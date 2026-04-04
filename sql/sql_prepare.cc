@@ -3364,6 +3364,13 @@ void Prepared_statement::swap_prepared_statement(Prepared_statement *copy) {
 
   // Need a new cursor, if requested
   std::swap(m_cursor, copy->m_cursor);
+
+  // ps_point_plan_cache: swap all per-statement plan-cache state so that
+  // after reprepare the new statement gets a clean slate and the old
+  // statement (about to be destroyed) carries away the stale state.
+  std::swap(m_ps_pc_state, copy->m_ps_pc_state);
+  std::swap(m_ps_pc, copy->m_ps_pc);
+  std::swap(m_ps_pc_cursor_execution, copy->m_ps_pc_cursor_execution);
 }
 
 /**

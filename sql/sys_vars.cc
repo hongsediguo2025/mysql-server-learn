@@ -3611,6 +3611,12 @@ static Sys_var_ulong Sys_preload_buff_size(
     VALID_RANGE(1024, 1024 * 1024 * 1024), DEFAULT(32768), BLOCK_SIZE(1),
     NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(check_session_admin_no_super));
 
+static Sys_var_bool Sys_ps_point_plan_cache(
+    "ps_point_plan_cache",
+    "Enable per-prepared-statement plan fast path for single-table "
+    "unique-key point SELECT queries.",
+    SESSION_VAR(ps_point_plan_cache), CMD_LINE(OPT_ARG), DEFAULT(true));
+
 static Sys_var_uint Sys_protocol_version(
     "protocol_version",
     "The version of the client/server protocol used by the MySQL server",

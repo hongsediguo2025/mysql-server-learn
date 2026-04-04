@@ -1,0 +1,314 @@
+--echo #
+--echo # Phase 0 test: ps_point_plan_cache sysvar, status variables,
+--echo # and background data operations to verify no regression.
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # 1. Verify sysvar visibility and default value
+--echo # -------------------------------------------------------
+SELECT @@global.ps_point_plan_cache;
+SELECT @@session.ps_point_plan_cache;
+
+--echo # Default should be ON (1)
+SHOW VARIABLES LIKE 'ps_point_plan_cache';
+
+--echo # -------------------------------------------------------
+--echo # 2. Verify sysvar can be toggled at SESSION level
+--echo # -------------------------------------------------------
+SET SESSION ps_point_plan_cache = FALSE;
+SELECT @@session.ps_point_plan_cache;
+
+SET SESSION ps_point_plan_cache = TRUE;
+SELECT @@session.ps_point_plan_cache;
+
+SET SESSION ps_point_plan_cache = 0;
+SELECT @@session.ps_point_plan_cache;
+
+SET SESSION ps_point_plan_cache = 1;
+SELECT @@session.ps_point_plan_cache;
+
+SET SESSION ps_point_plan_cache = ON;
+SELECT @@session.ps_point_plan_cache;
+
+SET SESSION ps_point_plan_cache = OFF;
+SELECT @@session.ps_point_plan_cache;
+
+--echo # Restore session to default
+SET SESSION ps_point_plan_cache = DEFAULT;
+SELECT @@session.ps_point_plan_cache;
+
+--echo # -------------------------------------------------------
+--echo # 3. Verify sysvar can be toggled at GLOBAL level
+--echo # -------------------------------------------------------
+SET @orig_global = @@global.ps_point_plan_cache;
+
+SET GLOBAL ps_point_plan_cache = FALSE;
+SELECT @@global.ps_point_plan_cache;
+
+SET GLOBAL ps_point_plan_cache = TRUE;
+SELECT @@global.ps_point_plan_cache;
+
+--echo # Restore global
+SET GLOBAL ps_point_plan_cache = @orig_global;
+
+--echo # -------------------------------------------------------
+--echo # 4. Error cases: invalid values must be rejected
+--echo # -------------------------------------------------------
+
+--error ER_WRONG_TYPE_FOR_VAR, ER_WRONG_VALUE_FOR_VAR
+SET SESSION ps_point_plan_cache = 12.34;
+
+--error ER_WRONG_TYPE_FOR_VAR, ER_WRONG_VALUE_FOR_VAR
+SET SESSION ps_point_plan_cache = 'foobar';
+
+--error ER_WRONG_TYPE_FOR_VAR, ER_WRONG_VALUE_FOR_VAR
+SET SESSION ps_point_plan_cache = 5;
+
+--error ER_WRONG_TYPE_FOR_VAR, ER_WRONG_VALUE_FOR_VAR
+SET GLOBAL ps_point_plan_cache = -1;
+
+--echo # Confirm value unchanged after invalid SET attempts
+SELECT @@session.ps_point_plan_cache;
+
+--echo # -------------------------------------------------------
+--echo # 5. Session scope isolation
+--echo # -------------------------------------------------------
+SET SESSION ps_point_plan_cache = FALSE;
+SELECT @@session.ps_point_plan_cache AS 'main_session_after_set_false';
+
+connect (con1, localhost, root,,);
+--echo # New connection should inherit GLOBAL default, not the other session's value
+SELECT @@session.ps_point_plan_cache AS 'con1_session_value';
+
+disconnect con1;
+connection default;
+
+--echo # Restore
+SET SESSION ps_point_plan_cache = DEFAULT;
+
+--echo # -------------------------------------------------------
+--echo # 6. Verify all 4 status counters are visible and start at 0
+--echo # -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+SELECT VARIABLE_NAME, VARIABLE_VALUE
+FROM performance_schema.session_status
+WHERE VARIABLE_NAME LIKE 'Ps_point_plan_cache%'
+ORDER BY VARIABLE_NAME;
+
+SELECT VARIABLE_NAME, VARIABLE_VALUE
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME LIKE 'Ps_point_plan_cache%'
+ORDER BY VARIABLE_NAME;
+
+--echo # -------------------------------------------------------
+--echo # 7. Background data operations: single-table point select PS
+--echo #    Verifies new Prepared_statement members don't break
+--echo #    basic PS lifecycle (prepare → multi-execute → deallocate).
+--echo # -------------------------------------------------------
+
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  val VARCHAR(100),
+  uk INT NOT NULL,
+  UNIQUE KEY idx_uk (uk)
+);
+INSERT INTO t1 VALUES (1, 'alpha', 100), (2, 'beta', 200), (3, 'gamma', 300);
+
+--echo # 7a. Point select on PK — candidate shape for future phases
+PREPARE ps_pk FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE ps_pk USING @p;
+SET @p = 2;
+EXECUTE ps_pk USING @p;
+SET @p = 3;
+EXECUTE ps_pk USING @p;
+
+--echo # 7b. Point select on unique key
+PREPARE ps_uk FROM 'SELECT * FROM t1 WHERE uk = ?';
+SET @p = 100;
+EXECUTE ps_uk USING @p;
+SET @p = 300;
+EXECUTE ps_uk USING @p;
+
+--echo # 7c. Multiple executes of same PS with NULL param
+SET @p = NULL;
+EXECUTE ps_pk USING @p;
+
+DEALLOCATE PREPARE ps_pk;
+DEALLOCATE PREPARE ps_uk;
+
+--echo # -------------------------------------------------------
+--echo # 8. Background data operations: non-candidate query shapes
+--echo #    These must remain completely unaffected.
+--echo # -------------------------------------------------------
+
+CREATE TABLE t2 (
+  id INT PRIMARY KEY,
+  t1_id INT,
+  memo TEXT
+);
+INSERT INTO t2 VALUES (1, 1, 'join-a'), (2, 2, 'join-b'), (3, 3, 'join-c');
+
+--echo # 8a. JOIN query
+PREPARE ps_join FROM 'SELECT t1.val, t2.memo FROM t1 JOIN t2 ON t1.id = t2.t1_id WHERE t1.id = ?';
+SET @p = 1;
+EXECUTE ps_join USING @p;
+EXECUTE ps_join USING @p;
+DEALLOCATE PREPARE ps_join;
+
+--echo # 8b. Range query
+PREPARE ps_range FROM 'SELECT * FROM t1 WHERE id > ? ORDER BY id';
+SET @p = 1;
+EXECUTE ps_range USING @p;
+EXECUTE ps_range USING @p;
+DEALLOCATE PREPARE ps_range;
+
+--echo # 8c. Aggregation query
+PREPARE ps_agg FROM 'SELECT COUNT(*), MAX(val) FROM t1 WHERE id >= ?';
+SET @p = 1;
+EXECUTE ps_agg USING @p;
+EXECUTE ps_agg USING @p;
+DEALLOCATE PREPARE ps_agg;
+
+--echo # 8d. Subquery
+PREPARE ps_sub FROM 'SELECT * FROM t1 WHERE id IN (SELECT t1_id FROM t2 WHERE t2.id = ?)';
+SET @p = 2;
+EXECUTE ps_sub USING @p;
+EXECUTE ps_sub USING @p;
+DEALLOCATE PREPARE ps_sub;
+
+--echo # 8e. Multi-param query (not candidate: param_count != 1)
+PREPARE ps_multi FROM 'SELECT * FROM t1 WHERE id = ? AND val = ?';
+SET @p1 = 1;
+SET @p2 = 'alpha';
+EXECUTE ps_multi USING @p1, @p2;
+EXECUTE ps_multi USING @p1, @p2;
+DEALLOCATE PREPARE ps_multi;
+
+--echo # 8f. INSERT/UPDATE/DELETE via PS (non-SELECT)
+PREPARE ps_ins FROM 'INSERT INTO t1 VALUES (?, ?, ?)';
+SET @a = 4; SET @b = 'delta'; SET @c = 400;
+EXECUTE ps_ins USING @a, @b, @c;
+DEALLOCATE PREPARE ps_ins;
+
+PREPARE ps_upd FROM 'UPDATE t1 SET val = ? WHERE id = ?';
+SET @a = 'DELTA'; SET @b = 4;
+EXECUTE ps_upd USING @a, @b;
+DEALLOCATE PREPARE ps_upd;
+
+PREPARE ps_del FROM 'DELETE FROM t1 WHERE id = ?';
+SET @a = 4;
+EXECUTE ps_del USING @a;
+DEALLOCATE PREPARE ps_del;
+
+SELECT * FROM t1 ORDER BY id;
+
+--echo # -------------------------------------------------------
+--echo # 9. DDL-triggered reprepare
+--echo #    This exercises swap_prepared_statement() which must
+--echo #    correctly swap the 3 new fields we added.
+--echo # -------------------------------------------------------
+
+PREPARE ps_repr FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE ps_repr USING @p;
+
+--echo # ALTER TABLE invalidates the PS → next execute does reprepare
+ALTER TABLE t1 ADD COLUMN extra INT DEFAULT 0;
+SET @p = 2;
+EXECUTE ps_repr USING @p;
+
+--echo # Another DDL cycle
+ALTER TABLE t1 DROP COLUMN extra;
+SET @p = 3;
+EXECUTE ps_repr USING @p;
+
+DEALLOCATE PREPARE ps_repr;
+
+--echo # -------------------------------------------------------
+--echo # 10. SQL-syntax PREPARE/EXECUTE (not COM_STMT_* protocol)
+--echo #     These should also be unaffected.
+--echo # -------------------------------------------------------
+
+PREPARE ps_sql FROM 'SELECT val FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE ps_sql USING @p;
+SET @p = 2;
+EXECUTE ps_sql USING @p;
+DEALLOCATE PREPARE ps_sql;
+
+--echo # -------------------------------------------------------
+--echo # 11. Multiple PS alive simultaneously
+--echo #     Verifies per-statement state independence.
+--echo # -------------------------------------------------------
+
+PREPARE ps_a FROM 'SELECT id FROM t1 WHERE id = ?';
+PREPARE ps_b FROM 'SELECT val FROM t1 WHERE uk = ?';
+PREPARE ps_c FROM 'SELECT COUNT(*) FROM t1';
+
+SET @p = 1;
+EXECUTE ps_a USING @p;
+SET @p = 200;
+EXECUTE ps_b USING @p;
+EXECUTE ps_c;
+SET @p = 3;
+EXECUTE ps_a USING @p;
+SET @p = 100;
+EXECUTE ps_b USING @p;
+EXECUTE ps_c;
+
+DEALLOCATE PREPARE ps_a;
+DEALLOCATE PREPARE ps_b;
+DEALLOCATE PREPARE ps_c;
+
+--echo # -------------------------------------------------------
+--echo # 12. Toggle sysvar mid-session between PS executions
+--echo # -------------------------------------------------------
+
+PREPARE ps_toggle FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE ps_toggle USING @p;
+
+SET SESSION ps_point_plan_cache = FALSE;
+EXECUTE ps_toggle USING @p;
+
+SET SESSION ps_point_plan_cache = TRUE;
+SET @p = 2;
+EXECUTE ps_toggle USING @p;
+
+DEALLOCATE PREPARE ps_toggle;
+
+--echo # -------------------------------------------------------
+--echo # 13. Counters still 0 after all operations
+--echo #     (Phase 0 stubs never increment.)
+--echo #     Check BEFORE FLUSH STATUS — this is the real assertion.
+--echo #     If any counter was accidentally bumped during sections
+--echo #     7-12, FLUSH STATUS would hide it.
+--echo # -------------------------------------------------------
+
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # Also verify via FLUSH STATUS (additional, not primary assertion)
+FLUSH STATUS;
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # 14. Verify sysvar appears in expected P_S tables
+--echo # -------------------------------------------------------
+
+--let $count = `SELECT COUNT(*) FROM performance_schema.session_variables WHERE VARIABLE_NAME = 'ps_point_plan_cache'`
+--echo Variable found in session_variables: $count
+
+--let $count = `SELECT COUNT(*) FROM performance_schema.global_variables WHERE VARIABLE_NAME = 'ps_point_plan_cache'`
+--echo Variable found in global_variables: $count
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+DROP TABLE t2;
+DROP TABLE t1;
+
+--echo #
+--echo # End of Phase 0 tests
+--echo #

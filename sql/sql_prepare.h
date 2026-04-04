@@ -36,6 +36,7 @@
 #include "my_psi_config.h"
 #include "mysql/components/services/bits/psi_statement_bits.h"
 #include "mysql_com.h"
+#include "sql/ps_point_plan_cache.h"
 #include "sql/sql_class.h"  // Query_arena
 #include "sql/sql_error.h"
 #include "sql/sql_list.h"
@@ -448,6 +449,34 @@ class Prepared_statement final {
   void trace_parameter_types(THD *thd);
   void close_cursor();
 
+  /* --- ps_point_plan_cache accessors (Phase 0 skeleton) --- */
+
+  PsPointPlanState ps_point_plan_state() const { return m_ps_pc_state; }
+
+  const PsPointPlanTemplate &ps_point_plan_template() const {
+    return m_ps_pc;
+  }
+  PsPointPlanTemplate &ps_point_plan_template() { return m_ps_pc; }
+
+  void set_ps_point_plan_state(PsPointPlanState s) { m_ps_pc_state = s; }
+
+  void invalidate_ps_point_plan_cache() {
+    m_ps_pc_state = PsPointPlanState::INVALID;
+    m_ps_pc = PsPointPlanTemplate{};
+    m_ps_pc_cursor_execution = false;
+  }
+
+  void reset_ps_point_plan_runtime_state() {
+    m_ps_pc_cursor_execution = false;
+  }
+
+  bool ps_point_plan_cursor_execution() const {
+    return m_ps_pc_cursor_execution;
+  }
+  void set_ps_point_plan_cursor_execution(bool v) {
+    m_ps_pc_cursor_execution = v;
+  }
+
  private:
   void cleanup_stmt(THD *thd);
   void setup_stmt_logging(THD *thd);
@@ -463,6 +492,11 @@ class Prepared_statement final {
                                    String *query);
   bool insert_parameters(THD *thd, String *query, bool has_new_types,
                          PS_PARAM *parameters);
+
+  /* --- ps_point_plan_cache per-statement state (Phase 0 skeleton) --- */
+  PsPointPlanState m_ps_pc_state{PsPointPlanState::NEVER};
+  PsPointPlanTemplate m_ps_pc{};
+  bool m_ps_pc_cursor_execution{false};
 };
 
 #endif  // SQL_PREPARE_H

@@ -1,0 +1,125 @@
+#
+# Phase 0 test: ps_point_plan_cache under COM_STMT_PREPARE/COM_STMT_EXECUTE.
+#
+# This test MUST be run with --ps-protocol so that regular SELECTs
+# are sent via the binary prepared-statement protocol, which is the
+# actual target path for this feature (sysbench model).
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+val VARCHAR(100),
+uk INT NOT NULL,
+UNIQUE KEY idx_uk (uk)
+);
+INSERT INTO t1 VALUES (1, 'alpha', 100), (2, 'beta', 200), (3, 'gamma', 300);
+CREATE TABLE t2 (
+id INT PRIMARY KEY,
+t1_id INT,
+memo TEXT
+);
+INSERT INTO t2 VALUES (1, 1, 'join-a'), (2, 2, 'join-b');
+FLUSH STATUS;
+# -------------------------------------------------------
+# 0. Self-verification: prove we are running under binary PS protocol.
+#    Com_stmt_execute must increase when SELECTs go through
+#    COM_STMT_PREPARE/COM_STMT_EXECUTE.  If this test is accidentally
+#    run without --ps-protocol, the counter stays 0 and the
+#    assertion below will fail, catching the misconfiguration.
+# -------------------------------------------------------
+SELECT 1;
+1
+1
+# Confirmed: running under binary PS protocol (Com_stmt_execute incremented by 1)
+FLUSH STATUS;
+# -------------------------------------------------------
+# 1. Point select on PK (candidate shape) via binary protocol
+# -------------------------------------------------------
+SELECT * FROM t1 WHERE id = 1;
+id	val	uk
+1	alpha	100
+SELECT * FROM t1 WHERE id = 2;
+id	val	uk
+2	beta	200
+SELECT * FROM t1 WHERE id = 3;
+id	val	uk
+3	gamma	300
+# -------------------------------------------------------
+# 2. Point select on unique key via binary protocol
+# -------------------------------------------------------
+SELECT * FROM t1 WHERE uk = 100;
+id	val	uk
+1	alpha	100
+SELECT * FROM t1 WHERE uk = 300;
+id	val	uk
+3	gamma	300
+# -------------------------------------------------------
+# 3. Non-candidate shapes via binary protocol
+# -------------------------------------------------------
+SELECT * FROM t1 WHERE id > 1 ORDER BY id;
+id	val	uk
+2	beta	200
+3	gamma	300
+SELECT t1.val, t2.memo FROM t1 JOIN t2 ON t1.id = t2.t1_id WHERE t1.id = 1;
+val	memo
+alpha	join-a
+SELECT COUNT(*), MAX(val) FROM t1;
+COUNT(*)	MAX(val)
+3	gamma
+# -------------------------------------------------------
+# 4. Counters must be 0 — Phase 0 is fully inert even
+#    under the real binary protocol path.
+# -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admissions	0
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	0
+Ps_point_plan_cache_invalidations	0
+# -------------------------------------------------------
+# 5. DDL-triggered reprepare under binary protocol
+#    (ps-protocol implicitly prepares each SELECT, so ALTER
+#    in between forces COM_STMT_EXECUTE to see version mismatch
+#    and trigger server-side reprepare.)
+# -------------------------------------------------------
+SELECT * FROM t1 WHERE id = 1;
+id	val	uk
+1	alpha	100
+ALTER TABLE t1 ADD COLUMN extra INT DEFAULT 0;
+SELECT * FROM t1 WHERE id = 2;
+id	val	uk	extra
+2	beta	200	0
+ALTER TABLE t1 DROP COLUMN extra;
+SELECT * FROM t1 WHERE id = 3;
+id	val	uk
+3	gamma	300
+# -------------------------------------------------------
+# 6. Toggle sysvar between binary-protocol executions
+# -------------------------------------------------------
+SET SESSION ps_point_plan_cache = FALSE;
+SELECT * FROM t1 WHERE id = 1;
+id	val	uk
+1	alpha	100
+SET SESSION ps_point_plan_cache = TRUE;
+SELECT * FROM t1 WHERE id = 2;
+id	val	uk
+2	beta	200
+# -------------------------------------------------------
+# 7. Final counter check — still 0
+# -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admissions	0
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	0
+Ps_point_plan_cache_invalidations	0
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t2;
+DROP TABLE t1;
+#
+# End of binary protocol Phase 0 test
+#

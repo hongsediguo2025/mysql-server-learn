@@ -31,3 +31,9 @@ scalability_jobs_*
 .cproject
 .project
 .settings/
+
+# macOS metadata
+.DS_Store
+
+# Cursor IDE
+.cursor/

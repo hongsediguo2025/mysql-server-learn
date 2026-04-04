@@ -221,6 +221,7 @@ struct System_variables {
   ulonglong long_query_time;
   bool end_markers_in_json;
   bool windowing_use_high_precision;
+  bool ps_point_plan_cache;
   /* A bitmap for switching optimizations on/off */
   ulonglong optimizer_switch;
   ulonglong optimizer_trace;           ///< bitmap to tune optimizer tracing
@@ -572,6 +573,12 @@ struct System_status_var {
   /// How many queries have been executed on a secondary storage engine.
   ulonglong secondary_engine_execution_count;
 
+  /* ps_point_plan_cache status counters (Phase 0). */
+  ulonglong ps_point_plan_cache_hits;
+  ulonglong ps_point_plan_cache_admissions;
+  ulonglong ps_point_plan_cache_invalidations;
+  ulonglong ps_point_plan_cache_fallback_runtime;
+
   ulong com_other;
   ulong com_stat[(uint)SQLCOM_END];
 
@@ -589,7 +596,7 @@ struct System_status_var {
   used as a global counter. It marks the end of a contiguous block of counters
   that can be iteratively totaled. See add_to_status().
 */
-#define LAST_STATUS_VAR secondary_engine_execution_count
+#define LAST_STATUS_VAR ps_point_plan_cache_fallback_runtime
 
 /*
   This must reference the FIRST ulonglong variable in system_status_var that is

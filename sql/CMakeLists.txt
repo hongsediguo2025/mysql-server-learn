@@ -477,6 +477,7 @@ SET(SQL_SHARED_SOURCES
   partitioning/partition_handler.cc
   persisted_variable.cc
   protocol_classic.cc
+  ps_point_plan_cache.cc
   psi_memory_key.cc
   psi_memory_resource.cc
   query_result.cc
