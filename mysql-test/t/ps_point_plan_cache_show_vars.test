@@ -284,8 +284,9 @@ DEALLOCATE PREPARE ps_toggle;
 --echo # 13. Counter verification after all operations
 --echo #     cold_classifications = 10 (COLD candidates from PREPARE).
 --echo #     admissions = 9 (COLD statements that passed admission on
---echo #     first EXECUTE and transitioned to HOT). Phase 2 active.
---echo #     hits/invalidations/fallback_runtime remain 0 (Phase 3+).
+--echo #     first EXECUTE and transitioned to HOT).
+--echo #     hits = 7 (Phase 3 fast path hits on subsequent EXECUTEs).
+--echo #     fallback_runtime = 1 (NULL param in Section 7c).
 --echo # -------------------------------------------------------
 
 SHOW STATUS LIKE 'Ps_point_plan_cache%';

@@ -30,6 +30,8 @@
   Phase 0: skeleton — status counter helpers.
   Phase 1: static classification at PREPARE time.
   Phase 2: admission after first normal optimization.
+  Phase 3: fast path — HOT statements bypass make_join_plan() via
+           minimal one-table EQ_REF plan construction.
 */
 
 #include "sql/ps_point_plan_cache.h"
@@ -37,6 +39,7 @@
 #include "sql/item.h"
 #include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
+#include "sql/join_optimizer/access_path.h"
 #include "sql/key.h"
 #include "sql/sql_class.h"
 #include "sql/sql_executor.h"
@@ -245,10 +248,225 @@ bool ps_point_plan_extract_where_shape(Query_block *qb,
   return false;
 }
 
-bool ps_point_plan_runtime_guard(THD *, Prepared_statement *, TABLE **,
-                                 KEY **) {
-  /* Phase 3: implement runtime guard. */
-  return false;
+bool ps_point_plan_runtime_guard(THD *thd, Prepared_statement *stmt,
+                                 TABLE **table_out, KEY **keyinfo_out) {
+  const PsPointPlanTemplate &tpl = stmt->ps_point_plan_template();
+
+  /*
+    Structural guards — if any fails, the template is no longer valid
+    and must be invalidated.  The PS stays INVALID until reprepare.
+  */
+
+  /* G1: TABLE binding must be live. */
+  if (tpl.table_ref == nullptr || tpl.table_ref->table == nullptr) {
+    stmt->invalidate_ps_point_plan_cache();
+    ps_point_plan_mark_invalidation(thd);
+    return false;
+  }
+
+  TABLE *table = tpl.table_ref->table;
+
+  /* G1b: TABLE_SHARE must be present. */
+  if (table->s == nullptr) {
+    stmt->invalidate_ps_point_plan_cache();
+    ps_point_plan_mark_invalidation(thd);
+    return false;
+  }
+
+  /* G2: key index must still be within bounds. */
+  if (tpl.keyno >= table->s->keys) {
+    stmt->invalidate_ps_point_plan_cache();
+    ps_point_plan_mark_invalidation(thd);
+    return false;
+  }
+
+  KEY *keyinfo = &table->key_info[tpl.keyno];
+
+  /* G3: key must still be unique. */
+  if (!(actual_key_flags(keyinfo) & HA_NOSAME)) {
+    stmt->invalidate_ps_point_plan_cache();
+    ps_point_plan_mark_invalidation(thd);
+    return false;
+  }
+
+  /* G4: key part count must still match. */
+  if (keyinfo->user_defined_key_parts != tpl.key_parts) {
+    stmt->invalidate_ps_point_plan_cache();
+    ps_point_plan_mark_invalidation(thd);
+    return false;
+  }
+
+  /* G5: field ordinals for each key part must still match. */
+  for (uint i = 0; i < tpl.key_parts; i++) {
+    if (keyinfo->key_part[i].fieldnr - 1 != tpl.field_indices[i]) {
+      stmt->invalidate_ps_point_plan_cache();
+      ps_point_plan_mark_invalidation(thd);
+      return false;
+    }
+  }
+
+  /*
+    Parameter guards — per-execution checks.
+    If any fails, this execution falls back to normal path but
+    the template stays HOT for future executions.
+  */
+
+  for (uint i = 0; i < tpl.param_count; i++) {
+    /* G6: param pointer sanity. */
+    if (tpl.params[i] == nullptr) {
+      stmt->invalidate_ps_point_plan_cache();
+      ps_point_plan_mark_invalidation(thd);
+      return false;
+    }
+
+    /* G7: NULL parameter → runtime fallback. */
+    if (tpl.params[i]->param_state() == Item_param::NULL_VALUE) {
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
+    }
+
+    /* G8: parameter actual type must match admission snapshot. */
+    if (tpl.params[i]->data_type_actual() != tpl.actual_types[i]) {
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
+    }
+
+    /* G9: unsigned flag must match admission snapshot. */
+    if (tpl.params[i]->is_unsigned_actual() != tpl.unsigned_actuals[i]) {
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
+    }
+  }
+
+  *table_out = table;
+  *keyinfo_out = keyinfo;
+  return true;
+}
+
+/**
+  Construct a minimal one-table EQ_REF execution plan for a HOT
+  prepared statement, bypassing the full optimizer pipeline.
+
+  @pre  thd->variables.ps_point_plan_cache == true
+  @pre  stmt->ps_point_plan_state() == PsPointPlanState::HOT
+  @pre  !stmt->ps_point_plan_cursor_execution()
+  @pre  !thd->lex->using_hypergraph_optimizer()
+
+  @param  thd   Current thread.
+  @param  join  The JOIN being optimized.
+  @param  stmt  The owning Prepared_statement (HOT state).
+
+  @retval true  Fast path plan constructed; caller should set
+                PLAN_READY and return.
+  @retval false Fast path declined; caller should continue to
+                make_join_plan() (JOIN state is untouched).
+*/
+bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
+                                   Prepared_statement *stmt) {
+  const PsPointPlanTemplate &tpl = stmt->ps_point_plan_template();
+
+  /*
+    MANDATORY INVARIANT: Do NOT modify any JOIN member (tables,
+    primary_tables, const_tables, where_cond, having_cond, qep_tab,
+    best_read, best_rowcount, m_root_access_path) until ALL
+    construction steps below have succeeded.
+
+    Rationale:
+      - init_planner_arrays() asserts primary_tables == 0 && tables == 0.
+        Violating this crashes debug builds.
+      - where_cond is already set to the real WHERE by
+        get_optimizable_conditions().  Clearing it and then falling back
+        would make the normal optimizer miss the predicate.
+  */
+
+  /* --- Phase A: Runtime guard (read-only, no JOIN mutation) --- */
+  TABLE *table = nullptr;
+  KEY *keyinfo = nullptr;
+  if (!ps_point_plan_runtime_guard(thd, stmt, &table, &keyinfo))
+    return false;
+
+  /* --- Phase B: Construct all objects in local variables --- */
+
+  /* B1: Allocate QEP_TAB[2] (1 real + 1 sentinel) */
+  QEP_TAB *new_qep_tab = new (thd->mem_root) QEP_TAB[2];
+  if (new_qep_tab == nullptr) {
+    ps_point_plan_mark_runtime_fallback(thd);
+    return false;
+  }
+
+  /* B2: Allocate and link QEP_shared */
+  QEP_shared *qs = new (thd->mem_root) QEP_shared;
+  if (qs == nullptr) {
+    ps_point_plan_mark_runtime_fallback(thd);
+    return false;
+  }
+
+  QEP_TAB *tab = &new_qep_tab[0];
+  tab->set_qs(qs);
+  tab->set_join(join);
+  tab->set_idx(0);
+  tab->set_table(table);
+  tab->table_ref = tpl.table_ref;
+  tab->set_type(JT_EQ_REF);
+
+  /* B3: Build Index_lookup via init_ref + init_ref_part */
+  if (init_ref(thd, tpl.key_parts, tpl.key_length, tpl.keyno,
+               &tab->ref())) {
+    ps_point_plan_mark_runtime_fallback(thd);
+    return false;
+  }
+
+  uchar *key_buff = tab->ref().key_buff;
+  for (uint i = 0; i < tpl.key_parts; i++) {
+    const KEY_PART_INFO *key_part = &keyinfo->key_part[i];
+    const bool null_rej = (tpl.null_rejecting >> i) & 1;
+
+    if (init_ref_part(thd, i, tpl.params[i],
+                      /*cond_guard=*/nullptr, null_rej,
+                      /*const_tables=*/0,
+                      tpl.params[i]->used_tables(),
+                      key_part->null_bit != 0,
+                      key_part, key_buff, &tab->ref())) {
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
+    }
+    key_buff += key_part->store_length;
+  }
+  assert(key_buff == tab->ref().key_buff + tpl.key_length);
+
+  /* B4: Create AccessPath */
+  AccessPath *path =
+      NewEQRefAccessPath(thd, table, &tab->ref(), /*count_examined_rows=*/true);
+  if (path == nullptr) {
+    ps_point_plan_mark_runtime_fallback(thd);
+    return false;
+  }
+
+  path->set_num_output_rows(tpl.best_rowcount);
+  path->cost = tpl.best_read;
+  path->init_cost = 0.0;
+  path->init_once_cost = 0.0;
+
+  /*
+    --- Phase C: ALL construction succeeded — commit to JOIN ---
+
+    This is the ONLY place where JOIN members are modified.
+    If any step above failed and returned false, we reach here with
+    the JOIN completely untouched, so fallback to make_join_plan()
+    proceeds with correct state (tables==0, where_cond intact, etc.).
+  */
+  join->tables = 1;
+  join->primary_tables = 1;
+  join->const_tables = 0;
+  join->best_read = tpl.best_read;
+  join->best_rowcount = static_cast<ha_rows>(tpl.best_rowcount);
+  join->where_cond = nullptr;
+  join->having_cond = nullptr;
+  join->qep_tab = new_qep_tab;
+  join->set_root_access_path(path);
+
+  ps_point_plan_mark_hit(thd);
+  return true;
 }
 
 /**

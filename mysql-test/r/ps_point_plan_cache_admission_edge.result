@@ -231,7 +231,7 @@ Variable_name	Value
 Ps_point_plan_cache_admissions	11
 Ps_point_plan_cache_cold_classifications	13
 Ps_point_plan_cache_fallback_runtime	0
-Ps_point_plan_cache_hits	0
+Ps_point_plan_cache_hits	1
 Ps_point_plan_cache_invalidations	0
 # -------------------------------------------------------
 # Cleanup

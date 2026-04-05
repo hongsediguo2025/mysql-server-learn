@@ -692,6 +692,30 @@ bool JOIN::optimize(bool finalize_access_paths) {
   assert(!thd->optimizer_switch_flag(OPTIMIZER_SWITCH_HYPERGRAPH_OPTIMIZER) ||
          !thd->stmt_arena->is_regular());
 
+  /*
+    ps_point_plan_cache Phase 3: fast path for HOT prepared statements.
+
+    Before entering the expensive make_join_plan() pipeline, check if
+    this is a HOT PS that can skip optimization entirely.  On success,
+    a minimal one-table EQ_REF plan is constructed directly and we jump
+    to PLAN_READY.  On failure, fall through to the normal optimizer.
+  */
+  if (thd->variables.ps_point_plan_cache) {
+    Sql_cmd *sql_cmd = thd->lex->m_sql_cmd;
+    Prepared_statement *ps_owner =
+        (sql_cmd != nullptr) ? sql_cmd->owner() : nullptr;
+    if (ps_owner != nullptr &&
+        ps_owner->ps_point_plan_state() == PsPointPlanState::HOT &&
+        !ps_owner->ps_point_plan_cursor_execution()) {
+      if (ps_point_plan_build_fast_path(thd, this, ps_owner)) {
+        set_plan_state(PLAN_READY);
+        DEBUG_SYNC(thd, "after_join_optimize");
+        error = 0;
+        return false;
+      }
+    }
+  }
+
   // Set up join order and initial access paths
   THD_STAGE_INFO(thd, stage_statistics);
   if (make_join_plan()) {

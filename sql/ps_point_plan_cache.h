@@ -218,6 +218,27 @@ bool ps_point_plan_runtime_guard(THD *thd, Prepared_statement *stmt,
                                  TABLE **table_out, KEY **keyinfo_out);
 
 /**
+  Construct a minimal one-table EQ_REF execution plan for a HOT
+  prepared statement, bypassing make_join_plan() and the full
+  optimizer pipeline.
+
+  Called from the Phase 3 fast-path hook in JOIN::optimize(),
+  before make_join_plan().  Uses delayed-write: JOIN members are
+  only modified after all construction steps succeed.
+
+  @param  thd   Current thread.
+  @param  join  The JOIN being optimized.
+  @param  stmt  The owning Prepared_statement (HOT state).
+
+  @retval true  Fast path plan constructed; caller should set
+                PLAN_READY and return.
+  @retval false Fast path declined; caller should continue to
+                make_join_plan() (JOIN state is untouched).
+*/
+bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
+                                   Prepared_statement *stmt);
+
+/**
   Check whether the first normal optimization result qualifies for
   admission into the HOT state.
 

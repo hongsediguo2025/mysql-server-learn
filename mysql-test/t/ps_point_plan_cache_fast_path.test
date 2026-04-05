@@ -1,0 +1,505 @@
+--echo #
+--echo # Phase 3 test: ps_point_plan_cache fast path
+--echo # Verifies HOT statements bypass make_join_plan() and produce
+--echo # correct results via the minimal EQ_REF execution plan.
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  val VARCHAR(50),
+  uk INT NOT NULL,
+  UNIQUE KEY idx_uk (uk)
+);
+
+CREATE TABLE t_comp (
+  pk1 INT,
+  pk2 INT,
+  val INT,
+  PRIMARY KEY (pk1, pk2)
+);
+
+INSERT INTO t1 VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30);
+INSERT INTO t_comp VALUES (1, 1, 100), (1, 2, 200), (2, 1, 300);
+
+FLUSH STATUS;
+
+--echo # -------------------------------------------------------
+--echo # 1. PK point select — fast path hit + correct result
+--echo # -------------------------------------------------------
+
+PREPARE stmt_pk FROM 'SELECT * FROM t1 WHERE id = ?';
+
+--echo # First EXECUTE: admission (COLD → HOT, normal path)
+SET @p = 1;
+EXECUTE stmt_pk USING @p;
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+--echo # Second EXECUTE: should hit fast path
+SET @p = 2;
+EXECUTE stmt_pk USING @p;
+
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after PK second execute: $hits_delta
+
+DEALLOCATE PREPARE stmt_pk;
+
+--echo # -------------------------------------------------------
+--echo # 2. UK point select — fast path hit + correct result
+--echo # -------------------------------------------------------
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+PREPARE stmt_uk FROM 'SELECT * FROM t1 WHERE uk = ?';
+
+--echo # First EXECUTE: admission
+SET @p = 10;
+EXECUTE stmt_uk USING @p;
+
+--echo # Second EXECUTE: fast path
+SET @p = 20;
+EXECUTE stmt_uk USING @p;
+
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after UK second execute: $hits_delta
+
+DEALLOCATE PREPARE stmt_uk;
+
+--echo # -------------------------------------------------------
+--echo # 3. Composite PK — fast path hit + correct result
+--echo # -------------------------------------------------------
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+PREPARE stmt_cpk FROM 'SELECT * FROM t_comp WHERE pk1 = ? AND pk2 = ?';
+
+SET @p1 = 1;
+SET @p2 = 1;
+EXECUTE stmt_cpk USING @p1, @p2;
+
+SET @p1 = 2;
+SET @p2 = 1;
+EXECUTE stmt_cpk USING @p1, @p2;
+
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after composite PK second execute: $hits_delta
+
+DEALLOCATE PREPARE stmt_cpk;
+
+--echo # -------------------------------------------------------
+--echo # 4. Composite PK reversed WHERE order — fast path hit
+--echo #    (params reordered to key-part order in Phase 2)
+--echo # -------------------------------------------------------
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+PREPARE stmt_rev FROM 'SELECT * FROM t_comp WHERE pk2 = ? AND pk1 = ?';
+
+SET @p1 = 2;
+SET @p2 = 1;
+EXECUTE stmt_rev USING @p1, @p2;
+
+SET @p1 = 1;
+SET @p2 = 2;
+EXECUTE stmt_rev USING @p1, @p2;
+
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after reversed PK second execute: $hits_delta
+
+DEALLOCATE PREPARE stmt_rev;
+
+--echo # -------------------------------------------------------
+--echo # 5. Non-existent PK value — fast path returns empty set
+--echo # -------------------------------------------------------
+
+PREPARE stmt_norow FROM 'SELECT * FROM t1 WHERE id = ?';
+
+SET @p = 1;
+EXECUTE stmt_norow USING @p;
+
+--echo # Fast path with non-existent value
+SET @p = 999;
+EXECUTE stmt_norow USING @p;
+
+DEALLOCATE PREPARE stmt_norow;
+
+--echo # -------------------------------------------------------
+--echo # 6. NULL parameter — runtime fallback (G7)
+--echo # -------------------------------------------------------
+
+--let $fb_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+PREPARE stmt_null FROM 'SELECT * FROM t1 WHERE id = ?';
+
+SET @p = 1;
+EXECUTE stmt_null USING @p;
+
+--echo # EXECUTE with NULL — should fallback, not hit
+SET @p = NULL;
+EXECUTE stmt_null USING @p;
+
+--let $fb_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $fb_delta = `SELECT $fb_after - $fb_before`
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo fallback_runtime delta after NULL execute: $fb_delta
+--echo hits delta after NULL execute: $hits_delta
+
+--echo # Next EXECUTE with non-NULL should hit again (still HOT)
+--let $hits_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @p = 3;
+EXECUTE stmt_null USING @p;
+--let $hits_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta2 = `SELECT $hits_after2 - $hits_before2`
+--echo hits delta after non-NULL execute following NULL: $hits_delta2
+
+DEALLOCATE PREPARE stmt_null;
+
+--echo # -------------------------------------------------------
+--echo # 7. Sysvar OFF — bypass fast path
+--echo # -------------------------------------------------------
+
+PREPARE stmt_sysvar FROM 'SELECT * FROM t1 WHERE id = ?';
+
+SET @p = 1;
+EXECUTE stmt_sysvar USING @p;
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+SET SESSION ps_point_plan_cache = OFF;
+SET @p = 2;
+EXECUTE stmt_sysvar USING @p;
+
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta with sysvar OFF: $hits_delta
+
+--echo # Re-enable — should hit again
+SET SESSION ps_point_plan_cache = ON;
+--let $hits_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @p = 3;
+EXECUTE stmt_sysvar USING @p;
+--let $hits_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta2 = `SELECT $hits_after2 - $hits_before2`
+--echo hits delta with sysvar re-enabled: $hits_delta2
+
+DEALLOCATE PREPARE stmt_sysvar;
+
+--echo # -------------------------------------------------------
+--echo # 8. Multiple consecutive EXECUTEs — hits accumulate
+--echo # -------------------------------------------------------
+
+PREPARE stmt_multi FROM 'SELECT * FROM t1 WHERE id = ?';
+
+--echo # Admission
+SET @p = 1;
+EXECUTE stmt_multi USING @p;
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+SET @p = 1;
+EXECUTE stmt_multi USING @p;
+SET @p = 2;
+EXECUTE stmt_multi USING @p;
+SET @p = 3;
+EXECUTE stmt_multi USING @p;
+SET @p = 1;
+EXECUTE stmt_multi USING @p;
+SET @p = 2;
+EXECUTE stmt_multi USING @p;
+
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after 5 consecutive executes: $hits_delta
+
+DEALLOCATE PREPARE stmt_multi;
+
+--echo # -------------------------------------------------------
+--echo # 9. Different param values — each returns correct row
+--echo # -------------------------------------------------------
+
+PREPARE stmt_vals FROM 'SELECT * FROM t1 WHERE id = ?';
+
+SET @p = 1;
+EXECUTE stmt_vals USING @p;
+
+--echo # Fast path with various values
+SET @p = 1;
+EXECUTE stmt_vals USING @p;
+SET @p = 2;
+EXECUTE stmt_vals USING @p;
+SET @p = 3;
+EXECUTE stmt_vals USING @p;
+
+DEALLOCATE PREPARE stmt_vals;
+
+--echo # -------------------------------------------------------
+--echo # 10. DDL → reprepare → re-classify → re-admit → fast path
+--echo # -------------------------------------------------------
+
+PREPARE stmt_ddl FROM 'SELECT * FROM t1 WHERE id = ?';
+
+--echo # Admission
+SET @p = 1;
+EXECUTE stmt_ddl USING @p;
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+
+--echo # Fast path hit
+SET @p = 2;
+EXECUTE stmt_ddl USING @p;
+
+--echo # DDL triggers reprepare on next EXECUTE
+ALTER TABLE t1 ADD COLUMN extra INT DEFAULT 0;
+
+--echo # Re-admission after reprepare
+SET @p = 1;
+EXECUTE stmt_ddl USING @p;
+
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after DDL reprepare: $adm_delta
+
+--echo # Fast path should work again after re-admission
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @p = 2;
+EXECUTE stmt_ddl USING @p;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after re-admission: $hits_delta
+
+DEALLOCATE PREPARE stmt_ddl;
+
+--echo # Restore table
+ALTER TABLE t1 DROP COLUMN extra;
+
+--echo # -------------------------------------------------------
+--echo # 11. DML between fast-path EXECUTEs — data freshness
+--echo #     EQRefIterator must read current data, not stale.
+--echo # -------------------------------------------------------
+
+PREPARE stmt_dml FROM 'SELECT * FROM t1 WHERE id = ?';
+
+--echo # Admission
+SET @p = 1;
+EXECUTE stmt_dml USING @p;
+
+--echo # INSERT new row, fast path should see it
+INSERT INTO t1 VALUES (4, 'four', 40);
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @p = 4;
+EXECUTE stmt_dml USING @p;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after INSERT: $hits_delta
+
+--echo # UPDATE existing row, fast path should see updated value
+UPDATE t1 SET val = 'UPDATED' WHERE id = 1;
+SET @p = 1;
+EXECUTE stmt_dml USING @p;
+
+--echo # DELETE the inserted row, fast path should return empty
+DELETE FROM t1 WHERE id = 4;
+SET @p = 4;
+EXECUTE stmt_dml USING @p;
+
+--echo # Restore original data
+UPDATE t1 SET val = 'one' WHERE id = 1;
+
+DEALLOCATE PREPARE stmt_dml;
+
+--echo # -------------------------------------------------------
+--echo # 12. Nullable unique key — fast path hit
+--echo #     Tests init_ref_part with key_part->null_bit != 0
+--echo # -------------------------------------------------------
+
+CREATE TABLE t_nuk (
+  id INT PRIMARY KEY,
+  nuk INT,
+  val VARCHAR(50),
+  UNIQUE KEY idx_nuk (nuk)
+);
+INSERT INTO t_nuk VALUES (1, 100, 'a'), (2, 200, 'b'), (3, NULL, 'c');
+
+PREPARE stmt_nuk FROM 'SELECT * FROM t_nuk WHERE nuk = ?';
+
+--echo # Admission
+SET @p = 100;
+EXECUTE stmt_nuk USING @p;
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo # Fast path with nullable UK
+SET @p = 200;
+EXECUTE stmt_nuk USING @p;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after nullable UK fast path: $hits_delta
+
+DEALLOCATE PREPARE stmt_nuk;
+DROP TABLE t_nuk;
+
+--echo # -------------------------------------------------------
+--echo # 13. VARCHAR primary key — fast path with string key
+--echo # -------------------------------------------------------
+
+CREATE TABLE t_vpk (
+  name VARCHAR(50) PRIMARY KEY,
+  val INT
+);
+INSERT INTO t_vpk VALUES ('alice', 1), ('bob', 2), ('charlie', 3);
+
+PREPARE stmt_vpk FROM 'SELECT * FROM t_vpk WHERE name = ?';
+
+--echo # Admission
+SET @p = 'alice';
+EXECUTE stmt_vpk USING @p;
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo # Fast path with string key
+SET @p = 'bob';
+EXECUTE stmt_vpk USING @p;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after VARCHAR PK fast path: $hits_delta
+
+DEALLOCATE PREPARE stmt_vpk;
+DROP TABLE t_vpk;
+
+--echo # -------------------------------------------------------
+--echo # 14. Composite PK — NULL in second param triggers G7
+--echo #     Verifies G7 checks ALL params, not just the first.
+--echo # -------------------------------------------------------
+
+PREPARE stmt_cnull FROM 'SELECT * FROM t_comp WHERE pk1 = ? AND pk2 = ?';
+
+--echo # Admission
+SET @p1 = 1;
+SET @p2 = 1;
+EXECUTE stmt_cnull USING @p1, @p2;
+
+--let $fb_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+--echo # Second param NULL — should fallback (G7)
+SET @p1 = 1;
+SET @p2 = NULL;
+EXECUTE stmt_cnull USING @p1, @p2;
+
+--let $fb_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $fb_delta = `SELECT $fb_after - $fb_before`
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo fallback delta after NULL in second param: $fb_delta
+--echo hits delta after NULL in second param: $hits_delta
+
+--echo # Non-NULL params — should hit (state stays HOT)
+--let $hits_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @p1 = 1;
+SET @p2 = 2;
+EXECUTE stmt_cnull USING @p1, @p2;
+--let $hits_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta2 = `SELECT $hits_after2 - $hits_before2`
+--echo hits delta after recovery from NULL: $hits_delta2
+
+DEALLOCATE PREPARE stmt_cnull;
+
+--echo # -------------------------------------------------------
+--echo # 15. Multiple PS on same table — independent fast paths
+--echo # -------------------------------------------------------
+
+PREPARE stmt_m1 FROM 'SELECT * FROM t1 WHERE id = ?';
+PREPARE stmt_m2 FROM 'SELECT * FROM t1 WHERE uk = ?';
+
+--echo # Admission for both
+SET @p = 1;
+EXECUTE stmt_m1 USING @p;
+SET @p = 10;
+EXECUTE stmt_m2 USING @p;
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo # Both should independently hit fast path
+SET @p = 2;
+EXECUTE stmt_m1 USING @p;
+SET @p = 20;
+EXECUTE stmt_m2 USING @p;
+
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after both PS fast paths: $hits_delta
+
+DEALLOCATE PREPARE stmt_m1;
+DEALLOCATE PREPARE stmt_m2;
+
+--echo # -------------------------------------------------------
+--echo # 16. SELECT specific columns — output correctness
+--echo # -------------------------------------------------------
+
+PREPARE stmt_cols FROM 'SELECT val, uk FROM t1 WHERE id = ?';
+
+--echo # Admission
+SET @p = 1;
+EXECUTE stmt_cols USING @p;
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo # Fast path with specific columns
+SET @p = 2;
+EXECUTE stmt_cols USING @p;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after SELECT specific columns: $hits_delta
+
+DEALLOCATE PREPARE stmt_cols;
+
+--echo # -------------------------------------------------------
+--echo # 17. Transaction rollback — fast path sees current snapshot
+--echo # -------------------------------------------------------
+
+PREPARE stmt_tx FROM 'SELECT * FROM t1 WHERE id = ?';
+
+--echo # Admission
+SET @p = 1;
+EXECUTE stmt_tx USING @p;
+
+START TRANSACTION;
+INSERT INTO t1 VALUES (5, 'temp', 50);
+
+--echo # Fast path within transaction — should see inserted row
+SET @p = 5;
+EXECUTE stmt_tx USING @p;
+
+ROLLBACK;
+
+--echo # Fast path after rollback — should see empty (row gone)
+SET @p = 5;
+EXECUTE stmt_tx USING @p;
+
+--echo # Verify normal row still visible after rollback
+SET @p = 1;
+EXECUTE stmt_tx USING @p;
+
+DEALLOCATE PREPARE stmt_tx;
+
+--echo # -------------------------------------------------------
+--echo # 18. Final counter summary
+--echo # -------------------------------------------------------
+
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+DROP TABLE t_comp;
+DROP TABLE t1;
+
+--echo #
+--echo # End of Phase 3 fast path tests
+--echo #
