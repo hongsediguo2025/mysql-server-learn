@@ -1,0 +1,310 @@
+--echo #
+--echo # Phase 2 edge-case tests for ps_point_plan_cache admission
+--echo # Covers boundary conditions, exception scenarios, and
+--echo # state-machine transitions not exercised by the base test.
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  val VARCHAR(50),
+  uk INT NOT NULL,
+  UNIQUE KEY idx_uk (uk)
+);
+INSERT INTO t1 VALUES (1, 'alpha', 100),
+                      (2, 'beta',  200),
+                      (3, 'gamma', 300);
+
+CREATE TABLE t_empty (
+  id INT PRIMARY KEY,
+  val VARCHAR(50)
+);
+
+CREATE TABLE t_single (
+  id INT PRIMARY KEY,
+  val VARCHAR(50)
+);
+INSERT INTO t_single VALUES (1, 'only_row');
+
+CREATE TABLE t_nullable_uk (
+  id INT PRIMARY KEY,
+  nuk INT,
+  val VARCHAR(50),
+  UNIQUE KEY idx_nuk (nuk)
+);
+INSERT INTO t_nullable_uk VALUES (1, 100, 'a'), (2, NULL, 'b'), (3, 300, 'c');
+
+FLUSH STATUS;
+
+--echo # -------------------------------------------------------
+--echo # 1. Empty table — extract_const_tables marks it JT_SYSTEM
+--echo #    (stats.records=0 + HA_STATS_RECORDS_IS_EXACT for empty).
+--echo #    Optimizer short-circuits zero rows; hook not reached.
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_empty FROM 'SELECT * FROM t_empty WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_empty USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after empty table: $adm_delta
+DEALLOCATE PREPARE stmt_empty;
+
+--echo # -------------------------------------------------------
+--echo # 2. Single-row table — InnoDB uses estimated stats
+--echo #    (no HA_STATS_RECORDS_IS_EXACT), so extract_const_tables
+--echo #    does not trigger.  extract_func_dependent_tables
+--echo #    handles it as JT_CONST.  Admission SUCCEEDS.
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_single FROM 'SELECT * FROM t_single WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_single USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after single-row table: $adm_delta
+DEALLOCATE PREPARE stmt_single;
+
+--echo # -------------------------------------------------------
+--echo # 3. NULL parameter — read_const() detects
+--echo #    impossible_null_ref(), returns no row.
+--echo #    Optimizer sets zero_result_cause and short-circuits;
+--echo #    admission hook never reached.  State stays COLD.
+--echo #    On second execute with valid value, admission happens.
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_null FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = NULL;
+EXECUTE stmt_null USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after NULL param: $adm_delta
+
+# Second execute with valid value — state is still COLD, admission now succeeds
+--let $adm_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @p = 1;
+EXECUTE stmt_null USING @p;
+--let $adm_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta2 = `SELECT $adm_after2 - $adm_before2`
+--echo admissions delta after recovery with valid param: $adm_delta2
+DEALLOCATE PREPARE stmt_null;
+
+--echo # -------------------------------------------------------
+--echo # 4. Nullable unique key — admission should succeed
+--echo #    because the key IS unique and param matches.
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_nuk FROM 'SELECT * FROM t_nullable_uk WHERE nuk = ?';
+SET @p = 100;
+EXECUTE stmt_nuk USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after nullable UK: $adm_delta
+DEALLOCATE PREPARE stmt_nuk;
+
+--echo # -------------------------------------------------------
+--echo # 5. Sysvar OFF at PREPARE time — never classified COLD,
+--echo #    no admission possible.
+--echo # -------------------------------------------------------
+
+SET @saved_ps_pc = @@session.ps_point_plan_cache;
+SET SESSION ps_point_plan_cache = OFF;
+
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_off FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_off USING @p;
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo cold delta with sysvar OFF: $cold_delta
+--echo admissions delta with sysvar OFF: $adm_delta
+DEALLOCATE PREPARE stmt_off;
+
+SET SESSION ps_point_plan_cache = @saved_ps_pc;
+
+--echo # -------------------------------------------------------
+--echo # 6. Sysvar ON at PREPARE, OFF at EXECUTE —
+--echo #    classified COLD but admission hook skipped.
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_toggle FROM 'SELECT * FROM t1 WHERE id = ?';
+
+SET SESSION ps_point_plan_cache = OFF;
+SET @p = 1;
+EXECUTE stmt_toggle USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta with sysvar toggled OFF before execute: $adm_delta
+
+# Turn it back on and execute again — state should still be COLD,
+# admission should now succeed.
+SET SESSION ps_point_plan_cache = ON;
+--let $adm_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @p = 2;
+EXECUTE stmt_toggle USING @p;
+--let $adm_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta2 = `SELECT $adm_after2 - $adm_before2`
+--echo admissions delta after re-enabling sysvar: $adm_delta2
+
+DEALLOCATE PREPARE stmt_toggle;
+
+--echo # -------------------------------------------------------
+--echo # 7. DDL triggers reprepare — state resets correctly.
+--echo #    PREPARE -> EXECUTE (HOT) -> ALTER TABLE -> EXECUTE
+--echo #    (reprepare -> re-classify -> re-admit or NEVER)
+--echo # -------------------------------------------------------
+
+CREATE TABLE t_ddl (
+  id INT PRIMARY KEY,
+  val VARCHAR(50)
+);
+INSERT INTO t_ddl VALUES (1, 'before_alter'), (2, 'row2'), (3, 'row3');
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_ddl FROM 'SELECT * FROM t_ddl WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_ddl USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after first execute (before DDL): $adm_delta
+
+# DDL: add a column — triggers reprepare on next execute
+ALTER TABLE t_ddl ADD COLUMN extra INT DEFAULT 0;
+
+--let $adm_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @p = 1;
+EXECUTE stmt_ddl USING @p;
+--let $adm_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta2 = `SELECT $adm_after2 - $adm_before2`
+--echo admissions delta after DDL + reprepare execute: $adm_delta2
+
+DEALLOCATE PREPARE stmt_ddl;
+DROP TABLE t_ddl;
+
+--echo # -------------------------------------------------------
+--echo # 8. DEALLOCATE + re-PREPARE same query — state resets,
+--echo #    new PS gets fresh COLD classification and admission.
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_reuse FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_reuse USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta first prepare: $adm_delta
+
+DEALLOCATE PREPARE stmt_reuse;
+
+--let $adm_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_reuse FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt_reuse USING @p;
+--let $adm_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta2 = `SELECT $adm_after2 - $adm_before2`
+--echo admissions delta re-prepare: $adm_delta2
+
+DEALLOCATE PREPARE stmt_reuse;
+
+--echo # -------------------------------------------------------
+--echo # 9. Multiple EXECUTEs with varying param types —
+--echo #    INT then STRING for INT column.
+--echo #    Admission happens on first EXECUTE; subsequent EXECUTEs
+--echo #    are fine (HOT state, different param types).
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_types FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_types USING @p;
+SET @p = '2';
+EXECUTE stmt_types USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after INT then STRING executes: $adm_delta
+DEALLOCATE PREPARE stmt_types;
+
+--echo # -------------------------------------------------------
+--echo # 10. NEVER state persists — after a failed admission
+--echo #     (non-unique index), further EXECUTEs don't re-try.
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_never FROM 'SELECT * FROM t1 WHERE val = ?';
+SET @p = 'alpha';
+EXECUTE stmt_never USING @p;
+EXECUTE stmt_never USING @p;
+EXECUTE stmt_never USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after 3 executes on NEVER stmt: $adm_delta
+DEALLOCATE PREPARE stmt_never;
+
+--echo # -------------------------------------------------------
+--echo # 11. Boundary: MAX_INT PK lookup — admission succeeds
+--echo # -------------------------------------------------------
+
+INSERT INTO t1 VALUES (2147483647, 'max_int', 999);
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_maxint FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 2147483647;
+EXECUTE stmt_maxint USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after MAX_INT PK: $adm_delta
+DEALLOCATE PREPARE stmt_maxint;
+DELETE FROM t1 WHERE id = 2147483647;
+
+--echo # -------------------------------------------------------
+--echo # 12. Non-existent row — const table read finds no row,
+--echo #     optimizer sets zero_result_cause, hook skipped.
+--echo #     State stays COLD.  Second execute with existing row
+--echo #     triggers admission.
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_norow FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 999;
+EXECUTE stmt_norow USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after non-existent row: $adm_delta
+
+# Recovery: second execute with existing row — COLD -> HOT
+--let $adm_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @p = 1;
+EXECUTE stmt_norow USING @p;
+--let $adm_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta2 = `SELECT $adm_after2 - $adm_before2`
+--echo admissions delta after recovery with existing row: $adm_delta2
+DEALLOCATE PREPARE stmt_norow;
+
+--echo # -------------------------------------------------------
+--echo # 13. Final counter summary
+--echo # -------------------------------------------------------
+
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+
+DROP TABLE t_nullable_uk;
+DROP TABLE t_single;
+DROP TABLE t_empty;
+DROP TABLE t1;
+
+--echo #
+--echo # End of Phase 2 edge-case admission tests
+--echo #

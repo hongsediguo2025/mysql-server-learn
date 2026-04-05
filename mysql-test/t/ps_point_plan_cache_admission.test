@@ -1,0 +1,245 @@
+--echo #
+--echo # Phase 2 test: ps_point_plan_cache admission logic
+--echo # Verifies COLD -> HOT / COLD -> NEVER transitions after
+--echo # first normal optimization.
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup: schema for admission testing
+--echo # -------------------------------------------------------
+
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  val VARCHAR(50),
+  uk INT NOT NULL,
+  name VARCHAR(50),
+  UNIQUE KEY idx_uk (uk),
+  KEY idx_name (name)
+);
+INSERT INTO t1 VALUES (1, 'alpha', 100, 'Alice'),
+                      (2, 'beta', 200, 'Bob'),
+                      (3, 'gamma', 300, 'Charlie');
+
+CREATE TABLE t_comp (
+  pk1 INT,
+  pk2 INT,
+  val INT,
+  PRIMARY KEY (pk1, pk2)
+);
+INSERT INTO t_comp VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+
+CREATE TABLE t_comp_uk (
+  id INT PRIMARY KEY,
+  uk1 INT NOT NULL,
+  uk2 INT NOT NULL,
+  val INT,
+  UNIQUE KEY idx_uk12 (uk1, uk2)
+);
+INSERT INTO t_comp_uk VALUES (1, 10, 100, 1000), (2, 20, 200, 2000), (3, 30, 300, 3000);
+
+FLUSH STATUS;
+
+--echo # -------------------------------------------------------
+--echo # 1. PK point select — admission SUCCESS
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_pk FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_pk USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after PK first execute: $adm_delta
+
+--echo # Second execute should NOT re-admit
+--let $adm_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @p = 2;
+EXECUTE stmt_pk USING @p;
+--let $adm_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta2 = `SELECT $adm_after2 - $adm_before2`
+--echo admissions delta after PK second execute: $adm_delta2
+
+--echo # Third execute — verify results are still correct
+SET @p = 3;
+EXECUTE stmt_pk USING @p;
+
+DEALLOCATE PREPARE stmt_pk;
+
+--echo # -------------------------------------------------------
+--echo # 2. UK point select — admission SUCCESS
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_uk FROM 'SELECT * FROM t1 WHERE uk = ?';
+SET @p = 200;
+EXECUTE stmt_uk USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after UK first execute: $adm_delta
+
+DEALLOCATE PREPARE stmt_uk;
+
+--echo # -------------------------------------------------------
+--echo # 3. Composite PK — admission SUCCESS
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_cpk FROM 'SELECT * FROM t_comp WHERE pk1 = ? AND pk2 = ?';
+SET @p1 = 1;
+SET @p2 = 10;
+EXECUTE stmt_cpk USING @p1, @p2;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after composite PK first execute: $adm_delta
+
+DEALLOCATE PREPARE stmt_cpk;
+
+--echo # -------------------------------------------------------
+--echo # 4. Composite UK — admission SUCCESS
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_cuk FROM 'SELECT * FROM t_comp_uk WHERE uk1 = ? AND uk2 = ?';
+SET @p1 = 20;
+SET @p2 = 200;
+EXECUTE stmt_cuk USING @p1, @p2;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after composite UK first execute: $adm_delta
+
+DEALLOCATE PREPARE stmt_cuk;
+
+--echo # -------------------------------------------------------
+--echo # 5. Composite PK reversed WHERE order — admission SUCCESS
+--echo #    Tests parameter reordering in ps_point_plan_admit().
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_cpk_rev FROM 'SELECT * FROM t_comp WHERE pk2 = ? AND pk1 = ?';
+SET @p1 = 10;
+SET @p2 = 1;
+EXECUTE stmt_cpk_rev USING @p1, @p2;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after reversed PK first execute: $adm_delta
+
+DEALLOCATE PREPARE stmt_cpk_rev;
+
+--echo # -------------------------------------------------------
+--echo # 6. Composite UK reversed WHERE order — admission SUCCESS
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_cuk_rev FROM 'SELECT * FROM t_comp_uk WHERE uk2 = ? AND uk1 = ?';
+SET @p1 = 200;
+SET @p2 = 20;
+EXECUTE stmt_cuk_rev USING @p1, @p2;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after reversed UK first execute: $adm_delta
+
+DEALLOCATE PREPARE stmt_cuk_rev;
+
+--echo # -------------------------------------------------------
+--echo # 7. Table alias — admission SUCCESS
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_alias FROM 'SELECT * FROM t1 AS a WHERE a.id = ?';
+SET @p = 1;
+EXECUTE stmt_alias USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after alias first execute: $adm_delta
+
+DEALLOCATE PREPARE stmt_alias;
+
+--echo # -------------------------------------------------------
+--echo # 8. Non-SELECT * (partial column list) — admission SUCCESS
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_partial FROM 'SELECT id, val FROM t1 WHERE uk = ?';
+SET @p = 100;
+EXECUTE stmt_partial USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after partial columns first execute: $adm_delta
+
+DEALLOCATE PREPARE stmt_partial;
+
+--echo # -------------------------------------------------------
+--echo # 9. Non-unique index — admission FAILURE (not JT_CONST)
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_nonuk FROM 'SELECT * FROM t1 WHERE name = ?';
+SET @p = 'Alice';
+EXECUTE stmt_nonuk USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after non-unique index execute: $adm_delta
+
+DEALLOCATE PREPARE stmt_nonuk;
+
+--echo # -------------------------------------------------------
+--echo # 10. No index column — admission FAILURE (full table scan)
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_noindex FROM 'SELECT * FROM t1 WHERE val = ?';
+SET @p = 'alpha';
+EXECUTE stmt_noindex USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after no-index execute: $adm_delta
+
+DEALLOCATE PREPARE stmt_noindex;
+
+--echo # -------------------------------------------------------
+--echo # 11. Partial composite key — admission FAILURE
+--echo #     (key_parts != param_count)
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_partial_cpk FROM 'SELECT * FROM t_comp WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_partial_cpk USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after partial composite key execute: $adm_delta
+
+DEALLOCATE PREPARE stmt_partial_cpk;
+
+--echo # -------------------------------------------------------
+--echo # 12. PK + extra non-indexed column — admission FAILURE
+--echo #     (residual condition or key_parts != param_count)
+--echo # -------------------------------------------------------
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_pk_extra FROM 'SELECT * FROM t1 WHERE id = ? AND val = ?';
+SET @p1 = 1;
+SET @p2 = 'alpha';
+EXECUTE stmt_pk_extra USING @p1, @p2;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after PK+extra execute: $adm_delta
+
+DEALLOCATE PREPARE stmt_pk_extra;
+
+--echo # -------------------------------------------------------
+--echo # 13. Final counter summary
+--echo # -------------------------------------------------------
+
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+DROP TABLE t_comp_uk;
+DROP TABLE t_comp;
+DROP TABLE t1;
+
+--echo #
+--echo # End of Phase 2 admission tests
+--echo #

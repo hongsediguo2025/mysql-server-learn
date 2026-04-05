@@ -1,0 +1,245 @@
+#
+# Phase 2 edge-case tests for ps_point_plan_cache admission
+# Covers boundary conditions, exception scenarios, and
+# state-machine transitions not exercised by the base test.
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+val VARCHAR(50),
+uk INT NOT NULL,
+UNIQUE KEY idx_uk (uk)
+);
+INSERT INTO t1 VALUES (1, 'alpha', 100),
+(2, 'beta',  200),
+(3, 'gamma', 300);
+CREATE TABLE t_empty (
+id INT PRIMARY KEY,
+val VARCHAR(50)
+);
+CREATE TABLE t_single (
+id INT PRIMARY KEY,
+val VARCHAR(50)
+);
+INSERT INTO t_single VALUES (1, 'only_row');
+CREATE TABLE t_nullable_uk (
+id INT PRIMARY KEY,
+nuk INT,
+val VARCHAR(50),
+UNIQUE KEY idx_nuk (nuk)
+);
+INSERT INTO t_nullable_uk VALUES (1, 100, 'a'), (2, NULL, 'b'), (3, 300, 'c');
+FLUSH STATUS;
+# -------------------------------------------------------
+# 1. Empty table — extract_const_tables marks it JT_SYSTEM
+#    (stats.records=0 + HA_STATS_RECORDS_IS_EXACT for empty).
+#    Optimizer short-circuits zero rows; hook not reached.
+# -------------------------------------------------------
+PREPARE stmt_empty FROM 'SELECT * FROM t_empty WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_empty USING @p;
+id	val
+admissions delta after empty table: 0
+DEALLOCATE PREPARE stmt_empty;
+# -------------------------------------------------------
+# 2. Single-row table — InnoDB uses estimated stats
+#    (no HA_STATS_RECORDS_IS_EXACT), so extract_const_tables
+#    does not trigger.  extract_func_dependent_tables
+#    handles it as JT_CONST.  Admission SUCCEEDS.
+# -------------------------------------------------------
+PREPARE stmt_single FROM 'SELECT * FROM t_single WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_single USING @p;
+id	val
+1	only_row
+admissions delta after single-row table: 1
+DEALLOCATE PREPARE stmt_single;
+# -------------------------------------------------------
+# 3. NULL parameter — read_const() detects
+#    impossible_null_ref(), returns no row.
+#    Optimizer sets zero_result_cause and short-circuits;
+#    admission hook never reached.  State stays COLD.
+#    On second execute with valid value, admission happens.
+# -------------------------------------------------------
+PREPARE stmt_null FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = NULL;
+EXECUTE stmt_null USING @p;
+id	val	uk
+admissions delta after NULL param: 0
+SET @p = 1;
+EXECUTE stmt_null USING @p;
+id	val	uk
+1	alpha	100
+admissions delta after recovery with valid param: 1
+DEALLOCATE PREPARE stmt_null;
+# -------------------------------------------------------
+# 4. Nullable unique key — admission should succeed
+#    because the key IS unique and param matches.
+# -------------------------------------------------------
+PREPARE stmt_nuk FROM 'SELECT * FROM t_nullable_uk WHERE nuk = ?';
+SET @p = 100;
+EXECUTE stmt_nuk USING @p;
+id	nuk	val
+1	100	a
+admissions delta after nullable UK: 1
+DEALLOCATE PREPARE stmt_nuk;
+# -------------------------------------------------------
+# 5. Sysvar OFF at PREPARE time — never classified COLD,
+#    no admission possible.
+# -------------------------------------------------------
+SET @saved_ps_pc = @@session.ps_point_plan_cache;
+SET SESSION ps_point_plan_cache = OFF;
+PREPARE stmt_off FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_off USING @p;
+id	val	uk
+1	alpha	100
+cold delta with sysvar OFF: 0
+admissions delta with sysvar OFF: 0
+DEALLOCATE PREPARE stmt_off;
+SET SESSION ps_point_plan_cache = @saved_ps_pc;
+# -------------------------------------------------------
+# 6. Sysvar ON at PREPARE, OFF at EXECUTE —
+#    classified COLD but admission hook skipped.
+# -------------------------------------------------------
+PREPARE stmt_toggle FROM 'SELECT * FROM t1 WHERE id = ?';
+SET SESSION ps_point_plan_cache = OFF;
+SET @p = 1;
+EXECUTE stmt_toggle USING @p;
+id	val	uk
+1	alpha	100
+admissions delta with sysvar toggled OFF before execute: 0
+SET SESSION ps_point_plan_cache = ON;
+SET @p = 2;
+EXECUTE stmt_toggle USING @p;
+id	val	uk
+2	beta	200
+admissions delta after re-enabling sysvar: 1
+DEALLOCATE PREPARE stmt_toggle;
+# -------------------------------------------------------
+# 7. DDL triggers reprepare — state resets correctly.
+#    PREPARE -> EXECUTE (HOT) -> ALTER TABLE -> EXECUTE
+#    (reprepare -> re-classify -> re-admit or NEVER)
+# -------------------------------------------------------
+CREATE TABLE t_ddl (
+id INT PRIMARY KEY,
+val VARCHAR(50)
+);
+INSERT INTO t_ddl VALUES (1, 'before_alter'), (2, 'row2'), (3, 'row3');
+PREPARE stmt_ddl FROM 'SELECT * FROM t_ddl WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_ddl USING @p;
+id	val
+1	before_alter
+admissions delta after first execute (before DDL): 1
+ALTER TABLE t_ddl ADD COLUMN extra INT DEFAULT 0;
+SET @p = 1;
+EXECUTE stmt_ddl USING @p;
+id	val	extra
+1	before_alter	0
+admissions delta after DDL + reprepare execute: 1
+DEALLOCATE PREPARE stmt_ddl;
+DROP TABLE t_ddl;
+# -------------------------------------------------------
+# 8. DEALLOCATE + re-PREPARE same query — state resets,
+#    new PS gets fresh COLD classification and admission.
+# -------------------------------------------------------
+PREPARE stmt_reuse FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_reuse USING @p;
+id	val	uk
+1	alpha	100
+admissions delta first prepare: 1
+DEALLOCATE PREPARE stmt_reuse;
+PREPARE stmt_reuse FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt_reuse USING @p;
+id	val	uk
+2	beta	200
+admissions delta re-prepare: 1
+DEALLOCATE PREPARE stmt_reuse;
+# -------------------------------------------------------
+# 9. Multiple EXECUTEs with varying param types —
+#    INT then STRING for INT column.
+#    Admission happens on first EXECUTE; subsequent EXECUTEs
+#    are fine (HOT state, different param types).
+# -------------------------------------------------------
+PREPARE stmt_types FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_types USING @p;
+id	val	uk
+1	alpha	100
+SET @p = '2';
+EXECUTE stmt_types USING @p;
+id	val	uk
+2	beta	200
+admissions delta after INT then STRING executes: 1
+DEALLOCATE PREPARE stmt_types;
+# -------------------------------------------------------
+# 10. NEVER state persists — after a failed admission
+#     (non-unique index), further EXECUTEs don't re-try.
+# -------------------------------------------------------
+PREPARE stmt_never FROM 'SELECT * FROM t1 WHERE val = ?';
+SET @p = 'alpha';
+EXECUTE stmt_never USING @p;
+id	val	uk
+1	alpha	100
+EXECUTE stmt_never USING @p;
+id	val	uk
+1	alpha	100
+EXECUTE stmt_never USING @p;
+id	val	uk
+1	alpha	100
+admissions delta after 3 executes on NEVER stmt: 0
+DEALLOCATE PREPARE stmt_never;
+# -------------------------------------------------------
+# 11. Boundary: MAX_INT PK lookup — admission succeeds
+# -------------------------------------------------------
+INSERT INTO t1 VALUES (2147483647, 'max_int', 999);
+PREPARE stmt_maxint FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 2147483647;
+EXECUTE stmt_maxint USING @p;
+id	val	uk
+2147483647	max_int	999
+admissions delta after MAX_INT PK: 1
+DEALLOCATE PREPARE stmt_maxint;
+DELETE FROM t1 WHERE id = 2147483647;
+# -------------------------------------------------------
+# 12. Non-existent row — const table read finds no row,
+#     optimizer sets zero_result_cause, hook skipped.
+#     State stays COLD.  Second execute with existing row
+#     triggers admission.
+# -------------------------------------------------------
+PREPARE stmt_norow FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 999;
+EXECUTE stmt_norow USING @p;
+id	val	uk
+admissions delta after non-existent row: 0
+SET @p = 1;
+EXECUTE stmt_norow USING @p;
+id	val	uk
+1	alpha	100
+admissions delta after recovery with existing row: 1
+DEALLOCATE PREPARE stmt_norow;
+# -------------------------------------------------------
+# 13. Final counter summary
+# -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admissions	11
+Ps_point_plan_cache_cold_classifications	13
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	0
+Ps_point_plan_cache_invalidations	0
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t_nullable_uk;
+DROP TABLE t_single;
+DROP TABLE t_empty;
+DROP TABLE t1;
+#
+# End of Phase 2 edge-case admission tests
+#

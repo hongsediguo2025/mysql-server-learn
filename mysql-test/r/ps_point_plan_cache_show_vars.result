@@ -334,14 +334,14 @@ id	val	uk
 DEALLOCATE PREPARE ps_toggle;
 # -------------------------------------------------------
 # 13. Counter verification after all operations
-#     Phase 1 cold_classifications will be non-zero (10) because
-#     point-select PREPARE statements above are classified COLD.
-#     All other counters (admissions, hits, invalidations,
-#     fallback_runtime) remain 0 — Phase 2+ not yet active.
+#     cold_classifications = 10 (COLD candidates from PREPARE).
+#     admissions = 9 (COLD statements that passed admission on
+#     first EXECUTE and transitioned to HOT). Phase 2 active.
+#     hits/invalidations/fallback_runtime remain 0 (Phase 3+).
 # -------------------------------------------------------
 SHOW STATUS LIKE 'Ps_point_plan_cache%';
 Variable_name	Value
-Ps_point_plan_cache_admissions	0
+Ps_point_plan_cache_admissions	9
 Ps_point_plan_cache_cold_classifications	10
 Ps_point_plan_cache_fallback_runtime	0
 Ps_point_plan_cache_hits	0

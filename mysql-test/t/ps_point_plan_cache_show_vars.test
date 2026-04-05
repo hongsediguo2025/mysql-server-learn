@@ -282,10 +282,10 @@ DEALLOCATE PREPARE ps_toggle;
 
 --echo # -------------------------------------------------------
 --echo # 13. Counter verification after all operations
---echo #     Phase 1 cold_classifications will be non-zero (10) because
---echo #     point-select PREPARE statements above are classified COLD.
---echo #     All other counters (admissions, hits, invalidations,
---echo #     fallback_runtime) remain 0 — Phase 2+ not yet active.
+--echo #     cold_classifications = 10 (COLD candidates from PREPARE).
+--echo #     admissions = 9 (COLD statements that passed admission on
+--echo #     first EXECUTE and transitioned to HOT). Phase 2 active.
+--echo #     hits/invalidations/fallback_runtime remain 0 (Phase 3+).
 --echo # -------------------------------------------------------
 
 SHOW STATUS LIKE 'Ps_point_plan_cache%';

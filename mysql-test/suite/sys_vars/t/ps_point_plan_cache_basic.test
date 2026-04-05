@@ -1,0 +1,45 @@
+SET @start_global_value = @@global.ps_point_plan_cache;
+SELECT @start_global_value;
+
+#
+# exists as global and session
+#
+select @@global.ps_point_plan_cache;
+select @@session.ps_point_plan_cache;
+show global variables like 'ps_point_plan_cache';
+show session variables like 'ps_point_plan_cache';
+--disable_warnings
+select * from performance_schema.global_variables where variable_name='ps_point_plan_cache';
+select * from performance_schema.session_variables where variable_name='ps_point_plan_cache';
+--enable_warnings
+
+#
+# show that it's writable
+#
+set global ps_point_plan_cache=1;
+select @@global.ps_point_plan_cache;
+set session ps_point_plan_cache=1;
+select @@session.ps_point_plan_cache;
+set global ps_point_plan_cache=0;
+select @@global.ps_point_plan_cache;
+set session ps_point_plan_cache=0;
+select @@session.ps_point_plan_cache;
+set session ps_point_plan_cache=on;
+select @@session.ps_point_plan_cache;
+set session ps_point_plan_cache=off;
+select @@session.ps_point_plan_cache;
+set session ps_point_plan_cache=default;
+select @@session.ps_point_plan_cache;
+
+#
+# incorrect assignments
+#
+--error ER_WRONG_TYPE_FOR_VAR
+set global ps_point_plan_cache=1.1;
+--error ER_WRONG_TYPE_FOR_VAR
+set global ps_point_plan_cache=1e1;
+--error ER_WRONG_VALUE_FOR_VAR
+set session ps_point_plan_cache="foobar";
+
+SET @@global.ps_point_plan_cache = @start_global_value;
+SELECT @@global.ps_point_plan_cache;

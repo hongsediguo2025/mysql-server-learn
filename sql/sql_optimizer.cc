@@ -92,6 +92,7 @@
 #include "sql/opt_trace_context.h"
 #include "sql/parse_tree_node_base.h"
 #include "sql/parser_yystype.h"
+#include "sql/ps_point_plan_cache.h"
 #include "sql/query_options.h"
 #include "sql/query_result.h"
 #include "sql/range_optimizer/partition_pruning.h"
@@ -105,6 +106,7 @@
 #include "sql/sql_error.h"
 #include "sql/sql_join_buffer.h"  // JOIN_CACHE
 #include "sql/sql_planner.h"      // calculate_condition_filter
+#include "sql/sql_prepare.h"
 #include "sql/sql_test.h"         // print_where
 #include "sql/sql_tmp_table.h"
 #include "sql/system_variables.h"
@@ -1061,6 +1063,41 @@ bool JOIN::optimize(bool finalize_access_paths) {
     has finalized the 'plan'.
   */
   if (push_to_engines()) return true;
+
+  /*
+    ps_point_plan_cache Phase 2: admission hook.
+
+    After the first normal optimization of a COLD prepared statement,
+    inspect the plan to decide if it qualifies as a cacheable
+    single-table unique-key point lookup.
+
+    Placement rationale: must be after push_to_engines() (which
+    finalizes qep_tab, ref access, and access types) and before
+    set_plan_state(PLAN_READY) (after which the plan is visible).
+
+    If zero_result_cause was set (e.g. "no matching row in const
+    table" due to non-existent PK value or NULL parameter), the
+    optimizer jumped to setup_subq_exit before reaching here.
+    The PS stays COLD and can be admitted on a future EXECUTE.
+
+    State transitions:
+      COLD + admit pass  -> HOT   (template populated)
+      COLD + admit fail  -> NEVER (permanently rejected)
+      sysvar OFF         -> no-op (stays COLD for later retry)
+  */
+  if (thd->variables.ps_point_plan_cache) {
+    Sql_cmd *sql_cmd = thd->lex->m_sql_cmd;
+    Prepared_statement *ps_owner =
+        (sql_cmd != nullptr) ? sql_cmd->owner() : nullptr;
+    if (ps_owner != nullptr &&
+        ps_owner->ps_point_plan_state() == PsPointPlanState::COLD) {
+      if (ps_point_plan_can_admit(ps_owner, this)) {
+        ps_point_plan_admit(thd, ps_owner, this);
+      } else {
+        ps_owner->set_ps_point_plan_state(PsPointPlanState::NEVER);
+      }
+    }
+  }
 
   // Make plan visible for EXPLAIN
   set_plan_state(PLAN_READY);

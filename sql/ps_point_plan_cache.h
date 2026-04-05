@@ -58,12 +58,30 @@ class KEY;
 struct TABLE;
 
 /**
-  State of the per-PS point plan cache slot.
+  State machine for the per-PS point plan cache slot.
 
-  NEVER   - permanently not a candidate (fast bypass on every execute).
-  COLD    - static shape matches; awaiting first execution for admission.
-  HOT     - template cached; fast path may be attempted.
-  INVALID - template invalidated by structural change; awaits reprepare.
+  @verbatim
+    PREPARE                         first EXECUTE
+    ┌───────────┐  classify OK  ┌──────────────────────┐  admit OK
+    │  (new PS) ├──────────────>│        COLD          ├────────────> HOT
+    └─────┬─────┘               └──────────┬───────────┘              │
+          │                                │ admit fail               │
+          │ classify fail                  v                          │ DDL /
+          └─────────────────────────> NEVER                           │ reprepare
+                                        ^                             │
+                                        └─────────────── INVALID <────┘
+  @endverbatim
+
+  - NEVER   — permanently not a candidate; fast bypass on every EXECUTE.
+              Set when static classification fails, or when the first
+              normal optimization produces a plan that does not match
+              the expected point-query shape.
+  - COLD    — static WHERE shape matches; awaiting first EXECUTE to
+              inspect the optimizer output and decide admission.
+  - HOT     — template successfully cached; the fast path (Phase 3+)
+              may be attempted on subsequent EXECUTEs.
+  - INVALID — template invalidated by a structural change (DDL, etc.);
+              next EXECUTE triggers reprepare, which re-classifies.
 */
 enum class PsPointPlanState : uchar {
   NEVER = 0,
@@ -98,20 +116,71 @@ static constexpr uint PS_PC_MAX_PARAMS = 4;
   Phase 1-5 use only params[0] / field_indices[0] with param_count == 1.
 */
 struct PsPointPlanTemplate {
+  /*
+    --- Phase 1 fields (populated by ps_point_plan_classify) ---
+    Filled during PREPARE by inspecting the WHERE-clause AST.
+    These capture the "shape" of the query before any optimization.
+  */
+
+  /// The single leaf Table_ref from the Query_block.
   Table_ref *table_ref{nullptr};
+
+  /// Determines which fast-path builder to invoke (Phase 3+).
   PsCachedPlanType plan_type{PsCachedPlanType::POINT_EQ_REF};
 
+  /// Number of ? parameters found in WHERE equalities.
   uint param_count{0};
+
+  /**
+    Stable Item_param pointers from the parse tree.  After Phase 1
+    these are in WHERE-clause order; after Phase 2 admission they are
+    reordered to key-part order (matching the optimizer's ref.items[]).
+
+    Pointer identity is stable across executions because v1 excludes
+    CTE/derived-table scenarios that clone Item_param.
+  */
   Item_param *params[PS_PC_MAX_PARAMS]{};
+
+  /**
+    0-based field ordinal within TABLE for each parameter's column.
+    After Phase 2 admission, reordered to key-part order and filled
+    from KEY_PART_INFO::fieldnr - 1 (1-based to 0-based conversion).
+  */
   uint field_indices[PS_PC_MAX_PARAMS]{};
+
+  /**
+    Snapshot of each parameter's actual data type at first EXECUTE.
+    Populated during Phase 2 admission from Item_param::data_type_actual().
+    Used by Phase 3+ fast-path to detect type-change invalidation.
+  */
   enum_field_types actual_types[PS_PC_MAX_PARAMS]{};
+
+  /// Whether each parameter's actual integer value is unsigned.
   bool unsigned_actuals[PS_PC_MAX_PARAMS]{};
 
+  /*
+    --- Phase 2 fields (populated by ps_point_plan_admit) ---
+    Filled during the first EXECUTE by inspecting the optimizer's
+    QEP_TAB / Index_lookup output.  These are stable plan metadata
+    that do not change across executions of the same PS.
+  */
+
+  /// Index number within TABLE::key_info[].
   uint keyno{MAX_KEY};
+
+  /// Number of key parts used in the ref lookup.
   uint key_parts{0};
+
+  /// Total serialized key length in bytes.
   uint key_length{0};
+
+  /// Bitmask of key parts that reject NULL (from Index_lookup).
   key_part_map null_rejecting{0};
+
+  /// Optimizer's best_read cost estimate for the plan.
   double best_read{0.0};
+
+  /// Optimizer's best_rowcount estimate (cast from ha_rows).
   double best_rowcount{1.0};
 };
 
@@ -151,12 +220,50 @@ bool ps_point_plan_runtime_guard(THD *thd, Prepared_statement *stmt,
 /**
   Check whether the first normal optimization result qualifies for
   admission into the HOT state.
+
+  Called from the admission hook in JOIN::optimize() after
+  push_to_engines() succeeds, only for COLD statements when the
+  ps_point_plan_cache sysvar is ON.
+
+  The optimizer resolves single-table PS point queries as JT_CONST
+  (not JT_EQ_REF) because Item_param::used_tables() returns
+  INNER_TABLE_BIT and const_for_execution() is true.  Plan metadata
+  lives on qep_tab[0] since join_tab is freed after
+  get_best_combination().
+
+  Admission criteria (all must hold):
+  - Exactly one primary table, marked const (primary_tables==1,
+    const_tables==1, type==JT_CONST)
+  - No HAVING clause
+  - The chosen key is unique (HA_NOSAME)
+  - All user-defined key parts are covered (full unique key match)
+  - ref.key_parts == tpl.param_count (no extra WHERE predicates)
+  - Every ref.items[i] matches an Item_param from the template
+  - No guarded conditions (subquery-triggered guards)
+  - No keypart_hash (subquery materialization hash)
+
+  @param  stmt  The prepared statement in COLD state.
+  @param  join  The JOIN that just finished normal optimization.
+  @return true if plan qualifies for admission, false otherwise.
 */
 bool ps_point_plan_can_admit(Prepared_statement *stmt, JOIN *join);
 
 /**
   Perform admission: copy stable plan metadata from @p join into the
-  template stored on @p stmt, and transition state to HOT.
+  template stored on @p stmt, and transition state COLD -> HOT.
+
+  Must only be called after ps_point_plan_can_admit() returns true.
+  Copies key metadata (keyno, key_parts, key_length, null_rejecting)
+  and optimizer cost estimates from the QEP_TAB into the template.
+
+  Reorders params[] and field_indices[] from WHERE-clause order
+  (captured in Phase 1) to key-part order (as determined by the
+  optimizer's create_ref_for_key()), so that Phase 3+ fast-path
+  can use sequential key-part iteration.
+
+  @param  thd   Current thread (for status counter).
+  @param  stmt  The prepared statement to promote to HOT.
+  @param  join  The JOIN with finalized plan metadata.
 */
 void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join);
 
