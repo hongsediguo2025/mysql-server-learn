@@ -1,0 +1,706 @@
+--echo #
+--echo # Phase 1 extended test: comprehensive classification branch coverage
+--echo # with background DML operations and reprepare scenarios.
+--echo #
+--echo # Covers code branches in ps_point_plan_classify() and
+--echo # ps_point_plan_extract_where_shape() not exercised by
+--echo # ps_point_plan_cache_classify.test.
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  val VARCHAR(100),
+  uk INT NOT NULL,
+  UNIQUE KEY idx_uk (uk)
+);
+INSERT INTO t1 VALUES (1, 'alpha', 100), (2, 'beta', 200), (3, 'gamma', 300);
+
+CREATE TABLE t2 (
+  id INT PRIMARY KEY,
+  t1_id INT,
+  memo TEXT
+);
+INSERT INTO t2 VALUES (1, 1, 'join-a'), (2, 2, 'join-b');
+
+CREATE TABLE t_comp3 (
+  a INT NOT NULL, b INT NOT NULL, c INT NOT NULL,
+  val VARCHAR(50),
+  PRIMARY KEY (a, b, c)
+);
+INSERT INTO t_comp3 VALUES (1,1,1,'x'), (1,2,3,'y'), (2,1,1,'z');
+
+CREATE TABLE t_comp4 (
+  a INT NOT NULL, b INT NOT NULL, c INT NOT NULL, d INT NOT NULL,
+  val VARCHAR(50),
+  PRIMARY KEY (a, b, c, d)
+);
+INSERT INTO t_comp4 VALUES (1,1,1,1,'w'), (2,2,2,2,'v');
+
+CREATE TABLE t_wide (
+  c1 INT NOT NULL, c2 INT NOT NULL, c3 INT NOT NULL,
+  c4 INT NOT NULL, c5 INT NOT NULL,
+  val VARCHAR(50),
+  PRIMARY KEY (c1, c2, c3, c4, c5)
+);
+INSERT INTO t_wide VALUES (1,1,1,1,1,'five');
+
+CREATE TABLE t_nouk (
+  id INT,
+  val VARCHAR(100),
+  KEY idx_id (id)
+);
+INSERT INTO t_nouk VALUES (1, 'one'), (2, 'two');
+
+CREATE TABLE t_ft (
+  id INT PRIMARY KEY,
+  content TEXT,
+  FULLTEXT KEY ft_content (content)
+) ENGINE=InnoDB;
+INSERT INTO t_ft VALUES (1, 'hello world'), (2, 'foo bar baz');
+
+CREATE TABLE t_dml (
+  id INT PRIMARY KEY,
+  val VARCHAR(100)
+);
+INSERT INTO t_dml VALUES (1, 'one'), (2, 'two'), (3, 'three');
+
+CREATE TABLE t_ddl (
+  id INT PRIMARY KEY,
+  val VARCHAR(100)
+);
+INSERT INTO t_ddl VALUES (1, 'aaa'), (2, 'bbb');
+
+CREATE ALGORITHM=TEMPTABLE VIEW v_temp AS SELECT id, val, uk FROM t1;
+
+FLUSH STATUS;
+
+--echo # ===========================================================
+--echo # Section A: NEVER classification branches
+--echo # ===========================================================
+
+--echo # -------------------------------------------------------
+--echo # A1. > PS_PC_MAX_PARAMS (5 params in composite AND) — NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a1 FROM 'SELECT * FROM t_wide WHERE c1=? AND c2=? AND c3=? AND c4=? AND c5=?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (>4 params): $delta
+DEALLOCATE PREPARE stmt_a1;
+
+--echo # -------------------------------------------------------
+--echo # A2. UNION query — NEVER (!is_simple)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a2 FROM 'SELECT * FROM t1 WHERE id = ? UNION SELECT * FROM t1 WHERE id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (UNION): $delta
+DEALLOCATE PREPARE stmt_a2;
+
+--echo # -------------------------------------------------------
+--echo # A3. LEFT JOIN — NEVER (outer_join != 0)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a3 FROM 'SELECT t1.val FROM t1 LEFT JOIN t2 ON t1.id = t2.t1_id WHERE t1.id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (LEFT JOIN): $delta
+DEALLOCATE PREPARE stmt_a3;
+
+--echo # -------------------------------------------------------
+--echo # A4. RIGHT JOIN — NEVER (outer_join != 0)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a4 FROM 'SELECT t2.memo FROM t1 RIGHT JOIN t2 ON t1.id = t2.t1_id WHERE t2.id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (RIGHT JOIN): $delta
+DEALLOCATE PREPARE stmt_a4;
+
+--echo # -------------------------------------------------------
+--echo # A5. Window function — NEVER (has_windows)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a5 FROM 'SELECT *, ROW_NUMBER() OVER() AS rn FROM t1 WHERE id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (window function): $delta
+DEALLOCATE PREPARE stmt_a5;
+
+--echo # -------------------------------------------------------
+--echo # A6. TEMPTABLE view — NEVER (!is_base_table or leaf_table_count)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a6 FROM 'SELECT * FROM v_temp WHERE id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (TEMPTABLE view): $delta
+DEALLOCATE PREPARE stmt_a6;
+
+--echo # -------------------------------------------------------
+--echo # A7. OR predicate — NEVER (COND_OR_FUNC)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a7 FROM 'SELECT * FROM t1 WHERE id = ? OR uk = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (OR predicate): $delta
+DEALLOCATE PREPARE stmt_a7;
+
+--echo # -------------------------------------------------------
+--echo # A8. Mixed AND: equality + range — NEVER (non-EQ in AND child)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a8 FROM 'SELECT * FROM t1 WHERE id = ? AND uk > ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (mixed AND eq+range): $delta
+DEALLOCATE PREPARE stmt_a8;
+
+--echo # -------------------------------------------------------
+--echo # A9. Literal in AND: field=literal AND field=? — NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a9 FROM 'SELECT * FROM t1 WHERE id = 1 AND uk = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (literal in AND): $delta
+DEALLOCATE PREPARE stmt_a9;
+
+--echo # -------------------------------------------------------
+--echo # A10. IN predicate — NEVER (not EQ_FUNC, not AND)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a10 FROM 'SELECT * FROM t1 WHERE id IN (?, ?)';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (IN predicate): $delta
+DEALLOCATE PREPARE stmt_a10;
+
+--echo # -------------------------------------------------------
+--echo # A11. LIKE predicate — NEVER (LIKE_FUNC, not EQ_FUNC)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a11 FROM 'SELECT * FROM t1 WHERE val LIKE ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (LIKE): $delta
+DEALLOCATE PREPARE stmt_a11;
+
+--echo # -------------------------------------------------------
+--echo # A12. BETWEEN predicate — NEVER (BETWEEN_FUNC)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a12 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (BETWEEN): $delta
+DEALLOCATE PREPARE stmt_a12;
+
+--echo # -------------------------------------------------------
+--echo # A13. NULL-safe equal <=> — NEVER (EQUAL_FUNC, not EQ_FUNC)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a13 FROM 'SELECT * FROM t1 WHERE id <=> ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (NULL-safe equal): $delta
+DEALLOCATE PREPARE stmt_a13;
+
+--echo # -------------------------------------------------------
+--echo # A14. Arithmetic expression in WHERE: (id+0)=? — NEVER
+--echo #      LHS is Item_func_plus, not Item_field
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a14 FROM 'SELECT * FROM t1 WHERE id + 0 = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (expression WHERE): $delta
+DEALLOCATE PREPARE stmt_a14;
+
+--echo # -------------------------------------------------------
+--echo # A15. UPDATE — NEVER (sql_command != SQLCOM_SELECT)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a15 FROM 'UPDATE t1 SET val = ? WHERE id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (UPDATE): $delta
+DEALLOCATE PREPARE stmt_a15;
+
+--echo # -------------------------------------------------------
+--echo # A16. DELETE — NEVER (sql_command != SQLCOM_SELECT)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a16 FROM 'DELETE FROM t1 WHERE id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (DELETE): $delta
+DEALLOCATE PREPARE stmt_a16;
+
+--echo # -------------------------------------------------------
+--echo # A17. Param in SELECT list, no WHERE — NEVER (where == nullptr)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a17 FROM 'SELECT ? AS x FROM t1';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (param in SELECT, no WHERE): $delta
+DEALLOCATE PREPARE stmt_a17;
+
+--echo # -------------------------------------------------------
+--echo # A18. FULLTEXT MATCH in SELECT list + eq WHERE — NEVER (has_ft_funcs)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a18 FROM 'SELECT id, MATCH(content) AGAINST (''hello'') AS score FROM t_ft WHERE id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (FULLTEXT MATCH): $delta
+DEALLOCATE PREPARE stmt_a18;
+
+--echo # ===========================================================
+--echo # Section B: Additional COLD classification edge cases
+--echo # ===========================================================
+
+--echo # -------------------------------------------------------
+--echo # B1. 3-column composite equality — COLD
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_b1 FROM 'SELECT * FROM t_comp3 WHERE a = ? AND b = ? AND c = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (3-col composite): $delta
+DEALLOCATE PREPARE stmt_b1;
+
+--echo # -------------------------------------------------------
+--echo # B2. 4-column composite equality (PS_PC_MAX_PARAMS boundary) — COLD
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_b2 FROM 'SELECT * FROM t_comp4 WHERE a = ? AND b = ? AND c = ? AND d = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (4-col composite max): $delta
+DEALLOCATE PREPARE stmt_b2;
+
+--echo # -------------------------------------------------------
+--echo # B3. Table with no unique key — COLD (Phase 1 shape-only)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_b3 FROM 'SELECT * FROM t_nouk WHERE id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (no unique key table): $delta
+DEALLOCATE PREPARE stmt_b3;
+
+--echo # -------------------------------------------------------
+--echo # B4. Non-star SELECT columns — COLD
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_b4 FROM 'SELECT id, val FROM t1 WHERE id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (specific columns): $delta
+DEALLOCATE PREPARE stmt_b4;
+
+--echo # -------------------------------------------------------
+--echo # B5. SELECT ... FOR UPDATE — COLD (lock mode not checked in Phase 1)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_b5 FROM 'SELECT * FROM t1 WHERE id = ? FOR UPDATE';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (FOR UPDATE): $delta
+DEALLOCATE PREPARE stmt_b5;
+
+--echo # -------------------------------------------------------
+--echo # B6. Reversed argument order: ? = id — COLD
+--echo #     Tests extract_eq_field_param (PARAM, FIELD) branch
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_b6 FROM 'SELECT * FROM t1 WHERE ? = id';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (reversed ? = field): $delta
+DEALLOCATE PREPARE stmt_b6;
+
+--echo # -------------------------------------------------------
+--echo # B7. Reversed composite key order: pk2 = ? AND pk1 = ? — COLD
+--echo #     Phase 1 does not check key coverage or column order
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_b7 FROM 'SELECT * FROM t_comp3 WHERE c = ? AND a = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (reversed composite order): $delta
+DEALLOCATE PREPARE stmt_b7;
+
+--echo # ===========================================================
+--echo # Section C: Execution correctness with background DML
+--echo # Verifies that COLD classification does not interfere with
+--echo # normal execution when data is modified between EXECUTEs.
+--echo # ===========================================================
+
+--let $before_c = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_dml FROM 'SELECT val FROM t_dml WHERE id = ?';
+--let $after_c = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after_c - $before_c`
+--echo cold_delta (DML test PREPARE): $delta
+
+--echo # -------------------------------------------------------
+--echo # C1. Initial execute — should find existing row
+--echo # -------------------------------------------------------
+SET @p = 1;
+EXECUTE stmt_dml USING @p;
+
+--echo # -------------------------------------------------------
+--echo # C2. INSERT new row, execute with new key
+--echo # -------------------------------------------------------
+INSERT INTO t_dml VALUES (4, 'four');
+SET @p = 4;
+EXECUTE stmt_dml USING @p;
+
+--echo # -------------------------------------------------------
+--echo # C3. UPDATE the row, execute again — should see new value
+--echo # -------------------------------------------------------
+UPDATE t_dml SET val = 'FOUR' WHERE id = 4;
+EXECUTE stmt_dml USING @p;
+
+--echo # -------------------------------------------------------
+--echo # C4. DELETE the row, execute — should return empty
+--echo # -------------------------------------------------------
+DELETE FROM t_dml WHERE id = 4;
+EXECUTE stmt_dml USING @p;
+
+--echo # -------------------------------------------------------
+--echo # C5. Re-insert different value and verify
+--echo # -------------------------------------------------------
+INSERT INTO t_dml VALUES (4, 'four_v2');
+EXECUTE stmt_dml USING @p;
+
+--echo # -------------------------------------------------------
+--echo # C6. Bulk DML: insert, update multiple, then query
+--echo # -------------------------------------------------------
+INSERT INTO t_dml VALUES (5, 'five'), (6, 'six');
+UPDATE t_dml SET val = UPPER(val) WHERE id IN (5, 6);
+SET @p = 5;
+EXECUTE stmt_dml USING @p;
+SET @p = 6;
+EXECUTE stmt_dml USING @p;
+
+--echo # -------------------------------------------------------
+--echo # C7. Delete all test rows, restore original data
+--echo # -------------------------------------------------------
+DELETE FROM t_dml WHERE id >= 4;
+SET @p = 1;
+EXECUTE stmt_dml USING @p;
+SET @p = 999;
+EXECUTE stmt_dml USING @p;
+
+DEALLOCATE PREPARE stmt_dml;
+
+--echo # -------------------------------------------------------
+--echo # C8. Multi-PS interleaved with DML on same table
+--echo # -------------------------------------------------------
+PREPARE stmt_pk FROM 'SELECT val FROM t_dml WHERE id = ?';
+PREPARE stmt_all FROM 'SELECT id, val FROM t_dml ORDER BY id';
+
+SET @p = 2;
+EXECUTE stmt_pk USING @p;
+EXECUTE stmt_all;
+
+INSERT INTO t_dml VALUES (10, 'ten');
+SET @p = 10;
+EXECUTE stmt_pk USING @p;
+EXECUTE stmt_all;
+
+DELETE FROM t_dml WHERE id = 10;
+EXECUTE stmt_all;
+
+DEALLOCATE PREPARE stmt_pk;
+DEALLOCATE PREPARE stmt_all;
+
+--echo # ===========================================================
+--echo # Section D: DDL-triggered reprepare and counter behaviour
+--echo # ===========================================================
+
+--echo # -------------------------------------------------------
+--echo # D1. ALTER TABLE ADD COLUMN → reprepare → counter +1
+--echo # -------------------------------------------------------
+PREPARE stmt_d1 FROM 'SELECT * FROM t_ddl WHERE id = ?';
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+ALTER TABLE t_ddl ADD COLUMN extra INT DEFAULT 0;
+SET @p = 1;
+EXECUTE stmt_d1 USING @p;
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta after ALTER+reprepare: $delta
+ALTER TABLE t_ddl DROP COLUMN extra;
+DEALLOCATE PREPARE stmt_d1;
+
+--echo # -------------------------------------------------------
+--echo # D2. TRUNCATE TABLE → reprepare → counter +1
+--echo # -------------------------------------------------------
+INSERT INTO t_ddl VALUES (10, 'temp');
+PREPARE stmt_d2 FROM 'SELECT * FROM t_ddl WHERE id = ?';
+SET @p = 10;
+EXECUTE stmt_d2 USING @p;
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+TRUNCATE TABLE t_ddl;
+SET @p = 1;
+EXECUTE stmt_d2 USING @p;
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta after TRUNCATE+reprepare: $delta
+DEALLOCATE PREPARE stmt_d2;
+
+--echo # -------------------------------------------------------
+--echo # D3. Plain EXECUTE does NOT increment cold_classifications
+--echo # -------------------------------------------------------
+INSERT INTO t_ddl VALUES (1, 'aaa'), (2, 'bbb');
+PREPARE stmt_d3 FROM 'SELECT * FROM t_ddl WHERE id = ?';
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+SET @p = 1;
+EXECUTE stmt_d3 USING @p;
+SET @p = 2;
+EXECUTE stmt_d3 USING @p;
+SET @p = 1;
+EXECUTE stmt_d3 USING @p;
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta after 3 EXECUTEs (no reprepare): $delta
+DEALLOCATE PREPARE stmt_d3;
+
+--echo # -------------------------------------------------------
+--echo # D4. Sysvar toggle: ON → PREPARE (COLD) → OFF → PREPARE (NEVER)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_d4a FROM 'SELECT * FROM t1 WHERE id = ?';
+--let $mid = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $d1 = `SELECT $mid - $before`
+--echo cold_delta PREPARE with sysvar ON: $d1
+
+SET SESSION ps_point_plan_cache = FALSE;
+PREPARE stmt_d4b FROM 'SELECT * FROM t1 WHERE uk = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $d2 = `SELECT $after - $mid`
+--echo cold_delta PREPARE with sysvar OFF: $d2
+
+SET SESSION ps_point_plan_cache = TRUE;
+DEALLOCATE PREPARE stmt_d4a;
+DEALLOCATE PREPARE stmt_d4b;
+
+--echo # ===========================================================
+--echo # Section F: Abnormal / edge-case scenarios
+--echo # ===========================================================
+
+--echo # -------------------------------------------------------
+--echo # F1. Multiple sequential reprepares — counter +1 each time
+--echo # -------------------------------------------------------
+CREATE TABLE t_repr (id INT PRIMARY KEY, val VARCHAR(100));
+INSERT INTO t_repr VALUES (1, 'a'), (2, 'b');
+PREPARE stmt_f1 FROM 'SELECT * FROM t_repr WHERE id = ?';
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+ALTER TABLE t_repr ADD COLUMN c1 INT DEFAULT 0;
+SET @p = 1;
+EXECUTE stmt_f1 USING @p;
+ALTER TABLE t_repr ADD COLUMN c2 INT DEFAULT 0;
+SET @p = 1;
+EXECUTE stmt_f1 USING @p;
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta after 2 sequential reprepares: $delta
+ALTER TABLE t_repr DROP COLUMN c2;
+ALTER TABLE t_repr DROP COLUMN c1;
+DEALLOCATE PREPARE stmt_f1;
+DROP TABLE t_repr;
+
+--echo # -------------------------------------------------------
+--echo # F2. Sysvar OFF during reprepare — classify returns false
+--echo #     Stmt was COLD at PREPARE; sysvar toggled OFF before DDL
+--echo #     triggers reprepare — reclassification sees sysvar OFF.
+--echo # -------------------------------------------------------
+CREATE TABLE t_soff (id INT PRIMARY KEY, val VARCHAR(100));
+INSERT INTO t_soff VALUES (1, 'a');
+PREPARE stmt_f2 FROM 'SELECT * FROM t_soff WHERE id = ?';
+SET SESSION ps_point_plan_cache = FALSE;
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+ALTER TABLE t_soff ADD COLUMN extra INT DEFAULT 0;
+SET @p = 1;
+EXECUTE stmt_f2 USING @p;
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta reprepare with sysvar OFF: $delta
+SET SESSION ps_point_plan_cache = TRUE;
+ALTER TABLE t_soff DROP COLUMN extra;
+DEALLOCATE PREPARE stmt_f2;
+DROP TABLE t_soff;
+
+--echo # -------------------------------------------------------
+--echo # F3. Sysvar OFF at PREPARE, ON at reprepare
+--echo #     Stmt was NEVER (sysvar OFF); sysvar toggled ON before
+--echo #     DDL triggers reprepare — reclassification sees sysvar ON.
+--echo # -------------------------------------------------------
+CREATE TABLE t_son (id INT PRIMARY KEY, val VARCHAR(100));
+INSERT INTO t_son VALUES (1, 'a');
+SET SESSION ps_point_plan_cache = FALSE;
+PREPARE stmt_f3 FROM 'SELECT * FROM t_son WHERE id = ?';
+SET SESSION ps_point_plan_cache = TRUE;
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+ALTER TABLE t_son ADD COLUMN extra INT DEFAULT 0;
+SET @p = 1;
+EXECUTE stmt_f3 USING @p;
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta reprepare with sysvar ON (was OFF): $delta
+ALTER TABLE t_son DROP COLUMN extra;
+DEALLOCATE PREPARE stmt_f3;
+DROP TABLE t_son;
+
+--echo # -------------------------------------------------------
+--echo # F4. Re-PREPARE same name: candidate → non-candidate
+--echo #     Old PS (COLD) is implicitly deallocated; new PS classified.
+--echo # -------------------------------------------------------
+PREPARE stmt_reuse FROM 'SELECT * FROM t1 WHERE id = ?';
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_reuse FROM 'SELECT * FROM t1 WHERE id > ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta re-PREPARE candidate->non-candidate: $delta
+DEALLOCATE PREPARE stmt_reuse;
+
+--echo # -------------------------------------------------------
+--echo # F5. Re-PREPARE same name: non-candidate → candidate
+--echo # -------------------------------------------------------
+PREPARE stmt_reuse FROM 'SELECT * FROM t1 WHERE id > ?';
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_reuse FROM 'SELECT * FROM t1 WHERE id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta re-PREPARE non-candidate->candidate: $delta
+DEALLOCATE PREPARE stmt_reuse;
+
+--echo # -------------------------------------------------------
+--echo # F6. Temporary table — should be COLD (is_base_table() = true)
+--echo # -------------------------------------------------------
+CREATE TEMPORARY TABLE t_temp (id INT PRIMARY KEY, val VARCHAR(100));
+INSERT INTO t_temp VALUES (1, 'tmp_a'), (2, 'tmp_b');
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_f6 FROM 'SELECT * FROM t_temp WHERE id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (temporary table): $delta
+SET @p = 1;
+EXECUTE stmt_f6 USING @p;
+DEALLOCATE PREPARE stmt_f6;
+DROP TEMPORARY TABLE t_temp;
+
+--echo # -------------------------------------------------------
+--echo # F7. Table alias: SELECT * FROM t1 AS a WHERE a.id = ?
+--echo #     Alias does not affect table_ref matching.
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_f7 FROM 'SELECT * FROM t1 AS a WHERE a.id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (table alias): $delta
+DEALLOCATE PREPARE stmt_f7;
+
+--echo # -------------------------------------------------------
+--echo # F8. Duplicate field in AND: WHERE id = ? AND id = ?
+--echo #     Degenerate input — both equalities on same column.
+--echo #     Shape B: 2 EQ_FUNC(field, param), both succeed. → COLD
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_f8 FROM 'SELECT * FROM t1 WHERE id = ? AND id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (duplicate field in AND): $delta
+DEALLOCATE PREPARE stmt_f8;
+
+--echo # -------------------------------------------------------
+--echo # F9. NOT wrapping equality: WHERE NOT (id = ?)
+--echo #     WHERE type = FUNC_ITEM, functype = NOT_FUNC → NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_f9 FROM 'SELECT * FROM t1 WHERE NOT (id = ?)';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (NOT wrapping equality): $delta
+DEALLOCATE PREPARE stmt_f9;
+
+--echo # -------------------------------------------------------
+--echo # F10. Aggregate without GROUP BY: SELECT COUNT(*) WHERE id = ?
+--echo #      is_grouped() returns true because m_agg_func_used is set
+--echo #      by COUNT(*), even without explicit GROUP BY. → NEVER.
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_f10 FROM 'SELECT COUNT(*) FROM t1 WHERE id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (aggregate no GROUP BY): $delta
+DEALLOCATE PREPARE stmt_f10;
+
+--echo # -------------------------------------------------------
+--echo # F11. Tautological AND: WHERE id = ? AND 1=1
+--echo #      MySQL resolver may simplify to just WHERE id = ?.
+--echo #      If simplified: Shape A → COLD.
+--echo #      If not simplified: Shape B, second child 1=1 has
+--echo #      non-PARAM arg → NEVER.
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_f11 FROM 'SELECT * FROM t1 WHERE id = ? AND 1=1';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (tautological AND 1=1): $delta
+DEALLOCATE PREPARE stmt_f11;
+
+--echo # -------------------------------------------------------
+--echo # F12. Multi-session counter isolation
+--echo #      A separate connection's classification should not
+--echo #      affect the current session's counter.
+--echo # -------------------------------------------------------
+connect (con1, localhost, root,,);
+--let $con1_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_con1 FROM 'SELECT * FROM t1 WHERE id = ?';
+--let $con1_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $con1_delta = `SELECT $con1_after - $con1_before`
+--echo con1 cold_delta (isolated session): $con1_delta
+DEALLOCATE PREPARE stmt_con1;
+disconnect con1;
+connection default;
+--echo # Verify default session still classifies correctly after switch-back
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_f12 FROM 'SELECT * FROM t1 WHERE uk = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo default session cold_delta after switch-back: $delta
+DEALLOCATE PREPARE stmt_f12;
+
+--echo # ===========================================================
+--echo # Section E: Final counter snapshot
+--echo # ===========================================================
+
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+DROP VIEW v_temp;
+DROP TABLE t_ft;
+DROP TABLE t_nouk;
+DROP TABLE t_wide;
+DROP TABLE t_comp4;
+DROP TABLE t_comp3;
+DROP TABLE t_ddl;
+DROP TABLE t_dml;
+DROP TABLE t2;
+DROP TABLE t1;
+
+--echo #
+--echo # End of Phase 1 extended classification test
+--echo #

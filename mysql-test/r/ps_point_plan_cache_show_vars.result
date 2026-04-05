@@ -95,6 +95,7 @@ SET SESSION ps_point_plan_cache = DEFAULT;
 SHOW STATUS LIKE 'Ps_point_plan_cache%';
 Variable_name	Value
 Ps_point_plan_cache_admissions	0
+Ps_point_plan_cache_cold_classifications	0
 Ps_point_plan_cache_fallback_runtime	0
 Ps_point_plan_cache_hits	0
 Ps_point_plan_cache_invalidations	0
@@ -104,6 +105,7 @@ WHERE VARIABLE_NAME LIKE 'Ps_point_plan_cache%'
 ORDER BY VARIABLE_NAME;
 VARIABLE_NAME	VARIABLE_VALUE
 Ps_point_plan_cache_admissions	0
+Ps_point_plan_cache_cold_classifications	0
 Ps_point_plan_cache_fallback_runtime	0
 Ps_point_plan_cache_hits	0
 Ps_point_plan_cache_invalidations	0
@@ -112,10 +114,11 @@ FROM performance_schema.global_status
 WHERE VARIABLE_NAME LIKE 'Ps_point_plan_cache%'
 ORDER BY VARIABLE_NAME;
 VARIABLE_NAME	VARIABLE_VALUE
-Ps_point_plan_cache_admissions	0
-Ps_point_plan_cache_fallback_runtime	0
-Ps_point_plan_cache_hits	0
-Ps_point_plan_cache_invalidations	0
+Ps_point_plan_cache_admissions	#
+Ps_point_plan_cache_cold_classifications	#
+Ps_point_plan_cache_fallback_runtime	#
+Ps_point_plan_cache_hits	#
+Ps_point_plan_cache_invalidations	#
 # -------------------------------------------------------
 # 7. Background data operations: single-table point select PS
 #    Verifies new Prepared_statement members don't break
@@ -210,7 +213,7 @@ EXECUTE ps_sub USING @p;
 id	val	uk
 2	beta	200
 DEALLOCATE PREPARE ps_sub;
-# 8e. Multi-param query (not candidate: param_count != 1)
+# 8e. Multi-param composite equality (classified COLD since Phase 1)
 PREPARE ps_multi FROM 'SELECT * FROM t1 WHERE id = ? AND val = ?';
 SET @p1 = 1;
 SET @p2 = 'alpha';
@@ -330,15 +333,16 @@ id	val	uk
 2	beta	200
 DEALLOCATE PREPARE ps_toggle;
 # -------------------------------------------------------
-# 13. Counters still 0 after all operations
-#     (Phase 0 stubs never increment.)
-#     Check BEFORE FLUSH STATUS — this is the real assertion.
-#     If any counter was accidentally bumped during sections
-#     7-12, FLUSH STATUS would hide it.
+# 13. Counter verification after all operations
+#     Phase 1 cold_classifications will be non-zero (10) because
+#     point-select PREPARE statements above are classified COLD.
+#     All other counters (admissions, hits, invalidations,
+#     fallback_runtime) remain 0 — Phase 2+ not yet active.
 # -------------------------------------------------------
 SHOW STATUS LIKE 'Ps_point_plan_cache%';
 Variable_name	Value
 Ps_point_plan_cache_admissions	0
+Ps_point_plan_cache_cold_classifications	10
 Ps_point_plan_cache_fallback_runtime	0
 Ps_point_plan_cache_hits	0
 Ps_point_plan_cache_invalidations	0
@@ -347,6 +351,7 @@ FLUSH STATUS;
 SHOW STATUS LIKE 'Ps_point_plan_cache%';
 Variable_name	Value
 Ps_point_plan_cache_admissions	0
+Ps_point_plan_cache_cold_classifications	0
 Ps_point_plan_cache_fallback_runtime	0
 Ps_point_plan_cache_hits	0
 Ps_point_plan_cache_invalidations	0

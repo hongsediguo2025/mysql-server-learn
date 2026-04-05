@@ -2595,6 +2595,15 @@ bool Prepared_statement::prepare(THD *thd, const char *query_str,
     if (m_lex->opt_hints_global && m_lex->opt_hints_global->sys_var_hint)
       m_lex->opt_hints_global->sys_var_hint->restore_vars(thd);
   }
+
+  // ps_point_plan_cache: classify before LEX cleanup while tree is accessible.
+  // Runs for all prepared statements (both COM_STMT_PREPARE and SQL PREPARE).
+  // The fast-path exclusion for SQL PREPARE is enforced at execution time
+  // (Phase 3+), not here — classification is a read-only shape check.
+  if (error == 0) {
+    ps_point_plan_classify(thd, this);
+  }
+
   assert(error || !thd->is_error());
 
   /*

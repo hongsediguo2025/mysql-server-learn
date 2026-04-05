@@ -1,0 +1,152 @@
+#
+# Phase 1 test: ps_point_plan_cache static classification at PREPARE time.
+#
+# Verifies that COM_STMT_PREPARE correctly classifies statements as
+# COLD (candidate) or NEVER (non-candidate) by checking the
+# Ps_point_plan_cache_cold_classifications status counter.
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+val VARCHAR(100),
+uk INT NOT NULL,
+UNIQUE KEY idx_uk (uk)
+);
+INSERT INTO t1 VALUES (1, 'alpha', 100), (2, 'beta', 200), (3, 'gamma', 300);
+CREATE TABLE t2 (
+id INT PRIMARY KEY,
+t1_id INT,
+memo TEXT
+);
+INSERT INTO t2 VALUES (1, 1, 'join-a'), (2, 2, 'join-b');
+CREATE TABLE t_comp (
+pk1 INT NOT NULL,
+pk2 INT NOT NULL,
+val VARCHAR(50),
+PRIMARY KEY (pk1, pk2)
+);
+INSERT INTO t_comp VALUES (1, 1, 'a'), (1, 2, 'b'), (2, 1, 'c');
+FLUSH STATUS;
+# -------------------------------------------------------
+# 1. Single-column PK equality — should be COLD
+# -------------------------------------------------------
+PREPARE stmt_pk FROM 'SELECT * FROM t1 WHERE id = ?';
+cold_classifications delta after PK point select: 1
+# -------------------------------------------------------
+# 2. Single-column UK equality — should be COLD
+# -------------------------------------------------------
+PREPARE stmt_uk FROM 'SELECT * FROM t1 WHERE uk = ?';
+cold_classifications delta after UK point select: 1
+# -------------------------------------------------------
+# 3. Composite key equality — should be COLD
+# -------------------------------------------------------
+PREPARE stmt_comp FROM 'SELECT * FROM t_comp WHERE pk1 = ? AND pk2 = ?';
+cold_classifications delta after composite key equality: 1
+# -------------------------------------------------------
+# 4. Range predicate — should be NEVER (not equality)
+# -------------------------------------------------------
+PREPARE stmt_range FROM 'SELECT * FROM t1 WHERE id > ?';
+cold_classifications delta after range predicate: 0
+# -------------------------------------------------------
+# 5. JOIN — should be NEVER (multi-table)
+# -------------------------------------------------------
+PREPARE stmt_join FROM 'SELECT t1.val, t2.memo FROM t1 JOIN t2 ON t1.id = t2.t1_id WHERE t1.id = ?';
+cold_classifications delta after JOIN: 0
+# -------------------------------------------------------
+# 6. ORDER BY — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_order FROM 'SELECT * FROM t1 WHERE id = ? ORDER BY val';
+cold_classifications delta after ORDER BY: 0
+# -------------------------------------------------------
+# 7. LIMIT — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_limit FROM 'SELECT * FROM t1 WHERE id = ? LIMIT 1';
+cold_classifications delta after LIMIT: 0
+# -------------------------------------------------------
+# 8. GROUP BY / aggregate — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_group FROM 'SELECT COUNT(*) FROM t1 WHERE id = ? GROUP BY val';
+cold_classifications delta after GROUP BY: 0
+# -------------------------------------------------------
+# 9. DISTINCT — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_distinct FROM 'SELECT DISTINCT val FROM t1 WHERE id = ?';
+cold_classifications delta after DISTINCT: 0
+# -------------------------------------------------------
+# 10. INSERT — should be NEVER (not SELECT)
+# -------------------------------------------------------
+PREPARE stmt_insert FROM 'INSERT INTO t1 VALUES (?, ?, ?)';
+cold_classifications delta after INSERT: 0
+# -------------------------------------------------------
+# 11. No WHERE clause — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_nowhere FROM 'SELECT * FROM t1';
+cold_classifications delta after no WHERE: 0
+# -------------------------------------------------------
+# 12. No parameters — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_noparam FROM 'SELECT * FROM t1 WHERE id = 1';
+cold_classifications delta after no parameters: 0
+# -------------------------------------------------------
+# 13. Subquery — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_subq FROM 'SELECT * FROM t1 WHERE id = (SELECT MIN(id) FROM t1 WHERE id = ?)';
+cold_classifications delta after subquery: 0
+# -------------------------------------------------------
+# 14. sysvar OFF — should be NEVER even for candidate shape
+# -------------------------------------------------------
+SET SESSION ps_point_plan_cache = FALSE;
+PREPARE stmt_off FROM 'SELECT * FROM t1 WHERE id = ?';
+cold_classifications delta with sysvar OFF: 0
+SET SESSION ps_point_plan_cache = TRUE;
+# -------------------------------------------------------
+# 15. SQL PREPARE with candidate shape — should be COLD
+#     Classification runs for all prepared statements (both SQL and binary).
+#     Fast-path exclusion for SQL PREPARE is enforced at execution time.
+# -------------------------------------------------------
+PREPARE stmt_sql FROM 'SELECT * FROM t1 WHERE id = ?';
+cold_classifications delta after SQL PREPARE: 1
+# -------------------------------------------------------
+# 16. Parameter in SELECT list — should be NEVER
+#     All ? must be in WHERE equality conditions;
+#     extra params in SELECT list are not handled by fast path.
+# -------------------------------------------------------
+PREPARE stmt_selpar FROM 'SELECT ?, id FROM t1 WHERE id = ?';
+cold_classifications delta after param in SELECT list: 0
+# -------------------------------------------------------
+# 17. Final status snapshot
+# -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admissions	0
+Ps_point_plan_cache_cold_classifications	4
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	0
+Ps_point_plan_cache_invalidations	0
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DEALLOCATE PREPARE stmt_pk;
+DEALLOCATE PREPARE stmt_uk;
+DEALLOCATE PREPARE stmt_comp;
+DEALLOCATE PREPARE stmt_range;
+DEALLOCATE PREPARE stmt_join;
+DEALLOCATE PREPARE stmt_order;
+DEALLOCATE PREPARE stmt_limit;
+DEALLOCATE PREPARE stmt_group;
+DEALLOCATE PREPARE stmt_distinct;
+DEALLOCATE PREPARE stmt_insert;
+DEALLOCATE PREPARE stmt_nowhere;
+DEALLOCATE PREPARE stmt_noparam;
+DEALLOCATE PREPARE stmt_subq;
+DEALLOCATE PREPARE stmt_off;
+DEALLOCATE PREPARE stmt_sql;
+DEALLOCATE PREPARE stmt_selpar;
+DROP TABLE t_comp;
+DROP TABLE t2;
+DROP TABLE t1;
+#
+# End of Phase 1 classification test
+#

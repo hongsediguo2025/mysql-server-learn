@@ -132,8 +132,8 @@ bool ps_point_plan_classify(THD *thd, Prepared_statement *stmt);
 
 /**
   Extract the WHERE shape and populate template fields.
-  Phase 1: recognizes single Item_func_eq(field, param).
-  Phase 6: recognizes Item_cond_and wrapping multiple Item_func_eq.
+  Phase 1: recognizes single Item_func_eq(field, param) and
+           Item_cond_and wrapping multiple Item_func_eq for composite keys.
   Phase 7+: will also recognize Item_func_between(field, param, param).
   Sets plan_type, param_count, params[], and field_indices[] in @p tpl.
   @return true if a supported shape is found, false otherwise.
@@ -165,5 +165,6 @@ void ps_point_plan_mark_hit(THD *thd);
 void ps_point_plan_mark_admission(THD *thd);
 void ps_point_plan_mark_invalidation(THD *thd);
 void ps_point_plan_mark_runtime_fallback(THD *thd);
+void ps_point_plan_mark_cold_classification(THD *thd);
 
 #endif  // SQL_PS_POINT_PLAN_CACHE_H

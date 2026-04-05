@@ -1,0 +1,218 @@
+--echo #
+--echo # Phase 1 test: ps_point_plan_cache static classification at PREPARE time.
+--echo #
+--echo # Verifies that COM_STMT_PREPARE correctly classifies statements as
+--echo # COLD (candidate) or NEVER (non-candidate) by checking the
+--echo # Ps_point_plan_cache_cold_classifications status counter.
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  val VARCHAR(100),
+  uk INT NOT NULL,
+  UNIQUE KEY idx_uk (uk)
+);
+INSERT INTO t1 VALUES (1, 'alpha', 100), (2, 'beta', 200), (3, 'gamma', 300);
+
+CREATE TABLE t2 (
+  id INT PRIMARY KEY,
+  t1_id INT,
+  memo TEXT
+);
+INSERT INTO t2 VALUES (1, 1, 'join-a'), (2, 2, 'join-b');
+
+CREATE TABLE t_comp (
+  pk1 INT NOT NULL,
+  pk2 INT NOT NULL,
+  val VARCHAR(50),
+  PRIMARY KEY (pk1, pk2)
+);
+INSERT INTO t_comp VALUES (1, 1, 'a'), (1, 2, 'b'), (2, 1, 'c');
+
+FLUSH STATUS;
+
+--echo # -------------------------------------------------------
+--echo # 1. Single-column PK equality — should be COLD
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_pk FROM 'SELECT * FROM t1 WHERE id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_classifications delta after PK point select: $delta
+
+--echo # -------------------------------------------------------
+--echo # 2. Single-column UK equality — should be COLD
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_uk FROM 'SELECT * FROM t1 WHERE uk = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_classifications delta after UK point select: $delta
+
+--echo # -------------------------------------------------------
+--echo # 3. Composite key equality — should be COLD
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_comp FROM 'SELECT * FROM t_comp WHERE pk1 = ? AND pk2 = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_classifications delta after composite key equality: $delta
+
+--echo # -------------------------------------------------------
+--echo # 4. Range predicate — should be NEVER (not equality)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_range FROM 'SELECT * FROM t1 WHERE id > ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_classifications delta after range predicate: $delta
+
+--echo # -------------------------------------------------------
+--echo # 5. JOIN — should be NEVER (multi-table)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_join FROM 'SELECT t1.val, t2.memo FROM t1 JOIN t2 ON t1.id = t2.t1_id WHERE t1.id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_classifications delta after JOIN: $delta
+
+--echo # -------------------------------------------------------
+--echo # 6. ORDER BY — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_order FROM 'SELECT * FROM t1 WHERE id = ? ORDER BY val';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_classifications delta after ORDER BY: $delta
+
+--echo # -------------------------------------------------------
+--echo # 7. LIMIT — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_limit FROM 'SELECT * FROM t1 WHERE id = ? LIMIT 1';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_classifications delta after LIMIT: $delta
+
+--echo # -------------------------------------------------------
+--echo # 8. GROUP BY / aggregate — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_group FROM 'SELECT COUNT(*) FROM t1 WHERE id = ? GROUP BY val';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_classifications delta after GROUP BY: $delta
+
+--echo # -------------------------------------------------------
+--echo # 9. DISTINCT — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_distinct FROM 'SELECT DISTINCT val FROM t1 WHERE id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_classifications delta after DISTINCT: $delta
+
+--echo # -------------------------------------------------------
+--echo # 10. INSERT — should be NEVER (not SELECT)
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_insert FROM 'INSERT INTO t1 VALUES (?, ?, ?)';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_classifications delta after INSERT: $delta
+
+--echo # -------------------------------------------------------
+--echo # 11. No WHERE clause — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_nowhere FROM 'SELECT * FROM t1';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_classifications delta after no WHERE: $delta
+
+--echo # -------------------------------------------------------
+--echo # 12. No parameters — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_noparam FROM 'SELECT * FROM t1 WHERE id = 1';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_classifications delta after no parameters: $delta
+
+--echo # -------------------------------------------------------
+--echo # 13. Subquery — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_subq FROM 'SELECT * FROM t1 WHERE id = (SELECT MIN(id) FROM t1 WHERE id = ?)';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_classifications delta after subquery: $delta
+
+--echo # -------------------------------------------------------
+--echo # 14. sysvar OFF — should be NEVER even for candidate shape
+--echo # -------------------------------------------------------
+SET SESSION ps_point_plan_cache = FALSE;
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_off FROM 'SELECT * FROM t1 WHERE id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_classifications delta with sysvar OFF: $delta
+SET SESSION ps_point_plan_cache = TRUE;
+
+--echo # -------------------------------------------------------
+--echo # 15. SQL PREPARE with candidate shape — should be COLD
+--echo #     Classification runs for all prepared statements (both SQL and binary).
+--echo #     Fast-path exclusion for SQL PREPARE is enforced at execution time.
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_sql FROM 'SELECT * FROM t1 WHERE id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_classifications delta after SQL PREPARE: $delta
+
+--echo # -------------------------------------------------------
+--echo # 16. Parameter in SELECT list — should be NEVER
+--echo #     All ? must be in WHERE equality conditions;
+--echo #     extra params in SELECT list are not handled by fast path.
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_selpar FROM 'SELECT ?, id FROM t1 WHERE id = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_classifications delta after param in SELECT list: $delta
+
+--echo # -------------------------------------------------------
+--echo # 17. Final status snapshot
+--echo # -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+DEALLOCATE PREPARE stmt_pk;
+DEALLOCATE PREPARE stmt_uk;
+DEALLOCATE PREPARE stmt_comp;
+DEALLOCATE PREPARE stmt_range;
+DEALLOCATE PREPARE stmt_join;
+DEALLOCATE PREPARE stmt_order;
+DEALLOCATE PREPARE stmt_limit;
+DEALLOCATE PREPARE stmt_group;
+DEALLOCATE PREPARE stmt_distinct;
+DEALLOCATE PREPARE stmt_insert;
+DEALLOCATE PREPARE stmt_nowhere;
+DEALLOCATE PREPARE stmt_noparam;
+DEALLOCATE PREPARE stmt_subq;
+DEALLOCATE PREPARE stmt_off;
+DEALLOCATE PREPARE stmt_sql;
+DEALLOCATE PREPARE stmt_selpar;
+DROP TABLE t_comp;
+DROP TABLE t2;
+DROP TABLE t1;
+
+--echo #
+--echo # End of Phase 1 classification test
+--echo #

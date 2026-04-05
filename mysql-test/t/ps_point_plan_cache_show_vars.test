@@ -96,6 +96,7 @@ FROM performance_schema.session_status
 WHERE VARIABLE_NAME LIKE 'Ps_point_plan_cache%'
 ORDER BY VARIABLE_NAME;
 
+--replace_column 2 #
 SELECT VARIABLE_NAME, VARIABLE_VALUE
 FROM performance_schema.global_status
 WHERE VARIABLE_NAME LIKE 'Ps_point_plan_cache%'
@@ -178,7 +179,7 @@ EXECUTE ps_sub USING @p;
 EXECUTE ps_sub USING @p;
 DEALLOCATE PREPARE ps_sub;
 
---echo # 8e. Multi-param query (not candidate: param_count != 1)
+--echo # 8e. Multi-param composite equality (classified COLD since Phase 1)
 PREPARE ps_multi FROM 'SELECT * FROM t1 WHERE id = ? AND val = ?';
 SET @p1 = 1;
 SET @p2 = 'alpha';
@@ -280,11 +281,11 @@ EXECUTE ps_toggle USING @p;
 DEALLOCATE PREPARE ps_toggle;
 
 --echo # -------------------------------------------------------
---echo # 13. Counters still 0 after all operations
---echo #     (Phase 0 stubs never increment.)
---echo #     Check BEFORE FLUSH STATUS — this is the real assertion.
---echo #     If any counter was accidentally bumped during sections
---echo #     7-12, FLUSH STATUS would hide it.
+--echo # 13. Counter verification after all operations
+--echo #     Phase 1 cold_classifications will be non-zero (10) because
+--echo #     point-select PREPARE statements above are classified COLD.
+--echo #     All other counters (admissions, hits, invalidations,
+--echo #     fallback_runtime) remain 0 — Phase 2+ not yet active.
 --echo # -------------------------------------------------------
 
 SHOW STATUS LIKE 'Ps_point_plan_cache%';

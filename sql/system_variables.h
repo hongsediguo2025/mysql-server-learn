@@ -573,11 +573,12 @@ struct System_status_var {
   /// How many queries have been executed on a secondary storage engine.
   ulonglong secondary_engine_execution_count;
 
-  /* ps_point_plan_cache status counters (Phase 0). */
+  /* ps_point_plan_cache status counters. */
   ulonglong ps_point_plan_cache_hits;
   ulonglong ps_point_plan_cache_admissions;
   ulonglong ps_point_plan_cache_invalidations;
   ulonglong ps_point_plan_cache_fallback_runtime;
+  ulonglong ps_point_plan_cache_cold_classifications;
 
   ulong com_other;
   ulong com_stat[(uint)SQLCOM_END];
@@ -596,7 +597,7 @@ struct System_status_var {
   used as a global counter. It marks the end of a contiguous block of counters
   that can be iteratively totaled. See add_to_status().
 */
-#define LAST_STATUS_VAR ps_point_plan_cache_fallback_runtime
+#define LAST_STATUS_VAR ps_point_plan_cache_cold_classifications
 
 /*
   This must reference the FIRST ulonglong variable in system_status_var that is
