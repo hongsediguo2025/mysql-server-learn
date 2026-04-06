@@ -1,0 +1,150 @@
+--echo #
+--echo # Plan cache smoke test under binary-protocol cursor execution.
+--echo #
+--echo # Run: mtr --cursor-protocol --ps-protocol ps_point_plan_cache_cursor_proto
+--echo #
+--echo # Under --cursor-protocol, regular SELECTs are sent via
+--echo # COM_STMT_EXECUTE with CURSOR_TYPE_READ_ONLY (open_cursor=true).
+--echo # DDL/DML/PREPARE/EXECUTE don't support cursor mode, so they
+--echo # are wrapped with --disable_ps_protocol.
+--echo #
+--echo # Full cursor bypass verification (COM_STMT_EXECUTE with
+--echo # CURSOR_TYPE_READ_ONLY on a parameterized PS) requires the
+--echo # C API and is covered in Phase 5 testing.
+--echo #
+
+--source include/have_ps_protocol.inc
+
+if (`SELECT $CURSOR_PROTOCOL = 0`)
+{
+   --skip Need cursor-protocol (run: mtr --cursor-protocol --ps-protocol ps_point_plan_cache_cursor_proto)
+}
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+--disable_ps_protocol
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  val VARCHAR(50),
+  uk INT NOT NULL,
+  UNIQUE KEY idx_uk (uk)
+);
+INSERT INTO t1 VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30);
+--enable_ps_protocol
+
+--echo # -------------------------------------------------------
+--echo # K1: Regular SELECTs under cursor protocol — smoke test.
+--echo #     Implicit PS has literal values (no Item_param), so
+--echo #     classify → NEVER.  Counters must all be 0.
+--echo #     Primary goal: verify no crash with cursor + plan cache.
+--echo # -------------------------------------------------------
+
+--disable_ps_protocol
+FLUSH STATUS;
+--enable_ps_protocol
+
+SELECT * FROM t1 WHERE id = 1;
+SELECT * FROM t1 WHERE id = 2;
+SELECT * FROM t1 WHERE id = 3;
+
+--disable_ps_protocol
+--let $cold = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo cold after K1 (expect 0): $cold
+--echo admissions after K1 (expect 0): $adm
+--echo hits after K1 (expect 0): $hits
+--enable_ps_protocol
+
+--echo # -------------------------------------------------------
+--echo # K2: SQL PREPARE/EXECUTE under cursor protocol session.
+--echo #     SQL-level EXECUTE always uses open_cursor=false, so
+--echo #     the plan cache fast path is unaffected by the session's
+--echo #     cursor protocol setting.  Admission + hit expected.
+--echo # -------------------------------------------------------
+
+--disable_ps_protocol
+FLUSH STATUS;
+
+PREPARE stmt FROM 'SELECT * FROM t1 WHERE id = ?';
+
+--echo # K2-admit: first EXECUTE → admission → HOT
+SET @p = 1;
+EXECUTE stmt USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after K2-admit (expect 1): $adm
+
+--echo # K2-hit1: second EXECUTE → fast path hit
+SET @p = 2;
+EXECUTE stmt USING @p;
+
+--echo # K2-hit2: third EXECUTE → fast path hit
+SET @p = 3;
+EXECUTE stmt USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after K2 (expect 2): $hits
+
+DEALLOCATE PREPARE stmt;
+--enable_ps_protocol
+
+--echo # -------------------------------------------------------
+--echo # K3: DDL + reprepare under cursor protocol session.
+--echo # -------------------------------------------------------
+
+--disable_ps_protocol
+FLUSH STATUS;
+
+PREPARE stmt2 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt2 USING @p;
+
+--let $adm_base = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+
+ALTER TABLE t1 ADD COLUMN extra INT DEFAULT 0;
+SET @p = 2;
+EXECUTE stmt2 USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm - $adm_base`
+--echo admissions delta after K3 DDL (expect 1): $adm_delta
+
+--echo # K3-hit: fast path hit after re-admission
+SET @p = 3;
+EXECUTE stmt2 USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after K3-hit (expect 1): $hits
+
+ALTER TABLE t1 DROP COLUMN extra;
+SET @p = 1;
+EXECUTE stmt2 USING @p;
+
+DEALLOCATE PREPARE stmt2;
+--enable_ps_protocol
+
+--echo # -------------------------------------------------------
+--echo # K4: Verify binary protocol is active
+--echo # -------------------------------------------------------
+--disable_ps_protocol
+--let $stmt_exec = query_get_value(SHOW STATUS LIKE 'Com_stmt_execute', Value, 1)
+if ($stmt_exec == 0) {
+  --die Test NOT running under binary protocol. Com_stmt_execute = 0.
+}
+--echo # Confirmed: binary protocol active (Com_stmt_execute > 0)
+--enable_ps_protocol
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+
+--disable_ps_protocol
+DROP TABLE t1;
+--enable_ps_protocol
+
+--echo #
+--echo # Cursor protocol plan cache smoke test complete.
+--echo #

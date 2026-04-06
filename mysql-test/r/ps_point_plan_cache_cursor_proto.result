@@ -1,0 +1,107 @@
+#
+# Plan cache smoke test under binary-protocol cursor execution.
+#
+# Run: mtr --cursor-protocol --ps-protocol ps_point_plan_cache_cursor_proto
+#
+# Under --cursor-protocol, regular SELECTs are sent via
+# COM_STMT_EXECUTE with CURSOR_TYPE_READ_ONLY (open_cursor=true).
+# DDL/DML/PREPARE/EXECUTE don't support cursor mode, so they
+# are wrapped with --disable_ps_protocol.
+#
+# Full cursor bypass verification (COM_STMT_EXECUTE with
+# CURSOR_TYPE_READ_ONLY on a parameterized PS) requires the
+# C API and is covered in Phase 5 testing.
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+val VARCHAR(50),
+uk INT NOT NULL,
+UNIQUE KEY idx_uk (uk)
+);
+INSERT INTO t1 VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30);
+# -------------------------------------------------------
+# K1: Regular SELECTs under cursor protocol — smoke test.
+#     Implicit PS has literal values (no Item_param), so
+#     classify → NEVER.  Counters must all be 0.
+#     Primary goal: verify no crash with cursor + plan cache.
+# -------------------------------------------------------
+FLUSH STATUS;
+SELECT * FROM t1 WHERE id = 1;
+id	val	uk
+1	one	10
+SELECT * FROM t1 WHERE id = 2;
+id	val	uk
+2	two	20
+SELECT * FROM t1 WHERE id = 3;
+id	val	uk
+3	three	30
+cold after K1 (expect 0): 0
+admissions after K1 (expect 0): 0
+hits after K1 (expect 0): 0
+# -------------------------------------------------------
+# K2: SQL PREPARE/EXECUTE under cursor protocol session.
+#     SQL-level EXECUTE always uses open_cursor=false, so
+#     the plan cache fast path is unaffected by the session's
+#     cursor protocol setting.  Admission + hit expected.
+# -------------------------------------------------------
+FLUSH STATUS;
+PREPARE stmt FROM 'SELECT * FROM t1 WHERE id = ?';
+# K2-admit: first EXECUTE → admission → HOT
+SET @p = 1;
+EXECUTE stmt USING @p;
+id	val	uk
+1	one	10
+admissions after K2-admit (expect 1): 1
+# K2-hit1: second EXECUTE → fast path hit
+SET @p = 2;
+EXECUTE stmt USING @p;
+id	val	uk
+2	two	20
+# K2-hit2: third EXECUTE → fast path hit
+SET @p = 3;
+EXECUTE stmt USING @p;
+id	val	uk
+3	three	30
+hits after K2 (expect 2): 2
+DEALLOCATE PREPARE stmt;
+# -------------------------------------------------------
+# K3: DDL + reprepare under cursor protocol session.
+# -------------------------------------------------------
+FLUSH STATUS;
+PREPARE stmt2 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt2 USING @p;
+id	val	uk
+1	one	10
+ALTER TABLE t1 ADD COLUMN extra INT DEFAULT 0;
+SET @p = 2;
+EXECUTE stmt2 USING @p;
+id	val	uk	extra
+2	two	20	0
+admissions delta after K3 DDL (expect 1): 1
+# K3-hit: fast path hit after re-admission
+SET @p = 3;
+EXECUTE stmt2 USING @p;
+id	val	uk	extra
+3	three	30	0
+hits after K3-hit (expect 1): 1
+ALTER TABLE t1 DROP COLUMN extra;
+SET @p = 1;
+EXECUTE stmt2 USING @p;
+id	val	uk
+1	one	10
+DEALLOCATE PREPARE stmt2;
+# -------------------------------------------------------
+# K4: Verify binary protocol is active
+# -------------------------------------------------------
+# Confirmed: binary protocol active (Com_stmt_execute > 0)
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t1;
+#
+# Cursor protocol plan cache smoke test complete.
+#

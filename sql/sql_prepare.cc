@@ -3547,6 +3547,8 @@ bool Prepared_statement::execute(THD *thd, String *expanded_query,
     // Restore the original rewritten query.
     stmt_backup.restore_rlb(thd);
 
+    reset_ps_point_plan_runtime_state();
+
     if (m_arena.get_state() == Query_arena::STMT_PREPARED)
       m_arena.set_state(Query_arena::STMT_EXECUTED);
 
@@ -3558,6 +3560,8 @@ bool Prepared_statement::execute(THD *thd, String *expanded_query,
     // Validate postconditions:
     assert(thd->change_list.is_empty());
   });
+
+  m_ps_pc_cursor_execution = open_cursor;
 
   /*
     Change the current database (if needed).

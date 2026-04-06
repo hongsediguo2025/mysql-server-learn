@@ -1,0 +1,598 @@
+--echo #
+--echo # Phase 4 test: ps_point_plan_cache edge cases
+--echo # Covers invalidation, fallback, zero-row COLD retention,
+--echo # reprepare chains, DEALLOCATE, and multi-PS independence.
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  val VARCHAR(50),
+  uk INT NOT NULL,
+  UNIQUE KEY idx_uk (uk)
+);
+
+CREATE TABLE t2 (
+  id INT PRIMARY KEY,
+  val INT
+);
+
+CREATE TABLE t_comp (
+  pk1 INT,
+  pk2 INT,
+  val INT,
+  PRIMARY KEY (pk1, pk2)
+);
+
+INSERT INTO t1 VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30);
+INSERT INTO t2 VALUES (1, 100), (2, 200);
+INSERT INTO t_comp VALUES (1, 1, 100), (1, 2, 200), (2, 1, 300);
+
+--echo # =======================================================
+--echo # A. Zero-row first EXECUTE — COLD retention
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_a FROM 'SELECT * FROM t1 WHERE id = ?';
+
+--echo # A1: first EXECUTE with non-existent PK → empty result, stays COLD
+SET @p = 999;
+EXECUTE stmt_a USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after A1 (expect 0): $adm
+
+--echo # A2: second EXECUTE with valid PK → normal optimize → admission → HOT
+SET @p = 1;
+EXECUTE stmt_a USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after A2 (expect 1): $adm
+
+--echo # A3: third EXECUTE → fast path hit
+SET @p = 2;
+EXECUTE stmt_a USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after A3 (expect 1): $hits
+
+DEALLOCATE PREPARE stmt_a;
+
+--echo # =======================================================
+--echo # B. Parameter type change — runtime fallback (G8)
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_b FROM 'SELECT * FROM t1 WHERE id = ?';
+
+--echo # B-admit: INT parameter → admission → HOT
+SET @p = 1;
+EXECUTE stmt_b USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after B-admit (expect 1): $adm
+
+--echo # B1: STRING parameter 'abc' → G8 type mismatch → runtime fallback
+SET @p = 'abc';
+EXECUTE stmt_b USING @p;
+
+--let $fb = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--echo fallback_runtime after B1 (expect 1): $fb
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after B1 (expect 0): $hits
+
+--echo # B2: restore INT parameter → G8 passes → fast path hit
+SET @p = 2;
+EXECUTE stmt_b USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after B2 (expect 1): $hits
+
+--echo # B3: DOUBLE parameter 1.5 → check_parameter_types() rejects → reprepare
+--echo #     After reprepare, PS is re-classified COLD.
+--echo #     The reprepare-for-types propagation via copy_param_actual_type()
+--echo #     causes the PS to not re-admit on subsequent INT executions in
+--echo #     this sequence (B1 STRING changed internal param state).
+--echo #     This is safe: correct results via normal optimizer path.
+SET @p = 1.5;
+EXECUTE stmt_b USING @p;
+
+--let $cold = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--echo cold_classifications after B3 reprepare (expect 2): $cold
+
+--echo # B4: INT parameter — correct result via normal optimizer
+SET @p = 3;
+EXECUTE stmt_b USING @p;
+
+--echo # B5: INT parameter — correct result
+SET @p = 1;
+EXECUTE stmt_b USING @p;
+
+DEALLOCATE PREPARE stmt_b;
+
+--echo # =======================================================
+--echo # C. DROP INDEX — invalidation via reprepare
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_c FROM 'SELECT * FROM t1 WHERE uk = ?';
+
+--echo # C-admit: UK lookup → admission → HOT
+SET @p = 10;
+EXECUTE stmt_c USING @p;
+
+--echo # C-hit: fast path hit
+SET @p = 20;
+EXECUTE stmt_c USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after C-hit (expect 1): $hits
+
+--echo # C1: DROP INDEX → next EXECUTE triggers reprepare
+ALTER TABLE t1 DROP INDEX idx_uk;
+
+SET @p = 10;
+EXECUTE stmt_c USING @p;
+
+--echo # After DROP INDEX + reprepare, uk has no unique key.
+--echo # classify succeeds (WHERE shape ok) → COLD, but admission fails (no JT_CONST) → NEVER.
+--echo # Verify: no new admissions from this path.
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after C1 (expect 1, no new admission): $adm
+
+--echo # Restore the index for subsequent tests
+ALTER TABLE t1 ADD UNIQUE KEY idx_uk (uk);
+
+DEALLOCATE PREPARE stmt_c;
+
+--echo # =======================================================
+--echo # D. Multiple consecutive DDLs — reprepare chain
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_d FROM 'SELECT * FROM t1 WHERE id = ?';
+
+--echo # D-admit: admission → HOT
+SET @p = 1;
+EXECUTE stmt_d USING @p;
+
+--let $adm_base = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+
+--echo # D1a: ALTER ADD COLUMN → EXECUTE → reprepare → re-admit
+ALTER TABLE t1 ADD COLUMN extra1 INT DEFAULT 0;
+
+SET @p = 2;
+EXECUTE stmt_d USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm - $adm_base`
+--echo admissions delta after D1a (expect 1): $adm_delta
+
+--echo # D1b: fast path hit confirms re-admission succeeded
+SET @p = 3;
+EXECUTE stmt_d USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after D1b (expect 1): $hits
+
+--echo # D1c: second ALTER + EXECUTE → another reprepare + re-admit
+ALTER TABLE t1 DROP COLUMN extra1;
+
+SET @p = 1;
+EXECUTE stmt_d USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm - $adm_base`
+--echo admissions delta after D1c (expect 2): $adm_delta
+
+--echo # D2: two DDLs before one EXECUTE → single reprepare + re-admit
+ALTER TABLE t1 ADD COLUMN extra_a INT DEFAULT 0;
+ALTER TABLE t1 ADD COLUMN extra_b INT DEFAULT 0;
+
+SET @p = 2;
+EXECUTE stmt_d USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm - $adm_base`
+--echo admissions delta after D2 (expect 3): $adm_delta
+
+--echo # Cleanup extra columns
+ALTER TABLE t1 DROP COLUMN extra_a, DROP COLUMN extra_b;
+
+SET @p = 1;
+EXECUTE stmt_d USING @p;
+
+DEALLOCATE PREPARE stmt_d;
+
+--echo # =======================================================
+--echo # E. TRUNCATE TABLE — zero-result after empty + re-admit
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_e FROM 'SELECT * FROM t1 WHERE id = ?';
+
+--echo # E-admit: admission → HOT
+SET @p = 1;
+EXECUTE stmt_e USING @p;
+
+--let $adm_base = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+
+--echo # E1: TRUNCATE → EXECUTE → reprepare → table empty → zero_result → COLD stays
+TRUNCATE TABLE t1;
+
+SET @p = 1;
+EXECUTE stmt_e USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm - $adm_base`
+--echo admissions delta after E1 TRUNCATE (expect 0): $adm_delta
+
+--echo # E2: INSERT data back → EXECUTE → normal optimize → admission → HOT
+INSERT INTO t1 VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30);
+
+SET @p = 1;
+EXECUTE stmt_e USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm - $adm_base`
+--echo admissions delta after E2 INSERT+EXECUTE (expect 1): $adm_delta
+
+--echo # E3: fast path hit
+SET @p = 2;
+EXECUTE stmt_e USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after E3 (expect 1): $hits
+
+DEALLOCATE PREPARE stmt_e;
+
+--echo # =======================================================
+--echo # F. DEALLOCATE + re-PREPARE — fresh PS lifecycle
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_f FROM 'SELECT * FROM t1 WHERE id = ?';
+
+--echo # F-admit: admission → HOT
+SET @p = 1;
+EXECUTE stmt_f USING @p;
+
+--echo # F-hit: fast path hit
+SET @p = 2;
+EXECUTE stmt_f USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after F-hit (expect 1): $hits
+
+--echo # F1: DEALLOCATE → re-PREPARE same statement → fresh PS
+DEALLOCATE PREPARE stmt_f;
+
+FLUSH STATUS;
+PREPARE stmt_f FROM 'SELECT * FROM t1 WHERE id = ?';
+
+--let $cold = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--echo cold_classifications after re-PREPARE (expect 1): $cold
+
+--echo # F1-admit: first EXECUTE → admission → HOT
+SET @p = 1;
+EXECUTE stmt_f USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after F1-admit (expect 1): $adm
+
+--echo # F1-hit: second EXECUTE → fast path hit
+SET @p = 3;
+EXECUTE stmt_f USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after F1-hit (expect 1): $hits
+
+DEALLOCATE PREPARE stmt_f;
+
+--echo # =======================================================
+--echo # G. Multi-PS independence across different tables + DDL
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE ps_g1 FROM 'SELECT * FROM t1 WHERE id = ?';
+PREPARE ps_g2 FROM 'SELECT * FROM t2 WHERE id = ?';
+
+--echo # G-admit both
+SET @p = 1;
+EXECUTE ps_g1 USING @p;
+EXECUTE ps_g2 USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after both admit (expect 2): $adm
+
+--echo # G-hit both
+SET @p = 2;
+EXECUTE ps_g1 USING @p;
+EXECUTE ps_g2 USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after both hit (expect 2): $hits
+
+--echo # G1: ALTER only t1 → ps_g1 reprepares, ps_g2 unaffected
+ALTER TABLE t1 ADD COLUMN g_extra INT DEFAULT 0;
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+SET @p = 1;
+EXECUTE ps_g1 USING @p;
+
+--echo # ps_g1 reprepared → re-admission
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after G1 ps_g1 (expect 3): $adm
+
+--echo # G2: ps_g2 still HOT → fast path hit (unaffected by t1 DDL)
+SET @p = 1;
+EXECUTE ps_g2 USING @p;
+
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta for ps_g2 after t1 DDL (expect 1): $hits_delta
+
+--echo # Cleanup
+ALTER TABLE t1 DROP COLUMN g_extra;
+SET @p = 1;
+EXECUTE ps_g1 USING @p;
+
+DEALLOCATE PREPARE ps_g1;
+DEALLOCATE PREPARE ps_g2;
+
+--echo # =======================================================
+--echo # H. Concurrent DDL — multi-session reprepare
+--echo # =======================================================
+
+connect (con_ddl, localhost, root,,);
+connection default;
+
+FLUSH STATUS;
+
+PREPARE stmt_h FROM 'SELECT * FROM t1 WHERE id = ?';
+
+--echo # H-admit: admission → HOT
+SET @p = 1;
+EXECUTE stmt_h USING @p;
+
+--echo # H-hit: fast path hit
+SET @p = 2;
+EXECUTE stmt_h USING @p;
+
+--let $hits_base = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $adm_base = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+
+--echo # H1: Another session does ALTER TABLE → next EXECUTE triggers reprepare
+connection con_ddl;
+ALTER TABLE t1 ADD COLUMN h_col INT DEFAULT 0;
+
+connection default;
+SET @p = 1;
+EXECUTE stmt_h USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm - $adm_base`
+--echo admissions delta after H1 (expect 1): $adm_delta
+
+--echo # H1b: fast path hit confirms re-admission after cross-session DDL
+SET @p = 2;
+EXECUTE stmt_h USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits - $hits_base`
+--echo hits delta after H1b (expect 1): $hits_delta
+
+--echo # H2: Second DDL from another session → another reprepare + re-admit
+connection con_ddl;
+ALTER TABLE t1 DROP COLUMN h_col;
+
+connection default;
+SET @p = 3;
+EXECUTE stmt_h USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm - $adm_base`
+--echo admissions delta after H2 (expect 2): $adm_delta
+
+DEALLOCATE PREPARE stmt_h;
+
+--echo # H3: DROP TABLE from another session → reprepare fails → error
+CREATE TABLE t_h3 (id INT PRIMARY KEY, val INT);
+INSERT INTO t_h3 VALUES (1, 10), (2, 20);
+
+PREPARE stmt_h3 FROM 'SELECT * FROM t_h3 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_h3 USING @p;
+SET @p = 2;
+EXECUTE stmt_h3 USING @p;
+
+connection con_ddl;
+DROP TABLE t_h3;
+
+connection default;
+--error ER_NO_SUCH_TABLE
+EXECUTE stmt_h3 USING @p;
+DEALLOCATE PREPARE stmt_h3;
+
+disconnect con_ddl;
+connection default;
+
+--echo # =======================================================
+--echo # I. Handler error handling
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # I-setup: get PS to HOT
+PREPARE stmt_i FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_i USING @p;
+SET @p = 2;
+EXECUTE stmt_i USING @p;
+
+--let $hits_base = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+--echo # I1: DELETE all rows → fast path still entered, handler returns no row
+DELETE FROM t1;
+SET @p = 1;
+EXECUTE stmt_i USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits - $hits_base`
+--echo hits delta after I1 empty table (expect 1): $hits_delta
+
+--echo # I2: INSERT data back → fast path returns fresh data
+INSERT INTO t1 VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30);
+SET @p = 1;
+EXECUTE stmt_i USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits - $hits_base`
+--echo hits delta after I2 data restored (expect 2): $hits_delta
+
+DEALLOCATE PREPARE stmt_i;
+
+--echo # I3: HOT PS → DROP TABLE → reprepare fails → error
+CREATE TABLE t_drop (id INT PRIMARY KEY, val INT);
+INSERT INTO t_drop VALUES (1, 10), (2, 20);
+
+PREPARE stmt_drop FROM 'SELECT * FROM t_drop WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_drop USING @p;
+SET @p = 2;
+EXECUTE stmt_drop USING @p;
+
+DROP TABLE t_drop;
+
+--error ER_NO_SUCH_TABLE
+EXECUTE stmt_drop USING @p;
+DEALLOCATE PREPARE stmt_drop;
+
+--echo # I4: Lock contention → MDL timeout → PS stays HOT after unlock
+connect (con_lock, localhost, root,,);
+connection default;
+
+FLUSH STATUS;
+
+PREPARE stmt_lock FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_lock USING @p;
+SET @p = 2;
+EXECUTE stmt_lock USING @p;
+
+--let $hits_base = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+connection con_lock;
+LOCK TABLES t1 WRITE;
+
+connection default;
+SET @lock_save = @@session.lock_wait_timeout;
+SET SESSION lock_wait_timeout = 1;
+
+--error ER_LOCK_WAIT_TIMEOUT
+EXECUTE stmt_lock USING @p;
+
+connection con_lock;
+UNLOCK TABLES;
+
+connection default;
+SET SESSION lock_wait_timeout = @lock_save;
+
+--echo # After unlock, PS should still be HOT → fast path hit
+SET @p = 3;
+EXECUTE stmt_lock USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits - $hits_base`
+--echo hits delta after I4 unlock+execute (expect 1): $hits_delta
+
+DEALLOCATE PREPARE stmt_lock;
+disconnect con_lock;
+connection default;
+
+--echo # =======================================================
+--echo # J. Stored procedure context
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # J-setup: PREPARE outside SP, admission → HOT
+PREPARE stmt_j FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_j USING @p;
+
+--let $hits_base = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+--echo # J1: EXECUTE inside stored procedure → fast path hits
+--delimiter |
+CREATE PROCEDURE sp_pc_exec(IN p1 INT, IN p2 INT, IN p3 INT)
+BEGIN
+  SET @sp_p = p1;
+  EXECUTE stmt_j USING @sp_p;
+  SET @sp_p = p2;
+  EXECUTE stmt_j USING @sp_p;
+  SET @sp_p = p3;
+  EXECUTE stmt_j USING @sp_p;
+END|
+--delimiter ;
+
+CALL sp_pc_exec(1, 2, 3);
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits - $hits_base`
+--echo hits delta after J1 SP exec (expect 3): $hits_delta
+
+DROP PROCEDURE sp_pc_exec;
+DEALLOCATE PREPARE stmt_j;
+
+--echo # J2: Stored procedure cursor — plan cache counters unaffected
+FLUSH STATUS;
+
+--delimiter |
+CREATE PROCEDURE sp_cursor_test()
+BEGIN
+  DECLARE v_id INT;
+  DECLARE v_val VARCHAR(50);
+  DECLARE v_uk INT;
+  DECLARE done INT DEFAULT FALSE;
+  DECLARE cur CURSOR FOR SELECT * FROM t1 WHERE id = 1;
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
+  OPEN cur;
+  FETCH cur INTO v_id, v_val, v_uk;
+  CLOSE cur;
+  SELECT v_id AS sp_cursor_id, v_val AS sp_cursor_val;
+END|
+--delimiter ;
+
+CALL sp_cursor_test();
+
+--let $cold = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo cold after SP cursor (expect 0): $cold
+--echo admissions after SP cursor (expect 0): $adm
+--echo hits after SP cursor (expect 0): $hits
+
+DROP PROCEDURE sp_cursor_test;
+
+--echo # -------------------------------------------------------
+--echo # Teardown
+--echo # -------------------------------------------------------
+
+DROP TABLE t1;
+DROP TABLE t2;
+DROP TABLE t_comp;
+
+--echo # Phase 4 edge tests complete.

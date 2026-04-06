@@ -1,0 +1,460 @@
+#
+# Phase 4 test: ps_point_plan_cache edge cases
+# Covers invalidation, fallback, zero-row COLD retention,
+# reprepare chains, DEALLOCATE, and multi-PS independence.
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+val VARCHAR(50),
+uk INT NOT NULL,
+UNIQUE KEY idx_uk (uk)
+);
+CREATE TABLE t2 (
+id INT PRIMARY KEY,
+val INT
+);
+CREATE TABLE t_comp (
+pk1 INT,
+pk2 INT,
+val INT,
+PRIMARY KEY (pk1, pk2)
+);
+INSERT INTO t1 VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30);
+INSERT INTO t2 VALUES (1, 100), (2, 200);
+INSERT INTO t_comp VALUES (1, 1, 100), (1, 2, 200), (2, 1, 300);
+# =======================================================
+# A. Zero-row first EXECUTE — COLD retention
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_a FROM 'SELECT * FROM t1 WHERE id = ?';
+# A1: first EXECUTE with non-existent PK → empty result, stays COLD
+SET @p = 999;
+EXECUTE stmt_a USING @p;
+id	val	uk
+admissions after A1 (expect 0): 0
+# A2: second EXECUTE with valid PK → normal optimize → admission → HOT
+SET @p = 1;
+EXECUTE stmt_a USING @p;
+id	val	uk
+1	one	10
+admissions after A2 (expect 1): 1
+# A3: third EXECUTE → fast path hit
+SET @p = 2;
+EXECUTE stmt_a USING @p;
+id	val	uk
+2	two	20
+hits after A3 (expect 1): 1
+DEALLOCATE PREPARE stmt_a;
+# =======================================================
+# B. Parameter type change — runtime fallback (G8)
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_b FROM 'SELECT * FROM t1 WHERE id = ?';
+# B-admit: INT parameter → admission → HOT
+SET @p = 1;
+EXECUTE stmt_b USING @p;
+id	val	uk
+1	one	10
+admissions after B-admit (expect 1): 1
+# B1: STRING parameter 'abc' → G8 type mismatch → runtime fallback
+SET @p = 'abc';
+EXECUTE stmt_b USING @p;
+id	val	uk
+Warnings:
+Warning	1292	Truncated incorrect INTEGER value: 'abc'
+fallback_runtime after B1 (expect 1): 1
+hits after B1 (expect 0): 0
+# B2: restore INT parameter → G8 passes → fast path hit
+SET @p = 2;
+EXECUTE stmt_b USING @p;
+id	val	uk
+2	two	20
+hits after B2 (expect 1): 1
+# B3: DOUBLE parameter 1.5 → check_parameter_types() rejects → reprepare
+#     After reprepare, PS is re-classified COLD.
+#     The reprepare-for-types propagation via copy_param_actual_type()
+#     causes the PS to not re-admit on subsequent INT executions in
+#     this sequence (B1 STRING changed internal param state).
+#     This is safe: correct results via normal optimizer path.
+SET @p = 1.5;
+EXECUTE stmt_b USING @p;
+id	val	uk
+cold_classifications after B3 reprepare (expect 2): 2
+# B4: INT parameter — correct result via normal optimizer
+SET @p = 3;
+EXECUTE stmt_b USING @p;
+id	val	uk
+3	three	30
+# B5: INT parameter — correct result
+SET @p = 1;
+EXECUTE stmt_b USING @p;
+id	val	uk
+1	one	10
+DEALLOCATE PREPARE stmt_b;
+# =======================================================
+# C. DROP INDEX — invalidation via reprepare
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_c FROM 'SELECT * FROM t1 WHERE uk = ?';
+# C-admit: UK lookup → admission → HOT
+SET @p = 10;
+EXECUTE stmt_c USING @p;
+id	val	uk
+1	one	10
+# C-hit: fast path hit
+SET @p = 20;
+EXECUTE stmt_c USING @p;
+id	val	uk
+2	two	20
+hits after C-hit (expect 1): 1
+# C1: DROP INDEX → next EXECUTE triggers reprepare
+ALTER TABLE t1 DROP INDEX idx_uk;
+SET @p = 10;
+EXECUTE stmt_c USING @p;
+id	val	uk
+1	one	10
+# After DROP INDEX + reprepare, uk has no unique key.
+# classify succeeds (WHERE shape ok) → COLD, but admission fails (no JT_CONST) → NEVER.
+# Verify: no new admissions from this path.
+admissions after C1 (expect 1, no new admission): 1
+# Restore the index for subsequent tests
+ALTER TABLE t1 ADD UNIQUE KEY idx_uk (uk);
+DEALLOCATE PREPARE stmt_c;
+# =======================================================
+# D. Multiple consecutive DDLs — reprepare chain
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_d FROM 'SELECT * FROM t1 WHERE id = ?';
+# D-admit: admission → HOT
+SET @p = 1;
+EXECUTE stmt_d USING @p;
+id	val	uk
+1	one	10
+# D1a: ALTER ADD COLUMN → EXECUTE → reprepare → re-admit
+ALTER TABLE t1 ADD COLUMN extra1 INT DEFAULT 0;
+SET @p = 2;
+EXECUTE stmt_d USING @p;
+id	val	uk	extra1
+2	two	20	0
+admissions delta after D1a (expect 1): 1
+# D1b: fast path hit confirms re-admission succeeded
+SET @p = 3;
+EXECUTE stmt_d USING @p;
+id	val	uk	extra1
+3	three	30	0
+hits after D1b (expect 1): 1
+# D1c: second ALTER + EXECUTE → another reprepare + re-admit
+ALTER TABLE t1 DROP COLUMN extra1;
+SET @p = 1;
+EXECUTE stmt_d USING @p;
+id	val	uk
+1	one	10
+admissions delta after D1c (expect 2): 2
+# D2: two DDLs before one EXECUTE → single reprepare + re-admit
+ALTER TABLE t1 ADD COLUMN extra_a INT DEFAULT 0;
+ALTER TABLE t1 ADD COLUMN extra_b INT DEFAULT 0;
+SET @p = 2;
+EXECUTE stmt_d USING @p;
+id	val	uk	extra_a	extra_b
+2	two	20	0	0
+admissions delta after D2 (expect 3): 3
+# Cleanup extra columns
+ALTER TABLE t1 DROP COLUMN extra_a, DROP COLUMN extra_b;
+SET @p = 1;
+EXECUTE stmt_d USING @p;
+id	val	uk
+1	one	10
+DEALLOCATE PREPARE stmt_d;
+# =======================================================
+# E. TRUNCATE TABLE — zero-result after empty + re-admit
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_e FROM 'SELECT * FROM t1 WHERE id = ?';
+# E-admit: admission → HOT
+SET @p = 1;
+EXECUTE stmt_e USING @p;
+id	val	uk
+1	one	10
+# E1: TRUNCATE → EXECUTE → reprepare → table empty → zero_result → COLD stays
+TRUNCATE TABLE t1;
+SET @p = 1;
+EXECUTE stmt_e USING @p;
+id	val	uk
+admissions delta after E1 TRUNCATE (expect 0): 0
+# E2: INSERT data back → EXECUTE → normal optimize → admission → HOT
+INSERT INTO t1 VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30);
+SET @p = 1;
+EXECUTE stmt_e USING @p;
+id	val	uk
+1	one	10
+admissions delta after E2 INSERT+EXECUTE (expect 1): 1
+# E3: fast path hit
+SET @p = 2;
+EXECUTE stmt_e USING @p;
+id	val	uk
+2	two	20
+hits after E3 (expect 1): 1
+DEALLOCATE PREPARE stmt_e;
+# =======================================================
+# F. DEALLOCATE + re-PREPARE — fresh PS lifecycle
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_f FROM 'SELECT * FROM t1 WHERE id = ?';
+# F-admit: admission → HOT
+SET @p = 1;
+EXECUTE stmt_f USING @p;
+id	val	uk
+1	one	10
+# F-hit: fast path hit
+SET @p = 2;
+EXECUTE stmt_f USING @p;
+id	val	uk
+2	two	20
+hits after F-hit (expect 1): 1
+# F1: DEALLOCATE → re-PREPARE same statement → fresh PS
+DEALLOCATE PREPARE stmt_f;
+FLUSH STATUS;
+PREPARE stmt_f FROM 'SELECT * FROM t1 WHERE id = ?';
+cold_classifications after re-PREPARE (expect 1): 1
+# F1-admit: first EXECUTE → admission → HOT
+SET @p = 1;
+EXECUTE stmt_f USING @p;
+id	val	uk
+1	one	10
+admissions after F1-admit (expect 1): 1
+# F1-hit: second EXECUTE → fast path hit
+SET @p = 3;
+EXECUTE stmt_f USING @p;
+id	val	uk
+3	three	30
+hits after F1-hit (expect 1): 1
+DEALLOCATE PREPARE stmt_f;
+# =======================================================
+# G. Multi-PS independence across different tables + DDL
+# =======================================================
+FLUSH STATUS;
+PREPARE ps_g1 FROM 'SELECT * FROM t1 WHERE id = ?';
+PREPARE ps_g2 FROM 'SELECT * FROM t2 WHERE id = ?';
+# G-admit both
+SET @p = 1;
+EXECUTE ps_g1 USING @p;
+id	val	uk
+1	one	10
+EXECUTE ps_g2 USING @p;
+id	val
+1	100
+admissions after both admit (expect 2): 2
+# G-hit both
+SET @p = 2;
+EXECUTE ps_g1 USING @p;
+id	val	uk
+2	two	20
+EXECUTE ps_g2 USING @p;
+id	val
+2	200
+hits after both hit (expect 2): 2
+# G1: ALTER only t1 → ps_g1 reprepares, ps_g2 unaffected
+ALTER TABLE t1 ADD COLUMN g_extra INT DEFAULT 0;
+SET @p = 1;
+EXECUTE ps_g1 USING @p;
+id	val	uk	g_extra
+1	one	10	0
+# ps_g1 reprepared → re-admission
+admissions after G1 ps_g1 (expect 3): 3
+# G2: ps_g2 still HOT → fast path hit (unaffected by t1 DDL)
+SET @p = 1;
+EXECUTE ps_g2 USING @p;
+id	val
+1	100
+hits delta for ps_g2 after t1 DDL (expect 1): 1
+# Cleanup
+ALTER TABLE t1 DROP COLUMN g_extra;
+SET @p = 1;
+EXECUTE ps_g1 USING @p;
+id	val	uk
+1	one	10
+DEALLOCATE PREPARE ps_g1;
+DEALLOCATE PREPARE ps_g2;
+# =======================================================
+# H. Concurrent DDL — multi-session reprepare
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_h FROM 'SELECT * FROM t1 WHERE id = ?';
+# H-admit: admission → HOT
+SET @p = 1;
+EXECUTE stmt_h USING @p;
+id	val	uk
+1	one	10
+# H-hit: fast path hit
+SET @p = 2;
+EXECUTE stmt_h USING @p;
+id	val	uk
+2	two	20
+# H1: Another session does ALTER TABLE → next EXECUTE triggers reprepare
+ALTER TABLE t1 ADD COLUMN h_col INT DEFAULT 0;
+SET @p = 1;
+EXECUTE stmt_h USING @p;
+id	val	uk	h_col
+1	one	10	0
+admissions delta after H1 (expect 1): 1
+# H1b: fast path hit confirms re-admission after cross-session DDL
+SET @p = 2;
+EXECUTE stmt_h USING @p;
+id	val	uk	h_col
+2	two	20	0
+hits delta after H1b (expect 1): 1
+# H2: Second DDL from another session → another reprepare + re-admit
+ALTER TABLE t1 DROP COLUMN h_col;
+SET @p = 3;
+EXECUTE stmt_h USING @p;
+id	val	uk
+3	three	30
+admissions delta after H2 (expect 2): 2
+DEALLOCATE PREPARE stmt_h;
+# H3: DROP TABLE from another session → reprepare fails → error
+CREATE TABLE t_h3 (id INT PRIMARY KEY, val INT);
+INSERT INTO t_h3 VALUES (1, 10), (2, 20);
+PREPARE stmt_h3 FROM 'SELECT * FROM t_h3 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_h3 USING @p;
+id	val
+1	10
+SET @p = 2;
+EXECUTE stmt_h3 USING @p;
+id	val
+2	20
+DROP TABLE t_h3;
+EXECUTE stmt_h3 USING @p;
+ERROR 42S02: Table 'test.t_h3' doesn't exist
+DEALLOCATE PREPARE stmt_h3;
+# =======================================================
+# I. Handler error handling
+# =======================================================
+FLUSH STATUS;
+# I-setup: get PS to HOT
+PREPARE stmt_i FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_i USING @p;
+id	val	uk
+1	one	10
+SET @p = 2;
+EXECUTE stmt_i USING @p;
+id	val	uk
+2	two	20
+# I1: DELETE all rows → fast path still entered, handler returns no row
+DELETE FROM t1;
+SET @p = 1;
+EXECUTE stmt_i USING @p;
+id	val	uk
+hits delta after I1 empty table (expect 1): 1
+# I2: INSERT data back → fast path returns fresh data
+INSERT INTO t1 VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30);
+SET @p = 1;
+EXECUTE stmt_i USING @p;
+id	val	uk
+1	one	10
+hits delta after I2 data restored (expect 2): 2
+DEALLOCATE PREPARE stmt_i;
+# I3: HOT PS → DROP TABLE → reprepare fails → error
+CREATE TABLE t_drop (id INT PRIMARY KEY, val INT);
+INSERT INTO t_drop VALUES (1, 10), (2, 20);
+PREPARE stmt_drop FROM 'SELECT * FROM t_drop WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_drop USING @p;
+id	val
+1	10
+SET @p = 2;
+EXECUTE stmt_drop USING @p;
+id	val
+2	20
+DROP TABLE t_drop;
+EXECUTE stmt_drop USING @p;
+ERROR 42S02: Table 'test.t_drop' doesn't exist
+DEALLOCATE PREPARE stmt_drop;
+# I4: Lock contention → MDL timeout → PS stays HOT after unlock
+FLUSH STATUS;
+PREPARE stmt_lock FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_lock USING @p;
+id	val	uk
+1	one	10
+SET @p = 2;
+EXECUTE stmt_lock USING @p;
+id	val	uk
+2	two	20
+LOCK TABLES t1 WRITE;
+SET @lock_save = @@session.lock_wait_timeout;
+SET SESSION lock_wait_timeout = 1;
+EXECUTE stmt_lock USING @p;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+UNLOCK TABLES;
+SET SESSION lock_wait_timeout = @lock_save;
+# After unlock, PS should still be HOT → fast path hit
+SET @p = 3;
+EXECUTE stmt_lock USING @p;
+id	val	uk
+3	three	30
+hits delta after I4 unlock+execute (expect 1): 1
+DEALLOCATE PREPARE stmt_lock;
+# =======================================================
+# J. Stored procedure context
+# =======================================================
+FLUSH STATUS;
+# J-setup: PREPARE outside SP, admission → HOT
+PREPARE stmt_j FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_j USING @p;
+id	val	uk
+1	one	10
+# J1: EXECUTE inside stored procedure → fast path hits
+CREATE PROCEDURE sp_pc_exec(IN p1 INT, IN p2 INT, IN p3 INT)
+BEGIN
+SET @sp_p = p1;
+EXECUTE stmt_j USING @sp_p;
+SET @sp_p = p2;
+EXECUTE stmt_j USING @sp_p;
+SET @sp_p = p3;
+EXECUTE stmt_j USING @sp_p;
+END|
+CALL sp_pc_exec(1, 2, 3);
+id	val	uk
+1	one	10
+id	val	uk
+2	two	20
+id	val	uk
+3	three	30
+hits delta after J1 SP exec (expect 3): 3
+DROP PROCEDURE sp_pc_exec;
+DEALLOCATE PREPARE stmt_j;
+# J2: Stored procedure cursor — plan cache counters unaffected
+FLUSH STATUS;
+CREATE PROCEDURE sp_cursor_test()
+BEGIN
+DECLARE v_id INT;
+DECLARE v_val VARCHAR(50);
+DECLARE v_uk INT;
+DECLARE done INT DEFAULT FALSE;
+DECLARE cur CURSOR FOR SELECT * FROM t1 WHERE id = 1;
+DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
+OPEN cur;
+FETCH cur INTO v_id, v_val, v_uk;
+CLOSE cur;
+SELECT v_id AS sp_cursor_id, v_val AS sp_cursor_val;
+END|
+CALL sp_cursor_test();
+sp_cursor_id	sp_cursor_val
+1	one
+cold after SP cursor (expect 0): 0
+admissions after SP cursor (expect 0): 0
+hits after SP cursor (expect 0): 0
+DROP PROCEDURE sp_cursor_test;
+# -------------------------------------------------------
+# Teardown
+# -------------------------------------------------------
+DROP TABLE t1;
+DROP TABLE t2;
+DROP TABLE t_comp;
+# Phase 4 edge tests complete.
