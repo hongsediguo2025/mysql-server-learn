@@ -1,0 +1,236 @@
+#
+# ps_point_plan_cache: type variant coverage
+# Verifies plan cache behavior for different PK/UK column types:
+# VARCHAR PK, VARBINARY PK, nullable UNIQUE KEY, ENUM UK,
+# generated column UK, composite mixed-type UK, and partitioned
+# table exclusion.
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t_varchar (
+id VARCHAR(64) PRIMARY KEY,
+val INT
+) CHARACTER SET utf8mb4;
+CREATE TABLE t_varbinary (
+id VARBINARY(64) PRIMARY KEY,
+val INT
+);
+CREATE TABLE t_nullable_uk (
+id INT AUTO_INCREMENT PRIMARY KEY,
+uk_col VARCHAR(50),
+val INT,
+UNIQUE KEY idx_uk (uk_col)
+);
+CREATE TABLE t_enum_uk (
+id INT AUTO_INCREMENT PRIMARY KEY,
+status ENUM('active', 'inactive', 'pending') NOT NULL,
+val INT,
+UNIQUE KEY idx_status (status)
+);
+CREATE TABLE t_generated (
+id INT PRIMARY KEY,
+first_name VARCHAR(50),
+last_name VARCHAR(50),
+full_name VARCHAR(101) AS (CONCAT(first_name, ' ', last_name)) STORED NOT NULL,
+UNIQUE KEY idx_full (full_name)
+);
+CREATE TABLE t_comp_mixed (
+pk_int INT,
+pk_str VARCHAR(32),
+val INT,
+PRIMARY KEY (pk_int, pk_str)
+) CHARACTER SET utf8mb4;
+CREATE TABLE t_partitioned (
+id INT PRIMARY KEY,
+val INT
+) PARTITION BY HASH(id) PARTITIONS 4;
+INSERT INTO t_varchar VALUES ('alpha', 1), ('beta', 2), ('gamma', 3);
+INSERT INTO t_varbinary VALUES ('bin_a', 1), ('bin_b', 2), ('bin_c', 3);
+INSERT INTO t_nullable_uk VALUES (1, 'unique_a', 10), (2, 'unique_b', 20), (3, NULL, 30);
+INSERT INTO t_enum_uk VALUES (1, 'active', 10), (2, 'inactive', 20), (3, 'pending', 30);
+INSERT INTO t_generated (id, first_name, last_name) VALUES (1, 'John', 'Doe'), (2, 'Jane', 'Smith'), (3, 'Bob', 'Jones');
+INSERT INTO t_comp_mixed VALUES (1, 'aaa', 10), (1, 'bbb', 20), (2, 'aaa', 30);
+INSERT INTO t_partitioned VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+# =======================================================
+# A. VARCHAR PRIMARY KEY
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_vc FROM 'SELECT * FROM t_varchar WHERE id = ?';
+# A1: first EXECUTE (INT param) → admission
+SET @p = 'alpha';
+EXECUTE stmt_vc USING @p;
+id	val
+alpha	1
+admissions after A1 (expect 1): 1
+# A2: fast path hit with different value
+SET @p = 'beta';
+EXECUTE stmt_vc USING @p;
+id	val
+beta	2
+hits after A2 (expect 1): 1
+# A3: non-existent key → fast path hit (returns empty)
+SET @p = 'no_such_key';
+EXECUTE stmt_vc USING @p;
+id	val
+hits after A3 (expect 2): 2
+DEALLOCATE PREPARE stmt_vc;
+# =======================================================
+# B. VARBINARY PRIMARY KEY
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_vb FROM 'SELECT * FROM t_varbinary WHERE id = ?';
+SET @p = 'bin_a';
+EXECUTE stmt_vb USING @p;
+id	val
+bin_a	1
+admissions after B1 (expect 1): 1
+SET @p = 'bin_b';
+EXECUTE stmt_vb USING @p;
+id	val
+bin_b	2
+hits after B2 (expect 1): 1
+DEALLOCATE PREPARE stmt_vb;
+# =======================================================
+# C. Nullable UNIQUE KEY
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_nuk FROM 'SELECT * FROM t_nullable_uk WHERE uk_col = ?';
+# C1: admission with non-NULL value
+SET @p = 'unique_a';
+EXECUTE stmt_nuk USING @p;
+id	uk_col	val
+1	unique_a	10
+admissions after C1 (expect 1): 1
+# C2: fast path hit
+SET @p = 'unique_b';
+EXECUTE stmt_nuk USING @p;
+id	uk_col	val
+2	unique_b	20
+hits after C2 (expect 1): 1
+# C3: NULL parameter → runtime fallback (G7), HOT preserved
+SET @p = NULL;
+EXECUTE stmt_nuk USING @p;
+id	uk_col	val
+fallback after C3 (expect 1): 1
+# C4: non-NULL again → fast path hit (HOT was preserved)
+SET @p = 'unique_a';
+EXECUTE stmt_nuk USING @p;
+id	uk_col	val
+1	unique_a	10
+hits after C4 (expect 2): 2
+DEALLOCATE PREPARE stmt_nuk;
+# =======================================================
+# D. ENUM UNIQUE KEY
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_enum FROM 'SELECT * FROM t_enum_uk WHERE status = ?';
+SET @p = 'active';
+EXECUTE stmt_enum USING @p;
+id	status	val
+1	active	10
+admissions after D1 (expect 1): 1
+SET @p = 'inactive';
+EXECUTE stmt_enum USING @p;
+id	status	val
+2	inactive	20
+hits after D2 (expect 1): 1
+DEALLOCATE PREPARE stmt_enum;
+# =======================================================
+# E. Generated (STORED) column UNIQUE KEY
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_gen FROM 'SELECT * FROM t_generated WHERE full_name = ?';
+SET @p = 'John Doe';
+EXECUTE stmt_gen USING @p;
+id	first_name	last_name	full_name
+1	John	Doe	John Doe
+admissions after E1 (expect 1): 1
+SET @p = 'Jane Smith';
+EXECUTE stmt_gen USING @p;
+id	first_name	last_name	full_name
+2	Jane	Smith	Jane Smith
+hits after E2 (expect 1): 1
+DEALLOCATE PREPARE stmt_gen;
+# =======================================================
+# F. Composite mixed-type PRIMARY KEY (INT, VARCHAR)
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_cm FROM 'SELECT * FROM t_comp_mixed WHERE pk_int = ? AND pk_str = ?';
+SET @p1 = 1;
+SET @p2 = 'aaa';
+EXECUTE stmt_cm USING @p1, @p2;
+pk_int	pk_str	val
+1	aaa	10
+admissions after F1 (expect 1): 1
+SET @p1 = 2;
+SET @p2 = 'aaa';
+EXECUTE stmt_cm USING @p1, @p2;
+pk_int	pk_str	val
+2	aaa	30
+hits after F2 (expect 1): 1
+# F3: reversed key order in WHERE is fine (reordered at admission)
+SET @p1 = 1;
+SET @p2 = 'bbb';
+EXECUTE stmt_cm USING @p1, @p2;
+pk_int	pk_str	val
+1	bbb	20
+hits after F3 (expect 2): 2
+DEALLOCATE PREPARE stmt_cm;
+# =======================================================
+# G. Partitioned table — must be excluded (NEVER)
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_part FROM 'SELECT * FROM t_partitioned WHERE id = ?';
+# G1: partitioned table classified as NEVER — no cold_classification
+cold_classifications after G-prepare (expect 0): 0
+SET @p = 1;
+EXECUTE stmt_part USING @p;
+id	val
+1	10
+admissions after G1 (expect 0): 0
+SET @p = 2;
+EXECUTE stmt_part USING @p;
+id	val
+2	20
+hits after G2 (expect 0): 0
+DEALLOCATE PREPARE stmt_part;
+# =======================================================
+# H. SELECT * vs SELECT col — same plan cache behavior
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_sel_star FROM 'SELECT * FROM t_varchar WHERE id = ?';
+PREPARE stmt_sel_col FROM 'SELECT val FROM t_varchar WHERE id = ?';
+# H1: SELECT * admission
+SET @p = 'alpha';
+EXECUTE stmt_sel_star USING @p;
+id	val
+alpha	1
+admissions after H1 (expect 1): 1
+# H2: SELECT col admission (second PS, independent)
+SET @p = 'beta';
+EXECUTE stmt_sel_col USING @p;
+val
+2
+admissions after H2 (expect 2): 2
+# H3: both hit fast path
+SET @p = 'gamma';
+EXECUTE stmt_sel_star USING @p;
+id	val
+gamma	3
+EXECUTE stmt_sel_col USING @p;
+val
+3
+hits after H3 (expect 2): 2
+DEALLOCATE PREPARE stmt_sel_star;
+DEALLOCATE PREPARE stmt_sel_col;
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t_varchar;
+DROP TABLE t_varbinary;
+DROP TABLE t_nullable_uk;
+DROP TABLE t_enum_uk;
+DROP TABLE t_generated;
+DROP TABLE t_comp_mixed;
+DROP TABLE t_partitioned;

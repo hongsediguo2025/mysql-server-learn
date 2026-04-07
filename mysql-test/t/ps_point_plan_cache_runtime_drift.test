@@ -1,0 +1,123 @@
+--echo #
+--echo # Phase 4 test: ps_point_plan_cache runtime drift
+--echo # Covers retryable HOT -> COLD demotion on optimizer-switch
+--echo # and character-set / collation changes.
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+CREATE TABLE t_inv (
+  id INT PRIMARY KEY,
+  uk INT NOT NULL,
+  val VARCHAR(20),
+  UNIQUE KEY idx_uk (uk) INVISIBLE
+);
+
+CREATE TABLE t_bin (
+  id VARBINARY(10) PRIMARY KEY,
+  val INT
+);
+
+INSERT INTO t_inv VALUES (1, 10, 'ten'), (2, 20, 'twenty');
+INSERT INTO t_bin VALUES ('a', 1), ('b', 2);
+
+--echo # =======================================================
+--echo # A. use_invisible_indexes drift — retryable HOT -> COLD
+--echo # =======================================================
+
+FLUSH STATUS;
+
+SET SESSION optimizer_switch='use_invisible_indexes=on';
+
+PREPARE stmt_inv FROM 'SELECT * FROM t_inv WHERE uk = ?';
+
+--echo # A1: admission with invisible unique index enabled
+SET @p = 10;
+EXECUTE stmt_inv USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after A1 (expect 1): $adm
+
+--echo # A2: disable use_invisible_indexes → fast path demotes to COLD
+SET SESSION optimizer_switch='use_invisible_indexes=off';
+SET @p = 20;
+EXECUTE stmt_inv USING @p;
+
+--let $fb = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--echo fallback_runtime after A2 (expect 1): $fb
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after A2 (expect 1): $adm
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after A2 (expect 0): $hits
+
+--echo # A3: re-enable use_invisible_indexes → normal optimize re-admits
+SET SESSION optimizer_switch='use_invisible_indexes=on';
+SET @p = 20;
+EXECUTE stmt_inv USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after A3 (expect 2): $adm
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after A3 (expect 0): $hits
+
+--echo # A4: next EXECUTE hits fast path again
+SET @p = 10;
+EXECUTE stmt_inv USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after A4 (expect 1): $hits
+
+DEALLOCATE PREPARE stmt_inv;
+
+SET SESSION optimizer_switch='use_invisible_indexes=default';
+
+--echo # =======================================================
+--echo # B. Charset / collation drift on binary key parameter
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_bin FROM 'SELECT * FROM t_bin WHERE id = ?';
+
+--echo # B1: admit with utf8mb4 connection collation
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+SET @p = 'a';
+EXECUTE stmt_bin USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after B1 (expect 1): $adm
+
+--echo # B2: switch connection collation → HOT demotes to COLD
+SET NAMES latin1 COLLATE latin1_swedish_ci;
+SET @p = 'b';
+EXECUTE stmt_bin USING @p;
+
+--let $fb = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--echo fallback_runtime after B2 (expect 1): $fb
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after B2 (expect 2): $adm
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after B2 (expect 0): $hits
+
+--echo # B3: same collation again → fast path hit
+SET @p = 'a';
+EXECUTE stmt_bin USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after B3 (expect 1): $hits
+
+DEALLOCATE PREPARE stmt_bin;
+
+SET character_set_client = DEFAULT;
+SET character_set_results = DEFAULT;
+SET collation_connection = DEFAULT;
+
+DROP TABLE t_bin;
+DROP TABLE t_inv;

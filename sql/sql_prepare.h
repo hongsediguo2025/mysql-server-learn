@@ -464,6 +464,7 @@ class Prepared_statement final {
     m_ps_pc_state = PsPointPlanState::INVALID;
     m_ps_pc = PsPointPlanTemplate{};
     m_ps_pc_cursor_execution = false;
+    m_ps_pc_retryable_cold = false;
   }
 
   void reset_ps_point_plan_runtime_state() {
@@ -476,6 +477,9 @@ class Prepared_statement final {
   void set_ps_point_plan_cursor_execution(bool v) {
     m_ps_pc_cursor_execution = v;
   }
+
+  bool ps_point_plan_retryable_cold() const { return m_ps_pc_retryable_cold; }
+  void set_ps_point_plan_retryable_cold(bool v) { m_ps_pc_retryable_cold = v; }
 
  private:
   void cleanup_stmt(THD *thd);
@@ -497,6 +501,7 @@ class Prepared_statement final {
   PsPointPlanState m_ps_pc_state{PsPointPlanState::NEVER};
   PsPointPlanTemplate m_ps_pc{};
   bool m_ps_pc_cursor_execution{false};
+  bool m_ps_pc_retryable_cold{false};
 };
 
 #endif  // SQL_PREPARE_H

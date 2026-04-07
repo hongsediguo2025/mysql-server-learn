@@ -48,6 +48,8 @@
 #include "my_inttypes.h"
 #include "sql/sql_const.h"
 
+struct CHARSET_INFO;
+class Field;
 class Item_param;
 class Prepared_statement;
 class Query_block;
@@ -55,6 +57,7 @@ class Table_ref;
 class THD;
 class JOIN;
 class KEY;
+class store_key;
 struct TABLE;
 
 /**
@@ -158,6 +161,9 @@ struct PsPointPlanTemplate {
   /// Whether each parameter's actual integer value is unsigned.
   bool unsigned_actuals[PS_PC_MAX_PARAMS]{};
 
+  /// Actual string collation snapshot for each parameter at admission.
+  const CHARSET_INFO *actual_collations[PS_PC_MAX_PARAMS]{};
+
   /*
     --- Phase 2 fields (populated by ps_point_plan_admit) ---
     Filled during the first EXECUTE by inspecting the optimizer's
@@ -182,6 +188,38 @@ struct PsPointPlanTemplate {
 
   /// Optimizer's best_rowcount estimate (cast from ha_rows).
   double best_rowcount{1.0};
+
+  /// Relevant optimizer_switch bits captured at admission time.
+  ulonglong optimizer_switch{0};
+
+  /// Current TABLE_SHARE::get_table_ref_version() at admission time.
+  ulonglong table_ref_version{0};
+
+  /// Relevant sql_mode bits (e.g. PAD_CHAR_TO_FULL_LENGTH) at admission.
+  ulonglong relevant_sql_mode{0};
+
+  /*
+    --- Cached Index_lookup components (allocated on PS m_arena) ---
+    Populated during admission to avoid per-execution Field cloning
+    and buffer allocation in the fast path.  The store_key objects
+    and their Field clones live on the PS arena and survive across
+    executions; only to_field->table needs re-patching each time.
+  */
+
+  /// Pre-allocated key serialization buffer on PS arena.
+  uchar *cached_key_buff{nullptr};
+
+  /// Secondary key buffer (for EQRefIterator key comparison).
+  uchar *cached_key_buff2{nullptr};
+
+  /// Cached store_key objects (one per key part) on PS arena.
+  store_key *cached_store_keys[PS_PC_MAX_PARAMS]{};
+
+  /// Cached Field clones inside store_key (for re-patching table ptr).
+  Field *cached_to_fields[PS_PC_MAX_PARAMS]{};
+
+  /// True when cached_key_buff et al. are populated and usable.
+  bool ref_cached{false};
 };
 
 /*
@@ -212,6 +250,9 @@ bool ps_point_plan_extract_where_shape(Query_block *qb,
 
 /**
   Runtime guard — O(1) checks before attempting the fast path.
+  Structural changes invalidate the cached HOT template; retryable
+  environment changes demote the PS back to COLD so the current
+  execution can re-optimize and potentially re-admit.
   @return true if guard passes and fast path may proceed.
 */
 bool ps_point_plan_runtime_guard(THD *thd, Prepared_statement *stmt,

@@ -87,14 +87,25 @@ EXECUTE stmt_b USING @p;
 --let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
 --echo hits after B1 (expect 0): $hits
 
---echo # B2: restore INT parameter → G8 passes → fast path hit
+--echo # B2: restore INT parameter → HOT was demoted to COLD,
+--echo #     so this EXECUTE runs normal optimize and re-admits.
 SET @p = 2;
 EXECUTE stmt_b USING @p;
 
---let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
---echo hits after B2 (expect 1): $hits
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after B2 (expect 2): $adm
 
---echo # B3: DOUBLE parameter 1.5 → check_parameter_types() rejects → reprepare
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after B2 (expect 0): $hits
+
+--echo # B3: next INT parameter → fast path hit again
+SET @p = 3;
+EXECUTE stmt_b USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after B3 (expect 1): $hits
+
+--echo # B4: DOUBLE parameter 1.5 → check_parameter_types() rejects → reprepare
 --echo #     After reprepare, PS is re-classified COLD.
 --echo #     The reprepare-for-types propagation via copy_param_actual_type()
 --echo #     causes the PS to not re-admit on subsequent INT executions in
@@ -104,13 +115,13 @@ SET @p = 1.5;
 EXECUTE stmt_b USING @p;
 
 --let $cold = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
---echo cold_classifications after B3 reprepare (expect 2): $cold
+--echo cold_classifications after B4 reprepare (expect 2): $cold
 
---echo # B4: INT parameter — correct result via normal optimizer
+--echo # B5: INT parameter — correct result via normal optimizer
 SET @p = 3;
 EXECUTE stmt_b USING @p;
 
---echo # B5: INT parameter — correct result
+--echo # B6: INT parameter — correct result
 SET @p = 1;
 EXECUTE stmt_b USING @p;
 

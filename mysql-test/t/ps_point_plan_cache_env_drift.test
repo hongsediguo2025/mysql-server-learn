@@ -1,0 +1,219 @@
+--echo #
+--echo # ps_point_plan_cache: environment drift tests
+--echo # Covers: sql_mode drift (PAD_CHAR_TO_FULL_LENGTH),
+--echo # ANALYZE TABLE table_ref_version change, and
+--echo # RENAME INDEX / ALTER TABLE impacts.
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+CREATE TABLE t_char_uk (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  code CHAR(10) NOT NULL,
+  val INT,
+  UNIQUE KEY idx_code (code)
+) CHARACTER SET utf8mb4;
+
+CREATE TABLE t_analyze (
+  id INT PRIMARY KEY,
+  val INT
+);
+
+CREATE TABLE t_rename_idx (
+  id INT PRIMARY KEY,
+  uk_col INT NOT NULL,
+  val VARCHAR(50),
+  UNIQUE KEY idx_old (uk_col)
+);
+
+INSERT INTO t_char_uk VALUES (1, 'ABC', 10), (2, 'DEF', 20), (3, 'GHI', 30);
+INSERT INTO t_analyze VALUES (1, 10), (2, 20), (3, 30);
+INSERT INTO t_rename_idx VALUES (1, 100, 'one'), (2, 200, 'two'), (3, 300, 'three');
+
+--echo # =======================================================
+--echo # A. sql_mode drift — PAD_CHAR_TO_FULL_LENGTH (G11)
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_char FROM 'SELECT * FROM t_char_uk WHERE code = ?';
+
+--echo # A1: admission under default sql_mode (no PAD_CHAR_TO_FULL_LENGTH)
+SET @p = 'ABC';
+EXECUTE stmt_char USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after A1 (expect 1): $adm
+
+--echo # A2: fast path hit under same sql_mode
+SET @p = 'DEF';
+EXECUTE stmt_char USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after A2 (expect 1): $hits
+
+--echo # A3: enable PAD_CHAR_TO_FULL_LENGTH → G11 triggers demotion to COLD
+SET SESSION sql_mode = 'PAD_CHAR_TO_FULL_LENGTH';
+SET @p = 'ABC';
+EXECUTE stmt_char USING @p;
+
+--let $fb = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--echo fallback_runtime after A3 (expect 1): $fb
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after A3 (expect 2): $adm
+
+--echo # A4: execute again under PAD_CHAR mode → fast path hit
+SET @p = 'DEF';
+EXECUTE stmt_char USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after A4 (expect 2): $hits
+
+--echo # A5: revert sql_mode → another demotion + re-admission
+SET SESSION sql_mode = DEFAULT;
+SET @p = 'GHI';
+EXECUTE stmt_char USING @p;
+
+--let $fb = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--echo fallback_runtime after A5 (expect 2): $fb
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after A5 (expect 3): $adm
+
+DEALLOCATE PREPARE stmt_char;
+
+--echo # =======================================================
+--echo # B. ANALYZE TABLE — table_ref_version drift
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_az FROM 'SELECT * FROM t_analyze WHERE id = ?';
+
+--echo # B1: admission
+SET @p = 1;
+EXECUTE stmt_az USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after B1 (expect 1): $adm
+
+--echo # B2: fast path hit
+SET @p = 2;
+EXECUTE stmt_az USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after B2 (expect 1): $hits
+
+--echo # B3: ANALYZE TABLE may update table_ref_version
+ANALYZE TABLE t_analyze;
+
+SET @p = 3;
+EXECUTE stmt_az USING @p;
+
+--echo # After ANALYZE, if version changed → fallback + re-admission;
+--echo # if version unchanged → fast path hit.  Either way, result correct.
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo admissions after B3: $adm
+--echo hits after B3: $hits
+
+--echo # B4: next execute should always be fast path hit now
+SET @p = 1;
+EXECUTE stmt_az USING @p;
+
+--let $hits2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits increased after B4 (expect > previous): $hits2
+
+DEALLOCATE PREPARE stmt_az;
+
+--echo # =======================================================
+--echo # C. RENAME INDEX via ALTER TABLE
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_ri FROM 'SELECT * FROM t_rename_idx WHERE uk_col = ?';
+
+--echo # C1: admission on idx_old
+SET @p = 100;
+EXECUTE stmt_ri USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after C1 (expect 1): $adm
+
+--echo # C2: fast path hit
+SET @p = 200;
+EXECUTE stmt_ri USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after C2 (expect 1): $hits
+
+--echo # C3: RENAME INDEX → DDL triggers reprepare, plan cache reset
+ALTER TABLE t_rename_idx RENAME INDEX idx_old TO idx_new;
+
+SET @p = 300;
+EXECUTE stmt_ri USING @p;
+
+--echo # After RENAME INDEX: reprepare → re-classify → re-admit
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after C3 (expect 2): $adm
+
+--echo # C4: fast path hit with renamed index
+SET @p = 100;
+EXECUTE stmt_ri USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after C4 (expect 2): $hits
+
+DEALLOCATE PREPARE stmt_ri;
+
+--echo # =======================================================
+--echo # D. ALTER TABLE ADD COLUMN (INSTANT) — reprepare chain
+--echo # =======================================================
+
+FLUSH STATUS;
+
+CREATE TABLE t_instant (
+  id INT PRIMARY KEY,
+  val INT
+);
+INSERT INTO t_instant VALUES (1, 10), (2, 20);
+
+PREPARE stmt_inst FROM 'SELECT * FROM t_instant WHERE id = ?';
+
+--echo # D1: admission
+SET @p = 1;
+EXECUTE stmt_inst USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after D1 (expect 1): $adm
+
+--echo # D2: ADD COLUMN triggers reprepare
+ALTER TABLE t_instant ADD COLUMN extra INT DEFAULT 0;
+
+SET @p = 2;
+EXECUTE stmt_inst USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after D2 (expect 2): $adm
+
+--echo # D3: fast path hit with new schema
+SET @p = 1;
+EXECUTE stmt_inst USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after D3 (expect 1): $hits
+
+DEALLOCATE PREPARE stmt_inst;
+DROP TABLE t_instant;
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+
+DROP TABLE t_char_uk;
+DROP TABLE t_analyze;
+DROP TABLE t_rename_idx;

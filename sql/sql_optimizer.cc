@@ -1106,7 +1106,8 @@ bool JOIN::optimize(bool finalize_access_paths) {
 
     State transitions:
       COLD + admit pass  -> HOT   (template populated)
-      COLD + admit fail  -> NEVER (permanently rejected)
+      COLD + admit fail  -> NEVER (first-shape rejection)
+      retryable COLD miss -> COLD (keep re-learning after runtime drift)
       sysvar OFF         -> no-op (stays COLD for later retry)
   */
   if (thd->variables.ps_point_plan_cache) {
@@ -1117,7 +1118,7 @@ bool JOIN::optimize(bool finalize_access_paths) {
         ps_owner->ps_point_plan_state() == PsPointPlanState::COLD) {
       if (ps_point_plan_can_admit(ps_owner, this)) {
         ps_point_plan_admit(thd, ps_owner, this);
-      } else {
+      } else if (!ps_owner->ps_point_plan_retryable_cold()) {
         ps_owner->set_ps_point_plan_state(PsPointPlanState::NEVER);
       }
     }

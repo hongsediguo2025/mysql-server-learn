@@ -50,6 +50,67 @@
 #include "sql/sql_select.h"
 #include "sql/table.h"
 
+namespace {
+
+constexpr ulonglong kPsPcRelevantOptimizerSwitchMask =
+    OPTIMIZER_SWITCH_USE_INVISIBLE_INDEXES;
+
+constexpr ulonglong kPsPcRelevantSqlModeMask = MODE_PAD_CHAR_TO_FULL_LENGTH;
+
+ulonglong ps_point_plan_relevant_optimizer_switch(const THD *thd) {
+  return thd->variables.optimizer_switch & kPsPcRelevantOptimizerSwitchMask;
+}
+
+ulonglong ps_point_plan_relevant_sql_mode(const THD *thd) {
+  return thd->variables.sql_mode & kPsPcRelevantSqlModeMask;
+}
+
+const CHARSET_INFO *ps_point_plan_actual_collation(const Item_param *param) {
+  return is_string_type(param->data_type_actual()) ? param->collation_actual()
+                                                   : nullptr;
+}
+
+Item_param *ps_point_plan_find_stable_param(const PsPointPlanTemplate &tpl,
+                                            const Item_param *param) {
+  for (uint i = 0; i < tpl.param_count; i++) {
+    if (tpl.params[i] != nullptr &&
+        tpl.params[i]->pos_in_query == param->pos_in_query) {
+      return tpl.params[i];
+    }
+  }
+  return nullptr;
+}
+
+void ps_point_plan_clear_hot_metadata(PsPointPlanTemplate *tpl) {
+  tpl->keyno = MAX_KEY;
+  tpl->key_parts = 0;
+  tpl->key_length = 0;
+  tpl->null_rejecting = 0;
+  tpl->best_read = 0.0;
+  tpl->best_rowcount = 1.0;
+  tpl->optimizer_switch = 0;
+  tpl->table_ref_version = 0;
+  tpl->relevant_sql_mode = 0;
+  /*
+    ref_cached stays true if previously built — the arena-allocated
+    buffers / store_keys survive demotion and are reused on re-admission.
+    They are only freed when the PS itself is destroyed.
+  */
+  for (uint i = 0; i < PS_PC_MAX_PARAMS; i++) {
+    tpl->actual_types[i] = MYSQL_TYPE_INVALID;
+    tpl->unsigned_actuals[i] = false;
+    tpl->actual_collations[i] = nullptr;
+  }
+}
+
+void ps_point_plan_demote_to_cold(Prepared_statement *stmt) {
+  ps_point_plan_clear_hot_metadata(&stmt->ps_point_plan_template());
+  stmt->set_ps_point_plan_state(PsPointPlanState::COLD);
+  stmt->set_ps_point_plan_retryable_cold(true);
+}
+
+}  // namespace
+
 /**
   Try to extract a single field=param equality from an Item_func_eq.
   Handles both (field, param) and (param, field) argument order.
@@ -116,6 +177,8 @@ static bool extract_eq_field_param(Item_func *eq_item, const Table_ref *tbl,
   @retval false Not a candidate (state NEVER or unchanged).
 */
 bool ps_point_plan_classify(THD *thd, Prepared_statement *stmt) {
+  stmt->set_ps_point_plan_retryable_cold(false);
+
   /* Gate 1: feature switch and basic param count bounds. */
   if (!thd->variables.ps_point_plan_cache) return false;
   if (stmt->m_param_count < 1 || stmt->m_param_count > PS_PC_MAX_PARAMS)
@@ -142,6 +205,9 @@ bool ps_point_plan_classify(THD *thd, Prepared_statement *stmt) {
 
   Table_ref *tbl = qb->leaf_tables;
   if (tbl == nullptr || !tbl->is_base_table()) return false;
+
+  /* Gate 4b: exclude partitioned tables — JT_CONST semantics differ. */
+  if (tbl->table != nullptr && tbl->table->part_info != nullptr) return false;
 
   /* Gate 5: extract WHERE shape (field=? equalities). */
   PsPointPlanTemplate &tpl = stmt->ps_point_plan_template();
@@ -273,6 +339,31 @@ bool ps_point_plan_runtime_guard(THD *thd, Prepared_statement *stmt,
     return false;
   }
 
+  /*
+    G1c-G1d: retryable environment drift.
+    These do not make the statement permanently invalid; instead we
+    demote HOT -> COLD so the current execution can re-optimize and
+    potentially re-admit with refreshed metadata.
+  */
+  if (ps_point_plan_relevant_optimizer_switch(thd) != tpl.optimizer_switch) {
+    ps_point_plan_demote_to_cold(stmt);
+    ps_point_plan_mark_runtime_fallback(thd);
+    return false;
+  }
+
+  if (table->s->get_table_ref_version() != tpl.table_ref_version) {
+    ps_point_plan_demote_to_cold(stmt);
+    ps_point_plan_mark_runtime_fallback(thd);
+    return false;
+  }
+
+  /* G11: sql_mode bits affecting comparison semantics. */
+  if (ps_point_plan_relevant_sql_mode(thd) != tpl.relevant_sql_mode) {
+    ps_point_plan_demote_to_cold(stmt);
+    ps_point_plan_mark_runtime_fallback(thd);
+    return false;
+  }
+
   /* G2: key index must still be within bounds. */
   if (tpl.keyno >= table->s->keys) {
     stmt->invalidate_ps_point_plan_cache();
@@ -327,12 +418,22 @@ bool ps_point_plan_runtime_guard(THD *thd, Prepared_statement *stmt,
 
     /* G8: parameter actual type must match admission snapshot. */
     if (tpl.params[i]->data_type_actual() != tpl.actual_types[i]) {
+      ps_point_plan_demote_to_cold(stmt);
       ps_point_plan_mark_runtime_fallback(thd);
       return false;
     }
 
     /* G9: unsigned flag must match admission snapshot. */
     if (tpl.params[i]->is_unsigned_actual() != tpl.unsigned_actuals[i]) {
+      ps_point_plan_demote_to_cold(stmt);
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
+    }
+
+    /* G10: string collation drift must be re-optimized. */
+    if (ps_point_plan_actual_collation(tpl.params[i]) !=
+        tpl.actual_collations[i]) {
+      ps_point_plan_demote_to_cold(stmt);
       ps_point_plan_mark_runtime_fallback(thd);
       return false;
     }
@@ -409,30 +510,76 @@ bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
   tab->table_ref = tpl.table_ref;
   tab->set_type(JT_EQ_REF);
 
-  /* B3: Build Index_lookup via init_ref + init_ref_part */
-  if (init_ref(thd, tpl.key_parts, tpl.key_length, tpl.keyno,
-               &tab->ref())) {
-    ps_point_plan_mark_runtime_fallback(thd);
-    return false;
-  }
+  /*
+    B3: Build Index_lookup.
+    Fast path: reuse arena-cached key buffers and store_key objects,
+    only re-patching the TABLE pointer on the Field clones and calling
+    copy() to serialize current parameter values.
+    Slow path: full init_ref + init_ref_part (first execution before
+    cache is built, or if cache construction failed).
+  */
+  if (tpl.ref_cached) {
+    /* --- Fast ref path: reuse cached components --- */
+    Index_lookup &ref = tab->ref();
+    ref.key_parts = tpl.key_parts;
+    ref.key_length = tpl.key_length;
+    ref.key = static_cast<int>(tpl.keyno);
+    ref.key_buff = tpl.cached_key_buff;
+    ref.key_buff2 = tpl.cached_key_buff2;
+    ref.key_err = true;
+    ref.null_rejecting = tpl.null_rejecting;
+    ref.use_count = 0;
+    ref.disable_cache = false;
+    ref.null_ref_key = nullptr;
+    ref.depend_map = 0;
 
-  uchar *key_buff = tab->ref().key_buff;
-  for (uint i = 0; i < tpl.key_parts; i++) {
-    const KEY_PART_INFO *key_part = &keyinfo->key_part[i];
-    const bool null_rej = (tpl.null_rejecting >> i) & 1;
-
-    if (init_ref_part(thd, i, tpl.params[i],
-                      /*cond_guard=*/nullptr, null_rej,
-                      /*const_tables=*/0,
-                      tpl.params[i]->used_tables(),
-                      key_part->null_bit != 0,
-                      key_part, key_buff, &tab->ref())) {
+    ref.key_copy = thd->mem_root->ArrayAlloc<store_key *>(tpl.key_parts);
+    ref.items = thd->mem_root->ArrayAlloc<Item *>(tpl.key_parts);
+    ref.cond_guards = thd->mem_root->ArrayAlloc<bool *>(tpl.key_parts);
+    if (ref.key_copy == nullptr || ref.items == nullptr ||
+        ref.cond_guards == nullptr) {
       ps_point_plan_mark_runtime_fallback(thd);
       return false;
     }
-    key_buff += key_part->store_length;
+
+    for (uint i = 0; i < tpl.key_parts; i++) {
+      tpl.cached_to_fields[i]->init(table);
+      ref.items[i] = tpl.params[i];
+      ref.cond_guards[i] = nullptr;
+
+      store_key *sk = tpl.cached_store_keys[i];
+      (void)sk->copy();
+      if (sk->null_key)
+        ref.key_copy[i] = sk;
+      else
+        ref.key_copy[i] = nullptr;
+    }
+  } else {
+    /* --- Slow ref path: full construction --- */
+    if (init_ref(thd, tpl.key_parts, tpl.key_length, tpl.keyno,
+                 &tab->ref())) {
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
+    }
+
+    uchar *key_buff = tab->ref().key_buff;
+    for (uint i = 0; i < tpl.key_parts; i++) {
+      const KEY_PART_INFO *key_part = &keyinfo->key_part[i];
+      const bool null_rej = (tpl.null_rejecting >> i) & 1;
+
+      if (init_ref_part(thd, i, tpl.params[i],
+                        /*cond_guard=*/nullptr, null_rej,
+                        /*const_tables=*/0,
+                        tpl.params[i]->used_tables(),
+                        key_part->null_bit != 0,
+                        key_part, key_buff, &tab->ref())) {
+        ps_point_plan_mark_runtime_fallback(thd);
+        return false;
+      }
+      key_buff += key_part->store_length;
+    }
+    assert(key_buff == tab->ref().key_buff + tpl.key_length);
   }
-  assert(key_buff == tab->ref().key_buff + tpl.key_length);
 
   /* B4: Create AccessPath */
   AccessPath *path =
@@ -563,31 +710,23 @@ bool ps_point_plan_can_admit(Prepared_statement *stmt, JOIN *join) {
   if (ref.key_parts != tpl.param_count) return false;
 
   /*
-    Check 9: verify every ref item is one of the Item_param pointers
-    captured in the template during Phase 1.
+    Check 9: verify every ref item maps back to one of the stable
+    Item_param masters captured in the template during Phase 1.
 
-    The comparison uses pointer identity (not value equality).  This
-    is safe because v1 scope excludes CTE / derived-table scenarios
-    that clone Item_param (via Item_param::add_clone), and
-    create_ref_for_key() stores keyuse->val directly for PARAM_ITEM.
-
-    The search is O(n²) where n <= PS_PC_MAX_PARAMS (4), acceptable
-    because the WHERE clause order may differ from key-part order
-    (e.g. WHERE pk2=? AND pk1=? on PRIMARY KEY(pk1,pk2)).
+    Matching uses Item_param::pos_in_query instead of pointer identity.
+    This avoids caching per-execution optimizer clones while still
+    reusing the permanent parameter objects from the prepared-statement
+    parse tree.
   */
   for (uint i = 0; i < ref.key_parts; i++) {
     if (ref.items[i] == nullptr ||
         ref.items[i]->type() != Item::PARAM_ITEM)
       return false;
 
-    bool found = false;
-    for (uint j = 0; j < tpl.param_count; j++) {
-      if (tpl.params[j] == ref.items[i]) {
-        found = true;
-        break;
-      }
+    if (ps_point_plan_find_stable_param(
+            tpl, down_cast<Item_param *>(ref.items[i])) == nullptr) {
+      return false;
     }
-    if (!found) return false;
   }
 
   return true;
@@ -614,6 +753,7 @@ void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
   const Index_lookup &ref = tab->ref();
   TABLE *table = tab->table();
   const KEY *keyinfo = &table->key_info[ref.key];
+  Item_param *stable_params[PS_PC_MAX_PARAMS]{};
 
   /* Copy stable key metadata from the optimizer's ref structure. */
   tpl.keyno = static_cast<uint>(ref.key);
@@ -624,6 +764,9 @@ void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
   /* Copy optimizer cost estimates for potential use by Phase 3+. */
   tpl.best_read = join->best_read;
   tpl.best_rowcount = static_cast<double>(join->best_rowcount);
+  tpl.optimizer_switch = ps_point_plan_relevant_optimizer_switch(thd);
+  tpl.table_ref_version = table->s->get_table_ref_version();
+  tpl.relevant_sql_mode = ps_point_plan_relevant_sql_mode(thd);
 
   /*
     Reorder params[] and field_indices[] from WHERE-clause order
@@ -645,14 +788,68 @@ void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
     fieldnr is 1-based; we store 0-based indices.
   */
   for (uint i = 0; i < ref.key_parts; i++) {
-    Item_param *prm = down_cast<Item_param *>(ref.items[i]);
+    stable_params[i] = ps_point_plan_find_stable_param(
+        tpl, down_cast<Item_param *>(ref.items[i]));
+    assert(stable_params[i] != nullptr);
+  }
+
+  for (uint i = 0; i < ref.key_parts; i++) {
+    Item_param *prm = stable_params[i];
     tpl.params[i] = prm;
     tpl.field_indices[i] = keyinfo->key_part[i].fieldnr - 1;
     tpl.actual_types[i] = prm->data_type_actual();
     tpl.unsigned_actuals[i] = prm->is_unsigned_actual();
+    tpl.actual_collations[i] = ps_point_plan_actual_collation(prm);
+  }
+
+  /*
+    Build cached Index_lookup components on PS arena so the fast path
+    can reuse them across executions, avoiding per-execution Field
+    cloning and buffer allocation.  Only done once (ref_cached stays
+    true across HOT->COLD->HOT transitions as the arena persists).
+  */
+  if (!tpl.ref_cached) {
+    Query_arena backup;
+    thd->swap_query_arena(stmt->m_arena, &backup);
+
+    const uint aligned_len = ALIGN_SIZE(tpl.key_length);
+    tpl.cached_key_buff = thd->mem_root->ArrayAlloc<uchar>(aligned_len);
+    tpl.cached_key_buff2 = thd->mem_root->ArrayAlloc<uchar>(aligned_len);
+
+    bool cache_ok = (tpl.cached_key_buff != nullptr &&
+                     tpl.cached_key_buff2 != nullptr);
+
+    uchar *kb_pos = tpl.cached_key_buff;
+    for (uint i = 0; i < tpl.key_parts && cache_ok; i++) {
+      const KEY_PART_INFO *kp = &keyinfo->key_part[i];
+      Field *orig_field = table->field[tpl.field_indices[i]];
+      const bool nullable = (kp->null_bit != 0);
+
+      /*
+        store_key constructor internally clones orig_field via
+        new_key_field(thd->mem_root, ...) — since we swapped to the
+        PS arena, the clone lives on the arena and survives across
+        executions.
+      */
+      store_key *sk = new (thd->mem_root)
+          store_key(thd, orig_field, kb_pos + nullable,
+                    nullable ? kb_pos : nullptr, kp->length, tpl.params[i]);
+      if (sk == nullptr) {
+        cache_ok = false;
+        break;
+      }
+
+      tpl.cached_store_keys[i] = sk;
+      tpl.cached_to_fields[i] = sk->store_field();
+      kb_pos += kp->store_length;
+    }
+    if (cache_ok) tpl.ref_cached = true;
+
+    thd->swap_query_arena(backup, &stmt->m_arena);
   }
 
   stmt->set_ps_point_plan_state(PsPointPlanState::HOT);
+  stmt->set_ps_point_plan_retryable_cold(false);
   ps_point_plan_mark_admission(thd);
 }
 

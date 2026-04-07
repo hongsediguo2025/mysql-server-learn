@@ -831,6 +831,9 @@ class store_key {
   */
   store_key_result copy();
 
+  /// Accessor for the destination Field used during key serialization.
+  Field *store_field() const { return to_field; }
+
  protected:
   Field *to_field;  // Store data here
   Item *item;

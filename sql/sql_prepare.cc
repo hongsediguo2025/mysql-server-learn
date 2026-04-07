@@ -3380,6 +3380,7 @@ void Prepared_statement::swap_prepared_statement(Prepared_statement *copy) {
   std::swap(m_ps_pc_state, copy->m_ps_pc_state);
   std::swap(m_ps_pc, copy->m_ps_pc);
   std::swap(m_ps_pc_cursor_execution, copy->m_ps_pc_cursor_execution);
+  std::swap(m_ps_pc_retryable_cold, copy->m_ps_pc_retryable_cold);
 }
 
 /**

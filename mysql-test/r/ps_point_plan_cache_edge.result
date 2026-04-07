@@ -67,13 +67,21 @@ Warnings:
 Warning	1292	Truncated incorrect INTEGER value: 'abc'
 fallback_runtime after B1 (expect 1): 1
 hits after B1 (expect 0): 0
-# B2: restore INT parameter → G8 passes → fast path hit
+# B2: restore INT parameter → HOT was demoted to COLD,
+#     so this EXECUTE runs normal optimize and re-admits.
 SET @p = 2;
 EXECUTE stmt_b USING @p;
 id	val	uk
 2	two	20
-hits after B2 (expect 1): 1
-# B3: DOUBLE parameter 1.5 → check_parameter_types() rejects → reprepare
+admissions after B2 (expect 2): 2
+hits after B2 (expect 0): 0
+# B3: next INT parameter → fast path hit again
+SET @p = 3;
+EXECUTE stmt_b USING @p;
+id	val	uk
+3	three	30
+hits after B3 (expect 1): 1
+# B4: DOUBLE parameter 1.5 → check_parameter_types() rejects → reprepare
 #     After reprepare, PS is re-classified COLD.
 #     The reprepare-for-types propagation via copy_param_actual_type()
 #     causes the PS to not re-admit on subsequent INT executions in
@@ -82,13 +90,13 @@ hits after B2 (expect 1): 1
 SET @p = 1.5;
 EXECUTE stmt_b USING @p;
 id	val	uk
-cold_classifications after B3 reprepare (expect 2): 2
-# B4: INT parameter — correct result via normal optimizer
+cold_classifications after B4 reprepare (expect 2): 2
+# B5: INT parameter — correct result via normal optimizer
 SET @p = 3;
 EXECUTE stmt_b USING @p;
 id	val	uk
 3	three	30
-# B5: INT parameter — correct result
+# B6: INT parameter — correct result
 SET @p = 1;
 EXECUTE stmt_b USING @p;
 id	val	uk
