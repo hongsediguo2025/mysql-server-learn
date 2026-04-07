@@ -206,8 +206,9 @@ bool ps_point_plan_classify(THD *thd, Prepared_statement *stmt) {
   Table_ref *tbl = qb->leaf_tables;
   if (tbl == nullptr || !tbl->is_base_table()) return false;
 
-  /* Gate 4b: exclude partitioned tables — JT_CONST semantics differ. */
-  if (tbl->table != nullptr && tbl->table->part_info != nullptr) return false;
+  /* Gate 4b: TABLE must be open; exclude partitioned tables. */
+  if (tbl->table == nullptr) return false;
+  if (tbl->table->part_info != nullptr) return false;
 
   /* Gate 5: extract WHERE shape (field=? equalities). */
   PsPointPlanTemplate &tpl = stmt->ps_point_plan_template();

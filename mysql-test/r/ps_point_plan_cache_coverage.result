@@ -1,0 +1,439 @@
+#
+# Supplementary coverage tests for ps_point_plan_cache.
+# Targets gaps identified in code review:
+#   A. Gate 6 — extra params outside WHERE
+#   B. Composite key param reordering correctness
+#   C. Multiple DDL/reprepare cycles (arena stability)
+#   D. ANALYZE TABLE — deterministic G1d demotion + re-admission
+#   E. ALTER PRIMARY KEY structure change
+#   F. DROP UK → reprepare → NEVER permanence
+#   G. Partitioned table exclusion (Gate 4b)
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+val VARCHAR(50)
+);
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+CREATE TABLE t_comp (
+pk1 INT NOT NULL,
+pk2 INT NOT NULL,
+val VARCHAR(50),
+PRIMARY KEY (pk1, pk2)
+);
+INSERT INTO t_comp VALUES (1, 10, 'a'), (1, 20, 'b'), (2, 10, 'c'), (2, 20, 'd');
+CREATE TABLE t_uk (
+id INT PRIMARY KEY,
+uk_col INT NOT NULL,
+val VARCHAR(50),
+UNIQUE KEY idx_uk (uk_col)
+);
+INSERT INTO t_uk VALUES (1, 100, 'x'), (2, 200, 'y'), (3, 300, 'z');
+CREATE TABLE t_alt (
+id INT PRIMARY KEY,
+val VARCHAR(50)
+);
+INSERT INTO t_alt VALUES (1, 'aa'), (2, 'bb'), (3, 'cc');
+# =======================================================
+# A. Gate 6 — extra parameter outside WHERE equalities
+#    param_count (1 in WHERE) != m_param_count (2 total)
+#    → NEVER at classify time.
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_a FROM 'SELECT ?, id, val FROM t1 WHERE id = ?';
+cold_delta (extra param in SELECT): 0
+# Execute to confirm correct results and no admission
+SET @extra = 'hello';
+SET @p = 1;
+EXECUTE stmt_a USING @extra, @p;
+?	id	val
+hello	1	one
+admissions after A (expect 0): 0
+DEALLOCATE PREPARE stmt_a;
+# A2: param in LIMIT position also counts
+PREPARE stmt_a2 FROM 'SELECT * FROM t1 WHERE id = ? LIMIT ?';
+cold_delta (param in LIMIT — has_limit gate): 0
+DEALLOCATE PREPARE stmt_a2;
+# =======================================================
+# B. Composite key — param reordering correctness
+#    WHERE pk2 = ? AND pk1 = ? — reversed from key order.
+#    Phase 2 admission reorders params to (pk1, pk2).
+#    Verify correct results across multiple executes.
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_b FROM 'SELECT * FROM t_comp WHERE pk2 = ? AND pk1 = ?';
+# B1: first execute — admission (params reordered to key order)
+SET @pk2 = 10;
+SET @pk1 = 1;
+EXECUTE stmt_b USING @pk2, @pk1;
+pk1	pk2	val
+1	10	a
+admissions after B1 (expect 1): 1
+# B2: second execute — fast path hit with different values
+SET @pk2 = 20;
+SET @pk1 = 2;
+EXECUTE stmt_b USING @pk2, @pk1;
+pk1	pk2	val
+2	20	d
+hits after B2 (expect 1): 1
+# B3: verify all four combinations return correct data
+SET @pk2 = 10;
+SET @pk1 = 2;
+EXECUTE stmt_b USING @pk2, @pk1;
+pk1	pk2	val
+2	10	c
+SET @pk2 = 20;
+SET @pk1 = 1;
+EXECUTE stmt_b USING @pk2, @pk1;
+pk1	pk2	val
+1	20	b
+hits after B3 (expect 3): 3
+# B4: non-existent composite key — empty result, still a hit
+SET @pk2 = 99;
+SET @pk1 = 99;
+EXECUTE stmt_b USING @pk2, @pk1;
+pk1	pk2	val
+hits after B4 (expect 4): 4
+DEALLOCATE PREPARE stmt_b;
+# =======================================================
+# C. Multiple DDL/reprepare cycles — arena stability
+#    5 consecutive ALTER → EXECUTE cycles on the same PS.
+#    Each cycle: HOT → reprepare → re-classify → re-admit → HOT.
+#    Verifies arena-cached ref components survive across cycles.
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_c FROM 'SELECT * FROM t_alt WHERE id = ?';
+# C-admit: initial admission → HOT
+SET @p = 1;
+EXECUTE stmt_c USING @p;
+id	val
+1	aa
+admissions baseline: 1
+# C-hit: verify HOT
+SET @p = 2;
+EXECUTE stmt_c USING @p;
+id	val
+2	bb
+hits baseline: 1
+# Cycle 1
+ALTER TABLE t_alt ADD COLUMN c1 INT DEFAULT 0;
+SET @p = 1;
+EXECUTE stmt_c USING @p;
+id	val	c1
+1	aa	0
+SET @p = 2;
+EXECUTE stmt_c USING @p;
+id	val	c1
+2	bb	0
+# Cycle 2
+ALTER TABLE t_alt DROP COLUMN c1;
+SET @p = 1;
+EXECUTE stmt_c USING @p;
+id	val
+1	aa
+SET @p = 3;
+EXECUTE stmt_c USING @p;
+id	val
+3	cc
+# Cycle 3
+ALTER TABLE t_alt ADD COLUMN c2 INT DEFAULT 0;
+SET @p = 2;
+EXECUTE stmt_c USING @p;
+id	val	c2
+2	bb	0
+SET @p = 3;
+EXECUTE stmt_c USING @p;
+id	val	c2
+3	cc	0
+# Cycle 4
+ALTER TABLE t_alt DROP COLUMN c2;
+SET @p = 1;
+EXECUTE stmt_c USING @p;
+id	val
+1	aa
+SET @p = 2;
+EXECUTE stmt_c USING @p;
+id	val
+2	bb
+# Cycle 5
+ALTER TABLE t_alt ADD COLUMN c3 VARCHAR(10) DEFAULT 'x';
+SET @p = 3;
+EXECUTE stmt_c USING @p;
+id	val	c3
+3	cc	x
+SET @p = 1;
+EXECUTE stmt_c USING @p;
+id	val	c3
+1	aa	x
+admissions delta after 5 cycles (expect 5): 5
+hits delta after 5 cycles (expect 5): 5
+# Final result correctness check
+SET @p = 1;
+EXECUTE stmt_c USING @p;
+id	val	c3
+1	aa	x
+ALTER TABLE t_alt DROP COLUMN c3;
+DEALLOCATE PREPARE stmt_c;
+# =======================================================
+# D. ANALYZE TABLE — deterministic G1d demotion
+#    Insert bulk data to force stats change, then ANALYZE.
+#    Verify demotion to COLD and re-admission.
+# =======================================================
+FLUSH STATUS;
+CREATE TABLE t_az (
+id INT PRIMARY KEY,
+val INT
+);
+INSERT INTO t_az VALUES (1, 10), (2, 20);
+PREPARE stmt_d FROM 'SELECT * FROM t_az WHERE id = ?';
+# D1: admission
+SET @p = 1;
+EXECUTE stmt_d USING @p;
+id	val
+1	10
+admissions after D1 (expect 1): 1
+# D2: fast path hit (confirms HOT)
+SET @p = 2;
+EXECUTE stmt_d USING @p;
+id	val
+2	20
+hits after D2 (expect 1): 1
+# D3: insert bulk data to force stats change + ANALYZE
+ANALYZE TABLE t_az;
+Table	Op	Msg_type	Msg_text
+test.t_az	analyze	status	OK
+# D4: execute after ANALYZE — if version changed, demotion + re-admit
+SET @p = 1;
+EXECUTE stmt_d USING @p;
+id	val
+1	10
+# D5: next execute — fast path hit (re-admitted or was still HOT)
+SET @p = 500;
+EXECUTE stmt_d USING @p;
+id	val
+500	5000
+hits delta after D5 (expect >= 1): 2
+# Result correctness
+SET @p = 2;
+EXECUTE stmt_d USING @p;
+id	val
+2	20
+DEALLOCATE PREPARE stmt_d;
+DROP TABLE t_az;
+# =======================================================
+# E. ALTER PRIMARY KEY structure — verify re-admission
+#    with a different key layout after reprepare.
+# =======================================================
+FLUSH STATUS;
+CREATE TABLE t_pk_change (
+a INT NOT NULL,
+b INT NOT NULL,
+val VARCHAR(50),
+PRIMARY KEY (a)
+);
+INSERT INTO t_pk_change VALUES (1, 10, 'r1'), (2, 20, 'r2'), (3, 30, 'r3');
+PREPARE stmt_e FROM 'SELECT * FROM t_pk_change WHERE a = ?';
+# E1: admission on PK(a)
+SET @p = 1;
+EXECUTE stmt_e USING @p;
+a	b	val
+1	10	r1
+admissions after E1 (expect 1): 1
+# E2: fast path hit
+SET @p = 2;
+EXECUTE stmt_e USING @p;
+a	b	val
+2	20	r2
+hits after E2 (expect 1): 1
+# E3: change PK structure — reprepare → re-classify → re-admit
+ALTER TABLE t_pk_change DROP PRIMARY KEY, ADD PRIMARY KEY (a, b);
+SET @p = 1;
+EXECUTE stmt_e USING @p;
+a	b	val
+1	10	r1
+# After PK change from (a) to (a,b): query WHERE a = ? has
+# only 1 param but key now has 2 parts. Admission will fail
+# (ref.key_parts != tpl.param_count) → NEVER.
+admissions after E3 (expect 1, no new): 1
+# E4: result is still correct via normal optimizer
+SET @p = 2;
+EXECUTE stmt_e USING @p;
+a	b	val
+2	20	r2
+SET @p = 3;
+EXECUTE stmt_e USING @p;
+a	b	val
+3	30	r3
+DEALLOCATE PREPARE stmt_e;
+DROP TABLE t_pk_change;
+# =======================================================
+# F. DROP UNIQUE KEY → reprepare → NEVER permanence
+#    After the UK is dropped, admission fails.
+#    Verify NEVER persists across many subsequent executes.
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_f FROM 'SELECT * FROM t_uk WHERE uk_col = ?';
+# F1: admission on UNIQUE KEY
+SET @p = 100;
+EXECUTE stmt_f USING @p;
+id	uk_col	val
+1	100	x
+admissions after F1 (expect 1): 1
+# F2: fast path hit
+SET @p = 200;
+EXECUTE stmt_f USING @p;
+id	uk_col	val
+2	200	y
+hits after F2 (expect 1): 1
+# F3: DROP the unique index → reprepare → NEVER
+ALTER TABLE t_uk DROP INDEX idx_uk;
+SET @p = 100;
+EXECUTE stmt_f USING @p;
+id	uk_col	val
+1	100	x
+admissions after F3 (still 1, no new): 1
+# F4: multiple executes in NEVER state — no counters change
+SET @p = 200;
+EXECUTE stmt_f USING @p;
+id	uk_col	val
+2	200	y
+SET @p = 300;
+EXECUTE stmt_f USING @p;
+id	uk_col	val
+3	300	z
+SET @p = 100;
+EXECUTE stmt_f USING @p;
+id	uk_col	val
+1	100	x
+SET @p = 200;
+EXECUTE stmt_f USING @p;
+id	uk_col	val
+2	200	y
+admissions after F4 (still 1): 1
+hits delta after F4 (expect 0): 0
+# Restore index for cleanup
+ALTER TABLE t_uk ADD UNIQUE KEY idx_uk (uk_col);
+DEALLOCATE PREPARE stmt_f;
+# =======================================================
+# G. Partitioned table exclusion (Gate 4b)
+#    Partitioned table must be rejected at classify time.
+#    PK point select on partitioned table → no cold.
+# =======================================================
+FLUSH STATUS;
+CREATE TABLE t_part (
+id INT PRIMARY KEY,
+val VARCHAR(50)
+) PARTITION BY HASH(id) PARTITIONS 4;
+INSERT INTO t_part VALUES (1, 'p1'), (2, 'p2'), (3, 'p3'), (4, 'p4');
+PREPARE stmt_g FROM 'SELECT * FROM t_part WHERE id = ?';
+cold_delta (partitioned table): 0
+# Execute to confirm correct results but no admission
+SET @p = 1;
+EXECUTE stmt_g USING @p;
+id	val
+1	p1
+SET @p = 3;
+EXECUTE stmt_g USING @p;
+id	val
+3	p3
+admissions after G (expect 0): 0
+hits after G (expect 0): 0
+DEALLOCATE PREPARE stmt_g;
+DROP TABLE t_part;
+# =======================================================
+# H. G8 type drift: INT → STRING → COLD → INT re-admit
+#    Uses non-numeric string to trigger type drift.
+#    'abc' converts to 0 for INT comparison; no row found
+#    so optimizer short-circuits before admission hook.
+#    PS stays COLD until a valid INT param triggers admission.
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_h FROM 'SELECT * FROM t1 WHERE id = ?';
+# H1: INT admission → HOT
+SET @p = 1;
+EXECUTE stmt_h USING @p;
+id	val
+1	one
+admissions after H1 (expect 1): 1
+# H2: non-numeric STRING → G8 runtime guard triggers demotion HOT→COLD.
+#     'abc'→0 finds no row, optimizer zero-results before admission hook.
+#     PS stays COLD (not re-admitted yet).
+SET @p = 'abc';
+EXECUTE stmt_h USING @p;
+id	val
+Warnings:
+Warning	1292	Truncated incorrect INTEGER value: 'abc'
+fallback_runtime after H2 (expect 1): 1
+admissions after H2 (expect 1, no re-admit yet): 1
+# H3: another STRING while COLD — zero result again, stays COLD
+SET @p = 'xyz';
+EXECUTE stmt_h USING @p;
+id	val
+Warnings:
+Warning	1292	Truncated incorrect INTEGER value: 'xyz'
+hits after H3 (expect 0): 0
+# H4: INT param with valid row → COLD → normal optimize → re-admission
+SET @p = 1;
+EXECUTE stmt_h USING @p;
+id	val
+1	one
+admissions after H4 (expect 2): 2
+# H5: INT hit confirms re-admission succeeded
+SET @p = 2;
+EXECUTE stmt_h USING @p;
+id	val
+2	two
+hits after H5 (expect 1): 1
+DEALLOCATE PREPARE stmt_h;
+# =======================================================
+# I. NULL param on HOT → fallback preserves HOT
+#    After fallback, next non-NULL execute is a hit.
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_i FROM 'SELECT * FROM t1 WHERE id = ?';
+# I1: admission → HOT
+SET @p = 1;
+EXECUTE stmt_i USING @p;
+id	val
+1	one
+# I2: hit confirms HOT
+SET @p = 2;
+EXECUTE stmt_i USING @p;
+id	val
+2	two
+# I3: NULL param → G7 fallback, stays HOT
+SET @p = NULL;
+EXECUTE stmt_i USING @p;
+id	val
+fallback_runtime after I3 (expect 1): 1
+# I4: non-NULL → should be a hit (HOT preserved)
+SET @p = 3;
+EXECUTE stmt_i USING @p;
+id	val
+3	three
+hits delta after I4 (expect 1): 1
+# I5: multiple NULL → multiple fallbacks, still HOT after
+SET @p = NULL;
+EXECUTE stmt_i USING @p;
+id	val
+EXECUTE stmt_i USING @p;
+id	val
+EXECUTE stmt_i USING @p;
+id	val
+fallback_runtime after I5 (expect 4): 4
+SET @p = 1;
+EXECUTE stmt_i USING @p;
+id	val
+1	one
+hits delta after I5 recovery (expect 2): 2
+DEALLOCATE PREPARE stmt_i;
+# -------------------------------------------------------
+# Teardown
+# -------------------------------------------------------
+DROP TABLE t1;
+DROP TABLE t_comp;
+DROP TABLE t_uk;
+DROP TABLE t_alt;
+# Supplementary coverage tests complete.

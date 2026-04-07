@@ -462,7 +462,32 @@ class Prepared_statement final {
 
   void invalidate_ps_point_plan_cache() {
     m_ps_pc_state = PsPointPlanState::INVALID;
+    /*
+      Preserve arena-allocated cached components (key buffers, store_key
+      objects, Field clones) across invalidation.  These live on the PS
+      m_arena and can be reused after re-classification and re-admission,
+      avoiding redundant allocations on the same arena.
+    */
+    const bool saved_ref_cached = m_ps_pc.ref_cached;
+    uchar *saved_key_buff = m_ps_pc.cached_key_buff;
+    uchar *saved_key_buff2 = m_ps_pc.cached_key_buff2;
+    store_key *saved_store_keys[PS_PC_MAX_PARAMS];
+    Field *saved_to_fields[PS_PC_MAX_PARAMS];
+    for (uint i = 0; i < PS_PC_MAX_PARAMS; i++) {
+      saved_store_keys[i] = m_ps_pc.cached_store_keys[i];
+      saved_to_fields[i] = m_ps_pc.cached_to_fields[i];
+    }
+
     m_ps_pc = PsPointPlanTemplate{};
+
+    m_ps_pc.ref_cached = saved_ref_cached;
+    m_ps_pc.cached_key_buff = saved_key_buff;
+    m_ps_pc.cached_key_buff2 = saved_key_buff2;
+    for (uint i = 0; i < PS_PC_MAX_PARAMS; i++) {
+      m_ps_pc.cached_store_keys[i] = saved_store_keys[i];
+      m_ps_pc.cached_to_fields[i] = saved_to_fields[i];
+    }
+
     m_ps_pc_cursor_execution = false;
     m_ps_pc_retryable_cold = false;
   }

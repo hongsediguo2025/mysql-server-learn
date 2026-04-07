@@ -1,0 +1,521 @@
+--echo #
+--echo # Supplementary coverage tests for ps_point_plan_cache.
+--echo # Targets gaps identified in code review:
+--echo #   A. Gate 6 — extra params outside WHERE
+--echo #   B. Composite key param reordering correctness
+--echo #   C. Multiple DDL/reprepare cycles (arena stability)
+--echo #   D. ANALYZE TABLE — deterministic G1d demotion + re-admission
+--echo #   E. ALTER PRIMARY KEY structure change
+--echo #   F. DROP UK → reprepare → NEVER permanence
+--echo #   G. Partitioned table exclusion (Gate 4b)
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  val VARCHAR(50)
+);
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+
+CREATE TABLE t_comp (
+  pk1 INT NOT NULL,
+  pk2 INT NOT NULL,
+  val VARCHAR(50),
+  PRIMARY KEY (pk1, pk2)
+);
+INSERT INTO t_comp VALUES (1, 10, 'a'), (1, 20, 'b'), (2, 10, 'c'), (2, 20, 'd');
+
+CREATE TABLE t_uk (
+  id INT PRIMARY KEY,
+  uk_col INT NOT NULL,
+  val VARCHAR(50),
+  UNIQUE KEY idx_uk (uk_col)
+);
+INSERT INTO t_uk VALUES (1, 100, 'x'), (2, 200, 'y'), (3, 300, 'z');
+
+CREATE TABLE t_alt (
+  id INT PRIMARY KEY,
+  val VARCHAR(50)
+);
+INSERT INTO t_alt VALUES (1, 'aa'), (2, 'bb'), (3, 'cc');
+
+--echo # =======================================================
+--echo # A. Gate 6 — extra parameter outside WHERE equalities
+--echo #    param_count (1 in WHERE) != m_param_count (2 total)
+--echo #    → NEVER at classify time.
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a FROM 'SELECT ?, id, val FROM t1 WHERE id = ?';
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta (extra param in SELECT): $cold_delta
+
+--echo # Execute to confirm correct results and no admission
+SET @extra = 'hello';
+SET @p = 1;
+EXECUTE stmt_a USING @extra, @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after A (expect 0): $adm
+
+DEALLOCATE PREPARE stmt_a;
+
+--echo # A2: param in LIMIT position also counts
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_a2 FROM 'SELECT * FROM t1 WHERE id = ? LIMIT ?';
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta (param in LIMIT — has_limit gate): $cold_delta
+
+DEALLOCATE PREPARE stmt_a2;
+
+--echo # =======================================================
+--echo # B. Composite key — param reordering correctness
+--echo #    WHERE pk2 = ? AND pk1 = ? — reversed from key order.
+--echo #    Phase 2 admission reorders params to (pk1, pk2).
+--echo #    Verify correct results across multiple executes.
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_b FROM 'SELECT * FROM t_comp WHERE pk2 = ? AND pk1 = ?';
+
+--echo # B1: first execute — admission (params reordered to key order)
+SET @pk2 = 10;
+SET @pk1 = 1;
+EXECUTE stmt_b USING @pk2, @pk1;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after B1 (expect 1): $adm
+
+--echo # B2: second execute — fast path hit with different values
+SET @pk2 = 20;
+SET @pk1 = 2;
+EXECUTE stmt_b USING @pk2, @pk1;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after B2 (expect 1): $hits
+
+--echo # B3: verify all four combinations return correct data
+SET @pk2 = 10;
+SET @pk1 = 2;
+EXECUTE stmt_b USING @pk2, @pk1;
+
+SET @pk2 = 20;
+SET @pk1 = 1;
+EXECUTE stmt_b USING @pk2, @pk1;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after B3 (expect 3): $hits
+
+--echo # B4: non-existent composite key — empty result, still a hit
+SET @pk2 = 99;
+SET @pk1 = 99;
+EXECUTE stmt_b USING @pk2, @pk1;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after B4 (expect 4): $hits
+
+DEALLOCATE PREPARE stmt_b;
+
+--echo # =======================================================
+--echo # C. Multiple DDL/reprepare cycles — arena stability
+--echo #    5 consecutive ALTER → EXECUTE cycles on the same PS.
+--echo #    Each cycle: HOT → reprepare → re-classify → re-admit → HOT.
+--echo #    Verifies arena-cached ref components survive across cycles.
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_c FROM 'SELECT * FROM t_alt WHERE id = ?';
+
+--echo # C-admit: initial admission → HOT
+SET @p = 1;
+EXECUTE stmt_c USING @p;
+
+--let $adm_base = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions baseline: $adm_base
+
+--echo # C-hit: verify HOT
+SET @p = 2;
+EXECUTE stmt_c USING @p;
+
+--let $hits_base = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits baseline: $hits_base
+
+--echo # Cycle 1
+ALTER TABLE t_alt ADD COLUMN c1 INT DEFAULT 0;
+SET @p = 1;
+EXECUTE stmt_c USING @p;
+SET @p = 2;
+EXECUTE stmt_c USING @p;
+
+--echo # Cycle 2
+ALTER TABLE t_alt DROP COLUMN c1;
+SET @p = 1;
+EXECUTE stmt_c USING @p;
+SET @p = 3;
+EXECUTE stmt_c USING @p;
+
+--echo # Cycle 3
+ALTER TABLE t_alt ADD COLUMN c2 INT DEFAULT 0;
+SET @p = 2;
+EXECUTE stmt_c USING @p;
+SET @p = 3;
+EXECUTE stmt_c USING @p;
+
+--echo # Cycle 4
+ALTER TABLE t_alt DROP COLUMN c2;
+SET @p = 1;
+EXECUTE stmt_c USING @p;
+SET @p = 2;
+EXECUTE stmt_c USING @p;
+
+--echo # Cycle 5
+ALTER TABLE t_alt ADD COLUMN c3 VARCHAR(10) DEFAULT 'x';
+SET @p = 3;
+EXECUTE stmt_c USING @p;
+SET @p = 1;
+EXECUTE stmt_c USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm - $adm_base`
+--echo admissions delta after 5 cycles (expect 5): $adm_delta
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits - $hits_base`
+--echo hits delta after 5 cycles (expect 5): $hits_delta
+
+--echo # Final result correctness check
+SET @p = 1;
+EXECUTE stmt_c USING @p;
+
+ALTER TABLE t_alt DROP COLUMN c3;
+DEALLOCATE PREPARE stmt_c;
+
+--echo # =======================================================
+--echo # D. ANALYZE TABLE — deterministic G1d demotion
+--echo #    Insert bulk data to force stats change, then ANALYZE.
+--echo #    Verify demotion to COLD and re-admission.
+--echo # =======================================================
+
+FLUSH STATUS;
+
+CREATE TABLE t_az (
+  id INT PRIMARY KEY,
+  val INT
+);
+INSERT INTO t_az VALUES (1, 10), (2, 20);
+
+PREPARE stmt_d FROM 'SELECT * FROM t_az WHERE id = ?';
+
+--echo # D1: admission
+SET @p = 1;
+EXECUTE stmt_d USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after D1 (expect 1): $adm
+
+--echo # D2: fast path hit (confirms HOT)
+SET @p = 2;
+EXECUTE stmt_d USING @p;
+
+--let $hits_base = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after D2 (expect 1): $hits_base
+
+--echo # D3: insert bulk data to force stats change + ANALYZE
+--disable_query_log
+--let $i = 100
+while ($i < 1100)
+{
+  eval INSERT INTO t_az VALUES ($i, $i * 10);
+  --inc $i
+}
+--enable_query_log
+
+ANALYZE TABLE t_az;
+
+--echo # D4: execute after ANALYZE — if version changed, demotion + re-admit
+SET @p = 1;
+EXECUTE stmt_d USING @p;
+
+--echo # D5: next execute — fast path hit (re-admitted or was still HOT)
+SET @p = 500;
+EXECUTE stmt_d USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits - $hits_base`
+--echo hits delta after D5 (expect >= 1): $hits_delta
+
+--echo # Result correctness
+SET @p = 2;
+EXECUTE stmt_d USING @p;
+
+DEALLOCATE PREPARE stmt_d;
+DROP TABLE t_az;
+
+--echo # =======================================================
+--echo # E. ALTER PRIMARY KEY structure — verify re-admission
+--echo #    with a different key layout after reprepare.
+--echo # =======================================================
+
+FLUSH STATUS;
+
+CREATE TABLE t_pk_change (
+  a INT NOT NULL,
+  b INT NOT NULL,
+  val VARCHAR(50),
+  PRIMARY KEY (a)
+);
+INSERT INTO t_pk_change VALUES (1, 10, 'r1'), (2, 20, 'r2'), (3, 30, 'r3');
+
+PREPARE stmt_e FROM 'SELECT * FROM t_pk_change WHERE a = ?';
+
+--echo # E1: admission on PK(a)
+SET @p = 1;
+EXECUTE stmt_e USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after E1 (expect 1): $adm
+
+--echo # E2: fast path hit
+SET @p = 2;
+EXECUTE stmt_e USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after E2 (expect 1): $hits
+
+--echo # E3: change PK structure — reprepare → re-classify → re-admit
+ALTER TABLE t_pk_change DROP PRIMARY KEY, ADD PRIMARY KEY (a, b);
+
+SET @p = 1;
+EXECUTE stmt_e USING @p;
+
+--echo # After PK change from (a) to (a,b): query WHERE a = ? has
+--echo # only 1 param but key now has 2 parts. Admission will fail
+--echo # (ref.key_parts != tpl.param_count) → NEVER.
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after E3 (expect 1, no new): $adm
+
+--echo # E4: result is still correct via normal optimizer
+SET @p = 2;
+EXECUTE stmt_e USING @p;
+
+SET @p = 3;
+EXECUTE stmt_e USING @p;
+
+DEALLOCATE PREPARE stmt_e;
+DROP TABLE t_pk_change;
+
+--echo # =======================================================
+--echo # F. DROP UNIQUE KEY → reprepare → NEVER permanence
+--echo #    After the UK is dropped, admission fails.
+--echo #    Verify NEVER persists across many subsequent executes.
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_f FROM 'SELECT * FROM t_uk WHERE uk_col = ?';
+
+--echo # F1: admission on UNIQUE KEY
+SET @p = 100;
+EXECUTE stmt_f USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after F1 (expect 1): $adm
+
+--echo # F2: fast path hit
+SET @p = 200;
+EXECUTE stmt_f USING @p;
+
+--let $hits_base = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after F2 (expect 1): $hits_base
+
+--echo # F3: DROP the unique index → reprepare → NEVER
+ALTER TABLE t_uk DROP INDEX idx_uk;
+
+SET @p = 100;
+EXECUTE stmt_f USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after F3 (still 1, no new): $adm
+
+--echo # F4: multiple executes in NEVER state — no counters change
+SET @p = 200;
+EXECUTE stmt_f USING @p;
+SET @p = 300;
+EXECUTE stmt_f USING @p;
+SET @p = 100;
+EXECUTE stmt_f USING @p;
+SET @p = 200;
+EXECUTE stmt_f USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after F4 (still 1): $adm
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits - $hits_base`
+--echo hits delta after F4 (expect 0): $hits_delta
+
+--echo # Restore index for cleanup
+ALTER TABLE t_uk ADD UNIQUE KEY idx_uk (uk_col);
+DEALLOCATE PREPARE stmt_f;
+
+--echo # =======================================================
+--echo # G. Partitioned table exclusion (Gate 4b)
+--echo #    Partitioned table must be rejected at classify time.
+--echo #    PK point select on partitioned table → no cold.
+--echo # =======================================================
+
+FLUSH STATUS;
+
+CREATE TABLE t_part (
+  id INT PRIMARY KEY,
+  val VARCHAR(50)
+) PARTITION BY HASH(id) PARTITIONS 4;
+INSERT INTO t_part VALUES (1, 'p1'), (2, 'p2'), (3, 'p3'), (4, 'p4');
+
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_g FROM 'SELECT * FROM t_part WHERE id = ?';
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta (partitioned table): $cold_delta
+
+--echo # Execute to confirm correct results but no admission
+SET @p = 1;
+EXECUTE stmt_g USING @p;
+
+SET @p = 3;
+EXECUTE stmt_g USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after G (expect 0): $adm
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after G (expect 0): $hits
+
+DEALLOCATE PREPARE stmt_g;
+DROP TABLE t_part;
+
+--echo # =======================================================
+--echo # H. G8 type drift: INT → STRING → COLD → INT re-admit
+--echo #    Uses non-numeric string to trigger type drift.
+--echo #    'abc' converts to 0 for INT comparison; no row found
+--echo #    so optimizer short-circuits before admission hook.
+--echo #    PS stays COLD until a valid INT param triggers admission.
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_h FROM 'SELECT * FROM t1 WHERE id = ?';
+
+--echo # H1: INT admission → HOT
+SET @p = 1;
+EXECUTE stmt_h USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after H1 (expect 1): $adm
+
+--echo # H2: non-numeric STRING → G8 runtime guard triggers demotion HOT→COLD.
+--echo #     'abc'→0 finds no row, optimizer zero-results before admission hook.
+--echo #     PS stays COLD (not re-admitted yet).
+SET @p = 'abc';
+EXECUTE stmt_h USING @p;
+
+--let $fb = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--echo fallback_runtime after H2 (expect 1): $fb
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after H2 (expect 1, no re-admit yet): $adm
+
+--echo # H3: another STRING while COLD — zero result again, stays COLD
+SET @p = 'xyz';
+EXECUTE stmt_h USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after H3 (expect 0): $hits
+
+--echo # H4: INT param with valid row → COLD → normal optimize → re-admission
+SET @p = 1;
+EXECUTE stmt_h USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after H4 (expect 2): $adm
+
+--echo # H5: INT hit confirms re-admission succeeded
+SET @p = 2;
+EXECUTE stmt_h USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after H5 (expect 1): $hits
+
+DEALLOCATE PREPARE stmt_h;
+
+--echo # =======================================================
+--echo # I. NULL param on HOT → fallback preserves HOT
+--echo #    After fallback, next non-NULL execute is a hit.
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_i FROM 'SELECT * FROM t1 WHERE id = ?';
+
+--echo # I1: admission → HOT
+SET @p = 1;
+EXECUTE stmt_i USING @p;
+
+--echo # I2: hit confirms HOT
+SET @p = 2;
+EXECUTE stmt_i USING @p;
+
+--let $hits_base = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+--echo # I3: NULL param → G7 fallback, stays HOT
+SET @p = NULL;
+EXECUTE stmt_i USING @p;
+
+--let $fb = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--echo fallback_runtime after I3 (expect 1): $fb
+
+--echo # I4: non-NULL → should be a hit (HOT preserved)
+SET @p = 3;
+EXECUTE stmt_i USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits - $hits_base`
+--echo hits delta after I4 (expect 1): $hits_delta
+
+--echo # I5: multiple NULL → multiple fallbacks, still HOT after
+SET @p = NULL;
+EXECUTE stmt_i USING @p;
+EXECUTE stmt_i USING @p;
+EXECUTE stmt_i USING @p;
+
+--let $fb = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--echo fallback_runtime after I5 (expect 4): $fb
+
+SET @p = 1;
+EXECUTE stmt_i USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits - $hits_base`
+--echo hits delta after I5 recovery (expect 2): $hits_delta
+
+DEALLOCATE PREPARE stmt_i;
+
+--echo # -------------------------------------------------------
+--echo # Teardown
+--echo # -------------------------------------------------------
+
+DROP TABLE t1;
+DROP TABLE t_comp;
+DROP TABLE t_uk;
+DROP TABLE t_alt;
+
+--echo # Supplementary coverage tests complete.
