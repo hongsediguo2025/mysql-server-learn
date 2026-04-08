@@ -36,6 +36,9 @@
 
 #include "sql/ps_point_plan_cache.h"
 
+#include <new>
+#include <type_traits>
+
 #include "sql/item.h"
 #include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
@@ -92,9 +95,10 @@ void ps_point_plan_clear_hot_metadata(PsPointPlanTemplate *tpl) {
   tpl->table_ref_version = 0;
   tpl->relevant_sql_mode = 0;
   /*
-    ref_cached stays true if previously built — the arena-allocated
-    buffers / store_keys survive demotion and are reused on re-admission.
-    They are only freed when the PS itself is destroyed.
+    ref_cached / qep_cached stay true if previously built — the
+    arena-allocated buffers survive demotion.  A compatibility check
+    in ps_point_plan_admit() validates the cached Field clones match
+    the new key layout before reuse; mismatches force a rebuild.
   */
   for (uint i = 0; i < PS_PC_MAX_PARAMS; i++) {
     tpl->actual_types[i] = MYSQL_TYPE_INVALID;
@@ -321,7 +325,9 @@ bool ps_point_plan_runtime_guard(THD *thd, Prepared_statement *stmt,
 
   /*
     Structural guards — if any fails, the template is no longer valid
-    and must be invalidated.  The PS stays INVALID until reprepare.
+    and must be invalidated.  Invalidation demotes to COLD (non-retryable)
+    with cache flags reset, so the next execution goes through the normal
+    optimizer and can re-admit with fresh cached components.
   */
 
   /* G1: TABLE binding must be live. */
@@ -341,8 +347,8 @@ bool ps_point_plan_runtime_guard(THD *thd, Prepared_statement *stmt,
   }
 
   /*
-    G1c-G1d: retryable environment drift.
-    These do not make the statement permanently invalid; instead we
+    G1c: retryable environment drift — optimizer_switch.
+    Does not make the statement permanently invalid; instead we
     demote HOT -> COLD so the current execution can re-optimize and
     potentially re-admit with refreshed metadata.
   */
@@ -352,9 +358,24 @@ bool ps_point_plan_runtime_guard(THD *thd, Prepared_statement *stmt,
     return false;
   }
 
+  /*
+    G1d: table_ref_version drift.
+    table_ref_version tracks TABLE_SHARE identity (table_map_id),
+    which changes when the share is reloaded into TDC.  This can
+    reflect DDL that alters column definitions (charset, nullability,
+    pack_length) without changing the column ordinal.  Use hard
+    invalidation (cache flags reset) to ensure Field clones and
+    key buffers are rebuilt, since field_index()-based compatibility
+    checks cannot detect definition-level changes.
+
+    In practice this guard rarely fires because
+    check_and_update_table_version() in open_tables_for_query()
+    detects version changes earlier and triggers reprepare, which
+    swaps away the entire plan cache state.
+  */
   if (table->s->get_table_ref_version() != tpl.table_ref_version) {
-    ps_point_plan_demote_to_cold(stmt);
-    ps_point_plan_mark_runtime_fallback(thd);
+    stmt->invalidate_ps_point_plan_cache();
+    ps_point_plan_mark_invalidation(thd);
     return false;
   }
 
@@ -476,9 +497,9 @@ bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
     Rationale:
       - init_planner_arrays() asserts primary_tables == 0 && tables == 0.
         Violating this crashes debug builds.
-      - where_cond is already set to the real WHERE by
-        get_optimizable_conditions().  Clearing it and then falling back
-        would make the normal optimizer miss the predicate.
+      - V1.2: the fast path hook fires before get_optimizable_conditions(),
+        so where_cond has not been set yet.  On failure we fall through
+        to the normal preamble which will set it correctly.
   */
 
   /* --- Phase A: Runtime guard (read-only, no JOIN mutation) --- */
@@ -487,40 +508,90 @@ bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
   if (!ps_point_plan_runtime_guard(thd, stmt, &table, &keyinfo))
     return false;
 
-  /* --- Phase B: Construct all objects in local variables --- */
+  /* --- Phase B: Construct plan in local variables --- */
 
-  /* B1: Allocate QEP_TAB[2] (1 real + 1 sentinel) */
-  QEP_TAB *new_qep_tab = new (thd->mem_root) QEP_TAB[2];
-  if (new_qep_tab == nullptr) {
-    ps_point_plan_mark_runtime_fallback(thd);
-    return false;
-  }
+  QEP_TAB *new_qep_tab;
+  QEP_TAB *tab;
 
-  /* B2: Allocate and link QEP_shared */
-  QEP_shared *qs = new (thd->mem_root) QEP_shared;
-  if (qs == nullptr) {
-    ps_point_plan_mark_runtime_fallback(thd);
-    return false;
-  }
+  if (tpl.qep_cached && tpl.ref_cached) {
+    /*
+      V1.2 fully-cached path: reuse arena QEP_TAB, QEP_shared,
+      pointer arrays, key buffers, and store_key objects.
+      Only re-bind per-execution pointers (join, table) and
+      serialize current parameter values via store_key::copy().
 
-  QEP_TAB *tab = &new_qep_tab[0];
-  tab->set_qs(qs);
-  tab->set_join(join);
-  tab->set_idx(0);
-  tab->set_table(table);
-  tab->table_ref = tpl.table_ref;
-  tab->set_type(JT_EQ_REF);
+      Placement-new reinitializes the cached objects to their
+      default-constructed state, resetting QEP_shared::m_idx and
+      QEP_shared_owner::m_qs which have one-shot assertions in
+      set_idx() / set_qs().  The arena memory is not freed.
 
-  /*
-    B3: Build Index_lookup.
-    Fast path: reuse arena-cached key buffers and store_key objects,
-    only re-patching the TABLE pointer on the Field clones and calling
-    copy() to serialize current parameter values.
-    Slow path: full init_ref + init_ref_part (first execution before
-    cache is built, or if cache construction failed).
-  */
-  if (tpl.ref_cached) {
-    /* --- Fast ref path: reuse cached components --- */
+      Both types are trivially destructible so skipping the explicit
+      destructor call before placement-new is safe and well-defined.
+      The static_asserts guard against future regressions.
+    */
+    static_assert(std::is_trivially_destructible<QEP_shared>::value,
+                  "QEP_shared must be trivially destructible for "
+                  "placement-new reuse without explicit dtor call");
+    static_assert(std::is_trivially_destructible<QEP_TAB>::value,
+                  "QEP_TAB must be trivially destructible for "
+                  "placement-new reuse without explicit dtor call");
+    new_qep_tab = tpl.cached_qep_tab;
+    new (tpl.cached_qep_shared) QEP_shared();
+    new (&new_qep_tab[0]) QEP_TAB();
+    tab = &new_qep_tab[0];
+    tab->set_qs(tpl.cached_qep_shared);
+    tab->set_join(join);
+    tab->set_idx(0);
+    tab->set_table(table);
+    tab->table_ref = tpl.table_ref;
+    tab->set_type(JT_EQ_REF);
+
+    Index_lookup &ref = tab->ref();
+    ref.key_parts = tpl.key_parts;
+    ref.key_length = tpl.key_length;
+    ref.key = static_cast<int>(tpl.keyno);
+    ref.key_buff = tpl.cached_key_buff;
+    ref.key_buff2 = tpl.cached_key_buff2;
+    ref.key_err = true;
+    ref.null_rejecting = tpl.null_rejecting;
+    ref.use_count = 0;
+    ref.disable_cache = false;
+    ref.null_ref_key = nullptr;
+    ref.depend_map = 0;
+    ref.key_copy = tpl.cached_key_copy;
+    ref.items = tpl.cached_ref_items;
+    ref.cond_guards = tpl.cached_cond_guards;
+
+    for (uint i = 0; i < tpl.key_parts; i++) {
+      tpl.cached_to_fields[i]->init(table);
+      store_key *sk = tpl.cached_store_keys[i];
+      (void)sk->copy();
+      tpl.cached_key_copy[i] = sk->null_key ? sk : nullptr;
+    }
+  } else if (tpl.ref_cached) {
+    /*
+      V1.1 ref-cached path: reuse arena key buffers and store_key
+      objects, but allocate QEP_TAB and pointer arrays per-execution.
+    */
+    new_qep_tab = new (thd->mem_root) QEP_TAB[2];
+    if (new_qep_tab == nullptr) {
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
+    }
+    QEP_shared *qs = new (thd->mem_root) QEP_shared;
+    if (qs == nullptr) {
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
+    }
+
+    tab = &new_qep_tab[0];
+    tab->set_qs(qs);
+    tab->set_join(join);
+    tab->set_idx(0);
+    tab->set_table(table);
+    tab->table_ref = tpl.table_ref;
+    tab->set_type(JT_EQ_REF);
+
     Index_lookup &ref = tab->ref();
     ref.key_parts = tpl.key_parts;
     ref.key_length = tpl.key_length;
@@ -550,13 +621,29 @@ bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
 
       store_key *sk = tpl.cached_store_keys[i];
       (void)sk->copy();
-      if (sk->null_key)
-        ref.key_copy[i] = sk;
-      else
-        ref.key_copy[i] = nullptr;
+      ref.key_copy[i] = sk->null_key ? sk : nullptr;
     }
   } else {
-    /* --- Slow ref path: full construction --- */
+    /* Slow path: no arena cache available, full construction. */
+    new_qep_tab = new (thd->mem_root) QEP_TAB[2];
+    if (new_qep_tab == nullptr) {
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
+    }
+    QEP_shared *qs = new (thd->mem_root) QEP_shared;
+    if (qs == nullptr) {
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
+    }
+
+    tab = &new_qep_tab[0];
+    tab->set_qs(qs);
+    tab->set_join(join);
+    tab->set_idx(0);
+    tab->set_table(table);
+    tab->table_ref = tpl.table_ref;
+    tab->set_type(JT_EQ_REF);
+
     if (init_ref(thd, tpl.key_parts, tpl.key_length, tpl.keyno,
                  &tab->ref())) {
       ps_point_plan_mark_runtime_fallback(thd);
@@ -582,7 +669,7 @@ bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
     assert(key_buff == tab->ref().key_buff + tpl.key_length);
   }
 
-  /* B4: Create AccessPath */
+  /* B4: Create AccessPath (always per-execution). */
   AccessPath *path =
       NewEQRefAccessPath(thd, table, &tab->ref(), /*count_examined_rows=*/true);
   if (path == nullptr) {
@@ -600,8 +687,8 @@ bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
 
     This is the ONLY place where JOIN members are modified.
     If any step above failed and returned false, we reach here with
-    the JOIN completely untouched, so fallback to make_join_plan()
-    proceeds with correct state (tables==0, where_cond intact, etc.).
+    the JOIN completely untouched, so fallback to the normal optimizer
+    preamble proceeds with correct state.
   */
   join->tables = 1;
   join->primary_tables = 1;
@@ -804,47 +891,107 @@ void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
   }
 
   /*
-    Build cached Index_lookup components on PS arena so the fast path
-    can reuse them across executions, avoiding per-execution Field
-    cloning and buffer allocation.  Only done once (ref_cached stays
-    true across HOT->COLD->HOT transitions as the arena persists).
+    Validate cached helpers are compatible with the current key choice.
+    After a retryable HOT->COLD demotion (type drift, optimizer_switch,
+    etc.), the optimizer usually picks the same key, but if the key or
+    field layout changed, the cached store_key / key_buff objects are
+    stale and must be rebuilt.
+
+    Only field_index is checked — key_length is not checked separately
+    because structural DDL (which could change column size / key_length)
+    is caught earlier by either:
+      (a) check_and_update_table_version() → full reprepare, or
+      (b) G1d guard → invalidate_ps_point_plan_cache() (ref_cached=false).
+    Retryable soft demotions (type drift, optimizer_switch, sql_mode,
+    collation) preserve the table structure, so same field_index set
+    implies same key_length.  The assert below guards this invariant.
   */
-  if (!tpl.ref_cached) {
+  if (tpl.ref_cached) {
+    bool compatible = true;
+    for (uint i = 0; i < tpl.key_parts && compatible; i++) {
+      if (tpl.cached_to_fields[i] == nullptr ||
+          tpl.cached_to_fields[i]->field_index() != tpl.field_indices[i]) {
+        compatible = false;
+      }
+    }
+    if (compatible) {
+      assert(tpl.key_length == ref.key_length);
+    } else {
+      tpl.ref_cached = false;
+      tpl.qep_cached = false;
+    }
+  }
+
+  /*
+    Build cached components on PS arena so the fast path can reuse them
+    across executions, avoiding per-execution allocation overhead.
+
+    V1.1: Index_lookup components (key buffers, store_key, Field clones).
+    V1.2: QEP skeleton (QEP_TAB, QEP_shared, pointer arrays).
+
+    Built once per component group.  After retryable demotion the
+    validation above ensures stale helpers are discarded before rebuild.
+
+    Lifecycle coupling: V1.2 (qep) depends on V1.1 (ref) — the
+    cached key_copy array references store_key objects from ref.
+    If ref allocation fails, skip qep to avoid a partial-cache state
+    where qep_cached=true but ref_cached=false (which the fast path
+    handles but makes reasoning harder).
+  */
+  if (!tpl.ref_cached || !tpl.qep_cached) {
     Query_arena backup;
     thd->swap_query_arena(stmt->m_arena, &backup);
 
-    const uint aligned_len = ALIGN_SIZE(tpl.key_length);
-    tpl.cached_key_buff = thd->mem_root->ArrayAlloc<uchar>(aligned_len);
-    tpl.cached_key_buff2 = thd->mem_root->ArrayAlloc<uchar>(aligned_len);
+    if (!tpl.ref_cached) {
+      const uint aligned_len = ALIGN_SIZE(tpl.key_length);
+      tpl.cached_key_buff = thd->mem_root->ArrayAlloc<uchar>(aligned_len);
+      tpl.cached_key_buff2 = thd->mem_root->ArrayAlloc<uchar>(aligned_len);
 
-    bool cache_ok = (tpl.cached_key_buff != nullptr &&
-                     tpl.cached_key_buff2 != nullptr);
+      bool cache_ok = (tpl.cached_key_buff != nullptr &&
+                       tpl.cached_key_buff2 != nullptr);
 
-    uchar *kb_pos = tpl.cached_key_buff;
-    for (uint i = 0; i < tpl.key_parts && cache_ok; i++) {
-      const KEY_PART_INFO *kp = &keyinfo->key_part[i];
-      Field *orig_field = table->field[tpl.field_indices[i]];
-      const bool nullable = (kp->null_bit != 0);
+      uchar *kb_pos = tpl.cached_key_buff;
+      for (uint i = 0; i < tpl.key_parts && cache_ok; i++) {
+        const KEY_PART_INFO *kp = &keyinfo->key_part[i];
+        Field *orig_field = table->field[tpl.field_indices[i]];
+        const bool nullable = (kp->null_bit != 0);
 
-      /*
-        store_key constructor internally clones orig_field via
-        new_key_field(thd->mem_root, ...) — since we swapped to the
-        PS arena, the clone lives on the arena and survives across
-        executions.
-      */
-      store_key *sk = new (thd->mem_root)
-          store_key(thd, orig_field, kb_pos + nullable,
-                    nullable ? kb_pos : nullptr, kp->length, tpl.params[i]);
-      if (sk == nullptr) {
-        cache_ok = false;
-        break;
+        store_key *sk = new (thd->mem_root)
+            store_key(thd, orig_field, kb_pos + nullable,
+                      nullable ? kb_pos : nullptr, kp->length, tpl.params[i]);
+        if (sk == nullptr) {
+          cache_ok = false;
+          break;
+        }
+
+        tpl.cached_store_keys[i] = sk;
+        tpl.cached_to_fields[i] = sk->store_field();
+        kb_pos += kp->store_length;
       }
-
-      tpl.cached_store_keys[i] = sk;
-      tpl.cached_to_fields[i] = sk->store_field();
-      kb_pos += kp->store_length;
+      if (cache_ok) tpl.ref_cached = true;
     }
-    if (cache_ok) tpl.ref_cached = true;
+
+    if (tpl.ref_cached && !tpl.qep_cached) {
+      QEP_TAB *qt = new (thd->mem_root) QEP_TAB[2];
+      QEP_shared *qs = new (thd->mem_root) QEP_shared;
+      store_key **kc = thd->mem_root->ArrayAlloc<store_key *>(tpl.key_parts);
+      Item **ri = thd->mem_root->ArrayAlloc<Item *>(tpl.key_parts);
+      bool **cg = thd->mem_root->ArrayAlloc<bool *>(tpl.key_parts);
+
+      if (qt != nullptr && qs != nullptr &&
+          kc != nullptr && ri != nullptr && cg != nullptr) {
+        for (uint i = 0; i < tpl.key_parts; i++) {
+          ri[i] = tpl.params[i];
+          cg[i] = nullptr;
+        }
+        tpl.cached_qep_tab = qt;
+        tpl.cached_qep_shared = qs;
+        tpl.cached_key_copy = kc;
+        tpl.cached_ref_items = ri;
+        tpl.cached_cond_guards = cg;
+        tpl.qep_cached = true;
+      }
+    }
 
     thd->swap_query_arena(backup, &stmt->m_arena);
   }

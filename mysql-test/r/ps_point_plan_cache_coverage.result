@@ -8,6 +8,16 @@
 #   E. ALTER PRIMARY KEY structure change
 #   F. DROP UK → reprepare → NEVER permanence
 #   G. Partitioned table exclusion (Gate 4b)
+#   H. G8 type drift: INT → STRING → re-admission
+#   I. NULL param fallback preserves HOT
+#   J. Multiple consecutive HOT hits (placement-new fix)
+#   K. Guard failure recovery (INVALID dead-end fix)
+#   L. Composite key — QEP_TAB reuse
+#   M. PS_PC_MAX_PARAMS boundary (5-column PK rejected)
+#   N. Repeated type drift cycles (G8 stress)
+#   O. optimizer_switch drift (G1c guard, use_invisible_indexes)
+#   P. sql_mode drift (G11 guard, PAD_CHAR_TO_FULL_LENGTH)
+#   Q. Composite key with type drift (G8 + reordering)
 #
 # -------------------------------------------------------
 # Setup
@@ -429,6 +439,520 @@ id	val
 1	one
 hits delta after I5 recovery (expect 2): 2
 DEALLOCATE PREPARE stmt_i;
+# =======================================================
+# J. Multiple consecutive HOT hits — QEP_TAB/QEP_shared
+#    reuse across executions.  Before the placement-new
+#    fix, set_qs()/set_idx() would assert on the second
+#    hit in debug builds (one-shot initialization).
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_j FROM 'SELECT * FROM t1 WHERE id = ?';
+# J1: admission → HOT
+SET @p = 1;
+EXECUTE stmt_j USING @p;
+id	val
+1	one
+admissions after J1 (expect 1): 1
+# J2-J11: 10 consecutive HOT hits — exercises cached QEP reuse
+SET @p = 2;
+EXECUTE stmt_j USING @p;
+id	val
+2	two
+SET @p = 3;
+EXECUTE stmt_j USING @p;
+id	val
+3	three
+SET @p = 1;
+EXECUTE stmt_j USING @p;
+id	val
+1	one
+SET @p = 2;
+EXECUTE stmt_j USING @p;
+id	val
+2	two
+SET @p = 3;
+EXECUTE stmt_j USING @p;
+id	val
+3	three
+SET @p = 1;
+EXECUTE stmt_j USING @p;
+id	val
+1	one
+SET @p = 2;
+EXECUTE stmt_j USING @p;
+id	val
+2	two
+SET @p = 3;
+EXECUTE stmt_j USING @p;
+id	val
+3	three
+SET @p = 1;
+EXECUTE stmt_j USING @p;
+id	val
+1	one
+SET @p = 2;
+EXECUTE stmt_j USING @p;
+id	val
+2	two
+hits after J (expect 10): 10
+admissions after J (still 1): 1
+DEALLOCATE PREPARE stmt_j;
+# =======================================================
+# K. Guard failure recovery — invalidation demotes to COLD,
+#    next execution re-admits with fresh cached components.
+#    Covers the former INVALID dead-end fix.
+#
+#    Scenario: HOT → DDL drops extra column → reprepare →
+#    COLD (classify) → normal optimize → re-admit → HOT.
+#    Then another DDL + 10 hits to verify fresh arena cache.
+# =======================================================
+FLUSH STATUS;
+CREATE TABLE t_guard (
+id INT PRIMARY KEY,
+val VARCHAR(50),
+extra INT DEFAULT 0
+);
+INSERT INTO t_guard VALUES (1, 'g1', 10), (2, 'g2', 20), (3, 'g3', 30);
+PREPARE stmt_k FROM 'SELECT * FROM t_guard WHERE id = ?';
+# K1: admission → HOT
+SET @p = 1;
+EXECUTE stmt_k USING @p;
+id	val	extra
+1	g1	10
+admissions after K1 (expect 1): 1
+# K2: HOT hit
+SET @p = 2;
+EXECUTE stmt_k USING @p;
+id	val	extra
+2	g2	20
+hits after K2 (expect 1): 1
+# K3: DDL → reprepare → re-classify → COLD → re-admit → HOT
+ALTER TABLE t_guard DROP COLUMN extra;
+SET @p = 1;
+EXECUTE stmt_k USING @p;
+id	val
+1	g1
+admissions after K3 (expect 2): 2
+# K4: 10 consecutive HOT hits after re-admission (fresh cache)
+SET @p = 2;
+EXECUTE stmt_k USING @p;
+id	val
+2	g2
+SET @p = 3;
+EXECUTE stmt_k USING @p;
+id	val
+3	g3
+SET @p = 1;
+EXECUTE stmt_k USING @p;
+id	val
+1	g1
+SET @p = 2;
+EXECUTE stmt_k USING @p;
+id	val
+2	g2
+SET @p = 3;
+EXECUTE stmt_k USING @p;
+id	val
+3	g3
+SET @p = 1;
+EXECUTE stmt_k USING @p;
+id	val
+1	g1
+SET @p = 2;
+EXECUTE stmt_k USING @p;
+id	val
+2	g2
+SET @p = 3;
+EXECUTE stmt_k USING @p;
+id	val
+3	g3
+SET @p = 1;
+EXECUTE stmt_k USING @p;
+id	val
+1	g1
+SET @p = 2;
+EXECUTE stmt_k USING @p;
+id	val
+2	g2
+hits delta after K4 (expect 10): 10
+# K5: another DDL cycle to verify repeated recovery
+ALTER TABLE t_guard ADD COLUMN extra2 INT DEFAULT 0;
+SET @p = 3;
+EXECUTE stmt_k USING @p;
+id	val	extra2
+3	g3	0
+admissions after K5 (expect 3): 3
+SET @p = 1;
+EXECUTE stmt_k USING @p;
+id	val	extra2
+1	g1	0
+hits delta after K5 final hit (expect 11): 11
+ALTER TABLE t_guard DROP COLUMN extra2;
+DEALLOCATE PREPARE stmt_k;
+DROP TABLE t_guard;
+# =======================================================
+# L. Composite key — multiple HOT hits after admission
+#    Verifies that cached QEP_TAB reuse works correctly
+#    for composite-key lookups with param reordering.
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_l FROM 'SELECT * FROM t_comp WHERE pk2 = ? AND pk1 = ?';
+# L1: admission
+SET @pk2 = 10;
+SET @pk1 = 1;
+EXECUTE stmt_l USING @pk2, @pk1;
+pk1	pk2	val
+1	10	a
+admissions after L1 (expect 1): 1
+# L2-L6: 5 consecutive HOT hits with different values
+SET @pk2 = 20;
+SET @pk1 = 1;
+EXECUTE stmt_l USING @pk2, @pk1;
+pk1	pk2	val
+1	20	b
+SET @pk2 = 10;
+SET @pk1 = 2;
+EXECUTE stmt_l USING @pk2, @pk1;
+pk1	pk2	val
+2	10	c
+SET @pk2 = 20;
+SET @pk1 = 2;
+EXECUTE stmt_l USING @pk2, @pk1;
+pk1	pk2	val
+2	20	d
+SET @pk2 = 10;
+SET @pk1 = 1;
+EXECUTE stmt_l USING @pk2, @pk1;
+pk1	pk2	val
+1	10	a
+SET @pk2 = 20;
+SET @pk1 = 2;
+EXECUTE stmt_l USING @pk2, @pk1;
+pk1	pk2	val
+2	20	d
+hits after L (expect 5): 5
+DEALLOCATE PREPARE stmt_l;
+# =======================================================
+# M. PS_PC_MAX_PARAMS boundary — 5-column composite PK
+#    param_count (5) > PS_PC_MAX_PARAMS (4) → NEVER.
+#    Queries on wide composite keys gracefully fall back
+#    to the standard optimizer with correct results.
+# =======================================================
+FLUSH STATUS;
+CREATE TABLE t_wide (
+c1 INT NOT NULL,
+c2 INT NOT NULL,
+c3 INT NOT NULL,
+c4 INT NOT NULL,
+c5 INT NOT NULL,
+val VARCHAR(50),
+PRIMARY KEY (c1, c2, c3, c4, c5)
+);
+INSERT INTO t_wide VALUES (1, 2, 3, 4, 5, 'row1'), (10, 20, 30, 40, 50, 'row2');
+# M1: 5 params exceeds PS_PC_MAX_PARAMS=4, classify rejects → NEVER
+PREPARE stmt_m FROM 'SELECT * FROM t_wide WHERE c1 = ? AND c2 = ? AND c3 = ? AND c4 = ? AND c5 = ?';
+cold_delta (5 params): 0
+# M2: execute — correct results via normal optimizer, no admission
+SET @a=1, @b=2, @c=3, @d=4, @e=5;
+EXECUTE stmt_m USING @a, @b, @c, @d, @e;
+c1	c2	c3	c4	c5	val
+1	2	3	4	5	row1
+admissions after M2 (expect 0): 0
+# M3: second execute — still no hits
+SET @a=10, @b=20, @c=30, @d=40, @e=50;
+EXECUTE stmt_m USING @a, @b, @c, @d, @e;
+c1	c2	c3	c4	c5	val
+10	20	30	40	50	row2
+hits after M3 (expect 0): 0
+# M4: 4 params is within limit — verify classify succeeds
+CREATE TABLE t_four (
+c1 INT NOT NULL,
+c2 INT NOT NULL,
+c3 INT NOT NULL,
+c4 INT NOT NULL,
+val VARCHAR(50),
+PRIMARY KEY (c1, c2, c3, c4)
+);
+INSERT INTO t_four VALUES (1, 2, 3, 4, 'f1'), (5, 6, 7, 8, 'f2');
+PREPARE stmt_m4 FROM 'SELECT * FROM t_four WHERE c1 = ? AND c2 = ? AND c3 = ? AND c4 = ?';
+cold_delta (4 params — at limit): 1
+SET @a=1, @b=2, @c=3, @d=4;
+EXECUTE stmt_m4 USING @a, @b, @c, @d;
+c1	c2	c3	c4	val
+1	2	3	4	f1
+admissions after M4 (expect 1): 1
+SET @a=5, @b=6, @c=7, @d=8;
+EXECUTE stmt_m4 USING @a, @b, @c, @d;
+c1	c2	c3	c4	val
+5	6	7	8	f2
+hits after M4 hit (expect 1): 1
+DEALLOCATE PREPARE stmt_m;
+DEALLOCATE PREPARE stmt_m4;
+DROP TABLE t_wide;
+DROP TABLE t_four;
+# =======================================================
+# N. Repeated type drift cycles — G8 stress test
+#    3 full INT → STRING → INT cycles on the same PS.
+#    Each cycle: HOT → type drift demotion → COLD →
+#    (STRING exec stays COLD) → INT re-admit → HOT.
+#    Verifies demotion/re-admission is repeatable.
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_n FROM 'SELECT * FROM t1 WHERE id = ?';
+# N-cycle1: INT admit → HOT, STRING demote → COLD, INT re-admit → HOT
+SET @p = 1;
+EXECUTE stmt_n USING @p;
+id	val
+1	one
+admissions after cycle1 admit (expect 1): 1
+SET @p = 2;
+EXECUTE stmt_n USING @p;
+id	val
+2	two
+hits after cycle1 HOT hit (expect 1): 1
+SET @p = 'drift1';
+EXECUTE stmt_n USING @p;
+id	val
+Warnings:
+Warning	1292	Truncated incorrect INTEGER value: 'drift1'
+fallback after cycle1 drift (expect 1): 1
+SET @p = 1;
+EXECUTE stmt_n USING @p;
+id	val
+1	one
+admissions after cycle1 re-admit (expect 2): 2
+# N-cycle2: repeat
+SET @p = 3;
+EXECUTE stmt_n USING @p;
+id	val
+3	three
+SET @p = 'drift2';
+EXECUTE stmt_n USING @p;
+id	val
+Warnings:
+Warning	1292	Truncated incorrect INTEGER value: 'drift2'
+fallback after cycle2 drift (expect 2): 2
+SET @p = 2;
+EXECUTE stmt_n USING @p;
+id	val
+2	two
+admissions after cycle2 re-admit (expect 3): 3
+# N-cycle3: repeat once more
+SET @p = 1;
+EXECUTE stmt_n USING @p;
+id	val
+1	one
+SET @p = 'drift3';
+EXECUTE stmt_n USING @p;
+id	val
+Warnings:
+Warning	1292	Truncated incorrect INTEGER value: 'drift3'
+fallback after cycle3 drift (expect 3): 3
+SET @p = 3;
+EXECUTE stmt_n USING @p;
+id	val
+3	three
+admissions after cycle3 re-admit (expect 4): 4
+# N-final: 5 HOT hits to confirm stable after 3 cycles
+SET @p = 1;
+EXECUTE stmt_n USING @p;
+id	val
+1	one
+SET @p = 2;
+EXECUTE stmt_n USING @p;
+id	val
+2	two
+SET @p = 3;
+EXECUTE stmt_n USING @p;
+id	val
+3	three
+SET @p = 1;
+EXECUTE stmt_n USING @p;
+id	val
+1	one
+SET @p = 2;
+EXECUTE stmt_n USING @p;
+id	val
+2	two
+hits after N-final (expect 8): 8
+DEALLOCATE PREPARE stmt_n;
+# =======================================================
+# O. optimizer_switch drift — G1c guard
+#    use_invisible_indexes is the only switch tracked by
+#    the plan cache mask.  Toggling it triggers soft
+#    demotion (HOT → COLD retryable), then re-admission.
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_o FROM 'SELECT * FROM t1 WHERE id = ?';
+# O1: admission → HOT
+SET @p = 1;
+EXECUTE stmt_o USING @p;
+id	val
+1	one
+admissions after O1 (expect 1): 1
+# O2: confirm HOT
+SET @p = 2;
+EXECUTE stmt_o USING @p;
+id	val
+2	two
+hits after O2 (expect 1): 1
+# O3: toggle use_invisible_indexes → G1c demotion
+SET @optimizer_switch_save = @@optimizer_switch;
+SET optimizer_switch = 'use_invisible_indexes=on';
+SET @p = 1;
+EXECUTE stmt_o USING @p;
+id	val
+1	one
+fallback after O3 switch change (expect 1): 1
+# O4: COLD → re-admission with new switch value
+SET @p = 2;
+EXECUTE stmt_o USING @p;
+id	val
+2	two
+admissions after O4 (expect 2): 2
+# O5: HOT hits with new switch value
+#     Note: O3 fallback also re-admitted (same execution),
+#     so O4 was already a hit, not an admission.
+SET @p = 3;
+EXECUTE stmt_o USING @p;
+id	val
+3	three
+SET @p = 1;
+EXECUTE stmt_o USING @p;
+id	val
+1	one
+hits delta after O5 (expect 3): 3
+# O6: restore switch → another drift + re-admission (same exec)
+SET optimizer_switch = @optimizer_switch_save;
+SET @p = 2;
+EXECUTE stmt_o USING @p;
+id	val
+2	two
+fallback after O6 restore (expect 2): 2
+admissions after O6 re-admit (expect 3): 3
+# O7: 2 HOT hits after O6 re-admission
+SET @p = 1;
+EXECUTE stmt_o USING @p;
+id	val
+1	one
+SET @p = 3;
+EXECUTE stmt_o USING @p;
+id	val
+3	three
+hits delta after O7 (expect 5): 5
+DEALLOCATE PREPARE stmt_o;
+# =======================================================
+# P. sql_mode drift — G11 guard
+#    PAD_CHAR_TO_FULL_LENGTH is tracked by the plan cache
+#    sql_mode mask.  Toggling it triggers soft demotion
+#    (HOT → COLD retryable) + re-admission in same exec.
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_p FROM 'SELECT * FROM t1 WHERE id = ?';
+# P1: admission → HOT
+SET @p = 1;
+EXECUTE stmt_p USING @p;
+id	val
+1	one
+admissions after P1 (expect 1): 1
+# P2: confirm HOT
+SET @p = 2;
+EXECUTE stmt_p USING @p;
+id	val
+2	two
+hits after P2 (expect 1): 1
+# P3: set PAD_CHAR_TO_FULL_LENGTH → G11 drift + re-admission
+SET @sql_mode_save = @@sql_mode;
+SET sql_mode = 'PAD_CHAR_TO_FULL_LENGTH';
+Warnings:
+Warning	3090	Changing sql mode 'PAD_CHAR_TO_FULL_LENGTH' is deprecated. It will be removed in a future release.
+SET @p = 1;
+EXECUTE stmt_p USING @p;
+id	val
+1	one
+fallback after P3 sql_mode change (expect 1): 1
+admissions after P3 (expect 2, re-admit in same exec): 2
+# P4: HOT hit with new sql_mode
+SET @p = 2;
+EXECUTE stmt_p USING @p;
+id	val
+2	two
+hits delta after P4 (expect 1): 1
+# P5: restore sql_mode → another drift + re-admission
+SET sql_mode = @sql_mode_save;
+SET @p = 3;
+EXECUTE stmt_p USING @p;
+id	val
+3	three
+fallback after P5 restore (expect 2): 2
+admissions after P5 (expect 3): 3
+# P6: stable HOT hits after restore
+SET @p = 1;
+EXECUTE stmt_p USING @p;
+id	val
+1	one
+SET @p = 2;
+EXECUTE stmt_p USING @p;
+id	val
+2	two
+hits delta after P6 (expect 3): 3
+DEALLOCATE PREPARE stmt_p;
+# =======================================================
+# Q. Composite key with type drift — G8 + reordering
+#    Verifies type drift detection works correctly with
+#    composite key param reordering (Phase 2 reorders
+#    params to key-part order).
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_q FROM 'SELECT * FROM t_comp WHERE pk2 = ? AND pk1 = ?';
+# Q1: INT admission → HOT (params reordered to pk1, pk2)
+SET @pk2 = 10;
+SET @pk1 = 1;
+EXECUTE stmt_q USING @pk2, @pk1;
+pk1	pk2	val
+1	10	a
+admissions after Q1 (expect 1): 1
+# Q2: HOT hits
+SET @pk2 = 20;
+SET @pk1 = 2;
+EXECUTE stmt_q USING @pk2, @pk1;
+pk1	pk2	val
+2	20	d
+hits after Q2 (expect 1): 1
+# Q3: STRING drift on one param → G8 demotion
+SET @pk2 = 'abc';
+SET @pk1 = 1;
+EXECUTE stmt_q USING @pk2, @pk1;
+pk1	pk2	val
+Warnings:
+Warning	1292	Truncated incorrect INTEGER value: 'abc'
+Warning	1292	Truncated incorrect INTEGER value: 'abc'
+fallback after Q3 STRING drift (expect 1): 1
+# Q4: INT params → re-admission
+SET @pk2 = 10;
+SET @pk1 = 2;
+EXECUTE stmt_q USING @pk2, @pk1;
+pk1	pk2	val
+2	10	c
+admissions after Q4 re-admit (expect 2): 2
+# Q5: 3 HOT hits — verify reordering still correct after drift
+SET @pk2 = 20;
+SET @pk1 = 1;
+EXECUTE stmt_q USING @pk2, @pk1;
+pk1	pk2	val
+1	20	b
+SET @pk2 = 10;
+SET @pk1 = 1;
+EXECUTE stmt_q USING @pk2, @pk1;
+pk1	pk2	val
+1	10	a
+SET @pk2 = 20;
+SET @pk1 = 2;
+EXECUTE stmt_q USING @pk2, @pk1;
+pk1	pk2	val
+2	20	d
+hits delta after Q5 (expect 3): 3
+DEALLOCATE PREPARE stmt_q;
 # -------------------------------------------------------
 # Teardown
 # -------------------------------------------------------

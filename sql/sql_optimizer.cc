@@ -351,6 +351,38 @@ bool JOIN::optimize(bool finalize_access_paths) {
   // to prevent double initialization on EXPLAIN
   if (optimized) return false;
 
+  /*
+    V1.2: Early fast path for HOT prepared statements.
+
+    Fire BEFORE the entire optimizer preamble (Opt_trace, count_field_types,
+    alloc_func_list, get_optimizable_conditions, optimize_cond, etc.) so
+    that a HOT point-select skips all of it.  The classify gates guarantee
+    that any HOT statement is a single-table point SELECT with no aggregates,
+    subqueries, derived tables, windows, or LIMIT — none of the preamble
+    output is needed.
+
+    On success: set_optimized(), tables_list, PLAN_READY, and return.
+    On failure: fall through to the normal optimizer preamble unchanged.
+  */
+  if (thd->variables.ps_point_plan_cache &&
+      !thd->lex->using_hypergraph_optimizer()) {
+    Sql_cmd *sql_cmd = thd->lex->m_sql_cmd;
+    Prepared_statement *ps_owner =
+        (sql_cmd != nullptr) ? sql_cmd->owner() : nullptr;
+    if (ps_owner != nullptr &&
+        ps_owner->ps_point_plan_state() == PsPointPlanState::HOT &&
+        !ps_owner->ps_point_plan_cursor_execution()) {
+      if (ps_point_plan_build_fast_path(thd, this, ps_owner)) {
+        set_optimized();
+        tables_list = query_block->leaf_tables;
+        set_plan_state(PLAN_READY);
+        DEBUG_SYNC(thd, "after_join_optimize");
+        error = 0;
+        return false;
+      }
+    }
+  }
+
   DEBUG_SYNC(thd, "before_join_optimize");
 
   THD_STAGE_INFO(thd, stage_optimizing);
@@ -691,30 +723,6 @@ bool JOIN::optimize(bool finalize_access_paths) {
   // subsequent execution.
   assert(!thd->optimizer_switch_flag(OPTIMIZER_SWITCH_HYPERGRAPH_OPTIMIZER) ||
          !thd->stmt_arena->is_regular());
-
-  /*
-    ps_point_plan_cache Phase 3: fast path for HOT prepared statements.
-
-    Before entering the expensive make_join_plan() pipeline, check if
-    this is a HOT PS that can skip optimization entirely.  On success,
-    a minimal one-table EQ_REF plan is constructed directly and we jump
-    to PLAN_READY.  On failure, fall through to the normal optimizer.
-  */
-  if (thd->variables.ps_point_plan_cache) {
-    Sql_cmd *sql_cmd = thd->lex->m_sql_cmd;
-    Prepared_statement *ps_owner =
-        (sql_cmd != nullptr) ? sql_cmd->owner() : nullptr;
-    if (ps_owner != nullptr &&
-        ps_owner->ps_point_plan_state() == PsPointPlanState::HOT &&
-        !ps_owner->ps_point_plan_cursor_execution()) {
-      if (ps_point_plan_build_fast_path(thd, this, ps_owner)) {
-        set_plan_state(PLAN_READY);
-        DEBUG_SYNC(thd, "after_join_optimize");
-        error = 0;
-        return false;
-      }
-    }
-  }
 
   // Set up join order and initial access paths
   THD_STAGE_INFO(thd, stage_statistics);

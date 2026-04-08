@@ -57,6 +57,8 @@ class Table_ref;
 class THD;
 class JOIN;
 class KEY;
+class QEP_shared;
+class QEP_TAB;
 class store_key;
 struct TABLE;
 
@@ -67,12 +69,12 @@ struct TABLE;
     PREPARE                         first EXECUTE
     ┌───────────┐  classify OK  ┌──────────────────────┐  admit OK
     │  (new PS) ├──────────────>│        COLD          ├────────────> HOT
-    └─────┬─────┘               └──────────┬───────────┘              │
-          │                                │ admit fail               │
-          │ classify fail                  v                          │ DDL /
-          └─────────────────────────> NEVER                           │ reprepare
-                                        ^                             │
-                                        └─────────────── INVALID <────┘
+    └─────┬─────┘               └──────────┬───────────┘     ┌────────┘
+          │                                │ admit fail      │ guard fail /
+          │ classify fail                  v                 │ type drift
+          └─────────────────────────> NEVER <────────────────┘
+                                                          (non-retryable COLD
+                                                           re-admit fails)
   @endverbatim
 
   - NEVER   — permanently not a candidate; fast bypass on every EXECUTE.
@@ -81,10 +83,11 @@ struct TABLE;
               the expected point-query shape.
   - COLD    — static WHERE shape matches; awaiting first EXECUTE to
               inspect the optimizer output and decide admission.
+              Also used as the demotion target from HOT when a runtime
+              guard or environment drift invalidates the template.
   - HOT     — template successfully cached; the fast path (Phase 3+)
               may be attempted on subsequent EXECUTEs.
-  - INVALID — template invalidated by a structural change (DDL, etc.);
-              next EXECUTE triggers reprepare, which re-classifies.
+  - INVALID — reserved (unused); kept for enum stability.
 */
 enum class PsPointPlanState : uchar {
   NEVER = 0,
@@ -110,9 +113,10 @@ static constexpr uint PS_PC_MAX_PARAMS = 4;
 /**
   Minimal plan template for a single-table point SELECT.
 
-  Only stores information that is stable across executions of the same
-  prepared statement.  No JOIN*, TABLE*, AccessPath*, Field*, or QEP_TAB*
-  are kept here — those are per-execution objects.
+  Stores information that is stable across executions of the same
+  prepared statement.  V1.2 also caches arena-allocated QEP_TAB,
+  QEP_shared, and Index_lookup pointer arrays to eliminate
+  per-execution allocation overhead on thd->mem_root.
 
   The arrays are sized to accommodate composite unique keys (up to
   PS_PC_MAX_KEY_PARTS columns) and BETWEEN predicates (2 parameters).
@@ -220,6 +224,31 @@ struct PsPointPlanTemplate {
 
   /// True when cached_key_buff et al. are populated and usable.
   bool ref_cached{false};
+
+  /*
+    --- V1.2: Arena-cached QEP skeleton ---
+    Allocated on PS m_arena during admission.  Reused across HOT
+    executions to avoid per-execution QEP_TAB / pointer-array
+    allocation on thd->mem_root.
+  */
+
+  /// Arena-cached QEP_TAB[2] (1 real + 1 sentinel).
+  QEP_TAB *cached_qep_tab{nullptr};
+
+  /// Arena-cached QEP_shared for qep_tab[0].
+  QEP_shared *cached_qep_shared{nullptr};
+
+  /// Arena-cached store_key* array for Index_lookup::key_copy.
+  store_key **cached_key_copy{nullptr};
+
+  /// Arena-cached Item* array for Index_lookup::items.
+  Item **cached_ref_items{nullptr};
+
+  /// Arena-cached bool* array for Index_lookup::cond_guards.
+  bool **cached_cond_guards{nullptr};
+
+  /// True when the QEP skeleton above is populated and usable.
+  bool qep_cached{false};
 };
 
 /*
@@ -260,21 +289,27 @@ bool ps_point_plan_runtime_guard(THD *thd, Prepared_statement *stmt,
 
 /**
   Construct a minimal one-table EQ_REF execution plan for a HOT
-  prepared statement, bypassing make_join_plan() and the full
-  optimizer pipeline.
+  prepared statement, bypassing the entire optimizer pipeline.
 
-  Called from the Phase 3 fast-path hook in JOIN::optimize(),
-  before make_join_plan().  Uses delayed-write: JOIN members are
-  only modified after all construction steps succeed.
+  V1.2: Called from the early fast-path hook at the TOP of
+  JOIN::optimize(), before any optimizer preamble code
+  (count_field_types, alloc_func_list, get_optimizable_conditions,
+  optimize_cond, etc.).  This allows HOT point-selects to skip
+  the full optimizer preamble.
+
+  Uses delayed-write: JOIN members are only modified after all
+  construction steps succeed.  When both qep_cached and ref_cached
+  are true, reuses arena-allocated QEP_TAB / QEP_shared / pointer
+  arrays, minimizing per-execution allocation.
 
   @param  thd   Current thread.
   @param  join  The JOIN being optimized.
   @param  stmt  The owning Prepared_statement (HOT state).
 
   @retval true  Fast path plan constructed; caller should set
-                PLAN_READY and return.
+                set_optimized(), tables_list, PLAN_READY and return.
   @retval false Fast path declined; caller should continue to
-                make_join_plan() (JOIN state is untouched).
+                the normal optimizer preamble (JOIN state is untouched).
 */
 bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
                                    Prepared_statement *stmt);
