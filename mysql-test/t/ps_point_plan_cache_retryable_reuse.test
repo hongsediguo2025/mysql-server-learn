@@ -1,0 +1,86 @@
+--echo #
+--echo # ps_point_plan_cache: retryable-cold helper reuse
+--echo # Verifies that retryable HOT -> COLD -> re-admit cycles do not
+--echo # keep allocating on Prepared_statement::main_mem_root once the
+--echo # helper cache has been built.
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+CREATE TABLE t_retry_reuse (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  code CHAR(10) NOT NULL,
+  val INT,
+  UNIQUE KEY idx_code (code)
+) CHARACTER SET utf8mb4;
+
+INSERT INTO t_retry_reuse(code, val) VALUES
+  ('AAA', 10), ('BBB', 20), ('CCC', 30);
+
+TRUNCATE TABLE performance_schema.memory_summary_by_thread_by_event_name;
+FLUSH STATUS;
+
+PREPARE stmt_retry_reuse FROM
+  'SELECT * FROM t_retry_reuse WHERE code = ?';
+
+--echo # =======================================================
+--echo # A. First admission builds helper cache on PS arena
+--echo # =======================================================
+
+SET @p = 'AAA';
+EXECUTE stmt_retry_reuse USING @p;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after A1 (expect 1): $adm
+
+--let $base_bytes = `SELECT COALESCE(SUM_NUMBER_OF_BYTES_ALLOC, 0) FROM performance_schema.memory_summary_by_thread_by_event_name WHERE EVENT_NAME = 'memory/sql/Prepared_statement::main_mem_root' AND THREAD_ID = ps_thread_id(CONNECTION_ID())`
+
+--echo # =======================================================
+--echo # B. sql_mode drift forces a retryable HOT -> COLD fallback.
+--echo #    Helper cache metadata must survive the soft demotion.
+--echo # =======================================================
+
+SET SESSION sql_mode = 'PAD_CHAR_TO_FULL_LENGTH';
+SET @p = 'BBB';
+EXECUTE stmt_retry_reuse USING @p;
+
+--let $fb = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--echo fallback_runtime after B1 (expect 1): $fb
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after B1 (expect 1): $adm
+
+--let $bytes_b1 = `SELECT COALESCE(SUM_NUMBER_OF_BYTES_ALLOC, 0) FROM performance_schema.memory_summary_by_thread_by_event_name WHERE EVENT_NAME = 'memory/sql/Prepared_statement::main_mem_root' AND THREAD_ID = ps_thread_id(CONNECTION_ID())`
+--let $delta_b1 = `SELECT $bytes_b1 - $base_bytes`
+--echo bytes delta after B1 soft demotion (expect 0): $delta_b1
+
+--echo # =======================================================
+--echo # C. Returning to the original environment re-admits the plan.
+--echo #    The helper cache must be reused without PS arena growth.
+--echo # =======================================================
+
+SET SESSION sql_mode = DEFAULT;
+SET @p = 'CCC';
+EXECUTE stmt_retry_reuse USING @p;
+
+--let $fb = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--echo fallback_runtime after C1 (expect 1): $fb
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after C1 (expect 2): $adm
+
+--let $bytes_c1 = `SELECT COALESCE(SUM_NUMBER_OF_BYTES_ALLOC, 0) FROM performance_schema.memory_summary_by_thread_by_event_name WHERE EVENT_NAME = 'memory/sql/Prepared_statement::main_mem_root' AND THREAD_ID = ps_thread_id(CONNECTION_ID())`
+--let $delta_c1 = `SELECT $bytes_c1 - $base_bytes`
+--echo bytes delta after C1 retryable re-admit (expect 0): $delta_c1
+
+--echo # C2: stable environment again -> fast path hit
+SET @p = 'AAA';
+EXECUTE stmt_retry_reuse USING @p;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after C2 (expect 1): $hits
+
+DEALLOCATE PREPARE stmt_retry_reuse;
+DROP TABLE t_retry_reuse;

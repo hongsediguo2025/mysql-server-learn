@@ -495,9 +495,13 @@ class Prepared_statement final {
     m_ps_pc.ref_cached = false;
     m_ps_pc.cached_key_buff = nullptr;
     m_ps_pc.cached_key_buff2 = nullptr;
+    m_ps_pc.cached_key_parts = 0;
+    m_ps_pc.cached_key_length = 0;
     for (uint i = 0; i < PS_PC_MAX_PARAMS; i++) {
       m_ps_pc.cached_store_keys[i] = nullptr;
       m_ps_pc.cached_to_fields[i] = nullptr;
+      m_ps_pc.cached_part_lengths[i] = 0;
+      m_ps_pc.cached_part_store_lengths[i] = 0;
     }
 
     m_ps_pc.qep_cached = false;

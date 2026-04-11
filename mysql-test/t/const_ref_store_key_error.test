@@ -1,0 +1,37 @@
+--source include/have_debug.inc
+
+--echo #
+--echo # const-ref initialization must not ignore STORE_KEY_FATAL
+--echo #
+
+CREATE TABLE t_const_src (
+  pk INT PRIMARY KEY
+);
+
+CREATE TABLE t_const_lookup (
+  pk INT PRIMARY KEY,
+  v INT NOT NULL
+);
+
+INSERT INTO t_const_src VALUES (7);
+INSERT INTO t_const_lookup VALUES (0, 100), (7, 700);
+
+--echo # Baseline: const-ref lookup returns the matching row.
+SELECT t_const_lookup.v
+FROM t_const_src STRAIGHT_JOIN t_const_lookup
+  ON t_const_lookup.pk = t_const_src.pk
+WHERE t_const_src.pk = 7;
+
+--echo # Inject STORE_KEY_FATAL during const-ref setup.
+--echo # The optimizer must surface an error instead of continuing with
+--echo # a partially initialized lookup tuple.
+SET DEBUG = '+d,simulate_store_key_copy_fatal';
+--error ER_OUT_OF_RESOURCES
+SELECT t_const_lookup.v
+FROM t_const_src STRAIGHT_JOIN t_const_lookup
+  ON t_const_lookup.pk = t_const_src.pk
+WHERE t_const_src.pk = 7;
+SET DEBUG = '-d,simulate_store_key_copy_fatal';
+
+DROP TABLE t_const_lookup;
+DROP TABLE t_const_src;

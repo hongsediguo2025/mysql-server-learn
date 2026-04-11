@@ -222,6 +222,18 @@ struct PsPointPlanTemplate {
   /// Cached Field clones inside store_key (for re-patching table ptr).
   Field *cached_to_fields[PS_PC_MAX_PARAMS]{};
 
+  /// Cached KEY_PART_INFO::length values for helper compatibility checks.
+  uint cached_part_lengths[PS_PC_MAX_PARAMS]{};
+
+  /// Cached KEY_PART_INFO::store_length values for key-buffer layout checks.
+  uint cached_part_store_lengths[PS_PC_MAX_PARAMS]{};
+
+  /// Cached helper layout key-part count, kept across retryable demotion.
+  uint cached_key_parts{0};
+
+  /// Cached helper layout serialized key length, kept across retryable demotion.
+  uint cached_key_length{0};
+
   /// True when cached_key_buff et al. are populated and usable.
   bool ref_cached{false};
 

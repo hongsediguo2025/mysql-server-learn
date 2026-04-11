@@ -1,0 +1,62 @@
+#
+# ps_point_plan_cache: retryable-cold helper reuse
+# Verifies that retryable HOT -> COLD -> re-admit cycles do not
+# keep allocating on Prepared_statement::main_mem_root once the
+# helper cache has been built.
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t_retry_reuse (
+id INT AUTO_INCREMENT PRIMARY KEY,
+code CHAR(10) NOT NULL,
+val INT,
+UNIQUE KEY idx_code (code)
+) CHARACTER SET utf8mb4;
+INSERT INTO t_retry_reuse(code, val) VALUES
+('AAA', 10), ('BBB', 20), ('CCC', 30);
+TRUNCATE TABLE performance_schema.memory_summary_by_thread_by_event_name;
+FLUSH STATUS;
+PREPARE stmt_retry_reuse FROM
+'SELECT * FROM t_retry_reuse WHERE code = ?';
+# =======================================================
+# A. First admission builds helper cache on PS arena
+# =======================================================
+SET @p = 'AAA';
+EXECUTE stmt_retry_reuse USING @p;
+id	code	val
+1	AAA	10
+admissions after A1 (expect 1): 1
+# =======================================================
+# B. sql_mode drift forces a retryable HOT -> COLD fallback.
+#    Helper cache metadata must survive the soft demotion.
+# =======================================================
+SET SESSION sql_mode = 'PAD_CHAR_TO_FULL_LENGTH';
+Warnings:
+Warning	3090	Changing sql mode 'PAD_CHAR_TO_FULL_LENGTH' is deprecated. It will be removed in a future release.
+SET @p = 'BBB';
+EXECUTE stmt_retry_reuse USING @p;
+id	code	val
+fallback_runtime after B1 (expect 1): 1
+admissions after B1 (expect 1): 1
+bytes delta after B1 soft demotion (expect 0): 0
+# =======================================================
+# C. Returning to the original environment re-admits the plan.
+#    The helper cache must be reused without PS arena growth.
+# =======================================================
+SET SESSION sql_mode = DEFAULT;
+SET @p = 'CCC';
+EXECUTE stmt_retry_reuse USING @p;
+id	code	val
+3	CCC	30
+fallback_runtime after C1 (expect 1): 1
+admissions after C1 (expect 2): 2
+bytes delta after C1 retryable re-admit (expect 0): 0
+# C2: stable environment again -> fast path hit
+SET @p = 'AAA';
+EXECUTE stmt_retry_reuse USING @p;
+id	code	val
+1	AAA	10
+hits after C2 (expect 1): 1
+DEALLOCATE PREPARE stmt_retry_reuse;
+DROP TABLE t_retry_reuse;

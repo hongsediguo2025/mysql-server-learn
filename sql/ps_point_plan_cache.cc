@@ -58,7 +58,9 @@ namespace {
 constexpr ulonglong kPsPcRelevantOptimizerSwitchMask =
     OPTIMIZER_SWITCH_USE_INVISIBLE_INDEXES;
 
-constexpr ulonglong kPsPcRelevantSqlModeMask = MODE_PAD_CHAR_TO_FULL_LENGTH;
+constexpr ulonglong kPsPcRelevantSqlModeMask =
+    MODE_PAD_CHAR_TO_FULL_LENGTH | MODE_INVALID_DATES | MODE_NO_ZERO_DATE |
+    MODE_NO_ZERO_IN_DATE | MODE_TIME_TRUNCATE_FRACTIONAL;
 
 ulonglong ps_point_plan_relevant_optimizer_switch(const THD *thd) {
   return thd->variables.optimizer_switch & kPsPcRelevantOptimizerSwitchMask;
@@ -99,6 +101,9 @@ void ps_point_plan_clear_hot_metadata(PsPointPlanTemplate *tpl) {
     arena-allocated buffers survive demotion.  A compatibility check
     in ps_point_plan_admit() validates the cached Field clones match
     the new key layout before reuse; mismatches force a rebuild.
+    Helper-layout metadata needed by that check is stored separately
+    in cached_key_parts/cached_key_length so we can still clear the
+    active HOT plan metadata here.
   */
   for (uint i = 0; i < PS_PC_MAX_PARAMS; i++) {
     tpl->actual_types[i] = MYSQL_TYPE_INVALID;
@@ -111,6 +116,45 @@ void ps_point_plan_demote_to_cold(Prepared_statement *stmt) {
   ps_point_plan_clear_hot_metadata(&stmt->ps_point_plan_template());
   stmt->set_ps_point_plan_state(PsPointPlanState::COLD);
   stmt->set_ps_point_plan_retryable_cold(true);
+}
+
+bool ps_point_plan_bind_cached_ref_parts(TABLE *table,
+                                         const PsPointPlanTemplate &tpl,
+                                         Index_lookup *ref) {
+  for (uint i = 0; i < tpl.key_parts; i++) {
+    if (tpl.cached_to_fields[i] == nullptr || tpl.cached_store_keys[i] == nullptr)
+      return false;
+
+    tpl.cached_to_fields[i]->init(table);
+    ref->items[i] = tpl.params[i];
+    ref->cond_guards[i] = nullptr;
+    ref->key_copy[i] = tpl.cached_store_keys[i];
+  }
+
+  return true;
+}
+
+bool ps_point_plan_cached_helpers_compatible(const PsPointPlanTemplate &tpl,
+                                             const KEY *keyinfo,
+                                             uint key_parts, uint key_length,
+                                             const uint *field_indices) {
+  if (!tpl.ref_cached) return false;
+  if (tpl.cached_key_parts != key_parts ||
+      tpl.cached_key_length != key_length) {
+    return false;
+  }
+
+  for (uint i = 0; i < key_parts; i++) {
+    const KEY_PART_INFO *kp = &keyinfo->key_part[i];
+    if (tpl.cached_to_fields[i] == nullptr ||
+        tpl.cached_to_fields[i]->field_index() != field_indices[i] ||
+        tpl.cached_part_lengths[i] != kp->length ||
+        tpl.cached_part_store_lengths[i] != kp->store_length) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 }  // namespace
@@ -562,11 +606,9 @@ bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
     ref.items = tpl.cached_ref_items;
     ref.cond_guards = tpl.cached_cond_guards;
 
-    for (uint i = 0; i < tpl.key_parts; i++) {
-      tpl.cached_to_fields[i]->init(table);
-      store_key *sk = tpl.cached_store_keys[i];
-      (void)sk->copy();
-      tpl.cached_key_copy[i] = sk->null_key ? sk : nullptr;
+    if (!ps_point_plan_bind_cached_ref_parts(table, tpl, &ref)) {
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
     }
   } else if (tpl.ref_cached) {
     /*
@@ -614,14 +656,9 @@ bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
       return false;
     }
 
-    for (uint i = 0; i < tpl.key_parts; i++) {
-      tpl.cached_to_fields[i]->init(table);
-      ref.items[i] = tpl.params[i];
-      ref.cond_guards[i] = nullptr;
-
-      store_key *sk = tpl.cached_store_keys[i];
-      (void)sk->copy();
-      ref.key_copy[i] = sk->null_key ? sk : nullptr;
+    if (!ps_point_plan_bind_cached_ref_parts(table, tpl, &ref)) {
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
     }
   } else {
     /* Slow path: no arena cache available, full construction. */
@@ -842,19 +879,10 @@ void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
   TABLE *table = tab->table();
   const KEY *keyinfo = &table->key_info[ref.key];
   Item_param *stable_params[PS_PC_MAX_PARAMS]{};
-
-  /* Copy stable key metadata from the optimizer's ref structure. */
-  tpl.keyno = static_cast<uint>(ref.key);
-  tpl.key_parts = ref.key_parts;
-  tpl.key_length = ref.key_length;
-  tpl.null_rejecting = ref.null_rejecting;
-
-  /* Copy optimizer cost estimates for potential use by Phase 3+. */
-  tpl.best_read = join->best_read;
-  tpl.best_rowcount = static_cast<double>(join->best_rowcount);
-  tpl.optimizer_switch = ps_point_plan_relevant_optimizer_switch(thd);
-  tpl.table_ref_version = table->s->get_table_ref_version();
-  tpl.relevant_sql_mode = ps_point_plan_relevant_sql_mode(thd);
+  uint field_indices[PS_PC_MAX_PARAMS]{};
+  enum_field_types actual_types[PS_PC_MAX_PARAMS]{};
+  bool unsigned_actuals[PS_PC_MAX_PARAMS]{};
+  const CHARSET_INFO *actual_collations[PS_PC_MAX_PARAMS]{};
 
   /*
     Reorder params[] and field_indices[] from WHERE-clause order
@@ -883,11 +911,10 @@ void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
 
   for (uint i = 0; i < ref.key_parts; i++) {
     Item_param *prm = stable_params[i];
-    tpl.params[i] = prm;
-    tpl.field_indices[i] = keyinfo->key_part[i].fieldnr - 1;
-    tpl.actual_types[i] = prm->data_type_actual();
-    tpl.unsigned_actuals[i] = prm->is_unsigned_actual();
-    tpl.actual_collations[i] = ps_point_plan_actual_collation(prm);
+    field_indices[i] = keyinfo->key_part[i].fieldnr - 1;
+    actual_types[i] = prm->data_type_actual();
+    unsigned_actuals[i] = prm->is_unsigned_actual();
+    actual_collations[i] = ps_point_plan_actual_collation(prm);
   }
 
   /*
@@ -897,29 +924,40 @@ void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
     field layout changed, the cached store_key / key_buff objects are
     stale and must be rebuilt.
 
-    Only field_index is checked — key_length is not checked separately
-    because structural DDL (which could change column size / key_length)
-    is caught earlier by either:
-      (a) check_and_update_table_version() → full reprepare, or
-      (b) G1d guard → invalidate_ps_point_plan_cache() (ref_cached=false).
-    Retryable soft demotions (type drift, optimizer_switch, sql_mode,
-    collation) preserve the table structure, so same field_index set
-    implies same key_length.  The assert below guards this invariant.
+    Compare against the previously admitted key layout before tpl is
+    overwritten with the new plan metadata below.  This protects the
+    retryable HOT->COLD path from reusing stale helper objects after a
+    same-field unique-index switch with a different serialized layout.
   */
   if (tpl.ref_cached) {
-    bool compatible = true;
-    for (uint i = 0; i < tpl.key_parts && compatible; i++) {
-      if (tpl.cached_to_fields[i] == nullptr ||
-          tpl.cached_to_fields[i]->field_index() != tpl.field_indices[i]) {
-        compatible = false;
-      }
-    }
-    if (compatible) {
-      assert(tpl.key_length == ref.key_length);
-    } else {
+    if (!ps_point_plan_cached_helpers_compatible(
+            tpl, keyinfo, ref.key_parts, ref.key_length, field_indices)) {
       tpl.ref_cached = false;
       tpl.qep_cached = false;
+      tpl.cached_key_parts = 0;
+      tpl.cached_key_length = 0;
     }
+  }
+
+  /* Copy stable key metadata from the optimizer's ref structure. */
+  tpl.keyno = static_cast<uint>(ref.key);
+  tpl.key_parts = ref.key_parts;
+  tpl.key_length = ref.key_length;
+  tpl.null_rejecting = ref.null_rejecting;
+
+  /* Copy optimizer cost estimates for potential use by Phase 3+. */
+  tpl.best_read = join->best_read;
+  tpl.best_rowcount = static_cast<double>(join->best_rowcount);
+  tpl.optimizer_switch = ps_point_plan_relevant_optimizer_switch(thd);
+  tpl.table_ref_version = table->s->get_table_ref_version();
+  tpl.relevant_sql_mode = ps_point_plan_relevant_sql_mode(thd);
+
+  for (uint i = 0; i < ref.key_parts; i++) {
+    tpl.params[i] = stable_params[i];
+    tpl.field_indices[i] = field_indices[i];
+    tpl.actual_types[i] = actual_types[i];
+    tpl.unsigned_actuals[i] = unsigned_actuals[i];
+    tpl.actual_collations[i] = actual_collations[i];
   }
 
   /*
@@ -939,18 +977,22 @@ void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
     handles but makes reasoning harder).
   */
   if (!tpl.ref_cached || !tpl.qep_cached) {
+    const bool had_error_before_cache_build = thd->is_error();
     Query_arena backup;
     thd->swap_query_arena(stmt->m_arena, &backup);
 
     if (!tpl.ref_cached) {
       const uint aligned_len = ALIGN_SIZE(tpl.key_length);
-      tpl.cached_key_buff = thd->mem_root->ArrayAlloc<uchar>(aligned_len);
-      tpl.cached_key_buff2 = thd->mem_root->ArrayAlloc<uchar>(aligned_len);
+      uchar *cached_key_buff = thd->mem_root->ArrayAlloc<uchar>(aligned_len);
+      uchar *cached_key_buff2 = thd->mem_root->ArrayAlloc<uchar>(aligned_len);
+      store_key *cached_store_keys[PS_PC_MAX_PARAMS]{};
+      Field *cached_to_fields[PS_PC_MAX_PARAMS]{};
+      uint cached_part_lengths[PS_PC_MAX_PARAMS]{};
+      uint cached_part_store_lengths[PS_PC_MAX_PARAMS]{};
 
-      bool cache_ok = (tpl.cached_key_buff != nullptr &&
-                       tpl.cached_key_buff2 != nullptr);
+      bool cache_ok = (cached_key_buff != nullptr && cached_key_buff2 != nullptr);
 
-      uchar *kb_pos = tpl.cached_key_buff;
+      uchar *kb_pos = cached_key_buff;
       for (uint i = 0; i < tpl.key_parts && cache_ok; i++) {
         const KEY_PART_INFO *kp = &keyinfo->key_part[i];
         Field *orig_field = table->field[tpl.field_indices[i]];
@@ -959,16 +1001,30 @@ void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
         store_key *sk = new (thd->mem_root)
             store_key(thd, orig_field, kb_pos + nullable,
                       nullable ? kb_pos : nullptr, kp->length, tpl.params[i]);
-        if (sk == nullptr) {
+        if (sk == nullptr || sk->store_field() == nullptr || thd->is_error()) {
           cache_ok = false;
           break;
         }
 
-        tpl.cached_store_keys[i] = sk;
-        tpl.cached_to_fields[i] = sk->store_field();
+        cached_store_keys[i] = sk;
+        cached_to_fields[i] = sk->store_field();
+        cached_part_lengths[i] = kp->length;
+        cached_part_store_lengths[i] = kp->store_length;
         kb_pos += kp->store_length;
       }
-      if (cache_ok) tpl.ref_cached = true;
+      if (cache_ok) {
+        tpl.cached_key_buff = cached_key_buff;
+        tpl.cached_key_buff2 = cached_key_buff2;
+        tpl.cached_key_parts = tpl.key_parts;
+        tpl.cached_key_length = tpl.key_length;
+        for (uint i = 0; i < tpl.key_parts; i++) {
+          tpl.cached_store_keys[i] = cached_store_keys[i];
+          tpl.cached_to_fields[i] = cached_to_fields[i];
+          tpl.cached_part_lengths[i] = cached_part_lengths[i];
+          tpl.cached_part_store_lengths[i] = cached_part_store_lengths[i];
+        }
+        tpl.ref_cached = true;
+      }
     }
 
     if (tpl.ref_cached && !tpl.qep_cached) {
@@ -994,6 +1050,7 @@ void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
     }
 
     thd->swap_query_arena(backup, &stmt->m_arena);
+    if (!had_error_before_cache_build && thd->is_error()) thd->clear_error();
   }
 
   stmt->set_ps_point_plan_state(PsPointPlanState::HOT);

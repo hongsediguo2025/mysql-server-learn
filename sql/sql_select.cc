@@ -2353,15 +2353,19 @@ bool init_ref_part(THD *thd, unsigned part_no, Item *val, bool *cond_guard,
       key is const, copy value now and possibly skip it while ::exec().
 
       Note:
-        Result check of store_key::copy() is unnecessary,
-        it could be an error returned by store_key::copy() method
-        but stored value is not null and default value could be used
-        in this case. Methods which used for storing the value
-        should be responsible for proper null value setting
-        in case of an error. Thus it's enough to check s_key->null_key
-        value only.
+        Conversion warnings from store_key::copy() can be ignored here
+        as long as the stored key value is non-NULL, because execution
+        can use the serialized bytes prepared during optimization.
+        Fatal failures are different: they mean the lookup tuple was not
+        fully initialized, unless the key is NULL and must be reevaluated
+        during execution for the NULL-key special handling path.
     */
-    (void)s_key->copy();
+    const store_key::store_key_result copy_res = s_key->copy();
+    if ((copy_res == store_key::STORE_KEY_FATAL && !s_key->null_key) ||
+        thd->is_error()) {
+      if (!thd->is_error()) my_error(ER_OUT_OF_RESOURCES, MYF(0));
+      return true;
+    }
     /*
       It should be reevaluated in ::exec() if
       constant evaluated to NULL value which we might need to
@@ -2594,7 +2598,7 @@ static store_key *get_store_key(THD *thd, Item *val, table_map used_tables,
 
 store_key::store_key(THD *thd, Field *field_arg, uchar *ptr, uchar *null,
                      uint length, Item *item_arg)
-    : item(item_arg) {
+    : to_field(nullptr), item(item_arg) {
   if (field_arg->type() == MYSQL_TYPE_BLOB ||
       field_arg->type() == MYSQL_TYPE_GEOMETRY) {
     /*
@@ -2604,7 +2608,7 @@ store_key::store_key(THD *thd, Field *field_arg, uchar *ptr, uchar *null,
     to_field = new (thd->mem_root) Field_varstring(
         ptr, length, 2, null, 1, Field::NONE, field_arg->field_name,
         field_arg->table->s, field_arg->charset());
-    to_field->init(field_arg->table);
+    if (to_field != nullptr) to_field->init(field_arg->table);
   } else
     to_field =
         field_arg->new_key_field(thd->mem_root, field_arg->table, ptr, null, 1);
@@ -2612,13 +2616,15 @@ store_key::store_key(THD *thd, Field *field_arg, uchar *ptr, uchar *null,
   // If the item is nullable, but we cannot store null, make
   // to_field temporary nullable so that we can check in copy_inner()
   // if we end up with an illegal null value.
-  if (!to_field->is_nullable() && item->is_nullable())
+  if (to_field != nullptr && !to_field->is_nullable() && item->is_nullable())
     to_field->set_tmp_nullable();
 }
 
 store_key::store_key_result store_key::copy() {
   enum store_key_result result;
   THD *thd = current_thd;
+  DBUG_EXECUTE_IF("simulate_store_key_copy_fatal", return STORE_KEY_FATAL;);
+  if (to_field == nullptr) return STORE_KEY_FATAL;
   enum_check_fields saved_check_for_truncated_fields =
       thd->check_for_truncated_fields;
   sql_mode_t sql_mode = thd->variables.sql_mode;

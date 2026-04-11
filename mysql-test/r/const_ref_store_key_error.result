@@ -1,0 +1,31 @@
+#
+# const-ref initialization must not ignore STORE_KEY_FATAL
+#
+CREATE TABLE t_const_src (
+pk INT PRIMARY KEY
+);
+CREATE TABLE t_const_lookup (
+pk INT PRIMARY KEY,
+v INT NOT NULL
+);
+INSERT INTO t_const_src VALUES (7);
+INSERT INTO t_const_lookup VALUES (0, 100), (7, 700);
+# Baseline: const-ref lookup returns the matching row.
+SELECT t_const_lookup.v
+FROM t_const_src STRAIGHT_JOIN t_const_lookup
+ON t_const_lookup.pk = t_const_src.pk
+WHERE t_const_src.pk = 7;
+v
+700
+# Inject STORE_KEY_FATAL during const-ref setup.
+# The optimizer must surface an error instead of continuing with
+# a partially initialized lookup tuple.
+SET DEBUG = '+d,simulate_store_key_copy_fatal';
+SELECT t_const_lookup.v
+FROM t_const_src STRAIGHT_JOIN t_const_lookup
+ON t_const_lookup.pk = t_const_src.pk
+WHERE t_const_src.pk = 7;
+ERROR HY000: Out of memory; check if mysqld or some other process uses all available memory; if not, you may have to use 'ulimit' to allow mysqld to use more memory or you can add more swap space
+SET DEBUG = '-d,simulate_store_key_copy_fatal';
+DROP TABLE t_const_lookup;
+DROP TABLE t_const_src;
