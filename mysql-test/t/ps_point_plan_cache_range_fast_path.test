@@ -1,0 +1,150 @@
+--echo #
+--echo # Phase 7 test: ps_point_plan_cache simple_ranges fast path
+--echo # Verifies HOT RANGE_PK_BETWEEN statements hit the fast path and
+--echo # still return correct range results across normal and edge cases.
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+CREATE TABLE t_range_fp (
+  id INT PRIMARY KEY,
+  c VARCHAR(64)
+);
+INSERT INTO t_range_fp VALUES
+  (1, 'a'),
+  (2, 'b'),
+  (3, 'c'),
+  (4, 'd'),
+  (5, 'e');
+
+FLUSH STATUS;
+
+--echo # -------------------------------------------------------
+--echo # 1. PK BETWEEN — second EXECUTE hits fast path
+--echo # -------------------------------------------------------
+
+PREPARE stmt_rf1 FROM 'SELECT c FROM t_range_fp WHERE id BETWEEN ? AND ?';
+
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_rf1 USING @l, @h;
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_rf1 USING @l, @h;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo admissions delta after second execute: $adm_delta
+--echo hits delta after second execute: $hits_delta
+
+DEALLOCATE PREPARE stmt_rf1;
+
+--echo # -------------------------------------------------------
+--echo # 2. Single-row range — hot execute returns one row
+--echo # -------------------------------------------------------
+
+PREPARE stmt_rf2 FROM 'SELECT c FROM t_range_fp WHERE id BETWEEN ? AND ?';
+
+SET @l = 3;
+SET @h = 3;
+EXECUTE stmt_rf2 USING @l, @h;
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 4;
+SET @h = 4;
+EXECUTE stmt_rf2 USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after single-row hot execute: $hits_delta
+
+DEALLOCATE PREPARE stmt_rf2;
+
+--echo # -------------------------------------------------------
+--echo # 3. Empty result on hot path
+--echo # -------------------------------------------------------
+
+PREPARE stmt_rf3 FROM 'SELECT c FROM t_range_fp WHERE id BETWEEN ? AND ?';
+
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt_rf3 USING @l, @h;
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 8;
+SET @h = 9;
+EXECUTE stmt_rf3 USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after empty hot execute: $hits_delta
+
+DEALLOCATE PREPARE stmt_rf3;
+
+--echo # -------------------------------------------------------
+--echo # 4. Consecutive hot executes accumulate hits
+--echo # -------------------------------------------------------
+
+PREPARE stmt_rf4 FROM 'SELECT c FROM t_range_fp WHERE id BETWEEN ? AND ?';
+
+SET @l = 1;
+SET @h = 5;
+EXECUTE stmt_rf4 USING @l, @h;
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 1;
+SET @h = 1;
+EXECUTE stmt_rf4 USING @l, @h;
+SET @l = 2;
+SET @h = 3;
+EXECUTE stmt_rf4 USING @l, @h;
+SET @l = 4;
+SET @h = 5;
+EXECUTE stmt_rf4 USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after 3 consecutive hot executes: $hits_delta
+
+DEALLOCATE PREPARE stmt_rf4;
+
+--echo # -------------------------------------------------------
+--echo # 5. DML visibility — hot path sees latest rows
+--echo # -------------------------------------------------------
+
+PREPARE stmt_rf5 FROM 'SELECT id, c FROM t_range_fp WHERE id BETWEEN ? AND ?';
+
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_rf5 USING @l, @h;
+
+UPDATE t_range_fp SET c = 'bb' WHERE id = 2;
+DELETE FROM t_range_fp WHERE id = 3;
+INSERT INTO t_range_fp VALUES (6, 'f');
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 2;
+SET @h = 6;
+EXECUTE stmt_rf5 USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after DML-visible hot execute: $hits_delta
+
+DEALLOCATE PREPARE stmt_rf5;
+
+--echo # -------------------------------------------------------
+--echo # Final counter summary
+--echo # -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+DROP TABLE t_range_fp;
+
+--echo #
+--echo # End of Phase 7 range fast-path test
+--echo #

@@ -1,0 +1,233 @@
+--echo #
+--echo # Phase 7 test: ps_point_plan_cache simple_ranges type system
+--echo # Verifies classification and admission for different data types:
+--echo # BIGINT, BIGINT UNSIGNED, SMALLINT, TINYINT, and rejects non-integer types.
+--echo #
+--echo # Run: mtr --ps-protocol ps_point_plan_cache_range_types
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+--echo # Table 1: BIGINT PRIMARY KEY
+CREATE TABLE t_range_bigint (
+  id BIGINT PRIMARY KEY,
+  c VARCHAR(32)
+);
+INSERT INTO t_range_bigint VALUES
+  (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'),
+  (1000000000000, 'x'), (2000000000000, 'y');
+
+--echo # Table 2: BIGINT UNSIGNED PRIMARY KEY
+CREATE TABLE t_range_uint (
+  id BIGINT UNSIGNED PRIMARY KEY,
+  c VARCHAR(32)
+);
+INSERT INTO t_range_uint VALUES
+  (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'),
+  (4294967295, 'max');
+
+--echo # Table 3: SMALLINT PRIMARY KEY
+CREATE TABLE t_range_small (
+  id SMALLINT PRIMARY KEY,
+  c VARCHAR(32)
+);
+INSERT INTO t_range_small VALUES
+  (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'),
+  (1000, 'x'), (2000, 'y');
+
+--echo # Table 4: TINYINT PRIMARY KEY
+CREATE TABLE t_range_tiny (
+  id TINYINT PRIMARY KEY,
+  c VARCHAR(32)
+);
+INSERT INTO t_range_tiny VALUES
+  (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'),
+  (100, 'x'), (120, 'y');
+
+--echo # Table 5: DECIMAL column (secondary index - should be NEVER)
+CREATE TABLE t_range_decimal (
+  id INT PRIMARY KEY,
+  amount DECIMAL(10,2),
+  KEY idx_amount (amount)
+);
+INSERT INTO t_range_decimal VALUES
+  (1, 10.50), (2, 20.75), (3, 99.99);
+
+--echo # Table 6: DATE column (should be NEVER)
+CREATE TABLE t_range_date (
+  id INT PRIMARY KEY,
+  order_date DATE
+);
+INSERT INTO t_range_date VALUES
+  (1, '2024-01-01'), (2, '2024-06-15'), (3, '2024-12-31');
+
+FLUSH STATUS;
+
+--echo # =======================================================
+--echo # Test 1: BIGINT PRIMARY KEY range - should be COLD then HOT
+--echo # =======================================================
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_bigint FROM 'SELECT c FROM t_range_bigint WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_bigint USING @l, @h;
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta (bigint): $cold_delta
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @l = 1000000000000;
+SET @h = 2000000000000;
+EXECUTE stmt_bigint USING @l, @h;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta (bigint admit): $adm_delta
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt_bigint USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta (bigint hit): $hits_delta
+
+DEALLOCATE PREPARE stmt_bigint;
+
+--echo # =======================================================
+--echo # Test 2: BIGINT UNSIGNED PRIMARY KEY range - should be COLD then HOT
+--echo # =======================================================
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_uint FROM 'SELECT c FROM t_range_uint WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_uint USING @l, @h;
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta (uint): $cold_delta
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @l = 4294967290;
+SET @h = 4294967295;
+EXECUTE stmt_uint USING @l, @h;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta (uint admit): $adm_delta
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 1;
+SET @h = 5;
+EXECUTE stmt_uint USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta (uint hit): $hits_delta
+
+DEALLOCATE PREPARE stmt_uint;
+
+--echo # =======================================================
+--echo # Test 3: SMALLINT PRIMARY KEY range - should be COLD then HOT
+--echo # =======================================================
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_small FROM 'SELECT c FROM t_range_small WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_small USING @l, @h;
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta (smallint): $cold_delta
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @l = 1000;
+SET @h = 2000;
+EXECUTE stmt_small USING @l, @h;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta (smallint admit): $adm_delta
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt_small USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta (smallint hit): $hits_delta
+
+DEALLOCATE PREPARE stmt_small;
+
+--echo # =======================================================
+--echo # Test 4: TINYINT PRIMARY KEY range - should be COLD then HOT
+--echo # =======================================================
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_tiny FROM 'SELECT c FROM t_range_tiny WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_tiny USING @l, @h;
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta (tinyint): $cold_delta
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @l = 50;
+SET @h = 100;
+EXECUTE stmt_tiny USING @l, @h;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta (tinyint admit): $adm_delta
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt_tiny USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta (tinyint hit): $hits_delta
+
+DEALLOCATE PREPARE stmt_tiny;
+
+--echo # =======================================================
+--echo # Test 5: DECIMAL secondary index range - should be NEVER
+--echo # =======================================================
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_decimal FROM 'SELECT * FROM t_range_decimal WHERE amount BETWEEN ? AND ?';
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta (decimal): $cold_delta
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @l = 10;
+SET @h = 50;
+EXECUTE stmt_decimal USING @l, @h;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta (decimal): $adm_delta
+DEALLOCATE PREPARE stmt_decimal;
+
+--echo # =======================================================
+--echo # Test 6: DATE column range - should be NEVER
+--echo # =======================================================
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_date FROM 'SELECT * FROM t_range_date WHERE order_date BETWEEN ? AND ?';
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta (date): $cold_delta
+DEALLOCATE PREPARE stmt_date;
+
+--echo # -------------------------------------------------------
+--echo # Final counter summary
+--echo # -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+DROP TABLE t_range_bigint;
+DROP TABLE t_range_uint;
+DROP TABLE t_range_small;
+DROP TABLE t_range_tiny;
+DROP TABLE t_range_decimal;
+DROP TABLE t_range_date;
+
+--echo #
+--echo # End of Phase 7 range type system test
+--echo #

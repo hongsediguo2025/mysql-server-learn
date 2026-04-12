@@ -1,0 +1,182 @@
+--echo #
+--echo # Phase 7 test: ps_point_plan_cache simple_ranges MRR modes
+--echo # Verifies behavior under different MRR (Multi-Range Read) settings:
+--echo # - Default MRR
+--echo # - MRR disabled
+--echo # - MRR forced
+--echo #
+--echo # Run: mtr --ps-protocol ps_point_plan_cache_range_mrr
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+CREATE TABLE t_range_mrr (
+  id INT PRIMARY KEY,
+  c VARCHAR(64)
+);
+INSERT INTO t_range_mrr VALUES
+  (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e'),
+  (10, 'j'), (20, 't'), (30, 'u'), (40, 'v'), (50, 'w'),
+  (100, 'x'), (200, 'y'), (300, 'z'), (400, 'aa'), (500, 'bb');
+
+FLUSH STATUS;
+
+--echo # =======================================================
+--echo # Test 1: Default MRR settings - should work normally
+--echo # =======================================================
+
+--echo # 1.1. Check current MRR status
+--let $mrr_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_mrr_default FROM 'SELECT c FROM t_range_mrr WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 5;
+EXECUTE stmt_mrr_default USING @l, @h;
+--let $mrr_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $mrr_delta = `SELECT $mrr_after - $mrr_before`
+--echo admissions delta (default MRR): $mrr_delta
+--echo Expected: 1
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 10;
+SET @h = 50;
+EXECUTE stmt_mrr_default USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta (default MRR): $hits_delta
+--echo Expected: 1
+
+DEALLOCATE PREPARE stmt_mrr_default;
+
+--echo # =======================================================
+--echo # Test 2: MRR disabled via optimizer_switch - should still work (cached MRR flags)
+--echo # =======================================================
+
+FLUSH STATUS;
+
+SET @save_mrr_off = @@session.optimizer_switch;
+SET SESSION optimizer_switch='mrr=off';
+
+--let $mrr_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_mrr_off FROM 'SELECT c FROM t_range_mrr WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 5;
+EXECUTE stmt_mrr_off USING @l, @h;
+--let $mrr_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $mrr_delta = `SELECT $mrr_after - $mrr_before`
+--echo admissions delta (MRR off): $mrr_delta
+--echo Expected: 1 (uses cached MRR flags, not current setting)
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 10;
+SET @h = 50;
+EXECUTE stmt_mrr_off USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta (MRR off): $hits_delta
+--echo Expected: 1
+
+SET SESSION optimizer_switch=@save_mrr_off;
+DEALLOCATE PREPARE stmt_mrr_off;
+
+--echo # =======================================================
+--echo # Test 3: MRR cost-based disabled - should still work (cached MRR flags)
+--echo # =======================================================
+
+FLUSH STATUS;
+
+SET @save_mrr_force = @@session.optimizer_switch;
+SET SESSION optimizer_switch='mrr_cost_based=off';
+
+--let $mrr_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_mrr_force FROM 'SELECT c FROM t_range_mrr WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 5;
+EXECUTE stmt_mrr_force USING @l, @h;
+--let $mrr_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $mrr_delta = `SELECT $mrr_after - $mrr_before`
+--echo admissions delta (MRR forced): $mrr_delta
+--echo Expected: 1 (uses cached MRR flags, not current setting)
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 10;
+SET @h = 50;
+EXECUTE stmt_mrr_force USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta (MRR force): $hits_delta
+--echo Expected: 1
+
+SET SESSION optimizer_switch=@save_mrr_force;
+DEALLOCATE PREPARE stmt_mrr_force;
+
+--echo # =======================================================
+--echo # Test 4: MRR buffer size variations
+--echo # =======================================================
+
+FLUSH STATUS;
+
+SET @save_mrr_buf = @@session.read_rnd_buffer_size;
+SET SESSION read_rnd_buffer_size = 262144;
+
+--let $mrr_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_mrr_buf FROM 'SELECT c FROM t_range_mrr WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 5;
+EXECUTE stmt_mrr_buf USING @l, @h;
+--let $mrr_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $mrr_delta = `SELECT $mrr_after - $mrr_before`
+--echo admissions delta (custom MRR buffer): $mrr_delta
+--echo Expected: 1 (uses cached MRR flags, not current setting)
+
+SET SESSION read_rnd_buffer_size = @save_mrr_buf;
+DEALLOCATE PREPARE stmt_mrr_buf;
+
+--echo # =======================================================
+--echo # Test 5: Verify MRR flags are cached (not re-read)
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 5.1. Admit with default MRR settings
+PREPARE stmt_mrr_verify FROM 'SELECT c FROM t_range_mrr WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_mrr_verify USING @l, @h;
+
+--echo # 5.2. Change MRR settings after admission
+SET SESSION optimizer_switch='mrr=off';
+SET SESSION read_rnd_buffer_size = 131072;
+
+--let $fb_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_mrr_verify USING @l, @h;
+--let $fb_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $fb_delta = `SELECT $fb_after - $fb_before`
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo After MRR change (should use cached flags):
+--echo   fallback_runtime delta: $fb_delta
+--echo   hits delta: $hits_delta
+--echo Expected: fallback_runtime=0, hits_delta=1 (cached flags used)
+
+SET SESSION optimizer_switch=default;
+SET SESSION read_rnd_buffer_size = default;
+DEALLOCATE PREPARE stmt_mrr_verify;
+
+--echo # -------------------------------------------------------
+--echo # Final counter summary
+--echo # -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+DROP TABLE t_range_mrr;
+
+--echo #
+--echo # End of Phase 7 range MRR modes test
+--echo #

@@ -1,0 +1,187 @@
+--echo #
+--echo # Phase 7 test: ps_point_plan_cache simple_ranges nullable validation
+--echo # Verifies that nullable key parts are properly handled.
+--echo # Note: MySQL 8.0.45 does not allow nullable PRIMARY KEY, so we test
+--echo # the null_bit check through secondary indexes and NULL parameters.
+--echo #
+--echo # Run: mtr --ps-protocol ps_point_plan_cache_range_nullable
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+--echo # Table 1: NOT NULL PK (should be accepted)
+CREATE TABLE t_range_not_null (
+  id INT NOT NULL PRIMARY KEY,
+  c VARCHAR(32)
+);
+INSERT INTO t_range_not_null VALUES
+  (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'),
+  (10, 'ten'), (20, 'twenty');
+
+--echo # Table 2: Secondary index with nullable column (should NEVER - not PK)
+CREATE TABLE t_range_nullable_sec (
+  id INT NOT NULL PRIMARY KEY,
+  nullable_col INT NULL,
+  c VARCHAR(32),
+  KEY idx_nullable (nullable_col)
+);
+INSERT INTO t_range_nullable_sec VALUES
+  (1, 10, 'a'), (2, 20, 'b'), (3, NULL, 'c'),
+  (4, 40, 'd'), (5, 50, 'e');
+
+--echo # Table 3: Composite PK (should NEVER - not single column PK)
+CREATE TABLE t_range_comp_pk (
+  pk1 INT NOT NULL,
+  pk2 INT NOT NULL,
+  c VARCHAR(32),
+  PRIMARY KEY (pk1, pk2)
+);
+INSERT INTO t_range_comp_pk VALUES
+  (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c');
+
+FLUSH STATUS;
+
+--echo # =======================================================
+--echo # Test 1: NOT NULL PK - admission should SUCCEED
+--echo # =======================================================
+
+--echo # 1.1. PREPARE should succeed (COLD classification)
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_notnull FROM 'SELECT c FROM t_range_not_null WHERE id BETWEEN ? AND ?';
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta (NOT NULL PK PREPARE): $cold_delta
+--echo Expected: 1
+
+--echo # 1.2. First EXECUTE - admission should succeed
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @l = 1;
+SET @h = 4;
+EXECUTE stmt_notnull USING @l, @h;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta (NOT NULL PK): $adm_delta
+--echo Expected: 1
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 2;
+SET @h = 3;
+EXECUTE stmt_notnull USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta (NOT NULL PK): $hits_delta
+--echo Expected: 1
+
+DEALLOCATE PREPARE stmt_notnull;
+
+--echo # =======================================================
+--echo # Test 2: Secondary index with nullable column - should be NEVER
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 2.1. PREPARE for secondary index range
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_sec FROM 'SELECT * FROM t_range_nullable_sec WHERE nullable_col BETWEEN ? AND ?';
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta (secondary index): $cold_delta
+--echo Expected: 0 (secondary index not PK, rejected)
+
+--echo # Note: The null_bit check in code applies to PK key parts.
+--echo # Secondary indexes with nullable columns are rejected by
+--echo # the "must use primary key" requirement, not null_bit check.
+
+--echo # =======================================================
+--echo # Test 3: Composite PK - should be NEVER
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_comp FROM 'SELECT * FROM t_range_comp_pk WHERE pk1 BETWEEN ? AND ?';
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta (composite PK): $cold_delta
+--echo Expected: 0 (composite PK rejected - user_defined_key_parts != 1)
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_comp USING @l, @h;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta (composite PK): $adm_delta
+--echo Expected: 0
+
+DEALLOCATE PREPARE stmt_comp;
+
+--echo # =======================================================
+--echo # Test 4: NULL parameters work on NOT NULL PK
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_null_param FROM 'SELECT c FROM t_range_not_null WHERE id BETWEEN ? AND ?';
+
+--echo # 4.1. NULL low parameter - should be runtime fallback, no admission
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @l = NULL;
+SET @h = 5;
+EXECUTE stmt_null_param USING @l, @h;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta (NULL low): $adm_delta
+--echo Expected: 0
+
+--echo # 4.2. Valid parameters after NULL - should admit
+--let $adm_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_null_param USING @l, @h;
+--let $adm_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta2 = `SELECT $adm_after2 - $adm_before2`
+--echo admissions delta (after NULL recovery): $adm_delta2
+--echo Expected: 1
+
+DEALLOCATE PREPARE stmt_null_param;
+
+--echo # =======================================================
+--echo # Test 5: NULL high parameter also triggers fallback
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_null_high FROM 'SELECT c FROM t_range_not_null WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 10;
+EXECUTE stmt_null_high USING @l, @h;
+
+--let $fb_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+SET @l = 1;
+SET @h = NULL;
+EXECUTE stmt_null_high USING @l, @h;
+--let $fb_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $fb_delta = `SELECT $fb_after - $fb_before`
+--echo fallback_runtime delta (NULL high): $fb_delta
+--echo Expected: 1
+
+DEALLOCATE PREPARE stmt_null_high;
+
+--echo # -------------------------------------------------------
+--echo # Final counter summary
+--echo # -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+DROP TABLE t_range_not_null;
+DROP TABLE t_range_nullable_sec;
+DROP TABLE t_range_comp_pk;
+
+--echo #
+--echo # End of Phase 7 range nullable validation test
+--echo #

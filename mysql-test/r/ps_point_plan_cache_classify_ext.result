@@ -135,10 +135,10 @@ PREPARE stmt_a11 FROM 'SELECT * FROM t1 WHERE val LIKE ?';
 cold_delta (LIKE): 0
 DEALLOCATE PREPARE stmt_a11;
 # -------------------------------------------------------
-# A12. BETWEEN predicate — NEVER (BETWEEN_FUNC)
+# A12. BETWEEN predicate — COLD (simple range candidate)
 # -------------------------------------------------------
 PREPARE stmt_a12 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ?';
-cold_delta (BETWEEN): 0
+cold_delta (BETWEEN): 1
 DEALLOCATE PREPARE stmt_a12;
 # -------------------------------------------------------
 # A13. NULL-safe equal <=> — NEVER (EQUAL_FUNC, not EQ_FUNC)
@@ -532,7 +532,7 @@ DEALLOCATE PREPARE stmt_f12;
 SHOW STATUS LIKE 'Ps_point_plan_cache%';
 Variable_name	Value
 Ps_point_plan_cache_admissions	9
-Ps_point_plan_cache_cold_classifications	27
+Ps_point_plan_cache_cold_classifications	28
 Ps_point_plan_cache_fallback_runtime	0
 Ps_point_plan_cache_hits	11
 Ps_point_plan_cache_invalidations	0

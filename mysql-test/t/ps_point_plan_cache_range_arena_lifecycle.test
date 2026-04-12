@@ -1,0 +1,185 @@
+--echo #
+--echo # Phase 7 test: ps_point_plan_cache simple_ranges arena cache lifecycle
+--echo # Verifies the complete lifecycle of arena-cached range fast path:
+--echo # - First execution: slow path (no arena cache)
+--echo # - Second execution: fast path (arena cache active)
+--echo # - Multiple executions: hit accumulation
+--echo # - Cache cleanup after DEALLOCATE
+--echo #
+--echo # Run: mtr --ps-protocol ps_point_plan_cache_range_arena_lifecycle
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+CREATE TABLE t_range_arena (
+  id INT PRIMARY KEY,
+  c VARCHAR(64)
+);
+INSERT INTO t_range_arena VALUES
+  (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'),
+  (5, 'e'), (6, 'f'), (7, 'g'), (8, 'h'),
+  (9, 'i'), (10, 'j'), (11, 'k'), (12, 'l');
+
+FLUSH STATUS;
+
+--echo # =======================================================
+--echo # Test 1: Complete lifecycle - COLD → admission → HOT → hits
+--echo # =======================================================
+
+--echo # 1.1. PREPARE - should be COLD classified
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_arena FROM 'SELECT c FROM t_range_arena WHERE id BETWEEN ? AND ?';
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta after PREPARE (expect 1): $cold_delta
+
+--echo # 1.2. First EXECUTE - should admit (COLD → HOT), slow path
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $fallback_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_arena USING @l, @h;
+
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $fallback_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--let $fallback_delta = `SELECT $fallback_after - $fallback_before`
+--echo After first EXECUTE (slow path):
+--echo   admissions delta (expect 1): $adm_delta
+--echo   hits delta (expect 0): $hits_delta
+--echo   fallback_runtime delta (expect 0): $fallback_delta
+
+--echo # 1.3. Second EXECUTE - should hit fast path
+--let $hits_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 2;
+SET @h = 5;
+EXECUTE stmt_arena USING @l, @h;
+--let $hits_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta2 = `SELECT $hits_after2 - $hits_before2`
+--echo hits delta after second EXECUTE (expect 1): $hits_delta2
+
+--echo # 1.4. Third EXECUTE - fast path with arena cache
+--let $hits_before3 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 6;
+SET @h = 8;
+EXECUTE stmt_arena USING @l, @h;
+--let $hits_after3 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta3 = `SELECT $hits_after3 - $hits_before3`
+--echo hits delta after third EXECUTE (expect 1): $hits_delta3
+
+--echo # 1.5. Fourth EXECUTE - verify arena cache still active
+--let $hits_before4 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 9;
+SET @h = 12;
+EXECUTE stmt_arena USING @l, @h;
+--let $hits_after4 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta4 = `SELECT $hits_after4 - $hits_before4`
+--echo hits delta after fourth EXECUTE (expect 1): $hits_delta4
+
+DEALLOCATE PREPARE stmt_arena;
+
+--echo # =======================================================
+--echo # Test 2: Arena cache cleanup after DEALLOCATE
+--echo # =======================================================
+--echo # 2.1. Prepare and admit another PS - should get fresh arena cache
+FLUSH STATUS;
+
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_arena2 FROM 'SELECT c FROM t_range_arena WHERE id BETWEEN ? AND ?';
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta after second PREPARE (expect 1): $cold_delta
+
+--echo # 2.2. Execute and admit
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @l = 1;
+SET @h = 4;
+EXECUTE stmt_arena2 USING @l, @h;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta (expect 1): $adm_delta
+
+--echo # 2.3. Hot execute with arena cache
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 2;
+SET @h = 6;
+EXECUTE stmt_arena2 USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta (expect 1): $hits_delta
+
+DEALLOCATE PREPARE stmt_arena2;
+
+--echo # =======================================================
+--echo # Test 3: Multiple PS with independent arena caches
+--echo # =======================================================
+FLUSH STATUS;
+
+--echo # 3.1. Prepare two different range PS
+PREPARE stmt_multi1 FROM 'SELECT c FROM t_range_arena WHERE id BETWEEN ? AND ?';
+PREPARE stmt_multi2 FROM 'SELECT c FROM t_range_arena WHERE id BETWEEN ? AND ?';
+
+--echo # 3.2. Admit both (they get independent arena caches)
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_multi1 USING @l, @h;
+
+SET @l = 5;
+SET @h = 7;
+EXECUTE stmt_multi2 USING @l, @h;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after both admit (expect 2): $adm
+
+--echo # 3.3. Hot execute both - each uses its own arena cache
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_multi1 USING @l, @h;
+
+SET @l = 6;
+SET @h = 8;
+EXECUTE stmt_multi2 USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after both hot executes (expect 2): $hits_delta
+
+--echo # 3.4. Fallback on one should not affect the other
+SET @l = NULL;
+SET @h = 2;
+--let $fb_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+EXECUTE stmt_multi1 USING @l, @h;
+--let $fb_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $fb_delta = `SELECT $fb_after - $fb_before`
+--echo fallback_runtime delta (stmt1, NULL low): $fb_delta
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 9;
+SET @h = 11;
+EXECUTE stmt_multi2 USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta for stmt2 (expect 1): $hits_delta
+
+DEALLOCATE PREPARE stmt_multi1;
+DEALLOCATE PREPARE stmt_multi2;
+
+--echo # -------------------------------------------------------
+--echo # Final counter summary
+--echo # -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+DROP TABLE t_range_arena;
+
+--echo #
+--echo # End of Phase 7 range arena lifecycle test
+--echo #

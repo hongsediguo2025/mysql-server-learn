@@ -1,0 +1,167 @@
+#
+# Phase 7 test: ps_point_plan_cache range and point-query coexistence
+# Verifies that range PS and point-query PS can coexist on the same table
+# without interfering with each other's arena caches or templates.
+#
+# Run: mtr --ps-protocol ps_point_plan_cache_range_cross_type
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t_range_cross (
+id INT PRIMARY KEY,
+k INT NOT NULL,
+c VARCHAR(64)
+);
+INSERT INTO t_range_cross VALUES
+(1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd'),
+(5, 50, 'e'), (10, 100, 'f'), (11, 110, 'g'), (12, 120, 'h'),
+(15, 150, 'i'), (20, 200, 'j'), (25, 250, 'k'), (30, 300, 'l');
+FLUSH STATUS;
+# =======================================================
+# Test 1: Point query PS then range PS on same table
+# =======================================================
+# 1.1. Point query PS first
+PREPARE stmt_point1 FROM 'SELECT * FROM t_range_cross WHERE id = ?';
+cold_delta (point query): 1
+SET @id = 5;
+EXECUTE stmt_point1 USING @id;
+id	k	c
+5	50	e
+admissions delta (point query): 1
+# 1.2. Range PS on same table - independent classification
+PREPARE stmt_range1 FROM 'SELECT c FROM t_range_cross WHERE id BETWEEN ? AND ?';
+cold_delta (range PS): 1
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_range1 USING @l, @h;
+c
+a
+b
+c
+admissions delta (range PS): 1
+# 1.3. Both should hit independently
+SET @id = 10;
+EXECUTE stmt_point1 USING @id;
+id	k	c
+10	100	f
+SET @l = 5;
+SET @h = 8;
+EXECUTE stmt_range1 USING @l, @h;
+c
+e
+hits delta (both types): 2
+Expected: 2
+DEALLOCATE PREPARE stmt_point1;
+DEALLOCATE PREPARE stmt_range1;
+# =======================================================
+# Test 2: Range PS first, then point query PS
+# =======================================================
+FLUSH STATUS;
+# 2.1. Range PS first
+PREPARE stmt_range2 FROM 'SELECT c FROM t_range_cross WHERE id BETWEEN ? AND ?';
+cold_delta (range PS first): 1
+SET @l = 10;
+SET @h = 20;
+EXECUTE stmt_range2 USING @l, @h;
+c
+f
+g
+h
+i
+j
+admissions delta (range PS): 1
+# 2.2. Point query PS on same table
+PREPARE stmt_point2 FROM 'SELECT * FROM t_range_cross WHERE id = ?';
+cold_delta (point query second): 1
+SET @id = 15;
+EXECUTE stmt_point2 USING @id;
+id	k	c
+15	150	i
+admissions delta (point query): 1
+# 2.3. Both should hit independently
+SET @l = 15;
+SET @h = 18;
+EXECUTE stmt_range2 USING @l, @h;
+c
+i
+SET @id = 25;
+EXECUTE stmt_point2 USING @id;
+id	k	c
+25	250	k
+hits delta (both types swapped order): 2
+Expected: 2
+DEALLOCATE PREPARE stmt_point2;
+DEALLOCATE PREPARE stmt_range2;
+# =======================================================
+# Test 3: Type drift on range PS doesn't affect point query PS
+# =======================================================
+FLUSH STATUS;
+# 3.1. Prepare and admit both
+PREPARE stmt_range_drift FROM 'SELECT c FROM t_range_cross WHERE id BETWEEN ? AND ?';
+PREPARE stmt_point_drift FROM 'SELECT * FROM t_range_cross WHERE id = ?';
+SET @l = 1;
+SET @h = 5;
+EXECUTE stmt_range_drift USING @l, @h;
+c
+a
+b
+c
+d
+e
+SET @id = 10;
+EXECUTE stmt_point_drift USING @id;
+id	k	c
+10	100	f
+# 3.2. Trigger type drift on range PS (INT to BIGINT)
+SET @l = '100000000000';
+SET @h = '200000000000';
+EXECUTE stmt_range_drift USING @l, @h;
+c
+After range PS type drift:
+fallback_runtime delta: 1
+hits delta: 0
+Expected: fallback_runtime > 0, hits_delta = 0
+# 3.3. Point query PS should still work
+SET @id = 20;
+EXECUTE stmt_point_drift USING @id;
+id	k	c
+20	200	j
+hits delta (point PS unaffected): 1
+Expected: 1
+DEALLOCATE PREPARE stmt_range_drift;
+DEALLOCATE PREPARE stmt_point_drift;
+# =======================================================
+# Test 4: Composite equality PS with range PS
+# =======================================================
+FLUSH STATUS;
+# 4.1. Point query PS now
+PREPARE stmt_comp FROM 'SELECT * FROM t_range_cross WHERE id = ? AND k = ?';
+cold_delta (composite equality): 1
+SET @id = 5;
+SET @k = 50;
+EXECUTE stmt_comp USING @id, @k;
+id	k	c
+5	50	e
+# 4.2. Range PS - should be independent
+PREPARE stmt_range_comp FROM 'SELECT c FROM t_range_cross WHERE id BETWEEN ? AND ?';
+cold_delta (range with composite point present): 1
+DEALLOCATE PREPARE stmt_comp;
+DEALLOCATE PREPARE stmt_range_comp;
+# -------------------------------------------------------
+# Final counter summary
+# -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admissions	0
+Ps_point_plan_cache_cold_classifications	2
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	0
+Ps_point_plan_cache_invalidations	0
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t_range_cross;
+#
+# End of Phase 7 range cross-type coexistence test
+#

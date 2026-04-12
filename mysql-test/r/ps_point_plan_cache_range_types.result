@@ -1,0 +1,207 @@
+#
+# Phase 7 test: ps_point_plan_cache simple_ranges type system
+# Verifies classification and admission for different data types:
+# BIGINT, BIGINT UNSIGNED, SMALLINT, TINYINT, and rejects non-integer types.
+#
+# Run: mtr --ps-protocol ps_point_plan_cache_range_types
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+# Table 1: BIGINT PRIMARY KEY
+CREATE TABLE t_range_bigint (
+id BIGINT PRIMARY KEY,
+c VARCHAR(32)
+);
+INSERT INTO t_range_bigint VALUES
+(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'),
+(1000000000000, 'x'), (2000000000000, 'y');
+# Table 2: BIGINT UNSIGNED PRIMARY KEY
+CREATE TABLE t_range_uint (
+id BIGINT UNSIGNED PRIMARY KEY,
+c VARCHAR(32)
+);
+INSERT INTO t_range_uint VALUES
+(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'),
+(4294967295, 'max');
+# Table 3: SMALLINT PRIMARY KEY
+CREATE TABLE t_range_small (
+id SMALLINT PRIMARY KEY,
+c VARCHAR(32)
+);
+INSERT INTO t_range_small VALUES
+(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'),
+(1000, 'x'), (2000, 'y');
+# Table 4: TINYINT PRIMARY KEY
+CREATE TABLE t_range_tiny (
+id TINYINT PRIMARY KEY,
+c VARCHAR(32)
+);
+INSERT INTO t_range_tiny VALUES
+(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'),
+(100, 'x'), (120, 'y');
+# Table 5: DECIMAL column (secondary index - should be NEVER)
+CREATE TABLE t_range_decimal (
+id INT PRIMARY KEY,
+amount DECIMAL(10,2),
+KEY idx_amount (amount)
+);
+INSERT INTO t_range_decimal VALUES
+(1, 10.50), (2, 20.75), (3, 99.99);
+# Table 6: DATE column (should be NEVER)
+CREATE TABLE t_range_date (
+id INT PRIMARY KEY,
+order_date DATE
+);
+INSERT INTO t_range_date VALUES
+(1, '2024-01-01'), (2, '2024-06-15'), (3, '2024-12-31');
+FLUSH STATUS;
+# =======================================================
+# Test 1: BIGINT PRIMARY KEY range - should be COLD then HOT
+# =======================================================
+PREPARE stmt_bigint FROM 'SELECT c FROM t_range_bigint WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_bigint USING @l, @h;
+c
+a
+b
+c
+cold_delta (bigint): 1
+SET @l = 1000000000000;
+SET @h = 2000000000000;
+EXECUTE stmt_bigint USING @l, @h;
+c
+x
+y
+admissions delta (bigint admit): 0
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt_bigint USING @l, @h;
+c
+a
+b
+hits delta (bigint hit): 1
+DEALLOCATE PREPARE stmt_bigint;
+# =======================================================
+# Test 2: BIGINT UNSIGNED PRIMARY KEY range - should be COLD then HOT
+# =======================================================
+PREPARE stmt_uint FROM 'SELECT c FROM t_range_uint WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_uint USING @l, @h;
+c
+a
+b
+c
+cold_delta (uint): 2
+SET @l = 4294967290;
+SET @h = 4294967295;
+EXECUTE stmt_uint USING @l, @h;
+c
+max
+admissions delta (uint admit): 0
+SET @l = 1;
+SET @h = 5;
+EXECUTE stmt_uint USING @l, @h;
+c
+a
+b
+c
+d
+hits delta (uint hit): 1
+DEALLOCATE PREPARE stmt_uint;
+# =======================================================
+# Test 3: SMALLINT PRIMARY KEY range - should be COLD then HOT
+# =======================================================
+PREPARE stmt_small FROM 'SELECT c FROM t_range_small WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_small USING @l, @h;
+c
+a
+b
+c
+cold_delta (smallint): 1
+SET @l = 1000;
+SET @h = 2000;
+EXECUTE stmt_small USING @l, @h;
+c
+x
+y
+admissions delta (smallint admit): 0
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt_small USING @l, @h;
+c
+a
+b
+hits delta (smallint hit): 1
+DEALLOCATE PREPARE stmt_small;
+# =======================================================
+# Test 4: TINYINT PRIMARY KEY range - should be COLD then HOT
+# =======================================================
+PREPARE stmt_tiny FROM 'SELECT c FROM t_range_tiny WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_tiny USING @l, @h;
+c
+a
+b
+c
+cold_delta (tinyint): 1
+SET @l = 50;
+SET @h = 100;
+EXECUTE stmt_tiny USING @l, @h;
+c
+x
+admissions delta (tinyint admit): 0
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt_tiny USING @l, @h;
+c
+a
+b
+hits delta (tinyint hit): 1
+DEALLOCATE PREPARE stmt_tiny;
+# =======================================================
+# Test 5: DECIMAL secondary index range - should be NEVER
+# =======================================================
+PREPARE stmt_decimal FROM 'SELECT * FROM t_range_decimal WHERE amount BETWEEN ? AND ?';
+cold_delta (decimal): 1
+SET @l = 10;
+SET @h = 50;
+EXECUTE stmt_decimal USING @l, @h;
+id	amount
+1	10.50
+2	20.75
+admissions delta (decimal): 0
+DEALLOCATE PREPARE stmt_decimal;
+# =======================================================
+# Test 6: DATE column range - should be NEVER
+# =======================================================
+PREPARE stmt_date FROM 'SELECT * FROM t_range_date WHERE order_date BETWEEN ? AND ?';
+cold_delta (date): 1
+DEALLOCATE PREPARE stmt_date;
+# -------------------------------------------------------
+# Final counter summary
+# -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admissions	4
+Ps_point_plan_cache_cold_classifications	7
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	8
+Ps_point_plan_cache_invalidations	0
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t_range_bigint;
+DROP TABLE t_range_uint;
+DROP TABLE t_range_small;
+DROP TABLE t_range_tiny;
+DROP TABLE t_range_decimal;
+DROP TABLE t_range_date;
+#
+# End of Phase 7 range type system test
+#

@@ -1,0 +1,229 @@
+#
+# Phase 7 test: ps_point_plan_cache simple_ranges concurrent PS
+# Verifies that multiple range PS can coexist with independent
+# arena caches, and that fallback on one doesn't affect others.
+#
+# Run: mtr --ps-protocol ps_point_plan_cache_range_concurrent
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t_range_conc1 (
+id INT PRIMARY KEY,
+c1 VARCHAR(32)
+);
+INSERT INTO t_range_conc1 VALUES
+(1, 'a1'), (2, 'b1'), (3, 'c1'), (4, 'd1'),
+(10, 'e1'), (20, 'f1'), (30, 'g1'), (40, 'h1');
+CREATE TABLE t_range_conc2 (
+id INT PRIMARY KEY,
+c2 VARCHAR(32)
+);
+INSERT INTO t_range_conc2 VALUES
+(1, 'a2'), (2, 'b2'), (3, 'c2'), (4, 'd2'),
+(10, 'e2'), (20, 'f2'), (30, 'g2'), (40, 'h2');
+CREATE TABLE t_range_conc3 (
+id INT PRIMARY KEY,
+c3 VARCHAR(32)
+);
+INSERT INTO t_range_conc3 VALUES
+(1, 'a3'), (2, 'b3'), (3, 'c3'), (4, 'd3'),
+(10, 'e3'), (20, 'f3'), (30, 'g3'), (40, 'h3');
+FLUSH STATUS;
+# =======================================================
+# Test 1: Three concurrent PS with independent arena caches
+# =======================================================
+# 1.1. Prepare all three statements
+PREPARE stmt_conc1 FROM 'SELECT c1 FROM t_range_conc1 WHERE id BETWEEN ? AND ?';
+PREPARE stmt_conc2 FROM 'SELECT c2 FROM t_range_conc2 WHERE id BETWEEN ? AND ?';
+PREPARE stmt_conc3 FROM 'SELECT c3 FROM t_range_conc3 WHERE id BETWEEN ? AND ?';
+cold_delta after 3 PREPAREs: 3
+Expected: 3 (all COLD)
+# 1.2. Admit all three
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_conc1 USING @l, @h;
+c1
+a1
+b1
+c1
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_conc2 USING @l, @h;
+c2
+a2
+b2
+c2
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_conc3 USING @l, @h;
+c3
+a3
+b3
+c3
+admissions delta after all admit: 3
+Expected: 3
+# 1.3. Hot execute all three
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_conc1 USING @l, @h;
+c1
+b1
+c1
+d1
+SET @l = 5;
+SET @h = 7;
+EXECUTE stmt_conc2 USING @l, @h;
+c2
+SET @l = 10;
+SET @h = 20;
+EXECUTE stmt_conc3 USING @l, @h;
+c3
+e3
+f3
+hits delta after all hot executes: 3
+Expected: 3
+DEALLOCATE PREPARE stmt_conc1;
+DEALLOCATE PREPARE stmt_conc2;
+DEALLOCATE PREPARE stmt_conc3;
+# =======================================================
+# Test 2: Fallback on one PS doesn't affect others
+# =======================================================
+FLUSH STATUS;
+# 2.1. Prepare and admit two statements
+PREPARE stmt_fallback1 FROM 'SELECT c1 FROM t_range_conc1 WHERE id BETWEEN ? AND ?';
+PREPARE stmt_fallback2 FROM 'SELECT c2 FROM t_range_conc2 WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 4;
+EXECUTE stmt_fallback1 USING @l, @h;
+c1
+a1
+b1
+c1
+d1
+SET @l = 1;
+SET @h = 4;
+EXECUTE stmt_fallback2 USING @l, @h;
+c2
+a2
+b2
+c2
+d2
+# 2.2. Trigger fallback on stmt_fallback1 (NULL param)
+SET @l = NULL;
+SET @h = 2;
+EXECUTE stmt_fallback1 USING @l, @h;
+c1
+fallback_runtime delta (stmt_fallback1): 1
+hits delta (stmt_fallback1 with NULL): 0
+Expected: 0 (fallback occurred)
+# 2.3. stmt_fallback2 should still work normally
+SET @l = 2;
+SET @h = 5;
+EXECUTE stmt_fallback2 USING @l, @h;
+c2
+b2
+c2
+d2
+hits delta (stmt_fallback2 unaffected): 1
+Expected: 1 (other PS unaffected)
+# 2.4. Recover stmt_fallback1 with valid params
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_fallback1 USING @l, @h;
+c1
+a1
+b1
+c1
+hits delta (stmt_fallback1 recovered): 1
+Expected: 1 (recovered to HOT)
+DEALLOCATE PREPARE stmt_fallback1;
+DEALLOCATE PREPARE stmt_fallback2;
+# =======================================================
+# Test 3: DEALLOCATE one PS doesn't affect others
+# =======================================================
+FLUSH STATUS;
+# 3.1. Prepare and admit two statements
+PREPARE stmt_dealloc1 FROM 'SELECT c1 FROM t_range_conc1 WHERE id BETWEEN ? AND ?';
+PREPARE stmt_dealloc2 FROM 'SELECT c2 FROM t_range_conc2 WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_dealloc1 USING @l, @h;
+c1
+a1
+b1
+c1
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_dealloc2 USING @l, @h;
+c2
+a2
+b2
+c2
+# 3.2. DEALLOCATE stmt_dealloc1
+DEALLOCATE PREPARE stmt_dealloc1;
+# 3.3. stmt_dealloc2 should still work
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_dealloc2 USING @l, @h;
+c2
+b2
+c2
+d2
+hits delta (after DEALLOCATE of other PS): 1
+Expected: 1 (independent arena caches)
+DEALLOCATE PREPARE stmt_dealloc2;
+# =======================================================
+# Test 4: Arena cache independence - re-prepare same query
+# =======================================================
+FLUSH STATUS;
+# 4.1. Prepare and admit
+PREPARE stmt_reprepare FROM 'SELECT c1 FROM t_range_conc1 WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_reprepare USING @l, @h;
+c1
+a1
+b1
+c1
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_reprepare USING @l, @h;
+c1
+b1
+c1
+d1
+hits delta (first arena): 1
+DEALLOCATE PREPARE stmt_reprepare;
+# 4.2. Prepare again (new arena cache)
+PREPARE stmt_reprepare FROM 'SELECT c1 FROM t_range_conc1 WHERE id BETWEEN ? AND ?';
+SET @l = 5;
+SET @h = 8;
+EXECUTE stmt_reprepare USING @l, @h;
+c1
+admissions delta (re-prepare): 1
+SET @l = 6;
+SET @h = 7;
+EXECUTE stmt_reprepare USING @l, @h;
+c1
+hits delta (new arena cache): 1
+DEALLOCATE PREPARE stmt_reprepare;
+# -------------------------------------------------------
+# Final counter summary
+# -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admissions	2
+Ps_point_plan_cache_cold_classifications	2
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	2
+Ps_point_plan_cache_invalidations	0
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t_range_conc1;
+DROP TABLE t_range_conc2;
+DROP TABLE t_range_conc3;
+#
+# End of Phase 7 range concurrent PS test
+#

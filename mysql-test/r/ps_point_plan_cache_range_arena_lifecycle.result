@@ -1,0 +1,171 @@
+#
+# Phase 7 test: ps_point_plan_cache simple_ranges arena cache lifecycle
+# Verifies the complete lifecycle of arena-cached range fast path:
+# - First execution: slow path (no arena cache)
+# - Second execution: fast path (arena cache active)
+# - Multiple executions: hit accumulation
+# - Cache cleanup after DEALLOCATE
+#
+# Run: mtr --ps-protocol ps_point_plan_cache_range_arena_lifecycle
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t_range_arena (
+id INT PRIMARY KEY,
+c VARCHAR(64)
+);
+INSERT INTO t_range_arena VALUES
+(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'),
+(5, 'e'), (6, 'f'), (7, 'g'), (8, 'h'),
+(9, 'i'), (10, 'j'), (11, 'k'), (12, 'l');
+FLUSH STATUS;
+# =======================================================
+# Test 1: Complete lifecycle - COLD → admission → HOT → hits
+# =======================================================
+# 1.1. PREPARE - should be COLD classified
+PREPARE stmt_arena FROM 'SELECT c FROM t_range_arena WHERE id BETWEEN ? AND ?';
+cold_delta after PREPARE (expect 1): 1
+# 1.2. First EXECUTE - should admit (COLD → HOT), slow path
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_arena USING @l, @h;
+c
+a
+b
+c
+After first EXECUTE (slow path):
+admissions delta (expect 1): 1
+hits delta (expect 0): 0
+fallback_runtime delta (expect 0): 0
+# 1.3. Second EXECUTE - should hit fast path
+SET @l = 2;
+SET @h = 5;
+EXECUTE stmt_arena USING @l, @h;
+c
+b
+c
+d
+e
+hits delta after second EXECUTE (expect 1): 1
+# 1.4. Third EXECUTE - fast path with arena cache
+SET @l = 6;
+SET @h = 8;
+EXECUTE stmt_arena USING @l, @h;
+c
+f
+g
+h
+hits delta after third EXECUTE (expect 1): 1
+# 1.5. Fourth EXECUTE - verify arena cache still active
+SET @l = 9;
+SET @h = 12;
+EXECUTE stmt_arena USING @l, @h;
+c
+i
+j
+k
+l
+hits delta after fourth EXECUTE (expect 1): 1
+DEALLOCATE PREPARE stmt_arena;
+# =======================================================
+# Test 2: Arena cache cleanup after DEALLOCATE
+# =======================================================
+# 2.1. Prepare and admit another PS - should get fresh arena cache
+FLUSH STATUS;
+PREPARE stmt_arena2 FROM 'SELECT c FROM t_range_arena WHERE id BETWEEN ? AND ?';
+cold_delta after second PREPARE (expect 1): 1
+# 2.2. Execute and admit
+SET @l = 1;
+SET @h = 4;
+EXECUTE stmt_arena2 USING @l, @h;
+c
+a
+b
+c
+d
+admissions delta (expect 1): 1
+# 2.3. Hot execute with arena cache
+SET @l = 2;
+SET @h = 6;
+EXECUTE stmt_arena2 USING @l, @h;
+c
+b
+c
+d
+e
+f
+hits delta (expect 1): 1
+DEALLOCATE PREPARE stmt_arena2;
+# =======================================================
+# Test 3: Multiple PS with independent arena caches
+# =======================================================
+FLUSH STATUS;
+# 3.1. Prepare two different range PS
+PREPARE stmt_multi1 FROM 'SELECT c FROM t_range_arena WHERE id BETWEEN ? AND ?';
+PREPARE stmt_multi2 FROM 'SELECT c FROM t_range_arena WHERE id BETWEEN ? AND ?';
+# 3.2. Admit both (they get independent arena caches)
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_multi1 USING @l, @h;
+c
+a
+b
+c
+SET @l = 5;
+SET @h = 7;
+EXECUTE stmt_multi2 USING @l, @h;
+c
+e
+f
+g
+admissions after both admit (expect 2): 2
+# 3.3. Hot execute both - each uses its own arena cache
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_multi1 USING @l, @h;
+c
+b
+c
+d
+SET @l = 6;
+SET @h = 8;
+EXECUTE stmt_multi2 USING @l, @h;
+c
+f
+g
+h
+hits delta after both hot executes (expect 2): 2
+# 3.4. Fallback on one should not affect the other
+SET @l = NULL;
+SET @h = 2;
+EXECUTE stmt_multi1 USING @l, @h;
+c
+fallback_runtime delta (stmt1, NULL low): 1
+SET @l = 9;
+SET @h = 11;
+EXECUTE stmt_multi2 USING @l, @h;
+c
+i
+j
+k
+hits delta for stmt2 (expect 1): 1
+DEALLOCATE PREPARE stmt_multi1;
+DEALLOCATE PREPARE stmt_multi2;
+# -------------------------------------------------------
+# Final counter summary
+# -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admissions	2
+Ps_point_plan_cache_cold_classifications	2
+Ps_point_plan_cache_fallback_runtime	1
+Ps_point_plan_cache_hits	3
+Ps_point_plan_cache_invalidations	0
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t_range_arena;
+#
+# End of Phase 7 range arena lifecycle test
+#

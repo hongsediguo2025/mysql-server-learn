@@ -1,0 +1,260 @@
+--echo #
+--echo # Phase 7 test: ps_point_plan_cache simple_ranges unsigned type drift
+--echo # Verifies that unsigned parameter type drift is properly detected
+--echo # and triggers runtime fallback with re-admission.
+--echo #
+--echo # Run: mtr --ps-protocol ps_point_plan_cache_range_unsigned
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+CREATE TABLE t_range_unsigned (
+  id INT UNSIGNED PRIMARY KEY,
+  c VARCHAR(32)
+);
+INSERT INTO t_range_unsigned VALUES
+  (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'),
+  (10, 'e'), (20, 'f'), (30, 'g'), (40, 'h'),
+  (100, 'i'), (200, 'j'), (1000, 'k'), (2000, 'l');
+
+FLUSH STATUS;
+
+--echo # =======================================================
+--echo # Test 1: Normal INT UNSIGNED range - should admit
+--echo # =======================================================
+
+--echo # 1.1. PREPARE and admit with INT UNSIGNED params
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_unsigned FROM 'SELECT c FROM t_range_unsigned WHERE id BETWEEN ? AND ?';
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta (INT UNSIGNED): $cold_delta
+--echo Expected: 1
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @l = 1;
+SET @h = 10;
+EXECUTE stmt_unsigned USING @l, @h;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta (INT UNSIGNED): $adm_delta
+--echo Expected: 1
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 5;
+SET @h = 20;
+EXECUTE stmt_unsigned USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta (INT UNSIGNED): $hits_delta
+--echo Expected: 1
+
+DEALLOCATE PREPARE stmt_unsigned;
+
+--echo # =======================================================
+--echo # Test 2: Type drift from INT to BIGINT UNSIGNED
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_drift1 FROM 'SELECT c FROM t_range_unsigned WHERE id BETWEEN ? AND ?';
+
+--echo # 2.1. Admit with normal INT values
+SET @l = 1;
+SET @h = 5;
+EXECUTE stmt_drift1 USING @l, @h;
+
+--echo # 2.2. Trigger type drift with BIGINT UNSIGNED value
+--let $fb_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+SET @l = 10000000000;
+SET @h = 20000000000;
+EXECUTE stmt_drift1 USING @l, @h;
+
+--let $fb_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $fb_delta = `SELECT $fb_after - $fb_before`
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo After BIGINT UNSIGNED type drift:
+--echo   fallback_runtime delta: $fb_delta
+--echo   hits delta: $hits_delta
+--echo Expected: fallback_runtime > 0, hits_delta = 0
+
+--echo # 2.3. Re-admit with same BIGINT UNSIGNED type
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @l = 10000000000;
+SET @h = 15000000000;
+EXECUTE stmt_drift1 USING @l, @h;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta (re-admit BIGINT UNSIGNED): $adm_delta
+--echo Expected: 1 (re-admitted with new type)
+
+DEALLOCATE PREPARE stmt_drift1;
+
+--echo # =======================================================
+--echo # Test 3: BIGINT UNSIGNED table with BIGINT params
+--echo # =======================================================
+
+FLUSH STATUS;
+
+CREATE TABLE t_range_biguint (
+  id BIGINT UNSIGNED PRIMARY KEY,
+  c VARCHAR(32)
+);
+INSERT INTO t_range_biguint VALUES
+  (1, 'a'), (2, 'b'), (3, 'c'),
+  (10000000000, 'd'), (20000000000, 'e'),
+  (1000000000000, 'f'), (2000000000000, 'g');
+
+--echo # 3.1. PREPARE and admit with BIGINT UNSIGNED values
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_biguint FROM 'SELECT c FROM t_range_biguint WHERE id BETWEEN ? AND ?';
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta (BIGINT UNSIGNED table): $cold_delta
+--echo Expected: 1
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @l = 10000000000;
+SET @h = 20000000000;
+EXECUTE stmt_biguint USING @l, @h;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta (BIGINT UNSIGNED): $adm_delta
+--echo Expected: 1
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 1000000000000;
+SET @h = 2000000000000;
+EXECUTE stmt_biguint USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta (BIGINT UNSIGNED): $hits_delta
+--echo Expected: 1
+
+DEALLOCATE PREPARE stmt_biguint;
+
+--echo # =======================================================
+--echo # Test 4: Signed vs unsigned boundary values
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_boundary FROM 'SELECT c FROM t_range_unsigned WHERE id BETWEEN ? AND ?';
+
+--echo # 4.1. Start with small unsigned values
+SET @l = 1;
+SET @h = 100;
+EXECUTE stmt_boundary USING @l, @h;
+
+--echo # 4.2. Use values near INT_MAX but still valid for INT UNSIGNED
+--let $fb_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+SET @l = 1000;
+SET @h = 2000;
+EXECUTE stmt_boundary USING @l, @h;
+
+--let $fb_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $fb_delta = `SELECT $fb_after - $fb_before`
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo After high unsigned values:
+--echo   fallback_runtime delta: $fb_delta
+--echo   hits delta: $hits_delta
+--echo Expected: fallback_runtime=0, hits_delta=1 (same type)
+
+DEALLOCATE PREPARE stmt_boundary;
+
+--echo # =======================================================
+--echo # Test 5: Type drift recovery and consistency
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_recovery FROM 'SELECT c FROM t_range_unsigned WHERE id BETWEEN ? AND ?';
+
+--echo # 5.1. First admission with INT
+SET @l = 1;
+SET @h = 10;
+EXECUTE stmt_recovery USING @l, @h;
+
+--echo # 5.2. Trigger drift with BIGINT
+SET @l = 5000000000;
+SET @h = 10000000000;
+EXECUTE stmt_recovery USING @l, @h;
+
+--echo # 5.3. Continue with BIGINT (should stay admitted)
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 6000000000;
+SET @h = 12000000000;
+EXECUTE stmt_recovery USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta (consistent BIGINT UNSIGNED): $hits_delta
+--echo Expected: 1
+
+--echo # 5.4. Drift back to small INT (should trigger another fallback)
+--let $fb_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+SET @l = 1;
+SET @h = 20;
+EXECUTE stmt_recovery USING @l, @h;
+--let $fb_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $fb_delta2 = `SELECT $fb_after2 - $fb_before2`
+--echo fallback_runtime delta (drift back to INT): $fb_delta2
+--echo Expected: 1 (type changed again)
+
+DEALLOCATE PREPARE stmt_recovery;
+
+--echo # =======================================================
+--echo # Test 6: Mixed signed/signed comparison with same numeric value
+--echo # =======================================================
+
+FLUSH STATUS;
+
+CREATE TABLE t_range_signed (
+  id INT PRIMARY KEY,
+  c VARCHAR(32)
+);
+INSERT INTO t_range_signed VALUES
+  (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'),
+  (10, 'e'), (20, 'f'), (30, 'g'), (40, 'h');
+
+PREPARE stmt_signed FROM 'SELECT c FROM t_range_signed WHERE id BETWEEN ? AND ?';
+
+--echo # 6.1. Admit with signed INT
+SET @l = 1;
+SET @h = 10;
+EXECUTE stmt_signed USING @l, @h;
+
+--echo # 6.2. Try values that fit in signed range
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 5;
+SET @h = 20;
+EXECUTE stmt_signed USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta (signed table): $hits_delta
+--echo Expected: 1
+
+DEALLOCATE PREPARE stmt_signed;
+
+--echo # -------------------------------------------------------
+--echo # Final counter summary
+--echo # -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+DROP TABLE t_range_unsigned;
+DROP TABLE t_range_biguint;
+DROP TABLE t_range_signed;
+
+--echo #
+--echo # End of Phase 7 range unsigned type drift test
+--echo #

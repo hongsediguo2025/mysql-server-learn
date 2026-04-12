@@ -44,6 +44,7 @@
 #include "sql/item_func.h"
 #include "sql/join_optimizer/access_path.h"
 #include "sql/key.h"
+#include "sql/range_optimizer/path_helpers.h"
 #include "sql/sql_class.h"
 #include "sql/sql_executor.h"
 #include "sql/sql_lex.h"
@@ -93,6 +94,17 @@ void ps_point_plan_clear_hot_metadata(PsPointPlanTemplate *tpl) {
   tpl->null_rejecting = 0;
   tpl->best_read = 0.0;
   tpl->best_rowcount = 1.0;
+  tpl->range_flag = 0;
+  tpl->range_rkey_func_flag = HA_READ_INVALID;
+  tpl->range_mrr_flags = 0;
+  tpl->range_mrr_buf_size = 0;
+  tpl->range_need_rows_in_rowid_order = false;
+  tpl->range_can_be_used_for_ror = false;
+  tpl->range_can_be_used_for_imerge = false;
+  tpl->range_reuse_handler = false;
+  tpl->range_geometry = false;
+  tpl->range_reverse = false;
+  tpl->range_using_extended_key_parts = false;
   tpl->optimizer_switch = 0;
   tpl->table_ref_version = 0;
   tpl->relevant_sql_mode = 0;
@@ -199,6 +211,47 @@ static bool extract_eq_field_param(Item_func *eq_item, const Table_ref *tbl,
 }
 
 /**
+  Try to extract a single field BETWEEN ? AND ? predicate.
+
+  Accepts only the non-negated canonical form:
+    field BETWEEN ? AND ?
+
+  @param      between_item The BETWEEN item to inspect.
+  @param      tbl          The target table — field must belong to it.
+  @param[out] field_out    Receives the Item_field pointer on success.
+  @param[out] low_out      Receives the lower-bound Item_param on success.
+  @param[out] high_out     Receives the upper-bound Item_param on success.
+  @return true on success, false if pattern does not match.
+*/
+static bool extract_between_field_params(Item_func *between_item,
+                                         const Table_ref *tbl,
+                                         Item_field **field_out,
+                                         Item_param **low_out,
+                                         Item_param **high_out) {
+  if (between_item->functype() != Item_func::BETWEEN) return false;
+  if (between_item->argument_count() != 3) return false;
+
+  auto *between = down_cast<Item_func_between *>(between_item);
+  if (between->negated) return false;
+
+  Item *field_arg = between_item->arguments()[0];
+  Item *low_arg = between_item->arguments()[1];
+  Item *high_arg = between_item->arguments()[2];
+
+  if (field_arg->type() != Item::FIELD_ITEM) return false;
+  if (low_arg->type() != Item::PARAM_ITEM) return false;
+  if (high_arg->type() != Item::PARAM_ITEM) return false;
+
+  Item_field *field = down_cast<Item_field *>(field_arg);
+  if (field->table_ref != tbl) return false;
+
+  *field_out = field;
+  *low_out = down_cast<Item_param *>(low_arg);
+  *high_out = down_cast<Item_param *>(high_arg);
+  return true;
+}
+
+/**
   Classify a freshly prepared statement as a plan-cache candidate.
 
   Called once from Prepared_statement::prepare() (and again on
@@ -286,7 +339,7 @@ bool ps_point_plan_classify(THD *thd, Prepared_statement *stmt) {
 /**
   Extract the WHERE-clause shape and populate template fields.
 
-  Recognizes two supported shapes:
+  Recognizes three supported shapes:
 
   - Shape A (single equality):
     @code WHERE field = ? @endcode
@@ -296,6 +349,10 @@ bool ps_point_plan_classify(THD *thd, Prepared_statement *stmt) {
     @code WHERE f1 = ? AND f2 = ? [AND ...] @endcode
     Represented as Item_cond_and (COND_ITEM) wrapping 2..MAX_PARAMS
     Item_func_eq items.
+
+  - Shape C (simple primary-key range candidate):
+    @code WHERE field BETWEEN ? AND ? @endcode
+    Represented as a top-level Item_func_between (FUNC_ITEM).
 
   For each recognized equality, the Item_param pointer and the
   field's 0-based index within the table are stored in the template
@@ -319,11 +376,26 @@ bool ps_point_plan_extract_where_shape(Query_block *qb,
   tpl->param_count = 0;
 
   if (where->type() == Item::FUNC_ITEM) {
+    Item_func *func = down_cast<Item_func *>(where);
+
+    /* Shape C: simple range candidate  WHERE field BETWEEN ? AND ? */
+    Item_field *between_field = nullptr;
+    Item_param *low = nullptr;
+    Item_param *high = nullptr;
+    if (extract_between_field_params(func, tbl, &between_field, &low, &high)) {
+      tpl->plan_type = PsCachedPlanType::RANGE_PK_BETWEEN;
+      tpl->params[0] = low;
+      tpl->params[1] = high;
+      tpl->field_indices[0] = between_field->field_index;
+      tpl->field_indices[1] = between_field->field_index;
+      tpl->param_count = 2;
+      return true;
+    }
+
     /* Shape A: single equality  WHERE field = ? */
     Item_field *fld = nullptr;
     Item_param *prm = nullptr;
-    if (!extract_eq_field_param(down_cast<Item_func *>(where), tbl, &fld, &prm))
-      return false;
+    if (!extract_eq_field_param(func, tbl, &fld, &prm)) return false;
     tpl->params[0] = prm;
     tpl->field_indices[0] = fld->field_index;
     tpl->param_count = 1;
@@ -359,7 +431,7 @@ bool ps_point_plan_extract_where_shape(Query_block *qb,
     return true;
   }
 
-  /* Unsupported WHERE shape (e.g. BETWEEN, IN, OR, etc.). */
+  /* Unsupported WHERE shape (e.g. IN, OR, mixed predicates, etc.). */
   return false;
 }
 
@@ -551,6 +623,162 @@ bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
   KEY *keyinfo = nullptr;
   if (!ps_point_plan_runtime_guard(thd, stmt, &table, &keyinfo))
     return false;
+
+  if (tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN) {
+    const KEY_PART_INFO *key_part = &keyinfo->key_part[0];
+    const uint key_bytes = key_part->store_length;
+    const key_part_map keypart_map = static_cast<key_part_map>(1);
+
+    QEP_TAB *new_qep_tab;
+    QEP_shared *qs;
+    KEY_PART *used_key_part;
+    QUICK_RANGE **ranges;
+    uchar *min_key;
+    uchar *max_key;
+
+    if (tpl.range_arena_cached) {
+      /*
+        Arena-cached path: reuse QEP_TAB, QEP_shared, KEY_PART,
+        pointer array, key buffers, and store_key objects from the
+        PS arena.  Only QUICK_RANGE + AccessPath are per-execution.
+        Placement-new reinitializes QEP_TAB/QEP_shared to reset
+        one-shot assertions in set_idx()/set_qs().
+      */
+      static_assert(std::is_trivially_destructible<QEP_shared>::value,
+                    "QEP_shared must be trivially destructible for "
+                    "placement-new reuse without explicit dtor call");
+      static_assert(std::is_trivially_destructible<QEP_TAB>::value,
+                    "QEP_TAB must be trivially destructible for "
+                    "placement-new reuse without explicit dtor call");
+
+      new_qep_tab = tpl.cached_range_qep_tab;
+      new (tpl.cached_range_qep_shared) QEP_shared();
+      new (&new_qep_tab[0]) QEP_TAB();
+
+      qs = tpl.cached_range_qep_shared;
+      used_key_part = tpl.cached_range_key_part;
+      ranges = tpl.cached_range_array;
+      min_key = tpl.cached_range_min_key;
+      max_key = tpl.cached_range_max_key;
+
+      tpl.cached_range_to_fields[0]->init(table);
+      tpl.cached_range_to_fields[1]->init(table);
+
+      if (tpl.cached_range_low_store->copy() != store_key::STORE_KEY_OK ||
+          tpl.cached_range_high_store->copy() != store_key::STORE_KEY_OK ||
+          thd->is_error()) {
+        ps_point_plan_mark_runtime_fallback(thd);
+        return false;
+      }
+    } else {
+      /*
+        Slow path: arena cache not available — full per-execution allocation.
+      */
+      const bool nullable = key_part->null_bit != 0;
+
+      min_key = thd->mem_root->ArrayAlloc<uchar>(key_bytes + 1);
+      max_key = thd->mem_root->ArrayAlloc<uchar>(key_bytes + 1);
+      used_key_part = thd->mem_root->ArrayAlloc<KEY_PART>(1);
+      ranges = thd->mem_root->ArrayAlloc<QUICK_RANGE *>(1);
+      new_qep_tab = new (thd->mem_root) QEP_TAB[2];
+      qs = new (thd->mem_root) QEP_shared;
+      if (min_key == nullptr || max_key == nullptr ||
+          used_key_part == nullptr || ranges == nullptr ||
+          new_qep_tab == nullptr || qs == nullptr) {
+        ps_point_plan_mark_runtime_fallback(thd);
+        return false;
+      }
+      memset(min_key, 0, key_bytes + 1);
+      memset(max_key, 0, key_bytes + 1);
+
+      store_key low_store(thd, key_part->field, min_key + nullable,
+                          nullable ? min_key : nullptr, key_part->length,
+                          tpl.params[0]);
+      store_key high_store(thd, key_part->field, max_key + nullable,
+                           nullable ? max_key : nullptr, key_part->length,
+                           tpl.params[1]);
+      if (low_store.copy() != store_key::STORE_KEY_OK ||
+          high_store.copy() != store_key::STORE_KEY_OK || thd->is_error()) {
+        ps_point_plan_mark_runtime_fallback(thd);
+        return false;
+      }
+    }
+
+    if (key_cmp2(&keyinfo->key_part[0], min_key, key_bytes, max_key,
+                 key_bytes) > 0) {
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
+    }
+
+    QUICK_RANGE *range = new (thd->mem_root)
+        QUICK_RANGE(thd->mem_root, min_key, key_bytes, keypart_map, max_key,
+                    key_bytes, keypart_map, tpl.range_flag,
+                    tpl.range_rkey_func_flag);
+    AccessPath *path = new (thd->mem_root) AccessPath{};
+    if (range == nullptr || path == nullptr) {
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
+    }
+    ranges[0] = range;
+    used_key_part[0].key = 0;
+    used_key_part[0].part = 0;
+    used_key_part[0].store_length = key_part->store_length;
+    used_key_part[0].length = key_part->length;
+    used_key_part[0].null_bit = key_part->null_bit;
+    used_key_part[0].flag = key_part->key_part_flag;
+    used_key_part[0].field = key_part->field;
+    used_key_part[0].image_type = Field::itRAW;
+
+    path->type = AccessPath::INDEX_RANGE_SCAN;
+    path->count_examined_rows = true;
+    path->init_cost = 0.0;
+    path->init_once_cost = 0.0;
+    path->cost = path->cost_before_filter = tpl.best_read;
+    path->set_num_output_rows(tpl.best_rowcount);
+    path->num_output_rows_before_filter = tpl.best_rowcount;
+    path->index_range_scan().index = tpl.keyno;
+    path->index_range_scan().num_used_key_parts = 1;
+    path->index_range_scan().used_key_part = used_key_part;
+    path->index_range_scan().ranges = ranges;
+    path->index_range_scan().num_ranges = 1;
+    path->index_range_scan().mrr_flags = tpl.range_mrr_flags;
+    path->index_range_scan().mrr_buf_size = tpl.range_mrr_buf_size;
+    path->index_range_scan().can_be_used_for_ror = tpl.range_can_be_used_for_ror;
+    path->index_range_scan().need_rows_in_rowid_order =
+        tpl.range_need_rows_in_rowid_order;
+    path->index_range_scan().can_be_used_for_imerge =
+        tpl.range_can_be_used_for_imerge;
+    path->index_range_scan().reuse_handler = tpl.range_reuse_handler;
+    path->index_range_scan().geometry = tpl.range_geometry;
+    path->index_range_scan().reverse = tpl.range_reverse;
+    path->index_range_scan().using_extended_key_parts =
+        tpl.range_using_extended_key_parts;
+
+    QEP_TAB *tab = &new_qep_tab[0];
+    tab->set_qs(qs);
+    tab->set_join(join);
+    tab->set_idx(0);
+    tab->set_table(table);
+    tab->table_ref = tpl.table_ref;
+    tab->set_type(JT_RANGE);
+    tab->set_condition(nullptr);
+    tab->set_range_scan(path);
+
+    join->tables = 1;
+    join->primary_tables = 1;
+    join->const_tables = 0;
+    join->best_read = tpl.best_read;
+    join->best_rowcount = static_cast<ha_rows>(tpl.best_rowcount);
+    join->where_cond = nullptr;
+    join->having_cond = nullptr;
+    join->qep_tab = new_qep_tab;
+    join->set_root_access_path(path);
+
+    ps_point_plan_mark_hit(thd);
+    return true;
+  }
+
+  if (tpl.plan_type != PsCachedPlanType::POINT_EQ_REF) return false;
 
   /* --- Phase B: Construct plan in local variables --- */
 
@@ -774,6 +1002,46 @@ bool ps_point_plan_can_admit(Prepared_statement *stmt, JOIN *join) {
 
   const PsPointPlanTemplate &tpl = stmt->ps_point_plan_template();
 
+  if (tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN) {
+    if (tpl.param_count != 2) return false;
+    if (join->primary_tables != 1) return false;
+    if (join->qep_tab == nullptr) return false;
+
+    const QEP_TAB *tab = &join->qep_tab[0];
+    if (tab->type() != JT_RANGE) return false;
+    if (join->having_cond != nullptr) return false;
+
+    TABLE *table = tab->table();
+    if (table == nullptr || table->s == nullptr) return false;
+    if (table->s->primary_key == MAX_KEY) return false;
+
+    AccessPath *range_scan = tab->range_scan();
+    if (range_scan == nullptr) return false;
+    if (range_scan->type != AccessPath::INDEX_RANGE_SCAN) return false;
+    if (used_index(range_scan) != table->s->primary_key) return false;
+    if (get_used_key_parts(range_scan) != 1) return false;
+    if (range_scan->index_range_scan().num_ranges != 1) return false;
+    if (range_scan->index_range_scan().used_key_part == nullptr) return false;
+    if (range_scan->index_range_scan().ranges == nullptr) return false;
+    if (range_scan->index_range_scan().ranges[0] == nullptr) return false;
+
+    KEY_PART *used_key_part = range_scan->index_range_scan().used_key_part;
+    if (used_key_part[0].field == nullptr) return false;
+    if (used_key_part[0].field->field_index() != tpl.field_indices[0])
+      return false;
+
+    const KEY *keyinfo = &table->key_info[table->s->primary_key];
+    if (!(actual_key_flags(keyinfo) & HA_NOSAME)) return false;
+    if (keyinfo->user_defined_key_parts != 1) return false;
+    if (keyinfo->key_part[0].fieldnr - 1 != tpl.field_indices[0]) return false;
+    if (keyinfo->key_part[0].null_bit != 0) return false;
+
+    for (uint i = 0; i < tpl.param_count; i++) {
+      if (tpl.params[i] == nullptr) return false;
+    }
+    return true;
+  }
+
   /*
     Check 1: Table topology.
     primary_tables includes const tables.  join->tables may be larger
@@ -874,6 +1142,128 @@ bool ps_point_plan_can_admit(Prepared_statement *stmt, JOIN *join) {
 */
 void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
   PsPointPlanTemplate &tpl = stmt->ps_point_plan_template();
+
+  if (tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN) {
+    const QEP_TAB *tab = &join->qep_tab[0];
+    TABLE *table = tab->table();
+    AccessPath *range_scan = tab->range_scan();
+    const KEY_PART *used_key_part = range_scan->index_range_scan().used_key_part;
+    const uint keyno = used_index(range_scan);
+    const KEY *keyinfo = &table->key_info[keyno];
+    const uint field_index = used_key_part[0].field->field_index();
+
+    tpl.keyno = keyno;
+    tpl.key_parts = 1;
+    tpl.key_length = keyinfo->key_part[0].store_length;
+    tpl.null_rejecting = 0;
+    tpl.best_read = join->best_read;
+    tpl.best_rowcount = static_cast<double>(join->best_rowcount);
+    tpl.range_flag = range_scan->index_range_scan().ranges[0]->flag;
+    tpl.range_rkey_func_flag =
+        range_scan->index_range_scan().ranges[0]->rkey_func_flag;
+    tpl.range_mrr_flags = range_scan->index_range_scan().mrr_flags;
+    tpl.range_mrr_buf_size = range_scan->index_range_scan().mrr_buf_size;
+    tpl.range_need_rows_in_rowid_order =
+        range_scan->index_range_scan().need_rows_in_rowid_order;
+    tpl.range_can_be_used_for_ror =
+        range_scan->index_range_scan().can_be_used_for_ror;
+    tpl.range_can_be_used_for_imerge =
+        range_scan->index_range_scan().can_be_used_for_imerge;
+    tpl.range_reuse_handler = range_scan->index_range_scan().reuse_handler;
+    tpl.range_geometry = range_scan->index_range_scan().geometry;
+    tpl.range_reverse = range_scan->index_range_scan().reverse;
+    tpl.range_using_extended_key_parts =
+        range_scan->index_range_scan().using_extended_key_parts;
+    tpl.optimizer_switch = ps_point_plan_relevant_optimizer_switch(thd);
+    tpl.table_ref_version = table->s->get_table_ref_version();
+    tpl.relevant_sql_mode = ps_point_plan_relevant_sql_mode(thd);
+    tpl.field_indices[0] = field_index;
+    tpl.field_indices[1] = field_index;
+
+    for (uint i = 0; i < tpl.param_count; i++) {
+      Item_param *prm = tpl.params[i];
+      assert(prm != nullptr);
+      tpl.actual_types[i] = prm->data_type_actual();
+      tpl.unsigned_actuals[i] = prm->is_unsigned_actual();
+      tpl.actual_collations[i] = ps_point_plan_actual_collation(prm);
+    }
+
+    /*
+      Build arena-cached components for the range fast path.
+      Allocates QEP_TAB, QEP_shared, KEY_PART, pointer array, key buffers,
+      and store_key objects (with Field clones) on the PS arena so that
+      HOT executions only need 2 per-execution mem_root allocations
+      (QUICK_RANGE + AccessPath) instead of ~8.
+    */
+    if (!tpl.range_arena_cached) {
+      const bool had_error = thd->is_error();
+      Query_arena backup;
+      thd->swap_query_arena(stmt->m_arena, &backup);
+
+      const uint key_bytes = keyinfo->key_part[0].store_length;
+      bool cache_ok = true;
+
+      QEP_TAB *qt = new (thd->mem_root) QEP_TAB[2];
+      QEP_shared *qs = new (thd->mem_root) QEP_shared;
+      KEY_PART *kp = thd->mem_root->ArrayAlloc<KEY_PART>(1);
+      QUICK_RANGE **ra = thd->mem_root->ArrayAlloc<QUICK_RANGE *>(1);
+      uchar *min_buf = thd->mem_root->ArrayAlloc<uchar>(key_bytes + 1);
+      uchar *max_buf = thd->mem_root->ArrayAlloc<uchar>(key_bytes + 1);
+
+      if (qt == nullptr || qs == nullptr || kp == nullptr || ra == nullptr ||
+          min_buf == nullptr || max_buf == nullptr) {
+        cache_ok = false;
+      }
+
+      store_key *low_sk = nullptr;
+      store_key *high_sk = nullptr;
+      if (cache_ok) {
+        memset(min_buf, 0, key_bytes + 1);
+        memset(max_buf, 0, key_bytes + 1);
+
+        const KEY_PART_INFO *kpi = &keyinfo->key_part[0];
+        Field *orig_field = table->field[tpl.field_indices[0]];
+        const bool nullable = (kpi->null_bit != 0);
+
+        low_sk = new (thd->mem_root)
+            store_key(thd, orig_field, min_buf + nullable,
+                      nullable ? min_buf : nullptr, kpi->length, tpl.params[0]);
+        high_sk = new (thd->mem_root)
+            store_key(thd, orig_field, max_buf + nullable,
+                      nullable ? max_buf : nullptr, kpi->length, tpl.params[1]);
+
+        if (low_sk == nullptr || low_sk->store_field() == nullptr ||
+            high_sk == nullptr || high_sk->store_field() == nullptr ||
+            thd->is_error()) {
+          cache_ok = false;
+        }
+      }
+
+      if (cache_ok) {
+        tpl.cached_range_qep_tab = qt;
+        tpl.cached_range_qep_shared = qs;
+        tpl.cached_range_key_part = kp;
+        tpl.cached_range_array = ra;
+        tpl.cached_range_min_key = min_buf;
+        tpl.cached_range_max_key = max_buf;
+        tpl.cached_range_key_bytes = key_bytes;
+        tpl.cached_range_low_store = low_sk;
+        tpl.cached_range_high_store = high_sk;
+        tpl.cached_range_to_fields[0] = low_sk->store_field();
+        tpl.cached_range_to_fields[1] = high_sk->store_field();
+        tpl.range_arena_cached = true;
+      }
+
+      thd->swap_query_arena(backup, &stmt->m_arena);
+      if (!had_error && thd->is_error()) thd->clear_error();
+    }
+
+    stmt->set_ps_point_plan_state(PsPointPlanState::HOT);
+    stmt->set_ps_point_plan_retryable_cold(false);
+    ps_point_plan_mark_admission(thd);
+    return;
+  }
+
   const QEP_TAB *tab = &join->qep_tab[0];
   const Index_lookup &ref = tab->ref();
   TABLE *table = tab->table();

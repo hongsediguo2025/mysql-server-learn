@@ -1,0 +1,179 @@
+#
+# Phase 7 test: ps_point_plan_cache simple_ranges admission
+# Verifies COLD -> HOT transitions for PK BETWEEN predicates and
+# rejection/recovery behavior for non-target range shapes.
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t_range_adm (
+id INT PRIMARY KEY,
+uk INT NOT NULL,
+k INT NOT NULL,
+c VARCHAR(64),
+UNIQUE KEY idx_uk (uk),
+KEY idx_k (k)
+);
+INSERT INTO t_range_adm VALUES
+(1, 101, 11, 'alpha'),
+(2, 102, 22, 'beta'),
+(3, 103, 33, 'gamma'),
+(4, 104, 44, 'delta');
+CREATE TABLE t_range_comp (
+pk1 INT NOT NULL,
+pk2 INT NOT NULL,
+val VARCHAR(32),
+PRIMARY KEY (pk1, pk2)
+);
+INSERT INTO t_range_comp VALUES
+(1, 10, 'a'),
+(2, 20, 'b'),
+(3, 30, 'c');
+FLUSH STATUS;
+# -------------------------------------------------------
+# 1. PK BETWEEN — admission SUCCESS
+# -------------------------------------------------------
+PREPARE stmt_ra1 FROM 'SELECT * FROM t_range_adm WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_ra1 USING @l, @h;
+id	uk	k	c
+1	101	11	alpha
+2	102	22	beta
+3	103	33	gamma
+admissions delta after PK BETWEEN first execute: 1
+# Second execute should not re-admit
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_ra1 USING @l, @h;
+id	uk	k	c
+2	102	22	beta
+3	103	33	gamma
+4	104	44	delta
+admissions delta after PK BETWEEN second execute: 0
+DEALLOCATE PREPARE stmt_ra1;
+# -------------------------------------------------------
+# 2. Valid empty PK range — admission SUCCESS
+# -------------------------------------------------------
+PREPARE stmt_ra2 FROM 'SELECT * FROM t_range_adm WHERE id BETWEEN ? AND ?';
+SET @l = 90;
+SET @h = 99;
+EXECUTE stmt_ra2 USING @l, @h;
+id	uk	k	c
+admissions delta after empty PK range execute: 1
+DEALLOCATE PREPARE stmt_ra2;
+# -------------------------------------------------------
+# 3. Non-unique secondary range — admission FAILURE
+# -------------------------------------------------------
+PREPARE stmt_ra3 FROM 'SELECT * FROM t_range_adm WHERE k BETWEEN ? AND ?';
+SET @l = 10;
+SET @h = 40;
+EXECUTE stmt_ra3 USING @l, @h;
+id	uk	k	c
+1	101	11	alpha
+2	102	22	beta
+3	103	33	gamma
+admissions delta after secondary range execute: 0
+DEALLOCATE PREPARE stmt_ra3;
+# -------------------------------------------------------
+# 4. Unique but non-PK range — admission FAILURE
+# -------------------------------------------------------
+PREPARE stmt_ra4 FROM 'SELECT * FROM t_range_adm WHERE uk BETWEEN ? AND ?';
+SET @l = 101;
+SET @h = 104;
+EXECUTE stmt_ra4 USING @l, @h;
+id	uk	k	c
+1	101	11	alpha
+2	102	22	beta
+3	103	33	gamma
+4	104	44	delta
+admissions delta after unique non-PK range execute: 0
+DEALLOCATE PREPARE stmt_ra4;
+# -------------------------------------------------------
+# 5. Composite PK prefix range — admission FAILURE
+# -------------------------------------------------------
+PREPARE stmt_ra5 FROM 'SELECT * FROM t_range_comp WHERE pk1 BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_ra5 USING @l, @h;
+pk1	pk2	val
+1	10	a
+2	20	b
+3	30	c
+admissions delta after composite PK prefix range execute: 0
+DEALLOCATE PREPARE stmt_ra5;
+# -------------------------------------------------------
+# 6. NULL low bound on first execute — no admission, stays COLD
+# -------------------------------------------------------
+PREPARE stmt_ra6 FROM 'SELECT * FROM t_range_adm WHERE id BETWEEN ? AND ?';
+SET @l = NULL;
+SET @h = 3;
+EXECUTE stmt_ra6 USING @l, @h;
+id	uk	k	c
+admissions delta after NULL low bound: 0
+# Recovery execute with valid bounds should now admit
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt_ra6 USING @l, @h;
+id	uk	k	c
+1	101	11	alpha
+2	102	22	beta
+admissions delta after NULL low recovery: 1
+DEALLOCATE PREPARE stmt_ra6;
+# -------------------------------------------------------
+# 7. NULL high bound on first execute — no admission, stays COLD
+# -------------------------------------------------------
+PREPARE stmt_ra7 FROM 'SELECT * FROM t_range_adm WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = NULL;
+EXECUTE stmt_ra7 USING @l, @h;
+id	uk	k	c
+admissions delta after NULL high bound: 0
+# Recovery execute with valid bounds should now admit
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_ra7 USING @l, @h;
+id	uk	k	c
+2	102	22	beta
+3	103	33	gamma
+4	104	44	delta
+admissions delta after NULL high recovery: 1
+DEALLOCATE PREPARE stmt_ra7;
+# -------------------------------------------------------
+# 8. low > high on first execute — no admission, stays COLD
+# -------------------------------------------------------
+PREPARE stmt_ra8 FROM 'SELECT * FROM t_range_adm WHERE id BETWEEN ? AND ?';
+SET @l = 4;
+SET @h = 2;
+EXECUTE stmt_ra8 USING @l, @h;
+id	uk	k	c
+admissions delta after inverted bounds: 0
+# Recovery execute with valid bounds should now admit
+SET @l = 1;
+SET @h = 4;
+EXECUTE stmt_ra8 USING @l, @h;
+id	uk	k	c
+1	101	11	alpha
+2	102	22	beta
+3	103	33	gamma
+4	104	44	delta
+admissions delta after inverted bounds recovery: 1
+DEALLOCATE PREPARE stmt_ra8;
+# -------------------------------------------------------
+# 9. Final counter summary
+# -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admissions	5
+Ps_point_plan_cache_cold_classifications	8
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	1
+Ps_point_plan_cache_invalidations	0
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t_range_comp;
+DROP TABLE t_range_adm;
+#
+# End of Phase 7 range admission test
+#

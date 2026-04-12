@@ -1,0 +1,267 @@
+--echo #
+--echo # Phase 7 test: ps_point_plan_cache simple_ranges edge cases
+--echo # Covers runtime fallback, type/environment drift, sysvar bypass,
+--echo # and DDL reprepare for RANGE_PK_BETWEEN statements.
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+CREATE TABLE t_range_edge (
+  id INT PRIMARY KEY,
+  c VARCHAR(32)
+);
+INSERT INTO t_range_edge VALUES
+  (1, 'a'),
+  (2, 'b'),
+  (3, 'c'),
+  (4, 'd');
+
+--echo # =======================================================
+--echo # A. NULL low bound on HOT statement
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_re_a FROM 'SELECT c FROM t_range_edge WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_re_a USING @l, @h;
+
+--let $fb_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = NULL;
+SET @h = 3;
+EXECUTE stmt_re_a USING @l, @h;
+--let $fb_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $fb_delta = `SELECT $fb_after - $fb_before`
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo fallback_runtime delta after NULL low bound: $fb_delta
+--echo hits delta after NULL low bound: $hits_delta
+
+--let $hits_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_re_a USING @l, @h;
+--let $hits_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta2 = `SELECT $hits_after2 - $hits_before2`
+--echo hits delta after NULL low recovery: $hits_delta2
+
+DEALLOCATE PREPARE stmt_re_a;
+
+--echo # =======================================================
+--echo # B. NULL high bound on HOT statement
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_re_b FROM 'SELECT c FROM t_range_edge WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 4;
+EXECUTE stmt_re_b USING @l, @h;
+
+--let $fb_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 2;
+SET @h = NULL;
+EXECUTE stmt_re_b USING @l, @h;
+--let $fb_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $fb_delta = `SELECT $fb_after - $fb_before`
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo fallback_runtime delta after NULL high bound: $fb_delta
+--echo hits delta after NULL high bound: $hits_delta
+
+--let $hits_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt_re_b USING @l, @h;
+--let $hits_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta2 = `SELECT $hits_after2 - $hits_before2`
+--echo hits delta after NULL high recovery: $hits_delta2
+
+DEALLOCATE PREPARE stmt_re_b;
+
+--echo # =======================================================
+--echo # C. Inverted bounds on HOT statement
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_re_c FROM 'SELECT c FROM t_range_edge WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 4;
+EXECUTE stmt_re_c USING @l, @h;
+
+--let $fb_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 4;
+SET @h = 2;
+EXECUTE stmt_re_c USING @l, @h;
+--let $fb_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $fb_delta = `SELECT $fb_after - $fb_before`
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo fallback_runtime delta after inverted bounds: $fb_delta
+--echo hits delta after inverted bounds: $hits_delta
+
+--let $hits_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 2;
+SET @h = 3;
+EXECUTE stmt_re_c USING @l, @h;
+--let $hits_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta2 = `SELECT $hits_after2 - $hits_before2`
+--echo hits delta after inverted-bounds recovery: $hits_delta2
+
+DEALLOCATE PREPARE stmt_re_c;
+
+--echo # =======================================================
+--echo # D. Parameter type drift — fallback + re-admit on current EXECUTE
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_re_d FROM 'SELECT c FROM t_range_edge WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_re_d USING @l, @h;
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $fb_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = '2';
+SET @h = '4';
+EXECUTE stmt_re_d USING @l, @h;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $fb_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--let $fb_delta = `SELECT $fb_after - $fb_before`
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo admissions delta after string type drift: $adm_delta
+--echo fallback_runtime delta after string type drift: $fb_delta
+--echo hits delta after string type drift: $hits_delta
+
+--let $hits_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = '1';
+SET @h = '2';
+EXECUTE stmt_re_d USING @l, @h;
+--let $hits_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta2 = `SELECT $hits_after2 - $hits_before2`
+--echo hits delta after same-type post-drift execute: $hits_delta2
+
+DEALLOCATE PREPARE stmt_re_d;
+
+--echo # =======================================================
+--echo # E. Session sysvar OFF/ON bypasses and resumes hot path
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_re_e FROM 'SELECT c FROM t_range_edge WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_re_e USING @l, @h;
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET SESSION ps_point_plan_cache = OFF;
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_re_e USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta with ps_point_plan_cache OFF: $hits_delta
+
+SET SESSION ps_point_plan_cache = ON;
+--let $hits_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt_re_e USING @l, @h;
+--let $hits_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta2 = `SELECT $hits_after2 - $hits_before2`
+--echo hits delta after re-enabling ps_point_plan_cache: $hits_delta2
+
+DEALLOCATE PREPARE stmt_re_e;
+
+--echo # =======================================================
+--echo # F. DDL reprepare — re-admit then hit again
+--echo # =======================================================
+
+FLUSH STATUS;
+
+PREPARE stmt_re_f FROM 'SELECT c FROM t_range_edge WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_re_f USING @l, @h;
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+ALTER TABLE t_range_edge ADD COLUMN extra INT DEFAULT 0;
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_re_f USING @l, @h;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta after DDL reprepare execute: $adm_delta
+
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt_re_f USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after DDL recovery execute: $hits_delta
+
+ALTER TABLE t_range_edge DROP COLUMN extra;
+DEALLOCATE PREPARE stmt_re_f;
+
+--echo # =======================================================
+--echo # G. optimizer_switch drift — fallback + re-admit
+--echo # =======================================================
+
+FLUSH STATUS;
+
+SET SESSION optimizer_switch='use_invisible_indexes=on';
+PREPARE stmt_re_g FROM 'SELECT c FROM t_range_edge WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_re_g USING @l, @h;
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $fb_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET SESSION optimizer_switch='use_invisible_indexes=off';
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_re_g USING @l, @h;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $fb_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--let $fb_delta = `SELECT $fb_after - $fb_before`
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo admissions delta after optimizer_switch drift execute: $adm_delta
+--echo fallback_runtime delta after optimizer_switch drift execute: $fb_delta
+--echo hits delta after optimizer_switch drift execute: $hits_delta
+
+--let $hits_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt_re_g USING @l, @h;
+--let $hits_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta2 = `SELECT $hits_after2 - $hits_before2`
+--echo hits delta after stable optimizer_switch execute: $hits_delta2
+
+DEALLOCATE PREPARE stmt_re_g;
+SET SESSION optimizer_switch='default';
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+SET SESSION ps_point_plan_cache = ON;
+DROP TABLE t_range_edge;
+
+--echo #
+--echo # End of Phase 7 range edge-case test
+--echo #

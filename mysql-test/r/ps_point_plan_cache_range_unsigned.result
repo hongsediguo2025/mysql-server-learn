@@ -1,0 +1,233 @@
+#
+# Phase 7 test: ps_point_plan_cache simple_ranges unsigned type drift
+# Verifies that unsigned parameter type drift is properly detected
+# and triggers runtime fallback with re-admission.
+#
+# Run: mtr --ps-protocol ps_point_plan_cache_range_unsigned
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t_range_unsigned (
+id INT UNSIGNED PRIMARY KEY,
+c VARCHAR(32)
+);
+INSERT INTO t_range_unsigned VALUES
+(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'),
+(10, 'e'), (20, 'f'), (30, 'g'), (40, 'h'),
+(100, 'i'), (200, 'j'), (1000, 'k'), (2000, 'l');
+FLUSH STATUS;
+# =======================================================
+# Test 1: Normal INT UNSIGNED range - should admit
+# =======================================================
+# 1.1. PREPARE and admit with INT UNSIGNED params
+PREPARE stmt_unsigned FROM 'SELECT c FROM t_range_unsigned WHERE id BETWEEN ? AND ?';
+cold_delta (INT UNSIGNED): 1
+Expected: 1
+SET @l = 1;
+SET @h = 10;
+EXECUTE stmt_unsigned USING @l, @h;
+c
+a
+b
+c
+d
+e
+admissions delta (INT UNSIGNED): 1
+Expected: 1
+SET @l = 5;
+SET @h = 20;
+EXECUTE stmt_unsigned USING @l, @h;
+c
+e
+f
+hits delta (INT UNSIGNED): 1
+Expected: 1
+DEALLOCATE PREPARE stmt_unsigned;
+# =======================================================
+# Test 2: Type drift from INT to BIGINT UNSIGNED
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_drift1 FROM 'SELECT c FROM t_range_unsigned WHERE id BETWEEN ? AND ?';
+# 2.1. Admit with normal INT values
+SET @l = 1;
+SET @h = 5;
+EXECUTE stmt_drift1 USING @l, @h;
+c
+a
+b
+c
+d
+# 2.2. Trigger type drift with BIGINT UNSIGNED value
+SET @l = 10000000000;
+SET @h = 20000000000;
+EXECUTE stmt_drift1 USING @l, @h;
+c
+After BIGINT UNSIGNED type drift:
+fallback_runtime delta: 1
+hits delta: 0
+Expected: fallback_runtime > 0, hits_delta = 0
+# 2.3. Re-admit with same BIGINT UNSIGNED type
+SET @l = 10000000000;
+SET @h = 15000000000;
+EXECUTE stmt_drift1 USING @l, @h;
+c
+admissions delta (re-admit BIGINT UNSIGNED): 0
+Expected: 1 (re-admitted with new type)
+DEALLOCATE PREPARE stmt_drift1;
+# =======================================================
+# Test 3: BIGINT UNSIGNED table with BIGINT params
+# =======================================================
+FLUSH STATUS;
+CREATE TABLE t_range_biguint (
+id BIGINT UNSIGNED PRIMARY KEY,
+c VARCHAR(32)
+);
+INSERT INTO t_range_biguint VALUES
+(1, 'a'), (2, 'b'), (3, 'c'),
+(10000000000, 'd'), (20000000000, 'e'),
+(1000000000000, 'f'), (2000000000000, 'g');
+# 3.1. PREPARE and admit with BIGINT UNSIGNED values
+PREPARE stmt_biguint FROM 'SELECT c FROM t_range_biguint WHERE id BETWEEN ? AND ?';
+cold_delta (BIGINT UNSIGNED table): 1
+Expected: 1
+SET @l = 10000000000;
+SET @h = 20000000000;
+EXECUTE stmt_biguint USING @l, @h;
+c
+d
+e
+admissions delta (BIGINT UNSIGNED): 1
+Expected: 1
+SET @l = 1000000000000;
+SET @h = 2000000000000;
+EXECUTE stmt_biguint USING @l, @h;
+c
+f
+g
+hits delta (BIGINT UNSIGNED): 1
+Expected: 1
+DEALLOCATE PREPARE stmt_biguint;
+# =======================================================
+# Test 4: Signed vs unsigned boundary values
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_boundary FROM 'SELECT c FROM t_range_unsigned WHERE id BETWEEN ? AND ?';
+# 4.1. Start with small unsigned values
+SET @l = 1;
+SET @h = 100;
+EXECUTE stmt_boundary USING @l, @h;
+c
+a
+b
+c
+d
+e
+f
+g
+h
+i
+# 4.2. Use values near INT_MAX but still valid for INT UNSIGNED
+SET @l = 1000;
+SET @h = 2000;
+EXECUTE stmt_boundary USING @l, @h;
+c
+k
+l
+After high unsigned values:
+fallback_runtime delta: 0
+hits delta: 1
+Expected: fallback_runtime=0, hits_delta=1 (same type)
+DEALLOCATE PREPARE stmt_boundary;
+# =======================================================
+# Test 5: Type drift recovery and consistency
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_recovery FROM 'SELECT c FROM t_range_unsigned WHERE id BETWEEN ? AND ?';
+# 5.1. First admission with INT
+SET @l = 1;
+SET @h = 10;
+EXECUTE stmt_recovery USING @l, @h;
+c
+a
+b
+c
+d
+e
+# 5.2. Trigger drift with BIGINT
+SET @l = 5000000000;
+SET @h = 10000000000;
+EXECUTE stmt_recovery USING @l, @h;
+c
+# 5.3. Continue with BIGINT (should stay admitted)
+SET @l = 6000000000;
+SET @h = 12000000000;
+EXECUTE stmt_recovery USING @l, @h;
+c
+hits delta (consistent BIGINT UNSIGNED): 0
+Expected: 1
+# 5.4. Drift back to small INT (should trigger another fallback)
+SET @l = 1;
+SET @h = 20;
+EXECUTE stmt_recovery USING @l, @h;
+c
+a
+b
+c
+d
+e
+f
+fallback_runtime delta (drift back to INT): 0
+Expected: 1 (type changed again)
+DEALLOCATE PREPARE stmt_recovery;
+# =======================================================
+# Test 6: Mixed signed/signed comparison with same numeric value
+# =======================================================
+FLUSH STATUS;
+CREATE TABLE t_range_signed (
+id INT PRIMARY KEY,
+c VARCHAR(32)
+);
+INSERT INTO t_range_signed VALUES
+(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'),
+(10, 'e'), (20, 'f'), (30, 'g'), (40, 'h');
+PREPARE stmt_signed FROM 'SELECT c FROM t_range_signed WHERE id BETWEEN ? AND ?';
+# 6.1. Admit with signed INT
+SET @l = 1;
+SET @h = 10;
+EXECUTE stmt_signed USING @l, @h;
+c
+a
+b
+c
+d
+e
+# 6.2. Try values that fit in signed range
+SET @l = 5;
+SET @h = 20;
+EXECUTE stmt_signed USING @l, @h;
+c
+e
+f
+hits delta (signed table): 1
+Expected: 1
+DEALLOCATE PREPARE stmt_signed;
+# -------------------------------------------------------
+# Final counter summary
+# -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admissions	1
+Ps_point_plan_cache_cold_classifications	1
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	1
+Ps_point_plan_cache_invalidations	0
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t_range_unsigned;
+DROP TABLE t_range_biguint;
+DROP TABLE t_range_signed;
+#
+# End of Phase 7 range unsigned type drift test
+#

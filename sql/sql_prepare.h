@@ -511,6 +511,19 @@ class Prepared_statement final {
     m_ps_pc.cached_ref_items = nullptr;
     m_ps_pc.cached_cond_guards = nullptr;
 
+    m_ps_pc.range_arena_cached = false;
+    m_ps_pc.cached_range_low_store = nullptr;
+    m_ps_pc.cached_range_high_store = nullptr;
+    m_ps_pc.cached_range_to_fields[0] = nullptr;
+    m_ps_pc.cached_range_to_fields[1] = nullptr;
+    m_ps_pc.cached_range_key_part = nullptr;
+    m_ps_pc.cached_range_array = nullptr;
+    m_ps_pc.cached_range_min_key = nullptr;
+    m_ps_pc.cached_range_max_key = nullptr;
+    m_ps_pc.cached_range_key_bytes = 0;
+    m_ps_pc.cached_range_qep_tab = nullptr;
+    m_ps_pc.cached_range_qep_shared = nullptr;
+
     m_ps_pc_cursor_execution = false;
     m_ps_pc_retryable_cold = false;
   }

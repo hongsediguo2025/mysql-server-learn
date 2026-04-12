@@ -1,0 +1,178 @@
+#
+# Phase 7 test: ps_point_plan_cache simple_ranges MRR modes
+# Verifies behavior under different MRR (Multi-Range Read) settings:
+# - Default MRR
+# - MRR disabled
+# - MRR forced
+#
+# Run: mtr --ps-protocol ps_point_plan_cache_range_mrr
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t_range_mrr (
+id INT PRIMARY KEY,
+c VARCHAR(64)
+);
+INSERT INTO t_range_mrr VALUES
+(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e'),
+(10, 'j'), (20, 't'), (30, 'u'), (40, 'v'), (50, 'w'),
+(100, 'x'), (200, 'y'), (300, 'z'), (400, 'aa'), (500, 'bb');
+FLUSH STATUS;
+# =======================================================
+# Test 1: Default MRR settings - should work normally
+# =======================================================
+# 1.1. Check current MRR status
+PREPARE stmt_mrr_default FROM 'SELECT c FROM t_range_mrr WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 5;
+EXECUTE stmt_mrr_default USING @l, @h;
+c
+a
+b
+c
+d
+e
+admissions delta (default MRR): 1
+Expected: 1
+SET @l = 10;
+SET @h = 50;
+EXECUTE stmt_mrr_default USING @l, @h;
+c
+j
+t
+u
+v
+w
+hits delta (default MRR): 1
+Expected: 1
+DEALLOCATE PREPARE stmt_mrr_default;
+# =======================================================
+# Test 2: MRR disabled via optimizer_switch - should still work (cached MRR flags)
+# =======================================================
+FLUSH STATUS;
+SET @save_mrr_off = @@session.optimizer_switch;
+SET SESSION optimizer_switch='mrr=off';
+PREPARE stmt_mrr_off FROM 'SELECT c FROM t_range_mrr WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 5;
+EXECUTE stmt_mrr_off USING @l, @h;
+c
+a
+b
+c
+d
+e
+admissions delta (MRR off): 1
+Expected: 1 (uses cached MRR flags, not current setting)
+SET @l = 10;
+SET @h = 50;
+EXECUTE stmt_mrr_off USING @l, @h;
+c
+j
+t
+u
+v
+w
+hits delta (MRR off): 1
+Expected: 1
+SET SESSION optimizer_switch=@save_mrr_off;
+DEALLOCATE PREPARE stmt_mrr_off;
+# =======================================================
+# Test 3: MRR cost-based disabled - should still work (cached MRR flags)
+# =======================================================
+FLUSH STATUS;
+SET @save_mrr_force = @@session.optimizer_switch;
+SET SESSION optimizer_switch='mrr_cost_based=off';
+PREPARE stmt_mrr_force FROM 'SELECT c FROM t_range_mrr WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 5;
+EXECUTE stmt_mrr_force USING @l, @h;
+c
+a
+b
+c
+d
+e
+admissions delta (MRR forced): 1
+Expected: 1 (uses cached MRR flags, not current setting)
+SET @l = 10;
+SET @h = 50;
+EXECUTE stmt_mrr_force USING @l, @h;
+c
+j
+t
+u
+v
+w
+hits delta (MRR force): 1
+Expected: 1
+SET SESSION optimizer_switch=@save_mrr_force;
+DEALLOCATE PREPARE stmt_mrr_force;
+# =======================================================
+# Test 4: MRR buffer size variations
+# =======================================================
+FLUSH STATUS;
+SET @save_mrr_buf = @@session.read_rnd_buffer_size;
+SET SESSION read_rnd_buffer_size = 262144;
+PREPARE stmt_mrr_buf FROM 'SELECT c FROM t_range_mrr WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 5;
+EXECUTE stmt_mrr_buf USING @l, @h;
+c
+a
+b
+c
+d
+e
+admissions delta (custom MRR buffer): 1
+Expected: 1 (uses cached MRR flags, not current setting)
+SET SESSION read_rnd_buffer_size = @save_mrr_buf;
+DEALLOCATE PREPARE stmt_mrr_buf;
+# =======================================================
+# Test 5: Verify MRR flags are cached (not re-read)
+# =======================================================
+FLUSH STATUS;
+# 5.1. Admit with default MRR settings
+PREPARE stmt_mrr_verify FROM 'SELECT c FROM t_range_mrr WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_mrr_verify USING @l, @h;
+c
+a
+b
+c
+# 5.2. Change MRR settings after admission
+SET SESSION optimizer_switch='mrr=off';
+SET SESSION read_rnd_buffer_size = 131072;
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_mrr_verify USING @l, @h;
+c
+b
+c
+d
+After MRR change (should use cached flags):
+fallback_runtime delta: 0
+hits delta: 1
+Expected: fallback_runtime=0, hits_delta=1 (cached flags used)
+SET SESSION optimizer_switch=default;
+SET SESSION read_rnd_buffer_size = default;
+DEALLOCATE PREPARE stmt_mrr_verify;
+# -------------------------------------------------------
+# Final counter summary
+# -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admissions	1
+Ps_point_plan_cache_cold_classifications	1
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	1
+Ps_point_plan_cache_invalidations	0
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t_range_mrr;
+#
+# End of Phase 7 range MRR modes test
+#

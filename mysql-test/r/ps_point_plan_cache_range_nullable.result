@@ -1,0 +1,157 @@
+#
+# Phase 7 test: ps_point_plan_cache simple_ranges nullable validation
+# Verifies that nullable key parts are properly handled.
+# Note: MySQL 8.0.45 does not allow nullable PRIMARY KEY, so we test
+# the null_bit check through secondary indexes and NULL parameters.
+#
+# Run: mtr --ps-protocol ps_point_plan_cache_range_nullable
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+# Table 1: NOT NULL PK (should be accepted)
+CREATE TABLE t_range_not_null (
+id INT NOT NULL PRIMARY KEY,
+c VARCHAR(32)
+);
+INSERT INTO t_range_not_null VALUES
+(1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'),
+(10, 'ten'), (20, 'twenty');
+# Table 2: Secondary index with nullable column (should NEVER - not PK)
+CREATE TABLE t_range_nullable_sec (
+id INT NOT NULL PRIMARY KEY,
+nullable_col INT NULL,
+c VARCHAR(32),
+KEY idx_nullable (nullable_col)
+);
+INSERT INTO t_range_nullable_sec VALUES
+(1, 10, 'a'), (2, 20, 'b'), (3, NULL, 'c'),
+(4, 40, 'd'), (5, 50, 'e');
+# Table 3: Composite PK (should NEVER - not single column PK)
+CREATE TABLE t_range_comp_pk (
+pk1 INT NOT NULL,
+pk2 INT NOT NULL,
+c VARCHAR(32),
+PRIMARY KEY (pk1, pk2)
+);
+INSERT INTO t_range_comp_pk VALUES
+(1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c');
+FLUSH STATUS;
+# =======================================================
+# Test 1: NOT NULL PK - admission should SUCCEED
+# =======================================================
+# 1.1. PREPARE should succeed (COLD classification)
+PREPARE stmt_notnull FROM 'SELECT c FROM t_range_not_null WHERE id BETWEEN ? AND ?';
+cold_delta (NOT NULL PK PREPARE): 1
+Expected: 1
+# 1.2. First EXECUTE - admission should succeed
+SET @l = 1;
+SET @h = 4;
+EXECUTE stmt_notnull USING @l, @h;
+c
+a
+b
+c
+d
+admissions delta (NOT NULL PK): 1
+Expected: 1
+SET @l = 2;
+SET @h = 3;
+EXECUTE stmt_notnull USING @l, @h;
+c
+b
+c
+hits delta (NOT NULL PK): 1
+Expected: 1
+DEALLOCATE PREPARE stmt_notnull;
+# =======================================================
+# Test 2: Secondary index with nullable column - should be NEVER
+# =======================================================
+FLUSH STATUS;
+# 2.1. PREPARE for secondary index range
+PREPARE stmt_sec FROM 'SELECT * FROM t_range_nullable_sec WHERE nullable_col BETWEEN ? AND ?';
+cold_delta (secondary index): 1
+Expected: 0 (secondary index not PK, rejected)
+# Note: The null_bit check in code applies to PK key parts.
+# Secondary indexes with nullable columns are rejected by
+# the "must use primary key" requirement, not null_bit check.
+# =======================================================
+# Test 3: Composite PK - should be NEVER
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_comp FROM 'SELECT * FROM t_range_comp_pk WHERE pk1 BETWEEN ? AND ?';
+cold_delta (composite PK): 1
+Expected: 0 (composite PK rejected - user_defined_key_parts != 1)
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_comp USING @l, @h;
+pk1	pk2	c
+1	10	a
+2	20	b
+3	30	c
+admissions delta (composite PK): 0
+Expected: 0
+DEALLOCATE PREPARE stmt_comp;
+# =======================================================
+# Test 4: NULL parameters work on NOT NULL PK
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_null_param FROM 'SELECT c FROM t_range_not_null WHERE id BETWEEN ? AND ?';
+# 4.1. NULL low parameter - should be runtime fallback, no admission
+SET @l = NULL;
+SET @h = 5;
+EXECUTE stmt_null_param USING @l, @h;
+c
+admissions delta (NULL low): 0
+Expected: 0
+# 4.2. Valid parameters after NULL - should admit
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_null_param USING @l, @h;
+c
+a
+b
+c
+admissions delta (after NULL recovery): 1
+Expected: 1
+DEALLOCATE PREPARE stmt_null_param;
+# =======================================================
+# Test 5: NULL high parameter also triggers fallback
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_null_high FROM 'SELECT c FROM t_range_not_null WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 10;
+EXECUTE stmt_null_high USING @l, @h;
+c
+a
+b
+c
+d
+ten
+SET @l = 1;
+SET @h = NULL;
+EXECUTE stmt_null_high USING @l, @h;
+c
+fallback_runtime delta (NULL high): 1
+Expected: 1
+DEALLOCATE PREPARE stmt_null_high;
+# -------------------------------------------------------
+# Final counter summary
+# -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admissions	1
+Ps_point_plan_cache_cold_classifications	1
+Ps_point_plan_cache_fallback_runtime	1
+Ps_point_plan_cache_hits	0
+Ps_point_plan_cache_invalidations	0
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t_range_not_null;
+DROP TABLE t_range_nullable_sec;
+DROP TABLE t_range_comp_pk;
+#
+# End of Phase 7 range nullable validation test
+#

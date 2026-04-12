@@ -1,0 +1,209 @@
+--echo #
+--echo # Phase 7 test: ps_point_plan_cache range and point-query coexistence
+--echo # Verifies that range PS and point-query PS can coexist on the same table
+--echo # without interfering with each other's arena caches or templates.
+--echo #
+--echo # Run: mtr --ps-protocol ps_point_plan_cache_range_cross_type
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+CREATE TABLE t_range_cross (
+  id INT PRIMARY KEY,
+  k INT NOT NULL,
+  c VARCHAR(64)
+);
+INSERT INTO t_range_cross VALUES
+  (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd'),
+  (5, 50, 'e'), (10, 100, 'f'), (11, 110, 'g'), (12, 120, 'h'),
+  (15, 150, 'i'), (20, 200, 'j'), (25, 250, 'k'), (30, 300, 'l');
+
+FLUSH STATUS;
+
+--echo # =======================================================
+--echo # Test 1: Point query PS then range PS on same table
+--echo # =======================================================
+
+--echo # 1.1. Point query PS first
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_point1 FROM 'SELECT * FROM t_range_cross WHERE id = ?';
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta (point query): $cold_delta
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @id = 5;
+EXECUTE stmt_point1 USING @id;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta (point query): $adm_delta
+
+--echo # 1.2. Range PS on same table - independent classification
+--let $cold_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_range1 FROM 'SELECT c FROM t_range_cross WHERE id BETWEEN ? AND ?';
+--let $cold_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta2 = `SELECT $cold_after2 - $cold_before2`
+--echo cold_delta (range PS): $cold_delta2
+
+--let $adm_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_range1 USING @l, @h;
+--let $adm_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta2 = `SELECT $adm_after2 - $adm_before2`
+--echo admissions delta (range PS): $adm_delta2
+
+--echo # 1.3. Both should hit independently
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @id = 10;
+EXECUTE stmt_point1 USING @id;
+
+SET @l = 5;
+SET @h = 8;
+EXECUTE stmt_range1 USING @l, @h;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta (both types): $hits_delta
+--echo Expected: 2
+
+DEALLOCATE PREPARE stmt_point1;
+DEALLOCATE PREPARE stmt_range1;
+
+--echo # =======================================================
+--echo # Test 2: Range PS first, then point query PS
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 2.1. Range PS first
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_range2 FROM 'SELECT c FROM t_range_cross WHERE id BETWEEN ? AND ?';
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta (range PS first): $cold_delta
+
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @l = 10;
+SET @h = 20;
+EXECUTE stmt_range2 USING @l, @h;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions delta (range PS): $adm_delta
+
+--echo # 2.2. Point query PS on same table
+--let $cold_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_point2 FROM 'SELECT * FROM t_range_cross WHERE id = ?';
+--let $cold_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta2 = `SELECT $cold_after2 - $cold_before2`
+--echo cold_delta (point query second): $cold_delta2
+
+--let $adm_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+SET @id = 15;
+EXECUTE stmt_point2 USING @id;
+--let $adm_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta2 = `SELECT $adm_after2 - $adm_before2`
+--echo admissions delta (point query): $adm_delta2
+
+--echo # 2.3. Both should hit independently
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @l = 15;
+SET @h = 18;
+EXECUTE stmt_range2 USING @l, @h;
+
+SET @id = 25;
+EXECUTE stmt_point2 USING @id;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta (both types swapped order): $hits_delta
+--echo Expected: 2
+
+DEALLOCATE PREPARE stmt_point2;
+DEALLOCATE PREPARE stmt_range2;
+
+--echo # =======================================================
+--echo # Test 3: Type drift on range PS doesn't affect point query PS
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 3.1. Prepare and admit both
+PREPARE stmt_range_drift FROM 'SELECT c FROM t_range_cross WHERE id BETWEEN ? AND ?';
+PREPARE stmt_point_drift FROM 'SELECT * FROM t_range_cross WHERE id = ?';
+
+SET @l = 1;
+SET @h = 5;
+EXECUTE stmt_range_drift USING @l, @h;
+
+SET @id = 10;
+EXECUTE stmt_point_drift USING @id;
+
+--echo # 3.2. Trigger type drift on range PS (INT to BIGINT)
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $fb_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+SET @l = '100000000000';
+SET @h = '200000000000';
+EXECUTE stmt_range_drift USING @l, @h;
+--let $fb_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $fb_delta = `SELECT $fb_after - $fb_before`
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo After range PS type drift:
+--echo   fallback_runtime delta: $fb_delta
+--echo   hits delta: $hits_delta
+--echo Expected: fallback_runtime > 0, hits_delta = 0
+
+--echo # 3.3. Point query PS should still work
+SET @id = 20;
+EXECUTE stmt_point_drift USING @id;
+--let $hits_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta2 = `SELECT $hits_after2 - $hits_after`
+--echo hits delta (point PS unaffected): $hits_delta2
+--echo Expected: 1
+
+DEALLOCATE PREPARE stmt_range_drift;
+DEALLOCATE PREPARE stmt_point_drift;
+
+--echo # =======================================================
+--echo # Test 4: Composite equality PS with range PS
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 4.1. Point query PS now
+--let $cold_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_comp FROM 'SELECT * FROM t_range_cross WHERE id = ? AND k = ?';
+--let $cold_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta = `SELECT $cold_after - $cold_before`
+--echo cold_delta (composite equality): $cold_delta
+
+SET @id = 5;
+SET @k = 50;
+EXECUTE stmt_comp USING @id, @k;
+
+--echo # 4.2. Range PS - should be independent
+--let $cold_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_range_comp FROM 'SELECT c FROM t_range_cross WHERE id BETWEEN ? AND ?';
+--let $cold_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $cold_delta2 = `SELECT $cold_after2 - $cold_before2`
+--echo cold_delta (range with composite point present): $cold_delta2
+
+DEALLOCATE PREPARE stmt_comp;
+DEALLOCATE PREPARE stmt_range_comp;
+
+--echo # -------------------------------------------------------
+--echo # Final counter summary
+--echo # -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+DROP TABLE t_range_cross;
+
+--echo #
+--echo # End of Phase 7 range cross-type coexistence test
+--echo #

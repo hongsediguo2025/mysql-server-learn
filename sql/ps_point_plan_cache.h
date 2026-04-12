@@ -60,6 +60,8 @@ class KEY;
 class QEP_shared;
 class QEP_TAB;
 class store_key;
+struct KEY_PART;
+struct QUICK_RANGE;
 struct TABLE;
 
 /**
@@ -193,6 +195,39 @@ struct PsPointPlanTemplate {
   /// Optimizer's best_rowcount estimate (cast from ha_rows).
   double best_rowcount{1.0};
 
+  /// Cached QUICK_RANGE::flag for RANGE_PK_BETWEEN.
+  uint16 range_flag{0};
+
+  /// Cached QUICK_RANGE::rkey_func_flag for RANGE_PK_BETWEEN.
+  enum ha_rkey_function range_rkey_func_flag{HA_READ_INVALID};
+
+  /// Cached MRR flags from the admitted INDEX_RANGE_SCAN path.
+  unsigned range_mrr_flags{0};
+
+  /// Cached MRR buffer size from the admitted INDEX_RANGE_SCAN path.
+  unsigned range_mrr_buf_size{0};
+
+  /// Cached INDEX_RANGE_SCAN row-order requirement.
+  bool range_need_rows_in_rowid_order{false};
+
+  /// Cached INDEX_RANGE_SCAN ROR capability.
+  bool range_can_be_used_for_ror{false};
+
+  /// Cached INDEX_RANGE_SCAN index-merge capability.
+  bool range_can_be_used_for_imerge{false};
+
+  /// Cached INDEX_RANGE_SCAN handler reuse flag.
+  bool range_reuse_handler{false};
+
+  /// Cached INDEX_RANGE_SCAN geometry flag.
+  bool range_geometry{false};
+
+  /// Cached INDEX_RANGE_SCAN reverse-scan flag.
+  bool range_reverse{false};
+
+  /// Cached INDEX_RANGE_SCAN extended-keyparts flag.
+  bool range_using_extended_key_parts{false};
+
   /// Relevant optimizer_switch bits captured at admission time.
   ulonglong optimizer_switch{0};
 
@@ -261,6 +296,43 @@ struct PsPointPlanTemplate {
 
   /// True when the QEP skeleton above is populated and usable.
   bool qep_cached{false};
+
+  /*
+    --- Phase 7b: Arena-cached range fast-path components ---
+    Allocated on PS m_arena during RANGE_PK_BETWEEN admission.
+    Reused across HOT executions to reduce per-execution mem_root
+    allocations from ~8 to 2 (only QUICK_RANGE + AccessPath remain
+    per-execution).
+  */
+
+  /// Arena-cached store_key for BETWEEN low bound.
+  store_key *cached_range_low_store{nullptr};
+  /// Arena-cached store_key for BETWEEN high bound.
+  store_key *cached_range_high_store{nullptr};
+
+  /// Arena-cached Field clones inside range store_keys (for re-patching table ptr).
+  Field *cached_range_to_fields[2]{};
+
+  /// Arena-cached KEY_PART for range fast path.
+  KEY_PART *cached_range_key_part{nullptr};
+
+  /// Arena-cached QUICK_RANGE pointer array (1 element).
+  QUICK_RANGE **cached_range_array{nullptr};
+
+  /// Arena-cached min_key buffer (serialization target for low bound).
+  uchar *cached_range_min_key{nullptr};
+  /// Arena-cached max_key buffer (serialization target for high bound).
+  uchar *cached_range_max_key{nullptr};
+  /// Cached key buffer size (bytes), equals key_part[0].store_length.
+  uint cached_range_key_bytes{0};
+
+  /// Arena-cached QEP_TAB[2] for range fast path.
+  QEP_TAB *cached_range_qep_tab{nullptr};
+  /// Arena-cached QEP_shared for range fast path.
+  QEP_shared *cached_range_qep_shared{nullptr};
+
+  /// True when range arena components are populated and usable.
+  bool range_arena_cached{false};
 };
 
 /*

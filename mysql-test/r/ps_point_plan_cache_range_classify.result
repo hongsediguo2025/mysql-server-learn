@@ -1,0 +1,154 @@
+#
+# Phase 7 test: ps_point_plan_cache simple_ranges classification
+# Verifies PREPARE-time classification for sysbench-style
+# WHERE id BETWEEN ? AND ? candidates and nearby reject cases.
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t_range_pk (
+id INT PRIMARY KEY,
+k INT NOT NULL,
+c VARCHAR(64),
+KEY idx_k (k)
+);
+INSERT INTO t_range_pk VALUES
+(1, 10, 'alpha'),
+(2, 20, 'beta'),
+(3, 30, 'gamma'),
+(4, 40, 'delta');
+CREATE TABLE t_range_join (
+id INT PRIMARY KEY,
+t_id INT NOT NULL,
+note VARCHAR(32)
+);
+INSERT INTO t_range_join VALUES
+(1, 1, 'j1'),
+(2, 2, 'j2');
+FLUSH STATUS;
+# -------------------------------------------------------
+# 1. PK BETWEEN — should be COLD
+# -------------------------------------------------------
+PREPARE stmt_r1 FROM 'SELECT * FROM t_range_pk WHERE id BETWEEN ? AND ?';
+cold_delta (pk between): 1
+# -------------------------------------------------------
+# 2. Specific column projection — should be COLD
+# -------------------------------------------------------
+PREPARE stmt_r2 FROM 'SELECT id, c FROM t_range_pk WHERE id BETWEEN ? AND ?';
+cold_delta (projection between): 1
+# -------------------------------------------------------
+# 3. Table alias — should be COLD
+# -------------------------------------------------------
+PREPARE stmt_r3 FROM 'SELECT * FROM t_range_pk AS a WHERE a.id BETWEEN ? AND ?';
+cold_delta (aliased between): 1
+# -------------------------------------------------------
+# 4. id > ? — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_r4 FROM 'SELECT * FROM t_range_pk WHERE id > ?';
+cold_delta (gt predicate): 0
+DEALLOCATE PREPARE stmt_r4;
+# -------------------------------------------------------
+# 5. id >= ? — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_r5 FROM 'SELECT * FROM t_range_pk WHERE id >= ?';
+cold_delta (ge predicate): 0
+DEALLOCATE PREPARE stmt_r5;
+# -------------------------------------------------------
+# 6. id < ? — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_r6 FROM 'SELECT * FROM t_range_pk WHERE id < ?';
+cold_delta (lt predicate): 0
+DEALLOCATE PREPARE stmt_r6;
+# -------------------------------------------------------
+# 7. id <= ? — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_r7 FROM 'SELECT * FROM t_range_pk WHERE id <= ?';
+cold_delta (le predicate): 0
+DEALLOCATE PREPARE stmt_r7;
+# -------------------------------------------------------
+# 8. NOT BETWEEN — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_r8 FROM 'SELECT * FROM t_range_pk WHERE id NOT BETWEEN ? AND ?';
+cold_delta (not between): 0
+DEALLOCATE PREPARE stmt_r8;
+# -------------------------------------------------------
+# 9. ? BETWEEN id AND ? — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_r9 FROM 'SELECT * FROM t_range_pk WHERE ? BETWEEN id AND ?';
+cold_delta (param between field and param): 0
+DEALLOCATE PREPARE stmt_r9;
+# -------------------------------------------------------
+# 10. id BETWEEN literal AND ? — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_r10 FROM 'SELECT * FROM t_range_pk WHERE id BETWEEN 1 AND ?';
+cold_delta (literal low bound): 0
+DEALLOCATE PREPARE stmt_r10;
+# -------------------------------------------------------
+# 11. id BETWEEN ? AND literal — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_r11 FROM 'SELECT * FROM t_range_pk WHERE id BETWEEN ? AND 10';
+cold_delta (literal high bound): 0
+DEALLOCATE PREPARE stmt_r11;
+# -------------------------------------------------------
+# 12. BETWEEN mixed with AND — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_r12 FROM 'SELECT * FROM t_range_pk WHERE id BETWEEN ? AND ? AND k = ?';
+cold_delta (between and equality): 0
+DEALLOCATE PREPARE stmt_r12;
+# -------------------------------------------------------
+# 13. BETWEEN mixed with OR — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_r13 FROM 'SELECT * FROM t_range_pk WHERE id BETWEEN ? AND ? OR k = ?';
+cold_delta (between or equality): 0
+DEALLOCATE PREPARE stmt_r13;
+# -------------------------------------------------------
+# 14. ORDER BY — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_r14 FROM 'SELECT * FROM t_range_pk WHERE id BETWEEN ? AND ? ORDER BY c';
+cold_delta (between with order): 0
+DEALLOCATE PREPARE stmt_r14;
+# -------------------------------------------------------
+# 15. LIMIT — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_r15 FROM 'SELECT * FROM t_range_pk WHERE id BETWEEN ? AND ? LIMIT 1';
+cold_delta (between with limit): 0
+DEALLOCATE PREPARE stmt_r15;
+# -------------------------------------------------------
+# 16. Aggregate query — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_r16 FROM 'SELECT SUM(k) FROM t_range_pk WHERE id BETWEEN ? AND ? GROUP BY c';
+cold_delta (between with aggregate): 0
+DEALLOCATE PREPARE stmt_r16;
+# -------------------------------------------------------
+# 17. JOIN — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_r17 FROM 'SELECT t_range_pk.c, t_range_join.note FROM t_range_pk JOIN t_range_join ON t_range_pk.id = t_range_join.t_id WHERE t_range_pk.id BETWEEN ? AND ?';
+cold_delta (join with between): 0
+DEALLOCATE PREPARE stmt_r17;
+# -------------------------------------------------------
+# 18. Subquery — should be NEVER
+# -------------------------------------------------------
+PREPARE stmt_r18 FROM 'SELECT * FROM t_range_pk WHERE id = (SELECT MIN(id) FROM t_range_pk WHERE id BETWEEN ? AND ?)';
+cold_delta (subquery between): 0
+DEALLOCATE PREPARE stmt_r18;
+# -------------------------------------------------------
+# 19. Final status snapshot
+# -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admissions	0
+Ps_point_plan_cache_cold_classifications	3
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	0
+Ps_point_plan_cache_invalidations	0
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DEALLOCATE PREPARE stmt_r1;
+DEALLOCATE PREPARE stmt_r2;
+DEALLOCATE PREPARE stmt_r3;
+DROP TABLE t_range_join;
+DROP TABLE t_range_pk;
+#
+# End of Phase 7 range classification test
+#

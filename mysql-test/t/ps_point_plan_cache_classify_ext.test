@@ -193,7 +193,7 @@ PREPARE stmt_a11 FROM 'SELECT * FROM t1 WHERE val LIKE ?';
 DEALLOCATE PREPARE stmt_a11;
 
 --echo # -------------------------------------------------------
---echo # A12. BETWEEN predicate — NEVER (BETWEEN_FUNC)
+--echo # A12. BETWEEN predicate — COLD (simple range candidate)
 --echo # -------------------------------------------------------
 --let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
 PREPARE stmt_a12 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ?';

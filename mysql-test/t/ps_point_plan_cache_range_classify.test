@@ -1,0 +1,227 @@
+--echo #
+--echo # Phase 7 test: ps_point_plan_cache simple_ranges classification
+--echo # Verifies PREPARE-time classification for sysbench-style
+--echo # WHERE id BETWEEN ? AND ? candidates and nearby reject cases.
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+CREATE TABLE t_range_pk (
+  id INT PRIMARY KEY,
+  k INT NOT NULL,
+  c VARCHAR(64),
+  KEY idx_k (k)
+);
+INSERT INTO t_range_pk VALUES
+  (1, 10, 'alpha'),
+  (2, 20, 'beta'),
+  (3, 30, 'gamma'),
+  (4, 40, 'delta');
+
+CREATE TABLE t_range_join (
+  id INT PRIMARY KEY,
+  t_id INT NOT NULL,
+  note VARCHAR(32)
+);
+INSERT INTO t_range_join VALUES
+  (1, 1, 'j1'),
+  (2, 2, 'j2');
+
+FLUSH STATUS;
+
+--echo # -------------------------------------------------------
+--echo # 1. PK BETWEEN — should be COLD
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r1 FROM 'SELECT * FROM t_range_pk WHERE id BETWEEN ? AND ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (pk between): $delta
+
+--echo # -------------------------------------------------------
+--echo # 2. Specific column projection — should be COLD
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r2 FROM 'SELECT id, c FROM t_range_pk WHERE id BETWEEN ? AND ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (projection between): $delta
+
+--echo # -------------------------------------------------------
+--echo # 3. Table alias — should be COLD
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r3 FROM 'SELECT * FROM t_range_pk AS a WHERE a.id BETWEEN ? AND ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (aliased between): $delta
+
+--echo # -------------------------------------------------------
+--echo # 4. id > ? — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r4 FROM 'SELECT * FROM t_range_pk WHERE id > ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (gt predicate): $delta
+DEALLOCATE PREPARE stmt_r4;
+
+--echo # -------------------------------------------------------
+--echo # 5. id >= ? — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r5 FROM 'SELECT * FROM t_range_pk WHERE id >= ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (ge predicate): $delta
+DEALLOCATE PREPARE stmt_r5;
+
+--echo # -------------------------------------------------------
+--echo # 6. id < ? — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r6 FROM 'SELECT * FROM t_range_pk WHERE id < ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (lt predicate): $delta
+DEALLOCATE PREPARE stmt_r6;
+
+--echo # -------------------------------------------------------
+--echo # 7. id <= ? — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r7 FROM 'SELECT * FROM t_range_pk WHERE id <= ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (le predicate): $delta
+DEALLOCATE PREPARE stmt_r7;
+
+--echo # -------------------------------------------------------
+--echo # 8. NOT BETWEEN — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r8 FROM 'SELECT * FROM t_range_pk WHERE id NOT BETWEEN ? AND ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (not between): $delta
+DEALLOCATE PREPARE stmt_r8;
+
+--echo # -------------------------------------------------------
+--echo # 9. ? BETWEEN id AND ? — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r9 FROM 'SELECT * FROM t_range_pk WHERE ? BETWEEN id AND ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (param between field and param): $delta
+DEALLOCATE PREPARE stmt_r9;
+
+--echo # -------------------------------------------------------
+--echo # 10. id BETWEEN literal AND ? — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r10 FROM 'SELECT * FROM t_range_pk WHERE id BETWEEN 1 AND ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (literal low bound): $delta
+DEALLOCATE PREPARE stmt_r10;
+
+--echo # -------------------------------------------------------
+--echo # 11. id BETWEEN ? AND literal — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r11 FROM 'SELECT * FROM t_range_pk WHERE id BETWEEN ? AND 10';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (literal high bound): $delta
+DEALLOCATE PREPARE stmt_r11;
+
+--echo # -------------------------------------------------------
+--echo # 12. BETWEEN mixed with AND — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r12 FROM 'SELECT * FROM t_range_pk WHERE id BETWEEN ? AND ? AND k = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (between and equality): $delta
+DEALLOCATE PREPARE stmt_r12;
+
+--echo # -------------------------------------------------------
+--echo # 13. BETWEEN mixed with OR — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r13 FROM 'SELECT * FROM t_range_pk WHERE id BETWEEN ? AND ? OR k = ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (between or equality): $delta
+DEALLOCATE PREPARE stmt_r13;
+
+--echo # -------------------------------------------------------
+--echo # 14. ORDER BY — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r14 FROM 'SELECT * FROM t_range_pk WHERE id BETWEEN ? AND ? ORDER BY c';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (between with order): $delta
+DEALLOCATE PREPARE stmt_r14;
+
+--echo # -------------------------------------------------------
+--echo # 15. LIMIT — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r15 FROM 'SELECT * FROM t_range_pk WHERE id BETWEEN ? AND ? LIMIT 1';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (between with limit): $delta
+DEALLOCATE PREPARE stmt_r15;
+
+--echo # -------------------------------------------------------
+--echo # 16. Aggregate query — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r16 FROM 'SELECT SUM(k) FROM t_range_pk WHERE id BETWEEN ? AND ? GROUP BY c';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (between with aggregate): $delta
+DEALLOCATE PREPARE stmt_r16;
+
+--echo # -------------------------------------------------------
+--echo # 17. JOIN — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r17 FROM 'SELECT t_range_pk.c, t_range_join.note FROM t_range_pk JOIN t_range_join ON t_range_pk.id = t_range_join.t_id WHERE t_range_pk.id BETWEEN ? AND ?';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (join with between): $delta
+DEALLOCATE PREPARE stmt_r17;
+
+--echo # -------------------------------------------------------
+--echo # 18. Subquery — should be NEVER
+--echo # -------------------------------------------------------
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+PREPARE stmt_r18 FROM 'SELECT * FROM t_range_pk WHERE id = (SELECT MIN(id) FROM t_range_pk WHERE id BETWEEN ? AND ?)';
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo cold_delta (subquery between): $delta
+DEALLOCATE PREPARE stmt_r18;
+
+--echo # -------------------------------------------------------
+--echo # 19. Final status snapshot
+--echo # -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+DEALLOCATE PREPARE stmt_r1;
+DEALLOCATE PREPARE stmt_r2;
+DEALLOCATE PREPARE stmt_r3;
+DROP TABLE t_range_join;
+DROP TABLE t_range_pk;
+
+--echo #
+--echo # End of Phase 7 range classification test
+--echo #

@@ -1,0 +1,229 @@
+#
+# Phase 7 test: ps_point_plan_cache simple_ranges edge cases
+# Covers runtime fallback, type/environment drift, sysvar bypass,
+# and DDL reprepare for RANGE_PK_BETWEEN statements.
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t_range_edge (
+id INT PRIMARY KEY,
+c VARCHAR(32)
+);
+INSERT INTO t_range_edge VALUES
+(1, 'a'),
+(2, 'b'),
+(3, 'c'),
+(4, 'd');
+# =======================================================
+# A. NULL low bound on HOT statement
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_re_a FROM 'SELECT c FROM t_range_edge WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_re_a USING @l, @h;
+c
+a
+b
+c
+SET @l = NULL;
+SET @h = 3;
+EXECUTE stmt_re_a USING @l, @h;
+c
+fallback_runtime delta after NULL low bound: 1
+hits delta after NULL low bound: 0
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_re_a USING @l, @h;
+c
+b
+c
+d
+hits delta after NULL low recovery: 1
+DEALLOCATE PREPARE stmt_re_a;
+# =======================================================
+# B. NULL high bound on HOT statement
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_re_b FROM 'SELECT c FROM t_range_edge WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 4;
+EXECUTE stmt_re_b USING @l, @h;
+c
+a
+b
+c
+d
+SET @l = 2;
+SET @h = NULL;
+EXECUTE stmt_re_b USING @l, @h;
+c
+fallback_runtime delta after NULL high bound: 1
+hits delta after NULL high bound: 0
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt_re_b USING @l, @h;
+c
+a
+b
+hits delta after NULL high recovery: 1
+DEALLOCATE PREPARE stmt_re_b;
+# =======================================================
+# C. Inverted bounds on HOT statement
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_re_c FROM 'SELECT c FROM t_range_edge WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 4;
+EXECUTE stmt_re_c USING @l, @h;
+c
+a
+b
+c
+d
+SET @l = 4;
+SET @h = 2;
+EXECUTE stmt_re_c USING @l, @h;
+c
+fallback_runtime delta after inverted bounds: 1
+hits delta after inverted bounds: 0
+SET @l = 2;
+SET @h = 3;
+EXECUTE stmt_re_c USING @l, @h;
+c
+b
+c
+hits delta after inverted-bounds recovery: 1
+DEALLOCATE PREPARE stmt_re_c;
+# =======================================================
+# D. Parameter type drift — fallback + re-admit on current EXECUTE
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_re_d FROM 'SELECT c FROM t_range_edge WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_re_d USING @l, @h;
+c
+a
+b
+c
+SET @l = '2';
+SET @h = '4';
+EXECUTE stmt_re_d USING @l, @h;
+c
+b
+c
+d
+admissions delta after string type drift: 0
+fallback_runtime delta after string type drift: 0
+hits delta after string type drift: 1
+SET @l = '1';
+SET @h = '2';
+EXECUTE stmt_re_d USING @l, @h;
+c
+a
+b
+hits delta after same-type post-drift execute: 1
+DEALLOCATE PREPARE stmt_re_d;
+# =======================================================
+# E. Session sysvar OFF/ON bypasses and resumes hot path
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_re_e FROM 'SELECT c FROM t_range_edge WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_re_e USING @l, @h;
+c
+a
+b
+c
+SET SESSION ps_point_plan_cache = OFF;
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_re_e USING @l, @h;
+c
+b
+c
+d
+hits delta with ps_point_plan_cache OFF: 0
+SET SESSION ps_point_plan_cache = ON;
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt_re_e USING @l, @h;
+c
+a
+b
+hits delta after re-enabling ps_point_plan_cache: 1
+DEALLOCATE PREPARE stmt_re_e;
+# =======================================================
+# F. DDL reprepare — re-admit then hit again
+# =======================================================
+FLUSH STATUS;
+PREPARE stmt_re_f FROM 'SELECT c FROM t_range_edge WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_re_f USING @l, @h;
+c
+a
+b
+c
+ALTER TABLE t_range_edge ADD COLUMN extra INT DEFAULT 0;
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_re_f USING @l, @h;
+c
+b
+c
+d
+admissions delta after DDL reprepare execute: 1
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt_re_f USING @l, @h;
+c
+a
+b
+hits delta after DDL recovery execute: 1
+ALTER TABLE t_range_edge DROP COLUMN extra;
+DEALLOCATE PREPARE stmt_re_f;
+# =======================================================
+# G. optimizer_switch drift — fallback + re-admit
+# =======================================================
+FLUSH STATUS;
+SET SESSION optimizer_switch='use_invisible_indexes=on';
+PREPARE stmt_re_g FROM 'SELECT c FROM t_range_edge WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt_re_g USING @l, @h;
+c
+a
+b
+c
+SET SESSION optimizer_switch='use_invisible_indexes=off';
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt_re_g USING @l, @h;
+c
+b
+c
+d
+admissions delta after optimizer_switch drift execute: 1
+fallback_runtime delta after optimizer_switch drift execute: 1
+hits delta after optimizer_switch drift execute: 0
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt_re_g USING @l, @h;
+c
+a
+b
+hits delta after stable optimizer_switch execute: 1
+DEALLOCATE PREPARE stmt_re_g;
+SET SESSION optimizer_switch='default';
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+SET SESSION ps_point_plan_cache = ON;
+DROP TABLE t_range_edge;
+#
+# End of Phase 7 range edge-case test
+#

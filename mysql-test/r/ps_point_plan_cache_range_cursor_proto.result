@@ -1,0 +1,112 @@
+#
+# Range plan cache smoke test under binary-protocol cursor execution.
+#
+# Run: mtr --cursor-protocol --ps-protocol ps_point_plan_cache_range_cursor_proto
+#
+# Under --cursor-protocol, regular SELECTs are sent via
+# COM_STMT_EXECUTE with CURSOR_TYPE_READ_ONLY (open_cursor=true).
+# SQL PREPARE/EXECUTE statements still use open_cursor=false, so
+# this test focuses on range-query stability and non-regression
+# in a cursor-protocol session rather than true cursor hits.
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t_range_cur (
+id INT PRIMARY KEY,
+c VARCHAR(32)
+);
+INSERT INTO t_range_cur VALUES
+(1, 'a'),
+(2, 'b'),
+(3, 'c'),
+(4, 'd');
+# -------------------------------------------------------
+# K1: Literal BETWEEN selects under cursor protocol
+#     Implicit PS has no Item_param, so counters stay 0.
+# -------------------------------------------------------
+FLUSH STATUS;
+SELECT c FROM t_range_cur WHERE id BETWEEN 1 AND 2;
+c
+a
+b
+SELECT c FROM t_range_cur WHERE id BETWEEN 2 AND 3;
+c
+b
+c
+SELECT c FROM t_range_cur WHERE id BETWEEN 3 AND 4;
+c
+c
+d
+cold after K1 (expect 0): 0
+admissions after K1 (expect 0): 0
+hits after K1 (expect 0): 0
+# -------------------------------------------------------
+# K2: SQL PREPARE/EXECUTE range query in cursor session
+# -------------------------------------------------------
+FLUSH STATUS;
+PREPARE stmt FROM 'SELECT c FROM t_range_cur WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt USING @l, @h;
+c
+a
+b
+c
+admissions after K2-admit (expect 1): 1
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt USING @l, @h;
+c
+b
+c
+d
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt USING @l, @h;
+c
+a
+b
+hits after K2 (expect 2): 2
+DEALLOCATE PREPARE stmt;
+# -------------------------------------------------------
+# K3: DDL + reprepare for range query in cursor session
+# -------------------------------------------------------
+FLUSH STATUS;
+PREPARE stmt2 FROM 'SELECT c FROM t_range_cur WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt2 USING @l, @h;
+c
+a
+b
+c
+ALTER TABLE t_range_cur ADD COLUMN extra INT DEFAULT 0;
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt2 USING @l, @h;
+c
+b
+c
+d
+admissions delta after K3 DDL (expect 1): 1
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt2 USING @l, @h;
+c
+a
+b
+hits after K3-hit (expect 1): 1
+ALTER TABLE t_range_cur DROP COLUMN extra;
+DEALLOCATE PREPARE stmt2;
+# -------------------------------------------------------
+# K4: Verify binary protocol is active
+# -------------------------------------------------------
+# Confirmed: binary protocol active (Com_stmt_execute > 0)
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t_range_cur;
+#
+# Range cursor protocol plan cache smoke test complete.
+#

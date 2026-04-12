@@ -1,0 +1,143 @@
+--echo #
+--echo # Range plan cache smoke test under binary-protocol cursor execution.
+--echo #
+--echo # Run: mtr --cursor-protocol --ps-protocol ps_point_plan_cache_range_cursor_proto
+--echo #
+--echo # Under --cursor-protocol, regular SELECTs are sent via
+--echo # COM_STMT_EXECUTE with CURSOR_TYPE_READ_ONLY (open_cursor=true).
+--echo # SQL PREPARE/EXECUTE statements still use open_cursor=false, so
+--echo # this test focuses on range-query stability and non-regression
+--echo # in a cursor-protocol session rather than true cursor hits.
+--echo #
+
+--source include/have_ps_protocol.inc
+
+if (`SELECT $CURSOR_PROTOCOL = 0`)
+{
+   --skip Need cursor-protocol (run: mtr --cursor-protocol --ps-protocol ps_point_plan_cache_range_cursor_proto)
+}
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+--disable_ps_protocol
+CREATE TABLE t_range_cur (
+  id INT PRIMARY KEY,
+  c VARCHAR(32)
+);
+INSERT INTO t_range_cur VALUES
+  (1, 'a'),
+  (2, 'b'),
+  (3, 'c'),
+  (4, 'd');
+--enable_ps_protocol
+
+--echo # -------------------------------------------------------
+--echo # K1: Literal BETWEEN selects under cursor protocol
+--echo #     Implicit PS has no Item_param, so counters stay 0.
+--echo # -------------------------------------------------------
+
+--disable_ps_protocol
+FLUSH STATUS;
+--enable_ps_protocol
+
+SELECT c FROM t_range_cur WHERE id BETWEEN 1 AND 2;
+SELECT c FROM t_range_cur WHERE id BETWEEN 2 AND 3;
+SELECT c FROM t_range_cur WHERE id BETWEEN 3 AND 4;
+
+--disable_ps_protocol
+--let $cold = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo cold after K1 (expect 0): $cold
+--echo admissions after K1 (expect 0): $adm
+--echo hits after K1 (expect 0): $hits
+--enable_ps_protocol
+
+--echo # -------------------------------------------------------
+--echo # K2: SQL PREPARE/EXECUTE range query in cursor session
+--echo # -------------------------------------------------------
+
+--disable_ps_protocol
+FLUSH STATUS;
+
+PREPARE stmt FROM 'SELECT c FROM t_range_cur WHERE id BETWEEN ? AND ?';
+
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt USING @l, @h;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo admissions after K2-admit (expect 1): $adm
+
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt USING @l, @h;
+
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt USING @l, @h;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after K2 (expect 2): $hits
+
+DEALLOCATE PREPARE stmt;
+--enable_ps_protocol
+
+--echo # -------------------------------------------------------
+--echo # K3: DDL + reprepare for range query in cursor session
+--echo # -------------------------------------------------------
+
+--disable_ps_protocol
+FLUSH STATUS;
+
+PREPARE stmt2 FROM 'SELECT c FROM t_range_cur WHERE id BETWEEN ? AND ?';
+SET @l = 1;
+SET @h = 3;
+EXECUTE stmt2 USING @l, @h;
+
+--let $adm_base = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+
+ALTER TABLE t_range_cur ADD COLUMN extra INT DEFAULT 0;
+SET @l = 2;
+SET @h = 4;
+EXECUTE stmt2 USING @l, @h;
+
+--let $adm = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm - $adm_base`
+--echo admissions delta after K3 DDL (expect 1): $adm_delta
+
+SET @l = 1;
+SET @h = 2;
+EXECUTE stmt2 USING @l, @h;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after K3-hit (expect 1): $hits
+
+ALTER TABLE t_range_cur DROP COLUMN extra;
+DEALLOCATE PREPARE stmt2;
+--enable_ps_protocol
+
+--echo # -------------------------------------------------------
+--echo # K4: Verify binary protocol is active
+--echo # -------------------------------------------------------
+--disable_ps_protocol
+--let $stmt_exec = query_get_value(SHOW STATUS LIKE 'Com_stmt_execute', Value, 1)
+if ($stmt_exec == 0) {
+  --die Test NOT running under binary protocol. Com_stmt_execute = 0.
+}
+--echo # Confirmed: binary protocol active (Com_stmt_execute > 0)
+--enable_ps_protocol
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+
+--disable_ps_protocol
+DROP TABLE t_range_cur;
+--enable_ps_protocol
+
+--echo #
+--echo # Range cursor protocol plan cache smoke test complete.
+--echo #
