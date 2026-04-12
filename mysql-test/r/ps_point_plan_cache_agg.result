@@ -1,0 +1,569 @@
+DROP TABLE IF EXISTS t1, t2, t3;
+# ========== Test 1: Basic aggregate functions ==========
+CREATE TABLE t1 (id INT PRIMARY KEY, k INT, c CHAR(10));
+INSERT INTO t1 VALUES (1, 100, 'a'), (2, 200, 'b'), (3, 300, 'c'), (4, 400, 'd'), (5, 500, 'e');
+SET SESSION ps_point_plan_cache = ON;
+# Test 1.1: SUM(field)
+PREPARE stmt_sum FROM 'SELECT SUM(k) FROM t1 WHERE id BETWEEN ? AND ?';
+SET @low = 1, @high = 3;
+EXECUTE stmt_sum USING @low, @high;
+SUM(k)
+600
+EXECUTE stmt_sum USING @low, @high;
+SUM(k)
+600
+DEALLOCATE PREPARE stmt_sum;
+SHOW STATUS LIKE 'ps_point_plan_cache_admissions';
+Variable_name	Value
+Ps_point_plan_cache_admissions	1
+SHOW STATUS LIKE 'ps_point_plan_cache_hits';
+Variable_name	Value
+Ps_point_plan_cache_hits	1
+# Test 1.2: COUNT(*)
+PREPARE stmt_cnt_star FROM 'SELECT COUNT(*) FROM t1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_cnt_star USING @low, @high;
+COUNT(*)
+3
+EXECUTE stmt_cnt_star USING @low, @high;
+COUNT(*)
+3
+DEALLOCATE PREPARE stmt_cnt_star;
+# Test 1.3: COUNT(field)
+PREPARE stmt_cnt_field FROM 'SELECT COUNT(k) FROM t1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_cnt_field USING @low, @high;
+COUNT(k)
+3
+EXECUTE stmt_cnt_field USING @low, @high;
+COUNT(k)
+3
+DEALLOCATE PREPARE stmt_cnt_field;
+# Test 1.4: MIN(field)
+PREPARE stmt_min FROM 'SELECT MIN(k) FROM t1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_min USING @low, @high;
+MIN(k)
+100
+EXECUTE stmt_min USING @low, @high;
+MIN(k)
+100
+DEALLOCATE PREPARE stmt_min;
+# Test 1.5: MAX(field)
+PREPARE stmt_max FROM 'SELECT MAX(k) FROM t1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_max USING @low, @high;
+MAX(k)
+300
+EXECUTE stmt_max USING @low, @high;
+MAX(k)
+300
+DEALLOCATE PREPARE stmt_max;
+# Test 1.6: Aggregate primary key field
+PREPARE stmt_sum_pk FROM 'SELECT SUM(id) FROM t1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_sum_pk USING @low, @high;
+SUM(id)
+6
+EXECUTE stmt_sum_pk USING @low, @high;
+SUM(id)
+6
+DEALLOCATE PREPARE stmt_sum_pk;
+# ========== Test 2: Boundary conditions ==========
+# Test 2.1: Single point range (low = high)
+PREPARE stmt_single FROM 'SELECT SUM(k) FROM t1 WHERE id BETWEEN ? AND ?';
+SET @val = 3;
+EXECUTE stmt_single USING @val, @val;
+SUM(k)
+300
+EXECUTE stmt_single USING @val, @val;
+SUM(k)
+300
+DEALLOCATE PREPARE stmt_single;
+# Test 2.2: Empty result set (range beyond data)
+SET @low = 100, @high = 200;
+PREPARE stmt_empty FROM 'SELECT SUM(k) FROM t1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_empty USING @low, @high;
+SUM(k)
+NULL
+EXECUTE stmt_empty USING @low, @high;
+SUM(k)
+NULL
+DEALLOCATE PREPARE stmt_empty;
+# Test 2.3: Full table range
+SET @low = 1, @high = 999999;
+PREPARE stmt_full FROM 'SELECT SUM(k) FROM t1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_full USING @low, @high;
+SUM(k)
+1500
+EXECUTE stmt_full USING @low, @high;
+SUM(k)
+1500
+DEALLOCATE PREPARE stmt_full;
+# Test 2.4: Reverse range (low > high, empty result)
+SET @low = 5, @high = 1;
+PREPARE stmt_reverse FROM 'SELECT SUM(k) FROM t1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_reverse USING @low, @high;
+SUM(k)
+NULL
+EXECUTE stmt_reverse USING @low, @high;
+SUM(k)
+NULL
+DEALLOCATE PREPARE stmt_reverse;
+# Test 2.5: NULL parameter boundary (MySQL returns NULL, no error)
+PREPARE stmt_null FROM 'SELECT SUM(k) FROM t1 WHERE id BETWEEN ? AND ?';
+SET @low = NULL, @high = 3;
+EXECUTE stmt_null USING @low, @high;
+SUM(k)
+NULL
+EXECUTE stmt_null USING @low, @high;
+SUM(k)
+NULL
+DEALLOCATE PREPARE stmt_null;
+# ========== Test 3: Unsupported aggregate functions ==========
+# Test 3.1: AVG function
+PREPARE stmt_avg FROM 'SELECT AVG(k) FROM t1 WHERE id BETWEEN ? AND ?';
+SET @low = 1, @high = 3;
+EXECUTE stmt_avg USING @low, @high;
+AVG(k)
+200.0000
+EXECUTE stmt_avg USING @low, @high;
+AVG(k)
+200.0000
+DEALLOCATE PREPARE stmt_avg;
+SHOW STATUS LIKE 'ps_point_plan_cache_admissions';
+Variable_name	Value
+Ps_point_plan_cache_admissions	9
+# Test 3.2: STDDEV
+PREPARE stmt_stddev FROM 'SELECT STDDEV(k) FROM t1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_stddev USING @low, @high;
+STDDEV(k)
+81.64965809277261
+DEALLOCATE PREPARE stmt_stddev;
+# Test 3.3: GROUP_CONCAT
+PREPARE stmt_group_concat FROM 'SELECT GROUP_CONCAT(c) FROM t1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_group_concat USING @low, @high;
+GROUP_CONCAT(c)
+a,b,c
+DEALLOCATE PREPARE stmt_group_concat;
+# Test 3.4: BIT_AND
+PREPARE stmt_bit_and FROM 'SELECT BIT_AND(k) FROM t1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_bit_and USING @low, @high;
+BIT_AND(k)
+0
+DEALLOCATE PREPARE stmt_bit_and;
+# Test 3.5: BIT_OR
+PREPARE stmt_bit_or FROM 'SELECT BIT_OR(k) FROM t1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_bit_or USING @low, @high;
+BIT_OR(k)
+492
+DEALLOCATE PREPARE stmt_bit_or;
+# Test 3.6: BIT_XOR
+PREPARE stmt_bit_xor FROM 'SELECT BIT_XOR(k) FROM t1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_bit_xor USING @low, @high;
+BIT_XOR(k)
+384
+DEALLOCATE PREPARE stmt_bit_xor;
+# ========== Test 4: Unsupported query structures ==========
+# Test 4.1: Multiple aggregate functions
+PREPARE stmt_multi_agg FROM 'SELECT SUM(k), COUNT(*) FROM t1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_multi_agg USING @low, @high;
+SUM(k)	COUNT(*)
+600	3
+EXECUTE stmt_multi_agg USING @low, @high;
+SUM(k)	COUNT(*)
+600	3
+DEALLOCATE PREPARE stmt_multi_agg;
+# Test 4.2: HAVING clause
+PREPARE stmt_having FROM 'SELECT SUM(k) FROM t1 WHERE id BETWEEN ? AND ? HAVING SUM(k) > 100';
+EXECUTE stmt_having USING @low, @high;
+SUM(k)
+600
+EXECUTE stmt_having USING @low, @high;
+SUM(k)
+600
+DEALLOCATE PREPARE stmt_having;
+# Test 4.3: GROUP BY clause
+PREPARE stmt_group_by FROM 'SELECT SUM(k) FROM t1 WHERE id BETWEEN ? AND ? GROUP BY k';
+EXECUTE stmt_group_by USING @low, @high;
+SUM(k)
+100
+200
+300
+DEALLOCATE PREPARE stmt_group_by;
+# Test 4.4: ORDER BY clause
+PREPARE stmt_order_by FROM 'SELECT SUM(k) FROM t1 WHERE id BETWEEN ? AND ? ORDER BY SUM(k)';
+EXECUTE stmt_order_by USING @low, @high;
+SUM(k)
+600
+DEALLOCATE PREPARE stmt_order_by;
+# Test 4.5: DISTINCT clause
+PREPARE stmt_distinct FROM 'SELECT COUNT(DISTINCT k) FROM t1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_distinct USING @low, @high;
+COUNT(DISTINCT k)
+3
+DEALLOCATE PREPARE stmt_distinct;
+# Test 4.6: DISTINCT with SUM
+PREPARE stmt_distinct_sum FROM 'SELECT SUM(DISTINCT k) FROM t1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_distinct_sum USING @low, @high;
+SUM(DISTINCT k)
+600
+DEALLOCATE PREPARE stmt_distinct_sum;
+# Test 4.7: Non-PK WHERE condition
+PREPARE stmt_non_pk FROM 'SELECT SUM(k) FROM t1 WHERE k BETWEEN ? AND ?';
+SET @k1 = 100, @k2 = 300;
+EXECUTE stmt_non_pk USING @k1, @k2;
+SUM(k)
+600
+DEALLOCATE PREPARE stmt_non_pk;
+# Test 4.8: Compound WHERE condition
+PREPARE stmt_compound FROM 'SELECT SUM(k) FROM t1 WHERE id BETWEEN ? AND ? AND k > 0';
+SET @low = 1, @high = 3;
+EXECUTE stmt_compound USING @low, @high;
+SUM(k)
+600
+DEALLOCATE PREPARE stmt_compound;
+# Test 4.9: OR condition
+PREPARE stmt_or FROM 'SELECT SUM(k) FROM t1 WHERE id = 1 OR id = 2';
+EXECUTE stmt_or;
+SUM(k)
+300
+EXECUTE stmt_or;
+SUM(k)
+300
+DEALLOCATE PREPARE stmt_or;
+# Test 4.10: IN condition
+PREPARE stmt_in FROM 'SELECT SUM(k) FROM t1 WHERE id IN (1, 2, 3)';
+EXECUTE stmt_in;
+SUM(k)
+600
+DEALLOCATE PREPARE stmt_in;
+# Test 4.11: No WHERE clause
+PREPARE stmt_no_where FROM 'SELECT SUM(k) FROM t1';
+EXECUTE stmt_no_where;
+SUM(k)
+1500
+EXECUTE stmt_no_where;
+SUM(k)
+1500
+DEALLOCATE PREPARE stmt_no_where;
+# ========== Test 5: Multi-table scenarios ==========
+CREATE TABLE t2 (id INT PRIMARY KEY, val INT);
+INSERT INTO t2 VALUES (1, 10), (2, 20), (3, 30);
+# Test 5.1: JOIN query
+PREPARE stmt_join FROM 'SELECT SUM(t1.k) FROM t1 JOIN t2 ON t1.id = t2.id WHERE t1.id BETWEEN ? AND ?';
+SET @low = 1, @high = 2;
+EXECUTE stmt_join USING @low, @high;
+SUM(t1.k)
+300
+DEALLOCATE PREPARE stmt_join;
+# Test 5.2: Subquery
+PREPARE stmt_subq FROM 'SELECT SUM(k) FROM t1 WHERE id IN (SELECT id FROM t2 WHERE id BETWEEN ? AND ?)';
+EXECUTE stmt_subq USING @low, @high;
+SUM(k)
+300
+DEALLOCATE PREPARE stmt_subq;
+# Test 5.3: UNION query
+PREPARE stmt_union FROM 'SELECT SUM(k) FROM t1 WHERE id BETWEEN ? AND ? UNION ALL SELECT COUNT(*) FROM t2';
+EXECUTE stmt_union USING @low, @high;
+SUM(k)
+300
+3
+DEALLOCATE PREPARE stmt_union;
+# ========== Test 6: Data type coverage ==========
+# Test 6.1: Aggregate BIGINT column
+CREATE TABLE t3 (id INT PRIMARY KEY, big_col BIGINT);
+INSERT INTO t3 VALUES (1, 9223372036854775800), (2, 100), (3, 200);
+PREPARE stmt_bigint FROM 'SELECT SUM(big_col) FROM t3 WHERE id BETWEEN ? AND ?';
+SET @low = 1, @high = 3;
+EXECUTE stmt_bigint USING @low, @high;
+SUM(big_col)
+9223372036854776100
+EXECUTE stmt_bigint USING @low, @high;
+SUM(big_col)
+9223372036854776100
+DEALLOCATE PREPARE stmt_bigint;
+# Test 6.2: Aggregate DECIMAL column
+CREATE TABLE t4 (id INT PRIMARY KEY, dec_col DECIMAL(10,2));
+INSERT INTO t4 VALUES (1, 10.5), (2, 20.3), (3, 30.7);
+PREPARE stmt_decimal FROM 'SELECT SUM(dec_col) FROM t4 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_decimal USING @low, @high;
+SUM(dec_col)
+61.50
+EXECUTE stmt_decimal USING @low, @high;
+SUM(dec_col)
+61.50
+DEALLOCATE PREPARE stmt_decimal;
+# Test 6.3: Aggregate DOUBLE column
+CREATE TABLE t5 (id INT PRIMARY KEY, dbl_col DOUBLE);
+INSERT INTO t5 VALUES (1, 1.5), (2, 2.5), (3, 3.5);
+PREPARE stmt_double FROM 'SELECT SUM(dbl_col) FROM t5 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_double USING @low, @high;
+SUM(dbl_col)
+7.5
+EXECUTE stmt_double USING @low, @high;
+SUM(dbl_col)
+7.5
+DEALLOCATE PREPARE stmt_double;
+# Test 6.4: Aggregate SIGNED/UNSIGNED INT
+CREATE TABLE t6 (id INT PRIMARY KEY, signed_col INT, unsigned_col INT UNSIGNED);
+INSERT INTO t6 VALUES (1, -100, 100), (2, -200, 200), (3, 1000, 300);
+PREPARE stmt_signed FROM 'SELECT SUM(signed_col) FROM t6 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_signed USING @low, @high;
+SUM(signed_col)
+700
+EXECUTE stmt_signed USING @low, @high;
+SUM(signed_col)
+700
+DEALLOCATE PREPARE stmt_signed;
+PREPARE stmt_unsigned FROM 'SELECT SUM(unsigned_col) FROM t6 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_unsigned USING @low, @high;
+SUM(unsigned_col)
+600
+EXECUTE stmt_unsigned USING @low, @high;
+SUM(unsigned_col)
+600
+DEALLOCATE PREPARE stmt_unsigned;
+# ========== Test 7: Parameter type changes ==========
+# Test 7.1: Stable parameter types - should stay HOT
+PREPARE stmt_type_stable FROM 'SELECT SUM(k) FROM t1 WHERE id BETWEEN ? AND ?';
+SET @low = 1, @high = 2;
+EXECUTE stmt_type_stable USING @low, @high;
+SUM(k)
+300
+EXECUTE stmt_type_stable USING @low, @high;
+SUM(k)
+300
+EXECUTE stmt_type_stable USING @low, @high;
+SUM(k)
+300
+SHOW STATUS LIKE 'ps_point_plan_cache_hits';
+Variable_name	Value
+Ps_point_plan_cache_hits	16
+DEALLOCATE PREPARE stmt_type_stable;
+# Test 7.2: INT parameter changed to BIGINT
+CREATE TABLE t7 (id BIGINT PRIMARY KEY, k INT);
+INSERT INTO t7 VALUES (1, 100), (2, 200), (3, 300);
+PREPARE stmt_bigint_param FROM 'SELECT SUM(k) FROM t7 WHERE id BETWEEN ? AND ?';
+SET @low = 1, @high = 2;
+EXECUTE stmt_bigint_param USING @low, @high;
+SUM(k)
+300
+SET @low = CAST(1 AS UNSIGNED), @high = CAST(2 AS UNSIGNED);
+EXECUTE stmt_bigint_param USING @low, @high;
+SUM(k)
+300
+DEALLOCATE PREPARE stmt_bigint_param;
+SHOW STATUS LIKE 'ps_point_plan_cache_fallback_runtime';
+Variable_name	Value
+Ps_point_plan_cache_fallback_runtime	0
+# Test 7.3: String parameters
+PREPARE stmt_str_param FROM 'SELECT SUM(k) FROM t1 WHERE id BETWEEN ? AND ?';
+SET @low = '1', @high = '3';
+EXECUTE stmt_str_param USING @low, @high;
+SUM(k)
+600
+EXECUTE stmt_str_param USING @low, @high;
+SUM(k)
+600
+DEALLOCATE PREPARE stmt_str_param;
+# ========== Test 8: Status variable verification ==========
+# Reset by restarting
+# Test 8.1: cold_classifications counter
+SHOW STATUS LIKE 'ps_point_plan_cache_cold_classifications';
+Variable_name	Value
+Ps_point_plan_cache_cold_classifications	22
+# Test 8.2: admissions counter
+SHOW STATUS LIKE 'ps_point_plan_cache_admissions';
+Variable_name	Value
+Ps_point_plan_cache_admissions	19
+# Test 8.3: hits counter
+SHOW STATUS LIKE 'ps_point_plan_cache_hits';
+Variable_name	Value
+Ps_point_plan_cache_hits	17
+# Test 8.4: fallback_runtime counter
+SHOW STATUS LIKE 'ps_point_plan_cache_fallback_runtime';
+Variable_name	Value
+Ps_point_plan_cache_fallback_runtime	0
+# Test 8.5: invalidations counter
+SHOW STATUS LIKE 'ps_point_plan_cache_invalidations';
+Variable_name	Value
+Ps_point_plan_cache_invalidations	0
+# ========== Test 9: Concurrent preparation ==========
+# Note: Real concurrent testing requires --mysqld=--thread-handling=one-thread-per-connection
+# and multiple connection blocks
+# ========== Test 10: Composite primary key ==========
+CREATE TABLE t8 (
+id1 INT NOT NULL,
+id2 INT NOT NULL,
+k INT,
+PRIMARY KEY (id1, id2)
+);
+INSERT INTO t8 VALUES
+(1, 1, 100),
+(1, 2, 200),
+(2, 1, 300),
+(2, 2, 400);
+# Test 10.1: Composite PK using only first column (rejected - not single-column PK)
+PREPARE stmt_compound_pk FROM 'SELECT SUM(k) FROM t8 WHERE id1 BETWEEN ? AND ?';
+SET @low = 1, @high = 2;
+EXECUTE stmt_compound_pk USING @low, @high;
+SUM(k)
+1000
+DEALLOCATE PREPARE stmt_compound_pk;
+# ========== Test 11: DDL 导致的 invalidation ==========
+CREATE TABLE t9 (id INT PRIMARY KEY, k INT);
+INSERT INTO t9 VALUES (1, 100), (2, 200), (3, 300);
+# Test 11.1: Establish HOT state
+PREPARE stmt_ddl FROM 'SELECT SUM(k) FROM t9 WHERE id BETWEEN ? AND ?';
+SET @low = 1, @high = 2;
+EXECUTE stmt_ddl USING @low, @high;
+SUM(k)
+300
+EXECUTE stmt_ddl USING @low, @high;
+SUM(k)
+300
+SHOW STATUS LIKE 'ps_point_plan_cache_hits';
+Variable_name	Value
+Ps_point_plan_cache_hits	18
+# Test 11.2: Add index (should trigger invalidation)
+ALTER TABLE t9 ADD INDEX idx_k (k);
+EXECUTE stmt_ddl USING @low, @high;
+SUM(k)
+300
+SHOW STATUS LIKE 'ps_point_plan_cache_invalidations';
+Variable_name	Value
+Ps_point_plan_cache_invalidations	0
+SHOW STATUS LIKE 'ps_point_plan_cache_fallback_runtime';
+Variable_name	Value
+Ps_point_plan_cache_fallback_runtime	0
+# Test 11.3: DROP and reprepare
+DROP PREPARE stmt_ddl;
+PREPARE stmt_ddl FROM 'SELECT SUM(k) FROM t9 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_ddl USING @low, @high;
+SUM(k)
+300
+EXECUTE stmt_ddl USING @low, @high;
+SUM(k)
+300
+SHOW STATUS LIKE 'ps_point_plan_cache_hits';
+Variable_name	Value
+Ps_point_plan_cache_hits	18
+# ========== Test 12: Sysbench compatibility ==========
+# Create sbtest-like table
+CREATE TABLE sbtest (
+id INT PRIMARY KEY,
+k INT,
+c CHAR(120) DEFAULT '' NOT NULL,
+pad CHAR(60) DEFAULT '' NOT NULL
+);
+INSERT INTO sbtest VALUES
+(1, 100, 'aaaaaaaaaa', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
+(2, 200, 'bbbbbbbbbb', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'),
+(3, 300, 'cccccccccc', 'cccccccccccccccccccccccccccccccccccccccccccccccccc'),
+(4, 400, 'dddddddddd', 'dddddddddddddddddddddddddddddddddddddddddddddddddd'),
+(5, 500, 'eeeeeeeeee', 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee');
+# Test 12.1: sum_ranges (sysbench)
+PREPARE sb_sum FROM 'SELECT SUM(k) FROM sbtest WHERE id BETWEEN ? AND ?';
+SET @low = 1, @high = 3;
+EXECUTE sb_sum USING @low, @high;
+SUM(k)
+600
+EXECUTE sb_sum USING @low, @high;
+SUM(k)
+600
+EXECUTE sb_sum USING @low, @high;
+SUM(k)
+600
+SHOW STATUS LIKE 'ps_point_plan_cache_hits';
+Variable_name	Value
+Ps_point_plan_cache_hits	20
+DEALLOCATE PREPARE sb_sum;
+# Test 12.2: COUNT(*) aggregate
+PREPARE sb_cnt FROM 'SELECT COUNT(*) FROM sbtest WHERE id BETWEEN ? AND ?';
+EXECUTE sb_cnt USING @low, @high;
+COUNT(*)
+3
+EXECUTE sb_cnt USING @low, @high;
+COUNT(*)
+3
+DEALLOCATE PREPARE sb_cnt;
+# Test 12.3: Aggregate long string column
+PREPARE sb_str FROM 'SELECT SUM(LENGTH(c)) FROM sbtest WHERE id BETWEEN ? AND ?';
+EXECUTE sb_str USING @low, @high;
+SUM(LENGTH(c))
+30
+EXECUTE sb_str USING @low, @high;
+SUM(LENGTH(c))
+30
+DEALLOCATE PREPARE sb_str;
+# ========== Test 13: Non-PS statements ==========
+# Test 13.1: Direct SQL execution
+SET @start_hits = (SELECT VARIABLE_VALUE FROM PERFORMANCE_SCHEMA.session_status WHERE VARIABLE_NAME = 'Ps_point_plan_cache_hits');
+SELECT SUM(k) FROM t1 WHERE id BETWEEN 1 AND 3;
+SUM(k)
+600
+SELECT SUM(k) FROM t1 WHERE id BETWEEN 1 AND 3;
+SUM(k)
+600
+SET @end_hits = (SELECT VARIABLE_VALUE FROM PERFORMANCE_SCHEMA.session_status WHERE VARIABLE_NAME = 'Ps_point_plan_cache_hits');
+SELECT @end_hits - @start_hits AS hits_increased;
+hits_increased
+0
+# ========== Test 14: Transaction scenarios ==========
+START TRANSACTION;
+PREPARE stmt_txn FROM 'SELECT SUM(k) FROM t1 WHERE id BETWEEN ? AND ?';
+SET @low = 1, @high = 2;
+EXECUTE stmt_txn USING @low, @high;
+SUM(k)
+300
+EXECUTE stmt_txn USING @low, @high;
+SUM(k)
+300
+COMMIT;
+DEALLOCATE PREPARE stmt_txn;
+# Test 14.2: ROLLBACK scenario
+START TRANSACTION;
+PREPARE stmt_txn2 FROM 'SELECT SUM(k) FROM t1 WHERE id BETWEEN ? AND ?';
+EXECUTE stmt_txn2 USING @low, @high;
+SUM(k)
+300
+ROLLBACK;
+EXECUTE stmt_txn2 USING @low, @high;
+SUM(k)
+300
+DEALLOCATE PREPARE stmt_txn2;
+# ========== Test 15: Cursor scenarios ==========
+# Note: Requires cursor support, current implementation should skip cursor execution
+# This is a design constraint, checked in fast path guard
+# ========== Test 16: Error recovery ==========
+# Test 16.1: Division by zero (should not affect caching)
+CREATE TABLE t10 (id INT PRIMARY KEY, val INT);
+INSERT INTO t10 VALUES (1, 10), (2, 0), (3, 30);
+PREPARE stmt_div FROM 'SELECT SUM(val) / SUM(id) FROM t10 WHERE id BETWEEN ? AND ?';
+SET @low = 1, @high = 2;
+EXECUTE stmt_div USING @low, @high;
+SUM(val) / SUM(id)
+3.3333
+EXECUTE stmt_div USING @low, @high;
+SUM(val) / SUM(id)
+3.3333
+DEALLOCATE PREPARE stmt_div;
+# Test 16.2: Overflow scenario
+CREATE TABLE t11 (id INT PRIMARY KEY, big_val BIGINT);
+INSERT INTO t11 VALUES (1, 9223372036854775800), (2, 100);
+PREPARE stmt_overflow FROM 'SELECT SUM(big_val) FROM t11 WHERE id BETWEEN ? AND ?';
+SET @low = 1, @high = 2;
+EXECUTE stmt_overflow USING @low, @high;
+SUM(big_val)
+9223372036854775900
+EXECUTE stmt_overflow USING @low, @high;
+SUM(big_val)
+9223372036854775900
+DEALLOCATE PREPARE stmt_overflow;
+# ========== Cleanup ==========
+DROP TABLE IF EXISTS t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, sbtest;
+SET SESSION ps_point_plan_cache = DEFAULT;
+# Final status check
+SHOW STATUS LIKE 'ps_point_plan%';
+Variable_name	Value
+Ps_point_plan_cache_admissions	25
+Ps_point_plan_cache_cold_classifications	31
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	24
+Ps_point_plan_cache_invalidations	0

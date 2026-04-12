@@ -352,14 +352,20 @@ bool JOIN::optimize(bool finalize_access_paths) {
   if (optimized) return false;
 
   /*
-    V1.2: Early fast path for HOT prepared statements.
+    V1.3: Early fast path for HOT prepared statements.
 
     Fire BEFORE the entire optimizer preamble (Opt_trace, count_field_types,
     alloc_func_list, get_optimizable_conditions, optimize_cond, etc.) so
-    that a HOT point-select skips all of it.  The classify gates guarantee
-    that any HOT statement is a single-table point SELECT with no aggregates,
-    subqueries, derived tables, windows, or LIMIT — none of the preamble
-    output is needed.
+    that a HOT point-select skips all of it.
+
+    Phase 8: RANGE_PK_BETWEEN_AGG (single aggregate queries) manually
+    calls count_field_types + alloc_func_list + make_sum_func_list +
+    prepare_sum_aggregators + setup_sum_funcs inside the fast path,
+    since AggregateIterator requires join->sum_funcs to be initialized.
+
+    Classify gates guarantee HOT statements are single-table queries
+    with no subqueries, derived tables, windows, HAVING, explicit
+    GROUP BY, or LIMIT.
 
     On success: set_optimized(), tables_list, PLAN_READY, and return.
     On failure: fall through to the normal optimizer preamble unchanged.

@@ -51,6 +51,7 @@
 struct CHARSET_INFO;
 class Field;
 class Item_param;
+class Item_sum;
 class Prepared_statement;
 class Query_block;
 class Table_ref;
@@ -61,7 +62,7 @@ class QEP_shared;
 class QEP_TAB;
 class store_key;
 struct KEY_PART;
-struct QUICK_RANGE;
+class QUICK_RANGE;
 struct TABLE;
 
 /**
@@ -105,6 +106,7 @@ enum class PsPointPlanState : uchar {
 enum class PsCachedPlanType : uchar {
   POINT_EQ_REF = 0,
   RANGE_PK_BETWEEN,
+  RANGE_PK_BETWEEN_AGG,
 };
 
 /// Maximum key parts in a cached plan template.
@@ -333,6 +335,31 @@ struct PsPointPlanTemplate {
 
   /// True when range arena components are populated and usable.
   bool range_arena_cached{false};
+
+  /*
+    --- Phase 8: Aggregate fields for RANGE_PK_BETWEEN_AGG ---
+    Metadata only; Item_sum objects are NOT cached (clone_item()
+    returns nullptr).  The fast path reinitializes sum_funcs via
+    count_field_types + alloc_func_list + make_sum_func_list.
+  */
+
+  /// True when the query contains a single aggregate function.
+  bool has_aggregate{false};
+
+  // TODO: aggregate_type is captured at classify time but not yet consumed
+  // by any guard or fast-path logic.  Future phases may use it for runtime
+  // validation that the aggregate function kind has not changed.
+  /// Aggregate function type (SUM_FUNC / COUNT_FUNC / MIN_FUNC / MAX_FUNC).
+  uint8 aggregate_type{0};
+
+  /// Aggregate field index in TABLE::field[] (MAX_KEY for COUNT(*)).
+  uint aggregate_field_index{MAX_KEY};
+
+  /// Snapshot of the aggregate field's data type (for drift detection).
+  enum_field_types aggregate_field_type{MYSQL_TYPE_INVALID};
+
+  /// Whether the aggregate field is unsigned.
+  bool aggregate_field_unsigned{false};
 };
 
 /*
