@@ -36,6 +36,7 @@
 
 #include "sql/ps_point_plan_cache.h"
 
+#include <assert.h>
 #include <new>
 #include <type_traits>
 
@@ -55,6 +56,7 @@
 #include "sql/sql_prepare.h"
 #include "sql/sql_select.h"
 #include "sql/table.h"
+#include "sql/visible_fields.h"
 
 namespace {
 
@@ -131,6 +133,8 @@ void ps_point_plan_clear_hot_metadata(PsPointPlanTemplate *tpl) {
   tpl->order_field_type = MYSQL_TYPE_INVALID;
   tpl->order_field_unsigned = false;
   tpl->order_collation = nullptr;
+
+  tpl->has_distinct = false;
 
   for (uint i = 0; i < PS_PC_MAX_PARAMS; i++) {
     tpl->actual_types[i] = MYSQL_TYPE_INVALID;
@@ -300,6 +304,45 @@ static bool ps_point_plan_validate_simple_order_by(
 }
 
 /**
+  Validate that a query block has a simple DISTINCT suitable for
+  RANGE_PK_BETWEEN_SORT_DISTINCT caching.
+
+  Accepts:
+    SELECT DISTINCT <single_physical_column> ... ORDER BY <same_column>
+
+  Rejects:
+    - Multi-column DISTINCT (SELECT DISTINCT c, k ...)
+    - DISTINCT column differs from ORDER BY column
+    - DISTINCT on expressions
+    - DISTINCT without prior ORDER BY validation
+
+  @param  qb   Query block to validate.
+  @param  tpl  Template with ORDER BY metadata already populated.
+  @retval true  Valid simple DISTINCT.
+  @retval false Not a cacheable DISTINCT pattern.
+*/
+static bool ps_point_plan_validate_simple_distinct(
+    Query_block *qb, PsPointPlanTemplate *tpl) {
+  if (!tpl->has_order_by) return false;
+
+  uint visible_count = 0;
+  for (Item *item : VisibleFields(qb->fields)) {
+    visible_count++;
+    if (visible_count > 1) return false;
+
+    Item *real = item->real_item();
+    if (real->type() != Item::FIELD_ITEM) return false;
+
+    Item_field *field = down_cast<Item_field *>(real);
+    if (field->table_ref != tpl->table_ref) return false;
+    if (field->field == nullptr) return false;
+    if (field->field_index >= field->table_ref->table->s->fields) return false;
+    if (field->field_index != tpl->order_field_index) return false;
+  }
+  return visible_count == 1;
+}
+
+/**
   Try to extract a single field=param equality from an Item_func_eq.
   Handles both (field, param) and (param, field) argument order.
 
@@ -427,10 +470,20 @@ bool ps_point_plan_classify(THD *thd, Prepared_statement *stmt) {
   if (qb->outer_join != 0) return false;
   if (qb->first_inner_query_expression() != nullptr) return false;
 
-  /* Gate 4: no DISTINCT, LIMIT, window functions, FULLTEXT. */
-  if (qb->is_distinct() || qb->has_limit() ||
-      qb->has_windows() || qb->has_ft_funcs())
+  /* Gate 4: no LIMIT, window functions, FULLTEXT. */
+  if (qb->has_limit() || qb->has_windows() || qb->has_ft_funcs())
     return false;
+
+  /*
+    Gate 4-pre: DISTINCT requires ORDER BY on the same column.
+    DISTINCT without ORDER BY or with aggregates is not supported —
+    the fast path relies on Filesort(remove_duplicates=true) which
+    needs a sort key matching the DISTINCT key.
+  */
+  if (qb->is_distinct() && (!qb->is_ordered() || qb->agg_func_used())) {
+    stmt->set_ps_point_plan_state(PsPointPlanState::NEVER);
+    return false;
+  }
 
   /*
     Gate 4a: ORDER BY is only allowed for non-aggregate BETWEEN patterns.
@@ -481,6 +534,20 @@ bool ps_point_plan_classify(THD *thd, Prepared_statement *stmt) {
       return false;
     }
     tpl.has_order_by = true;
+  }
+
+  /*
+    Gate 4e: validate simple DISTINCT.
+    Requires single-column SELECT list matching the ORDER BY column.
+    Must be after Gate 4d (ORDER BY validation) since validate reads
+    tpl->has_order_by and tpl->order_field_index.
+  */
+  if (qb->is_distinct()) {
+    if (!ps_point_plan_validate_simple_distinct(qb, &tpl)) {
+      stmt->set_ps_point_plan_state(PsPointPlanState::NEVER);
+      return false;
+    }
+    tpl.has_distinct = true;
   }
 
   if (!ps_point_plan_extract_where_shape(qb, &tpl)) {
@@ -552,6 +619,9 @@ bool ps_point_plan_extract_where_shape(Query_block *qb,
     if (extract_between_field_params(func, tbl, &between_field, &low, &high)) {
       if (qb->agg_func_used()) {
         tpl->plan_type = PsCachedPlanType::RANGE_PK_BETWEEN_AGG;
+      } else if (qb->is_distinct()) {
+        assert(qb->is_ordered());
+        tpl->plan_type = PsCachedPlanType::RANGE_PK_BETWEEN_SORT_DISTINCT;
       } else if (qb->is_ordered()) {
         tpl->plan_type = PsCachedPlanType::RANGE_PK_BETWEEN_SORT;
       } else {
@@ -1111,6 +1181,37 @@ bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
     return true;
   }
 
+  if (tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_SORT_DISTINCT) {
+    QEP_TAB *new_qep_tab = nullptr;
+    AccessPath *range_path = nullptr;
+    if (!ps_point_plan_build_range_components(thd, join, tpl, table, keyinfo,
+                                              &new_qep_tab, &range_path))
+      return false;
+
+    Filesort *filesort = new (thd->mem_root)
+        Filesort(thd, {table}, /*keep_buffers=*/false, join->order.order,
+                 /*limit_arg=*/HA_POS_ERROR,
+                 /*remove_duplicates=*/true,
+                 /*force_sort_rowids=*/false,
+                 /*unwrap_rollup=*/false);
+    if (filesort == nullptr || filesort->sortorder == nullptr) {
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
+    }
+
+    AccessPath *sort_path =
+        NewSortAccessPath(thd, range_path, filesort, join->order.order,
+                          /*count_examined_rows=*/true);
+    if (sort_path == nullptr) {
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
+    }
+
+    ps_point_plan_commit_range_to_join(join, tpl, new_qep_tab, sort_path);
+    ps_point_plan_mark_hit(thd);
+    return true;
+  }
+
   if (tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN) {
     QEP_TAB *new_qep_tab = nullptr;
     AccessPath *range_path = nullptr;
@@ -1476,6 +1577,23 @@ bool ps_point_plan_can_admit(Prepared_statement *stmt, JOIN *join) {
     return true;
   }
 
+  if (tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_SORT_DISTINCT) {
+    if (!ps_point_plan_can_admit_range_between(tpl, join)) return false;
+
+    /*
+      The optimizer converts DISTINCT to GROUP BY and uses temp table
+      materialization, producing a complex AccessPath tree.  We don't
+      match the exact tree shape — only verify the base table access
+      is a valid PK range scan via can_admit_range_between().
+      The fast path builds a simpler SORT(Filesort with dedup) ->
+      INDEX_RANGE_SCAN tree which is semantically equivalent.
+    */
+    AccessPath *root_path = join->root_access_path();
+    if (root_path == nullptr) return false;
+
+    return true;
+  }
+
   /*
     Check 1: Table topology.
     primary_tables includes const tables.  join->tables may be larger
@@ -1721,7 +1839,8 @@ void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
 
   if (tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN ||
       tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_AGG ||
-      tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_SORT) {
+      tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_SORT ||
+      tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_SORT_DISTINCT) {
     ps_point_plan_admit_range_metadata(thd, tpl, join);
     ps_point_plan_admit_range_arena_cache(thd, stmt, tpl);
 

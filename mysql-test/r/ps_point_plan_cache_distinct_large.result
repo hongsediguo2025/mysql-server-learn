@@ -1,0 +1,1177 @@
+SET SESSION cte_max_recursion_depth = 2000;
+DROP TABLE IF EXISTS t1;
+SET SESSION ps_point_plan_cache = ON;
+# === Test 1: Large data - external merge sort dedup ===
+# This test exercises the external merge sort path when data
+# exceeds sort_buffer_size. The plan cache should still work
+# correctly even when Filesort needs to spill to disk.
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(100) NOT NULL DEFAULT '',
+padding CHAR(200) NOT NULL DEFAULT ''
+);
+# Insert many rows with repeating values to force dedup work
+# Using ~1000 rows with small sort_buffer_size will trigger external sort
+INSERT INTO t1
+SELECT
+seq AS id,
+CONCAT('value-', (seq % 50)) AS c,
+REPEAT('x', 200) AS padding
+FROM (
+WITH RECURSIVE cte(seq) AS (
+SELECT 1 UNION ALL SELECT seq + 1 FROM cte WHERE seq < 1000
+)
+SELECT seq FROM cte
+) AS seq_table;
+# Set a small sort_buffer_size to force external merge sort
+SET SESSION sort_buffer_size = 32768;
+sort_buffer_size set to 32KB
+FLUSH STATUS;
+SET @lo = 1, @hi = 1000;
+# First execute - should be admitted to HOT even with external sort
+PREPARE stmt_large FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt_large USING @lo, @hi;
+c
+value-0
+value-1
+value-10
+value-11
+value-12
+value-13
+value-14
+value-15
+value-16
+value-17
+value-18
+value-19
+value-2
+value-20
+value-21
+value-22
+value-23
+value-24
+value-25
+value-26
+value-27
+value-28
+value-29
+value-3
+value-30
+value-31
+value-32
+value-33
+value-34
+value-35
+value-36
+value-37
+value-38
+value-39
+value-4
+value-40
+value-41
+value-42
+value-43
+value-44
+value-45
+value-46
+value-47
+value-48
+value-49
+value-5
+value-6
+value-7
+value-8
+value-9
+Admissions with external sort: 1
+# Verify we got 50 distinct values (value-0 through value-49)
+SELECT COUNT(*) AS distinct_count FROM (SELECT DISTINCT c FROM t1 WHERE id BETWEEN 1 AND 1000 ORDER BY c) AS sub;
+distinct_count
+50
+# Second execute - should be cache HIT (fast path with external sort)
+EXECUTE stmt_large USING @lo, @hi;
+c
+value-0
+value-1
+value-10
+value-11
+value-12
+value-13
+value-14
+value-15
+value-16
+value-17
+value-18
+value-19
+value-2
+value-20
+value-21
+value-22
+value-23
+value-24
+value-25
+value-26
+value-27
+value-28
+value-29
+value-3
+value-30
+value-31
+value-32
+value-33
+value-34
+value-35
+value-36
+value-37
+value-38
+value-39
+value-4
+value-40
+value-41
+value-42
+value-43
+value-44
+value-45
+value-46
+value-47
+value-48
+value-49
+value-5
+value-6
+value-7
+value-8
+value-9
+Cache hits with external sort: 1
+# Third execute with smaller range - still should HIT
+SET @lo = 100, @hi = 500;
+EXECUTE stmt_large USING @lo, @hi;
+c
+value-0
+value-1
+value-10
+value-11
+value-12
+value-13
+value-14
+value-15
+value-16
+value-17
+value-18
+value-19
+value-2
+value-20
+value-21
+value-22
+value-23
+value-24
+value-25
+value-26
+value-27
+value-28
+value-29
+value-3
+value-30
+value-31
+value-32
+value-33
+value-34
+value-35
+value-36
+value-37
+value-38
+value-39
+value-4
+value-40
+value-41
+value-42
+value-43
+value-44
+value-45
+value-46
+value-47
+value-48
+value-49
+value-5
+value-6
+value-7
+value-8
+value-9
+Cache hits after range change: 2
+# DESC variant with external sort
+PREPARE stmt_large_desc FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c DESC';
+SET @lo = 1, @hi = 1000;
+EXECUTE stmt_large_desc USING @lo, @hi;
+c
+value-9
+value-8
+value-7
+value-6
+value-5
+value-49
+value-48
+value-47
+value-46
+value-45
+value-44
+value-43
+value-42
+value-41
+value-40
+value-4
+value-39
+value-38
+value-37
+value-36
+value-35
+value-34
+value-33
+value-32
+value-31
+value-30
+value-3
+value-29
+value-28
+value-27
+value-26
+value-25
+value-24
+value-23
+value-22
+value-21
+value-20
+value-2
+value-19
+value-18
+value-17
+value-16
+value-15
+value-14
+value-13
+value-12
+value-11
+value-10
+value-1
+value-0
+EXECUTE stmt_large_desc USING @lo, @hi;
+c
+value-9
+value-8
+value-7
+value-6
+value-5
+value-49
+value-48
+value-47
+value-46
+value-45
+value-44
+value-43
+value-42
+value-41
+value-40
+value-4
+value-39
+value-38
+value-37
+value-36
+value-35
+value-34
+value-33
+value-32
+value-31
+value-30
+value-3
+value-29
+value-28
+value-27
+value-26
+value-25
+value-24
+value-23
+value-22
+value-21
+value-20
+value-2
+value-19
+value-18
+value-17
+value-16
+value-15
+value-14
+value-13
+value-12
+value-11
+value-10
+value-1
+value-0
+Cache hits with DESC external sort: 3
+# Restore normal sort_buffer_size
+SET SESSION sort_buffer_size = DEFAULT;
+DEALLOCATE PREPARE stmt_large;
+DEALLOCATE PREPARE stmt_large_desc;
+DROP TABLE t1;
+# === Test 2: Large data external sort with INT column ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+val INT NOT NULL,
+padding CHAR(200) NOT NULL DEFAULT ''
+);
+# Insert 1000 rows with 100 distinct values
+INSERT INTO t1
+SELECT
+seq AS id,
+(seq % 100) AS val,
+REPEAT('y', 200) AS padding
+FROM (
+WITH RECURSIVE cte(seq) AS (
+SELECT 1 UNION ALL SELECT seq + 1 FROM cte WHERE seq < 1000
+)
+SELECT seq FROM cte
+) AS seq_table;
+SET SESSION sort_buffer_size = 32768;
+FLUSH STATUS;
+SET @lo = 1, @hi = 1000;
+# DISTINCT + ORDER BY on INT with external sort
+PREPARE stmt_int FROM 'SELECT DISTINCT val FROM t1 WHERE id BETWEEN ? AND ? ORDER BY val';
+EXECUTE stmt_int USING @lo, @hi;
+val
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+97
+98
+99
+First execute complete
+# Verify 100 distinct values (0-99)
+SELECT COUNT(*) AS distinct_int_count FROM (SELECT DISTINCT val FROM t1 WHERE id BETWEEN 1 AND 1000 ORDER BY val) AS sub;
+distinct_int_count
+100
+EXECUTE stmt_int USING @lo, @hi;
+val
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+97
+98
+99
+Cache hits with INT external sort: 1
+# DESC order
+SET @lo = 1, @hi = 500;
+EXECUTE stmt_int USING @lo, @hi;
+val
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+97
+98
+99
+SET SESSION sort_buffer_size = DEFAULT;
+DEALLOCATE PREPARE stmt_int;
+DROP TABLE t1;
+# === Test 3: Very small sort_buffer_size (16KB) ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(50) NOT NULL DEFAULT '',
+k INT NOT NULL
+);
+# Insert 500 rows
+INSERT INTO t1
+SELECT
+seq AS id,
+CONCAT('item-', (seq % 25)) AS c,
+(seq % 25) AS k
+FROM (
+WITH RECURSIVE cte(seq) AS (
+SELECT 1 UNION ALL SELECT seq + 1 FROM cte WHERE seq < 500
+)
+SELECT seq FROM cte
+) AS seq_table;
+# Very small sort_buffer_size - forces immediate external merge
+SET SESSION sort_buffer_size = 16384;
+Warnings:
+Warning	1292	Truncated incorrect sort_buffer_size value: '16384'
+FLUSH STATUS;
+SET @lo = 1, @hi = 500;
+PREPARE stmt_small FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt_small USING @lo, @hi;
+c
+item-0
+item-1
+item-10
+item-11
+item-12
+item-13
+item-14
+item-15
+item-16
+item-17
+item-18
+item-19
+item-2
+item-20
+item-21
+item-22
+item-23
+item-24
+item-3
+item-4
+item-5
+item-6
+item-7
+item-8
+item-9
+First execute with 16KB sort_buffer_size
+EXECUTE stmt_small USING @lo, @hi;
+c
+item-0
+item-1
+item-10
+item-11
+item-12
+item-13
+item-14
+item-15
+item-16
+item-17
+item-18
+item-19
+item-2
+item-20
+item-21
+item-22
+item-23
+item-24
+item-3
+item-4
+item-5
+item-6
+item-7
+item-8
+item-9
+Cache hits with 16KB sort_buffer: 1
+# Different range
+SET @lo = 50, @hi = 300;
+EXECUTE stmt_small USING @lo, @hi;
+c
+item-0
+item-1
+item-10
+item-11
+item-12
+item-13
+item-14
+item-15
+item-16
+item-17
+item-18
+item-19
+item-2
+item-20
+item-21
+item-22
+item-23
+item-24
+item-3
+item-4
+item-5
+item-6
+item-7
+item-8
+item-9
+SET SESSION sort_buffer_size = DEFAULT;
+DEALLOCATE PREPARE stmt_small;
+DROP TABLE t1;
+# === Test 4: Multiple concurrent large DISTINCT statements ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c1 CHAR(50) NOT NULL DEFAULT '',
+c2 CHAR(50) NOT NULL DEFAULT '',
+padding CHAR(150) NOT NULL DEFAULT ''
+);
+INSERT INTO t1
+SELECT
+seq AS id,
+CONCAT('c1-', (seq % 30)) AS c1,
+CONCAT('c2-', (seq % 40)) AS c2,
+REPEAT('z', 150) AS padding
+FROM (
+WITH RECURSIVE cte(seq) AS (
+SELECT 1 UNION ALL SELECT seq + 1 FROM cte WHERE seq < 800
+)
+SELECT seq FROM cte
+) AS seq_table;
+SET SESSION sort_buffer_size = 32768;
+FLUSH STATUS;
+SET @lo = 1, @hi = 800;
+PREPARE stmt_a FROM 'SELECT DISTINCT c1 FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c1';
+PREPARE stmt_b FROM 'SELECT DISTINCT c2 FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c2';
+EXECUTE stmt_a USING @lo, @hi;
+c1
+c1-0
+c1-1
+c1-10
+c1-11
+c1-12
+c1-13
+c1-14
+c1-15
+c1-16
+c1-17
+c1-18
+c1-19
+c1-2
+c1-20
+c1-21
+c1-22
+c1-23
+c1-24
+c1-25
+c1-26
+c1-27
+c1-28
+c1-29
+c1-3
+c1-4
+c1-5
+c1-6
+c1-7
+c1-8
+c1-9
+EXECUTE stmt_b USING @lo, @hi;
+c2
+c2-0
+c2-1
+c2-10
+c2-11
+c2-12
+c2-13
+c2-14
+c2-15
+c2-16
+c2-17
+c2-18
+c2-19
+c2-2
+c2-20
+c2-21
+c2-22
+c2-23
+c2-24
+c2-25
+c2-26
+c2-27
+c2-28
+c2-29
+c2-3
+c2-30
+c2-31
+c2-32
+c2-33
+c2-34
+c2-35
+c2-36
+c2-37
+c2-38
+c2-39
+c2-4
+c2-5
+c2-6
+c2-7
+c2-8
+c2-9
+Both statements executed (first time)
+Admissions: 2
+EXECUTE stmt_a USING @lo, @hi;
+c1
+c1-0
+c1-1
+c1-10
+c1-11
+c1-12
+c1-13
+c1-14
+c1-15
+c1-16
+c1-17
+c1-18
+c1-19
+c1-2
+c1-20
+c1-21
+c1-22
+c1-23
+c1-24
+c1-25
+c1-26
+c1-27
+c1-28
+c1-29
+c1-3
+c1-4
+c1-5
+c1-6
+c1-7
+c1-8
+c1-9
+EXECUTE stmt_b USING @lo, @hi;
+c2
+c2-0
+c2-1
+c2-10
+c2-11
+c2-12
+c2-13
+c2-14
+c2-15
+c2-16
+c2-17
+c2-18
+c2-19
+c2-2
+c2-20
+c2-21
+c2-22
+c2-23
+c2-24
+c2-25
+c2-26
+c2-27
+c2-28
+c2-29
+c2-3
+c2-30
+c2-31
+c2-32
+c2-33
+c2-34
+c2-35
+c2-36
+c2-37
+c2-38
+c2-39
+c2-4
+c2-5
+c2-6
+c2-7
+c2-8
+c2-9
+Cache hits: 2
+SET SESSION sort_buffer_size = DEFAULT;
+DEALLOCATE PREPARE stmt_a;
+DEALLOCATE PREPARE stmt_b;
+DROP TABLE t1;
+# === Test 5: Boundary case - data near sort_buffer_size limit ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(100) NOT NULL DEFAULT ''
+);
+# Insert rows that will be close to sort_buffer_size boundary
+INSERT INTO t1
+SELECT
+seq AS id,
+CONCAT('boundary-', (seq % 20)) AS c
+FROM (
+WITH RECURSIVE cte(seq) AS (
+SELECT 1 UNION ALL SELECT seq + 1 FROM cte WHERE seq < 200
+)
+SELECT seq FROM cte
+) AS seq_table;
+# Use sort_buffer_size that might cause edge cases
+SET SESSION sort_buffer_size = 49152;
+FLUSH STATUS;
+SET @lo = 1, @hi = 200;
+PREPARE stmt_boundary FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt_boundary USING @lo, @hi;
+c
+boundary-0
+boundary-1
+boundary-10
+boundary-11
+boundary-12
+boundary-13
+boundary-14
+boundary-15
+boundary-16
+boundary-17
+boundary-18
+boundary-19
+boundary-2
+boundary-3
+boundary-4
+boundary-5
+boundary-6
+boundary-7
+boundary-8
+boundary-9
+EXECUTE stmt_boundary USING @lo, @hi;
+c
+boundary-0
+boundary-1
+boundary-10
+boundary-11
+boundary-12
+boundary-13
+boundary-14
+boundary-15
+boundary-16
+boundary-17
+boundary-18
+boundary-19
+boundary-2
+boundary-3
+boundary-4
+boundary-5
+boundary-6
+boundary-7
+boundary-8
+boundary-9
+Cache hits at boundary: 1
+SET SESSION sort_buffer_size = DEFAULT;
+DEALLOCATE PREPARE stmt_boundary;
+DROP TABLE t1;
+# === Test 6: Large data - ensure DISTINCT still preferred over aggregation ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(80) NOT NULL DEFAULT '',
+padding CHAR(180) NOT NULL DEFAULT ''
+);
+INSERT INTO t1
+SELECT
+seq AS id,
+CONCAT('unique-', LPAD(seq % 60, 3, '0')) AS c,
+REPEAT('w', 180) AS padding
+FROM (
+WITH RECURSIVE cte(seq) AS (
+SELECT 1 UNION ALL SELECT seq + 1 FROM cte WHERE seq < 1200
+)
+SELECT seq FROM cte
+) AS seq_table;
+SET SESSION sort_buffer_size = 28672;
+Warnings:
+Warning	1292	Truncated incorrect sort_buffer_size value: '28672'
+FLUSH STATUS;
+SET @lo = 1, @hi = 1200;
+# DISTINCT with external sort should still be admitted
+PREPARE stmt_dedup FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt_dedup USING @lo, @hi;
+c
+unique-000
+unique-001
+unique-002
+unique-003
+unique-004
+unique-005
+unique-006
+unique-007
+unique-008
+unique-009
+unique-010
+unique-011
+unique-012
+unique-013
+unique-014
+unique-015
+unique-016
+unique-017
+unique-018
+unique-019
+unique-020
+unique-021
+unique-022
+unique-023
+unique-024
+unique-025
+unique-026
+unique-027
+unique-028
+unique-029
+unique-030
+unique-031
+unique-032
+unique-033
+unique-034
+unique-035
+unique-036
+unique-037
+unique-038
+unique-039
+unique-040
+unique-041
+unique-042
+unique-043
+unique-044
+unique-045
+unique-046
+unique-047
+unique-048
+unique-049
+unique-050
+unique-051
+unique-052
+unique-053
+unique-054
+unique-055
+unique-056
+unique-057
+unique-058
+unique-059
+# Verify 60 distinct values
+SELECT COUNT(*) AS distinct_count FROM (SELECT DISTINCT c FROM t1 WHERE id BETWEEN 1 AND 1200 ORDER BY c) AS sub;
+distinct_count
+60
+EXECUTE stmt_dedup USING @lo, @hi;
+c
+unique-000
+unique-001
+unique-002
+unique-003
+unique-004
+unique-005
+unique-006
+unique-007
+unique-008
+unique-009
+unique-010
+unique-011
+unique-012
+unique-013
+unique-014
+unique-015
+unique-016
+unique-017
+unique-018
+unique-019
+unique-020
+unique-021
+unique-022
+unique-023
+unique-024
+unique-025
+unique-026
+unique-027
+unique-028
+unique-029
+unique-030
+unique-031
+unique-032
+unique-033
+unique-034
+unique-035
+unique-036
+unique-037
+unique-038
+unique-039
+unique-040
+unique-041
+unique-042
+unique-043
+unique-044
+unique-045
+unique-046
+unique-047
+unique-048
+unique-049
+unique-050
+unique-051
+unique-052
+unique-053
+unique-054
+unique-055
+unique-056
+unique-057
+unique-058
+unique-059
+Cache hits with large dedup: 1
+SET SESSION sort_buffer_size = DEFAULT;
+DEALLOCATE PREPARE stmt_dedup;
+DROP TABLE t1;
+# === Final Status Summary ===
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admissions	1
+Ps_point_plan_cache_cold_classifications	1
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	1
+Ps_point_plan_cache_invalidations	0
+SET SESSION ps_point_plan_cache = DEFAULT;

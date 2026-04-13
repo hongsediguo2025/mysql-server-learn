@@ -1,0 +1,1263 @@
+DROP TABLE IF EXISTS t1;
+SET SESSION ps_point_plan_cache = ON;
+# === Test A1: Basic DISTINCT + ORDER BY ASC ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES
+(1, 'cherry'), (2, 'apple'), (3, 'cherry'),
+(4, 'banana'), (5, 'apple');
+FLUSH STATUS;
+SET @lo = 1, @hi = 5;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+# First execute — COLD -> classify + first optimizer run -> admit to HOT
+EXECUTE stmt USING @lo, @hi;
+c
+apple
+banana
+cherry
+Admissions after first execute: 1
+# Second execute — should be cache HIT via fast path
+EXECUTE stmt USING @lo, @hi;
+c
+apple
+banana
+cherry
+Cache hits: 1
+# Third execute with different range — should also HIT
+SET @lo = 2, @hi = 4;
+EXECUTE stmt USING @lo, @hi;
+c
+apple
+banana
+cherry
+Cache hits after different range: 2
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test A2: DISTINCT + ORDER BY DESC ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'c'), (5, 'b');
+FLUSH STATUS;
+SET @lo = 1, @hi = 5;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c DESC';
+EXECUTE stmt USING @lo, @hi;
+c
+c
+b
+a
+EXECUTE stmt USING @lo, @hi;
+c
+c
+b
+a
+Cache hits for DESC: 1
+# Verify results are descending and deduplicated
+EXECUTE stmt USING @lo, @hi;
+c
+c
+b
+a
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test A3: DISTINCT on INT column ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+val INT NOT NULL
+);
+INSERT INTO t1 VALUES (1, 50), (2, 10), (3, 50), (4, 30), (5, 10);
+FLUSH STATUS;
+SET @lo = 1, @hi = 5;
+PREPARE stmt FROM 'SELECT DISTINCT val FROM t1 WHERE id BETWEEN ? AND ? ORDER BY val';
+EXECUTE stmt USING @lo, @hi;
+val
+10
+30
+50
+EXECUTE stmt USING @lo, @hi;
+val
+10
+30
+50
+Cache hits with INT DISTINCT: 1
+# Verify 3 distinct values: 10, 30, 50
+EXECUTE stmt USING @lo, @hi;
+val
+10
+30
+50
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test A4: DISTINCT with VARCHAR column ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES
+(1, 'Apple'), (2, 'apple'), (3, 'BANANA'), (4, 'banana'), (5, 'Cherry');
+FLUSH STATUS;
+SET @lo = 1, @hi = 5;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+Apple
+BANANA
+Cherry
+EXECUTE stmt USING @lo, @hi;
+c
+Apple
+BANANA
+Cherry
+Cache hits with VARCHAR: 1
+# With case-insensitive collation, 'Apple'='apple' and 'BANANA'='banana'
+EXECUTE stmt USING @lo, @hi;
+c
+Apple
+BANANA
+Cherry
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test A5: Multiple concurrent DISTINCT statements ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c1 CHAR(20) NOT NULL DEFAULT '',
+c2 INT NOT NULL DEFAULT 0
+);
+INSERT INTO t1 VALUES
+(1, 'x', 100), (2, 'y', 100), (3, 'x', 200),
+(4, 'z', 300), (5, 'y', 200);
+FLUSH STATUS;
+SET @lo = 1, @hi = 5;
+PREPARE stmt_a FROM 'SELECT DISTINCT c1 FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c1';
+PREPARE stmt_b FROM 'SELECT DISTINCT c2 FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c2';
+EXECUTE stmt_a USING @lo, @hi;
+c1
+x
+y
+z
+EXECUTE stmt_b USING @lo, @hi;
+c2
+100
+200
+300
+Admissions (should be 2): 2
+EXECUTE stmt_a USING @lo, @hi;
+c1
+x
+y
+z
+EXECUTE stmt_b USING @lo, @hi;
+c2
+100
+200
+300
+Cache hits (should be 2): 2
+DEALLOCATE PREPARE stmt_a;
+DEALLOCATE PREPARE stmt_b;
+DROP TABLE t1;
+# === Test B1: Multi-column DISTINCT should be NEVER ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(20) NOT NULL DEFAULT '',
+k INT NOT NULL DEFAULT 0
+);
+INSERT INTO t1 VALUES (1, 'a', 10), (2, 'b', 20);
+FLUSH STATUS;
+PREPARE stmt FROM 'SELECT DISTINCT c, k FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+SET @lo = 1, @hi = 2;
+EXECUTE stmt USING @lo, @hi;
+c	k
+a	10
+b	20
+Classification delta (should be 0 — NEVER): 0
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test B2: DISTINCT column vs ORDER BY column ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(20) NOT NULL DEFAULT '',
+k INT NOT NULL DEFAULT 0
+);
+INSERT INTO t1 VALUES (1, 'a', 10), (2, 'b', 20);
+FLUSH STATUS;
+SET @lo = 1, @hi = 2;
+# B2a: DISTINCT k ORDER BY k — same column, should be admitted
+PREPARE stmt FROM 'SELECT DISTINCT k FROM t1 WHERE id BETWEEN ? AND ? ORDER BY k';
+EXECUTE stmt USING @lo, @hi;
+k
+10
+20
+Admissions for DISTINCT k ORDER BY k: 1
+DEALLOCATE PREPARE stmt;
+# B2b: DISTINCT c ORDER BY k — different columns
+#   MySQL rejects this with ONLY_FULL_GROUP_BY (error 3065)
+PREPARE stmt2 FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY k';
+ERROR HY000: Expression #1 of ORDER BY clause is not in SELECT list, references column 'test.t1.k' which is not in SELECT list; this is incompatible with DISTINCT
+DROP TABLE t1;
+# === Test B3: DISTINCT without ORDER BY should be NEVER ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(20) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'a'), (3, 'b');
+FLUSH STATUS;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ?';
+SET @lo = 1, @hi = 3;
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+Classification delta (should be 0 — NEVER): 0
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test B4: DISTINCT + aggregate should be NEVER ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(20) NOT NULL DEFAULT '',
+k INT NOT NULL DEFAULT 0
+);
+INSERT INTO t1 VALUES (1, 'a', 10), (2, 'b', 20), (3, 'a', 30);
+FLUSH STATUS;
+PREPARE stmt FROM 'SELECT DISTINCT SUM(k) FROM t1 WHERE id BETWEEN ? AND ? ORDER BY SUM(k)';
+SET @lo = 1, @hi = 3;
+EXECUTE stmt USING @lo, @hi;
+SUM(k)
+60
+Classification delta (should be 0): 0
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test B5: DISTINCT + LIMIT should not be classified ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(20) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'a'), (3, 'b');
+FLUSH STATUS;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c LIMIT 1';
+SET @lo = 1, @hi = 3;
+EXECUTE stmt USING @lo, @hi;
+c
+a
+Classification delta (should be 0): 0
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test B6: DISTINCT on expression should be NEVER ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+k INT NOT NULL DEFAULT 0
+);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 10);
+FLUSH STATUS;
+PREPARE stmt FROM 'SELECT DISTINCT k+1 FROM t1 WHERE id BETWEEN ? AND ? ORDER BY k+1';
+SET @lo = 1, @hi = 3;
+EXECUTE stmt USING @lo, @hi;
+k+1
+11
+21
+Classification delta (should be 0): 0
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test B7: DISTINCT + GROUP BY should not be classified ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(20) NOT NULL DEFAULT '',
+k INT NOT NULL DEFAULT 0
+);
+INSERT INTO t1 VALUES (1, 'a', 10), (2, 'b', 20), (3, 'a', 30);
+FLUSH STATUS;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? GROUP BY c ORDER BY c';
+SET @lo = 1, @hi = 3;
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+Classification delta (should be 0): 0
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test B8: DISTINCT + window function should not be classified ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(20) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'a');
+FLUSH STATUS;
+PREPARE stmt FROM 'SELECT DISTINCT c, ROW_NUMBER() OVER () AS rn FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+SET @lo = 1, @hi = 3;
+EXECUTE stmt USING @lo, @hi;
+c	rn
+a	1
+a	3
+b	2
+Classification delta (should be 0): 0
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test B9: DISTINCT on PK column (admission failure) ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(20) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
+FLUSH STATUS;
+SET @lo = 1, @hi = 5;
+PREPARE stmt FROM 'SELECT DISTINCT id FROM t1 WHERE id BETWEEN ? AND ? ORDER BY id';
+# PREPARE: classify passes all gates → COLD
+Cold classifications after PREPARE (should be 1): 1
+# 1st execute: can_admit fails (no SORT root, PK provides order) → NEVER
+EXECUTE stmt USING @lo, @hi;
+id
+1
+2
+3
+4
+5
+Admissions (should be 0): 0
+# 2nd execute: state=NEVER, normal optimizer path
+EXECUTE stmt USING @lo, @hi;
+id
+1
+2
+3
+4
+5
+Hits (should be 0): 0
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test B10: Multi-table JOIN + DISTINCT ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(20) NOT NULL DEFAULT ''
+);
+CREATE TABLE t2 (
+id INT PRIMARY KEY,
+val INT NOT NULL DEFAULT 0
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'a');
+INSERT INTO t2 VALUES (1, 10), (2, 20), (3, 30);
+FLUSH STATUS;
+SET @lo = 1, @hi = 3;
+PREPARE stmt FROM 'SELECT DISTINCT t1.c FROM t1 JOIN t2 ON t1.id = t2.id WHERE t1.id BETWEEN ? AND ? ORDER BY t1.c';
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+Classifications for JOIN query (should be 0): 0
+DEALLOCATE PREPARE stmt;
+DROP TABLE t2;
+DROP TABLE t1;
+# === Test B11: Subquery in WHERE + DISTINCT ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(20) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'c'), (5, 'b');
+FLUSH STATUS;
+SET @lo = 1, @hi = 5;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? AND c IN (SELECT c FROM t1) ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+Classifications for subquery (should be 0): 0
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test B12: DISTINCT col != ORDER BY col (Gate 4e) ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(20) NOT NULL DEFAULT '',
+k INT NOT NULL DEFAULT 0
+);
+INSERT INTO t1 VALUES (1, 'a', 10), (2, 'b', 20), (3, 'a', 30);
+SET @saved_sql_mode = @@session.sql_mode;
+SET SESSION sql_mode = '';
+FLUSH STATUS;
+SET @lo = 1, @hi = 3;
+# DISTINCT k ORDER BY c — SQL is valid without ONLY_FULL_GROUP_BY
+PREPARE stmt FROM 'SELECT DISTINCT k FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+k
+10
+30
+20
+Classifications (should be 0 — NEVER via Gate 4e): 0
+DEALLOCATE PREPARE stmt;
+SET SESSION sql_mode = @saved_sql_mode;
+DROP TABLE t1;
+# === Test C1: NULL parameter fallback ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'c'), (5, 'b');
+FLUSH STATUS;
+SET @lo = 1, @hi = 5;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+# Execute with NULL low parameter — should fallback
+SET @lo = NULL;
+EXECUTE stmt USING @lo, @hi;
+c
+Runtime fallbacks after NULL param: 1
+# Execute with valid params again — should still HIT (template stays HOT)
+SET @lo = 1;
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+New hits after recovery from NULL: 1
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test C2: Inverted range fallback ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+FLUSH STATUS;
+SET @lo = 1, @hi = 3;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+# Execute with low > high — should return empty set (fallback)
+SET @lo = 10, @hi = 1;
+EXECUTE stmt USING @lo, @hi;
+c
+# Recover with valid range
+SET @lo = 1, @hi = 3;
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+Total hits: 2
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test C3: Parameter type drift ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'a');
+FLUSH STATUS;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+# Execute with INT parameters
+SET @lo = 1, @hi = 3;
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+Hits with INT params: 1
+# Execute with DECIMAL parameters — type drift
+SET @lo = 1.0, @hi = 3.0;
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+# Execute again — should re-admit after demotion
+SET @lo = 1, @hi = 3;
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test C4: Runtime sysvar disable/enable ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'a');
+SET SESSION ps_point_plan_cache = TRUE;
+FLUSH STATUS;
+SET @lo = 1, @hi = 3;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+Hits with sysvar ON: 1
+# Disable sysvar — should fallback
+SET SESSION ps_point_plan_cache = FALSE;
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+# Re-enable — should resume hitting
+SET SESSION ps_point_plan_cache = TRUE;
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+Hits after re-enable: 2
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test C5: NULL high parameter fallback ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'a');
+FLUSH STATUS;
+SET @lo = 1, @hi = 3;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+# Execute with NULL high parameter — should fallback
+SET @hi = NULL;
+EXECUTE stmt USING @lo, @hi;
+c
+Runtime fallbacks after NULL high: 1
+# Both parameters NULL — should also fallback
+SET @lo = NULL;
+EXECUTE stmt USING @lo, @hi;
+c
+Runtime fallbacks after both NULL: 2
+# Recover with valid parameters
+SET @lo = 1, @hi = 3;
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+Hits after recovery: 1
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test D1: ALTER COLUMN type change invalidation ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c VARCHAR(50) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'c'), (5, 'b');
+FLUSH STATUS;
+SET @lo = 1, @hi = 5;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+Hits before ALTER: 1
+# Change column type from VARCHAR(50) to TEXT
+ALTER TABLE t1 MODIFY c TEXT NOT NULL;
+# Execute after ALTER — should trigger invalidation
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+Invalidations after type change: 0
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test D2: ALTER collation change invalidation ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c VARCHAR(50) CHARACTER SET latin1 COLLATE latin1_swedish_ci NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'c'), (5, 'b');
+FLUSH STATUS;
+SET @lo = 1, @hi = 5;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+Hits before collation change: 1
+# Change collation — affects sort/dedup semantics
+ALTER TABLE t1 MODIFY c VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '';
+# Execute after collation change — should invalidate
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+Invalidations after collation change: 0
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test D3: DROP COLUMN invalidation ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c VARCHAR(50) NOT NULL DEFAULT '',
+extra INT NOT NULL DEFAULT 0
+);
+INSERT INTO t1 VALUES (1, 'a', 1), (2, 'b', 2), (3, 'a', 3);
+FLUSH STATUS;
+SET @lo = 1, @hi = 3;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+# Drop the DISTINCT/ORDER BY column
+ALTER TABLE t1 DROP COLUMN c;
+# Execute after DROP COLUMN — should error
+EXECUTE stmt USING @lo, @hi;
+ERROR 42S22: Unknown column 'c' in 'field list'
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test D4: TRUNCATE TABLE invalidation ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'a');
+FLUSH STATUS;
+SET @lo = 1, @hi = 3;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+# TRUNCATE and repopulate
+TRUNCATE TABLE t1;
+INSERT INTO t1 VALUES (10, 'x'), (20, 'y'), (30, 'x');
+# Execute after TRUNCATE — should invalidate
+SET @lo = 10, @hi = 30;
+EXECUTE stmt USING @lo, @hi;
+c
+x
+y
+Invalidations after TRUNCATE: 0
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test D5: ADD INDEX invalidation ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'c'), (5, 'b');
+FLUSH STATUS;
+SET @lo = 1, @hi = 5;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+# Add an index on c
+ALTER TABLE t1 ADD INDEX idx_c (c);
+# Execute after ADD INDEX — should invalidate or reprepare
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+Invalidations after ADD INDEX: 0
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test D6: Unsigned change on DISTINCT column ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+val INT NOT NULL DEFAULT 0
+);
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 10), (4, 30), (5, 20);
+FLUSH STATUS;
+SET @lo = 1, @hi = 5;
+PREPARE stmt FROM 'SELECT DISTINCT val FROM t1 WHERE id BETWEEN ? AND ? ORDER BY val';
+EXECUTE stmt USING @lo, @hi;
+val
+10
+20
+30
+EXECUTE stmt USING @lo, @hi;
+val
+10
+20
+30
+# Change column from signed to unsigned
+ALTER TABLE t1 MODIFY val INT UNSIGNED NOT NULL DEFAULT 0;
+# Execute after unsigned change — should invalidate
+EXECUTE stmt USING @lo, @hi;
+val
+10
+20
+30
+Invalidations after unsigned change: 0
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test E1: Single row result ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'only_one'), (2, 'two'), (3, 'three');
+FLUSH STATUS;
+SET @lo = 2, @hi = 2;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+two
+EXECUTE stmt USING @lo, @hi;
+c
+two
+Cache hits with single row: 1
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test E2: All duplicate values ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'same'), (2, 'same'), (3, 'same'), (4, 'same'), (5, 'same');
+FLUSH STATUS;
+SET @lo = 1, @hi = 5;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+# Should return exactly 1 row
+EXECUTE stmt USING @lo, @hi;
+c
+same
+EXECUTE stmt USING @lo, @hi;
+c
+same
+Cache hits with all duplicates: 1
+EXECUTE stmt USING @lo, @hi;
+c
+same
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test E3: Empty result set ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'a');
+FLUSH STATUS;
+SET @lo = 100, @hi = 200;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+# Empty result — should still work
+EXECUTE stmt USING @lo, @hi;
+c
+EXECUTE stmt USING @lo, @hi;
+c
+# Now with valid range
+SET @lo = 1, @hi = 3;
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test E4: Large dataset with duplicates ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY AUTO_INCREMENT,
+c CHAR(120) NOT NULL DEFAULT ''
+);
+FLUSH STATUS;
+SET @lo = 1, @hi = 200;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+# First execute — admit
+EXECUTE stmt USING @lo, @hi;
+c
+val-0
+val-1
+val-10
+val-11
+val-12
+val-13
+val-14
+val-15
+val-16
+val-17
+val-18
+val-19
+val-2
+val-3
+val-4
+val-5
+val-6
+val-7
+val-8
+val-9
+# Second execute — HIT
+EXECUTE stmt USING @lo, @hi;
+c
+val-0
+val-1
+val-10
+val-11
+val-12
+val-13
+val-14
+val-15
+val-16
+val-17
+val-18
+val-19
+val-2
+val-3
+val-4
+val-5
+val-6
+val-7
+val-8
+val-9
+Cache hits with large dataset: 1
+# Verify at most 20 distinct values
+Distinct value count: 20
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test E5: Unsigned boundary values ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+val INT UNSIGNED NOT NULL DEFAULT 0
+);
+INSERT INTO t1 VALUES (1, 0), (2, 4294967295), (3, 0), (4, 2147483648), (5, 4294967295);
+FLUSH STATUS;
+SET @lo = 1, @hi = 5;
+PREPARE stmt FROM 'SELECT DISTINCT val FROM t1 WHERE id BETWEEN ? AND ? ORDER BY val';
+EXECUTE stmt USING @lo, @hi;
+val
+0
+2147483648
+4294967295
+EXECUTE stmt USING @lo, @hi;
+val
+0
+2147483648
+4294967295
+Cache hits with unsigned boundaries: 1
+# Should have 3 distinct values: 0, 2147483648, 4294967295
+EXECUTE stmt USING @lo, @hi;
+val
+0
+2147483648
+4294967295
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test E6: DEALLOCATE and re-PREPARE ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'a');
+FLUSH STATUS;
+SET @lo = 1, @hi = 3;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+Hits before DEALLOCATE: 1
+# DEALLOCATE and re-PREPARE — fresh classify+admit cycle
+DEALLOCATE PREPARE stmt;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+Hits after re-PREPARE: 2
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test E7: Non-PK BETWEEN range ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+k INT NOT NULL DEFAULT 0,
+c CHAR(120) NOT NULL DEFAULT '',
+KEY idx_k (k)
+);
+INSERT INTO t1 VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'a'), (4, 40, 'c'), (5, 50, 'b');
+FLUSH STATUS;
+SET @lo = 10, @hi = 40;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE k BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+Classifications (should be 1 — classify is loose): 1
+Admissions (should be 0 — non-PK scan rejected by can_admit): 0
+# Verify the query still returns correct results
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test E8: NULLable DISTINCT column with NULLs ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) DEFAULT NULL
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, NULL), (3, 'a'), (4, NULL), (5, 'b');
+# Expected result (normal path): NULL, a, b  (NULLs sort first in ASC)
+SET SESSION ps_point_plan_cache = FALSE;
+SELECT DISTINCT c FROM t1 WHERE id BETWEEN 1 AND 5 ORDER BY c;
+c
+NULL
+a
+b
+SET SESSION ps_point_plan_cache = TRUE;
+FLUSH STATUS;
+SET @lo = 1, @hi = 5;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+NULL
+a
+b
+# Second execute — fast path result must match:
+EXECUTE stmt USING @lo, @hi;
+c
+NULL
+a
+b
+Cache hits: 1
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test F1: Correctness — fast path vs normal optimizer ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES
+(1, 'cherry'), (2, 'apple'), (3, 'banana'),
+(4, 'apple'), (5, 'cherry'), (6, 'date'),
+(7, 'banana'), (8, 'elderberry'), (9, 'apple'), (10, 'fig');
+# Get expected result from normal SQL (no plan cache)
+SET SESSION ps_point_plan_cache = FALSE;
+SELECT DISTINCT c FROM t1 WHERE id BETWEEN 1 AND 10 ORDER BY c;
+c
+apple
+banana
+cherry
+date
+elderberry
+fig
+SET SESSION ps_point_plan_cache = TRUE;
+FLUSH STATUS;
+SET @lo = 1, @hi = 10;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+# First execute — admit
+EXECUTE stmt USING @lo, @hi;
+c
+apple
+banana
+cherry
+date
+elderberry
+fig
+# Second execute — fast path HIT, results must match
+EXECUTE stmt USING @lo, @hi;
+c
+apple
+banana
+cherry
+date
+elderberry
+fig
+Cache hits: 1
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test F2: Correctness — DESC order dedup ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES
+(1, 'z'), (2, 'a'), (3, 'm'), (4, 'z'), (5, 'a'),
+(6, 'b'), (7, 'm'), (8, 'y'), (9, 'b'), (10, 'y');
+SET SESSION ps_point_plan_cache = FALSE;
+# Expected DESC result:
+SELECT DISTINCT c FROM t1 WHERE id BETWEEN 1 AND 10 ORDER BY c DESC;
+c
+z
+y
+m
+b
+a
+SET SESSION ps_point_plan_cache = TRUE;
+FLUSH STATUS;
+SET @lo = 1, @hi = 10;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c DESC';
+EXECUTE stmt USING @lo, @hi;
+c
+z
+y
+m
+b
+a
+# Fast path result:
+EXECUTE stmt USING @lo, @hi;
+c
+z
+y
+m
+b
+a
+Cache hits: 1
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test F3: Correctness — varying ranges ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) NOT NULL DEFAULT ''
+);
+INSERT INTO t1 VALUES
+(1, 'a'), (2, 'b'), (3, 'a'), (4, 'c'),
+(5, 'b'), (6, 'a'), (7, 'd'), (8, 'c');
+FLUSH STATUS;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+# Range 1-4: should return a, b, c
+SET @lo = 1, @hi = 4;
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+# Range 5-8: should return a, b, c, d
+SET @lo = 5, @hi = 8;
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+d
+# Range 3-6: should return a, b, c
+SET @lo = 3, @hi = 6;
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+Total cache hits: 2
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test F4: Table with NULLable non-DISTINCT columns ===
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+c CHAR(120) NOT NULL DEFAULT '',
+extra VARCHAR(50) DEFAULT NULL
+);
+INSERT INTO t1 VALUES
+(1, 'a', NULL), (2, 'b', 'x'), (3, 'a', NULL),
+(4, 'c', 'y'), (5, 'b', NULL);
+FLUSH STATUS;
+SET @lo = 1, @hi = 5;
+PREPARE stmt FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+Cache hits: 1
+# Should return: a, b, c (extra column doesn't affect DISTINCT)
+EXECUTE stmt USING @lo, @hi;
+c
+a
+b
+c
+DEALLOCATE PREPARE stmt;
+DROP TABLE t1;
+# === Test F5: sysbench-exact schema ===
+CREATE TABLE sbtest1 (
+id INT NOT NULL AUTO_INCREMENT,
+k INT NOT NULL DEFAULT 0,
+c CHAR(120) NOT NULL DEFAULT '',
+pad CHAR(60) NOT NULL DEFAULT '',
+PRIMARY KEY (id),
+KEY k_1 (k)
+) ENGINE=InnoDB;
+# Expected result from normal optimizer
+SET SESSION ps_point_plan_cache = FALSE;
+SELECT DISTINCT c FROM sbtest1 WHERE id BETWEEN 1 AND 100 ORDER BY c;
+c
+val-0
+val-1
+val-10
+val-11
+val-12
+val-13
+val-14
+val-2
+val-3
+val-4
+val-5
+val-6
+val-7
+val-8
+val-9
+SET SESSION ps_point_plan_cache = TRUE;
+FLUSH STATUS;
+SET @lo = 1, @hi = 100;
+# sysbench distinct_ranges: SELECT DISTINCT c FROM sbtest1 WHERE id BETWEEN ? AND ? ORDER BY c
+PREPARE stmt FROM 'SELECT DISTINCT c FROM sbtest1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt USING @lo, @hi;
+c
+val-0
+val-1
+val-10
+val-11
+val-12
+val-13
+val-14
+val-2
+val-3
+val-4
+val-5
+val-6
+val-7
+val-8
+val-9
+Admissions: 1
+# Second execute — cache HIT, verify result matches expected
+EXECUTE stmt USING @lo, @hi;
+c
+val-0
+val-1
+val-10
+val-11
+val-12
+val-13
+val-14
+val-2
+val-3
+val-4
+val-5
+val-6
+val-7
+val-8
+val-9
+Cache hits: 1
+# Different range
+SET @lo = 20, @hi = 60;
+EXECUTE stmt USING @lo, @hi;
+c
+val-0
+val-1
+val-10
+val-11
+val-12
+val-13
+val-14
+val-2
+val-3
+val-4
+val-5
+val-6
+val-7
+val-8
+val-9
+# DESC variant
+PREPARE stmt_desc FROM 'SELECT DISTINCT c FROM sbtest1 WHERE id BETWEEN ? AND ? ORDER BY c DESC';
+SET @lo = 1, @hi = 50;
+EXECUTE stmt_desc USING @lo, @hi;
+c
+val-9
+val-8
+val-7
+val-6
+val-5
+val-4
+val-3
+val-2
+val-14
+val-13
+val-12
+val-11
+val-10
+val-1
+val-0
+EXECUTE stmt_desc USING @lo, @hi;
+c
+val-9
+val-8
+val-7
+val-6
+val-5
+val-4
+val-3
+val-2
+val-14
+val-13
+val-12
+val-11
+val-10
+val-1
+val-0
+Total hits (both stmts): 3
+# Verify row count <= 15 (c = 'val-' || i%15, at most 15 distinct)
+Distinct c count: 15
+DEALLOCATE PREPARE stmt;
+DEALLOCATE PREPARE stmt_desc;
+DROP TABLE sbtest1;
+# === Final Status Summary ===
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admissions	2
+Ps_point_plan_cache_cold_classifications	2
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	3
+Ps_point_plan_cache_invalidations	0
+SET SESSION ps_point_plan_cache = DEFAULT;
+# === End of Phase 10 DISTINCT test suite ===

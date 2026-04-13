@@ -191,9 +191,11 @@ DEALLOCATE PREPARE stmt7;
 DROP TABLE t1;
 
 # -----------------------------------------------------------------------
-# Test 8: ORDER BY + DISTINCT should be NEVER
+# Test 8: ORDER BY + DISTINCT — now handled by Phase 10
+#   (RANGE_PK_BETWEEN_SORT_DISTINCT).  Simple single-column
+#   DISTINCT matching ORDER BY is admitted; multi-column is NEVER.
 # -----------------------------------------------------------------------
---echo # === Test 8: ORDER BY + DISTINCT should be NEVER ===
+--echo # === Test 8: ORDER BY + DISTINCT (Phase 10 support) ===
 CREATE TABLE t1 (
   id INT PRIMARY KEY,
   c VARCHAR(50)
@@ -201,16 +203,28 @@ CREATE TABLE t1 (
 INSERT INTO t1 VALUES (1, 'a'), (2, 'a'), (3, 'b');
 
 FLUSH STATUS;
-PREPARE stmt8 FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
---let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
 SET @a = 1;
 SET @b = 3;
+
+--echo # Single-column DISTINCT matching ORDER BY — should be classified and admitted
+PREPARE stmt8 FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
 EXECUTE stmt8 USING @a, @b;
+--let $admissions = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo Admissions (should be >= 1): $admissions
+EXECUTE stmt8 USING @a, @b;
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Cache hits (should be >= 1): $hits
+
+--echo # Multi-column DISTINCT — should still be NEVER
+PREPARE stmt8b FROM 'SELECT DISTINCT c, id FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+EXECUTE stmt8b USING @a, @b;
 --let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
 --let $delta = `SELECT $after - $before`
---echo Classification delta (should be 0): $delta
+--echo Multi-column DISTINCT classification delta (should be 0): $delta
 
 DEALLOCATE PREPARE stmt8;
+DEALLOCATE PREPARE stmt8b;
 DROP TABLE t1;
 
 # -----------------------------------------------------------------------

@@ -161,22 +161,37 @@ id	c
 Classification delta (should be 0): 0
 DEALLOCATE PREPARE stmt7;
 DROP TABLE t1;
-# === Test 8: ORDER BY + DISTINCT should be NEVER ===
+# === Test 8: ORDER BY + DISTINCT (Phase 10 support) ===
 CREATE TABLE t1 (
 id INT PRIMARY KEY,
 c VARCHAR(50)
 );
 INSERT INTO t1 VALUES (1, 'a'), (2, 'a'), (3, 'b');
 FLUSH STATUS;
-PREPARE stmt8 FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
 SET @a = 1;
 SET @b = 3;
+# Single-column DISTINCT matching ORDER BY — should be classified and admitted
+PREPARE stmt8 FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
 EXECUTE stmt8 USING @a, @b;
 c
 a
 b
-Classification delta (should be 0): 0
+Admissions (should be >= 1): 1
+EXECUTE stmt8 USING @a, @b;
+c
+a
+b
+Cache hits (should be >= 1): 1
+# Multi-column DISTINCT — should still be NEVER
+PREPARE stmt8b FROM 'SELECT DISTINCT c, id FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt8b USING @a, @b;
+c	id
+a	1
+a	2
+b	3
+Multi-column DISTINCT classification delta (should be 0): 0
 DEALLOCATE PREPARE stmt8;
+DEALLOCATE PREPARE stmt8b;
 DROP TABLE t1;
 # === Test 9: Invalidation on ORDER BY field type change ===
 CREATE TABLE t1 (

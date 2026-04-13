@@ -108,6 +108,7 @@ enum class PsCachedPlanType : uchar {
   RANGE_PK_BETWEEN,
   RANGE_PK_BETWEEN_AGG,
   RANGE_PK_BETWEEN_SORT,
+  RANGE_PK_BETWEEN_SORT_DISTINCT,
 };
 
 /// Maximum key parts in a cached plan template.
@@ -387,6 +388,9 @@ struct PsPointPlanTemplate {
 
   /// Character set / collation of the ORDER BY column.
   const CHARSET_INFO *order_collation{nullptr};
+
+  /// True when the query has DISTINCT matching the ORDER BY column.
+  bool has_distinct{false};
 };
 
 /*

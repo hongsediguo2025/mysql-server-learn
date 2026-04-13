@@ -1,0 +1,319 @@
+#
+# Phase 10 DISTINCT Large Data Test Suite for ps_point_plan_cache
+#
+# Tests the external merge sort dedup path when data exceeds sort_buffer_size.
+# This exercises a different code path in Filesort and ensures the plan
+# cache works correctly even when sorting spills to disk.
+#
+
+SET SESSION cte_max_recursion_depth = 2000;
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+SET SESSION ps_point_plan_cache = ON;
+
+# ========================================================================
+# Test 1: External merge sort dedup (exceeds sort_buffer_size)
+# ========================================================================
+--echo # === Test 1: Large data - external merge sort dedup ===
+--echo # This test exercises the external merge sort path when data
+--echo # exceeds sort_buffer_size. The plan cache should still work
+--echo # correctly even when Filesort needs to spill to disk.
+
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c CHAR(100) NOT NULL DEFAULT '',
+  padding CHAR(200) NOT NULL DEFAULT ''
+);
+
+--echo # Insert many rows with repeating values to force dedup work
+--echo # Using ~1000 rows with small sort_buffer_size will trigger external sort
+INSERT INTO t1
+SELECT
+  seq AS id,
+  CONCAT('value-', (seq % 50)) AS c,
+  REPEAT('x', 200) AS padding
+FROM (
+  WITH RECURSIVE cte(seq) AS (
+    SELECT 1 UNION ALL SELECT seq + 1 FROM cte WHERE seq < 1000
+  )
+  SELECT seq FROM cte
+) AS seq_table;
+
+--echo # Set a small sort_buffer_size to force external merge sort
+SET SESSION sort_buffer_size = 32768;
+--echo sort_buffer_size set to 32KB
+
+FLUSH STATUS;
+SET @lo = 1, @hi = 1000;
+
+--echo # First execute - should be admitted to HOT even with external sort
+PREPARE stmt_large FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt_large USING @lo, @hi;
+--let $admissions = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo Admissions with external sort: $admissions
+
+--echo # Verify we got 50 distinct values (value-0 through value-49)
+SELECT COUNT(*) AS distinct_count FROM (SELECT DISTINCT c FROM t1 WHERE id BETWEEN 1 AND 1000 ORDER BY c) AS sub;
+
+--echo # Second execute - should be cache HIT (fast path with external sort)
+EXECUTE stmt_large USING @lo, @hi;
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Cache hits with external sort: $hits
+
+--echo # Third execute with smaller range - still should HIT
+SET @lo = 100, @hi = 500;
+EXECUTE stmt_large USING @lo, @hi;
+--let $hits2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Cache hits after range change: $hits2
+
+--echo # DESC variant with external sort
+PREPARE stmt_large_desc FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c DESC';
+SET @lo = 1, @hi = 1000;
+EXECUTE stmt_large_desc USING @lo, @hi;
+EXECUTE stmt_large_desc USING @lo, @hi;
+--let $hits3 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Cache hits with DESC external sort: $hits3
+
+--echo # Restore normal sort_buffer_size
+SET SESSION sort_buffer_size = DEFAULT;
+
+DEALLOCATE PREPARE stmt_large;
+DEALLOCATE PREPARE stmt_large_desc;
+DROP TABLE t1;
+
+# ========================================================================
+# Test 2: Large data with INT column (different data type)
+# ========================================================================
+--echo # === Test 2: Large data external sort with INT column ===
+
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  val INT NOT NULL,
+  padding CHAR(200) NOT NULL DEFAULT ''
+);
+
+--echo # Insert 1000 rows with 100 distinct values
+INSERT INTO t1
+SELECT
+  seq AS id,
+  (seq % 100) AS val,
+  REPEAT('y', 200) AS padding
+FROM (
+  WITH RECURSIVE cte(seq) AS (
+    SELECT 1 UNION ALL SELECT seq + 1 FROM cte WHERE seq < 1000
+  )
+  SELECT seq FROM cte
+) AS seq_table;
+
+SET SESSION sort_buffer_size = 32768;
+FLUSH STATUS;
+
+SET @lo = 1, @hi = 1000;
+
+--echo # DISTINCT + ORDER BY on INT with external sort
+PREPARE stmt_int FROM 'SELECT DISTINCT val FROM t1 WHERE id BETWEEN ? AND ? ORDER BY val';
+EXECUTE stmt_int USING @lo, @hi;
+--echo First execute complete
+
+--echo # Verify 100 distinct values (0-99)
+SELECT COUNT(*) AS distinct_int_count FROM (SELECT DISTINCT val FROM t1 WHERE id BETWEEN 1 AND 1000 ORDER BY val) AS sub;
+
+EXECUTE stmt_int USING @lo, @hi;
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Cache hits with INT external sort: $hits
+
+--echo # DESC order
+SET @lo = 1, @hi = 500;
+EXECUTE stmt_int USING @lo, @hi;
+
+SET SESSION sort_buffer_size = DEFAULT;
+DEALLOCATE PREPARE stmt_int;
+DROP TABLE t1;
+
+# ========================================================================
+# Test 3: Large data with very small sort_buffer_size (aggressive external sort)
+# ========================================================================
+--echo # === Test 3: Very small sort_buffer_size (16KB) ===
+
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c CHAR(50) NOT NULL DEFAULT '',
+  k INT NOT NULL
+);
+
+--echo # Insert 500 rows
+INSERT INTO t1
+SELECT
+  seq AS id,
+  CONCAT('item-', (seq % 25)) AS c,
+  (seq % 25) AS k
+FROM (
+  WITH RECURSIVE cte(seq) AS (
+    SELECT 1 UNION ALL SELECT seq + 1 FROM cte WHERE seq < 500
+  )
+  SELECT seq FROM cte
+) AS seq_table;
+
+--echo # Very small sort_buffer_size - forces immediate external merge
+SET SESSION sort_buffer_size = 16384;
+FLUSH STATUS;
+
+SET @lo = 1, @hi = 500;
+
+PREPARE stmt_small FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt_small USING @lo, @hi;
+--echo First execute with 16KB sort_buffer_size
+
+EXECUTE stmt_small USING @lo, @hi;
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Cache hits with 16KB sort_buffer: $hits
+
+--echo # Different range
+SET @lo = 50, @hi = 300;
+EXECUTE stmt_small USING @lo, @hi;
+
+SET SESSION sort_buffer_size = DEFAULT;
+DEALLOCATE PREPARE stmt_small;
+DROP TABLE t1;
+
+# ========================================================================
+# Test 4: Multiple concurrent large DISTINCT statements
+# ========================================================================
+--echo # === Test 4: Multiple concurrent large DISTINCT statements ===
+
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c1 CHAR(50) NOT NULL DEFAULT '',
+  c2 CHAR(50) NOT NULL DEFAULT '',
+  padding CHAR(150) NOT NULL DEFAULT ''
+);
+
+INSERT INTO t1
+SELECT
+  seq AS id,
+  CONCAT('c1-', (seq % 30)) AS c1,
+  CONCAT('c2-', (seq % 40)) AS c2,
+  REPEAT('z', 150) AS padding
+FROM (
+  WITH RECURSIVE cte(seq) AS (
+    SELECT 1 UNION ALL SELECT seq + 1 FROM cte WHERE seq < 800
+  )
+  SELECT seq FROM cte
+) AS seq_table;
+
+SET SESSION sort_buffer_size = 32768;
+FLUSH STATUS;
+
+SET @lo = 1, @hi = 800;
+
+PREPARE stmt_a FROM 'SELECT DISTINCT c1 FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c1';
+PREPARE stmt_b FROM 'SELECT DISTINCT c2 FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c2';
+
+EXECUTE stmt_a USING @lo, @hi;
+EXECUTE stmt_b USING @lo, @hi;
+--echo Both statements executed (first time)
+
+--let $admissions = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo Admissions: $admissions
+
+EXECUTE stmt_a USING @lo, @hi;
+EXECUTE stmt_b USING @lo, @hi;
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Cache hits: $hits
+
+SET SESSION sort_buffer_size = DEFAULT;
+DEALLOCATE PREPARE stmt_a;
+DEALLOCATE PREPARE stmt_b;
+DROP TABLE t1;
+
+# ========================================================================
+# Test 5: Edge case - exactly at sort_buffer_size boundary
+# ========================================================================
+--echo # === Test 5: Boundary case - data near sort_buffer_size limit ===
+
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c CHAR(100) NOT NULL DEFAULT ''
+);
+
+--echo # Insert rows that will be close to sort_buffer_size boundary
+INSERT INTO t1
+SELECT
+  seq AS id,
+  CONCAT('boundary-', (seq % 20)) AS c
+FROM (
+  WITH RECURSIVE cte(seq) AS (
+    SELECT 1 UNION ALL SELECT seq + 1 FROM cte WHERE seq < 200
+  )
+  SELECT seq FROM cte
+) AS seq_table;
+
+--echo # Use sort_buffer_size that might cause edge cases
+SET SESSION sort_buffer_size = 49152;
+FLUSH STATUS;
+
+SET @lo = 1, @hi = 200;
+
+PREPARE stmt_boundary FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt_boundary USING @lo, @hi;
+EXECUTE stmt_boundary USING @lo, @hi;
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Cache hits at boundary: $hits
+
+SET SESSION sort_buffer_size = DEFAULT;
+DEALLOCATE PREPARE stmt_boundary;
+DROP TABLE t1;
+
+# ========================================================================
+# Test 6: Large data with DISTINCT + aggregation edge case
+# ========================================================================
+--echo # === Test 6: Large data - ensure DISTINCT still preferred over aggregation ===
+
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c CHAR(80) NOT NULL DEFAULT '',
+  padding CHAR(180) NOT NULL DEFAULT ''
+);
+
+INSERT INTO t1
+SELECT
+  seq AS id,
+  CONCAT('unique-', LPAD(seq % 60, 3, '0')) AS c,
+  REPEAT('w', 180) AS padding
+FROM (
+  WITH RECURSIVE cte(seq) AS (
+    SELECT 1 UNION ALL SELECT seq + 1 FROM cte WHERE seq < 1200
+  )
+  SELECT seq FROM cte
+) AS seq_table;
+
+SET SESSION sort_buffer_size = 28672;
+FLUSH STATUS;
+
+SET @lo = 1, @hi = 1200;
+
+--echo # DISTINCT with external sort should still be admitted
+PREPARE stmt_dedup FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+EXECUTE stmt_dedup USING @lo, @hi;
+
+--echo # Verify 60 distinct values
+SELECT COUNT(*) AS distinct_count FROM (SELECT DISTINCT c FROM t1 WHERE id BETWEEN 1 AND 1200 ORDER BY c) AS sub;
+
+EXECUTE stmt_dedup USING @lo, @hi;
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Cache hits with large dedup: $hits
+
+SET SESSION sort_buffer_size = DEFAULT;
+DEALLOCATE PREPARE stmt_dedup;
+DROP TABLE t1;
+
+# ========================================================================
+# Final summary
+# ========================================================================
+--echo # === Final Status Summary ===
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+SET SESSION ps_point_plan_cache = DEFAULT;
