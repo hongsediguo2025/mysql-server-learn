@@ -1,0 +1,633 @@
+#
+# Phase 9 ORDER BY Test Suite for ps_point_plan_cache
+#
+# Comprehensive test coverage for RANGE_PK_BETWEEN_SORT functionality:
+# - Branch scenarios (normal paths)
+# - Exception handling
+# - Invalidation scenarios
+# - Cache misses
+# - Table change invalidations
+#
+
+# -----------------------------------------------------------------------
+# Test 1: Basic ORDER BY ASC - classification and admission
+# -----------------------------------------------------------------------
+--echo # === Test 1: Basic ORDER BY ASC ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c VARCHAR(50),
+  k INT
+);
+INSERT INTO t1 VALUES
+  (1, 'z', 100), (2, 'y', 200), (3, 'x', 300),
+  (4, 'w', 400), (5, 'v', 500);
+
+FLUSH STATUS;
+SET @p_low = 1;
+SET @p_high = 5;
+
+PREPARE stmt1 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c ASC';
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $after_classify = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta_classify = `SELECT $after_classify - $before`
+--echo Classification result (should be 1 for COLD): $delta_classify
+
+--echo # First execute - should admit to HOT
+EXECUTE stmt1 USING @p_low, @p_high;
+--let $after_admit = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo Admissions after first execute: $after_admit
+
+--echo # Second execute - should be cache HIT
+EXECUTE stmt1 USING @p_low, @p_high;
+--let $after_hit = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Cache hits: $after_hit
+
+--echo # Verify results are correct (ordered by c)
+EXECUTE stmt1 USING @p_low, @p_high;
+
+DEALLOCATE PREPARE stmt1;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 2: Basic ORDER BY DESC
+# -----------------------------------------------------------------------
+--echo # === Test 2: Basic ORDER BY DESC ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c VARCHAR(50)
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
+
+FLUSH STATUS;
+SET @p_low = 1;
+SET @p_high = 4;
+
+PREPARE stmt2 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c DESC';
+EXECUTE stmt2 USING @p_low, @p_high;
+EXECUTE stmt2 USING @p_low, @p_high;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Cache hits for DESC order: $hits
+
+DEALLOCATE PREPARE stmt2;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 3: ORDER BY with different data types (INT)
+# -----------------------------------------------------------------------
+--echo # === Test 3: ORDER BY with INT column ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  val INT
+);
+INSERT INTO t1 VALUES (1, 50), (2, 10), (3, 90), (4, 30), (5, 70);
+
+SET @p_low = 1;
+SET @p_high = 5;
+
+PREPARE stmt3 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY val';
+EXECUTE stmt3 USING @p_low, @p_high;
+EXECUTE stmt3 USING @p_low, @p_high;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Cache hits: $hits
+
+DEALLOCATE PREPARE stmt3;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 4: ORDER BY should be rejected with aggregate (NEVER)
+# -----------------------------------------------------------------------
+--echo # === Test 4: ORDER BY + aggregate should be NEVER ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c VARCHAR(50),
+  k INT
+);
+INSERT INTO t1 VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30);
+
+FLUSH STATUS;
+--echo # This query has both aggregate and ORDER BY - should be NEVER
+PREPARE stmt4 FROM 'SELECT SUM(k) FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+SET @a = 1;
+SET @b = 3;
+EXECUTE stmt4 USING @a, @b;
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo Classification delta (should be 0 - NEVER): $delta
+
+DEALLOCATE PREPARE stmt4;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 5: Multi-column ORDER BY should be NEVER
+# -----------------------------------------------------------------------
+--echo # === Test 5: Multi-column ORDER BY should be NEVER ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c1 VARCHAR(50),
+  c2 VARCHAR(50)
+);
+INSERT INTO t1 VALUES (1, 'a', 'x'), (2, 'b', 'y');
+
+FLUSH STATUS;
+PREPARE stmt5 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c1, c2';
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+SET @a = 1;
+SET @b = 2;
+EXECUTE stmt5 USING @a, @b;
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo Classification delta (should be 0): $delta
+
+DEALLOCATE PREPARE stmt5;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 6: ORDER BY expression should be NEVER
+# -----------------------------------------------------------------------
+--echo # === Test 6: ORDER BY expression should be NEVER ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  val INT
+);
+INSERT INTO t1 VALUES (1, 10), (2, 20);
+
+FLUSH STATUS;
+PREPARE stmt6 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY val + 1';
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+SET @a = 1;
+SET @b = 2;
+EXECUTE stmt6 USING @a, @b;
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo Classification delta (should be 0): $delta
+
+DEALLOCATE PREPARE stmt6;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 7: ORDER BY with LIMIT should be NEVER
+# -----------------------------------------------------------------------
+--echo # === Test 7: ORDER BY + LIMIT should be NEVER ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c VARCHAR(50)
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+FLUSH STATUS;
+PREPARE stmt7 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c LIMIT 2';
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+SET @a = 1;
+SET @b = 3;
+EXECUTE stmt7 USING @a, @b;
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo Classification delta (should be 0): $delta
+
+DEALLOCATE PREPARE stmt7;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 8: ORDER BY + DISTINCT should be NEVER
+# -----------------------------------------------------------------------
+--echo # === Test 8: ORDER BY + DISTINCT should be NEVER ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c VARCHAR(50)
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'a'), (3, 'b');
+
+FLUSH STATUS;
+PREPARE stmt8 FROM 'SELECT DISTINCT c FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+SET @a = 1;
+SET @b = 3;
+EXECUTE stmt8 USING @a, @b;
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo Classification delta (should be 0): $delta
+
+DEALLOCATE PREPARE stmt8;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 9: Invalidation - ORDER BY field type change
+# -----------------------------------------------------------------------
+--echo # === Test 9: Invalidation on ORDER BY field type change ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c VARCHAR(50)
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
+
+FLUSH STATUS;
+SET @p_low = 1;
+SET @p_high = 3;
+
+PREPARE stmt9 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+
+--echo # First execute - should admit
+EXECUTE stmt9 USING @p_low, @p_high;
+--let $admit1 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo Admissions: $admit1
+
+--echo # Second execute - cache hit
+EXECUTE stmt9 USING @p_low, @p_high;
+--let $hit1 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Hits before ALTER: $hit1
+
+--echo # ALTER TABLE to change column type
+ALTER TABLE t1 MODIFY c TEXT;
+
+--echo # Execute after ALTER - should invalidate and fallback
+EXECUTE stmt9 USING @p_low, @p_high;
+--let $invalidations = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_invalidations', Value, 1)
+--echo Invalidation after ALTER: $invalidations
+--let $fallback = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--echo Runtime fallbacks: $fallback
+
+DEALLOCATE PREPARE stmt9;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 10: Invalidation - ORDER BY field dropped
+# -----------------------------------------------------------------------
+--echo # === Test 10: Invalidation when ORDER BY column is dropped ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c VARCHAR(50),
+  extra INT
+);
+INSERT INTO t1 VALUES (1, 'a', 100), (2, 'b', 200);
+
+FLUSH STATUS;
+SET @p_low = 1;
+SET @p_high = 2;
+
+PREPARE stmt10 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+
+--echo # Admit and hit
+EXECUTE stmt10 USING @p_low, @p_high;
+EXECUTE stmt10 USING @p_low, @p_high;
+--let $hit1 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+--echo # Drop the ORDER BY column
+ALTER TABLE t1 DROP COLUMN c;
+
+--echo # Execute after DROP - should invalidate
+--error ER_BAD_FIELD_ERROR
+EXECUTE stmt10 USING @p_low, @p_high;
+
+--let $invalidations = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_invalidations', Value, 1)
+--echo Invalidation after DROP COLUMN: $invalidations
+
+DEALLOCATE PREPARE stmt10;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 11: Multiple concurrent statements with ORDER BY
+# -----------------------------------------------------------------------
+--echo # === Test 11: Multiple concurrent ORDER BY statements ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c1 VARCHAR(50),
+  c2 INT,
+  c3 DATE
+);
+INSERT INTO t1 VALUES
+  (1, 'z', 300, '2023-03-01'),
+  (2, 'y', 200, '2023-02-01'),
+  (3, 'x', 100, '2023-01-01');
+
+FLUSH STATUS;
+
+--echo # Prepare multiple statements with different ORDER BY columns
+SET @p_low = 1;
+SET @p_high = 3;
+
+PREPARE stmt11a FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c1';
+PREPARE stmt11b FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c2 DESC';
+PREPARE stmt11c FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c3';
+
+--echo # Execute all - each should be admitted separately
+EXECUTE stmt11a USING @p_low, @p_high;
+EXECUTE stmt11b USING @p_low, @p_high;
+EXECUTE stmt11c USING @p_low, @p_high;
+
+--let $admissions = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--echo Total admissions: $admissions
+
+--echo # Execute again - all should hit
+EXECUTE stmt11a USING @p_low, @p_high;
+EXECUTE stmt11b USING @p_low, @p_high;
+EXECUTE stmt11c USING @p_low, @p_high;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Total hits: $hits
+
+DEALLOCATE PREPARE stmt11a;
+DEALLOCATE PREPARE stmt11b;
+DEALLOCATE PREPARE stmt11c;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 12: Empty result set with ORDER BY
+# -----------------------------------------------------------------------
+--echo # === Test 12: Empty result set with ORDER BY ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c VARCHAR(50)
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+FLUSH STATUS;
+
+PREPARE stmt12 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+SET @p_low = 10;
+SET @p_high = 20;
+
+EXECUTE stmt12 USING @p_low, @p_high;
+--echo Should return empty set but still work
+
+SET @p_low = 1;
+SET @p_high = 3;
+EXECUTE stmt12 USING @p_low, @p_high;
+--echo Should return results after parameter change
+
+DEALLOCATE PREPARE stmt12;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 13: ORDER BY with composite PK
+# -----------------------------------------------------------------------
+--echo # === Test 13: ORDER BY with composite primary key ===
+CREATE TABLE t1 (
+  pk1 INT NOT NULL,
+  pk2 INT NOT NULL,
+  c VARCHAR(50),
+  PRIMARY KEY (pk1, pk2)
+);
+INSERT INTO t1 VALUES
+  (1, 1, 'c'), (1, 2, 'b'), (1, 3, 'a'),
+  (2, 1, 'f'), (2, 2, 'e'), (2, 3, 'd');
+
+FLUSH STATUS;
+
+--echo # Composite PK with ORDER BY - both params on same composite PK
+PREPARE stmt13 FROM 'SELECT * FROM t1 WHERE pk1 BETWEEN ? AND ? AND pk2 BETWEEN ? AND ? ORDER BY c';
+
+SET @p1_low = 1;
+SET @p1_high = 2;
+SET @p2_low = 1;
+SET @p2_high = 3;
+
+--echo # Note: This won't be classified as BETWEEN pattern due to AND between two BETWEEN
+EXECUTE stmt13 USING @p1_low, @p1_high, @p2_low, @p2_high;
+
+--echo # Simple composite PK BETWEEN (only first part)
+PREPARE stmt13b FROM 'SELECT * FROM t1 WHERE pk1 = ? AND pk2 = ?';
+--let $before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+SET @a = 1;
+SET @b = 1;
+EXECUTE stmt13b USING @a, @b;
+--let $after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_cold_classifications', Value, 1)
+--let $delta = `SELECT $after - $before`
+--echo Composite equality classification: $delta
+
+DEALLOCATE PREPARE stmt13;
+DEALLOCATE PREPARE stmt13b;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 14: ORDER BY collation change invalidation
+# -----------------------------------------------------------------------
+--echo # === Test 14: ORDER BY collation drift invalidation ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c VARCHAR(50) CHARACTER SET latin1 COLLATE latin1_swedish_ci
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'å'), (5, 'z');
+
+FLUSH STATUS;
+SET @p_low = 1;
+SET @p_high = 5;
+
+PREPARE stmt14 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+
+--echo # Admit and hit
+EXECUTE stmt14 USING @p_low, @p_high;
+EXECUTE stmt14 USING @p_low, @p_high;
+--let $hit1 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Hits before collation change: $hit1
+
+--echo # Change column collation
+ALTER TABLE t1 MODIFY c VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+--echo # Execute after collation change - should invalidate
+EXECUTE stmt14 USING @p_low, @p_high;
+--let $invalidations = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_invalidations', Value, 1)
+--echo Invalidation after collation change: $invalidations
+
+DEALLOCATE PREPARE stmt14;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 15: ORDER BY with unsigned column
+# -----------------------------------------------------------------------
+--echo # === Test 15: ORDER BY with unsigned column ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  val INT UNSIGNED
+);
+INSERT INTO t1 VALUES (1, 4294967295), (2, 0), (3, 2147483648);
+
+FLUSH STATUS;
+SET @p_low = 1;
+SET @p_high = 3;
+
+PREPARE stmt15 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY val';
+EXECUTE stmt15 USING @p_low, @p_high;
+EXECUTE stmt15 USING @p_low, @p_high;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Cache hits with unsigned column: $hits
+
+DEALLOCATE PREPARE stmt15;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 16: Table TRUNCATE invalidation
+# -----------------------------------------------------------------------
+--echo # === Test 16: Table TRUNCATE invalidation ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c VARCHAR(50)
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+FLUSH STATUS;
+SET @p_low = 1;
+SET @p_high = 3;
+
+PREPARE stmt16 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+
+--echo # Admit to HOT
+EXECUTE stmt16 USING @p_low, @p_high;
+EXECUTE stmt16 USING @p_low, @p_high;
+--let $hit1 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+--echo # TRUNCATE table
+TRUNCATE TABLE t1;
+INSERT INTO t1 VALUES (10, 'x'), (20, 'y'), (30, 'z');
+
+--echo # Execute after TRUNCATE - should invalidate
+SET @p_low = 10;
+SET @p_high = 30;
+EXECUTE stmt16 USING @p_low, @p_high;
+--let $invalidations = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_invalidations', Value, 1)
+--echo Invalidation after TRUNCATE: $invalidations
+
+DEALLOCATE PREPARE stmt16;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 17: Parameter type drift detection
+# -----------------------------------------------------------------------
+--echo # === Test 17: Parameter type drift ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c VARCHAR(50)
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+FLUSH STATUS;
+
+PREPARE stmt17 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+
+--echo # Execute with INT parameters
+SET @p_low = 1;
+SET @p_high = 3;
+EXECUTE stmt17 USING @p_low, @p_high;
+EXECUTE stmt17 USING @p_low, @p_high;
+
+--echo # Execute with different numeric types - should still work
+SET @p_low = 1.0;
+SET @p_high = 3.0;
+EXECUTE stmt17 USING @p_low, @p_high;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Cache hits with type variations: $hits
+
+DEALLOCATE PREPARE stmt17;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 18: sysvar off at runtime
+# -----------------------------------------------------------------------
+--echo # === Test 18: Runtime sysvar disable ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c VARCHAR(50)
+);
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+SET SESSION ps_point_plan_cache = TRUE;
+FLUSH STATUS;
+
+PREPARE stmt18 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+
+SET @p_low = 1;
+SET @p_high = 3;
+
+--echo # Admit with sysvar ON
+EXECUTE stmt18 USING @p_low, @p_high;
+EXECUTE stmt18 USING @p_low, @p_high;
+--let $hit1 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+--echo # Turn off sysvar - should fallback to normal path
+SET SESSION ps_point_plan_cache = FALSE;
+EXECUTE stmt18 USING @p_low, @p_high;
+--let $fallback = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_fallback_runtime', Value, 1)
+--echo Runtime fallbacks with sysvar OFF: $fallback
+
+--echo # Turn back on - should recover
+SET SESSION ps_point_plan_cache = TRUE;
+EXECUTE stmt18 USING @p_low, @p_high;
+--let $hit2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Hits after re-enable: $hit2
+
+DEALLOCATE PREPARE stmt18;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 19: Very large range with ORDER BY
+# -----------------------------------------------------------------------
+--echo # === Test 19: Large range scan with ORDER BY ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c VARCHAR(50)
+);
+INSERT INTO t1 VALUES
+  (1, 'val1'), (2, 'val2'), (3, 'val3'), (4, 'val4'), (5, 'val5'),
+  (6, 'val6'), (7, 'val7'), (8, 'val8'), (9, 'val9'), (10, 'val10'),
+  (11, 'val11'), (12, 'val12'), (13, 'val13'), (14, 'val14'), (15, 'val15'),
+  (16, 'val16'), (17, 'val17'), (18, 'val18'), (19, 'val19'), (20, 'val20'),
+  (21, 'val21'), (22, 'val22'), (23, 'val23'), (24, 'val24'), (25, 'val25'),
+  (26, 'val26'), (27, 'val27'), (28, 'val28'), (29, 'val29'), (30, 'val30'),
+  (31, 'val31'), (32, 'val32'), (33, 'val33'), (34, 'val34'), (35, 'val35'),
+  (36, 'val36'), (37, 'val37'), (38, 'val38'), (39, 'val39'), (40, 'val40'),
+  (41, 'val41'), (42, 'val42'), (43, 'val43'), (44, 'val44'), (45, 'val45'),
+  (46, 'val46'), (47, 'val47'), (48, 'val48'), (49, 'val49'), (50, 'val50');
+
+FLUSH STATUS;
+
+PREPARE stmt19 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+
+SET @p_low = 1;
+SET @p_high = 50;
+
+EXECUTE stmt19 USING @p_low, @p_high;
+EXECUTE stmt19 USING @p_low, @p_high;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Cache hits with large range: $hits
+
+DEALLOCATE PREPARE stmt19;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 20: Edge case - single row result with ORDER BY
+# -----------------------------------------------------------------------
+--echo # === Test 20: Single row result with ORDER BY ===
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  c VARCHAR(50)
+);
+INSERT INTO t1 VALUES (1, 'single'), (2, 'double'), (3, 'triple');
+
+FLUSH STATUS;
+
+PREPARE stmt20 FROM 'SELECT * FROM t1 WHERE id BETWEEN ? AND ? ORDER BY c';
+
+SET @p_low = 2;
+SET @p_high = 2;
+
+EXECUTE stmt20 USING @p_low, @p_high;
+EXECUTE stmt20 USING @p_low, @p_high;
+
+--let $hits = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo Cache hits with single row: $hits
+
+DEALLOCATE PREPARE stmt20;
+DROP TABLE t1;
+
+# -----------------------------------------------------------------------
+# Test 21: Final summary
+# -----------------------------------------------------------------------
+--echo # === Test Summary ===
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # === End of Phase 9 ORDER BY test suite ===

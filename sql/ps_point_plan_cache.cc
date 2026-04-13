@@ -43,6 +43,7 @@
 #include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
 #include "sql/item_sum.h"
+#include "sql/filesort.h"
 #include "sql/join_optimizer/access_path.h"
 #include "sql/key.h"
 #include "sql/range_optimizer/path_helpers.h"
@@ -123,6 +124,13 @@ void ps_point_plan_clear_hot_metadata(PsPointPlanTemplate *tpl) {
   tpl->aggregate_field_index = MAX_KEY;
   tpl->aggregate_field_type = MYSQL_TYPE_INVALID;
   tpl->aggregate_field_unsigned = false;
+
+  tpl->has_order_by = false;
+  tpl->order_field_index = MAX_KEY;
+  tpl->order_direction_desc = false;
+  tpl->order_field_type = MYSQL_TYPE_INVALID;
+  tpl->order_field_unsigned = false;
+  tpl->order_collation = nullptr;
 
   for (uint i = 0; i < PS_PC_MAX_PARAMS; i++) {
     tpl->actual_types[i] = MYSQL_TYPE_INVALID;
@@ -247,6 +255,48 @@ static bool ps_point_plan_validate_simple_aggregate(
   }
 
   return sum_count == 1;
+}
+
+/**
+  Validate that a query block has a simple single-column ORDER BY
+  suitable for RANGE_PK_BETWEEN_SORT caching.
+
+  Accepts:
+    ORDER BY <physical_column> [ASC|DESC]
+
+  Rejects:
+    - Multi-column ORDER BY
+    - ORDER BY on expressions (e.g., ORDER BY c+1)
+    - ORDER BY on columns from a different table
+    - ORDER BY NULL / ORDER BY constant
+
+  @param  qb   Query block to validate.
+  @param  tpl  Template to populate with ORDER BY metadata.
+  @retval true  Valid simple ORDER BY.
+  @retval false Not a cacheable ORDER BY pattern.
+*/
+static bool ps_point_plan_validate_simple_order_by(
+    Query_block *qb, PsPointPlanTemplate *tpl) {
+  ORDER *order = qb->order_list.first;
+  if (order == nullptr) return false;
+
+  if (order->next != nullptr) return false;
+
+  Item *item = order->item[0]->real_item();
+  if (item->type() != Item::FIELD_ITEM) return false;
+
+  Item_field *field = down_cast<Item_field *>(item);
+  if (field->table_ref != tpl->table_ref) return false;
+
+  if (field->field == nullptr) return false;
+
+  tpl->order_field_index = field->field_index;
+  tpl->order_direction_desc = (order->direction == ORDER_DESC);
+  tpl->order_field_type = field->field->type();
+  tpl->order_field_unsigned = field->field->is_unsigned();
+  tpl->order_collation = field->field->charset();
+
+  return true;
 }
 
 /**
@@ -377,10 +427,21 @@ bool ps_point_plan_classify(THD *thd, Prepared_statement *stmt) {
   if (qb->outer_join != 0) return false;
   if (qb->first_inner_query_expression() != nullptr) return false;
 
-  /* Gate 4: no sorting or complex features. */
-  if (qb->is_distinct() || qb->is_ordered() ||
-      qb->has_limit() || qb->has_windows() || qb->has_ft_funcs())
+  /* Gate 4: no DISTINCT, LIMIT, window functions, FULLTEXT. */
+  if (qb->is_distinct() || qb->has_limit() ||
+      qb->has_windows() || qb->has_ft_funcs())
     return false;
+
+  /*
+    Gate 4a: ORDER BY is only allowed for non-aggregate BETWEEN patterns.
+    ORDER BY + aggregate (e.g. SELECT SUM(k) ... ORDER BY c) is not
+    supported — the optimizer produces a different access path shape
+    that we cannot reconstruct in the fast path.
+  */
+  if (qb->is_ordered() && qb->agg_func_used()) {
+    stmt->set_ps_point_plan_state(PsPointPlanState::NEVER);
+    return false;
+  }
 
   /* Reject explicit GROUP BY (implicit grouping via agg is OK). */
   if (qb->group_list.elements > 0) return false;
@@ -407,6 +468,19 @@ bool ps_point_plan_classify(THD *thd, Prepared_statement *stmt) {
       return false;
     }
     tpl.has_aggregate = true;
+  }
+
+  /*
+    Gate 4d: validate simple ORDER BY shape.
+    Must be after tpl initialization since validate accesses tpl->table_ref.
+    Must be after Gate 4a (ORDER BY + aggregate rejection).
+  */
+  if (qb->is_ordered()) {
+    if (!ps_point_plan_validate_simple_order_by(qb, &tpl)) {
+      stmt->set_ps_point_plan_state(PsPointPlanState::NEVER);
+      return false;
+    }
+    tpl.has_order_by = true;
   }
 
   if (!ps_point_plan_extract_where_shape(qb, &tpl)) {
@@ -476,11 +550,21 @@ bool ps_point_plan_extract_where_shape(Query_block *qb,
     Item_param *low = nullptr;
     Item_param *high = nullptr;
     if (extract_between_field_params(func, tbl, &between_field, &low, &high)) {
-      tpl->plan_type = qb->agg_func_used()
-                            ? PsCachedPlanType::RANGE_PK_BETWEEN_AGG
-                            : PsCachedPlanType::RANGE_PK_BETWEEN;
+      if (qb->agg_func_used()) {
+        tpl->plan_type = PsCachedPlanType::RANGE_PK_BETWEEN_AGG;
+      } else if (qb->is_ordered()) {
+        tpl->plan_type = PsCachedPlanType::RANGE_PK_BETWEEN_SORT;
+      } else {
+        tpl->plan_type = PsCachedPlanType::RANGE_PK_BETWEEN;
+      }
       tpl->params[0] = low;
       tpl->params[1] = high;
+      /*
+        Both params (low, high) bind to the same PK field, so
+        field_indices[0] == field_indices[1] is intentional.
+        G5 loops over key_parts (= 1 for single-column PK),
+        so only field_indices[0] is checked at runtime.
+      */
       tpl->field_indices[0] = between_field->field_index;
       tpl->field_indices[1] = between_field->field_index;
       tpl->param_count = 2;
@@ -683,6 +767,28 @@ bool ps_point_plan_runtime_guard(THD *thd, Prepared_statement *stmt,
     if (agg_field == nullptr ||
         agg_field->type() != tpl.aggregate_field_type ||
         agg_field->is_unsigned() != tpl.aggregate_field_unsigned) {
+      stmt->invalidate_ps_point_plan_cache();
+      ps_point_plan_mark_invalidation(thd);
+      return false;
+    }
+  }
+
+  /* G13: ORDER BY field type / collation drift detection. */
+  if (tpl.has_order_by && tpl.order_field_index != MAX_KEY) {
+    if (tpl.order_field_index >= table->s->fields) {
+      stmt->invalidate_ps_point_plan_cache();
+      ps_point_plan_mark_invalidation(thd);
+      return false;
+    }
+    Field *order_field = table->field[tpl.order_field_index];
+    if (order_field == nullptr ||
+        order_field->type() != tpl.order_field_type ||
+        order_field->is_unsigned() != tpl.order_field_unsigned) {
+      stmt->invalidate_ps_point_plan_cache();
+      ps_point_plan_mark_invalidation(thd);
+      return false;
+    }
+    if (order_field->charset() != tpl.order_collation) {
       stmt->invalidate_ps_point_plan_cache();
       ps_point_plan_mark_invalidation(thd);
       return false;
@@ -970,6 +1076,37 @@ bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
     agg_path->cost = range_path->cost;
 
     ps_point_plan_commit_range_to_join(join, tpl, new_qep_tab, agg_path);
+    ps_point_plan_mark_hit(thd);
+    return true;
+  }
+
+  if (tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_SORT) {
+    QEP_TAB *new_qep_tab = nullptr;
+    AccessPath *range_path = nullptr;
+    if (!ps_point_plan_build_range_components(thd, join, tpl, table, keyinfo,
+                                              &new_qep_tab, &range_path))
+      return false;
+
+    Filesort *filesort = new (thd->mem_root)
+        Filesort(thd, {table}, /*keep_buffers=*/false, join->order.order,
+                 /*limit_arg=*/HA_POS_ERROR,
+                 /*remove_duplicates=*/false,
+                 /*force_sort_rowids=*/false,
+                 /*unwrap_rollup=*/false);
+    if (filesort == nullptr || filesort->sortorder == nullptr) {
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
+    }
+
+    AccessPath *sort_path =
+        NewSortAccessPath(thd, range_path, filesort, join->order.order,
+                          /*count_examined_rows=*/true);
+    if (sort_path == nullptr) {
+      ps_point_plan_mark_runtime_fallback(thd);
+      return false;
+    }
+
+    ps_point_plan_commit_range_to_join(join, tpl, new_qep_tab, sort_path);
     ps_point_plan_mark_hit(thd);
     return true;
   }
@@ -1311,6 +1448,34 @@ bool ps_point_plan_can_admit(Prepared_statement *stmt, JOIN *join) {
     return true;
   }
 
+  if (tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_SORT) {
+    if (!ps_point_plan_can_admit_range_between(tpl, join)) return false;
+
+    AccessPath *root_path = join->root_access_path();
+    if (root_path == nullptr || root_path->type != AccessPath::SORT)
+      return false;
+
+    if (root_path->sort().filesort == nullptr) return false;
+    if (root_path->sort().order == nullptr) return false;
+
+    AccessPath *child = root_path->sort().child;
+    if (child == nullptr) return false;
+
+    AccessPath *scan_path = child;
+    if (child->type == AccessPath::FILTER) {
+      scan_path = child->filter().child;
+    }
+
+    if (scan_path == nullptr ||
+        scan_path->type != AccessPath::INDEX_RANGE_SCAN)
+      return false;
+    if (used_index(scan_path) !=
+        join->qep_tab[0].table()->s->primary_key)
+      return false;
+
+    return true;
+  }
+
   /*
     Check 1: Table topology.
     primary_tables includes const tables.  join->tables may be larger
@@ -1555,7 +1720,8 @@ void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
   PsPointPlanTemplate &tpl = stmt->ps_point_plan_template();
 
   if (tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN ||
-      tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_AGG) {
+      tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_AGG ||
+      tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_SORT) {
     ps_point_plan_admit_range_metadata(thd, tpl, join);
     ps_point_plan_admit_range_arena_cache(thd, stmt, tpl);
 

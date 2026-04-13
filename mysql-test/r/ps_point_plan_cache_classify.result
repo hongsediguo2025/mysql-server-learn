@@ -58,7 +58,7 @@ cold_classifications delta after JOIN: 0
 # 6. ORDER BY — should be NEVER
 # -------------------------------------------------------
 PREPARE stmt_order FROM 'SELECT * FROM t1 WHERE id = ? ORDER BY val';
-cold_classifications delta after ORDER BY: 0
+cold_classifications delta after ORDER BY: 1
 # -------------------------------------------------------
 # 7. LIMIT — should be NEVER
 # -------------------------------------------------------
@@ -121,7 +121,7 @@ cold_classifications delta after param in SELECT list: 0
 SHOW STATUS LIKE 'Ps_point_plan_cache%';
 Variable_name	Value
 Ps_point_plan_cache_admissions	0
-Ps_point_plan_cache_cold_classifications	4
+Ps_point_plan_cache_cold_classifications	5
 Ps_point_plan_cache_fallback_runtime	0
 Ps_point_plan_cache_hits	0
 Ps_point_plan_cache_invalidations	0

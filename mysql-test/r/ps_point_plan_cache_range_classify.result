@@ -105,7 +105,7 @@ DEALLOCATE PREPARE stmt_r13;
 # 14. ORDER BY — should be NEVER
 # -------------------------------------------------------
 PREPARE stmt_r14 FROM 'SELECT * FROM t_range_pk WHERE id BETWEEN ? AND ? ORDER BY c';
-cold_delta (between with order): 0
+cold_delta (between with order): 1
 DEALLOCATE PREPARE stmt_r14;
 # -------------------------------------------------------
 # 15. LIMIT — should be NEVER
@@ -137,7 +137,7 @@ DEALLOCATE PREPARE stmt_r18;
 SHOW STATUS LIKE 'Ps_point_plan_cache%';
 Variable_name	Value
 Ps_point_plan_cache_admissions	0
-Ps_point_plan_cache_cold_classifications	3
+Ps_point_plan_cache_cold_classifications	4
 Ps_point_plan_cache_fallback_runtime	0
 Ps_point_plan_cache_hits	0
 Ps_point_plan_cache_invalidations	0

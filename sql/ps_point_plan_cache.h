@@ -107,6 +107,7 @@ enum class PsCachedPlanType : uchar {
   POINT_EQ_REF = 0,
   RANGE_PK_BETWEEN,
   RANGE_PK_BETWEEN_AGG,
+  RANGE_PK_BETWEEN_SORT,
 };
 
 /// Maximum key parts in a cached plan template.
@@ -360,6 +361,32 @@ struct PsPointPlanTemplate {
 
   /// Whether the aggregate field is unsigned.
   bool aggregate_field_unsigned{false};
+
+  /*
+    --- Phase 9: ORDER BY fields for RANGE_PK_BETWEEN_SORT ---
+    Captured at classify time from the ORDER BY clause.
+    The Filesort object is NOT cached — it holds THD* and
+    Mem_root_array members that are per-execution.  Each HOT
+    execution constructs a fresh Filesort on thd->mem_root.
+  */
+
+  /// True when the query has a cacheable single-column ORDER BY.
+  bool has_order_by{false};
+
+  /// 0-based field ordinal of the ORDER BY column in TABLE::field[].
+  uint order_field_index{MAX_KEY};
+
+  /// True for DESC, false for ASC.
+  bool order_direction_desc{false};
+
+  /// Data type of the ORDER BY column (for drift detection).
+  enum_field_types order_field_type{MYSQL_TYPE_INVALID};
+
+  /// Whether the ORDER BY column is unsigned.
+  bool order_field_unsigned{false};
+
+  /// Character set / collation of the ORDER BY column.
+  const CHARSET_INFO *order_collation{nullptr};
 };
 
 /*
