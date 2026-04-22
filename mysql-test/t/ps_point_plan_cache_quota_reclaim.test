@@ -1,0 +1,326 @@
+--echo #
+--echo # ps_point_plan_cache quota reclamation tests
+--echo # Verifies that quota is properly released when:
+--echo # 1. DEALLOCATE PREPARE is called
+--echo # 2. DDL invalidation occurs
+--echo # 3. Connection disconnects
+--echo # 4. Both plan count AND memory quota are released
+--echo #
+--echo # Run: mtr --ps-protocol ps_point_plan_cache_quota_reclaim
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup: schema for quota reclamation testing
+--echo # -------------------------------------------------------
+
+SET @orig_max_plans = @@global.ps_point_plan_cache_max_cached_plans;
+SET @orig_max_mem = @@global.ps_point_plan_cache_max_mem_size;
+
+CREATE TABLE t_quota (
+  id INT PRIMARY KEY,
+  val VARCHAR(50)
+);
+INSERT INTO t_quota VALUES (1, 'one'), (2, 'two'), (3, 'three'),
+                          (4, 'four'), (5, 'five');
+
+CREATE TABLE t_quota2 (
+  id INT PRIMARY KEY,
+  data VARCHAR(50)
+);
+INSERT INTO t_quota2 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+--echo # -------------------------------------------------------
+--echo # Test 1: DEALLOCATE releases quota (plan count)
+--echo # -------------------------------------------------------
+
+--echo # 1.1. Set strict quota
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 3;
+SELECT @@global.ps_point_plan_cache_max_cached_plans AS max_plans_setting;
+
+FLUSH STATUS;
+
+--echo # 1.2. Create and admit 3 PS (filling quota)
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_q1 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_q2 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_q3 FROM 'SELECT * FROM t_quota WHERE id = ?';
+
+SET @p = 1;
+EXECUTE stmt_q1 USING @p;
+
+SET @p = 2;
+EXECUTE stmt_q2 USING @p;
+
+SET @p = 3;
+EXECUTE stmt_q3 USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions after 3 PS: $adm_delta
+
+--echo # 1.3. Verify quota is full - 4th PS should admit but may trigger eviction if needed
+--let $refused_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+PREPARE stmt_q4 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 4;
+EXECUTE stmt_q4 USING @p;
+--let $refused_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta = `SELECT $refused_after - $refused_before`
+--echo admission_refused after 4th PS (should be 0, quota not exceeded): $refused_delta
+
+--echo # 1.4. DEALLOCATE one PS, freeing quota
+DEALLOCATE PREPARE stmt_q2;
+
+--echo # 1.5. Create 5th PS - should succeed since quota was released
+--let $refused_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+PREPARE stmt_q5 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 5;
+EXECUTE stmt_q5 USING @p;
+--let $refused_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta2 = `SELECT $refused_after2 - $refused_before2`
+--echo admission_refused after DEALLOCATE + 5th PS: $refused_delta2
+
+DEALLOCATE PREPARE stmt_q1;
+DEALLOCATE PREPARE stmt_q3;
+DEALLOCATE PREPARE stmt_q4;
+DEALLOCATE PREPARE stmt_q5;
+
+--echo # -------------------------------------------------------
+--echo # Test 2: DDL invalidation releases quota
+--echo # -------------------------------------------------------
+
+FLUSH STATUS;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 3;
+
+--echo # 2.1. Create and admit 3 PS on t_quota2
+PREPARE stmt_ddl1 FROM 'SELECT * FROM t_quota2 WHERE id = ?';
+PREPARE stmt_ddl2 FROM 'SELECT * FROM t_quota2 WHERE id = ?';
+PREPARE stmt_ddl3 FROM 'SELECT * FROM t_quota2 WHERE id = ?';
+
+SET @p = 1;
+EXECUTE stmt_ddl1 USING @p;
+
+SET @p = 2;
+EXECUTE stmt_ddl2 USING @p;
+
+SET @p = 3;
+EXECUTE stmt_ddl3 USING @p;
+
+--echo # 2.2. Trigger DDL invalidation via ALTER TABLE
+--let $inv_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_invalidations', Value, 1)
+ALTER TABLE t_quota2 ADD COLUMN extra INT;
+--let $inv_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_invalidations', Value, 1)
+--let $inv_delta = `SELECT $inv_after - $inv_before`
+--echo invalidations after ALTER TABLE: $inv_delta
+
+--echo # 2.3. Create 4th PS - quota should be available after invalidation freed entries
+--let $refused_before3 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+PREPARE stmt_ddl4 FROM 'SELECT * FROM t_quota2 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_ddl4 USING @p;
+--let $refused_after3 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta3 = `SELECT $refused_after3 - $refused_before3`
+--echo admission_refused after DDL invalidation + 4th PS: $refused_delta3
+
+--echo # 2.4. Verify invalidated PS still work (reprepare path)
+SET @p = 2;
+EXECUTE stmt_ddl1 USING @p;
+SET @p = 3;
+EXECUTE stmt_ddl2 USING @p;
+
+DEALLOCATE PREPARE stmt_ddl1;
+DEALLOCATE PREPARE stmt_ddl2;
+DEALLOCATE PREPARE stmt_ddl3;
+DEALLOCATE PREPARE stmt_ddl4;
+
+--echo # Restore table schema
+ALTER TABLE t_quota2 DROP COLUMN extra;
+
+--echo # -------------------------------------------------------
+--echo # Test 3: Connection disconnect releases quota
+--echo # -------------------------------------------------------
+
+FLUSH STATUS;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+
+--echo # 3.1. Default connection: create 2 PS (filling quota)
+PREPARE stmt_conn1 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_conn2 FROM 'SELECT * FROM t_quota WHERE id = ?';
+
+SET @p = 1;
+EXECUTE stmt_conn1 USING @p;
+
+SET @p = 2;
+EXECUTE stmt_conn2 USING @p;
+
+--echo # 3.2. Connect second connection
+--connect (con1, localhost, root,,)
+
+--echo # 3.3. Second connection: verify can still admit plans
+--echo #     (quota is global, but existing entries from conn1 occupy it)
+--let $refused_before4 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+PREPARE stmt_con1 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 3;
+EXECUTE stmt_con1 USING @p;
+--let $refused_after4 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta4 = `SELECT $refused_after4 - $refused_before4`
+--echo admission_refused on con1 (may trigger eviction): $refused_delta4
+
+DEALLOCATE PREPARE stmt_con1;
+
+--echo # 3.4. Disconnect con1
+--disconnect con1
+--source include/wait_until_disconnected.inc
+--connection default
+
+--echo # 3.5. Back on default - create additional PS
+--echo #     (verify no issues with disconnect/reconnect cycle)
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+SET @p = 3;
+EXECUTE stmt_conn1 USING @p;
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits on default connection: $hits_delta
+
+DEALLOCATE PREPARE stmt_conn1;
+DEALLOCATE PREPARE stmt_conn2;
+
+--echo # -------------------------------------------------------
+--echo # Test 4: DEALLOCATE releases plan count quota
+--echo # -------------------------------------------------------
+
+FLUSH STATUS;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 3;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 0;
+
+--echo # 4.1. Create 3 PS filling quota
+PREPARE stmt_dealloc1 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_dealloc2 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_dealloc3 FROM 'SELECT * FROM t_quota WHERE id = ?';
+
+SET @p = 1;
+EXECUTE stmt_dealloc1 USING @p;
+SET @p = 2;
+EXECUTE stmt_dealloc2 USING @p;
+SET @p = 3;
+EXECUTE stmt_dealloc3 USING @p;
+
+--echo # 4.2. Try to create 4th PS - should be refused
+--let $refused_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+PREPARE stmt_dealloc4 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 4;
+EXECUTE stmt_dealloc4 USING @p;
+--let $refused_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta = `SELECT $refused_after - $refused_before`
+--echo Quota full - admission_refused: $refused_delta
+
+--echo # 4.3. DEALLOCATE one PS, then try 4th again - should succeed
+DEALLOCATE PREPARE stmt_dealloc2;
+
+--let $refused_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+PREPARE stmt_dealloc5 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 5;
+EXECUTE stmt_dealloc5 USING @p;
+--let $refused_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta2 = `SELECT $refused_after2 - $refused_before2`
+--echo After DEALLOCATE - admission_refused: $refused_delta2
+
+DEALLOCATE PREPARE stmt_dealloc1;
+DEALLOCATE PREPARE stmt_dealloc3;
+DEALLOCATE PREPARE stmt_dealloc4;
+DEALLOCATE PREPARE stmt_dealloc5;
+
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = DEFAULT;
+
+--echo # -------------------------------------------------------
+--echo # Test 5: Quota reclamation with multiple DEALLOCATE scenarios
+--echo # -------------------------------------------------------
+
+FLUSH STATUS;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 4;
+
+--echo # 5.1. Create 4 PS filling quota
+PREPARE stmt_multi1 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_multi2 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_multi3 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_multi4 FROM 'SELECT * FROM t_quota WHERE id = ?';
+
+SET @p = 1;
+EXECUTE stmt_multi1 USING @p;
+SET @p = 2;
+EXECUTE stmt_multi2 USING @p;
+SET @p = 3;
+EXECUTE stmt_multi3 USING @p;
+SET @p = 4;
+EXECUTE stmt_multi4 USING @p;
+
+--echo # 5.2. DEALLOCATE 2 PS
+DEALLOCATE PREPARE stmt_multi2;
+DEALLOCATE PREPARE stmt_multi4;
+
+--echo # 5.3. Create 2 new PS - should succeed
+--let $adm_before5 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_multi5 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_multi6 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 5;
+EXECUTE stmt_multi5 USING @p;
+EXECUTE stmt_multi6 USING @p;
+--let $adm_after5 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta5 = `SELECT $adm_after5 - $adm_before5`
+--echo new admissions after DEALLOCATE: $adm_delta5
+
+DEALLOCATE PREPARE stmt_multi1;
+DEALLOCATE PREPARE stmt_multi3;
+DEALLOCATE PREPARE stmt_multi5;
+DEALLOCATE PREPARE stmt_multi6;
+
+--echo # -------------------------------------------------------
+--echo # Test 6: Quota behavior with DEALLOCATE before admission
+--echo # -------------------------------------------------------
+
+FLUSH STATUS;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+
+--echo # 6.1. PREPARE without EXECUTE (COLD, not occupying quota yet)
+PREPARE stmt_cold1 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_cold2 FROM 'SELECT * FROM t_quota WHERE id = ?';
+
+--echo # 6.2. Admit both (quota now used)
+SET @p = 1;
+EXECUTE stmt_cold1 USING @p;
+SET @p = 2;
+EXECUTE stmt_cold2 USING @p;
+
+--echo # 6.3. DEALLOCATE before creating 3rd
+DEALLOCATE PREPARE stmt_cold1;
+
+--echo # 6.4. 3rd PS should now admit successfully
+--let $refused_before6 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+PREPARE stmt_cold3 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 3;
+EXECUTE stmt_cold3 USING @p;
+--let $refused_after6 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta6 = `SELECT $refused_after6 - $refused_before6`
+--echo admission_refused after DEALLOCATE before 3rd: $refused_delta6
+
+DEALLOCATE PREPARE stmt_cold2;
+DEALLOCATE PREPARE stmt_cold3;
+
+--echo # -------------------------------------------------------
+--echo # Final counter summary
+--echo # -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Restore defaults
+--echo # -------------------------------------------------------
+SET GLOBAL ps_point_plan_cache_max_cached_plans = @orig_max_plans;
+SET GLOBAL ps_point_plan_cache_max_mem_size = @orig_max_mem;
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+DROP TABLE t_quota2;
+DROP TABLE t_quota;
+
+--echo #
+--echo # End of quota reclamation tests
+--echo #

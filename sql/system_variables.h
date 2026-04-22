@@ -579,6 +579,8 @@ struct System_status_var {
   ulonglong ps_point_plan_cache_invalidations;
   ulonglong ps_point_plan_cache_fallback_runtime;
   ulonglong ps_point_plan_cache_cold_classifications;
+  ulonglong ps_point_plan_cache_admission_refused;
+  ulonglong ps_point_plan_cache_evictions;
 
   ulong com_other;
   ulong com_stat[(uint)SQLCOM_END];
@@ -597,7 +599,7 @@ struct System_status_var {
   used as a global counter. It marks the end of a contiguous block of counters
   that can be iteratively totaled. See add_to_status().
 */
-#define LAST_STATUS_VAR ps_point_plan_cache_cold_classifications
+#define LAST_STATUS_VAR ps_point_plan_cache_evictions
 
 /*
   This must reference the FIRST ulonglong variable in system_status_var that is

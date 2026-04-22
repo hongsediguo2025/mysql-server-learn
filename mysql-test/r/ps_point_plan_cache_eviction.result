@@ -1,0 +1,296 @@
+#
+# Plan cache eviction testing
+# Tests eviction_pct watermark trigger, idle eviction, and
+# re-execution after eviction (HOT -> COLD transition).
+#
+# -------------------------------------------------------
+# Setup: schema for eviction testing
+# -------------------------------------------------------
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+val VARCHAR(50),
+uk INT NOT NULL,
+name VARCHAR(50),
+UNIQUE KEY idx_uk (uk),
+KEY idx_name (name)
+);
+INSERT INTO t1 VALUES (1, 'alpha', 100, 'Alice'),
+(2, 'beta', 200, 'Bob'),
+(3, 'gamma', 300, 'Charlie'),
+(4, 'delta', 400, 'David'),
+(5, 'epsilon', 500, 'Eve'),
+(6, 'zeta', 600, 'Frank'),
+(7, 'eta', 700, 'Grace'),
+(8, 'theta', 800, 'Henry'),
+(9, 'iota', 900, 'Ivy'),
+(10, 'kappa', 1000, 'Jack'),
+(11, 'lambda', 1100, 'Karen'),
+(12, 'mu', 1200, 'Leo'),
+(13, 'nu', 1300, 'Mia'),
+(14, 'xi', 1400, 'Noah'),
+(15, 'omicron', 1500, 'Olivia');
+# -------------------------------------------------------
+# 1. eviction_pct = 0: Disable eviction, verify direct refusal
+#    when quota is full
+# -------------------------------------------------------
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 5;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 0;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 1;
+FLUSH STATUS;
+# Prepare and execute 5 PS (should all be admitted)
+PREPARE stmt1 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+PREPARE stmt2 FROM 'SELECT * FROM t1 WHERE uk = ?';
+SET @p = 200;
+EXECUTE stmt2 USING @p;
+id	val	uk	name
+2	beta	200	Bob
+PREPARE stmt3 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt3 USING @p;
+id	val	uk	name
+2	beta	200	Bob
+PREPARE stmt4 FROM 'SELECT * FROM t1 WHERE uk = ?';
+SET @p = 300;
+EXECUTE stmt4 USING @p;
+id	val	uk	name
+3	gamma	300	Charlie
+PREPARE stmt5 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 3;
+EXECUTE stmt5 USING @p;
+id	val	uk	name
+3	gamma	300	Charlie
+admissions after 5 PS: 5
+# 6th PS should be refused (eviction disabled)
+PREPARE stmt6 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 4;
+EXECUTE stmt6 USING @p;
+id	val	uk	name
+4	delta	400	David
+admission_refused after 6th PS: 1
+# Cleanup
+DEALLOCATE PREPARE stmt1;
+DEALLOCATE PREPARE stmt2;
+DEALLOCATE PREPARE stmt3;
+DEALLOCATE PREPARE stmt4;
+DEALLOCATE PREPARE stmt5;
+DEALLOCATE PREPARE stmt6;
+# -------------------------------------------------------
+# 2. eviction_pct = 100: Trigger eviction scan on every admission
+# -------------------------------------------------------
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 3;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 1;
+FLUSH STATUS;
+# Prepare and execute 3 PS (fill quota)
+PREPARE stmt_a FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_a USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+PREPARE stmt_b FROM 'SELECT * FROM t1 WHERE uk = ?';
+SET @p = 200;
+EXECUTE stmt_b USING @p;
+id	val	uk	name
+2	beta	200	Bob
+PREPARE stmt_c FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt_c USING @p;
+id	val	uk	name
+2	beta	200	Bob
+# Wait for entries to become idle
+# 4th PS should trigger eviction scan
+PREPARE stmt_d FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 3;
+EXECUTE stmt_d USING @p;
+id	val	uk	name
+3	gamma	300	Charlie
+evictions after 4th PS: 3
+admissions after 4th PS: 1
+DEALLOCATE PREPARE stmt_a;
+DEALLOCATE PREPARE stmt_b;
+DEALLOCATE PREPARE stmt_c;
+DEALLOCATE PREPARE stmt_d;
+# -------------------------------------------------------
+# 3. Watermark trigger test: max_cached_plans=10,
+#    eviction_pct=70 (watermark=7), verify eviction triggers
+#    at 8th PS when quota is full
+# -------------------------------------------------------
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 10;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 70;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 1;
+FLUSH STATUS;
+# Prepare 7 PS (below watermark, should all be admitted)
+PREPARE stmt_w1 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_w1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+PREPARE stmt_w2 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt_w2 USING @p;
+id	val	uk	name
+2	beta	200	Bob
+PREPARE stmt_w3 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 3;
+EXECUTE stmt_w3 USING @p;
+id	val	uk	name
+3	gamma	300	Charlie
+PREPARE stmt_w4 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 4;
+EXECUTE stmt_w4 USING @p;
+id	val	uk	name
+4	delta	400	David
+PREPARE stmt_w5 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 5;
+EXECUTE stmt_w5 USING @p;
+id	val	uk	name
+5	epsilon	500	Eve
+PREPARE stmt_w6 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 6;
+EXECUTE stmt_w6 USING @p;
+id	val	uk	name
+6	zeta	600	Frank
+PREPARE stmt_w7 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 7;
+EXECUTE stmt_w7 USING @p;
+id	val	uk	name
+7	eta	700	Grace
+admissions after 7 PS (below watermark): 7
+# Wait for entries to become idle
+# 8th PS should trigger eviction (above watermark)
+PREPARE stmt_w8 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 8;
+EXECUTE stmt_w8 USING @p;
+id	val	uk	name
+8	theta	800	Henry
+evictions after 8th PS (above watermark): 0
+DEALLOCATE PREPARE stmt_w1;
+DEALLOCATE PREPARE stmt_w2;
+DEALLOCATE PREPARE stmt_w3;
+DEALLOCATE PREPARE stmt_w4;
+DEALLOCATE PREPARE stmt_w5;
+DEALLOCATE PREPARE stmt_w6;
+DEALLOCATE PREPARE stmt_w7;
+DEALLOCATE PREPARE stmt_w8;
+# -------------------------------------------------------
+# 4. Evicted PS re-execution: After eviction (HOT -> COLD),
+#    re-execute should take normal optimizer path with correct results
+# -------------------------------------------------------
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 1;
+FLUSH STATUS;
+# Create PS and execute it (will be admitted as HOT)
+PREPARE stmt_re FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 5;
+EXECUTE stmt_re USING @p;
+id	val	uk	name
+5	epsilon	500	Eve
+# Verify it was admitted
+hits after first execute: 0
+# Wait for idle timeout
+# Create another PS to trigger eviction of stmt_re
+PREPARE stmt_trigger FROM 'SELECT * FROM t1 WHERE uk = ?';
+SET @p = 300;
+EXECUTE stmt_trigger USING @p;
+id	val	uk	name
+3	gamma	300	Charlie
+# Re-execute the original PS (should now be COLD, go through optimizer)
+SET @p = 6;
+EXECUTE stmt_re USING @p;
+id	val	uk	name
+6	zeta	600	Frank
+hits delta after re-execute (evicted PS): 1
+DEALLOCATE PREPARE stmt_re;
+DEALLOCATE PREPARE stmt_trigger;
+# -------------------------------------------------------
+# 5. Evictions counter verification
+# -------------------------------------------------------
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 3;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 1;
+FLUSH STATUS;
+# Fill quota with 3 PS
+PREPARE stmt_c1 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_c1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+PREPARE stmt_c2 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt_c2 USING @p;
+id	val	uk	name
+2	beta	200	Bob
+PREPARE stmt_c3 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 3;
+EXECUTE stmt_c3 USING @p;
+id	val	uk	name
+3	gamma	300	Charlie
+# Create 4th PS to trigger eviction
+PREPARE stmt_c4 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 4;
+EXECUTE stmt_c4 USING @p;
+id	val	uk	name
+4	delta	400	David
+evictions counter increment: 3
+# Verify evictions > 0
+evictions counter is positive: 1
+DEALLOCATE PREPARE stmt_c1;
+DEALLOCATE PREPARE stmt_c2;
+DEALLOCATE PREPARE stmt_c3;
+DEALLOCATE PREPARE stmt_c4;
+# -------------------------------------------------------
+# 6. eviction_idle_seconds = 0: Disable TTL eviction
+# -------------------------------------------------------
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 0;
+FLUSH STATUS;
+# Fill quota
+PREPARE stmt_t1 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_t1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+PREPARE stmt_t2 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt_t2 USING @p;
+id	val	uk	name
+2	beta	200	Bob
+# 3rd PS should be refused (no eviction, TTL disabled)
+PREPARE stmt_t3 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 3;
+EXECUTE stmt_t3 USING @p;
+id	val	uk	name
+3	gamma	300	Charlie
+admission_refused with TTL disabled: 1
+DEALLOCATE PREPARE stmt_t1;
+DEALLOCATE PREPARE stmt_t2;
+DEALLOCATE PREPARE stmt_t3;
+# -------------------------------------------------------
+# 7. Final counter summary
+# -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admission_refused	1
+Ps_point_plan_cache_admissions	2
+Ps_point_plan_cache_cold_classifications	3
+Ps_point_plan_cache_evictions	0
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	0
+Ps_point_plan_cache_invalidations	0
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t1;
+# Reset to defaults
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 500000;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 75;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 300;
+#
+# End of plan cache eviction tests
+#

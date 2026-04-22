@@ -1,0 +1,663 @@
+--echo #
+--echo # ps_point_plan_cache edge cases and boundary conditions test
+--echo # Covers extreme parameter values, counter validation,
+--echo # and corner scenarios not covered in main tests.
+--echo #
+--echo # Run: mtr --ps-protocol ps_point_plan_cache_edge_cases
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup: save original values and create test schema
+--echo # -------------------------------------------------------
+
+SET @orig_max_mem = @@global.ps_point_plan_cache_max_mem_size;
+SET @orig_max_plans = @@global.ps_point_plan_cache_max_cached_plans;
+SET @orig_eviction_pct = @@global.ps_point_plan_cache_eviction_pct;
+SET @orig_idle_seconds = @@global.ps_point_plan_cache_eviction_idle_seconds;
+
+CREATE TABLE t_edge (
+  id INT PRIMARY KEY,
+  val VARCHAR(50),
+  uk INT NOT NULL UNIQUE,
+  name VARCHAR(50),
+  KEY idx_name (name)
+);
+INSERT INTO t_edge VALUES (1, 'alpha', 100, 'Alice'),
+                          (2, 'beta', 200, 'Bob'),
+                          (3, 'gamma', 300, 'Charlie'),
+                          (4, 'delta', 400, 'David'),
+                          (5, 'epsilon', 500, 'Eve');
+
+CREATE TABLE t_edge2 (
+  pk1 INT,
+  pk2 INT,
+  data VARCHAR(50),
+  PRIMARY KEY (pk1, pk2)
+);
+INSERT INTO t_edge2 VALUES (1, 10, 'first'), (2, 20, 'second'), (3, 30, 'third');
+
+--echo # =======================================================
+--echo # Test 1: max_mem_size = 0 (unlimited memory)
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 1.1. Set max_mem_size = 0 (unlimited)
+SET GLOBAL ps_point_plan_cache_max_mem_size = 0;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 0;
+SELECT @@global.ps_point_plan_cache_max_mem_size AS 'max_mem_size unlimited (0)';
+SELECT @@global.ps_point_plan_cache_max_cached_plans AS 'max_cached_plans unlimited (0)';
+
+--echo # 1.2. Create multiple PS - all should be admitted without limit
+PREPARE stmt_unlim1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+PREPARE stmt_unlim2 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+PREPARE stmt_unlim3 FROM 'SELECT * FROM t_edge WHERE name = ?';
+PREPARE stmt_unlim4 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ? AND pk2 = ?';
+PREPARE stmt_unlim5 FROM 'SELECT * FROM t_edge WHERE id BETWEEN ? AND ?';
+
+--echo # 1.3. Execute all - should all become HOT
+SET @p = 1;
+EXECUTE stmt_unlim1 USING @p;
+
+SET @p = 100;
+EXECUTE stmt_unlim2 USING @p;
+
+SET @p = 'Alice';
+EXECUTE stmt_unlim3 USING @p;
+
+SET @p1 = 1;
+SET @p2 = 10;
+EXECUTE stmt_unlim4 USING @p1, @p2;
+
+SET @p1 = 1;
+SET @p2 = 3;
+EXECUTE stmt_unlim5 USING @p1, @p2;
+
+--echo # 1.4. Verify no admission refused
+--let $refused = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--echo admission_refused with unlimited: $refused (expected: 0)
+
+--echo # 1.5. Verify mem_used is being tracked even when unlimited
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+
+DEALLOCATE PREPARE stmt_unlim1;
+DEALLOCATE PREPARE stmt_unlim2;
+DEALLOCATE PREPARE stmt_unlim3;
+DEALLOCATE PREPARE stmt_unlim4;
+DEALLOCATE PREPARE stmt_unlim5;
+
+--echo # =======================================================
+--echo # Test 2: Extremely small memory limit (1 byte)
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 2.1. Set max_mem_size = 1 (smaller than any PS arena)
+SET GLOBAL ps_point_plan_cache_max_mem_size = 1;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 1000000;
+SELECT @@global.ps_point_plan_cache_max_mem_size AS 'max_mem_size = 1 byte';
+
+--echo # 2.2. Try to create PS - should be refused (arena > 1 byte)
+--let $refused_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+PREPARE stmt_1byte FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_1byte USING @p;
+--let $refused_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta = `SELECT $refused_after - $refused_before`
+--echo admission_refused with 1 byte limit: $refused_delta (expected: 1)
+
+--echo # 2.3. Verify mem_used didn't increase (PS not admitted)
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+
+DEALLOCATE PREPARE stmt_1byte;
+
+--echo # =======================================================
+--echo # Test 3: Memory limit exactly sized for one PS
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 3.1. Set max_mem_size to approximately one PS size (~1024 bytes)
+SET GLOBAL ps_point_plan_cache_max_mem_size = 1024;
+SELECT @@global.ps_point_plan_cache_max_mem_size AS 'max_mem_size = 1024 bytes';
+
+--echo # 3.2. First PS should succeed
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_fit1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_fit1 USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo First PS admission: $adm_delta (expected: 1)
+
+--echo # 3.3. Second PS should be refused (not enough memory)
+--let $refused_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+PREPARE stmt_fit2 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_fit2 USING @p;
+--let $refused_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta = `SELECT $refused_after - $refused_before`
+--echo Second PS refused: $refused_delta (expected: 1)
+
+DEALLOCATE PREPARE stmt_fit1;
+DEALLOCATE PREPARE stmt_fit2;
+
+--echo # =======================================================
+--echo # Test 4: max_cached_plans = 1 (minimum non-zero)
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 4.1. Set max_cached_plans = 1
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 1;
+SET GLOBAL ps_point_plan_cache_max_mem_size = 0;
+SELECT @@global.ps_point_plan_cache_max_cached_plans AS 'max_cached_plans = 1';
+
+--echo # 4.2. First PS should succeed
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_single1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_single1 USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo First PS admission: $adm_delta (expected: 1)
+
+--echo # 4.3. Second PS should be refused
+--let $refused_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+PREPARE stmt_single2 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_single2 USING @p;
+--let $refused_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta = `SELECT $refused_after - $refused_before`
+--echo Second PS refused: $refused_delta (expected: 1)
+
+--echo # 4.4. Verify cached_plans counter shows 1
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+
+DEALLOCATE PREPARE stmt_single1;
+DEALLOCATE PREPARE stmt_single2;
+
+--echo # =======================================================
+--echo # Test 5: eviction_pct boundary values
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 5.1. eviction_pct = 0 (disable eviction scan)
+SET GLOBAL ps_point_plan_cache_max_mem_size = 4096;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 0;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 0;
+SELECT @@global.ps_point_plan_cache_eviction_pct AS 'eviction_pct = 0 (disabled)';
+
+--echo # 5.2. Fill quota to max
+PREPARE stmt_pct1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_pct1 USING @p;
+
+PREPARE stmt_pct2 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_pct2 USING @p;
+
+--echo # 5.3. Third PS should be refused (no eviction scan when pct=0)
+--let $refused_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+PREPARE stmt_pct3 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+SET @p = 100;
+EXECUTE stmt_pct3 USING @p;
+--let $refused_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta = `SELECT $refused_after - $refused_before`
+--echo Refused with pct=0 (no eviction): $refused_delta (expected: 1)
+
+DEALLOCATE PREPARE stmt_pct1;
+DEALLOCATE PREPARE stmt_pct2;
+DEALLOCATE PREPARE stmt_pct3;
+
+--echo # 5.4. eviction_pct = 100 (always scan)
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 100;
+SELECT @@global.ps_point_plan_cache_eviction_pct AS 'eviction_pct = 100 (always scan)';
+
+--echo # 5.5. Create PS - should trigger eviction scan even at low usage
+--let $ev_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_evictions', Value, 1)
+PREPARE stmt_pct4 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_pct4 USING @p;
+--let $ev_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_evictions', Value, 1)
+--echo Eviction scan triggered at low usage: evictions may be 0 (no idle PS)
+
+DEALLOCATE PREPARE stmt_pct4;
+
+--echo # =======================================================
+--echo # Test 6: eviction_idle_seconds boundary values
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 6.1. eviction_idle_seconds = 0 (disable TTL eviction)
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 0;
+SELECT @@global.ps_point_plan_cache_eviction_idle_seconds AS 'idle_seconds = 0 (disabled)';
+
+--echo # 6.2. Fill quota
+PREPARE stmt_ttl1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_ttl1 USING @p;
+
+PREPARE stmt_ttl2 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_ttl2 USING @p;
+
+--echo # 6.3. Wait and create third PS - should refuse (no TTL eviction)
+SELECT SLEEP(2);
+--let $refused_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+PREPARE stmt_ttl3 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+SET @p = 100;
+EXECUTE stmt_ttl3 USING @p;
+--let $refused_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta = `SELECT $refused_after - $refused_before`
+--echo Refused with idle_seconds=0: $refused_delta (expected: 1)
+
+DEALLOCATE PREPARE stmt_ttl1;
+DEALLOCATE PREPARE stmt_ttl2;
+DEALLOCATE PREPARE stmt_ttl3;
+
+--echo # 6.4. eviction_idle_seconds = 1 (minimum practical value)
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 1;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+SELECT @@global.ps_point_plan_cache_eviction_idle_seconds AS 'idle_seconds = 1';
+
+--echo # 6.5. Create and execute PS
+PREPARE stmt_ttl4 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_ttl4 USING @p;
+
+PREPARE stmt_ttl5 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_ttl5 USING @p;
+
+--echo # 6.6. Wait 2 seconds, then create third PS
+SELECT SLEEP(2);
+--let $ev_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_evictions', Value, 1)
+PREPARE stmt_ttl6 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+SET @p = 100;
+EXECUTE stmt_ttl6 USING @p;
+--let $ev_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_evictions', Value, 1)
+--let $ev_delta = `SELECT $ev_after - $ev_before`
+--echo Evictions after idle timeout: $ev_delta (expected: >= 1)
+
+DEALLOCATE PREPARE stmt_ttl4;
+DEALLOCATE PREPARE stmt_ttl5;
+DEALLOCATE PREPARE stmt_ttl6;
+
+--echo # =======================================================
+--echo # Test 7: Counter validation - mem_used non-negative
+--echo # =======================================================
+
+FLUSH STATUS;
+
+SET GLOBAL ps_point_plan_cache_max_mem_size = 4096;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 100;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 75;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 300;
+
+--echo # 7.1. Show initial mem_used
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+
+--echo # 7.2. Create and deallocate PS
+PREPARE stmt_counter1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_counter1 USING @p;
+
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+
+DEALLOCATE PREPARE stmt_counter1;
+
+--echo # 7.3. Verify mem_used decreased (non-negative)
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+
+--echo # =======================================================
+--echo # Test 8: Counter validation - cached_plans non-negative
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 8.1. Create multiple PS
+PREPARE stmt_counter2 FROM 'SELECT * FROM t_edge WHERE id = ?';
+PREPARE stmt_counter3 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+
+SET @p = 1;
+EXECUTE stmt_counter2 USING @p;
+
+SET @p = 100;
+EXECUTE stmt_counter3 USING @p;
+
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+
+--echo # 8.2. DEALLOCATE all
+DEALLOCATE PREPARE stmt_counter2;
+DEALLOCATE PREPARE stmt_counter3;
+
+--echo # 8.3. Verify cached_plans decreased
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+
+--echo # =======================================================
+--echo # Test 9: admission_refused counter increments
+--echo # =======================================================
+
+FLUSH STATUS;
+
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 1;
+SET GLOBAL ps_point_plan_cache_max_mem_size = 0;
+
+--echo # 9.1. First PS succeeds
+--let $refused_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+PREPARE stmt_refuse1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_refuse1 USING @p;
+
+--echo # 9.2. Second PS refused
+PREPARE stmt_refuse2 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+SET @p = 100;
+EXECUTE stmt_refuse2 USING @p;
+
+--echo # 9.3. Third PS also refused
+PREPARE stmt_refuse3 FROM 'SELECT * FROM t_edge WHERE name = ?';
+SET @p = 'Alice';
+EXECUTE stmt_refuse3 USING @p;
+
+--let $refused_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--echo Total refused attempts: $refused_after (expected: 2)
+
+DEALLOCATE PREPARE stmt_refuse1;
+DEALLOCATE PREPARE stmt_refuse2;
+DEALLOCATE PREPARE stmt_refuse3;
+
+--echo # =======================================================
+--echo # Test 10: evictions counter increments
+--echo # =======================================================
+
+FLUSH STATUS;
+
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 2;
+
+--echo # 10.1. Create 2 PS and execute
+PREPARE stmt_evict1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+PREPARE stmt_evict2 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+
+SET @p = 1;
+EXECUTE stmt_evict1 USING @p;
+
+SET @p = 100;
+EXECUTE stmt_evict2 USING @p;
+
+--echo # 10.2. Keep hitting stmt_evict1, let stmt_evict2 go idle
+SELECT SLEEP(1);
+SET @p = 2;
+EXECUTE stmt_evict1 USING @p;
+SELECT SLEEP(1);
+SET @p = 3;
+EXECUTE stmt_evict1 USING @p;
+
+--echo # 10.3. Wait for timeout, create third PS
+SELECT SLEEP(3);
+--let $ev_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_evictions', Value, 1)
+PREPARE stmt_evict3 FROM 'SELECT * FROM t_edge WHERE name = ?';
+SET @p = 'Alice';
+EXECUTE stmt_evict3 USING @p;
+--let $ev_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_evictions', Value, 1)
+--let $ev_delta = `SELECT $ev_after - $ev_before`
+--echo Evictions occurred: $ev_delta (expected: 1)
+
+DEALLOCATE PREPARE stmt_evict1;
+DEALLOCATE PREPARE stmt_evict2;
+DEALLOCATE PREPARE stmt_evict3;
+
+--echo # =======================================================
+--echo # Test 11: PREPARE without EXECUTE (COLD state)
+--echo # =======================================================
+
+FLUSH STATUS;
+
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 300;
+
+--echo # 11.1. PREPARE without EXECUTE - stays COLD, doesn't occupy quota
+PREPARE stmt_cold1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+PREPARE stmt_cold2 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+PREPARE stmt_cold3 FROM 'SELECT * FROM t_edge WHERE name = ?';
+
+--echo # 11.2. Check cached_plans - should be 0 (no HOT PS yet)
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+
+--echo # 11.3. EXECUTE to make them HOT
+SET @p = 1;
+EXECUTE stmt_cold1 USING @p;
+
+SET @p = 100;
+EXECUTE stmt_cold2 USING @p;
+
+--echo # 11.4. Check cached_plans - should be 2
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+
+--echo # 11.5. Try to EXECUTE third - should be refused (quota full)
+--let $refused_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+SET @p = 'Alice';
+EXECUTE stmt_cold3 USING @p;
+--let $refused_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta = `SELECT $refused_after - $refused_before`
+--echo Third PS refused: $refused_delta (expected: 1)
+
+DEALLOCATE PREPARE stmt_cold1;
+DEALLOCATE PREPARE stmt_cold2;
+DEALLOCATE PREPARE stmt_cold3;
+
+--echo # =======================================================
+--echo # Test 12: DDL invalidation with counters
+--echo # =======================================================
+
+FLUSH STATUS;
+
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+
+--echo # 12.1. Create PS on t_edge2
+PREPARE stmt_ddl_inv FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_ddl_inv USING @p;
+
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+
+--echo # 12.2. Trigger DDL invalidation
+--let $inv_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_invalidations', Value, 1)
+ALTER TABLE t_edge2 ADD COLUMN extra INT;
+--let $inv_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_invalidations', Value, 1)
+--let $inv_delta = `SELECT $inv_after - $inv_before`
+--echo Invalidations after DDL: $inv_delta (expected: >= 1)
+
+--echo # 12.3. Verify cached_plans decreased
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+
+--echo # 12.4. Restore table schema
+ALTER TABLE t_edge2 DROP COLUMN extra;
+
+--echo # 12.5. New PS should be able to admit
+PREPARE stmt_ddl_inv2 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_ddl_inv2 USING @p;
+
+DEALLOCATE PREPARE stmt_ddl_inv;
+DEALLOCATE PREPARE stmt_ddl_inv2;
+
+--echo # =======================================================
+--echo # Test 13: Dynamic parameter changes during runtime
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 13.1. Start with moderate limit
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 3;
+SET GLOBAL ps_point_plan_cache_max_mem_size = 0;
+
+--echo # 13.2. Create 3 PS
+PREPARE stmt_dyn1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+PREPARE stmt_dyn2 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+PREPARE stmt_dyn3 FROM 'SELECT * FROM t_edge WHERE name = ?';
+
+SET @p = 1;
+EXECUTE stmt_dyn1 USING @p;
+
+SET @p = 100;
+EXECUTE stmt_dyn2 USING @p;
+
+SET @p = 'Alice';
+EXECUTE stmt_dyn3 USING @p;
+
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+
+--echo # 13.3. Reduce limit to 2 (existing HOT PS not affected)
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SELECT @@global.ps_point_plan_cache_max_cached_plans AS 'Reduced to 2';
+
+--echo # 13.4. Existing PS still work (HOT)
+SET @p = 2;
+EXECUTE stmt_dyn1 USING @p;
+
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+
+--echo # 13.5. New PS should be refused (quota exceeded)
+--let $refused_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+PREPARE stmt_dyn4 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_dyn4 USING @p;
+--let $refused_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta = `SELECT $refused_after - $refused_before`
+--echo Refused after reducing quota: $refused_delta (expected: 1)
+
+--echo # 13.6. Increase limit back to 5
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 5;
+SELECT @@global.ps_point_plan_cache_max_cached_plans AS 'Increased to 5';
+
+--echo # 13.7. New PS should now succeed
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_dyn5 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_dyn5 USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo Admission after increasing quota: $adm_delta (expected: 1)
+
+DEALLOCATE PREPARE stmt_dyn1;
+DEALLOCATE PREPARE stmt_dyn2;
+DEALLOCATE PREPARE stmt_dyn3;
+DEALLOCATE PREPARE stmt_dyn4;
+DEALLOCATE PREPARE stmt_dyn5;
+
+--echo # =======================================================
+--echo # Test 14: Memory limit + plan limit combination
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 14.1. Set both limits low
+SET GLOBAL ps_point_plan_cache_max_mem_size = 2048;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 100;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 75;
+
+--echo # 14.2. Fill memory quota
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_combo1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_combo1 USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo First PS admitted: $adm_delta
+
+--echo # 14.3. Second PS should hit memory limit
+--let $refused_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+PREPARE stmt_combo2 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_combo2 USING @p;
+--let $refused_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta = `SELECT $refused_after - $refused_before`
+--echo Second PS refused by memory: $refused_delta
+
+DEALLOCATE PREPARE stmt_combo1;
+DEALLOCATE PREPARE stmt_combo2;
+
+--echo # 14.4. Now test plan limit (memory unlimited)
+SET GLOBAL ps_point_plan_cache_max_mem_size = 0;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 1;
+
+PREPARE stmt_combo3 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_combo3 USING @p;
+
+--let $refused_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+PREPARE stmt_combo4 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+SET @p = 100;
+EXECUTE stmt_combo4 USING @p;
+--let $refused_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta2 = `SELECT $refused_after2 - $refused_before2`
+--echo Second PS refused by plan count: $refused_delta2
+
+DEALLOCATE PREPARE stmt_combo3;
+DEALLOCATE PREPARE stmt_combo4;
+
+--echo # =======================================================
+--echo # Test 15: Refused PS re-execution behavior
+--echo # =======================================================
+
+FLUSH STATUS;
+
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 1;
+SET GLOBAL ps_point_plan_cache_max_mem_size = 0;
+
+--echo # 15.1. Create first PS (HOT)
+PREPARE stmt_retry FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_retry USING @p;
+
+--echo # 15.2. Try to create second PS (refused)
+PREPARE stmt_retry2 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+SET @p = 100;
+EXECUTE stmt_retry2 USING @p;
+
+--echo # 15.3. Execute refused PS multiple times - should work (normal optimizer)
+SET @p = 200;
+EXECUTE stmt_retry2 USING @p;
+
+SET @p = 300;
+EXECUTE stmt_retry2 USING @p;
+
+--echo # 15.4. First PS still HOT (cached)
+SET @p = 2;
+EXECUTE stmt_retry USING @p;
+
+DEALLOCATE PREPARE stmt_retry;
+DEALLOCATE PREPARE stmt_retry2;
+
+--echo # -------------------------------------------------------
+--echo # Final counter summary
+--echo # -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Restore original values
+--echo # -------------------------------------------------------
+SET GLOBAL ps_point_plan_cache_max_mem_size = @orig_max_mem;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = @orig_max_plans;
+SET GLOBAL ps_point_plan_cache_eviction_pct = @orig_eviction_pct;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = @orig_idle_seconds;
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+DROP TABLE t_edge2;
+DROP TABLE t_edge;
+
+--echo #
+--echo # End of edge cases test
+--echo #

@@ -1,0 +1,42 @@
+--echo # Simple TTL test - Test 5 only
+CREATE TABLE t_ttl_simple (id INT PRIMARY KEY, val VARCHAR(50));
+INSERT INTO t_ttl_simple VALUES (1, 'alpha'), (2, 'beta'), (10, 'delta'), (20, 'epsilon');
+
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 2;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 10;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+
+PREPARE stmt_multi1 FROM 'SELECT * FROM t_ttl_simple WHERE id = ?';
+PREPARE stmt_multi2 FROM 'SELECT * FROM t_ttl_simple WHERE id = ?';
+
+SET @p = 1;
+EXECUTE stmt_multi1 USING @p;
+SET @p = 2;
+EXECUTE stmt_multi2 USING @p;
+
+SELECT SLEEP(1);
+SET @p = 3;
+EXECUTE stmt_multi1 USING @p;
+
+SELECT SLEEP(1);
+SET @p = 4;
+EXECUTE stmt_multi1 USING @p;
+
+SELECT SLEEP(1);
+SET @p = 5;
+EXECUTE stmt_multi1 USING @p;
+
+--echo # Wait for timeout
+SELECT SLEEP(3);
+
+--echo # Execute both
+SET @p = 10;
+EXECUTE stmt_multi1 USING @p;
+SET @p = 20;
+EXECUTE stmt_multi2 USING @p;
+
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+DEALLOCATE PREPARE stmt_multi1;
+DEALLOCATE PREPARE stmt_multi2;
+DROP TABLE t_ttl_simple;

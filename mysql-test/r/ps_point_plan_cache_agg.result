@@ -562,8 +562,10 @@ SET SESSION ps_point_plan_cache = DEFAULT;
 # Final status check
 SHOW STATUS LIKE 'ps_point_plan%';
 Variable_name	Value
+Ps_point_plan_cache_admission_refused	0
 Ps_point_plan_cache_admissions	25
 Ps_point_plan_cache_cold_classifications	31
+Ps_point_plan_cache_evictions	0
 Ps_point_plan_cache_fallback_runtime	0
 Ps_point_plan_cache_hits	24
 Ps_point_plan_cache_invalidations	0

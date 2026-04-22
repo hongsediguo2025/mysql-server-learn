@@ -475,6 +475,16 @@ class Prepared_statement final {
       retryable_cold is false so that if the next admission also
       fails, the PS transitions to NEVER permanently.
     */
+
+    /* Release from global memory tracker if currently HOT. */
+    if (m_ps_pc_state == PsPointPlanState::HOT) {
+      ps_plan_cache_tracker.remove_plan();
+      if (m_ps_pc.arena_cached_bytes > 0) {
+        ps_plan_cache_tracker.release(m_ps_pc.arena_cached_bytes);
+        m_ps_pc.arena_cached_bytes = 0;
+      }
+    }
+
     m_ps_pc_state = PsPointPlanState::COLD;
 
     m_ps_pc.keyno = MAX_KEY;

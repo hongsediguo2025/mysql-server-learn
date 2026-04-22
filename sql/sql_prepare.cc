@@ -2356,6 +2356,16 @@ void Prepared_statement::setup_stmt_logging(THD *thd) {
 Prepared_statement::~Prepared_statement() {
   DBUG_TRACE;
   DBUG_PRINT("enter", ("stmt: %p  cursor: %p", this, m_cursor));
+
+  /* Release from global plan cache memory tracker. */
+  if (m_ps_pc_state == PsPointPlanState::HOT) {
+    ps_plan_cache_tracker.remove_plan();
+  }
+  if (m_ps_pc.arena_cached_bytes > 0) {
+    ps_plan_cache_tracker.release(m_ps_pc.arena_cached_bytes);
+    m_ps_pc.arena_cached_bytes = 0;
+  }
+
   if (m_used_as_cursor) {
     close_cursor();
   }
@@ -3378,7 +3388,19 @@ void Prepared_statement::swap_prepared_statement(Prepared_statement *copy) {
   // after reprepare the new statement gets a clean slate and the old
   // statement (about to be destroyed) carries away the stale state.
   std::swap(m_ps_pc_state, copy->m_ps_pc_state);
-  std::swap(m_ps_pc, copy->m_ps_pc);
+  /*
+    Byte-level swap for PsPointPlanTemplate: the struct contains
+    std::atomic<uint64_t> last_hit_time which deletes the copy/move
+    assignment operators needed by std::swap.  During reprepare both
+    PS objects are owned by the current thread — no concurrent access
+    to the atomics.  PsPointPlanTemplate is trivially destructible.
+  */
+  {
+    char tmp[sizeof(PsPointPlanTemplate)];
+    memcpy(tmp, &m_ps_pc, sizeof(m_ps_pc));
+    memcpy(&m_ps_pc, &copy->m_ps_pc, sizeof(m_ps_pc));
+    memcpy(&copy->m_ps_pc, tmp, sizeof(m_ps_pc));
+  }
   std::swap(m_ps_pc_cursor_execution, copy->m_ps_pc_cursor_execution);
   std::swap(m_ps_pc_retryable_cold, copy->m_ps_pc_retryable_cold);
 }

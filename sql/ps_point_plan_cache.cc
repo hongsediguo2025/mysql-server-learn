@@ -58,6 +58,12 @@
 #include "sql/table.h"
 #include "sql/visible_fields.h"
 
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#else
+#include <time.h>
+#endif
+
 namespace {
 
 constexpr ulonglong kPsPcRelevantOptimizerSwitchMask =
@@ -144,6 +150,11 @@ void ps_point_plan_clear_hot_metadata(PsPointPlanTemplate *tpl) {
 }
 
 void ps_point_plan_demote_to_cold(Prepared_statement *stmt) {
+  /* Release plan count from global tracker (HOT → COLD). */
+  if (stmt->ps_point_plan_state() == PsPointPlanState::HOT) {
+    ps_plan_cache_tracker.remove_plan();
+    /* arena_cached_bytes preserved — may be reused on re-admission */
+  }
   ps_point_plan_clear_hot_metadata(&stmt->ps_point_plan_template());
   stmt->set_ps_point_plan_state(PsPointPlanState::COLD);
   stmt->set_ps_point_plan_retryable_cold(true);
@@ -188,7 +199,36 @@ bool ps_point_plan_cached_helpers_compatible(const PsPointPlanTemplate &tpl,
   return true;
 }
 
+/**
+  Get current monotonic time in seconds.
+  Used for last_hit_time / admission_time tracking.
+  Cost: ~5ns on modern hardware (vDSO / mach_absolute_time).
+*/
+uint64_t ps_point_plan_now_seconds() {
+#ifdef __APPLE__
+  static mach_timebase_info_data_t tb_info = {0, 0};
+  if (tb_info.denom == 0) mach_timebase_info(&tb_info);
+  uint64_t ns = mach_absolute_time() * tb_info.numer / tb_info.denom;
+  return ns / 1000000000ULL;
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+  return static_cast<uint64_t>(ts.tv_sec);
+#endif
+}
+
 }  // namespace
+
+/**
+  Record a HOT hit: update last_hit_time and increment status counter.
+  Called from build_fast_path on every successful fast-path construction.
+*/
+static void ps_point_plan_record_hit(THD *thd,
+                                     const PsPointPlanTemplate &tpl) {
+  tpl.last_hit_time.store(ps_point_plan_now_seconds(),
+                          std::memory_order_relaxed);
+  ps_point_plan_mark_hit(thd);
+}
 
 /**
   Validate that a query block contains exactly one simple aggregate
@@ -508,7 +548,14 @@ bool ps_point_plan_classify(THD *thd, Prepared_statement *stmt) {
 
   /* Gate 5: extract WHERE shape (field=? equalities). */
   PsPointPlanTemplate &tpl = stmt->ps_point_plan_template();
-  tpl = PsPointPlanTemplate{};
+  /*
+    Placement-new to reinitialize the template to default state.
+    Direct assignment (tpl = PsPointPlanTemplate{}) is not possible
+    because std::atomic<uint64_t> last_hit_time deletes the copy
+    assignment operator.  PsPointPlanTemplate is trivially destructible
+    so skipping the explicit destructor call is safe.
+  */
+  new (&tpl) PsPointPlanTemplate{};
   tpl.table_ref = tbl;
 
   /*
@@ -1146,7 +1193,7 @@ bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
     agg_path->cost = range_path->cost;
 
     ps_point_plan_commit_range_to_join(join, tpl, new_qep_tab, agg_path);
-    ps_point_plan_mark_hit(thd);
+    ps_point_plan_record_hit(thd, tpl);
     return true;
   }
 
@@ -1177,7 +1224,7 @@ bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
     }
 
     ps_point_plan_commit_range_to_join(join, tpl, new_qep_tab, sort_path);
-    ps_point_plan_mark_hit(thd);
+    ps_point_plan_record_hit(thd, tpl);
     return true;
   }
 
@@ -1208,7 +1255,7 @@ bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
     }
 
     ps_point_plan_commit_range_to_join(join, tpl, new_qep_tab, sort_path);
-    ps_point_plan_mark_hit(thd);
+    ps_point_plan_record_hit(thd, tpl);
     return true;
   }
 
@@ -1220,7 +1267,7 @@ bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
       return false;
 
     ps_point_plan_commit_range_to_join(join, tpl, new_qep_tab, range_path);
-    ps_point_plan_mark_hit(thd);
+    ps_point_plan_record_hit(thd, tpl);
     return true;
   }
 
@@ -1411,7 +1458,7 @@ bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
   join->qep_tab = new_qep_tab;
   join->set_root_access_path(path);
 
-  ps_point_plan_mark_hit(thd);
+  ps_point_plan_record_hit(thd, tpl);
   return true;
 }
 
@@ -1837,12 +1884,48 @@ static void ps_point_plan_admit_range_arena_cache(
 void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
   PsPointPlanTemplate &tpl = stmt->ps_point_plan_template();
 
+  /* Snapshot arena size before admission allocations. */
+  const size_t arena_before = stmt->m_arena.mem_root->allocated_size();
+
   if (tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN ||
       tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_AGG ||
       tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_SORT ||
       tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_SORT_DISTINCT) {
     ps_point_plan_admit_range_metadata(thd, tpl, join);
     ps_point_plan_admit_range_arena_cache(thd, stmt, tpl);
+
+    /* --- Quota check: memory + plan count --- */
+    const size_t arena_after = stmt->m_arena.mem_root->allocated_size();
+    const size_t arena_delta =
+        (arena_after >= arena_before) ? (arena_after - arena_before) : 0;
+
+    bool mem_ok = ps_plan_cache_tracker.try_reserve(arena_delta);
+    if (!mem_ok) {
+      ps_point_plan_try_evict_idle(thd);
+      mem_ok = ps_plan_cache_tracker.try_reserve(arena_delta);
+    }
+    if (mem_ok) {
+      bool plan_ok = ps_plan_cache_tracker.try_add_plan();
+      if (!plan_ok) {
+        ps_point_plan_try_evict_idle(thd);
+        plan_ok = ps_plan_cache_tracker.try_add_plan();
+      }
+      if (!plan_ok) {
+        ps_plan_cache_tracker.release(arena_delta);
+        mem_ok = false;
+      }
+    }
+    if (!mem_ok) {
+      ps_point_plan_mark_admission_refused(thd);
+      /* Stay COLD; next can_admit fail → NEVER. */
+      stmt->set_ps_point_plan_retryable_cold(false);
+      return;
+    }
+
+    tpl.arena_cached_bytes = arena_delta;
+    const uint64_t now = ps_point_plan_now_seconds();
+    tpl.admission_time = now;
+    tpl.last_hit_time.store(now, std::memory_order_relaxed);
 
     stmt->set_ps_point_plan_state(PsPointPlanState::HOT);
     stmt->set_ps_point_plan_retryable_cold(false);
@@ -2029,6 +2112,41 @@ void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
     if (!had_error_before_cache_build && thd->is_error()) thd->clear_error();
   }
 
+  /* --- Quota check: memory + plan count (EQ_REF path) --- */
+  {
+    const size_t arena_after = stmt->m_arena.mem_root->allocated_size();
+    const size_t arena_delta =
+        (arena_after >= arena_before) ? (arena_after - arena_before) : 0;
+
+    bool mem_ok = ps_plan_cache_tracker.try_reserve(arena_delta);
+    if (!mem_ok) {
+      ps_point_plan_try_evict_idle(thd);
+      mem_ok = ps_plan_cache_tracker.try_reserve(arena_delta);
+    }
+    if (mem_ok) {
+      bool plan_ok = ps_plan_cache_tracker.try_add_plan();
+      if (!plan_ok) {
+        ps_point_plan_try_evict_idle(thd);
+        plan_ok = ps_plan_cache_tracker.try_add_plan();
+      }
+      if (!plan_ok) {
+        ps_plan_cache_tracker.release(arena_delta);
+        mem_ok = false;
+      }
+    }
+    if (!mem_ok) {
+      ps_point_plan_mark_admission_refused(thd);
+      /* Stay COLD; next can_admit fail → NEVER. */
+      stmt->set_ps_point_plan_retryable_cold(false);
+      return;
+    }
+
+    tpl.arena_cached_bytes = arena_delta;
+    const uint64_t now = ps_point_plan_now_seconds();
+    tpl.admission_time = now;
+    tpl.last_hit_time.store(now, std::memory_order_relaxed);
+  }
+
   stmt->set_ps_point_plan_state(PsPointPlanState::HOT);
   stmt->set_ps_point_plan_retryable_cold(false);
   ps_point_plan_mark_admission(thd);
@@ -2052,4 +2170,110 @@ void ps_point_plan_mark_runtime_fallback(THD *thd) {
 
 void ps_point_plan_mark_cold_classification(THD *thd) {
   thd->status_var.ps_point_plan_cache_cold_classifications++;
+}
+
+void ps_point_plan_mark_admission_refused(THD *thd) {
+  thd->status_var.ps_point_plan_cache_admission_refused++;
+}
+
+void ps_point_plan_mark_eviction(THD *thd) {
+  thd->status_var.ps_point_plan_cache_evictions++;
+}
+
+/* --- Global plan cache memory tracker implementation --- */
+
+Ps_plan_cache_mem_tracker ps_plan_cache_tracker;
+
+bool Ps_plan_cache_mem_tracker::try_reserve(size_t bytes) {
+  ulonglong max_mem = ps_point_plan_cache_max_mem_size;
+  if (max_mem == 0) {
+    m_total_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    return true;
+  }
+  size_t current = m_total_bytes.load(std::memory_order_relaxed);
+  while (true) {
+    if (current + bytes > max_mem) return false;
+    if (m_total_bytes.compare_exchange_weak(
+            current, current + bytes,
+            std::memory_order_acq_rel, std::memory_order_relaxed))
+      return true;
+  }
+}
+
+void Ps_plan_cache_mem_tracker::release(size_t bytes) {
+  m_total_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+}
+
+bool Ps_plan_cache_mem_tracker::try_add_plan() {
+  ulong max_plans = ps_point_plan_cache_max_cached_plans;
+  if (max_plans == 0) {
+    m_total_plans.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  size_t current = m_total_plans.load(std::memory_order_relaxed);
+  while (true) {
+    if (current >= max_plans) return false;
+    if (m_total_plans.compare_exchange_weak(
+            current, current + 1,
+            std::memory_order_acq_rel, std::memory_order_relaxed))
+      return true;
+  }
+}
+
+void Ps_plan_cache_mem_tracker::remove_plan() {
+  m_total_plans.fetch_sub(1, std::memory_order_relaxed);
+}
+
+/* --- TTL-based eviction for idle HOT plan cache entries --- */
+
+/**
+  Scan the current THD's prepared statements for idle HOT entries
+  and evict (demote to COLD) those whose last_hit_time is older than
+  the configured idle threshold.
+
+  Connection-local only — iterates thd->stmt_map.for_each() without
+  cross-thread locking.  This is safe because stmt_map belongs to the
+  current connection and is only modified by the owning thread.
+
+  Called from ps_point_plan_admit() when a quota check fails, to free
+  up global memory/plan-count quota for the new admission.
+
+  Evicted entries are demoted to COLD (non-retryable): the next
+  execution will re-optimize and can re-admit if quota allows.
+  Arena-allocated objects are orphaned but cannot be freed from the
+  bump allocator; they are reclaimed when the PS is destroyed.
+
+  @param  thd  Current thread whose stmt_map is scanned.
+*/
+void ps_point_plan_try_evict_idle(THD *thd) {
+  const ulong idle_seconds = ps_point_plan_cache_eviction_idle_seconds;
+  if (idle_seconds == 0) return;  /* eviction disabled */
+
+  const uint64_t now = ps_point_plan_now_seconds();
+  const uint64_t cutoff = (now > idle_seconds) ? (now - idle_seconds) : 0;
+
+  thd->stmt_map.for_each([&](Prepared_statement *ps) {
+    if (ps->ps_point_plan_state() != PsPointPlanState::HOT) return;
+
+    PsPointPlanTemplate &tpl = ps->ps_point_plan_template();
+    const uint64_t last_hit =
+        tpl.last_hit_time.load(std::memory_order_relaxed);
+
+    /* Evict only entries idle longer than the threshold. */
+    if (last_hit > 0 && last_hit < cutoff) {
+      /* Release from global tracker. */
+      ps_plan_cache_tracker.remove_plan();
+      if (tpl.arena_cached_bytes > 0) {
+        ps_plan_cache_tracker.release(tpl.arena_cached_bytes);
+        tpl.arena_cached_bytes = 0;
+      }
+
+      /* Demote HOT → COLD (non-retryable). */
+      ps_point_plan_clear_hot_metadata(&tpl);
+      ps->set_ps_point_plan_state(PsPointPlanState::COLD);
+      ps->set_ps_point_plan_retryable_cold(false);
+
+      ps_point_plan_mark_eviction(thd);
+    }
+  });
 }

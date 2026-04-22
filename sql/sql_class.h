@@ -515,6 +515,18 @@ class Prepared_statement_map {
 
   void reset();
 
+  /**
+    Iterate over all prepared statements, invoking fn for each.
+    Used by plan cache eviction to scan for idle HOT entries.
+    Connection-local only — no cross-thread locking needed.
+  */
+  template <typename Fn>
+  void for_each(Fn &&fn) {
+    for (auto &entry : st_hash) {
+      fn(entry.second.get());
+    }
+  }
+
   ~Prepared_statement_map();
 
  private:

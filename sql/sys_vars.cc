@@ -3617,6 +3617,34 @@ static Sys_var_bool Sys_ps_point_plan_cache(
     "unique-key point SELECT queries.",
     SESSION_VAR(ps_point_plan_cache), CMD_LINE(OPT_ARG), DEFAULT(true));
 
+static Sys_var_ulonglong Sys_ps_point_plan_cache_max_mem_size(
+    "ps_point_plan_cache_max_mem_size",
+    "Maximum total arena memory (bytes) used by all plan-cache entries "
+    "across all connections. 0 = unlimited.",
+    GLOBAL_VAR(ps_point_plan_cache_max_mem_size), CMD_LINE(OPT_ARG),
+    VALID_RANGE(0, 1ULL << 40), DEFAULT(1ULL << 30), BLOCK_SIZE(1024));
+
+static Sys_var_ulong Sys_ps_point_plan_cache_max_cached_plans(
+    "ps_point_plan_cache_max_cached_plans",
+    "Maximum number of prepared statements in HOT state (plan-cached) "
+    "across all connections. 0 = unlimited.",
+    GLOBAL_VAR(ps_point_plan_cache_max_cached_plans), CMD_LINE(OPT_ARG),
+    VALID_RANGE(0, 1000000), DEFAULT(500000), BLOCK_SIZE(1));
+
+static Sys_var_uint Sys_ps_point_plan_cache_eviction_pct(
+    "ps_point_plan_cache_eviction_pct",
+    "Watermark percentage of max limits that triggers eviction scanning "
+    "during admission. 0 = disable eviction (only hard limit rejection).",
+    GLOBAL_VAR(ps_point_plan_cache_eviction_pct), CMD_LINE(OPT_ARG),
+    VALID_RANGE(0, 100), DEFAULT(75), BLOCK_SIZE(1));
+
+static Sys_var_ulong Sys_ps_point_plan_cache_eviction_idle_seconds(
+    "ps_point_plan_cache_eviction_idle_seconds",
+    "HOT prepared statements not hit within this many seconds become "
+    "eligible for eviction. 0 = disable TTL-based eviction.",
+    GLOBAL_VAR(ps_point_plan_cache_eviction_idle_seconds), CMD_LINE(OPT_ARG),
+    VALID_RANGE(0, 86400), DEFAULT(300), BLOCK_SIZE(1));
+
 static Sys_var_uint Sys_protocol_version(
     "protocol_version",
     "The version of the client/server protocol used by the MySQL server",

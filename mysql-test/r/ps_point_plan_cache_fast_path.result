@@ -404,8 +404,10 @@ DEALLOCATE PREPARE stmt_tx;
 # -------------------------------------------------------
 SHOW STATUS LIKE 'Ps_point_plan_cache%';
 Variable_name	Value
+Ps_point_plan_cache_admission_refused	0
 Ps_point_plan_cache_admissions	19
 Ps_point_plan_cache_cold_classifications	19
+Ps_point_plan_cache_evictions	0
 Ps_point_plan_cache_fallback_runtime	2
 Ps_point_plan_cache_hits	29
 Ps_point_plan_cache_invalidations	0

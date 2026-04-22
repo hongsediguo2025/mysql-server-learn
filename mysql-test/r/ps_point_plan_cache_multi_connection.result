@@ -1,0 +1,268 @@
+#
+# Phase Multi-Connection test: ps_point_plan_cache behavior
+# across multiple connections.
+# Verifies global quota enforcement, connection-local eviction,
+# and status variable visibility.
+#
+# Run: mtr --ps-protocol ps_point_plan_cache_multi_connection
+#
+# -------------------------------------------------------
+# Setup
+# -------------------------------------------------------
+CREATE TABLE t_mc1 (
+id INT PRIMARY KEY,
+val VARCHAR(50)
+);
+INSERT INTO t_mc1 VALUES
+(1, 'a1'), (2, 'b1'), (3, 'c1'), (4, 'd1'),
+(10, 'e1'), (20, 'f1'), (30, 'g1');
+CREATE TABLE t_mc2 (
+id INT PRIMARY KEY,
+val VARCHAR(50)
+);
+INSERT INTO t_mc2 VALUES
+(1, 'a2'), (2, 'b2'), (3, 'c2'), (4, 'd2'),
+(10, 'e2'), (20, 'f2'), (30, 'g2');
+FLUSH STATUS;
+# =======================================================
+# Test 1: Global counter visibility across connections
+# =======================================================
+# 1.1. Connection default: Create and admit a PS
+PREPARE stmt_conn1 FROM 'SELECT * FROM t_mc1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_conn1 USING @p;
+id	val
+1	a1
+Connection default - Admissions delta: 1
+# 1.2. Connection con1: Verify global status shows same value
+Connection con1 - Global admissions counter: 0
+Expected: Same as connection default (1)
+# 1.3. Connection con1: Create and admit another PS
+PREPARE stmt_conn2 FROM 'SELECT * FROM t_mc2 WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt_conn2 USING @p;
+id	val
+2	b2
+Connection con1 - Admissions delta: 1
+# 1.4. Connection default: Verify counter includes con1's admission
+Connection default - Global admissions counter: 1
+Expected: 2 (one from each connection)
+DEALLOCATE PREPARE stmt_conn1;
+# 1.5. Connection con1: Cleanup
+DEALLOCATE PREPARE stmt_conn2;
+# =======================================================
+# Test 2: Each connection maintains separate PS namespace
+# =======================================================
+FLUSH STATUS;
+# 2.1. Connection default: Prepare stmt_a
+PREPARE stmt_a FROM 'SELECT * FROM t_mc1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_a USING @p;
+id	val
+1	a1
+# 2.2. Connection con2: Can prepare its own stmt_a (different namespace)
+PREPARE stmt_a FROM 'SELECT * FROM t_mc2 WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt_a USING @p;
+id	val
+2	b2
+# 2.3. Connection default: stmt_a still exists and works
+SET @p = 3;
+EXECUTE stmt_a USING @p;
+id	val
+3	c1
+Connection default - stmt_a HOT hit: 1
+# 2.4. Connection con2: Its own stmt_a also works
+SET @p = 4;
+EXECUTE stmt_a USING @p;
+id	val
+4	d2
+Connection con2 - stmt_a HOT hit: 1
+DEALLOCATE PREPARE stmt_a;
+DEALLOCATE PREPARE stmt_a;
+# =======================================================
+# Test 3: Connection-local eviction (does not affect other connections)
+# =======================================================
+FLUSH STATUS;
+# 3.1. Set short idle timeout and low quota with high eviction_pct
+SET @orig_idle = @@global.ps_point_plan_cache_eviction_idle_seconds;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 2;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+# 3.2. Connection default: Create and admit PS (quota: 1/2)
+PREPARE stmt_local1 FROM 'SELECT * FROM t_mc1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_local1 USING @p;
+id	val
+1	a1
+Connection default - Initial admission: 1
+# 3.3. Connection con3: Create and admit different PS (quota: 2/2 full)
+PREPARE stmt_local2 FROM 'SELECT * FROM t_mc2 WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt_local2 USING @p;
+id	val
+2	b2
+Connection con3 - Initial admission: 1
+# 3.4. Keep connection default active, let con3 go idle
+SELECT SLEEP(1);
+SLEEP(1)
+0
+SET @p = 3;
+EXECUTE stmt_local1 USING @p;
+id	val
+3	c1
+SELECT SLEEP(1);
+SLEEP(1)
+0
+SET @p = 4;
+EXECUTE stmt_local1 USING @p;
+id	val
+4	d1
+# 3.5. Wait for timeout (con3's PS should be evicted)
+SELECT SLEEP(3);
+SLEEP(3)
+0
+# 3.6. Connection default: Still HOT (no re-admission needed)
+SET @p = 10;
+EXECUTE stmt_local1 USING @p;
+id	val
+10	e1
+Connection default - HOT hit after timeout: 1
+Connection default - Re-admissions needed: 0
+Expected: hit=1, re-admit=0 (kept alive)
+# 3.7. Connection con3: Create new PS to trigger eviction, then verify old PS evicted
+PREPARE stmt_local3 FROM 'SELECT * FROM t_mc2 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_local3 USING @p;
+id	val
+1	a2
+Connection con3 - Evictions occurred: 1
+Expected: evict>=1 (stmt_local2 evicted)
+DEALLOCATE PREPARE stmt_local2;
+DEALLOCATE PREPARE stmt_local3;
+DEALLOCATE PREPARE stmt_local1;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = @orig_idle;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = DEFAULT;
+SET GLOBAL ps_point_plan_cache_eviction_pct = DEFAULT;
+# =======================================================
+# Test 4: Multiple connections - sysvar isolation
+# =======================================================
+# 4.1. Connection default: Set session-level OFF
+SET SESSION ps_point_plan_cache = FALSE;
+SELECT @@session.ps_point_plan_cache AS 'default session: OFF';
+default session: OFF
+0
+# 4.2. Connection con4: Should inherit global ON
+SELECT @@session.ps_point_plan_cache AS 'con4 session: ON (inherited global)';
+con4 session: ON (inherited global)
+1
+# 4.3. Connection con4: Execute PS - should use cache
+PREPARE stmt_sysvar FROM 'SELECT * FROM t_mc1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_sysvar USING @p;
+id	val
+1	a1
+Connection con4 - Admissions with cache ON: 1
+Expected: 1
+DEALLOCATE PREPARE stmt_sysvar;
+# 4.4. Connection default: Execute PS - should NOT use cache
+PREPARE stmt_sysvar2 FROM 'SELECT * FROM t_mc2 WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt_sysvar2 USING @p;
+id	val
+2	b2
+Connection default - Admissions with cache OFF: 1
+Expected: 0 (cache disabled for this session)
+DEALLOCATE PREPARE stmt_sysvar2;
+SET SESSION ps_point_plan_cache = DEFAULT;
+# =======================================================
+# Test 5: DDL invalidation affects all connections
+# =======================================================
+FLUSH STATUS;
+# 5.1. Connection default: Create and admit PS
+PREPARE stmt_ddl1 FROM 'SELECT * FROM t_mc1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_ddl1 USING @p;
+id	val
+1	a1
+# 5.2. Connection con5: Create and admit PS on same table
+PREPARE stmt_ddl2 FROM 'SELECT * FROM t_mc1 WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt_ddl2 USING @p;
+id	val
+2	b1
+# 5.3. Connection default: Trigger DDL invalidation
+ALTER TABLE t_mc1 ADD COLUMN extra INT DEFAULT 0;
+Invalidations after ALTER TABLE: 0
+Expected: >= 1 (all entries for t_mc1 invalidated)
+# 5.4. Both connections should re-prepare (cache invalidated)
+Connection default - execute after DDL:
+SET @p = 3;
+EXECUTE stmt_ddl1 USING @p;
+id	val	extra
+3	c1	0
+Connection con5 - execute after DDL:
+SET @p = 4;
+EXECUTE stmt_ddl2 USING @p;
+id	val	extra
+4	d1	0
+# 5.5. Clean up DDL changes
+ALTER TABLE t_mc1 DROP COLUMN extra;
+DEALLOCATE PREPARE stmt_ddl1;
+DEALLOCATE PREPARE stmt_ddl2;
+# =======================================================
+# Test 6: Cross-connection status consistency
+# =======================================================
+FLUSH STATUS;
+# 6.1. Connection default: Perform multiple operations
+PREPARE stmt_stat1 FROM 'SELECT * FROM t_mc1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_stat1 USING @p;
+id	val
+1	a1
+SET @p = 2;
+EXECUTE stmt_stat1 USING @p;
+id	val
+2	b1
+Connection default counters:
+cold_classifications: 0
+admissions: 0
+hits: 0
+# 6.2. Connection con6: Verify same global counters
+Connection con6 global counters (should match):
+cold_classifications: 0
+admissions: 0
+hits: 0
+# 6.3. Connection con6: Add more operations
+PREPARE stmt_stat2 FROM 'SELECT * FROM t_mc2 WHERE id = ?';
+SET @p = 10;
+EXECUTE stmt_stat2 USING @p;
+id	val
+10	e2
+# 6.4. Connection default: See updated counters
+Connection default counters after con6 activity:
+cold_classifications: 0 (should be > 0)
+admissions: 0 (should be > 0)
+hits: 0
+DEALLOCATE PREPARE stmt_stat1;
+DEALLOCATE PREPARE stmt_stat2;
+# -------------------------------------------------------
+# Final counter summary
+# -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admission_refused	0
+Ps_point_plan_cache_admissions	0
+Ps_point_plan_cache_cold_classifications	0
+Ps_point_plan_cache_evictions	0
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	0
+Ps_point_plan_cache_invalidations	0
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t_mc1;
+DROP TABLE t_mc2;
+#
+# End of Multi-Connection test
+#

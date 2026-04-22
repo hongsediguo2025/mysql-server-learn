@@ -691,8 +691,10 @@ DROP TABLE t1;
 # === Test Summary ===
 SHOW STATUS LIKE 'Ps_point_plan_cache%';
 Variable_name	Value
+Ps_point_plan_cache_admission_refused	0
 Ps_point_plan_cache_admissions	1
 Ps_point_plan_cache_cold_classifications	1
+Ps_point_plan_cache_evictions	0
 Ps_point_plan_cache_fallback_runtime	0
 Ps_point_plan_cache_hits	1
 Ps_point_plan_cache_invalidations	0

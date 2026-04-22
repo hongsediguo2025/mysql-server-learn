@@ -43,6 +43,8 @@
   call into.
 */
 
+#include <atomic>
+
 #include "field_types.h"
 #include "my_base.h"
 #include "my_inttypes.h"
@@ -391,6 +393,25 @@ struct PsPointPlanTemplate {
 
   /// True when the query has DISTINCT matching the ORDER BY column.
   bool has_distinct{false};
+
+  /*
+    --- Memory limit tracking fields ---
+    Used by the global plan cache memory tracker to account for
+    arena-allocated bytes and support TTL-based eviction.
+  */
+
+  /// Total arena bytes charged to the global tracker for this PS.
+  /// Set during admission; released on invalidation/deallocation.
+  size_t arena_cached_bytes{0};
+
+  /// Timestamp of last successful HOT hit (monotonic clock, seconds).
+  /// Updated on every fast-path hit via relaxed atomic store (~5ns).
+  /// Declared mutable so it can be updated through const references
+  /// (build_fast_path receives const PsPointPlanTemplate&).
+  mutable std::atomic<uint64_t> last_hit_time{0};
+
+  /// Timestamp of admission (monotonic clock, seconds).
+  uint64_t admission_time{0};
 };
 
 /*
@@ -512,5 +533,62 @@ void ps_point_plan_mark_admission(THD *thd);
 void ps_point_plan_mark_invalidation(THD *thd);
 void ps_point_plan_mark_runtime_fallback(THD *thd);
 void ps_point_plan_mark_cold_classification(THD *thd);
+void ps_point_plan_mark_admission_refused(THD *thd);
+void ps_point_plan_mark_eviction(THD *thd);
+
+/**
+  Scan the current THD's prepared statements for idle HOT entries
+  and evict them to free global plan-cache quota.
+
+  Connection-local only — iterates thd->stmt_map without cross-thread
+  locking.  Called from admission when quota is exhausted.
+
+  @param  thd  Current thread whose stmt_map is scanned.
+*/
+void ps_point_plan_try_evict_idle(THD *thd);
+
+/*
+  -----------------------------------------------------------------------
+  Global plan cache memory tracker.
+  -----------------------------------------------------------------------
+
+  Thread-safe via std::atomic; lock-free on the HOT-hit fast path.
+  The tracker only participates in the admission path (COLD → HOT),
+  never on the HOT-hit fast path, so its overhead is negligible in
+  steady state.
+*/
+
+/// Global sysvar variables — defined in mysqld.cc, declared here for
+/// inline access by the tracker methods.
+extern ulonglong ps_point_plan_cache_max_mem_size;
+extern ulong ps_point_plan_cache_max_cached_plans;
+extern uint ps_point_plan_cache_eviction_pct;
+extern ulong ps_point_plan_cache_eviction_idle_seconds;
+
+class Ps_plan_cache_mem_tracker {
+ public:
+  /** Try to reserve @p bytes.  @return true on success. */
+  bool try_reserve(size_t bytes);
+  /** Release @p bytes back to the pool. */
+  void release(size_t bytes);
+  /** Try to increment the HOT plan count.  @return true on success. */
+  bool try_add_plan();
+  /** Decrement the HOT plan count. */
+  void remove_plan();
+
+  size_t current_mem_used() const {
+    return m_total_bytes.load(std::memory_order_relaxed);
+  }
+  size_t current_plan_count() const {
+    return m_total_plans.load(std::memory_order_relaxed);
+  }
+
+ private:
+  std::atomic<size_t> m_total_bytes{0};
+  std::atomic<size_t> m_total_plans{0};
+};
+
+/// Global singleton — defined in ps_point_plan_cache.cc.
+extern Ps_plan_cache_mem_tracker ps_plan_cache_tracker;
 
 #endif  // SQL_PS_POINT_PLAN_CACHE_H

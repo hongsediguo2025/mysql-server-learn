@@ -1,0 +1,375 @@
+--echo #
+--echo # ps_point_plan_cache arena memory estimation test
+--echo # Validates memory tracking for different plan types
+--echo #
+--echo # Run: mtr --ps-protocol ps_point_plan_cache_arena_estimation
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup: save original values
+--echo # -------------------------------------------------------
+
+SET @orig_max_mem = @@global.ps_point_plan_cache_max_mem_size;
+SET @orig_max_plans = @@global.ps_point_plan_cache_max_cached_plans;
+
+--echo # =======================================================
+--echo # Test 1: Arena tracking for POINT_EQ_REF plan
+--echo # =======================================================
+
+--echo # 1.1. Create test table with INT primary key
+CREATE TABLE t_point (
+  id INT PRIMARY KEY,
+  val VARCHAR(50)
+);
+INSERT INTO t_point VALUES (1, 'first'), (2, 'second'), (3, 'third');
+
+FLUSH STATUS;
+SET GLOBAL ps_point_plan_cache_max_mem_size = 0;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 100;
+
+--echo # 1.2. Create and execute POINT_EQ_REF PS
+--let $mem_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+PREPARE stmt_point FROM 'SELECT * FROM t_point WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_point USING @p;
+--let $mem_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+--let $mem_delta = `SELECT $mem_after - $mem_before`
+--echo POINT_EQ_REF arena allocated: $mem_delta bytes (expected: ~600)
+
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+
+--echo # 1.3. DEALLOCATE and verify memory released
+DEALLOCATE PREPARE stmt_point;
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+
+--echo # =======================================================
+--echo # Test 2: Arena tracking for RANGE_PK_BETWEEN plan
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 2.1. Create and execute RANGE_PK_BETWEEN PS
+--let $mem_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+PREPARE stmt_range FROM 'SELECT * FROM t_point WHERE id BETWEEN ? AND ?';
+SET @p1 = 1;
+SET @p2 = 3;
+EXECUTE stmt_range USING @p1, @p2;
+--let $mem_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+--let $mem_delta = `SELECT $mem_after - $mem_before`
+--echo RANGE_PK_BETWEEN arena allocated: $mem_delta bytes (expected: ~810)
+
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+
+DEALLOCATE PREPARE stmt_range;
+
+--echo # =======================================================
+--echo # Test 3: Arena tracking for RANGE_PK_BETWEEN_SORT plan
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 3.1. Create test table with ORDER BY column
+CREATE TABLE t_sort (
+  id INT PRIMARY KEY,
+  val VARCHAR(50),
+  num INT
+);
+INSERT INTO t_sort VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30);
+
+--echo # 3.2. Create and execute RANGE with SORT PS
+--let $mem_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+PREPARE stmt_sort FROM 'SELECT * FROM t_sort WHERE id BETWEEN ? AND ? ORDER BY num';
+SET @p1 = 1;
+SET @p2 = 3;
+EXECUTE stmt_sort USING @p1, @p2;
+--let $mem_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+--let $mem_delta = `SELECT $mem_after - $mem_before`
+--echo RANGE_PK_BETWEEN_SORT arena allocated: $mem_delta bytes (expected: ~1000)
+
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+
+DEALLOCATE PREPARE stmt_sort;
+
+--echo # =======================================================
+--echo # Test 4: Arena tracking for RANGE_PK_BETWEEN_AGG plan
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 4.1. Create and execute RANGE with AGGREGATION PS
+--let $mem_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+PREPARE stmt_agg FROM 'SELECT COUNT(*), SUM(num) FROM t_sort WHERE id BETWEEN ? AND ?';
+SET @p1 = 1;
+SET @p2 = 3;
+EXECUTE stmt_agg USING @p1, @p2;
+--let $mem_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+--let $mem_delta = `SELECT $mem_after - $mem_before`
+--echo RANGE_PK_BETWEEN_AGG arena allocated: $mem_delta bytes (expected: ~1200)
+
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+
+DEALLOCATE PREPARE stmt_agg;
+
+--echo # =======================================================
+--echo # Test 5: Arena tracking for RANGE_PK_BETWEEN_DISTINCT plan
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 5.1. Create and execute RANGE with DISTINCT PS
+--let $mem_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+PREPARE stmt_distinct FROM 'SELECT DISTINCT val FROM t_sort WHERE id BETWEEN ? AND ?';
+SET @p1 = 1;
+SET @p2 = 3;
+EXECUTE stmt_distinct USING @p1, @p2;
+--let $mem_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+--let $mem_delta = `SELECT $mem_after - $mem_before`
+--echo RANGE_PK_BETWEEN_DISTINCT arena allocated: $mem_delta bytes (expected: ~1400)
+
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+
+DEALLOCATE PREPARE stmt_distinct;
+
+--echo # =======================================================
+--echo # Test 6: Composite primary key arena estimation
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 6.1. Create table with composite PK
+CREATE TABLE t_composite (
+  pk1 INT,
+  pk2 INT,
+  pk3 INT,
+  data VARCHAR(50),
+  PRIMARY KEY (pk1, pk2, pk3)
+);
+INSERT INTO t_composite VALUES
+  (1, 10, 100, 'first'),
+  (2, 20, 200, 'second'),
+  (3, 30, 300, 'third');
+
+--echo # 6.2. Create PS with composite PK range
+--let $mem_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+PREPARE stmt_comp FROM 'SELECT * FROM t_composite WHERE pk1 = ? AND pk2 = ?';
+SET @p1 = 1;
+SET @p2 = 10;
+EXECUTE stmt_comp USING @p1, @p2;
+--let $mem_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+--let $mem_delta = `SELECT $mem_after - $mem_before`
+--echo Composite PK POINT_EQ_REF arena: $mem_delta bytes
+
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+
+DEALLOCATE PREPARE stmt_comp;
+
+--echo # =======================================================
+--echo # Test 7: Unique key query arena estimation
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 7.1. Create table with unique key
+CREATE TABLE t_unique (
+  id INT PRIMARY KEY,
+  uk INT NOT NULL UNIQUE,
+  val VARCHAR(50)
+);
+INSERT INTO t_unique VALUES (1, 100, 'first'), (2, 200, 'second');
+
+--echo # 7.2. Create PS on unique key
+--let $mem_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+PREPARE stmt_uk FROM 'SELECT * FROM t_unique WHERE uk = ?';
+SET @p = 100;
+EXECUTE stmt_uk USING @p;
+--let $mem_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+--let $mem_delta = `SELECT $mem_after - $mem_before`
+--echo Unique key POINT_EQ_REF arena: $mem_delta bytes
+
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+
+DEALLOCATE PREPARE stmt_uk;
+
+--echo # =======================================================
+--echo # Test 8: LONG VARCHAR key arena estimation
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 8.1. Create table with VARCHAR primary key
+CREATE TABLE t_varchar (
+  id VARCHAR(50) PRIMARY KEY,
+  val VARCHAR(50)
+);
+INSERT INTO t_varchar VALUES ('short', 'first'), ('medium-key', 'second');
+
+--echo # 8.2. Create PS on VARCHAR PK
+--let $mem_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+PREPARE stmt_varchar FROM 'SELECT * FROM t_varchar WHERE id = ?';
+SET @p = 'short';
+EXECUTE stmt_varchar USING @p;
+--let $mem_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+--let $mem_delta = `SELECT $mem_after - $mem_before`
+--echo VARCHAR PK POINT_EQ_REF arena: $mem_delta bytes
+
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+
+DEALLOCATE PREPARE stmt_varchar;
+
+--echo # =======================================================
+--echo # Test 9: Memory quota enforcement accuracy
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 9.1. Set memory limit to approximately 2 PS
+SET GLOBAL ps_point_plan_cache_max_mem_size = 1600;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 100;
+
+--echo # 9.2. First PS should admit
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_quota1 FROM 'SELECT * FROM t_point WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_quota1 USING @p;
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo First PS admitted: $adm_delta
+
+--echo # 9.3. Second PS should admit
+--let $adm_before2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+PREPARE stmt_quota2 FROM 'SELECT * FROM t_sort WHERE id BETWEEN ? AND ?';
+SET @p1 = 1;
+SET @p2 = 3;
+EXECUTE stmt_quota2 USING @p1, @p2;
+--let $adm_after2 = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta2 = `SELECT $adm_after2 - $adm_before2`
+--echo Second PS admitted: $adm_delta2
+
+--echo # 9.4. Third PS should be refused (memory limit)
+--let $refused_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+PREPARE stmt_quota3 FROM 'SELECT * FROM t_unique WHERE uk = ?';
+SET @p = 100;
+EXECUTE stmt_quota3 USING @p;
+--let $refused_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta = `SELECT $refused_after - $refused_before`
+--echo Third PS refused: $refused_delta
+
+DEALLOCATE PREPARE stmt_quota1;
+DEALLOCATE PREPARE stmt_quota2;
+DEALLOCATE PREPARE stmt_quota3;
+
+--echo # =======================================================
+--echo # Test 10: Multiple PS of same type memory tracking
+--echo # =======================================================
+
+FLUSH STATUS;
+
+SET GLOBAL ps_point_plan_cache_max_mem_size = 0;
+
+--echo # 10.1. Create 5 identical POINT_EQ_REF PS
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+
+PREPARE stmt_multi1 FROM 'SELECT * FROM t_point WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_multi1 USING @p;
+
+PREPARE stmt_multi2 FROM 'SELECT * FROM t_sort WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_multi2 USING @p;
+
+PREPARE stmt_multi3 FROM 'SELECT * FROM t_unique WHERE uk = ?';
+SET @p = 100;
+EXECUTE stmt_multi3 USING @p;
+
+PREPARE stmt_multi4 FROM 'SELECT * FROM t_varchar WHERE id = ?';
+SET @p = 'short';
+EXECUTE stmt_multi4 USING @p;
+
+PREPARE stmt_multi5 FROM 'SELECT * FROM t_composite WHERE pk1 = ? AND pk2 = ?';
+SET @p1 = 1;
+SET @p2 = 10;
+EXECUTE stmt_multi5 USING @p1, @p2;
+
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+
+--echo # 10.2. DEALLOCATE all and verify memory goes to 0 (or near 0)
+DEALLOCATE PREPARE stmt_multi1;
+DEALLOCATE PREPARE stmt_multi2;
+DEALLOCATE PREPARE stmt_multi3;
+DEALLOCATE PREPARE stmt_multi4;
+DEALLOCATE PREPARE stmt_multi5;
+
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+
+--echo # =======================================================
+--echo # Test 11: Range with ORDER BY and DISTINCT combined
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 11.1. Create complex range query
+--let $mem_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+PREPARE stmt_complex FROM 'SELECT DISTINCT num FROM t_sort WHERE id BETWEEN ? AND ? ORDER BY num DESC';
+SET @p1 = 1;
+SET @p2 = 3;
+EXECUTE stmt_complex USING @p1, @p2;
+--let $mem_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+--let $mem_delta = `SELECT $mem_after - $mem_before`
+--echo Complex range (SORT+DISTINCT) arena: $mem_delta bytes
+
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+
+DEALLOCATE PREPARE stmt_complex;
+
+--echo # =======================================================
+--echo # Test 12: BIGINT primary key arena estimation
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 12.1. Create table with BIGINT PK
+CREATE TABLE t_bigint (
+  id BIGINT PRIMARY KEY,
+  val VARCHAR(50)
+);
+INSERT INTO t_bigint VALUES (1000000000000, 'first'), (2000000000000, 'second');
+
+--echo # 12.2. Create PS on BIGINT PK
+--let $mem_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+PREPARE stmt_bigint FROM 'SELECT * FROM t_bigint WHERE id = ?';
+SET @p = 1000000000000;
+EXECUTE stmt_bigint USING @p;
+--let $mem_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used', Value, 1)
+--let $mem_delta = `SELECT $mem_after - $mem_before`
+--echo BIGINT PK POINT_EQ_REF arena: $mem_delta bytes
+
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+
+DEALLOCATE PREPARE stmt_bigint;
+
+--echo # -------------------------------------------------------
+--echo # Final summary
+--echo # -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Restore original values
+--echo # -------------------------------------------------------
+SET GLOBAL ps_point_plan_cache_max_mem_size = @orig_max_mem;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = @orig_max_plans;
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+DROP TABLE t_bigint;
+DROP TABLE t_varchar;
+DROP TABLE t_unique;
+DROP TABLE t_composite;
+DROP TABLE t_sort;
+DROP TABLE t_point;
+
+--echo #
+--echo # End of arena estimation test
+--echo #

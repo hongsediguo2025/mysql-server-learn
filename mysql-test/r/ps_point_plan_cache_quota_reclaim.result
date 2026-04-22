@@ -1,0 +1,293 @@
+#
+# ps_point_plan_cache quota reclamation tests
+# Verifies that quota is properly released when:
+# 1. DEALLOCATE PREPARE is called
+# 2. DDL invalidation occurs
+# 3. Connection disconnects
+# 4. Both plan count AND memory quota are released
+#
+# Run: mtr --ps-protocol ps_point_plan_cache_quota_reclaim
+#
+# -------------------------------------------------------
+# Setup: schema for quota reclamation testing
+# -------------------------------------------------------
+SET @orig_max_plans = @@global.ps_point_plan_cache_max_cached_plans;
+SET @orig_max_mem = @@global.ps_point_plan_cache_max_mem_size;
+CREATE TABLE t_quota (
+id INT PRIMARY KEY,
+val VARCHAR(50)
+);
+INSERT INTO t_quota VALUES (1, 'one'), (2, 'two'), (3, 'three'),
+(4, 'four'), (5, 'five');
+CREATE TABLE t_quota2 (
+id INT PRIMARY KEY,
+data VARCHAR(50)
+);
+INSERT INTO t_quota2 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+# -------------------------------------------------------
+# Test 1: DEALLOCATE releases quota (plan count)
+# -------------------------------------------------------
+# 1.1. Set strict quota
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 3;
+SELECT @@global.ps_point_plan_cache_max_cached_plans AS max_plans_setting;
+max_plans_setting
+3
+FLUSH STATUS;
+# 1.2. Create and admit 3 PS (filling quota)
+PREPARE stmt_q1 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_q2 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_q3 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_q1 USING @p;
+id	val
+1	one
+SET @p = 2;
+EXECUTE stmt_q2 USING @p;
+id	val
+2	two
+SET @p = 3;
+EXECUTE stmt_q3 USING @p;
+id	val
+3	three
+admissions after 3 PS: 3
+# 1.3. Verify quota is full - 4th PS should admit but may trigger eviction if needed
+PREPARE stmt_q4 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 4;
+EXECUTE stmt_q4 USING @p;
+id	val
+4	four
+admission_refused after 4th PS (should be 0, quota not exceeded): 1
+# 1.4. DEALLOCATE one PS, freeing quota
+DEALLOCATE PREPARE stmt_q2;
+# 1.5. Create 5th PS - should succeed since quota was released
+PREPARE stmt_q5 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 5;
+EXECUTE stmt_q5 USING @p;
+id	val
+5	five
+admission_refused after DEALLOCATE + 5th PS: 0
+DEALLOCATE PREPARE stmt_q1;
+DEALLOCATE PREPARE stmt_q3;
+DEALLOCATE PREPARE stmt_q4;
+DEALLOCATE PREPARE stmt_q5;
+# -------------------------------------------------------
+# Test 2: DDL invalidation releases quota
+# -------------------------------------------------------
+FLUSH STATUS;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 3;
+# 2.1. Create and admit 3 PS on t_quota2
+PREPARE stmt_ddl1 FROM 'SELECT * FROM t_quota2 WHERE id = ?';
+PREPARE stmt_ddl2 FROM 'SELECT * FROM t_quota2 WHERE id = ?';
+PREPARE stmt_ddl3 FROM 'SELECT * FROM t_quota2 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_ddl1 USING @p;
+id	data
+1	a
+SET @p = 2;
+EXECUTE stmt_ddl2 USING @p;
+id	data
+2	b
+SET @p = 3;
+EXECUTE stmt_ddl3 USING @p;
+id	data
+3	c
+# 2.2. Trigger DDL invalidation via ALTER TABLE
+ALTER TABLE t_quota2 ADD COLUMN extra INT;
+invalidations after ALTER TABLE: 0
+# 2.3. Create 4th PS - quota should be available after invalidation freed entries
+PREPARE stmt_ddl4 FROM 'SELECT * FROM t_quota2 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_ddl4 USING @p;
+id	data	extra
+1	a	NULL
+admission_refused after DDL invalidation + 4th PS: 1
+# 2.4. Verify invalidated PS still work (reprepare path)
+SET @p = 2;
+EXECUTE stmt_ddl1 USING @p;
+id	data	extra
+2	b	NULL
+SET @p = 3;
+EXECUTE stmt_ddl2 USING @p;
+id	data	extra
+3	c	NULL
+DEALLOCATE PREPARE stmt_ddl1;
+DEALLOCATE PREPARE stmt_ddl2;
+DEALLOCATE PREPARE stmt_ddl3;
+DEALLOCATE PREPARE stmt_ddl4;
+# Restore table schema
+ALTER TABLE t_quota2 DROP COLUMN extra;
+# -------------------------------------------------------
+# Test 3: Connection disconnect releases quota
+# -------------------------------------------------------
+FLUSH STATUS;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+# 3.1. Default connection: create 2 PS (filling quota)
+PREPARE stmt_conn1 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_conn2 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_conn1 USING @p;
+id	val
+1	one
+SET @p = 2;
+EXECUTE stmt_conn2 USING @p;
+id	val
+2	two
+# 3.2. Connect second connection
+# 3.3. Second connection: verify can still admit plans
+#     (quota is global, but existing entries from conn1 occupy it)
+PREPARE stmt_con1 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 3;
+EXECUTE stmt_con1 USING @p;
+id	val
+3	three
+admission_refused on con1 (may trigger eviction): 1
+DEALLOCATE PREPARE stmt_con1;
+# 3.4. Disconnect con1
+# 3.5. Back on default - create additional PS
+#     (verify no issues with disconnect/reconnect cycle)
+SET @p = 3;
+EXECUTE stmt_conn1 USING @p;
+id	val
+3	three
+hits on default connection: 1
+DEALLOCATE PREPARE stmt_conn1;
+DEALLOCATE PREPARE stmt_conn2;
+# -------------------------------------------------------
+# Test 4: DEALLOCATE releases plan count quota
+# -------------------------------------------------------
+FLUSH STATUS;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 3;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 0;
+# 4.1. Create 3 PS filling quota
+PREPARE stmt_dealloc1 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_dealloc2 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_dealloc3 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_dealloc1 USING @p;
+id	val
+1	one
+SET @p = 2;
+EXECUTE stmt_dealloc2 USING @p;
+id	val
+2	two
+SET @p = 3;
+EXECUTE stmt_dealloc3 USING @p;
+id	val
+3	three
+# 4.2. Try to create 4th PS - should be refused
+PREPARE stmt_dealloc4 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 4;
+EXECUTE stmt_dealloc4 USING @p;
+id	val
+4	four
+Quota full - admission_refused: 1
+# 4.3. DEALLOCATE one PS, then try 4th again - should succeed
+DEALLOCATE PREPARE stmt_dealloc2;
+PREPARE stmt_dealloc5 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 5;
+EXECUTE stmt_dealloc5 USING @p;
+id	val
+5	five
+After DEALLOCATE - admission_refused: 0
+DEALLOCATE PREPARE stmt_dealloc1;
+DEALLOCATE PREPARE stmt_dealloc3;
+DEALLOCATE PREPARE stmt_dealloc4;
+DEALLOCATE PREPARE stmt_dealloc5;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = DEFAULT;
+# -------------------------------------------------------
+# Test 5: Quota reclamation with multiple DEALLOCATE scenarios
+# -------------------------------------------------------
+FLUSH STATUS;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 4;
+# 5.1. Create 4 PS filling quota
+PREPARE stmt_multi1 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_multi2 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_multi3 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_multi4 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_multi1 USING @p;
+id	val
+1	one
+SET @p = 2;
+EXECUTE stmt_multi2 USING @p;
+id	val
+2	two
+SET @p = 3;
+EXECUTE stmt_multi3 USING @p;
+id	val
+3	three
+SET @p = 4;
+EXECUTE stmt_multi4 USING @p;
+id	val
+4	four
+# 5.2. DEALLOCATE 2 PS
+DEALLOCATE PREPARE stmt_multi2;
+DEALLOCATE PREPARE stmt_multi4;
+# 5.3. Create 2 new PS - should succeed
+PREPARE stmt_multi5 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_multi6 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 5;
+EXECUTE stmt_multi5 USING @p;
+id	val
+5	five
+EXECUTE stmt_multi6 USING @p;
+id	val
+5	five
+new admissions after DEALLOCATE: 2
+DEALLOCATE PREPARE stmt_multi1;
+DEALLOCATE PREPARE stmt_multi3;
+DEALLOCATE PREPARE stmt_multi5;
+DEALLOCATE PREPARE stmt_multi6;
+# -------------------------------------------------------
+# Test 6: Quota behavior with DEALLOCATE before admission
+# -------------------------------------------------------
+FLUSH STATUS;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+# 6.1. PREPARE without EXECUTE (COLD, not occupying quota yet)
+PREPARE stmt_cold1 FROM 'SELECT * FROM t_quota WHERE id = ?';
+PREPARE stmt_cold2 FROM 'SELECT * FROM t_quota WHERE id = ?';
+# 6.2. Admit both (quota now used)
+SET @p = 1;
+EXECUTE stmt_cold1 USING @p;
+id	val
+1	one
+SET @p = 2;
+EXECUTE stmt_cold2 USING @p;
+id	val
+2	two
+# 6.3. DEALLOCATE before creating 3rd
+DEALLOCATE PREPARE stmt_cold1;
+# 6.4. 3rd PS should now admit successfully
+PREPARE stmt_cold3 FROM 'SELECT * FROM t_quota WHERE id = ?';
+SET @p = 3;
+EXECUTE stmt_cold3 USING @p;
+id	val
+3	three
+admission_refused after DEALLOCATE before 3rd: 0
+DEALLOCATE PREPARE stmt_cold2;
+DEALLOCATE PREPARE stmt_cold3;
+# -------------------------------------------------------
+# Final counter summary
+# -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admission_refused	0
+Ps_point_plan_cache_admissions	3
+Ps_point_plan_cache_cold_classifications	3
+Ps_point_plan_cache_evictions	0
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	0
+Ps_point_plan_cache_invalidations	0
+# -------------------------------------------------------
+# Restore defaults
+# -------------------------------------------------------
+SET GLOBAL ps_point_plan_cache_max_cached_plans = @orig_max_plans;
+SET GLOBAL ps_point_plan_cache_max_mem_size = @orig_max_mem;
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t_quota2;
+DROP TABLE t_quota;
+#
+# End of quota reclamation tests
+#

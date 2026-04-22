@@ -1,0 +1,143 @@
+#
+# ps_point_plan_cache memory limit and admission control tests
+# Tests for max_mem_size and max_cached_plans limits
+#
+# -------------------------------------------------------
+# Setup: schema for memory limit testing
+# -------------------------------------------------------
+SET @orig_max_mem_size = @@global.ps_point_plan_cache_max_mem_size;
+SET @orig_max_cached_plans = @@global.ps_point_plan_cache_max_cached_plans;
+CREATE TABLE t1 (
+id INT PRIMARY KEY,
+val VARCHAR(50),
+uk INT NOT NULL,
+name VARCHAR(50),
+UNIQUE KEY idx_uk (uk),
+KEY idx_name (name)
+);
+INSERT INTO t1 VALUES (1, 'alpha', 100, 'Alice'),
+(2, 'beta', 200, 'Bob'),
+(3, 'gamma', 300, 'Charlie');
+CREATE TABLE t2 (
+id INT PRIMARY KEY,
+data VARCHAR(100)
+);
+INSERT INTO t2 VALUES (1, 'first'), (2, 'second'), (3, 'third');
+CREATE TABLE t3 (
+pk1 INT,
+pk2 INT,
+val INT,
+PRIMARY KEY (pk1, pk2)
+);
+INSERT INTO t3 VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+FLUSH STATUS;
+# =======================================================
+# Test 1: max_cached_plans exhaustion test
+# =======================================================
+# 1.1. Set max_cached_plans = 2
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SELECT @@global.ps_point_plan_cache_max_cached_plans AS 'max_cached_plans set to 2';
+max_cached_plans set to 2
+2
+# 1.2. Create first PS - should be admitted
+PREPARE stmt_count1 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_count1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+# 1.3. Create second PS - should be admitted
+PREPARE stmt_count2 FROM 'SELECT * FROM t2 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_count2 USING @p;
+id	data
+1	first
+# 1.4. Create third PS - should be refused (max_cached_plans=2)
+PREPARE stmt_count3 FROM 'SELECT * FROM t3 WHERE pk1 = ? AND pk2 = ?';
+SET @p1 = 1;
+SET @p2 = 10;
+EXECUTE stmt_count3 USING @p1, @p2;
+pk1	pk2	val
+1	10	100
+DEALLOCATE PREPARE stmt_count1;
+DEALLOCATE PREPARE stmt_count2;
+DEALLOCATE PREPARE stmt_count3;
+# =======================================================
+# Test 2: SET GLOBAL max_cached_plans=0 (unlimited)
+# =======================================================
+FLUSH STATUS;
+# 2.1. Set max_cached_plans = 0 (unlimited)
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 0;
+SELECT @@global.ps_point_plan_cache_max_cached_plans AS 'max_cached_plans set to 0 (unlimited)';
+max_cached_plans set to 0 (unlimited)
+0
+# 2.2. Create multiple PS - all should be admitted
+PREPARE stmt_unl1 FROM 'SELECT * FROM t1 WHERE id = ?';
+PREPARE stmt_unl2 FROM 'SELECT * FROM t2 WHERE id = ?';
+PREPARE stmt_unl3 FROM 'SELECT * FROM t1 WHERE uk = ?';
+PREPARE stmt_unl4 FROM 'SELECT * FROM t1 WHERE name = ?';
+SET @p = 1;
+EXECUTE stmt_unl1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+SET @p = 2;
+EXECUTE stmt_unl2 USING @p;
+id	data
+2	second
+SET @p = 100;
+EXECUTE stmt_unl3 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+SET @p = 'Alice';
+EXECUTE stmt_unl4 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+DEALLOCATE PREPARE stmt_unl1;
+DEALLOCATE PREPARE stmt_unl2;
+DEALLOCATE PREPARE stmt_unl3;
+DEALLOCATE PREPARE stmt_unl4;
+# =======================================================
+# Test 3: max_mem_size exhaustion test
+# =======================================================
+FLUSH STATUS;
+# 3.1. Set very small memory limit (4096 bytes)
+SET GLOBAL ps_point_plan_cache_max_mem_size = 4096;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 500000;
+SELECT @@global.ps_point_plan_cache_max_mem_size AS 'max_mem_size set to 4096';
+max_mem_size set to 4096
+4096
+# 3.2. Create first PS - may or may not be admitted depending on existing cache
+PREPARE stmt_mem1 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_mem1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+# 3.3. Create second PS - should hit limit
+PREPARE stmt_mem2 FROM 'SELECT * FROM t2 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_mem2 USING @p;
+id	data
+1	first
+# 3.4. Create third PS - should definitely be refused
+PREPARE stmt_mem3 FROM 'SELECT * FROM t3 WHERE pk1 = ? AND pk2 = ?';
+SET @p1 = 1;
+SET @p2 = 10;
+EXECUTE stmt_mem3 USING @p1, @p2;
+pk1	pk2	val
+1	10	100
+DEALLOCATE PREPARE stmt_mem1;
+DEALLOCATE PREPARE stmt_mem2;
+DEALLOCATE PREPARE stmt_mem3;
+# -------------------------------------------------------
+# Restore original values
+# -------------------------------------------------------
+SET GLOBAL ps_point_plan_cache_max_mem_size = @orig_max_mem_size;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = @orig_max_cached_plans;
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t3;
+DROP TABLE t2;
+DROP TABLE t1;
+#
+# End of ps_point_plan_cache memory limit tests
+#

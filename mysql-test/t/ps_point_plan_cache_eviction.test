@@ -1,0 +1,343 @@
+--echo #
+--echo # Plan cache eviction testing
+--echo # Tests eviction_pct watermark trigger, idle eviction, and
+--echo # re-execution after eviction (HOT -> COLD transition).
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup: schema for eviction testing
+--echo # -------------------------------------------------------
+
+CREATE TABLE t1 (
+  id INT PRIMARY KEY,
+  val VARCHAR(50),
+  uk INT NOT NULL,
+  name VARCHAR(50),
+  UNIQUE KEY idx_uk (uk),
+  KEY idx_name (name)
+);
+INSERT INTO t1 VALUES (1, 'alpha', 100, 'Alice'),
+                      (2, 'beta', 200, 'Bob'),
+                      (3, 'gamma', 300, 'Charlie'),
+                      (4, 'delta', 400, 'David'),
+                      (5, 'epsilon', 500, 'Eve'),
+                      (6, 'zeta', 600, 'Frank'),
+                      (7, 'eta', 700, 'Grace'),
+                      (8, 'theta', 800, 'Henry'),
+                      (9, 'iota', 900, 'Ivy'),
+                      (10, 'kappa', 1000, 'Jack'),
+                      (11, 'lambda', 1100, 'Karen'),
+                      (12, 'mu', 1200, 'Leo'),
+                      (13, 'nu', 1300, 'Mia'),
+                      (14, 'xi', 1400, 'Noah'),
+                      (15, 'omicron', 1500, 'Olivia');
+
+--echo # -------------------------------------------------------
+--echo # 1. eviction_pct = 0: Disable eviction, verify direct refusal
+--echo #    when quota is full
+--echo # -------------------------------------------------------
+
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 5;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 0;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 1;
+FLUSH STATUS;
+
+--echo # Prepare and execute 5 PS (should all be admitted)
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+
+PREPARE stmt1 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt1 USING @p;
+
+PREPARE stmt2 FROM 'SELECT * FROM t1 WHERE uk = ?';
+SET @p = 200;
+EXECUTE stmt2 USING @p;
+
+PREPARE stmt3 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt3 USING @p;
+
+PREPARE stmt4 FROM 'SELECT * FROM t1 WHERE uk = ?';
+SET @p = 300;
+EXECUTE stmt4 USING @p;
+
+PREPARE stmt5 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 3;
+EXECUTE stmt5 USING @p;
+
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions after 5 PS: $adm_delta
+
+--echo # 6th PS should be refused (eviction disabled)
+--let $refused_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+
+PREPARE stmt6 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 4;
+EXECUTE stmt6 USING @p;
+
+--let $refused_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta = `SELECT $refused_after - $refused_before`
+--echo admission_refused after 6th PS: $refused_delta
+
+--echo # Cleanup
+DEALLOCATE PREPARE stmt1;
+DEALLOCATE PREPARE stmt2;
+DEALLOCATE PREPARE stmt3;
+DEALLOCATE PREPARE stmt4;
+DEALLOCATE PREPARE stmt5;
+DEALLOCATE PREPARE stmt6;
+
+--echo # -------------------------------------------------------
+--echo # 2. eviction_pct = 100: Trigger eviction scan on every admission
+--echo # -------------------------------------------------------
+
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 3;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 1;
+FLUSH STATUS;
+
+--echo # Prepare and execute 3 PS (fill quota)
+PREPARE stmt_a FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_a USING @p;
+
+PREPARE stmt_b FROM 'SELECT * FROM t1 WHERE uk = ?';
+SET @p = 200;
+EXECUTE stmt_b USING @p;
+
+PREPARE stmt_c FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt_c USING @p;
+
+--echo # Wait for entries to become idle
+--sleep 2
+
+--echo # 4th PS should trigger eviction scan
+--let $evict_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_evictions', Value, 1)
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+
+PREPARE stmt_d FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 3;
+EXECUTE stmt_d USING @p;
+
+--let $evict_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_evictions', Value, 1)
+--let $evict_delta = `SELECT $evict_after - $evict_before`
+--echo evictions after 4th PS: $evict_delta
+
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions after 4th PS: $adm_delta
+
+DEALLOCATE PREPARE stmt_a;
+DEALLOCATE PREPARE stmt_b;
+DEALLOCATE PREPARE stmt_c;
+DEALLOCATE PREPARE stmt_d;
+
+--echo # -------------------------------------------------------
+--echo # 3. Watermark trigger test: max_cached_plans=10,
+--echo #    eviction_pct=70 (watermark=7), verify eviction triggers
+--echo #    at 8th PS when quota is full
+--echo # -------------------------------------------------------
+
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 10;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 70;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 1;
+FLUSH STATUS;
+
+--echo # Prepare 7 PS (below watermark, should all be admitted)
+--let $adm_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+
+PREPARE stmt_w1 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_w1 USING @p;
+
+PREPARE stmt_w2 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt_w2 USING @p;
+
+PREPARE stmt_w3 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 3;
+EXECUTE stmt_w3 USING @p;
+
+PREPARE stmt_w4 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 4;
+EXECUTE stmt_w4 USING @p;
+
+PREPARE stmt_w5 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 5;
+EXECUTE stmt_w5 USING @p;
+
+PREPARE stmt_w6 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 6;
+EXECUTE stmt_w6 USING @p;
+
+PREPARE stmt_w7 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 7;
+EXECUTE stmt_w7 USING @p;
+
+--let $adm_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admissions', Value, 1)
+--let $adm_delta = `SELECT $adm_after - $adm_before`
+--echo admissions after 7 PS (below watermark): $adm_delta
+
+--echo # Wait for entries to become idle
+--sleep 2
+
+--echo # 8th PS should trigger eviction (above watermark)
+--let $evict_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_evictions', Value, 1)
+
+PREPARE stmt_w8 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 8;
+EXECUTE stmt_w8 USING @p;
+
+--let $evict_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_evictions', Value, 1)
+--let $evict_delta = `SELECT $evict_after - $evict_before`
+--echo evictions after 8th PS (above watermark): $evict_delta
+
+DEALLOCATE PREPARE stmt_w1;
+DEALLOCATE PREPARE stmt_w2;
+DEALLOCATE PREPARE stmt_w3;
+DEALLOCATE PREPARE stmt_w4;
+DEALLOCATE PREPARE stmt_w5;
+DEALLOCATE PREPARE stmt_w6;
+DEALLOCATE PREPARE stmt_w7;
+DEALLOCATE PREPARE stmt_w8;
+
+--echo # -------------------------------------------------------
+--echo # 4. Evicted PS re-execution: After eviction (HOT -> COLD),
+--echo #    re-execute should take normal optimizer path with correct results
+--echo # -------------------------------------------------------
+
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 1;
+FLUSH STATUS;
+
+--echo # Create PS and execute it (will be admitted as HOT)
+PREPARE stmt_re FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 5;
+EXECUTE stmt_re USING @p;
+
+--echo # Verify it was admitted
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--echo hits after first execute: $hits_after
+
+--echo # Wait for idle timeout
+--sleep 2
+
+--echo # Create another PS to trigger eviction of stmt_re
+PREPARE stmt_trigger FROM 'SELECT * FROM t1 WHERE uk = ?';
+SET @p = 300;
+EXECUTE stmt_trigger USING @p;
+
+--echo # Re-execute the original PS (should now be COLD, go through optimizer)
+--let $hits_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+
+SET @p = 6;
+EXECUTE stmt_re USING @p;
+
+--let $hits_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_hits', Value, 1)
+--let $hits_delta = `SELECT $hits_after - $hits_before`
+--echo hits delta after re-execute (evicted PS): $hits_delta
+
+DEALLOCATE PREPARE stmt_re;
+DEALLOCATE PREPARE stmt_trigger;
+
+--echo # -------------------------------------------------------
+--echo # 5. Evictions counter verification
+--echo # -------------------------------------------------------
+
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 3;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 1;
+FLUSH STATUS;
+
+--echo # Fill quota with 3 PS
+PREPARE stmt_c1 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_c1 USING @p;
+
+PREPARE stmt_c2 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt_c2 USING @p;
+
+PREPARE stmt_c3 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 3;
+EXECUTE stmt_c3 USING @p;
+
+--sleep 2
+
+--echo # Create 4th PS to trigger eviction
+--let $evict_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_evictions', Value, 1)
+
+PREPARE stmt_c4 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 4;
+EXECUTE stmt_c4 USING @p;
+
+--let $evict_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_evictions', Value, 1)
+--let $evict_delta = `SELECT $evict_after - $evict_before`
+--echo evictions counter increment: $evict_delta
+
+--echo # Verify evictions > 0
+--let $evict_is_positive = `SELECT $evict_delta > 0`
+--echo evictions counter is positive: $evict_is_positive
+
+DEALLOCATE PREPARE stmt_c1;
+DEALLOCATE PREPARE stmt_c2;
+DEALLOCATE PREPARE stmt_c3;
+DEALLOCATE PREPARE stmt_c4;
+
+--echo # -------------------------------------------------------
+--echo # 6. eviction_idle_seconds = 0: Disable TTL eviction
+--echo # -------------------------------------------------------
+
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 0;
+FLUSH STATUS;
+
+--echo # Fill quota
+PREPARE stmt_t1 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_t1 USING @p;
+
+PREPARE stmt_t2 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt_t2 USING @p;
+
+--sleep 2
+
+--echo # 3rd PS should be refused (no eviction, TTL disabled)
+--let $refused_before = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+
+PREPARE stmt_t3 FROM 'SELECT * FROM t1 WHERE id = ?';
+SET @p = 3;
+EXECUTE stmt_t3 USING @p;
+
+--let $refused_after = query_get_value(SHOW STATUS LIKE 'Ps_point_plan_cache_admission_refused', Value, 1)
+--let $refused_delta = `SELECT $refused_after - $refused_before`
+--echo admission_refused with TTL disabled: $refused_delta
+
+DEALLOCATE PREPARE stmt_t1;
+DEALLOCATE PREPARE stmt_t2;
+DEALLOCATE PREPARE stmt_t3;
+
+--echo # -------------------------------------------------------
+--echo # 7. Final counter summary
+--echo # -------------------------------------------------------
+
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Cleanup
+--echo # -------------------------------------------------------
+DROP TABLE t1;
+
+--echo # Reset to defaults
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 500000;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 75;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 300;
+
+--echo #
+--echo # End of plan cache eviction tests
+--echo #

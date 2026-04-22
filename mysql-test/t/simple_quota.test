@@ -1,0 +1,18 @@
+--echo # Simple quota test
+CREATE TABLE t_simple (id INT PRIMARY KEY, val INT);
+INSERT INTO t_simple VALUES (1, 10), (2, 20);
+
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 0;
+
+PREPARE stmt1 FROM 'SELECT * FROM t_simple WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt1 USING @p;
+
+PREPARE stmt2 FROM 'SELECT * FROM t_simple WHERE id = ?';
+SET @p = 2;
+EXECUTE stmt2 USING @p;
+
+DEALLOCATE PREPARE stmt1;
+DEALLOCATE PREPARE stmt2;
+DROP TABLE t_simple;

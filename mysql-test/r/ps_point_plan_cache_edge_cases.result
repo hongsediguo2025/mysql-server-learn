@@ -1,0 +1,622 @@
+#
+# ps_point_plan_cache edge cases and boundary conditions test
+# Covers extreme parameter values, counter validation,
+# and corner scenarios not covered in main tests.
+#
+# Run: mtr --ps-protocol ps_point_plan_cache_edge_cases
+#
+# -------------------------------------------------------
+# Setup: save original values and create test schema
+# -------------------------------------------------------
+SET @orig_max_mem = @@global.ps_point_plan_cache_max_mem_size;
+SET @orig_max_plans = @@global.ps_point_plan_cache_max_cached_plans;
+SET @orig_eviction_pct = @@global.ps_point_plan_cache_eviction_pct;
+SET @orig_idle_seconds = @@global.ps_point_plan_cache_eviction_idle_seconds;
+CREATE TABLE t_edge (
+id INT PRIMARY KEY,
+val VARCHAR(50),
+uk INT NOT NULL UNIQUE,
+name VARCHAR(50),
+KEY idx_name (name)
+);
+INSERT INTO t_edge VALUES (1, 'alpha', 100, 'Alice'),
+(2, 'beta', 200, 'Bob'),
+(3, 'gamma', 300, 'Charlie'),
+(4, 'delta', 400, 'David'),
+(5, 'epsilon', 500, 'Eve');
+CREATE TABLE t_edge2 (
+pk1 INT,
+pk2 INT,
+data VARCHAR(50),
+PRIMARY KEY (pk1, pk2)
+);
+INSERT INTO t_edge2 VALUES (1, 10, 'first'), (2, 20, 'second'), (3, 30, 'third');
+# =======================================================
+# Test 1: max_mem_size = 0 (unlimited memory)
+# =======================================================
+FLUSH STATUS;
+# 1.1. Set max_mem_size = 0 (unlimited)
+SET GLOBAL ps_point_plan_cache_max_mem_size = 0;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 0;
+SELECT @@global.ps_point_plan_cache_max_mem_size AS 'max_mem_size unlimited (0)';
+max_mem_size unlimited (0)
+0
+SELECT @@global.ps_point_plan_cache_max_cached_plans AS 'max_cached_plans unlimited (0)';
+max_cached_plans unlimited (0)
+0
+# 1.2. Create multiple PS - all should be admitted without limit
+PREPARE stmt_unlim1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+PREPARE stmt_unlim2 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+PREPARE stmt_unlim3 FROM 'SELECT * FROM t_edge WHERE name = ?';
+PREPARE stmt_unlim4 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ? AND pk2 = ?';
+PREPARE stmt_unlim5 FROM 'SELECT * FROM t_edge WHERE id BETWEEN ? AND ?';
+# 1.3. Execute all - should all become HOT
+SET @p = 1;
+EXECUTE stmt_unlim1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+SET @p = 100;
+EXECUTE stmt_unlim2 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+SET @p = 'Alice';
+EXECUTE stmt_unlim3 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+SET @p1 = 1;
+SET @p2 = 10;
+EXECUTE stmt_unlim4 USING @p1, @p2;
+pk1	pk2	data
+1	10	first
+SET @p1 = 1;
+SET @p2 = 3;
+EXECUTE stmt_unlim5 USING @p1, @p2;
+id	val	uk	name
+1	alpha	100	Alice
+2	beta	200	Bob
+3	gamma	300	Charlie
+# 1.4. Verify no admission refused
+admission_refused with unlimited: 0 (expected: 0)
+# 1.5. Verify mem_used is being tracked even when unlimited
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+Variable_name	Value
+DEALLOCATE PREPARE stmt_unlim1;
+DEALLOCATE PREPARE stmt_unlim2;
+DEALLOCATE PREPARE stmt_unlim3;
+DEALLOCATE PREPARE stmt_unlim4;
+DEALLOCATE PREPARE stmt_unlim5;
+# =======================================================
+# Test 2: Extremely small memory limit (1 byte)
+# =======================================================
+FLUSH STATUS;
+# 2.1. Set max_mem_size = 1 (smaller than any PS arena)
+SET GLOBAL ps_point_plan_cache_max_mem_size = 1;
+Warnings:
+Warning	1292	Truncated incorrect ps_point_plan_cache_max_mem_size value: '1'
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 1000000;
+SELECT @@global.ps_point_plan_cache_max_mem_size AS 'max_mem_size = 1 byte';
+max_mem_size = 1 byte
+0
+# 2.2. Try to create PS - should be refused (arena > 1 byte)
+PREPARE stmt_1byte FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_1byte USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+admission_refused with 1 byte limit: 0 (expected: 1)
+# 2.3. Verify mem_used didn't increase (PS not admitted)
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+Variable_name	Value
+DEALLOCATE PREPARE stmt_1byte;
+# =======================================================
+# Test 3: Memory limit exactly sized for one PS
+# =======================================================
+FLUSH STATUS;
+# 3.1. Set max_mem_size to approximately one PS size (~1024 bytes)
+SET GLOBAL ps_point_plan_cache_max_mem_size = 1024;
+SELECT @@global.ps_point_plan_cache_max_mem_size AS 'max_mem_size = 1024 bytes';
+max_mem_size = 1024 bytes
+1024
+# 3.2. First PS should succeed
+PREPARE stmt_fit1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_fit1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+First PS admission: 0 (expected: 1)
+# 3.3. Second PS should be refused (not enough memory)
+PREPARE stmt_fit2 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_fit2 USING @p;
+pk1	pk2	data
+1	10	first
+Second PS refused: 0 (expected: 1)
+DEALLOCATE PREPARE stmt_fit1;
+DEALLOCATE PREPARE stmt_fit2;
+# =======================================================
+# Test 4: max_cached_plans = 1 (minimum non-zero)
+# =======================================================
+FLUSH STATUS;
+# 4.1. Set max_cached_plans = 1
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 1;
+SET GLOBAL ps_point_plan_cache_max_mem_size = 0;
+SELECT @@global.ps_point_plan_cache_max_cached_plans AS 'max_cached_plans = 1';
+max_cached_plans = 1
+1
+# 4.2. First PS should succeed
+PREPARE stmt_single1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_single1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+First PS admission: 1 (expected: 1)
+# 4.3. Second PS should be refused
+PREPARE stmt_single2 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_single2 USING @p;
+pk1	pk2	data
+1	10	first
+Second PS refused: 0 (expected: 1)
+# 4.4. Verify cached_plans counter shows 1
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+Variable_name	Value
+DEALLOCATE PREPARE stmt_single1;
+DEALLOCATE PREPARE stmt_single2;
+# =======================================================
+# Test 5: eviction_pct boundary values
+# =======================================================
+FLUSH STATUS;
+# 5.1. eviction_pct = 0 (disable eviction scan)
+SET GLOBAL ps_point_plan_cache_max_mem_size = 4096;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 0;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 0;
+SELECT @@global.ps_point_plan_cache_eviction_pct AS 'eviction_pct = 0 (disabled)';
+eviction_pct = 0 (disabled)
+0
+# 5.2. Fill quota to max
+PREPARE stmt_pct1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_pct1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+PREPARE stmt_pct2 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_pct2 USING @p;
+pk1	pk2	data
+1	10	first
+# 5.3. Third PS should be refused (no eviction scan when pct=0)
+PREPARE stmt_pct3 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+SET @p = 100;
+EXECUTE stmt_pct3 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+Refused with pct=0 (no eviction): 1 (expected: 1)
+DEALLOCATE PREPARE stmt_pct1;
+DEALLOCATE PREPARE stmt_pct2;
+DEALLOCATE PREPARE stmt_pct3;
+# 5.4. eviction_pct = 100 (always scan)
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 100;
+SELECT @@global.ps_point_plan_cache_eviction_pct AS 'eviction_pct = 100 (always scan)';
+eviction_pct = 100 (always scan)
+100
+# 5.5. Create PS - should trigger eviction scan even at low usage
+PREPARE stmt_pct4 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_pct4 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+Eviction scan triggered at low usage: evictions may be 0 (no idle PS)
+DEALLOCATE PREPARE stmt_pct4;
+# =======================================================
+# Test 6: eviction_idle_seconds boundary values
+# =======================================================
+FLUSH STATUS;
+# 6.1. eviction_idle_seconds = 0 (disable TTL eviction)
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 0;
+SELECT @@global.ps_point_plan_cache_eviction_idle_seconds AS 'idle_seconds = 0 (disabled)';
+idle_seconds = 0 (disabled)
+0
+# 6.2. Fill quota
+PREPARE stmt_ttl1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_ttl1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+PREPARE stmt_ttl2 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_ttl2 USING @p;
+pk1	pk2	data
+1	10	first
+# 6.3. Wait and create third PS - should refuse (no TTL eviction)
+SELECT SLEEP(2);
+SLEEP(2)
+0
+PREPARE stmt_ttl3 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+SET @p = 100;
+EXECUTE stmt_ttl3 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+Refused with idle_seconds=0: 1 (expected: 1)
+DEALLOCATE PREPARE stmt_ttl1;
+DEALLOCATE PREPARE stmt_ttl2;
+DEALLOCATE PREPARE stmt_ttl3;
+# 6.4. eviction_idle_seconds = 1 (minimum practical value)
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 1;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+SELECT @@global.ps_point_plan_cache_eviction_idle_seconds AS 'idle_seconds = 1';
+idle_seconds = 1
+1
+# 6.5. Create and execute PS
+PREPARE stmt_ttl4 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_ttl4 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+PREPARE stmt_ttl5 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_ttl5 USING @p;
+pk1	pk2	data
+1	10	first
+# 6.6. Wait 2 seconds, then create third PS
+SELECT SLEEP(2);
+SLEEP(2)
+0
+PREPARE stmt_ttl6 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+SET @p = 100;
+EXECUTE stmt_ttl6 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+Evictions after idle timeout: 0 (expected: >= 1)
+DEALLOCATE PREPARE stmt_ttl4;
+DEALLOCATE PREPARE stmt_ttl5;
+DEALLOCATE PREPARE stmt_ttl6;
+# =======================================================
+# Test 7: Counter validation - mem_used non-negative
+# =======================================================
+FLUSH STATUS;
+SET GLOBAL ps_point_plan_cache_max_mem_size = 4096;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 100;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 75;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 300;
+# 7.1. Show initial mem_used
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+Variable_name	Value
+# 7.2. Create and deallocate PS
+PREPARE stmt_counter1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_counter1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+Variable_name	Value
+DEALLOCATE PREPARE stmt_counter1;
+# 7.3. Verify mem_used decreased (non-negative)
+SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
+Variable_name	Value
+# =======================================================
+# Test 8: Counter validation - cached_plans non-negative
+# =======================================================
+FLUSH STATUS;
+# 8.1. Create multiple PS
+PREPARE stmt_counter2 FROM 'SELECT * FROM t_edge WHERE id = ?';
+PREPARE stmt_counter3 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+SET @p = 1;
+EXECUTE stmt_counter2 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+SET @p = 100;
+EXECUTE stmt_counter3 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+Variable_name	Value
+# 8.2. DEALLOCATE all
+DEALLOCATE PREPARE stmt_counter2;
+DEALLOCATE PREPARE stmt_counter3;
+# 8.3. Verify cached_plans decreased
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+Variable_name	Value
+# =======================================================
+# Test 9: admission_refused counter increments
+# =======================================================
+FLUSH STATUS;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 1;
+SET GLOBAL ps_point_plan_cache_max_mem_size = 0;
+# 9.1. First PS succeeds
+PREPARE stmt_refuse1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_refuse1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+# 9.2. Second PS refused
+PREPARE stmt_refuse2 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+SET @p = 100;
+EXECUTE stmt_refuse2 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+# 9.3. Third PS also refused
+PREPARE stmt_refuse3 FROM 'SELECT * FROM t_edge WHERE name = ?';
+SET @p = 'Alice';
+EXECUTE stmt_refuse3 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+Total refused attempts: 1 (expected: 2)
+DEALLOCATE PREPARE stmt_refuse1;
+DEALLOCATE PREPARE stmt_refuse2;
+DEALLOCATE PREPARE stmt_refuse3;
+# =======================================================
+# Test 10: evictions counter increments
+# =======================================================
+FLUSH STATUS;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 100;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 2;
+# 10.1. Create 2 PS and execute
+PREPARE stmt_evict1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+PREPARE stmt_evict2 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+SET @p = 1;
+EXECUTE stmt_evict1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+SET @p = 100;
+EXECUTE stmt_evict2 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+# 10.2. Keep hitting stmt_evict1, let stmt_evict2 go idle
+SELECT SLEEP(1);
+SLEEP(1)
+0
+SET @p = 2;
+EXECUTE stmt_evict1 USING @p;
+id	val	uk	name
+2	beta	200	Bob
+SELECT SLEEP(1);
+SLEEP(1)
+0
+SET @p = 3;
+EXECUTE stmt_evict1 USING @p;
+id	val	uk	name
+3	gamma	300	Charlie
+# 10.3. Wait for timeout, create third PS
+SELECT SLEEP(3);
+SLEEP(3)
+0
+PREPARE stmt_evict3 FROM 'SELECT * FROM t_edge WHERE name = ?';
+SET @p = 'Alice';
+EXECUTE stmt_evict3 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+Evictions occurred: 0 (expected: 1)
+DEALLOCATE PREPARE stmt_evict1;
+DEALLOCATE PREPARE stmt_evict2;
+DEALLOCATE PREPARE stmt_evict3;
+# =======================================================
+# Test 11: PREPARE without EXECUTE (COLD state)
+# =======================================================
+FLUSH STATUS;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 300;
+# 11.1. PREPARE without EXECUTE - stays COLD, doesn't occupy quota
+PREPARE stmt_cold1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+PREPARE stmt_cold2 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+PREPARE stmt_cold3 FROM 'SELECT * FROM t_edge WHERE name = ?';
+# 11.2. Check cached_plans - should be 0 (no HOT PS yet)
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+Variable_name	Value
+# 11.3. EXECUTE to make them HOT
+SET @p = 1;
+EXECUTE stmt_cold1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+SET @p = 100;
+EXECUTE stmt_cold2 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+# 11.4. Check cached_plans - should be 2
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+Variable_name	Value
+# 11.5. Try to EXECUTE third - should be refused (quota full)
+SET @p = 'Alice';
+EXECUTE stmt_cold3 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+Third PS refused: 0 (expected: 1)
+DEALLOCATE PREPARE stmt_cold1;
+DEALLOCATE PREPARE stmt_cold2;
+DEALLOCATE PREPARE stmt_cold3;
+# =======================================================
+# Test 12: DDL invalidation with counters
+# =======================================================
+FLUSH STATUS;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+# 12.1. Create PS on t_edge2
+PREPARE stmt_ddl_inv FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_ddl_inv USING @p;
+pk1	pk2	data
+1	10	first
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+Variable_name	Value
+# 12.2. Trigger DDL invalidation
+ALTER TABLE t_edge2 ADD COLUMN extra INT;
+Invalidations after DDL: 0 (expected: >= 1)
+# 12.3. Verify cached_plans decreased
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+Variable_name	Value
+# 12.4. Restore table schema
+ALTER TABLE t_edge2 DROP COLUMN extra;
+# 12.5. New PS should be able to admit
+PREPARE stmt_ddl_inv2 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_ddl_inv2 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+DEALLOCATE PREPARE stmt_ddl_inv;
+DEALLOCATE PREPARE stmt_ddl_inv2;
+# =======================================================
+# Test 13: Dynamic parameter changes during runtime
+# =======================================================
+FLUSH STATUS;
+# 13.1. Start with moderate limit
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 3;
+SET GLOBAL ps_point_plan_cache_max_mem_size = 0;
+# 13.2. Create 3 PS
+PREPARE stmt_dyn1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+PREPARE stmt_dyn2 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+PREPARE stmt_dyn3 FROM 'SELECT * FROM t_edge WHERE name = ?';
+SET @p = 1;
+EXECUTE stmt_dyn1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+SET @p = 100;
+EXECUTE stmt_dyn2 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+SET @p = 'Alice';
+EXECUTE stmt_dyn3 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+Variable_name	Value
+# 13.3. Reduce limit to 2 (existing HOT PS not affected)
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
+SELECT @@global.ps_point_plan_cache_max_cached_plans AS 'Reduced to 2';
+Reduced to 2
+2
+# 13.4. Existing PS still work (HOT)
+SET @p = 2;
+EXECUTE stmt_dyn1 USING @p;
+id	val	uk	name
+2	beta	200	Bob
+SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
+Variable_name	Value
+# 13.5. New PS should be refused (quota exceeded)
+PREPARE stmt_dyn4 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_dyn4 USING @p;
+pk1	pk2	data
+1	10	first
+Refused after reducing quota: 0 (expected: 1)
+# 13.6. Increase limit back to 5
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 5;
+SELECT @@global.ps_point_plan_cache_max_cached_plans AS 'Increased to 5';
+Increased to 5
+5
+# 13.7. New PS should now succeed
+PREPARE stmt_dyn5 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_dyn5 USING @p;
+pk1	pk2	data
+1	10	first
+Admission after increasing quota: 0 (expected: 1)
+DEALLOCATE PREPARE stmt_dyn1;
+DEALLOCATE PREPARE stmt_dyn2;
+DEALLOCATE PREPARE stmt_dyn3;
+DEALLOCATE PREPARE stmt_dyn4;
+DEALLOCATE PREPARE stmt_dyn5;
+# =======================================================
+# Test 14: Memory limit + plan limit combination
+# =======================================================
+FLUSH STATUS;
+# 14.1. Set both limits low
+SET GLOBAL ps_point_plan_cache_max_mem_size = 2048;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 100;
+SET GLOBAL ps_point_plan_cache_eviction_pct = 75;
+# 14.2. Fill memory quota
+PREPARE stmt_combo1 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_combo1 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+First PS admitted: 0
+# 14.3. Second PS should hit memory limit
+PREPARE stmt_combo2 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
+SET @p = 1;
+EXECUTE stmt_combo2 USING @p;
+pk1	pk2	data
+1	10	first
+Second PS refused by memory: 0
+DEALLOCATE PREPARE stmt_combo1;
+DEALLOCATE PREPARE stmt_combo2;
+# 14.4. Now test plan limit (memory unlimited)
+SET GLOBAL ps_point_plan_cache_max_mem_size = 0;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 1;
+PREPARE stmt_combo3 FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_combo3 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+PREPARE stmt_combo4 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+SET @p = 100;
+EXECUTE stmt_combo4 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+Second PS refused by plan count: 1
+DEALLOCATE PREPARE stmt_combo3;
+DEALLOCATE PREPARE stmt_combo4;
+# =======================================================
+# Test 15: Refused PS re-execution behavior
+# =======================================================
+FLUSH STATUS;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 1;
+SET GLOBAL ps_point_plan_cache_max_mem_size = 0;
+# 15.1. Create first PS (HOT)
+PREPARE stmt_retry FROM 'SELECT * FROM t_edge WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_retry USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+# 15.2. Try to create second PS (refused)
+PREPARE stmt_retry2 FROM 'SELECT * FROM t_edge WHERE uk = ?';
+SET @p = 100;
+EXECUTE stmt_retry2 USING @p;
+id	val	uk	name
+1	alpha	100	Alice
+# 15.3. Execute refused PS multiple times - should work (normal optimizer)
+SET @p = 200;
+EXECUTE stmt_retry2 USING @p;
+id	val	uk	name
+2	beta	200	Bob
+SET @p = 300;
+EXECUTE stmt_retry2 USING @p;
+id	val	uk	name
+3	gamma	300	Charlie
+# 15.4. First PS still HOT (cached)
+SET @p = 2;
+EXECUTE stmt_retry USING @p;
+id	val	uk	name
+2	beta	200	Bob
+DEALLOCATE PREPARE stmt_retry;
+DEALLOCATE PREPARE stmt_retry2;
+# -------------------------------------------------------
+# Final counter summary
+# -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+Variable_name	Value
+Ps_point_plan_cache_admission_refused	3
+Ps_point_plan_cache_admissions	1
+Ps_point_plan_cache_cold_classifications	2
+Ps_point_plan_cache_evictions	0
+Ps_point_plan_cache_fallback_runtime	0
+Ps_point_plan_cache_hits	1
+Ps_point_plan_cache_invalidations	0
+# -------------------------------------------------------
+# Restore original values
+# -------------------------------------------------------
+SET GLOBAL ps_point_plan_cache_max_mem_size = @orig_max_mem;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = @orig_max_plans;
+SET GLOBAL ps_point_plan_cache_eviction_pct = @orig_eviction_pct;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = @orig_idle_seconds;
+# -------------------------------------------------------
+# Cleanup
+# -------------------------------------------------------
+DROP TABLE t_edge2;
+DROP TABLE t_edge;
+#
+# End of edge cases test
+#

@@ -141,8 +141,10 @@ DEALLOCATE PREPARE stmt_null_high;
 # -------------------------------------------------------
 SHOW STATUS LIKE 'Ps_point_plan_cache%';
 Variable_name	Value
+Ps_point_plan_cache_admission_refused	0
 Ps_point_plan_cache_admissions	1
 Ps_point_plan_cache_cold_classifications	1
+Ps_point_plan_cache_evictions	0
 Ps_point_plan_cache_fallback_runtime	1
 Ps_point_plan_cache_hits	0
 Ps_point_plan_cache_invalidations	0

@@ -1,0 +1,195 @@
+--echo #
+--echo # Phase TTL test: ps_point_plan_cache idle timeout eviction
+--echo # Verifies TTL-based eviction of cached plans when idle.
+--echo #
+--echo # Run: mtr --ps-protocol ps_point_plan_cache_ttl
+--echo #
+
+--echo # -------------------------------------------------------
+--echo # Setup
+--echo # -------------------------------------------------------
+
+CREATE TABLE t_ttl (
+  id INT PRIMARY KEY,
+  val VARCHAR(50)
+);
+INSERT INTO t_ttl VALUES
+  (1, 'alpha'), (2, 'beta'), (3, 'gamma'), (4, 'delta'), (5, 'epsilon'),
+  (6, 'zeta'), (7, 'eta'), (8, 'theta'), (9, 'iota'),
+  (10, 'kappa'), (20, 'lambda'), (30, 'mu');
+
+FLUSH STATUS;
+
+--echo # =======================================================
+--echo # Test 1: Idle timeout eviction
+--echo # =======================================================
+
+--echo # 1.1. Set short idle timeout (3 seconds)
+SET @orig_idle = @@global.ps_point_plan_cache_eviction_idle_seconds;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 3;
+SELECT @@global.ps_point_plan_cache_eviction_idle_seconds AS 'Idle timeout set to 3 seconds';
+
+--echo # 1.2. Prepare and admit a PS
+PREPARE stmt_ttl1 FROM 'SELECT * FROM t_ttl WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_ttl1 USING @p;
+
+--echo # 1.3. HOT hit to confirm cache is working
+SET @p = 2;
+EXECUTE stmt_ttl1 USING @p;
+
+--echo # 1.4. Wait for idle timeout (4 seconds, > 3 second threshold)
+SELECT SLEEP(4) AS 'Waited 4 seconds for idle timeout';
+
+--echo # 1.5. Execute after idle - should trigger re-admission (eviction occurred)
+SET @p = 3;
+EXECUTE stmt_ttl1 USING @p;
+
+DEALLOCATE PREPARE stmt_ttl1;
+
+--echo # =======================================================
+--echo # Test 2: last_hit_time update on each HOT hit
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 2.1. Prepare and admit a PS
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 2;
+PREPARE stmt_hit_time FROM 'SELECT * FROM t_ttl WHERE id = ?';
+SET @p = 10;
+EXECUTE stmt_hit_time USING @p;
+
+--echo # 2.2. Execute at 1 second intervals - should keep cache alive
+--echo Each HOT hit updates last_hit_time, preventing eviction
+SELECT SLEEP(1);
+SET @p = 20;
+EXECUTE stmt_hit_time USING @p;
+
+SELECT SLEEP(1);
+SET @p = 30;
+EXECUTE stmt_hit_time USING @p;
+
+--echo # 2.3. Verify no eviction occurred during the keep-alive period
+SHOW STATUS LIKE 'Ps_point_plan_cache_admissions';
+
+DEALLOCATE PREPARE stmt_hit_time;
+
+--echo # =======================================================
+--echo # Test 3: Disable TTL with eviction_idle_seconds=0
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 3.1. Disable TTL
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 0;
+SELECT @@global.ps_point_plan_cache_eviction_idle_seconds AS 'TTL disabled (0)';
+
+--echo # 3.2. Prepare and admit a PS
+PREPARE stmt_no_ttl FROM 'SELECT * FROM t_ttl WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_no_ttl USING @p;
+
+--echo # 3.3. Wait extended time (5 seconds)
+SELECT SLEEP(5) AS 'Waited 5 seconds with TTL disabled';
+
+--echo # 3.4. Execute - should still be HOT (no eviction possible)
+SET @p = 2;
+EXECUTE stmt_no_ttl USING @p;
+
+DEALLOCATE PREPARE stmt_no_ttl;
+
+--echo # =======================================================
+--echo # Test 4: Frequent hit keeps alive, then eventual eviction
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 4.1. Re-enable TTL with short timeout
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 2;
+
+--echo # 4.2. Prepare and admit
+PREPARE stmt_keep_alive FROM 'SELECT * FROM t_ttl WHERE id = ?';
+SET @p = 1;
+EXECUTE stmt_keep_alive USING @p;
+
+--echo # 4.3. Keep alive with frequent hits (every 1.5 seconds < 2s timeout)
+SELECT SLEEP(1);
+SET @p = 2;
+EXECUTE stmt_keep_alive USING @p;
+
+SELECT SLEEP(1);
+SET @p = 3;
+EXECUTE stmt_keep_alive USING @p;
+
+SELECT SLEEP(1);
+SET @p = 10;
+EXECUTE stmt_keep_alive USING @p;
+
+--echo # 4.4. Stop hitting, wait for timeout (3 seconds > 2s threshold)
+SELECT SLEEP(3) AS 'Waited 3 seconds without hits';
+
+--echo # 4.5. Now execute - should trigger eviction and re-admission
+SET @p = 20;
+EXECUTE stmt_keep_alive USING @p;
+
+DEALLOCATE PREPARE stmt_keep_alive;
+
+--echo # =======================================================
+--echo # Test 5: Multiple PS - eviction is per-entry
+--echo # =======================================================
+
+FLUSH STATUS;
+
+--echo # 5.1. Set short timeout
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 2;
+
+--echo # 5.2. Prepare and admit two PS
+PREPARE stmt_multi1 FROM 'SELECT * FROM t_ttl WHERE id = ?';
+PREPARE stmt_multi2 FROM 'SELECT * FROM t_ttl WHERE id = ?';
+
+--echo Admit both
+SET @p = 1;
+EXECUTE stmt_multi1 USING @p;
+SET @p = 2;
+EXECUTE stmt_multi2 USING @p;
+
+--echo # 5.3. Keep hitting stmt_multi1, let stmt_multi2 go idle
+SELECT SLEEP(1);
+SET @p = 3;
+EXECUTE stmt_multi1 USING @p;
+
+SELECT SLEEP(1);
+SET @p = 4;
+EXECUTE stmt_multi1 USING @p;
+
+SELECT SLEEP(1);
+SET @p = 5;
+EXECUTE stmt_multi1 USING @p;
+
+--echo # 5.4. Wait for timeout (stmt_multi2 should be evicted)
+SELECT SLEEP(3);
+
+--echo # 5.5. Execute both - only stmt_multi2 should need re-admission
+SET @p = 10;
+EXECUTE stmt_multi1 USING @p;
+
+SET @p = 20;
+EXECUTE stmt_multi2 USING @p;
+
+DEALLOCATE PREPARE stmt_multi1;
+DEALLOCATE PREPARE stmt_multi2;
+
+--echo # -------------------------------------------------------
+--echo # Final counter summary
+--echo # -------------------------------------------------------
+SHOW STATUS LIKE 'Ps_point_plan_cache%';
+
+--echo # -------------------------------------------------------
+--echo # Restore original setting and cleanup
+--echo # -------------------------------------------------------
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = @orig_idle;
+DROP TABLE t_ttl;
+
+--echo #
+--echo # End of TTL test
+--echo #

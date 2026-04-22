@@ -1425,6 +1425,12 @@ bool opt_keyring_operations = true;
 
 bool opt_table_encryption_privilege_check = false;
 
+/* ps_point_plan_cache memory limit global variables. */
+ulonglong ps_point_plan_cache_max_mem_size = 1ULL << 30;  // 1 GB
+ulong ps_point_plan_cache_max_cached_plans = 500000;
+uint ps_point_plan_cache_eviction_pct = 75;
+ulong ps_point_plan_cache_eviction_idle_seconds = 300;
+
 const double log_10[] = {
     1e000, 1e001, 1e002, 1e003, 1e004, 1e005, 1e006, 1e007, 1e008, 1e009, 1e010,
     1e011, 1e012, 1e013, 1e014, 1e015, 1e016, 1e017, 1e018, 1e019, 1e020, 1e021,
@@ -9852,6 +9858,9 @@ SHOW_VAR status_vars[] = {
      SHOW_SCOPE_ALL},
     {"Prepared_stmt_count", (char *)&show_prepared_stmt_count, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
+    {"Ps_point_plan_cache_admission_refused",
+     (char *)offsetof(System_status_var, ps_point_plan_cache_admission_refused),
+     SHOW_LONGLONG_STATUS, SHOW_SCOPE_ALL},
     {"Ps_point_plan_cache_admissions",
      (char *)offsetof(System_status_var, ps_point_plan_cache_admissions),
      SHOW_LONGLONG_STATUS, SHOW_SCOPE_ALL},
@@ -9864,6 +9873,9 @@ SHOW_VAR status_vars[] = {
      SHOW_LONGLONG_STATUS, SHOW_SCOPE_ALL},
     {"Ps_point_plan_cache_hits",
      (char *)offsetof(System_status_var, ps_point_plan_cache_hits),
+     SHOW_LONGLONG_STATUS, SHOW_SCOPE_ALL},
+    {"Ps_point_plan_cache_evictions",
+     (char *)offsetof(System_status_var, ps_point_plan_cache_evictions),
      SHOW_LONGLONG_STATUS, SHOW_SCOPE_ALL},
     {"Ps_point_plan_cache_invalidations",
      (char *)offsetof(System_status_var, ps_point_plan_cache_invalidations),
