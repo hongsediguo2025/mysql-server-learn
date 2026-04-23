@@ -58,12 +58,6 @@
 #include "sql/table.h"
 #include "sql/visible_fields.h"
 
-#ifdef __APPLE__
-#include <mach/mach_time.h>
-#else
-#include <time.h>
-#endif
-
 namespace {
 
 constexpr ulonglong kPsPcRelevantOptimizerSwitchMask =
@@ -118,30 +112,6 @@ void ps_point_plan_clear_hot_metadata(PsPointPlanTemplate *tpl) {
   tpl->optimizer_switch = 0;
   tpl->table_ref_version = 0;
   tpl->relevant_sql_mode = 0;
-  /*
-    ref_cached / qep_cached stay true if previously built — the
-    arena-allocated buffers survive demotion.  A compatibility check
-    in ps_point_plan_admit() validates the cached Field clones match
-    the new key layout before reuse; mismatches force a rebuild.
-    Helper-layout metadata needed by that check is stored separately
-    in cached_key_parts/cached_key_length so we can still clear the
-    active HOT plan metadata here.
-  */
-  tpl->has_aggregate = false;
-  tpl->aggregate_type = 0;
-  tpl->aggregate_field_index = MAX_KEY;
-  tpl->aggregate_field_type = MYSQL_TYPE_INVALID;
-  tpl->aggregate_field_unsigned = false;
-
-  tpl->has_order_by = false;
-  tpl->order_field_index = MAX_KEY;
-  tpl->order_direction_desc = false;
-  tpl->order_field_type = MYSQL_TYPE_INVALID;
-  tpl->order_field_unsigned = false;
-  tpl->order_collation = nullptr;
-
-  tpl->has_distinct = false;
-
   for (uint i = 0; i < PS_PC_MAX_PARAMS; i++) {
     tpl->actual_types[i] = MYSQL_TYPE_INVALID;
     tpl->unsigned_actuals[i] = false;
@@ -149,15 +119,52 @@ void ps_point_plan_clear_hot_metadata(PsPointPlanTemplate *tpl) {
   }
 }
 
-void ps_point_plan_demote_to_cold(Prepared_statement *stmt) {
-  /* Release plan count from global tracker (HOT → COLD). */
-  if (stmt->ps_point_plan_state() == PsPointPlanState::HOT) {
-    ps_plan_cache_tracker.remove_plan();
-    /* arena_cached_bytes preserved — may be reused on re-admission */
+void ps_point_plan_clear_cached_helpers(PsPointPlanTemplate *tpl) {
+  tpl->ref_cached = false;
+  tpl->cached_key_buff = nullptr;
+  tpl->cached_key_buff2 = nullptr;
+  tpl->cached_key_parts = 0;
+  tpl->cached_key_length = 0;
+  for (uint i = 0; i < PS_PC_MAX_PARAMS; i++) {
+    tpl->cached_store_keys[i] = nullptr;
+    tpl->cached_to_fields[i] = nullptr;
+    tpl->cached_part_lengths[i] = 0;
+    tpl->cached_part_store_lengths[i] = 0;
   }
-  ps_point_plan_clear_hot_metadata(&stmt->ps_point_plan_template());
-  stmt->set_ps_point_plan_state(PsPointPlanState::COLD);
-  stmt->set_ps_point_plan_retryable_cold(true);
+
+  tpl->qep_cached = false;
+  tpl->cached_qep_tab = nullptr;
+  tpl->cached_qep_shared = nullptr;
+  tpl->cached_key_copy = nullptr;
+  tpl->cached_ref_items = nullptr;
+  tpl->cached_cond_guards = nullptr;
+
+  tpl->range_arena_cached = false;
+  tpl->cached_range_low_store = nullptr;
+  tpl->cached_range_high_store = nullptr;
+  tpl->cached_range_to_fields[0] = nullptr;
+  tpl->cached_range_to_fields[1] = nullptr;
+  tpl->cached_range_key_part = nullptr;
+  tpl->cached_range_array = nullptr;
+  tpl->cached_range_min_key = nullptr;
+  tpl->cached_range_max_key = nullptr;
+  tpl->cached_range_key_bytes = 0;
+  tpl->cached_range_qep_tab = nullptr;
+  tpl->cached_range_qep_shared = nullptr;
+}
+
+void ps_point_plan_demote_to_cold(Prepared_statement *stmt) {
+  stmt->reset_ps_point_plan_cache_helpers(
+      PsPointPlanResetReason::DEMOTE_RETRYABLE);
+}
+
+bool ps_point_plan_param_drift_keeps_hot(const PsPointPlanTemplate &tpl) {
+  /*
+    DISTINCT fast path has a richer SORT/filesort shape.  On parameter
+    type drift, prefer one-shot fallback while keeping the existing HOT
+    template, avoiding admission-time arena churn for uncommon param types.
+  */
+  return tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_SORT_DISTINCT;
 }
 
 bool ps_point_plan_bind_cached_ref_parts(TABLE *table,
@@ -199,24 +206,6 @@ bool ps_point_plan_cached_helpers_compatible(const PsPointPlanTemplate &tpl,
   return true;
 }
 
-/**
-  Get current monotonic time in seconds.
-  Used for last_hit_time / admission_time tracking.
-  Cost: ~5ns on modern hardware (vDSO / mach_absolute_time).
-*/
-uint64_t ps_point_plan_now_seconds() {
-#ifdef __APPLE__
-  static mach_timebase_info_data_t tb_info = {0, 0};
-  if (tb_info.denom == 0) mach_timebase_info(&tb_info);
-  uint64_t ns = mach_absolute_time() * tb_info.numer / tb_info.denom;
-  return ns / 1000000000ULL;
-#else
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
-  return static_cast<uint64_t>(ts.tv_sec);
-#endif
-}
-
 }  // namespace
 
 /**
@@ -224,10 +213,59 @@ uint64_t ps_point_plan_now_seconds() {
   Called from build_fast_path on every successful fast-path construction.
 */
 static void ps_point_plan_record_hit(THD *thd,
-                                     const PsPointPlanTemplate &tpl) {
-  tpl.last_hit_time.store(ps_point_plan_now_seconds(),
-                          std::memory_order_relaxed);
+                                     PsPointPlanTemplate &tpl) {
+  tpl.last_hit_time = static_cast<uint64_t>(thd->query_start_in_secs());
   ps_point_plan_mark_hit(thd);
+}
+
+void Prepared_statement::invalidate_ps_point_plan_cache() {
+  reset_ps_point_plan_cache_helpers(PsPointPlanResetReason::INVALIDATE_DDL);
+}
+
+void Prepared_statement::reset_ps_point_plan_cache_helpers(
+    PsPointPlanResetReason reason) {
+  if (m_ps_pc_state == PsPointPlanState::HOT) {
+    ps_plan_cache_tracker.remove_plan();
+  }
+  if (m_ps_pc.arena_cached_bytes > 0) {
+    ps_plan_cache_tracker.release(m_ps_pc.arena_cached_bytes);
+    m_ps_pc.arena_cached_bytes = 0;
+  }
+
+  ps_point_plan_clear_hot_metadata(&m_ps_pc);
+  ps_point_plan_clear_cached_helpers(&m_ps_pc);
+  m_ps_pc.admission_time = 0;
+  m_ps_pc.last_hit_time = 0;
+
+  m_ps_pc_arena.free_items();
+  m_ps_pc_mem_root.Clear();
+  m_ps_pc_arena.reset_item_list();
+  m_ps_pc_arena.set_state(Query_arena::STMT_PREPARED);
+
+  m_ps_pc_cursor_execution = false;
+
+  switch (reason) {
+    case PsPointPlanResetReason::DEMOTE_RETRYABLE:
+      m_ps_pc_state = PsPointPlanState::COLD;
+      m_ps_pc_retryable_cold = true;
+      break;
+    case PsPointPlanResetReason::INVALIDATE_DDL:
+      m_ps_pc_state = PsPointPlanState::COLD;
+      m_ps_pc_retryable_cold = true;
+      break;
+    case PsPointPlanResetReason::EVICT_IDLE:
+      m_ps_pc_state = PsPointPlanState::COLD;
+      m_ps_pc_retryable_cold = false;
+      break;
+    case PsPointPlanResetReason::QUOTA_REFUSED:
+      m_ps_pc_state = PsPointPlanState::COLD;
+      m_ps_pc_retryable_cold = false;
+      break;
+    case PsPointPlanResetReason::DESTROY:
+      m_ps_pc_state = PsPointPlanState::NEVER;
+      m_ps_pc_retryable_cold = false;
+      break;
+  }
 }
 
 /**
@@ -548,14 +586,7 @@ bool ps_point_plan_classify(THD *thd, Prepared_statement *stmt) {
 
   /* Gate 5: extract WHERE shape (field=? equalities). */
   PsPointPlanTemplate &tpl = stmt->ps_point_plan_template();
-  /*
-    Placement-new to reinitialize the template to default state.
-    Direct assignment (tpl = PsPointPlanTemplate{}) is not possible
-    because std::atomic<uint64_t> last_hit_time deletes the copy
-    assignment operator.  PsPointPlanTemplate is trivially destructible
-    so skipping the explicit destructor call is safe.
-  */
-  new (&tpl) PsPointPlanTemplate{};
+  tpl = PsPointPlanTemplate{};
   tpl.table_ref = tbl;
 
   /*
@@ -733,7 +764,7 @@ bool ps_point_plan_extract_where_shape(Query_block *qb,
 
 bool ps_point_plan_runtime_guard(THD *thd, Prepared_statement *stmt,
                                  TABLE **table_out, KEY **keyinfo_out) {
-  const PsPointPlanTemplate &tpl = stmt->ps_point_plan_template();
+  PsPointPlanTemplate &tpl = stmt->ps_point_plan_template();
 
   /*
     Structural guards — if any fails, the template is no longer valid
@@ -852,6 +883,10 @@ bool ps_point_plan_runtime_guard(THD *thd, Prepared_statement *stmt,
 
     /* G8: parameter actual type must match admission snapshot. */
     if (tpl.params[i]->data_type_actual() != tpl.actual_types[i]) {
+      if (ps_point_plan_param_drift_keeps_hot(tpl)) {
+        ps_point_plan_mark_runtime_fallback(thd);
+        return false;
+      }
       ps_point_plan_demote_to_cold(stmt);
       ps_point_plan_mark_runtime_fallback(thd);
       return false;
@@ -859,6 +894,10 @@ bool ps_point_plan_runtime_guard(THD *thd, Prepared_statement *stmt,
 
     /* G9: unsigned flag must match admission snapshot. */
     if (tpl.params[i]->is_unsigned_actual() != tpl.unsigned_actuals[i]) {
+      if (ps_point_plan_param_drift_keeps_hot(tpl)) {
+        ps_point_plan_mark_runtime_fallback(thd);
+        return false;
+      }
       ps_point_plan_demote_to_cold(stmt);
       ps_point_plan_mark_runtime_fallback(thd);
       return false;
@@ -867,6 +906,10 @@ bool ps_point_plan_runtime_guard(THD *thd, Prepared_statement *stmt,
     /* G10: string collation drift must be re-optimized. */
     if (ps_point_plan_actual_collation(tpl.params[i]) !=
         tpl.actual_collations[i]) {
+      if (ps_point_plan_param_drift_keeps_hot(tpl)) {
+        ps_point_plan_mark_runtime_fallback(thd);
+        return false;
+      }
       ps_point_plan_demote_to_cold(stmt);
       ps_point_plan_mark_runtime_fallback(thd);
       return false;
@@ -1113,7 +1156,7 @@ static void ps_point_plan_commit_range_to_join(
 */
 bool ps_point_plan_build_fast_path(THD *thd, JOIN *join,
                                    Prepared_statement *stmt) {
-  const PsPointPlanTemplate &tpl = stmt->ps_point_plan_template();
+  PsPointPlanTemplate &tpl = stmt->ps_point_plan_template();
 
   /*
     MANDATORY INVARIANT: Do NOT modify the following JOIN members until ALL
@@ -1797,16 +1840,17 @@ static void ps_point_plan_admit_range_metadata(
   @param  stmt  The prepared statement owning the arena.
   @param  tpl   Template to populate with cached objects.
 */
-static void ps_point_plan_admit_range_arena_cache(
-    THD *thd, Prepared_statement *stmt, PsPointPlanTemplate &tpl) {
-  if (tpl.range_arena_cached) return;
+static bool ps_point_plan_admit_range_arena_cache(
+    THD *thd, Prepared_statement *stmt, PsPointPlanTemplate &tpl,
+    TABLE *table) {
+  if (tpl.range_arena_cached) return true;
 
-  TABLE *table = tpl.table_ref->table;
+  if (table == nullptr) return false;
   const KEY *keyinfo = &table->key_info[tpl.keyno];
 
   const bool had_error = thd->is_error();
   Query_arena backup;
-  thd->swap_query_arena(stmt->m_arena, &backup);
+  thd->swap_query_arena(stmt->ps_point_plan_cache_arena(), &backup);
 
   const uint key_bytes = keyinfo->key_part[0].store_length;
   bool cache_ok = true;
@@ -1862,8 +1906,52 @@ static void ps_point_plan_admit_range_arena_cache(
     tpl.range_arena_cached = true;
   }
 
-  thd->swap_query_arena(backup, &stmt->m_arena);
+  thd->swap_query_arena(backup, &stmt->ps_point_plan_cache_arena());
   if (!had_error && thd->is_error()) thd->clear_error();
+  return tpl.range_arena_cached;
+}
+
+static bool ps_point_plan_should_try_evict(size_t candidate_bytes,
+                                           uint candidate_plans) {
+  const uint pct = ps_point_plan_cache_eviction_pct;
+  if (pct == 0 || ps_point_plan_cache_eviction_idle_seconds == 0) return false;
+
+  const ulonglong max_mem = ps_point_plan_cache_max_mem_size;
+  const ulong max_plans = ps_point_plan_cache_max_cached_plans;
+  if (pct == 100) return max_mem != 0 || max_plans != 0;
+
+  if (max_mem != 0) {
+    const ulonglong watermark = (max_mem * pct) / 100;
+    const size_t used = ps_plan_cache_tracker.current_mem_used();
+    if (candidate_bytes >= watermark ||
+        used >= static_cast<size_t>(watermark) - candidate_bytes)
+      return true;
+  }
+
+  if (max_plans != 0) {
+    const ulong watermark = (max_plans * pct) / 100;
+    const size_t plans = ps_plan_cache_tracker.current_plan_count();
+    if (candidate_plans >= watermark ||
+        plans >= static_cast<size_t>(watermark) - candidate_plans)
+      return true;
+  }
+
+  return false;
+}
+
+static bool ps_point_plan_try_reserve_admission_quota(
+    THD *thd, size_t candidate_bytes) {
+  if (ps_point_plan_should_try_evict(candidate_bytes, 1))
+    ps_point_plan_try_evict_idle(thd);
+
+  if (!ps_plan_cache_tracker.try_reserve(candidate_bytes)) return false;
+
+  if (!ps_plan_cache_tracker.try_add_plan()) {
+    ps_plan_cache_tracker.release(candidate_bytes);
+    return false;
+  }
+
+  return true;
 }
 
 /**
@@ -1881,56 +1969,42 @@ static void ps_point_plan_admit_range_arena_cache(
   @param  stmt  The prepared statement to promote to HOT.
   @param  join  The JOIN with finalized plan metadata.
 */
-void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
+PsPointPlanAdmitResult ps_point_plan_admit(THD *thd,
+                                           Prepared_statement *stmt,
+                                           JOIN *join) {
   PsPointPlanTemplate &tpl = stmt->ps_point_plan_template();
-
-  /* Snapshot arena size before admission allocations. */
-  const size_t arena_before = stmt->m_arena.mem_root->allocated_size();
 
   if (tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN ||
       tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_AGG ||
       tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_SORT ||
       tpl.plan_type == PsCachedPlanType::RANGE_PK_BETWEEN_SORT_DISTINCT) {
     ps_point_plan_admit_range_metadata(thd, tpl, join);
-    ps_point_plan_admit_range_arena_cache(thd, stmt, tpl);
+    TABLE *table = join->qep_tab[0].table();
+    if (!ps_point_plan_admit_range_arena_cache(thd, stmt, tpl, table)) {
+      stmt->reset_ps_point_plan_cache_helpers(
+          PsPointPlanResetReason::QUOTA_REFUSED);
+      stmt->set_ps_point_plan_state(PsPointPlanState::NEVER);
+      return PsPointPlanAdmitResult::BUILD_FAILED;
+    }
 
     /* --- Quota check: memory + plan count --- */
-    const size_t arena_after = stmt->m_arena.mem_root->allocated_size();
-    const size_t arena_delta =
-        (arena_after >= arena_before) ? (arena_after - arena_before) : 0;
-
-    bool mem_ok = ps_plan_cache_tracker.try_reserve(arena_delta);
-    if (!mem_ok) {
-      ps_point_plan_try_evict_idle(thd);
-      mem_ok = ps_plan_cache_tracker.try_reserve(arena_delta);
-    }
-    if (mem_ok) {
-      bool plan_ok = ps_plan_cache_tracker.try_add_plan();
-      if (!plan_ok) {
-        ps_point_plan_try_evict_idle(thd);
-        plan_ok = ps_plan_cache_tracker.try_add_plan();
-      }
-      if (!plan_ok) {
-        ps_plan_cache_tracker.release(arena_delta);
-        mem_ok = false;
-      }
-    }
-    if (!mem_ok) {
+    const size_t arena_delta = stmt->ps_point_plan_cache_arena_size();
+    if (!ps_point_plan_try_reserve_admission_quota(thd, arena_delta)) {
+      stmt->reset_ps_point_plan_cache_helpers(
+          PsPointPlanResetReason::QUOTA_REFUSED);
       ps_point_plan_mark_admission_refused(thd);
-      /* Stay COLD; next can_admit fail → NEVER. */
-      stmt->set_ps_point_plan_retryable_cold(false);
-      return;
+      return PsPointPlanAdmitResult::REFUSED_BY_QUOTA;
     }
 
     tpl.arena_cached_bytes = arena_delta;
-    const uint64_t now = ps_point_plan_now_seconds();
+    const uint64_t now = static_cast<uint64_t>(thd->query_start_in_secs());
     tpl.admission_time = now;
-    tpl.last_hit_time.store(now, std::memory_order_relaxed);
+    tpl.last_hit_time = now;
 
     stmt->set_ps_point_plan_state(PsPointPlanState::HOT);
     stmt->set_ps_point_plan_retryable_cold(false);
     ps_point_plan_mark_admission(thd);
-    return;
+    return PsPointPlanAdmitResult::ADMITTED;
   }
 
   const QEP_TAB *tab = &join->qep_tab[0];
@@ -2038,7 +2112,7 @@ void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
   if (!tpl.ref_cached || !tpl.qep_cached) {
     const bool had_error_before_cache_build = thd->is_error();
     Query_arena backup;
-    thd->swap_query_arena(stmt->m_arena, &backup);
+    thd->swap_query_arena(stmt->ps_point_plan_cache_arena(), &backup);
 
     if (!tpl.ref_cached) {
       const uint aligned_len = ALIGN_SIZE(tpl.key_length);
@@ -2108,48 +2182,37 @@ void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join) {
       }
     }
 
-    thd->swap_query_arena(backup, &stmt->m_arena);
+    thd->swap_query_arena(backup, &stmt->ps_point_plan_cache_arena());
     if (!had_error_before_cache_build && thd->is_error()) thd->clear_error();
+  }
+
+  if (!tpl.ref_cached || !tpl.qep_cached) {
+    stmt->reset_ps_point_plan_cache_helpers(
+        PsPointPlanResetReason::QUOTA_REFUSED);
+    stmt->set_ps_point_plan_state(PsPointPlanState::NEVER);
+    return PsPointPlanAdmitResult::BUILD_FAILED;
   }
 
   /* --- Quota check: memory + plan count (EQ_REF path) --- */
   {
-    const size_t arena_after = stmt->m_arena.mem_root->allocated_size();
-    const size_t arena_delta =
-        (arena_after >= arena_before) ? (arena_after - arena_before) : 0;
-
-    bool mem_ok = ps_plan_cache_tracker.try_reserve(arena_delta);
-    if (!mem_ok) {
-      ps_point_plan_try_evict_idle(thd);
-      mem_ok = ps_plan_cache_tracker.try_reserve(arena_delta);
-    }
-    if (mem_ok) {
-      bool plan_ok = ps_plan_cache_tracker.try_add_plan();
-      if (!plan_ok) {
-        ps_point_plan_try_evict_idle(thd);
-        plan_ok = ps_plan_cache_tracker.try_add_plan();
-      }
-      if (!plan_ok) {
-        ps_plan_cache_tracker.release(arena_delta);
-        mem_ok = false;
-      }
-    }
-    if (!mem_ok) {
+    const size_t arena_delta = stmt->ps_point_plan_cache_arena_size();
+    if (!ps_point_plan_try_reserve_admission_quota(thd, arena_delta)) {
+      stmt->reset_ps_point_plan_cache_helpers(
+          PsPointPlanResetReason::QUOTA_REFUSED);
       ps_point_plan_mark_admission_refused(thd);
-      /* Stay COLD; next can_admit fail → NEVER. */
-      stmt->set_ps_point_plan_retryable_cold(false);
-      return;
+      return PsPointPlanAdmitResult::REFUSED_BY_QUOTA;
     }
 
     tpl.arena_cached_bytes = arena_delta;
-    const uint64_t now = ps_point_plan_now_seconds();
+    const uint64_t now = static_cast<uint64_t>(thd->query_start_in_secs());
     tpl.admission_time = now;
-    tpl.last_hit_time.store(now, std::memory_order_relaxed);
+    tpl.last_hit_time = now;
   }
 
   stmt->set_ps_point_plan_state(PsPointPlanState::HOT);
   stmt->set_ps_point_plan_retryable_cold(false);
   ps_point_plan_mark_admission(thd);
+  return PsPointPlanAdmitResult::ADMITTED;
 }
 
 void ps_point_plan_mark_hit(THD *thd) {
@@ -2192,7 +2255,9 @@ bool Ps_plan_cache_mem_tracker::try_reserve(size_t bytes) {
   }
   size_t current = m_total_bytes.load(std::memory_order_relaxed);
   while (true) {
-    if (current + bytes > max_mem) return false;
+    if (bytes > static_cast<size_t>(max_mem) ||
+        current > static_cast<size_t>(max_mem) - bytes)
+      return false;
     if (m_total_bytes.compare_exchange_weak(
             current, current + bytes,
             std::memory_order_acq_rel, std::memory_order_relaxed))
@@ -2201,7 +2266,15 @@ bool Ps_plan_cache_mem_tracker::try_reserve(size_t bytes) {
 }
 
 void Ps_plan_cache_mem_tracker::release(size_t bytes) {
-  m_total_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+  if (bytes == 0) return;
+  size_t current = m_total_bytes.load(std::memory_order_relaxed);
+  while (current > 0) {
+    const size_t next = (current > bytes) ? (current - bytes) : 0;
+    if (m_total_bytes.compare_exchange_weak(
+            current, next, std::memory_order_acq_rel,
+            std::memory_order_relaxed))
+      return;
+  }
 }
 
 bool Ps_plan_cache_mem_tracker::try_add_plan() {
@@ -2221,7 +2294,13 @@ bool Ps_plan_cache_mem_tracker::try_add_plan() {
 }
 
 void Ps_plan_cache_mem_tracker::remove_plan() {
-  m_total_plans.fetch_sub(1, std::memory_order_relaxed);
+  size_t current = m_total_plans.load(std::memory_order_relaxed);
+  while (current > 0) {
+    if (m_total_plans.compare_exchange_weak(
+            current, current - 1, std::memory_order_acq_rel,
+            std::memory_order_relaxed))
+      return;
+  }
 }
 
 /* --- TTL-based eviction for idle HOT plan cache entries --- */
@@ -2249,30 +2328,18 @@ void ps_point_plan_try_evict_idle(THD *thd) {
   const ulong idle_seconds = ps_point_plan_cache_eviction_idle_seconds;
   if (idle_seconds == 0) return;  /* eviction disabled */
 
-  const uint64_t now = ps_point_plan_now_seconds();
+  const uint64_t now = static_cast<uint64_t>(thd->query_start_in_secs());
   const uint64_t cutoff = (now > idle_seconds) ? (now - idle_seconds) : 0;
 
   thd->stmt_map.for_each([&](Prepared_statement *ps) {
     if (ps->ps_point_plan_state() != PsPointPlanState::HOT) return;
 
     PsPointPlanTemplate &tpl = ps->ps_point_plan_template();
-    const uint64_t last_hit =
-        tpl.last_hit_time.load(std::memory_order_relaxed);
+    const uint64_t last_hit = tpl.last_hit_time;
 
     /* Evict only entries idle longer than the threshold. */
     if (last_hit > 0 && last_hit < cutoff) {
-      /* Release from global tracker. */
-      ps_plan_cache_tracker.remove_plan();
-      if (tpl.arena_cached_bytes > 0) {
-        ps_plan_cache_tracker.release(tpl.arena_cached_bytes);
-        tpl.arena_cached_bytes = 0;
-      }
-
-      /* Demote HOT → COLD (non-retryable). */
-      ps_point_plan_clear_hot_metadata(&tpl);
-      ps->set_ps_point_plan_state(PsPointPlanState::COLD);
-      ps->set_ps_point_plan_retryable_cold(false);
-
+      ps->reset_ps_point_plan_cache_helpers(PsPointPlanResetReason::EVICT_IDLE);
       ps_point_plan_mark_eviction(thd);
     }
   });

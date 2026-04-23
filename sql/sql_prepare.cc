@@ -2291,7 +2291,10 @@ Prepared_statement::Prepared_statement(THD *thd_arg)
     : m_arena(&m_mem_root, Query_arena::STMT_INITIALIZED),
       m_id(++thd_arg->statement_id_counter),
       m_mem_root(key_memory_prepared_statement_main_mem_root,
-                 thd_arg->variables.query_alloc_block_size) {
+                 thd_arg->variables.query_alloc_block_size),
+      m_ps_pc_mem_root(key_memory_prepared_statement_main_mem_root,
+                       thd_arg->variables.query_alloc_block_size),
+      m_ps_pc_arena(&m_ps_pc_mem_root, Query_arena::STMT_PREPARED) {
   *m_last_error = '\0';
 }
 
@@ -2357,14 +2360,7 @@ Prepared_statement::~Prepared_statement() {
   DBUG_TRACE;
   DBUG_PRINT("enter", ("stmt: %p  cursor: %p", this, m_cursor));
 
-  /* Release from global plan cache memory tracker. */
-  if (m_ps_pc_state == PsPointPlanState::HOT) {
-    ps_plan_cache_tracker.remove_plan();
-  }
-  if (m_ps_pc.arena_cached_bytes > 0) {
-    ps_plan_cache_tracker.release(m_ps_pc.arena_cached_bytes);
-    m_ps_pc.arena_cached_bytes = 0;
-  }
+  reset_ps_point_plan_cache_helpers(PsPointPlanResetReason::DESTROY);
 
   if (m_used_as_cursor) {
     close_cursor();
@@ -3388,19 +3384,12 @@ void Prepared_statement::swap_prepared_statement(Prepared_statement *copy) {
   // after reprepare the new statement gets a clean slate and the old
   // statement (about to be destroyed) carries away the stale state.
   std::swap(m_ps_pc_state, copy->m_ps_pc_state);
-  /*
-    Byte-level swap for PsPointPlanTemplate: the struct contains
-    std::atomic<uint64_t> last_hit_time which deletes the copy/move
-    assignment operators needed by std::swap.  During reprepare both
-    PS objects are owned by the current thread — no concurrent access
-    to the atomics.  PsPointPlanTemplate is trivially destructible.
-  */
-  {
-    char tmp[sizeof(PsPointPlanTemplate)];
-    memcpy(tmp, &m_ps_pc, sizeof(m_ps_pc));
-    memcpy(&m_ps_pc, &copy->m_ps_pc, sizeof(m_ps_pc));
-    memcpy(&copy->m_ps_pc, tmp, sizeof(m_ps_pc));
-  }
+  std::swap(m_ps_pc, copy->m_ps_pc);
+  std::swap(m_ps_pc_mem_root, copy->m_ps_pc_mem_root);
+  Query_arena tmp_ps_pc_arena;
+  m_ps_pc_arena.swap_query_arena(copy->m_ps_pc_arena, &tmp_ps_pc_arena);
+  copy->m_ps_pc_arena.set_query_arena(tmp_ps_pc_arena);
+  std::swap(m_ps_pc_arena.mem_root, copy->m_ps_pc_arena.mem_root);
   std::swap(m_ps_pc_cursor_execution, copy->m_ps_pc_cursor_execution);
   std::swap(m_ps_pc_retryable_cold, copy->m_ps_pc_retryable_cold);
 }

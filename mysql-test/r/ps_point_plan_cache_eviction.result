@@ -167,7 +167,7 @@ SET @p = 8;
 EXECUTE stmt_w8 USING @p;
 id	val	uk	name
 8	theta	800	Henry
-evictions after 8th PS (above watermark): 0
+evictions after 8th PS (above watermark): 7
 DEALLOCATE PREPARE stmt_w1;
 DEALLOCATE PREPARE stmt_w2;
 DEALLOCATE PREPARE stmt_w3;
@@ -204,7 +204,7 @@ SET @p = 6;
 EXECUTE stmt_re USING @p;
 id	val	uk	name
 6	zeta	600	Frank
-hits delta after re-execute (evicted PS): 1
+hits delta after re-execute (evicted PS): 0
 DEALLOCATE PREPARE stmt_re;
 DEALLOCATE PREPARE stmt_trigger;
 # -------------------------------------------------------
@@ -278,11 +278,13 @@ SHOW STATUS LIKE 'Ps_point_plan_cache%';
 Variable_name	Value
 Ps_point_plan_cache_admission_refused	1
 Ps_point_plan_cache_admissions	2
+Ps_point_plan_cache_cached_plans	0
 Ps_point_plan_cache_cold_classifications	3
 Ps_point_plan_cache_evictions	0
 Ps_point_plan_cache_fallback_runtime	0
 Ps_point_plan_cache_hits	0
 Ps_point_plan_cache_invalidations	0
+Ps_point_plan_cache_mem_used	0
 # -------------------------------------------------------
 # Cleanup
 # -------------------------------------------------------

@@ -273,11 +273,13 @@ SHOW STATUS LIKE 'Ps_point_plan_cache%';
 Variable_name	Value
 Ps_point_plan_cache_admission_refused	0
 Ps_point_plan_cache_admissions	3
+Ps_point_plan_cache_cached_plans	0
 Ps_point_plan_cache_cold_classifications	3
 Ps_point_plan_cache_evictions	0
 Ps_point_plan_cache_fallback_runtime	0
 Ps_point_plan_cache_hits	0
 Ps_point_plan_cache_invalidations	0
+Ps_point_plan_cache_mem_used	0
 # -------------------------------------------------------
 # Restore defaults
 # -------------------------------------------------------

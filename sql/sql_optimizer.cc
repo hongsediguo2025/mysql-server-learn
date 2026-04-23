@@ -1131,7 +1131,7 @@ bool JOIN::optimize(bool finalize_access_paths) {
     if (ps_owner != nullptr &&
         ps_owner->ps_point_plan_state() == PsPointPlanState::COLD) {
       if (ps_point_plan_can_admit(ps_owner, this)) {
-        ps_point_plan_admit(thd, ps_owner, this);
+        (void)ps_point_plan_admit(thd, ps_owner, this);
       } else if (!ps_owner->ps_point_plan_retryable_cold()) {
         ps_owner->set_ps_point_plan_state(PsPointPlanState::NEVER);
       }

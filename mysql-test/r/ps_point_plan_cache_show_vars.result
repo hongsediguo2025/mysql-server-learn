@@ -96,11 +96,13 @@ SHOW STATUS LIKE 'Ps_point_plan_cache%';
 Variable_name	Value
 Ps_point_plan_cache_admission_refused	0
 Ps_point_plan_cache_admissions	0
+Ps_point_plan_cache_cached_plans	0
 Ps_point_plan_cache_cold_classifications	0
 Ps_point_plan_cache_evictions	0
 Ps_point_plan_cache_fallback_runtime	0
 Ps_point_plan_cache_hits	0
 Ps_point_plan_cache_invalidations	0
+Ps_point_plan_cache_mem_used	0
 SELECT VARIABLE_NAME, VARIABLE_VALUE
 FROM performance_schema.session_status
 WHERE VARIABLE_NAME LIKE 'Ps_point_plan_cache%'
@@ -108,11 +110,13 @@ ORDER BY VARIABLE_NAME;
 VARIABLE_NAME	VARIABLE_VALUE
 Ps_point_plan_cache_admission_refused	0
 Ps_point_plan_cache_admissions	0
+Ps_point_plan_cache_cached_plans	0
 Ps_point_plan_cache_cold_classifications	0
 Ps_point_plan_cache_evictions	0
 Ps_point_plan_cache_fallback_runtime	0
 Ps_point_plan_cache_hits	0
 Ps_point_plan_cache_invalidations	0
+Ps_point_plan_cache_mem_used	0
 SELECT VARIABLE_NAME, VARIABLE_VALUE
 FROM performance_schema.global_status
 WHERE VARIABLE_NAME LIKE 'Ps_point_plan_cache%'
@@ -120,11 +124,13 @@ ORDER BY VARIABLE_NAME;
 VARIABLE_NAME	VARIABLE_VALUE
 Ps_point_plan_cache_admission_refused	#
 Ps_point_plan_cache_admissions	#
+Ps_point_plan_cache_cached_plans	#
 Ps_point_plan_cache_cold_classifications	#
 Ps_point_plan_cache_evictions	#
 Ps_point_plan_cache_fallback_runtime	#
 Ps_point_plan_cache_hits	#
 Ps_point_plan_cache_invalidations	#
+Ps_point_plan_cache_mem_used	#
 # -------------------------------------------------------
 # 7. Background data operations: single-table point select PS
 #    Verifies new Prepared_statement members don't break
@@ -350,22 +356,26 @@ SHOW STATUS LIKE 'Ps_point_plan_cache%';
 Variable_name	Value
 Ps_point_plan_cache_admission_refused	0
 Ps_point_plan_cache_admissions	9
+Ps_point_plan_cache_cached_plans	0
 Ps_point_plan_cache_cold_classifications	10
 Ps_point_plan_cache_evictions	0
 Ps_point_plan_cache_fallback_runtime	1
 Ps_point_plan_cache_hits	7
 Ps_point_plan_cache_invalidations	0
+Ps_point_plan_cache_mem_used	0
 # Also verify via FLUSH STATUS (additional, not primary assertion)
 FLUSH STATUS;
 SHOW STATUS LIKE 'Ps_point_plan_cache%';
 Variable_name	Value
 Ps_point_plan_cache_admission_refused	0
 Ps_point_plan_cache_admissions	0
+Ps_point_plan_cache_cached_plans	0
 Ps_point_plan_cache_cold_classifications	0
 Ps_point_plan_cache_evictions	0
 Ps_point_plan_cache_fallback_runtime	0
 Ps_point_plan_cache_hits	0
 Ps_point_plan_cache_invalidations	0
+Ps_point_plan_cache_mem_used	0
 # -------------------------------------------------------
 # 14. Verify sysvar appears in expected P_S tables
 # -------------------------------------------------------

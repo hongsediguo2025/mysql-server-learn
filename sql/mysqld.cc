@@ -811,6 +811,7 @@ MySQL clients support the protocol:
 #include "sql/persisted_variable.h"              // Persisted_variables_cache
 #include "sql/plugin_table.h"
 #include "sql/protocol.h"
+#include "sql/ps_point_plan_cache.h"
 #include "sql/psi_memory_key.h"  // key_memory_MYSQL_RELAY_LOG_index
 #include "sql/query_options.h"
 #include "sql/range_optimizer/range_optimizer.h"    // range_optimizer_init
@@ -9515,6 +9516,23 @@ static int show_prepared_stmt_count(THD *, SHOW_VAR *var, char *buff) {
   return 0;
 }
 
+static int show_ps_point_plan_cache_mem_used(THD *, SHOW_VAR *var, char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->value = buff;
+  *((longlong *)buff) =
+      static_cast<longlong>(ps_plan_cache_tracker.current_mem_used());
+  return 0;
+}
+
+static int show_ps_point_plan_cache_cached_plans(THD *, SHOW_VAR *var,
+                                                 char *buff) {
+  var->type = SHOW_LONGLONG;
+  var->value = buff;
+  *((longlong *)buff) =
+      static_cast<longlong>(ps_plan_cache_tracker.current_plan_count());
+  return 0;
+}
+
 static int show_global_mem_counter(THD *, SHOW_VAR *var, char *buff) {
   var->type = SHOW_LONGLONG;
   var->value = buff;
@@ -9858,6 +9876,9 @@ SHOW_VAR status_vars[] = {
      SHOW_SCOPE_ALL},
     {"Prepared_stmt_count", (char *)&show_prepared_stmt_count, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
+    {"Ps_point_plan_cache_cached_plans",
+     (char *)&show_ps_point_plan_cache_cached_plans, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
     {"Ps_point_plan_cache_admission_refused",
      (char *)offsetof(System_status_var, ps_point_plan_cache_admission_refused),
      SHOW_LONGLONG_STATUS, SHOW_SCOPE_ALL},
@@ -9880,6 +9901,8 @@ SHOW_VAR status_vars[] = {
     {"Ps_point_plan_cache_invalidations",
      (char *)offsetof(System_status_var, ps_point_plan_cache_invalidations),
      SHOW_LONGLONG_STATUS, SHOW_SCOPE_ALL},
+    {"Ps_point_plan_cache_mem_used",
+     (char *)&show_ps_point_plan_cache_mem_used, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Replica_open_temp_tables", (char *)&show_replica_open_temp_tables,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
 #ifndef NDEBUG

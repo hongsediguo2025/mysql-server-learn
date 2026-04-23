@@ -80,6 +80,7 @@ admission_refused with unlimited: 0 (expected: 0)
 # 1.5. Verify mem_used is being tracked even when unlimited
 SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
 Variable_name	Value
+Ps_point_plan_cache_mem_used	32768
 DEALLOCATE PREPARE stmt_unlim1;
 DEALLOCATE PREPARE stmt_unlim2;
 DEALLOCATE PREPARE stmt_unlim3;
@@ -107,6 +108,7 @@ admission_refused with 1 byte limit: 0 (expected: 1)
 # 2.3. Verify mem_used didn't increase (PS not admitted)
 SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
 Variable_name	Value
+Ps_point_plan_cache_mem_used	8192
 DEALLOCATE PREPARE stmt_1byte;
 # =======================================================
 # Test 3: Memory limit exactly sized for one PS
@@ -160,6 +162,7 @@ Second PS refused: 0 (expected: 1)
 # 4.4. Verify cached_plans counter shows 1
 SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
 Variable_name	Value
+Ps_point_plan_cache_cached_plans	1
 DEALLOCATE PREPARE stmt_single1;
 DEALLOCATE PREPARE stmt_single2;
 # =======================================================
@@ -286,6 +289,7 @@ SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 300;
 # 7.1. Show initial mem_used
 SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
 Variable_name	Value
+Ps_point_plan_cache_mem_used	0
 # 7.2. Create and deallocate PS
 PREPARE stmt_counter1 FROM 'SELECT * FROM t_edge WHERE id = ?';
 SET @p = 1;
@@ -294,10 +298,12 @@ id	val	uk	name
 1	alpha	100	Alice
 SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
 Variable_name	Value
+Ps_point_plan_cache_mem_used	0
 DEALLOCATE PREPARE stmt_counter1;
 # 7.3. Verify mem_used decreased (non-negative)
 SHOW STATUS LIKE 'Ps_point_plan_cache_mem_used';
 Variable_name	Value
+Ps_point_plan_cache_mem_used	0
 # =======================================================
 # Test 8: Counter validation - cached_plans non-negative
 # =======================================================
@@ -315,12 +321,14 @@ id	val	uk	name
 1	alpha	100	Alice
 SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
 Variable_name	Value
+Ps_point_plan_cache_cached_plans	0
 # 8.2. DEALLOCATE all
 DEALLOCATE PREPARE stmt_counter2;
 DEALLOCATE PREPARE stmt_counter3;
 # 8.3. Verify cached_plans decreased
 SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
 Variable_name	Value
+Ps_point_plan_cache_cached_plans	0
 # =======================================================
 # Test 9: admission_refused counter increments
 # =======================================================
@@ -408,6 +416,7 @@ PREPARE stmt_cold3 FROM 'SELECT * FROM t_edge WHERE name = ?';
 # 11.2. Check cached_plans - should be 0 (no HOT PS yet)
 SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
 Variable_name	Value
+Ps_point_plan_cache_cached_plans	0
 # 11.3. EXECUTE to make them HOT
 SET @p = 1;
 EXECUTE stmt_cold1 USING @p;
@@ -420,6 +429,7 @@ id	val	uk	name
 # 11.4. Check cached_plans - should be 2
 SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
 Variable_name	Value
+Ps_point_plan_cache_cached_plans	2
 # 11.5. Try to EXECUTE third - should be refused (quota full)
 SET @p = 'Alice';
 EXECUTE stmt_cold3 USING @p;
@@ -442,12 +452,14 @@ pk1	pk2	data
 1	10	first
 SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
 Variable_name	Value
+Ps_point_plan_cache_cached_plans	0
 # 12.2. Trigger DDL invalidation
 ALTER TABLE t_edge2 ADD COLUMN extra INT;
 Invalidations after DDL: 0 (expected: >= 1)
 # 12.3. Verify cached_plans decreased
 SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
 Variable_name	Value
+Ps_point_plan_cache_cached_plans	0
 # 12.4. Restore table schema
 ALTER TABLE t_edge2 DROP COLUMN extra;
 # 12.5. New PS should be able to admit
@@ -483,6 +495,7 @@ id	val	uk	name
 1	alpha	100	Alice
 SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
 Variable_name	Value
+Ps_point_plan_cache_cached_plans	2
 # 13.3. Reduce limit to 2 (existing HOT PS not affected)
 SET GLOBAL ps_point_plan_cache_max_cached_plans = 2;
 SELECT @@global.ps_point_plan_cache_max_cached_plans AS 'Reduced to 2';
@@ -495,6 +508,7 @@ id	val	uk	name
 2	beta	200	Bob
 SHOW STATUS LIKE 'Ps_point_plan_cache_cached_plans';
 Variable_name	Value
+Ps_point_plan_cache_cached_plans	2
 # 13.5. New PS should be refused (quota exceeded)
 PREPARE stmt_dyn4 FROM 'SELECT * FROM t_edge2 WHERE pk1 = ?';
 SET @p = 1;
@@ -600,11 +614,13 @@ SHOW STATUS LIKE 'Ps_point_plan_cache%';
 Variable_name	Value
 Ps_point_plan_cache_admission_refused	3
 Ps_point_plan_cache_admissions	1
+Ps_point_plan_cache_cached_plans	0
 Ps_point_plan_cache_cold_classifications	2
 Ps_point_plan_cache_evictions	0
 Ps_point_plan_cache_fallback_runtime	0
 Ps_point_plan_cache_hits	1
 Ps_point_plan_cache_invalidations	0
+Ps_point_plan_cache_mem_used	0
 # -------------------------------------------------------
 # Restore original values
 # -------------------------------------------------------

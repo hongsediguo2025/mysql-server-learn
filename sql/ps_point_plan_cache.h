@@ -101,6 +101,20 @@ enum class PsPointPlanState : uchar {
   INVALID
 };
 
+enum class PsPointPlanResetReason : uchar {
+  DEMOTE_RETRYABLE = 0,
+  INVALIDATE_DDL,
+  EVICT_IDLE,
+  QUOTA_REFUSED,
+  DESTROY
+};
+
+enum class PsPointPlanAdmitResult : uchar {
+  ADMITTED = 0,
+  REFUSED_BY_QUOTA,
+  BUILD_FAILED
+};
+
 /**
   Cached plan type — determines which fast-path builder to invoke.
   Phase 1-6 use POINT_EQ_REF; Phase 7+ adds RANGE_PK_BETWEEN.
@@ -404,11 +418,10 @@ struct PsPointPlanTemplate {
   /// Set during admission; released on invalidation/deallocation.
   size_t arena_cached_bytes{0};
 
-  /// Timestamp of last successful HOT hit (monotonic clock, seconds).
-  /// Updated on every fast-path hit via relaxed atomic store (~5ns).
-  /// Declared mutable so it can be updated through const references
-  /// (build_fast_path receives const PsPointPlanTemplate&).
-  mutable std::atomic<uint64_t> last_hit_time{0};
+  /// Timestamp of last successful HOT hit (THD query start seconds).
+  /// Prepared statements are connection-local, and idle eviction only scans
+  /// the owning THD's statement map, so no atomic access is required here.
+  uint64_t last_hit_time{0};
 
   /// Timestamp of admission (monotonic clock, seconds).
   uint64_t admission_time{0};
@@ -525,7 +538,9 @@ bool ps_point_plan_can_admit(Prepared_statement *stmt, JOIN *join);
   @param  stmt  The prepared statement to promote to HOT.
   @param  join  The JOIN with finalized plan metadata.
 */
-void ps_point_plan_admit(THD *thd, Prepared_statement *stmt, JOIN *join);
+PsPointPlanAdmitResult ps_point_plan_admit(THD *thd,
+                                           Prepared_statement *stmt,
+                                           JOIN *join);
 
 /* Status counter helpers. */
 void ps_point_plan_mark_hit(THD *thd);

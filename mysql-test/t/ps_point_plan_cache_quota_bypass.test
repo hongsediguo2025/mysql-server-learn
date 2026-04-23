@@ -1,0 +1,221 @@
+--echo #
+--echo # ps_point_plan_cache quota refusal retry safety
+--echo #
+
+--disable_query_log
+SET @orig_max_mem_size = @@global.ps_point_plan_cache_max_mem_size;
+SET @orig_max_cached_plans = @@global.ps_point_plan_cache_max_cached_plans;
+SET @orig_eviction_pct = @@global.ps_point_plan_cache_eviction_pct;
+SET @orig_eviction_idle_seconds = @@global.ps_point_plan_cache_eviction_idle_seconds;
+
+CREATE TABLE t_qb (
+  id INT PRIMARY KEY,
+  c INT NOT NULL
+);
+INSERT INTO t_qb VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+
+SET GLOBAL ps_point_plan_cache_eviction_pct = 0;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = 0;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = 0;
+SET GLOBAL ps_point_plan_cache_max_mem_size = 1024;
+
+FLUSH STATUS;
+
+--echo # -------------------------------------------------------
+--echo # 1. POINT_EQ_REF: quota refusal must not leave reusable helpers
+--echo # -------------------------------------------------------
+
+PREPARE stmt_point FROM 'SELECT c FROM t_qb WHERE id = ?';
+SET @id = 1;
+
+SELECT VARIABLE_VALUE INTO @adm_before FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admissions';
+SELECT VARIABLE_VALUE INTO @hit_before FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_hits';
+SELECT VARIABLE_VALUE INTO @ref_before FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admission_refused';
+EXECUTE stmt_point USING @id;
+SELECT VARIABLE_VALUE INTO @adm_after FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admissions';
+SELECT VARIABLE_VALUE INTO @hit_after FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_hits';
+SELECT VARIABLE_VALUE INTO @ref_after FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admission_refused';
+SELECT VARIABLE_VALUE INTO @mem_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_mem_used';
+SELECT VARIABLE_VALUE INTO @plans_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_cached_plans';
+SELECT IF(@adm_after - @adm_before = 0, 'OK', 'FAIL') AS point_first_no_admit;
+SELECT IF(@hit_after - @hit_before = 0, 'OK', 'FAIL') AS point_first_no_hit;
+SELECT IF(@ref_after - @ref_before = 1, 'OK', 'FAIL') AS point_first_refused;
+SELECT IF(@mem_after = 0, 'OK', 'FAIL') AS point_first_no_mem;
+SELECT IF(@plans_after = 0, 'OK', 'FAIL') AS point_first_no_plan;
+
+SET @id = 2;
+SELECT VARIABLE_VALUE INTO @adm_before FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admissions';
+SELECT VARIABLE_VALUE INTO @hit_before FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_hits';
+SELECT VARIABLE_VALUE INTO @ref_before FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admission_refused';
+EXECUTE stmt_point USING @id;
+SELECT VARIABLE_VALUE INTO @adm_after FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admissions';
+SELECT VARIABLE_VALUE INTO @hit_after FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_hits';
+SELECT VARIABLE_VALUE INTO @ref_after FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admission_refused';
+SELECT VARIABLE_VALUE INTO @mem_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_mem_used';
+SELECT VARIABLE_VALUE INTO @plans_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_cached_plans';
+SELECT IF(@adm_after - @adm_before = 0, 'OK', 'FAIL') AS point_retry_no_admit;
+SELECT IF(@hit_after - @hit_before = 0, 'OK', 'FAIL') AS point_retry_no_hit;
+SELECT IF(@ref_after - @ref_before = 1, 'OK', 'FAIL') AS point_retry_refused;
+SELECT IF(@mem_after = 0, 'OK', 'FAIL') AS point_retry_no_mem;
+SELECT IF(@plans_after = 0, 'OK', 'FAIL') AS point_retry_no_plan;
+
+SET GLOBAL ps_point_plan_cache_max_mem_size = 0;
+SET @id = 3;
+SELECT VARIABLE_VALUE INTO @adm_before FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admissions';
+EXECUTE stmt_point USING @id;
+SELECT VARIABLE_VALUE INTO @adm_after FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admissions';
+SELECT VARIABLE_VALUE INTO @mem_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_mem_used';
+SELECT VARIABLE_VALUE INTO @plans_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_cached_plans';
+SELECT IF(@adm_after - @adm_before = 1, 'OK', 'FAIL') AS point_readmit;
+SELECT IF(@mem_after > 0, 'OK', 'FAIL') AS point_mem_charged;
+SELECT IF(@plans_after = 1, 'OK', 'FAIL') AS point_plan_charged;
+
+SET @id = 4;
+SELECT VARIABLE_VALUE INTO @hit_before FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_hits';
+SELECT VARIABLE_VALUE INTO @mem_before FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_mem_used';
+EXECUTE stmt_point USING @id;
+SELECT VARIABLE_VALUE INTO @hit_after FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_hits';
+SELECT VARIABLE_VALUE INTO @mem_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_mem_used';
+SELECT IF(@hit_after - @hit_before = 1, 'OK', 'FAIL') AS point_hot_hit;
+SELECT IF(@mem_after = @mem_before, 'OK', 'FAIL') AS point_hot_mem_stable;
+
+DEALLOCATE PREPARE stmt_point;
+SELECT VARIABLE_VALUE INTO @mem_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_mem_used';
+SELECT VARIABLE_VALUE INTO @plans_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_cached_plans';
+SELECT IF(@mem_after = 0, 'OK', 'FAIL') AS point_dealloc_mem_released;
+SELECT IF(@plans_after = 0, 'OK', 'FAIL') AS point_dealloc_plan_released;
+
+--echo # -------------------------------------------------------
+--echo # 2. RANGE_PK_BETWEEN: quota refusal must not leave reusable helpers
+--echo # -------------------------------------------------------
+
+SET GLOBAL ps_point_plan_cache_max_mem_size = 1024;
+FLUSH STATUS;
+
+PREPARE stmt_range FROM 'SELECT c FROM t_qb WHERE id BETWEEN ? AND ?';
+SET @lo = 1;
+SET @hi = 2;
+
+SELECT VARIABLE_VALUE INTO @adm_before FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admissions';
+SELECT VARIABLE_VALUE INTO @hit_before FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_hits';
+SELECT VARIABLE_VALUE INTO @ref_before FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admission_refused';
+EXECUTE stmt_range USING @lo, @hi;
+SELECT VARIABLE_VALUE INTO @adm_after FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admissions';
+SELECT VARIABLE_VALUE INTO @hit_after FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_hits';
+SELECT VARIABLE_VALUE INTO @ref_after FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admission_refused';
+SELECT VARIABLE_VALUE INTO @mem_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_mem_used';
+SELECT VARIABLE_VALUE INTO @plans_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_cached_plans';
+SELECT IF(@adm_after - @adm_before = 0, 'OK', 'FAIL') AS range_first_no_admit;
+SELECT IF(@hit_after - @hit_before = 0, 'OK', 'FAIL') AS range_first_no_hit;
+SELECT IF(@ref_after - @ref_before = 1, 'OK', 'FAIL') AS range_first_refused;
+SELECT IF(@mem_after = 0, 'OK', 'FAIL') AS range_first_no_mem;
+SELECT IF(@plans_after = 0, 'OK', 'FAIL') AS range_first_no_plan;
+
+SET @lo = 2;
+SET @hi = 4;
+SELECT VARIABLE_VALUE INTO @adm_before FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admissions';
+SELECT VARIABLE_VALUE INTO @hit_before FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_hits';
+SELECT VARIABLE_VALUE INTO @ref_before FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admission_refused';
+EXECUTE stmt_range USING @lo, @hi;
+SELECT VARIABLE_VALUE INTO @adm_after FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admissions';
+SELECT VARIABLE_VALUE INTO @hit_after FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_hits';
+SELECT VARIABLE_VALUE INTO @ref_after FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admission_refused';
+SELECT VARIABLE_VALUE INTO @mem_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_mem_used';
+SELECT VARIABLE_VALUE INTO @plans_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_cached_plans';
+SELECT IF(@adm_after - @adm_before = 0, 'OK', 'FAIL') AS range_retry_no_admit;
+SELECT IF(@hit_after - @hit_before = 0, 'OK', 'FAIL') AS range_retry_no_hit;
+SELECT IF(@ref_after - @ref_before = 1, 'OK', 'FAIL') AS range_retry_refused;
+SELECT IF(@mem_after = 0, 'OK', 'FAIL') AS range_retry_no_mem;
+SELECT IF(@plans_after = 0, 'OK', 'FAIL') AS range_retry_no_plan;
+
+SET GLOBAL ps_point_plan_cache_max_mem_size = 0;
+SET @lo = 1;
+SET @hi = 3;
+SELECT VARIABLE_VALUE INTO @adm_before FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admissions';
+EXECUTE stmt_range USING @lo, @hi;
+SELECT VARIABLE_VALUE INTO @adm_after FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_admissions';
+SELECT VARIABLE_VALUE INTO @mem_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_mem_used';
+SELECT VARIABLE_VALUE INTO @plans_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_cached_plans';
+SELECT IF(@adm_after - @adm_before = 1, 'OK', 'FAIL') AS range_readmit;
+SELECT IF(@mem_after > 0, 'OK', 'FAIL') AS range_mem_charged;
+SELECT IF(@plans_after = 1, 'OK', 'FAIL') AS range_plan_charged;
+
+SET @lo = 4;
+SET @hi = 4;
+SELECT VARIABLE_VALUE INTO @hit_before FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_hits';
+SELECT VARIABLE_VALUE INTO @mem_before FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_mem_used';
+EXECUTE stmt_range USING @lo, @hi;
+SELECT VARIABLE_VALUE INTO @hit_after FROM performance_schema.session_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_hits';
+SELECT VARIABLE_VALUE INTO @mem_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_mem_used';
+SELECT IF(@hit_after - @hit_before = 1, 'OK', 'FAIL') AS range_hot_hit;
+SELECT IF(@mem_after = @mem_before, 'OK', 'FAIL') AS range_hot_mem_stable;
+
+DEALLOCATE PREPARE stmt_range;
+SELECT VARIABLE_VALUE INTO @mem_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_mem_used';
+SELECT VARIABLE_VALUE INTO @plans_after FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'Ps_point_plan_cache_cached_plans';
+SELECT IF(@mem_after = 0, 'OK', 'FAIL') AS range_dealloc_mem_released;
+SELECT IF(@plans_after = 0, 'OK', 'FAIL') AS range_dealloc_plan_released;
+
+SET GLOBAL ps_point_plan_cache_max_mem_size = @orig_max_mem_size;
+SET GLOBAL ps_point_plan_cache_max_cached_plans = @orig_max_cached_plans;
+SET GLOBAL ps_point_plan_cache_eviction_pct = @orig_eviction_pct;
+SET GLOBAL ps_point_plan_cache_eviction_idle_seconds = @orig_eviction_idle_seconds;
+
+DROP TABLE t_qb;
+--enable_query_log
+
+--echo #
+--echo # End of ps_point_plan_cache quota refusal retry safety tests
+--echo #

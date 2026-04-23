@@ -423,6 +423,16 @@ class Prepared_statement final {
   */
   MEM_ROOT m_mem_root;
 
+  /**
+    Dedicated memory root for ps_point_plan_cache helper objects.
+
+    This root can be cleared independently from the prepared-statement parse
+    tree arena, so quota refusals, demotion, eviction, and invalidation do not
+    leave reusable uncharged helper objects behind.
+  */
+  MEM_ROOT m_ps_pc_mem_root;
+  Query_arena m_ps_pc_arena;
+
   bool prepare_query(THD *thd);
 
  public:
@@ -460,82 +470,14 @@ class Prepared_statement final {
 
   void set_ps_point_plan_state(PsPointPlanState s) { m_ps_pc_state = s; }
 
-  void invalidate_ps_point_plan_cache() {
-    /*
-      Demote to COLD instead of INVALID so the next execution goes
-      through the normal optimizer and can re-admit.  Phase 1 classify
-      data (table_ref, params, param_count, field_indices, plan_type)
-      is preserved because classify only runs during prepare().
+  void invalidate_ps_point_plan_cache();
 
-      Cache flags are reset: the orphaned arena objects (store_key,
-      QEP_TAB, etc.) are small and cannot be individually freed from
-      the PS arena.  Re-admission will allocate fresh ones, ensuring
-      no stale pointers survive across structural changes.
+  void reset_ps_point_plan_cache_helpers(PsPointPlanResetReason reason);
 
-      retryable_cold is false so that if the next admission also
-      fails, the PS transitions to NEVER permanently.
-    */
+  Query_arena &ps_point_plan_cache_arena() { return m_ps_pc_arena; }
 
-    /* Release from global memory tracker if currently HOT. */
-    if (m_ps_pc_state == PsPointPlanState::HOT) {
-      ps_plan_cache_tracker.remove_plan();
-      if (m_ps_pc.arena_cached_bytes > 0) {
-        ps_plan_cache_tracker.release(m_ps_pc.arena_cached_bytes);
-        m_ps_pc.arena_cached_bytes = 0;
-      }
-    }
-
-    m_ps_pc_state = PsPointPlanState::COLD;
-
-    m_ps_pc.keyno = MAX_KEY;
-    m_ps_pc.key_parts = 0;
-    m_ps_pc.key_length = 0;
-    m_ps_pc.null_rejecting = 0;
-    m_ps_pc.best_read = 0.0;
-    m_ps_pc.best_rowcount = 1.0;
-    m_ps_pc.optimizer_switch = 0;
-    m_ps_pc.table_ref_version = 0;
-    m_ps_pc.relevant_sql_mode = 0;
-    for (uint i = 0; i < PS_PC_MAX_PARAMS; i++) {
-      m_ps_pc.actual_types[i] = MYSQL_TYPE_INVALID;
-      m_ps_pc.unsigned_actuals[i] = false;
-      m_ps_pc.actual_collations[i] = nullptr;
-    }
-
-    m_ps_pc.ref_cached = false;
-    m_ps_pc.cached_key_buff = nullptr;
-    m_ps_pc.cached_key_buff2 = nullptr;
-    m_ps_pc.cached_key_parts = 0;
-    m_ps_pc.cached_key_length = 0;
-    for (uint i = 0; i < PS_PC_MAX_PARAMS; i++) {
-      m_ps_pc.cached_store_keys[i] = nullptr;
-      m_ps_pc.cached_to_fields[i] = nullptr;
-      m_ps_pc.cached_part_lengths[i] = 0;
-      m_ps_pc.cached_part_store_lengths[i] = 0;
-    }
-
-    m_ps_pc.qep_cached = false;
-    m_ps_pc.cached_qep_tab = nullptr;
-    m_ps_pc.cached_qep_shared = nullptr;
-    m_ps_pc.cached_key_copy = nullptr;
-    m_ps_pc.cached_ref_items = nullptr;
-    m_ps_pc.cached_cond_guards = nullptr;
-
-    m_ps_pc.range_arena_cached = false;
-    m_ps_pc.cached_range_low_store = nullptr;
-    m_ps_pc.cached_range_high_store = nullptr;
-    m_ps_pc.cached_range_to_fields[0] = nullptr;
-    m_ps_pc.cached_range_to_fields[1] = nullptr;
-    m_ps_pc.cached_range_key_part = nullptr;
-    m_ps_pc.cached_range_array = nullptr;
-    m_ps_pc.cached_range_min_key = nullptr;
-    m_ps_pc.cached_range_max_key = nullptr;
-    m_ps_pc.cached_range_key_bytes = 0;
-    m_ps_pc.cached_range_qep_tab = nullptr;
-    m_ps_pc.cached_range_qep_shared = nullptr;
-
-    m_ps_pc_cursor_execution = false;
-    m_ps_pc_retryable_cold = false;
+  size_t ps_point_plan_cache_arena_size() const {
+    return m_ps_pc_mem_root.allocated_size();
   }
 
   void reset_ps_point_plan_runtime_state() {
