@@ -260,6 +260,13 @@ Progress notes:
   not durable token/runtime behavior. Debug/release `mysqld mysqltest` builds
   passed, and the migrated preserve_trx shell MTR set passed in debug/release
   with normal binlog and `--skip-log-bin`.
+- 2026-06-16: added the `preserve_trx_is_enabled()` cached-enable shell,
+  startup-option cache synchronization, and the minimal IDLE/DISABLING manager
+  state needed for safe disable checks. This keeps the current 8.0.22 staging
+  default OFF but removes direct command-path reads of the mutable sysvar and
+  prepares the later default-ON/drain-state batches. Debug/release
+  `mysqld mysqltest` builds passed, and the migrated preserve_trx shell MTR set
+  passed in debug/release with normal binlog and `--skip-log-bin`.
 - Adding a PFS table changes the performance_schema schema surface. The final
   8.0.22 port must explicitly resolve the `PFS_DD_VERSION`/upgrade contract
   before release; this staging slice intentionally leaves that as a tracked

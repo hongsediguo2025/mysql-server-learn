@@ -70,12 +70,32 @@ extern uint preserve_trx_materialize_timeout_ms;
 
 enum class Preserve_trx_user_vars_mode { DEFAULT, INCLUDE, EXCLUDE };
 
+enum class Preserve_trx_manager_state {
+  IDLE,
+  DISABLING,
+  SOFT_DRAINING,
+  HARD_DRAINING,
+  WARMCOPY_DRAINING,
+  WARMCOPY_CLOSING,
+  BATCH_DRAINING,
+  SNAPSHOTTING,
+  EXPIRED_ROLLBACK,
+  DRAIN_CLEANUP_FAILED,
+  SHUTDOWN_REQUESTED
+};
+
 struct Preserve_trx_options {
   bool has_timeout{false};
   ulonglong timeout_seconds{0};
   Preserve_trx_user_vars_mode user_vars_mode{
       Preserve_trx_user_vars_mode::DEFAULT};
 };
+
+bool preserve_trx_is_enabled();
+void preserve_trx_set_enable_value(bool enabled);
+Preserve_trx_manager_state preserved_trx_manager_state();
+bool preserved_trx_can_disable_feature();
+bool preserved_trx_try_disable_feature_for_update();
 
 struct Preserved_trx_view_row {
   std::string token;

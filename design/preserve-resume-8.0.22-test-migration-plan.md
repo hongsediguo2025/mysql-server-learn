@@ -154,6 +154,10 @@ Tests:
   defaults, SHUTDOWN privilege enforcement for PREPARE, RESUME_ANY privilege
   shell behavior, and the current unsupported runtime boundaries without
   claiming durable token generation.
+- The 8.0.22 shell now has the cached-enable helper and minimal
+  IDLE/DISABLING manager-state shell used by later drain/default-ON batches.
+  Existing staging tests cover SET ON/OFF, startup option validation, and
+  command-path enabled/disabled behavior.
 - `token_visibility_redaction.test`;
 - bundle/carrier gunit.
 
@@ -191,6 +195,15 @@ Evidence:
   expected debug-only skip. The first release `--skip-log-bin` attempt hit
   `No space left on device` while writing the status file; after deleting
   generated `/tmp/preserve_8022_*_vardir` directories, the same shard passed.
+- 2026-06-16 GREEN debug/release build: `preserve_trx_is_enabled()` cached
+  enable state, startup-option cache synchronization, and the minimal
+  IDLE/DISABLING manager-state shell were added.
+- 2026-06-16 GREEN post-enable-cache MTR regression: debug normal-binlog
+  passed with 20 successful and 2 expected `not_log_bin` skips; debug
+  `--skip-log-bin` passed with 22 successful; release normal-binlog passed
+  with 19 successful, 2 expected `not_log_bin` skips, and 1 expected
+  debug-only skip; release `--skip-log-bin` passed with 21 successful and 1
+  expected debug-only skip.
 - 2026-06-16 RED: `core_limit_sysvars` failed before code migration with
   `Unknown system variable 'preserve_trx_max_total'`.
 - 2026-06-16 GREEN debug/release: Batch 0 targeted set plus

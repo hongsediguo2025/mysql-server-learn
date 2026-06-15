@@ -81,6 +81,15 @@ uint preserve_trx_max_modified_tables = 64;
 uint preserve_trx_max_scan_pages = 20000;
 uint preserve_trx_materialize_timeout_ms = 5000;
 
+static std::atomic<bool> g_preserve_trx_enable_cached{false};
+static std::atomic<uint> g_preserve_trx_manager_state{
+    static_cast<uint>(Preserve_trx_manager_state::IDLE)};
+
+static Preserve_trx_manager_state preserve_trx_load_manager_state() {
+  return static_cast<Preserve_trx_manager_state>(
+      g_preserve_trx_manager_state.load(std::memory_order_acquire));
+}
+
 namespace {
 
 constexpr size_t kPreservedTrxSha256Length = 32;
@@ -488,6 +497,41 @@ bool thd_has_unsupported_resume_context(THD *thd) {
 
 }  // namespace
 
+bool preserve_trx_is_enabled() {
+  return g_preserve_trx_enable_cached.load(std::memory_order_acquire);
+}
+
+void preserve_trx_set_enable_value(bool enabled) {
+  preserve_trx_enable = enabled;
+  g_preserve_trx_enable_cached.store(enabled, std::memory_order_release);
+}
+
+Preserve_trx_manager_state preserved_trx_manager_state() {
+  return preserve_trx_load_manager_state();
+}
+
+bool preserved_trx_can_disable_feature() {
+  return preserved_trx_manager_state() == Preserve_trx_manager_state::IDLE &&
+         preserved_trx_snapshot(nullptr).empty();
+}
+
+bool preserved_trx_try_disable_feature_for_update() {
+  if (!preserved_trx_can_disable_feature()) return false;
+
+  uint expected = static_cast<uint>(Preserve_trx_manager_state::IDLE);
+  if (!g_preserve_trx_manager_state.compare_exchange_strong(
+          expected, static_cast<uint>(Preserve_trx_manager_state::DISABLING),
+          std::memory_order_acq_rel, std::memory_order_acquire)) {
+    return false;
+  }
+
+  preserve_trx_set_enable_value(false);
+  g_preserve_trx_manager_state.store(
+      static_cast<uint>(Preserve_trx_manager_state::IDLE),
+      std::memory_order_release);
+  return true;
+}
+
 bool preserve_trx_temp_table_session_needs_eligibility_check(const THD *thd) {
   return preserve_trx_temp_table_enable && thd != nullptr &&
          thd->temporary_tables != nullptr;
@@ -646,7 +690,7 @@ static bool preserve_trx_handle_drain_transactions(THD *thd) {
 bool preserve_trx_execute_command(THD *thd) {
   DBUG_TRACE;
 
-  if (!preserve_trx_enable) {
+  if (!preserve_trx_is_enabled()) {
     my_error(ER_PRESERVE_TRX_DISABLED, MYF(0));
     return true;
   }

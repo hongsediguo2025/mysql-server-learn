@@ -6163,6 +6163,7 @@ static int init_server_components() {
            "preserve_trx_enable=ON requires valid snapshot support");
     unireg_abort(MYSQLD_ABORT_EXIT);
   }
+  preserve_trx_set_enable_value(preserve_trx_enable);
 
   if (is_help_or_validate_option()) unireg_abort(MYSQLD_SUCCESS_EXIT);
 
