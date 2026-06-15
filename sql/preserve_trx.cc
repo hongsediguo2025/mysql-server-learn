@@ -580,6 +580,29 @@ bool preserved_trx_registry_contains_token(const std::string &token) {
                      });
 }
 
+bool string_eq_lex_cstring(const std::string &value,
+                           const LEX_CSTRING &lex_string) {
+  return lex_string.str != nullptr && value.length() == lex_string.length &&
+         std::strncmp(value.c_str(), lex_string.str, lex_string.length) == 0;
+}
+
+bool preserved_trx_row_owned_by_account(LEX_CSTRING priv_user,
+                                        LEX_CSTRING priv_host,
+                                        const Preserved_trx_view_row &row) {
+  if (row.owner_user.empty() || row.owner_host.empty()) return false;
+  return string_eq_lex_cstring(row.owner_user, priv_user) &&
+         string_eq_lex_cstring(row.owner_host, priv_host);
+}
+
+bool preserved_trx_row_visible_for_account(bool has_process_acl,
+                                           bool has_resume_any_privilege,
+                                           LEX_CSTRING priv_user,
+                                           LEX_CSTRING priv_host,
+                                           const Preserved_trx_view_row &row) {
+  if (has_process_acl || has_resume_any_privilege) return true;
+  return preserved_trx_row_owned_by_account(priv_user, priv_host, row);
+}
+
 }  // namespace
 
 bool preserve_trx_is_enabled() {
@@ -828,15 +851,38 @@ bool preserve_trx_execute_command(THD *thd) {
 }
 
 Preserved_trx_view_rows preserved_trx_snapshot(THD *thd) {
-  (void)thd;
   DBUG_EXECUTE_IF("preserve_trx_clear_debug_observable_records", {
     clear_debug_observable_records();
   });
   DBUG_EXECUTE_IF("preserve_trx_inject_observable_record", {
     insert_debug_observable_record_if_missing();
   });
+
   std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
-  return g_preserved_trx_registry;
+  if (thd == nullptr) return g_preserved_trx_registry;
+
+  Security_context *sctx = thd->security_context();
+  const bool has_process_acl =
+      sctx != nullptr && sctx->check_access(PROCESS_ACL);
+  const bool has_resume_any_privilege =
+      thd_has_resume_any_preserved_transaction(thd);
+  const LEX_CSTRING priv_user =
+      sctx != nullptr ? sctx->priv_user() : LEX_CSTRING{nullptr, 0};
+  const LEX_CSTRING priv_host =
+      sctx != nullptr ? sctx->priv_host() : LEX_CSTRING{nullptr, 0};
+
+  Preserved_trx_view_rows visible_rows;
+  visible_rows.reserve(g_preserved_trx_registry.size());
+  for (Preserved_trx_view_row row : g_preserved_trx_registry) {
+    if (!preserved_trx_row_visible_for_account(has_process_acl,
+                                               has_resume_any_privilege,
+                                               priv_user, priv_host, row)) {
+      continue;
+    }
+    if (!has_process_acl) row.token = preserved_trx_redacted_token(row.token);
+    visible_rows.push_back(std::move(row));
+  }
+  return visible_rows;
 }
 
 static bool store_preserved_trx_row(Protocol *protocol,

@@ -281,6 +281,15 @@ Progress notes:
   `--skip-log-bin` (24 successful), release normal-binlog (20 successful, 4
   expected skips), and release `--skip-log-bin` (22 successful, 2 expected
   debug-only skips).
+- 2026-06-16: added registry-row ACL filtering for the P_S/SHOW snapshot shell.
+  RED was `pfs_preserved_transactions_acl_debug` showing the injected registry
+  row to an account with only P_S `SELECT`, and exposing a full token to an
+  account with `RESUME_ANY_PRESERVED_TRANSACTION`. GREEN filters rows in
+  `preserved_trx_snapshot(thd)`: `PROCESS` sees full tokens, `RESUME_ANY` sees
+  redacted tokens, owner-visible rows use the same helper, and unrelated
+  accounts see no rows. Debug/release builds passed, and the migrated
+  preserve_trx shell MTR set passed in four modes. This remains a registry
+  shell test; durable token ownership is still later Batch 1/2 work.
 - 2026-06-16: added the `preserve_trx_is_enabled()` cached-enable shell,
   startup-option cache synchronization, and the minimal IDLE/DISABLING manager
   state needed for safe disable checks. This keeps the current 8.0.22 staging

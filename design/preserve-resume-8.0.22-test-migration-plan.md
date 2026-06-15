@@ -119,6 +119,12 @@ Tests:
   `preserve_trx_clear_debug_observable_records` removes it, proving the
   8.0.22 shell now has a mutex-protected registry container. This is registry
   shell/display coverage only, not production durable-token insertion.
+- `pfs_preserved_transactions_acl_debug.test` - added as an 8.0.22
+  target-only debug staging test for registry-row ACL filtering and token
+  redaction. It injects one observable row, then verifies that an account with
+  only P_S `SELECT` sees no row, an account with
+  `RESUME_ANY_PRESERVED_TRANSACTION` sees a redacted token, and an account with
+  `PROCESS` sees the full token.
 - `perfschema.dml_handler` - non-preserve-suite regression updated for the new
   read-only PFS table and rerun in debug/release.
 - `core_limit_sysvars.test` - added as an 8.0.22 port staging test for core
@@ -212,6 +218,18 @@ Evidence:
   column metadata and unsigned-column SHOW types. The new debug observable-row
   test passed under debug, and release correctly skips it through
   `have_debug.inc`.
+- 2026-06-16 RED: `pfs_preserved_transactions_acl_debug` first needed explicit
+  `SELECT ON performance_schema.*` grants to reach row filtering, then failed
+  because a plain account saw the injected registry row and a `RESUME_ANY`
+  account saw the full token.
+- 2026-06-16 GREEN: `pfs_preserved_transactions_acl_debug` passed after
+  `preserved_trx_snapshot(thd)` applied account visibility and token redaction:
+  `PROCESS` sees full tokens, `RESUME_ANY` sees redacted tokens, owner-visible
+  rows use the same helper, and accounts without a matching privilege or owner
+  identity see no row. Debug and release builds passed. The migrated shell MTR
+  set passed in four modes: debug normal-binlog, debug `--skip-log-bin`,
+  release normal-binlog, and release `--skip-log-bin`; release runs skip this
+  debug-only test through `have_debug.inc`.
 - 2026-06-16 RED: the expanded debug observable test failed because the
   injected row disappeared once `preserve_trx_inject_observable_record` was
   cleared. GREEN introduced the first mutex-protected in-memory registry shell
