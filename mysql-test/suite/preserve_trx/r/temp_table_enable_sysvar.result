@@ -1,0 +1,13 @@
+SELECT @@GLOBAL.preserve_trx_temp_table_enable AS temp_table_enable;
+temp_table_enable
+1
+SET @saved_temp_table_enable=@@GLOBAL.preserve_trx_temp_table_enable;
+SET GLOBAL preserve_trx_temp_table_enable=OFF;
+SELECT @@GLOBAL.preserve_trx_temp_table_enable AS temp_table_enable;
+temp_table_enable
+0
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SELECT @@GLOBAL.preserve_trx_temp_table_enable AS temp_table_enable;
+temp_table_enable
+1
+SET GLOBAL preserve_trx_temp_table_enable=@saved_temp_table_enable;

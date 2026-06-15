@@ -196,6 +196,16 @@ Additional core limit sysvars slice evidence:
 - Scope is configuration surface only. It does not claim snapshot write/read
   enforcement, carrier size-limit enforcement, token registry capacity
   enforcement, or timeout/reaper runtime semantics.
+
+Additional temp-table enable sysvar slice evidence:
+- RED: `temp_table_enable_sysvar` failed before code migration with
+  `Unknown system variable 'preserve_trx_temp_table_enable'`.
+- GREEN: debug and release builds passed after adding the default-ON global
+  temp-table feature flag.
+- Targeted preserve set with `temp_table_enable_sysvar` added: all 11 tests
+  successful on 2026-06-16 in debug, release, and release `--skip-log-bin`.
+- Scope is configuration surface only. It does not claim user temporary table
+  image/rebind, temp-DML fail-closed, sidecar, spill, or resume behavior.
 ```
 
 Review findings summary:

@@ -29,6 +29,7 @@
 class THD;
 
 extern bool preserve_trx_enable;
+extern bool preserve_trx_temp_table_enable;
 extern uint preserve_trx_max_total;
 extern uint preserve_trx_max_pending_per_user;
 extern uint preserve_trx_batch_max_transactions;

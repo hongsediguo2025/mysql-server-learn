@@ -44,6 +44,7 @@
 #include "sql/mysqld.h"
 
 bool preserve_trx_enable = false;
+bool preserve_trx_temp_table_enable = true;
 uint preserve_trx_max_total = 256;
 uint preserve_trx_max_pending_per_user = 256;
 uint preserve_trx_batch_max_transactions = 256;

@@ -254,6 +254,10 @@ Progress notes:
   `core_limit_sysvars` failing on unknown `preserve_trx_max_total`; GREEN
   passed debug/release targeted MTR with normal binlog and release
   `--skip-log-bin`.
+- 2026-06-16: added `preserve_trx_temp_table_enable` as an early configuration
+  surface for the third source branch. It defaults ON per the final release
+  contract, but this slice does not claim temp-table image/rebind or resume
+  runtime support.
 - These current slices do not claim full carrier or token ACL/redaction. Those
   remain in Batch 1.
 - Because the current 8.0.22 port is still an unsupported shell, it keeps

@@ -1042,6 +1042,14 @@ static bool check_preserve_trx_enable(sys_var *, THD *, set_var *var) {
   return true;
 }
 
+static Sys_var_bool Sys_preserve_trx_temp_table_enable(
+    "preserve_trx_temp_table_enable",
+    "Enable user InnoDB temporary table preserve/resume support for tables "
+    "without temp row history. Temp-DML and unsupported table metadata remain "
+    "fail-closed before durable token creation.",
+    GLOBAL_VAR(preserve_trx_temp_table_enable), CMD_LINE(OPT_ARG),
+    DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
 static Sys_var_uint Sys_preserve_trx_max_total(
     "preserve_trx_max_total",
     "Maximum total number of preserved transactions allowed on the instance.",
