@@ -107,6 +107,9 @@ Tests:
 - `temp_table_enable_sysvar.test` - added as an early configuration-surface
   test for the user temporary table feature flag. It verifies the final default
   ON contract without claiming temp-table runtime preserve/resume support.
+- `resource_limit_sysvars.test` - added as an 8.0.22 port staging test for
+  temp sidecar, memory/spill, single-phase binlog-cache, and lock/scan limit
+  variables. This is a sysvar contract test only.
 - `token_redaction.test`;
 - `token_visibility_redaction.test`;
 - `validation_and_privileges.test`;
@@ -147,6 +150,13 @@ Evidence:
   `pfs_preserved_transactions_empty`, `core_limit_sysvars`, and
   `temp_table_enable_sysvar` passed in debug, release, and release
   `--skip-log-bin`.
+- 2026-06-16 RED: `resource_limit_sysvars` failed before code migration with
+  `Unknown system variable 'preserve_trx_max_temp_sidecar_bytes'`.
+- 2026-06-16 GREEN debug/release: Batch 0 targeted set plus
+  `snapshot_format`, `key_permission_reject`,
+  `pfs_preserved_transactions_empty`, `core_limit_sysvars`,
+  `temp_table_enable_sysvar`, and `resource_limit_sysvars` passed in debug,
+  release, and release `--skip-log-bin`.
 
 ## Batch 2 Tests
 

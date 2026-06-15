@@ -37,6 +37,15 @@ extern uint preserve_trx_recovery_max_count;
 extern uint preserve_trx_recovery_grace_seconds;
 extern ulonglong preserve_trx_max_snapshot_bytes;
 extern ulonglong preserve_trx_max_binlog_cache_bytes;
+extern ulonglong preserve_trx_max_temp_sidecar_bytes;
+extern ulonglong preserve_trx_memory_budget_bytes;
+extern ulonglong preserve_trx_memory_per_token_bytes;
+extern uint preserve_trx_spill_chunk_bytes;
+extern ulonglong preserve_trx_single_phase_max_binlog_cache_bytes;
+extern uint preserve_trx_max_lock_count;
+extern uint preserve_trx_max_modified_tables;
+extern uint preserve_trx_max_scan_pages;
+extern uint preserve_trx_materialize_timeout_ms;
 
 bool preserve_trx_execute_command(THD *thd);
 const char *preserved_trx_dir_value();

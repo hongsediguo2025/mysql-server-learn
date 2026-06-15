@@ -52,6 +52,15 @@ uint preserve_trx_recovery_max_count = 3;
 uint preserve_trx_recovery_grace_seconds = 120;
 ulonglong preserve_trx_max_snapshot_bytes = 16777216;
 ulonglong preserve_trx_max_binlog_cache_bytes = 1073741824;
+ulonglong preserve_trx_max_temp_sidecar_bytes = 1073741824;
+ulonglong preserve_trx_memory_budget_bytes = 268435456;
+ulonglong preserve_trx_memory_per_token_bytes = 67108864;
+uint preserve_trx_spill_chunk_bytes = 4194304;
+ulonglong preserve_trx_single_phase_max_binlog_cache_bytes = ULLONG_MAX;
+uint preserve_trx_max_lock_count = 2000;
+uint preserve_trx_max_modified_tables = 64;
+uint preserve_trx_max_scan_pages = 20000;
+uint preserve_trx_materialize_timeout_ms = 5000;
 
 namespace {
 

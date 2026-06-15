@@ -1127,6 +1127,79 @@ static Sys_var_ulonglong Sys_preserve_trx_max_binlog_cache_bytes(
     VALID_RANGE(1, ULLONG_MAX), DEFAULT(1073741824), BLOCK_SIZE(1),
     NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
+static Sys_var_ulonglong Sys_preserve_trx_max_temp_sidecar_bytes(
+    "preserve_trx_max_temp_sidecar_bytes",
+    "Maximum size in bytes of a preserved temporary table image or undo "
+    "sidecar file.",
+    GLOBAL_VAR(preserve_trx_max_temp_sidecar_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, 1073741824ULL), DEFAULT(1073741824), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_memory_budget_bytes(
+    "preserve_trx_memory_budget_bytes",
+    "Maximum Preserve/Resume heap bytes that may be leased across all active "
+    "preserve operations before callers must spill or fail closed.",
+    GLOBAL_VAR(preserve_trx_memory_budget_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(4096, ULLONG_MAX), DEFAULT(268435456), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_memory_per_token_bytes(
+    "preserve_trx_memory_per_token_bytes",
+    "Maximum Preserve/Resume heap bytes that may be leased by one preserved "
+    "transaction token before callers must spill or fail closed.",
+    GLOBAL_VAR(preserve_trx_memory_per_token_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(4096, ULLONG_MAX), DEFAULT(67108864), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_spill_chunk_bytes(
+    "preserve_trx_spill_chunk_bytes",
+    "Scratch chunk size used when Preserve/Resume streams large artifacts to "
+    "the spill backend.",
+    GLOBAL_VAR(preserve_trx_spill_chunk_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(4096, 67108864), DEFAULT(4194304), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_single_phase_max_binlog_cache_bytes(
+    "preserve_trx_single_phase_max_binlog_cache_bytes",
+    "Maximum logged binlog cache bytes that preserve may copy without a "
+    "warm-copy phase. Larger single-phase preserves fail before undo prepare "
+    "or detach.",
+    GLOBAL_VAR(preserve_trx_single_phase_max_binlog_cache_bytes),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, ULLONG_MAX), DEFAULT(ULLONG_MAX),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_max_lock_count(
+    "preserve_trx_max_lock_count",
+    "Maximum number of record locks that preserve may materialize or export "
+    "before rejecting the transaction.",
+    GLOBAL_VAR(preserve_trx_max_lock_count), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, UINT_MAX32), DEFAULT(2000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_max_modified_tables(
+    "preserve_trx_max_modified_tables",
+    "Maximum number of modified InnoDB tables that preserve may scan for "
+    "implicit locks before rejecting the transaction.",
+    GLOBAL_VAR(preserve_trx_max_modified_tables), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, UINT_MAX32), DEFAULT(64), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_max_scan_pages(
+    "preserve_trx_max_scan_pages",
+    "Maximum number of clustered index pages that preserve may scan while "
+    "materializing implicit locks before rejecting the transaction.",
+    GLOBAL_VAR(preserve_trx_max_scan_pages), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, UINT_MAX32), DEFAULT(20000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_materialize_timeout_ms(
+    "preserve_trx_materialize_timeout_ms",
+    "Maximum wall-clock time in milliseconds that preserve may spend "
+    "materializing implicit locks before rejecting the transaction.",
+    GLOBAL_VAR(preserve_trx_materialize_timeout_ms), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, UINT_MAX32), DEFAULT(5000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
 static bool fix_binlog_cache_size(sys_var *, THD *thd, enum_var_type) {
   check_binlog_cache_size(thd);
   return false;

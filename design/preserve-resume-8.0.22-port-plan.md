@@ -258,6 +258,10 @@ Progress notes:
   surface for the third source branch. It defaults ON per the final release
   contract, but this slice does not claim temp-table image/rebind or resume
   runtime support.
+- 2026-06-16: added resource, memory/spill, single-phase binlog-cache, and lock
+  materialization limit sysvars as a configuration-surface slice. This prepares
+  later carrier/temp-table/resource-manager batches without claiming runtime
+  enforcement yet.
 - These current slices do not claim full carrier or token ACL/redaction. Those
   remain in Batch 1.
 - Because the current 8.0.22 port is still an unsupported shell, it keeps

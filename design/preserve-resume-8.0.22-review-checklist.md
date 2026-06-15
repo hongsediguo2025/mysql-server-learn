@@ -206,6 +206,17 @@ Additional temp-table enable sysvar slice evidence:
   successful on 2026-06-16 in debug, release, and release `--skip-log-bin`.
 - Scope is configuration surface only. It does not claim user temporary table
   image/rebind, temp-DML fail-closed, sidecar, spill, or resume behavior.
+
+Additional resource limit sysvars slice evidence:
+- RED: `resource_limit_sysvars` failed before code migration with
+  `Unknown system variable 'preserve_trx_max_temp_sidecar_bytes'`.
+- GREEN: debug and release builds passed after adding temp sidecar,
+  memory/spill, single-phase binlog-cache, and lock/scan limit sysvars.
+- Targeted preserve set with `resource_limit_sysvars` added: all 12 tests
+  successful on 2026-06-16 in debug, release, and release `--skip-log-bin`.
+- Scope is configuration surface only. It does not claim memory lease
+  accounting, spill backend, temp image streaming, single-phase copy limits, or
+  lock materialization enforcement.
 ```
 
 Review findings summary:
