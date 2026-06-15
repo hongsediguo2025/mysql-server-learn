@@ -125,6 +125,11 @@ Tests:
   test for `RESUME_ANY_PRESERVED_TRANSACTION` dynamic privilege registration.
   It verifies `GRANT` and `SHOW GRANTS` only; it does not claim registry-backed
   RESUME authorization yet.
+- `resume_privilege_gate_staging.test` - added as an 8.0.22 Batch 1 staging
+  test for the RESUME authorization shell. It verifies that an account without
+  `RESUME_ANY_PRESERVED_TRANSACTION` receives access denied and an account with
+  that privilege reaches the missing-token path. It does not claim owner-token
+  matching or real attach/resume.
 - `token_redaction.test`;
 - `token_visibility_redaction.test`;
 - `validation_and_privileges.test`;
@@ -207,6 +212,12 @@ Evidence:
 - 2026-06-16 GREEN debug/release: `syntax_feature_gate` passed with normal
   binlog and release `--skip-log-bin`; it now verifies the disabled preserve
   command shell plus the empty `SHOW PRESERVED TRANSACTIONS` column surface.
+- 2026-06-16 RED: `resume_privilege_gate_staging` failed before code migration
+  because `ER_PRESERVE_TRX_ACCESS_DENIED` was not registered.
+- 2026-06-16 GREEN debug/release: `resume_privilege_gate_staging` passed with
+  normal binlog and release `--skip-log-bin`; `unsupported_single_instance_guards`
+  was narrowed to PREPARE/DRAIN unsupported shell coverage so RESUME semantics
+  are owned by the dedicated privilege gate test.
 
 ## Batch 2 Tests
 

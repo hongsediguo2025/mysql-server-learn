@@ -44,10 +44,12 @@
 #include "mysql/components/services/log_builtins.h"
 #include "mysqld_error.h"
 #include "sha2.h"
+#include "sql/auth/sql_security_ctx.h"
 #include "sql/item.h"
 #include "sql/mysqld.h"
 #include "sql/protocol.h"
 #include "sql/sql_class.h"
+#include "sql/sql_lex.h"
 
 bool preserve_trx_enable = false;
 bool preserve_trx_temp_table_enable = true;
@@ -462,6 +464,14 @@ Preserve_snapshot_support_status validate_snapshot_support_once(
   return Preserve_snapshot_support_status::CONFIG_ERROR;
 }
 
+bool thd_has_resume_any_preserved_transaction(THD *thd) {
+  Security_context *sctx = thd != nullptr ? thd->security_context() : nullptr;
+  return sctx != nullptr &&
+         sctx->has_global_grant(
+                 STRING_WITH_LEN("RESUME_ANY_PRESERVED_TRANSACTION"))
+             .first;
+}
+
 }  // namespace
 
 const char *preserved_trx_dir_value() {
@@ -537,11 +547,21 @@ ulonglong preserve_trx_warmcopy_phase2_pause_us_status() {
   return g_warmcopy_phase2_pause_us.load();
 }
 
-bool preserve_trx_execute_command(THD *) {
+bool preserve_trx_execute_command(THD *thd) {
   DBUG_TRACE;
 
   if (!preserve_trx_enable) {
     my_error(ER_PRESERVE_TRX_DISABLED, MYF(0));
+    return true;
+  }
+
+  if (thd != nullptr && thd->lex != nullptr &&
+      thd->lex->sql_command == SQLCOM_RESUME_PRESERVED_TRX) {
+    if (!thd_has_resume_any_preserved_transaction(thd)) {
+      my_error(ER_PRESERVE_TRX_ACCESS_DENIED, MYF(0));
+      return true;
+    }
+    my_error(ER_PRESERVE_TRX_NOT_FOUND, MYF(0));
     return true;
   }
 

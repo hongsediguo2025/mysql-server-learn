@@ -1,0 +1,13 @@
+DROP USER IF EXISTS preserve_resume_denied@localhost;
+DROP USER IF EXISTS preserve_resume_any@localhost;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE USER preserve_resume_denied@localhost;
+RESUME PRESERVED TRANSACTION 'msp_missing_token';
+ERROR HY000: Access denied for preserved transaction
+CREATE USER preserve_resume_any@localhost;
+GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO preserve_resume_any@localhost;
+RESUME PRESERVED TRANSACTION 'msp_missing_token';
+ERROR HY000: Preserved transaction was not found
+DROP USER preserve_resume_any@localhost;
+DROP USER preserve_resume_denied@localhost;
+SET GLOBAL preserve_trx_enable=OFF;

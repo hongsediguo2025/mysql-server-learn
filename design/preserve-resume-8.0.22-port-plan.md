@@ -289,6 +289,13 @@ Progress notes:
   empty SHOW surface; registry-backed rows, ACL filtering, token redaction,
   FAILED/reaper states, and real preserve/resume observability remain later
   work.
+- 2026-06-16: added the staging RESUME privilege gate shell. RED was
+  `resume_privilege_gate_staging` failing because
+  `ER_PRESERVE_TRX_ACCESS_DENIED` did not exist; GREEN passed debug/release
+  normal and release `--skip-log-bin`. This slice distinguishes unauthorised
+  `RESUME PRESERVED TRANSACTION` from authorised missing-token lookup, but it
+  still uses the empty registry shell. Owner-token matching, token lookup,
+  attach, and redaction remain later Batch 1/2 work.
 - These current slices do not claim full carrier or token ACL/redaction. Those
   remain in Batch 1.
 - Because the current 8.0.22 port is still an unsupported shell, it keeps
