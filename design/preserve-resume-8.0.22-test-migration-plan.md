@@ -116,6 +116,11 @@ Tests:
 - `resource_status_vars.test` - added as an 8.0.22 port staging test for
   warm-copy/resource `SHOW GLOBAL STATUS` names. This is a zero-value status
   surface test only; runtime producers are later Batch 5/6 work.
+- `startup_transient_key_io_retry.test` - ported as a debug-only Batch 1
+  hardening test for bounded transient I/O retry during startup snapshot
+  support validation. It injects a one-shot `.key` read failure and a one-shot
+  preserve-dir stat failure through DBUG, then requires validate-config to
+  succeed with explicit retry evidence in the error log.
 - `token_redaction.test`;
 - `token_visibility_redaction.test`;
 - `validation_and_privileges.test`;
@@ -181,6 +186,12 @@ Evidence:
   `temp_table_enable_sysvar`, `resource_limit_sysvars`,
   `drain_warmcopy_sysvars`, and `resource_status_vars` passed in debug,
   release, and release `--skip-log-bin`.
+- 2026-06-16 RED: `startup_transient_key_io_retry` found no
+  `preserve_trx startup support transient I/O retry succeeded` evidence for
+  injected transient startup failures.
+- 2026-06-16 GREEN: `startup_transient_key_io_retry` passed in debug after
+  bounded retry support was added; release MTR reports an expected
+  `have_debug` skip.
 
 ## Batch 2 Tests
 

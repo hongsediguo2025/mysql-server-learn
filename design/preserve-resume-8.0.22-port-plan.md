@@ -272,6 +272,11 @@ Progress notes:
   `Preserve_trx_*` status rows; GREEN passed debug/release targeted MTR with
   normal binlog and release `--skip-log-bin`. Runtime producers remain later
   Batch 5/6 work.
+- 2026-06-16: added bounded transient I/O retry for startup snapshot support
+  validation. RED was `startup_transient_key_io_retry` finding no retry
+  evidence for injected `.key` read and preserve-dir stat transient failures;
+  GREEN passed debug and is an expected debug-only skip in release. Persistent
+  configuration, permission, path, and corrupt-key errors remain fail-loud.
 - These current slices do not claim full carrier or token ACL/redaction. Those
   remain in Batch 1.
 - Because the current 8.0.22 port is still an unsupported shell, it keeps

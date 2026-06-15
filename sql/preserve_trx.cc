@@ -39,7 +39,9 @@
 #include "my_io.h"
 #include "my_rnd.h"
 #include "my_sys.h"
+#include "my_systime.h"
 #include "my_thread_local.h"
+#include "mysql/components/services/log_builtins.h"
 #include "mysqld_error.h"
 #include "sha2.h"
 #include "sql/mysqld.h"
@@ -91,6 +93,12 @@ std::atomic<ulonglong> g_warmcopy_provider_full_copy_to_count{0};
 std::atomic<ulonglong> g_warmcopy_phase2_pause_us{0};
 
 enum class Preserve_key_status { OK, MISSING, CORRUPT, IO_ERROR };
+enum class Preserve_snapshot_support_status {
+  OK,
+  CONFIG_ERROR,
+  CORRUPT_KEY,
+  TRANSIENT_IO
+};
 
 std::string normalize_dir(std::string dir) {
   if (dir.empty()) return dir;
@@ -273,6 +281,12 @@ bool parse_bound_key_payload(
 Preserve_key_status read_key(
     const std::string &dir,
     std::array<unsigned char, kPreservedTrxKeyLength> *key) {
+  DBUG_EXECUTE_IF("preserve_trx_simulate_startup_key_read_io_once", {
+    static std::atomic_uint injected_read_errors{0};
+    if (injected_read_errors.fetch_add(1, std::memory_order_acq_rel) == 0)
+      return Preserve_key_status::IO_ERROR;
+  });
+
   const std::string path = join_path(dir, ".key");
   MY_STAT stat_area;
   if (my_stat(path.c_str(), &stat_area, MYF(0)) == nullptr) {
@@ -361,23 +375,88 @@ bool create_key(const std::string &dir) {
   return error;
 }
 
-bool ensure_directory(const std::string &dir) {
-  if (my_mkdir(normalize_dir(dir).c_str(), 0700, MYF(0)) == 0) return false;
-  return my_errno() != EEXIST;
+bool preserve_trx_errno_is_transient_io(int err) {
+  switch (err) {
+    case EAGAIN:
+    case EINTR:
+    case EIO:
+      return true;
+    default:
+      return false;
+  }
 }
 
-bool ensure_key(const std::string &dir) {
+Preserve_snapshot_support_status ensure_directory_status(
+    const std::string &dir) {
+  if (my_mkdir(normalize_dir(dir).c_str(), 0700, MYF(0)) == 0)
+    return Preserve_snapshot_support_status::OK;
+
+  const int mkdir_errno = my_errno();
+  if (mkdir_errno == EEXIST) return Preserve_snapshot_support_status::OK;
+  return preserve_trx_errno_is_transient_io(mkdir_errno)
+             ? Preserve_snapshot_support_status::TRANSIENT_IO
+             : Preserve_snapshot_support_status::CONFIG_ERROR;
+}
+
+Preserve_snapshot_support_status ensure_key_status(const std::string &dir) {
   std::array<unsigned char, kPreservedTrxKeyLength> key{};
   switch (read_key(dir, &key)) {
     case Preserve_key_status::OK:
-      return false;
+      return Preserve_snapshot_support_status::OK;
     case Preserve_key_status::MISSING:
-      return create_key(dir);
+      return create_key(dir) ? Preserve_snapshot_support_status::TRANSIENT_IO
+                             : Preserve_snapshot_support_status::OK;
     case Preserve_key_status::CORRUPT:
+      return Preserve_snapshot_support_status::CORRUPT_KEY;
     case Preserve_key_status::IO_ERROR:
-      return true;
+      return Preserve_snapshot_support_status::TRANSIENT_IO;
   }
-  return true;
+  return Preserve_snapshot_support_status::CONFIG_ERROR;
+}
+
+Preserve_snapshot_support_status validate_snapshot_support_once(
+    const std::string &dir, bool allow_create_missing) {
+  if (allow_create_missing) {
+    Preserve_snapshot_support_status status = ensure_directory_status(dir);
+    if (status == Preserve_snapshot_support_status::OK)
+      status = ensure_key_status(dir);
+    return status;
+  }
+
+  Preserve_snapshot_support_status status =
+      Preserve_snapshot_support_status::OK;
+  DBUG_EXECUTE_IF("preserve_trx_simulate_startup_dir_stat_io_once", {
+    static std::atomic_uint injected_stat_errors{0};
+    if (injected_stat_errors.fetch_add(1, std::memory_order_acq_rel) == 0)
+      status = Preserve_snapshot_support_status::TRANSIENT_IO;
+  });
+  if (status == Preserve_snapshot_support_status::TRANSIENT_IO) return status;
+
+  MY_STAT dir_stat;
+  if (my_stat(dir.c_str(), &dir_stat, MYF(0)) == nullptr) {
+    if (my_errno() == ENOENT) {
+      return path_is_symlink(dir)
+                 ? Preserve_snapshot_support_status::CONFIG_ERROR
+                 : Preserve_snapshot_support_status::OK;
+    }
+    return preserve_trx_errno_is_transient_io(my_errno())
+               ? Preserve_snapshot_support_status::TRANSIENT_IO
+               : Preserve_snapshot_support_status::CONFIG_ERROR;
+  }
+  if (!MY_S_ISDIR(dir_stat.st_mode))
+    return Preserve_snapshot_support_status::CONFIG_ERROR;
+
+  std::array<unsigned char, kPreservedTrxKeyLength> key{};
+  switch (read_key(dir, &key)) {
+    case Preserve_key_status::OK:
+    case Preserve_key_status::MISSING:
+      return Preserve_snapshot_support_status::OK;
+    case Preserve_key_status::CORRUPT:
+      return Preserve_snapshot_support_status::CORRUPT_KEY;
+    case Preserve_key_status::IO_ERROR:
+      return Preserve_snapshot_support_status::TRANSIENT_IO;
+  }
+  return Preserve_snapshot_support_status::CONFIG_ERROR;
 }
 
 }  // namespace
@@ -389,18 +468,26 @@ const char *preserved_trx_dir_value() {
 
 bool preserved_trx_validate_snapshot_support(bool allow_create_missing) {
   const std::string dir = preserve_trx_default_dir();
-  if (allow_create_missing) return ensure_directory(dir) || ensure_key(dir);
+  constexpr uint kMaxTransientIoAttempts = 3;
+  bool retried_transient_io = false;
 
-  MY_STAT dir_stat;
-  if (my_stat(dir.c_str(), &dir_stat, MYF(0)) == nullptr) {
-    return my_errno() != ENOENT || path_is_symlink(dir);
+  for (uint attempt = 1; attempt <= kMaxTransientIoAttempts; ++attempt) {
+    const Preserve_snapshot_support_status status =
+        validate_snapshot_support_once(dir, allow_create_missing);
+    if (status != Preserve_snapshot_support_status::TRANSIENT_IO) {
+      if (retried_transient_io &&
+          status == Preserve_snapshot_support_status::OK) {
+        LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+               "preserve_trx startup support transient I/O retry succeeded");
+      }
+      return status != Preserve_snapshot_support_status::OK;
+    }
+    if (attempt == kMaxTransientIoAttempts) return true;
+    retried_transient_io = true;
+    my_sleep(10000);
   }
-  if (!MY_S_ISDIR(dir_stat.st_mode)) return true;
 
-  std::array<unsigned char, kPreservedTrxKeyLength> key{};
-  const Preserve_key_status status = read_key(dir, &key);
-  return status == Preserve_key_status::CORRUPT ||
-         status == Preserve_key_status::IO_ERROR;
+  return true;
 }
 
 bool preserved_trx_ensure_snapshot_support() {
