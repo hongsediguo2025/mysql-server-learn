@@ -105,7 +105,10 @@ Tests:
 - `pfs_preserved_transactions_empty.test` - added as an 8.0.22 port staging
   test for the empty `performance_schema.preserved_transactions` surface. It
   verifies that the table exists, scans as empty before registry integration,
-  and exposes the expected column contract.
+  and exposes the expected column contract. The table now scans through the
+  shared `preserved_trx_snapshot()` view shell rather than a hardcoded
+  `HA_ERR_END_OF_FILE` stub, but the provider still returns no rows until the
+  preserved-record registry is ported.
 - `perfschema.dml_handler` - non-preserve-suite regression updated for the new
   read-only PFS table and rerun in debug/release.
 - `core_limit_sysvars.test` - added as an 8.0.22 port staging test for core
@@ -176,6 +179,18 @@ Evidence:
 - 2026-06-16 GREEN debug/release: `perfschema.dml_handler` passed after
   re-recording the expected table-list id shift and HANDLER rejection for
   `performance_schema.preserved_transactions`.
+- 2026-06-16 GREEN debug/release build: `SHOW PRESERVED TRANSACTIONS` and
+  `performance_schema.preserved_transactions` now read from the shared
+  `Preserved_trx_view_row` / `preserved_trx_snapshot()` shell. This is still
+  empty-view staging coverage; registry-backed rows remain pending.
+- 2026-06-16 GREEN post-PFS-view MTR regression: debug normal-binlog passed
+  with 20 successful and 2 expected `not_log_bin` skips; debug
+  `--skip-log-bin` passed with 22 successful; release normal-binlog passed
+  with 19 successful, 2 expected `not_log_bin` skips, and 1 expected
+  debug-only skip; release `--skip-log-bin` passed with 21 successful and 1
+  expected debug-only skip. The first release `--skip-log-bin` attempt hit
+  `No space left on device` while writing the status file; after deleting
+  generated `/tmp/preserve_8022_*_vardir` directories, the same shard passed.
 - 2026-06-16 RED: `core_limit_sysvars` failed before code migration with
   `Unknown system variable 'preserve_trx_max_total'`.
 - 2026-06-16 GREEN debug/release: Batch 0 targeted set plus

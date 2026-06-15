@@ -27,6 +27,7 @@
 #include <sys/types.h>
 
 #include "my_base.h"
+#include "sql/preserve_trx.h"
 #include "storage/perfschema/pfs_engine_table.h"
 
 class Field;
@@ -45,6 +46,7 @@ class table_preserved_transactions : public PFS_engine_table {
 
   void reset_position() override;
 
+  int rnd_init(bool scan) override;
   int rnd_next() override;
   int rnd_pos(const void *pos) override;
 
@@ -57,7 +59,9 @@ class table_preserved_transactions : public PFS_engine_table {
   static THR_LOCK m_table_lock;
   static Plugin_table m_table_def;
 
+  Preserved_trx_view_rows m_rows;
   pos_t m_pos;
+  pos_t m_next_pos;
 };
 
 #endif /* TABLE_PRESERVED_TRANSACTIONS_H */

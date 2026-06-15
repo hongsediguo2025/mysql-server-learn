@@ -685,6 +685,86 @@ bool preserve_trx_execute_command(THD *thd) {
   return true;
 }
 
+Preserved_trx_view_rows preserved_trx_snapshot(THD *thd) {
+  (void)thd;
+  return {};
+}
+
+static bool store_preserved_trx_row(Protocol *protocol,
+                                    const Preserved_trx_view_row &row) {
+  protocol->start_row();
+
+  protocol->store_string(row.token.c_str(), row.token.length(),
+                         system_charset_info);
+  protocol->store_string(row.user.c_str(), row.user.length(),
+                         system_charset_info);
+  protocol->store_string(row.host.c_str(), row.host.length(),
+                         system_charset_info);
+  protocol->store_string(row.state.c_str(), row.state.length(),
+                         system_charset_info);
+  if (row.created_at.empty())
+    protocol->store_null();
+  else
+    protocol->store_string(row.created_at.c_str(), row.created_at.length(),
+                           system_charset_info);
+  if (row.expires_at.empty())
+    protocol->store_null();
+  else
+    protocol->store_string(row.expires_at.c_str(), row.expires_at.length(),
+                           system_charset_info);
+  protocol->store(row.recovered_count);
+  protocol->store(row.age_seconds);
+  if (row.schema_name.empty())
+    protocol->store_null();
+  else
+    protocol->store_string(row.schema_name.c_str(), row.schema_name.length(),
+                           system_charset_info);
+  protocol->store_string(row.isolation.c_str(), row.isolation.length(),
+                         system_charset_info);
+  protocol->store(row.mod_tables_count);
+  if (row.locks_count_valid)
+    protocol->store(row.locks_count);
+  else
+    protocol->store_null();
+  protocol->store(row.has_read_view ? "YES" : "NO", system_charset_info);
+  protocol->store(row.rv_low_limit_no);
+  protocol->store(row.savepoint_count);
+  protocol->store_string(row.binlog_state.c_str(), row.binlog_state.length(),
+                         system_charset_info);
+  protocol->store(row.wrote_to_cache ? "YES" : "NO", system_charset_info);
+  protocol->store(row.binlog_cache_size);
+  protocol->store_string(row.binlog_warmcopy_state.c_str(),
+                         row.binlog_warmcopy_state.length(),
+                         system_charset_info);
+  protocol->store(row.session_sql_log_bin ? "ON" : "OFF",
+                  system_charset_info);
+  protocol->store(row.global_log_bin ? "ON" : "OFF", system_charset_info);
+  if (row.gtid_next.empty())
+    protocol->store_null();
+  else
+    protocol->store_string(row.gtid_next.c_str(), row.gtid_next.length(),
+                           system_charset_info);
+  protocol->store(row.autoinc_lock_owned ? "YES" : "NO", system_charset_info);
+  protocol->store_string(row.temp_table_state.c_str(),
+                         row.temp_table_state.length(), system_charset_info);
+  protocol->store(row.temp_image_bytes);
+  protocol->store(row.temp_undo_bytes);
+  protocol->store(row.temp_sidecars_complete ? "YES" : "NO",
+                  system_charset_info);
+  if (row.last_error.empty())
+    protocol->store_null();
+  else
+    protocol->store_string(row.last_error.c_str(), row.last_error.length(),
+                           system_charset_info);
+  if (row.last_error_at.empty())
+    protocol->store_null();
+  else
+    protocol->store_string(row.last_error_at.c_str(),
+                           row.last_error_at.length(), system_charset_info);
+
+  return protocol->end_row();
+}
+
 bool Sql_cmd_show_preserved_transactions::execute(THD *thd) {
   DBUG_TRACE;
 
@@ -727,6 +807,11 @@ bool Sql_cmd_show_preserved_transactions::execute(THD *thd) {
   if (thd->send_result_metadata(
           fields, Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF)) {
     return true;
+  }
+
+  Protocol *protocol = thd->get_protocol();
+  for (const Preserved_trx_view_row &row : preserved_trx_snapshot(thd)) {
+    if (store_preserved_trx_row(protocol, row)) return true;
   }
 
   my_eof(thd);

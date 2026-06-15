@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "my_inttypes.h"
 #include "sql/sql_cmd.h"
@@ -76,12 +77,50 @@ struct Preserve_trx_options {
       Preserve_trx_user_vars_mode::DEFAULT};
 };
 
+struct Preserved_trx_view_row {
+  std::string token;
+  std::string user;
+  std::string host;
+  std::string owner_user;
+  std::string owner_host;
+  std::string state;
+  std::string created_at;
+  std::string expires_at;
+  ulonglong recovered_count{0};
+  ulonglong age_seconds{0};
+  std::string schema_name;
+  std::string isolation;
+  ulonglong mod_tables_count{0};
+  ulonglong locks_count{0};
+  bool locks_count_valid{true};
+  bool has_read_view{false};
+  ulonglong rv_low_limit_no{0};
+  ulonglong savepoint_count{0};
+  std::string binlog_state;
+  bool wrote_to_cache{false};
+  ulonglong binlog_cache_size{0};
+  std::string binlog_warmcopy_state;
+  bool session_sql_log_bin{false};
+  bool global_log_bin{false};
+  std::string gtid_next;
+  bool autoinc_lock_owned{false};
+  std::string temp_table_state;
+  ulonglong temp_image_bytes{0};
+  ulonglong temp_undo_bytes{0};
+  bool temp_sidecars_complete{true};
+  std::string last_error;
+  std::string last_error_at;
+};
+
+using Preserved_trx_view_rows = std::vector<Preserved_trx_view_row>;
+
 bool preserve_trx_execute_command(THD *thd);
 bool preserve_trx_temp_table_session_needs_eligibility_check(const THD *thd);
 bool preserve_trx_temp_table_session_supported(THD *thd);
 bool preserve_trx_temp_table_capture_enabled(THD *thd, const TABLE *table);
 bool preserve_trx_temp_table_resume_supported(
     bool snapshot_has_temp_table_manifest);
+Preserved_trx_view_rows preserved_trx_snapshot(THD *thd);
 class Sql_cmd_show_preserved_transactions final : public Sql_cmd {
  public:
   enum_sql_command sql_command_code() const override {

@@ -213,10 +213,10 @@ Status:
 - The default-OFF shell is a port staging guard only; the final 8.0.22 release
   contract remains default ON.
 
-## Batch 1: Snapshot, Token, Bundle/Carrier, Empty P_S
+## Batch 1: Snapshot, Token, Bundle/Carrier, P_S View Shell
 
-Goal: port snapshot codec, token, key, HMAC/CRC, carrier, and empty P_S surface
-without attaching real transactions.
+Goal: port snapshot codec, token, key, HMAC/CRC, carrier, and P_S/SHOW view
+surface without attaching real transactions.
 
 Representative tests:
 
@@ -231,7 +231,7 @@ Implementation scope:
 - `sql/preserve_trx_bundle*`;
 - `sql/preserve_trx_carrier*`;
 - key management and token helpers;
-- empty `performance_schema.preserved_transactions` registration.
+- `performance_schema.preserved_transactions` registration and scan shell.
 
 Progress notes:
 
@@ -252,6 +252,14 @@ Progress notes:
 - The empty P_S slice only registers schema and read-only empty-scan behavior;
   it does not claim registry-backed rows, ACL-filtered visibility, token
   redaction, or resume/reaper state integration.
+- 2026-06-16: imported the shared `Preserved_trx_view_row` /
+  `preserved_trx_snapshot()` shell and wired both `SHOW PRESERVED
+  TRANSACTIONS` and `performance_schema.preserved_transactions` to read from
+  that view. The snapshot provider still returns an empty set until the
+  preserved-record registry is ported, so this is observability framework only,
+  not durable token/runtime behavior. Debug/release `mysqld mysqltest` builds
+  passed, and the migrated preserve_trx shell MTR set passed in debug/release
+  with normal binlog and `--skip-log-bin`.
 - Adding a PFS table changes the performance_schema schema surface. The final
   8.0.22 port must explicitly resolve the `PFS_DD_VERSION`/upgrade contract
   before release; this staging slice intentionally leaves that as a tracked
