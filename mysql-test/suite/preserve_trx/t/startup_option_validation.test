@@ -1,0 +1,10 @@
+--let $error_log= $MYSQLTEST_VARDIR/log/preserve_trx_startup_option.err
+--error 0,1
+--remove_file $error_log
+
+--exec $MYSQLD_CMD --validate-config --preserve-trx-enable=OFF --log-error=$error_log > $error_log 2>&1
+--exec $MYSQLD_CMD --validate-config --preserve-trx-enable=ON --log-error=$error_log > $error_log 2>&1
+
+SELECT 'startup option accepted' AS result;
+
+--remove_file $error_log

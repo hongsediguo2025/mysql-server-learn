@@ -61,6 +61,24 @@ Round B expected behavior:
 
 - `N/A with reason`: no real semantics in this batch.
 
+Current status:
+
+- 2026-06-15: Batch 0 debug build and Round A targeted MTR passed.
+- 2026-06-15: Batch 0 release build and Round A targeted MTR passed.
+- 2026-06-15: Batch 0 release `--skip-log-bin` targeted MTR passed.
+- Verified targets:
+  `mysqld`, `mysqltest`, `syntax_feature_gate`,
+  `startup_option_validation`, `unsupported_single_instance_guards`,
+  `feature_off_normal_transaction_smoke`,
+  `feature_off_binlog_temp_table_smoke`.
+- On this macOS/Clang setup, the 8.0.22 release build requires
+  `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` and
+  `-DCMAKE_CXX_FLAGS="-Wno-enum-constexpr-conversion"` because Boost 1.73
+  trips a modern Clang enum constexpr diagnostic.
+- Batch 0 keeps `preserve_trx_enable` default OFF as an explicit staging shell;
+  the final 8.0.22 release gate must still flip to the current GA contract:
+  `preserve_trx_enable=ON` and `preserve_trx_temp_table_enable=ON`.
+
 ## Batch 1 Tests
 
 Purpose: snapshot, token, bundle/carrier, and empty P_S.

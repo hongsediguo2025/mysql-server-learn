@@ -119,6 +119,7 @@
 #include "sql/persisted_variable.h"
 #include "sql/protocol.h"
 #include "sql/protocol_classic.h"
+#include "sql/preserve_trx.h"
 #include "sql/psi_memory_key.h"
 #include "sql/query_options.h"
 #include "sql/query_result.h"
@@ -4334,11 +4335,20 @@ int mysql_execute_command(THD *thd, bool first_level) {
     case SQLCOM_CLONE:
     case SQLCOM_LOCK_INSTANCE:
     case SQLCOM_UNLOCK_INSTANCE:
+    case SQLCOM_PREPARE_SHUTDOWN_PRESERVE:
+    case SQLCOM_DRAIN_TRANSACTIONS_PRESERVE:
+    case SQLCOM_RESUME_PRESERVED_TRX:
     case SQLCOM_ALTER_TABLESPACE:
     case SQLCOM_EXPLAIN_OTHER:
     case SQLCOM_RESTART_SERVER:
     case SQLCOM_CREATE_SRS:
     case SQLCOM_DROP_SRS: {
+      if (lex->sql_command == SQLCOM_PREPARE_SHUTDOWN_PRESERVE ||
+          lex->sql_command == SQLCOM_DRAIN_TRANSACTIONS_PRESERVE ||
+          lex->sql_command == SQLCOM_RESUME_PRESERVED_TRX) {
+        res = preserve_trx_execute_command(thd);
+        break;
+      }
       DBUG_ASSERT(lex->m_sql_cmd != nullptr);
 
       res = lex->m_sql_cmd->execute(thd);

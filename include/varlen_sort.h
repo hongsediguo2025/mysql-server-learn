@@ -33,6 +33,7 @@
 #include "template_utils.h"
 
 #include <algorithm>
+#include <iterator>
 #include <memory>
 #include <utility>
 
@@ -183,7 +184,13 @@ namespace std {
 
 // Required for Iterator.
 template <>
-struct iterator_traits<varlen_iterator> : iterator_traits<varlen_element *> {};
+struct iterator_traits<varlen_iterator> {
+  using difference_type = ptrdiff_t;
+  using value_type = varlen_element;
+  using pointer = varlen_element;
+  using reference = varlen_element;
+  using iterator_category = random_access_iterator_tag;
+};
 
 }  // namespace std
 

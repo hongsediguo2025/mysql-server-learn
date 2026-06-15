@@ -436,6 +436,7 @@ SET(SQL_SHARED_SOURCES
   parser_service.cc
   partition_info.cc
   partitioning/partition_handler.cc
+  preserve_trx.cc
   persisted_variable.cc
   protocol_classic.cc
   psi_memory_key.cc

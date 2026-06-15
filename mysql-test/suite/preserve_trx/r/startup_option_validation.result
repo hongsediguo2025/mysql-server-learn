@@ -1,0 +1,3 @@
+SELECT 'startup option accepted' AS result;
+result
+startup option accepted

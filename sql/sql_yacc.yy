@@ -1325,6 +1325,9 @@ void warn_about_deprecated_binary(THD *thd)
                                                             table expressions. */
 %token<lexer.keyword> REPLICA_SYM 1159
 %token<lexer.keyword> REPLICAS_SYM 1160
+%token<lexer.keyword> PRESERVED_SYM 1161              /* MYSQL */
+%token<lexer.keyword> TRANSACTIONS_SYM 1162           /* MYSQL */
+%token<lexer.keyword> DRAIN_SYM 1163                  /* MYSQL */
 
 
 /*
@@ -2170,7 +2173,8 @@ opt_end_of_input:
         ;
 
 simple_statement_or_begin:
-          simple_statement      { *parse_tree= $1; }
+          resume_preserved_trx_stmt { *parse_tree= nullptr; }
+        | simple_statement      { *parse_tree= $1; }
         | begin_stmt
         ;
 
@@ -2239,7 +2243,9 @@ simple_statement:
         | lock                          { $$= nullptr; }
         | optimize_table_stmt
         | keycache_stmt
+        | drain_transactions_preserve_stmt { $$= nullptr; }
         | preload_stmt
+        | prepare_shutdown_preserve_stmt { $$= nullptr; }
         | prepare                       { $$= nullptr; }
         | purge                         { $$= nullptr; }
         | release                       { $$= nullptr; }
@@ -2283,6 +2289,20 @@ deallocate:
 deallocate_or_drop:
           DEALLOCATE_SYM
         | DROP
+        ;
+
+prepare_shutdown_preserve_stmt:
+          PREPARE_SYM SHUTDOWN PRESERVE_SYM TRANSACTION_SYM
+          {
+            Lex->sql_command= SQLCOM_PREPARE_SHUTDOWN_PRESERVE;
+          }
+        ;
+
+drain_transactions_preserve_stmt:
+          DRAIN_SYM TRANSACTIONS_SYM PRESERVE_SYM
+          {
+            Lex->sql_command= SQLCOM_DRAIN_TRANSACTIONS_PRESERVE;
+          }
         ;
 
 prepare:
@@ -14517,6 +14537,7 @@ ident_keywords_ambiguous_2_labels:
         | CONTAINS_SYM
         | DEALLOCATE_SYM
         | DO_SYM
+        | DRAIN_SYM
         | END
         | FLUSH_SYM
         | FOLLOWS_SYM
@@ -14820,6 +14841,7 @@ ident_keywords_unambiguous:
         | PORT_SYM
         | PRECEDING_SYM
         | PRESERVE_SYM
+        | PRESERVED_SYM
         | PREV_SYM
         | PRIVILEGES
         | PRIVILEGE_CHECKS_USER_SYM
@@ -14934,6 +14956,7 @@ ident_keywords_unambiguous:
         | TIME_SYM %prec KEYWORD_USED_AS_IDENT
         | TLS_SYM
         | TRANSACTION_SYM
+        | TRANSACTIONS_SYM
         | TRIGGERS_SYM
         | TYPES_SYM
         | TYPE_SYM
@@ -15455,6 +15478,13 @@ shutdown_stmt:
           {
             Lex->sql_command= SQLCOM_SHUTDOWN;
             $$= NEW_PTN PT_shutdown();
+          }
+        ;
+
+resume_preserved_trx_stmt:
+          RESUME_SYM PRESERVED_SYM TRANSACTION_SYM text_string
+          {
+            Lex->sql_command= SQLCOM_RESUME_PRESERVED_TRX;
           }
         ;
 

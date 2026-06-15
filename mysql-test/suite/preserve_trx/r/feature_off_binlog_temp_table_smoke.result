@@ -1,0 +1,7 @@
+CREATE TEMPORARY TABLE t_preserve_tmp(a INT PRIMARY KEY, b VARCHAR(20)) ENGINE=InnoDB;
+INSERT INTO t_preserve_tmp VALUES (1, 'before'), (2, 'after');
+UPDATE t_preserve_tmp SET b = CONCAT(b, '-off') WHERE a = 2;
+SELECT COUNT(*) AS rows_seen, MAX(b) AS max_b FROM t_preserve_tmp;
+rows_seen	max_b
+2	before
+DROP TEMPORARY TABLE t_preserve_tmp;

@@ -188,6 +188,24 @@ Implementation scope:
 - errors/messages needed by the tests;
 - no InnoDB, binlog, or temp-table runtime integration yet.
 
+Status:
+
+- 2026-06-15: debug `mysqld` and `mysqltest` build passed for this shell.
+- 2026-06-15: release `mysqld`, `mysqltest`, and MTR-required client/helper
+  binaries built for this shell.
+- 2026-06-15: Batch 0 Round A targeted MTR passed for
+  `syntax_feature_gate`, `startup_option_validation`,
+  `unsupported_single_instance_guards`,
+  `feature_off_normal_transaction_smoke`, and
+  `feature_off_binlog_temp_table_smoke` in debug and release.
+- 2026-06-15: the same Batch 0 Round A set passed in release with
+  `--skip-log-bin`.
+- On this macOS/Clang setup, the 8.0.22 release build requires
+  `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` and
+  `-DCMAKE_CXX_FLAGS="-Wno-enum-constexpr-conversion"` for Boost 1.73.
+- The default-OFF shell is a port staging guard only; the final 8.0.22 release
+  contract remains default ON.
+
 ## Batch 1: Snapshot, Token, Bundle/Carrier, Empty P_S
 
 Goal: port snapshot codec, token, key, HMAC/CRC, carrier, and empty P_S surface

@@ -1,0 +1,12 @@
+CREATE TABLE t_preserve_off(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+START TRANSACTION;
+INSERT INTO t_preserve_off VALUES (1, 10);
+UPDATE t_preserve_off SET b = b + 1 WHERE a = 1;
+SELECT b FROM t_preserve_off WHERE a = 1;
+b
+11
+COMMIT;
+SELECT b FROM t_preserve_off WHERE a = 1;
+b
+11
+DROP TABLE t_preserve_off;

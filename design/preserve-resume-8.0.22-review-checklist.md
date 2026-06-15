@@ -60,6 +60,75 @@ Resolution:
 Commit:
 ```
 
+### Batch 0: MTR suite skeleton and feature-off guards
+
+- [x] Test inventory updated.
+- [x] Code inventory updated.
+- [x] Commit manifest rows updated.
+- [x] Test manifest rows updated.
+- [x] Round A feature-off / unsupported targeted MTR passed in debug.
+- [x] Round A feature-off / unsupported targeted MTR passed in release.
+- [x] Round B RED was observed and recorded, or `N/A with reason` for Batch 0.
+- [x] Round B GREEN passed in debug, or `N/A with reason` for Batch 0.
+- [x] Round B GREEN passed in release, or `N/A with reason` for Batch 0.
+- [x] Touched explicit conflict files reviewed.
+- [x] Touched changed-both files reviewed.
+- [x] Expected-but-untouched conflict/overlap files justified.
+- [x] `git diff --check` passed.
+- [x] `git status --short` reviewed.
+- [x] `git branch --show-current` verified target branch.
+- [ ] `git diff --name-only --cached` reviewed for batch scope.
+- [ ] 3 independent sub-agent reviews completed.
+- [ ] All Blocker/Major review findings fixed or rejected with evidence.
+- [ ] Batch commit created.
+
+Review findings summary:
+
+```text
+Commands/results:
+Build:
+- cmake --build build-debug --target mysqld -- -j4
+- cmake --build build-debug --target mysqltest -- -j4
+- cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+  -DCMAKE_CXX_FLAGS="-Wno-enum-constexpr-conversion"
+  -DWITH_BOOST=/Users/a1234/project/boost-1.73-cache
+  -DDOWNLOAD_BOOST=0
+  -DWITH_SSL=/Users/a1234/project/openssl-1.1.1w
+  -DWITH_ZLIB=system
+- cmake --build build-release --target mysqld mysqltest mysqladmin mysql
+  mysql_ssl_rsa_setup mysqltest_safe_process mysqlbinlog mysqlcheck mysqldump
+  mysqlimport mysqlshow mysqlslap mysqlpump mysql_upgrade mysql_config_editor
+  my_print_defaults innochecksum ibd2sdi myisamchk myisamlog myisampack perror
+  mysql_tzinfo_to_sql -- -j4
+Round A:
+- perl mysql-test/mysql-test-run.pl --suite=preserve_trx syntax_feature_gate startup_option_validation unsupported_single_instance_guards feature_off_normal_transaction_smoke feature_off_binlog_temp_table_smoke --force --parallel=1
+- Result: all 6 tests successful on 2026-06-15 in debug and release.
+- perl mysql-test/mysql-test-run.pl --suite=preserve_trx syntax_feature_gate startup_option_validation unsupported_single_instance_guards feature_off_normal_transaction_smoke feature_off_binlog_temp_table_smoke --skip-log-bin --force --parallel=1
+- Result: all 6 tests successful on 2026-06-15 in release.
+Round B:
+- N/A with reason: Batch 0 only installs parser/sysvar/error shell and does not
+  implement runtime preserve/resume semantics.
+Conflict/overlap disposition:
+- Touched SQL command enum, lexer/parser, sql_parse dispatch, sysvar, messages,
+  SQL CMake, mysqld command status, and one 8.0.22 compiler compatibility
+  header. No InnoDB/binlog/temp-table runtime files are touched in Batch 0.
+Reviewer A:
+- Pending.
+Reviewer B:
+- Pending.
+Reviewer C:
+- Pending.
+Resolution:
+- The first debug build failure was a parser placement mismatch for
+  `RESUME PRESERVED TRANSACTION`; it was fixed by matching the source branch
+  pattern and placing the rule under `simple_statement_or_begin`.
+- The second debug build failure was an 8.0.22 include layout difference:
+  `my_error()` is declared by `my_sys.h`, not `my_error.h`.
+Commit:
+- Pending.
+```
+
 ## Final Review Checklist
 
 - [ ] 5 independent full-review sub agents completed.

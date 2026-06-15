@@ -107,6 +107,7 @@
 #include "sql/options_mysqld.h"
 #include "sql/protocol_classic.h"
 #include "sql/psi_memory_key.h"
+#include "sql/preserve_trx.h"
 #include "sql/query_options.h"
 #include "sql/rpl_group_replication.h"  // is_group_replication_running
 #include "sql/rpl_info_factory.h"       // Rpl_info_factory
@@ -1286,6 +1287,13 @@ static bool prevent_global_rbr_exec_mode_idempotent(sys_var *self, THD *,
 static Sys_var_test_flag Sys_core_file("core_file",
                                        "write a core-file on crashes",
                                        TEST_CORE_ON_SIGNAL);
+
+static Sys_var_bool Sys_preserve_trx_enable(
+    "preserve_trx_enable",
+    "Enable resumable transactions across shutdown. In this 8.0.22 port "
+    "batch the variable gates syntax only; preserve/resume operations return "
+    "unsupported when enabled.",
+    GLOBAL_VAR(preserve_trx_enable), CMD_LINE(OPT_ARG), DEFAULT(false));
 
 static Sys_var_enum Sys_binlog_format(
     "binlog_format",

@@ -1,0 +1,9 @@
+SELECT @@global.preserve_trx_enable;
+@@global.preserve_trx_enable
+0
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+ERROR HY000: Resumable transactions across shutdown are disabled
+RESUME PRESERVED TRANSACTION 'msp_test_token';
+ERROR HY000: Resumable transactions across shutdown are disabled
+DRAIN TRANSACTIONS PRESERVE;
+ERROR HY000: Resumable transactions across shutdown are disabled

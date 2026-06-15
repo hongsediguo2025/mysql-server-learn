@@ -201,8 +201,8 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 | `mysql-test/suite/preserve_trx/t/snapshot_format.test` | `mysql-test/suite/preserve_trx/r/snapshot_format.result` | Batch 1 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/snapshot_size_limit.test` | `mysql-test/suite/preserve_trx/r/snapshot_size_limit.result` | Batch 1 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/sql_surface_review_guards.test` | `mysql-test/suite/preserve_trx/r/sql_surface_review_guards.result` | Batch 7 | pending | Verify source expectation before moving. |
-| `mysql-test/suite/preserve_trx/t/startup_option_validation.test` | `mysql-test/suite/preserve_trx/r/startup_option_validation.result` | Batch 0 | pending | Verify source expectation before moving. |
-| `mysql-test/suite/preserve_trx/t/syntax_feature_gate.test` | `mysql-test/suite/preserve_trx/r/syntax_feature_gate.result` | Batch 0 | pending | Verify source expectation before moving. |
+| `mysql-test/suite/preserve_trx/t/startup_option_validation.test` | `mysql-test/suite/preserve_trx/r/startup_option_validation.result` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed in shell mode; validates option parsing only, not final default-ON startup preflight. |
+| `mysql-test/suite/preserve_trx/t/syntax_feature_gate.test` | `mysql-test/suite/preserve_trx/r/syntax_feature_gate.result` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed; SQL surface routes to disabled shell. |
 | `mysql-test/suite/preserve_trx/t/table_lock_after_resume.test` | `mysql-test/suite/preserve_trx/r/table_lock_after_resume.result` | Batch 2 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/table_lock_tlv_import_isolated.test` | `mysql-test/suite/preserve_trx/r/table_lock_tlv_import_isolated.result` | Batch 2 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/temp_table_basic_commit_after_resume.test` | `mysql-test/suite/preserve_trx/r/temp_table_basic_commit_after_resume.result` | Batch 6 | pending | Verify source expectation before moving. |
@@ -237,7 +237,7 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 | `mysql-test/suite/preserve_trx/t/token_redaction.test` | `mysql-test/suite/preserve_trx/r/token_redaction.result` | Batch 1 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/token_visibility_redaction.test` | `mysql-test/suite/preserve_trx/r/token_visibility_redaction.result` | Batch 1 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/unsupported_cases.test` | `mysql-test/suite/preserve_trx/r/unsupported_cases.result` | Batch 0 | pending | Verify source expectation before moving. |
-| `mysql-test/suite/preserve_trx/t/unsupported_single_instance_guards.test` | `mysql-test/suite/preserve_trx/r/unsupported_single_instance_guards.result` | Batch 0 | pending | Verify source expectation before moving. |
+| `mysql-test/suite/preserve_trx/t/unsupported_single_instance_guards.test` | `mysql-test/suite/preserve_trx/r/unsupported_single_instance_guards.result` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed; enabled shell returns unsupported before runtime migration. |
 | `mysql-test/suite/preserve_trx/t/validation_and_privileges.test` | `mysql-test/suite/preserve_trx/r/validation_and_privileges.result` | Batch 1 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/warmcopy_admission_toctou.test` | `mysql-test/suite/preserve_trx/r/warmcopy_admission_toctou.result` | Batch 5 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/warmcopy_idle_silent_large_cache.test` | `mysql-test/suite/preserve_trx/r/warmcopy_idle_silent_large_cache.result` | Batch 5 | pending | Verify source expectation before moving. |
@@ -446,8 +446,8 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 | `mysql-test/suite/preserve_trx/r/snapshot_format.result` | Batch 1 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/snapshot_size_limit.result` | Batch 1 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/sql_surface_review_guards.result` | Batch 7 | pending | Must match the paired test or owning non-preserve suite test. |
-| `mysql-test/suite/preserve_trx/r/startup_option_validation.result` | Batch 0 | pending | Must match the paired test or owning non-preserve suite test. |
-| `mysql-test/suite/preserve_trx/r/syntax_feature_gate.result` | Batch 0 | pending | Must match the paired test or owning non-preserve suite test. |
+| `mysql-test/suite/preserve_trx/r/startup_option_validation.result` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed with paired test. |
+| `mysql-test/suite/preserve_trx/r/syntax_feature_gate.result` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed with paired test. |
 | `mysql-test/suite/preserve_trx/r/table_lock_after_resume.result` | Batch 2 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/table_lock_tlv_import_isolated.result` | Batch 2 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/temp_table_basic_commit_after_resume.result` | Batch 6 | pending | Must match the paired test or owning non-preserve suite test. |
@@ -482,7 +482,7 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 | `mysql-test/suite/preserve_trx/r/token_redaction.result` | Batch 1 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/token_visibility_redaction.result` | Batch 1 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/unsupported_cases.result` | Batch 0 | pending | Must match the paired test or owning non-preserve suite test. |
-| `mysql-test/suite/preserve_trx/r/unsupported_single_instance_guards.result` | Batch 0 | pending | Must match the paired test or owning non-preserve suite test. |
+| `mysql-test/suite/preserve_trx/r/unsupported_single_instance_guards.result` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed with paired test. |
 | `mysql-test/suite/preserve_trx/r/validation_and_privileges.result` | Batch 1 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/warmcopy_admission_toctou.result` | Batch 5 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/warmcopy_idle_silent_large_cache.result` | Batch 5 | pending | Must match the paired test or owning non-preserve suite test. |
@@ -514,7 +514,7 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 
 | Target path | Proposed batch | Migration state | Reason |
 |---|---|---|---|
-| `mysql-test/suite/preserve_trx/t/feature_off_normal_transaction_smoke.test` | Batch 0 | pending | Proves feature-off normal transaction behavior before any runtime migration. |
-| `mysql-test/suite/preserve_trx/t/feature_off_binlog_temp_table_smoke.test` | Batch 0 | pending | Proves feature-off binlog and temporary table behavior before any runtime migration. |
+| `mysql-test/suite/preserve_trx/t/feature_off_normal_transaction_smoke.test` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed; proves feature-off normal transaction behavior before any runtime migration. |
+| `mysql-test/suite/preserve_trx/t/feature_off_binlog_temp_table_smoke.test` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed; proves feature-off binlog and temporary table behavior before any runtime migration. |
 | `mysql-test/suite/preserve_trx/t/warmcopy_default_off_normal_binlog_smoke.test` | Batch 5 | pending | Proves warm-copy integration is parameter-isolated when disabled. |
 | `mysql-test/suite/preserve_trx/t/warmcopy_parameter_isolation.test` | Batch 5 | pending | Proves warm-copy knobs do not affect ordinary binlog cache paths when disabled. |
