@@ -130,6 +130,10 @@ Tests:
   `RESUME_ANY_PRESERVED_TRANSACTION` receives access denied and an account with
   that privilege reaches the missing-token path. It does not claim owner-token
   matching or real attach/resume.
+- `resume_unsupported_context_staging.test` - added as an 8.0.22 Batch 1
+  staging test for the RESUME unsupported-context shell. It verifies that user
+  locks and open HANDLER state fail closed before missing-token lookup. It does
+  not claim the full source branch unsupported-context matrix yet.
 - `token_redaction.test`;
 - `token_visibility_redaction.test`;
 - `validation_and_privileges.test`;
@@ -218,6 +222,12 @@ Evidence:
   normal binlog and release `--skip-log-bin`; `unsupported_single_instance_guards`
   was narrowed to PREPARE/DRAIN unsupported shell coverage so RESUME semantics
   are owned by the dedicated privilege gate test.
+- 2026-06-16 RED: `resume_unsupported_context_staging` failed because a
+  granted RESUME session holding a user lock reached `ER_PRESERVE_TRX_NOT_FOUND`
+  instead of the unsupported-context gate.
+- 2026-06-16 GREEN debug/release: `resume_unsupported_context_staging` passed
+  with normal binlog and release `--skip-log-bin`; it covers user lock and
+  HANDLER-open context in the current empty-registry shell.
 
 ## Batch 2 Tests
 

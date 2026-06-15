@@ -472,6 +472,12 @@ bool thd_has_resume_any_preserved_transaction(THD *thd) {
              .first;
 }
 
+bool thd_has_unsupported_resume_context(THD *thd) {
+  if (thd == nullptr) return true;
+  return thd->locked_tables_mode != LTM_NONE || !thd->ull_hash.empty() ||
+         !thd->handler_tables_hash.empty();
+}
+
 }  // namespace
 
 const char *preserved_trx_dir_value() {
@@ -557,6 +563,10 @@ bool preserve_trx_execute_command(THD *thd) {
 
   if (thd != nullptr && thd->lex != nullptr &&
       thd->lex->sql_command == SQLCOM_RESUME_PRESERVED_TRX) {
+    if (thd_has_unsupported_resume_context(thd)) {
+      my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+      return true;
+    }
     if (!thd_has_resume_any_preserved_transaction(thd)) {
       my_error(ER_PRESERVE_TRX_ACCESS_DENIED, MYF(0));
       return true;

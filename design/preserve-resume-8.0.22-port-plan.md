@@ -296,6 +296,12 @@ Progress notes:
   `RESUME PRESERVED TRANSACTION` from authorised missing-token lookup, but it
   still uses the empty registry shell. Owner-token matching, token lookup,
   attach, and redaction remain later Batch 1/2 work.
+- 2026-06-16: added the staging RESUME unsupported-context gate for session
+  state that is unsafe for attach. RED was `resume_unsupported_context_staging`
+  returning missing-token while a session held a user lock; GREEN passed
+  debug/release normal and release `--skip-log-bin`. This slice covers user
+  locks and HANDLER-open context only; replication/GR, cursors, stored program
+  context, and full record-backed INVALID_STATE handling remain later work.
 - These current slices do not claim full carrier or token ACL/redaction. Those
   remain in Batch 1.
 - Because the current 8.0.22 port is still an unsupported shell, it keeps

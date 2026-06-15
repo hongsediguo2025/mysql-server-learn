@@ -1,0 +1,27 @@
+DROP USER IF EXISTS preserve_resume_context@localhost;
+DROP TABLE IF EXISTS t_resume_context_staging;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_resume_context_staging(id INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO t_resume_context_staging VALUES(1);
+CREATE USER preserve_resume_context@localhost;
+GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO
+preserve_resume_context@localhost;
+GRANT SELECT ON test.t_resume_context_staging TO
+preserve_resume_context@localhost;
+SELECT GET_LOCK('resume_context_staging_lock', 0) AS got_lock;
+got_lock
+1
+RESUME PRESERVED TRANSACTION 'msp_missing_token';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT RELEASE_LOCK('resume_context_staging_lock') AS released_lock;
+released_lock
+1
+HANDLER t_resume_context_staging OPEN;
+RESUME PRESERVED TRANSACTION 'msp_missing_token';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+HANDLER t_resume_context_staging CLOSE;
+RESUME PRESERVED TRANSACTION 'msp_missing_token';
+ERROR HY000: Preserved transaction was not found
+DROP USER preserve_resume_context@localhost;
+DROP TABLE t_resume_context_staging;
+SET GLOBAL preserve_trx_enable=OFF;
