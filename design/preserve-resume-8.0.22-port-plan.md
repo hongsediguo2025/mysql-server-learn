@@ -264,6 +264,19 @@ Progress notes:
   not durable token/runtime behavior. Debug/release `mysqld mysqltest` builds
   passed, and the migrated preserve_trx shell MTR set passed in debug/release
   with normal binlog and `--skip-log-bin`.
+- 2026-06-16: added a debug-only observable-row injection test for the shared
+  P_S/SHOW view shell. RED proved the provider still returned no rows; GREEN
+  added `Preserved_trx_column_metadata`, correct unsigned-column SHOW metadata,
+  and a no-durable-side-effect DBUG row in `preserved_trx_snapshot()`. This
+  fixes the previously hidden debug assertion where `SHOW PRESERVED
+  TRANSACTIONS` declared all columns as strings and then stored BIGINT values.
+  It does not claim production preserved-record registration; the injected row
+  exists only while the debug flag is set. Debug/release `mysqld mysqltest`
+  builds passed. The migrated preserve_trx shell MTR set passed in four modes:
+  debug normal-binlog (22 successful, 2 expected `not_log_bin` skips), debug
+  `--skip-log-bin` (24 successful), release normal-binlog (20 successful, 4
+  expected skips), and release `--skip-log-bin` (22 successful, 2 expected
+  debug-only skips).
 - 2026-06-16: added the `preserve_trx_is_enabled()` cached-enable shell,
   startup-option cache synchronization, and the minimal IDLE/DISABLING manager
   state needed for safe disable checks. This keeps the current 8.0.22 staging

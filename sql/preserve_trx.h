@@ -91,6 +91,11 @@ struct Preserve_trx_options {
       Preserve_trx_user_vars_mode::DEFAULT};
 };
 
+struct Preserved_trx_column_metadata {
+  const char *name;
+  uint length;
+};
+
 bool preserve_trx_is_enabled();
 void preserve_trx_set_enable_value(bool enabled);
 Preserve_trx_manager_state preserved_trx_manager_state();
@@ -140,6 +145,7 @@ bool preserve_trx_temp_table_session_supported(THD *thd);
 bool preserve_trx_temp_table_capture_enabled(THD *thd, const TABLE *table);
 bool preserve_trx_temp_table_resume_supported(
     bool snapshot_has_temp_table_manifest);
+const Preserved_trx_column_metadata *preserved_trx_columns(size_t *count);
 Preserved_trx_view_rows preserved_trx_snapshot(THD *thd);
 class Sql_cmd_show_preserved_transactions final : public Sql_cmd {
  public:

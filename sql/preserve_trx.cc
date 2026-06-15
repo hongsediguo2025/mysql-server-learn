@@ -49,6 +49,7 @@
 #include "sql/auth/sql_security_ctx.h"
 #include "sql/item.h"
 #include "sql/mysqld.h"
+#include "sql/preserve_trx_xid.h"
 #include "sql/protocol.h"
 #include "sql/query_options.h"
 #include "sql/sql_class.h"
@@ -108,6 +109,38 @@ std::atomic<ulonglong> g_warmcopy_digest_bytes{0};
 std::atomic<ulonglong> g_warmcopy_durable_bytes{0};
 std::atomic<ulonglong> g_warmcopy_provider_full_copy_to_count{0};
 std::atomic<ulonglong> g_warmcopy_phase2_pause_us{0};
+
+constexpr Preserved_trx_column_metadata kPreservedTrxColumns[] = {
+    {"TOKEN", PRESERVE_TRX_TOKEN_MAX_LENGTH},
+    {"USER", 32},
+    {"HOST", 255},
+    {"STATE", 32},
+    {"CREATED_AT", 26},
+    {"EXPIRES_AT", 26},
+    {"RECOVERED_COUNT", 20},
+    {"AGE_SECONDS", 20},
+    {"SCHEMA_NAME", 64},
+    {"ISOLATION", 32},
+    {"MOD_TABLES_COUNT", 20},
+    {"LOCKS_COUNT", 20},
+    {"HAS_READ_VIEW", 3},
+    {"RV_LOW_LIMIT_NO", 20},
+    {"SAVEPOINT_COUNT", 20},
+    {"BINLOG_STATE", 32},
+    {"WROTE_TO_CACHE", 3},
+    {"BINLOG_CACHE_SIZE", 20},
+    {"BINLOG_WARMCOPY_STATE", 32},
+    {"SESSION_SQL_LOG_BIN", 3},
+    {"GLOBAL_LOG_BIN", 3},
+    {"GTID_NEXT", 1024},
+    {"AUTOINC_LOCK_OWNED", 3},
+    {"TEMP_TABLE_STATE", 32},
+    {"TEMP_IMAGE_BYTES", 20},
+    {"TEMP_UNDO_BYTES", 20},
+    {"TEMP_SIDECARS_COMPLETE", 3},
+    {"LAST_ERROR", 1024},
+    {"LAST_ERROR_AT", 26},
+};
 
 enum class Preserve_key_status { OK, MISSING, CORRUPT, IO_ERROR };
 enum class Preserve_snapshot_support_status {
@@ -562,6 +595,11 @@ bool preserve_trx_temp_table_resume_supported(
   return !snapshot_has_temp_table_manifest;
 }
 
+const Preserved_trx_column_metadata *preserved_trx_columns(size_t *count) {
+  *count = sizeof(kPreservedTrxColumns) / sizeof(kPreservedTrxColumns[0]);
+  return kPreservedTrxColumns;
+}
+
 std::string preserved_trx_redacted_token(const std::string &token) {
   if (token.empty()) return "****????";
   std::string redacted("****");
@@ -731,7 +769,23 @@ bool preserve_trx_execute_command(THD *thd) {
 
 Preserved_trx_view_rows preserved_trx_snapshot(THD *thd) {
   (void)thd;
-  return {};
+  Preserved_trx_view_rows rows;
+  DBUG_EXECUTE_IF("preserve_trx_inject_observable_record", {
+    Preserved_trx_view_row row;
+    row.token = "debug-observable-token";
+    row.user = "debug_user";
+    row.host = "debug_host";
+    row.owner_user = row.user;
+    row.owner_host = row.host;
+    row.state = "FAILED";
+    row.isolation = "REPEATABLE-READ";
+    row.binlog_state = "NONE";
+    row.binlog_warmcopy_state = "NONE";
+    row.temp_table_state = "NONE";
+    row.last_error = "debug observable record";
+    rows.push_back(row);
+  });
+  return rows;
 }
 
 static bool store_preserved_trx_row(Protocol *protocol,
@@ -809,43 +863,33 @@ static bool store_preserved_trx_row(Protocol *protocol,
   return protocol->end_row();
 }
 
+static bool preserved_trx_show_column_is_unsigned_integer(const char *name) {
+  return strcmp(name, "RECOVERED_COUNT") == 0 ||
+         strcmp(name, "AGE_SECONDS") == 0 ||
+         strcmp(name, "MOD_TABLES_COUNT") == 0 ||
+         strcmp(name, "LOCKS_COUNT") == 0 ||
+         strcmp(name, "RV_LOW_LIMIT_NO") == 0 ||
+         strcmp(name, "SAVEPOINT_COUNT") == 0 ||
+         strcmp(name, "BINLOG_CACHE_SIZE") == 0 ||
+         strcmp(name, "TEMP_IMAGE_BYTES") == 0 ||
+         strcmp(name, "TEMP_UNDO_BYTES") == 0;
+}
+
 bool Sql_cmd_show_preserved_transactions::execute(THD *thd) {
   DBUG_TRACE;
 
-  static constexpr const char *kColumns[] = {
-      "TOKEN",
-      "USER",
-      "HOST",
-      "STATE",
-      "CREATED_AT",
-      "EXPIRES_AT",
-      "RECOVERED_COUNT",
-      "AGE_SECONDS",
-      "SCHEMA_NAME",
-      "ISOLATION",
-      "MOD_TABLES_COUNT",
-      "LOCKS_COUNT",
-      "HAS_READ_VIEW",
-      "RV_LOW_LIMIT_NO",
-      "SAVEPOINT_COUNT",
-      "BINLOG_STATE",
-      "WROTE_TO_CACHE",
-      "BINLOG_CACHE_SIZE",
-      "BINLOG_WARMCOPY_STATE",
-      "SESSION_SQL_LOG_BIN",
-      "GLOBAL_LOG_BIN",
-      "GTID_NEXT",
-      "AUTOINC_LOCK_OWNED",
-      "TEMP_TABLE_STATE",
-      "TEMP_IMAGE_BYTES",
-      "TEMP_UNDO_BYTES",
-      "TEMP_SIDECARS_COMPLETE",
-      "LAST_ERROR",
-      "LAST_ERROR_AT"};
-
   mem_root_deque<Item *> fields(thd->mem_root);
-  for (const char *column : kColumns) {
-    fields.push_back(new Item_empty_string(column, 1024));
+  size_t column_count = 0;
+  const Preserved_trx_column_metadata *columns =
+      preserved_trx_columns(&column_count);
+  for (size_t i = 0; i < column_count; ++i) {
+    if (preserved_trx_show_column_is_unsigned_integer(columns[i].name)) {
+      fields.push_back(new Item_return_int(columns[i].name, columns[i].length,
+                                           MYSQL_TYPE_LONGLONG));
+    } else {
+      fields.push_back(
+          new Item_empty_string(columns[i].name, columns[i].length));
+    }
   }
 
   if (thd->send_result_metadata(

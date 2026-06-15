@@ -1,0 +1,12 @@
+--source include/have_debug.inc
+
+SET SESSION debug='+d,preserve_trx_inject_observable_record';
+
+SELECT TOKEN, USER, HOST, STATE, ISOLATION, BINLOG_STATE, TEMP_TABLE_STATE,
+       LAST_ERROR
+  FROM performance_schema.preserved_transactions
+  ORDER BY TOKEN;
+
+SHOW PRESERVED TRANSACTIONS;
+
+SET SESSION debug='-d,preserve_trx_inject_observable_record';
