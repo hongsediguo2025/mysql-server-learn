@@ -116,7 +116,7 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 | `mysql-test/suite/preserve_trx/t/implicit_lock_materialize_limits.test` | `mysql-test/suite/preserve_trx/r/implicit_lock_materialize_limits.result` | Batch 2 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/implicit_lock_materialize_secondary_index.test` | `mysql-test/suite/preserve_trx/r/implicit_lock_materialize_secondary_index.result` | Batch 2 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/implicit_lock_scan_budget_debug.test` | `mysql-test/suite/preserve_trx/r/implicit_lock_scan_budget_debug.result` | Batch 2 | pending | Verify source expectation before moving. |
-| `mysql-test/suite/preserve_trx/t/key_permission_reject.test` | `mysql-test/suite/preserve_trx/r/key_permission_reject.result` | Batch 1 | pending | Verify source expectation before moving. |
+| `mysql-test/suite/preserve_trx/t/key_permission_reject.test` | `mysql-test/suite/preserve_trx/r/key_permission_reject.result` | Batch 1 | ported | RED failed because `--validate-config --preserve-trx-enable=ON` accepted a too-open `.key`; GREEN passed debug/release normal and release `--skip-log-bin` on 2026-06-16. Includes 8.0.22 staging cleanup line. |
 | `mysql-test/suite/preserve_trx/t/key_rotation.test` | `mysql-test/suite/preserve_trx/r/key_rotation.result` | Batch 1 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/kill_connection_after_token_delivery_pending.test` | `mysql-test/suite/preserve_trx/r/kill_connection_after_token_delivery_pending.result` | Batch 1 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/kill_connection_during_preserve.test` | `mysql-test/suite/preserve_trx/r/kill_connection_during_preserve.result` | Batch 3 | pending | Verify source expectation before moving. |
@@ -361,7 +361,7 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 | `mysql-test/suite/preserve_trx/r/implicit_lock_materialize_limits.result` | Batch 2 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/implicit_lock_materialize_secondary_index.result` | Batch 2 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/implicit_lock_scan_budget_debug.result` | Batch 2 | pending | Must match the paired test or owning non-preserve suite test. |
-| `mysql-test/suite/preserve_trx/r/key_permission_reject.result` | Batch 1 | pending | Must match the paired test or owning non-preserve suite test. |
+| `mysql-test/suite/preserve_trx/r/key_permission_reject.result` | Batch 1 | ported | Paired with ported `key_permission_reject.test`; includes 8.0.22 staging cleanup line. |
 | `mysql-test/suite/preserve_trx/r/key_rotation.result` | Batch 1 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/kill_connection_after_token_delivery_pending.result` | Batch 1 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/kill_connection_during_preserve.result` | Batch 3 | pending | Must match the paired test or owning non-preserve suite test. |

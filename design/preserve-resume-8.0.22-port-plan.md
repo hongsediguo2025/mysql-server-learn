@@ -232,7 +232,11 @@ Progress notes:
   bound `.key` creation/validation support in the 8.0.22 shell. RED was
   `snapshot_format` failing on missing `preserve_trx_dir`; GREEN passed
   debug/release targeted MTR with normal binlog and release `--skip-log-bin`.
-- This first slice does not claim full carrier, token ACL/redaction, or empty
+- 2026-06-16: second Batch 1 RED/GREEN slice added startup/validate-config key
+  permission rejection. RED was `key_permission_reject` accepting a too-open
+  `.key`; GREEN passed debug/release targeted MTR with normal binlog and
+  release `--skip-log-bin`.
+- These current slices do not claim full carrier, token ACL/redaction, or empty
   P_S registration. Those remain in Batch 1.
 - Because the current 8.0.22 port is still an unsupported shell, it keeps
   `preserve_trx_enable` default OFF as a staging guard. The final release

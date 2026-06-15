@@ -762,6 +762,7 @@
 #include "sql/partitioning/partition_handler.h"  // partitioning_init
 #include "sql/persisted_variable.h"              // Persisted_variables_cache
 #include "sql/plugin_table.h"
+#include "sql/preserve_trx.h"
 #include "sql/protocol.h"
 #include "sql/psi_memory_key.h"  // key_memory_MYSQL_RELAY_LOG_index
 #include "sql/query_options.h"
@@ -6149,6 +6150,13 @@ static int init_server_components() {
                        mysqld_get_one_option))
       unireg_abort(MYSQLD_ABORT_EXIT);
     my_getopt_skip_unknown = saved_getopt_skip_unknown;
+  }
+
+  if (!opt_initialize && preserve_trx_enable &&
+      preserved_trx_validate_snapshot_support(!is_help_or_validate_option())) {
+    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+           "preserve_trx_enable=ON requires valid snapshot support");
+    unireg_abort(MYSQLD_ABORT_EXIT);
   }
 
   if (is_help_or_validate_option()) unireg_abort(MYSQLD_SUCCESS_EXIT);

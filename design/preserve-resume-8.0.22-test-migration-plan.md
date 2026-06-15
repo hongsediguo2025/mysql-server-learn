@@ -90,6 +90,11 @@ Tests:
   test keeps the source branch idempotent `SET ...=ON` checks and adds a final
   `SET ...=OFF` cleanup until the default-ON release-contract batch flips the
   suite default.
+- `key_permission_reject.test` - ported as the second Batch 1 RED/GREEN
+  slice. The test validates that a too-open `.key` is rejected by
+  `--validate-config --preserve-trx-enable=ON`, then restores the key and
+  checks idempotent enablement. As with `snapshot_format`, the 8.0.22 staging
+  shell adds a final `SET ...=OFF` cleanup.
 - `token_redaction.test`;
 - `token_visibility_redaction.test`;
 - `validation_and_privileges.test`;
@@ -102,6 +107,11 @@ Evidence:
 - 2026-06-16 GREEN debug: Batch 0 targeted set plus `snapshot_format` passed.
 - 2026-06-16 GREEN release: Batch 0 targeted set plus `snapshot_format`
   passed with normal binlog and with `--skip-log-bin`.
+- 2026-06-16 RED: `key_permission_reject` failed because
+  `--validate-config --preserve-trx-enable=ON` succeeded with a too-open key.
+- 2026-06-16 GREEN debug/release: Batch 0 targeted set plus
+  `snapshot_format` and `key_permission_reject` passed in debug, release, and
+  release `--skip-log-bin`.
 
 ## Batch 2 Tests
 

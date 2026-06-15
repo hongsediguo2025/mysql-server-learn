@@ -162,20 +162,25 @@ Round A:
 - perl mysql-test/mysql-test-run.pl --suite=preserve_trx
   syntax_feature_gate startup_option_validation unsupported_single_instance_guards
   feature_off_normal_transaction_smoke feature_off_binlog_temp_table_smoke
-  snapshot_format --force --parallel=1
-- Result: all 7 tests successful on 2026-06-16 in debug and release.
+  snapshot_format key_permission_reject --force --parallel=1
+- Result: all 8 tests successful on 2026-06-16 in debug and release.
 - perl mysql-test/mysql-test-run.pl --suite=preserve_trx
   syntax_feature_gate startup_option_validation unsupported_single_instance_guards
   feature_off_normal_transaction_smoke feature_off_binlog_temp_table_smoke
-  snapshot_format --skip-log-bin --force --parallel=1
-- Result: all 7 tests successful on 2026-06-16 in release.
+  snapshot_format key_permission_reject --skip-log-bin --force --parallel=1
+- Result: all 8 tests successful on 2026-06-16 in release.
 Round B:
 - RED: `snapshot_format` failed before code migration with
   `Unknown system variable 'preserve_trx_dir'`.
 - GREEN: `snapshot_format` passed in debug and release after adding
   `preserve_trx_dir` and bound `.key` creation/validation support.
+- RED: `key_permission_reject` failed because
+  `--validate-config --preserve-trx-enable=ON` accepted a too-open `.key`.
+- GREEN: `key_permission_reject` passed in debug and release after adding
+  startup/validate-config snapshot support preflight.
 Conflict/overlap disposition:
-- Touched SQL sysvar registration and the 8.0.22 shell `sql/preserve_trx.cc`.
+- Touched SQL sysvar registration, the 8.0.22 shell `sql/preserve_trx.cc`,
+  and `sql/mysqld.cc` startup/validate-config option validation.
   This slice deliberately does not claim full carrier, token ACL, or P_S
   migration.
 Reviewer A:
