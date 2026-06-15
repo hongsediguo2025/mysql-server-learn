@@ -396,6 +396,17 @@ Feature-off check:
 - `m_server_idle`, packet read, command read, and prepared statement dispatch
   must behave like unmodified 8.0.22 when disabled.
 
+Current 8.0.22 port status:
+
+- 2026-06-16: ported the DRAIN syntax/feature-gate shell through
+  `batch_drain_syntax_feature_gate`. RED was
+  `DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 NO USER VARS` failing as SQL
+  syntax; GREEN passed debug/release normal and `--skip-log-bin` after adding
+  8.0.22-compatible DRAIN/PREPARE option parsing and owner active-transaction
+  invalid-state classification. This is parser and command-shell coverage
+  only; target discovery, quiesce, context switching, cleanup, and all
+  all-or-nothing runtime behavior remain Batch 4 work.
+
 ## Batch 5: Binlog Cache And Warm-Copy
 
 Goal: port binlog four-state model, cache sidecars, and two-phase warm-copy

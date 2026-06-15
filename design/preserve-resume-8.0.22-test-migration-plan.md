@@ -287,12 +287,25 @@ Purpose: batch drain session control.
 
 Tests:
 
-- `batch_drain_syntax_feature_gate.test`;
+- `batch_drain_syntax_feature_gate.test` - ported early as an 8.0.22 staging
+  parser/feature-gate shell. It verifies disabled DRAIN commands, DRAIN option
+  syntax, batch-drain sysvars, owner user-lock unsupported classification, and
+  owner active-transaction invalid-state classification. It does not claim real
+  target discovery, quiesce, preserve, token, or restart semantics yet.
 - `batch_drain_single_idle_transaction.test`;
 - `batch_drain_multiple_idle_transactions.test`;
 - `batch_drain_idle_100_sessions.test`;
 - `batch_drain_context_switch_guard.test`;
 - `batch_drain_cleanup_failure_keeps_drain.test`.
+
+Evidence:
+
+- 2026-06-16 RED: `batch_drain_syntax_feature_gate` failed before parser
+  migration because `DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 NO USER VARS`
+  was rejected as SQL syntax.
+- 2026-06-16 GREEN debug/release: `batch_drain_syntax_feature_gate` passed with
+  normal binlog and `--skip-log-bin` after adding 8.0.22-compatible DRAIN
+  option parsing and owner-session invalid-state classification.
 
 ## Batch 5 Tests
 

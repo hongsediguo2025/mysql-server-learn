@@ -1467,6 +1467,11 @@ void warn_about_deprecated_binary(THD *thd)
 
 %type <ulonglong_number>
         ulonglong_num real_ulonglong_num size_number
+        preserve_trx_timeout_num
+
+%type <preserve_trx_options>
+        opt_preserve_trx_with_clauses preserve_trx_with_clause
+        opt_drain_preserve_trx_clauses drain_preserve_trx_clause
 
 %type <lock_type>
         replace_lock_option opt_low_priority insert_lock_option load_data_lock
@@ -2294,6 +2299,7 @@ deallocate_or_drop:
 
 prepare_shutdown_preserve_stmt:
           PREPARE_SYM SHUTDOWN PRESERVE_SYM TRANSACTION_SYM
+          opt_preserve_trx_with_clauses
           {
             Lex->sql_command= SQLCOM_PREPARE_SHUTDOWN_PRESERVE;
           }
@@ -2301,8 +2307,83 @@ prepare_shutdown_preserve_stmt:
 
 drain_transactions_preserve_stmt:
           DRAIN_SYM TRANSACTIONS_SYM PRESERVE_SYM
+          opt_drain_preserve_trx_clauses
           {
             Lex->sql_command= SQLCOM_DRAIN_TRANSACTIONS_PRESERVE;
+          }
+        ;
+
+opt_preserve_trx_with_clauses:
+          /* empty */ { $$.init(); }
+        | opt_preserve_trx_with_clauses preserve_trx_with_clause
+          {
+            $$= $1;
+            if ($$.merge($2))
+            {
+              YYTHD->syntax_error_at(@2);
+              MYSQL_YYABORT;
+            }
+          }
+        ;
+
+opt_drain_preserve_trx_clauses:
+          /* empty */ { $$.init(); }
+        | opt_drain_preserve_trx_clauses drain_preserve_trx_clause
+          {
+            $$= $1;
+            if ($$.merge($2))
+            {
+              YYTHD->syntax_error_at(@2);
+              MYSQL_YYABORT;
+            }
+          }
+        ;
+
+preserve_trx_with_clause:
+          WITH ident preserve_trx_timeout_num
+          {
+            if (!is_identifier($2, "TIMEOUT"))
+            {
+              YYTHD->syntax_error_at(@2);
+              MYSQL_YYABORT;
+            }
+            $$.init();
+            $$.has_timeout= true;
+            $$.timeout_seconds= $3;
+          }
+        | WITH USER ident
+          {
+            if (!is_identifier($3, "VARS"))
+            {
+              YYTHD->syntax_error_at(@3);
+              MYSQL_YYABORT;
+            }
+            $$.init();
+            $$.user_vars_mode= Preserve_trx_parser_user_vars_mode::INCLUDE;
+          }
+        | WITH NO_SYM USER ident
+          {
+            if (!is_identifier($4, "VARS"))
+            {
+              YYTHD->syntax_error_at(@4);
+              MYSQL_YYABORT;
+            }
+            $$.init();
+            $$.user_vars_mode= Preserve_trx_parser_user_vars_mode::EXCLUDE;
+          }
+        ;
+
+drain_preserve_trx_clause:
+          preserve_trx_with_clause
+        | NO_SYM USER ident
+          {
+            if (!is_identifier($3, "VARS"))
+            {
+              YYTHD->syntax_error_at(@3);
+              MYSQL_YYABORT;
+            }
+            $$.init();
+            $$.user_vars_mode= Preserve_trx_parser_user_vars_mode::EXCLUDE;
           }
         ;
 
@@ -12165,6 +12246,12 @@ real_ulonglong_num:
         | ULONGLONG_NUM { int error; $$= (ulonglong) my_strtoll10($1.str, nullptr, &error); }
         | LONG_NUM      { int error; $$= (ulonglong) my_strtoll10($1.str, nullptr, &error); }
         | dec_num_error { MYSQL_YYABORT; }
+        ;
+
+preserve_trx_timeout_num:
+          NUM           { int error; $$= (ulonglong) my_strtoll10($1.str, nullptr, &error); }
+        | LONG_NUM      { int error; $$= (ulonglong) my_strtoll10($1.str, nullptr, &error); }
+        | ULONGLONG_NUM { int error; $$= (ulonglong) my_strtoll10($1.str, nullptr, &error); }
         ;
 
 dec_num_error:

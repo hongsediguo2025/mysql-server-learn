@@ -590,6 +590,18 @@ static bool preserve_trx_handle_prepare_shutdown(THD *thd) {
   return true;
 }
 
+static bool preserve_trx_handle_drain_transactions(THD *thd) {
+  if (thd != nullptr &&
+      (thd->in_active_multi_stmt_transaction() ||
+       (thd->variables.option_bits & OPTION_NOT_AUTOCOMMIT))) {
+    my_error(ER_PRESERVE_TRX_INVALID_STATE, MYF(0));
+    return true;
+  }
+
+  my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+  return true;
+}
+
 bool preserve_trx_execute_command(THD *thd) {
   DBUG_TRACE;
 
@@ -612,8 +624,7 @@ bool preserve_trx_execute_command(THD *thd) {
   }
 
   if (command == SQLCOM_DRAIN_TRANSACTIONS_PRESERVE) {
-    my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
-    return true;
+    return preserve_trx_handle_drain_transactions(thd);
   }
 
   if (command == SQLCOM_RESUME_PRESERVED_TRX) {

@@ -50,7 +50,7 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 | `mysql-test/suite/preserve_trx/t/batch_drain_reattach_cleanup_delete_failure.test` | `mysql-test/suite/preserve_trx/r/batch_drain_reattach_cleanup_delete_failure.result` | Batch 3 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/batch_drain_semantics_matrix.test` | `mysql-test/suite/preserve_trx/r/batch_drain_semantics_matrix.result` | Batch 4 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/batch_drain_single_idle_transaction.test` | `mysql-test/suite/preserve_trx/r/batch_drain_single_idle_transaction.result` | Batch 4 | pending | Verify source expectation before moving. |
-| `mysql-test/suite/preserve_trx/t/batch_drain_syntax_feature_gate.test` | `mysql-test/suite/preserve_trx/r/batch_drain_syntax_feature_gate.result` | Batch 0 | pending | Verify source expectation before moving. |
+| `mysql-test/suite/preserve_trx/t/batch_drain_syntax_feature_gate.test` | `mysql-test/suite/preserve_trx/r/batch_drain_syntax_feature_gate.result` | Batch 0 | ported | 8.0.22 staging parser/feature-gate shell for DRAIN. RED failed on `DRAIN ... WITH TIMEOUT 300 NO USER VARS` syntax; GREEN passed debug/release normal and `--skip-log-bin` on 2026-06-16. Full batch-drain runtime remains Batch 4. |
 | `mysql-test/suite/preserve_trx/t/batch_drain_target_command_blocked.test` | `mysql-test/suite/preserve_trx/r/batch_drain_target_command_blocked.result` | Batch 4 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/batch_drain_target_disconnect_during_quiesce.test` | `mysql-test/suite/preserve_trx/r/batch_drain_target_disconnect_during_quiesce.result` | Batch 4 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/batch_drain_temp_table_100_sessions.test` | `mysql-test/suite/preserve_trx/r/batch_drain_temp_table_100_sessions.result` | Batch 6 | pending | Verify source expectation before moving. |
@@ -305,7 +305,7 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 | `mysql-test/suite/preserve_trx/r/batch_drain_reattach_cleanup_delete_failure.result` | Batch 3 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/batch_drain_semantics_matrix.result` | Batch 4 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/batch_drain_single_idle_transaction.result` | Batch 4 | pending | Must match the paired test or owning non-preserve suite test. |
-| `mysql-test/suite/preserve_trx/r/batch_drain_syntax_feature_gate.result` | Batch 0 | pending | Must match the paired test or owning non-preserve suite test. |
+| `mysql-test/suite/preserve_trx/r/batch_drain_syntax_feature_gate.result` | Batch 0 | ported | Paired with ported `batch_drain_syntax_feature_gate.test`; parser/feature-gate shell only. |
 | `mysql-test/suite/preserve_trx/r/batch_drain_target_command_blocked.result` | Batch 4 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/batch_drain_target_disconnect_during_quiesce.result` | Batch 4 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/batch_drain_temp_table_100_sessions.result` | Batch 6 | pending | Must match the paired test or owning non-preserve suite test. |
