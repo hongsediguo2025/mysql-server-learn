@@ -113,6 +113,9 @@ Tests:
 - `drain_warmcopy_sysvars.test` - added as an 8.0.22 port staging test for
   drain and warm-copy configuration variables. This is a sysvar contract test
   only; it does not claim batch-drain or warm-copy runtime support.
+- `resource_status_vars.test` - added as an 8.0.22 port staging test for
+  warm-copy/resource `SHOW GLOBAL STATUS` names. This is a zero-value status
+  surface test only; runtime producers are later Batch 5/6 work.
 - `token_redaction.test`;
 - `token_visibility_redaction.test`;
 - `validation_and_privileges.test`;
@@ -170,6 +173,14 @@ Evidence:
   `temp_table_enable_sysvar`, `resource_limit_sysvars`, and
   `drain_warmcopy_sysvars` passed in debug, release, and release
   `--skip-log-bin`.
+- 2026-06-16 RED: `resource_status_vars` failed before code migration because
+  `SHOW GLOBAL STATUS` returned no `Preserve_trx_*` rows.
+- 2026-06-16 GREEN debug/release: Batch 0 targeted set plus
+  `snapshot_format`, `key_permission_reject`,
+  `pfs_preserved_transactions_empty`, `core_limit_sysvars`,
+  `temp_table_enable_sysvar`, `resource_limit_sysvars`,
+  `drain_warmcopy_sysvars`, and `resource_status_vars` passed in debug,
+  release, and release `--skip-log-bin`.
 
 ## Batch 2 Tests
 

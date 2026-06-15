@@ -267,6 +267,11 @@ Progress notes:
   unknown `preserve_trx_drain_mode`; GREEN passed debug/release single-test
   MTR. This prepares Batch 4/5 without claiming batch-drain or warm-copy
   runtime behavior.
+- 2026-06-16: added the resource manager foundation and warm-copy/resource
+  `SHOW GLOBAL STATUS` surface. RED was `resource_status_vars` returning no
+  `Preserve_trx_*` status rows; GREEN passed debug/release targeted MTR with
+  normal binlog and release `--skip-log-bin`. Runtime producers remain later
+  Batch 5/6 work.
 - These current slices do not claim full carrier or token ACL/redaction. Those
   remain in Batch 1.
 - Because the current 8.0.22 port is still an unsupported shell, it keeps

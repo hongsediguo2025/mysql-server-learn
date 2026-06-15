@@ -763,6 +763,7 @@
 #include "sql/persisted_variable.h"              // Persisted_variables_cache
 #include "sql/plugin_table.h"
 #include "sql/preserve_trx.h"
+#include "sql/preserve_trx_resource.h"
 #include "sql/protocol.h"
 #include "sql/psi_memory_key.h"  // key_memory_MYSQL_RELAY_LOG_index
 #include "sql/query_options.h"
@@ -8893,6 +8894,81 @@ static int show_slave_open_temp_tables(THD *, SHOW_VAR *var, char *buf) {
   return 0;
 }
 
+static int show_preserve_trx_warmcopy_prefix_bytes(THD *, SHOW_VAR *var,
+                                                   char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_warmcopy_prefix_bytes_status();
+  return 0;
+}
+
+static int show_preserve_trx_warmcopy_digest_bytes(THD *, SHOW_VAR *var,
+                                                   char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_warmcopy_digest_bytes_status();
+  return 0;
+}
+
+static int show_preserve_trx_warmcopy_durable_bytes(THD *, SHOW_VAR *var,
+                                                    char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_warmcopy_durable_bytes_status();
+  return 0;
+}
+
+static int show_preserve_trx_warmcopy_provider_full_copy_to_count(
+    THD *, SHOW_VAR *var, char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_warmcopy_provider_full_copy_to_count_status();
+  return 0;
+}
+
+static int show_preserve_trx_warmcopy_phase2_pause_us(THD *, SHOW_VAR *var,
+                                                      char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_warmcopy_phase2_pause_us_status();
+  return 0;
+}
+
+static int show_preserve_trx_memory_current_bytes(THD *, SHOW_VAR *var,
+                                                  char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) = (long long)preserve_trx_memory_current_bytes_status();
+  return 0;
+}
+
+static int show_preserve_trx_memory_peak_bytes(THD *, SHOW_VAR *var,
+                                               char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) = (long long)preserve_trx_memory_peak_bytes_status();
+  return 0;
+}
+
+static int show_preserve_trx_spill_bytes(THD *, SHOW_VAR *var, char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) = (long long)preserve_trx_spill_bytes_status();
+  return 0;
+}
+
+static int show_preserve_trx_spill_failures(THD *, SHOW_VAR *var, char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) = (long long)preserve_trx_spill_failures_status();
+  return 0;
+}
+
 /*
   Variables shown by SHOW STATUS in alphabetical order
 */
@@ -8924,6 +9000,31 @@ SHOW_VAR status_vars[] = {
      SHOW_LONG, SHOW_SCOPE_GLOBAL},
     {"Binlog_stmt_cache_use", (char *)&binlog_stmt_cache_use, SHOW_LONG,
      SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_memory_current_bytes",
+     (char *)&show_preserve_trx_memory_current_bytes, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_memory_peak_bytes",
+     (char *)&show_preserve_trx_memory_peak_bytes, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_spill_bytes", (char *)&show_preserve_trx_spill_bytes,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_spill_failures",
+     (char *)&show_preserve_trx_spill_failures, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_warmcopy_digest_bytes",
+     (char *)&show_preserve_trx_warmcopy_digest_bytes, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_warmcopy_durable_bytes",
+     (char *)&show_preserve_trx_warmcopy_durable_bytes, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_warmcopy_phase2_pause_us",
+     (char *)&show_preserve_trx_warmcopy_phase2_pause_us, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_warmcopy_prefix_bytes",
+     (char *)&show_preserve_trx_warmcopy_prefix_bytes, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_warmcopy_provider_full_copy_to_count",
+     (char *)&show_preserve_trx_warmcopy_provider_full_copy_to_count,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Bytes_received", (char *)offsetof(System_status_var, bytes_received),
      SHOW_LONGLONG_STATUS, SHOW_SCOPE_ALL},
     {"Bytes_sent", (char *)offsetof(System_status_var, bytes_sent),

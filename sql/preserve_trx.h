@@ -24,6 +24,8 @@
 #ifndef SQL_PRESERVE_TRX_INCLUDED
 #define SQL_PRESERVE_TRX_INCLUDED
 
+#include <cstdint>
+
 #include "my_inttypes.h"
 
 class THD;
@@ -66,5 +68,15 @@ bool preserve_trx_execute_command(THD *thd);
 const char *preserved_trx_dir_value();
 bool preserved_trx_ensure_snapshot_support();
 bool preserved_trx_validate_snapshot_support(bool allow_create_missing);
+ulonglong preserve_trx_warmcopy_prefix_bytes_status();
+ulonglong preserve_trx_warmcopy_digest_bytes_status();
+ulonglong preserve_trx_warmcopy_durable_bytes_status();
+ulonglong preserve_trx_warmcopy_provider_full_copy_to_count_status();
+ulonglong preserve_trx_warmcopy_phase2_pause_us_status();
+void preserve_trx_warmcopy_note_prefix_bytes(uint64_t bytes);
+void preserve_trx_warmcopy_note_digest_bytes(uint64_t bytes);
+void preserve_trx_warmcopy_note_durable_bytes(uint64_t bytes);
+void preserve_trx_warmcopy_note_provider_full_copy_to();
+void preserve_trx_warmcopy_note_phase2_pause_us(uint64_t phase2_pause_us);
 
 #endif /* SQL_PRESERVE_TRX_INCLUDED */

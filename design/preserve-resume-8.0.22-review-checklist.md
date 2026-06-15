@@ -230,6 +230,20 @@ Additional drain/warm-copy sysvars slice evidence:
 - Scope is configuration surface only. It does not claim batch drain,
   warm-copy admission, mirror, lease ownership, or binlog-cache sidecar
   behavior.
+
+Additional resource status/resource-manager slice evidence:
+- RED: `resource_status_vars` failed before code migration because
+  `SHOW GLOBAL STATUS` returned no `Preserve_trx_*` rows.
+- GREEN: debug and release builds passed after adding `sql/preserve_trx_resource.*`,
+  registering it in SQL CMake, moving memory/spill sysvar storage into the
+  resource manager, and adding warm-copy/resource status functions.
+- Single-test MTR `resource_status_vars` passed in debug and release on
+  2026-06-16.
+- Targeted preserve set with `resource_status_vars` added: all 14 tests
+  successful on 2026-06-16 in debug, release, and release `--skip-log-bin`.
+- Scope is foundation and zero-value status surface only. It does not claim
+  temp image streaming, spill writer integration, warm-copy byte accounting, or
+  resource admission decisions are wired into runtime paths.
 ```
 
 Review findings summary:

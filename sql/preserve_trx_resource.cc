@@ -1,0 +1,247 @@
+/* Copyright (c) 2026, Oracle and/or its affiliates.
+
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is designed to work with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have either included with
+   the program or referenced in the documentation.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License, version 2.0, for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software
+   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
+
+#include "sql/preserve_trx_resource.h"
+
+#include <algorithm>
+#include <map>
+#include <mutex>
+#include <utility>
+
+ulonglong preserve_trx_memory_budget_bytes = 256ULL * 1024ULL * 1024ULL;
+ulonglong preserve_trx_memory_per_token_bytes = 64ULL * 1024ULL * 1024ULL;
+uint preserve_trx_spill_chunk_bytes = 4U * 1024U * 1024U;
+
+namespace {
+
+struct Token_kind_key {
+  std::string token;
+  Preserve_trx_memory_kind kind{Preserve_trx_memory_kind::SNAPSHOT_CODEC_BUFFER};
+
+  bool operator<(const Token_kind_key &other) const {
+    if (token != other.token) return token < other.token;
+    return static_cast<int>(kind) < static_cast<int>(other.kind);
+  }
+};
+
+class Preserve_resource_manager {
+ public:
+  bool acquire(const std::string &token, Preserve_trx_memory_kind kind,
+               uint64_t bytes) {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    if (token.empty()) return false;
+    const uint64_t global_budget = preserve_trx_memory_budget_bytes;
+    const uint64_t per_token_budget = preserve_trx_memory_per_token_bytes;
+    if (bytes > global_budget || bytes > per_token_budget) return false;
+    if (m_current_bytes > global_budget - bytes) return false;
+
+    const uint64_t token_bytes = m_by_token[token];
+    if (token_bytes > per_token_budget - bytes) return false;
+
+    m_current_bytes += bytes;
+    m_peak_bytes = std::max(m_peak_bytes, m_current_bytes);
+    m_by_token[token] = token_bytes + bytes;
+    m_by_token_kind[{token, kind}] += bytes;
+    return true;
+  }
+
+  void release(const std::string &token, Preserve_trx_memory_kind kind,
+               uint64_t bytes) {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    if (token.empty()) return;
+    if (bytes > m_current_bytes) {
+      m_current_bytes = 0;
+    } else {
+      m_current_bytes -= bytes;
+    }
+
+    auto token_it = m_by_token.find(token);
+    if (token_it != m_by_token.end()) {
+      if (bytes >= token_it->second) {
+        m_by_token.erase(token_it);
+      } else {
+        token_it->second -= bytes;
+      }
+    }
+
+    Token_kind_key key{token, kind};
+    auto kind_it = m_by_token_kind.find(key);
+    if (kind_it != m_by_token_kind.end()) {
+      if (bytes >= kind_it->second) {
+        m_by_token_kind.erase(kind_it);
+      } else {
+        kind_it->second -= bytes;
+      }
+    }
+  }
+
+  void note_spill_bytes(uint64_t bytes) {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    m_spill_bytes += bytes;
+  }
+
+  void note_spill_failure() {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    ++m_spill_failures;
+  }
+
+  ulonglong current_bytes() const {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    return static_cast<ulonglong>(m_current_bytes);
+  }
+
+  ulonglong peak_bytes() const {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    return static_cast<ulonglong>(m_peak_bytes);
+  }
+
+  ulonglong spill_bytes() const {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    return static_cast<ulonglong>(m_spill_bytes);
+  }
+
+  ulonglong spill_failures() const {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    return static_cast<ulonglong>(m_spill_failures);
+  }
+
+  void reset_for_unit_test() {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    m_current_bytes = 0;
+    m_peak_bytes = 0;
+    m_spill_bytes = 0;
+    m_spill_failures = 0;
+    m_by_token.clear();
+    m_by_token_kind.clear();
+  }
+
+ private:
+  mutable std::mutex m_mutex;
+  uint64_t m_current_bytes{0};
+  uint64_t m_peak_bytes{0};
+  uint64_t m_spill_bytes{0};
+  uint64_t m_spill_failures{0};
+  std::map<std::string, uint64_t> m_by_token;
+  std::map<Token_kind_key, uint64_t> m_by_token_kind;
+};
+
+Preserve_resource_manager g_preserve_resource_manager;
+
+}  // namespace
+
+Preserve_memory_lease::Preserve_memory_lease(
+    std::string token, Preserve_trx_memory_kind kind, uint64_t bytes,
+    bool acquired)
+    : m_token(std::move(token)),
+      m_kind(kind),
+      m_bytes(bytes),
+      m_acquired(acquired) {}
+
+Preserve_memory_lease::Preserve_memory_lease(
+    Preserve_memory_lease &&other) noexcept
+    : m_token(std::move(other.m_token)),
+      m_kind(other.m_kind),
+      m_bytes(other.m_bytes),
+      m_acquired(other.m_acquired) {
+  other.m_bytes = 0;
+  other.m_acquired = false;
+}
+
+Preserve_memory_lease &Preserve_memory_lease::operator=(
+    Preserve_memory_lease &&other) noexcept {
+  if (this != &other) {
+    release();
+    m_token = std::move(other.m_token);
+    m_kind = other.m_kind;
+    m_bytes = other.m_bytes;
+    m_acquired = other.m_acquired;
+    other.m_bytes = 0;
+    other.m_acquired = false;
+  }
+  return *this;
+}
+
+Preserve_memory_lease::~Preserve_memory_lease() { release(); }
+
+void Preserve_memory_lease::release() {
+  if (!m_acquired) return;
+  g_preserve_resource_manager.release(m_token, m_kind, m_bytes);
+  m_bytes = 0;
+  m_acquired = false;
+}
+
+Preserve_memory_lease preserve_trx_acquire_memory_lease(
+    const std::string &token, Preserve_trx_memory_kind kind, uint64_t bytes) {
+  if (!g_preserve_resource_manager.acquire(token, kind, bytes)) {
+    return Preserve_memory_lease(token, kind, bytes, false);
+  }
+  return Preserve_memory_lease(token, kind, bytes, true);
+}
+
+bool preserve_trx_resource_acquire_memory(const std::string &token,
+                                          Preserve_trx_memory_kind kind,
+                                          uint64_t bytes) {
+  return g_preserve_resource_manager.acquire(token, kind, bytes);
+}
+
+void preserve_trx_resource_release_memory(const std::string &token,
+                                          Preserve_trx_memory_kind kind,
+                                          uint64_t bytes) {
+  g_preserve_resource_manager.release(token, kind, bytes);
+}
+
+void preserve_trx_resource_note_spill_bytes(uint64_t bytes) {
+  g_preserve_resource_manager.note_spill_bytes(bytes);
+}
+
+void preserve_trx_resource_note_spill_failure() {
+  g_preserve_resource_manager.note_spill_failure();
+}
+
+ulonglong preserve_trx_memory_current_bytes_status() {
+  return g_preserve_resource_manager.current_bytes();
+}
+
+ulonglong preserve_trx_memory_peak_bytes_status() {
+  return g_preserve_resource_manager.peak_bytes();
+}
+
+ulonglong preserve_trx_spill_bytes_status() {
+  return g_preserve_resource_manager.spill_bytes();
+}
+
+ulonglong preserve_trx_spill_failures_status() {
+  return g_preserve_resource_manager.spill_failures();
+}
+
+void preserve_trx_resource_manager_reset_for_unit_test() {
+  g_preserve_resource_manager.reset_for_unit_test();
+}
+
+void preserve_trx_resource_manager_set_limits_for_unit_test(
+    const Preserve_trx_resource_limits &limits) {
+  preserve_trx_memory_budget_bytes =
+      static_cast<ulonglong>(limits.global_memory_budget_bytes);
+  preserve_trx_memory_per_token_bytes =
+      static_cast<ulonglong>(limits.per_token_memory_budget_bytes);
+}

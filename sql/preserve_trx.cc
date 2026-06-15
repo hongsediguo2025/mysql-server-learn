@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -64,9 +65,6 @@ uint preserve_trx_recovery_grace_seconds = 120;
 ulonglong preserve_trx_max_snapshot_bytes = 16777216;
 ulonglong preserve_trx_max_binlog_cache_bytes = 1073741824;
 ulonglong preserve_trx_max_temp_sidecar_bytes = 1073741824;
-ulonglong preserve_trx_memory_budget_bytes = 268435456;
-ulonglong preserve_trx_memory_per_token_bytes = 67108864;
-uint preserve_trx_spill_chunk_bytes = 4194304;
 ulonglong preserve_trx_single_phase_max_binlog_cache_bytes = ULLONG_MAX;
 uint preserve_trx_max_lock_count = 2000;
 uint preserve_trx_max_modified_tables = 64;
@@ -85,6 +83,12 @@ constexpr size_t kPreservedTrxBoundKeyLength =
     kPreservedTrxBoundKeyMagic.size() + 2 +
     kPreservedTrxKeyServerUuidLength + kPreservedTrxSha256Length +
     kPreservedTrxKeyLength;
+
+std::atomic<ulonglong> g_warmcopy_prefix_bytes{0};
+std::atomic<ulonglong> g_warmcopy_digest_bytes{0};
+std::atomic<ulonglong> g_warmcopy_durable_bytes{0};
+std::atomic<ulonglong> g_warmcopy_provider_full_copy_to_count{0};
+std::atomic<ulonglong> g_warmcopy_phase2_pause_us{0};
 
 enum class Preserve_key_status { OK, MISSING, CORRUPT, IO_ERROR };
 
@@ -401,6 +405,46 @@ bool preserved_trx_validate_snapshot_support(bool allow_create_missing) {
 
 bool preserved_trx_ensure_snapshot_support() {
   return !preserved_trx_validate_snapshot_support(true);
+}
+
+void preserve_trx_warmcopy_note_prefix_bytes(uint64_t bytes) {
+  g_warmcopy_prefix_bytes.fetch_add(bytes);
+}
+
+void preserve_trx_warmcopy_note_digest_bytes(uint64_t bytes) {
+  g_warmcopy_digest_bytes.fetch_add(bytes);
+}
+
+void preserve_trx_warmcopy_note_durable_bytes(uint64_t bytes) {
+  g_warmcopy_durable_bytes.fetch_add(bytes);
+}
+
+void preserve_trx_warmcopy_note_provider_full_copy_to() {
+  g_warmcopy_provider_full_copy_to_count.fetch_add(1);
+}
+
+void preserve_trx_warmcopy_note_phase2_pause_us(uint64_t phase2_pause_us) {
+  g_warmcopy_phase2_pause_us.fetch_add(phase2_pause_us);
+}
+
+ulonglong preserve_trx_warmcopy_prefix_bytes_status() {
+  return g_warmcopy_prefix_bytes.load();
+}
+
+ulonglong preserve_trx_warmcopy_digest_bytes_status() {
+  return g_warmcopy_digest_bytes.load();
+}
+
+ulonglong preserve_trx_warmcopy_durable_bytes_status() {
+  return g_warmcopy_durable_bytes.load();
+}
+
+ulonglong preserve_trx_warmcopy_provider_full_copy_to_count_status() {
+  return g_warmcopy_provider_full_copy_to_count.load();
+}
+
+ulonglong preserve_trx_warmcopy_phase2_pause_us_status() {
+  return g_warmcopy_phase2_pause_us.load();
 }
 
 bool preserve_trx_execute_command(THD *) {
