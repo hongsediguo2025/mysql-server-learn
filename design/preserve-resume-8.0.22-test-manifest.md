@@ -198,7 +198,7 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 | `mysql-test/suite/preserve_trx/t/savepoint_mdl_ordinal.test` | `mysql-test/suite/preserve_trx/r/savepoint_mdl_ordinal.result` | Batch 2 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/savepoint_rollback_to.test` | `mysql-test/suite/preserve_trx/r/savepoint_rollback_to.result` | Batch 2 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/sigterm_during_preserve_shutdown.test` | `mysql-test/suite/preserve_trx/r/sigterm_during_preserve_shutdown.result` | Batch 7 | pending | Verify source expectation before moving. |
-| `mysql-test/suite/preserve_trx/t/snapshot_format.test` | `mysql-test/suite/preserve_trx/r/snapshot_format.result` | Batch 1 | pending | Verify source expectation before moving. |
+| `mysql-test/suite/preserve_trx/t/snapshot_format.test` | `mysql-test/suite/preserve_trx/r/snapshot_format.result` | Batch 1 | ported | RED failed on missing `preserve_trx_dir`; GREEN passed debug/release normal and release `--skip-log-bin` on 2026-06-16. Staging cleanup keeps `preserve_trx_enable` OFF until the default-ON release-contract batch. |
 | `mysql-test/suite/preserve_trx/t/snapshot_size_limit.test` | `mysql-test/suite/preserve_trx/r/snapshot_size_limit.result` | Batch 1 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/sql_surface_review_guards.test` | `mysql-test/suite/preserve_trx/r/sql_surface_review_guards.result` | Batch 7 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/startup_option_validation.test` | `mysql-test/suite/preserve_trx/r/startup_option_validation.result` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed in shell mode; validates option parsing only, not final default-ON startup preflight. |
@@ -443,7 +443,7 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 | `mysql-test/suite/preserve_trx/r/savepoint_mdl_ordinal.result` | Batch 2 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/savepoint_rollback_to.result` | Batch 2 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/sigterm_during_preserve_shutdown.result` | Batch 7 | pending | Must match the paired test or owning non-preserve suite test. |
-| `mysql-test/suite/preserve_trx/r/snapshot_format.result` | Batch 1 | pending | Must match the paired test or owning non-preserve suite test. |
+| `mysql-test/suite/preserve_trx/r/snapshot_format.result` | Batch 1 | ported | Paired with ported `snapshot_format.test`; includes 8.0.22 staging cleanup line. |
 | `mysql-test/suite/preserve_trx/r/snapshot_size_limit.result` | Batch 1 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/sql_surface_review_guards.result` | Batch 7 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/startup_option_validation.result` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed with paired test. |

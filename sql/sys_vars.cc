@@ -1018,6 +1018,30 @@ static Sys_var_bool Sys_partial_revokes(
     ON_CHECK(check_partial_revokes), ON_UPDATE(partial_revokes_update), nullptr,
     sys_var::PARSE_EARLY);
 
+class Sys_var_preserve_trx_dir final : public Sys_var_charptr_func {
+ public:
+  Sys_var_preserve_trx_dir()
+      : Sys_var_charptr_func(
+            "preserve_trx_dir",
+            "Directory used for preserved transaction snapshot files.",
+            GLOBAL) {
+    is_os_charset = true;
+  }
+
+  const uchar *global_value_ptr(THD *, LEX_STRING *) override {
+    return pointer_cast<const uchar *>(preserved_trx_dir_value());
+  }
+};
+
+static Sys_var_preserve_trx_dir Sys_preserve_trx_dir;
+
+static bool check_preserve_trx_enable(sys_var *, THD *, set_var *var) {
+  if (var->save_result.ulonglong_value == 0) return false;
+  if (preserved_trx_ensure_snapshot_support()) return false;
+  my_error(ER_WRONG_ARGUMENTS, MYF(0), "SET");
+  return true;
+}
+
 static bool fix_binlog_cache_size(sys_var *, THD *thd, enum_var_type) {
   check_binlog_cache_size(thd);
   return false;
@@ -1293,7 +1317,8 @@ static Sys_var_bool Sys_preserve_trx_enable(
     "Enable resumable transactions across shutdown. In this 8.0.22 port "
     "batch the variable gates syntax only; preserve/resume operations return "
     "unsupported when enabled.",
-    GLOBAL_VAR(preserve_trx_enable), CMD_LINE(OPT_ARG), DEFAULT(false));
+    GLOBAL_VAR(preserve_trx_enable), CMD_LINE(OPT_ARG), DEFAULT(false),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(check_preserve_trx_enable));
 
 static Sys_var_enum Sys_binlog_format(
     "binlog_format",

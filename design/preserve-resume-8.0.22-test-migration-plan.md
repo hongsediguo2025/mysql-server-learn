@@ -85,11 +85,23 @@ Purpose: snapshot, token, bundle/carrier, and empty P_S.
 
 Tests:
 
-- `snapshot_format.test`;
+- `snapshot_format.test` - ported as the first Batch 1 RED/GREEN slice. The
+  8.0.22 staging shell still defaults `preserve_trx_enable=OFF`, so the ported
+  test keeps the source branch idempotent `SET ...=ON` checks and adds a final
+  `SET ...=OFF` cleanup until the default-ON release-contract batch flips the
+  suite default.
 - `token_redaction.test`;
 - `token_visibility_redaction.test`;
 - `validation_and_privileges.test`;
 - bundle/carrier gunit.
+
+Evidence:
+
+- 2026-06-16 RED: `snapshot_format` failed before code migration with
+  `Unknown system variable 'preserve_trx_dir'`.
+- 2026-06-16 GREEN debug: Batch 0 targeted set plus `snapshot_format` passed.
+- 2026-06-16 GREEN release: Batch 0 targeted set plus `snapshot_format`
+  passed with normal binlog and with `--skip-log-bin`.
 
 ## Batch 2 Tests
 

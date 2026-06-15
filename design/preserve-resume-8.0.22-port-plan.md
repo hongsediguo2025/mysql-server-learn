@@ -226,6 +226,19 @@ Implementation scope:
 - key management and token helpers;
 - empty `performance_schema.preserved_transactions` registration.
 
+Progress notes:
+
+- 2026-06-16: first Batch 1 RED/GREEN slice landed `preserve_trx_dir` and
+  bound `.key` creation/validation support in the 8.0.22 shell. RED was
+  `snapshot_format` failing on missing `preserve_trx_dir`; GREEN passed
+  debug/release targeted MTR with normal binlog and release `--skip-log-bin`.
+- This first slice does not claim full carrier, token ACL/redaction, or empty
+  P_S registration. Those remain in Batch 1.
+- Because the current 8.0.22 port is still an unsupported shell, it keeps
+  `preserve_trx_enable` default OFF as a staging guard. The final release
+  contract remains default ON and must be flipped in the explicit default-ON
+  batch.
+
 ## Batch 2: Single Transaction Preserve/Resume
 
 Goal: close the single transaction preserve/restart/resume loop.

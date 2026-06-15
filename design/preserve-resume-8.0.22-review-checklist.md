@@ -77,10 +77,10 @@ Commit:
 - [x] `git diff --check` passed.
 - [x] `git status --short` reviewed.
 - [x] `git branch --show-current` verified target branch.
-- [ ] `git diff --name-only --cached` reviewed for batch scope.
+- [x] `git diff --name-only --cached` reviewed for batch scope.
 - [ ] 3 independent sub-agent reviews completed.
 - [ ] All Blocker/Major review findings fixed or rejected with evidence.
-- [ ] Batch commit created.
+- [x] Batch commit created.
 
 Review findings summary:
 
@@ -126,7 +126,74 @@ Resolution:
 - The second debug build failure was an 8.0.22 include layout difference:
   `my_error()` is declared by `my_sys.h`, not `my_error.h`.
 Commit:
+- `634f4ad0a22 Port preserve resume SQL shell to 8.0.22`.
+```
+
+### Batch 1: snapshot directory and bound key first slice
+
+- [x] Test inventory updated.
+- [x] Code inventory updated.
+- [ ] Commit manifest rows updated.
+- [x] Test manifest rows updated.
+- [x] Round A feature-off / unsupported targeted MTR passed in debug.
+- [x] Round A feature-off / unsupported targeted MTR passed in release.
+- [x] Round B RED was observed and recorded, or `N/A with reason` for Batch 0.
+- [x] Round B GREEN passed in debug, or `N/A with reason` for Batch 0.
+- [x] Round B GREEN passed in release, or `N/A with reason` for Batch 0.
+- [x] Touched explicit conflict files reviewed.
+- [x] Touched changed-both files reviewed.
+- [x] Expected-but-untouched conflict/overlap files justified.
+- [x] `git diff --check` passed.
+- [x] `git status --short` reviewed.
+- [x] `git branch --show-current` verified target branch.
+- [x] `git diff --name-only --cached` reviewed for batch scope.
+- [ ] 3 independent sub-agent reviews completed.
+- [ ] All Blocker/Major review findings fixed or rejected with evidence.
+- [x] Batch commit created.
+
+Review findings summary:
+
+```text
+Commands/results:
+Build:
+- cmake --build build-debug --target mysqld mysqltest -- -j4
+- cmake --build build-release --target mysqld mysqltest -- -j4
+Round A:
+- perl mysql-test/mysql-test-run.pl --suite=preserve_trx
+  syntax_feature_gate startup_option_validation unsupported_single_instance_guards
+  feature_off_normal_transaction_smoke feature_off_binlog_temp_table_smoke
+  snapshot_format --force --parallel=1
+- Result: all 7 tests successful on 2026-06-16 in debug and release.
+- perl mysql-test/mysql-test-run.pl --suite=preserve_trx
+  syntax_feature_gate startup_option_validation unsupported_single_instance_guards
+  feature_off_normal_transaction_smoke feature_off_binlog_temp_table_smoke
+  snapshot_format --skip-log-bin --force --parallel=1
+- Result: all 7 tests successful on 2026-06-16 in release.
+Round B:
+- RED: `snapshot_format` failed before code migration with
+  `Unknown system variable 'preserve_trx_dir'`.
+- GREEN: `snapshot_format` passed in debug and release after adding
+  `preserve_trx_dir` and bound `.key` creation/validation support.
+Conflict/overlap disposition:
+- Touched SQL sysvar registration and the 8.0.22 shell `sql/preserve_trx.cc`.
+  This slice deliberately does not claim full carrier, token ACL, or P_S
+  migration.
+Reviewer A:
 - Pending.
+Reviewer B:
+- Pending.
+Reviewer C:
+- Pending.
+Resolution:
+- 8.0.22 uses `Sys_var_charptr_func::global_value_ptr(THD *, LEX_STRING *)`,
+  so the source branch `std::string_view` signature was adapted.
+- 8.0.22 requires `my_thread_local.h` for the `my_errno()` accessor used by
+  mysys file helpers.
+- The port still defaults `preserve_trx_enable=OFF` as a staging guard; the
+  final default-ON release contract remains a later explicit batch.
+Commit:
+- Created in this batch; use `git log --oneline -1` for the final amended
+  commit hash.
 ```
 
 ## Final Review Checklist

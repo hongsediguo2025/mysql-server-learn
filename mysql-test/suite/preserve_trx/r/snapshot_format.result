@@ -1,0 +1,10 @@
+SELECT @@global.preserve_trx_dir = CONCAT(@@global.datadir, 'preserve/') AS default_dir;
+default_dir
+1
+SET GLOBAL preserve_trx_enable=ON;
+preserve dir exists
+.key mode 0600
+.key size 110
+no preserve temp files
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_enable=OFF;

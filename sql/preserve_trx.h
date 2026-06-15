@@ -29,5 +29,8 @@ class THD;
 extern bool preserve_trx_enable;
 
 bool preserve_trx_execute_command(THD *thd);
+const char *preserved_trx_dir_value();
+bool preserved_trx_ensure_snapshot_support();
+bool preserved_trx_validate_snapshot_support(bool allow_create_missing);
 
 #endif /* SQL_PRESERVE_TRX_INCLUDED */
