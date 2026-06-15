@@ -32,7 +32,7 @@ Source stack:
 | `8.0` | `666701570c392a6052341b6ddb9c21869bb1d733` | MySQL 8.0.45 source base |
 | `resumable-trx-across-shutdown` | `58d72034b10b457fd5c4ed220876c943fe7944f5` | Base preserve/resume |
 | `binlog-cache-warmcopy-drain` | `fbf670b36cd43564d29214e69ad594f33c8978b3` | Binlog cache warm-copy drain |
-| `preserve-user-temp-tables` | `0c7fb425f53e6cfcec9f5b7ef9cb85904468d60b` | User temp table support and hardening |
+| `preserve-user-temp-tables` | `b78b96f99f16133f613f22a679dc061ff7fb7917` | User temp table support and hardening |
 | `mysql-8.0.22` | `ee4455a33b10f1b1886044322e4893f587b319ed` | Target backport base |
 
 The source branch stack is based on MySQL 8.0.45 LTS. This target branch starts
@@ -42,22 +42,23 @@ Final cumulative source size relative to `8.0`:
 
 | Metric | Value |
 |---|---:|
-| Commits | 123 |
-| Files changed | 734 |
-| Insertions / deletions | +106,846 / -132 |
-| Core server files | 83 |
-| MTR `.test` files | 239 |
-| Preserve-suite MTR `.result` files | 239 |
-| Total `.result` files changed | 240 |
-| Preserve gunit files | 4 |
-| Python E2E / benchmark scripts | 2 |
-| Python unit test files | 2 |
+| Commits | 137 |
+| Files changed | 1,078 |
+| Insertions / deletions | +160,727 / -262 |
+| Core server files | 87 |
+| Preserve-suite MTR `.test` files | 366 |
+| Preserve-suite MTR `.result` files | 366 |
+| Total `.result` files changed | 369 |
+| Preserve gunit files | 5 |
+| Python E2E / benchmark scripts | 5 |
+| Python unit test files | 4 |
 | Python package marker files | 1 |
 
-The total `.result` count includes the 239 preserve-suite result files plus
-`mysql-test/suite/perfschema/r/dml_handler.result`. The gunit count includes
-`unittest/gunit/innodb/trx0preserve-t.cc` plus the three top-level preserve
-gunit files.
+The total `.result` count includes the 366 preserve-suite result files plus
+three non-preserve-suite result deltas. The gunit count includes
+`unittest/gunit/innodb/trx0preserve-t.cc` plus four top-level preserve gunit
+files. These counts were regenerated from `/Users/a1234/project/mysql-server`
+on 2026-06-16; refresh them again before any final 8.0.22 landing review.
 
 ## Branch Isolation Rules
 
@@ -69,15 +70,15 @@ gunit files.
   test "$(git rev-parse 8.0)" = "666701570c392a6052341b6ddb9c21869bb1d733"
   test "$(git rev-parse resumable-trx-across-shutdown)" = "58d72034b10b457fd5c4ed220876c943fe7944f5"
   test "$(git rev-parse binlog-cache-warmcopy-drain)" = "fbf670b36cd43564d29214e69ad594f33c8978b3"
-  test "$(git rev-parse preserve-user-temp-tables)" = "0c7fb425f53e6cfcec9f5b7ef9cb85904468d60b"
+  test "$(git rev-parse preserve-user-temp-tables)" = "b78b96f99f16133f613f22a679dc061ff7fb7917"
   test "$(git rev-parse mysql-8.0.22)" = "ee4455a33b10f1b1886044322e4893f587b319ed"
   git merge-base --is-ancestor mysql-8.0.22 HEAD
   test "$(git branch --show-current)" = "codex/preserve-resume-8.0.22-port"
   ```
 
 - Read source content through pinned SHAs, for example
-  `git show 0c7fb425f53e6cfcec9f5b7ef9cb85904468d60b:<path>` or
-  `git diff 666701570c392a6052341b6ddb9c21869bb1d733..0c7fb425f53e6cfcec9f5b7ef9cb85904468d60b`.
+  `git show b78b96f99f16133f613f22a679dc061ff7fb7917:<path>` or
+  `git diff 666701570c392a6052341b6ddb9c21869bb1d733..b78b96f99f16133f613f22a679dc061ff7fb7917`.
 - Do not cherry-pick blindly across SQL parser, binlog, XA, or InnoDB state
   machine files. Those areas must be ported function-by-function.
 - Temporary analysis files should go to `/tmp` unless they are intentional
@@ -85,13 +86,16 @@ gunit files.
 
 ## Traceability Manifests
 
-Day 1 creates two machine-reviewable manifests:
+Day 1 created two machine-reviewable manifests. They are historical landing
+artifacts and must be regenerated before a final 8.0.22 landing review because
+the source branch has continued to harden after the original Day 1 snapshot:
 
-- `design/preserve-resume-8.0.22-commit-manifest.md` tracks all 123 source
-  commits with source branch, proposed batch, migration status, and evidence.
-- `design/preserve-resume-8.0.22-test-manifest.md` tracks all 239 preserve MTR
-  `.test` files, all 240 changed `.result` files, all 4 preserve gunit files,
-  and all Python E2E/benchmark/unit-test assets.
+- `design/preserve-resume-8.0.22-commit-manifest.md` must be refreshed to
+  track all 137 source commits with source branch, proposed batch, migration
+  status, and evidence.
+- `design/preserve-resume-8.0.22-test-manifest.md` must be refreshed to track
+  all 366 preserve MTR `.test` files, all 369 changed `.result` files, all 5
+  preserve gunit files, and all Python E2E/benchmark/unit-test assets.
 
 Every batch must update both manifests before commit. Final review fails if any
 row remains `pending` without an explicit `deferred` or `obsolete` reason.
@@ -389,6 +393,25 @@ Implementation scope:
 - SQL `PREPARE SHUTDOWN PRESERVE TRANSACTION`;
 - SQL `RESUME PRESERVED TRANSACTION`;
 - XA adaptation to 8.0.22 `sql/xa.cc` / `sql/xa.h`.
+
+Current 8.0.22 landing status:
+
+- 2026-06-16: added `storage/innobase/include/trx0preserve.h` and
+  `storage/innobase/trx/trx0preserve.cc` to the target tree and linked them
+  into `innobase` as an API-shape shell. The declarations match the current
+  source branch interface used by SQL, drain, recovery, temp-table, and
+  warm-copy code. The implementation intentionally returns `DB_UNSUPPORTED`,
+  empty payloads, or no-op results for real preserve/resume operations.
+- This shell is a compile/link staging point only. It does not implement
+  `TRX_STATE_PRESERVED`, `trx_t::preserve_trx_claimed`, ReadView import/export,
+  lock export/import, implicit-lock materialization, savepoint import/export,
+  undo history activation, no-redo undo handling, or temp tablespace
+  reservation semantics.
+- The next Batch 2 InnoDB slice must port the transaction-state and magic-XID
+  primitives first, then add ReadView, locks, savepoints, and undo integration
+  with behavior tests. Do not relax SQL admission from `DB_UNSUPPORTED` until
+  the corresponding kernel path has both debug/release build evidence and MTR
+  coverage.
 
 ## Batch 3: Recovery And Failure Windows
 

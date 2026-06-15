@@ -310,6 +310,17 @@ Evidence:
 
 Purpose: single transaction preserve/resume core.
 
+Current migration status:
+
+- 2026-06-16: `trx0preserve.h` and a fail-closed `trx0preserve.cc` API shell
+  are build-imported into `innobase`. This is a compile/link prerequisite for
+  later Batch 2 SQL and InnoDB work, not behavioral coverage for the tests
+  below.
+- The current shell keeps read-view, record/table/predicate lock, savepoint,
+  implicit-lock materialization, attach/detach, and rollback/activation paths
+  unsupported. The positive Batch 2 MTR tests must remain pending until those
+  kernel paths are ported with real debug/release behavior evidence.
+
 Tests:
 
 - `basic_resume.test`;
