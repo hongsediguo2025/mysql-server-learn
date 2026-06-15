@@ -217,6 +217,19 @@ Additional resource limit sysvars slice evidence:
 - Scope is configuration surface only. It does not claim memory lease
   accounting, spill backend, temp image streaming, single-phase copy limits, or
   lock materialization enforcement.
+
+Additional drain/warm-copy sysvars slice evidence:
+- RED: `drain_warmcopy_sysvars` failed before code migration with
+  `Unknown system variable 'preserve_trx_drain_mode'`.
+- GREEN: debug and release builds passed after adding drain mode/grace/hard
+  timeout and warm-copy admission/resource sysvars.
+- Single-test MTR `drain_warmcopy_sysvars` passed in debug and release on
+  2026-06-16.
+- Targeted preserve set with `drain_warmcopy_sysvars` added: all 13 tests
+  successful on 2026-06-16 in debug, release, and release `--skip-log-bin`.
+- Scope is configuration surface only. It does not claim batch drain,
+  warm-copy admission, mirror, lease ownership, or binlog-cache sidecar
+  behavior.
 ```
 
 Review findings summary:

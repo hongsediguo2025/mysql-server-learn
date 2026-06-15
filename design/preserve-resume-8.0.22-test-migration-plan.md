@@ -110,6 +110,9 @@ Tests:
 - `resource_limit_sysvars.test` - added as an 8.0.22 port staging test for
   temp sidecar, memory/spill, single-phase binlog-cache, and lock/scan limit
   variables. This is a sysvar contract test only.
+- `drain_warmcopy_sysvars.test` - added as an 8.0.22 port staging test for
+  drain and warm-copy configuration variables. This is a sysvar contract test
+  only; it does not claim batch-drain or warm-copy runtime support.
 - `token_redaction.test`;
 - `token_visibility_redaction.test`;
 - `validation_and_privileges.test`;
@@ -157,6 +160,16 @@ Evidence:
   `pfs_preserved_transactions_empty`, `core_limit_sysvars`,
   `temp_table_enable_sysvar`, and `resource_limit_sysvars` passed in debug,
   release, and release `--skip-log-bin`.
+- 2026-06-16 RED: `drain_warmcopy_sysvars` failed before code migration with
+  `Unknown system variable 'preserve_trx_drain_mode'`.
+- 2026-06-16 GREEN debug/release: `drain_warmcopy_sysvars` passed as a
+  single-test MTR after adding drain and warm-copy sysvars.
+- 2026-06-16 GREEN debug/release: Batch 0 targeted set plus
+  `snapshot_format`, `key_permission_reject`,
+  `pfs_preserved_transactions_empty`, `core_limit_sysvars`,
+  `temp_table_enable_sysvar`, `resource_limit_sysvars`, and
+  `drain_warmcopy_sysvars` passed in debug, release, and release
+  `--skip-log-bin`.
 
 ## Batch 2 Tests
 

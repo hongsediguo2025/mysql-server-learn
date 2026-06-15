@@ -262,6 +262,11 @@ Progress notes:
   materialization limit sysvars as a configuration-surface slice. This prepares
   later carrier/temp-table/resource-manager batches without claiming runtime
   enforcement yet.
+- 2026-06-16: added drain and warm-copy configuration sysvars as a
+  configuration-surface slice. RED was `drain_warmcopy_sysvars` failing on
+  unknown `preserve_trx_drain_mode`; GREEN passed debug/release single-test
+  MTR. This prepares Batch 4/5 without claiming batch-drain or warm-copy
+  runtime behavior.
 - These current slices do not claim full carrier or token ACL/redaction. Those
   remain in Batch 1.
 - Because the current 8.0.22 port is still an unsupported shell, it keeps

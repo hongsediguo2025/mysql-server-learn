@@ -1,0 +1,61 @@
+SELECT
+  @@GLOBAL.preserve_trx_drain_mode AS drain_mode,
+  @@GLOBAL.preserve_trx_drain_grace_ms AS drain_grace_ms,
+  @@GLOBAL.preserve_trx_drain_hard_timeout_ms AS drain_hard_timeout_ms,
+  @@GLOBAL.preserve_trx_warmcopy_enable AS warmcopy_enable,
+  @@GLOBAL.preserve_trx_warmcopy_close_timeout_ms AS warmcopy_close_timeout_ms,
+  @@GLOBAL.preserve_trx_warmcopy_min_open_ms AS warmcopy_min_open_ms,
+  @@GLOBAL.preserve_trx_warmcopy_chunk_bytes AS warmcopy_chunk_bytes,
+  @@GLOBAL.preserve_trx_warmcopy_tail_budget_bytes AS warmcopy_tail_budget_bytes,
+  @@GLOBAL.preserve_trx_warmcopy_max_total_bytes AS warmcopy_max_total_bytes,
+  @@GLOBAL.preserve_trx_warmcopy_pending_range_limit AS warmcopy_pending_range_limit,
+  @@GLOBAL.preserve_trx_warmcopy_pending_bytes_limit AS warmcopy_pending_bytes_limit;
+
+SET @saved_drain_mode=@@GLOBAL.preserve_trx_drain_mode;
+SET @saved_drain_grace_ms=@@GLOBAL.preserve_trx_drain_grace_ms;
+SET @saved_drain_hard_timeout_ms=@@GLOBAL.preserve_trx_drain_hard_timeout_ms;
+SET @saved_warmcopy_enable=@@GLOBAL.preserve_trx_warmcopy_enable;
+SET @saved_warmcopy_close_timeout_ms=@@GLOBAL.preserve_trx_warmcopy_close_timeout_ms;
+SET @saved_warmcopy_min_open_ms=@@GLOBAL.preserve_trx_warmcopy_min_open_ms;
+SET @saved_warmcopy_chunk_bytes=@@GLOBAL.preserve_trx_warmcopy_chunk_bytes;
+SET @saved_warmcopy_tail_budget_bytes=@@GLOBAL.preserve_trx_warmcopy_tail_budget_bytes;
+SET @saved_warmcopy_max_total_bytes=@@GLOBAL.preserve_trx_warmcopy_max_total_bytes;
+SET @saved_warmcopy_pending_range_limit=@@GLOBAL.preserve_trx_warmcopy_pending_range_limit;
+SET @saved_warmcopy_pending_bytes_limit=@@GLOBAL.preserve_trx_warmcopy_pending_bytes_limit;
+
+SET GLOBAL preserve_trx_drain_mode=HARD;
+SET GLOBAL preserve_trx_drain_grace_ms=0;
+SET GLOBAL preserve_trx_drain_hard_timeout_ms=1;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=0;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=0;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=0;
+SET GLOBAL preserve_trx_warmcopy_max_total_bytes=1;
+SET GLOBAL preserve_trx_warmcopy_pending_range_limit=0;
+SET GLOBAL preserve_trx_warmcopy_pending_bytes_limit=0;
+
+SELECT
+  @@GLOBAL.preserve_trx_drain_mode AS drain_mode,
+  @@GLOBAL.preserve_trx_drain_grace_ms AS drain_grace_ms,
+  @@GLOBAL.preserve_trx_drain_hard_timeout_ms AS drain_hard_timeout_ms,
+  @@GLOBAL.preserve_trx_warmcopy_enable AS warmcopy_enable,
+  @@GLOBAL.preserve_trx_warmcopy_close_timeout_ms AS warmcopy_close_timeout_ms,
+  @@GLOBAL.preserve_trx_warmcopy_min_open_ms AS warmcopy_min_open_ms,
+  @@GLOBAL.preserve_trx_warmcopy_chunk_bytes AS warmcopy_chunk_bytes,
+  @@GLOBAL.preserve_trx_warmcopy_tail_budget_bytes AS warmcopy_tail_budget_bytes,
+  @@GLOBAL.preserve_trx_warmcopy_max_total_bytes AS warmcopy_max_total_bytes,
+  @@GLOBAL.preserve_trx_warmcopy_pending_range_limit AS warmcopy_pending_range_limit,
+  @@GLOBAL.preserve_trx_warmcopy_pending_bytes_limit AS warmcopy_pending_bytes_limit;
+
+SET GLOBAL preserve_trx_drain_mode=@saved_drain_mode;
+SET GLOBAL preserve_trx_drain_grace_ms=@saved_drain_grace_ms;
+SET GLOBAL preserve_trx_drain_hard_timeout_ms=@saved_drain_hard_timeout_ms;
+SET GLOBAL preserve_trx_warmcopy_enable=@saved_warmcopy_enable;
+SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=@saved_warmcopy_close_timeout_ms;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=@saved_warmcopy_min_open_ms;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=@saved_warmcopy_chunk_bytes;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=@saved_warmcopy_tail_budget_bytes;
+SET GLOBAL preserve_trx_warmcopy_max_total_bytes=@saved_warmcopy_max_total_bytes;
+SET GLOBAL preserve_trx_warmcopy_pending_range_limit=@saved_warmcopy_pending_range_limit;
+SET GLOBAL preserve_trx_warmcopy_pending_bytes_limit=@saved_warmcopy_pending_bytes_limit;

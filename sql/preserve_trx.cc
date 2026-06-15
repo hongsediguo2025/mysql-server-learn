@@ -45,6 +45,17 @@
 
 bool preserve_trx_enable = false;
 bool preserve_trx_temp_table_enable = true;
+ulong preserve_trx_drain_mode = PRESERVE_TRX_DRAIN_MODE_SOFT;
+uint preserve_trx_drain_grace_ms = 30000;
+uint preserve_trx_drain_hard_timeout_ms = 30000;
+bool preserve_trx_warmcopy_enable = false;
+uint preserve_trx_warmcopy_close_timeout_ms = 30000;
+uint preserve_trx_warmcopy_min_open_ms = 1000;
+uint preserve_trx_warmcopy_chunk_bytes = 1048576;
+uint preserve_trx_warmcopy_tail_budget_bytes = 1048576;
+ulonglong preserve_trx_warmcopy_max_total_bytes = 10737418240ULL;
+uint preserve_trx_warmcopy_pending_range_limit = 1024;
+ulonglong preserve_trx_warmcopy_pending_bytes_limit = 67108864ULL;
 uint preserve_trx_max_total = 256;
 uint preserve_trx_max_pending_per_user = 256;
 uint preserve_trx_batch_max_transactions = 256;

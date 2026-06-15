@@ -30,6 +30,21 @@ class THD;
 
 extern bool preserve_trx_enable;
 extern bool preserve_trx_temp_table_enable;
+enum enum_preserve_trx_drain_mode {
+  PRESERVE_TRX_DRAIN_MODE_SOFT = 0,
+  PRESERVE_TRX_DRAIN_MODE_HARD = 1
+};
+extern ulong preserve_trx_drain_mode;
+extern uint preserve_trx_drain_grace_ms;
+extern uint preserve_trx_drain_hard_timeout_ms;
+extern bool preserve_trx_warmcopy_enable;
+extern uint preserve_trx_warmcopy_close_timeout_ms;
+extern uint preserve_trx_warmcopy_min_open_ms;
+extern uint preserve_trx_warmcopy_chunk_bytes;
+extern uint preserve_trx_warmcopy_tail_budget_bytes;
+extern ulonglong preserve_trx_warmcopy_max_total_bytes;
+extern uint preserve_trx_warmcopy_pending_range_limit;
+extern ulonglong preserve_trx_warmcopy_pending_bytes_limit;
 extern uint preserve_trx_max_total;
 extern uint preserve_trx_max_pending_per_user;
 extern uint preserve_trx_batch_max_transactions;

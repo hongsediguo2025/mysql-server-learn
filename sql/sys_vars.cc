@@ -1200,6 +1200,93 @@ static Sys_var_uint Sys_preserve_trx_materialize_timeout_ms(
     VALID_RANGE(0, UINT_MAX32), DEFAULT(5000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
     NOT_IN_BINLOG);
 
+static const char *preserve_trx_drain_mode_names[] = {"SOFT", "HARD", nullptr};
+static Sys_var_enum Sys_preserve_trx_drain_mode(
+    "preserve_trx_drain_mode",
+    "Shutdown drain mode for preserved transactions. SOFT blocks new risky "
+    "statements and waits for existing active transactions until "
+    "preserve_trx_drain_grace_ms before escalating to HARD. HARD immediately "
+    "kills other active user transactions.",
+    GLOBAL_VAR(preserve_trx_drain_mode), CMD_LINE(REQUIRED_ARG),
+    preserve_trx_drain_mode_names, DEFAULT(PRESERVE_TRX_DRAIN_MODE_SOFT),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_drain_grace_ms(
+    "preserve_trx_drain_grace_ms",
+    "Maximum wall-clock time in milliseconds that SOFT preserved transaction "
+    "shutdown drain waits before escalating to HARD.",
+    GLOBAL_VAR(preserve_trx_drain_grace_ms), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, UINT_MAX32), DEFAULT(30000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_drain_hard_timeout_ms(
+    "preserve_trx_drain_hard_timeout_ms",
+    "Maximum wall-clock time in milliseconds that HARD preserved transaction "
+    "shutdown drain waits for active transactions before failing.",
+    GLOBAL_VAR(preserve_trx_drain_hard_timeout_ms), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(30000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_bool Sys_preserve_trx_warmcopy_enable(
+    "preserve_trx_warmcopy_enable",
+    "Enable the warm-copy phase for DRAIN TRANSACTIONS PRESERVE binlog caches.",
+    GLOBAL_VAR(preserve_trx_warmcopy_enable), CMD_LINE(OPT_ARG),
+    DEFAULT(false), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_warmcopy_close_timeout_ms(
+    "preserve_trx_warmcopy_close_timeout_ms",
+    "Maximum wall-clock time in milliseconds to wait for warm-copy closing "
+    "convergence.",
+    GLOBAL_VAR(preserve_trx_warmcopy_close_timeout_ms), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, UINT_MAX32), DEFAULT(30000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_warmcopy_min_open_ms(
+    "preserve_trx_warmcopy_min_open_ms",
+    "Minimum wall-clock time in milliseconds that a warm-copy drain remains "
+    "open before closing admission.",
+    GLOBAL_VAR(preserve_trx_warmcopy_min_open_ms), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, UINT_MAX32), DEFAULT(1000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_warmcopy_chunk_bytes(
+    "preserve_trx_warmcopy_chunk_bytes",
+    "Target byte chunk size for warm-copy binlog cache prefix copy.",
+    GLOBAL_VAR(preserve_trx_warmcopy_chunk_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(1048576), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_warmcopy_tail_budget_bytes(
+    "preserve_trx_warmcopy_tail_budget_bytes",
+    "Maximum binlog cache tail bytes allowed after the warm-copy descriptor "
+    "high-water mark before preserve phase rejects the drain.",
+    GLOBAL_VAR(preserve_trx_warmcopy_tail_budget_bytes),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT_MAX32), DEFAULT(1048576),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_warmcopy_max_total_bytes(
+    "preserve_trx_warmcopy_max_total_bytes",
+    "Maximum total bytes of warm-copy binlog cache artifacts per drain epoch.",
+    GLOBAL_VAR(preserve_trx_warmcopy_max_total_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, ULLONG_MAX), DEFAULT(10737418240ULL), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_warmcopy_pending_range_limit(
+    "preserve_trx_warmcopy_pending_range_limit",
+    "Maximum number of out-of-order warm-copy mirror ranges retained per "
+    "participant before the participant is degraded.",
+    GLOBAL_VAR(preserve_trx_warmcopy_pending_range_limit),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT_MAX32), DEFAULT(1024),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_warmcopy_pending_bytes_limit(
+    "preserve_trx_warmcopy_pending_bytes_limit",
+    "Maximum bytes of out-of-order warm-copy mirror payload retained per "
+    "participant before the participant is degraded.",
+    GLOBAL_VAR(preserve_trx_warmcopy_pending_bytes_limit),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, ULLONG_MAX), DEFAULT(67108864ULL),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
 static bool fix_binlog_cache_size(sys_var *, THD *thd, enum_var_type) {
   check_binlog_cache_size(thd);
   return false;
