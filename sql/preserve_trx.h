@@ -66,6 +66,15 @@ extern uint preserve_trx_max_modified_tables;
 extern uint preserve_trx_max_scan_pages;
 extern uint preserve_trx_materialize_timeout_ms;
 
+enum class Preserve_trx_user_vars_mode { DEFAULT, INCLUDE, EXCLUDE };
+
+struct Preserve_trx_options {
+  bool has_timeout{false};
+  ulonglong timeout_seconds{0};
+  Preserve_trx_user_vars_mode user_vars_mode{
+      Preserve_trx_user_vars_mode::DEFAULT};
+};
+
 bool preserve_trx_execute_command(THD *thd);
 class Sql_cmd_show_preserved_transactions final : public Sql_cmd {
  public:

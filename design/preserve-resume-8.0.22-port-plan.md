@@ -432,6 +432,13 @@ Current 8.0.22 port status:
   invalid-state classification. This is parser and command-shell coverage
   only; target discovery, quiesce, context switching, cleanup, and all
   all-or-nothing runtime behavior remain Batch 4 work.
+- 2026-06-16: imported `sql/preserve_trx_drain.{cc,h}` as a build-only
+  orchestrator/participant infrastructure slice and introduced the runtime
+  `Preserve_trx_options` struct required by that interface. The current
+  `SQLCOM_DRAIN_TRANSACTIONS_PRESERVE` shell still returns unsupported; it does
+  not call `Preserve_trx_drain_service` yet. Debug/release `mysqld mysqltest`
+  builds passed, and the migrated preserve_trx shell MTR set passed in
+  debug/release with normal binlog and `--skip-log-bin`.
 
 ## Batch 5: Binlog Cache And Warm-Copy
 

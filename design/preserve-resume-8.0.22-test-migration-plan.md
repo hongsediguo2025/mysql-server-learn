@@ -333,6 +333,17 @@ Evidence:
 - 2026-06-16 GREEN debug/release: `batch_drain_syntax_feature_gate` passed with
   normal binlog and `--skip-log-bin` after adding 8.0.22-compatible DRAIN
   option parsing and owner-session invalid-state classification.
+- 2026-06-16 GREEN debug/release build: `sql/preserve_trx_drain.{cc,h}` was
+  imported and linked as a build-only DRAIN participant/orchestrator layer. The
+  current SQL command path does not call `Preserve_trx_drain_service` yet, so
+  this evidence covers compile/link compatibility only, not target discovery,
+  quiesce, context switch, cleanup, or all-or-nothing behavior.
+- 2026-06-16 GREEN post-drain-import MTR regression: debug normal-binlog passed
+  with 20 successful and 2 expected `not_log_bin` skips; debug
+  `--skip-log-bin` passed with 22 successful; release normal-binlog passed with
+  19 successful, 2 expected `not_log_bin` skips, and 1 expected debug-only
+  skip; release `--skip-log-bin` passed with 21 successful and 1 expected
+  debug-only skip.
 
 ## Batch 5 Tests
 

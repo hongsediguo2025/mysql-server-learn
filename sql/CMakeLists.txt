@@ -440,6 +440,7 @@ SET(SQL_SHARED_SOURCES
   preserve_trx_carrier.cc
   preserve_trx_carrier_file.cc
   preserve_trx.cc
+  preserve_trx_drain.cc
   preserve_trx_resource.cc
   preserve_trx_temp_table_carrier.cc
   persisted_variable.cc
