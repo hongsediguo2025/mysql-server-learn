@@ -114,8 +114,11 @@ Tests:
   It uses `preserve_trx_inject_observable_record` to inject one observable
   failed row without creating a durable token. RED found no row; GREEN also
   fixed `SHOW PRESERVED TRANSACTIONS` metadata so BIGINT columns are declared
-  as `MYSQL_TYPE_LONGLONG` instead of strings. This is display/metadata
-  coverage only, not production registry insertion.
+  as `MYSQL_TYPE_LONGLONG` instead of strings. A second RED/GREEN step requires
+  the injected row to remain visible after the debug flag is cleared until
+  `preserve_trx_clear_debug_observable_records` removes it, proving the
+  8.0.22 shell now has a mutex-protected registry container. This is registry
+  shell/display coverage only, not production durable-token insertion.
 - `perfschema.dml_handler` - non-preserve-suite regression updated for the new
   read-only PFS table and rerun in debug/release.
 - `core_limit_sysvars.test` - added as an 8.0.22 port staging test for core
@@ -202,6 +205,10 @@ Evidence:
   column metadata and unsigned-column SHOW types. The new debug observable-row
   test passed under debug, and release correctly skips it through
   `have_debug.inc`.
+- 2026-06-16 RED: the expanded debug observable test failed because the
+  injected row disappeared once `preserve_trx_inject_observable_record` was
+  cleared. GREEN introduced the first mutex-protected in-memory registry shell
+  and explicit debug clear hook.
 - 2026-06-16 GREEN post-PFS-view MTR regression: debug normal-binlog passed
   with 20 successful and 2 expected `not_log_bin` skips; debug
   `--skip-log-bin` passed with 22 successful; release normal-binlog passed
@@ -220,6 +227,12 @@ Evidence:
   debug-only skip; release `--skip-log-bin` passed with 21 successful and 1
   expected debug-only skip.
 - 2026-06-16 GREEN post-observable-PFS MTR regression: debug normal-binlog
+  passed with 22 successful and 2 expected `not_log_bin` skips; debug
+  `--skip-log-bin` passed with 24 successful; release normal-binlog passed
+  with 20 successful, 2 expected `not_log_bin` skips, and 2 expected
+  debug-only skips; release `--skip-log-bin` passed with 22 successful and 2
+  expected debug-only skips.
+- 2026-06-16 GREEN post-registry-shell MTR regression: debug normal-binlog
   passed with 22 successful and 2 expected `not_log_bin` skips; debug
   `--skip-log-bin` passed with 24 successful; release normal-binlog passed
   with 20 successful, 2 expected `not_log_bin` skips, and 2 expected

@@ -267,13 +267,17 @@ Progress notes:
 - 2026-06-16: added a debug-only observable-row injection test for the shared
   P_S/SHOW view shell. RED proved the provider still returned no rows; GREEN
   added `Preserved_trx_column_metadata`, correct unsigned-column SHOW metadata,
-  and a no-durable-side-effect DBUG row in `preserved_trx_snapshot()`. This
+  and the first no-durable-side-effect debug row path. A follow-up RED/GREEN
+  step changed that debug row from a transient snapshot append into the first
+  mutex-protected registry shell: once injected, it remains visible after the
+  debug flag is cleared until an explicit debug clear hook removes it. This
   fixes the previously hidden debug assertion where `SHOW PRESERVED
-  TRANSACTIONS` declared all columns as strings and then stored BIGINT values.
-  It does not claim production preserved-record registration; the injected row
-  exists only while the debug flag is set. Debug/release `mysqld mysqltest`
-  builds passed. The migrated preserve_trx shell MTR set passed in four modes:
-  debug normal-binlog (22 successful, 2 expected `not_log_bin` skips), debug
+  TRANSACTIONS` declared all columns as strings and then stored BIGINT values,
+  and prepares later FAILED/reaper/recovery records to share the same
+  registry. It does not claim production preserved-record registration or
+  durable-token lifecycle yet. Debug/release `mysqld mysqltest` builds passed.
+  The migrated preserve_trx shell MTR set passed in four modes: debug
+  normal-binlog (22 successful, 2 expected `not_log_bin` skips), debug
   `--skip-log-bin` (24 successful), release normal-binlog (20 successful, 4
   expected skips), and release `--skip-log-bin` (22 successful, 2 expected
   debug-only skips).

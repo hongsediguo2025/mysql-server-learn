@@ -27,6 +27,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -109,6 +110,8 @@ std::atomic<ulonglong> g_warmcopy_digest_bytes{0};
 std::atomic<ulonglong> g_warmcopy_durable_bytes{0};
 std::atomic<ulonglong> g_warmcopy_provider_full_copy_to_count{0};
 std::atomic<ulonglong> g_warmcopy_phase2_pause_us{0};
+std::mutex g_preserved_trx_registry_mutex;
+Preserved_trx_view_rows g_preserved_trx_registry;
 
 constexpr Preserved_trx_column_metadata kPreservedTrxColumns[] = {
     {"TOKEN", PRESERVE_TRX_TOKEN_MAX_LENGTH},
@@ -528,6 +531,46 @@ bool thd_has_unsupported_resume_context(THD *thd) {
   return thd_has_unsupported_preserve_context(thd);
 }
 
+Preserved_trx_view_row make_debug_observable_record() {
+  Preserved_trx_view_row row;
+  row.token = "debug-observable-token";
+  row.user = "debug_user";
+  row.host = "debug_host";
+  row.owner_user = row.user;
+  row.owner_host = row.host;
+  row.state = "FAILED";
+  row.isolation = "REPEATABLE-READ";
+  row.binlog_state = "NONE";
+  row.binlog_warmcopy_state = "NONE";
+  row.temp_table_state = "NONE";
+  row.last_error = "debug observable record";
+  return row;
+}
+
+void insert_debug_observable_record_if_missing() MY_ATTRIBUTE((unused));
+void insert_debug_observable_record_if_missing() {
+  std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
+  const auto it = std::find_if(
+      g_preserved_trx_registry.begin(), g_preserved_trx_registry.end(),
+      [](const Preserved_trx_view_row &row) {
+        return row.token == "debug-observable-token";
+      });
+  if (it == g_preserved_trx_registry.end())
+    g_preserved_trx_registry.push_back(make_debug_observable_record());
+}
+
+void clear_debug_observable_records() MY_ATTRIBUTE((unused));
+void clear_debug_observable_records() {
+  std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
+  g_preserved_trx_registry.erase(
+      std::remove_if(g_preserved_trx_registry.begin(),
+                     g_preserved_trx_registry.end(),
+                     [](const Preserved_trx_view_row &row) {
+                       return row.token == "debug-observable-token";
+                     }),
+      g_preserved_trx_registry.end());
+}
+
 }  // namespace
 
 bool preserve_trx_is_enabled() {
@@ -769,23 +812,14 @@ bool preserve_trx_execute_command(THD *thd) {
 
 Preserved_trx_view_rows preserved_trx_snapshot(THD *thd) {
   (void)thd;
-  Preserved_trx_view_rows rows;
-  DBUG_EXECUTE_IF("preserve_trx_inject_observable_record", {
-    Preserved_trx_view_row row;
-    row.token = "debug-observable-token";
-    row.user = "debug_user";
-    row.host = "debug_host";
-    row.owner_user = row.user;
-    row.owner_host = row.host;
-    row.state = "FAILED";
-    row.isolation = "REPEATABLE-READ";
-    row.binlog_state = "NONE";
-    row.binlog_warmcopy_state = "NONE";
-    row.temp_table_state = "NONE";
-    row.last_error = "debug observable record";
-    rows.push_back(row);
+  DBUG_EXECUTE_IF("preserve_trx_clear_debug_observable_records", {
+    clear_debug_observable_records();
   });
-  return rows;
+  DBUG_EXECUTE_IF("preserve_trx_inject_observable_record", {
+    insert_debug_observable_record_if_missing();
+  });
+  std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
+  return g_preserved_trx_registry;
 }
 
 static bool store_preserved_trx_row(Protocol *protocol,
