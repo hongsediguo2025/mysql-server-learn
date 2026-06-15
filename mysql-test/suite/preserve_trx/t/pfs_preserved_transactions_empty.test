@@ -1,0 +1,8 @@
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+SELECT COLUMN_NAME
+  FROM information_schema.columns
+  WHERE TABLE_SCHEMA='performance_schema'
+    AND TABLE_NAME='preserved_transactions'
+  ORDER BY ORDINAL_POSITION;

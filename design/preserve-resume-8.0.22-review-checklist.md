@@ -129,7 +129,7 @@ Commit:
 - `634f4ad0a22 Port preserve resume SQL shell to 8.0.22`.
 ```
 
-### Batch 1: snapshot directory and bound key first slice
+### Batch 1: snapshot directory, bound key, and empty P_S slices
 
 - [x] Test inventory updated.
 - [x] Code inventory updated.
@@ -150,6 +150,42 @@ Commit:
 - [ ] 3 independent sub-agent reviews completed.
 - [ ] All Blocker/Major review findings fixed or rejected with evidence.
 - [x] Batch commit created.
+
+Additional empty P_S slice evidence:
+
+```text
+Commands/results:
+Build:
+- cmake --build build-debug --target mysqld mysqltest -- -j4
+- cmake --build build-release --target mysqld mysqltest -- -j4
+Round B:
+- RED: `pfs_preserved_transactions_empty` failed before code migration with
+  `Table 'performance_schema.preserved_transactions' doesn't exist`.
+- GREEN: `pfs_preserved_transactions_empty` passed in debug and release after
+  adding the empty read-only PFS table surface.
+Targeted preserve set:
+- perl mysql-test/mysql-test-run.pl --suite=preserve_trx
+  syntax_feature_gate startup_option_validation unsupported_single_instance_guards
+  feature_off_normal_transaction_smoke feature_off_binlog_temp_table_smoke
+  snapshot_format key_permission_reject pfs_preserved_transactions_empty
+  --force --parallel=1
+- Result: all 9 tests successful on 2026-06-16 in debug and release.
+- perl mysql-test/mysql-test-run.pl --suite=preserve_trx
+  syntax_feature_gate startup_option_validation unsupported_single_instance_guards
+  feature_off_normal_transaction_smoke feature_off_binlog_temp_table_smoke
+  snapshot_format key_permission_reject pfs_preserved_transactions_empty
+  --skip-log-bin --force --parallel=1
+- Result: all 9 tests successful on 2026-06-16 in release.
+PFS regression:
+- perl mysql-test/mysql-test-run.pl --suite=perfschema dml_handler --force
+  --parallel=1
+- Result: successful on 2026-06-16 in debug and release after re-recording the
+  table-list id shift and HANDLER rejection.
+Scope:
+- The table currently exposes schema and empty-scan behavior only. Registry
+  rows, ACL-filtered token visibility, redaction, resume/reaper observability,
+  and `PFS_DD_VERSION`/upgrade handling remain later Batch 1/default-ON work.
+```
 
 Review findings summary:
 

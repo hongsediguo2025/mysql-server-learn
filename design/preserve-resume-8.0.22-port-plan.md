@@ -236,8 +236,21 @@ Progress notes:
   permission rejection. RED was `key_permission_reject` accepting a too-open
   `.key`; GREEN passed debug/release targeted MTR with normal binlog and
   release `--skip-log-bin`.
-- These current slices do not claim full carrier, token ACL/redaction, or empty
-  P_S registration. Those remain in Batch 1.
+- 2026-06-16: third Batch 1 RED/GREEN slice added the empty
+  `performance_schema.preserved_transactions` table surface and its column
+  contract. RED was `pfs_preserved_transactions_empty` failing with table not
+  found; GREEN passed debug/release targeted MTR with normal binlog and release
+  `--skip-log-bin`. `perfschema.dml_handler` was re-recorded and passed in
+  debug/release after the new PFS table shifted table-list ids.
+- The empty P_S slice only registers schema and read-only empty-scan behavior;
+  it does not claim registry-backed rows, ACL-filtered visibility, token
+  redaction, or resume/reaper state integration.
+- Adding a PFS table changes the performance_schema schema surface. The final
+  8.0.22 port must explicitly resolve the `PFS_DD_VERSION`/upgrade contract
+  before release; this staging slice intentionally leaves that as a tracked
+  version-difference item rather than silently declaring upgrade readiness.
+- These current slices do not claim full carrier or token ACL/redaction. Those
+  remain in Batch 1.
 - Because the current 8.0.22 port is still an unsupported shell, it keeps
   `preserve_trx_enable` default OFF as a staging guard. The final release
   contract remains default ON and must be flipped in the explicit default-ON

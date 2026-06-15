@@ -95,6 +95,12 @@ Tests:
   `--validate-config --preserve-trx-enable=ON`, then restores the key and
   checks idempotent enablement. As with `snapshot_format`, the 8.0.22 staging
   shell adds a final `SET ...=OFF` cleanup.
+- `pfs_preserved_transactions_empty.test` - added as an 8.0.22 port staging
+  test for the empty `performance_schema.preserved_transactions` surface. It
+  verifies that the table exists, scans as empty before registry integration,
+  and exposes the expected column contract.
+- `perfschema.dml_handler` - non-preserve-suite regression updated for the new
+  read-only PFS table and rerun in debug/release.
 - `token_redaction.test`;
 - `token_visibility_redaction.test`;
 - `validation_and_privileges.test`;
@@ -112,6 +118,16 @@ Evidence:
 - 2026-06-16 GREEN debug/release: Batch 0 targeted set plus
   `snapshot_format` and `key_permission_reject` passed in debug, release, and
   release `--skip-log-bin`.
+- 2026-06-16 RED: `pfs_preserved_transactions_empty` failed before code
+  migration with `Table 'performance_schema.preserved_transactions' doesn't
+  exist`.
+- 2026-06-16 GREEN debug/release: Batch 0 targeted set plus
+  `snapshot_format`, `key_permission_reject`, and
+  `pfs_preserved_transactions_empty` passed in debug, release, and release
+  `--skip-log-bin`.
+- 2026-06-16 GREEN debug/release: `perfschema.dml_handler` passed after
+  re-recording the expected table-list id shift and HANDLER rejection for
+  `performance_schema.preserved_transactions`.
 
 ## Batch 2 Tests
 
