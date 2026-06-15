@@ -258,6 +258,12 @@ Progress notes:
   surface for the third source branch. It defaults ON per the final release
   contract, but this slice does not claim temp-table image/rebind or resume
   runtime support.
+- 2026-06-16: ported RESUME token log redaction for the current staging shell.
+  RED was `token_redaction` under `--skip-log-bin` finding raw quoted and hex
+  token literals in `mysql.general_log` and `mysql.slow_log`; GREEN passed
+  debug/release after adding SQL rewrite and raw general-log redaction. This
+  slice covers missing-token RESUME logging only; successful token-delivery and
+  registry-backed RESUME redaction remain later Batch 1/2 work.
 - 2026-06-16: added resource, memory/spill, single-phase binlog-cache, and lock
   materialization limit sysvars as a configuration-surface slice. This prepares
   later carrier/temp-table/resource-manager batches without claiming runtime

@@ -1759,9 +1759,18 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
 
       const char *packet_end = thd->query().str + thd->query().length;
 
-      if (opt_general_log_raw)
-        query_logger.general_log_write(thd, command, thd->query().str,
-                                       thd->query().length);
+      if (opt_general_log_raw) {
+        String rewritten_query;
+        if (mysql_rewrite_resume_preserved_transaction_raw(
+                thd, thd->query().str, thd->query().length,
+                &rewritten_query)) {
+          query_logger.general_log_write(thd, command, rewritten_query.ptr(),
+                                         rewritten_query.length());
+        } else {
+          query_logger.general_log_write(thd, command, thd->query().str,
+                                         thd->query().length);
+        }
+      }
 
       DBUG_PRINT("query", ("%-.4096s", thd->query().str));
 

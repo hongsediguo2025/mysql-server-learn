@@ -244,7 +244,7 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 | `mysql-test/suite/preserve_trx/t/token_delivery_drain_blocks_risky.test` | `mysql-test/suite/preserve_trx/r/token_delivery_drain_blocks_risky.result` | Batch 1 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/token_delivery_rollback_failure_pending.test` | `mysql-test/suite/preserve_trx/r/token_delivery_rollback_failure_pending.result` | Batch 1 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/token_delivery_taken_by_resume.test` | `mysql-test/suite/preserve_trx/r/token_delivery_taken_by_resume.result` | Batch 1 | pending | Verify source expectation before moving. |
-| `mysql-test/suite/preserve_trx/t/token_redaction.test` | `mysql-test/suite/preserve_trx/r/token_redaction.result` | Batch 1 | pending | Verify source expectation before moving. |
+| `mysql-test/suite/preserve_trx/t/token_redaction.test` | `mysql-test/suite/preserve_trx/r/token_redaction.result` | Batch 1 | ported | 8.0.22 staging test for missing-token RESUME log redaction. RED showed raw quoted/hex token literals in general and slow logs; GREEN passed debug/release `--skip-log-bin` on 2026-06-16. Does not yet claim successful token-delivery redaction. |
 | `mysql-test/suite/preserve_trx/t/token_visibility_redaction.test` | `mysql-test/suite/preserve_trx/r/token_visibility_redaction.result` | Batch 1 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/unsupported_cases.test` | `mysql-test/suite/preserve_trx/r/unsupported_cases.result` | Batch 0 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/unsupported_single_instance_guards.test` | `mysql-test/suite/preserve_trx/r/unsupported_single_instance_guards.result` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed; enabled shell returns unsupported before runtime migration. |
@@ -493,7 +493,7 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 | `mysql-test/suite/preserve_trx/r/token_delivery_drain_blocks_risky.result` | Batch 1 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/token_delivery_rollback_failure_pending.result` | Batch 1 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/token_delivery_taken_by_resume.result` | Batch 1 | pending | Must match the paired test or owning non-preserve suite test. |
-| `mysql-test/suite/preserve_trx/r/token_redaction.result` | Batch 1 | pending | Must match the paired test or owning non-preserve suite test. |
+| `mysql-test/suite/preserve_trx/r/token_redaction.result` | Batch 1 | ported | Paired with ported `token_redaction.test`; staging coverage for missing-token RESUME log redaction. |
 | `mysql-test/suite/preserve_trx/r/token_visibility_redaction.result` | Batch 1 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/unsupported_cases.result` | Batch 0 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/unsupported_single_instance_guards.result` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed with paired test. |

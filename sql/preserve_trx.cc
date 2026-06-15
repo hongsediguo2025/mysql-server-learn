@@ -480,6 +480,14 @@ bool thd_has_unsupported_resume_context(THD *thd) {
 
 }  // namespace
 
+std::string preserved_trx_redacted_token(const std::string &token) {
+  if (token.empty()) return "****????";
+  std::string redacted("****");
+  const size_t suffix_length = std::min<size_t>(4, token.length());
+  redacted.append(token, token.length() - suffix_length, suffix_length);
+  return redacted;
+}
+
 const char *preserved_trx_dir_value() {
   static const std::string dir = preserve_trx_default_dir();
   return dir.c_str();

@@ -134,7 +134,11 @@ Tests:
   staging test for the RESUME unsupported-context shell. It verifies that user
   locks and open HANDLER state fail closed before missing-token lookup. It does
   not claim the full source branch unsupported-context matrix yet.
-- `token_redaction.test`;
+- `token_redaction.test` - ported as an 8.0.22 Batch 1 staging test for
+  RESUME token redaction in general and slow logs. Because the staging shell
+  has no durable token registry yet, this slice verifies missing-token RESUME
+  for quoted and hex literals under `log_raw=ON`; it does not claim successful
+  token-delivery or registry-backed RESUME redaction yet.
 - `token_visibility_redaction.test`;
 - `validation_and_privileges.test`;
 - bundle/carrier gunit.
@@ -228,6 +232,12 @@ Evidence:
 - 2026-06-16 GREEN debug/release: `resume_unsupported_context_staging` passed
   with normal binlog and release `--skip-log-bin`; it covers user lock and
   HANDLER-open context in the current empty-registry shell.
+- 2026-06-16 RED: `token_redaction` under `--skip-log-bin` showed raw RESUME
+  token literals in both `mysql.general_log` and `mysql.slow_log`.
+- 2026-06-16 GREEN debug/release: `token_redaction` passed under
+  `--skip-log-bin` after adding RESUME-specific SQL rewrite and raw
+  general-log redaction; normal-binlog runs correctly skip through
+  `include/not_log_bin.inc`.
 
 ## Batch 2 Tests
 

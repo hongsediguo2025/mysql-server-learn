@@ -25,6 +25,7 @@
 #define SQL_PRESERVE_TRX_INCLUDED
 
 #include <cstdint>
+#include <string>
 
 #include "my_inttypes.h"
 #include "sql/sql_cmd.h"
@@ -88,5 +89,6 @@ void preserve_trx_warmcopy_note_digest_bytes(uint64_t bytes);
 void preserve_trx_warmcopy_note_durable_bytes(uint64_t bytes);
 void preserve_trx_warmcopy_note_provider_full_copy_to();
 void preserve_trx_warmcopy_note_phase2_pause_us(uint64_t phase2_pause_us);
+std::string preserved_trx_redacted_token(const std::string &token);
 
 #endif /* SQL_PRESERVE_TRX_INCLUDED */

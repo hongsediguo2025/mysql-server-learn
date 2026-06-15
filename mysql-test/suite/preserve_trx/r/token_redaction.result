@@ -1,0 +1,79 @@
+DROP USER IF EXISTS preserve_redact@localhost;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE USER preserve_redact@localhost;
+GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO preserve_redact@localhost;
+SET SESSION long_query_time=0;
+SET @raw_token='msp_redaction_abcd';
+SET @redacted_token='****abcd';
+SET GLOBAL log_output='TABLE';
+SET GLOBAL general_log=OFF;
+SET GLOBAL slow_query_log=OFF;
+SET GLOBAL log_raw=ON;
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+SET GLOBAL general_log=ON;
+SET GLOBAL slow_query_log=ON;
+SET GLOBAL long_query_time=0;
+SET GLOBAL log_slow_admin_statements=ON;
+RESUME PRESERVED TRANSACTION 'msp_redaction_abcd';
+ERROR HY000: Preserved transaction was not found
+SET GLOBAL general_log=OFF;
+SET GLOBAL slow_query_log=OFF;
+SELECT COUNT(*) AS raw_token_in_general_log
+FROM mysql.general_log
+WHERE argument LIKE CONCAT('%', @raw_token, '%');
+raw_token_in_general_log
+0
+SELECT COUNT(*) > 0 AS redacted_token_in_general_log
+FROM mysql.general_log
+WHERE argument = CONCAT("RESUME PRESERVED TRANSACTION '", @redacted_token, "'");
+redacted_token_in_general_log
+1
+SELECT COUNT(*) AS raw_token_in_slow_log
+FROM mysql.slow_log
+WHERE sql_text LIKE CONCAT('%', @raw_token, '%');
+raw_token_in_slow_log
+0
+SELECT COUNT(*) > 0 AS redacted_token_in_slow_log
+FROM mysql.slow_log
+WHERE sql_text = CONCAT("RESUME PRESERVED TRANSACTION '", @redacted_token, "'");
+redacted_token_in_slow_log
+1
+SET @hex_token='msp_redaction_q123';
+SET @hex_redacted_token='****q123';
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+SET GLOBAL general_log=ON;
+SET GLOBAL slow_query_log=ON;
+RESUME PRESERVED TRANSACTION x'6D73705F726564616374696F6E5F71313233';
+ERROR HY000: Preserved transaction was not found
+SET GLOBAL general_log=OFF;
+SET GLOBAL slow_query_log=OFF;
+SELECT COUNT(*) AS hex_raw_token_in_general_log
+FROM mysql.general_log
+WHERE argument LIKE CONCAT('%', @hex_token, '%')
+OR argument LIKE "RESUME PRESERVED TRANSACTION x'%";
+hex_raw_token_in_general_log
+0
+SELECT COUNT(*) > 0 AS hex_redacted_token_in_general_log
+FROM mysql.general_log
+WHERE argument = CONCAT("RESUME PRESERVED TRANSACTION '",
+@hex_redacted_token, "'");
+hex_redacted_token_in_general_log
+1
+SELECT COUNT(*) AS hex_raw_token_in_slow_log
+FROM mysql.slow_log
+WHERE sql_text LIKE CONCAT('%', @hex_token, '%')
+OR sql_text LIKE "RESUME PRESERVED TRANSACTION x'%";
+hex_raw_token_in_slow_log
+0
+SELECT COUNT(*) > 0 AS hex_redacted_token_in_slow_log
+FROM mysql.slow_log
+WHERE sql_text = CONCAT("RESUME PRESERVED TRANSACTION '",
+@hex_redacted_token, "'");
+hex_redacted_token_in_slow_log
+1
+DROP USER preserve_redact@localhost;
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+SET GLOBAL preserve_trx_enable=OFF;
