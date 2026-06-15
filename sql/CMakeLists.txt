@@ -443,6 +443,7 @@ SET(SQL_SHARED_SOURCES
   preserve_trx_drain.cc
   preserve_trx_resource.cc
   preserve_trx_temp_table_carrier.cc
+  preserve_trx_warmcopy.cc
   persisted_variable.cc
   protocol_classic.cc
   psi_memory_key.cc

@@ -1302,6 +1302,13 @@ class THD : public MDL_context_owner,
 #endif
   bool is_killable;
   /**
+    Warm-copy participant id assigned by the preserve/drain coordinator while
+    this THD is admitted to an open warm-copy epoch. Protected by
+    LOCK_thd_data. The 8.0.22 port currently imports only the warm-copy model;
+    production binlog mirroring is connected in a later batch.
+  */
+  uint preserve_trx_warmcopy_participant_id{0};
+  /**
     Mutex protecting access to current_mutex and current_cond.
   */
   mysql_mutex_t LOCK_current_cond;

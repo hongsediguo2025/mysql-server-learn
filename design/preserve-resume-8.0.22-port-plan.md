@@ -465,6 +465,18 @@ Implementation scope:
 - `sql/binlog_ostream*` mirror path;
 - GTID and compression metadata.
 
+Current 8.0.22 port status:
+
+- 2026-06-16: imported `sql/preserve_trx_warmcopy.{cc,h}` as a build-only
+  warm-copy model layer and added the zero-initialized
+  `THD::preserve_trx_warmcopy_participant_id` field needed by that model. The
+  slice covers descriptor tracking, participant/coordinator model logic,
+  resource-limit arithmetic, and observability formatting only. It does not
+  connect binlog-cache mirrors, provider leases, warm artifact writers, or
+  production `DRAIN TRANSACTIONS PRESERVE` warm-copy admission. Debug/release
+  `mysqld mysqltest` builds passed, and the migrated preserve_trx shell MTR set
+  passed in debug/release with normal binlog and `--skip-log-bin`.
+
 ## Batch 6: User Temporary Tables
 
 Goal: port user temporary table physical-image preserve/resume with strict

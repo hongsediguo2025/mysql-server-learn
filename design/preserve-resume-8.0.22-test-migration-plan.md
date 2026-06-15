@@ -361,6 +361,22 @@ Tests:
 - `warmcopy_savepoint_truncate.test`;
 - `batch_drain_warmcopy_*`.
 
+Evidence:
+
+- 2026-06-16 GREEN debug/release build: `sql/preserve_trx_warmcopy.{cc,h}`
+  was imported and linked as a build-only warm-copy model layer, with
+  `THD::preserve_trx_warmcopy_participant_id` added for model compatibility.
+  This evidence covers descriptor tracking, participant/coordinator model
+  logic, resource-limit arithmetic, and observability formatting only. It does
+  not claim binlog mirror integration, provider leases, warm artifact writers,
+  or production drain warm-copy runtime.
+- 2026-06-16 GREEN post-warmcopy-import MTR regression: debug normal-binlog
+  passed with 20 successful and 2 expected `not_log_bin` skips; debug
+  `--skip-log-bin` passed with 22 successful; release normal-binlog passed with
+  19 successful, 2 expected `not_log_bin` skips, and 1 expected debug-only
+  skip; release `--skip-log-bin` passed with 21 successful and 1 expected
+  debug-only skip.
+
 ## Batch 6 Tests
 
 Purpose: user temporary tables.

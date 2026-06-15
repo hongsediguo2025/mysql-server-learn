@@ -92,7 +92,7 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 | `mysql-test/suite/preserve_trx/t/binlog_state_logged_with_cache_to_off_reject.test` | `mysql-test/suite/preserve_trx/r/binlog_state_logged_with_cache_to_off_reject.result` | Batch 5 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/binlog_state_session_off_basic.test` | `mysql-test/suite/preserve_trx/r/binlog_state_session_off_basic.result` | Batch 5 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/core_limit_sysvars.test` | `mysql-test/suite/preserve_trx/r/core_limit_sysvars.result` | Batch 1 | ported | 8.0.22 staging test for core limit sysvars. RED failed on unknown `preserve_trx_max_total`; GREEN passed debug/release normal and release `--skip-log-bin` on 2026-06-16. |
-| `mysql-test/suite/preserve_trx/t/drain_warmcopy_sysvars.test` | `mysql-test/suite/preserve_trx/r/drain_warmcopy_sysvars.result` | Batch 5 | ported | 8.0.22 staging test for drain and warm-copy sysvars. RED failed on unknown `preserve_trx_drain_mode`; GREEN passed debug/release normal and release `--skip-log-bin` on 2026-06-16. Runtime drain/warm-copy behavior remains pending. |
+| `mysql-test/suite/preserve_trx/t/drain_warmcopy_sysvars.test` | `mysql-test/suite/preserve_trx/r/drain_warmcopy_sysvars.result` | Batch 5 | ported | 8.0.22 staging test for drain and warm-copy sysvars. RED failed on unknown `preserve_trx_drain_mode`; GREEN passed debug/release normal and release `--skip-log-bin` on 2026-06-16. `sql/preserve_trx_warmcopy.{cc,h}` is now build-imported as a model layer, but runtime drain/warm-copy behavior remains pending. |
 | `mysql-test/suite/preserve_trx/t/code_review_resumable_trx_slices_guard.test` | `mysql-test/suite/preserve_trx/r/code_review_resumable_trx_slices_guard.result` | Batch 7 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/concurrent_resume_race.test` | `mysql-test/suite/preserve_trx/r/concurrent_resume_race.result` | Batch 7 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/concurrent_standard_xa.test` | `mysql-test/suite/preserve_trx/r/concurrent_standard_xa.result` | Batch 7 | pending | Verify source expectation before moving. |
@@ -512,7 +512,7 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 | `unittest/gunit/innodb/trx0preserve-t.cc` | Batch 2 | pending | `trx0preserve-t or the 8.0.22 equivalent gunit binary` |
 | `unittest/gunit/preserve_trx-t.cc` | Batch 1 | pending | `preserve_trx-t`; carrier/codec source files are build-imported in the 8.0.22 tree, but this checkout has no googletest target configured yet, so bundle/carrier gunit coverage remains pending. |
 | `unittest/gunit/preserve_trx_temp_table-t.cc` | Batch 6 | pending | `preserve_trx_temp_table-t` |
-| `unittest/gunit/preserve_trx_warmcopy-t.cc` | Batch 5 | pending | `preserve_trx_warmcopy-t` |
+| `unittest/gunit/preserve_trx_warmcopy-t.cc` | Batch 5 | pending | `preserve_trx_warmcopy-t`; warm-copy model source is build-imported, but this checkout has no googletest target configured and production binlog mirror integration remains pending. |
 
 ## Python E2E, Benchmark, And Unit Tests
 
