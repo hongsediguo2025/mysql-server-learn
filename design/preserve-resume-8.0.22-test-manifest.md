@@ -209,7 +209,7 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 | `mysql-test/suite/preserve_trx/t/sql_surface_review_guards.test` | `mysql-test/suite/preserve_trx/r/sql_surface_review_guards.result` | Batch 7 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/startup_option_validation.test` | `mysql-test/suite/preserve_trx/r/startup_option_validation.result` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed in shell mode; validates option parsing only, not final default-ON startup preflight. |
 | `mysql-test/suite/preserve_trx/t/startup_transient_key_io_retry.test` | `mysql-test/suite/preserve_trx/r/startup_transient_key_io_retry.result` | Batch 1 | ported | Debug-only DBUG test. RED found no transient retry evidence; GREEN passed debug and release reports expected `have_debug` skip on 2026-06-16. |
-| `mysql-test/suite/preserve_trx/t/syntax_feature_gate.test` | `mysql-test/suite/preserve_trx/r/syntax_feature_gate.result` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed; SQL surface routes to disabled shell. |
+| `mysql-test/suite/preserve_trx/t/syntax_feature_gate.test` | `mysql-test/suite/preserve_trx/r/syntax_feature_gate.result` | Batch 0 | ported | 2026-06-16 debug/release normal and release `--skip-log-bin` passed. Verifies disabled preserve command shell plus empty `SHOW PRESERVED TRANSACTIONS` column surface only. |
 | `mysql-test/suite/preserve_trx/t/table_lock_after_resume.test` | `mysql-test/suite/preserve_trx/r/table_lock_after_resume.result` | Batch 2 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/table_lock_tlv_import_isolated.test` | `mysql-test/suite/preserve_trx/r/table_lock_tlv_import_isolated.result` | Batch 2 | pending | Verify source expectation before moving. |
 | `mysql-test/suite/preserve_trx/t/temp_table_basic_commit_after_resume.test` | `mysql-test/suite/preserve_trx/r/temp_table_basic_commit_after_resume.result` | Batch 6 | pending | Verify source expectation before moving. |
@@ -457,7 +457,7 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 | `mysql-test/suite/preserve_trx/r/sql_surface_review_guards.result` | Batch 7 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/startup_option_validation.result` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed with paired test. |
 | `mysql-test/suite/preserve_trx/r/startup_transient_key_io_retry.result` | Batch 1 | ported | Paired with debug-only `startup_transient_key_io_retry.test`; release skip is expected. |
-| `mysql-test/suite/preserve_trx/r/syntax_feature_gate.result` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed with paired test. |
+| `mysql-test/suite/preserve_trx/r/syntax_feature_gate.result` | Batch 0 | ported | Paired with ported `syntax_feature_gate.test`; includes empty `SHOW PRESERVED TRANSACTIONS` header contract. |
 | `mysql-test/suite/preserve_trx/r/table_lock_after_resume.result` | Batch 2 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/table_lock_tlv_import_isolated.result` | Batch 2 | pending | Must match the paired test or owning non-preserve suite test. |
 | `mysql-test/suite/preserve_trx/r/temp_table_basic_commit_after_resume.result` | Batch 6 | pending | Must match the paired test or owning non-preserve suite test. |

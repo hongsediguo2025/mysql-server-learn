@@ -44,7 +44,10 @@
 #include "mysql/components/services/log_builtins.h"
 #include "mysqld_error.h"
 #include "sha2.h"
+#include "sql/item.h"
 #include "sql/mysqld.h"
+#include "sql/protocol.h"
+#include "sql/sql_class.h"
 
 bool preserve_trx_enable = false;
 bool preserve_trx_temp_table_enable = true;
@@ -544,4 +547,52 @@ bool preserve_trx_execute_command(THD *) {
 
   my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
   return true;
+}
+
+bool Sql_cmd_show_preserved_transactions::execute(THD *thd) {
+  DBUG_TRACE;
+
+  static constexpr const char *kColumns[] = {
+      "TOKEN",
+      "USER",
+      "HOST",
+      "STATE",
+      "CREATED_AT",
+      "EXPIRES_AT",
+      "RECOVERED_COUNT",
+      "AGE_SECONDS",
+      "SCHEMA_NAME",
+      "ISOLATION",
+      "MOD_TABLES_COUNT",
+      "LOCKS_COUNT",
+      "HAS_READ_VIEW",
+      "RV_LOW_LIMIT_NO",
+      "SAVEPOINT_COUNT",
+      "BINLOG_STATE",
+      "WROTE_TO_CACHE",
+      "BINLOG_CACHE_SIZE",
+      "BINLOG_WARMCOPY_STATE",
+      "SESSION_SQL_LOG_BIN",
+      "GLOBAL_LOG_BIN",
+      "GTID_NEXT",
+      "AUTOINC_LOCK_OWNED",
+      "TEMP_TABLE_STATE",
+      "TEMP_IMAGE_BYTES",
+      "TEMP_UNDO_BYTES",
+      "TEMP_SIDECARS_COMPLETE",
+      "LAST_ERROR",
+      "LAST_ERROR_AT"};
+
+  mem_root_deque<Item *> fields(thd->mem_root);
+  for (const char *column : kColumns) {
+    fields.push_back(new Item_empty_string(column, 1024));
+  }
+
+  if (thd->send_result_metadata(
+          fields, Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF)) {
+    return true;
+  }
+
+  my_eof(thd);
+  return false;
 }

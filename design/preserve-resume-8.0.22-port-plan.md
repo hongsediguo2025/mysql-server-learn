@@ -282,6 +282,13 @@ Progress notes:
   RESUME_ANY_PRESERVED_TRANSACTION`; GREEN passed debug/release normal and
   release `--skip-log-bin`. This is only the privilege-name registration
   slice; full RESUME ACL checks remain later Batch 1/2 work.
+- 2026-06-16: added the `SHOW PRESERVED TRANSACTIONS` parser/command shell
+  with the GA column header contract and an empty result set. RED was
+  `syntax_feature_gate` failing to parse `SHOW PRESERVED TRANSACTIONS`; GREEN
+  passed debug/release normal and release `--skip-log-bin`. This is only the
+  empty SHOW surface; registry-backed rows, ACL filtering, token redaction,
+  FAILED/reaper states, and real preserve/resume observability remain later
+  work.
 - These current slices do not claim full carrier or token ACL/redaction. Those
   remain in Batch 1.
 - Because the current 8.0.22 port is still an unsupported shell, it keeps

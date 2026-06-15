@@ -27,6 +27,7 @@
 #include <cstdint>
 
 #include "my_inttypes.h"
+#include "sql/sql_cmd.h"
 
 class THD;
 
@@ -65,6 +66,15 @@ extern uint preserve_trx_max_scan_pages;
 extern uint preserve_trx_materialize_timeout_ms;
 
 bool preserve_trx_execute_command(THD *thd);
+class Sql_cmd_show_preserved_transactions final : public Sql_cmd {
+ public:
+  enum_sql_command sql_command_code() const override {
+    return SQLCOM_SHOW_PRESERVED_TRX;
+  }
+
+  bool execute(THD *thd) override;
+};
+
 const char *preserved_trx_dir_value();
 bool preserved_trx_ensure_snapshot_support();
 bool preserved_trx_validate_snapshot_support(bool allow_create_missing);

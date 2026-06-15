@@ -121,6 +121,7 @@ Note: YYTHD is passed as an argument to yyparse(), and subsequently to yylex().
 #include "sql/parser_yystype.h"
 #include "sql/partition_element.h"
 #include "sql/partition_info.h"
+#include "sql/preserve_trx.h"
 #include "sql/protocol.h"
 #include "sql/query_options.h"
 #include "sql/resourcegroups/platform/thread_attrs_api.h"
@@ -13230,6 +13231,13 @@ show_param:
           {
             auto *p= NEW_PTN PT_show_privileges(@$);
             MAKE_CMD(p);
+          }
+        | PRESERVED_SYM TRANSACTIONS_SYM
+          {
+            Lex->sql_command= SQLCOM_SHOW_PRESERVED_TRX;
+            Lex->m_sql_cmd= NEW_PTN Sql_cmd_show_preserved_transactions();
+            if (Lex->m_sql_cmd == nullptr)
+              MYSQL_YYABORT;
           }
         | GRANTS
           {

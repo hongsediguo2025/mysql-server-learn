@@ -201,6 +201,12 @@ Evidence:
   privilege registration.
 - 2026-06-16 GREEN debug/release: `resume_any_dynamic_privilege` passed with
   normal binlog and release `--skip-log-bin`.
+- 2026-06-16 RED: `syntax_feature_gate` failed because
+  `SHOW PRESERVED TRANSACTIONS` was rejected as SQL syntax before the SHOW
+  command shell existed.
+- 2026-06-16 GREEN debug/release: `syntax_feature_gate` passed with normal
+  binlog and release `--skip-log-bin`; it now verifies the disabled preserve
+  command shell plus the empty `SHOW PRESERVED TRANSACTIONS` column surface.
 
 ## Batch 2 Tests
 
