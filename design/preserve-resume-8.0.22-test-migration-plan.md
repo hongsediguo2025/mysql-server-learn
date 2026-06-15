@@ -48,6 +48,7 @@ Tests:
 - `syntax_feature_gate.test`;
 - `startup_option_validation.test`;
 - `unsupported_single_instance_guards.test`;
+- `unsupported_cases.test`;
 - new 8.0.22 test `feature_off_normal_transaction_smoke.test`;
 - new 8.0.22 test `feature_off_binlog_temp_table_smoke.test`.
 
@@ -66,9 +67,15 @@ Current status:
 - 2026-06-15: Batch 0 debug build and Round A targeted MTR passed.
 - 2026-06-15: Batch 0 release build and Round A targeted MTR passed.
 - 2026-06-15: Batch 0 release `--skip-log-bin` targeted MTR passed.
+- 2026-06-16: `unsupported_cases` was ported as a `--skip-log-bin` staging
+  unsupported-context test. It verifies XA, non-InnoDB table changes, temporary
+  tables, user locks, open HANDLER state, backup locks, LOCK TABLES, stored
+  routine sub-statement context, empty P_S rows, and clean preserve directory
+  behavior all fail closed with `ER_PRESERVE_TRX_UNSUPPORTED`.
 - Verified targets:
   `mysqld`, `mysqltest`, `syntax_feature_gate`,
   `startup_option_validation`, `unsupported_single_instance_guards`,
+  `unsupported_cases`,
   `feature_off_normal_transaction_smoke`,
   `feature_off_binlog_temp_table_smoke`.
 - On this macOS/Clang setup, the 8.0.22 release build requires

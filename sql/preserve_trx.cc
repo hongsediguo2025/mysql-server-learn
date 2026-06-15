@@ -475,10 +475,14 @@ bool thd_has_resume_any_preserved_transaction(THD *thd) {
              .first;
 }
 
-bool thd_has_unsupported_resume_context(THD *thd) {
+bool thd_has_unsupported_preserve_context(THD *thd) {
   if (thd == nullptr) return true;
   return thd->locked_tables_mode != LTM_NONE || !thd->ull_hash.empty() ||
-         !thd->handler_tables_hash.empty();
+         !thd->handler_tables_hash.empty() || thd->in_sub_stmt != 0;
+}
+
+bool thd_has_unsupported_resume_context(THD *thd) {
+  return thd_has_unsupported_preserve_context(thd);
 }
 
 }  // namespace
@@ -572,6 +576,11 @@ static bool preserve_trx_requires_shutdown_acl(enum_sql_command command) {
 static bool preserve_trx_handle_prepare_shutdown(THD *thd) {
   if (thd == nullptr) {
     my_error(ER_PRESERVE_TRX_INVALID_STATE, MYF(0));
+    return true;
+  }
+
+  if (thd_has_unsupported_preserve_context(thd)) {
+    my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
     return true;
   }
 

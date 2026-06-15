@@ -167,6 +167,7 @@ Representative tests:
 - `syntax_feature_gate.test`;
 - `startup_option_validation.test`;
 - `unsupported_single_instance_guards.test`;
+- `unsupported_cases.test`;
 - new 8.0.22 test `feature_off_normal_transaction_smoke.test`;
 - new 8.0.22 test `feature_off_binlog_temp_table_smoke.test`.
 
@@ -200,6 +201,12 @@ Status:
   `feature_off_binlog_temp_table_smoke` in debug and release.
 - 2026-06-15: the same Batch 0 Round A set passed in release with
   `--skip-log-bin`.
+- 2026-06-16: `unsupported_cases` was ported as a `--skip-log-bin` staging
+  unsupported-context test for XA, non-InnoDB writes, temporary tables, user
+  locks, open HANDLER state, backup locks, LOCK TABLES, stored routine
+  sub-statement context, empty P_S rows, and clean preserve-directory behavior.
+  It passed debug/release `--skip-log-bin`; normal-binlog runs correctly skip
+  through `include/not_log_bin.inc`.
 - On this macOS/Clang setup, the 8.0.22 release build requires
   `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` and
   `-DCMAKE_CXX_FLAGS="-Wno-enum-constexpr-conversion"` for Boost 1.73.

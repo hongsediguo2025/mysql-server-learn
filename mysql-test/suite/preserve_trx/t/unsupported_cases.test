@@ -1,0 +1,116 @@
+--source include/not_log_bin.inc
+--source include/have_myisam.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_unsupported_innodb;
+DROP TABLE IF EXISTS t_unsupported_myisam;
+DROP FUNCTION IF EXISTS preserve_unsupported_ddl_func;
+DROP TABLE IF EXISTS t_unsupported_ddl;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+CREATE TABLE t_unsupported_innodb(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+CREATE TABLE t_unsupported_myisam(a INT PRIMARY KEY, b INT) ENGINE=MyISAM;
+
+INSERT INTO t_unsupported_innodb VALUES(1,10),(2,20),(3,30),(4,40),(5,50);
+INSERT INTO t_unsupported_myisam VALUES(1,10);
+
+XA START 'msp_unsupported_xa';
+UPDATE t_unsupported_innodb SET b=11 WHERE a=1;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+XA END 'msp_unsupported_xa';
+XA ROLLBACK 'msp_unsupported_xa';
+SELECT @@global.preserve_trx_enable AS still_running_after_xa;
+
+START TRANSACTION;
+UPDATE t_unsupported_innodb SET b=21 WHERE a=2;
+INSERT INTO t_unsupported_myisam VALUES(2,20);
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--disable_warnings
+ROLLBACK;
+--enable_warnings
+SELECT @@global.preserve_trx_enable AS still_running_after_myisam;
+
+START TRANSACTION;
+CREATE TEMPORARY TABLE tmp_unsupported(a INT) ENGINE=InnoDB;
+UPDATE t_unsupported_innodb SET b=31 WHERE a=3;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--disable_warnings
+ROLLBACK;
+--enable_warnings
+DROP TEMPORARY TABLE IF EXISTS tmp_unsupported;
+SELECT @@global.preserve_trx_enable AS still_running_after_temp;
+
+SELECT GET_LOCK('msp_unsupported_user_lock', 0) AS got_user_lock;
+START TRANSACTION;
+UPDATE t_unsupported_innodb SET b=41 WHERE a=4;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ROLLBACK;
+SELECT RELEASE_LOCK('msp_unsupported_user_lock') AS released_user_lock;
+SELECT @@global.preserve_trx_enable AS still_running_after_user_lock;
+
+HANDLER t_unsupported_innodb OPEN;
+START TRANSACTION;
+UPDATE t_unsupported_innodb SET b=12 WHERE a=1;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ROLLBACK;
+HANDLER t_unsupported_innodb CLOSE;
+SELECT @@global.preserve_trx_enable AS still_running_after_handler;
+
+LOCK INSTANCE FOR BACKUP;
+START TRANSACTION;
+UPDATE t_unsupported_innodb SET b=22 WHERE a=2;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ROLLBACK;
+UNLOCK INSTANCE;
+SELECT @@global.preserve_trx_enable AS still_running_after_backup_lock;
+
+LOCK TABLES t_unsupported_innodb WRITE;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+UNLOCK TABLES;
+SELECT @@global.preserve_trx_enable AS still_running_after_lock_tables;
+
+delimiter |;
+CREATE FUNCTION preserve_unsupported_ddl_func() RETURNS INT
+BEGIN
+  PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+  RETURN 1;
+END|
+delimiter ;|
+--error ER_PRESERVE_TRX_UNSUPPORTED
+CREATE TABLE t_unsupported_ddl ENGINE=InnoDB
+  AS SELECT preserve_unsupported_ddl_func() AS a;
+DROP FUNCTION preserve_unsupported_ddl_func;
+--disable_warnings
+DROP TABLE IF EXISTS t_unsupported_ddl;
+--enable_warnings
+SELECT @@global.preserve_trx_enable AS still_running_after_ddl_context;
+
+SELECT COUNT(*) AS preserved_after_unsupported_cases
+  FROM performance_schema.preserved_transactions;
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+opendir(my $dh, $dir) or die "cannot open preserve dir: $dir: $!";
+my @files = grep { /\.(?:bin|binlog_cache)(?:\.tmp)?\z/ } readdir($dh);
+closedir($dh);
+die "unsupported cases left preserved files in $dir\n" if @files;
+print "preserve dir clean after unsupported cases\n";
+EOF
+
+DROP TABLE t_unsupported_myisam;
+DROP TABLE t_unsupported_innodb;
+SET GLOBAL preserve_trx_enable=OFF;
