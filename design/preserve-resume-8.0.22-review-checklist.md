@@ -185,6 +185,17 @@ Scope:
 - The table currently exposes schema and empty-scan behavior only. Registry
   rows, ACL-filtered token visibility, redaction, resume/reaper observability,
   and `PFS_DD_VERSION`/upgrade handling remain later Batch 1/default-ON work.
+
+Additional core limit sysvars slice evidence:
+- RED: `core_limit_sysvars` failed before code migration with
+  `Unknown system variable 'preserve_trx_max_total'`.
+- GREEN: debug and release builds passed after adding the core global/session
+  sysvars and `system_variables` session fields.
+- Targeted preserve set with `core_limit_sysvars` added: all 10 tests
+  successful on 2026-06-16 in debug, release, and release `--skip-log-bin`.
+- Scope is configuration surface only. It does not claim snapshot write/read
+  enforcement, carrier size-limit enforcement, token registry capacity
+  enforcement, or timeout/reaper runtime semantics.
 ```
 
 Review findings summary:

@@ -24,9 +24,18 @@
 #ifndef SQL_PRESERVE_TRX_INCLUDED
 #define SQL_PRESERVE_TRX_INCLUDED
 
+#include "my_inttypes.h"
+
 class THD;
 
 extern bool preserve_trx_enable;
+extern uint preserve_trx_max_total;
+extern uint preserve_trx_max_pending_per_user;
+extern uint preserve_trx_batch_max_transactions;
+extern uint preserve_trx_recovery_max_count;
+extern uint preserve_trx_recovery_grace_seconds;
+extern ulonglong preserve_trx_max_snapshot_bytes;
+extern ulonglong preserve_trx_max_binlog_cache_bytes;
 
 bool preserve_trx_execute_command(THD *thd);
 const char *preserved_trx_dir_value();

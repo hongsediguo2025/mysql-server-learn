@@ -249,6 +249,11 @@ Progress notes:
   8.0.22 port must explicitly resolve the `PFS_DD_VERSION`/upgrade contract
   before release; this staging slice intentionally leaves that as a tracked
   version-difference item rather than silently declaring upgrade readiness.
+- 2026-06-16: fourth Batch 1 RED/GREEN slice added the core preserve limit
+  sysvars used by later snapshot/carrier/recovery code. RED was
+  `core_limit_sysvars` failing on unknown `preserve_trx_max_total`; GREEN
+  passed debug/release targeted MTR with normal binlog and release
+  `--skip-log-bin`.
 - These current slices do not claim full carrier or token ACL/redaction. Those
   remain in Batch 1.
 - Because the current 8.0.22 port is still an unsupported shell, it keeps

@@ -101,6 +101,9 @@ Tests:
   and exposes the expected column contract.
 - `perfschema.dml_handler` - non-preserve-suite regression updated for the new
   read-only PFS table and rerun in debug/release.
+- `core_limit_sysvars.test` - added as an 8.0.22 port staging test for core
+  snapshot/carrier/recovery limit variables. This is intentionally a sysvar
+  contract test, not a preserve runtime behavior test.
 - `token_redaction.test`;
 - `token_visibility_redaction.test`;
 - `validation_and_privileges.test`;
@@ -128,6 +131,12 @@ Evidence:
 - 2026-06-16 GREEN debug/release: `perfschema.dml_handler` passed after
   re-recording the expected table-list id shift and HANDLER rejection for
   `performance_schema.preserved_transactions`.
+- 2026-06-16 RED: `core_limit_sysvars` failed before code migration with
+  `Unknown system variable 'preserve_trx_max_total'`.
+- 2026-06-16 GREEN debug/release: Batch 0 targeted set plus
+  `snapshot_format`, `key_permission_reject`,
+  `pfs_preserved_transactions_empty`, and `core_limit_sysvars` passed in
+  debug, release, and release `--skip-log-bin`.
 
 ## Batch 2 Tests
 

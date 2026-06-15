@@ -44,6 +44,13 @@
 #include "sql/mysqld.h"
 
 bool preserve_trx_enable = false;
+uint preserve_trx_max_total = 256;
+uint preserve_trx_max_pending_per_user = 256;
+uint preserve_trx_batch_max_transactions = 256;
+uint preserve_trx_recovery_max_count = 3;
+uint preserve_trx_recovery_grace_seconds = 120;
+ulonglong preserve_trx_max_snapshot_bytes = 16777216;
+ulonglong preserve_trx_max_binlog_cache_bytes = 1073741824;
 
 namespace {
 

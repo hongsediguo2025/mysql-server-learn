@@ -1042,6 +1042,83 @@ static bool check_preserve_trx_enable(sys_var *, THD *, set_var *var) {
   return true;
 }
 
+static Sys_var_uint Sys_preserve_trx_max_total(
+    "preserve_trx_max_total",
+    "Maximum total number of preserved transactions allowed on the instance.",
+    GLOBAL_VAR(preserve_trx_max_total), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(256), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_max_pending_per_user(
+    "preserve_trx_max_pending_per_user",
+    "Maximum number of preserved transactions pending for one account.",
+    GLOBAL_VAR(preserve_trx_max_pending_per_user), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(256), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_batch_max_transactions(
+    "preserve_trx_batch_max_transactions",
+    "Maximum number of transactions that one DRAIN TRANSACTIONS PRESERVE "
+    "command may preserve.",
+    GLOBAL_VAR(preserve_trx_batch_max_transactions), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(256), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_default_timeout(
+    "preserve_trx_default_timeout",
+    "Default wall-clock timeout in seconds for PREPARE SHUTDOWN PRESERVE "
+    "TRANSACTION and DRAIN TRANSACTIONS PRESERVE when WITH TIMEOUT is omitted.",
+    SESSION_VAR(preserve_trx_default_timeout), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(300), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_min_timeout(
+    "preserve_trx_min_timeout",
+    "Minimum client-specified wall-clock timeout in seconds for preserved "
+    "transactions.",
+    SESSION_VAR(preserve_trx_min_timeout), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(60), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_max_timeout(
+    "preserve_trx_max_timeout",
+    "Maximum client-specified wall-clock timeout in seconds for preserved "
+    "transactions.",
+    SESSION_VAR(preserve_trx_max_timeout), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(86400), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_recovery_max_count(
+    "preserve_trx_recovery_max_count",
+    "Maximum number of startup recovery passes for the same preserved "
+    "transaction before it is rolled back.",
+    GLOBAL_VAR(preserve_trx_recovery_max_count), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(3), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_recovery_grace_seconds(
+    "preserve_trx_recovery_grace_seconds",
+    "Startup recovery grace window in seconds for the first recovery of a "
+    "preserved transaction whose original timeout already expired.",
+    GLOBAL_VAR(preserve_trx_recovery_grace_seconds), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(30, 1800), DEFAULT(120), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_max_snapshot_bytes(
+    "preserve_trx_max_snapshot_bytes",
+    "Maximum size in bytes of a preserved transaction snapshot metadata file.",
+    GLOBAL_VAR(preserve_trx_max_snapshot_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, ULLONG_MAX), DEFAULT(16777216), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_max_binlog_cache_bytes(
+    "preserve_trx_max_binlog_cache_bytes",
+    "Maximum size in bytes of a preserved transaction binlog cache sidecar "
+    "file.",
+    GLOBAL_VAR(preserve_trx_max_binlog_cache_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, ULLONG_MAX), DEFAULT(1073741824), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
 static bool fix_binlog_cache_size(sys_var *, THD *thd, enum_var_type) {
   check_binlog_cache_size(thd);
   return false;
