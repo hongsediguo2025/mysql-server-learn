@@ -121,6 +121,10 @@ Tests:
   support validation. It injects a one-shot `.key` read failure and a one-shot
   preserve-dir stat failure through DBUG, then requires validate-config to
   succeed with explicit retry evidence in the error log.
+- `resume_any_dynamic_privilege.test` - added as an 8.0.22 Batch 1 staging
+  test for `RESUME_ANY_PRESERVED_TRANSACTION` dynamic privilege registration.
+  It verifies `GRANT` and `SHOW GRANTS` only; it does not claim registry-backed
+  RESUME authorization yet.
 - `token_redaction.test`;
 - `token_visibility_redaction.test`;
 - `validation_and_privileges.test`;
@@ -192,6 +196,11 @@ Evidence:
 - 2026-06-16 GREEN: `startup_transient_key_io_retry` passed in debug after
   bounded retry support was added; release MTR reports an expected
   `have_debug` skip.
+- 2026-06-16 RED: `resume_any_dynamic_privilege` failed because `GRANT
+  RESUME_ANY_PRESERVED_TRANSACTION` was rejected as SQL syntax before dynamic
+  privilege registration.
+- 2026-06-16 GREEN debug/release: `resume_any_dynamic_privilege` passed with
+  normal binlog and release `--skip-log-bin`.
 
 ## Batch 2 Tests
 

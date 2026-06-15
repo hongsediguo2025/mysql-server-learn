@@ -277,6 +277,11 @@ Progress notes:
   evidence for injected `.key` read and preserve-dir stat transient failures;
   GREEN passed debug and is an expected debug-only skip in release. Persistent
   configuration, permission, path, and corrupt-key errors remain fail-loud.
+- 2026-06-16: registered the `RESUME_ANY_PRESERVED_TRANSACTION` dynamic
+  privilege. RED was `resume_any_dynamic_privilege` failing to parse `GRANT
+  RESUME_ANY_PRESERVED_TRANSACTION`; GREEN passed debug/release normal and
+  release `--skip-log-bin`. This is only the privilege-name registration
+  slice; full RESUME ACL checks remain later Batch 1/2 work.
 - These current slices do not claim full carrier or token ACL/redaction. Those
   remain in Batch 1.
 - Because the current 8.0.22 port is still an unsupported shell, it keeps
