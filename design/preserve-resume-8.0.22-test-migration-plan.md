@@ -257,6 +257,26 @@ Evidence:
   SHUTDOWN privilege enforcement to the staging shell. The older
   `unsupported_single_instance_guards` staging test was narrowed to the same
   invalid-state contract for PREPARE while keeping DRAIN as unsupported.
+- 2026-06-16 GREEN debug/release build: the bundle/carrier/file/temp-manifest
+  codec layer was imported and linked into `mysqld`:
+  `sql/preserve_trx_bundle.{cc,h}`, `sql/preserve_trx_carrier.{cc,h}`,
+  `sql/preserve_trx_carrier_file.{cc,h}`,
+  `sql/preserve_trx_temp_table_carrier.{cc,h}`, `sql/preserve_trx_xid.h`, and
+  `storage/innobase/include/trx0temp_preserve.h`. The 8.0.22 adaptations were
+  limited to C++14 compatibility, checksum include differences, writable string
+  buffers, structured-binding removal, and the MDL namespace support helper.
+  This is an infrastructure/build slice only: durable snapshot writes, record
+  registration, registry-backed RESUME, and temp image runtime remain later
+  work.
+- Bundle/carrier gunit remains pending. This 8.0.22 checkout currently has no
+  googletest target configured, so the current evidence is debug/release build
+  plus MTR shell regression only.
+- 2026-06-16 GREEN post-carrier-import MTR regression:
+  debug normal-binlog passed with 20 successful and 2 expected
+  `not_log_bin` skips; debug `--skip-log-bin` passed with 22 successful;
+  release normal-binlog passed with 19 successful, 2 expected `not_log_bin`
+  skips, and 1 expected debug-only skip; release `--skip-log-bin` passed with
+  21 successful and 1 expected debug-only skip.
 
 ## Batch 2 Tests
 

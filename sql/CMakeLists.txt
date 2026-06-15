@@ -436,8 +436,12 @@ SET(SQL_SHARED_SOURCES
   parser_service.cc
   partition_info.cc
   partitioning/partition_handler.cc
+  preserve_trx_bundle.cc
+  preserve_trx_carrier.cc
+  preserve_trx_carrier_file.cc
   preserve_trx.cc
   preserve_trx_resource.cc
+  preserve_trx_temp_table_carrier.cc
   persisted_variable.cc
   protocol_classic.cc
   psi_memory_key.cc

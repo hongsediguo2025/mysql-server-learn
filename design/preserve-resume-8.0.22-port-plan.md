@@ -323,8 +323,27 @@ Progress notes:
   `unsupported_single_instance_guards` test was adjusted to the same
   invalid-state contract for no-active-transaction PREPARE while DRAIN remains
   unsupported until Batch 4 runtime migration.
-- These current slices do not claim full carrier or token ACL/redaction. Those
-  remain in Batch 1.
+- 2026-06-16: imported the source branch bundle/carrier/file/temp-manifest codec
+  layer into the 8.0.22 tree as a buildable infrastructure slice:
+  `sql/preserve_trx_bundle.{cc,h}`, `sql/preserve_trx_carrier.{cc,h}`,
+  `sql/preserve_trx_carrier_file.{cc,h}`,
+  `sql/preserve_trx_temp_table_carrier.{cc,h}`, `sql/preserve_trx_xid.h`, and
+  the temp-preserve type header
+  `storage/innobase/include/trx0temp_preserve.h`. The port required only
+  compatibility adaptations: C++14-safe constexpr/static assertions,
+  8.0.22's `my_checksum()` declaration location, writable `std::string`
+  buffers without C++17 `data()`, removal of structured bindings, and an
+  `mdl_preserve_namespace_supported()` helper matching the source branch
+  namespace allowlist. Debug and release `mysqld mysqltest` builds passed.
+  Runtime durable snapshot generation/registration, registry-backed RESUME, and
+  temp image materialization are still intentionally disabled by the current
+  shell.
+- The current carrier/codec import does not yet claim bundle/carrier gunit
+  coverage in the 8.0.22 tree. This checkout is configured without googletest,
+  so the slice is build-verified plus covered by the existing shell MTR set.
+  The full codec gunit migration remains a required Batch 1 follow-up.
+- These current slices do not claim full carrier runtime behavior or
+  registry-backed token ACL/redaction. Those remain in Batch 1.
 - Because the current 8.0.22 port is still an unsupported shell, it keeps
   `preserve_trx_enable` default OFF as a staging guard. The final release
   contract remains default ON and must be flipped in the explicit default-ON

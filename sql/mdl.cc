@@ -3628,6 +3628,34 @@ err:
   return true;
 }
 
+bool mdl_preserve_namespace_supported(
+    MDL_key::enum_mdl_namespace mdl_namespace) {
+  switch (mdl_namespace) {
+    case MDL_key::GLOBAL:
+    case MDL_key::TABLESPACE:
+    case MDL_key::SCHEMA:
+    case MDL_key::TABLE:
+    case MDL_key::COMMIT:
+    case MDL_key::FOREIGN_KEY:
+    case MDL_key::CHECK_CONSTRAINT:
+    case MDL_key::FUNCTION:
+    case MDL_key::PROCEDURE:
+    case MDL_key::TRIGGER:
+      return true;
+    case MDL_key::BACKUP_LOCK:
+    case MDL_key::EVENT:
+    case MDL_key::USER_LEVEL_LOCK:
+    case MDL_key::LOCKING_SERVICE:
+    case MDL_key::SRID:
+    case MDL_key::ACL_CACHE:
+    case MDL_key::COLUMN_STATISTICS:
+    case MDL_key::RESOURCE_GROUPS:
+    case MDL_key::NAMESPACE_END:
+      return false;
+  }
+  return false;
+}
+
 bool MDL_context::clone_tickets(const MDL_context *ticket_owner,
                                 enum_mdl_duration duration) {
   MDL_ticket *ticket;

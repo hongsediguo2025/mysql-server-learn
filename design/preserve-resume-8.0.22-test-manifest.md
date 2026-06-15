@@ -510,7 +510,7 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 | Source path | Proposed batch | Migration state | Final gate |
 |---|---|---|---|
 | `unittest/gunit/innodb/trx0preserve-t.cc` | Batch 2 | pending | `trx0preserve-t or the 8.0.22 equivalent gunit binary` |
-| `unittest/gunit/preserve_trx-t.cc` | Batch 1 | pending | `preserve_trx-t` |
+| `unittest/gunit/preserve_trx-t.cc` | Batch 1 | pending | `preserve_trx-t`; carrier/codec source files are build-imported in the 8.0.22 tree, but this checkout has no googletest target configured yet, so bundle/carrier gunit coverage remains pending. |
 | `unittest/gunit/preserve_trx_temp_table-t.cc` | Batch 6 | pending | `preserve_trx_temp_table-t` |
 | `unittest/gunit/preserve_trx_warmcopy-t.cc` | Batch 5 | pending | `preserve_trx_warmcopy-t` |
 

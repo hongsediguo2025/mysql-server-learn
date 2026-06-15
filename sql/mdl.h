@@ -771,6 +771,9 @@ struct MDL_key {
   static PSI_stage_info m_namespace_to_wait_state_name[NAMESPACE_END];
 };
 
+bool mdl_preserve_namespace_supported(
+    MDL_key::enum_mdl_namespace mdl_namespace);
+
 /**
   A pending metadata lock request.
 
