@@ -571,6 +571,15 @@ void clear_debug_observable_records() {
       g_preserved_trx_registry.end());
 }
 
+bool preserved_trx_registry_contains_token(const std::string &token) {
+  std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
+  return std::any_of(g_preserved_trx_registry.begin(),
+                     g_preserved_trx_registry.end(),
+                     [&token](const Preserved_trx_view_row &row) {
+                       return row.token == token;
+                     });
+}
+
 }  // namespace
 
 bool preserve_trx_is_enabled() {
@@ -768,6 +777,23 @@ static bool preserve_trx_handle_drain_transactions(THD *thd) {
   return true;
 }
 
+static bool preserve_trx_handle_resume(THD *thd, const std::string &token) {
+  if (thd_has_unsupported_resume_context(thd)) {
+    my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+    return true;
+  }
+  if (!thd_has_resume_any_preserved_transaction(thd)) {
+    my_error(ER_PRESERVE_TRX_ACCESS_DENIED, MYF(0));
+    return true;
+  }
+  if (preserved_trx_registry_contains_token(token)) {
+    my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+    return true;
+  }
+  my_error(ER_PRESERVE_TRX_NOT_FOUND, MYF(0));
+  return true;
+}
+
 bool preserve_trx_execute_command(THD *thd) {
   DBUG_TRACE;
 
@@ -794,16 +820,7 @@ bool preserve_trx_execute_command(THD *thd) {
   }
 
   if (command == SQLCOM_RESUME_PRESERVED_TRX) {
-    if (thd_has_unsupported_resume_context(thd)) {
-      my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
-      return true;
-    }
-    if (!thd_has_resume_any_preserved_transaction(thd)) {
-      my_error(ER_PRESERVE_TRX_ACCESS_DENIED, MYF(0));
-      return true;
-    }
-    my_error(ER_PRESERVE_TRX_NOT_FOUND, MYF(0));
-    return true;
+    return preserve_trx_handle_resume(thd, "");
   }
 
   my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
@@ -938,4 +955,15 @@ bool Sql_cmd_show_preserved_transactions::execute(THD *thd) {
 
   my_eof(thd);
   return false;
+}
+
+bool Sql_cmd_resume_preserved_transaction::execute(THD *thd) {
+  DBUG_TRACE;
+
+  if (!preserve_trx_is_enabled()) {
+    my_error(ER_PRESERVE_TRX_DISABLED, MYF(0));
+    return true;
+  }
+
+  return preserve_trx_handle_resume(thd, m_resume_token);
 }

@@ -154,6 +154,13 @@ Tests:
   staging test for the RESUME unsupported-context shell. It verifies that user
   locks and open HANDLER state fail closed before missing-token lookup. It does
   not claim the full source branch unsupported-context matrix yet.
+- `resume_registry_lookup_staging_debug.test` - added as an 8.0.22
+  target-only debug staging test for RESUME token parser/`Sql_cmd` plumbing and
+  the first registry-backed lookup split. It injects an observable in-memory
+  record, verifies an authorised existing-token RESUME reaches the staged
+  unsupported path rather than missing-token lookup, then verifies a different
+  missing token still returns not-found. This does not claim owner matching,
+  attach, activation, or durable token recovery.
 - `token_redaction.test` - ported as an 8.0.22 Batch 1 staging test for
   RESUME token redaction in general and slow logs. Because the staging shell
   has no durable token registry yet, this slice verifies missing-token RESUME
@@ -305,6 +312,19 @@ Evidence:
 - 2026-06-16 GREEN debug/release: `resume_unsupported_context_staging` passed
   with normal binlog and release `--skip-log-bin`; it covers user lock and
   HANDLER-open context in the current empty-registry shell.
+- 2026-06-16 RED: `resume_registry_lookup_staging_debug` failed because an
+  authorised RESUME for an injected registry token still returned
+  `ER_PRESERVE_TRX_NOT_FOUND`, proving the parser path discarded the token and
+  RESUME still used the empty-registry legacy command shell.
+- 2026-06-16 GREEN: `resume_registry_lookup_staging_debug` passed after adding
+  `Sql_cmd_resume_preserved_transaction`, preserving the token literal through
+  the parser, routing RESUME through `Sql_cmd::execute`, and checking the
+  in-memory registry before the missing-token path. Debug and release builds
+  passed. The migrated shell MTR set passed in four modes: debug normal-binlog,
+  debug `--skip-log-bin`, release normal-binlog, and release `--skip-log-bin`.
+  Release runs skip this debug-only test through `have_debug.inc`; the first
+  release normal retry failed only because `/tmp` was full during bootstrap,
+  and the same shard passed after deleting this slice's generated vardirs.
 - 2026-06-16 RED: `token_redaction` under `--skip-log-bin` showed raw RESUME
   token literals in both `mysql.general_log` and `mysql.slow_log`.
 - 2026-06-16 GREEN debug/release: `token_redaction` passed under

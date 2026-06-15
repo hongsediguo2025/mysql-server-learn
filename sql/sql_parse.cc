@@ -4354,8 +4354,7 @@ int mysql_execute_command(THD *thd, bool first_level) {
     case SQLCOM_CREATE_SRS:
     case SQLCOM_DROP_SRS: {
       if (lex->sql_command == SQLCOM_PREPARE_SHUTDOWN_PRESERVE ||
-          lex->sql_command == SQLCOM_DRAIN_TRANSACTIONS_PRESERVE ||
-          lex->sql_command == SQLCOM_RESUME_PRESERVED_TRX) {
+          lex->sql_command == SQLCOM_DRAIN_TRANSACTIONS_PRESERVE) {
         res = preserve_trx_execute_command(thd);
         break;
       }

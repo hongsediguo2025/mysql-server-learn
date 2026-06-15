@@ -15580,6 +15580,11 @@ resume_preserved_trx_stmt:
           RESUME_SYM PRESERVED_SYM TRANSACTION_SYM text_string
           {
             Lex->sql_command= SQLCOM_RESUME_PRESERVED_TRX;
+            Lex->m_sql_cmd=
+              NEW_PTN Sql_cmd_resume_preserved_transaction($4->ptr(),
+                                                           $4->length());
+            if (Lex->m_sql_cmd == nullptr)
+              MYSQL_YYABORT;
           }
         ;
 

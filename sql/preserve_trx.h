@@ -156,6 +156,22 @@ class Sql_cmd_show_preserved_transactions final : public Sql_cmd {
   bool execute(THD *thd) override;
 };
 
+class Sql_cmd_resume_preserved_transaction final : public Sql_cmd {
+ public:
+  Sql_cmd_resume_preserved_transaction(const char *token, size_t token_length)
+      : m_resume_token(token != nullptr ? token : "",
+                       token != nullptr ? token_length : 0) {}
+
+  enum_sql_command sql_command_code() const override {
+    return SQLCOM_RESUME_PRESERVED_TRX;
+  }
+
+  bool execute(THD *thd) override;
+
+ private:
+  std::string m_resume_token;
+};
+
 const char *preserved_trx_dir_value();
 bool preserved_trx_ensure_snapshot_support();
 bool preserved_trx_validate_snapshot_support(bool allow_create_missing);

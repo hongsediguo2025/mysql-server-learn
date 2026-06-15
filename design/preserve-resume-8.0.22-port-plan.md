@@ -351,6 +351,20 @@ Progress notes:
   debug/release normal and release `--skip-log-bin`. This slice covers user
   locks and HANDLER-open context only; replication/GR, cursors, stored program
   context, and full record-backed INVALID_STATE handling remain later work.
+- 2026-06-16: added the first registry-backed RESUME token lookup staging
+  slice. RED was `resume_registry_lookup_staging_debug` returning
+  `ER_PRESERVE_TRX_NOT_FOUND` for an injected registry token because the
+  parser discarded the literal and RESUME still used the legacy command shell.
+  GREEN added `Sql_cmd_resume_preserved_transaction`, preserved the token from
+  `sql_yacc.yy`, routed RESUME through `Sql_cmd::execute` instead of
+  `preserve_trx_execute_command()`, and returned staged unsupported for
+  registry hits while preserving not-found for true misses. 8.0.22 has no
+  source-branch `LEX::set_rewrite_required()` helper, so this slice deliberately
+  leaves the existing token-redaction staging test as the logging guard.
+  Debug/release builds passed, and the migrated preserve_trx shell MTR set
+  passed in four modes. This is token lookup plumbing only; attach, owner-token
+  matching, durable registry recovery, and activation remain later Batch 1/2
+  work.
 - 2026-06-16: ported `validation_and_privileges` as the staging validation and
   privilege shell. RED was `PREPARE SHUTDOWN PRESERVE TRANSACTION` outside an
   active transaction returning generic unsupported; GREEN passed debug/release
