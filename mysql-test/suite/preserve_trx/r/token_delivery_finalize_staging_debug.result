@@ -1,0 +1,17 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET SESSION debug='+d,preserve_trx_debug_pending_token_delivery_no_shutdown';
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug='-d,preserve_trx_debug_pending_token_delivery_no_shutdown';
+SELECT TOKEN, STATE
+FROM performance_schema.preserved_transactions
+WHERE TOKEN='debug-delivery-token';
+TOKEN	STATE
+debug-delivery-token	PRESERVED
+SET SESSION debug='+d,preserve_trx_clear_debug_observable_records';
+SELECT COUNT(*) AS after_clear
+FROM performance_schema.preserved_transactions
+WHERE TOKEN='debug-delivery-token';
+after_clear
+0
+SET SESSION debug='-d,preserve_trx_clear_debug_observable_records';
+SET GLOBAL preserve_trx_enable=OFF;

@@ -79,6 +79,7 @@
 #include "sql/parse_location.h"
 #include "sql/protocol.h"
 #include "sql/protocol_classic.h"
+#include "sql/preserve_trx.h"
 #include "sql/psi_memory_key.h"
 #include "sql/query_result.h"
 #include "sql/rpl_rli.h"    // Relay_log_info
@@ -1038,6 +1039,7 @@ void THD::release_resources() {
   mysql_mutex_unlock(&LOCK_thd_query);
 
   stmt_map.reset(); /* close all prepared statements */
+  preserved_trx_release_resources(this);
   if (!cleanup_done) cleanup();
 
   mdl_context.destroy();

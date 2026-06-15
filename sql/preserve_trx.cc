@@ -29,6 +29,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #ifndef _WIN32
@@ -48,6 +49,7 @@
 #include "sql/auth/auth_acls.h"
 #include "sql/auth/auth_common.h"
 #include "sql/auth/sql_security_ctx.h"
+#include "sql/debug_sync.h"
 #include "sql/item.h"
 #include "sql/mysqld.h"
 #include "sql/preserve_trx_xid.h"
@@ -112,6 +114,17 @@ std::atomic<ulonglong> g_warmcopy_provider_full_copy_to_count{0};
 std::atomic<ulonglong> g_warmcopy_phase2_pause_us{0};
 std::mutex g_preserved_trx_registry_mutex;
 Preserved_trx_view_rows g_preserved_trx_registry;
+
+struct Pending_token_delivery {
+  std::string token;
+  bool response_observed{false};
+  bool ok_delivered{false};
+  bool finalizing{false};
+  bool request_shutdown{true};
+};
+
+std::mutex g_token_delivery_mutex;
+std::unordered_map<THD *, Pending_token_delivery> g_pending_token_delivery;
 
 constexpr Preserved_trx_column_metadata kPreservedTrxColumns[] = {
     {"TOKEN", PRESERVE_TRX_TOKEN_MAX_LENGTH},
@@ -547,6 +560,22 @@ Preserved_trx_view_row make_debug_observable_record() {
   return row;
 }
 
+Preserved_trx_view_row make_debug_delivery_record() {
+  Preserved_trx_view_row row;
+  row.token = "debug-delivery-token";
+  row.user = "debug_user";
+  row.host = "debug_host";
+  row.owner_user = row.user;
+  row.owner_host = row.host;
+  row.state = "PENDING";
+  row.isolation = "REPEATABLE-READ";
+  row.binlog_state = "NONE";
+  row.binlog_warmcopy_state = "NONE";
+  row.temp_table_state = "NONE";
+  row.last_error = "debug pending token delivery";
+  return row;
+}
+
 void insert_debug_observable_record_if_missing() MY_ATTRIBUTE((unused));
 void insert_debug_observable_record_if_missing() {
   std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
@@ -566,9 +595,22 @@ void clear_debug_observable_records() {
       std::remove_if(g_preserved_trx_registry.begin(),
                      g_preserved_trx_registry.end(),
                      [](const Preserved_trx_view_row &row) {
-                       return row.token == "debug-observable-token";
+                       return row.token == "debug-observable-token" ||
+                              row.token == "debug-delivery-token";
                      }),
       g_preserved_trx_registry.end());
+}
+
+void insert_debug_delivery_record_if_missing() MY_ATTRIBUTE((unused));
+void insert_debug_delivery_record_if_missing() {
+  std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
+  const auto it = std::find_if(
+      g_preserved_trx_registry.begin(), g_preserved_trx_registry.end(),
+      [](const Preserved_trx_view_row &row) {
+        return row.token == "debug-delivery-token";
+      });
+  if (it == g_preserved_trx_registry.end())
+    g_preserved_trx_registry.push_back(make_debug_delivery_record());
 }
 
 bool preserved_trx_registry_contains_token(const std::string &token) {
@@ -578,6 +620,29 @@ bool preserved_trx_registry_contains_token(const std::string &token) {
                      [&token](const Preserved_trx_view_row &row) {
                        return row.token == token;
                      });
+}
+
+bool preserved_trx_mark_resumable(const std::string &token) {
+  std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
+  for (Preserved_trx_view_row &row : g_preserved_trx_registry) {
+    if (row.token == token) {
+      row.state = "PRESERVED";
+      row.last_error.clear();
+      return false;
+    }
+  }
+  return true;
+}
+
+void preserved_trx_remove_registry_record(const std::string &token) {
+  std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
+  g_preserved_trx_registry.erase(
+      std::remove_if(g_preserved_trx_registry.begin(),
+                     g_preserved_trx_registry.end(),
+                     [&token](const Preserved_trx_view_row &row) {
+                       return row.token == token;
+                     }),
+      g_preserved_trx_registry.end());
 }
 
 bool string_eq_lex_cstring(const std::string &value,
@@ -716,6 +781,79 @@ bool preserved_trx_ensure_snapshot_support() {
   return !preserved_trx_validate_snapshot_support(true);
 }
 
+void preserved_trx_register_pending_token_delivery(THD *thd,
+                                                   const std::string &token,
+                                                   bool request_shutdown) {
+  if (thd == nullptr) return;
+  std::lock_guard<std::mutex> lock(g_token_delivery_mutex);
+  g_pending_token_delivery[thd] = {
+      token, false, false, false, request_shutdown};
+}
+
+bool preserved_trx_has_pending_token_delivery(THD *thd) {
+  std::lock_guard<std::mutex> lock(g_token_delivery_mutex);
+  return g_pending_token_delivery.find(thd) != g_pending_token_delivery.end();
+}
+
+bool preserved_trx_begin_pending_token_delivery_finalization(
+    THD *thd, std::string *token, bool *ok_delivered,
+    bool *request_shutdown) {
+  std::lock_guard<std::mutex> lock(g_token_delivery_mutex);
+  auto it = g_pending_token_delivery.find(thd);
+  if (it == g_pending_token_delivery.end() || it->second.finalizing)
+    return false;
+
+  if (!it->second.response_observed && thd != nullptr) {
+    Diagnostics_area *da = thd->get_stmt_da();
+    it->second.response_observed = true;
+    it->second.ok_delivered = da->is_sent() && da->is_ok();
+  }
+
+  it->second.finalizing = true;
+  if (token != nullptr) *token = it->second.token;
+  if (ok_delivered != nullptr) *ok_delivered = it->second.ok_delivered;
+  if (request_shutdown != nullptr)
+    *request_shutdown = it->second.request_shutdown;
+  return true;
+}
+
+void preserved_trx_erase_pending_token_delivery(THD *thd) {
+  std::lock_guard<std::mutex> lock(g_token_delivery_mutex);
+  g_pending_token_delivery.erase(thd);
+}
+
+void preserved_trx_finalize_statement_response(THD *thd) {
+  if (!preserved_trx_has_pending_token_delivery(thd)) return;
+
+  DEBUG_SYNC(thd, "preserve_trx_finalize_token_delivery");
+
+  std::string token;
+  bool ok_delivered = false;
+  bool request_shutdown = false;
+  if (!preserved_trx_begin_pending_token_delivery_finalization(
+          thd, &token, &ok_delivered, &request_shutdown)) {
+    return;
+  }
+
+  if (ok_delivered) {
+    if (preserved_trx_mark_resumable(token)) {
+      preserved_trx_remove_registry_record(token);
+      preserved_trx_erase_pending_token_delivery(thd);
+      return;
+    }
+    preserved_trx_erase_pending_token_delivery(thd);
+    if (request_shutdown) kill_mysql();
+    return;
+  }
+
+  preserved_trx_remove_registry_record(token);
+  preserved_trx_erase_pending_token_delivery(thd);
+}
+
+void preserved_trx_release_resources(THD *thd) {
+  preserved_trx_finalize_statement_response(thd);
+}
+
 void preserve_trx_warmcopy_note_prefix_bytes(uint64_t bytes) {
   g_warmcopy_prefix_bytes.fetch_add(bytes);
 }
@@ -766,6 +904,14 @@ static bool preserve_trx_handle_prepare_shutdown(THD *thd) {
     my_error(ER_PRESERVE_TRX_INVALID_STATE, MYF(0));
     return true;
   }
+
+  DBUG_EXECUTE_IF("preserve_trx_debug_pending_token_delivery_no_shutdown", {
+    insert_debug_delivery_record_if_missing();
+    preserved_trx_register_pending_token_delivery(
+        thd, "debug-delivery-token", false);
+    my_ok(thd);
+    return false;
+  });
 
   if (thd_has_unsupported_preserve_context(thd)) {
     my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));

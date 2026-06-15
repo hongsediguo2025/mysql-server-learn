@@ -2174,6 +2174,10 @@ done:
   thd->update_slow_query_status();
   if (thd->killed) thd->send_kill_message();
   thd->send_statement_status();
+  bool skip_preserve_finalize = false;
+  DBUG_EXECUTE_IF("preserve_trx_skip_dispatch_finalize_statement_response",
+                  skip_preserve_finalize = true;);
+  if (!skip_preserve_finalize) preserved_trx_finalize_statement_response(thd);
 
   /* After sending response, switch to clone protocol */
   if (clone_cmd != nullptr) {

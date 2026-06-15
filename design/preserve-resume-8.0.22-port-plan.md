@@ -382,6 +382,21 @@ Progress notes:
   `unsupported_single_instance_guards` test was adjusted to the same
   invalid-state contract for no-active-transaction PREPARE while DRAIN remains
   unsupported until Batch 4 runtime migration.
+- 2026-06-16: added the first token-delivery finalization staging slice. RED
+  was `token_delivery_finalize_staging_debug` returning
+  `ER_PRESERVE_TRX_INVALID_STATE` because the 8.0.22 shell still had no
+  post-response delivery hook. GREEN added a guarded pending-delivery registry,
+  called `preserved_trx_finalize_statement_response()` from
+  `dispatch_command()` immediately after `thd->send_statement_status()`, and
+  added the disconnect fallback in `THD::release_resources()` after
+  `stmt_map.reset()`, matching the source-branch lifecycle point. The debug
+  staging hook uses `request_shutdown=false`, so the test can prove that an OK
+  response transitions the injected token from `PENDING` to `PRESERVED` without
+  shutting down the MTR server. Debug/release builds passed, the new debug-only
+  test passed in debug, release skipped it via `have_debug.inc`, and the
+  migrated preserve_trx shell MTR set passed in four modes. This is statement
+  response/finalizer plumbing only; real durable token generation and
+  shutdown-after-delivery remain Batch 2 work.
 - 2026-06-16: imported the source branch bundle/carrier/file/temp-manifest codec
   layer into the 8.0.22 tree as a buildable infrastructure slice:
   `sql/preserve_trx_bundle.{cc,h}`, `sql/preserve_trx_carrier.{cc,h}`,

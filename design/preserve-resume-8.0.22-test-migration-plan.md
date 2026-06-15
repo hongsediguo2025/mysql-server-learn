@@ -357,6 +357,18 @@ Evidence:
   SHUTDOWN privilege enforcement to the staging shell. The older
   `unsupported_single_instance_guards` staging test was narrowed to the same
   invalid-state contract for PREPARE while keeping DRAIN as unsupported.
+- 2026-06-16 RED: `token_delivery_finalize_staging_debug` failed with
+  `ER_PRESERVE_TRX_INVALID_STATE`, proving the 8.0.22 shell had no token
+  delivery finalizer after a successful statement response.
+- 2026-06-16 GREEN: `token_delivery_finalize_staging_debug` passed after adding
+  the pending token-delivery registry plus the 8.0.22 lifecycle hooks:
+  `preserved_trx_finalize_statement_response()` after
+  `thd->send_statement_status()` in `dispatch_command()`, and
+  `preserved_trx_release_resources()` after `stmt_map.reset()` in
+  `THD::release_resources()`. Debug and release builds passed. The migrated
+  shell MTR set passed in four modes: debug normal-binlog, debug
+  `--skip-log-bin`, release normal-binlog, and release `--skip-log-bin`.
+  Release runs skip this debug-only staging test through `have_debug.inc`.
 - 2026-06-16 GREEN debug/release build: the bundle/carrier/file/temp-manifest
   codec layer was imported and linked into `mysqld`:
   `sql/preserve_trx_bundle.{cc,h}`, `sql/preserve_trx_carrier.{cc,h}`,
