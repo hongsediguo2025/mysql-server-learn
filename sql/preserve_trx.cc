@@ -44,10 +44,13 @@
 #include "mysql/components/services/log_builtins.h"
 #include "mysqld_error.h"
 #include "sha2.h"
+#include "sql/auth/auth_acls.h"
+#include "sql/auth/auth_common.h"
 #include "sql/auth/sql_security_ctx.h"
 #include "sql/item.h"
 #include "sql/mysqld.h"
 #include "sql/protocol.h"
+#include "sql/query_options.h"
 #include "sql/sql_class.h"
 #include "sql/sql_lex.h"
 
@@ -561,6 +564,32 @@ ulonglong preserve_trx_warmcopy_phase2_pause_us_status() {
   return g_warmcopy_phase2_pause_us.load();
 }
 
+static bool preserve_trx_requires_shutdown_acl(enum_sql_command command) {
+  return command == SQLCOM_PREPARE_SHUTDOWN_PRESERVE ||
+         command == SQLCOM_DRAIN_TRANSACTIONS_PRESERVE;
+}
+
+static bool preserve_trx_handle_prepare_shutdown(THD *thd) {
+  if (thd == nullptr) {
+    my_error(ER_PRESERVE_TRX_INVALID_STATE, MYF(0));
+    return true;
+  }
+
+  if (!thd->in_active_multi_stmt_transaction() ||
+      (thd->variables.option_bits & OPTION_NOT_AUTOCOMMIT)) {
+    my_error(ER_PRESERVE_TRX_INVALID_STATE, MYF(0));
+    return true;
+  }
+
+  if (thd->temporary_tables != nullptr || preserve_trx_max_scan_pages == 0) {
+    my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+    return true;
+  }
+
+  my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+  return true;
+}
+
 bool preserve_trx_execute_command(THD *thd) {
   DBUG_TRACE;
 
@@ -569,8 +598,25 @@ bool preserve_trx_execute_command(THD *thd) {
     return true;
   }
 
-  if (thd != nullptr && thd->lex != nullptr &&
-      thd->lex->sql_command == SQLCOM_RESUME_PRESERVED_TRX) {
+  const enum_sql_command command =
+      thd != nullptr && thd->lex != nullptr ? thd->lex->sql_command
+                                            : SQLCOM_END;
+
+  if (preserve_trx_requires_shutdown_acl(command) &&
+      check_global_access(thd, SHUTDOWN_ACL)) {
+    return true;
+  }
+
+  if (command == SQLCOM_PREPARE_SHUTDOWN_PRESERVE) {
+    return preserve_trx_handle_prepare_shutdown(thd);
+  }
+
+  if (command == SQLCOM_DRAIN_TRANSACTIONS_PRESERVE) {
+    my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+    return true;
+  }
+
+  if (command == SQLCOM_RESUME_PRESERVED_TRX) {
     if (thd_has_unsupported_resume_context(thd)) {
       my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
       return true;

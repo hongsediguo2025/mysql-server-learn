@@ -139,8 +139,12 @@ Tests:
   has no durable token registry yet, this slice verifies missing-token RESUME
   for quoted and hex literals under `log_raw=ON`; it does not claim successful
   token-delivery or registry-backed RESUME redaction yet.
+- `validation_and_privileges.test` - ported as an 8.0.22 Batch 1 staging test
+  for validation taxonomy and privilege gates. It verifies drain sysvar
+  defaults, SHUTDOWN privilege enforcement for PREPARE, RESUME_ANY privilege
+  shell behavior, and the current unsupported runtime boundaries without
+  claiming durable token generation.
 - `token_visibility_redaction.test`;
-- `validation_and_privileges.test`;
 - bundle/carrier gunit.
 
 Evidence:
@@ -238,6 +242,14 @@ Evidence:
   `--skip-log-bin` after adding RESUME-specific SQL rewrite and raw
   general-log redaction; normal-binlog runs correctly skip through
   `include/not_log_bin.inc`.
+- 2026-06-16 RED: `validation_and_privileges` failed because
+  `PREPARE SHUTDOWN PRESERVE TRANSACTION` outside an active transaction returned
+  generic unsupported instead of `ER_PRESERVE_TRX_INVALID_STATE`.
+- 2026-06-16 GREEN debug/release: `validation_and_privileges` passed with
+  normal binlog and `--skip-log-bin` after adding PREPARE state taxonomy and
+  SHUTDOWN privilege enforcement to the staging shell. The older
+  `unsupported_single_instance_guards` staging test was narrowed to the same
+  invalid-state contract for PREPARE while keeping DRAIN as unsupported.
 
 ## Batch 2 Tests
 

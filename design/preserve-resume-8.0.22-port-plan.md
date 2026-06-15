@@ -308,6 +308,14 @@ Progress notes:
   debug/release normal and release `--skip-log-bin`. This slice covers user
   locks and HANDLER-open context only; replication/GR, cursors, stored program
   context, and full record-backed INVALID_STATE handling remain later work.
+- 2026-06-16: ported `validation_and_privileges` as the staging validation and
+  privilege shell. RED was `PREPARE SHUTDOWN PRESERVE TRANSACTION` outside an
+  active transaction returning generic unsupported; GREEN passed debug/release
+  normal and `--skip-log-bin` after adding SHUTDOWN privilege enforcement and
+  PREPARE invalid-state taxonomy. The existing
+  `unsupported_single_instance_guards` test was adjusted to the same
+  invalid-state contract for no-active-transaction PREPARE while DRAIN remains
+  unsupported until Batch 4 runtime migration.
 - These current slices do not claim full carrier or token ACL/redaction. Those
   remain in Batch 1.
 - Because the current 8.0.22 port is still an unsupported shell, it keeps
