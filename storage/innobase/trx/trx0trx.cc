@@ -52,6 +52,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "srv0mon.h"
 #include "srv0srv.h"
 #include "srv0start.h"
+#include "sql/preserve_trx_xid.h"
 #include "trx0purge.h"
 #include "trx0rec.h"
 #include "trx0roll.h"
@@ -2996,7 +2997,8 @@ int trx_recover_for_mysql(
     from or to NOT_STARTED while we are holding the
     trx_sys->mutex. It may change to PREPARED, but not if
     trx->is_recovered. */
-    if (trx_state_eq(trx, TRX_STATE_PREPARED)) {
+    if (trx_state_eq(trx, TRX_STATE_PREPARED) &&
+        !xid_is_preserve_magic(*trx->xid)) {
       if (get_info_about_prepared_transaction(&txn_list[count], trx, mem_root))
         break;
 
@@ -3066,7 +3068,7 @@ static MY_ATTRIBUTE((warn_unused_result)) trx_t *trx_get_trx_by_xid_low(
 trx_t *trx_get_trx_by_xid(const XID *xid) {
   trx_t *trx;
 
-  if (xid == nullptr) {
+  if (xid == nullptr || xid_is_preserve_magic(*xid)) {
     return (nullptr);
   }
 

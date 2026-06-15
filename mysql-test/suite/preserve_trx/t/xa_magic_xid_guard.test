@@ -1,0 +1,14 @@
+--echo # Preserve magic XID is reserved for internal tokens.
+--error ER_XAER_INVAL
+XA START 'MSP_PRES','tok',1836281843;
+--error ER_XAER_INVAL
+XA PREPARE 'MSP_PRES','tok',1836281843;
+
+--echo # The same formatID remains valid for non-magic XA gtrids.
+CREATE TABLE t_xa_magic_guard(a INT PRIMARY KEY) ENGINE=InnoDB;
+XA START 'MSP_USER','tok',1836281843;
+INSERT INTO t_xa_magic_guard VALUES(1);
+XA END 'MSP_USER','tok',1836281843;
+XA ROLLBACK 'MSP_USER','tok',1836281843;
+SELECT COUNT(*) AS row_count_after_rollback FROM t_xa_magic_guard;
+DROP TABLE t_xa_magic_guard;

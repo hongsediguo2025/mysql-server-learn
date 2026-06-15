@@ -621,6 +621,21 @@ void trx_sys_before_pre_dd_shutdown_validate() {
   trx_sys_mutex_exit();
 }
 
+static size_t trx_sys_preserved_trxs_count() {
+  size_t total_trx = 0;
+
+  trx_sys_mutex_enter();
+  for (trx_t *trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
+       trx = UT_LIST_GET_NEXT(trx_list, trx)) {
+    if (trx_state_eq(trx, TRX_STATE_PRESERVED)) {
+      total_trx++;
+    }
+  }
+  trx_sys_mutex_exit();
+
+  return (total_trx);
+}
+
 void trx_sys_after_pre_dd_shutdown_validate() {
   trx_sys_mutex_enter();
   /** At this point we check the mysql_trx_list again, now we don't expect purge
@@ -636,13 +651,14 @@ void trx_sys_after_pre_dd_shutdown_validate() {
   [2] Not fast shutdown
   [3] The rollback thread has started and stopped gracefully.
 
-  The only left transactions are those that have state == TRX_STATE_PREPARED.
+  The only left transactions are prepared, preserved, or active recovered.
 
   Above, [3] could be false during error exit, when the rollback thread might
   never have started and we don't rollback the recovered transactions in that
   case. */
 
   const auto active_recovered_trxs = trx_sys_recovered_active_trxs_count();
+  const auto preserved_trxs = trx_sys_preserved_trxs_count();
   if (srv_shutdown_waits_for_rollback_of_recovered_transactions() &&
       srv_thread_is_stopped(srv_threads.m_trx_recovery_rollback)) {
     ut_a(active_recovered_trxs == 0);
@@ -650,7 +666,7 @@ void trx_sys_after_pre_dd_shutdown_validate() {
 
   trx_sys_mutex_enter();
   ut_a(UT_LIST_GET_LEN(trx_sys->rw_trx_list) ==
-       trx_sys->n_prepared_trx + active_recovered_trxs);
+       trx_sys->n_prepared_trx + preserved_trxs + active_recovered_trxs);
   trx_sys_mutex_exit();
 }
 

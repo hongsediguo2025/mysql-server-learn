@@ -169,6 +169,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "os0thread.h"
 #include "sql/item.h"
 #include "sql/json_dom.h"
+#include "sql/preserve_trx_xid.h"
 #include "sql_base.h"
 #include "srv0tmp.h"
 #include "trx0rec.h"
@@ -19245,6 +19246,10 @@ static xa_status_code innobase_commit_by_xid(
 {
   DBUG_ASSERT(hton == innodb_hton_ptr);
 
+  if (xid != nullptr && xid_is_preserve_magic(*xid)) {
+    return (XAER_NOTA);
+  }
+
   trx_t *trx = trx_get_trx_by_xid(xid);
 
   if (trx != nullptr) {
@@ -19272,6 +19277,10 @@ static xa_status_code innobase_rollback_by_xid(
                       identification */
 {
   DBUG_ASSERT(hton == innodb_hton_ptr);
+
+  if (xid != nullptr && xid_is_preserve_magic(*xid)) {
+    return (XAER_NOTA);
+  }
 
   trx_t *trx = trx_get_trx_by_xid(xid);
 

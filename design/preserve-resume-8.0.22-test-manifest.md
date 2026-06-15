@@ -530,5 +530,6 @@ Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 sta
 |---|---|---|---|
 | `mysql-test/suite/preserve_trx/t/feature_off_normal_transaction_smoke.test` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed; proves feature-off normal transaction behavior before any runtime migration. |
 | `mysql-test/suite/preserve_trx/t/feature_off_binlog_temp_table_smoke.test` | Batch 0 | moved-round-a | 2026-06-15 debug and release MTR passed; proves feature-off binlog and temporary table behavior before any runtime migration. |
+| `mysql-test/suite/preserve_trx/t/xa_magic_xid_guard.test` | Batch 2 | ported | 8.0.22 target-only guard for preserve magic-XID isolation. RED showed user `XA START 'MSP_PRES','tok',1836281843` succeeded before the SQL guard was rebuilt; GREEN passed debug/release single-test MTR and debug/release normal plus `--skip-log-bin` migrated-shell regression on 2026-06-16. |
 | `mysql-test/suite/preserve_trx/t/warmcopy_default_off_normal_binlog_smoke.test` | Batch 5 | pending | Proves warm-copy integration is parameter-isolated when disabled. |
 | `mysql-test/suite/preserve_trx/t/warmcopy_parameter_isolation.test` | Batch 5 | pending | Proves warm-copy knobs do not affect ordinary binlog cache paths when disabled. |

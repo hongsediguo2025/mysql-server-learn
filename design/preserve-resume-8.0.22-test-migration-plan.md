@@ -325,6 +325,10 @@ Current migration status:
   debug/release build plus the migrated preserve_trx shell MTR regression, but
   still does not satisfy `basic_resume`, lock, ReadView, savepoint, or rollback
   behavior tests.
+- 2026-06-16: `xa_magic_xid_guard` covers the magic-XID isolation prerequisite
+  for Batch 2. SQL `XA START/PREPARE` reject the internal preserve XID prefix,
+  and the InnoDB XA entry points filter the same XID family from XA recover and
+  commit/rollback-by-XID.
 
 Tests:
 

@@ -419,6 +419,12 @@ Current 8.0.22 landing status:
   without making `trx_preserve_claim_prepared()` return live transactions yet.
   Public preserve/resume behavior remains fail-closed until claim/rollback,
   attach/detach, ReadView, lock, savepoint, and undo activation are ported.
+- 2026-06-16: ported the preserve magic-XID isolation guard. User SQL cannot
+  start or prepare an XA branch with the internal preserve XID prefix, InnoDB
+  XA recover skips preserve magic XIDs, and InnoDB commit/rollback-by-XID
+  returns `XAER_NOTA` for preserve magic XIDs. The new
+  `xa_magic_xid_guard` MTR proves the internal XID is rejected while the same
+  format ID remains usable for non-magic XA gtrids.
 
 ## Batch 3: Recovery And Failure Windows
 
