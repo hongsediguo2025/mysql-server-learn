@@ -152,6 +152,7 @@ static void trx_init(trx_t *trx) {
   trx->skip_lock_inheritance = false;
 
   trx->is_recovered = false;
+  trx->preserve_trx_claimed = false;
 
   trx->op_info = "";
 
@@ -598,7 +599,8 @@ void trx_free_prepared_or_active_recovered(trx_t *trx) {
     ut_a(trx->is_recovered);
     expected_undo_state = TRX_UNDO_ACTIVE;
   } else {
-    ut_a(trx_state_eq(trx, TRX_STATE_PREPARED));
+    ut_a(trx_state_eq(trx, TRX_STATE_PREPARED) ||
+         trx_state_eq(trx, TRX_STATE_PRESERVED));
     expected_undo_state = TRX_UNDO_PREPARED;
   }
 
@@ -2183,6 +2185,7 @@ void trx_commit_or_rollback_prepare(trx_t *trx) /*!< in/out: transaction */
 
     case TRX_STATE_ACTIVE:
     case TRX_STATE_PREPARED:
+    case TRX_STATE_PRESERVED:
 
       /* If the trx is in a lock wait state, moves the waiting
       query thread to the suspended state */
@@ -2313,6 +2316,7 @@ dberr_t trx_commit_for_mysql(trx_t *trx) /*!< in/out: transaction */
       MONITOR_DEC(MONITOR_TRX_ACTIVE);
       trx->op_info = "";
       return (DB_SUCCESS);
+    case TRX_STATE_PRESERVED:
     case TRX_STATE_COMMITTED_IN_MEMORY:
       break;
   }
@@ -2348,6 +2352,7 @@ void trx_mark_sql_stat_end(trx_t *trx) /*!< in: trx handle */
 
   switch (trx->state) {
     case TRX_STATE_PREPARED:
+    case TRX_STATE_PRESERVED:
     case TRX_STATE_COMMITTED_IN_MEMORY:
       break;
     case TRX_STATE_NOT_STARTED:
@@ -2407,6 +2412,10 @@ void trx_print_low(FILE *f,
       goto state_ok;
     case TRX_STATE_PREPARED:
       fprintf(f, ", ACTIVE (PREPARED) %lu sec",
+              (ulong)difftime(time(nullptr), trx->start_time));
+      goto state_ok;
+    case TRX_STATE_PRESERVED:
+      fprintf(f, ", ACTIVE (PRESERVED) %lu sec",
               (ulong)difftime(time(nullptr), trx->start_time));
       goto state_ok;
     case TRX_STATE_COMMITTED_IN_MEMORY:
@@ -2535,6 +2544,7 @@ ibool trx_assert_started(const trx_t *trx) /*!< in: transaction */
 
   switch (trx->state) {
     case TRX_STATE_PREPARED:
+    case TRX_STATE_PRESERVED:
       return (TRUE);
 
     case TRX_STATE_ACTIVE:
@@ -3095,6 +3105,7 @@ void trx_start_if_not_started_xa_low(trx_t *trx, bool read_write) {
       }
       return;
     case TRX_STATE_PREPARED:
+    case TRX_STATE_PRESERVED:
     case TRX_STATE_COMMITTED_IN_MEMORY:
       break;
   }
@@ -3121,6 +3132,7 @@ void trx_start_if_not_started_low(trx_t *trx, bool read_write) {
       return;
 
     case TRX_STATE_PREPARED:
+    case TRX_STATE_PRESERVED:
     case TRX_STATE_COMMITTED_IN_MEMORY:
       break;
   }

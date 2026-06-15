@@ -320,6 +320,11 @@ Current migration status:
   implicit-lock materialization, attach/detach, and rollback/activation paths
   unsupported. The positive Batch 2 MTR tests must remain pending until those
   kernel paths are ported with real debug/release behavior evidence.
+- 2026-06-16: the target kernel can now represent `TRX_STATE_PRESERVED` and
+  the `trx_t::preserve_trx_claimed` ownership bit. The slice is covered by
+  debug/release build plus the migrated preserve_trx shell MTR regression, but
+  still does not satisfy `basic_resume`, lock, ReadView, savepoint, or rollback
+  behavior tests.
 
 Tests:
 

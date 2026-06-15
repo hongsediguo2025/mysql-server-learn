@@ -198,6 +198,7 @@ static dberr_t trx_rollback_low(trx_t *trx) {
       return (trx_rollback_for_mysql_low(trx));
 
     case TRX_STATE_PREPARED:
+    case TRX_STATE_PRESERVED:
       /* Check an validate that undo is available for GTID. */
       trx_undo_gtid_add_update_undo(trx, false, true);
       ut_ad(!trx_is_autocommit_non_locking(trx));
@@ -313,6 +314,7 @@ dberr_t trx_rollback_last_sql_stat_for_mysql(
       return (err);
 
     case TRX_STATE_PREPARED:
+    case TRX_STATE_PRESERVED:
     case TRX_STATE_COMMITTED_IN_MEMORY:
       /* The statement rollback is only allowed on an ACTIVE
       transaction, not a PREPARED or COMMITTED one. */
@@ -460,6 +462,7 @@ dberr_t trx_rollback_to_savepoint_for_mysql(
                                                       mysql_binlog_cache_pos));
 
     case TRX_STATE_PREPARED:
+    case TRX_STATE_PRESERVED:
     case TRX_STATE_COMMITTED_IN_MEMORY:
       /* The savepoint rollback is only allowed on an ACTIVE
       transaction, not a PREPARED or COMMITTED one. */
@@ -666,6 +669,7 @@ static ibool trx_rollback_or_clean_resurrected(
       }
       return (FALSE);
     case TRX_STATE_PREPARED:
+    case TRX_STATE_PRESERVED:
       return (FALSE);
     case TRX_STATE_NOT_STARTED:
     case TRX_STATE_FORCED_ROLLBACK:

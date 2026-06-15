@@ -114,7 +114,11 @@ uint64_t trx_preserve_trx_id(const trx_t *trx) {
   return trx != nullptr ? trx->id : 0;
 }
 
-void trx_preserve_release_claim_before_free(trx_t *trx) { (void)trx; }
+void trx_preserve_release_claim_before_free(trx_t *trx) {
+  if (trx != nullptr) {
+    trx->preserve_trx_claimed = false;
+  }
+}
 
 bool trx_preserve_current_thd_has_read_view(THD *thd) {
   (void)thd;

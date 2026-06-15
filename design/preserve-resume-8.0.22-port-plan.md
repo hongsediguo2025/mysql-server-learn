@@ -412,6 +412,13 @@ Current 8.0.22 landing status:
   with behavior tests. Do not relax SQL admission from `DB_UNSUPPORTED` until
   the corresponding kernel path has both debug/release build evidence and MTR
   coverage.
+- 2026-06-16: added the `TRX_STATE_PRESERVED` enum value, the
+  `trx_t::preserve_trx_claimed` ownership field, initialization/reset, and
+  state switch handling in transaction, rollback, diagnostic, and debug helper
+  code. This lets the 8.0.22 kernel safely represent the preserve lifecycle
+  without making `trx_preserve_claim_prepared()` return live transactions yet.
+  Public preserve/resume behavior remains fail-closed until claim/rollback,
+  attach/detach, ReadView, lock, savepoint, and undo activation are ported.
 
 ## Batch 3: Recovery And Failure Windows
 
