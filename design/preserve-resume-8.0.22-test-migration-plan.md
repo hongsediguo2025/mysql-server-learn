@@ -383,12 +383,30 @@ Purpose: user temporary tables.
 
 Tests:
 
-- `temp_table_default_off_unsupported.test`;
+- `temp_table_default_off_unsupported.test` remains a historical source test
+  name; the 8.0.22 final release contract is default ON, so ported tests must
+  verify explicit-OFF safety and default-ON fail-closed behavior separately;
 - `temp_table_basic_commit_after_resume.test`;
 - `temp_table_rollback_after_resume.test`;
 - `temp_table_corrupt_image_recovery.test`;
 - `temp_table_space_id_reserved_on_restart.test`;
 - `batch_drain_temp_table_100_sessions.test`.
+
+Evidence:
+
+- 2026-06-16 GREEN debug/release build: added SQL/THD staging state and helper
+  declarations for the user temporary-table preserve interface. The helpers
+  are wired into the preserve/resume unsupported-context shell and remain
+  fail-closed for sessions with user temporary tables until the InnoDB temp
+  image/rebind runtime is ported. This is an interface/contract slice only; it
+  does not claim `temp_table_basic_commit_after_resume` or any positive temp
+  image/rebind behavior.
+- 2026-06-16 GREEN post-temp-shell MTR regression: debug normal-binlog passed
+  with 20 successful and 2 expected `not_log_bin` skips; debug
+  `--skip-log-bin` passed with 22 successful; release normal-binlog passed
+  with 19 successful, 2 expected `not_log_bin` skips, and 1 expected
+  debug-only skip; release `--skip-log-bin` passed with 21 successful and 1
+  expected debug-only skip.
 
 ## Batch 7 Tests
 

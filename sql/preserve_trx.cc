@@ -478,7 +478,8 @@ bool thd_has_resume_any_preserved_transaction(THD *thd) {
 bool thd_has_unsupported_preserve_context(THD *thd) {
   if (thd == nullptr) return true;
   return thd->locked_tables_mode != LTM_NONE || !thd->ull_hash.empty() ||
-         !thd->handler_tables_hash.empty() || thd->in_sub_stmt != 0;
+         !thd->handler_tables_hash.empty() || thd->in_sub_stmt != 0 ||
+         !::preserve_trx_temp_table_session_supported(thd);
 }
 
 bool thd_has_unsupported_resume_context(THD *thd) {
@@ -486,6 +487,36 @@ bool thd_has_unsupported_resume_context(THD *thd) {
 }
 
 }  // namespace
+
+bool preserve_trx_temp_table_session_needs_eligibility_check(const THD *thd) {
+  return preserve_trx_temp_table_enable && thd != nullptr &&
+         thd->temporary_tables != nullptr;
+}
+
+bool preserve_trx_temp_table_session_supported(THD *thd) {
+  if (thd == nullptr) return false;
+  if (thd->temporary_tables == nullptr) return true;
+  if (!preserve_trx_temp_table_enable) return false;
+
+  /*
+    The 8.0.22 port has not connected the authoritative InnoDB user
+    temporary-table image/rebind runtime yet. Keep the public default-ON
+    sysvar and SQL admission shape visible, but fail closed before any durable
+    token can be generated for sessions that would need temp-table state.
+  */
+  return false;
+}
+
+bool preserve_trx_temp_table_capture_enabled(THD *thd, const TABLE *table) {
+  (void)thd;
+  (void)table;
+  return false;
+}
+
+bool preserve_trx_temp_table_resume_supported(
+    bool snapshot_has_temp_table_manifest) {
+  return !snapshot_has_temp_table_manifest;
+}
 
 std::string preserved_trx_redacted_token(const std::string &token) {
   if (token.empty()) return "****????";
@@ -590,7 +621,8 @@ static bool preserve_trx_handle_prepare_shutdown(THD *thd) {
     return true;
   }
 
-  if (thd->temporary_tables != nullptr || preserve_trx_max_scan_pages == 0) {
+  if (!preserve_trx_temp_table_session_supported(thd) ||
+      preserve_trx_max_scan_pages == 0) {
     my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
     return true;
   }

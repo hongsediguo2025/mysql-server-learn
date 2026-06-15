@@ -118,6 +118,7 @@ class Parser_state;
 class PROFILING;
 class Query_tables_list;
 class Relay_log_info;
+class Temp_table_warmcopy_participant;
 class THD;
 class partition_info;
 class Protocol;
@@ -1308,6 +1309,21 @@ class THD : public MDL_context_owner,
     production binlog mirroring is connected in a later batch.
   */
   uint preserve_trx_warmcopy_participant_id{0};
+  /**
+    Optional user temporary-table preserve participant. The 8.0.22 port keeps
+    this as staging state until the InnoDB temp image/rebind runtime is
+    connected; any session that would need it still fails closed before a
+    durable token is generated. Protected by LOCK_thd_data where it is read
+    together with per-session preserve/drain state.
+  */
+  Temp_table_warmcopy_participant *preserve_trx_temp_table_participant{
+      nullptr};
+  std::atomic<bool> preserve_trx_temp_table_has_participant{false};
+  std::atomic<bool> preserve_trx_temp_table_untracked_change{false};
+  bool preserve_trx_temp_table_no_redo_baseline_valid{false};
+  bool preserve_trx_temp_table_no_redo_baseline_present{false};
+  uint64_t preserve_trx_temp_table_no_redo_baseline_top{0};
+  uint preserve_trx_temp_table_participant_id{0};
   /**
     Mutex protecting access to current_mutex and current_cond.
   */

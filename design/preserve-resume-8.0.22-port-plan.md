@@ -501,8 +501,24 @@ Implementation scope:
 
 Strict isolation:
 
-- `preserve_trx_temp_table_enable=OFF` by default;
-- normal user temporary table behavior must be unchanged when disabled.
+- final release contract is `preserve_trx_temp_table_enable=ON` by default;
+- during intermediate 8.0.22 port slices, any session that would require the
+  not-yet-connected temp image/rebind runtime must fail closed before durable
+  token generation;
+- normal user temporary table behavior must be unchanged when the top-level
+  preserve feature is disabled or when no preserve/drain command is active.
+
+Current 8.0.22 port status:
+
+- 2026-06-16: added SQL/THD staging state for user temporary-table preserve
+  participation and wired the public temp-table admission helpers into the
+  preserve/resume unsupported-context shell. This keeps
+  `preserve_trx_temp_table_enable` default ON and exposes the interface shape
+  needed by later Batch 6 work, but still returns fail-closed for sessions that
+  have user temporary tables because the authoritative InnoDB temp
+  image/rebind runtime is not yet connected. Debug/release `mysqld mysqltest`
+  builds passed, and the migrated preserve_trx shell MTR set passed in
+  debug/release with normal binlog and `--skip-log-bin`.
 
 ## Batch 7: Long Matrix, Python E2E, Final Hardening
 

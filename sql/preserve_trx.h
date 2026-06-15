@@ -31,6 +31,7 @@
 #include "sql/sql_cmd.h"
 
 class THD;
+struct TABLE;
 
 extern bool preserve_trx_enable;
 extern bool preserve_trx_temp_table_enable;
@@ -76,6 +77,11 @@ struct Preserve_trx_options {
 };
 
 bool preserve_trx_execute_command(THD *thd);
+bool preserve_trx_temp_table_session_needs_eligibility_check(const THD *thd);
+bool preserve_trx_temp_table_session_supported(THD *thd);
+bool preserve_trx_temp_table_capture_enabled(THD *thd, const TABLE *table);
+bool preserve_trx_temp_table_resume_supported(
+    bool snapshot_has_temp_table_manifest);
 class Sql_cmd_show_preserved_transactions final : public Sql_cmd {
  public:
   enum_sql_command sql_command_code() const override {
