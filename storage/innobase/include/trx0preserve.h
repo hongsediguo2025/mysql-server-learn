@@ -126,6 +126,8 @@ dberr_t trx_preserve_export_savepoints(THD *thd, std::string *payload);
 dberr_t trx_preserve_import_savepoints(
     trx_t *trx, const std::string &payload,
     const std::vector<std::string> &savepoint_names);
+dberr_t trx_preserve_import_current_thd_savepoints(THD *thd,
+                                                  const std::string &payload);
 bool trx_preserve_savepoints_payload_is_valid_for_import(
     const std::string &payload, uint32_t *savepoint_count);
 dberr_t trx_preserve_set_isolation(trx_t *trx, uint8_t tx_isolation);

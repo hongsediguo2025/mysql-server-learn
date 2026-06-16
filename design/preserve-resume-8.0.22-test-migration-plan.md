@@ -445,6 +445,13 @@ Current migration status:
   `savepoint_rollback_to` and RESUME-time savepoint import coverage remains
   pending until attach/activation and binlog-cache savepoint restoration are
   connected.
+- 2026-06-16: `savepoint_import_staging_debug` covers 8.0.22 savepoint import
+  helper staging. RED showed no observable row. The first GREEN attempt
+  exposed a version-specific mismatch: InnoDB savepoint names are the engine
+  savepoint storage addresses, not the SQL names. GREEN passed after deriving
+  the engine names from `THD::get_transaction()->m_savepoints`, rebuilding the
+  InnoDB `trx_named_savept_t` list, and proving `ROLLBACK TO SAVEPOINT sp1`
+  still works. Public PREPARE still returns `ER_PRESERVE_TRX_UNSUPPORTED`.
 - 2026-06-16: `resume_acceptance_staging_debug` covers the idle-target THD
   acceptance prerequisite for RESUME. RED returned not-found without any
   observable row. GREEN passed after porting

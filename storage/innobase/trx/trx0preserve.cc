@@ -36,6 +36,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "sess0sess.h"
 #include "sql/mysqld.h"
 #include "sql/sql_class.h"
+#include "sql/transaction_info.h"
 #include "storage/innobase/handler/ha_innodb.h"
 #include "trx0roll.h"
 #include "trx0trx.h"
@@ -543,13 +544,105 @@ dberr_t trx_preserve_export_savepoints(THD *thd, std::string *payload) {
   return trx_preserve_export_savepoints(trx, payload);
 }
 
+static void trx_preserve_clear_savepoints(trx_t *trx) {
+  trx_roll_savepoints_free(trx, UT_LIST_GET_FIRST(trx->trx_savepoints));
+}
+
+static void trx_preserve_free_savepoint(trx_named_savept_t *savep) {
+  if (savep == nullptr) return;
+  ut_free(savep->name);
+  ut_free(savep);
+}
+
+static void trx_preserve_free_savepoint_vector(
+    std::vector<trx_named_savept_t *> *savepoints) {
+  for (trx_named_savept_t *savep : *savepoints) {
+    trx_preserve_free_savepoint(savep);
+  }
+  savepoints->clear();
+}
+
 dberr_t trx_preserve_import_savepoints(
     trx_t *trx, const std::string &payload,
     const std::vector<std::string> &savepoint_names) {
-  (void)trx;
-  (void)payload;
-  (void)savepoint_names;
-  return DB_UNSUPPORTED;
+  uint32_t count = 0;
+  if (trx == nullptr ||
+      !trx_preserve_savepoints_payload_is_valid_for_import(payload, &count) ||
+      count != savepoint_names.size()) {
+    return DB_ERROR;
+  }
+  if (count != 0 && trx->fts_trx != nullptr) {
+    return DB_ERROR;
+  }
+
+  if (count == 0) {
+    trx_preserve_clear_savepoints(trx);
+    return DB_SUCCESS;
+  }
+
+  std::vector<trx_named_savept_t *> imported_savepoints;
+  imported_savepoints.reserve(count);
+
+  size_t offset = 4;
+  for (uint32_t i = 0; i < count; ++i) {
+    uint64_t undo_no = 0;
+    uint64_t binlog_pos = 0;
+    if (trx_preserve_read_le64(payload, &offset, &undo_no) ||
+        trx_preserve_read_le64(payload, &offset, &binlog_pos) ||
+        undo_no > trx->undo_no || savepoint_names[i].empty()) {
+      trx_preserve_free_savepoint_vector(&imported_savepoints);
+      return DB_ERROR;
+    }
+
+    trx_named_savept_t *savep =
+        static_cast<trx_named_savept_t *>(ut_malloc_nokey(sizeof(*savep)));
+    if (savep == nullptr) {
+      trx_preserve_free_savepoint_vector(&imported_savepoints);
+      return DB_OUT_OF_MEMORY;
+    }
+
+    savep->name = mem_strdup(savepoint_names[i].c_str());
+    if (savep->name == nullptr) {
+      trx_preserve_free_savepoint(savep);
+      trx_preserve_free_savepoint_vector(&imported_savepoints);
+      return DB_OUT_OF_MEMORY;
+    }
+
+    savep->savept.least_undo_no = static_cast<undo_no_t>(undo_no);
+    savep->mysql_binlog_cache_pos = static_cast<int64_t>(binlog_pos);
+    imported_savepoints.push_back(savep);
+  }
+
+  if (offset != payload.size()) {
+    trx_preserve_free_savepoint_vector(&imported_savepoints);
+    return DB_ERROR;
+  }
+
+  trx_preserve_clear_savepoints(trx);
+  for (trx_named_savept_t *savep : imported_savepoints) {
+    UT_LIST_ADD_LAST(trx->trx_savepoints, savep);
+  }
+  return DB_SUCCESS;
+}
+
+dberr_t trx_preserve_import_current_thd_savepoints(THD *thd,
+                                                  const std::string &payload) {
+  if (thd == nullptr) return DB_ERROR;
+
+  std::vector<std::string> savepoint_names;
+  for (SAVEPOINT *sv = thd->get_transaction()->m_savepoints; sv != nullptr;
+       sv = sv->prev) {
+    char name[64];
+    const void *engine_savepoint =
+        reinterpret_cast<const unsigned char *>(sv + 1) +
+        innodb_hton->savepoint_offset;
+    longlong2str(reinterpret_cast<ulint>(engine_savepoint), name, 36);
+    savepoint_names.push_back(name);
+  }
+  std::reverse(savepoint_names.begin(), savepoint_names.end());
+
+  return trx_preserve_import_savepoints(thd_to_trx(thd), payload,
+                                        savepoint_names);
 }
 
 bool trx_preserve_savepoints_payload_is_valid_for_import(

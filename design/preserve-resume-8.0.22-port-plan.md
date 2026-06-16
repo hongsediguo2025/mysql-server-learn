@@ -521,6 +521,15 @@ Current 8.0.22 landing status:
   `ER_PRESERVE_TRX_UNSUPPORTED`. RESUME-time savepoint import remains
   fail-closed until attach/activation and binlog-cache savepoint restoration
   are ported together.
+- 2026-06-16: added the savepoint import staging slice and adapted it to the
+  8.0.22 SQL/InnoDB savepoint contract. In 8.0.22 InnoDB stores savepoints
+  under the engine savepoint storage address encoded with `longlong2str(...,
+  36)`, not under the SQL name (`sp1`, `sp2`). The target helper derives those
+  engine names from the SQL `SAVEPOINT` chain before rebuilding
+  `trx_named_savept_t` entries. The debug-only
+  `savepoint_import_staging_debug` test exports, imports, and then proves
+  `ROLLBACK TO SAVEPOINT sp1` still reaches the rebuilt engine savepoint while
+  public SQL preserve behavior remains fail-closed.
 - 2026-06-16: added the RESUME acceptance staging slice. The InnoDB helper
   `trx_preserve_thd_can_accept_preserved_trx()` now checks whether the target
   THD has no active native InnoDB transaction and whether
