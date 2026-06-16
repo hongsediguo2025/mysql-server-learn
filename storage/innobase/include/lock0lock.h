@@ -245,6 +245,7 @@ That might lead to the deadlock with G3 never being noticed.
 
 // Forward declaration
 class ReadView;
+struct Preserve_lock_limits;
 
 extern bool innobase_deadlock_detect;
 
@@ -1044,6 +1045,15 @@ void lock_rec_convert_active_impl_to_expl(const buf_block_t *block,
                                           const rec_t *rec, dict_index_t *index,
                                           const ulint *offsets, trx_t *trx,
                                           ulint heap_no);
+
+/** Converts implicit record locks for a transaction's modified clustered
+records to explicit record locks so they can be exported for preserve.
+@param[in,out] trx transaction whose implicit locks should be materialized
+@param[in] limits bounded scan/lock limits
+@param[out] materialized_any set to true if any implicit lock was converted
+@return DB_SUCCESS or error code */
+dberr_t lock_preserve_materialize_implicit_locks(
+    trx_t *trx, const Preserve_lock_limits &limits, bool *materialized_any);
 
 /** Removes a record lock request, waiting or granted, from the queue. */
 void lock_rec_discard(lock_t *in_lock); /*!< in: record lock object: all

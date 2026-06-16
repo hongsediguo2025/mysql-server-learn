@@ -36,27 +36,39 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <sys/types.h>
 
 #include <algorithm>
+#include <chrono>
+#include <functional>
+#include <limits>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "btr0btr.h"
+#include "btr0pcur.h"
+#include "buf0buf.h"
 #include "current_thd.h"
 #include "debug_sync.h" /* CONDITIONAL_SYNC_POINT */
 #include "dict0boot.h"
 #include "dict0dd.h"
 #include "dict0mem.h"
+#include "fil0types.h"
 #include "ha_prototypes.h"
 #include "lock0lock.h"
 #include "lock0priv.h"
+#include "mach0data.h"
+#include "os0thread.h"
 #include "pars0pars.h"
 #include "row0mysql.h"
 #include "row0sel.h"
 #include "srv0mon.h"
 #include "trx0purge.h"
+#include "trx0preserve.h"
 #include "trx0sys.h"
 #include "usr0sess.h"
+#include "ut0bitset.h"
 #include "ut0new.h"
 #include "ut0vec.h"
 
@@ -5704,15 +5716,21 @@ dberr_t lock_rec_insert_check_and_lock(
  only has an implicit lock on the record. The transaction instance must have a
  reference count > 0 so that it can't be committed and freed before this
  function has completed. */
-static void lock_rec_convert_impl_to_expl_for_trx(
+static dberr_t lock_rec_convert_impl_to_expl_for_trx(
     const buf_block_t *block, /*!< in: buffer block of rec */
     const rec_t *rec,         /*!< in: user record on page */
     dict_index_t *index,      /*!< in: index of record */
     const ulint *offsets,     /*!< in: rec_get_offsets(rec, index) */
     trx_t *trx,               /*!< in/out: active transaction */
-    ulint heap_no)            /*!< in: rec heap number to lock */
+    ulint heap_no,            /*!< in: rec heap number to lock */
+    bool *converted = nullptr,
+    bool allow_conversion = true)
 {
   ut_ad(trx_is_referenced(trx));
+  dberr_t err = DB_SUCCESS;
+  if (converted != nullptr) {
+    *converted = false;
+  }
 
   DEBUG_SYNC_C("before_lock_rec_convert_impl_to_expl_for_trx");
   {
@@ -5743,13 +5761,20 @@ static void lock_rec_convert_impl_to_expl_for_trx(
 
     ut_ad(!trx_state_eq(trx, TRX_STATE_NOT_STARTED));
 
-    if (!trx_state_eq(trx, TRX_STATE_COMMITTED_IN_MEMORY) &&
-        !lock_rec_has_expl(LOCK_X | LOCK_REC_NOT_GAP, block, heap_no, trx)) {
+    const bool needs_conversion =
+        !trx_state_eq(trx, TRX_STATE_COMMITTED_IN_MEMORY) &&
+        !lock_rec_has_expl(LOCK_X | LOCK_REC_NOT_GAP, block, heap_no, trx);
+    if (needs_conversion && !allow_conversion) {
+      err = DB_UNSUPPORTED;
+    } else if (needs_conversion) {
       ulint type_mode;
 
       type_mode = (LOCK_REC | LOCK_X | LOCK_REC_NOT_GAP);
 
       lock_rec_add_to_queue(type_mode, block, heap_no, index, trx, true);
+      if (converted != nullptr) {
+        *converted = true;
+      }
     }
 
     trx_mutex_exit(trx);
@@ -5758,6 +5783,7 @@ static void lock_rec_convert_impl_to_expl_for_trx(
   trx_release_reference(trx);
 
   DEBUG_SYNC_C("after_lock_rec_convert_impl_to_expl_for_trx");
+  return err;
 }
 
 /** If a transaction has an implicit x-lock on a record, but no explicit x-lock
@@ -5807,6 +5833,204 @@ static void lock_rec_convert_impl_to_expl(const buf_block_t *block,
     lock_rec_convert_impl_to_expl_for_trx(block, rec, index, offsets, trx,
                                           heap_no);
   }
+}
+
+/** Owner-of-implicit-lock predicate for a single index record. */
+static bool lock_preserve_record_belongs_to_trx(const rec_t *rec,
+                                                dict_index_t *index,
+                                                const ulint *offsets,
+                                                trx_t *trx,
+                                                bool *owns_trx_reference) {
+  ut_ad(owns_trx_reference != nullptr);
+  *owns_trx_reference = false;
+
+  if (index->is_clustered()) {
+    return rec_get_trx_id(rec, index) == trx->id;
+  }
+
+  trx_t *impl_owner = lock_sec_rec_some_has_impl(rec, index, offsets);
+  if (impl_owner == nullptr) {
+    return false;
+  }
+
+  if (impl_owner != trx) {
+    trx_release_reference(impl_owner);
+    return false;
+  }
+
+  *owns_trx_reference = true;
+  return true;
+}
+
+/** Scan one index and convert implicit X-locks owned by trx into explicit
+record locks so they can later be exported. */
+static dberr_t lock_preserve_materialize_one_index(
+    trx_t *trx, dict_index_t *index, const Preserve_lock_limits &limits,
+    bool *materialized_any, uint32_t *materialized_locks,
+    uint32_t *scanned_pages,
+    const std::function<bool()> &timed_out) {
+  if (*scanned_pages == limits.max_scan_pages) {
+    return DB_UNSUPPORTED;
+  }
+  ++(*scanned_pages);
+
+  mtr_t mtr;
+  btr_pcur_t pcur;
+  mtr_start(&mtr);
+  pcur.open_at_side(true, index, BTR_SEARCH_LEAF, true, 0, &mtr);
+  if (index->is_clustered()) {
+    DEBUG_SYNC_C("preserve_trx_materialize_after_first_page_open");
+  } else {
+    DEBUG_SYNC_C("preserve_trx_materialize_after_first_secondary_page_open");
+  }
+
+  for (;;) {
+    if (timed_out()) {
+      pcur.close();
+      mtr_commit(&mtr);
+      return DB_UNSUPPORTED;
+    }
+
+    if (pcur.is_after_last_on_page()) {
+      if (pcur.is_after_last_in_tree(&mtr)) {
+        break;
+      }
+      if (*scanned_pages == limits.max_scan_pages) {
+        pcur.close();
+        mtr_commit(&mtr);
+        return DB_UNSUPPORTED;
+      }
+      ++(*scanned_pages);
+      pcur.move_to_next_page(&mtr);
+      continue;
+    }
+
+    pcur.move_to_next_on_page();
+    if (!pcur.is_on_user_rec()) {
+      continue;
+    }
+
+    const rec_t *rec = pcur.get_rec();
+    ulint offsets_[REC_OFFS_NORMAL_SIZE];
+    rec_offs_init(offsets_);
+    mem_heap_t *heap = nullptr;
+    ulint *offsets =
+        rec_get_offsets(rec, index, offsets_, ULINT_UNDEFINED, &heap);
+
+    bool owns_trx_reference = false;
+    if (lock_preserve_record_belongs_to_trx(rec, index, offsets, trx,
+                                            &owns_trx_reference)) {
+      const bool allow_conversion =
+          *materialized_locks < limits.max_lock_count;
+      bool converted = false;
+      if (!owns_trx_reference) {
+        trx_reference(trx, true);
+      }
+      const dberr_t err = lock_rec_convert_impl_to_expl_for_trx(
+          pcur.get_block(), rec, index, offsets, trx,
+          page_rec_get_heap_no(rec), &converted, allow_conversion);
+      if (err != DB_SUCCESS) {
+        if (heap != nullptr) {
+          mem_heap_free(heap);
+        }
+        pcur.close();
+        mtr_commit(&mtr);
+        return err;
+      }
+      if (converted) {
+        ++(*materialized_locks);
+        if (materialized_any != nullptr) {
+          *materialized_any = true;
+        }
+        if (*materialized_locks >= limits.max_lock_count) {
+          if (heap != nullptr) {
+            mem_heap_free(heap);
+          }
+          pcur.close();
+          mtr_commit(&mtr);
+          return DB_UNSUPPORTED;
+        }
+      }
+    }
+
+    if (heap != nullptr) {
+      mem_heap_free(heap);
+    }
+  }
+
+  pcur.close();
+  mtr_commit(&mtr);
+  return DB_SUCCESS;
+}
+
+dberr_t lock_preserve_materialize_implicit_locks(
+    trx_t *trx, const Preserve_lock_limits &limits, bool *materialized_any) {
+  if (trx == nullptr) {
+    return DB_ERROR;
+  }
+  if (materialized_any != nullptr) {
+    *materialized_any = false;
+  }
+
+  DBUG_EXECUTE_IF("preserve_trx_fail_materialize_implicit_locks",
+                  return DB_OUT_OF_MEMORY;);
+
+  if (trx->mod_tables.size() > limits.max_modified_tables) {
+    return DB_UNSUPPORTED;
+  }
+
+  using Clock = std::chrono::steady_clock;
+  const auto started_at = Clock::now();
+  const auto timed_out = [&]() {
+    if (limits.materialize_timeout_ms == 0) {
+      return true;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - started_at);
+    return elapsed.count() >
+           static_cast<int64_t>(limits.materialize_timeout_ms);
+  };
+
+  uint32_t materialized_locks = 0;
+  uint32_t scanned_pages = 0;
+
+  for (dict_table_t *table : trx->mod_tables) {
+    if (table == nullptr || table->is_temporary() || table->ibd_file_missing) {
+      return DB_UNSUPPORTED;
+    }
+
+    dict_index_t *clust = table->first_index();
+    if (clust == nullptr || !clust->is_clustered() ||
+        dict_index_is_spatial(clust)) {
+      return DB_UNSUPPORTED;
+    }
+
+    const dberr_t clust_err = lock_preserve_materialize_one_index(
+        trx, clust, limits, materialized_any, &materialized_locks,
+        &scanned_pages, timed_out);
+    if (clust_err != DB_SUCCESS) {
+      return clust_err;
+    }
+
+    for (dict_index_t *sec = clust->next(); sec != nullptr;
+         sec = sec->next()) {
+      if (dict_index_is_spatial(sec) || (sec->type & DICT_FTS)) {
+        continue;
+      }
+      if (!sec->is_committed() || dict_index_is_online_ddl(sec)) {
+        return DB_UNSUPPORTED;
+      }
+
+      const dberr_t sec_err = lock_preserve_materialize_one_index(
+          trx, sec, limits, materialized_any, &materialized_locks,
+          &scanned_pages, timed_out);
+      if (sec_err != DB_SUCCESS) {
+        return sec_err;
+      }
+    }
+  }
+
+  return DB_SUCCESS;
 }
 
 void lock_rec_convert_active_impl_to_expl(const buf_block_t *block,

@@ -779,10 +779,17 @@ void trx_preserve_close_read_views_for_shutdown() {
 
 dberr_t trx_preserve_materialize_implicit_locks(
     THD *thd, const Preserve_lock_limits &limits, bool *materialized_any) {
-  (void)thd;
-  (void)limits;
-  if (materialized_any != nullptr) *materialized_any = false;
-  return DB_UNSUPPORTED;
+  if (thd == nullptr) {
+    return DB_ERROR;
+  }
+
+  trx_t *trx = thd_to_trx(thd);
+  if (trx == nullptr) {
+    return DB_ERROR;
+  }
+
+  return lock_preserve_materialize_implicit_locks(trx, limits,
+                                                 materialized_any);
 }
 
 dberr_t trx_preserve_export_read_view(THD *thd, std::string *payload,
