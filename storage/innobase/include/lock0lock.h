@@ -655,6 +655,54 @@ void lock_rec_unlock(
     const buf_block_t *block, /*!< in: buffer block containing rec */
     const rec_t *rec,         /*!< in: record */
     lock_mode lock_mode);     /*!< in: LOCK_S or LOCK_X */
+
+/** Export granted explicit record locks for a preserved transaction.
+@param[in]  trx      transaction whose record locks are exported
+@param[out] payload  opaque serialized record-lock payload
+@return DB_SUCCESS or error */
+dberr_t lock_preserve_export_record_locks(trx_t *trx, std::string *payload);
+
+/** Export granted explicit record locks for a preserved transaction.
+@param[in]  trx             transaction whose record locks are exported
+@param[out] payload         opaque serialized record-lock payload
+@param[in]  max_lock_count  maximum record bits to export
+@return DB_SUCCESS or error */
+dberr_t lock_preserve_export_record_locks(trx_t *trx, std::string *payload,
+                                          uint32_t max_lock_count);
+
+/** Last precise record-lock export failure reason, for diagnostics. */
+const char *lock_preserve_last_record_lock_export_error();
+
+/** Import granted explicit record locks for a preserved transaction.
+@param[in,out] trx      transaction receiving restored record locks
+@param[in]     payload  opaque serialized record-lock payload
+@return DB_SUCCESS or error */
+dberr_t lock_preserve_import_record_locks(trx_t *trx,
+                                          const std::string &payload);
+
+/** Validate an opaque preserved record-lock payload.
+@param[in] payload opaque serialized record-lock payload
+@return true if the payload is syntactically importable */
+bool lock_preserve_record_locks_payload_is_valid_for_import(
+    const std::string &payload);
+
+/** Count record bits encoded in a preserved record-lock payload.
+@param[in]  payload     opaque serialized record-lock payload
+@param[out] lock_count  number of record bits in the payload
+@return true if the payload was parsed and counted successfully */
+bool lock_preserve_record_locks_payload_lock_count(const std::string &payload,
+                                                   uint32_t *lock_count);
+
+/** Split a mixed record/predicate payload into ordinary record-lock and
+predicate-lock payloads.
+@param[in]  payload                  mixed record-lock payload
+@param[out] record_locks_payload     ordinary record-lock subset
+@param[out] predicate_locks_payload  predicate-lock subset
+@return true if payload was parsed and split successfully */
+bool lock_preserve_split_record_and_predicate_locks(
+    const std::string &payload, std::string *record_locks_payload,
+    std::string *predicate_locks_payload);
+
 /** Releases a transaction's locks, and releases possible other transactions
  waiting because of these locks. Change the state of the transaction to
  TRX_STATE_COMMITTED_IN_MEMORY. */

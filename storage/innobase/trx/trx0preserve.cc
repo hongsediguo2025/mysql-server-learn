@@ -922,56 +922,52 @@ bool trx_preserve_read_view_payload_is_valid_for_import(
 }
 
 dberr_t trx_preserve_export_record_locks(trx_t *trx, std::string *payload) {
-  return trx_preserve_export_record_locks(trx, payload, 0);
+  return lock_preserve_export_record_locks(trx, payload);
 }
 
 dberr_t trx_preserve_export_record_locks(trx_t *trx, std::string *payload,
                                          uint32_t max_lock_count) {
-  (void)trx;
-  (void)max_lock_count;
-  if (payload != nullptr) payload->clear();
-  return DB_UNSUPPORTED;
+  return lock_preserve_export_record_locks(trx, payload, max_lock_count);
 }
 
 dberr_t trx_preserve_export_record_locks(THD *thd, std::string *payload,
                                          uint32_t max_lock_count) {
-  (void)thd;
-  (void)max_lock_count;
-  if (payload != nullptr) payload->clear();
-  return DB_UNSUPPORTED;
+  if (thd == nullptr || payload == nullptr) {
+    return DB_ERROR;
+  }
+
+  trx_t *trx = thd_to_trx(thd);
+  if (trx == nullptr) {
+    return DB_ERROR;
+  }
+
+  return lock_preserve_export_record_locks(trx, payload, max_lock_count);
 }
 
 const char *trx_preserve_last_record_lock_export_error() {
-  return "trx0preserve not yet ported";
+  return lock_preserve_last_record_lock_export_error();
 }
 
 dberr_t trx_preserve_import_record_locks(trx_t *trx,
                                          const std::string &payload) {
-  (void)trx;
-  (void)payload;
-  return DB_UNSUPPORTED;
+  return lock_preserve_import_record_locks(trx, payload);
 }
 
 bool trx_preserve_record_locks_payload_is_valid_for_import(
     const std::string &payload) {
-  (void)payload;
-  return false;
+  return lock_preserve_record_locks_payload_is_valid_for_import(payload);
 }
 
 bool trx_preserve_record_locks_payload_lock_count(
     const std::string &payload, uint32_t *lock_count) {
-  (void)payload;
-  if (lock_count != nullptr) *lock_count = 0;
-  return false;
+  return lock_preserve_record_locks_payload_lock_count(payload, lock_count);
 }
 
 bool trx_preserve_split_record_and_predicate_locks(
     const std::string &payload, std::string *record_locks_payload,
     std::string *predicate_locks_payload) {
-  (void)payload;
-  if (record_locks_payload != nullptr) record_locks_payload->clear();
-  if (predicate_locks_payload != nullptr) predicate_locks_payload->clear();
-  return false;
+  return lock_preserve_split_record_and_predicate_locks(
+      payload, record_locks_payload, predicate_locks_payload);
 }
 
 dberr_t trx_preserve_export_table_locks(trx_t *trx, std::string *payload,
