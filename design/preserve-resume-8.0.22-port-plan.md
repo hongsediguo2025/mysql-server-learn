@@ -397,6 +397,16 @@ Progress notes:
   migrated preserve_trx shell MTR set passed in four modes. This is statement
   response/finalizer plumbing only; real durable token generation and
   shutdown-after-delivery remain Batch 2 work.
+- 2026-06-16: added the paired token-delivery release fallback guard. RED was
+  `token_delivery_release_resources_staging_debug` showing that a skipped
+  dispatch finalizer followed by disconnect removed the token instead of making
+  it resumable. The root cause was that `COM_QUIT` could overwrite the cached
+  PREPARE OK response before `THD::release_resources()` finalized delivery.
+  GREEN added `preserved_trx_note_statement_response()` after
+  `send_statement_status()` and made it first-response-only, so disconnect
+  fallback preserves the original user-visible OK result. This remains a
+  debug-only staging guard for lifecycle plumbing, not a durable preserve
+  runtime claim.
 - 2026-06-16: imported the source branch bundle/carrier/file/temp-manifest codec
   layer into the 8.0.22 tree as a buildable infrastructure slice:
   `sql/preserve_trx_bundle.{cc,h}`, `sql/preserve_trx_carrier.{cc,h}`,

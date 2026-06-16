@@ -369,6 +369,14 @@ Evidence:
   shell MTR set passed in four modes: debug normal-binlog, debug
   `--skip-log-bin`, release normal-binlog, and release `--skip-log-bin`.
   Release runs skip this debug-only staging test through `have_debug.inc`.
+- 2026-06-16 RED: `token_delivery_release_resources_staging_debug` skipped the
+  dispatch finalizer, disconnected, and then found no `debug-delivery-token`.
+  That proved `THD::release_resources()` could not reconstruct the original OK
+  result after `COM_QUIT` processing.
+- 2026-06-16 GREEN: `token_delivery_release_resources_staging_debug` passed
+  after adding `preserved_trx_note_statement_response()` and making the cached
+  response first-writer-wins, so `COM_QUIT` cannot overwrite the PREPARE OK
+  result before the release fallback finalizes token delivery.
 - 2026-06-16 GREEN debug/release build: the bundle/carrier/file/temp-manifest
   codec layer was imported and linked into `mysqld`:
   `sql/preserve_trx_bundle.{cc,h}`, `sql/preserve_trx_carrier.{cc,h}`,

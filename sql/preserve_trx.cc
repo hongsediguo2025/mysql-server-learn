@@ -790,6 +790,19 @@ void preserved_trx_register_pending_token_delivery(THD *thd,
       token, false, false, false, request_shutdown};
 }
 
+void preserved_trx_note_statement_response(THD *thd) {
+  if (thd == nullptr) return;
+
+  std::lock_guard<std::mutex> lock(g_token_delivery_mutex);
+  auto it = g_pending_token_delivery.find(thd);
+  if (it == g_pending_token_delivery.end()) return;
+  if (it->second.response_observed) return;
+
+  Diagnostics_area *da = thd->get_stmt_da();
+  it->second.response_observed = true;
+  it->second.ok_delivered = da->is_sent() && da->is_ok();
+}
+
 bool preserved_trx_has_pending_token_delivery(THD *thd) {
   std::lock_guard<std::mutex> lock(g_token_delivery_mutex);
   return g_pending_token_delivery.find(thd) != g_pending_token_delivery.end();

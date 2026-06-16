@@ -2174,6 +2174,7 @@ done:
   thd->update_slow_query_status();
   if (thd->killed) thd->send_kill_message();
   thd->send_statement_status();
+  preserved_trx_note_statement_response(thd);
   bool skip_preserve_finalize = false;
   DBUG_EXECUTE_IF("preserve_trx_skip_dispatch_finalize_statement_response",
                   skip_preserve_finalize = true;);

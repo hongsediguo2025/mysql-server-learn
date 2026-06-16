@@ -140,6 +140,7 @@ struct Preserved_trx_view_row {
 using Preserved_trx_view_rows = std::vector<Preserved_trx_view_row>;
 
 bool preserve_trx_execute_command(THD *thd);
+void preserved_trx_note_statement_response(THD *thd);
 void preserved_trx_finalize_statement_response(THD *thd);
 void preserved_trx_release_resources(THD *thd);
 bool preserve_trx_temp_table_session_needs_eligibility_check(const THD *thd);
