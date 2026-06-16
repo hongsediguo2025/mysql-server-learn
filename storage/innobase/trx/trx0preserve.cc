@@ -301,13 +301,61 @@ dberr_t trx_preserve_activate_resumed(trx_t *trx) {
 }
 
 dberr_t trx_preserve_reactivate_prepared_in_original_thd(THD *thd) {
-  (void)thd;
-  return DB_UNSUPPORTED;
+  if (thd == nullptr) return DB_ERROR;
+
+  trx_t *trx = thd_to_trx(thd);
+  if (trx == nullptr || trx->xid == nullptr ||
+      !xid_is_preserve_magic(*trx->xid) || trx->mysql_thd != thd ||
+      trx->preserve_trx_claimed) {
+    return DB_ERROR;
+  }
+
+  dberr_t err = DB_SUCCESS;
+  trx_sys_mutex_enter();
+  if (!trx_state_eq(trx, TRX_STATE_PREPARED) || trx->mysql_thd != thd ||
+      trx->preserve_trx_claimed) {
+    err = DB_ERROR;
+  } else {
+    ut_a(trx_sys->n_prepared_trx > 0);
+    --trx_sys->n_prepared_trx;
+    trx_preserve_store_state_trx_sys_locked(trx, TRX_STATE_ACTIVE);
+  }
+  trx_sys_mutex_exit();
+
+  if (err != DB_SUCCESS) return err;
+  return trx_preserve_activate_undo_state(trx);
 }
 
 dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(THD *thd) {
-  (void)thd;
-  return DB_UNSUPPORTED;
+  if (thd == nullptr) return DB_ERROR;
+
+  trx_t *trx = thd_to_trx(thd);
+  if (trx == nullptr || trx->xid == nullptr ||
+      !xid_is_preserve_magic(*trx->xid) || trx->mysql_thd != thd ||
+      trx->preserve_trx_claimed) {
+    return DB_ERROR;
+  }
+
+  bool was_prepared = false;
+  dberr_t err = DB_SUCCESS;
+  trx_sys_mutex_enter();
+  if (trx_state_eq(trx, TRX_STATE_PREPARED)) {
+    if (trx->mysql_thd != thd || trx->preserve_trx_claimed) {
+      err = DB_ERROR;
+    } else {
+      ut_a(trx_sys->n_prepared_trx > 0);
+      --trx_sys->n_prepared_trx;
+      trx_preserve_store_state_trx_sys_locked(trx, TRX_STATE_ACTIVE);
+      was_prepared = true;
+    }
+  } else if (!trx_state_eq(trx, TRX_STATE_ACTIVE) || trx->mysql_thd != thd ||
+             trx->preserve_trx_claimed) {
+    err = DB_ERROR;
+  }
+  trx_sys_mutex_exit();
+
+  if (err != DB_SUCCESS) return err;
+  return was_prepared ? trx_preserve_activate_undo_state(trx) : DB_SUCCESS;
 }
 
 dberr_t trx_preserve_activate_reattached_in_original_thd(trx_t *trx,
