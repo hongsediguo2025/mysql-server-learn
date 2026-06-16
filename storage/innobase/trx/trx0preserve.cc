@@ -1235,13 +1235,74 @@ bool trx_preserve_thd_can_accept_preserved_trx(THD *thd) {
 }
 
 bool trx_preserve_rseg_has_preserved_trx(const trx_rseg_t *rseg) {
-  (void)rseg;
-  return false;
+  if (rseg == nullptr) return false;
+
+  bool found = false;
+  trx_sys_mutex_enter();
+  for (trx_t *trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
+       trx = UT_LIST_GET_NEXT(trx_list, trx)) {
+    assert_trx_in_rw_list(trx);
+    const bool uses_rseg = trx->rsegs.m_redo.rseg == rseg ||
+                           trx->rsegs.m_noredo.rseg == rseg;
+    if (!uses_rseg) continue;
+
+    if (trx_state_eq(trx, TRX_STATE_PRESERVED) ||
+        (trx_state_eq(trx, TRX_STATE_PREPARED) && trx->xid != nullptr &&
+         xid_is_preserve_magic(*trx->xid))) {
+      found = true;
+      break;
+    }
+  }
+  trx_sys_mutex_exit();
+
+  return found;
 }
 
 void trx_preserve_collect_preserved_rsegs(
     std::vector<const trx_rseg_t *> *rsegs) {
-  if (rsegs != nullptr) rsegs->clear();
+  if (rsegs == nullptr) return;
+
+  rsegs->clear();
+  auto remember_rseg = [rsegs](const trx_rseg_t *rseg) {
+    if (rseg != nullptr &&
+        std::find(rsegs->begin(), rsegs->end(), rseg) == rsegs->end()) {
+      rsegs->push_back(rseg);
+    }
+  };
+
+  trx_sys_mutex_enter();
+  for (trx_t *trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
+       trx = UT_LIST_GET_NEXT(trx_list, trx)) {
+    assert_trx_in_rw_list(trx);
+    if (trx_state_eq(trx, TRX_STATE_PRESERVED) ||
+        (trx_state_eq(trx, TRX_STATE_PREPARED) && trx->xid != nullptr &&
+         xid_is_preserve_magic(*trx->xid))) {
+      remember_rseg(trx->rsegs.m_redo.rseg);
+      remember_rseg(trx->rsegs.m_noredo.rseg);
+    }
+  }
+  trx_sys_mutex_exit();
+}
+
+void trx_preserve_debug_current_thd_rseg_collection(
+    THD *thd, Preserve_rseg_collection_debug_result *result) {
+  if (result == nullptr) return;
+  *result = Preserve_rseg_collection_debug_result{};
+
+  trx_t *trx = thd != nullptr ? thd_to_trx(thd) : nullptr;
+  if (trx == nullptr) return;
+
+  std::vector<const trx_rseg_t *> rsegs;
+  trx_preserve_collect_preserved_rsegs(&rsegs);
+  result->count = static_cast<uint32_t>(rsegs.size());
+
+  const auto contains = [&rsegs](const trx_rseg_t *rseg) {
+    return rseg != nullptr &&
+           std::find(rsegs.begin(), rsegs.end(), rseg) != rsegs.end();
+  };
+
+  result->contains_redo = contains(trx->rsegs.m_redo.rseg);
+  result->contains_noredo = contains(trx->rsegs.m_noredo.rseg);
 }
 
 trx_t *trx_preserve_detach_current_thd(THD *thd) {

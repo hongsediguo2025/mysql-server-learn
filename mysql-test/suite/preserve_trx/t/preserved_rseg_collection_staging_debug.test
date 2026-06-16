@@ -1,0 +1,40 @@
+--source include/have_debug.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_preserved_rseg_collection;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_preserved_rseg_collection(id INT PRIMARY KEY, v INT)
+  ENGINE=InnoDB;
+INSERT INTO t_preserved_rseg_collection VALUES (1, 10);
+
+START TRANSACTION;
+UPDATE t_preserved_rseg_collection SET v = 11 WHERE id = 1;
+
+SET SESSION debug='+d,preserve_trx_debug_preserved_rseg_collection_observable';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+SET SESSION debug='-d,preserve_trx_debug_preserved_rseg_collection_observable';
+
+SELECT TOKEN, STATE, LOCKS_COUNT, LAST_ERROR
+  FROM performance_schema.preserved_transactions
+  WHERE TOKEN='debug-preserved-rseg-collection-token';
+
+SELECT LAST_ERROR REGEXP
+       'preserved rseg collection: xid_ok=1 prepare_ok=1 contains_redo=1 contains_noredo=[01] count=[1-9][0-9]* detach_ok=1 claim_ok=1 rollback_ok=1 fallback_rollback_ok=1'
+       AS preserved_rseg_collection_ok
+  FROM performance_schema.preserved_transactions
+  WHERE TOKEN='debug-preserved-rseg-collection-token';
+
+SELECT v FROM t_preserved_rseg_collection;
+
+SET SESSION debug='+d,preserve_trx_clear_debug_observable_records';
+SELECT COUNT(*) AS after_clear
+  FROM performance_schema.preserved_transactions
+  WHERE TOKEN='debug-preserved-rseg-collection-token';
+SET SESSION debug='-d,preserve_trx_clear_debug_observable_records';
+
+DROP TABLE t_preserved_rseg_collection;
+SET GLOBAL preserve_trx_enable=OFF;

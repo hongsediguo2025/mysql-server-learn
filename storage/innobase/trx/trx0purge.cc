@@ -56,6 +56,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "srv0srv.h"
 #include "srv0start.h"
 #include "sync0sync.h"
+#include "trx0preserve.h"
 #include "trx0purge.h"
 #include "trx0rec.h"
 #include "trx0roll.h"
@@ -1340,6 +1341,8 @@ static bool trx_purge_check_if_marked_undo_is_empty(purge_iter_t *limit) {
   /* Scan over each rseg in this inactive undo tablespace
   and ensure that it does not hold any active undo records. */
   bool all_free = true;
+  std::vector<const trx_rseg_t *> preserve_rsegs;
+  trx_preserve_collect_preserved_rsegs(&preserve_rsegs);
 
   marked_rsegs->x_lock();
 
@@ -1349,7 +1352,15 @@ static bool trx_purge_check_if_marked_undo_is_empty(purge_iter_t *limit) {
   for (auto rseg : *marked_rsegs) {
     rseg->latch();
 
-    if (rseg->trx_ref_count > 0) {
+    if (std::find(preserve_rsegs.begin(), preserve_rsegs.end(), rseg) !=
+        preserve_rsegs.end()) {
+      /*
+        Preserved transactions keep prepared undo alive across restart. Keep
+        the undo tablespace away from truncation even if a future ref-counting
+        change weakens the generic active-transaction guard.
+      */
+      all_free = false;
+    } else if (rseg->trx_ref_count > 0) {
       /* This rseg is still being held by an active transaction. */
       all_free = false;
     } else if (rseg->last_page_no != FIL_NULL) {

@@ -155,6 +155,16 @@ bool trx_preserve_thd_can_accept_preserved_trx(THD *thd);
 bool trx_preserve_rseg_has_preserved_trx(const trx_rseg_t *rseg);
 void trx_preserve_collect_preserved_rsegs(
     std::vector<const trx_rseg_t *> *rsegs);
+
+struct Preserve_rseg_collection_debug_result {
+  bool contains_redo{false};
+  bool contains_noredo{false};
+  uint32_t count{0};
+};
+
+void trx_preserve_debug_current_thd_rseg_collection(
+    THD *thd, Preserve_rseg_collection_debug_result *result);
+
 trx_t *trx_preserve_detach_current_thd(THD *thd);
 dberr_t trx_preserve_attach_to_thd(trx_t *trx, THD *thd);
 dberr_t trx_preserve_reattach_preserved_to_original_thd(trx_t *trx, THD *thd);

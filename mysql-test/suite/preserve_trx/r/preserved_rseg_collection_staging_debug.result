@@ -1,0 +1,35 @@
+DROP TABLE IF EXISTS t_preserved_rseg_collection;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_preserved_rseg_collection(id INT PRIMARY KEY, v INT)
+ENGINE=InnoDB;
+INSERT INTO t_preserved_rseg_collection VALUES (1, 10);
+START TRANSACTION;
+UPDATE t_preserved_rseg_collection SET v = 11 WHERE id = 1;
+SET SESSION debug='+d,preserve_trx_debug_preserved_rseg_collection_observable';
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug='-d,preserve_trx_debug_preserved_rseg_collection_observable';
+SELECT TOKEN, STATE, LOCKS_COUNT, LAST_ERROR
+FROM performance_schema.preserved_transactions
+WHERE TOKEN='debug-preserved-rseg-collection-token';
+TOKEN	STATE	LOCKS_COUNT	LAST_ERROR
+debug-preserved-rseg-collection-token	FAILED	1	preserved rseg collection: xid_ok=1 prepare_ok=1 contains_redo=1 contains_noredo=0 count=1 detach_ok=1 claim_ok=1 rollback_ok=1 fallback_rollback_ok=1
+SELECT LAST_ERROR REGEXP
+'preserved rseg collection: xid_ok=1 prepare_ok=1 contains_redo=1 contains_noredo=[01] count=[1-9][0-9]* detach_ok=1 claim_ok=1 rollback_ok=1 fallback_rollback_ok=1'
+       AS preserved_rseg_collection_ok
+FROM performance_schema.preserved_transactions
+WHERE TOKEN='debug-preserved-rseg-collection-token';
+preserved_rseg_collection_ok
+1
+SELECT v FROM t_preserved_rseg_collection;
+v
+10
+SET SESSION debug='+d,preserve_trx_clear_debug_observable_records';
+SELECT COUNT(*) AS after_clear
+FROM performance_schema.preserved_transactions
+WHERE TOKEN='debug-preserved-rseg-collection-token';
+after_clear
+0
+SET SESSION debug='-d,preserve_trx_clear_debug_observable_records';
+DROP TABLE t_preserved_rseg_collection;
+SET GLOBAL preserve_trx_enable=OFF;
