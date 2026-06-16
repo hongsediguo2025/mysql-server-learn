@@ -447,8 +447,17 @@ dberr_t trx_preserve_rollback_prepared_without_snapshot(
 }
 
 dberr_t trx_preserve_prepare_resumed_rollback_gtid(trx_t *trx) {
-  (void)trx;
-  return DB_UNSUPPORTED;
+  if (trx == nullptr || trx->xid == nullptr ||
+      !xid_is_preserve_magic(*trx->xid)) {
+    return DB_ERROR;
+  }
+
+  if (!trx_state_eq(trx, TRX_STATE_PRESERVED) || trx->mysql_thd != nullptr ||
+      !trx->preserve_trx_claimed) {
+    return DB_ERROR;
+  }
+
+  return trx_undo_gtid_add_update_undo(trx, false, true);
 }
 
 static dberr_t trx_preserve_activate_undo_ptr_state(trx_t *trx,
