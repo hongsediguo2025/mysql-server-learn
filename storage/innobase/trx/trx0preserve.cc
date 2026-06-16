@@ -40,6 +40,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0roll.h"
 #include "trx0trx.h"
 #include "trx0undo.h"
+#include "ut0vec.h"
 
 static void trx_preserve_append_le32(std::string *payload, uint32_t value) {
   for (size_t i = 0; i < 4; ++i) {
@@ -240,13 +241,26 @@ bool trx_preserve_current_thd_no_redo_undo_state(THD *thd, bool *present,
   return true;
 }
 
+bool trx_preserve_current_thd_has_autoinc_locks(THD *thd) {
+  trx_t *trx = trx_preserve_current_thd_get_trx_if_available(thd);
+  return trx_preserve_trx_has_autoinc_locks(trx);
+}
+
 bool trx_preserve_trx_has_read_view(trx_t *trx) {
   return trx != nullptr && MVCC::is_view_active(trx->read_view);
 }
 
 bool trx_preserve_trx_has_autoinc_locks(trx_t *trx) {
-  (void)trx;
-  return false;
+  if (trx == nullptr) {
+    return false;
+  }
+
+  trx_mutex_enter(trx);
+  const bool has_autoinc_locks = trx->lock.autoinc_locks != nullptr &&
+                                 !ib_vector_is_empty(trx->lock.autoinc_locks);
+  trx_mutex_exit(trx);
+
+  return has_autoinc_locks;
 }
 
 uint32_t trx_preserve_modified_table_count(trx_t *trx) {

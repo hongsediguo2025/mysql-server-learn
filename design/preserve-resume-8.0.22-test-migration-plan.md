@@ -424,7 +424,8 @@ Current migration status:
 - 2026-06-16: `kernel_preflight_introspection_staging_debug` covers the first
   read-only InnoDB current-THD preflight helpers. RED showed the debug hook
   produced no observable row. GREEN passed after porting current ReadView
-  detection, no-redo undo state inspection, and modified-table name export.
+  detection, no-redo undo state inspection, autoinc lock inspection, and
+  modified-table name export.
   The test is target-only and debug-only: it uses the P_S observable registry
   to expose helper state while preserving the public fail-closed
   `ER_PRESERVE_TRX_UNSUPPORTED` behavior.

@@ -75,6 +75,7 @@ bool trx_preserve_current_thd_has_read_view(THD *thd);
 bool trx_preserve_current_thd_has_no_redo_undo(THD *thd);
 bool trx_preserve_current_thd_no_redo_undo_state(THD *thd, bool *present,
                                                  uint64_t *top_undo_no);
+bool trx_preserve_current_thd_has_autoinc_locks(THD *thd);
 bool trx_preserve_trx_has_read_view(trx_t *trx);
 bool trx_preserve_trx_has_autoinc_locks(trx_t *trx);
 uint32_t trx_preserve_modified_table_count(trx_t *trx);

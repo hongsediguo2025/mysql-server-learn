@@ -15,7 +15,7 @@ SELECT TOKEN, STATE, MOD_TABLES_COUNT, HAS_READ_VIEW, LAST_ERROR
 FROM performance_schema.preserved_transactions
 WHERE TOKEN='debug-kernel-preflight-token';
 TOKEN	STATE	MOD_TABLES_COUNT	HAS_READ_VIEW	LAST_ERROR
-debug-kernel-preflight-token	FAILED	1	YES	kernel preflight: read_view=1 no_redo_undo=0 no_redo_state_ok=1 no_redo_present=0 top_undo_no=0 modified_tables_ok=1 modified_tables=1 first_table=test/t_kernel_preflight
+debug-kernel-preflight-token	FAILED	1	YES	kernel preflight: read_view=1 no_redo_undo=0 no_redo_state_ok=1 no_redo_present=0 top_undo_no=0 autoinc_locks=0 modified_tables_ok=1 modified_tables=1 first_table=test/t_kernel_preflight
 ROLLBACK;
 SET SESSION debug='+d,preserve_trx_clear_debug_observable_records';
 SELECT COUNT(*) AS after_clear

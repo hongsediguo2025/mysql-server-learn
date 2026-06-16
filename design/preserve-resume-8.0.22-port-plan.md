@@ -491,12 +491,13 @@ Current 8.0.22 landing status:
   `xa_magic_xid_guard` MTR proves the internal XID is rejected while the same
   format ID remains usable for non-magic XA gtrids.
 - 2026-06-16: added the first read-only InnoDB kernel preflight slice for
-  current-THD ReadView detection, no-redo undo detection/state reporting, and
-  modified-table counting/name export. RED was
+  current-THD ReadView detection, no-redo undo detection/state reporting,
+  autoinc lock inspection, and modified-table counting/name export. RED was
   `kernel_preflight_introspection_staging_debug` producing no observable
   kernel row while `PREPARE SHUTDOWN PRESERVE TRANSACTION` remained
   unsupported; GREEN records the current transaction as having one modified
-  table and an active ReadView through a debug-only P_S row. This is
+  table, an active ReadView, and no current autoinc locks through a debug-only
+  P_S row. This is
   introspection coverage only: SQL admission still returns unsupported, and
   detach/attach, ReadView payload import/export, lock/savepoint export/import,
   and undo activation remain pending.

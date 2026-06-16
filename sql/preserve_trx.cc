@@ -596,6 +596,8 @@ Preserved_trx_view_row make_debug_kernel_preflight_record(THD *thd) {
   const bool no_redo_state_ok =
       trx_preserve_current_thd_no_redo_undo_state(thd, &no_redo_present,
                                                   &top_undo_no);
+  const bool has_autoinc_locks =
+      trx_preserve_current_thd_has_autoinc_locks(thd);
   std::vector<Preserve_modified_table_name> modified_tables;
   const dberr_t modified_tables_err = trx_preserve_export_modified_table_names(
       thd, &modified_tables, preserve_trx_max_modified_tables);
@@ -618,6 +620,8 @@ Preserved_trx_view_row make_debug_kernel_preflight_record(THD *thd) {
                    " no_redo_present=" +
                    std::to_string(no_redo_present ? 1 : 0) +
                    " top_undo_no=" + std::to_string(top_undo_no) +
+                   " autoinc_locks=" +
+                   std::to_string(has_autoinc_locks ? 1 : 0) +
                    " modified_tables_ok=" +
                    std::to_string(modified_tables_err == DB_SUCCESS ? 1 : 0) +
                    " modified_tables=" +
