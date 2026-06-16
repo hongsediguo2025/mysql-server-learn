@@ -866,6 +866,66 @@ Preserved_trx_view_row make_debug_prepare_rollback_gtid_record(THD *thd) {
   return row;
 }
 
+Preserved_trx_view_row make_debug_close_read_views_record(THD *thd) {
+  Preserved_trx_view_row row;
+  row.token = "debug-close-read-views-token";
+  row.user = "debug_user";
+  row.host = "debug_host";
+  row.owner_user = row.user;
+  row.owner_host = row.host;
+  row.state = "FAILED";
+  row.isolation = "REPEATABLE-READ";
+  row.binlog_state = "NONE";
+  row.binlog_warmcopy_state = "NONE";
+  row.temp_table_state = "NONE";
+
+  XID xid;
+  const bool xid_ok = debug_preserve_token_to_xid(row.token, &xid);
+  bool prepare_ok = false;
+  bool detach_ok = false;
+  bool claim_ok = false;
+  bool had_read_view_before_close = false;
+  bool has_read_view_after_close = false;
+  bool rollback_ok = false;
+  bool fallback_rollback_ok = true;
+
+  trx_t *trx = nullptr;
+  if (xid_ok && thd != nullptr) {
+    *thd->get_transaction()->xid_state()->get_xid() = xid;
+    had_read_view_before_close = trx_preserve_current_thd_has_read_view(thd);
+    prepare_ok = ha_prepare_low(thd, true) == 0;
+    if (prepare_ok) {
+      trx = trx_preserve_detach_current_thd(thd);
+      detach_ok = trx != nullptr;
+      if (detach_ok) {
+        claim_ok = trx_preserve_claim_detached_prepared(trx) == DB_SUCCESS;
+        if (claim_ok) {
+          trx_preserve_close_read_views_for_shutdown();
+          has_read_view_after_close = trx_preserve_trx_has_read_view(trx);
+          rollback_ok = trx_preserve_rollback_claimed(trx) == DB_SUCCESS;
+        }
+      } else {
+        fallback_rollback_ok = ha_rollback_trans(thd, true) == 0;
+      }
+    }
+  }
+
+  debug_reset_thd_after_detached_preserve(thd);
+  row.last_error = "close read views: xid_ok=" +
+                   std::to_string(xid_ok ? 1 : 0) +
+                   " prepare_ok=" + std::to_string(prepare_ok ? 1 : 0) +
+                   " detach_ok=" + std::to_string(detach_ok ? 1 : 0) +
+                   " claim_ok=" + std::to_string(claim_ok ? 1 : 0) +
+                   " before=" +
+                   std::to_string(had_read_view_before_close ? 1 : 0) +
+                   " after=" +
+                   std::to_string(has_read_view_after_close ? 1 : 0) +
+                   " rollback_ok=" + std::to_string(rollback_ok ? 1 : 0) +
+                   " fallback_rollback_ok=" +
+                   std::to_string(fallback_rollback_ok ? 1 : 0);
+  return row;
+}
+
 Preserved_trx_view_row make_debug_attach_activate_record(THD *thd) {
   Preserved_trx_view_row row;
   row.token = "debug-attach-activate-token";
@@ -1345,6 +1405,7 @@ void clear_debug_observable_records() {
                                   "debug-rollback-without-snapshot-token" ||
                               row.token ==
                                   "debug-prepare-rollback-gtid-token" ||
+                              row.token == "debug-close-read-views-token" ||
                               row.token == "debug-attach-activate-token" ||
                               row.token == "debug-detach-reattach-token" ||
                               row.token == "debug-reactivate-prepared-token" ||
@@ -1437,6 +1498,20 @@ void insert_debug_prepare_rollback_gtid_record(THD *thd) {
                      [](const Preserved_trx_view_row &existing) {
                        return existing.token ==
                               "debug-prepare-rollback-gtid-token";
+                     }),
+      g_preserved_trx_registry.end());
+  g_preserved_trx_registry.push_back(std::move(row));
+}
+
+void insert_debug_close_read_views_record(THD *thd) MY_ATTRIBUTE((unused));
+void insert_debug_close_read_views_record(THD *thd) {
+  Preserved_trx_view_row row = make_debug_close_read_views_record(thd);
+  std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
+  g_preserved_trx_registry.erase(
+      std::remove_if(g_preserved_trx_registry.begin(),
+                     g_preserved_trx_registry.end(),
+                     [](const Preserved_trx_view_row &existing) {
+                       return existing.token == "debug-close-read-views-token";
                      }),
       g_preserved_trx_registry.end());
   g_preserved_trx_registry.push_back(std::move(row));
@@ -1990,6 +2065,11 @@ static bool preserve_trx_handle_prepare_shutdown(THD *thd) {
   });
   DBUG_EXECUTE_IF("preserve_trx_debug_prepare_rollback_gtid_observable", {
     insert_debug_prepare_rollback_gtid_record(thd);
+    my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+    return true;
+  });
+  DBUG_EXECUTE_IF("preserve_trx_debug_close_read_views_observable", {
+    insert_debug_close_read_views_record(thd);
     my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
     return true;
   });

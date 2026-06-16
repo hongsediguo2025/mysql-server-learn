@@ -759,7 +759,23 @@ dberr_t trx_preserve_export_modified_table_names(
                                                  max_modified_tables);
 }
 
-void trx_preserve_close_read_views_for_shutdown() {}
+void trx_preserve_close_read_views_for_shutdown() {
+  if (trx_sys == nullptr || trx_sys->mvcc == nullptr) return;
+
+  trx_sys_mutex_enter();
+  for (trx_t *trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
+       trx = UT_LIST_GET_NEXT(trx_list, trx)) {
+    const bool is_preserved = trx_state_eq(trx, TRX_STATE_PRESERVED);
+    const bool is_claimed_prepared_preserve_trx =
+        trx_state_eq(trx, TRX_STATE_PREPARED) && trx->preserve_trx_claimed &&
+        trx->xid != nullptr && xid_is_preserve_magic(*trx->xid);
+    if ((is_preserved || is_claimed_prepared_preserve_trx) &&
+        trx->read_view != nullptr) {
+      trx_sys->mvcc->view_close(trx->read_view, true);
+    }
+  }
+  trx_sys_mutex_exit();
+}
 
 dberr_t trx_preserve_materialize_implicit_locks(
     THD *thd, const Preserve_lock_limits &limits, bool *materialized_any) {
