@@ -96,4 +96,4 @@ preserved_after_unsupported_cases
 preserve dir clean after unsupported cases
 DROP TABLE t_unsupported_myisam;
 DROP TABLE t_unsupported_innodb;
-SET GLOBAL preserve_trx_enable=OFF;
+SET GLOBAL preserve_trx_enable=ON;

@@ -101,4 +101,4 @@ TRUNCATE TABLE mysql.slow_log;
 --eval SET GLOBAL log_slow_admin_statements=$old_log_slow_admin_statements
 --eval SET GLOBAL log_output='$old_log_output'
 --enable_query_log
-SET GLOBAL preserve_trx_enable=OFF;
+SET GLOBAL preserve_trx_enable=ON;

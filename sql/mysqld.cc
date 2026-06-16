@@ -6157,13 +6157,12 @@ static int init_server_components() {
     my_getopt_skip_unknown = saved_getopt_skip_unknown;
   }
 
-  if (!opt_initialize && preserve_trx_enable &&
-      preserved_trx_validate_snapshot_support(!is_help_or_validate_option())) {
+  if (opt_validate_config && !opt_initialize && preserve_trx_enable &&
+      preserved_trx_validate_snapshot_support(false)) {
     LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
            "preserve_trx_enable=ON requires valid snapshot support");
     unireg_abort(MYSQLD_ABORT_EXIT);
   }
-  preserve_trx_set_enable_value(preserve_trx_enable);
 
   if (is_help_or_validate_option()) unireg_abort(MYSQLD_SUCCESS_EXIT);
 
@@ -6296,6 +6295,14 @@ static int init_server_components() {
     LogErr(ERROR_LEVEL, ER_CANT_CREATE_UUID);
     unireg_abort(MYSQLD_ABORT_EXIT);
   }
+
+  if (!opt_initialize && preserve_trx_enable &&
+      preserved_trx_validate_snapshot_support(!is_help_or_validate_option())) {
+    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+           "preserve_trx_enable=ON requires valid snapshot support");
+    unireg_abort(MYSQLD_ABORT_EXIT);
+  }
+  preserve_trx_set_enable_value(preserve_trx_enable);
 
   if (rpl_encryption.initialize()) {
     LogErr(ERROR_LEVEL, ER_SERVER_RPL_ENCRYPTION_UNABLE_TO_INITIALIZE);

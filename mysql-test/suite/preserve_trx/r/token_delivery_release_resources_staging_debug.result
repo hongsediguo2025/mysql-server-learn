@@ -13,4 +13,4 @@ WHERE TOKEN='debug-delivery-token';
 after_clear
 0
 SET SESSION debug='-d,preserve_trx_clear_debug_observable_records';
-SET GLOBAL preserve_trx_enable=OFF;
+SET GLOBAL preserve_trx_enable=ON;

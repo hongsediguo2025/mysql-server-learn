@@ -76,4 +76,4 @@ hex_redacted_token_in_slow_log
 DROP USER preserve_redact@localhost;
 TRUNCATE TABLE mysql.general_log;
 TRUNCATE TABLE mysql.slow_log;
-SET GLOBAL preserve_trx_enable=OFF;
+SET GLOBAL preserve_trx_enable=ON;

@@ -36,4 +36,4 @@ SELECT COUNT(*) AS after_clear
 SET SESSION debug='-d,preserve_trx_clear_debug_observable_records';
 
 DROP TABLE t_detach_claim_rollback;
-SET GLOBAL preserve_trx_enable=OFF;
+SET GLOBAL preserve_trx_enable=ON;

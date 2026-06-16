@@ -1582,7 +1582,7 @@ static Sys_var_bool Sys_preserve_trx_enable(
     "Enable resumable transactions across shutdown. In this 8.0.22 port "
     "batch the variable gates syntax only; preserve/resume operations return "
     "unsupported when enabled.",
-    GLOBAL_VAR(preserve_trx_enable), CMD_LINE(OPT_ARG), DEFAULT(false),
+    GLOBAL_VAR(preserve_trx_enable), CMD_LINE(OPT_ARG), DEFAULT(true),
     NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(check_preserve_trx_enable),
     ON_UPDATE(update_preserve_trx_enable));
 

@@ -44,6 +44,6 @@ EOF
 
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_enable=OFF;
+SET GLOBAL preserve_trx_enable=ON;
 
 --remove_file $error_log

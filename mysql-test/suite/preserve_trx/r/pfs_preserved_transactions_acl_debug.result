@@ -40,4 +40,4 @@ SET SESSION debug='-d,preserve_trx_clear_debug_observable_records';
 DROP USER preserve_pfs_none@localhost;
 DROP USER preserve_pfs_resume_any@localhost;
 DROP USER preserve_pfs_process@localhost;
-SET GLOBAL preserve_trx_enable=OFF;
+SET GLOBAL preserve_trx_enable=ON;

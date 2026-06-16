@@ -42,4 +42,4 @@ SET SESSION debug='-d,preserve_trx_clear_debug_observable_records';
 
 DROP TABLE t_close_read_views;
 DROP TABLE t_close_read_views_marker;
-SET GLOBAL preserve_trx_enable=OFF;
+SET GLOBAL preserve_trx_enable=ON;

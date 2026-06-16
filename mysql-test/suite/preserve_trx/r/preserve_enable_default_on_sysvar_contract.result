@@ -1,0 +1,15 @@
+SELECT @@global.preserve_trx_enable AS preserve_enable_default_on;
+preserve_enable_default_on
+1
+SELECT @@global.preserve_trx_temp_table_enable AS temp_table_enable_default_on;
+temp_table_enable_default_on
+1
+SET GLOBAL preserve_trx_enable=OFF;
+SELECT @@global.preserve_trx_enable AS preserve_enable_after_explicit_off;
+preserve_enable_after_explicit_off
+0
+SET GLOBAL preserve_trx_enable=ON;
+SELECT @@global.preserve_trx_enable AS preserve_enable_after_explicit_on;
+preserve_enable_after_explicit_on
+1
+SET GLOBAL preserve_trx_enable=ON;

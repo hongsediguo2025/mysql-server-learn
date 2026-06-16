@@ -50,4 +50,4 @@ connection default;
 
 DROP TABLE t_read_view_import;
 DROP TABLE t_read_view_marker;
-SET GLOBAL preserve_trx_enable=OFF;
+SET GLOBAL preserve_trx_enable=ON;

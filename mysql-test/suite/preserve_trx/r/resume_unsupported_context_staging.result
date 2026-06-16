@@ -24,4 +24,4 @@ RESUME PRESERVED TRANSACTION 'msp_missing_token';
 ERROR HY000: Preserved transaction was not found
 DROP USER preserve_resume_context@localhost;
 DROP TABLE t_resume_context_staging;
-SET GLOBAL preserve_trx_enable=OFF;
+SET GLOBAL preserve_trx_enable=ON;

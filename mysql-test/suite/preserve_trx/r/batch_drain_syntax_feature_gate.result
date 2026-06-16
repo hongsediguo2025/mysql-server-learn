@@ -30,4 +30,4 @@ START TRANSACTION;
 DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Invalid preserved transaction state
 ROLLBACK;
-SET GLOBAL preserve_trx_enable=OFF;
+SET GLOBAL preserve_trx_enable=ON;

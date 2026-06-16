@@ -22,4 +22,4 @@ RESUME PRESERVED TRANSACTION 'msp_missing_token';
 
 DROP USER preserve_resume_any@localhost;
 DROP USER preserve_resume_denied@localhost;
-SET GLOBAL preserve_trx_enable=OFF;
+SET GLOBAL preserve_trx_enable=ON;

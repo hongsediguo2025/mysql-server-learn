@@ -7,4 +7,4 @@ preserve dir exists
 .key size 110
 no preserve temp files
 SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_enable=OFF;
+SET GLOBAL preserve_trx_enable=ON;

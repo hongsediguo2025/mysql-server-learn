@@ -60,7 +60,7 @@
 #include "sql/sql_lex.h"
 #include "storage/innobase/include/trx0preserve.h"
 
-bool preserve_trx_enable = false;
+bool preserve_trx_enable = true;
 bool preserve_trx_temp_table_enable = true;
 ulong preserve_trx_drain_mode = PRESERVE_TRX_DRAIN_MODE_SOFT;
 uint preserve_trx_drain_grace_ms = 30000;

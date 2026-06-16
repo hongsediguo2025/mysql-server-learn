@@ -66,4 +66,4 @@ DROP USER preserve_resume_any@localhost;
 DROP USER preserve_resume_denied@localhost;
 DROP USER preserve_u@localhost;
 DROP TABLE t_priv;
-SET GLOBAL preserve_trx_enable=OFF;
+SET GLOBAL preserve_trx_enable=ON;
