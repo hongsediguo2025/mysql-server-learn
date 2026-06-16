@@ -474,6 +474,14 @@ Current migration status:
   returning `DB_ERROR` for invalid payload bytes. The public PREPARE path still
   returns `ER_PRESERVE_TRX_UNSUPPORTED`; RESUME-time isolation restore remains
   pending until durable snapshot replay is connected.
+- 2026-06-16: `table_lock_payload_export_staging_debug` covers the first
+  table-lock kernel payload slice. RED recorded `export_ok=0` from the shell
+  implementation. GREEN passed after porting table-lock payload export,
+  validation, lock-count extraction, and AUTO_INC detection for real InnoDB
+  table locks; the test exports the IX table lock created by an UPDATE
+  transaction and records one validated payload entry through P_S. Public
+  PREPARE still returns `ER_PRESERVE_TRX_UNSUPPORTED`; table-lock import and
+  positive RESUME-time lock restoration remain pending.
 
 Tests:
 

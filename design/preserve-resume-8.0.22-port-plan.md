@@ -556,6 +556,14 @@ Current 8.0.22 landing status:
   succeeds and an invalid byte fails while public PREPARE still returns
   `ER_PRESERVE_TRX_UNSUPPORTED`. Positive RESUME-time isolation restoration
   remains pending until attach and durable snapshot replay are connected.
+- 2026-06-16: added the table-lock payload export staging slice. 8.0.22 now
+  serializes current transaction table locks into a bounded payload, validates
+  the payload shape, extracts the lock count, and detects AUTO_INC table-lock
+  entries. The debug-only `table_lock_payload_export_staging_debug` row proves
+  a real UPDATE transaction exports one IX table lock and a nonempty valid
+  payload while public PREPARE still returns `ER_PRESERVE_TRX_UNSUPPORTED`.
+  Table-lock import and positive RESUME-time lock restoration remain pending;
+  this slice is export/parser coverage only.
 
 ## Batch 3: Recovery And Failure Windows
 

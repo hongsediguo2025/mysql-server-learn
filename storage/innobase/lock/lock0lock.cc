@@ -3211,6 +3211,230 @@ void lock_rec_restore_from_page_infimum(const buf_block_t *block,
   lock_rec_move(block, donator, heap_no, PAGE_HEAP_NO_INFIMUM);
 }
 
+/* === Preserved transaction: table locks (TLV 0x31) ======================= */
+
+static void lock_preserve_append_le32(std::string *payload, uint32_t value) {
+  for (size_t i = 0; i < 4; ++i) {
+    payload->push_back(static_cast<char>((value >> (i * 8)) & 0xff));
+  }
+}
+
+static bool lock_preserve_read_le32(const std::string &payload, size_t *offset,
+                                    uint32_t *value) {
+  if (offset == nullptr || value == nullptr || *offset + 4 > payload.size()) {
+    return true;
+  }
+
+  uint32_t result = 0;
+  for (size_t i = 0; i < 4; ++i) {
+    result |= static_cast<uint32_t>(
+                  static_cast<unsigned char>(payload[*offset + i]))
+              << (i * 8);
+  }
+  *offset += 4;
+  *value = result;
+  return false;
+}
+
+static void lock_preserve_append_le64(std::string *payload, uint64_t value) {
+  for (size_t i = 0; i < 8; ++i) {
+    payload->push_back(static_cast<char>((value >> (i * 8)) & 0xff));
+  }
+}
+
+static bool lock_preserve_read_le64(const std::string &payload, size_t *offset,
+                                    uint64_t *value) {
+  if (offset == nullptr || value == nullptr || *offset + 8 > payload.size()) {
+    return true;
+  }
+
+  uint64_t result = 0;
+  for (size_t i = 0; i < 8; ++i) {
+    result |= static_cast<uint64_t>(
+                  static_cast<unsigned char>(payload[*offset + i]))
+              << (i * 8);
+  }
+  *offset += 8;
+  *value = result;
+  return false;
+}
+
+constexpr uint32_t kPreserveTableLockEntryStaticLength =
+    sizeof(uint64_t) + sizeof(uint32_t) * 3;
+constexpr uint32_t kPreserveTableLockTypeModeKnownBits = LOCK_TABLE;
+
+struct Preserve_table_lock_entry {
+  table_id_t table_id{0};
+  uint32_t lock_mode{0};
+  uint32_t type_mode_bits{0};
+};
+
+static bool lock_preserve_table_lock_mode_is_valid(uint32_t mode) {
+  return mode == LOCK_IS || mode == LOCK_IX || mode == LOCK_S ||
+         mode == LOCK_X || mode == LOCK_AUTO_INC;
+}
+
+dberr_t lock_preserve_export_table_locks(trx_t *trx, std::string *payload,
+                                         uint32_t max_lock_count,
+                                         uint32_t already_used) {
+  if (payload == nullptr) {
+    return DB_ERROR;
+  }
+
+  payload->clear();
+  if (trx == nullptr) {
+    return DB_ERROR;
+  }
+
+  std::vector<Preserve_table_lock_entry> entries;
+  uint32_t exported = 0;
+  {
+    locksys::Global_exclusive_latch_guard guard{};
+    trx_mutex_enter(trx);
+
+    for (const lock_t *lock = UT_LIST_GET_FIRST(trx->lock.trx_locks);
+         lock != nullptr; lock = UT_LIST_GET_NEXT(trx_locks, lock)) {
+      if (lock_get_type_low(lock) != LOCK_TABLE) {
+        continue;
+      }
+
+      if (lock->is_waiting()) {
+        trx_mutex_exit(trx);
+        payload->clear();
+        return DB_UNSUPPORTED;
+      }
+
+      const uint32_t mode = lock_get_mode(lock);
+      if (!lock_preserve_table_lock_mode_is_valid(mode)) {
+        trx_mutex_exit(trx);
+        payload->clear();
+        return DB_UNSUPPORTED;
+      }
+
+      if (lock->tab_lock.table == nullptr) {
+        trx_mutex_exit(trx);
+        payload->clear();
+        return DB_ERROR;
+      }
+
+      if (max_lock_count != UINT32_MAX &&
+          (already_used >= max_lock_count ||
+           exported >= max_lock_count - already_used)) {
+        trx_mutex_exit(trx);
+        payload->clear();
+        return DB_UNSUPPORTED;
+      }
+
+      Preserve_table_lock_entry entry;
+      entry.table_id = lock->tab_lock.table->id;
+      entry.lock_mode = mode;
+      entry.type_mode_bits =
+          lock->type_mode & kPreserveTableLockTypeModeKnownBits;
+      entries.push_back(entry);
+      ++exported;
+    }
+
+    trx_mutex_exit(trx);
+  }
+
+  if (entries.empty()) {
+    return DB_SUCCESS;
+  }
+
+  lock_preserve_append_le32(payload, static_cast<uint32_t>(entries.size()));
+  for (const Preserve_table_lock_entry &entry : entries) {
+    lock_preserve_append_le64(payload, entry.table_id);
+    lock_preserve_append_le32(payload, entry.lock_mode);
+    lock_preserve_append_le32(payload, entry.type_mode_bits);
+    lock_preserve_append_le32(payload, 0);
+  }
+
+  return DB_SUCCESS;
+}
+
+static dberr_t lock_preserve_parse_table_locks_payload(
+    const std::string &payload,
+    std::vector<Preserve_table_lock_entry> *entries) {
+  ut_ad(entries != nullptr);
+
+  entries->clear();
+  if (payload.empty()) {
+    return DB_SUCCESS;
+  }
+
+  uint32_t count = 0;
+  size_t offset = 0;
+  if (lock_preserve_read_le32(payload, &offset, &count) || count == 0) {
+    return DB_ERROR;
+  }
+
+  const uint64_t expected_remaining =
+      static_cast<uint64_t>(count) * kPreserveTableLockEntryStaticLength;
+  if (expected_remaining != payload.size() - offset) {
+    return DB_ERROR;
+  }
+
+  for (uint32_t i = 0; i < count; ++i) {
+    Preserve_table_lock_entry entry;
+    uint64_t table_id = 0;
+    uint32_t lock_mode = 0;
+    uint32_t type_mode_bits = 0;
+    uint32_t reserved = 0;
+    if (lock_preserve_read_le64(payload, &offset, &table_id) ||
+        lock_preserve_read_le32(payload, &offset, &lock_mode) ||
+        lock_preserve_read_le32(payload, &offset, &type_mode_bits) ||
+        lock_preserve_read_le32(payload, &offset, &reserved)) {
+      return DB_ERROR;
+    }
+
+    if (reserved != 0 ||
+        type_mode_bits != kPreserveTableLockTypeModeKnownBits ||
+        !lock_preserve_table_lock_mode_is_valid(lock_mode)) {
+      return DB_ERROR;
+    }
+
+    entry.table_id = table_id;
+    entry.lock_mode = lock_mode;
+    entry.type_mode_bits = type_mode_bits;
+    entries->push_back(entry);
+  }
+
+  return offset == payload.size() ? DB_SUCCESS : DB_ERROR;
+}
+
+bool lock_preserve_table_locks_payload_is_valid_for_import(
+    const std::string &payload) {
+  std::vector<Preserve_table_lock_entry> entries;
+  return lock_preserve_parse_table_locks_payload(payload, &entries) ==
+         DB_SUCCESS;
+}
+
+bool lock_preserve_table_locks_payload_lock_count(const std::string &payload,
+                                                  uint32_t *lock_count) {
+  if (lock_count == nullptr) return false;
+  std::vector<Preserve_table_lock_entry> entries;
+  if (lock_preserve_parse_table_locks_payload(payload, &entries) !=
+      DB_SUCCESS) {
+    return false;
+  }
+  *lock_count = static_cast<uint32_t>(entries.size());
+  return true;
+}
+
+bool lock_preserve_table_locks_payload_has_autoinc(const std::string &payload) {
+  std::vector<Preserve_table_lock_entry> entries;
+  if (lock_preserve_parse_table_locks_payload(payload, &entries) !=
+      DB_SUCCESS) {
+    return false;
+  }
+  for (const Preserve_table_lock_entry &entry : entries) {
+    if (entry.lock_mode == LOCK_AUTO_INC) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /*========================= TABLE LOCKS ==============================*/
 
 /** Functor for accessing the embedded node within a table lock. */

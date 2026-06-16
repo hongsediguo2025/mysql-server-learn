@@ -33,6 +33,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #ifndef lock0lock_h
 #define lock0lock_h
 
+#include <string>
+
 #include "buf0types.h"
 #include "dict0types.h"
 #include "hash0hash.h"
@@ -590,6 +592,41 @@ dberr_t lock_table(ulint flags, /*!< in: if BTR_NO_LOCKING_FLAG bit is set,
 @param[in,out] table Table
 @param[in,out] trx Transaction */
 void lock_table_ix_resurrect(dict_table_t *table, trx_t *trx);
+
+/** Export granted explicit table locks (IS/IX/S/X/AUTO_INC) for a preserved
+transaction.
+@param[in]  trx             transaction whose table locks are exported
+@param[out] payload         opaque serialized table-lock payload
+@param[in]  max_lock_count  shared lock-count budget that must not be exceeded
+                            when combined with already exported record locks
+@param[in]  already_used    number of lock-budget units already consumed by
+                            previously exported record locks
+@return DB_SUCCESS or error */
+dberr_t lock_preserve_export_table_locks(trx_t *trx, std::string *payload,
+                                         uint32_t max_lock_count,
+                                         uint32_t already_used);
+
+/** Validate an opaque preserved table-lock payload with the same parser used
+for import.
+@param[in] payload opaque serialized table-lock payload
+@return true if the payload is syntactically and semantically importable */
+bool lock_preserve_table_locks_payload_is_valid_for_import(
+    const std::string &payload);
+
+/** Count explicit table locks encoded in a preserved table-lock payload.
+Uses the import parser so corrupt payloads fail closed.
+@param[in]  payload    opaque serialized table-lock payload
+@param[out] lock_count number of table-lock entries in the payload
+@return true if the payload was parsed and counted successfully */
+bool lock_preserve_table_locks_payload_lock_count(const std::string &payload,
+                                                  uint32_t *lock_count);
+
+/** Returns whether a preserved table-lock payload encodes an explicit
+AUTO_INCREMENT table lock. Used by snapshot validation to keep the derived
+`autoinc_lock_owned` flag and the 0x31 TLV in sync.
+@param[in] payload opaque serialized table-lock payload
+@return true if at least one AUTO_INCREMENT table lock is present */
+bool lock_preserve_table_locks_payload_has_autoinc(const std::string &payload);
 
 /** Sets a lock on a table based on the given mode.
 @param[in]	table	table to lock

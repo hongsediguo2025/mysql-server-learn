@@ -32,6 +32,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include <algorithm>
 
+#include "lock0lock.h"
 #include "read0read.h"
 #include "sess0sess.h"
 #include "sql/mysqld.h"
@@ -496,21 +497,19 @@ bool trx_preserve_split_record_and_predicate_locks(
 dberr_t trx_preserve_export_table_locks(trx_t *trx, std::string *payload,
                                         uint32_t max_lock_count,
                                         uint32_t already_used) {
-  (void)trx;
-  (void)max_lock_count;
-  (void)already_used;
-  if (payload != nullptr) payload->clear();
-  return DB_UNSUPPORTED;
+  return lock_preserve_export_table_locks(trx, payload, max_lock_count,
+                                          already_used);
 }
 
 dberr_t trx_preserve_export_table_locks(THD *thd, std::string *payload,
                                         uint32_t max_lock_count,
                                         uint32_t already_used) {
-  (void)thd;
-  (void)max_lock_count;
-  (void)already_used;
-  if (payload != nullptr) payload->clear();
-  return DB_UNSUPPORTED;
+  if (thd == nullptr) {
+    if (payload != nullptr) payload->clear();
+    return DB_ERROR;
+  }
+  return trx_preserve_export_table_locks(thd_to_trx(thd), payload,
+                                         max_lock_count, already_used);
 }
 
 dberr_t trx_preserve_import_table_locks(trx_t *trx,
@@ -522,20 +521,16 @@ dberr_t trx_preserve_import_table_locks(trx_t *trx,
 
 bool trx_preserve_table_locks_payload_is_valid_for_import(
     const std::string &payload) {
-  (void)payload;
-  return false;
+  return lock_preserve_table_locks_payload_is_valid_for_import(payload);
 }
 
 bool trx_preserve_table_locks_payload_lock_count(
     const std::string &payload, uint32_t *lock_count) {
-  (void)payload;
-  if (lock_count != nullptr) *lock_count = 0;
-  return false;
+  return lock_preserve_table_locks_payload_lock_count(payload, lock_count);
 }
 
 bool trx_preserve_table_locks_payload_has_autoinc(const std::string &payload) {
-  (void)payload;
-  return false;
+  return lock_preserve_table_locks_payload_has_autoinc(payload);
 }
 
 dberr_t trx_preserve_export_savepoints(trx_t *trx, std::string *payload) {
