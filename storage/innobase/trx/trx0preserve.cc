@@ -31,6 +31,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0preserve.h"
 
 #include <algorithm>
+#include <cstring>
 
 #include "log0log.h"
 #include "lock0lock.h"
@@ -47,6 +48,24 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0trx.h"
 #include "trx0undo.h"
 #include "ut0vec.h"
+
+static bool trx_preserve_token_to_xid(const char *token, XID *xid) {
+  if (token == nullptr || xid == nullptr) {
+    return false;
+  }
+
+  const size_t token_length = std::strlen(token);
+  if (token_length == 0 || token_length > PRESERVE_TRX_TOKEN_MAX_LENGTH ||
+      token_length >
+          XIDDATASIZE - static_cast<size_t>(PRESERVE_TRX_XID_GTRID_LENGTH)) {
+    return false;
+  }
+
+  xid->set(PRESERVE_TRX_XID_FORMAT_ID, PRESERVE_TRX_XID_GTRID,
+           PRESERVE_TRX_XID_GTRID_LENGTH, token,
+           static_cast<long>(token_length));
+  return true;
+}
 
 static void trx_preserve_append_le32(std::string *payload, uint32_t value) {
   for (size_t i = 0; i < 4; ++i) {
@@ -145,9 +164,97 @@ static bool trx_preserve_state_allows_token_rollback(trx_state_t state) {
   return state == TRX_STATE_PREPARED || state == TRX_STATE_PRESERVED;
 }
 
-trx_t *trx_preserve_claim_prepared(const XID &xid) {
-  (void)xid;
+enum class trx_preserve_rollback_scope {
+  DETACHED_ONLY,
+  OWNER_ONLY,
+  DETACHED_OR_OWNER
+};
+
+static bool trx_preserve_rollback_owner_matches(const trx_t *trx,
+                                                const THD *owner_thd,
+                                                trx_preserve_rollback_scope
+                                                    scope) {
+  switch (scope) {
+    case trx_preserve_rollback_scope::DETACHED_ONLY:
+      return trx->mysql_thd == nullptr;
+    case trx_preserve_rollback_scope::OWNER_ONLY:
+      return trx->mysql_thd == owner_thd;
+    case trx_preserve_rollback_scope::DETACHED_OR_OWNER:
+      return trx->mysql_thd == nullptr ||
+             (owner_thd != nullptr && trx->mysql_thd == owner_thd);
+  }
+
+  ut_error;
+}
+
+static trx_t *trx_preserve_find_for_token_rollback(
+    const XID &xid, const THD *owner_thd, trx_preserve_rollback_scope scope,
+    XID *claimed_xid) {
+  ut_ad(trx_sys_mutex_own());
+  ut_ad(claimed_xid != nullptr);
+
+  for (trx_t *trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
+       trx = UT_LIST_GET_NEXT(trx_list, trx)) {
+    assert_trx_in_rw_list(trx);
+
+    if (trx->xid == nullptr ||
+        !trx_preserve_rollback_owner_matches(trx, owner_thd, scope) ||
+        !xid.eq(trx->xid)) {
+      continue;
+    }
+
+    if (!trx_preserve_state_allows_token_rollback(trx->state) ||
+        trx->preserve_trx_claimed) {
+      continue;
+    }
+
+    if (trx_state_eq(trx, TRX_STATE_PREPARED) &&
+        trx_preserve_mark_preserved(trx) != DB_SUCCESS) {
+      return nullptr;
+    }
+
+    *claimed_xid = *trx->xid;
+    trx->xid->reset();
+    return trx;
+  }
+
   return nullptr;
+}
+
+static void trx_preserve_release_token_rollback_claim(trx_t *trx,
+                                                      const XID &xid) {
+  trx_sys_mutex_enter();
+  if (trx->xid->is_null()) {
+    *trx->xid = xid;
+  }
+  trx_sys_mutex_exit();
+}
+
+trx_t *trx_preserve_claim_prepared(const XID &xid) {
+  if (!xid_is_preserve_magic(xid)) {
+    return nullptr;
+  }
+
+  trx_t *claimed = nullptr;
+
+  trx_sys_mutex_enter();
+
+  for (trx_t *trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
+       trx = UT_LIST_GET_NEXT(trx_list, trx)) {
+    assert_trx_in_rw_list(trx);
+
+    if (trx->mysql_thd == nullptr && !trx->preserve_trx_claimed &&
+        trx_state_eq(trx, TRX_STATE_PREPARED) && xid.eq(trx->xid) &&
+        trx_preserve_mark_preserved(trx) == DB_SUCCESS) {
+      trx->preserve_trx_claimed = true;
+      claimed = trx;
+      break;
+    }
+  }
+
+  trx_sys_mutex_exit();
+
+  return claimed;
 }
 
 dberr_t trx_preserve_claim_detached_prepared(trx_t *trx) {
@@ -169,14 +276,75 @@ dberr_t trx_preserve_claim_detached_prepared(trx_t *trx) {
 }
 
 dberr_t trx_preserve_rollback_by_token(const char *token) {
-  (void)token;
-  return DB_UNSUPPORTED;
+  XID xid;
+
+  if (!trx_preserve_token_to_xid(token, &xid)) {
+    return DB_ERROR;
+  }
+
+  if (trx_sys == nullptr) {
+    return DB_NOT_FOUND;
+  }
+
+  XID claimed_xid;
+  trx_t *trx;
+
+  trx_sys_mutex_enter();
+  trx = trx_preserve_find_for_token_rollback(
+      xid, nullptr, trx_preserve_rollback_scope::DETACHED_ONLY, &claimed_xid);
+  trx_sys_mutex_exit();
+
+  if (trx == nullptr) {
+    return DB_NOT_FOUND;
+  }
+
+  const dberr_t err = trx_rollback_for_mysql(trx);
+
+  if (err == DB_SUCCESS) {
+    trx->is_registered = false;
+    trx_free_for_background(trx);
+  } else {
+    trx_preserve_release_token_rollback_claim(trx, claimed_xid);
+  }
+
+  return err;
 }
 
 dberr_t trx_preserve_rollback_by_token_for_thd(const char *token, THD *thd) {
-  (void)token;
-  (void)thd;
-  return DB_UNSUPPORTED;
+  XID xid;
+
+  if (!trx_preserve_token_to_xid(token, &xid)) {
+    return DB_ERROR;
+  }
+
+  if (trx_sys == nullptr) {
+    return DB_NOT_FOUND;
+  }
+
+  XID claimed_xid;
+  trx_t *trx;
+
+  trx_sys_mutex_enter();
+  trx = trx_preserve_find_for_token_rollback(
+      xid, thd, trx_preserve_rollback_scope::DETACHED_OR_OWNER, &claimed_xid);
+  trx_sys_mutex_exit();
+
+  if (trx == nullptr) {
+    return DB_NOT_FOUND;
+  }
+
+  const dberr_t err = trx_rollback_for_mysql(trx);
+
+  if (err == DB_SUCCESS) {
+    trx->is_registered = false;
+    if (trx->mysql_thd == nullptr) {
+      trx_free_for_background(trx);
+    }
+  } else {
+    trx_preserve_release_token_rollback_claim(trx, claimed_xid);
+  }
+
+  return err;
 }
 
 dberr_t trx_preserve_rollback_claimed(trx_t *trx) {

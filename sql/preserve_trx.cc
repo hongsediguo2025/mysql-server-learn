@@ -655,6 +655,105 @@ Preserved_trx_view_row make_debug_detach_claim_rollback_record(THD *thd) {
   return row;
 }
 
+Preserved_trx_view_row make_debug_claim_prepared_record(THD *thd) {
+  Preserved_trx_view_row row;
+  row.token = "debug-claim-prepared-token";
+  row.user = "debug_user";
+  row.host = "debug_host";
+  row.owner_user = row.user;
+  row.owner_host = row.host;
+  row.state = "FAILED";
+  row.isolation = "REPEATABLE-READ";
+  row.binlog_state = "NONE";
+  row.binlog_warmcopy_state = "NONE";
+  row.temp_table_state = "NONE";
+
+  XID xid;
+  const bool xid_ok = debug_preserve_token_to_xid(row.token, &xid);
+  bool prepare_ok = false;
+  bool detach_ok = false;
+  bool claim_ok = false;
+  bool rollback_ok = false;
+  bool fallback_rollback_ok = true;
+
+  trx_t *trx = nullptr;
+  if (xid_ok && thd != nullptr) {
+    *thd->get_transaction()->xid_state()->get_xid() = xid;
+    prepare_ok = ha_prepare_low(thd, true) == 0;
+    if (prepare_ok) {
+      trx = trx_preserve_detach_current_thd(thd);
+      detach_ok = trx != nullptr;
+      if (detach_ok) {
+        trx_t *claimed = trx_preserve_claim_prepared(xid);
+        claim_ok = claimed == trx;
+        if (claim_ok) {
+          rollback_ok = trx_preserve_rollback_claimed(claimed) == DB_SUCCESS;
+        }
+      } else {
+        fallback_rollback_ok = ha_rollback_trans(thd, true) == 0;
+      }
+    }
+  }
+
+  debug_reset_thd_after_detached_preserve(thd);
+  row.last_error = "claim prepared: xid_ok=" +
+                   std::to_string(xid_ok ? 1 : 0) +
+                   " prepare_ok=" + std::to_string(prepare_ok ? 1 : 0) +
+                   " detach_ok=" + std::to_string(detach_ok ? 1 : 0) +
+                   " claim_ok=" + std::to_string(claim_ok ? 1 : 0) +
+                   " rollback_ok=" + std::to_string(rollback_ok ? 1 : 0) +
+                   " fallback_rollback_ok=" +
+                   std::to_string(fallback_rollback_ok ? 1 : 0);
+  return row;
+}
+
+Preserved_trx_view_row make_debug_rollback_by_token_record(THD *thd) {
+  Preserved_trx_view_row row;
+  row.token = "debug-rollback-by-token-token";
+  row.user = "debug_user";
+  row.host = "debug_host";
+  row.owner_user = row.user;
+  row.owner_host = row.host;
+  row.state = "FAILED";
+  row.isolation = "REPEATABLE-READ";
+  row.binlog_state = "NONE";
+  row.binlog_warmcopy_state = "NONE";
+  row.temp_table_state = "NONE";
+
+  XID xid;
+  const bool xid_ok = debug_preserve_token_to_xid(row.token, &xid);
+  bool prepare_ok = false;
+  bool detach_ok = false;
+  bool rollback_by_token_ok = false;
+  bool fallback_rollback_ok = true;
+
+  if (xid_ok && thd != nullptr) {
+    *thd->get_transaction()->xid_state()->get_xid() = xid;
+    prepare_ok = ha_prepare_low(thd, true) == 0;
+    if (prepare_ok) {
+      trx_t *trx = trx_preserve_detach_current_thd(thd);
+      detach_ok = trx != nullptr;
+      if (detach_ok) {
+        rollback_by_token_ok =
+            trx_preserve_rollback_by_token(row.token.c_str()) == DB_SUCCESS;
+      } else {
+        fallback_rollback_ok = ha_rollback_trans(thd, true) == 0;
+      }
+    }
+  }
+
+  debug_reset_thd_after_detached_preserve(thd);
+  row.last_error = "rollback by token: xid_ok=" +
+                   std::to_string(xid_ok ? 1 : 0) +
+                   " prepare_ok=" + std::to_string(prepare_ok ? 1 : 0) +
+                   " detach_ok=" + std::to_string(detach_ok ? 1 : 0) +
+                   " rollback_by_token_ok=" +
+                   std::to_string(rollback_by_token_ok ? 1 : 0) +
+                   " fallback_rollback_ok=" +
+                   std::to_string(fallback_rollback_ok ? 1 : 0);
+  return row;
+}
+
 Preserved_trx_view_row make_debug_attach_activate_record(THD *thd) {
   Preserved_trx_view_row row;
   row.token = "debug-attach-activate-token";
@@ -1128,6 +1227,8 @@ void clear_debug_observable_records() {
                               row.token == "debug-isolation-restore-token" ||
                               row.token ==
                                   "debug-detach-claim-rollback-token" ||
+                              row.token == "debug-claim-prepared-token" ||
+                              row.token == "debug-rollback-by-token-token" ||
                               row.token == "debug-attach-activate-token" ||
                               row.token == "debug-detach-reattach-token" ||
                               row.token == "debug-reactivate-prepared-token" ||
@@ -1159,6 +1260,35 @@ void insert_debug_detach_claim_rollback_record(THD *thd) {
                      [](const Preserved_trx_view_row &existing) {
                        return existing.token ==
                               "debug-detach-claim-rollback-token";
+                     }),
+      g_preserved_trx_registry.end());
+  g_preserved_trx_registry.push_back(std::move(row));
+}
+
+void insert_debug_claim_prepared_record(THD *thd) MY_ATTRIBUTE((unused));
+void insert_debug_claim_prepared_record(THD *thd) {
+  Preserved_trx_view_row row = make_debug_claim_prepared_record(thd);
+  std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
+  g_preserved_trx_registry.erase(
+      std::remove_if(g_preserved_trx_registry.begin(),
+                     g_preserved_trx_registry.end(),
+                     [](const Preserved_trx_view_row &existing) {
+                       return existing.token == "debug-claim-prepared-token";
+                     }),
+      g_preserved_trx_registry.end());
+  g_preserved_trx_registry.push_back(std::move(row));
+}
+
+void insert_debug_rollback_by_token_record(THD *thd) MY_ATTRIBUTE((unused));
+void insert_debug_rollback_by_token_record(THD *thd) {
+  Preserved_trx_view_row row = make_debug_rollback_by_token_record(thd);
+  std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
+  g_preserved_trx_registry.erase(
+      std::remove_if(g_preserved_trx_registry.begin(),
+                     g_preserved_trx_registry.end(),
+                     [](const Preserved_trx_view_row &existing) {
+                       return existing.token ==
+                              "debug-rollback-by-token-token";
                      }),
       g_preserved_trx_registry.end());
   g_preserved_trx_registry.push_back(std::move(row));
@@ -1692,6 +1822,16 @@ static bool preserve_trx_handle_prepare_shutdown(THD *thd) {
 
   DBUG_EXECUTE_IF("preserve_trx_debug_detach_claim_rollback_observable", {
     insert_debug_detach_claim_rollback_record(thd);
+    my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+    return true;
+  });
+  DBUG_EXECUTE_IF("preserve_trx_debug_claim_prepared_observable", {
+    insert_debug_claim_prepared_record(thd);
+    my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+    return true;
+  });
+  DBUG_EXECUTE_IF("preserve_trx_debug_rollback_by_token_observable", {
+    insert_debug_rollback_by_token_record(thd);
     my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
     return true;
   });
