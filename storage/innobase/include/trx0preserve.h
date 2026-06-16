@@ -121,6 +121,7 @@ bool trx_preserve_table_locks_payload_lock_count(
     const std::string &payload, uint32_t *lock_count);
 bool trx_preserve_table_locks_payload_has_autoinc(const std::string &payload);
 dberr_t trx_preserve_export_savepoints(trx_t *trx, std::string *payload);
+dberr_t trx_preserve_export_savepoints(THD *thd, std::string *payload);
 dberr_t trx_preserve_import_savepoints(
     trx_t *trx, const std::string &payload,
     const std::vector<std::string> &savepoint_names);

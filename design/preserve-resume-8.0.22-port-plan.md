@@ -511,6 +511,15 @@ Current 8.0.22 landing status:
   and ReadView import during RESUME remain pending. The 8.0.22 import validity
   check uses `trx_sys_get_max_trx_id()` because the current source branch helper
   `trx_sys_get_next_trx_id_or_no()` is not available in 8.0.22.
+- 2026-06-16: added the savepoint payload export/validation staging slice.
+  8.0.22 now has little-endian 32-bit payload helpers, current-THD savepoint
+  export, savepoint payload validation with count extraction, and the
+  debug-only `savepoint_payload_export_staging_debug` observable row. The RED
+  case produced no savepoint payload row; GREEN exports two real transaction
+  savepoints and validates the payload while public SQL still returns
+  `ER_PRESERVE_TRX_UNSUPPORTED`. RESUME-time savepoint import remains
+  fail-closed until attach/activation and binlog-cache savepoint restoration
+  are ported together.
 
 ## Batch 3: Recovery And Failure Windows
 

@@ -436,6 +436,14 @@ Current migration status:
   registry while preserving public fail-closed behavior. Positive
   `read_view_rr`/`read_view_rc` resume coverage remains pending until durable
   snapshot serialization and RESUME-time import are connected.
+- 2026-06-16: `savepoint_payload_export_staging_debug` covers savepoint payload
+  export/validation. RED showed no debug payload row. GREEN passed after
+  porting current-THD savepoint export and payload validation with count
+  extraction. The test records two real savepoints through the observable
+  registry while preserving public fail-closed behavior. Positive
+  `savepoint_rollback_to` and RESUME-time savepoint import coverage remains
+  pending until attach/activation and binlog-cache savepoint restoration are
+  connected.
 
 Tests:
 

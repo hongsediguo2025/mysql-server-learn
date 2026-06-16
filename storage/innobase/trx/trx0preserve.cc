@@ -37,8 +37,32 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "sql/mysqld.h"
 #include "sql/sql_class.h"
 #include "storage/innobase/handler/ha_innodb.h"
+#include "trx0roll.h"
 #include "trx0trx.h"
 #include "trx0undo.h"
+
+static void trx_preserve_append_le32(std::string *payload, uint32_t value) {
+  for (size_t i = 0; i < 4; ++i) {
+    payload->push_back(static_cast<char>((value >> (i * 8)) & 0xff));
+  }
+}
+
+static bool trx_preserve_read_le32(const std::string &payload, size_t *offset,
+                                   uint32_t *value) {
+  if (offset == nullptr || value == nullptr || *offset + 4 > payload.size()) {
+    return true;
+  }
+
+  uint32_t result = 0;
+  for (size_t i = 0; i < 4; ++i) {
+    result |= static_cast<uint32_t>(
+                  static_cast<unsigned char>(payload[*offset + i]))
+              << (i * 8);
+  }
+  *offset += 4;
+  *value = result;
+  return false;
+}
 
 static void trx_preserve_append_le64(std::string *payload, uint64_t value) {
   for (size_t i = 0; i < 8; ++i) {
@@ -473,9 +497,36 @@ bool trx_preserve_table_locks_payload_has_autoinc(const std::string &payload) {
 }
 
 dberr_t trx_preserve_export_savepoints(trx_t *trx, std::string *payload) {
-  (void)trx;
-  if (payload != nullptr) payload->clear();
-  return DB_UNSUPPORTED;
+  if (trx == nullptr || payload == nullptr) {
+    return DB_ERROR;
+  }
+
+  payload->clear();
+  if (trx->fts_trx != nullptr) {
+    return DB_ERROR;
+  }
+
+  const uint32_t count =
+      static_cast<uint32_t>(UT_LIST_GET_LEN(trx->trx_savepoints));
+  if (count == 0) {
+    return DB_SUCCESS;
+  }
+
+  trx_preserve_append_le32(payload, count);
+  for (trx_named_savept_t *savep = UT_LIST_GET_FIRST(trx->trx_savepoints);
+       savep != nullptr; savep = UT_LIST_GET_NEXT(trx_savepoints, savep)) {
+    trx_preserve_append_le64(payload, savep->savept.least_undo_no);
+    trx_preserve_append_le64(
+        payload, static_cast<uint64_t>(savep->mysql_binlog_cache_pos));
+  }
+
+  return DB_SUCCESS;
+}
+
+dberr_t trx_preserve_export_savepoints(THD *thd, std::string *payload) {
+  if (thd == nullptr) return DB_ERROR;
+  trx_t *trx = thd_to_trx(thd);
+  return trx_preserve_export_savepoints(trx, payload);
 }
 
 dberr_t trx_preserve_import_savepoints(
@@ -489,9 +540,31 @@ dberr_t trx_preserve_import_savepoints(
 
 bool trx_preserve_savepoints_payload_is_valid_for_import(
     const std::string &payload, uint32_t *savepoint_count) {
-  (void)payload;
   if (savepoint_count != nullptr) *savepoint_count = 0;
-  return false;
+  if (payload.empty()) return true;
+  if (payload.size() < 4) return false;
+
+  size_t offset = 0;
+  uint32_t count = 0;
+  if (trx_preserve_read_le32(payload, &offset, &count)) return false;
+  if (count == 0 || payload.size() - offset != static_cast<size_t>(count) * 16)
+    return false;
+
+  uint64_t previous_undo_no = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    uint64_t undo_no = 0;
+    uint64_t binlog_pos = 0;
+    if (trx_preserve_read_le64(payload, &offset, &undo_no) ||
+        trx_preserve_read_le64(payload, &offset, &binlog_pos)) {
+      return false;
+    }
+    if (i > 0 && undo_no < previous_undo_no) return false;
+    previous_undo_no = undo_no;
+  }
+
+  if (offset != payload.size()) return false;
+  if (savepoint_count != nullptr) *savepoint_count = count;
+  return true;
 }
 
 dberr_t trx_preserve_set_isolation(trx_t *trx, uint8_t tx_isolation) {
