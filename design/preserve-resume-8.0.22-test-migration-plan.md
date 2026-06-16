@@ -482,6 +482,15 @@ Current migration status:
   transaction and records one validated payload entry through P_S. Public
   PREPARE still returns `ER_PRESERVE_TRX_UNSUPPORTED`; table-lock import and
   positive RESUME-time lock restoration remain pending.
+- 2026-06-16: `detach_claim_rollback_staging_debug` covers the first real
+  detached prepared lifecycle primitive. The debug hook sets a preserve magic
+  XID, calls `ha_prepare_low()`, detaches the InnoDB transaction from the
+  owner THD, claims it as preserved, rolls it back as a detached background
+  transaction, and proves the UPDATE was undone. RED exposed two 8.0.22
+  rollback-state assertions that accepted only ACTIVE/PREPARED; GREEN passed
+  after allowing PRESERVED rollback graph creation and explicit-lock release.
+  This is still staging coverage only: durable snapshot creation, registry
+  publication, and RESUME attach remain pending.
 
 Tests:
 

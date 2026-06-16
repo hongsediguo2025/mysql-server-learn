@@ -41,6 +41,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "storage/innobase/handler/ha_innodb.h"
 #include "trx0purge.h"
 #include "trx0roll.h"
+#include "trx0sys.h"
 #include "trx0trx.h"
 #include "trx0undo.h"
 #include "ut0vec.h"
@@ -91,14 +92,78 @@ static bool trx_preserve_read_le64(const std::string &payload, size_t *offset,
   return false;
 }
 
+static void trx_preserve_store_state_trx_sys_locked(trx_t *trx,
+                                                    trx_state_t state) {
+  ut_ad(trx != nullptr);
+  ut_ad(trx_sys_mutex_own());
+#ifdef UNIV_DEBUG
+  const trx_state_t old_state = trx->state;
+  ut_ad(old_state == TRX_STATE_ACTIVE || old_state == TRX_STATE_PREPARED ||
+        old_state == TRX_STATE_PRESERVED);
+  ut_ad(state == TRX_STATE_ACTIVE || state == TRX_STATE_PREPARED ||
+        state == TRX_STATE_PRESERVED);
+  ut_ad(trx->in_rw_trx_list || trx->in_mysql_trx_list ||
+        trx->preserve_trx_claimed || trx->is_recovered ||
+        trx->mysql_thd != nullptr);
+#endif /* UNIV_DEBUG */
+
+  /*
+    Preserve/resume changes only ACTIVE/PREPARED/PRESERVED list-ownership
+    states. Keep these transitions under trx_sys_mutex, matching InnoDB's
+    ACTIVE->PREPARED path and the list/n_prepared_trx bookkeeping updated
+    beside these stores.
+  */
+  trx->state = state;
+}
+
+static dberr_t trx_preserve_mark_preserved(trx_t *trx) {
+  ut_ad(trx_sys_mutex_own());
+
+  if (trx == nullptr || trx->xid == nullptr ||
+      !xid_is_preserve_magic(*trx->xid)) {
+    return DB_ERROR;
+  }
+
+  if (trx_state_eq(trx, TRX_STATE_PRESERVED)) {
+    return DB_SUCCESS;
+  }
+
+  if (!trx_state_eq(trx, TRX_STATE_PREPARED)) {
+    return DB_ERROR;
+  }
+
+  ut_a(trx_sys->n_prepared_trx > 0);
+  --trx_sys->n_prepared_trx;
+  trx_preserve_store_state_trx_sys_locked(trx, TRX_STATE_PRESERVED);
+
+  return DB_SUCCESS;
+}
+
+static bool trx_preserve_state_allows_token_rollback(trx_state_t state) {
+  return state == TRX_STATE_PREPARED || state == TRX_STATE_PRESERVED;
+}
+
 trx_t *trx_preserve_claim_prepared(const XID &xid) {
   (void)xid;
   return nullptr;
 }
 
 dberr_t trx_preserve_claim_detached_prepared(trx_t *trx) {
-  (void)trx;
-  return DB_UNSUPPORTED;
+  dberr_t err;
+
+  trx_sys_mutex_enter();
+  if (trx == nullptr || trx->mysql_thd != nullptr ||
+      trx->preserve_trx_claimed || !trx_state_eq(trx, TRX_STATE_PREPARED)) {
+    err = DB_ERROR;
+  } else if (trx_preserve_mark_preserved(trx) != DB_SUCCESS) {
+    err = DB_ERROR;
+  } else {
+    trx->preserve_trx_claimed = true;
+    err = DB_SUCCESS;
+  }
+  trx_sys_mutex_exit();
+
+  return err;
 }
 
 dberr_t trx_preserve_rollback_by_token(const char *token) {
@@ -113,8 +178,48 @@ dberr_t trx_preserve_rollback_by_token_for_thd(const char *token, THD *thd) {
 }
 
 dberr_t trx_preserve_rollback_claimed(trx_t *trx) {
-  (void)trx;
-  return DB_UNSUPPORTED;
+  if (trx == nullptr) {
+    return DB_ERROR;
+  }
+
+  XID claimed_xid;
+  bool claimed = false;
+
+  trx_sys_mutex_enter();
+  if (trx->mysql_thd == nullptr && trx->preserve_trx_claimed &&
+      trx->xid != nullptr && xid_is_preserve_magic(*trx->xid) &&
+      trx_preserve_state_allows_token_rollback(trx->state)) {
+    if (trx_state_eq(trx, TRX_STATE_PREPARED) &&
+        trx_preserve_mark_preserved(trx) != DB_SUCCESS) {
+      trx_sys_mutex_exit();
+      return DB_ERROR;
+    }
+    claimed_xid = *trx->xid;
+    trx->xid->reset();
+    trx->preserve_trx_claimed = false;
+    claimed = true;
+  }
+  trx_sys_mutex_exit();
+
+  if (!claimed) {
+    return DB_ERROR;
+  }
+
+  const dberr_t err = trx_rollback_for_mysql(trx);
+
+  if (err == DB_SUCCESS) {
+    trx->is_registered = false;
+    trx_free_for_background(trx);
+  } else {
+    trx_sys_mutex_enter();
+    if (trx->xid->is_null()) {
+      *trx->xid = claimed_xid;
+      trx->preserve_trx_claimed = true;
+    }
+    trx_sys_mutex_exit();
+  }
+
+  return err;
 }
 
 dberr_t trx_preserve_rollback_prepared_without_snapshot(
@@ -739,8 +844,44 @@ void trx_preserve_collect_preserved_rsegs(
 }
 
 trx_t *trx_preserve_detach_current_thd(THD *thd) {
-  (void)thd;
-  return nullptr;
+  if (thd == nullptr || innodb_hton == nullptr ||
+      innodb_hton->replace_native_transaction_in_thd == nullptr) {
+    return nullptr;
+  }
+
+  trx_t *trx = thd_to_trx(thd);
+  if (trx == nullptr || trx->xid == nullptr ||
+      !xid_is_preserve_magic(*trx->xid) ||
+      !trx_state_eq(trx, TRX_STATE_PREPARED) ||
+      !trx_is_rseg_updated(trx)) {
+    return nullptr;
+  }
+
+  trx_sys_mutex_enter();
+  if (
+#ifdef UNIV_DEBUG
+      !trx->in_mysql_trx_list ||
+#endif /* UNIV_DEBUG */
+      trx->mysql_thd != thd) {
+    trx_sys_mutex_exit();
+    return nullptr;
+  }
+
+  UT_LIST_REMOVE(trx_sys->mysql_trx_list, trx);
+  ut_d(trx->in_mysql_trx_list = false);
+  trx->mysql_thd = nullptr;
+  ut_ad(trx_sys_validate_trx_list());
+  trx_sys_mutex_exit();
+
+  thd_to_trx(thd) = nullptr;
+  thd->get_ha_data(innodb_hton->slot)
+      ->ha_info[Transaction_ctx::SESSION]
+      .reset();
+  thd->get_ha_data(innodb_hton->slot)
+      ->ha_info[Transaction_ctx::STMT]
+      .reset();
+
+  return trx;
 }
 
 dberr_t trx_preserve_attach_to_thd(trx_t *trx, THD *thd) {

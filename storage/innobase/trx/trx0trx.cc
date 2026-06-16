@@ -1756,10 +1756,12 @@ static void trx_erase_lists(trx_t *trx, bool serialised, Gtid_desc &gtid_desc) {
 static void trx_release_impl_and_expl_locks(trx_t *trx, bool serialized) {
   check_trx_state(trx);
   ut_ad(trx_state_eq(trx, TRX_STATE_ACTIVE) ||
-        trx_state_eq(trx, TRX_STATE_PREPARED));
+        trx_state_eq(trx, TRX_STATE_PREPARED) ||
+        trx_state_eq(trx, TRX_STATE_PRESERVED));
 
   bool trx_sys_latch_is_needed =
-      (trx->id > 0) || trx_state_eq(trx, TRX_STATE_PREPARED);
+      (trx->id > 0) || trx_state_eq(trx, TRX_STATE_PREPARED) ||
+      trx_state_eq(trx, TRX_STATE_PRESERVED);
 
   /* Check and get GTID to be persisted. Do it outside trx_sys mutex. */
   Gtid_desc gtid_desc;

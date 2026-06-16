@@ -564,6 +564,14 @@ Current 8.0.22 landing status:
   payload while public PREPARE still returns `ER_PRESERVE_TRX_UNSUPPORTED`.
   Table-lock import and positive RESUME-time lock restoration remain pending;
   this slice is export/parser coverage only.
+- 2026-06-16: added the detach/claim/rollback lifecycle staging slice.
+  8.0.22 can now take a real magic prepared InnoDB transaction, detach it from
+  the original THD, mark it PRESERVED/claimed, and roll it back as a detached
+  background transaction. The RED run found 8.0.22 rollback assertions that
+  needed PRESERVED alongside ACTIVE/PREPARED in rollback graph creation and
+  explicit-lock release; the GREEN test proves the staged UPDATE is undone.
+  Public PREPARE remains fail-closed, and durable snapshot/register plus
+  RESUME attach are still future Batch 2 slices.
 
 ## Batch 3: Recovery And Failure Windows
 
