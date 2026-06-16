@@ -30,7 +30,15 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "trx0preserve.h"
 
+#include <algorithm>
+
+#include "read0read.h"
+#include "sess0sess.h"
+#include "sql/mysqld.h"
+#include "sql/sql_class.h"
+#include "storage/innobase/handler/ha_innodb.h"
 #include "trx0trx.h"
+#include "trx0undo.h"
 
 trx_t *trx_preserve_claim_prepared(const XID &xid) {
   (void)xid;
@@ -121,26 +129,72 @@ void trx_preserve_release_claim_before_free(trx_t *trx) {
 }
 
 bool trx_preserve_current_thd_has_read_view(THD *thd) {
-  (void)thd;
-  return false;
+  if (thd == nullptr) {
+    return false;
+  }
+
+  trx_t *trx = thd_to_trx(thd);
+  return trx_preserve_trx_has_read_view(trx);
+}
+
+static trx_t *trx_preserve_current_thd_get_trx_if_available(THD *thd) {
+  if (thd == nullptr || innodb_hton == nullptr || innodb_hton->slot < 0) {
+    return nullptr;
+  }
+
+  Ha_data *ha_data = thd->get_ha_data(innodb_hton->slot);
+  if (ha_data == nullptr || ha_data->ha_ptr == nullptr) {
+    return nullptr;
+  }
+
+  return static_cast<innodb_session_t *>(ha_data->ha_ptr)->m_trx;
 }
 
 bool trx_preserve_current_thd_has_no_redo_undo(THD *thd) {
-  (void)thd;
-  return false;
+  trx_t *trx = trx_preserve_current_thd_get_trx_if_available(thd);
+  if (trx == nullptr) {
+    return false;
+  }
+
+  return trx->rsegs.m_noredo.insert_undo != nullptr ||
+         trx->rsegs.m_noredo.update_undo != nullptr;
 }
 
 bool trx_preserve_current_thd_no_redo_undo_state(THD *thd, bool *present,
                                                  uint64_t *top_undo_no) {
-  (void)thd;
   if (present != nullptr) *present = false;
   if (top_undo_no != nullptr) *top_undo_no = 0;
-  return false;
+  if (thd == nullptr || present == nullptr || top_undo_no == nullptr) {
+    return false;
+  }
+
+  trx_t *trx = trx_preserve_current_thd_get_trx_if_available(thd);
+  if (trx == nullptr || trx->rsegs.m_noredo.rseg == nullptr) {
+    return true;
+  }
+
+  bool local_present = false;
+  uint64_t local_top = 0;
+  if (trx->rsegs.m_noredo.insert_undo != nullptr) {
+    local_present = true;
+    local_top = std::max(
+        local_top,
+        static_cast<uint64_t>(trx->rsegs.m_noredo.insert_undo->top_undo_no));
+  }
+  if (trx->rsegs.m_noredo.update_undo != nullptr) {
+    local_present = true;
+    local_top = std::max(
+        local_top,
+        static_cast<uint64_t>(trx->rsegs.m_noredo.update_undo->top_undo_no));
+  }
+
+  *present = local_present;
+  *top_undo_no = local_top;
+  return true;
 }
 
 bool trx_preserve_trx_has_read_view(trx_t *trx) {
-  (void)trx;
-  return false;
+  return trx != nullptr && MVCC::is_view_active(trx->read_view);
 }
 
 bool trx_preserve_trx_has_autoinc_locks(trx_t *trx) {
@@ -149,26 +203,39 @@ bool trx_preserve_trx_has_autoinc_locks(trx_t *trx) {
 }
 
 uint32_t trx_preserve_modified_table_count(trx_t *trx) {
-  (void)trx;
-  return 0;
+  if (trx == nullptr) return 0;
+  return static_cast<uint32_t>(trx->mod_tables.size());
 }
 
 dberr_t trx_preserve_export_modified_table_names(
     trx_t *trx, std::vector<Preserve_modified_table_name> *tables,
     uint32_t max_modified_tables) {
-  (void)trx;
-  (void)max_modified_tables;
-  if (tables != nullptr) tables->clear();
+  if (trx == nullptr || tables == nullptr) return DB_ERROR;
+
+  tables->clear();
+  if (trx->mod_tables.size() > max_modified_tables) return DB_UNSUPPORTED;
+
+  tables->reserve(trx->mod_tables.size());
+  for (dict_table_t *table : trx->mod_tables) {
+    if (table == nullptr) return DB_ERROR;
+
+    Preserve_modified_table_name name;
+    table->get_table_name(name.schema_name, name.table_name);
+    if (name.schema_name.empty() || name.table_name.empty()) return DB_ERROR;
+
+    tables->push_back(std::move(name));
+  }
+
   return DB_SUCCESS;
 }
 
 dberr_t trx_preserve_export_modified_table_names(
     THD *thd, std::vector<Preserve_modified_table_name> *tables,
     uint32_t max_modified_tables) {
-  (void)thd;
-  (void)max_modified_tables;
-  if (tables != nullptr) tables->clear();
-  return DB_SUCCESS;
+  if (thd == nullptr) return DB_ERROR;
+  trx_t *trx = thd_to_trx(thd);
+  return trx_preserve_export_modified_table_names(trx, tables,
+                                                 max_modified_tables);
 }
 
 void trx_preserve_close_read_views_for_shutdown() {}

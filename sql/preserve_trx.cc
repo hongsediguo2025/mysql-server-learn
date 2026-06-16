@@ -57,6 +57,7 @@
 #include "sql/query_options.h"
 #include "sql/sql_class.h"
 #include "sql/sql_lex.h"
+#include "storage/innobase/include/trx0preserve.h"
 
 bool preserve_trx_enable = false;
 bool preserve_trx_temp_table_enable = true;
@@ -576,6 +577,55 @@ Preserved_trx_view_row make_debug_delivery_record() {
   return row;
 }
 
+Preserved_trx_view_row make_debug_kernel_preflight_record(THD *thd) {
+  Preserved_trx_view_row row;
+  row.token = "debug-kernel-preflight-token";
+  row.user = "debug_user";
+  row.host = "debug_host";
+  row.owner_user = row.user;
+  row.owner_host = row.host;
+  row.state = "FAILED";
+  row.isolation = "REPEATABLE-READ";
+  row.binlog_state = "NONE";
+  row.binlog_warmcopy_state = "NONE";
+  row.temp_table_state = "NONE";
+
+  const bool has_no_redo_undo = trx_preserve_current_thd_has_no_redo_undo(thd);
+  bool no_redo_present = false;
+  uint64_t top_undo_no = 0;
+  const bool no_redo_state_ok =
+      trx_preserve_current_thd_no_redo_undo_state(thd, &no_redo_present,
+                                                  &top_undo_no);
+  std::vector<Preserve_modified_table_name> modified_tables;
+  const dberr_t modified_tables_err = trx_preserve_export_modified_table_names(
+      thd, &modified_tables, preserve_trx_max_modified_tables);
+
+  row.has_read_view = trx_preserve_current_thd_has_read_view(thd);
+  if (modified_tables_err == DB_SUCCESS) {
+    row.mod_tables_count = modified_tables.size();
+  }
+
+  const std::string first_table =
+      modified_tables.empty()
+          ? "-"
+          : modified_tables[0].schema_name + "/" + modified_tables[0].table_name;
+  row.last_error = "kernel preflight: read_view=" +
+                   std::to_string(row.has_read_view ? 1 : 0) +
+                   " no_redo_undo=" +
+                   std::to_string(has_no_redo_undo ? 1 : 0) +
+                   " no_redo_state_ok=" +
+                   std::to_string(no_redo_state_ok ? 1 : 0) +
+                   " no_redo_present=" +
+                   std::to_string(no_redo_present ? 1 : 0) +
+                   " top_undo_no=" + std::to_string(top_undo_no) +
+                   " modified_tables_ok=" +
+                   std::to_string(modified_tables_err == DB_SUCCESS ? 1 : 0) +
+                   " modified_tables=" +
+                   std::to_string(modified_tables.size()) +
+                   " first_table=" + first_table;
+  return row;
+}
+
 void insert_debug_observable_record_if_missing() MY_ATTRIBUTE((unused));
 void insert_debug_observable_record_if_missing() {
   std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
@@ -596,7 +646,8 @@ void clear_debug_observable_records() {
                      g_preserved_trx_registry.end(),
                      [](const Preserved_trx_view_row &row) {
                        return row.token == "debug-observable-token" ||
-                              row.token == "debug-delivery-token";
+                              row.token == "debug-delivery-token" ||
+                              row.token == "debug-kernel-preflight-token";
                      }),
       g_preserved_trx_registry.end());
 }
@@ -611,6 +662,20 @@ void insert_debug_delivery_record_if_missing() {
       });
   if (it == g_preserved_trx_registry.end())
     g_preserved_trx_registry.push_back(make_debug_delivery_record());
+}
+
+void insert_debug_kernel_preflight_record(THD *thd) MY_ATTRIBUTE((unused));
+void insert_debug_kernel_preflight_record(THD *thd) {
+  Preserved_trx_view_row row = make_debug_kernel_preflight_record(thd);
+  std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
+  g_preserved_trx_registry.erase(
+      std::remove_if(g_preserved_trx_registry.begin(),
+                     g_preserved_trx_registry.end(),
+                     [](const Preserved_trx_view_row &existing) {
+                       return existing.token == "debug-kernel-preflight-token";
+                     }),
+      g_preserved_trx_registry.end());
+  g_preserved_trx_registry.push_back(std::move(row));
 }
 
 bool preserved_trx_registry_contains_token(const std::string &token) {
@@ -924,6 +989,11 @@ static bool preserve_trx_handle_prepare_shutdown(THD *thd) {
         thd, "debug-delivery-token", false);
     my_ok(thd);
     return false;
+  });
+  DBUG_EXECUTE_IF("preserve_trx_debug_kernel_preflight_observable", {
+    insert_debug_kernel_preflight_record(thd);
+    my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+    return true;
   });
 
   if (thd_has_unsupported_preserve_context(thd)) {
