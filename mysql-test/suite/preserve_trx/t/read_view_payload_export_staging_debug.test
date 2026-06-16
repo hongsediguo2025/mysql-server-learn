@@ -1,0 +1,35 @@
+--source include/have_debug.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_read_view_payload;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_read_view_payload(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_read_view_payload VALUES (1, 10);
+
+START TRANSACTION;
+SELECT v FROM t_read_view_payload WHERE id = 1;
+UPDATE t_read_view_payload SET v = v + 1 WHERE id = 1;
+
+SET SESSION debug='+d,preserve_trx_debug_read_view_payload_observable';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+SET SESSION debug='-d,preserve_trx_debug_read_view_payload_observable';
+
+--replace_regex /payload_bytes=[0-9]+/payload_bytes=#/ /low_limit_no=[0-9]+/low_limit_no=#/
+SELECT TOKEN, STATE, HAS_READ_VIEW, LAST_ERROR
+  FROM performance_schema.preserved_transactions
+  WHERE TOKEN='debug-read-view-payload-token';
+
+ROLLBACK;
+
+SET SESSION debug='+d,preserve_trx_clear_debug_observable_records';
+SELECT COUNT(*) AS after_clear
+  FROM performance_schema.preserved_transactions
+  WHERE TOKEN='debug-read-view-payload-token';
+SET SESSION debug='-d,preserve_trx_clear_debug_observable_records';
+
+DROP TABLE t_read_view_payload;
+SET GLOBAL preserve_trx_enable=OFF;

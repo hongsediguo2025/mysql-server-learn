@@ -40,6 +40,29 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0trx.h"
 #include "trx0undo.h"
 
+static void trx_preserve_append_le64(std::string *payload, uint64_t value) {
+  for (size_t i = 0; i < 8; ++i) {
+    payload->push_back(static_cast<char>((value >> (i * 8)) & 0xff));
+  }
+}
+
+static bool trx_preserve_read_le64(const std::string &payload, size_t *offset,
+                                   uint64_t *value) {
+  if (offset == nullptr || value == nullptr || *offset + 8 > payload.size()) {
+    return true;
+  }
+
+  uint64_t result = 0;
+  for (size_t i = 0; i < 8; ++i) {
+    result |= static_cast<uint64_t>(
+                  static_cast<unsigned char>(payload[*offset + i]))
+              << (i * 8);
+  }
+  *offset += 8;
+  *value = result;
+  return false;
+}
+
 trx_t *trx_preserve_claim_prepared(const XID &xid) {
   (void)xid;
   return nullptr;
@@ -250,22 +273,105 @@ dberr_t trx_preserve_materialize_implicit_locks(
 
 dberr_t trx_preserve_export_read_view(THD *thd, std::string *payload,
                                       uint64_t *low_limit_no) {
-  (void)thd;
+  if (thd == nullptr || payload == nullptr || low_limit_no == nullptr) {
+    return DB_ERROR;
+  }
+
   if (payload != nullptr) payload->clear();
   if (low_limit_no != nullptr) *low_limit_no = 0;
-  return DB_UNSUPPORTED;
+
+  trx_t *trx = thd_to_trx(thd);
+  if (trx == nullptr || !MVCC::is_view_active(trx->read_view)) {
+    return DB_SUCCESS;
+  }
+
+  Preserve_read_view_snapshot snapshot;
+  DBUG_EXECUTE_IF("preserve_trx_fail_export_read_view", return DB_ERROR;);
+  if (!MVCC::preserve_export_view(trx->read_view, &snapshot)) {
+    return DB_ERROR;
+  }
+
+  trx_preserve_append_le64(payload, snapshot.low_limit_id);
+  trx_preserve_append_le64(payload, snapshot.up_limit_id);
+  trx_preserve_append_le64(payload, snapshot.creator_trx_id);
+  trx_preserve_append_le64(payload, snapshot.low_limit_no);
+  trx_preserve_append_le64(payload, snapshot.ids.size());
+  for (trx_id_t id : snapshot.ids) {
+    trx_preserve_append_le64(payload, id);
+  }
+
+  *low_limit_no = snapshot.low_limit_no;
+  return DB_SUCCESS;
+}
+
+static bool trx_preserve_parse_read_view_payload(
+    const std::string &payload, Preserve_read_view_snapshot *snapshot) {
+  if (snapshot == nullptr || payload.size() < 40 || payload.size() % 8 != 0) {
+    return false;
+  }
+
+  uint64_t count = 0;
+  size_t offset = 0;
+
+  snapshot->ids.clear();
+  if (trx_preserve_read_le64(payload, &offset, &snapshot->low_limit_id) ||
+      trx_preserve_read_le64(payload, &offset, &snapshot->up_limit_id) ||
+      trx_preserve_read_le64(payload, &offset, &snapshot->creator_trx_id) ||
+      trx_preserve_read_le64(payload, &offset, &snapshot->low_limit_no) ||
+      trx_preserve_read_le64(payload, &offset, &count)) {
+    return false;
+  }
+
+  if (count != static_cast<uint64_t>((payload.size() - offset) / 8)) {
+    return false;
+  }
+  if (snapshot->low_limit_no == 0) {
+    return false;
+  }
+
+  snapshot->ids.reserve(static_cast<size_t>(count));
+  for (uint64_t i = 0; i < count; ++i) {
+    uint64_t id = 0;
+    if (trx_preserve_read_le64(payload, &offset, &id)) {
+      return false;
+    }
+    snapshot->ids.push_back(id);
+  }
+
+  return offset == payload.size();
 }
 
 dberr_t trx_preserve_import_read_view(trx_t *trx, const std::string &payload) {
-  (void)trx;
-  (void)payload;
-  return DB_UNSUPPORTED;
+  if (payload.empty()) {
+    return DB_SUCCESS;
+  }
+  DBUG_EXECUTE_IF("preserve_trx_fail_import_read_view",
+                  return DB_OUT_OF_MEMORY;);
+  if (trx == nullptr || trx_sys == nullptr || trx_sys->mvcc == nullptr) {
+    return DB_ERROR;
+  }
+
+  Preserve_read_view_snapshot snapshot;
+  if (!trx_preserve_parse_read_view_payload(payload, &snapshot)) {
+    return DB_ERROR;
+  }
+  const trx_id_t next_trx_id = trx_sys_get_max_trx_id();
+  if (snapshot.low_limit_no > next_trx_id ||
+      snapshot.low_limit_id > next_trx_id) {
+    return DB_ERROR;
+  }
+
+  return trx_sys->mvcc->preserve_import_view(trx->read_view, snapshot, trx);
 }
 
 bool trx_preserve_read_view_payload_is_valid_for_import(
     const std::string &payload) {
-  (void)payload;
-  return false;
+  if (payload.empty()) {
+    return true;
+  }
+
+  Preserve_read_view_snapshot snapshot;
+  return trx_preserve_parse_read_view_payload(payload, &snapshot);
 }
 
 dberr_t trx_preserve_export_record_locks(trx_t *trx, std::string *payload) {

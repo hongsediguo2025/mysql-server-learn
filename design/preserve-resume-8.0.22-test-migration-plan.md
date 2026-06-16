@@ -428,6 +428,14 @@ Current migration status:
   The test is target-only and debug-only: it uses the P_S observable registry
   to expose helper state while preserving the public fail-closed
   `ER_PRESERVE_TRX_UNSUPPORTED` behavior.
+- 2026-06-16: `read_view_payload_export_staging_debug` covers the next ReadView
+  kernel slice. RED showed no debug payload row. GREEN passed after porting
+  `Preserve_read_view_snapshot`, MVCC export/import helpers, payload
+  encode/decode, and import-validity checks. The test exports a real RR
+  ReadView and records payload size plus `low_limit_no` through the observable
+  registry while preserving public fail-closed behavior. Positive
+  `read_view_rr`/`read_view_rc` resume coverage remains pending until durable
+  snapshot serialization and RESUME-time import are connected.
 
 Tests:
 

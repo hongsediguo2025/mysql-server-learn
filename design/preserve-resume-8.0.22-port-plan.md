@@ -500,6 +500,17 @@ Current 8.0.22 landing status:
   introspection coverage only: SQL admission still returns unsupported, and
   detach/attach, ReadView payload import/export, lock/savepoint export/import,
   and undo activation remain pending.
+- 2026-06-16: added the ReadView payload staging slice. 8.0.22 now has
+  `Preserve_read_view_snapshot`, MVCC export/import helpers, little-endian
+  ReadView payload encode/decode, import-validity checks, and a debug-only
+  `read_view_payload_export_staging_debug` observable row. The RED case
+  produced no debug payload row; GREEN exports a real RR ReadView payload with
+  `low_limit_no`, active-transaction ids, and nonzero payload bytes while the
+  public SQL path still returns `ER_PRESERVE_TRX_UNSUPPORTED`. This is still
+  not positive resume behavior: claim/attach, durable snapshot serialization,
+  and ReadView import during RESUME remain pending. The 8.0.22 import validity
+  check uses `trx_sys_get_max_trx_id()` because the current source branch helper
+  `trx_sys_get_next_trx_id_or_no()` is not available in 8.0.22.
 
 ## Batch 3: Recovery And Failure Windows
 

@@ -34,6 +34,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #define read0types_h
 
 #include <algorithm>
+#include <vector>
 #include "dict0mem.h"
 
 #include "trx0types.h"
@@ -262,6 +263,18 @@ class ReadView {
   Complete the copy, insert the creator transaction id into the
   m_trx_ids too and adjust the m_up_limit_id *, if required */
   inline void copy_complete();
+
+  void preserve_export_ids(std::vector<trx_id_t> *ids) const {
+    ids->assign(m_ids.data(), m_ids.data() + m_ids.size());
+  }
+
+  void preserve_import_ids(const std::vector<trx_id_t> &ids) {
+    if (ids.empty()) {
+      m_ids.clear();
+    } else {
+      m_ids.assign(ids.data(), ids.data() + ids.size());
+    }
+  }
 
   /**
   Set the creator transaction id, existing id must be 0 */
