@@ -392,11 +392,58 @@ dberr_t trx_preserve_rollback_claimed(trx_t *trx) {
   return err;
 }
 
+static bool trx_preserve_xid_token_in(
+    const XID &xid, const std::vector<std::string> &tokens) {
+  if (!xid_is_preserve_magic(xid)) return false;
+
+  const char *token =
+      xid.get_data() + static_cast<size_t>(PRESERVE_TRX_XID_GTRID_LENGTH);
+  const size_t token_length = static_cast<size_t>(xid.get_bqual_length());
+
+  for (const std::string &snapshot_token : tokens) {
+    if (snapshot_token.length() == token_length &&
+        std::memcmp(snapshot_token.c_str(), token, token_length) == 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 dberr_t trx_preserve_rollback_prepared_without_snapshot(
     const std::vector<std::string> &snapshot_tokens, uint32_t *rolled_back) {
-  (void)snapshot_tokens;
   if (rolled_back != nullptr) *rolled_back = 0;
-  return DB_SUCCESS;
+  if (trx_sys == nullptr) return DB_SUCCESS;
+
+  for (;;) {
+    trx_t *trx = nullptr;
+
+    trx_sys_mutex_enter();
+    for (trx_t *candidate = UT_LIST_GET_FIRST(trx_sys->rw_trx_list);
+         candidate != nullptr;
+         candidate = UT_LIST_GET_NEXT(trx_list, candidate)) {
+      assert_trx_in_rw_list(candidate);
+
+      if (candidate->mysql_thd == nullptr &&
+          !candidate->preserve_trx_claimed &&
+          trx_state_eq(candidate, TRX_STATE_PREPARED) &&
+          candidate->xid != nullptr &&
+          xid_is_preserve_magic(*candidate->xid) &&
+          !trx_preserve_xid_token_in(*candidate->xid, snapshot_tokens)) {
+        candidate->preserve_trx_claimed = true;
+        trx = candidate;
+        break;
+      }
+    }
+    trx_sys_mutex_exit();
+
+    if (trx == nullptr) return DB_SUCCESS;
+
+    const dberr_t err = trx_preserve_rollback_claimed(trx);
+    if (err != DB_SUCCESS) return err;
+
+    if (rolled_back != nullptr) ++*rolled_back;
+  }
 }
 
 dberr_t trx_preserve_prepare_resumed_rollback_gtid(trx_t *trx) {
