@@ -1268,6 +1268,48 @@ Preserved_trx_view_row make_debug_table_lock_payload_record(THD *thd) {
   return row;
 }
 
+Preserved_trx_view_row make_debug_table_lock_import_record(THD *thd) {
+  Preserved_trx_view_row row;
+  row.token = "debug-table-lock-import-token";
+  row.user = "debug_user";
+  row.host = "debug_host";
+  row.owner_user = row.user;
+  row.owner_host = row.host;
+  row.state = "FAILED";
+  row.isolation = "REPEATABLE-READ";
+  row.binlog_state = "NONE";
+  row.binlog_warmcopy_state = "NONE";
+  row.temp_table_state = "NONE";
+
+  Preserve_table_lock_import_debug_result debug_result;
+  trx_preserve_debug_table_lock_import_roundtrip(
+      thd, preserve_trx_max_lock_count, &debug_result);
+
+  row.locks_count = debug_result.reexport_count;
+  row.last_error = "table lock import: export_ok=" +
+                   std::to_string(debug_result.export_err == DB_SUCCESS ? 1
+                                                                        : 0) +
+                   " valid=" +
+                   std::to_string(debug_result.valid ? 1 : 0) +
+                   " count_ok=" +
+                   std::to_string(debug_result.count_ok ? 1 : 0) +
+                   " count=" + std::to_string(debug_result.count) +
+                   " import_ok=" +
+                   std::to_string(debug_result.import_err == DB_SUCCESS ? 1
+                                                                        : 0) +
+                   " reexport_ok=" +
+                   std::to_string(debug_result.reexport_err == DB_SUCCESS ? 1
+                                                                          : 0) +
+                   " reexport_count_ok=" +
+                   std::to_string(debug_result.reexport_count_ok ? 1 : 0) +
+                   " reexport_count=" +
+                   std::to_string(debug_result.reexport_count) +
+                   " release_ok=" +
+                   std::to_string(debug_result.release_err == DB_SUCCESS ? 1
+                                                                         : 0);
+  return row;
+}
+
 Preserved_trx_view_row make_debug_savepoint_payload_record(THD *thd) {
   Preserved_trx_view_row row;
   row.token = "debug-savepoint-payload-token";
@@ -1391,10 +1433,11 @@ void clear_debug_observable_records() {
                        return row.token == "debug-observable-token" ||
                               row.token == "debug-delivery-token" ||
                               row.token == "debug-kernel-preflight-token" ||
-                              row.token == "debug-read-view-payload-token" ||
-                              row.token == "debug-read-view-import-token" ||
-                              row.token == "debug-table-lock-payload-token" ||
-                              row.token == "debug-savepoint-payload-token" ||
+                               row.token == "debug-read-view-payload-token" ||
+                               row.token == "debug-read-view-import-token" ||
+                               row.token == "debug-table-lock-payload-token" ||
+                               row.token == "debug-table-lock-import-token" ||
+                               row.token == "debug-savepoint-payload-token" ||
                               row.token == "debug-resume-acceptance-token" ||
                               row.token == "debug-isolation-restore-token" ||
                               row.token ==
@@ -1614,6 +1657,21 @@ void insert_debug_table_lock_payload_record(THD *thd) {
                      [](const Preserved_trx_view_row &existing) {
                        return existing.token ==
                               "debug-table-lock-payload-token";
+                     }),
+      g_preserved_trx_registry.end());
+  g_preserved_trx_registry.push_back(std::move(row));
+}
+
+void insert_debug_table_lock_import_record(THD *thd) MY_ATTRIBUTE((unused));
+void insert_debug_table_lock_import_record(THD *thd) {
+  Preserved_trx_view_row row = make_debug_table_lock_import_record(thd);
+  std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
+  g_preserved_trx_registry.erase(
+      std::remove_if(g_preserved_trx_registry.begin(),
+                     g_preserved_trx_registry.end(),
+                     [](const Preserved_trx_view_row &existing) {
+                       return existing.token ==
+                              "debug-table-lock-import-token";
                      }),
       g_preserved_trx_registry.end());
   g_preserved_trx_registry.push_back(std::move(row));
@@ -2007,6 +2065,11 @@ static bool preserve_trx_handle_prepare_shutdown(THD *thd) {
   });
   DBUG_EXECUTE_IF("preserve_trx_debug_table_lock_payload_observable", {
     insert_debug_table_lock_payload_record(thd);
+    my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+    return true;
+  });
+  DBUG_EXECUTE_IF("preserve_trx_debug_table_lock_import_observable", {
+    insert_debug_table_lock_import_record(thd);
     my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
     return true;
   });

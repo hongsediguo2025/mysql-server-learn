@@ -628,6 +628,15 @@ AUTO_INCREMENT table lock. Used by snapshot validation to keep the derived
 @return true if at least one AUTO_INCREMENT table lock is present */
 bool lock_preserve_table_locks_payload_has_autoinc(const std::string &payload);
 
+/** Import granted explicit table locks for a preserved/resumed transaction.
+The payload is parsed with the same parser used by validation, and each table is
+reopened by InnoDB table id before recreating the lock on trx.
+@param[in,out] trx transaction receiving imported table locks
+@param[in] payload opaque serialized table-lock payload
+@return DB_SUCCESS or error */
+dberr_t lock_preserve_import_table_locks(trx_t *trx,
+                                         const std::string &payload);
+
 /** Sets a lock on a table based on the given mode.
 @param[in]	table	table to lock
 @param[in,out]	trx	transaction

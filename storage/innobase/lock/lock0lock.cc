@@ -45,6 +45,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "current_thd.h"
 #include "debug_sync.h" /* CONDITIONAL_SYNC_POINT */
 #include "dict0boot.h"
+#include "dict0dd.h"
 #include "dict0mem.h"
 #include "ha_prototypes.h"
 #include "lock0lock.h"
@@ -3269,6 +3270,11 @@ struct Preserve_table_lock_entry {
   uint32_t type_mode_bits{0};
 };
 
+static dberr_t lock_preserve_import_one_table_lock(
+    trx_t *trx, const Preserve_table_lock_entry &entry);
+UNIV_INLINE const lock_t *lock_table_other_has_incompatible(
+    const trx_t *trx, ulint wait, const dict_table_t *table, lock_mode mode);
+
 static bool lock_preserve_table_lock_mode_is_valid(uint32_t mode) {
   return mode == LOCK_IS || mode == LOCK_IX || mode == LOCK_S ||
          mode == LOCK_X || mode == LOCK_AUTO_INC;
@@ -3435,6 +3441,36 @@ bool lock_preserve_table_locks_payload_has_autoinc(const std::string &payload) {
   return false;
 }
 
+dberr_t lock_preserve_import_table_locks(trx_t *trx,
+                                         const std::string &payload) {
+  if (payload.empty()) {
+    return DB_SUCCESS;
+  }
+
+  DBUG_EXECUTE_IF("preserve_trx_fail_import_table_locks",
+                  return DB_OUT_OF_MEMORY;);
+
+  if (trx == nullptr) {
+    return DB_ERROR;
+  }
+
+  std::vector<Preserve_table_lock_entry> entries;
+  const dberr_t parse_err =
+      lock_preserve_parse_table_locks_payload(payload, &entries);
+  if (parse_err != DB_SUCCESS) {
+    return parse_err;
+  }
+
+  for (const Preserve_table_lock_entry &entry : entries) {
+    const dberr_t err = lock_preserve_import_one_table_lock(trx, entry);
+    if (err != DB_SUCCESS) {
+      return err;
+    }
+  }
+
+  return DB_SUCCESS;
+}
+
 /*========================= TABLE LOCKS ==============================*/
 
 /** Functor for accessing the embedded node within a table lock. */
@@ -3510,6 +3546,76 @@ lock_t *lock_table_create(dict_table_t *table, /*!< in/out: database table
   MONITOR_INC(MONITOR_NUM_TABLELOCK);
 
   return (lock);
+}
+
+class Lock_preserve_table_handle {
+ public:
+  explicit Lock_preserve_table_handle(table_id_t table_id) : m_thd(current_thd) {
+    if (m_thd != nullptr) {
+      m_table = dd_table_open_on_id(table_id, m_thd, &m_mdl, false, true);
+    } else {
+      m_table = dd_table_open_on_id(table_id, nullptr, nullptr, false, true);
+    }
+  }
+
+  ~Lock_preserve_table_handle() {
+    if (m_table != nullptr) {
+      dd_table_close(m_table, m_thd, &m_mdl, false);
+    }
+  }
+
+  dict_table_t *get() const { return m_table; }
+
+  Lock_preserve_table_handle(const Lock_preserve_table_handle &) = delete;
+  Lock_preserve_table_handle &operator=(const Lock_preserve_table_handle &) =
+      delete;
+
+ private:
+  THD *m_thd{nullptr};
+  MDL_ticket *m_mdl{nullptr};
+  dict_table_t *m_table{nullptr};
+};
+
+static dberr_t lock_preserve_resurrect_table_lock(dict_table_t *table,
+                                                  trx_t *trx,
+                                                  lock_mode mode) {
+  if (mode != LOCK_AUTO_INC && lock_table_has(trx, table, mode)) {
+    return DB_SUCCESS;
+  }
+
+  locksys::Shard_latch_guard table_latch_guard{*table};
+
+  /*
+    Bootstrap isolation normally means no other transaction can hold an
+    incompatible table lock. If a valid snapshot still describes an impossible
+    lock graph, fail this token closed instead of aborting the server.
+  */
+  if (lock_table_other_has_incompatible(trx, LOCK_WAIT, table, mode)) {
+    return DB_LOCK_WAIT;
+  }
+
+  trx_mutex_enter(trx);
+  lock_table_create(table, mode, trx);
+  trx_mutex_exit(trx);
+
+  return DB_SUCCESS;
+}
+
+static dberr_t lock_preserve_import_one_table_lock(
+    trx_t *trx, const Preserve_table_lock_entry &entry) {
+  Lock_preserve_table_handle table_handle(entry.table_id);
+  dict_table_t *table = table_handle.get();
+
+  if (table == nullptr) {
+    return DB_TABLE_NOT_FOUND;
+  }
+
+  if (table->ibd_file_missing || table->is_temporary()) {
+    return DB_TABLE_NOT_FOUND;
+  }
+
+  const auto mode = static_cast<lock_mode>(entry.lock_mode);
+  return lock_preserve_resurrect_table_lock(table, trx, mode);
 }
 
 /** Pops autoinc lock requests from the transaction's autoinc_locks. We

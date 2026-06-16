@@ -1,0 +1,39 @@
+--source include/have_debug.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_table_lock_import;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_table_lock_import(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_table_lock_import VALUES (1, 10);
+
+START TRANSACTION;
+UPDATE t_table_lock_import SET v = 11 WHERE id = 1;
+
+SET SESSION debug='+d,preserve_trx_debug_table_lock_import_observable';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+SET SESSION debug='-d,preserve_trx_debug_table_lock_import_observable';
+
+SELECT TOKEN, STATE, LOCKS_COUNT, LAST_ERROR
+  FROM performance_schema.preserved_transactions
+  WHERE TOKEN='debug-table-lock-import-token';
+
+SELECT LAST_ERROR REGEXP
+       'table lock import: export_ok=1 valid=1 count_ok=1 count=[1-9][0-9]* import_ok=1 reexport_ok=1 reexport_count_ok=1 reexport_count=[1-9][0-9]* release_ok=1'
+       AS table_lock_import_ok
+  FROM performance_schema.preserved_transactions
+  WHERE TOKEN='debug-table-lock-import-token';
+
+ROLLBACK;
+
+SET SESSION debug='+d,preserve_trx_clear_debug_observable_records';
+SELECT COUNT(*) AS after_clear
+  FROM performance_schema.preserved_transactions
+  WHERE TOKEN='debug-table-lock-import-token';
+SET SESSION debug='-d,preserve_trx_clear_debug_observable_records';
+
+DROP TABLE t_table_lock_import;
+SET GLOBAL preserve_trx_enable=OFF;

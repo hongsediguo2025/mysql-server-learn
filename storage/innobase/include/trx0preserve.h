@@ -123,6 +123,23 @@ bool trx_preserve_table_locks_payload_is_valid_for_import(
 bool trx_preserve_table_locks_payload_lock_count(
     const std::string &payload, uint32_t *lock_count);
 bool trx_preserve_table_locks_payload_has_autoinc(const std::string &payload);
+
+struct Preserve_table_lock_import_debug_result {
+  dberr_t export_err{DB_ERROR};
+  dberr_t import_err{DB_ERROR};
+  dberr_t reexport_err{DB_ERROR};
+  dberr_t release_err{DB_ERROR};
+  bool valid{false};
+  bool count_ok{false};
+  bool reexport_count_ok{false};
+  uint32_t count{0};
+  uint32_t reexport_count{0};
+};
+
+void trx_preserve_debug_table_lock_import_roundtrip(
+    THD *thd, uint32_t max_lock_count,
+    Preserve_table_lock_import_debug_result *result);
+
 dberr_t trx_preserve_export_savepoints(trx_t *trx, std::string *payload);
 dberr_t trx_preserve_export_savepoints(THD *thd, std::string *payload);
 dberr_t trx_preserve_import_savepoints(

@@ -987,9 +987,7 @@ dberr_t trx_preserve_export_table_locks(THD *thd, std::string *payload,
 
 dberr_t trx_preserve_import_table_locks(trx_t *trx,
                                         const std::string &payload) {
-  (void)trx;
-  (void)payload;
-  return DB_UNSUPPORTED;
+  return lock_preserve_import_table_locks(trx, payload);
 }
 
 bool trx_preserve_table_locks_payload_is_valid_for_import(
@@ -1004,6 +1002,41 @@ bool trx_preserve_table_locks_payload_lock_count(
 
 bool trx_preserve_table_locks_payload_has_autoinc(const std::string &payload) {
   return lock_preserve_table_locks_payload_has_autoinc(payload);
+}
+
+void trx_preserve_debug_table_lock_import_roundtrip(
+    THD *thd, uint32_t max_lock_count,
+    Preserve_table_lock_import_debug_result *result) {
+  if (result == nullptr) return;
+  *result = Preserve_table_lock_import_debug_result{};
+
+  std::string payload;
+  result->export_err =
+      trx_preserve_export_table_locks(thd, &payload, max_lock_count, 0);
+  result->valid = trx_preserve_table_locks_payload_is_valid_for_import(payload);
+  result->count_ok =
+      trx_preserve_table_locks_payload_lock_count(payload, &result->count);
+
+  trx_t *import_trx = trx_allocate_for_background();
+  trx_start_internal(import_trx);
+
+  if (result->export_err == DB_SUCCESS && result->valid) {
+    result->import_err = trx_preserve_import_table_locks(import_trx, payload);
+  }
+
+  std::string reexport_payload;
+  if (result->import_err == DB_SUCCESS) {
+    result->reexport_err = trx_preserve_export_table_locks(
+        import_trx, &reexport_payload, max_lock_count, 0);
+    result->reexport_count_ok =
+        trx_preserve_table_locks_payload_lock_count(reexport_payload,
+                                                   &result->reexport_count);
+  }
+
+  result->release_err = trx_commit_for_mysql(import_trx);
+  if (result->release_err == DB_SUCCESS) {
+    trx_free_for_background(import_trx);
+  }
 }
 
 dberr_t trx_preserve_export_savepoints(trx_t *trx, std::string *payload) {

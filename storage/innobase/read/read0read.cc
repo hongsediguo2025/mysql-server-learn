@@ -414,7 +414,9 @@ void ReadView::copy_trx_ids(const trx_ids_t &trx_ids) {
        ++it) {
     trx_t *trx = trx_get_rw_trx_by_id(*it);
     ut_ad(trx != nullptr);
-    ut_ad(trx->state == TRX_STATE_ACTIVE || trx->state == TRX_STATE_PREPARED);
+    ut_ad(trx->state == TRX_STATE_ACTIVE ||
+          trx->state == TRX_STATE_PREPARED ||
+          trx->state == TRX_STATE_PRESERVED);
   }
 #endif /* UNIV_DEBUG */
 }
