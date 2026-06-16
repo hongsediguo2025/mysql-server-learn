@@ -718,6 +718,85 @@ Preserved_trx_view_row make_debug_attach_activate_record(THD *thd) {
   return row;
 }
 
+Preserved_trx_view_row make_debug_detach_reattach_record(THD *thd) {
+  Preserved_trx_view_row row;
+  row.token = "debug-detach-reattach-token";
+  row.user = "debug_user";
+  row.host = "debug_host";
+  row.owner_user = row.user;
+  row.owner_host = row.host;
+  row.state = "FAILED";
+  row.isolation = "REPEATABLE-READ";
+  row.binlog_state = "NONE";
+  row.binlog_warmcopy_state = "NONE";
+  row.temp_table_state = "NONE";
+
+  XID xid;
+  const bool xid_ok = debug_preserve_token_to_xid(row.token, &xid);
+  bool prepare_ok = false;
+  bool detach_ok = false;
+  bool claim_ok = false;
+  bool attach_ok = false;
+  bool detach_resumed_ok = false;
+  bool reattach_ok = false;
+  bool activate_ok = false;
+  bool rollback_ok = true;
+
+  trx_t *trx = nullptr;
+  if (xid_ok && thd != nullptr) {
+    *thd->get_transaction()->xid_state()->get_xid() = xid;
+    prepare_ok = ha_prepare_low(thd, true) == 0;
+    if (prepare_ok) {
+      trx = trx_preserve_detach_current_thd(thd);
+      detach_ok = trx != nullptr;
+      if (detach_ok) {
+        claim_ok = trx_preserve_claim_detached_prepared(trx) == DB_SUCCESS;
+        if (claim_ok) {
+          attach_ok = trx_preserve_attach_to_thd(trx, thd) == DB_SUCCESS;
+          if (attach_ok) {
+            detach_resumed_ok =
+                trx_preserve_detach_resumed_from_thd(trx, thd) == DB_SUCCESS;
+            if (detach_resumed_ok) {
+              reattach_ok =
+                  trx_preserve_reattach_preserved_to_original_thd(trx, thd) ==
+                  DB_SUCCESS;
+              if (reattach_ok) {
+                activate_ok =
+                    trx_preserve_activate_reattached_in_original_thd(
+                        trx, thd) == DB_SUCCESS;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (!activate_ok) {
+    if (reattach_ok || (attach_ok && !detach_resumed_ok)) {
+      rollback_ok = ha_rollback_trans(thd, true) == 0;
+    } else if (claim_ok) {
+      rollback_ok = trx_preserve_rollback_claimed(trx) == DB_SUCCESS;
+    } else if (prepare_ok && !detach_ok) {
+      rollback_ok = ha_rollback_trans(thd, true) == 0;
+    }
+    debug_reset_thd_after_detached_preserve(thd);
+  }
+
+  row.last_error = "detach reattach: xid_ok=" +
+                   std::to_string(xid_ok ? 1 : 0) +
+                   " prepare_ok=" + std::to_string(prepare_ok ? 1 : 0) +
+                   " detach_ok=" + std::to_string(detach_ok ? 1 : 0) +
+                   " claim_ok=" + std::to_string(claim_ok ? 1 : 0) +
+                   " attach_ok=" + std::to_string(attach_ok ? 1 : 0) +
+                   " detach_resumed_ok=" +
+                   std::to_string(detach_resumed_ok ? 1 : 0) +
+                   " reattach_ok=" + std::to_string(reattach_ok ? 1 : 0) +
+                   " activate_ok=" + std::to_string(activate_ok ? 1 : 0) +
+                   " rollback_ok=" + std::to_string(rollback_ok ? 1 : 0);
+  return row;
+}
+
 Preserved_trx_view_row make_debug_reactivate_prepared_record(THD *thd) {
   Preserved_trx_view_row row;
   row.token = "debug-reactivate-prepared-token";
@@ -1050,6 +1129,7 @@ void clear_debug_observable_records() {
                               row.token ==
                                   "debug-detach-claim-rollback-token" ||
                               row.token == "debug-attach-activate-token" ||
+                              row.token == "debug-detach-reattach-token" ||
                               row.token == "debug-reactivate-prepared-token" ||
                               row.token == "debug-savepoint-import-token";
                      }),
@@ -1093,6 +1173,20 @@ void insert_debug_attach_activate_record(THD *thd) {
                      g_preserved_trx_registry.end(),
                      [](const Preserved_trx_view_row &existing) {
                        return existing.token == "debug-attach-activate-token";
+                     }),
+      g_preserved_trx_registry.end());
+  g_preserved_trx_registry.push_back(std::move(row));
+}
+
+void insert_debug_detach_reattach_record(THD *thd) MY_ATTRIBUTE((unused));
+void insert_debug_detach_reattach_record(THD *thd) {
+  Preserved_trx_view_row row = make_debug_detach_reattach_record(thd);
+  std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
+  g_preserved_trx_registry.erase(
+      std::remove_if(g_preserved_trx_registry.begin(),
+                     g_preserved_trx_registry.end(),
+                     [](const Preserved_trx_view_row &existing) {
+                       return existing.token == "debug-detach-reattach-token";
                      }),
       g_preserved_trx_registry.end());
   g_preserved_trx_registry.push_back(std::move(row));
@@ -1603,6 +1697,11 @@ static bool preserve_trx_handle_prepare_shutdown(THD *thd) {
   });
   DBUG_EXECUTE_IF("preserve_trx_debug_attach_activate_observable", {
     insert_debug_attach_activate_record(thd);
+    my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+    return true;
+  });
+  DBUG_EXECUTE_IF("preserve_trx_debug_detach_reattach_observable", {
+    insert_debug_detach_reattach_record(thd);
     my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
     return true;
   });

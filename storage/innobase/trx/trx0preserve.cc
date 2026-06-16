@@ -1067,22 +1067,125 @@ dberr_t trx_preserve_attach_to_thd(trx_t *trx, THD *thd) {
 }
 
 dberr_t trx_preserve_reattach_preserved_to_original_thd(trx_t *trx, THD *thd) {
-  (void)trx;
-  (void)thd;
-  return DB_UNSUPPORTED;
+  if (trx == nullptr || thd == nullptr || trx->xid == nullptr ||
+      !xid_is_preserve_magic(*trx->xid) || innodb_hton == nullptr ||
+      innodb_hton->replace_native_transaction_in_thd == nullptr) {
+    return DB_ERROR;
+  }
+
+  trx_t *existing_trx = thd_to_trx(thd);
+  if (existing_trx != nullptr &&
+      !trx_state_eq(existing_trx, TRX_STATE_NOT_STARTED)) {
+    return DB_ERROR;
+  }
+  if (existing_trx != nullptr &&
+      trx_rollback_for_mysql(existing_trx) != DB_SUCCESS) {
+    return DB_ERROR;
+  }
+
+  DBUG_EXECUTE_IF("preserve_trx_fail_reattach_original_thd",
+                  return DB_ERROR;);
+
+  dberr_t err = DB_SUCCESS;
+
+  trx_sys_mutex_enter();
+  if ((!trx_state_eq(trx, TRX_STATE_PREPARED) &&
+       !trx_state_eq(trx, TRX_STATE_PRESERVED)) ||
+      trx->mysql_thd != nullptr) {
+    err = DB_ERROR;
+  } else {
+    if (trx_state_eq(trx, TRX_STATE_PREPARED)) {
+      ut_a(trx_sys->n_prepared_trx > 0);
+      --trx_sys->n_prepared_trx;
+    }
+    trx->mysql_thd = thd;
+    trx->preserve_trx_claimed = false;
+    trx->is_recovered = false;
+    trx_preserve_store_state_trx_sys_locked(trx, TRX_STATE_ACTIVE);
+    UT_LIST_ADD_FIRST(trx_sys->mysql_trx_list, trx);
+    ut_d(trx->in_mysql_trx_list = true);
+  }
+  trx_sys_mutex_exit();
+
+  if (err != DB_SUCCESS) {
+    return err;
+  }
+
+  trx->last_sql_stat_start.least_undo_no = trx->undo_no;
+
+  innodb_hton->replace_native_transaction_in_thd(thd, trx, nullptr);
+  innobase_register_trx(innodb_hton, thd, trx);
+  {
+    const ulonglong trx_id =
+        static_cast<ulonglong>(trx_get_id_for_print(trx));
+    trans_register_ha(thd, true, innodb_hton, &trx_id);
+  }
+
+  return DB_SUCCESS;
+}
+
+static dberr_t trx_preserve_detach_resumed_from_thd_low(trx_t *trx, THD *thd) {
+  if (trx == nullptr || thd == nullptr || trx->xid == nullptr ||
+      !xid_is_preserve_magic(*trx->xid) || thd_to_trx(thd) != trx ||
+      innodb_hton == nullptr) {
+    return DB_ERROR;
+  }
+
+  trx_sys_mutex_enter();
+  if (
+#ifdef UNIV_DEBUG
+      !trx->in_mysql_trx_list ||
+#endif /* UNIV_DEBUG */
+      trx->mysql_thd != thd || trx->preserve_trx_claimed ||
+      !trx_state_eq(trx, TRX_STATE_ACTIVE)) {
+    trx_sys_mutex_exit();
+    return DB_ERROR;
+  }
+
+  UT_LIST_REMOVE(trx_sys->mysql_trx_list, trx);
+  ut_d(trx->in_mysql_trx_list = false);
+  trx->mysql_thd = nullptr;
+  trx->preserve_trx_claimed = true;
+  trx->is_registered = false;
+  trx_preserve_store_state_trx_sys_locked(trx, TRX_STATE_PRESERVED);
+  ut_ad(trx_sys_validate_trx_list());
+  trx_sys_mutex_exit();
+
+  thd_to_trx(thd) = nullptr;
+  thd->get_ha_data(innodb_hton->slot)
+      ->ha_info[Transaction_ctx::SESSION]
+      .reset();
+  thd->get_ha_data(innodb_hton->slot)->ha_info[Transaction_ctx::STMT].reset();
+  thd->get_transaction()->reset_scope(Transaction_ctx::SESSION);
+  thd->get_transaction()->reset_scope(Transaction_ctx::STMT);
+
+  return DB_SUCCESS;
 }
 
 dberr_t trx_preserve_detach_resumed_from_thd(trx_t *trx, THD *thd) {
-  (void)trx;
-  (void)thd;
-  return DB_UNSUPPORTED;
+  if (trx == nullptr || thd == nullptr || trx->xid == nullptr ||
+      !xid_is_preserve_magic(*trx->xid) || thd_to_trx(thd) != trx ||
+      innodb_hton == nullptr) {
+    return DB_ERROR;
+  }
+
+  DBUG_EXECUTE_IF("preserve_trx_fail_detach_resumed_from_thd",
+                  return DB_ERROR;);
+
+  return trx_preserve_detach_resumed_from_thd_low(trx, thd);
 }
 
 dberr_t trx_preserve_detach_resumed_from_thd_for_cleanup(trx_t *trx,
                                                         THD *thd) {
-  (void)trx;
-  (void)thd;
-  return DB_UNSUPPORTED;
+  DBUG_EXECUTE_IF("preserve_trx_fail_detach_resumed_from_thd_for_cleanup",
+                  return DB_ERROR;);
+
+  return trx_preserve_detach_resumed_from_thd_low(trx, thd);
 }
 
-void trx_preserve_reset_thd_statement_registration(THD *thd) { (void)thd; }
+void trx_preserve_reset_thd_statement_registration(THD *thd) {
+  if (thd == nullptr || innodb_hton == nullptr) return;
+
+  thd->get_ha_data(innodb_hton->slot)->ha_info[Transaction_ctx::STMT].reset();
+  thd->get_transaction()->reset_scope(Transaction_ctx::STMT);
+}
