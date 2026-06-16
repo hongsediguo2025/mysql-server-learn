@@ -91,6 +91,8 @@ dberr_t trx_preserve_materialize_implicit_locks(
 dberr_t trx_preserve_export_read_view(THD *thd, std::string *payload,
                                       uint64_t *low_limit_no);
 dberr_t trx_preserve_import_read_view(trx_t *trx, const std::string &payload);
+dberr_t trx_preserve_debug_replace_current_thd_read_view(
+    THD *thd, const std::string &payload);
 bool trx_preserve_read_view_payload_is_valid_for_import(
     const std::string &payload);
 dberr_t trx_preserve_export_record_locks(trx_t *trx, std::string *payload);

@@ -1,0 +1,40 @@
+DROP TABLE IF EXISTS t_read_view_import;
+DROP TABLE IF EXISTS t_read_view_marker;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_read_view_import(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+CREATE TABLE t_read_view_marker(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_read_view_import VALUES (1, 10);
+INSERT INTO t_read_view_marker VALUES (1, 10);
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE t_read_view_marker SET v = 11 WHERE id = 1;
+SELECT v FROM t_read_view_import WHERE id = 1;
+v
+10
+UPDATE t_read_view_import SET v = 20 WHERE id = 1;
+SELECT v FROM t_read_view_import WHERE id = 1;
+v
+10
+SET SESSION debug='+d,preserve_trx_debug_read_view_import_observable';
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug='-d,preserve_trx_debug_read_view_import_observable';
+SELECT TOKEN, STATE, HAS_READ_VIEW, LAST_ERROR
+FROM performance_schema.preserved_transactions
+WHERE TOKEN='debug-read-view-import-token';
+TOKEN	STATE	HAS_READ_VIEW	LAST_ERROR
+debug-read-view-import-token	FAILED	YES	read view import: export_ok=1 valid=1 import_ok=0 has_read_view=1 payload_bytes=# low_limit_no=#
+SELECT v FROM t_read_view_import WHERE id = 1;
+v
+10
+ROLLBACK;
+SET SESSION debug='+d,preserve_trx_clear_debug_observable_records';
+SELECT COUNT(*) AS after_clear
+FROM performance_schema.preserved_transactions
+WHERE TOKEN='debug-read-view-import-token';
+after_clear
+0
+SET SESSION debug='-d,preserve_trx_clear_debug_observable_records';
+DROP TABLE t_read_view_import;
+DROP TABLE t_read_view_marker;
+SET GLOBAL preserve_trx_enable=OFF;

@@ -1,0 +1,53 @@
+--source include/have_debug.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_read_view_import;
+DROP TABLE IF EXISTS t_read_view_marker;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_read_view_import(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+CREATE TABLE t_read_view_marker(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_read_view_import VALUES (1, 10);
+INSERT INTO t_read_view_marker VALUES (1, 10);
+
+connect(con1, localhost, root);
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE t_read_view_marker SET v = 11 WHERE id = 1;
+SELECT v FROM t_read_view_import WHERE id = 1;
+
+connect(con2, localhost, root);
+UPDATE t_read_view_import SET v = 20 WHERE id = 1;
+
+connection con1;
+SELECT v FROM t_read_view_import WHERE id = 1;
+
+SET SESSION debug='+d,preserve_trx_debug_read_view_import_observable';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+SET SESSION debug='-d,preserve_trx_debug_read_view_import_observable';
+
+--replace_regex /payload_bytes=[0-9]+/payload_bytes=#/ /low_limit_no=[0-9]+/low_limit_no=#/
+SELECT TOKEN, STATE, HAS_READ_VIEW, LAST_ERROR
+  FROM performance_schema.preserved_transactions
+  WHERE TOKEN='debug-read-view-import-token';
+
+SELECT v FROM t_read_view_import WHERE id = 1;
+ROLLBACK;
+
+SET SESSION debug='+d,preserve_trx_clear_debug_observable_records';
+SELECT COUNT(*) AS after_clear
+  FROM performance_schema.preserved_transactions
+  WHERE TOKEN='debug-read-view-import-token';
+SET SESSION debug='-d,preserve_trx_clear_debug_observable_records';
+
+disconnect con2;
+connection con1;
+disconnect con1;
+connection default;
+
+DROP TABLE t_read_view_import;
+DROP TABLE t_read_view_marker;
+SET GLOBAL preserve_trx_enable=OFF;

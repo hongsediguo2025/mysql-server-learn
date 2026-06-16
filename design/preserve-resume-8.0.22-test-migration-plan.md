@@ -437,6 +437,15 @@ Current migration status:
   registry while preserving public fail-closed behavior. Positive
   `read_view_rr`/`read_view_rc` resume coverage remains pending until durable
   snapshot serialization and RESUME-time import are connected.
+- 2026-06-16: `read_view_import_staging_debug` covers the 8.0.22 runtime guard
+  around ReadView import. RED showed no observable row; the first attempted
+  runtime import exposed the correct InnoDB invariant that
+  `MVCC::preserve_import_view()` may only run while purge is `INIT` or
+  `DISABLED`. GREEN now fails closed before closing the current RR view,
+  records `import_ok=0` through P_S, and proves the original snapshot still
+  sees the pre-concurrent-update value. This is intentionally not positive
+  import coverage; positive RESUME-time ReadView import must be tested in the
+  recovery/attach slice where purge has not started.
 - 2026-06-16: `savepoint_payload_export_staging_debug` covers savepoint payload
   export/validation. RED showed no debug payload row. GREEN passed after
   porting current-THD savepoint export and payload validation with count

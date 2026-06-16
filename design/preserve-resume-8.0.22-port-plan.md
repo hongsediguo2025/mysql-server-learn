@@ -512,6 +512,16 @@ Current 8.0.22 landing status:
   and ReadView import during RESUME remain pending. The 8.0.22 import validity
   check uses `trx_sys_get_max_trx_id()` because the current source branch helper
   `trx_sys_get_next_trx_id_or_no()` is not available in 8.0.22.
+- 2026-06-16: added the ReadView import runtime guard staging slice. The
+  initial RED/GREEN attempt deliberately found an 8.0.22 invariant that must
+  not be papered over: `MVCC::preserve_import_view()` is recovery-only and
+  asserts unless purge is still `INIT` or `DISABLED`. The port now checks that
+  purge-state contract before import so runtime misuse fails closed instead of
+  aborting or closing the caller's existing RR view. The debug-only
+  `read_view_import_staging_debug` test records `import_ok=0` and proves the
+  current snapshot remains stable. Positive ReadView import must be connected
+  and verified in the later RESUME recovery/attach slice, not through a normal
+  SQL runtime hook.
 - 2026-06-16: added the savepoint payload export/validation staging slice.
   8.0.22 now has little-endian 32-bit payload helpers, current-THD savepoint
   export, savepoint payload validation with count extraction, and the

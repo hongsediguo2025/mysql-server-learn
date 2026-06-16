@@ -38,6 +38,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "sql/sql_class.h"
 #include "sql/transaction_info.h"
 #include "storage/innobase/handler/ha_innodb.h"
+#include "trx0purge.h"
 #include "trx0roll.h"
 #include "trx0trx.h"
 #include "trx0undo.h"
@@ -394,6 +395,10 @@ dberr_t trx_preserve_import_read_view(trx_t *trx, const std::string &payload) {
   if (!trx_preserve_parse_read_view_payload(payload, &snapshot)) {
     return DB_ERROR;
   }
+  const purge_state_t purge_state = trx_purge_state();
+  if (purge_state != PURGE_STATE_INIT && purge_state != PURGE_STATE_DISABLED) {
+    return DB_ERROR;
+  }
   const trx_id_t next_trx_id = trx_sys_get_max_trx_id();
   if (snapshot.low_limit_no > next_trx_id ||
       snapshot.low_limit_id > next_trx_id) {
@@ -401,6 +406,28 @@ dberr_t trx_preserve_import_read_view(trx_t *trx, const std::string &payload) {
   }
 
   return trx_sys->mvcc->preserve_import_view(trx->read_view, snapshot, trx);
+}
+
+dberr_t trx_preserve_debug_replace_current_thd_read_view(
+    THD *thd, const std::string &payload) {
+  if (thd == nullptr) return DB_ERROR;
+  trx_t *trx = thd_to_trx(thd);
+  if (trx == nullptr || trx_sys == nullptr || trx_sys->mvcc == nullptr) {
+    return DB_ERROR;
+  }
+
+  const purge_state_t purge_state = trx_purge_state();
+  if (purge_state != PURGE_STATE_INIT && purge_state != PURGE_STATE_DISABLED) {
+    return DB_ERROR;
+  }
+
+  if (MVCC::is_view_active(trx->read_view)) {
+    trx_sys_mutex_enter();
+    trx_sys->mvcc->view_close(trx->read_view, true);
+    trx_sys_mutex_exit();
+  }
+
+  return trx_preserve_import_read_view(trx, payload);
 }
 
 bool trx_preserve_read_view_payload_is_valid_for_import(
