@@ -1,0 +1,297 @@
+--source include/big_test.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $setup_file = File::Spec->catfile($vardir, 'tmp',
+                                     'batch_long_basic_dml_setup.inc');
+my $apps_file = File::Spec->catfile($vardir, 'tmp',
+                                    'batch_long_basic_dml_apps.inc');
+my $post_apps_file = File::Spec->catfile($vardir, 'tmp',
+                                         'batch_long_basic_dml_post_apps.inc');
+my $cleanup_file = File::Spec->catfile($vardir, 'tmp',
+                                       'batch_long_basic_dml_cleanup.inc');
+my $verify_file = File::Spec->catfile($vardir, 'tmp',
+                                      'batch_long_basic_dml_verify.inc');
+
+open(my $setup, '>', $setup_file)
+  or die "cannot open $setup_file for write: $!";
+open(my $apps, '>', $apps_file)
+  or die "cannot open $apps_file for write: $!";
+open(my $post_apps, '>', $post_apps_file)
+  or die "cannot open $post_apps_file for write: $!";
+open(my $cleanup, '>', $cleanup_file)
+  or die "cannot open $cleanup_file for write: $!";
+open(my $verify, '>', $verify_file)
+  or die "cannot open $verify_file for write: $!";
+
+print $cleanup "DROP PROCEDURE IF EXISTS p_batch_long_finalize;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_long_tokens;\n";
+print $cleanup "DROP TABLE IF EXISTS t_dml_aux;\n";
+print $cleanup "DROP TABLE IF EXISTS t_dml_src;\n";
+print $cleanup "DROP TABLE IF EXISTS t_dml_base;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_long_audit;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_long_control;\n";
+
+print $setup "CREATE TABLE t_batch_long_control(" .
+             "sid INT PRIMARY KEY, " .
+             "case_id INT NOT NULL, " .
+             "started_at DATETIME(6) NOT NULL" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_batch_long_audit(" .
+             "sid INT PRIMARY KEY, " .
+             "case_id INT NOT NULL, " .
+             "lifecycle_age_us BIGINT UNSIGNED NOT NULL, " .
+             "max_stmt_us BIGINT UNSIGNED NOT NULL, " .
+             "sql_count INT UNSIGNED NOT NULL, " .
+             "resumed_ok TINYINT NOT NULL, " .
+             "detail VARCHAR(255) NOT NULL" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_batch_long_tokens(" .
+             "token_id INT PRIMARY KEY AUTO_INCREMENT, " .
+             "token VARCHAR(255) NOT NULL UNIQUE" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_dml_base(" .
+             "sid INT NOT NULL, " .
+             "k INT NOT NULL, " .
+             "uk INT NOT NULL, " .
+             "v INT NOT NULL, " .
+             "note VARCHAR(64), " .
+             "heartbeat INT NOT NULL DEFAULT 0, " .
+             "PRIMARY KEY(sid, k), " .
+             "UNIQUE KEY uq_sid_uk(sid, uk), " .
+             "KEY idx_sid_v(sid, v)" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_dml_src(" .
+             "sid INT NOT NULL, " .
+             "k INT NOT NULL, " .
+             "v INT NOT NULL, " .
+             "PRIMARY KEY(sid, k)" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_dml_aux(" .
+             "sid INT PRIMARY KEY, " .
+             "amount DECIMAL(10,2) NOT NULL, " .
+             "d DATE NOT NULL, " .
+             "note VARCHAR(64)" .
+             ") ENGINE=InnoDB;\n";
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  print $setup "INSERT INTO t_batch_long_control " .
+               "VALUES($sid, $case_id, TIMESTAMP'2000-01-01 00:00:00.000000');\n";
+  for my $k (0 .. 25, 90, 91, 160, 161, 162) {
+    my $uk = $sid * 1000 + $k;
+    my $v = $sid * 100 + $k;
+    print $setup "INSERT INTO t_dml_base " .
+                 "VALUES($sid, $k, $uk, $v, 'seed', 0);\n";
+  }
+  for my $k (1 .. 5) {
+    print $setup "INSERT INTO t_dml_src " .
+                 "VALUES($sid, $k, " . ($sid * 10 + $k) . ");\n";
+  }
+  print $setup "INSERT INTO t_dml_aux " .
+               "VALUES($sid, 10.00, DATE '2026-05-17', 'seed');\n";
+}
+
+print $setup "DELIMITER |;\n";
+print $setup "CREATE PROCEDURE p_batch_long_finalize()\n";
+print $setup "BEGIN\n";
+print $setup "  DECLARE semantic_ok BOOL DEFAULT FALSE;\n";
+print $setup "  IF \@batch_long_sid IS NULL OR \@batch_long_case_id IS NULL THEN\n";
+print $setup "    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'missing restored batch long user vars';\n";
+print $setup "  END IF;\n";
+print $setup "  SELECT CASE \@batch_long_case_id\n";
+print $setup "    WHEN 1 THEN (SELECT COUNT(*) = 1 FROM t_dml_base WHERE sid = \@batch_long_sid AND k = 101 AND v = 102)\n";
+print $setup "    WHEN 2 THEN (SELECT COUNT(*) = 2 FROM t_dml_base WHERE sid = \@batch_long_sid AND k IN (201, 202))\n";
+print $setup "    WHEN 3 THEN (SELECT COUNT(*) = 2 FROM t_dml_base WHERE sid = \@batch_long_sid AND note = 'secondary' AND v BETWEEN 30000 AND 39999)\n";
+print $setup "    WHEN 4 THEN (SELECT COUNT(*) = 1 FROM t_dml_base WHERE sid = \@batch_long_sid AND k = 4 AND v = 404 AND note = 'reinserted')\n";
+print $setup "    WHEN 5 THEN (SELECT COUNT(*) = 1 FROM t_dml_base WHERE sid = \@batch_long_sid AND k = 5 AND note = 'seed')\n";
+print $setup "    WHEN 6 THEN (SELECT COUNT(*) = 1 FROM t_dml_base WHERE sid = \@batch_long_sid AND k = 6 AND note = 'odku' AND v >= 60000)\n";
+print $setup "    WHEN 7 THEN (SELECT COUNT(*) = 1 FROM t_dml_base WHERE sid = \@batch_long_sid AND k = 7 AND v = 707 AND note = 'replace')\n";
+print $setup "    WHEN 8 THEN (SELECT COUNT(*) = 1 FROM t_dml_base WHERE sid = \@batch_long_sid AND k = 808 AND note = 'insert-select')\n";
+print $setup "    WHEN 9 THEN (SELECT COUNT(*) = 1 FROM t_dml_base WHERE sid = \@batch_long_sid AND k IN (90, 91) AND note = 'limit')\n";
+print $setup "    WHEN 10 THEN (SELECT COUNT(*) = 1 FROM t_dml_base WHERE sid = \@batch_long_sid AND k = 10 AND v > sid * 200)\n";
+print $setup "    WHEN 11 THEN (SELECT COUNT(*) = 1 FROM t_dml_base WHERE sid = \@batch_long_sid AND k = 11 AND note IS NULL)\n";
+print $setup "    WHEN 12 THEN (SELECT COUNT(*) = 1 FROM t_dml_base WHERE sid = \@batch_long_sid AND k = 12 AND LOWER(note) = 'case12')\n";
+print $setup "    WHEN 13 THEN (SELECT COUNT(*) = 1 FROM t_dml_aux WHERE sid = \@batch_long_sid AND amount = 13.25 AND d = DATE '2026-05-18')\n";
+print $setup "    WHEN 14 THEN ((SELECT COUNT(*) = 1 FROM t_dml_base WHERE sid = \@batch_long_sid AND k = 140 AND v = 140 AND note = 'own-write') AND COALESCE(\@batch_long_own_sum, -1) = \@batch_long_sid * 100 + 140)\n";
+print $setup "    WHEN 15 THEN (SELECT COUNT(*) = 1 FROM t_dml_base WHERE sid = \@batch_long_sid AND k = 150 AND note = 'anti')\n";
+print $setup "    WHEN 16 THEN (SELECT COUNT(*) = 0 FROM t_dml_base WHERE sid = \@batch_long_sid AND k BETWEEN 160 AND 162)\n";
+print $setup "    WHEN 17 THEN (SELECT COUNT(*) = 1 FROM t_dml_base WHERE sid = \@batch_long_sid AND k = 17 AND note = 'composite' AND v = sid * 100 + 1717)\n";
+print $setup "    WHEN 18 THEN (SELECT COUNT(*) = 1 FROM t_dml_base WHERE sid = \@batch_long_sid AND k = 18 AND note = 'seed')\n";
+print $setup "    WHEN 19 THEN (SELECT COUNT(*) = 1 FROM t_dml_base WHERE sid = \@batch_long_sid AND k = 19 AND v = sid * 100 + 22)\n";
+print $setup "    WHEN 20 THEN ((SELECT COUNT(*) = 1 FROM t_dml_base WHERE sid = \@batch_long_sid AND k = 200 AND note = 'mixed') AND (SELECT COUNT(*) = 1 FROM t_dml_base WHERE sid = \@batch_long_sid AND k = 20 AND v = sid * 100 + 2020) AND (SELECT COUNT(*) = 0 FROM t_dml_base WHERE sid = \@batch_long_sid AND k = 21))\n";
+print $setup "    ELSE FALSE\n";
+print $setup "  END INTO semantic_ok;\n";
+print $setup "  IF NOT COALESCE(semantic_ok, FALSE) THEN\n";
+print $setup "    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'post-resume basic DML semantic check failed';\n";
+print $setup "  END IF;\n";
+print $setup "  IF \@batch_long_case_id = 16 THEN\n";
+print $setup "    ROLLBACK;\n";
+print $setup "    SET \@batch_long_end_action = 'NONE';\n";
+print $setup "  ELSE\n";
+print $setup "    SET \@batch_long_end_action = 'COMMIT';\n";
+print $setup "  END IF;\n";
+print $setup "  INSERT INTO t_batch_long_audit VALUES(\n";
+print $setup "    \@batch_long_sid,\n";
+print $setup "    \@batch_long_case_id,\n";
+print $setup "    TIMESTAMPDIFF(MICROSECOND, \@batch_long_started_at, NOW(6)),\n";
+print $setup "    \@batch_long_max_stmt_us,\n";
+print $setup "    \@batch_long_sql_count,\n";
+print $setup "    1,\n";
+print $setup "    CONCAT('basic-dml-case-', \@batch_long_case_id));\n";
+print $setup "END|\n";
+print $setup "DELIMITER ;|\n";
+
+my @verify_cases = (
+  [1,  "SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 1 AND b.k = 101 AND b.v = 102"],
+  [2,  "SELECT COUNT(*) = 10 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 2 AND b.k IN (201, 202)"],
+  [3,  "SELECT COUNT(*) = 10 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 3 AND b.note = 'secondary' AND b.v BETWEEN 30000 AND 39999"],
+  [4,  "SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 4 AND b.k = 4 AND b.note = 'reinserted'"],
+  [5,  "SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 5 AND b.k = 5 AND b.note = 'seed'"],
+  [6,  "SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 6 AND b.k = 6 AND b.note = 'odku' AND b.v >= 60000"],
+  [7,  "SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 7 AND b.k = 7 AND b.note = 'replace'"],
+  [8,  "SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 8 AND b.k = 808"],
+  [9,  "SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 9 AND b.k IN (90, 91) AND b.note = 'limit'"],
+  [10, "SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 10 AND b.k = 10 AND b.v > b.sid * 200"],
+  [11, "SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 11 AND b.k = 11 AND b.note IS NULL"],
+  [12, "SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 12 AND b.k = 12 AND LOWER(b.note) = 'case12'"],
+  [13, "SELECT COUNT(*) = 5 FROM t_dml_aux a JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 13 AND a.amount = 13.25 AND a.d = DATE '2026-05-18'"],
+  [14, "SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 14 AND b.k = 140 AND b.v = 140 AND b.note = 'own-write'"],
+  [15, "SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 15 AND b.k = 150"],
+  [16, "SELECT COUNT(*) = 15 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 16 AND b.k BETWEEN 160 AND 162 AND b.note = 'seed'"],
+  [17, "SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 17 AND b.k = 17 AND b.note = 'composite'"],
+  [18, "SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 18 AND b.k = 18 AND b.note = 'seed'"],
+  [19, "SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 19 AND b.k = 19 AND b.v >= b.sid * 100 + 22"],
+  [20, "SELECT (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 20 AND b.k = 200 AND b.note = 'mixed') AND (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 20 AND b.k = 20 AND b.v >= b.sid * 100 + 2020) AND (SELECT COUNT(*) = 0 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 20 AND b.k = 21)"],
+);
+for my $i (0 .. $#verify_cases) {
+  my ($case_id, $predicate) = @{$verify_cases[$i]};
+  print $verify $i == 0 ? "SELECT " : "UNION ALL SELECT ";
+  print $verify "$case_id AS case_id, ($predicate) AS ok\n";
+}
+print $verify "ORDER BY case_id;\n";
+
+sub emit_measured {
+  my ($fh, $sql) = @_;
+  print $fh "SET \@batch_long_stmt_start = NOW(6);\n";
+  print $fh "$sql;\n";
+  print $fh "SET \@batch_long_stmt_us = " .
+            "TIMESTAMPDIFF(MICROSECOND, \@batch_long_stmt_start, NOW(6));\n";
+  print $fh "SET \@batch_long_max_stmt_us = " .
+            "GREATEST(\@batch_long_max_stmt_us, \@batch_long_stmt_us);\n";
+  print $fh "SET \@batch_long_sql_count = \@batch_long_sql_count + 1;\n";
+}
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  my $name = sprintf("batch_long_app_%03d", $sid);
+  print $apps "--connect($name,localhost,root,,test)\n";
+  print $apps "--connection $name\n";
+  print $apps "UPDATE t_batch_long_control SET started_at = NOW(6) WHERE sid = $sid;\n";
+  print $apps "SET \@batch_long_sid = $sid;\n";
+  print $apps "SET \@batch_long_case_id = $case_id;\n";
+  print $apps "SET \@batch_long_started_at = " .
+              "(SELECT started_at FROM t_batch_long_control WHERE sid = $sid);\n";
+  print $apps "SET \@batch_long_max_stmt_us = 0;\n";
+  print $apps "SET \@batch_long_sql_count = 0;\n";
+  print $apps "SET \@batch_long_end_action = 'COMMIT';\n";
+  print $apps "START TRANSACTION;\n";
+  emit_measured($apps, "UPDATE t_dml_base SET heartbeat = heartbeat + 1 WHERE sid = $sid AND k = 0");
+  emit_measured($apps, "UPDATE t_dml_base SET v = v + 1 WHERE sid = $sid AND k = 1");
+
+  if ($case_id == 1) {
+    emit_measured($apps, "INSERT INTO t_dml_base VALUES($sid, 101, " . ($sid * 1000 + 101) . ", 101, 'insert', 0)");
+    emit_measured($apps, "UPDATE t_dml_base SET v = v + 1 WHERE sid = $sid AND k = 101");
+  } elsif ($case_id == 2) {
+    emit_measured($apps, "INSERT INTO t_dml_base VALUES($sid, 201, " . ($sid * 1000 + 201) . ", 201, 'multi-a', 0),($sid, 202, " . ($sid * 1000 + 202) . ", 202, 'multi-b', 0)");
+  } elsif ($case_id == 3) {
+    emit_measured($apps, "UPDATE t_dml_base SET v = 30000 + k, note = 'secondary' WHERE sid = $sid AND v BETWEEN " . ($sid * 100 + 3) . " AND " . ($sid * 100 + 4));
+  } elsif ($case_id == 4) {
+    emit_measured($apps, "DELETE FROM t_dml_base WHERE sid = $sid AND k = 4");
+    emit_measured($apps, "INSERT INTO t_dml_base VALUES($sid, 4, " . ($sid * 1000 + 4) . ", 404, 'reinserted', 0)");
+  } elsif ($case_id == 5) {
+    emit_measured($apps, "INSERT IGNORE INTO t_dml_base VALUES($sid, 505, " . ($sid * 1000 + 5) . ", 505, 'ignored', 0)");
+  } elsif ($case_id == 6) {
+    emit_measured($apps, "INSERT INTO t_dml_base VALUES($sid, 606, " . ($sid * 1000 + 6) . ", 60000, 'odku', 0) ON DUPLICATE KEY UPDATE v = v + 60000, note = 'odku'");
+  } elsif ($case_id == 7) {
+    emit_measured($apps, "REPLACE INTO t_dml_base VALUES($sid, 7, " . ($sid * 1000 + 7) . ", 707, 'replace', 0)");
+  } elsif ($case_id == 8) {
+    emit_measured($apps, "INSERT INTO t_dml_base SELECT sid, 808, sid * 1000 + 808, v + 808, 'insert-select', 0 FROM t_dml_src WHERE sid = $sid AND k = 1");
+  } elsif ($case_id == 9) {
+    emit_measured($apps, "UPDATE t_dml_base SET note = 'limit', v = v + 900 WHERE sid = $sid AND k IN (90, 91) ORDER BY k LIMIT 1");
+  } elsif ($case_id == 10) {
+    emit_measured($apps, "UPDATE t_dml_base SET v = v * 2 + $case_id WHERE sid = $sid AND k = 10");
+  } elsif ($case_id == 11) {
+    emit_measured($apps, "UPDATE t_dml_base SET note = NULL WHERE sid = $sid AND k = 11");
+  } elsif ($case_id == 12) {
+    emit_measured($apps, "UPDATE t_dml_base SET note = 'Case12' WHERE sid = $sid AND k = 12");
+  } elsif ($case_id == 13) {
+    emit_measured($apps, "UPDATE t_dml_aux SET amount = amount + 3.25, d = d + INTERVAL 1 DAY, note = 'typed' WHERE sid = $sid");
+  } elsif ($case_id == 14) {
+    emit_measured($apps, "INSERT INTO t_dml_base VALUES($sid, 140, " . ($sid * 1000 + 140) . ", 140, 'own-write', 0)");
+    emit_measured($apps, "SELECT SUM(v) INTO \@batch_long_own_sum FROM t_dml_base WHERE sid = $sid AND k IN (0, 140)");
+  } elsif ($case_id == 15) {
+    emit_measured($apps, "INSERT INTO t_dml_base SELECT sid, 150, sid * 1000 + 150, v + 150, 'anti', 0 FROM t_dml_src s WHERE s.sid = $sid AND s.k = 1 AND NOT EXISTS (SELECT 1 FROM t_dml_base b WHERE b.sid = s.sid AND b.k = 150)");
+  } elsif ($case_id == 16) {
+    emit_measured($apps, "DELETE FROM t_dml_base WHERE sid = $sid AND k BETWEEN 160 AND 162");
+  } elsif ($case_id == 17) {
+    emit_measured($apps, "UPDATE t_dml_base SET note = 'composite', v = v + 1700 WHERE sid = $sid AND k = 17 AND v = " . ($sid * 100 + 17));
+  } elsif ($case_id == 18) {
+    emit_measured($apps, "UPDATE t_dml_base SET v = v WHERE sid = $sid AND k = 18");
+  } elsif ($case_id == 19) {
+    emit_measured($apps, "UPDATE t_dml_base SET v = v + 1 WHERE sid = $sid AND k = 19");
+    emit_measured($apps, "UPDATE t_dml_base SET v = v + 1 WHERE sid = $sid AND k = 19");
+    emit_measured($apps, "UPDATE t_dml_base SET v = v + 1 WHERE sid = $sid AND k = 19");
+  } elsif ($case_id == 20) {
+    emit_measured($apps, "INSERT INTO t_dml_base VALUES($sid, 200, " . ($sid * 1000 + 200) . ", 200, 'mixed', 0)");
+    emit_measured($apps, "UPDATE t_dml_base SET v = v + 2000 WHERE sid = $sid AND k = 20");
+    emit_measured($apps, "DELETE FROM t_dml_base WHERE sid = $sid AND k = 21");
+  }
+
+}
+print $apps "--connection default\n";
+
+for my $round (1 .. 80) {
+  for my $sid (1 .. 100) {
+    my $name = sprintf("batch_long_app_%03d", $sid);
+    print $post_apps "--connection $name\n";
+    emit_measured($post_apps, "UPDATE t_dml_base SET heartbeat = heartbeat + 1 WHERE sid = $sid AND k = 0");
+  }
+}
+print $post_apps "--connection default\n";
+
+close($setup);
+close($apps);
+close($post_apps);
+close($cleanup);
+close($verify);
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+SET GLOBAL preserve_trx_recovery_max_count=200;
+--let $old_preserve_trx_drain_grace_ms= `SELECT @@GLOBAL.preserve_trx_drain_grace_ms`
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+
+--let $batch_long_prefix= batch_long_basic_dml
+--let $batch_long_setup_file= $MYSQLTEST_VARDIR/tmp/batch_long_basic_dml_setup.inc
+--let $batch_long_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_basic_dml_apps.inc
+--let $batch_long_post_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_basic_dml_post_apps.inc
+--let $batch_long_cleanup_file= $MYSQLTEST_VARDIR/tmp/batch_long_basic_dml_cleanup.inc
+--let $batch_long_resume_file= $MYSQLTEST_VARDIR/tmp/batch_long_basic_dml_resume.inc
+--let $batch_long_verify_file= $MYSQLTEST_VARDIR/tmp/batch_long_basic_dml_verify.inc
+--source suite/preserve_trx/include/batch_drain_100_long_common.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+--disable_query_log
+--disable_result_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_drain_grace_ms=$old_preserve_trx_drain_grace_ms
+--enable_result_log
+--enable_query_log

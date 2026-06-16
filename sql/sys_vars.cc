@@ -1042,7 +1042,7 @@ static bool check_preserve_trx_enable(sys_var *, THD *, set_var *var) {
              "preserve_trx_enable=OFF while preserve/drain is active");
     return true;
   }
-  if (preserved_trx_ensure_snapshot_support()) return false;
+  if (!preserved_trx_ensure_snapshot_support()) return false;
   my_error(ER_WRONG_ARGUMENTS, MYF(0), "SET");
   return true;
 }

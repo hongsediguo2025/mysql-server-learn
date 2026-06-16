@@ -1,0 +1,138 @@
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_batch_log_bin_cleanup;
+--enable_warnings
+
+CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files before reattach");
+CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted by innodb_force_recovery");
+CALL mtr.add_suppression("Preserved transaction batch cleanup failed after target preserve error");
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_batch_log_bin_cleanup(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_batch_log_bin_cleanup VALUES(1,10);
+RESET MASTER;
+
+--connect(batch_log_bin_a,localhost,root,,test)
+--connection batch_log_bin_a
+START TRANSACTION;
+UPDATE t_batch_log_bin_cleanup SET v=11 WHERE id=1;
+
+--connect(batch_log_bin_b,localhost,root,,test)
+--connection batch_log_bin_b
+START TRANSACTION;
+INSERT INTO t_batch_log_bin_cleanup VALUES(2,20);
+
+--connection default
+SET SESSION debug="+d,preserve_trx_batch_fail_after_one_target";
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET SESSION debug="-d,preserve_trx_batch_fail_after_one_target";
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--replace_column 1 TOKEN
+SELECT TOKEN, LAST_ERROR
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_snapshot_file.inc
+
+--connection batch_log_bin_a
+COMMIT;
+--disconnect batch_log_bin_a
+
+--connection batch_log_bin_b
+ROLLBACK;
+--disconnect batch_log_bin_b
+
+--connection default
+SELECT * FROM t_batch_log_bin_cleanup ORDER BY id;
+
+--let $binlog_file= query_get_value(SHOW MASTER STATUS, File, 1)
+--exec $MYSQL_BINLOG --force-if-open --base64-output=decode-rows -v -v $MYSQLTEST_VARDIR/mysqld.1/data/$binlog_file > $MYSQLTEST_VARDIR/tmp/batch_log_bin_cleanup.mysqlbinlog
+--let $assert_text= Committed restored batch transaction remains in binlog
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/batch_log_bin_cleanup.mysqlbinlog
+--let $assert_select= @2=11
+--let $assert_count_condition= >= 1
+--source include/assert_grep.inc
+--let $assert_text= Rolled back batch transaction is discarded from binlog cache
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/batch_log_bin_cleanup.mysqlbinlog
+--let $assert_select= @1=2
+--let $assert_count_condition= == 0
+--source include/assert_grep.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/batch_log_bin_cleanup.mysqlbinlog
+
+--disable_query_log
+--disable_result_log
+--let $remaining_preserved= `SELECT COUNT(*) FROM performance_schema.preserved_transactions`
+if ($remaining_preserved)
+{
+  --let $cleanup_token= `SELECT TOKEN FROM performance_schema.preserved_transactions LIMIT 1`
+  --connect(batch_log_bin_cleanup_resume,localhost,root,,test)
+  --connection batch_log_bin_cleanup_resume
+  --eval RESUME PRESERVED TRANSACTION '$cleanup_token'
+  ROLLBACK;
+  --disconnect batch_log_bin_cleanup_resume
+  --connection default
+}
+--enable_result_log
+--enable_query_log
+
+--connect(batch_log_bin_delete_before,localhost,root,,test)
+--connection batch_log_bin_delete_before
+START TRANSACTION;
+UPDATE t_batch_log_bin_cleanup SET v=12 WHERE id=1;
+
+--connection default
+SET SESSION debug="+d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_delete_snapshot_files";
+--error ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET SESSION debug="-d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_delete_snapshot_files";
+
+SELECT 1 AS server_alive_after_delete_before_failure;
+SELECT COUNT(*) AS preserved_delete_before_records
+  FROM performance_schema.preserved_transactions
+ WHERE STATE = 'PRESERVED'
+   AND LAST_ERROR IS NOT NULL
+   AND LAST_ERROR_AT IS NOT NULL;
+--replace_column 1 TOKEN
+SELECT TOKEN, STATE, LAST_ERROR IS NOT NULL AS has_last_error
+  FROM performance_schema.preserved_transactions
+ ORDER BY TOKEN;
+
+--connection batch_log_bin_delete_before
+SELECT 1;
+COMMIT;
+--disconnect batch_log_bin_delete_before
+
+--connection default
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--shutdown_server
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count_after_delete_before
+  FROM performance_schema.preserved_transactions;
+
+SELECT * FROM t_batch_log_bin_cleanup ORDER BY id;
+
+--exec $MYSQL_BINLOG --force-if-open --base64-output=decode-rows -v -v $MYSQLTEST_VARDIR/mysqld.1/data/preserve-trx-batch-cleanup-bin.[0-9]* > $MYSQLTEST_VARDIR/tmp/batch_log_bin_cleanup_delete_before.mysqlbinlog
+--let $assert_text= Reattached delete-before cleanup transaction remains in binlog
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/batch_log_bin_cleanup_delete_before.mysqlbinlog
+--let $assert_select= @2=12
+--let $assert_count_condition= >= 1
+--source include/assert_grep.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/batch_log_bin_cleanup_delete_before.mysqlbinlog
+
+DROP TABLE t_batch_log_bin_cleanup;
+SET GLOBAL preserve_trx_enable=ON;

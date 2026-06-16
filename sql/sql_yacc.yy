@@ -2302,6 +2302,10 @@ prepare_shutdown_preserve_stmt:
           opt_preserve_trx_with_clauses
           {
             Lex->sql_command= SQLCOM_PREPARE_SHUTDOWN_PRESERVE;
+            Lex->preserve_trx_has_timeout= $5.has_timeout;
+            Lex->preserve_trx_timeout_seconds= $5.timeout_seconds;
+            Lex->preserve_trx_user_vars_mode=
+              static_cast<uint>($5.user_vars_mode);
           }
         ;
 
@@ -2310,6 +2314,10 @@ drain_transactions_preserve_stmt:
           opt_drain_preserve_trx_clauses
           {
             Lex->sql_command= SQLCOM_DRAIN_TRANSACTIONS_PRESERVE;
+            Lex->preserve_trx_has_timeout= $4.has_timeout;
+            Lex->preserve_trx_timeout_seconds= $4.timeout_seconds;
+            Lex->preserve_trx_user_vars_mode=
+              static_cast<uint>($4.user_vars_mode);
           }
         ;
 

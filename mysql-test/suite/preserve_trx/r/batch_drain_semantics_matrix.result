@@ -1,0 +1,127 @@
+UPDATE t SET v=201 WHERE id=2;
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE t SET v=11 WHERE id=10;
+SELECT * FROM t WHERE id > 10 AND id <= 20 FOR UPDATE;
+id	v
+20	20
+START TRANSACTION;
+UPDATE t SET v=11 WHERE id=1;
+SAVEPOINT s1;
+UPDATE t SET v=22 WHERE id=2;
+SAVEPOINT s2;
+UPDATE t SET v=33 WHERE id=3;
+START TRANSACTION;
+INSERT INTO t(v) VALUES(10);
+SET @batch_user_var = 'restored-value';
+START TRANSACTION;
+INSERT INTO t VALUES(1,10);
+START TRANSACTION;
+UPDATE preserve_batch_ignored.seed SET v=11 WHERE id=1;
+SET SESSION sql_log_bin=0;
+START TRANSACTION;
+UPDATE t SET v=11 WHERE id=1;
+START TRANSACTION;
+UPDATE t SET v=11 WHERE id=1;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS;
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+8
+SELECT SCHEMA_NAME, BINLOG_STATE, HAS_READ_VIEW, SAVEPOINT_COUNT,
+AUTOINC_LOCK_OWNED, WROTE_TO_CACHE,
+BINLOG_CACHE_SIZE > 0 AS CACHE_SIZE_POSITIVE,
+SESSION_SQL_LOG_BIN, GLOBAL_LOG_BIN
+FROM performance_schema.preserved_transactions
+ORDER BY SCHEMA_NAME;
+SCHEMA_NAME	BINLOG_STATE	HAS_READ_VIEW	SAVEPOINT_COUNT	AUTOINC_LOCK_OWNED	WROTE_TO_CACHE	CACHE_SIZE_POSITIVE	SESSION_SQL_LOG_BIN	GLOBAL_LOG_BIN
+preserve_batch_autoinc	LOGGED_WITH_CACHE	NO	0	NO	YES	1	ON	ON
+preserve_batch_lock	LOGGED_WITH_CACHE	NO	0	NO	YES	1	ON	ON
+preserve_batch_logged_cache	LOGGED_WITH_CACHE	NO	0	NO	YES	1	ON	ON
+preserve_batch_logged_empty	LOGGED_EMPTY	NO	0	NO	NO	0	ON	ON
+preserve_batch_rv	LOGGED_WITH_CACHE	YES	0	NO	YES	1	ON	ON
+preserve_batch_savepoint	LOGGED_WITH_CACHE	NO	2	NO	YES	1	ON	ON
+preserve_batch_session_off	SESSION_OFF_NO_CACHE	NO	0	NO	NO	0	OFF	ON
+preserve_batch_user_vars	LOGGED_WITH_CACHE	NO	0	NO	YES	1	ON	ON
+SET SESSION innodb_lock_wait_timeout=1;
+UPDATE preserve_batch_lock.t SET v=21 WHERE id=20;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+INSERT INTO preserve_batch_lock.t VALUES(15,15);
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+SELECT * FROM preserve_batch_rv.t ORDER BY id;
+id	v
+1	10
+2	201
+3	300
+COMMIT;
+ROLLBACK;
+UPDATE preserve_batch_lock.t SET v=21 WHERE id=20;
+INSERT INTO preserve_batch_lock.t VALUES(15,15);
+ROLLBACK TO SAVEPOINT s1;
+RELEASE SAVEPOINT s1;
+COMMIT;
+SELECT LAST_INSERT_ID() AS resumed_last_insert_id;
+resumed_last_insert_id
+1
+INSERT INTO preserve_batch_autoinc.t(v) VALUES(20);
+SELECT LAST_INSERT_ID() AS second_insert_id;
+second_insert_id
+2
+COMMIT;
+SELECT @batch_user_var AS restored_user_var;
+restored_user_var
+restored-value
+COMMIT;
+SELECT @@session.sql_log_bin AS logged_empty_sql_log_bin;
+logged_empty_sql_log_bin
+1
+UPDATE preserve_batch_logged_empty.t SET v=11 WHERE id=1;
+COMMIT;
+SELECT @@session.sql_log_bin AS session_off_sql_log_bin;
+session_off_sql_log_bin
+0
+UPDATE preserve_batch_session_off.t SET v=12 WHERE id=1;
+COMMIT;
+SELECT @@session.sql_log_bin AS logged_cache_sql_log_bin;
+logged_cache_sql_log_bin
+1
+COMMIT;
+SELECT COUNT(*) AS remaining_preserved
+FROM performance_schema.preserved_transactions;
+remaining_preserved
+0
+SELECT * FROM preserve_batch_rv.t ORDER BY id;
+id	v
+1	20
+2	201
+3	330
+SELECT * FROM preserve_batch_lock.t ORDER BY id;
+id	v
+10	10
+15	15
+20	21
+30	30
+SELECT * FROM preserve_batch_savepoint.t ORDER BY id;
+id	v
+1	11
+2	20
+3	30
+SELECT * FROM preserve_batch_autoinc.t ORDER BY id;
+id	v
+1	10
+2	20
+SELECT * FROM preserve_batch_user_vars.t ORDER BY id;
+id	v
+1	10
+SELECT * FROM preserve_batch_logged_empty.t ORDER BY id;
+id	v
+1	11
+SELECT * FROM preserve_batch_session_off.t ORDER BY id;
+id	v
+1	12
+SELECT * FROM preserve_batch_logged_cache.t ORDER BY id;
+id	v
+1	11
+include/assert_grep.inc [Batch LOGGED_EMPTY future DML is written to the binlog]
+include/assert_grep.inc [Batch LOGGED_WITH_CACHE preserved DML is written to the binlog]
+include/assert_grep.inc [Batch SESSION_OFF_NO_CACHE DML stays out of the binlog]

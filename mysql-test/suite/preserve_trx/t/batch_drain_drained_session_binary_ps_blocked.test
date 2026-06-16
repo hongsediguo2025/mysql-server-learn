@@ -1,0 +1,242 @@
+--source include/have_debug_sync.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_batch_drained_ps;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_batch_drained_ps(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_batch_drained_ps VALUES(1,10);
+
+--let $raw_ps_client= $MYSQLTEST_VARDIR/tmp/batch_drain_raw_ps_client.pl
+--let $raw_ps_ready= $MYSQLTEST_VARDIR/tmp/batch_drain_raw_ps_ready
+--let $raw_ps_go= $MYSQLTEST_VARDIR/tmp/batch_drain_raw_ps_go
+--let $raw_ps_output= $MYSQLTEST_VARDIR/tmp/batch_drain_raw_ps.out
+
+--write_file $raw_ps_client
+use strict;
+use warnings;
+use IO::Socket::UNIX;
+
+$| = 1;
+
+my ($socket_path, $ready_file, $go_file) = @ARGV;
+
+use constant CLIENT_LONG_PASSWORD => 0x00000001;
+use constant CLIENT_LONG_FLAG => 0x00000004;
+use constant CLIENT_CONNECT_WITH_DB => 0x00000008;
+use constant CLIENT_PROTOCOL_41 => 0x00000200;
+use constant CLIENT_TRANSACTIONS => 0x00002000;
+use constant CLIENT_SECURE_CONNECTION => 0x00008000;
+use constant CLIENT_MULTI_RESULTS => 0x00020000;
+use constant CLIENT_PLUGIN_AUTH => 0x00080000;
+use constant CLIENT_CONNECT_ATTRS => 0x00100000;
+
+sub read_exact {
+  my ($sock, $len) = @_;
+  my $buf = '';
+  while (length($buf) < $len) {
+    my $read = sysread($sock, my $chunk, $len - length($buf));
+    die "socket closed\n" unless defined($read) && $read > 0;
+    $buf .= $chunk;
+  }
+  return $buf;
+}
+
+sub read_packet {
+  my ($sock) = @_;
+  my $header = read_exact($sock, 4);
+  my @h = unpack('C4', $header);
+  my $len = $h[0] | ($h[1] << 8) | ($h[2] << 16);
+  return read_exact($sock, $len);
+}
+
+sub write_packet {
+  my ($sock, $seq, $payload) = @_;
+  my $len = length($payload);
+  print {$sock} pack('C4', $len & 0xff, ($len >> 8) & 0xff,
+                     ($len >> 16) & 0xff, $seq) . $payload;
+}
+
+sub error_packet {
+  my ($packet) = @_;
+  return unless length($packet) > 0 && ord(substr($packet, 0, 1)) == 0xff;
+  my $code = unpack('v', substr($packet, 1, 2));
+  my $msg_start = substr($packet, 3, 1) eq '#' ? 9 : 3;
+  my $message = substr($packet, $msg_start);
+  $message =~ s/\r?\n/ /g;
+  return ($code, $message);
+}
+
+sub expect_ok {
+  my ($packet, $label) = @_;
+  if (my ($code, $message) = error_packet($packet)) {
+    die "$label failed: $code $message\n";
+  }
+  die "$label failed: unexpected packet\n"
+      unless length($packet) > 0 && ord(substr($packet, 0, 1)) == 0x00;
+}
+
+sub command {
+  my ($sock, $cmd, $body) = @_;
+  write_packet($sock, 0, chr($cmd) . $body);
+  return read_packet($sock);
+}
+
+sub query_ok {
+  my ($sock, $query) = @_;
+  expect_ok(command($sock, 0x03, $query), $query);
+}
+
+my $sock = IO::Socket::UNIX->new(Type => SOCK_STREAM(), Peer => $socket_path)
+  or die "connect failed: $!\n";
+
+my $handshake = read_packet($sock);
+my $pos = 0;
+$pos += 1;
+my $nul = index($handshake, "\0", $pos);
+$pos = $nul + 1;
+$pos += 4 + 8 + 1;
+my $cap_lower = unpack('v', substr($handshake, $pos, 2));
+$pos += 2 + 1 + 2;
+my $cap_upper = unpack('v', substr($handshake, $pos, 2));
+my $server_cap = $cap_lower | ($cap_upper << 16);
+$pos += 2;
+my $auth_len = ord(substr($handshake, $pos, 1));
+$pos += 1 + 10;
+my $auth_part2_len = $auth_len > 8 ? $auth_len - 8 : 13;
+$pos += $auth_part2_len;
+my $plugin = 'mysql_native_password';
+if ($server_cap & CLIENT_PLUGIN_AUTH) {
+  my $plugin_end = index($handshake, "\0", $pos);
+  $plugin = substr($handshake, $pos, $plugin_end - $pos)
+    if $plugin_end > $pos;
+}
+
+my $flags = CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG | CLIENT_CONNECT_WITH_DB |
+            CLIENT_PROTOCOL_41 | CLIENT_TRANSACTIONS |
+            CLIENT_SECURE_CONNECTION | CLIENT_MULTI_RESULTS |
+            CLIENT_PLUGIN_AUTH | CLIENT_CONNECT_ATTRS;
+$flags &= $server_cap;
+
+my $response = pack('VVC', $flags, 16 * 1024 * 1024, 33) . ("\0" x 23) .
+               "root\0" . pack('C', 0) . "test\0";
+$response .= "$plugin\0" if $flags & CLIENT_PLUGIN_AUTH;
+$response .= "\0" if $flags & CLIENT_CONNECT_ATTRS;
+write_packet($sock, 1, $response);
+
+my $auth = read_packet($sock);
+if (length($auth) > 0 && ord(substr($auth, 0, 1)) == 0x01) {
+  die "full authentication requested\n"
+    unless length($auth) > 1 && ord(substr($auth, 1, 1)) == 0x03;
+  $auth = read_packet($sock);
+} elsif (length($auth) > 0 && ord(substr($auth, 0, 1)) == 0xfe) {
+  write_packet($sock, 3, '');
+  $auth = read_packet($sock);
+}
+expect_ok($auth, 'auth');
+
+query_ok($sock, 'START TRANSACTION');
+query_ok($sock, 'UPDATE t_batch_drained_ps SET b=20 WHERE a=1');
+
+my $prepare = command(
+  $sock, 0x16, 'UPDATE t_batch_drained_ps SET b=40 WHERE a=1');
+if (my ($code, $message) = error_packet($prepare)) {
+  die "COM_STMT_PREPARE failed: $code $message\n";
+}
+die "COM_STMT_PREPARE returned non-OK\n"
+  unless length($prepare) >= 12 && ord(substr($prepare, 0, 1)) == 0x00;
+my $stmt_id = unpack('V', substr($prepare, 1, 4));
+my $param_count = unpack('v', substr($prepare, 7, 2));
+my $column_count = unpack('v', substr($prepare, 5, 2));
+read_packet($sock) for 1..$param_count;
+read_packet($sock) if $param_count > 0;
+read_packet($sock) for 1..$column_count;
+read_packet($sock) if $column_count > 0;
+
+open(my $ready_fh, '>', $ready_file) or die "open ready failed: $!\n";
+print {$ready_fh} "raw_ps_client_ready\n";
+close($ready_fh);
+print "raw_ps_client_ready\n";
+
+sleep 1 until -e $go_file;
+
+my $execute_payload = pack('VCV', $stmt_id, 0, 1);
+my $execute = command($sock, 0x17, $execute_payload);
+if (my ($code, $message) = error_packet($execute)) {
+  print "stmt_execute_error_code=$code\n";
+  print "stmt_execute_error_message=$message\n";
+  my $ping = command($sock, 0x0e, '');
+  if (my ($ping_code, $ping_message) = error_packet($ping)) {
+    print "ping_error_code=$ping_code\n";
+    print "ping_error_message=$ping_message\n";
+    exit 0;
+  }
+  print "ping_unexpected_success\n";
+  exit 1;
+}
+
+print "stmt_execute_unexpected_success\n";
+exit 1;
+EOF
+
+--exec echo "raw_ps_client_start" > $raw_ps_output
+--exec_in_background perl $raw_ps_client $MASTER_MYSOCK $raw_ps_ready $raw_ps_go >> $raw_ps_output 2>&1
+
+--let $grep_file= $raw_ps_output
+--let $grep_pattern= raw_ps_client_ready
+--let $wait_timeout= 10
+--source include/wait_for_pattern_in_file.inc
+
+--connect(batch_drained_ps_owner,localhost,root,,test)
+--connection batch_drained_ps_owner
+SET DEBUG_SYNC =
+  'preserve_trx_batch_after_one_target_preserved SIGNAL batch_drained_ps_preserved WAIT_FOR continue_batch_drained_ps';
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+--disable_warnings
+SET DEBUG_SYNC = 'now WAIT_FOR batch_drained_ps_preserved TIMEOUT 10';
+--enable_warnings
+--exec echo "go" > $raw_ps_go
+
+--let $grep_file= $raw_ps_output
+--let $grep_pattern= stmt_execute_error_code=4177
+--let $wait_timeout= 10
+--source include/wait_for_pattern_in_file.inc
+--let $grep_pattern= ping_error_code=4177
+--let $wait_timeout= 10
+--source include/wait_for_pattern_in_file.inc
+--cat_file $raw_ps_output
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SET DEBUG_SYNC = 'now SIGNAL continue_batch_drained_ps';
+
+--connection batch_drained_ps_owner
+--reap
+--disconnect batch_drained_ps_owner
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+ROLLBACK;
+
+SELECT * FROM t_batch_drained_ps;
+
+DROP TABLE t_batch_drained_ps;
+SET GLOBAL preserve_trx_enable=ON;
+
+--remove_file $raw_ps_client
+--remove_file $raw_ps_ready
+--remove_file $raw_ps_go
+--remove_file $raw_ps_output

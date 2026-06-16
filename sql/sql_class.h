@@ -137,6 +137,15 @@ struct timeval;
 struct User_level_lock;
 struct YYLTYPE;
 
+enum class Preserve_trx_batch_thd_state {
+  NONE,
+  PENDING_QUIESCE,
+  QUIESCED,
+  ATTACHING,
+  DRAINED_NO_TRANSACTION,
+  PRESERVED_DRAINED
+};
+
 namespace dd {
 namespace cache {
 class Dictionary_client;
@@ -385,6 +394,8 @@ class Prepared_statement_map {
 
   /** Erase all prepared statements (calls Prepared_statement destructor). */
   void erase(Prepared_statement *statement);
+
+  bool has_open_server_side_cursor() const;
 
   void claim_memory_ownership(bool claim);
 
@@ -1302,6 +1313,16 @@ class THD : public MDL_context_owner,
   uint dbug_sentry;  // watch out for memory corruption
 #endif
   bool is_killable;
+  /**
+    Non-zero while this THD is executing a statement that may create
+    transaction state or locks blocked by preserve-trx soft drain.
+    Protected by LOCK_thd_data.
+  */
+  uint preserve_trx_inflight_risky_statement_depth{0};
+  uint preserve_trx_inflight_unknown_query_depth{0};
+  ulonglong preserve_trx_batch_generation{0};
+  Preserve_trx_batch_thd_state preserve_trx_batch_state{
+      Preserve_trx_batch_thd_state::NONE};
   /**
     Warm-copy participant id assigned by the preserve/drain coordinator while
     this THD is admitted to an open warm-copy epoch. Protected by

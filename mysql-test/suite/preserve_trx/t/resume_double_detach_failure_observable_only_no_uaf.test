@@ -1,0 +1,59 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_resume_double_detach_failure;
+--enable_warnings
+
+--disable_query_log
+CALL mtr.add_suppression("Preserved transaction resume failed to detach transaction after savepoint restore failure; retrying cleanup detach");
+CALL mtr.add_suppression("Preserved transaction resume failed to detach transaction after savepoint restore failure; killing session");
+--enable_query_log
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_resume_double_detach_failure(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_resume_double_detach_failure VALUES(1,10),(2,20);
+
+START TRANSACTION;
+UPDATE t_resume_double_detach_failure SET v=11 WHERE id=1;
+SAVEPOINT s1;
+UPDATE t_resume_double_detach_failure SET v=22 WHERE id=2;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--connect(resume_double_detach, localhost, root,, test)
+--connection resume_double_detach
+SET SESSION debug="+d,preserve_trx_fail_restore_savepoints_after_sql,preserve_trx_fail_detach_resumed_from_thd,preserve_trx_fail_detach_resumed_from_thd_for_cleanup";
+--replace_result $preserved_token TOKEN
+--error ER_QUERY_INTERRUPTED,ER_PRESERVE_TRX_UNSUPPORTED,2013
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+--disconnect resume_double_detach
+
+--connection default
+--replace_result $preserved_token TOKEN
+--eval SELECT TOKEN, STATE, LAST_ERROR IS NOT NULL AS has_last_error FROM performance_schema.preserved_transactions WHERE TOKEN = '$preserved_token'
+
+--exec echo "restart" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--source include/restart_mysqld.inc
+
+SELECT COUNT(*) AS preserved_count_after_restart
+  FROM performance_schema.preserved_transactions;
+
+SELECT * FROM t_resume_double_detach_failure ORDER BY id;
+
+DROP TABLE t_resume_double_detach_failure;
+SET GLOBAL preserve_trx_enable=ON;

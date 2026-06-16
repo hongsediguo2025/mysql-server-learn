@@ -1,0 +1,3 @@
+SELECT 'lint-only' AS temp_table_sidecar_already_exists_preserves_durable_lint;
+temp_table_sidecar_already_exists_preserves_durable_lint
+lint-only

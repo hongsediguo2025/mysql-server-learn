@@ -1,0 +1,88 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to fsync preserved transaction directory after unlink");
+CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files before reattach");
+CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files");
+CALL mtr.add_suppression("Preserved transaction batch cleanup failed after target preserve error");
+
+--disable_warnings
+DROP TABLE IF EXISTS t_batch_post_detach_failure;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_batch_post_detach_failure(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+--connect(batch_post_detach_app,localhost,root,,test)
+--connection batch_post_detach_app
+START TRANSACTION;
+INSERT INTO t_batch_post_detach_failure VALUES(1,10);
+
+--connection default
+SET SESSION debug="+d,preserve_trx_fail_after_snapshot_rename";
+--error ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET SESSION debug="-d,preserve_trx_fail_after_snapshot_rename";
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_snapshot_file.inc
+
+--connection batch_post_detach_app
+COMMIT;
+--disconnect batch_post_detach_app
+
+--connection default
+SELECT * FROM t_batch_post_detach_failure ORDER BY id;
+
+--connect(batch_post_detach_cleanup_app,localhost,root,,test)
+--connection batch_post_detach_cleanup_app
+START TRANSACTION;
+INSERT INTO t_batch_post_detach_failure VALUES(2,20);
+
+--connection default
+SET SESSION debug="+d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_delete_snapshot_after_unlink";
+--error ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET SESSION debug="-d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_delete_snapshot_after_unlink";
+
+SELECT COUNT(*) AS preserved_count_after_cleanup_failure
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_snapshot_file.inc
+
+--connection batch_post_detach_cleanup_app
+COMMIT;
+--disconnect batch_post_detach_cleanup_app
+
+--connection default
+SELECT * FROM t_batch_post_detach_failure ORDER BY id;
+
+--connect(batch_post_detach_before_unlink_app,localhost,root,,test)
+--connection batch_post_detach_before_unlink_app
+START TRANSACTION;
+INSERT INTO t_batch_post_detach_failure VALUES(3,30);
+
+--connection default
+SET SESSION debug="+d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_delete_snapshot_files";
+--error ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET SESSION debug="-d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_delete_snapshot_files";
+
+SELECT COUNT(*) AS preserved_count_after_delete_before_unlink_failure
+  FROM performance_schema.preserved_transactions;
+
+--connection batch_post_detach_before_unlink_app
+SELECT 1;
+COMMIT;
+--disconnect batch_post_detach_before_unlink_app
+
+--connection default
+SELECT * FROM t_batch_post_detach_failure ORDER BY id;
+
+DROP TABLE t_batch_post_detach_failure;
+SET GLOBAL preserve_trx_enable=ON;

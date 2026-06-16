@@ -1,0 +1,47 @@
+DROP TABLE IF EXISTS t_ps_warmcopy_temp_obs;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1024;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=8192;
+CREATE TABLE t_ps_warmcopy_temp_obs(
+id INT PRIMARY KEY,
+payload VARBINARY(4096)
+) ENGINE=InnoDB;
+INSERT INTO t_ps_warmcopy_temp_obs VALUES(1, REPEAT('a', 1024));
+CREATE TEMPORARY TABLE tmp_ps_warmcopy_temp_obs(
+id INT PRIMARY KEY,
+v INT,
+KEY(v)
+) ENGINE=InnoDB;
+START TRANSACTION;
+INSERT INTO tmp_ps_warmcopy_temp_obs VALUES(1, 10), (2, 20);
+UPDATE tmp_ps_warmcopy_temp_obs SET v = v + 1 WHERE id = 1;
+UPDATE t_ps_warmcopy_temp_obs
+SET payload = REPEAT('b', 2048)
+WHERE id = 1;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+SELECT COUNT(*) AS temp_rows, SUM(v) AS temp_sum
+FROM tmp_ps_warmcopy_temp_obs;
+temp_rows	temp_sum
+2	31
+COMMIT;
+DROP TEMPORARY TABLE tmp_ps_warmcopy_temp_obs;
+SELECT payload = REPEAT('b', 2048) AS persistent_payload_ok
+FROM t_ps_warmcopy_temp_obs
+WHERE id = 1;
+persistent_payload_ok
+1
+DROP TABLE t_ps_warmcopy_temp_obs;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_enable=ON;

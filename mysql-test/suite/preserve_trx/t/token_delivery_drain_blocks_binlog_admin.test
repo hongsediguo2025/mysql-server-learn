@@ -1,0 +1,68 @@
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_preserve_token_binlog_admin;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+SET SESSION sql_log_bin=0;
+CREATE TABLE t_preserve_token_binlog_admin(a INT PRIMARY KEY, b INT)
+  ENGINE=InnoDB;
+INSERT INTO t_preserve_token_binlog_admin VALUES(1,10);
+SET SESSION sql_log_bin=1;
+RESET MASTER;
+
+--connect(preserve_owner,localhost,root,,test)
+--connection preserve_owner
+SET DEBUG_SYNC =
+  'preserve_trx_finalize_token_delivery SIGNAL token_binlog_admin_pending WAIT_FOR continue_token_binlog_admin';
+START TRANSACTION;
+UPDATE t_preserve_token_binlog_admin SET b=11 WHERE a=1;
+--send PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR token_binlog_admin_pending TIMEOUT 10';
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--connect(token_binlog_admin_blocker,localhost,root,,test)
+--connection token_binlog_admin_blocker
+--error ER_PRESERVE_TRX_UNSUPPORTED
+FLUSH BINARY LOGS;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+FLUSH LOGS;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+RESET MASTER;
+--disconnect token_binlog_admin_blocker
+
+--connection default
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SET DEBUG_SYNC = 'now SIGNAL continue_token_binlog_admin';
+
+--connection preserve_owner
+--reap
+--disconnect preserve_owner
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+ROLLBACK;
+
+SELECT * FROM t_preserve_token_binlog_admin ORDER BY a;
+
+SET SESSION sql_log_bin=0;
+DROP TABLE t_preserve_token_binlog_admin;
+SET SESSION sql_log_bin=1;
+RESET MASTER;
+SET GLOBAL preserve_trx_enable=ON;

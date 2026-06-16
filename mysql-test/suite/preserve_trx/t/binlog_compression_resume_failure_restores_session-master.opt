@@ -1,0 +1,1 @@
+--log-bin=preserve-trx-compression-failure-bin --server-id=1 --binlog-format=ROW --binlog-transaction-compression=OFF

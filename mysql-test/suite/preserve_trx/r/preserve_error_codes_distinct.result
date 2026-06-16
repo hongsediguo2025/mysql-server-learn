@@ -1,0 +1,32 @@
+DROP USER IF EXISTS preserve_error_reader@localhost;
+DROP TABLE IF EXISTS t_preserve_error_codes;
+SET GLOBAL preserve_trx_enable=OFF;
+RESUME PRESERVED TRANSACTION 'missing_token_for_disabled';
+ERROR HY000: Resumable transactions across shutdown are disabled
+SET GLOBAL preserve_trx_enable=ON;
+RESUME PRESERVED TRANSACTION 'missing_token_for_not_found';
+ERROR HY000: Preserved transaction was not found
+CREATE TABLE t_preserve_error_codes(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_preserve_error_codes VALUES(1,10);
+START TRANSACTION;
+UPDATE t_preserve_error_codes SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+CREATE USER preserve_error_reader@localhost;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Access denied for preserved transaction
+START TRANSACTION;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Invalid preserved transaction state
+ROLLBACK;
+SET SESSION debug='+d,preserve_trx_resume_force_binlog_mode_mismatch';
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Preserved transaction binlog mode does not match current server binlog mode
+SET SESSION debug='-d,preserve_trx_resume_force_binlog_mode_mismatch';
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+SELECT * FROM t_preserve_error_codes ORDER BY a;
+a	b
+1	11
+DROP USER preserve_error_reader@localhost;
+DROP TABLE t_preserve_error_codes;
+SET GLOBAL preserve_trx_enable=ON;

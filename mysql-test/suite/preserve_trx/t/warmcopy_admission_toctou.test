@@ -1,0 +1,195 @@
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+# Lint-only source-shape preflight. Runtime evidence in this file comes from
+# the DRAIN admission-window command blocking and RESUME assertions below.
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+my $path = File::Spec->catfile($source_root, 'sql', 'preserve_trx.h');
+open(my $fh, '<', $path) or die "cannot open $path: $!";
+my $hdr = do { local $/; <$fh> };
+close($fh);
+
+die "warm-copy close must have a distinct WARMCOPY_CLOSING manager state\n"
+  unless $hdr =~ /WARMCOPY_CLOSING/s;
+
+$path = File::Spec->catfile($source_root, 'sql', 'preserve_trx.cc');
+open($fh, '<', $path) or die "cannot open $path: $!";
+my $src = do { local $/; <$fh> };
+close($fh);
+
+$src =~ /Preserve_trx_command_block_result preserved_trx_command_block_result\s*\(.*?^}/ms
+  or die "could not find preserved_trx_command_block_result\n";
+my $block_body = $&;
+die "warm-copy closing must block risky commands before batch target state is published\n"
+  unless $block_body =~ /Preserve_trx_manager_state::WARMCOPY_CLOSING/s;
+die "preserve-control and SQL SHUTDOWN must be blocked before warm-copy state-specific business SQL handling\n"
+  unless $src =~ /bool preserve_trx_sql_command_is_preserve_control_or_shutdown[\s\S]*?SQLCOM_PREPARE_SHUTDOWN_PRESERVE[\s\S]*?SQLCOM_DRAIN_TRANSACTIONS_PRESERVE[\s\S]*?SQLCOM_RESUME_PRESERVED_TRX[\s\S]*?SQLCOM_SHUTDOWN[\s\S]*?return true/s &&
+         $block_body =~ /preserve_trx_sql_command_is_preserve_control_or_shutdown\s*\(\s*sql_command\s*\)/s &&
+         index($block_body,
+               'preserve_trx_sql_command_is_preserve_control_or_shutdown') <
+             index($block_body,
+                   'Preserve_trx_manager_state::WARMCOPY_DRAINING');
+
+$src =~ /bool Preserve_trx_drain_service::execute\s*\(.*?^bool Sql_cmd_drain_transactions_preserve::execute/ms
+  or die "could not find drain facade warm-copy close body\n";
+my $drain_body = $&;
+$src =~ /class Warmcopy_batch_drain_participant[\s\S]*?^};/ms
+  or die "could not find Warmcopy_batch_drain_participant\n";
+my $participant_body = $&;
+$src =~ /class Warmcopy_batch_blob_provider[\s\S]*?^};/ms
+  or die "could not find Warmcopy_batch_blob_provider\n";
+my $provider_body = $&;
+$src =~ /class Warmcopy_prepare_quiesced_targets[\s\S]*?^};/ms
+  or die "could not find Warmcopy_prepare_quiesced_targets\n";
+my $prepare_quiesced_body = $&;
+$src =~ /class Warmcopy_tail_budget_validator[\s\S]*?^};/ms
+  or die "could not find Warmcopy_tail_budget_validator\n";
+my $tail_validator_body = $&;
+$src =~ /class Warmcopy_prepare_idle_participants[\s\S]*?^};/ms
+  or die "could not find Warmcopy_prepare_idle_participants\n";
+my $prepare_idle_body = $&;
+$src =~ /void preserve_trx_warmcopy_admit_current_thd_binlog_write_impl\s*\(.*?^}/ms
+  or die "could not find preserve_trx_warmcopy_admit_current_thd_binlog_write_impl\n";
+my $admission_body = $&;
+my $closing_pos =
+  index($drain_body, 'transition_to(Preserve_trx_manager_state::WARMCOPY_CLOSING)');
+my $counter_pos = index($drain_body, 'Preserve_batch_target_counter counter');
+my $prepare_quiesced_pos =
+  index($drain_body, 'warmcopy_participant->prepare_quiesced_targets');
+my $close_pos = index($drain_body, 'drain_orchestrator.close_phase1_participants',
+                      $prepare_quiesced_pos);
+my $sync_pos =
+  index($participant_body, 'preserve_trx_warmcopy_after_admission_close_before_batch');
+my $participant_close_pos = index($participant_body, 'm_admission_scope->close');
+my $batch_pos =
+  index($drain_body, 'transition_to(Preserve_trx_manager_state::BATCH_DRAINING)');
+die "warm-copy drain must transition to WARMCOPY_CLOSING before admission close\n"
+  unless $closing_pos >= 0 && $closing_pos < $close_pos;
+die "warm-copy drain must keep admission open until targets are counted and quiesced\n"
+  unless $counter_pos >= 0 && $counter_pos < $close_pos;
+die "warm-copy drain must close admission only after quiesced target warm-copy prepare\n"
+  unless $prepare_quiesced_pos >= 0 && $prepare_quiesced_pos < $close_pos;
+die "warm-copy drain must expose a post-admission-close pre-batch sync point\n"
+  unless $participant_close_pos >= 0 && $participant_close_pos < $sync_pos &&
+         $close_pos < $batch_pos;
+die "warm-copy drain must publish BATCH_DRAINING only after admission close\n"
+  unless $close_pos < $batch_pos;
+die "warm-copy drain must route coordinator closing through DrainOrchestrator\n"
+  unless $drain_body =~ /Warmcopy_batch_drain_participant/s &&
+         $drain_body =~ /drain_orchestrator\.close_phase1_participants/s &&
+         $drain_body =~ /drain_orchestrator\.phase2_preflight_participants/s;
+my $prepare_flush_pos =
+  index($prepare_quiesced_body, 'binlog_flush_pending_rows_event(true)');
+my $prepare_blob_pos =
+  index($prepare_quiesced_body, 'prepare_blob_for_thd_if_present');
+die "warm-copy quiesced prepare must flush pending row events before blob prepare\n"
+  unless $prepare_flush_pos >= 0 && $prepare_flush_pos < $prepare_blob_pos;
+my $tail_flush_pos =
+  index($tail_validator_body, 'binlog_flush_pending_rows_event(true)');
+my $tail_budget_pos =
+  index($tail_validator_body, 'tail_budget_exceeded');
+die "warm-copy tail budget check must flush pending row events before cache length validation\n"
+  unless $tail_flush_pos >= 0 && $tail_flush_pos < $tail_budget_pos;
+die "warm-copy idle phase1 scan must not create zero-length blob sessions\n"
+  unless $participant_body =~ /prepare_warmcopy\.targets\s*\(\s*\)[\s\S]*prepare_blob_for_thd_if_present/s &&
+         $prepare_idle_body !~ /prepare_blob_for_thd\s*\(/s;
+die "warm-copy admission must stay open even if the global warm-copy sysvar is disabled after drain starts\n"
+  if $admission_body =~ /preserve_trx_warmcopy_enable/s;
+die "warm-copy duplicate admission must wait for an in-flight prepare instead of treating it as ready\n"
+  unless $provider_body =~ /wait_for_existing_entry/s &&
+         $provider_body =~ /wait_for_prepare_state_change_locked/s &&
+         $provider_body =~ /m_condition\.wait_for/s &&
+         $provider_body =~ /existing_it->second\.preparing/s;
+
+$path = File::Spec->catfile($source_root, 'sql', 'binlog.cc');
+open($fh, '<', $path) or die "cannot open $path: $!";
+my $binlog_src = do { local $/; <$fh> };
+close($fh);
+
+$binlog_src =~ /int binlog_cache_data::write_event\s*\(.*?^}/ms
+  or die "could not find binlog_cache_data::write_event\n";
+my $write_event_body = $&;
+my $admit_pos = index(
+  $write_event_body, 'preserve_trx_warmcopy_admit_current_thd_binlog_write');
+my $serialize_pos = index($write_event_body, 'binary_event_serialize');
+die "warm-copy must admit already-open transaction caches before event serialization\n"
+  unless $admit_pos >= 0 && $admit_pos < $serialize_pos;
+$binlog_src =~ /int THD::binlog_setup_trx_data\s*\(.*?^}/ms
+  or die "could not find THD::binlog_setup_trx_data\n";
+my $setup_body = $&;
+die "warm-copy admission must not create zero-length sessions during binlog cache setup\n"
+  if $setup_body =~ /preserve_trx_warmcopy_admit_current_thd_binlog_write/s;
+EOF
+
+--disable_warnings
+DROP TABLE IF EXISTS t_warmcopy_toctou;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=5000;
+
+CREATE TABLE t_warmcopy_toctou(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_warmcopy_toctou VALUES(1,10),(2,20);
+PREPARE warmcopy_toctou_stmt FROM
+  'UPDATE t_warmcopy_toctou SET v=v+1 WHERE id=?';
+
+--connect(warmcopy_toctou_app, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_warmcopy_toctou SET v=11 WHERE id=1;
+
+--connect(warmcopy_toctou_owner, localhost, root,,test)
+--connection warmcopy_toctou_owner
+SET DEBUG_SYNC =
+  'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL warmcopy_toctou_window WAIT_FOR warmcopy_toctou_continue';
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_toctou_window TIMEOUT 10';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+BEGIN;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+UPDATE t_warmcopy_toctou SET v=v+1 WHERE id=2;
+SET @warmcopy_toctou_id=2;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+EXECUTE warmcopy_toctou_stmt USING @warmcopy_toctou_id;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+SELECT * FROM t_warmcopy_toctou WHERE id=2 FOR UPDATE;
+SET DEBUG_SYNC = 'now SIGNAL warmcopy_toctou_continue';
+
+--connection warmcopy_toctou_owner
+--reap
+--disconnect warmcopy_toctou_owner
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+COMMIT;
+SELECT * FROM t_warmcopy_toctou ORDER BY id;
+
+DROP TABLE t_warmcopy_toctou;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=30000;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET DEBUG_SYNC = 'RESET';

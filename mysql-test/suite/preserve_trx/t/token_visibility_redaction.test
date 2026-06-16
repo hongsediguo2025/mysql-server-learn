@@ -1,0 +1,117 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP USER IF EXISTS preserve_owner@localhost;
+DROP USER IF EXISTS preserve_unprivileged_reader@localhost;
+DROP USER IF EXISTS preserve_process@localhost;
+DROP USER IF EXISTS preserve_resume_any_reader@localhost;
+DROP TABLE IF EXISTS t_preserve_token_visibility;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_preserve_token_visibility(a INT PRIMARY KEY, b INT)
+  ENGINE=InnoDB;
+INSERT INTO t_preserve_token_visibility VALUES(1,10);
+
+CREATE USER preserve_owner@localhost;
+GRANT SHUTDOWN ON *.* TO preserve_owner@localhost;
+GRANT SELECT, UPDATE ON test.t_preserve_token_visibility
+  TO preserve_owner@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_owner@localhost;
+CREATE USER preserve_process@localhost;
+GRANT PROCESS ON *.* TO preserve_process@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_process@localhost;
+CREATE USER preserve_unprivileged_reader@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_unprivileged_reader@localhost;
+CREATE USER preserve_resume_any_reader@localhost;
+GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO
+  preserve_resume_any_reader@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_resume_any_reader@localhost;
+
+--connect(preserve_owner_con, localhost, preserve_owner,,test)
+START TRANSACTION;
+UPDATE t_preserve_token_visibility SET b=11 WHERE a=1;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT TOKEN LIKE '****____' AND TOKEN <> '****' AS owner_token_is_redacted
+  FROM performance_schema.preserved_transactions;
+
+--connect(preserve_root_con, localhost, root,,test)
+--source suite/preserve_trx/include/get_preserved_token.inc
+--let $redacted_preserved_token= `SELECT CONCAT('****', RIGHT('$preserved_token', 4))`
+--connection preserve_owner_con
+--replace_result $redacted_preserved_token REDACTED $preserved_token TOKEN
+--eval SELECT TOKEN AS owner_visible_token FROM performance_schema.preserved_transactions
+--replace_result $preserved_token TOKEN
+--eval SELECT TOKEN <> '$preserved_token' AS owner_full_token_not_visible FROM performance_schema.preserved_transactions
+--replace_result $redacted_preserved_token REDACTED $preserved_token TOKEN
+--replace_column 5 CREATED_AT 6 EXPIRES_AT 8 AGE_SECONDS
+SHOW PRESERVED TRANSACTIONS;
+
+--connect(preserve_process_con, localhost, preserve_process,,test)
+SELECT COUNT(*) AS process_row_count
+  FROM performance_schema.preserved_transactions;
+--replace_result $preserved_token TOKEN
+--eval SELECT TOKEN AS process_visible_token FROM performance_schema.preserved_transactions
+--replace_result $preserved_token TOKEN
+--eval SELECT TOKEN = '$preserved_token' AS process_full_token_visible FROM performance_schema.preserved_transactions
+--replace_result $preserved_token TOKEN
+--replace_column 5 CREATED_AT 6 EXPIRES_AT 8 AGE_SECONDS
+SHOW PRESERVED TRANSACTIONS;
+
+--connect(preserve_unprivileged_con, localhost, preserve_unprivileged_reader,,test)
+SELECT COUNT(*) AS unprivileged_row_count
+  FROM performance_schema.preserved_transactions;
+SELECT COALESCE(TABLE_ROWS, 0) =
+       (SELECT COUNT(*) FROM performance_schema.preserved_transactions)
+       AS p_s_table_rows_matches_visible_count
+  FROM information_schema.tables
+  WHERE table_schema='performance_schema'
+    AND table_name='preserved_transactions';
+SHOW PRESERVED TRANSACTIONS;
+
+--connect(preserve_resume_any_con, localhost, preserve_resume_any_reader,,test)
+--replace_result $redacted_preserved_token REDACTED $preserved_token TOKEN
+--eval SELECT TOKEN AS resume_any_visible_token FROM performance_schema.preserved_transactions
+--replace_result $preserved_token TOKEN
+--eval SELECT TOKEN <> '$preserved_token' AS resume_any_full_token_not_visible FROM performance_schema.preserved_transactions
+--replace_result $redacted_preserved_token REDACTED $preserved_token TOKEN
+--replace_column 5 CREATED_AT 6 EXPIRES_AT 8 AGE_SECONDS
+SHOW PRESERVED TRANSACTIONS;
+
+--connection preserve_root_con
+--replace_result $preserved_token TOKEN
+--eval SELECT TOKEN = '$preserved_token' AS root_token_visible FROM performance_schema.preserved_transactions
+--replace_result $preserved_token TOKEN
+--replace_column 5 CREATED_AT 6 EXPIRES_AT 8 AGE_SECONDS
+SHOW PRESERVED TRANSACTIONS;
+
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+ROLLBACK;
+SELECT * FROM t_preserve_token_visibility WHERE a=1;
+
+--connection preserve_owner_con
+--disconnect preserve_owner_con
+--connection preserve_process_con
+--disconnect preserve_process_con
+--connection preserve_unprivileged_con
+--disconnect preserve_unprivileged_con
+--connection preserve_resume_any_con
+--disconnect preserve_resume_any_con
+--connection preserve_root_con
+DROP USER preserve_resume_any_reader@localhost;
+DROP USER preserve_unprivileged_reader@localhost;
+DROP USER preserve_process@localhost;
+DROP USER preserve_owner@localhost;
+DROP TABLE t_preserve_token_visibility;
+SET GLOBAL preserve_trx_enable=ON;

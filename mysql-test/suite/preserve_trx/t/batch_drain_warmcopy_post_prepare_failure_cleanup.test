@@ -1,0 +1,69 @@
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_warmcopy_post_prepare_failure;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+
+CREATE TABLE t_warmcopy_post_prepare_failure(
+  id INT PRIMARY KEY,
+  v INT,
+  payload VARBINARY(512)
+) ENGINE=InnoDB;
+INSERT INTO t_warmcopy_post_prepare_failure VALUES(1,10,'seed');
+RESET MASTER;
+
+--connect(warmcopy_post_prepare_app,localhost,root,,test)
+--connection warmcopy_post_prepare_app
+START TRANSACTION;
+UPDATE t_warmcopy_post_prepare_failure
+  SET v=11, payload=REPEAT('a',512)
+  WHERE id=1;
+
+--connection default
+SET SESSION debug="+d,preserve_trx_fail_after_undo_prepared";
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET SESSION debug="-d,preserve_trx_fail_after_undo_prepared";
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_snapshot_file.inc
+
+--connection warmcopy_post_prepare_app
+SELECT id, v, OCTET_LENGTH(payload) AS payload_len,
+       payload = REPEAT('a',512) AS payload_matches_expected
+  FROM t_warmcopy_post_prepare_failure
+  ORDER BY id;
+COMMIT;
+--disconnect warmcopy_post_prepare_app
+
+--connection default
+SELECT id, v, OCTET_LENGTH(payload) AS payload_len,
+       payload = REPEAT('a',512) AS payload_matches_expected
+  FROM t_warmcopy_post_prepare_failure
+  ORDER BY id;
+
+--let $binlog_file= query_get_value(SHOW MASTER STATUS, File, 1)
+--exec $MYSQL_BINLOG --force-if-open --base64-output=decode-rows -v -v $MYSQLTEST_VARDIR/mysqld.1/data/$binlog_file > $MYSQLTEST_VARDIR/tmp/warmcopy_post_prepare_failure.mysqlbinlog
+--let $assert_text= Warmcopy post-prepare failure keeps original binlog cache committable
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/warmcopy_post_prepare_failure.mysqlbinlog
+--let $assert_select= t_warmcopy_post_prepare_failure
+--let $assert_count_condition= >= 1
+--source include/assert_grep.inc
+--let $assert_text= Warmcopy post-prepare failure commits with a nonzero Xid event
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/warmcopy_post_prepare_failure.mysqlbinlog
+--let $assert_select= Xid = [1-9][0-9]*
+--let $assert_count_condition= >= 1
+--source include/assert_grep.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/warmcopy_post_prepare_failure.mysqlbinlog
+
+DROP TABLE t_warmcopy_post_prepare_failure;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_enable=ON;

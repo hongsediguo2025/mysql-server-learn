@@ -1,0 +1,5 @@
+# Lint-only source-shape guard. Runtime behavior is covered by
+# batch_drain_packet_before_dispatch and batch_drain_waits_inflight_statements.
+SELECT 'ok' AS batch_drain_unknown_query_quiesce_boundary_lint;
+batch_drain_unknown_query_quiesce_boundary_lint
+ok

@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <functional>
+#include <limits>
 
 #include "lf.h"
 #include "m_ctype.h"
@@ -4436,6 +4437,160 @@ bool MDL_ticket::has_pending_conflicting_lock() const {
 /** Return a key identifying this lock. */
 
 const MDL_key *MDL_ticket::get_key() const { return &m_lock->key; }
+
+namespace {
+
+void mdl_preserve_append_le16(std::string *bytes, uint16 value) {
+  bytes->push_back(static_cast<char>(value & 0xff));
+  bytes->push_back(static_cast<char>((value >> 8) & 0xff));
+}
+
+void mdl_preserve_append_le32(std::string *bytes, uint32 value) {
+  for (size_t i = 0; i < 4; ++i)
+    bytes->push_back(static_cast<char>((value >> (i * 8)) & 0xff));
+}
+
+bool mdl_preserve_normalized_namespace(
+    MDL_key::enum_mdl_namespace mdl_namespace) {
+  switch (mdl_namespace) {
+    case MDL_key::FUNCTION:
+    case MDL_key::PROCEDURE:
+    case MDL_key::TRIGGER:
+      return true;
+    default:
+      return false;
+  }
+}
+
+uint mdl_preserve_key_payload_length(const MDL_key *key) {
+  if (key == nullptr) return 0;
+  uint length = key->length();
+  if (mdl_preserve_normalized_namespace(key->mdl_namespace()))
+    length += key->name_length() + 1;
+  return length;
+}
+
+}  // namespace
+
+bool MDL_context::export_preserved_locks(std::string *payload,
+                                         size_t *lock_count) const {
+  if (payload == nullptr || lock_count == nullptr) return true;
+  if (!m_ticket_store.is_empty(MDL_STATEMENT) ||
+      !m_ticket_store.is_empty(MDL_EXPLICIT)) {
+    return true;
+  }
+
+  std::string bytes;
+  bytes.reserve(64);
+  mdl_preserve_append_le32(&bytes, 0);
+
+  uint32 count = 0;
+  MDL_ticket_store::List_iterator it =
+      m_ticket_store.list_iterator(MDL_TRANSACTION);
+  for (MDL_ticket *ticket = it++; ticket != nullptr; ticket = it++) {
+    const MDL_key *key = ticket->get_key();
+    if (key == nullptr || key->length() == 0 ||
+        ticket->get_type() >= MDL_TYPE_END) {
+      return true;
+    }
+
+    const MDL_key::enum_mdl_namespace mdl_namespace = key->mdl_namespace();
+    if (!mdl_preserve_namespace_supported(mdl_namespace)) {
+      return true;
+    }
+
+    const uint key_length = mdl_preserve_key_payload_length(key);
+    const uint part_key_length = key_length - 1;
+    if (part_key_length > std::numeric_limits<uint16>::max() ||
+        key->db_name_length() > std::numeric_limits<uint16>::max() ||
+        count == std::numeric_limits<uint32>::max()) {
+      return true;
+    }
+
+    bytes.push_back(static_cast<char>(mdl_namespace));
+    bytes.push_back(static_cast<char>(ticket->get_type()));
+    bytes.push_back(static_cast<char>(MDL_TRANSACTION));
+    bytes.push_back(0);
+    mdl_preserve_append_le32(&bytes, count + 1);
+    mdl_preserve_append_le16(&bytes, static_cast<uint16>(key->db_name_length()));
+    mdl_preserve_append_le16(&bytes, static_cast<uint16>(part_key_length));
+    bytes.append(reinterpret_cast<const char *>(key->ptr() + 1),
+                 part_key_length);
+    ++count;
+  }
+
+  for (size_t i = 0; i < 4; ++i) {
+    bytes[i] = static_cast<char>((count >> (i * 8)) & 0xff);
+  }
+  *lock_count = count;
+  *payload = std::move(bytes);
+  return false;
+}
+
+bool MDL_context::export_savepoint_ordinals(
+    const MDL_savepoint &mdl_savepoint, uint32 *stmt_ordinal,
+    uint32 *trans_ordinal) const {
+  auto ticket_ordinal = [this](enum_mdl_duration duration, MDL_ticket *sentinel,
+                               uint32 *ordinal) {
+    if (ordinal == nullptr) return true;
+    if (sentinel == nullptr) {
+      *ordinal = 0;
+      return false;
+    }
+
+    uint32 current_ordinal = 0;
+    MDL_ticket_store::List_iterator it = m_ticket_store.list_iterator(duration);
+    for (MDL_ticket *ticket = it++; ticket != nullptr; ticket = it++) {
+      ++current_ordinal;
+      if (ticket == sentinel) {
+        *ordinal = current_ordinal;
+        return false;
+      }
+    }
+    return true;
+  };
+
+  return ticket_ordinal(MDL_STATEMENT, mdl_savepoint.m_stmt_ticket,
+                        stmt_ordinal) ||
+         ticket_ordinal(MDL_TRANSACTION, mdl_savepoint.m_trans_ticket,
+                        trans_ordinal);
+}
+
+bool MDL_context::savepoint_from_ordinals(uint32 stmt_ordinal,
+                                          uint32 trans_ordinal,
+                                          MDL_savepoint *mdl_savepoint) const {
+  if (mdl_savepoint == nullptr) return true;
+
+  auto ticket_from_ordinal = [this](enum_mdl_duration duration, uint32 ordinal,
+                                    MDL_ticket **sentinel) {
+    if (sentinel == nullptr) return true;
+    if (ordinal == 0) {
+      *sentinel = nullptr;
+      return false;
+    }
+
+    uint32 current_ordinal = 0;
+    MDL_ticket_store::List_iterator it = m_ticket_store.list_iterator(duration);
+    for (MDL_ticket *ticket = it++; ticket != nullptr; ticket = it++) {
+      ++current_ordinal;
+      if (current_ordinal == ordinal) {
+        *sentinel = ticket;
+        return false;
+      }
+    }
+    return true;
+  };
+
+  MDL_ticket *stmt_ticket = nullptr;
+  MDL_ticket *trans_ticket = nullptr;
+  if (ticket_from_ordinal(MDL_STATEMENT, stmt_ordinal, &stmt_ticket) ||
+      ticket_from_ordinal(MDL_TRANSACTION, trans_ordinal, &trans_ticket)) {
+    return true;
+  }
+
+  *mdl_savepoint = MDL_savepoint(stmt_ticket, trans_ticket);
+  return false;
+}
 
 /**
   Releases metadata locks that were acquired after a specific savepoint.

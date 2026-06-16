@@ -1,0 +1,31 @@
+DROP TABLE IF EXISTS t_logged_empty_gtid_next;
+DROP DATABASE IF EXISTS preserve_trx_ignored;
+SET GLOBAL preserve_trx_enable=ON;
+SET SESSION sql_log_bin=0;
+CREATE DATABASE preserve_trx_ignored;
+CREATE TABLE t_logged_empty_gtid_next(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+CREATE TABLE preserve_trx_ignored.gtid_seed(a INT PRIMARY KEY, b INT)
+ENGINE=InnoDB;
+INSERT INTO t_logged_empty_gtid_next VALUES(1,10);
+INSERT INTO preserve_trx_ignored.gtid_seed VALUES(1,10);
+SET SESSION sql_log_bin=1;
+RESET MASTER;
+SET GTID_NEXT='SERVER_UUID:41';
+START TRANSACTION;
+UPDATE preserve_trx_ignored.gtid_seed SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT * FROM preserve_trx_ignored.gtid_seed WHERE a=1;
+a	b
+1	11
+ROLLBACK;
+SET GTID_NEXT=AUTOMATIC;
+SELECT @@SESSION.GTID_NEXT;
+@@SESSION.GTID_NEXT
+AUTOMATIC
+SET SESSION sql_log_bin=0;
+DROP TABLE t_logged_empty_gtid_next;
+DROP DATABASE preserve_trx_ignored;
+SET SESSION sql_log_bin=1;
+RESET MASTER;
+SET GLOBAL preserve_trx_enable=ON;

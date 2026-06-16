@@ -1,0 +1,30 @@
+DROP TABLE IF EXISTS t_warmcopy_export_metadata_fail;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+CREATE TABLE t_warmcopy_export_metadata_fail(id INT PRIMARY KEY, v INT)
+ENGINE=InnoDB;
+INSERT INTO t_warmcopy_export_metadata_fail VALUES(1,10);
+START TRANSACTION;
+UPDATE t_warmcopy_export_metadata_fail SET v=11 WHERE id=1;
+SET SESSION debug="+d,preserve_trx_fail_warmcopy_export_metadata";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug="-d,preserve_trx_fail_warmcopy_export_metadata";
+SELECT COUNT(*) AS preserved_count_after_drain
+FROM performance_schema.preserved_transactions;
+preserved_count_after_drain
+0
+COMMIT;
+SELECT COUNT(*) AS preserved_count_after_commit
+FROM performance_schema.preserved_transactions;
+preserved_count_after_commit
+0
+SELECT * FROM t_warmcopy_export_metadata_fail;
+id	v
+1	11
+DROP TABLE t_warmcopy_export_metadata_fail;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET DEBUG_SYNC = 'RESET';

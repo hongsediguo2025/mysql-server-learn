@@ -1,0 +1,56 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_global_off;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_global_off(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_global_off VALUES(1,10);
+
+START TRANSACTION;
+SELECT * FROM t_global_off WHERE a=1 FOR UPDATE;
+UPDATE t_global_off SET b=11 WHERE a=1;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+SELECT @@global.log_bin AS log_bin_after_restart;
+
+--replace_column 1 TOKEN
+SELECT TOKEN, BINLOG_STATE, WROTE_TO_CACHE, BINLOG_CACHE_SIZE, GLOBAL_LOG_BIN
+  FROM performance_schema.preserved_transactions;
+
+--error 1
+--file_exists $PRESERVED_BINLOG_CACHE_FILE
+
+--connect(preserve_observer, localhost, root,,test)
+SELECT * FROM t_global_off WHERE a=1;
+--disconnect preserve_observer
+--source include/wait_until_disconnected.inc
+--connection default
+
+SELECT * FROM t_global_off WHERE a=1;
+
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+
+--error 1
+--file_exists $PRESERVED_SNAPSHOT_FILE
+
+SELECT * FROM t_global_off WHERE a=1;
+UPDATE t_global_off SET b=12 WHERE a=1;
+COMMIT;
+SELECT * FROM t_global_off WHERE a=1;
+
+DROP TABLE t_global_off;
+SET GLOBAL preserve_trx_enable=ON;

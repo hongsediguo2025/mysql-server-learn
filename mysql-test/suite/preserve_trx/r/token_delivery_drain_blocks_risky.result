@@ -1,0 +1,33 @@
+DROP TABLE IF EXISTS t_preserve_token_drain;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_preserve_token_drain(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_preserve_token_drain VALUES(1,10),(2,20),(3,30),(4,40);
+SET DEBUG_SYNC =
+'preserve_trx_finalize_token_delivery SIGNAL token_finalize_pending WAIT_FOR continue_token_finalize';
+START TRANSACTION;
+UPDATE t_preserve_token_drain SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET DEBUG_SYNC = 'now WAIT_FOR token_finalize_pending TIMEOUT 10';
+UPDATE t_preserve_token_drain SET b=21 WHERE a=2;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET @token_drain_sql =
+'UPDATE t_preserve_token_drain SET b=31 WHERE a=3';
+PREPARE token_drain_stmt FROM @token_drain_sql;
+EXECUTE token_drain_stmt;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+DEALLOCATE PREPARE token_drain_stmt;
+SELECT * FROM t_preserve_token_drain WHERE a=4 FOR UPDATE;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET DEBUG_SYNC = 'now SIGNAL continue_token_finalize';
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ROLLBACK;
+SELECT * FROM t_preserve_token_drain ORDER BY a;
+a	b
+1	10
+2	20
+3	30
+4	40
+DROP TABLE t_preserve_token_drain;
+SET GLOBAL preserve_trx_enable=ON;

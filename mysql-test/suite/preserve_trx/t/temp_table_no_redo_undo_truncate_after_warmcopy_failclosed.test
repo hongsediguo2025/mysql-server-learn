@@ -1,0 +1,65 @@
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+
+--connect(temp_truncate_target, localhost, root,,test)
+--connection temp_truncate_target
+CREATE TEMPORARY TABLE tmp_preserve_truncate(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+START TRANSACTION;
+INSERT INTO tmp_preserve_truncate VALUES(1, 10), (2, 20);
+
+--connect(temp_truncate_owner, localhost, root,,test)
+--connection temp_truncate_owner
+SET DEBUG_SYNC =
+  'preserve_trx_warmcopy_open SIGNAL temp_truncate_warmcopy_open WAIT_FOR temp_truncate_continue_warmcopy';
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR temp_truncate_warmcopy_open TIMEOUT 10';
+
+--connection temp_truncate_target
+TRUNCATE TABLE tmp_preserve_truncate;
+START TRANSACTION;
+INSERT INTO tmp_preserve_truncate VALUES(3, 30);
+
+--connection default
+SET DEBUG_SYNC = 'now SIGNAL temp_truncate_continue_warmcopy';
+
+--connection temp_truncate_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+--disconnect temp_truncate_owner
+
+--connection default
+--remove_file $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+--connection temp_truncate_target
+SELECT * FROM tmp_preserve_truncate ORDER BY id;
+INSERT INTO tmp_preserve_truncate VALUES(4, 40);
+COMMIT;
+SELECT COUNT(*) AS rows_after_commit, SUM(v) AS sum_after_commit
+  FROM tmp_preserve_truncate;
+
+DROP TEMPORARY TABLE tmp_preserve_truncate;
+--disconnect temp_truncate_target
+--connection default
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET DEBUG_SYNC = 'RESET';

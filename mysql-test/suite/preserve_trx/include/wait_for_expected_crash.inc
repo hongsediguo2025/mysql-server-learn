@@ -1,0 +1,4 @@
+--let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $grep_pattern= safe_process\\[[0-9]+\\]: Child process: [0-9]+, (exit: 1|killed by signal: 6)
+--let $wait_timeout= 30
+--source include/wait_for_pattern_in_file.inc

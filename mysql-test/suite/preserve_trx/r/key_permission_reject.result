@@ -4,4 +4,3 @@ preserve key mode is too open
 Pattern "preserve_trx_enable=ON requires valid snapshot support" found
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;

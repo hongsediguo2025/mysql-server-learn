@@ -1,0 +1,1392 @@
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+# Lint-only source-shape guard; behavior coverage lives in targeted MTR/gunit
+# tests. Do not cite this file as evidence for runtime preserve/resume behavior.
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_source {
+  my ($path) = @_;
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $src = do { local $/; <$fh> };
+  close($fh);
+  return $src;
+}
+
+sub read_optional_source {
+  my ($path) = @_;
+  return '' unless -f $path;
+  return read_source($path);
+}
+
+my $preserve_path = File::Spec->catfile($source_root, 'sql', 'preserve_trx.cc');
+my $preserve_header_path = File::Spec->catfile($source_root, 'sql',
+                                              'preserve_trx.h');
+my $binlog_path = File::Spec->catfile($source_root, 'sql', 'binlog.cc');
+my $binlog_ostream_path = File::Spec->catfile($source_root, 'sql',
+                                              'binlog_ostream.cc');
+my $bundle_path = File::Spec->catfile($source_root, 'sql',
+                                      'preserve_trx_bundle.cc');
+my $lock_path = File::Spec->catfile($source_root, 'storage', 'innobase',
+                                    'lock', 'lock0lock.cc');
+my $purge_path = File::Spec->catfile($source_root, 'storage', 'innobase',
+                                     'trx', 'trx0purge.cc');
+my $trx_preserve_path = File::Spec->catfile($source_root, 'storage', 'innobase',
+                                           'trx', 'trx0preserve.cc');
+my $trx_temp_preserve_path = File::Spec->catfile(
+  $source_root, 'storage', 'innobase', 'trx', 'trx0temp_preserve.cc');
+my $trx_undo_path = File::Spec->catfile($source_root, 'storage', 'innobase',
+                                        'trx', 'trx0undo.cc');
+my $trx_path = File::Spec->catfile($source_root, 'storage', 'innobase',
+                                   'trx', 'trx0trx.cc');
+my $mtr_path = File::Spec->catfile($source_root, 'storage', 'innobase',
+                                   'mtr', 'mtr0mtr.cc');
+my $ha_innodb_path = File::Spec->catfile($source_root, 'storage', 'innobase',
+                                         'handler', 'ha_innodb.cc');
+my $mysqld_path = File::Spec->catfile($source_root, 'sql', 'mysqld.cc');
+my $carrier_file_path = File::Spec->catfile($source_root, 'sql',
+                                            'preserve_trx_carrier_file.cc');
+my $carrier_path = File::Spec->catfile($source_root, 'sql',
+                                       'preserve_trx_carrier.cc');
+my $bundle_doc_path = File::Spec->catfile(
+  $source_root, 'design', 'resumable-trx-bundle-carrier-decoupling.md');
+my $temp_table_path = File::Spec->catfile($source_root, 'sql',
+                                          'preserve_trx_temp_table.cc');
+my $temp_table_carrier_path = File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_temp_table_carrier.cc');
+my $mdl_context_backup_path = File::Spec->catfile(
+  $source_root, 'sql', 'mdl_context_backup.cc');
+my $drain_path = File::Spec->catfile($source_root, 'sql',
+                                     'preserve_trx_drain.cc');
+my $handler_path = File::Spec->catfile($source_root, 'sql', 'handler.cc');
+my $gunit_path = File::Spec->catfile($source_root, 'unittest', 'gunit',
+                                     'preserve_trx-t.cc');
+my $sql_parse_path = File::Spec->catfile($source_root, 'sql', 'sql_parse.cc');
+
+my $preserve = read_source($preserve_path);
+my $preserve_header = read_source($preserve_header_path);
+my $binlog = read_source($binlog_path);
+my $binlog_ostream = read_source($binlog_ostream_path);
+my $bundle = read_source($bundle_path);
+my $lock = read_source($lock_path);
+my $purge = read_source($purge_path);
+my $trx_preserve = read_source($trx_preserve_path);
+my $trx_temp_preserve = read_source($trx_temp_preserve_path);
+my $trx_undo = read_source($trx_undo_path);
+my $trx = read_source($trx_path);
+my $mtr = read_source($mtr_path);
+my $ha_innodb = read_source($ha_innodb_path);
+my $mysqld = read_source($mysqld_path);
+my $carrier_file = read_source($carrier_file_path);
+my $carrier = read_source($carrier_path);
+my $bundle_doc = read_optional_source($bundle_doc_path);
+my $temp_table = read_source($temp_table_path);
+my $temp_table_carrier = read_source($temp_table_carrier_path);
+my $mdl_context_backup = read_source($mdl_context_backup_path);
+my $drain = read_source($drain_path);
+my $handler = read_source($handler_path);
+my $gunit = read_source($gunit_path);
+my $sql_parse = read_source($sql_parse_path);
+
+$lock =~ /static bool lock_preserve_page_identity_matches[\s\S]*?^}/m
+  or die "could not isolate lock_preserve_page_identity_matches\n";
+my $page_identity = $&;
+die "predicate lock identity must fail closed when the persisted identity is empty\n"
+  unless $page_identity =~
+         /lock_preserve_entry_is_predicate[\s\S]*entry\.heap_offsets\.empty\s*\(\s*\)[\s\S]*return\s+false\s*;/s;
+die "predicate lock identity must compare stable predicate page identity payloads\n"
+  unless $page_identity =~
+         /lock_preserve_entry_is_predicate[\s\S]*current_identity\s*==\s*entry\.heap_offsets/s;
+die "ordinary record lock identity must document page_n_heap as diagnostic-only context\n"
+  unless $page_identity =~
+         /page_n_heap is retained in the payload as diagnostic context[\s\S]*not a stable identity component for ordinary\s+record locks/s;
+die "ordinary record lock identity must not reject solely on page_n_heap drift\n"
+  if $page_identity =~
+     /entry\.page_n_heap\s*!=\s*page_dir_get_n_heap\s*\(\s*page\s*\)[\s\S]*return\s+false\s*;/s;
+
+die "preserved temp-table acquire must parse the final generated _preserved_space_<id>_table_<id> suffix and require an active reservation\n"
+  unless $ha_innodb =~
+         /for\s*\(\s*const char \*candidate\s*=\s*std::strstr\s*\(\s*table_name,\s*marker\s*\)[\s\S]*suffix\s*=\s*candidate[\s\S]*table_suffix[\s\S]*generated_name[\s\S]*is_preserved_space_id_reserved/s;
+
+$lock =~ /static dberr_t lock_preserve_import_one_table_lock[\s\S]*?^}/m
+  or die "could not isolate lock_preserve_import_one_table_lock\n";
+my $preserve_import_table_lock = $&;
+die "preserved table-lock import must fail closed instead of assert-aborting on incompatible locks\n"
+  unless $preserve_import_table_lock =~
+         /lock_preserve_resurrect_table_lock[\s\S]*return\s+err/s &&
+         $preserve_import_table_lock !~ /ut_a\s*\(\s*!\s*lock_table_other_has_incompatible/s;
+
+$lock =~ /static dberr_t lock_preserve_import_record_lock[\s\S]*?^}/m
+  or die "could not isolate lock_preserve_import_record_lock\n";
+my $preserve_import_record_lock = $&;
+die "preserved record-lock import must fail closed when intention-lock resurrect sees an incompatible table lock\n"
+  unless $preserve_import_record_lock =~
+         /lock_preserve_resurrect_table_lock[\s\S]*if\s*\(\s*table_err\s*!=\s*DB_SUCCESS\s*\)[\s\S]*return\s+table_err/s;
+
+$lock =~ /static bool lock_preserve_append_record_image[\s\S]*?^}/m
+  or die "could not isolate lock_preserve_append_record_image\n";
+my $preserve_record_image = $&;
+die "record-lock export must explicitly fail closed on unsupported field-length sentinels\n"
+  unless $preserve_record_image =~ /UNIV_SQL_ADD_COL_DEFAULT/s &&
+         $preserve_record_image =~ /UNIV_SQL_INSTANT_DROP_COL/s &&
+         $preserve_record_image =~ /UNIV_NO_INDEX_VALUE/s &&
+         $preserve_record_image =~ /UNIV_MULTI_VALUE_ARRAY_MARKER/s &&
+         $preserve_record_image =~ /UNIV_EXTERN_STORAGE_FIELD/s;
+
+$lock =~ /static dberr_t lock_preserve_import_predicate_lock[\s\S]*?^}/m
+  or die "could not isolate lock_preserve_import_predicate_lock\n";
+my $preserve_import_predicate_lock = $&;
+die "preserved predicate-lock import must fail closed when intention-lock resurrect sees an incompatible table lock\n"
+  unless $preserve_import_predicate_lock =~
+         /lock_preserve_resurrect_table_lock[\s\S]*if\s*\(\s*table_err\s*!=\s*DB_SUCCESS\s*\)[\s\S]*return\s+table_err/s;
+
+$mdl_context_backup =~
+  /bool MDL_context_backup_manager::create_backup\(const MDL_context \*context[\s\S]*?^}/m
+  or die "could not isolate session MDL create_backup overload\n";
+my $session_mdl_backup = $&;
+die "duplicate session MDL backup must fail closed instead of reporting success\n"
+  unless $session_mdl_backup =~ /if\s*\(\s*check_key_exist\s*\(\s*key_obj\s*\)\s*\)\s*return\s+true\s*;/s;
+
+$binlog =~ /bool mysql_binlog_preserve_export[\s\S]*?^}/m
+  or die "could not isolate mysql_binlog_preserve_export\n";
+my $binlog_export = $&;
+die "binlog export must explicitly fail closed when trx cache has pending rows\n"
+  unless $binlog_export =~ /trx_cache\.pending\s*\(\s*\)\s*!=\s*nullptr/s;
+
+$binlog =~ /bool mysql_binlog_preserve_reactivate_after_prepare_failure[\s\S]*?^}/m
+  or die "could not isolate mysql_binlog_preserve_reactivate_after_prepare_failure\n";
+my $binlog_prepare_failure_reactivate = $&;
+die "binlog prepare-failure reactivation must clear table-map state before more DML can be logged\n"
+  unless $binlog_prepare_failure_reactivate =~ /thd->clear_binlog_table_maps\s*\(\s*\)/s;
+die "binlog prepare-failure reactivation must reset trx-cache statement savepoint state after resetting STMT scope\n"
+  unless $binlog_prepare_failure_reactivate =~
+         /reset_scope\s*\(\s*Transaction_ctx::STMT\s*\)[\s\S]*set_prev_position\s*\(\s*MY_OFF_T_UNDEF\s*\)/s;
+
+$binlog =~ /bool mysql_binlog_preserve_export_metadata_only[\s\S]*?^}/m
+  or die "could not isolate mysql_binlog_preserve_export_metadata_only\n";
+my $binlog_export_metadata_only = $&;
+die "metadata-only binlog export must expose warmcopy failure injection\n"
+  unless $binlog_export_metadata_only =~
+         /preserve_trx_fail_warmcopy_export_metadata[\s\S]*return\s+true/s;
+
+$binlog =~ /bool mysql_binlog_preserve_warmcopy_build_blob[\s\S]*?^}/m
+  or die "could not isolate mysql_binlog_preserve_warmcopy_build_blob\n";
+my $warmcopy_build_blob = $&;
+die "warmcopy build must fail closed when metadata export fails\n"
+  unless $warmcopy_build_blob =~
+         /mysql_binlog_preserve_export_metadata_only\s*\(\s*thd\s*,\s*&metadata\s*\)[\s\S]*return\s+true\s*;/s;
+die "warmcopy full-build path must compute and publish the external blob digest\n"
+  unless $warmcopy_build_blob =~ /ostream\.finish\s*\(\s*&digest\s*\)/s &&
+         $warmcopy_build_blob =~ /blob->digest\s*=\s*digest/s;
+my $warmcopy_finalize_start = index($binlog, 'bool finalize(THD *thd');
+my $warmcopy_finalize_end =
+  index($binlog, 'Binlog_warmcopy_mirror_status write_at',
+        $warmcopy_finalize_start);
+die "could not isolate warmcopy live-session finalize\n"
+  if $warmcopy_finalize_start < 0 || $warmcopy_finalize_end < 0 ||
+     $warmcopy_finalize_end <= $warmcopy_finalize_start;
+my $warmcopy_finalize =
+  substr($binlog, $warmcopy_finalize_start,
+         $warmcopy_finalize_end - $warmcopy_finalize_start);
+die "warmcopy live session must fail closed until every mirrored byte is digested\n"
+  unless $warmcopy_finalize =~ /m_digest_until\s*!=\s*current_length/s &&
+         $warmcopy_finalize =~ /!\s*m_pending_ranges\.empty\s*\(\s*\)/s;
+die "warmcopy live-session path must compute and publish the external blob digest\n"
+  unless $warmcopy_finalize =~ /EVP_DigestFinal_ex[\s\S]*digest\.data\s*\(\s*\)/s &&
+         $warmcopy_finalize =~ /blob->digest\s*=\s*digest/s;
+
+$preserve =~ /bool preserved_trx_metadata_locks_count[\s\S]*?^}/m
+  or die "could not isolate preserved_trx_metadata_locks_count\n";
+my $metadata_locks_count = $&;
+die "P_S LOCKS_COUNT must include preserved table-lock payload entries\n"
+  unless $metadata_locks_count =~ /metadata\.table_locks_payload/s &&
+         $metadata_locks_count =~ /trx_preserve_table_locks_payload_lock_count/s;
+
+$carrier =~ /Preserve_snapshot_status cleanup_after_write_failure[\s\S]*?^}/m
+  or die "could not isolate cleanup_after_write_failure\n";
+my $store_write_cleanup = $&;
+die "store write cleanup must remove the full carrier record after snapshot write failure\n"
+  unless $store_write_cleanup =~ /remove_with_status\s*\(\s*token\s*\)/s;
+
+$carrier =~ /Preserve_snapshot_status Preserved_trx_store::write[\s\S]*?^Preserve_snapshot_status Preserved_trx_store::read/m
+  or die "could not isolate Preserved_trx_store::write\n";
+my $store_writer = $&;
+die "store writer must persist external blobs before the main snapshot\n"
+  unless $store_writer =~ /write_external_blobs_new[\s\S]*write_snapshot_new/s;
+die "store writer must clean external blobs when the main snapshot already exists\n"
+  unless $store_writer =~ /write_snapshot_new[\s\S]*cleanup_external_blobs_after_write_failure/s;
+die "store writer must clean the full carrier record when final snapshot write fails\n"
+  unless $store_writer =~ /write_snapshot_new[\s\S]*cleanup_after_write_failure/s;
+
+$purge =~ /static bool trx_purge_check_if_marked_undo_is_empty[\s\S]*?^}/m
+  or die "could not isolate trx_purge_check_if_marked_undo_is_empty\n";
+my $purge_check = $&;
+die "undo truncate check must explicitly account for preserved transactions\n"
+  unless $purge_check =~ /trx_preserve|TRX_STATE_PRESERVED|xid_is_preserve_magic/s;
+die "undo truncate check must collect preserved rsegs before taking marked rseg locks\n"
+  unless $purge_check =~ /trx_preserve_collect_preserved_rsegs[\s\S]*marked_rsegs->x_lock/s;
+die "undo truncate check must not call trx_sys-scanning preserve helper under rseg latch\n"
+  if $purge_check =~ /rseg->latch\s*\(\s*\)[\s\S]*trx_preserve_rseg_has_preserved_trx/s;
+die "undo truncate check must use the pre-collected preserved rseg set under rseg latch\n"
+  unless $purge_check =~ /rseg->latch\s*\(\s*\)[\s\S]*std::find\s*\(\s*preserve_rsegs\.begin/s;
+
+$trx =~ /static trx_t \*trx_resurrect_insert[\s\S]*?^}/m
+  or die "could not isolate trx_resurrect_insert\n";
+my $trx_resurrect_insert = $&;
+die "force recovery must keep preserve magic XA transactions prepared\n"
+  unless $trx_resurrect_insert =~
+         /srv_force_recovery\s*==\s*0\s*\|\|[\s\S]*xid_is_preserve_magic/s &&
+         $trx_resurrect_insert =~ /\+\+trx_sys->n_prepared_trx/s;
+
+$carrier_file =~ /Preserved_trx_carrier_status read_file_limited[\s\S]*?^}/m
+  or die "could not isolate read_file_limited\n";
+my $carrier_limited_read = $&;
+die "carrier read must stat and enforce the byte limit before allocation/open read\n"
+  unless $carrier_limited_read =~
+         /file_exists\s*\([^;]*&stat_area[\s\S]*stat_area\.st_size[\s\S]*>\s*max_bytes[\s\S]*my_open/s &&
+         index($carrier_limited_read, 'stat_area.st_size') <
+         index($carrier_limited_read, 'out->assign');
+
+$carrier_file =~ /Preserved_trx_carrier_status Local_file_preserved_trx_carrier::read_existing[\s\S]*?^}/m
+  or die "could not isolate Local_file_preserved_trx_carrier::read_existing\n";
+my $carrier_read_existing = $&;
+die "carrier read_existing must apply snapshot and external blob read limits\n"
+  unless $carrier_read_existing =~ /read_limits\.max_snapshot_bytes/s &&
+         $carrier_read_existing =~ /read_limits\.max_external_blob_bytes/s;
+die "carrier metadata-only read must stream external sidecar digest metadata without returning payloads\n"
+  unless $carrier_read_existing =~ /Payload_read_mode::METADATA_ONLY/s &&
+         $carrier_read_existing =~ /read_external_blob_metadata/s &&
+         $carrier_read_existing =~ /set_blob_descriptor_from_payload/s;
+die "carrier snapshot-only read must not scan external sidecars\n"
+  unless index($carrier_read_existing, 'Payload_read_mode::SNAPSHOT_ONLY') >= 0 &&
+         index($carrier_read_existing, 'Payload_read_mode::SNAPSHOT_ONLY') <
+         index($carrier_read_existing, 'binlog_cache_path');
+
+$temp_table_carrier =~ /Preserved_trx_carrier_status validate_file_digest[\s\S]*?^}/m
+  or die "could not isolate temp sidecar streaming digest validator\n";
+my $temp_sidecar_digest_validator = $&;
+die "temporary table sidecar recovery validation must stream digest bytes instead of allocating the full sidecar\n"
+  unless $temp_sidecar_digest_validator =~ /EVP_DigestUpdate/s &&
+         $temp_sidecar_digest_validator =~ /my_read/s &&
+         $temp_sidecar_digest_validator !~ /out->assign/s;
+$temp_table =~ /Preserve_snapshot_status preserve_trx_temp_table_validate_sidecars[\s\S]*?^}/m
+  or die "could not isolate preserve_trx_temp_table_validate_sidecars\n";
+my $temp_sidecar_validation = $&;
+die "temporary table startup sidecar validation must not call payload-returning sealed sidecar reads\n"
+  unless $temp_sidecar_validation =~ /validate_sealed_image/s &&
+         $temp_sidecar_validation =~ /validate_sealed_undo/s &&
+         $temp_sidecar_validation !~ /read_sealed_image/s &&
+         $temp_sidecar_validation !~ /read_sealed_undo/s;
+
+$carrier =~ /bool external_blob_metadata_matches_descriptors[\s\S]*?^}/m
+  or die "could not isolate external_blob_metadata_matches_descriptors\n";
+my $carrier_metadata_match = $&;
+die "metadata-only store read must validate sidecar names, sizes, and digests against snapshot descriptors\n"
+  unless $carrier_metadata_match =~ /external_blobs\.size\(\)\s*!=\s*descriptors\.size\(\)/s &&
+         $carrier_metadata_match =~ /candidate\.name\s*==\s*descriptor\.name/s &&
+         $carrier_metadata_match =~ /candidate\.descriptor\.name\s*==\s*descriptor\.name/s &&
+         $carrier_metadata_match =~ /blob->descriptor\.size\s*!=\s*descriptor\.size/s &&
+         $carrier_metadata_match =~ /blob->descriptor\.digest\s*!=\s*descriptor\.digest/s;
+my $store_read_start =
+  index($carrier, 'Preserve_snapshot_status Preserved_trx_store::read(',
+        index($carrier, 'Preserve_snapshot_status Preserved_trx_store::read(') + 1);
+die "could not isolate Preserved_trx_store::read with payload_read_mode\n"
+  if $store_read_start < 0;
+my $store_read_end =
+  index($carrier, 'Preserve_snapshot_status Preserved_trx_store::rewrite_recovered_count',
+        $store_read_start);
+die "could not find Preserved_trx_store::read end\n"
+  if $store_read_end < 0;
+my $store_read_payload_mode =
+  substr($carrier, $store_read_start, $store_read_end - $store_read_start);
+die "store metadata-only read must not accept empty sidecar metadata silently\n"
+  unless $store_read_payload_mode =~
+           /const bool read_external_blobs[\s\S]*Payload_read_mode::WITH_EXTERNAL_BLOBS/s &&
+         $store_read_payload_mode =~
+           /if\s*\(\s*read_external_blobs\s*\)[\s\S]*external_blobs_match_descriptors/s &&
+         $store_read_payload_mode =~
+           /else\s+if\s*\(\s*validate_external_blob_metadata\s*\)[\s\S]*external_blob_metadata_matches_descriptors/s;
+
+$preserve =~ /static bool reactivate_current_batch_prepared_failure_to_original_thd[\s\S]*?^}/m
+  or die "could not isolate reactivate_current_batch_prepared_failure_to_original_thd\n";
+my $batch_prepare_reactivate = $&;
+die "batch prepare failure reactivation must accept active or prepared magic transactions\n"
+  unless $batch_prepare_reactivate =~
+         /trx_preserve_reactivate_prepare_failure_in_original_thd/s;
+
+$preserve =~ /auto restore_batch_prepare_failure_or_rollback = \[\&\]\(\) \{[\s\S]*?^\s*\};/m
+  or die "could not isolate restore_batch_prepare_failure_or_rollback\n";
+my $batch_prepare_restore = $&;
+$batch_prepare_restore =~
+  /if\s*\(\s*batch_delivery\s*\)\s*\{([\s\S]*?)return\s+reject_unsupported_for_delivery\s*\(\s*\);\s*\}\s*return\s+reject_single_after_attached_cleanup/ms
+  or die "could not isolate batch branch in restore_batch_prepare_failure_or_rollback\n";
+my $batch_prepare_restore_branch = $1;
+die "batch prepare failure branch must not rollback the user transaction\n"
+  if $batch_prepare_restore_branch =~ /ha_rollback_trans/s;
+die "batch prepare failure branch must restore InnoDB and binlog state before rejecting\n"
+  unless $batch_prepare_restore_branch =~
+         /reactivate_current_batch_prepared_failure_to_original_thd/s &&
+         $batch_prepare_restore_branch =~
+         /mysql_binlog_preserve_reactivate_after_prepare_failure/s &&
+         $batch_prepare_restore_branch =~ /reattached_to_original_thd/s;
+$preserve =~ /DBUG_EXECUTE_IF\s*\(\s*"pfx_prepare_low"[\s\S]*?prepare_failed\s*=\s*true[\s\S]*?if\s*\(\s*prepare_failed\s*\)\s*\{[\s\S]*?return\s+restore_unprepared_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
+  or die "pre-ha_prepare_low failure hook must route through unprepared batch restore helper\n";
+$preserve =~ /ha_prepare_low\s*\(\s*thd\s*,\s*true\s*\)[\s\S]*?return\s+restore_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
+  or die "ha_prepare_low engine failure must route through prepared batch restore helper\n";
+$preserve =~ /DBUG_EXECUTE_IF\s*\(\s*"pfx_temp_prepare"[\s\S]*?temp_prepare_failed\s*=\s*true[\s\S]*?if\s*\(\s*temp_prepare_failed\s*\)\s*\{[\s\S]*?return\s+restore_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
+  or die "temp-only prepare failure hook must route through batch restore helper\n";
+
+$preserve =~ /auto reject_after_binlog_export = \[\&\]\(const char \*reason\) \{[\s\S]*?^\s*\};/m
+  or die "could not isolate reject_after_binlog_export\n";
+my $reject_after_binlog_export = $&;
+die "pre-prepare reject after binlog export must restore the exported binlog cache\n"
+  unless $reject_after_binlog_export =~
+         /mysql_binlog_preserve_reactivate_after_prepare_failure\s*\(\s*thd\s*,\s*binlog_snapshot\s*\)/s;
+my $pre_prepare_export_start = index($preserve, 'has_logged_binlog_cache = true;');
+my $pre_prepare_export_end =
+  index($preserve, 'auto restore_batch_prepare_failure_or_rollback');
+die "could not isolate pre-prepare post-binlog-export region\n"
+  if $pre_prepare_export_start < 0 || $pre_prepare_export_end < 0 ||
+     $pre_prepare_export_end <= $pre_prepare_export_start;
+my $pre_prepare_post_binlog_export =
+  substr($preserve, $pre_prepare_export_start,
+         $pre_prepare_export_end - $pre_prepare_export_start);
+$pre_prepare_post_binlog_export =~
+  s/auto reject_after_binlog_export = \[\&\]\(const char \*reason\) \{[\s\S]*?^\s*\};\n//m
+  or die "could not remove reject_after_binlog_export helper from pre-prepare region\n";
+die "pre-prepare reject paths after logged binlog export must route through reject_after_binlog_export\n"
+  if $pre_prepare_post_binlog_export =~ /return\s+reject_unsupported_for_delivery\s*\(/s;
+
+$temp_table =~ /bool preserve_trx_temp_table_build_baseline_image[\s\S]*?^}/m
+  or die "could not isolate preserve_trx_temp_table_build_baseline_image\n";
+my $temp_baseline_builder = $&;
+die "temp no-redo undo preserve must fail closed before physical page capture\n"
+  unless $temp_baseline_builder =~ /has_row_history\s*\(\s*\)[\s\S]*no-redo undo sidecars are unsupported/s &&
+         index($temp_baseline_builder, 'no-redo undo sidecars are unsupported') <
+         index($temp_baseline_builder,
+               'trx_preserve_temp_space_image_arm_dirty_page_stream');
+
+die "temp sidecar read limit must use the temp-sidecar sysvar, not binlog cache cap\n"
+  unless $temp_table_carrier =~ /temp_sidecar_max_read_bytes[\s\S]*preserve_trx_max_temp_sidecar_bytes/s &&
+         $preserve_header =~ /preserve_trx_max_temp_sidecar_bytes/s;
+die "temp sidecar carrier must reject over-limit warm image and undo writes before atomic write\n"
+  unless $temp_table_carrier =~ /write_warm_image[\s\S]*length\s*>\s*temp_sidecar_max_read_bytes\s*\(\s*\)[\s\S]*atomic_write_file/s &&
+         $temp_table_carrier =~ /write_warm_undo[\s\S]*length\s*>\s*temp_sidecar_max_read_bytes\s*\(\s*\)[\s\S]*atomic_write_file/s;
+die "temp-table raw image builder must receive the temp sidecar byte budget before payload allocation\n"
+  unless $temp_baseline_builder =~ /trx_preserve_temp_space_image_build_raw_sidecar_payload\s*\([\s\S]*preserve_trx_max_temp_sidecar_bytes/s &&
+         $trx_temp_preserve =~ /raw_size\s*>\s*max_payload_bytes[\s\S]*payload->assign/s;
+die "temp sidecar carrier must not read-limit by preserve_trx_max_binlog_cache_bytes\n"
+  if $temp_table_carrier =~ /preserve_trx_max_binlog_cache_bytes/s;
+
+$temp_table =~ /bool preserve_trx_temp_table_has_row_history[\s\S]*?^}/m
+  or die "could not isolate preserve_trx_temp_table_has_row_history\n";
+my $temp_has_row_history = $&;
+die "temp preserve must reject row history lost while the feature gate was disabled\n"
+  unless $temp_has_row_history =~ /preserve_trx_temp_table_has_untracked_change/s;
+
+$temp_table =~ /Preserve_snapshot_status preserve_trx_temp_table_preflight_preserve[\s\S]*?^}/m
+  or die "could not isolate preserve_trx_temp_table_preflight_preserve\n";
+my $temp_preflight_preserve = $&;
+die "temp preflight must reject dropped-temp row history even when no temp tables remain linked\n"
+  if $temp_preflight_preserve =~ /temporary_tables\s*==\s*nullptr/s;
+
+$handler =~ /int handler::ha_write_row[\s\S]*?^}/m
+  or die "could not isolate handler::ha_write_row\n";
+my $handler_write_row_untracked = $&;
+$handler =~ /int handler::ha_update_row[\s\S]*?^}/m
+  or die "could not isolate handler::ha_update_row\n";
+my $handler_update_row_untracked = $&;
+$handler =~ /int handler::ha_delete_row[\s\S]*?^}/m
+  or die "could not isolate handler::ha_delete_row\n";
+my $handler_delete_row_untracked = $&;
+die "temp write hook must run for transactional temp rows even when the feature gate is disabled\n"
+  unless $handler_write_row_untracked =~ /preserve_trx_temp_table_row_capture_candidate[\s\S]*preserve_trx_temp_table_note_row_write/s;
+die "temp update hook must run for transactional temp rows even when the feature gate is disabled\n"
+  unless $handler_update_row_untracked =~ /preserve_trx_temp_table_row_capture_candidate[\s\S]*preserve_trx_temp_table_note_row_update/s;
+die "temp delete hook must run for transactional temp rows even when the feature gate is disabled\n"
+  unless $handler_delete_row_untracked =~ /preserve_trx_temp_table_row_capture_candidate[\s\S]*preserve_trx_temp_table_note_row_delete/s;
+
+$temp_table =~ /Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume[\s\S]*?^}/m
+  or die "could not isolate preserve_trx_temp_table_materialize_for_resume\n";
+my $temp_materialize = $&;
+die "temp no-redo undo resume must fail closed before sidecar read/materialize\n"
+  unless $temp_materialize =~
+         /plan\.requires_no_redo_undo_sidecars[\s\S]*Preserve_snapshot_status::UNSUPPORTED/s &&
+         index($temp_materialize, 'plan.requires_no_redo_undo_sidecars') <
+         index($temp_materialize, 'preserve_trx_temp_table_validate_sidecars');
+
+$temp_table =~ /auto cleanup_sidecars = \[\&\]\(\) \{[\s\S]*?^\s*\};/m
+  or die "could not isolate temp cleanup_sidecars\n";
+my $temp_cleanup_sidecars = $&;
+die "temp sidecar cleanup must delete only sidecars sealed by this attempt\n"
+  unless $temp_cleanup_sidecars =~ /remove_warm_image/s &&
+         $temp_cleanup_sidecars =~ /remove_sealed_image/s &&
+         $temp_cleanup_sidecars !~ /remove_warm_undo/s &&
+         $temp_cleanup_sidecars !~ /remove_sealed_undo/s &&
+         $temp_cleanup_sidecars !~ /remove_sealed_sidecars/s;
+$temp_table_carrier =~ /Preserved_trx_carrier_status fsync_directory_after_install[\s\S]*?^}/m
+  or die "could not isolate fsync_directory_after_install\n";
+my $temp_fsync_after_install = $&;
+die "temp sidecar install/fsync failure must delete only the sidecar installed by this attempt\n"
+  unless $temp_fsync_after_install =~ /my_delete\s*\(\s*installed_path\.c_str/s;
+$temp_table_carrier =~ /seal_warm_image[\s\S]*?install_temp_file[\s\S]*?fsync_directory_after_install\s*\(\s*m_dir\s*,\s*sealed_path\s*\)/m
+  or die "temp image seal must cleanup installed sidecar on post-install fsync failure\n";
+$temp_table_carrier =~ /seal_warm_undo[\s\S]*?install_temp_file[\s\S]*?fsync_directory_after_install\s*\(\s*m_dir\s*,\s*sealed_path\s*\)/m
+  or die "temp undo seal must cleanup installed sidecar on post-install fsync failure\n";
+$temp_table_carrier =~ /bool shared_physical_image_matches[\s\S]*?^}/m
+  or die "could not isolate shared_physical_image_matches\n";
+my $temp_carrier_shared_image = $&;
+die "carrier shared temp-table physical sidecar matching must not compare per-table table_flags\n"
+  if $temp_carrier_shared_image =~ /table_flags/s;
+
+$temp_table =~ /bool remember_or_match_shared_image[\s\S]*?^}/m
+  or die "could not isolate remember_or_match_shared_image\n";
+my $temp_shared_image = $&;
+die "shared temp-table physical sidecar matching must not compare per-table table_flags\n"
+  if $temp_shared_image =~ /shared->table_flags|image\.table_flags/s;
+
+$trx_temp_preserve =~
+  /dberr_t trx_preserve_temp_space_image_stage_dirty_page[\s\S]*?^}/m
+  or die "could not isolate trx_preserve_temp_space_image_stage_dirty_page\n";
+my $temp_stage_dirty_page = $&;
+$mtr =~ /void add_dirty_page_to_flush_list\(mtr_memo_slot_t \*slot\) const[\s\S]*?buf_flush_note_modification/m
+  or die "could not isolate add_dirty_page_to_flush_list\n";
+my $mtr_add_dirty_page = $&;
+die "mtr dirty-page hot path must test temp preserve hook enablement before staging a page image\n"
+  unless $mtr_add_dirty_page =~
+           /trx_preserve_temp_space_image_dirty_page_hook_enabled\s*\(\s*\)[\s\S]*trx_preserve_temp_space_image_stage_dirty_page\s*\(/s;
+my $temp_stage_active_filter_pos =
+  index($temp_stage_dirty_page,
+        'trx_preserve_temp_space_image_may_have_active_stream');
+my $temp_stage_reserve_pos =
+  index($temp_stage_dirty_page,
+        'trx_preserve_temp_space_image_try_reserve_staged_dirty_page_bytes');
+my $temp_stage_copy_pos =
+  index($temp_stage_dirty_page, 'staged.bytes.assign');
+my $temp_stage_count_add_pos =
+  index($temp_stage_dirty_page,
+        'trx_preserve_temp_staged_dirty_page_count.fetch_add');
+die "temp dirty-page staging must filter active source-space before admission accounting\n"
+  unless $temp_stage_active_filter_pos >= 0 &&
+         $temp_stage_count_add_pos >= 0 &&
+         $temp_stage_active_filter_pos < $temp_stage_count_add_pos;
+die "temp dirty-page staging must resolve source-space membership and staged-byte budget before copying page bytes\n"
+  unless $temp_stage_reserve_pos >= 0 && $temp_stage_copy_pos >= 0 &&
+         $temp_stage_reserve_pos < $temp_stage_copy_pos;
+
+$handler =~ /int handler::ha_update_row[\s\S]*?^}/m
+  or die "could not isolate handler::ha_update_row\n";
+my $handler_update_row = $&;
+die "ha_update_row must gate temp-table payload copy before allocating old+new payload\n"
+  unless $handler_update_row =~ /preserve_trx_temp_table_row_capture_candidate/s &&
+         index($handler_update_row, 'preserve_trx_temp_table_row_capture_candidate') >= 0 &&
+         index($handler_update_row, 'preserve_trx_temp_table_enable') >= 0 &&
+         index($handler_update_row, 'std::string payload') >= 0 &&
+         index($handler_update_row, 'preserve_trx_temp_table_row_capture_candidate') <
+         index($handler_update_row, 'preserve_trx_temp_table_enable') &&
+         index($handler_update_row, 'preserve_trx_temp_table_enable') <
+         index($handler_update_row, 'std::string payload') &&
+         $handler_update_row =~
+           /!\s*preserve_trx_temp_table_enable[\s\S]*preserve_trx_temp_table_note_row_update\s*\(\s*ha_thd\(\)\s*,\s*table\s*,\s*nullptr\s*,\s*0\s*\)/s;
+
+$binlog_ostream =~ /bool Binlog_cache_storage::write[\s\S]*?^}/m
+  or die "could not isolate Binlog_cache_storage::write\n";
+my $binlog_cache_write = $&;
+die "binlog cache write must avoid the warmcopy mutex when no mirror is installed\n"
+  unless $binlog_cache_write =~ /m_warmcopy_lease->active\s*\(\s*\)/s &&
+         index($binlog_cache_write, 'm_warmcopy_lease->active') <
+         index($binlog_cache_write, 'std::lock_guard');
+
+$binlog_ostream =~ /bool Binlog_cache_storage::truncate[\s\S]*?^}/m
+  or die "could not isolate Binlog_cache_storage::truncate\n";
+my $binlog_cache_truncate = $&;
+die "binlog cache truncate must avoid the warmcopy mutex when no mirror is installed\n"
+  unless $binlog_cache_truncate =~ /m_warmcopy_lease->active\s*\(\s*\)/s &&
+         index($binlog_cache_truncate, 'm_warmcopy_lease->active') <
+         index($binlog_cache_truncate, 'std::lock_guard');
+
+$binlog_ostream =~ /bool Binlog_cache_storage::reset[\s\S]*?^}/m
+  or die "could not isolate Binlog_cache_storage::reset\n";
+my $binlog_cache_reset = $&;
+die "binlog cache reset must avoid the warmcopy mutex when no mirror is installed\n"
+  unless $binlog_cache_reset =~ /m_warmcopy_lease->active\s*\(\s*\)/s &&
+         index($binlog_cache_reset, 'm_warmcopy_lease->active') <
+         index($binlog_cache_reset, 'std::lock_guard');
+
+die "temp dirty-page hook must test active source-space before per-space admission-close checks\n"
+  unless $temp_stage_dirty_page =~
+           /trx_preserve_temp_space_image_may_have_active_stream/s &&
+         $temp_stage_dirty_page =~
+           /trx_preserve_temp_stage_admission_closed_for_space/s &&
+         index($temp_stage_dirty_page,
+               'trx_preserve_temp_space_image_may_have_active_stream') <
+         index($temp_stage_dirty_page,
+               'trx_preserve_temp_stage_admission_closed_for_space');
+
+$trx_undo =~ /static trx_undo_t \*trx_undo_reuse_cached[\s\S]*?^}/m
+  or die "could not isolate trx_undo_reuse_cached\n";
+my $undo_reuse_cached = $&;
+die "temp undo cache reuse must be disabled only by an active preserve capture predicate\n"
+  unless $undo_reuse_cached =~
+         /trx_preserve_temp_space_image_should_disable_undo_cache/s &&
+         $undo_reuse_cached !~
+         /preserve_trx_temp_table_enable\s*&&\s*fsp_is_system_temporary/s;
+
+$preserve =~ /class Preserve_drain_active_transactions[\s\S]*?^};/m
+  or die "could not isolate Preserve_drain_active_transactions\n";
+my $single_drain = $&;
+die "single-trx drain must fail closed on system-thread RW transactions\n"
+  unless $single_drain =~ /is_system_thread[\s\S]*m_has_unsupported_thread/s;
+die "single-trx hard drain timeout test must be able to keep active transactions alive deterministically\n"
+  unless $single_drain =~ /preserve_trx_drain_skip_kill_active/s;
+
+$preserve =~ /bool preserve_trx_drain_other_active_transactions[\s\S]*?^}/m
+  or die "could not isolate preserve_trx_drain_other_active_transactions\n";
+my $single_drain_loop = $&;
+die "single-trx hard drain must have a configurable absolute timeout\n"
+  unless $single_drain_loop =~ /preserve_trx_drain_hard_timeout_ms/s &&
+         $single_drain_loop =~ /hard_deadline_us/s &&
+         $single_drain_loop =~ /ER_PRESERVE_TRX_DRAIN_TIMEOUT/s;
+die "single-trx hard drain must arm its deadline when hard mode begins\n"
+  unless $single_drain_loop =~ /auto\s+arm_hard_deadline/s &&
+         $single_drain_loop =~ /if\s*\(\s*hard_drain\s*\)\s*arm_hard_deadline/s &&
+         $single_drain_loop =~ /hard_drain\s*=\s*true\s*;[\s\S]*arm_hard_deadline/s;
+$preserve =~
+  /if\s*\(preserve_trx_drain_other_active_transactions\(target_thd\)\)\s*\{[\s\S]*?return preserve_trx_reject_unsupported\(\);/m
+  or die "could not isolate single-trx drain failure branch\n";
+my $single_drain_failure_branch = $&;
+die "single-trx drain failure must preserve a specific hard-timeout error\n"
+  unless $single_drain_failure_branch =~
+         /target_thd->is_error\s*\(\s*\)[\s\S]*return\s+true/s;
+
+$preserve =~ /class Preserve_thd_context_switch[\s\S]*?^};/m
+  or die "could not isolate Preserve_thd_context_switch\n";
+my $context_switch = $&;
+die "batch THD context switch must lock target THD data for the final attach guard\n"
+  unless $context_switch =~ /LOCK_thd_data/ &&
+         $context_switch =~ /preserve_trx_batch_state/;
+die "batch THD context switch must restore ATTACHING targets on early return\n"
+  unless $context_switch =~ /m_generation/s &&
+         $context_switch =~ /Preserve_trx_batch_thd_state::ATTACHING[\s\S]*Preserve_trx_batch_thd_state::QUIESCED/s;
+
+$preserve =~ /if\s*\(preserved_trx_resume_deadline_expired\(record\.metadata\)\)[\s\S]*?return preserve_trx_reject_unsupported\(\);/m
+  or die "could not isolate second resume deadline branch\n";
+my $resume_deadline = $&;
+die "second resume deadline branch must preserve timeout as LAST_ERROR before rollback\n"
+  unless $resume_deadline =~ /preserve_trx_set_record_error|restore_record_after_resume_failure/s;
+
+$preserve =~ /bool Sql_cmd_resume_preserved_transaction::execute\(THD \*thd\)[\s\S]*?^}/m
+  or die "could not isolate Sql_cmd_resume_preserved_transaction::execute\n";
+my $resume_execute = $&;
+my $deadline_pos = index($resume_execute,
+                         "preserved_trx_resume_deadline_expired(record.metadata)");
+my $not_resumable_pos = index($resume_execute, "if (!record.resumable)");
+my $temp_preclaim_pos = index($resume_execute,
+                              "preserve_trx_temp_table_preclaim_decision");
+die "resume deadline cleanup must run before non-resumable pending-token rejection\n"
+  unless $deadline_pos >= 0 &&
+         $not_resumable_pos >= 0 &&
+         $deadline_pos < $not_resumable_pos;
+die "resume deadline cleanup must run before temp-table retryable preclaim\n"
+  unless $deadline_pos >= 0 &&
+         $temp_preclaim_pos >= 0 &&
+         $deadline_pos < $temp_preclaim_pos;
+
+$preserve =~ /static bool rollback_resumable_record_after_resume_timeout[\s\S]*?^}/m
+  or die "could not isolate rollback_resumable_record_after_resume_timeout\n";
+my $resume_timeout_rollback = $&;
+die "resume timeout rollback failure must be runtime injectable\n"
+  unless $resume_timeout_rollback =~ /preserve_trx_fail_resume_timeout_rollback/s;
+
+$preserve =~ /bool preserved_trx_add_record_with_error[\s\S]*?^}/m
+  or die "could not isolate preserved_trx_add_record_with_error\n";
+my $add_record_with_error = $&;
+die "preserved_trx_add_record_with_error must set LAST_ERROR before publishing the record\n"
+  unless $add_record_with_error =~
+         /preserve_trx_set_record_error[\s\S]*g_preserved_trx_records\.push_back/s;
+die "preserved_trx_add_record_with_error must not repair LAST_ERROR after publishing the record\n"
+  if $add_record_with_error =~
+     /g_preserved_trx_records\.push_back[\s\S]*preserved_trx_update_record_error/s;
+
+$preserve =~ /static bool restore_record_after_resume_failure[\s\S]*?^}/m
+  or die "could not isolate restore_record_after_resume_failure\n";
+my $restore_record_after_resume_failure = $&;
+die "resume failure record restore must atomically publish LAST_ERROR with the record\n"
+  if $restore_record_after_resume_failure =~
+     /preserved_trx_add_record[\s\S]*preserved_trx_update_record_error/s;
+
+$preserve =~ /static void rollback_pending_token_delivery_record[\s\S]*?^}/m
+  or die "could not isolate rollback_pending_token_delivery_record\n";
+my $rollback_pending_token_delivery_record = $&;
+die "token delivery rollback failure must atomically publish LAST_ERROR with the record\n"
+  if $rollback_pending_token_delivery_record =~
+     /preserved_trx_add_record[\s\S]*preserved_trx_update_record_error/s;
+
+$preserve =~ /bool Sql_cmd_resume_preserved_transaction::execute[\s\S]*?^}/m
+  or die "could not isolate Sql_cmd_resume_preserved_transaction::execute\n";
+my $resume_execute_for_failure_guards = $&;
+
+$resume_execute_for_failure_guards =~ /if\s*\(restore_savepoints_to_thd[\s\S]*?return preserve_trx_reject_unsupported\(\);/m
+  or die "could not isolate RESUME savepoint failure branch\n";
+my $resume_savepoint_failure = $&;
+die "RESUME savepoint failure branch must route through detach cleanup helper\n"
+  unless $resume_savepoint_failure =~ /detach_resumed_after_failure/s &&
+         $resume_savepoint_failure !~ /else\s*\{[\s\S]*thd_state_guard\.dismiss/s;
+
+$resume_execute_for_failure_guards =~ /if\s*\(trx_preserve_activate_resumed\(record\.trx\)[\s\S]*?return preserve_trx_reject_unsupported\(\);/m
+  or die "could not isolate RESUME activation failure branch\n";
+my $resume_activation_failure = $&;
+die "RESUME activation failure branch must route through detach cleanup helper\n"
+  unless $resume_activation_failure =~
+         /detach_resumed_after_failure/s &&
+         $resume_activation_failure !~ /else\s*\{[\s\S]*thd_state_guard\.dismiss/s;
+
+$resume_execute_for_failure_guards =~
+  /auto detach_resumed_after_failure[\s\S]*?return true;\s*\n\s*\};/m
+  or die "could not isolate RESUME detach failure cleanup helper\n";
+my $resume_detach_failure_helper = $&;
+die "RESUME detach cleanup helper must publish observable-only FAILED token before killing session\n"
+  unless $resume_detach_failure_helper =~
+         /preserved_trx_add_resume_detach_failure_observable_record[\s\S]*THD::KILL_CONNECTION/s;
+
+$preserve =~ /bool preserve_trx_has_unsupported_transaction_contents[\s\S]*?^}/m
+  or die "could not isolate preserve_trx_has_unsupported_transaction_contents\n";
+my $unsupported_contents = $&;
+die "unsupported transaction check must include STMT-scope non-transactional changes\n"
+  unless $unsupported_contents =~ /has_modified_non_trans_table\s*\(\s*Transaction_ctx::STMT/s;
+die "generic unsupported transaction check must leave temp row-history decisions to the temp-table manifest layer\n"
+  if $unsupported_contents =~ /preserve_trx_temp_table_has_row_history/s;
+
+my $unsupported_preflight_pos =
+  index($preserve, 'const bool unsupported_transaction_contents =');
+my $unsupported_call_pos = $unsupported_preflight_pos < 0 ? -1 :
+  index($preserve,
+        'preserve_trx_has_unsupported_transaction_contents(thd, binlog_state)',
+        $unsupported_preflight_pos);
+my $temp_preflight_pos = $unsupported_call_pos < 0 ? -1 :
+  index($preserve, 'preserve_trx_temp_table_preflight_preserve(thd)',
+        $unsupported_call_pos);
+my $lock_preflight_stage_pos = $temp_preflight_pos < 0 ? -1 :
+  index($preserve, 'set_stage(Preserve_trx_preserve_stage::LOCK_PREFLIGHT)',
+        $temp_preflight_pos);
+die "unsupported transaction contents must be rejected before preserve lock/prepare flow\n"
+  unless $unsupported_preflight_pos >= 0 && $unsupported_call_pos >= 0 &&
+         $temp_preflight_pos >= 0 && $lock_preflight_stage_pos >= 0 &&
+         $unsupported_call_pos < $temp_preflight_pos &&
+         $temp_preflight_pos < $lock_preflight_stage_pos;
+my $prelock_preserve_window =
+  substr($preserve, $unsupported_preflight_pos,
+         $lock_preflight_stage_pos - $unsupported_preflight_pos);
+die "unsupported transaction contents must fail closed before preserve lock/prepare flow\n"
+  unless $prelock_preserve_window =~
+         /return\s+reject_after_binlog_export\s*\(\s*"unsupported_transaction_contents"\s*\)/s;
+die "temp-table no-redo undo preflight must fail closed before preserve lock/prepare flow\n"
+  unless $prelock_preserve_window =~
+         /temp_preflight_status\s*!=\s*Preserve_snapshot_status::OK[\s\S]*return\s+reject_after_binlog_export\s*\(\s*"temp_table_no_redo_undo_unsupported"\s*\)/s;
+
+$preserve =~ /bool no_cache_gtid_state_is_clean[\s\S]*?^}/m
+  or die "could not isolate no_cache_gtid_state_is_clean\n";
+my $no_cache_gtid = $&;
+die "no-cache GTID preserve must fail closed for GTID_NEXT_LIST ownership\n"
+  unless $no_cache_gtid =~ /get_gtid_next_list/s &&
+         $no_cache_gtid =~ /OWNED_SIDNO_GTID_SET/s;
+die "no-cache GTID preserve must require GTID_NEXT=AUTOMATIC\n"
+  unless $no_cache_gtid =~ /gtid_next\.type\s*!=\s*AUTOMATIC_GTID/s;
+my $gtid_next_list_ifdef_start = index($no_cache_gtid, '#ifdef HAVE_GTID_NEXT_LIST');
+my $gtid_next_list_ifdef_end =
+  $gtid_next_list_ifdef_start < 0 ? -1 :
+  index($no_cache_gtid, '#endif', $gtid_next_list_ifdef_start);
+my $owned_sidno_pos = index($no_cache_gtid, 'OWNED_SIDNO_GTID_SET');
+die "OWNED_SIDNO_GTID_SET rejection must not depend on HAVE_GTID_NEXT_LIST\n"
+  if $gtid_next_list_ifdef_start >= 0 && $gtid_next_list_ifdef_end >= 0 &&
+     $owned_sidno_pos > $gtid_next_list_ifdef_start &&
+     $owned_sidno_pos < $gtid_next_list_ifdef_end;
+
+$preserve =~ /bool preserve_snapshot_allows_gtid_restore[\s\S]*?^}/m
+  or die "could not isolate preserve_snapshot_allows_gtid_restore\n";
+my $gtid_restore_gate = $&;
+die "GTID restore gate must allow only LOGGED_WITH_CACHE snapshots with GTID metadata\n"
+  unless $gtid_restore_gate =~ /LOGGED_WITH_CACHE/s &&
+         $gtid_restore_gate =~ /!\s*metadata\.binlog_gtid_next\.empty/s;
+$preserve !~ /if\s*\(\s*!\s*record\.metadata\.binlog_gtid_next\.empty\s*\(\s*\)\s*\)\s*\{[\s\S]*?restore_logged_cache_gtid_next/s
+  or die "GTID restore call sites must use preserve_snapshot_allows_gtid_restore\n";
+
+$preserve =~ /Preserve_snapshot_metadata make_no_cache_metadata[\s\S]*?^}/m
+  or die "could not isolate make_no_cache_metadata\n";
+my $make_no_cache_metadata = $&;
+die "new no-cache metadata must clear GTID restore fields\n"
+  unless $make_no_cache_metadata =~ /metadata\.binlog_gtid_next\.clear\s*\(\s*\)/s &&
+         $make_no_cache_metadata =~ /metadata\.binlog_owned_gtid\.clear\s*\(\s*\)/s;
+die "new no-cache metadata must not serialize THD GTID_NEXT text\n"
+  if $make_no_cache_metadata =~ /gtid_next\.to_string|metadata\.binlog_gtid_next\.assign/s;
+
+$bundle =~ /std::vector<Preserve_snapshot_tlv> no_cache_tlvs[\s\S]*?^}/m
+  or die "could not isolate no_cache_tlvs\n";
+my $no_cache_tlvs = $&;
+die "new no-cache snapshots must not emit GTID restore metadata TLV\n"
+  if $no_cache_tlvs =~ /kTlvBinlogNoCacheMetadata/s;
+
+$preserve =~ /if\s*\(trx_preserve_export_read_view[\s\S]*?preserve_trx_reject_unsupported\s*\(\s*\)/m
+  or die "preserve flow must reject ReadView export failure before durable point\n";
+$trx_preserve =~ /dberr_t trx_preserve_export_read_view[\s\S]*?^}/m
+  or die "could not isolate trx_preserve_export_read_view\n";
+my $read_view_export = $&;
+die "ReadView export failure must have an injectable debug point\n"
+  unless $read_view_export =~ /preserve_trx_fail_export_read_view/s;
+die "ReadView export failure must fail closed\n"
+  unless $read_view_export =~ /preserve_trx_fail_export_read_view[\s\S]*return\s+DB_ERROR/s &&
+         $read_view_export =~ /preserve_export_view[\s\S]*return\s+DB_ERROR/s;
+$trx_preserve =~ /dberr_t trx_preserve_import_read_view[\s\S]*?^}/m
+  or die "could not isolate trx_preserve_import_read_view\n";
+my $read_view_import = $&;
+die "ReadView import must reject future system bounds before MVCC import\n"
+  unless $read_view_import =~ /trx_sys_get_next_trx_id_or_no/s &&
+         $read_view_import =~ /snapshot\.low_limit_no\s*>\s*next_trx_id_or_no/s &&
+         $read_view_import =~ /snapshot\.low_limit_id\s*>\s*next_trx_id_or_no/s;
+$trx_preserve =~ /static bool trx_preserve_parse_read_view_payload[\s\S]*?^}/m
+  or die "could not isolate trx_preserve_parse_read_view_payload\n";
+my $read_view_parse = $&;
+die "ReadView payload validation must reject zero low_limit_no\n"
+  unless $read_view_parse =~ /snapshot->low_limit_no\s*==\s*0/s;
+$bundle =~ /bool read_view_payload_is_valid[\s\S]*?^}/m
+  or die "could not isolate read_view_payload_is_valid\n";
+my $bundle_read_view_parse = $&;
+die "bundle ReadView payload validation must reject zero low_limit_no before writing durable snapshots\n"
+  unless $bundle_read_view_parse =~ /view_low_limit_no\s*==\s*0/s;
+
+$carrier_file =~ /bool write_tainted_marker[\s\S]*?^}/m
+  or die "could not isolate write_tainted_marker\n";
+my $taint_writer = $&;
+die "force recovery taint marker must have an injectable failure point\n"
+  unless $taint_writer =~ /preserve_trx_fail_write_tainted_marker/s;
+
+$preserve =~ /bool preserved_trx_recover_all[\s\S]*?if\s*\(srv_force_recovery\s*>\s*0\)[\s\S]*?files are retained and marked tainted[\s\S]*?return\s+false\s*;/m
+  or die "could not isolate force-recovery taint branch\n";
+my $force_taint_branch = $&;
+die "force recovery must fail closed when taint marker persistence fails\n"
+  unless $force_taint_branch =~ /taint_error/s &&
+         $force_taint_branch =~ /return\s+true\s*;/s;
+die "force recovery taint marker failure must retain snapshot evidence\n"
+  if $force_taint_branch =~ /remove_with_status\s*\(/s;
+
+my $preflight_pos = index($mysqld, 'preserved_trx_preflight_recoverability()');
+die "could not isolate startup preserve-trx preflight call\n"
+  if $preflight_pos < 0;
+my $preflight_window = substr($mysqld, $preflight_pos > 300 ? $preflight_pos - 300 : 0,
+                              800);
+die "startup preserve-trx preflight must run even when --skip-log-bin is used\n"
+  if $preflight_window =~ /\bopt_bin_log\b/s;
+
+$preserve =~ /Preserve_trx_command_block_result preserved_trx_protocol_command_block_result[\s\S]*?^}/m
+  or die "could not isolate preserved_trx_protocol_command_block_result\n";
+my $protocol_command_gate = $&;
+die "protocol command gate must block COM_FIELD_LIST and COM_REFRESH when drain is blocking lock-taking commands\n"
+  unless $protocol_command_gate =~ /preserve_trx_protocol_command_may_create_trx_or_lock/s &&
+         $preserve =~ /case\s+COM_FIELD_LIST\s*:/s &&
+         $preserve =~ /case\s+COM_REFRESH\s*:/s &&
+         $protocol_command_gate =~ /BLOCK_DRAINING/s;
+$sql_parse =~ /bool dispatch_command\(THD \*thd, const COM_DATA \*com_data,[\s\S]*?^}/m
+  or die "could not isolate dispatch_command\n";
+my $dispatch_command = $&;
+my $protocol_gate_pos =
+  index($dispatch_command, 'preserved_trx_protocol_command_block_result');
+my $dispatch_switch_pos = index($dispatch_command, 'switch (command)');
+die "dispatch_command must run preserve protocol command gate before the protocol switch\n"
+  unless $protocol_gate_pos >= 0 && $dispatch_switch_pos >= 0 &&
+         $protocol_gate_pos < $dispatch_switch_pos &&
+         $dispatch_command =~ /ER_PRESERVE_TRX_UNSUPPORTED/s &&
+         $dispatch_command =~ /ER_PRESERVE_TRX_SESSION_DRAINED/s;
+
+$preserve =~ /static bool recover_preserved_snapshot[\s\S]*?^}/m
+  or die "could not isolate recover_preserved_snapshot\n";
+my $recover_snapshot = $&;
+die "recovery must read durable snapshots through Preserved_trx_store\n"
+  unless $recover_snapshot =~ /create_preserved_trx_default_store/s &&
+         $recover_snapshot =~ /->read\s*\(/s;
+die "recovery must not load logged binlog cache payload while registering preserved snapshots\n"
+  unless $recover_snapshot =~ /store->read\s*\(\s*token\s*,\s*true\s*,[\s\S]*Payload_read_mode::METADATA_ONLY[\s\S]*&bundle\s*\)/s;
+die "recovery must rewrite recovered_count through Preserved_trx_store\n"
+  unless $recover_snapshot =~ /->rewrite_recovered_count\s*\(/s;
+my $recover_add_record_pos =
+  index($recover_snapshot, 'preserved_trx_add_record');
+my $recover_rewrite_count_pos =
+  index($recover_snapshot, '->rewrite_recovered_count');
+my $recover_claim_pos = index($recover_snapshot, 'trx_preserve_claim_prepared');
+die "recovery must rewrite durable recovered_count after claiming but before publishing the recovered record\n"
+  unless $recover_add_record_pos >= 0 && $recover_rewrite_count_pos >= 0 &&
+         $recover_claim_pos >= 0 &&
+         $recover_claim_pos < $recover_rewrite_count_pos &&
+         $recover_rewrite_count_pos < $recover_add_record_pos;
+die "recovery recovered_count rewrite failure must rollback the claimed transaction before registration\n"
+  unless $recover_snapshot =~
+         /rewrite_recovered_count[\s\S]*rollback_claimed_preserved_snapshot_or_log/s &&
+         $recover_snapshot !~ /rewrite_recovered_count[\s\S]*preserved_trx_add_record[\s\S]*preserved_trx_update_record_last_error/s;
+die "recovery must not call legacy raw snapshot read/rewrite helpers\n"
+  if $recover_snapshot =~ /preserved_trx_read_snapshot|read_snapshot_with_identity_check|rewrite_snapshot_recovered_count/s;
+die "recovery max-count cleanup must leave a FAILED observable P_S record\n"
+  unless $recover_snapshot =~
+         /metadata\.recovered_count\s*>=\s*preserve_trx_recovery_max_count[\s\S]*?preserved_trx_add_failed_observable_record\s*\(\s*metadata\s*,\s*"recovery max count exceeded"\s*\)[\s\S]*?rollback_preserved_snapshot_or_log/s;
+die "recovery timeout cleanup must leave a FAILED observable P_S record\n"
+  unless $recover_snapshot =~
+         /if\s*\(\s*recovery_deadline_expired\s*\)[\s\S]*?preserved_trx_add_failed_observable_record\s*\(\s*metadata\s*,\s*"recovery timeout expired"\s*\)[\s\S]*?rollback_preserved_snapshot_or_log/s;
+
+die "recovered-count offset must not be duplicated in carrier\n"
+  if $carrier =~ /kRecoveredCountOffset\s*=/;
+die "carrier recovered-count rewrite must use bundle-owned header offset\n"
+  unless $carrier =~ /preserve_trx_bundle_recovered_count_offset\s*\(\s*\)/s;
+
+$carrier_file =~ /bool create_key[\s\S]*?^}/m
+  or die "could not isolate create_key\n";
+my $carrier_create_key = $&;
+die "carrier key tmp creation must use O_CREAT and O_EXCL\n"
+  unless $carrier_create_key =~ /my_create\s*\([^;]*O_CREAT[^;]*O_EXCL/s;
+die "carrier key tmp creation must reject preexisting tmp symlinks\n"
+  unless $carrier_create_key =~ /path_is_symlink\s*\(\s*tmp_path\s*\)/s;
+
+$bundle =~ /Preserve_snapshot_status encode_preserved_trx_bundle[\s\S]*?^}/m
+  or die "could not isolate encode_preserved_trx_bundle\n";
+my $snapshot_encode = $&;
+die "snapshot encode must reject empty runtime server_uuid before durable write\n"
+  unless $snapshot_encode =~ /context\.server_uuid\.empty\s*\(\s*\)[\s\S]*?Preserve_snapshot_status::INVALID_ARGUMENT/s;
+
+$bundle =~ /Preserve_snapshot_status decode_preserved_trx_snapshot_bytes[\s\S]*?^}/m
+  or die "could not isolate decode_preserved_trx_snapshot_bytes\n";
+my $snapshot_decode = $&;
+die "snapshot identity validation must reject empty runtime server_uuid\n"
+  unless $snapshot_decode =~ /context\.server_uuid\.empty\s*\(\s*\)[\s\S]*?Preserve_snapshot_status::CORRUPT/s;
+die "snapshot identity validation must compare runtime server_uuid unconditionally after empty check\n"
+  unless $snapshot_decode =~ /read_fixed_string\s*\([^;]*kServerUuidOffset[\s\S]*!=\s*context\.server_uuid/s;
+
+$drain =~ /Preserve_trx_drain_orchestrator::observations[\s\S]*?^}/m
+  or die "drain orchestrator must expose participant observations\n";
+my $drain_observations = $&;
+die "drain orchestrator observations must read every participant observation\n"
+  unless $drain_observations =~ /participant->observation\s*\(\s*\)/s;
+
+$preserve =~ /static void log_preserve_trx_drain_participant_observations[\s\S]*?^}/m
+  or die "drain participant observations must be emitted to production logs\n";
+my $drain_observation_logger = $&;
+die "drain participant observation log must include state and bytes fields\n"
+  unless $drain_observation_logger =~ /state=/s &&
+         $drain_observation_logger =~ /bytes_used=/s &&
+         $drain_observation_logger =~ /bytes_budget=/s &&
+         $drain_observation_logger =~ /failure_reason=/s;
+
+$preserve =~ /bool Preserve_trx_drain_service::execute[\s\S]*?^}/m
+  or die "could not isolate DRAIN service implementation\n";
+my $drain_execute = $&;
+die "DRAIN abort paths must consume participant observations\n"
+  unless $drain_execute =~ /abort_drain_participants[\s\S]*log_preserve_trx_drain_participant_observations/s;
+die "DRAIN finalize path must consume participant observations\n"
+  unless $drain_execute =~ /finalize_drain_participants[\s\S]*log_preserve_trx_drain_participant_observations/s;
+my $drain_execute_without_observation_helpers = $drain_execute;
+$drain_execute_without_observation_helpers =~
+  s/auto abort_drain_participants = \[\&\]\(const char \*stage\) \{[\s\S]*?\n  \};\n\n//s
+  or die "could not remove DRAIN abort observation helper\n";
+$drain_execute_without_observation_helpers =~
+  s/auto finalize_drain_participants = \[\&\]\(const char \*stage\) \{[\s\S]*?\n  \};\n\n//s
+  or die "could not remove DRAIN finalize observation helper\n";
+die "DRAIN service must not bypass observation helpers for participant abort/finalize\n"
+  if $drain_execute_without_observation_helpers =~
+     /drain_orchestrator\.(?:abort_participants|finalize_participants)\s*\(/s;
+
+$preserve =~ /bool Sql_cmd_drain_transactions_preserve::execute[\s\S]*?^}/m
+  or die "could not isolate DRAIN SQL command execute\n";
+my $drain_sql_execute = $&;
+die "DRAIN SQL command must delegate to Preserve_trx_drain_service\n"
+  unless $drain_sql_execute =~ /Preserve_trx_drain_service\s+service/s &&
+         $drain_sql_execute =~ /service\.execute\s*\(/s;
+die "DRAIN SQL command must not directly run target enumeration or shutdown\n"
+  if $drain_sql_execute =~
+     /Global_THD_manager|Preserve_batch_|Warmcopy_batch_|shutdown\s*\(/s;
+
+$preserve =~ /bool preserved_trx_preflight_recoverability[\s\S]*?^}/m
+  or die "could not isolate preserved_trx_preflight_recoverability\n";
+my $preflight_recovery = $&;
+die "recovery preflight must list snapshots through Preserved_trx_store\n"
+  unless $preflight_recovery =~ /create_preserved_trx_default_store/s &&
+         $preflight_recovery =~ /->list_tokens\s*\(/s &&
+         $preflight_recovery =~ /->read\s*\(/s;
+die "recovery preflight must read snapshot-only so sidecar corruption is handled by recovery proper\n"
+  unless $preflight_recovery =~ /Payload_read_mode::SNAPSHOT_ONLY/s;
+die "recovery preflight must fail fast on unreadable durable snapshots\n"
+  unless $preflight_recovery =~
+         /status\s*!=\s*Preserve_snapshot_status::OK[\s\S]*?return\s+log_preserved_trx_recovery_failure/s;
+die "recovery preflight must not directly scan local files\n"
+  if $preflight_recovery =~ /\bmy_dir\s*\(/s;
+
+$preserve =~ /bool preserved_trx_recover_all[\s\S]*?^}/m
+  or die "could not isolate preserved_trx_recover_all\n";
+my $recover_all = $&;
+die "recover_all must list snapshots through Preserved_trx_store\n"
+  unless $recover_all =~ /create_preserved_trx_default_store/s &&
+         $recover_all =~ /->list_tokens\s*\(/s;
+die "recover_all must mark force-recovery taint through Preserved_trx_store\n"
+  unless $recover_all =~ /->mark_tainted\s*\(/s;
+die "recover_all must remove taint markers through Preserved_trx_store\n"
+  unless $recover_all =~ /->remove_taint\s*\(/s;
+die "recover_all must not directly scan local files\n"
+  if $recover_all =~ /\bmy_dir\s*\(/s;
+
+$ha_innodb =~ /if\s*\(srv_force_recovery\s*>=\s*SRV_FORCE_NO_BACKGROUND\)[\s\S]*?return\s*;/m
+  or die "could not isolate InnoDB force-recovery branch\n";
+my $ha_force_branch = $&;
+die "InnoDB force-recovery startup must not ignore preserved-trx recovery errors\n"
+  unless $ha_force_branch =~ /preserved_trx_recover_all\s*\(\s*\)/s &&
+         $ha_force_branch =~ /fatal/s;
+
+die "snapshot compatibility wrapper definitions or calls must not remain public in preserve_trx.h\n"
+  if $preserve_header =~
+     /\bpreserved_trx_(write_snapshot|read_snapshot|delete_snapshot_files)\s*\(/s;
+die "preserve_trx.h must not expose the local-file carrier implementation\n"
+  if $preserve_header =~ /preserve_trx_carrier_file\.h|Local_file_preserved_trx_carrier/s;
+die "SQL orchestration must not include the local-file carrier implementation\n"
+  if $preserve =~ /preserve_trx_carrier_file\.h/s;
+die "snapshot compatibility wrapper definitions or calls must be removed from SQL orchestration\n"
+  if $preserve =~
+     /\bpreserved_trx_(write_snapshot|read_snapshot|delete_snapshot_files)\s*\(/s;
+die "legacy identity-check snapshot wrapper must be removed from SQL orchestration\n"
+  if $preserve =~ /\bread_snapshot_with_identity_check\s*\(/s;
+die "legacy recovered-count rewrite wrapper must be removed from SQL orchestration\n"
+  if $preserve =~ /\brewrite_snapshot_recovered_count\s*\(/s;
+die "SQL orchestration must not instantiate the local-file carrier directly\n"
+  if $preserve =~ /Local_file_preserved_trx_carrier/s;
+die "legacy local-file snapshot byte decoder must be removed from SQL orchestration\n"
+  if $preserve =~ /\bvalidate_snapshot_bytes\s*\(/s;
+die "legacy local-file binlog-cache sidecar validator must be removed from SQL orchestration\n"
+  if $preserve =~ /\bvalidate_external_binlog_cache\s*\(/s;
+die "preserve-trx gunit must use Store/codec/carrier APIs instead of snapshot wrappers\n"
+  if $gunit =~
+     /\bpreserved_trx_(write_snapshot|read_snapshot|delete_snapshot_files)\s*\(/s;
+
+$preserve =~ /static bool restore_batch_record_to_original_thd[\s\S]*?^}/m
+  or die "could not isolate restore_batch_record_to_original_thd\n";
+my $batch_restore = $&;
+die "batch cleanup must lazy-load logged binlog cache payload through the store path\n"
+  unless $batch_restore =~ /hydrate_logged_binlog_cache_payload_if_needed/s;
+die "batch cleanup must not read local snapshot files directly\n"
+  if $batch_restore =~ /read_snapshot_with_identity_check|preserved_trx_read_snapshot|Local_file_preserved_trx_carrier/s;
+my $batch_restore_activate_pos =
+  index($batch_restore, 'trx_preserve_activate_reattached_in_original_thd');
+my $batch_restore_delete_pos =
+  index($batch_restore, 'delete_snapshot_files_with_status');
+die "batch cleanup must activate reattached undo state before deleting the durable snapshot\n"
+  unless $batch_restore_activate_pos >= 0 &&
+         $batch_restore_delete_pos >= 0 &&
+         $batch_restore_activate_pos < $batch_restore_delete_pos;
+
+$preserve =~ /bool hydrate_logged_binlog_cache_payload_if_needed[\s\S]*?^}/m
+  or die "could not isolate hydrate_logged_binlog_cache_payload_if_needed\n";
+my $hydrate_cache_payload = $&;
+die "logged binlog-cache hydration must use the default store factory\n"
+  unless $hydrate_cache_payload =~ /create_preserved_trx_default_store/s &&
+         $hydrate_cache_payload =~ /->read\s*\(/s;
+die "logged binlog-cache hydration must validate the hydrated token against registered metadata\n"
+  unless $hydrate_cache_payload =~ /bundle\.metadata\.token\s*!=\s*record->metadata\.token/s;
+die "logged binlog-cache hydration must validate the hydrated payload digest metadata\n"
+  unless $hydrate_cache_payload =~ /blob_descriptors/s &&
+         $preserve =~
+         /bool preserved_trx_blob_descriptors_equal[\s\S]*right->digest\s*!=\s*left\.digest/s;
+
+$preserve =~ /static Preserve_snapshot_delete_status delete_snapshot_files_with_status[\s\S]*?^}/m
+  or die "could not isolate delete_snapshot_files_with_status\n";
+my $delete_snapshot = $&;
+die "snapshot deletion must use the default store factory\n"
+  unless $delete_snapshot =~ /create_preserved_trx_default_store/s &&
+         $delete_snapshot =~ /->remove_with_status\s*\(/s;
+die "SQL orchestration must not keep token-only direct temp sidecar cleanup helper\n"
+  if $preserve =~ /delete_preserved_temp_table_sidecars_by_token_or_log/s;
+
+$preserve =~ /bool Sql_cmd_drain_transactions_preserve::execute[\s\S]*?^}/m
+  or die "could not isolate Sql_cmd_drain_transactions_preserve::execute\n";
+my $drain_sql_entry = $&;
+die "DRAIN SQL entry must delegate to a command facade with parsed options only\n"
+  unless $drain_sql_entry =~
+         /Preserve_trx_drain_request\s+request\s*\{\s*m_options\s*\}/s &&
+         $drain_sql_entry =~ /Preserve_trx_drain_service\s+service/s &&
+         $drain_sql_entry =~ /return\s+service\.execute\s*\(\s*thd\s*,\s*request\s*\)/s;
+die "DRAIN SQL entry must not directly own warm-copy, target enumeration, preserve kernel, or shutdown details\n"
+  if $drain_sql_entry =~
+     /Warmcopy|Preserve_batch_|Global_THD_manager|Preserve_trx_manager_state_guard|preserve_trx_preserve_attached_transaction|preserve_trx_execute_drain_transactions_preserve|shutdown\s*\(/s;
+
+$preserve =~ /bool Preserve_trx_drain_service::execute[\s\S]*?^}/m
+  or die "could not isolate Preserve_trx_drain_service::execute\n";
+my $drain_service_impl = $&;
+die "DRAIN service must route drain participant phases through DrainOrchestrator\n"
+  unless $drain_service_impl =~ /Preserve_trx_drain_orchestrator/s;
+die "DRAIN service must adapt warm-copy through DrainParticipant\n"
+  unless $drain_service_impl =~ /Warmcopy_batch_drain_participant/s;
+die "DRAIN service must not directly open warm-copy epochs\n"
+  if $drain_service_impl =~ /\bopen_epoch\s*\(/s;
+die "DRAIN service must not directly begin warm-copy closing\n"
+  if $drain_service_impl =~ /\bbegin_closing\s*\(/s;
+die "DRAIN service must not directly prepare warm-copy payloads\n"
+  if $drain_service_impl =~
+     /Warmcopy_prepare_idle_participants|Warmcopy_prepare_quiesced_targets|Warmcopy_tail_budget_validator|Warmcopy_open_admission_scope|Warmcopy_batch_blob_provider/s;
+
+$preserve =~ /class Warmcopy_batch_drain_participant[\s\S]*?^};/m
+  or die "could not isolate Warmcopy_batch_drain_participant\n";
+my $warmcopy_participant = $&;
+die "warm-copy drain participant must expose artifact/budget/progress observation\n"
+  unless $warmcopy_participant =~ /observation\s*\(\s*\)\s+const\s+override/s &&
+         $warmcopy_participant =~ /Preserve_trx_drain_participant_observation\s+m_observation/s &&
+         $warmcopy_participant =~ /bytes_budget\s*=\s*preserve_trx_warmcopy_max_total_bytes/s &&
+         $warmcopy_participant =~ /bytes_used\s*=\s*m_provider->total_bytes\s*\(\s*\)/s &&
+         $warmcopy_participant =~ /phase1_progress/s &&
+         $warmcopy_participant =~ /failure_reason/s;
+die "warm-copy drain participant must report ready, degraded, abandoned, and finalized states\n"
+  unless $warmcopy_participant =~ /Preserve_trx_drain_participant_state::READY/s &&
+         $warmcopy_participant =~ /Preserve_trx_drain_participant_state::DEGRADED/s &&
+         $warmcopy_participant =~ /Preserve_trx_drain_participant_state::ABANDONED/s &&
+         $warmcopy_participant =~ /Preserve_trx_drain_participant_state::FINALIZED/s;
+die "warm-copy participant must preserve concrete quiesced-target failure reason\n"
+  unless $warmcopy_participant =~
+         /prepare_quiesced_targets[\s\S]*mark_degraded\s*\(\s*"warm-copy quiesced target preparation failed"/s;
+die "warm-copy participant must preserve concrete tail-budget failure reason\n"
+  unless $warmcopy_participant =~
+         /tail_budget_within_limits[\s\S]*mark_degraded\s*\(\s*"warm-copy tail budget exceeded"/s;
+$warmcopy_participant =~ /void abort_phase\(\)[\s\S]*?^\s*}\n\n\s*void finalize_phase/m
+  or die "could not isolate Warmcopy_batch_drain_participant::abort_phase\n";
+my $warmcopy_participant_abort = $&;
+die "warm-copy abort must not clear last observed bytes after a degraded failure\n"
+  if $warmcopy_participant_abort =~ /bytes_used\s*=\s*0/s;
+
+my $preserve_attached_start =
+  index($preserve, 'bool preserve_trx_preserve_attached_transaction(');
+die "could not isolate preserve_trx_preserve_attached_transaction\n"
+  if $preserve_attached_start < 0;
+my $preserve_attached_end =
+  index($preserve, 'static const char *preserve_trx_drain_participant_state_name',
+        $preserve_attached_start);
+die "could not find preserve_trx_preserve_attached_transaction end\n"
+  if $preserve_attached_end < 0;
+my $preserve_attached =
+  substr($preserve, $preserve_attached_start,
+         $preserve_attached_end - $preserve_attached_start);
+die "preserve public helper must route object construction through kernel\n"
+  unless $preserve_attached =~ /Preserve_trx_kernel_request\s+request/s &&
+         $preserve_attached =~ /preserve_trx_kernel_preserve_attached_transaction\s*\(\s*request\s*\)/s;
+die "preserve public helper must not directly export objects or write snapshots\n"
+  if $preserve_attached =~
+     /create_preserved_trx_default_store|build_preserved_trx_bundle|trx_preserve_export_record_locks|trx_preserve_export_table_locks|trx_preserve_export_read_view/s;
+die "preserve public helper must own client token delivery after kernel success\n"
+  unless $preserve_attached =~ /preserved_trx_register_pending_token_delivery/s &&
+         $preserve_attached =~ /\bmy_ok\s*\(/s;
+
+my $preserve_kernel_start =
+  index($preserve, 'bool preserve_trx_kernel_preserve_attached_transaction(');
+die "could not isolate preserve_trx_kernel_preserve_attached_transaction\n"
+  if $preserve_kernel_start < 0;
+my $preserve_kernel_end =
+  index($preserve, 'bool preserve_trx_preserve_attached_transaction(',
+        $preserve_kernel_start);
+die "could not find preserve_trx_kernel_preserve_attached_transaction end\n"
+  if $preserve_kernel_end < 0;
+my $preserve_kernel =
+  substr($preserve, $preserve_kernel_start,
+         $preserve_kernel_end - $preserve_kernel_start);
+die "preserve kernel path must write snapshots through the default store factory until store/carrier slice splits it\n"
+  unless $preserve_kernel =~ /create_preserved_trx_default_store/s &&
+         $preserve_kernel =~ /->write\s*\(/s;
+die "preserve kernel must not send client OK packets\n"
+  if $preserve_kernel =~ /\bmy_ok\s*\(/s;
+die "preserve kernel must not register pending token delivery\n"
+  if $preserve_kernel =~ /preserved_trx_register_pending_token_delivery/s;
+
+$preserve =~ /class Preserve_batch_quiesced_idle_target[\s\S]*?^};/m
+  or die "could not isolate Preserve_batch_quiesced_idle_target\n";
+my $quiesced_target = $&;
+die "batch target early errors must clear QUIESCED/ATTACHING state\n"
+  unless $quiesced_target =~ /clear_target_after_error/s &&
+         $quiesced_target =~ /preserve_trx_is_unsupported_common_context\(candidate\)[\s\S]*clear_target_after_error\(candidate\)[\s\S]*return/s &&
+         $quiesced_target =~ /!switch_thd\.active\(\)[\s\S]*clear_target_after_error\(candidate\)[\s\S]*return/s;
+
+my $switch_pos = index($quiesced_target, 'Preserve_thd_context_switch switch_thd');
+die "could not find batch target context-switch scope\n" if $switch_pos < 0;
+my $scope_start = rindex(substr($quiesced_target, 0, $switch_pos), '{');
+die "could not find batch target context-switch scope start\n"
+  if $scope_start < 0;
+my $depth = 0;
+my $scope_end = -1;
+for my $idx ($scope_start .. length($quiesced_target) - 1) {
+  my $ch = substr($quiesced_target, $idx, 1);
+  ++$depth if $ch eq '{';
+  --$depth if $ch eq '}';
+  if ($idx > $scope_start && $depth == 0) {
+    $scope_end = $idx;
+    last;
+  }
+}
+die "could not find batch target context-switch scope end\n" if $scope_end < 0;
+my $switch_scope = substr($quiesced_target, $scope_start, $scope_end - $scope_start + 1);
+die "batch target must not clear state while THD globals are switched\n"
+  if $switch_scope =~ /clear_target_after_error\s*\(/s;
+die "batch target ATTACHING failures must defer state clear until after globals restore\n"
+  unless $switch_scope =~ /!switch_thd\.active\(\)[\s\S]*early_target_error\s*=\s*true/s &&
+         $switch_scope =~ /preserve_trx_is_unsupported_common_context\(candidate\)[\s\S]*early_target_error\s*=\s*true/s;
+my $after_switch_scope = substr($quiesced_target, $scope_end + 1);
+die "batch target deferred ATTACHING failures must clear after context-switch scope\n"
+  unless $after_switch_scope =~ /if\s*\(\s*early_target_error\s*\)[\s\S]*clear_target_after_error\s*\(\s*candidate\s*\)[\s\S]*return/s;
+
+$preserve =~ /void audit_preserved_trx_event[\s\S]*?^}/m
+  or die "could not isolate audit_preserved_trx_event\n";
+my $audit_helper = $&;
+die "preserve-trx audit helper must emit MYSQL_AUDIT_MESSAGE_INTERNAL events\n"
+  unless $audit_helper =~ /MYSQL_AUDIT_MESSAGE_INTERNAL/s &&
+         $audit_helper =~ /preserved_transaction/s;
+die "preserve-trx audit helper must redact tokens before audit emission\n"
+  unless $audit_helper =~ /preserved_trx_redacted_token/s;
+die "preserve-trx audit helper must include action, token, and result fields\n"
+  unless $audit_helper =~ /"action"/s &&
+         $audit_helper =~ /"token"/s &&
+         $audit_helper =~ /"result"/s;
+die "preserve-trx audit helper must allow null THD global dispatch for startup recovery\n"
+  if $audit_helper =~ /thd\s*==\s*nullptr[\s\S]*return/s;
+
+$preserve =~ /void preserved_trx_finalize_statement_response[\s\S]*?^}/m
+  or die "could not isolate preserved_trx_finalize_statement_response\n";
+my $token_delivery_finalization = $&;
+die "successful live PRESERVE token delivery must emit an audit event\n"
+  unless $token_delivery_finalization =~
+         /audit_preserved_trx_event\s*\(\s*thd\s*,\s*token\s*,\s*"preserve"\s*,\s*"success"\s*\)/s;
+
+die "batch preserve target success must emit an audit event\n"
+  unless $preserve =~
+         /batch_delivery[\s\S]*?audit_preserved_trx_event\s*\(\s*thd\s*,\s*token\s*,\s*"preserve"\s*,\s*"success"\s*\)/s;
+die "manager state and drain owner must be published as one packed snapshot\n"
+  unless $preserve =~ /std::atomic<uint64_t>\s+g_manager_state_owner/s &&
+         $preserve =~ /preserve_trx_manager_state_owner_snapshot/s;
+die "manager state and drain owner must not use legacy split atomics\n"
+  if $preserve =~ /std::atomic<Preserve_trx_manager_state>\s+g_manager_state/s ||
+     $preserve =~ /std::atomic<my_thread_id>\s+g_draining_thread_id/s;
+die "batch cleanup failure must not publish ownerless SHUTDOWN_REQUESTED state\n"
+  if $preserve =~
+     /g_draining_thread_id\.store\s*\(\s*0\s*\)[\s\S]*g_manager_state\.store\s*\(\s*Preserve_trx_manager_state::SHUTDOWN_REQUESTED\s*\)/s;
+$preserve =~ /auto finish_cleanup_failure_without_shutdown = \[\&\]\(const char \*stage\) \{([\s\S]*?)^\s*\};/m
+  or die "could not isolate batch cleanup failure no-shutdown helper\n";
+my $batch_cleanup_failure_no_shutdown = $1;
+die "batch cleanup failure helper must not call shutdown\n"
+  if $batch_cleanup_failure_no_shutdown =~ /shutdown\s*\(/s;
+die "batch cleanup failure helper must clear non-preserved targets, abort participants, and return cleanup-failed error\n"
+  unless $batch_cleanup_failure_no_shutdown =~ /Preserve_batch_clear_generation/s &&
+         $batch_cleanup_failure_no_shutdown =~ /abort_drain_participants\s*\(\s*stage\s*\)/s &&
+         $batch_cleanup_failure_no_shutdown =~ /preserve_trx_reject_batch_cleanup_failed\s*\(\s*\)/s;
+die "batch cleanup failure must use a dedicated client error\n"
+  unless $preserve =~ /ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED/s;
+$preserve =~ /DEBUG_SYNC\s*\(\s*thd\s*,\s*"preserve_trx_batch_after_targets_quiesced_before_attach"\s*\)([\s\S]*?)Preserve_batch_quiesced_idle_target\s+batch/m
+  or die "batch drain must expose a pre-attach sync point after targets are quiesced\n";
+die "pre-attach sync point must be before target context-switch attach loop\n"
+  if $& =~ /preserve_trx_preserve_attached_transaction/s;
+$preserve =~ /void reset_thd_after_preserve_detach\(THD \*thd\)([\s\S]*?)^}/m
+  or die "could not isolate reset_thd_after_preserve_detach\n";
+my $reset_after_detach = $1;
+die "preserve detach reset must end the THD PSI transaction before clearing its handle\n"
+  unless $reset_after_detach =~ /MYSQL_ROLLBACK_TRANSACTION\s*\(\s*thd->m_transaction_psi\s*\)[\s\S]*thd->m_transaction_psi\s*=\s*nullptr/s;
+die "batch reattach activation failure must not leave an active transaction attached\n"
+  unless $preserve =~
+         /trx_preserve_activate_reattached_in_original_thd[\s\S]*restore_record_after_failure/s &&
+         $preserve =~
+         /static bool restore_batch_record_to_original_thd[\s\S]*if\s*\(attached\)[\s\S]*trx_preserve_detach_resumed_from_thd/s;
+
+$preserve =~ /static bool restore_batch_record_to_original_thd[\s\S]*?^}/m
+  or die "could not isolate restore_batch_record_to_original_thd for WI-29\n";
+my $wi29_batch_restore = $&;
+die "batch reattach attached-detach failure must restore token or terminate after publishing failure\n"
+  if $wi29_batch_restore =~
+     /else\s*\{\s*thd_state_guard\.dismiss\s*\(\s*\)\s*;\s*return true\s*;\s*\}/s;
+die "batch restore delete-before-unlink cleanup failure after activation must taint the stale snapshot\n"
+  unless $wi29_batch_restore =~
+         /ERROR_BEFORE_SNAPSHOT_DELETE[\s\S]*mark_tainted\s*\(\s*item\.token\s*\)/s;
+die "batch restore delete-after-unlink cleanup failure must clear the target batch state\n"
+  unless $wi29_batch_restore =~
+         /ERROR_AFTER_SNAPSHOT_DELETE[\s\S]*preserve_trx_set_batch_state\s*\(\s*thd\s*,\s*0\s*,\s*Preserve_trx_batch_thd_state::NONE\s*\)/s;
+
+$preserve =~ /static bool reattach_current_batch_preserve_failure_to_original_thd[\s\S]*?^}/m
+  or die "could not isolate reattach_current_batch_preserve_failure_to_original_thd for WI-29\n";
+my $wi29_current_reattach = $&;
+my $wi29_current_delete_pos =
+  index($wi29_current_reattach, 'delete_snapshot_after_activation();');
+my $wi29_current_activate_pos =
+  index($wi29_current_reattach, 'trx_preserve_activate_reattached_in_original_thd');
+die "current batch cleanup must activate reattached undo state before durable snapshot delete\n"
+  unless $wi29_current_delete_pos >= 0 && $wi29_current_activate_pos >= 0 &&
+         $wi29_current_activate_pos < $wi29_current_delete_pos;
+die "current batch cleanup snapshot delete-before-unlink failure after activation must taint the stale snapshot\n"
+  unless $wi29_current_reattach =~
+         /ERROR_BEFORE_SNAPSHOT_DELETE[\s\S]*mark_tainted\s*\(\s*token\s*\)/s;
+die "current batch cleanup snapshot delete-before-unlink failure must restore SQL transaction state before returning to the app session\n"
+  unless $wi29_current_reattach =~
+         /ERROR_BEFORE_SNAPSHOT_DELETE[\s\S]*mark_tainted\s*\(\s*token\s*\)[\s\S]*reset_preserve_xid_to_active_transaction_xid\s*\(\s*thd\s*\)[\s\S]*preserve_trx_set_batch_state\s*\(\s*thd\s*,\s*0\s*,\s*Preserve_trx_batch_thd_state::NONE\s*\)/s;
+die "current batch cleanup snapshot delete-after-unlink failure must not keep the target drained\n"
+  unless $preserve =~
+         /restored_active_to_original_thd[\s\S]*unresolved_detached_state[\s\S]*must_keep_target_drained\s*=\s*!m_error\s*\|\|\s*unresolved_detached_state/s;
+die "current batch reattach activation failure must detach before caller rollback cleanup\n"
+  unless $wi29_current_reattach =~
+         /trx_preserve_activate_reattached_in_original_thd[\s\S]*!=\s*DB_SUCCESS[\s\S]*trx_preserve_detach_resumed_from_thd_for_cleanup/s;
+die "batch target post-detach heuristic must recognize completed rollback cleanup\n"
+  unless $preserve =~
+         /cleanup_completed_after_detach_failure[\s\S]*durable_point_crossed/s &&
+         $preserve =~
+         /cleanup_completed_after_detach_failure[\s\S]*must_keep_target_drained/s;
+die "batch post-detach rollback cleanup must publish a completed-cleanup result\n"
+  unless $preserve =~
+         /rollback_claimed_after_detach_failure[\s\S]*cleanup_completed_after_detach_failure[\s\S]*rollback_status\s*==\s*DB_SUCCESS/s;
+die "WI-29 runtime MTR must have a post-detach batch reattach failpoint\n"
+  unless $preserve =~ /preserve_trx_fail_after_detach_for_batch_reattach/s &&
+         $trx_preserve =~ /preserve_trx_fail_activate_reattached_original/s;
+die "Slice 2 local carrier must expose crash hook before snapshot .bin rename\n"
+  unless $carrier_file =~
+         /snapshot_file[\s\S]*preserve_trx_crash_before_snapshot_rename[\s\S]*install_temp_file/s;
+die "recovered-count rewrite must remove stale snapshot temp files before atomic replacement\n"
+  unless $carrier_file =~
+         /rewrite_existing[\s\S]*remove_stale_tmp_before_create[\s\S]*atomic_write_file\s*\([^;]*remove_stale_tmp_before_create/s;
+$carrier_file =~ /Preserve_snapshot_delete_status remove_stale_tmp_files_for_token[\s\S]*?^}/m
+  or die "could not isolate remove_stale_tmp_files_for_token\n";
+my $stale_tmp_cleanup = $&;
+die "stale tmp cleanup must delete only tmp snapshot and sidecar artifacts\n"
+  unless $stale_tmp_cleanup =~ /token\s*\+\s*"\.bin\.tmp"/s &&
+         $stale_tmp_cleanup =~ /token\s*\+\s*"\.binlog_cache\.tmp"/s &&
+         $stale_tmp_cleanup =~ /token\s*\+\s*"\.tainted\.tmp"/s &&
+         $stale_tmp_cleanup =~ /remove_generic_external_blobs_for_token\s*\(\s*dir\s*,\s*token\s*,\s*true\s*,\s*false/s &&
+         $stale_tmp_cleanup =~ /remove_temp_sidecars_for_token[\s\S]*Temp_sidecar_removal_mode::NON_COMMITTED_ARTIFACTS/s &&
+         $stale_tmp_cleanup !~ /remove_generic_external_blobs_for_token\s*\(\s*dir\s*,\s*token\s*,\s*false\s*,\s*true/s &&
+         $stale_tmp_cleanup !~ /Temp_sidecar_removal_mode::ALL/s;
+$carrier_file =~ /Preserve_snapshot_delete_status delete_snapshot_files_with_status[\s\S]*?^}/m
+  or die "could not isolate local carrier delete_snapshot_files_with_status\n";
+my $carrier_delete_snapshot = $&;
+my $install_temp_file_start =
+  index($carrier_file, 'Atomic_write_status install_temp_file');
+my $install_temp_file_end =
+  index($carrier_file, 'Atomic_write_status atomic_write_file',
+        $install_temp_file_start);
+die "could not isolate install_temp_file\n"
+  if $install_temp_file_start < 0 || $install_temp_file_end < 0 ||
+     $install_temp_file_end <= $install_temp_file_start;
+my $install_temp_file =
+  substr($carrier_file, $install_temp_file_start,
+         $install_temp_file_end - $install_temp_file_start);
+my $link_success_start =
+  index($install_temp_file,
+        'if (link(tmp_path.c_str(), final_path.c_str()) == 0)');
+my $link_success_end =
+  index($install_temp_file, 'set_my_errno(errno);', $link_success_start);
+die "could not isolate install_temp_file link-success branch\n"
+  if $link_success_start < 0 || $link_success_end < 0 ||
+     $link_success_end <= $link_success_start;
+my $link_success_branch =
+  substr($install_temp_file, $link_success_start,
+         $link_success_end - $link_success_start);
+die "install_temp_file must treat link-success tmp cleanup failure as a stale-artifact cleanup issue, not an untracked final-file failure\n"
+  unless $link_success_branch =~
+         /my_delete\s*\(tmp_path\.c_str\(\)[\s\S]*return\s+Atomic_write_status::OK/s &&
+         $link_success_branch !~ /Atomic_write_status::IO_ERROR/s;
+my $snapshot_unlink_pos =
+  index($carrier_delete_snapshot, 'my_delete(snapshot_path.c_str()');
+my $binlog_delete_pos =
+  index($carrier_delete_snapshot, 'delete_optional_sidecar(binlog_cache_path)');
+my $stale_tmp_call_pos =
+  index($carrier_delete_snapshot, 'remove_stale_tmp_files_for_token');
+my $temp_all_pos =
+  index($carrier_delete_snapshot, 'Temp_sidecar_removal_mode::ALL');
+die "Slice 2 stale tmp artifacts should be cleaned before main snapshot unlink\n"
+  unless $stale_tmp_call_pos >= 0 &&
+         $snapshot_unlink_pos >= 0 &&
+         $stale_tmp_call_pos < $snapshot_unlink_pos;
+die "Slice 2 committed sidecars must not be deleted before the main snapshot unlink barrier\n"
+  unless $temp_all_pos > $snapshot_unlink_pos &&
+         $binlog_delete_pos > $snapshot_unlink_pos &&
+         $binlog_delete_pos < $temp_all_pos;
+die "Slice 2 SQL success cleanup must not directly delete temp-table sidecars after store removal\n"
+  unless $delete_snapshot !~
+         /preserve_trx_temp_table_remove_token_sidecars/s;
+die "Slice 2 snapshot-failure cleanup must use unified token removal, not direct temp sidecar deletion\n"
+  unless $preserve =~
+         /reject_after_snapshot_failure[\s\S]*delete_preserved_snapshot_files_and_sidecars_or_log\s*\(\s*preserve_trx_default_dir\(\)\s*,\s*token\s*,\s*&metadata\s*\)/s &&
+         $preserve =~
+         /reject_after_snapshot_failure[\s\S]*store->mark_tainted\s*\(\s*token\s*\)/s &&
+         $preserve !~
+         /reject_after_snapshot_failure[\s\S]*write_failure_delete_status\s*==\s*Preserve_snapshot_delete_status::OK[\s\S]*delete_snapshot_files/s &&
+         $preserve !~
+         /reject_after_snapshot_failure[\s\S]*delete_preserved_temp_table_sidecars_by_token_or_log/s;
+die "Slice 2 bootstrap temp orphan cleanup must route through Preserved_trx_store remove_with_status\n"
+  unless $preserve =~
+         /delete_orphan_temp_table_sidecars_or_log[\s\S]*Preserved_trx_store\s*&store[\s\S]*store\.remove_with_status/s &&
+         $preserve =~ /delete_orphan_temp_table_sidecars_or_log\s*\(\s*store\.store\(\)\s*,\s*listing\s*\)/s;
+die "temporary tablespace bootstrap must skip force recovery before carrier scan\n"
+  unless $preserve =~
+         /bool preserved_temp_images_bootstrap_preamble\s*\(\s*\)\s*\{\s*if\s*\(srv_force_recovery\s*>\s*0\)\s*return\s+false;\s*const std::string dir[\s\S]*create_preserved_trx_default_store/s;
+die "temporary tablespace bootstrap must snapshot-read headers before validating temp sidecars\n"
+  unless $preserve =~
+         /bool preserved_temp_images_bootstrap_preamble[\s\S]*store->read\s*\(\s*token\s*,\s*true\s*,\s*Preserved_trx_carrier::Payload_read_mode::SNAPSHOT_ONLY[\s\S]*validate_temp_sidecars_for_bootstrap/s &&
+         $preserve =~
+         /Preserve_snapshot_status validate_temp_sidecars_for_bootstrap[\s\S]*preserve_trx_temp_table_validate_sidecars/s;
+die "startup recovery must delete stale tmp files for durable snapshot tokens without deleting final artifacts\n"
+  unless $preserve =~
+         /for\s*\(\s*const std::string &token\s*:\s*snapshot_tokens\s*\)[\s\S]*delete_stale_tmp_files_or_log\s*\(\s*store\.store\(\)\s*,\s*token\s*\)[\s\S]*recover_preserved_snapshot/s;
+my $bundle_doc_matches =
+  $bundle_doc eq '' ||
+  ($bundle_doc =~ /Format Version 8 and TLV Extensions/s &&
+   $bundle_doc =~ /0x81[\s\S]*kTlvExternalBlobDescriptors/s &&
+   $bundle_doc =~ /> 8/s);
+die "TLV registry source contract must keep the current writer format and multi-blob descriptor tag\n"
+  unless $bundle =~ /constexpr uint16_t kSnapshotFormatVersion\s*=\s*8\s*;/s &&
+         $bundle =~ /constexpr uint16_t kTlvExternalBlobDescriptors\s*=\s*0x81\s*;/s &&
+         $bundle =~ /format_version\s*<\s*8[\s\S]*kTlvExternalBlobDescriptors/s &&
+         $bundle_doc_matches;
+die "SQL savepoint validator must bound binlog positions and event counters by snapshot metadata\n"
+  unless $bundle =~
+         /bool sql_savepoints_payload_is_valid[\s\S]*max_binlog_position[\s\S]*max_binlog_event_counter[\s\S]*binlog_position\s*>\s*max_binlog_position[\s\S]*checkpoint_event_counter\s*>\s*max_binlog_event_counter/s &&
+         $bundle =~
+         /sql_savepoints_payload_is_valid\s*\(\s*metadata\.sql_savepoints_payload[\s\S]*metadata\.binlog_cache_size[\s\S]*metadata\.binlog_cache_event_counter/s &&
+         $gunit =~ /BinlogSavepointPositionCannotExceedPayload/s &&
+         $gunit =~ /BinlogSavepointEventCounterCannotExceedCache/s;
+die "startup recovery success must emit an audit event\n"
+  unless $recover_snapshot =~
+         /audit_preserved_trx_event\s*\(\s*current_thd\s*,\s*token\s*,\s*"recover"\s*,\s*"success"\s*\)/s;
+
+$preserve =~ /bool Sql_cmd_resume_preserved_transaction::execute[\s\S]*?^}/m
+  or die "could not isolate Sql_cmd_resume_preserved_transaction::execute\n";
+my $resume_execute_audit = $&;
+die "successful RESUME must emit an audit event\n"
+  unless $resume_execute_audit =~
+         /audit_preserved_trx_event\s*\(\s*thd\s*,\s*token\s*,\s*"resume"\s*,\s*"success"\s*\)/s;
+die "RESUME must revalidate durable carrier contents before attaching the preserved transaction\n"
+  unless $resume_execute_audit =~
+         /store->read\s*\(\s*token\s*,\s*true\s*,\s*Preserved_trx_carrier::Payload_read_mode::\s*METADATA_ONLY\s*,\s*&durable_bundle\s*\)[\s\S]*durable_status\s*==\s*Preserve_snapshot_status::CORRUPT[\s\S]*rollback_resumable_record_after_corrupt_snapshot[\s\S]*my_error\s*\(\s*ER_PRESERVE_TRX_CORRUPT_SNAPSHOT/s;
+die "RESUME not-found privilege probe must not load external blob payloads\n"
+  unless $resume_execute_audit =~
+         /token_is_filename_safe\s*\(\s*token\s*\)[\s\S]*store->read\s*\(\s*token\s*,\s*true\s*,\s*Preserved_trx_carrier::Payload_read_mode::\s*METADATA_ONLY\s*,\s*&bundle\s*\)/s;
+my $resume_take_pos = index($resume_execute_audit,
+                            'preserved_trx_take_resumable_record');
+die "RESUME must not full-read durable carrier before claiming the record\n"
+  if $resume_take_pos > 0 &&
+     substr($resume_execute_audit, 0, $resume_take_pos) =~
+       /store->read\s*\(\s*token\s*,\s*true\s*,\s*&/s;
+
+$preserve =~ /static void rollback_pending_token_delivery_record[\s\S]*?^}/m
+  or die "could not isolate rollback_pending_token_delivery_record\n";
+my $token_delivery_rollback = $&;
+die "token-delivery failure rollback must emit an audit event\n"
+  unless $token_delivery_rollback =~
+         /audit_preserved_trx_event\s*\(\s*current_thd\s*,\s*token\s*,\s*"rollback"/s;
+
+die "recovery failure rollback must emit an audit event\n"
+  unless $preserve =~
+         /static bool rollback_preserved_snapshot_or_log[\s\S]*?audit_preserved_trx_event\s*\(\s*current_thd\s*,\s*token\s*,\s*"rollback"/s &&
+         $preserve =~
+         /static bool rollback_claimed_preserved_snapshot_or_log[\s\S]*?audit_preserved_trx_event\s*\(\s*current_thd\s*,\s*token\s*,\s*"rollback"/s;
+die "resume-timeout rollback must emit an audit event\n"
+  unless $resume_timeout_rollback =~
+         /audit_preserved_trx_event\s*\(\s*current_thd\s*,\s*record\.metadata\.token\s*,\s*"rollback"\s*,\s*"timeout"/s;
+die "resume corrupt-snapshot rollback must emit an audit event\n"
+  unless $preserve =~
+         /static bool rollback_resumable_record_after_corrupt_snapshot[\s\S]*?audit_preserved_trx_event\s*\(\s*current_thd\s*,\s*record\.metadata\.token\s*,\s*"rollback"\s*,\s*"failure"/s;
+EOF
+
+SELECT 'ok' AS code_review_resumable_trx_slices_lint;

@@ -1,0 +1,54 @@
+--disable_warnings
+DROP TABLE IF EXISTS xa_keep;
+--enable_warnings
+
+CREATE TABLE xa_keep(a INT PRIMARY KEY) ENGINE=InnoDB;
+
+XA START 'normal_xa';
+INSERT INTO xa_keep VALUES(1);
+XA END 'normal_xa';
+XA PREPARE 'normal_xa';
+XA RECOVER;
+XA ROLLBACK 'normal_xa';
+
+SELECT COUNT(*) AS rows_after_rollback FROM xa_keep;
+
+--error ER_XAER_INVAL
+XA START X'4d53505f50524553', X'746f6b656e', 1836281843;
+
+--error ER_XAER_INVAL
+XA PREPARE X'4d53505f50524553', X'746f6b656e', 1836281843;
+
+--error ER_XAER_NOTA
+XA COMMIT X'4d53505f50524553', X'746f6b656e', 1836281843;
+
+# Lint-only source-shape preflight. Runtime evidence in this file comes from
+# the standard XA and preserve-magic XA SQL assertions above.
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+my $path = File::Spec->catfile($source_root, 'storage', 'innobase',
+                               'trx', 'trx0trx.cc');
+open(my $fh, '<', $path) or die "cannot open $path: $!";
+my $source = do { local $/; <$fh> };
+close($fh);
+
+my $function_start = index($source, 'static trx_t *trx_get_trx_by_xid_low');
+die "trx_get_trx_by_xid_low not found\n" if $function_start < 0;
+my $function_body = substr($source, $function_start, 1200);
+my $guard_pos = index($function_body, 'xid_is_preserve_magic');
+my $scan_pos = index($function_body, 'trx_sys->rw_trx_list');
+my $reset_pos = index($function_body, 'trx->xid->reset()');
+die "generic XA lookup must reject preserve magic XIDs before scan/reset\n"
+  if $guard_pos < 0 || $scan_pos < 0 || $reset_pos < 0 ||
+     $guard_pos > $scan_pos || $guard_pos > $reset_pos;
+print "generic_xa_preserve_magic_guard\n1\n";
+EOF
+
+DROP TABLE xa_keep;

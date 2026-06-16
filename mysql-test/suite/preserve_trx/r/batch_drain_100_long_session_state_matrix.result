@@ -1,0 +1,189 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_recovery_max_count=200;
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+SELECT COUNT(*) AS session_count
+FROM t_batch_long_control;
+session_count
+100
+SELECT MIN(TIMESTAMPDIFF(MICROSECOND, started_at, NOW(6))) >= 5000000
+AS all_sessions_older_than_five_seconds
+FROM t_batch_long_control;
+all_sessions_older_than_five_seconds
+1
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS;
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+100
+SELECT COUNT(*) AS preserved_state_count
+FROM performance_schema.preserved_transactions
+WHERE STATE = 'PRESERVED';
+preserved_state_count
+100
+SELECT COUNT(*) AS mapped_token_count
+FROM t_batch_long_tokens;
+mapped_token_count
+100
+SELECT COUNT(*) AS preserved_count_after_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_resume
+0
+SELECT COUNT(*) AS resume_success_count
+FROM t_batch_long_audit
+WHERE resumed_ok = 1;
+resume_success_count
+100
+SELECT COUNT(DISTINCT sid) AS resumed_distinct_sessions
+FROM t_batch_long_audit;
+resumed_distinct_sessions
+100
+SELECT MIN(lifecycle_age_us) >= 5000000 AS all_resumed_lifecycles_were_long
+FROM t_batch_long_audit;
+all_resumed_lifecycles_were_long
+1
+SELECT MIN(sql_count) >= 8 AS every_session_ran_enough_sql
+FROM t_batch_long_audit;
+every_session_ran_enough_sql
+1
+SELECT MAX(max_stmt_us) < 1000000 AS every_statement_under_one_second
+FROM t_batch_long_audit;
+every_statement_under_one_second
+1
+SELECT COUNT(*) AS audit_rows
+FROM t_batch_long_audit;
+audit_rows
+100
+SELECT COUNT(*) AS audit_control_case_mismatch_count
+FROM t_batch_long_audit a
+JOIN t_batch_long_control c USING(sid)
+WHERE a.case_id <> c.case_id;
+audit_control_case_mismatch_count
+0
+SELECT COUNT(DISTINCT detail) AS session_state_cases_ok
+FROM t_batch_long_audit WHERE resumed_ok = 1;
+session_state_cases_ok
+20
+SELECT detail, COUNT(*) = 5 AS ok
+FROM t_batch_long_audit GROUP BY detail ORDER BY detail;
+detail	ok
+charset-connection	1
+collation-connection	1
+explicit-last-insert-id	1
+isolation-rc	1
+isolation-rr	1
+last-insert-id	1
+multiple-user-vars	1
+null-user-var	1
+overwritten-user-var	1
+resume-set-user-var	1
+sql-log-bin-off	1
+sql-mode-ansi-quotes	1
+sql-mode-no-backslash	1
+sql-mode-strict	1
+state-savepoint-light	1
+time-zone-plus8	1
+time-zone-utc	1
+user-var-decimal	1
+user-var-integer	1
+user-var-string	1
+SELECT COUNT(*) = 10 AS last_insert_id_preserve_point_ok
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id IN (4, 5)
+AND b.last_id_seen IS NOT NULL
+AND b.marker IN ('last-insert-id', 'explicit-last-insert-id');
+last_insert_id_preserve_point_ok
+1
+SELECT COUNT(*) = 100 AS user_vars_restored_ok
+FROM t_batch_long_audit
+WHERE resumed_ok = 1;
+user_vars_restored_ok
+1
+SELECT 1 AS case_id,
+COUNT(*) = 5 AS ok
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 1 AND b.v = b.sid * 10 + 2
+UNION ALL SELECT 2, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 2 AND b.txt = CONCAT('state-', b.sid)
+UNION ALL SELECT 3, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 3 AND b.decval = CAST(b.sid AS DECIMAL(12,2)) + 0.35
+UNION ALL SELECT 4, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 4 AND b.marker = 'last-insert-id'
+   AND b.last_id_seen IS NOT NULL
+UNION ALL SELECT 5, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 5 AND b.marker = 'explicit-last-insert-id'
+   AND b.last_id_seen = b.sid * 10000 + 5
+UNION ALL SELECT 6, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 6 AND b.txt = 'ansi-resumed'
+UNION ALL SELECT 7, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 7 AND b.txt = CONCAT('slash', CHAR(92), 'path')
+UNION ALL SELECT 8, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 8 AND b.v = 8
+UNION ALL SELECT 9, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 9 AND b.marker = 'time-zone-utc'
+   AND b.ts = TIMESTAMP'2026-05-17 01:02:03'
+UNION ALL SELECT 10, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 10 AND b.marker = 'time-zone-plus8'
+   AND b.ts = TIMESTAMP'2026-05-17 01:02:03'
+UNION ALL SELECT 11, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 11 AND b.txt = 'utf8mb4-ok'
+UNION ALL SELECT 12, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 12 AND b.txt = 'collation-ci'
+UNION ALL SELECT 13, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 13 AND b.marker = 'isolation-rr'
+UNION ALL SELECT 14, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 14 AND b.marker = 'isolation-rc'
+UNION ALL SELECT 15, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 15 AND b.marker = 'sql-log-bin-off'
+UNION ALL SELECT 16, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 16 AND b.v = b.sid + 17
+AND b.txt = CONCAT('multi-', b.sid)
+UNION ALL SELECT 17, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 17 AND b.txt = 'null-restored'
+UNION ALL SELECT 18, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 18 AND b.txt = CONCAT('final-', b.sid)
+UNION ALL SELECT 19, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 19 AND b.v = b.sid + 1901
+UNION ALL SELECT 20, COUNT(*) = 5
+FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 20 AND b.v = b.sid * 2 + 1
+ORDER BY case_id;
+case_id	ok
+1	1
+2	1
+3	1
+4	1
+5	1
+6	1
+7	1
+8	1
+9	1
+10	1
+11	1
+12	1
+13	1
+14	1
+15	1
+16	1
+17	1
+18	1
+19	1
+20	1
+SET GLOBAL preserve_trx_enable=ON;

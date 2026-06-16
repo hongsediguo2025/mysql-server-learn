@@ -1,0 +1,58 @@
+DROP TABLE IF EXISTS t_warmcopy_resource;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=16;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=8;
+SET GLOBAL preserve_trx_warmcopy_max_total_bytes=1500;
+CREATE TABLE t_warmcopy_resource(
+id INT PRIMARY KEY,
+payload VARBINARY(1024)
+) ENGINE=InnoDB;
+INSERT INTO t_warmcopy_resource VALUES(1,REPEAT('a',512)),(2,REPEAT('a',512));
+START TRANSACTION;
+UPDATE t_warmcopy_resource SET payload=REPEAT('b',512) WHERE id=1;
+START TRANSACTION;
+UPDATE t_warmcopy_resource SET payload=REPEAT('d',512) WHERE id=2;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+include/assert.inc [warm-copy phase1 aggregate bytes status exists]
+include/assert.inc [warm-copy phase1 aggregate bytes stay within max total budget]
+COMMIT;
+COMMIT;
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+SELECT id, OCTET_LENGTH(payload) AS payload_len FROM t_warmcopy_resource
+ORDER BY id;
+id	payload_len
+1	512
+2	512
+SELECT id,
+payload = CASE id
+WHEN 1 THEN REPEAT('b',512)
+WHEN 2 THEN REPEAT('d',512)
+END AS payload_matches_expected
+FROM t_warmcopy_resource ORDER BY id;
+id	payload_matches_expected
+1	1
+2	1
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_warmcopy_max_total_bytes=10737418240;
+START TRANSACTION;
+UPDATE t_warmcopy_resource SET payload=REPEAT('c',512) WHERE id=1;
+SET SESSION debug="+d,preserve_trx_fail_after_binlog_mode_validation";
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug="-d,preserve_trx_fail_after_binlog_mode_validation";
+include/assert.inc [legacy full binlog cache export increments the diagnostic counter]
+ROLLBACK;
+DROP TABLE t_warmcopy_resource;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_max_total_bytes=10737418240;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET DEBUG_SYNC = 'RESET';

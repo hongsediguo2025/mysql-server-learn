@@ -1,0 +1,3 @@
+SELECT 'ok' AS batch_drain_nonidle_autocommit_no_token_lint;
+batch_drain_nonidle_autocommit_no_token_lint
+ok

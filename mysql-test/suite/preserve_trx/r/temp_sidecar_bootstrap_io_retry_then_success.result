@@ -1,0 +1,9 @@
+SET GLOBAL preserve_trx_enable=ON;
+SHUTDOWN;
+include/wait_for_pattern_in_file.inc [TEMP_SIDECAR_IO_RETRY token='.*' attempt=1 reason=preserved temporary table sidecar read failed]
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

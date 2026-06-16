@@ -1,0 +1,1 @@
+--log-bin=preserve-trx-batch-cleanup-bin --server-id=1 --binlog-format=ROW

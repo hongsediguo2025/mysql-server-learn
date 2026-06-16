@@ -526,6 +526,13 @@ class ha_innobase : public handler {
   @retval false  if the handler does not want a buffer */
   bool is_record_buffer_wanted(ha_rows *const max_rows) const override;
 
+ public:
+  /** Return the InnoDB prebuilt state for preserve temp-table metadata export. */
+  row_prebuilt_t *preserve_trx_temp_table_prebuilt() const {
+    return m_prebuilt;
+  }
+
+ private:
   /** TRUNCATE an InnoDB table.
   @param[in]		name		table name
   @param[in]		form		table definition

@@ -1,10 +1,39 @@
+--source include/force_restart.inc
+
 SELECT @@global.preserve_trx_enable AS preserve_enable_default_on;
 SELECT @@global.preserve_trx_temp_table_enable AS temp_table_enable_default_on;
 
-SET GLOBAL preserve_trx_enable=OFF;
-SELECT @@global.preserve_trx_enable AS preserve_enable_after_explicit_off;
+--disable_warnings
+DROP TABLE IF EXISTS t_preserve_default_on;
+--enable_warnings
 
-SET GLOBAL preserve_trx_enable=ON;
-SELECT @@global.preserve_trx_enable AS preserve_enable_after_explicit_on;
+CREATE TABLE t_preserve_default_on(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_preserve_default_on VALUES(1, 10);
 
-SET GLOBAL preserve_trx_enable=ON;
+START TRANSACTION;
+UPDATE t_preserve_default_on SET v = 11 WHERE id = 1;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT @@global.preserve_trx_enable AS preserve_enable_after_restart;
+SELECT @@global.preserve_trx_temp_table_enable AS temp_table_enable_after_restart;
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+COMMIT;
+
+SELECT * FROM t_preserve_default_on ORDER BY id;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+DROP TABLE t_preserve_default_on;

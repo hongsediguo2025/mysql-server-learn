@@ -46,6 +46,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "my_dbug.h"
 #ifndef UNIV_HOTBACKUP
 #include "page0types.h"
+#include "trx0temp_preserve.h"
 #include "trx0purge.h"
 #endif /* !UNIV_HOTBACKUP */
 
@@ -286,6 +287,12 @@ struct Add_dirty_blocks_to_flush_list {
 
     block = reinterpret_cast<buf_block_t *>(slot->object);
 
+    if (trx_preserve_temp_space_image_dirty_page_hook_enabled()) {
+      (void)trx_preserve_temp_space_image_stage_dirty_page(
+          block->page.id.space(), block->page.id.page_no(), block->frame,
+          UNIV_PAGE_SIZE);
+    }
+
     buf_flush_note_modification(block, m_start_lsn, m_end_lsn,
                                 m_flush_observer);
 #endif /* !UNIV_HOTBACKUP */
@@ -308,7 +315,7 @@ struct Add_dirty_blocks_to_flush_list {
       }
     }
 
-    return (true);
+    return true;
   }
 
   /** Mini-transaction REDO end LSN */
@@ -819,6 +826,9 @@ void mtr_t::Command::execute() {
 #endif /* !UNIV_HOTBACKUP */
 
   release_all();
+#ifndef UNIV_HOTBACKUP
+  (void)trx_preserve_temp_space_image_drain_staged_dirty_pages();
+#endif /* !UNIV_HOTBACKUP */
   release_resources();
 }
 

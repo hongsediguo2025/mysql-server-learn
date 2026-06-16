@@ -1,0 +1,49 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL log_output='TABLE';
+SET GLOBAL general_log=ON;
+SET GLOBAL log_raw=ON;
+SET GLOBAL slow_query_log=ON;
+SET GLOBAL long_query_time=0;
+SET SESSION long_query_time=0;
+SET GLOBAL log_slow_admin_statements=ON;
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+SET @redaction_matrix_token=CONCAT('msp_matrix_redaction_', 'abcd');
+SET @redaction_matrix_redacted=CONCAT('****', RIGHT(@redaction_matrix_token, 4));
+include/suppress_messages.inc
+ERROR HY000: Preserved transaction was not found
+SELECT COUNT(*) AS raw_token_in_general_log
+FROM mysql.general_log
+WHERE argument LIKE CONCAT('%', @redaction_matrix_token, '%');
+raw_token_in_general_log
+0
+SELECT COUNT(*) > 0 AS redacted_token_in_general_log
+FROM mysql.general_log
+WHERE argument LIKE '%RESUME PRESERVED TRANSACTION%'
+   AND argument LIKE CONCAT('%', @redaction_matrix_redacted, '%');
+redacted_token_in_general_log
+1
+SELECT COUNT(*) AS raw_token_in_slow_log
+FROM mysql.slow_log
+WHERE sql_text LIKE CONCAT('%', @redaction_matrix_token, '%');
+raw_token_in_slow_log
+0
+SELECT COUNT(*) > 0 AS redacted_token_in_slow_log
+FROM mysql.slow_log
+WHERE sql_text LIKE '%RESUME PRESERVED TRANSACTION%'
+   AND sql_text LIKE CONCAT('%', @redaction_matrix_redacted, '%');
+redacted_token_in_slow_log
+1
+Occurrences of 'RESUME PRESERVED TRANSACTION '\*\*\*\*abcd' in the input file: 1
+Occurrences of 'TOKEN' in the input file: 0
+SET GLOBAL general_log=OFF;
+SET GLOBAL slow_query_log=OFF;
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+SET GLOBAL log_raw=0;
+SET GLOBAL long_query_time=10.000000;
+SET GLOBAL log_slow_admin_statements=0;
+SET GLOBAL log_output='FILE';
+SET GLOBAL general_log=1;
+SET GLOBAL slow_query_log=1;
+SET GLOBAL preserve_trx_enable=1;

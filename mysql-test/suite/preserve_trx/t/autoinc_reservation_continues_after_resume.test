@@ -1,0 +1,99 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_autoinc_reservation_resume;
+DROP TABLE IF EXISTS t_autoinc_reservation_touch;
+DROP TABLE IF EXISTS t_autoinc_forced_resume;
+DROP TABLE IF EXISTS t_autoinc_forced_touch;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_autoinc_reservation_touch(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+CREATE TABLE t_autoinc_reservation_resume(
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+INSERT INTO t_autoinc_reservation_touch VALUES(1,1);
+
+START TRANSACTION;
+UPDATE t_autoinc_reservation_touch SET v = 2 WHERE id = 1;
+SAVEPOINT before_autoinc_allocation;
+INSERT INTO t_autoinc_reservation_resume(v) VALUES(10),(20);
+SELECT LAST_INSERT_ID() AS first_reserved_id;
+ROLLBACK TO SAVEPOINT before_autoinc_allocation;
+SELECT COUNT(*) AS rows_after_rollback_to_savepoint
+  FROM t_autoinc_reservation_resume;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+
+INSERT INTO t_autoinc_reservation_resume(v) VALUES(30);
+SELECT LAST_INSERT_ID() AS id_after_resume;
+COMMIT;
+
+SELECT * FROM t_autoinc_reservation_resume ORDER BY id;
+SELECT * FROM t_autoinc_reservation_touch ORDER BY id;
+
+DROP TABLE t_autoinc_reservation_resume;
+DROP TABLE t_autoinc_reservation_touch;
+
+CREATE TABLE t_autoinc_forced_resume(
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+CREATE TABLE t_autoinc_forced_touch(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+INSERT INTO t_autoinc_forced_touch VALUES(1,1);
+
+START TRANSACTION;
+UPDATE t_autoinc_forced_touch SET v = 2 WHERE id = 1;
+SET INSERT_ID=100;
+SELECT @@session.insert_id AS forced_insert_id_before_preserve;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+
+SELECT @@session.insert_id AS forced_insert_id_after_resume;
+INSERT INTO t_autoinc_forced_resume(v) VALUES(40);
+SELECT LAST_INSERT_ID() AS forced_insert_id_used_after_resume;
+COMMIT;
+
+SELECT * FROM t_autoinc_forced_resume ORDER BY id;
+SELECT * FROM t_autoinc_forced_touch ORDER BY id;
+
+DROP TABLE t_autoinc_forced_resume;
+DROP TABLE t_autoinc_forced_touch;
+SET GLOBAL preserve_trx_enable=ON;

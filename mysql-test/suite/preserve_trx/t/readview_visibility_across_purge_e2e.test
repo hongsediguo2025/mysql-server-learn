@@ -1,0 +1,98 @@
+--source include/not_log_bin.inc
+--source include/have_debug.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_readview_visibility_purge;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_readview_visibility_purge(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_readview_visibility_purge VALUES
+  (1,10),(2,20),(3,30),(4,40),(5,50),(100,100);
+
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT COUNT(*) AS original_count, SUM(v) AS original_sum
+  FROM t_readview_visibility_purge
+ WHERE id <= 5;
+UPDATE t_readview_visibility_purge SET v=1001 WHERE id=100;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+SELECT HAS_READ_VIEW, RV_LOW_LIMIT_NO > 0 AS has_low_limit
+  FROM performance_schema.preserved_transactions;
+
+--connect(purge_writer, localhost, root,,test)
+UPDATE t_readview_visibility_purge SET v=v+1000 WHERE id <= 5;
+DELETE FROM t_readview_visibility_purge WHERE id=5;
+INSERT INTO t_readview_visibility_purge VALUES(6,6000);
+--disconnect purge_writer
+--source include/wait_until_disconnected.inc
+
+--connection default
+--disable_query_log
+--let $is_debug= `SELECT VERSION() LIKE '%debug%'`
+--let $purge_blocked= 0
+--let $purge_wait_counter= 50
+while ($purge_wait_counter)
+{
+  if ($is_debug)
+  {
+    SET GLOBAL innodb_purge_run_now=ON;
+  }
+  --sleep 0.1
+  --let $purge_trx_age= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'INNODB_PURGE_TRX_ID_AGE'`
+  --let $purge_view_age= `SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'INNODB_PURGE_VIEW_TRX_ID_AGE'`
+  --let $purge_blocked= `SELECT $purge_view_age > 0 AND $purge_trx_age <= $purge_view_age`
+  if ($purge_blocked)
+  {
+    --let $purge_wait_counter= 0
+  }
+  if (!$purge_blocked)
+  {
+    --dec $purge_wait_counter
+  }
+}
+--enable_query_log
+--let $assert_text= purge was blocked by preserved read view
+--let $assert_cond= $purge_blocked
+--source include/assert.inc
+--eval SELECT $purge_blocked AS purge_blocked_by_preserved_readview
+
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+
+SELECT COUNT(*) AS resumed_count, SUM(v) AS resumed_sum
+  FROM t_readview_visibility_purge
+ WHERE id <= 5;
+SELECT v AS own_write_seen
+  FROM t_readview_visibility_purge
+ WHERE id=100;
+
+COMMIT;
+--disable_query_log
+if ($is_debug)
+{
+  SET GLOBAL innodb_purge_run_now=ON;
+  --source include/wait_innodb_all_purged.inc
+}
+--enable_query_log
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+SELECT id, v FROM t_readview_visibility_purge ORDER BY id;
+
+DROP TABLE t_readview_visibility_purge;
+SET GLOBAL preserve_trx_enable=ON;

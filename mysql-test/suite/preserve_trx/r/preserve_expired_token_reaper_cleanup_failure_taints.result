@@ -1,0 +1,30 @@
+DROP TABLE IF EXISTS t_expired_reaper_cleanup_failure;
+SET GLOBAL preserve_trx_enable=ON;
+SET SESSION preserve_trx_min_timeout=1;
+SET SESSION preserve_trx_default_timeout=1;
+SET SESSION preserve_trx_max_timeout=86400;
+CREATE TABLE t_expired_reaper_cleanup_failure(a INT PRIMARY KEY, b INT)
+ENGINE=InnoDB;
+INSERT INTO t_expired_reaper_cleanup_failure VALUES(1,10);
+START TRANSACTION;
+UPDATE t_expired_reaper_cleanup_failure SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+include/wait_for_pattern_in_file.inc [Preserved transaction .* expired-token reaper forced rollback: recovery timeout expired]
+SELECT TOKEN, STATE, LAST_ERROR IS NOT NULL AS has_last_error
+FROM performance_schema.preserved_transactions;
+TOKEN	STATE	has_last_error
+TOKEN	EXPIRED_CLEANUP_FAILED	1
+SELECT * FROM t_expired_reaper_cleanup_failure ORDER BY a;
+a	b
+1	10
+# restart
+include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted]
+SELECT COUNT(*) AS preserved_count_after_tainted_cleanup
+FROM performance_schema.preserved_transactions;
+preserved_count_after_tainted_cleanup
+0
+SELECT * FROM t_expired_reaper_cleanup_failure ORDER BY a;
+a	b
+1	10
+DROP TABLE t_expired_reaper_cleanup_failure;
+SET GLOBAL preserve_trx_enable=ON;

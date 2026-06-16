@@ -1,0 +1,348 @@
+--source include/big_test.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $setup_file = File::Spec->catfile($vardir, 'tmp',
+                                     'batch_long_readview_setup.inc');
+my $apps_file = File::Spec->catfile($vardir, 'tmp',
+                                    'batch_long_readview_apps.inc');
+my $post_apps_file = File::Spec->catfile($vardir, 'tmp',
+                                         'batch_long_readview_post_apps.inc');
+my $cleanup_file = File::Spec->catfile($vardir, 'tmp',
+                                       'batch_long_readview_cleanup.inc');
+my $verify_file = File::Spec->catfile($vardir, 'tmp',
+                                      'batch_long_readview_verify.inc');
+
+open(my $setup, '>', $setup_file)
+  or die "cannot open $setup_file for write: $!";
+open(my $apps, '>', $apps_file)
+  or die "cannot open $apps_file for write: $!";
+open(my $post_apps, '>', $post_apps_file)
+  or die "cannot open $post_apps_file for write: $!";
+open(my $cleanup, '>', $cleanup_file)
+  or die "cannot open $cleanup_file for write: $!";
+open(my $verify, '>', $verify_file)
+  or die "cannot open $verify_file for write: $!";
+
+print $cleanup "DROP PROCEDURE IF EXISTS p_batch_long_finalize;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_long_tokens;\n";
+print $cleanup "DROP TABLE IF EXISTS t_rv_base;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_long_audit;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_long_control;\n";
+
+print $setup "CREATE TABLE t_batch_long_control(" .
+             "sid INT PRIMARY KEY, " .
+             "case_id INT NOT NULL, " .
+             "started_at DATETIME(6) NOT NULL" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_batch_long_audit(" .
+             "sid INT PRIMARY KEY, " .
+             "case_id INT NOT NULL, " .
+             "lifecycle_age_us BIGINT UNSIGNED NOT NULL, " .
+             "max_stmt_us BIGINT UNSIGNED NOT NULL, " .
+             "sql_count INT UNSIGNED NOT NULL, " .
+             "resumed_ok TINYINT NOT NULL, " .
+             "detail VARCHAR(255) NOT NULL" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_batch_long_tokens(" .
+             "token_id INT PRIMARY KEY AUTO_INCREMENT, " .
+             "token VARCHAR(255) NOT NULL UNIQUE" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_rv_base(" .
+             "sid INT NOT NULL, " .
+             "k INT NOT NULL, " .
+             "v INT NOT NULL, " .
+             "version_tag VARCHAR(32), " .
+             "touch INT NOT NULL DEFAULT 0, " .
+             "PRIMARY KEY(sid, k), " .
+             "KEY idx_sid_v(sid, v), " .
+             "KEY idx_sid_tag(sid, version_tag)" .
+             ") ENGINE=InnoDB;\n";
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  print $setup "INSERT INTO t_batch_long_control " .
+               "VALUES($sid, $case_id, TIMESTAMP'2000-01-01 00:00:00.000000');\n";
+  for my $k (0 .. 12) {
+    my $v = $sid * 100 + $k;
+    print $setup "INSERT INTO t_rv_base " .
+                 "VALUES($sid, $k, $v, 'seed', 0);\n";
+  }
+  print $setup "INSERT INTO t_rv_base " .
+               "VALUES($sid, 999, " . ($sid * 100 + 999) .
+               ", 'sentinel', 0);\n";
+}
+
+print $setup "DELIMITER |;\n";
+print $setup "CREATE PROCEDURE p_batch_long_finalize()\n";
+print $setup "BEGIN\n";
+print $setup "  DECLARE post_ok TINYINT DEFAULT 0;\n";
+print $setup "  DECLARE detail_value VARCHAR(255) DEFAULT NULL;\n";
+print $setup "  IF \@batch_long_sid IS NULL OR \@batch_long_case_id IS NULL THEN\n";
+print $setup "    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'missing restored batch long user vars';\n";
+print $setup "  END IF;\n";
+print $setup "  IF COALESCE(\@batch_rv_pre_ok, 0) <> 1 THEN\n";
+print $setup "    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'pre-drain readview check was not restored';\n";
+print $setup "  END IF;\n";
+print $setup "  IF \@batch_long_case_id = 1 THEN\n";
+print $setup "    SELECT v = \@batch_long_sid * 100 + 1 INTO post_ok FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 1;\n";
+print $setup "    SET detail_value = 'rr-old-snapshot';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 2 THEN\n";
+print $setup "    SELECT v = \@batch_long_sid * 100 + 1003 INTO post_ok FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 3 FOR UPDATE;\n";
+print $setup "    SET detail_value = 'locking-current-read';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 3 THEN\n";
+print $setup "    SELECT v = \@batch_long_sid * 100 + 1001 INTO post_ok FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 1;\n";
+print $setup "    SET detail_value = 'rc-new-statement';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 4 THEN\n";
+print $setup "    SELECT v = \@batch_long_sid * 100 + 5004 INTO post_ok FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 4;\n";
+print $setup "    SET detail_value = 'own-update';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 5 THEN\n";
+print $setup "    SELECT COUNT(*) = 0 INTO post_ok FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 5;\n";
+print $setup "    SET detail_value = 'own-delete';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 6 THEN\n";
+print $setup "    SELECT COUNT(*) = 1 INTO post_ok FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 60 AND version_tag = 'own-insert';\n";
+print $setup "    SET detail_value = 'own-insert';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 7 THEN\n";
+print $setup "    SELECT SUM(v) = \@batch_long_sid * 300 + 5006 INTO post_ok FROM t_rv_base WHERE sid = \@batch_long_sid AND k BETWEEN 1 AND 3;\n";
+print $setup "    SET detail_value = 'rr-own-write-mixed';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 8 THEN\n";
+print $setup "    SELECT COUNT(*) = 14 INTO post_ok FROM t_rv_base WHERE sid = \@batch_long_sid AND k < 100;\n";
+print $setup "    SET detail_value = 'rc-external-insert-visible';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 9 THEN\n";
+print $setup "    SELECT COUNT(*) = 13 INTO post_ok FROM t_rv_base WHERE sid = \@batch_long_sid AND k BETWEEN 0 AND 15;\n";
+print $setup "    SET detail_value = 'rr-external-insert-hidden';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 10 THEN\n";
+print $setup "    SELECT COUNT(*) = 14 INTO post_ok FROM t_rv_base WHERE sid = \@batch_long_sid AND k BETWEEN 0 AND 15 FOR UPDATE;\n";
+print $setup "    SET detail_value = 'locking-insert-visible';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 11 THEN\n";
+print $setup "    SELECT COUNT(*) = 1 INTO post_ok FROM t_rv_base FORCE INDEX(idx_sid_v) WHERE sid = \@batch_long_sid AND v = \@batch_long_sid * 100 + 1;\n";
+print $setup "    SET detail_value = 'rr-secondary-old';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 12 THEN\n";
+print $setup "    SELECT COUNT(*) = 1 INTO post_ok FROM t_rv_base FORCE INDEX(idx_sid_v) WHERE sid = \@batch_long_sid AND v = \@batch_long_sid * 100 + 1001;\n";
+print $setup "    SET detail_value = 'rc-secondary-new';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 13 THEN\n";
+print $setup "    SELECT COUNT(*) = 1 INTO post_ok FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 1;\n";
+print $setup "    SET detail_value = 'rr-external-delete-hidden';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 14 THEN\n";
+print $setup "    SELECT COUNT(*) = 0 INTO post_ok FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 14;\n";
+print $setup "    SET detail_value = 'rr-insert-gap-hidden';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 15 THEN\n";
+print $setup "    SELECT ((SELECT v FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 1) = \@batch_long_sid * 100 + 1) AND ((SELECT v FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 1 FOR UPDATE) = \@batch_long_sid * 100 + 1001) INTO post_ok;\n";
+print $setup "    SET detail_value = 'rr-vs-current-read';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 16 THEN\n";
+print $setup "    SELECT ((SELECT v FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 1) = \@batch_long_sid * 100 + 1001) AND ((SELECT v FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 2) = \@batch_long_sid * 100 + 5002) INTO post_ok;\n";
+print $setup "    SET detail_value = 'rc-own-and-external';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 17 THEN\n";
+print $setup "    SELECT ((SELECT v FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 1) = \@batch_long_sid * 100 + 1) AND ((SELECT v FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 2) = \@batch_long_sid * 100 + 5002) INTO post_ok;\n";
+print $setup "    SET detail_value = 'rr-own-write-external-hidden';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 18 THEN\n";
+print $setup "    SELECT ((SELECT v FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 1) = \@batch_long_sid * 100 + 1001) AND ((SELECT v FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 2) = \@batch_long_sid * 100 + 5002) INTO post_ok;\n";
+print $setup "    SET detail_value = 'rr-late-read-view-own-external';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 19 THEN\n";
+print $setup "    SELECT ((SELECT v FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 1) = \@batch_long_sid * 100 + 1) AND ((SELECT v FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 3) = \@batch_long_sid * 100 + 3) INTO post_ok;\n";
+print $setup "    SET detail_value = 'rr-multi-read-hidden';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 20 THEN\n";
+print $setup "    UPDATE t_rv_base SET v = v + 20, version_tag = 'post-resume' WHERE sid = \@batch_long_sid AND k = 3;\n";
+print $setup "    SELECT ((SELECT v FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 1) = \@batch_long_sid * 100 + 1001) AND ((SELECT version_tag FROM t_rv_base WHERE sid = \@batch_long_sid AND k = 3) = 'post-resume') INTO post_ok;\n";
+print $setup "    SET detail_value = 'rc-post-resume-continuation';\n";
+print $setup "  END IF;\n";
+print $setup "  IF COALESCE(post_ok, 0) <> 1 THEN\n";
+print $setup "    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'post-resume readview check failed';\n";
+print $setup "  END IF;\n";
+print $setup "  SET \@batch_long_end_action = 'COMMIT';\n";
+print $setup "  INSERT INTO t_batch_long_audit VALUES(\n";
+print $setup "    \@batch_long_sid,\n";
+print $setup "    \@batch_long_case_id,\n";
+print $setup "    TIMESTAMPDIFF(MICROSECOND, \@batch_long_started_at, NOW(6)),\n";
+print $setup "    \@batch_long_max_stmt_us,\n";
+print $setup "    \@batch_long_sql_count,\n";
+print $setup "    1,\n";
+print $setup "    detail_value);\n";
+print $setup "END|\n";
+print $setup "DELIMITER ;|\n";
+
+print $verify "SELECT COUNT(DISTINCT detail) AS readview_details_ok\n";
+print $verify "  FROM t_batch_long_audit\n";
+print $verify " WHERE resumed_ok = 1;\n";
+print $verify "SELECT SUM(detail IN ('rr-old-snapshot','rr-own-write-mixed','rr-external-insert-hidden','rr-secondary-old','rr-external-delete-hidden','rr-insert-gap-hidden','rr-vs-current-read','rr-own-write-external-hidden','rr-multi-read-hidden')) = 45 AS rr_old_snapshot_checks\n";
+print $verify "  FROM t_batch_long_audit WHERE resumed_ok = 1;\n";
+print $verify "SELECT SUM(detail IN ('rc-new-statement','rc-external-insert-visible','rc-secondary-new','rc-own-and-external','rc-post-resume-continuation')) = 25 AS rc_new_statement_checks\n";
+print $verify "  FROM t_batch_long_audit WHERE resumed_ok = 1;\n";
+print $verify "SELECT SUM(detail IN ('own-update','own-delete','own-insert','rr-own-write-mixed','rc-own-and-external','rr-own-write-external-hidden','rr-late-read-view-own-external','rc-post-resume-continuation')) = 40 AS own_write_checks\n";
+print $verify "  FROM t_batch_long_audit WHERE resumed_ok = 1;\n";
+print $verify "SELECT detail, COUNT(*) = 5 AS ok\n";
+print $verify "  FROM t_batch_long_audit\n";
+print $verify " GROUP BY detail\n";
+print $verify " ORDER BY detail;\n";
+
+sub emit_measured {
+  my ($fh, $sql) = @_;
+  print $fh "SET \@batch_long_stmt_start = NOW(6);\n";
+  print $fh "$sql;\n";
+  print $fh "SET \@batch_long_stmt_us = " .
+            "TIMESTAMPDIFF(MICROSECOND, \@batch_long_stmt_start, NOW(6));\n";
+  print $fh "SET \@batch_long_max_stmt_us = " .
+            "GREATEST(\@batch_long_max_stmt_us, \@batch_long_stmt_us);\n";
+  print $fh "SET \@batch_long_sql_count = \@batch_long_sql_count + 1;\n";
+}
+
+sub emit_external {
+  my ($fh, $sid, $sql) = @_;
+  my $name = sprintf("batch_long_rv_writer_%03d", $sid);
+  print $fh "--connect($name,localhost,root,,test)\n";
+  print $fh "--connection $name\n";
+  print $fh "SET SESSION innodb_lock_wait_timeout=1;\n";
+  print $fh "$sql;\n";
+  print $fh "--disconnect $name\n";
+  print $fh "--source include/wait_until_disconnected.inc\n";
+  print $fh "--disable_query_log\n";
+  print $fh "--disable_result_log\n";
+  print $fh "--connection batch_long_app_" . sprintf("%03d", $sid) . "\n";
+}
+
+sub ext_update_k1 {
+  my ($sid) = @_;
+  return "UPDATE t_rv_base SET v = " . ($sid * 100 + 1001) .
+         ", version_tag = 'external' WHERE sid = $sid AND k = 1";
+}
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  my $app_name = sprintf("batch_long_app_%03d", $sid);
+  print $apps "--connect($app_name,localhost,root,,test)\n";
+  print $apps "--connection $app_name\n";
+  if ($case_id =~ /^(3|8|12|16|20)$/) {
+    print $apps "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;\n";
+  } else {
+    print $apps "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;\n";
+  }
+  print $apps "UPDATE t_batch_long_control SET started_at = NOW(6) WHERE sid = $sid;\n";
+  print $apps "SET \@batch_long_sid = $sid;\n";
+  print $apps "SET \@batch_long_case_id = $case_id;\n";
+  print $apps "SET \@batch_long_started_at = " .
+              "(SELECT started_at FROM t_batch_long_control WHERE sid = $sid);\n";
+  print $apps "SET \@batch_long_max_stmt_us = 0;\n";
+  print $apps "SET \@batch_long_sql_count = 0;\n";
+  print $apps "SET \@batch_long_end_action = 'COMMIT';\n";
+  print $apps "SET \@batch_rv_pre_ok = 0;\n";
+  print $apps "START TRANSACTION;\n";
+  emit_measured($apps, "UPDATE t_rv_base SET touch = touch + 1 WHERE sid = $sid AND k = 0");
+
+  if ($case_id == 1) {
+    emit_measured($apps, "SELECT v = " . ($sid * 100 + 1) . " INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k = 1");
+    emit_external($apps, $sid, ext_update_k1($sid));
+  } elsif ($case_id == 2) {
+    emit_measured($apps, "SELECT v = " . ($sid * 100 + 1) . " INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k = 1");
+    emit_external($apps, $sid, "UPDATE t_rv_base SET v = " . ($sid * 100 + 1003) . ", version_tag = 'external' WHERE sid = $sid AND k = 3");
+    emit_measured($apps, "SELECT v = " . ($sid * 100 + 1003) . " INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k = 3 FOR UPDATE");
+  } elsif ($case_id == 3) {
+    emit_measured($apps, "SELECT v = " . ($sid * 100 + 1) . " INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k = 1");
+    emit_external($apps, $sid, ext_update_k1($sid));
+    emit_measured($apps, "SELECT v = " . ($sid * 100 + 1001) . " INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k = 1");
+  } elsif ($case_id == 4) {
+    emit_measured($apps, "UPDATE t_rv_base SET v = " . ($sid * 100 + 5004) . ", version_tag = 'own' WHERE sid = $sid AND k = 4");
+    emit_measured($apps, "SELECT v = " . ($sid * 100 + 5004) . " INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k = 4");
+  } elsif ($case_id == 5) {
+    emit_measured($apps, "DELETE FROM t_rv_base WHERE sid = $sid AND k = 5");
+    emit_measured($apps, "SELECT COUNT(*) = 0 INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k = 5");
+  } elsif ($case_id == 6) {
+    emit_measured($apps, "INSERT INTO t_rv_base VALUES($sid, 60, 60, 'own-insert', 0)");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k = 60");
+  } elsif ($case_id == 7) {
+    emit_measured($apps, "SELECT SUM(v) = " . ($sid * 300 + 6) . " INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k BETWEEN 1 AND 3");
+    emit_external($apps, $sid, ext_update_k1($sid));
+    emit_measured($apps, "UPDATE t_rv_base SET v = " . ($sid * 100 + 5002) . ", version_tag = 'own' WHERE sid = $sid AND k = 2");
+  } elsif ($case_id == 8) {
+    emit_measured($apps, "SELECT COUNT(*) = 13 INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k < 100");
+    emit_external($apps, $sid, "INSERT INTO t_rv_base VALUES($sid, 80, 80, 'external-insert', 0)");
+    emit_measured($apps, "SELECT COUNT(*) = 14 INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k < 100");
+  } elsif ($case_id == 9) {
+    emit_measured($apps, "SELECT COUNT(*) = 13 INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k BETWEEN 0 AND 15");
+    emit_external($apps, $sid, "INSERT INTO t_rv_base VALUES($sid, 14, 14, 'external-insert', 0)");
+  } elsif ($case_id == 10) {
+    emit_external($apps, $sid, "INSERT INTO t_rv_base VALUES($sid, 15, 15, 'external-insert', 0)");
+    emit_measured($apps, "SELECT COUNT(*) = 14 INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k BETWEEN 0 AND 15 FOR UPDATE");
+  } elsif ($case_id == 11) {
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@batch_rv_pre_ok FROM t_rv_base FORCE INDEX(idx_sid_v) WHERE sid = $sid AND v = " . ($sid * 100 + 1));
+    emit_external($apps, $sid, ext_update_k1($sid));
+  } elsif ($case_id == 12) {
+    emit_external($apps, $sid, ext_update_k1($sid));
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@batch_rv_pre_ok FROM t_rv_base FORCE INDEX(idx_sid_v) WHERE sid = $sid AND v = " . ($sid * 100 + 1001));
+  } elsif ($case_id == 13) {
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k = 1");
+    emit_external($apps, $sid, "DELETE FROM t_rv_base WHERE sid = $sid AND k = 1");
+  } elsif ($case_id == 14) {
+    emit_measured($apps, "SELECT COUNT(*) = 13 INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k BETWEEN 0 AND 15");
+    emit_external($apps, $sid, "INSERT INTO t_rv_base VALUES($sid, 14, 14, 'external-insert', 0)");
+  } elsif ($case_id == 15) {
+    emit_measured($apps, "SELECT v = " . ($sid * 100 + 1) . " INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k = 1");
+    emit_external($apps, $sid, ext_update_k1($sid));
+    emit_measured($apps, "SELECT v = " . ($sid * 100 + 1001) . " INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k = 1 FOR UPDATE");
+  } elsif ($case_id == 16) {
+    emit_measured($apps, "UPDATE t_rv_base SET v = " . ($sid * 100 + 5002) . ", version_tag = 'own' WHERE sid = $sid AND k = 2");
+    emit_external($apps, $sid, ext_update_k1($sid));
+    emit_measured($apps, "SELECT ((SELECT v FROM t_rv_base WHERE sid = $sid AND k = 1) = " . ($sid * 100 + 1001) . ") AND ((SELECT v FROM t_rv_base WHERE sid = $sid AND k = 2) = " . ($sid * 100 + 5002) . ") INTO \@batch_rv_pre_ok");
+  } elsif ($case_id == 17) {
+    emit_measured($apps, "SELECT v = " . ($sid * 100 + 1) . " INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k = 1");
+    emit_external($apps, $sid, ext_update_k1($sid));
+    emit_measured($apps, "UPDATE t_rv_base SET v = " . ($sid * 100 + 5002) . ", version_tag = 'own' WHERE sid = $sid AND k = 2");
+  } elsif ($case_id == 18) {
+    emit_measured($apps, "UPDATE t_rv_base SET v = " . ($sid * 100 + 5002) . ", version_tag = 'own' WHERE sid = $sid AND k = 2");
+    emit_external($apps, $sid, ext_update_k1($sid));
+    emit_measured($apps, "SELECT ((SELECT v FROM t_rv_base WHERE sid = $sid AND k = 1) = " . ($sid * 100 + 1001) . ") AND ((SELECT v FROM t_rv_base WHERE sid = $sid AND k = 2) = " . ($sid * 100 + 5002) . ") INTO \@batch_rv_pre_ok");
+  } elsif ($case_id == 19) {
+    emit_measured($apps, "SELECT v = " . ($sid * 100 + 1) . " INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k = 1");
+    emit_external($apps, $sid, ext_update_k1($sid));
+    emit_measured($apps, "SELECT ((SELECT v FROM t_rv_base WHERE sid = $sid AND k = 1) = " . ($sid * 100 + 1) . ") AND ((SELECT v FROM t_rv_base WHERE sid = $sid AND k = 3) = " . ($sid * 100 + 3) . ") INTO \@batch_rv_pre_ok");
+  } elsif ($case_id == 20) {
+    emit_external($apps, $sid, ext_update_k1($sid));
+    emit_measured($apps, "SELECT v = " . ($sid * 100 + 1001) . " INTO \@batch_rv_pre_ok FROM t_rv_base WHERE sid = $sid AND k = 1");
+  }
+
+}
+print $apps "--connection default\n";
+
+for my $round (1 .. 80) {
+  for my $sid (1 .. 100) {
+    my $name = sprintf("batch_long_app_%03d", $sid);
+    print $post_apps "--connection $name\n";
+    emit_measured($post_apps, "SELECT COUNT(*) >= 1 INTO \@batch_rv_heartbeat_ok FROM t_rv_base WHERE sid = $sid AND k = 0");
+  }
+}
+print $post_apps "--connection default\n";
+
+close($setup);
+close($apps);
+close($post_apps);
+close($cleanup);
+close($verify);
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+SET GLOBAL preserve_trx_recovery_max_count=200;
+--let $old_preserve_trx_drain_grace_ms= `SELECT @@GLOBAL.preserve_trx_drain_grace_ms`
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+
+--let $batch_long_prefix= batch_long_readview
+--let $batch_long_setup_file= $MYSQLTEST_VARDIR/tmp/batch_long_readview_setup.inc
+--let $batch_long_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_readview_apps.inc
+--let $batch_long_post_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_readview_post_apps.inc
+--let $batch_long_cleanup_file= $MYSQLTEST_VARDIR/tmp/batch_long_readview_cleanup.inc
+--let $batch_long_resume_file= $MYSQLTEST_VARDIR/tmp/batch_long_readview_resume.inc
+--let $batch_long_verify_file= $MYSQLTEST_VARDIR/tmp/batch_long_readview_verify.inc
+--source suite/preserve_trx/include/batch_drain_100_long_common.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+--disable_query_log
+--disable_result_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_drain_grace_ms=$old_preserve_trx_drain_grace_ms
+--enable_result_log
+--enable_query_log

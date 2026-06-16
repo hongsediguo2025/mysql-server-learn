@@ -1,0 +1,38 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+CREATE TEMPORARY TABLE tmp_preserve_truncate(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+START TRANSACTION;
+INSERT INTO tmp_preserve_truncate VALUES(1, 10), (2, 20);
+SET DEBUG_SYNC =
+'preserve_trx_warmcopy_open SIGNAL temp_truncate_warmcopy_open WAIT_FOR temp_truncate_continue_warmcopy';
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET DEBUG_SYNC = 'now WAIT_FOR temp_truncate_warmcopy_open TIMEOUT 10';
+TRUNCATE TABLE tmp_preserve_truncate;
+START TRANSACTION;
+INSERT INTO tmp_preserve_truncate VALUES(3, 30);
+SET DEBUG_SYNC = 'now SIGNAL temp_truncate_continue_warmcopy';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+SELECT * FROM tmp_preserve_truncate ORDER BY id;
+id	v
+3	30
+INSERT INTO tmp_preserve_truncate VALUES(4, 40);
+COMMIT;
+SELECT COUNT(*) AS rows_after_commit, SUM(v) AS sum_after_commit
+FROM tmp_preserve_truncate;
+rows_after_commit	sum_after_commit
+2	70
+DROP TEMPORARY TABLE tmp_preserve_truncate;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET DEBUG_SYNC = 'RESET';

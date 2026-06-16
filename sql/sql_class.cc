@@ -80,6 +80,7 @@
 #include "sql/protocol.h"
 #include "sql/protocol_classic.h"
 #include "sql/preserve_trx.h"
+#include "sql/preserve_trx_temp_table.h"
 #include "sql/psi_memory_key.h"
 #include "sql/query_result.h"
 #include "sql/rpl_rli.h"    // Relay_log_info
@@ -92,6 +93,7 @@
 #include "sql/sql_base.h"         // close_temporary_tables
 #include "sql/sql_callback.h"     // MYSQL_CALLBACK
 #include "sql/sql_cmd.h"
+#include "sql/sql_cursor.h"
 #include "sql/sql_handler.h"  // mysql_ha_cleanup
 #include "sql/sql_lex.h"
 #include "sql/sql_parse.h"    // is_update_query
@@ -962,6 +964,8 @@ void THD::cleanup(void) {
     global_read_lock.unlock_global_read_lock(this);
 
   mysql_ull_cleanup(this);
+  if (preserve_trx_temp_table_transaction_state_needs_clear(this))
+    preserve_trx_temp_table_clear_transaction_state(this);
   /*
     All locking service locks must be released on disconnect.
   */
@@ -1092,6 +1096,8 @@ THD::~THD() {
   DBUG_PRINT("info", ("THD dtor, this %p", this));
 
   if (!m_release_resources_done) release_resources();
+  if (preserve_trx_temp_table_transaction_state_needs_clear(this))
+    preserve_trx_temp_table_clear_transaction_state(this);
 
   clear_next_event_pos();
 
@@ -1755,6 +1761,15 @@ void Prepared_statement_map::erase(Prepared_statement *statement) {
   DBUG_ASSERT(prepared_stmt_count > 0);
   prepared_stmt_count--;
   mysql_mutex_unlock(&LOCK_prepared_stmt_count);
+}
+
+bool Prepared_statement_map::has_open_server_side_cursor() const {
+  for (const auto &key_and_value : st_hash) {
+    const Prepared_statement *stmt = key_and_value.second.get();
+    if (stmt != nullptr && stmt->cursor != nullptr && stmt->cursor->is_open())
+      return true;
+  }
+  return false;
 }
 
 void Prepared_statement_map::claim_memory_ownership(bool claim) {

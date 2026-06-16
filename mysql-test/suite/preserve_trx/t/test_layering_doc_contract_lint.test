@@ -1,0 +1,173 @@
+--echo # Lint-only guard: preserve/resume behavior tests must not read
+--echo # design documents, and new source-shape checks must be explicit lint.
+--perl
+use strict;
+use warnings;
+use File::Find;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+my $suite_dir = File::Spec->catdir($source_root, 'mysql-test', 'suite',
+                                   'preserve_trx');
+my $mtr_test_dir = File::Spec->catdir($suite_dir, 't');
+my $gunit_dir = File::Spec->catdir($source_root, 'unittest', 'gunit');
+my $python_test_dir = File::Spec->catdir($source_root, 'scripts', 'tests');
+
+# Do not open or require any design document here. Downstream source imports may
+# carry the preserve/resume tests without carrying the design/ tree; that is
+# valid. The guard only rejects behavior tests that encode such a dependency.
+my @doc_patterns = (
+  qr{design/[A-Za-z0-9_./-]*\.md},
+  qr{File::Spec->cat(?:dir|file)\s*\([^;]*['"]design['"][^;]*\.md}s,
+  qr{['"][^'"\n]*(?:preserve-resume|resumable-trx)[^'"\n]*\.md['"]},
+);
+
+my @hard_doc_read_patterns = (
+  qr{read_source\s*\(\s*\$[A-Za-z0-9_]*doc[A-Za-z0-9_]*\s*\)},
+  qr{read_file\s*\(\s*\$[A-Za-z0-9_]*doc[A-Za-z0-9_]*\s*\)},
+);
+
+my @source_shape_patterns = (
+  qr{File::Spec->catfile\s*\(\s*\$source_root\s*,\s*['"](?:sql|storage|unittest|include)['"]}s,
+  qr{read_source_file_for_[A-Za-z0-9_]+\s*\(\s*["](?:sql|storage|unittest|include)/}s,
+);
+
+my %allowed_mtr_source_shape_debt = map { $_ => 1 } (
+  File::Spec->catfile($suite_dir, 't',
+                      'batch_drain_drained_session_blocked.test'),
+  File::Spec->catfile($suite_dir, 't',
+                      'batch_drain_warmcopy_large_cache.test'),
+  File::Spec->catfile($suite_dir, 't',
+                      'batch_drain_warmcopy_missing_prebuilt_failure.test'),
+  File::Spec->catfile($suite_dir, 't',
+                      'batch_drain_warmcopy_resource_limits.test'),
+  File::Spec->catfile($suite_dir, 't',
+                      'batch_drain_warmcopy_tail_budget.test'),
+  File::Spec->catfile($suite_dir, 't', 'concurrent_standard_xa.test'),
+  File::Spec->catfile($suite_dir, 't',
+                      'force_recovery_level2_unsupported_with_cache.test'),
+  File::Spec->catfile($suite_dir, 't', 'sigterm_during_preserve_shutdown.test'),
+  File::Spec->catfile($suite_dir, 't',
+                      'temp_table_space_id_reserved_on_restart.test'),
+  File::Spec->catfile($suite_dir, 't',
+                      'token_delivery_disconnect_cleanup.test'),
+  File::Spec->catfile($suite_dir, 't', 'warmcopy_admission_toctou.test'),
+);
+
+sub line_for_pos {
+  my ($text, $pos) = @_;
+  return 1 + (substr($text, 0, $pos) =~ tr/\n//);
+}
+
+sub collect_matches {
+  my ($path, $text, $patterns) = @_;
+  my @matches;
+  for my $pattern (@$patterns) {
+    while ($text =~ /$pattern/g) {
+      push @matches, $path . ':' . line_for_pos($text, $-[0]) . ': ' . $&;
+    }
+  }
+  return @matches;
+}
+
+sub read_file {
+  my ($path) = @_;
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $text = do { local $/; <$fh> };
+  close($fh);
+  return $text;
+}
+
+sub require_dir {
+  my ($label, $path) = @_;
+  die "$label directory does not exist: $path\n" unless -d $path;
+}
+
+require_dir('preserve_trx MTR test', $mtr_test_dir);
+
+my @doc_violations;
+my @hard_doc_read_violations;
+my @source_shape_violations;
+my @stale_source_shape_debt;
+my $mtr_non_lint_seen = 0;
+my $mtr_lint_seen = 0;
+my $gunit_preserve_seen = 0;
+my $python_resumable_seen = 0;
+
+find(
+  sub {
+    return unless -f $_;
+    return unless /\.test$/;
+    my $path = $File::Find::name;
+    my $text = read_file($path);
+    push @hard_doc_read_violations,
+      collect_matches($path, $text, \@hard_doc_read_patterns);
+    if (/_lint\.test$/) {
+      ++$mtr_lint_seen;
+    } else {
+      ++$mtr_non_lint_seen;
+      push @doc_violations, collect_matches($path, $text, \@doc_patterns);
+      if (!$allowed_mtr_source_shape_debt{$path}) {
+        push @source_shape_violations,
+          collect_matches($path, $text, \@source_shape_patterns);
+      } elsif (-f $path) {
+        my @matches = collect_matches($path, $text, \@source_shape_patterns);
+        push @stale_source_shape_debt, $path unless @matches;
+      }
+    }
+  },
+  $mtr_test_dir,
+);
+
+find(
+  sub {
+    return unless -f $_;
+    return unless /(?:preserve_trx|trx0preserve).*\.cc$/;
+    ++$gunit_preserve_seen;
+    my $path = $File::Find::name;
+    my $text = read_file($path);
+    push @doc_violations, collect_matches($path, $text, \@doc_patterns);
+  },
+  $gunit_dir,
+) if -d $gunit_dir;
+
+find(
+  sub {
+    return unless -f $_;
+    return unless /test_resumable_trx.*\.py$/;
+    ++$python_resumable_seen;
+    my $path = $File::Find::name;
+    my $text = read_file($path);
+    push @doc_violations, collect_matches($path, $text, \@doc_patterns);
+  },
+  $python_test_dir,
+) if -d $python_test_dir;
+
+die "lint scanned zero non-lint preserve_trx MTR tests\n"
+  unless $mtr_non_lint_seen > 0;
+
+die "lint scanned zero preserve_trx MTR lint tests\n"
+  unless $mtr_lint_seen > 0;
+
+die "tests must not hard-require design documents; use optional lint-only " .
+    "checks when docs are present:\n" .
+    join("\n", @hard_doc_read_violations) . "\n"
+  if @hard_doc_read_violations;
+
+die "non-lint behavior tests must not read design documents:\n" .
+    join("\n", @doc_violations) . "\n"
+  if @doc_violations;
+
+die "new non-lint MTR source-shape checks must be split into *_lint tests:\n" .
+    join("\n", @source_shape_violations) . "\n"
+  if @source_shape_violations;
+
+die "stale source-shape debt allowlist entries must be removed:\n" .
+    join("\n", @stale_source_shape_debt) . "\n"
+  if @stale_source_shape_debt;
+EOF
+
+SELECT 'ok' AS test_layering_doc_contract_lint;

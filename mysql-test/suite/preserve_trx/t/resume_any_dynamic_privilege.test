@@ -1,8 +1,0 @@
---disable_warnings
-DROP USER IF EXISTS preserve_resume_any@localhost;
---enable_warnings
-
-CREATE USER preserve_resume_any@localhost;
-GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO preserve_resume_any@localhost;
-SHOW GRANTS FOR preserve_resume_any@localhost;
-DROP USER preserve_resume_any@localhost;

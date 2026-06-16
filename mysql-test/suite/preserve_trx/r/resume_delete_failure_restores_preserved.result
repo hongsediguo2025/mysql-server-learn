@@ -1,0 +1,24 @@
+DROP TABLE IF EXISTS t_resume_delete_failure;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_resume_delete_failure(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_resume_delete_failure VALUES(1,10);
+START TRANSACTION;
+SELECT * FROM t_resume_delete_failure WHERE a=1 FOR UPDATE;
+a	b
+1	10
+UPDATE t_resume_delete_failure SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug="+d,preserve_trx_fail_delete_snapshot_files";
+RESUME PRESERVED TRANSACTION 'TOKEN';
+SET SESSION debug="-d,preserve_trx_fail_delete_snapshot_files";
+include/wait_for_pattern_in_file.inc [Preserved transaction .* snapshot cleanup failed after resume; transaction remains attached]
+SELECT COUNT(*) AS remaining_preserved
+FROM performance_schema.preserved_transactions;
+remaining_preserved
+0
+COMMIT;
+SELECT * FROM t_resume_delete_failure ORDER BY a;
+a	b
+1	11
+DROP TABLE t_resume_delete_failure;
+SET GLOBAL preserve_trx_enable=ON;

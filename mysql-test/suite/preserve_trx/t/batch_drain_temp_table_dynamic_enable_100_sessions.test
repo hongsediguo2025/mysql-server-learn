@@ -1,0 +1,130 @@
+--source include/big_test.inc
+--source include/not_log_bin.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $setup_file = File::Spec->catfile($vardir, 'tmp',
+                                     'batch_temp_dynamic_setup.inc');
+my $apps_file = File::Spec->catfile($vardir, 'tmp',
+                                    'batch_temp_dynamic_apps.inc');
+my $finalize_file = File::Spec->catfile($vardir, 'tmp',
+                                        'batch_temp_dynamic_finalize.inc');
+my $disconnect_file = File::Spec->catfile($vardir, 'tmp',
+                                          'batch_temp_dynamic_disconnect.inc');
+my $cleanup_file = File::Spec->catfile($vardir, 'tmp',
+                                       'batch_temp_dynamic_cleanup.inc');
+
+open(my $setup, '>', $setup_file)
+  or die "cannot open $setup_file for write: $!";
+open(my $apps, '>', $apps_file)
+  or die "cannot open $apps_file for write: $!";
+open(my $finalize, '>', $finalize_file)
+  or die "cannot open $finalize_file for write: $!";
+open(my $disconnect, '>', $disconnect_file)
+  or die "cannot open $disconnect_file for write: $!";
+open(my $cleanup, '>', $cleanup_file)
+  or die "cannot open $cleanup_file for write: $!";
+
+print $cleanup "DROP TABLE IF EXISTS t_batch_temp_dynamic_audit;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_temp_dynamic_base;\n";
+print $setup "CREATE TABLE t_batch_temp_dynamic_base(" .
+             "sid INT PRIMARY KEY, v INT NOT NULL) ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_batch_temp_dynamic_audit(" .
+             "sid INT PRIMARY KEY, temp_count INT NOT NULL, " .
+             "temp_sum BIGINT NOT NULL) ENGINE=InnoDB;\n";
+
+for my $sid (1 .. 100) {
+  my $app = sprintf("batch_temp_dynamic_app_%03d", $sid);
+  my $tmp = sprintf("tmp_batch_temp_dynamic_%03d", $sid);
+  print $apps "--connect($app,localhost,root,,test)\n";
+  print $apps "--connection $app\n";
+  print $apps "CREATE TEMPORARY TABLE $tmp(" .
+              "id INT PRIMARY KEY, v INT NOT NULL, KEY(v)) ENGINE=InnoDB;\n";
+  print $apps "START TRANSACTION;\n";
+  print $apps "INSERT INTO t_batch_temp_dynamic_base VALUES($sid, " .
+              ($sid * 10) . ");\n";
+  print $apps "UPDATE t_batch_temp_dynamic_base SET v = v + 1 " .
+              "WHERE sid = $sid;\n";
+  print $apps "INSERT INTO $tmp VALUES(1, " . ($sid * 100) . ");\n";
+  print $apps "UPDATE $tmp SET v = v + 1 WHERE id = 1;\n";
+
+  print $finalize "--connection $app\n";
+  print $finalize "INSERT INTO t_batch_temp_dynamic_audit " .
+                  "SELECT $sid, COUNT(*), SUM(v) FROM $tmp;\n";
+  print $finalize "COMMIT;\n";
+  print $finalize "DROP TEMPORARY TABLE $tmp;\n";
+  print $disconnect "--disconnect $app\n";
+}
+print $apps "--connection default\n";
+print $finalize "--connection default\n";
+print $disconnect "--connection default\n";
+
+close($setup);
+close($apps);
+close($finalize);
+close($disconnect);
+close($cleanup);
+EOF
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/batch_temp_dynamic_cleanup.inc
+--source $MYSQLTEST_VARDIR/tmp/batch_temp_dynamic_setup.inc
+--enable_result_log
+--enable_query_log
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=OFF;
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/batch_temp_dynamic_apps.inc
+--enable_result_log
+--enable_query_log
+
+--let $wait_condition= SELECT COUNT(*) = 100 FROM performance_schema.threads WHERE PROCESSLIST_USER = 'root' AND PROCESSLIST_DB = 'test' AND PROCESSLIST_COMMAND = 'Sleep'
+--source include/wait_condition.inc
+
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+
+SELECT COUNT(*) AS preserved_count_after_dynamic_enable_reject
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_snapshot_file.inc
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/batch_temp_dynamic_finalize.inc
+--source $MYSQLTEST_VARDIR/tmp/batch_temp_dynamic_disconnect.inc
+--enable_result_log
+--enable_query_log
+
+SELECT COUNT(*) AS audit_rows,
+       SUM(temp_count) AS temp_count_sum,
+       SUM(temp_sum) AS temp_sum
+  FROM t_batch_temp_dynamic_audit;
+SELECT COUNT(*) AS base_rows,
+       SUM(v = sid * 10 + 1) AS base_values_matched,
+       SUM(v) AS base_sum
+  FROM t_batch_temp_dynamic_base;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/batch_temp_dynamic_cleanup.inc
+--enable_result_log
+--enable_query_log
+
+--remove_file $MYSQLTEST_VARDIR/tmp/batch_temp_dynamic_setup.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/batch_temp_dynamic_apps.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/batch_temp_dynamic_finalize.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/batch_temp_dynamic_disconnect.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/batch_temp_dynamic_cleanup.inc
+
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_enable=ON;

@@ -27,6 +27,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <atomic>
+#include <string>
 #include <utility>
 
 #include "libbinlogevents/include/binlog_event.h"  // enum_binlog_checksum_alg
@@ -66,8 +67,22 @@ class Transaction_boundary_parser;
 class binlog_cache_data;
 class user_var_entry;
 class Binlog_cache_storage;
+class Mysql_binlog_warmcopy_session;
+class Preserved_trx_warm_external_blob_carrier;
 
 struct Gtid;
+struct Mysql_binlog_preserve_snapshot;
+struct PrebuiltBinlogCacheBlob;
+
+struct Mysql_binlog_preserve_cache_state {
+  uint64_t position{0};
+  uint64_t event_counter{0};
+  bool with_sbr{false};
+  bool with_rbr{false};
+  bool with_start{false};
+  bool with_end{false};
+  bool with_content{false};
+};
 
 typedef int64 query_id_t;
 
@@ -945,6 +960,42 @@ bool trans_has_updated_trans_table(const THD *thd);
 bool stmt_has_updated_trans_table(Ha_trx_info *ha_list);
 bool ending_trans(THD *thd, const bool all);
 bool ending_single_stmt_trans(THD *thd, const bool all);
+bool mysql_binlog_preserve_no_cache_boundary_is_clean(const THD *thd);
+bool mysql_binlog_preserve_export(THD *thd,
+                                  Mysql_binlog_preserve_snapshot *snapshot);
+bool mysql_binlog_preserve_export_metadata_only(
+    THD *thd, Mysql_binlog_preserve_snapshot *snapshot);
+bool mysql_binlog_preserve_warmcopy_build_blob(
+    THD *thd, const std::string &warmcopy_id, uint64_t epoch,
+    Preserved_trx_warm_external_blob_carrier *carrier,
+    uint64_t max_blob_bytes, PrebuiltBinlogCacheBlob *blob, bool *has_blob);
+bool mysql_binlog_preserve_warmcopy_begin_session(
+    THD *thd, const std::string &warmcopy_id, uint64_t epoch,
+    Preserved_trx_warm_external_blob_carrier *carrier,
+    uint64_t max_blob_bytes, Mysql_binlog_warmcopy_session **session,
+    bool *has_blob, uint64_t *prefix_bytes = nullptr);
+bool mysql_binlog_preserve_warmcopy_finalize_session(
+    THD *thd, Mysql_binlog_warmcopy_session *session,
+    uint64_t tail_budget_bytes, PrebuiltBinlogCacheBlob *blob,
+    bool *has_blob);
+bool mysql_binlog_preserve_warmcopy_tail_budget_exceeded(
+    THD *thd, Mysql_binlog_warmcopy_session *session,
+    uint64_t tail_budget_bytes, bool *exceeded);
+void mysql_binlog_preserve_warmcopy_abort_session(
+    Mysql_binlog_warmcopy_session *session);
+bool mysql_binlog_preserve_warmcopy_cache_length(THD *thd, uint64_t *length,
+                                                 bool *has_blob);
+bool mysql_binlog_preserve_import(
+    THD *thd, const Mysql_binlog_preserve_snapshot &snapshot);
+bool mysql_binlog_preserve_reactivate_after_prepare_failure(
+    THD *thd, const Mysql_binlog_preserve_snapshot &snapshot);
+bool mysql_binlog_preserve_reactivate_after_detach_failure(
+    THD *thd, const Mysql_binlog_preserve_snapshot &snapshot);
+bool mysql_binlog_preserve_get_cache_state(
+    THD *thd, uint64_t position, Mysql_binlog_preserve_cache_state *state);
+bool mysql_binlog_preserve_import_cache_state(
+    THD *thd, const Mysql_binlog_preserve_cache_state &state);
+void mysql_binlog_preserve_discard(THD *thd);
 bool trans_cannot_safely_rollback(const THD *thd);
 bool stmt_cannot_safely_rollback(const THD *thd);
 

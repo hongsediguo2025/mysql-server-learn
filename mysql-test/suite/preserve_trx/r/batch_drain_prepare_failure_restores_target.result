@@ -1,0 +1,37 @@
+DROP TABLE IF EXISTS t_batch_prepare_failure;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_batch_prepare_failure(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+START TRANSACTION;
+INSERT INTO t_batch_prepare_failure VALUES(1,10);
+SET SESSION debug="+d,pfx_prepare_low";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug="-d,pfx_prepare_low";
+SELECT COUNT(*) AS preserved_count_after_ha_prepare_failure
+FROM performance_schema.preserved_transactions;
+preserved_count_after_ha_prepare_failure
+0
+COMMIT;
+SELECT * FROM t_batch_prepare_failure ORDER BY id;
+id	v
+1	10
+START TRANSACTION;
+INSERT INTO t_batch_prepare_failure VALUES(2,20);
+SET SESSION debug="+d,pfx_temp_prepare";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug="-d,pfx_temp_prepare";
+SELECT COUNT(*) AS preserved_count_after_temp_prepare_failure
+FROM performance_schema.preserved_transactions;
+preserved_count_after_temp_prepare_failure
+0
+COMMIT;
+SELECT * FROM t_batch_prepare_failure ORDER BY id;
+id	v
+1	10
+2	20
+DROP TABLE t_batch_prepare_failure;
+SET GLOBAL preserve_trx_enable=ON;

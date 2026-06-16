@@ -1,0 +1,27 @@
+DROP TABLE IF EXISTS t_temp_unsupported_column_base;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_temp_unsupported_column_base(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO t_temp_unsupported_column_base VALUES(1, 10);
+CREATE TEMPORARY TABLE tmp_temp_unsupported_column(
+id INT PRIMARY KEY,
+payload BLOB
+) ENGINE=InnoDB;
+INSERT INTO tmp_temp_unsupported_column VALUES(1, 'payload');
+START TRANSACTION;
+UPDATE t_temp_unsupported_column_base SET v = 11 WHERE id = 1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+COMMIT;
+SELECT * FROM t_temp_unsupported_column_base ORDER BY id;
+id	v
+1	11
+DROP TEMPORARY TABLE tmp_temp_unsupported_column;
+DROP TABLE t_temp_unsupported_column_base;
+SET GLOBAL preserve_trx_enable=ON;

@@ -1,0 +1,41 @@
+DROP TABLE IF EXISTS t_force_recovery_unsupported;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_force_recovery_unsupported(a INT PRIMARY KEY, b INT)
+ENGINE=InnoDB;
+INSERT INTO t_force_recovery_unsupported VALUES(1,10);
+START TRANSACTION;
+SELECT * FROM t_force_recovery_unsupported WHERE a=1 FOR UPDATE;
+a	b
+1	10
+UPDATE t_force_recovery_unsupported SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SELECT @@global.innodb_force_recovery AS force_recovery_after_restart;
+force_recovery_after_restart
+1
+SELECT COUNT(*) AS preserved_count_during_force_recovery
+FROM performance_schema.preserved_transactions;
+preserved_count_during_force_recovery
+0
+START TRANSACTION;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+ROLLBACK;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+# restart
+SELECT @@global.innodb_force_recovery AS force_recovery_after_normal_restart;
+force_recovery_after_normal_restart
+0
+SELECT COUNT(*) AS preserved_count_after_normal_restart
+FROM performance_schema.preserved_transactions;
+preserved_count_after_normal_restart
+0
+SELECT * FROM t_force_recovery_unsupported ORDER BY a;
+a	b
+1	10
+SELECT COUNT(*) AS preserved_count_after_tainted_rollback
+FROM performance_schema.preserved_transactions;
+preserved_count_after_tainted_rollback
+0
+DROP TABLE t_force_recovery_unsupported;
+SET GLOBAL preserve_trx_enable=ON;

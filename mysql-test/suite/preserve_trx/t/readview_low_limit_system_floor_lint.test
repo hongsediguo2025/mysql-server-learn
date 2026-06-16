@@ -1,0 +1,51 @@
+--echo # Lint-only source-shape guard; runtime purge/read-view behavior is
+--echo # covered by readview_visibility_across_purge_e2e and related MTR.
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_source {
+  my ($path) = @_;
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $src = do { local $/; <$fh> };
+  close($fh);
+  return $src;
+}
+
+my $trx_preserve_path = File::Spec->catfile($source_root, 'storage',
+                                           'innobase', 'trx',
+                                           'trx0preserve.cc');
+my $bundle_path = File::Spec->catfile($source_root, 'sql',
+                                      'preserve_trx_bundle.cc');
+my $trx_preserve = read_source($trx_preserve_path);
+my $bundle = read_source($bundle_path);
+
+$trx_preserve =~ /static bool trx_preserve_parse_read_view_payload[\s\S]*?^}/m
+  or die "could not isolate trx_preserve_parse_read_view_payload\n";
+my $read_view_parse = $&;
+die "ReadView payload parser must reject zero low_limit_no before import\n"
+  unless $read_view_parse =~ /snapshot->low_limit_no\s*==\s*0/s;
+
+$trx_preserve =~ /dberr_t trx_preserve_import_read_view[\s\S]*?^}/m
+  or die "could not isolate trx_preserve_import_read_view\n";
+my $read_view_import = $&;
+die "ReadView import must compare persisted low limits against current system transaction id before MVCC import\n"
+  unless $read_view_import =~ /trx_sys_get_next_trx_id_or_no/s &&
+         $read_view_import =~ /snapshot\.low_limit_no\s*>\s*next_trx_id_or_no/s &&
+         $read_view_import =~ /snapshot\.low_limit_id\s*>\s*next_trx_id_or_no/s &&
+         $read_view_import =~ /return\s+DB_ERROR/s;
+
+$bundle =~ /bool read_view_payload_is_valid[\s\S]*?^}/m
+  or die "could not isolate read_view_payload_is_valid\n";
+my $bundle_read_view_parse = $&;
+die "bundle validation must reject zero low_limit_no before writing durable snapshots\n"
+  unless $bundle_read_view_parse =~ /view_low_limit_no\s*==\s*0/s;
+EOF
+
+SELECT 'ok' AS readview_low_limit_system_floor_lint;

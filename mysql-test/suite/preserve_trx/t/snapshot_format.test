@@ -29,4 +29,3 @@ print "no preserve temp files\n";
 EOF
 
 SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;

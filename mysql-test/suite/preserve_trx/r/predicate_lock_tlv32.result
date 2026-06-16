@@ -1,0 +1,63 @@
+DROP TABLE IF EXISTS t_predicate_tlv32_anchor;
+DROP TABLE IF EXISTS t_predicate_tlv32;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_predicate_tlv32_anchor(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+CREATE TABLE t_predicate_tlv32(
+id INT PRIMARY KEY,
+pos POINT NOT NULL SRID 0,
+SPATIAL KEY(pos)
+) ENGINE=InnoDB;
+INSERT INTO t_predicate_tlv32_anchor VALUES(1,0);
+INSERT INTO t_predicate_tlv32 VALUES
+(1, ST_GeomFromText('POINT(1 1)')),
+(2, ST_GeomFromText('POINT(10 10)'));
+SET @g = ST_GeomFromText('POLYGON((0 0,0 5,5 5,5 0,0 0))');
+START TRANSACTION;
+UPDATE t_predicate_tlv32_anchor SET v=1 WHERE id=1;
+SELECT COUNT(*) AS locked_rows
+FROM t_predicate_tlv32 FORCE INDEX(pos)
+WHERE MBRWithin(pos, @g) FOR UPDATE;
+locked_rows
+1
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+snapshot_tlv30_count
+1
+snapshot_tlv32_count
+1
+snapshot_tlv30_predicate_entries
+0
+snapshot_tlv32_non_predicate_entries
+0
+SELECT COUNT(*) AS recovered_predicate_locks
+FROM performance_schema.data_locks
+WHERE OBJECT_SCHEMA='test'
+    AND OBJECT_NAME='t_predicate_tlv32'
+    AND INDEX_NAME='pos'
+    AND LOCK_MODE LIKE '%PREDICATE%'
+    AND LOCK_STATUS='GRANTED';
+recovered_predicate_locks
+1
+SELECT LOCKS_COUNT AS preserved_locks_count
+FROM performance_schema.preserved_transactions;
+preserved_locks_count
+6
+SET innodb_lock_wait_timeout=1;
+INSERT INTO t_predicate_tlv32 VALUES
+(3, ST_GeomFromText('POINT(2 2)'));
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ROLLBACK;
+SELECT id, ST_AsText(pos) AS pos
+FROM t_predicate_tlv32 ORDER BY id;
+id	pos
+1	POINT(1 1)
+2	POINT(10 10)
+SELECT * FROM t_predicate_tlv32_anchor;
+id	v
+1	0
+DROP TABLE t_predicate_tlv32;
+DROP TABLE t_predicate_tlv32_anchor;
+SET GLOBAL preserve_trx_enable=ON;

@@ -1,0 +1,193 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_recovery_max_count=200;
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+SELECT COUNT(*) AS session_count
+FROM t_batch_long_control;
+session_count
+100
+SELECT MIN(TIMESTAMPDIFF(MICROSECOND, started_at, NOW(6))) >= 5000000
+AS all_sessions_older_than_five_seconds
+FROM t_batch_long_control;
+all_sessions_older_than_five_seconds
+1
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS;
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+100
+SELECT COUNT(*) AS preserved_state_count
+FROM performance_schema.preserved_transactions
+WHERE STATE = 'PRESERVED';
+preserved_state_count
+100
+SELECT COUNT(*) AS mapped_token_count
+FROM t_batch_long_tokens;
+mapped_token_count
+100
+SELECT COUNT(*) AS preserved_count_after_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_resume
+0
+SELECT COUNT(*) AS resume_success_count
+FROM t_batch_long_audit
+WHERE resumed_ok = 1;
+resume_success_count
+100
+SELECT COUNT(DISTINCT sid) AS resumed_distinct_sessions
+FROM t_batch_long_audit;
+resumed_distinct_sessions
+100
+SELECT MIN(lifecycle_age_us) >= 5000000 AS all_resumed_lifecycles_were_long
+FROM t_batch_long_audit;
+all_resumed_lifecycles_were_long
+1
+SELECT MIN(sql_count) >= 8 AS every_session_ran_enough_sql
+FROM t_batch_long_audit;
+every_session_ran_enough_sql
+1
+SELECT MAX(max_stmt_us) < 1000000 AS every_statement_under_one_second
+FROM t_batch_long_audit;
+every_statement_under_one_second
+1
+SELECT COUNT(*) AS audit_rows
+FROM t_batch_long_audit;
+audit_rows
+100
+SELECT COUNT(*) AS audit_control_case_mismatch_count
+FROM t_batch_long_audit a
+JOIN t_batch_long_control c USING(sid)
+WHERE a.case_id <> c.case_id;
+audit_control_case_mismatch_count
+0
+SELECT COUNT(DISTINCT detail) AS savepoint_cases_ok
+FROM t_batch_long_audit WHERE resumed_ok = 1;
+savepoint_cases_ok
+20
+SELECT detail, COUNT(*) = 5 AS ok
+FROM t_batch_long_audit GROUP BY detail ORDER BY detail;
+detail	ok
+autoinc-savepoint	1
+deep-stack	1
+delete-boundary	1
+final-commit-invariant	1
+insert-boundary	1
+multiple-rollback	1
+new-savepoint-after-resume	1
+own-read-after-rollback	1
+release-latest	1
+release-new-savepoint	1
+release-pre-drain	1
+rollback-new-dml	1
+rollback-pre-drain	1
+rollback-to-older	1
+same-name-overwrite	1
+secondary-update	1
+single-savepoint-rollback	1
+two-savepoints-s2	1
+update-boundary	1
+user-var-expression	1
+SELECT COUNT(*) = 5 AS rollback_to_pre_drain_savepoint_ok
+FROM t_batch_long_audit
+WHERE detail = 'rollback-pre-drain' AND resumed_ok = 1;
+rollback_to_pre_drain_savepoint_ok
+1
+SELECT COUNT(*) = 5 AS release_pre_drain_savepoint_ok
+FROM t_batch_long_audit
+WHERE detail = 'release-pre-drain' AND resumed_ok = 1;
+release_pre_drain_savepoint_ok
+1
+SELECT 1 AS case_id,
+COUNT(*) = 5 AS ok
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 1 AND b.k = 1 AND b.marker = 'before-s1'
+UNION ALL SELECT 2, COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 2 AND b.k = 2 AND b.marker = 'between-s1-s2'
+UNION ALL SELECT 3, COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 3 AND b.k = 3 AND b.marker = 'before-s1'
+UNION ALL SELECT 4, COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 4 AND b.k = 4 AND b.marker = 'before-s1'
+UNION ALL SELECT 5, COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 5 AND b.k = 5 AND b.marker = 'after-first-s1'
+UNION ALL SELECT 6, COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 6 AND b.k = 61 AND b.marker = 'inserted-before-s1'
+UNION ALL SELECT 7, COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 7 AND b.k = 7 AND b.marker = 'updated-before-s1'
+   AND b.v = 7000
+UNION ALL SELECT 8, COUNT(*) = 0
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 8 AND b.k = 8
+UNION ALL SELECT 9, COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 9 AND b.k = 9 AND b.marker = 'after-s1'
+UNION ALL SELECT 10, COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 10 AND b.k = 10 AND b.marker = 'after-rollback-new'
+UNION ALL SELECT 11, COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 11 AND b.k = 11 AND b.marker = 'after-s1'
+UNION ALL SELECT 12, COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 12 AND b.k = 12 AND b.marker = 'sec-before'
+UNION ALL SELECT 13, COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 13 AND b.k = 13 AND b.marker = 'own-before'
+UNION ALL SELECT 14, COUNT(*) = 5
+FROM t_sp_auto a JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 14 AND a.k = 14 AND a.marker = 'auto-before'
+UNION ALL SELECT 15, COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 15 AND b.k = 15 AND b.marker = 'var-resumed'
+UNION ALL SELECT 16, COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 16 AND b.k = 16 AND b.marker = 'deep-final'
+UNION ALL SELECT 17, COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 17 AND b.k = 17 AND b.marker = 'pre-drain'
+UNION ALL SELECT 18, COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 18 AND b.k = 18 AND b.marker = 'released-final'
+UNION ALL SELECT 19, COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 19 AND b.k = 19 AND b.marker = 'old-base'
+UNION ALL SELECT 20,
+(SELECT COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 20 AND b.k = 20 AND b.marker = 'final')
+AND
+(SELECT COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 20 AND b.k = 200
+AND b.marker = 'inserted-before-s2')
+AND
+(SELECT COUNT(*) = 5
+FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 20 AND b.k = 21 AND b.marker = 'seed')
+ORDER BY case_id;
+case_id	ok
+1	1
+2	1
+3	1
+4	1
+5	1
+6	1
+7	1
+8	1
+9	1
+10	1
+11	1
+12	1
+13	1
+14	1
+15	1
+16	1
+17	1
+18	1
+19	1
+20	1
+SET GLOBAL preserve_trx_enable=ON;

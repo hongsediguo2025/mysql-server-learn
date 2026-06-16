@@ -1,0 +1,40 @@
+--source include/not_log_bin.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+
+CREATE TEMPORARY TABLE tmp_preserve_untracked(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+START TRANSACTION;
+SAVEPOINT before_temp_history;
+CREATE TEMPORARY TABLE tmp_preserve_untracked_late(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO tmp_preserve_untracked_late VALUES(1, 10);
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+
+ROLLBACK;
+DROP TEMPORARY TABLE tmp_preserve_untracked_late;
+DROP TEMPORARY TABLE tmp_preserve_untracked;
+
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+START TRANSACTION;
+CREATE TEMPORARY TABLE tmp_preserve_toggle_off_late(
+  id INT PRIMARY KEY
+) ENGINE=InnoDB;
+SET GLOBAL preserve_trx_temp_table_enable=OFF;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+ROLLBACK;
+DROP TEMPORARY TABLE tmp_preserve_toggle_off_late;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

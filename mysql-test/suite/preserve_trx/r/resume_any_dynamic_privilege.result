@@ -1,8 +1,0 @@
-DROP USER IF EXISTS preserve_resume_any@localhost;
-CREATE USER preserve_resume_any@localhost;
-GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO preserve_resume_any@localhost;
-SHOW GRANTS FOR preserve_resume_any@localhost;
-Grants for preserve_resume_any@localhost
-GRANT USAGE ON *.* TO `preserve_resume_any`@`localhost`
-GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO `preserve_resume_any`@`localhost`
-DROP USER preserve_resume_any@localhost;

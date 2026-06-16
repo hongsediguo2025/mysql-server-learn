@@ -40,17 +40,22 @@
 #include "sql/check_stack.h"
 #include "sql/clone_handler.h"
 #include "sql_string.h"
+#include "scope_guard.h"
 #include "template_utils.h"
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
 #endif
 #include <algorithm>
+#include <array>
+#include <limits>
 #include <list>
 #include <map>
+#include <memory>
 #include <new>
 #include <queue>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "dur_prop.h"
 #include "libbinlogevents/include/compression/base.h"
@@ -99,6 +104,10 @@
 #include "sql/protocol.h"
 #include "sql/psi_memory_key.h"
 #include "sql/query_options.h"
+#include "sql/preserve_trx.h"
+#include "sql/preserve_trx_bundle.h"
+#include "sql/preserve_trx_carrier.h"
+#include "sql/preserve_trx_warmcopy.h"
 #include "sql/rpl_filter.h"
 #include "sql/rpl_gtid.h"
 #include "sql/rpl_handler.h"  // RUN_HOOK
@@ -139,6 +148,74 @@ using std::string;
 
 #define FLAGSTR(V, F) ((V) & (F) ? #F " " : "")
 #define YESNO(X) ((X) ? "yes" : "no")
+
+namespace {
+
+class Warmcopy_blob_copy_ostream final : public Basic_ostream {
+ public:
+  explicit Warmcopy_blob_copy_ostream(Preserved_trx_external_blob_writer *writer)
+      : m_writer(writer), m_ctx(EVP_MD_CTX_new()) {
+    if (m_ctx != nullptr && EVP_DigestInit_ex(m_ctx, EVP_sha256(), nullptr) != 1)
+      m_error = true;
+  }
+
+  ~Warmcopy_blob_copy_ostream() override {
+    if (m_ctx != nullptr) EVP_MD_CTX_free(m_ctx);
+  }
+
+  bool write(const unsigned char *buffer, my_off_t length) override {
+    if (m_writer == nullptr || m_ctx == nullptr || length < 0 ||
+        (buffer == nullptr && length != 0) || m_error) {
+      m_error = true;
+      return true;
+    }
+    if (length == 0) return false;
+
+    const size_t write_length = static_cast<size_t>(length);
+    if (m_writer->write_at(m_offset, buffer, write_length) !=
+        Preserved_trx_carrier_status::OK) {
+      m_error = true;
+      return true;
+    }
+    if (EVP_DigestUpdate(m_ctx, buffer, write_length) != 1) {
+      m_error = true;
+      return true;
+    }
+    m_offset += write_length;
+    return false;
+  }
+
+  bool finish(std::array<unsigned char, kPreservedTrxSha256Length> *digest) {
+    if (digest == nullptr || m_ctx == nullptr || m_error) return true;
+    unsigned int length = 0;
+    if (EVP_DigestFinal_ex(m_ctx, digest->data(), &length) != 1 ||
+        length != digest->size()) {
+      return true;
+    }
+    EVP_MD_CTX_free(m_ctx);
+    m_ctx = nullptr;
+    return false;
+  }
+
+  uint64_t bytes_written() const { return m_offset; }
+
+ private:
+  Preserved_trx_external_blob_writer *m_writer{nullptr};
+  EVP_MD_CTX *m_ctx{nullptr};
+  uint64_t m_offset{0};
+  bool m_error{false};
+};
+
+Preserved_trx_external_blob_descriptor descriptor_from_prebuilt_warmcopy_blob(
+    const PrebuiltBinlogCacheBlob &blob) {
+  Preserved_trx_external_blob_descriptor descriptor;
+  descriptor.name = blob.name;
+  descriptor.size = blob.size;
+  descriptor.digest = blob.digest;
+  return descriptor;
+}
+
+}  // namespace
 
 /**
   @defgroup Binary_Log Binary Log
@@ -581,6 +658,62 @@ class binlog_cache_data {
   int flush(THD *thd, my_off_t *bytes, bool *wrote_xid);
   int write_event(Log_event *event);
   size_t get_event_counter() { return event_counter; }
+  void preserve_export_state(Mysql_binlog_preserve_snapshot *snapshot) const {
+    snapshot->event_counter = event_counter;
+    snapshot->immediate = flags.immediate;
+    snapshot->with_xid = flags.with_xid;
+    snapshot->with_sbr = flags.with_sbr;
+    snapshot->with_rbr = flags.with_rbr;
+    snapshot->with_start = flags.with_start;
+    snapshot->with_end = flags.with_end;
+    snapshot->with_content = flags.with_content;
+  }
+  void preserve_import_state(const Mysql_binlog_preserve_snapshot &snapshot) {
+    flags.immediate = snapshot.immediate;
+    flags.with_xid = snapshot.with_xid;
+    flags.with_sbr = snapshot.with_sbr;
+    flags.with_rbr = snapshot.with_rbr;
+    flags.with_start = snapshot.with_start;
+    flags.with_end = snapshot.with_end;
+    flags.with_content = snapshot.with_content;
+    event_counter = snapshot.event_counter;
+  }
+  void preserve_import_reactivated_transaction_state(
+      const Mysql_binlog_preserve_snapshot &snapshot) {
+    preserve_import_state(snapshot);
+    flags.with_xid = false;
+    flags.with_end = false;
+    flags.finalized = false;
+  }
+  bool preserve_export_cache_state(my_off_t position,
+                                   Mysql_binlog_preserve_cache_state *state)
+      const {
+    if (state == nullptr || position == MY_OFF_T_UNDEF) return true;
+    *state = Mysql_binlog_preserve_cache_state{};
+    state->position = static_cast<uint64_t>(position);
+    if (position == 0) return false;
+    const auto it = cache_state_map.find(position);
+    if (it == cache_state_map.end()) return true;
+    state->event_counter = it->second.event_counter;
+    state->with_sbr = it->second.with_sbr;
+    state->with_rbr = it->second.with_rbr;
+    state->with_start = it->second.with_start;
+    state->with_end = it->second.with_end;
+    state->with_content = it->second.with_content;
+    return false;
+  }
+  void preserve_import_cache_state(
+      const Mysql_binlog_preserve_cache_state &state) {
+    if (state.position == 0 || state.position == UINT64_MAX) return;
+    cache_state cache_state;
+    cache_state.with_sbr = state.with_sbr;
+    cache_state.with_rbr = state.with_rbr;
+    cache_state.with_start = state.with_start;
+    cache_state.with_end = state.with_end;
+    cache_state.with_content = state.with_content;
+    cache_state.event_counter = state.event_counter;
+    cache_state_map[static_cast<my_off_t>(state.position)] = cache_state;
+  }
   size_t get_compressed_size() { return m_compressed_size; }
   size_t get_decompressed_size() { return m_decompressed_size; }
   binary_log::transaction::compression::type get_compression_type() {
@@ -985,6 +1118,28 @@ class binlog_trx_cache_data : public binlog_cache_data {
     cache_state_checkpoint(before_stmt_pos);
     DBUG_PRINT("return", ("before_stmt_pos: %llu", (ulonglong)before_stmt_pos));
     return;
+  }
+
+  void preserve_import_prev_position(
+      const Mysql_binlog_preserve_snapshot &snapshot) {
+    before_stmt_pos = snapshot.has_prev_position
+                          ? static_cast<my_off_t>(snapshot.prev_position)
+                          : MY_OFF_T_UNDEF;
+    if (before_stmt_pos != MY_OFF_T_UNDEF)
+      cache_state_checkpoint(before_stmt_pos);
+  }
+
+  bool preserve_truncate_to_reactivated_transaction_state(
+      const Mysql_binlog_preserve_snapshot &snapshot) {
+    if (!snapshot.has_cache_length) return true;
+    if (snapshot.cache_length >
+        static_cast<uint64_t>(std::numeric_limits<my_off_t>::max()))
+      return true;
+    const my_off_t cache_length = static_cast<my_off_t>(snapshot.cache_length);
+    binlog_cache_data::truncate(cache_length);
+    binlog_cache_data::preserve_import_reactivated_transaction_state(snapshot);
+    preserve_import_prev_position(snapshot);
+    return false;
   }
 
   void restore_prev_position() {
@@ -3016,6 +3171,832 @@ bool is_empty_transaction_in_binlog_cache(const THD *thd) {
   }
 
   return false;
+}
+
+bool mysql_binlog_preserve_no_cache_boundary_is_clean(const THD *thd) {
+  DBUG_TRACE;
+
+  if (thd == nullptr) return false;
+  if (!opt_bin_log || !mysql_bin_log.is_open()) return true;
+
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr) return true;
+
+  return (cache_mngr->is_binlog_empty() || cache_mngr->has_empty_transaction()) &&
+         !cache_mngr->stmt_cache.has_incident() &&
+         !cache_mngr->trx_cache.has_incident() &&
+         !cache_mngr->stmt_cache.is_finalized() &&
+         !cache_mngr->trx_cache.is_finalized() &&
+         !cache_mngr->trx_cache.cannot_rollback() &&
+         cache_mngr->trx_cache.get_prev_position() == MY_OFF_T_UNDEF;
+}
+
+class Preserve_binlog_string_ostream final : public Basic_ostream {
+ public:
+  explicit Preserve_binlog_string_ostream(std::string *out) : m_out(out) {}
+
+  bool write(const unsigned char *buffer, my_off_t length) override {
+    if (m_out == nullptr || length < 0) return true;
+    m_out->append(pointer_cast<const char *>(buffer),
+                  static_cast<size_t>(length));
+    return false;
+  }
+
+ private:
+  std::string *m_out;
+};
+
+static bool mysql_binlog_preserve_export_common(
+    THD *thd, Mysql_binlog_preserve_snapshot *snapshot, bool include_payload) {
+  DBUG_TRACE;
+
+  if (thd == nullptr || snapshot == nullptr) return true;
+  if (!opt_bin_log || !mysql_bin_log.is_open()) return true;
+  if (!(thd->variables.option_bits & OPTION_BIN_LOG)) return true;
+  if (thd->variables.gtid_next.type == ANONYMOUS_GTID) return true;
+  if (thd->variables.gtid_next.type == ASSIGNED_GTID &&
+      thd->owned_gtid_is_empty())
+    return true;
+  if (thd->binlog_flush_pending_rows_event(true)) return true;
+
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr) return true;
+  if (cache_mngr->trx_cache.pending() != nullptr) return true;
+  if (!cache_mngr->stmt_cache.is_binlog_empty()) return true;
+  if (cache_mngr->trx_cache.is_binlog_empty()) return true;
+  if (cache_mngr->trx_cache.get_prev_position() != MY_OFF_T_UNDEF) return true;
+  if (cache_mngr->stmt_cache.has_incident() ||
+      cache_mngr->trx_cache.has_incident() ||
+      cache_mngr->stmt_cache.is_finalized() ||
+      cache_mngr->trx_cache.is_finalized() ||
+      cache_mngr->trx_cache.cannot_rollback()) {
+    return true;
+  }
+
+  Mysql_binlog_preserve_snapshot exported;
+  exported.has_prev_position =
+      cache_mngr->trx_cache.get_prev_position() != MY_OFF_T_UNDEF;
+  if (exported.has_prev_position) {
+    exported.prev_position =
+        static_cast<uint64_t>(cache_mngr->trx_cache.get_prev_position());
+  }
+  char gtid_next_buf[Gtid_specification::MAX_TEXT_LENGTH + 1];
+  thd->variables.gtid_next.to_string(global_sid_map, gtid_next_buf, true);
+  exported.gtid_next.assign(gtid_next_buf);
+  if (thd->owned_gtid.sidno > 0) {
+    char owned_gtid_buf[Gtid::MAX_TEXT_LENGTH + 1];
+    thd->owned_gtid.to_string(global_sid_map, owned_gtid_buf, true);
+    exported.owned_gtid.assign(owned_gtid_buf);
+  } else if (thd->owned_gtid.sidno == THD::OWNED_SIDNO_ANONYMOUS) {
+    return true;
+  }
+  exported.has_compression_session_state = true;
+  exported.binlog_trx_compression = thd->variables.binlog_trx_compression;
+  exported.binlog_trx_compression_type =
+      static_cast<uint32_t>(thd->variables.binlog_trx_compression_type);
+  exported.binlog_trx_compression_level_zstd =
+      thd->variables.binlog_trx_compression_level_zstd;
+  cache_mngr->trx_cache.preserve_export_state(&exported);
+  exported.has_cache_length = true;
+  exported.cache_length =
+      static_cast<uint64_t>(cache_mngr->trx_cache.get_byte_position());
+
+  if (include_payload) {
+    Preserve_binlog_string_ostream ostream(&exported.cache_payload);
+    if (cache_mngr->trx_cache.get_cache()->copy_to(&ostream)) return true;
+    if (exported.cache_payload.empty()) return true;
+  }
+
+  *snapshot = std::move(exported);
+  return false;
+}
+
+bool mysql_binlog_preserve_export(THD *thd,
+                                  Mysql_binlog_preserve_snapshot *snapshot) {
+  return mysql_binlog_preserve_export_common(thd, snapshot, true);
+}
+
+bool mysql_binlog_preserve_export_metadata_only(
+    THD *thd, Mysql_binlog_preserve_snapshot *snapshot) {
+  DBUG_EXECUTE_IF("preserve_trx_fail_warmcopy_export_metadata",
+                  return true;);
+  return mysql_binlog_preserve_export_common(thd, snapshot, false);
+}
+
+class Mysql_binlog_warmcopy_session final
+    : public Binlog_cache_warmcopy_mirror {
+ public:
+  Mysql_binlog_warmcopy_session(
+      THD *thd, std::string warmcopy_id, uint64_t epoch,
+      Preserved_trx_warm_external_blob_carrier *carrier,
+      uint64_t max_blob_bytes)
+      : m_thd(thd),
+        m_warmcopy_id(std::move(warmcopy_id)),
+        m_epoch(epoch),
+        m_carrier(carrier),
+        m_max_blob_bytes(max_blob_bytes),
+        m_digest_ctx(EVP_MD_CTX_new()) {
+    if (m_digest_ctx == nullptr ||
+        EVP_DigestInit_ex(m_digest_ctx, EVP_sha256(), nullptr) != 1) {
+      m_degraded = true;
+      m_degraded_reason = "digest initialization failed";
+    }
+  }
+
+  ~Mysql_binlog_warmcopy_session() override {
+    clear_mirror();
+    if (m_writer != nullptr) (void)m_writer->abort();
+    if (m_digest_ctx != nullptr) EVP_MD_CTX_free(m_digest_ctx);
+  }
+
+  bool begin(bool *has_blob) {
+    if (has_blob != nullptr) *has_blob = false;
+    if (m_thd == nullptr || m_carrier == nullptr || m_degraded) return true;
+    if (!opt_bin_log || !mysql_bin_log.is_open()) return false;
+    if (!(m_thd->variables.option_bits & OPTION_BIN_LOG)) return false;
+
+    binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(m_thd);
+    if (cache_mngr == nullptr || cache_mngr->trx_cache.pending() != nullptr ||
+        !cache_mngr->stmt_cache.is_binlog_empty() ||
+        cache_mngr->trx_cache.get_prev_position() != MY_OFF_T_UNDEF ||
+        cache_mngr->stmt_cache.has_incident() ||
+        cache_mngr->trx_cache.has_incident() ||
+        cache_mngr->stmt_cache.is_finalized() ||
+        cache_mngr->trx_cache.is_finalized() ||
+        cache_mngr->trx_cache.cannot_rollback()) {
+      return false;
+    }
+
+    if (m_carrier->create_warm_external_blob_writer(
+            m_warmcopy_id, kPreservedTrxBlobBinlogCache, m_epoch,
+            &m_writer) != Preserved_trx_carrier_status::OK) {
+      return true;
+    }
+
+    my_off_t prefix_end = 0;
+    Binlog_cache_storage *const source_cache = cache_mngr->trx_cache.get_cache();
+    if (source_cache->install_warmcopy_mirror_if_absent(
+            this, &prefix_end, &m_truncate_generation, &m_cache_lease)) {
+      (void)m_writer->abort();
+      m_writer.reset();
+      return false;
+    }
+    if (static_cast<uint64_t>(prefix_end) > m_max_blob_bytes) {
+      mark_degraded("warm-copy prefix exceeds configured limit");
+      return true;
+    }
+    m_prefix_end = static_cast<uint64_t>(prefix_end);
+
+    uint64_t copied = 0;
+    Warmcopy_blob_copy_ostream ostream(m_writer.get());
+    bool stale_generation = false;
+    while (copied < m_prefix_end) {
+      const uint64_t remaining = m_prefix_end - copied;
+      const size_t bytes_to_copy = static_cast<size_t>(
+          std::min<uint64_t>(remaining, preserve_trx_warmcopy_chunk_bytes));
+      if (source_cache->copy_range_to(static_cast<my_off_t>(copied),
+                                      bytes_to_copy, &ostream,
+                                      m_truncate_generation,
+                                      &stale_generation) ||
+          stale_generation) {
+        mark_degraded(stale_generation ? "warm-copy prefix generation stale"
+                                       : "warm-copy prefix copy failed");
+        return true;
+      }
+      copied += bytes_to_copy;
+    }
+    DBUG_EXECUTE_IF("preserve_trx_warmcopy_fail_after_source_copy", {
+      mark_degraded("warm-copy injected failure after prefix source copy");
+      return true;
+    });
+    std::array<unsigned char, kPreservedTrxSha256Length> ignored_digest{};
+    if (ostream.finish(&ignored_digest) || ostream.bytes_written() != m_prefix_end) {
+      mark_degraded("warm-copy prefix digest failed");
+      return true;
+    }
+    DEBUG_SYNC(current_thd, "preserve_trx_warmcopy_before_prefix_digest_replay");
+
+    copied = 0;
+    while (copied < m_prefix_end) {
+      const uint64_t remaining = m_prefix_end - copied;
+      const size_t bytes_to_copy = static_cast<size_t>(
+          std::min<uint64_t>(remaining, preserve_trx_warmcopy_chunk_bytes));
+      Prefix_digest_ostream digest_ostream(this);
+      if (source_cache->copy_range_to(static_cast<my_off_t>(copied),
+                                      bytes_to_copy, &digest_ostream,
+                                      m_truncate_generation,
+                                      &stale_generation) ||
+          stale_generation) {
+        mark_degraded(stale_generation ? "warm-copy digest generation stale"
+                                       : "warm-copy digest copy failed");
+        return true;
+      }
+      copied += bytes_to_copy;
+    }
+    absorb_pending_ranges();
+    if (m_degraded) return true;
+
+    preserve_trx_warmcopy_note_prefix_bytes(m_prefix_end);
+    m_destination_length = std::max(m_destination_length, m_prefix_end);
+    if (flush_writer_durable_watermark()) return true;
+    if (has_blob != nullptr) *has_blob = m_prefix_end != 0;
+    return false;
+  }
+
+  bool active() const { return m_writer != nullptr; }
+
+  uint64_t prefix_bytes() const { return m_prefix_end; }
+
+  bool tail_budget_exceeded(THD *thd, uint64_t tail_budget_bytes,
+                            bool *exceeded) {
+    if (exceeded != nullptr) *exceeded = false;
+    if (thd != m_thd || m_writer == nullptr) return true;
+
+    uint64_t current_length = 0;
+    bool current_has_blob = false;
+    if (mysql_binlog_preserve_warmcopy_cache_length(thd, &current_length,
+                                                    &current_has_blob)) {
+      return true;
+    }
+    if (!current_has_blob || current_length < m_prefix_end) return true;
+    if (exceeded != nullptr)
+      *exceeded = current_length - m_prefix_end > tail_budget_bytes;
+    return false;
+  }
+
+  bool finalize(THD *thd, uint64_t tail_budget_bytes,
+                PrebuiltBinlogCacheBlob *blob, bool *has_blob) {
+    if (has_blob != nullptr) *has_blob = false;
+    if (blob == nullptr) return true;
+    if (thd != m_thd || m_writer == nullptr) return true;
+
+    uint64_t current_length = 0;
+    bool current_has_blob = false;
+    if (mysql_binlog_preserve_warmcopy_cache_length(thd, &current_length,
+                                                    &current_has_blob)) {
+      return true;
+    }
+    if (!current_has_blob || current_length == 0) {
+      (void)m_writer->abort();
+      m_writer.reset();
+      return false;
+    }
+    if (m_degraded || current_length > m_max_blob_bytes ||
+        current_length < m_prefix_end ||
+        current_length - m_prefix_end > tail_budget_bytes ||
+        m_digest_until != current_length ||
+        m_destination_length != current_length ||
+        m_durable_length != current_length || !m_pending_ranges.empty()) {
+      return true;
+    }
+
+    clear_mirror();
+
+    if (m_writer->close_without_sync() != Preserved_trx_carrier_status::OK)
+      return true;
+
+    std::array<unsigned char, kPreservedTrxSha256Length> digest{};
+    unsigned int digest_length = 0;
+    if (m_digest_ctx == nullptr ||
+        EVP_DigestFinal_ex(m_digest_ctx, digest.data(), &digest_length) != 1 ||
+        digest_length != digest.size()) {
+      return true;
+    }
+    EVP_MD_CTX_free(m_digest_ctx);
+    m_digest_ctx = nullptr;
+
+    *blob = PrebuiltBinlogCacheBlob{};
+    blob->warmcopy_id = m_warmcopy_id;
+    blob->name = kPreservedTrxBlobBinlogCache;
+    blob->size = current_length;
+    blob->digest = digest;
+    if (mysql_binlog_preserve_export_metadata_only(thd, &blob->metadata)) {
+      (void)m_writer->abort();
+      return true;
+    }
+    if (m_writer->seal_descriptor(descriptor_from_prebuilt_warmcopy_blob(*blob)) !=
+        Preserved_trx_carrier_status::OK) {
+      (void)m_writer->abort();
+      return true;
+    }
+    if (has_blob != nullptr) *has_blob = true;
+    m_writer.reset();
+    return false;
+  }
+
+  Binlog_warmcopy_mirror_status write_at(uint64_t offset,
+                                         const unsigned char *data,
+                                         size_t length) override {
+    if (m_writer == nullptr || (data == nullptr && length != 0) ||
+        offset > std::numeric_limits<uint64_t>::max() - length ||
+        offset + length > m_max_blob_bytes) {
+      return Binlog_warmcopy_mirror_status::ERROR;
+    }
+    DBUG_EXECUTE_IF("preserve_trx_warmcopy_force_pending_range_limit", {
+      if (length != 0) {
+        mark_degraded("warm-copy pending mirror range limit exceeded");
+        return Binlog_warmcopy_mirror_status::ERROR;
+      }
+    });
+    const bool pending_range = length != 0 && offset > m_digest_until;
+    uint64_t next_pending_range_bytes = m_pending_range_bytes;
+    if (pending_range) {
+      if (m_pending_ranges.find(offset) != m_pending_ranges.end()) {
+        mark_degraded("duplicate warm-copy pending mirror range");
+        return Binlog_warmcopy_mirror_status::ERROR;
+      }
+      if (warmcopy_pending_range_limit_exceeded(
+              static_cast<uint64_t>(m_pending_ranges.size()),
+              m_pending_range_bytes, static_cast<uint64_t>(length),
+              preserve_trx_warmcopy_pending_range_limit,
+              preserve_trx_warmcopy_pending_bytes_limit,
+              &next_pending_range_bytes)) {
+        mark_degraded("warm-copy pending mirror range limit exceeded");
+        return Binlog_warmcopy_mirror_status::ERROR;
+      }
+    }
+    if (m_writer->write_at(offset, data, length) !=
+        Preserved_trx_carrier_status::OK) {
+      return Binlog_warmcopy_mirror_status::ERROR;
+    }
+    m_destination_length =
+        std::max<uint64_t>(m_destination_length, offset + length);
+    if (length == 0) return Binlog_warmcopy_mirror_status::OK;
+    if (offset < m_digest_until) {
+      if (offset + length <= m_digest_until)
+        return flush_writer_durable_watermark()
+                   ? Binlog_warmcopy_mirror_status::ERROR
+                   : Binlog_warmcopy_mirror_status::OK;
+      mark_degraded("overlapping warm-copy mirror write");
+      return Binlog_warmcopy_mirror_status::ERROR;
+    }
+    if (offset == m_digest_until) {
+      if (digest_bytes(data, length)) return Binlog_warmcopy_mirror_status::ERROR;
+      absorb_pending_ranges();
+      if (m_degraded) return Binlog_warmcopy_mirror_status::ERROR;
+      return flush_writer_durable_watermark()
+                 ? Binlog_warmcopy_mirror_status::ERROR
+                 : Binlog_warmcopy_mirror_status::OK;
+    }
+    m_pending_ranges.emplace(offset,
+                             std::string(pointer_cast<const char *>(data),
+                                         length));
+    m_pending_range_bytes = next_pending_range_bytes;
+    return flush_writer_durable_watermark()
+               ? Binlog_warmcopy_mirror_status::ERROR
+               : Binlog_warmcopy_mirror_status::OK;
+  }
+
+  Binlog_warmcopy_mirror_status truncate(uint64_t length) override {
+    if (m_writer == nullptr ||
+        m_writer->truncate(length) != Preserved_trx_carrier_status::OK) {
+      return Binlog_warmcopy_mirror_status::ERROR;
+    }
+    mark_degraded("warm-copy mirror truncate invalidated digest");
+    return Binlog_warmcopy_mirror_status::OK;
+  }
+
+  void mark_degraded(const char *reason) override {
+    if (!m_degraded) {
+      m_degraded = true;
+      m_degraded_reason =
+          reason == nullptr ? "warm-copy mirror degraded" : reason;
+    }
+  }
+
+  void note_source_write_failed() override {
+    mark_degraded("source binlog cache write failed");
+  }
+
+  void note_non_lifecycle_reset() override {
+    detach_source_cache("source binlog cache reset");
+  }
+
+  void note_source_cache_closed() override {
+    detach_source_cache("source binlog cache closed");
+  }
+
+ private:
+  class Prefix_digest_ostream final : public Basic_ostream {
+   public:
+    explicit Prefix_digest_ostream(Mysql_binlog_warmcopy_session *session)
+        : m_session(session) {}
+
+    bool write(const unsigned char *buffer, my_off_t length) override {
+      return m_session == nullptr || length < 0 ||
+             m_session->digest_prefix(buffer, static_cast<size_t>(length));
+    }
+
+   private:
+    Mysql_binlog_warmcopy_session *m_session{nullptr};
+  };
+
+  bool digest_prefix(const unsigned char *data, size_t length) {
+    if (m_digest_until + length > m_prefix_end) return true;
+    return digest_bytes(data, length);
+  }
+
+  bool digest_bytes(const unsigned char *data, size_t length) {
+    if (length == 0) return false;
+    if (m_digest_ctx == nullptr || data == nullptr ||
+        EVP_DigestUpdate(m_digest_ctx, data, length) != 1) {
+      mark_degraded("warm-copy digest update failed");
+      return true;
+    }
+    m_digest_until += length;
+    preserve_trx_warmcopy_note_digest_bytes(length);
+    return false;
+  }
+
+  void absorb_pending_ranges() {
+    for (;;) {
+      auto it = m_pending_ranges.find(m_digest_until);
+      if (it == m_pending_ranges.end()) return;
+      const size_t payload_length = it->second.length();
+      const std::string payload = std::move(it->second);
+      m_pending_ranges.erase(it);
+      m_pending_range_bytes =
+          payload_length > m_pending_range_bytes
+              ? 0
+              : m_pending_range_bytes - static_cast<uint64_t>(payload_length);
+      if (digest_bytes(pointer_cast<const unsigned char *>(payload.data()),
+                       payload.length())) {
+        return;
+      }
+    }
+  }
+
+  bool flush_writer_durable_watermark() {
+    if (m_writer == nullptr) return true;
+    if (m_writer->flush() != Preserved_trx_carrier_status::OK) {
+      mark_degraded("warm-copy durable flush failed");
+      return true;
+    }
+    if (m_destination_length > m_durable_length) {
+      preserve_trx_warmcopy_note_durable_bytes(m_destination_length -
+                                               m_durable_length);
+      m_durable_length = m_destination_length;
+    }
+    return false;
+  }
+
+  void clear_mirror() {
+    std::shared_ptr<Binlog_cache_warmcopy_lease> lease;
+    lease.swap(m_cache_lease);
+    if (lease != nullptr) lease->clear_if_owner(this);
+  }
+
+  void detach_source_cache(const char *reason) { mark_degraded(reason); }
+
+  THD *m_thd{nullptr};
+  std::string m_warmcopy_id;
+  uint64_t m_epoch{0};
+  Preserved_trx_warm_external_blob_carrier *m_carrier{nullptr};
+  uint64_t m_max_blob_bytes{0};
+  std::unique_ptr<Preserved_trx_external_blob_writer> m_writer;
+  std::shared_ptr<Binlog_cache_warmcopy_lease> m_cache_lease;
+  EVP_MD_CTX *m_digest_ctx{nullptr};
+  std::map<uint64_t, std::string> m_pending_ranges;
+  uint64_t m_pending_range_bytes{0};
+  uint64_t m_truncate_generation{0};
+  uint64_t m_prefix_end{0};
+  uint64_t m_digest_until{0};
+  uint64_t m_destination_length{0};
+  uint64_t m_durable_length{0};
+  bool m_degraded{false};
+  std::string m_degraded_reason;
+};
+
+bool mysql_binlog_preserve_warmcopy_cache_length(THD *thd, uint64_t *length,
+                                                 bool *has_blob) {
+  if (length != nullptr) *length = 0;
+  if (has_blob != nullptr) *has_blob = false;
+  if (thd == nullptr || length == nullptr) return true;
+
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr || cache_mngr->trx_cache.pending() != nullptr ||
+      !cache_mngr->stmt_cache.is_binlog_empty() ||
+      cache_mngr->trx_cache.is_binlog_empty() ||
+      cache_mngr->trx_cache.get_prev_position() != MY_OFF_T_UNDEF ||
+      cache_mngr->stmt_cache.has_incident() ||
+      cache_mngr->trx_cache.has_incident() ||
+      cache_mngr->stmt_cache.is_finalized() ||
+      cache_mngr->trx_cache.is_finalized() ||
+      cache_mngr->trx_cache.cannot_rollback()) {
+    return false;
+  }
+
+  const my_off_t cache_length = cache_mngr->trx_cache.get_cache()->length();
+  if (cache_length <= 0) return false;
+  *length = static_cast<uint64_t>(cache_length);
+  if (has_blob != nullptr) *has_blob = true;
+  return false;
+}
+
+bool mysql_binlog_preserve_warmcopy_build_blob(
+    THD *thd, const std::string &warmcopy_id, uint64_t epoch,
+    Preserved_trx_warm_external_blob_carrier *carrier,
+    uint64_t max_blob_bytes, PrebuiltBinlogCacheBlob *blob, bool *has_blob) {
+  if (has_blob != nullptr) *has_blob = false;
+  if (thd == nullptr || carrier == nullptr || blob == nullptr) return true;
+
+  Mysql_binlog_preserve_snapshot metadata;
+  if (mysql_binlog_preserve_export_metadata_only(thd, &metadata)) return true;
+
+  uint64_t cache_length = 0;
+  bool cache_has_blob = false;
+  if (mysql_binlog_preserve_warmcopy_cache_length(thd, &cache_length,
+                                                  &cache_has_blob)) {
+    return true;
+  }
+  if (!cache_has_blob) return false;
+  if (cache_length > max_blob_bytes) return true;
+
+  std::unique_ptr<Preserved_trx_external_blob_writer> writer;
+  if (carrier->create_warm_external_blob_writer(
+          warmcopy_id, kPreservedTrxBlobBinlogCache, epoch, &writer) !=
+      Preserved_trx_carrier_status::OK) {
+    return true;
+  }
+
+  Warmcopy_blob_copy_ostream ostream(writer.get());
+  bool stale_generation = false;
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr) {
+    (void)writer->abort();
+    return true;
+  }
+  const uint64_t truncate_generation =
+      cache_mngr->trx_cache.get_cache()->truncate_generation();
+  uint64_t copied = 0;
+  while (copied < cache_length) {
+    const uint64_t remaining = cache_length - copied;
+    const size_t bytes_to_copy = static_cast<size_t>(
+        std::min<uint64_t>(remaining, preserve_trx_warmcopy_chunk_bytes));
+    if (cache_mngr->trx_cache.get_cache()->copy_range_to(
+            static_cast<my_off_t>(copied), bytes_to_copy, &ostream,
+            truncate_generation, &stale_generation) ||
+        stale_generation) {
+      (void)writer->abort();
+      return true;
+    }
+    copied += bytes_to_copy;
+  }
+  DBUG_EXECUTE_IF("preserve_trx_warmcopy_fail_after_source_copy", {
+    (void)writer->abort();
+    return true;
+  });
+  if (writer->flush() != Preserved_trx_carrier_status::OK ||
+      writer->close() != Preserved_trx_carrier_status::OK) {
+    (void)writer->abort();
+    return true;
+  }
+
+  std::array<unsigned char, kPreservedTrxSha256Length> digest{};
+  if (ostream.finish(&digest) || ostream.bytes_written() != cache_length) {
+    (void)carrier->remove_warm_external_blob(warmcopy_id,
+                                             kPreservedTrxBlobBinlogCache);
+    return true;
+  }
+
+  *blob = PrebuiltBinlogCacheBlob{};
+  blob->warmcopy_id = warmcopy_id;
+  blob->name = kPreservedTrxBlobBinlogCache;
+  blob->size = cache_length;
+  blob->digest = digest;
+  blob->metadata = std::move(metadata);
+  if (writer->seal_descriptor(descriptor_from_prebuilt_warmcopy_blob(*blob)) !=
+      Preserved_trx_carrier_status::OK) {
+    (void)writer->abort();
+    return true;
+  }
+  if (has_blob != nullptr) *has_blob = true;
+  return false;
+}
+
+bool mysql_binlog_preserve_warmcopy_begin_session(
+    THD *thd, const std::string &warmcopy_id, uint64_t epoch,
+    Preserved_trx_warm_external_blob_carrier *carrier,
+    uint64_t max_blob_bytes, Mysql_binlog_warmcopy_session **session,
+    bool *has_blob, uint64_t *prefix_bytes) {
+  if (session != nullptr) *session = nullptr;
+  if (has_blob != nullptr) *has_blob = false;
+  if (prefix_bytes != nullptr) *prefix_bytes = 0;
+  if (thd == nullptr || carrier == nullptr || session == nullptr) return true;
+
+  std::unique_ptr<Mysql_binlog_warmcopy_session> owned_session(
+      new Mysql_binlog_warmcopy_session(thd, warmcopy_id, epoch, carrier,
+                                        max_blob_bytes));
+  if (owned_session->begin(has_blob)) return true;
+  if (prefix_bytes != nullptr) *prefix_bytes = owned_session->prefix_bytes();
+  if (!owned_session->active()) return false;
+
+  *session = owned_session.release();
+  return false;
+}
+
+bool mysql_binlog_preserve_warmcopy_finalize_session(
+    THD *thd, Mysql_binlog_warmcopy_session *session,
+    uint64_t tail_budget_bytes, PrebuiltBinlogCacheBlob *blob,
+    bool *has_blob) {
+  if (has_blob != nullptr) *has_blob = false;
+  if (session == nullptr) return true;
+  return session->finalize(thd, tail_budget_bytes, blob, has_blob);
+}
+
+bool mysql_binlog_preserve_warmcopy_tail_budget_exceeded(
+    THD *thd, Mysql_binlog_warmcopy_session *session,
+    uint64_t tail_budget_bytes, bool *exceeded) {
+  if (exceeded != nullptr) *exceeded = false;
+  if (session == nullptr) return true;
+  return session->tail_budget_exceeded(thd, tail_budget_bytes, exceeded);
+}
+
+void mysql_binlog_preserve_warmcopy_abort_session(
+    Mysql_binlog_warmcopy_session *session) {
+  delete session;
+}
+
+bool mysql_binlog_preserve_import(
+    THD *thd, const Mysql_binlog_preserve_snapshot &snapshot) {
+  DBUG_TRACE;
+
+  if (thd == nullptr || snapshot.cache_payload.empty()) return true;
+  if (!opt_bin_log || !mysql_bin_log.is_open()) return true;
+  if (!(thd->variables.option_bits & OPTION_BIN_LOG)) return true;
+  const auto saved_binlog_trx_compression =
+      thd->variables.binlog_trx_compression;
+  const auto saved_binlog_trx_compression_type =
+      thd->variables.binlog_trx_compression_type;
+  const auto saved_binlog_trx_compression_level_zstd =
+      thd->variables.binlog_trx_compression_level_zstd;
+  bool keep_imported_compression_state =
+      !snapshot.has_compression_session_state;
+  auto restore_compression_state_on_failure = create_scope_guard([&]() {
+    if (!keep_imported_compression_state) {
+      thd->variables.binlog_trx_compression = saved_binlog_trx_compression;
+      thd->variables.binlog_trx_compression_type =
+          saved_binlog_trx_compression_type;
+      thd->variables.binlog_trx_compression_level_zstd =
+          saved_binlog_trx_compression_level_zstd;
+    }
+  });
+  if (snapshot.has_compression_session_state) {
+    thd->variables.binlog_trx_compression = snapshot.binlog_trx_compression;
+    thd->variables.binlog_trx_compression_type =
+        snapshot.binlog_trx_compression_type;
+    thd->variables.binlog_trx_compression_level_zstd =
+        snapshot.binlog_trx_compression_level_zstd;
+  }
+  if (thd->binlog_setup_trx_data()) return true;
+
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr || !cache_mngr->is_binlog_empty()) return true;
+
+  register_binlog_handler(thd, true);
+  Binlog_cache_storage *const trx_cache = cache_mngr->get_trx_cache();
+  if (trx_cache->write(pointer_cast<const unsigned char *>(
+                           snapshot.cache_payload.data()),
+                       static_cast<my_off_t>(snapshot.cache_payload.size()))) {
+    cache_mngr->reset();
+    return true;
+  }
+  cache_mngr->trx_cache.preserve_import_state(snapshot);
+  cache_mngr->trx_cache.preserve_import_prev_position(snapshot);
+  keep_imported_compression_state = true;
+  return false;
+}
+
+bool mysql_binlog_preserve_reactivate_after_prepare_failure(
+    THD *thd, const Mysql_binlog_preserve_snapshot &snapshot) {
+  DBUG_TRACE;
+
+  if (thd == nullptr ||
+      (snapshot.cache_payload.empty() && !snapshot.has_cache_length)) {
+    return true;
+  }
+  if (!opt_bin_log || !mysql_bin_log.is_open()) return true;
+  if (!(thd->variables.option_bits & OPTION_BIN_LOG)) return true;
+  if (binlog_hton == nullptr || binlog_hton->slot == HA_SLOT_UNDEF)
+    return true;
+  const auto saved_binlog_trx_compression =
+      thd->variables.binlog_trx_compression;
+  const auto saved_binlog_trx_compression_type =
+      thd->variables.binlog_trx_compression_type;
+  const auto saved_binlog_trx_compression_level_zstd =
+      thd->variables.binlog_trx_compression_level_zstd;
+  bool keep_imported_compression_state =
+      !snapshot.has_compression_session_state;
+  auto restore_compression_state_on_failure = create_scope_guard([&]() {
+    if (!keep_imported_compression_state) {
+      thd->variables.binlog_trx_compression = saved_binlog_trx_compression;
+      thd->variables.binlog_trx_compression_type =
+          saved_binlog_trx_compression_type;
+      thd->variables.binlog_trx_compression_level_zstd =
+          saved_binlog_trx_compression_level_zstd;
+    }
+  });
+  if (snapshot.has_compression_session_state) {
+    thd->variables.binlog_trx_compression = snapshot.binlog_trx_compression;
+    thd->variables.binlog_trx_compression_type =
+        snapshot.binlog_trx_compression_type;
+    thd->variables.binlog_trx_compression_level_zstd =
+        snapshot.binlog_trx_compression_level_zstd;
+  }
+  if (thd->binlog_setup_trx_data()) return true;
+
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr) return true;
+
+  register_binlog_handler(thd, true);
+  if (!snapshot.cache_payload.empty()) {
+    cache_mngr->trx_cache.reset();
+    Binlog_cache_storage *const trx_cache = cache_mngr->get_trx_cache();
+    if (trx_cache->write(pointer_cast<const unsigned char *>(
+                             snapshot.cache_payload.data()),
+                         static_cast<my_off_t>(snapshot.cache_payload.size()))) {
+      cache_mngr->trx_cache.reset();
+      return true;
+    }
+    cache_mngr->trx_cache.preserve_import_reactivated_transaction_state(
+        snapshot);
+    cache_mngr->trx_cache.preserve_import_prev_position(snapshot);
+  } else {
+    if (cache_mngr->trx_cache.preserve_truncate_to_reactivated_transaction_state(
+            snapshot)) {
+      return true;
+    }
+  }
+  thd->clear_binlog_table_maps();
+
+  Ha_data *const ha_data = thd->get_ha_data(binlog_hton->slot);
+  Ha_trx_info *const session_info =
+      &ha_data->ha_info[Transaction_ctx::SESSION];
+  if (!session_info->is_started())
+    trans_register_ha(thd, true, binlog_hton, nullptr);
+  session_info->set_trx_read_write();
+  ha_data->ha_info[Transaction_ctx::STMT].reset();
+  thd->get_transaction()->reset_scope(Transaction_ctx::STMT);
+  cache_mngr->trx_cache.set_prev_position(MY_OFF_T_UNDEF);
+  keep_imported_compression_state = true;
+  return false;
+}
+
+bool mysql_binlog_preserve_reactivate_after_detach_failure(
+    THD *thd, const Mysql_binlog_preserve_snapshot &snapshot) {
+  DBUG_TRACE;
+
+  if (thd == nullptr) return true;
+  if (binlog_hton != nullptr && binlog_hton->slot != HA_SLOT_UNDEF) {
+    Ha_data *const ha_data = thd->get_ha_data(binlog_hton->slot);
+    ha_data->ha_info[Transaction_ctx::SESSION].reset();
+    ha_data->ha_info[Transaction_ctx::STMT].reset();
+  }
+  thd->get_transaction()->reset_scope(Transaction_ctx::SESSION);
+  thd->get_transaction()->reset_scope(Transaction_ctx::STMT);
+  return mysql_binlog_preserve_reactivate_after_prepare_failure(thd, snapshot);
+}
+
+bool mysql_binlog_preserve_get_cache_state(
+    THD *thd, uint64_t position, Mysql_binlog_preserve_cache_state *state) {
+  DBUG_TRACE;
+
+  if (thd == nullptr || state == nullptr || position == UINT64_MAX)
+    return true;
+  if (!opt_bin_log || !mysql_bin_log.is_open()) return true;
+  if (!(thd->variables.option_bits & OPTION_BIN_LOG)) return true;
+
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr) return true;
+  return cache_mngr->trx_cache.preserve_export_cache_state(
+      static_cast<my_off_t>(position), state);
+}
+
+bool mysql_binlog_preserve_import_cache_state(
+    THD *thd, const Mysql_binlog_preserve_cache_state &state) {
+  DBUG_TRACE;
+
+  if (thd == nullptr || state.position == UINT64_MAX) return true;
+  if (!opt_bin_log || !mysql_bin_log.is_open()) return true;
+  if (!(thd->variables.option_bits & OPTION_BIN_LOG)) return true;
+
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr) return true;
+  cache_mngr->trx_cache.preserve_import_cache_state(state);
+  return false;
+}
+
+void mysql_binlog_preserve_discard(THD *thd) {
+  DBUG_TRACE;
+
+  if (thd == nullptr || !opt_bin_log || !mysql_bin_log.is_open()) return;
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr != nullptr) cache_mngr->reset();
+  if (binlog_hton != nullptr && binlog_hton->slot != HA_SLOT_UNDEF) {
+    Ha_data *const ha_data = thd->get_ha_data(binlog_hton->slot);
+    ha_data->ha_info[Transaction_ctx::SESSION].reset();
+    ha_data->ha_info[Transaction_ctx::STMT].reset();
+  }
 }
 
 /**

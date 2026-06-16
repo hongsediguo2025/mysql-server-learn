@@ -1,0 +1,35 @@
+DROP TABLE IF EXISTS t_concurrent_resume_race;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_concurrent_resume_race(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_concurrent_resume_race VALUES(1, 10);
+START TRANSACTION;
+UPDATE t_concurrent_resume_race SET v = 11 WHERE id = 1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET DEBUG_SYNC =
+'preserve_trx_after_resume_failure_record_readd_with_error SIGNAL resume_record_readded WAIT_FOR continue_resume_restore';
+SET SESSION debug="+d,preserve_trx_fail_resume_set_isolation";
+RESUME PRESERVED TRANSACTION 'TOKEN';
+SET DEBUG_SYNC = 'now WAIT_FOR resume_record_readded TIMEOUT 10';
+SELECT COUNT(*) AS clean_preserved_records FROM performance_schema.preserved_transactions WHERE TOKEN = 'TOKEN' AND STATE = 'PRESERVED' AND LAST_ERROR IS NULL;
+clean_preserved_records
+0
+SELECT COUNT(*) AS preserved_error_records FROM performance_schema.preserved_transactions WHERE TOKEN = 'TOKEN' AND STATE = 'PRESERVED' AND LAST_ERROR IS NOT NULL;
+preserved_error_records
+1
+SET DEBUG_SYNC = 'now SIGNAL continue_resume_restore';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET DEBUG_SYNC = 'RESET';
+SELECT COUNT(*) AS clean_preserved_records FROM performance_schema.preserved_transactions WHERE TOKEN = 'TOKEN' AND STATE = 'PRESERVED' AND LAST_ERROR IS NULL;
+clean_preserved_records
+0
+SELECT COUNT(*) AS preserved_error_records FROM performance_schema.preserved_transactions WHERE TOKEN = 'TOKEN' AND STATE = 'PRESERVED' AND LAST_ERROR IS NOT NULL;
+preserved_error_records
+1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+SELECT * FROM t_concurrent_resume_race ORDER BY id;
+id	v
+1	11
+DROP TABLE t_concurrent_resume_race;
+SET GLOBAL preserve_trx_enable=ON;
+SET DEBUG_SYNC = 'RESET';

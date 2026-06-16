@@ -1,0 +1,78 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP VIEW IF EXISTS v_rtv_mdl_base;
+DROP TRIGGER IF EXISTS t_rtv_mdl_bu;
+DROP FUNCTION IF EXISTS f_rtv_mdl_delta;
+DROP PROCEDURE IF EXISTS p_rtv_mdl_bump;
+DROP TABLE IF EXISTS t_rtv_mdl_audit;
+DROP TABLE IF EXISTS t_rtv_mdl_base;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_rtv_mdl_base(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE t_rtv_mdl_audit(
+  id INT NOT NULL,
+  old_v INT NOT NULL,
+  new_v INT NOT NULL,
+  PRIMARY KEY(id, old_v, new_v)
+) ENGINE=InnoDB;
+INSERT INTO t_rtv_mdl_base VALUES(1,10),(2,20),(3,30);
+
+delimiter |;
+CREATE PROCEDURE p_rtv_mdl_bump(IN p_id INT, IN p_delta INT)
+BEGIN
+  UPDATE t_rtv_mdl_base SET v=v+p_delta WHERE id=p_id;
+END|
+
+CREATE FUNCTION f_rtv_mdl_delta(p_base INT) RETURNS INT DETERMINISTIC
+BEGIN
+  RETURN p_base + 1;
+END|
+
+CREATE VIEW v_rtv_mdl_base AS
+  SELECT id, v FROM t_rtv_mdl_base|
+
+CREATE TRIGGER t_rtv_mdl_bu BEFORE UPDATE ON t_rtv_mdl_base
+FOR EACH ROW
+BEGIN
+  INSERT INTO t_rtv_mdl_audit VALUES(OLD.id, OLD.v, NEW.v);
+END|
+delimiter ;|
+
+START TRANSACTION;
+CALL p_rtv_mdl_bump(1,10);
+UPDATE t_rtv_mdl_base SET v=f_rtv_mdl_delta(v) WHERE id=2;
+UPDATE v_rtv_mdl_base SET v=v+30 WHERE id=3;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+UPDATE t_rtv_mdl_base SET v=v+1 WHERE id=1;
+COMMIT;
+
+SELECT * FROM t_rtv_mdl_base ORDER BY id;
+SELECT * FROM t_rtv_mdl_audit ORDER BY id, old_v, new_v;
+
+DROP VIEW v_rtv_mdl_base;
+DROP TRIGGER t_rtv_mdl_bu;
+DROP FUNCTION f_rtv_mdl_delta;
+DROP PROCEDURE p_rtv_mdl_bump;
+DROP TABLE t_rtv_mdl_audit;
+DROP TABLE t_rtv_mdl_base;
+SET GLOBAL preserve_trx_enable=ON;

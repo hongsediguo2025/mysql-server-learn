@@ -1,0 +1,60 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+CALL mtr.add_suppression("Preserved transaction batch cleanup failed after debug injected target error");
+
+--disable_warnings
+DROP TABLE IF EXISTS t_batch_restore_activate_failure;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_batch_restore_activate_failure(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+--connect(batch_restore_activate_a,localhost,root,,test)
+--connection batch_restore_activate_a
+START TRANSACTION;
+INSERT INTO t_batch_restore_activate_failure VALUES(1,10);
+
+--connect(batch_restore_activate_b,localhost,root,,test)
+--connection batch_restore_activate_b
+START TRANSACTION;
+INSERT INTO t_batch_restore_activate_failure VALUES(2,20);
+
+--connection default
+SET SESSION debug="+d,preserve_trx_batch_fail_after_one_target,preserve_trx_fail_activate_reattached_original";
+--error ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET SESSION debug="-d,preserve_trx_batch_fail_after_one_target,preserve_trx_fail_activate_reattached_original";
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+SELECT TOKEN, STATE, LAST_ERROR IS NOT NULL AS has_last_error
+  FROM performance_schema.preserved_transactions;
+--let $expect_bin= 1
+--source suite/preserve_trx/include/assert_preserve_dir_files.inc
+
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+ROLLBACK;
+
+--connection batch_restore_activate_a
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--disconnect batch_restore_activate_a
+
+--connection batch_restore_activate_b
+ROLLBACK;
+--disconnect batch_restore_activate_b
+
+--connection default
+SELECT * FROM t_batch_restore_activate_failure ORDER BY id;
+
+DROP TABLE t_batch_restore_activate_failure;
+SET GLOBAL preserve_trx_enable=ON;

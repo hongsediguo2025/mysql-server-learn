@@ -1,0 +1,32 @@
+--echo # Lint-only source-shape guard; behavior is covered by temp sidecar
+--echo # recovery MTR plus preserve_trx_temp_table-t gunit parser checks.
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+my $gunit_path = File::Spec->catfile($source_root, 'unittest', 'gunit',
+                                     'preserve_trx_temp_table-t.cc');
+open(my $fh, '<', $gunit_path) or die "cannot open $gunit_path: $!";
+my $gunit = do { local $/; <$fh> };
+close($fh);
+
+die "gunit must reject no-redo undo sidecars whose rseg identity does not match the table image\n"
+  unless $gunit =~ /RejectsRsegIdentityMismatchWithoutMutation/s &&
+         $gunit =~ /RejectsPageLevelRsegIdentityMismatchWithoutMutation/s &&
+         $gunit =~ /RejectsRsegSlotMismatchWithoutMutation/s;
+die "gunit must reject manifests with partial no-redo undo sidecar pairing\n"
+  unless $gunit =~ /RejectsManifestWithPartialNoRedoUndoSidecars/s;
+die "gunit must reject shared source-space manifests whose physical image sidecar identity conflicts\n"
+  unless $gunit =~ /RejectsSharedSourceSpaceWithConflictingPhysicalImageSidecar/s;
+die "gunit must validate sealed image and undo sidecars through the decoded TLV80 manifest\n"
+  unless $gunit =~ /DecodedTlv80RejectsMissingOrCorruptSidecars/s &&
+         $gunit =~ /carrier\.read_sealed_image/s &&
+         $gunit =~ /carrier\.read_sealed_undo/s;
+EOF
+
+SELECT 'ok' AS temp_table_sidecar_pair_mismatch_rollback_lint;

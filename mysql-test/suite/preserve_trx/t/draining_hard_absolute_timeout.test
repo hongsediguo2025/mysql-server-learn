@@ -1,0 +1,47 @@
+--source include/have_debug.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_preserve_drain_hard_timeout;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_drain_mode=HARD;
+SET GLOBAL preserve_trx_drain_hard_timeout_ms=50;
+
+CREATE TABLE t_preserve_drain_hard_timeout(a INT PRIMARY KEY, b INT)
+  ENGINE=InnoDB;
+INSERT INTO t_preserve_drain_hard_timeout VALUES(1,10),(2,20);
+
+--connect(drain_hard_timeout_blocker,localhost,root,,test)
+--connection drain_hard_timeout_blocker
+START TRANSACTION;
+UPDATE t_preserve_drain_hard_timeout SET b=21 WHERE a=2;
+
+--connect(drain_hard_timeout_preserve,localhost,root,,test)
+--connection drain_hard_timeout_preserve
+SET SESSION debug="+d,preserve_trx_drain_skip_kill_active";
+START TRANSACTION;
+UPDATE t_preserve_drain_hard_timeout SET b=11 WHERE a=1;
+--error ER_PRESERVE_TRX_DRAIN_TIMEOUT
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug="-d,preserve_trx_drain_skip_kill_active";
+SELECT * FROM t_preserve_drain_hard_timeout WHERE a=1;
+ROLLBACK;
+--disconnect drain_hard_timeout_preserve
+
+--connection drain_hard_timeout_blocker
+SELECT * FROM t_preserve_drain_hard_timeout WHERE a=2;
+ROLLBACK;
+--disconnect drain_hard_timeout_blocker
+
+--connection default
+SELECT * FROM t_preserve_drain_hard_timeout ORDER BY a;
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+DROP TABLE t_preserve_drain_hard_timeout;
+SET GLOBAL preserve_trx_drain_hard_timeout_ms=30000;
+SET GLOBAL preserve_trx_drain_mode=SOFT;
+SET GLOBAL preserve_trx_enable=ON;
+SET DEBUG_SYNC = 'RESET';

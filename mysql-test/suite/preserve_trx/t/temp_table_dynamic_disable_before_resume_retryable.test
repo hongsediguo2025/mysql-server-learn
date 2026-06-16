@@ -1,0 +1,68 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+CALL mtr.add_suppression("Preserved transaction '.*' resume forced rollback: recovery timeout expired");
+CALL mtr.add_suppression("RESUME PRESERVED TRANSACTION '.*' failed: token is pending and cannot be resumed");
+--enable_query_log
+
+--disable_warnings
+DROP TABLE IF EXISTS t_temp_dynamic_disable_base;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET SESSION preserve_trx_min_timeout=1;
+SET SESSION preserve_trx_default_timeout=1;
+SET SESSION preserve_trx_max_timeout=86400;
+
+CREATE TABLE t_temp_dynamic_disable_base(id INT PRIMARY KEY, v INT)
+  ENGINE=InnoDB;
+INSERT INTO t_temp_dynamic_disable_base VALUES(1,10);
+
+CREATE TEMPORARY TABLE tmp_dynamic_disable_before_resume(
+  id INT PRIMARY KEY,
+  v INT,
+  KEY(v)
+) ENGINE=InnoDB;
+INSERT INTO tmp_dynamic_disable_before_resume VALUES(1,100),(2,200);
+
+START TRANSACTION;
+UPDATE t_temp_dynamic_disable_base SET v=11 WHERE id=1;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+--source include/wait_until_disconnected.inc
+
+--sleep 2
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=OFF --preserve-trx-recovery-grace-seconds=30" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+SELECT COUNT(*) AS preserved_count_before_disabled_resume
+  FROM performance_schema.preserved_transactions;
+--replace_result $preserved_token TOKEN
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+SELECT COUNT(*) AS preserved_count_after_disabled_resume
+  FROM performance_schema.preserved_transactions;
+SELECT * FROM t_temp_dynamic_disable_base ORDER BY id;
+
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+SELECT * FROM tmp_dynamic_disable_before_resume ORDER BY id;
+COMMIT;
+SELECT COUNT(*) AS preserved_count_after_enabled_resume
+  FROM performance_schema.preserved_transactions;
+SELECT * FROM t_temp_dynamic_disable_base ORDER BY id;
+DROP TEMPORARY TABLE tmp_dynamic_disable_before_resume;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+DROP TABLE t_temp_dynamic_disable_base;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_enable=ON;

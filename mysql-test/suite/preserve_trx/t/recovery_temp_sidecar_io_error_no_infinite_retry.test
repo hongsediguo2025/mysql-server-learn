@@ -1,0 +1,102 @@
+--source include/not_windows.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+--disable_query_log
+CALL mtr.add_suppression("TEMP_SIDECAR_IO_RETRY");
+CALL mtr.add_suppression("TEMP_SIDECAR_IO_ABORT");
+CALL mtr.add_suppression("Preserved transaction .* recovery failed: preserved temporary table image sidecar read failed");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved temporary table image sidecar read failed");
+CALL mtr.add_suppression("PRESERVE: failed to delete preserved temporary table sidecars");
+CALL mtr.add_suppression("\\[FATAL\\] Preserved temporary table bootstrap failed before InnoDB recovery could proceed");
+CALL mtr.add_suppression("Plugin initialization aborted at srv0start.cc.* with error Generic error");
+CALL mtr.add_suppression("Plugin initialization aborted with error Generic error");
+CALL mtr.add_suppression("Failed to initialize DD Storage Engine");
+CALL mtr.add_suppression("Data Dictionary initialization failed");
+CALL mtr.add_suppression("Assertion failure: ha_innodb.cc:.*ib::fatal triggered");
+CALL mtr.add_suppression("Aborting");
+CALL mtr.add_suppression("Attempting backtrace");
+CALL mtr.add_suppression("You can use the following information to find out");
+--enable_query_log
+
+SET GLOBAL preserve_trx_enable=ON;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source include/wait_until_disconnected.inc
+
+--let TEMP_SNAPSHOT_TOKEN= temp_sidecar_io
+--let TEMP_SNAPSHOT_SPACE_ID= 4243767311
+--let TEMP_SNAPSHOT_CORRUPT_IMAGE= 0
+--let TEMP_SNAPSHOT_INCLUDE_UNDO= 1
+--let TEMP_SNAPSHOT_CORRUPT_UNDO= 0
+--source suite/preserve_trx/include/write_temp_table_preserved_snapshot.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
+my $image = File::Spec->catfile($datadir, 'preserve',
+                                'temp_sidecar_io.tempts.4243767311.image');
+chmod 0000, $image or die "cannot make image sidecar unreadable: $!";
+EOF
+
+--let $_server_id= 1
+--let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--let $restart_parameters= --preserve-trx-enable=ON --preserve-trx-temp-table-enable=OFF
+--source include/start_mysqld_expecting_crash.inc
+
+--let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $grep_pattern= TEMP_SIDECAR_IO_ABORT token='.*' attempt=3 reason=preserved temporary table image sidecar read failed
+--let $wait_timeout= 30
+--source include/wait_for_pattern_in_file.inc
+--source suite/preserve_trx/include/wait_for_expected_crash.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
+my $image = File::Spec->catfile($datadir, 'preserve',
+                                'temp_sidecar_io.tempts.4243767311.image');
+chmod 0600, $image or die "cannot restore image sidecar permissions: $!";
+EOF
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=OFF" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+--let $assert_text= Temp sidecar I/O error is reported
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_select= preserved temporary table image sidecar read failed
+--let $assert_count_condition= >= 1
+--source include/assert_grep.inc
+--let $assert_count_condition=
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
+my $preserve_dir = File::Spec->catdir($datadir, 'preserve');
+for my $name (
+  'temp_sidecar_io.bin',
+  'temp_sidecar_io.tempts.4243767311.image',
+  'temp_sidecar_io.tempts.4243767311.undo') {
+  my $path = File::Spec->catfile($preserve_dir, $name);
+  die "unexpected preserved temp artifact remains: $path" if -e $path;
+}
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

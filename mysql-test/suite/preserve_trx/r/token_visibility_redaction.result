@@ -1,0 +1,92 @@
+DROP USER IF EXISTS preserve_owner@localhost;
+DROP USER IF EXISTS preserve_unprivileged_reader@localhost;
+DROP USER IF EXISTS preserve_process@localhost;
+DROP USER IF EXISTS preserve_resume_any_reader@localhost;
+DROP TABLE IF EXISTS t_preserve_token_visibility;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_preserve_token_visibility(a INT PRIMARY KEY, b INT)
+ENGINE=InnoDB;
+INSERT INTO t_preserve_token_visibility VALUES(1,10);
+CREATE USER preserve_owner@localhost;
+GRANT SHUTDOWN ON *.* TO preserve_owner@localhost;
+GRANT SELECT, UPDATE ON test.t_preserve_token_visibility
+TO preserve_owner@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_owner@localhost;
+CREATE USER preserve_process@localhost;
+GRANT PROCESS ON *.* TO preserve_process@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_process@localhost;
+CREATE USER preserve_unprivileged_reader@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_unprivileged_reader@localhost;
+CREATE USER preserve_resume_any_reader@localhost;
+GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO
+preserve_resume_any_reader@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_resume_any_reader@localhost;
+START TRANSACTION;
+UPDATE t_preserve_token_visibility SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SELECT TOKEN LIKE '****____' AND TOKEN <> '****' AS owner_token_is_redacted
+FROM performance_schema.preserved_transactions;
+owner_token_is_redacted
+1
+SELECT TOKEN AS owner_visible_token FROM performance_schema.preserved_transactions;
+owner_visible_token
+REDACTED
+SELECT TOKEN <> 'TOKEN' AS owner_full_token_not_visible FROM performance_schema.preserved_transactions;
+owner_full_token_not_visible
+1
+SHOW PRESERVED TRANSACTIONS;
+TOKEN	USER	HOST	STATE	CREATED_AT	EXPIRES_AT	RECOVERED_COUNT	AGE_SECONDS	SCHEMA_NAME	ISOLATION	MOD_TABLES_COUNT	LOCKS_COUNT	HAS_READ_VIEW	RV_LOW_LIMIT_NO	SAVEPOINT_COUNT	BINLOG_STATE	WROTE_TO_CACHE	BINLOG_CACHE_SIZE	BINLOG_WARMCOPY_STATE	SESSION_SQL_LOG_BIN	GLOBAL_LOG_BIN	GTID_NEXT	AUTOINC_LOCK_OWNED	TEMP_TABLE_STATE	TEMP_IMAGE_BYTES	TEMP_UNDO_BYTES	TEMP_SIDECARS_COMPLETE	LAST_ERROR	LAST_ERROR_AT
+REDACTED	preserve_owner	localhost	PRESERVED	CREATED_AT	EXPIRES_AT	1	AGE_SECONDS	test	REPEATABLE-READ	1	2	NO	0	0	GLOBAL_OFF_NO_CACHE	NO	0	NONE	ON	OFF	NULL	NO	NONE	0	0	YES	NULL	NULL
+SELECT COUNT(*) AS process_row_count
+FROM performance_schema.preserved_transactions;
+process_row_count
+1
+SELECT TOKEN AS process_visible_token FROM performance_schema.preserved_transactions;
+process_visible_token
+TOKEN
+SELECT TOKEN = 'TOKEN' AS process_full_token_visible FROM performance_schema.preserved_transactions;
+process_full_token_visible
+1
+SHOW PRESERVED TRANSACTIONS;
+TOKEN	USER	HOST	STATE	CREATED_AT	EXPIRES_AT	RECOVERED_COUNT	AGE_SECONDS	SCHEMA_NAME	ISOLATION	MOD_TABLES_COUNT	LOCKS_COUNT	HAS_READ_VIEW	RV_LOW_LIMIT_NO	SAVEPOINT_COUNT	BINLOG_STATE	WROTE_TO_CACHE	BINLOG_CACHE_SIZE	BINLOG_WARMCOPY_STATE	SESSION_SQL_LOG_BIN	GLOBAL_LOG_BIN	GTID_NEXT	AUTOINC_LOCK_OWNED	TEMP_TABLE_STATE	TEMP_IMAGE_BYTES	TEMP_UNDO_BYTES	TEMP_SIDECARS_COMPLETE	LAST_ERROR	LAST_ERROR_AT
+TOKEN	preserve_owner	localhost	PRESERVED	CREATED_AT	EXPIRES_AT	1	AGE_SECONDS	test	REPEATABLE-READ	1	2	NO	0	0	GLOBAL_OFF_NO_CACHE	NO	0	NONE	ON	OFF	NULL	NO	NONE	0	0	YES	NULL	NULL
+SELECT COUNT(*) AS unprivileged_row_count
+FROM performance_schema.preserved_transactions;
+unprivileged_row_count
+0
+SELECT COALESCE(TABLE_ROWS, 0) =
+(SELECT COUNT(*) FROM performance_schema.preserved_transactions)
+AS p_s_table_rows_matches_visible_count
+FROM information_schema.tables
+WHERE table_schema='performance_schema'
+    AND table_name='preserved_transactions';
+p_s_table_rows_matches_visible_count
+1
+SHOW PRESERVED TRANSACTIONS;
+TOKEN	USER	HOST	STATE	CREATED_AT	EXPIRES_AT	RECOVERED_COUNT	AGE_SECONDS	SCHEMA_NAME	ISOLATION	MOD_TABLES_COUNT	LOCKS_COUNT	HAS_READ_VIEW	RV_LOW_LIMIT_NO	SAVEPOINT_COUNT	BINLOG_STATE	WROTE_TO_CACHE	BINLOG_CACHE_SIZE	BINLOG_WARMCOPY_STATE	SESSION_SQL_LOG_BIN	GLOBAL_LOG_BIN	GTID_NEXT	AUTOINC_LOCK_OWNED	TEMP_TABLE_STATE	TEMP_IMAGE_BYTES	TEMP_UNDO_BYTES	TEMP_SIDECARS_COMPLETE	LAST_ERROR	LAST_ERROR_AT
+SELECT TOKEN AS resume_any_visible_token FROM performance_schema.preserved_transactions;
+resume_any_visible_token
+REDACTED
+SELECT TOKEN <> 'TOKEN' AS resume_any_full_token_not_visible FROM performance_schema.preserved_transactions;
+resume_any_full_token_not_visible
+1
+SHOW PRESERVED TRANSACTIONS;
+TOKEN	USER	HOST	STATE	CREATED_AT	EXPIRES_AT	RECOVERED_COUNT	AGE_SECONDS	SCHEMA_NAME	ISOLATION	MOD_TABLES_COUNT	LOCKS_COUNT	HAS_READ_VIEW	RV_LOW_LIMIT_NO	SAVEPOINT_COUNT	BINLOG_STATE	WROTE_TO_CACHE	BINLOG_CACHE_SIZE	BINLOG_WARMCOPY_STATE	SESSION_SQL_LOG_BIN	GLOBAL_LOG_BIN	GTID_NEXT	AUTOINC_LOCK_OWNED	TEMP_TABLE_STATE	TEMP_IMAGE_BYTES	TEMP_UNDO_BYTES	TEMP_SIDECARS_COMPLETE	LAST_ERROR	LAST_ERROR_AT
+REDACTED	preserve_owner	localhost	PRESERVED	CREATED_AT	EXPIRES_AT	1	AGE_SECONDS	test	REPEATABLE-READ	1	2	NO	0	0	GLOBAL_OFF_NO_CACHE	NO	0	NONE	ON	OFF	NULL	NO	NONE	0	0	YES	NULL	NULL
+SELECT TOKEN = 'TOKEN' AS root_token_visible FROM performance_schema.preserved_transactions;
+root_token_visible
+1
+SHOW PRESERVED TRANSACTIONS;
+TOKEN	USER	HOST	STATE	CREATED_AT	EXPIRES_AT	RECOVERED_COUNT	AGE_SECONDS	SCHEMA_NAME	ISOLATION	MOD_TABLES_COUNT	LOCKS_COUNT	HAS_READ_VIEW	RV_LOW_LIMIT_NO	SAVEPOINT_COUNT	BINLOG_STATE	WROTE_TO_CACHE	BINLOG_CACHE_SIZE	BINLOG_WARMCOPY_STATE	SESSION_SQL_LOG_BIN	GLOBAL_LOG_BIN	GTID_NEXT	AUTOINC_LOCK_OWNED	TEMP_TABLE_STATE	TEMP_IMAGE_BYTES	TEMP_UNDO_BYTES	TEMP_SIDECARS_COMPLETE	LAST_ERROR	LAST_ERROR_AT
+TOKEN	preserve_owner	localhost	PRESERVED	CREATED_AT	EXPIRES_AT	1	AGE_SECONDS	test	REPEATABLE-READ	1	2	NO	0	0	GLOBAL_OFF_NO_CACHE	NO	0	NONE	ON	OFF	NULL	NO	NONE	0	0	YES	NULL	NULL
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ROLLBACK;
+SELECT * FROM t_preserve_token_visibility WHERE a=1;
+a	b
+1	10
+DROP USER preserve_resume_any_reader@localhost;
+DROP USER preserve_unprivileged_reader@localhost;
+DROP USER preserve_process@localhost;
+DROP USER preserve_owner@localhost;
+DROP TABLE t_preserve_token_visibility;
+SET GLOBAL preserve_trx_enable=ON;

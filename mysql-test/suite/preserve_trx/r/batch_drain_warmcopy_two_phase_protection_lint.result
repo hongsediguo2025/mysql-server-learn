@@ -1,0 +1,3 @@
+SELECT 'ok' AS batch_drain_warmcopy_two_phase_protection_lint;
+batch_drain_warmcopy_two_phase_protection_lint
+ok

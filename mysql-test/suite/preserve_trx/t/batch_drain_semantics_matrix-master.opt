@@ -1,0 +1,1 @@
+--log-bin=preserve-trx-batch-semantics-bin --server-id=1 --binlog-format=ROW --binlog-ignore-db=preserve_batch_ignored

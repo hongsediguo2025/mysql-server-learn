@@ -1,0 +1,240 @@
+--source include/have_debug_sync.inc
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+# Lint-only source-shape preflight. Runtime evidence in this file comes from
+# the DRAIN/PREPARE, status-variable, P_S, and residue assertions below.
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+my $path = File::Spec->catfile($source_root, 'sql', 'binlog.cc');
+open(my $fh, '<', $path) or die "cannot open $path: $!";
+my $src = do { local $/; <$fh> };
+close($fh);
+
+$src =~ /bool mysql_binlog_preserve_warmcopy_build_blob\s*\(.*?^}/ms
+  or die "could not find mysql_binlog_preserve_warmcopy_build_blob\n";
+my $body = $&;
+die "warm-copy build_blob must use preserve_trx_warmcopy_chunk_bytes as a runtime chunk bound\n"
+  unless $body =~ /preserve_trx_warmcopy_chunk_bytes/s &&
+         $body =~ /while\s*\([^)]*copied/s &&
+         $body =~ /copy_range_to\s*\([^;]*bytes_to_copy/s;
+die "warm-copy build_blob must reject oversized blobs before opening the warm artifact writer\n"
+  unless $body =~ /max_blob_bytes/s &&
+         index($body, 'cache_length > max_blob_bytes') >= 0 &&
+         index($body, 'cache_length > max_blob_bytes') <
+             index($body, 'create_warm_external_blob_writer');
+
+$src =~ /bool finish\s*\(.*?^  }/ms
+  or die "could not find Warmcopy_blob_copy_ostream::finish\n";
+my $finish = $&;
+die "warm-copy digest context must be freed after finish\n"
+  unless $finish =~ /EVP_MD_CTX_free\s*\(\s*m_ctx\s*\)/s &&
+         $finish =~ /m_ctx\s*=\s*nullptr/s;
+
+$src =~ /bool finalize\s*\(THD \*thd, uint64_t tail_budget_bytes,.*?^  }/ms
+  or die "could not find Mysql_binlog_warmcopy_session::finalize\n";
+my $session_finalize = $&;
+die "warm-copy finalize must rely on close for file sync instead of double fsync\n"
+  if $session_finalize =~ /m_writer->flush\s*\(/s;
+
+$src = '';
+$path = File::Spec->catfile($source_root, 'sql', 'preserve_trx.cc');
+open($fh, '<', $path) or die "cannot open $path: $!";
+$src = do { local $/; <$fh> };
+close($fh);
+$src =~ /class Warmcopy_batch_blob_provider.*?class Warmcopy_tail_budget_validator/ms
+  or die "could not isolate Warmcopy_batch_blob_provider\n";
+my $provider = $&;
+die "warm-copy provider must enforce preserve_trx_warmcopy_max_total_bytes before copying all participants\n"
+  unless $provider =~ /preserve_trx_warmcopy_max_total_bytes/s &&
+         $provider =~ /m_total_bytes/s &&
+         $provider =~ /reserved_size/s &&
+         $provider =~ /m_error\s*=\s*true/s;
+die "warm-copy provider must enforce the final binlog-cache blob limit before copying a participant\n"
+  unless $provider =~ /preserve_trx_max_binlog_cache_bytes/s &&
+         $provider =~ /warmcopy_effective_entry_blob_limit/s;
+die "warm-copy provider must account refreshed tail blobs against max_total_bytes\n"
+  unless $provider =~ /can_account_replacement\s*\(\s*entry\.reserved_size,\s*finalized\.size/s &&
+         $provider =~ /m_total_bytes\s*=\s*m_total_bytes\s*-\s*entry\.reserved_size\s*\+\s*finalized\.size/s;
+
+die "warm-copy admission must wait for in-flight admissions before provider destruction\n"
+  unless $src =~ /g_warmcopy_admission_inflight/s &&
+         $src =~ /g_warmcopy_admission_cond\.wait/s &&
+         $src =~ /g_warmcopy_admission_cond\.notify_all/s;
+die "warm-copy admission provider must be shared across in-flight admission\n"
+  unless $src =~ /std::shared_ptr<Warmcopy_batch_blob_provider>\s+g_warmcopy_admission_provider/s;
+die "warm-copy admission close must use the configured close timeout or remaining close deadline\n"
+  unless $src =~ /g_warmcopy_admission_cond\.wait_for/s &&
+         $src =~ /warmcopy_close_timeout_ms_until_deadline/s &&
+         $src =~ /m_admission_scope->close\s*\(\s*close_timeout_ms\s*\)/s;
+die "warm-copy admission close timeout must not fall back to destructor unbounded wait\n"
+  unless $src =~ /if\s*\(!drained\)\s*\{\s*m_closed\s*=\s*true;\s*m_provider\.reset\(\);\s*return false;\s*\}/s;
+die "warm-copy admission destructor must use a bounded close path for open-phase early returns\n"
+  unless $src =~ /~Warmcopy_open_admission_scope\s*\(\)\s*\{[^}]*close\s*\(\s*warmcopy_admission_destructor_close_timeout_ms\s*\(\s*\)\s*\)\s*;[^}]*\}/s &&
+         $src =~ /warmcopy_admission_destructor_close_timeout_ms\s*\(\s*\).*?preserve_trx_warmcopy_close_timeout_ms\s*==\s*0\s*\?\s*1/s;
+die "warm-copy admission must have an atomic no-open fast path before taking the global mutex\n"
+  unless $src =~ /std::atomic<bool>\s+g_warmcopy_admission_open\{false\}/s &&
+         $src =~ /g_warmcopy_admission_open\.load\s*\(\s*std::memory_order_acquire\s*\)/s &&
+         $src =~ /g_warmcopy_admission_open\.store\s*\([^;]*std::memory_order_release\s*\)/s;
+die "warm-copy provider must not report a prebuilt blob while prefix preparation is still in flight\n"
+  unless $provider =~ /it->second\.session\s*==\s*nullptr/s &&
+         $provider =~ /mysql_binlog_preserve_warmcopy_cache_length/s &&
+         $provider =~ /current_has_blob\s*&&\s*current_length\s*!=\s*0/s;
+
+$src =~ /Preserve_trx_command_block_result preserved_trx_command_block_result\s*\(.*?^}/ms
+  or die "could not find preserved_trx_command_block_result\n";
+my $block_body = $&;
+die "warm-copy open must block only preserve-control commands while allowing business SQL to keep running\n"
+  unless $src =~ /bool preserve_trx_sql_command_is_preserve_control_or_shutdown[\s\S]*?SQLCOM_PREPARE_SHUTDOWN_PRESERVE[\s\S]*?SQLCOM_DRAIN_TRANSACTIONS_PRESERVE[\s\S]*?SQLCOM_RESUME_PRESERVED_TRX[\s\S]*?SQLCOM_SHUTDOWN/s &&
+         $block_body =~ /preserve_trx_sql_command_is_preserve_control_or_shutdown\s*\(\s*sql_command\s*\)/s &&
+         $block_body =~ /Preserve_trx_manager_state::WARMCOPY_DRAINING[\s\S]*?Preserve_trx_command_block_result::ALLOW/s &&
+         index($block_body,
+               'preserve_trx_sql_command_is_preserve_control_or_shutdown') <
+             index($block_body,
+                   'Preserve_trx_manager_state::WARMCOPY_DRAINING');
+
+$src =~ /bool Preserve_trx_drain_service::execute\s*\(.*?^Preserve_trx_drain_request::Preserve_trx_drain_request/ms
+  or die "could not find drain facade warm-copy setup body\n";
+my $drain_body = $&;
+my $prepare_quiesced_pos =
+  index($drain_body, 'warmcopy_participant->prepare_quiesced_targets');
+my $main_close_pos = $prepare_quiesced_pos >= 0
+  ? index($drain_body, 'drain_orchestrator.close_phase1_participants',
+          $prepare_quiesced_pos)
+  : -1;
+die "warm-copy drain must acquire the single-instance manager gate before opening admission\n"
+  unless $drain_body =~ /Preserve_trx_manager_state::WARMCOPY_DRAINING/s &&
+         index($drain_body, 'Preserve_trx_manager_state::WARMCOPY_DRAINING') <
+             index($drain_body, 'drain_orchestrator.open_phase1_participants');
+die "warm-copy admission scope must be declared after the manager guard so it closes before the guard resets IDLE\n"
+  unless index($drain_body, 'Preserve_trx_manager_state_guard draining') <
+         index($drain_body, 'drain_orchestrator.open_phase1_participants');
+die "warm-copy drain must keep admission open under WARMCOPY_CLOSING until targets are quiesced\n"
+  unless $drain_body =~ /transition_to\s*\(\s*Preserve_trx_manager_state::WARMCOPY_CLOSING\s*\)/s &&
+         $drain_body =~ /transition_to\s*\(\s*Preserve_trx_manager_state::BATCH_DRAINING\s*\)/s &&
+         index($drain_body, 'transition_to(Preserve_trx_manager_state::WARMCOPY_CLOSING)') <
+             index($drain_body, 'Preserve_batch_target_counter counter') &&
+         $prepare_quiesced_pos >= 0 &&
+         $prepare_quiesced_pos < $main_close_pos &&
+         $main_close_pos <
+             index($drain_body, 'transition_to(Preserve_trx_manager_state::BATCH_DRAINING)');
+die "warm-copy drain must route phase close/preflight through DrainOrchestrator\n"
+  unless $drain_body =~ /Warmcopy_batch_drain_participant/s &&
+         $drain_body =~ /drain_orchestrator\.close_phase1_participants/s &&
+         $drain_body =~ /drain_orchestrator\.phase2_preflight_participants/s;
+
+$path = File::Spec->catfile($source_root, 'sql', 'binlog.cc');
+open($fh, '<', $path) or die "cannot open $path: $!";
+my $binlog_src = do { local $/; <$fh> };
+close($fh);
+$binlog_src =~ /bool mysql_binlog_preserve_import\s*\(.*?^}/ms
+  or die "could not find mysql_binlog_preserve_import\n";
+my $regular_import = $&;
+die "regular RESUME binlog import must not accept metadata-only warm-copy snapshots\n"
+  if $regular_import =~ /has_cache_length/s;
+$binlog_src =~ /bool mysql_binlog_preserve_reactivate_after_prepare_failure\s*\(.*?^}/ms
+  or die "could not find mysql_binlog_preserve_reactivate_after_prepare_failure\n";
+my $reactivate_import = $&;
+die "post-prepare failure reactivation must still accept metadata-only warm-copy snapshots\n"
+  unless $reactivate_import =~ /has_cache_length/s;
+die "metadata-only post-prepare reactivation must fail closed if binlog cache truncate fails\n"
+  unless $binlog_src =~ /bool\s+truncate_checked\s*\(\s*my_off_t pos\s*\)/s &&
+         $binlog_src =~ /if\s*\(\s*binlog_cache_data::truncate_checked\s*\(\s*cache_length\s*\)\s*\)\s*return true/s;
+EOF
+
+--disable_warnings
+DROP TABLE IF EXISTS t_warmcopy_resource;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=16;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=8;
+SET GLOBAL preserve_trx_warmcopy_max_total_bytes=1500;
+
+CREATE TABLE t_warmcopy_resource(
+  id INT PRIMARY KEY,
+  payload VARBINARY(1024)
+) ENGINE=InnoDB;
+INSERT INTO t_warmcopy_resource VALUES(1,REPEAT('a',512)),(2,REPEAT('a',512));
+
+--connect(warmcopy_resource_app, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_warmcopy_resource SET payload=REPEAT('b',512) WHERE id=1;
+
+--connect(warmcopy_resource_app2, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_warmcopy_resource SET payload=REPEAT('d',512) WHERE id=2;
+
+--connect(warmcopy_resource_owner, localhost, root,,test)
+--connection warmcopy_resource_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+--disconnect warmcopy_resource_owner
+
+--connect(warmcopy_resource_check, localhost, root,,test)
+--connection warmcopy_resource_check
+--let $prefix_bytes= `SELECT COALESCE((SELECT CAST(VARIABLE_VALUE AS SIGNED) FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_warmcopy_prefix_bytes'), -1)`
+--let $assert_text= warm-copy phase1 aggregate bytes status exists
+--let $assert_cond= $prefix_bytes >= 0
+--source include/assert.inc
+--let $assert_text= warm-copy phase1 aggregate bytes stay within max total budget
+--let $assert_cond= $prefix_bytes <= 1500
+--source include/assert.inc
+--disconnect warmcopy_resource_check
+
+--connection warmcopy_resource_app
+COMMIT;
+--disconnect warmcopy_resource_app
+
+--connection warmcopy_resource_app2
+COMMIT;
+--disconnect warmcopy_resource_app2
+
+--connection default
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+SELECT id, OCTET_LENGTH(payload) AS payload_len FROM t_warmcopy_resource
+  ORDER BY id;
+SELECT id,
+       payload = CASE id
+                   WHEN 1 THEN REPEAT('b',512)
+                   WHEN 2 THEN REPEAT('d',512)
+                 END AS payload_matches_expected
+  FROM t_warmcopy_resource ORDER BY id;
+--source suite/preserve_trx/include/assert_no_snapshot_file.inc
+
+--let $full_copy_before= `SELECT COALESCE((SELECT CAST(VARIABLE_VALUE AS SIGNED) FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_warmcopy_provider_full_copy_to_count'), -1)`
+
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_warmcopy_max_total_bytes=10737418240;
+START TRANSACTION;
+UPDATE t_warmcopy_resource SET payload=REPEAT('c',512) WHERE id=1;
+SET SESSION debug="+d,preserve_trx_fail_after_binlog_mode_validation";
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug="-d,preserve_trx_fail_after_binlog_mode_validation";
+
+--let $full_copy_after= `SELECT COALESCE((SELECT CAST(VARIABLE_VALUE AS SIGNED) FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_warmcopy_provider_full_copy_to_count'), -1)`
+--let $assert_text= legacy full binlog cache export increments the diagnostic counter
+--let $assert_cond= $full_copy_after > $full_copy_before
+--source include/assert.inc
+
+ROLLBACK;
+DROP TABLE t_warmcopy_resource;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_max_total_bytes=10737418240;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET DEBUG_SYNC = 'RESET';

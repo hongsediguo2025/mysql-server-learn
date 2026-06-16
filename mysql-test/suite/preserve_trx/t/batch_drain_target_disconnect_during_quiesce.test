@@ -1,0 +1,59 @@
+--source include/have_debug_sync.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_batch_disconnect;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_batch_disconnect(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+
+--connect(batch_disconnect_app,localhost,root,,test)
+--connection batch_disconnect_app
+SET DEBUG_SYNC =
+  'preserve_trx_batch_after_one_target_preserved SIGNAL batch_disconnect_paused WAIT_FOR continue_batch_disconnect';
+START TRANSACTION;
+INSERT INTO t_batch_disconnect VALUES(1,10);
+
+--connect(batch_disconnect_owner,localhost,root,,test)
+--connection batch_disconnect_owner
+SET DEBUG_SYNC =
+  'preserve_trx_batch_after_one_target_preserved SIGNAL batch_disconnect_paused WAIT_FOR continue_batch_disconnect';
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+--disable_warnings
+SET DEBUG_SYNC = 'now WAIT_FOR batch_disconnect_paused TIMEOUT 1';
+--enable_warnings
+
+--connection batch_disconnect_app
+--dirty_close batch_disconnect_app
+
+--connection default
+--sleep 1
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SET DEBUG_SYNC = 'now SIGNAL continue_batch_disconnect';
+
+--connection batch_disconnect_owner
+--reap
+--disconnect batch_disconnect_owner
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+UPDATE t_batch_disconnect SET b=11 WHERE a=1;
+COMMIT;
+
+SELECT * FROM t_batch_disconnect;
+
+DROP TABLE t_batch_disconnect;
+SET GLOBAL preserve_trx_enable=ON;

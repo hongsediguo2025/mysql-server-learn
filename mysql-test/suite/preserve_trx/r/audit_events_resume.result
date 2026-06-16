@@ -1,0 +1,39 @@
+DROP TABLE IF EXISTS t_preserve_audit_resume;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_preserve_audit_resume(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_preserve_audit_resume VALUES(1,10);
+START TRANSACTION;
+UPDATE t_preserve_audit_resume SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+INSTALL PLUGIN null_audit SONAME 'adt_null.so';
+SET @preserved_token='TOKEN';
+SET @redacted_preserved_token=CONCAT('****', RIGHT(@preserved_token, 4));
+SET @expected_resume_audit=CONCAT(
+'MYSQL_AUDIT_MESSAGE_INTERNAL;component="mysqld" producer="preserve_trx" ',
+'message="preserved_transaction" key[0]="action" value[0]="resume" ',
+'key[1]="token" value[1]="', @redacted_preserved_token, '" ',
+'key[2]="result" value[2]="success";;');
+SET @@null_audit_event_order_check_exact=0;
+SET @@null_audit_event_order_check=@expected_resume_audit;
+SET @@null_audit_event_record_def='MYSQL_AUDIT_MESSAGE_INTERNAL;MYSQL_AUDIT_QUERY_STATUS_END';
+RESUME PRESERVED TRANSACTION 'TOKEN';
+SELECT @@null_audit_event_order_check;
+@@null_audit_event_order_check
+EVENT-ORDER-OK
+SELECT @@null_audit_event_record LIKE CONCAT('%', @preserved_token, '%')
+AS raw_token_in_audit_record;
+raw_token_in_audit_record
+0
+SELECT @@null_audit_event_record LIKE CONCAT('%', @redacted_preserved_token, '%')
+AS redacted_token_in_audit_record;
+redacted_token_in_audit_record
+1
+COMMIT;
+SELECT * FROM t_preserve_audit_resume ORDER BY a;
+a	b
+1	11
+UNINSTALL PLUGIN null_audit;
+Warnings:
+Warning	1620	Plugin is busy and will be uninstalled on shutdown
+DROP TABLE t_preserve_audit_resume;
+SET GLOBAL preserve_trx_enable=ON;

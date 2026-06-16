@@ -1,0 +1,126 @@
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+# Lint-only source-shape preflight. Runtime evidence in this file comes from
+# the drained-session command blocking assertions below.
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+my $header_path = File::Spec->catfile($source_root, 'sql', 'preserve_trx.h');
+open(my $header_fh, '<', $header_path)
+  or die "cannot open $header_path: $!";
+my $header = do { local $/; <$header_fh> };
+close($header_fh);
+
+die "drain command blocking must expose typed block results\n"
+  unless $header =~ /enum class Preserve_trx_command_block_result/s &&
+         $header =~ /BLOCK_DRAINING/s &&
+         $header =~ /BLOCK_SESSION_DRAINED/s;
+
+my $source_path = File::Spec->catfile($source_root, 'sql', 'preserve_trx.cc');
+open(my $source_fh, '<', $source_path)
+  or die "cannot open $source_path: $!";
+my $source = do { local $/; <$source_fh> };
+close($source_fh);
+
+die "drained-session blocking must take precedence over generic drain blocking\n"
+  unless $source =~
+         /Preserve_trx_command_block_result\s+preserved_trx_command_block_result\b.*?BLOCK_SESSION_DRAINED.*?BLOCK_DRAINING/s;
+
+my $sql_parse_path = File::Spec->catfile($source_root, 'sql', 'sql_parse.cc');
+open(my $sql_parse_fh, '<', $sql_parse_path)
+  or die "cannot open $sql_parse_path: $!";
+my $sql_parse = do { local $/; <$sql_parse_fh> };
+close($sql_parse_fh);
+
+die "SQL dispatch must map drained-session and draining block results separately\n"
+  unless $sql_parse =~ /Preserve_trx_command_block_result::BLOCK_SESSION_DRAINED/s &&
+         $sql_parse =~ /ER_PRESERVE_TRX_SESSION_DRAINED/s &&
+         $sql_parse =~ /Preserve_trx_command_block_result::BLOCK_DRAINING/s &&
+         $sql_parse =~ /ER_PRESERVE_TRX_UNSUPPORTED/s;
+EOF
+
+--source include/have_debug_sync.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_batch_drained;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_batch_drained(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_batch_drained VALUES(1,10);
+
+--connect(batch_drained_app,localhost,root,,test)
+--connection batch_drained_app
+START TRANSACTION;
+UPDATE t_batch_drained SET b=20 WHERE a=1;
+PREPARE drained_existing_stmt FROM 'UPDATE t_batch_drained SET b=40 WHERE a=1';
+
+--connect(batch_drained_owner,localhost,root,,test)
+--connection batch_drained_owner
+SET DEBUG_SYNC =
+  'preserve_trx_batch_after_one_target_preserved SIGNAL batch_drained_preserved WAIT_FOR continue_batch_drained';
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+--disable_warnings
+SET DEBUG_SYNC = 'now WAIT_FOR batch_drained_preserved TIMEOUT 10';
+--enable_warnings
+
+--connection batch_drained_app
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT 1;
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SET @drained = 1;
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SHOW WARNINGS;
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+COMMIT;
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+ROLLBACK;
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+UPDATE t_batch_drained SET b=30 WHERE a=1;
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+PREPARE drained_stmt FROM 'UPDATE t_batch_drained SET b=40 WHERE a=1';
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+EXECUTE drained_existing_stmt;
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+SELECT * FROM t_batch_drained WHERE a=1 FOR UPDATE;
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+RESUME PRESERVED TRANSACTION 'not-a-token';
+
+--connection default
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SET DEBUG_SYNC = 'now SIGNAL continue_batch_drained';
+
+--connection batch_drained_owner
+--reap
+--disconnect batch_drained_owner
+
+--connection batch_drained_app
+--disconnect batch_drained_app
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+ROLLBACK;
+
+SELECT * FROM t_batch_drained;
+
+DROP TABLE t_batch_drained;
+SET GLOBAL preserve_trx_enable=ON;

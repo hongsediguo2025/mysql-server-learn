@@ -1,0 +1,40 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+CREATE TABLE t_temp_second_drain(
+sid INT NOT NULL,
+k INT NOT NULL,
+v BIGINT NOT NULL,
+counter INT NOT NULL DEFAULT 0,
+note VARCHAR(96),
+PRIMARY KEY(sid, k),
+UNIQUE KEY uq_sid_note(sid, note),
+KEY idx_sid_v(sid, v)
+) ENGINE=InnoDB;
+CREATE TEMPORARY TABLE tmp_temp_second_drain(
+id INT PRIMARY KEY,
+v INT NOT NULL,
+KEY(v)
+) ENGINE=InnoDB;
+START TRANSACTION;
+INSERT INTO tmp_temp_second_drain VALUES(1, 10);
+UPDATE tmp_temp_second_drain SET v = 11 WHERE id = 1;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+SELECT COUNT(*), COALESCE(SUM(v),0) FROM tmp_temp_second_drain;
+COUNT(*)	COALESCE(SUM(v),0)
+1	11
+REPLACE INTO t_temp_second_drain
+(sid,k,v,counter,note)
+VALUES
+(1,100003,10000003,3,'s001-t00001-n003');
+COMMIT;
+SELECT sid,k,v,counter,note FROM t_temp_second_drain ORDER BY sid,k;
+sid	k	v	counter	note
+1	100003	10000003	3	s001-t00001-n003
+DROP TABLE t_temp_second_drain;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

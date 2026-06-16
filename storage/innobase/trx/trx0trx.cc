@@ -54,6 +54,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "srv0start.h"
 #include "sql/preserve_trx_xid.h"
 #include "trx0purge.h"
+#include "trx0preserve.h"
 #include "trx0rec.h"
 #include "trx0roll.h"
 #include "trx0rseg.h"
@@ -604,6 +605,14 @@ void trx_free_prepared_or_active_recovered(trx_t *trx) {
          trx_state_eq(trx, TRX_STATE_PRESERVED));
     expected_undo_state = TRX_UNDO_PREPARED;
   }
+  /*
+    A disconnected PREPARED/PRESERVED transaction can legitimately retain
+    will_lock while locks are released. trx_free() requires the field to be
+    clear, so reset it at the last point before returning the object to the
+    pool.
+  */
+  ut_ad(!trx->will_lock || trx_state_eq(trx, TRX_STATE_PREPARED) ||
+        trx_state_eq(trx, TRX_STATE_PRESERVED));
 
   assert_trx_in_rw_list(trx);
 
@@ -614,6 +623,8 @@ void trx_free_prepared_or_active_recovered(trx_t *trx) {
   ut_a(!trx->read_only);
 
   trx->state = TRX_STATE_NOT_STARTED;
+  trx->will_lock = 0;
+  trx_preserve_release_claim_before_free(trx);
 
   /* Undo trx_resurrect_table_locks(). */
   lock_trx_lock_list_init(&trx->lock.trx_locks);
@@ -1492,13 +1503,20 @@ static bool trx_write_serialisation_history(
     trx_undo_ptr_t *redo_rseg_undo_ptr =
         trx->rsegs.m_redo.update_undo != nullptr ? &trx->rsegs.m_redo : nullptr;
 
+    const bool temp_update_undo_skips_history =
+        trx_undo_preserve_magic_no_redo_should_skip_history(
+            trx->rsegs.m_noredo.update_undo);
     trx_undo_ptr_t *temp_rseg_undo_ptr =
-        trx->rsegs.m_noredo.update_undo != nullptr ? &trx->rsegs.m_noredo
-                                                   : nullptr;
+        trx->rsegs.m_noredo.update_undo != nullptr &&
+                !temp_update_undo_skips_history
+            ? &trx->rsegs.m_noredo
+            : nullptr;
 
     /* Will set trx->no and will add rseg to purge queue. */
-    serialised = trx_serialisation_number_get(trx, redo_rseg_undo_ptr,
-                                              temp_rseg_undo_ptr);
+    if (redo_rseg_undo_ptr != nullptr || temp_rseg_undo_ptr != nullptr) {
+      serialised = trx_serialisation_number_get(trx, redo_rseg_undo_ptr,
+                                                temp_rseg_undo_ptr);
+    }
 
     /* It is not necessary to obtain trx->undo_mutex here because
     only a single OS thread is allowed to do the transaction commit
@@ -1513,7 +1531,7 @@ static bool trx_write_serialisation_history(
       non-redo update_undo too. This is to avoid immediate
       invocation of purge as we need to club these 2 segments
       with same trx-no as single unit. */
-      bool update_rseg_len = !(trx->rsegs.m_noredo.update_undo != nullptr);
+      bool update_rseg_len = temp_rseg_undo_ptr == nullptr;
 
       /* Set flag if GTID information need to persist. */
       auto undo_ptr = &trx->rsegs.m_redo;

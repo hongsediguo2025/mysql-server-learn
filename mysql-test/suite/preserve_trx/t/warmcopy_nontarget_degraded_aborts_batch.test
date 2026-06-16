@@ -1,0 +1,76 @@
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_warmcopy_nontarget_degraded;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=4096;
+
+CREATE TABLE t_warmcopy_nontarget_degraded(
+  id INT PRIMARY KEY,
+  v INT,
+  filler VARBINARY(512)
+) ENGINE=InnoDB;
+INSERT INTO t_warmcopy_nontarget_degraded
+  VALUES(1,10,REPEAT('a',128)),(2,20,REPEAT('b',128));
+
+--connect(warmcopy_nontarget_app1, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_warmcopy_nontarget_degraded
+  SET v=11, filler=REPEAT('c',256) WHERE id=1;
+SAVEPOINT s_warmcopy_degraded;
+UPDATE t_warmcopy_nontarget_degraded
+  SET v=12, filler=REPEAT('d',256) WHERE id=1;
+
+--connect(warmcopy_nontarget_app2, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_warmcopy_nontarget_degraded
+  SET v=21, filler=REPEAT('e',256) WHERE id=2;
+
+--connect(warmcopy_nontarget_owner, localhost, root,,test)
+--connection warmcopy_nontarget_owner
+SET DEBUG_SYNC =
+  'preserve_trx_warmcopy_after_descriptor_hwm SIGNAL warmcopy_nontarget_hwm WAIT_FOR warmcopy_nontarget_continue';
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_nontarget_hwm TIMEOUT 10';
+
+--connection warmcopy_nontarget_app1
+ROLLBACK TO SAVEPOINT s_warmcopy_degraded;
+SELECT v AS app1_value_after_savepoint
+  FROM t_warmcopy_nontarget_degraded WHERE id=1;
+
+--connection default
+SET DEBUG_SYNC = 'now SIGNAL warmcopy_nontarget_continue';
+
+--connection warmcopy_nontarget_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+--disconnect warmcopy_nontarget_owner
+
+--connection warmcopy_nontarget_app1
+COMMIT;
+--disconnect warmcopy_nontarget_app1
+
+--connection warmcopy_nontarget_app2
+COMMIT;
+--disconnect warmcopy_nontarget_app2
+
+--connection default
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+SELECT id, v, OCTET_LENGTH(filler) AS filler_len
+  FROM t_warmcopy_nontarget_degraded ORDER BY id;
+--source suite/preserve_trx/include/assert_no_snapshot_file.inc
+
+DROP TABLE t_warmcopy_nontarget_degraded;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET DEBUG_SYNC = 'RESET';

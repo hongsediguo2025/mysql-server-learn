@@ -4,6 +4,9 @@ DROP USER IF EXISTS preserve_resume_any@localhost;
 DROP USER IF EXISTS preserve_u@localhost;
 DROP TABLE IF EXISTS t_priv;
 --enable_warnings
+--disable_query_log
+CALL mtr.add_suppression("RESUME PRESERVED TRANSACTION .* failed: token not found");
+--enable_query_log
 
 SET GLOBAL preserve_trx_enable=ON;
 

@@ -1,15 +1,16 @@
-/* Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2018, 2025, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
    as published by the Free Software Foundation.
 
-   This program is also distributed with certain software (including
+   This program is designed to work with certain software (including
    but not limited to OpenSSL) that is licensed under separate terms,
    as designated in a particular file or component or in included license
    documentation.  The authors of MySQL hereby grant you an additional
    permission to link the program and your derivative works with the
-   separately licensed software that they have included with MySQL.
+   separately licensed software that they have either included with
+   the program or referenced in the documentation.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -23,12 +24,18 @@
 #ifndef BINLOG_OSTREAM_INCLUDED
 #define BINLOG_OSTREAM_INCLUDED
 
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+
 #include <openssl/evp.h>
 #include "sql/basic_ostream.h"
+#include "sql/binlog_warmcopy.h"
 #include "sql/rpl_log_encryption.h"
 
 // True if binlog cache is reset.
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 extern bool binlog_cache_is_reset;
 #endif
 
@@ -47,6 +54,7 @@ extern bool binlog_cache_is_reset;
 template <class ISTREAM, class OSTREAM>
 bool stream_copy(ISTREAM *istream, OSTREAM *ostream,
                  bool *ostream_error = nullptr) {
+  DBUG_TRACE;
   unsigned char *buffer = nullptr;
   my_off_t length = 0;
 
@@ -75,8 +83,8 @@ class IO_CACHE_binlog_cache_storage : public Truncatable_ostream {
 
   /**
      Opens the binlog cache. It creates a memory buffer as long as cache_size.
-     The buffer will be extended up to max_cache_size when writting data. The
-     data exceeds max_cache_size will be writting into temporary file.
+     The buffer will be extended up to max_cache_size when writing data. The
+     data exceeding max_cache_size will be written into a temporary file.
 
      @param[in] dir  Where the temporary file will be created
      @param[in] prefix  Prefix of the temporary file name
@@ -93,7 +101,7 @@ class IO_CACHE_binlog_cache_storage : public Truncatable_ostream {
   bool truncate(my_off_t offset) override;
   /* purecov: inspected */
   /* binlog cache doesn't need seek operation. Setting true to return error */
-  bool seek(my_off_t offset MY_ATTRIBUTE((unused))) override { return true; }
+  bool seek(my_off_t offset [[maybe_unused]]) override { return true; }
   /**
      Reset status and drop all data. It looks like a cache never was used after
      reset.
@@ -132,6 +140,7 @@ class IO_CACHE_binlog_cache_storage : public Truncatable_ostream {
      @retval true  Error
   */
   bool next(unsigned char **buffer, my_off_t *length);
+  bool copy_range_to(my_off_t offset, size_t length, Basic_ostream *ostream);
   my_off_t length() const;
   bool flush() override { return false; }
   bool sync() override { return false; }
@@ -164,6 +173,26 @@ class IO_CACHE_binlog_cache_storage : public Truncatable_ostream {
   bool setup_ciphers_password();
 };
 
+class Binlog_cache_warmcopy_lease {
+ public:
+  bool active() const;
+  bool install_if_absent(Binlog_cache_warmcopy_mirror *mirror);
+  void clear_if_owner(Binlog_cache_warmcopy_mirror *mirror);
+  void close_source_cache();
+  void note_source_write_failed();
+  void note_non_lifecycle_reset();
+  Binlog_warmcopy_mirror_status write_at(uint64_t offset,
+                                         const unsigned char *data,
+                                         size_t length);
+  Binlog_warmcopy_mirror_status truncate(uint64_t length);
+  void mark_degraded(const char *reason);
+
+ private:
+  mutable std::mutex m_mutex;
+  Binlog_cache_warmcopy_mirror *m_mirror{nullptr};
+  std::atomic<bool> m_active{false};
+};
+
 /**
    Byte container that provides a storage for serializing session
    binlog events. This way of arranging the classes separates storage layer
@@ -176,10 +205,7 @@ class Binlog_cache_storage : public Basic_ostream {
   bool open(my_off_t cache_size, my_off_t max_cache_size);
   void close();
 
-  bool write(const unsigned char *buffer, my_off_t length) override {
-    DBUG_ASSERT(m_pipeline_head != nullptr);
-    return m_pipeline_head->write(buffer, length);
-  }
+  bool write(const unsigned char *buffer, my_off_t length) override;
   /**
      Truncates some data at the end of the binlog cache.
 
@@ -187,13 +213,13 @@ class Binlog_cache_storage : public Basic_ostream {
      @retval false  Success
      @retval true  Error
   */
-  bool truncate(my_off_t offset) { return m_pipeline_head->truncate(offset); }
+  bool truncate(my_off_t offset);
 
   /**
      Reset status and drop all data. It looks like a cache was never used
      after reset.
   */
-  bool reset() { return m_file.reset(); }
+  bool reset();
   /**
      Returns the count of disk writes
   */
@@ -218,8 +244,13 @@ class Binlog_cache_storage : public Basic_ostream {
      @retval true  Error happens in either the istream or ostream.
   */
   bool copy_to(Basic_ostream *ostream, bool *ostream_error = nullptr) {
+    DBUG_TRACE;
     return stream_copy(&m_file, ostream, ostream_error);
   }
+
+  bool copy_range_to(my_off_t offset, size_t length, Basic_ostream *ostream,
+                     uint64_t expected_truncate_generation,
+                     bool *stale_generation);
 
   /**
      Returns data length.
@@ -230,9 +261,24 @@ class Binlog_cache_storage : public Basic_ostream {
   */
   bool is_empty() const { return length() == 0; }
 
+  void set_warmcopy_mirror(Binlog_cache_warmcopy_mirror *mirror);
+  bool install_warmcopy_mirror_if_absent(Binlog_cache_warmcopy_mirror *mirror,
+                                         my_off_t *length,
+                                         uint64_t *truncate_generation,
+                                         std::shared_ptr<
+                                             Binlog_cache_warmcopy_lease>
+                                             *lease = nullptr);
+  void clear_warmcopy_mirror(Binlog_cache_warmcopy_mirror *mirror);
+  bool warmcopy_mirror_active() const;
+  uint64_t truncate_generation() const;
+
  private:
   Truncatable_ostream *m_pipeline_head = nullptr;
   IO_CACHE_binlog_cache_storage m_file;
+  mutable std::mutex m_warmcopy_mutex;
+  std::shared_ptr<Binlog_cache_warmcopy_lease> m_warmcopy_lease{
+      std::make_shared<Binlog_cache_warmcopy_lease>()};
+  uint64_t m_truncate_generation{0};
 };
 
 /**

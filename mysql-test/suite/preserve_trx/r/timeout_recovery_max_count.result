@@ -1,0 +1,26 @@
+DROP TABLE IF EXISTS t_recovery_max_count;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_recovery_max_count(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_recovery_max_count VALUES(1,10);
+START TRANSACTION;
+SELECT * FROM t_recovery_max_count WHERE a=1 FOR UPDATE;
+a	b
+1	10
+UPDATE t_recovery_max_count SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SELECT TOKEN, RECOVERED_COUNT AS recovered_count_after_first_restart
+FROM performance_schema.preserved_transactions;
+TOKEN	recovered_count_after_first_restart
+TOKEN	1
+# restart
+include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: recovery max count exceeded]
+SELECT TOKEN, STATE, LAST_ERROR
+FROM performance_schema.preserved_transactions;
+TOKEN	STATE	LAST_ERROR
+TOKEN	FAILED	recovery max count exceeded
+SELECT * FROM t_recovery_max_count ORDER BY a;
+a	b
+1	10
+DROP TABLE t_recovery_max_count;
+SET GLOBAL preserve_trx_enable=ON;
+# restart

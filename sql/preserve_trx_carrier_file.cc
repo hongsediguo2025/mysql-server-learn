@@ -1373,7 +1373,7 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::codec_context(
 
   out->hmac_key = key;
   out->datadir_fingerprint = datadir_fingerprint(m_dir);
-  out->server_uuid = server_uuid_ptr != nullptr ? server_uuid_ptr : "";
+  out->server_uuid = current_server_uuid_for_preserve_key(m_dir);
   return Preserved_trx_carrier_status::OK;
 }
 

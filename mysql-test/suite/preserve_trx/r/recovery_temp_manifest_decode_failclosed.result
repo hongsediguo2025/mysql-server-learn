@@ -1,0 +1,9 @@
+SET GLOBAL preserve_trx_enable=ON;
+SHUTDOWN;
+SELECT COUNT(*) AS preserved_count_after_corrupt_temp_manifest
+FROM performance_schema.preserved_transactions;
+preserved_count_after_corrupt_temp_manifest
+0
+include/assert_grep.inc [Corrupt temp manifest is reported as a corrupt snapshot]
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

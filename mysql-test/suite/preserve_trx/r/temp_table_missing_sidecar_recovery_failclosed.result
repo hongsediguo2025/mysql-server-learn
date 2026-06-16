@@ -1,0 +1,10 @@
+SET GLOBAL preserve_trx_enable=ON;
+SHUTDOWN;
+include/assert_grep.inc [Missing preserved temp image is reported]
+include/assert_grep.inc [Missing preserved temp undo is reported]
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

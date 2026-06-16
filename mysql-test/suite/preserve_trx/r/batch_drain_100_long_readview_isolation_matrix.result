@@ -1,0 +1,104 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_recovery_max_count=200;
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+SELECT COUNT(*) AS session_count
+FROM t_batch_long_control;
+session_count
+100
+SELECT MIN(TIMESTAMPDIFF(MICROSECOND, started_at, NOW(6))) >= 5000000
+AS all_sessions_older_than_five_seconds
+FROM t_batch_long_control;
+all_sessions_older_than_five_seconds
+1
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS;
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+100
+SELECT COUNT(*) AS preserved_state_count
+FROM performance_schema.preserved_transactions
+WHERE STATE = 'PRESERVED';
+preserved_state_count
+100
+SELECT COUNT(*) AS mapped_token_count
+FROM t_batch_long_tokens;
+mapped_token_count
+100
+SELECT COUNT(*) AS preserved_count_after_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_resume
+0
+SELECT COUNT(*) AS resume_success_count
+FROM t_batch_long_audit
+WHERE resumed_ok = 1;
+resume_success_count
+100
+SELECT COUNT(DISTINCT sid) AS resumed_distinct_sessions
+FROM t_batch_long_audit;
+resumed_distinct_sessions
+100
+SELECT MIN(lifecycle_age_us) >= 5000000 AS all_resumed_lifecycles_were_long
+FROM t_batch_long_audit;
+all_resumed_lifecycles_were_long
+1
+SELECT MIN(sql_count) >= 8 AS every_session_ran_enough_sql
+FROM t_batch_long_audit;
+every_session_ran_enough_sql
+1
+SELECT MAX(max_stmt_us) < 1000000 AS every_statement_under_one_second
+FROM t_batch_long_audit;
+every_statement_under_one_second
+1
+SELECT COUNT(*) AS audit_rows
+FROM t_batch_long_audit;
+audit_rows
+100
+SELECT COUNT(*) AS audit_control_case_mismatch_count
+FROM t_batch_long_audit a
+JOIN t_batch_long_control c USING(sid)
+WHERE a.case_id <> c.case_id;
+audit_control_case_mismatch_count
+0
+SELECT COUNT(DISTINCT detail) AS readview_details_ok
+FROM t_batch_long_audit
+WHERE resumed_ok = 1;
+readview_details_ok
+20
+SELECT SUM(detail IN ('rr-old-snapshot','rr-own-write-mixed','rr-external-insert-hidden','rr-secondary-old','rr-external-delete-hidden','rr-insert-gap-hidden','rr-vs-current-read','rr-own-write-external-hidden','rr-multi-read-hidden')) = 45 AS rr_old_snapshot_checks
+FROM t_batch_long_audit WHERE resumed_ok = 1;
+rr_old_snapshot_checks
+1
+SELECT SUM(detail IN ('rc-new-statement','rc-external-insert-visible','rc-secondary-new','rc-own-and-external','rc-post-resume-continuation')) = 25 AS rc_new_statement_checks
+FROM t_batch_long_audit WHERE resumed_ok = 1;
+rc_new_statement_checks
+1
+SELECT SUM(detail IN ('own-update','own-delete','own-insert','rr-own-write-mixed','rc-own-and-external','rr-own-write-external-hidden','rr-late-read-view-own-external','rc-post-resume-continuation')) = 40 AS own_write_checks
+FROM t_batch_long_audit WHERE resumed_ok = 1;
+own_write_checks
+1
+SELECT detail, COUNT(*) = 5 AS ok
+FROM t_batch_long_audit
+GROUP BY detail
+ORDER BY detail;
+detail	ok
+locking-current-read	1
+locking-insert-visible	1
+own-delete	1
+own-insert	1
+own-update	1
+rc-external-insert-visible	1
+rc-new-statement	1
+rc-own-and-external	1
+rc-post-resume-continuation	1
+rc-secondary-new	1
+rr-external-delete-hidden	1
+rr-external-insert-hidden	1
+rr-insert-gap-hidden	1
+rr-late-read-view-own-external	1
+rr-multi-read-hidden	1
+rr-old-snapshot	1
+rr-own-write-external-hidden	1
+rr-own-write-mixed	1
+rr-secondary-old	1
+rr-vs-current-read	1
+SET GLOBAL preserve_trx_enable=ON;

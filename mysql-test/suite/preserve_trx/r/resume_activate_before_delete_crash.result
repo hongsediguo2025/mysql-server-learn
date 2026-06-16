@@ -1,0 +1,22 @@
+DROP TABLE IF EXISTS t_resume_activate_crash;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_resume_activate_crash(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_resume_activate_crash VALUES(1,10);
+START TRANSACTION;
+SELECT * FROM t_resume_activate_crash WHERE a=1 FOR UPDATE;
+a	b
+1	10
+UPDATE t_resume_activate_crash SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug="+d,preserve_trx_crash_after_resume_activate_before_snapshot_delete";
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Lost connection to MySQL server during query
+SELECT COUNT(*) AS remaining_preserved
+FROM performance_schema.preserved_transactions;
+remaining_preserved
+0
+SELECT * FROM t_resume_activate_crash ORDER BY a;
+a	b
+1	10
+DROP TABLE t_resume_activate_crash;
+SET GLOBAL preserve_trx_enable=ON;

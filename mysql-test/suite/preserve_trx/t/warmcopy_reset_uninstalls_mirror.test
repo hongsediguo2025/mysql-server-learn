@@ -1,0 +1,58 @@
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_warmcopy_reset_mirror;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=4096;
+
+CREATE TABLE t_warmcopy_reset_mirror(id INT PRIMARY KEY, v INT)
+  ENGINE=InnoDB;
+INSERT INTO t_warmcopy_reset_mirror VALUES(1,10),(2,20);
+
+--connect(warmcopy_reset_app, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_warmcopy_reset_mirror SET v=11 WHERE id=1;
+
+--connect(warmcopy_reset_owner, localhost, root,,test)
+--connection warmcopy_reset_owner
+SET DEBUG_SYNC =
+  'preserve_trx_warmcopy_after_descriptor_hwm SIGNAL warmcopy_reset_hwm WAIT_FOR warmcopy_reset_continue';
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_reset_hwm TIMEOUT 10';
+
+--connection warmcopy_reset_app
+ROLLBACK;
+START TRANSACTION;
+UPDATE t_warmcopy_reset_mirror SET v=21 WHERE id=2;
+
+--connection default
+SET DEBUG_SYNC = 'now SIGNAL warmcopy_reset_continue';
+
+--connection warmcopy_reset_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+--disconnect warmcopy_reset_owner
+
+--connection warmcopy_reset_app
+COMMIT;
+--disconnect warmcopy_reset_app
+
+--connection default
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+SELECT * FROM t_warmcopy_reset_mirror ORDER BY id;
+--source suite/preserve_trx/include/assert_no_snapshot_file.inc
+
+DROP TABLE t_warmcopy_reset_mirror;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET DEBUG_SYNC = 'RESET';

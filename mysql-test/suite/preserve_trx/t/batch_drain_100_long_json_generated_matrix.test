@@ -1,0 +1,611 @@
+--source include/big_test.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $setup_file = File::Spec->catfile($vardir, 'tmp',
+                                     'batch_long_json_setup.inc');
+my $apps_file = File::Spec->catfile($vardir, 'tmp',
+                                    'batch_long_json_apps.inc');
+my $post_apps_file = File::Spec->catfile($vardir, 'tmp',
+                                         'batch_long_json_post_apps.inc');
+my $cleanup_file = File::Spec->catfile($vardir, 'tmp',
+                                       'batch_long_json_cleanup.inc');
+my $verify_file = File::Spec->catfile($vardir, 'tmp',
+                                      'batch_long_json_verify.inc');
+
+open(my $setup, '>', $setup_file)
+  or die "cannot open $setup_file for write: $!";
+open(my $apps, '>', $apps_file)
+  or die "cannot open $apps_file for write: $!";
+open(my $post_apps, '>', $post_apps_file)
+  or die "cannot open $post_apps_file for write: $!";
+open(my $cleanup, '>', $cleanup_file)
+  or die "cannot open $cleanup_file for write: $!";
+open(my $verify, '>', $verify_file)
+  or die "cannot open $verify_file for write: $!";
+
+print $cleanup <<'SQL';
+DROP PROCEDURE IF EXISTS p_batch_long_finalize;
+DROP TABLE IF EXISTS t_batch_long_tokens;
+DROP TABLE IF EXISTS t_json_side;
+DROP TABLE IF EXISTS t_json_lookup;
+DROP TABLE IF EXISTS t_json_base;
+DROP TABLE IF EXISTS t_batch_long_audit;
+DROP TABLE IF EXISTS t_batch_long_control;
+SQL
+
+print $setup <<'SQL';
+CREATE TABLE t_batch_long_control(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  started_at DATETIME(6) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE t_batch_long_audit(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  lifecycle_age_us BIGINT UNSIGNED NOT NULL,
+  max_stmt_us BIGINT UNSIGNED NOT NULL,
+  sql_count INT UNSIGNED NOT NULL,
+  resumed_ok TINYINT NOT NULL,
+  detail VARCHAR(255) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE t_batch_long_tokens(
+  token_id INT PRIMARY KEY AUTO_INCREMENT,
+  token VARCHAR(255) NOT NULL UNIQUE
+) ENGINE=InnoDB;
+CREATE TABLE t_json_base(
+  sid INT NOT NULL,
+  k INT NOT NULL,
+  doc JSON NOT NULL,
+  note VARCHAR(128),
+  heartbeat INT NOT NULL DEFAULT 0,
+  gc_stored INT GENERATED ALWAYS AS
+    (CAST(JSON_UNQUOTE(JSON_EXTRACT(doc, '$.n')) AS SIGNED)) STORED,
+  gc_virtual VARCHAR(32) GENERATED ALWAYS AS
+    (JSON_UNQUOTE(JSON_EXTRACT(doc, '$.tag'))) VIRTUAL,
+  PRIMARY KEY(sid, k),
+  KEY idx_sid_stored(sid, gc_stored),
+  KEY idx_sid_virtual(sid, gc_virtual)
+) ENGINE=InnoDB;
+CREATE TABLE t_json_lookup(
+  sid INT NOT NULL,
+  lk INT NOT NULL,
+  n_delta INT NOT NULL,
+  tag_suffix VARCHAR(32) NOT NULL,
+  patch JSON NOT NULL,
+  PRIMARY KEY(sid, lk)
+) ENGINE=InnoDB;
+CREATE TABLE t_json_side(
+  sid INT NOT NULL,
+  case_id INT NOT NULL,
+  path_value VARCHAR(128) NOT NULL,
+  calc INT NOT NULL,
+  PRIMARY KEY(sid, case_id)
+) ENGINE=InnoDB;
+SQL
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  print $setup "INSERT INTO t_batch_long_control " .
+               "VALUES($sid, $case_id, TIMESTAMP'2000-01-01 00:00:00.000000');\n";
+  for my $k (0 .. 20) {
+    print $setup "INSERT INTO t_json_base(sid, k, doc, note, heartbeat) " .
+                 "VALUES($sid, $k, " .
+                 "JSON_OBJECT(" .
+                 "'n', " . ($sid * 100 + $k) . ", " .
+                 "'tag', CONCAT('seed-', $k), " .
+                 "'arr', JSON_ARRAY($k), " .
+                 "'a', JSON_OBJECT('b', $k), " .
+                 "'keep', 'yes'), " .
+                 "'seed', 0);\n";
+  }
+  print $setup "INSERT INTO t_json_lookup VALUES(" .
+               "$sid, 1, " . ($sid + 7000) . ", " .
+               "CONCAT('lookup-', $sid), " .
+               "JSON_OBJECT('lookup', JSON_OBJECT('sid', $sid), " .
+               "'mixed', JSON_OBJECT('from_lookup', $sid)));\n";
+}
+
+print $setup <<'SQL';
+DELIMITER |;
+CREATE PROCEDURE p_batch_long_finalize()
+BEGIN
+  DECLARE post_ok TINYINT DEFAULT 0;
+  DECLARE detail_value VARCHAR(255) DEFAULT NULL;
+  DECLARE failure_message VARCHAR(255) DEFAULT NULL;
+
+  IF @batch_long_sid IS NULL OR @batch_long_case_id IS NULL THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'missing restored batch long user vars';
+  END IF;
+  IF COALESCE(@json_pre_ok, 0) <> 1 THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'pre-drain JSON check was not restored';
+  END IF;
+
+  IF @batch_long_case_id = 1 THEN
+    UPDATE t_json_base
+       SET doc = JSON_SET(doc, '$.n', @batch_long_sid + 1001)
+     WHERE sid = @batch_long_sid AND k = 1;
+    SELECT gc_stored = @batch_long_sid + 1001
+           AND CAST(JSON_UNQUOTE(JSON_EXTRACT(doc, '$.n')) AS SIGNED) =
+               @batch_long_sid + 1001
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 1;
+    SET detail_value = 'json-set-number';
+  ELSEIF @batch_long_case_id = 2 THEN
+    UPDATE t_json_base
+       SET doc = JSON_SET(doc, '$.tag',
+                          CONCAT('tag-', @batch_long_sid, '-post'))
+     WHERE sid = @batch_long_sid AND k = 2;
+    SELECT gc_virtual = CONCAT('tag-', @batch_long_sid, '-post')
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 2;
+    SET detail_value = 'json-set-string';
+  ELSEIF @batch_long_case_id = 3 THEN
+    UPDATE t_json_base
+       SET doc = JSON_INSERT(doc, '$.newAfter', @batch_long_sid + 3)
+     WHERE sid = @batch_long_sid AND k = 3;
+    SELECT JSON_CONTAINS_PATH(doc, 'all', '$.newPath', '$.newAfter')
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 3;
+    SET detail_value = 'json-insert-path';
+  ELSEIF @batch_long_case_id = 4 THEN
+    UPDATE t_json_base
+       SET doc = JSON_REPLACE(doc, '$.tag',
+                              CONCAT('replace-post-', @batch_long_sid))
+     WHERE sid = @batch_long_sid AND k = 4;
+    SELECT JSON_UNQUOTE(JSON_EXTRACT(doc, '$.tag')) =
+           CONCAT('replace-post-', @batch_long_sid)
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 4;
+    SET detail_value = 'json-replace';
+  ELSEIF @batch_long_case_id = 5 THEN
+    UPDATE t_json_base
+       SET doc = JSON_REMOVE(doc, '$.a.b')
+     WHERE sid = @batch_long_sid AND k = 5;
+    SELECT JSON_CONTAINS_PATH(doc, 'one', '$.keep') = 0
+           AND JSON_CONTAINS_PATH(doc, 'one', '$.a.b') = 0
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 5;
+    SET detail_value = 'json-remove';
+  ELSEIF @batch_long_case_id = 6 THEN
+    UPDATE t_json_base
+       SET note = 'extract-post'
+     WHERE sid = @batch_long_sid AND k = 6
+       AND JSON_UNQUOTE(JSON_EXTRACT(doc, '$.hit')) = 'hit';
+    SELECT note = 'extract-post'
+           AND JSON_UNQUOTE(JSON_EXTRACT(doc, '$.hit')) = 'hit'
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 6;
+    SET detail_value = 'json-extract-predicate';
+  ELSEIF @batch_long_case_id = 7 THEN
+    UPDATE t_json_base
+       SET doc = JSON_SET(doc, '$.n', @batch_long_sid + 7001)
+     WHERE sid = @batch_long_sid AND k = 7;
+    SELECT gc_stored = @batch_long_sid + 7001
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 7;
+    SET detail_value = 'generated-stored-lookup';
+  ELSEIF @batch_long_case_id = 8 THEN
+    UPDATE t_json_base
+       SET note = 'virtual-lookup-post'
+     WHERE sid = @batch_long_sid AND k = 8;
+    SELECT note = 'virtual-lookup-post'
+           AND gc_virtual = CONCAT('lookup-', @batch_long_sid)
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 8;
+    SET detail_value = 'generated-virtual-lookup';
+  ELSEIF @batch_long_case_id = 9 THEN
+    UPDATE t_json_base
+       SET doc = JSON_ARRAY_APPEND(doc, '$.arr', @batch_long_sid + 1)
+     WHERE sid = @batch_long_sid AND k = 9;
+    SELECT JSON_LENGTH(JSON_EXTRACT(doc, '$.arr')) = 3
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 9;
+    SET detail_value = 'json-array-append';
+  ELSEIF @batch_long_case_id = 10 THEN
+    UPDATE t_json_base
+       SET doc = JSON_ARRAY_APPEND(doc, '$.tags',
+                                   CONCAT('post-', @batch_long_sid))
+     WHERE sid = @batch_long_sid AND k = 10
+       AND JSON_CONTAINS(doc,
+                         JSON_QUOTE(CONCAT('sid-', @batch_long_sid)),
+                         '$.tags');
+    SELECT JSON_CONTAINS(doc,
+                         JSON_QUOTE(CONCAT('post-', @batch_long_sid)),
+                         '$.tags')
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 10;
+    SET detail_value = 'json-contains';
+  ELSEIF @batch_long_case_id = 11 THEN
+    UPDATE t_json_base
+       SET doc = JSON_SET(doc, '$.a.c', @batch_long_sid * 12)
+     WHERE sid = @batch_long_sid AND k = 11;
+    SELECT CAST(JSON_UNQUOTE(JSON_EXTRACT(doc, '$.a.b')) AS SIGNED) =
+               @batch_long_sid * 11
+           AND CAST(JSON_UNQUOTE(JSON_EXTRACT(doc, '$.a.c')) AS SIGNED) =
+               @batch_long_sid * 12
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 11;
+    SET detail_value = 'nested-object';
+  ELSEIF @batch_long_case_id = 12 THEN
+    UPDATE t_json_base
+       SET note = CONCAT('own-', @json_own_n)
+     WHERE sid = @batch_long_sid AND k = 12;
+    SELECT note = CONCAT('own-', @batch_long_sid + 1200)
+           AND CAST(JSON_UNQUOTE(JSON_EXTRACT(doc, '$.n')) AS SIGNED) =
+               @batch_long_sid + 1200
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 12;
+    SET detail_value = 'own-write-json-read';
+  ELSEIF @batch_long_case_id = 13 THEN
+    UPDATE t_json_base
+       SET note = 'gc-secondary-post'
+     WHERE sid = @batch_long_sid AND k = 13;
+    SELECT note = 'gc-secondary-post'
+           AND gc_stored = @batch_long_sid + 1300
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 13;
+    SET detail_value = 'json-secondary-update';
+  ELSEIF @batch_long_case_id = 14 THEN
+    UPDATE t_json_base
+       SET doc = JSON_SET(doc, '$.tag', JSON_UNQUOTE(JSON_EXTRACT(doc, '$.tag'))),
+           note = 'noop-post'
+     WHERE sid = @batch_long_sid AND k = 14;
+    SELECT note = 'noop-post'
+           AND JSON_UNQUOTE(JSON_EXTRACT(doc, '$.tag')) = CONCAT('seed-', 14)
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 14;
+    SET detail_value = 'json-noop-set';
+  ELSEIF @batch_long_case_id = 15 THEN
+    UPDATE t_json_base
+       SET doc = JSON_SET(doc, '$.after_null', 'seen')
+     WHERE sid = @batch_long_sid AND k = 15;
+    SELECT JSON_TYPE(JSON_EXTRACT(doc, '$.json_null')) = 'NULL'
+           AND JSON_EXTRACT(doc, '$.sql_absent') IS NULL
+           AND JSON_UNQUOTE(JSON_EXTRACT(doc, '$.after_null')) = 'seen'
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 15;
+    SET detail_value = 'json-null-literal';
+  ELSEIF @batch_long_case_id = 16 THEN
+    UPDATE t_json_base
+       SET doc = JSON_SET(doc, '$.n', @batch_long_sid + 16001)
+     WHERE sid = @batch_long_sid AND k = 16;
+    SELECT gc_stored BETWEEN @batch_long_sid + 16000
+                         AND @batch_long_sid + 16002
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 16;
+    SET detail_value = 'generated-range';
+  ELSEIF @batch_long_case_id = 17 THEN
+    UPDATE t_json_base
+       SET doc = JSON_SET(doc, '$.after_resume', @batch_long_sid + 17)
+     WHERE sid = @batch_long_sid AND k = 17;
+    SELECT CAST(JSON_UNQUOTE(JSON_EXTRACT(doc, '$.before_resume')) AS SIGNED) =
+               @batch_long_sid
+           AND CAST(JSON_UNQUOTE(JSON_EXTRACT(doc, '$.after_resume')) AS SIGNED) =
+               @batch_long_sid + 17
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 17;
+    SET detail_value = 'resume-json-set';
+  ELSEIF @batch_long_case_id = 18 THEN
+    UPDATE t_json_base
+       SET doc = JSON_SET(doc, '$.n', @batch_long_sid + 1801)
+     WHERE sid = @batch_long_sid AND k = 18;
+    SELECT gc_stored = @batch_long_sid + 1801
+           AND gc_virtual = CONCAT('gc-pre-', @batch_long_sid)
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 18;
+    SET detail_value = 'resume-gc-lookup';
+  ELSEIF @batch_long_case_id = 19 THEN
+    UPDATE t_json_base
+       SET doc = JSON_SET(doc, '$.mixed.post', @batch_long_sid + 19)
+     WHERE sid = @batch_long_sid AND k = 19;
+    SELECT s.path_value = CONCAT('lookup-', @batch_long_sid, ':',
+                                 @batch_long_sid + 1900)
+           AND CAST(JSON_UNQUOTE(JSON_EXTRACT(b.doc, '$.mixed.from_lookup'))
+                    AS SIGNED) = @batch_long_sid
+           AND CAST(JSON_UNQUOTE(JSON_EXTRACT(b.doc, '$.mixed.post'))
+                    AS SIGNED) = @batch_long_sid + 19
+      INTO post_ok
+      FROM t_json_base b JOIN t_json_side s
+        ON s.sid = b.sid AND s.case_id = 19
+     WHERE b.sid = @batch_long_sid AND b.k = 19;
+    SET detail_value = 'mixed-json-paths';
+  ELSEIF @batch_long_case_id = 20 THEN
+    ROLLBACK TO SAVEPOINT s_json;
+    UPDATE t_json_base
+       SET doc = JSON_SET(doc, '$.tag', CONCAT('savepoint-', @batch_long_sid))
+     WHERE sid = @batch_long_sid AND k = 20;
+    SELECT gc_stored = @batch_long_sid + 2000
+           AND gc_virtual = CONCAT('savepoint-', @batch_long_sid)
+      INTO post_ok FROM t_json_base
+     WHERE sid = @batch_long_sid AND k = 20;
+    SET detail_value = 'json-savepoint-light';
+  END IF;
+
+  IF COALESCE(post_ok, 0) <> 1 THEN
+    SET failure_message = CONCAT(
+      'post-resume JSON check failed sid=',
+      COALESCE(CAST(@batch_long_sid AS CHAR), 'NULL'),
+      ' case=',
+      COALESCE(CAST(@batch_long_case_id AS CHAR), 'NULL'),
+      ' detail=',
+      COALESCE(detail_value, 'NULL'),
+      ' post_ok=',
+      COALESCE(CAST(post_ok AS CHAR), 'NULL'));
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = failure_message;
+  END IF;
+
+  SET @batch_long_end_action = 'COMMIT';
+  INSERT INTO t_batch_long_audit VALUES(
+    @batch_long_sid,
+    @batch_long_case_id,
+    TIMESTAMPDIFF(MICROSECOND, @batch_long_started_at, UTC_TIMESTAMP(6)),
+    @batch_long_max_stmt_us,
+    @batch_long_sql_count,
+    1,
+    detail_value);
+END|
+DELIMITER ;|
+SQL
+
+print $verify <<'SQL';
+SELECT COUNT(DISTINCT detail) AS json_cases_ok
+  FROM t_batch_long_audit WHERE resumed_ok = 1;
+SELECT detail, COUNT(*) = 5 AS ok
+  FROM t_batch_long_audit GROUP BY detail ORDER BY detail;
+SELECT COUNT(*) = 0 AS small_json_guard_ok
+  FROM t_json_base
+ WHERE JSON_STORAGE_SIZE(doc) > 512;
+SELECT 1 AS case_id,
+       COUNT(*) = 5 AS ok
+  FROM t_json_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 1 AND b.k = 1
+   AND b.gc_stored = b.sid + 1001
+UNION ALL SELECT 2, COUNT(*) = 5
+  FROM t_json_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 2 AND b.k = 2
+   AND b.gc_virtual = CONCAT('tag-', b.sid, '-post')
+UNION ALL SELECT 3, COUNT(*) = 5
+  FROM t_json_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 3 AND b.k = 3
+   AND JSON_CONTAINS_PATH(b.doc, 'all', '$.newPath', '$.newAfter')
+UNION ALL SELECT 4, COUNT(*) = 5
+  FROM t_json_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 4 AND b.k = 4
+   AND b.gc_virtual = CONCAT('replace-post-', b.sid)
+UNION ALL SELECT 5, COUNT(*) = 5
+  FROM t_json_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 5 AND b.k = 5
+   AND JSON_CONTAINS_PATH(b.doc, 'one', '$.keep') = 0
+   AND JSON_CONTAINS_PATH(b.doc, 'one', '$.a.b') = 0
+UNION ALL SELECT 6, COUNT(*) = 5
+  FROM t_json_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 6 AND b.k = 6
+   AND b.note = 'extract-post'
+   AND JSON_UNQUOTE(JSON_EXTRACT(b.doc, '$.hit')) = 'hit'
+UNION ALL SELECT 7, COUNT(*) = 5
+  FROM t_json_base b FORCE INDEX(idx_sid_stored)
+  JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 7 AND b.k = 7
+   AND b.gc_stored = b.sid + 7001
+UNION ALL SELECT 8, COUNT(*) = 5
+  FROM t_json_base b FORCE INDEX(idx_sid_virtual)
+  JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 8 AND b.k = 8
+   AND b.note = 'virtual-lookup-post'
+   AND b.gc_virtual = CONCAT('lookup-', b.sid)
+UNION ALL SELECT 9, COUNT(*) = 5
+  FROM t_json_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 9 AND b.k = 9
+   AND JSON_LENGTH(JSON_EXTRACT(b.doc, '$.arr')) = 3
+UNION ALL SELECT 10, COUNT(*) = 5
+  FROM t_json_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 10 AND b.k = 10
+   AND JSON_CONTAINS(b.doc, JSON_QUOTE(CONCAT('post-', b.sid)), '$.tags')
+UNION ALL SELECT 11, COUNT(*) = 5
+  FROM t_json_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 11 AND b.k = 11
+   AND CAST(JSON_UNQUOTE(JSON_EXTRACT(b.doc, '$.a.b')) AS SIGNED) =
+       b.sid * 11
+   AND CAST(JSON_UNQUOTE(JSON_EXTRACT(b.doc, '$.a.c')) AS SIGNED) =
+       b.sid * 12
+UNION ALL SELECT 12, COUNT(*) = 5
+  FROM t_json_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 12 AND b.k = 12
+   AND b.note = CONCAT('own-', b.sid + 1200)
+UNION ALL SELECT 13, COUNT(*) = 5
+  FROM t_json_base b FORCE INDEX(idx_sid_stored)
+  JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 13 AND b.k = 13
+   AND b.note = 'gc-secondary-post'
+   AND b.gc_stored = b.sid + 1300
+UNION ALL SELECT 14, COUNT(*) = 5
+  FROM t_json_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 14 AND b.k = 14
+   AND b.note = 'noop-post'
+   AND b.gc_virtual = 'seed-14'
+UNION ALL SELECT 15, COUNT(*) = 5
+  FROM t_json_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 15 AND b.k = 15
+   AND JSON_TYPE(JSON_EXTRACT(b.doc, '$.json_null')) = 'NULL'
+   AND JSON_EXTRACT(b.doc, '$.sql_absent') IS NULL
+UNION ALL SELECT 16, COUNT(*) = 5
+  FROM t_json_base b FORCE INDEX(idx_sid_stored)
+  JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 16 AND b.k = 16
+   AND b.gc_stored BETWEEN b.sid + 16000 AND b.sid + 16002
+   AND b.gc_stored = b.sid + 16001
+UNION ALL SELECT 17, COUNT(*) = 5
+  FROM t_json_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 17 AND b.k = 17
+   AND CAST(JSON_UNQUOTE(JSON_EXTRACT(b.doc, '$.before_resume')) AS SIGNED) =
+       b.sid
+   AND CAST(JSON_UNQUOTE(JSON_EXTRACT(b.doc, '$.after_resume')) AS SIGNED) =
+       b.sid + 17
+UNION ALL SELECT 18, COUNT(*) = 5
+  FROM t_json_base b FORCE INDEX(idx_sid_virtual)
+  JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 18 AND b.k = 18
+   AND b.gc_stored = b.sid + 1801
+   AND b.gc_virtual = CONCAT('gc-pre-', b.sid)
+UNION ALL SELECT 19, COUNT(*) = 5
+  FROM t_json_base b JOIN t_batch_long_control c USING(sid)
+  JOIN t_json_side s ON s.sid = b.sid AND s.case_id = 19
+ WHERE c.case_id = 19 AND b.k = 19
+   AND s.path_value = CONCAT('lookup-', b.sid, ':', b.sid + 1900)
+   AND CAST(JSON_UNQUOTE(JSON_EXTRACT(b.doc, '$.mixed.from_lookup'))
+            AS SIGNED) = b.sid
+   AND CAST(JSON_UNQUOTE(JSON_EXTRACT(b.doc, '$.mixed.post'))
+            AS SIGNED) = b.sid + 19
+UNION ALL SELECT 20, COUNT(*) = 5
+  FROM t_json_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 20 AND b.k = 20
+   AND b.gc_stored = b.sid + 2000
+   AND b.gc_virtual = CONCAT('savepoint-', b.sid)
+ORDER BY case_id;
+SQL
+
+sub emit_measured {
+  my ($fh, $sql) = @_;
+  print $fh "SET \@batch_long_stmt_start = NOW(6);\n";
+  print $fh "$sql;\n";
+  print $fh "SET \@batch_long_stmt_us = " .
+            "TIMESTAMPDIFF(MICROSECOND, \@batch_long_stmt_start, NOW(6));\n";
+  print $fh "SET \@batch_long_max_stmt_us = " .
+            "GREATEST(\@batch_long_max_stmt_us, \@batch_long_stmt_us);\n";
+  print $fh "SET \@batch_long_sql_count = \@batch_long_sql_count + 1;\n";
+}
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  my $name = sprintf("batch_long_app_%03d", $sid);
+  print $apps "--connect($name,localhost,root,,test)\n";
+  print $apps "--connection $name\n";
+  print $apps "UPDATE t_batch_long_control SET started_at = NOW(6) WHERE sid = $sid;\n";
+  print $apps "SET \@batch_long_sid = $sid;\n";
+  print $apps "SET \@batch_long_case_id = $case_id;\n";
+  print $apps "SET \@batch_long_started_at = UTC_TIMESTAMP(6);\n";
+  print $apps "SET \@batch_long_max_stmt_us = 0;\n";
+  print $apps "SET \@batch_long_sql_count = 0;\n";
+  print $apps "SET \@batch_long_end_action = 'COMMIT';\n";
+  print $apps "SET \@json_pre_ok = 0;\n";
+  print $apps "SET \@json_own_n = NULL;\n";
+  print $apps "START TRANSACTION;\n";
+  emit_measured($apps, "UPDATE t_json_base SET heartbeat = heartbeat + 1 WHERE sid = $sid AND k = 0");
+
+  if ($case_id == 1) {
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_SET(doc, '\$.n', $sid + 1000) WHERE sid = $sid AND k = 1");
+    emit_measured($apps, "SELECT gc_stored = $sid + 1000 INTO \@json_pre_ok FROM t_json_base WHERE sid = $sid AND k = 1");
+  } elsif ($case_id == 2) {
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_SET(doc, '\$.tag', CONCAT('tag-', $sid)) WHERE sid = $sid AND k = 2");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@json_pre_ok FROM t_json_base WHERE sid = $sid AND k = 2 AND gc_virtual = CONCAT('tag-', $sid)");
+  } elsif ($case_id == 3) {
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_INSERT(doc, '\$.newPath', $sid + 3) WHERE sid = $sid AND k = 3");
+    emit_measured($apps, "SELECT JSON_CONTAINS_PATH(doc, 'one', '\$.newPath') INTO \@json_pre_ok FROM t_json_base WHERE sid = $sid AND k = 3");
+  } elsif ($case_id == 4) {
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_REPLACE(doc, '\$.tag', CONCAT('replace-pre-', $sid)) WHERE sid = $sid AND k = 4");
+    emit_measured($apps, "SELECT gc_virtual = CONCAT('replace-pre-', $sid) INTO \@json_pre_ok FROM t_json_base WHERE sid = $sid AND k = 4");
+  } elsif ($case_id == 5) {
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_REMOVE(doc, '\$.keep') WHERE sid = $sid AND k = 5");
+    emit_measured($apps, "SELECT JSON_CONTAINS_PATH(doc, 'one', '\$.keep') = 0 INTO \@json_pre_ok FROM t_json_base WHERE sid = $sid AND k = 5");
+  } elsif ($case_id == 6) {
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_SET(doc, '\$.hit', 'hit') WHERE sid = $sid AND k = 6 AND CAST(JSON_UNQUOTE(JSON_EXTRACT(doc, '\$.n')) AS SIGNED) = " . ($sid * 100 + 6));
+    emit_measured($apps, "SELECT JSON_UNQUOTE(JSON_EXTRACT(doc, '\$.hit')) = 'hit' INTO \@json_pre_ok FROM t_json_base WHERE sid = $sid AND k = 6");
+  } elsif ($case_id == 7) {
+    emit_measured($apps, "UPDATE t_json_base b JOIN t_json_lookup l USING(sid) SET b.doc = JSON_SET(b.doc, '\$.n', l.n_delta) WHERE b.sid = $sid AND b.k = 7 AND l.lk = 1");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@json_pre_ok FROM t_json_base FORCE INDEX(idx_sid_stored) WHERE sid = $sid AND gc_stored = $sid + 7000 AND k = 7");
+  } elsif ($case_id == 8) {
+    emit_measured($apps, "UPDATE t_json_base b JOIN t_json_lookup l USING(sid) SET b.doc = JSON_SET(b.doc, '\$.tag', l.tag_suffix) WHERE b.sid = $sid AND b.k = 8 AND l.lk = 1");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@json_pre_ok FROM t_json_base FORCE INDEX(idx_sid_virtual) WHERE sid = $sid AND gc_virtual = CONCAT('lookup-', $sid) AND k = 8");
+  } elsif ($case_id == 9) {
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_ARRAY_APPEND(doc, '\$.arr', $sid) WHERE sid = $sid AND k = 9");
+    emit_measured($apps, "SELECT JSON_LENGTH(JSON_EXTRACT(doc, '\$.arr')) = 2 INTO \@json_pre_ok FROM t_json_base WHERE sid = $sid AND k = 9");
+  } elsif ($case_id == 10) {
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_SET(doc, '\$.tags', JSON_ARRAY('base', CONCAT('sid-', $sid))) WHERE sid = $sid AND k = 10");
+    emit_measured($apps, "SELECT JSON_CONTAINS(doc, JSON_QUOTE(CONCAT('sid-', $sid)), '\$.tags') INTO \@json_pre_ok FROM t_json_base WHERE sid = $sid AND k = 10");
+  } elsif ($case_id == 11) {
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_SET(doc, '\$.a.b', $sid * 11) WHERE sid = $sid AND k = 11");
+    emit_measured($apps, "SELECT CAST(JSON_UNQUOTE(JSON_EXTRACT(doc, '\$.a.b')) AS SIGNED) = " . ($sid * 11) . " INTO \@json_pre_ok FROM t_json_base WHERE sid = $sid AND k = 11");
+  } elsif ($case_id == 12) {
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_SET(doc, '\$.n', $sid + 1200) WHERE sid = $sid AND k = 12");
+    emit_measured($apps, "SELECT CAST(JSON_UNQUOTE(JSON_EXTRACT(doc, '\$.n')) AS SIGNED) INTO \@json_own_n FROM t_json_base WHERE sid = $sid AND k = 12");
+    emit_measured($apps, "SELECT \@json_own_n = $sid + 1200 INTO \@json_pre_ok");
+  } elsif ($case_id == 13) {
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_SET(doc, '\$.n', $sid + 1300) WHERE sid = $sid AND k = 13");
+    emit_measured($apps, "UPDATE t_json_base SET note = 'gc-secondary-pre' WHERE sid = $sid AND k = 13");
+    emit_measured($apps, "SELECT note = 'gc-secondary-pre' INTO \@json_pre_ok FROM t_json_base FORCE INDEX(idx_sid_stored) WHERE sid = $sid AND gc_stored = $sid + 1300 AND k = 13");
+  } elsif ($case_id == 14) {
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_SET(doc, '\$.tag', JSON_UNQUOTE(JSON_EXTRACT(doc, '\$.tag'))), note = 'noop-pre' WHERE sid = $sid AND k = 14");
+    emit_measured($apps, "SELECT note = 'noop-pre' AND gc_virtual = 'seed-14' INTO \@json_pre_ok FROM t_json_base WHERE sid = $sid AND k = 14");
+  } elsif ($case_id == 15) {
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_SET(doc, '\$.json_null', JSON_EXTRACT('null', '\$')) WHERE sid = $sid AND k = 15");
+    emit_measured($apps, "SELECT JSON_TYPE(JSON_EXTRACT(doc, '\$.json_null')) = 'NULL' INTO \@json_pre_ok FROM t_json_base WHERE sid = $sid AND k = 15");
+  } elsif ($case_id == 16) {
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_SET(doc, '\$.n', $sid + 16000) WHERE sid = $sid AND k = 16");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@json_pre_ok FROM t_json_base FORCE INDEX(idx_sid_stored) WHERE sid = $sid AND gc_stored BETWEEN " . ($sid + 15999) . " AND " . ($sid + 16001) . " AND k = 16");
+  } elsif ($case_id == 17) {
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_SET(doc, '\$.before_resume', $sid) WHERE sid = $sid AND k = 17");
+    emit_measured($apps, "SELECT CAST(JSON_UNQUOTE(JSON_EXTRACT(doc, '\$.before_resume')) AS SIGNED) = $sid INTO \@json_pre_ok FROM t_json_base WHERE sid = $sid AND k = 17");
+  } elsif ($case_id == 18) {
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_SET(doc, '\$.tag', CONCAT('gc-pre-', $sid)) WHERE sid = $sid AND k = 18");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@json_pre_ok FROM t_json_base FORCE INDEX(idx_sid_virtual) WHERE sid = $sid AND gc_virtual = CONCAT('gc-pre-', $sid) AND k = 18");
+  } elsif ($case_id == 19) {
+    emit_measured($apps, "UPDATE t_json_base b JOIN t_json_lookup l USING(sid) SET b.doc = JSON_MERGE_PATCH(JSON_SET(b.doc, '\$.n', $sid + 1900, '\$.tag', CONCAT('lookup-', $sid)), l.patch) WHERE b.sid = $sid AND b.k = 19 AND l.lk = 1");
+    emit_measured($apps, "INSERT INTO t_json_side VALUES($sid, 19, CONCAT('lookup-', $sid, ':', $sid + 1900), $sid + 1900)");
+    emit_measured($apps, "SELECT path_value = CONCAT('lookup-', $sid, ':', $sid + 1900) INTO \@json_pre_ok FROM t_json_side WHERE sid = $sid AND case_id = 19");
+  } elsif ($case_id == 20) {
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_SET(doc, '\$.n', $sid + 2000) WHERE sid = $sid AND k = 20");
+    emit_measured($apps, "SAVEPOINT s_json");
+    emit_measured($apps, "UPDATE t_json_base SET doc = JSON_SET(doc, '\$.n', $sid + 2999) WHERE sid = $sid AND k = 20");
+    emit_measured($apps, "SELECT gc_stored = $sid + 2999 INTO \@json_pre_ok FROM t_json_base WHERE sid = $sid AND k = 20");
+  }
+}
+print $apps "--connection default\n";
+
+for my $round (1 .. 80) {
+  for my $sid (1 .. 100) {
+    my $name = sprintf("batch_long_app_%03d", $sid);
+    print $post_apps "--connection $name\n";
+    emit_measured($post_apps, "UPDATE t_json_base SET heartbeat = heartbeat + 1 WHERE sid = $sid AND k = 0");
+  }
+}
+print $post_apps "--connection default\n";
+
+close($setup);
+close($apps);
+close($post_apps);
+close($cleanup);
+close($verify);
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+SET GLOBAL preserve_trx_recovery_max_count=200;
+--let $old_preserve_trx_drain_grace_ms= `SELECT @@GLOBAL.preserve_trx_drain_grace_ms`
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+
+--let $batch_long_prefix= batch_long_json
+--let $batch_long_setup_file= $MYSQLTEST_VARDIR/tmp/batch_long_json_setup.inc
+--let $batch_long_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_json_apps.inc
+--let $batch_long_post_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_json_post_apps.inc
+--let $batch_long_cleanup_file= $MYSQLTEST_VARDIR/tmp/batch_long_json_cleanup.inc
+--let $batch_long_resume_file= $MYSQLTEST_VARDIR/tmp/batch_long_json_resume.inc
+--let $batch_long_verify_file= $MYSQLTEST_VARDIR/tmp/batch_long_json_verify.inc
+--source suite/preserve_trx/include/batch_drain_100_long_common.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+--disable_query_log
+--disable_result_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_drain_grace_ms=$old_preserve_trx_drain_grace_ms
+--enable_result_log
+--enable_query_log

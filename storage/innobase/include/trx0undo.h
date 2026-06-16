@@ -257,6 +257,13 @@ page_t *trx_undo_set_state_at_finish(
 page_t *trx_undo_set_state_at_prepare(trx_t *trx, trx_undo_t *undo,
                                       bool rollback, mtr_t *mtr);
 
+/** Checks whether a preserved no-redo undo log is a temp-table image that must
+not be linked to the generic update undo history.
+@param[in] undo  undo log memory copy
+@return true if history/cache reuse must be skipped */
+bool trx_undo_preserve_magic_no_redo_should_skip_history(
+    const trx_undo_t *undo);
+
 /** Adds the update undo log header as the first in the history list, and
  frees the memory object, or puts it to the list of cached update undo log
  segments.
@@ -278,6 +285,18 @@ the data can be discarded.
 @param[in,out]	undo_ptr	undo log to clean up
 @param[in]	noredo		whether the undo tablespace is redo logged */
 void trx_undo_insert_cleanup(trx_undo_ptr_t *undo_ptr, bool noredo);
+
+/** Discards cached undo objects whose header page is about to be replaced by
+an externally materialized no-redo undo image.
+@param[in,out]  rseg         rollback segment whose cached lists are scanned
+@param[in]      hdr_page_no  undo header page number to discard */
+void trx_undo_discard_cached_for_header_page(trx_rseg_t *rseg,
+                                             page_no_t hdr_page_no);
+
+/** Discards all cached undo objects for a rollback segment before a preserved
+no-redo undo image is materialized into the same physical temp space.
+@param[in,out]  rseg  rollback segment whose cached lists are discarded */
+void trx_undo_discard_cached_for_rseg(trx_rseg_t *rseg);
 
 /** At shutdown, frees the undo logs of a transaction which was either
 PREPARED or (ACTIVE and recovered).
@@ -368,6 +387,10 @@ struct trx_undo_t {
                    identification */
   ulint flag;      /*!< flag for current transaction XID and GTID.
                    Persisted in TRX_UNDO_FLAGS flag of undo header. */
+  bool preserve_restored_no_redo_undo{
+      false}; /*!< true iff this no-redo undo object was restored from a
+                 preserved temporary-table sidecar image and must not be linked
+                 to normal history/cache lists. */
 
   /** Set if space for GTID is allocated. */
   bool gtid_allocated;

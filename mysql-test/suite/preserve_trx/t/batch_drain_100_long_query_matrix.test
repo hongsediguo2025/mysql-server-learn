@@ -1,0 +1,281 @@
+--source include/big_test.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $setup_file = File::Spec->catfile($vardir, 'tmp',
+                                     'batch_long_query_setup.inc');
+my $apps_file = File::Spec->catfile($vardir, 'tmp',
+                                    'batch_long_query_apps.inc');
+my $post_apps_file = File::Spec->catfile($vardir, 'tmp',
+                                         'batch_long_query_post_apps.inc');
+my $cleanup_file = File::Spec->catfile($vardir, 'tmp',
+                                       'batch_long_query_cleanup.inc');
+my $verify_file = File::Spec->catfile($vardir, 'tmp',
+                                      'batch_long_query_verify.inc');
+
+open(my $setup, '>', $setup_file)
+  or die "cannot open $setup_file for write: $!";
+open(my $apps, '>', $apps_file)
+  or die "cannot open $apps_file for write: $!";
+open(my $post_apps, '>', $post_apps_file)
+  or die "cannot open $post_apps_file for write: $!";
+open(my $cleanup, '>', $cleanup_file)
+  or die "cannot open $cleanup_file for write: $!";
+open(my $verify, '>', $verify_file)
+  or die "cannot open $verify_file for write: $!";
+
+print $cleanup "DROP PROCEDURE IF EXISTS p_batch_long_finalize;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_long_tokens;\n";
+print $cleanup "DROP TABLE IF EXISTS t_query_side;\n";
+print $cleanup "DROP TABLE IF EXISTS t_query_base;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_long_audit;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_long_control;\n";
+
+print $setup "CREATE TABLE t_batch_long_control(" .
+             "sid INT PRIMARY KEY, " .
+             "case_id INT NOT NULL, " .
+             "started_at DATETIME(6) NOT NULL" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_batch_long_audit(" .
+             "sid INT PRIMARY KEY, " .
+             "case_id INT NOT NULL, " .
+             "lifecycle_age_us BIGINT UNSIGNED NOT NULL, " .
+             "max_stmt_us BIGINT UNSIGNED NOT NULL, " .
+             "sql_count INT UNSIGNED NOT NULL, " .
+             "resumed_ok TINYINT NOT NULL, " .
+             "detail VARCHAR(255) NOT NULL" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_batch_long_tokens(" .
+             "token_id INT PRIMARY KEY AUTO_INCREMENT, " .
+             "token VARCHAR(255) NOT NULL UNIQUE" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_query_base(" .
+             "sid INT NOT NULL, " .
+             "k INT NOT NULL, " .
+             "grp INT NOT NULL, " .
+             "v INT NOT NULL, " .
+             "txt VARCHAR(64), " .
+             "PRIMARY KEY(sid, k), " .
+             "KEY idx_sid_grp(sid, grp), " .
+             "KEY idx_sid_v(sid, v), " .
+             "KEY idx_sid_txt(sid, txt)" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_query_side(" .
+             "sid INT NOT NULL, " .
+             "k INT NOT NULL, " .
+             "score INT NOT NULL, " .
+             "PRIMARY KEY(sid, k), " .
+             "KEY idx_sid_score(sid, score)" .
+             ") ENGINE=InnoDB;\n";
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  print $setup "INSERT INTO t_batch_long_control " .
+               "VALUES($sid, $case_id, TIMESTAMP'2000-01-01 00:00:00.000000');\n";
+  for my $k (1 .. 8) {
+    my $grp = $k % 3;
+    my $v = $sid * 10 + $k;
+    print $setup "INSERT INTO t_query_base " .
+                 "VALUES($sid, $k, $grp, $v, 'txt$k');\n";
+  }
+  for my $k (1 .. 5) {
+    my $score = $sid * 10 + $k;
+    print $setup "INSERT INTO t_query_side VALUES($sid, $k, $score);\n";
+  }
+}
+
+print $setup "DELIMITER |;\n";
+print $setup "CREATE PROCEDURE p_batch_long_finalize()\n";
+print $setup "BEGIN\n";
+print $setup "  DECLARE post_ok TINYINT DEFAULT 0;\n";
+print $setup "  IF \@batch_long_sid IS NULL OR \@batch_long_case_id IS NULL THEN\n";
+print $setup "    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'missing restored batch long user vars';\n";
+print $setup "  END IF;\n";
+print $setup "  IF COALESCE(\@batch_query_pre_ok, 0) <> 1 THEN\n";
+print $setup "    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'pre-drain query check was not restored';\n";
+print $setup "  END IF;\n";
+print $setup "  IF \@batch_long_case_id = 1 THEN\n";
+print $setup "    SELECT v = \@batch_long_sid * 10 + 2 INTO post_ok FROM t_query_base WHERE sid = \@batch_long_sid AND k = 1;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 2 THEN\n";
+print $setup "    SELECT COUNT(*) = 4 INTO post_ok FROM t_query_base WHERE sid = \@batch_long_sid AND k BETWEEN 1 AND 4;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 3 THEN\n";
+print $setup "    SELECT COUNT(*) = 3 INTO post_ok FROM t_query_base WHERE sid = \@batch_long_sid AND grp = 1;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 4 THEN\n";
+print $setup "    SELECT SUM(v) = \@batch_long_sid * 30 + 15 INTO post_ok FROM t_query_base WHERE sid = \@batch_long_sid AND grp = 2;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 5 THEN\n";
+print $setup "    SELECT k = 8 INTO post_ok FROM t_query_base WHERE sid = \@batch_long_sid ORDER BY v DESC, k DESC LIMIT 1;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 6 THEN\n";
+print $setup "    SELECT k = 3 INTO post_ok FROM t_query_base WHERE sid = \@batch_long_sid ORDER BY v, k LIMIT 1 OFFSET 2;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 7 THEN\n";
+print $setup "    SELECT COUNT(DISTINCT grp) = 3 INTO post_ok FROM t_query_base WHERE sid = \@batch_long_sid;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 8 THEN\n";
+print $setup "    SELECT COUNT(*) = 8 AND MIN(v) >= \@batch_long_sid * 10 + 2 INTO post_ok FROM t_query_base WHERE sid = \@batch_long_sid;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 9 THEN\n";
+print $setup "    SELECT COUNT(*) = 3 INTO post_ok FROM (SELECT grp FROM t_query_base WHERE sid = \@batch_long_sid GROUP BY grp) q;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 10 THEN\n";
+print $setup "    SELECT COUNT(*) = 3 INTO post_ok FROM (SELECT grp, COUNT(*) AS c FROM t_query_base WHERE sid = \@batch_long_sid GROUP BY grp HAVING c >= 2) q;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 11 THEN\n";
+print $setup "    SELECT COUNT(*) = 2 INTO post_ok FROM (SELECT k FROM t_query_base WHERE sid = \@batch_long_sid AND k = 1 UNION ALL SELECT k FROM t_query_side WHERE sid = \@batch_long_sid AND k = 1) q;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 12 THEN\n";
+print $setup "    SELECT COUNT(*) = 1 INTO post_ok FROM (SELECT k FROM t_query_base WHERE sid = \@batch_long_sid AND k = 1 UNION SELECT k FROM t_query_side WHERE sid = \@batch_long_sid AND k = 1) q;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 13 THEN\n";
+print $setup "    WITH cte AS (SELECT k FROM t_query_base WHERE sid = \@batch_long_sid AND k <= 3) SELECT COUNT(*) = 3 INTO post_ok FROM cte;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 14 THEN\n";
+print $setup "    WITH RECURSIVE n(i) AS (SELECT MIN(k) FROM t_query_base WHERE sid = \@batch_long_sid UNION ALL SELECT i + 1 FROM n WHERE i < 5) SELECT SUM(i) = 15 INTO post_ok FROM n;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 15 THEN\n";
+print $setup "    SELECT rn = 8 INTO post_ok FROM (SELECT k, ROW_NUMBER() OVER (ORDER BY v, k) AS rn FROM t_query_base WHERE sid = \@batch_long_sid) q WHERE k = 8;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 16 THEN\n";
+print $setup "    SELECT (SELECT SUM(score) FROM t_query_side WHERE sid = \@batch_long_sid) = \@batch_long_sid * 50 + 15 INTO post_ok;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 17 THEN\n";
+print $setup "    SELECT EXISTS(SELECT 1 FROM t_query_side s WHERE s.sid = b.sid AND s.k = b.k) INTO post_ok FROM t_query_base b WHERE b.sid = \@batch_long_sid AND b.k = 3;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 18 THEN\n";
+print $setup "    SELECT COUNT(*) = 3 INTO post_ok FROM t_query_base WHERE sid = \@batch_long_sid AND k IN (SELECT k FROM t_query_side WHERE sid = \@batch_long_sid AND k <= 3);\n";
+print $setup "  ELSEIF \@batch_long_case_id = 19 THEN\n";
+print $setup "    SELECT COUNT(*) = 0 INTO post_ok FROM t_query_base WHERE sid = \@batch_long_sid AND k = 8;\n";
+print $setup "  ELSEIF \@batch_long_case_id = 20 THEN\n";
+print $setup "    SELECT EXISTS(SELECT 1 FROM t_query_base WHERE sid = \@batch_long_sid AND k = 20 AND v = 2000) AND EXISTS(SELECT 1 FROM t_query_base WHERE sid = \@batch_long_sid AND k = 2 AND txt = 'post-update') INTO post_ok;\n";
+print $setup "  END IF;\n";
+print $setup "  IF COALESCE(post_ok, 0) <> 1 THEN\n";
+print $setup "    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'post-resume query check failed';\n";
+print $setup "  END IF;\n";
+print $setup "  SET \@batch_long_end_action = 'COMMIT';\n";
+print $setup "  INSERT INTO t_batch_long_audit VALUES(\n";
+print $setup "    \@batch_long_sid,\n";
+print $setup "    \@batch_long_case_id,\n";
+print $setup "    TIMESTAMPDIFF(MICROSECOND, \@batch_long_started_at, NOW(6)),\n";
+print $setup "    \@batch_long_max_stmt_us,\n";
+print $setup "    \@batch_long_sql_count,\n";
+print $setup "    1,\n";
+print $setup "    CONCAT('query-case-', \@batch_long_case_id));\n";
+print $setup "END|\n";
+print $setup "DELIMITER ;|\n";
+
+print $verify "SELECT COUNT(DISTINCT case_id) AS all_query_cases_passed\n";
+print $verify "  FROM t_batch_long_audit\n";
+print $verify " WHERE resumed_ok = 1 AND detail LIKE 'query-case-%';\n";
+print $verify "SELECT case_id, COUNT(*) = 5 AS ok\n";
+print $verify "  FROM t_batch_long_audit\n";
+print $verify " GROUP BY case_id\n";
+print $verify " ORDER BY case_id;\n";
+
+sub emit_measured {
+  my ($fh, $sql) = @_;
+  print $fh "SET \@batch_long_stmt_start = NOW(6);\n";
+  print $fh "$sql;\n";
+  print $fh "SET \@batch_long_stmt_us = " .
+            "TIMESTAMPDIFF(MICROSECOND, \@batch_long_stmt_start, NOW(6));\n";
+  print $fh "SET \@batch_long_max_stmt_us = " .
+            "GREATEST(\@batch_long_max_stmt_us, \@batch_long_stmt_us);\n";
+  print $fh "SET \@batch_long_sql_count = \@batch_long_sql_count + 1;\n";
+}
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  my $name = sprintf("batch_long_app_%03d", $sid);
+  print $apps "--connect($name,localhost,root,,test)\n";
+  print $apps "--connection $name\n";
+  print $apps "UPDATE t_batch_long_control SET started_at = NOW(6) WHERE sid = $sid;\n";
+  print $apps "SET \@batch_long_sid = $sid;\n";
+  print $apps "SET \@batch_long_case_id = $case_id;\n";
+  print $apps "SET \@batch_long_started_at = " .
+              "(SELECT started_at FROM t_batch_long_control WHERE sid = $sid);\n";
+  print $apps "SET \@batch_long_max_stmt_us = 0;\n";
+  print $apps "SET \@batch_long_sql_count = 0;\n";
+  print $apps "SET \@batch_long_end_action = 'COMMIT';\n";
+  print $apps "SET \@batch_query_pre_ok = 0;\n";
+  print $apps "START TRANSACTION;\n";
+  emit_measured($apps, "UPDATE t_query_base SET v = v + 1 WHERE sid = $sid AND k = 1");
+
+  if ($case_id == 1) {
+    emit_measured($apps, "SELECT v = " . ($sid * 10 + 2) . " INTO \@batch_query_pre_ok FROM t_query_base WHERE sid = $sid AND k = 1");
+  } elsif ($case_id == 2) {
+    emit_measured($apps, "SELECT COUNT(*) = 4 INTO \@batch_query_pre_ok FROM t_query_base WHERE sid = $sid AND k BETWEEN 1 AND 4");
+  } elsif ($case_id == 3) {
+    emit_measured($apps, "SELECT COUNT(*) = 3 INTO \@batch_query_pre_ok FROM t_query_base WHERE sid = $sid AND grp = 1");
+  } elsif ($case_id == 4) {
+    emit_measured($apps, "SELECT SUM(v) = " . ($sid * 30 + 15) . " INTO \@batch_query_pre_ok FROM t_query_base WHERE sid = $sid AND grp = 2");
+  } elsif ($case_id == 5) {
+    emit_measured($apps, "SELECT k = 8 INTO \@batch_query_pre_ok FROM t_query_base WHERE sid = $sid ORDER BY v DESC, k DESC LIMIT 1");
+  } elsif ($case_id == 6) {
+    emit_measured($apps, "SELECT k = 3 INTO \@batch_query_pre_ok FROM t_query_base WHERE sid = $sid ORDER BY v, k LIMIT 1 OFFSET 2");
+  } elsif ($case_id == 7) {
+    emit_measured($apps, "SELECT COUNT(DISTINCT grp) = 3 INTO \@batch_query_pre_ok FROM t_query_base WHERE sid = $sid");
+  } elsif ($case_id == 8) {
+    emit_measured($apps, "SELECT COUNT(*) = 8 AND MIN(v) >= " . ($sid * 10 + 2) . " INTO \@batch_query_pre_ok FROM t_query_base WHERE sid = $sid");
+  } elsif ($case_id == 9) {
+    emit_measured($apps, "SELECT COUNT(*) = 3 INTO \@batch_query_pre_ok FROM (SELECT grp FROM t_query_base WHERE sid = $sid GROUP BY grp) q");
+  } elsif ($case_id == 10) {
+    emit_measured($apps, "SELECT COUNT(*) = 3 INTO \@batch_query_pre_ok FROM (SELECT grp, COUNT(*) AS c FROM t_query_base WHERE sid = $sid GROUP BY grp HAVING c >= 2) q");
+  } elsif ($case_id == 11) {
+    emit_measured($apps, "SELECT COUNT(*) = 2 INTO \@batch_query_pre_ok FROM (SELECT k FROM t_query_base WHERE sid = $sid AND k = 1 UNION ALL SELECT k FROM t_query_side WHERE sid = $sid AND k = 1) q");
+  } elsif ($case_id == 12) {
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@batch_query_pre_ok FROM (SELECT k FROM t_query_base WHERE sid = $sid AND k = 1 UNION SELECT k FROM t_query_side WHERE sid = $sid AND k = 1) q");
+  } elsif ($case_id == 13) {
+    emit_measured($apps, "WITH cte AS (SELECT k FROM t_query_base WHERE sid = $sid AND k <= 3) SELECT COUNT(*) = 3 INTO \@batch_query_pre_ok FROM cte");
+  } elsif ($case_id == 14) {
+    emit_measured($apps, "SELECT k FROM t_query_base WHERE sid = $sid AND k = 2 FOR UPDATE");
+    emit_measured($apps, "WITH RECURSIVE n(i) AS (SELECT MIN(k) FROM t_query_base WHERE sid = $sid UNION ALL SELECT i + 1 FROM n WHERE i < 5) SELECT SUM(i) = 15 INTO \@batch_query_pre_ok FROM n");
+  } elsif ($case_id == 15) {
+    emit_measured($apps, "SELECT rn = 8 INTO \@batch_query_pre_ok FROM (SELECT k, ROW_NUMBER() OVER (ORDER BY v, k) AS rn FROM t_query_base WHERE sid = $sid) q WHERE k = 8");
+  } elsif ($case_id == 16) {
+    emit_measured($apps, "SELECT (SELECT SUM(score) FROM t_query_side WHERE sid = $sid) = " . ($sid * 50 + 15) . " INTO \@batch_query_pre_ok");
+  } elsif ($case_id == 17) {
+    emit_measured($apps, "SELECT EXISTS(SELECT 1 FROM t_query_side s WHERE s.sid = b.sid AND s.k = b.k) INTO \@batch_query_pre_ok FROM t_query_base b WHERE b.sid = $sid AND b.k = 3");
+  } elsif ($case_id == 18) {
+    emit_measured($apps, "SELECT COUNT(*) = 3 INTO \@batch_query_pre_ok FROM t_query_base WHERE sid = $sid AND k IN (SELECT k FROM t_query_side WHERE sid = $sid AND k <= 3)");
+  } elsif ($case_id == 19) {
+    emit_measured($apps, "DELETE FROM t_query_base WHERE sid = $sid AND k = 8");
+    emit_measured($apps, "SELECT COUNT(*) = 0 INTO \@batch_query_pre_ok FROM t_query_base WHERE sid = $sid AND k = 8");
+  } elsif ($case_id == 20) {
+    emit_measured($apps, "INSERT INTO t_query_base VALUES($sid, 20, 2, 2000, 'inserted')");
+    emit_measured($apps, "UPDATE t_query_base SET txt = 'post-update' WHERE sid = $sid AND k = 2");
+    emit_measured($apps, "SELECT EXISTS(SELECT 1 FROM t_query_base WHERE sid = $sid AND k = 20 AND v = 2000) AND EXISTS(SELECT 1 FROM t_query_base WHERE sid = $sid AND k = 2 AND txt = 'post-update') INTO \@batch_query_pre_ok");
+  }
+
+}
+print $apps "--connection default\n";
+
+for my $round (1 .. 80) {
+  for my $sid (1 .. 100) {
+    my $name = sprintf("batch_long_app_%03d", $sid);
+    print $post_apps "--connection $name\n";
+    emit_measured($post_apps, "SELECT COUNT(*) >= 1 INTO \@batch_query_heartbeat_ok FROM t_query_base WHERE sid = $sid AND k = 1");
+  }
+}
+print $post_apps "--connection default\n";
+
+close($setup);
+close($apps);
+close($post_apps);
+close($cleanup);
+close($verify);
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+SET GLOBAL preserve_trx_recovery_max_count=200;
+--let $old_preserve_trx_drain_grace_ms= `SELECT @@GLOBAL.preserve_trx_drain_grace_ms`
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+
+--let $batch_long_prefix= batch_long_query
+--let $batch_long_setup_file= $MYSQLTEST_VARDIR/tmp/batch_long_query_setup.inc
+--let $batch_long_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_query_apps.inc
+--let $batch_long_post_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_query_post_apps.inc
+--let $batch_long_cleanup_file= $MYSQLTEST_VARDIR/tmp/batch_long_query_cleanup.inc
+--let $batch_long_resume_file= $MYSQLTEST_VARDIR/tmp/batch_long_query_resume.inc
+--let $batch_long_verify_file= $MYSQLTEST_VARDIR/tmp/batch_long_query_verify.inc
+--source suite/preserve_trx/include/batch_drain_100_long_common.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+--disable_query_log
+--disable_result_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_drain_grace_ms=$old_preserve_trx_drain_grace_ms
+--enable_result_log
+--enable_query_log

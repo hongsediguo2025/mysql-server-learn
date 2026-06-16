@@ -9454,11 +9454,26 @@ ER_PRESERVE_TRX_INVALID_STATE
 ER_PRESERVE_TRX_UNSUPPORTED
   eng "Resumable transactions across shutdown do not support this operation"
 
+ER_PRESERVE_TRX_DRAIN_TIMEOUT
+  eng "DRAIN TRANSACTIONS PRESERVE hard drain timed out"
+
+ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED
+  eng "DRAIN TRANSACTIONS PRESERVE batch cleanup failed; inspect preserved_transactions and target sessions before retry"
+
 ER_PRESERVE_TRX_NOT_FOUND
   eng "Preserved transaction was not found"
 
 ER_PRESERVE_TRX_ACCESS_DENIED
   eng "Access denied for preserved transaction"
+
+ER_PRESERVE_TRX_BINLOG_MODE_MISMATCH
+  eng "Preserved transaction binlog mode does not match current server binlog mode"
+
+ER_PRESERVE_TRX_CORRUPT_SNAPSHOT
+  eng "Preserved transaction snapshot is corrupt"
+
+ER_PRESERVE_TRX_SESSION_DRAINED
+  eng "This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE"
 
 #
 #  End of 8.0 error messages (server-to-client).

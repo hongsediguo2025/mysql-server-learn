@@ -1,0 +1,16 @@
+SET GLOBAL preserve_trx_enable=ON;
+SHUTDOWN;
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+SELECT COUNT(*) AS reserved_space_in_temp_pool
+FROM INFORMATION_SCHEMA.INNODB_SESSION_TEMP_TABLESPACES
+WHERE SPACE = 4243767281;
+reserved_space_in_temp_pool
+0
+SELECT MIN(SPACE) AS min_session_temp_space_id
+FROM INFORMATION_SCHEMA.INNODB_SESSION_TEMP_TABLESPACES;
+min_session_temp_space_id
+4243767282
+SET GLOBAL preserve_trx_enable=ON;

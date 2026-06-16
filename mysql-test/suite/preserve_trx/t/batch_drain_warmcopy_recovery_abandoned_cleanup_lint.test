@@ -1,0 +1,27 @@
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+# Lint-only test-shape guard. The actual warm-copy orphan artifact cleanup
+# behavior is covered by recover_warmcopy_orphan_cleanup.
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+my $mtr_path = File::Spec->catfile($source_root, 'mysql-test', 'suite',
+                                   'preserve_trx', 't',
+                                   'recover_warmcopy_orphan_cleanup.test');
+open(my $fh, '<', $mtr_path) or die "cannot open $mtr_path: $!";
+my $mtr = do { local $/; <$fh> };
+close($fh);
+
+die "warmcopy orphan cleanup MTR must create orphan warm artifacts and remove them during startup recovery\n"
+  unless $mtr =~ /\.warm\./s &&
+         $mtr =~ /preserved_count/s &&
+         $mtr =~ /test ! -e .*\.warm\.7/s &&
+         $mtr =~ /test ! -e .*\.warm\.7\.tmp/s;
+EOF
+
+SELECT 'lint-only' AS batch_drain_warmcopy_recovery_abandoned_cleanup_lint;

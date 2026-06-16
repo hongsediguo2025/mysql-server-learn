@@ -1,0 +1,75 @@
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_warmcopy_pending_tail;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=4096;
+
+CREATE TABLE t_warmcopy_pending_tail(
+  id INT PRIMARY KEY,
+  v INT,
+  payload VARBINARY(1024)
+) ENGINE=InnoDB;
+INSERT INTO t_warmcopy_pending_tail VALUES(1,10,REPEAT('a',1024));
+
+--connect(warmcopy_pending_tail_app, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_warmcopy_pending_tail
+  SET v=11, payload=REPEAT('b',1024)
+  WHERE id=1;
+
+--connect(warmcopy_pending_tail_owner, localhost, root,,test)
+--connection warmcopy_pending_tail_owner
+SET DEBUG_SYNC =
+  'preserve_trx_warmcopy_after_descriptor_hwm SIGNAL warmcopy_pending_tail_ready WAIT_FOR warmcopy_pending_tail_continue';
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_pending_tail_ready TIMEOUT 10';
+--connection warmcopy_pending_tail_app
+UPDATE t_warmcopy_pending_tail
+  SET v=12, payload=REPEAT('c',1024)
+  WHERE id=1;
+--connection default
+SET DEBUG_SYNC = 'now SIGNAL warmcopy_pending_tail_continue';
+
+--connection warmcopy_pending_tail_owner
+--reap
+--disconnect warmcopy_pending_tail_owner
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--let $token= `SELECT TOKEN FROM performance_schema.preserved_transactions`
+
+--connect(warmcopy_pending_tail_resume, localhost, root,,test)
+--connection warmcopy_pending_tail_resume
+--replace_result $token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$token'
+COMMIT;
+--disconnect warmcopy_pending_tail_resume
+
+--connection default
+SELECT id, v, OCTET_LENGTH(payload) AS payload_len, payload=REPEAT('c',1024) AS payload_ok
+  FROM t_warmcopy_pending_tail
+  ORDER BY id;
+
+DROP TABLE t_warmcopy_pending_tail;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_enable=ON;
+SET DEBUG_SYNC = 'RESET';

@@ -137,6 +137,16 @@ static void trx_preserve_store_state_trx_sys_locked(trx_t *trx,
   trx->state = state;
 }
 
+static void trx_preserve_store_private_state(trx_t *trx, trx_state_t state) {
+  ut_ad(trx != nullptr);
+#ifdef UNIV_DEBUG
+  ut_ad(!trx->in_rw_trx_list);
+  ut_ad(!trx->in_mysql_trx_list);
+#endif /* UNIV_DEBUG */
+
+  trx->state = state;
+}
+
 static dberr_t trx_preserve_mark_preserved(trx_t *trx) {
   ut_ad(trx_sys_mutex_own());
 
@@ -311,6 +321,10 @@ dberr_t trx_preserve_rollback_by_token(const char *token) {
 }
 
 dberr_t trx_preserve_rollback_by_token_for_thd(const char *token, THD *thd) {
+  if (thd == nullptr) {
+    return DB_ERROR;
+  }
+
   XID xid;
 
   if (!trx_preserve_token_to_xid(token, &xid)) {
@@ -615,15 +629,105 @@ bool trx_preserve_is_active_attached_to_thd(trx_t *trx, THD *thd) {
 }
 
 dberr_t trx_preserve_prepare_current_temp_only(THD *thd, const XID &xid) {
-  (void)thd;
-  (void)xid;
-  return DB_UNSUPPORTED;
+  if (thd == nullptr || !xid_is_preserve_magic(xid)) return DB_ERROR;
+
+  trx_t *trx = thd_to_trx(thd);
+  if (trx == nullptr) return DB_ERROR;
+
+  if (trx_state_eq(trx, TRX_STATE_PREPARED)) {
+    return trx->xid != nullptr && xid_is_preserve_magic(*trx->xid)
+               ? DB_SUCCESS
+               : DB_ERROR;
+  }
+
+  if (!trx_state_eq(trx, TRX_STATE_ACTIVE) ||
+      !trx_is_temp_rseg_updated(trx) || trx_is_redo_rseg_updated(trx)) {
+    return DB_SUCCESS;
+  }
+
+  *trx->xid = xid;
+  return trx_prepare_for_mysql(trx);
+}
+
+static void trx_preserve_add_to_rw_trx_list_ordered(trx_t *trx) {
+  ut_ad(trx_sys_mutex_own());
+  ut_ad(trx != nullptr);
+  ut_ad(!trx->in_rw_trx_list);
+
+  trx_t *prev = nullptr;
+  for (trx_t *candidate = UT_LIST_GET_FIRST(trx_sys->rw_trx_list);
+       candidate != nullptr; candidate = UT_LIST_GET_NEXT(trx_list, candidate)) {
+    if (candidate->id < trx->id) {
+      if (prev == nullptr) {
+        UT_LIST_ADD_FIRST(trx_sys->rw_trx_list, trx);
+      } else {
+        UT_LIST_INSERT_AFTER(trx_sys->rw_trx_list, prev, trx);
+      }
+      ut_d(trx->in_rw_trx_list = true);
+      return;
+    }
+    prev = candidate;
+  }
+
+  UT_LIST_ADD_LAST(trx_sys->rw_trx_list, trx);
+  ut_d(trx->in_rw_trx_list = true);
 }
 
 trx_t *trx_preserve_create_temp_only_claimed(const XID &xid, uint64_t trx_id) {
-  (void)xid;
-  (void)trx_id;
-  return nullptr;
+  if (!xid_is_preserve_magic(xid) || trx_id == 0 || trx_id >= TRX_ID_MAX) {
+    return nullptr;
+  }
+
+  const trx_id_t recovered_trx_id = static_cast<trx_id_t>(trx_id);
+  trx_t *trx = trx_allocate_for_background();
+  if (trx == nullptr) return nullptr;
+
+  *trx->xid = xid;
+  trx->id = recovered_trx_id;
+  trx->read_only = false;
+  trx->auto_commit = false;
+  trx->will_lock = 1;
+  trx->is_recovered = true;
+  trx->preserve_trx_claimed = true;
+  trx_preserve_store_private_state(trx, TRX_STATE_PRESERVED);
+
+  trx_assign_rseg_durable(trx);
+  if (trx->rsegs.m_redo.rseg == nullptr) {
+    trx->id = 0;
+    trx_preserve_store_private_state(trx, TRX_STATE_NOT_STARTED);
+    trx->xid->reset();
+    trx->preserve_trx_claimed = false;
+    trx->will_lock = 0;
+    trx->is_recovered = false;
+    trx_free_for_background(trx);
+    return nullptr;
+  }
+
+  trx_sys_mutex_enter();
+  if (trx_sys->max_trx_id <= recovered_trx_id) {
+    trx_sys->max_trx_id = recovered_trx_id + 1;
+  }
+  auto pos = std::lower_bound(trx_sys->rw_trx_ids.begin(),
+                              trx_sys->rw_trx_ids.end(), recovered_trx_id);
+  if (pos != trx_sys->rw_trx_ids.end() && *pos == recovered_trx_id) {
+    trx_sys_mutex_exit();
+    trx->rsegs.m_redo.rseg->trx_ref_count--;
+    trx->rsegs.m_redo.rseg = nullptr;
+    trx->id = 0;
+    trx_preserve_store_private_state(trx, TRX_STATE_NOT_STARTED);
+    trx->xid->reset();
+    trx->preserve_trx_claimed = false;
+    trx->will_lock = 0;
+    trx->is_recovered = false;
+    trx_free_for_background(trx);
+    return nullptr;
+  }
+  trx_sys->rw_trx_ids.insert(pos, recovered_trx_id);
+  trx_preserve_add_to_rw_trx_list_ordered(trx);
+  trx_sys_mutex_exit();
+
+  trx_sys_rw_trx_add(trx);
+  return trx;
 }
 
 uint64_t trx_preserve_trx_id(const trx_t *trx) {

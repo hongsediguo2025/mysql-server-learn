@@ -1,3 +1,22 @@
-SELECT 'startup option accepted' AS result;
-result
-startup option accepted
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_enable=OFF;
+key malformed
+Pattern "preserve_trx_enable=ON requires valid snapshot support" found
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_enable=OFF;
+preserve path is file
+Pattern "preserve_trx_enable=ON requires valid snapshot support" found
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_enable=OFF;
+preserve key inaccessible
+Pattern "preserve_trx_enable=ON requires valid snapshot support" found
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_enable=OFF;
+preserve path is dangling symlink
+Pattern "preserve_trx_enable=ON requires valid snapshot support" found
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_enable=OFF;
+preserve key is dangling symlink
+Pattern "preserve_trx_enable=ON requires valid snapshot support" found
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_enable=ON;

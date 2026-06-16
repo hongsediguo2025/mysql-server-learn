@@ -1,0 +1,61 @@
+--source include/not_windows.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_binlog_cache_sidecar_symlink_reject;
+--enable_warnings
+
+--disable_query_log
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot");
+--enable_query_log
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_binlog_cache_sidecar_symlink_reject(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_binlog_cache_sidecar_symlink_reject VALUES(1,10);
+
+START TRANSACTION;
+UPDATE t_binlog_cache_sidecar_symlink_reject SET v=11 WHERE id=1;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+--source suite/preserve_trx/include/assert_one_snapshot_file.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+opendir(my $dh, $dir) or die "cannot open preserve dir: $!";
+my @sidecars = grep { /\.binlog_cache\z/ } readdir($dh);
+closedir($dh);
+die "expected one binlog cache sidecar" unless @sidecars == 1;
+my $sidecar = File::Spec->catfile($dir, $sidecars[0]);
+my $real = File::Spec->catfile($dir, 'binlog-cache-real');
+rename($sidecar, $real) or die "cannot rename binlog cache sidecar: $!";
+symlink($real, $sidecar) or die "cannot create binlog cache symlink: $!";
+print "binlog cache sidecar symlink installed\n";
+EOF
+
+--echo # restart: --preserve-trx-enable=ON
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $grep_pattern= Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot
+--let $wait_timeout= 30
+--source include/wait_for_pattern_in_file.inc
+
+SELECT COUNT(*) AS preserved_count_after_binlog_cache_symlink
+  FROM performance_schema.preserved_transactions;
+SELECT * FROM t_binlog_cache_sidecar_symlink_reject ORDER BY id;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+DROP TABLE t_binlog_cache_sidecar_symlink_reject;

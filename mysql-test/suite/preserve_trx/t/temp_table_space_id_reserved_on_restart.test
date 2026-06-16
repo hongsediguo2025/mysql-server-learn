@@ -1,0 +1,274 @@
+--source include/not_windows.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+SET GLOBAL preserve_trx_enable=ON;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source include/wait_until_disconnected.inc
+
+--perl
+use strict;
+use warnings;
+use Compress::Zlib qw(crc32);
+use Digest::SHA qw(hmac_sha256 sha256);
+use File::Basename qw(dirname);
+use File::Path qw(make_path);
+use File::Spec;
+use Time::HiRes qw(time);
+
+my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $mysql_basedir = $ENV{'MYSQL_BASEDIR'} || '';
+my $mysql_bindir = $ENV{'MYSQL_BINDIR'} || '';
+my $mysqltest_vardir = $ENV{'MYSQLTEST_VARDIR'}
+  or die "MYSQLTEST_VARDIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+my @version_headers = (
+  File::Spec->catfile($mysql_basedir, 'include', 'mysql_version.h'),
+  File::Spec->catfile($mysql_bindir, 'include', 'mysql_version.h'),
+  File::Spec->catfile(dirname($mysql_bindir), 'include', 'mysql_version.h'),
+  File::Spec->catfile($mysqltest_vardir, '..', '..', 'include',
+                      'mysql_version.h'),
+  File::Spec->catfile($mysql_test_dir, '..', 'include', 'mysql_version.h'),
+  File::Spec->catfile($source_root, 'include', 'mysql_version.h'),
+);
+my $version_source = '';
+my $version_header = '';
+for my $candidate (@version_headers) {
+  next unless -f $candidate;
+  open(my $vh, '<', $candidate)
+    or die "cannot open $candidate: $!";
+  $version_source = do { local $/; <$vh> };
+  close($vh);
+  if ($version_source =~ /^\s*#define\s+MYSQL_VERSION_ID\s+(\d+)/m) {
+    $version_header = $candidate;
+    last;
+  }
+}
+die "MYSQL_VERSION_ID not found in candidate mysql_version.h files"
+  if $version_header eq '';
+$version_source =~ /^\s*#define\s+MYSQL_VERSION_ID\s+(\d+)/m
+  or die "MYSQL_VERSION_ID not found in $version_header";
+my $mysql_version_id = $1 + 0;
+
+my $auto_cnf = File::Spec->catfile($datadir, 'auto.cnf');
+open(my $ah, '<', $auto_cnf) or die "cannot open $auto_cnf: $!";
+my $auto_cnf_text = do { local $/; <$ah> };
+close($ah);
+$auto_cnf_text =~ /^server-uuid=([0-9a-fA-F-]{36})$/m
+  or die "server-uuid not found in $auto_cnf";
+my $server_uuid = lc($1);
+
+my $normalized_datadir = $datadir;
+$normalized_datadir .= '/' unless $normalized_datadir =~ m{/$};
+my $preserve_dir = $normalized_datadir . 'preserve';
+make_path($preserve_dir, {mode => 0700}) unless -d $preserve_dir;
+
+my $key_path = File::Spec->catfile($preserve_dir, '.key');
+my $key;
+if (-e $key_path) {
+  open(my $kh, '<:raw', $key_path) or die "cannot read $key_path: $!";
+  local $/;
+  $key = <$kh>;
+  close($kh);
+  $key = substr($key, -32) if length($key) == 110;
+  die "bad preserve key length" unless length($key) == 32;
+} else {
+  $key = pack('C*', 1 .. 32);
+  my $normalized_preserve_dir = $preserve_dir;
+  $normalized_preserve_dir .= '/' unless $normalized_preserve_dir =~ m{/$};
+  my $key_payload =
+    "MSPKEY1\0" .
+    pack('v', 1) .
+    $server_uuid .
+    sha256($normalized_preserve_dir) .
+    $key;
+  open(my $kh, '>:raw', $key_path) or die "cannot write $key_path: $!";
+  print {$kh} $key_payload;
+  close($kh);
+  chmod 0600, $key_path or die "cannot chmod $key_path: $!";
+}
+
+sub le16 { return pack('v', $_[0]); }
+sub le32 { return pack('V', $_[0]); }
+sub le64 { return pack('Q<', $_[0]); }
+sub string_field {
+  my ($value) = @_;
+  die "string too long" if length($value) > 0xffffffff;
+  return le32(length($value)) . $value;
+}
+sub fixed_field {
+  my ($value, $length) = @_;
+  die "fixed string too long" if length($value) > $length;
+  return $value . ("\0" x ($length - length($value)));
+}
+sub tlv {
+  my ($tag, $value) = @_;
+  return le16($tag) . le32(length($value)) . $value;
+}
+
+my $token = 'orphan_temp_bootstrap';
+my $space_id = 4243767281; # dict_sys_t::s_min_temp_space_id + 1
+my $image_payload = 'I' x 16384;
+my $image_name = "$token.tempts.$space_id.image";
+
+open(my $ih, '>:raw', File::Spec->catfile($preserve_dir, $image_name))
+  or die "cannot write image sidecar: $!";
+print {$ih} $image_payload;
+close($ih);
+
+my $image_digest = sha256($image_payload);
+
+my $index = le64(9003) . le32(3) . le32(0) . string_field('PRIMARY');
+my $image_descriptor =
+  le32(1) .                         # table ordinal
+  le32($space_id) .
+  string_field($image_name) .
+  le64(length($image_payload)) .
+  $image_digest .
+  le64(1) .                         # sealed temp op sequence
+  le64(9001) .                      # image space id
+  le64(9002) .                      # image table id
+  le32(1) .                         # image format version
+  le32(3) .                         # clustered root page
+  le32(16384) .                     # page size
+  le32(0) .                         # space flags
+  le32(0) .                         # table flags
+  le32(1) .                         # index count
+  $index;
+my $dict_column =
+  string_field('id') .
+  le32(6) .                         # DATA_INT
+  le32(256 | 512) .                 # NOT NULL | UNSIGNED
+  le32(4) .                         # length
+  chr(1);                           # visible
+my $dict_index_field =
+  string_field('id') .
+  le32(0) .                         # prefix length
+  chr(1);                           # ascending
+my $dict_index =
+  string_field('PRIMARY') .
+  le64(9003) .                      # image index id
+	  le32(3) .                         # root page
+	  chr(1) .                          # clustered
+	  chr(1) .                          # unique
+	  le32(1) .                         # n_unique_fields
+	  le32(1) .                         # field count
+	  $dict_index_field;
+my $dict_binding =
+  le32($space_id) .
+  le64(9002) .                      # image table id
+  le32(3) .                         # clustered root page
+  le32(0) .                         # table flags
+  string_field('test') .
+  string_field('tmp_bootstrap') .
+  le32(1) .                         # column count
+  $dict_column .
+  le32(1) .                         # index count
+  $dict_index;
+my $manifest =
+	  le32(6) .                         # manifest version
+  le32(1) .                         # table count
+  le64(0) .                         # owner trx id
+  le32(1) .                         # table ordinal
+  string_field('test') .
+  string_field('tmp_bootstrap') .
+  string_field('InnoDB') .
+  chr(0) .                          # binlog_drop_if_temp
+  string_field('serialized-dd-placeholder') .
+  $image_descriptor .
+  $dict_binding .
+  le32(0);                          # undo descriptor count
+
+my $session_state =
+  chr(2) .                          # REPEATABLE READ
+  le64(0) .                         # first_successful_insert_id_in_prev_stmt
+  le64(0) .                         # first_successful_insert_id_for_binlog
+  le64(0) .                         # first_successful_insert_id_in_cur_stmt
+  chr(0) .                          # arg_of_last_insert_id_function
+  chr(0);                           # stmt_depends_on_first_successful_insert_id
+my $no_cache_metadata = le16(1) . le16(0) . le16(0);
+my $payload =
+  tlv(0x10, 'no-cache') .
+  tlv(0x11, le32(0)) .
+  tlv(0x50, $session_state) .
+  tlv(0x62, chr(0)) .
+  tlv(0x51, le32(0)) .
+  tlv(0x61, $no_cache_metadata) .
+  tlv(0x80, $manifest);
+
+my $header_len = 552;
+my $snapshot = "\0" x ($header_len + length($payload));
+substr($snapshot, 0, 8) = 'MSP_PRES';
+substr($snapshot, 8, 2) = le16(8);
+substr($snapshot, 10, 2) = le16($header_len);
+substr($snapshot, 12, 4) = le32($mysql_version_id);
+substr($snapshot, 16, 4) = le32(0);
+substr($snapshot, 20, 1) = chr(2);  # SESSION_OFF_NO_CACHE
+substr($snapshot, 22, 1) = chr(0);  # session sql_log_bin
+substr($snapshot, 23, 1) = chr(0);  # option bin_log
+substr($snapshot, 24, 1) = chr(1);  # global log_bin
+substr($snapshot, 25, 4) = le32(0);
+my $created_at = int(time() * 1000000);
+substr($snapshot, 32, 8) = le64($created_at);
+substr($snapshot, 40, 8) = le64($created_at + 300 * 1000000);
+substr($snapshot, 48, 8) = le64(length($payload));
+substr($snapshot, 56, 8) = le64(0);
+substr($snapshot, 64, 36) = fixed_field($server_uuid, 36);
+my $normalized_preserve_dir = $preserve_dir;
+$normalized_preserve_dir .= '/' unless $normalized_preserve_dir =~ m{/$};
+substr($snapshot, 100, 32) = sha256($normalized_preserve_dir);
+substr($snapshot, 132, 128) = fixed_field($token, 128);
+substr($snapshot, 260, 64) = fixed_field('root', 64);
+substr($snapshot, 324, 128) = fixed_field('localhost', 128);
+substr($snapshot, 452, 64) = fixed_field('test', 64);
+substr($snapshot, $header_len, length($payload)) = $payload;
+
+substr($snapshot, 516, 32) = "\0" x 32;
+substr($snapshot, 548, 4) = "\0" x 4;
+substr($snapshot, 516, 32) = hmac_sha256($snapshot, $key);
+substr($snapshot, 548, 4) = le32(crc32($snapshot));
+
+open(my $sh, '>:raw', File::Spec->catfile($preserve_dir, "$token.bin"))
+  or die "cannot write snapshot: $!";
+print {$sh} $snapshot;
+close($sh);
+EOF
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=OFF" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+SELECT COUNT(*) AS reserved_space_in_temp_pool
+  FROM INFORMATION_SCHEMA.INNODB_SESSION_TEMP_TABLESPACES
+  WHERE SPACE = 4243767281;
+
+SELECT MIN(SPACE) AS min_session_temp_space_id
+  FROM INFORMATION_SCHEMA.INNODB_SESSION_TEMP_TABLESPACES;
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
+for my $name (
+  'orphan_temp_bootstrap.bin',
+  'orphan_temp_bootstrap.tempts.4243767281.image',
+  'orphan_temp_bootstrap.tempts.4243767281.undo') {
+  my $path = File::Spec->catfile($datadir, 'preserve', $name);
+  unlink($path) or die "cannot unlink $path: $!" if -e $path;
+}
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;

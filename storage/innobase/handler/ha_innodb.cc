@@ -169,6 +169,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "os0thread.h"
 #include "sql/item.h"
 #include "sql/json_dom.h"
+#include "sql/preserve_trx.h"
 #include "sql/preserve_trx_xid.h"
 #include "sql_base.h"
 #include "srv0tmp.h"
@@ -176,6 +177,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0roll.h"
 #include "trx0rseg.h"
 #include "trx0sys.h"
+#include "trx0temp_preserve.h"
 #include "trx0trx.h"
 #include "trx0xa.h"
 #include "ut0mem.h"
@@ -3725,14 +3727,33 @@ static void innobase_post_recover() {
     }
   }
 
-  if (srv_read_only_mode || srv_force_recovery >= SRV_FORCE_NO_BACKGROUND) {
+  if (srv_read_only_mode) {
     purge_sys->state = PURGE_STATE_DISABLED;
+    preserved_trx_mark_recovery_complete();
+    return;
+  }
+
+  if (srv_force_recovery >= SRV_FORCE_NO_BACKGROUND) {
+    purge_sys->state = PURGE_STATE_DISABLED;
+    if (!opt_initialize && preserved_trx_recover_all()) {
+      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: recovery failed before InnoDB background threads "
+             "could start");
+      ib::fatal(ER_IB_MSG_POST_RECOVER_DDL_LOG_RECOVER);
+    }
     return;
   }
 
   Auto_THD thd;
   if (dd_tablespace_update_cache(thd.thd)) {
     ut_ad(0);
+  }
+
+  if (!opt_initialize && preserved_trx_recover_all()) {
+    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+           "PRESERVE: recovery failed before InnoDB background threads could "
+           "start");
+    ib::fatal(ER_IB_MSG_POST_RECOVER_DDL_LOG_RECOVER);
   }
 
   srv_start_threads_after_ddl_recovery();
@@ -6796,8 +6817,49 @@ int ha_innobase::open(const char *name, int, uint open_flags,
       }
     }
   } else {
-    ib_table->acquire();
-    ut_ad(ib_table->is_intrinsic());
+    bool preserved_user_temp_table = false;
+    if (ib_table->is_temporary()) {
+      const char marker[] = "_preserved_space_";
+      const char table_suffix[] = "_table_";
+      const char *table_name = strrchr(ib_table->name.m_name, '/');
+      table_name = table_name == nullptr ? ib_table->name.m_name : table_name + 1;
+      const char *suffix = nullptr;
+      for (const char *candidate = strstr(table_name, marker);
+           candidate != nullptr;
+           candidate = strstr(candidate + sizeof(marker) - 1, marker)) {
+        suffix = candidate;
+      }
+      if (suffix != nullptr) {
+        suffix += sizeof(marker) - 1;
+        if (*suffix >= '0' && *suffix <= '9') {
+          char *end = nullptr;
+          const unsigned long parsed_space_id = strtoul(suffix, &end, 10);
+          bool generated_name = false;
+          if (end != suffix && end != nullptr &&
+              strncmp(end, table_suffix, sizeof(table_suffix) - 1) == 0) {
+            const char *table_id = end + sizeof(table_suffix) - 1;
+            const char *table_id_end = table_id;
+            while (*table_id_end >= '0' && *table_id_end <= '9') {
+              ++table_id_end;
+            }
+            generated_name = table_id_end != table_id && *table_id_end == '\0';
+          }
+          preserved_user_temp_table =
+              generated_name &&
+              parsed_space_id <= std::numeric_limits<space_id_t>::max() &&
+              ibt::is_preserved_space_id_reserved(
+                  static_cast<space_id_t>(parsed_space_id));
+        }
+      }
+    }
+    if (preserved_user_temp_table) {
+      mutex_enter(&dict_sys->mutex);
+      ib_table->acquire_with_lock();
+      mutex_exit(&dict_sys->mutex);
+    } else {
+      ib_table->acquire();
+      ut_ad(ib_table->is_intrinsic());
+    }
   }
 
   if (ib_table != nullptr) {
@@ -13554,8 +13616,23 @@ int innobase_basic_ddl::delete_impl(THD *thd, const char *name,
       index->last_ins_cur->release();
       index->last_sel_cur->release();
     }
-  } else if (srv_read_only_mode ||
-             srv_force_recovery >= SRV_FORCE_NO_UNDO_LOG_SCAN) {
+  }
+
+  if (handler != nullptr && handler->is_temporary() &&
+      trx_preserve_temp_space_image_fil_space_adopted_by_space_id(
+          handler->space)) {
+    error = trx_preserve_temp_space_image_drop_bound_table_by_space_id(
+        handler->space, handler);
+    if (error != DB_SUCCESS && error != DB_TABLESPACE_NOT_FOUND) {
+      return (convert_error_code_to_mysql(error, 0, nullptr));
+    }
+    priv->unregister_table_handler(norm_name);
+    return 0;
+  }
+
+  if (handler == nullptr &&
+      (srv_read_only_mode ||
+       srv_force_recovery >= SRV_FORCE_NO_UNDO_LOG_SCAN)) {
     return (HA_ERR_TABLE_READONLY);
   }
 

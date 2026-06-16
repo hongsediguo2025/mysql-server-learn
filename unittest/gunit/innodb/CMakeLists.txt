@@ -39,6 +39,7 @@ SET(TESTS
   ut0mem
   ut0new
   srv0conc
+  trx0preserve
 )
 
 SET(ALL_INNODB_TESTS)

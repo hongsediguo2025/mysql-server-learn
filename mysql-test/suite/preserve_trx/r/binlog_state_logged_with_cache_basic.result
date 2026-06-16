@@ -1,0 +1,23 @@
+DROP TABLE IF EXISTS t_logged_cache;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_logged_cache(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_logged_cache VALUES(1,10);
+START TRANSACTION;
+UPDATE t_logged_cache SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SELECT TOKEN, BINLOG_STATE, WROTE_TO_CACHE, BINLOG_CACHE_SIZE > 0 AS BINLOG_CACHE_SIZE_POSITIVE,
+SESSION_SQL_LOG_BIN, GLOBAL_LOG_BIN
+FROM performance_schema.preserved_transactions;
+TOKEN	BINLOG_STATE	WROTE_TO_CACHE	BINLOG_CACHE_SIZE_POSITIVE	SESSION_SQL_LOG_BIN	GLOBAL_LOG_BIN
+TOKEN	LOGGED_WITH_CACHE	YES	1	ON	ON
+RESUME PRESERVED TRANSACTION 'TOKEN';
+SELECT @@session.sql_log_bin AS session_sql_log_bin_after_resume;
+session_sql_log_bin_after_resume
+1
+COMMIT;
+SELECT * FROM t_logged_cache WHERE a=1;
+a	b
+1	11
+include/assert_grep.inc [Preserved LOGGED_WITH_CACHE update is written on final COMMIT]
+DROP TABLE t_logged_cache;
+SET GLOBAL preserve_trx_enable=ON;

@@ -1,0 +1,56 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_resume_activate_crash;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+--disable_query_log
+CALL mtr.add_suppression("Attempting backtrace");
+CALL mtr.add_suppression("You can use the following information to find out");
+--enable_query_log
+
+CREATE TABLE t_resume_activate_crash(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_resume_activate_crash VALUES(1,10);
+
+START TRANSACTION;
+SELECT * FROM t_resume_activate_crash WHERE a=1 FOR UPDATE;
+UPDATE t_resume_activate_crash SET b=11 WHERE a=1;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+--file_exists $PRESERVED_SNAPSHOT_FILE
+
+SET SESSION debug="+d,preserve_trx_crash_after_resume_activate_before_snapshot_delete";
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+
+--replace_result $preserved_token TOKEN
+--error 2013
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS remaining_preserved
+  FROM performance_schema.preserved_transactions;
+--error 1
+--file_exists $PRESERVED_SNAPSHOT_FILE
+
+SELECT * FROM t_resume_activate_crash ORDER BY a;
+
+DROP TABLE t_resume_activate_crash;
+SET GLOBAL preserve_trx_enable=ON;

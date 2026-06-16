@@ -1,0 +1,49 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_record_lock_after_resume;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_record_lock_after_resume(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_record_lock_after_resume VALUES(1,10),(2,20);
+
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE t_record_lock_after_resume SET v=21 WHERE id=2;
+SELECT * FROM t_record_lock_after_resume WHERE id=1 FOR SHARE;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--connect(record_writer, localhost, root,,test)
+connection record_writer;
+SET innodb_lock_wait_timeout=1;
+--error ER_LOCK_WAIT_TIMEOUT
+UPDATE t_record_lock_after_resume SET v=11 WHERE id=1;
+
+connection default;
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+ROLLBACK;
+
+connection record_writer;
+UPDATE t_record_lock_after_resume SET v=11 WHERE id=1;
+disconnect record_writer;
+
+connection default;
+SELECT * FROM t_record_lock_after_resume ORDER BY id;
+
+DROP TABLE t_record_lock_after_resume;
+SET GLOBAL preserve_trx_enable=ON;

@@ -365,6 +365,10 @@ trx_id_t trx_get_id_for_print(const trx_t *trx);
 @param[in,out]	trx	transaction that involves write to temp-table. */
 void trx_assign_rseg_temp(trx_t *trx);
 
+/** Assign a durable rollback segment to a transaction in a round-robin fashion.
+@param[in,out]	trx	transaction that involves a durable write. */
+void trx_assign_rseg_durable(trx_t *trx);
+
 /** Create the trx_t pool */
 void trx_pool_init();
 

@@ -1,0 +1,39 @@
+DROP TABLE IF EXISTS t_temp_sidecar_write_failure;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+CREATE TABLE t_temp_sidecar_write_failure(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO t_temp_sidecar_write_failure VALUES(1, 10);
+CREATE TEMPORARY TABLE tmp_temp_sidecar_write_failure(
+id INT PRIMARY KEY,
+v INT,
+KEY(v)
+) ENGINE=InnoDB;
+INSERT INTO tmp_temp_sidecar_write_failure VALUES(1, 100), (2, 200);
+SET SESSION debug="+d,preserve_trx_fail_before_snapshot_fsync";
+START TRANSACTION;
+UPDATE t_temp_sidecar_write_failure SET v=11 WHERE id=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug="-d,preserve_trx_fail_before_snapshot_fsync";
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+SELECT COUNT(*) AS temp_rows, SUM(v) AS temp_sum
+FROM tmp_temp_sidecar_write_failure;
+temp_rows	temp_sum
+2	300
+SELECT * FROM t_temp_sidecar_write_failure ORDER BY id;
+id	v
+1	10
+ROLLBACK;
+SELECT * FROM t_temp_sidecar_write_failure ORDER BY id;
+id	v
+1	10
+DROP TEMPORARY TABLE tmp_temp_sidecar_write_failure;
+DROP TABLE t_temp_sidecar_write_failure;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_enable=ON;

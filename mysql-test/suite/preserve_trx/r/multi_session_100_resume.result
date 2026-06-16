@@ -1,0 +1,22 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_recovery_max_count=200;
+SELECT COUNT(*) AS mapped_token_count
+FROM t_multi_session_100_tokens;
+mapped_token_count
+100
+SELECT COUNT(*) AS preserved_count_after_generation
+FROM performance_schema.preserved_transactions;
+preserved_count_after_generation
+100
+SELECT COUNT(*) AS preserved_count_after_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_resume
+0
+SELECT COUNT(*) AS row_count,
+COUNT(DISTINCT id) AS distinct_keys,
+SUM(resumed_by IS NOT NULL) AS resumed_rows,
+SUM(v >= 100000) AS bumped_rows
+FROM t_multi_session_100_resume;
+row_count	distinct_keys	resumed_rows	bumped_rows
+100	100	100	100
+SET GLOBAL preserve_trx_enable=ON;

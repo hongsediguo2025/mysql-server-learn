@@ -115,6 +115,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "row0row.h"
 #include "row0sel.h"
 #include "row0upd.h"
+#include "sql/preserve_trx.h"
 #include "srv0tmp.h"
 #include "trx0purge.h"
 #include "trx0roll.h"
@@ -2705,6 +2706,10 @@ files_checked:
   err = srv_open_tmp_tablespace(create_new_db, &srv_tmp_space);
   if (err != DB_SUCCESS) {
     return (srv_init_abort(err));
+  }
+
+  if (!opt_initialize && preserved_temp_images_bootstrap_preamble()) {
+    return (srv_init_abort(DB_ERROR));
   }
 
   err = ibt::open_or_create(create_new_db);

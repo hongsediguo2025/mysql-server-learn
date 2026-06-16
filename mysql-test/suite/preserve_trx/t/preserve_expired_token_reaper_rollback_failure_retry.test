@@ -1,0 +1,76 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+CALL mtr.add_suppression("Preserved transaction '.*' expired-token reaper forced rollback: recovery timeout expired");
+CALL mtr.add_suppression("Preserved transaction '.*' recovery forced rollback: recovery timeout expired");
+--enable_query_log
+
+--disable_warnings
+DROP TABLE IF EXISTS t_expired_reaper_rollback_failure;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET SESSION preserve_trx_min_timeout=1;
+SET SESSION preserve_trx_default_timeout=1;
+SET SESSION preserve_trx_max_timeout=86400;
+
+CREATE TABLE t_expired_reaper_rollback_failure(a INT PRIMARY KEY, b INT)
+  ENGINE=InnoDB;
+INSERT INTO t_expired_reaper_rollback_failure VALUES(1,10);
+
+START TRANSACTION;
+UPDATE t_expired_reaper_rollback_failure SET b=11 WHERE a=1;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+--source include/wait_until_disconnected.inc
+
+--sleep 2
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-grace-seconds=30 --debug=d,preserve_trx_fail_expired_reaper_rollback" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $grep_pattern= Preserved transaction .* expired-token reaper forced rollback: recovery timeout expired
+--let $wait_timeout= 45
+--source include/wait_for_pattern_in_file.inc
+
+SELECT STATE,
+       LAST_ERROR = 'expired-token reaper rollback failure'
+         AS last_error_preserved,
+       LAST_ERROR_AT IS NOT NULL AS last_error_at_set
+  FROM performance_schema.preserved_transactions;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-recovery-grace-seconds=30
+--let $do_not_echo_parameters= 1
+--source include/restart_mysqld.inc
+--let $do_not_echo_parameters=
+--let $restart_parameters=
+
+--let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $grep_pattern= Preserved transaction .* expired-token reaper forced rollback: recovery timeout expired
+--let $wait_timeout= 45
+--source include/wait_for_pattern_in_file.inc
+
+SELECT COUNT(*) AS preserved_count_after_retry_cleanup
+  FROM performance_schema.preserved_transactions;
+--replace_column 1 TOKEN
+SELECT TOKEN, STATE, LAST_ERROR
+  FROM performance_schema.preserved_transactions;
+SELECT * FROM t_expired_reaper_rollback_failure ORDER BY a;
+--let $allow_preserved_rows= 1
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+--let $allow_preserved_rows=
+
+DROP TABLE t_expired_reaper_rollback_failure;
+SET GLOBAL preserve_trx_enable=ON;
+
+--let $restart_parameters= restart: --preserve-trx-enable=OFF --skip-log-bin
+--let $do_not_echo_parameters= 1
+--source include/restart_mysqld.inc
+--let $do_not_echo_parameters=
+--let $restart_parameters=

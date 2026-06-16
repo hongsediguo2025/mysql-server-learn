@@ -1,0 +1,5 @@
+# Lint-only source-shape guard; runtime purge/read-view behavior is
+# covered by readview_visibility_across_purge_e2e and related MTR.
+SELECT 'ok' AS readview_low_limit_system_floor_lint;
+readview_low_limit_system_floor_lint
+ok
