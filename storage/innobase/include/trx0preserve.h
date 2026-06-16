@@ -129,6 +129,7 @@ dberr_t trx_preserve_import_savepoints(
 bool trx_preserve_savepoints_payload_is_valid_for_import(
     const std::string &payload, uint32_t *savepoint_count);
 dberr_t trx_preserve_set_isolation(trx_t *trx, uint8_t tx_isolation);
+dberr_t trx_preserve_set_current_thd_isolation(THD *thd, uint8_t tx_isolation);
 bool trx_preserve_thd_can_accept_preserved_trx(THD *thd);
 bool trx_preserve_rseg_has_preserved_trx(const trx_rseg_t *rseg);
 void trx_preserve_collect_preserved_rsegs(

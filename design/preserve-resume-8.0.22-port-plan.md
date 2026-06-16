@@ -529,6 +529,14 @@ Current 8.0.22 landing status:
   accept a preserved transaction while public RESUME behavior still returns
   `ER_PRESERVE_TRX_UNSUPPORTED`. Actual transaction attach, ownership transfer,
   and rollback-on-attach-failure remain pending.
+- 2026-06-16: added the isolation restore staging slice. The InnoDB helper
+  `trx_preserve_set_isolation()` now maps valid SQL isolation levels through
+  the 8.0.22 `innobase_trx_map_isolation_level()` helper and rejects invalid
+  payload values with `DB_ERROR`. The debug-only
+  `isolation_restore_staging_debug` row proves a valid READ COMMITTED payload
+  succeeds and an invalid byte fails while public PREPARE still returns
+  `ER_PRESERVE_TRX_UNSUPPORTED`. Positive RESUME-time isolation restoration
+  remains pending until attach and durable snapshot replay are connected.
 
 ## Batch 3: Recovery And Failure Windows
 

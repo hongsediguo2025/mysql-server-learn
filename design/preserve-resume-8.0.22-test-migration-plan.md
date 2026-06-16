@@ -451,6 +451,13 @@ Current migration status:
   `trx_preserve_thd_can_accept_preserved_trx()` and a debug-only RESUME
   observable hook. The public RESUME path still returns
   `ER_PRESERVE_TRX_UNSUPPORTED`; attach/ownership transfer remains pending.
+- 2026-06-16: `isolation_restore_staging_debug` covers isolation-level restore
+  helper staging. RED produced no observable row. GREEN passed after wiring
+  `trx_preserve_set_isolation()` to 8.0.22's
+  `innobase_trx_map_isolation_level()` for valid SQL isolation values and
+  returning `DB_ERROR` for invalid payload bytes. The public PREPARE path still
+  returns `ER_PRESERVE_TRX_UNSUPPORTED`; RESUME-time isolation restore remains
+  pending until durable snapshot replay is connected.
 
 Tests:
 

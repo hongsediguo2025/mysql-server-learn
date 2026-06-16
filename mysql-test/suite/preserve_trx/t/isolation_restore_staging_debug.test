@@ -1,0 +1,34 @@
+--source include/have_debug.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_isolation_restore;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_isolation_restore(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_isolation_restore VALUES (1, 10);
+
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+START TRANSACTION;
+UPDATE t_isolation_restore SET v = v + 1 WHERE id = 1;
+
+SET SESSION debug='+d,preserve_trx_debug_isolation_restore_observable';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+SET SESSION debug='-d,preserve_trx_debug_isolation_restore_observable';
+
+SELECT TOKEN, STATE, LAST_ERROR
+  FROM performance_schema.preserved_transactions
+  WHERE TOKEN='debug-isolation-restore-token';
+
+ROLLBACK;
+
+SET SESSION debug='+d,preserve_trx_clear_debug_observable_records';
+SELECT COUNT(*) AS after_clear
+  FROM performance_schema.preserved_transactions
+  WHERE TOKEN='debug-isolation-restore-token';
+SET SESSION debug='-d,preserve_trx_clear_debug_observable_records';
+
+DROP TABLE t_isolation_restore;
+SET GLOBAL preserve_trx_enable=OFF;

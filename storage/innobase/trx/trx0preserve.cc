@@ -582,9 +582,25 @@ bool trx_preserve_savepoints_payload_is_valid_for_import(
 }
 
 dberr_t trx_preserve_set_isolation(trx_t *trx, uint8_t tx_isolation) {
-  (void)trx;
-  (void)tx_isolation;
-  return DB_UNSUPPORTED;
+  if (trx == nullptr) return DB_ERROR;
+
+  switch (static_cast<enum_tx_isolation>(tx_isolation)) {
+    case ISO_READ_UNCOMMITTED:
+    case ISO_READ_COMMITTED:
+    case ISO_REPEATABLE_READ:
+    case ISO_SERIALIZABLE:
+      trx->isolation_level = innobase_trx_map_isolation_level(
+          static_cast<enum_tx_isolation>(tx_isolation));
+      return DB_SUCCESS;
+  }
+
+  return DB_ERROR;
+}
+
+dberr_t trx_preserve_set_current_thd_isolation(THD *thd,
+                                               uint8_t tx_isolation) {
+  if (thd == nullptr) return DB_ERROR;
+  return trx_preserve_set_isolation(thd_to_trx(thd), tx_isolation);
 }
 
 bool trx_preserve_thd_can_accept_preserved_trx(THD *thd) {

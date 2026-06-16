@@ -50,6 +50,7 @@
 #include "sql/auth/auth_common.h"
 #include "sql/auth/sql_security_ctx.h"
 #include "sql/debug_sync.h"
+#include "sql/handler.h"
 #include "sql/item.h"
 #include "sql/mysqld.h"
 #include "sql/preserve_trx_xid.h"
@@ -707,6 +708,30 @@ Preserved_trx_view_row make_debug_resume_acceptance_record(THD *thd) {
   return row;
 }
 
+Preserved_trx_view_row make_debug_isolation_restore_record(THD *thd) {
+  Preserved_trx_view_row row;
+  row.token = "debug-isolation-restore-token";
+  row.user = "debug_user";
+  row.host = "debug_host";
+  row.owner_user = row.user;
+  row.owner_host = row.host;
+  row.state = "FAILED";
+  row.isolation = "READ-COMMITTED";
+  row.binlog_state = "NONE";
+  row.binlog_warmcopy_state = "NONE";
+  row.temp_table_state = "NONE";
+
+  const dberr_t valid_err = trx_preserve_set_current_thd_isolation(
+      thd, static_cast<uint8_t>(ISO_READ_COMMITTED));
+  const dberr_t invalid_err =
+      trx_preserve_set_current_thd_isolation(thd, 255);
+  row.last_error = "isolation restore: valid_ok=" +
+                   std::to_string(valid_err == DB_SUCCESS ? 1 : 0) +
+                   " invalid_ok=" +
+                   std::to_string(invalid_err == DB_SUCCESS ? 1 : 0);
+  return row;
+}
+
 void insert_debug_observable_record_if_missing() MY_ATTRIBUTE((unused));
 void insert_debug_observable_record_if_missing() {
   std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
@@ -731,7 +756,8 @@ void clear_debug_observable_records() {
                               row.token == "debug-kernel-preflight-token" ||
                               row.token == "debug-read-view-payload-token" ||
                               row.token == "debug-savepoint-payload-token" ||
-                              row.token == "debug-resume-acceptance-token";
+                              row.token == "debug-resume-acceptance-token" ||
+                              row.token == "debug-isolation-restore-token";
                      }),
       g_preserved_trx_registry.end());
 }
@@ -800,6 +826,21 @@ void insert_debug_resume_acceptance_record(THD *thd) {
                      [](const Preserved_trx_view_row &existing) {
                        return existing.token ==
                               "debug-resume-acceptance-token";
+                     }),
+      g_preserved_trx_registry.end());
+  g_preserved_trx_registry.push_back(std::move(row));
+}
+
+void insert_debug_isolation_restore_record(THD *thd) MY_ATTRIBUTE((unused));
+void insert_debug_isolation_restore_record(THD *thd) {
+  Preserved_trx_view_row row = make_debug_isolation_restore_record(thd);
+  std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
+  g_preserved_trx_registry.erase(
+      std::remove_if(g_preserved_trx_registry.begin(),
+                     g_preserved_trx_registry.end(),
+                     [](const Preserved_trx_view_row &existing) {
+                       return existing.token ==
+                              "debug-isolation-restore-token";
                      }),
       g_preserved_trx_registry.end());
   g_preserved_trx_registry.push_back(std::move(row));
@@ -1129,6 +1170,11 @@ static bool preserve_trx_handle_prepare_shutdown(THD *thd) {
   });
   DBUG_EXECUTE_IF("preserve_trx_debug_savepoint_payload_observable", {
     insert_debug_savepoint_payload_record(thd);
+    my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+    return true;
+  });
+  DBUG_EXECUTE_IF("preserve_trx_debug_isolation_restore_observable", {
+    insert_debug_isolation_restore_record(thd);
     my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
     return true;
   });
