@@ -20,10 +20,10 @@ FROM performance_schema.preserved_transactions
 WHERE TOKEN='debug-reactivate-prepared-token';
 reactivate_prepared_ok
 1
-ROLLBACK;
+COMMIT;
 SELECT * FROM t_reactivate_prepared;
 id	v
-1	10
+1	11
 SET SESSION debug='+d,preserve_trx_clear_debug_observable_records';
 SELECT COUNT(*) AS after_clear
 FROM performance_schema.preserved_transactions

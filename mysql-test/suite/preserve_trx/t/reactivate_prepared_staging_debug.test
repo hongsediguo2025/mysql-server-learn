@@ -27,7 +27,7 @@ SELECT LAST_ERROR REGEXP
   FROM performance_schema.preserved_transactions
   WHERE TOKEN='debug-reactivate-prepared-token';
 
-ROLLBACK;
+COMMIT;
 SELECT * FROM t_reactivate_prepared;
 
 SET SESSION debug='+d,preserve_trx_clear_debug_observable_records';

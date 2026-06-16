@@ -254,6 +254,7 @@ static dberr_t trx_preserve_activate_undo_ptr_state(trx_t *trx,
 
   if (undo_ptr->insert_undo != nullptr) {
     trx_undo_set_state_at_prepare(trx, undo_ptr->insert_undo, true, &mtr);
+    undo_ptr->insert_undo->state = TRX_UNDO_ACTIVE;
   }
 
   if (undo_ptr->update_undo != nullptr) {
@@ -261,6 +262,7 @@ static dberr_t trx_preserve_activate_undo_ptr_state(trx_t *trx,
       trx_undo_gtid_set(trx, undo_ptr->update_undo);
     }
     trx_undo_set_state_at_prepare(trx, undo_ptr->update_undo, true, &mtr);
+    undo_ptr->update_undo->state = TRX_UNDO_ACTIVE;
   }
 
   undo_ptr->rseg->unlatch();
