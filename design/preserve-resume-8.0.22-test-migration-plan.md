@@ -445,6 +445,12 @@ Current migration status:
   `savepoint_rollback_to` and RESUME-time savepoint import coverage remains
   pending until attach/activation and binlog-cache savepoint restoration are
   connected.
+- 2026-06-16: `resume_acceptance_staging_debug` covers the idle-target THD
+  acceptance prerequisite for RESUME. RED returned not-found without any
+  observable row. GREEN passed after porting
+  `trx_preserve_thd_can_accept_preserved_trx()` and a debug-only RESUME
+  observable hook. The public RESUME path still returns
+  `ER_PRESERVE_TRX_UNSUPPORTED`; attach/ownership transfer remains pending.
 
 Tests:
 

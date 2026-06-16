@@ -688,6 +688,25 @@ Preserved_trx_view_row make_debug_savepoint_payload_record(THD *thd) {
   return row;
 }
 
+Preserved_trx_view_row make_debug_resume_acceptance_record(THD *thd) {
+  Preserved_trx_view_row row;
+  row.token = "debug-resume-acceptance-token";
+  row.user = "debug_user";
+  row.host = "debug_host";
+  row.owner_user = row.user;
+  row.owner_host = row.host;
+  row.state = "FAILED";
+  row.isolation = "REPEATABLE-READ";
+  row.binlog_state = "NONE";
+  row.binlog_warmcopy_state = "NONE";
+  row.temp_table_state = "NONE";
+
+  const bool can_accept = trx_preserve_thd_can_accept_preserved_trx(thd);
+  row.last_error =
+      "resume acceptance: can_accept=" + std::to_string(can_accept ? 1 : 0);
+  return row;
+}
+
 void insert_debug_observable_record_if_missing() MY_ATTRIBUTE((unused));
 void insert_debug_observable_record_if_missing() {
   std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
@@ -711,7 +730,8 @@ void clear_debug_observable_records() {
                               row.token == "debug-delivery-token" ||
                               row.token == "debug-kernel-preflight-token" ||
                               row.token == "debug-read-view-payload-token" ||
-                              row.token == "debug-savepoint-payload-token";
+                              row.token == "debug-savepoint-payload-token" ||
+                              row.token == "debug-resume-acceptance-token";
                      }),
       g_preserved_trx_registry.end());
 }
@@ -765,6 +785,21 @@ void insert_debug_savepoint_payload_record(THD *thd) {
                      g_preserved_trx_registry.end(),
                      [](const Preserved_trx_view_row &existing) {
                        return existing.token == "debug-savepoint-payload-token";
+                     }),
+      g_preserved_trx_registry.end());
+  g_preserved_trx_registry.push_back(std::move(row));
+}
+
+void insert_debug_resume_acceptance_record(THD *thd) MY_ATTRIBUTE((unused));
+void insert_debug_resume_acceptance_record(THD *thd) {
+  Preserved_trx_view_row row = make_debug_resume_acceptance_record(thd);
+  std::lock_guard<std::mutex> lock(g_preserved_trx_registry_mutex);
+  g_preserved_trx_registry.erase(
+      std::remove_if(g_preserved_trx_registry.begin(),
+                     g_preserved_trx_registry.end(),
+                     [](const Preserved_trx_view_row &existing) {
+                       return existing.token ==
+                              "debug-resume-acceptance-token";
                      }),
       g_preserved_trx_registry.end());
   g_preserved_trx_registry.push_back(std::move(row));
@@ -1136,6 +1171,11 @@ static bool preserve_trx_handle_resume(THD *thd, const std::string &token) {
     my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
     return true;
   }
+  DBUG_EXECUTE_IF("preserve_trx_debug_resume_acceptance_observable", {
+    insert_debug_resume_acceptance_record(thd);
+    my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+    return true;
+  });
   if (!thd_has_resume_any_preserved_transaction(thd)) {
     my_error(ER_PRESERVE_TRX_ACCESS_DENIED, MYF(0));
     return true;

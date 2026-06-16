@@ -521,6 +521,14 @@ Current 8.0.22 landing status:
   `ER_PRESERVE_TRX_UNSUPPORTED`. RESUME-time savepoint import remains
   fail-closed until attach/activation and binlog-cache savepoint restoration
   are ported together.
+- 2026-06-16: added the RESUME acceptance staging slice. The InnoDB helper
+  `trx_preserve_thd_can_accept_preserved_trx()` now checks whether the target
+  THD has no active native InnoDB transaction and whether
+  `replace_native_transaction_in_thd` is available. The debug-only
+  `resume_acceptance_staging_debug` row proves an idle THD is eligible to
+  accept a preserved transaction while public RESUME behavior still returns
+  `ER_PRESERVE_TRX_UNSUPPORTED`. Actual transaction attach, ownership transfer,
+  and rollback-on-attach-failure remain pending.
 
 ## Batch 3: Recovery And Failure Windows
 

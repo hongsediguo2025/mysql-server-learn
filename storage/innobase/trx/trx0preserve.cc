@@ -588,8 +588,13 @@ dberr_t trx_preserve_set_isolation(trx_t *trx, uint8_t tx_isolation) {
 }
 
 bool trx_preserve_thd_can_accept_preserved_trx(THD *thd) {
-  (void)thd;
-  return false;
+  if (thd == nullptr || innodb_hton == nullptr ||
+      innodb_hton->replace_native_transaction_in_thd == nullptr) {
+    return false;
+  }
+
+  trx_t *trx = thd_to_trx(thd);
+  return trx == nullptr || trx_state_eq(trx, TRX_STATE_NOT_STARTED);
 }
 
 bool trx_preserve_rseg_has_preserved_trx(const trx_rseg_t *rseg) {
