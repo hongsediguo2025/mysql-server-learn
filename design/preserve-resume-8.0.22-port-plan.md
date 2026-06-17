@@ -1,24 +1,42 @@
 # Preserve/Resume Backport to MySQL 8.0.22 Plan
 
-This is the Day 1 plan for the 8.0.22 port branch
-`codex/preserve-resume-8.0.22-port`.
+> This copy lives on the active 8.0.22 port branch
+> `codex/preserve-resume-8.0.22-port`.  It is the current checklist for the
+> in-progress port and must stay aligned with the source branch handoff plan,
+> the 8.0.22-specific manifests, and the evidence produced in this worktree.
 
-Day 1 is documentation-only:
+## 1. Goal
 
-- no source code migration;
-- no MTR/gunit/Python test migration;
-- no changes to the three source feature branches;
-- commit only these Day 1 design artifacts:
-  `preserve-resume-8.0.22-port-plan.md`,
-  `preserve-resume-8.0.22-conflict-manifest.md`,
-  `preserve-resume-8.0.22-test-migration-plan.md`,
-  `preserve-resume-8.0.22-review-checklist.md`,
-  `preserve-resume-8.0.22-commit-manifest.md`, and
-  `preserve-resume-8.0.22-test-manifest.md`.
+Backport the complete Preserve/Resume transaction feature set from the current
+8.0.45-based branch stack to MySQL 8.0.22 without modifying the source feature
+branches.
 
-## Fixed Source And Target Facts
+The final 8.0.22 port must support, with release defaults enabled:
 
-Source stack:
+- single transaction `PREPARE SHUTDOWN PRESERVE TRANSACTION` and
+  `RESUME PRESERVED TRANSACTION`;
+- batch `DRAIN TRANSACTIONS PRESERVE`;
+- binlog cache sidecars and two-phase warm-copy drain;
+- user InnoDB temporary table physical-image preserve/resume for supported
+  read-only-in-transaction temp-table state;
+- P_S / SHOW observability, diagnostics, privilege checks, and hardening;
+- bounded memory use, local-file spill, and streaming sidecar validation;
+- current MTR, gunit, source-lint, Python unit, live E2E, longrun, and soak
+  coverage.
+
+The port must remain MTR-first and batch-by-batch:
+
+1. inventory and migrate tests first;
+2. make tests run in explicit feature-off or unsupported mode where needed;
+3. switch the same tests to real Preserve/Resume expectations;
+4. implement the matching code;
+5. run debug/release verification and independent review before the next batch.
+
+## 2. Current Source Facts
+
+### 2.1 Branch stack
+
+The source branches are linear and read-only for this port:
 
 ```text
 8.0
@@ -32,733 +50,423 @@ Source stack:
 | `8.0` | `666701570c392a6052341b6ddb9c21869bb1d733` | MySQL 8.0.45 source base |
 | `resumable-trx-across-shutdown` | `58d72034b10b457fd5c4ed220876c943fe7944f5` | Base preserve/resume |
 | `binlog-cache-warmcopy-drain` | `fbf670b36cd43564d29214e69ad594f33c8978b3` | Binlog cache warm-copy drain |
-| `preserve-user-temp-tables` | `b78b96f99f16133f613f22a679dc061ff7fb7917` | User temp table support and hardening |
+| `preserve-user-temp-tables` | `7caefcc30efd79df3c5e2a38eb2b98a94461bd0f` | Current GA hardening source |
 | `mysql-8.0.22` | `ee4455a33b10f1b1886044322e4893f587b319ed` | Target backport base |
 
-The source branch stack is based on MySQL 8.0.45 LTS. This target branch starts
-from MySQL 8.0.22.
+The current source version is MySQL 8.0.45 LTS. The target version is MySQL
+8.0.22.
 
-Final cumulative source size relative to `8.0`:
+### 2.2 Current source size and inventory
+
+Current cumulative feature size relative to `8.0` at this document update:
 
 | Metric | Value |
 |---|---:|
-| Commits | 137 |
-| Files changed | 1,078 |
-| Insertions / deletions | +160,727 / -262 |
-| Core server files | 87 |
-| Preserve-suite MTR `.test` files | 366 |
-| Preserve-suite MTR `.result` files | 366 |
-| Total `.result` files changed | 369 |
+| Commits | 136 |
+| Files changed | 1077 |
+| Insertions / deletions | +160106 / -262 |
+| Preserve-suite MTR `.test` files in source tree | 366 |
+| Preserve-suite MTR `.result` files in source tree | 366 |
+| Preserve-suite `_lint.test` files | 17 |
 | Preserve gunit files | 5 |
-| Python E2E / benchmark scripts | 5 |
-| Python unit test files | 4 |
-| Python package marker files | 1 |
 
-The total `.result` count includes the 366 preserve-suite result files plus
-three non-preserve-suite result deltas. The gunit count includes
-`unittest/gunit/innodb/trx0preserve-t.cc` plus four top-level preserve gunit
-files. These counts were regenerated from `/Users/a1234/project/mysql-server`
-on 2026-06-16; refresh them again before any final 8.0.22 landing review.
+The five gunit files are:
 
-## Branch Isolation Rules
+- `unittest/gunit/preserve_trx-t.cc`;
+- `unittest/gunit/preserve_trx_drain-t.cc`;
+- `unittest/gunit/preserve_trx_temp_table-t.cc`;
+- `unittest/gunit/preserve_trx_warmcopy-t.cc`;
+- `unittest/gunit/innodb/trx0preserve-t.cc`.
 
-- The source branches are read-only.
-- All porting commits must stay on `codex/preserve-resume-8.0.22-port`.
-- Every batch must start by verifying the pinned refs:
+Regenerate these facts before starting the actual 8.0.22 port:
 
-  ```bash
-  test "$(git rev-parse 8.0)" = "666701570c392a6052341b6ddb9c21869bb1d733"
-  test "$(git rev-parse resumable-trx-across-shutdown)" = "58d72034b10b457fd5c4ed220876c943fe7944f5"
-  test "$(git rev-parse binlog-cache-warmcopy-drain)" = "fbf670b36cd43564d29214e69ad594f33c8978b3"
-  test "$(git rev-parse preserve-user-temp-tables)" = "b78b96f99f16133f613f22a679dc061ff7fb7917"
-  test "$(git rev-parse mysql-8.0.22)" = "ee4455a33b10f1b1886044322e4893f587b319ed"
-  git merge-base --is-ancestor mysql-8.0.22 HEAD
-  test "$(git branch --show-current)" = "codex/preserve-resume-8.0.22-port"
-  ```
+```bash
+git rev-parse 8.0 resumable-trx-across-shutdown \
+  binlog-cache-warmcopy-drain preserve-user-temp-tables mysql-8.0.22
+git rev-list --count 8.0..preserve-user-temp-tables
+git diff --shortstat 8.0...preserve-user-temp-tables
+git diff --name-only 8.0...preserve-user-temp-tables | wc -l
+find mysql-test/suite/preserve_trx/t -name '*.test' | wc -l
+find mysql-test/suite/preserve_trx/r -name '*.result' | wc -l
+find mysql-test/suite/preserve_trx/t -name '*_lint.test' | wc -l
+find unittest/gunit -maxdepth 3 \
+  \( -name '*preserve*trx*.cc' -o -name 'trx0preserve-t.cc' \) | sort
+```
 
-- Read source content through pinned SHAs, for example
-  `git show b78b96f99f16133f613f22a679dc061ff7fb7917:<path>` or
-  `git diff 666701570c392a6052341b6ddb9c21869bb1d733..b78b96f99f16133f613f22a679dc061ff7fb7917`.
-- Do not cherry-pick blindly across SQL parser, binlog, XA, or InnoDB state
-  machine files. Those areas must be ported function-by-function.
-- Temporary analysis files should go to `/tmp` unless they are intentional
-  review artifacts under `design/`.
+Do not use old counts from this document as final port evidence. Treat them as
+the source snapshot observed at `7caefcc30ef`.
 
-## Traceability Manifests
+## 3. Release Contract To Preserve
 
-Day 1 created two machine-reviewable manifests. They are historical landing
-artifacts and must be regenerated before a final 8.0.22 landing review because
-the source branch has continued to harden after the original Day 1 snapshot:
+The final 8.0.22 implementation must match the current GA hardening contract:
 
-- `design/preserve-resume-8.0.22-commit-manifest.md` must be refreshed to
-  track all 137 source commits with source branch, proposed batch, migration
-  status, and evidence.
-- `design/preserve-resume-8.0.22-test-manifest.md` must be refreshed to track
-  all 366 preserve MTR `.test` files, all 369 changed `.result` files, all 5
-  preserve gunit files, and all Python E2E/benchmark/unit-test assets.
+- `preserve_trx_enable=ON` is the release default.
+- `preserve_trx_temp_table_enable=ON` is the release default.
+- During intermediate migration batches, explicit OFF may be used only as a
+  staging guard for incomplete code. Final release gates must pass with the
+  default ON contract.
+- Unsupported states must fail closed before durable token generation whenever
+  possible. They must not silently rollback user work, silently disable the
+  feature, or create resumable artifacts that cannot be safely handled later.
 
-Every batch must update both manifests before commit. Final review fails if any
-row remains `pending` without an explicit `deferred` or `obsolete` reason.
+User temporary table support is intentionally conservative:
 
-## Review Severity
+- Supported: user InnoDB temporary tables with no temp row history in the
+  preserved transaction; the implementation preserves a physical image sidecar
+  and rebinds it during RESUME.
+- Unsupported: temp-DML/no-redo undo, `CREATE`, `DROP`, `TRUNCATE`, `ALTER`,
+  `RENAME`, `REPLACE`, encrypted temp tablespace, unsupported metadata shapes,
+  and any table whose source dictionary cannot be exported authoritatively.
+- Unsupported temp-table cases must return unsupported/fail-closed before a
+  durable token is generated, or retain retry/cleanup evidence if discovered
+  during recovery.
 
-- Blocker: must be fixed before the current batch can commit.
-- Major: must be fixed or explicitly rejected with evidence before the current
-  batch can commit.
-- Minor: may be deferred, but the deferral must be recorded.
+No-cache plus explicit GTID is still a future capability. The current port must
+preserve the fail-closed behavior for explicit GTID in no-cache modes and must
+not claim full positive support.
 
-## MTR-First Backport Strategy
+## 4. Format, Security, And Resource Requirements
 
-Every implementation batch uses two rounds. Batch 0 is the only exception:
-because it is a feature-off command/suite shell, Round B is explicitly
-`N/A with reason` and no real preserve/resume semantics may be introduced.
+The 8.0.22 port must keep these current invariants:
 
-Round A: feature-off / unsupported / non-preserve GREEN
+- Snapshot readable floor is format v8. v1-v7 live recovery and RESUME must
+  fail closed.
+- Snapshot authentication uses CRC plus HMAC-SHA256 with constant-time compare
+  and server identity binding.
+- `.key` is a bound key file that includes magic/version, `server_uuid`,
+  datadir/preserve-dir fingerprint, and the 32-byte HMAC key. Raw 32-byte key
+  migration is not part of this port unless a separate migration design is
+  approved.
+- `.bin`, `.binlog_cache`, external blob, and temp sidecar reads must use
+  no-symlink regular-file checks, size limits, and digest/HMAC validation before
+  data is trusted.
+- Token filenames must use an ASCII whitelist. Do not use locale-sensitive
+  character classification.
+- Expiration and reaper decisions must use monotonic deadlines derived from the
+  stored wall-clock expiration. P_S still displays wall-clock `created_at` and
+  `expires_at`.
+- FAILED and observable-only records must be garbage-collected by the reaper
+  after their retention window.
+- Expired preserved transactions are claimed by the background reaper and rolled
+  back or tainted through observable states.
+- Temp image sidecars must not be materialized as one heap object. Large image
+  data must use streaming writers, fixed-size buffers, digest streaming, and
+  spill to the configured backend.
+- The current spill backend is local file storage under the preserve directory.
+  Future remote/standby spill must not change SQL-level semantics.
+- Warm-copy phase 1 owns durable prefix work. Phase 2 is bounded tail-only work
+  plus digest/seal checks; it must not fsync or re-read the historical cache.
 
-- Move the batch tests and minimal code shell.
-- Feature-disabled behavior must not alter normal MySQL 8.0.22 behavior.
-- Preserve/resume/drain commands may return disabled or unsupported.
-- Debug and release targeted MTR must pass.
+## 5. Conflict And Risk Manifest
 
-Round B: real preserve/resume RED -> GREEN
+The old 30-file conflict list in earlier versions of this plan is stale. The
+actual 8.0.22 port must regenerate its conflict manifest in the target worktree
+before code migration starts:
 
-- Change the same tests to real preserve/resume expectations.
-- Run RED and confirm the failure is the missing feature behavior.
-- Implement the matching code.
-- Run GREEN in debug and release.
+```bash
+git merge-tree --messages --name-only --merge-base=8.0 \
+  mysql-8.0.22 preserve-user-temp-tables |
+  awk 'NR > 1 && NF == 1 { print } /^$/ { exit }' \
+  > design/preserve-resume-8.0.22-conflict-manifest.txt
+```
 
-Every batch must record:
+Also regenerate the broader overlap surface:
 
-- test inventory;
-- code inventory;
-- Round A commands and results;
-- Round B commands and results;
-- `git diff --check`;
-- independent review results;
-- commit SHA.
+```bash
+comm -12 \
+  <(git diff --no-renames --name-only mysql-8.0.22..8.0 | sort) \
+  <(git diff --no-renames --name-only 8.0...preserve-user-temp-tables | sort) \
+  > design/preserve-resume-8.0.22-overlap-manifest.txt
+```
 
-## Mandatory Per-Batch Workflow
+At this document update, the broader overlap count is at least 70 files. High
+risk overlap categories include:
 
-1. Update `design/preserve-resume-8.0.22-test-migration-plan.md`.
-2. Update this plan with code inventory and 8.0.22 landing points.
-3. Run Round A and make feature-off / unsupported mode pass.
-4. Run Round B RED -> GREEN, except Batch 0 where Round B must be recorded as
-   `N/A: shell-only feature-off batch`.
-5. Run self-check:
+- SQL command dispatch, parser, protocol, transaction, sysvar, and privilege
+  paths: `include/my_sqlcommand.h`, `sql/sql_parse.cc`, `sql/sql_yacc.yy`,
+  `sql/protocol_classic.cc`, `sql/handler.cc`, `sql/transaction.cc`,
+  `sql/sys_vars.cc`, `sql/auth/dynamic_privileges_impl.cc`.
+- Binlog and warm-copy: `sql/binlog.cc`, `sql/binlog.h`,
+  `sql/binlog_ostream.cc`, `sql/binlog_ostream.h`.
+- XA layout: `sql/xa/sql_xa_prepare.cc`, `sql/xa/sql_xa_start.cc`, and the
+  8.0.22 `sql/xa.cc` / `sql/xa.h` equivalents.
+- Carrier, build, and scripts: `sql/CMakeLists.txt`, `scripts/CMakeLists.txt`,
+  `share/messages_to_clients.txt`.
+- InnoDB transaction, undo, purge, read-view, locks, fil, temp, and bootstrap:
+  `ha_innodb.cc`, `fil0fil.cc`, `lock0lock.cc`, `mtr0mtr.cc`, `read0read.cc`,
+  `srv0start.cc`, `srv0tmp.cc`, `trx0purge.cc`, `trx0roll.cc`, `trx0sys.cc`,
+  `trx0trx.cc`, `trx0undo.cc`, and related headers.
+- Performance Schema and test harness: `storage/perfschema/CMakeLists.txt`,
+  `storage/perfschema/pfs_engine_table.cc`, `unittest/gunit/CMakeLists.txt`,
+  `unittest/gunit/innodb/CMakeLists.txt`, `unittest/gunit/innodb/ha_innodb-t.cc`.
 
-   ```bash
-   test "$(git branch --show-current)" = "codex/preserve-resume-8.0.22-port"
-   git rev-parse HEAD
-   git diff --name-only --cached
-   git diff --check
-   git status --short
-   ```
+Do not port by applying large patches blindly. For all high-risk overlap files,
+adapt function-by-function against the 8.0.22 API and execution order.
 
-6. Start at least 3 independent sub agents. Each agent reviews the whole batch,
-   not a split sub-area.
-7. Fix or explicitly reject every Blocker/Major review finding with
-   evidence.
-8. Update `design/preserve-resume-8.0.22-review-checklist.md`.
-9. Commit only the batch-scoped files.
+## 6. Branch Isolation Rules
 
-## Batch 0: MTR Suite Skeleton And Feature-Off Guards
+Actual porting must happen in a separate 8.0.22 worktree:
 
-Goal: make `mysql-test/suite/preserve_trx` collect and run on 8.0.22 while the
-feature is disabled.
+```bash
+cd /Users/a1234/project/mysql-server
+git worktree add ../mysql-server-8022-preserve-port mysql-8.0.22
+cd ../mysql-server-8022-preserve-port
+git switch -c codex/preserve-resume-8.0.22-port
+```
 
-Representative tests:
+Mandatory isolation checks:
 
-- `syntax_feature_gate.test`;
-- `startup_option_validation.test`;
-- `unsupported_single_instance_guards.test`;
-- `unsupported_cases.test`;
-- new 8.0.22 test `feature_off_normal_transaction_smoke.test`;
-- new 8.0.22 test `feature_off_binlog_temp_table_smoke.test`.
+```bash
+git branch --show-current
+git rev-parse HEAD
+git status --short
+cat MYSQL_VERSION
+```
 
-Round A expectations:
+Expected:
 
-- preserve/resume/drain commands return disabled or unsupported;
-- normal transaction, DML, binlog, and temporary table operations are unchanged;
-- no snapshot, sidecar, P_S preserved row, or warm-copy artifact is created.
+- branch is `codex/preserve-resume-8.0.22-port`;
+- base is `mysql-8.0.22`;
+- `MYSQL_VERSION_PATCH=22`;
+- worktree is clean before implementation starts.
 
-Round B expectations:
+Rules:
 
-- `N/A with reason`: this batch remains shell-level; real semantics start in
-  later batches.
+- Do not modify, rebase, reset, or commit to the three source feature branches.
+- Use `git show <sha>:<path>` and `git diff <base>..<head>` to inspect source
+  content.
+- All code and test migration commits go only to
+  `codex/preserve-resume-8.0.22-port`.
+- Temporary statistics and generated patches should live under `/tmp` unless
+  they are intentional review artifacts.
+
+## 7. Per-Batch Mandatory Workflow
+
+Every batch must follow this sequence:
+
+1. Build the test inventory for the batch and update
+   `design/preserve-resume-8.0.22-test-migration-plan.md`.
+2. Build the code inventory and record the 8.0.22 landing points in this plan.
+3. Run Round A: explicit feature-off, unsupported, or non-preserve GREEN.
+4. Run Round B: real Preserve/Resume RED -> GREEN.
+5. Run `git diff --check`, targeted debug/release build, targeted gunit, and
+   targeted MTR.
+6. Run at least three independent full-batch reviews. Reviewers must inspect
+   the whole batch, not split sub-areas.
+7. Update `design/preserve-resume-8.0.22-review-checklist.md`.
+8. Commit only batch-scoped files.
+
+Round A exists to protect original 8.0.22 behavior while the port is incomplete.
+It does not change the final default-ON release contract.
+
+## 8. Batch Plan
+
+### Batch 0: Suite Skeleton, Explicit OFF Guards, Default-ON Startup Smoke
+
+Goal: make `mysql-test/suite/preserve_trx` collect on 8.0.22 and establish both
+explicit-OFF compatibility and default-ON bootstrap preflight.
+
+Required coverage:
+
+- parser shell and errors for preserve, resume, and drain commands;
+- explicit OFF smoke for normal transaction, binlog, and user temp-table DML;
+- default ON smoke for preserve directory/key creation and validation;
+- startup failure for persistent config/key/path errors;
+- transient startup I/O retry behavior for key/preserve-dir reads.
 
 Implementation scope:
 
-- minimal parser and command shell;
-- feature gate variable with default OFF;
-- errors/messages needed by the tests;
-- no InnoDB, binlog, or temp-table runtime integration yet.
+- minimal parser, command shell, sysvars, errors, and startup preflight;
+- no InnoDB/binlog/temp runtime integration yet.
 
-Status:
+### Batch 1: Snapshot, Token, Bundle, Carrier, P_S Shell
 
-- 2026-06-15: debug `mysqld` and `mysqltest` build passed for this shell.
-- 2026-06-15: release `mysqld`, `mysqltest`, and MTR-required client/helper
-  binaries built for this shell.
-- 2026-06-15: Batch 0 Round A targeted MTR passed for
-  `syntax_feature_gate`, `startup_option_validation`,
-  `unsupported_single_instance_guards`,
-  `feature_off_normal_transaction_smoke`, and
-  `feature_off_binlog_temp_table_smoke` in debug and release.
-- 2026-06-15: the same Batch 0 Round A set passed in release with
-  `--skip-log-bin`.
-- 2026-06-16: `unsupported_cases` was ported as a `--skip-log-bin` staging
-  unsupported-context test for XA, non-InnoDB writes, temporary tables, user
-  locks, open HANDLER state, backup locks, LOCK TABLES, stored routine
-  sub-statement context, empty P_S rows, and clean preserve-directory behavior.
-  It passed debug/release `--skip-log-bin`; normal-binlog runs correctly skip
-  through `include/not_log_bin.inc`.
-- On this macOS/Clang setup, the 8.0.22 release build requires
-  `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` and
-  `-DCMAKE_CXX_FLAGS="-Wno-enum-constexpr-conversion"` for Boost 1.73.
-- The default-OFF shell is a port staging guard only; the final 8.0.22 release
-  contract remains default ON.
+Goal: port snapshot codec, token, key, HMAC/CRC, carrier, and empty P_S surface.
 
-## Batch 1: Snapshot, Token, Bundle/Carrier, P_S View Shell
+Required coverage:
 
-Goal: port snapshot codec, token, key, HMAC/CRC, carrier, and P_S/SHOW view
-surface without attaching real transactions.
-
-Representative tests:
-
-- `snapshot_format.test`;
-- `token_redaction.test`;
-- `token_visibility_redaction.test`;
-- `validation_and_privileges.test`;
-- bundle/carrier gunit.
+- format v8 encode/decode;
+- v1-v7 live recovery/RESUME reject;
+- bound `.key` server identity validation;
+- symlink rejection for `.bin`, `.binlog_cache`, external blob, and temp
+  sidecar paths;
+- ASCII token filename whitelist;
+- duplicate token, corrupt payload, and size-limit fail-closed paths;
+- token redaction and visibility checks;
+- empty `performance_schema.preserved_transactions` registration.
 
 Implementation scope:
 
 - `sql/preserve_trx_bundle*`;
 - `sql/preserve_trx_carrier*`;
-- key management and token helpers;
-- `performance_schema.preserved_transactions` registration and scan shell.
+- key management, token helpers, and P_S shell registration.
 
-Progress notes:
-
-- 2026-06-16: first Batch 1 RED/GREEN slice landed `preserve_trx_dir` and
-  bound `.key` creation/validation support in the 8.0.22 shell. RED was
-  `snapshot_format` failing on missing `preserve_trx_dir`; GREEN passed
-  debug/release targeted MTR with normal binlog and release `--skip-log-bin`.
-- 2026-06-16: second Batch 1 RED/GREEN slice added startup/validate-config key
-  permission rejection. RED was `key_permission_reject` accepting a too-open
-  `.key`; GREEN passed debug/release targeted MTR with normal binlog and
-  release `--skip-log-bin`.
-- 2026-06-16: third Batch 1 RED/GREEN slice added the empty
-  `performance_schema.preserved_transactions` table surface and its column
-  contract. RED was `pfs_preserved_transactions_empty` failing with table not
-  found; GREEN passed debug/release targeted MTR with normal binlog and release
-  `--skip-log-bin`. `perfschema.dml_handler` was re-recorded and passed in
-  debug/release after the new PFS table shifted table-list ids.
-- The empty P_S slice only registers schema and read-only empty-scan behavior;
-  it does not claim registry-backed rows, ACL-filtered visibility, token
-  redaction, or resume/reaper state integration.
-- 2026-06-16: imported the shared `Preserved_trx_view_row` /
-  `preserved_trx_snapshot()` shell and wired both `SHOW PRESERVED
-  TRANSACTIONS` and `performance_schema.preserved_transactions` to read from
-  that view. The snapshot provider still returns an empty set until the
-  preserved-record registry is ported, so this is observability framework only,
-  not durable token/runtime behavior. Debug/release `mysqld mysqltest` builds
-  passed, and the migrated preserve_trx shell MTR set passed in debug/release
-  with normal binlog and `--skip-log-bin`.
-- 2026-06-16: added a debug-only observable-row injection test for the shared
-  P_S/SHOW view shell. RED proved the provider still returned no rows; GREEN
-  added `Preserved_trx_column_metadata`, correct unsigned-column SHOW metadata,
-  and the first no-durable-side-effect debug row path. A follow-up RED/GREEN
-  step changed that debug row from a transient snapshot append into the first
-  mutex-protected registry shell: once injected, it remains visible after the
-  debug flag is cleared until an explicit debug clear hook removes it. This
-  fixes the previously hidden debug assertion where `SHOW PRESERVED
-  TRANSACTIONS` declared all columns as strings and then stored BIGINT values,
-  and prepares later FAILED/reaper/recovery records to share the same
-  registry. It does not claim production preserved-record registration or
-  durable-token lifecycle yet. Debug/release `mysqld mysqltest` builds passed.
-  The migrated preserve_trx shell MTR set passed in four modes: debug
-  normal-binlog (22 successful, 2 expected `not_log_bin` skips), debug
-  `--skip-log-bin` (24 successful), release normal-binlog (20 successful, 4
-  expected skips), and release `--skip-log-bin` (22 successful, 2 expected
-  debug-only skips).
-- 2026-06-16: added registry-row ACL filtering for the P_S/SHOW snapshot shell.
-  RED was `pfs_preserved_transactions_acl_debug` showing the injected registry
-  row to an account with only P_S `SELECT`, and exposing a full token to an
-  account with `RESUME_ANY_PRESERVED_TRANSACTION`. GREEN filters rows in
-  `preserved_trx_snapshot(thd)`: `PROCESS` sees full tokens, `RESUME_ANY` sees
-  redacted tokens, owner-visible rows use the same helper, and unrelated
-  accounts see no rows. Debug/release builds passed, and the migrated
-  preserve_trx shell MTR set passed in four modes. This remains a registry
-  shell test; durable token ownership is still later Batch 1/2 work.
-- 2026-06-16: added the `preserve_trx_is_enabled()` cached-enable shell,
-  startup-option cache synchronization, and the minimal IDLE/DISABLING manager
-  state needed for safe disable checks. This keeps the current 8.0.22 staging
-  default OFF but removes direct command-path reads of the mutable sysvar and
-  prepares the later default-ON/drain-state batches. Debug/release
-  `mysqld mysqltest` builds passed, and the migrated preserve_trx shell MTR set
-  passed in debug/release with normal binlog and `--skip-log-bin`.
-- Adding a PFS table changes the performance_schema schema surface. The final
-  8.0.22 port must explicitly resolve the `PFS_DD_VERSION`/upgrade contract
-  before release; this staging slice intentionally leaves that as a tracked
-  version-difference item rather than silently declaring upgrade readiness.
-- 2026-06-16: fourth Batch 1 RED/GREEN slice added the core preserve limit
-  sysvars used by later snapshot/carrier/recovery code. RED was
-  `core_limit_sysvars` failing on unknown `preserve_trx_max_total`; GREEN
-  passed debug/release targeted MTR with normal binlog and release
-  `--skip-log-bin`.
-- 2026-06-16: added `preserve_trx_temp_table_enable` as an early configuration
-  surface for the third source branch. It defaults ON per the final release
-  contract, but this slice does not claim temp-table image/rebind or resume
-  runtime support.
-- 2026-06-16: ported RESUME token log redaction for the current staging shell.
-  RED was `token_redaction` under `--skip-log-bin` finding raw quoted and hex
-  token literals in `mysql.general_log` and `mysql.slow_log`; GREEN passed
-  debug/release after adding SQL rewrite and raw general-log redaction. This
-  slice covers missing-token RESUME logging only; successful token-delivery and
-  registry-backed RESUME redaction remain later Batch 1/2 work.
-- 2026-06-16: added resource, memory/spill, single-phase binlog-cache, and lock
-  materialization limit sysvars as a configuration-surface slice. This prepares
-  later carrier/temp-table/resource-manager batches without claiming runtime
-  enforcement yet.
-- 2026-06-16: added drain and warm-copy configuration sysvars as a
-  configuration-surface slice. RED was `drain_warmcopy_sysvars` failing on
-  unknown `preserve_trx_drain_mode`; GREEN passed debug/release single-test
-  MTR. This prepares Batch 4/5 without claiming batch-drain or warm-copy
-  runtime behavior.
-- 2026-06-16: added the resource manager foundation and warm-copy/resource
-  `SHOW GLOBAL STATUS` surface. RED was `resource_status_vars` returning no
-  `Preserve_trx_*` status rows; GREEN passed debug/release targeted MTR with
-  normal binlog and release `--skip-log-bin`. Runtime producers remain later
-  Batch 5/6 work.
-- 2026-06-16: added bounded transient I/O retry for startup snapshot support
-  validation. RED was `startup_transient_key_io_retry` finding no retry
-  evidence for injected `.key` read and preserve-dir stat transient failures;
-  GREEN passed debug and is an expected debug-only skip in release. Persistent
-  configuration, permission, path, and corrupt-key errors remain fail-loud.
-- 2026-06-16: registered the `RESUME_ANY_PRESERVED_TRANSACTION` dynamic
-  privilege. RED was `resume_any_dynamic_privilege` failing to parse `GRANT
-  RESUME_ANY_PRESERVED_TRANSACTION`; GREEN passed debug/release normal and
-  release `--skip-log-bin`. This is only the privilege-name registration
-  slice; full RESUME ACL checks remain later Batch 1/2 work.
-- 2026-06-16: added the `SHOW PRESERVED TRANSACTIONS` parser/command shell
-  with the GA column header contract and an empty result set. RED was
-  `syntax_feature_gate` failing to parse `SHOW PRESERVED TRANSACTIONS`; GREEN
-  passed debug/release normal and release `--skip-log-bin`. This is only the
-  empty SHOW surface; registry-backed rows, ACL filtering, token redaction,
-  FAILED/reaper states, and real preserve/resume observability remain later
-  work.
-- 2026-06-16: added the staging RESUME privilege gate shell. RED was
-  `resume_privilege_gate_staging` failing because
-  `ER_PRESERVE_TRX_ACCESS_DENIED` did not exist; GREEN passed debug/release
-  normal and release `--skip-log-bin`. This slice distinguishes unauthorised
-  `RESUME PRESERVED TRANSACTION` from authorised missing-token lookup, but it
-  still uses the empty registry shell. Owner-token matching, token lookup,
-  attach, and redaction remain later Batch 1/2 work.
-- 2026-06-16: added the staging RESUME unsupported-context gate for session
-  state that is unsafe for attach. RED was `resume_unsupported_context_staging`
-  returning missing-token while a session held a user lock; GREEN passed
-  debug/release normal and release `--skip-log-bin`. This slice covers user
-  locks and HANDLER-open context only; replication/GR, cursors, stored program
-  context, and full record-backed INVALID_STATE handling remain later work.
-- 2026-06-16: added the first registry-backed RESUME token lookup staging
-  slice. RED was `resume_registry_lookup_staging_debug` returning
-  `ER_PRESERVE_TRX_NOT_FOUND` for an injected registry token because the
-  parser discarded the literal and RESUME still used the legacy command shell.
-  GREEN added `Sql_cmd_resume_preserved_transaction`, preserved the token from
-  `sql_yacc.yy`, routed RESUME through `Sql_cmd::execute` instead of
-  `preserve_trx_execute_command()`, and returned staged unsupported for
-  registry hits while preserving not-found for true misses. 8.0.22 has no
-  source-branch `LEX::set_rewrite_required()` helper, so this slice deliberately
-  leaves the existing token-redaction staging test as the logging guard.
-  Debug/release builds passed, and the migrated preserve_trx shell MTR set
-  passed in four modes. This is token lookup plumbing only; attach, owner-token
-  matching, durable registry recovery, and activation remain later Batch 1/2
-  work.
-- 2026-06-16: ported `validation_and_privileges` as the staging validation and
-  privilege shell. RED was `PREPARE SHUTDOWN PRESERVE TRANSACTION` outside an
-  active transaction returning generic unsupported; GREEN passed debug/release
-  normal and `--skip-log-bin` after adding SHUTDOWN privilege enforcement and
-  PREPARE invalid-state taxonomy. The existing
-  `unsupported_single_instance_guards` test was adjusted to the same
-  invalid-state contract for no-active-transaction PREPARE while DRAIN remains
-  unsupported until Batch 4 runtime migration.
-- 2026-06-16: added the first token-delivery finalization staging slice. RED
-  was `token_delivery_finalize_staging_debug` returning
-  `ER_PRESERVE_TRX_INVALID_STATE` because the 8.0.22 shell still had no
-  post-response delivery hook. GREEN added a guarded pending-delivery registry,
-  called `preserved_trx_finalize_statement_response()` from
-  `dispatch_command()` immediately after `thd->send_statement_status()`, and
-  added the disconnect fallback in `THD::release_resources()` after
-  `stmt_map.reset()`, matching the source-branch lifecycle point. The debug
-  staging hook uses `request_shutdown=false`, so the test can prove that an OK
-  response transitions the injected token from `PENDING` to `PRESERVED` without
-  shutting down the MTR server. Debug/release builds passed, the new debug-only
-  test passed in debug, release skipped it via `have_debug.inc`, and the
-  migrated preserve_trx shell MTR set passed in four modes. This is statement
-  response/finalizer plumbing only; real durable token generation and
-  shutdown-after-delivery remain Batch 2 work.
-- 2026-06-16: added the paired token-delivery release fallback guard. RED was
-  `token_delivery_release_resources_staging_debug` showing that a skipped
-  dispatch finalizer followed by disconnect removed the token instead of making
-  it resumable. The root cause was that `COM_QUIT` could overwrite the cached
-  PREPARE OK response before `THD::release_resources()` finalized delivery.
-  GREEN added `preserved_trx_note_statement_response()` after
-  `send_statement_status()` and made it first-response-only, so disconnect
-  fallback preserves the original user-visible OK result. This remains a
-  debug-only staging guard for lifecycle plumbing, not a durable preserve
-  runtime claim.
-- 2026-06-16: imported the source branch bundle/carrier/file/temp-manifest codec
-  layer into the 8.0.22 tree as a buildable infrastructure slice:
-  `sql/preserve_trx_bundle.{cc,h}`, `sql/preserve_trx_carrier.{cc,h}`,
-  `sql/preserve_trx_carrier_file.{cc,h}`,
-  `sql/preserve_trx_temp_table_carrier.{cc,h}`, `sql/preserve_trx_xid.h`, and
-  the temp-preserve type header
-  `storage/innobase/include/trx0temp_preserve.h`. The port required only
-  compatibility adaptations: C++14-safe constexpr/static assertions,
-  8.0.22's `my_checksum()` declaration location, writable `std::string`
-  buffers without C++17 `data()`, removal of structured bindings, and an
-  `mdl_preserve_namespace_supported()` helper matching the source branch
-  namespace allowlist. Debug and release `mysqld mysqltest` builds passed.
-  Runtime durable snapshot generation/registration, registry-backed RESUME, and
-  temp image materialization are still intentionally disabled by the current
-  shell.
-- The current carrier/codec import does not yet claim bundle/carrier gunit
-  coverage in the 8.0.22 tree. This checkout is configured without googletest,
-  so the slice is build-verified plus covered by the existing shell MTR set.
-  The full codec gunit migration remains a required Batch 1 follow-up.
-- These current slices do not claim full carrier runtime behavior or
-  registry-backed token ACL/redaction. Those remain in Batch 1.
-- Because the current 8.0.22 port is still an unsupported shell, it keeps
-  `preserve_trx_enable` default OFF as a staging guard. The final release
-  contract remains default ON and must be flipped in the explicit default-ON
-  batch.
-
-## Batch 2: Single Transaction Preserve/Resume
+### Batch 2: Single Transaction Kernel And RESUME
 
 Goal: close the single transaction preserve/restart/resume loop.
 
-Representative tests:
+Required coverage:
 
-- `basic_resume.test`;
-- `rollback_after_resume.test`;
-- `read_view_rr.test`;
-- `read_view_rc.test`;
-- `record_lock_after_resume.test`;
-- `gap_next_key_lock_after_resume.test`;
-- `table_lock_after_resume.test`;
-- `savepoint_rollback_to.test`;
-- `last_insert_id_after_resume.test`.
+- magic XID, `TRX_STATE_PRESERVED`, and recovery before purge;
+- read-view, record/table/predicate lock, savepoint, MDL, and user/session
+  state export/import;
+- attach-before/delete ordering and rollback after resume;
+- single preserve failure cleanup for prepare, detach, snapshot write, register,
+  token delivery, and rollback failure;
+- detach double-failure path produces observable-only records without dangling
+  `trx` pointers.
 
 Implementation scope:
 
-- `TRX_STATE_PRESERVED`;
-- magic XID;
-- InnoDB prepare/recover/rollback hooks;
-- read-view, record/table/predicate lock, savepoint, MDL export/import;
+- InnoDB transaction state, prepare/recover/rollback hooks;
 - SQL `PREPARE SHUTDOWN PRESERVE TRANSACTION`;
 - SQL `RESUME PRESERVED TRANSACTION`;
-- XA adaptation to 8.0.22 `sql/xa.cc` / `sql/xa.h`.
+- XA adaptation to the 8.0.22 XA layout.
 
-Current 8.0.22 landing status:
+### Batch 3: Recovery, Reaper, Time, And Failure Windows
 
-- 2026-06-16: added `storage/innobase/include/trx0preserve.h` and
-  `storage/innobase/trx/trx0preserve.cc` to the target tree and linked them
-  into `innobase` as an API-shape shell. The declarations match the current
-  source branch interface used by SQL, drain, recovery, temp-table, and
-  warm-copy code. The implementation intentionally returns `DB_UNSUPPORTED`,
-  empty payloads, or no-op results for real preserve/resume operations.
-- This shell is a compile/link staging point only. It does not implement
-  `TRX_STATE_PRESERVED`, `trx_t::preserve_trx_claimed`, ReadView import/export,
-  lock export/import, implicit-lock materialization, savepoint import/export,
-  undo history activation, no-redo undo handling, or temp tablespace
-  reservation semantics.
-- The next Batch 2 InnoDB slice must port the transaction-state and magic-XID
-  primitives first, then add ReadView, locks, savepoints, and undo integration
-  with behavior tests. Do not relax SQL admission from `DB_UNSUPPORTED` until
-  the corresponding kernel path has both debug/release build evidence and MTR
-  coverage.
-- 2026-06-16: added the `TRX_STATE_PRESERVED` enum value, the
-  `trx_t::preserve_trx_claimed` ownership field, initialization/reset, and
-  state switch handling in transaction, rollback, diagnostic, and debug helper
-  code. This lets the 8.0.22 kernel safely represent the preserve lifecycle
-  without making `trx_preserve_claim_prepared()` return live transactions yet.
-  Public preserve/resume behavior remains fail-closed until claim/rollback,
-  attach/detach, ReadView, lock, savepoint, and undo activation are ported.
-- 2026-06-16: ported the preserve magic-XID isolation guard. User SQL cannot
-  start or prepare an XA branch with the internal preserve XID prefix, InnoDB
-  XA recover skips preserve magic XIDs, and InnoDB commit/rollback-by-XID
-  returns `XAER_NOTA` for preserve magic XIDs. The new
-  `xa_magic_xid_guard` MTR proves the internal XID is rejected while the same
-  format ID remains usable for non-magic XA gtrids.
-- 2026-06-16: added the first read-only InnoDB kernel preflight slice for
-  current-THD ReadView detection, no-redo undo detection/state reporting,
-  autoinc lock inspection, and modified-table counting/name export. RED was
-  `kernel_preflight_introspection_staging_debug` producing no observable
-  kernel row while `PREPARE SHUTDOWN PRESERVE TRANSACTION` remained
-  unsupported; GREEN records the current transaction as having one modified
-  table, an active ReadView, and no current autoinc locks through a debug-only
-  P_S row. This is
-  introspection coverage only: SQL admission still returns unsupported, and
-  detach/attach, ReadView payload import/export, lock/savepoint export/import,
-  and undo activation remain pending.
-- 2026-06-16: added the ReadView payload staging slice. 8.0.22 now has
-  `Preserve_read_view_snapshot`, MVCC export/import helpers, little-endian
-  ReadView payload encode/decode, import-validity checks, and a debug-only
-  `read_view_payload_export_staging_debug` observable row. The RED case
-  produced no debug payload row; GREEN exports a real RR ReadView payload with
-  `low_limit_no`, active-transaction ids, and nonzero payload bytes while the
-  public SQL path still returns `ER_PRESERVE_TRX_UNSUPPORTED`. This is still
-  not positive resume behavior: claim/attach, durable snapshot serialization,
-  and ReadView import during RESUME remain pending. The 8.0.22 import validity
-  check uses `trx_sys_get_max_trx_id()` because the current source branch helper
-  `trx_sys_get_next_trx_id_or_no()` is not available in 8.0.22.
-- 2026-06-16: added the ReadView import runtime guard staging slice. The
-  initial RED/GREEN attempt deliberately found an 8.0.22 invariant that must
-  not be papered over: `MVCC::preserve_import_view()` is recovery-only and
-  asserts unless purge is still `INIT` or `DISABLED`. The port now checks that
-  purge-state contract before import so runtime misuse fails closed instead of
-  aborting or closing the caller's existing RR view. The debug-only
-  `read_view_import_staging_debug` test records `import_ok=0` and proves the
-  current snapshot remains stable. Positive ReadView import must be connected
-  and verified in the later RESUME recovery/attach slice, not through a normal
-  SQL runtime hook.
-- 2026-06-16: added the savepoint payload export/validation staging slice.
-  8.0.22 now has little-endian 32-bit payload helpers, current-THD savepoint
-  export, savepoint payload validation with count extraction, and the
-  debug-only `savepoint_payload_export_staging_debug` observable row. The RED
-  case produced no savepoint payload row; GREEN exports two real transaction
-  savepoints and validates the payload while public SQL still returns
-  `ER_PRESERVE_TRX_UNSUPPORTED`. RESUME-time savepoint import remains
-  fail-closed until attach/activation and binlog-cache savepoint restoration
-  are ported together.
-- 2026-06-16: added the savepoint import staging slice and adapted it to the
-  8.0.22 SQL/InnoDB savepoint contract. In 8.0.22 InnoDB stores savepoints
-  under the engine savepoint storage address encoded with `longlong2str(...,
-  36)`, not under the SQL name (`sp1`, `sp2`). The target helper derives those
-  engine names from the SQL `SAVEPOINT` chain before rebuilding
-  `trx_named_savept_t` entries. The debug-only
-  `savepoint_import_staging_debug` test exports, imports, and then proves
-  `ROLLBACK TO SAVEPOINT sp1` still reaches the rebuilt engine savepoint while
-  public SQL preserve behavior remains fail-closed.
-- 2026-06-16: added the RESUME acceptance staging slice. The InnoDB helper
-  `trx_preserve_thd_can_accept_preserved_trx()` now checks whether the target
-  THD has no active native InnoDB transaction and whether
-  `replace_native_transaction_in_thd` is available. The debug-only
-  `resume_acceptance_staging_debug` row proves an idle THD is eligible to
-  accept a preserved transaction while public RESUME behavior still returns
-  `ER_PRESERVE_TRX_UNSUPPORTED`. Actual transaction attach, ownership transfer,
-  and rollback-on-attach-failure remain pending.
-- 2026-06-16: added the isolation restore staging slice. The InnoDB helper
-  `trx_preserve_set_isolation()` now maps valid SQL isolation levels through
-  the 8.0.22 `innobase_trx_map_isolation_level()` helper and rejects invalid
-  payload values with `DB_ERROR`. The debug-only
-  `isolation_restore_staging_debug` row proves a valid READ COMMITTED payload
-  succeeds and an invalid byte fails while public PREPARE still returns
-  `ER_PRESERVE_TRX_UNSUPPORTED`. Positive RESUME-time isolation restoration
-  remains pending until attach and durable snapshot replay are connected.
-- 2026-06-16: added the table-lock payload export staging slice. 8.0.22 now
-  serializes current transaction table locks into a bounded payload, validates
-  the payload shape, extracts the lock count, and detects AUTO_INC table-lock
-  entries. The debug-only `table_lock_payload_export_staging_debug` row proves
-  a real UPDATE transaction exports one IX table lock and a nonempty valid
-  payload while public PREPARE still returns `ER_PRESERVE_TRX_UNSUPPORTED`.
-  Table-lock import and positive RESUME-time lock restoration remain pending;
-  this slice is export/parser coverage only.
-- 2026-06-16: added the detach/claim/rollback lifecycle staging slice.
-  8.0.22 can now take a real magic prepared InnoDB transaction, detach it from
-  the original THD, mark it PRESERVED/claimed, and roll it back as a detached
-  background transaction. The RED run found 8.0.22 rollback assertions that
-  needed PRESERVED alongside ACTIVE/PREPARED in rollback graph creation and
-  explicit-lock release; the GREEN test proves the staged UPDATE is undone.
-  Public PREPARE remains fail-closed, and durable snapshot/register plus
-  RESUME attach are still future Batch 2 slices.
+Goal: port recovery failure behavior, monotonic expiration, reaper, cleanup, and
+diagnostics.
 
-## Batch 3: Recovery And Failure Windows
+Required coverage:
 
-Goal: port crash windows, cleanup, diagnostics, and recovery failure behavior.
-
-Representative tests:
-
-- `recover_before_purge.test`;
-- `recover_before_recovery_rollback.test`;
-- `preserve_crash_after_prepare_before_snapshot.test`;
-- `resume_activate_before_delete_crash.test`;
-- `resume_attach_failure_keeps_snapshot.test`;
-- `resume_delete_failure_restores_preserved.test`;
-- `preflight_skip_log_bin_corrupt_snapshot_aborts.test`.
+- recover before purge and before normal InnoDB recovery rollback;
+- crash windows around prepare, snapshot write, register, delete, activation,
+  and cleanup;
+- monotonic deadline behavior under wall-clock changes;
+- expired token reaper rollback, retry, taint, and cleanup-failure observability;
+- FAILED / observable-only GC after the retention window;
+- non-corrupt I/O behavior does not create permanent boot loops unless startup
+  cannot safely continue.
 
 Implementation scope:
 
-- bootstrap recovery hook in 8.0.22 startup flow;
+- bootstrap recovery hook in the 8.0.22 startup flow;
 - recovered-count rewrite;
-- cleanup and rollback failure paths;
-- crash/debug sync points available in debug builds.
+- reaper thread lifecycle;
+- cleanup and rollback failure paths.
 
-## Batch 4: Batch Drain Session Control
+### Batch 4: Batch Drain Session Control
 
 Goal: port batch drain orchestration and session blocking.
 
-Representative tests:
+Required coverage:
 
-- `batch_drain_syntax_feature_gate.test`;
-- `batch_drain_single_idle_transaction.test`;
-- `batch_drain_multiple_idle_transactions.test`;
-- `batch_drain_idle_100_sessions.test`;
-- `batch_drain_context_switch_guard.test`;
-- `batch_drain_cleanup_failure_keeps_drain.test`.
+- target discovery, quiesce, context switch, and drained session blocking;
+- XA `PREPARE`, `COMMIT`, and `ROLLBACK` are blocked during drain states;
+- enable-OFF TOCTOU guard and safe OFF rejection while manager state or records
+  are active;
+- batch cleanup sticky blocked state if cleanup itself fails;
+- all-or-nothing behavior when one participant fails prepare, detach, snapshot,
+  or cleanup.
 
 Implementation scope:
 
-- global drain state;
+- global manager state;
 - target discovery and quiesce;
 - `Preserve_thd_context_switch`;
 - command/packet hooks;
 - batch cleanup and target reattach.
 
-Feature-off check:
+### Batch 5: Binlog Cache And Warm-Copy
 
-- `m_server_idle`, packet read, command read, and prepared statement dispatch
-  must behave like unmodified 8.0.22 when disabled.
-
-Current 8.0.22 port status:
-
-- 2026-06-16: ported the DRAIN syntax/feature-gate shell through
-  `batch_drain_syntax_feature_gate`. RED was
-  `DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 NO USER VARS` failing as SQL
-  syntax; GREEN passed debug/release normal and `--skip-log-bin` after adding
-  8.0.22-compatible DRAIN/PREPARE option parsing and owner active-transaction
-  invalid-state classification. This is parser and command-shell coverage
-  only; target discovery, quiesce, context switching, cleanup, and all
-  all-or-nothing runtime behavior remain Batch 4 work.
-- 2026-06-16: imported `sql/preserve_trx_drain.{cc,h}` as a build-only
-  orchestrator/participant infrastructure slice and introduced the runtime
-  `Preserve_trx_options` struct required by that interface. The current
-  `SQLCOM_DRAIN_TRANSACTIONS_PRESERVE` shell still returns unsupported; it does
-  not call `Preserve_trx_drain_service` yet. Debug/release `mysqld mysqltest`
-  builds passed, and the migrated preserve_trx shell MTR set passed in
-  debug/release with normal binlog and `--skip-log-bin`.
-
-## Batch 5: Binlog Cache And Warm-Copy
-
-Goal: port binlog four-state model, cache sidecars, and two-phase warm-copy
+Goal: port the binlog four-state model, cache sidecars, and two-phase warm-copy
 drain.
 
-Representative tests:
+Required coverage:
 
-- `binlog_state_*`;
-- `binlog_gtid_*`;
-- `fault_injection_binlog_cache_cleanup.test`;
-- new 8.0.22 test `warmcopy_default_off_normal_binlog_smoke.test`;
-- new 8.0.22 test `warmcopy_parameter_isolation.test`;
-- `warmcopy_idle_silent_large_cache.test`;
-- `warmcopy_admission_toctou.test`;
-- `warmcopy_savepoint_truncate.test`;
-- `batch_drain_warmcopy_*`.
+- no-cache automatic GTID support and explicit GTID fail-closed;
+- binlog cache sidecar durability, digest, symlink rejection, and cleanup;
+- warmcopy lease ownership, source-cache close/reset/disconnect safety;
+- phase-1 durable watermark and phase-2 tail-only finalize;
+- provider/epoch inflight isolation;
+- savepoint truncate fail-closed unless generation-based support is later
+  implemented;
+- 320+ profile tail-budget runtime reset so per-session tail reservation cannot
+  exhaust total warmcopy budget.
 
 Implementation scope:
 
-- `sql/binlog_warmcopy*`;
-- `sql/preserve_trx_warmcopy*`;
-- `sql/binlog.cc/h` function-level integration;
-- `sql/binlog_ostream*` mirror path;
-- GTID and compression metadata.
+- `sql/binlog.cc/h` and `sql/binlog_ostream*` integration;
+- warmcopy provider/session/lease code;
+- GTID, cache compression metadata, and P_S/status metrics.
 
-Current 8.0.22 port status:
+### Batch 6: User Temporary Tables, Streaming Images, And Spill
 
-- 2026-06-16: imported `sql/preserve_trx_warmcopy.{cc,h}` as a build-only
-  warm-copy model layer and added the zero-initialized
-  `THD::preserve_trx_warmcopy_participant_id` field needed by that model. The
-  slice covers descriptor tracking, participant/coordinator model logic,
-  resource-limit arithmetic, and observability formatting only. It does not
-  connect binlog-cache mirrors, provider leases, warm artifact writers, or
-  production `DRAIN TRANSACTIONS PRESERVE` warm-copy admission. Debug/release
-  `mysqld mysqltest` builds passed, and the migrated preserve_trx shell MTR set
-  passed in debug/release with normal binlog and `--skip-log-bin`.
+Goal: port default-ON user temp-table physical image/rebind support with bounded
+memory.
 
-## Batch 6: User Temporary Tables
+Required coverage:
 
-Goal: port user temporary table physical-image preserve/resume with strict
-feature isolation.
-
-Representative tests:
-
-- `temp_table_default_off_unsupported.test`;
-- `temp_table_basic_commit_after_resume.test`;
-- `temp_table_rollback_after_resume.test`;
-- `temp_table_corrupt_image_recovery.test`;
-- `temp_table_space_id_reserved_on_restart.test`;
-- `batch_drain_temp_table_100_sessions.test`.
+- supported no-row-history user InnoDB temp tables preserve/resume by physical
+  image and rebind;
+- temp-DML/no-redo undo and metadata mutations fail closed before durable token;
+- encrypted temp tablespace fails closed before token generation;
+- authoritative dictionary export and unsupported shape rejection;
+- temp image writer streams source pages, buffer-pool overlay, and dirty-page
+  journal replay;
+- memory budget, per-token budget, spill chunk size, local-file spill backend,
+  ENOSPC/short-write/fsync/rename failure cleanup;
+- sidecar space-id reservation release on resume, rollback, reaper, taint, and
+  cleanup paths.
 
 Implementation scope:
 
 - `sql/preserve_trx_temp_table*`;
-- `storage/innobase/trx/trx0temp_preserve.cc`;
-- `trx0temp_preserve.h`;
-- temp tablespace reserve/adopt/forget/release hooks;
-- temp sidecar P_S observability.
+- temp sidecar carrier;
+- preserve resource manager;
+- `trx0temp_preserve.cc/h`;
+- temp tablespace reserve/adopt/forget/release hooks.
 
-Strict isolation:
+Do not resurrect old no-redo undo page-number materialization. Positive
+temp-DML/no-redo resume is future work.
 
-- final release contract is `preserve_trx_temp_table_enable=ON` by default;
-- during intermediate 8.0.22 port slices, any session that would require the
-  not-yet-connected temp image/rebind runtime must fail closed before durable
-  token generation;
-- normal user temporary table behavior must be unchanged when the top-level
-  preserve feature is disabled or when no preserve/drain command is active.
+### Batch 7: Long Matrix, Accelerated MTR, Python E2E, And GA Evidence
 
-Current 8.0.22 port status:
+Goal: port long-running coverage, accelerated execution, E2E, benchmarks, and
+GA hardening evidence.
 
-- 2026-06-16: added SQL/THD staging state for user temporary-table preserve
-  participation and wired the public temp-table admission helpers into the
-  preserve/resume unsupported-context shell. This keeps
-  `preserve_trx_temp_table_enable` default ON and exposes the interface shape
-  needed by later Batch 6 work, but still returns fail-closed for sessions that
-  have user temporary tables because the authoritative InnoDB temp
-  image/rebind runtime is not yet connected. Debug/release `mysqld mysqltest`
-  builds passed, and the migrated preserve_trx shell MTR set passed in
-  debug/release with normal binlog and `--skip-log-bin`.
+Required coverage:
 
-## Batch 7: Long Matrix, Python E2E, Final Hardening
-
-Goal: port long-running matrix tests, E2E, benchmark tooling, and final
-hardening.
-
-Representative tests:
-
-- `batch_drain_100_long_*`;
-- `multi_session_100_resume.test`;
-- `p_s_sidecar_warmcopy_temp_observability.test`;
-- `scripts/resumable_trx_business_e2e.py`;
-- `scripts/resumable_trx_nfr2_benchmark.py`.
+- accelerated full MTR debug/release x normal/skipbin;
+- standalone source lint runner for `_lint.test` rules;
+- 100-session matrix and reduced 32-session default gate;
+- Python unit tests for business E2E, NFR benchmark, longrun E2E, MTR
+  accelerator, and lint runner;
+- live E2E baseline binlog equivalence, single-phase, two-phase warmcopy, and
+  reduced semantic matrix;
+- longrun smoke, medium, and 320+ full soak with audit;
+- crash fuzz multi-seed run;
+- real replica/GR profile and downstream binlog apply checks;
+- cross-version snapshot corpus for legal current format and fail-closed legacy
+  or malformed variants.
 
 Implementation scope:
 
-- object privilege recheck;
-- user variable replacement;
-- autoincrement reservation;
-- predicate page drift handling;
-- open cursor rejection;
-- P_S/SHOW metadata fields;
-- Python E2E and NFR-2 benchmark.
+- Python harnesses and audit tools;
+- MTR accelerator and lint runner;
+- CI/nightly profile definitions;
+- final evidence ledger.
 
-## Final Full Review
+## 9. Final Review
 
-After all batches close, start at least 5 independent sub agents. Each agent
-must perform a full review, not a split review.
+After all batches close, start at least five independent reviewers. Each reviewer
+must inspect the complete port, not a split sub-area.
 
-Each final reviewer checks:
+Each reviewer checks:
 
-- whether all 123 source commits are represented or explicitly superseded;
-- whether all 239 MTR `.test` files are migrated, adapted, or explicitly
+- whether all 136 source commits are represented or explicitly superseded;
+- whether all preserve MTR tests/results are migrated, adapted, or explicitly
   deferred with reason;
-- whether all 240 changed `.result` files are migrated, adapted, or explicitly
-  deferred with reason;
-- whether gunit files, Python scripts, and Python unit tests are migrated;
+- whether all five gunit files and Python tools are migrated;
 - whether 8.0.22 structural differences were handled correctly;
-- whether feature-off behavior remains equivalent to original 8.0.22;
-- whether warm-copy and temp-table logic are parameter isolated;
-- whether any `.result` changes mask product bugs;
-- whether every prior review finding is closed.
+- whether explicit-OFF staging behavior remains equivalent to original 8.0.22;
+- whether final default-ON behavior passes all release gates;
+- whether warm-copy, temp-table, carrier, and resource logic are parameter
+  isolated;
+- whether `_lint` coverage is kept separate from behavior evidence;
+- whether every prior review finding is closed or recorded as future work with
+  fail-closed tests.
 
 The main agent must summarize those reviews in:
 
@@ -767,29 +475,54 @@ The main agent must summarize those reviews in:
 No final merge or push is allowed while any blocker or important finding remains
 open.
 
-## Final Test Gates
+## 10. Final Test Gates
 
-Build gates:
+### Build and gunit
+
+Build debug and release:
 
 ```bash
-cmake --build build-debug --target mysqld preserve_trx-t trx0preserve-t preserve_trx_warmcopy-t preserve_trx_temp_table-t -- -j<N>
-cmake --build build-release --target mysqld preserve_trx-t trx0preserve-t preserve_trx_warmcopy-t preserve_trx_temp_table-t -- -j<N>
+cmake --build build-debug --target mysqld \
+  preserve_trx-t preserve_trx_drain-t preserve_trx_temp_table-t \
+  preserve_trx_warmcopy-t trx0preserve-t -- -j<N>
+cmake --build build-release --target mysqld \
+  preserve_trx-t preserve_trx_drain-t preserve_trx_temp_table-t \
+  preserve_trx_warmcopy-t trx0preserve-t -- -j<N>
 ```
 
-Gunit gates:
+Run all preserve gunit targets in debug and release:
 
 ```bash
 build-debug/runtime_output_directory/preserve_trx-t --gtest_color=no
-build-debug/runtime_output_directory/trx0preserve-t --gtest_color=no
-build-debug/runtime_output_directory/preserve_trx_warmcopy-t --gtest_color=no
+build-debug/runtime_output_directory/preserve_trx_drain-t --gtest_color=no
 build-debug/runtime_output_directory/preserve_trx_temp_table-t --gtest_color=no
+build-debug/runtime_output_directory/preserve_trx_warmcopy-t --gtest_color=no
+build-debug/runtime_output_directory/trx0preserve-t --gtest_color=no
+
 build-release/runtime_output_directory/preserve_trx-t --gtest_color=no
-build-release/runtime_output_directory/trx0preserve-t --gtest_color=no
-build-release/runtime_output_directory/preserve_trx_warmcopy-t --gtest_color=no
+build-release/runtime_output_directory/preserve_trx_drain-t --gtest_color=no
 build-release/runtime_output_directory/preserve_trx_temp_table-t --gtest_color=no
+build-release/runtime_output_directory/preserve_trx_warmcopy-t --gtest_color=no
+build-release/runtime_output_directory/trx0preserve-t --gtest_color=no
 ```
 
-MTR gates:
+Release builds may have expected debug-only skips. Those skips must be reported
+as expected skips, not as missing coverage.
+
+### MTR and source lint
+
+Behavior MTR should use the accelerator when available:
+
+```bash
+python3 scripts/preserve_trx_lint_runner.py --repo-root .
+
+python3 scripts/preserve_trx_mtr_accelerator.py \
+  --build-profile debug --build-dir build-debug --mode both --big-test
+python3 scripts/preserve_trx_mtr_accelerator.py \
+  --build-profile release --build-dir build-release --mode both --big-test
+```
+
+If the accelerator is unavailable during early porting, fall back to raw MTR:
 
 ```bash
 perl build-debug/mysql-test/mysql-test-run.pl --suite=preserve_trx --force --parallel=<N>
@@ -798,54 +531,91 @@ perl build-release/mysql-test/mysql-test-run.pl --suite=preserve_trx --force --p
 perl build-release/mysql-test/mysql-test-run.pl --suite=preserve_trx --force --parallel=<N> --mysqld=--skip-log-bin
 ```
 
-Perfschema targeted gate for the non-preserve result file:
+`*_lint.test` files are source/structure guards. They must not be counted as
+runtime behavior coverage. The lint runner may read source and test files, but
+behavior claims require MTR/gunit/live E2E evidence.
+
+### Python and live E2E
+
+Run Python unit tests:
 
 ```bash
-perl build-debug/mysql-test/mysql-test-run.pl --suite=perfschema dml_handler --force
-perl build-release/mysql-test/mysql-test-run.pl --suite=perfschema dml_handler --force
+python3 -m unittest \
+  scripts.tests.test_resumable_trx_business_e2e \
+  scripts.tests.test_resumable_trx_nfr2_benchmark \
+  scripts.tests.test_resumable_trx_longrun_e2e
 ```
 
-Big-test gates:
+Run live E2E profiles:
 
-```bash
-perl build-debug/mysql-test/mysql-test-run.pl --suite=preserve_trx --big-test --force --parallel=1
-perl build-release/mysql-test/mysql-test-run.pl --suite=preserve_trx --big-test --force --parallel=1
-```
+- baseline binlog equivalence;
+- single-phase preserve/resume;
+- two-phase warmcopy compare;
+- reduced semantic matrix;
+- longrun smoke, medium, and 320+ full soak.
 
-Python release E2E gate:
+Longrun reports must record validation mode, covered large-cache buckets, cycle
+count, seed, and profile. `capture_only` longrun evidence counts for soak,
+resource, and resume lifecycle validation only. Binlog equivalence evidence must
+come from deterministic short-cycle compare or explicit expected binlog events.
 
-```bash
-python3 scripts/resumable_trx_business_e2e.py \
-  --sessions 100 \
-  --tables 30 \
-  --statements-per-tx 100 \
-  --cycles 10 \
-  --drain-interval 20 \
-  --duration 300 \
-  --warmcopy-required \
-  --temp-table-workload \
-  <release mysqld connection/restart args>
-```
+### GA and nightly evidence
 
-Python benchmark and unit gates:
+Before GA:
 
-```bash
-python3 scripts/resumable_trx_nfr2_benchmark.py <release mysqld connection/restart args>
-python3 -m pytest scripts/tests/test_resumable_trx_business_e2e.py scripts/tests/test_resumable_trx_nfr2_benchmark.py
-```
+- 32-session matrix must be in the default gate.
+- 100-session matrix must run in nightly/full gate.
+- 320+ connection longrun soak must pass with no token, MDL, temp space-id,
+  manager-state, file-count, memory, or RSS leakage.
+- Crash fuzz must cover preserve, snapshot write, sidecar seal, recover_all,
+  reaper rollback, cleanup, and restart consistency.
+- Real replica/GR profile must verify preserve/drain/resume rejection boundaries
+  and downstream binlog apply behavior.
+- Cross-version snapshot corpus must include current valid format and
+  fail-closed legacy/malformed variants.
 
-Full regression gate:
-
-- Run full MySQL MTR locally if feasible.
-- If local full MTR is not feasible, submit to CI or release farm and treat CI
-  green as mandatory.
-- Any baseline 8.0.22 failures must be reproduced on untouched `mysql-8.0.22`
-  and documented before they can be excluded.
-
-Static gates:
+Final static gates:
 
 ```bash
 git diff --check
 git status --short
 git log --oneline mysql-8.0.22..HEAD
 ```
+
+## 11. Document Maintenance Checklist
+
+The original landing checklist for this file is historical. Future agents must
+not interpret it as meaning this document should stay unchanged.
+
+Refresh this file after every Preserve/Resume GA hardening round:
+
+- source branch SHA and commit count;
+- changed-file and test inventory;
+- conflict and overlap manifests;
+- release contract defaults;
+- unsupported/future capability list;
+- final test gates;
+- longrun/soak evidence requirements.
+
+Before committing a document refresh:
+
+```bash
+git diff --check -- design/preserve-resume-8.0.22-port-plan.md
+python3 - <<'PY'
+from pathlib import Path
+text = Path("design/preserve-resume-8.0.22-port-plan.md").read_text()
+stale = [
+    "default " + "OFF",
+    "no-redo undo sidecar " + "survives restart",
+    "format " + "v7",
+]
+for needle in stale:
+    if needle in text:
+        raise SystemExit(f"stale contract text found: {needle}")
+PY
+grep -n "7caefcc30efd79df3c5e2a38eb2b98a94461bd0f\\|format v8" \
+  design/preserve-resume-8.0.22-port-plan.md
+```
+
+The first grep must not find stale release-contract claims. The second grep
+must find the current source SHA and format contract.
