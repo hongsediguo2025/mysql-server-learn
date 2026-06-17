@@ -2,6 +2,19 @@
 
 Generated from `git diff --name-only 8.0...preserve-user-temp-tables`. Day 1 status is `pending` for every migrated asset. Each later batch must change the relevant rows to exactly one migration state: `moved-round-a`, `moved-round-b`, `deferred`, or `obsolete`.
 
+## Post-Generation Port Delta
+
+The manifest table below was generated before the GA-hardening test tooling and
+real topology checks were added upstream.  The 8.0.22 port now also carries:
+
+- `scripts/preserve_trx_lint_runner.py` and
+  `scripts/preserve_trx_mtr_accelerator.py`, plus their Python unit tests.
+- `mysql-test/suite/rpl/t/rpl_preserve_trx_reject_and_apply.test`, with
+  8.0.22-specific `START SLAVE` result wording.
+- `mysql-test/suite/group_replication/t/gr_preserve_trx_reject_and_apply.test`;
+  this is collected by MTR and skips when the Group Replication plugin is not
+  available in the local build.
+
 ## MTR Test Files
 
 | Source path | Expected result path | Proposed batch | Migration state | 8.0.22 note |

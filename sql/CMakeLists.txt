@@ -883,6 +883,7 @@ SET(BINLOG_SOURCE
   binlog.cc
   binlog_istream.cc
   binlog_ostream.cc
+  binlog_warmcopy.cc
   binlog_reader.cc
   log_event.cc
   rpl_commit_stage_manager.cc
