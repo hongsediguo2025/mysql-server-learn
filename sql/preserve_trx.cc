@@ -8217,6 +8217,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
         binlog_blob_provider->finalize_for_preserve(thd, token,
                                                     &prebuilt_binlog_blob);
     if (provider_status != Preserve_snapshot_status::OK) {
+      set_failure_reason("warmcopy_blob_finalize_failed");
       return reject_after_snapshot_failure(false);
     }
     prebuilt_binlog_blob_finalized = true;
@@ -8768,25 +8769,33 @@ bool Preserve_trx_drain_service::execute(
     if (target_pin.error() || !batch.visited_target() || batch.error() ||
         batch.result().stage != Preserve_trx_preserve_stage::COMPLETE) {
       const Preserve_trx_preserve_result &batch_result = batch.result();
-      LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
-             "PRESERVE: batch target preserve failed visited=%d error=%d "
-             "stage=%s reason=%s token_present=%d durable_point_crossed=%d "
-             "detached_from_original_thd=%d reattached_to_original_thd=%d "
-             "cleanup_completed_after_detach_failure=%d "
-             "cleanup_failed_after_reattach=%d "
-             "left_preserved_after_cleanup_failure=%d logged_binlog_cache=%d",
-             batch.visited_target() ? 1 : 0, batch.error() ? 1 : 0,
-             preserve_trx_preserve_stage_name(batch_result.stage),
-             batch_result.failure_reason == nullptr ? "unknown"
-                                                    : batch_result.failure_reason,
-             batch_result.token.empty() ? 0 : 1,
-             batch_result.durable_point_crossed ? 1 : 0,
-             batch_result.detached_from_original_thd ? 1 : 0,
-             batch_result.reattached_to_original_thd ? 1 : 0,
-             batch_result.cleanup_completed_after_detach_failure ? 1 : 0,
-             batch_result.cleanup_failed_after_reattach ? 1 : 0,
-             batch_result.left_preserved_after_cleanup_failure ? 1 : 0,
-             batch_result.logged_binlog_cache ? 1 : 0);
+      const std::string message =
+          "PRESERVE: batch target preserve failed visited=" +
+          std::to_string(batch.visited_target() ? 1 : 0) +
+          " error=" + std::to_string(batch.error() ? 1 : 0) +
+          " stage=" + preserve_trx_preserve_stage_name(batch_result.stage) +
+          " reason=" +
+          (batch_result.failure_reason == nullptr ? "unknown"
+                                                  : batch_result.failure_reason) +
+          " token_present=" +
+          std::to_string(batch_result.token.empty() ? 0 : 1) +
+          " durable_point_crossed=" +
+          std::to_string(batch_result.durable_point_crossed ? 1 : 0) +
+          " detached_from_original_thd=" +
+          std::to_string(batch_result.detached_from_original_thd ? 1 : 0) +
+          " reattached_to_original_thd=" +
+          std::to_string(batch_result.reattached_to_original_thd ? 1 : 0) +
+          " cleanup_completed_after_detach_failure=" +
+          std::to_string(batch_result.cleanup_completed_after_detach_failure ? 1
+                                                                             : 0) +
+          " cleanup_failed_after_reattach=" +
+          std::to_string(batch_result.cleanup_failed_after_reattach ? 1 : 0) +
+          " left_preserved_after_cleanup_failure=" +
+          std::to_string(batch_result.left_preserved_after_cleanup_failure ? 1
+                                                                           : 0) +
+          " logged_binlog_cache=" +
+          std::to_string(batch_result.logged_binlog_cache ? 1 : 0);
+      LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
       const bool prior_cleanup_error = restore_preserved_batch_items_to_original_thds(
           generation, preserved_batch_items);
       const bool cleanup_error =

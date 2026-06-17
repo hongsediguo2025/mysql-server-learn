@@ -2271,6 +2271,36 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         configured_total = int(total_settings[0].split("=")[1])
         self.assertGreaterEqual(configured_total, (100 + 2) * 64 * 1024 * 1024)
 
+    def test_warmcopy_required_scales_close_timeout_for_full_profile(self):
+        cfg = HarnessConfig(
+            sessions=320,
+            cycles=3,
+            warmcopy_required=True,
+            large_binlog_cache_sessions=8,
+            large_binlog_cache_buckets_mb=[1, 16, 64],
+            artifact_dir=".",
+        )
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = cfg
+        runner.plan = WorkloadPlan(cfg)
+        runner.runtime = _FakeRuntime()
+
+        fake_usage = type("Usage", (), {"free": 40 * 1024 * 1024 * 1024})()
+        with mock.patch(
+            "scripts.resumable_trx_business_e2e.shutil.disk_usage",
+            return_value=fake_usage,
+        ):
+            runner.configure_preserve_globals()
+
+        close_timeout_settings = [
+            sql
+            for sql in runner.runtime.sql
+            if sql.startswith("SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=")
+        ]
+        self.assertEqual(len(close_timeout_settings), 1)
+        configured_timeout_ms = int(close_timeout_settings[0].split("=")[1])
+        self.assertGreater(configured_timeout_ms, 30000)
+
     def test_warmcopy_required_without_large_cache_keeps_prefix_headroom(self):
         cfg = HarnessConfig(
             sessions=100,

@@ -490,6 +490,21 @@ CREATE TEMPORARY TABLE `{table}` (
             for index in range(len(self.effective_large_binlog_cache_buckets_mb()))
         )
 
+    def warmcopy_close_timeout_ms(self) -> int:
+        default_timeout_ms = 30_000
+        max_timeout_ms = 300_000
+        if not self.config.warmcopy_required:
+            return default_timeout_ms
+        effective_buckets = self.effective_large_binlog_cache_buckets_mb()
+        if not effective_buckets or self.config.large_binlog_cache_sessions == 0:
+            return default_timeout_ms
+        scaled_timeout_ms = (
+            default_timeout_ms
+            + self.config.sessions * 250
+            + max(effective_buckets) * 1000
+        )
+        return min(max_timeout_ms, max(default_timeout_ms, scaled_timeout_ms))
+
     def large_payload_sql_expr(self, sid: int, tx_id: int) -> Optional[str]:
         payload_bytes = self.large_payload_bytes_per_statement(sid, tx_id)
         if payload_bytes == 0:
@@ -2354,6 +2369,7 @@ class BusinessE2ERunner:
                         "SET GLOBAL log_error_verbosity=3",
                         "SET GLOBAL binlog_format=ROW",
                         "SET GLOBAL preserve_trx_warmcopy_enable=ON",
+                        f"SET GLOBAL preserve_trx_warmcopy_close_timeout_ms={plan.warmcopy_close_timeout_ms()}",
                         "SET GLOBAL preserve_trx_warmcopy_min_open_ms=1",
                         "SET GLOBAL preserve_trx_warmcopy_chunk_bytes=16777216",
                         f"SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes={max_bucket_bytes}",
