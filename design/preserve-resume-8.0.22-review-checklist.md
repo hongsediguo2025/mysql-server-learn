@@ -649,6 +649,9 @@ environment.  The unchecked final checklist item must be closed only by one of:
 2. an approved release-farm/CI result that covers the all-suite gate; or
 3. an explicit release waiver that enumerates every remaining all-suite failure,
    its baseline/environment reproduction, and the owner accepting that waiver.
+
+The handoff document for this still-open gate is
+`design/preserve-resume-8.0.22-release-gate-handoff.md`.
 ```
 
 Current-HEAD broad all-suite follow-up after `447fba51540`: 2026-06-18
