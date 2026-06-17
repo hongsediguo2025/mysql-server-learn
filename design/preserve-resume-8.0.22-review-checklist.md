@@ -119,6 +119,68 @@ Static:
 - git diff --check = pass
 ```
 
+## Exact-Current Code Gate Evidence: 2026-06-17
+
+This section records verification after the follow-up review fixes, including
+the modified privilege recheck and temp-sidecar skip-binlog suppression.  Live
+E2E and longrun evidence are still tracked separately below and must not be
+inferred from these MTR/GUnit/Python-unit gates.
+
+```text
+branch: codex/preserve-resume-8.0.22-port
+run root: /tmp/preserve-8022-current-fullgate-1781676558
+
+Build:
+- release mysqld: cmake --build build-release --target mysqld -- -j4 = 0
+- debug mysqld: cmake --build build-debug --target mysqld -- -j4 = 0
+- release gunit targets rebuilt:
+  preserve_trx-t, preserve_trx_drain-t, preserve_trx_temp_table-t,
+  preserve_trx_warmcopy-t, trx0preserve-t = 0
+- debug gunit targets rebuilt:
+  preserve_trx-t, preserve_trx_drain-t, preserve_trx_temp_table-t,
+  preserve_trx_warmcopy-t, trx0preserve-t = 0
+
+GUnit:
+- release preserve_trx-t: 243/243 passed.
+- release preserve_trx_drain-t: 10/10 passed.
+- release preserve_trx_temp_table-t: passed with 8 expected skips.
+- release preserve_trx_warmcopy-t: 84/84 passed.
+- release trx0preserve-t: 17 passed, 4 expected skips.
+- debug preserve_trx-t: 243/243 passed.
+- debug preserve_trx_drain-t: 10/10 passed.
+- debug preserve_trx_temp_table-t: 255/255 passed.
+- debug preserve_trx_warmcopy-t: 84/84 passed.
+- debug trx0preserve-t: 17 passed, 4 expected skips.
+
+MTR accelerated full, behavior only, with source lint separate:
+- source lint runner: status 0, 17 rules, 0 findings.
+- release normal-binlog big-test:
+  /tmp/preserve-8022-current-fullgate-1781676558/mtr-release-normal/20260617-140918/summary.txt
+  status pass, 23 shards.
+- release --skip-log-bin big-test:
+  /tmp/preserve-8022-current-fullgate-1781676558/mtr-release-skipbin/20260617-142316/summary.txt
+  status pass, 23 shards.
+- debug normal-binlog big-test:
+  /tmp/preserve-8022-current-fullgate-1781676558/mtr-debug-normal/20260617-143222/summary.txt
+  status pass, 24 shards.
+- debug --skip-log-bin big-test:
+  /tmp/preserve-8022-current-fullgate-1781676558/mtr-debug-skipbin/20260617-144053/summary.txt
+  status pass, 24 shards.
+
+Python unit:
+- python3 -m unittest scripts.tests.test_preserve_trx_lint_runner
+  scripts.tests.test_preserve_trx_mtr_accelerator
+  scripts.tests.test_resumable_trx_business_e2e
+  scripts.tests.test_resumable_trx_longrun_e2e
+  scripts.tests.test_resumable_trx_crash_fuzz
+  scripts.tests.test_resumable_trx_nfr2_benchmark
+- Result: 271 tests passed.
+
+Known remaining exact-current evidence gap:
+- live E2E baseline/single-phase/two-phase/reduced semantic matrix and
+  longrun/320-session soak have not yet been rerun after this patch set.
+```
+
 ## Per-Batch Checklist Template
 
 For each batch, copy this section and fill it in before committing the batch.
@@ -411,16 +473,16 @@ Commit:
 - [ ] Warm-copy behavior is isolated and verified.
 - [ ] User temporary table behavior is isolated and verified.
 - [ ] No `.result` update masks a product bug.
-- [ ] Final debug/release build gates passed on exact current HEAD.
-- [ ] Final debug/release gunit gates passed on exact current HEAD, including
+- [x] Final debug/release build gates passed on exact current HEAD.
+- [x] Final debug/release gunit gates passed on exact current HEAD, including
   `trx0preserve-t`.
-- [ ] Final debug/release preserve_trx MTR gates passed on exact current HEAD
+- [x] Final debug/release preserve_trx MTR gates passed on exact current HEAD
   with log-bin and no-bin.
-- [ ] Final debug/release preserve_trx big-test gates passed on exact current
+- [x] Final debug/release preserve_trx big-test gates passed on exact current
   HEAD.
 - [ ] Final perfschema `dml_handler` targeted gates passed on exact current
   HEAD.
-- [ ] Final Python E2E, benchmark, and Python unit-test gates passed on exact
-  current HEAD.
+- [x] Final Python unit-test gates passed on exact current HEAD.
+- [ ] Final live Python E2E and benchmark gates passed on exact current HEAD.
 - [ ] Full MySQL MTR or CI/release farm gate passed.
 - [ ] Any excluded baseline failures reproduced on untouched `mysql-8.0.22`.

@@ -2177,7 +2177,8 @@ bool preserve_trx_recheck_mdl_object_privileges(
 }
 
 bool preserve_trx_recheck_modified_table_privileges(
-    THD *thd, const std::vector<Preserve_modified_table_name> &tables) {
+    THD *thd, const std::vector<Preserve_modified_table_name> &tables,
+    bool require_all_write_acls = false) {
   if (thd == nullptr) return true;
 
   constexpr Access_bitmask kModifiedTableWriteAcls =
@@ -2209,7 +2210,9 @@ bool preserve_trx_recheck_modified_table_privileges(
       access |= table_access;
     }
 
-    return (access & kModifiedTableWriteAcls) != kModifiedTableWriteAcls;
+    return require_all_write_acls
+               ? (access & kModifiedTableWriteAcls) != kModifiedTableWriteAcls
+               : (access & kModifiedTableWriteAcls) == 0;
   };
 
   for (const Preserve_modified_table_name &name : tables) {
@@ -2221,7 +2224,8 @@ bool preserve_trx_recheck_modified_table_privileges(
 
 bool preserve_trx_recheck_modified_table_privileges(
     THD *thd,
-    const std::vector<Preserve_snapshot_modified_table_name> &tables) {
+    const std::vector<Preserve_snapshot_modified_table_name> &tables,
+    bool require_all_write_acls = false) {
   if (thd == nullptr) return true;
 
   std::vector<Preserve_modified_table_name> converted;
@@ -2229,7 +2233,8 @@ bool preserve_trx_recheck_modified_table_privileges(
   for (const Preserve_snapshot_modified_table_name &name : tables) {
     converted.push_back({name.schema_name, name.table_name});
   }
-  return preserve_trx_recheck_modified_table_privileges(thd, converted);
+  return preserve_trx_recheck_modified_table_privileges(
+      thd, converted, require_all_write_acls);
 }
 
 bool preserve_trx_recheck_resume_object_privileges(
@@ -2243,7 +2248,8 @@ bool preserve_trx_recheck_resume_object_privileges(
   }
   if (metadata.mod_tables_count != metadata.modified_table_names.size() ||
       preserve_trx_recheck_modified_table_privileges(
-          thd, metadata.modified_table_names)) {
+          thd, metadata.modified_table_names,
+          true /* require_all_write_acls */)) {
     if (!thd->is_error())
       my_error(ER_PRESERVE_TRX_ACCESS_DENIED, MYF(0));
     return true;

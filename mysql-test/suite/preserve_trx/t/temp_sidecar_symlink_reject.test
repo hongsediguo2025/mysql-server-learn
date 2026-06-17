@@ -9,6 +9,7 @@ CALL mtr.add_suppression("Preserved transaction .* recovery failed: preserved te
 CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved temporary table .* sidecar read failed");
 CALL mtr.add_suppression("Preserved transaction .* recovery failed: preserved temporary table .* sidecar digest mismatch");
 CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved temporary table .* sidecar digest mismatch");
+CALL mtr.add_suppression("Preserved transaction .* rejected because snapshot binlog_state=.* requires log_bin=ON");
 --enable_query_log
 
 SET GLOBAL preserve_trx_enable=ON;
