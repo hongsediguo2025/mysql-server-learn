@@ -67,6 +67,28 @@ This should only be closed by one of:
 Local raw all-suite attempts are useful for triage, but they are not currently
 green release evidence on this macOS host.
 
+Current remote CI availability check on 2026-06-18:
+
+```text
+branch:
+  mxx/codex/preserve-resume-8.0.22-port =
+  91fc295361d353731979cda0c250c99f8080dc86
+
+GitHub PR query:
+  hongsediguo2025/mysql-server-learn head
+  hongsediguo2025:codex/preserve-resume-8.0.22-port -> count=0
+
+GitHub combined status for 91fc295361d:
+  statuses=[]
+
+repository workflows:
+  no tracked .github/workflows files in this checkout
+```
+
+So this branch currently has no automatic GitHub status/check context that can
+close the release gate. The final gate still requires an explicit release-farm
+run, release-owner CI, or accepted waiver.
+
 ## Current Local Baseline-Parity Blockers
 
 The latest local broad all-suite attempt after `447fba51540` was stopped after
