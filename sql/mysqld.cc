@@ -2391,6 +2391,8 @@ static void clean_up(bool print_message) {
   DBUG_PRINT("exit", ("clean_up"));
   if (cleanup_done++) return; /* purecov: inspected */
 
+  preserved_trx_stop_expired_reaper();
+
   ha_pre_dd_shutdown();
   dd::shutdown();
 
@@ -3481,6 +3483,11 @@ extern "C" void *signal_hand(void *arg MY_ATTRIBUTE((unused))) {
                    ("Got signal: %d  connection_events_loop_aborted: %d", sig,
                     connection_events_loop_aborted()));
         if (!connection_events_loop_aborted()) {
+          if (preserved_trx_defer_shutdown_signal()) {
+            query_logger.set_handlers(log_output_options);
+            break;
+          }
+
           // Mark abort for threads.
           set_connection_events_loop_aborted(true);
 #ifdef HAVE_PSI_THREAD_INTERFACE
@@ -6249,6 +6256,29 @@ static int init_server_components() {
       tc_log = &tc_log_mmap;
   }
 
+  /*
+    Each server should have one UUID. It must be initialized before TC and
+    storage engine recovery so preserve/resume can validate bound keys and
+    recovered snapshots against the same identity used later by the binlog.
+  */
+  if (!opt_initialize && !is_help_or_validate_option() &&
+      init_server_auto_options()) {
+    LogErr(ERROR_LEVEL, ER_CANT_CREATE_UUID);
+    unireg_abort(MYSQLD_ABORT_EXIT);
+  }
+
+  if (!opt_initialize && preserve_trx_enable &&
+      preserved_trx_validate_snapshot_support(!is_help_or_validate_option())) {
+    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+           "preserve_trx_enable=ON requires valid snapshot support");
+    unireg_abort(MYSQLD_ABORT_EXIT);
+  }
+  preserve_trx_set_enable_value(preserve_trx_enable);
+
+  if (!opt_initialize && preserved_trx_preflight_recoverability()) {
+    unireg_abort(MYSQLD_ABORT_EXIT);
+  }
+
   if (Recovered_xa_transactions::init()) {
     LogErr(ERROR_LEVEL, ER_OOM);
     unireg_abort(MYSQLD_ABORT_EXIT);
@@ -6268,6 +6298,11 @@ static int init_server_components() {
   }
   ha_post_recover();
 
+  if (opt_initialize && init_server_auto_options()) {
+    LogErr(ERROR_LEVEL, ER_CANT_CREATE_UUID);
+    unireg_abort(MYSQLD_ABORT_EXIT);
+  }
+
   /*
     Add prepared XA transactions into the cache of XA transactions and acquire
     mdl lock for every table involved in any of these prepared XA transactions.
@@ -6285,24 +6320,6 @@ static int init_server_components() {
     LogErr(ERROR_LEVEL, ER_RPL_GTID_MODE_REQUIRES_ENFORCE_GTID_CONSISTENCY_ON);
     unireg_abort(MYSQLD_ABORT_EXIT);
   }
-
-  /*
-    Each server should have one UUID. We will create it automatically, if it
-    does not exist. It should be initialized before opening binlog file. Because
-    server's uuid will be stored into the new binlog file.
-  */
-  if (init_server_auto_options()) {
-    LogErr(ERROR_LEVEL, ER_CANT_CREATE_UUID);
-    unireg_abort(MYSQLD_ABORT_EXIT);
-  }
-
-  if (!opt_initialize && preserve_trx_enable &&
-      preserved_trx_validate_snapshot_support(!is_help_or_validate_option())) {
-    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-           "preserve_trx_enable=ON requires valid snapshot support");
-    unireg_abort(MYSQLD_ABORT_EXIT);
-  }
-  preserve_trx_set_enable_value(preserve_trx_enable);
 
   if (rpl_encryption.initialize()) {
     LogErr(ERROR_LEVEL, ER_SERVER_RPL_ENCRYPTION_UNABLE_TO_INITIALIZE);

@@ -1104,6 +1104,17 @@ TEST(PreservedTrxExpiredReaper,
   preserved_trx_remove_record_for_unit_test("unit-expired-reaper-claim-token");
 }
 
+TEST(PreservedTrxExpiredReaper, EmptyClaimDoesNotPublishManagerState) {
+  preserve_trx_set_enable_value(true);
+  preserved_trx_set_manager_state_for_unit_test(Preserve_trx_manager_state::IDLE,
+                                                0);
+
+  EXPECT_TRUE(
+      preserved_trx_expired_reaper_empty_claim_keeps_manager_idle_for_unit_test(
+          "unit-expired-reaper-empty-token"));
+  EXPECT_EQ(Preserve_trx_manager_state::IDLE, preserved_trx_manager_state());
+}
+
 TEST(PreservedTrxExpiredReaper, DeadlineUsesMonotonicAnchor) {
   ASSERT_TRUE(preserved_trx_add_deadline_record_for_unit_test(
       "unit-monotonic-deadline-token", 1000, 2000, 1000, 5000));

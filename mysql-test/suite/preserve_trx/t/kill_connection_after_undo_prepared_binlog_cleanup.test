@@ -22,6 +22,9 @@ UPDATE t_preserve_kill_after_undo_binlog SET b=11 WHERE a=1;
 --send PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300
 
 --connection default
+# Let preserve progress through the active-session drain before the control
+# connection waits for the post-prepare kill window.
+--sleep 2
 SET DEBUG_SYNC = 'now WAIT_FOR after_undo_prepared TIMEOUT 10';
 --replace_result $preserve_conn_id CONN_ID
 --eval KILL CONNECTION $preserve_conn_id

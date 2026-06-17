@@ -30,6 +30,8 @@ UPDATE t_preserve_drain_indirect SET b=11 WHERE a=1;
 --send PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300
 
 --connection default
+# Avoid making the DEBUG_SYNC wait itself part of the active-session drain.
+--sleep 2
 SET DEBUG_SYNC = 'now WAIT_FOR drain_indirect_ready TIMEOUT 10';
 
 --connect(drain_indirect_writer,localhost,root,,test)

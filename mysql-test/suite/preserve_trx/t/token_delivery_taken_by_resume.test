@@ -26,6 +26,7 @@ UPDATE t_preserve_token_delivery_taken SET b=11 WHERE a=1;
 --send PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300
 
 --connection default
+--sleep 2
 SET DEBUG_SYNC = 'now WAIT_FOR before_token_taken TIMEOUT 10';
 --source suite/preserve_trx/include/get_preserved_token.inc
 

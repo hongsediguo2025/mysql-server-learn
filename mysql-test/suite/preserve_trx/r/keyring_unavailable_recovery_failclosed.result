@@ -23,7 +23,7 @@ resumable_count
 SELECT * FROM t_keyring_unavailable_recovery ORDER BY a;
 a	b
 1	10
-# restart
+# restart: --preserve-trx-enable=ON
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted]
 SELECT COUNT(*) AS preserved_count_after_taint_cleanup
 FROM performance_schema.preserved_transactions;

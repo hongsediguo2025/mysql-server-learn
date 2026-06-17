@@ -199,6 +199,44 @@ class Abstract_table;
 using Mysql::Nullable;
 using std::max;
 
+class Preserve_trx_inflight_statement_guard {
+ public:
+  Preserve_trx_inflight_statement_guard() = default;
+  Preserve_trx_inflight_statement_guard(
+      const Preserve_trx_inflight_statement_guard &) = delete;
+  Preserve_trx_inflight_statement_guard &operator=(
+      const Preserve_trx_inflight_statement_guard &) = delete;
+  ~Preserve_trx_inflight_statement_guard() {
+    if (!m_active) return;
+    if (m_unknown_query)
+      preserved_trx_clear_inflight_unknown_query(m_thd);
+    else
+      preserved_trx_clear_inflight_risky_statement(m_thd);
+  }
+
+  void mark(THD *thd, enum_sql_command sql_command) {
+    assert(!m_active);
+    if (preserved_trx_mark_inflight_risky_statement(thd, sql_command)) {
+      m_thd = thd;
+      m_active = true;
+    }
+  }
+
+  void mark_unknown_query(THD *thd) {
+    assert(!m_active);
+    if (preserved_trx_mark_inflight_unknown_query(thd)) {
+      m_thd = thd;
+      m_active = true;
+      m_unknown_query = true;
+    }
+  }
+
+ private:
+  THD *m_thd{nullptr};
+  bool m_active{false};
+  bool m_unknown_query{false};
+};
+
 /**
   @defgroup Runtime_Environment Runtime Environment
   @{
@@ -1193,9 +1231,9 @@ void bind_fields(Item *first) {
 
 bool do_command(THD *thd) {
   bool return_value;
-  int rc;
+  int rc = 0;
   NET *net = nullptr;
-  enum enum_server_command command;
+  enum enum_server_command command = COM_SLEEP;
   COM_DATA com_data;
   DBUG_TRACE;
   DBUG_ASSERT(thd->is_classic_protocol());
@@ -1252,9 +1290,19 @@ bool do_command(THD *thd) {
     In particular, a new instrumented statement is started.
     See init_net_server_extension()
   */
-  thd->m_server_idle = true;
-  rc = thd->get_protocol()->get_command(&com_data, &command);
-  thd->m_server_idle = false;
+  if (!preserved_trx_begin_command_read(thd)) {
+    rc = 1;
+  }
+  DEBUG_SYNC(thd, "preserve_trx_after_begin_before_command_read");
+  if (!rc) {
+    rc = thd->get_protocol()->get_command(&com_data, &command);
+    DEBUG_SYNC(thd, "preserve_trx_after_command_read_before_packet_marker");
+    if (!rc) preserved_trx_mark_inflight_command_packet(thd, command);
+    if (!preserved_trx_end_command_read(thd)) rc = 1;
+  } else {
+    (void)preserved_trx_end_command_read(thd);
+  }
+  if (!rc && preserved_trx_reject_if_batch_session_drained(thd)) rc = 1;
 
   if (rc) {
 #ifndef DBUG_OFF
@@ -1600,6 +1648,17 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
     goto done;
   }
 
+  switch (preserved_trx_protocol_command_block_result(thd, command)) {
+    case Preserve_trx_command_block_result::ALLOW:
+      break;
+    case Preserve_trx_command_block_result::BLOCK_SESSION_DRAINED:
+      my_error(ER_PRESERVE_TRX_SESSION_DRAINED, MYF(0));
+      goto done;
+    case Preserve_trx_command_block_result::BLOCK_DRAINING:
+      my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+      goto done;
+  }
+
   switch (command) {
     case COM_INIT_DB: {
       LEX_STRING tmp;
@@ -1685,6 +1744,10 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
     case COM_STMT_EXECUTE: {
       /* Clear possible warnings from the previous command */
       thd->reset_for_next_command();
+      preserved_trx_consume_inflight_command_packet(thd, command);
+      Preserve_trx_inflight_statement_guard preserve_trx_inflight_guard;
+      preserve_trx_inflight_guard.mark(thd, SQLCOM_EXECUTE);
+      DEBUG_SYNC(thd, "after_protocol_ps_inflight_mark");
 
       Prepared_statement *stmt = nullptr;
       if (!mysql_stmt_precheck(thd, com_data, command, &stmt)) {
@@ -1697,6 +1760,9 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
     case COM_STMT_FETCH: {
       /* Clear possible warnings from the previous command */
       thd->reset_for_next_command();
+      preserved_trx_consume_inflight_command_packet(thd, command);
+      Preserve_trx_inflight_statement_guard preserve_trx_inflight_guard;
+      preserve_trx_inflight_guard.mark(thd, SQLCOM_EXECUTE);
 
       Prepared_statement *stmt = nullptr;
       if (!mysql_stmt_precheck(thd, com_data, command, &stmt))
@@ -1717,6 +1783,9 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
     case COM_STMT_PREPARE: {
       /* Clear possible warnings from the previous command */
       thd->reset_for_next_command();
+      preserved_trx_consume_inflight_command_packet(thd, command);
+      Preserve_trx_inflight_statement_guard preserve_trx_inflight_guard;
+      preserve_trx_inflight_guard.mark(thd, SQLCOM_PREPARE);
       Prepared_statement *stmt = nullptr;
 
       DBUG_EXECUTE_IF("parser_stmt_to_error_log", {
@@ -1782,6 +1851,10 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
 
       Parser_state parser_state;
       if (parser_state.init(thd, thd->query().str, thd->query().length)) break;
+
+      preserved_trx_consume_inflight_command_packet(thd, command);
+      Preserve_trx_inflight_statement_guard preserve_trx_inflight_guard;
+      preserve_trx_inflight_guard.mark_unknown_query(thd);
 
       // Initially, prepare and optimize the statement for the primary
       // storage engine. If an eligible secondary storage engine is
@@ -2677,6 +2750,21 @@ int mysql_execute_command(THD *thd, bool first_level) {
 
   DBUG_ASSERT(!thd->m_transactional_ddl.inited() ||
               thd->in_active_multi_stmt_transaction());
+
+  Preserve_trx_inflight_statement_guard preserve_trx_inflight_guard;
+  if (thd->get_command() == COM_STMT_EXECUTE)
+    preserve_trx_inflight_guard.mark(thd, lex->sql_command);
+
+  switch (preserved_trx_command_block_result(thd, lex->sql_command)) {
+    case Preserve_trx_command_block_result::ALLOW:
+      break;
+    case Preserve_trx_command_block_result::BLOCK_SESSION_DRAINED:
+      my_error(ER_PRESERVE_TRX_SESSION_DRAINED, MYF(0));
+      return 1;
+    case Preserve_trx_command_block_result::BLOCK_DRAINING:
+      my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+      return 1;
+  }
 
   /*
     If there is a CREATE TABLE...START TRANSACTION command which

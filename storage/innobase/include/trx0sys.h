@@ -139,6 +139,10 @@ trx_id_t trx_sys_get_new_trx_id();
  next call to trx_sys_get_new_trx_id() */
 UNIV_INLINE
 trx_id_t trx_sys_get_max_trx_id(void);
+/** Retrieves a next value that will be allocated for trx id or trx no.
+ @return the next trx id or trx no that will be allocated */
+UNIV_INLINE
+trx_id_t trx_sys_get_next_trx_id_or_no(void);
 
 #ifdef UNIV_DEBUG
 /* Flag to control TRX_RSEG_N_SLOTS behavior debugging. */

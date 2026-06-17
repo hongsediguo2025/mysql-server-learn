@@ -3255,7 +3255,7 @@ bool preserve_trx_has_resume_any_privilege(THD *thd) {
       .first;
 }
 
-bool preserve_trx_thd_has_inflight_risky_statement(THD *candidate);
+bool preserve_trx_thd_has_batch_inflight_statement(THD *candidate);
 
 class Preserve_drain_active_transactions final : public Do_THD_Impl {
  public:
@@ -3270,21 +3270,44 @@ class Preserve_drain_active_transactions final : public Do_THD_Impl {
         candidate->in_active_multi_stmt_transaction() ||
         candidate->get_transaction()->is_active(Transaction_ctx::SESSION) ||
         candidate->get_transaction()->is_active(Transaction_ctx::STMT);
+    const bool inflight_statement =
+        preserve_trx_thd_has_batch_inflight_statement(candidate);
     if (candidate->is_system_thread() &&
-        (active_transaction ||
-         preserve_trx_thd_has_inflight_risky_statement(candidate))) {
+        (active_transaction || inflight_statement)) {
       m_has_unsupported_thread = true;
       mysql_mutex_unlock(&candidate->LOCK_thd_data);
       return;
     }
     const bool active_user_statement =
-        active_transaction ||
-        preserve_trx_thd_has_inflight_risky_statement(candidate);
+        active_transaction || inflight_statement;
 
     if (active_user_statement) {
       ++m_active_count;
       if (m_kill_active) {
+        /*
+          Do not wait at the debug sync point while holding a candidate THD's
+          LOCK_thd_data. Test controller sessions may need their own THD lock to
+          signal the sync point back to the drain owner.
+        */
+        mysql_mutex_unlock(&candidate->LOCK_thd_data);
         DEBUG_SYNC(m_owner, "preserve_trx_drain_before_kill_active");
+        mysql_mutex_lock(&candidate->LOCK_thd_data);
+        const bool still_active_transaction =
+            candidate->in_active_multi_stmt_transaction() ||
+            candidate->get_transaction()->is_active(Transaction_ctx::SESSION) ||
+            candidate->get_transaction()->is_active(Transaction_ctx::STMT);
+        const bool still_inflight_statement =
+            preserve_trx_thd_has_batch_inflight_statement(candidate);
+        if (candidate->is_system_thread() &&
+            (still_active_transaction || still_inflight_statement)) {
+          m_has_unsupported_thread = true;
+          mysql_mutex_unlock(&candidate->LOCK_thd_data);
+          return;
+        }
+        if (!still_active_transaction && !still_inflight_statement) {
+          mysql_mutex_unlock(&candidate->LOCK_thd_data);
+          return;
+        }
         bool debug_skip_kill_active = false;
         DBUG_EXECUTE_IF("preserve_trx_drain_skip_kill_active",
                         debug_skip_kill_active = true;);
@@ -3384,11 +3407,26 @@ bool preserve_trx_select_uses_locking_read(LEX *lex) {
   return false;
 }
 
+bool preserve_trx_transaction_sysvar_name(const char *name) {
+  return name != nullptr &&
+         (strcmp(name, "autocommit") == 0 ||
+          strcmp(name, "transaction_isolation") == 0 ||
+          strcmp(name, "transaction_read_only") == 0 ||
+          strcmp(name, "tx_isolation") == 0 ||
+          strcmp(name, "tx_read_only") == 0);
+}
+
 bool preserve_trx_set_option_changes_transaction_semantics(LEX *lex) {
   if (lex == nullptr) return false;
   List_iterator_fast<set_var_base> it(lex->var_list);
   set_var_base *var;
-  while ((var = it++)) return true;
+  while ((var = it++)) {
+    const set_var *sysvar = dynamic_cast<const set_var *>(var);
+    if (sysvar != nullptr && sysvar->var != nullptr &&
+        preserve_trx_transaction_sysvar_name(sysvar->var->name.str)) {
+      return true;
+    }
+  }
   return false;
 }
 
@@ -3458,11 +3496,6 @@ bool preserve_trx_protocol_command_may_create_trx_or_lock(
     default:
       return false;
   }
-}
-
-bool preserve_trx_thd_has_inflight_risky_statement(THD *candidate) {
-  return candidate != nullptr &&
-         candidate->preserve_trx_inflight_risky_statement_depth > 0;
 }
 
 bool preserve_trx_thd_has_batch_inflight_statement(THD *candidate) {
@@ -6205,30 +6238,6 @@ bool preserved_trx_resume_deadline_expired(
   return deadline_us != 0 && my_micro_time() >= deadline_us;
 }
 
-static bool preserved_trx_take_expired_resumable_record(
-    Preserved_trx_record *record) {
-  std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
-  const uint64_t now_us = preserve_trx_monotonic_us();
-  for (auto it = g_preserved_trx_records.begin();
-       it != g_preserved_trx_records.end(); ++it) {
-    if (!it->observable_only && it->resumable &&
-        preserved_trx_record_resume_deadline_expired(*it, now_us)) {
-      if (it->last_error == kExpiredReaperRollbackFailure &&
-          it->last_error_monotonic_us != 0) {
-        const bool within_retry_backoff =
-            now_us < it->last_error_monotonic_us ||
-            now_us - it->last_error_monotonic_us <
-                kExpiredReaperRollbackFailureRetryBackoffUs;
-        if (within_retry_backoff) continue;
-      }
-      if (record != nullptr) *record = *it;
-      g_preserved_trx_records.erase(it);
-      return true;
-    }
-  }
-  return false;
-}
-
 static bool restore_record_after_resume_failure(
     Preserved_trx_record &record, const std::string &reason) {
   if (!preserved_trx_add_record_with_last_error(record, reason)) {
@@ -6361,21 +6370,49 @@ static bool rollback_expired_resumable_record_by_reaper(
 
 static bool preserved_trx_claim_expired_resumable_record_for_reaper(
     Preserved_trx_record *record) {
+  std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
+  const uint64_t now_us = preserve_trx_monotonic_us();
+  auto expired = g_preserved_trx_records.end();
+  for (auto it = g_preserved_trx_records.begin();
+       it != g_preserved_trx_records.end(); ++it) {
+    if (it->observable_only || !it->resumable ||
+        !preserved_trx_record_resume_deadline_expired(*it, now_us)) {
+      continue;
+    }
+    if (it->last_error == kExpiredReaperRollbackFailure &&
+        it->last_error_monotonic_us != 0) {
+      const bool within_retry_backoff =
+          now_us < it->last_error_monotonic_us ||
+          now_us - it->last_error_monotonic_us <
+              kExpiredReaperRollbackFailureRetryBackoffUs;
+      if (within_retry_backoff) continue;
+    }
+    expired = it;
+    break;
+  }
+  if (expired == g_preserved_trx_records.end()) return false;
+
   if (!preserve_trx_compare_exchange_manager_state_owner(
           Preserve_trx_manager_state::IDLE,
           Preserve_trx_manager_state::EXPIRED_ROLLBACK, 0)) {
     return false;
   }
 
-  const bool claimed = preserved_trx_take_expired_resumable_record(record);
-  if (claimed && record != nullptr) {
-    preserved_trx_add_observable_record(
-        record->metadata, record->trx,
-        Preserved_trx_lifecycle_state::EXPIRED_ROLLBACK);
-  }
+  Preserved_trx_record claimed = *expired;
+  g_preserved_trx_records.erase(expired);
+  Preserved_trx_record observable;
+  observable.metadata = claimed.metadata;
+  observable.trx = claimed.trx;
+  observable.resumable = false;
+  observable.state = Preserved_trx_lifecycle_state::EXPIRED_ROLLBACK;
+  observable.observable_only = true;
+  preserved_trx_initialize_record_deadlines(&observable);
+  preserved_trx_initialize_observable_gc_deadline(&observable);
+  g_preserved_trx_records.push_back(std::move(observable));
+  if (record != nullptr) *record = claimed;
 
   preserve_trx_store_manager_state_owner(Preserve_trx_manager_state::IDLE, 0);
-  return claimed;
+  return true;
 }
 
 bool preserved_trx_expired_reaper_claim_releases_manager_state_for_unit_test(
@@ -6410,6 +6447,20 @@ bool preserved_trx_expired_reaper_claim_releases_manager_state_for_unit_test(
 
   return claimed_record && released_manager &&
          claimed.metadata.token == token;
+}
+
+bool preserved_trx_expired_reaper_empty_claim_keeps_manager_idle_for_unit_test(
+    const std::string &token) {
+  preserved_trx_remove_record_for_unit_test(token);
+  preserved_trx_remove_observable_record(
+      token, Preserved_trx_lifecycle_state::EXPIRED_ROLLBACK);
+
+  Preserved_trx_record claimed;
+  const bool claimed_record =
+      preserved_trx_claim_expired_resumable_record_for_reaper(&claimed);
+  return !claimed_record &&
+         preserved_trx_manager_state() == Preserve_trx_manager_state::IDLE &&
+         !preserved_trx_observable_record_exists_for_unit_test(token);
 }
 
 static void preserved_trx_expired_reaper_scan_once() {
@@ -8005,22 +8056,15 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       innodb_savepoint_count != sql_innodb_savepoint_count) {
     return reject_after_detach_failure_or_rollback();
   }
-  std::string exported_record_locks_payload;
-  if (trx_preserve_export_record_locks(trx, &exported_record_locks_payload,
-                                       lock_limits.max_lock_count) !=
-      DB_SUCCESS) {
-    const char *reason = preserve_trx_record_lock_export_failure_reason(
-        "record_lock_export_failed_after_detach");
-    log_preserve_reject_reason(thd, reason);
-    set_failure_reason(reason);
-    return reject_after_detach_failure_or_rollback();
-  }
-  uint32_t record_locks_count = 0;
-  if (!exported_record_locks_payload.empty() &&
-      !trx_preserve_record_locks_payload_lock_count(
-          exported_record_locks_payload, &record_locks_count)) {
-    return reject_after_detach_failure_or_rollback();
-  }
+  /*
+    Use the pre-prepare record-lock snapshot as the durable lock contract.
+    InnoDB XA prepare may release gap locks for RC-style transactions; PRESERVE
+    must keep the user-visible transaction semantics from before the durable
+    prepare step, including next-key/gap locks that protect future inserts.
+  */
+  const std::string &exported_record_locks_payload =
+      record_locks_preflight_payload;
+  uint32_t record_locks_count = record_locks_preflight_count;
   if (!split_record_and_predicate_locks_payload(
           exported_record_locks_payload, &metadata.record_locks_payload,
           &metadata.predicate_locks_payload)) {

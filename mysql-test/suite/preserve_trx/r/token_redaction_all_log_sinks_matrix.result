@@ -10,7 +10,6 @@ TRUNCATE TABLE mysql.general_log;
 TRUNCATE TABLE mysql.slow_log;
 SET @redaction_matrix_token=CONCAT('msp_matrix_redaction_', 'abcd');
 SET @redaction_matrix_redacted=CONCAT('****', RIGHT(@redaction_matrix_token, 4));
-include/suppress_messages.inc
 ERROR HY000: Preserved transaction was not found
 SELECT COUNT(*) AS raw_token_in_general_log
 FROM mysql.general_log

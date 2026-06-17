@@ -27,6 +27,7 @@ UPDATE t_preserve_disconnect_cleanup SET b=11 WHERE a=1;
 --send PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300
 
 --connection default
+--sleep 2
 SET DEBUG_SYNC = 'now WAIT_FOR disconnect_token_pending TIMEOUT 10';
 --replace_result $preserve_conn_id CONN_ID
 --eval KILL CONNECTION $preserve_conn_id
@@ -83,7 +84,14 @@ open(my $class_fh, '<', $class_path)
 my $class = do { local $/; <$class_fh> };
 close($class_fh);
 
+$class =~ /void\s+THD::release_resources\s*\(\s*\)\s*\{(?<body>.*?)^}/ms
+  or die "could not find THD::release_resources body\n";
+my $release_body = $+{body};
+my $preserve_pos =
+  index($release_body, 'preserved_trx_release_resources(this)');
+my $cleanup_pos = index($release_body, 'cleanup()');
+my $ha_close_pos = index($release_body, 'ha_close_connection(this)');
 die "THD::release_resources must call preserve cleanup before generic cleanup and ha_close_connection\n"
-  unless $class =~
-         /void\s+THD::release_resources\s*\(\s*\).*?preserved_trx_release_resources\s*\(\s*this\s*\).*?if\s*\(\s*!is_cleanup_done\s*\(\s*\)\s*\)\s*cleanup\s*\(\s*\).*?ha_close_connection\s*\(\s*this\s*\)/s;
+  unless $preserve_pos >= 0 && $cleanup_pos >= 0 && $ha_close_pos >= 0 &&
+         $preserve_pos < $cleanup_pos && $cleanup_pos < $ha_close_pos;
 EOF

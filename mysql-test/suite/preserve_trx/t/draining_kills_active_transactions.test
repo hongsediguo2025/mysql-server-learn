@@ -28,6 +28,8 @@ UPDATE t_preserve_drain SET b=11 WHERE a=1;
 --send PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300
 
 --connection default
+# Keep the control connection out of the HARD drain kill set.
+--sleep 2
 SET DEBUG_SYNC = 'now WAIT_FOR drain_snapshot_ready TIMEOUT 10';
 --replace_result $blocker_conn_id BLOCKER_ID
 --eval SELECT COUNT(*) AS blocker_thread_count FROM performance_schema.threads WHERE PROCESSLIST_ID = $blocker_conn_id

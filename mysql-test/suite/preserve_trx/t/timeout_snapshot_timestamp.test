@@ -27,8 +27,8 @@ UPDATE t_timeout_snapshot_timestamp SET b=11 WHERE a=1;
 --send PREPARE SHUTDOWN PRESERVE TRANSACTION
 
 --connection default
-SET DEBUG_SYNC = 'now WAIT_FOR before_snapshot_timestamp TIMEOUT 3';
 --sleep 2
+SET DEBUG_SYNC = 'now WAIT_FOR before_snapshot_timestamp TIMEOUT 3';
 --exec perl -MTime::HiRes=time -e 'printf "%s %.6f\n", "--let " . chr(36) . "marker_epoch=", time' > $MYSQLTEST_VARDIR/tmp/timeout_snapshot_timestamp_marker.inc
 --exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 SET DEBUG_SYNC = 'now SIGNAL continue_snapshot_timestamp';

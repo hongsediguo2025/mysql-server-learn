@@ -94,6 +94,7 @@
 #include "sql/opt_costconstantcache.h"  // reload_optimizer_cost_constants
 #include "sql/opt_costmodel.h"
 #include "sql/opt_hints.h"
+#include "sql/preserve_trx_temp_table.h"
 #include "sql/protocol.h"
 #include "sql/psi_memory_key.h"
 #include "sql/query_options.h"
@@ -1981,6 +1982,14 @@ err:
     if (!error) (void)RUN_HOOK(transaction, after_commit, (thd, all));
     trn_ctx->m_flags.run_hooks = false;
   }
+  if (!error) {
+    if (all) {
+      if (preserve_trx_temp_table_transaction_state_needs_clear(thd))
+        preserve_trx_temp_table_clear_transaction_state(thd);
+    } else {
+      preserve_trx_temp_table_note_statement_commit(thd);
+    }
+  }
   return error;
 }
 
@@ -2130,6 +2139,13 @@ int ha_rollback_trans(THD *thd, bool all) {
       trn_ctx->cannot_safely_rollback(Transaction_ctx::SESSION) &&
       !thd->slave_thread && thd->killed != THD::KILL_CONNECTION)
     trn_ctx->push_unsafe_rollback_warnings(thd);
+
+  if (all) {
+    if (preserve_trx_temp_table_transaction_state_needs_clear(thd))
+      preserve_trx_temp_table_clear_transaction_state(thd);
+  } else {
+    preserve_trx_temp_table_note_statement_rollback(thd);
+  }
 
   return error;
 }
@@ -7825,6 +7841,11 @@ int handler::ha_write_row(uchar *buf) {
   if (unlikely((error = binlog_log_row(table, nullptr, buf, log_func))))
     return error; /* purecov: inspected */
 
+  if (preserve_trx_temp_table_row_hooks_enabled() &&
+      preserve_trx_temp_table_row_capture_candidate(ha_thd(), table))
+    (void)preserve_trx_temp_table_note_row_write(
+        ha_thd(), table, reinterpret_cast<const char *>(buf),
+        static_cast<size_t>(table->s->reclength));
   DEBUG_SYNC_C("ha_write_row_end");
   return 0;
 }
@@ -7854,6 +7875,21 @@ int handler::ha_update_row(const uchar *old_data, uchar *new_data) {
   if (unlikely(error)) return error;
   if (unlikely((error = binlog_log_row(table, old_data, new_data, log_func))))
     return error;
+  if (preserve_trx_temp_table_row_hooks_enabled() &&
+      preserve_trx_temp_table_row_capture_candidate(ha_thd(), table)) {
+    preserve_trx_temp_table_note_untracked_change(ha_thd());
+    if (!preserve_trx_temp_table_enable) {
+      (void)preserve_trx_temp_table_note_row_update(ha_thd(), table, nullptr, 0);
+    } else {
+      const size_t row_length = static_cast<size_t>(table->s->reclength);
+      std::string payload;
+      payload.reserve(row_length * 2);
+      payload.append(reinterpret_cast<const char *>(old_data), row_length);
+      payload.append(reinterpret_cast<const char *>(new_data), row_length);
+      (void)preserve_trx_temp_table_note_row_update(
+          ha_thd(), table, payload.data(), payload.size());
+    }
+  }
   return 0;
 }
 
@@ -7880,6 +7916,11 @@ int handler::ha_delete_row(const uchar *buf) {
   if (unlikely(error)) return error;
   if (unlikely((error = binlog_log_row(table, buf, nullptr, log_func))))
     return error;
+  if (preserve_trx_temp_table_row_hooks_enabled() &&
+      preserve_trx_temp_table_row_capture_candidate(ha_thd(), table))
+    (void)preserve_trx_temp_table_note_row_delete(
+        ha_thd(), table, reinterpret_cast<const char *>(buf),
+        static_cast<size_t>(table->s->reclength));
   return 0;
 }
 

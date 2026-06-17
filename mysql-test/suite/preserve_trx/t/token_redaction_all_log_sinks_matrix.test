@@ -20,9 +20,9 @@ TRUNCATE TABLE mysql.slow_log;
 SET @redaction_matrix_token=CONCAT('msp_matrix_redaction_', 'abcd');
 SET @redaction_matrix_redacted=CONCAT('****', RIGHT(@redaction_matrix_token, 4));
 
---let $messages= RESUME PRESERVED TRANSACTION .* failed: token not found
---let $suppress_silent= 1
---source include/suppress_messages.inc
+--disable_query_log
+CALL mtr.add_suppression("RESUME PRESERVED TRANSACTION .* failed: token not found");
+--enable_query_log
 
 --disable_query_log
 --error ER_PRESERVE_TRX_NOT_FOUND

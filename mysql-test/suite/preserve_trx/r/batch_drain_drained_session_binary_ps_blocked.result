@@ -7,13 +7,13 @@ SET DEBUG_SYNC =
 'preserve_trx_batch_after_one_target_preserved SIGNAL batch_drained_ps_preserved WAIT_FOR continue_batch_drained_ps';
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SET DEBUG_SYNC = 'now WAIT_FOR batch_drained_ps_preserved TIMEOUT 10';
-include/wait_for_pattern_in_file.inc [stmt_execute_error_code=4177]
-include/wait_for_pattern_in_file.inc [ping_error_code=4177]
+include/wait_for_pattern_in_file.inc [stmt_execute_error_code=4020]
+include/wait_for_pattern_in_file.inc [ping_error_code=4020]
 raw_ps_client_start
 raw_ps_client_ready
-stmt_execute_error_code=4177
+stmt_execute_error_code=4020
 stmt_execute_error_message=This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
-ping_error_code=4177
+ping_error_code=4020
 ping_error_message=This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_drained_ps';
 RESUME PRESERVED TRANSACTION 'TOKEN';

@@ -45,7 +45,7 @@ SELECT 1;
 1
 1
 COMMIT;
-# restart
+# restart: --preserve-trx-enable=ON
 SELECT COUNT(*) AS preserved_count_after_before_unlink_restart
 FROM performance_schema.preserved_transactions;
 preserved_count_after_before_unlink_restart

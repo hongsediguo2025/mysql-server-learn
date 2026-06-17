@@ -30,6 +30,7 @@ UPDATE t_timeout_logged_cache_timestamp
 --send PREPARE SHUTDOWN PRESERVE TRANSACTION
 
 --connection default
+--sleep 2
 SET DEBUG_SYNC = 'now WAIT_FOR before_binlog_cache_rename TIMEOUT 5';
 --exec perl -MTime::HiRes=time -e 'printf "%s %.6f\n", "--let " . chr(36) . "marker_epoch=", time' > $MYSQLTEST_VARDIR/tmp/timeout_logged_cache_snapshot_marker.inc
 --exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect

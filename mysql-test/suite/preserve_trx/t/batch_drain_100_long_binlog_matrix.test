@@ -191,9 +191,9 @@ BEGIN
            AND @@session.gtid_next = @batch_gtid_next
            AND marker = 'explicit-gtid-post'
       INTO post_ok FROM t_binlog_gtid
-     WHERE sid = @batch_long_sid;
+    WHERE sid = @batch_long_sid;
     SET detail_value = 'explicit-gtid';
-    SET @batch_long_end_action = 'NONE';
+    SET @batch_long_end_action = 'COMMIT_EXPLICIT_GTID';
   END IF;
 
   IF COALESCE(post_ok, 0) <> 1 THEN
@@ -228,10 +228,6 @@ BEGIN
     1,
     detail_value);
 
-  IF @batch_long_case_id BETWEEN 17 AND 20 THEN
-    COMMIT;
-    SET GTID_NEXT=AUTOMATIC;
-  END IF;
 END|
 DELIMITER ;|
 SQL
@@ -258,13 +254,12 @@ SELECT detail, resumed_sql_log_bin, COUNT(*) AS row_count
 SELECT COUNT(*) = 20 AS explicit_gtid_next_restored
   FROM t_binlog_resume_state
  WHERE detail = 'explicit-gtid'
-   AND resumed_gtid_next LIKE '11111111-1111-1111-1111-111111111111:%';
-SELECT COUNT(*) = 20 AS explicit_gtids_committed
-  FROM t_batch_long_control
- WHERE case_id BETWEEN 17 AND 20
-   AND GTID_SUBSET(CONCAT('11111111-1111-1111-1111-111111111111:',
-                          10000 + sid),
-                   @@GLOBAL.GTID_EXECUTED);
+   AND resumed_gtid_next LIKE CONCAT(@@GLOBAL.SERVER_UUID, ':%');
+SELECT COALESCE(SUM(GTID_SUBSET(resumed_gtid_next,
+                                @@GLOBAL.GTID_EXECUTED)), 0) = 20
+       AS explicit_gtids_committed
+  FROM t_binlog_resume_state
+ WHERE detail = 'explicit-gtid';
 SELECT COUNT(*) = 40 AS logged_cache_rows
   FROM t_binlog_logged_cache
  WHERE case_id BETWEEN 1 AND 8
@@ -356,9 +351,9 @@ for my $sid (1 .. 100) {
   if ($case_id >= 13 && $case_id <= 16) {
     print $apps "SET SESSION sql_log_bin = 0;\n";
   } elsif ($case_id >= 17 && $case_id <= 20) {
-    my $gtid = "11111111-1111-1111-1111-111111111111:" . (10000 + $sid);
-    print $apps "SET \@batch_gtid_next = '$gtid';\n";
-    print $apps "SET GTID_NEXT = '$gtid';\n";
+    print $apps "SET \@batch_gtid_next = CONCAT(\@\@GLOBAL.SERVER_UUID, ':" .
+                (10000 + $sid) . "');\n";
+    print $apps "SET GTID_NEXT = \@batch_gtid_next;\n";
   }
 
   print $apps "START TRANSACTION;\n";
@@ -418,7 +413,9 @@ SET GLOBAL preserve_trx_drain_grace_ms=60000;
 --let $batch_long_pre_resume_file= $MYSQLTEST_VARDIR/tmp/batch_long_binlog_pre_resume.inc
 --let $batch_long_resume_file= $MYSQLTEST_VARDIR/tmp/batch_long_binlog_resume.inc
 --let $batch_long_verify_file= $MYSQLTEST_VARDIR/tmp/batch_long_binlog_verify.inc
+--let $batch_long_restart_options= --gtid-mode=ON --enforce-gtid-consistency
 --source suite/preserve_trx/include/batch_drain_100_long_common.inc
+--let $batch_long_restart_options=
 
 SET GLOBAL preserve_trx_enable=ON;
 --disable_query_log

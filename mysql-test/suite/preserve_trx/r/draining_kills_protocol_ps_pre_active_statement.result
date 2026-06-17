@@ -1,23 +1,24 @@
 DROP TABLE IF EXISTS t_preserve_drain_protocol_ps;
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_drain_mode=HARD;
+SET GLOBAL preserve_trx_drain_grace_ms=0;
 CREATE TABLE t_preserve_drain_protocol_ps(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_preserve_drain_protocol_ps VALUES(1,10),(2,20);
 SET DEBUG_SYNC = 'now WAIT_FOR protocol_ps_after_gate TIMEOUT 10';
 SET DEBUG_SYNC =
-'preserve_trx_after_lock_materialization SIGNAL protocol_ps_preserve_ready WAIT_FOR continue_protocol_ps_preserve';
+'preserve_trx_drain_before_kill_active SIGNAL protocol_ps_preserve_ready';
+SET DEBUG_SYNC =
+'preserve_trx_before_token_delivery SIGNAL protocol_ps_before_token WAIT_FOR continue_protocol_ps_token';
 START TRANSACTION;
 UPDATE t_preserve_drain_protocol_ps SET b=11 WHERE a=1;
 PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
-SET DEBUG_SYNC = 'now WAIT_FOR protocol_ps_preserve_ready TIMEOUT 10';
-KILL QUERY PRESERVE_ID;
-SET DEBUG_SYNC = 'now SIGNAL continue_protocol_ps_preserve';
-ERROR 70100: Query execution was interrupted
-SET DEBUG_SYNC = 'RESET';
-ROLLBACK;
-SET DEBUG_SYNC = 'now SIGNAL continue_protocol_ps';
+SET DEBUG_SYNC = 'now WAIT_FOR protocol_ps_before_token TIMEOUT 10';
+KILL CONNECTION PRESERVE_ID;
+SET DEBUG_SYNC = 'now SIGNAL continue_protocol_ps_token';
+Got one of the listed errors
 include/wait_for_pattern_in_file.inc [protocol_ps_writer_done]
+SET DEBUG_SYNC = 'RESET';
 SELECT * FROM t_preserve_drain_protocol_ps ORDER BY a;
 a	b
 1	10
@@ -28,3 +29,5 @@ preserved_count
 0
 DROP TABLE t_preserve_drain_protocol_ps;
 SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_drain_grace_ms=30000;
+SET GLOBAL preserve_trx_drain_mode=SOFT;

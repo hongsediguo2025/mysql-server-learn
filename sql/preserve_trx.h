@@ -203,6 +203,7 @@ const Preserved_trx_column_metadata *preserved_trx_columns(size_t *count);
 const char *preserved_trx_dir_value();
 bool preserved_trx_ensure_snapshot_support();
 bool preserved_trx_validate_snapshot_support(bool allow_create_missing);
+bool preserved_trx_preflight_recoverability();
 Preserve_trx_manager_state preserved_trx_manager_state();
 bool preserved_trx_can_disable_feature();
 bool preserved_trx_try_disable_feature_for_update();
@@ -232,6 +233,8 @@ bool preserved_trx_recovery_read_failure_requires_startup_abort_for_unit_test(
 bool preserved_trx_preflight_read_failure_requires_startup_abort_for_unit_test(
     Preserve_snapshot_status status);
 bool preserved_trx_expired_reaper_claim_releases_manager_state_for_unit_test(
+    const std::string &token);
+bool preserved_trx_expired_reaper_empty_claim_keeps_manager_idle_for_unit_test(
     const std::string &token);
 bool preserved_trx_begin_command_read(THD *thd);
 bool preserved_trx_command_read_is_idle(THD *thd);

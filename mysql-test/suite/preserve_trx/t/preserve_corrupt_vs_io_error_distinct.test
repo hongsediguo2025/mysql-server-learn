@@ -15,7 +15,12 @@ CALL mtr.add_suppression("Preserved transaction .* recovery deferred cleanup: co
 CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot");
 CALL mtr.add_suppression("Preserved transaction .* recovery failed: I/O error reading durable transaction snapshot");
 CALL mtr.add_suppression("\\[FATAL\\] Preserved transaction preflight failed before InnoDB recovery could proceed");
+CALL mtr.add_suppression("Plugin initialization aborted at srv0start.cc.* with error Generic error");
+CALL mtr.add_suppression("Failed to initialize DD Storage Engine");
+CALL mtr.add_suppression("Data Dictionary initialization failed");
 CALL mtr.add_suppression("Assertion failure: ha_innodb.cc:.*ib::fatal triggered");
+CALL mtr.add_suppression("\\[FATAL\\] Error in DDL Log recovery during Post-Recovery processing");
+CALL mtr.add_suppression("Assertion failure: ut0ut.cc:.*");
 CALL mtr.add_suppression("Aborting");
 CALL mtr.add_suppression("Attempting backtrace");
 CALL mtr.add_suppression("You can use the following information to find out");

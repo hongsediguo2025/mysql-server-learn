@@ -28,6 +28,11 @@ if (!$batch_long_resume_file)
   --die batch_long_resume_file must be set
 }
 
+if (!$batch_long_restart_options)
+{
+  --let $batch_long_restart_options=
+}
+
 --disable_query_log
 --disable_result_log
 --source $batch_long_cleanup_file
@@ -67,6 +72,7 @@ while (!$batch_long_age_ready)
   --let $batch_long_age_ready= `SELECT MIN(TIMESTAMPDIFF(MICROSECOND, started_at, NOW(6))) >= 5000000 FROM t_batch_long_control`
   if (!$batch_long_age_ready)
   {
+    --sleep 1
     --dec $batch_long_age_attempts
     if (!$batch_long_age_attempts)
     {
@@ -90,7 +96,7 @@ SELECT MIN(TIMESTAMPDIFF(MICROSECOND, started_at, NOW(6))) >= 5000000
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS;
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
 
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=200 --max-connections=400" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=200 --max-connections=400 $batch_long_restart_options" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
@@ -155,7 +161,7 @@ EOF
 --let $batch_long_resume_finalize_file= $MYSQLTEST_VARDIR/tmp/batch_drain_100_long_resume_finalize.inc
 --disable_query_log
 --let $write_to_file= $batch_long_resume_finalize_file
---let $write_var= `SELECT GROUP_CONCAT(CONCAT('--connection batch_long_resume_', LPAD(token_id, 3, '0'), '\\n', 'SET @batch_long_pre_finalize_sql = COALESCE(@batch_long_pre_finalize_sql, CONCAT(CHAR(68), CHAR(79), CHAR(32), CHAR(48)));\\n', 'PREPARE batch_long_pre_finalize_stmt FROM @batch_long_pre_finalize_sql;\\n', 'EXECUTE batch_long_pre_finalize_stmt;\\n', 'DEALLOCATE PREPARE batch_long_pre_finalize_stmt;\\n', 'CALL p_batch_long_finalize();\\n', 'CALL p_batch_long_apply_end_action();\\n') ORDER BY token_id SEPARATOR '') FROM t_batch_long_tokens`
+--let $write_var= `SELECT GROUP_CONCAT(CONCAT('--connection batch_long_resume_', LPAD(token_id, 3, '0'), '\\n', 'SET @batch_long_pre_finalize_sql = COALESCE(@batch_long_pre_finalize_sql, CONCAT(CHAR(68), CHAR(79), CHAR(32), CHAR(48)));\\n', 'PREPARE batch_long_pre_finalize_stmt FROM @batch_long_pre_finalize_sql;\\n', 'EXECUTE batch_long_pre_finalize_stmt;\\n', 'DEALLOCATE PREPARE batch_long_pre_finalize_stmt;\\n', 'CALL p_batch_long_finalize();\\n', '--let ', CHAR(36), 'batch_long_end_action_value= query_get_value(SELECT @batch_long_end_action AS action, action, 1)\\n', 'if (', CHAR(36), 'batch_long_end_action_value == COMMIT) {\\nCOMMIT;\\n}\\n', 'if (', CHAR(36), 'batch_long_end_action_value == ROLLBACK) {\\nROLLBACK;\\n}\\n', 'if (', CHAR(36), 'batch_long_end_action_value == COMMIT_EXPLICIT_GTID) {\\nCOMMIT;\\nSET GTID_NEXT=AUTOMATIC;\\n}\\n', 'if (', CHAR(36), 'batch_long_end_action_value == NONE) {\\nDO 0;\\n}\\n') ORDER BY token_id SEPARATOR '') FROM t_batch_long_tokens`
 --source include/write_var_to_file.inc
 --enable_query_log
 

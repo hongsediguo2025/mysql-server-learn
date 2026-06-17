@@ -194,7 +194,6 @@ WHERE sql_text = "RESUME PRESERVED TRANSACTION '****'";
 empty_token_bare_redacted_in_slow_log
 0
 SET GLOBAL log_raw=OFF;
-include/suppress_messages.inc
 Occurrences of 'RESUME PRESERVED TRANSACTION '\*\*\*\*\?\?\?\?' in the input file: 1
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ERROR HY000: Preserved transaction was not found

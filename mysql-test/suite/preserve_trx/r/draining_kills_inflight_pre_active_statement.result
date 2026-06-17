@@ -1,6 +1,7 @@
 DROP TABLE IF EXISTS t_preserve_drain_inflight;
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_drain_mode=HARD;
+SET GLOBAL preserve_trx_drain_grace_ms=0;
 CREATE TABLE t_preserve_drain_inflight(a INT PRIMARY KEY, b INT)
 ENGINE=InnoDB;
 INSERT INTO t_preserve_drain_inflight VALUES(1,10),(2,20);
@@ -9,18 +10,18 @@ SET DEBUG_SYNC =
 UPDATE t_preserve_drain_inflight SET b=21 WHERE a=2;
 SET DEBUG_SYNC = 'now WAIT_FOR inflight_after_gate TIMEOUT 10';
 SET DEBUG_SYNC =
-'preserve_trx_after_lock_materialization SIGNAL drain_inflight_ready WAIT_FOR continue_drain_inflight';
+'preserve_trx_drain_before_kill_active SIGNAL drain_inflight_ready';
+SET DEBUG_SYNC =
+'preserve_trx_before_token_delivery SIGNAL drain_inflight_before_token WAIT_FOR continue_drain_token';
 START TRANSACTION;
 UPDATE t_preserve_drain_inflight SET b=11 WHERE a=1;
 PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
-SET DEBUG_SYNC = 'now WAIT_FOR drain_inflight_ready TIMEOUT 10';
-SET DEBUG_SYNC = 'now SIGNAL continue_inflight';
+SET DEBUG_SYNC = 'now WAIT_FOR drain_inflight_before_token TIMEOUT 10';
+KILL CONNECTION PRESERVE_ID;
+SET DEBUG_SYNC = 'now SIGNAL continue_drain_token';
 Got one of the listed errors
-KILL QUERY PRESERVE_ID;
-SET DEBUG_SYNC = 'now SIGNAL continue_drain_inflight';
-ERROR 70100: Query execution was interrupted
+Got one of the listed errors
 SET DEBUG_SYNC = 'RESET';
-ROLLBACK;
 SELECT * FROM t_preserve_drain_inflight ORDER BY a;
 a	b
 1	10
@@ -31,3 +32,5 @@ preserved_count
 0
 DROP TABLE t_preserve_drain_inflight;
 SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_drain_grace_ms=30000;
+SET GLOBAL preserve_trx_drain_mode=SOFT;

@@ -12,7 +12,7 @@ SELECT TOKEN, RECOVERED_COUNT AS recovered_count_after_first_restart
 FROM performance_schema.preserved_transactions;
 TOKEN	recovered_count_after_first_restart
 TOKEN	1
-# restart
+# restart: --preserve-trx-enable=ON
 SELECT TOKEN, RECOVERED_COUNT AS recovered_count_after_second_restart
 FROM performance_schema.preserved_transactions;
 TOKEN	recovered_count_after_second_restart

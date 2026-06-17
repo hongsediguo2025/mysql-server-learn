@@ -15,7 +15,7 @@ preserved_count_during_force_recovery
 0
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ERROR HY000: Resumable transactions across shutdown do not support this operation
-# restart
+# restart: --preserve-trx-enable=ON --innodb-force-recovery=0
 SELECT @@global.innodb_force_recovery AS force_recovery_after_normal_restart;
 force_recovery_after_normal_restart
 0

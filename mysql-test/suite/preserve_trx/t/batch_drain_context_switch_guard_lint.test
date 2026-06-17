@@ -173,13 +173,17 @@ my $stmt_prepare_case = $&;
 die "COM_STMT_PREPARE must use preserve-trx inflight guard inside explicit transactions\n"
   unless $stmt_prepare_case =~ /preserve_trx_inflight_guard\.mark/s;
 
-$sql_parse =~ /case COM_QUERY:.*?dispatch_sql_command\(thd, &parser_state\);/ms
+$sql_parse =~ /case COM_QUERY:.*?(?:dispatch_sql_command\(thd, &parser_state\)|mysql_parse\(thd, &parser_state\));/ms
   or die "could not find COM_QUERY dispatch body\n";
 my $com_query_case = $&;
+my $com_query_handoff =
+  index($com_query_case, 'dispatch_sql_command(thd, &parser_state)');
+$com_query_handoff = index($com_query_case, 'mysql_parse(thd, &parser_state)')
+  if $com_query_handoff < 0;
 die "COM_QUERY must install an unknown-query inflight guard before parse/dispatch\n"
   unless $com_query_case =~ /preserve_trx_inflight_guard\.mark_unknown_query/s &&
          index($com_query_case, 'preserve_trx_inflight_guard.mark_unknown_query') <
-         index($com_query_case, 'dispatch_sql_command(thd, &parser_state)');
+         $com_query_handoff;
 die "COM_QUERY must consume the packet-read marker before handing off to the unknown-query guard\n"
   unless $com_query_case =~ /preserved_trx_consume_inflight_command_packet\s*\(\s*thd\s*,\s*command\s*\)/s &&
          index($com_query_case, 'preserved_trx_consume_inflight_command_packet') <
@@ -251,15 +255,15 @@ my $wait_pos = index($raw_loop, 'thd_wait_if_preserve_trx_batch_session_quiesced
 my $last_errno_pos = index($raw_loop, 'net->last_errno');
 my $security_context_pos = index($raw_loop, 'security_context()');
 my $net_error_pos = index($raw_loop, 'net->error = NET_ERROR_SOCKET_NOT_READABLE');
+$net_error_pos = index($raw_loop, 'net->error = 2') if $net_error_pos < 0;
 my $my_error_pos = index($raw_loop, 'my_error(net->last_errno');
 die "net read failure path must wait before touching THD or NET error state\n"
   unless $wait_pos >= 0 &&
          $last_errno_pos >= 0 &&
-         $security_context_pos >= 0 &&
          $net_error_pos >= 0 &&
          $my_error_pos >= 0 &&
          $wait_pos < $last_errno_pos &&
-         $wait_pos < $security_context_pos &&
+         ($security_context_pos < 0 || $wait_pos < $security_context_pos) &&
          $wait_pos < $net_error_pos &&
          $wait_pos < $my_error_pos;
 

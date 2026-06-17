@@ -17,7 +17,7 @@ RECOVERED_COUNT AS recovered_count_during_grace
 FROM performance_schema.preserved_transactions;
 expires_present	default_timeout_seconds	recovered_count_during_grace
 1	1	1
-# restart
+# restart: --preserve-trx-enable=ON --preserve-trx-recovery-grace-seconds=30
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: recovery timeout expired]
 SELECT TOKEN, STATE, LAST_ERROR
 FROM performance_schema.preserved_transactions;
@@ -28,4 +28,4 @@ a	b
 1	10
 DROP TABLE t_timeout_wallclock;
 SET GLOBAL preserve_trx_enable=ON;
-# restart
+# restart: --preserve-trx-enable=OFF --skip-log-bin

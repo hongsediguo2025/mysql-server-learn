@@ -16,7 +16,7 @@ PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
 SET SESSION debug='+d,do_page_reorganize';
 INSERT INTO t_recover_record_lock_page_reorg VALUES(1000,1000,'trigger');
 SET SESSION debug='-d,do_page_reorganize';
-# restart
+# restart: --preserve-trx-enable=ON
 SELECT COUNT(*) AS preserved_count_after_page_reorganize
 FROM performance_schema.preserved_transactions;
 preserved_count_after_page_reorganize

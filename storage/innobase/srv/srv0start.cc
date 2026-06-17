@@ -117,6 +117,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "row0upd.h"
 #include "sql/preserve_trx.h"
 #include "srv0tmp.h"
+#include "trx0preserve.h"
 #include "trx0purge.h"
 #include "trx0roll.h"
 #include "trx0rseg.h"
@@ -3239,6 +3240,8 @@ void srv_pre_dd_shutdown() {
     case PURGE_STATE_STOP:
       ut_ad(0);
   }
+
+  trx_preserve_close_read_views_for_shutdown();
 
   /* After this phase plugins are asked to be shut down, in which case they
   will be marked as DELETED. Note: we cannot leave any transaction in the THD,

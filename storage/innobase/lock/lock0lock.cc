@@ -4531,6 +4531,8 @@ dberr_t lock_preserve_export_table_locks(trx_t *trx, std::string *payload,
   if (trx == nullptr) {
     return DB_ERROR;
   }
+  DBUG_EXECUTE_IF("preserve_trx_fail_export_table_locks",
+                  return DB_OUT_OF_MEMORY;);
 
   std::vector<Preserve_table_lock_entry> entries;
   uint32_t exported = 0;
@@ -7823,6 +7825,7 @@ void lock_unlock_table_autoinc(trx_t *trx) /*!< in/out: transaction */
 {
   ut_ad(!locksys::owns_exclusive_global_latch());
   ut_ad(!trx_mutex_own(trx));
+  DBUG_EXECUTE_IF("preserve_trx_keep_autoinc_lock_at_statement_end", return;);
 
   /* This can be invoked on NOT_STARTED, ACTIVE, PREPARED,
   but not COMMITTED transactions. */

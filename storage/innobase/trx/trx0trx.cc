@@ -814,7 +814,15 @@ static trx_t *trx_resurrect_insert(
       ib::info(ER_IB_MSG_1204) << "Transaction " << trx_get_id_for_print(trx)
                                << " was in the XA prepared state.";
 
-      if (srv_force_recovery == 0) {
+      const bool preserve_magic_xid = xid_is_preserve_magic(*trx->xid);
+
+      if (srv_force_recovery == 0 || preserve_magic_xid) {
+        if (srv_force_recovery > 0) {
+          ib::info(ER_IB_MSG_1205)
+              << "Since innodb_force_recovery > 0, preserved XA transaction "
+                 "will remain prepared for SQL-layer taint handling.";
+        }
+
         trx->state = TRX_STATE_PREPARED;
         ++trx_sys->n_prepared_trx;
       } else {

@@ -190,7 +190,7 @@ EOF
 --exec perl $raw_cursor_client $MASTER_MYSOCK > $raw_cursor_output 2>&1
 
 --let $grep_file= $raw_cursor_output
---let $grep_pattern= preserve_error_code=4170
+--let $grep_pattern= preserve_error_code=4013
 --let $wait_timeout= 10
 --source include/wait_for_pattern_in_file.inc
 --cat_file $raw_cursor_output

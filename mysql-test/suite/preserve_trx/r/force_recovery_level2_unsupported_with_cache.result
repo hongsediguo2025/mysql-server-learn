@@ -22,7 +22,7 @@ START TRANSACTION;
 PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 ROLLBACK;
-# restart
+# restart: --preserve-trx-enable=ON --innodb-force-recovery=0
 SELECT @@global.innodb_force_recovery AS force_recovery_after_normal_restart;
 force_recovery_after_normal_restart
 0

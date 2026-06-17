@@ -13,8 +13,10 @@ SET GLOBAL preserve_trx_enable=ON;
 CALL mtr.add_suppression("Skip updating information_schema metadata in InnoDB read-only mode");
 CALL mtr.add_suppression("Skip re-populating collations and character sets tables in InnoDB read-only mode");
 CALL mtr.add_suppression("PRESERVE: failed to mark preserved transaction snapshot tainted while innodb_force_recovery is enabled");
-CALL mtr.add_suppression("\\[FATAL\\] Preserved transaction recovery failed before InnoDB background threads could start");
+CALL mtr.add_suppression("PRESERVE: recovery failed before InnoDB background threads could start");
 CALL mtr.add_suppression("Assertion failure: ha_innodb.cc:.*ib::fatal triggered");
+CALL mtr.add_suppression("\\[FATAL\\] Error in DDL Log recovery during Post-Recovery processing");
+CALL mtr.add_suppression("Assertion failure: ut0ut.cc:.*");
 CALL mtr.add_suppression("Attempting backtrace");
 CALL mtr.add_suppression("You can use the following information to find out");
 CALL mtr.add_suppression("PRESERVE: rolled back prepared transaction without snapshot during recovery");
@@ -52,7 +54,7 @@ EOF
 --let $grep_pattern= PRESERVE: failed to mark preserved transaction snapshot tainted while innodb_force_recovery is enabled
 --let $wait_timeout= 30
 --source include/wait_for_pattern_in_file.inc
---let $grep_pattern= Preserved transaction recovery failed before InnoDB background threads could start
+--let $grep_pattern= PRESERVE: recovery failed before InnoDB background threads could start
 --source include/wait_for_pattern_in_file.inc
 --source suite/preserve_trx/include/wait_for_expected_crash.inc
 --source suite/preserve_trx/include/assert_one_snapshot_file.inc

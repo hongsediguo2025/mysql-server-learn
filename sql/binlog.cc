@@ -929,12 +929,16 @@ class binlog_cache_data {
     pending event. It corresponds to rollback statement or rollback to
     a savepoint. It doesn't change transaction state.
    */
-  void truncate(my_off_t pos) {
+  bool truncate_checked(my_off_t pos) {
     DBUG_PRINT("info", ("truncating to position %lu", (ulong)pos));
     remove_pending_event();
 
-    // TODO: check the return value.
-    (void)m_cache.truncate(pos);
+    return m_cache.truncate(pos);
+  }
+
+  void truncate(my_off_t pos) {
+    /* Legacy callers intentionally retain the historical ignore-error behavior. */
+    (void)truncate_checked(pos);
   }
 
   /**
@@ -1136,7 +1140,9 @@ class binlog_trx_cache_data : public binlog_cache_data {
         static_cast<uint64_t>(std::numeric_limits<my_off_t>::max()))
       return true;
     const my_off_t cache_length = static_cast<my_off_t>(snapshot.cache_length);
-    binlog_cache_data::truncate(cache_length);
+    if (get_byte_position() < cache_length) return true;
+
+    if (binlog_cache_data::truncate_checked(cache_length)) return true;
     binlog_cache_data::preserve_import_reactivated_transaction_state(snapshot);
     preserve_import_prev_position(snapshot);
     return false;
@@ -1538,6 +1544,8 @@ int binlog_cache_data::write_event(Log_event *ev) {
   DBUG_TRACE;
 
   if (ev != nullptr) {
+    preserve_trx_warmcopy_admit_current_thd_binlog_write(ev->thd);
+
     DBUG_EXECUTE_IF("simulate_disk_full_at_flush_pending",
                     { DBUG_SET("+d,simulate_file_write_error"); });
 
@@ -12213,6 +12221,7 @@ void binlog_prepare_row_images(const THD *thd, TABLE *table) {
 
 int THD::binlog_flush_pending_rows_event(bool stmt_end, bool is_transactional) {
   DBUG_TRACE;
+  DBUG_EXECUTE_IF("preserve_trx_fail_flush_pending_rows_event", { return 1; });
   /*
     We shall flush the pending event even if we are not in row-based
     mode: it might be the case that we left row-based mode before

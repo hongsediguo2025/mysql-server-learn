@@ -91,15 +91,14 @@ session-off-no-cache	0	20
 SELECT COUNT(*) = 20 AS explicit_gtid_next_restored
 FROM t_binlog_resume_state
 WHERE detail = 'explicit-gtid'
-   AND resumed_gtid_next LIKE '11111111-1111-1111-1111-111111111111:%';
+   AND resumed_gtid_next LIKE CONCAT(@@GLOBAL.SERVER_UUID, ':%');
 explicit_gtid_next_restored
 1
-SELECT COUNT(*) = 20 AS explicit_gtids_committed
-FROM t_batch_long_control
-WHERE case_id BETWEEN 17 AND 20
-AND GTID_SUBSET(CONCAT('11111111-1111-1111-1111-111111111111:',
-10000 + sid),
-@@GLOBAL.GTID_EXECUTED);
+SELECT COALESCE(SUM(GTID_SUBSET(resumed_gtid_next,
+@@GLOBAL.GTID_EXECUTED)), 0) = 20
+AS explicit_gtids_committed
+FROM t_binlog_resume_state
+WHERE detail = 'explicit-gtid';
 explicit_gtids_committed
 1
 SELECT COUNT(*) = 40 AS logged_cache_rows

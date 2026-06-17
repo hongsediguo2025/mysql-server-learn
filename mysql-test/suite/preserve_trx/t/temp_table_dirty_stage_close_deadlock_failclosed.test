@@ -33,6 +33,7 @@ SET DEBUG_SYNC =
 --send PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300
 
 --connection temp_dirty_close_worker
+--sleep 2
 SET DEBUG_SYNC = 'now WAIT_FOR temp_dirty_close_entered TIMEOUT 10';
 --send INSERT INTO tmp_temp_dirty_close_worker VALUES (2, 'worker-during-close-a'), (3, 'worker-during-close-b'), (4, 'worker-during-close-c'), (5, 'worker-during-close-d')
 --error ER_PRESERVE_TRX_UNSUPPORTED

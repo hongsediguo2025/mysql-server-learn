@@ -34,8 +34,8 @@ die "drained-session SQL matrix must cover ordinary SQL, transaction control, pr
          $sql_matrix =~ /RESUME PRESERVED TRANSACTION/s;
 die "drained-session matrix must include binary protocol prepared statement execute\n"
   unless $binary_ps =~ /COM_STMT_PREPARE/s &&
-         $binary_ps =~ /stmt_execute_error_code=4177/s &&
-         $binary_ps =~ /ping_error_code=4177/s;
+         $binary_ps =~ /stmt_execute_error_code=4020/s &&
+         $binary_ps =~ /ping_error_code=4020/s;
 die "drain command blocking must include indirect write paths\n"
   unless $indirect =~ /CALL p_preserve_drain_update/s &&
          $indirect =~ /EXECUTE preserve_drain_update_stmt/s &&

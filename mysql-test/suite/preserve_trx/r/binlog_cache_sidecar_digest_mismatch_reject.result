@@ -16,7 +16,7 @@ WHERE id=2;
 PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
 corrupted_same_size_binlog_cache_sidecar
 1
-# restart
+# restart: --preserve-trx-enable=ON
 SELECT COUNT(*) AS preserved_count_after_corrupt_sidecar
 FROM performance_schema.preserved_transactions;
 preserved_count_after_corrupt_sidecar

@@ -3756,6 +3756,15 @@ static void innobase_post_recover() {
     ib::fatal(ER_IB_MSG_POST_RECOVER_DDL_LOG_RECOVER);
   }
 
+  DBUG_EXECUTE_IF(
+      "preserve_trx_assert_recovered_before_purge",
+      LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: recovery completed before purge thread start"););
+  DBUG_EXECUTE_IF("preserve_trx_assert_recovered_before_recovery_rollback",
+                  LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+                         "PRESERVE: recovery completed before recovery "
+                         "rollback thread start"););
+
   srv_start_threads_after_ddl_recovery();
 }
 

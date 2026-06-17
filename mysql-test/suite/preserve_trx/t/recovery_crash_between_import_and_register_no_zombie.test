@@ -38,10 +38,7 @@ PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
 --let $grep_pattern= Preserved transaction recovery reached post-import pre-register crash point
 --let $wait_timeout= 30
 --source include/wait_for_pattern_in_file.inc
---let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
---let $grep_pattern= safe_process\\[[0-9]+\\]: Child process: [0-9]+, (exit: 1|killed by signal: 6|killed by signal: 9)
---let $wait_timeout= 30
---source include/wait_for_pattern_in_file.inc
+--source suite/preserve_trx/include/wait_for_expected_crash.inc
 --source suite/preserve_trx/include/assert_one_snapshot_file.inc
 
 --exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect

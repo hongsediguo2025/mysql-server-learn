@@ -984,9 +984,9 @@ dberr_t trx_preserve_import_read_view(trx_t *trx, const std::string &payload) {
   if (purge_state != PURGE_STATE_INIT && purge_state != PURGE_STATE_DISABLED) {
     return DB_ERROR;
   }
-  const trx_id_t next_trx_id = trx_sys_get_max_trx_id();
-  if (snapshot.low_limit_no > next_trx_id ||
-      snapshot.low_limit_id > next_trx_id) {
+  const trx_id_t next_trx_id_or_no = trx_sys_get_next_trx_id_or_no();
+  if (snapshot.low_limit_no > next_trx_id_or_no ||
+      snapshot.low_limit_id > next_trx_id_or_no) {
     return DB_ERROR;
   }
 

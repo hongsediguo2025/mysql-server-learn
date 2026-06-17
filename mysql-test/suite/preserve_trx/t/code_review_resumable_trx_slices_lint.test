@@ -112,15 +112,22 @@ die "ordinary record lock identity must not reject solely on page_n_heap drift\n
 
 die "preserved temp-table acquire must parse the final generated _preserved_space_<id>_table_<id> suffix and require an active reservation\n"
   unless $ha_innodb =~
-         /for\s*\(\s*const char \*candidate\s*=\s*std::strstr\s*\(\s*table_name,\s*marker\s*\)[\s\S]*suffix\s*=\s*candidate[\s\S]*table_suffix[\s\S]*generated_name[\s\S]*is_preserved_space_id_reserved/s;
+         /for\s*\(\s*const char \*candidate\s*=\s*(?:std::)?strstr\s*\(\s*table_name,\s*marker\s*\)[\s\S]*suffix\s*=\s*candidate[\s\S]*table_suffix[\s\S]*generated_name[\s\S]*is_preserved_space_id_reserved/s;
 
-$lock =~ /static dberr_t lock_preserve_import_one_table_lock[\s\S]*?^}/m
+$lock =~ /static dberr_t lock_preserve_resurrect_table_lock\s*\([^)]*\)\s*\{[\s\S]*?^}/m
+  or die "could not isolate lock_preserve_resurrect_table_lock\n";
+my $preserve_resurrect_table_lock = $&;
+die "preserved table-lock resurrect must fail closed instead of assert-aborting on incompatible locks\n"
+  unless $preserve_resurrect_table_lock =~
+         /lock_table_other_has_incompatible[\s\S]*return\s+DB_LOCK_WAIT\s*;/s &&
+         $preserve_resurrect_table_lock !~ /ut_a\s*\(\s*!\s*lock_table_other_has_incompatible/s;
+
+$lock =~ /static dberr_t lock_preserve_import_one_table_lock\s*\([^)]*\)\s*\{[\s\S]*?^}/m
   or die "could not isolate lock_preserve_import_one_table_lock\n";
 my $preserve_import_table_lock = $&;
-die "preserved table-lock import must fail closed instead of assert-aborting on incompatible locks\n"
+die "preserved table-lock import must delegate resurrection errors to the caller\n"
   unless $preserve_import_table_lock =~
-         /lock_preserve_resurrect_table_lock[\s\S]*return\s+err/s &&
-         $preserve_import_table_lock !~ /ut_a\s*\(\s*!\s*lock_table_other_has_incompatible/s;
+         /return\s+lock_preserve_resurrect_table_lock\s*\(\s*table\s*,\s*trx\s*,\s*mode\s*\)\s*;/s;
 
 $lock =~ /static dberr_t lock_preserve_import_record_lock[\s\S]*?^}/m
   or die "could not isolate lock_preserve_import_record_lock\n";
@@ -134,10 +141,12 @@ $lock =~ /static bool lock_preserve_append_record_image[\s\S]*?^}/m
 my $preserve_record_image = $&;
 die "record-lock export must explicitly fail closed on unsupported field-length sentinels\n"
   unless $preserve_record_image =~ /UNIV_SQL_ADD_COL_DEFAULT/s &&
-         $preserve_record_image =~ /UNIV_SQL_INSTANT_DROP_COL/s &&
          $preserve_record_image =~ /UNIV_NO_INDEX_VALUE/s &&
          $preserve_record_image =~ /UNIV_MULTI_VALUE_ARRAY_MARKER/s &&
          $preserve_record_image =~ /UNIV_EXTERN_STORAGE_FIELD/s;
+die "record-lock export must explicitly fail closed on instant-drop column sentinels when this source tree defines them\n"
+  if $lock =~ /UNIV_SQL_INSTANT_DROP_COL/s &&
+     $preserve_record_image !~ /UNIV_SQL_INSTANT_DROP_COL/s;
 
 $lock =~ /static dberr_t lock_preserve_import_predicate_lock[\s\S]*?^}/m
   or die "could not isolate lock_preserve_import_predicate_lock\n";
@@ -241,7 +250,7 @@ $trx =~ /static trx_t \*trx_resurrect_insert[\s\S]*?^}/m
 my $trx_resurrect_insert = $&;
 die "force recovery must keep preserve magic XA transactions prepared\n"
   unless $trx_resurrect_insert =~
-         /srv_force_recovery\s*==\s*0\s*\|\|[\s\S]*xid_is_preserve_magic/s &&
+         /preserve_magic_xid\s*=\s*xid_is_preserve_magic[\s\S]*srv_force_recovery\s*==\s*0\s*\|\|\s*preserve_magic_xid/s &&
          $trx_resurrect_insert =~ /\+\+trx_sys->n_prepared_trx/s;
 
 $carrier_file =~ /Preserved_trx_carrier_status read_file_limited[\s\S]*?^}/m
@@ -575,7 +584,7 @@ die "batch THD context switch must restore ATTACHING targets on early return\n"
   unless $context_switch =~ /m_generation/s &&
          $context_switch =~ /Preserve_trx_batch_thd_state::ATTACHING[\s\S]*Preserve_trx_batch_thd_state::QUIESCED/s;
 
-$preserve =~ /if\s*\(preserved_trx_resume_deadline_expired\(record\.metadata\)\)[\s\S]*?return preserve_trx_reject_unsupported\(\);/m
+$preserve =~ /if\s*\(preserved_trx_record_resume_deadline_expired\(record\)\)[\s\S]*?return preserve_trx_reject_unsupported\(\);/m
   or die "could not isolate second resume deadline branch\n";
 my $resume_deadline = $&;
 die "second resume deadline branch must preserve timeout as LAST_ERROR before rollback\n"
@@ -585,7 +594,7 @@ $preserve =~ /bool Sql_cmd_resume_preserved_transaction::execute\(THD \*thd\)[\s
   or die "could not isolate Sql_cmd_resume_preserved_transaction::execute\n";
 my $resume_execute = $&;
 my $deadline_pos = index($resume_execute,
-                         "preserved_trx_resume_deadline_expired(record.metadata)");
+                         "preserved_trx_record_resume_deadline_expired(record)");
 my $not_resumable_pos = index($resume_execute, "if (!record.resumable)");
 my $temp_preclaim_pos = index($resume_execute,
                               "preserve_trx_temp_table_preclaim_decision");
@@ -778,8 +787,9 @@ die "force recovery taint marker failure must retain snapshot evidence\n"
 my $preflight_pos = index($mysqld, 'preserved_trx_preflight_recoverability()');
 die "could not isolate startup preserve-trx preflight call\n"
   if $preflight_pos < 0;
-my $preflight_window = substr($mysqld, $preflight_pos > 300 ? $preflight_pos - 300 : 0,
-                              800);
+$mysqld =~ /if\s*\([^)]*preserved_trx_preflight_recoverability\s*\(\s*\)[^)]*\)\s*\{\s*unireg_abort/m
+  or die "could not isolate startup preserve-trx preflight condition\n";
+my $preflight_window = $&;
 die "startup preserve-trx preflight must run even when --skip-log-bin is used\n"
   if $preflight_window =~ /\bopt_bin_log\b/s;
 

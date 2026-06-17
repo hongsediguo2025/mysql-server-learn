@@ -7,8 +7,8 @@ UPDATE t_force_recovery_taint_fail SET b=11 WHERE a=1;
 PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
 # restart_abort: --preserve-trx-enable=ON --innodb-force-recovery=1 --debug=d,preserve_trx_fail_write_tainted_marker
 include/wait_for_pattern_in_file.inc [PRESERVE: failed to mark preserved transaction snapshot tainted while innodb_force_recovery is enabled]
-include/wait_for_pattern_in_file.inc [Preserved transaction recovery failed before InnoDB background threads could start]
-include/wait_for_pattern_in_file.inc [safe_process\[[0-9]+\]: Child process: [0-9]+, (exit: 1|killed by signal: 6)]
+include/wait_for_pattern_in_file.inc [PRESERVE: recovery failed before InnoDB background threads could start]
+include/wait_for_expected_crash.inc [safe_process]
 SELECT COUNT(*) AS preserved_count_after_failed_taint
 FROM performance_schema.preserved_transactions;
 preserved_count_after_failed_taint

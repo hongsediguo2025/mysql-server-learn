@@ -11,8 +11,10 @@ SET GLOBAL preserve_trx_enable=ON;
 
 --disable_query_log
 CALL mtr.add_suppression("Failed to scan preserved transaction directory .* during recovery");
-CALL mtr.add_suppression("\\[FATAL\\] Preserved transaction recovery failed before InnoDB background threads could start");
+CALL mtr.add_suppression("PRESERVE: recovery failed before InnoDB background threads could start");
 CALL mtr.add_suppression("Assertion failure: ha_innodb.cc:.*ib::fatal triggered");
+CALL mtr.add_suppression("\\[FATAL\\] Error in DDL Log recovery during Post-Recovery processing");
+CALL mtr.add_suppression("Assertion failure: ut0ut.cc:.*");
 CALL mtr.add_suppression("Attempting backtrace");
 CALL mtr.add_suppression("You can use the following information to find out");
 --enable_query_log

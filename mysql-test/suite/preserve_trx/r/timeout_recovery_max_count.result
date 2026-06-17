@@ -12,7 +12,7 @@ SELECT TOKEN, RECOVERED_COUNT AS recovered_count_after_first_restart
 FROM performance_schema.preserved_transactions;
 TOKEN	recovered_count_after_first_restart
 TOKEN	1
-# restart
+# restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=2
 include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: recovery max count exceeded]
 SELECT TOKEN, STATE, LAST_ERROR
 FROM performance_schema.preserved_transactions;
@@ -23,4 +23,4 @@ a	b
 1	10
 DROP TABLE t_recovery_max_count;
 SET GLOBAL preserve_trx_enable=ON;
-# restart
+# restart: --preserve-trx-enable=OFF --skip-log-bin
