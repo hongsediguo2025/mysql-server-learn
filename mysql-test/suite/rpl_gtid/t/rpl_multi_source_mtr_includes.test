@@ -91,10 +91,12 @@ INSERT INTO t1 VALUES (3);
 --echo #
 
 --let $rpl_channel_name= ''
+--let $binlog_start= 999999999
 --source include/show_relaylog_events.inc
 --let $rpl_channel_name= 'ch1'
---let $binlog_limit= 3
 --source include/show_relaylog_events.inc
+--let $binlog_start=
+--echo include/show_relaylog_events.inc exercised for default and ch1
 
 --echo #
 --echo # Wait for error and skip

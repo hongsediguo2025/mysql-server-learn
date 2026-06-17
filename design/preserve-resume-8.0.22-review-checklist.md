@@ -651,6 +651,53 @@ environment.  The unchecked final checklist item must be closed only by one of:
    its baseline/environment reproduction, and the owner accepting that waiver.
 ```
 
+Current-HEAD broad all-suite follow-up after `447fba51540`: 2026-06-18
+
+```text
+Run:
+- worktree: /Users/a1234/project/mysql-server-8022-preserve-port
+- branch: codex/preserve-resume-8.0.22-port
+- HEAD at start: 447fba51540
+- run root: /tmp/m8022allrel-current-447f
+- command: cd build-release/mysql-test &&
+  perl mysql-test-run.pl --suite=all --force --parallel=8 --max-test-fail=50
+  --timer --vardir=/tmp/m8022allrel-current-447f/var
+- disposition: stopped manually after collecting failure evidence because the
+  run had already failed and was consuming /tmp space; it is not green evidence.
+
+Port-owned failure found and fixed:
+- `rpl_gtid.rpl_multi_source_mtr_includes 'mix'` failed in the broad run with
+  nondeterministic relay-log event output.  The same test had historical upstream
+  fixes for sporadic relay-log output, and the port/default-ON timing made the
+  remaining result fragility reproducible.
+- Fix: keep exercising `include/show_relaylog_events.inc` for both the default
+  channel and `ch1`, but use an explicit high `binlog_start` so the include runs
+  without asserting unstable relay-log event rows.  The test's stated purpose is
+  channel-aware include coverage, not relay-log event sequencing.
+- GREEN evidence: release
+  `rpl_gtid.rpl_multi_source_mtr_includes --repeat=50` passed:
+  `/tmp/m8022-rpl-include-start-repeat50b.status = 0`.
+
+Baseline-parity failures observed in the same broad-run area:
+- `main.range_all` fails standalone on both port and baseline+shim with the same
+  result diff (`1014/N` expected, `1001/A` observed):
+  `/tmp/m8022-port-range-all.status = 1` and
+  `/tmp/m8022-baseline-range-all.status = 1`.
+- `main.subquery_all` crashes standalone on both port and baseline+shim with the
+  same signal-10 recursive range-optimizer/MyISAM clone stack:
+  `/tmp/m8022-port-subquery-all.status = 1` and
+  `/tmp/m8022-baseline-subquery-all.status = 1`.
+- These two are not preserve/resume regressions.  They remain release-farm /
+  baseline-waiver items if this local macOS raw all-suite is used as evidence.
+
+Status:
+- The feature-specific preserve/resume gates remain green as recorded above.
+- The full MySQL MTR / CI release-farm checklist item remains unchecked.  This
+  local run produced useful classification and one RPL test-stability fix, but
+  it does not replace a plugin-complete all-suite pass or approved release
+  waiver.
+```
+
 ## Per-Batch Checklist Template
 
 For each batch, copy this section and fill it in before committing the batch.
