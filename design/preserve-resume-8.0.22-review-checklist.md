@@ -348,8 +348,9 @@ Resolution:
   so the source branch `std::string_view` signature was adapted.
 - 8.0.22 requires `my_thread_local.h` for the `my_errno()` accessor used by
   mysys file helpers.
-- The port still defaults `preserve_trx_enable=OFF` as a staging guard; the
-  final default-ON release contract remains a later explicit batch.
+- Earlier batches used explicit-OFF staging guards.  The current release
+  contract and full-gate evidence are default ON for both `preserve_trx_enable`
+  and `preserve_trx_temp_table_enable`.
 Commit:
 - Created in this batch; use `git log --oneline -1` for the final amended
   commit hash.
@@ -358,23 +359,23 @@ Commit:
 ## Final Review Checklist
 
 - [ ] 5 independent full-review sub agents completed.
-- [ ] All 123 source commits represented or explicitly superseded.
-- [ ] All 239 MTR `.test` files migrated, adapted, or explicitly deferred.
-- [ ] All 240 changed `.result` files migrated, adapted, or explicitly deferred.
-- [ ] All 4 preserve gunit files migrated.
-- [ ] Python E2E and benchmark scripts migrated and run.
-- [ ] Python unit tests migrated and run.
+- [x] All 123 source commits represented or explicitly superseded.
+- [x] All 544 tracked test-manifest assets migrated, adapted, or explicitly
+  superseded.
+- [x] All 4 preserve gunit files migrated.
+- [x] Python E2E and benchmark scripts migrated and run.
+- [x] Python unit tests migrated and run.
 - [ ] 30 explicit conflict files reviewed.
 - [ ] 66 changed-both files reviewed.
 - [ ] Feature-off behavior remains equivalent to original 8.0.22.
 - [ ] Warm-copy behavior is isolated and verified.
 - [ ] User temporary table behavior is isolated and verified.
 - [ ] No `.result` update masks a product bug.
-- [ ] Final debug/release build gates passed.
-- [ ] Final debug/release gunit gates passed, including `trx0preserve-t`.
-- [ ] Final debug/release preserve_trx MTR gates passed with log-bin and no-bin.
-- [ ] Final debug/release preserve_trx big-test gates passed.
-- [ ] Final perfschema `dml_handler` targeted gates passed.
-- [ ] Final Python E2E, benchmark, and Python unit-test gates passed.
+- [x] Final debug/release build gates passed.
+- [x] Final debug/release gunit gates passed, including `trx0preserve-t`.
+- [x] Final debug/release preserve_trx MTR gates passed with log-bin and no-bin.
+- [x] Final debug/release preserve_trx big-test gates passed.
+- [x] Final perfschema `dml_handler` targeted gates passed.
+- [x] Final Python E2E, benchmark, and Python unit-test gates passed.
 - [ ] Full MySQL MTR or CI/release farm gate passed.
 - [ ] Any excluded baseline failures reproduced on untouched `mysql-8.0.22`.

@@ -29,10 +29,11 @@ The audit answers two questions:
 ## Current Result
 
 No missing preserve/resume kernel object was identified by this audit.  The
-remaining risk is bookkeeping: historical source/test manifests still contain
-many `pending` rows and must be gradually converted into per-commit/per-test
-status.  That ledger debt is separate from the current code/test gate, which is
-recorded in `design/preserve-resume-8.0.22-review-checklist.md`.
+follow-up ledger work has also been closed: the source commit manifest now marks
+all 123 source commits as represented by the 8.0.22 adapted port stack, and the
+test manifest now classifies every tracked asset as moved or superseded.  The
+current code/test gate is recorded in
+`design/preserve-resume-8.0.22-review-checklist.md`.
 
 ## File-Level Delta Check
 
@@ -358,17 +359,16 @@ Key evidence paths:
 - `/tmp/preserve-8022-fullgate-1781667266/longrun-smoke-latest`
 - `/tmp/preserve-8022-longrun-full320-allbuckets-fix2-1781666099`
 
-## Follow-Up Ledger Work
+## Ledger Closure
 
-This audit does not replace the generated commit/test manifests.  The next
-ledger cleanup should convert the historical `pending` rows in
-`design/preserve-resume-8.0.22-commit-manifest.md` and
-`design/preserve-resume-8.0.22-test-manifest.md` into one of:
+This audit does not replace the generated commit/test manifests.  As of target
+commit `55e04bbb565`, those manifests have been closed:
 
-- `ported`
-- `ported-with-8.0.22-adaptation`
-- `superseded`
-- `deferred`
-- `obsolete`
+- `design/preserve-resume-8.0.22-commit-manifest.md`: 123 rows, all `ported`.
+- `design/preserve-resume-8.0.22-test-manifest.md`: 544 rows, 444
+  `moved-round-b` and 100 `superseded`.
+
+Any future preserve/resume hardening imported into this 8.0.22 branch must
+update the manifests again instead of reintroducing open-ended `pending` rows.
 
 Each converted row should cite a target commit, test, or this audit document.
