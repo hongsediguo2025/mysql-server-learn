@@ -14,6 +14,24 @@ branch: codex/preserve-resume-8.0.22-port
 evidence baseline HEAD before this doc-only handoff: 2d35914e6f8
 ```
 
+## Draft PR Entry
+
+A draft PR now exists for release-owner review and release-farm handoff:
+
+```text
+url: https://github.com/hongsediguo2025/mysql-server-learn/pull/1
+state: open draft
+base: codex/mysql-8.0.22-port-base
+base SHA: ee4455a33b10f1b1886044322e4893f587b319ed
+head: codex/preserve-resume-8.0.22-port
+head SHA at PR creation: 6f0ce733a1bdd5327a14375d41b87c9bc02dabab
+mergeable at creation: true
+size at creation: 84 commits, 1092 changed files
+```
+
+The base branch is intentionally `codex/mysql-8.0.22-port-base`, not `trunk`;
+the port branch is based on `mysql-8.0.22`.
+
 ## Completed Local Gates
 
 The detailed evidence is recorded in

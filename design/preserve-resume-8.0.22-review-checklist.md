@@ -1017,6 +1017,15 @@ Commit:
   clang/libc++ toolchain; the fully untouched baseline cannot build on this
   host.
 
+Draft PR / release-owner entry:
+- URL: https://github.com/hongsediguo2025/mysql-server-learn/pull/1
+- Base: `codex/mysql-8.0.22-port-base`
+  (`ee4455a33b10f1b1886044322e4893f587b319ed`).
+- Head: `codex/preserve-resume-8.0.22-port`.
+- Status at creation: open draft, mergeable, no GitHub status/check context.
+- The PR must remain draft until the full MySQL MTR / CI release-farm gate is
+  passed or an explicit release-owner waiver is accepted.
+
 Final checklist evidence refresh after `ba5f5a14fdb`:
 
 ```text
