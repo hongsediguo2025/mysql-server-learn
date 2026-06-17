@@ -94,18 +94,18 @@ This should only be closed by one of:
 Local raw all-suite attempts are useful for triage, but they are not currently
 green release evidence on this macOS host.
 
-Current remote CI availability check on 2026-06-18:
+Remote CI availability check on 2026-06-18:
 
 ```text
 branch:
-  mxx/codex/preserve-resume-8.0.22-port =
+  mxx/codex/preserve-resume-8.0.22-port was checked at =
   c8a629878528f047f51369c6a4dc2dc41340cbec
 
 GitHub PR:
   https://github.com/hongsediguo2025/mysql-server-learn/pull/1
   state=open draft
   mergeable=true
-  head=c8a629878528f047f51369c6a4dc2dc41340cbec
+  checked head=c8a629878528f047f51369c6a4dc2dc41340cbec
   release-owner action comment id=4733460926
 
 GitHub combined status for c8a629878528:
@@ -114,6 +114,11 @@ GitHub combined status for c8a629878528:
 repository workflows:
   no tracked .github/workflows files in this checkout
 ```
+
+This documentation-only handoff refresh may advance the PR head; use the PR head
+ref as authoritative for the exact latest commit. The absence of automatic
+GitHub status/check context was observed for the checked head and still requires
+external release-farm or release-owner action.
 
 So this branch currently has no automatic GitHub status/check context that can
 close the release gate. The final gate still requires an explicit release-farm
