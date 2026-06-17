@@ -1042,6 +1042,16 @@ Latest plugin-available local full all-suite refresh:
 - This is stronger local integration evidence, but it still does not close the
   final full-MySQL gate because the 49 remaining failures are not all
   baseline-waived by the release owner.
+- Set comparison and targeted reproduction now cover all 49 final failures:
+  45 are in `/tmp/m8022-baseline-49fail-repro2/run.log`, 3 `engines/rr_trx`
+  failures are in `/tmp/m8022-baseline-rrtrxfail-repro/run.log`, and the only
+  new outlier `main.grant_user_lock` fails identically on both port and
+  baseline+shim:
+  `/tmp/m8022-port-grant-user-lock-targeted/status = 1` and
+  `/tmp/m8022-baseline-grant-user-lock-targeted/status = 1`.
+- The local classification package is therefore waiver-ready for the release
+  owner, but the final gate remains unchecked until that waiver is explicitly
+  accepted or a release-farm all-suite pass is provided.
 
 Final checklist evidence refresh after `ba5f5a14fdb`:
 

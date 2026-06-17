@@ -207,6 +207,37 @@ The final full-MySQL gate remains open until those failures are either absent in
 a release-farm all-suite pass or explicitly classified/waived by the release
 owner against an acceptable baseline.
 
+Local baseline coverage for this final failing list:
+
+```text
+current all-suite failing tests: 49
+covered by previous baseline reproduction:
+  /tmp/m8022-baseline-49fail-repro2/run.log -> 45 tests
+covered by previous baseline rr_trx reproduction:
+  /tmp/m8022-baseline-rrtrxfail-repro/run.log -> 3 tests
+new outlier:
+  main.grant_user_lock
+
+targeted port reproduction:
+  /tmp/m8022-port-grant-user-lock-targeted/status = 1
+
+targeted baseline reproduction:
+  /tmp/m8022-baseline-grant-user-lock-targeted/status = 1
+```
+
+`main.grant_user_lock` fails with the same error on the port and the
+`mysql-8.0.22` baseline plus local compiler shim:
+
+```text
+connect anonymous_user_con, localhost, '', pass
+ERROR 1045 (28000): Access denied for user 'root'@'localhost'
+```
+
+So the 49 failures from `/tmp/m8022allrel-final-20260618005336` are all covered
+by baseline reproduction or targeted baseline reproduction. This still is not a
+green full all-suite result; it is a waiver-ready classification package for the
+release owner.
+
 ## Current Local Baseline-Parity Blockers
 
 The latest local broad all-suite attempt after `447fba51540` was stopped after
