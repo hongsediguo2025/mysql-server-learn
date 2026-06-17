@@ -93,6 +93,26 @@ class PreserveTrxMtrAcceleratorTest(unittest.TestCase):
         heavy_tests = {tuple(shard.tests) for shard in heavy_shards}
         self.assertIn(("multi_session_100_resume",), heavy_tests)
         self.assertTrue(all(shard.parallel == 1 for shard in heavy_shards))
+        self.assertTrue(all("--max-connections=512" in shard.command
+                            for shard in heavy_shards))
+
+    def test_all_shards_get_configured_connection_limit(self):
+        tmp = self.make_repo()
+        self.addCleanup(tmp.cleanup)
+
+        plan = build_execution_plan(MtrAcceleratorConfig(
+            repo_root=Path(tmp.name),
+            build_profile="debug",
+            build_dir=Path(tmp.name) / "build-debug",
+            mode="normal",
+            big_test=True,
+            dry_run=True,
+            max_connections=640,
+        ))
+
+        self.assertTrue(plan.shards)
+        self.assertTrue(all("--max-connections=640" in shard.command
+                            for shard in plan.shards))
 
     def test_latency_threshold_100_session_tests_are_exclusive(self):
         tmp = self.make_repo()

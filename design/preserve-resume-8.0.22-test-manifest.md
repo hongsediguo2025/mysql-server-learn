@@ -15,6 +15,44 @@ real topology checks were added upstream.  The 8.0.22 port now also carries:
   this is collected by MTR and skips when the Group Replication plugin is not
   available in the local build.
 
+## Current Full-Gate Evidence
+
+The 2026-06-17 full gate used the accelerated runner and keeps behavior MTR
+coverage separate from source-lint coverage:
+
+- Release behavior MTR, default-ON normal-binlog plus `--skip-log-bin`:
+  `/tmp/preserve-8022-fullgate-1781667266/mtr-release/20260617-114253`,
+  status `pass`, 46 shards, 384 shard-scheduled behavior tests, and 157
+  debug-only expected skips.
+- Debug behavior MTR, default-ON normal-binlog plus `--skip-log-bin`:
+  `/tmp/preserve-8022-fullgate-1781667266/mtr-debug/20260617-120623`,
+  status `pass`, 48 shards, 698 shard-scheduled behavior tests, no expected
+  skips.
+- Source lint runner: `python3 scripts/preserve_trx_lint_runner.py --repo-root .`
+  passed 17 rules with zero findings.  These `_lint` checks are static review
+  guards and are not counted as behavior MTR coverage.
+- Python unit suite:
+  `scripts.tests.test_preserve_trx_lint_runner`,
+  `scripts.tests.test_preserve_trx_mtr_accelerator`,
+  `scripts.tests.test_resumable_trx_business_e2e`,
+  `scripts.tests.test_resumable_trx_longrun_e2e`,
+  `scripts.tests.test_resumable_trx_crash_fuzz`, and
+  `scripts.tests.test_resumable_trx_nfr2_benchmark` ran 271 tests and passed.
+- Latest-head live E2E smoke:
+  32-session deterministic binlog equivalence passed with
+  `--canonical-binlog-transaction-order`, 3 cycles, and 9600 statements;
+  32-session two-phase warmcopy passed with 1/16/64 MiB buckets and
+  `capture_only` binlog recording; 32-session reduced semantic matrix passed
+  with 2 cycles and 6400 statements.
+- Longrun evidence:
+  latest-head smoke controller/audit passed at
+  `/tmp/preserve-8022-fullgate-1781667266/longrun-smoke-latest`;
+  full 320-session soak passed at
+  `/tmp/preserve-8022-longrun-full320-allbuckets-fix2-1781666099` with
+  3 cycles, 320 workers, 1/16/64 MiB bucket coverage, validation/resource/
+  contract `pass`, and `capture_only` binlog validation mode.  That full run is
+  soak/resource/resume evidence, not binlog-equivalence evidence.
+
 ## MTR Test Files
 
 | Source path | Expected result path | Proposed batch | Migration state | 8.0.22 note |

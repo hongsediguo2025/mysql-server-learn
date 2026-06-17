@@ -27,6 +27,7 @@ DEFAULT_RUN_ROOT = Path("/tmp/preserve-mtr-shards")
 DEFAULT_FAST_PARALLEL = 6
 DEFAULT_MAX_HEAVY_100 = 2
 DEFAULT_MEDIUM_SHARDS = 4
+DEFAULT_MAX_CONNECTIONS = 512
 PORT_BASE_START = 17000
 PORT_BASE_STEP = 50
 
@@ -57,6 +58,7 @@ class MtrAcceleratorConfig:
     big_test: bool = False
     jobs: int = os.cpu_count() or 4
     max_heavy_100: int = DEFAULT_MAX_HEAVY_100
+    max_connections: int = DEFAULT_MAX_CONNECTIONS
     include_mtr_lint: bool = False
     dry_run: bool = False
     run_root: Path = DEFAULT_RUN_ROOT
@@ -256,6 +258,7 @@ def _make_shard(
         f"--vardir={vardir}",
         f"--port-base={PORT_BASE_START + seq * PORT_BASE_STEP}",
         f"--parallel={parallel}",
+        f"--max-connections={config.max_connections}",
         "--force",
         "--retry=0",
         "--timer",
@@ -538,6 +541,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     parser.add_argument("--max-heavy-100", type=int,
                         default=DEFAULT_MAX_HEAVY_100)
+    parser.add_argument("--max-connections", type=int,
+                        default=DEFAULT_MAX_CONNECTIONS)
     parser.add_argument("--include-mtr-lint", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--run-root", type=Path, default=DEFAULT_RUN_ROOT)
@@ -555,6 +560,7 @@ def _config_from_args(args: argparse.Namespace) -> MtrAcceleratorConfig:
         big_test=args.big_test,
         jobs=args.jobs,
         max_heavy_100=args.max_heavy_100,
+        max_connections=args.max_connections,
         include_mtr_lint=args.include_mtr_lint,
         dry_run=args.dry_run,
         run_root=args.run_root,
