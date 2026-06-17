@@ -206,6 +206,14 @@ business-live hold fix:
     and buckets `[1, 16, 64]`.
   - 3 DRAIN/RESUME cycles, 320 preserved transactions per cycle,
     completed_stmt_total=96000.
+
+Perfschema targeted gate:
+- debug `perfschema.dml_handler`:
+  `/tmp/preserve-8022-pfs-dml-handler-1781682603/debug.status = 0`
+  and `Completed: All 2 tests were successful.`
+- release `perfschema.dml_handler`:
+  `/tmp/preserve-8022-pfs-dml-handler-1781682603/release.status = 0`
+  and `Completed: All 2 tests were successful.`
 ```
 
 ## Per-Batch Checklist Template
@@ -507,7 +515,7 @@ Commit:
   with log-bin and no-bin.
 - [x] Final debug/release preserve_trx big-test gates passed on exact current
   HEAD.
-- [ ] Final perfschema `dml_handler` targeted gates passed on exact current
+- [x] Final perfschema `dml_handler` targeted gates passed on exact current
   HEAD.
 - [x] Final Python unit-test gates passed on exact current HEAD.
 - [x] Final live Python E2E and benchmark gates passed on exact current HEAD.
