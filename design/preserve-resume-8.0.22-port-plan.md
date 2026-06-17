@@ -567,6 +567,12 @@ count, seed, and profile. `capture_only` longrun evidence counts for soak,
 resource, and resume lifecycle validation only. Binlog equivalence evidence must
 come from deterministic short-cycle compare or explicit expected binlog events.
 
+The current port branch also maintains a live release-gate handoff in
+`design/preserve-resume-8.0.22-release-gate-handoff.md`. If local full MySQL MTR
+cannot be used as release evidence, that handoff is the authoritative place to
+record baseline-parity failures, release-farm requirements, accepted waivers, and
+the evidence needed before checking off the final full-MySQL gate.
+
 ### GA and nightly evidence
 
 Before GA:
