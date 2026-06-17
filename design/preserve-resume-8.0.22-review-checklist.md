@@ -411,6 +411,151 @@ Static hygiene:
 - `git diff --check` passed after the port hygiene fixes.
 ```
 
+## Broad All-Suite Perfschema Coverage Follow-Up: 2026-06-17
+
+This section records the first broad `--suite=all` release rerun after the
+8.0.22 full-build compatibility fixes.  It separates port-owned failures from
+failures reproduced on a clean `mysql-8.0.22` baseline with the local compiler
+shim needed by this macOS toolchain.
+
+```text
+Release all-suite attempt:
+- run root: /tmp/m8022allrel4
+- command: perl mysql-test-run.pl --suite=all --force --parallel=8
+  --max-test-fail=50 --timer --vardir=/tmp/m8022allrel4/var
+- result: status 1, stopped at 50 failures after 4246 executed tests and
+  3065 skipped tests; 98.82% successful.
+
+Baseline reproduction:
+- baseline worktree: /Users/a1234/project/mysql-server-8022-baseline
+- baseline: mysql-8.0.22 tag plus the existing local compiler shim required
+  to build this old release on the current libc++ toolchain.
+- command reran the 49 non-`perfschema.all_tests` failures from the port run
+  under the baseline build with --force/--parallel=4.
+- result: /tmp/m8022-baseline-49fail-repro2/status = 1, with 45 failures
+  reproduced on baseline.  These are classified as current macOS/toolchain or
+  8.0.22 baseline result differences, not preserve/resume port failures.
+
+Port-owned failures from the all-suite attempt:
+- `perfschema.all_tests`
+- `perfschema.information_schema`
+- `perfschema.nesting`
+- `perfschema.privilege_table_io`
+- `perfschema.schema`
+
+Fix:
+- Added the missing PFS table coverage files for
+  `performance_schema.preserved_transactions`:
+  `ddl_preserved_transactions`, `dml_preserved_transactions`, and
+  `idx_preserved_transactions`.
+- Re-recorded PFS inventory/result files that are expected to enumerate the new
+  PFS table: `information_schema.result` and `schema.result`.
+- Re-recorded `privilege_table_io.result` for the extra deterministic
+  `mysql.global_grants` fetch caused by the preserve/resume dynamic privilege.
+- Re-recorded `nesting.result` for default-ON preserve/resume command-boundary
+  instrumentation.  The added rows are `THD::LOCK_thd_data` waits visible to
+  this PFS nesting test because it explicitly instruments that mutex; this is
+  expected default-ON PFS behavior, not a source-shape or lint-only check.
+
+Targeted GREEN evidence:
+- `build-release/mysql-test/mtr --record --suite=perfschema
+  ddl_preserved_transactions dml_preserved_transactions
+  idx_preserved_transactions` passed:
+  /tmp/m8022-pfs-preserved-record.status = 0.
+- `build-release/mysql-test/mtr --suite=perfschema
+  ddl_preserved_transactions dml_preserved_transactions
+  idx_preserved_transactions all_tests` passed:
+  /tmp/m8022-pfs-preserved-targeted.status = 0.
+- `build-release/mysql-test/mtr --record --suite=perfschema
+  information_schema schema nesting privilege_table_io` passed:
+  /tmp/m8022-pfs-portonly-record.status = 0.
+- `build-release/mysql-test/mtr --suite=perfschema
+  ddl_preserved_transactions dml_preserved_transactions
+  idx_preserved_transactions information_schema schema nesting
+  privilege_table_io all_tests` passed:
+  /tmp/m8022-pfs-final-targeted.status = 0.
+
+Follow-up broad rerun after the perfschema fix:
+- run root: /tmp/m8022allrel5
+- command: perl mysql-test-run.pl --suite=all --force --parallel=8
+  --max-test-fail=60 --timer --vardir=/tmp/m8022allrel5/var
+- result: /tmp/m8022allrel5/full.status = 1; stopped at 59 failures after
+  4222 executed tests and 3059 skipped tests; 98.60% successful.
+- Preserve/resume broad-run signals inside this run included passing
+  replication, binlog/GTID, object-privilege, record-lock, savepoint,
+  temp-DML fail-closed, timeout/recovery, and resume cleanup tests such as
+  `rpl_preserve_trx_reject_and_apply`,
+  `preserve_trx.preserve_object_privilege_recheck`,
+  `preserve_trx.record_lock_supremum_gap_preserve_resume`,
+  `preserve_trx.timeout_recovery_max_count`, and
+  `preserve_trx.resume_success_removes_temp_sidecars`.
+- `perfschema.all_tests`, `ddl_preserved_transactions`,
+  `dml_preserved_transactions`, and `idx_preserved_transactions` passed in
+  the broad run.
+- `perfschema.information_schema` failed once and was scheduled for retry, but
+  was not in the final failing test list.  The targeted perfschema gate above
+  remains the authoritative evidence for the new table metadata.
+
+Failure classification:
+- The 45 failures from the previous baseline reproduction remained present.
+- The 14 additional failures were all in `engines/rr_trx` and were reproduced
+  on the clean `mysql-8.0.22` baseline with the local compiler shim:
+  /tmp/m8022-baseline-rrtrxfail-repro/status = 1, with 14/15 tests failed.
+- Set comparison result: all 59 final all-suite failures are covered by
+  `baseline-49fail-repro2` plus `baseline-rrtrxfail-repro`; unclassified
+  port-only failures: 0.
+- This is not a green MySQL all-suite release claim.  It is a port-disposition
+  finding: after the perfschema fix, the broad release all-suite failures seen
+  locally are reproducible on the 8.0.22 baseline or current macOS/toolchain
+  environment and are not preserve/resume-specific.
+
+Exact-current broad rerun after the final perfschema result edits:
+- `/tmp/m8022allrel6` was stopped and discarded as broad evidence because the
+  run hit `No space left on device`; its later failures were polluted by the
+  exhausted `/tmp` filesystem.
+- run root: /tmp/m8022allrel7
+- command: perl mysql-test-run.pl --suite=all --force --parallel=8
+  --max-test-fail=60 --timer --vardir=/tmp/m8022allrel7/var
+- result: /tmp/m8022allrel7/full.status = 1; stopped at 60 failures after
+  4395 executed tests and 3109 skipped tests; 98.63% successful.
+- Set comparison against `/tmp/m8022-baseline-49fail-repro2/run.log` and
+  `/tmp/m8022-baseline-rrtrxfail-repro/run.log` found 59 baseline-covered
+  failures and one remaining port-owned failure:
+  `perfschema.table_schema`.
+- `perfschema.table_schema` failed because it is a schema snapshot test and
+  the new `performance_schema.preserved_transactions` table was not yet
+  recorded there.  The fix re-recorded `table_schema.result` with the 29
+  `preserved_transactions` columns.
+- Targeted release PFS regression after the `table_schema` fix passed:
+  `/tmp/m8022-pfs-after-table-schema.status = 0`, with all 10 tests
+  successful:
+  `information_schema`, `schema`, `table_schema`, `nesting`,
+  `privilege_table_io`, `ddl_preserved_transactions`,
+  `dml_preserved_transactions`, `idx_preserved_transactions`, and `all_tests`.
+
+Exact-current broad rerun after the `table_schema` fix:
+- run root: /tmp/m8022allrel8
+- command: perl mysql-test-run.pl --suite=all --force --parallel=8
+  --max-test-fail=60 --timer --vardir=/tmp/m8022allrel8/var
+- result: /tmp/m8022allrel8/full.status = 1; stopped at 60 failures after
+  4419 executed tests and 3123 skipped tests; 98.64% successful.
+- `perfschema.table_schema` was no longer in the final failing test list.
+- Set comparison against `/tmp/m8022-baseline-49fail-repro2/run.log` and
+  `/tmp/m8022-baseline-rrtrxfail-repro/run.log` found one final-list outlier:
+  `rpl.rpl_start_slave_after_restart_initialized_slave`.
+- That RPL outlier is not a preserve/resume code-path failure in targeted
+  reproduction: both the port and baseline builds passed the test once and
+  under `--repeat=5`:
+  - port targeted: /tmp/m8022-port-rpl-start-slave-targeted/status = 0.
+  - baseline targeted: /tmp/m8022-baseline-rpl-start-slave-targeted/status = 0.
+  - port repeat5: /tmp/m8022-port-rpl-start-slave-repeat5/status = 0.
+  - baseline repeat5: /tmp/m8022-baseline-rpl-start-slave-repeat5/status = 0.
+- Disposition after allrel8: the port-owned PFS schema failure found by the
+  broad run was fixed and covered by targeted PFS regression.  The remaining
+  all-suite failures are either baseline-covered or the RPL broad-run outlier
+  above, which passed repeated targeted checks on both port and baseline.
+```
+
 ## Per-Batch Checklist Template
 
 For each batch, copy this section and fill it in before committing the batch.

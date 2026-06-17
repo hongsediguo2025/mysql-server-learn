@@ -75,6 +75,7 @@ objects_summary_global_by_type
 performance_timers
 persisted_variables
 prepared_statements_instances
+preserved_transactions
 processlist
 replication_applier_configuration
 replication_applier_filters
