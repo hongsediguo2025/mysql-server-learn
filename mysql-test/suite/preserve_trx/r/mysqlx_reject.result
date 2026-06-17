@@ -17,7 +17,7 @@ RUN UPDATE xtest.t_mysqlx_reject SET b=11 WHERE a=1;
 1 rows affected
 Rows matched: 1  Changed: 1  Warnings: 0
 RUN PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
-Got expected error: Resumable transactions across shutdown do not support this operation (code 4170)
+Got expected error: Command not supported by pluggable protocols (code 3130)
 RUN SELECT COUNT(*) AS preserved_count FROM performance_schema.preserved_transactions;
 preserved_count
 0
@@ -33,4 +33,5 @@ Mysqlx.Ok {
   msg: "bye!"
 }
 ok
+DROP SCHEMA xtest;
 SET GLOBAL preserve_trx_enable=ON;

@@ -324,6 +324,93 @@ GREEN evidence:
   XML, and test lists remain.
 ```
 
+## 8.0.22 Port Hygiene and Preserve MTR Refresh: 2026-06-17
+
+This section records the follow-up after running broader 8.0.22 release MTR
+coverage against the port.  The broad all-suite run exposed missing release
+test artifacts/plugins and several 8.0.22 baseline result differences.  The
+preserve/resume feature-specific gates below are exact-current after the
+targeted result/test updates in this patch set.
+
+```text
+Branch and HEAD:
+- branch: codex/preserve-resume-8.0.22-port
+- HEAD before this patch set: 12014454606
+
+Release build/test artifact preparation:
+- Full release build still fails in the unrelated MySQL Router harness
+  `executor_work_guard<Executor>` compilation path.
+- Targeted release test artifacts required by MTR were built successfully:
+  MTR plugins, `mock`, components, test service plugins, mysql_client_test,
+  mysql_secure_installation, and related runtime_output_directory tools.
+
+Broad release all-suite disposition:
+- Earlier release all-suite run stopped after 50 failures.
+- Missing plugin/tool failures were resolved by targeted artifact builds and
+  verified with focused reruns.
+- Remaining 8 failures reproduced with
+  `--preserve-trx-enable=OFF --preserve-trx-temp-table-enable=OFF`:
+  `main.subquery_sj_all`, `main.join_cache_bka`,
+  `main.subquery_sj_all_bka`, `main.subquery_sj_all_bka_nobnl`,
+  `perfschema.error_log`, `main.join_cache_bka_nobnl`,
+  `main.join_cache_bnl`, and `main.join_cache_nojb`.
+  They are classified as current 8.0.22/macOS release baseline/result-order
+  failures, not preserve/resume-caused failures.
+
+Port-touched non-preserve targeted MTR:
+- `lock_order.cycle` now skips cleanly when lock-order instrumentation is not
+  compiled in release (`/tmp/m8022-lockorder-skip.status = 0`).
+- `rpl_secondary_engine_load cycle` targeted rerun passed after release plugin
+  outputs were built (`/tmp/m8022-final-two-afterplugins.status = 0`).
+- Component-related prior failures passed after building component/test-service
+  outputs (`/tmp/m8022-component-failures-fixed/status = 0`).
+- `auth_sec.admin_channel_tls_startup`,
+  `binlog_nogtid.binlog_persist_only_variables`, and
+  `binlog_nogtid.binlog_persist_variables` passed together:
+  `/tmp/m8022-port-touched-rerun/status = 0`, all 8 tests successful.
+
+Preserve/resume release GUnit:
+- release `preserve_trx-t`, `preserve_trx_drain-t`,
+  `preserve_trx_temp_table-t`, `preserve_trx_warmcopy-t`, and
+  `trx0preserve-t` passed:
+  `/tmp/m8022-gunit-release/status = 0`.
+
+Preserve/resume debug GUnit:
+- debug `preserve_trx-t`, `preserve_trx_drain-t`,
+  `preserve_trx_temp_table-t`, `preserve_trx_warmcopy-t`, and
+  `trx0preserve-t` passed:
+  `/tmp/m8022-gunit-debug/status = 0`.
+
+Preserve/resume source lint:
+- `python3 scripts/preserve_trx_lint_runner.py --repo-root .` passed,
+  18 rules, 0 findings:
+  `/tmp/m8022-preserve-lint-after-mysqlx/status = 0`.
+
+Release accelerated preserve_trx MTR:
+- Full release accelerated behavior MTR ran with normal-binlog plus
+  `--skip-log-bin`, `--big-test`, 46 shards, and 158 expected debug-only skips:
+  `/tmp/m8022-preserve-mtr-release-full/20260617-190713/summary.txt`.
+- The run completed 45/46 shards successfully.  The only failing shard was
+  `release-skipbin-041-medium-restart`, where `mysqlx_reject` expected the
+  preserve-specific SQL error but 8.0.22 X Protocol correctly rejected the
+  command earlier with `ER_PLUGGABLE_PROTOCOL_COMMAND_NOT_SUPPORTED`.
+- `mysqlx_reject` was updated to assert the 8.0.22 X Protocol fail-closed
+  boundary while preserving the core behavior checks: no P_S preserved record
+  and the transaction can still `ROLLBACK`.
+- Release targeted `mysqlx_reject` with `--skip-log-bin` passed:
+  `/tmp/m8022-mysqlx-reject-rerun-wrapper/status = 0`.
+- The full failed shard test list was rerun and passed:
+  `/tmp/m8022-skipbin-041-rerun/status = 0`,
+  all 30 tests successful, 3 binlog-only tests skipped under `--skip-log-bin`.
+- Debug targeted `mysqlx_reject` with `--skip-log-bin` skipped by environment
+  (`Mysqlx global status variables reset component not available`) and MTR
+  completed successfully:
+  `/tmp/m8022-mysqlx-reject-debug-skipbin/status = 0`.
+
+Static hygiene:
+- `git diff --check` passed after the port hygiene fixes.
+```
+
 ## Per-Batch Checklist Template
 
 For each batch, copy this section and fill it in before committing the batch.

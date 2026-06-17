@@ -21,7 +21,7 @@ SET GLOBAL preserve_trx_enable=ON;
 -->stmtsql UPDATE xtest.t_mysqlx_reject SET b=11 WHERE a=1;
 -->recvresult
 -->stmtsql PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
--->expecterror ER_PRESERVE_TRX_UNSUPPORTED
+-->expecterror ER_PLUGGABLE_PROTOCOL_COMMAND_NOT_SUPPORTED
 -->recvresult
 -->stmtsql SELECT COUNT(*) AS preserved_count FROM performance_schema.preserved_transactions;
 -->recvresult
@@ -33,5 +33,7 @@ EOF
 
 --exec $MYSQLXTEST -u x_root --password='' --file=$MYSQL_TMP_DIR/preserve_trx_mysqlx_reject.xpl 2>&1
 
---source suite/x/include/xplugin_cleanup.inc
+--remove_file $MYSQL_TMP_DIR/preserve_trx_mysqlx_reject.xpl
+DROP SCHEMA xtest;
+--source include/xplugin_drop_user.inc
 SET GLOBAL preserve_trx_enable=ON;
