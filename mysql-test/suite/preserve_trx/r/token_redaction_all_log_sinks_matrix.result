@@ -33,6 +33,81 @@ WHERE sql_text LIKE '%RESUME PRESERVED TRANSACTION%'
    AND sql_text LIKE CONCAT('%', @redaction_matrix_redacted, '%');
 redacted_token_in_slow_log
 1
+SET @redaction_comment_token=CONCAT('msp_matrix_comment_', 'wxyz');
+SET @redaction_comment_redacted=CONCAT('****', RIGHT(@redaction_comment_token, 4));
+ERROR HY000: Preserved transaction was not found
+SELECT COUNT(*) AS raw_comment_token_in_general_log
+FROM mysql.general_log
+WHERE argument LIKE CONCAT('%', @redaction_comment_token, '%');
+raw_comment_token_in_general_log
+0
+SELECT COUNT(*) > 0 AS redacted_comment_token_in_general_log
+FROM mysql.general_log
+WHERE argument LIKE '%RESUME%'
+   AND argument LIKE CONCAT('%', @redaction_comment_redacted, '%');
+redacted_comment_token_in_general_log
+1
+SELECT COUNT(*) AS raw_comment_token_in_slow_log
+FROM mysql.slow_log
+WHERE sql_text LIKE CONCAT('%', @redaction_comment_token, '%');
+raw_comment_token_in_slow_log
+0
+SELECT COUNT(*) > 0 AS redacted_comment_token_in_slow_log
+FROM mysql.slow_log
+WHERE sql_text LIKE '%RESUME%'
+   AND sql_text LIKE CONCAT('%', @redaction_comment_redacted, '%');
+redacted_comment_token_in_slow_log
+1
+SET @redaction_line_token=CONCAT('msp_matrix_line_', 'lmno');
+SET @redaction_line_redacted=CONCAT('****', RIGHT(@redaction_line_token, 4));
+ERROR HY000: Preserved transaction was not found
+SELECT COUNT(*) AS raw_line_token_in_general_log
+FROM mysql.general_log
+WHERE argument LIKE CONCAT('%', @redaction_line_token, '%');
+raw_line_token_in_general_log
+0
+SELECT COUNT(*) > 0 AS redacted_line_token_in_general_log
+FROM mysql.general_log
+WHERE argument LIKE '%RESUME%'
+   AND argument LIKE CONCAT('%', @redaction_line_redacted, '%');
+redacted_line_token_in_general_log
+1
+SELECT COUNT(*) AS raw_line_token_in_slow_log
+FROM mysql.slow_log
+WHERE sql_text LIKE CONCAT('%', @redaction_line_token, '%');
+raw_line_token_in_slow_log
+0
+SELECT COUNT(*) > 0 AS redacted_line_token_in_slow_log
+FROM mysql.slow_log
+WHERE sql_text LIKE '%RESUME%'
+   AND sql_text LIKE CONCAT('%', @redaction_line_redacted, '%');
+redacted_line_token_in_slow_log
+1
+SET @redaction_version_token=CONCAT('msp_matrix_version_', 'v123');
+SET @redaction_version_redacted=CONCAT('****', RIGHT(@redaction_version_token, 4));
+ERROR HY000: Preserved transaction was not found
+SELECT COUNT(*) AS raw_version_token_in_general_log
+FROM mysql.general_log
+WHERE argument LIKE CONCAT('%', @redaction_version_token, '%');
+raw_version_token_in_general_log
+0
+SELECT COUNT(*) > 0 AS redacted_version_token_in_general_log
+FROM mysql.general_log
+WHERE argument LIKE '%RESUME%'
+   AND argument LIKE CONCAT('%', @redaction_version_redacted, '%');
+redacted_version_token_in_general_log
+1
+SELECT COUNT(*) AS raw_version_token_in_slow_log
+FROM mysql.slow_log
+WHERE sql_text LIKE CONCAT('%', @redaction_version_token, '%');
+raw_version_token_in_slow_log
+0
+SELECT COUNT(*) > 0 AS redacted_version_token_in_slow_log
+FROM mysql.slow_log
+WHERE sql_text LIKE '%RESUME%'
+   AND sql_text LIKE CONCAT('%', @redaction_version_redacted, '%');
+redacted_version_token_in_slow_log
+1
 Occurrences of 'RESUME PRESERVED TRANSACTION '\*\*\*\*abcd' in the input file: 1
 Occurrences of 'TOKEN' in the input file: 0
 SET GLOBAL general_log=OFF;

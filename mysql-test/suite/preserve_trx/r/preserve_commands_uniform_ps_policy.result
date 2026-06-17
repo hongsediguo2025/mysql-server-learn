@@ -5,6 +5,7 @@ SET GLOBAL preserve_trx_enable=ON;
 binary_ps_prepare_preserve_unsupported
 binary_ps_prepare_drain_unsupported
 binary_ps_prepare_resume_unsupported
+binary_ps_prepare_show_unsupported
 PREPARE preserve_stmt FROM 'PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300';
 ERROR HY000: This command is not supported in the prepared statement protocol yet
 DEALLOCATE PREPARE preserve_stmt;
@@ -17,4 +18,8 @@ PREPARE resume_stmt FROM 'RESUME PRESERVED TRANSACTION ''msp_missing_token''';
 ERROR HY000: This command is not supported in the prepared statement protocol yet
 DEALLOCATE PREPARE resume_stmt;
 ERROR HY000: Unknown prepared statement handler (resume_stmt) given to DEALLOCATE PREPARE
+PREPARE show_preserved_stmt FROM 'SHOW PRESERVED TRANSACTIONS';
+ERROR HY000: This command is not supported in the prepared statement protocol yet
+DEALLOCATE PREPARE show_preserved_stmt;
+ERROR HY000: Unknown prepared statement handler (show_preserved_stmt) given to DEALLOCATE PREPARE
 SET GLOBAL preserve_trx_enable=ON;

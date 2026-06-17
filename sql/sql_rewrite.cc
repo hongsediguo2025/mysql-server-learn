@@ -82,6 +82,7 @@
 #include "my_compiler.h"
 #include "my_dbug.h"
 #include "my_inttypes.h"
+#include "mysql_version.h"  // MYSQL_VERSION_ID
 #include "prealloced_array.h"
 #include "sql/auth/auth_acls.h"
 #include "sql/auth/auth_common.h"  // GRANT_ACL
@@ -112,18 +113,92 @@ bool raw_sql_is_ident_char(char c) {
   return my_isalnum(&my_charset_latin1, c) || c == '_' || c == '$';
 }
 
-void raw_sql_skip_spaces(const char *query, size_t query_length,
-                         size_t *position) {
-  while (*position < query_length &&
-         my_isspace(&my_charset_latin1, query[*position])) {
-    ++*position;
+bool raw_sql_starts_dash_comment(const char *query, size_t query_length,
+                                 size_t position) {
+  return position + 2 < query_length && query[position] == '-' &&
+         query[position + 1] == '-' &&
+         (my_isspace(&my_charset_latin1, query[position + 2]) ||
+          my_iscntrl(&my_charset_latin1, query[position + 2]));
+}
+
+bool raw_sql_read_version_comment(const char *query, size_t query_length,
+                                  size_t position, ulong *version) {
+  if (position + 8 > query_length || query[position] != '/' ||
+      query[position + 1] != '*' || query[position + 2] != '!')
+    return false;
+
+  ulong value = 0;
+  for (size_t i = 0; i < 5; ++i) {
+    const char c = query[position + 3 + i];
+    if (!my_isdigit(&my_charset_latin1, c)) return false;
+    value = value * 10 + static_cast<ulong>(c - '0');
+  }
+  *version = value;
+  return true;
+}
+
+void raw_sql_skip_spaces_and_comments(const char *query, size_t query_length,
+                                      size_t *position) {
+  while (*position < query_length) {
+    if (my_isspace(&my_charset_latin1, query[*position])) {
+      ++*position;
+      continue;
+    }
+
+    if (query[*position] == '#') {
+      while (*position < query_length && query[*position] != '\n' &&
+             query[*position] != '\r') {
+        ++*position;
+      }
+      continue;
+    }
+
+    if (raw_sql_starts_dash_comment(query, query_length, *position)) {
+      *position += 2;
+      while (*position < query_length && query[*position] != '\n' &&
+             query[*position] != '\r') {
+        ++*position;
+      }
+      continue;
+    }
+
+    if (*position + 1 < query_length && query[*position] == '*' &&
+        query[*position + 1] == '/') {
+      *position += 2;
+      continue;
+    }
+
+    if (*position + 1 < query_length && query[*position] == '/' &&
+        query[*position + 1] == '*') {
+      ulong version = 0;
+      if (raw_sql_read_version_comment(query, query_length, *position,
+                                       &version) &&
+          version <= MYSQL_VERSION_ID) {
+        *position += 8;  // /*! + five version digits.
+        continue;
+      }
+
+      *position += 2;
+      while (*position + 1 < query_length &&
+             !(query[*position] == '*' && query[*position + 1] == '/')) {
+        ++*position;
+      }
+      if (*position + 1 < query_length) {
+        *position += 2;
+        continue;
+      }
+      *position = query_length;
+      return;
+    }
+
+    return;
   }
 }
 
 bool raw_sql_match_keyword(const char *query, size_t query_length,
                            size_t *position, const char *keyword,
                            size_t keyword_length) {
-  raw_sql_skip_spaces(query, query_length, position);
+  raw_sql_skip_spaces_and_comments(query, query_length, position);
   if (query_length - *position < keyword_length) return false;
   for (size_t i = 0; i < keyword_length; ++i) {
     if (my_toupper(&my_charset_latin1, query[*position + i]) != keyword[i])
@@ -243,7 +318,7 @@ bool raw_sql_parse_resume_token(const char *query, size_t query_length,
     return false;
 
   size_t pos = 0;
-  raw_sql_skip_spaces(query, query_length, &pos);
+  raw_sql_skip_spaces_and_comments(query, query_length, &pos);
   if (!raw_sql_match_keyword(query, query_length, &pos, STRING_WITH_LEN("RESUME")) ||
       !raw_sql_match_keyword(query, query_length, &pos,
                              STRING_WITH_LEN("PRESERVED")) ||
@@ -252,7 +327,7 @@ bool raw_sql_parse_resume_token(const char *query, size_t query_length,
     return false;
   }
 
-  raw_sql_skip_spaces(query, query_length, &pos);
+  raw_sql_skip_spaces_and_comments(query, query_length, &pos);
   if (pos >= query_length) return false;
 
   *literal_start = pos;

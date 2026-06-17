@@ -264,7 +264,11 @@ Preserved_trx_carrier_support_status ensure_directory_support_status(
     return Preserved_trx_carrier_support_status::OK;
 
   const int mkdir_errno = my_errno();
-  if (mkdir_errno == EEXIST) return Preserved_trx_carrier_support_status::OK;
+  if (mkdir_errno == EEXIST) {
+    return path_is_symlink(dir)
+               ? Preserved_trx_carrier_support_status::PERMISSION_PATH_ERROR
+               : Preserved_trx_carrier_support_status::OK;
+  }
   return preserve_trx_errno_is_transient_io(mkdir_errno)
              ? Preserved_trx_carrier_support_status::TRANSIENT_IO
              : Preserved_trx_carrier_support_status::PERMISSION_PATH_ERROR;
@@ -1787,6 +1791,27 @@ Local_file_preserved_trx_carrier::adopt_warm_external_blob(
     return Preserved_trx_carrier_status::CORRUPT;
   }
 
+  DBUG_EXECUTE_IF("preserve_trx_corrupt_warmcopy_blob_after_descriptor", {
+    File corrupt_file = my_open(warm_path.c_str(), O_WRONLY, MYF(0));
+    if (corrupt_file >= 0) {
+      const uchar corrupt_byte = 0x5a;
+      (void)my_pwrite(corrupt_file, &corrupt_byte, 1, 0, MYF(0));
+      (void)my_sync(corrupt_file, MYF(0));
+      (void)my_close(corrupt_file, MYF(0));
+    }
+  });
+
+  Preserved_trx_external_blob verified_blob;
+  const Preserved_trx_carrier_status verify_status =
+      read_external_blob_metadata(warm_path, blob_name, descriptor.size,
+                                  &verified_blob);
+  if (verify_status != Preserved_trx_carrier_status::OK) return verify_status;
+  if (verified_blob.descriptor.name != descriptor.name ||
+      verified_blob.descriptor.size != descriptor.size ||
+      verified_blob.descriptor.digest != descriptor.digest) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+
   const Preserved_trx_carrier_status status = map_atomic_write_status(
       install_temp_file(warm_path, join_path(m_dir, token + ".binlog_cache"),
                         true, nullptr));
@@ -1894,13 +1919,13 @@ preserved_trx_default_carrier_support_status(const std::string &dir,
       if (support_status == Preserved_trx_carrier_support_status::TRANSIENT_IO)
         goto support_status_ready;
 
-      if (my_stat(dir.c_str(), &dir_stat, MYF(0)) == nullptr) {
+      if (path_is_symlink(dir)) {
+        support_status =
+            Preserved_trx_carrier_support_status::PERMISSION_PATH_ERROR;
+      } else if (my_stat(dir.c_str(), &dir_stat, MYF(0)) == nullptr) {
         const int stat_errno = my_errno();
         if (stat_errno == ENOENT) {
-          support_status =
-              path_is_dangling_symlink(dir)
-                  ? Preserved_trx_carrier_support_status::PERMISSION_PATH_ERROR
-                  : Preserved_trx_carrier_support_status::OK;
+          support_status = Preserved_trx_carrier_support_status::OK;
         } else {
           support_status =
               preserve_trx_errno_is_transient_io(stat_errno)

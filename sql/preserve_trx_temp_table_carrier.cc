@@ -83,6 +83,20 @@ bool file_exists(const std::string &path, MY_STAT *stat_area = nullptr) {
                  MYF(0)) != nullptr;
 }
 
+bool path_is_symlink(const std::string &path) {
+  return my_is_symlink(path.c_str(), nullptr);
+}
+
+Preserved_trx_carrier_status stat_regular_sidecar(
+    const std::string &path, MY_STAT *stat_area) {
+  if (path_is_symlink(path)) return Preserved_trx_carrier_status::CORRUPT;
+  if (!file_exists(path, stat_area))
+    return Preserved_trx_carrier_status::NOT_FOUND;
+  if (stat_area->st_size < 0 || !MY_S_ISREG(stat_area->st_mode))
+    return Preserved_trx_carrier_status::CORRUPT;
+  return Preserved_trx_carrier_status::OK;
+}
+
 bool token_is_filename_safe(const std::string &token) {
   if (token.empty() || token.length() > PRESERVE_TRX_TOKEN_MAX_LENGTH)
     return false;
@@ -234,8 +248,10 @@ bool sidecar_blob_name_is_valid(const std::string &blob_name,
 bool read_file(const std::string &path, std::string *out) {
   if (out == nullptr) return false;
   MY_STAT stat_area;
-  if (!file_exists(path, &stat_area)) return false;
-  if (stat_area.st_size < 0) return false;
+  if (stat_regular_sidecar(path, &stat_area) !=
+      Preserved_trx_carrier_status::OK) {
+    return false;
+  }
 
   File file = my_open(path.c_str(), O_RDONLY, MYF(0));
   if (file < 0) return false;
@@ -259,10 +275,10 @@ Preserved_trx_carrier_status validate_file_digest(
     return Preserved_trx_carrier_status::CORRUPT;
 
   MY_STAT stat_area;
-  if (!file_exists(path, &stat_area))
-    return Preserved_trx_carrier_status::NOT_FOUND;
-  if (stat_area.st_size < 0 ||
-      static_cast<uint64_t>(stat_area.st_size) != expected_size) {
+  const Preserved_trx_carrier_status stat_status =
+      stat_regular_sidecar(path, &stat_area);
+  if (stat_status != Preserved_trx_carrier_status::OK) return stat_status;
+  if (static_cast<uint64_t>(stat_area.st_size) != expected_size) {
     return Preserved_trx_carrier_status::CORRUPT;
   }
 
@@ -317,8 +333,9 @@ Preserved_trx_carrier_status file_size_and_digest(
     const std::string &path, Preserved_temp_table_image_writer_result *result) {
   if (result == nullptr) return Preserved_trx_carrier_status::CORRUPT;
   MY_STAT stat_area;
-  if (!file_exists(path, &stat_area))
-    return Preserved_trx_carrier_status::NOT_FOUND;
+  const Preserved_trx_carrier_status stat_status =
+      stat_regular_sidecar(path, &stat_area);
+  if (stat_status != Preserved_trx_carrier_status::OK) return stat_status;
   if (stat_area.st_size <= 0 ||
       temp_sidecar_expected_size_exceeds_read_limit(
           static_cast<uint64_t>(stat_area.st_size))) {
@@ -888,10 +905,10 @@ Preserved_trx_carrier_status read_and_validate_file(
     return Preserved_trx_carrier_status::CORRUPT;
 
   MY_STAT stat_area;
-  if (!file_exists(path, &stat_area))
-    return Preserved_trx_carrier_status::NOT_FOUND;
-  if (stat_area.st_size < 0 ||
-      static_cast<uint64_t>(stat_area.st_size) != expected_size) {
+  const Preserved_trx_carrier_status stat_status =
+      stat_regular_sidecar(path, &stat_area);
+  if (stat_status != Preserved_trx_carrier_status::OK) return stat_status;
+  if (static_cast<uint64_t>(stat_area.st_size) != expected_size) {
     return Preserved_trx_carrier_status::CORRUPT;
   }
   if (!read_file(path, payload)) return Preserved_trx_carrier_status::IO_ERROR;

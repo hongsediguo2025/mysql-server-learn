@@ -20,10 +20,14 @@ changed files: design/*.md only
 source/test migration files: none
 ```
 
-## Current Full-Gate Evidence: 2026-06-17
+## Prior Full-Gate Evidence: 2026-06-17
 
-This section records the latest 8.0.22 port verification checkpoint.  It is a
-run-level audit summary, not a replacement for per-batch migration rows.
+This section records the most recent 8.0.22 port full-gate checkpoint before
+the follow-up review-fix patch set.  It is a run-level audit summary, not a
+replacement for per-batch migration rows.  Because later review fixes changed
+SQL, carrier, redaction, and MTR files, this checkpoint is historical evidence
+for the port baseline and must be rerun before making an exact-current-HEAD
+release claim.
 
 ```text
 branch: codex/preserve-resume-8.0.22-port
@@ -66,8 +70,12 @@ Python:
 - Result: 271 tests passed.
 
 Live E2E:
-- 32-session deterministic binlog equivalence passed with canonical
-  transaction ordering, 3 cycles, and 9600 statements.
+- 32-session deterministic binlog equivalence is not yet closed for this run:
+  `binlog-preserve32-compare.status=1` and
+  `binlog-preserve32max5-compare.status=1`; only the scoped
+  `binlog-preserve32max3-compare.status=0` run passed.  Do not cite the
+  broader 32-session/max5 run as binlog-equivalence evidence until rerun and
+  passing on the current tree.
 - 32-session two-phase warmcopy passed with 1/16/64 MiB large-cache buckets;
   binlog validation mode is capture_only, so this is warmcopy/resume evidence.
 - 32-session reduced semantic matrix passed with 2 cycles and 6400 statements.
@@ -77,6 +85,38 @@ Live E2E:
   /tmp/preserve-8022-longrun-full320-allbuckets-fix2-1781666099
   3 cycles, 320 workers, 1/16/64 MiB buckets, validation/resource/contract pass,
   completed_stmt_total=83900, binlog validation mode capture_only.
+```
+
+## Post-Review Targeted Evidence: 2026-06-17
+
+This section records focused checks for the follow-up review fixes only.  It is
+not a substitute for rerunning the full gate on the exact current HEAD.
+
+```text
+Build:
+- debug mysqld: cmake --build build-debug --target mysqld -- -j4 = 0
+- release mysqld: rebuilt after the review-fix source changes = 0
+
+MTR targeted:
+- release normal-binlog:
+  token_redaction_all_log_sinks_matrix,
+  preserve_commands_uniform_ps_policy,
+  temp_sidecar_symlink_reject,
+  startup_option_validation = pass
+- debug normal-binlog:
+  token_redaction_all_log_sinks_matrix,
+  preserve_commands_uniform_ps_policy,
+  temp_sidecar_symlink_reject,
+  startup_option_validation = pass
+- release --skip-log-bin:
+  resume_any_rechecks_object_privileges = pass
+- debug --skip-log-bin:
+  resume_any_rechecks_object_privileges = pass
+- debug-only:
+  warmcopy_adopt_rehash_mismatch_failclosed = pass
+
+Static:
+- git diff --check = pass
 ```
 
 ## Per-Batch Checklist Template
@@ -365,17 +405,22 @@ Commit:
 - [x] All 4 preserve gunit files migrated.
 - [x] Python E2E and benchmark scripts migrated and run.
 - [x] Python unit tests migrated and run.
-- [ ] 30 explicit conflict files reviewed.
-- [ ] 66 changed-both files reviewed.
+- [ ] 34 explicit conflict files reviewed.
+- [ ] 70 changed-both files reviewed.
 - [ ] Feature-off behavior remains equivalent to original 8.0.22.
 - [ ] Warm-copy behavior is isolated and verified.
 - [ ] User temporary table behavior is isolated and verified.
 - [ ] No `.result` update masks a product bug.
-- [x] Final debug/release build gates passed.
-- [x] Final debug/release gunit gates passed, including `trx0preserve-t`.
-- [x] Final debug/release preserve_trx MTR gates passed with log-bin and no-bin.
-- [x] Final debug/release preserve_trx big-test gates passed.
-- [x] Final perfschema `dml_handler` targeted gates passed.
-- [x] Final Python E2E, benchmark, and Python unit-test gates passed.
+- [ ] Final debug/release build gates passed on exact current HEAD.
+- [ ] Final debug/release gunit gates passed on exact current HEAD, including
+  `trx0preserve-t`.
+- [ ] Final debug/release preserve_trx MTR gates passed on exact current HEAD
+  with log-bin and no-bin.
+- [ ] Final debug/release preserve_trx big-test gates passed on exact current
+  HEAD.
+- [ ] Final perfschema `dml_handler` targeted gates passed on exact current
+  HEAD.
+- [ ] Final Python E2E, benchmark, and Python unit-test gates passed on exact
+  current HEAD.
 - [ ] Full MySQL MTR or CI/release farm gate passed.
 - [ ] Any excluded baseline failures reproduced on untouched `mysql-8.0.22`.

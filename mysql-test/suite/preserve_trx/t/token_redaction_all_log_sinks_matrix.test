@@ -45,6 +45,80 @@ SELECT COUNT(*) > 0 AS redacted_token_in_slow_log
  WHERE sql_text LIKE '%RESUME PRESERVED TRANSACTION%'
    AND sql_text LIKE CONCAT('%', @redaction_matrix_redacted, '%');
 
+SET @redaction_comment_token=CONCAT('msp_matrix_comment_', 'wxyz');
+SET @redaction_comment_redacted=CONCAT('****', RIGHT(@redaction_comment_token, 4));
+
+--disable_query_log
+--error ER_PRESERVE_TRX_NOT_FOUND
+RESUME/**/PRESERVED/*!99999 ignored */TRANSACTION 'msp_matrix_comment_wxyz';
+--enable_query_log
+
+SELECT COUNT(*) AS raw_comment_token_in_general_log
+  FROM mysql.general_log
+ WHERE argument LIKE CONCAT('%', @redaction_comment_token, '%');
+SELECT COUNT(*) > 0 AS redacted_comment_token_in_general_log
+  FROM mysql.general_log
+ WHERE argument LIKE '%RESUME%'
+   AND argument LIKE CONCAT('%', @redaction_comment_redacted, '%');
+
+SELECT COUNT(*) AS raw_comment_token_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text LIKE CONCAT('%', @redaction_comment_token, '%');
+SELECT COUNT(*) > 0 AS redacted_comment_token_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text LIKE '%RESUME%'
+   AND sql_text LIKE CONCAT('%', @redaction_comment_redacted, '%');
+
+SET @redaction_line_token=CONCAT('msp_matrix_line_', 'lmno');
+SET @redaction_line_redacted=CONCAT('****', RIGHT(@redaction_line_token, 4));
+
+--disable_query_log
+--error ER_PRESERVE_TRX_NOT_FOUND
+RESUME -- line comment before PRESERVED
+PRESERVED # hash comment before TRANSACTION
+TRANSACTION 'msp_matrix_line_lmno';
+--enable_query_log
+
+SELECT COUNT(*) AS raw_line_token_in_general_log
+  FROM mysql.general_log
+ WHERE argument LIKE CONCAT('%', @redaction_line_token, '%');
+SELECT COUNT(*) > 0 AS redacted_line_token_in_general_log
+  FROM mysql.general_log
+ WHERE argument LIKE '%RESUME%'
+   AND argument LIKE CONCAT('%', @redaction_line_redacted, '%');
+
+SELECT COUNT(*) AS raw_line_token_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text LIKE CONCAT('%', @redaction_line_token, '%');
+SELECT COUNT(*) > 0 AS redacted_line_token_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text LIKE '%RESUME%'
+   AND sql_text LIKE CONCAT('%', @redaction_line_redacted, '%');
+
+SET @redaction_version_token=CONCAT('msp_matrix_version_', 'v123');
+SET @redaction_version_redacted=CONCAT('****', RIGHT(@redaction_version_token, 4));
+
+--disable_query_log
+--error ER_PRESERVE_TRX_NOT_FOUND
+RESUME /*!80000 PRESERVED */ /*!80000 TRANSACTION */ 'msp_matrix_version_v123';
+--enable_query_log
+
+SELECT COUNT(*) AS raw_version_token_in_general_log
+  FROM mysql.general_log
+ WHERE argument LIKE CONCAT('%', @redaction_version_token, '%');
+SELECT COUNT(*) > 0 AS redacted_version_token_in_general_log
+  FROM mysql.general_log
+ WHERE argument LIKE '%RESUME%'
+   AND argument LIKE CONCAT('%', @redaction_version_redacted, '%');
+
+SELECT COUNT(*) AS raw_version_token_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text LIKE CONCAT('%', @redaction_version_token, '%');
+SELECT COUNT(*) > 0 AS redacted_version_token_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text LIKE '%RESUME%'
+   AND sql_text LIKE CONCAT('%', @redaction_version_redacted, '%');
+
 --let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
 --let $grep_pattern= RESUME PRESERVED TRANSACTION '\\*\\*\\*\\*abcd
 --let $grep_output= count

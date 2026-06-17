@@ -1,5 +1,6 @@
 DROP USER IF EXISTS preserve_resume_any_no_table@localhost;
 DROP USER IF EXISTS preserve_resume_any_readonly@localhost;
+DROP USER IF EXISTS preserve_resume_any_insert_only@localhost;
 DROP DATABASE IF EXISTS preserve_resume_any_obj_db;
 SET GLOBAL preserve_trx_enable=ON;
 CREATE DATABASE preserve_resume_any_obj_db;
@@ -14,6 +15,11 @@ GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO
 preserve_resume_any_readonly@localhost;
 GRANT SELECT ON preserve_resume_any_obj_db.t_resume_any_obj_priv TO
 preserve_resume_any_readonly@localhost;
+CREATE USER preserve_resume_any_insert_only@localhost;
+GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO
+preserve_resume_any_insert_only@localhost;
+GRANT INSERT ON preserve_resume_any_obj_db.t_resume_any_obj_priv TO
+preserve_resume_any_insert_only@localhost;
 START TRANSACTION;
 UPDATE t_resume_any_obj_priv SET b=11 WHERE a=1;
 PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
@@ -21,6 +27,8 @@ SELECT TOKEN, USER, HOST, MOD_TABLES_COUNT
 FROM performance_schema.preserved_transactions;
 TOKEN	USER	HOST	MOD_TABLES_COUNT
 TOKEN	root	localhost	1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Access denied for preserved transaction
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ERROR HY000: Access denied for preserved transaction
 RESUME PRESERVED TRANSACTION 'TOKEN';
@@ -36,6 +44,7 @@ a	b
 1	10
 DROP USER preserve_resume_any_no_table@localhost;
 DROP USER preserve_resume_any_readonly@localhost;
+DROP USER preserve_resume_any_insert_only@localhost;
 USE test;
 DROP DATABASE preserve_resume_any_obj_db;
 SET GLOBAL preserve_trx_enable=ON;

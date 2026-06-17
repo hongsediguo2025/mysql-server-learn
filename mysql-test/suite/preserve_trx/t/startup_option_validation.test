@@ -1,6 +1,53 @@
 --source include/not_windows.inc
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`
+--let $error_log= $MYSQLTEST_VARDIR/log/preserve_trx_startup_option.err
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_enable=OFF;
+
+--perl
+use strict;
+use warnings;
+use File::Path qw(make_path remove_tree);
+use File::Spec;
+
+my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+my $key = File::Spec->catfile($dir, '.key');
+my $target = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve-real-target');
+unlink($key) or die "cannot remove key before directory symlink test: $!";
+rmdir($dir) or die "cannot remove preserve dir before directory symlink test: $!";
+remove_tree($target) if -e $target;
+make_path($target, {mode => 0700});
+symlink($target, $dir) or die "cannot create preserve directory symlink: $!";
+print "preserve path is directory symlink\n";
+EOF
+
+--perl
+use strict;
+use warnings;
+my $path = $ENV{'error_log'} || '';
+unlink $path if $path ne '' && -e $path;
+EOF
+
+--error 1
+--exec $MYSQLD_CMD --validate-config --preserve-trx-enable=ON --log-error=$error_log > $error_log 2>&1
+
+--let SEARCH_FILE= $error_log
+--let SEARCH_PATTERN= preserve_trx_enable=ON requires valid snapshot support
+--source include/search_pattern.inc
+
+--perl
+use strict;
+use warnings;
+use File::Path qw(remove_tree);
+use File::Spec;
+
+my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+my $target = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve-real-target');
+unlink($dir) or die "cannot remove preserve directory symlink: $!";
+remove_tree($target) if -e $target;
+EOF
 
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_enable=OFF;
@@ -19,7 +66,6 @@ close($key_fh);
 print "key malformed\n";
 EOF
 
---let $error_log= $MYSQLTEST_VARDIR/log/preserve_trx_startup_option.err
 --perl
 use strict;
 use warnings;

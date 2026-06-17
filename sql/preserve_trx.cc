@@ -2209,7 +2209,7 @@ bool preserve_trx_recheck_modified_table_privileges(
       access |= table_access;
     }
 
-    return (access & kModifiedTableWriteAcls) == 0;
+    return (access & kModifiedTableWriteAcls) != kModifiedTableWriteAcls;
   };
 
   for (const Preserve_modified_table_name &name : tables) {

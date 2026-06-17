@@ -1579,9 +1579,10 @@ static Sys_var_test_flag Sys_core_file("core_file",
 
 static Sys_var_bool Sys_preserve_trx_enable(
     "preserve_trx_enable",
-    "Enable resumable transactions across shutdown. In this 8.0.22 port "
-    "batch the variable gates syntax only; preserve/resume operations return "
-    "unsupported when enabled.",
+    "Enable resumable transactions across shutdown. When enabled, supported "
+    "transactions can be preserved, drained, recovered, and resumed across a "
+    "server restart; unsupported cases fail closed before a durable token is "
+    "published.",
     GLOBAL_VAR(preserve_trx_enable), CMD_LINE(OPT_ARG), DEFAULT(true),
     NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(check_preserve_trx_enable),
     ON_UPDATE(update_preserve_trx_enable));

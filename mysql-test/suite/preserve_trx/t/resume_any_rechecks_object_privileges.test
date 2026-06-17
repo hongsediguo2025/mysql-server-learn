@@ -4,6 +4,7 @@
 --disable_warnings
 DROP USER IF EXISTS preserve_resume_any_no_table@localhost;
 DROP USER IF EXISTS preserve_resume_any_readonly@localhost;
+DROP USER IF EXISTS preserve_resume_any_insert_only@localhost;
 DROP DATABASE IF EXISTS preserve_resume_any_obj_db;
 --enable_warnings
 
@@ -23,6 +24,12 @@ GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO
   preserve_resume_any_readonly@localhost;
 GRANT SELECT ON preserve_resume_any_obj_db.t_resume_any_obj_priv TO
   preserve_resume_any_readonly@localhost;
+
+CREATE USER preserve_resume_any_insert_only@localhost;
+GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO
+  preserve_resume_any_insert_only@localhost;
+GRANT INSERT ON preserve_resume_any_obj_db.t_resume_any_obj_priv TO
+  preserve_resume_any_insert_only@localhost;
 
 START TRANSACTION;
 UPDATE t_resume_any_obj_priv SET b=11 WHERE a=1;
@@ -56,6 +63,13 @@ SELECT TOKEN, USER, HOST, MOD_TABLES_COUNT
 --disconnect resume_any_readonly_con
 --connection default
 
+--connect(resume_any_insert_only_con, localhost, preserve_resume_any_insert_only,,test)
+--replace_result $preserved_token TOKEN
+--error ER_PRESERVE_TRX_ACCESS_DENIED
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+--disconnect resume_any_insert_only_con
+--connection default
+
 SELECT COUNT(*) AS preserved_after_failed_resume_any
   FROM performance_schema.preserved_transactions;
 
@@ -67,6 +81,7 @@ SELECT * FROM t_resume_any_obj_priv ORDER BY a;
 
 DROP USER preserve_resume_any_no_table@localhost;
 DROP USER preserve_resume_any_readonly@localhost;
+DROP USER preserve_resume_any_insert_only@localhost;
 USE test;
 DROP DATABASE preserve_resume_any_obj_db;
 SET GLOBAL preserve_trx_enable=ON;

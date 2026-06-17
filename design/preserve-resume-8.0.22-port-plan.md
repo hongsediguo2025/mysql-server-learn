@@ -160,12 +160,17 @@ The 8.0.22 port must keep these current invariants:
 ## 5. Conflict And Risk Manifest
 
 The old 30-file conflict list in earlier versions of this plan is stale. The
-actual 8.0.22 port must regenerate its conflict manifest in the target worktree
-before code migration starts:
+current 8.0.22 port refreshed the manifest with source commit
+`7caefcc30efd79df3c5e2a38eb2b98a94461bd0f`; the result is 34 explicit conflict
+files and 70 changed-both overlap files in
+`design/preserve-resume-8.0.22-conflict-manifest.md`. Future re-ports must
+regenerate the manifest in the target worktree before code migration starts:
 
 ```bash
-git merge-tree --messages --name-only --merge-base=8.0 \
-  mysql-8.0.22 preserve-user-temp-tables |
+git merge-tree --messages --name-only \
+  --merge-base=666701570c392a6052341b6ddb9c21869bb1d733 \
+  ee4455a33b10f1b1886044322e4893f587b319ed \
+  7caefcc30efd79df3c5e2a38eb2b98a94461bd0f |
   awk 'NR > 1 && NF == 1 { print } /^$/ { exit }' \
   > design/preserve-resume-8.0.22-conflict-manifest.txt
 ```
@@ -174,13 +179,13 @@ Also regenerate the broader overlap surface:
 
 ```bash
 comm -12 \
-  <(git diff --no-renames --name-only mysql-8.0.22..8.0 | sort) \
-  <(git diff --no-renames --name-only 8.0...preserve-user-temp-tables | sort) \
+  <(git diff --no-renames --name-only ee4455a33b10f1b1886044322e4893f587b319ed..666701570c392a6052341b6ddb9c21869bb1d733 | sort) \
+  <(git diff --no-renames --name-only 666701570c392a6052341b6ddb9c21869bb1d733...7caefcc30efd79df3c5e2a38eb2b98a94461bd0f | sort) \
   > design/preserve-resume-8.0.22-overlap-manifest.txt
 ```
 
-At this document update, the broader overlap count is at least 70 files. High
-risk overlap categories include:
+At this document update, the broader overlap count is 70 files. High risk
+overlap categories include:
 
 - SQL command dispatch, parser, protocol, transaction, sysvar, and privilege
   paths: `include/my_sqlcommand.h`, `sql/sql_parse.cc`, `sql/sql_yacc.yy`,

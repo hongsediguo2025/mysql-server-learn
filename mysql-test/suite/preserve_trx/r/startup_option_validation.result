@@ -1,5 +1,9 @@
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_enable=OFF;
+preserve path is directory symlink
+Pattern "preserve_trx_enable=ON requires valid snapshot support" found
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_enable=OFF;
 key malformed
 Pattern "preserve_trx_enable=ON requires valid snapshot support" found
 SET GLOBAL preserve_trx_enable=ON;
