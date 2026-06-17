@@ -62,6 +62,15 @@ coverage separate from source-lint coverage:
   3 cycles, 320 workers, 1/16/64 MiB bucket coverage, validation/resource/
   contract `pass`, and `capture_only` binlog validation mode.  That full run is
   soak/resource/resume evidence, not binlog-equivalence evidence.
+- Exact-current holdfix rerun:
+  after fixing bounded business-live transaction-start scheduling, the live
+  gate passed at `/tmp/preserve-8022-live-exact-after-holdfix-1781682325`
+  (binlog equivalence baseline/compare, single-phase 100-session,
+  reduced semantic 32-session, two-phase warmcopy baseline/compare, and NFR
+  smoke all status 0).  Full 320-session business-live longrun passed at
+  `/tmp/preserve-8022-longrun-full320-current-1781681962` with 3 cycles, 320
+  workers, buckets `[1, 16, 64]`, validation/resource/contract `pass`, clean
+  audit tail, and binlog validation mode `binlog_equivalence`.
 
 ## MTR Test Files
 

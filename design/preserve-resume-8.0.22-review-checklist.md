@@ -176,9 +176,36 @@ Python unit:
   scripts.tests.test_resumable_trx_nfr2_benchmark
 - Result: 271 tests passed.
 
-Known remaining exact-current evidence gap:
-- live E2E baseline/single-phase/two-phase/reduced semantic matrix and
-  longrun/320-session soak have not yet been rerun after this patch set.
+Exact-current live E2E, benchmark, and longrun closure after the bounded
+business-live hold fix:
+- Python unit rerun:
+  `python3 -m unittest scripts.tests.test_resumable_trx_business_e2e
+  scripts.tests.test_resumable_trx_longrun_e2e
+  scripts.tests.test_resumable_trx_nfr2_benchmark`
+  passed 254 tests.
+- Live gate root:
+  `/tmp/preserve-8022-live-exact-after-holdfix-1781682325`
+  - `binlog_equivalence_32max3_baseline.status = 0`
+  - `binlog_equivalence_32max3_preserve_compare.status = 0`
+  - `single_phase_100.status = 0`
+  - `reduced_semantic_32.status = 0`
+  - `warmcopy_compare_32_baseline.status = 0`
+  - `warmcopy_compare_32_preserve_compare.status = 0`
+  - `nfr_smoke.status = 0`
+  - NFR smoke report:
+    `/tmp/preserve-8022-live-exact-after-holdfix-1781682325/nfr_smoke/nfr-report.json`
+    recorded baseline wall_ms 4629.492, warmcopy-large-cache wall_ms 4663.713,
+    phase2_pause_median_ms 4.142, phase2_pause_us 4142, durable_bytes 194175,
+    prefix_bytes 194175, and full_copy_to_count 0.
+- Full 320-session business-live longrun root:
+  `/tmp/preserve-8022-longrun-full320-current-1781681962`
+  - `longrun-full.status = 0`
+  - audit status `complete`, validation/resource/contract `pass`, clean tail.
+  - baseline phase returncode 0 with buckets `[1, 16, 64]`.
+  - preserve phase returncode 0 with binlog validation mode `binlog_equivalence`
+    and buckets `[1, 16, 64]`.
+  - 3 DRAIN/RESUME cycles, 320 preserved transactions per cycle,
+    completed_stmt_total=96000.
 ```
 
 ## Per-Batch Checklist Template
@@ -483,6 +510,6 @@ Commit:
 - [ ] Final perfschema `dml_handler` targeted gates passed on exact current
   HEAD.
 - [x] Final Python unit-test gates passed on exact current HEAD.
-- [ ] Final live Python E2E and benchmark gates passed on exact current HEAD.
+- [x] Final live Python E2E and benchmark gates passed on exact current HEAD.
 - [ ] Full MySQL MTR or CI/release farm gate passed.
 - [ ] Any excluded baseline failures reproduced on untouched `mysql-8.0.22`.

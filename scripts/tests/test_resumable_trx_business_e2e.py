@@ -1024,6 +1024,36 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertTrue(result["permit"])
 
+    def test_bounded_preserve_run_holds_workers_before_first_drain(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            cycles=1,
+            drain_interval_s=0,
+            max_transactions_per_worker=1,
+        )
+        runner.plan = WorkloadPlan(runner.config)
+        runner.runtime = _FakeRuntime()
+        runner.coordinator = ResumeCoordinator(runner.config.sessions)
+        runner.expected_state = _NoopExpectedState()
+        runner.stop_event = threading.Event()
+        runner.workers = []
+        runner.phase2_pause_samples = []
+        runner.binlog_event_validation_enabled = lambda: False
+        runner.setup_schema = lambda: None
+        runner.configure_preserve_globals = lambda: None
+
+        class StopAfterStart(Exception):
+            pass
+
+        def start_workers():
+            self.assertTrue(runner.coordinator._hold_transaction_starts)
+            raise StopAfterStart()
+
+        runner.start_workers = start_workers
+
+        with self.assertRaises(StopAfterStart):
+            runner.run()
+
     def test_stale_resumed_connection_cannot_satisfy_next_generation(self):
         coordinator = ResumeCoordinator(sessions=1)
         generation1 = coordinator.request_drain_checkpoint()

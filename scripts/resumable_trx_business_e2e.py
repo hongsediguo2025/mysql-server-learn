@@ -1339,6 +1339,11 @@ class ResumeCoordinator:
             except Exception:
                 pass
 
+    def hold_transaction_starts_until_next_checkpoint(self) -> None:
+        with self._condition:
+            self._hold_transaction_starts = True
+            self._condition.notify_all()
+
     def release_transaction_start_hold(self) -> None:
         with self._condition:
             self._hold_transaction_starts = False
@@ -1908,6 +1913,8 @@ class BusinessE2ERunner:
         if self.binlog_event_validation_enabled():
             self.reset_binary_logs_for_event_validation()
         self.configure_preserve_globals()
+        if self.config.max_transactions_per_worker > 0:
+            self.coordinator.hold_transaction_starts_until_next_checkpoint()
         self.start_workers()
         started_at = time.monotonic()
         completed_successfully = False
