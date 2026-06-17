@@ -556,6 +556,74 @@ Exact-current broad rerun after the `table_schema` fix:
   above, which passed repeated targeted checks on both port and baseline.
 ```
 
+## Current-HEAD Feature Gate Refresh After 5021bb15256: 2026-06-17
+
+This section records the feature-specific verification refresh after
+`5021bb15256 Add PFS coverage for preserved transactions`.  That commit only
+changed the review checklist and Performance Schema test/result files:
+
+```text
+git diff --name-only 71fed10ff1d..HEAD
+  design/preserve-resume-8.0.22-review-checklist.md
+  mysql-test/suite/perfschema/r/ddl_preserved_transactions.result
+  mysql-test/suite/perfschema/r/dml_preserved_transactions.result
+  mysql-test/suite/perfschema/r/idx_preserved_transactions.result
+  mysql-test/suite/perfschema/r/information_schema.result
+  mysql-test/suite/perfschema/r/nesting.result
+  mysql-test/suite/perfschema/r/privilege_table_io.result
+  mysql-test/suite/perfschema/r/schema.result
+  mysql-test/suite/perfschema/r/table_schema.result
+  mysql-test/suite/perfschema/t/ddl_preserved_transactions.test
+  mysql-test/suite/perfschema/t/dml_preserved_transactions.test
+  mysql-test/suite/perfschema/t/idx_preserved_transactions.test
+  mysql-test/suite/perfschema/t/information_schema.test
+
+git diff --name-only 71fed10ff1d..HEAD -- ':!design/**' \
+  ':!mysql-test/suite/perfschema/**'
+  <empty>
+```
+
+Current-head Python/source-lint gate:
+
+```text
+python3 -m unittest \
+  scripts.tests.test_preserve_trx_lint_runner \
+  scripts.tests.test_preserve_trx_mtr_accelerator \
+  scripts.tests.test_resumable_trx_business_e2e \
+  scripts.tests.test_resumable_trx_longrun_e2e \
+  scripts.tests.test_resumable_trx_crash_fuzz \
+  scripts.tests.test_resumable_trx_nfr2_benchmark
+
+Result: /tmp/m8022-python-unit-current-head.status = 0, 274 tests passed.
+The embedded source-lint run reported 18 rules and zero findings.
+```
+
+Current-head accelerated preserve_trx MTR gate:
+
+```text
+release:
+- command: python3 scripts/preserve_trx_mtr_accelerator.py
+  --build-profile release --build-dir build-release --mode both --big-test
+  --run-root /tmp/p8022-current-5021 --run-id release
+- result: /tmp/p8022-current-5021/release.status = 0.
+- summary: /tmp/p8022-current-5021/release/summary.txt
+- status: pass, 46 behavior shards, normal-binlog plus --skip-log-bin,
+  158 expected debug-only skips.
+
+debug:
+- command: python3 scripts/preserve_trx_mtr_accelerator.py
+  --build-profile debug --build-dir build-debug --mode both --big-test
+  --run-root /tmp/p8022-current-5021 --run-id debug
+- result: /tmp/p8022-current-5021/debug.status = 0.
+- summary: /tmp/p8022-current-5021/debug/summary.txt
+- status: pass, 48 behavior shards, normal-binlog plus --skip-log-bin,
+  no expected skips.
+
+The large shard `var/` directories were removed after both runs; logs,
+status files, summaries, JUnit XML, and test lists remain under
+/tmp/p8022-current-5021.
+```
+
 ## Per-Batch Checklist Template
 
 For each batch, copy this section and fill it in before committing the batch.
