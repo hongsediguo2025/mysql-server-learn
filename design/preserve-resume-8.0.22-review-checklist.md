@@ -28,6 +28,7 @@ run-level audit summary, not a replacement for per-batch migration rows.
 ```text
 branch: codex/preserve-resume-8.0.22-port
 run root: /tmp/preserve-8022-fullgate-1781667266
+kernel object audit: design/preserve-resume-8.0.22-kernel-object-audit.md
 
 Build:
 - debug build status: /tmp/preserve-8022-fullgate-1781667266/build-debug.status = 0

@@ -459,7 +459,9 @@ Each reviewer checks:
 - whether all preserve MTR tests/results are migrated, adapted, or explicitly
   deferred with reason;
 - whether all five gunit files and Python tools are migrated;
-- whether 8.0.22 structural differences were handled correctly;
+- whether 8.0.22 structural differences were handled correctly, using
+  `design/preserve-resume-8.0.22-kernel-object-audit.md` as the object-level
+  mapping checklist;
 - whether explicit-OFF staging behavior remains equivalent to original 8.0.22;
 - whether final default-ON behavior passes all release gates;
 - whether warm-copy, temp-table, carrier, and resource logic are parameter
@@ -470,6 +472,7 @@ Each reviewer checks:
 
 The main agent must summarize those reviews in:
 
+- `design/preserve-resume-8.0.22-kernel-object-audit.md`;
 - `design/preserve-resume-8.0.22-final-review.md`.
 
 No final merge or push is allowed while any blocker or important finding remains
