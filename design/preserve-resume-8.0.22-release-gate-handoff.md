@@ -32,6 +32,15 @@ size at creation: 84 commits, 1092 changed files
 The base branch is intentionally `codex/mysql-8.0.22-port-base`, not `trunk`;
 the port branch is based on `mysql-8.0.22`.
 
+A release-owner action comment was added to the PR after the 49/49 local
+all-suite failure baseline-coverage classification:
+
+```text
+comment id: 4733460926
+purpose: request release-farm run or explicit release-owner waiver while keeping
+  the PR draft until the final full-MySQL gate closes
+```
+
 ## Completed Local Gates
 
 The detailed evidence is recorded in
