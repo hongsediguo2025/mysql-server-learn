@@ -1026,6 +1026,23 @@ Draft PR / release-owner entry:
 - The PR must remain draft until the full MySQL MTR / CI release-farm gate is
   passed or an explicit release-owner waiver is accepted.
 
+Latest plugin-available local full all-suite refresh:
+- Command:
+  `cd build-release/mysql-test && perl mysql-test-run.pl --suite=all --force
+  --parallel=8 --max-test-fail=50 --timer
+  --vardir=/tmp/m8022allrel-final-20260618005336/var`.
+- Result: `/tmp/m8022allrel-final-20260618005336/full.status = 1`;
+  49/4313 tests failed, 98.86% successful, 3098 skipped, 1465 server restarts,
+  50 reinitializations, terminated at `Too many tests(50) failed`.
+- This run used a release build with clone, keyring, group-replication, and
+  mysqlxtest artifacts present. It reached plugin-dependent suites that earlier
+  local attempts could not cover.
+- The final failing-test list contains no `preserve_trx.*` tests. Preserve/Resume
+  entries observed before the abort passed inside the broad all-suite run.
+- This is stronger local integration evidence, but it still does not close the
+  final full-MySQL gate because the 49 remaining failures are not all
+  baseline-waived by the release owner.
+
 Final checklist evidence refresh after `ba5f5a14fdb`:
 
 ```text

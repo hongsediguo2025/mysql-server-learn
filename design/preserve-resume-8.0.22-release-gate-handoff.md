@@ -107,6 +107,106 @@ So this branch currently has no automatic GitHub status/check context that can
 close the release gate. The final gate still requires an explicit release-farm
 run, release-owner CI, or accepted waiver.
 
+## Current Plugin-Available Local All-Suite Refresh
+
+A newer local release all-suite attempt was run after the missing local plugin
+artifacts were built and available in `build-release/plugin_output_directory`.
+This makes the local evidence stronger than the earlier plugin-missing attempt,
+but it still does not close the final gate because the remaining failures are not
+all baseline-waived.
+
+```text
+run dir:
+  /tmp/m8022allrel-final-20260618005336
+
+command:
+  cd build-release/mysql-test &&
+  perl mysql-test-run.pl --suite=all --force --parallel=8 --max-test-fail=50 \
+    --timer --vardir=/tmp/m8022allrel-final-20260618005336/var
+
+status:
+  /tmp/m8022allrel-final-20260618005336/full.status = 1
+
+summary:
+  servers restarted: 1465
+  servers reinitialized: 50
+  failed: 49/4313 tests
+  successful: 98.86%
+  skipped: 3098 tests, 509 by the test itself
+  termination: Too many tests(50) failed.
+```
+
+The run exercised plugin-dependent areas that were previously unavailable on
+this host. For example, clone and group-replication tests such as
+`clone.remote_basic_replace`, `clone.remote_dml_replace`,
+`group_replication.gr_message_service`, and
+`group_replication.gr_clone_integration_basics` passed before the run reached
+the failure threshold.
+
+The final failing test list contains no `preserve_trx.*` tests. Preserve/Resume
+tests observed during the run passed, including warmcopy, token visibility,
+GTID/binlog-cache, lock/read-view, temp-table fail-closed, timeout/recovery, and
+batch-drain cases. This is useful integration evidence, but it is not a green
+full-MySQL gate.
+
+Failing tests from this local run:
+
+```text
+main.subquery_sj_all_bka_nobnl
+main.select_icp_mrr_bka
+main.range_icp_mrr
+auth_sec.cert_verify_openssl
+main.join_cache_bnl
+main.join_outer_bka
+main.myisam_mrr
+main.innodb_mrr
+main.subquery_nomat_nosj_bka
+main.sp
+engines/rr_trx.rr_c_stats
+main.select_all_bka
+auth_sec.admin_channel_tls
+main.subquery_none_bka_nobnl
+main.subquery_all_bka
+main.subquery_nomat_nosj_bka_nobnl
+main.grant_user_lock
+main.join_cache_nojb
+main.partition_column
+main.subquery_all
+main.join_cache_bka
+main.innodb_mrr_all
+perfschema.error_log
+main.myisam_mrr_all
+auth_sec.cert_verify
+main.subquery_nomat_nosj
+main.range_all
+main.range_mrr
+main.subquery_sj_all_bka
+main.select_all
+main.myisam_mrr_icp
+main.partition_list
+main.innodb_mrr_icp
+main.subquery_sj_all
+main.select_icp_mrr
+main.mysql_not_windows
+main.execution_constants
+main.subquery_all_bka_nobnl
+main.select_all_bka_nobnl
+main.subquery_none
+main.window_std_var
+engines/rr_trx.rr_c_count_not_zero
+json.array_index
+main.join_cache_bka_nobnl
+main.select_icp_mrr_bka_nobnl
+main.window_std_var_optimized
+main.join_outer_bka_nobnl
+engines/rr_trx.init_innodb
+main.subquery_none_bka
+```
+
+The final full-MySQL gate remains open until those failures are either absent in
+a release-farm all-suite pass or explicitly classified/waived by the release
+owner against an acceptable baseline.
+
 ## Current Local Baseline-Parity Blockers
 
 The latest local broad all-suite attempt after `447fba51540` was stopped after
