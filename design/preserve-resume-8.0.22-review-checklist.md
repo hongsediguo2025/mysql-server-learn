@@ -703,6 +703,13 @@ Status:
 
 ## Per-Batch Checklist Template
 
+This section is a historical batch ledger plus a reusable template. Unchecked
+items inside the template, and early-batch reviewer placeholders below, are not
+current release blockers. The current release decision is governed by the
+`Final Review Checklist` section and the release-gate handoff document. As of
+the latest refresh, the only active unchecked final-gate item is the full MySQL
+MTR / CI release-farm gate recorded there.
+
 For each batch, copy this section and fill it in before committing the batch.
 
 ### Batch N: <name>
