@@ -1326,16 +1326,16 @@ class THD : public MDL_context_owner,
   /**
     Warm-copy participant id assigned by the preserve/drain coordinator while
     this THD is admitted to an open warm-copy epoch. Protected by
-    LOCK_thd_data. The 8.0.22 port currently imports only the warm-copy model;
-    production binlog mirroring is connected in a later batch.
+    LOCK_thd_data. The 8.0.22 port connects this field to the production
+    binlog warm-copy mirror and drain participant lifecycle.
   */
   uint preserve_trx_warmcopy_participant_id{0};
   /**
-    Optional user temporary-table preserve participant. The 8.0.22 port keeps
-    this as staging state until the InnoDB temp image/rebind runtime is
-    connected; any session that would need it still fails closed before a
-    durable token is generated. Protected by LOCK_thd_data where it is read
-    together with per-session preserve/drain state.
+    Optional user temporary-table preserve participant. The 8.0.22 port
+    connects this state to the user temporary-table image/rebind runtime; temp
+    row-history/no-redo undo cases still fail closed before a durable token is
+    generated. Protected by LOCK_thd_data where it is read together with
+    per-session preserve/drain state.
   */
   Temp_table_warmcopy_participant *preserve_trx_temp_table_participant{
       nullptr};
