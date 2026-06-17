@@ -40,6 +40,11 @@ LEGACY_LINT_RULE_IDS: Sequence[str] = (
     "wide_error_masks_lint",
 )
 
+SOURCE_LINT_RULE_IDS: Sequence[str] = (
+    *LEGACY_LINT_RULE_IDS,
+    "preserve_sql_command_flags_lint",
+)
+
 SOURCE_SHAPE_DEBT_ALLOWLIST: Sequence[str] = (
     "mysql-test/suite/preserve_trx/t/batch_drain_drained_session_blocked.test",
     "mysql-test/suite/preserve_trx/t/batch_drain_warmcopy_large_cache.test",
@@ -306,6 +311,36 @@ def _check_wide_error_masks(repo_root: Path,
                     ))
 
 
+def _check_preserve_sql_command_flags(repo_root: Path,
+                                      findings: List[LintFinding]) -> None:
+    sql_parse = repo_root / "sql/sql_parse.cc"
+    if not sql_parse.is_file():
+        return
+    text = _read_text(sql_parse)
+    match = re.search(
+        r"sql_command_flags\s*\[\s*SQLCOM_SHOW_PRESERVED_TRX\s*\]\s*="
+        r"(?P<flags>[^;]+);",
+        text,
+        re.S,
+    )
+    required = (
+        "CF_STATUS_COMMAND",
+        "CF_HAS_RESULT_SET",
+        "CF_REEXECUTION_FRAGILE",
+    )
+    if match is None or any(flag not in match.group("flags")
+                            for flag in required):
+        findings.append(LintFinding(
+            rule="preserve_sql_command_flags_lint",
+            path="sql/sql_parse.cc",
+            line=_line_for_pos(text, match.start()) if match else 1,
+            message="SHOW PRESERVED TRANSACTIONS must be registered as a "
+                    "status command with result-set and reexecution-fragile "
+                    "flags",
+            snippet=match.group(0).strip() if match else "",
+        ))
+
+
 def run_lint_checks(repo_root: Path,
                     output_dir: Optional[Path] = None) -> Dict[str, object]:
     repo_root = repo_root.resolve()
@@ -314,12 +349,13 @@ def run_lint_checks(repo_root: Path,
     _check_legacy_lint_registration(repo_root, findings)
     _check_test_layering(repo_root, findings)
     _check_wide_error_masks(repo_root, findings)
+    _check_preserve_sql_command_flags(repo_root, findings)
 
     summary: Dict[str, object] = {
         "validation_mode": VALIDATION_MODE,
         "status": "pass" if not findings else "fail",
-        "rule_count": len(LEGACY_LINT_RULE_IDS),
-        "rules": list(LEGACY_LINT_RULE_IDS),
+        "rule_count": len(SOURCE_LINT_RULE_IDS),
+        "rules": list(SOURCE_LINT_RULE_IDS),
         "findings": [finding.to_dict() for finding in findings],
     }
     if output_dir is not None:

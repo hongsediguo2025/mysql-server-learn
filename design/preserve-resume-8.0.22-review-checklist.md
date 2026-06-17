@@ -119,12 +119,15 @@ Static:
 - git diff --check = pass
 ```
 
-## Exact-Current Code Gate Evidence: 2026-06-17
+## Prior Exact-Current Code Gate Evidence Before Post-214f Follow-Up: 2026-06-17
 
 This section records verification after the follow-up review fixes, including
 the modified privilege recheck and temp-sidecar skip-binlog suppression.  Live
 E2E and longrun evidence are still tracked separately below and must not be
-inferred from these MTR/GUnit/Python-unit gates.
+inferred from these MTR/GUnit/Python-unit gates.  Later post-214f SQL command
+registry and owner-privilege fixes changed source and test files, so this
+section is historical full-gate evidence rather than a release claim for the
+post-214f follow-up patch set.
 
 ```text
 branch: codex/preserve-resume-8.0.22-port
@@ -214,6 +217,111 @@ Perfschema targeted gate:
 - release `perfschema.dml_handler`:
   `/tmp/preserve-8022-pfs-dml-handler-1781682603/release.status = 0`
   and `Completed: All 2 tests were successful.`
+```
+
+## Post-214f SQL Command Registry Follow-Up: 2026-06-17
+
+This section records the focused follow-up after independent review identified
+that `SHOW PRESERVED TRANSACTIONS` was missing `sql_command_flags`
+registration.  The first fix attempt intentionally exposed the behavior risk:
+registering it as a status command without preserving the maintenance-command
+PS policy caused binary `COM_STMT_PREPARE` for `SHOW PRESERVED TRANSACTIONS` to
+crash in `Prepared_statement::prepare_query()`.  The final fix registers the
+command flags and explicitly rejects the statement in the prepared-statement
+prepare path.
+
+```text
+RED evidence:
+- python3 -m unittest
+  scripts.tests.test_preserve_trx_lint_runner.PreserveTrxLintRunnerTest.
+  test_missing_preserve_show_command_flags_fails
+  initially failed because source lint did not catch the missing command flags.
+- release/debug `preserve_commands_uniform_ps_policy` initially failed after
+  adding the command flags alone: binary PS prepare for
+  `SHOW PRESERVED TRANSACTIONS` crashed mysqld with signal 11.
+
+Fix:
+- `SQLCOM_SHOW_PRESERVED_TRX` now has
+  `CF_STATUS_COMMAND | CF_REEXECUTION_FRAGILE | CF_HAS_RESULT_SET`.
+- `Prepared_statement::prepare_query()` explicitly returns
+  `ER_UNSUPPORTED_PS` for `SQLCOM_SHOW_PRESERVED_TRX`.
+- `scripts/preserve_trx_lint_runner.py` now reports 18 source-lint rules,
+  including `preserve_sql_command_flags_lint`.
+
+GREEN evidence:
+- cmake --build build-release --target mysqld -j 8 = 0
+- cmake --build build-debug --target mysqld -j 8 = 0
+- python3 -m unittest scripts.tests.test_preserve_trx_lint_runner = 8/8 pass
+- python3 scripts/preserve_trx_lint_runner.py --repo-root . = pass,
+  18 rules, 0 findings.
+- release MTR:
+  `preserve_commands_uniform_ps_policy token_redaction_all_log_sinks_matrix`
+  = pass.
+- debug MTR:
+  `preserve_commands_uniform_ps_policy token_redaction_all_log_sinks_matrix`
+  = pass.
+```
+
+## Post-214f Independent Review Follow-Up: 2026-06-17
+
+Five independent full-context review agents were run against the 8.0.22
+preserve/resume port.  Four agents found no new source-confirmed release
+blockers; one agent found a real owner-RESUME privilege recheck gap.
+
+```text
+Independent reviews:
+- Tesla: no blocker; documentation/evidence drift only.
+- Pasteur: no source-confirmed blocker.
+- Locke: no source-confirmed blocker; `_lint` remains static-only coverage.
+- Meitner: temp-DML positive resume remains future capability and current
+  fail-closed behavior is intentional.
+- Wegener: HIGH owner RESUME skipped post-preserve object privilege recheck.
+
+RED evidence:
+- `resume_any_rechecks_object_privileges` was extended with a same-owner
+  revoke-after-preserve scenario.
+- release --skip-log-bin initially failed because the owner could RESUME after
+  `UPDATE` was revoked:
+  `RESUME PRESERVED TRANSACTION '$preserved_token' succeeded, should have
+  failed with ER_PRESERVE_TRX_ACCESS_DENIED`.
+
+Fix:
+- RESUME now always rechecks object privileges.
+- Same-owner RESUME requires current object/modified-table write capability.
+- Non-owner `RESUME_ANY_PRESERVED_TRANSACTION` keeps the conservative
+  all-write modified-table policy.
+
+GREEN evidence:
+- cmake --build build-release --target mysqld -j 8 = 0
+- cmake --build build-debug --target mysqld -j 8 = 0
+- release gunit:
+  `preserve_trx-t preserve_trx_drain-t preserve_trx_temp_table-t
+  preserve_trx_warmcopy-t trx0preserve-t` = pass
+  (`/tmp/preserve-8022-gunit-post-owner-release`).
+- debug gunit:
+  `preserve_trx-t preserve_trx_drain-t preserve_trx_temp_table-t
+  preserve_trx_warmcopy-t trx0preserve-t` = pass
+  (`/tmp/preserve-8022-gunit-post-owner-debug`).
+- release --skip-log-bin `resume_any_rechecks_object_privileges` = pass
+  (`/tmp/preserve-8022-owner-revoke-release-green3`).
+- debug --skip-log-bin `resume_any_rechecks_object_privileges` = pass
+  (`/tmp/preserve-8022-owner-revoke-debug-green3`).
+- python3 -m unittest scripts.tests.test_preserve_trx_lint_runner = pass.
+- python3 scripts/preserve_trx_lint_runner.py --repo-root . = pass,
+  18 rules, 0 findings.
+- git diff --check = pass.
+- release/debug `preserve_commands_uniform_ps_policy
+  token_redaction_all_log_sinks_matrix` rerun after the owner fix = pass.
+- exact-current release accelerated full preserve_trx MTR:
+  `/tmp/p8022rel/rel/summary.txt`, status pass, 46 behavior shards,
+  normal-binlog plus `--skip-log-bin`, `--big-test`, 158 expected debug-only
+  skips.  The large `var/` tree was removed after the run; logs, status,
+  summaries, JUnit XML, and test lists remain.
+- exact-current debug accelerated full preserve_trx MTR:
+  `/tmp/p8022dbg/dbg/summary.txt`, status pass, 48 behavior shards,
+  normal-binlog plus `--skip-log-bin`, `--big-test`, no expected skips.  The
+  large `var/` tree was removed after the run; logs, status, summaries, JUnit
+  XML, and test lists remain.
 ```
 
 ## Per-Batch Checklist Template
@@ -495,7 +603,7 @@ Commit:
 
 ## Final Review Checklist
 
-- [ ] 5 independent full-review sub agents completed.
+- [x] 5 independent full-review sub agents completed.
 - [x] All 123 source commits represented or explicitly superseded.
 - [x] All 544 tracked test-manifest assets migrated, adapted, or explicitly
   superseded.

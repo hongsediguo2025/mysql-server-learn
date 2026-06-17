@@ -2,6 +2,13 @@
 
 This file tracks the test-first migration contract for the 8.0.22 port.
 
+Status note: this is the historical migration ledger.  Staging-era statements
+below describe how the port was brought up batch by batch; they are not current
+release gaps.  The current release contract is default ON for both
+`preserve_trx_enable` and `preserve_trx_temp_table_enable`, and exact-current
+test evidence is recorded in
+`design/preserve-resume-8.0.22-review-checklist.md`.
+
 ## Global Test Inventory
 
 Final source test assets:
@@ -82,8 +89,8 @@ Current status:
   `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` and
   `-DCMAKE_CXX_FLAGS="-Wno-enum-constexpr-conversion"` because Boost 1.73
   trips a modern Clang enum constexpr diagnostic.
-- Batch 0 keeps `preserve_trx_enable` default OFF as an explicit staging shell;
-  the final 8.0.22 release gate must still flip to the current GA contract:
+- Historical note: Batch 0 originally used explicit-OFF staging guards while the
+  runtime was incomplete.  The current 8.0.22 release contract is default ON:
   `preserve_trx_enable=ON` and `preserve_trx_temp_table_enable=ON`.
 
 ## Batch 1 Tests
@@ -104,11 +111,10 @@ Tests:
   shell adds a final `SET ...=OFF` cleanup.
 - `pfs_preserved_transactions_empty.test` - added as an 8.0.22 port staging
   test for the empty `performance_schema.preserved_transactions` surface. It
-  verifies that the table exists, scans as empty before registry integration,
-  and exposes the expected column contract. The table now scans through the
-  shared `preserved_trx_snapshot()` view shell rather than a hardcoded
-  `HA_ERR_END_OF_FILE` stub, but the provider still returns no rows until the
-  preserved-record registry is ported.
+  verifies that the table exists and exposes the expected column contract.
+  Registry integration is now complete: the table scans through the shared
+  `preserved_trx_snapshot()` view and the release checklist records targeted
+  `perfschema.dml_handler` coverage.
 - `pfs_preserved_transactions_observable_debug.test` - added as an 8.0.22
   target-only debug staging test for the shared P_S/SHOW row rendering path.
   It uses `preserve_trx_inject_observable_record` to inject one observable

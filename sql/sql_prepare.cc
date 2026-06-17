@@ -1416,6 +1416,10 @@ bool Prepared_statement::prepare_query() {
       res = lex->m_sql_cmd->prepare(thd);
       break;
 
+    case SQLCOM_SHOW_PRESERVED_TRX:
+      my_error(ER_UNSUPPORTED_PS, MYF(0));
+      return true;
+
     case SQLCOM_PREPARE:
     case SQLCOM_EXECUTE:
     case SQLCOM_DEALLOCATE_PREPARE:

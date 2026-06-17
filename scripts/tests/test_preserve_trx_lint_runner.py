@@ -5,6 +5,7 @@ from pathlib import Path
 
 from scripts.preserve_trx_lint_runner import (
     LEGACY_LINT_RULE_IDS,
+    SOURCE_LINT_RULE_IDS,
     main as lint_main,
     run_lint_checks,
 )
@@ -38,6 +39,8 @@ class PreserveTrxLintRunnerTest(unittest.TestCase):
         self.assertIn("wide_error_masks_lint", LEGACY_LINT_RULE_IDS)
         self.assertIn("code_review_resumable_trx_slices_lint",
                       LEGACY_LINT_RULE_IDS)
+        self.assertIn("preserve_sql_command_flags_lint",
+                      SOURCE_LINT_RULE_IDS)
 
     def test_missing_design_directory_does_not_fail(self):
         tmp = self.make_repo()
@@ -46,7 +49,7 @@ class PreserveTrxLintRunnerTest(unittest.TestCase):
         summary = run_lint_checks(Path(tmp.name))
 
         self.assertEqual("pass", summary["status"])
-        self.assertEqual(17, summary["rule_count"])
+        self.assertEqual(len(SOURCE_LINT_RULE_IDS), summary["rule_count"])
         self.assertEqual([], summary["findings"])
 
     def test_non_lint_behavior_test_must_not_read_design_docs(self):
@@ -91,6 +94,39 @@ class PreserveTrxLintRunnerTest(unittest.TestCase):
 
         self.assertEqual("fail", summary["status"])
         self.assertTrue(any(item["rule"] == "wide_error_masks_lint"
+                            for item in summary["findings"]))
+
+    def test_preserve_show_command_flags_are_registered(self):
+        tmp = self.make_repo()
+        self.addCleanup(tmp.cleanup)
+        sql_dir = Path(tmp.name) / "sql"
+        sql_dir.mkdir()
+        (sql_dir / "sql_parse.cc").write_text(
+            "void init_update_queries(void) {\n"
+            "  sql_command_flags[SQLCOM_SHOW_PRESERVED_TRX] = "
+            "CF_STATUS_COMMAND | CF_HAS_RESULT_SET | CF_REEXECUTION_FRAGILE;\n"
+            "}\n"
+        )
+
+        summary = run_lint_checks(Path(tmp.name))
+
+        self.assertEqual("pass", summary["status"])
+
+    def test_missing_preserve_show_command_flags_fails(self):
+        tmp = self.make_repo()
+        self.addCleanup(tmp.cleanup)
+        sql_dir = Path(tmp.name) / "sql"
+        sql_dir.mkdir()
+        (sql_dir / "sql_parse.cc").write_text(
+            "void init_update_queries(void) {\n"
+            "  sql_command_flags[SQLCOM_SHOW_STATUS] = CF_STATUS_COMMAND;\n"
+            "}\n"
+        )
+
+        summary = run_lint_checks(Path(tmp.name))
+
+        self.assertEqual("fail", summary["status"])
+        self.assertTrue(any(item["rule"] == "preserve_sql_command_flags_lint"
                             for item in summary["findings"]))
 
     def test_main_writes_lint_summary_json(self):

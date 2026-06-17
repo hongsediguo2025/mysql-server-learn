@@ -4,7 +4,13 @@ Date: 2026-06-17
 
 Port branch: `codex/preserve-resume-8.0.22-port`
 
-Port HEAD audited: `5eac659bee63`
+Port object-mapping HEAD audited: `5eac659bee63`
+
+Later GA-hardening commits changed SQL command registration, carrier hardening,
+redaction tests, P_S integration evidence, and longrun/E2E evidence.  Treat this
+file as the kernel-object mapping audit; exact-current release evidence and
+post-audit deltas are tracked in
+`design/preserve-resume-8.0.22-review-checklist.md`.
 
 Source branch audited: `/Users/a1234/project/mysql-server`
 `preserve-user-temp-tables` at `b78b96f99f16`

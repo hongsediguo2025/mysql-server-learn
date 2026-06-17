@@ -2238,7 +2238,8 @@ bool preserve_trx_recheck_modified_table_privileges(
 }
 
 bool preserve_trx_recheck_resume_object_privileges(
-    THD *thd, const Preserve_snapshot_metadata &metadata) {
+    THD *thd, const Preserve_snapshot_metadata &metadata,
+    bool require_all_modified_write_acls) {
   if (preserve_trx_recheck_mdl_object_privileges(
           thd, metadata.mdl_descriptors_payload,
           true /* table_write_locks_require_write_privilege */)) {
@@ -2248,8 +2249,7 @@ bool preserve_trx_recheck_resume_object_privileges(
   }
   if (metadata.mod_tables_count != metadata.modified_table_names.size() ||
       preserve_trx_recheck_modified_table_privileges(
-          thd, metadata.modified_table_names,
-          true /* require_all_write_acls */)) {
+          thd, metadata.modified_table_names, require_all_modified_write_acls)) {
     if (!thd->is_error())
       my_error(ER_PRESERVE_TRX_ACCESS_DENIED, MYF(0));
     return true;
@@ -9052,8 +9052,9 @@ bool Sql_cmd_resume_preserved_transaction::execute(THD *thd) {
     return preserve_trx_reject_unsupported();
   }
 
-  if (!owns_token &&
-      preserve_trx_recheck_resume_object_privileges(thd, record.metadata)) {
+  if (preserve_trx_recheck_resume_object_privileges(
+          thd, record.metadata,
+          !owns_token /* require_all_modified_write_acls */)) {
     (void)preserved_trx_update_record_last_error(
         record.metadata.token, "resume user lacks object privileges");
     return true;
