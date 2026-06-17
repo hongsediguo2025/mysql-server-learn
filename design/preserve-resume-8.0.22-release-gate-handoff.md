@@ -99,13 +99,16 @@ Current remote CI availability check on 2026-06-18:
 ```text
 branch:
   mxx/codex/preserve-resume-8.0.22-port =
-  91fc295361d353731979cda0c250c99f8080dc86
+  c8a629878528f047f51369c6a4dc2dc41340cbec
 
-GitHub PR query:
-  hongsediguo2025/mysql-server-learn head
-  hongsediguo2025:codex/preserve-resume-8.0.22-port -> count=0
+GitHub PR:
+  https://github.com/hongsediguo2025/mysql-server-learn/pull/1
+  state=open draft
+  mergeable=true
+  head=c8a629878528f047f51369c6a4dc2dc41340cbec
+  release-owner action comment id=4733460926
 
-GitHub combined status for 91fc295361d:
+GitHub combined status for c8a629878528:
   statuses=[]
 
 repository workflows:
