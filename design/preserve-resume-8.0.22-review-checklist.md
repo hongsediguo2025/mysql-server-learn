@@ -715,7 +715,10 @@ Commit:
 - [x] Final Python unit-test gates passed on exact current HEAD.
 - [x] Final live Python E2E and benchmark gates passed on exact current HEAD.
 - [ ] Full MySQL MTR or CI/release farm gate passed.
-- [ ] Any excluded baseline failures reproduced on untouched `mysql-8.0.22`.
+- [x] Any excluded result-diff baseline failures reproduced on
+  `mysql-8.0.22` plus the minimal local compiler shim required by the current
+  clang/libc++ toolchain; the fully untouched baseline cannot build on this
+  host.
 
 Final checklist evidence refresh after `ba5f5a14fdb`:
 
@@ -811,4 +814,69 @@ Full MySQL MTR release attempt:
 - The full MySQL MTR / release-farm checklist item remains unchecked until a
   plugin-complete all-suite environment passes or these environment failures
   are reproduced and waived against untouched `mysql-8.0.22`.
+```
+
+Final build-compatibility evidence refresh after `64068af885a`:
+
+```text
+Port build compatibility fixes:
+- `router/src/harness/include/mysql/harness/net_ts/executor.h` fixes the
+  `executor_work_guard` copy constructor typo (`other.ex` -> `other.ex_`) that
+  blocked the full release router/harness build.
+- `include/mem_root_deque.h` makes iterator `operator+` / `operator-` const so
+  libc++ can sort through const iterator references.
+- `unittest/gunit/stl_alloc-t.cc` adds allocator `rebind` support and shares
+  `MEM_ROOT` state across libc++ allocator copies/rebinds, avoiding invalid
+  frees in STL allocator gunit coverage.
+
+Full build gates on exact current tree:
+- release: `/tmp/m8022-build-release-all-final-compat.status = 0`.
+- debug: `/tmp/m8022-build-debug-all-final-compat.status = 0`.
+- targeted release `harness_net_ts` after router fix:
+  `/tmp/m8022-harness-net-ts-afterfix.status = 0`.
+- targeted release `merge_small_tests-t` after STL allocator compatibility:
+  `/tmp/m8022-merge-small-tests-after-memrootstate.status = 0`.
+- targeted debug `merge_small_tests-t` after STL allocator compatibility:
+  `/tmp/m8022-debug-merge-small-after-memrootstate.status = 0`.
+
+Affected gunit gates:
+- release `STLAllocTest*` / `MEM_ROOT` filters:
+  `/tmp/m8022-release-merge-small-affected-gunit2.status = 0`, 42 tests
+  passed.
+- debug `STLAllocTest*` / `MEM_ROOT` filters:
+  `/tmp/m8022-debug-merge-small-affected-gunit2.status = 0`, 47 tests passed.
+
+Preserve/resume gates after the compatibility fixes:
+- source lint:
+  `/tmp/m8022-preserve-lint-after-build-compat.status = 0`, 18 rules, 0
+  findings.
+- release gunit:
+  `preserve_trx-t` 243 passed, `preserve_trx_drain-t` 10 passed,
+  `preserve_trx_temp_table-t` 247 passed, `preserve_trx_warmcopy-t` 84 passed,
+  `trx0preserve-t` 17 passed.
+- debug gunit:
+  `preserve_trx-t` 243 passed, `preserve_trx_drain-t` 10 passed,
+  `preserve_trx_temp_table-t` 255 passed, `preserve_trx_warmcopy-t` 84 passed,
+  `trx0preserve-t` 17 passed.
+- combined status:
+  `/tmp/m8022-preserve-gunit-after-build-compat.status = 0`.
+
+Baseline result-diff classification:
+- A detached `mysql-8.0.22` worktree at `ee4455a33b1` could not build untouched
+  on this host because current libc++ rejects the original
+  `include/varlen_sort.h` `iterator_traits<varlen_iterator>` definition.
+  Evidence: `/tmp/m8022-baseline-min-build.status = 2`.
+- After applying only the local compiler shim equivalent to the port's
+  `varlen_sort.h` traits fix, the baseline minimal MTR build passed:
+  `/tmp/m8022-baseline-min-build-shim.status = 0`.
+- The eight remaining broad all-suite result-diff failures reproduced on that
+  baseline+shim build:
+  `/tmp/m8022-baseline-8fail-repro/status = 1`, failing
+  `main.subquery_sj_all`, `main.subquery_sj_all_bka`,
+  `main.subquery_sj_all_bka_nobnl`, `perfschema.error_log`,
+  `main.join_cache_bka_nobnl`, `main.join_cache_bnl`, `main.join_cache_bka`,
+  and `main.join_cache_nojb`.
+- This confirms the eight result diffs are not caused by preserve/resume code.
+  It does not replace a plugin-complete full all-suite or release-farm pass,
+  so the full MySQL MTR / release-farm checklist item remains open.
 ```

@@ -26,6 +26,7 @@
 #include <deque>
 #include <list>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "my_inttypes.h"
@@ -56,33 +57,78 @@ namespace stlalloc_unittest {
 template <typename T>
 class Malloc_allocator_wrapper : public Malloc_allocator<T> {
  public:
+  template <class U>
+  struct rebind {
+    typedef Malloc_allocator_wrapper<U> other;
+  };
+
   Malloc_allocator_wrapper() : Malloc_allocator<T>(PSI_NOT_INSTRUMENTED) {}
+
+  template <typename U>
+  Malloc_allocator_wrapper(const Malloc_allocator_wrapper<U> &other)
+      : Malloc_allocator<T>(other.psi_key()) {}
+};
+
+class Mem_root_allocator_wrapper_state {
+ protected:
+  using Mem_root_ptr = std::shared_ptr<MEM_ROOT>;
+
+  Mem_root_allocator_wrapper_state() : m_mem_root(create_mem_root()) {}
+
+  explicit Mem_root_allocator_wrapper_state(Mem_root_ptr mem_root)
+      : m_mem_root(std::move(mem_root)) {}
+
+  Mem_root_ptr mem_root_ptr() const { return m_mem_root; }
+
+ private:
+  struct Mem_root_deleter {
+    void operator()(MEM_ROOT *mem_root) const {
+      free_root(mem_root, MYF(0));
+      delete mem_root;
+    }
+  };
+
+  static Mem_root_ptr create_mem_root() {
+    Mem_root_ptr mem_root(new MEM_ROOT, Mem_root_deleter{});
+    init_sql_alloc(PSI_NOT_INSTRUMENTED, mem_root.get(), 1024, 0);
+    // memory allocation error is expected, don't abort unit test.
+    mem_root->set_error_handler(nullptr);
+    return mem_root;
+  }
+
+  Mem_root_ptr m_mem_root;
 };
 
 template <typename T>
-class Mem_root_allocator_wrapper : public Mem_root_allocator<T> {
-  MEM_ROOT m_mem_root;
+class Mem_root_allocator_wrapper : private Mem_root_allocator_wrapper_state,
+                                   public Mem_root_allocator<T> {
+  template <typename U>
+  friend class Mem_root_allocator_wrapper;
 
  public:
-  Mem_root_allocator_wrapper() : Mem_root_allocator<T>(&m_mem_root) {
-    init_sql_alloc(PSI_NOT_INSTRUMENTED, &m_mem_root, 1024, 0);
-    // memory allocation error is expected, don't abort unit test.
-    m_mem_root.set_error_handler(nullptr);
-  }
+  template <class U>
+  struct rebind {
+    typedef Mem_root_allocator_wrapper<U> other;
+  };
+
+  Mem_root_allocator_wrapper()
+      : Mem_root_allocator_wrapper_state(),
+        Mem_root_allocator<T>(mem_root_ptr().get()) {}
+
+  template <typename U>
+  Mem_root_allocator_wrapper(const Mem_root_allocator_wrapper<U> &other)
+      : Mem_root_allocator_wrapper_state(other.mem_root_ptr()),
+        Mem_root_allocator<T>(mem_root_ptr().get()) {}
 
   /*
     Allocators before C++17 need to be copy-constructible, and libc++ enforces
-    this (libstdc++ is fine with them being move-only). As a hack, we implement
-    copying the MEM_ROOT here; this type is never used outside of unit tests.
-
-    Note that this will stop working if MEM_ROOT grows a destructor.
+    this (libstdc++ is fine with them being move-only). This wrapper shares the
+    MEM_ROOT across copies and rebinds so container node allocators can destroy
+    objects with allocator copies created by libc++ internals.
   */
   Mem_root_allocator_wrapper(const Mem_root_allocator_wrapper &other)
-      : Mem_root_allocator<T>(&m_mem_root) {
-    memcpy(&m_mem_root, &other.m_mem_root, sizeof(m_mem_root));
-  }
-
-  ~Mem_root_allocator_wrapper() { free_root(&m_mem_root, MYF(0)); }
+      : Mem_root_allocator_wrapper_state(other.mem_root_ptr()),
+        Mem_root_allocator<T>(mem_root_ptr().get()) {}
 };
 
 /*
