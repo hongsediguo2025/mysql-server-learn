@@ -556,11 +556,13 @@ Exact-current broad rerun after the `table_schema` fix:
   above, which passed repeated targeted checks on both port and baseline.
 ```
 
-## Current-HEAD Feature Gate Refresh After 5021bb15256: 2026-06-17
+## Current-HEAD Feature Gate Refresh After 5021bb15256/b764f8a36af: 2026-06-17
 
 This section records the feature-specific verification refresh after
-`5021bb15256 Add PFS coverage for preserved transactions`.  That commit only
-changed the review checklist and Performance Schema test/result files:
+`5021bb15256 Add PFS coverage for preserved transactions` and
+`b764f8a36af Refresh current-head preserve gate evidence`.  The product-code
+delta since `71fed10ff1d` is empty; the post-`71fed10ff1d` changes are the
+review checklist plus Performance Schema test/result coverage:
 
 ```text
 git diff --name-only 71fed10ff1d..HEAD
@@ -582,6 +584,12 @@ git diff --name-only 71fed10ff1d..HEAD -- ':!design/**' \
   ':!mysql-test/suite/perfschema/**'
   <empty>
 ```
+
+The accelerated preserve_trx MTR commands below were rerun on `b764f8a36af`.
+Any later commit that only updates this checklist must be treated as an
+evidence-only documentation commit unless `git diff --name-only
+71fed10ff1d..HEAD -- ':!design/**' ':!mysql-test/suite/perfschema/**'`
+becomes non-empty.
 
 Current-head Python/source-lint gate:
 
@@ -622,6 +630,25 @@ debug:
 The large shard `var/` directories were removed after both runs; logs,
 status files, summaries, JUnit XML, and test lists remain under
 /tmp/p8022-current-5021.
+```
+
+Remaining external gate:
+
+```text
+The feature-specific gate is green on the current local port worktree:
+debug/release accelerated preserve_trx MTR, normal-binlog plus --skip-log-bin,
+with --big-test, passed; Python unit/source-lint also passed.
+
+The full MySQL MTR / CI release-farm gate remains open.  Local broad all-suite
+runs have classified the current failures as environment/plugin/baseline issues
+or as targeted-repro-passing RPL flakiness, but those classifications are not a
+substitute for a plugin-complete full all-suite pass in the release-farm
+environment.  The unchecked final checklist item must be closed only by one of:
+
+1. a plugin-complete full MySQL MTR pass for this 8.0.22 port branch; or
+2. an approved release-farm/CI result that covers the all-suite gate; or
+3. an explicit release waiver that enumerates every remaining all-suite failure,
+   its baseline/environment reproduction, and the owner accepting that waiver.
 ```
 
 ## Per-Batch Checklist Template
