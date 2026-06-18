@@ -34,6 +34,8 @@ from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence,
 
 LOG = logging.getLogger("resumable_trx_business_e2e")
 
+WARMCOPY_TAIL_BUDGET_BYTES = 1024 * 1024
+
 SCENARIOS = {
     "hundred_session_semantic_matrix",
     "binlog_equivalence",
@@ -435,10 +437,22 @@ CREATE TEMPORARY TABLE `{table}` (
         self._effective_large_buckets_mb = effective
         return effective
 
-    def warmcopy_reservation_bytes_for_bucket(self, bucket_mb: int) -> int:
+    def warmcopy_tail_budget_bytes(self, bucket_mb: int = 0) -> int:
+        del bucket_mb
+        return WARMCOPY_TAIL_BUDGET_BYTES
+
+    def warmcopy_reservation_bytes_for_bucket(
+        self, bucket_mb: int, tail_budget_bytes: Optional[int] = None
+    ) -> int:
         bucket_bytes = bucket_mb * 1024 * 1024
-        return bucket_bytes * (
-            self.config.sessions + self.config.large_binlog_cache_sessions
+        tail_bytes = (
+            self.warmcopy_tail_budget_bytes(bucket_mb)
+            if tail_budget_bytes is None
+            else tail_budget_bytes
+        )
+        return (
+            self.config.sessions * tail_bytes
+            + self.config.large_binlog_cache_sessions * bucket_bytes
         )
 
     def large_cache_disk_usage_path(self) -> str:
@@ -500,10 +514,26 @@ CREATE TEMPORARY TABLE `{table}` (
             return default_timeout_ms
         scaled_timeout_ms = (
             default_timeout_ms
-            + self.config.sessions * 250
-            + max(effective_buckets) * 1000
+            + self.config.sessions * 750
+            + max(effective_buckets) * 2000
         )
         return min(max_timeout_ms, max(default_timeout_ms, scaled_timeout_ms))
+
+    def drain_hard_timeout_ms(self) -> int:
+        base_timeout_ms = 120_000
+        if not self.config.warmcopy_required:
+            return base_timeout_ms
+        return max(base_timeout_ms, self.warmcopy_close_timeout_ms() + 120_000)
+
+    def resume_connection_wait_timeout_s(self) -> float:
+        drain_budget_s = self.drain_hard_timeout_ms() / 1000.0
+        return max(
+            self.config.resume_timeout_s,
+            drain_budget_s
+            + self.config.shutdown_timeout_s
+            + self.config.startup_timeout_s
+            + self.config.resume_timeout_s,
+        )
 
     def large_payload_sql_expr(self, sid: int, tx_id: int) -> Optional[str]:
         payload_bytes = self.large_payload_bytes_per_statement(sid, tx_id)
@@ -1700,7 +1730,7 @@ class BusinessWorker(threading.Thread):
                     tx_id,
                 )
                 conn = self.coordinator.wait_for_resumed_connection(
-                    self.sid, self.plan.config.resume_timeout_s
+                    self.sid, self.plan.resume_connection_wait_timeout_s()
                 )
         self.coordinator.mark_in_transaction(self.sid, True)
         self.coordinator.mark_drainable_transaction(self.sid, False)
@@ -1751,7 +1781,7 @@ class BusinessWorker(threading.Thread):
                         )
                         pause_log_generation = generation
                     resumed_conn = self.coordinator.pause_for_drain_if_requested(
-                        self.sid, self.plan.config.resume_timeout_s
+                        self.sid, self.plan.resume_connection_wait_timeout_s()
                     )
                     if resumed_conn is not None:
                         conn = resumed_conn
@@ -1760,7 +1790,7 @@ class BusinessWorker(threading.Thread):
                     raise
                 LOG.info("worker sid=%s waiting for resume at tx=%s stmt=%s", self.sid, tx_id, stmt_index)
                 conn = self.coordinator.wait_for_resumed_connection(
-                    self.sid, self.plan.config.resume_timeout_s
+                    self.sid, self.plan.resume_connection_wait_timeout_s()
                 )
 
         while True:
@@ -1777,7 +1807,7 @@ class BusinessWorker(threading.Thread):
                     raise
                 LOG.info("worker sid=%s waiting for resume while committing tx=%s", self.sid, tx_id)
                 conn = self.coordinator.wait_for_resumed_connection(
-                    self.sid, self.plan.config.resume_timeout_s
+                    self.sid, self.plan.resume_connection_wait_timeout_s()
                 )
 
     def _next_tx_id(self, previous_tx_id: int) -> int:
@@ -2339,11 +2369,18 @@ class BusinessE2ERunner:
     def configure_preserve_globals(self) -> None:
         conn = self.runtime.connect(database=False)
         try:
+            plan = getattr(self, "plan", None)
+            if plan is None and self.config.warmcopy_required:
+                plan = WorkloadPlan(self.config)
+            drain_hard_timeout_ms = (
+                plan.drain_hard_timeout_ms() if plan is not None else 120_000
+            )
             batch_capacity = max(256, self.config.sessions * 2)
             commands = [
                 "SET GLOBAL preserve_trx_enable=ON",
                 f"SET GLOBAL preserve_trx_recovery_max_count={max(200, self.config.sessions * 2)}",
                 "SET GLOBAL preserve_trx_drain_grace_ms=60000",
+                f"SET GLOBAL preserve_trx_drain_hard_timeout_ms={drain_hard_timeout_ms}",
                 f"SET GLOBAL preserve_trx_max_total={batch_capacity}",
                 f"SET GLOBAL preserve_trx_max_pending_per_user={batch_capacity}",
                 f"SET GLOBAL preserve_trx_batch_max_transactions={batch_capacity}",
@@ -2357,17 +2394,15 @@ class BusinessE2ERunner:
             if self.config.scenario == "binlog_equivalence":
                 commands.append("SET GLOBAL binlog_format=ROW")
             if self.config.warmcopy_required:
-                plan = getattr(self, "plan", WorkloadPlan(self.config))
+                assert plan is not None
                 effective_buckets = plan.effective_large_binlog_cache_buckets_mb()
-                max_bucket_bytes = (
-                    max(effective_buckets) * 1024 * 1024
-                    if effective_buckets
-                    else 1024 * 1024
-                )
                 max_bucket_mb = max(effective_buckets) if effective_buckets else 1
+                tail_budget_bytes = plan.warmcopy_tail_budget_bytes(max_bucket_mb)
                 normal_cache_headroom_bytes = self.config.sessions * 1024 * 1024
                 warmcopy_total_bytes = max(
-                    plan.warmcopy_reservation_bytes_for_bucket(max_bucket_mb) +
+                    plan.warmcopy_reservation_bytes_for_bucket(
+                        max_bucket_mb, tail_budget_bytes
+                    ) +
                     normal_cache_headroom_bytes,
                     plan.max_large_payload_bytes_per_statement(),
                 )
@@ -2379,7 +2414,7 @@ class BusinessE2ERunner:
                         f"SET GLOBAL preserve_trx_warmcopy_close_timeout_ms={plan.warmcopy_close_timeout_ms()}",
                         "SET GLOBAL preserve_trx_warmcopy_min_open_ms=1",
                         "SET GLOBAL preserve_trx_warmcopy_chunk_bytes=16777216",
-                        f"SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes={max_bucket_bytes}",
+                        f"SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes={tail_budget_bytes}",
                         f"SET GLOBAL preserve_trx_warmcopy_max_total_bytes={warmcopy_total_bytes}",
                     ]
                 )

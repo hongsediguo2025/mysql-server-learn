@@ -20,6 +20,73 @@ changed files: design/*.md only
 source/test migration files: none
 ```
 
+## Exact Current-HEAD Final Gate Evidence: 2026-06-19
+
+This section records the fresh gate after the warmcopy finalize-deadline fix,
+source-lint/MTR behavior separation cleanup, accelerated MTR vardir cleanup
+fix, and 320-session live E2E timeout-budget fix.
+
+```text
+branch: codex/preserve-resume-8.0.22-port
+run root: /tmp/preserve-mtr-fresh-20260619-0210
+live root: /tmp/preserve-live-gate-20260619-0245
+
+MTR accelerated full, behavior only, with source lint separate:
+- debug default-ON normal-binlog plus --skip-log-bin:
+  /tmp/preserve-mtr-fresh-20260619-0210/debug-full/summary.txt
+  status pass, 48 shards, 704 shard-scheduled behavior tests, 0 expected skips.
+- release default-ON normal-binlog plus --skip-log-bin:
+  /tmp/preserve-mtr-fresh-20260619-0210/release-full/summary.txt
+  status pass, 46 shards, 386 shard-scheduled behavior tests,
+  159 debug-only expected skips.
+- source lint runner:
+  python3 scripts/preserve_trx_lint_runner.py --repo-root .
+  Result: 19 rules passed with zero findings after executing the legacy
+  _lint.test Perl bodies.
+- MTR lint fallback smoke:
+  build-debug/mysql-test/mtr with
+  batch_drain_warmcopy_two_phase_protection_lint and
+  code_review_resumable_trx_slices_lint passed; summary:
+  /tmp/preserve-mtr-lint-fallback-20260619/summaries/lint.summary
+
+Python unit:
+- python3 -m unittest scripts.tests.test_preserve_trx_lint_runner
+  scripts.tests.test_preserve_trx_mtr_accelerator
+  scripts.tests.test_resumable_trx_business_e2e
+  scripts.tests.test_resumable_trx_nfr2_benchmark
+  scripts.tests.test_resumable_trx_longrun_e2e
+- Result: 278 tests passed.
+
+Live E2E:
+- /tmp/preserve-live-gate-20260619-0245/binlog-baseline.status = 0
+- /tmp/preserve-live-gate-20260619-0245/single-phase-compare.status = 0
+- /tmp/preserve-live-gate-20260619-0245/warmcopy-baseline.status = 0
+- /tmp/preserve-live-gate-20260619-0245/warmcopy-two-phase-compare.status = 0
+- /tmp/preserve-live-gate-20260619-0245/reduced-semantic.status = 0
+- /tmp/preserve-live-gate-20260619-0245/longrun-smoke.status = 0
+- /tmp/preserve-live-gate-20260619-0245/longrun-medium.status = 0
+- /tmp/preserve-live-gate-20260619-0245/longrun-full-320.status = 1
+  was an environment capacity run with default max_connections; it is kept as
+  diagnostic evidence only and is not counted as product pass/fail evidence.
+- /tmp/preserve-live-gate-20260619-0245/longrun-full-320-rerun.status = 0
+- /tmp/preserve-live-gate-20260619-0245/longrun-full-320-rerun.top.status = 0
+
+Final 320-session full soak:
+- root: /tmp/preserve-live-gate-20260619-0245/longrun-full-320-rerun
+- profile: 320 workers, 3 cycles, 480-second drain interval, warmcopy required,
+  two-phase, 1/16/64 MiB large-cache buckets.
+- business-live returncode 0, binlog validation mode capture_only,
+  completed_tx_min=90, completed_stmt_total=2922600.
+- cycle 1/2/3 each drained and resumed 320 preserved transactions.
+- audit_status complete, validation_status pass, resource_status pass,
+  contract_status pass, tail_status clean.
+- This full soak is soak/resource/resume evidence.  Binlog equivalence evidence
+  remains the deterministic baseline/compare live E2E runs above.
+
+Hygiene:
+- git diff --check = pass after the code/test harness changes.
+```
+
 ## Prior Full-Gate Evidence: 2026-06-17
 
 This section records the most recent 8.0.22 port full-gate checkpoint before
@@ -57,7 +124,7 @@ MTR:
 - debug accelerated full: pass, 48 shards, 698 shard-scheduled behavior
   tests, normal-binlog plus --skip-log-bin, no expected skips.
   Summary: /tmp/preserve-8022-fullgate-1781667266/mtr-debug/20260617-120623/summary.txt
-- source lint runner: 17 rules passed with zero findings; static lint is
+- source lint runner: 19 rules passed with zero findings; static lint is
   tracked separately from behavior MTR coverage.
 
 Python:
@@ -156,7 +223,7 @@ GUnit:
 - debug trx0preserve-t: 17 passed, 4 expected skips.
 
 MTR accelerated full, behavior only, with source lint separate:
-- source lint runner: status 0, 17 rules, 0 findings.
+- source lint runner: status 0, 19 rules, 0 findings.
 - release normal-binlog big-test:
   /tmp/preserve-8022-current-fullgate-1781676558/mtr-release-normal/20260617-140918/summary.txt
   status pass, 23 shards.
@@ -245,15 +312,16 @@ Fix:
   `CF_STATUS_COMMAND | CF_REEXECUTION_FRAGILE | CF_HAS_RESULT_SET`.
 - `Prepared_statement::prepare_query()` explicitly returns
   `ER_UNSUPPORTED_PS` for `SQLCOM_SHOW_PRESERVED_TRX`.
-- `scripts/preserve_trx_lint_runner.py` now reports 18 source-lint rules,
-  including `preserve_sql_command_flags_lint`.
+- `scripts/preserve_trx_lint_runner.py` now reports 19 source-lint rules,
+  including `preserve_sql_command_flags_lint` and
+  `carrier_read_no_follow_lint`.
 
 GREEN evidence:
 - cmake --build build-release --target mysqld -j 8 = 0
 - cmake --build build-debug --target mysqld -j 8 = 0
-- python3 -m unittest scripts.tests.test_preserve_trx_lint_runner = 8/8 pass
+- python3 -m unittest scripts.tests.test_preserve_trx_lint_runner = 10/10 pass
 - python3 scripts/preserve_trx_lint_runner.py --repo-root . = pass,
-  18 rules, 0 findings.
+  19 rules, 0 findings.
 - release MTR:
   `preserve_commands_uniform_ps_policy token_redaction_all_log_sinks_matrix`
   = pass.
@@ -308,7 +376,7 @@ GREEN evidence:
   (`/tmp/preserve-8022-owner-revoke-debug-green3`).
 - python3 -m unittest scripts.tests.test_preserve_trx_lint_runner = pass.
 - python3 scripts/preserve_trx_lint_runner.py --repo-root . = pass,
-  18 rules, 0 findings.
+  19 rules, 0 findings.
 - git diff --check = pass.
 - release/debug `preserve_commands_uniform_ps_policy
   token_redaction_all_log_sinks_matrix` rerun after the owner fix = pass.
@@ -383,7 +451,7 @@ Preserve/resume debug GUnit:
 
 Preserve/resume source lint:
 - `python3 scripts/preserve_trx_lint_runner.py --repo-root .` passed,
-  18 rules, 0 findings:
+  19 rules, 0 findings:
   `/tmp/m8022-preserve-lint-after-mysqlx/status = 0`.
 
 Release accelerated preserve_trx MTR:
@@ -603,7 +671,7 @@ python3 -m unittest \
   scripts.tests.test_resumable_trx_nfr2_benchmark
 
 Result: /tmp/m8022-python-unit-current-head.status = 0, 274 tests passed.
-The embedded source-lint run reported 18 rules and zero findings.
+The embedded source-lint run reported 19 rules and zero findings.
 ```
 
 Current-head accelerated preserve_trx MTR gate:
@@ -1181,7 +1249,7 @@ Affected gunit gates:
 
 Preserve/resume gates after the compatibility fixes:
 - source lint:
-  `/tmp/m8022-preserve-lint-after-build-compat.status = 0`, 18 rules, 0
+  `/tmp/m8022-preserve-lint-after-build-compat.status = 0`, 19 rules, 0
   findings.
 - release gunit:
   `preserve_trx-t` 243 passed, `preserve_trx_drain-t` 10 passed,

@@ -12,10 +12,12 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import dataclasses
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -24,6 +26,7 @@ from typing import Dict, Iterable, List, Optional, Sequence
 
 
 DEFAULT_RUN_ROOT = Path("/tmp/preserve-mtr-shards")
+DEFAULT_VARDIR_ROOT = Path("/tmp")
 DEFAULT_FAST_PARALLEL = 6
 DEFAULT_MAX_HEAVY_100 = 2
 DEFAULT_MEDIUM_SHARDS = 4
@@ -245,7 +248,10 @@ def _make_shard(
     profile = config.build_profile
     shard_id = f"{profile}-{mode}-{seq:03d}-{kind}"
     list_path = run_dir / "test-lists" / f"{shard_id}.list"
-    vardir = run_dir / "var" / shard_id
+    run_hash = hashlib.sha1(str(run_dir).encode("utf-8")).hexdigest()[:8]
+    # MTR creates worker sockets below <vardir>/tmp/<worker>.  Keep the actual
+    # vardir short even when the auditable run root is descriptive.
+    vardir = DEFAULT_VARDIR_ROOT / f"pmtrv-{run_hash}-{seq:03d}"
     log_path = run_dir / "logs" / f"{shard_id}.log"
     status_path = run_dir / "status" / f"{shard_id}.status"
     summary_path = run_dir / "summaries" / f"{shard_id}.summary"
@@ -460,6 +466,8 @@ def _run_shard(shard: MtrShard) -> int:
             check=False,
         )
     shard.status_path.write_text(str(proc.returncode) + "\n")
+    if proc.returncode == 0:
+        shutil.rmtree(shard.vardir, ignore_errors=True)
     return proc.returncode
 
 

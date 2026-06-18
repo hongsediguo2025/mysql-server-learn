@@ -25,6 +25,19 @@ sub read_case {
   return $src;
 }
 
+sub read_source {
+  my (@parts) = @_;
+  my $source_root = File::Spec->rel2abs(
+    File::Spec->catdir($mysql_test_dir, '..'));
+  my $path = File::Spec->catfile($source_root, @parts);
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $src = do { local $/; <$fh> };
+  close($fh);
+  return $src;
+}
+
+my $preserve_src = read_source('sql', 'preserve_trx.cc');
+
 my $admission = read_case('t', 'warmcopy_admission_toctou');
 my $admission_result = read_case('r', 'warmcopy_admission_toctou');
 $admission =~
@@ -71,17 +84,21 @@ die "committed participant cleanup result must preserve exactly one remaining ta
 
 my $missing = read_case('t', 'batch_drain_warmcopy_missing_prebuilt_failure');
 my $missing_result = read_case('r', 'batch_drain_warmcopy_missing_prebuilt_failure');
-$missing =~
-  /die "warm-copy provider must fail closed when a logged target has no prebuilt blob\\n"\s+unless(.*?);/s
-  or die "could not isolate missing-prebuilt static assertion\n";
-my $missing_assert = $1;
-die "missing prebuilt guard must statically enforce fail-closed provider lookup\n"
-  unless index($missing_assert,
-               '$body =~ /binlog_blob_provider\s*!=\s*nullptr/s &&') >= 0 &&
-         index($missing_assert,
-               '$body =~ /!\s*binlog_blob_provider->has_blob_for_thd\s*\(\s*thd\s*\)/s &&') >= 0 &&
-         index($missing_assert,
-               '$body =~ /return preserve_trx_reject_unsupported\s*\(\s*\)/s') >= 0;
+my $kernel_start =
+  index($preserve_src, 'bool preserve_trx_kernel_preserve_attached_transaction(');
+die "could not isolate preserve_trx_kernel_preserve_attached_transaction\n"
+  if $kernel_start < 0;
+my $kernel_end =
+  index($preserve_src, 'bool preserve_trx_preserve_attached_transaction(',
+        $kernel_start);
+die "could not find preserve_trx_kernel_preserve_attached_transaction end\n"
+  if $kernel_end < 0;
+my $kernel_body = substr($preserve_src, $kernel_start,
+                         $kernel_end - $kernel_start);
+die "missing prebuilt guard must fail closed in the provider lookup path\n"
+  unless $kernel_body =~ /binlog_blob_provider\s*!=\s*nullptr/s &&
+         $kernel_body =~
+           /!\s*binlog_blob_provider->has_blob_for_thd\s*\(\s*thd\s*\)[\s\S]*return\s+reject_unsupported_for_delivery\s*\(\s*"warmcopy_blob_missing"\s*\)/s;
 die "missing prebuilt guard must still resume the originally preserved target\n"
   unless $missing =~ /RESUME PRESERVED TRANSACTION/s &&
          $missing =~ /full_copy_to_count/s &&
@@ -94,19 +111,34 @@ die "missing prebuilt result must preserve/resume one original target and avoid 
 
 my $tail = read_case('t', 'batch_drain_warmcopy_tail_budget');
 my $tail_result = read_case('r', 'batch_drain_warmcopy_tail_budget');
-$tail =~
-  /my \$body = \$&;\s+die "warm-copy phase 2 must not rebuild a full binlog cache blob\\n"\s+if(.*?);/s
-  or die "could not isolate phase2 full-copy negative assertion\n";
-my $tail_no_rebuild_assert = $1;
-$tail =~
-  /my \$adopt_body = \$&;\s+die "warm-copy phase 2 adopt must not scan the whole warm blob for digest\\n"\s+if(.*?);/s
-  or die "could not isolate phase2 digest negative assertion\n";
-my $tail_no_digest_scan_assert = $1;
+my $provider_start =
+  index($preserve_src, 'class Warmcopy_batch_blob_provider final');
+die "could not isolate Warmcopy_batch_blob_provider\n"
+  if $provider_start < 0;
+my $provider_end =
+  index($preserve_src, 'class Warmcopy_prepare_idle_participants final',
+        $provider_start);
+die "could not find Warmcopy_batch_blob_provider end\n"
+  if $provider_end < 0;
+my $provider_body = substr($preserve_src, $provider_start,
+                           $provider_end - $provider_start);
+my $finalize_start =
+  index($provider_body, 'Preserve_snapshot_status finalize_for_preserve');
+die "could not isolate Warmcopy_batch_blob_provider::finalize_for_preserve\n"
+  if $finalize_start < 0;
+my $finalize_end =
+  index($provider_body, 'void discard_for_preserve', $finalize_start);
+die "could not find Warmcopy_batch_blob_provider::finalize_for_preserve end\n"
+  if $finalize_end < 0;
+my $finalize_body = substr($provider_body, $finalize_start,
+                           $finalize_end - $finalize_start);
 die "tail budget guard must prevent full-copy rebuild during phase2\n"
-  unless index($tail_no_rebuild_assert,
-               '$body =~ /mysql_binlog_preserve_warmcopy_build_blob\s*\(/s') >= 0 &&
-         index($tail_no_digest_scan_assert,
-               '$adopt_body =~ /read_file_sha256_digest|EVP_DigestUpdate|my_read/s') >= 0;
+  if $finalize_body =~ /mysql_binlog_preserve_warmcopy_build_blob\s*\(/s;
+die "tail budget guard must not scan the whole warm blob for digest during phase2\n"
+  if $finalize_body =~ /read_file_sha256_digest|EVP_DigestUpdate|my_read/s;
+die "tail budget guard must finalize via the live warmcopy session path\n"
+  unless $finalize_body =~ /mysql_binlog_preserve_warmcopy_finalize_session/s &&
+         $finalize_body =~ /preserve_trx_warmcopy_tail_budget_bytes/s;
 die "tail budget guard must fail closed after post-HWM tail growth\n"
   unless $tail =~ /preserve_trx_warmcopy_after_descriptor_hwm/s &&
          $tail =~ /preserve_trx_warmcopy_tail_budget_bytes=8/s &&

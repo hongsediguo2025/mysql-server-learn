@@ -27,6 +27,62 @@ real topology checks were added upstream.  The 8.0.22 port now also carries:
 
 ## Current Full-Gate Evidence
 
+### Exact Current-HEAD Gate: 2026-06-19
+
+This checkpoint was collected after the warmcopy finalize-deadline fix, the
+source-lint/MTR separation cleanup, the accelerator short-vardir cleanup fix,
+and the live E2E warmcopy/320-session timeout-budget fix.
+
+- Accelerated debug behavior MTR, default-ON normal-binlog plus
+  `--skip-log-bin`:
+  `/tmp/preserve-mtr-fresh-20260619-0210/debug-full`, status `pass`, 48
+  shards, 704 shard-scheduled behavior tests, and 0 expected skips.
+- Accelerated release behavior MTR, default-ON normal-binlog plus
+  `--skip-log-bin`:
+  `/tmp/preserve-mtr-fresh-20260619-0210/release-full`, status `pass`, 46
+  shards, 386 shard-scheduled behavior tests, and 159 debug-only expected
+  skips.
+- Source lint runner: `python3 scripts/preserve_trx_lint_runner.py --repo-root .`
+  passed 19 rules with zero findings after executing the legacy `_lint.test`
+  Perl bodies. These `_lint` checks are static review guards and are not
+  counted as behavior MTR coverage.
+- Python unit suite:
+  `scripts.tests.test_preserve_trx_lint_runner`,
+  `scripts.tests.test_preserve_trx_mtr_accelerator`,
+  `scripts.tests.test_resumable_trx_business_e2e`,
+  `scripts.tests.test_resumable_trx_nfr2_benchmark`, and
+  `scripts.tests.test_resumable_trx_longrun_e2e` ran 278 tests and passed.
+- MTR lint fallback smoke:
+  `batch_drain_warmcopy_two_phase_protection_lint` and
+  `code_review_resumable_trx_slices_lint` passed through
+  `build-debug/mysql-test/mtr`; summary at
+  `/tmp/preserve-mtr-lint-fallback-20260619/summaries/lint.summary`.
+- Live E2E gate root:
+  `/tmp/preserve-live-gate-20260619-0245`
+  - `binlog-baseline.status = 0`
+  - `single-phase-compare.status = 0`
+  - `warmcopy-baseline.status = 0`
+  - `warmcopy-two-phase-compare.status = 0`
+  - `reduced-semantic.status = 0`
+  - `longrun-smoke.status = 0`
+  - `longrun-medium.status = 0`
+  - initial `longrun-full-320.status = 1` was an environment capacity failure
+    from the default `max_connections`; it is not counted as product evidence.
+  - final `longrun-full-320-rerun.status = 0` and
+    `longrun-full-320-rerun.top.status = 0`.
+- Final 320-session full soak:
+  `/tmp/preserve-live-gate-20260619-0245/longrun-full-320-rerun` ran 320
+  workers, 3 cycles, and 480-second drain intervals.  The business-live phase
+  used `capture_only` binlog validation, covered large-cache buckets
+  `[1, 16, 64]`, resumed 320 preserved transactions in each cycle, and finished
+  with `completed_tx_min=90` and `completed_stmt_total=2922600`.
+  The audit reported `audit_status=complete`, `validation_status=pass`,
+  `resource_status=pass`, `contract_status=pass`, and `tail_status=clean`.
+  This run is soak/resource/resume evidence; binlog equivalence evidence comes
+  from the deterministic baseline/compare live E2E runs above.
+
+### Historical Gates
+
 The 2026-06-17 full gate used the accelerated runner and keeps behavior MTR
 coverage separate from source-lint coverage:
 
@@ -39,7 +95,7 @@ coverage separate from source-lint coverage:
   status `pass`, 48 shards, 698 shard-scheduled behavior tests, no expected
   skips.
 - Source lint runner: `python3 scripts/preserve_trx_lint_runner.py --repo-root .`
-  passed 17 rules with zero findings.  These `_lint` checks are static review
+  passed 19 rules with zero findings.  These `_lint` checks are static review
   guards and are not counted as behavior MTR coverage.
 - Python unit suite:
   `scripts.tests.test_preserve_trx_lint_runner`,
@@ -99,8 +155,8 @@ coverage separate from source-lint coverage:
 | `mysql-test/suite/preserve_trx/t/batch_drain_all_pending_no_tokens.test` | `mysql-test/suite/preserve_trx/r/batch_drain_all_pending_no_tokens.result` | Batch 1 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/t/batch_drain_capacity_limits.test` | `mysql-test/suite/preserve_trx/r/batch_drain_capacity_limits.result` | Batch 4 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/t/batch_drain_cleanup_failure_keeps_drain.test` | `mysql-test/suite/preserve_trx/r/batch_drain_cleanup_failure_keeps_drain.result` | Batch 3 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
-| `mysql-test/suite/preserve_trx/t/batch_drain_command_read_state.test` | `mysql-test/suite/preserve_trx/r/batch_drain_command_read_state.result` | Batch 4 | superseded | Replaced by static lint guard `batch_drain_command_read_state_lint`; source lint runner passed 17 rules on 2026-06-17. |
-| `mysql-test/suite/preserve_trx/t/batch_drain_context_switch_guard.test` | `mysql-test/suite/preserve_trx/r/batch_drain_context_switch_guard.result` | Batch 4 | superseded | Replaced by static lint guard `batch_drain_context_switch_guard_lint`; source lint runner passed 17 rules on 2026-06-17. |
+| `mysql-test/suite/preserve_trx/t/batch_drain_command_read_state.test` | `mysql-test/suite/preserve_trx/r/batch_drain_command_read_state.result` | Batch 4 | superseded | Replaced by static lint guard `batch_drain_command_read_state_lint`; source lint runner passed 19 rules on 2026-06-18. |
+| `mysql-test/suite/preserve_trx/t/batch_drain_context_switch_guard.test` | `mysql-test/suite/preserve_trx/r/batch_drain_context_switch_guard.result` | Batch 4 | superseded | Replaced by static lint guard `batch_drain_context_switch_guard_lint`; source lint runner passed 19 rules on 2026-06-18. |
 | `mysql-test/suite/preserve_trx/t/batch_drain_current_target_durable_failure.test` | `mysql-test/suite/preserve_trx/r/batch_drain_current_target_durable_failure.result` | Batch 3 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/t/batch_drain_current_target_durable_failure_log_bin.test` | `mysql-test/suite/preserve_trx/r/batch_drain_current_target_durable_failure_log_bin.result` | Batch 3 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/t/batch_drain_current_target_durable_rollback_log_bin.test` | `mysql-test/suite/preserve_trx/r/batch_drain_current_target_durable_rollback_log_bin.result` | Batch 4 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
@@ -164,7 +220,7 @@ coverage separate from source-lint coverage:
 | `mysql-test/suite/preserve_trx/t/core_limit_sysvars.test` | `mysql-test/suite/preserve_trx/r/core_limit_sysvars.result` | Batch 1 | superseded | Early sysvar staging guard was superseded by `preserve_enable_default_on_sysvar_contract`, `validation_and_privileges`, resource limit MTR, and the 2026-06-17 full gate. |
 | `mysql-test/suite/preserve_trx/t/drain_warmcopy_sysvars.test` | `mysql-test/suite/preserve_trx/r/drain_warmcopy_sysvars.result` | Batch 5 | superseded | Early drain/warmcopy sysvar staging guard was superseded by warmcopy runtime MTR, preserve_trx_warmcopy GUnit, and the 2026-06-17 full gate. |
 | `mysql-test/suite/preserve_trx/t/detach_claim_rollback_staging_debug.test` | `mysql-test/suite/preserve_trx/r/detach_claim_rollback_staging_debug.result` | Batch 2 | superseded | Early detach/claim/rollback staging guard was superseded by runtime preserve/rollback/reaper tests, InnoDB GUnit, and the 2026-06-17 full gate. |
-| `mysql-test/suite/preserve_trx/t/code_review_resumable_trx_slices_guard.test` | `mysql-test/suite/preserve_trx/r/code_review_resumable_trx_slices_guard.result` | Batch 7 | superseded | Replaced by static lint guard `code_review_resumable_trx_slices_lint`; source lint runner passed 17 rules on 2026-06-17. |
+| `mysql-test/suite/preserve_trx/t/code_review_resumable_trx_slices_guard.test` | `mysql-test/suite/preserve_trx/r/code_review_resumable_trx_slices_guard.result` | Batch 7 | superseded | Replaced by static lint guard `code_review_resumable_trx_slices_lint`; source lint runner passed 19 rules on 2026-06-18. |
 | `mysql-test/suite/preserve_trx/t/concurrent_resume_race.test` | `mysql-test/suite/preserve_trx/r/concurrent_resume_race.result` | Batch 7 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/t/concurrent_standard_xa.test` | `mysql-test/suite/preserve_trx/r/concurrent_standard_xa.result` | Batch 7 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/t/draining_blocks_indirect_writes.test` | `mysql-test/suite/preserve_trx/r/draining_blocks_indirect_writes.result` | Batch 7 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
@@ -222,7 +278,7 @@ coverage separate from source-lint coverage:
 | `mysql-test/suite/preserve_trx/t/preserve_commands_uniform_ps_policy.test` | `mysql-test/suite/preserve_trx/r/preserve_commands_uniform_ps_policy.result` | Batch 7 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/t/preserve_corrupt_vs_io_error_distinct.test` | `mysql-test/suite/preserve_trx/r/preserve_corrupt_vs_io_error_distinct.result` | Batch 3 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/t/preserve_crash_after_prepare_before_snapshot.test` | `mysql-test/suite/preserve_trx/r/preserve_crash_after_prepare_before_snapshot.result` | Batch 1 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
-| `mysql-test/suite/preserve_trx/t/preserve_mdl_privilege_all_namespaces.test` | `mysql-test/suite/preserve_trx/r/preserve_mdl_privilege_all_namespaces.result` | Batch 1 | superseded | Replaced by static lint guard `preserve_mdl_privilege_all_namespaces_lint`; source lint runner passed 17 rules on 2026-06-17. |
+| `mysql-test/suite/preserve_trx/t/preserve_mdl_privilege_all_namespaces.test` | `mysql-test/suite/preserve_trx/r/preserve_mdl_privilege_all_namespaces.result` | Batch 1 | superseded | Replaced by static lint guard `preserve_mdl_privilege_all_namespaces_lint`; source lint runner passed 19 rules on 2026-06-18. |
 | `mysql-test/suite/preserve_trx/t/preserve_object_privilege_recheck.test` | `mysql-test/suite/preserve_trx/r/preserve_object_privilege_recheck.result` | Batch 1 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/t/preserve_object_privilege_recheck_positive.test` | `mysql-test/suite/preserve_trx/r/preserve_object_privilege_recheck_positive.result` | Batch 1 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/t/preserve_rejects_open_server_cursor.test` | `mysql-test/suite/preserve_trx/r/preserve_rejects_open_server_cursor.result` | Batch 7 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
@@ -367,8 +423,8 @@ coverage separate from source-lint coverage:
 | `mysql-test/suite/preserve_trx/r/batch_drain_all_pending_no_tokens.result` | Batch 1 | moved-round-b | Paired result exists in the 8.0.22 target and was covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/r/batch_drain_capacity_limits.result` | Batch 4 | moved-round-b | Paired result exists in the 8.0.22 target and was covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/r/batch_drain_cleanup_failure_keeps_drain.result` | Batch 3 | moved-round-b | Paired result exists in the 8.0.22 target and was covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
-| `mysql-test/suite/preserve_trx/r/batch_drain_command_read_state.result` | Batch 4 | superseded | Replaced by static lint guard `batch_drain_command_read_state_lint`; source lint runner passed 17 rules on 2026-06-17. |
-| `mysql-test/suite/preserve_trx/r/batch_drain_context_switch_guard.result` | Batch 4 | superseded | Replaced by static lint guard `batch_drain_context_switch_guard_lint`; source lint runner passed 17 rules on 2026-06-17. |
+| `mysql-test/suite/preserve_trx/r/batch_drain_command_read_state.result` | Batch 4 | superseded | Replaced by static lint guard `batch_drain_command_read_state_lint`; source lint runner passed 19 rules on 2026-06-18. |
+| `mysql-test/suite/preserve_trx/r/batch_drain_context_switch_guard.result` | Batch 4 | superseded | Replaced by static lint guard `batch_drain_context_switch_guard_lint`; source lint runner passed 19 rules on 2026-06-18. |
 | `mysql-test/suite/preserve_trx/r/batch_drain_current_target_durable_failure.result` | Batch 3 | moved-round-b | Paired result exists in the 8.0.22 target and was covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/r/batch_drain_current_target_durable_failure_log_bin.result` | Batch 3 | moved-round-b | Paired result exists in the 8.0.22 target and was covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/r/batch_drain_current_target_durable_rollback_log_bin.result` | Batch 4 | moved-round-b | Paired result exists in the 8.0.22 target and was covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
@@ -430,7 +486,7 @@ coverage separate from source-lint coverage:
 | `mysql-test/suite/preserve_trx/r/binlog_state_logged_with_cache_to_off_reject.result` | Batch 5 | moved-round-b | Paired result exists in the 8.0.22 target and was covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/r/binlog_state_session_off_basic.result` | Batch 5 | moved-round-b | Paired result exists in the 8.0.22 target and was covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/r/detach_claim_rollback_staging_debug.result` | Batch 2 | superseded | Early detach/claim/rollback staging guard was superseded by runtime preserve/rollback/reaper tests, InnoDB GUnit, and the 2026-06-17 full gate. |
-| `mysql-test/suite/preserve_trx/r/code_review_resumable_trx_slices_guard.result` | Batch 7 | superseded | Replaced by static lint guard `code_review_resumable_trx_slices_lint`; source lint runner passed 17 rules on 2026-06-17. |
+| `mysql-test/suite/preserve_trx/r/code_review_resumable_trx_slices_guard.result` | Batch 7 | superseded | Replaced by static lint guard `code_review_resumable_trx_slices_lint`; source lint runner passed 19 rules on 2026-06-18. |
 | `mysql-test/suite/preserve_trx/r/concurrent_resume_race.result` | Batch 7 | moved-round-b | Paired result exists in the 8.0.22 target and was covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/r/concurrent_standard_xa.result` | Batch 7 | moved-round-b | Paired result exists in the 8.0.22 target and was covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/r/draining_blocks_indirect_writes.result` | Batch 7 | moved-round-b | Paired result exists in the 8.0.22 target and was covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
@@ -487,7 +543,7 @@ coverage separate from source-lint coverage:
 | `mysql-test/suite/preserve_trx/r/preserve_commands_uniform_ps_policy.result` | Batch 7 | moved-round-b | Paired result exists in the 8.0.22 target and was covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/r/preserve_corrupt_vs_io_error_distinct.result` | Batch 3 | moved-round-b | Paired result exists in the 8.0.22 target and was covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/r/preserve_crash_after_prepare_before_snapshot.result` | Batch 1 | moved-round-b | Paired result exists in the 8.0.22 target and was covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
-| `mysql-test/suite/preserve_trx/r/preserve_mdl_privilege_all_namespaces.result` | Batch 1 | superseded | Replaced by static lint guard `preserve_mdl_privilege_all_namespaces_lint`; source lint runner passed 17 rules on 2026-06-17. |
+| `mysql-test/suite/preserve_trx/r/preserve_mdl_privilege_all_namespaces.result` | Batch 1 | superseded | Replaced by static lint guard `preserve_mdl_privilege_all_namespaces_lint`; source lint runner passed 19 rules on 2026-06-18. |
 | `mysql-test/suite/preserve_trx/r/preserve_object_privilege_recheck.result` | Batch 1 | moved-round-b | Paired result exists in the 8.0.22 target and was covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/r/preserve_object_privilege_recheck_positive.result` | Batch 1 | moved-round-b | Paired result exists in the 8.0.22 target and was covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
 | `mysql-test/suite/preserve_trx/r/preserve_rejects_open_server_cursor.result` | Batch 7 | moved-round-b | Paired result exists in the 8.0.22 target and was covered by the 2026-06-17 debug/release accelerated full preserve_trx MTR; see Current Full-Gate Evidence. |
@@ -605,6 +661,7 @@ coverage separate from source-lint coverage:
 |---|---|---|---|
 | `unittest/gunit/innodb/trx0preserve-t.cc` | Batch 2 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release GUnit full gate; see Current Full-Gate Evidence. |
 | `unittest/gunit/preserve_trx-t.cc` | Batch 1 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release GUnit full gate; see Current Full-Gate Evidence. |
+| `unittest/gunit/preserve_trx_drain-t.cc` | Batch 4 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release GUnit full gate; see Current Full-Gate Evidence. |
 | `unittest/gunit/preserve_trx_temp_table-t.cc` | Batch 6 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release GUnit full gate; see Current Full-Gate Evidence. |
 | `unittest/gunit/preserve_trx_warmcopy-t.cc` | Batch 5 | moved-round-b | Present in the 8.0.22 target and covered by the 2026-06-17 debug/release GUnit full gate; see Current Full-Gate Evidence. |
 

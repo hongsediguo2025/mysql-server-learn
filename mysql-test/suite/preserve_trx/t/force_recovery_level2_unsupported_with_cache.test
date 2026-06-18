@@ -48,30 +48,6 @@ use strict;
 use warnings;
 use File::Spec;
 
-my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
-  or die "MYSQL_TEST_DIR is not set";
-my $source_root = File::Spec->rel2abs(
-  File::Spec->catdir($mysql_test_dir, '..'));
-my $path = File::Spec->catfile($source_root, 'sql', 'preserve_trx.cc');
-open(my $fh, '<', $path) or die "cannot open $path: $!";
-my $source = do { local $/; <$fh> };
-close($fh);
-
-my $start = index($source, 'bool preserved_trx_preflight_recoverability()');
-die "preserved_trx_preflight_recoverability not found\n" if $start < 0;
-my $body = substr($source, $start, 800);
-my $force_guard_pos = index($body, 'srv_force_recovery > 0');
-my $carrier_pos = index($body, 'create_preserved_trx_default_store');
-die "force recovery preflight must not scan snapshot files\n"
-  if $force_guard_pos < 0 || $carrier_pos < 0 || $force_guard_pos > $carrier_pos;
-print "force_recovery_preflight_skips_snapshot_scan\n1\n";
-EOF
-
---perl
-use strict;
-use warnings;
-use File::Spec;
-
 my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
 opendir(my $dh, $dir) or die "cannot open preserve dir: $dir: $!";
 my @bins = readdir($dh);

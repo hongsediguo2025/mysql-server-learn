@@ -5,6 +5,7 @@ from pathlib import Path
 
 from scripts.preserve_trx_lint_runner import (
     LEGACY_LINT_RULE_IDS,
+    SOURCE_SHAPE_DEBT_ALLOWLIST,
     SOURCE_LINT_RULE_IDS,
     main as lint_main,
     run_lint_checks,
@@ -42,6 +43,9 @@ class PreserveTrxLintRunnerTest(unittest.TestCase):
         self.assertIn("preserve_sql_command_flags_lint",
                       SOURCE_LINT_RULE_IDS)
 
+    def test_source_shape_debt_allowlist_is_empty(self):
+        self.assertEqual((), SOURCE_SHAPE_DEBT_ALLOWLIST)
+
     def test_missing_design_directory_does_not_fail(self):
         tmp = self.make_repo()
         self.addCleanup(tmp.cleanup)
@@ -51,6 +55,31 @@ class PreserveTrxLintRunnerTest(unittest.TestCase):
         self.assertEqual("pass", summary["status"])
         self.assertEqual(len(SOURCE_LINT_RULE_IDS), summary["rule_count"])
         self.assertEqual([], summary["findings"])
+
+    def test_legacy_lint_perl_body_is_executed(self):
+        tmp = self.make_repo()
+        self.addCleanup(tmp.cleanup)
+        lint_test = (
+            Path(tmp.name) / "mysql-test/suite/preserve_trx/t" /
+            "batch_drain_warmcopy_two_phase_protection_lint.test"
+        )
+        lint_test.write_text(
+            "--perl\n"
+            "use strict;\n"
+            "use warnings;\n"
+            "die \"legacy lint body executed\\n\";\n"
+            "EOF\n"
+            "SELECT 'ok';\n"
+        )
+
+        summary = run_lint_checks(Path(tmp.name))
+
+        self.assertEqual("fail", summary["status"])
+        self.assertTrue(any(
+            item["rule"] == "batch_drain_warmcopy_two_phase_protection_lint" and
+            "legacy lint body executed" in item["message"]
+            for item in summary["findings"]
+        ))
 
     def test_non_lint_behavior_test_must_not_read_design_docs(self):
         tmp = self.make_repo()
@@ -127,6 +156,37 @@ class PreserveTrxLintRunnerTest(unittest.TestCase):
 
         self.assertEqual("fail", summary["status"])
         self.assertTrue(any(item["rule"] == "preserve_sql_command_flags_lint"
+                            for item in summary["findings"]))
+
+    def test_carrier_read_paths_require_no_follow_open(self):
+        tmp = self.make_repo()
+        self.addCleanup(tmp.cleanup)
+        sql_dir = Path(tmp.name) / "sql"
+        sql_dir.mkdir()
+        (sql_dir / "preserve_trx_carrier_file.cc").write_text(
+            "Preserved_trx_carrier_status read_file_limited() {\n"
+            "  File file = my_open(path.c_str(), O_RDONLY, MYF(0));\n"
+            "}\n"
+            "Preserved_trx_carrier_status read_external_blob_metadata() {\n"
+            "  File file = my_open(path.c_str(), O_RDONLY, MYF(0));\n"
+            "}\n"
+            "Preserve_key_status read_key() {\n"
+            "  File file = my_open(path.c_str(), O_RDONLY, MYF(0));\n"
+            "}\n"
+        )
+        (sql_dir / "preserve_trx_temp_table_carrier.cc").write_text(
+            "bool read_file() {\n"
+            "  File file = my_open(path.c_str(), O_RDONLY, MYF(0));\n"
+            "}\n"
+            "Preserved_trx_carrier_status validate_file_digest() {\n"
+            "  File file = my_open(path.c_str(), O_RDONLY, MYF(0));\n"
+            "}\n"
+        )
+
+        summary = run_lint_checks(Path(tmp.name))
+
+        self.assertEqual("fail", summary["status"])
+        self.assertTrue(any(item["rule"] == "carrier_read_no_follow_lint"
                             for item in summary["findings"]))
 
     def test_main_writes_lint_summary_json(self):

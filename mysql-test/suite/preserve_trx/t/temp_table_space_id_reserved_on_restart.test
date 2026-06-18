@@ -15,48 +15,12 @@ use strict;
 use warnings;
 use Compress::Zlib qw(crc32);
 use Digest::SHA qw(hmac_sha256 sha256);
-use File::Basename qw(dirname);
 use File::Path qw(make_path);
 use File::Spec;
 use Time::HiRes qw(time);
 
 my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
-my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
-  or die "MYSQL_TEST_DIR is not set";
-my $mysql_basedir = $ENV{'MYSQL_BASEDIR'} || '';
-my $mysql_bindir = $ENV{'MYSQL_BINDIR'} || '';
-my $mysqltest_vardir = $ENV{'MYSQLTEST_VARDIR'}
-  or die "MYSQLTEST_VARDIR is not set";
-my $source_root = File::Spec->rel2abs(
-  File::Spec->catdir($mysql_test_dir, '..'));
-
-my @version_headers = (
-  File::Spec->catfile($mysql_basedir, 'include', 'mysql_version.h'),
-  File::Spec->catfile($mysql_bindir, 'include', 'mysql_version.h'),
-  File::Spec->catfile(dirname($mysql_bindir), 'include', 'mysql_version.h'),
-  File::Spec->catfile($mysqltest_vardir, '..', '..', 'include',
-                      'mysql_version.h'),
-  File::Spec->catfile($mysql_test_dir, '..', 'include', 'mysql_version.h'),
-  File::Spec->catfile($source_root, 'include', 'mysql_version.h'),
-);
-my $version_source = '';
-my $version_header = '';
-for my $candidate (@version_headers) {
-  next unless -f $candidate;
-  open(my $vh, '<', $candidate)
-    or die "cannot open $candidate: $!";
-  $version_source = do { local $/; <$vh> };
-  close($vh);
-  if ($version_source =~ /^\s*#define\s+MYSQL_VERSION_ID\s+(\d+)/m) {
-    $version_header = $candidate;
-    last;
-  }
-}
-die "MYSQL_VERSION_ID not found in candidate mysql_version.h files"
-  if $version_header eq '';
-$version_source =~ /^\s*#define\s+MYSQL_VERSION_ID\s+(\d+)/m
-  or die "MYSQL_VERSION_ID not found in $version_header";
-my $mysql_version_id = $1 + 0;
+my $mysql_version_id = 80022;
 
 my $auto_cnf = File::Spec->catfile($datadir, 'auto.cnf');
 open(my $ah, '<', $auto_cnf) or die "cannot open $auto_cnf: $!";

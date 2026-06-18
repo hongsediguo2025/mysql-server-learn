@@ -1,0 +1,94 @@
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_warmcopy_finalize_deadline;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=15000;
+CALL mtr.add_suppression("PRESERVE: session remains QUIESCED while waiting for batch drain to release it");
+
+CREATE TABLE t_warmcopy_finalize_deadline(
+  id INT PRIMARY KEY,
+  payload VARBINARY(512)
+) ENGINE=InnoDB;
+INSERT INTO t_warmcopy_finalize_deadline VALUES(1, REPEAT('a',512));
+RESET MASTER;
+
+--connect(warmcopy_finalize_app, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_warmcopy_finalize_deadline SET payload=REPEAT('x',512) WHERE id=1;
+INSERT INTO t_warmcopy_finalize_deadline VALUES(2, REPEAT('b',512));
+SET DEBUG_SYNC =
+  'preserve_trx_after_begin_before_command_read SIGNAL warmcopy_finalize_before_read WAIT_FOR warmcopy_finalize_read_continue';
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_finalize_before_read TIMEOUT 10';
+
+--connect(warmcopy_finalize_owner, localhost, root,,test)
+--connection warmcopy_finalize_owner
+SET DEBUG_SYNC =
+  'preserve_trx_batch_after_targets_quiesced_before_attach SIGNAL warmcopy_finalize_ready WAIT_FOR warmcopy_finalize_continue';
+SET DEBUG_SYNC =
+  'preserve_trx_batch_after_one_target_preserved SIGNAL warmcopy_finalize_preserved WAIT_FOR warmcopy_finalize_preserved_continue';
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+--disable_warnings
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_finalize_ready TIMEOUT 2';
+--enable_warnings
+
+--connection warmcopy_finalize_app
+--send SELECT 1
+
+--connection default
+SET DEBUG_SYNC = 'now SIGNAL warmcopy_finalize_read_continue';
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_finalize_ready TIMEOUT 30';
+--sleep 16
+SET DEBUG_SYNC = 'now SIGNAL warmcopy_finalize_continue';
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_finalize_preserved TIMEOUT 10';
+
+--connection warmcopy_finalize_app
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--disconnect warmcopy_finalize_app
+
+--connection default
+SET DEBUG_SYNC = 'now SIGNAL warmcopy_finalize_preserved_continue';
+
+--connection warmcopy_finalize_owner
+--reap
+--disconnect warmcopy_finalize_owner
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+COMMIT;
+SELECT id, OCTET_LENGTH(payload) AS payload_len,
+       CASE id
+         WHEN 1 THEN payload=REPEAT('x',512)
+         WHEN 2 THEN payload=REPEAT('b',512)
+       END AS payload_ok
+  FROM t_warmcopy_finalize_deadline
+  ORDER BY id;
+
+DROP TABLE t_warmcopy_finalize_deadline;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=30000;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET DEBUG_SYNC = 'RESET';

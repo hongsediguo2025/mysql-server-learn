@@ -26,7 +26,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 *****************************************************************************/
 
 /** @file trx/trx0preserve.cc
- Preserve transaction helper stubs for the 8.0.22 port. */
+ Preserve transaction bridge helpers for the 8.0.22 port. */
 
 #include "trx0preserve.h"
 

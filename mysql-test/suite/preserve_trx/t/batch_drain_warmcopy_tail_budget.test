@@ -10,40 +10,6 @@ SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
 SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=8;
 
-# Lint-only source-shape preflight. Runtime evidence in this file comes from
-# the DRAIN, tail-budget rejection, status, and residue assertions below.
---perl
-use strict;
-use warnings;
-use File::Spec;
-
-my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
-  or die "MYSQL_TEST_DIR is not set";
-my $source_root = File::Spec->rel2abs(
-  File::Spec->catdir($mysql_test_dir, '..'));
-my $path = File::Spec->catfile($source_root, 'sql', 'preserve_trx.cc');
-open(my $fh, '<', $path) or die "cannot open $path: $!";
-my $src = do { local $/; <$fh> };
-close($fh);
-
-$src =~ /Preserve_snapshot_status finalize_for_preserve\s*\(.*?^\s*}\n\n  void discard_for_preserve/ms
-  or die "could not find Warmcopy_batch_blob_provider::finalize_for_preserve\n";
-my $body = $&;
-die "warm-copy phase 2 must not rebuild a full binlog cache blob\n"
-  if $body =~ /mysql_binlog_preserve_warmcopy_build_blob\s*\(/s;
-
-my $carrier_path = File::Spec->catfile($source_root, 'sql',
-  'preserve_trx_carrier_file.cc');
-open($fh, '<', $carrier_path) or die "cannot open $carrier_path: $!";
-my $carrier_src = do { local $/; <$fh> };
-close($fh);
-$carrier_src =~ /Local_file_preserved_trx_carrier::adopt_warm_external_blob\s*\(.*?^\}\n\nPreserved_trx_carrier_status/ms
-  or die "could not find Local_file_preserved_trx_carrier::adopt_warm_external_blob\n";
-my $adopt_body = $&;
-die "warm-copy phase 2 adopt must not scan the whole warm blob for digest\n"
-  if $adopt_body =~ /read_file_sha256_digest|EVP_DigestUpdate|my_read/s;
-EOF
-
 CREATE TABLE t_warmcopy_tail(id INT PRIMARY KEY, payload VARBINARY(1024))
   ENGINE=InnoDB;
 INSERT INTO t_warmcopy_tail VALUES(1,REPEAT('a',512));

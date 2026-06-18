@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
@@ -42,24 +44,11 @@ LEGACY_LINT_RULE_IDS: Sequence[str] = (
 
 SOURCE_LINT_RULE_IDS: Sequence[str] = (
     *LEGACY_LINT_RULE_IDS,
+    "carrier_read_no_follow_lint",
     "preserve_sql_command_flags_lint",
 )
 
-SOURCE_SHAPE_DEBT_ALLOWLIST: Sequence[str] = (
-    "mysql-test/suite/preserve_trx/t/batch_drain_drained_session_blocked.test",
-    "mysql-test/suite/preserve_trx/t/batch_drain_warmcopy_large_cache.test",
-    "mysql-test/suite/preserve_trx/t/"
-    "batch_drain_warmcopy_missing_prebuilt_failure.test",
-    "mysql-test/suite/preserve_trx/t/batch_drain_warmcopy_resource_limits.test",
-    "mysql-test/suite/preserve_trx/t/batch_drain_warmcopy_tail_budget.test",
-    "mysql-test/suite/preserve_trx/t/concurrent_standard_xa.test",
-    "mysql-test/suite/preserve_trx/t/"
-    "force_recovery_level2_unsupported_with_cache.test",
-    "mysql-test/suite/preserve_trx/t/sigterm_during_preserve_shutdown.test",
-    "mysql-test/suite/preserve_trx/t/temp_table_space_id_reserved_on_restart.test",
-    "mysql-test/suite/preserve_trx/t/token_delivery_disconnect_cleanup.test",
-    "mysql-test/suite/preserve_trx/t/warmcopy_admission_toctou.test",
-)
+SOURCE_SHAPE_DEBT_ALLOWLIST: Sequence[str] = ()
 
 WIDE_ERROR_MASK_ALLOWLIST: Sequence[str] = (
     "mysql-test/suite/preserve_trx/include/"
@@ -184,6 +173,72 @@ def _check_legacy_lint_registration(repo_root: Path,
             line=1,
             message="registered legacy lint MTR test is missing",
         ))
+
+
+def _extract_mtr_perl_blocks(text: str) -> List[tuple[int, str]]:
+    blocks: List[tuple[int, str]] = []
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        if lines[index].strip() != "--perl":
+            index += 1
+            continue
+        start_line = index + 1
+        index += 1
+        body: List[str] = []
+        while index < len(lines) and lines[index].strip() != "EOF":
+            body.append(lines[index])
+            index += 1
+        blocks.append((start_line, "\n".join(body) + "\n"))
+        if index < len(lines) and lines[index].strip() == "EOF":
+            index += 1
+    return blocks
+
+
+def _check_legacy_lint_bodies(repo_root: Path,
+                              findings: List[LintFinding]) -> None:
+    test_dir = repo_root / "mysql-test/suite/preserve_trx/t"
+    mysql_test_dir = repo_root / "mysql-test"
+    if not test_dir.is_dir() or not mysql_test_dir.is_dir():
+        return
+
+    env = os.environ.copy()
+    env["MYSQL_TEST_DIR"] = str(mysql_test_dir)
+    for name in LEGACY_LINT_RULE_IDS:
+        path = test_dir / f"{name}.test"
+        if not path.is_file():
+            continue
+        blocks = _extract_mtr_perl_blocks(_read_text(path))
+        if not blocks:
+            findings.append(LintFinding(
+                rule=name,
+                path=_relpath(repo_root, path),
+                line=1,
+                message="legacy MTR lint test has no --perl block to execute",
+            ))
+            continue
+        for start_line, body in blocks:
+            proc = subprocess.run(
+                ["perl", "-"],
+                input=body,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=repo_root,
+                env=env,
+                check=False,
+            )
+            if proc.returncode == 0:
+                continue
+            message = (proc.stderr or proc.stdout or
+                       f"perl exited with status {proc.returncode}").strip()
+            findings.append(LintFinding(
+                rule=name,
+                path=_relpath(repo_root, path),
+                line=start_line,
+                message=message.splitlines()[0][:500],
+                snippet="\n".join(message.splitlines()[1:4])[:500],
+            ))
 
 
 def _check_test_layering(repo_root: Path,
@@ -341,14 +396,41 @@ def _check_preserve_sql_command_flags(repo_root: Path,
         ))
 
 
+def _check_carrier_read_no_follow(repo_root: Path,
+                                  findings: List[LintFinding]) -> None:
+    targets = (
+        "sql/preserve_trx_carrier_file.cc",
+        "sql/preserve_trx_temp_table_carrier.cc",
+    )
+    unsafe_open = re.compile(
+        r"my_open\s*\(\s*[^;]*?,\s*O_RDONLY\s*,\s*MYF\s*\(\s*0\s*\)\s*\)"
+    )
+    for rel in targets:
+        path = repo_root / rel
+        if not path.is_file():
+            continue
+        text = _read_text(path)
+        for match in unsafe_open.finditer(text):
+            findings.append(LintFinding(
+                rule="carrier_read_no_follow_lint",
+                path=rel,
+                line=_line_for_pos(text, match.start()),
+                message="preserve carrier read paths must use no-follow "
+                        "regular-file open helpers",
+                snippet=match.group(0).strip().replace("\n", " ")[:240],
+            ))
+
+
 def run_lint_checks(repo_root: Path,
                     output_dir: Optional[Path] = None) -> Dict[str, object]:
     repo_root = repo_root.resolve()
     findings: List[LintFinding] = []
 
     _check_legacy_lint_registration(repo_root, findings)
+    _check_legacy_lint_bodies(repo_root, findings)
     _check_test_layering(repo_root, findings)
     _check_wide_error_masks(repo_root, findings)
+    _check_carrier_read_no_follow(repo_root, findings)
     _check_preserve_sql_command_flags(repo_root, findings)
 
     summary: Dict[str, object] = {

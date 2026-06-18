@@ -1127,6 +1127,42 @@ TEST(PreservedTrxExpiredReaper, DeadlineUsesMonotonicAnchor) {
   preserved_trx_remove_record_for_unit_test("unit-monotonic-deadline-token");
 }
 
+TEST(PreservedTrxDeadline, OperationalDeadlineUsesMonotonicElapsedTime) {
+  EXPECT_EQ(0U, preserved_trx_monotonic_deadline_after_ms_for_unit_test(1000, 0));
+  EXPECT_EQ(6000U,
+            preserved_trx_monotonic_deadline_after_ms_for_unit_test(1000, 5));
+
+  EXPECT_FALSE(
+      preserved_trx_monotonic_deadline_expired_for_unit_test(6000, 5999));
+  EXPECT_TRUE(
+      preserved_trx_monotonic_deadline_expired_for_unit_test(6000, 6000));
+  EXPECT_FALSE(preserved_trx_monotonic_deadline_expired_for_unit_test(0, 9000));
+
+  EXPECT_EQ(5U, preserved_trx_monotonic_timeout_ms_until_deadline_for_unit_test(
+                    6000, 99, 1000));
+  EXPECT_EQ(1U, preserved_trx_monotonic_timeout_ms_until_deadline_for_unit_test(
+                    6000, 99, 6000));
+  EXPECT_EQ(99U, preserved_trx_monotonic_timeout_ms_until_deadline_for_unit_test(
+                     0, 99, 6000));
+}
+
+TEST(PreservedTrxDeadline, RecoveryDeadlineUsesMonotonicAnchor) {
+  const uint old_grace_seconds = preserve_trx_recovery_grace_seconds;
+  preserve_trx_recovery_grace_seconds = 0;
+
+  Preserve_snapshot_metadata input = {};
+  input.created_at_us = 1000;
+  input.expires_at_us = 2000;
+  input.recovered_count = 1;
+
+  EXPECT_FALSE(preserved_trx_recovery_deadline_expired_for_unit_test(
+      input, 1000, 5000, 5999));
+  EXPECT_TRUE(preserved_trx_recovery_deadline_expired_for_unit_test(
+      input, 1000, 5000, 6000));
+
+  preserve_trx_recovery_grace_seconds = old_grace_seconds;
+}
+
 TEST(PreservedTrxExpiredReaper, FailedObservableRecordsAreGarbageCollected) {
   preserved_trx_add_failed_observable_record_for_unit_test(
       "unit-failed-observable-gc-token", 1000);

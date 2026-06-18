@@ -14,8 +14,6 @@ FROM performance_schema.preserved_transactions;
 preserved_count_during_force_recovery
 0
 include/assert_grep.inc [Force recovery level 2 reports preserved snapshot retention]
-force_recovery_preflight_skips_snapshot_scan
-1
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 START TRANSACTION;

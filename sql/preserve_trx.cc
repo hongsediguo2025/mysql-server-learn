@@ -37,6 +37,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -366,6 +367,38 @@ static uint64_t preserve_trx_monotonic_us() {
           .count());
 }
 
+static uint64_t preserve_trx_monotonic_deadline_after_us(uint64_t now_us,
+                                                         uint64_t delay_us) {
+  if (now_us > std::numeric_limits<uint64_t>::max() - delay_us)
+    return std::numeric_limits<uint64_t>::max();
+  return now_us + delay_us;
+}
+
+static uint64_t preserve_trx_monotonic_deadline_after_ms(uint64_t now_us,
+                                                         uint64_t timeout_ms) {
+  if (timeout_ms == 0) return 0;
+  if (timeout_ms > std::numeric_limits<uint64_t>::max() / 1000)
+    return std::numeric_limits<uint64_t>::max();
+  return preserve_trx_monotonic_deadline_after_us(now_us, timeout_ms * 1000);
+}
+
+static bool preserve_trx_monotonic_deadline_expired_at(uint64_t deadline_us,
+                                                       uint64_t now_us) {
+  return deadline_us != 0 && now_us >= deadline_us;
+}
+
+static unsigned long preserve_trx_monotonic_timeout_ms_until_deadline_at(
+    uint64_t deadline_us, unsigned long fallback_timeout_ms, uint64_t now_us) {
+  if (deadline_us == 0) return fallback_timeout_ms;
+  if (now_us >= deadline_us) return 1;
+  const uint64_t remaining_us = deadline_us - now_us;
+  const uint64_t remaining_ms = (remaining_us + 999) / 1000;
+  return remaining_ms > std::numeric_limits<unsigned long>::max()
+             ? std::numeric_limits<unsigned long>::max()
+             : static_cast<unsigned long>(
+                   std::max<uint64_t>(1, remaining_ms));
+}
+
 static uint64_t preserve_trx_wall_deadline_to_monotonic(
     uint64_t deadline_wall_us, uint64_t anchor_wall_us,
     uint64_t anchor_monotonic_us) {
@@ -386,6 +419,26 @@ static uint64_t preserve_trx_wall_deadline_for_record(
     const uint64_t started_at_us =
         server_start_time <= 0
             ? my_micro_time()
+            : static_cast<uint64_t>(server_start_time) *
+                  kMicrosecondsPerSecond;
+    const uint64_t grace_deadline_us =
+        started_at_us +
+        static_cast<uint64_t>(preserve_trx_recovery_grace_seconds) *
+            kMicrosecondsPerSecond;
+    deadline_us = std::max(deadline_us, grace_deadline_us);
+  }
+  return deadline_us;
+}
+
+static uint64_t preserve_trx_recovery_wall_deadline_for_snapshot(
+    const Preserve_snapshot_metadata &metadata, uint64_t anchor_wall_us) {
+  if (metadata.expires_at_us == 0) return 1;
+
+  uint64_t deadline_us = metadata.expires_at_us;
+  if (metadata.recovered_count == 0) {
+    const uint64_t started_at_us =
+        server_start_time <= 0
+            ? anchor_wall_us
             : static_cast<uint64_t>(server_start_time) *
                   kMicrosecondsPerSecond;
     const uint64_t grace_deadline_us =
@@ -3348,25 +3401,25 @@ class Preserve_drain_active_transactions final : public Do_THD_Impl {
 bool preserve_trx_drain_other_active_transactions(THD *thd) {
   const bool hard_configured =
       preserve_trx_drain_mode == PRESERVE_TRX_DRAIN_MODE_HARD;
-  const uint64_t now_us = my_micro_time();
-  const uint64_t soft_deadline_us =
-      now_us +
-      static_cast<uint64_t>(preserve_trx_drain_grace_ms) * 1000ULL;
+  const uint64_t now_us = preserve_trx_monotonic_us();
+  const uint64_t soft_deadline_us = preserve_trx_monotonic_deadline_after_us(
+      now_us, static_cast<uint64_t>(preserve_trx_drain_grace_ms) * 1000ULL);
   bool hard_drain = hard_configured || preserve_trx_drain_grace_ms == 0;
   uint64_t hard_deadline_us = 0;
 
   auto arm_hard_deadline = [&]() {
     if (hard_deadline_us == 0) {
-      hard_deadline_us =
-          my_micro_time() +
-          static_cast<uint64_t>(preserve_trx_drain_hard_timeout_ms) * 1000ULL;
+      hard_deadline_us = preserve_trx_monotonic_deadline_after_us(
+          preserve_trx_monotonic_us(),
+          static_cast<uint64_t>(preserve_trx_drain_hard_timeout_ms) * 1000ULL);
     }
   };
   if (hard_drain) arm_hard_deadline();
 
   for (;;) {
     if (thd->killed) return true;
-    if (!hard_drain && my_micro_time() >= soft_deadline_us) {
+    if (!hard_drain && preserve_trx_monotonic_deadline_expired_at(
+                           soft_deadline_us, preserve_trx_monotonic_us())) {
       DEBUG_SYNC(thd, "preserve_trx_drain_before_hard");
       hard_drain = true;
       arm_hard_deadline();
@@ -3379,7 +3432,8 @@ bool preserve_trx_drain_other_active_transactions(THD *thd) {
     }
     if (drain.active_count() == 0) return false;
     if (hard_drain && hard_deadline_us != 0 &&
-        my_micro_time() >= hard_deadline_us) {
+        preserve_trx_monotonic_deadline_expired_at(
+            hard_deadline_us, preserve_trx_monotonic_us())) {
       my_error(ER_PRESERVE_TRX_DRAIN_TIMEOUT, MYF(0));
       return true;
     }
@@ -3927,7 +3981,8 @@ bool preserve_trx_batch_wait_target_ready(
     Preserve_trx_batch_thd_state *state, ulonglong close_deadline_us) {
   for (;;) {
     if (owner != nullptr && owner->killed) return true;
-    if (close_deadline_us != 0 && my_micro_time() >= close_deadline_us)
+    if (preserve_trx_monotonic_deadline_expired_at(
+            close_deadline_us, preserve_trx_monotonic_us()))
       return true;
 
     Preserve_batch_target_state_reader reader(generation, target_thread_id);
@@ -3944,11 +3999,8 @@ bool preserve_trx_batch_wait_target_ready(
 }
 
 ulonglong preserve_trx_batch_hard_deadline_us() {
-  return preserve_trx_drain_hard_timeout_ms == 0
-             ? 0
-             : my_micro_time() +
-                   static_cast<ulonglong>(preserve_trx_drain_hard_timeout_ms) *
-                       1000ULL;
+  return preserve_trx_monotonic_deadline_after_ms(
+      preserve_trx_monotonic_us(), preserve_trx_drain_hard_timeout_ms);
 }
 
 class Preserve_batch_clear_generation final : public Do_THD_Impl {
@@ -4043,47 +4095,69 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
       of batch preserve, which is dominated by lock/read-view/MDL/undo work and
       is not the large binlog-cache copy regression this gate measures.
     */
-    const ulonglong phase2_started_us = my_micro_time();
+    const ulonglong phase2_started_us = preserve_trx_monotonic_us();
     auto finish = [&](Preserve_snapshot_status status) {
-      const ulonglong now_us = my_micro_time();
+      const ulonglong now_us = preserve_trx_monotonic_us();
       const ulonglong elapsed_us =
           now_us >= phase2_started_us ? now_us - phase2_started_us : 0;
       preserve_trx_warmcopy_note_phase2_pause_us(
           elapsed_us == 0 ? 1 : elapsed_us);
       return status;
     };
+    auto log_provider_failure = [&](const char *reason, uint64_t reserved_size,
+                                    uint64_t finalized_size) {
+      std::ostringstream message;
+      message << "PRESERVE: warm-copy provider finalize failed"
+              << " reason=" << reason
+              << " thread_id=" << (thd == nullptr ? 0 : thd->thread_id())
+              << " reserved_size=" << reserved_size
+              << " finalized_size=" << finalized_size
+              << " total_bytes=" << m_total_bytes
+              << " max_total_bytes=" << preserve_trx_warmcopy_max_total_bytes
+              << " tail_budget=" << preserve_trx_warmcopy_tail_budget_bytes
+              << " close_deadline_us=" << m_close_deadline_us;
+      LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.str().c_str());
+    };
 
-    if (thd == nullptr || blob == nullptr)
+    if (thd == nullptr || blob == nullptr) {
+      log_provider_failure("invalid argument", 0, 0);
       return finish(Preserve_snapshot_status::INVALID_ARGUMENT);
-    std::lock_guard<std::mutex> guard(m_mutex);
-    if (warmcopy_close_deadline_expired(m_close_deadline_us)) {
-      return finish(Preserve_snapshot_status::IO_ERROR);
     }
+    std::lock_guard<std::mutex> guard(m_mutex);
     auto it = m_entries.find(thd->thread_id());
     if (it == m_entries.end() || it->second.preparing) {
+      log_provider_failure("entry missing or still preparing", 0, 0);
       return finish(Preserve_snapshot_status::INVALID_ARGUMENT);
     }
     Entry &entry = it->second;
     Mysql_binlog_warmcopy_session *session = entry.session;
-    if (session == nullptr)
+    if (session == nullptr) {
+      log_provider_failure("session missing", entry.reserved_size, 0);
       return finish(Preserve_snapshot_status::IO_ERROR);
+    }
 
     bool has_final_blob = false;
     PrebuiltBinlogCacheBlob finalized;
-    if (mysql_binlog_preserve_warmcopy_finalize_session(
-            thd, session, preserve_trx_warmcopy_tail_budget_bytes, &finalized,
-            &has_final_blob) ||
-        !has_final_blob) {
+    const bool finalize_failed = mysql_binlog_preserve_warmcopy_finalize_session(
+        thd, session, preserve_trx_warmcopy_tail_budget_bytes, &finalized,
+        &has_final_blob);
+    if (finalize_failed || !has_final_blob) {
+      log_provider_failure(finalize_failed ? "session finalize failed"
+                                           : "session produced no final blob",
+                           entry.reserved_size, finalized.size);
       return finish(Preserve_snapshot_status::IO_ERROR);
     }
-    if (warmcopy_close_deadline_expired(m_close_deadline_us)) {
-      if (m_carrier != nullptr) {
-        (void)m_carrier->remove_warm_external_blob(finalized.warmcopy_id,
-                                                   finalized.name);
-      }
-      return finish(Preserve_snapshot_status::IO_ERROR);
-    }
+    /*
+      m_close_deadline_us bounds the admission-closing and quiesced-target
+      preparation window.  Once phase-2 target preserve has started, rejecting a
+      ready warm-copy artifact solely because that earlier deadline elapsed can
+      turn a large but otherwise consistent batch into a cleanup failure.  The
+      session finalize path itself is bounded by its tail budget and by the
+      surrounding batch drain lifecycle.
+    */
     if (!can_account_replacement(entry.reserved_size, finalized.size)) {
+      log_provider_failure("replacement accounting exceeded budget",
+                           entry.reserved_size, finalized.size);
       if (m_carrier != nullptr) {
         (void)m_carrier->remove_warm_external_blob(finalized.warmcopy_id,
                                                    finalized.name);
@@ -4638,19 +4712,14 @@ uint warmcopy_admission_destructor_close_timeout_ms() {
 }
 
 bool warmcopy_close_deadline_expired(ulonglong close_deadline_us) {
-  return close_deadline_us != 0 && my_micro_time() >= close_deadline_us;
+  return preserve_trx_monotonic_deadline_expired_at(
+      close_deadline_us, preserve_trx_monotonic_us());
 }
 
 unsigned long warmcopy_close_timeout_ms_until_deadline(
     ulonglong close_deadline_us, unsigned long fallback_timeout_ms) {
-  if (close_deadline_us == 0) return fallback_timeout_ms;
-  const ulonglong now_us = my_micro_time();
-  if (now_us >= close_deadline_us) return 1;
-  const ulonglong remaining_us = close_deadline_us - now_us;
-  const ulonglong remaining_ms = (remaining_us + 999) / 1000;
-  return remaining_ms > std::numeric_limits<unsigned long>::max()
-             ? std::numeric_limits<unsigned long>::max()
-             : static_cast<unsigned long>(std::max<ulonglong>(1, remaining_ms));
+  return preserve_trx_monotonic_timeout_ms_until_deadline_at(
+      close_deadline_us, fallback_timeout_ms, preserve_trx_monotonic_us());
 }
 
 class Warmcopy_open_admission_scope {
@@ -4784,8 +4853,8 @@ class Warmcopy_batch_drain_participant final
     }
 
     if (m_closing_deadline_us == 0 && m_close_timeout_ms != 0) {
-      m_closing_deadline_us =
-          my_micro_time() + static_cast<ulonglong>(m_close_timeout_ms) * 1000;
+      m_closing_deadline_us = preserve_trx_monotonic_deadline_after_ms(
+          preserve_trx_monotonic_us(), m_close_timeout_ms);
       m_provider->set_close_deadline_us(m_closing_deadline_us);
     }
     m_closed = true;
@@ -5223,6 +5292,37 @@ bool preserved_trx_record_expired_for_unit_test(const std::string &token,
   return false;
 }
 
+uint64_t preserved_trx_monotonic_deadline_after_ms_for_unit_test(
+    uint64_t now_monotonic_us, uint64_t timeout_ms) {
+  return preserve_trx_monotonic_deadline_after_ms(now_monotonic_us, timeout_ms);
+}
+
+bool preserved_trx_monotonic_deadline_expired_for_unit_test(
+    uint64_t deadline_monotonic_us, uint64_t now_monotonic_us) {
+  return preserve_trx_monotonic_deadline_expired_at(deadline_monotonic_us,
+                                                   now_monotonic_us);
+}
+
+unsigned long preserved_trx_monotonic_timeout_ms_until_deadline_for_unit_test(
+    uint64_t deadline_monotonic_us, unsigned long fallback_timeout_ms,
+    uint64_t now_monotonic_us) {
+  return preserve_trx_monotonic_timeout_ms_until_deadline_at(
+      deadline_monotonic_us, fallback_timeout_ms, now_monotonic_us);
+}
+
+bool preserved_trx_recovery_deadline_expired_for_unit_test(
+    const Preserve_snapshot_metadata &metadata, uint64_t anchor_wall_us,
+    uint64_t anchor_monotonic_us, uint64_t now_monotonic_us) {
+  const uint64_t deadline_wall_us =
+      preserve_trx_recovery_wall_deadline_for_snapshot(metadata,
+                                                       anchor_wall_us);
+  const uint64_t deadline_monotonic_us =
+      preserve_trx_wall_deadline_to_monotonic(
+          deadline_wall_us, anchor_wall_us, anchor_monotonic_us);
+  return preserve_trx_monotonic_deadline_expired_at(deadline_monotonic_us,
+                                                   now_monotonic_us);
+}
+
 void preserved_trx_add_failed_observable_record_for_unit_test(
     const std::string &token, uint64_t anchor_monotonic_us) {
   Preserve_snapshot_metadata metadata;
@@ -5304,11 +5404,11 @@ static bool preserve_trx_wait_target_timed_out(THD *thd,
                                               uint *quiesced_wait_loops) {
   if (thd == nullptr || preserve_trx_drain_hard_timeout_ms == 0) return false;
   if (*hard_deadline_us == 0) {
-    *hard_deadline_us =
-        my_micro_time() +
-        static_cast<uint64_t>(preserve_trx_drain_hard_timeout_ms) * 1000ULL;
+    *hard_deadline_us = preserve_trx_monotonic_deadline_after_ms(
+        preserve_trx_monotonic_us(), preserve_trx_drain_hard_timeout_ms);
   }
-  if (my_micro_time() >= *hard_deadline_us) {
+  if (preserve_trx_monotonic_deadline_expired_at(
+          *hard_deadline_us, preserve_trx_monotonic_us())) {
     my_error(ER_PRESERVE_TRX_DRAIN_TIMEOUT, MYF(0));
     return true;
   }
@@ -6206,42 +6306,30 @@ static bool rollback_claimed_preserved_snapshot_or_log(
                                                              metadata);
 }
 
-static uint64_t preserve_trx_server_started_at_us() {
-  if (server_start_time <= 0) return my_micro_time();
-  return static_cast<uint64_t>(server_start_time) * kMicrosecondsPerSecond;
-}
-
-static uint64_t preserve_trx_deadline_us(
-    const Preserve_snapshot_metadata &metadata, bool apply_recovery_grace) {
-  if (metadata.expires_at_us == 0) return 1;
-
-  uint64_t deadline_us = metadata.expires_at_us;
-  if (apply_recovery_grace) {
-    const uint64_t grace_deadline_us =
-        preserve_trx_server_started_at_us() +
-        static_cast<uint64_t>(preserve_trx_recovery_grace_seconds) *
-            kMicrosecondsPerSecond;
-    deadline_us = std::max(deadline_us, grace_deadline_us);
-  }
-  return deadline_us;
-}
-
-static uint64_t preserve_trx_recovery_deadline_us(
-    const Preserve_snapshot_metadata &metadata) {
-  return preserve_trx_deadline_us(metadata, metadata.recovered_count == 0);
-}
-
 static bool preserve_trx_recovery_deadline_expired(
-    const Preserve_snapshot_metadata &metadata) {
-  const uint64_t deadline_us = preserve_trx_recovery_deadline_us(metadata);
-  return deadline_us != 0 && my_micro_time() >= deadline_us;
+    const Preserve_snapshot_metadata &metadata, uint64_t anchor_wall_us,
+    uint64_t anchor_monotonic_us) {
+  const uint64_t deadline_wall_us =
+      preserve_trx_recovery_wall_deadline_for_snapshot(metadata,
+                                                       anchor_wall_us);
+  const uint64_t deadline_monotonic_us =
+      preserve_trx_wall_deadline_to_monotonic(
+          deadline_wall_us, anchor_wall_us, anchor_monotonic_us);
+  return preserve_trx_monotonic_deadline_expired_at(
+      deadline_monotonic_us, preserve_trx_monotonic_us());
 }
 
 bool preserved_trx_resume_deadline_expired(
     const Preserve_snapshot_metadata &metadata) {
-  const uint64_t deadline_us =
-      preserve_trx_deadline_us(metadata, metadata.recovered_count == 1);
-  return deadline_us != 0 && my_micro_time() >= deadline_us;
+  const uint64_t anchor_wall_us = my_micro_time();
+  const uint64_t anchor_monotonic_us = preserve_trx_monotonic_us();
+  const uint64_t deadline_wall_us =
+      preserve_trx_wall_deadline_for_record(metadata);
+  const uint64_t deadline_monotonic_us =
+      preserve_trx_wall_deadline_to_monotonic(
+          deadline_wall_us, anchor_wall_us, anchor_monotonic_us);
+  return preserve_trx_monotonic_deadline_expired_at(deadline_monotonic_us,
+                                                   anchor_monotonic_us);
 }
 
 static bool restore_record_after_resume_failure(
@@ -7127,7 +7215,9 @@ bool preserved_trx_thd_has_external_use(THD *thd) {
 }
 
 static bool recover_preserved_snapshot(const std::string &dir,
-                                       const std::string &token) {
+                                       const std::string &token,
+                                       uint64_t recovery_anchor_wall_us,
+                                       uint64_t recovery_anchor_monotonic_us) {
   auto store = create_preserved_trx_default_store(dir);
   Preserved_trx_bundle bundle;
   Preserve_snapshot_status status =
@@ -7183,7 +7273,8 @@ static bool recover_preserved_snapshot(const std::string &dir,
     later passes must use the original wall-clock expiry exactly as stored.
   */
   const bool recovery_deadline_expired =
-      preserve_trx_recovery_deadline_expired(metadata);
+      preserve_trx_recovery_deadline_expired(metadata, recovery_anchor_wall_us,
+                                             recovery_anchor_monotonic_us);
   ++metadata.recovered_count;
   if (metadata.recovered_count >= preserve_trx_recovery_max_count) {
     preserved_trx_add_failed_observable_record(
@@ -7466,6 +7557,8 @@ bool preserved_temp_images_bootstrap_preamble() {
 bool preserved_trx_recover_all() {
   const std::string dir = normalize_dir(preserve_trx_default_dir());
   auto store = create_preserved_trx_default_store(dir);
+  const uint64_t recovery_anchor_wall_us = my_micro_time();
+  const uint64_t recovery_anchor_monotonic_us = preserve_trx_monotonic_us();
   DBUG_EXECUTE_IF("preserve_trx_fail_recover_scan", {
     const std::string message =
         "Failed to scan preserved transaction directory '" + dir +
@@ -7562,7 +7655,9 @@ bool preserved_trx_recover_all() {
         error = true;
       continue;
     }
-    if (recover_preserved_snapshot(dir, token)) error = true;
+    if (recover_preserved_snapshot(dir, token, recovery_anchor_wall_us,
+                                   recovery_anchor_monotonic_us))
+      error = true;
   }
 
   for (const std::string &token : binlog_cache_tokens) {
@@ -8585,13 +8680,8 @@ bool Preserve_trx_drain_service::execute(
       epoch admission and waits for already-admitted mirror work to drain.
     */
     draining.transition_to(Preserve_trx_manager_state::WARMCOPY_CLOSING);
-    warmcopy_close_deadline_us =
-        preserve_trx_warmcopy_close_timeout_ms == 0
-            ? 0
-            : my_micro_time() +
-                  static_cast<ulonglong>(
-                      preserve_trx_warmcopy_close_timeout_ms) *
-                      1000;
+    warmcopy_close_deadline_us = preserve_trx_monotonic_deadline_after_ms(
+        preserve_trx_monotonic_us(), preserve_trx_warmcopy_close_timeout_ms);
     warmcopy_participant->set_closing_deadline_us(warmcopy_close_deadline_us);
     DEBUG_SYNC(thd, "preserve_trx_warmcopy_after_closing_state_before_targets");
   }

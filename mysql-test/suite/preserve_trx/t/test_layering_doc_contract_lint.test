@@ -35,27 +35,7 @@ my @source_shape_patterns = (
   qr{read_source_file_for_[A-Za-z0-9_]+\s*\(\s*["](?:sql|storage|unittest|include)/}s,
 );
 
-my %allowed_mtr_source_shape_debt = map { $_ => 1 } (
-  File::Spec->catfile($suite_dir, 't',
-                      'batch_drain_drained_session_blocked.test'),
-  File::Spec->catfile($suite_dir, 't',
-                      'batch_drain_warmcopy_large_cache.test'),
-  File::Spec->catfile($suite_dir, 't',
-                      'batch_drain_warmcopy_missing_prebuilt_failure.test'),
-  File::Spec->catfile($suite_dir, 't',
-                      'batch_drain_warmcopy_resource_limits.test'),
-  File::Spec->catfile($suite_dir, 't',
-                      'batch_drain_warmcopy_tail_budget.test'),
-  File::Spec->catfile($suite_dir, 't', 'concurrent_standard_xa.test'),
-  File::Spec->catfile($suite_dir, 't',
-                      'force_recovery_level2_unsupported_with_cache.test'),
-  File::Spec->catfile($suite_dir, 't', 'sigterm_during_preserve_shutdown.test'),
-  File::Spec->catfile($suite_dir, 't',
-                      'temp_table_space_id_reserved_on_restart.test'),
-  File::Spec->catfile($suite_dir, 't',
-                      'token_delivery_disconnect_cleanup.test'),
-  File::Spec->catfile($suite_dir, 't', 'warmcopy_admission_toctou.test'),
-);
+my %allowed_mtr_source_shape_debt = ();
 
 sub line_for_pos {
   my ($text, $pos) = @_;

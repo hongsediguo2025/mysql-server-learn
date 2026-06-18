@@ -3435,39 +3435,93 @@ class Mysql_binlog_warmcopy_session final
   bool finalize(THD *thd, uint64_t tail_budget_bytes,
                 PrebuiltBinlogCacheBlob *blob, bool *has_blob) {
     if (has_blob != nullptr) *has_blob = false;
-    if (blob == nullptr) return true;
-    if (thd != m_thd || m_writer == nullptr) return true;
+    auto log_finalize_failure = [&](const char *reason, uint64_t current_length,
+                                    bool current_has_blob) {
+      std::ostringstream message;
+      message << "PRESERVE: warm-copy binlog cache finalize failed"
+              << " reason=" << reason << " current_length=" << current_length
+              << " current_has_blob=" << (current_has_blob ? 1 : 0)
+              << " prefix_end=" << m_prefix_end
+              << " tail_budget=" << tail_budget_bytes
+              << " max_blob_bytes=" << m_max_blob_bytes
+              << " digest_until=" << m_digest_until
+              << " destination_length=" << m_destination_length
+              << " durable_length=" << m_durable_length
+              << " pending_ranges=" << m_pending_ranges.size()
+              << " pending_range_bytes=" << m_pending_range_bytes
+              << " degraded=" << (m_degraded ? 1 : 0);
+      LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.str().c_str());
+    };
+    if (blob == nullptr) {
+      log_finalize_failure("warm-copy output blob pointer is null", 0, false);
+      return true;
+    }
+    if (thd != m_thd || m_writer == nullptr) {
+      log_finalize_failure("warm-copy session ownership mismatch", 0, false);
+      return true;
+    }
 
     uint64_t current_length = 0;
     bool current_has_blob = false;
     if (mysql_binlog_preserve_warmcopy_cache_length(thd, &current_length,
                                                     &current_has_blob)) {
+      log_finalize_failure("warm-copy cache length lookup failed", 0, false);
       return true;
     }
     if (!current_has_blob || current_length == 0) {
+      log_finalize_failure("warm-copy cache became empty before finalize",
+                           current_length, current_has_blob);
       (void)m_writer->abort();
       m_writer.reset();
       return false;
     }
-    if (m_degraded || current_length > m_max_blob_bytes ||
-        current_length < m_prefix_end ||
-        current_length - m_prefix_end > tail_budget_bytes ||
+    const uint64_t tail_bytes =
+        current_length >= m_prefix_end ? current_length - m_prefix_end : 0;
+    const bool finalize_invariant_failed =
+        m_degraded || current_length > m_max_blob_bytes ||
+        current_length < m_prefix_end || tail_bytes > tail_budget_bytes ||
         m_digest_until != current_length ||
         m_destination_length != current_length ||
-        m_durable_length != current_length || !m_pending_ranges.empty()) {
+        m_durable_length != current_length || !m_pending_ranges.empty();
+    if (finalize_invariant_failed) {
+      const char *reason = "warm-copy finalize invariant mismatch";
+      if (m_degraded)
+        reason = m_degraded_reason.empty() ? "warm-copy mirror degraded"
+                                           : m_degraded_reason.c_str();
+      else if (current_length > m_max_blob_bytes)
+        reason = "warm-copy current length exceeds session limit";
+      else if (current_length < m_prefix_end)
+        reason = "warm-copy current length below copied prefix";
+      else if (tail_bytes > tail_budget_bytes)
+        reason = "warm-copy tail exceeds phase-2 budget";
+      else if (m_digest_until != current_length)
+        reason = "warm-copy digest watermark incomplete";
+      else if (m_destination_length != current_length)
+        reason = "warm-copy destination length incomplete";
+      else if (m_durable_length != current_length)
+        reason = "warm-copy durable watermark incomplete";
+      else if (!m_pending_ranges.empty())
+        reason = "warm-copy pending mirror ranges remain";
+      log_finalize_failure(reason, current_length, current_has_blob);
       return true;
     }
 
     clear_mirror();
 
-    if (m_writer->close_without_sync() != Preserved_trx_carrier_status::OK)
+    const Preserved_trx_carrier_status close_status = m_writer->close_without_sync();
+    if (close_status != Preserved_trx_carrier_status::OK) {
+      log_finalize_failure("warm-copy writer close failed", current_length,
+                           current_has_blob);
       return true;
+    }
 
     std::array<unsigned char, kPreservedTrxSha256Length> digest{};
     unsigned int digest_length = 0;
     if (m_digest_ctx == nullptr ||
         EVP_DigestFinal_ex(m_digest_ctx, digest.data(), &digest_length) != 1 ||
         digest_length != digest.size()) {
+      log_finalize_failure("warm-copy digest finalization failed", current_length,
+                           current_has_blob);
       return true;
     }
     EVP_MD_CTX_free(m_digest_ctx);
@@ -3479,11 +3533,16 @@ class Mysql_binlog_warmcopy_session final
     blob->size = current_length;
     blob->digest = digest;
     if (mysql_binlog_preserve_export_metadata_only(thd, &blob->metadata)) {
+      log_finalize_failure("warm-copy metadata export failed", current_length,
+                           current_has_blob);
       (void)m_writer->abort();
       return true;
     }
-    if (m_writer->seal_descriptor(descriptor_from_prebuilt_warmcopy_blob(*blob)) !=
-        Preserved_trx_carrier_status::OK) {
+    const Preserved_trx_carrier_status seal_status =
+        m_writer->seal_descriptor(descriptor_from_prebuilt_warmcopy_blob(*blob));
+    if (seal_status != Preserved_trx_carrier_status::OK) {
+      log_finalize_failure("warm-copy descriptor seal failed", current_length,
+                           current_has_blob);
       (void)m_writer->abort();
       return true;
     }

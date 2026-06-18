@@ -222,6 +222,16 @@ bool preserved_trx_add_deadline_record_for_unit_test(
     uint64_t anchor_monotonic_us);
 bool preserved_trx_record_expired_for_unit_test(const std::string &token,
                                                 uint64_t now_monotonic_us);
+uint64_t preserved_trx_monotonic_deadline_after_ms_for_unit_test(
+    uint64_t now_monotonic_us, uint64_t timeout_ms);
+bool preserved_trx_monotonic_deadline_expired_for_unit_test(
+    uint64_t deadline_monotonic_us, uint64_t now_monotonic_us);
+unsigned long preserved_trx_monotonic_timeout_ms_until_deadline_for_unit_test(
+    uint64_t deadline_monotonic_us, unsigned long fallback_timeout_ms,
+    uint64_t now_monotonic_us);
+bool preserved_trx_recovery_deadline_expired_for_unit_test(
+    const Preserve_snapshot_metadata &metadata, uint64_t anchor_wall_us,
+    uint64_t anchor_monotonic_us, uint64_t now_monotonic_us);
 void preserved_trx_add_failed_observable_record_for_unit_test(
     const std::string &token, uint64_t anchor_monotonic_us);
 size_t preserved_trx_gc_failed_observable_records_for_unit_test(

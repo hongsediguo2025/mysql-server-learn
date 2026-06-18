@@ -257,9 +257,12 @@ $carrier_file =~ /Preserved_trx_carrier_status read_file_limited[\s\S]*?^}/m
   or die "could not isolate read_file_limited\n";
 my $carrier_limited_read = $&;
 die "carrier read must stat and enforce the byte limit before allocation/open read\n"
-  unless $carrier_limited_read =~
-         /file_exists\s*\([^;]*&stat_area[\s\S]*stat_area\.st_size[\s\S]*>\s*max_bytes[\s\S]*my_open/s &&
+  unless $carrier_limited_read =~ /file_exists\s*\([^;]*&stat_area/s &&
+         $carrier_limited_read =~ /stat_area\.st_size[\s\S]*>\s*max_bytes/s &&
+         $carrier_limited_read =~ /open_regular_file_no_follow_for_read/s &&
          index($carrier_limited_read, 'stat_area.st_size') <
+         index($carrier_limited_read, 'out->assign') &&
+         index($carrier_limited_read, 'open_regular_file_no_follow_for_read') <
          index($carrier_limited_read, 'out->assign');
 
 $carrier_file =~ /Preserved_trx_carrier_status Local_file_preserved_trx_carrier::read_existing[\s\S]*?^}/m

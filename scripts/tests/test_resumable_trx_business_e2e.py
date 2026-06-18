@@ -25,6 +25,7 @@ from scripts.resumable_trx_business_e2e import (
     OperationKind,
     Phase2PauseSample,
     ResumeCoordinator,
+    WARMCOPY_TAIL_BUDGET_BYTES,
     WorkloadPlan,
     canonicalize_normalized_binlog_table_events,
     comparable_binlog_table_events,
@@ -591,6 +592,27 @@ class _NoPauseBeforeProbeCoordinator(ResumeCoordinator):
         raise AssertionError("waiter should not checkpoint-pause before in-flight probe")
 
 
+class _RecordingResumeWaitCoordinator(ResumeCoordinator):
+    def __init__(self, sessions):
+        super().__init__(sessions)
+        self.wait_timeouts = []
+        self.pause_timeouts = []
+
+    def wait_for_resumed_connection(self, sid, timeout_s):
+        self.wait_timeouts.append((sid, timeout_s))
+        return _FakeConnection()
+
+    def current_drain_generation(self):
+        return 1
+
+    def drain_large_bucket_mb(self, generation):
+        return 0
+
+    def pause_for_drain_if_requested(self, sid, timeout_s):
+        self.pause_timeouts.append((sid, timeout_s))
+        return None
+
+
 class WorkloadPlanTest(unittest.TestCase):
     def test_default_plan_uses_30_tables_and_100_session_transactions(self):
         cfg = HarnessConfig()
@@ -859,6 +881,59 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertIs(result, resumed)
         self.assertEqual(original.commit_count, 0)
         self.assertGreater(resumed.commit_count, 0)
+
+    def test_worker_resume_wait_covers_full_warmcopy_drain_lifecycle(self):
+        cfg = HarnessConfig(
+            sessions=320,
+            resume_timeout_s=120,
+            shutdown_timeout_s=120,
+            startup_timeout_s=120,
+            warmcopy_required=True,
+            large_binlog_cache_sessions=8,
+            large_binlog_cache_buckets_mb=[1, 16, 64],
+            artifact_dir=".",
+        )
+        runtime = _SetupDisconnectRuntime()
+        coordinator = _RecordingResumeWaitCoordinator(cfg.sessions)
+        worker = BusinessWorker(
+            1,
+            WorkloadPlan(cfg),
+            runtime,
+            coordinator,
+            stop_event=threading.Event(),
+        )
+
+        worker._run_transaction(_FakeConnection(), tx_id=1)
+
+        self.assertTrue(coordinator.wait_timeouts)
+        _, timeout_s = coordinator.wait_timeouts[0]
+        self.assertGreaterEqual(timeout_s, 540)
+
+    def test_worker_pause_wait_covers_full_warmcopy_drain_lifecycle(self):
+        cfg = HarnessConfig(
+            sessions=320,
+            resume_timeout_s=120,
+            shutdown_timeout_s=120,
+            startup_timeout_s=120,
+            warmcopy_required=True,
+            large_binlog_cache_sessions=8,
+            large_binlog_cache_buckets_mb=[1, 16, 64],
+            artifact_dir=".",
+        )
+        coordinator = _RecordingResumeWaitCoordinator(cfg.sessions)
+        worker = BusinessWorker(
+            1,
+            WorkloadPlan(cfg),
+            _FakeRuntime(),
+            coordinator,
+            stop_event=threading.Event(),
+        )
+
+        worker._run_transaction(_FakeConnection(), tx_id=1)
+
+        self.assertTrue(coordinator.pause_timeouts)
+        _, timeout_s = coordinator.pause_timeouts[0]
+        self.assertGreaterEqual(timeout_s, 540)
 
     def test_temp_table_workload_commit_verification_uses_persistent_dml_table(self):
         cfg = HarnessConfig(sessions=1, temp_table_workload=True)
@@ -2232,7 +2307,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         runner.plan = WorkloadPlan(cfg)
         runner.runtime = _FakeRuntime()
 
-        fake_usage = type("Usage", (), {"free": 16 * 1024 * 1024 * 1024})()
+        fake_usage = type("Usage", (), {"free": 4 * 1024 * 1024 * 1024})()
         with mock.patch(
             "scripts.resumable_trx_business_e2e.shutil.disk_usage",
             return_value=fake_usage,
@@ -2247,7 +2322,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertIn("SET GLOBAL preserve_trx_warmcopy_chunk_bytes=16777216", sql_text)
         self.assertIn(
             "SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes="
-            f"{64 * 1024 * 1024}",
+            f"{WARMCOPY_TAIL_BUDGET_BYTES}",
             sql_text,
         )
         total_settings = [
@@ -2256,7 +2331,14 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         ]
         self.assertEqual(len(total_settings), 1)
         configured_total = int(total_settings[0].split("=")[1])
-        self.assertGreater(configured_total, 512 * 1024 * 1024 * 2)
+        effective_buckets = runner.plan.effective_large_binlog_cache_buckets_mb()
+        max_bucket_mb = max(effective_buckets) if effective_buckets else 1
+        expected_total = max(
+            runner.plan.warmcopy_reservation_bytes_for_bucket(max_bucket_mb)
+            + cfg.sessions * 1024 * 1024,
+            runner.plan.max_large_payload_bytes_per_statement(),
+        )
+        self.assertEqual(configured_total, expected_total)
 
     def test_large_batch_configures_preserve_capacity_for_all_sessions(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -2285,7 +2367,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         runner.plan = WorkloadPlan(cfg)
         runner.runtime = _FakeRuntime()
 
-        fake_usage = type("Usage", (), {"free": 16 * 1024 * 1024 * 1024})()
+        fake_usage = type("Usage", (), {"free": 4 * 1024 * 1024 * 1024})()
         with mock.patch(
             "scripts.resumable_trx_business_e2e.shutil.disk_usage",
             return_value=fake_usage,
@@ -2297,9 +2379,62 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             sql for sql in runner.runtime.sql
             if sql.startswith("SET GLOBAL preserve_trx_warmcopy_max_total_bytes=")
         ]
+        tail_settings = [
+            sql for sql in runner.runtime.sql
+            if sql.startswith("SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=")
+        ]
         self.assertEqual(len(total_settings), 1)
+        self.assertEqual(len(tail_settings), 1)
+        configured_tail = int(tail_settings[0].split("=")[1])
         configured_total = int(total_settings[0].split("=")[1])
-        self.assertGreaterEqual(configured_total, (100 + 2) * 64 * 1024 * 1024)
+        self.assertEqual(configured_tail, 1024 * 1024)
+        self.assertGreaterEqual(
+            configured_total,
+            (100 * configured_tail) + (2 * 64 * 1024 * 1024) +
+            (100 * 1024 * 1024),
+        )
+        self.assertLess(configured_total, (100 + 2) * 64 * 1024 * 1024)
+
+    def test_warmcopy_required_full_profile_avoids_per_session_large_tail(self):
+        cfg = HarnessConfig(
+            sessions=320,
+            cycles=3,
+            warmcopy_required=True,
+            large_binlog_cache_sessions=8,
+            large_binlog_cache_buckets_mb=[1, 16, 64],
+            artifact_dir=".",
+        )
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = cfg
+        runner.plan = WorkloadPlan(cfg)
+        runner.runtime = _FakeRuntime()
+
+        fake_usage = type("Usage", (), {"free": 40 * 1024 * 1024 * 1024})()
+        with mock.patch(
+            "scripts.resumable_trx_business_e2e.shutil.disk_usage",
+            return_value=fake_usage,
+        ):
+            runner.configure_preserve_globals()
+
+        total_settings = [
+            sql for sql in runner.runtime.sql
+            if sql.startswith("SET GLOBAL preserve_trx_warmcopy_max_total_bytes=")
+        ]
+        tail_settings = [
+            sql for sql in runner.runtime.sql
+            if sql.startswith("SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=")
+        ]
+        self.assertEqual(len(total_settings), 1)
+        self.assertEqual(len(tail_settings), 1)
+        configured_tail = int(tail_settings[0].split("=")[1])
+        configured_total = int(total_settings[0].split("=")[1])
+        self.assertEqual(configured_tail, 1024 * 1024)
+        self.assertGreaterEqual(
+            configured_total,
+            (320 * configured_tail) + (8 * 64 * 1024 * 1024) +
+            (320 * 1024 * 1024),
+        )
+        self.assertLess(configured_total, 2 * 1024 * 1024 * 1024)
 
     def test_warmcopy_required_scales_close_timeout_for_full_profile(self):
         cfg = HarnessConfig(
@@ -2327,9 +2462,31 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             for sql in runner.runtime.sql
             if sql.startswith("SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=")
         ]
+        hard_timeout_settings = [
+            sql
+            for sql in runner.runtime.sql
+            if sql.startswith("SET GLOBAL preserve_trx_drain_hard_timeout_ms=")
+        ]
         self.assertEqual(len(close_timeout_settings), 1)
+        self.assertEqual(len(hard_timeout_settings), 1)
         configured_timeout_ms = int(close_timeout_settings[0].split("=")[1])
-        self.assertGreater(configured_timeout_ms, 30000)
+        configured_hard_timeout_ms = int(hard_timeout_settings[0].split("=")[1])
+        self.assertEqual(configured_timeout_ms, 300000)
+        self.assertGreater(configured_hard_timeout_ms, configured_timeout_ms)
+
+    def test_warmcopy_required_180_session_profile_uses_large_close_budget(self):
+        cfg = HarnessConfig(
+            sessions=180,
+            cycles=3,
+            warmcopy_required=True,
+            large_binlog_cache_sessions=8,
+            large_binlog_cache_buckets_mb=[1, 16, 64],
+            artifact_dir=".",
+        )
+        plan = WorkloadPlan(cfg)
+        self.assertGreaterEqual(plan.warmcopy_close_timeout_ms(), 290000)
+        self.assertGreater(plan.drain_hard_timeout_ms(),
+                           plan.warmcopy_close_timeout_ms())
 
     def test_warmcopy_required_without_large_cache_keeps_prefix_headroom(self):
         cfg = HarnessConfig(

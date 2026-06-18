@@ -97,6 +97,40 @@ Preserved_trx_carrier_status stat_regular_sidecar(
   return Preserved_trx_carrier_status::OK;
 }
 
+bool same_opened_regular_sidecar(const MY_STAT &expected,
+                                 const MY_STAT &opened) {
+  if (opened.st_size < 0 || !MY_S_ISREG(opened.st_mode)) return false;
+  if (expected.st_size != opened.st_size) return false;
+#ifndef _WIN32
+  if (expected.st_dev != opened.st_dev || expected.st_ino != opened.st_ino)
+    return false;
+#endif
+  return true;
+}
+
+Preserved_trx_carrier_status open_regular_sidecar_for_read(
+    const std::string &path, const MY_STAT &expected_stat, File *file_out) {
+  if (file_out == nullptr) return Preserved_trx_carrier_status::CORRUPT;
+  *file_out = -1;
+  File file = my_open(path.c_str(), O_RDONLY | O_NOFOLLOW, MYF(0));
+  if (file < 0) {
+    return my_errno() == ELOOP ? Preserved_trx_carrier_status::CORRUPT
+                               : Preserved_trx_carrier_status::IO_ERROR;
+  }
+
+  MY_STAT opened_stat;
+  if (my_fstat(file, &opened_stat) != 0) {
+    (void)my_close(file, MYF(0));
+    return Preserved_trx_carrier_status::IO_ERROR;
+  }
+  if (!same_opened_regular_sidecar(expected_stat, opened_stat)) {
+    (void)my_close(file, MYF(0));
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  *file_out = file;
+  return Preserved_trx_carrier_status::OK;
+}
+
 bool token_is_filename_safe(const std::string &token) {
   if (token.empty() || token.length() > PRESERVE_TRX_TOKEN_MAX_LENGTH)
     return false;
@@ -117,7 +151,7 @@ bool fsync_directory(const std::string &dir) {
   (void)dir;
   return false;
 #else
-  File fd = my_open(normalize_dir(dir).c_str(), O_RDONLY, MYF(0));
+  File fd = my_open(normalize_dir(dir).c_str(), O_RDONLY | O_NOFOLLOW, MYF(0));
   if (fd < 0) return true;
   bool error = my_sync(fd, MYF(0)) != 0;
   if (my_close(fd, MYF(0))) error = true;
@@ -253,8 +287,11 @@ bool read_file(const std::string &path, std::string *out) {
     return false;
   }
 
-  File file = my_open(path.c_str(), O_RDONLY, MYF(0));
-  if (file < 0) return false;
+  File file;
+  if (open_regular_sidecar_for_read(path, stat_area, &file) !=
+      Preserved_trx_carrier_status::OK) {
+    return false;
+  }
 
   out->assign(static_cast<size_t>(stat_area.st_size), '\0');
   bool error = false;
@@ -282,8 +319,10 @@ Preserved_trx_carrier_status validate_file_digest(
     return Preserved_trx_carrier_status::CORRUPT;
   }
 
-  File file = my_open(path.c_str(), O_RDONLY, MYF(0));
-  if (file < 0) return Preserved_trx_carrier_status::IO_ERROR;
+  File file;
+  Preserved_trx_carrier_status open_status =
+      open_regular_sidecar_for_read(path, stat_area, &file);
+  if (open_status != Preserved_trx_carrier_status::OK) return open_status;
 
   EVP_MD_CTX *ctx = EVP_MD_CTX_new();
   if (ctx == nullptr || EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1) {
@@ -342,8 +381,10 @@ Preserved_trx_carrier_status file_size_and_digest(
     return Preserved_trx_carrier_status::CORRUPT;
   }
 
-  File file = my_open(path.c_str(), O_RDONLY, MYF(0));
-  if (file < 0) return Preserved_trx_carrier_status::IO_ERROR;
+  File file;
+  Preserved_trx_carrier_status open_status =
+      open_regular_sidecar_for_read(path, stat_area, &file);
+  if (open_status != Preserved_trx_carrier_status::OK) return open_status;
 
   EVP_MD_CTX *ctx = EVP_MD_CTX_new();
   if (ctx == nullptr || EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1) {

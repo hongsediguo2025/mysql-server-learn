@@ -172,6 +172,28 @@ class PreserveTrxMtrAcceleratorTest(unittest.TestCase):
         self.assertEqual(len(vardirs), len(set(vardirs)))
         self.assertEqual(len(port_bases), len(set(port_bases)))
 
+    def test_shard_vardirs_keep_worker_socket_paths_short(self):
+        tmp = self.make_repo()
+        self.addCleanup(tmp.cleanup)
+        long_run_root = Path(tmp.name) / (
+            "preserve-mtr-fresh-20260619-with-a-very-descriptive-run-root"
+        )
+
+        plan = build_execution_plan(MtrAcceleratorConfig(
+            repo_root=Path(tmp.name),
+            build_profile="debug",
+            build_dir=Path(tmp.name) / "build-debug",
+            mode="both",
+            big_test=True,
+            dry_run=True,
+            run_root=long_run_root,
+            run_id="debug-full-with-descriptive-name",
+        ))
+
+        self.assertTrue(plan.shards)
+        for shard in plan.shards:
+            self.assertLess(len(str(shard.vardir / "tmp" / "6")), 90)
+
     def test_main_dry_run_writes_manifest_and_summary(self):
         tmp = self.make_repo()
         self.addCleanup(tmp.cleanup)

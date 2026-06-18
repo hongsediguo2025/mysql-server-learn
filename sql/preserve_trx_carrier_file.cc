@@ -28,6 +28,7 @@
 #include <cerrno>
 #include <cctype>
 #include <cstring>
+#include <fcntl.h>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -280,6 +281,39 @@ bool file_exists(const std::string &path, MY_STAT *stat_area = nullptr) {
                  MYF(0)) != nullptr;
 }
 
+bool same_opened_regular_file(const MY_STAT &expected, const MY_STAT &opened) {
+  if (opened.st_size < 0 || !MY_S_ISREG(opened.st_mode)) return false;
+  if (expected.st_size != opened.st_size) return false;
+#ifndef _WIN32
+  if (expected.st_dev != opened.st_dev || expected.st_ino != opened.st_ino)
+    return false;
+#endif
+  return true;
+}
+
+Preserved_trx_carrier_status open_regular_file_no_follow_for_read(
+    const std::string &path, const MY_STAT &expected_stat, File *file_out) {
+  if (file_out == nullptr) return Preserved_trx_carrier_status::CORRUPT;
+  *file_out = -1;
+  File file = my_open(path.c_str(), O_RDONLY | O_NOFOLLOW, MYF(0));
+  if (file < 0) {
+    return my_errno() == ELOOP ? Preserved_trx_carrier_status::CORRUPT
+                               : Preserved_trx_carrier_status::IO_ERROR;
+  }
+
+  MY_STAT opened_stat;
+  if (my_fstat(file, &opened_stat) != 0) {
+    (void)my_close(file, MYF(0));
+    return Preserved_trx_carrier_status::IO_ERROR;
+  }
+  if (!same_opened_regular_file(expected_stat, opened_stat)) {
+    (void)my_close(file, MYF(0));
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  *file_out = file;
+  return Preserved_trx_carrier_status::OK;
+}
+
 Preserved_trx_carrier_status read_file_limited(
     const std::string &path, uint64_t max_bytes,
     std::vector<unsigned char> *out) {
@@ -295,8 +329,10 @@ Preserved_trx_carrier_status read_file_limited(
   if (static_cast<uint64_t>(stat_area.st_size) > max_bytes)
     return Preserved_trx_carrier_status::CORRUPT;
 
-  File file = my_open(path.c_str(), O_RDONLY, MYF(0));
-  if (file < 0) return Preserved_trx_carrier_status::IO_ERROR;
+  File file;
+  Preserved_trx_carrier_status open_status =
+      open_regular_file_no_follow_for_read(path, stat_area, &file);
+  if (open_status != Preserved_trx_carrier_status::OK) return open_status;
 
   out->assign(static_cast<size_t>(stat_area.st_size), 0);
   bool error = false;
@@ -333,10 +369,12 @@ Preserved_trx_carrier_status read_external_blob_metadata(
     return Preserved_trx_carrier_status::IO_ERROR;
   }
 
-  File file = my_open(path.c_str(), O_RDONLY, MYF(0));
-  if (file < 0) {
+  File file;
+  Preserved_trx_carrier_status open_status =
+      open_regular_file_no_follow_for_read(path, stat_area, &file);
+  if (open_status != Preserved_trx_carrier_status::OK) {
     EVP_MD_CTX_free(ctx);
-    return Preserved_trx_carrier_status::IO_ERROR;
+    return open_status;
   }
 
   std::array<unsigned char, 64 * 1024> buffer{};
@@ -475,7 +513,7 @@ bool fsync_directory(const std::string &dir) {
   (void)dir;
   return false;
 #else
-  File fd = my_open(normalize_dir(dir).c_str(), O_RDONLY, MYF(0));
+  File fd = my_open(normalize_dir(dir).c_str(), O_RDONLY | O_NOFOLLOW, MYF(0));
   if (fd < 0) return true;
   bool error = my_sync(fd, MYF(0)) != 0;
   if (my_close(fd, MYF(0))) error = true;
@@ -887,8 +925,14 @@ Preserve_key_status read_key(
     return Preserve_key_status::CORRUPT;
   }
 
-  File file = my_open(path.c_str(), O_RDONLY, MYF(0));
-  if (file < 0) return Preserve_key_status::IO_ERROR;
+  File file;
+  const Preserved_trx_carrier_status open_status =
+      open_regular_file_no_follow_for_read(path, stat_area, &file);
+  if (open_status != Preserved_trx_carrier_status::OK) {
+    return open_status == Preserved_trx_carrier_status::CORRUPT
+               ? Preserve_key_status::CORRUPT
+               : Preserve_key_status::IO_ERROR;
+  }
 
   std::vector<unsigned char> payload(kPreservedTrxBoundKeyLength, 0);
   const size_t read_len = my_read(file, payload.data(), payload.size(), MYF(0));
