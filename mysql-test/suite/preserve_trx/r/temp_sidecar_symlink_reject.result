@@ -1,0 +1,20 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+# image sidecar symlink is rejected
+SHUTDOWN;
+temp image sidecar symlink installed
+include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: preserved temporary table image sidecar digest mismatch]
+SELECT COUNT(*) AS preserved_count_after_image_symlink
+FROM performance_schema.preserved_transactions;
+preserved_count_after_image_symlink
+0
+# undo sidecar symlink is rejected
+SHUTDOWN;
+temp undo sidecar symlink installed
+include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: preserved temporary table undo sidecar digest mismatch]
+SELECT COUNT(*) AS preserved_count_after_undo_symlink
+FROM performance_schema.preserved_transactions;
+preserved_count_after_undo_symlink
+0
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

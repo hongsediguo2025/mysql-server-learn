@@ -1,0 +1,24 @@
+DROP TABLE IF EXISTS t_timeout_live_resume_expiry;
+SET GLOBAL preserve_trx_enable=ON;
+SET SESSION preserve_trx_min_timeout=1;
+SET SESSION preserve_trx_default_timeout=1;
+SET SESSION preserve_trx_max_timeout=86400;
+CREATE TABLE t_timeout_live_resume_expiry(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_timeout_live_resume_expiry VALUES(1,10);
+START TRANSACTION;
+UPDATE t_timeout_live_resume_expiry SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+SELECT COUNT(*) AS preserved_count_during_grace
+FROM performance_schema.preserved_transactions;
+preserved_count_during_grace
+1
+include/wait_for_pattern_in_file.inc [Preserved transaction .* expired-token reaper forced rollback: recovery timeout expired]
+SELECT COUNT(*) AS preserved_count_after_live_timeout
+FROM performance_schema.preserved_transactions;
+preserved_count_after_live_timeout
+0
+SELECT * FROM t_timeout_live_resume_expiry ORDER BY a;
+a	b
+1	10
+DROP TABLE t_timeout_live_resume_expiry;
+SET GLOBAL preserve_trx_enable=ON;

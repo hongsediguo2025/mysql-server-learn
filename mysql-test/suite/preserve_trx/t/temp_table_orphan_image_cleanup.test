@@ -1,0 +1,71 @@
+--source include/not_windows.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+SET GLOBAL preserve_trx_enable=ON;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source include/wait_until_disconnected.inc
+
+--perl
+use strict;
+use warnings;
+use File::Path qw(make_path);
+use File::Spec;
+
+my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
+my $preserve_dir = File::Spec->catdir($datadir, 'preserve');
+make_path($preserve_dir, {mode => 0700}) unless -d $preserve_dir;
+
+my %files = (
+  'warm_orphan.tempts.4243767301.warm' => 'warm-image',
+  'warm_orphan.tempts.4243767301.undo.warm' => 'warm-undo',
+  'warm_tmp_orphan.tempts.4243767303.warm.tmp' => 'warm-image-tmp',
+  'warm_tmp_orphan.tempts.4243767303.undo.warm.tmp' => 'warm-undo-tmp',
+  'sealed_orphan.tempts.4243767302.image' => 'sealed-image',
+  'sealed_orphan.tempts.4243767302.undo' => 'sealed-undo',
+  'sealed_tmp_orphan.tempts.4243767304.image.tmp' => 'sealed-image-tmp',
+  'sealed_tmp_orphan.tempts.4243767304.undo.tmp' => 'sealed-undo-tmp',
+);
+
+for my $name (sort keys %files) {
+  open(my $fh, '>:raw', File::Spec->catfile($preserve_dir, $name))
+    or die "cannot write $name: $!";
+  print {$fh} $files{$name};
+  close($fh);
+}
+EOF
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=OFF" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
+my $preserve_dir = File::Spec->catdir($datadir, 'preserve');
+for my $name (
+  'warm_orphan.tempts.4243767301.warm',
+  'warm_orphan.tempts.4243767301.undo.warm',
+  'warm_tmp_orphan.tempts.4243767303.warm.tmp',
+  'warm_tmp_orphan.tempts.4243767303.undo.warm.tmp',
+  'sealed_orphan.tempts.4243767302.image',
+  'sealed_orphan.tempts.4243767302.undo',
+  'sealed_tmp_orphan.tempts.4243767304.image.tmp',
+  'sealed_tmp_orphan.tempts.4243767304.undo.tmp') {
+  my $path = File::Spec->catfile($preserve_dir, $name);
+  die "unexpected orphan temp artifact remains: $path" if -e $path;
+}
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

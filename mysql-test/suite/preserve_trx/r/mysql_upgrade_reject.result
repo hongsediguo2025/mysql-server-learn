@@ -1,0 +1,27 @@
+DROP TABLE IF EXISTS t_preserve_upgrade_context;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_preserve_upgrade_context(a INT PRIMARY KEY, b INT)
+ENGINE=InnoDB;
+INSERT INTO t_preserve_upgrade_context VALUES(1,10), (2,20);
+START TRANSACTION;
+UPDATE t_preserve_upgrade_context SET b=11 WHERE a=1;
+SET SESSION debug='+d,preserve_trx_simulate_server_upgrade_context';
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug='-d,preserve_trx_simulate_server_upgrade_context';
+UPDATE t_preserve_upgrade_context SET b=12 WHERE a=1;
+COMMIT;
+SET SESSION debug='+d,preserve_trx_simulate_server_upgrade_context';
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug='-d,preserve_trx_simulate_server_upgrade_context';
+SELECT * FROM t_preserve_upgrade_context ORDER BY a;
+a	b
+1	12
+2	20
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+DROP TABLE t_preserve_upgrade_context;
+SET GLOBAL preserve_trx_enable=ON;

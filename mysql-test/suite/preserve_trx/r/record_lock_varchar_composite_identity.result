@@ -1,0 +1,51 @@
+DROP TABLE IF EXISTS t_record_lock_varchar_composite;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_record_lock_varchar_composite(
+tenant VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL,
+id DECIMAL(10,2) NOT NULL,
+ts DATETIME(6) NOT NULL,
+v INT,
+PRIMARY KEY(tenant, id, ts)
+) ENGINE=InnoDB;
+INSERT INTO t_record_lock_varchar_composite VALUES
+('tenant-a', 10.50, '2026-06-06 10:11:12.123456', 10),
+('tenant-a', 11.50, '2026-06-06 10:11:12.123456', 20);
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE t_record_lock_varchar_composite
+SET v=101
+WHERE tenant='tenant-a'
+   AND id=10.50
+AND ts='2026-06-06 10:11:12.123456';
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SELECT LOCKS_COUNT >= 1 AS has_preserved_locks
+FROM performance_schema.preserved_transactions;
+has_preserved_locks
+1
+SET SESSION innodb_lock_wait_timeout=1;
+UPDATE t_record_lock_varchar_composite
+SET v=102
+WHERE tenant='tenant-a'
+   AND id=10.50
+AND ts='2026-06-06 10:11:12.123456';
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+UPDATE t_record_lock_varchar_composite
+SET v=201
+WHERE tenant='tenant-a'
+   AND id=11.50
+AND ts='2026-06-06 10:11:12.123456';
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ROLLBACK;
+UPDATE t_record_lock_varchar_composite
+SET v=102
+WHERE tenant='tenant-a'
+   AND id=10.50
+AND ts='2026-06-06 10:11:12.123456';
+SELECT tenant, id, ts, v
+FROM t_record_lock_varchar_composite
+ORDER BY tenant, id, ts;
+tenant	id	ts	v
+tenant-a	10.50	2026-06-06 10:11:12.123456	102
+tenant-a	11.50	2026-06-06 10:11:12.123456	201
+DROP TABLE t_record_lock_varchar_composite;
+SET GLOBAL preserve_trx_enable=ON;

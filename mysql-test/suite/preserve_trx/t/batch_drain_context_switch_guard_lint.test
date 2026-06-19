@@ -1,0 +1,322 @@
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+sub extract_function_body {
+  my ($src, $signature) = @_;
+  my $sig_pos = index($src, $signature);
+  die "could not find signature: $signature\n" if $sig_pos < 0;
+
+  my $brace_pos = index($src, '{', $sig_pos);
+  die "could not find function body start for: $signature\n" if $brace_pos < 0;
+
+  my $depth = 0;
+  for (my $i = $brace_pos; $i < length($src); ++$i) {
+    my $ch = substr($src, $i, 1);
+    $depth++ if $ch eq '{';
+    $depth-- if $ch eq '}';
+    if ($depth == 0 && $ch eq '}') {
+      return substr($src, $sig_pos, $i - $sig_pos + 1);
+    }
+  }
+  die "could not parse balanced braces for: $signature\n";
+}
+
+# Lint-only source-shape guard; behavior coverage lives in targeted MTR/gunit
+# tests. Do not cite this file as evidence for runtime drain behavior.
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+my $path = File::Spec->catfile($source_root, 'sql', 'preserve_trx.cc');
+my $carrier_file_path =
+  File::Spec->catfile($source_root, 'sql', 'preserve_trx_carrier_file.cc');
+
+open(my $fh, '<', $path) or die "cannot open $path: $!";
+my @lines = <$fh>;
+close($fh);
+my $preserve_src = join('', @lines);
+
+open(my $carrier_file_fh, '<', $carrier_file_path)
+  or die "cannot open $carrier_file_path: $!";
+my $carrier_file_src = do { local $/; <$carrier_file_fh> };
+close($carrier_file_fh);
+
+my $switch_line = -1;
+my $publish_line = -1;
+for my $idx (0 .. $#lines) {
+  $switch_line = $idx
+    if $lines[$idx] =~ /Preserve_thd_context_switch\s+switch_thd/;
+  if ($switch_line >= 0 &&
+      $lines[$idx] =~ /preserve_trx_set_batch_state\s*\(/) {
+    $publish_line = $idx;
+    last;
+  }
+}
+
+die "could not find batch context switch and publish lines\n"
+  if $switch_line < 0 || $publish_line < 0;
+
+my $scope_start = $switch_line - 1;
+$scope_start-- while $scope_start >= 0 && $lines[$scope_start] =~ /^\s*$/;
+die "batch target context switch must use an explicit inner scope\n"
+  unless $scope_start >= 0 && $lines[$scope_start] =~ /^\s*\{\s*$/;
+
+my $depth = 0;
+my $scope_end = -1;
+for my $idx ($scope_start .. $#lines) {
+  my $line = $lines[$idx];
+  $depth += () = $line =~ /\{/g;
+  $depth -= () = $line =~ /\}/g;
+  if ($idx > $scope_start && $depth == 0) {
+    $scope_end = $idx;
+    last;
+  }
+}
+
+die "batch drained-state publish must happen after context switch scope closes\n"
+  unless $scope_end >= 0 && $scope_end < $publish_line;
+
+my $clear_body_for_cleanup = $preserve_src;
+my $clear_body = $preserve_src;
+$clear_body_for_cleanup =~ s/^.*class Preserve_batch_clear_generation/class Preserve_batch_clear_generation/s
+  or die "could not find Preserve_batch_clear_generation\n";
+$clear_body_for_cleanup =~ s/class Preserve_batch_quiesced_idle_target.*$//s
+  or die "could not isolate Preserve_batch_clear_generation\n";
+
+die "batch failure cleanup must not clear already PRESERVED_DRAINED sessions\n"
+  unless $clear_body_for_cleanup =~ /preserve_trx_batch_state\s*!=\s*\n?\s*Preserve_trx_batch_thd_state::PRESERVED_DRAINED/s;
+
+$preserve_src =~ /class Preserve_batch_target_counter.*?class Preserve_batch_target_state_reader/ms
+  or die "could not isolate Preserve_batch_target_counter\n";
+my $target_counter = $&;
+$target_counter =~ /const bool ignored\s*=.*?;/s
+  or die "could not find batch target ignored predicate\n";
+my $ignored_predicate = $&;
+die "batch target enumeration must not ignore in-flight statements before statement boundary\n"
+  if $ignored_predicate =~ /!\s*preserve_trx_has_explicit_active_transaction/s;
+die "batch target enumeration must include in-flight risky statements\n"
+  unless $target_counter =~ /pending_target/s &&
+         $target_counter =~ /preserve_trx_thd_has_batch_inflight_statement/s;
+die "batch target enumeration must wait explicit transactions that are already inside an unmarked command packet\n"
+  unless $target_counter =~ /pending_target/s &&
+         $target_counter =~ /active_explicit_transaction/s &&
+         $target_counter =~ /!\s*candidate->m_server_idle/s;
+die "batch target enumeration must wait non-idle unclassified classic command packets\n"
+  unless $target_counter =~ /nonidle_unclassified_command_packet/s &&
+         $target_counter =~ /candidate->is_classic_protocol/s &&
+         $target_counter =~ /!\s*candidate->m_server_idle/s &&
+         $target_counter =~ /pending_target/s;
+
+$preserve_src =~ /class Preserve_batch_target_state_reader.*?class Preserve_batch_clear_target_generation/ms
+  or die "could not isolate Preserve_batch_target_state_reader\n";
+my $target_state_reader = $&;
+die "batch owner must promote already-idle pending targets without waiting for a client packet\n"
+  unless $target_state_reader =~
+         /preserve_trx_publish_pending_quiesce_at_idle_boundary\s*\(\s*candidate\s*\)/s;
+die "COM_SLEEP is not a safe batch attach boundary\n"
+  if $target_state_reader =~ /COM_SLEEP/s;
+
+my $sql_parse_path = File::Spec->catfile($source_root, 'sql', 'sql_parse.cc');
+open(my $sql_parse_fh, '<', $sql_parse_path)
+  or die "cannot open $sql_parse_path: $!";
+my $sql_parse = do { local $/; <$sql_parse_fh> };
+close($sql_parse_fh);
+
+$sql_parse =~ /bool do_command\(THD \*thd\).*?^}/ms
+  or die "could not find do_command body\n";
+my $do_command = $&;
+
+die "do_command must enter server-idle state through preserve-trx helper\n"
+  unless $do_command =~ /preserved_trx_begin_command_read\s*\(\s*thd\s*\)/s;
+die "do_command must leave server-idle state through preserve-trx helper\n"
+  unless $do_command =~ /preserved_trx_end_command_read\s*\(\s*thd\s*\)/s;
+die "do_command must mark transaction-capable packets before leaving command-read boundary\n"
+  unless index($do_command, 'thd->get_protocol()->get_command(&com_data, &command)') >= 0 &&
+         index($do_command, 'preserve_trx_after_command_read_before_packet_marker') >= 0 &&
+         index($do_command, 'preserved_trx_mark_inflight_command_packet(thd, command)') >= 0 &&
+         index($do_command, 'preserved_trx_end_command_read(thd)') >= 0 &&
+         index($do_command, 'thd->get_protocol()->get_command(&com_data, &command)') <
+         index($do_command, 'preserve_trx_after_command_read_before_packet_marker') &&
+         index($do_command, 'preserve_trx_after_command_read_before_packet_marker') <
+         index($do_command, 'preserved_trx_mark_inflight_command_packet(thd, command)') &&
+         index($do_command, 'preserved_trx_mark_inflight_command_packet(thd, command)') <
+         index($do_command, 'preserved_trx_end_command_read(thd)');
+die "post-read quiesce check must happen before command dispatch\n"
+  unless index($do_command, 'preserved_trx_end_command_read(thd)') >= 0 &&
+         index($do_command, 'preserved_trx_reject_if_batch_session_drained(thd)') >= 0 &&
+         index($do_command, 'dispatch_command(thd, &com_data, command)') >= 0 &&
+         index($do_command, 'preserved_trx_end_command_read(thd)') <
+         index($do_command, 'preserved_trx_reject_if_batch_session_drained(thd)') &&
+         index($do_command, 'preserved_trx_reject_if_batch_session_drained(thd)') <
+         index($do_command, 'dispatch_command(thd, &com_data, command)');
+
+$sql_parse =~ /case COM_STMT_FETCH:.*?break;/ms
+  or die "could not find COM_STMT_FETCH dispatch body\n";
+my $stmt_fetch_case = $&;
+die "COM_STMT_FETCH must use preserve-trx inflight guard inside explicit transactions\n"
+  unless $stmt_fetch_case =~ /preserve_trx_inflight_guard\.mark/s;
+
+$sql_parse =~ /case COM_STMT_EXECUTE:.*?break;/ms
+  or die "could not find COM_STMT_EXECUTE dispatch body\n";
+my $stmt_execute_case = $&;
+die "COM_STMT_EXECUTE must use preserve-trx inflight guard before precheck\n"
+  unless $stmt_execute_case =~ /preserve_trx_inflight_guard\.mark/s &&
+         index($stmt_execute_case, 'preserve_trx_inflight_guard.mark') <
+         index($stmt_execute_case, 'mysql_stmt_precheck');
+
+$sql_parse =~ /case COM_STMT_PREPARE:.*?break;/ms
+  or die "could not find COM_STMT_PREPARE dispatch body\n";
+my $stmt_prepare_case = $&;
+die "COM_STMT_PREPARE must use preserve-trx inflight guard inside explicit transactions\n"
+  unless $stmt_prepare_case =~ /preserve_trx_inflight_guard\.mark/s;
+
+$sql_parse =~ /case COM_QUERY:.*?(?:dispatch_sql_command\(thd, &parser_state\)|mysql_parse\(thd, &parser_state\));/ms
+  or die "could not find COM_QUERY dispatch body\n";
+my $com_query_case = $&;
+my $com_query_handoff =
+  index($com_query_case, 'dispatch_sql_command(thd, &parser_state)');
+$com_query_handoff = index($com_query_case, 'mysql_parse(thd, &parser_state)')
+  if $com_query_handoff < 0;
+die "COM_QUERY must install an unknown-query inflight guard before parse/dispatch\n"
+  unless $com_query_case =~ /preserve_trx_inflight_guard\.mark_unknown_query/s &&
+         index($com_query_case, 'preserve_trx_inflight_guard.mark_unknown_query') <
+         $com_query_handoff;
+die "COM_QUERY must consume the packet-read marker before handing off to the unknown-query guard\n"
+  unless $com_query_case =~ /preserved_trx_consume_inflight_command_packet\s*\(\s*thd\s*,\s*command\s*\)/s &&
+         index($com_query_case, 'preserved_trx_consume_inflight_command_packet') <
+         index($com_query_case, 'preserve_trx_inflight_guard.mark_unknown_query');
+
+my $net_ext_path = File::Spec->catfile(
+  $source_root, 'sql', 'conn_handler', 'init_net_server_extension.cc');
+open(my $net_ext_fh, '<', $net_ext_path)
+  or die "cannot open $net_ext_path: $!";
+my $net_ext = do { local $/; <$net_ext_fh> };
+close($net_ext_fh);
+
+die "network idle callbacks must use preserve-trx guarded idle helpers\n"
+  unless $net_ext =~ /preserved_trx_command_read_is_idle\s*\(\s*thd\s*\)/s &&
+         $net_ext =~ /preserved_trx_end_idle_for_command_packet\s*\(\s*thd\s*\)/s;
+my $net_callbacks = $net_ext;
+$net_callbacks =~ s/^.*static void net_before_header_psi/static void net_before_header_psi/s
+  or die "could not find net_before_header_psi\n";
+$net_callbacks =~ s/void init_net_server_extension.*$//s
+  or die "could not isolate net idle callbacks\n";
+die "network idle callbacks must not write m_server_idle directly\n"
+  if $net_callbacks =~ /m_server_idle\s*=\s*false/s;
+
+my $net_clear_body = join('', @lines);
+$net_clear_body =~ s/^.*bool preserved_trx_command_read_is_idle/bool preserved_trx_command_read_is_idle/s
+  or die "could not find preserved_trx_command_read_is_idle\n";
+$net_clear_body =~ s/bool preserved_trx_end_idle_for_command_packet.*$//s
+  or die "could not isolate preserved_trx_command_read_is_idle\n";
+
+die "before-header idle helper must wait via the shared quiesce timeout helper if target is owned by batch drain\n"
+  unless $net_clear_body =~ /preserve_trx_batch_state_blocks_target_owner/s &&
+         $net_clear_body =~ /preserve_trx_wait_target_timed_out/s;
+
+my $blocks_target_owner =
+  extract_function_body($preserve_src,
+  'bool preserve_trx_batch_state_blocks_target_owner(');
+die "batch target wait predicate must include QUIESCED and ATTACHING states\n"
+  unless $blocks_target_owner =~ /Preserve_trx_batch_thd_state::QUIESCED/s &&
+         $blocks_target_owner =~ /Preserve_trx_batch_thd_state::ATTACHING/s;
+die "batch target sessions must not clear owner-controlled QUIESCED/ATTACHING state\n"
+  if $preserve_src =~ /clear_own_batch_state_after_timeout/s;
+
+my $thd_api_path =
+  File::Spec->catfile($source_root, 'sql', 'sql_thd_internal_api.cc');
+open(my $thd_api_fh, '<', $thd_api_path)
+  or die "cannot open $thd_api_path: $!";
+my $thd_api = do { local $/; <$thd_api_fh> };
+close($thd_api_fh);
+
+$thd_api =~ /void thd_increment_bytes_received\(size_t length\).*?^}/ms
+  or die "could not find thd_increment_bytes_received body\n";
+my $bytes_received = $&;
+die "bytes-received THD status update must wait while target is QUIESCED\n"
+  unless index($bytes_received, 'preserved_trx_wait_if_batch_session_quiesced(thd)') >= 0 &&
+         index($bytes_received, 'status_var.bytes_received') >= 0 &&
+         index($bytes_received, 'preserved_trx_wait_if_batch_session_quiesced(thd)') <
+         index($bytes_received, 'status_var.bytes_received');
+
+my $net_serv_path = File::Spec->catfile($source_root, 'sql-common', 'net_serv.cc');
+open(my $net_serv_fh, '<', $net_serv_path)
+  or die "cannot open $net_serv_path: $!";
+my $net_serv = do { local $/; <$net_serv_fh> };
+close($net_serv_fh);
+
+$net_serv =~ /static bool net_read_raw_loop\(NET \*net, size_t count\).*?^}/ms
+  or die "could not find net_read_raw_loop body\n";
+my $raw_loop = $&;
+my $wait_pos = index($raw_loop, 'thd_wait_if_preserve_trx_batch_session_quiesced()');
+my $last_errno_pos = index($raw_loop, 'net->last_errno');
+my $security_context_pos = index($raw_loop, 'security_context()');
+my $net_error_pos = index($raw_loop, 'net->error = NET_ERROR_SOCKET_NOT_READABLE');
+$net_error_pos = index($raw_loop, 'net->error = 2') if $net_error_pos < 0;
+my $my_error_pos = index($raw_loop, 'my_error(net->last_errno');
+die "net read failure path must wait before touching THD or NET error state\n"
+  unless $wait_pos >= 0 &&
+         $last_errno_pos >= 0 &&
+         $net_error_pos >= 0 &&
+         $my_error_pos >= 0 &&
+         $wait_pos < $last_errno_pos &&
+         ($security_context_pos < 0 || $wait_pos < $security_context_pos) &&
+         $wait_pos < $net_error_pos &&
+         $wait_pos < $my_error_pos;
+
+$preserve_src =~ /void preserved_trx_clear_inflight_risky_statement\(THD \*thd\).*?^}/ms
+  or die "could not find preserved_trx_clear_inflight_risky_statement body\n";
+my $clear_inflight = $&;
+die "inflight cleanup must not publish QUIESCED before command-read boundary\n"
+  if $clear_inflight =~ /preserve_trx_batch_state\s*=\s*Preserve_trx_batch_thd_state::QUIESCED/s;
+die "risky-statement inflight cleanup must decrement its depth counter\n"
+  unless $clear_inflight =~
+         /mysql_mutex_lock\(&thd->LOCK_thd_data\).*?assert\(thd->preserve_trx_inflight_risky_statement_depth > 0\).*?--thd->preserve_trx_inflight_risky_statement_depth.*?mysql_mutex_unlock\(&thd->LOCK_thd_data\)/s;
+
+$preserve_src =~ /void preserved_trx_clear_inflight_unknown_query\(THD \*thd\).*?^}/ms
+  or die "could not find preserved_trx_clear_inflight_unknown_query body\n";
+my $clear_unknown_query = $&;
+die "unknown-query inflight cleanup must not publish QUIESCED before command-read boundary\n"
+  if $clear_unknown_query =~ /preserve_trx_batch_state\s*=\s*Preserve_trx_batch_thd_state::QUIESCED/s;
+die "unknown-query inflight cleanup must decrement its depth counter\n"
+  unless $clear_unknown_query =~
+         /mysql_mutex_lock\(&thd->LOCK_thd_data\).*?assert\(thd->preserve_trx_inflight_unknown_query_depth > 0\).*?--thd->preserve_trx_inflight_unknown_query_depth.*?mysql_mutex_unlock\(&thd->LOCK_thd_data\)/s;
+
+my $begin_read = extract_function_body($preserve_src,
+  'bool preserved_trx_begin_command_read(THD *thd)');
+die "command-read boundary must publish QUIESCED for pending batch targets\n"
+  unless $begin_read =~ /Preserve_trx_batch_thd_state::PENDING_QUIESCE/s &&
+         $begin_read =~ /preserve_trx_publish_pending_quiesce_at_idle_boundary/s;
+my $publish_pending =
+  extract_function_body($preserve_src,
+  'static bool preserve_trx_publish_pending_quiesce_at_idle_boundary(THD *thd)');
+die "pending-quiesce publisher must resolve to QUIESCED or DRAINED_NO_TRANSACTION\n"
+  unless $publish_pending =~ /Preserve_trx_batch_thd_state::QUIESCED/s &&
+         $publish_pending =~ /Preserve_trx_batch_thd_state::DRAINED_NO_TRANSACTION/s;
+
+$preserve_src =~ /class Preserve_batch_quiesced_idle_target.*?^};/ms
+  or die "could not isolate Preserve_batch_quiesced_idle_target\n";
+my $quiesced_target = $&;
+die "quiesced in-flight targets must recheck common unsupported context before preserve helper\n"
+  unless $quiesced_target =~ /preserve_trx_is_unsupported_common_context/s &&
+         index($quiesced_target, 'preserve_trx_is_unsupported_common_context') <
+         index($quiesced_target, 'preserve_trx_preserve_attached_transaction');
+
+die "SQL snapshot deletion helper must delegate through the preserve store\n"
+  unless $preserve_src =~
+    /static Preserve_snapshot_delete_status delete_snapshot_files_with_status.*?create_preserved_trx_default_store.*?->remove_with_status\s*\(/ms;
+
+$carrier_file_src =~ /Preserve_snapshot_delete_status delete_snapshot_files_with_status.*?^}/ms
+  or die "could not isolate carrier delete_snapshot_files_with_status\n";
+my $delete_snapshot = $&;
+my $delete_snapshot_pos = index($delete_snapshot, 'my_delete(snapshot_path.c_str()');
+my $delete_binlog_cache_pos =
+  index($delete_snapshot, 'delete_optional_sidecar(binlog_cache_path)');
+die "snapshot delete must happen before external binlog cache delete\n"
+  unless $delete_snapshot_pos >= 0 &&
+         $delete_binlog_cache_pos >= 0 &&
+         $delete_snapshot_pos < $delete_binlog_cache_pos;
+EOF

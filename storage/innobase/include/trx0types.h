@@ -96,6 +96,9 @@ enum trx_state_t {
   /** Support for 2PC/XA */
   TRX_STATE_PREPARED,
 
+  /** Preserve transaction claimed by resumable shutdown recovery */
+  TRX_STATE_PRESERVED,
+
   TRX_STATE_COMMITTED_IN_MEMORY
 };
 

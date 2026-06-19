@@ -1,0 +1,618 @@
+--source include/big_test.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $setup_file = File::Spec->catfile($vardir, 'tmp',
+                                     'batch_long_rtv_setup.inc');
+my $apps_file = File::Spec->catfile($vardir, 'tmp',
+                                    'batch_long_rtv_apps.inc');
+my $post_apps_file = File::Spec->catfile($vardir, 'tmp',
+                                         'batch_long_rtv_post_apps.inc');
+my $cleanup_file = File::Spec->catfile($vardir, 'tmp',
+                                       'batch_long_rtv_cleanup.inc');
+my $verify_file = File::Spec->catfile($vardir, 'tmp',
+                                      'batch_long_rtv_verify.inc');
+
+open(my $setup, '>', $setup_file)
+  or die "cannot open $setup_file for write: $!";
+open(my $apps, '>', $apps_file)
+  or die "cannot open $apps_file for write: $!";
+open(my $post_apps, '>', $post_apps_file)
+  or die "cannot open $post_apps_file for write: $!";
+open(my $cleanup, '>', $cleanup_file)
+  or die "cannot open $cleanup_file for write: $!";
+open(my $verify, '>', $verify_file)
+  or die "cannot open $verify_file for write: $!";
+
+print $cleanup <<'SQL';
+DROP PROCEDURE IF EXISTS p_batch_long_finalize;
+DROP TRIGGER IF EXISTS t_rtv_bi;
+DROP TRIGGER IF EXISTS t_rtv_au;
+DROP VIEW IF EXISTS v_rtv_base;
+DROP FUNCTION IF EXISTS f_rtv_delta;
+DROP PROCEDURE IF EXISTS p_rtv_insert_update;
+DROP TABLE IF EXISTS t_batch_long_tokens;
+DROP TABLE IF EXISTS t_rtv_trigger_audit;
+DROP TABLE IF EXISTS t_rtv_base;
+DROP TABLE IF EXISTS t_batch_long_audit;
+DROP TABLE IF EXISTS t_batch_long_control;
+SQL
+
+print $setup <<'SQL';
+CREATE TABLE t_batch_long_control(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  started_at DATETIME(6) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE t_batch_long_audit(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  lifecycle_age_us BIGINT UNSIGNED NOT NULL,
+  max_stmt_us BIGINT UNSIGNED NOT NULL,
+  sql_count INT UNSIGNED NOT NULL,
+  resumed_ok TINYINT NOT NULL,
+  detail VARCHAR(255) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE t_batch_long_tokens(
+  token_id INT PRIMARY KEY AUTO_INCREMENT,
+  token VARCHAR(255) NOT NULL UNIQUE
+) ENGINE=InnoDB;
+CREATE TABLE t_rtv_base(
+  sid INT NOT NULL,
+  k INT NOT NULL,
+  v INT NOT NULL,
+  note VARCHAR(64),
+  heartbeat INT NOT NULL DEFAULT 0,
+  PRIMARY KEY(sid, k),
+  UNIQUE KEY uq_sid_note(sid, note),
+  KEY idx_sid_v(sid, v)
+) ENGINE=InnoDB;
+CREATE TABLE t_rtv_trigger_audit(
+  sid INT NOT NULL,
+  k INT NOT NULL,
+  action_name VARCHAR(64) NOT NULL,
+  PRIMARY KEY(sid, k, action_name)
+) ENGINE=InnoDB;
+SQL
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  print $setup "INSERT INTO t_batch_long_control " .
+               "VALUES($sid, $case_id, TIMESTAMP'2000-01-01 00:00:00.000000');\n";
+  for my $k (0 .. 40) {
+    print $setup "INSERT INTO t_rtv_base " .
+                 "VALUES($sid, $k, " . ($sid * 100 + $k) .
+                 ", 'seed-$k', 0);\n";
+  }
+}
+
+print $setup <<'SQL';
+DELIMITER |;
+CREATE PROCEDURE p_rtv_insert_update(
+  IN p_sid INT,
+  IN p_k INT,
+  IN p_delta INT,
+  IN p_note VARCHAR(64)
+)
+BEGIN
+  INSERT INTO t_rtv_base(sid, k, v, note, heartbeat)
+  VALUES(p_sid, p_k, p_delta, p_note, 0)
+  ON DUPLICATE KEY UPDATE
+    v = v + p_delta,
+    note = p_note;
+END|
+CREATE FUNCTION f_rtv_delta(p_base INT)
+RETURNS INT
+DETERMINISTIC
+RETURN p_base + 7|
+CREATE VIEW v_rtv_base AS
+  SELECT sid, k, v, note, heartbeat FROM t_rtv_base|
+CREATE TRIGGER t_rtv_bi BEFORE INSERT ON t_rtv_base
+FOR EACH ROW
+BEGIN
+  IF NEW.note LIKE 'trigger-bi%' OR NEW.note LIKE 'mixed%' THEN
+    INSERT IGNORE INTO t_rtv_trigger_audit
+    VALUES(NEW.sid, NEW.k, CONCAT('bi-', NEW.note));
+  END IF;
+END|
+CREATE TRIGGER t_rtv_au AFTER UPDATE ON t_rtv_base
+FOR EACH ROW
+BEGIN
+  IF NEW.note LIKE 'trigger-au%' OR
+     NEW.note LIKE 'resume-trigger%' OR
+     NEW.note LIKE 'mixed%' THEN
+    INSERT IGNORE INTO t_rtv_trigger_audit
+    VALUES(NEW.sid, NEW.k, CONCAT('au-', NEW.note));
+  END IF;
+END|
+CREATE PROCEDURE p_batch_long_finalize()
+BEGIN
+  DECLARE post_ok TINYINT DEFAULT 0;
+  DECLARE detail_value VARCHAR(255) DEFAULT NULL;
+  DECLARE failure_message VARCHAR(255) DEFAULT NULL;
+
+  IF @batch_long_sid IS NULL OR @batch_long_case_id IS NULL THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'missing restored batch long user vars';
+  END IF;
+  IF COALESCE(@rtv_pre_ok, 0) <> 1 THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'pre-drain routine/view/trigger check was not restored';
+  END IF;
+
+  IF @batch_long_case_id = 1 THEN
+    CALL p_rtv_insert_update(@batch_long_sid, 101,
+                             @batch_long_sid + 101, 'proc-insert-post');
+    SELECT note = 'proc-insert-post'
+      INTO post_ok FROM t_rtv_base
+     WHERE sid = @batch_long_sid AND k = 101;
+    SET detail_value = 'procedure-insert';
+  ELSEIF @batch_long_case_id = 2 THEN
+    CALL p_rtv_insert_update(@batch_long_sid, 2, 20, 'proc-update-post');
+    SELECT note = 'proc-update-post'
+           AND v = @batch_long_sid * 100 + 2 + 22
+      INTO post_ok FROM t_rtv_base
+     WHERE sid = @batch_long_sid AND k = 2;
+    SET detail_value = 'procedure-update';
+  ELSEIF @batch_long_case_id = 3 THEN
+    UPDATE t_rtv_base
+       SET v = f_rtv_delta(v),
+           note = 'function-post'
+     WHERE sid = @batch_long_sid AND k = 3;
+    SELECT v = f_rtv_delta(@batch_long_sid * 100 + 10)
+           AND note = 'function-post'
+      INTO post_ok FROM t_rtv_base
+     WHERE sid = @batch_long_sid AND k = 3;
+    SET detail_value = 'function-expression';
+  ELSEIF @batch_long_case_id = 4 THEN
+    INSERT INTO t_rtv_base
+    VALUES(@batch_long_sid, 204, @batch_long_sid + 204,
+           'trigger-bi-post', 0);
+    SELECT COUNT(*) = 2
+      INTO post_ok FROM t_rtv_trigger_audit
+     WHERE sid = @batch_long_sid
+       AND k IN (104, 204)
+       AND action_name LIKE 'bi-trigger-bi%';
+    SET detail_value = 'before-trigger';
+  ELSEIF @batch_long_case_id = 5 THEN
+    UPDATE t_rtv_base
+       SET note = 'trigger-au-post',
+           v = v + 5
+     WHERE sid = @batch_long_sid AND k = 5;
+    SELECT COUNT(*) = 2
+      INTO post_ok FROM t_rtv_trigger_audit
+     WHERE sid = @batch_long_sid
+       AND k = 5
+       AND action_name LIKE 'au-trigger-au%';
+    SET detail_value = 'after-trigger';
+  ELSEIF @batch_long_case_id = 6 THEN
+    UPDATE v_rtv_base
+       SET note = 'view-insert-post',
+           v = v + 6
+     WHERE sid = @batch_long_sid AND k = 106;
+    SELECT note = 'view-insert-post'
+      INTO post_ok FROM t_rtv_base
+     WHERE sid = @batch_long_sid AND k = 106;
+    SET detail_value = 'view-insert';
+  ELSEIF @batch_long_case_id = 7 THEN
+    UPDATE v_rtv_base
+       SET note = 'view-update-post',
+           v = v + 7
+     WHERE sid = @batch_long_sid AND k = 7;
+    SELECT note = 'view-update-post'
+           AND v = @batch_long_sid * 100 + 21
+      INTO post_ok FROM t_rtv_base
+     WHERE sid = @batch_long_sid AND k = 7;
+    SET detail_value = 'view-update';
+  ELSEIF @batch_long_case_id = 8 THEN
+    UPDATE t_rtv_base
+       SET v = @rtv_view_value + 8,
+           note = 'view-read-post'
+     WHERE sid = @batch_long_sid AND k = 8;
+    SELECT note = 'view-read-post'
+           AND v = @batch_long_sid * 100 + 16
+      INTO post_ok FROM t_rtv_base
+     WHERE sid = @batch_long_sid AND k = 8;
+    SET detail_value = 'view-read-base-write';
+  ELSEIF @batch_long_case_id = 9 THEN
+    UPDATE t_rtv_base
+       SET note = 'prepared-post',
+           v = v + 9
+     WHERE sid = @batch_long_sid AND k = 9;
+    SELECT note = 'prepared-post'
+      INTO post_ok FROM t_rtv_base
+     WHERE sid = @batch_long_sid AND k = 9;
+    SET detail_value = 'prepared-execute';
+  ELSEIF @batch_long_case_id = 10 THEN
+    UPDATE t_rtv_base
+       SET note = 'deallocate-post'
+     WHERE sid = @batch_long_sid AND k = 110;
+    SELECT note = 'deallocate-post'
+      INTO post_ok FROM t_rtv_base
+     WHERE sid = @batch_long_sid AND k = 110;
+    SET detail_value = 'prepared-deallocate';
+  ELSEIF @batch_long_case_id = 11 THEN
+    CALL p_rtv_insert_update(@batch_long_sid, 11, 11, 'multi-proc-post');
+    SELECT note = 'multi-proc-post'
+           AND v = @batch_long_sid * 100 + 11 + 11 + 22 + 11
+      INTO post_ok FROM t_rtv_base
+     WHERE sid = @batch_long_sid AND k = 11;
+    SET detail_value = 'multiple-procedure-calls';
+  ELSEIF @batch_long_case_id = 12 THEN
+    ROLLBACK TO SAVEPOINT s_rtv_proc;
+    CALL p_rtv_insert_update(@batch_long_sid, 12, 12, 'proc-save-post');
+    SELECT note = 'proc-save-post'
+      INTO post_ok FROM t_rtv_base
+     WHERE sid = @batch_long_sid AND k = 12;
+    SET detail_value = 'procedure-savepoint-light';
+  ELSEIF @batch_long_case_id = 13 THEN
+    UPDATE t_rtv_base
+       SET note = 'trigger-au-unique-post'
+     WHERE sid = @batch_long_sid AND k = 13;
+    SELECT COUNT(*) = 2
+      INTO post_ok FROM t_rtv_trigger_audit
+     WHERE sid = @batch_long_sid
+       AND k = 13
+       AND action_name LIKE 'au-trigger-au-unique%';
+    SET detail_value = 'trigger-unique';
+  ELSEIF @batch_long_case_id = 14 THEN
+    UPDATE t_rtv_base
+       SET note = CONCAT('string-', f_rtv_delta(@rtv_func_value), '-post')
+     WHERE sid = @batch_long_sid AND k = 14;
+    SELECT note = CONCAT('string-', @batch_long_sid + 28, '-post')
+      INTO post_ok FROM t_rtv_base
+     WHERE sid = @batch_long_sid AND k = 14;
+    SET detail_value = 'function-string-expression';
+  ELSEIF @batch_long_case_id = 15 THEN
+    UPDATE v_rtv_base
+       SET note = 'view-predicate-post'
+     WHERE sid = @batch_long_sid
+       AND k = 15
+       AND v = @batch_long_sid + 15000;
+    SELECT note = 'view-predicate-post'
+      INTO post_ok FROM t_rtv_base
+     WHERE sid = @batch_long_sid AND k = 15;
+    SET detail_value = 'view-predicate';
+  ELSEIF @batch_long_case_id = 16 THEN
+    UPDATE t_rtv_base
+       SET v = v + 16,
+           note = 'prepared-param-post'
+     WHERE sid = @batch_long_sid AND k = 16;
+    SELECT note = 'prepared-param-post'
+           AND v = @batch_long_sid + 16016
+      INTO post_ok FROM t_rtv_base
+     WHERE sid = @batch_long_sid AND k = 16;
+    SET detail_value = 'prepared-params';
+  ELSEIF @batch_long_case_id = 17 THEN
+    CALL p_rtv_insert_update(@batch_long_sid, 17, 17,
+                             'resume-procedure-post');
+    SELECT note = 'resume-procedure-post'
+      INTO post_ok FROM t_rtv_base
+     WHERE sid = @batch_long_sid AND k = 17;
+    SET detail_value = 'resume-procedure-call';
+  ELSEIF @batch_long_case_id = 18 THEN
+    UPDATE v_rtv_base
+       SET note = 'resume-view-post',
+           v = v + 18
+     WHERE sid = @batch_long_sid AND k = 18;
+    SELECT note = 'resume-view-post'
+      INTO post_ok FROM t_rtv_base
+     WHERE sid = @batch_long_sid AND k = 18;
+    SET detail_value = 'resume-view-update';
+  ELSEIF @batch_long_case_id = 19 THEN
+    UPDATE t_rtv_base
+       SET note = 'resume-trigger-post',
+           v = v + 19
+     WHERE sid = @batch_long_sid AND k = 19;
+    SELECT COUNT(*) = 1
+      INTO post_ok FROM t_rtv_trigger_audit
+     WHERE sid = @batch_long_sid
+       AND k = 19
+       AND action_name = 'au-resume-trigger-post';
+    SET detail_value = 'resume-trigger-fire';
+  ELSEIF @batch_long_case_id = 20 THEN
+    UPDATE v_rtv_base
+       SET note = 'mixed-post'
+     WHERE sid = @batch_long_sid AND k = 120;
+    CALL p_rtv_insert_update(@batch_long_sid, 20, 20, 'mixed-proc-post');
+    SELECT (SELECT COUNT(*) = 1 FROM t_rtv_trigger_audit
+             WHERE sid = @batch_long_sid
+               AND k = 120
+               AND action_name = 'au-mixed-post')
+           AND
+           (SELECT note = 'mixed-proc-post' FROM t_rtv_base
+             WHERE sid = @batch_long_sid AND k = 20)
+      INTO post_ok;
+    SET detail_value = 'mixed-routine-view-trigger';
+  END IF;
+
+  IF COALESCE(post_ok, 0) <> 1 THEN
+    SET failure_message = CONCAT(
+      'post-resume rtv check failed sid=',
+      COALESCE(CAST(@batch_long_sid AS CHAR), 'NULL'),
+      ' case=',
+      COALESCE(CAST(@batch_long_case_id AS CHAR), 'NULL'),
+      ' detail=',
+      COALESCE(detail_value, 'NULL'),
+      ' post_ok=',
+      COALESCE(CAST(post_ok AS CHAR), 'NULL'));
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = failure_message;
+  END IF;
+
+  SET @batch_long_end_action = 'COMMIT';
+  INSERT INTO t_batch_long_audit VALUES(
+    @batch_long_sid,
+    @batch_long_case_id,
+    TIMESTAMPDIFF(MICROSECOND, @batch_long_started_at, UTC_TIMESTAMP(6)),
+    @batch_long_max_stmt_us,
+    @batch_long_sql_count,
+    1,
+    detail_value);
+END|
+DELIMITER ;|
+SQL
+
+print $verify <<'SQL';
+SELECT COUNT(DISTINCT detail) AS routine_cases_ok
+  FROM t_batch_long_audit WHERE resumed_ok = 1;
+SELECT detail, COUNT(*) = 5 AS ok
+  FROM t_batch_long_audit GROUP BY detail ORDER BY detail;
+SELECT COUNT(*) = 70 AS trigger_audit_cases_ok
+  FROM t_rtv_trigger_audit;
+SELECT COUNT(*) = 30 AS mixed_trigger_audit_cases_ok
+  FROM t_rtv_trigger_audit a JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 20
+   AND a.action_name LIKE '%mixed%';
+SELECT COUNT(*) = 30 AS view_cases_ok
+  FROM t_batch_long_audit
+ WHERE detail IN ('view-insert',
+                  'view-update',
+                  'view-read-base-write',
+                  'view-predicate',
+                  'resume-view-update',
+                  'mixed-routine-view-trigger');
+SELECT COUNT(*) = 1 AS procedure_exists
+  FROM information_schema.routines
+ WHERE routine_schema = DATABASE()
+   AND routine_name = 'p_rtv_insert_update'
+   AND routine_type = 'PROCEDURE';
+SELECT COUNT(*) = 1 AS function_exists
+  FROM information_schema.routines
+ WHERE routine_schema = DATABASE()
+   AND routine_name = 'f_rtv_delta'
+   AND routine_type = 'FUNCTION';
+SELECT COUNT(*) = 1 AS view_exists
+  FROM information_schema.views
+ WHERE table_schema = DATABASE()
+   AND table_name = 'v_rtv_base';
+SELECT COUNT(*) = 2 AS triggers_exist
+  FROM information_schema.triggers
+ WHERE trigger_schema = DATABASE()
+   AND trigger_name IN ('t_rtv_bi', 't_rtv_au');
+SELECT 1 AS case_id,
+       COUNT(*) = 5 AS ok
+  FROM t_rtv_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 1 AND b.k = 101 AND b.note = 'proc-insert-post'
+UNION ALL SELECT 2, COUNT(*) = 5
+  FROM t_rtv_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 2 AND b.k = 2 AND b.note = 'proc-update-post'
+UNION ALL SELECT 3, COUNT(*) = 5
+  FROM t_rtv_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 3 AND b.k = 3 AND b.note = 'function-post'
+UNION ALL SELECT 4, COUNT(*) = 10
+  FROM t_rtv_trigger_audit a JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 4 AND a.action_name LIKE 'bi-trigger-bi%'
+UNION ALL SELECT 5, COUNT(*) = 10
+  FROM t_rtv_trigger_audit a JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 5 AND a.action_name LIKE 'au-trigger-au%'
+UNION ALL SELECT 6, COUNT(*) = 5
+  FROM t_rtv_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 6 AND b.k = 106 AND b.note = 'view-insert-post'
+UNION ALL SELECT 7, COUNT(*) = 5
+  FROM t_rtv_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 7 AND b.k = 7 AND b.note = 'view-update-post'
+UNION ALL SELECT 8, COUNT(*) = 5
+  FROM t_rtv_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 8 AND b.k = 8 AND b.note = 'view-read-post'
+UNION ALL SELECT 9, COUNT(*) = 5
+  FROM t_rtv_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 9 AND b.k = 9 AND b.note = 'prepared-post'
+UNION ALL SELECT 10, COUNT(*) = 5
+  FROM t_rtv_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 10 AND b.k = 110 AND b.note = 'deallocate-post'
+UNION ALL SELECT 11, COUNT(*) = 5
+  FROM t_rtv_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 11 AND b.k = 11 AND b.note = 'multi-proc-post'
+UNION ALL SELECT 12, COUNT(*) = 5
+  FROM t_rtv_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 12 AND b.k = 12 AND b.note = 'proc-save-post'
+UNION ALL SELECT 13, COUNT(*) = 10
+  FROM t_rtv_trigger_audit a JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 13
+   AND a.k = 13
+   AND a.action_name LIKE 'au-trigger-au-unique%'
+UNION ALL SELECT 14, COUNT(*) = 5
+ FROM t_rtv_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 14 AND b.k = 14
+   AND b.note = CONCAT('string-', b.sid + 28, '-post')
+UNION ALL SELECT 15, COUNT(*) = 5
+  FROM t_rtv_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 15 AND b.k = 15 AND b.note = 'view-predicate-post'
+UNION ALL SELECT 16, COUNT(*) = 5
+  FROM t_rtv_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 16 AND b.k = 16 AND b.note = 'prepared-param-post'
+UNION ALL SELECT 17, COUNT(*) = 5
+  FROM t_rtv_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 17 AND b.k = 17 AND b.note = 'resume-procedure-post'
+UNION ALL SELECT 18, COUNT(*) = 5
+  FROM t_rtv_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 18 AND b.k = 18 AND b.note = 'resume-view-post'
+UNION ALL SELECT 19, COUNT(*) = 5
+  FROM t_rtv_trigger_audit a JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 19
+   AND a.k = 19
+   AND a.action_name = 'au-resume-trigger-post'
+UNION ALL SELECT 20, COUNT(*) = 5
+  FROM t_rtv_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 20 AND b.k = 120 AND b.note = 'mixed-post'
+ORDER BY case_id;
+SQL
+
+sub emit_measured {
+  my ($fh, $sql) = @_;
+  print $fh "SET \@batch_long_stmt_start = NOW(6);\n";
+  print $fh "$sql;\n";
+  print $fh "SET \@batch_long_stmt_us = " .
+            "TIMESTAMPDIFF(MICROSECOND, \@batch_long_stmt_start, NOW(6));\n";
+  print $fh "SET \@batch_long_max_stmt_us = " .
+            "GREATEST(\@batch_long_max_stmt_us, \@batch_long_stmt_us);\n";
+  print $fh "SET \@batch_long_sql_count = \@batch_long_sql_count + 1;\n";
+}
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  my $name = sprintf("batch_long_app_%03d", $sid);
+  print $apps "--connect($name,localhost,root,,test)\n";
+  print $apps "--connection $name\n";
+  print $apps "UPDATE t_batch_long_control SET started_at = NOW(6) WHERE sid = $sid;\n";
+  print $apps "SET \@batch_long_sid = $sid;\n";
+  print $apps "SET \@batch_long_case_id = $case_id;\n";
+  print $apps "SET \@batch_long_started_at = UTC_TIMESTAMP(6);\n";
+  print $apps "SET \@batch_long_max_stmt_us = 0;\n";
+  print $apps "SET \@batch_long_sql_count = 0;\n";
+  print $apps "SET \@batch_long_end_action = 'COMMIT';\n";
+  print $apps "SET \@rtv_pre_ok = 0;\n";
+  print $apps "SET \@rtv_view_value = NULL;\n";
+  print $apps "SET \@rtv_func_value = NULL;\n";
+  print $apps "START TRANSACTION;\n";
+  emit_measured($apps, "UPDATE t_rtv_base SET heartbeat = heartbeat + 1 WHERE sid = $sid AND k = 0");
+
+  if ($case_id == 1) {
+    emit_measured($apps, "CALL p_rtv_insert_update($sid, 101, $sid + 101, 'proc-insert-pre')");
+    emit_measured($apps, "SELECT note = 'proc-insert-pre' INTO \@rtv_pre_ok FROM t_rtv_base WHERE sid = $sid AND k = 101");
+  } elsif ($case_id == 2) {
+    emit_measured($apps, "CALL p_rtv_insert_update($sid, 2, 2, 'proc-update-pre')");
+    emit_measured($apps, "SELECT note = 'proc-update-pre' INTO \@rtv_pre_ok FROM t_rtv_base WHERE sid = $sid AND k = 2");
+  } elsif ($case_id == 3) {
+    emit_measured($apps, "UPDATE t_rtv_base SET v = f_rtv_delta(v), note = 'function-pre' WHERE sid = $sid AND k = 3");
+    emit_measured($apps, "SELECT v = " . ($sid * 100 + 10) . " INTO \@rtv_pre_ok FROM t_rtv_base WHERE sid = $sid AND k = 3");
+  } elsif ($case_id == 4) {
+    emit_measured($apps, "INSERT INTO t_rtv_base VALUES($sid, 104, $sid + 104, 'trigger-bi-pre', 0)");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@rtv_pre_ok FROM t_rtv_trigger_audit WHERE sid = $sid AND k = 104 AND action_name = 'bi-trigger-bi-pre'");
+  } elsif ($case_id == 5) {
+    emit_measured($apps, "UPDATE t_rtv_base SET note = 'trigger-au-pre' WHERE sid = $sid AND k = 5");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@rtv_pre_ok FROM t_rtv_trigger_audit WHERE sid = $sid AND k = 5 AND action_name = 'au-trigger-au-pre'");
+  } elsif ($case_id == 6) {
+    emit_measured($apps, "INSERT INTO v_rtv_base VALUES($sid, 106, $sid + 106, 'view-insert-pre', 0)");
+    emit_measured($apps, "SELECT note = 'view-insert-pre' INTO \@rtv_pre_ok FROM t_rtv_base WHERE sid = $sid AND k = 106");
+  } elsif ($case_id == 7) {
+    emit_measured($apps, "UPDATE v_rtv_base SET v = $sid * 100 + 14, note = 'view-update-pre' WHERE sid = $sid AND k = 7");
+    emit_measured($apps, "SELECT note = 'view-update-pre' INTO \@rtv_pre_ok FROM v_rtv_base WHERE sid = $sid AND k = 7");
+  } elsif ($case_id == 8) {
+    emit_measured($apps, "SELECT v INTO \@rtv_view_value FROM v_rtv_base WHERE sid = $sid AND k = 8");
+    emit_measured($apps, "UPDATE t_rtv_base SET note = 'view-read-pre' WHERE sid = $sid AND k = 8");
+    emit_measured($apps, "SELECT \@rtv_view_value = " . ($sid * 100 + 8) . " INTO \@rtv_pre_ok");
+  } elsif ($case_id == 9) {
+    print $apps "PREPARE rtv_app_stmt FROM 'UPDATE t_rtv_base SET note = ''prepared-pre'' WHERE sid = ? AND k = ?';\n";
+    print $apps "SET \@rtv_p_sid = $sid;\n";
+    print $apps "SET \@rtv_p_k = 9;\n";
+    emit_measured($apps, "EXECUTE rtv_app_stmt USING \@rtv_p_sid, \@rtv_p_k");
+    print $apps "DEALLOCATE PREPARE rtv_app_stmt;\n";
+    emit_measured($apps, "SELECT note = 'prepared-pre' INTO \@rtv_pre_ok FROM t_rtv_base WHERE sid = $sid AND k = 9");
+  } elsif ($case_id == 10) {
+    print $apps "PREPARE rtv_app_stmt FROM 'INSERT INTO t_rtv_base VALUES(?, 110, ?, ''deallocate-pre'', 0)';\n";
+    print $apps "SET \@rtv_p_sid = $sid;\n";
+    print $apps "SET \@rtv_p_v = $sid + 110;\n";
+    emit_measured($apps, "EXECUTE rtv_app_stmt USING \@rtv_p_sid, \@rtv_p_v");
+    print $apps "DEALLOCATE PREPARE rtv_app_stmt;\n";
+    emit_measured($apps, "SELECT note = 'deallocate-pre' INTO \@rtv_pre_ok FROM t_rtv_base WHERE sid = $sid AND k = 110");
+  } elsif ($case_id == 11) {
+    emit_measured($apps, "CALL p_rtv_insert_update($sid, 11, 11, 'multi-proc-a')");
+    emit_measured($apps, "CALL p_rtv_insert_update($sid, 11, 22, 'multi-proc-b')");
+    emit_measured($apps, "SELECT note = 'multi-proc-b' INTO \@rtv_pre_ok FROM t_rtv_base WHERE sid = $sid AND k = 11");
+  } elsif ($case_id == 12) {
+    emit_measured($apps, "CALL p_rtv_insert_update($sid, 12, 12, 'proc-save-pre')");
+    emit_measured($apps, "SAVEPOINT s_rtv_proc");
+    emit_measured($apps, "CALL p_rtv_insert_update($sid, 12, 99, 'proc-save-rollback')");
+    emit_measured($apps, "SELECT note = 'proc-save-rollback' INTO \@rtv_pre_ok FROM t_rtv_base WHERE sid = $sid AND k = 12");
+  } elsif ($case_id == 13) {
+    emit_measured($apps, "UPDATE t_rtv_base SET note = 'trigger-au-unique-pre' WHERE sid = $sid AND k = 13");
+    emit_measured($apps, "UPDATE t_rtv_base SET note = 'trigger-au-unique-pre' WHERE sid = $sid AND k = 13");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@rtv_pre_ok FROM t_rtv_trigger_audit WHERE sid = $sid AND k = 13 AND action_name = 'au-trigger-au-unique-pre'");
+  } elsif ($case_id == 14) {
+    emit_measured($apps, "SELECT f_rtv_delta($sid + 14) INTO \@rtv_func_value");
+    emit_measured($apps, "UPDATE t_rtv_base SET note = CONCAT('string-', \@rtv_func_value) WHERE sid = $sid AND k = 14");
+    emit_measured($apps, "SELECT note = CONCAT('string-', $sid + 21) INTO \@rtv_pre_ok FROM t_rtv_base WHERE sid = $sid AND k = 14");
+  } elsif ($case_id == 15) {
+    emit_measured($apps, "UPDATE v_rtv_base SET v = $sid + 15000, note = 'view-predicate-pre' WHERE sid = $sid AND k = 15");
+    emit_measured($apps, "SELECT note = 'view-predicate-pre' INTO \@rtv_pre_ok FROM v_rtv_base WHERE sid = $sid AND k = 15 AND v = $sid + 15000");
+  } elsif ($case_id == 16) {
+    print $apps "PREPARE rtv_app_stmt FROM 'UPDATE t_rtv_base SET v = ?, note = ''prepared-param-pre'' WHERE sid = ? AND k = ?';\n";
+    print $apps "SET \@rtv_p_v = $sid + 16000;\n";
+    print $apps "SET \@rtv_p_sid = $sid;\n";
+    print $apps "SET \@rtv_p_k = 16;\n";
+    emit_measured($apps, "EXECUTE rtv_app_stmt USING \@rtv_p_v, \@rtv_p_sid, \@rtv_p_k");
+    print $apps "DEALLOCATE PREPARE rtv_app_stmt;\n";
+    emit_measured($apps, "SELECT note = 'prepared-param-pre' INTO \@rtv_pre_ok FROM t_rtv_base WHERE sid = $sid AND k = 16");
+  } elsif ($case_id == 17) {
+    emit_measured($apps, "UPDATE t_rtv_base SET note = 'resume-procedure-pre' WHERE sid = $sid AND k = 17");
+    emit_measured($apps, "SELECT note = 'resume-procedure-pre' INTO \@rtv_pre_ok FROM t_rtv_base WHERE sid = $sid AND k = 17");
+  } elsif ($case_id == 18) {
+    emit_measured($apps, "UPDATE t_rtv_base SET note = 'resume-view-pre' WHERE sid = $sid AND k = 18");
+    emit_measured($apps, "SELECT note = 'resume-view-pre' INTO \@rtv_pre_ok FROM v_rtv_base WHERE sid = $sid AND k = 18");
+  } elsif ($case_id == 19) {
+    emit_measured($apps, "UPDATE t_rtv_base SET note = 'resume-trigger-pre' WHERE sid = $sid AND k = 19");
+    emit_measured($apps, "SELECT note = 'resume-trigger-pre' INTO \@rtv_pre_ok FROM t_rtv_base WHERE sid = $sid AND k = 19");
+  } elsif ($case_id == 20) {
+    emit_measured($apps, "INSERT INTO v_rtv_base VALUES($sid, 120, $sid + 120, 'mixed-pre', 0)");
+    emit_measured($apps, "CALL p_rtv_insert_update($sid, 20, 20, 'mixed-proc-pre')");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@rtv_pre_ok FROM t_rtv_trigger_audit WHERE sid = $sid AND k = 120 AND action_name = 'bi-mixed-pre'");
+  }
+}
+print $apps "--connection default\n";
+
+for my $round (1 .. 80) {
+  for my $sid (1 .. 100) {
+    my $name = sprintf("batch_long_app_%03d", $sid);
+    print $post_apps "--connection $name\n";
+    emit_measured($post_apps, "UPDATE t_rtv_base SET heartbeat = heartbeat + 1 WHERE sid = $sid AND k = 0");
+  }
+}
+print $post_apps "--connection default\n";
+
+close($setup);
+close($apps);
+close($post_apps);
+close($cleanup);
+close($verify);
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+SET GLOBAL preserve_trx_recovery_max_count=200;
+--let $old_preserve_trx_drain_grace_ms= `SELECT @@GLOBAL.preserve_trx_drain_grace_ms`
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+
+--let $batch_long_prefix= batch_long_rtv
+--let $batch_long_setup_file= $MYSQLTEST_VARDIR/tmp/batch_long_rtv_setup.inc
+--let $batch_long_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_rtv_apps.inc
+--let $batch_long_post_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_rtv_post_apps.inc
+--let $batch_long_cleanup_file= $MYSQLTEST_VARDIR/tmp/batch_long_rtv_cleanup.inc
+--let $batch_long_resume_file= $MYSQLTEST_VARDIR/tmp/batch_long_rtv_resume.inc
+--let $batch_long_verify_file= $MYSQLTEST_VARDIR/tmp/batch_long_rtv_verify.inc
+--source suite/preserve_trx/include/batch_drain_100_long_common.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+--disable_query_log
+--disable_result_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_drain_grace_ms=$old_preserve_trx_drain_grace_ms
+--enable_result_log
+--enable_query_log

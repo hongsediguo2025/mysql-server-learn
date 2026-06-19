@@ -436,6 +436,15 @@ SET(SQL_SHARED_SOURCES
   parser_service.cc
   partition_info.cc
   partitioning/partition_handler.cc
+  preserve_trx_bundle.cc
+  preserve_trx_carrier.cc
+  preserve_trx_carrier_file.cc
+  preserve_trx.cc
+  preserve_trx_drain.cc
+  preserve_trx_resource.cc
+  preserve_trx_temp_table.cc
+  preserve_trx_temp_table_carrier.cc
+  preserve_trx_warmcopy.cc
   persisted_variable.cc
   protocol_classic.cc
   psi_memory_key.cc
@@ -874,6 +883,7 @@ SET(BINLOG_SOURCE
   binlog.cc
   binlog_istream.cc
   binlog_ostream.cc
+  binlog_warmcopy.cc
   binlog_reader.cc
   log_event.cc
   rpl_commit_stage_manager.cc

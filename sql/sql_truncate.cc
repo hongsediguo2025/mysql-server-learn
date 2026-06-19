@@ -48,6 +48,7 @@
 #include "sql/handler.h"
 #include "sql/lock.h"  // MYSQL_OPEN_* flags
 #include "sql/mdl.h"
+#include "sql/preserve_trx_temp_table.h"
 #include "sql/query_options.h"
 #include "sql/sql_audit.h"        // mysql_audit_table_access_notify
 #include "sql/sql_backup_lock.h"  // acquire_shared_backup_lock
@@ -646,6 +647,8 @@ void Sql_cmd_truncate_table::truncate_temporary(THD *thd,
 
   TABLE *tmp_table = table_ref->table;
   hton = tmp_table->s->db_type();
+  const bool preserve_temp_truncate =
+      tmp_table->s->tmp_table == TRANSACTIONAL_TMP_TABLE;
 
   /*
     THD::decide_logging_format has not yet been called and may
@@ -704,6 +707,10 @@ void Sql_cmd_truncate_table::truncate_temporary(THD *thd,
     }
 
     /* Only binlog if truncate-by-recreate succeeds. */
+    if (preserve_temp_truncate)
+      (void)preserve_trx_temp_table_note_table_truncate(
+          thd, table_ref->db, strlen(table_ref->db), table_ref->table_name,
+          strlen(table_ref->table_name));
     /* In RBR, the statement is not binlogged if the table is temporary. */
     binlog_stmt = !thd->is_current_stmt_binlog_format_row();
     return;
@@ -720,6 +727,7 @@ void Sql_cmd_truncate_table::truncate_temporary(THD *thd,
   if (tr != Truncate_result::OK) {
     return;
   }
+  (void)preserve_trx_temp_table_note_table_truncate(thd, table_ref->table);
   m_error = false;
   /* Only binlog if truncate succeeds. */
   /* In RBR, the statement is not binlogged if the table is temporary. */

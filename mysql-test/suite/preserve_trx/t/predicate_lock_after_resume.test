@@ -1,0 +1,82 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_predicate_lock_anchor;
+DROP TABLE IF EXISTS t_predicate_lock_after_resume;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_predicate_lock_anchor(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+CREATE TABLE t_predicate_lock_after_resume(
+  id INT PRIMARY KEY,
+  pos POINT NOT NULL SRID 0,
+  SPATIAL KEY(pos)
+) ENGINE=InnoDB;
+INSERT INTO t_predicate_lock_anchor VALUES(1,0);
+INSERT INTO t_predicate_lock_after_resume VALUES
+  (1, ST_GeomFromText('POINT(1 1)')),
+  (2, ST_GeomFromText('POINT(10 10)'));
+
+SET @g = ST_GeomFromText('POLYGON((0 0,0 5,5 5,5 0,0 0))');
+START TRANSACTION;
+UPDATE t_predicate_lock_anchor SET v=1 WHERE id=1;
+SELECT COUNT(*) AS locked_rows
+  FROM t_predicate_lock_after_resume FORCE INDEX(pos)
+  WHERE MBRWithin(pos, @g) FOR UPDATE;
+
+--connect(predicate_writer_before, localhost, root,,test)
+connection predicate_writer_before;
+SET innodb_lock_wait_timeout=1;
+--error ER_LOCK_WAIT_TIMEOUT
+INSERT INTO t_predicate_lock_after_resume VALUES
+  (4, ST_GeomFromText('POINT(2 2)'));
+disconnect predicate_writer_before;
+
+connection default;
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS recovered_predicate_locks
+  FROM performance_schema.data_locks
+  WHERE OBJECT_SCHEMA='test'
+    AND OBJECT_NAME='t_predicate_lock_after_resume'
+    AND INDEX_NAME='pos'
+    AND LOCK_MODE LIKE '%PREDICATE%'
+    AND LOCK_STATUS='GRANTED';
+
+--connect(predicate_writer, localhost, root,,test)
+connection predicate_writer;
+SET innodb_lock_wait_timeout=1;
+--error ER_LOCK_WAIT_TIMEOUT
+INSERT INTO t_predicate_lock_after_resume VALUES
+  (3, ST_GeomFromText('POINT(2 2)'));
+
+connection default;
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+ROLLBACK;
+
+connection predicate_writer;
+INSERT INTO t_predicate_lock_after_resume VALUES
+  (3, ST_GeomFromText('POINT(2 2)'));
+disconnect predicate_writer;
+
+connection default;
+SELECT id, ST_AsText(pos) AS pos
+  FROM t_predicate_lock_after_resume ORDER BY id;
+SELECT * FROM t_predicate_lock_anchor;
+
+DROP TABLE t_predicate_lock_after_resume;
+DROP TABLE t_predicate_lock_anchor;
+SET GLOBAL preserve_trx_enable=ON;

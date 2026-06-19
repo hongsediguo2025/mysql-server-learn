@@ -197,6 +197,36 @@ struct Query_options {
   bool save_to(Parse_context *);
 };
 
+enum class Preserve_trx_parser_user_vars_mode { DEFAULT, INCLUDE, EXCLUDE };
+
+struct Preserve_trx_parser_options {
+  bool has_timeout;
+  ulonglong timeout_seconds;
+  Preserve_trx_parser_user_vars_mode user_vars_mode;
+
+  void init() {
+    has_timeout = false;
+    timeout_seconds = 0;
+    user_vars_mode = Preserve_trx_parser_user_vars_mode::DEFAULT;
+  }
+
+  bool merge(const Preserve_trx_parser_options &x) {
+    if ((has_timeout && x.has_timeout) ||
+        (user_vars_mode != Preserve_trx_parser_user_vars_mode::DEFAULT &&
+         x.user_vars_mode != Preserve_trx_parser_user_vars_mode::DEFAULT)) {
+      return true;
+    }
+
+    if (x.has_timeout) {
+      has_timeout = true;
+      timeout_seconds = x.timeout_seconds;
+    }
+    if (x.user_vars_mode != Preserve_trx_parser_user_vars_mode::DEFAULT)
+      user_vars_mode = x.user_vars_mode;
+    return false;
+  }
+};
+
 enum delete_option_enum {
   DELETE_QUICK = 1 << 0,
   DELETE_LOW_PRIORITY = 1 << 1,
@@ -424,6 +454,7 @@ union YYSTYPE {
   PT_order_list *order_list;
   Limit_options limit_options;
   Query_options select_options;
+  Preserve_trx_parser_options preserve_trx_options;
   PT_limit_clause *limit_clause;
   Parse_tree_node *node;
   enum olap_type olap_type;

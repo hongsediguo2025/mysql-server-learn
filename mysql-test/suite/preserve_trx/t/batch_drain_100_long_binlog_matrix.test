@@ -1,0 +1,430 @@
+--source include/big_test.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $setup_file = File::Spec->catfile($vardir, 'tmp',
+                                     'batch_long_binlog_setup.inc');
+my $apps_file = File::Spec->catfile($vardir, 'tmp',
+                                    'batch_long_binlog_apps.inc');
+my $post_apps_file = File::Spec->catfile($vardir, 'tmp',
+                                         'batch_long_binlog_post_apps.inc');
+my $cleanup_file = File::Spec->catfile($vardir, 'tmp',
+                                       'batch_long_binlog_cleanup.inc');
+my $pre_resume_file = File::Spec->catfile($vardir, 'tmp',
+                                          'batch_long_binlog_pre_resume.inc');
+my $verify_file = File::Spec->catfile($vardir, 'tmp',
+                                      'batch_long_binlog_verify.inc');
+
+open(my $setup, '>', $setup_file)
+  or die "cannot open $setup_file for write: $!";
+open(my $apps, '>', $apps_file)
+  or die "cannot open $apps_file for write: $!";
+open(my $post_apps, '>', $post_apps_file)
+  or die "cannot open $post_apps_file for write: $!";
+open(my $cleanup, '>', $cleanup_file)
+  or die "cannot open $cleanup_file for write: $!";
+open(my $pre_resume, '>', $pre_resume_file)
+  or die "cannot open $pre_resume_file for write: $!";
+open(my $verify, '>', $verify_file)
+  or die "cannot open $verify_file for write: $!";
+
+print $cleanup <<'SQL';
+SET GTID_NEXT=AUTOMATIC;
+SET SESSION sql_log_bin=0;
+DROP PROCEDURE IF EXISTS p_batch_long_finalize;
+DROP TABLE IF EXISTS t_batch_long_tokens;
+DROP TABLE IF EXISTS t_binlog_resume_state;
+DROP TABLE IF EXISTS t_binlog_gtid;
+DROP TABLE IF EXISTS t_binlog_session_off;
+DROP TABLE IF EXISTS t_binlog_logged_empty;
+DROP TABLE IF EXISTS t_binlog_logged_cache;
+DROP TABLE IF EXISTS t_batch_long_audit;
+DROP TABLE IF EXISTS t_batch_long_control;
+DROP DATABASE IF EXISTS batch_long_binlog_ignored;
+SET SESSION sql_log_bin=1;
+SQL
+
+print $setup <<'SQL';
+SET SESSION sql_log_bin=0;
+CREATE DATABASE batch_long_binlog_ignored;
+CREATE TABLE t_batch_long_control(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  started_at DATETIME(6) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE t_batch_long_audit(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  lifecycle_age_us BIGINT UNSIGNED NOT NULL,
+  max_stmt_us BIGINT UNSIGNED NOT NULL,
+  sql_count INT UNSIGNED NOT NULL,
+  resumed_ok TINYINT NOT NULL,
+  detail VARCHAR(255) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE t_batch_long_tokens(
+  token_id INT PRIMARY KEY AUTO_INCREMENT,
+  token VARCHAR(255) NOT NULL UNIQUE
+) ENGINE=InnoDB;
+CREATE TABLE t_binlog_logged_cache(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  v INT NOT NULL,
+  marker VARCHAR(64),
+  heartbeat INT NOT NULL DEFAULT 0
+) ENGINE=InnoDB;
+CREATE TABLE t_binlog_logged_empty(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  v INT NOT NULL,
+  marker VARCHAR(64),
+  heartbeat INT NOT NULL DEFAULT 0
+) ENGINE=InnoDB;
+CREATE TABLE t_binlog_session_off(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  v INT NOT NULL,
+  marker VARCHAR(64),
+  heartbeat INT NOT NULL DEFAULT 0
+) ENGINE=InnoDB;
+CREATE TABLE t_binlog_gtid(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  v INT NOT NULL,
+  marker VARCHAR(64),
+  heartbeat INT NOT NULL DEFAULT 0
+) ENGINE=InnoDB;
+CREATE TABLE t_binlog_resume_state(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  detail VARCHAR(64) NOT NULL,
+  resumed_sql_log_bin INT NOT NULL,
+  resumed_gtid_next VARCHAR(255) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE batch_long_binlog_ignored.seed(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  v INT NOT NULL,
+  heartbeat INT NOT NULL DEFAULT 0
+) ENGINE=InnoDB;
+SQL
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  print $setup "INSERT INTO t_batch_long_control " .
+               "VALUES($sid, $case_id, TIMESTAMP'2000-01-01 00:00:00.000000');\n";
+  print $setup "INSERT INTO t_binlog_logged_cache VALUES($sid, $case_id, " .
+               ($sid * 10) . ", 'seed', 0);\n";
+  print $setup "INSERT INTO t_binlog_logged_empty VALUES($sid, $case_id, " .
+               ($sid * 20) . ", 'seed', 0);\n";
+  print $setup "INSERT INTO t_binlog_session_off VALUES($sid, $case_id, " .
+               ($sid * 30) . ", 'seed', 0);\n";
+  print $setup "INSERT INTO t_binlog_gtid VALUES($sid, $case_id, " .
+               ($sid * 40) . ", 'seed', 0);\n";
+  print $setup "INSERT INTO batch_long_binlog_ignored.seed VALUES($sid, " .
+               "$case_id, " . ($sid * 50) . ", 0);\n";
+}
+
+print $setup <<'SQL';
+SET SESSION sql_log_bin=1;
+RESET MASTER;
+DELIMITER |;
+CREATE PROCEDURE p_batch_long_finalize()
+BEGIN
+  DECLARE post_ok TINYINT DEFAULT 0;
+  DECLARE detail_value VARCHAR(255) DEFAULT NULL;
+  DECLARE failure_message VARCHAR(255) DEFAULT NULL;
+
+  IF @batch_long_sid IS NULL OR @batch_long_case_id IS NULL THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'missing restored batch long user vars';
+  END IF;
+  IF COALESCE(@batch_binlog_pre_ok, 0) <> 1 THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'pre-drain binlog check was not restored';
+  END IF;
+
+  IF @batch_long_case_id BETWEEN 1 AND 8 THEN
+    UPDATE t_binlog_logged_cache
+       SET v = v + 1000,
+           marker = 'logged-cache-post'
+     WHERE sid = @batch_long_sid;
+    SELECT @@session.sql_log_bin = 1
+           AND marker = 'logged-cache-post'
+      INTO post_ok FROM t_binlog_logged_cache
+     WHERE sid = @batch_long_sid;
+    SET detail_value = 'logged-with-cache';
+    SET @batch_long_end_action = 'COMMIT';
+  ELSEIF @batch_long_case_id BETWEEN 9 AND 12 THEN
+    UPDATE t_binlog_logged_empty
+       SET v = v + 2000,
+           marker = 'logged-empty-post'
+     WHERE sid = @batch_long_sid;
+    SELECT @@session.sql_log_bin = 1
+           AND marker = 'logged-empty-post'
+      INTO post_ok FROM t_binlog_logged_empty
+     WHERE sid = @batch_long_sid;
+    SET detail_value = 'logged-empty';
+    SET @batch_long_end_action = 'COMMIT';
+  ELSEIF @batch_long_case_id BETWEEN 13 AND 16 THEN
+    UPDATE t_binlog_session_off
+       SET v = v + 3000,
+           marker = 'session-off-post'
+     WHERE sid = @batch_long_sid;
+    SELECT @@session.sql_log_bin = 0
+           AND marker = 'session-off-post'
+      INTO post_ok FROM t_binlog_session_off
+     WHERE sid = @batch_long_sid;
+    SET detail_value = 'session-off-no-cache';
+    SET @batch_long_end_action = 'COMMIT';
+  ELSE
+    UPDATE t_binlog_gtid
+       SET v = v + 4000,
+           marker = 'explicit-gtid-post'
+     WHERE sid = @batch_long_sid;
+    SELECT @@session.sql_log_bin = 1
+           AND @@session.gtid_next = @batch_gtid_next
+           AND marker = 'explicit-gtid-post'
+      INTO post_ok FROM t_binlog_gtid
+    WHERE sid = @batch_long_sid;
+    SET detail_value = 'explicit-gtid';
+    SET @batch_long_end_action = 'COMMIT_EXPLICIT_GTID';
+  END IF;
+
+  IF COALESCE(post_ok, 0) <> 1 THEN
+    SET failure_message = CONCAT(
+      'post-resume binlog check failed sid=',
+      COALESCE(CAST(@batch_long_sid AS CHAR), 'NULL'),
+      ' case=',
+      COALESCE(CAST(@batch_long_case_id AS CHAR), 'NULL'),
+      ' detail=',
+      COALESCE(detail_value, 'NULL'),
+      ' sql_log_bin=',
+      COALESCE(CAST(@@session.sql_log_bin AS CHAR), 'NULL'),
+      ' gtid_next=',
+      COALESCE(@@session.gtid_next, 'NULL'));
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = failure_message;
+  END IF;
+
+  INSERT INTO t_binlog_resume_state VALUES(
+    @batch_long_sid,
+    @batch_long_case_id,
+    detail_value,
+    @@session.sql_log_bin,
+    @@session.gtid_next);
+
+  INSERT INTO t_batch_long_audit VALUES(
+    @batch_long_sid,
+    @batch_long_case_id,
+    TIMESTAMPDIFF(MICROSECOND, @batch_long_started_at, UTC_TIMESTAMP(6)),
+    @batch_long_max_stmt_us,
+    @batch_long_sql_count,
+    1,
+    detail_value);
+
+END|
+DELIMITER ;|
+SQL
+
+print $pre_resume <<'SQL';
+SELECT BINLOG_STATE,
+       COUNT(*) AS state_count,
+       SUM(WROTE_TO_CACHE = 'YES') AS wrote_to_cache_count,
+       SUM(SESSION_SQL_LOG_BIN = 'OFF') AS session_off_count
+  FROM performance_schema.preserved_transactions
+ GROUP BY BINLOG_STATE
+ ORDER BY BINLOG_STATE;
+SQL
+
+print $verify <<'SQL';
+SELECT detail, COUNT(*) AS row_count
+  FROM t_batch_long_audit
+ GROUP BY detail
+ ORDER BY detail;
+SELECT detail, resumed_sql_log_bin, COUNT(*) AS row_count
+  FROM t_binlog_resume_state
+ GROUP BY detail, resumed_sql_log_bin
+ ORDER BY detail, resumed_sql_log_bin;
+SELECT COUNT(*) = 20 AS explicit_gtid_next_restored
+  FROM t_binlog_resume_state
+ WHERE detail = 'explicit-gtid'
+   AND resumed_gtid_next LIKE CONCAT(@@GLOBAL.SERVER_UUID, ':%');
+SELECT COALESCE(SUM(GTID_SUBSET(resumed_gtid_next,
+                                @@GLOBAL.GTID_EXECUTED)), 0) = 20
+       AS explicit_gtids_committed
+  FROM t_binlog_resume_state
+ WHERE detail = 'explicit-gtid';
+SELECT COUNT(*) = 40 AS logged_cache_rows
+  FROM t_binlog_logged_cache
+ WHERE case_id BETWEEN 1 AND 8
+   AND marker = 'logged-cache-post';
+SELECT COUNT(*) = 20 AS logged_empty_rows
+  FROM t_binlog_logged_empty
+ WHERE case_id BETWEEN 9 AND 12
+   AND marker = 'logged-empty-post';
+SELECT COUNT(*) = 20 AS session_off_rows
+  FROM t_binlog_session_off
+ WHERE case_id BETWEEN 13 AND 16
+   AND marker = 'session-off-post';
+SELECT COUNT(*) = 20 AS explicit_gtid_rows
+  FROM t_binlog_gtid
+ WHERE case_id BETWEEN 17 AND 20
+   AND marker = 'explicit-gtid-post';
+
+--let $binlog_file= query_get_value(SHOW MASTER STATUS, File, 1)
+--exec $MYSQL_BINLOG --force-if-open --base64-output=decode-rows -v -v $MYSQLTEST_VARDIR/mysqld.1/data/$binlog_file > $MYSQLTEST_VARDIR/tmp/batch_long_binlog.mysqlbinlog
+--let $assert_match=
+--let $assert_count=
+--let $assert_count_condition=
+--let $assert_text= 100-session LOGGED_WITH_CACHE events are written to the binlog
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/batch_long_binlog.mysqlbinlog
+--let $assert_select= ### UPDATE `test`.`t_binlog_logged_cache`
+--let $assert_count_condition= >= 40
+--source include/assert_grep.inc
+--let $assert_match=
+--let $assert_count=
+--let $assert_count_condition=
+--let $assert_text= 100-session LOGGED_EMPTY future DML is written to the binlog
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/batch_long_binlog.mysqlbinlog
+--let $assert_select= ### UPDATE `test`.`t_binlog_logged_empty`
+--let $assert_count_condition= >= 20
+--source include/assert_grep.inc
+--let $assert_match=
+--let $assert_count=
+--let $assert_count_condition=
+--let $assert_text= 100-session explicit GTID DML is written to the binlog
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/batch_long_binlog.mysqlbinlog
+--let $assert_select= ### UPDATE `test`.`t_binlog_gtid`
+--let $assert_count_condition= >= 20
+--source include/assert_grep.inc
+--let $assert_match=
+--let $assert_count=
+--let $assert_count_condition=
+--let $assert_text= 100-session SESSION_OFF_NO_CACHE DML stays out of the binlog
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/batch_long_binlog.mysqlbinlog
+--let $assert_select= ### UPDATE `test`.`t_binlog_session_off`
+--let $assert_count= 0
+--source include/assert_grep.inc
+--let $assert_match=
+--let $assert_count=
+--let $assert_count_condition=
+--let $assert_text= 100-session ignored LOGGED_EMPTY pre-drain DML stays out of the binlog
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/batch_long_binlog.mysqlbinlog
+--let $assert_select= ### UPDATE `batch_long_binlog_ignored`.`seed`
+--let $assert_count= 0
+--source include/assert_grep.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/batch_long_binlog.mysqlbinlog
+SQL
+
+sub emit_measured {
+  my ($fh, $sql) = @_;
+  print $fh "SET \@batch_long_stmt_start = NOW(6);\n";
+  print $fh "$sql;\n";
+  print $fh "SET \@batch_long_stmt_us = " .
+            "TIMESTAMPDIFF(MICROSECOND, \@batch_long_stmt_start, NOW(6));\n";
+  print $fh "SET \@batch_long_max_stmt_us = " .
+            "GREATEST(\@batch_long_max_stmt_us, \@batch_long_stmt_us);\n";
+  print $fh "SET \@batch_long_sql_count = \@batch_long_sql_count + 1;\n";
+}
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  my $name = sprintf("batch_long_app_%03d", $sid);
+  print $apps "--connect($name,localhost,root,,test)\n";
+  print $apps "--connection $name\n";
+  print $apps "UPDATE t_batch_long_control SET started_at = NOW(6) WHERE sid = $sid;\n";
+  print $apps "SET \@batch_long_sid = $sid;\n";
+  print $apps "SET \@batch_long_case_id = $case_id;\n";
+  print $apps "SET \@batch_long_started_at = UTC_TIMESTAMP(6);\n";
+  print $apps "SET \@batch_long_max_stmt_us = 0;\n";
+  print $apps "SET \@batch_long_sql_count = 0;\n";
+  print $apps "SET \@batch_long_end_action = 'COMMIT';\n";
+  print $apps "SET \@batch_binlog_pre_ok = 0;\n";
+  print $apps "SET \@batch_gtid_next = NULL;\n";
+
+  if ($case_id >= 13 && $case_id <= 16) {
+    print $apps "SET SESSION sql_log_bin = 0;\n";
+  } elsif ($case_id >= 17 && $case_id <= 20) {
+    print $apps "SET \@batch_gtid_next = CONCAT(\@\@GLOBAL.SERVER_UUID, ':" .
+                (10000 + $sid) . "');\n";
+    print $apps "SET GTID_NEXT = \@batch_gtid_next;\n";
+  }
+
+  print $apps "START TRANSACTION;\n";
+  if ($case_id >= 1 && $case_id <= 8) {
+    emit_measured($apps, "UPDATE t_binlog_logged_cache SET v = v + $case_id, marker = 'logged-cache-pre' WHERE sid = $sid");
+    emit_measured($apps, "SELECT marker = 'logged-cache-pre' INTO \@batch_binlog_pre_ok FROM t_binlog_logged_cache WHERE sid = $sid");
+  } elsif ($case_id >= 9 && $case_id <= 12) {
+    emit_measured($apps, "UPDATE batch_long_binlog_ignored.seed SET v = v + $case_id, heartbeat = heartbeat + 1 WHERE sid = $sid");
+    emit_measured($apps, "SELECT v = " . ($sid * 50 + $case_id) . " INTO \@batch_binlog_pre_ok FROM batch_long_binlog_ignored.seed WHERE sid = $sid");
+  } elsif ($case_id >= 13 && $case_id <= 16) {
+    emit_measured($apps, "UPDATE t_binlog_session_off SET v = v + $case_id, marker = 'session-off-pre' WHERE sid = $sid");
+    emit_measured($apps, "SELECT \@\@session.sql_log_bin = 0 AND marker = 'session-off-pre' INTO \@batch_binlog_pre_ok FROM t_binlog_session_off WHERE sid = $sid");
+  } else {
+    emit_measured($apps, "UPDATE t_binlog_gtid SET v = v + $case_id, marker = 'explicit-gtid-pre' WHERE sid = $sid");
+    emit_measured($apps, "SELECT \@\@session.gtid_next = \@batch_gtid_next AND marker = 'explicit-gtid-pre' INTO \@batch_binlog_pre_ok FROM t_binlog_gtid WHERE sid = $sid");
+  }
+}
+print $apps "--connection default\n";
+
+for my $round (1 .. 80) {
+  for my $sid (1 .. 100) {
+    my $case_id = (($sid - 1) % 20) + 1;
+    my $name = sprintf("batch_long_app_%03d", $sid);
+    print $post_apps "--connection $name\n";
+    if ($case_id >= 1 && $case_id <= 8) {
+      emit_measured($post_apps, "UPDATE t_binlog_logged_cache SET heartbeat = heartbeat + 1 WHERE sid = $sid");
+    } elsif ($case_id >= 9 && $case_id <= 12) {
+      emit_measured($post_apps, "UPDATE batch_long_binlog_ignored.seed SET heartbeat = heartbeat + 1 WHERE sid = $sid");
+    } elsif ($case_id >= 13 && $case_id <= 16) {
+      emit_measured($post_apps, "UPDATE t_binlog_session_off SET heartbeat = heartbeat + 1 WHERE sid = $sid");
+    } else {
+      emit_measured($post_apps, "UPDATE t_binlog_gtid SET heartbeat = heartbeat + 1 WHERE sid = $sid");
+    }
+  }
+}
+print $post_apps "--connection default\n";
+
+close($setup);
+close($apps);
+close($post_apps);
+close($cleanup);
+close($pre_resume);
+close($verify);
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+SET GLOBAL preserve_trx_recovery_max_count=200;
+--let $old_preserve_trx_drain_grace_ms= `SELECT @@GLOBAL.preserve_trx_drain_grace_ms`
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+
+--let $batch_long_prefix= batch_long_binlog
+--let $batch_long_setup_file= $MYSQLTEST_VARDIR/tmp/batch_long_binlog_setup.inc
+--let $batch_long_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_binlog_apps.inc
+--let $batch_long_post_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_binlog_post_apps.inc
+--let $batch_long_cleanup_file= $MYSQLTEST_VARDIR/tmp/batch_long_binlog_cleanup.inc
+--let $batch_long_pre_resume_file= $MYSQLTEST_VARDIR/tmp/batch_long_binlog_pre_resume.inc
+--let $batch_long_resume_file= $MYSQLTEST_VARDIR/tmp/batch_long_binlog_resume.inc
+--let $batch_long_verify_file= $MYSQLTEST_VARDIR/tmp/batch_long_binlog_verify.inc
+--let $batch_long_restart_options= --gtid-mode=ON --enforce-gtid-consistency
+--source suite/preserve_trx/include/batch_drain_100_long_common.inc
+--let $batch_long_restart_options=
+
+SET GLOBAL preserve_trx_enable=ON;
+--disable_query_log
+--disable_result_log
+SET SESSION sql_log_bin=0;
+DROP PROCEDURE IF EXISTS p_batch_long_apply_end_action;
+SET SESSION sql_log_bin=1;
+RESET MASTER;
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_drain_grace_ms=$old_preserve_trx_drain_grace_ms
+--enable_result_log
+--enable_query_log

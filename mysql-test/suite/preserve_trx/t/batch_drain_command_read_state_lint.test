@@ -1,0 +1,95 @@
+# Lint-only source-shape guard. This test protects wiring invariants around
+# command-read state transitions, but it is not runtime behavior coverage.
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+sub extract_function_body {
+  my ($src, $signature) = @_;
+  my $sig_pos = index($src, $signature);
+  die "could not find signature: $signature\n" if $sig_pos < 0;
+
+  my $brace_pos = index($src, '{', $sig_pos);
+  die "could not find function body start for: $signature\n" if $brace_pos < 0;
+
+  my $depth = 0;
+  for (my $i = $brace_pos; $i < length($src); ++$i) {
+    my $ch = substr($src, $i, 1);
+    $depth++ if $ch eq '{';
+    $depth-- if $ch eq '}';
+    if ($depth == 0 && $ch eq '}') {
+      return substr($src, $sig_pos, $i - $sig_pos + 1);
+    }
+  }
+  die "could not parse balanced braces for: $signature\n";
+}
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+my $path = File::Spec->catfile($source_root, 'sql', 'preserve_trx.cc');
+
+open(my $fh, '<', $path) or die "cannot open $path: $!";
+my $preserve_src = do { local $/; <$fh> };
+close($fh);
+
+my $shared_helper = extract_function_body(
+  $preserve_src,
+  'static bool preserve_trx_publish_pending_quiesce_at_idle_boundary(THD *thd)');
+die "shared helper must only publish PENDING_QUIESCE targets at an idle boundary\n"
+  unless $shared_helper =~ /Preserve_trx_batch_thd_state::PENDING_QUIESCE/s &&
+         $shared_helper =~ /m_server_idle/s;
+die "shared helper must publish both active and transactionless target states\n"
+  unless $shared_helper =~ /preserve_trx_has_explicit_active_transaction/s &&
+         $shared_helper =~ /Preserve_trx_batch_thd_state::QUIESCED/s &&
+         $shared_helper =~ /Preserve_trx_batch_thd_state::DRAINED_NO_TRANSACTION/s;
+
+$preserve_src =~
+  /class Preserve_batch_target_state_reader.*?class Preserve_batch_clear_target_generation/ms
+  or die "could not isolate Preserve_batch_target_state_reader\n";
+my $target_state_reader = $&;
+die "target-state reader must use the shared pending-quiesce helper\n"
+  unless $target_state_reader =~
+         /preserve_trx_publish_pending_quiesce_at_idle_boundary\s*\(\s*candidate\s*\)/s;
+
+my $begin_read =
+  extract_function_body($preserve_src, 'bool preserved_trx_begin_command_read(THD *thd)');
+die "command-read boundary must use the shared pending-quiesce helper\n"
+  unless $begin_read =~ /preserve_trx_publish_pending_quiesce_at_idle_boundary/s;
+die "command-read boundary must not compare counters to zero immediately after resetting them\n"
+  if $begin_read =~
+     /if\s*\([^)]*preserve_trx_inflight_risky_statement_depth\s*==\s*0[^)]*preserve_trx_inflight_unknown_query_depth\s*==\s*0/s;
+die "command-read boundary must assert that reset counters are zero\n"
+  unless $begin_read =~
+         /assert\(thd->preserve_trx_inflight_risky_statement_depth == 0\)/s &&
+         $begin_read =~
+         /assert\(thd->preserve_trx_inflight_unknown_query_depth == 0\)/s;
+
+my $quiesced_wait =
+  extract_function_body($preserve_src,
+  'bool preserved_trx_wait_if_batch_session_quiesced(THD *thd)');
+die "QUIESCED wait path must expose repeated warning observability\n"
+  unless $quiesced_wait =~ /preserve_trx_wait_target_timed_out/s &&
+         $preserve_src =~ /kPreserveTrxBatchQuiescedWaitWarningLoops/s &&
+         $preserve_src =~ /remains QUIESCED/s &&
+         $preserve_src =~ /WARNING_LEVEL/s;
+
+for my $function_name (
+  'preserved_trx_begin_command_read',
+  'preserved_trx_command_read_is_idle',
+  'preserved_trx_end_idle_for_command_packet',
+  'preserved_trx_end_command_read',
+  'preserved_trx_wait_if_batch_session_quiesced') {
+  my $body =
+    extract_function_body($preserve_src, "bool $function_name(THD *thd)");
+  if ($body =~ /Preserve_trx_batch_thd_state::QUIESCED/s ||
+      $body =~ /preserve_trx_batch_state\(thd\).*?QUIESCED/s) {
+    die "$function_name must note repeated QUIESCED waits\n"
+      unless $body =~ /uint\s+quiesced_wait_loops\s*=\s*0/s &&
+             $body =~ /preserve_trx_note_quiesced_wait\s*\(&quiesced_wait_loops\)/s;
+  }
+}
+
+EOF

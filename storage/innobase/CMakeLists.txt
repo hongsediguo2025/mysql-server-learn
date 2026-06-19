@@ -198,6 +198,8 @@ SET(INNOBASE_SOURCES
   sync/sync0debug.cc
   sync/sync0sync.cc
   trx/trx0i_s.cc
+  trx/trx0preserve.cc
+  trx/trx0temp_preserve.cc
   trx/trx0purge.cc
   trx/trx0rec.cc
   trx/trx0roll.cc

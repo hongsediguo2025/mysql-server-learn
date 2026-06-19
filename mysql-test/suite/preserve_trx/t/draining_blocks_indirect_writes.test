@@ -1,0 +1,113 @@
+--source include/have_debug_sync.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP PROCEDURE IF EXISTS p_preserve_drain_update;
+DROP TABLE IF EXISTS t_preserve_drain_indirect;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_preserve_drain_indirect(a INT PRIMARY KEY, b INT)
+  ENGINE=InnoDB;
+INSERT INTO t_preserve_drain_indirect VALUES(1,10),(2,20),(3,30),(4,40);
+
+DELIMITER |;
+CREATE PROCEDURE p_preserve_drain_update()
+BEGIN
+  UPDATE t_preserve_drain_indirect SET b=31 WHERE a=3;
+END|
+DELIMITER ;|
+
+--connect(drain_indirect_preserve,localhost,root,,test)
+--connection drain_indirect_preserve
+--let $preserve_conn_id= `SELECT CONNECTION_ID()`
+SET DEBUG_SYNC =
+  'preserve_trx_after_lock_materialization SIGNAL drain_indirect_ready WAIT_FOR continue_drain_indirect';
+START TRANSACTION;
+UPDATE t_preserve_drain_indirect SET b=11 WHERE a=1;
+--send PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300
+
+--connection default
+# Avoid making the DEBUG_SYNC wait itself part of the active-session drain.
+--sleep 2
+SET DEBUG_SYNC = 'now WAIT_FOR drain_indirect_ready TIMEOUT 10';
+
+--connect(drain_indirect_writer,localhost,root,,test)
+--connection drain_indirect_writer
+SET @preserve_drain_update_sql =
+  'UPDATE t_preserve_drain_indirect SET b=21 WHERE a=2';
+PREPARE preserve_drain_update_stmt FROM @preserve_drain_update_sql;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+EXECUTE preserve_drain_update_stmt;
+DEALLOCATE PREPARE preserve_drain_update_stmt;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+CALL p_preserve_drain_update();
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+RESUME PRESERVED TRANSACTION 'missing_drain_token';
+
+SET SESSION lock_wait_timeout=1;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+LOCK TABLES t_preserve_drain_indirect WRITE;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+SELECT * FROM t_preserve_drain_indirect WHERE a=4 FOR UPDATE;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+SELECT * FROM t_preserve_drain_indirect WHERE a=4 FOR SHARE;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+SET @preserve_drain_locking_read =
+  (SELECT b FROM t_preserve_drain_indirect WHERE a=4 FOR UPDATE);
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DO (SELECT b FROM t_preserve_drain_indirect WHERE a=4 FOR SHARE);
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+BEGIN;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+SAVEPOINT preserve_drain_sp;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+ROLLBACK TO SAVEPOINT preserve_drain_sp;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+SET autocommit=0;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+XA START 'preserve_drain_xa';
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+FLUSH TABLES WITH READ LOCK;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+FLUSH TABLES t_preserve_drain_indirect FOR EXPORT;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+LOCK INSTANCE FOR BACKUP;
+--disconnect drain_indirect_writer
+
+--connection default
+--replace_result $preserve_conn_id PRESERVE_ID
+--eval KILL QUERY $preserve_conn_id
+SET DEBUG_SYNC = 'now SIGNAL continue_drain_indirect';
+
+--connection drain_indirect_preserve
+--error ER_QUERY_INTERRUPTED
+--reap
+SET DEBUG_SYNC = 'RESET';
+ROLLBACK;
+--disconnect drain_indirect_preserve
+
+--connection default
+SELECT * FROM t_preserve_drain_indirect ORDER BY a;
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+DROP PROCEDURE p_preserve_drain_update;
+DROP TABLE t_preserve_drain_indirect;
+SET GLOBAL preserve_trx_enable=ON;

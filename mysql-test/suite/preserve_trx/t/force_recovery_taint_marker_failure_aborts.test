@@ -1,0 +1,92 @@
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_force_recovery_taint_fail;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+--disable_query_log
+CALL mtr.add_suppression("Skip updating information_schema metadata in InnoDB read-only mode");
+CALL mtr.add_suppression("Skip re-populating collations and character sets tables in InnoDB read-only mode");
+CALL mtr.add_suppression("PRESERVE: failed to mark preserved transaction snapshot tainted while innodb_force_recovery is enabled");
+CALL mtr.add_suppression("PRESERVE: recovery failed before InnoDB background threads could start");
+CALL mtr.add_suppression("Assertion failure: ha_innodb.cc:.*ib::fatal triggered");
+CALL mtr.add_suppression("\\[FATAL\\] Error in DDL Log recovery during Post-Recovery processing");
+CALL mtr.add_suppression("Assertion failure: ut0ut.cc:.*");
+CALL mtr.add_suppression("Attempting backtrace");
+CALL mtr.add_suppression("You can use the following information to find out");
+CALL mtr.add_suppression("PRESERVE: rolled back prepared transaction without snapshot during recovery");
+--enable_query_log
+
+CREATE TABLE t_force_recovery_taint_fail(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_force_recovery_taint_fail VALUES(1,10);
+
+START TRANSACTION;
+UPDATE t_force_recovery_taint_fail SET b=11 WHERE a=1;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+--source suite/preserve_trx/include/assert_one_snapshot_file.inc
+--perl
+use strict;
+use warnings;
+use File::Spec;
+my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+opendir(my $dh, $dir) or die "cannot open preserve dir: $dir: $!";
+my @entries = readdir($dh);
+closedir($dh);
+my @caches = grep { /\.binlog_cache$/ } @entries;
+die "expected one preserved binlog cache in $dir, found " . scalar(@caches) . "\n"
+  unless scalar(@caches) == 1;
+EOF
+
+--let $_server_id= 1
+--let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--let $restart_parameters= --preserve-trx-enable=ON --innodb-force-recovery=1 --debug=d,preserve_trx_fail_write_tainted_marker
+--source include/start_mysqld_expecting_crash.inc
+
+--let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $grep_pattern= PRESERVE: failed to mark preserved transaction snapshot tainted while innodb_force_recovery is enabled
+--let $wait_timeout= 30
+--source include/wait_for_pattern_in_file.inc
+--let $grep_pattern= PRESERVE: recovery failed before InnoDB background threads could start
+--source include/wait_for_pattern_in_file.inc
+--source suite/preserve_trx/include/wait_for_expected_crash.inc
+--source suite/preserve_trx/include/assert_one_snapshot_file.inc
+--perl
+use strict;
+use warnings;
+use File::Spec;
+my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+opendir(my $dh, $dir) or die "cannot open preserve dir: $dir: $!";
+my @entries = readdir($dh);
+closedir($dh);
+my @caches = grep { /\.binlog_cache$/ } @entries;
+die "expected one retained binlog cache after taint marker failure in $dir, found " .
+    scalar(@caches) . "\n"
+  unless scalar(@caches) == 1;
+EOF
+
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count_after_failed_taint
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+COMMIT;
+SELECT * FROM t_force_recovery_taint_fail ORDER BY a;
+SELECT COUNT(*) AS preserved_count_after_resume_commit
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_snapshot_file.inc
+
+DROP TABLE t_force_recovery_taint_fail;
+SET GLOBAL preserve_trx_enable=ON;

@@ -1,0 +1,74 @@
+--source include/big_test.inc
+--source include/have_group_replication_plugin.inc
+
+--let $rpl_skip_group_replication_start= 1
+--let $rpl_server_count= 2
+--let $rpl_group_replication_single_primary_mode= 1
+--source include/group_replication.inc
+
+--echo #
+--echo # Preserve/resume remains single-instance only while Group Replication
+--echo # is running. The real GR topology must reject preserve commands and
+--echo # still apply ordinary group writes.
+--echo #
+
+--let $rpl_connection_name= server1
+--source include/rpl_connection.inc
+--let $server1_uuid= `SELECT @@server_uuid`
+--source include/start_and_bootstrap_group_replication.inc
+--let $group_replication_expected_uuid= $server1_uuid
+--source include/gr_wait_primary_member_uuid.inc
+
+--let $rpl_connection_name= server2
+--source include/rpl_connection.inc
+--source include/start_group_replication.inc
+--let $group_replication_expected_uuid= $server1_uuid
+--source include/gr_wait_primary_member_uuid.inc
+
+--let $rpl_connection_silent= 1
+--source include/gr_find_a_primary.inc
+if (!$group_replication_found_primary_out_var)
+{
+  --echo performance_schema.replication_group_members
+  --echo --------------------------------------------
+  --query_vertical SELECT * FROM performance_schema.replication_group_members
+  --die "Unable to find Group Replication primary"
+}
+--let $rpl_primary_server_name= $group_replication_primary_connection_out_var
+--let $rpl_connection_silent= 0
+
+--let $rpl_connection_name= $rpl_primary_server_name
+--source include/rpl_connection.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_gr_preserve_apply;
+--enable_warnings
+CREATE TABLE t_gr_preserve_apply(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_gr_preserve_apply VALUES(1, 10), (2, 20);
+--source include/rpl_sync.inc
+
+START TRANSACTION;
+UPDATE t_gr_preserve_apply SET b=11 WHERE a=1;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ROLLBACK;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+RESUME PRESERVED TRANSACTION 'invalid-token';
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+INSERT INTO t_gr_preserve_apply VALUES(3, 30);
+--source include/rpl_sync.inc
+
+--let $diff_tables= server1:t_gr_preserve_apply, server2:t_gr_preserve_apply
+--source include/diff_tables.inc
+
+DROP TABLE t_gr_preserve_apply;
+--source include/rpl_sync.inc
+
+--source include/group_replication_end.inc

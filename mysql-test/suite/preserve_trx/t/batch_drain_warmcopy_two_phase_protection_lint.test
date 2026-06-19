@@ -1,0 +1,153 @@
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+# Lint-only source-shape guard. It cross-checks that runtime MTR cases keep
+# their expected protection hooks and assertions, but it is not standalone
+# behavior coverage.
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $suite_dir = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, 'suite', 'preserve_trx'));
+
+sub read_case {
+  my ($subdir, $name) = @_;
+  my $path = File::Spec->catfile($suite_dir, $subdir, "$name.$subdir");
+  $path = File::Spec->catfile($suite_dir, $subdir, "$name.test")
+    if $subdir eq 't';
+  $path = File::Spec->catfile($suite_dir, $subdir, "$name.result")
+    if $subdir eq 'r';
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $src = do { local $/; <$fh> };
+  close($fh);
+  return $src;
+}
+
+sub read_source {
+  my (@parts) = @_;
+  my $source_root = File::Spec->rel2abs(
+    File::Spec->catdir($mysql_test_dir, '..'));
+  my $path = File::Spec->catfile($source_root, @parts);
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $src = do { local $/; <$fh> };
+  close($fh);
+  return $src;
+}
+
+my $preserve_src = read_source('sql', 'preserve_trx.cc');
+
+my $admission = read_case('t', 'warmcopy_admission_toctou');
+my $admission_result = read_case('r', 'warmcopy_admission_toctou');
+$admission =~
+  /SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_toctou_window TIMEOUT 10';(.*?)SET DEBUG_SYNC = 'now SIGNAL warmcopy_toctou_continue'/s
+  or die "could not isolate phase1 admission close window\n";
+my $admission_window = $1;
+die "phase1 admission close guard must block new UPDATE/EXECUTE/FOR UPDATE before batch publish\n"
+  unless $admission_window =~ /--error ER_PRESERVE_TRX_UNSUPPORTED\s+BEGIN/s &&
+         $admission_window =~ /--error ER_PRESERVE_TRX_UNSUPPORTED\s+UPDATE/s &&
+         $admission_window =~ /--error ER_PRESERVE_TRX_UNSUPPORTED\s+EXECUTE/s &&
+         $admission_window =~ /--error ER_PRESERVE_TRX_UNSUPPORTED\s+SELECT[\s\S]*FOR UPDATE/s;
+die "phase1 admission close result must keep one preserved transaction and original row values\n"
+  unless $admission_result =~ /preserved_count\s+1/s &&
+         $admission_result =~ /id\s+v\s+1\s+11\s+2\s+20/s;
+
+my $degraded = read_case('t', 'batch_drain_warmcopy_degraded_failure');
+my $degraded_result = read_case('r', 'batch_drain_warmcopy_degraded_failure');
+die "degraded participant guard must inject warm-copy failure and reject batch\n"
+  unless $degraded =~ /preserve_trx_warmcopy_fail_after_source_copy/s &&
+         $degraded =~ /--error ER_PRESERVE_TRX_UNSUPPORTED\s+DRAIN TRANSACTIONS PRESERVE/s &&
+         $degraded =~ /assert_no_snapshot_file\.inc/s;
+die "degraded participant guard must leave original transaction committable\n"
+  unless $degraded =~ /COMMIT/s &&
+         $degraded =~ /preserved_count_after_commit/s;
+die "degraded participant result must publish no preserved rows and keep committed row\n"
+  unless $degraded_result =~ /preserved_count_after_drain\s+0/s &&
+         $degraded_result =~ /preserved_count_after_commit\s+0/s &&
+         $degraded_result =~ /id\s+v\s+1\s+11/s;
+
+my $committed = read_case('t', 'batch_drain_warmcopy_committed_participant_cleanup');
+my $committed_result = read_case('r', 'batch_drain_warmcopy_committed_participant_cleanup');
+die "committed participant cleanup guard must commit one warm-copy participant during phase1\n"
+  unless $committed =~
+           /preserve_trx_warmcopy_after_descriptor_hwm/s &&
+         $committed =~ /--connection warmcopy_abandon_commit\s+COMMIT/s;
+die "committed participant cleanup guard must recover only remaining preserved work\n"
+  unless $committed =~ /SELECT COUNT\(\*\) AS preserved_count/s &&
+         $committed =~ /RESUME PRESERVED TRANSACTION/s &&
+         $committed =~ /assert_no_snapshot_file\.inc/s;
+die "committed participant cleanup result must preserve exactly one remaining target and no residue after resume\n"
+  unless $committed_result =~ /preserved_count\s+1/s &&
+         $committed_result =~ /id\s+v\s+1\s+11\s+2\s+21/s &&
+         $committed_result =~ /preserved_count_after_resume\s+0/s;
+
+my $missing = read_case('t', 'batch_drain_warmcopy_missing_prebuilt_failure');
+my $missing_result = read_case('r', 'batch_drain_warmcopy_missing_prebuilt_failure');
+my $kernel_start =
+  index($preserve_src, 'bool preserve_trx_kernel_preserve_attached_transaction(');
+die "could not isolate preserve_trx_kernel_preserve_attached_transaction\n"
+  if $kernel_start < 0;
+my $kernel_end =
+  index($preserve_src, 'bool preserve_trx_preserve_attached_transaction(',
+        $kernel_start);
+die "could not find preserve_trx_kernel_preserve_attached_transaction end\n"
+  if $kernel_end < 0;
+my $kernel_body = substr($preserve_src, $kernel_start,
+                         $kernel_end - $kernel_start);
+die "missing prebuilt guard must fail closed in the provider lookup path\n"
+  unless $kernel_body =~ /binlog_blob_provider\s*!=\s*nullptr/s &&
+         $kernel_body =~
+           /!\s*binlog_blob_provider->has_blob_for_thd\s*\(\s*thd\s*\)[\s\S]*return\s+reject_unsupported_for_delivery\s*\(\s*"warmcopy_blob_missing"\s*\)/s;
+die "missing prebuilt guard must still resume the originally preserved target\n"
+  unless $missing =~ /RESUME PRESERVED TRANSACTION/s &&
+         $missing =~ /full_copy_to_count/s &&
+         $missing =~ /assert_no_snapshot_file\.inc/s;
+die "missing prebuilt result must preserve/resume one original target and avoid full-copy fallback\n"
+  unless $missing_result =~ /preserved_count\s+1/s &&
+         $missing_result =~ /preserved_count\s+0/s &&
+         $missing_result =~ /id\s+v\s+1\s+11/s &&
+         $missing_result =~ /full_copy_to_count\s+0/s;
+
+my $tail = read_case('t', 'batch_drain_warmcopy_tail_budget');
+my $tail_result = read_case('r', 'batch_drain_warmcopy_tail_budget');
+my $provider_start =
+  index($preserve_src, 'class Warmcopy_batch_blob_provider final');
+die "could not isolate Warmcopy_batch_blob_provider\n"
+  if $provider_start < 0;
+my $provider_end =
+  index($preserve_src, 'class Warmcopy_prepare_idle_participants final',
+        $provider_start);
+die "could not find Warmcopy_batch_blob_provider end\n"
+  if $provider_end < 0;
+my $provider_body = substr($preserve_src, $provider_start,
+                           $provider_end - $provider_start);
+my $finalize_start =
+  index($provider_body, 'Preserve_snapshot_status finalize_for_preserve');
+die "could not isolate Warmcopy_batch_blob_provider::finalize_for_preserve\n"
+  if $finalize_start < 0;
+my $finalize_end =
+  index($provider_body, 'void discard_for_preserve', $finalize_start);
+die "could not find Warmcopy_batch_blob_provider::finalize_for_preserve end\n"
+  if $finalize_end < 0;
+my $finalize_body = substr($provider_body, $finalize_start,
+                           $finalize_end - $finalize_start);
+die "tail budget guard must prevent full-copy rebuild during phase2\n"
+  if $finalize_body =~ /mysql_binlog_preserve_warmcopy_build_blob\s*\(/s;
+die "tail budget guard must not scan the whole warm blob for digest during phase2\n"
+  if $finalize_body =~ /read_file_sha256_digest|EVP_DigestUpdate|my_read/s;
+die "tail budget guard must finalize via the live warmcopy session path\n"
+  unless $finalize_body =~ /mysql_binlog_preserve_warmcopy_finalize_session/s &&
+         $finalize_body =~ /preserve_trx_warmcopy_tail_budget_bytes/s;
+die "tail budget guard must fail closed after post-HWM tail growth\n"
+  unless $tail =~ /preserve_trx_warmcopy_after_descriptor_hwm/s &&
+         $tail =~ /preserve_trx_warmcopy_tail_budget_bytes=8/s &&
+         $tail =~ /--error ER_PRESERVE_TRX_UNSUPPORTED\s+--reap/s &&
+         $tail =~ /assert_no_snapshot_file\.inc/s;
+die "tail budget result must fail closed, preserve nothing, and leave committed tail row intact\n"
+  unless $tail_result =~ /ERROR HY000: Resumable transactions across shutdown do not support this operation/s &&
+         $tail_result =~ /preserved_count\s+0/s &&
+         $tail_result =~ /payload_len\s+1024/s;
+EOF
+
+SELECT 'ok' AS batch_drain_warmcopy_two_phase_protection_lint;

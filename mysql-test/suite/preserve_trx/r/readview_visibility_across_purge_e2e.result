@@ -1,0 +1,50 @@
+DROP TABLE IF EXISTS t_readview_visibility_purge;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_readview_visibility_purge(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO t_readview_visibility_purge VALUES
+(1,10),(2,20),(3,30),(4,40),(5,50),(100,100);
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT COUNT(*) AS original_count, SUM(v) AS original_sum
+FROM t_readview_visibility_purge
+WHERE id <= 5;
+original_count	original_sum
+5	150
+UPDATE t_readview_visibility_purge SET v=1001 WHERE id=100;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SELECT HAS_READ_VIEW, RV_LOW_LIMIT_NO > 0 AS has_low_limit
+FROM performance_schema.preserved_transactions;
+HAS_READ_VIEW	has_low_limit
+YES	1
+UPDATE t_readview_visibility_purge SET v=v+1000 WHERE id <= 5;
+DELETE FROM t_readview_visibility_purge WHERE id=5;
+INSERT INTO t_readview_visibility_purge VALUES(6,6000);
+include/assert.inc [purge was blocked by preserved read view]
+SELECT 1 AS purge_blocked_by_preserved_readview;
+purge_blocked_by_preserved_readview
+1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+SELECT COUNT(*) AS resumed_count, SUM(v) AS resumed_sum
+FROM t_readview_visibility_purge
+WHERE id <= 5;
+resumed_count	resumed_sum
+5	150
+SELECT v AS own_write_seen
+FROM t_readview_visibility_purge
+WHERE id=100;
+own_write_seen
+1001
+COMMIT;
+SELECT id, v FROM t_readview_visibility_purge ORDER BY id;
+id	v
+1	1010
+2	1020
+3	1030
+4	1040
+6	6000
+100	1001
+DROP TABLE t_readview_visibility_purge;
+SET GLOBAL preserve_trx_enable=ON;

@@ -217,6 +217,8 @@ bool dynamic_privilege_init(void) {
       ret |= service->register_privilege(STRING_WITH_LEN("SHOW_ROUTINE"));
       ret |= service->register_privilege(
           STRING_WITH_LEN("INNODB_REDO_LOG_ENABLE"));
+      ret |= service->register_privilege(
+          STRING_WITH_LEN("RESUME_ANY_PRESERVED_TRANSACTION"));
     }
   }  // exist scope
   mysql_plugin_registry_release(r);

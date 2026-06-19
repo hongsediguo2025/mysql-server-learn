@@ -131,6 +131,7 @@ table_os_global_by_type.h
 table_performance_timers.h
 table_persisted_variables.h
 table_plugin_table.h
+table_preserved_transactions.h
 table_prepared_stmt_instances.h
 table_processlist.h
 table_replication_applier_configuration.h
@@ -293,6 +294,7 @@ table_os_global_by_type.cc
 table_performance_timers.cc
 table_persisted_variables.cc
 table_plugin_table.cc
+table_preserved_transactions.cc
 table_prepared_stmt_instances.cc
 table_processlist.cc
 table_replication_applier_configuration.cc
@@ -404,4 +406,3 @@ MARK_AS_ADVANCED(DISABLE_PSI_TRANSACTION)
 MARK_AS_ADVANCED(DISABLE_PSI_ERROR)
 MARK_AS_ADVANCED(DISABLE_PSI_DATA_LOCK)
 MARK_AS_ADVANCED(DISABLE_PSI_TLS_CHANNEL)
-

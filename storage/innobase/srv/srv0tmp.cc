@@ -26,6 +26,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "srv0tmp.h"
 #include <algorithm>
+#include <mutex>
+#include <set>
 #include "dict0dict.h"
 #include "ib0mutex.h"
 #include "srv0srv.h"
@@ -63,9 +65,94 @@ Tablespace_pool *tbsp_pool = nullptr;
 /* Directory to store session temporary tablespaces, provided by user */
 char *srv_temp_dir = nullptr;
 
+namespace {
+
+std::mutex preserved_space_id_reservations_mutex;
+std::set<space_id_t> preserved_space_id_reservations;
+
+bool temp_space_id_in_reservable_range(space_id_t space_id) {
+  return space_id > dict_sys_t::s_min_temp_space_id &&
+         space_id <= dict_sys_t::s_max_temp_space_id;
+}
+
+bool is_preserved_space_id_reserved_low(space_id_t space_id) {
+  return preserved_space_id_reservations.find(space_id) !=
+         preserved_space_id_reservations.end();
+}
+
+}  // namespace
+
+bool reserve_preserved_space_id(space_id_t space_id) {
+  std::lock_guard<std::mutex> guard(preserved_space_id_reservations_mutex);
+
+  if (!temp_space_id_in_reservable_range(space_id) ||
+      is_preserved_space_id_reserved_low(space_id) ||
+      space_id <= Tablespace::m_last_used_space_id) {
+    return false;
+  }
+
+  preserved_space_id_reservations.insert(space_id);
+  return true;
+}
+
+bool reserve_or_keep_preserved_space_id(space_id_t space_id, bool *created) {
+  std::lock_guard<std::mutex> guard(preserved_space_id_reservations_mutex);
+  if (created != nullptr) *created = false;
+
+  if (!temp_space_id_in_reservable_range(space_id)) {
+    return false;
+  }
+
+  if (is_preserved_space_id_reserved_low(space_id)) {
+    return true;
+  }
+
+  if (space_id <= Tablespace::m_last_used_space_id) {
+    return false;
+  }
+
+  std::pair<std::set<space_id_t>::iterator, bool> result =
+      preserved_space_id_reservations.insert(space_id);
+  if (created != nullptr) *created = result.second;
+  return true;
+}
+
+bool release_preserved_space_id(space_id_t space_id) {
+  std::lock_guard<std::mutex> guard(preserved_space_id_reservations_mutex);
+  return preserved_space_id_reservations.erase(space_id) != 0;
+}
+
+bool is_preserved_space_id_reserved(space_id_t space_id) {
+  std::lock_guard<std::mutex> guard(preserved_space_id_reservations_mutex);
+  return is_preserved_space_id_reserved_low(space_id);
+}
+
+void clear_preserved_space_id_reservations_for_test() {
+  std::lock_guard<std::mutex> guard(preserved_space_id_reservations_mutex);
+  preserved_space_id_reservations.clear();
+}
+
+void reset_temp_space_id_allocator_for_test() {
+  std::lock_guard<std::mutex> guard(preserved_space_id_reservations_mutex);
+  Tablespace::m_last_used_space_id = dict_sys_t::s_min_temp_space_id;
+}
+
+space_id_t min_temp_space_id_for_test() {
+  return dict_sys_t::s_min_temp_space_id;
+}
+
+space_id_t max_temp_space_id_for_test() {
+  return dict_sys_t::s_max_temp_space_id;
+}
+
+space_id_t allocate_temp_tablespace_object_for_test() {
+  Tablespace tablespace;
+  return tablespace.space_id();
+}
+
 /** Sesssion Temporary tablespace */
 Tablespace::Tablespace()
-    : m_space_id(++m_last_used_space_id), m_inited(), m_thread_id() {
+    : m_space_id(next_space_id()), m_inited(), m_thread_id() {
   ut_ad(m_space_id <= dict_sys_t::s_max_temp_space_id);
   m_purpose = TBSP_NONE;
 }
@@ -167,6 +254,19 @@ std::string Tablespace::path() const {
   str.append(file_name());
   str.append(DOT_IBT);
   return (str);
+}
+
+space_id_t Tablespace::next_space_id() {
+  std::lock_guard<std::mutex> guard(preserved_space_id_reservations_mutex);
+
+  space_id_t candidate = m_last_used_space_id;
+  do {
+    ut_a(candidate < dict_sys_t::s_max_temp_space_id);
+    ++candidate;
+  } while (is_preserved_space_id_reserved_low(candidate));
+
+  m_last_used_space_id = candidate;
+  return m_last_used_space_id;
 }
 
 /** Space_ids for Session temporary tablespace. The available range is

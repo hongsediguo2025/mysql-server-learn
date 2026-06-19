@@ -51,6 +51,7 @@
 #include "sql/current_thd.h"  // current_thd
 #include "sql/mysqld.h"
 #include "sql/mysqld_thd_manager.h"  // Global_THD_manager
+#include "sql/preserve_trx.h"
 #include "sql/protocol_classic.h"
 #include "sql/query_options.h"
 #include "sql/rpl_filter.h"  // binlog_filter
@@ -179,7 +180,16 @@ void thd_increment_bytes_sent(size_t length) {
 
 void thd_increment_bytes_received(size_t length) {
   THD *thd = current_thd;
-  if (likely(thd != nullptr)) thd->status_var.bytes_received += length;
+  if (likely(thd != nullptr)) {
+    (void)preserved_trx_wait_if_batch_session_quiesced(thd);
+    thd->status_var.bytes_received += length;
+  }
+}
+
+void thd_wait_if_preserve_trx_batch_session_quiesced() {
+  THD *thd = current_thd;
+  if (likely(thd != nullptr))
+    (void)preserved_trx_wait_if_batch_session_quiesced(thd);
 }
 
 partition_info *thd_get_work_part_info(THD *thd) { return thd->work_part_info; }

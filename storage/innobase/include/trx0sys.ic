@@ -346,6 +346,10 @@ inline trx_id_t trx_sys_get_max_trx_id() {
   }
 }
 
+inline trx_id_t trx_sys_get_next_trx_id_or_no() {
+  return (trx_sys_get_max_trx_id());
+}
+
 /** Determine if there are incomplete transactions in the system.
 @return whether incomplete transactions need rollback */
 UNIV_INLINE

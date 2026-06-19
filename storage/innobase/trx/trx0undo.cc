@@ -49,6 +49,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "srv0mon.h"
 #include "srv0srv.h"
 #include "srv0start.h"
+#include "trx0temp_preserve.h"
 #include "trx0purge.h"
 #include "trx0rec.h"
 #include "trx0rseg.h"
@@ -1434,6 +1435,7 @@ static trx_undo_t *trx_undo_mem_create(trx_rseg_t *rseg, ulint id, ulint type,
 
   undo->dict_operation = FALSE;
   undo->flag = 0;
+  undo->preserve_restored_no_redo_undo = false;
   undo->gtid_allocated = false;
 
   undo->rseg = rseg;
@@ -1471,10 +1473,21 @@ static void trx_undo_mem_init_for_reuse(
 
   undo->dict_operation = FALSE;
   undo->flag = 0;
+  undo->preserve_restored_no_redo_undo = false;
   undo->gtid_allocated = false;
 
   undo->hdr_offset = offset;
   undo->empty = TRUE;
+}
+
+bool trx_undo_preserve_magic_no_redo_should_skip_history(
+    const trx_undo_t *undo) {
+  return undo != nullptr && undo->preserve_restored_no_redo_undo;
+}
+
+static bool trx_undo_preserve_magic_no_redo_should_skip_cache(
+    const trx_undo_t *undo) {
+  return trx_undo_preserve_magic_no_redo_should_skip_history(undo);
 }
 
 /** Frees an undo log memory copy. */
@@ -1483,6 +1496,53 @@ void trx_undo_mem_free(trx_undo_t *undo) /*!< in: the undo object to be freed */
   ut_a(undo->id < TRX_RSEG_N_SLOTS);
 
   ut_free(undo);
+}
+
+void trx_undo_discard_cached_for_header_page(trx_rseg_t *rseg,
+                                             page_no_t hdr_page_no) {
+  if (rseg == nullptr || hdr_page_no == FIL_NULL) return;
+
+  ut_ad(mutex_own(&(rseg->mutex)));
+
+  for (trx_undo_t *undo = UT_LIST_GET_FIRST(rseg->insert_undo_cached);
+       undo != nullptr;) {
+    trx_undo_t *next = UT_LIST_GET_NEXT(undo_list, undo);
+    if (undo->hdr_page_no == hdr_page_no) {
+      UT_LIST_REMOVE(rseg->insert_undo_cached, undo);
+      MONITOR_DEC(MONITOR_NUM_UNDO_SLOT_CACHED);
+      trx_undo_mem_free(undo);
+    }
+    undo = next;
+  }
+
+  for (trx_undo_t *undo = UT_LIST_GET_FIRST(rseg->update_undo_cached);
+       undo != nullptr;) {
+    trx_undo_t *next = UT_LIST_GET_NEXT(undo_list, undo);
+    if (undo->hdr_page_no == hdr_page_no) {
+      UT_LIST_REMOVE(rseg->update_undo_cached, undo);
+      MONITOR_DEC(MONITOR_NUM_UNDO_SLOT_CACHED);
+      trx_undo_mem_free(undo);
+    }
+    undo = next;
+  }
+}
+
+void trx_undo_discard_cached_for_rseg(trx_rseg_t *rseg) {
+  if (rseg == nullptr) return;
+
+  ut_ad(mutex_own(&(rseg->mutex)));
+
+  while (trx_undo_t *undo = UT_LIST_GET_FIRST(rseg->insert_undo_cached)) {
+    UT_LIST_REMOVE(rseg->insert_undo_cached, undo);
+    MONITOR_DEC(MONITOR_NUM_UNDO_SLOT_CACHED);
+    trx_undo_mem_free(undo);
+  }
+
+  while (trx_undo_t *undo = UT_LIST_GET_FIRST(rseg->update_undo_cached)) {
+    UT_LIST_REMOVE(rseg->update_undo_cached, undo);
+    MONITOR_DEC(MONITOR_NUM_UNDO_SLOT_CACHED);
+    trx_undo_mem_free(undo);
+  }
 }
 
 /** Create a new undo log in the given rollback segment.
@@ -1566,6 +1626,11 @@ static trx_undo_t *trx_undo_reuse_cached(trx_t *trx, trx_rseg_t *rseg,
   trx_undo_t *undo;
 
   ut_ad(mutex_own(&(rseg->mutex)));
+
+  if (fsp_is_system_temporary(rseg->space_id) &&
+      trx_preserve_temp_space_image_should_disable_undo_cache(rseg->space_id)) {
+    return (nullptr);
+  }
 
   if (type == TRX_UNDO_INSERT) {
     undo = UT_LIST_GET_FIRST(rseg->insert_undo_cached);
@@ -1770,7 +1835,8 @@ page_t *trx_undo_set_state_at_finish(
   seg_hdr = undo_page + TRX_UNDO_SEG_HDR;
   page_hdr = undo_page + TRX_UNDO_PAGE_HDR;
 
-  if (undo->size == 1 && mach_read_from_2(page_hdr + TRX_UNDO_PAGE_FREE) <
+  if (!trx_undo_preserve_magic_no_redo_should_skip_cache(undo) &&
+      undo->size == 1 && mach_read_from_2(page_hdr + TRX_UNDO_PAGE_FREE) <
                              TRX_UNDO_PAGE_REUSE_LIMIT) {
     state = TRX_UNDO_CACHED;
 
@@ -1856,6 +1922,13 @@ void trx_undo_update_cleanup(trx_t *trx, trx_undo_ptr_t *undo_ptr,
 
   ut_ad(mutex_own(&(rseg->mutex)));
 
+  if (trx_undo_preserve_magic_no_redo_should_skip_cache(undo)) {
+    UT_LIST_REMOVE(rseg->update_undo_list, undo);
+    undo_ptr->update_undo = nullptr;
+    trx_undo_mem_free(undo);
+    return;
+  }
+
   trx_purge_add_update_undo_to_history(
       trx, undo_ptr, undo_page, update_rseg_history_len, n_added_logs, mtr);
 
@@ -1895,7 +1968,9 @@ void trx_undo_insert_cleanup(trx_undo_ptr_t *undo_ptr, bool noredo) {
   UT_LIST_REMOVE(rseg->insert_undo_list, undo);
   undo_ptr->insert_undo = nullptr;
 
-  if (undo->state == TRX_UNDO_CACHED) {
+  if (trx_undo_preserve_magic_no_redo_should_skip_cache(undo)) {
+    trx_undo_mem_free(undo);
+  } else if (undo->state == TRX_UNDO_CACHED) {
     UT_LIST_ADD_FIRST(rseg->insert_undo_cached, undo);
 
     MONITOR_INC(MONITOR_NUM_UNDO_SLOT_CACHED);

@@ -1,0 +1,67 @@
+DROP TABLE IF EXISTS t_warmcopy_large;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1024;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=4096;
+CREATE TABLE t_warmcopy_large(
+id INT PRIMARY KEY,
+sid INT NOT NULL,
+payload VARBINARY(512),
+KEY(sid)
+) ENGINE=InnoDB;
+INSERT INTO t_warmcopy_large VALUES
+(1,1,REPEAT('a',512)),
+(2,2,REPEAT('b',512));
+RESET MASTER;
+START TRANSACTION;
+UPDATE t_warmcopy_large SET payload=REPEAT('x',512) WHERE id=1;
+INSERT INTO t_warmcopy_large VALUES(101,1,REPEAT('p',512));
+START TRANSACTION;
+UPDATE t_warmcopy_large SET payload=REPEAT('y',512) WHERE id=2;
+INSERT INTO t_warmcopy_large VALUES(102,2,REPEAT('q',512));
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+include/assert_grep.inc [warm-copy large cache used prebuilt fast path metrics]
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+2
+CREATE TEMPORARY TABLE warmcopy_tokens AS
+SELECT ROW_NUMBER() OVER (ORDER BY TOKEN) AS rn, TOKEN
+FROM performance_schema.preserved_transactions;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+SELECT COUNT(*) AS preserved_count_after_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_resume
+0
+SELECT COUNT(*) AS row_count,
+SUM(sid=1) AS sid1_rows,
+SUM(sid=2) AS sid2_rows
+FROM t_warmcopy_large;
+row_count	sid1_rows	sid2_rows
+4	2	2
+SELECT id, sid, OCTET_LENGTH(payload) AS payload_len,
+CASE id
+WHEN 1 THEN payload=REPEAT('x',512)
+WHEN 2 THEN payload=REPEAT('y',512)
+WHEN 101 THEN payload=REPEAT('p',512)
+WHEN 102 THEN payload=REPEAT('q',512)
+END AS payload_ok
+FROM t_warmcopy_large
+ORDER BY id;
+id	sid	payload_len	payload_ok
+1	1	512	1
+2	2	512	1
+101	1	512	1
+102	2	512	1
+include/assert_grep.inc [committed warm-copy resumed transaction one appears once in binlog]
+include/assert_grep.inc [committed warm-copy resumed transaction two appears once in binlog]
+DROP TABLE t_warmcopy_large;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;

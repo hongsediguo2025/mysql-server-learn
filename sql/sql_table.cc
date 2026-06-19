@@ -148,6 +148,7 @@
 #include "sql/sql_partition.h"
 #include "sql/sql_plist.h"
 #include "sql/sql_plugin_ref.h"
+#include "sql/preserve_trx_temp_table.h"
 #include "sql/sql_resolver.h"  // setup_order
 #include "sql/sql_show.h"
 #include "sql/sql_tablespace.h"  // validate_tablespace_name
@@ -986,6 +987,7 @@ static bool rea_create_tmp_table(
 
   // Transfer ownership of dd::Table object to TABLE_SHARE.
   table->s->tmp_table_def = tmp_table_ptr.release();
+  (void)preserve_trx_temp_table_note_table_create(thd, table);
 
   thd->thread_specific_used = true;
 

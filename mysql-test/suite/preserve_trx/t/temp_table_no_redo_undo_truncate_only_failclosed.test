@@ -1,0 +1,39 @@
+--source include/not_log_bin.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+
+CREATE TABLE t_temp_no_redo_truncate_anchor(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_temp_no_redo_truncate_anchor VALUES(1, 10);
+
+CREATE TEMPORARY TABLE tmp_temp_no_redo_truncate_only(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO tmp_temp_no_redo_truncate_only VALUES(1, 10), (2, 20);
+
+START TRANSACTION;
+UPDATE t_temp_no_redo_truncate_anchor SET v=11 WHERE id=1;
+TRUNCATE TABLE tmp_temp_no_redo_truncate_only;
+
+--error ER_PRESERVE_TRX_INVALID_STATE
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+SELECT * FROM tmp_temp_no_redo_truncate_only ORDER BY id;
+INSERT INTO tmp_temp_no_redo_truncate_only VALUES(4, 40);
+UPDATE t_temp_no_redo_truncate_anchor SET v=12 WHERE id=1;
+COMMIT;
+SELECT COUNT(*) AS temp_rows, SUM(v) AS temp_sum
+  FROM tmp_temp_no_redo_truncate_only;
+SELECT * FROM t_temp_no_redo_truncate_anchor ORDER BY id;
+
+DROP TEMPORARY TABLE tmp_temp_no_redo_truncate_only;
+DROP TABLE t_temp_no_redo_truncate_anchor;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_enable=ON;

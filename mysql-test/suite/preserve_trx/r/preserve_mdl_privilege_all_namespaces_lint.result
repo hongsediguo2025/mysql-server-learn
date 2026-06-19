@@ -1,0 +1,5 @@
+#
+# Lint-only source-shape guard. Runtime MDL privilege behavior is
+# covered by resume_any_rechecks_object_privileges and related MDL MTRs.
+# Every exportable MDL namespace must have an explicit privilege policy.
+#

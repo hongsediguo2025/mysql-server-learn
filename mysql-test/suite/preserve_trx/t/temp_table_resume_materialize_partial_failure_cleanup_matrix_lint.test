@@ -1,0 +1,66 @@
+--source include/have_debug.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+# Lint-only: runtime coverage for the staged-open branch lives in
+# temp_table_resume_materialize_failure_no_partial_link.
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_source {
+  my ($path) = @_;
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $src = do { local $/; <$fh> };
+  close($fh);
+  return $src;
+}
+
+my $temp_path = File::Spec->catfile($source_root, 'sql',
+                                    'preserve_trx_temp_table.cc');
+my $gunit_path = File::Spec->catfile($source_root, 'unittest', 'gunit',
+                                     'preserve_trx_temp_table-t.cc');
+my $mtr_path = File::Spec->catfile($source_root, 'mysql-test', 'suite',
+                                   'preserve_trx', 't',
+                                   'temp_table_resume_materialize_failure_no_partial_link.test');
+my $result_path = File::Spec->catfile($source_root, 'mysql-test', 'suite',
+                                      'preserve_trx', 'r',
+                                      'temp_table_resume_materialize_failure_no_partial_link.result');
+
+my $temp_src = read_source($temp_path);
+my $gunit = read_source($gunit_path);
+my $mtr = read_source($mtr_path);
+my $result = read_source($result_path);
+
+$temp_src =~ /Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume[\s\S]*?^}/m
+  or die "could not isolate temp-table materializer\n";
+my $materializer = $&;
+die "temp-table resume materializer must centralize retry cleanup\n"
+  unless $materializer =~ /auto cleanup_for_retry/s &&
+         $materializer =~ /preserve_trx_temp_table_close_staged_tables/s &&
+         $materializer =~ /trx_preserve_temp_space_image_release_preserved_fil_space_for_retry/s;
+my $cleanup_calls = () = $materializer =~ /cleanup_for_retry\s*\(\s*\)/g;
+die "temp-table resume materializer must call retry cleanup on staged failure branches\n"
+  unless $cleanup_calls >= 10;
+die "debug hook for open-before-link partial materialization must remain available\n"
+  unless $temp_src =~ /preserve_temp_fail_after_open_before_link/s &&
+         $gunit =~ /StagedOpenFailureHookIsReservedForAfterOneOpenBeforeNext/s;
+die "MTR partial-link regression must exercise a real RESUME materialize staged-open failure\n"
+  unless $mtr =~ /tmp_preserve_partial_link_a/s &&
+         $mtr =~ /tmp_preserve_partial_link_b/s &&
+         $mtr =~ /preserve_temp_fail_after_open_before_link/s &&
+         $mtr =~ /RESUME PRESERVED TRANSACTION/s &&
+         $mtr =~ /--error ER_NO_SUCH_TABLE/s &&
+         $result =~ /preserved_count_after_failed_resume\n1/s &&
+         $result =~ /failed_resume_has_error\n1/s &&
+         $result =~ /active_innodb_trx_after_failed_resume\n0/s &&
+         $result =~ /preserved_count_after_retry_resume\n0/s &&
+         $result =~ /partial_link_a_rows\tpartial_link_a_sum\n2\t31/s &&
+         $result =~ /partial_link_b_rows\tpartial_link_b_sum\n2\t232/s;
+EOF
+
+SELECT 'lint-only' AS temp_table_resume_materialize_partial_failure_cleanup_matrix_lint;

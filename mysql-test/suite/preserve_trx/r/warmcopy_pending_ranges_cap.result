@@ -1,0 +1,46 @@
+DROP TABLE IF EXISTS t_warmcopy_pending_cap;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=4096;
+SET GLOBAL preserve_trx_warmcopy_pending_range_limit=1024;
+SET GLOBAL preserve_trx_warmcopy_pending_bytes_limit=8;
+CREATE TABLE t_warmcopy_pending_cap(
+id INT PRIMARY KEY,
+v INT,
+payload VARBINARY(1024)
+) ENGINE=InnoDB;
+INSERT INTO t_warmcopy_pending_cap VALUES(1,10,REPEAT('a',1024));
+START TRANSACTION;
+UPDATE t_warmcopy_pending_cap
+SET v=11, payload=REPEAT('b',1024)
+WHERE id=1;
+SET DEBUG_SYNC =
+'preserve_trx_warmcopy_after_descriptor_hwm SIGNAL warmcopy_pending_cap_ready WAIT_FOR warmcopy_pending_cap_continue';
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_pending_cap_ready TIMEOUT 10';
+SET SESSION debug="+d,preserve_trx_warmcopy_force_pending_range_limit";
+UPDATE t_warmcopy_pending_cap
+SET v=12, payload=REPEAT('c',1024)
+WHERE id=1;
+SET SESSION debug="-d,preserve_trx_warmcopy_force_pending_range_limit";
+SET DEBUG_SYNC = 'now SIGNAL warmcopy_pending_cap_continue';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*) AS preserved_count_after_reject
+FROM performance_schema.preserved_transactions;
+preserved_count_after_reject
+0
+COMMIT;
+SELECT id, v, OCTET_LENGTH(payload) AS payload_len, payload=REPEAT('c',1024) AS payload_ok
+FROM t_warmcopy_pending_cap
+ORDER BY id;
+id	v	payload_len	payload_ok
+1	12	1024	1
+DROP TABLE t_warmcopy_pending_cap;
+SET GLOBAL preserve_trx_warmcopy_pending_bytes_limit=67108864;
+SET GLOBAL preserve_trx_warmcopy_pending_range_limit=1024;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_enable=ON;
+SET DEBUG_SYNC = 'RESET';

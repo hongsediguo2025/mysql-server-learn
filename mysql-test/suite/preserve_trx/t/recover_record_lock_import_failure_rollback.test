@@ -1,0 +1,43 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_recover_record_lock_import_failure;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+--disable_query_log
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: failed to restore durable transaction semantics");
+--enable_query_log
+
+CREATE TABLE t_recover_record_lock_import_failure(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_recover_record_lock_import_failure VALUES(1,10),(2,20);
+
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE t_recover_record_lock_import_failure SET b=21 WHERE a=2;
+SELECT * FROM t_recover_record_lock_import_failure WHERE a=1 FOR SHARE;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+--source suite/preserve_trx/include/assert_one_snapshot_file.inc
+
+--let $_server_id= 1
+--let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--let $restart_parameters= restart: --preserve-trx-enable=ON --debug=d,preserve_trx_fail_import_record_locks
+--source include/start_mysqld.inc
+
+--let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $grep_pattern= Preserved transaction .* recovery forced rollback: failed to restore durable transaction semantics
+--let $wait_timeout= 30
+--source include/wait_for_pattern_in_file.inc
+--source suite/preserve_trx/include/assert_no_snapshot_file.inc
+
+SELECT * FROM t_recover_record_lock_import_failure ORDER BY a;
+
+DROP TABLE t_recover_record_lock_import_failure;
+SET GLOBAL preserve_trx_enable=ON;

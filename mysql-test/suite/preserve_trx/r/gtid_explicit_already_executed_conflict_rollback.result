@@ -1,0 +1,36 @@
+DROP TABLE IF EXISTS t_gtid_conflict_preserved;
+DROP TABLE IF EXISTS t_gtid_conflict_marker;
+SET GLOBAL preserve_trx_enable=ON;
+SET SESSION sql_log_bin=0;
+CREATE TABLE t_gtid_conflict_preserved(a INT PRIMARY KEY, b INT)
+ENGINE=InnoDB;
+CREATE TABLE t_gtid_conflict_marker(a INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO t_gtid_conflict_preserved VALUES(1,10);
+SET SESSION sql_log_bin=1;
+RESET MASTER;
+SET GTID_NEXT='SERVER_UUID:7';
+START TRANSACTION;
+UPDATE t_gtid_conflict_preserved SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SELECT COUNT(*) AS preserved_count_before_gtid_conflict
+FROM performance_schema.preserved_transactions;
+preserved_count_before_gtid_conflict
+1
+SET GTID_NEXT='SERVER_UUID:7';
+START TRANSACTION;
+INSERT INTO t_gtid_conflict_marker VALUES(7);
+COMMIT;
+SET GTID_NEXT=AUTOMATIC;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT * FROM t_gtid_conflict_preserved ORDER BY a;
+a	b
+1	10
+SELECT * FROM t_gtid_conflict_marker ORDER BY a;
+a
+7
+SET SESSION sql_log_bin=0;
+DROP TABLE t_gtid_conflict_preserved, t_gtid_conflict_marker;
+SET SESSION sql_log_bin=1;
+RESET MASTER;
+SET GLOBAL preserve_trx_enable=ON;

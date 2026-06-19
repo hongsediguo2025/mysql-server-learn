@@ -1,0 +1,33 @@
+DROP TABLE IF EXISTS t_gtid_auto;
+SET GLOBAL preserve_trx_enable=ON;
+SET SESSION sql_log_bin=0;
+CREATE TABLE t_gtid_auto(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_gtid_auto VALUES(1,10);
+SET SESSION sql_log_bin=1;
+RESET MASTER;
+SELECT @@GLOBAL.GTID_EXECUTED = '' AS gtid_empty_before;
+gtid_empty_before
+1
+START TRANSACTION;
+UPDATE t_gtid_auto SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+SELECT @@SESSION.GTID_NEXT AS gtid_next_after_resume;
+gtid_next_after_resume
+AUTOMATIC
+SELECT @@GLOBAL.GTID_EXECUTED = '' AS gtid_empty_after_resume;
+gtid_empty_after_resume
+1
+COMMIT;
+SELECT GTID_SUBSET(CONCAT(@@GLOBAL.SERVER_UUID, ':1'), @@GLOBAL.GTID_EXECUTED)
+AS automatic_gtid_committed;
+automatic_gtid_committed
+1
+SELECT * FROM t_gtid_auto WHERE a=1;
+a	b
+1	11
+SET SESSION sql_log_bin=0;
+DROP TABLE t_gtid_auto;
+SET SESSION sql_log_bin=1;
+RESET MASTER;
+SET GLOBAL preserve_trx_enable=ON;

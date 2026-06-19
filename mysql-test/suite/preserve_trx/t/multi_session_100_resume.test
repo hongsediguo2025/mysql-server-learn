@@ -1,0 +1,207 @@
+--source include/big_test.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $setup_file = File::Spec->catfile($vardir, 'tmp',
+                                     'preserve_trx_multi_session_100_setup.inc');
+my $cleanup_file = File::Spec->catfile($vardir, 'tmp',
+                                       'preserve_trx_multi_session_100_cleanup.inc');
+
+open(my $setup, '>', $setup_file)
+  or die "cannot open $setup_file for write: $!";
+open(my $cleanup, '>', $cleanup_file)
+  or die "cannot open $cleanup_file for write: $!";
+
+print $cleanup "DROP TABLE IF EXISTS t_multi_session_100_tokens;\n";
+print $cleanup "DROP TABLE IF EXISTS t_multi_session_100_resume;\n";
+
+print $setup "CREATE TABLE t_multi_session_100_resume(" .
+             "id INT PRIMARY KEY, " .
+             "v INT, " .
+             "resumed_by INT DEFAULT NULL) ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_multi_session_100_tokens(" .
+             "session_id INT PRIMARY KEY, " .
+             "token VARCHAR(255) NOT NULL UNIQUE) ENGINE=InnoDB;\n";
+
+close($setup);
+close($cleanup);
+EOF
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_cleanup.inc
+--source $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_setup.inc
+--enable_result_log
+--enable_query_log
+
+SET GLOBAL preserve_trx_enable=ON;
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+SET GLOBAL preserve_trx_recovery_max_count=200;
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $file = File::Spec->catfile($vardir, 'tmp',
+                               'preserve_trx_multi_session_100_preserve.inc');
+
+open(my $fh, '>', $file) or die "cannot open $file for write: $!";
+for my $i (1 .. 100) {
+  print $fh "START TRANSACTION;\n";
+  print $fh "INSERT INTO t_multi_session_100_resume VALUES($i, " .
+            ($i * 10) . ", NULL);\n";
+  print $fh "--exec echo \"wait\" > " .
+            "$vardir/tmp/mysqld.1.expect\n";
+  print $fh "PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 86400;\n";
+  print $fh "--source include/wait_until_disconnected.inc\n";
+  print $fh "--exec echo \"restart: --preserve-trx-enable=ON " .
+            "--preserve-trx-recovery-max-count=200\" > " .
+            "$vardir/tmp/mysqld.1.expect\n";
+  print $fh "--enable_reconnect\n";
+  print $fh "--source include/wait_until_connected_again.inc\n";
+  print $fh "--disable_reconnect\n";
+  print $fh "--disable_query_log\n";
+  print $fh "--disable_result_log\n";
+  print $fh "SET \@new_preserved_token = NULL;\n";
+  print $fh "SELECT TOKEN INTO \@new_preserved_token " .
+            "FROM performance_schema.preserved_transactions p " .
+            "WHERE NOT EXISTS (" .
+            "SELECT 1 FROM t_multi_session_100_tokens m " .
+            "WHERE m.token = p.TOKEN) " .
+            "ORDER BY TOKEN LIMIT 1;\n";
+  print $fh "INSERT INTO t_multi_session_100_tokens " .
+            "VALUES($i, \@new_preserved_token);\n";
+  print $fh "--let \$mapped_rows= `SELECT ROW_COUNT()`\n";
+  print $fh "if (\$mapped_rows != 1)\n";
+  print $fh "{\n";
+  print $fh "--die Expected one newly mapped preserved transaction token\n";
+  print $fh "}\n";
+}
+close($fh);
+EOF
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_preserve.inc
+--enable_result_log
+--enable_query_log
+
+SELECT COUNT(*) AS mapped_token_count
+  FROM t_multi_session_100_tokens;
+
+SELECT COUNT(*) AS preserved_count_after_generation
+  FROM performance_schema.preserved_transactions;
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+--disable_query_log
+SET SESSION group_concat_max_len=1000000;
+--let $write_to_file= $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_resume.inc
+--let $write_var= `SELECT GROUP_CONCAT(CONCAT('--connect(resume_', LPAD(session_id, 3, '0'), ',localhost,root,,test)\\n', '--connection resume_', LPAD(session_id, 3, '0'), '\\n', 'RESUME PRESERVED TRANSACTION \"', token, '\";\\n', 'UPDATE t_multi_session_100_resume SET v = v + 100000, resumed_by = ', session_id, ' WHERE id = ', session_id, ';\\n', 'COMMIT;\\n') ORDER BY session_id SEPARATOR '') FROM t_multi_session_100_tokens`
+--source include/write_var_to_file.inc
+--enable_query_log
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
+my $preserve_dir = File::Spec->catdir($datadir, 'preserve');
+opendir(my $dh, $preserve_dir)
+  or die "cannot open preserve dir $preserve_dir: $!";
+my @tokens = sort map {
+  s/\.bin$//r;
+} grep {
+  /\.bin$/ && -f File::Spec->catfile($preserve_dir, $_);
+} readdir($dh);
+closedir($dh);
+
+die "expected 100 preserved snapshots, found " . scalar(@tokens) . "\n"
+  unless scalar(@tokens) == 100;
+EOF
+
+--append_file $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_resume.inc
+--connection default
+EOF
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_resume.inc
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $file = File::Spec->catfile($vardir, 'tmp',
+                               'preserve_trx_multi_session_100_disconnect.inc');
+open(my $fh, '>', $file) or die "cannot open $file for write: $!";
+for my $idx (1 .. 100) {
+  my $name = sprintf("resume_%03d", $idx);
+  print $fh "--disconnect $name\n";
+}
+print $fh "--connection default\n";
+close($fh);
+EOF
+--source $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_disconnect.inc
+--enable_result_log
+--enable_query_log
+
+SELECT COUNT(*) AS preserved_count_after_resume
+  FROM performance_schema.preserved_transactions;
+
+SELECT COUNT(*) AS row_count,
+       COUNT(DISTINCT id) AS distinct_keys,
+       SUM(resumed_by IS NOT NULL) AS resumed_rows,
+       SUM(v >= 100000) AS bumped_rows
+  FROM t_multi_session_100_resume;
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
+my $preserve_dir = File::Spec->catdir($datadir, 'preserve');
+if (-d $preserve_dir) {
+  opendir(my $dh, $preserve_dir)
+    or die "cannot open preserve dir $preserve_dir: $!";
+  my @leftovers = grep {
+    /\.(?:bin|binlog_cache)(?:\.tmp)?$/ &&
+      -f File::Spec->catfile($preserve_dir, $_);
+  } readdir($dh);
+  closedir($dh);
+  die "expected no preserved transaction files after resume, found: " .
+      join(", ", sort @leftovers) . "\n"
+    if @leftovers;
+}
+EOF
+
+--remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_preserve.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_resume.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_disconnect.inc
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_cleanup.inc
+--enable_result_log
+--enable_query_log
+
+--remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_setup.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_multi_session_100_cleanup.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+--disable_query_log
+--disable_result_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--enable_result_log
+--enable_query_log

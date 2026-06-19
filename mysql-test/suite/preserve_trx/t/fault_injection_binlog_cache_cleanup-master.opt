@@ -1,0 +1,1 @@
+--log-bin=preserve-trx-fault-binlog-cache-bin --server-id=1 --binlog-format=ROW

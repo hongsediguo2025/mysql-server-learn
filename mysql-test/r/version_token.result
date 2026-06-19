@@ -291,6 +291,7 @@ REPLICATION_APPLIER	Server Admin
 REPLICATION_SLAVE_ADMIN	Server Admin	
 RESOURCE_GROUP_ADMIN	Server Admin	
 RESOURCE_GROUP_USER	Server Admin	
+RESUME_ANY_PRESERVED_TRANSACTION	Server Admin	
 ROLE_ADMIN	Server Admin	
 References	Databases,Tables	To have references on tables
 Reload	Server Admin	To reload or refresh tables, logs and privileges

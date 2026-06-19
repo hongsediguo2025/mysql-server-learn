@@ -1,0 +1,20 @@
+DROP TABLE IF EXISTS xa_keep;
+CREATE TABLE xa_keep(a INT PRIMARY KEY) ENGINE=InnoDB;
+XA START 'normal_xa';
+INSERT INTO xa_keep VALUES(1);
+XA END 'normal_xa';
+XA PREPARE 'normal_xa';
+XA RECOVER;
+formatID	gtrid_length	bqual_length	data
+1	9	0	normal_xa
+XA ROLLBACK 'normal_xa';
+SELECT COUNT(*) AS rows_after_rollback FROM xa_keep;
+rows_after_rollback
+0
+XA START X'4d53505f50524553', X'746f6b656e', 1836281843;
+ERROR XAE05: XAER_INVAL: Invalid arguments (or unsupported command)
+XA PREPARE X'4d53505f50524553', X'746f6b656e', 1836281843;
+ERROR XAE05: XAER_INVAL: Invalid arguments (or unsupported command)
+XA COMMIT X'4d53505f50524553', X'746f6b656e', 1836281843;
+ERROR XAE04: XAER_NOTA: Unknown XID
+DROP TABLE xa_keep;

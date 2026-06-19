@@ -26,6 +26,7 @@
 #include <sys/types.h>
 #include <algorithm>
 #include <new>
+#include <string>
 #include <unordered_map>
 
 #include "m_string.h"
@@ -771,6 +772,9 @@ struct MDL_key {
   static PSI_stage_info m_namespace_to_wait_state_name[NAMESPACE_END];
 };
 
+bool mdl_preserve_namespace_supported(
+    MDL_key::enum_mdl_namespace mdl_namespace);
+
 /**
   A pending metadata lock request.
 
@@ -1457,6 +1461,13 @@ class MDL_context {
     return MDL_savepoint(m_ticket_store.front(MDL_STATEMENT),
                          m_ticket_store.front(MDL_TRANSACTION));
   }
+
+  bool export_preserved_locks(std::string *payload, size_t *lock_count) const;
+  bool export_savepoint_ordinals(const MDL_savepoint &mdl_savepoint,
+                                 uint32 *stmt_ordinal,
+                                 uint32 *trans_ordinal) const;
+  bool savepoint_from_ordinals(uint32 stmt_ordinal, uint32 trans_ordinal,
+                               MDL_savepoint *mdl_savepoint) const;
 
   void set_explicit_duration_for_all_locks();
   void set_transaction_duration_for_all_locks();

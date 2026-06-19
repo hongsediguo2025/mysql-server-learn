@@ -1,0 +1,90 @@
+--source include/not_log_bin.inc
+
+--disable_warnings
+DROP USER IF EXISTS preserve_obj_user@localhost;
+DROP ROLE IF EXISTS preserve_obj_role;
+DROP DATABASE IF EXISTS preserve_obj_db;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE DATABASE preserve_obj_db;
+USE preserve_obj_db;
+
+CREATE TABLE t_preserve_obj_priv(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+CREATE TABLE t_preserve_obj_priv2(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_preserve_obj_priv VALUES(1,10);
+INSERT INTO t_preserve_obj_priv2 VALUES(1,20);
+DELIMITER |;
+CREATE DEFINER=root@localhost PROCEDURE p_preserve_obj_priv_update()
+SQL SECURITY DEFINER
+BEGIN
+  UPDATE t_preserve_obj_priv SET b=11 WHERE a=1;
+  UPDATE t_preserve_obj_priv2 SET b=21 WHERE a=1;
+END|
+DELIMITER ;|
+
+CREATE USER preserve_obj_user@localhost;
+CREATE ROLE preserve_obj_role;
+GRANT SHUTDOWN ON *.* TO preserve_obj_user@localhost;
+GRANT SELECT ON preserve_obj_db.t_preserve_obj_priv TO preserve_obj_user@localhost;
+GRANT SELECT ON preserve_obj_db.t_preserve_obj_priv2 TO preserve_obj_user@localhost;
+GRANT UPDATE ON preserve_obj_db.t_preserve_obj_priv TO preserve_obj_user@localhost;
+GRANT UPDATE ON preserve_obj_db.t_preserve_obj_priv TO preserve_obj_role;
+GRANT EXECUTE ON PROCEDURE preserve_obj_db.p_preserve_obj_priv_update TO preserve_obj_user@localhost;
+GRANT preserve_obj_role TO preserve_obj_user@localhost;
+
+--connect(obj_user_con, localhost, preserve_obj_user,,preserve_obj_db)
+START TRANSACTION;
+CALL p_preserve_obj_priv_update();
+
+--connection obj_user_con
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--connection default
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--connection obj_user_con
+ROLLBACK;
+
+--connection default
+REVOKE UPDATE ON preserve_obj_db.t_preserve_obj_priv FROM preserve_obj_user@localhost;
+GRANT UPDATE ON preserve_obj_db.t_preserve_obj_priv2 TO preserve_obj_user@localhost;
+
+--connection obj_user_con
+START TRANSACTION;
+CALL p_preserve_obj_priv_update();
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--connection default
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--connection obj_user_con
+ROLLBACK;
+
+--connection default
+REVOKE UPDATE ON preserve_obj_db.t_preserve_obj_priv2 FROM preserve_obj_user@localhost;
+GRANT UPDATE ON preserve_obj_db.t_preserve_obj_priv2 TO preserve_obj_role;
+
+--connection obj_user_con
+SET ROLE NONE;
+START TRANSACTION;
+CALL p_preserve_obj_priv_update();
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--connection default
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--connection obj_user_con
+ROLLBACK;
+--disconnect obj_user_con
+--connection default
+
+SELECT * FROM t_preserve_obj_priv ORDER BY a;
+SELECT * FROM t_preserve_obj_priv2 ORDER BY a;
+
+DROP USER preserve_obj_user@localhost;
+DROP ROLE preserve_obj_role;
+USE test;
+DROP DATABASE preserve_obj_db;
+SET GLOBAL preserve_trx_enable=ON;

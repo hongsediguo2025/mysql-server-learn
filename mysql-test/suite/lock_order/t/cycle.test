@@ -3,6 +3,8 @@
 # while having as much plugin code loaded as possible.
 #
 
+--source include/have_lock_order.inc
+
 --source include/have_semisync_plugin.inc
 
 ## FIXME : does not start
@@ -59,4 +61,3 @@ UNINSTALL PLUGIN rpl_semi_sync_master;
 UNINSTALL PLUGIN rpl_semi_sync_slave;
 
 UNINSTALL PLUGIN pfs_example_plugin_employee;
-

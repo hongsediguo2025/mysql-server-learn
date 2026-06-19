@@ -1,0 +1,229 @@
+--source include/have_debug_sync.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_preserve_token_redaction;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+--let $old_log_output= `SELECT @@global.log_output`
+--let $old_general_log= `SELECT @@global.general_log`
+--let $old_log_raw= `SELECT @@global.log_raw`
+--let $old_slow_query_log= `SELECT @@global.slow_query_log`
+--let $old_long_query_time= `SELECT @@global.long_query_time`
+--let $old_log_slow_admin_statements= `SELECT @@global.log_slow_admin_statements`
+SET GLOBAL log_output='TABLE';
+SET GLOBAL general_log=OFF;
+SET GLOBAL slow_query_log=OFF;
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+SET GLOBAL general_log=ON;
+SET GLOBAL slow_query_log=ON;
+SET GLOBAL long_query_time=0;
+SET GLOBAL log_slow_admin_statements=ON;
+
+CREATE TABLE t_preserve_token_redaction(a INT PRIMARY KEY, b INT)
+  ENGINE=InnoDB;
+INSERT INTO t_preserve_token_redaction VALUES(1,10);
+
+START TRANSACTION;
+UPDATE t_preserve_token_redaction SET b=11 WHERE a=1;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval SET @preserved_token='$preserved_token'
+SET @redacted_preserved_token=CONCAT('****', RIGHT(@preserved_token, 4));
+
+SET GLOBAL log_output='TABLE';
+SET GLOBAL general_log=ON;
+SET GLOBAL log_raw=ON;
+SET GLOBAL slow_query_log=ON;
+SET GLOBAL long_query_time=0;
+SET SESSION long_query_time=0;
+SET GLOBAL log_slow_admin_statements=ON;
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+
+--connect(preserve_resume_waiter,localhost,root,,test)
+--connection default
+SET DEBUG_SYNC =
+  'preserve_trx_resume_start SIGNAL resume_started WAIT_FOR resume_continue';
+--replace_result $preserved_token TOKEN
+--send_eval RESUME PRESERVED TRANSACTION '$preserved_token'
+--connection preserve_resume_waiter
+SET DEBUG_SYNC = 'now WAIT_FOR resume_started TIMEOUT 10';
+--sleep 1
+SET DEBUG_SYNC = 'now SIGNAL resume_continue';
+--connection default
+--reap
+SET DEBUG_SYNC = 'RESET';
+--disconnect preserve_resume_waiter
+--connection default
+COMMIT;
+
+SELECT COUNT(*) AS raw_token_in_general_log
+  FROM mysql.general_log
+ WHERE argument LIKE CONCAT('%', @preserved_token, '%');
+SELECT COUNT(*) > 0 AS redacted_last4_token_in_general_log
+  FROM mysql.general_log
+ WHERE argument LIKE '%RESUME PRESERVED TRANSACTION%'
+   AND argument LIKE CONCAT('%', @redacted_preserved_token, '%');
+SELECT COUNT(*) AS bare_redacted_token_in_general_log
+  FROM mysql.general_log
+ WHERE argument = "RESUME PRESERVED TRANSACTION '****'";
+
+SELECT COUNT(*) AS raw_token_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text LIKE CONCAT('%', @preserved_token, '%');
+SELECT COUNT(*) > 0 AS redacted_last4_token_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text LIKE '%RESUME PRESERVED TRANSACTION%'
+   AND sql_text LIKE CONCAT('%', @redacted_preserved_token, '%');
+SELECT COUNT(*) AS bare_redacted_token_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text = "RESUME PRESERVED TRANSACTION '****'";
+
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+--error ER_PRESERVE_TRX_NOT_FOUND
+RESUME PRESERVED TRANSACTION 0x6D73705F726564616374696F6E5F61626364;
+SELECT COUNT(*) > 0 AS hex_literal_last4_in_general_log
+  FROM mysql.general_log
+ WHERE argument = "RESUME PRESERVED TRANSACTION '****abcd'";
+SELECT COUNT(*) AS hex_literal_raw_in_general_log
+  FROM mysql.general_log
+ WHERE argument LIKE 'RESUME PRESERVED TRANSACTION 0x%';
+SELECT COUNT(*) AS hex_literal_wrong_last4_in_general_log
+  FROM mysql.general_log
+ WHERE argument = "RESUME PRESERVED TRANSACTION '****6364'";
+SELECT COUNT(*) > 0 AS hex_literal_last4_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text = "RESUME PRESERVED TRANSACTION '****abcd'";
+SELECT COUNT(*) AS hex_literal_raw_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text LIKE 'RESUME PRESERVED TRANSACTION 0x%';
+SELECT COUNT(*) AS hex_literal_wrong_last4_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text = "RESUME PRESERVED TRANSACTION '****6364'";
+
+--let $binary_redaction_token_bits= `SELECT CONCAT('0b', LPAD(BIN(ASCII('m')), 8, '0'), LPAD(BIN(ASCII('s')), 8, '0'), LPAD(BIN(ASCII('p')), 8, '0'), LPAD(BIN(ASCII('_')), 8, '0'), LPAD(BIN(ASCII('r')), 8, '0'), LPAD(BIN(ASCII('e')), 8, '0'), LPAD(BIN(ASCII('d')), 8, '0'), LPAD(BIN(ASCII('a')), 8, '0'), LPAD(BIN(ASCII('c')), 8, '0'), LPAD(BIN(ASCII('t')), 8, '0'), LPAD(BIN(ASCII('i')), 8, '0'), LPAD(BIN(ASCII('o')), 8, '0'), LPAD(BIN(ASCII('n')), 8, '0'), LPAD(BIN(ASCII('_')), 8, '0'), LPAD(BIN(ASCII('w')), 8, '0'), LPAD(BIN(ASCII('x')), 8, '0'), LPAD(BIN(ASCII('y')), 8, '0'), LPAD(BIN(ASCII('z')), 8, '0'))`
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+--disable_query_log
+--error ER_PRESERVE_TRX_NOT_FOUND
+--eval RESUME PRESERVED TRANSACTION $binary_redaction_token_bits
+--enable_query_log
+SELECT COUNT(*) > 0 AS binary_literal_last4_in_general_log
+  FROM mysql.general_log
+ WHERE argument = "RESUME PRESERVED TRANSACTION '****wxyz'";
+SELECT COUNT(*) AS binary_literal_raw_in_general_log
+  FROM mysql.general_log
+ WHERE argument LIKE 'RESUME PRESERVED TRANSACTION 0b%';
+SELECT COUNT(*) > 0 AS binary_literal_last4_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text = "RESUME PRESERVED TRANSACTION '****wxyz'";
+SELECT COUNT(*) AS binary_literal_raw_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text LIKE 'RESUME PRESERVED TRANSACTION 0b%';
+
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+--error ER_PRESERVE_TRX_NOT_FOUND
+RESUME PRESERVED TRANSACTION x'6D73705F726564616374696F6E5F71313233';
+SELECT COUNT(*) > 0 AS x_literal_last4_in_general_log
+  FROM mysql.general_log
+ WHERE argument = "RESUME PRESERVED TRANSACTION '****q123'";
+SELECT COUNT(*) AS x_literal_raw_in_general_log
+  FROM mysql.general_log
+ WHERE argument LIKE "RESUME PRESERVED TRANSACTION x'%";
+SELECT COUNT(*) > 0 AS x_literal_last4_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text = "RESUME PRESERVED TRANSACTION '****q123'";
+SELECT COUNT(*) AS x_literal_raw_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text LIKE "RESUME PRESERVED TRANSACTION x'%";
+
+--let $quoted_binary_redaction_token_bits= `SELECT CONCAT('b''', LPAD(BIN(ASCII('m')), 8, '0'), LPAD(BIN(ASCII('s')), 8, '0'), LPAD(BIN(ASCII('p')), 8, '0'), LPAD(BIN(ASCII('_')), 8, '0'), LPAD(BIN(ASCII('r')), 8, '0'), LPAD(BIN(ASCII('e')), 8, '0'), LPAD(BIN(ASCII('d')), 8, '0'), LPAD(BIN(ASCII('a')), 8, '0'), LPAD(BIN(ASCII('c')), 8, '0'), LPAD(BIN(ASCII('t')), 8, '0'), LPAD(BIN(ASCII('i')), 8, '0'), LPAD(BIN(ASCII('o')), 8, '0'), LPAD(BIN(ASCII('n')), 8, '0'), LPAD(BIN(ASCII('_')), 8, '0'), LPAD(BIN(ASCII('r')), 8, '0'), LPAD(BIN(ASCII('7')), 8, '0'), LPAD(BIN(ASCII('8')), 8, '0'), LPAD(BIN(ASCII('9')), 8, '0'), '''')`
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+--disable_query_log
+--error ER_PRESERVE_TRX_NOT_FOUND
+--eval RESUME PRESERVED TRANSACTION $quoted_binary_redaction_token_bits
+--enable_query_log
+SELECT COUNT(*) > 0 AS b_literal_last4_in_general_log
+  FROM mysql.general_log
+ WHERE argument = "RESUME PRESERVED TRANSACTION '****r789'";
+SELECT COUNT(*) AS b_literal_raw_in_general_log
+  FROM mysql.general_log
+ WHERE argument LIKE "RESUME PRESERVED TRANSACTION b'%";
+SELECT COUNT(*) > 0 AS b_literal_last4_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text = "RESUME PRESERVED TRANSACTION '****r789'";
+SELECT COUNT(*) AS b_literal_raw_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text LIKE "RESUME PRESERVED TRANSACTION b'%";
+
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+--error ER_PRESERVE_TRX_NOT_FOUND
+RESUME PRESERVED TRANSACTION '';
+SELECT COUNT(*) > 0 AS empty_token_placeholder_in_general_log
+  FROM mysql.general_log
+ WHERE argument = "RESUME PRESERVED TRANSACTION '****????'";
+SELECT COUNT(*) AS empty_token_bare_redacted_in_general_log
+  FROM mysql.general_log
+ WHERE argument = "RESUME PRESERVED TRANSACTION '****'";
+SELECT COUNT(*) > 0 AS empty_token_placeholder_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text = "RESUME PRESERVED TRANSACTION '****????'";
+SELECT COUNT(*) AS empty_token_bare_redacted_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text = "RESUME PRESERVED TRANSACTION '****'";
+
+SET GLOBAL log_raw=OFF;
+
+--disable_query_log
+CALL mtr.add_suppression("RESUME PRESERVED TRANSACTION .* failed: token not found");
+--enable_query_log
+
+--let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $grep_pattern= RESUME PRESERVED TRANSACTION '\\*\\*\\*\\*\\?\\?\\?\\?
+--let $grep_output= count
+--source include/grep_pattern.inc
+
+--replace_result $preserved_token TOKEN
+--error ER_PRESERVE_TRX_NOT_FOUND
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+
+--let $preserved_token_last4= `SELECT RIGHT(@preserved_token, 4)`
+--let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $grep_pattern= RESUME PRESERVED TRANSACTION '\\*\\*\\*\\*$preserved_token_last4
+--let $grep_output= count
+--replace_result $preserved_token_last4 LAST4
+--source include/grep_pattern.inc
+
+--let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $grep_pattern= $preserved_token
+--let $grep_output= count
+--replace_result $preserved_token TOKEN
+--source include/grep_pattern.inc
+
+DROP TABLE t_preserve_token_redaction;
+--eval SET GLOBAL general_log=$old_general_log
+--eval SET GLOBAL log_raw=$old_log_raw
+--eval SET GLOBAL slow_query_log=$old_slow_query_log
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+--eval SET GLOBAL long_query_time=$old_long_query_time
+--eval SET GLOBAL log_slow_admin_statements=$old_log_slow_admin_statements
+--eval SET GLOBAL log_output='$old_log_output'
+SET GLOBAL preserve_trx_enable=ON;

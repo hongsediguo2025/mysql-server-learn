@@ -1,0 +1,3 @@
+SELECT 'lint-only' AS temp_table_resume_materialize_partial_failure_cleanup_matrix_lint;
+temp_table_resume_materialize_partial_failure_cleanup_matrix_lint
+lint-only

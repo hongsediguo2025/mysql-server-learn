@@ -1,0 +1,64 @@
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_batch_current_durable_rollback_log_bin;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_batch_current_durable_rollback_log_bin(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_batch_current_durable_rollback_log_bin VALUES(1,10),(2,20);
+RESET MASTER;
+
+--connect(batch_current_durable_rollback_app,localhost,root,,test)
+--connection batch_current_durable_rollback_app
+START TRANSACTION;
+UPDATE t_batch_current_durable_rollback_log_bin SET v=11 WHERE id=1;
+
+--connection default
+SET SESSION debug="+d,preserve_trx_fail_after_undo_prepared";
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET SESSION debug="-d,preserve_trx_fail_after_undo_prepared";
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_snapshot_file.inc
+
+--connection batch_current_durable_rollback_app
+SELECT * FROM t_batch_current_durable_rollback_log_bin ORDER BY id;
+ROLLBACK;
+START TRANSACTION;
+UPDATE t_batch_current_durable_rollback_log_bin SET v=22 WHERE id=2;
+COMMIT;
+--disconnect batch_current_durable_rollback_app
+
+--connection default
+SELECT * FROM t_batch_current_durable_rollback_log_bin ORDER BY id;
+
+--let $binlog_file= query_get_value(SHOW MASTER STATUS, File, 1)
+--exec $MYSQL_BINLOG --force-if-open --base64-output=decode-rows -v -v $MYSQLTEST_VARDIR/mysqld.1/data/$binlog_file > $MYSQLTEST_VARDIR/tmp/batch_current_durable_rollback_log_bin.mysqlbinlog
+--let $assert_text= New transaction after current target rollback remains in binlog
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/batch_current_durable_rollback_log_bin.mysqlbinlog
+--let $assert_select= @2=22
+--let $assert_count_condition= >= 1
+--source include/assert_grep.inc
+--let $assert_text= Rolled back current target durable failure is not written to binlog
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/batch_current_durable_rollback_log_bin.mysqlbinlog
+--let $assert_select= @2=11
+--let $assert_count_condition= == 0
+--source include/assert_grep.inc
+--let $assert_text= New transaction after current target rollback commits with a nonzero Xid event
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/batch_current_durable_rollback_log_bin.mysqlbinlog
+--let $assert_select= Xid = [1-9][0-9]*
+--let $assert_count_condition= >= 1
+--source include/assert_grep.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/batch_current_durable_rollback_log_bin.mysqlbinlog
+
+DROP TABLE t_batch_current_durable_rollback_log_bin;
+SET GLOBAL preserve_trx_enable=ON;

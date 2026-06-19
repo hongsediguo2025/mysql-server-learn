@@ -109,6 +109,7 @@
 #include "storage/perfschema/table_os_global_by_type.h"
 #include "storage/perfschema/table_performance_timers.h"
 #include "storage/perfschema/table_persisted_variables.h"
+#include "storage/perfschema/table_preserved_transactions.h"
 #include "storage/perfschema/table_prepared_stmt_instances.h"
 #include "storage/perfschema/table_processlist.h"
 #include "storage/perfschema/table_replication_applier_configuration.h"
@@ -662,6 +663,7 @@ static PFS_engine_table_share *all_shares[] = {
     &table_replication_asynchronous_connection_failover::m_share,
     &table_log_status::m_share,
 
+    &table_preserved_transactions::m_share,
     &table_prepared_stmt_instances::m_share,
 
     &table_uvar_by_thread::m_share,

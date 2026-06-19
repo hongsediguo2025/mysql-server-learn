@@ -1,0 +1,68 @@
+--source include/have_debug_sync.inc
+--source include/not_log_bin.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_batch_pending_capacity;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+--let $old_batch_max= `SELECT @@GLOBAL.preserve_trx_batch_max_transactions`
+
+CREATE TABLE t_batch_pending_capacity(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+
+--connect(batch_pending_capacity_a,localhost,root,,test)
+--connection batch_pending_capacity_a
+SET DEBUG_SYNC =
+  'before_execute_sql_command SIGNAL batch_pending_capacity_a_ready WAIT_FOR continue_batch_pending_capacity_a';
+--send START TRANSACTION; INSERT INTO t_batch_pending_capacity VALUES(1,10)
+
+--connect(batch_pending_capacity_b,localhost,root,,test)
+--connection batch_pending_capacity_b
+SET DEBUG_SYNC =
+  'before_execute_sql_command SIGNAL batch_pending_capacity_b_ready WAIT_FOR continue_batch_pending_capacity_b';
+--send START TRANSACTION; INSERT INTO t_batch_pending_capacity VALUES(2,20)
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR batch_pending_capacity_a_ready TIMEOUT 10';
+SET DEBUG_SYNC = 'now WAIT_FOR batch_pending_capacity_b_ready TIMEOUT 10';
+SET GLOBAL preserve_trx_batch_max_transactions=1;
+
+--connect(batch_pending_capacity_owner,localhost,root,,test)
+--connection batch_pending_capacity_owner
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now SIGNAL continue_batch_pending_capacity_a';
+SET DEBUG_SYNC = 'now SIGNAL continue_batch_pending_capacity_b';
+
+--connection batch_pending_capacity_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+--disconnect batch_pending_capacity_owner
+
+--connection batch_pending_capacity_a
+--disable_result_log
+--reap
+--enable_result_log
+COMMIT;
+--disconnect batch_pending_capacity_a
+
+--connection batch_pending_capacity_b
+--disable_result_log
+--reap
+--enable_result_log
+ROLLBACK;
+--disconnect batch_pending_capacity_b
+
+--connection default
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+SELECT * FROM t_batch_pending_capacity ORDER BY id;
+
+DROP TABLE t_batch_pending_capacity;
+SET GLOBAL preserve_trx_enable=ON;
+--disable_query_log
+--disable_result_log
+--eval SET GLOBAL preserve_trx_batch_max_transactions=$old_batch_max
+--enable_result_log
+--enable_query_log

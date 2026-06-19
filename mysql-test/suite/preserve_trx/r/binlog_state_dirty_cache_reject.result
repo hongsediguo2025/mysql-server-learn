@@ -1,0 +1,40 @@
+DROP TABLE IF EXISTS t_dirty_cache;
+DROP TABLE IF EXISTS t_dirty_cache_myisam;
+DROP DATABASE IF EXISTS preserve_trx_ignored;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_dirty_cache(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_dirty_cache VALUES(1,10);
+CREATE TABLE t_dirty_cache_myisam(a INT PRIMARY KEY, b INT) ENGINE=MyISAM;
+START TRANSACTION;
+UPDATE t_dirty_cache SET b=11 WHERE a=1;
+INSERT INTO t_dirty_cache_myisam VALUES(1,11);
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT * FROM t_dirty_cache WHERE a=1;
+a	b
+1	11
+ROLLBACK;
+Warnings:
+Warning	1196	Some non-transactional changed tables couldn't be rolled back
+SELECT * FROM t_dirty_cache WHERE a=1;
+a	b
+1	10
+DROP TABLE t_dirty_cache, t_dirty_cache_myisam;
+CREATE DATABASE preserve_trx_ignored;
+CREATE TABLE preserve_trx_ignored.gtid_seed(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO preserve_trx_ignored.gtid_seed VALUES(1,10);
+SET GTID_NEXT='ANONYMOUS';
+START TRANSACTION;
+UPDATE preserve_trx_ignored.gtid_seed SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT * FROM preserve_trx_ignored.gtid_seed WHERE a=1;
+a	b
+1	11
+ROLLBACK;
+SET GTID_NEXT=DEFAULT;
+SELECT @@SESSION.GTID_NEXT;
+@@SESSION.GTID_NEXT
+AUTOMATIC
+DROP DATABASE preserve_trx_ignored;
+SET GLOBAL preserve_trx_enable=ON;

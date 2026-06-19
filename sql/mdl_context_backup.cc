@@ -167,7 +167,7 @@ bool MDL_context_backup_manager::create_backup(const MDL_context *context,
       In other words, it mustn't be present any element for specified xid
       when this method called. Check that this invariant is satisfied.
     */
-    DBUG_ASSERT(!check_key_exist(key_obj));
+    if (check_key_exist(key_obj)) return true;
 
     std::unique_ptr<MDL_context_backup> element(new (std::nothrow)
                                                     MDL_context_backup());
@@ -245,6 +245,8 @@ bool MDL_context_backup_manager::restore_backup(MDL_context *mdl_context,
   if (result != m_backup_map.end()) {
     element = result->second.get();
     res = mdl_context->clone_tickets(element->get_context(), MDL_TRANSACTION);
+  } else {
+    res = true;
   }
 
   return res;

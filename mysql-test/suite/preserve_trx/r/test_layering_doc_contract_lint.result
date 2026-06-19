@@ -1,0 +1,5 @@
+# Lint-only guard: preserve/resume behavior tests must not read
+# design documents, and new source-shape checks must be explicit lint.
+SELECT 'ok' AS test_layering_doc_contract_lint;
+test_layering_doc_contract_lint
+ok

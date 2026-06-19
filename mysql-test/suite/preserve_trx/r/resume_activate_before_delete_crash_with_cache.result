@@ -1,0 +1,31 @@
+DROP TABLE IF EXISTS t_resume_activate_cache_crash;
+SET GLOBAL preserve_trx_enable=ON;
+SET SESSION sql_log_bin=0;
+CREATE TABLE t_resume_activate_cache_crash(a INT PRIMARY KEY, b INT)
+ENGINE=InnoDB;
+INSERT INTO t_resume_activate_cache_crash VALUES(1,10);
+SET SESSION sql_log_bin=1;
+RESET MASTER;
+SET GTID_NEXT='SERVER_UUID:7';
+START TRANSACTION;
+INSERT INTO t_resume_activate_cache_crash VALUES(2,11);
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug="+d,preserve_trx_crash_after_resume_activate_before_snapshot_delete";
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Lost connection to MySQL server during query
+SELECT COUNT(*) AS remaining_preserved
+FROM performance_schema.preserved_transactions;
+remaining_preserved
+0
+SELECT GTID_SUBSET(CONCAT(@@GLOBAL.SERVER_UUID, ':7'), @@GLOBAL.GTID_EXECUTED)
+AS explicit_gtid_not_committed;
+explicit_gtid_not_committed
+0
+SELECT * FROM t_resume_activate_cache_crash ORDER BY a;
+a	b
+1	10
+SET SESSION sql_log_bin=0;
+DROP TABLE t_resume_activate_cache_crash;
+SET SESSION sql_log_bin=1;
+RESET MASTER;
+SET GLOBAL preserve_trx_enable=ON;

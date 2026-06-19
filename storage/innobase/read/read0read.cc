@@ -34,6 +34,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "clone0clone.h"
 
 #include "srv0srv.h"
+#include "trx0purge.h"
 #include "trx0sys.h"
 
 /*
@@ -413,7 +414,9 @@ void ReadView::copy_trx_ids(const trx_ids_t &trx_ids) {
        ++it) {
     trx_t *trx = trx_get_rw_trx_by_id(*it);
     ut_ad(trx != nullptr);
-    ut_ad(trx->state == TRX_STATE_ACTIVE || trx->state == TRX_STATE_PREPARED);
+    ut_ad(trx->state == TRX_STATE_ACTIVE ||
+          trx->state == TRX_STATE_PREPARED ||
+          trx->state == TRX_STATE_PRESERVED);
   }
 #endif /* UNIV_DEBUG */
 }
@@ -728,6 +731,103 @@ void MVCC::view_close(ReadView *&view, bool own_mutex) {
 
     view = nullptr;
   }
+}
+
+bool MVCC::preserve_export_view(ReadView *view,
+                                Preserve_read_view_snapshot *snapshot) {
+  if (snapshot == nullptr || !is_view_active(view)) {
+    return false;
+  }
+
+  trx_sys_mutex_enter();
+
+  if (!is_view_active(view)) {
+    trx_sys_mutex_exit();
+    return false;
+  }
+
+  snapshot->low_limit_id = view->m_low_limit_id;
+  snapshot->up_limit_id = view->m_up_limit_id;
+  snapshot->creator_trx_id = view->m_creator_trx_id;
+  snapshot->low_limit_no = view->m_low_limit_no;
+  view->preserve_export_ids(&snapshot->ids);
+
+  trx_sys_mutex_exit();
+
+  return true;
+}
+
+dberr_t MVCC::preserve_import_view(
+    ReadView *&view, const Preserve_read_view_snapshot &snapshot, trx_t *trx) {
+  if (trx == nullptr || view != nullptr ||
+      snapshot.creator_trx_id != trx->id ||
+      snapshot.creator_trx_id == 0 ||
+      snapshot.low_limit_no > snapshot.low_limit_id ||
+      snapshot.up_limit_id > snapshot.low_limit_id) {
+    return DB_ERROR;
+  }
+
+  ut_a(purge_sys != nullptr);
+  const purge_state_t purge_state = trx_purge_state();
+  ut_a(purge_state == PURGE_STATE_INIT ||
+       purge_state == PURGE_STATE_DISABLED);
+
+  if (!snapshot.ids.empty()) {
+    if (snapshot.ids.front() != snapshot.up_limit_id) {
+      return DB_ERROR;
+    }
+    for (size_t i = 0; i < snapshot.ids.size(); ++i) {
+      if (snapshot.ids[i] == 0 || snapshot.ids[i] == snapshot.creator_trx_id ||
+          snapshot.ids[i] >= snapshot.low_limit_id ||
+          (i > 0 && snapshot.ids[i - 1] >= snapshot.ids[i])) {
+        return DB_ERROR;
+      }
+    }
+  } else if (snapshot.up_limit_id != snapshot.low_limit_id) {
+    return DB_ERROR;
+  }
+
+  trx_sys_mutex_enter();
+
+  view = get_view();
+  if (view == nullptr) {
+    trx_sys_mutex_exit();
+    return DB_OUT_OF_MEMORY;
+  }
+
+  view->m_low_limit_id = snapshot.low_limit_id;
+  view->m_up_limit_id = snapshot.up_limit_id;
+  view->m_creator_trx_id = snapshot.creator_trx_id;
+  view->m_low_limit_no = snapshot.low_limit_no;
+  view->preserve_import_ids(snapshot.ids);
+  view->m_closed = false;
+  ut_d(view->m_view_low_limit_no = snapshot.low_limit_no);
+
+  ReadView *prev = nullptr;
+  ReadView *next = nullptr;
+  for (ReadView *existing = UT_LIST_GET_FIRST(m_views); existing != nullptr;
+       existing = UT_LIST_GET_NEXT(m_view_list, existing)) {
+    if (snapshot.low_limit_no > existing->m_low_limit_no) {
+      next = existing;
+      break;
+    }
+    prev = existing;
+  }
+
+  if (prev == nullptr) {
+    UT_LIST_ADD_FIRST(m_views, view);
+  } else {
+    UT_LIST_INSERT_AFTER(m_views, prev, view);
+  }
+
+  ut_a(prev == nullptr || snapshot.low_limit_no <= prev->m_low_limit_no);
+  ut_a(next == nullptr || next->is_closed() ||
+       next->m_low_limit_no <= snapshot.low_limit_no);
+  ut_ad(validate());
+
+  trx_sys_mutex_exit();
+
+  return DB_SUCCESS;
 }
 
 /**

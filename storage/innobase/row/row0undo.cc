@@ -130,7 +130,8 @@ undo_node_t *row_undo_node_create(trx_t *trx, que_thr_t *parent,
   undo_node_t *undo;
 
   ut_ad(trx_state_eq(trx, TRX_STATE_ACTIVE) ||
-        trx_state_eq(trx, TRX_STATE_PREPARED));
+        trx_state_eq(trx, TRX_STATE_PREPARED) ||
+        trx_state_eq(trx, TRX_STATE_PRESERVED));
   ut_ad(parent);
 
   undo = static_cast<undo_node_t *>(mem_heap_alloc(heap, sizeof(undo_node_t)));

@@ -1,0 +1,68 @@
+DROP TABLE IF EXISTS t_batch_log_bin_cleanup;
+CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files before reattach");
+CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted by innodb_force_recovery");
+CALL mtr.add_suppression("Preserved transaction batch cleanup failed after target preserve error");
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_batch_log_bin_cleanup(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO t_batch_log_bin_cleanup VALUES(1,10);
+RESET MASTER;
+START TRANSACTION;
+UPDATE t_batch_log_bin_cleanup SET v=11 WHERE id=1;
+START TRANSACTION;
+INSERT INTO t_batch_log_bin_cleanup VALUES(2,20);
+SET SESSION debug="+d,preserve_trx_batch_fail_after_one_target";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug="-d,preserve_trx_batch_fail_after_one_target";
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+SELECT TOKEN, LAST_ERROR
+FROM performance_schema.preserved_transactions;
+TOKEN	LAST_ERROR
+COMMIT;
+ROLLBACK;
+SELECT * FROM t_batch_log_bin_cleanup ORDER BY id;
+id	v
+1	11
+include/assert_grep.inc [Committed restored batch transaction remains in binlog]
+include/assert_grep.inc [Rolled back batch transaction is discarded from binlog cache]
+START TRANSACTION;
+UPDATE t_batch_log_bin_cleanup SET v=12 WHERE id=1;
+SET SESSION debug="+d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_delete_snapshot_files";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: DRAIN TRANSACTIONS PRESERVE batch cleanup failed; inspect preserved_transactions and target sessions before retry
+SET SESSION debug="-d,preserve_trx_fail_after_snapshot_rename,preserve_trx_fail_delete_snapshot_files";
+SELECT 1 AS server_alive_after_delete_before_failure;
+server_alive_after_delete_before_failure
+1
+SELECT COUNT(*) AS preserved_delete_before_records
+FROM performance_schema.preserved_transactions
+WHERE STATE = 'PRESERVED'
+   AND LAST_ERROR IS NOT NULL
+AND LAST_ERROR_AT IS NOT NULL;
+preserved_delete_before_records
+0
+SELECT TOKEN, STATE, LAST_ERROR IS NOT NULL AS has_last_error
+FROM performance_schema.preserved_transactions
+ORDER BY TOKEN;
+TOKEN	STATE	has_last_error
+SELECT 1;
+1
+1
+COMMIT;
+SELECT COUNT(*) AS preserved_count_after_delete_before
+FROM performance_schema.preserved_transactions;
+preserved_count_after_delete_before
+0
+SELECT * FROM t_batch_log_bin_cleanup ORDER BY id;
+id	v
+1	12
+include/assert_grep.inc [Reattached delete-before cleanup transaction remains in binlog]
+DROP TABLE t_batch_log_bin_cleanup;
+SET GLOBAL preserve_trx_enable=ON;

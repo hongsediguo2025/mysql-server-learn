@@ -1179,6 +1179,36 @@ fil_space_t *fil_space_create(const char *name, space_id_t space_id,
                               uint32_t flags, fil_type_t purpose)
     MY_ATTRIBUTE((warn_unused_result));
 
+/** Adopt an existing preserved session temporary tablespace image into the
+fil system without joining the normal session temporary tablespace pool.
+@param[in]      space_id        original temporary tablespace ID
+@param[in]      name            preserve-owned tablespace name
+@param[in]      path            path to the sealed image file
+@param[in]      flags           tablespace flags
+@param[in]      size            file size in pages
+@return DB_SUCCESS or error code */
+dberr_t fil_preserve_temp_space_adopt(space_id_t space_id, const char *name,
+                                      const char *path, uint32_t flags,
+                                      page_no_t size)
+    MY_ATTRIBUTE((warn_unused_result));
+
+/** Detach and delete a preserve-owned temporary tablespace image from the fil
+system.
+@param[in]      space_id        original temporary tablespace ID
+@param[in]      buf_remove      buffer pool eviction policy
+@return DB_SUCCESS or error code */
+dberr_t fil_preserve_temp_space_detach(space_id_t space_id,
+                                       buf_remove_t buf_remove)
+    MY_ATTRIBUTE((warn_unused_result));
+
+/** Detach a preserve-owned temporary tablespace image from the fil system
+without deleting its sidecar file, so a failed RESUME materialization can be
+retried with the same snapshot.
+@param[in]      space_id        original temporary tablespace ID
+@return DB_SUCCESS or error code */
+dberr_t fil_preserve_temp_space_forget(space_id_t space_id)
+    MY_ATTRIBUTE((warn_unused_result));
+
 /** Assigns a new space id for a new single-table tablespace. This works
 simply by incrementing the global counter. If 4 billion id's is not enough,
 we may need to recycle id's.

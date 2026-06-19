@@ -35,9 +35,19 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include <stddef.h>
 #include <algorithm>
+#include <vector>
 
+#include "db0err.h"
 #include "read0types.h"
 #include "univ.i"
+
+struct Preserve_read_view_snapshot {
+  trx_id_t low_limit_id{0};
+  trx_id_t up_limit_id{0};
+  trx_id_t creator_trx_id{0};
+  trx_id_t low_limit_no{0};
+  std::vector<trx_id_t> ids;
+};
 
 /** The MVCC read view manager */
 class MVCC {
@@ -92,6 +102,22 @@ class MVCC {
   Set the view creator transaction id. Note: This shouldbe set only
   for views created by RW transactions. */
   static void set_view_creator_trx_id(ReadView *view, trx_id_t id);
+
+  /** Export a read view into a preserve snapshot.
+  @param view      read view to export
+  @param snapshot  output snapshot
+  @return true on successful export */
+  static bool preserve_export_view(ReadView *view,
+                                   Preserve_read_view_snapshot *snapshot);
+
+  /** Import a preserved read view.
+  @param view      destination read view pointer; must be null
+  @param snapshot  read view snapshot to import
+  @param trx       transaction that owns the imported view
+  @return DB_SUCCESS or error */
+  dberr_t preserve_import_view(ReadView *&view,
+                               const Preserve_read_view_snapshot &snapshot,
+                               trx_t *trx);
 
  private:
   /**

@@ -1,0 +1,40 @@
+--source include/have_debug.inc
+--source include/not_windows.inc
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_enable=OFF;
+
+--let $error_log= $MYSQLTEST_VARDIR/log/preserve_trx_startup_transient_key_io_retry.err
+--perl
+use strict;
+use warnings;
+my $path = $ENV{'error_log'} || '';
+unlink $path if $path ne '' && -e $path;
+EOF
+
+--exec $MYSQLD_CMD --validate-config --preserve-trx-enable=ON --debug=d,preserve_trx_simulate_startup_key_read_io_once --log-error=$error_log > $error_log 2>&1
+
+--let SEARCH_FILE= $error_log
+--let SEARCH_PATTERN= preserve_trx startup support transient I/O retry succeeded
+--source include/search_pattern.inc
+--remove_file $error_log
+
+--let $error_log= $MYSQLTEST_VARDIR/log/preserve_trx_startup_transient_dir_stat_retry.err
+--perl
+use strict;
+use warnings;
+my $path = $ENV{'error_log'} || '';
+unlink $path if $path ne '' && -e $path;
+EOF
+
+--exec $MYSQLD_CMD --validate-config --preserve-trx-enable=ON --debug=d,preserve_trx_simulate_startup_dir_stat_io_once --log-error=$error_log > $error_log 2>&1
+
+--let SEARCH_FILE= $error_log
+--let SEARCH_PATTERN= preserve_trx startup support transient I/O retry succeeded
+--source include/search_pattern.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+
+--remove_file $error_log

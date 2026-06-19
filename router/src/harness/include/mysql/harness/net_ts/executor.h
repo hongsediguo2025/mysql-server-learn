@@ -468,7 +468,7 @@ class executor_work_guard {
     ex_.on_work_started();
   }
   executor_work_guard(const executor_work_guard &other) noexcept
-      : ex_{other.ex}, owns_{other.owns_} {
+      : ex_{other.ex_}, owns_{other.owns_} {
     if (owns_) {
       ex_.on_work_started();
     }

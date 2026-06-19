@@ -1,0 +1,52 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_read_view_rr;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_read_view_rr(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_read_view_rr VALUES(1,10),(2,200),(3,300);
+
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT * FROM t_read_view_rr WHERE a=1;
+
+--connect(rr_writer, localhost, root,,test)
+UPDATE t_read_view_rr SET b=20 WHERE a=1;
+UPDATE t_read_view_rr SET b=330 WHERE a=3;
+--disconnect rr_writer
+--source include/wait_until_disconnected.inc
+--connection default
+
+UPDATE t_read_view_rr SET b=201 WHERE a=2;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+
+SELECT * FROM t_read_view_rr WHERE a=1;
+SELECT * FROM t_read_view_rr WHERE a=2;
+SELECT * FROM t_read_view_rr WHERE a=3;
+
+SELECT COUNT(*) AS remaining_preserved
+  FROM performance_schema.preserved_transactions;
+--error 1
+--file_exists $PRESERVED_SNAPSHOT_FILE
+
+COMMIT;
+SELECT * FROM t_read_view_rr ORDER BY a;
+
+DROP TABLE t_read_view_rr;
+SET GLOBAL preserve_trx_enable=ON;

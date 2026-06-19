@@ -1,0 +1,10 @@
+SET GLOBAL preserve_trx_enable=ON;
+SHUTDOWN;
+include/wait_for_pattern_in_file.inc [TEMP_SIDECAR_RESERVED_BEFORE_VALIDATION token='.*' reason=reserved source space ids before sidecar digest validation]
+include/wait_for_pattern_in_file.inc [TEMP_SIDECAR_CORRUPT_DEFERRED token='.*' reason=preserved temporary table image sidecar digest mismatch]
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

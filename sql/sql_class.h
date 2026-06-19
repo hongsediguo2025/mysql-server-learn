@@ -118,6 +118,7 @@ class Parser_state;
 class PROFILING;
 class Query_tables_list;
 class Relay_log_info;
+class Temp_table_warmcopy_participant;
 class THD;
 class partition_info;
 class Protocol;
@@ -135,6 +136,15 @@ struct TABLE_LIST;
 struct timeval;
 struct User_level_lock;
 struct YYLTYPE;
+
+enum class Preserve_trx_batch_thd_state {
+  NONE,
+  PENDING_QUIESCE,
+  QUIESCED,
+  ATTACHING,
+  DRAINED_NO_TRANSACTION,
+  PRESERVED_DRAINED
+};
 
 namespace dd {
 namespace cache {
@@ -384,6 +394,8 @@ class Prepared_statement_map {
 
   /** Erase all prepared statements (calls Prepared_statement destructor). */
   void erase(Prepared_statement *statement);
+
+  bool has_open_server_side_cursor() const;
 
   void claim_memory_ownership(bool claim);
 
@@ -1301,6 +1313,38 @@ class THD : public MDL_context_owner,
   uint dbug_sentry;  // watch out for memory corruption
 #endif
   bool is_killable;
+  /**
+    Non-zero while this THD is executing a statement that may create
+    transaction state or locks blocked by preserve-trx soft drain.
+    Protected by LOCK_thd_data.
+  */
+  uint preserve_trx_inflight_risky_statement_depth{0};
+  uint preserve_trx_inflight_unknown_query_depth{0};
+  ulonglong preserve_trx_batch_generation{0};
+  Preserve_trx_batch_thd_state preserve_trx_batch_state{
+      Preserve_trx_batch_thd_state::NONE};
+  /**
+    Warm-copy participant id assigned by the preserve/drain coordinator while
+    this THD is admitted to an open warm-copy epoch. Protected by
+    LOCK_thd_data. The 8.0.22 port connects this field to the production
+    binlog warm-copy mirror and drain participant lifecycle.
+  */
+  uint preserve_trx_warmcopy_participant_id{0};
+  /**
+    Optional user temporary-table preserve participant. The 8.0.22 port
+    connects this state to the user temporary-table image/rebind runtime; temp
+    row-history/no-redo undo cases still fail closed before a durable token is
+    generated. Protected by LOCK_thd_data where it is read together with
+    per-session preserve/drain state.
+  */
+  Temp_table_warmcopy_participant *preserve_trx_temp_table_participant{
+      nullptr};
+  std::atomic<bool> preserve_trx_temp_table_has_participant{false};
+  std::atomic<bool> preserve_trx_temp_table_untracked_change{false};
+  bool preserve_trx_temp_table_no_redo_baseline_valid{false};
+  bool preserve_trx_temp_table_no_redo_baseline_present{false};
+  uint64_t preserve_trx_temp_table_no_redo_baseline_top{0};
+  uint preserve_trx_temp_table_participant_id{0};
   /**
     Mutex protecting access to current_mutex and current_cond.
   */

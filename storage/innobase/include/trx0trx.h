@@ -365,6 +365,10 @@ trx_id_t trx_get_id_for_print(const trx_t *trx);
 @param[in,out]	trx	transaction that involves write to temp-table. */
 void trx_assign_rseg_temp(trx_t *trx);
 
+/** Assign a durable rollback segment to a transaction in a round-robin fashion.
+@param[in,out]	trx	transaction that involves a durable write. */
+void trx_assign_rseg_durable(trx_t *trx);
+
 /** Create the trx_t pool */
 void trx_pool_init();
 
@@ -475,6 +479,8 @@ Check transaction state */
     ut_ad(!trx_is_autocommit_non_locking((t))); \
     switch ((t)->state) {                       \
       case TRX_STATE_PREPARED:                  \
+        /* fall through */                      \
+      case TRX_STATE_PRESERVED:                 \
         /* fall through */                      \
       case TRX_STATE_ACTIVE:                    \
       case TRX_STATE_COMMITTED_IN_MEMORY:       \
@@ -898,6 +904,7 @@ struct trx_t {
   TRX_STATE_FORCED_ROLLBACK
   TRX_STATE_ACTIVE
   TRX_STATE_PREPARED
+  TRX_STATE_PRESERVED
   TRX_STATE_COMMITTED_IN_MEMORY (alias below COMMITTED)
 
   Valid state transitions are:
@@ -913,6 +920,11 @@ struct trx_t {
 
   Recovered XA:
   * NOT_STARTED -> PREPARED -> COMMITTED -> (freed)
+
+  Preserved transactions:
+  * ACTIVE -> PREPARED -> PRESERVED -> ACTIVE -> COMMITTED -> NOT_STARTED
+  or
+  * ACTIVE -> PREPARED -> PRESERVED -> rolled back and freed
 
   XA (2PC) (shutdown or disconnect before ROLLBACK or COMMIT):
   * NOT_STARTED -> PREPARED -> (freed)
@@ -942,6 +954,8 @@ struct trx_t {
 
   ACTIVE->PREPARED->COMMITTED is only possible when trx->in_rw_trx_list.
   The transition ACTIVE->PREPARED is protected by trx_sys->mutex.
+  PREPARED->PRESERVED and PRESERVED->ACTIVE are preserve/resume transitions
+  protected by trx_sys->mutex while the transaction remains in rw_trx_list.
 
   ACTIVE->COMMITTED is possible when the transaction is in
   rw_trx_list.
@@ -1073,6 +1087,11 @@ struct trx_t {
   /*------------------------------*/
   THD *mysql_thd; /*!< MySQL thread handle corresponding
                   to this trx, or NULL */
+
+  /** True when resumable shutdown recovery manager has claimed this preserved
+  transaction and owns its lifecycle. Protected by trx_sys_t::mutex while the
+  transaction is in trx_sys->rw_trx_list. */
+  bool preserve_trx_claimed;
 
   const char *mysql_log_file_name;
   /*!< if MySQL binlog is used, this field

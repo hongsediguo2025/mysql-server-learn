@@ -1,0 +1,63 @@
+--source include/have_debug_sync.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_preserve_drain_inflight;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_drain_mode=HARD;
+SET GLOBAL preserve_trx_drain_grace_ms=0;
+
+CREATE TABLE t_preserve_drain_inflight(a INT PRIMARY KEY, b INT)
+  ENGINE=InnoDB;
+INSERT INTO t_preserve_drain_inflight VALUES(1,10),(2,20);
+
+--connect(drain_inflight_writer,localhost,root,,test)
+--connection drain_inflight_writer
+SET DEBUG_SYNC =
+  'before_execute_sql_command SIGNAL inflight_after_gate WAIT_FOR continue_inflight';
+--send UPDATE t_preserve_drain_inflight SET b=21 WHERE a=2
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR inflight_after_gate TIMEOUT 10';
+
+--connect(drain_inflight_preserve,localhost,root,,test)
+--connection drain_inflight_preserve
+--let $preserve_conn_id= `SELECT CONNECTION_ID()`
+SET DEBUG_SYNC =
+  'preserve_trx_drain_before_kill_active SIGNAL drain_inflight_ready';
+SET DEBUG_SYNC =
+  'preserve_trx_before_token_delivery SIGNAL drain_inflight_before_token WAIT_FOR continue_drain_token';
+START TRANSACTION;
+UPDATE t_preserve_drain_inflight SET b=11 WHERE a=1;
+--send PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300
+
+--connection default
+--sleep 1
+SET DEBUG_SYNC = 'now WAIT_FOR drain_inflight_before_token TIMEOUT 10';
+--replace_result $preserve_conn_id PRESERVE_ID
+--eval KILL CONNECTION $preserve_conn_id
+SET DEBUG_SYNC = 'now SIGNAL continue_drain_token';
+
+--connection drain_inflight_preserve
+--error 2013,ER_QUERY_INTERRUPTED
+--reap
+--disconnect drain_inflight_preserve
+
+--connection drain_inflight_writer
+--error 2013,ER_QUERY_INTERRUPTED
+--reap
+--disconnect drain_inflight_writer
+
+--connection default
+SET DEBUG_SYNC = 'RESET';
+SELECT * FROM t_preserve_drain_inflight ORDER BY a;
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+DROP TABLE t_preserve_drain_inflight;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_drain_grace_ms=30000;
+SET GLOBAL preserve_trx_drain_mode=SOFT;

@@ -1,0 +1,37 @@
+DROP TABLE IF EXISTS t_temp_legacy_undo_base;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+CREATE TABLE t_temp_legacy_undo_base(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_temp_legacy_undo_base VALUES(1,10);
+CREATE TEMPORARY TABLE tmp_legacy_undo(
+id INT PRIMARY KEY,
+v INT,
+KEY(v)
+) ENGINE=InnoDB;
+INSERT INTO tmp_legacy_undo VALUES(1,100),(2,200);
+START TRANSACTION;
+UPDATE t_temp_legacy_undo_base SET v=11 WHERE id=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+SELECT COUNT(*) AS preserved_count_before_legacy_undo_resume FROM performance_schema.preserved_transactions WHERE TOKEN = 'TOKEN';
+preserved_count_before_legacy_undo_resume
+1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*) AS preserved_count_after_legacy_undo_resume FROM performance_schema.preserved_transactions WHERE TOKEN = 'TOKEN';
+preserved_count_after_legacy_undo_resume
+1
+include/assert_grep.inc [Legacy no-redo undo sidecar is rejected before sidecar parse]
+SHUTDOWN;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+SELECT * FROM tmp_legacy_undo ORDER BY id;
+id	v
+1	100
+2	200
+COMMIT;
+SELECT * FROM t_temp_legacy_undo_base ORDER BY id;
+id	v
+1	11
+DROP TEMPORARY TABLE tmp_legacy_undo;
+DROP TABLE t_temp_legacy_undo_base;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_enable=ON;

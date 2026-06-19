@@ -1,0 +1,49 @@
+--echo #
+--echo # Lint-only source-shape guard. Runtime MDL privilege behavior is
+--echo # covered by resume_any_rechecks_object_privileges and related MDL MTRs.
+--echo # Every exportable MDL namespace must have an explicit privilege policy.
+--echo #
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+my $path = File::Spec->catfile($source_root, 'sql', 'preserve_trx.cc');
+
+open(my $fh, '<', $path) or die "cannot open $path: $!";
+my $src = do { local $/; <$fh> };
+close($fh);
+
+$src =~ /bool preserve_trx_recheck_mdl_object_privileges\(\s*THD \*thd,\s*const std::string &payload(?:,\s*bool [^)]*)?\).*?^}/ms
+  or die "could not isolate preserve_trx_recheck_mdl_object_privileges\n";
+my $body = $&;
+
+die "MDL privilege recheck must use an explicit namespace switch\n"
+  unless $body =~ /switch\s*\(\s*mdl_namespace\s*\)/s;
+
+my @namespaces = qw(
+  GLOBAL
+  TABLESPACE
+  SCHEMA
+  TABLE
+  COMMIT
+  FOREIGN_KEY
+  CHECK_CONSTRAINT
+  FUNCTION
+  PROCEDURE
+  TRIGGER
+);
+
+for my $namespace (@namespaces) {
+  die "MDL privilege recheck missing explicit policy for $namespace\n"
+    unless $body =~ /case\s+MDL_key::$namespace\s*:/s;
+}
+
+die "MDL privilege recheck must fail closed for unexpected namespaces\n"
+  unless $body =~ /default\s*:\s*return true\s*;/s;
+EOF

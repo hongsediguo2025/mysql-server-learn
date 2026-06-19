@@ -1,0 +1,232 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_recovery_max_count=200;
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+SET GLOBAL preserve_trx_max_modified_tables=512;
+SELECT COUNT(*) AS session_count
+FROM t_batch_long_control;
+session_count
+100
+SELECT MIN(TIMESTAMPDIFF(MICROSECOND, started_at, NOW(6))) >= 5000000
+AS all_sessions_older_than_five_seconds
+FROM t_batch_long_control;
+all_sessions_older_than_five_seconds
+1
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS;
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+100
+SELECT COUNT(*) AS preserved_state_count
+FROM performance_schema.preserved_transactions
+WHERE STATE = 'PRESERVED';
+preserved_state_count
+100
+SELECT COUNT(*) AS mapped_token_count
+FROM t_batch_long_tokens;
+mapped_token_count
+100
+SELECT COUNT(*) AS preserved_count_after_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_resume
+0
+SELECT COUNT(*) AS resume_success_count
+FROM t_batch_long_audit
+WHERE resumed_ok = 1;
+resume_success_count
+100
+SELECT COUNT(DISTINCT sid) AS resumed_distinct_sessions
+FROM t_batch_long_audit;
+resumed_distinct_sessions
+100
+SELECT MIN(lifecycle_age_us) >= 5000000 AS all_resumed_lifecycles_were_long
+FROM t_batch_long_audit;
+all_resumed_lifecycles_were_long
+1
+SELECT MIN(sql_count) >= 8 AS every_session_ran_enough_sql
+FROM t_batch_long_audit;
+every_session_ran_enough_sql
+1
+SELECT MAX(max_stmt_us) < 1000000 AS every_statement_under_one_second
+FROM t_batch_long_audit;
+every_statement_under_one_second
+1
+SELECT COUNT(*) AS audit_rows
+FROM t_batch_long_audit;
+audit_rows
+100
+SELECT COUNT(*) AS audit_control_case_mismatch_count
+FROM t_batch_long_audit a
+JOIN t_batch_long_control c USING(sid)
+WHERE a.case_id <> c.case_id;
+audit_control_case_mismatch_count
+0
+SELECT COUNT(DISTINCT detail) AS schema_cases_ok
+FROM t_batch_long_audit WHERE resumed_ok = 1;
+schema_cases_ok
+20
+SELECT detail, COUNT(*) = 5 AS ok
+FROM t_batch_long_audit GROUP BY detail ORDER BY detail;
+detail	ok
+autoinc	1
+autoinc-savepoint-light	1
+check-valid	1
+composite-pk	1
+composite-secondary	1
+fk-child-update	1
+fk-parent-child	1
+fk-restrict-safe	1
+fk-savepoint-light	1
+mixed-schema-features	1
+multiple-children	1
+parent-child-aggregate	1
+partition-insert	1
+partition-range-read	1
+partition-secondary	1
+partition-update	1
+resume-child-insert	1
+resume-parent-update	1
+unique-conflict-update	1
+unique-key	1
+SELECT COUNT(*) = 40 AS fk_same_transaction_cases_ok
+FROM t_batch_long_audit
+WHERE detail IN ('fk-parent-child',
+'fk-child-update',
+'fk-restrict-safe',
+'fk-savepoint-light',
+'multiple-children',
+'resume-parent-update',
+'resume-child-insert',
+'mixed-schema-features');
+fk_same_transaction_cases_ok
+1
+SELECT COUNT(*) = 25 AS partition_cases_ok
+FROM t_batch_long_audit
+WHERE detail IN ('partition-insert',
+'partition-update',
+'partition-range-read',
+'partition-secondary',
+'mixed-schema-features');
+partition_cases_ok
+1
+SELECT 1 AS case_id,
+(
+(SELECT COUNT(*) FROM t_schema_auto_1
+WHERE phase IN ('pre-autoinc', 'post-autoinc')) +
+(SELECT COUNT(*) FROM t_schema_auto_21
+WHERE phase IN ('pre-autoinc', 'post-autoinc')) +
+(SELECT COUNT(*) FROM t_schema_auto_41
+WHERE phase IN ('pre-autoinc', 'post-autoinc')) +
+(SELECT COUNT(*) FROM t_schema_auto_61
+WHERE phase IN ('pre-autoinc', 'post-autoinc')) +
+(SELECT COUNT(*) FROM t_schema_auto_81
+WHERE phase IN ('pre-autoinc', 'post-autoinc'))
+) = 10 AS ok
+UNION ALL SELECT 2, COUNT(*) = 5
+FROM t_schema_parent p JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 2 AND p.id = 102 AND p.note = 'unique-post'
+UNION ALL SELECT 3, COUNT(*) = 5
+FROM t_schema_parent p JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 3 AND p.id = 3 AND p.note = 'composite-pk-post'
+UNION ALL SELECT 4, COUNT(*) = 5
+FROM t_schema_parent p FORCE INDEX(uq_sid_v)
+JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 4 AND p.v = p.sid + 40000
+AND p.note = 'secondary-post'
+UNION ALL SELECT 5, COUNT(*) = 5
+FROM t_schema_child ch JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 5 AND ch.id = 105 AND ch.note = 'fk-post'
+UNION ALL SELECT 6, COUNT(*) = 5
+FROM t_schema_child ch JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 6 AND ch.id = 6 AND ch.parent_id = 26
+AND ch.note = 'fk-child-post'
+UNION ALL SELECT 7, COUNT(*) = 5
+FROM t_schema_child ch JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 7 AND ch.id = 107 AND ch.parent_id = 7
+UNION ALL SELECT 8, COUNT(*) = 5
+FROM t_schema_parent p JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 8 AND p.id = 8 AND p.v >= 0
+AND p.note = 'check-post'
+UNION ALL SELECT 9, COUNT(*) = 5
+FROM t_schema_part p JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 9 AND p.k = 109
+AND p.note = 'partition-insert-post'
+UNION ALL SELECT 10, COUNT(*) = 5
+FROM t_schema_part p JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 10 AND p.k = 10
+AND p.note = 'partition-update-post'
+UNION ALL SELECT 11, COUNT(*) = 10
+FROM t_schema_part p JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 11 AND p.k IN (11, 12)
+AND p.note IN ('partition-range-pre', 'partition-range-post')
+UNION ALL SELECT 12, COUNT(*) = 5
+FROM t_schema_parent p JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 12 AND p.id = 12 AND p.v = 144
+UNION ALL SELECT 13, COUNT(*) = 5
+FROM t_schema_parent p JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 13 AND p.id = 13 AND p.note = 'odku-post'
+UNION ALL SELECT 14, COUNT(*) = 10
+FROM (
+SELECT phase FROM t_schema_auto_14
+UNION ALL SELECT phase FROM t_schema_auto_34
+UNION ALL SELECT phase FROM t_schema_auto_54
+UNION ALL SELECT phase FROM t_schema_auto_74
+UNION ALL SELECT phase FROM t_schema_auto_94
+) a
+WHERE a.phase IN ('save-pre', 'save-post')
+UNION ALL SELECT 15, COUNT(*) = 5
+FROM t_schema_child ch JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 15 AND ch.id = 115 AND ch.note = 'fk-save-post'
+UNION ALL SELECT 16, COUNT(*) = 5
+FROM t_schema_part p FORCE INDEX(idx_sid_v)
+JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 16 AND p.v = p.sid + 16000
+AND p.note = 'partition-secondary-post'
+UNION ALL SELECT 17, COUNT(*) = 15
+FROM t_schema_child ch JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 17 AND ch.parent_id = 117
+AND ch.note LIKE 'multi-child%'
+UNION ALL SELECT 18, COUNT(*) = 5
+FROM t_schema_parent p JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 18 AND p.id = 18
+AND p.note = 'resume-parent-post'
+UNION ALL SELECT 19, COUNT(*) = 5
+FROM t_schema_child ch JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 19 AND ch.id = 119
+AND ch.note = 'resume-child-post'
+UNION ALL SELECT 20, COUNT(*) = 5
+FROM t_schema_part p JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 20 AND p.k = 120
+AND p.note = 'mixed-post'
+   AND (SELECT COUNT(*) FROM t_schema_auto_20
+WHERE phase = 'mixed-post') = 1
+AND (SELECT COUNT(*) FROM t_schema_auto_40
+WHERE phase = 'mixed-post') = 1
+AND (SELECT COUNT(*) FROM t_schema_auto_60
+WHERE phase = 'mixed-post') = 1
+AND (SELECT COUNT(*) FROM t_schema_auto_80
+WHERE phase = 'mixed-post') = 1
+AND (SELECT COUNT(*) FROM t_schema_auto_100
+WHERE phase = 'mixed-post') = 1
+ORDER BY case_id;
+case_id	ok
+1	1
+2	1
+3	1
+4	1
+5	1
+6	1
+7	1
+8	1
+9	1
+10	1
+11	1
+12	1
+13	1
+14	1
+15	1
+16	1
+17	1
+18	1
+19	1
+20	1
+SET GLOBAL preserve_trx_enable=ON;

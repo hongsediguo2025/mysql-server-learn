@@ -1,0 +1,51 @@
+DROP TABLE IF EXISTS t_preserve_token_rollback_failure;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE USER preserve_pending_intruder@localhost;
+CREATE TABLE t_preserve_token_rollback_failure(a INT PRIMARY KEY, b INT)
+ENGINE=InnoDB;
+INSERT INTO t_preserve_token_rollback_failure VALUES(1,10);
+SET SESSION debug="+d,preserve_trx_fail_token_delivery_rollback";
+SET DEBUG_SYNC =
+'preserve_trx_before_token_delivery SIGNAL before_token_rollback WAIT_FOR continue_owner';
+START TRANSACTION;
+UPDATE t_preserve_token_rollback_failure SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET DEBUG_SYNC = 'now WAIT_FOR before_token_rollback TIMEOUT 10';
+KILL CONNECTION CONN_ID;
+SET DEBUG_SYNC = 'now SIGNAL continue_owner';
+ERROR HY000: Lost connection to MySQL server during query
+SELECT * FROM t_preserve_token_rollback_failure WHERE a=1;
+a	b
+1	10
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+1
+SELECT STATE AS preserved_state
+FROM performance_schema.preserved_transactions;
+preserved_state
+FAILED
+SELECT COUNT(*) AS preserved_count_with_last_error
+FROM performance_schema.preserved_transactions
+WHERE LAST_ERROR IS NOT NULL;
+preserved_count_with_last_error
+1
+SELECT COUNT(*) AS preserved_count_with_last_error_at
+FROM performance_schema.preserved_transactions
+WHERE LAST_ERROR_AT IS NOT NULL;
+preserved_count_with_last_error_at
+1
+Occurrences of 'failed to rollback durable transaction' in the input file: 1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Access denied for preserved transaction
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+# restart: --preserve-trx-enable=ON
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ROLLBACK;
+SELECT * FROM t_preserve_token_rollback_failure WHERE a=1;
+a	b
+1	10
+DROP TABLE t_preserve_token_rollback_failure;
+DROP USER preserve_pending_intruder@localhost;
+SET GLOBAL preserve_trx_enable=ON;

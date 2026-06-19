@@ -1,0 +1,31 @@
+DROP TABLE IF EXISTS t_timeout_wallclock;
+SET GLOBAL preserve_trx_enable=ON;
+SET SESSION preserve_trx_min_timeout=1;
+SET SESSION preserve_trx_default_timeout=1;
+SET SESSION preserve_trx_max_timeout=86400;
+CREATE TABLE t_timeout_wallclock(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_timeout_wallclock VALUES(1,10);
+START TRANSACTION;
+UPDATE t_timeout_wallclock SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+SELECT @@global.preserve_trx_recovery_grace_seconds AS recovery_grace_seconds;
+recovery_grace_seconds
+30
+SELECT EXPIRES_AT IS NOT NULL AS expires_present,
+TIMESTAMPDIFF(SECOND, CREATED_AT, EXPIRES_AT) AS default_timeout_seconds,
+RECOVERED_COUNT AS recovered_count_during_grace
+FROM performance_schema.preserved_transactions;
+expires_present	default_timeout_seconds	recovered_count_during_grace
+1	1	1
+# restart: --preserve-trx-enable=ON --preserve-trx-recovery-grace-seconds=30
+include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: recovery timeout expired]
+SELECT TOKEN, STATE, LAST_ERROR
+FROM performance_schema.preserved_transactions;
+TOKEN	STATE	LAST_ERROR
+TOKEN	FAILED	recovery timeout expired
+SELECT * FROM t_timeout_wallclock ORDER BY a;
+a	b
+1	10
+DROP TABLE t_timeout_wallclock;
+SET GLOBAL preserve_trx_enable=ON;
+# restart: --preserve-trx-enable=OFF --skip-log-bin

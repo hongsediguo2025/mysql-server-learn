@@ -1,0 +1,52 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_resume_user_vars_failure;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_resume_user_vars_failure(id INT PRIMARY KEY, v INT)
+  ENGINE=InnoDB;
+
+SET @batch_user_var = 'restored-value';
+START TRANSACTION;
+INSERT INTO t_resume_user_vars_failure VALUES(1,10);
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300 WITH USER VARS;
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+SET @batch_user_var = 'preexisting-value';
+SET @unrelated_user_var = 'keep-me';
+SET SESSION debug="+d,preserve_trx_fail_resume_before_attach";
+--replace_result $preserved_token TOKEN
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+SET SESSION debug="-d,preserve_trx_fail_resume_before_attach";
+
+SELECT @batch_user_var AS user_var_after_failed_resume,
+       @unrelated_user_var AS unrelated_after_failed_resume;
+
+SELECT COUNT(*) AS preserved_count_after_failed_resume
+  FROM performance_schema.preserved_transactions;
+--file_exists $PRESERVED_SNAPSHOT_FILE
+
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+SELECT @batch_user_var AS user_var_after_resume;
+COMMIT;
+
+SELECT * FROM t_resume_user_vars_failure ORDER BY id;
+
+DROP TABLE t_resume_user_vars_failure;
+SET GLOBAL preserve_trx_enable=ON;

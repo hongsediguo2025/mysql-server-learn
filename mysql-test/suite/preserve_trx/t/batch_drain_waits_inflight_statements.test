@@ -1,0 +1,133 @@
+--source include/have_debug_sync.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_batch_inflight;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_batch_inflight(
+  id INT PRIMARY KEY,
+  v INT,
+  tag VARCHAR(32),
+  resumed_by INT DEFAULT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO t_batch_inflight VALUES
+  (1,10,'base-a',NULL),
+  (2,20,'base-b',NULL);
+
+--connect(batch_inflight_a,localhost,root,,test)
+--connection batch_inflight_a
+START TRANSACTION;
+UPDATE t_batch_inflight SET v=11, tag='a-first' WHERE id=1;
+SET DEBUG_SYNC =
+  'before_execute_sql_command SIGNAL batch_inflight_a_blocked WAIT_FOR continue_batch_inflight_a';
+--send UPDATE t_batch_inflight SET v=12, tag='a-inflight' WHERE id=1
+
+--connect(batch_inflight_b,localhost,root,,test)
+--connection batch_inflight_b
+SET DEBUG_SYNC =
+  'before_execute_sql_command SIGNAL batch_inflight_b_blocked WAIT_FOR continue_batch_inflight_b';
+--send UPDATE t_batch_inflight SET v=22, tag='b-autocommit' WHERE id=2
+
+--connect(batch_inflight_c,localhost,root,,test)
+--connection batch_inflight_c
+START TRANSACTION;
+INSERT INTO t_batch_inflight VALUES(3,30,'c-idle',NULL);
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR batch_inflight_a_blocked TIMEOUT 10';
+SET DEBUG_SYNC = 'now WAIT_FOR batch_inflight_b_blocked TIMEOUT 10';
+SET GLOBAL preserve_trx_batch_max_transactions=2;
+
+--connect(batch_inflight_owner,localhost,root,,test)
+--connection batch_inflight_owner
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now SIGNAL continue_batch_inflight_a';
+SET DEBUG_SYNC = 'now SIGNAL continue_batch_inflight_b';
+
+--connection batch_inflight_a
+--reap
+--disconnect batch_inflight_a
+
+--connection batch_inflight_b
+--reap
+--disconnect batch_inflight_b
+
+--connection batch_inflight_owner
+--reap
+--disconnect batch_inflight_owner
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+CREATE TEMPORARY TABLE t_batch_inflight_tokens AS
+SELECT ROW_NUMBER() OVER (ORDER BY TOKEN) AS rn, TOKEN
+  FROM performance_schema.preserved_transactions;
+
+SELECT COUNT(*) AS token_count
+  FROM t_batch_inflight_tokens;
+
+--let $token1= `SELECT TOKEN FROM t_batch_inflight_tokens WHERE rn = 1`
+--let $token2= `SELECT TOKEN FROM t_batch_inflight_tokens WHERE rn = 2`
+
+--disable_query_log
+--disable_result_log
+--connect(batch_inflight_resume1,localhost,root,,test)
+--connection batch_inflight_resume1
+--eval RESUME PRESERVED TRANSACTION '$token1'
+SET @batch_inflight_resume_id = NULL;
+SELECT id INTO @batch_inflight_resume_id
+  FROM t_batch_inflight
+  WHERE tag IN ('a-inflight','c-idle') AND resumed_by IS NULL
+  LIMIT 1;
+UPDATE t_batch_inflight
+  SET v=v+1000, resumed_by=1
+  WHERE id=@batch_inflight_resume_id;
+COMMIT;
+
+--connect(batch_inflight_resume2,localhost,root,,test)
+--connection batch_inflight_resume2
+--eval RESUME PRESERVED TRANSACTION '$token2'
+SET @batch_inflight_resume_id = NULL;
+SELECT id INTO @batch_inflight_resume_id
+  FROM t_batch_inflight
+  WHERE tag IN ('a-inflight','c-idle') AND resumed_by IS NULL
+  LIMIT 1;
+UPDATE t_batch_inflight
+  SET v=v+1000, resumed_by=2
+  WHERE id=@batch_inflight_resume_id;
+COMMIT;
+
+--disconnect batch_inflight_resume1
+--disconnect batch_inflight_resume2
+--connection default
+--enable_result_log
+--enable_query_log
+
+SELECT COUNT(*) AS preserved_count_after_resume
+  FROM performance_schema.preserved_transactions;
+
+SELECT COUNT(*) AS row_count,
+       SUM(tag='a-inflight' AND v=1012 AND resumed_by IS NOT NULL) AS a_resumed,
+       SUM(tag='b-autocommit' AND v=22 AND resumed_by IS NULL) AS b_committed,
+       SUM(tag='c-idle' AND v=1030 AND resumed_by IS NOT NULL) AS c_resumed,
+       COUNT(DISTINCT resumed_by) AS resume_sessions
+  FROM t_batch_inflight;
+
+DROP TABLE t_batch_inflight;
+SET GLOBAL preserve_trx_enable=ON;

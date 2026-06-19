@@ -1,0 +1,67 @@
+--source include/have_debug_sync.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_concurrent_resume_race;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_concurrent_resume_race(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_concurrent_resume_race VALUES(1, 10);
+
+START TRANSACTION;
+UPDATE t_concurrent_resume_race SET v = 11 WHERE id = 1;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--connect(resume_owner,localhost,root,,test)
+--connection resume_owner
+SET DEBUG_SYNC =
+  'preserve_trx_after_resume_failure_record_readd_with_error SIGNAL resume_record_readded WAIT_FOR continue_resume_restore';
+SET SESSION debug="+d,preserve_trx_fail_resume_set_isolation";
+--replace_result $preserved_token TOKEN
+--send_eval RESUME PRESERVED TRANSACTION '$preserved_token'
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR resume_record_readded TIMEOUT 10';
+
+--replace_result $preserved_token TOKEN
+--eval SELECT COUNT(*) AS clean_preserved_records FROM performance_schema.preserved_transactions WHERE TOKEN = '$preserved_token' AND STATE = 'PRESERVED' AND LAST_ERROR IS NULL
+
+--replace_result $preserved_token TOKEN
+--eval SELECT COUNT(*) AS preserved_error_records FROM performance_schema.preserved_transactions WHERE TOKEN = '$preserved_token' AND STATE = 'PRESERVED' AND LAST_ERROR IS NOT NULL
+
+SET DEBUG_SYNC = 'now SIGNAL continue_resume_restore';
+
+--connection resume_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+SET DEBUG_SYNC = 'RESET';
+--disconnect resume_owner
+
+--connection default
+--replace_result $preserved_token TOKEN
+--eval SELECT COUNT(*) AS clean_preserved_records FROM performance_schema.preserved_transactions WHERE TOKEN = '$preserved_token' AND STATE = 'PRESERVED' AND LAST_ERROR IS NULL
+
+--replace_result $preserved_token TOKEN
+--eval SELECT COUNT(*) AS preserved_error_records FROM performance_schema.preserved_transactions WHERE TOKEN = '$preserved_token' AND STATE = 'PRESERVED' AND LAST_ERROR IS NOT NULL
+
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+
+COMMIT;
+SELECT * FROM t_concurrent_resume_race ORDER BY id;
+
+DROP TABLE t_concurrent_resume_race;
+SET GLOBAL preserve_trx_enable=ON;
+SET DEBUG_SYNC = 'RESET';

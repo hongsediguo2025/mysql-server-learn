@@ -1,0 +1,68 @@
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_warmcopy_abandon;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+
+CREATE TABLE t_warmcopy_abandon(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_warmcopy_abandon VALUES(1,10),(2,20);
+
+--connect(warmcopy_abandon_keep, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_warmcopy_abandon SET v=11 WHERE id=1;
+
+--connect(warmcopy_abandon_commit, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_warmcopy_abandon SET v=21 WHERE id=2;
+
+--connect(warmcopy_abandon_owner, localhost, root,,test)
+--connection warmcopy_abandon_owner
+SET DEBUG_SYNC =
+  'preserve_trx_warmcopy_after_descriptor_hwm SIGNAL warmcopy_abandon_hwm WAIT_FOR warmcopy_abandon_continue';
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_abandon_hwm TIMEOUT 10';
+--connection warmcopy_abandon_commit
+COMMIT;
+SET DEBUG_SYNC = 'now SIGNAL warmcopy_abandon_continue';
+
+--connection warmcopy_abandon_owner
+--reap
+--disconnect warmcopy_abandon_owner
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+COMMIT;
+--disconnect warmcopy_abandon_keep
+--disconnect warmcopy_abandon_commit
+
+--connection default
+SELECT * FROM t_warmcopy_abandon ORDER BY id;
+SELECT COUNT(*) AS preserved_count_after_resume
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_snapshot_file.inc
+
+DROP TABLE t_warmcopy_abandon;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET DEBUG_SYNC = 'RESET';

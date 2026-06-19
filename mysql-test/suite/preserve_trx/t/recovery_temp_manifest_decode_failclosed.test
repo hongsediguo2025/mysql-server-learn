@@ -1,0 +1,59 @@
+--source include/not_windows.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+--disable_query_log
+CALL mtr.add_suppression("Preserved transaction .* recovery failed: corrupt temporary table manifest");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: corrupt temporary table manifest");
+CALL mtr.add_suppression("Preserved transaction .* recovery deferred cleanup: corrupt temporary table manifest");
+CALL mtr.add_suppression("Preserved transaction .* recovery deferred cleanup: corrupt durable transaction snapshot");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot");
+--enable_query_log
+
+SET GLOBAL preserve_trx_enable=ON;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source include/wait_until_disconnected.inc
+
+--let TEMP_SNAPSHOT_TOKEN= corrupt_temp_manifest
+--let TEMP_SNAPSHOT_SPACE_ID= 4243767315
+--let TEMP_SNAPSHOT_CORRUPT_IMAGE= 0
+--let TEMP_SNAPSHOT_INCLUDE_UNDO= 0
+--let TEMP_SNAPSHOT_CORRUPT_MANIFEST= 1
+--source suite/preserve_trx/include/write_temp_table_preserved_snapshot.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count_after_corrupt_temp_manifest
+  FROM performance_schema.preserved_transactions;
+
+--let $assert_text= Corrupt temp manifest is reported as a corrupt snapshot
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_select= corrupt durable transaction snapshot
+--let $assert_count_condition= >= 1
+--source include/assert_grep.inc
+--let $assert_count_condition=
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
+my $preserve_dir = File::Spec->catdir($datadir, 'preserve');
+for my $name (
+  'corrupt_temp_manifest.bin',
+  'corrupt_temp_manifest.tempts.4243767315.image') {
+  my $path = File::Spec->catfile($preserve_dir, $name);
+  die "unexpected preserved temp artifact remains: $path" if -e $path;
+}
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

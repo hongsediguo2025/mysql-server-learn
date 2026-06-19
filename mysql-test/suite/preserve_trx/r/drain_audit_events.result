@@ -1,0 +1,25 @@
+SET GLOBAL preserve_trx_enable=ON;
+INSTALL PLUGIN null_audit SONAME 'adt_null.so';
+SET @expected_drain_audit=CONCAT(
+'MYSQL_AUDIT_MESSAGE_INTERNAL;component="mysqld" producer="preserve_trx" ',
+'message="preserved_transaction_control" ',
+'key[0]="action" value[0]="drain" ',
+'key[1]="result" value[1]="success" ',
+'key[2]="target_count" value[2]=0 ',
+'key[3]="token_count" value[3]=0;;');
+SET @@null_audit_event_order_check_exact=0;
+SET @@null_audit_event_order_check=@expected_drain_audit;
+SET @@null_audit_event_record_def='MYSQL_AUDIT_MESSAGE_INTERNAL;MYSQL_AUDIT_QUERY_STATUS_END';
+SET SESSION debug='+d,preserve_trx_drain_skip_shutdown_after_audit_no_targets';
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET SESSION debug='-d,preserve_trx_drain_skip_shutdown_after_audit_no_targets';
+SELECT @@null_audit_event_order_check;
+@@null_audit_event_order_check
+EVENT-ORDER-OK
+SELECT @@null_audit_event_record LIKE
+'%message="preserved_transaction_control" key[0]="action" value[0]="drain"%'
+       AS drain_audit_recorded;
+drain_audit_recorded
+1
+UNINSTALL PLUGIN null_audit;
+SET GLOBAL preserve_trx_enable=ON;

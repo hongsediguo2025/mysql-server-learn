@@ -1,0 +1,429 @@
+--source include/big_test.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $setup_file = File::Spec->catfile($vardir, 'tmp',
+                                     'batch_long_locking_setup.inc');
+my $apps_file = File::Spec->catfile($vardir, 'tmp',
+                                    'batch_long_locking_apps.inc');
+my $post_apps_file = File::Spec->catfile($vardir, 'tmp',
+                                         'batch_long_locking_post_apps.inc');
+my $pre_resume_file = File::Spec->catfile($vardir, 'tmp',
+                                          'batch_long_locking_pre_resume.inc');
+my $cleanup_file = File::Spec->catfile($vardir, 'tmp',
+                                       'batch_long_locking_cleanup.inc');
+my $verify_file = File::Spec->catfile($vardir, 'tmp',
+                                      'batch_long_locking_verify.inc');
+
+open(my $setup, '>', $setup_file)
+  or die "cannot open $setup_file for write: $!";
+open(my $apps, '>', $apps_file)
+  or die "cannot open $apps_file for write: $!";
+open(my $post_apps, '>', $post_apps_file)
+  or die "cannot open $post_apps_file for write: $!";
+open(my $pre_resume, '>', $pre_resume_file)
+  or die "cannot open $pre_resume_file for write: $!";
+open(my $cleanup, '>', $cleanup_file)
+  or die "cannot open $cleanup_file for write: $!";
+open(my $verify, '>', $verify_file)
+  or die "cannot open $verify_file for write: $!";
+
+print $cleanup "DROP PROCEDURE IF EXISTS p_batch_long_finalize;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_long_tokens;\n";
+print $cleanup "DROP TABLE IF EXISTS t_lock_release_audit;\n";
+print $cleanup "DROP TABLE IF EXISTS t_lock_conflict_audit;\n";
+print $cleanup "DROP TABLE IF EXISTS t_lock_base;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_long_audit;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_long_control;\n";
+
+print $setup "CREATE TABLE t_batch_long_control(" .
+             "sid INT PRIMARY KEY, " .
+             "case_id INT NOT NULL, " .
+             "started_at DATETIME(6) NOT NULL" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_batch_long_audit(" .
+             "sid INT PRIMARY KEY, " .
+             "case_id INT NOT NULL, " .
+             "lifecycle_age_us BIGINT UNSIGNED NOT NULL, " .
+             "max_stmt_us BIGINT UNSIGNED NOT NULL, " .
+             "sql_count INT UNSIGNED NOT NULL, " .
+             "resumed_ok TINYINT NOT NULL, " .
+             "detail VARCHAR(255) NOT NULL" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_batch_long_tokens(" .
+             "token_id INT PRIMARY KEY AUTO_INCREMENT, " .
+             "token VARCHAR(255) NOT NULL UNIQUE" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_lock_base(" .
+             "sid INT NOT NULL, " .
+             "k INT NOT NULL, " .
+             "u INT NOT NULL, " .
+             "v INT NOT NULL, " .
+             "pad VARCHAR(64), " .
+             "PRIMARY KEY(sid, k), " .
+             "UNIQUE KEY uq_sid_u(sid, u), " .
+             "KEY idx_sid_v(sid, v), " .
+             "KEY idx_sid_pad(sid, pad)" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_lock_conflict_audit(" .
+             "sid INT PRIMARY KEY, " .
+             "case_id INT NOT NULL, " .
+             "ok TINYINT NOT NULL" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_lock_release_audit(" .
+             "sid INT PRIMARY KEY, " .
+             "case_id INT NOT NULL, " .
+             "ok TINYINT NOT NULL" .
+             ") ENGINE=InnoDB;\n";
+
+my @keys = (0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 101, 102,
+            110, 111, 112, 120, 121, 130, 140, 150, 170, 180, 181,
+            190, 200, 9000);
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  print $setup "INSERT INTO t_batch_long_control " .
+               "VALUES($sid, $case_id, TIMESTAMP'2000-01-01 00:00:00.000000');\n";
+  for my $k (@keys) {
+    my $u = $sid * 10000 + $k;
+    my $v = $sid * 1000 + $k;
+    my $pad = sprintf("p%03d-%04d", $sid, $k);
+    print $setup "INSERT INTO t_lock_base " .
+                 "VALUES($sid, $k, $u, $v, '$pad');\n";
+  }
+}
+
+print $setup "DELIMITER |;\n";
+print $setup "CREATE PROCEDURE p_batch_long_finalize()\n";
+print $setup "BEGIN\n";
+print $setup "  DECLARE semantic_ok BOOL DEFAULT FALSE;\n";
+print $setup "  IF \@batch_long_sid IS NULL OR \@batch_long_case_id IS NULL THEN\n";
+print $setup "    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'missing restored batch long user vars';\n";
+print $setup "  END IF;\n";
+print $setup "  SELECT CASE \@batch_long_case_id\n";
+print $setup "    WHEN 1 THEN (SELECT COUNT(*) = 1 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 10 AND v = sid * 1000 + 110)\n";
+print $setup "    WHEN 2 THEN (SELECT COUNT(*) = 1 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 20 AND v = sid * 1000 + 20)\n";
+print $setup "    WHEN 3 THEN (SELECT COUNT(*) = 1 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 30)\n";
+print $setup "    WHEN 4 THEN (SELECT COUNT(*) = 1 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 50)\n";
+print $setup "    WHEN 5 THEN (SELECT COUNT(*) = 0 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 65)\n";
+print $setup "    WHEN 6 THEN (SELECT COUNT(*) = 1 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 70)\n";
+print $setup "    WHEN 7 THEN (SELECT COUNT(*) = 1 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 80)\n";
+print $setup "    WHEN 8 THEN (SELECT COUNT(*) = 1 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 90)\n";
+print $setup "    WHEN 9 THEN (SELECT COUNT(*) = 3 FROM t_lock_base WHERE sid = \@batch_long_sid AND k BETWEEN 100 AND 102)\n";
+print $setup "    WHEN 10 THEN (SELECT COUNT(*) = 1 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 110)\n";
+print $setup "    WHEN 11 THEN (SELECT COUNT(*) = 1 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 120 AND v = sid * 1000 + 1220)\n";
+print $setup "    WHEN 12 THEN (SELECT COUNT(*) = 1 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 9000 AND v = sid * 1000 + 10200)\n";
+print $setup "    WHEN 13 THEN (SELECT COUNT(*) = 0 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 135)\n";
+print $setup "    WHEN 14 THEN (SELECT COUNT(*) = 1 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 140 AND v = sid * 1000 + 1540)\n";
+print $setup "    WHEN 15 THEN (SELECT COUNT(*) = 0 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 150)\n";
+print $setup "    WHEN 16 THEN (SELECT COUNT(*) = 1 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 1600 AND pad = 'unique-lock')\n";
+print $setup "    WHEN 17 THEN (SELECT COUNT(*) = 0 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 175)\n";
+print $setup "    WHEN 18 THEN (SELECT COUNT(*) = 1 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 180 AND v = sid * 1000 + 1980)\n";
+print $setup "    WHEN 19 THEN (SELECT COUNT(*) = 1 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 190 AND v = sid * 1000 + 2090)\n";
+print $setup "    WHEN 20 THEN (SELECT COUNT(*) = 1 FROM t_lock_base WHERE sid = \@batch_long_sid AND k = 200 AND v = sid * 1000 + 2200)\n";
+print $setup "    ELSE FALSE\n";
+print $setup "  END INTO semantic_ok;\n";
+print $setup "  IF NOT COALESCE(semantic_ok, FALSE) THEN\n";
+print $setup "    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'post-resume locking semantic check failed';\n";
+print $setup "  END IF;\n";
+print $setup "  IF \@batch_long_case_id = 20 THEN\n";
+print $setup "    ROLLBACK;\n";
+print $setup "    SET \@batch_long_end_action = 'NONE';\n";
+print $setup "  ELSE\n";
+print $setup "    SET \@batch_long_end_action = 'COMMIT';\n";
+print $setup "  END IF;\n";
+print $setup "  INSERT INTO t_batch_long_audit VALUES(\n";
+print $setup "    \@batch_long_sid,\n";
+print $setup "    \@batch_long_case_id,\n";
+print $setup "    TIMESTAMPDIFF(MICROSECOND, \@batch_long_started_at, NOW(6)),\n";
+print $setup "    \@batch_long_max_stmt_us,\n";
+print $setup "    \@batch_long_sql_count,\n";
+print $setup "    1,\n";
+print $setup "    CONCAT('locking-case-', \@batch_long_case_id));\n";
+print $setup "END|\n";
+print $setup "DELIMITER ;|\n";
+
+sub emit_measured {
+  my ($fh, $sql) = @_;
+  print $fh "SET \@batch_long_stmt_start = NOW(6);\n";
+  print $fh "$sql;\n";
+  print $fh "SET \@batch_long_stmt_us = " .
+            "TIMESTAMPDIFF(MICROSECOND, \@batch_long_stmt_start, NOW(6));\n";
+  print $fh "SET \@batch_long_max_stmt_us = " .
+            "GREATEST(\@batch_long_max_stmt_us, \@batch_long_stmt_us);\n";
+  print $fh "SET \@batch_long_sql_count = \@batch_long_sql_count + 1;\n";
+}
+
+sub emit_app_case {
+  my ($fh, $sid, $case_id) = @_;
+  if ($case_id == 1) {
+    emit_measured($fh, "UPDATE t_lock_base SET v = v + 100 WHERE sid = $sid AND k = 10");
+  } elsif ($case_id == 2) {
+    emit_measured($fh, "SELECT v FROM t_lock_base FORCE INDEX(idx_sid_v) WHERE sid = $sid AND v = " . ($sid * 1000 + 20) . " FOR UPDATE");
+  } elsif ($case_id == 3) {
+    emit_measured($fh, "SELECT * FROM t_lock_base WHERE sid = $sid AND k = 30 FOR UPDATE");
+  } elsif ($case_id == 4) {
+    emit_measured($fh, "SELECT * FROM t_lock_base WHERE sid = $sid AND k > 40 AND k <= 50 FOR UPDATE");
+  } elsif ($case_id == 5) {
+    emit_measured($fh, "SELECT * FROM t_lock_base WHERE sid = $sid AND k > 60 AND k < 70 FOR UPDATE");
+  } elsif ($case_id == 6) {
+    emit_measured($fh, "SELECT * FROM t_lock_base WHERE sid = $sid AND k = 70 FOR SHARE");
+  } elsif ($case_id == 7) {
+    emit_measured($fh, "SELECT v FROM t_lock_base FORCE INDEX(idx_sid_v) WHERE sid = $sid AND v = " . ($sid * 1000 + 80) . " FOR UPDATE");
+  } elsif ($case_id == 8) {
+    emit_measured($fh, "SELECT pad FROM t_lock_base FORCE INDEX(idx_sid_v) WHERE sid = $sid AND v = " . ($sid * 1000 + 90) . " FOR UPDATE");
+  } elsif ($case_id == 9) {
+    emit_measured($fh, "SELECT * FROM t_lock_base WHERE sid = $sid AND k BETWEEN 100 AND 102 ORDER BY v DESC, k DESC FOR UPDATE");
+  } elsif ($case_id == 10) {
+    emit_measured($fh, "SELECT * FROM t_lock_base WHERE sid = $sid AND k BETWEEN 110 AND 112 ORDER BY k LIMIT 1 FOR UPDATE");
+  } elsif ($case_id == 11) {
+    emit_measured($fh, "UPDATE t_lock_base SET v = v + 1100 WHERE sid = $sid AND k = 120");
+  } elsif ($case_id == 12) {
+    emit_measured($fh, "UPDATE t_lock_base SET v = v + 1200 WHERE sid = $sid AND k = 9000");
+  } elsif ($case_id == 13) {
+    emit_measured($fh, "SELECT * FROM t_lock_base WHERE sid = $sid AND k > 130 AND k < 140 FOR UPDATE");
+  } elsif ($case_id == 14) {
+    emit_measured($fh, "UPDATE t_lock_base SET v = v + 1400 WHERE sid = $sid AND k = 140");
+  } elsif ($case_id == 15) {
+    emit_measured($fh, "DELETE FROM t_lock_base WHERE sid = $sid AND k = 150");
+  } elsif ($case_id == 16) {
+    emit_measured($fh, "INSERT INTO t_lock_base VALUES($sid, 1600, " . ($sid * 10000 + 1600) . ", 1600, 'unique-lock')");
+  } elsif ($case_id == 17) {
+    emit_measured($fh, "SELECT * FROM t_lock_base FORCE INDEX(idx_sid_pad) WHERE sid = $sid AND pad >= 'p" . sprintf("%03d", $sid) . "-0130' AND pad < 'p" . sprintf("%03d", $sid) . "-0140' FOR UPDATE");
+  } elsif ($case_id == 18) {
+    emit_measured($fh, "UPDATE t_lock_base SET v = v + 1800 WHERE sid = $sid AND k = 180");
+    emit_measured($fh, "SELECT * FROM t_lock_base WHERE sid = $sid AND k = 181 FOR UPDATE");
+  } elsif ($case_id == 19) {
+    emit_measured($fh, "UPDATE t_lock_base SET v = v + 1900 WHERE sid = $sid AND k = 190");
+  } elsif ($case_id == 20) {
+    emit_measured($fh, "UPDATE t_lock_base SET v = v + 2000 WHERE sid = $sid AND k = 200");
+  }
+}
+
+sub emit_expected_conflict {
+  my ($fh, $sid, $case_id) = @_;
+  if ($case_id == 14) {
+    print $fh "SET SESSION lock_wait_timeout=1;\n";
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "LOCK TABLES t_lock_base WRITE;\n";
+    return;
+  }
+
+  print $fh "SET SESSION innodb_lock_wait_timeout=1;\n";
+  if ($case_id == 1) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 10;\n";
+  } elsif ($case_id == 2) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND v = " . ($sid * 1000 + 20) . ";\n";
+  } elsif ($case_id == 3) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 30;\n";
+  } elsif ($case_id == 4) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "INSERT INTO t_lock_base VALUES($sid, 45, " . ($sid * 10000 + 45) . ", 45, 'gap45');\n";
+  } elsif ($case_id == 5) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "INSERT INTO t_lock_base VALUES($sid, 65, " . ($sid * 10000 + 65) . ", 65, 'gap65');\n";
+  } elsif ($case_id == 6) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 70;\n";
+  } elsif ($case_id == 7) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND v = " . ($sid * 1000 + 80) . ";\n";
+  } elsif ($case_id == 8) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND v = " . ($sid * 1000 + 90) . ";\n";
+  } elsif ($case_id == 9) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 102;\n";
+  } elsif ($case_id == 10) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 110;\n";
+  } elsif ($case_id == 11) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 120;\n";
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 121;\n";
+  } elsif ($case_id == 12) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 9000;\n";
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 12;\n";
+  } elsif ($case_id == 13) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "INSERT INTO t_lock_base VALUES($sid, 135, " . ($sid * 10000 + 135) . ", 135, 'gap135');\n";
+  } elsif ($case_id == 15) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "INSERT INTO t_lock_base VALUES($sid, 150, " . ($sid * 10000 + 150) . ", 150, 'delete-mark');\n";
+  } elsif ($case_id == 16) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "INSERT INTO t_lock_base VALUES($sid, 1601, " . ($sid * 10000 + 1600) . ", 1601, 'unique-wait');\n";
+  } elsif ($case_id == 17) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "INSERT INTO t_lock_base VALUES($sid, 175, " . ($sid * 10000 + 175) . ", 175, 'p" . sprintf("%03d", $sid) . "-0135');\n";
+  } elsif ($case_id == 18) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 181;\n";
+  } elsif ($case_id == 19) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 190;\n";
+  } elsif ($case_id == 20) {
+    print $fh "--error ER_LOCK_WAIT_TIMEOUT\n";
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 200;\n";
+  }
+}
+
+sub emit_release_check {
+  my ($fh, $sid, $case_id) = @_;
+  if ($case_id == 1) {
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 10;\n";
+  } elsif ($case_id == 2) {
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 20;\n";
+  } elsif ($case_id == 3) {
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 30;\n";
+  } elsif ($case_id == 4) {
+    print $fh "INSERT INTO t_lock_base VALUES($sid, 45, " . ($sid * 10000 + 45) . ", 45, 'released45');\n";
+  } elsif ($case_id == 5) {
+    print $fh "INSERT INTO t_lock_base VALUES($sid, 65, " . ($sid * 10000 + 65) . ", 65, 'released65');\n";
+  } elsif ($case_id == 6) {
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 70;\n";
+  } elsif ($case_id == 7) {
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 80;\n";
+  } elsif ($case_id == 8) {
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 90;\n";
+  } elsif ($case_id == 9) {
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 102;\n";
+  } elsif ($case_id == 10) {
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 110;\n";
+  } elsif ($case_id == 11) {
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 120;\n";
+  } elsif ($case_id == 12) {
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 9000;\n";
+  } elsif ($case_id == 13) {
+    print $fh "INSERT INTO t_lock_base VALUES($sid, 135, " . ($sid * 10000 + 135) . ", 135, 'released135');\n";
+  } elsif ($case_id == 14) {
+    print $fh "LOCK TABLES t_lock_base WRITE;\n";
+    print $fh "UNLOCK TABLES;\n";
+  } elsif ($case_id == 15) {
+    print $fh "INSERT INTO t_lock_base VALUES($sid, 150, " . ($sid * 10000 + 150) . ", 150, 'released-delete');\n";
+  } elsif ($case_id == 16) {
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 1600;\n";
+  } elsif ($case_id == 17) {
+    print $fh "INSERT INTO t_lock_base VALUES($sid, 175, " . ($sid * 10000 + 175) . ", 175, 'p" . sprintf("%03d", $sid) . "-0135');\n";
+  } elsif ($case_id == 18) {
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 181;\n";
+  } elsif ($case_id == 19) {
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 190;\n";
+  } elsif ($case_id == 20) {
+    print $fh "--let \$batch_lock_release_ok= `SELECT COUNT(*) = 1 FROM t_lock_base WHERE sid = $sid AND k = 200 AND v = " . ($sid * 1000 + 200) . "`\n";
+    print $fh "if (!\$batch_lock_release_ok)\n";
+    print $fh "{\n";
+    print $fh "  --die post-resume rollback semantic check failed\n";
+    print $fh "}\n";
+    print $fh "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 200;\n";
+    print $fh "--let \$batch_lock_release_ok= `SELECT COUNT(*) = 1 FROM t_lock_base WHERE sid = $sid AND k = 200 AND v = " . ($sid * 1000 + 201) . "`\n";
+    print $fh "if (!\$batch_lock_release_ok)\n";
+    print $fh "{\n";
+    print $fh "  --die post-resume release update check failed\n";
+    print $fh "}\n";
+  }
+  print $fh "INSERT INTO t_lock_release_audit VALUES($sid, $case_id, 1);\n";
+}
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  my $name = sprintf("batch_long_app_%03d", $sid);
+  print $apps "--connect($name,localhost,root,,test)\n";
+  print $apps "--connection $name\n";
+  print $apps "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;\n";
+  print $apps "UPDATE t_batch_long_control SET started_at = NOW(6) WHERE sid = $sid;\n";
+  print $apps "SET \@batch_long_sid = $sid;\n";
+  print $apps "SET \@batch_long_case_id = $case_id;\n";
+  print $apps "SET \@batch_long_started_at = " .
+              "(SELECT started_at FROM t_batch_long_control WHERE sid = $sid);\n";
+  print $apps "SET \@batch_long_max_stmt_us = 0;\n";
+  print $apps "SET \@batch_long_sql_count = 0;\n";
+  print $apps "SET \@batch_long_end_action = 'COMMIT';\n";
+  print $apps "START TRANSACTION;\n";
+  emit_measured($apps, "UPDATE t_lock_base SET v = v + 1 WHERE sid = $sid AND k = 0");
+  emit_app_case($apps, $sid, $case_id);
+}
+print $apps "--connection default\n";
+
+for my $round (1 .. 80) {
+  for my $sid (1 .. 100) {
+    my $name = sprintf("batch_long_app_%03d", $sid);
+    print $post_apps "--connection $name\n";
+    emit_measured($post_apps, "SELECT COUNT(*) >= 1 INTO \@batch_lock_heartbeat_ok FROM t_lock_base WHERE sid = $sid AND k = 0");
+  }
+}
+print $post_apps "--connection default\n";
+
+print $pre_resume "--disable_query_log\n";
+print $pre_resume "--disable_result_log\n";
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  my $name = sprintf("batch_long_lock_writer_%03d", $sid);
+  print $pre_resume "--connect($name,localhost,root,,test)\n";
+  print $pre_resume "--connection $name\n";
+  emit_expected_conflict($pre_resume, $sid, $case_id);
+  print $pre_resume "INSERT INTO t_lock_conflict_audit VALUES($sid, $case_id, 1);\n";
+  print $pre_resume "--disconnect $name\n";
+}
+print $pre_resume "--connection default\n";
+print $pre_resume "--enable_result_log\n";
+print $pre_resume "--enable_query_log\n";
+print $pre_resume "SELECT COUNT(*) AS lock_conflicts_before_resume\n";
+print $pre_resume "  FROM t_lock_conflict_audit WHERE ok = 1;\n";
+print $pre_resume "SELECT case_id, COUNT(*) = 5 AS conflict_case_ok\n";
+print $pre_resume "  FROM t_lock_conflict_audit GROUP BY case_id ORDER BY case_id;\n";
+
+print $verify "--disable_query_log\n";
+print $verify "--disable_result_log\n";
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  emit_release_check($verify, $sid, $case_id);
+}
+print $verify "--enable_result_log\n";
+print $verify "--enable_query_log\n";
+print $verify "SELECT COUNT(*) AS lock_release_checks_after_resume\n";
+print $verify "  FROM t_lock_release_audit WHERE ok = 1;\n";
+print $verify "SELECT case_id, COUNT(*) = 5 AS release_case_ok\n";
+print $verify "  FROM t_lock_release_audit GROUP BY case_id ORDER BY case_id;\n";
+
+close($setup);
+close($apps);
+close($post_apps);
+close($pre_resume);
+close($cleanup);
+close($verify);
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+SET GLOBAL preserve_trx_recovery_max_count=200;
+--let $old_preserve_trx_drain_grace_ms= `SELECT @@GLOBAL.preserve_trx_drain_grace_ms`
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+
+--let $batch_long_prefix= batch_long_locking
+--let $batch_long_setup_file= $MYSQLTEST_VARDIR/tmp/batch_long_locking_setup.inc
+--let $batch_long_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_locking_apps.inc
+--let $batch_long_post_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_locking_post_apps.inc
+--let $batch_long_pre_resume_file= $MYSQLTEST_VARDIR/tmp/batch_long_locking_pre_resume.inc
+--let $batch_long_cleanup_file= $MYSQLTEST_VARDIR/tmp/batch_long_locking_cleanup.inc
+--let $batch_long_resume_file= $MYSQLTEST_VARDIR/tmp/batch_long_locking_resume.inc
+--let $batch_long_verify_file= $MYSQLTEST_VARDIR/tmp/batch_long_locking_verify.inc
+--source suite/preserve_trx/include/batch_drain_100_long_common.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+--disable_query_log
+--disable_result_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_drain_grace_ms=$old_preserve_trx_drain_grace_ms
+--enable_result_log
+--enable_query_log

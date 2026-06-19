@@ -236,6 +236,9 @@ struct System_variables {
   ulong max_sp_recursion_depth;
   ulong default_week_format;
   ulong max_seeks_for_key;
+  uint preserve_trx_default_timeout;
+  uint preserve_trx_min_timeout;
+  uint preserve_trx_max_timeout;
   ulong range_alloc_block_size;
   ulong query_alloc_block_size;
   ulong query_prealloc_size;

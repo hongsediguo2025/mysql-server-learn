@@ -1,0 +1,3 @@
+SELECT 'ok' AS code_review_resumable_trx_slices_lint;
+code_review_resumable_trx_slices_lint
+ok

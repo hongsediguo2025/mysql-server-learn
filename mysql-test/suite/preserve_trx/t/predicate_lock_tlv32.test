@@ -1,0 +1,153 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_predicate_tlv32_anchor;
+DROP TABLE IF EXISTS t_predicate_tlv32;
+--enable_warnings
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_predicate_tlv32_anchor(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+CREATE TABLE t_predicate_tlv32(
+  id INT PRIMARY KEY,
+  pos POINT NOT NULL SRID 0,
+  SPATIAL KEY(pos)
+) ENGINE=InnoDB;
+INSERT INTO t_predicate_tlv32_anchor VALUES(1,0);
+INSERT INTO t_predicate_tlv32 VALUES
+  (1, ST_GeomFromText('POINT(1 1)')),
+  (2, ST_GeomFromText('POINT(10 10)'));
+
+SET @g = ST_GeomFromText('POLYGON((0 0,0 5,5 5,5 0,0 0))');
+START TRANSACTION;
+UPDATE t_predicate_tlv32_anchor SET v=1 WHERE id=1;
+SELECT COUNT(*) AS locked_rows
+  FROM t_predicate_tlv32 FORCE INDEX(pos)
+  WHERE MBRWithin(pos, @g) FOR UPDATE;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+opendir(my $dh, $dir) or die "cannot open preserve dir: $dir: $!";
+my @snapshots = grep { /\.bin$/ } readdir($dh);
+closedir($dh);
+die "expected one preserved snapshot, found " . scalar(@snapshots) . "\n"
+  unless scalar(@snapshots) == 1;
+
+my $path = File::Spec->catfile($dir, $snapshots[0]);
+open(my $fh, '<:raw', $path) or die "cannot open snapshot $path: $!";
+my $bytes = do { local $/; <$fh> };
+close($fh);
+
+die "snapshot too short\n" if length($bytes) < 552;
+my $payload_size = unpack('Q<', substr($bytes, 48, 8));
+my $offset = 552;
+my $end = $offset + $payload_size;
+die "snapshot payload extends past file\n" if $end > length($bytes);
+
+sub count_predicate_entries {
+  my ($payload) = @_;
+  die "truncated record-lock payload count\n" if length($payload) < 4;
+  my $count = unpack('V', substr($payload, 0, 4));
+  my $offset = 4;
+  my $predicate_count = 0;
+  for (my $i = 0; $i < $count; ++$i) {
+    die "truncated record-lock entry header\n"
+      if length($payload) - $offset < 56;
+    my $type_mode = unpack('V', substr($payload, $offset + 24, 4));
+    my $heap_offsets_length = unpack('V', substr($payload, $offset + 44, 4));
+    my $record_images_length = unpack('V', substr($payload, $offset + 48, 4));
+    my $bitmap_length = unpack('V', substr($payload, $offset + 52, 4));
+    $offset += 56;
+    my $variable_length =
+      $heap_offsets_length + $record_images_length + $bitmap_length;
+    die "truncated record-lock entry body\n"
+      if length($payload) - $offset < $variable_length;
+    ++$predicate_count if $type_mode == 8226 || $type_mode == 16418;
+    $offset += $variable_length;
+  }
+  die "extra bytes after record-lock entries\n"
+    if $offset != length($payload);
+  return ($count, $predicate_count);
+}
+
+my %counts;
+my $tlv30_predicates = 0;
+my $tlv32_non_predicates = 0;
+while ($offset < $end) {
+  die "truncated tlv header\n" if $end - $offset < 6;
+  my $tag = unpack('v', substr($bytes, $offset, 2));
+  my $length = unpack('V', substr($bytes, $offset + 2, 4));
+  $offset += 6;
+  die "truncated tlv value\n" if $length > $end - $offset;
+  ++$counts{$tag};
+  if ($tag == 0x30 || $tag == 0x32) {
+    my ($entry_count, $predicate_count) =
+      count_predicate_entries(substr($bytes, $offset, $length));
+    if ($tag == 0x30) {
+      $tlv30_predicates += $predicate_count;
+    } else {
+      $tlv32_non_predicates += $entry_count - $predicate_count;
+    }
+  }
+  $offset += $length;
+}
+
+print "snapshot_tlv30_count\n";
+print (($counts{0x30} || 0) . "\n");
+print "snapshot_tlv32_count\n";
+print (($counts{0x32} || 0) . "\n");
+print "snapshot_tlv30_predicate_entries\n";
+print "$tlv30_predicates\n";
+print "snapshot_tlv32_non_predicate_entries\n";
+print "$tlv32_non_predicates\n";
+EOF
+
+SELECT COUNT(*) AS recovered_predicate_locks
+  FROM performance_schema.data_locks
+  WHERE OBJECT_SCHEMA='test'
+    AND OBJECT_NAME='t_predicate_tlv32'
+    AND INDEX_NAME='pos'
+    AND LOCK_MODE LIKE '%PREDICATE%'
+    AND LOCK_STATUS='GRANTED';
+SELECT LOCKS_COUNT AS preserved_locks_count
+  FROM performance_schema.preserved_transactions;
+
+--connect(predicate_tlv32_writer, localhost, root,,test)
+connection predicate_tlv32_writer;
+SET innodb_lock_wait_timeout=1;
+--error ER_LOCK_WAIT_TIMEOUT
+INSERT INTO t_predicate_tlv32 VALUES
+  (3, ST_GeomFromText('POINT(2 2)'));
+disconnect predicate_tlv32_writer;
+
+connection default;
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+ROLLBACK;
+
+SELECT id, ST_AsText(pos) AS pos
+  FROM t_predicate_tlv32 ORDER BY id;
+SELECT * FROM t_predicate_tlv32_anchor;
+
+DROP TABLE t_predicate_tlv32;
+DROP TABLE t_predicate_tlv32_anchor;
+SET GLOBAL preserve_trx_enable=ON;

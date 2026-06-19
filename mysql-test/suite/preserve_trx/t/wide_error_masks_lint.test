@@ -1,0 +1,47 @@
+--echo # Lint-only guard: only documented disconnect/SIGTERM race helpers
+--echo # may use --error 0,... in preserve_trx tests.
+--perl
+use strict;
+use warnings;
+use File::Find;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+my $suite_dir = File::Spec->catdir($source_root, 'mysql-test', 'suite',
+                                   'preserve_trx');
+my %allowed = map { $_ => 1 } (
+  File::Spec->catfile($suite_dir, 'include',
+                      'wait_until_disconnected_allow_preserve_block.inc'),
+  File::Spec->catfile($suite_dir, 't',
+                      'sigterm_during_preserve_shutdown.test'),
+  File::Spec->catfile($suite_dir, 't',
+                      'batch_drain_warmcopy_disconnect_no_uaf.test'),
+);
+
+my @violations;
+find(
+  sub {
+    return unless -f $_;
+    return unless /\.(?:test|inc)$/;
+    my $path = $File::Find::name;
+    open(my $fh, '<', $path) or die "cannot open $path: $!";
+    my $line_no = 0;
+    while (my $line = <$fh>) {
+      ++$line_no;
+      next unless $line =~ /^\s*--error\s+0\s*,/;
+      push @violations, "$path:$line_no:$line" unless $allowed{$path};
+    }
+    close($fh);
+  },
+  File::Spec->catdir($suite_dir, 't'),
+  File::Spec->catdir($suite_dir, 'include'),
+);
+
+die "unexpected --error 0,... masks:\n" . join('', @violations)
+  if @violations;
+EOF
+
+SELECT 'ok' AS wide_error_masks_lint;

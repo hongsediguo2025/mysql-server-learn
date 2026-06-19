@@ -1,0 +1,32 @@
+DROP TABLE IF EXISTS t_resume_detach_after_attach_failure;
+CALL mtr.add_suppression("Preserved transaction resume failed to detach transaction after savepoint restore failure; retrying cleanup detach");
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_resume_detach_after_attach_failure(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO t_resume_detach_after_attach_failure VALUES(1,10),(2,20);
+START TRANSACTION;
+UPDATE t_resume_detach_after_attach_failure SET v=11 WHERE id=1;
+SAVEPOINT s1;
+UPDATE t_resume_detach_after_attach_failure SET v=22 WHERE id=2;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug="+d,preserve_trx_fail_restore_savepoints_after_sql,preserve_trx_fail_detach_resumed_from_thd";
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug="-d,preserve_trx_fail_restore_savepoints_after_sql,preserve_trx_fail_detach_resumed_from_thd";
+SELECT COUNT(*) AS in_transaction_after_savepoint_failure FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id = RESUME_THREAD_ID;
+in_transaction_after_savepoint_failure
+0
+SELECT TOKEN, STATE, LAST_ERROR IS NOT NULL AS has_last_error FROM performance_schema.preserved_transactions WHERE TOKEN = 'TOKEN';
+TOKEN	STATE	has_last_error
+TOKEN	PRESERVED	1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ROLLBACK TO SAVEPOINT s1;
+COMMIT;
+SELECT * FROM t_resume_detach_after_attach_failure ORDER BY id;
+id	v
+1	11
+2	20
+DROP TABLE t_resume_detach_after_attach_failure;
+SET GLOBAL preserve_trx_enable=ON;

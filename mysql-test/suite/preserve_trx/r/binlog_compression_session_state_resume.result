@@ -1,0 +1,49 @@
+DROP TABLE IF EXISTS t_binlog_compress_resume;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_binlog_compress_resume(
+id INT PRIMARY KEY,
+payload TEXT
+) ENGINE=InnoDB;
+INSERT INTO t_binlog_compress_resume VALUES(1, REPEAT('a', 1000));
+TRUNCATE performance_schema.binary_log_transaction_compression_stats;
+SET SESSION binlog_transaction_compression=ON;
+SET SESSION binlog_transaction_compression_level_zstd=10;
+START TRANSACTION;
+UPDATE t_binlog_compress_resume
+SET payload=REPEAT('b', 1000)
+WHERE id=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SELECT TOKEN, BINLOG_STATE, WROTE_TO_CACHE,
+BINLOG_CACHE_SIZE > 0 AS BINLOG_CACHE_SIZE_POSITIVE
+FROM performance_schema.preserved_transactions;
+TOKEN	BINLOG_STATE	WROTE_TO_CACHE	BINLOG_CACHE_SIZE_POSITIVE
+TOKEN	LOGGED_WITH_CACHE	YES	1
+TRUNCATE performance_schema.binary_log_transaction_compression_stats;
+SET SESSION binlog_transaction_compression=OFF;
+SET SESSION binlog_transaction_compression_level_zstd=1;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+SELECT @@session.binlog_transaction_compression AS compression_after_resume;
+compression_after_resume
+1
+SELECT @@session.binlog_transaction_compression_level_zstd AS compression_level_after_resume;
+compression_level_after_resume
+10
+COMMIT;
+SELECT COALESCE(SUM(transaction_counter), 0) AS zstd_compressed_transactions
+FROM performance_schema.binary_log_transaction_compression_stats
+WHERE log_type='BINARY' AND compression_type='ZSTD';
+zstd_compressed_transactions
+1
+SELECT COALESCE(SUM(transaction_counter), 0) AS none_compressed_transactions
+FROM performance_schema.binary_log_transaction_compression_stats
+WHERE log_type='BINARY' AND compression_type='NONE';
+none_compressed_transactions
+0
+SELECT id, LENGTH(payload) AS payload_length,
+SUBSTR(payload, 1, 1) AS payload_prefix
+FROM t_binlog_compress_resume;
+id	payload_length	payload_prefix
+1	1000	b
+include/assert_grep.inc [Preserved LOGGED_WITH_CACHE transaction keeps preserved compression state after RESUME]
+DROP TABLE t_binlog_compress_resume;
+SET GLOBAL preserve_trx_enable=ON;

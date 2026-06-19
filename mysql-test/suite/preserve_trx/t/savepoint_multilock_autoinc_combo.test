@@ -1,0 +1,77 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_savepoint_multilock_autoinc;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_savepoint_multilock_autoinc(
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  v INT,
+  KEY v_idx(v)
+) ENGINE=InnoDB;
+INSERT INTO t_savepoint_multilock_autoinc(v) VALUES(10),(20);
+
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE t_savepoint_multilock_autoinc SET v=11 WHERE id=1;
+SAVEPOINT s_record;
+SELECT * FROM t_savepoint_multilock_autoinc FORCE INDEX(v_idx)
+ WHERE v > 11 AND v < 20 FOR UPDATE;
+SAVEPOINT s_gap;
+INSERT INTO t_savepoint_multilock_autoinc(v) VALUES(30);
+SELECT LAST_INSERT_ID() AS first_generated_id;
+SAVEPOINT s_insert;
+INSERT INTO t_savepoint_multilock_autoinc(v) VALUES(40);
+SELECT LAST_INSERT_ID() AS second_generated_id;
+UPDATE t_savepoint_multilock_autoinc SET v=22 WHERE id=2;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+SELECT SAVEPOINT_COUNT, LOCKS_COUNT >= 1 AS has_preserved_locks
+  FROM performance_schema.preserved_transactions;
+
+--connect(savepoint_gap_writer, localhost, root,,test)
+SET SESSION innodb_lock_wait_timeout=1;
+--error ER_LOCK_WAIT_TIMEOUT
+INSERT INTO t_savepoint_multilock_autoinc(id, v) VALUES(100,15);
+
+--connect(savepoint_table_locker, localhost, root,,test)
+SET SESSION lock_wait_timeout=1;
+--error ER_LOCK_WAIT_TIMEOUT
+LOCK TABLES t_savepoint_multilock_autoinc WRITE;
+
+--connection default
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+SELECT LAST_INSERT_ID() AS resumed_last_insert_id;
+ROLLBACK TO SAVEPOINT s_gap;
+INSERT INTO t_savepoint_multilock_autoinc(v) VALUES(50);
+SELECT LAST_INSERT_ID() AS insert_after_rollback_to;
+COMMIT;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+--connection savepoint_gap_writer
+INSERT INTO t_savepoint_multilock_autoinc(id, v) VALUES(100,15);
+--disconnect savepoint_gap_writer
+
+--connection savepoint_table_locker
+LOCK TABLES t_savepoint_multilock_autoinc WRITE;
+UNLOCK TABLES;
+--disconnect savepoint_table_locker
+
+--connection default
+SELECT id, v FROM t_savepoint_multilock_autoinc ORDER BY id;
+
+DROP TABLE t_savepoint_multilock_autoinc;
+SET GLOBAL preserve_trx_enable=ON;

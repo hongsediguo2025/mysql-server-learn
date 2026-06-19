@@ -1,0 +1,31 @@
+# Tests for PERFORMANCE_SCHEMA
+#
+# Verify invalid DML operations on preserved_transactions.
+
+--disable_result_log
+SELECT * FROM performance_schema.preserved_transactions
+  LIMIT 1;
+--enable_result_log
+
+--error ER_TABLEACCESS_DENIED_ERROR
+INSERT INTO performance_schema.preserved_transactions
+  SET TOKEN='token', USER='root', HOST='localhost', STATE='PRESERVED';
+
+--error ER_TABLEACCESS_DENIED_ERROR
+UPDATE performance_schema.preserved_transactions
+  SET STATE='FAILED';
+
+--error ER_TABLEACCESS_DENIED_ERROR
+DELETE FROM performance_schema.preserved_transactions
+  WHERE TOKEN='token';
+
+--error ER_TABLEACCESS_DENIED_ERROR
+DELETE FROM performance_schema.preserved_transactions;
+
+--error ER_TABLEACCESS_DENIED_ERROR
+LOCK TABLES performance_schema.preserved_transactions READ;
+UNLOCK TABLES;
+
+--error ER_TABLEACCESS_DENIED_ERROR
+LOCK TABLES performance_schema.preserved_transactions WRITE;
+UNLOCK TABLES;

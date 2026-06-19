@@ -1,0 +1,199 @@
+--source include/big_test.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $setup_file = File::Spec->catfile($vardir, 'tmp',
+                                     'preserve_trx_batch_100_setup.inc');
+my $app_file = File::Spec->catfile($vardir, 'tmp',
+                                   'preserve_trx_batch_100_apps.inc');
+my $disconnect_file = File::Spec->catfile($vardir, 'tmp',
+                                          'preserve_trx_batch_100_disconnect.inc');
+my $cleanup_file = File::Spec->catfile($vardir, 'tmp',
+                                       'preserve_trx_batch_100_cleanup.inc');
+
+open(my $setup, '>', $setup_file)
+  or die "cannot open $setup_file for write: $!";
+open(my $apps, '>', $app_file)
+  or die "cannot open $app_file for write: $!";
+open(my $disconnect, '>', $disconnect_file)
+  or die "cannot open $disconnect_file for write: $!";
+open(my $cleanup, '>', $cleanup_file)
+  or die "cannot open $cleanup_file for write: $!";
+
+print $cleanup "DROP TABLE IF EXISTS t_batch_100_tokens;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_100;\n";
+
+print $setup "CREATE TABLE t_batch_100(" .
+             "id INT PRIMARY KEY, " .
+             "v INT, " .
+             "resumed_by INT DEFAULT NULL) ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_batch_100_tokens(" .
+             "session_id INT PRIMARY KEY, " .
+             "token VARCHAR(255) NOT NULL UNIQUE) ENGINE=InnoDB;\n";
+
+for my $i (1 .. 100) {
+  my $name = sprintf("batch_app_%03d", $i);
+  print $apps "--connect($name,localhost,root,,test)\n";
+  print $apps "--connection $name\n";
+  print $apps "START TRANSACTION;\n";
+  print $apps "INSERT INTO t_batch_100 VALUES($i, " . ($i * 10) .
+              ", NULL);\n";
+  print $disconnect "--disconnect $name\n";
+}
+print $apps "--connection default\n";
+print $disconnect "--connection default\n";
+
+close($setup);
+close($apps);
+close($disconnect);
+close($cleanup);
+EOF
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/preserve_trx_batch_100_cleanup.inc
+--source $MYSQLTEST_VARDIR/tmp/preserve_trx_batch_100_setup.inc
+--enable_result_log
+--enable_query_log
+
+SET GLOBAL preserve_trx_enable=ON;
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+SET GLOBAL preserve_trx_recovery_max_count=200;
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/preserve_trx_batch_100_apps.inc
+--enable_result_log
+--enable_query_log
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=200" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+INSERT INTO t_batch_100_tokens(session_id, token)
+SELECT ROW_NUMBER() OVER (ORDER BY TOKEN), TOKEN
+  FROM performance_schema.preserved_transactions;
+
+SELECT COUNT(*) AS mapped_token_count
+  FROM t_batch_100_tokens;
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+--disable_query_log
+SET SESSION group_concat_max_len=1000000;
+--let $write_to_file= $MYSQLTEST_VARDIR/tmp/preserve_trx_batch_100_resume.inc
+--let $write_var= `SELECT GROUP_CONCAT(CONCAT('--connect(batch_resume_', LPAD(session_id, 3, '0'), ',localhost,root,,test)\\n', '--connection batch_resume_', LPAD(session_id, 3, '0'), '\\n', 'RESUME PRESERVED TRANSACTION \"', token, '\";\\n', 'SET @batch_resume_id = NULL;\\n', 'SELECT id INTO @batch_resume_id FROM t_batch_100 WHERE v < 100000 AND resumed_by IS NULL LIMIT 1;\\n', 'UPDATE t_batch_100 SET v = v + 100000, resumed_by = ', session_id, ' WHERE id = @batch_resume_id;\\n', 'COMMIT;\\n') ORDER BY session_id SEPARATOR '') FROM t_batch_100_tokens`
+--source include/write_var_to_file.inc
+--enable_query_log
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
+my $preserve_dir = File::Spec->catdir($datadir, 'preserve');
+opendir(my $dh, $preserve_dir)
+  or die "cannot open preserve dir $preserve_dir: $!";
+my @tokens = sort map {
+  s/\.bin$//r;
+} grep {
+  /\.bin$/ && -f File::Spec->catfile($preserve_dir, $_);
+} readdir($dh);
+closedir($dh);
+
+die "expected 100 preserved snapshots, found " . scalar(@tokens) . "\n"
+  unless scalar(@tokens) == 100;
+EOF
+
+--append_file $MYSQLTEST_VARDIR/tmp/preserve_trx_batch_100_resume.inc
+--connection default
+EOF
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/preserve_trx_batch_100_resume.inc
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $file = File::Spec->catfile($vardir, 'tmp',
+                               'preserve_trx_batch_100_resume_disconnect.inc');
+open(my $fh, '>', $file) or die "cannot open $file for write: $!";
+for my $idx (1 .. 100) {
+  my $name = sprintf("batch_resume_%03d", $idx);
+  print $fh "--disconnect $name\n";
+}
+print $fh "--connection default\n";
+close($fh);
+EOF
+--source $MYSQLTEST_VARDIR/tmp/preserve_trx_batch_100_resume_disconnect.inc
+--enable_result_log
+--enable_query_log
+
+SELECT COUNT(*) AS preserved_count_after_resume
+  FROM performance_schema.preserved_transactions;
+
+SELECT COUNT(*) AS row_count,
+       COUNT(DISTINCT id) AS distinct_keys,
+       SUM(resumed_by IS NOT NULL) AS resumed_rows,
+       SUM(v >= 100000) AS bumped_rows
+  FROM t_batch_100;
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
+my $preserve_dir = File::Spec->catdir($datadir, 'preserve');
+if (-d $preserve_dir) {
+  opendir(my $dh, $preserve_dir)
+    or die "cannot open preserve dir $preserve_dir: $!";
+  my @leftovers = grep {
+    /\.(?:bin|binlog_cache)(?:\.tmp)?$/ &&
+      -f File::Spec->catfile($preserve_dir, $_);
+  } readdir($dh);
+  closedir($dh);
+  die "expected no preserved transaction files after resume, found: " .
+      join(", ", sort @leftovers) . "\n"
+    if @leftovers;
+}
+EOF
+
+--remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_batch_100_apps.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_batch_100_disconnect.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_batch_100_resume.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_batch_100_resume_disconnect.inc
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/preserve_trx_batch_100_cleanup.inc
+--enable_result_log
+--enable_query_log
+
+--remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_batch_100_setup.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/preserve_trx_batch_100_cleanup.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+--disable_query_log
+--disable_result_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--enable_result_log
+--enable_query_log

@@ -1,0 +1,16 @@
+# Tests for PERFORMANCE_SCHEMA
+#
+# Verify access paths for preserved_transactions. The table has no declared
+# indexes, so predicate access must remain a controlled table scan.
+
+EXPLAIN SELECT TOKEN
+  FROM performance_schema.preserved_transactions
+ WHERE TOKEN = 'not-present';
+
+EXPLAIN SELECT TOKEN
+  FROM performance_schema.preserved_transactions
+ WHERE STATE = 'PRESERVED';
+
+SELECT COUNT(*) AS matching_rows
+  FROM performance_schema.preserved_transactions
+ WHERE TOKEN = 'not-present';

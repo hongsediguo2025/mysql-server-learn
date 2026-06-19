@@ -1,0 +1,65 @@
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+# Lint-only test-shape guard. The actual preserve/resume matrix behavior is
+# covered by the batch_drain_100_long_* runtime tests.
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $suite_dir = File::Spec->catdir($mysql_test_dir, 'suite', 'preserve_trx');
+my $test_dir = File::Spec->catdir($suite_dir, 't');
+
+opendir(my $dh, $test_dir) or die "cannot open $test_dir: $!";
+my @tests = sort grep {
+  /^batch_drain_100_long_.*_matrix\.test$/ && -f File::Spec->catfile($test_dir, $_)
+} readdir($dh);
+closedir($dh);
+
+die "expected multiple batch_drain_100_long matrix tests\n" unless @tests >= 10;
+
+for my $test (@tests) {
+  my $path = File::Spec->catfile($test_dir, $test);
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $src = do { local $/; <$fh> };
+  close($fh);
+
+  die "$test must not use resumed_ok as the only final semantic check\n"
+    if $src !~ /SIGNAL SQLSTATE '45000'/s &&
+       $src =~ /resumed_ok/s;
+
+  if ($src =~ /CREATE PROCEDURE p_batch_long_finalize/s) {
+    $src =~ /CREATE PROCEDURE p_batch_long_finalize[\s\S]*?INSERT INTO t_batch_long_audit/s
+      or die "$test could not isolate finalize body before audit insert\n";
+    my $finalize_before_audit = $&;
+
+    die "$test finalize must compute a named semantic check before audit insert\n"
+      unless $finalize_before_audit =~
+        /\b[a-zA-Z0-9_]*(?:semantic|post|pre|state|schema|binlog|json|type|rtv|rv|sp|check)[a-zA-Z0-9_]*_ok\b/s;
+
+    die "$test finalize semantic check must inspect workload tables with restored sid/case context\n"
+      unless $finalize_before_audit =~ /\bFROM\s+(?!t_batch_long_audit\b)\w+/s &&
+             $finalize_before_audit =~ /\\?\@batch_long_sid/s &&
+             $finalize_before_audit =~ /\\?\@batch_long_case_id/s;
+
+    die "$test finalize must assign the semantic check from workload SQL\n"
+      unless $finalize_before_audit =~
+        /SELECT[\s\S]*\bINTO\s+\b[a-zA-Z0-9_]*(?:semantic|post|pre|state|schema|binlog|json|type|rtv|rv|sp|check)[a-zA-Z0-9_]*_ok\b[\s\S]*\bFROM\b/s ||
+             $finalize_before_audit =~
+        /SELECT\s+CASE\s+\\?\@batch_long_case_id[\s\S]*END\s+INTO\s+\b[a-zA-Z0-9_]*(?:semantic|post|pre|state|schema|binlog|json|type|rtv|rv|sp|check)[a-zA-Z0-9_]*_ok\b/s;
+
+    die "$test finalize must SIGNAL from an *_ok semantic check before audit insert\n"
+      unless $finalize_before_audit =~
+        /IF\s+(?:NOT\s+)?(?:COALESCE\s*\(\s*)?\b[a-zA-Z0-9_]*(?:semantic|post|pre|state|schema|binlog|json|type|rtv|rv|sp|check)[a-zA-Z0-9_]*_ok\b[\s\S]*?SIGNAL SQLSTATE '45000'/s;
+  }
+
+  if ($src =~ /t_batch_long_audit/s) {
+    die "$test must retain distinct sid coverage checks\n"
+      unless $src =~ /COUNT\s*\(\s*DISTINCT\s+sid\s*\)/s ||
+             $src =~ /batch_drain_100_long_common\.inc/s;
+  }
+}
+EOF
+
+SELECT 'ok' AS batch_drain_100_long_semantic_lint;

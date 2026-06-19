@@ -1,0 +1,55 @@
+DROP TABLE IF EXISTS t_warmcopy_two_phase_equiv;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1024;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1024;
+SET GLOBAL binlog_format=ROW;
+CREATE TABLE t_warmcopy_two_phase_equiv(
+id INT PRIMARY KEY,
+v INT NOT NULL,
+payload VARBINARY(4096)
+) ENGINE=InnoDB;
+INSERT INTO t_warmcopy_two_phase_equiv VALUES
+(1,10,REPEAT('a',4096)),
+(2,20,REPEAT('b',4096));
+RESET MASTER;
+# no-preserve baseline transaction
+START TRANSACTION;
+UPDATE t_warmcopy_two_phase_equiv
+SET v=11, payload=REPEAT('x',4096)
+WHERE id=1;
+INSERT INTO t_warmcopy_two_phase_equiv VALUES(101,101,REPEAT('p',4096));
+COMMIT;
+UPDATE t_warmcopy_two_phase_equiv
+SET v=10, payload=REPEAT('a',4096)
+WHERE id=1;
+DELETE FROM t_warmcopy_two_phase_equiv WHERE id=101;
+RESET MASTER;
+# preserve/resume transaction through warm-copy path
+START TRANSACTION;
+UPDATE t_warmcopy_two_phase_equiv
+SET v=11, payload=REPEAT('x',4096)
+WHERE id=1;
+INSERT INTO t_warmcopy_two_phase_equiv VALUES(101,101,REPEAT('p',4096));
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+include/assert_grep.inc [warm-copy two-phase binlog equivalence used prebuilt fast path metrics]
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+SELECT COUNT(*) AS preserved_count_after_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_resume
+0
+SELECT id, v, OCTET_LENGTH(payload) AS payload_len
+FROM t_warmcopy_two_phase_equiv
+ORDER BY id;
+id	v	payload_len
+1	11	4096
+2	20	4096
+101	101	4096
+DROP TABLE t_warmcopy_two_phase_equiv;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;

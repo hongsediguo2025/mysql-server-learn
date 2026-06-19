@@ -1,0 +1,43 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_temp_encrypted_space_base;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+
+CREATE TABLE t_temp_encrypted_space_base(id INT PRIMARY KEY, v INT)
+  ENGINE=InnoDB;
+INSERT INTO t_temp_encrypted_space_base VALUES(1,10);
+
+--error ER_CANNOT_USE_ENCRYPTION_CLAUSE
+CREATE TEMPORARY TABLE tmp_explicit_encrypted(c INT) ENCRYPTION='Y';
+
+CREATE TEMPORARY TABLE tmp_temp_encrypted_space(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO tmp_temp_encrypted_space VALUES(1,100),(2,200);
+
+START TRANSACTION;
+UPDATE t_temp_encrypted_space_base SET v=11 WHERE id=1;
+
+SET SESSION debug="+d,preserve_trx_temp_table_force_encrypted_space";
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug="-d,preserve_trx_temp_table_force_encrypted_space";
+
+SELECT COUNT(*) AS preserved_count_after_encrypted_temp_space
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+COMMIT;
+SELECT * FROM t_temp_encrypted_space_base ORDER BY id;
+SELECT * FROM tmp_temp_encrypted_space ORDER BY id;
+
+DROP TEMPORARY TABLE tmp_temp_encrypted_space;
+DROP TABLE t_temp_encrypted_space_base;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_enable=ON;

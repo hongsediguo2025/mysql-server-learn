@@ -1,0 +1,147 @@
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_batch_force_recovery;
+--enable_warnings
+
+--disable_query_log
+CALL mtr.add_suppression("Skip updating information_schema metadata in InnoDB read-only mode");
+CALL mtr.add_suppression("Skip re-populating collations and character sets tables in InnoDB read-only mode");
+CALL mtr.add_suppression("PRESERVE: preserved transaction recovery is not supported while innodb_force_recovery is enabled; snapshot and binlog-cache files are retained and marked tainted");
+CALL mtr.add_suppression("Preserved transaction '.*' recovery forced rollback: preserved transaction snapshot tainted by innodb_force_recovery");
+--enable_query_log
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_batch_force_recovery(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_batch_force_recovery VALUES(1,10);
+RESET MASTER;
+
+--connect(batch_force_a,localhost,root,,test)
+--connection batch_force_a
+START TRANSACTION;
+UPDATE t_batch_force_recovery SET v=11 WHERE id=1;
+
+--connect(batch_force_b,localhost,root,,test)
+--connection batch_force_b
+START TRANSACTION;
+INSERT INTO t_batch_force_recovery VALUES(2,20);
+
+--connection default
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --innodb-force-recovery=1" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT @@global.innodb_force_recovery AS force_recovery_after_restart;
+SELECT COUNT(*) AS preserved_count_during_force_recovery
+  FROM performance_schema.preserved_transactions;
+SHOW PRESERVED TRANSACTIONS;
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+--let $batch_force_tokens_inc= $MYSQLTEST_VARDIR/tmp/batch_force_tokens.inc
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+opendir(my $dh, $dir) or die "cannot open preserve dir: $dir: $!";
+my @entries = readdir($dh);
+closedir($dh);
+my @snapshots = sort grep { /\.bin$/ } @entries;
+my @caches = sort grep { /\.binlog_cache$/ } @entries;
+die "expected two preserved snapshots in $dir, found " . scalar(@snapshots) . "\n"
+  unless scalar(@snapshots) == 2;
+die "expected two preserved binlog caches in $dir, found " . scalar(@caches) . "\n"
+  unless scalar(@caches) == 2;
+
+my @snapshot_tokens = map { s/\.bin$//r } @snapshots;
+my @cache_tokens = map { s/\.binlog_cache$//r } @caches;
+die "snapshot/cache token mismatch\n"
+  unless join(",", @snapshot_tokens) eq join(",", @cache_tokens);
+
+my $include_path =
+  File::Spec->catfile($ENV{'MYSQLTEST_VARDIR'}, 'tmp',
+                      'batch_force_tokens.inc');
+open(my $out, ">", $include_path)
+  or die "cannot write $include_path: $!";
+for my $i (0 .. $#snapshot_tokens) {
+  my $n = $i + 1;
+  my $token = $snapshot_tokens[$i];
+  my $snapshot_path = File::Spec->catfile($dir, "$token.bin");
+  my $cache_path = File::Spec->catfile($dir, "$token.binlog_cache");
+  print $out "--let \$batch_force_token_$n= $token\n";
+  print $out "--let \$batch_force_snapshot_$n= $snapshot_path\n";
+  print $out "--let \$batch_force_cache_$n= $cache_path\n";
+}
+close($out);
+EOF
+
+--source $batch_force_tokens_inc
+
+--file_exists $batch_force_snapshot_1
+--file_exists $batch_force_cache_1
+--file_exists $batch_force_snapshot_2
+--file_exists $batch_force_cache_2
+
+--replace_result $batch_force_token_1 TOKEN
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--eval RESUME PRESERVED TRANSACTION '$batch_force_token_1'
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+
+--file_exists $batch_force_snapshot_1
+--file_exists $batch_force_cache_1
+--file_exists $batch_force_snapshot_2
+--file_exists $batch_force_cache_2
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON --innodb-force-recovery=0
+--let $do_not_echo_parameters= 1
+--source include/restart_mysqld.inc
+--let $do_not_echo_parameters=
+--let $restart_parameters=
+
+SELECT @@global.innodb_force_recovery AS force_recovery_after_normal_restart;
+
+--disable_query_log
+--disable_result_log
+--let $normal_recovered_count= `SELECT COUNT(*) FROM performance_schema.preserved_transactions`
+if ($normal_recovered_count > 2)
+{
+  --die Expected normal startup to recover or clean at most two batch force-recovery snapshots
+}
+--enable_result_log
+--enable_query_log
+--echo normal startup recovered or cleaned batch force-recovery snapshots
+
+--disable_query_log
+--disable_result_log
+while ($normal_recovered_count)
+{
+  --let $normal_token= `SELECT TOKEN FROM performance_schema.preserved_transactions ORDER BY TOKEN LIMIT 1`
+  --eval RESUME PRESERVED TRANSACTION '$normal_token'
+  ROLLBACK;
+  --dec $normal_recovered_count
+}
+--enable_result_log
+--enable_query_log
+
+SELECT * FROM t_batch_force_recovery ORDER BY id;
+SELECT COUNT(*) AS preserved_count_after_rollback
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_snapshot_file.inc
+
+DROP TABLE t_batch_force_recovery;
+SET GLOBAL preserve_trx_enable=ON;

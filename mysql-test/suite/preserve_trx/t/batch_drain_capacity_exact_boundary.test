@@ -1,0 +1,71 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_batch_capacity_exact;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_batch_capacity_exact(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+--connect(batch_capacity_exact_app1,localhost,root,,test)
+--connection batch_capacity_exact_app1
+START TRANSACTION;
+INSERT INTO t_batch_capacity_exact VALUES(1,10);
+
+--connect(batch_capacity_exact_app2,localhost,root,,test)
+--connection batch_capacity_exact_app2
+START TRANSACTION;
+INSERT INTO t_batch_capacity_exact VALUES(2,20);
+
+--connection default
+SET GLOBAL preserve_trx_batch_max_transactions=2;
+SET GLOBAL preserve_trx_max_total=2;
+SET GLOBAL preserve_trx_max_pending_per_user=2;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --skip-log-bin --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count_at_exact_limit
+  FROM performance_schema.preserved_transactions;
+
+CREATE TEMPORARY TABLE t_batch_capacity_exact_tokens AS
+SELECT ROW_NUMBER() OVER (ORDER BY TOKEN) AS rn, TOKEN
+  FROM performance_schema.preserved_transactions;
+
+--let $token1= `SELECT TOKEN FROM t_batch_capacity_exact_tokens WHERE rn = 1`
+--let $token2= `SELECT TOKEN FROM t_batch_capacity_exact_tokens WHERE rn = 2`
+
+--connect(batch_capacity_exact_resume1,localhost,root,,test)
+--connection batch_capacity_exact_resume1
+--replace_result $token1 TOKEN1
+--eval RESUME PRESERVED TRANSACTION '$token1'
+COMMIT;
+--disconnect batch_capacity_exact_resume1
+
+--connect(batch_capacity_exact_resume2,localhost,root,,test)
+--connection batch_capacity_exact_resume2
+--replace_result $token2 TOKEN2
+--eval RESUME PRESERVED TRANSACTION '$token2'
+COMMIT;
+--disconnect batch_capacity_exact_resume2
+
+--connection default
+SELECT COUNT(*) AS preserved_count_after_commit
+  FROM performance_schema.preserved_transactions;
+SELECT COUNT(*) AS committed_rows
+  FROM t_batch_capacity_exact;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+DROP TABLE t_batch_capacity_exact;
+SET GLOBAL preserve_trx_enable=ON;

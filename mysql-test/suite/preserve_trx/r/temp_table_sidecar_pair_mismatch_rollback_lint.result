@@ -1,0 +1,5 @@
+# Lint-only source-shape guard; behavior is covered by temp sidecar
+# recovery MTR plus preserve_trx_temp_table-t gunit parser checks.
+SELECT 'ok' AS temp_table_sidecar_pair_mismatch_rollback_lint;
+temp_table_sidecar_pair_mismatch_rollback_lint
+ok

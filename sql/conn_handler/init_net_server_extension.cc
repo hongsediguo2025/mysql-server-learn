@@ -39,6 +39,7 @@
 #include "mysql_com_server.h"
 // MYSQL_START_IDLE_WAIT
 #include "sql/mysqld.h"  // stage_starting
+#include "sql/preserve_trx.h"
 #include "sql/protocol_classic.h"
 #include "sql/sql_class.h"  // THD
 #include "violite.h"
@@ -54,7 +55,8 @@ static void net_before_header_psi(NET *net MY_ATTRIBUTE((unused)),
   thd = static_cast<THD *>(user_data);
   DBUG_ASSERT(thd != nullptr);
 
-  if (thd->m_server_idle) {
+  const bool server_idle = preserved_trx_command_read_is_idle(thd);
+  if (server_idle) {
     /*
       The server is IDLE, waiting for the next command.
       Technically, it is a wait on a socket, which may take a long time,
@@ -74,7 +76,7 @@ static void net_after_header_psi(NET *net MY_ATTRIBUTE((unused)),
   thd = static_cast<THD *>(user_data);
   DBUG_ASSERT(thd != nullptr);
 
-  if (thd->m_server_idle) {
+  if (preserved_trx_end_idle_for_command_packet(thd)) {
     /*
       The server just got data for a network packet header,
       from the network layer.
@@ -106,7 +108,6 @@ static void net_after_header_psi(NET *net MY_ATTRIBUTE((unused)),
       by also passing count here.
     */
     MYSQL_SOCKET_SET_STATE(net->vio->mysql_socket, PSI_SOCKET_STATE_ACTIVE);
-    thd->m_server_idle = false;
   }
 }
 

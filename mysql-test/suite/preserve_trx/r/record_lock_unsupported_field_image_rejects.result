@@ -1,0 +1,51 @@
+DROP TABLE IF EXISTS t_preserve_external_field;
+DROP TABLE IF EXISTS t_preserve_instant_field;
+DROP TABLE IF EXISTS t_preserve_instant_marker;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_preserve_external_field(
+id INT PRIMARY KEY,
+v INT,
+payload LONGTEXT
+) ENGINE=InnoDB ROW_FORMAT=DYNAMIC;
+INSERT INTO t_preserve_external_field
+VALUES(1, 1, REPEAT('x', 70000));
+START TRANSACTION;
+UPDATE t_preserve_external_field SET v=2 WHERE id=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+COMMIT;
+SELECT id, v, CHAR_LENGTH(payload) AS payload_len
+FROM t_preserve_external_field;
+id	v	payload_len
+1	2	70000
+CREATE TABLE t_preserve_instant_field(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+CREATE TABLE t_preserve_instant_marker(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO t_preserve_instant_field VALUES(1,10);
+INSERT INTO t_preserve_instant_marker VALUES(1,1);
+ALTER TABLE t_preserve_instant_field
+ADD COLUMN c INT NOT NULL DEFAULT 7,
+ALGORITHM=INSTANT;
+START TRANSACTION;
+UPDATE t_preserve_instant_marker SET v=2 WHERE id=1;
+SELECT id, v, c FROM t_preserve_instant_field WHERE id=1 FOR UPDATE;
+id	v	c
+1	10	7
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+COMMIT;
+SELECT id, v FROM t_preserve_instant_marker;
+id	v
+1	2
+SELECT id, v, c FROM t_preserve_instant_field;
+id	v	c
+1	10	7
+DROP TABLE t_preserve_external_field;
+DROP TABLE t_preserve_instant_field;
+DROP TABLE t_preserve_instant_marker;
+SET GLOBAL preserve_trx_enable=ON;

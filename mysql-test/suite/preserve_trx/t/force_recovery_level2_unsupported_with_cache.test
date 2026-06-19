@@ -1,0 +1,101 @@
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_force_recovery_level2_cache;
+--enable_warnings
+
+--disable_query_log
+CALL mtr.add_suppression("Skip updating information_schema metadata in InnoDB read-only mode");
+CALL mtr.add_suppression("Skip re-populating collations and character sets tables in InnoDB read-only mode");
+CALL mtr.add_suppression("PRESERVE: preserved transaction recovery is not supported while innodb_force_recovery is enabled; snapshot and binlog-cache files are retained and marked tainted");
+CALL mtr.add_suppression("Preserved transaction '.*' recovery forced rollback: preserved transaction snapshot tainted by innodb_force_recovery");
+--enable_query_log
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_force_recovery_level2_cache(a INT PRIMARY KEY, b INT)
+  ENGINE=InnoDB;
+INSERT INTO t_force_recovery_level2_cache VALUES(1,10);
+
+START TRANSACTION;
+UPDATE t_force_recovery_level2_cache SET b=11 WHERE a=1;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --innodb-force-recovery=2" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT @@global.innodb_force_recovery AS force_recovery_after_restart;
+SELECT COUNT(*) AS preserved_count_during_force_recovery
+  FROM performance_schema.preserved_transactions;
+
+--let $assert_text= Force recovery level 2 reports preserved snapshot retention
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_select= PRESERVE: preserved transaction recovery is not supported while innodb_force_recovery is enabled; snapshot and binlog-cache files are retained and marked tainted
+--let $assert_count_condition= >= 1
+--source include/assert_grep.inc
+--let $assert_count_condition=
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+opendir(my $dh, $dir) or die "cannot open preserve dir: $dir: $!";
+my @bins = readdir($dh);
+closedir($dh);
+my @snapshots = grep { /\.bin$/ } @bins;
+my @caches = grep { /\.binlog_cache$/ } @bins;
+my @tainted = grep { /\.tainted$/ } @bins;
+die "expected one preserved snapshot in $dir, found " . scalar(@snapshots) . "\n"
+  unless scalar(@snapshots) == 1;
+die "expected one preserved binlog cache in $dir, found " . scalar(@caches) . "\n"
+  unless scalar(@caches) == 1;
+die "expected one preserved tainted marker in $dir, found " . scalar(@tainted) . "\n"
+  unless scalar(@tainted) == 1;
+(my $token = $snapshots[0]) =~ s/\.bin$//;
+die "tainted marker token mismatch in $dir\n"
+  unless $tainted[0] eq "$token.tainted";
+open(my $out, '>', File::Spec->catfile($ENV{'MYSQLTEST_VARDIR'}, 'tmp',
+                                       'force_recovery_level2_token.inc'))
+  or die "cannot write token include: $!";
+print {$out} "--let \$force_recovery_preserved_token= $token\n";
+close($out);
+EOF
+
+--source $MYSQLTEST_VARDIR/tmp/force_recovery_level2_token.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/force_recovery_level2_token.inc
+--replace_result $force_recovery_preserved_token TOKEN
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--eval RESUME PRESERVED TRANSACTION '$force_recovery_preserved_token'
+
+START TRANSACTION;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ROLLBACK;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON --innodb-force-recovery=0
+--let $do_not_echo_parameters= 1
+--source include/restart_mysqld.inc
+--let $do_not_echo_parameters=
+--let $restart_parameters=
+
+SELECT @@global.innodb_force_recovery AS force_recovery_after_normal_restart;
+SELECT COUNT(*) AS preserved_count_after_normal_restart
+  FROM performance_schema.preserved_transactions;
+
+SELECT * FROM t_force_recovery_level2_cache ORDER BY a;
+SELECT COUNT(*) AS preserved_count_after_tainted_rollback
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_snapshot_file.inc
+
+DROP TABLE t_force_recovery_level2_cache;
+SET GLOBAL preserve_trx_enable=ON;

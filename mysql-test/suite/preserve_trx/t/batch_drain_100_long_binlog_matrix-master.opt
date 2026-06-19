@@ -1,0 +1,1 @@
+--log-bin=preserve-trx-batch-long-binlog-bin --server-id=1 --binlog-format=ROW --binlog-ignore-db=batch_long_binlog_ignored --gtid-mode=ON --enforce-gtid-consistency --max-connections=400

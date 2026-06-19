@@ -1,0 +1,3 @@
+SELECT 'ok' AS mdl_duplicate_backup_failclosed_standard_xa_lint;
+mdl_duplicate_backup_failclosed_standard_xa_lint
+ok

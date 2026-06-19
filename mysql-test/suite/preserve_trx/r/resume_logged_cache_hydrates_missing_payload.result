@@ -1,0 +1,17 @@
+DROP TABLE IF EXISTS t_resume_logged_cache_hydrate;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_resume_logged_cache_hydrate(a INT PRIMARY KEY, b INT)
+ENGINE=InnoDB;
+INSERT INTO t_resume_logged_cache_hydrate VALUES(1,10);
+START TRANSACTION;
+UPDATE t_resume_logged_cache_hydrate SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug="+d,preserve_trx_resume_clear_binlog_cache_payload";
+RESUME PRESERVED TRANSACTION 'TOKEN';
+SET SESSION debug="-d,preserve_trx_resume_clear_binlog_cache_payload";
+COMMIT;
+SELECT * FROM t_resume_logged_cache_hydrate ORDER BY a;
+a	b
+1	11
+DROP TABLE t_resume_logged_cache_hydrate;
+SET GLOBAL preserve_trx_enable=ON;

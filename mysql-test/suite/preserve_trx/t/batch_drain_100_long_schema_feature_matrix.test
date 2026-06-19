@@ -1,0 +1,683 @@
+--source include/big_test.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $setup_file = File::Spec->catfile($vardir, 'tmp',
+                                     'batch_long_schema_setup.inc');
+my $apps_file = File::Spec->catfile($vardir, 'tmp',
+                                    'batch_long_schema_apps.inc');
+my $post_apps_file = File::Spec->catfile($vardir, 'tmp',
+                                         'batch_long_schema_post_apps.inc');
+my $cleanup_file = File::Spec->catfile($vardir, 'tmp',
+                                       'batch_long_schema_cleanup.inc');
+my $verify_file = File::Spec->catfile($vardir, 'tmp',
+                                      'batch_long_schema_verify.inc');
+
+open(my $setup, '>', $setup_file)
+  or die "cannot open $setup_file for write: $!";
+open(my $apps, '>', $apps_file)
+  or die "cannot open $apps_file for write: $!";
+open(my $post_apps, '>', $post_apps_file)
+  or die "cannot open $post_apps_file for write: $!";
+open(my $cleanup, '>', $cleanup_file)
+  or die "cannot open $cleanup_file for write: $!";
+open(my $verify, '>', $verify_file)
+  or die "cannot open $verify_file for write: $!";
+
+print $cleanup <<'SQL';
+DROP PROCEDURE IF EXISTS p_batch_long_finalize;
+DROP TABLE IF EXISTS t_batch_long_tokens;
+DROP TABLE IF EXISTS t_schema_part;
+DROP TABLE IF EXISTS t_schema_child;
+DROP TABLE IF EXISTS t_schema_parent;
+DROP TABLE IF EXISTS t_batch_long_audit;
+DROP TABLE IF EXISTS t_batch_long_control;
+SQL
+
+for my $sid (1, 14, 20, 21, 34, 40, 41, 54, 60, 61, 74, 80, 81, 94, 100) {
+  print $cleanup "DROP TABLE IF EXISTS t_schema_auto_$sid;\n";
+}
+
+print $setup <<'SQL';
+CREATE TABLE t_batch_long_control(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  started_at DATETIME(6) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE t_batch_long_audit(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  lifecycle_age_us BIGINT UNSIGNED NOT NULL,
+  max_stmt_us BIGINT UNSIGNED NOT NULL,
+  sql_count INT UNSIGNED NOT NULL,
+  resumed_ok TINYINT NOT NULL,
+  detail VARCHAR(255) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE t_batch_long_tokens(
+  token_id INT PRIMARY KEY AUTO_INCREMENT,
+  token VARCHAR(255) NOT NULL UNIQUE
+) ENGINE=InnoDB;
+CREATE TABLE t_schema_parent(
+  sid INT NOT NULL,
+  id INT NOT NULL,
+  v INT NOT NULL,
+  note VARCHAR(64),
+  heartbeat INT NOT NULL DEFAULT 0,
+  PRIMARY KEY(sid, id),
+  UNIQUE KEY uq_sid_v(sid, v),
+  KEY idx_sid_note(sid, note),
+  CHECK (v >= 0)
+) ENGINE=InnoDB;
+CREATE TABLE t_schema_child(
+  sid INT NOT NULL,
+  id INT NOT NULL,
+  parent_id INT NOT NULL,
+  amount INT NOT NULL,
+  note VARCHAR(64),
+  PRIMARY KEY(sid, id),
+  KEY idx_sid_parent(sid, parent_id),
+  CONSTRAINT fk_schema_child_parent
+    FOREIGN KEY(sid, parent_id)
+    REFERENCES t_schema_parent(sid, id)
+) ENGINE=InnoDB;
+CREATE TABLE t_schema_part(
+  sid INT NOT NULL,
+  k INT NOT NULL,
+  v INT NOT NULL,
+  note VARCHAR(64),
+  heartbeat INT NOT NULL DEFAULT 0,
+  PRIMARY KEY(sid, k),
+  KEY idx_sid_v(sid, v)
+) ENGINE=InnoDB
+PARTITION BY HASH(sid) PARTITIONS 8;
+SQL
+
+for my $sid (1, 14, 20, 21, 34, 40, 41, 54, 60, 61, 74, 80, 81, 94, 100) {
+  print $setup "CREATE TABLE t_schema_auto_$sid(" .
+               "auto_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, " .
+               "phase VARCHAR(32) NOT NULL UNIQUE, " .
+               "v INT NOT NULL" .
+               ") ENGINE=InnoDB;\n";
+}
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  print $setup "INSERT INTO t_batch_long_control " .
+               "VALUES($sid, $case_id, TIMESTAMP'2000-01-01 00:00:00.000000');\n";
+  for my $id (0 .. 35) {
+    my $v = $sid * 1000 + $id;
+    print $setup "INSERT INTO t_schema_parent " .
+                 "VALUES($sid, $id, $v, 'seed', 0);\n";
+    print $setup "INSERT INTO t_schema_child " .
+                 "VALUES($sid, $id, $id, $id + 10, 'seed');\n"
+      if $id > 0;
+  }
+  for my $k (0 .. 35) {
+    print $setup "INSERT INTO t_schema_part " .
+                 "VALUES($sid, $k, " . ($sid * 100 + $k) . ", 'seed', 0);\n";
+  }
+}
+
+print $setup <<'SQL';
+DELIMITER |;
+CREATE PROCEDURE p_batch_long_finalize()
+BEGIN
+  DECLARE post_ok TINYINT DEFAULT 0;
+  DECLARE detail_value VARCHAR(255) DEFAULT NULL;
+  DECLARE failure_message VARCHAR(255) DEFAULT NULL;
+
+  IF @batch_long_sid IS NULL OR @batch_long_case_id IS NULL THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'missing restored batch long user vars';
+  END IF;
+  IF COALESCE(@schema_pre_ok, 0) <> 1 THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'pre-drain schema check was not restored';
+  END IF;
+
+  IF @batch_long_case_id = 1 THEN
+    SET @schema_auto_sql = CONCAT(
+      'INSERT INTO t_schema_auto_', @batch_long_sid,
+      '(phase, v) VALUES(''post-autoinc'', ', @batch_long_sid + 11, ')');
+    PREPARE schema_auto_stmt FROM @schema_auto_sql;
+    EXECUTE schema_auto_stmt;
+    DEALLOCATE PREPARE schema_auto_stmt;
+    SET @schema_post_ok = 0;
+    SET @schema_auto_sql = CONCAT(
+      'SELECT COUNT(*) = 2 AND MAX(auto_id) > MIN(auto_id) ',
+      'INTO @schema_post_ok FROM t_schema_auto_', @batch_long_sid,
+      ' WHERE phase IN (''pre-autoinc'', ''post-autoinc'')');
+    PREPARE schema_auto_stmt FROM @schema_auto_sql;
+    EXECUTE schema_auto_stmt;
+    DEALLOCATE PREPARE schema_auto_stmt;
+    SET post_ok = @schema_post_ok;
+    SET detail_value = 'autoinc';
+  ELSEIF @batch_long_case_id = 2 THEN
+    UPDATE t_schema_parent
+       SET v = @batch_long_sid + 50001,
+           note = 'unique-post'
+     WHERE sid = @batch_long_sid AND id = 102;
+    SELECT COUNT(*) = 1
+      INTO post_ok FROM t_schema_parent
+     WHERE sid = @batch_long_sid AND v = @batch_long_sid + 50001;
+    SET detail_value = 'unique-key';
+  ELSEIF @batch_long_case_id = 3 THEN
+    UPDATE t_schema_parent
+       SET v = v + 3,
+           note = 'composite-pk-post'
+     WHERE sid = @batch_long_sid AND id = 3;
+    SELECT v = @batch_long_sid * 1000 + 303
+           AND note = 'composite-pk-post'
+      INTO post_ok FROM t_schema_parent
+     WHERE sid = @batch_long_sid AND id = 3;
+    SET detail_value = 'composite-pk';
+  ELSEIF @batch_long_case_id = 4 THEN
+    UPDATE t_schema_parent
+       SET note = 'secondary-post'
+     WHERE sid = @batch_long_sid
+       AND v = @batch_long_sid + 40000;
+    SELECT COUNT(*) = 1
+      INTO post_ok FROM t_schema_parent FORCE INDEX(uq_sid_v)
+     WHERE sid = @batch_long_sid
+       AND v = @batch_long_sid + 40000
+       AND note = 'secondary-post';
+    SET detail_value = 'composite-secondary';
+  ELSEIF @batch_long_case_id = 5 THEN
+    UPDATE t_schema_child
+       SET amount = amount + 5,
+           note = 'fk-post'
+     WHERE sid = @batch_long_sid AND id = 105;
+    SELECT COUNT(*) = 1
+      INTO post_ok
+      FROM t_schema_child c JOIN t_schema_parent p
+        ON p.sid = c.sid AND p.id = c.parent_id
+     WHERE c.sid = @batch_long_sid
+       AND c.id = 105
+       AND p.id = 105
+       AND c.note = 'fk-post';
+    SET detail_value = 'fk-parent-child';
+  ELSEIF @batch_long_case_id = 6 THEN
+    UPDATE t_schema_child
+       SET amount = amount + 6,
+           note = 'fk-child-post'
+     WHERE sid = @batch_long_sid AND id = 6;
+    SELECT parent_id = 26 AND note = 'fk-child-post'
+      INTO post_ok FROM t_schema_child
+     WHERE sid = @batch_long_sid AND id = 6;
+    SET detail_value = 'fk-child-update';
+  ELSEIF @batch_long_case_id = 7 THEN
+    INSERT INTO t_schema_child
+    VALUES(@batch_long_sid, 107, 7, 107, 'fk-extra-post');
+    SELECT COUNT(*) = 1
+      INTO post_ok
+      FROM t_schema_child c JOIN t_schema_parent p
+        ON p.sid = c.sid AND p.id = c.parent_id
+     WHERE c.sid = @batch_long_sid
+       AND c.id = 107
+       AND p.note = 'fk-parent-live';
+    SET detail_value = 'fk-restrict-safe';
+  ELSEIF @batch_long_case_id = 8 THEN
+    UPDATE t_schema_parent
+       SET v = v + 8,
+           note = 'check-post'
+     WHERE sid = @batch_long_sid AND id = 8;
+    SELECT v >= 0 AND note = 'check-post'
+      INTO post_ok FROM t_schema_parent
+     WHERE sid = @batch_long_sid AND id = 8;
+    SET detail_value = 'check-valid';
+  ELSEIF @batch_long_case_id = 9 THEN
+    UPDATE t_schema_part
+       SET note = 'partition-insert-post'
+     WHERE sid = @batch_long_sid AND k = 109;
+    SELECT COUNT(*) = 1
+      INTO post_ok FROM t_schema_part
+     WHERE sid = @batch_long_sid
+       AND k = 109
+       AND note = 'partition-insert-post';
+    SET detail_value = 'partition-insert';
+  ELSEIF @batch_long_case_id = 10 THEN
+    UPDATE t_schema_part
+       SET v = v + 10,
+           note = 'partition-update-post'
+     WHERE sid = @batch_long_sid AND k = 10;
+    SELECT v = @batch_long_sid + 10010
+           AND note = 'partition-update-post'
+      INTO post_ok FROM t_schema_part
+     WHERE sid = @batch_long_sid AND k = 10;
+    SET detail_value = 'partition-update';
+  ELSEIF @batch_long_case_id = 11 THEN
+    UPDATE t_schema_part
+       SET note = 'partition-range-post'
+     WHERE sid = @batch_long_sid AND k = 11;
+    SELECT COUNT(*) = 2
+      INTO post_ok FROM t_schema_part
+     WHERE sid = @batch_long_sid
+       AND k BETWEEN 11 AND 12
+       AND note IN ('partition-range-pre', 'partition-range-post');
+    SET detail_value = 'partition-range-read';
+  ELSEIF @batch_long_case_id = 12 THEN
+    UPDATE t_schema_parent
+       SET v = (SELECT SUM(amount) FROM t_schema_child
+                 WHERE sid = @batch_long_sid AND parent_id = 12),
+           note = 'aggregate-post'
+     WHERE sid = @batch_long_sid AND id = 12;
+    SELECT p.v = 144 AND COUNT(c.id) = 2
+      INTO post_ok
+      FROM t_schema_parent p JOIN t_schema_child c
+        ON c.sid = p.sid AND c.parent_id = p.id
+     WHERE p.sid = @batch_long_sid AND p.id = 12
+     GROUP BY p.v;
+    SET detail_value = 'parent-child-aggregate';
+  ELSEIF @batch_long_case_id = 13 THEN
+    INSERT INTO t_schema_parent(sid, id, v, note)
+    VALUES(@batch_long_sid, 213, @batch_long_sid * 1000 + 13,
+           'odku-post')
+    ON DUPLICATE KEY UPDATE note = 'odku-post', heartbeat = heartbeat + 1;
+    SELECT note = 'odku-post' AND heartbeat >= 2
+      INTO post_ok FROM t_schema_parent
+     WHERE sid = @batch_long_sid AND id = 13;
+    SET detail_value = 'unique-conflict-update';
+  ELSEIF @batch_long_case_id = 14 THEN
+    SET @schema_auto_sql = CONCAT(
+      'INSERT INTO t_schema_auto_', @batch_long_sid,
+      '(phase, v) VALUES(''save-post'', ', @batch_long_sid + 14, ')');
+    PREPARE schema_auto_stmt FROM @schema_auto_sql;
+    EXECUTE schema_auto_stmt;
+    DEALLOCATE PREPARE schema_auto_stmt;
+    SET @schema_post_ok = 0;
+    SET @schema_auto_sql = CONCAT(
+      'SELECT COUNT(*) = 2 INTO @schema_post_ok FROM t_schema_auto_',
+      @batch_long_sid,
+      ' WHERE phase IN (''save-pre'', ''save-post'')');
+    PREPARE schema_auto_stmt FROM @schema_auto_sql;
+    EXECUTE schema_auto_stmt;
+    DEALLOCATE PREPARE schema_auto_stmt;
+    SET post_ok = @schema_post_ok;
+    SET detail_value = 'autoinc-savepoint-light';
+  ELSEIF @batch_long_case_id = 15 THEN
+    INSERT INTO t_schema_child
+    VALUES(@batch_long_sid, 115, 115, 115, 'fk-save-post');
+    SELECT COUNT(*) = 1
+      INTO post_ok
+      FROM t_schema_child c JOIN t_schema_parent p
+        ON p.sid = c.sid AND p.id = c.parent_id
+     WHERE c.sid = @batch_long_sid
+       AND c.id = 115
+       AND c.note = 'fk-save-post';
+    SET detail_value = 'fk-savepoint-light';
+  ELSEIF @batch_long_case_id = 16 THEN
+    UPDATE t_schema_part
+       SET note = 'partition-secondary-post'
+     WHERE sid = @batch_long_sid
+       AND v = @batch_long_sid + 16000;
+    SELECT COUNT(*) = 1
+      INTO post_ok FROM t_schema_part FORCE INDEX(idx_sid_v)
+     WHERE sid = @batch_long_sid
+       AND v = @batch_long_sid + 16000
+       AND note = 'partition-secondary-post';
+    SET detail_value = 'partition-secondary';
+  ELSEIF @batch_long_case_id = 17 THEN
+    INSERT INTO t_schema_child
+    VALUES(@batch_long_sid, 173, 117, 19, 'multi-child-post');
+    SELECT COUNT(*) = 3
+      INTO post_ok FROM t_schema_child
+     WHERE sid = @batch_long_sid
+       AND parent_id = 117
+       AND note LIKE 'multi-child%';
+    SET detail_value = 'multiple-children';
+  ELSEIF @batch_long_case_id = 18 THEN
+    UPDATE t_schema_parent
+       SET v = v + 18,
+           note = 'resume-parent-post'
+     WHERE sid = @batch_long_sid AND id = 18;
+    SELECT COUNT(*) = 1
+      INTO post_ok
+      FROM t_schema_child c JOIN t_schema_parent p
+        ON p.sid = c.sid AND p.id = c.parent_id
+     WHERE c.sid = @batch_long_sid
+       AND c.id = 18
+       AND p.note = 'resume-parent-post';
+    SET detail_value = 'resume-parent-update';
+  ELSEIF @batch_long_case_id = 19 THEN
+    INSERT INTO t_schema_child
+    VALUES(@batch_long_sid, 119, 119, 19, 'resume-child-post');
+    SELECT COUNT(*) = 1
+      INTO post_ok
+      FROM t_schema_child c JOIN t_schema_parent p
+        ON p.sid = c.sid AND p.id = c.parent_id
+     WHERE c.sid = @batch_long_sid
+       AND c.id = 119
+       AND p.note = 'resume-child-parent';
+    SET detail_value = 'resume-child-insert';
+  ELSEIF @batch_long_case_id = 20 THEN
+    SET @schema_auto_sql = CONCAT(
+      'INSERT INTO t_schema_auto_', @batch_long_sid,
+      '(phase, v) VALUES(''mixed-post'', ', @batch_long_sid + 20, ')');
+    PREPARE schema_auto_stmt FROM @schema_auto_sql;
+    EXECUTE schema_auto_stmt;
+    DEALLOCATE PREPARE schema_auto_stmt;
+    UPDATE t_schema_parent
+       SET note = 'mixed-post'
+     WHERE sid = @batch_long_sid AND id = 120;
+    UPDATE t_schema_part
+       SET note = 'mixed-post'
+     WHERE sid = @batch_long_sid AND k = 120;
+    SET @schema_post_ok = 0;
+    SET @schema_auto_sql = CONCAT(
+      'SELECT COUNT(*) = 1 INTO @schema_post_ok FROM t_schema_auto_',
+      @batch_long_sid,
+      ' WHERE phase = ''mixed-post''');
+    PREPARE schema_auto_stmt FROM @schema_auto_sql;
+    EXECUTE schema_auto_stmt;
+    DEALLOCATE PREPARE schema_auto_stmt;
+    SELECT @schema_post_ok
+           AND
+           (SELECT COUNT(*) = 1 FROM t_schema_child
+             WHERE sid = @batch_long_sid AND id = 120 AND parent_id = 120)
+           AND
+           (SELECT COUNT(*) = 1 FROM t_schema_part
+             WHERE sid = @batch_long_sid AND k = 120 AND note = 'mixed-post')
+      INTO post_ok;
+    SET detail_value = 'mixed-schema-features';
+  END IF;
+
+  IF COALESCE(post_ok, 0) <> 1 THEN
+    SET failure_message = CONCAT(
+      'post-resume schema check failed sid=',
+      COALESCE(CAST(@batch_long_sid AS CHAR), 'NULL'),
+      ' case=',
+      COALESCE(CAST(@batch_long_case_id AS CHAR), 'NULL'),
+      ' detail=',
+      COALESCE(detail_value, 'NULL'),
+      ' post_ok=',
+      COALESCE(CAST(post_ok AS CHAR), 'NULL'));
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = failure_message;
+  END IF;
+
+  SET @batch_long_end_action = 'COMMIT';
+  INSERT INTO t_batch_long_audit VALUES(
+    @batch_long_sid,
+    @batch_long_case_id,
+    TIMESTAMPDIFF(MICROSECOND, @batch_long_started_at, UTC_TIMESTAMP(6)),
+    @batch_long_max_stmt_us,
+    @batch_long_sql_count,
+    1,
+    detail_value);
+END|
+DELIMITER ;|
+SQL
+
+print $verify <<'SQL';
+SELECT COUNT(DISTINCT detail) AS schema_cases_ok
+  FROM t_batch_long_audit WHERE resumed_ok = 1;
+SELECT detail, COUNT(*) = 5 AS ok
+  FROM t_batch_long_audit GROUP BY detail ORDER BY detail;
+SELECT COUNT(*) = 40 AS fk_same_transaction_cases_ok
+  FROM t_batch_long_audit
+ WHERE detail IN ('fk-parent-child',
+                  'fk-child-update',
+                  'fk-restrict-safe',
+                  'fk-savepoint-light',
+                  'multiple-children',
+                  'resume-parent-update',
+                  'resume-child-insert',
+                  'mixed-schema-features');
+SELECT COUNT(*) = 25 AS partition_cases_ok
+  FROM t_batch_long_audit
+ WHERE detail IN ('partition-insert',
+                  'partition-update',
+                  'partition-range-read',
+                  'partition-secondary',
+                  'mixed-schema-features');
+SELECT 1 AS case_id,
+       (
+         (SELECT COUNT(*) FROM t_schema_auto_1
+           WHERE phase IN ('pre-autoinc', 'post-autoinc')) +
+         (SELECT COUNT(*) FROM t_schema_auto_21
+           WHERE phase IN ('pre-autoinc', 'post-autoinc')) +
+         (SELECT COUNT(*) FROM t_schema_auto_41
+           WHERE phase IN ('pre-autoinc', 'post-autoinc')) +
+         (SELECT COUNT(*) FROM t_schema_auto_61
+           WHERE phase IN ('pre-autoinc', 'post-autoinc')) +
+         (SELECT COUNT(*) FROM t_schema_auto_81
+           WHERE phase IN ('pre-autoinc', 'post-autoinc'))
+       ) = 10 AS ok
+UNION ALL SELECT 2, COUNT(*) = 5
+  FROM t_schema_parent p JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 2 AND p.id = 102 AND p.note = 'unique-post'
+UNION ALL SELECT 3, COUNT(*) = 5
+  FROM t_schema_parent p JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 3 AND p.id = 3 AND p.note = 'composite-pk-post'
+UNION ALL SELECT 4, COUNT(*) = 5
+  FROM t_schema_parent p FORCE INDEX(uq_sid_v)
+  JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 4 AND p.v = p.sid + 40000
+   AND p.note = 'secondary-post'
+UNION ALL SELECT 5, COUNT(*) = 5
+  FROM t_schema_child ch JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 5 AND ch.id = 105 AND ch.note = 'fk-post'
+UNION ALL SELECT 6, COUNT(*) = 5
+  FROM t_schema_child ch JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 6 AND ch.id = 6 AND ch.parent_id = 26
+   AND ch.note = 'fk-child-post'
+UNION ALL SELECT 7, COUNT(*) = 5
+  FROM t_schema_child ch JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 7 AND ch.id = 107 AND ch.parent_id = 7
+UNION ALL SELECT 8, COUNT(*) = 5
+  FROM t_schema_parent p JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 8 AND p.id = 8 AND p.v >= 0
+   AND p.note = 'check-post'
+UNION ALL SELECT 9, COUNT(*) = 5
+  FROM t_schema_part p JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 9 AND p.k = 109
+   AND p.note = 'partition-insert-post'
+UNION ALL SELECT 10, COUNT(*) = 5
+  FROM t_schema_part p JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 10 AND p.k = 10
+   AND p.note = 'partition-update-post'
+UNION ALL SELECT 11, COUNT(*) = 10
+  FROM t_schema_part p JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 11 AND p.k IN (11, 12)
+   AND p.note IN ('partition-range-pre', 'partition-range-post')
+UNION ALL SELECT 12, COUNT(*) = 5
+  FROM t_schema_parent p JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 12 AND p.id = 12 AND p.v = 144
+UNION ALL SELECT 13, COUNT(*) = 5
+  FROM t_schema_parent p JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 13 AND p.id = 13 AND p.note = 'odku-post'
+UNION ALL SELECT 14, COUNT(*) = 10
+  FROM (
+    SELECT phase FROM t_schema_auto_14
+    UNION ALL SELECT phase FROM t_schema_auto_34
+    UNION ALL SELECT phase FROM t_schema_auto_54
+    UNION ALL SELECT phase FROM t_schema_auto_74
+    UNION ALL SELECT phase FROM t_schema_auto_94
+  ) a
+ WHERE a.phase IN ('save-pre', 'save-post')
+UNION ALL SELECT 15, COUNT(*) = 5
+  FROM t_schema_child ch JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 15 AND ch.id = 115 AND ch.note = 'fk-save-post'
+UNION ALL SELECT 16, COUNT(*) = 5
+  FROM t_schema_part p FORCE INDEX(idx_sid_v)
+  JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 16 AND p.v = p.sid + 16000
+   AND p.note = 'partition-secondary-post'
+UNION ALL SELECT 17, COUNT(*) = 15
+  FROM t_schema_child ch JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 17 AND ch.parent_id = 117
+   AND ch.note LIKE 'multi-child%'
+UNION ALL SELECT 18, COUNT(*) = 5
+  FROM t_schema_parent p JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 18 AND p.id = 18
+   AND p.note = 'resume-parent-post'
+UNION ALL SELECT 19, COUNT(*) = 5
+  FROM t_schema_child ch JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 19 AND ch.id = 119
+   AND ch.note = 'resume-child-post'
+UNION ALL SELECT 20, COUNT(*) = 5
+  FROM t_schema_part p JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 20 AND p.k = 120
+   AND p.note = 'mixed-post'
+   AND (SELECT COUNT(*) FROM t_schema_auto_20
+         WHERE phase = 'mixed-post') = 1
+   AND (SELECT COUNT(*) FROM t_schema_auto_40
+         WHERE phase = 'mixed-post') = 1
+   AND (SELECT COUNT(*) FROM t_schema_auto_60
+         WHERE phase = 'mixed-post') = 1
+   AND (SELECT COUNT(*) FROM t_schema_auto_80
+         WHERE phase = 'mixed-post') = 1
+   AND (SELECT COUNT(*) FROM t_schema_auto_100
+         WHERE phase = 'mixed-post') = 1
+ORDER BY case_id;
+SQL
+
+sub emit_measured {
+  my ($fh, $sql) = @_;
+  print $fh "SET \@batch_long_stmt_start = NOW(6);\n";
+  print $fh "$sql;\n";
+  print $fh "SET \@batch_long_stmt_us = " .
+            "TIMESTAMPDIFF(MICROSECOND, \@batch_long_stmt_start, NOW(6));\n";
+  print $fh "SET \@batch_long_max_stmt_us = " .
+            "GREATEST(\@batch_long_max_stmt_us, \@batch_long_stmt_us);\n";
+  print $fh "SET \@batch_long_sql_count = \@batch_long_sql_count + 1;\n";
+}
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  my $name = sprintf("batch_long_app_%03d", $sid);
+  print $apps "--connect($name,localhost,root,,test)\n";
+  print $apps "--connection $name\n";
+  print $apps "UPDATE t_batch_long_control SET started_at = NOW(6) WHERE sid = $sid;\n";
+  print $apps "SET \@batch_long_sid = $sid;\n";
+  print $apps "SET \@batch_long_case_id = $case_id;\n";
+  print $apps "SET \@batch_long_started_at = UTC_TIMESTAMP(6);\n";
+  print $apps "SET \@batch_long_max_stmt_us = 0;\n";
+  print $apps "SET \@batch_long_sql_count = 0;\n";
+  print $apps "SET \@batch_long_end_action = 'COMMIT';\n";
+  print $apps "SET \@schema_pre_ok = 0;\n";
+  print $apps "START TRANSACTION;\n";
+  emit_measured($apps, "UPDATE t_schema_part SET heartbeat = heartbeat + 1 WHERE sid = $sid AND k = 0");
+
+  if ($case_id == 1) {
+    emit_measured($apps, "INSERT INTO t_schema_auto_$sid(phase, v) VALUES('pre-autoinc', $sid + 1)");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@schema_pre_ok FROM t_schema_auto_$sid WHERE phase = 'pre-autoinc'");
+  } elsif ($case_id == 2) {
+    emit_measured($apps, "INSERT INTO t_schema_parent(sid, id, v, note) VALUES($sid, 102, $sid + 50000, 'unique-pre')");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@schema_pre_ok FROM t_schema_parent WHERE sid = $sid AND v = $sid + 50000");
+  } elsif ($case_id == 3) {
+    emit_measured($apps, "UPDATE t_schema_parent SET v = $sid * 1000 + 300, note = 'composite-pk-pre' WHERE sid = $sid AND id = 3");
+    emit_measured($apps, "SELECT note = 'composite-pk-pre' INTO \@schema_pre_ok FROM t_schema_parent WHERE sid = $sid AND id = 3");
+  } elsif ($case_id == 4) {
+    emit_measured($apps, "UPDATE t_schema_parent SET v = $sid + 40000, note = 'secondary-pre' WHERE sid = $sid AND id = 4");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@schema_pre_ok FROM t_schema_parent FORCE INDEX(uq_sid_v) WHERE sid = $sid AND v = $sid + 40000");
+  } elsif ($case_id == 5) {
+    emit_measured($apps, "INSERT INTO t_schema_parent(sid, id, v, note) VALUES($sid, 105, $sid + 50105, 'fk-parent-pre')");
+    emit_measured($apps, "INSERT INTO t_schema_child VALUES($sid, 105, 105, 105, 'fk-pre')");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@schema_pre_ok FROM t_schema_child WHERE sid = $sid AND id = 105 AND parent_id = 105");
+  } elsif ($case_id == 6) {
+    emit_measured($apps, "UPDATE t_schema_child SET parent_id = 26, note = 'fk-child-pre' WHERE sid = $sid AND id = 6");
+    emit_measured($apps, "SELECT parent_id = 26 INTO \@schema_pre_ok FROM t_schema_child WHERE sid = $sid AND id = 6");
+  } elsif ($case_id == 7) {
+    emit_measured($apps, "UPDATE t_schema_parent SET note = 'fk-parent-live' WHERE sid = $sid AND id = 7");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@schema_pre_ok FROM t_schema_child WHERE sid = $sid AND id = 7 AND parent_id = 7");
+  } elsif ($case_id == 8) {
+    emit_measured($apps, "UPDATE t_schema_parent SET v = v + 80, note = 'check-pre' WHERE sid = $sid AND id = 8");
+    emit_measured($apps, "SELECT v >= 0 INTO \@schema_pre_ok FROM t_schema_parent WHERE sid = $sid AND id = 8");
+  } elsif ($case_id == 9) {
+    emit_measured($apps, "INSERT INTO t_schema_part VALUES($sid, 109, $sid + 9000, 'partition-insert-pre', 0)");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@schema_pre_ok FROM t_schema_part WHERE sid = $sid AND k = 109");
+  } elsif ($case_id == 10) {
+    emit_measured($apps, "UPDATE t_schema_part SET v = $sid + 10000, note = 'partition-update-pre' WHERE sid = $sid AND k = 10");
+    emit_measured($apps, "SELECT v = $sid + 10000 INTO \@schema_pre_ok FROM t_schema_part WHERE sid = $sid AND k = 10");
+  } elsif ($case_id == 11) {
+    emit_measured($apps, "UPDATE t_schema_part SET note = 'partition-range-pre' WHERE sid = $sid AND k IN (11, 12)");
+    emit_measured($apps, "SELECT COUNT(*) = 2 INTO \@schema_pre_ok FROM t_schema_part WHERE sid = $sid AND k BETWEEN 11 AND 12 AND note = 'partition-range-pre'");
+  } elsif ($case_id == 12) {
+    emit_measured($apps, "INSERT INTO t_schema_child VALUES($sid, 112, 12, 122, 'aggregate-pre')");
+    emit_measured($apps, "SELECT SUM(amount) = 144 INTO \@schema_pre_ok FROM t_schema_child WHERE sid = $sid AND parent_id = 12");
+  } elsif ($case_id == 13) {
+    emit_measured($apps, "INSERT INTO t_schema_parent(sid, id, v, note) VALUES($sid, 113, " . ($sid * 1000 + 13) . ", 'odku-pre') ON DUPLICATE KEY UPDATE note = 'odku-pre', heartbeat = heartbeat + 1");
+    emit_measured($apps, "SELECT note = 'odku-pre' INTO \@schema_pre_ok FROM t_schema_parent WHERE sid = $sid AND id = 13");
+  } elsif ($case_id == 14) {
+    emit_measured($apps, "INSERT INTO t_schema_auto_$sid(phase, v) VALUES('save-pre', $sid + 14)");
+    emit_measured($apps, "SAVEPOINT s_schema_auto");
+    emit_measured($apps, "INSERT INTO t_schema_auto_$sid(phase, v) VALUES('save-rollback', $sid + 1400)");
+    emit_measured($apps, "ROLLBACK TO SAVEPOINT s_schema_auto");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@schema_pre_ok FROM t_schema_auto_$sid WHERE phase = 'save-pre'");
+  } elsif ($case_id == 15) {
+    emit_measured($apps, "INSERT INTO t_schema_parent(sid, id, v, note) VALUES($sid, 115, $sid + 50115, 'fk-save-parent')");
+    emit_measured($apps, "SAVEPOINT s_schema_fk");
+    emit_measured($apps, "INSERT INTO t_schema_child VALUES($sid, 215, 115, 215, 'fk-save-rollback')");
+    emit_measured($apps, "ROLLBACK TO SAVEPOINT s_schema_fk");
+    emit_measured($apps, "SELECT COUNT(*) = 0 INTO \@schema_pre_ok FROM t_schema_child WHERE sid = $sid AND id = 215");
+  } elsif ($case_id == 16) {
+    emit_measured($apps, "UPDATE t_schema_part SET v = $sid + 16000, note = 'partition-secondary-pre' WHERE sid = $sid AND k = 16");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@schema_pre_ok FROM t_schema_part FORCE INDEX(idx_sid_v) WHERE sid = $sid AND v = $sid + 16000 AND k = 16");
+  } elsif ($case_id == 17) {
+    emit_measured($apps, "INSERT INTO t_schema_parent(sid, id, v, note) VALUES($sid, 117, $sid + 50117, 'multi-child-parent')");
+    emit_measured($apps, "INSERT INTO t_schema_child VALUES($sid, 171, 117, 17, 'multi-child-a'),($sid, 172, 117, 18, 'multi-child-b')");
+    emit_measured($apps, "SELECT COUNT(*) = 2 INTO \@schema_pre_ok FROM t_schema_child WHERE sid = $sid AND parent_id = 117");
+  } elsif ($case_id == 18) {
+    emit_measured($apps, "UPDATE t_schema_parent SET note = 'resume-parent-pre' WHERE sid = $sid AND id = 18");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@schema_pre_ok FROM t_schema_child WHERE sid = $sid AND id = 18 AND parent_id = 18");
+  } elsif ($case_id == 19) {
+    emit_measured($apps, "INSERT INTO t_schema_parent(sid, id, v, note) VALUES($sid, 119, $sid + 50119, 'resume-child-parent')");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@schema_pre_ok FROM t_schema_parent WHERE sid = $sid AND id = 119");
+  } elsif ($case_id == 20) {
+    emit_measured($apps, "INSERT INTO t_schema_auto_$sid(phase, v) VALUES('mixed-pre', $sid + 20)");
+    emit_measured($apps, "INSERT INTO t_schema_parent(sid, id, v, note) VALUES($sid, 120, $sid + 50120, 'mixed-parent')");
+    emit_measured($apps, "INSERT INTO t_schema_child VALUES($sid, 120, 120, 20, 'mixed-child')");
+    emit_measured($apps, "INSERT INTO t_schema_part VALUES($sid, 120, $sid + 20000, 'mixed-pre', 0)");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@schema_pre_ok FROM t_schema_child WHERE sid = $sid AND id = 120 AND parent_id = 120");
+  }
+}
+print $apps "--connection default\n";
+
+for my $round (1 .. 80) {
+  for my $sid (1 .. 100) {
+    my $name = sprintf("batch_long_app_%03d", $sid);
+    print $post_apps "--connection $name\n";
+    emit_measured($post_apps, "UPDATE t_schema_part SET heartbeat = heartbeat + 1 WHERE sid = $sid AND k = 0");
+  }
+}
+print $post_apps "--connection default\n";
+
+close($setup);
+close($apps);
+close($post_apps);
+close($cleanup);
+close($verify);
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+SET GLOBAL preserve_trx_recovery_max_count=200;
+--let $old_preserve_trx_drain_grace_ms= `SELECT @@GLOBAL.preserve_trx_drain_grace_ms`
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+--let $old_preserve_trx_max_modified_tables= `SELECT @@GLOBAL.preserve_trx_max_modified_tables`
+SET GLOBAL preserve_trx_max_modified_tables=512;
+
+--let $batch_long_prefix= batch_long_schema
+--let $batch_long_setup_file= $MYSQLTEST_VARDIR/tmp/batch_long_schema_setup.inc
+--let $batch_long_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_schema_apps.inc
+--let $batch_long_post_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_schema_post_apps.inc
+--let $batch_long_cleanup_file= $MYSQLTEST_VARDIR/tmp/batch_long_schema_cleanup.inc
+--let $batch_long_resume_file= $MYSQLTEST_VARDIR/tmp/batch_long_schema_resume.inc
+--let $batch_long_verify_file= $MYSQLTEST_VARDIR/tmp/batch_long_schema_verify.inc
+--source suite/preserve_trx/include/batch_drain_100_long_common.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+--disable_query_log
+--disable_result_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_drain_grace_ms=$old_preserve_trx_drain_grace_ms
+--eval SET GLOBAL preserve_trx_max_modified_tables=$old_preserve_trx_max_modified_tables
+--enable_result_log
+--enable_query_log

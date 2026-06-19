@@ -3245,6 +3245,57 @@ bool meb_fil_space_free(space_id_t space_id) {
 }
 #endif /* UNIV_HOTBACKUP */
 
+dberr_t fil_preserve_temp_space_adopt(space_id_t space_id, const char *name,
+                                      const char *path, uint32_t flags,
+                                      page_no_t size) {
+  if (space_id == 0 || name == nullptr || name[0] == '\0' ||
+      path == nullptr || path[0] == '\0' || size == 0) {
+    return DB_ERROR;
+  }
+  if (fil_system == nullptr) return DB_ERROR;
+
+  if (fil_space_get(space_id) != nullptr) return DB_TABLESPACE_EXISTS;
+
+  fil_space_t *space =
+      fil_space_create(name, space_id, flags, FIL_TYPE_TEMPORARY);
+  if (space == nullptr) return DB_ERROR;
+
+  DBUG_EXECUTE_IF("fil_preserve_temp_space_node_create_failure", {
+    fil_space_free(space_id, false);
+    return DB_ERROR;
+  });
+
+  if (fil_node_create(path, size, space, false, false) == nullptr) {
+    fil_space_free(space_id, false);
+    return DB_ERROR;
+  }
+  space->size_in_header = size;
+
+  return DB_SUCCESS;
+}
+
+dberr_t fil_preserve_temp_space_detach(space_id_t space_id,
+                                       buf_remove_t buf_remove) {
+  if (space_id == 0) return DB_ERROR;
+  if (fil_system == nullptr) return DB_ERROR;
+
+  dberr_t err = fil_delete_tablespace(space_id, buf_remove);
+  if (err == DB_SUCCESS) {
+    DBUG_EXECUTE_IF("fil_preserve_temp_space_detach_after_delete",
+                    return DB_IO_ERROR;);
+  }
+  return err;
+}
+
+dberr_t fil_preserve_temp_space_forget(space_id_t space_id) {
+  if (space_id == 0) return DB_ERROR;
+  if (fil_system == nullptr) return DB_ERROR;
+  if (fil_space_get(space_id) == nullptr) return DB_TABLESPACE_NOT_FOUND;
+  buf_LRU_flush_or_remove_pages(space_id, BUF_REMOVE_ALL_NO_WRITE, nullptr);
+  if (!fil_space_free(space_id, false)) return DB_ERROR;
+  return DB_SUCCESS;
+}
+
 /** Create a space memory object and put it to the fil_system hash table.
 The tablespace name is independent from the tablespace file-name.
 Error messages are issued to the server log.

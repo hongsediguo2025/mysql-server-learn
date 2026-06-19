@@ -1,0 +1,49 @@
+DROP TABLE IF EXISTS t_warmcopy_idle_silent;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1024;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=4096;
+CREATE TABLE t_warmcopy_idle_silent(
+id INT PRIMARY KEY,
+payload VARBINARY(1024)
+) ENGINE=InnoDB;
+INSERT INTO t_warmcopy_idle_silent VALUES(1,REPEAT('a',512));
+RESET MASTER;
+START TRANSACTION;
+UPDATE t_warmcopy_idle_silent SET payload=REPEAT('b',512) WHERE id=1;
+SET DEBUG_SYNC =
+'before_execute_sql_command SIGNAL warmcopy_idle_silent_select_blocked WAIT_FOR warmcopy_idle_silent_select_continue';
+SELECT COUNT(*) FROM t_warmcopy_idle_silent WHERE id=1;
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_idle_silent_select_blocked TIMEOUT 10';
+SET DEBUG_SYNC =
+'preserve_trx_warmcopy_after_descriptor_hwm SIGNAL warmcopy_idle_silent_hwm WAIT_FOR warmcopy_idle_silent_continue_drain';
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_idle_silent_hwm TIMEOUT 10';
+SET DEBUG_SYNC = 'now SIGNAL warmcopy_idle_silent_select_continue';
+COUNT(*)
+1
+SET DEBUG_SYNC = 'RESET';
+SET DEBUG_SYNC = 'now SIGNAL warmcopy_idle_silent_continue_drain';
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+SELECT COUNT(*) AS preserved_count_after_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_resume
+0
+SELECT id, payload=REPEAT('b',512) AS payload_ok
+FROM t_warmcopy_idle_silent;
+id	payload_ok
+1	1
+include/assert_grep.inc [committed warm-copy idle silent transaction appears once in binlog]
+DROP TABLE t_warmcopy_idle_silent;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET DEBUG_SYNC = 'RESET';

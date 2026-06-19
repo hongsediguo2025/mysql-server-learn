@@ -56,6 +56,7 @@
 #include "sql/mdl.h"
 #include "sql/mdl_context_backup.h"  // MDL_context_backup_manager
 #include "sql/mysqld.h"              // server_id
+#include "sql/preserve_trx_xid.h"    // xid_is_preserve_magic
 #include "sql/protocol.h"
 #include "sql/psi_memory_key.h"  // key_memory_XID
 #include "sql/query_options.h"
@@ -1097,6 +1098,8 @@ bool Sql_cmd_xa_start::trans_xa_start(THD *thd) {
     my_error(ER_XAER_RMFAIL, MYF(0), xid_state->state_name());
   else if (thd->locked_tables_mode || thd->in_active_multi_stmt_transaction())
     my_error(ER_XAER_OUTSIDE, MYF(0));
+  else if (xid_is_preserve_magic(*m_xid))
+    my_error(ER_XAER_INVAL, MYF(0));
   else if (!trans_begin(thd)) {
     xid_state->start_normal_xa(m_xid);
     MYSQL_SET_TRANSACTION_XID(thd->m_transaction_psi,
@@ -1175,7 +1178,9 @@ bool Sql_cmd_xa_prepare::trans_xa_prepare(THD *thd) {
   XID_STATE *xid_state = thd->get_transaction()->xid_state();
   DBUG_TRACE;
 
-  if (!xid_state->has_state(XID_STATE::XA_IDLE))
+  if (xid_is_preserve_magic(*m_xid))
+    my_error(ER_XAER_INVAL, MYF(0));
+  else if (!xid_state->has_state(XID_STATE::XA_IDLE))
     my_error(ER_XAER_RMFAIL, MYF(0), xid_state->state_name());
   else if (!xid_state->has_same_xid(m_xid))
     my_error(ER_XAER_NOTA, MYF(0));

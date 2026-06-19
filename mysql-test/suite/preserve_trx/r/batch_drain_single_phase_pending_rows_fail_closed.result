@@ -1,0 +1,40 @@
+DROP TABLE IF EXISTS t_single_phase_pending_rows;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=1073741824;
+CREATE TABLE t_single_phase_pending_rows(
+id INT PRIMARY KEY,
+payload VARCHAR(1200)
+) ENGINE=InnoDB;
+INSERT INTO t_single_phase_pending_rows VALUES
+(1,'before'), (2,'before'), (3,'before'), (4,'before'), (5,'before'),
+(6,'before'), (7,'before'), (8,'before'), (9,'before'), (10,'before'),
+(11,'before'), (12,'before'), (13,'before'), (14,'before'), (15,'before'),
+(16,'before'), (17,'before'), (18,'before'), (19,'before'), (20,'before');
+RESET MASTER;
+SELECT COUNT(*) AS status_counter_exists
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_warmcopy_provider_full_copy_to_count';
+status_counter_exists
+1
+START TRANSACTION;
+UPDATE t_single_phase_pending_rows
+SET payload=CONCAT(REPEAT('p',1000), '-', id);
+SET DEBUG='+d,preserve_trx_fail_flush_pending_rows_event';
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET DEBUG='-d,preserve_trx_fail_flush_pending_rows_event';
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+SELECT @single_phase_full_copy_delta AS full_copy_delta;
+full_copy_delta
+0
+COMMIT;
+SELECT COUNT(*) AS changed_rows
+FROM t_single_phase_pending_rows
+WHERE payload = CONCAT(REPEAT('p',1000), '-', id);
+changed_rows
+20
+DROP TABLE t_single_phase_pending_rows;

@@ -1,0 +1,1 @@
+--log-bin=preserve-trx-session-off-bin --server-id=1 --binlog-format=STATEMENT

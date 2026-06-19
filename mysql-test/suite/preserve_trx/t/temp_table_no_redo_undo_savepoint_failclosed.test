@@ -1,0 +1,34 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+
+CREATE TEMPORARY TABLE tmp_preserve_savepoint(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+START TRANSACTION;
+INSERT INTO tmp_preserve_savepoint VALUES(1, 10);
+SAVEPOINT s1;
+INSERT INTO tmp_preserve_savepoint VALUES(2, 20);
+UPDATE tmp_preserve_savepoint SET v = 21 WHERE id = 2;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+SELECT * FROM tmp_preserve_savepoint ORDER BY id;
+ROLLBACK TO SAVEPOINT s1;
+SELECT * FROM tmp_preserve_savepoint ORDER BY id;
+INSERT INTO tmp_preserve_savepoint VALUES(3, 30);
+COMMIT;
+SELECT * FROM tmp_preserve_savepoint ORDER BY id;
+
+DROP TEMPORARY TABLE tmp_preserve_savepoint;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
