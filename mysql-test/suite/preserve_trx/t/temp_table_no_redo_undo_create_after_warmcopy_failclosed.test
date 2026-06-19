@@ -63,6 +63,6 @@ DROP TEMPORARY TABLE tmp_preserve_existing;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_temp_table_enable=ON;
 SET DEBUG_SYNC = 'RESET';

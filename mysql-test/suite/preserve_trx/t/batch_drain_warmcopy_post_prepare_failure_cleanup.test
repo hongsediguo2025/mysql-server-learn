@@ -65,5 +65,5 @@ SELECT id, v, OCTET_LENGTH(payload) AS payload_len,
 
 DROP TABLE t_warmcopy_post_prepare_failure;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_enable=ON;

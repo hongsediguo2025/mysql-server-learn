@@ -122,7 +122,7 @@ uint preserve_trx_materialize_timeout_ms = 5000;
 ulong preserve_trx_drain_mode = PRESERVE_TRX_DRAIN_MODE_SOFT;
 uint preserve_trx_drain_grace_ms = 30000;
 uint preserve_trx_drain_hard_timeout_ms = 30000;
-bool preserve_trx_warmcopy_enable = false;
+bool preserve_trx_warmcopy_enable = true;
 uint preserve_trx_warmcopy_close_timeout_ms = 30000;
 uint preserve_trx_warmcopy_min_open_ms = 1000;
 uint preserve_trx_warmcopy_chunk_bytes = 1048576;
@@ -5105,7 +5105,7 @@ bool preserve_trx_temp_table_capture_enabled(THD *thd, const TABLE *table) {
   /*
     This is the no-allocation predicate for hook sites that require an
     already admitted participant. First-touch row/create/truncate admission is
-    handled by the temp-table participant helpers after their default-off gate.
+    handled by the temp-table participant helpers after their feature gate.
   */
   return preserve_trx_temp_table_get_participant(thd) != nullptr;
 }
@@ -8655,7 +8655,8 @@ bool Preserve_trx_drain_service::execute(
     return preserve_trx_reject_unsupported();
 
   const ulonglong generation = g_batch_generation.fetch_add(1) + 1;
-  const bool warmcopy_enabled = preserve_trx_warmcopy_enable;
+  const bool warmcopy_enabled =
+      preserve_trx_warmcopy_enable && opt_bin_log && mysql_bin_log.is_open();
   Preserve_trx_drain_orchestrator drain_orchestrator(
       warmcopy_enabled ? Preserve_trx_drain_phase_mode::TWO_PHASE
                        : Preserve_trx_drain_phase_mode::SINGLE_PHASE);

@@ -70,6 +70,6 @@ SET GLOBAL preserve_trx_warmcopy_pending_bytes_limit=67108864;
 SET GLOBAL preserve_trx_warmcopy_pending_range_limit=1024;
 SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_enable=ON;
 SET DEBUG_SYNC = 'RESET';

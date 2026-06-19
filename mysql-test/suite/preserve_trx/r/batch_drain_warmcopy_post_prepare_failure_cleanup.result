@@ -38,5 +38,5 @@ include/assert_grep.inc [Warmcopy post-prepare failure keeps original binlog cac
 include/assert_grep.inc [Warmcopy post-prepare failure commits with a nonzero Xid event]
 DROP TABLE t_warmcopy_post_prepare_failure;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_enable=ON;

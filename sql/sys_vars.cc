@@ -1251,7 +1251,7 @@ static Sys_var_bool Sys_preserve_trx_warmcopy_enable(
     "preserve_trx_warmcopy_enable",
     "Enable the warm-copy phase for DRAIN TRANSACTIONS PRESERVE binlog caches.",
     GLOBAL_VAR(preserve_trx_warmcopy_enable), CMD_LINE(OPT_ARG),
-    DEFAULT(false), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+    DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
 static Sys_var_uint Sys_preserve_trx_warmcopy_close_timeout_ms(
     "preserve_trx_warmcopy_close_timeout_ms",

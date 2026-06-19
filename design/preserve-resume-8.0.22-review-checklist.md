@@ -1114,8 +1114,8 @@ Resolution:
 - 8.0.22 requires `my_thread_local.h` for the `my_errno()` accessor used by
   mysys file helpers.
 - Earlier batches used explicit-OFF staging guards.  The current release
-  contract and full-gate evidence are default ON for both `preserve_trx_enable`
-  and `preserve_trx_temp_table_enable`.
+  contract and full-gate evidence are default ON for `preserve_trx_enable`,
+  `preserve_trx_temp_table_enable`, and `preserve_trx_warmcopy_enable`.
 Commit:
 - Created in this batch; use `git log --oneline -1` for the final amended
   commit hash.

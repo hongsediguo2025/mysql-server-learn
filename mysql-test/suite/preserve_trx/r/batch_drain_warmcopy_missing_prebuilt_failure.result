@@ -35,5 +35,5 @@ full_copy_to_count
 DROP TABLE t_warmcopy_missing_prebuilt;
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET DEBUG_SYNC = 'RESET';

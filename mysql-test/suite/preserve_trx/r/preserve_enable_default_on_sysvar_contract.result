@@ -4,6 +4,9 @@ preserve_enable_default_on
 SELECT @@global.preserve_trx_temp_table_enable AS temp_table_enable_default_on;
 temp_table_enable_default_on
 1
+SELECT @@global.preserve_trx_warmcopy_enable AS warmcopy_enable_default_on;
+warmcopy_enable_default_on
+1
 DROP TABLE IF EXISTS t_preserve_default_on;
 CREATE TABLE t_preserve_default_on(
 id INT PRIMARY KEY,
@@ -18,6 +21,9 @@ preserve_enable_after_restart
 1
 SELECT @@global.preserve_trx_temp_table_enable AS temp_table_enable_after_restart;
 temp_table_enable_after_restart
+1
+SELECT @@global.preserve_trx_warmcopy_enable AS warmcopy_enable_after_restart;
+warmcopy_enable_after_restart
 1
 RESUME PRESERVED TRANSACTION 'TOKEN';
 COMMIT;

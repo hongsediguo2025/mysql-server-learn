@@ -53,5 +53,5 @@ SELECT * FROM t_warmcopy_participant_observability ORDER BY id;
 DROP TABLE t_warmcopy_participant_observability;
 SET GLOBAL preserve_trx_temp_table_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_enable=ON;

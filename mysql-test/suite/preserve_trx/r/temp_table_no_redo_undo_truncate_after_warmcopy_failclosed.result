@@ -33,6 +33,6 @@ rows_after_commit	sum_after_commit
 DROP TEMPORARY TABLE tmp_preserve_truncate;
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_temp_table_enable=ON;
 SET DEBUG_SYNC = 'RESET';

@@ -4,9 +4,9 @@ This file tracks the test-first migration contract for the 8.0.22 port.
 
 Status note: this is the historical migration ledger.  Staging-era statements
 below describe how the port was brought up batch by batch; they are not current
-release gaps.  The current release contract is default ON for both
-`preserve_trx_enable` and `preserve_trx_temp_table_enable`, and exact-current
-test evidence is recorded in
+release gaps.  The current release contract is default ON for
+`preserve_trx_enable`, `preserve_trx_temp_table_enable`, and
+`preserve_trx_warmcopy_enable`, and exact-current test evidence is recorded in
 `design/preserve-resume-8.0.22-review-checklist.md`.
 
 ## Global Test Inventory
@@ -91,7 +91,8 @@ Current status:
   trips a modern Clang enum constexpr diagnostic.
 - Historical note: Batch 0 originally used explicit-OFF staging guards while the
   runtime was incomplete.  The current 8.0.22 release contract is default ON:
-  `preserve_trx_enable=ON` and `preserve_trx_temp_table_enable=ON`.
+  `preserve_trx_enable=ON`, `preserve_trx_temp_table_enable=ON`, and
+  `preserve_trx_warmcopy_enable=ON`.
 
 ## Batch 1 Tests
 
@@ -570,7 +571,9 @@ Tests:
 - `binlog_state_*`;
 - `binlog_gtid_*`;
 - `fault_injection_binlog_cache_cleanup.test`;
-- new 8.0.22 test `warmcopy_default_off_normal_binlog_smoke.test`;
+- historical 8.0.22 staging test name
+  `warmcopy_default_off_normal_binlog_smoke.test`, superseded by the
+  default-ON release contract plus explicit-OFF safety tests;
 - new 8.0.22 test `warmcopy_parameter_isolation.test`;
 - `warmcopy_idle_silent_large_cache.test`;
 - `warmcopy_admission_toctou.test`;

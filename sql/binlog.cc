@@ -3739,6 +3739,7 @@ bool mysql_binlog_preserve_warmcopy_cache_length(THD *thd, uint64_t *length,
   if (length != nullptr) *length = 0;
   if (has_blob != nullptr) *has_blob = false;
   if (thd == nullptr || length == nullptr) return true;
+  if (!opt_bin_log || !mysql_bin_log.is_open()) return false;
 
   binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
   if (cache_mngr == nullptr || cache_mngr->trx_cache.pending() != nullptr ||

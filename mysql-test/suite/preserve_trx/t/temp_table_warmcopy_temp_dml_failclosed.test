@@ -62,6 +62,6 @@ DROP TABLE t_ps_warmcopy_temp_obs;
 SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
 SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1048576;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_temp_table_enable=ON;
 SET GLOBAL preserve_trx_enable=ON;

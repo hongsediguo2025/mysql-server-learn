@@ -2,6 +2,7 @@
 
 SELECT @@global.preserve_trx_enable AS preserve_enable_default_on;
 SELECT @@global.preserve_trx_temp_table_enable AS temp_table_enable_default_on;
+SELECT @@global.preserve_trx_warmcopy_enable AS warmcopy_enable_default_on;
 
 --disable_warnings
 DROP TABLE IF EXISTS t_preserve_default_on;
@@ -27,6 +28,7 @@ PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
 
 SELECT @@global.preserve_trx_enable AS preserve_enable_after_restart;
 SELECT @@global.preserve_trx_temp_table_enable AS temp_table_enable_after_restart;
+SELECT @@global.preserve_trx_warmcopy_enable AS warmcopy_enable_after_restart;
 
 --source suite/preserve_trx/include/get_preserved_token.inc
 --replace_result $preserved_token TOKEN

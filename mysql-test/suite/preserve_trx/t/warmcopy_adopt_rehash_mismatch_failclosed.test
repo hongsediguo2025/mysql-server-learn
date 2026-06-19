@@ -40,5 +40,5 @@ SELECT * FROM t_warmcopy_adopt_rehash ORDER BY id;
 DROP TABLE t_warmcopy_adopt_rehash;
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
-SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET DEBUG_SYNC = 'RESET';
