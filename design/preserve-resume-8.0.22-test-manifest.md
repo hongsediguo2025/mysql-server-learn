@@ -25,7 +25,7 @@ real topology checks were added upstream.  The 8.0.22 port now also carries:
   this is collected by MTR and skips when the Group Replication plugin is not
   available in the local build.
 
-## Current Full-Gate Evidence
+## Current Gate Evidence
 
 ### 11-Review Follow-Up Targeted Gate: 2026-06-19
 
@@ -42,12 +42,22 @@ gate for those changes is:
   `mysqld`, `preserve_trx-t`, and `preserve_trx_warmcopy-t` built or ran
   successfully; `preserve_trx-t` passed 245 tests and
   `preserve_trx_warmcopy-t` passed 84 tests.
-- Targeted MTR in debug and release with `--skip-log-bin`:
-  `token_visibility_redaction`, `startup_option_validation`,
-  `resume_any_rechecks_object_privileges`, and `shutdown_report` passed.
-  The object-privilege test now includes a `RESUME_ANY` user with only a
-  column-level grant on a lock-only table; RESUME is denied and the token
-  remains available for an authorized user.
+- Targeted normal-binlog MTR in debug and release:
+  `preserve_object_privilege_recheck`,
+  `preserve_object_privilege_recheck_positive`, `validation_and_privileges`,
+  `startup_option_validation`, `key_permission_reject`,
+  `token_visibility_redaction`, `binlog_cache_sidecar_symlink_reject`,
+  `temp_sidecar_symlink_reject`, `batch_drain_warmcopy_two_phase_binlog_equiv`,
+  and `shutdown_report` passed.  The debug-only
+  `batch_drain_warmcopy_finalize_after_close_deadline` test passed in debug and
+  was an expected release skip.
+- Targeted `--skip-log-bin` MTR in debug and release:
+  `resume_any_rechecks_object_privileges`, `snapshot_bin_symlink_reject`, and
+  `shutdown_report` passed.  The object-privilege test now includes a
+  `RESUME_ANY` user with only a column-level grant on a lock-only table; RESUME
+  is denied and the token remains available for an authorized user.  It also
+  includes a table-level `RESUME_ANY` user proving lock-only MDL table grants
+  still permit RESUME.
 - Python unit:
   `scripts.tests.test_resumable_trx_longrun_e2e` and
   `scripts.tests.test_resumable_trx_business_e2e` ran 253 tests and passed.

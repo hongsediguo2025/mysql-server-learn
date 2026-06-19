@@ -44,14 +44,29 @@ GUnit:
 - release preserve_trx_warmcopy-t: 84 tests passed.
 
 MTR targeted:
+- debug normal-binlog:
+  preserve_object_privilege_recheck, preserve_object_privilege_recheck_positive,
+  validation_and_privileges, startup_option_validation, key_permission_reject,
+  token_visibility_redaction, binlog_cache_sidecar_symlink_reject,
+  temp_sidecar_symlink_reject, batch_drain_warmcopy_two_phase_binlog_equiv,
+  batch_drain_warmcopy_finalize_after_close_deadline, shutdown_report = pass.
 - debug --skip-log-bin:
-  token_visibility_redaction, startup_option_validation,
-  resume_any_rechecks_object_privileges, shutdown_report = pass.
+  resume_any_rechecks_object_privileges, snapshot_bin_symlink_reject,
+  shutdown_report = pass.
+- release normal-binlog:
+  preserve_object_privilege_recheck, preserve_object_privilege_recheck_positive,
+  validation_and_privileges, startup_option_validation, key_permission_reject,
+  token_visibility_redaction, binlog_cache_sidecar_symlink_reject,
+  temp_sidecar_symlink_reject, batch_drain_warmcopy_two_phase_binlog_equiv,
+  shutdown_report = pass.  The debug-sync-only warmcopy close-deadline test
+  was an expected release skip.
 - release --skip-log-bin:
-  token_visibility_redaction, startup_option_validation,
-  resume_any_rechecks_object_privileges, shutdown_report = pass.
+  resume_any_rechecks_object_privileges, snapshot_bin_symlink_reject,
+  shutdown_report = pass.
 - resume_any_rechecks_object_privileges now includes a column-only
-  RESUME_ANY user and proves the token remains preserved after access denied.
+  RESUME_ANY user and proves the token remains preserved after access denied;
+  it also includes a table-level RESUME_ANY user and proves lock-only MDL table
+  grants still permit RESUME.
 
 Python:
 - python3 -m unittest scripts.tests.test_resumable_trx_longrun_e2e
