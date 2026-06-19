@@ -91,6 +91,11 @@ class WarmcopyObservabilitySink {
   virtual void publish(const std::string &message) = 0;
 };
 
+/*
+  Model/helper used by preserve_trx_warmcopy gunit coverage.  The production
+  drain path uses Mysql_binlog_warmcopy_session together with
+  Warmcopy_batch_drain_participant in preserve_trx.cc.
+*/
 class Warmcopy_descriptor_tracker {
  public:
   void note_range_covered(uint64_t offset, uint64_t length,
@@ -167,6 +172,10 @@ class WarmcopyParticipantCleanup {
 
 class THD;
 
+/*
+  Model/helper used by preserve_trx_warmcopy gunit coverage.  It is not the
+  production DRAIN TRANSACTIONS PRESERVE coordinator.
+*/
 class WarmcopyDrainCoordinator {
  public:
   bool open_epoch(THD *coordinator_thd);
@@ -203,6 +212,10 @@ class WarmcopyDrainCoordinator {
   std::vector<WarmcopyParticipant *> m_participants;
 };
 
+/*
+  Adapter for the gunit coordinator model above.  Production warmcopy
+  participation is wired through Warmcopy_batch_drain_participant.
+*/
 class WarmcopyDrainParticipantAdapter final
     : public Preserve_trx_drain_participant {
  public:

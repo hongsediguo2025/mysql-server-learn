@@ -2014,10 +2014,7 @@ def business_live_large_cache_buckets_mb(config: LongRunConfig) -> List[int]:
 
 
 def business_live_default_baseline_compare(config: LongRunConfig) -> bool:
-    return (
-        config.warmcopy_enabled
-        and config.cycle_interval_s <= BUSINESS_LIVE_BASELINE_COMPARE_MAX_INTERVAL_S
-    )
+    return config.cycle_interval_s <= BUSINESS_LIVE_BASELINE_COMPARE_MAX_INTERVAL_S
 
 
 def business_live_covered_large_cache_buckets_mb(
@@ -2163,8 +2160,7 @@ def build_business_live_plan(
         config, options
     )
     if (
-        config.warmcopy_enabled
-        and not options.expected_binlog_events_file
+        not options.expected_binlog_events_file
         and not options.write_binlog_events_file
         and business_live_default_baseline_compare(config)
     ):

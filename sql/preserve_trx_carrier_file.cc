@@ -104,10 +104,6 @@ bool path_is_symlink(const std::string &path) {
   return my_is_symlink(normalized.c_str(), nullptr);
 }
 
-bool path_is_dangling_symlink(const std::string &path) {
-  return path_is_symlink(path);
-}
-
 bool token_is_filename_safe(const std::string &token) {
   if (token.empty() || token.length() > PRESERVE_TRX_TOKEN_MAX_LENGTH) {
     return false;
@@ -908,12 +904,12 @@ Preserve_key_status read_key(
   MY_STAT stat_area;
   if (my_stat(path.c_str(), &stat_area, MYF(0)) == nullptr) {
     if (my_errno() == ENOENT) {
-      return path_is_dangling_symlink(path) ? Preserve_key_status::CORRUPT
-                                            : Preserve_key_status::MISSING;
+      return path_is_symlink(path) ? Preserve_key_status::CORRUPT
+                                   : Preserve_key_status::MISSING;
     }
     return Preserve_key_status::IO_ERROR;
   }
-  if (path_is_dangling_symlink(path)) return Preserve_key_status::CORRUPT;
+  if (path_is_symlink(path)) return Preserve_key_status::CORRUPT;
   if (!MY_S_ISREG(stat_area.st_mode)) return Preserve_key_status::CORRUPT;
 #ifndef _WIN32
   if (stat_area.st_uid != geteuid() || (stat_area.st_mode & 0777) != 0600) {

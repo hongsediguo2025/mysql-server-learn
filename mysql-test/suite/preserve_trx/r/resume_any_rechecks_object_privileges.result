@@ -1,6 +1,7 @@
 DROP USER IF EXISTS preserve_resume_any_no_table@localhost;
 DROP USER IF EXISTS preserve_resume_any_readonly@localhost;
 DROP USER IF EXISTS preserve_resume_any_insert_only@localhost;
+DROP USER IF EXISTS pr_any_col_upd@localhost;
 DROP USER IF EXISTS preserve_resume_owner_revoke@localhost;
 DROP DATABASE IF EXISTS preserve_resume_any_obj_db;
 SET GLOBAL preserve_trx_enable=ON;
@@ -8,6 +9,8 @@ CREATE DATABASE preserve_resume_any_obj_db;
 USE preserve_resume_any_obj_db;
 CREATE TABLE t_resume_any_obj_priv(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_resume_any_obj_priv VALUES(1,10);
+CREATE TABLE t_resume_any_lock_only(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_resume_any_lock_only VALUES(1,100);
 CREATE USER preserve_resume_any_no_table@localhost;
 GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO
 preserve_resume_any_no_table@localhost;
@@ -21,6 +24,13 @@ GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO
 preserve_resume_any_insert_only@localhost;
 GRANT INSERT ON preserve_resume_any_obj_db.t_resume_any_obj_priv TO
 preserve_resume_any_insert_only@localhost;
+CREATE USER pr_any_col_upd@localhost;
+GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO
+pr_any_col_upd@localhost;
+GRANT INSERT, UPDATE, DELETE ON preserve_resume_any_obj_db.t_resume_any_obj_priv TO
+pr_any_col_upd@localhost;
+GRANT UPDATE (b) ON preserve_resume_any_obj_db.t_resume_any_lock_only TO
+pr_any_col_upd@localhost;
 START TRANSACTION;
 UPDATE t_resume_any_obj_priv SET b=11 WHERE a=1;
 PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
@@ -43,6 +53,26 @@ ROLLBACK;
 SELECT * FROM t_resume_any_obj_priv ORDER BY a;
 a	b
 1	10
+START TRANSACTION;
+UPDATE t_resume_any_obj_priv SET b=13 WHERE a=1;
+SELECT * FROM t_resume_any_lock_only WHERE a=1 FOR UPDATE;
+a	b
+1	100
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Access denied for preserved transaction
+SELECT COUNT(*) AS preserved_after_column_only_denied
+FROM performance_schema.preserved_transactions;
+preserved_after_column_only_denied
+1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ROLLBACK;
+SELECT * FROM t_resume_any_obj_priv ORDER BY a;
+a	b
+1	10
+SELECT * FROM t_resume_any_lock_only ORDER BY a;
+a	b
+1	100
 CREATE USER preserve_resume_owner_revoke@localhost;
 GRANT SHUTDOWN ON *.* TO preserve_resume_owner_revoke@localhost;
 GRANT SELECT, UPDATE ON preserve_resume_any_obj_db.t_resume_any_obj_priv TO
@@ -69,6 +99,7 @@ a	b
 DROP USER preserve_resume_any_no_table@localhost;
 DROP USER preserve_resume_any_readonly@localhost;
 DROP USER preserve_resume_any_insert_only@localhost;
+DROP USER pr_any_col_upd@localhost;
 DROP USER preserve_resume_owner_revoke@localhost;
 USE test;
 DROP DATABASE preserve_resume_any_obj_db;

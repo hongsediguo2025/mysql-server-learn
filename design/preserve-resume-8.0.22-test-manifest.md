@@ -27,11 +27,49 @@ real topology checks were added upstream.  The 8.0.22 port now also carries:
 
 ## Current Full-Gate Evidence
 
-### Exact Current-HEAD Gate: 2026-06-19
+### 11-Review Follow-Up Targeted Gate: 2026-06-19
+
+The 11-review follow-up changed SQL privilege recheck logic, one MTR test,
+single-phase business-live planning, carrier symlink helper naming, warmcopy
+helper/model comments, and release-owner decision documentation.  The focused
+gate for those changes is:
+
+- Debug targeted build and GUnit:
+  `mysqld`, `preserve_trx-t`, and `preserve_trx_warmcopy-t` built or ran
+  successfully; `preserve_trx-t` passed 245 tests and
+  `preserve_trx_warmcopy-t` passed 84 tests.
+- Release targeted build and GUnit:
+  `mysqld`, `preserve_trx-t`, and `preserve_trx_warmcopy-t` built or ran
+  successfully; `preserve_trx-t` passed 245 tests and
+  `preserve_trx_warmcopy-t` passed 84 tests.
+- Targeted MTR in debug and release with `--skip-log-bin`:
+  `token_visibility_redaction`, `startup_option_validation`,
+  `resume_any_rechecks_object_privileges`, and `shutdown_report` passed.
+  The object-privilege test now includes a `RESUME_ANY` user with only a
+  column-level grant on a lock-only table; RESUME is denied and the token
+  remains available for an authorized user.
+- Python unit:
+  `scripts.tests.test_resumable_trx_longrun_e2e` and
+  `scripts.tests.test_resumable_trx_business_e2e` ran 253 tests and passed.
+  The longrun tests now cover single-phase short-cycle baseline capture plus
+  deterministic binlog equivalence by default.
+- Source lint runner:
+  `python3 scripts/preserve_trx_lint_runner.py --repo-root .` passed 19 rules
+  with zero findings.  `_lint` remains static review coverage, not behavior MTR
+  coverage.
+
+This targeted gate does not claim that accelerated full preserve_trx MTR or the
+320-session live soak were rerun after the 11-review follow-up.  The most recent
+broader full-gate evidence remains below and should be refreshed before a final
+release-ready claim if release policy requires exact-current full reruns.
+
+### Previous Full-Gate Evidence Before 11-Review Follow-Up: 2026-06-19
 
 This checkpoint was collected after the warmcopy finalize-deadline fix, the
 source-lint/MTR separation cleanup, the accelerator short-vardir cleanup fix,
-and the live E2E warmcopy/320-session timeout-budget fix.
+and the live E2E warmcopy/320-session timeout-budget fix.  Later 11-review
+follow-up changes touched SQL, MTR, Python E2E, carrier, warmcopy comments, and
+release handoff documentation, so this is now previous full-gate evidence.
 
 - Accelerated debug behavior MTR, default-ON normal-binlog plus
   `--skip-log-bin`:

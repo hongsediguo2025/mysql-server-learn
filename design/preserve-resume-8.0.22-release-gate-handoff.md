@@ -75,6 +75,42 @@ status:
   /tmp/m8022-rpl-include-start-repeat50b.status = 0
 ```
 
+## Release-Owner Threat-Model Decisions
+
+The following preserve/resume semantics are intentional release-contract
+decisions rather than hidden implementation bugs.  They require explicit
+release-owner acceptance before the draft PR is marked ready:
+
+1. `PROCESS` sees full preserved-transaction tokens in
+   `performance_schema.preserved_transactions`.
+   - Current rationale: `PROCESS` is treated as a DBA/management trust boundary,
+     similar to visibility into other sessions' statement text.
+   - Risk: the token is a bearer credential for `RESUME PRESERVED TRANSACTION`.
+   - Future option if this trust boundary is rejected: add a dedicated
+     `PRESERVE_TRX_ADMIN` privilege and redact tokens from generic `PROCESS`.
+   - Sign-off status: pending release-owner decision.
+
+2. Snapshot and sidecar files are authenticated but not encrypted at rest.
+   - Current contract: CRC/HMAC, bound key, no-symlink regular-file checks,
+     `0600` files, and preserve directory permissions provide integrity and
+     filesystem-bound confidentiality.
+   - Risk: backups, shared storage, or host-level readers with datadir access can
+     inspect snapshot payloads.
+   - Future option if this threat model is rejected: add encryption-at-rest for
+     snapshot and sidecar payloads.
+   - Sign-off status: pending release-owner decision.
+
+3. RESUME object privilege recheck is conservative for column-level grants.
+   - Current hardening: lock-only MDL table checks now use only global/db/table
+     ACLs and reject column-only grants.  Modified-table checks already used
+     table-level grants only.
+   - Risk accepted by the implementation: a user with only column-level access
+     may be unable to resume a preserved transaction even if their original SQL
+     was column-limited.
+   - Chosen behavior: fail closed and keep the token available for an authorized
+     user rather than attempting to reconstruct original column access.
+   - Sign-off status: pending release-owner decision.
+
 ## Remaining Gate
 
 The final full MySQL gate is still open:

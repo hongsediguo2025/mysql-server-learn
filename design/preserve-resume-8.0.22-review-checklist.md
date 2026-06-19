@@ -20,11 +20,64 @@ changed files: design/*.md only
 source/test migration files: none
 ```
 
-## Exact Current-HEAD Final Gate Evidence: 2026-06-19
+## 11-Review Follow-Up Targeted Gate: 2026-06-19
+
+This section records the focused follow-up after the 11-review cross-check.  It
+is current for the column-level privilege hardening, single-phase binlog
+deterministic compare profile, warmcopy helper/model clarification, symlink
+helper rename, and release-owner decision record.  It is not a replacement for
+the accelerated full preserve_trx MTR and 320-session live soak recorded in the
+previous full-gate section below.
+
+```text
+branch: codex/preserve-resume-8.0.22-port
+
+Build:
+- debug mysqld after sql/preserve_trx.cc privilege recheck change = pass.
+- release mysqld, preserve_trx-t, and preserve_trx_warmcopy-t after the same
+  source changes = pass.
+
+GUnit:
+- debug preserve_trx-t: 245 tests passed.
+- debug preserve_trx_warmcopy-t: 84 tests passed.
+- release preserve_trx-t: 245 tests passed.
+- release preserve_trx_warmcopy-t: 84 tests passed.
+
+MTR targeted:
+- debug --skip-log-bin:
+  token_visibility_redaction, startup_option_validation,
+  resume_any_rechecks_object_privileges, shutdown_report = pass.
+- release --skip-log-bin:
+  token_visibility_redaction, startup_option_validation,
+  resume_any_rechecks_object_privileges, shutdown_report = pass.
+- resume_any_rechecks_object_privileges now includes a column-only
+  RESUME_ANY user and proves the token remains preserved after access denied.
+
+Python:
+- python3 -m unittest scripts.tests.test_resumable_trx_longrun_e2e
+  scripts.tests.test_resumable_trx_business_e2e = 253 tests passed.
+- The new single-phase business-live profile tests verify baseline capture plus
+  deterministic binlog equivalence by default for short-cycle non-warmcopy
+  runs.
+
+Source lint:
+- python3 scripts/preserve_trx_lint_runner.py --repo-root . = pass,
+  19 rules, 0 findings.
+
+Docs:
+- design/preserve-resume-8.0.22-release-gate-handoff.md now records
+  release-owner sign-off items for PROCESS token visibility, authenticated but
+  unencrypted snapshots, and conservative column-level privilege rejection.
+```
+
+## Previous Full-Gate Evidence Before 11-Review Follow-Up: 2026-06-19
 
 This section records the fresh gate after the warmcopy finalize-deadline fix,
 source-lint/MTR behavior separation cleanup, accelerated MTR vardir cleanup
-fix, and 320-session live E2E timeout-budget fix.
+fix, and 320-session live E2E timeout-budget fix.  Later 11-review follow-up
+changes touched SQL, MTR, Python E2E, carrier, warmcopy comments, and release
+handoff documentation, so this is now previous full-gate evidence.  The focused
+current follow-up gate is recorded above.
 
 ```text
 branch: codex/preserve-resume-8.0.22-port

@@ -2058,14 +2058,39 @@ bool preserve_trx_recheck_table_privileges(
     bool write_locks_require_write_privilege) {
   const char *table_name = part_key + db_length + 1;
   const size_t table_name_length = part_key_length - db_length - 2;
-  Table_ref table(part_key, db_length, table_name, table_name_length,
-                  table_name, TL_READ);
   const Access_bitmask access =
       write_locks_require_write_privilege &&
               preserve_trx_mdl_table_type_requires_write_privilege(type)
           ? INSERT_ACL | UPDATE_ACL | DELETE_ACL
           : TABLE_OP_ACLS;
-  return check_some_access(thd, access, &table);
+
+  const std::string schema_name(part_key, db_length);
+  const std::string normalized_table_name(table_name, table_name_length);
+  Security_context *sctx = thd->security_context();
+  Access_bitmask granted_access = sctx->master_access(schema_name);
+
+  if (sctx->get_active_roles()->size() > 0) {
+    const LEX_CSTRING db{schema_name.c_str(), schema_name.length()};
+    const LEX_CSTRING table{normalized_table_name.c_str(),
+                            normalized_table_name.length()};
+    granted_access |= sctx->db_acl(db, true) | sctx->table_acl(db, table);
+  } else {
+    granted_access |=
+        acl_get(thd, sctx->host().str, sctx->ip().str, sctx->priv_user().str,
+                schema_name.c_str(), false);
+
+    Acl_cache_lock_guard acl_cache_lock(thd, Acl_cache_lock_mode::READ_MODE);
+    if (!acl_cache_lock.lock(false)) return true;
+
+    GRANT_TABLE *grant_table =
+        table_hash_search(sctx->host().str, sctx->ip().str,
+                          schema_name.c_str(), sctx->priv_user().str,
+                          normalized_table_name.c_str(), false);
+    granted_access |= grant_table == nullptr ? 0 : grant_table->privs;
+  }
+
+  if ((granted_access & access) != 0) return false;
+  return true;
 }
 
 bool preserve_trx_recheck_schema_privileges(THD *thd, const char *part_key,
