@@ -388,3 +388,185 @@ Do not mark the final release checklist item complete solely because the
 feature-specific preserve/resume gates are green.  Those gates prove the feature
 surface; the remaining all-suite gate proves integration with the full MySQL
 8.0.22 test universe.
+
+## Lock Warmcopy Addendum, 2026-06-20
+
+This addendum tracks the lock warmcopy branch evidence in the current 8.0.22
+preserve-port worktree:
+
+```text
+worktree: /Users/a1234/project/mysql-server-8022-preserve-port
+branch: codex/preserve-trx-lock-warmcopy
+rule: no additional invasive changes to original MySQL 8.0.22 code
+```
+
+The lock warmcopy implementation remains an optimization over the current live
+lock export path. The current local evidence supports feature-specific review,
+but it does not close the full large-lockset release gate because this machine
+still lacks enough free disk for the configured full NFR workload.
+
+Fresh feature-specific gates:
+
+```text
+debug GUnit:
+  build-debug/runtime_output_directory/preserve_trx_lock_warmcopy-t
+  status: passed 40 tests
+
+  build-debug/runtime_output_directory/lock0warmcopy-t
+  status: passed 30 tests
+
+release GUnit:
+  build-release/runtime_output_directory/preserve_trx_lock_warmcopy-t
+  status: passed 40 tests
+
+  build-release/runtime_output_directory/lock0warmcopy-t
+  status: passed 30 tests
+
+debug MTR:
+  lock_warmcopy_test_count=41
+  status: all 42 executed MTR entries passed, including shutdown_report
+  server restarts: 30
+  elapsed executing testcases: 134.478 seconds
+```
+
+Fresh release hot-path gate:
+
+```text
+log:
+  build-release/lock-warmcopy-reports/lock0warmcopy-release-fresh.log
+report:
+  build-release/lock-warmcopy-reports/lock0warmcopy-hotpath-benchmark-fresh-report.json
+
+baseline:
+  BM_InnoDBLockWarmcopyRecordHotPathBaseline = 2.0 ns/iter
+disabled:
+  BM_InnoDBLockWarmcopyDisabledRecordHotPath = 2.0 ns/iter
+  disabled_regression_pct = 0.0
+  threshold = 2.0
+enabled:
+  BM_InnoDBLockWarmcopyEnabledRecordHotPath = 19.0 ns/iter
+status:
+  pass
+```
+
+Fresh release smoke:
+
+```text
+command shape:
+  python3 scripts/lock_warmcopy_nfr2_runner.py smoke --build-dir build-release
+    --clean --sessions 4 --tables 4 --statements-per-tx 20 --cycles 1
+    --drain-interval 0.1 --preserve-timeout 120 --lock-warmcopy-mode <on|off>
+    --stop-after
+
+lock_warmcopy_mode=on:
+  status: pass
+  workers: 4
+  cycles: 1
+  resumed preserved transactions: 4
+  completed_tx_min: 17
+  completed_stmt_total: 1360
+
+lock_warmcopy_mode=off:
+  status: pass
+  workers: 4
+  cycles: 1
+  resumed preserved transactions: 4
+  completed_tx_min: 10
+  completed_stmt_total: 840
+```
+
+Fresh scaled release NFR:
+
+```text
+command:
+  python3 scripts/lock_warmcopy_nfr2_runner.py run-scaled
+    --build-dir build-release --clean --sessions 4 --tables 4
+    --statements-per-tx 1000 --seed-rows-per-table-per-session 1000
+    --lockset-batch-size 100 --cycles 2 --drain-interval 0.1
+    --preserve-timeout 180
+    --output build-release/lock-warmcopy-nfr2/reports/large-lockset-bulk-4x1000-b100-c2-latest.json
+    --stop-after
+
+report:
+  build-release/lock-warmcopy-nfr2/reports/large-lockset-bulk-4x1000-b100-c2-latest.json
+
+live export:
+  p95: 49.241458 ms
+  p99: 49.241458 ms
+  max: 49.241458 ms
+  samples: 2
+
+lock warmcopy:
+  p95: 11.5245 ms
+  p99: 11.5245 ms
+  max: 11.5245 ms
+  samples: 2
+
+comparison:
+  warmcopy_p95_below_live_baseline: true
+  status: pass
+```
+
+Fresh larger scaled release NFR:
+
+```text
+command:
+  python3 scripts/lock_warmcopy_nfr2_runner.py run-scaled
+    --build-dir build-release --clean --sessions 16 --tables 16
+    --statements-per-tx 2000 --seed-rows-per-table-per-session 2000
+    --lockset-batch-size 100 --cycles 2 --drain-interval 0.1
+    --preserve-timeout 300
+    --output build-release/lock-warmcopy-nfr2/reports/large-lockset-bulk-16x2000-b100-c2-latest.json
+    --stop-after
+
+report:
+  build-release/lock-warmcopy-nfr2/reports/large-lockset-bulk-16x2000-b100-c2-latest.json
+
+live export:
+  p95: 472.180625 ms
+  p99: 472.180625 ms
+  max: 472.180625 ms
+  samples: 2
+
+lock warmcopy:
+  p95: 105.753333 ms
+  p99: 105.753333 ms
+  max: 105.753333 ms
+  samples: 2
+
+comparison:
+  warmcopy_p95_below_live_baseline: true
+  status: pass
+```
+
+Full large-lockset NFR status:
+
+```text
+command:
+  python3 scripts/lock_warmcopy_nfr2_runner.py run-full
+    --build-dir build-release --stop-after
+
+result:
+  fail-fast before starting mysqld
+  required_bytes: 51539607552
+  available_bytes: 22357970944
+  reusable_work_dir_bytes: 0
+  work_dir: build-release/lock-warmcopy-nfr2
+```
+
+This remains a local capacity blocker for the full large-lockset release gate,
+not a lock warmcopy runtime failure. The feature must not be called fully
+release-complete until the full NFR gate passes in an environment with enough
+disk, or a release owner explicitly accepts an equivalent release-farm result
+or waiver.
+
+Post-run process check:
+
+```text
+python3 scripts/lock_warmcopy_nfr2_runner.py status --build-dir build-release
+  socket not reachable after --stop-after
+
+ps scan:
+  no residual lock-warmcopy-nfr2, resumable_trx_nfr2_benchmark.py,
+  resumable_trx_business_e2e.py, or NFR mysqld process
+```

@@ -670,6 +670,13 @@ dberr_t lock_preserve_export_record_locks(trx_t *trx, std::string *payload);
 dberr_t lock_preserve_export_record_locks(trx_t *trx, std::string *payload,
                                           uint32_t max_lock_count);
 
+/** Check whether a transaction currently owns predicate record locks.
+@param[in]  trx                  transaction to inspect
+@param[out] has_predicate_locks  true if a predicate lock exists
+@return true if inspection succeeded */
+bool lock_preserve_trx_has_predicate_locks(trx_t *trx,
+                                           bool *has_predicate_locks);
+
 /** Last precise record-lock export failure reason, for diagnostics. */
 const char *lock_preserve_last_record_lock_export_error();
 
@@ -1088,11 +1095,13 @@ to explicit for partial rollback cases
 @param[in]	index		index of record
 @param[in]	offsets		rec_get_offsets(rec, index)
 @param[in,out]	trx		active transaction
-@param[in]	heap_no		rec heap number to lock */
-void lock_rec_convert_active_impl_to_expl(const buf_block_t *block,
-                                          const rec_t *rec, dict_index_t *index,
-                                          const ulint *offsets, trx_t *trx,
-                                          ulint heap_no);
+@param[in]	heap_no		rec heap number to lock
+@return DB_SUCCESS or lock wait/deadlock status if conversion cannot proceed */
+dberr_t lock_rec_convert_active_impl_to_expl(const buf_block_t *block,
+                                             const rec_t *rec,
+                                             dict_index_t *index,
+                                             const ulint *offsets, trx_t *trx,
+                                             ulint heap_no);
 
 /** Converts implicit record locks for a transaction's modified clustered
 records to explicit record locks so they can be exported for preserve.

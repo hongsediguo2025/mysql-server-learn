@@ -35,6 +35,16 @@ my $bundle_path = File::Spec->catfile($source_root, 'sql',
                                       'preserve_trx_bundle.cc');
 my $lock_path = File::Spec->catfile($source_root, 'storage', 'innobase',
                                     'lock', 'lock0lock.cc');
+my $lock_header_path = File::Spec->catfile($source_root, 'storage', 'innobase',
+                                           'include', 'lock0lock.h');
+my $lock_priv_ic_path = File::Spec->catfile($source_root, 'storage',
+                                           'innobase', 'include',
+                                           'lock0priv.ic');
+my $lock_warmcopy_path = File::Spec->catfile($source_root, 'storage',
+                                            'innobase', 'lock',
+                                            'lock0warmcopy.cc');
+my $lock_warmcopy_header_path = File::Spec->catfile(
+  $source_root, 'storage', 'innobase', 'include', 'lock0warmcopy.h');
 my $purge_path = File::Spec->catfile($source_root, 'storage', 'innobase',
                                      'trx', 'trx0purge.cc');
 my $trx_preserve_path = File::Spec->catfile($source_root, 'storage', 'innobase',
@@ -75,6 +85,10 @@ my $binlog = read_source($binlog_path);
 my $binlog_ostream = read_source($binlog_ostream_path);
 my $bundle = read_source($bundle_path);
 my $lock = read_source($lock_path);
+my $lock_header = read_source($lock_header_path);
+my $lock_priv_ic = read_source($lock_priv_ic_path);
+my $lock_warmcopy = read_source($lock_warmcopy_path);
+my $lock_warmcopy_header = read_source($lock_warmcopy_header_path);
 my $purge = read_source($purge_path);
 my $trx_preserve = read_source($trx_preserve_path);
 my $trx_temp_preserve = read_source($trx_temp_preserve_path);
@@ -1196,6 +1210,109 @@ $preserve =~ /DEBUG_SYNC\s*\(\s*thd\s*,\s*"preserve_trx_batch_after_targets_quie
   or die "batch drain must expose a pre-attach sync point after targets are quiesced\n";
 die "pre-attach sync point must be before target context-switch attach loop\n"
   if $& =~ /preserve_trx_preserve_attached_transaction/s;
+die "lock warmcopy must not hold a global prepare guard across ha_prepare_low\n"
+  if $preserve =~
+     /lock_warmcopy_prepare_guard\.reset\s*\(\s*lock_warmcopy_prepare_guard_create\s*\(\s*\)\s*\)[\s\S]*ha_prepare_low\s*\(\s*thd\s*,\s*true\s*\)[\s\S]*lock_warmcopy_prepare_guard\.reset\s*\(\s*\)/s ||
+     $preserve =~ /Keep the lock warmcopy prepare guard beyond ha_prepare_low/s;
+die "lock warmcopy final fence must use per-trx conversion freeze before ha_prepare_low\n"
+  unless $preserve =~
+         /trx_t\s+\*lock_warmcopy_frozen_trx\s*=\s*nullptr[\s\S]*auto\s+thaw_lock_warmcopy_conversion[\s\S]*trx_preserve_lock_warmcopy_conversion_freeze\s*\(\s*thd[\s\S]*ha_prepare_low\s*\(\s*thd\s*,\s*true\s*\)[\s\S]*thaw_lock_warmcopy_conversion/s;
+die "lock warmcopy must expose a debug-only post-freeze conversion attempt injection before the final fence\n"
+  unless $preserve =~
+         /preserve_trx_lock_warmcopy_after_conversion_freeze[\s\S]{0,600}DBUG_EXECUTE_IF\s*\(\s*"preserve_trx_lock_warmcopy_simulate_conversion_after_freeze"[\s\S]{0,600}preserve_trx_lock_warmcopy_after_final_fence/s &&
+         $trx_preserve =~
+         /trx_preserve_lock_warmcopy_note_conversion_attempt_after_freeze[\s\S]*lock_warmcopy_trx_conversion_note_attempt[\s\S]*lock_warmcopy_trx_conversion_note_handled/s;
+$preserve =~ /if\s*\(\s*ha_prepare_low\s*\(\s*thd\s*,\s*true\s*\)\s*\)([\s\S]*?)metadata\.has_read_view/m
+  or die "could not isolate lock warmcopy guarded metadata region\n";
+my $lock_warmcopy_guarded_metadata = $1;
+die "lock warmcopy conversion freeze must cover detach, claim, lock metadata, and table/autoinc cross-check\n"
+  unless $lock_warmcopy_guarded_metadata =~ /trx_preserve_detach_current_thd/s &&
+         $lock_warmcopy_guarded_metadata =~ /trx_preserve_claim_detached_prepared/s &&
+         $lock_warmcopy_guarded_metadata =~ /metadata\.record_locks_payload/s &&
+         $lock_warmcopy_guarded_metadata =~ /metadata\.table_locks_payload/s &&
+         $lock_warmcopy_guarded_metadata =~ /trx_preserve_table_locks_payload_has_autoinc[\s\S]*preserve_trx_lock_warmcopy_after_lock_metadata_guarded[\s\S]*verify_lock_warmcopy_frozen_fence\s*\(\s*\)/s;
+die "lock warmcopy conversion freeze must not be released before snapshot metadata is built\n"
+  if $preserve =~ /lock_warmcopy_trx_lock_fence_equal\s*\(\s*lock_warmcopy_frozen_fence[\s\S]{0,700}thaw_lock_warmcopy_conversion\s*\(\s*\)\s*;\s*metadata\.has_read_view/s;
+$preserve =~ /auto reject_after_snapshot_failure\s*=\s*\[\&\]\([\s\S]*?\)\s*\{([\s\S]*?)\n\s*\};\n\n\s*set_stage\s*\(\s*Preserve_trx_preserve_stage::SNAPSHOT_WRITE\s*\)/m
+  or die "could not isolate snapshot failure cleanup helper\n";
+my $lock_warmcopy_snapshot_failure_cleanup = $1;
+die "snapshot failure cleanup must thaw lock warmcopy conversion waiters before rollback or reattach\n"
+  unless $lock_warmcopy_snapshot_failure_cleanup =~ /thaw_lock_warmcopy_conversion\s*\(\s*\)\s*;/s;
+die "lock warmcopy conversion freeze must be released only after preserved record registration succeeds\n"
+  unless $preserve =~ /preserved_trx_add_record\s*\([\s\S]*?\)\s*\)\s*\{[\s\S]*?return reject_unsupported_for_delivery\s*\(\s*\)\s*;\s*\}\s*thaw_lock_warmcopy_conversion\s*\(\s*\)\s*;\s*snapshotting_state\.remove\s*\(\s*\)\s*;/s;
+die "lock warmcopy must recheck the frozen fence after snapshot write and before preserved record registration\n"
+  unless $preserve =~ /auto verify_lock_warmcopy_frozen_fence[\s\S]*lock_warmcopy_trx_lock_fence_equal\s*\(\s*lock_warmcopy_frozen_fence/s &&
+         $preserve =~
+         /store->write\s*\([\s\S]*?preserve_trx_lock_warmcopy_after_snapshot_write_before_final_fence[\s\S]*?preserve_trx_lock_warmcopy_simulate_conversion_after_snapshot_write[\s\S]*?verify_lock_warmcopy_frozen_fence\s*\(\s*\)[\s\S]*?reject_after_snapshot_failure[\s\S]*?preserved_trx_add_record/s;
+$lock =~ /static dberr_t lock_rec_convert_impl_to_expl_for_trx[\s\S]*?^}/m
+  or die "could not isolate lock_rec_convert_impl_to_expl_for_trx\n";
+my $impl_to_expl_for_trx = $&;
+die "implicit-to-explicit conversion must check lock warmcopy freeze before installing explicit lock\n"
+  unless $impl_to_expl_for_trx =~
+         /lock_warmcopy_trx_conversion_is_frozen\s*\(\s*&trx->lock\s*\)[\s\S]*lock_warmcopy_trx_conversion_note_attempt\s*\(\s*&trx->lock\s*\)[\s\S]*lock_rec_add_to_queue/s;
+die "frozen conversion must use lock warmcopy wait/retry, not ordinary DB_LOCK_WAIT\n"
+  unless $impl_to_expl_for_trx =~
+         /lock_warmcopy_wait_for_conversion_thaw\s*\(\s*trx\s*\)/s &&
+         $impl_to_expl_for_trx !~
+         /lock_warmcopy_trx_conversion_is_frozen\s*\(\s*&trx->lock\s*\)[\s\S]{0,300}err\s*=\s*DB_LOCK_WAIT/s;
+die "implicit-to-explicit conversion must expose a DEBUG_SYNC point after the freeze check\n"
+  unless $impl_to_expl_for_trx =~
+         /lock_warmcopy_trx_conversion_is_frozen\s*\(\s*&trx->lock\s*\)[\s\S]*DEBUG_SYNC_C\s*\(\s*"lock_warmcopy_impl_to_expl_after_freeze_check"\s*\)/s;
+die "implicit-to-explicit conversion must expose a DEBUG_SYNC point before returning frozen status\n"
+  unless $impl_to_expl_for_trx =~
+         /lock_warmcopy_impl_to_expl_after_freeze_check[\s\S]*DEBUG_SYNC_C\s*\(\s*"lock_warmcopy_impl_to_expl_before_return_frozen"\s*\)[\s\S]*lock_warmcopy_frozen_conversion_result/s;
+$lock_warmcopy =~ /void lock_warmcopy_trx_conversion_freeze\s*\([^)]*\)\s*\{[\s\S]*?^}/m
+  or die "could not isolate lock_warmcopy_trx_conversion_freeze\n";
+my $lock_warmcopy_conversion_freeze = $&;
+die "lock warmcopy conversion freeze must expose a DEBUG_SYNC point before publishing the frozen state\n"
+  unless $lock_warmcopy_conversion_freeze =~
+         /DEBUG_SYNC_C\s*\(\s*"lock_warmcopy_conversion_freeze_before_broadcast"\s*\)[\s\S]*lock_warmcopy_conversion_frozen\s*=\s*true/s;
+die "lock0lock.cc must delegate lock warmcopy thaw waiting to the new warmcopy module\n"
+  if $lock =~ /lock_warmcopy_wait_for_conversion_thaw_impl\s*\(/s;
+die "lock warmcopy thaw wait helper must live in lock0warmcopy.cc\n"
+  unless $lock_warmcopy =~ /lock_warmcopy_wait_for_conversion_thaw\s*\(\s*trx_t\s+\*trx\s*\)/s &&
+         $lock_warmcopy =~ /lock_warmcopy_wait_for_conversion_thaw_for_unit_test\s*\(/s;
+die "lock warmcopy thaw wait helper declarations must live in lock0warmcopy.h\n"
+  unless $lock_warmcopy_header =~ /lock_warmcopy_wait_for_conversion_thaw\s*\(\s*trx_t\s+\*trx\s*\)/s &&
+         $lock_warmcopy_header =~ /lock_warmcopy_wait_for_conversion_thaw_for_unit_test\s*\(/s;
+die "record bitmap set hot hook must delegate key construction to lock0warmcopy.cc\n"
+  if $lock_priv_ic =~ /lock_warmcopy_record_shard_key_t\s+key/s;
+$lock =~ /UNIV_INLINE\s*\nbyte lock_rec_reset_nth_bit\s*\([^)]*\)\s*\{[\s\S]*?^}/m
+  or die "could not isolate lock_rec_reset_nth_bit\n";
+my $lock_rec_reset_nth_bit = $&;
+die "record bitmap reset hot hook must delegate key construction to lock0warmcopy.cc\n"
+  if $lock_rec_reset_nth_bit =~ /lock_warmcopy_record_shard_key_t\s+key/s;
+die "lock warmcopy record bitmap lock wrappers must live in lock0warmcopy.cc\n"
+  unless $lock_warmcopy =~ /lock_warmcopy_record_bitmap_set_for_lock\s*\(/s &&
+         $lock_warmcopy =~ /lock_warmcopy_record_bitmap_reset_for_lock\s*\(/s;
+die "lock warmcopy record bitmap lock wrapper declarations must live in lock0warmcopy.h\n"
+  unless $lock_warmcopy_header =~ /lock_warmcopy_record_bitmap_set_for_lock\s*\(/s &&
+         $lock_warmcopy_header =~ /lock_warmcopy_record_bitmap_reset_for_lock\s*\(/s;
+die "record image hook must not keep SHA256 digesting in lock0lock.cc\n"
+  if $lock =~ /SHA_EVP256/s || $lock =~ /#include\s+"sha2\.h"/s;
+die "record image hook must not construct lock warmcopy shard keys in lock0lock.cc\n"
+  if $lock =~ /lock_warmcopy_record_shard_key_t\s+key/s;
+die "record image hook must delegate key and digest construction to lock0warmcopy.cc\n"
+  unless $lock_warmcopy =~ /lock_warmcopy_record_bitmap_set_with_image_for_lock\s*\(/s &&
+         $lock_warmcopy_header =~ /lock_warmcopy_record_bitmap_set_with_image_for_lock\s*\(/s;
+die "implicit-to-explicit wrapper must propagate frozen conversion status\n"
+  unless $lock =~ /static dberr_t lock_rec_convert_impl_to_expl\s*\(/s;
+die "active implicit-to-explicit API must propagate frozen conversion status\n"
+  unless $lock =~ /dberr_t\s+lock_rec_convert_active_impl_to_expl\s*\(/s &&
+         $lock_header =~ /dberr_t\s+lock_rec_convert_active_impl_to_expl\s*\(/s;
+for my $entry (
+  [qr/dberr_t lock_clust_rec_modify_check_and_lock[\s\S]*?^}/m,
+   "clustered modify"],
+  [qr/dberr_t lock_sec_rec_read_check_and_lock[\s\S]*?^}/m,
+   "secondary read"],
+  [qr/dberr_t lock_clust_rec_read_check_and_lock[\s\S]*?^}/m,
+   "clustered read"]) {
+  $lock =~ $entry->[0] or die "could not isolate $entry->[1] lock conversion caller\n";
+  my $caller = $&;
+  die "$entry->[1] must return conversion status before continuing to lock_rec_lock\n"
+    unless $caller =~
+           /conversion_err\s*=\s*lock_rec_convert_impl_to_expl\s*\([\s\S]*?if\s*\(\s*conversion_err\s*!=\s*DB_SUCCESS\s*\)\s*\{[\s\S]*?return\s*\(?\s*conversion_err\s*\)?\s*;[\s\S]*?lock_rec_lock/s;
+}
 $preserve =~ /void reset_thd_after_preserve_detach\(THD \*thd\)([\s\S]*?)^}/m
   or die "could not isolate reset_thd_after_preserve_detach\n";
 my $reset_after_detach = $1;

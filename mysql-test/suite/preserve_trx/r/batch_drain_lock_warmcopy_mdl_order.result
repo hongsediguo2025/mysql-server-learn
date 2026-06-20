@@ -1,0 +1,49 @@
+DROP TABLE IF EXISTS t_lock_warmcopy_mdl_a;
+DROP TABLE IF EXISTS t_lock_warmcopy_mdl_b;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+CREATE TABLE t_lock_warmcopy_mdl_a(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+CREATE TABLE t_lock_warmcopy_mdl_b(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_mdl_a VALUES(1,10);
+INSERT INTO t_lock_warmcopy_mdl_b VALUES(1,20);
+START TRANSACTION;
+UPDATE t_lock_warmcopy_mdl_b SET v=21 WHERE id=1;
+SELECT v AS mdl_order_a_before_drain
+FROM t_lock_warmcopy_mdl_a
+WHERE id=1;
+mdl_order_a_before_drain
+10
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+include/assert_grep.inc [lock warmcopy succeeds for transaction MDL order]
+SELECT COUNT(*) AS preserved_count_after_mdl_order_warmcopy
+FROM performance_schema.preserved_transactions;
+preserved_count_after_mdl_order_warmcopy
+1
+SET lock_wait_timeout=1;
+ALTER TABLE t_lock_warmcopy_mdl_a ADD COLUMN ddl_marker_a INT;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+ALTER TABLE t_lock_warmcopy_mdl_b ADD COLUMN ddl_marker_b INT;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ALTER TABLE t_lock_warmcopy_mdl_a ADD COLUMN ddl_marker_a INT;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+ALTER TABLE t_lock_warmcopy_mdl_b ADD COLUMN ddl_marker_b INT;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+COMMIT;
+ALTER TABLE t_lock_warmcopy_mdl_a ADD COLUMN ddl_marker_a INT;
+ALTER TABLE t_lock_warmcopy_mdl_b ADD COLUMN ddl_marker_b INT;
+SELECT COUNT(*) AS preserved_count_after_mdl_order_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_mdl_order_resume
+0
+SELECT id, v FROM t_lock_warmcopy_mdl_a ORDER BY id;
+id	v
+1	10
+SELECT id, v FROM t_lock_warmcopy_mdl_b ORDER BY id;
+id	v
+1	21
+DROP TABLE t_lock_warmcopy_mdl_b;
+DROP TABLE t_lock_warmcopy_mdl_a;

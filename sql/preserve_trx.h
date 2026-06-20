@@ -40,6 +40,7 @@
 class THD;
 struct TABLE;
 struct LEX;
+struct Preserve_trx_lock_warmcopy_artifact;
 
 extern bool preserve_trx_enable;
 extern bool preserve_trx_temp_table_enable;
@@ -74,6 +75,14 @@ extern uint preserve_trx_warmcopy_tail_budget_bytes;
 extern ulonglong preserve_trx_warmcopy_max_total_bytes;
 extern uint preserve_trx_warmcopy_pending_range_limit;
 extern ulonglong preserve_trx_warmcopy_pending_bytes_limit;
+extern bool preserve_trx_lock_warmcopy_enable;
+extern bool preserve_trx_lock_warmcopy_fallback_to_live_export;
+extern ulonglong preserve_trx_lock_warmcopy_max_memory_bytes;
+extern ulonglong preserve_trx_lock_warmcopy_max_journal_bytes;
+extern uint preserve_trx_lock_warmcopy_max_dirty_shards;
+extern uint preserve_trx_lock_warmcopy_max_mdl_descriptors;
+extern uint preserve_trx_lock_warmcopy_seal_threads;
+extern uint preserve_trx_lock_warmcopy_conversion_wait_timeout_ms;
 
 bool preserve_trx_is_enabled();
 void preserve_trx_set_enable_value(bool enabled);
@@ -84,6 +93,22 @@ ulonglong preserve_trx_warmcopy_digest_bytes_status();
 ulonglong preserve_trx_warmcopy_durable_bytes_status();
 ulonglong preserve_trx_warmcopy_provider_full_copy_to_count_status();
 ulonglong preserve_trx_warmcopy_phase2_pause_us_status();
+ulonglong preserve_trx_lock_warmcopy_attempts_status();
+ulonglong preserve_trx_lock_warmcopy_sealed_valid_status();
+ulonglong preserve_trx_lock_warmcopy_sealed_invalid_status();
+ulonglong preserve_trx_lock_warmcopy_live_fallback_status();
+ulonglong preserve_trx_lock_warmcopy_strict_reject_status();
+ulonglong preserve_trx_lock_warmcopy_canonical_mismatch_status();
+ulonglong preserve_trx_lock_warmcopy_resource_limit_status();
+ulonglong preserve_trx_lock_warmcopy_unsupported_family_status();
+ulonglong preserve_trx_lock_warmcopy_final_fence_mismatch_status();
+ulonglong preserve_trx_lock_warmcopy_artifact_bytes_status();
+ulonglong preserve_trx_lock_warmcopy_spill_bytes_status();
+ulonglong preserve_trx_lock_warmcopy_spill_failures_status();
+ulonglong preserve_trx_lock_warmcopy_journal_bytes_status();
+ulonglong preserve_trx_lock_warmcopy_dirty_shards_status();
+ulonglong preserve_trx_lock_warmcopy_phase2_pause_us_status();
+ulonglong preserve_trx_lock_warmcopy_conversion_freeze_waits_status();
 void preserve_trx_warmcopy_note_prefix_bytes(uint64_t bytes);
 void preserve_trx_warmcopy_note_digest_bytes(uint64_t bytes);
 void preserve_trx_warmcopy_note_durable_bytes(uint64_t bytes);
@@ -307,6 +332,7 @@ bool preserve_trx_preserve_attached_transaction(
     ulonglong timeout_seconds, Preserve_trx_delivery_mode delivery_mode,
     Preserve_trx_preserve_result *result,
     PreserveBinlogBlobProvider *binlog_blob_provider = nullptr,
+    const Preserve_trx_lock_warmcopy_artifact *lock_warmcopy_artifact = nullptr,
     bool debug_fail_ha_prepare_low = false,
     bool debug_fail_temp_only_prepare = false);
 

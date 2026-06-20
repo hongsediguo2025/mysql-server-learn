@@ -763,6 +763,7 @@
 #include "sql/persisted_variable.h"              // Persisted_variables_cache
 #include "sql/plugin_table.h"
 #include "sql/preserve_trx.h"
+#include "sql/preserve_trx_lock_warmcopy.h"
 #include "sql/preserve_trx_resource.h"
 #include "sql/protocol.h"
 #include "sql/psi_memory_key.h"  // key_memory_MYSQL_RELAY_LOG_index
@@ -6275,6 +6276,12 @@ static int init_server_components() {
   }
   preserve_trx_set_enable_value(preserve_trx_enable);
 
+  if (!opt_initialize && !is_help_or_validate_option() &&
+      !preserve_trx_lock_warmcopy_cleanup_orphan_spill_files()) {
+    LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+           "failed to clean orphan preserve lock warmcopy spill files");
+  }
+
   if (!opt_initialize && preserved_trx_preflight_recoverability()) {
     unireg_abort(MYSQLD_ABORT_EXIT);
   }
@@ -8968,6 +8975,151 @@ static int show_preserve_trx_warmcopy_phase2_pause_us(THD *, SHOW_VAR *var,
   return 0;
 }
 
+static int show_preserve_trx_lock_warmcopy_attempts(THD *, SHOW_VAR *var,
+                                                    char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_lock_warmcopy_attempts_status();
+  return 0;
+}
+
+static int show_preserve_trx_lock_warmcopy_artifact_bytes(THD *, SHOW_VAR *var,
+                                                          char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_lock_warmcopy_artifact_bytes_status();
+  return 0;
+}
+
+static int show_preserve_trx_lock_warmcopy_canonical_mismatch(
+    THD *, SHOW_VAR *var, char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_lock_warmcopy_canonical_mismatch_status();
+  return 0;
+}
+
+static int show_preserve_trx_lock_warmcopy_conversion_freeze_waits(
+    THD *, SHOW_VAR *var, char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_lock_warmcopy_conversion_freeze_waits_status();
+  return 0;
+}
+
+static int show_preserve_trx_lock_warmcopy_dirty_shards(THD *, SHOW_VAR *var,
+                                                        char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_lock_warmcopy_dirty_shards_status();
+  return 0;
+}
+
+static int show_preserve_trx_lock_warmcopy_final_fence_mismatch(
+    THD *, SHOW_VAR *var, char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_lock_warmcopy_final_fence_mismatch_status();
+  return 0;
+}
+
+static int show_preserve_trx_lock_warmcopy_journal_bytes(THD *, SHOW_VAR *var,
+                                                         char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_lock_warmcopy_journal_bytes_status();
+  return 0;
+}
+
+static int show_preserve_trx_lock_warmcopy_live_fallback(THD *, SHOW_VAR *var,
+                                                         char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_lock_warmcopy_live_fallback_status();
+  return 0;
+}
+
+static int show_preserve_trx_lock_warmcopy_phase2_pause_us(
+    THD *, SHOW_VAR *var, char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_lock_warmcopy_phase2_pause_us_status();
+  return 0;
+}
+
+static int show_preserve_trx_lock_warmcopy_spill_bytes(THD *, SHOW_VAR *var,
+                                                       char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_lock_warmcopy_spill_bytes_status();
+  return 0;
+}
+
+static int show_preserve_trx_lock_warmcopy_spill_failures(THD *,
+                                                          SHOW_VAR *var,
+                                                          char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_lock_warmcopy_spill_failures_status();
+  return 0;
+}
+
+static int show_preserve_trx_lock_warmcopy_resource_limit(THD *, SHOW_VAR *var,
+                                                         char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_lock_warmcopy_resource_limit_status();
+  return 0;
+}
+
+static int show_preserve_trx_lock_warmcopy_sealed_invalid(THD *, SHOW_VAR *var,
+                                                          char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_lock_warmcopy_sealed_invalid_status();
+  return 0;
+}
+
+static int show_preserve_trx_lock_warmcopy_sealed_valid(THD *, SHOW_VAR *var,
+                                                        char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_lock_warmcopy_sealed_valid_status();
+  return 0;
+}
+
+static int show_preserve_trx_lock_warmcopy_strict_reject(THD *, SHOW_VAR *var,
+                                                         char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_lock_warmcopy_strict_reject_status();
+  return 0;
+}
+
+static int show_preserve_trx_lock_warmcopy_unsupported_family(
+    THD *, SHOW_VAR *var, char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_lock_warmcopy_unsupported_family_status();
+  return 0;
+}
+
 static int show_preserve_trx_memory_current_bytes(THD *, SHOW_VAR *var,
                                                   char *buf) {
   var->type = SHOW_LONGLONG;
@@ -9028,6 +9180,54 @@ SHOW_VAR status_vars[] = {
     {"Binlog_stmt_cache_disk_use", (char *)&binlog_stmt_cache_disk_use,
      SHOW_LONG, SHOW_SCOPE_GLOBAL},
     {"Binlog_stmt_cache_use", (char *)&binlog_stmt_cache_use, SHOW_LONG,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_lock_warmcopy_artifact_bytes",
+     (char *)&show_preserve_trx_lock_warmcopy_artifact_bytes, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_lock_warmcopy_attempts",
+     (char *)&show_preserve_trx_lock_warmcopy_attempts, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_lock_warmcopy_canonical_mismatch",
+     (char *)&show_preserve_trx_lock_warmcopy_canonical_mismatch, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_lock_warmcopy_conversion_freeze_waits",
+     (char *)&show_preserve_trx_lock_warmcopy_conversion_freeze_waits,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_lock_warmcopy_dirty_shards",
+     (char *)&show_preserve_trx_lock_warmcopy_dirty_shards, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_lock_warmcopy_final_fence_mismatch",
+     (char *)&show_preserve_trx_lock_warmcopy_final_fence_mismatch, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_lock_warmcopy_journal_bytes",
+     (char *)&show_preserve_trx_lock_warmcopy_journal_bytes, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_lock_warmcopy_live_fallback",
+     (char *)&show_preserve_trx_lock_warmcopy_live_fallback, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_lock_warmcopy_phase2_pause_us",
+     (char *)&show_preserve_trx_lock_warmcopy_phase2_pause_us, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_lock_warmcopy_resource_limit",
+     (char *)&show_preserve_trx_lock_warmcopy_resource_limit, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_lock_warmcopy_sealed_invalid",
+     (char *)&show_preserve_trx_lock_warmcopy_sealed_invalid, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_lock_warmcopy_sealed_valid",
+     (char *)&show_preserve_trx_lock_warmcopy_sealed_valid, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_lock_warmcopy_spill_bytes",
+     (char *)&show_preserve_trx_lock_warmcopy_spill_bytes, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_lock_warmcopy_spill_failures",
+     (char *)&show_preserve_trx_lock_warmcopy_spill_failures, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_lock_warmcopy_strict_reject",
+     (char *)&show_preserve_trx_lock_warmcopy_strict_reject, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_lock_warmcopy_unsupported_family",
+     (char *)&show_preserve_trx_lock_warmcopy_unsupported_family, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_memory_current_bytes",
      (char *)&show_preserve_trx_memory_current_bytes, SHOW_FUNC,

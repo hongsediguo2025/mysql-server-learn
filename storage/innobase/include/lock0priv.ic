@@ -90,6 +90,10 @@ void lock_rec_set_nth_bit(lock_t *lock, /*!< in: record lock */
   ((byte *)&lock[1])[byte_index] |= 1 << bit_index;
 
   lock->trx->lock.n_rec_locks.fetch_add(1, std::memory_order_relaxed);
+  if (lock_warmcopy_hooks_enabled()) {
+    (void)lock_warmcopy_record_bitmap_set_for_lock(lock,
+                                                   static_cast<uint32_t>(i));
+  }
 }
 
 /** Gets the first or next record lock on a page.

@@ -165,6 +165,11 @@ static void trx_init(trx_t *trx) {
   trx->check_unique_secondary = true;
 
   trx->lock.n_rec_locks.store(0);
+  trx->lock.lock_warmcopy_conversion_frozen = false;
+  trx->lock.lock_warmcopy_freeze_generation = 0;
+  trx->lock.lock_warmcopy_conversion_freeze_wait_epoch = 0;
+  trx->lock.lock_warmcopy_conversion_attempt_after_freeze = false;
+  trx->lock.lock_warmcopy_conversion_unhandled_after_freeze = false;
 
   trx->lock.blocking_trx.store(nullptr);
 

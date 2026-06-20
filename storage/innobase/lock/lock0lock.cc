@@ -89,6 +89,9 @@ static const ulint REC_LOCK_SIZE = sizeof(ib_lock_t) + 256;
 /** Total number of cached table locks */
 static const ulint TABLE_LOCK_CACHE = 8;
 
+static bool lock_warmcopy_capture_record_image_for_lock(
+    const lock_t *lock, const buf_block_t *block, ulint heap_no);
+
 /** Size in bytes, of the table lock instance */
 static const ulint TABLE_LOCK_SIZE = sizeof(ib_lock_t);
 
@@ -677,6 +680,10 @@ byte lock_rec_reset_nth_bit(lock_t *lock, ulint i) {
   if (bit != 0) {
     ut_ad(lock->trx->lock.n_rec_locks.load() > 0);
     lock->trx->lock.n_rec_locks.fetch_sub(1, std::memory_order_relaxed);
+    if (lock_warmcopy_hooks_enabled()) {
+      (void)lock_warmcopy_record_bitmap_reset_for_lock(lock,
+                                                       static_cast<uint32_t>(i));
+    }
   }
 
   return (bit);
@@ -1475,6 +1482,8 @@ static void lock_rec_add_to_queue(ulint type_mode, const buf_block_t *block,
               (ULINT_UNDEFINED == lock_rec_find_set_bit(lock)));
 
         lock_rec_set_nth_bit(lock, heap_no);
+        (void)lock_warmcopy_capture_record_image_for_lock(lock, block,
+                                                          heap_no);
         if (found_waiter_before_lock) {
           lock_rec_move_granted_to_front(lock, RecID{lock, heap_no});
         }
@@ -1488,7 +1497,9 @@ static void lock_rec_add_to_queue(ulint type_mode, const buf_block_t *block,
   if (!we_own_trx_mutex) {
     trx_mutex_enter(trx);
   }
-  rec_lock.create(trx);
+  lock_t *created_lock = rec_lock.create(trx);
+  (void)lock_warmcopy_capture_record_image_for_lock(created_lock, block,
+                                                    heap_no);
   if (!we_own_trx_mutex) {
     trx_mutex_exit(trx);
   }
@@ -1545,7 +1556,9 @@ lock_rec_req_status lock_rec_lock_fast(
       RecLock rec_lock(index, block, heap_no, mode);
 
       trx_mutex_enter(trx);
-      rec_lock.create(trx);
+      lock_t *created_lock = rec_lock.create(trx);
+      (void)lock_warmcopy_capture_record_image_for_lock(created_lock, block,
+                                                        heap_no);
       trx_mutex_exit(trx);
 
       status = LOCK_REC_SUCCESS_CREATED;
@@ -1563,6 +1576,8 @@ lock_rec_req_status lock_rec_lock_fast(
       set */
       if (!lock_rec_get_nth_bit(lock, heap_no)) {
         lock_rec_set_nth_bit(lock, heap_no);
+        (void)lock_warmcopy_capture_record_image_for_lock(lock, block,
+                                                          heap_no);
         status = LOCK_REC_SUCCESS_CREATED;
       }
     }
@@ -3419,6 +3434,37 @@ static bool lock_preserve_record_images_payload_is_valid(
   return offset == record_images.size();
 }
 
+static bool lock_preserve_record_image_slots(
+    const std::string &record_images, uint32_t expected_count,
+    std::vector<std::string> *slots) {
+  if (slots == nullptr) return false;
+
+  slots->clear();
+  slots->reserve(expected_count);
+
+  size_t offset = 0;
+  for (uint32_t i = 0; i < expected_count; ++i) {
+    const size_t slot_offset = offset;
+    uint32_t image_len = 0;
+    if (lock_preserve_read_le32(record_images, &offset, &image_len) ||
+        image_len == 0 || image_len > UNIV_PAGE_SIZE_MAX ||
+        offset > record_images.size() ||
+        record_images.size() - offset < image_len) {
+      slots->clear();
+      return false;
+    }
+    offset += image_len;
+    slots->push_back(record_images.substr(slot_offset, 4 + image_len));
+  }
+
+  if (offset != record_images.size()) {
+    slots->clear();
+    return false;
+  }
+
+  return true;
+}
+
 static constexpr uint32_t kLockPreservePredicatePageIdentityVersion = 1;
 
 static bool lock_preserve_predicate_page_identity_payload_is_valid(
@@ -3571,6 +3617,19 @@ static bool lock_preserve_bitmap_matches_page(
   return true;
 }
 
+static bool lock_preserve_record_image_field_is_stable(
+    const dict_index_t *index, ulint field_no) {
+  if (index == nullptr || field_no >= index->n_def) return false;
+
+  const dict_field_t *field = index->get_field(field_no);
+  if (field == nullptr || field->col == nullptr) return true;
+
+  if (field->col->mtype != DATA_SYS) return true;
+
+  const uint32_t sys_type = field->col->prtype & DATA_SYS_PRTYPE_MASK;
+  return sys_type != DATA_TRX_ID && sys_type != DATA_ROLL_PTR;
+}
+
 static bool lock_preserve_append_record_image(const dict_index_t *index,
                                               const rec_t *rec,
                                               std::string *record_images) {
@@ -3583,13 +3642,23 @@ static bool lock_preserve_append_record_image(const dict_index_t *index,
 
   std::string image;
   const ulint n_fields = rec_offs_n_fields(offsets);
-  bool valid = n_fields > 0;
+  uint32_t stable_field_count = 0;
+  for (ulint i = 0; i < n_fields; ++i) {
+    if (lock_preserve_record_image_field_is_stable(index, i)) {
+      ++stable_field_count;
+    }
+  }
+  bool valid = stable_field_count > 0;
 
   if (valid) {
-    lock_preserve_append_le32(&image, static_cast<uint32_t>(n_fields));
+    lock_preserve_append_le32(&image, stable_field_count);
   }
 
   for (ulint i = 0; valid && i < n_fields; ++i) {
+    if (!lock_preserve_record_image_field_is_stable(index, i)) {
+      continue;
+    }
+
     if (rec_offs_nth_extern(offsets, i) ||
         rec_offs_nth_default(offsets, i)) {
       valid = false;
@@ -3648,6 +3717,61 @@ static bool lock_preserve_append_pseudo_record_image(
   return true;
 }
 
+static bool lock_preserve_encoded_pseudo_record_heap_no(
+    const std::string &encoded_record_image, uint32_t *heap_no) {
+  if (heap_no == nullptr || encoded_record_image.size() != 24) {
+    return false;
+  }
+
+  size_t offset = 0;
+  uint32_t image_len = 0;
+  if (lock_preserve_read_le32(encoded_record_image, &offset, &image_len) ||
+      image_len != 20 ||
+      encoded_record_image.compare(offset, 16, "PRESERVE_SYS_REC", 16) != 0) {
+    return false;
+  }
+  offset += 16;
+
+  return !lock_preserve_read_le32(encoded_record_image, &offset, heap_no) &&
+         offset == encoded_record_image.size();
+}
+
+static bool lock_warmcopy_capture_record_image_for_lock(
+    const lock_t *lock, const buf_block_t *block, ulint heap_no) {
+  if (!lock_warmcopy_hooks_enabled()) return true;
+  if (lock == nullptr || block == nullptr || lock->trx == nullptr ||
+      lock->index == nullptr || lock->index->table == nullptr ||
+      lock_get_type_low(lock) != LOCK_REC ||
+      lock_preserve_type_mode_is_predicate(lock->type_mode) ||
+      heap_no >= lock_rec_get_n_bits(lock)) {
+    lock_warmcopy_record_hook_event();
+    return false;
+  }
+
+  const rec_t *rec = page_find_rec_with_heap_no(block->frame, heap_no);
+  if (rec == nullptr) {
+    lock_warmcopy_record_hook_event();
+    return false;
+  }
+
+  std::string encoded_record_image;
+  if (page_rec_is_user_rec(rec)) {
+    if (!lock_preserve_append_record_image(lock->index, rec,
+                                           &encoded_record_image)) {
+      lock_warmcopy_record_hook_event();
+      return false;
+    }
+  } else if (!lock_preserve_append_pseudo_record_image(
+                 static_cast<uint32_t>(heap_no), &encoded_record_image)) {
+    lock_warmcopy_record_hook_event();
+    return false;
+  }
+
+  return lock_warmcopy_record_bitmap_set_with_image_for_lock(
+      lock, static_cast<uint32_t>(heap_no), static_cast<uint32_t>(heap_no),
+      encoded_record_image);
+}
+
 static bool lock_preserve_build_record_identity(
     const Preserve_record_lock_entry &entry, const dict_index_t *index,
     const page_t *page, std::string *heap_offsets,
@@ -3665,6 +3789,15 @@ static bool lock_preserve_build_record_identity(
 
     const rec_t *rec = page_find_rec_with_heap_no(page, heap_no);
     if (rec == nullptr) {
+      lock_preserve_set_record_export_error(
+          "record_lock_identity_record_missing");
+      ib::error() << "Preserve record lock identity rebuild failed"
+                  << ": reason=record_missing"
+                  << " table_id=" << entry.table_id
+                  << " index_id=" << entry.index_id
+                  << " space_id=" << entry.space_id
+                  << " page_no=" << entry.page_no
+                  << " heap_no=" << heap_no;
       return false;
     }
     /*
@@ -3676,16 +3809,168 @@ static bool lock_preserve_build_record_identity(
     lock_preserve_append_le32(heap_offsets, heap_no);
     if (!page_rec_is_user_rec(rec)) {
       if (!lock_preserve_append_pseudo_record_image(heap_no, record_images)) {
+        lock_preserve_set_record_export_error(
+            "record_lock_identity_pseudo_image_failed");
         return false;
       }
       continue;
     }
     if (!lock_preserve_append_record_image(index, rec, record_images)) {
+      lock_preserve_set_record_export_error(
+          "record_lock_identity_record_image_failed");
+      ib::error() << "Preserve record lock identity rebuild failed"
+                  << ": reason=record_image_failed"
+                  << " table_id=" << entry.table_id
+                  << " index_id=" << entry.index_id
+                  << " space_id=" << entry.space_id
+                  << " page_no=" << entry.page_no
+                  << " heap_no=" << heap_no
+                  << " type_mode=" << entry.type_mode
+                  << " n_bits=" << entry.n_bits;
       return false;
     }
   }
 
-  return !heap_offsets->empty() && !record_images->empty();
+  if (heap_offsets->empty() || record_images->empty()) {
+    lock_preserve_set_record_export_error(
+        "record_lock_identity_empty_rebuild");
+    return false;
+  }
+
+  return true;
+}
+
+static uint32_t lock_preserve_rounded_record_n_bits(uint32_t min_bits) {
+  if (min_bits == 0) return 8;
+  if (min_bits > UINT32_MAX - 7) return UINT32_MAX & ~7U;
+  return (min_bits + 7U) & ~7U;
+}
+
+static bool lock_preserve_build_current_record_image_map(
+    const dict_index_t *index, const page_t *page,
+    std::unordered_map<std::string, uint32_t> *image_to_heap_no) {
+  if (image_to_heap_no == nullptr) return false;
+
+  image_to_heap_no->clear();
+  const uint16_t n_heap = page_dir_get_n_heap(page);
+  for (uint32_t heap_no = PAGE_HEAP_NO_USER_LOW; heap_no < n_heap; ++heap_no) {
+    const rec_t *rec = page_find_rec_with_heap_no(page, heap_no);
+    if (rec == nullptr || !page_rec_is_user_rec(rec)) {
+      continue;
+    }
+
+    std::string encoded_record_image;
+    if (!lock_preserve_append_record_image(index, rec, &encoded_record_image)) {
+      continue;
+    }
+
+    const auto inserted =
+        image_to_heap_no->emplace(encoded_record_image, heap_no);
+    if (!inserted.second) {
+      inserted.first->second = std::numeric_limits<uint32_t>::max();
+    }
+  }
+
+  return true;
+}
+
+static bool lock_preserve_resolve_record_identity(
+    const Preserve_record_lock_entry &entry, const dict_index_t *index,
+    const page_t *page, Preserve_record_lock_entry *resolved_entry) {
+  if (resolved_entry == nullptr || lock_preserve_entry_is_predicate(entry)) {
+    return false;
+  }
+
+  const uint32_t set_bits = lock_preserve_bitmap_set_bit_count(entry);
+  std::vector<std::string> image_slots;
+  if (!lock_preserve_record_image_slots(entry.record_images, set_bits,
+                                        &image_slots)) {
+    lock_preserve_set_record_export_error(
+        "record_lock_identity_image_payload_invalid");
+    return false;
+  }
+
+  std::unordered_map<std::string, uint32_t> image_to_heap_no;
+  if (!lock_preserve_build_current_record_image_map(index, page,
+                                                    &image_to_heap_no)) {
+    lock_preserve_set_record_export_error(
+        "record_lock_identity_current_image_map_failed");
+    return false;
+  }
+
+  std::vector<uint32_t> resolved_heap_nos;
+  resolved_heap_nos.reserve(set_bits);
+
+  uint32_t max_heap_no = 0;
+  size_t slot_index = 0;
+  for (uint32_t old_heap_no = 0; old_heap_no < entry.n_bits; ++old_heap_no) {
+    if (!lock_preserve_bitmap_get_nth_bit(entry.bitmap, old_heap_no)) {
+      continue;
+    }
+
+    if (slot_index >= image_slots.size()) {
+      lock_preserve_set_record_export_error(
+          "record_lock_identity_image_slot_underflow");
+      return false;
+    }
+
+    const std::string &encoded_record_image = image_slots[slot_index++];
+    uint32_t pseudo_heap_no = 0;
+    uint32_t resolved_heap_no = 0;
+    if (lock_preserve_encoded_pseudo_record_heap_no(encoded_record_image,
+                                                    &pseudo_heap_no)) {
+      if (pseudo_heap_no != old_heap_no) {
+        lock_preserve_set_record_export_error(
+            "record_lock_identity_pseudo_heap_drift");
+        return false;
+      }
+      const rec_t *rec = page_find_rec_with_heap_no(page, pseudo_heap_no);
+      if (rec == nullptr || page_rec_is_user_rec(rec)) {
+        lock_preserve_set_record_export_error(
+            "record_lock_identity_pseudo_record_missing");
+        return false;
+      }
+      resolved_heap_no = pseudo_heap_no;
+    } else {
+      const auto image_it = image_to_heap_no.find(encoded_record_image);
+      if (image_it == image_to_heap_no.end()) {
+        lock_preserve_set_record_export_error(
+            "record_lock_identity_record_image_not_found");
+        return false;
+      }
+      if (image_it->second == std::numeric_limits<uint32_t>::max()) {
+        lock_preserve_set_record_export_error(
+            "record_lock_identity_record_image_ambiguous");
+        return false;
+      }
+      resolved_heap_no = image_it->second;
+    }
+
+    resolved_heap_nos.push_back(resolved_heap_no);
+    max_heap_no = std::max(max_heap_no, resolved_heap_no);
+  }
+
+  if (slot_index != image_slots.size() ||
+      resolved_heap_nos.size() != set_bits) {
+    lock_preserve_set_record_export_error(
+        "record_lock_identity_image_slot_count_mismatch");
+    return false;
+  }
+
+  *resolved_entry = entry;
+  resolved_entry->n_bits = lock_preserve_rounded_record_n_bits(
+      std::max(entry.n_bits, max_heap_no + 1));
+  resolved_entry->bitmap.assign(resolved_entry->n_bits / 8U, '\0');
+  resolved_entry->heap_offsets.clear();
+
+  for (uint32_t heap_no : resolved_heap_nos) {
+    resolved_entry->bitmap[heap_no / 8U] = static_cast<char>(
+        static_cast<unsigned char>(resolved_entry->bitmap[heap_no / 8U]) |
+        (1U << (heap_no & 0x7)));
+    lock_preserve_append_le32(&resolved_entry->heap_offsets, heap_no);
+  }
+
+  return true;
 }
 
 static bool lock_preserve_build_predicate_page_identity(
@@ -3719,6 +4004,53 @@ static bool lock_preserve_build_predicate_page_identity(
   return true;
 }
 
+static size_t lock_preserve_first_diff_offset(const std::string &lhs,
+                                              const std::string &rhs) {
+  const size_t common_len = std::min(lhs.size(), rhs.size());
+  for (size_t i = 0; i < common_len; ++i) {
+    if (lhs[i] != rhs[i]) return i;
+  }
+  return common_len;
+}
+
+static uint32_t lock_preserve_byte_at_or_sentinel(const std::string &value,
+                                                  size_t offset) {
+  if (offset >= value.size()) return UINT32_MAX;
+  return static_cast<unsigned char>(value[offset]);
+}
+
+static void lock_preserve_log_record_identity_mismatch(
+    const Preserve_record_lock_entry &entry, const page_t *page,
+    const std::string &current_heap_offsets,
+    const std::string &current_record_images) {
+  const size_t first_diff = lock_preserve_first_diff_offset(
+      entry.record_images, current_record_images);
+
+  ib::error() << "Preserve record lock identity mismatch"
+             << ": table_id=" << entry.table_id
+             << " index_id=" << entry.index_id
+             << " space_id=" << entry.space_id
+             << " page_no=" << entry.page_no
+             << " type_mode=" << entry.type_mode
+             << " n_bits=" << entry.n_bits
+             << " set_bits=" << lock_preserve_bitmap_set_bit_count(entry)
+             << " page_lsn=" << entry.page_lsn
+             << " current_page_lsn=" << mach_read_from_8(page + FIL_PAGE_LSN)
+             << " page_n_heap=" << entry.page_n_heap
+             << " current_page_n_heap=" << page_dir_get_n_heap(page)
+             << " expected_heap_len=" << entry.heap_offsets.size()
+             << " current_heap_len=" << current_heap_offsets.size()
+             << " expected_image_len=" << entry.record_images.size()
+             << " current_image_len=" << current_record_images.size()
+             << " first_image_diff_offset=" << first_diff
+             << " expected_byte="
+             << lock_preserve_byte_at_or_sentinel(entry.record_images,
+                                                  first_diff)
+             << " current_byte="
+             << lock_preserve_byte_at_or_sentinel(current_record_images,
+                                                  first_diff);
+}
+
 static bool lock_preserve_page_identity_matches(
     const Preserve_record_lock_entry &entry, const dict_index_t *index,
     const page_t *page) {
@@ -3749,6 +4081,8 @@ static bool lock_preserve_page_identity_matches(
   */
   if (entry.heap_offsets.size() !=
       static_cast<size_t>(lock_preserve_bitmap_set_bit_count(entry)) * 4) {
+    lock_preserve_set_record_export_error(
+        "record_lock_identity_heap_payload_invalid");
     return false;
   }
   std::string current_heap_offsets;
@@ -3757,10 +4091,23 @@ static bool lock_preserve_page_identity_matches(
     return false;
   }
 
-  return lock_preserve_build_record_identity(entry, index, page,
-                                             &current_heap_offsets,
-                                             &current_record_images) &&
-         current_record_images == entry.record_images;
+  if (!lock_preserve_build_record_identity(entry, index, page,
+                                           &current_heap_offsets,
+                                           &current_record_images)) {
+    if (lock_preserve_last_record_lock_export_error() == nullptr) {
+      lock_preserve_set_record_export_error(
+          "record_lock_identity_rebuild_failed");
+    }
+    return false;
+  }
+
+  if (current_record_images != entry.record_images) {
+    lock_preserve_log_record_identity_mismatch(
+        entry, page, current_heap_offsets, current_record_images);
+    return false;
+  }
+
+  return true;
 }
 
 static dict_index_t *lock_preserve_find_index(dict_table_t *table,
@@ -3971,6 +4318,27 @@ static dberr_t lock_preserve_capture_page_identity(
 
 dberr_t lock_preserve_export_record_locks(trx_t *trx, std::string *payload) {
   return lock_preserve_export_record_locks(trx, payload, UINT32_MAX);
+}
+
+bool lock_preserve_trx_has_predicate_locks(trx_t *trx,
+                                           bool *has_predicate_locks) {
+  if (trx == nullptr || has_predicate_locks == nullptr) return false;
+
+  *has_predicate_locks = false;
+  locksys::Global_exclusive_latch_guard guard{};
+  trx_mutex_enter(trx);
+
+  for (const lock_t *lock = UT_LIST_GET_FIRST(trx->lock.trx_locks);
+       lock != nullptr; lock = UT_LIST_GET_NEXT(trx_locks, lock)) {
+    if (lock_get_type_low(lock) == LOCK_REC &&
+        lock_preserve_type_mode_is_predicate(lock->type_mode)) {
+      *has_predicate_locks = true;
+      break;
+    }
+  }
+
+  trx_mutex_exit(trx);
+  return true;
 }
 
 static uint32_t lock_preserve_count_live_record_bits(const lock_t *lock) {
@@ -4261,19 +4629,23 @@ static dberr_t lock_preserve_import_record_lock(
   dict_table_t *table = table_handle.get();
 
   if (table == nullptr) {
+    lock_preserve_set_record_export_error("record_lock_import_table_open_failed");
     return DB_TABLE_NOT_FOUND;
   }
 
   if (table->ibd_file_missing || table->is_temporary()) {
+    lock_preserve_set_record_export_error("record_lock_import_table_unavailable");
     return DB_TABLE_NOT_FOUND;
   }
 
   dict_index_t *index = lock_preserve_find_index(table, entry.index_id);
   if (index == nullptr || index->space != entry.space_id) {
+    lock_preserve_set_record_export_error("record_lock_import_index_open_failed");
     return DB_ERROR;
   }
 
   if (!lock_preserve_bitmap_has_set_bit(entry)) {
+    lock_preserve_set_record_export_error("record_lock_import_empty_bitmap");
     return DB_ERROR;
   }
 
@@ -4282,7 +4654,11 @@ static dberr_t lock_preserve_import_record_lock(
   if (!lock_preserve_skip_record_lock_table_resurrect()) {
     const dberr_t table_err = lock_preserve_resurrect_table_lock(
         table, trx, record_mode == LOCK_S ? LOCK_IS : LOCK_IX);
-    if (table_err != DB_SUCCESS) return table_err;
+    if (table_err != DB_SUCCESS) {
+      lock_preserve_set_record_export_error(
+          "record_lock_import_table_resurrect_failed");
+      return table_err;
+    }
   }
 
   mtr_t mtr;
@@ -4291,9 +4667,26 @@ static dberr_t lock_preserve_import_record_lock(
   buf_block_t *block =
       buf_page_get(page_id, index->get_page_size(), RW_S_LATCH, &mtr);
 
-  if (block == nullptr || btr_page_get_index_id(block->frame) != entry.index_id ||
-      !lock_preserve_bitmap_matches_page(entry, block->frame) ||
-      !lock_preserve_page_identity_matches(entry, index, block->frame)) {
+  if (block == nullptr) {
+    lock_preserve_set_record_export_error("record_lock_import_page_open_failed");
+    mtr_commit(&mtr);
+    return DB_ERROR;
+  }
+
+  if (btr_page_get_index_id(block->frame) != entry.index_id) {
+    lock_preserve_set_record_export_error(
+        "record_lock_import_page_identity_drift");
+    mtr_commit(&mtr);
+    return DB_ERROR;
+  }
+
+  Preserve_record_lock_entry resolved_entry;
+  if (!lock_preserve_resolve_record_identity(entry, index, block->frame,
+                                             &resolved_entry)) {
+    if (lock_preserve_last_record_lock_export_error() == nullptr) {
+      lock_preserve_set_record_export_error(
+          "record_lock_import_identity_drift");
+    }
     mtr_commit(&mtr);
     return DB_ERROR;
   }
@@ -4301,13 +4694,14 @@ static dberr_t lock_preserve_import_record_lock(
   bool has_conflict = false;
   {
     locksys::Shard_latch_guard guard{block->get_page_id()};
-    has_conflict = lock_preserve_record_entry_has_conflict(trx, entry, block);
+    has_conflict =
+        lock_preserve_record_entry_has_conflict(trx, resolved_entry, block);
     if (!has_conflict) {
       trx_mutex_enter(trx);
-      for (uint32_t heap_no = 0; heap_no < entry.n_bits; ++heap_no) {
-        if (lock_preserve_bitmap_get_nth_bit(entry.bitmap, heap_no)) {
-          lock_rec_add_to_queue(entry.type_mode, block, heap_no, index, trx,
-                                true);
+      for (uint32_t heap_no = 0; heap_no < resolved_entry.n_bits; ++heap_no) {
+        if (lock_preserve_bitmap_get_nth_bit(resolved_entry.bitmap, heap_no)) {
+          lock_rec_add_to_queue(resolved_entry.type_mode, block, heap_no, index,
+                                trx, true);
         }
       }
       trx_mutex_exit(trx);
@@ -4315,6 +4709,7 @@ static dberr_t lock_preserve_import_record_lock(
   }
 
   if (has_conflict) {
+    lock_preserve_set_record_export_error("record_lock_import_conflict");
     mtr_commit(&mtr);
     return DB_LOCK_WAIT;
   }
@@ -4455,14 +4850,18 @@ static bool lock_preserve_skip_record_lock_table_resurrect() {
 
 dberr_t lock_preserve_import_record_locks(trx_t *trx,
                                           const std::string &payload) {
+  lock_preserve_set_record_export_error(nullptr);
   if (payload.empty()) {
     return DB_SUCCESS;
   }
 
-  DBUG_EXECUTE_IF("preserve_trx_fail_import_record_locks",
-                  return DB_OUT_OF_MEMORY;);
+  DBUG_EXECUTE_IF("preserve_trx_fail_import_record_locks", {
+    lock_preserve_set_record_export_error("record_lock_import_injected_failure");
+    return DB_OUT_OF_MEMORY;
+  });
 
   if (trx == nullptr) {
+    lock_preserve_set_record_export_error("record_lock_import_invalid_trx");
     return DB_ERROR;
   }
 
@@ -4471,6 +4870,7 @@ dberr_t lock_preserve_import_record_locks(trx_t *trx,
       lock_preserve_parse_record_locks_payload(payload, &entries);
 
   if (parse_err != DB_SUCCESS) {
+    lock_preserve_set_record_export_error("record_lock_import_payload_parse_failed");
     return parse_err;
   }
 
@@ -6926,7 +7326,8 @@ static dberr_t lock_rec_convert_impl_to_expl_for_trx(
     trx_t *trx,               /*!< in/out: active transaction */
     ulint heap_no,            /*!< in: rec heap number to lock */
     bool *converted = nullptr,
-    bool allow_conversion = true)
+    bool allow_conversion = true,
+    select_mode sel_mode = SELECT_ORDINARY)
 {
   ut_ad(trx_is_referenced(trx));
   dberr_t err = DB_SUCCESS;
@@ -6935,51 +7336,73 @@ static dberr_t lock_rec_convert_impl_to_expl_for_trx(
   }
 
   DEBUG_SYNC_C("before_lock_rec_convert_impl_to_expl_for_trx");
-  {
-    locksys::Shard_latch_guard guard{block->get_page_id()};
-    /* This trx->mutex acquisition here is not really needed.
-    Its purpose is to prevent a state transition between calls to trx_state_eq()
-    and lock_rec_add_to_queue().
-    But one can prove, that even if the state did change, it is not
-    a big problem, because we still keep reference count from dropping
-    to zero, so the trx object is still in use, and we hold the shard latched,
-    so trx can not release its explicit lock (if it has any) so we will
-    notice the explicit lock in lock_rec_has_expl.
-    On the other hand if trx does not have explicit lock, then we would create
-    one on its behalf, which is wasteful, but does not cause a problem, as once
-    the reference count drops to zero the trx will notice and remove this new
-    explicit lock. Also, even if some other trx had observed that trx is already
-    removed from rw trxs list and thus ignored the implicit lock and decided to
-    add its own lock, it will still have to wait for shard latch before adding
-    her lock. However it does not cost us much to simply take the trx->mutex
-    and avoid this whole shaky reasoning. */
-    trx_mutex_enter(trx);
 
-    ut_ad(!index->is_clustered() ||
-          trx->id ==
-              lock_clust_rec_some_has_impl(
-                  rec, index,
-                  offsets ? offsets : Rec_offsets().compute(rec, index)));
+  for (;;) {
+    bool wait_for_thaw = false;
 
-    ut_ad(!trx_state_eq(trx, TRX_STATE_NOT_STARTED));
+    {
+      locksys::Shard_latch_guard guard{block->get_page_id()};
+      /* This trx->mutex acquisition here is not really needed.
+      Its purpose is to prevent a state transition between calls to trx_state_eq()
+      and lock_rec_add_to_queue().
+      But one can prove, that even if the state did change, it is not
+      a big problem, because we still keep reference count from dropping
+      to zero, so the trx object is still in use, and we hold the shard latched,
+      so trx can not release its explicit lock (if it has any) so we will
+      notice the explicit lock in lock_rec_has_expl.
+      On the other hand if trx does not have explicit lock, then we would create
+      one on its behalf, which is wasteful, but does not cause a problem, as once
+      the reference count drops to zero the trx will notice and remove this new
+      explicit lock. Also, even if some other trx had observed that trx is already
+      removed from rw trxs list and thus ignored the implicit lock and decided to
+      add its own lock, it will still have to wait for shard latch before adding
+      her lock. However it does not cost us much to simply take the trx->mutex
+      and avoid this whole shaky reasoning. */
+      trx_mutex_enter(trx);
 
-    const bool needs_conversion =
-        !trx_state_eq(trx, TRX_STATE_COMMITTED_IN_MEMORY) &&
-        !lock_rec_has_expl(LOCK_X | LOCK_REC_NOT_GAP, block, heap_no, trx);
-    if (needs_conversion && !allow_conversion) {
-      err = DB_UNSUPPORTED;
-    } else if (needs_conversion) {
-      ulint type_mode;
+      ut_ad(!index->is_clustered() ||
+            trx->id ==
+                lock_clust_rec_some_has_impl(
+                    rec, index,
+                    offsets ? offsets : Rec_offsets().compute(rec, index)));
 
-      type_mode = (LOCK_REC | LOCK_X | LOCK_REC_NOT_GAP);
+      ut_ad(!trx_state_eq(trx, TRX_STATE_NOT_STARTED));
 
-      lock_rec_add_to_queue(type_mode, block, heap_no, index, trx, true);
-      if (converted != nullptr) {
-        *converted = true;
+      const bool needs_conversion =
+          !trx_state_eq(trx, TRX_STATE_COMMITTED_IN_MEMORY) &&
+          !lock_rec_has_expl(LOCK_X | LOCK_REC_NOT_GAP, block, heap_no, trx);
+      if (needs_conversion &&
+          lock_warmcopy_trx_conversion_is_frozen(&trx->lock)) {
+        DEBUG_SYNC_C("lock_warmcopy_impl_to_expl_after_freeze_check");
+        lock_warmcopy_trx_conversion_note_attempt(&trx->lock);
+        lock_warmcopy_trx_conversion_note_handled(&trx->lock);
+        DEBUG_SYNC_C("lock_warmcopy_impl_to_expl_before_return_frozen");
+        err = lock_warmcopy_frozen_conversion_result(sel_mode);
+        wait_for_thaw = err == DB_SUCCESS;
+      } else if (needs_conversion && !allow_conversion) {
+        err = DB_UNSUPPORTED;
+      } else if (needs_conversion) {
+        ulint type_mode;
+
+        type_mode = (LOCK_REC | LOCK_X | LOCK_REC_NOT_GAP);
+
+        lock_rec_add_to_queue(type_mode, block, heap_no, index, trx, true);
+        if (converted != nullptr) {
+          *converted = true;
+        }
       }
+
+      trx_mutex_exit(trx);
     }
 
-    trx_mutex_exit(trx);
+    if (!wait_for_thaw) {
+      break;
+    }
+
+    err = lock_warmcopy_wait_for_conversion_thaw(trx);
+    if (err != DB_SUCCESS) {
+      break;
+    }
   }
 
   trx_release_reference(trx);
@@ -6993,10 +7416,14 @@ set on the record, sets one for it.
 @param[in]	block		buffer block of rec
 @param[in]	rec		user record on page
 @param[in]	index		index of record
-@param[in]	offsets		rec_get_offsets(rec, index) */
-static void lock_rec_convert_impl_to_expl(const buf_block_t *block,
-                                          const rec_t *rec, dict_index_t *index,
-                                          const ulint *offsets) {
+@param[in]	offsets		rec_get_offsets(rec, index)
+@return DB_SUCCESS or lock wait/deadlock status if conversion cannot proceed */
+static dberr_t lock_rec_convert_impl_to_expl(const buf_block_t *block,
+                                             const rec_t *rec,
+                                             dict_index_t *index,
+                                             const ulint *offsets,
+                                             select_mode sel_mode =
+                                                 SELECT_ORDINARY) {
   trx_t *trx;
 
   ut_ad(!locksys::owns_exclusive_global_latch());
@@ -7032,9 +7459,11 @@ static void lock_rec_convert_impl_to_expl(const buf_block_t *block,
     explicit x-lock set on the record, set one for it.
     trx cannot be committed until the ref count is zero. */
 
-    lock_rec_convert_impl_to_expl_for_trx(block, rec, index, offsets, trx,
-                                          heap_no);
+    return lock_rec_convert_impl_to_expl_for_trx(
+        block, rec, index, offsets, trx, heap_no, nullptr, true, sel_mode);
   }
+
+  return DB_SUCCESS;
 }
 
 /** Owner-of-implicit-lock predicate for a single index record. */
@@ -7235,13 +7664,14 @@ dberr_t lock_preserve_materialize_implicit_locks(
   return DB_SUCCESS;
 }
 
-void lock_rec_convert_active_impl_to_expl(const buf_block_t *block,
-                                          const rec_t *rec, dict_index_t *index,
-                                          const ulint *offsets, trx_t *trx,
-                                          ulint heap_no) {
+dberr_t lock_rec_convert_active_impl_to_expl(const buf_block_t *block,
+                                             const rec_t *rec,
+                                             dict_index_t *index,
+                                             const ulint *offsets, trx_t *trx,
+                                             ulint heap_no) {
   trx_reference(trx, true);
-  lock_rec_convert_impl_to_expl_for_trx(block, rec, index, offsets, trx,
-                                        heap_no);
+  return lock_rec_convert_impl_to_expl_for_trx(block, rec, index, offsets, trx,
+                                               heap_no);
 }
 
 /** Checks if locks of other transactions prevent an immediate modify (update,
@@ -7279,7 +7709,12 @@ dberr_t lock_clust_rec_modify_check_and_lock(
   /* If a transaction has no explicit x-lock set on the record, set one
   for it */
 
-  lock_rec_convert_impl_to_expl(block, rec, index, offsets);
+  const dberr_t conversion_err =
+      lock_rec_convert_impl_to_expl(block, rec, index, offsets,
+                                    SELECT_ORDINARY);
+  if (conversion_err != DB_SUCCESS) {
+    return (conversion_err);
+  }
 
   {
     locksys::Shard_latch_guard guard{block->get_page_id()};
@@ -7388,7 +7823,11 @@ dberr_t lock_sec_rec_read_check_and_lock(
   if ((page_get_max_trx_id(block->frame) >= trx_rw_min_trx_id() ||
        recv_recovery_is_on()) &&
       !page_rec_is_supremum(rec)) {
-    lock_rec_convert_impl_to_expl(block, rec, index, offsets);
+    const dberr_t conversion_err =
+        lock_rec_convert_impl_to_expl(block, rec, index, offsets, sel_mode);
+    if (conversion_err != DB_SUCCESS) {
+      return (conversion_err);
+    }
   }
   {
     locksys::Shard_latch_guard guard{block->get_page_id()};
@@ -7437,7 +7876,11 @@ dberr_t lock_clust_rec_read_check_and_lock(
   heap_no = page_rec_get_heap_no(rec);
 
   if (heap_no != PAGE_HEAP_NO_SUPREMUM) {
-    lock_rec_convert_impl_to_expl(block, rec, index, offsets);
+    const dberr_t conversion_err =
+        lock_rec_convert_impl_to_expl(block, rec, index, offsets, sel_mode);
+    if (conversion_err != DB_SUCCESS) {
+      return (conversion_err);
+    }
   }
 
   DEBUG_SYNC_C("after_lock_clust_rec_read_check_and_lock_impl_to_expl");
@@ -7935,6 +8378,10 @@ void lock_trx_release_locks(trx_t *trx) /*!< in/out: transaction */
   trx_mutex_enter(trx);
   trx->lock.table_locks.clear();
   trx->lock.n_rec_locks.store(0);
+  trx->lock.lock_warmcopy_conversion_frozen = false;
+  trx->lock.lock_warmcopy_conversion_freeze_wait_epoch = 0;
+  trx->lock.lock_warmcopy_conversion_attempt_after_freeze = false;
+  trx->lock.lock_warmcopy_conversion_unhandled_after_freeze = false;
 
   ut_a(UT_LIST_GET_LEN(trx->lock.trx_locks) == 0);
   ut_a(ib_vector_is_empty(trx->lock.autoinc_locks));

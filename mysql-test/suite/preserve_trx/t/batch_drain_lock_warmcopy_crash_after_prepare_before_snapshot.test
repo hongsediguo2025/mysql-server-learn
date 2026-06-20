@@ -1,0 +1,68 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_lock_warmcopy_crash_prepare;
+--enable_warnings
+
+--let $MYSQLD_DATADIR= `SELECT @@datadir`
+
+--let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
+--let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_fallback= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_fallback_to_live_export`
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+
+--disable_query_log
+CALL mtr.add_suppression("Attempting backtrace");
+CALL mtr.add_suppression("You can use the following information to find out");
+CALL mtr.add_suppression("PRESERVE: rolled back prepared transaction without snapshot during recovery");
+--enable_query_log
+
+CREATE TABLE t_lock_warmcopy_crash_prepare(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_crash_prepare VALUES(1,10),(2,20);
+
+--connect(lock_wc_crash_app, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_lock_warmcopy_crash_prepare SET v=11 WHERE id=1;
+
+--connection default
+SET SESSION debug="+d,preserve_trx_crash_after_undo_prepared_before_snapshot";
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--error 2013
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10 --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count_after_crash_before_snapshot
+  FROM performance_schema.preserved_transactions;
+
+--exec sh -c 'test ! -d "$MYSQLD_DATADIR/preserve" || ! find "$MYSQLD_DATADIR/preserve" \( -name "*.bin" -o -name "*.bin.tmp" -o -name "*.binlog_cache" -o -name "*.binlog_cache.tmp" \) -print -quit | grep -q .'
+
+SELECT id, v FROM t_lock_warmcopy_crash_prepare ORDER BY id;
+UPDATE t_lock_warmcopy_crash_prepare SET v=21 WHERE id=2;
+SELECT id, v FROM t_lock_warmcopy_crash_prepare ORDER BY id;
+
+DROP TABLE t_lock_warmcopy_crash_prepare;
+
+--disable_query_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback
+--eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
+--eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
+--eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--enable_query_log

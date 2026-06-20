@@ -1,0 +1,46 @@
+DROP TABLE IF EXISTS t_lock_warmcopy_savepoint_bookkeeping;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+CREATE TABLE t_lock_warmcopy_savepoint_bookkeeping(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_savepoint_bookkeeping
+VALUES(1,10),(2,20),(3,30),(4,40);
+START TRANSACTION;
+UPDATE t_lock_warmcopy_savepoint_bookkeeping SET v=11 WHERE id=1;
+SAVEPOINT base;
+UPDATE t_lock_warmcopy_savepoint_bookkeeping SET v=22 WHERE id=2;
+SAVEPOINT later;
+UPDATE t_lock_warmcopy_savepoint_bookkeeping SET v=33 WHERE id=3;
+ROLLBACK TO SAVEPOINT later;
+RELEASE SAVEPOINT later;
+UPDATE t_lock_warmcopy_savepoint_bookkeeping SET v=44 WHERE id=4;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+include/assert_grep.inc [lock warmcopy succeeds for savepoint bookkeeping]
+SELECT COUNT(*) AS preserved_count_after_savepoint_bookkeeping_warmcopy
+FROM performance_schema.preserved_transactions;
+preserved_count_after_savepoint_bookkeeping_warmcopy
+1
+SELECT SAVEPOINT_COUNT AS preserved_savepoint_count_after_warmcopy
+FROM performance_schema.preserved_transactions;
+preserved_savepoint_count_after_warmcopy
+1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ROLLBACK TO SAVEPOINT base;
+RELEASE SAVEPOINT base;
+COMMIT;
+SELECT COUNT(*) AS preserved_count_after_savepoint_bookkeeping_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_savepoint_bookkeeping_resume
+0
+SELECT id, v FROM t_lock_warmcopy_savepoint_bookkeeping ORDER BY id;
+id	v
+1	11
+2	20
+3	30
+4	40
+DROP TABLE t_lock_warmcopy_savepoint_bookkeeping;

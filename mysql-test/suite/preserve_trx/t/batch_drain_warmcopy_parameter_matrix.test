@@ -1,0 +1,192 @@
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_warmcopy_parameter_matrix;
+--enable_warnings
+
+--let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
+--let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
+--let $old_preserve_trx_warmcopy_min_open_ms= `SELECT @@GLOBAL.preserve_trx_warmcopy_min_open_ms`
+--let $old_preserve_trx_warmcopy_close_timeout_ms= `SELECT @@GLOBAL.preserve_trx_warmcopy_close_timeout_ms`
+--let $old_preserve_trx_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_fallback= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_fallback_to_live_export`
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+--let $old_preserve_trx_single_phase_max_binlog_cache_bytes= `SELECT @@GLOBAL.preserve_trx_single_phase_max_binlog_cache_bytes`
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=5000;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=1048576;
+
+CREATE TABLE t_warmcopy_parameter_matrix(
+  id INT PRIMARY KEY,
+  v INT,
+  pad VARBINARY(64)
+) ENGINE=InnoDB;
+INSERT INTO t_warmcopy_parameter_matrix VALUES
+  (1,10,REPEAT('a',32)),
+  (2,20,REPEAT('b',32)),
+  (3,30,REPEAT('c',32));
+
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=ON;
+
+--connect(warmcopy_matrix_binlog_app, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_warmcopy_parameter_matrix
+  SET v=11, pad=REPEAT('x',32)
+  WHERE id=1;
+
+--connect(warmcopy_matrix_binlog_owner, localhost, root,,test)
+--connection warmcopy_matrix_binlog_owner
+SET DEBUG_SYNC =
+  'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL warmcopy_matrix_binlog_closing WAIT_FOR warmcopy_matrix_binlog_continue';
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_matrix_binlog_closing TIMEOUT 10';
+SELECT 'binlog_only_two_phase_observed' AS matrix_case;
+SET DEBUG_SYNC = 'now SIGNAL warmcopy_matrix_binlog_continue';
+
+--connection warmcopy_matrix_binlog_owner
+--reap
+--disconnect warmcopy_matrix_binlog_owner
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--connect(warmcopy_matrix_binlog_resume, localhost, root,,test)
+--connection warmcopy_matrix_binlog_resume
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+COMMIT;
+--disconnect warmcopy_matrix_binlog_resume
+
+--connection default
+SELECT COUNT(*) AS preserved_count_after_resume
+  FROM performance_schema.preserved_transactions;
+
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+
+--connect(warmcopy_matrix_lock_app, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_warmcopy_parameter_matrix
+  SET v=22, pad=REPEAT('y',32)
+  WHERE id=2;
+
+--connect(warmcopy_matrix_lock_owner, localhost, root,,test)
+--connection warmcopy_matrix_lock_owner
+SET DEBUG_SYNC =
+  'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL warmcopy_matrix_lock_closing WAIT_FOR warmcopy_matrix_lock_continue';
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_matrix_lock_closing TIMEOUT 10';
+SELECT 'lock_only_two_phase_observed' AS matrix_case;
+SET DEBUG_SYNC = 'now SIGNAL warmcopy_matrix_lock_continue';
+
+--connection warmcopy_matrix_lock_owner
+--reap
+--disconnect warmcopy_matrix_lock_owner
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--connect(warmcopy_matrix_lock_resume, localhost, root,,test)
+--connection warmcopy_matrix_lock_resume
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+COMMIT;
+--disconnect warmcopy_matrix_lock_resume
+
+--connection default
+SELECT COUNT(*) AS preserved_count_after_resume
+  FROM performance_schema.preserved_transactions;
+
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+
+--connect(warmcopy_matrix_both_app, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_warmcopy_parameter_matrix
+  SET v=33, pad=REPEAT('z',32)
+  WHERE id=3;
+
+--connect(warmcopy_matrix_both_owner, localhost, root,,test)
+--connection warmcopy_matrix_both_owner
+SET DEBUG_SYNC =
+  'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL warmcopy_matrix_both_closing WAIT_FOR warmcopy_matrix_both_continue';
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_matrix_both_closing TIMEOUT 10';
+SELECT 'both_warmcopy_two_phase_observed' AS matrix_case;
+SET DEBUG_SYNC = 'now SIGNAL warmcopy_matrix_both_continue';
+
+--connection warmcopy_matrix_both_owner
+--reap
+--disconnect warmcopy_matrix_both_owner
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--connect(warmcopy_matrix_both_resume, localhost, root,,test)
+--connection warmcopy_matrix_both_resume
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+COMMIT;
+--disconnect warmcopy_matrix_both_resume
+
+--connection default
+SELECT COUNT(*) AS preserved_count_after_resume
+  FROM performance_schema.preserved_transactions;
+SELECT id, v, pad IN (REPEAT('x',32), REPEAT('y',32), REPEAT('z',32)) AS pad_ok
+  FROM t_warmcopy_parameter_matrix
+  ORDER BY id;
+
+DROP TABLE t_warmcopy_parameter_matrix;
+--disable_query_log
+--eval SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=$old_preserve_trx_single_phase_max_binlog_cache_bytes
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback
+--eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
+--eval SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=$old_preserve_trx_warmcopy_close_timeout_ms
+--eval SET GLOBAL preserve_trx_warmcopy_min_open_ms=$old_preserve_trx_warmcopy_min_open_ms
+--eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
+--eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--enable_query_log
+SET DEBUG_SYNC = 'RESET';

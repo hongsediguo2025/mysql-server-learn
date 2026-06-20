@@ -260,6 +260,7 @@ SET(SERVER_TESTS
   preserve_trx_drain
   preserve_trx
   preserve_trx_temp_table
+  preserve_trx_lock_warmcopy
   preserve_trx_warmcopy
   protocol_classic
   regexp_engine

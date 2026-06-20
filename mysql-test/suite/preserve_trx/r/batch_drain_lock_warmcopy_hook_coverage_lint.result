@@ -1,0 +1,7 @@
+# Lint-only source-shape guard. Runtime lock warmcopy behavior is covered
+# by targeted MTR and GUnit tests; this file guards the hook coverage
+# contract so new record/table lock mutation sites cannot remain
+# unclassified silently.
+SELECT 'ok' AS batch_drain_lock_warmcopy_hook_coverage_lint;
+batch_drain_lock_warmcopy_hook_coverage_lint
+ok

@@ -441,6 +441,7 @@ SET(SQL_SHARED_SOURCES
   preserve_trx_carrier_file.cc
   preserve_trx.cc
   preserve_trx_drain.cc
+  preserve_trx_lock_warmcopy.cc
   preserve_trx_resource.cc
   preserve_trx_temp_table.cc
   preserve_trx_temp_table_carrier.cc

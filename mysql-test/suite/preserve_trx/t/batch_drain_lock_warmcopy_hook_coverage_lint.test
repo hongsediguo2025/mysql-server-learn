@@ -1,0 +1,163 @@
+--echo # Lint-only source-shape guard. Runtime lock warmcopy behavior is covered
+--echo # by targeted MTR and GUnit tests; this file guards the hook coverage
+--echo # contract so new record/table lock mutation sites cannot remain
+--echo # unclassified silently.
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_source {
+  my (@parts) = @_;
+  my $path = File::Spec->catfile($source_root, @parts);
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $src = do { local $/; <$fh> };
+  close($fh);
+  return $src;
+}
+
+sub extract_function {
+  my ($src, $signature_re, $label) = @_;
+  $src =~ /$signature_re/s or die "could not find $label signature\n";
+  my $sig_pos = $-[0];
+  my $brace_pos = index($src, '{', $sig_pos);
+  die "could not find $label body start\n" if $brace_pos < 0;
+
+  my $depth = 0;
+  for (my $i = $brace_pos; $i < length($src); ++$i) {
+    my $ch = substr($src, $i, 1);
+    ++$depth if $ch eq '{';
+    --$depth if $ch eq '}';
+    if ($depth == 0 && $ch eq '}') {
+      return substr($src, $sig_pos, $i - $sig_pos + 1);
+    }
+  }
+  die "could not parse $label body\n";
+}
+
+my $lock = read_source('storage', 'innobase', 'lock', 'lock0lock.cc');
+my $lock_priv_ic = read_source('storage', 'innobase', 'include',
+                               'lock0priv.ic');
+my $lock_warmcopy = read_source('storage', 'innobase', 'lock',
+                                'lock0warmcopy.cc');
+my $lock_warmcopy_header = read_source('storage', 'innobase', 'include',
+                                       'lock0warmcopy.h');
+my $gunit = read_source('unittest', 'gunit', 'innodb',
+                        'lock0warmcopy-t.cc');
+
+$lock_warmcopy =~
+  /constexpr\s+lock_warmcopy_hook_coverage_site_t\s+k_lock_warmcopy_hook_sites\[\]\s*=\s*\{([\s\S]*?)^\s*\};/m
+  or die "could not isolate k_lock_warmcopy_hook_sites\n";
+my $coverage_table = $1;
+
+die "hook coverage table must not contain UNCLASSIFIED actions\n"
+  if $coverage_table =~ /lock_warmcopy_hook_action_t::UNCLASSIFIED/s;
+
+my @required = (
+  ['lock_rec_add_to_queue', 'storage/innobase/lock/lock0lock.cc',
+   'RECORD', 'JOURNAL_DELTA'],
+  ['lock_rec_set_nth_bit', 'storage/innobase/include/lock0priv.ic',
+   'RECORD', 'JOURNAL_DELTA'],
+  ['lock_rec_reset_nth_bit', 'storage/innobase/lock/lock0lock.cc',
+   'RECORD', 'JOURNAL_DELTA'],
+  ['lock_rec_discard', 'storage/innobase/lock/lock0lock.cc',
+   'RECORD', 'DIRTY_SHARD'],
+  ['lock_rec_reset_and_release_wait_low', 'storage/innobase/lock/lock0lock.cc',
+   'RECORD', 'DIRTY_SHARD'],
+  ['lock_rec_move_low', 'storage/innobase/lock/lock0lock.cc',
+   'RECORD', 'DIRTY_SHARD'],
+  ['lock_rec_move', 'storage/innobase/lock/lock0lock.cc',
+   'RECORD', 'DIRTY_SHARD'],
+  ['lock_update_discard', 'storage/innobase/lock/lock0lock.cc',
+   'RECORD', 'DIRTY_SHARD'],
+  ['lock_rec_reset_and_inherit_gap_locks',
+   'storage/innobase/lock/lock0lock.cc', 'RECORD', 'DIRTY_SHARD'],
+  ['lock_rec_inherit_to_gap', 'storage/innobase/lock/lock0lock.cc',
+   'RECORD', 'DIRTY_SHARD'],
+  ['lock_rec_inherit_to_gap_if_gap_lock',
+   'storage/innobase/lock/lock0lock.cc', 'RECORD', 'DIRTY_SHARD'],
+  ['lock_rec_convert_impl_to_expl_for_trx',
+   'storage/innobase/lock/lock0lock.cc', 'RECORD', 'JOURNAL_DELTA'],
+  ['lock_rec_convert_active_impl_to_expl',
+   'storage/innobase/lock/lock0lock.cc', 'RECORD', 'JOURNAL_DELTA'],
+  ['lock_table_create', 'storage/innobase/lock/lock0lock.cc',
+   'TABLE', 'JOURNAL_DELTA'],
+  ['lock_table_remove_low', 'storage/innobase/lock/lock0lock.cc',
+   'TABLE', 'DIRTY_SHARD'],
+  ['lock_table_dequeue', 'storage/innobase/lock/lock0lock.cc',
+   'TABLE', 'DIRTY_SHARD'],
+  ['lock_unlock_table_autoinc', 'storage/innobase/lock/lock0lock.cc',
+   'AUTOINC', 'DIRTY_SHARD'],
+);
+
+for my $site (@required) {
+  my ($symbol, $path, $family, $action) = @$site;
+  die "missing hook coverage table entry for $symbol\n"
+    unless $coverage_table =~
+      /\Q"$symbol"\E\s*,\s*\Q"$path"\E[\s\S]{0,180}lock_warmcopy_hook_family_t::\Q$family\E[\s\S]{0,120}lock_warmcopy_hook_action_t::\Q$action\E/s;
+
+  die "hook coverage gunit missing $symbol\n"
+    unless $gunit =~ /\Q$symbol\E/s;
+}
+
+die "hook coverage gunit must reject unclassified actions\n"
+  unless $gunit =~ /lock_warmcopy_hook_action_t::UNCLASSIFIED/s;
+die "hook coverage accessor must be declared in lock0warmcopy.h\n"
+  unless $lock_warmcopy_header =~
+         /lock_warmcopy_hook_coverage_sites_for_unit_test\s*\(/s;
+die "hook coverage accessor must return k_lock_warmcopy_hook_sites\n"
+  unless $lock_warmcopy =~
+         /lock_warmcopy_hook_coverage_sites_for_unit_test[\s\S]*k_lock_warmcopy_hook_sites/s;
+
+my $set_bit = extract_function(
+  $lock_priv_ic,
+  qr/void\s+lock_rec_set_nth_bit\s*\(/,
+  'lock_rec_set_nth_bit');
+die "record bitmap set hot hook must delegate through lock0warmcopy.cc wrapper\n"
+  unless $set_bit =~ /lock_warmcopy_hooks_enabled\s*\(\s*\)/s &&
+         $set_bit =~ /lock_warmcopy_record_bitmap_set_for_lock\s*\(/s;
+die "record bitmap set hot hook must not build shard keys inline\n"
+  if $set_bit =~ /lock_warmcopy_record_shard_key_t/s;
+
+my $reset_bit = extract_function(
+  $lock,
+  qr/byte\s+lock_rec_reset_nth_bit\s*\(/,
+  'lock_rec_reset_nth_bit');
+die "record bitmap reset hot hook must delegate through lock0warmcopy.cc wrapper\n"
+  unless $reset_bit =~ /lock_warmcopy_hooks_enabled\s*\(\s*\)/s &&
+         $reset_bit =~ /lock_warmcopy_record_bitmap_reset_for_lock\s*\(/s;
+die "record bitmap reset hot hook must not build shard keys inline\n"
+  if $reset_bit =~ /lock_warmcopy_record_shard_key_t/s;
+
+my $add_to_queue = extract_function(
+  $lock,
+  qr/static\s+void\s+lock_rec_add_to_queue\s*\(/,
+  'lock_rec_add_to_queue');
+die "new record-lock object creation must capture record images via warmcopy wrapper\n"
+  unless $add_to_queue =~ /lock_warmcopy_capture_record_image_for_lock\s*\(/s;
+
+my $impl_to_expl = extract_function(
+  $lock,
+  qr/static\s+dberr_t\s+lock_rec_convert_impl_to_expl_for_trx\s*\(/,
+  'lock_rec_convert_impl_to_expl_for_trx');
+die "implicit-to-explicit conversion must honor the per-trx warmcopy freeze\n"
+  unless $impl_to_expl =~
+         /lock_warmcopy_trx_conversion_is_frozen\s*\(\s*&trx->lock\s*\)[\s\S]*lock_warmcopy_trx_conversion_note_attempt\s*\(\s*&trx->lock\s*\)[\s\S]*lock_warmcopy_frozen_conversion_result/s;
+my $freeze_guard_pos =
+  index($impl_to_expl, 'lock_warmcopy_trx_conversion_is_frozen(&trx->lock)');
+my $install_call_pos =
+  index($impl_to_expl, 'lock_rec_add_to_queue(type_mode');
+die "could not locate implicit-to-explicit freeze guard and install call\n"
+  if $freeze_guard_pos < 0 || $install_call_pos < 0;
+die "implicit-to-explicit conversion must not install explicit locks before checking freeze\n"
+  unless $freeze_guard_pos < $install_call_pos;
+
+EOF
+
+SELECT 'ok' AS batch_drain_lock_warmcopy_hook_coverage_lint;

@@ -1,0 +1,68 @@
+DROP TABLE IF EXISTS t_lock_warmcopy_savepoint_barrier;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+CREATE TABLE t_lock_warmcopy_savepoint_barrier(
+id INT PRIMARY KEY,
+v INT,
+pad VARBINARY(64)
+) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_savepoint_barrier VALUES
+(1,10,REPEAT('a',32)),
+(2,20,REPEAT('b',32)),
+(3,30,REPEAT('c',32));
+START TRANSACTION;
+UPDATE t_lock_warmcopy_savepoint_barrier
+SET v=11, pad=REPEAT('x',32)
+WHERE id=1;
+SAVEPOINT keep_one;
+UPDATE t_lock_warmcopy_savepoint_barrier
+SET v=22, pad=REPEAT('y',32)
+WHERE id=2;
+SET DEBUG_SYNC =
+'preserve_trx_warmcopy_after_phase1_open SIGNAL lock_wc_savepoint_barrier_open WAIT_FOR lock_wc_savepoint_barrier_continue';
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_savepoint_barrier_open TIMEOUT 10';
+ROLLBACK TO SAVEPOINT keep_one;
+UPDATE t_lock_warmcopy_savepoint_barrier
+SET v=33, pad=REPEAT('z',32)
+WHERE id=3;
+SET DEBUG_SYNC = 'now SIGNAL lock_wc_savepoint_barrier_continue';
+include/assert_grep.inc [lock warmcopy succeeds after rollback-to-savepoint barrier]
+SELECT COUNT(*) AS preserved_count_after_savepoint_barrier
+FROM performance_schema.preserved_transactions;
+preserved_count_after_savepoint_barrier
+1
+SET innodb_lock_wait_timeout=1;
+UPDATE t_lock_warmcopy_savepoint_barrier
+SET v=120, pad=REPEAT('q',32)
+WHERE id=1;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+UPDATE t_lock_warmcopy_savepoint_barrier
+SET v=220, pad=REPEAT('r',32)
+WHERE id=2;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+UPDATE t_lock_warmcopy_savepoint_barrier
+SET v=330, pad=REPEAT('s',32)
+WHERE id=3;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+SELECT COUNT(*) AS preserved_count_after_savepoint_barrier_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_savepoint_barrier_resume
+0
+UPDATE t_lock_warmcopy_savepoint_barrier
+SET v=220, pad=REPEAT('r',32)
+WHERE id=2;
+SELECT id, v, pad IN (REPEAT('x',32), REPEAT('r',32), REPEAT('z',32)) AS pad_ok
+FROM t_lock_warmcopy_savepoint_barrier
+ORDER BY id;
+id	v	pad_ok
+1	11	1
+2	220	1
+3	33	1
+DROP TABLE t_lock_warmcopy_savepoint_barrier;
+SET DEBUG_SYNC = 'RESET';

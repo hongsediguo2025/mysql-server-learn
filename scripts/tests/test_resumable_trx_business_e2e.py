@@ -9,6 +9,7 @@ come from running scripts/resumable_trx_business_e2e.py against a real server.
 import unittest
 import contextlib
 import io
+import queue
 import tempfile
 import threading
 import time
@@ -49,6 +50,69 @@ class _FakeConnection:
 
     def close(self):
         self.closed = True
+
+
+class _SchemaSeedCursor:
+    def __init__(self):
+        self.execute_calls = []
+        self.executemany_batch_sizes = []
+        self.closed = False
+
+    def execute(self, sql):
+        self.execute_calls.append(sql)
+
+    def executemany(self, sql, rows):
+        self.executemany_batch_sizes.append(len(list(rows)))
+
+    def close(self):
+        self.closed = True
+
+
+class _SchemaSeedConnection(_FakeConnection):
+    def __init__(self):
+        super().__init__()
+        self.cursor_obj = _SchemaSeedCursor()
+
+    def cursor(self):
+        return self.cursor_obj
+
+
+class _DiscardResultCursor:
+    def __init__(self):
+        self.sql = None
+        self.closed = False
+        self.with_rows = True
+        self.fetchmany_sizes = []
+        self._remaining_batches = [[(1,), (2,)], [(3,)]]
+
+    def execute(self, sql):
+        self.sql = sql
+
+    def fetchmany(self, size):
+        self.fetchmany_sizes.append(size)
+        if self._remaining_batches:
+            return self._remaining_batches.pop(0)
+        return []
+
+    def close(self):
+        self.closed = True
+
+
+class _DiscardResultConnection(_FakeConnection):
+    def __init__(self):
+        super().__init__()
+        self.cursor_obj = _DiscardResultCursor()
+
+    def cursor(self):
+        return self.cursor_obj
+
+
+class _SchemaSeedRuntime:
+    def __init__(self):
+        self.connection = _SchemaSeedConnection()
+
+    def connect(self, database=False, autocommit=True):
+        return self.connection
 
 
 def _fake_fetch_rows(sql):
@@ -111,6 +175,19 @@ class _FlappingShutdownRuntime:
         raise OSError("server is not accepting connections")
 
 
+class _PidFileShutdownRuntime(MySQLRuntime):
+    def __init__(self, pid_file):
+        self.config = HarnessConfig(
+            server_pid_file=str(pid_file),
+            shutdown_quiet_period_s=0.01,
+        )
+        self.connect_attempts = 0
+
+    def connect(self, database=False, autocommit=True):
+        self.connect_attempts += 1
+        raise OSError("server is not accepting connections")
+
+
 class _FingerprintRuntime(_FakeRuntime):
     def execute(self, conn, sql, fetch=False):
         self.sql.append(sql)
@@ -122,6 +199,58 @@ class _FingerprintRuntime(_FakeRuntime):
         if sql.startswith("SELECT sid,"):
             return []
         return [(1,)]
+
+
+class _NoRowDigestFingerprintRuntime(_FakeRuntime):
+    def execute(self, conn, sql, fetch=False):
+        self.sql.append(sql)
+        self.calls.append((sql, fetch))
+        if not fetch:
+            return ()
+        if sql.startswith("SELECT sid,"):
+            raise AssertionError("compact bulk validation must not full-scan row digest")
+        if sql.startswith("SELECT COUNT(*)"):
+            return [(0,) * 17]
+        return [(1,)]
+
+
+def _sql_spot_row_from_state(row, note_override=None, op_override=None):
+    return (
+        row.sid,
+        row.k,
+        row.v,
+        row.counter,
+        row.amount_cents,
+        row.d,
+        row.note if note_override is None else note_override,
+        row.deleted,
+        row.v + row.sid,
+        int(row.js.get("sid", 0) or 0),
+        int(row.js.get("tx", 0) or 0),
+        int(row.js.get("stmt", 0) or 0),
+        int(row.js.get("seed_sid", 0) or 0),
+        int(row.js.get("seed_k", 0) or 0),
+        str(row.js.get("op", "")) if op_override is None else op_override,
+        row.payload_len,
+    )
+
+
+class _CompactBulkSpotRuntime(_FakeRuntime):
+    def __init__(self, rows_by_table):
+        super().__init__()
+        self.rows_by_table = rows_by_table
+
+    def execute(self, conn, sql, fetch=False):
+        self.sql.append(sql)
+        self.calls.append((sql, fetch))
+        if fetch and sql.startswith("SELECT sid,"):
+            for table, rows in self.rows_by_table.items():
+                if f"`{table}`" in sql:
+                    return list(rows)
+            return []
+        if fetch:
+            return _fake_fetch_rows(sql)
+        return ()
 
 
 class _ResumeMappingRuntime(_FakeRuntime):
@@ -529,6 +658,7 @@ class _ReadyCoordinator:
         self.published = []
         self.cancelled = []
         self.calls = []
+        self.errors = queue.Queue()
 
     def request_drain_checkpoint(self):
         self.calls.append("request")
@@ -613,6 +743,64 @@ class _RecordingResumeWaitCoordinator(ResumeCoordinator):
         return None
 
 
+class _NotificationCountingCoordinator(ResumeCoordinator):
+    def __init__(self, sessions):
+        super().__init__(sessions)
+        self.notifications = []
+
+    def _notify_all_locked(self, reason):
+        self.notifications.append(reason)
+        return super()._notify_all_locked(reason)
+
+    def count_notifications(self, reason):
+        return self.notifications.count(reason)
+
+
+class _NeverPausedCoordinator(ResumeCoordinator):
+    def __init__(self, sessions):
+        super().__init__(sessions)
+        self.wait_timeouts = []
+        self.error_after_first_wait = None
+
+    def wait_all_paused_for_drain(self, generation, timeout_s):
+        self.wait_timeouts.append(timeout_s)
+        if timeout_s > 1.0:
+            raise AssertionError("pause wait must be chunked for worker fail-fast")
+        if self.error_after_first_wait is not None and len(self.wait_timeouts) == 1:
+            self.errors.put(self.error_after_first_wait)
+        return False
+
+    def paused_drain_snapshot(self, generation):
+        return {
+            "missing_paused": [1, 2],
+            "not_in_transaction": [1],
+            "not_drainable": [1],
+            "completed": [],
+        }
+
+
+class _RecordingDrainableCoordinator:
+    def __init__(self):
+        self.drainable_flags = []
+        self.pause_calls = 0
+
+    def mark_in_transaction(self, sid, value):
+        return None
+
+    def mark_drainable_transaction(self, sid, value):
+        self.drainable_flags.append(value)
+
+    def current_drain_generation(self):
+        return 1
+
+    def drain_large_bucket_mb(self, generation):
+        return 0
+
+    def pause_for_drain_if_requested(self, sid, timeout_s):
+        self.pause_calls += 1
+        return None
+
+
 class WorkloadPlanTest(unittest.TestCase):
     def test_default_plan_uses_30_tables_and_100_session_transactions(self):
         cfg = HarnessConfig()
@@ -622,6 +810,528 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertEqual(cfg.sessions, 100)
         self.assertEqual(cfg.statements_per_tx, 100)
         self.assertEqual(len(plan.transaction_operations(sid=17, tx_id=3)), 100)
+
+    def test_plan_allows_large_lockset_workload_dimensions(self):
+        cfg = HarnessConfig(
+            sessions=1000,
+            table_count=100,
+            statements_per_tx=100000,
+            preserve_max_lock_count=200_000_000,
+            preserve_max_modified_tables=2000,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+
+        self.assertEqual(len(plan.table_names()), 100)
+        self.assertEqual(cfg.sessions, 1000)
+        self.assertEqual(cfg.statements_per_tx, 100000)
+        self.assertEqual(plan.table_names()[99], "rtx_e2e_t99")
+
+    def test_bulk_lockset_plan_uses_batched_range_updates(self):
+        cfg = HarnessConfig(
+            sessions=12,
+            table_count=6,
+            statements_per_tx=1200,
+            seed_rows_per_table_per_session=200,
+            lockset_batch_size=200,
+            min_statements_before_drain_pause=6,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+
+        ops = plan.transaction_operations(sid=3, tx_id=7)
+
+        self.assertEqual(6, len(ops))
+        self.assertEqual({OperationKind.BULK_LOCKSET_UPDATE}, {op.kind for op in ops})
+        self.assertEqual({f"rtx_e2e_t{i:02d}" for i in range(6)}, {op.table for op in ops})
+        self.assertIn("UPDATE `rtx_e2e_t00`", ops[0].sql)
+        self.assertIn("note = CONCAT('bulk-s003-t00007-n', LPAD(k, 5, '0')", ops[0].sql)
+        self.assertIn("'k',k", ops[0].sql)
+        self.assertIn("WHERE sid = 3 AND k >= 0 AND k < 200", ops[0].sql)
+        self.assertIn("UPDATE `rtx_e2e_t05`", ops[-1].sql)
+        self.assertIn("WHERE sid = 3 AND k >= 0 AND k < 200", ops[-1].sql)
+
+    def test_bulk_lockset_uses_session_isolated_table_when_available(self):
+        cfg = HarnessConfig(
+            sessions=4,
+            table_count=4,
+            statements_per_tx=1000,
+            seed_rows_per_table_per_session=1000,
+            lockset_batch_size=100,
+            min_statements_before_drain_pause=10,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+
+        ops = plan.transaction_operations(sid=3, tx_id=7)
+
+        self.assertEqual(10, len(ops))
+        self.assertEqual({"rtx_e2e_t02"}, {op.table for op in ops})
+        self.assertIn("WHERE sid = 3 AND k >= 0 AND k < 100", ops[0].sql)
+        self.assertIn("WHERE sid = 3 AND k >= 900 AND k < 1000", ops[-1].sql)
+
+    def test_bulk_lockset_session_table_shards_seed_only_assigned_sids(self):
+        cfg = HarnessConfig(
+            sessions=6,
+            table_count=3,
+            statements_per_tx=12,
+            seed_rows_per_table_per_session=12,
+            lockset_batch_size=3,
+            lockset_session_table_shards=True,
+            min_statements_before_drain_pause=4,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+
+        ops = plan.transaction_operations(sid=5, tx_id=7)
+        seed_rows = list(plan.seed_rows())
+
+        self.assertEqual({"rtx_e2e_t01"}, {op.table for op in ops})
+        self.assertIn("WHERE sid = 5 AND k >= 0 AND k < 3", ops[0].sql)
+        self.assertIn("WHERE sid = 5 AND k >= 9 AND k < 12", ops[-1].sql)
+        self.assertEqual([2, 5], plan.seed_sids_for_table("rtx_e2e_t01"))
+        self.assertEqual(72, plan.expected_seed_row_count())
+        self.assertEqual(72, len(seed_rows))
+        self.assertFalse(any(table == "rtx_e2e_t01" and row[0] == 1 for table, row in seed_rows))
+        self.assertTrue(any(table == "rtx_e2e_t01" and row[0] == 5 for table, row in seed_rows))
+
+    def test_bulk_lockset_noop_update_keeps_expected_rows_unchanged(self):
+        cfg = HarnessConfig(
+            sessions=1,
+            table_count=1,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=8,
+            lockset_batch_size=8,
+            lockset_noop_update=True,
+            min_statements_before_drain_pause=1,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+        expected = ExpectedDatabaseState(plan)
+        before = expected.transaction_view(1)._rows["rtx_e2e_t00"][(1, 0)]
+
+        ops = plan.transaction_operations(sid=1, tx_id=7)
+        expected.record_committed_transaction(sid=1, tx_id=7)
+        after = expected.transaction_view(1)._rows["rtx_e2e_t00"][(1, 0)]
+
+        self.assertIn("SET counter = counter", ops[0].sql)
+        self.assertNotIn("JSON_OBJECT('sid'", ops[0].sql)
+        self.assertEqual(before, after)
+
+    def test_bulk_lockset_touch_one_row_updates_first_batch_row(self):
+        cfg = HarnessConfig(
+            sessions=1,
+            table_count=1,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=8,
+            lockset_batch_size=8,
+            lockset_noop_update=True,
+            lockset_touch_one_row=True,
+            min_statements_before_drain_pause=1,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+        expected = ExpectedDatabaseState(plan)
+
+        ops = plan.transaction_operations(sid=1, tx_id=7)
+        expected.record_committed_transaction(sid=1, tx_id=7)
+        rows = expected.transaction_view(1)._rows["rtx_e2e_t00"]
+
+        self.assertIn("SET counter = IF(k = 0, 10070000, counter)", ops[0].sql)
+        self.assertIn("WHERE sid = 1 AND k >= 0 AND k < 8", ops[0].sql)
+        self.assertEqual(10070000, rows[(1, 0)].counter)
+        self.assertEqual(0, rows[(1, 1)].counter)
+
+    def test_bulk_lockset_touch_one_row_requires_noop_update(self):
+        with self.assertRaisesRegex(ValueError, "requires lockset_noop_update"):
+            HarnessConfig(
+                statements_per_tx=8,
+                seed_rows_per_table_per_session=8,
+                lockset_batch_size=8,
+                lockset_touch_one_row=True,
+            ).validate()
+
+    def test_bulk_lockset_select_for_update_keeps_expected_rows_unchanged(self):
+        cfg = HarnessConfig(
+            sessions=1,
+            table_count=1,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=8,
+            lockset_batch_size=8,
+            lockset_select_for_update=True,
+            min_statements_before_drain_pause=1,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+        expected = ExpectedDatabaseState(plan)
+        before = expected.transaction_view(1)._rows["rtx_e2e_t00"][(1, 0)]
+
+        ops = plan.transaction_operations(sid=1, tx_id=7)
+        expected.record_committed_transaction(sid=1, tx_id=7)
+        after = expected.transaction_view(1)._rows["rtx_e2e_t00"][(1, 0)]
+
+        self.assertTrue(ops[0].sql.startswith("SELECT k FROM `rtx_e2e_t00`"))
+        self.assertIn("FOR UPDATE", ops[0].sql)
+        self.assertNotIn("SET counter = counter", ops[0].sql)
+        self.assertTrue(ops[0].discard_result)
+        self.assertEqual(before, after)
+
+    def test_bulk_lockset_select_for_update_requires_batch_size(self):
+        with self.assertRaisesRegex(ValueError, "lockset_select_for_update"):
+            HarnessConfig(lockset_select_for_update=True).validate()
+
+    def test_bulk_lockset_select_for_update_is_exclusive_with_noop_update(self):
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            HarnessConfig(
+                statements_per_tx=8,
+                seed_rows_per_table_per_session=8,
+                lockset_batch_size=8,
+                lockset_noop_update=True,
+                lockset_select_for_update=True,
+            ).validate()
+
+    def test_bulk_lockset_minimal_table_uses_narrow_schema_and_seed_rows(self):
+        cfg = HarnessConfig(
+            sessions=2,
+            table_count=1,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=8,
+            lockset_batch_size=8,
+            lockset_noop_update=True,
+            lockset_minimal_table=True,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+
+        ddl = plan.create_table_sql("rtx_e2e_t00")
+        seed_rows = list(plan.seed_rows())
+
+        self.assertIn("counter BIGINT NOT NULL DEFAULT 0", ddl)
+        self.assertIn("PRIMARY KEY(sid, k)", ddl)
+        self.assertNotIn("JSON", ddl)
+        self.assertNotIn("idx_sid_v", ddl)
+        self.assertEqual(("rtx_e2e_t00", (1, 0, 0)), seed_rows[0])
+
+    def test_bulk_lockset_minimal_table_counter_covers_full_nfr_value_range(self):
+        cfg = HarnessConfig(
+            sessions=1000,
+            table_count=100,
+            statements_per_tx=100000,
+            seed_rows_per_table_per_session=100000,
+            lockset_batch_size=100000,
+            lockset_noop_update=True,
+            lockset_touch_one_row=True,
+            lockset_minimal_table=True,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+
+        ddl = plan.create_table_sql("rtx_e2e_t00")
+        op = plan.transaction_operations(sid=1000, tx_id=1)[0]
+
+        self.assertIn("counter BIGINT NOT NULL DEFAULT 0", ddl)
+        self.assertIn("10000010000", op.sql)
+        self.assertGreater(10_000_010_000, 2_147_483_647)
+
+    def test_bulk_lockset_minimal_table_requires_noop_update(self):
+        with self.assertRaisesRegex(ValueError, "requires lockset_noop_update"):
+            HarnessConfig(
+                statements_per_tx=8,
+                seed_rows_per_table_per_session=8,
+                lockset_batch_size=8,
+                lockset_minimal_table=True,
+            ).validate()
+
+    def test_bulk_lockset_minimal_table_fingerprint_uses_lock_columns_only(self):
+        cfg = HarnessConfig(
+            sessions=2,
+            table_count=1,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=8,
+            lockset_batch_size=8,
+            lockset_noop_update=True,
+            lockset_minimal_table=True,
+        ).validate()
+        expected = ExpectedDatabaseState(WorkloadPlan(cfg))
+
+        fingerprint = expected.table_fingerprints()["rtx_e2e_t00"]
+
+        self.assertEqual(16, fingerprint.row_count)
+        self.assertEqual(24, fingerprint.sum_sid)
+        self.assertEqual(56, fingerprint.sum_k)
+        self.assertEqual(0, fingerprint.sum_v)
+        self.assertEqual(0, fingerprint.sum_counter)
+        self.assertEqual("", fingerprint.row_digest)
+
+    def test_bulk_lockset_minimal_touch_one_row_fingerprint_counts_touched_rows(self):
+        cfg = HarnessConfig(
+            sessions=2,
+            table_count=1,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=8,
+            lockset_batch_size=8,
+            lockset_noop_update=True,
+            lockset_touch_one_row=True,
+            lockset_minimal_table=True,
+            compact_expected_state_row_threshold=0,
+        ).validate()
+        expected = ExpectedDatabaseState(WorkloadPlan(cfg))
+
+        expected.record_committed_transaction(sid=1, tx_id=7)
+        expected.record_committed_transaction(sid=2, tx_id=9)
+        fingerprint = expected.table_fingerprints()["rtx_e2e_t00"]
+        spots = expected.compact_bulk_spot_expectations()["rtx_e2e_t00"]
+
+        self.assertEqual(16, fingerprint.row_count)
+        self.assertEqual(10070000 + 20090000, fingerprint.sum_counter)
+        self.assertEqual(10070000, spots[(1, 0)].counter)
+        self.assertEqual(0, spots[(1, 4)].counter)
+
+    def test_bulk_lockset_expected_state_uses_per_row_notes(self):
+        cfg = HarnessConfig(
+            sessions=1,
+            table_count=1,
+            statements_per_tx=100,
+            seed_rows_per_table_per_session=100,
+            lockset_batch_size=100,
+            min_statements_before_drain_pause=1,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+        expected = ExpectedDatabaseState(plan)
+
+        expected.record_committed_transaction(sid=1, tx_id=7)
+
+        table_rows = expected.transaction_view(1)._rows["rtx_e2e_t00"]
+        notes = [table_rows[(1, key)].note for key in range(100)]
+        self.assertEqual(100, len(set(notes)))
+        self.assertEqual("bulk-s001-t00007-n00000-stmt00000", table_rows[(1, 0)].note)
+        self.assertEqual("bulk-s001-t00007-n00099-stmt00000", table_rows[(1, 99)].note)
+        self.assertEqual(0, table_rows[(1, 0)].js["k"])
+        self.assertEqual(99, table_rows[(1, 99)].js["k"])
+
+    def test_large_bulk_lockset_expected_state_uses_compact_model(self):
+        cfg = HarnessConfig(
+            sessions=1000,
+            table_count=100,
+            statements_per_tx=100000,
+            seed_rows_per_table_per_session=1000,
+            lockset_batch_size=1000,
+            min_statements_before_drain_pause=100,
+            compact_expected_state_row_threshold=1_000_000,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+
+        expected = ExpectedDatabaseState(plan)
+
+        self.assertTrue(expected.uses_compact_bulk_model())
+        self.assertEqual({}, expected._rows)
+
+    def test_compact_bulk_lockset_fingerprint_matches_row_model_for_small_plan(self):
+        row_cfg = HarnessConfig(
+            sessions=2,
+            table_count=2,
+            statements_per_tx=4,
+            seed_rows_per_table_per_session=8,
+            lockset_batch_size=2,
+            min_statements_before_drain_pause=2,
+            compact_expected_state_row_threshold=1000000,
+        ).validate()
+        compact_cfg = replace(row_cfg, compact_expected_state_row_threshold=0).validate()
+        row_expected = ExpectedDatabaseState(WorkloadPlan(row_cfg))
+        compact_expected = ExpectedDatabaseState(WorkloadPlan(compact_cfg))
+
+        for expected in (row_expected, compact_expected):
+            expected.record_committed_transaction(sid=1, tx_id=1)
+            expected.record_committed_transaction(sid=2, tx_id=2)
+
+        row_fingerprints = row_expected.table_fingerprints()
+        compact_fingerprints = compact_expected.table_fingerprints()
+
+        self.assertFalse(row_expected.uses_compact_bulk_model())
+        self.assertTrue(compact_expected.uses_compact_bulk_model())
+        self.assertEqual(
+            row_expected.compact_comparable_fingerprints(row_fingerprints),
+            compact_expected.compact_comparable_fingerprints(compact_fingerprints),
+        )
+
+    def test_compact_bulk_validation_skips_full_row_digest_query(self):
+        cfg = HarnessConfig(
+            sessions=2,
+            table_count=2,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=8,
+            lockset_batch_size=8,
+            min_statements_before_drain_pause=1,
+            compact_expected_state_row_threshold=0,
+        ).validate()
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = cfg
+        runner.plan = WorkloadPlan(cfg)
+        runner.runtime = _NoRowDigestFingerprintRuntime()
+        runner.expected_state = ExpectedDatabaseState(runner.plan)
+
+        fingerprint = runner._actual_table_fingerprint(
+            _FakeConnection(),
+            runner.plan.table_names()[0],
+        )
+
+        self.assertFalse(fingerprint.row_digest)
+        self.assertFalse(
+            any(sql.startswith("SELECT sid,") for sql, _ in runner.runtime.calls)
+        )
+
+    def test_compact_bulk_worker_skips_per_statement_expected_row_view(self):
+        cfg = HarnessConfig(
+            sessions=2,
+            table_count=2,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=8,
+            lockset_batch_size=8,
+            min_statements_before_drain_pause=1,
+            compact_expected_state_row_threshold=0,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+        expected = ExpectedDatabaseState(plan)
+        worker = BusinessWorker(
+            1,
+            plan,
+            _FakeRuntime(),
+            ResumeCoordinator(cfg.sessions),
+            threading.Event(),
+            expected,
+        )
+
+        worker._run_transaction(_FakeConnection(), tx_id=1)
+
+        self.assertEqual({1: 1}, expected._compact_committed_tx_by_sid)
+
+    def test_bulk_lockset_worker_uses_read_committed_before_starting_transaction(self):
+        cfg = HarnessConfig(
+            sessions=1,
+            table_count=1,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=8,
+            lockset_batch_size=8,
+            min_statements_before_drain_pause=1,
+            cycles=1,
+            max_transactions_per_worker=1,
+        ).validate()
+        runtime = _FakeRuntime()
+        worker = BusinessWorker(
+            1,
+            WorkloadPlan(cfg),
+            runtime,
+            ResumeCoordinator(cfg.sessions),
+            threading.Event(),
+        )
+
+        worker.run()
+
+        self.assertIn(
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            runtime.sql,
+        )
+        self.assertLess(
+            runtime.sql.index("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+            runtime.sql.index("START TRANSACTION"),
+        )
+
+    def test_bulk_lockset_marks_drainable_only_after_pause_threshold(self):
+        cfg = HarnessConfig(
+            sessions=1,
+            table_count=1,
+            statements_per_tx=4,
+            seed_rows_per_table_per_session=8,
+            lockset_batch_size=2,
+            min_statements_before_drain_pause=2,
+        ).validate()
+        coordinator = _RecordingDrainableCoordinator()
+        worker = BusinessWorker(
+            1,
+            WorkloadPlan(cfg),
+            _FakeRuntime(),
+            coordinator,
+            threading.Event(),
+        )
+
+        worker._run_transaction(_FakeConnection(), tx_id=1)
+
+        self.assertEqual([False, False, True, False], coordinator.drainable_flags)
+        self.assertEqual(1, coordinator.pause_calls)
+
+    def test_compact_bulk_spot_check_rejects_note_mismatch(self):
+        cfg = HarnessConfig(
+            sessions=2,
+            table_count=2,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=8,
+            lockset_batch_size=8,
+            min_statements_before_drain_pause=1,
+            compact_expected_state_row_threshold=0,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+        expected = ExpectedDatabaseState(plan)
+        expected.record_committed_transaction(sid=1, tx_id=1)
+        expected.record_committed_transaction(sid=2, tx_id=1)
+        expectations = expected.compact_bulk_spot_expectations()
+        rows_by_table = {
+            table: [_sql_spot_row_from_state(row) for row in rows.values()]
+            for table, rows in expectations.items()
+        }
+        first_table = sorted(rows_by_table)[0]
+        first_expected_row = next(iter(expectations[first_table].values()))
+        rows_by_table[first_table][0] = _sql_spot_row_from_state(
+            first_expected_row,
+            note_override="wrong-note",
+        )
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = cfg
+        runner.plan = plan
+        runner.runtime = _CompactBulkSpotRuntime(rows_by_table)
+        runner.expected_state = expected
+
+        with self.assertRaisesRegex(AssertionError, "compact bulk spot mismatch"):
+            runner.validate_compact_bulk_spot_checks()
+
+    def test_final_validation_runs_compact_bulk_spot_check(self):
+        cfg = HarnessConfig(
+            sessions=2,
+            table_count=2,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=8,
+            lockset_batch_size=8,
+            min_statements_before_drain_pause=1,
+            compact_expected_state_row_threshold=0,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+        expected = ExpectedDatabaseState(plan)
+        expected.record_committed_transaction(sid=1, tx_id=1)
+        expected.record_committed_transaction(sid=2, tx_id=1)
+        expectations = expected.compact_bulk_spot_expectations()
+        rows_by_table = {
+            table: [_sql_spot_row_from_state(row) for row in rows.values()]
+            for table, rows in expectations.items()
+        }
+        first_table = sorted(rows_by_table)[0]
+        first_expected_row = next(iter(expectations[first_table].values()))
+        rows_by_table[first_table][0] = _sql_spot_row_from_state(
+            first_expected_row,
+            op_override="wrong-op",
+        )
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = cfg
+        runner.plan = plan
+        runner.runtime = _CompactBulkSpotRuntime(rows_by_table)
+        runner.expected_state = expected
+        runner.actual_table_fingerprints = expected.table_fingerprints
+        runner.workers = [_CompletedWorker()]
+        runner.phase2_pause_samples = []
+
+        with self.assertRaisesRegex(AssertionError, "compact bulk spot mismatch"):
+            runner.final_validation()
+
+    def test_bulk_lockset_pause_limit_uses_operation_count(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "min_statements_before_drain_pause cannot exceed lockset operation count",
+        ):
+            HarnessConfig(
+                statements_per_tx=1000,
+                seed_rows_per_table_per_session=100,
+                lockset_batch_size=100,
+                min_statements_before_drain_pause=11,
+            ).validate()
 
     def test_transaction_operations_are_rich_and_touch_every_table(self):
         cfg = HarnessConfig()
@@ -678,6 +1388,26 @@ class WorkloadPlanTest(unittest.TestCase):
         runner.configure_preserve_globals()
         sql_text = "\n".join(runner.runtime.sql)
         self.assertNotIn("preserve_trx_temp_table_enable", sql_text)
+
+    def test_lock_warmcopy_mode_controls_preserve_global(self):
+        off_runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        off_runner.config = HarnessConfig(lock_warmcopy_mode="off")
+        off_runner.runtime = _FakeRuntime()
+        off_runner.configure_preserve_globals()
+
+        on_runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        on_runner.config = HarnessConfig(lock_warmcopy_mode="on")
+        on_runner.runtime = _FakeRuntime()
+        on_runner.configure_preserve_globals()
+
+        self.assertIn(
+            "SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF",
+            off_runner.runtime.sql,
+        )
+        self.assertIn(
+            "SET GLOBAL preserve_trx_lock_warmcopy_enable=ON",
+            on_runner.runtime.sql,
+        )
 
     def test_expected_state_tracks_exact_committed_fingerprints_across_all_tables(self):
         cfg = HarnessConfig(sessions=2)
@@ -750,11 +1480,17 @@ class WorkloadPlanTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             HarnessConfig(sessions=0).validate()
         with self.assertRaises(ValueError):
-            HarnessConfig(table_count=29).validate()
+            HarnessConfig(table_count=0).validate()
         with self.assertRaises(ValueError):
-            HarnessConfig(statements_per_tx=99).validate()
+            HarnessConfig(statements_per_tx=0).validate()
+        with self.assertRaises(ValueError):
+            HarnessConfig(lock_warmcopy_mode="bad").validate()
         with self.assertRaises(ValueError):
             HarnessConfig(duration_s=-1).validate()
+        with self.assertRaises(ValueError):
+            HarnessConfig(preserve_max_binlog_cache_bytes=0).validate()
+        with self.assertRaises(ValueError):
+            HarnessConfig(preserve_lock_warmcopy_max_journal_bytes=0).validate()
         with self.assertRaises(ValueError):
             HarnessConfig(
                 inflight_drain_probe=True,
@@ -767,6 +1503,34 @@ class WorkloadPlanTest(unittest.TestCase):
         MySQLRuntime.wait_until_down(runtime, timeout_s=1.0)
 
         self.assertGreaterEqual(runtime.connect_attempts, 3)
+
+    def test_wait_until_down_waits_for_pid_file_removal_after_socket_closes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pid_file = Path(tmpdir) / "mysqld.pid"
+            pid_file.write_text("12345\n", encoding="utf-8")
+            runtime = _PidFileShutdownRuntime(pid_file)
+
+            with self.assertRaises(TimeoutError):
+                MySQLRuntime.wait_until_down(runtime, timeout_s=0.05)
+
+            pid_file.unlink()
+            MySQLRuntime.wait_until_down(runtime, timeout_s=1.0)
+
+    def test_execute_discarding_result_streams_batches_and_closes_cursor(self):
+        runtime = MySQLRuntime.__new__(MySQLRuntime)
+        conn = _DiscardResultConnection()
+
+        MySQLRuntime.execute_discarding_result(
+            runtime,
+            conn,
+            "SELECT k FROM t WHERE sid = 1 FOR UPDATE",
+            fetchmany_size=2,
+        )
+
+        cursor = conn.cursor_obj
+        self.assertEqual("SELECT k FROM t WHERE sid = 1 FOR UPDATE", cursor.sql)
+        self.assertEqual([2, 2, 2], cursor.fetchmany_sizes)
+        self.assertTrue(cursor.closed)
 
     def test_runner_waits_for_worker_transaction_progress_between_drain_cycles(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -1098,6 +1862,75 @@ class WorkloadPlanTest(unittest.TestCase):
 
         self.assertFalse(worker.is_alive())
         self.assertTrue(result["permit"])
+
+    def test_in_transaction_wait_is_notified_once_when_all_sessions_start(self):
+        coordinator = _NotificationCountingCoordinator(sessions=3)
+
+        coordinator.mark_in_transaction(1, True)
+        coordinator.mark_in_transaction(2, True)
+        self.assertEqual(
+            0,
+            coordinator.count_notifications("in_transaction_complete"),
+        )
+
+        coordinator.mark_in_transaction(3, True)
+
+        self.assertEqual(
+            1,
+            coordinator.count_notifications("in_transaction_complete"),
+        )
+
+    def test_drainable_wait_is_notified_once_when_all_sessions_are_ready(self):
+        coordinator = _NotificationCountingCoordinator(sessions=3)
+        coordinator.request_drain_checkpoint()
+        coordinator.notifications.clear()
+
+        coordinator.mark_drainable_transaction(1, True)
+        coordinator.mark_drainable_transaction(2, True)
+        self.assertEqual(
+            0,
+            coordinator.count_notifications("drainable_complete"),
+        )
+
+        coordinator.mark_drainable_transaction(3, True)
+
+        self.assertEqual(
+            1,
+            coordinator.count_notifications("drainable_complete"),
+        )
+
+    def test_pause_wait_is_notified_once_when_all_sessions_are_paused(self):
+        coordinator = _NotificationCountingCoordinator(sessions=3)
+        generation = coordinator.request_drain_checkpoint()
+        coordinator.notifications.clear()
+        resumed = {1: object(), 2: object(), 3: object()}
+        results = {}
+
+        def pause_worker(sid):
+            results[sid] = coordinator.pause_for_drain_if_requested(
+                sid=sid,
+                timeout_s=2.0,
+            )
+
+        workers = [
+            threading.Thread(target=pause_worker, args=(sid,))
+            for sid in (1, 2, 3)
+        ]
+        for worker in workers:
+            worker.start()
+
+        try:
+            self.assertTrue(
+                coordinator.wait_all_paused_for_drain(generation, timeout_s=2.0)
+            )
+            self.assertEqual(1, coordinator.count_notifications("paused_complete"))
+        finally:
+            coordinator.publish_resumed_connections(resumed, generation=generation)
+            for worker in workers:
+                worker.join(2.0)
+
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(resumed, results)
 
     def test_bounded_preserve_run_holds_workers_before_first_drain(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -1455,6 +2288,30 @@ class WorkloadPlanTest(unittest.TestCase):
 
         with self.assertRaises(_PreserveDrainRejected):
             runner.drain_restart_resume(cycle=1)
+
+    def test_drain_pause_wait_checks_worker_errors_without_long_timeout(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            sessions=2,
+            strict_token_count=False,
+            drain_interval_s=20,
+            resume_timeout_s=120,
+        )
+        runner.runtime = _DrainRuntime()
+        runner.coordinator = _NeverPausedCoordinator(runner.config.sessions)
+        runner.coordinator.error_after_first_wait = RuntimeError(
+            "worker failed before pause"
+        )
+        runner.restart_server = mock.Mock(side_effect=AssertionError("no restart"))
+        runner.configure_preserve_globals = mock.Mock(side_effect=AssertionError("no reconfigure"))
+        runner.read_preserved_tokens = mock.Mock(side_effect=AssertionError("no tokens"))
+
+        with self.assertRaisesRegex(RuntimeError, "worker failed before pause"):
+            runner.drain_restart_resume(cycle=1)
+
+        self.assertTrue(runner.coordinator.wait_timeouts)
+        self.assertLessEqual(max(runner.coordinator.wait_timeouts), 1.0)
+        runner.restart_server.assert_not_called()
 
     def test_inflight_drain_waits_for_observed_lock_waits_before_drain(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -1888,6 +2745,75 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertEqual(cfg.min_statements_before_drain_pause, 80)
         with self.assertRaisesRegex(ValueError, "at least cycles"):
             HarnessConfig(cycles=3, max_transactions_per_worker=1).validate()
+
+    def test_cli_bulk_lockset_flags_are_applied(self):
+        cfg = parse_args(
+            [
+                "--statements-per-tx",
+                "1000",
+                "--seed-rows-per-table-per-session",
+                "100",
+                "--lockset-batch-size",
+                "100",
+                "--lockset-noop-update",
+                "--lockset-touch-one-row",
+                "--min-statements-before-drain-pause",
+                "10",
+            ]
+        )
+
+        self.assertEqual(cfg.statements_per_tx, 1000)
+        self.assertEqual(cfg.seed_rows_per_table_per_session, 100)
+        self.assertEqual(cfg.lockset_batch_size, 100)
+        self.assertTrue(cfg.lockset_noop_update)
+        self.assertTrue(cfg.lockset_touch_one_row)
+        self.assertEqual(cfg.min_statements_before_drain_pause, 10)
+
+    def test_setup_schema_streams_seed_rows_in_bounded_batches(self):
+        cfg = HarnessConfig(
+            sessions=2,
+            table_count=2,
+            seed_rows_per_table_per_session=8,
+            seed_insert_batch_size=5,
+        ).validate()
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = cfg
+        runner.plan = WorkloadPlan(cfg)
+        runner.runtime = _SchemaSeedRuntime()
+
+        runner.setup_schema()
+
+        batches = runner.runtime.connection.cursor_obj.executemany_batch_sizes
+        self.assertEqual([5, 5, 5, 1, 5, 5, 5, 1], batches)
+        self.assertLessEqual(max(batches), cfg.seed_insert_batch_size)
+
+    def test_setup_schema_uses_server_side_seed_for_compact_bulk_model(self):
+        cfg = HarnessConfig(
+            sessions=2,
+            table_count=2,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=8,
+            lockset_batch_size=8,
+            min_statements_before_drain_pause=1,
+            compact_expected_state_row_threshold=0,
+        ).validate()
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = cfg
+        runner.plan = WorkloadPlan(cfg)
+        runner.runtime = _SchemaSeedRuntime()
+
+        runner.setup_schema()
+
+        cursor = runner.runtime.connection.cursor_obj
+        self.assertEqual([2, 8], cursor.executemany_batch_sizes)
+        insert_selects = [
+            sql for sql in cursor.execute_calls
+            if "SELECT s.sid, k.k" in sql
+        ]
+        self.assertEqual(2, len(insert_selects))
+        self.assertTrue(
+            all("FROM rtx_seed_sid s JOIN rtx_seed_k k" in sql for sql in insert_selects)
+        )
 
     def test_cli_scenario_presets_are_applied(self):
         cfg = parse_args(
@@ -2748,6 +3674,27 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             "@rtx_e2e_stmt_completed",
             runner.runtime.sql,
         )
+
+    def test_drain_restart_resume_records_lock_warmcopy_phase2_pause_sample(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            sessions=2,
+            strict_token_count=True,
+            lock_warmcopy_mode="on",
+        )
+        runner.plan = WorkloadPlan(runner.config)
+        runner.runtime = _ResumeMappingRuntime([(1, 10, 0), (2, 10, 0)])
+        runner.coordinator = _ReadyCoordinator()
+        runner.phase2_pause_samples = []
+        runner.restart_server = lambda: None
+        runner.configure_preserve_globals = lambda: None
+        runner.read_preserved_tokens = lambda: ["tok-a", "tok-b"]
+
+        runner.drain_restart_resume(cycle=1)
+
+        self.assertEqual(len(runner.phase2_pause_samples), 1)
+        self.assertEqual(runner.phase2_pause_samples[0].bucket_mb, 0)
+        self.assertGreaterEqual(runner.phase2_pause_samples[0].phase2_pause_ms, 0)
 
     def test_warmcopy_error_log_phase2_parser_uses_last_metric_after_offset(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)

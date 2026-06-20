@@ -82,6 +82,7 @@
 #include "sql/preserve_trx_carrier.h"
 #include "sql/preserve_trx_drain.h"
 #include "sql/preserve_trx_kernel.h"
+#include "sql/preserve_trx_lock_warmcopy.h"
 #include "sql/preserve_trx_temp_table.h"
 #include "sql/preserve_trx_warmcopy.h"
 #include "sql/preserve_trx_xid.h"
@@ -91,6 +92,7 @@
 #include "sql/sql_lex.h"
 #include "sql/sql_list.h"
 #include "sql/sql_audit.h"
+#include "sql/sql_backup_lock.h"
 #include "sql/sql_parse.h"
 #include "sql/sql_thd_internal_api.h"
 #include "sql/table.h"
@@ -130,6 +132,14 @@ uint preserve_trx_warmcopy_tail_budget_bytes = 1048576;
 ulonglong preserve_trx_warmcopy_max_total_bytes = 10737418240ULL;
 uint preserve_trx_warmcopy_pending_range_limit = 1024;
 ulonglong preserve_trx_warmcopy_pending_bytes_limit = 67108864ULL;
+bool preserve_trx_lock_warmcopy_enable = true;
+bool preserve_trx_lock_warmcopy_fallback_to_live_export = true;
+ulonglong preserve_trx_lock_warmcopy_max_memory_bytes = 268435456ULL;
+ulonglong preserve_trx_lock_warmcopy_max_journal_bytes = 1073741824ULL;
+uint preserve_trx_lock_warmcopy_max_dirty_shards = 100000;
+uint preserve_trx_lock_warmcopy_max_mdl_descriptors = 100000;
+uint preserve_trx_lock_warmcopy_seal_threads = 0;
+uint preserve_trx_lock_warmcopy_conversion_wait_timeout_ms = 30000;
 extern ulong srv_force_recovery;
 
 static std::atomic<bool> g_preserve_trx_enable_cached{false};
@@ -3297,6 +3307,13 @@ bool preserve_trx_is_unsupported_common_context(THD *thd) {
       !preserve_trx_temp_table_session_supported(thd)) {
     return true;
   }
+  if (thd->global_read_lock.is_acquired()) {
+    return true;
+  }
+  if (is_instance_backup_locked(thd) !=
+      Is_instance_backup_locked_result::NOT_LOCKED) {
+    return true;
+  }
   if (thd->locked_tables_mode != LTM_NONE) {
     return true;
   }
@@ -4593,6 +4610,8 @@ class Preserve_batch_quiesced_idle_target final {
                                       my_thread_id target_thread_id,
                                       PreserveBinlogBlobProvider
                                           *binlog_blob_provider = nullptr,
+                                      const Preserve_trx_lock_warmcopy_artifact
+                                          *lock_warmcopy_artifact = nullptr,
                                       bool debug_fail_ha_prepare_low = false,
                                       bool debug_fail_temp_only_prepare = false)
       : m_owner(owner),
@@ -4601,6 +4620,7 @@ class Preserve_batch_quiesced_idle_target final {
         m_generation(generation),
         m_target_thread_id(target_thread_id),
         m_binlog_blob_provider(binlog_blob_provider),
+        m_lock_warmcopy_artifact(lock_warmcopy_artifact),
         m_debug_fail_ha_prepare_low(debug_fail_ha_prepare_low),
         m_debug_fail_temp_only_prepare(debug_fail_temp_only_prepare) {}
 
@@ -4631,8 +4651,8 @@ class Preserve_batch_quiesced_idle_target final {
         m_error = preserve_trx_preserve_attached_transaction(
             candidate, m_options, m_timeout_seconds,
             Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY, &m_result,
-            m_binlog_blob_provider, m_debug_fail_ha_prepare_low,
-            m_debug_fail_temp_only_prepare);
+            m_binlog_blob_provider, m_lock_warmcopy_artifact,
+            m_debug_fail_ha_prepare_low, m_debug_fail_temp_only_prepare);
       }
     }
     if (early_target_error) {
@@ -4689,6 +4709,7 @@ class Preserve_batch_quiesced_idle_target final {
   ulonglong m_generation;
   my_thread_id m_target_thread_id;
   PreserveBinlogBlobProvider *m_binlog_blob_provider;
+  const Preserve_trx_lock_warmcopy_artifact *m_lock_warmcopy_artifact{nullptr};
   bool m_debug_fail_ha_prepare_low{false};
   bool m_debug_fail_temp_only_prepare{false};
   bool m_visited_target{false};
@@ -7364,11 +7385,18 @@ static bool recover_preserved_snapshot(const std::string &dir,
   }
 
   const auto rollback_semantics_failure = [&](const char *component) {
-    return rollback_claimed_preserved_snapshot_or_log(
-        dir, token, trx,
+    std::string reason =
         std::string("failed to restore durable transaction semantics: ") +
-            component,
-        &metadata);
+        component;
+    if (strcmp(component, "record locks") == 0) {
+      const char *detail = trx_preserve_last_record_lock_export_error();
+      if (detail != nullptr && detail[0] != '\0') {
+        reason.append(": ");
+        reason.append(detail);
+      }
+    }
+    return rollback_claimed_preserved_snapshot_or_log(
+        dir, token, trx, reason, &metadata);
   };
   if (trx_preserve_set_isolation(trx, metadata.tx_isolation) != DB_SUCCESS) {
     return rollback_semantics_failure("isolation level");
@@ -7809,6 +7837,31 @@ bool preserve_trx_kernel_preserve_attached_transaction(
                       "debug_after_binlog_mode_validation"););
 
   set_stage(Preserve_trx_preserve_stage::LOCK_PREFLIGHT);
+  const Preserve_trx_lock_warmcopy_options lock_warmcopy_options =
+      preserve_trx_lock_warmcopy_current_options();
+  const Preserve_trx_lock_warmcopy_route lock_warmcopy_route =
+      preserve_trx_lock_warmcopy_route_artifact(request.lock_warmcopy_artifact,
+                                                lock_warmcopy_options);
+  if (lock_warmcopy_route.action ==
+      Preserve_trx_lock_warmcopy_route_action::REJECT) {
+    if (batch_delivery && lock_warmcopy_options.enabled) {
+      preserve_trx_lock_warmcopy_note_route_reject(
+          lock_warmcopy_route.reason);
+    }
+    return reject_after_binlog_export(
+        preserve_trx_lock_warmcopy_reason_name(lock_warmcopy_route.reason));
+  }
+  if (batch_delivery && lock_warmcopy_options.enabled &&
+      lock_warmcopy_route.action ==
+          Preserve_trx_lock_warmcopy_route_action::FALLBACK_TO_LIVE_EXPORT) {
+    preserve_trx_lock_warmcopy_note_route_fallback(lock_warmcopy_route.reason);
+  }
+  bool use_lock_warmcopy_artifact =
+      lock_warmcopy_route.action ==
+      Preserve_trx_lock_warmcopy_route_action::USE_WARM_COPY;
+  const Preserve_trx_lock_warmcopy_artifact *lock_warmcopy_artifact =
+      request.lock_warmcopy_artifact;
+
   std::string read_view_payload;
   uint64_t rv_low_limit_no = 0;
   if (trx_preserve_export_read_view(thd, &read_view_payload,
@@ -7822,8 +7875,13 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   lock_limits.max_scan_pages = preserve_trx_max_scan_pages;
   lock_limits.materialize_timeout_ms = preserve_trx_materialize_timeout_ms;
   bool materialized_any_implicit_lock = false;
-  if (trx_preserve_materialize_implicit_locks(
-          thd, lock_limits, &materialized_any_implicit_lock) != DB_SUCCESS) {
+  auto materialize_implicit_locks_for_live_export = [&]() -> const char * {
+    materialized_any_implicit_lock = false;
+    if (trx_preserve_materialize_implicit_locks(
+            thd, lock_limits, &materialized_any_implicit_lock) ==
+        DB_SUCCESS) {
+      return nullptr;
+    }
     if (materialized_any_implicit_lock) {
       push_warning(
           thd, Sql_condition::SL_WARNING, ER_PRESERVE_TRX_UNSUPPORTED,
@@ -7831,7 +7889,14 @@ bool preserve_trx_kernel_preserve_attached_transaction(
           "transaction; the transaction remains active with equivalent or "
           "stronger InnoDB record locks");
     }
-    return reject_after_binlog_export("implicit_lock_materialize_failed");
+    return "implicit_lock_materialize_failed";
+  };
+  if (!use_lock_warmcopy_artifact) {
+    const char *materialize_failure =
+        materialize_implicit_locks_for_live_export();
+    if (materialize_failure != nullptr) {
+      return reject_after_binlog_export(materialize_failure);
+    }
   }
 
   DEBUG_SYNC(thd, "preserve_trx_after_lock_materialization");
@@ -7845,13 +7910,60 @@ bool preserve_trx_kernel_preserve_attached_transaction(
 
   std::string mdl_descriptors_payload;
   size_t mdl_descriptors_count = 0;
-  if (thd->mdl_context.export_preserved_locks(&mdl_descriptors_payload,
-                                              &mdl_descriptors_count)) {
-    return reject_after_binlog_export("mdl_export_failed");
+  auto export_live_mdl_descriptors = [&]() -> const char * {
+    mdl_descriptors_payload.clear();
+    mdl_descriptors_count = 0;
+    if (thd->mdl_context.export_preserved_locks(&mdl_descriptors_payload,
+                                                &mdl_descriptors_count)) {
+      return "mdl_export_failed";
+    }
+    if (preserve_trx_recheck_mdl_object_privileges(thd,
+                                                   mdl_descriptors_payload)) {
+      return "mdl_privilege_recheck_failed";
+    }
+    return nullptr;
+  };
+  /*
+    MDL warmcopy reuses the existing transaction-duration descriptor payload
+    and validates it against the live exporter before it can replace the live
+    payload.
+  */
+  const char *mdl_live_failure = export_live_mdl_descriptors();
+  if (mdl_live_failure != nullptr) {
+    return reject_after_binlog_export(mdl_live_failure);
   }
-  if (preserve_trx_recheck_mdl_object_privileges(thd,
-                                                 mdl_descriptors_payload)) {
-    return reject_after_binlog_export("mdl_privilege_recheck_failed");
+  if (use_lock_warmcopy_artifact) {
+    const Preserve_trx_lock_warmcopy_canonical_compare_result mdl_compare =
+        preserve_trx_lock_warmcopy_compare_mdl_payloads_canonical(
+            mdl_descriptors_payload,
+            lock_warmcopy_artifact->mdl_descriptors_payload);
+    if (!mdl_compare.equivalent ||
+        mdl_descriptors_count !=
+            lock_warmcopy_artifact->mdl_descriptor_count) {
+      preserve_trx_lock_warmcopy_note_canonical_mismatch("mdl");
+      if (!lock_warmcopy_options.fallback_to_live_export) {
+        preserve_trx_lock_warmcopy_note_route_reject(
+            Preserve_trx_lock_warmcopy_reason::
+                CANONICAL_EQUIVALENCE_FAILED);
+        return reject_after_binlog_export(
+            preserve_trx_lock_warmcopy_reason_name(
+                Preserve_trx_lock_warmcopy_reason::
+                    CANONICAL_EQUIVALENCE_FAILED));
+      }
+      const char *materialize_failure =
+          materialize_implicit_locks_for_live_export();
+      if (materialize_failure != nullptr) {
+        return reject_after_binlog_export(materialize_failure);
+      }
+      preserve_trx_lock_warmcopy_note_route_fallback(
+          Preserve_trx_lock_warmcopy_reason::CANONICAL_EQUIVALENCE_FAILED);
+      use_lock_warmcopy_artifact = false;
+      lock_warmcopy_artifact = nullptr;
+    } else {
+      mdl_descriptors_payload =
+          lock_warmcopy_artifact->mdl_descriptors_payload;
+      mdl_descriptors_count = lock_warmcopy_artifact->mdl_descriptor_count;
+    }
   }
   std::vector<Preserve_modified_table_name> modified_tables;
   if (trx_preserve_export_modified_table_names(
@@ -7877,14 +7989,27 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     committable.
   */
   std::string record_locks_preflight_payload;
-  if (trx_preserve_export_record_locks(thd, &record_locks_preflight_payload,
-                                       lock_limits.max_lock_count) !=
-      DB_SUCCESS) {
-    const char *reason = preserve_trx_record_lock_export_failure_reason(
-        "record_lock_preflight_failed");
-    log_preserve_reject_reason(thd, reason);
-    return reject_after_binlog_export(reason);
-  }
+  std::string table_locks_preflight_payload;
+  uint32_t record_locks_preflight_count = 0;
+  bool live_lock_preflight_payloads_exported = false;
+  auto export_live_record_locks_preflight = [&]() -> const char * {
+    record_locks_preflight_payload.clear();
+    record_locks_preflight_count = 0;
+    if (trx_preserve_export_record_locks(thd, &record_locks_preflight_payload,
+                                         lock_limits.max_lock_count) !=
+        DB_SUCCESS) {
+      const char *reason = preserve_trx_record_lock_export_failure_reason(
+          "record_lock_preflight_failed");
+      log_preserve_reject_reason(thd, reason);
+      return reason;
+    }
+    if (!record_locks_preflight_payload.empty() &&
+        !trx_preserve_record_locks_payload_lock_count(
+            record_locks_preflight_payload, &record_locks_preflight_count)) {
+      return "record_lock_count_decode_failed";
+    }
+    return nullptr;
+  };
 
   /*
     Table-lock preflight. Validates that every explicit IX/IS/S/X/AUTO_INC
@@ -7892,18 +8017,165 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     table-lock count stays within preserve_trx_max_lock_count. Done before any
     destructive step so the transaction stays committable on failure.
   */
-  std::string table_locks_preflight_payload;
-  uint32_t record_locks_preflight_count = 0;
-  if (!record_locks_preflight_payload.empty() &&
-      !trx_preserve_record_locks_payload_lock_count(
-          record_locks_preflight_payload, &record_locks_preflight_count)) {
-    return reject_after_binlog_export("record_lock_count_decode_failed");
+  auto export_live_table_locks_preflight = [&]() -> const char * {
+    table_locks_preflight_payload.clear();
+    if (trx_preserve_export_table_locks(thd, &table_locks_preflight_payload,
+                                        lock_limits.max_lock_count,
+                                        record_locks_preflight_count) !=
+        DB_SUCCESS) {
+      return "table_lock_preflight_failed";
+    }
+    return nullptr;
+  };
+  auto export_live_lock_preflight_payloads = [&]() -> const char * {
+    live_lock_preflight_payloads_exported = false;
+    const char *record_failure = export_live_record_locks_preflight();
+    if (record_failure != nullptr) return record_failure;
+    const char *table_failure = export_live_table_locks_preflight();
+    if (table_failure != nullptr) return table_failure;
+    live_lock_preflight_payloads_exported = true;
+    return nullptr;
+  };
+  auto switch_lock_warmcopy_to_live_export_for_preflight =
+      [&]() -> const char * {
+    const char *materialize_failure =
+        materialize_implicit_locks_for_live_export();
+    if (materialize_failure != nullptr) return materialize_failure;
+
+    const char *mdl_failure = export_live_mdl_descriptors();
+    if (mdl_failure != nullptr) return mdl_failure;
+
+    const char *lock_preflight_failure = export_live_lock_preflight_payloads();
+    if (lock_preflight_failure != nullptr) return lock_preflight_failure;
+
+    use_lock_warmcopy_artifact = false;
+    lock_warmcopy_artifact = nullptr;
+    return nullptr;
+  };
+
+  if (use_lock_warmcopy_artifact) {
+    bool has_predicate_locks = false;
+    if (!trx_preserve_has_predicate_locks(thd, &has_predicate_locks) ||
+        has_predicate_locks) {
+      if (!lock_warmcopy_options.fallback_to_live_export) {
+        preserve_trx_lock_warmcopy_note_route_reject(
+            Preserve_trx_lock_warmcopy_reason::UNSUPPORTED_FAMILY);
+        return reject_after_binlog_export(
+            preserve_trx_lock_warmcopy_reason_name(
+                Preserve_trx_lock_warmcopy_reason::UNSUPPORTED_FAMILY));
+      }
+      preserve_trx_lock_warmcopy_note_route_fallback(
+          Preserve_trx_lock_warmcopy_reason::UNSUPPORTED_FAMILY);
+      const char *fallback_failure =
+          switch_lock_warmcopy_to_live_export_for_preflight();
+      if (fallback_failure != nullptr) {
+        return reject_after_binlog_export(fallback_failure);
+      }
+    }
   }
-  if (trx_preserve_export_table_locks(thd, &table_locks_preflight_payload,
-                                      lock_limits.max_lock_count,
-                                      record_locks_preflight_count) !=
-      DB_SUCCESS) {
-    return reject_after_binlog_export("table_lock_preflight_failed");
+
+  if (use_lock_warmcopy_artifact) {
+    /*
+      Lock warmcopy compares the explicit record-lock family here.  Do not
+      materialize implicit X-locks before this comparison: implicit native
+      continuity is a separate family, and forcing it into explicit live export
+      would make every native implicit-only writer fail canonical equivalence.
+      The live fallback path still materializes before exporting.
+    */
+    const char *record_failure = export_live_record_locks_preflight();
+    if (record_failure != nullptr) {
+      return reject_after_binlog_export(record_failure);
+    }
+    const Preserve_trx_lock_warmcopy_canonical_compare_result record_compare =
+        preserve_trx_lock_warmcopy_compare_record_payloads_canonical(
+            record_locks_preflight_payload,
+            lock_warmcopy_artifact->record_locks_payload);
+    if (!record_compare.equivalent) {
+      DBUG_EXECUTE_IF(
+          "preserve_trx_lock_warmcopy_log_record_compare",
+          {
+            const std::string message =
+                "PRESERVE: lock warmcopy record canonical mismatch"
+                " difference=" +
+                record_compare.difference +
+                " live_bytes=" +
+                std::to_string(record_locks_preflight_payload.size()) +
+                " warmcopy_bytes=" +
+                std::to_string(
+                    lock_warmcopy_artifact->record_locks_payload.size()) +
+                " live_count=" +
+                std::to_string(record_locks_preflight_count) +
+                " warmcopy_count=" +
+                std::to_string(lock_warmcopy_artifact->record_lock_count);
+            LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
+          });
+      preserve_trx_lock_warmcopy_note_canonical_mismatch("record");
+      if (!lock_warmcopy_options.fallback_to_live_export) {
+        preserve_trx_lock_warmcopy_note_route_reject(
+            Preserve_trx_lock_warmcopy_reason::
+                CANONICAL_EQUIVALENCE_FAILED);
+        return reject_after_binlog_export(
+            preserve_trx_lock_warmcopy_reason_name(
+                Preserve_trx_lock_warmcopy_reason::
+                    CANONICAL_EQUIVALENCE_FAILED));
+      }
+      preserve_trx_lock_warmcopy_note_route_fallback(
+          Preserve_trx_lock_warmcopy_reason::CANONICAL_EQUIVALENCE_FAILED);
+      const char *fallback_failure =
+          switch_lock_warmcopy_to_live_export_for_preflight();
+      if (fallback_failure != nullptr) {
+        return reject_after_binlog_export(fallback_failure);
+      }
+    }
+  }
+
+  if (use_lock_warmcopy_artifact) {
+    if (lock_warmcopy_artifact->record_predicate_table_lock_count >
+        lock_limits.max_lock_count) {
+      preserve_trx_lock_warmcopy_note_route_reject(
+          Preserve_trx_lock_warmcopy_reason::RESOURCE_LIMIT_EXCEEDED);
+      return reject_after_binlog_export(
+          preserve_trx_lock_warmcopy_reason_name(
+              Preserve_trx_lock_warmcopy_reason::RESOURCE_LIMIT_EXCEEDED));
+    }
+    record_locks_preflight_count = lock_warmcopy_artifact->record_lock_count;
+    const char *table_failure = export_live_table_locks_preflight();
+    if (table_failure != nullptr) {
+      return reject_after_binlog_export(table_failure);
+    }
+    const Preserve_trx_lock_warmcopy_canonical_compare_result table_compare =
+        preserve_trx_lock_warmcopy_compare_table_payloads_canonical(
+            table_locks_preflight_payload,
+            lock_warmcopy_artifact->table_locks_payload);
+    if (!table_compare.equivalent ||
+        trx_preserve_table_locks_payload_has_autoinc(
+            lock_warmcopy_artifact->table_locks_payload) !=
+            lock_warmcopy_artifact->autoinc_lock_owned) {
+      preserve_trx_lock_warmcopy_note_canonical_mismatch("table");
+      if (!lock_warmcopy_options.fallback_to_live_export) {
+        preserve_trx_lock_warmcopy_note_route_reject(
+            Preserve_trx_lock_warmcopy_reason::
+                CANONICAL_EQUIVALENCE_FAILED);
+        return reject_after_binlog_export(
+            preserve_trx_lock_warmcopy_reason_name(
+                Preserve_trx_lock_warmcopy_reason::
+                    CANONICAL_EQUIVALENCE_FAILED));
+      }
+      preserve_trx_lock_warmcopy_note_route_fallback(
+          Preserve_trx_lock_warmcopy_reason::CANONICAL_EQUIVALENCE_FAILED);
+      const char *fallback_failure =
+          switch_lock_warmcopy_to_live_export_for_preflight();
+      if (fallback_failure != nullptr) {
+        return reject_after_binlog_export(fallback_failure);
+      }
+    }
+  } else {
+    if (!live_lock_preflight_payloads_exported) {
+      const char *lock_preflight_failure = export_live_lock_preflight_payloads();
+      if (lock_preflight_failure != nullptr) {
+        return reject_after_binlog_export(lock_preflight_failure);
+      }
+    }
   }
 
   std::string token;
@@ -8041,14 +8313,172 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   if (prepare_failed) {
     return restore_unprepared_batch_prepare_failure_or_rollback();
   }
+
+  trx_t *lock_warmcopy_frozen_trx = nullptr;
+  lock_warmcopy_trx_lock_fence_t lock_warmcopy_frozen_fence;
+  bool lock_warmcopy_frozen_fence_valid = false;
+  auto thaw_lock_warmcopy_conversion = [&]() {
+    if (lock_warmcopy_frozen_trx != nullptr) {
+      trx_preserve_lock_warmcopy_conversion_thaw(lock_warmcopy_frozen_trx);
+      lock_warmcopy_frozen_trx = nullptr;
+      lock_warmcopy_frozen_fence_valid = false;
+    }
+  };
+  auto switch_lock_warmcopy_to_live_export_before_prepare =
+      [&]() -> const char * {
+    const char *materialize_failure =
+        materialize_implicit_locks_for_live_export();
+    if (materialize_failure != nullptr) return materialize_failure;
+
+    const char *mdl_failure = export_live_mdl_descriptors();
+    if (mdl_failure != nullptr) return mdl_failure;
+
+    const char *lock_preflight_failure = export_live_lock_preflight_payloads();
+    if (lock_preflight_failure != nullptr) return lock_preflight_failure;
+
+    use_lock_warmcopy_artifact = false;
+    lock_warmcopy_artifact = nullptr;
+    return nullptr;
+  };
+  auto verify_lock_warmcopy_frozen_fence = [&]() -> bool {
+    if (!use_lock_warmcopy_artifact) return true;
+
+    lock_warmcopy_trx_lock_fence_t current_frozen_fence;
+    return lock_warmcopy_frozen_fence_valid &&
+           trx_preserve_sample_lock_warmcopy_fence(lock_warmcopy_frozen_trx,
+                                                   &current_frozen_fence) &&
+           lock_warmcopy_trx_lock_fence_equal(lock_warmcopy_frozen_fence,
+                                              current_frozen_fence);
+  };
+  auto inject_lock_warmcopy_conversion_after_freeze = [&]() {
+    (void)trx_preserve_lock_warmcopy_note_conversion_attempt_after_freeze(
+        lock_warmcopy_frozen_trx);
+  };
+  (void)inject_lock_warmcopy_conversion_after_freeze;
+  auto handle_lock_warmcopy_final_fence_failure =
+      [&](Preserve_trx_lock_warmcopy_reason reason,
+          const char *strict_failure_reason) -> bool {
+    preserve_trx_lock_warmcopy_note_final_fence_mismatch();
+    const Preserve_trx_lock_warmcopy_route route =
+        preserve_trx_lock_warmcopy_route_final_fence(reason,
+                                                     lock_warmcopy_options);
+    if (route.action ==
+        Preserve_trx_lock_warmcopy_route_action::FALLBACK_TO_LIVE_EXPORT) {
+      preserve_trx_lock_warmcopy_note_route_fallback(reason);
+      thaw_lock_warmcopy_conversion();
+      const char *fallback_failure =
+          switch_lock_warmcopy_to_live_export_before_prepare();
+      if (fallback_failure != nullptr) {
+        set_failure_reason(fallback_failure);
+        return false;
+      }
+      return true;
+    }
+
+    preserve_trx_lock_warmcopy_note_route_reject(reason);
+    thaw_lock_warmcopy_conversion();
+    set_failure_reason(strict_failure_reason != nullptr
+                           ? strict_failure_reason
+                           : preserve_trx_lock_warmcopy_reason_name(reason));
+    return false;
+  };
+  if (use_lock_warmcopy_artifact) {
+    lock_warmcopy_trx_lock_fence_t current_record_fence;
+    if (!trx_preserve_sample_lock_warmcopy_fence(thd,
+                                                 &current_record_fence)) {
+      if (!handle_lock_warmcopy_final_fence_failure(
+              Preserve_trx_lock_warmcopy_reason::ARTIFACT_INVALID,
+              "lock_warmcopy_final_fence_sample_failed")) {
+        return restore_unprepared_batch_prepare_failure_or_rollback();
+      }
+    }
+    if (use_lock_warmcopy_artifact) {
+      const Preserve_trx_lock_warmcopy_reason final_fence_reason =
+          preserve_trx_lock_warmcopy_verify_record_final_fence(
+              *lock_warmcopy_artifact, current_record_fence);
+      if (final_fence_reason != Preserve_trx_lock_warmcopy_reason::OK &&
+          !handle_lock_warmcopy_final_fence_failure(
+              final_fence_reason,
+              preserve_trx_lock_warmcopy_reason_name(final_fence_reason))) {
+        return restore_unprepared_batch_prepare_failure_or_rollback();
+      }
+    }
+    if (use_lock_warmcopy_artifact) {
+      if (!trx_preserve_lock_warmcopy_conversion_freeze(
+              thd, &lock_warmcopy_frozen_fence,
+              &lock_warmcopy_frozen_trx)) {
+        if (!handle_lock_warmcopy_final_fence_failure(
+                Preserve_trx_lock_warmcopy_reason::ARTIFACT_INVALID,
+                "lock_warmcopy_conversion_freeze_failed")) {
+          return restore_unprepared_batch_prepare_failure_or_rollback();
+        }
+      } else {
+        lock_warmcopy_frozen_fence_valid = true;
+      }
+    }
+    if (use_lock_warmcopy_artifact) {
+      /*
+        The warmcopy artifact is now tied to this trx-level conversion freeze.
+        Any other session that tries to materialize one of this transaction's
+        implicit locks before metadata is populated must update the frozen fence
+        and force fail-closed handling below.
+      */
+      DEBUG_SYNC(thd, "preserve_trx_lock_warmcopy_after_conversion_freeze");
+      DBUG_EXECUTE_IF(
+          "preserve_trx_lock_warmcopy_simulate_conversion_after_freeze", {
+            (void)trx_preserve_lock_warmcopy_note_conversion_attempt_after_freeze(
+                lock_warmcopy_frozen_trx);
+          });
+    }
+    if (use_lock_warmcopy_artifact) {
+      DEBUG_SYNC(thd, "preserve_trx_lock_warmcopy_after_final_fence");
+      if (!verify_lock_warmcopy_frozen_fence() &&
+          !handle_lock_warmcopy_final_fence_failure(
+              Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED,
+              preserve_trx_lock_warmcopy_reason_name(
+                  Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED))) {
+        return restore_unprepared_batch_prepare_failure_or_rollback();
+      }
+    }
+  }
+  if (use_lock_warmcopy_artifact) {
+    std::string current_sql_savepoints_payload;
+    uint32_t current_savepoint_count = 0;
+    uint32_t current_sql_innodb_savepoint_count = 0;
+    if (export_sql_savepoints(thd, binlog_state,
+                              &current_sql_savepoints_payload,
+                              &current_savepoint_count,
+                              &current_sql_innodb_savepoint_count)) {
+      thaw_lock_warmcopy_conversion();
+      set_failure_reason("savepoint_final_fence_export_failed");
+      return restore_unprepared_batch_prepare_failure_or_rollback();
+    }
+    DBUG_EXECUTE_IF(
+        "preserve_trx_lock_warmcopy_force_savepoint_final_fence_changed",
+        { current_sql_savepoints_payload.push_back('\1'); });
+    if (current_savepoint_count != savepoint_count ||
+        current_sql_innodb_savepoint_count != sql_innodb_savepoint_count ||
+        current_sql_savepoints_payload != sql_savepoints_payload) {
+      thaw_lock_warmcopy_conversion();
+      set_failure_reason("savepoint_final_fence_changed");
+      return restore_unprepared_batch_prepare_failure_or_rollback();
+    }
+  }
   if (ha_prepare_low(thd, true)) {
+    thaw_lock_warmcopy_conversion();
     return restore_batch_prepare_failure_or_rollback();
   }
+  /*
+    Keep the per-trx conversion freeze beyond ha_prepare_low().  The lock
+    payload contract is not fully frozen until the transaction is detached,
+    claimed, and the preserved lock metadata below has been populated.
+  */
   bool temp_prepare_failed =
       request.debug_fail_temp_only_prepare ||
       trx_preserve_prepare_current_temp_only(thd, xid) != DB_SUCCESS;
   DBUG_EXECUTE_IF("pfx_temp_prepare", { temp_prepare_failed = true; });
   if (temp_prepare_failed) {
+    thaw_lock_warmcopy_conversion();
     return restore_batch_prepare_failure_or_rollback();
   }
   if (result != nullptr) result->durable_point_crossed = true;
@@ -8081,9 +8511,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   DBUG_EXECUTE_IF("preserve_trx_crash_after_undo_prepared_before_snapshot",
                   DBUG_SUICIDE(););
   DBUG_EXECUTE_IF("preserve_trx_fail_after_undo_prepared", {
+    thaw_lock_warmcopy_conversion();
     return restore_prepared_batch_or_rollback();
   });
   if (thd->killed == THD::KILL_CONNECTION) {
+    thaw_lock_warmcopy_conversion();
     if (batch_delivery) return restore_prepared_batch_or_rollback();
     return reject_single_after_attached_cleanup(
         true, "single_kill_connection_after_prepare_cleanup");
@@ -8093,6 +8525,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   set_stage(Preserve_trx_preserve_stage::DETACH);
   trx_t *trx = trx_preserve_detach_current_thd(thd);
   if (trx == nullptr) {
+    thaw_lock_warmcopy_conversion();
     return restore_prepared_batch_or_rollback();
   }
   if (result != nullptr) result->detached_from_original_thd = true;
@@ -8150,6 +8583,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   };
 
   if (trx_preserve_claim_detached_prepared(trx) != DB_SUCCESS) {
+    thaw_lock_warmcopy_conversion();
     if (batch_reattached_after_detach_failure())
       return reject_unsupported_for_delivery();
     (void)trx_preserve_rollback_by_token(token.c_str());
@@ -8159,6 +8593,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   }
 
   DBUG_EXECUTE_IF("preserve_trx_fail_after_detach_for_batch_reattach", {
+    thaw_lock_warmcopy_conversion();
     return reject_after_detach_failure_or_rollback();
   });
 
@@ -8170,16 +8605,21 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     metadata.modified_table_names.push_back(
         {name.schema_name, name.table_name});
   }
-  metadata.autoinc_lock_owned = trx_preserve_trx_has_autoinc_locks(trx);
+  metadata.autoinc_lock_owned =
+      use_lock_warmcopy_artifact
+          ? lock_warmcopy_artifact->autoinc_lock_owned
+          : trx_preserve_trx_has_autoinc_locks(trx);
   std::string innodb_savepoints_payload;
   if (trx_preserve_export_savepoints(trx, &innodb_savepoints_payload) !=
       DB_SUCCESS) {
+    thaw_lock_warmcopy_conversion();
     return reject_after_detach_failure_or_rollback();
   }
   uint32_t innodb_savepoint_count = 0;
   if (!trx_preserve_savepoints_payload_is_valid_for_import(
           innodb_savepoints_payload, &innodb_savepoint_count) ||
       innodb_savepoint_count != sql_innodb_savepoint_count) {
+    thaw_lock_warmcopy_conversion();
     return reject_after_detach_failure_or_rollback();
   }
   /*
@@ -8188,18 +8628,66 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     must keep the user-visible transaction semantics from before the durable
     prepare step, including next-key/gap locks that protect future inserts.
   */
-  const std::string &exported_record_locks_payload =
-      record_locks_preflight_payload;
   uint32_t record_locks_count = record_locks_preflight_count;
-  if (!split_record_and_predicate_locks_payload(
-          exported_record_locks_payload, &metadata.record_locks_payload,
-          &metadata.predicate_locks_payload)) {
-    return reject_after_detach_failure_or_rollback();
+  if (use_lock_warmcopy_artifact) {
+    metadata.record_locks_payload =
+        lock_warmcopy_artifact->record_locks_payload;
+    metadata.predicate_locks_payload =
+        lock_warmcopy_artifact->predicate_locks_payload;
+  } else {
+    const std::string &exported_record_locks_payload =
+        record_locks_preflight_payload;
+    if (!split_record_and_predicate_locks_payload(
+            exported_record_locks_payload, &metadata.record_locks_payload,
+            &metadata.predicate_locks_payload)) {
+      thaw_lock_warmcopy_conversion();
+      return reject_after_detach_failure_or_rollback();
+    }
   }
-  if (trx_preserve_export_table_locks(
-          trx, &metadata.table_locks_payload, lock_limits.max_lock_count,
-          record_locks_count) != DB_SUCCESS) {
-    return reject_after_detach_failure_or_rollback();
+  if (use_lock_warmcopy_artifact) {
+    std::string prepared_table_locks_payload;
+    if (trx_preserve_export_table_locks(
+            trx, &prepared_table_locks_payload, lock_limits.max_lock_count,
+            record_locks_count) != DB_SUCCESS) {
+      thaw_lock_warmcopy_conversion();
+      return reject_after_detach_failure_or_rollback();
+    }
+    std::string warmcopy_table_locks_payload_for_compare =
+        lock_warmcopy_artifact->table_locks_payload;
+    DBUG_EXECUTE_IF(
+        "preserve_trx_lock_warmcopy_simulate_table_post_prepare_drift",
+        { warmcopy_table_locks_payload_for_compare.push_back('\1'); });
+    const Preserve_trx_lock_warmcopy_canonical_compare_result table_compare =
+        preserve_trx_lock_warmcopy_compare_table_payloads_canonical(
+            prepared_table_locks_payload,
+            warmcopy_table_locks_payload_for_compare);
+    if (!table_compare.equivalent ||
+        trx_preserve_table_locks_payload_has_autoinc(
+            warmcopy_table_locks_payload_for_compare) !=
+            lock_warmcopy_artifact->autoinc_lock_owned) {
+      preserve_trx_lock_warmcopy_note_canonical_mismatch("table_post_prepare");
+      if (!lock_warmcopy_options.fallback_to_live_export) {
+        preserve_trx_lock_warmcopy_note_route_reject(
+            Preserve_trx_lock_warmcopy_reason::TABLE_POST_PREPARE_DRIFT);
+        thaw_lock_warmcopy_conversion();
+        return reject_after_detach_failure_or_rollback();
+      }
+      preserve_trx_lock_warmcopy_note_route_fallback(
+          Preserve_trx_lock_warmcopy_reason::TABLE_POST_PREPARE_DRIFT);
+      metadata.table_locks_payload = std::move(prepared_table_locks_payload);
+      metadata.autoinc_lock_owned =
+          trx_preserve_table_locks_payload_has_autoinc(
+              metadata.table_locks_payload);
+    } else {
+      metadata.table_locks_payload = lock_warmcopy_artifact->table_locks_payload;
+    }
+  } else {
+    if (trx_preserve_export_table_locks(
+            trx, &metadata.table_locks_payload, lock_limits.max_lock_count,
+            record_locks_count) != DB_SUCCESS) {
+      thaw_lock_warmcopy_conversion();
+      return reject_after_detach_failure_or_rollback();
+    }
   }
   /* Cross-check: the table-locks payload and the derived autoinc_lock_owned
   flag must agree. metadata.autoinc_lock_owned was captured up-front; any
@@ -8208,6 +8696,18 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   if (!metadata.table_locks_payload.empty() &&
       trx_preserve_table_locks_payload_has_autoinc(
           metadata.table_locks_payload) != metadata.autoinc_lock_owned) {
+    thaw_lock_warmcopy_conversion();
+    return reject_after_detach_failure_or_rollback();
+  }
+  if (use_lock_warmcopy_artifact) {
+    DEBUG_SYNC(thd, "preserve_trx_lock_warmcopy_after_lock_metadata_guarded");
+  }
+  if (use_lock_warmcopy_artifact && !verify_lock_warmcopy_frozen_fence()) {
+    preserve_trx_lock_warmcopy_note_final_fence_mismatch();
+    preserve_trx_lock_warmcopy_note_route_reject(
+        Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED);
+    thaw_lock_warmcopy_conversion();
+    set_failure_reason("lock_warmcopy_conversion_freeze_changed");
     return reject_after_detach_failure_or_rollback();
   }
   metadata.has_read_view = !read_view_payload.empty();
@@ -8216,6 +8716,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   metadata.mdl_descriptors_payload = std::move(mdl_descriptors_payload);
   if (options.user_vars_mode == Preserve_trx_user_vars_mode::INCLUDE &&
       export_user_vars_payload(thd, &metadata.user_vars_payload)) {
+    thaw_lock_warmcopy_conversion();
     return reject_after_detach_failure_or_rollback();
   }
   metadata.savepoint_count = savepoint_count;
@@ -8223,6 +8724,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   metadata.innodb_savepoints_payload = std::move(innodb_savepoints_payload);
 
   if (create_detached_mdl_context(thd, token)) {
+    thaw_lock_warmcopy_conversion();
     return reject_after_detach_failure_or_rollback();
   }
 
@@ -8232,6 +8734,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       [&](bool snapshot_files_may_exist,
           Preserve_snapshot_delete_status write_failure_delete_status =
               Preserve_snapshot_delete_status::OK) {
+    thaw_lock_warmcopy_conversion();
     const bool effective_snapshot_files_may_exist =
         snapshot_files_may_exist ||
         write_failure_delete_status ==
@@ -8390,6 +8893,21 @@ bool preserve_trx_kernel_preserve_attached_transaction(
                                          write_failure_delete_status);
   }
 
+  if (use_lock_warmcopy_artifact) {
+    DEBUG_SYNC(thd,
+               "preserve_trx_lock_warmcopy_after_snapshot_write_before_final_fence");
+    DBUG_EXECUTE_IF(
+        "preserve_trx_lock_warmcopy_simulate_conversion_after_snapshot_write",
+        { inject_lock_warmcopy_conversion_after_freeze(); });
+    if (!verify_lock_warmcopy_frozen_fence()) {
+      preserve_trx_lock_warmcopy_note_final_fence_mismatch();
+      preserve_trx_lock_warmcopy_note_route_reject(
+          Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED);
+      set_failure_reason("lock_warmcopy_conversion_freeze_changed");
+      return reject_after_snapshot_failure(true);
+    }
+  }
+
   set_stage(Preserve_trx_preserve_stage::RECORD_REGISTER);
   const Preserved_trx_lifecycle_state registered_state =
       batch_delivery ? Preserved_trx_lifecycle_state::DRAINING
@@ -8397,6 +8915,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   if (preserved_trx_add_record(metadata, trx, batch_delivery,
                                registered_state,
                                blob_descriptors)) {
+    thaw_lock_warmcopy_conversion();
     discard_prebuilt_binlog_blob_if_needed();
     bool cleanup_failed = false;
     bool left_preserved = false;
@@ -8435,6 +8954,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
     return reject_unsupported_for_delivery();
   }
+  thaw_lock_warmcopy_conversion();
   snapshotting_state.remove();
 
   if (batch_delivery) {
@@ -8456,6 +8976,7 @@ bool preserve_trx_preserve_attached_transaction(
     ulonglong timeout_seconds, Preserve_trx_delivery_mode delivery_mode,
     Preserve_trx_preserve_result *result,
     PreserveBinlogBlobProvider *binlog_blob_provider,
+    const Preserve_trx_lock_warmcopy_artifact *lock_warmcopy_artifact,
     bool debug_fail_ha_prepare_low_override,
     bool debug_fail_temp_only_prepare_override) {
   const bool batch_delivery =
@@ -8494,7 +9015,8 @@ bool preserve_trx_preserve_attached_transaction(
                                       delivery_mode, effective_result,
                                       binlog_blob_provider,
                                       debug_fail_ha_prepare_low,
-                                      debug_fail_temp_only_prepare};
+                                      debug_fail_temp_only_prepare,
+                                      lock_warmcopy_artifact};
   const bool error = preserve_trx_kernel_preserve_attached_transaction(request);
   if (error || batch_delivery) return error;
 
@@ -8655,22 +9177,33 @@ bool Preserve_trx_drain_service::execute(
     return preserve_trx_reject_unsupported();
 
   const ulonglong generation = g_batch_generation.fetch_add(1) + 1;
-  const bool warmcopy_enabled =
+  const bool binlog_warmcopy_enabled =
       preserve_trx_warmcopy_enable && opt_bin_log && mysql_bin_log.is_open();
+  const bool lock_warmcopy_enabled = preserve_trx_lock_warmcopy_effective();
+  const bool two_phase_enabled =
+      preserve_trx_lock_warmcopy_requires_two_phase(binlog_warmcopy_enabled);
   Preserve_trx_drain_orchestrator drain_orchestrator(
-      warmcopy_enabled ? Preserve_trx_drain_phase_mode::TWO_PHASE
-                       : Preserve_trx_drain_phase_mode::SINGLE_PHASE);
+      two_phase_enabled ? Preserve_trx_drain_phase_mode::TWO_PHASE
+                        : Preserve_trx_drain_phase_mode::SINGLE_PHASE);
   std::unique_ptr<Warmcopy_batch_drain_participant> warmcopy_participant;
-  if (warmcopy_enabled) {
+  if (binlog_warmcopy_enabled) {
     warmcopy_participant = std::make_unique<Warmcopy_batch_drain_participant>(
         thd, generation, preserve_trx_warmcopy_close_timeout_ms);
     drain_orchestrator.add_participant(warmcopy_participant.get());
   }
+  std::unique_ptr<Preserve_trx_lock_warmcopy_drain_participant>
+      lock_warmcopy_participant;
+  if (lock_warmcopy_enabled) {
+    lock_warmcopy_participant =
+        std::make_unique<Preserve_trx_lock_warmcopy_drain_participant>(
+            preserve_trx_lock_warmcopy_current_options());
+    drain_orchestrator.add_participant(lock_warmcopy_participant.get());
+  }
   PreserveBinlogBlobProvider *warmcopy_provider = nullptr;
   Preserve_trx_manager_state_guard draining(
       Preserve_trx_manager_state::IDLE,
-      warmcopy_enabled ? Preserve_trx_manager_state::WARMCOPY_DRAINING
-                       : Preserve_trx_manager_state::BATCH_DRAINING,
+      two_phase_enabled ? Preserve_trx_manager_state::WARMCOPY_DRAINING
+                        : Preserve_trx_manager_state::BATCH_DRAINING,
       thd->thread_id());
   if (!draining.active()) return preserve_trx_reject_unsupported();
   std::unique_lock<std::mutex> warmcopy_status_guard;
@@ -8687,18 +9220,23 @@ bool Preserve_trx_drain_service::execute(
         drain_orchestrator, stage, INFORMATION_LEVEL);
   };
 
-  if (warmcopy_enabled) {
+  if (binlog_warmcopy_enabled) {
     warmcopy_status_guard = std::unique_lock<std::mutex>(g_warmcopy_status_mutex);
+  }
+  if (two_phase_enabled) {
     if (drain_orchestrator.open_phase1_participants() !=
         Preserve_trx_drain_status::OK) {
       abort_drain_participants("open_phase1_failed");
       return preserve_trx_reject_unsupported();
     }
-    warmcopy_provider = warmcopy_participant->provider();
+    if (warmcopy_participant != nullptr) {
+      warmcopy_provider = warmcopy_participant->provider();
+    }
+    DEBUG_SYNC(thd, "preserve_trx_warmcopy_after_phase1_open");
   }
 
   ulonglong warmcopy_close_deadline_us = 0;
-  if (warmcopy_enabled) {
+  if (two_phase_enabled) {
     /*
       Entering WARMCOPY_CLOSING is intentionally a two-step tightening:
       the manager state is published first, so command gates immediately block
@@ -8706,9 +9244,11 @@ bool Preserve_trx_drain_service::execute(
       epoch admission and waits for already-admitted mirror work to drain.
     */
     draining.transition_to(Preserve_trx_manager_state::WARMCOPY_CLOSING);
-    warmcopy_close_deadline_us = preserve_trx_monotonic_deadline_after_ms(
-        preserve_trx_monotonic_us(), preserve_trx_warmcopy_close_timeout_ms);
-    warmcopy_participant->set_closing_deadline_us(warmcopy_close_deadline_us);
+    if (warmcopy_participant != nullptr) {
+      warmcopy_close_deadline_us = preserve_trx_monotonic_deadline_after_ms(
+          preserve_trx_monotonic_us(), preserve_trx_warmcopy_close_timeout_ms);
+      warmcopy_participant->set_closing_deadline_us(warmcopy_close_deadline_us);
+    }
     DEBUG_SYNC(thd, "preserve_trx_warmcopy_after_closing_state_before_targets");
   }
   const ulonglong target_wait_deadline_us =
@@ -8752,7 +9292,7 @@ bool Preserve_trx_drain_service::execute(
   };
 
   auto close_warmcopy_participants_for_shutdown = [&](const char *stage) {
-    if (!warmcopy_enabled) return false;
+    if (!two_phase_enabled) return false;
     if (drain_orchestrator.close_phase1_participants() !=
             Preserve_trx_drain_status::OK ||
         drain_orchestrator.ensure_phase1_ready() !=
@@ -8841,6 +9381,23 @@ bool Preserve_trx_drain_service::execute(
       abort_drain_participants("participant_phase2_prepare_rejected");
       return preserve_trx_reject_unsupported();
     }
+  }
+  if (lock_warmcopy_participant != nullptr) {
+    std::vector<uint64_t> lock_warmcopy_target_thread_ids;
+    lock_warmcopy_target_thread_ids.reserve(quiesced_target_thread_ids.size());
+    for (const my_thread_id target_thread_id : quiesced_target_thread_ids) {
+      lock_warmcopy_target_thread_ids.push_back(
+          static_cast<uint64_t>(target_thread_id));
+    }
+    if (!lock_warmcopy_participant->prepare_quiesced_targets(
+            lock_warmcopy_target_thread_ids)) {
+      Preserve_batch_clear_generation clear(generation);
+      Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
+      abort_drain_participants("lock_warmcopy_phase2_prepare_rejected");
+      return preserve_trx_reject_unsupported();
+    }
+  }
+  if (two_phase_enabled) {
     if (drain_orchestrator.close_phase1_participants() !=
         Preserve_trx_drain_status::OK) {
       Preserve_batch_clear_generation clear(generation);
@@ -8857,6 +9414,8 @@ bool Preserve_trx_drain_service::execute(
       abort_drain_participants("phase1_not_ready");
       return preserve_trx_reject_unsupported();
     }
+  }
+  if (warmcopy_participant != nullptr) {
     if (!warmcopy_participant->tail_budget_within_limits(
             quiesced_target_thread_ids, warmcopy_close_deadline_us)) {
       Preserve_batch_clear_generation clear(generation);
@@ -8864,7 +9423,9 @@ bool Preserve_trx_drain_service::execute(
       abort_drain_participants("participant_phase2_budget_rejected");
       return preserve_trx_reject_unsupported();
     }
-      draining.transition_to(Preserve_trx_manager_state::BATCH_DRAINING);
+  }
+  if (two_phase_enabled) {
+    draining.transition_to(Preserve_trx_manager_state::BATCH_DRAINING);
   }
 
   DEBUG_SYNC(thd, "preserve_trx_batch_after_targets_quiesced_before_attach");
@@ -8881,9 +9442,14 @@ bool Preserve_trx_drain_service::execute(
                                                          target_thread_id);
     Global_THD_manager::get_instance()->do_for_all_thd_copy(&target_pin);
 
+    const Preserve_trx_lock_warmcopy_artifact *lock_warmcopy_artifact =
+        lock_warmcopy_participant == nullptr
+            ? nullptr
+            : lock_warmcopy_participant->artifact_for_thread(target_thread_id);
     Preserve_batch_quiesced_idle_target batch(thd, options, timeout_seconds,
                                               generation, target_thread_id,
                                               warmcopy_provider,
+                                              lock_warmcopy_artifact,
                                               debug_fail_ha_prepare_low,
                                               debug_fail_temp_only_prepare);
     if (target_pin.found()) batch.run(target_pin.target().thd);
@@ -8965,7 +9531,7 @@ bool Preserve_trx_drain_service::execute(
     });
   }
 
-  if (warmcopy_enabled) {
+  if (binlog_warmcopy_enabled) {
     const ulonglong phase2_pause_us =
         preserve_trx_warmcopy_phase2_pause_us_status();
     const std::string message =

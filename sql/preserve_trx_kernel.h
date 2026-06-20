@@ -26,6 +26,8 @@
 
 #include "sql/preserve_trx.h"
 
+struct Preserve_trx_lock_warmcopy_artifact;
+
 struct Preserve_trx_kernel_request {
   THD *target_thd{nullptr};
   const Preserve_trx_options &options;
@@ -36,6 +38,7 @@ struct Preserve_trx_kernel_request {
   PreserveBinlogBlobProvider *binlog_blob_provider{nullptr};
   bool debug_fail_ha_prepare_low{false};
   bool debug_fail_temp_only_prepare{false};
+  const Preserve_trx_lock_warmcopy_artifact *lock_warmcopy_artifact{nullptr};
 };
 
 struct Preserve_trx_kernel_result {

@@ -1,0 +1,178 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_lock_warmcopy_import_conflict;
+--enable_warnings
+
+--let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
+--let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_fallback= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_fallback_to_live_export`
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+
+--disable_query_log
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: failed to restore durable transaction semantics");
+--enable_query_log
+
+CREATE TABLE t_lock_warmcopy_import_conflict(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_import_conflict VALUES(1,10),(2,20),(3,30);
+
+--connect(lock_wc_import_conflict_a,localhost,root,,test)
+--connection lock_wc_import_conflict_a
+START TRANSACTION;
+UPDATE t_lock_warmcopy_import_conflict SET v=21 WHERE id=2;
+SELECT * FROM t_lock_warmcopy_import_conflict WHERE id=1 FOR SHARE;
+
+--connect(lock_wc_import_conflict_b,localhost,root,,test)
+--connection lock_wc_import_conflict_b
+START TRANSACTION;
+UPDATE t_lock_warmcopy_import_conflict SET v=31 WHERE id=3;
+SELECT * FROM t_lock_warmcopy_import_conflict WHERE id=1 FOR SHARE;
+
+--connection default
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--perl
+use strict;
+use warnings;
+use Compress::Zlib qw(crc32);
+use Digest::SHA qw(hmac_sha256);
+use File::Spec;
+
+my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
+my $preserve_dir = File::Spec->catdir($datadir, 'preserve');
+opendir(my $dh, $preserve_dir) or die "cannot open preserve dir: $!";
+my @bins = sort grep { /\.bin$/ } readdir($dh);
+closedir($dh);
+die "expected two preserved snapshots, found " . scalar(@bins) unless @bins == 2;
+
+sub read_le16_at { return unpack('v', substr($_[0], $_[1], 2)); }
+sub read_le32_at { return unpack('V', substr($_[0], $_[1], 4)); }
+sub read_le64_at { return unpack('Q<', substr($_[0], $_[1], 8)); }
+sub write_le32_at { substr($_[0], $_[1], 4) = pack('V', $_[2]); }
+sub le32 { return pack('V', $_[0]); }
+
+my $LOCK_MODE_MASK = 0x0f;
+my $LOCK_S = 2;
+my $LOCK_X = 3;
+my $mutated = 0;
+for my $bin_name (@bins) {
+  my $bin_path = File::Spec->catfile($preserve_dir, $bin_name);
+  open(my $fh, '<:raw', $bin_path) or die "cannot read $bin_path: $!";
+  my $snapshot = do { local $/; <$fh> };
+  close($fh);
+
+  die "bad preserve magic in $bin_name" unless substr($snapshot, 0, 8) eq 'MSP_PRES';
+  my $header_len = read_le16_at($snapshot, 10);
+  my $payload_len = read_le64_at($snapshot, 48);
+  my $payload = substr($snapshot, $header_len, $payload_len);
+
+  my $pos = 0;
+  while ($pos < length($payload)) {
+    die "bad tlv boundary" if $pos + 6 > length($payload);
+    my $tag = read_le16_at($payload, $pos);
+    my $len = read_le32_at($payload, $pos + 2);
+    my $value_pos = $pos + 6;
+    die "bad tlv length" if $value_pos + $len > length($payload);
+    if ($tag == 0x30) {
+      my $value = substr($payload, $value_pos, $len);
+      my $off = 0;
+      my $count = read_le32_at($value, $off); $off += 4;
+      for (my $i = 0; $i < $count; ++$i) {
+        $off += 8 + 8 + 4 + 4;
+        my $type_mode_off = $off;
+        my $type_mode = read_le32_at($value, $type_mode_off);
+        $off += 4;
+        $off += 4 + 8 + 4;
+        my $heap_offsets_len = read_le32_at($value, $off); $off += 4;
+        my $record_images_len = read_le32_at($value, $off); $off += 4;
+        my $bitmap_len = read_le32_at($value, $off); $off += 4;
+        die "bad record-lock entry" if $off + $heap_offsets_len +
+                                      $record_images_len + $bitmap_len >
+                                      length($value);
+        if (($type_mode & $LOCK_MODE_MASK) == $LOCK_S) {
+          my $new_type_mode = ($type_mode & ~$LOCK_MODE_MASK) | $LOCK_X;
+          write_le32_at($value, $type_mode_off, $new_type_mode);
+          substr($payload, $value_pos, $len) = $value;
+          substr($snapshot, $header_len, $payload_len) = $payload;
+
+          open(my $kh, '<:raw', File::Spec->catfile($preserve_dir, '.key'))
+            or die "cannot read preserve key: $!";
+          my $key = do { local $/; <$kh> };
+          close($kh);
+          $key = substr($key, -32) if length($key) == 110;
+          die "bad key length" unless length($key) == 32;
+          substr($snapshot, 516, 32) = "\0" x 32;
+          substr($snapshot, 548, 4) = "\0" x 4;
+          substr($snapshot, 516, 32) = hmac_sha256($snapshot, $key);
+          substr($snapshot, 548, 4) = le32(crc32($snapshot));
+
+          open(my $out, '>:raw', $bin_path) or die "cannot rewrite $bin_path: $!";
+          print {$out} $snapshot;
+          close($out);
+          $mutated = 1;
+          last;
+        }
+        $off += $heap_offsets_len + $record_images_len + $bitmap_len;
+      }
+    }
+    last if $mutated;
+    $pos = $value_pos + $len;
+  }
+  last if $mutated;
+}
+die "did not find a shared record lock to mutate" unless $mutated;
+EOF
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $grep_pattern= Preserved transaction .* recovery forced rollback: failed to restore durable transaction semantics
+--let $wait_timeout= 30
+--source include/wait_for_pattern_in_file.inc
+
+SELECT COUNT(*) AS preserved_count_after_lock_warmcopy_import_conflict
+  FROM performance_schema.preserved_transactions;
+
+CREATE TEMPORARY TABLE t_lock_warmcopy_import_conflict_tokens AS
+  SELECT TOKEN FROM performance_schema.preserved_transactions ORDER BY TOKEN;
+
+--let $remaining_token= `SELECT TOKEN FROM t_lock_warmcopy_import_conflict_tokens LIMIT 1`
+--replace_result $remaining_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$remaining_token'
+COMMIT;
+
+SELECT COUNT(*) AS preserved_count_after_lock_warmcopy_import_conflict_resume
+  FROM performance_schema.preserved_transactions;
+SELECT COUNT(*) AS row_count,
+       SUM((id = 2 AND v = 21) OR (id = 3 AND v = 31)) AS committed_updates,
+       SUM((id = 2 AND v = 20) OR (id = 3 AND v = 30)) AS rolled_back_updates
+  FROM t_lock_warmcopy_import_conflict;
+
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+DROP TABLE t_lock_warmcopy_import_conflict;
+
+--disable_query_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback
+--eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
+--eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
+--eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--enable_query_log

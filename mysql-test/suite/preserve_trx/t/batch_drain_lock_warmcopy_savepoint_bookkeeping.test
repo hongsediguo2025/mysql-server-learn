@@ -1,0 +1,83 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_lock_warmcopy_savepoint_bookkeeping;
+--enable_warnings
+
+--let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
+--let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_fallback= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_fallback_to_live_export`
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+
+CREATE TABLE t_lock_warmcopy_savepoint_bookkeeping(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_savepoint_bookkeeping
+  VALUES(1,10),(2,20),(3,30),(4,40);
+
+--connect(lock_wc_savepoint_bookkeeping_app, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_lock_warmcopy_savepoint_bookkeeping SET v=11 WHERE id=1;
+SAVEPOINT base;
+UPDATE t_lock_warmcopy_savepoint_bookkeeping SET v=22 WHERE id=2;
+SAVEPOINT later;
+UPDATE t_lock_warmcopy_savepoint_bookkeeping SET v=33 WHERE id=3;
+ROLLBACK TO SAVEPOINT later;
+RELEASE SAVEPOINT later;
+UPDATE t_lock_warmcopy_savepoint_bookkeeping SET v=44 WHERE id=4;
+
+--connection default
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_text= lock warmcopy succeeds for savepoint bookkeeping
+--let $assert_select= PRESERVE_LOCK_WARMCOPY.*action=warmcopy_success.*reason=ok
+--let $assert_count_condition= >= 1
+--source include/assert_grep.inc
+
+SELECT COUNT(*) AS preserved_count_after_savepoint_bookkeeping_warmcopy
+  FROM performance_schema.preserved_transactions;
+SELECT SAVEPOINT_COUNT AS preserved_savepoint_count_after_warmcopy
+  FROM performance_schema.preserved_transactions;
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--connect(lock_wc_savepoint_bookkeeping_resume, localhost, root,,test)
+--connection lock_wc_savepoint_bookkeeping_resume
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+ROLLBACK TO SAVEPOINT base;
+RELEASE SAVEPOINT base;
+COMMIT;
+--disconnect lock_wc_savepoint_bookkeeping_resume
+
+--connection default
+SELECT COUNT(*) AS preserved_count_after_savepoint_bookkeeping_resume
+  FROM performance_schema.preserved_transactions;
+SELECT id, v FROM t_lock_warmcopy_savepoint_bookkeeping ORDER BY id;
+
+DROP TABLE t_lock_warmcopy_savepoint_bookkeeping;
+
+--disable_query_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback
+--eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
+--eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
+--eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--enable_query_log

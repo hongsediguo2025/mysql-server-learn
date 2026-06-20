@@ -35,6 +35,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "log0log.h"
 #include "lock0lock.h"
+#include "lock0warmcopy.h"
+#include "my_dbug.h"
 #include "read0read.h"
 #include "sess0sess.h"
 #include "sql/handler.h"
@@ -1046,6 +1048,87 @@ dberr_t trx_preserve_export_record_locks(THD *thd, std::string *payload,
   }
 
   return lock_preserve_export_record_locks(trx, payload, max_lock_count);
+}
+
+bool trx_preserve_sample_lock_warmcopy_fence(
+    trx_t *trx, lock_warmcopy_trx_lock_fence_t *fence) {
+  if (trx == nullptr || fence == nullptr) return false;
+
+  trx_mutex_enter(trx);
+  const bool sampled = lock_warmcopy_trx_lock_fence_sample(&trx->lock, fence);
+  trx_mutex_exit(trx);
+  return sampled;
+}
+
+bool trx_preserve_sample_lock_warmcopy_fence(
+    THD *thd, lock_warmcopy_trx_lock_fence_t *fence) {
+  if (thd == nullptr) return false;
+
+  return trx_preserve_sample_lock_warmcopy_fence(thd_to_trx(thd), fence);
+}
+
+void trx_preserve_lock_warmcopy_conversion_thaw(trx_t *trx) {
+  if (trx == nullptr) return;
+
+  trx_mutex_enter(trx);
+  lock_warmcopy_trx_conversion_thaw(&trx->lock);
+  trx_mutex_exit(trx);
+}
+
+bool trx_preserve_lock_warmcopy_conversion_freeze(
+    THD *thd, lock_warmcopy_trx_lock_fence_t *fence, trx_t **frozen_trx) {
+  if (frozen_trx != nullptr) *frozen_trx = nullptr;
+  if (thd == nullptr || fence == nullptr || frozen_trx == nullptr) {
+    return false;
+  }
+
+  trx_t *trx = thd_to_trx(thd);
+  if (trx == nullptr) return false;
+
+  trx_mutex_enter(trx);
+  const uint64_t wait_epoch = trx->lock.lock_warmcopy_freeze_generation + 1;
+  lock_warmcopy_trx_conversion_freeze(&trx->lock, wait_epoch);
+  const bool sampled = lock_warmcopy_trx_lock_fence_sample(&trx->lock, fence);
+  trx_mutex_exit(trx);
+
+  if (!sampled) {
+    trx_preserve_lock_warmcopy_conversion_thaw(trx);
+    return false;
+  }
+
+  *frozen_trx = trx;
+  return true;
+}
+
+bool trx_preserve_lock_warmcopy_note_conversion_attempt_after_freeze(
+    trx_t *trx) {
+  if (trx == nullptr) return false;
+
+  trx_mutex_enter(trx);
+  const bool attempted =
+      lock_warmcopy_trx_conversion_note_attempt(&trx->lock);
+  const bool handled =
+      lock_warmcopy_trx_conversion_note_handled(&trx->lock);
+  trx_mutex_exit(trx);
+
+  return attempted && handled;
+}
+
+bool trx_preserve_has_predicate_locks(THD *thd, bool *has_predicate_locks) {
+  if (thd == nullptr || has_predicate_locks == nullptr) return false;
+
+  DBUG_EXECUTE_IF("preserve_trx_lock_warmcopy_fail_predicate_lock_probe", {
+    return false;
+  });
+  DBUG_EXECUTE_IF("preserve_trx_lock_warmcopy_simulate_predicate_locks", {
+    *has_predicate_locks = true;
+    return true;
+  });
+
+  trx_t *trx = thd_to_trx(thd);
+  if (trx == nullptr) return false;
+
+  return lock_preserve_trx_has_predicate_locks(trx, has_predicate_locks);
 }
 
 const char *trx_preserve_last_record_lock_export_error() {

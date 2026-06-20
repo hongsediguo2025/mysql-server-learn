@@ -1307,6 +1307,70 @@ static Sys_var_ulonglong Sys_preserve_trx_warmcopy_pending_bytes_limit(
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, ULLONG_MAX), DEFAULT(67108864ULL),
     BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
+static Sys_var_bool Sys_preserve_trx_lock_warmcopy_enable(
+    "preserve_trx_lock_warmcopy_enable",
+    "Enable Preserve/Resume lock metadata warm-copy. This option is "
+    "independent from preserve_trx_warmcopy_enable, which controls binlog "
+    "cache warm-copy.",
+    GLOBAL_VAR(preserve_trx_lock_warmcopy_enable), CMD_LINE(OPT_ARG),
+    DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_bool Sys_preserve_trx_lock_warmcopy_fallback_to_live_export(
+    "preserve_trx_lock_warmcopy_fallback_to_live_export",
+    "Allow Preserve/Resume to discard an invalid lock warm-copy artifact and "
+    "fall back to the existing live lock export path for the whole target.",
+    GLOBAL_VAR(preserve_trx_lock_warmcopy_fallback_to_live_export),
+    CMD_LINE(OPT_ARG), DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_lock_warmcopy_max_memory_bytes(
+    "preserve_trx_lock_warmcopy_max_memory_bytes",
+    "Maximum heap bytes for Preserve/Resume lock warm-copy state in one drain "
+    "epoch before spill or fail-closed handling is required.",
+    GLOBAL_VAR(preserve_trx_lock_warmcopy_max_memory_bytes),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, ULLONG_MAX), DEFAULT(268435456ULL),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_lock_warmcopy_max_journal_bytes(
+    "preserve_trx_lock_warmcopy_max_journal_bytes",
+    "Maximum journal bytes for Preserve/Resume lock warm-copy state in one "
+    "drain epoch before spill or fail-closed handling is required.",
+    GLOBAL_VAR(preserve_trx_lock_warmcopy_max_journal_bytes),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, ULLONG_MAX), DEFAULT(1073741824ULL),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_lock_warmcopy_max_dirty_shards(
+    "preserve_trx_lock_warmcopy_max_dirty_shards",
+    "Maximum dirty record shards that Preserve/Resume lock warm-copy may "
+    "revalidate in phase 2 before the target artifact becomes invalid.",
+    GLOBAL_VAR(preserve_trx_lock_warmcopy_max_dirty_shards),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT_MAX32), DEFAULT(100000),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_lock_warmcopy_max_mdl_descriptors(
+    "preserve_trx_lock_warmcopy_max_mdl_descriptors",
+    "Maximum transaction-duration MDL descriptors that Preserve/Resume lock "
+    "warm-copy may retain for one target before the artifact becomes invalid.",
+    GLOBAL_VAR(preserve_trx_lock_warmcopy_max_mdl_descriptors),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT_MAX32), DEFAULT(100000),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_lock_warmcopy_seal_threads(
+    "preserve_trx_lock_warmcopy_seal_threads",
+    "Number of lock warm-copy phase-2 seal worker threads. Zero lets the "
+    "implementation choose bounded automatic parallelism.",
+    GLOBAL_VAR(preserve_trx_lock_warmcopy_seal_threads),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 1024), DEFAULT(0), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_lock_warmcopy_conversion_wait_timeout_ms(
+    "preserve_trx_lock_warmcopy_conversion_wait_timeout_ms",
+    "Maximum milliseconds another session may wait when lock warm-copy has "
+    "temporarily frozen implicit-to-explicit record lock conversion for a "
+    "target transaction.",
+    GLOBAL_VAR(preserve_trx_lock_warmcopy_conversion_wait_timeout_ms),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT_MAX32), DEFAULT(30000),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
 static bool fix_binlog_cache_size(sys_var *, THD *thd, enum_var_type) {
   check_binlog_cache_size(thd);
   return false;

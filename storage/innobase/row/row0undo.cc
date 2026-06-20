@@ -311,7 +311,7 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
   return (err);
 }
 
-void row_convert_impl_to_expl_if_needed(btr_cur_t *cursor, undo_node_t *node) {
+dberr_t row_convert_impl_to_expl_if_needed(btr_cur_t *cursor, undo_node_t *node) {
   ulint *offsets = nullptr;
   /* In case of partial rollback implicit lock on the
   record is released in the middle of transaction, which
@@ -325,7 +325,7 @@ void row_convert_impl_to_expl_if_needed(btr_cur_t *cursor, undo_node_t *node) {
 
   if (!node->partial || (node->trx == nullptr) ||
       node->trx->isolation_level < trx_t::REPEATABLE_READ) {
-    return;
+    return DB_SUCCESS;
   }
 
   ut_ad(node->trx->in_rollback);
@@ -336,9 +336,11 @@ void row_convert_impl_to_expl_if_needed(btr_cur_t *cursor, undo_node_t *node) {
 
   if (heap_no != PAGE_HEAP_NO_SUPREMUM && !dict_index_is_spatial(index) &&
       !index->table->is_temporary() && !index->table->is_intrinsic()) {
-    lock_rec_convert_active_impl_to_expl(block, rec, index, offsets, node->trx,
-                                         heap_no);
+    return lock_rec_convert_active_impl_to_expl(block, rec, index, offsets,
+                                                node->trx, heap_no);
   }
+
+  return DB_SUCCESS;
 }
 
 /** Undoes a row operation in a table. This is a high-level function used

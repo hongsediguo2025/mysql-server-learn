@@ -1,0 +1,125 @@
+--echo # Lint-only source-shape guard. Runtime bitmap behavior is covered by
+--echo # batch_drain_lock_warmcopy_record_bitmap and low-level GUnit tests; this
+--echo # file keeps the mandatory mutation-generation/fingerprint contract in
+--echo # the MTR suite without adding invasive core hooks.
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_source {
+  my (@parts) = @_;
+  my $path = File::Spec->catfile($source_root, @parts);
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $src = do { local $/; <$fh> };
+  close($fh);
+  return $src;
+}
+
+sub extract_function {
+  my ($src, $signature_re, $label) = @_;
+  $src =~ /$signature_re/s or die "could not find $label signature\n";
+  my $sig_pos = $-[0];
+  my $brace_pos = index($src, '{', $sig_pos);
+  die "could not find $label body start\n" if $brace_pos < 0;
+
+  my $depth = 0;
+  for (my $i = $brace_pos; $i < length($src); ++$i) {
+    my $ch = substr($src, $i, 1);
+    ++$depth if $ch eq '{';
+    --$depth if $ch eq '}';
+    if ($depth == 0 && $ch eq '}') {
+      return substr($src, $sig_pos, $i - $sig_pos + 1);
+    }
+  }
+  die "could not parse $label body\n";
+}
+
+my $lock_warmcopy = read_source('storage', 'innobase', 'lock',
+                                'lock0warmcopy.cc');
+my $lock_warmcopy_header = read_source('storage', 'innobase', 'include',
+                                       'lock0warmcopy.h');
+my $gunit = read_source('unittest', 'gunit', 'innodb',
+                        'lock0warmcopy-t.cc');
+
+die "record shard state must own mutation_generation\n"
+  unless $lock_warmcopy =~ /uint64_t\s+mutation_generation\s*\{\s*0\s*\}/s;
+
+my $set_locked = extract_function(
+  $lock_warmcopy,
+  qr/bool\s+record_bitmap_set_locked\s*\(/,
+  'record_bitmap_set_locked');
+die "bitmap set must allocate journal sequence before mutating the shard\n"
+  unless $set_locked =~ /next_record_journal_sequence_for_target_locked[\s\S]*shard\.normalized_bitmap/s;
+die "bitmap set must update mutation_generation in the same helper as bitmap/image state\n"
+  unless $set_locked =~ /shard\.normalized_bitmap[\s\S]*refresh_missing_record_image_flag[\s\S]*\+\+shard\.mutation_generation[\s\S]*shard\.journal_cursor\s*=\s*journal_cursor/s;
+die "bitmap set must normalize the bitmap before returning\n"
+  unless $set_locked =~ /normalize_record_bitmap\s*\(\s*&shard\.normalized_bitmap,\s*shard\.key\.n_bits\s*\)/s;
+
+my $reset_locked = extract_function(
+  $lock_warmcopy,
+  qr/bool\s+record_bitmap_reset_locked\s*\(/,
+  'record_bitmap_reset_locked');
+die "bitmap reset must allocate journal sequence before mutating the shard\n"
+  unless $reset_locked =~ /next_record_journal_sequence_for_target_locked[\s\S]*shard\.normalized_bitmap/s;
+die "bitmap reset must update mutation_generation in the same helper as bitmap/image state\n"
+  unless $reset_locked =~ /shard\.normalized_bitmap[\s\S]*refresh_missing_record_image_flag[\s\S]*\+\+shard\.mutation_generation[\s\S]*shard\.journal_cursor\s*=\s*journal_cursor/s;
+die "bitmap reset must normalize the bitmap before returning\n"
+  unless $reset_locked =~ /normalize_record_bitmap\s*\(\s*&shard\.normalized_bitmap,\s*shard\.key\.n_bits\s*\)/s;
+
+my $journal_apply = extract_function(
+  $lock_warmcopy,
+  qr/bool\s+apply_record_journal_delta_locked\s*\(/,
+  'apply_record_journal_delta_locked');
+for my $kind (qw(UPSERT PATCH DELETE)) {
+  die "journal apply must handle $kind deltas\n"
+    unless $journal_apply =~ /record_journal_delta_kind_t::\Q$kind\E/s;
+}
+die "journal apply must invalidate seq gaps instead of applying out-of-order deltas\n"
+  unless $journal_apply =~ /journal_sequence\s*>\s*expected_sequence[\s\S]*mark_record_target_invalid_locked[\s\S]*"journal_seq_gap"/s;
+die "journal apply must not mutate old duplicate deltas\n"
+  unless $journal_apply =~ /journal_sequence\s*<\s*expected_sequence\)\s*return\s+false/s;
+die "journal apply must bump generation only after a delta has been accepted\n"
+  unless $journal_apply =~ /switch\s*\(\s*delta_kind\s*\)[\s\S]*\+\+shard\.mutation_generation[\s\S]*shard\.last_applied_journal_seq\s*=\s*journal_sequence/s;
+
+my $canonical = extract_function(
+  $lock_warmcopy,
+  qr/std::string\s+record_shard_canonical_bytes_locked\s*\(/,
+  'record_shard_canonical_bytes_locked');
+die "canonical shard bytes must include mutation_generation\n"
+  unless $canonical =~ /append_u64_le\s*\(\s*&out,\s*snapshot\.mutation_generation\s*\)/s;
+
+die "unit-test journal helpers must be declared in lock0warmcopy.h\n"
+  unless $lock_warmcopy_header =~ /lock_warmcopy_record_journal_upsert_for_target_for_unit_test\s*\(/s &&
+         $lock_warmcopy_header =~ /lock_warmcopy_record_journal_patch_for_target_for_unit_test\s*\(/s &&
+         $lock_warmcopy_header =~ /lock_warmcopy_record_journal_delete_for_target_for_unit_test\s*\(/s;
+die "unit-test journal helpers must delegate to apply_record_journal_delta_locked\n"
+  unless $lock_warmcopy =~ /lock_warmcopy_record_journal_upsert_for_target_for_unit_test[\s\S]*apply_record_journal_delta_locked/s &&
+         $lock_warmcopy =~ /lock_warmcopy_record_journal_patch_for_target_for_unit_test[\s\S]*apply_record_journal_delta_locked/s &&
+         $lock_warmcopy =~ /lock_warmcopy_record_journal_delete_for_target_for_unit_test[\s\S]*apply_record_journal_delta_locked/s;
+
+die "GUnit must prove set/reset changes generation even when final bitmap is identical\n"
+  unless $gunit =~ /SetResetMutationsUpdateGenerationAndBitmap/s &&
+         $gunit =~ /EXPECT_EQ\s*\(\s*2ULL,\s*snapshot\.mutation_generation\s*\)/s &&
+         $gunit =~ /EXPECT_EQ\s*\(\s*4ULL,\s*snapshot\.mutation_generation\s*\)/s &&
+         $gunit =~ /generation must change even when the final bitmap is identical/s;
+die "GUnit must cover accepted upsert/patch/delete/resurrect generation steps\n"
+  unless $gunit =~ /UpsertPatchDeleteAndResurrectUpdatesObjectState/s &&
+         $gunit =~ /EXPECT_EQ\s*\(\s*1ULL,\s*snapshot\.mutation_generation\s*\)/s &&
+         $gunit =~ /EXPECT_EQ\s*\(\s*2ULL,\s*snapshot\.mutation_generation\s*\)/s &&
+         $gunit =~ /EXPECT_EQ\s*\(\s*3ULL,\s*snapshot\.mutation_generation\s*\)/s &&
+         $gunit =~ /EXPECT_EQ\s*\(\s*4ULL,\s*snapshot\.mutation_generation\s*\)/s;
+die "GUnit must prove stale patch/delete do not advance generation or cursor\n"
+  unless $gunit =~ /RejectsStalePatchAndDuplicateDeleteWithoutMutation/s &&
+         $gunit =~ /EXPECT_EQ\s*\(\s*before_stale\.mutation_generation,\s*after_stale\.mutation_generation\s*\)/s &&
+         $gunit =~ /EXPECT_EQ\s*\(\s*before_stale\.journal_cursor,\s*after_stale\.journal_cursor\s*\)/s;
+
+EOF
+
+SELECT 'ok' AS batch_drain_lock_warmcopy_bitmap_atomicity;

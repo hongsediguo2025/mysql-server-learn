@@ -19,6 +19,7 @@ import datetime
 import enum
 import hashlib
 import logging
+import math
 from pathlib import Path
 import queue
 import re
@@ -61,6 +62,7 @@ class OperationKind(enum.Enum):
     LOCKING_SELECT = "locking_select"
     JSON_UPDATE = "json_update"
     TYPED_UPDATE = "typed_update"
+    BULK_LOCKSET_UPDATE = "bulk_lockset_update"
     TEMP_INSERT = "temp_insert"
     TEMP_UPDATE = "temp_update"
     TEMP_SELECT = "temp_select"
@@ -73,6 +75,7 @@ class Operation:
     _sql: str
     validator: Optional[Callable[[Sequence[Tuple]], None]] = None
     payload_bytes: int = 0
+    discard_result: bool = False
 
     @property
     def sql(self) -> str:
@@ -144,16 +147,26 @@ class HarnessConfig:
     table_count: int = 30
     statements_per_tx: int = 100
     seed_rows_per_table_per_session: int = 12
+    seed_insert_batch_size: int = 1000
     cycles: int = 3
     drain_interval_s: float = 30.0
     duration_s: float = 0.0
     max_transactions_per_worker: int = 0
     min_statements_before_drain_pause: int = 0
+    lockset_batch_size: int = 0
+    lockset_session_table_shards: bool = False
+    lockset_noop_update: bool = False
+    lockset_touch_one_row: bool = False
+    lockset_select_for_update: bool = False
+    lockset_minimal_table: bool = False
+    compact_expected_state_row_threshold: int = 1_000_000
     preserve_timeout_s: int = 86400
+    preserve_max_binlog_cache_bytes: int = 1_073_741_824
     preserve_max_lock_count: int = 1_000_000
     preserve_max_scan_pages: int = 1_000_000
     preserve_materialize_timeout_ms: int = 60_000
     preserve_max_modified_tables: int = 512
+    preserve_lock_warmcopy_max_journal_bytes: int = 1_073_741_824
     inflight_drain_probe: bool = False
     inflight_probe_min_waits: int = 1
     inflight_probe_timeout_s: int = 5
@@ -166,7 +179,9 @@ class HarnessConfig:
     strict_binlog_transaction_order: Optional[bool] = None
     no_preserve_baseline: bool = False
     server_error_log: Optional[str] = None
+    server_pid_file: Optional[str] = None
     warmcopy_required: bool = False
+    lock_warmcopy_mode: str = "default"
     two_phase: bool = False
     max_phase2_pause_ms: int = 5000
     warmcopy_disabled_baseline_slope_ms_per_mb: Optional[float] = None
@@ -191,12 +206,14 @@ class HarnessConfig:
             raise ValueError(f"unknown scenario: {self.scenario}")
         if self.sessions <= 0:
             raise ValueError("sessions must be positive")
-        if self.table_count != 30:
-            raise ValueError("table_count must be exactly 30 for this E2E")
-        if self.statements_per_tx != 100:
-            raise ValueError("statements_per_tx must be exactly 100")
+        if self.table_count <= 0:
+            raise ValueError("table_count must be positive")
+        if self.statements_per_tx <= 0:
+            raise ValueError("statements_per_tx must be positive")
         if self.seed_rows_per_table_per_session < 8:
             raise ValueError("seed_rows_per_table_per_session must be >= 8")
+        if self.seed_insert_batch_size <= 0:
+            raise ValueError("seed_insert_batch_size must be positive")
         if self.cycles < 0:
             raise ValueError("cycles must be non-negative")
         if self.drain_interval_s < 0:
@@ -218,10 +235,55 @@ class HarnessConfig:
             raise ValueError(
                 "min_statements_before_drain_pause cannot exceed statements_per_tx"
             )
+        if self.lockset_batch_size < 0:
+            raise ValueError("lockset_batch_size must be non-negative")
+        if self.lockset_session_table_shards and self.lockset_batch_size <= 0:
+            raise ValueError(
+                "lockset_session_table_shards requires lockset_batch_size"
+            )
+        if self.lockset_noop_update and self.lockset_batch_size <= 0:
+            raise ValueError("lockset_noop_update requires lockset_batch_size")
+        if self.lockset_touch_one_row and not self.lockset_noop_update:
+            raise ValueError("lockset_touch_one_row requires lockset_noop_update")
+        if self.lockset_select_for_update and self.lockset_batch_size <= 0:
+            raise ValueError("lockset_select_for_update requires lockset_batch_size")
+        if self.lockset_noop_update and self.lockset_select_for_update:
+            raise ValueError(
+                "lockset_noop_update cannot be combined with lockset_select_for_update"
+            )
+        if self.lockset_minimal_table and self.lockset_batch_size <= 0:
+            raise ValueError("lockset_minimal_table requires lockset_batch_size")
+        if self.lockset_minimal_table and not self.lockset_noop_update:
+            raise ValueError("lockset_minimal_table requires lockset_noop_update")
+        if self.lockset_minimal_table and self.lockset_select_for_update:
+            raise ValueError(
+                "lockset_minimal_table cannot be combined with lockset_select_for_update"
+            )
+        if self.compact_expected_state_row_threshold < 0:
+            raise ValueError("compact_expected_state_row_threshold must be non-negative")
+        if self.lockset_batch_size > 0:
+            operation_count = math.ceil(self.statements_per_tx / self.lockset_batch_size)
+            if self.min_statements_before_drain_pause > operation_count:
+                raise ValueError(
+                    "min_statements_before_drain_pause cannot exceed lockset operation count"
+                )
+            if self.temp_table_workload:
+                raise ValueError("lockset_batch_size cannot be combined with temp_table_workload")
+            if self.table_count >= self.sessions or self.lockset_session_table_shards:
+                required_seed_rows = self.statements_per_tx
+            else:
+                batches_per_table = math.ceil(operation_count / self.table_count)
+                required_seed_rows = batches_per_table * self.lockset_batch_size
+            if self.seed_rows_per_table_per_session < required_seed_rows:
+                raise ValueError(
+                    "seed_rows_per_table_per_session must cover bulk lockset ranges"
+                )
         if self.shutdown_quiet_period_s < 0:
             raise ValueError("shutdown_quiet_period_s must be non-negative")
         if self.preserve_timeout_s <= 0:
             raise ValueError("preserve_timeout_s must be positive")
+        if self.preserve_max_binlog_cache_bytes <= 0:
+            raise ValueError("preserve_max_binlog_cache_bytes must be positive")
         if self.preserve_max_lock_count <= 0:
             raise ValueError("preserve_max_lock_count must be positive")
         if self.preserve_max_scan_pages <= 0:
@@ -230,6 +292,10 @@ class HarnessConfig:
             raise ValueError("preserve_materialize_timeout_ms must be positive")
         if self.preserve_max_modified_tables <= 0:
             raise ValueError("preserve_max_modified_tables must be positive")
+        if self.preserve_lock_warmcopy_max_journal_bytes <= 0:
+            raise ValueError(
+                "preserve_lock_warmcopy_max_journal_bytes must be positive"
+            )
         if self.inflight_drain_probe and self.sessions < 2:
             raise ValueError("inflight_drain_probe requires at least 2 sessions")
         if self.inflight_probe_min_waits <= 0:
@@ -246,6 +312,8 @@ class HarnessConfig:
             raise ValueError("large_binlog_cache_sessions cannot exceed sessions")
         if any(bucket <= 0 for bucket in self.large_binlog_cache_buckets_mb):
             raise ValueError("large_binlog_cache_buckets_mb values must be positive")
+        if self.lock_warmcopy_mode not in ("default", "on", "off"):
+            raise ValueError("lock_warmcopy_mode must be default, on, or off")
         if self.max_phase2_pause_ms <= 0:
             raise ValueError("max_phase2_pause_ms must be positive")
         if (
@@ -322,6 +390,15 @@ class WorkloadPlan:
         return [f"rtx_e2e_t{i:02d}" for i in range(self.config.table_count)]
 
     def create_table_sql(self, table: str) -> str:
+        if self.config.lockset_minimal_table:
+            return f"""
+CREATE TABLE `{table}` (
+  sid INT NOT NULL,
+  k INT NOT NULL,
+  counter BIGINT NOT NULL DEFAULT 0,
+  PRIMARY KEY(sid, k)
+) ENGINE=InnoDB
+""".strip()
         return f"""
 CREATE TABLE `{table}` (
   sid INT NOT NULL,
@@ -363,8 +440,11 @@ CREATE TEMPORARY TABLE `{table}` (
     def seed_rows(self) -> Iterable[Tuple[str, Tuple]]:
         rows = self.config.seed_rows_per_table_per_session
         for table in self.table_names():
-            for sid in range(1, self.config.sessions + 1):
+            for sid in self.seed_sids_for_table(table):
                 for k in range(rows):
+                    if self.config.lockset_minimal_table:
+                        yield table, (sid, k, 0)
+                        continue
                     yield table, (
                         sid,
                         k,
@@ -541,7 +621,121 @@ CREATE TEMPORARY TABLE `{table}` (
             return None
         return "{payload_expr}"
 
+    def bulk_lockset_operation_count(self) -> int:
+        if self.config.lockset_batch_size <= 0:
+            return self.config.statements_per_tx
+        return math.ceil(self.config.statements_per_tx / self.config.lockset_batch_size)
+
+    def expected_seed_row_count(self) -> int:
+        if self.bulk_lockset_uses_session_sharded_tables():
+            return (
+                self.config.sessions
+                * self.config.seed_rows_per_table_per_session
+            )
+        return (
+            self.config.table_count
+            * self.config.sessions
+            * self.config.seed_rows_per_table_per_session
+        )
+
+    def uses_compact_bulk_expected_state(self) -> bool:
+        return (
+            self.config.lockset_batch_size > 0
+            and self.expected_seed_row_count()
+            > self.config.compact_expected_state_row_threshold
+        )
+
+    def bulk_lockset_uses_session_isolated_tables(self) -> bool:
+        return (
+            self.config.lockset_batch_size > 0
+            and self.config.table_count >= self.config.sessions
+        )
+
+    def bulk_lockset_uses_session_sharded_tables(self) -> bool:
+        return (
+            self.config.lockset_batch_size > 0
+            and self.config.lockset_session_table_shards
+        )
+
+    def seed_sids_for_table(self, table: str) -> List[int]:
+        tables = self.table_names()
+        if table not in tables:
+            raise ValueError(f"unknown table: {table}")
+        if not self.bulk_lockset_uses_session_sharded_tables():
+            return list(range(1, self.config.sessions + 1))
+        table_index = tables.index(table)
+        table_count = len(tables)
+        return [
+            sid
+            for sid in range(1, self.config.sessions + 1)
+            if (sid - 1) % table_count == table_index
+        ]
+
+    def bulk_lockset_operation_range(
+        self, sid: int, stmt_no: int
+    ) -> Tuple[str, int, int]:
+        if self.config.lockset_batch_size <= 0:
+            raise AssertionError("bulk lockset range requested without lockset_batch_size")
+        tables = self.table_names()
+        if (
+            self.bulk_lockset_uses_session_isolated_tables()
+            or self.bulk_lockset_uses_session_sharded_tables()
+        ):
+            table_index = (sid - 1) % len(tables)
+            table_batch_index = stmt_no
+        else:
+            table_index = stmt_no % len(tables)
+            table_batch_index = stmt_no // len(tables)
+        low = table_batch_index * self.config.lockset_batch_size
+        remaining = self.config.statements_per_tx - stmt_no * self.config.lockset_batch_size
+        batch_rows = max(0, min(self.config.lockset_batch_size, remaining))
+        return tables[table_index], low, low + batch_rows
+
+    def _bulk_lockset_operations(self, sid: int, tx_id: int) -> List[Operation]:
+        ops: List[Operation] = []
+        for stmt_no in range(self.bulk_lockset_operation_count()):
+            table, low, high = self.bulk_lockset_operation_range(sid, stmt_no)
+            value = sid * 10_000_000 + tx_id * 10_000 + stmt_no
+            note_prefix = f"bulk-s{sid:03d}-t{tx_id:05d}-n"
+            note_suffix = f"-stmt{stmt_no:05d}"
+            if self.config.lockset_select_for_update:
+                sql = (
+                    f"SELECT k FROM `{table}` "
+                    f"WHERE sid = {sid} AND k >= {low} AND k < {high} "
+                    f"FOR UPDATE"
+                )
+            elif self.config.lockset_noop_update:
+                assignment = "counter = counter"
+                if self.config.lockset_touch_one_row:
+                    assignment = f"counter = IF(k = {low}, {value}, counter)"
+                sql = (
+                    f"UPDATE `{table}` SET {assignment} "
+                    f"WHERE sid = {sid} AND k >= {low} AND k < {high}"
+                )
+            else:
+                sql = (
+                    f"UPDATE `{table}` SET v = {value}, counter = {stmt_no}, "
+                    f"amount = {stmt_no}.25, "
+                    f"d = DATE '2026-05-21' + INTERVAL {stmt_no % 20} DAY, "
+                    f"note = CONCAT('{note_prefix}', LPAD(k, 5, '0'), "
+                    f"'{note_suffix}'), "
+                    f"js = JSON_OBJECT('sid',{sid},'tx',{tx_id},"
+                    f"'stmt',{stmt_no},'k',k,'op','bulk_lockset'), deleted = 0 "
+                    f"WHERE sid = {sid} AND k >= {low} AND k < {high}"
+                )
+            ops.append(
+                Operation(
+                    OperationKind.BULK_LOCKSET_UPDATE,
+                    table,
+                    sql,
+                    discard_result=self.config.lockset_select_for_update,
+                )
+            )
+        return ops
+
     def transaction_operations(self, sid: int, tx_id: int) -> List[Operation]:
+        if self.config.lockset_batch_size > 0:
+            return self._bulk_lockset_operations(sid, tx_id)
         ops: List[Operation] = []
         tables = self.table_names()
         payload_bytes = self.large_payload_bytes_per_statement(sid, tx_id)
@@ -897,16 +1091,19 @@ class ExpectedDatabaseState:
     def __init__(self, plan: WorkloadPlan):
         self._plan = plan
         self._lock = threading.Lock()
-        self._rows: Dict[str, Dict[Tuple[int, int], RowState]] = {
-            table: {} for table in self._plan.table_names()
-        }
-        self._seed()
+        self._compact_bulk = self._plan.uses_compact_bulk_expected_state()
+        self._compact_committed_tx_by_sid: Dict[int, int] = {}
+        self._rows: Dict[str, Dict[Tuple[int, int], RowState]] = (
+            {} if self._compact_bulk else {table: {} for table in self._plan.table_names()}
+        )
+        if not self._compact_bulk:
+            self._seed()
 
     def _seed(self) -> None:
         rows = self._plan.config.seed_rows_per_table_per_session
         for table in self._plan.table_names():
             table_rows = self._rows[table]
-            for sid in range(1, self._plan.config.sessions + 1):
+            for sid in self._plan.seed_sids_for_table(table):
                 for k in range(rows):
                     table_rows[(sid, k)] = RowState(
                         sid=sid,
@@ -920,13 +1117,31 @@ class ExpectedDatabaseState:
                         deleted=0,
                     )
 
+    def uses_compact_bulk_model(self) -> bool:
+        return self._compact_bulk
+
     def record_committed_transaction(self, sid: int, tx_id: int) -> None:
         with self._lock:
-            for stmt_no in range(self._plan.config.statements_per_tx):
+            if self._compact_bulk:
+                self._compact_committed_tx_by_sid[sid] = tx_id
+                return
+            statement_count = (
+                self._plan.bulk_lockset_operation_count()
+                if self._plan.config.lockset_batch_size > 0
+                else self._plan.config.statements_per_tx
+            )
+            for stmt_no in range(statement_count):
                 self._apply_statement(sid, tx_id, stmt_no)
 
     def table_fingerprints(self) -> Dict[str, RowFingerprint]:
         with self._lock:
+            if self._compact_bulk:
+                return self._compact_table_fingerprints()
+            if self._plan.config.lockset_minimal_table:
+                return {
+                    table: self._minimal_fingerprint_rows(rows.values())
+                    for table, rows in self._rows.items()
+                }
             return {
                 table: self._fingerprint_rows(rows.values())
                 for table, rows in self._rows.items()
@@ -954,19 +1169,314 @@ class ExpectedDatabaseState:
             raise AssertionError(
                 f"fingerprint table set mismatch: missing={missing[:10]} extra={extra[:10]}"
             )
+        comparable_expected = (
+            self.compact_comparable_fingerprints(expected)
+            if self._compact_bulk
+            else expected
+        )
+        comparable_actual = (
+            self.compact_comparable_fingerprints(actual)
+            if self._compact_bulk
+            else actual
+        )
         mismatches = [
-            table for table in sorted(expected)
-            if expected[table] != actual[table]
+            table for table in sorted(comparable_expected)
+            if comparable_expected[table] != comparable_actual[table]
         ]
         if mismatches:
             table = mismatches[0]
             raise AssertionError(
-                f"fingerprint mismatch for {table}: expected={expected[table]} "
-                f"actual={actual[table]}"
+                f"fingerprint mismatch for {table}: "
+                f"expected={comparable_expected[table]} "
+                f"actual={comparable_actual[table]}"
             )
 
     def _apply_statement(self, sid: int, tx_id: int, stmt_no: int) -> None:
         _apply_expected_statement(self._plan, self._rows, sid, tx_id, stmt_no)
+
+    def compact_comparable_fingerprints(
+        self, fingerprints: Dict[str, RowFingerprint]
+    ) -> Dict[str, RowFingerprint]:
+        return {
+            table: dataclasses.replace(
+                fingerprint,
+                sum_note_crc=0,
+                sum_json_op_crc=0,
+                row_digest="",
+            )
+            for table, fingerprint in fingerprints.items()
+        }
+
+    def compact_bulk_spot_expectations(
+        self,
+    ) -> Dict[str, Dict[Tuple[int, int], RowState]]:
+        if not self._compact_bulk:
+            return {}
+        with self._lock:
+            committed = dict(self._compact_committed_tx_by_sid)
+        spots: Dict[str, Dict[Tuple[int, int], RowState]] = {}
+        seed_keys = self._compact_sample_values(
+            list(range(self._plan.config.seed_rows_per_table_per_session)),
+            limit=3,
+        )
+        for table in self._plan.table_names():
+            sampled_sids = self._compact_sample_values(
+                self._plan.seed_sids_for_table(table),
+                limit=3,
+            )
+            table_spots: Dict[Tuple[int, int], RowState] = {}
+            for sid in sampled_sids:
+                tx_id = committed.get(sid)
+                touched_ops: List[Tuple[int, int, int]] = []
+                if tx_id is not None:
+                    for stmt_no in range(self._plan.bulk_lockset_operation_count()):
+                        op_table, low, high = self._plan.bulk_lockset_operation_range(
+                            sid, stmt_no
+                        )
+                        if op_table == table and high > low:
+                            touched_ops.append((stmt_no, low, high))
+                for stmt_no, low, high in self._compact_sample_values(touched_ops, limit=2):
+                    for key in self._compact_sample_values(list(range(low, high)), limit=3):
+                        if self._plan.config.lockset_select_for_update:
+                            table_spots[(sid, key)] = self._compact_seed_row(sid, key)
+                        elif (
+                            self._plan.config.lockset_noop_update
+                            and not self._plan.config.lockset_touch_one_row
+                        ):
+                            table_spots[(sid, key)] = self._compact_seed_row(sid, key)
+                        else:
+                            table_spots[(sid, key)] = (
+                                self._compact_touch_one_row(sid, tx_id, stmt_no, key)
+                                if self._plan.config.lockset_touch_one_row
+                                else self._compact_bulk_row(sid, tx_id, stmt_no, key)
+                            )
+                for key in seed_keys:
+                    table_spots.setdefault(
+                        (sid, key),
+                        self._compact_expected_row(table, sid, key, committed),
+                    )
+            if table_spots:
+                spots[table] = table_spots
+        return spots
+
+    def _compact_sample_values(self, values: List, limit: int) -> List:
+        if not values or limit <= 0:
+            return []
+        if len(values) <= limit:
+            return list(values)
+        indexes = [0, len(values) // 2, len(values) - 1]
+        sampled = []
+        for index in indexes:
+            value = values[index]
+            if value not in sampled:
+                sampled.append(value)
+            if len(sampled) >= limit:
+                break
+        return sampled
+
+    def _compact_expected_row(
+        self,
+        table: str,
+        sid: int,
+        key: int,
+        committed: Dict[int, int],
+    ) -> RowState:
+        tx_id = committed.get(sid)
+        if tx_id is not None:
+            for stmt_no in range(self._plan.bulk_lockset_operation_count()):
+                op_table, low, high = self._plan.bulk_lockset_operation_range(
+                    sid, stmt_no
+                )
+                if op_table == table and low <= key < high:
+                    if self._plan.config.lockset_select_for_update:
+                        return self._compact_seed_row(sid, key)
+                    if (
+                        self._plan.config.lockset_noop_update
+                        and not self._plan.config.lockset_touch_one_row
+                    ):
+                        return self._compact_seed_row(sid, key)
+                    if self._plan.config.lockset_touch_one_row:
+                        return self._compact_touch_one_row(sid, tx_id, stmt_no, key)
+                    return self._compact_bulk_row(sid, tx_id, stmt_no, key)
+        return self._compact_seed_row(sid, key)
+
+    def _compact_seed_row(self, sid: int, key: int) -> RowState:
+        return RowState(
+            sid=sid,
+            k=key,
+            v=sid * 1000 + key,
+            counter=0,
+            amount_cents=1000,
+            d="2026-05-21",
+            note=f"seed-{sid}-{key}",
+            js={"seed_sid": sid, "seed_k": key},
+            deleted=0,
+        )
+
+    def _compact_bulk_row(
+        self,
+        sid: int,
+        tx_id: int,
+        stmt_no: int,
+        key: int,
+    ) -> RowState:
+        value = sid * 10_000_000 + tx_id * 10_000 + stmt_no
+        return RowState(
+            sid=sid,
+            k=key,
+            v=value,
+            counter=stmt_no,
+            amount_cents=stmt_no * 100 + 25,
+            d=(
+                datetime.date(2026, 5, 21)
+                + datetime.timedelta(days=stmt_no % 20)
+            ).isoformat(),
+            note=f"bulk-s{sid:03d}-t{tx_id:05d}-n{key:05d}-stmt{stmt_no:05d}",
+            js={
+                "sid": sid,
+                "tx": tx_id,
+                "stmt": stmt_no,
+                "k": key,
+                "op": "bulk_lockset",
+            },
+            deleted=0,
+        )
+
+    def _compact_touch_one_row(
+        self,
+        sid: int,
+        tx_id: int,
+        stmt_no: int,
+        key: int,
+    ) -> RowState:
+        row = self._compact_seed_row(sid, key)
+        _, low, _ = self._plan.bulk_lockset_operation_range(sid, stmt_no)
+        if key != low:
+            return row
+        value = sid * 10_000_000 + tx_id * 10_000 + stmt_no
+        return dataclasses.replace(row, counter=value)
+
+    def _compact_table_fingerprints(self) -> Dict[str, RowFingerprint]:
+        fingerprints = {
+            table: self._compact_seed_fingerprint(table)
+            for table in self._plan.table_names()
+        }
+        for sid, tx_id in self._compact_committed_tx_by_sid.items():
+            if self._plan.config.lockset_select_for_update:
+                continue
+            if (
+                self._plan.config.lockset_noop_update
+                and not self._plan.config.lockset_touch_one_row
+            ):
+                continue
+            for stmt_no in range(self._plan.bulk_lockset_operation_count()):
+                table, low, high = self._plan.bulk_lockset_operation_range(sid, stmt_no)
+                if high <= low:
+                    continue
+                if self._plan.config.lockset_touch_one_row:
+                    value = sid * 10_000_000 + tx_id * 10_000 + stmt_no
+                    fingerprints[table] = dataclasses.replace(
+                        fingerprints[table],
+                        sum_counter=fingerprints[table].sum_counter + value,
+                    )
+                else:
+                    fingerprints[table] = self._compact_apply_bulk_range(
+                        fingerprints[table],
+                        sid,
+                        tx_id,
+                        stmt_no,
+                        low,
+                        high,
+                    )
+        return fingerprints
+
+    def _compact_seed_fingerprint(self, table: str) -> RowFingerprint:
+        seed_sids = self._plan.seed_sids_for_table(table)
+        sessions = len(seed_sids)
+        rows_per_session = self._plan.config.seed_rows_per_table_per_session
+        sid_sum = sum(seed_sids)
+        k_sum = rows_per_session * (rows_per_session - 1) // 2
+        row_count = sessions * rows_per_session
+        sum_sid = rows_per_session * sid_sum
+        sum_k = sessions * k_sum
+        if self._plan.config.lockset_minimal_table:
+            return RowFingerprint(
+                row_count=row_count,
+                sum_sid=sum_sid,
+                sum_k=sum_k,
+                sum_counter=0,
+                row_digest="",
+            )
+        sum_v = rows_per_session * 1000 * sid_sum + sessions * k_sum
+        return RowFingerprint(
+            row_count=row_count,
+            sum_sid=sum_sid,
+            sum_k=sum_k,
+            sum_v=sum_v,
+            sum_counter=0,
+            sum_amount_cents=1000 * row_count,
+            sum_deleted=0,
+            sum_g=sum_v + sum_sid,
+            sum_note_crc=0,
+            sum_date_crc=row_count * _crc32("2026-05-21"),
+            sum_json_sid=0,
+            sum_json_tx=0,
+            sum_json_stmt=0,
+            sum_json_seed_sid=rows_per_session * sid_sum,
+            sum_json_seed_k=sessions * k_sum,
+            sum_json_op_crc=0,
+            sum_payload_len=0,
+            row_digest="",
+        )
+
+    def _compact_apply_bulk_range(
+        self,
+        fingerprint: RowFingerprint,
+        sid: int,
+        tx_id: int,
+        stmt_no: int,
+        low: int,
+        high: int,
+    ) -> RowFingerprint:
+        row_count = high - low
+        key_sum = (low + high - 1) * row_count // 2
+        seed_sum_v = row_count * sid * 1000 + key_sum
+        seed_sum_g = seed_sum_v + row_count * sid
+        seed_date_crc = row_count * _crc32("2026-05-21")
+        value = sid * 10_000_000 + tx_id * 10_000 + stmt_no
+        updated_date = (
+            datetime.date(2026, 5, 21)
+            + datetime.timedelta(days=stmt_no % 20)
+        ).isoformat()
+        updated_sum_v = row_count * value
+        updated_sum_g = row_count * (value + sid)
+        updated_date_crc = row_count * _crc32(updated_date)
+        return RowFingerprint(
+            row_count=fingerprint.row_count,
+            sum_sid=fingerprint.sum_sid,
+            sum_k=fingerprint.sum_k,
+            sum_v=fingerprint.sum_v - seed_sum_v + updated_sum_v,
+            sum_counter=fingerprint.sum_counter + row_count * stmt_no,
+            sum_amount_cents=(
+                fingerprint.sum_amount_cents
+                - row_count * 1000
+                + row_count * (stmt_no * 100 + 25)
+            ),
+            sum_deleted=fingerprint.sum_deleted,
+            sum_g=fingerprint.sum_g - seed_sum_g + updated_sum_g,
+            sum_note_crc=0,
+            sum_date_crc=fingerprint.sum_date_crc - seed_date_crc + updated_date_crc,
+            sum_json_sid=fingerprint.sum_json_sid + row_count * sid,
+            sum_json_tx=fingerprint.sum_json_tx + row_count * tx_id,
+            sum_json_stmt=fingerprint.sum_json_stmt + row_count * stmt_no,
+            sum_json_seed_sid=(
+                fingerprint.sum_json_seed_sid - row_count * sid
+            ),
+            sum_json_seed_k=fingerprint.sum_json_seed_k - key_sum,
+            sum_json_op_crc=0,
+            sum_payload_len=fingerprint.sum_payload_len,
+            row_digest="",
+        )
 
     def _fingerprint_rows(self, rows: Iterable[RowState]) -> RowFingerprint:
         fingerprint = RowFingerprint()
@@ -994,6 +1504,18 @@ class ExpectedDatabaseState:
                 row_digest=fingerprint.row_digest,
             )
         return dataclasses.replace(fingerprint, row_digest=hasher.hexdigest())
+
+    def _minimal_fingerprint_rows(self, rows: Iterable[RowState]) -> RowFingerprint:
+        fingerprint = RowFingerprint()
+        for row in rows:
+            fingerprint = RowFingerprint(
+                row_count=fingerprint.row_count + 1,
+                sum_sid=fingerprint.sum_sid + row.sid,
+                sum_k=fingerprint.sum_k + row.k,
+                sum_counter=fingerprint.sum_counter + row.counter,
+                row_digest="",
+            )
+        return fingerprint
 
 
 class ExpectedTransactionState:
@@ -1080,6 +1602,44 @@ def _apply_expected_statement(
     tx_id: int,
     stmt_no: int,
 ) -> None:
+    if plan.config.lockset_batch_size > 0:
+        if plan.config.lockset_select_for_update:
+            return
+        if plan.config.lockset_noop_update and not plan.config.lockset_touch_one_row:
+            return
+        table, low, high = plan.bulk_lockset_operation_range(sid, stmt_no)
+        value = sid * 10_000_000 + tx_id * 10_000 + stmt_no
+        if plan.config.lockset_touch_one_row:
+            if high > low:
+                row = rows[table][(sid, low)]
+                rows[table][(sid, low)] = dataclasses.replace(row, counter=value)
+            return
+        for key in range(low, high):
+            note = f"bulk-s{sid:03d}-t{tx_id:05d}-n{key:05d}-stmt{stmt_no:05d}"
+            _replace_expected_existing(
+                rows,
+                table,
+                sid,
+                key,
+                v=value,
+                counter=stmt_no,
+                amount_cents=stmt_no * 100 + 25,
+                d=(
+                    datetime.date(2026, 5, 21)
+                    + datetime.timedelta(days=stmt_no % 20)
+                ).isoformat(),
+                note=note,
+                js={
+                    "sid": sid,
+                    "tx": tx_id,
+                    "stmt": stmt_no,
+                    "k": key,
+                    "op": "bulk_lockset",
+                },
+                deleted=0,
+            )
+        return
+
     tables = plan.table_names()
     table = tables[stmt_no % len(tables)]
     peer = tables[(stmt_no + 1) % len(tables)]
@@ -1244,18 +1804,52 @@ class ResumeCoordinator:
         self._hold_transaction_starts = False
         self.errors: "queue.Queue[BaseException]" = queue.Queue()
 
+    def _notify_all_locked(self, reason: str) -> None:
+        del reason
+        self._condition.notify_all()
+
+    def _all_in_transaction_locked(self) -> bool:
+        return all(
+            self._in_transaction.get(sid, False)
+            for sid in range(1, self._sessions + 1)
+        )
+
+    def _all_drainable_locked(self, generation: int) -> bool:
+        return all(
+            self._drainable_generation.get(sid) == generation
+            for sid in range(1, self._sessions + 1)
+        )
+
+    def _all_paused_locked(self, generation: int) -> bool:
+        return all(
+            self._paused_generation.get(sid) == generation
+            for sid in range(1, self._sessions + 1)
+        )
+
     def mark_in_transaction(self, sid: int, value: bool) -> None:
         with self._condition:
+            previous = self._in_transaction.get(sid)
             self._in_transaction[sid] = value
-            self._condition.notify_all()
+            if value and previous is not True and self._all_in_transaction_locked():
+                self._notify_all_locked("in_transaction_complete")
 
     def mark_drainable_transaction(self, sid: int, value: bool) -> None:
         with self._condition:
+            changed_to_current = False
             if value:
-                self._drainable_generation[sid] = self._drain_generation
+                changed_to_current = (
+                    self._drainable_generation.get(sid) != self._drain_generation
+                )
+                if changed_to_current:
+                    self._drainable_generation[sid] = self._drain_generation
             else:
                 self._drainable_generation.pop(sid, None)
-            self._condition.notify_all()
+            if (
+                value
+                and changed_to_current
+                and self._all_drainable_locked(self._drain_generation)
+            ):
+                self._notify_all_locked("drainable_complete")
 
     def wait_all_in_transaction(self, timeout_s: float) -> bool:
         deadline = time.monotonic() + timeout_s
@@ -1300,7 +1894,7 @@ class ResumeCoordinator:
     def publish_resumed_connection(self, sid: int, conn: object) -> None:
         with self._condition:
             self._resumed_connections[sid] = (self._drain_generation, conn)
-            self._condition.notify_all()
+            self._notify_all_locked("resumed_connection_published")
 
     def publish_resumed_connections(
         self,
@@ -1317,12 +1911,12 @@ class ResumeCoordinator:
             )
             if hold_transaction_starts:
                 self._hold_transaction_starts = True
-            self._condition.notify_all()
+            self._notify_all_locked("resumed_connections_published")
 
     def set_desired_large_bucket_mb(self, bucket_mb: int) -> None:
         with self._condition:
             self._desired_large_bucket_mb = bucket_mb
-            self._condition.notify_all()
+            self._notify_all_locked("desired_large_bucket_changed")
 
     def desired_large_bucket_mb(self) -> int:
         with self._condition:
@@ -1342,7 +1936,7 @@ class ResumeCoordinator:
             self._inflight_probe_closed_generation.pop(self._drain_generation, None)
             self._drain_command_started_generation.pop(self._drain_generation, None)
             self._cancelled_generation.pop(self._drain_generation, None)
-            self._condition.notify_all()
+            self._notify_all_locked("drain_checkpoint_requested")
             return self._drain_generation
 
     def drain_large_bucket_mb(self, generation: int) -> int:
@@ -1362,7 +1956,7 @@ class ResumeCoordinator:
                 conn for _, conn in self._resumed_connections.values()
             ]
             self._resumed_connections.clear()
-            self._condition.notify_all()
+            self._notify_all_locked("drain_checkpoint_cancelled")
         for conn in pending_connections:
             try:
                 conn.close()
@@ -1372,12 +1966,12 @@ class ResumeCoordinator:
     def hold_transaction_starts_until_next_checkpoint(self) -> None:
         with self._condition:
             self._hold_transaction_starts = True
-            self._condition.notify_all()
+            self._notify_all_locked("transaction_start_hold_enabled")
 
     def release_transaction_start_hold(self) -> None:
         with self._condition:
             self._hold_transaction_starts = False
-            self._condition.notify_all()
+            self._notify_all_locked("transaction_start_hold_released")
 
     def wait_for_transaction_start_permit(
         self,
@@ -1400,10 +1994,7 @@ class ResumeCoordinator:
         deadline = time.monotonic() + timeout_s
         with self._condition:
             while True:
-                if all(
-                    self._paused_generation.get(sid) == generation
-                    for sid in range(1, self._sessions + 1)
-                ):
+                if self._all_paused_locked(generation):
                     return True
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1450,8 +2041,10 @@ class ResumeCoordinator:
                     except Exception:
                         pass
                     continue
-                self._paused_generation[sid] = generation
-                self._condition.notify_all()
+                if self._paused_generation.get(sid) != generation:
+                    self._paused_generation[sid] = generation
+                    if self._all_paused_locked(generation):
+                        self._notify_all_locked("paused_complete")
                 if self._cancelled_generation.get(generation):
                     self._completed_generation[sid] = generation
                     return None
@@ -1476,29 +2069,29 @@ class ResumeCoordinator:
             if self._inflight_probe_started_generation.get(sid) == generation:
                 return None
             self._inflight_probe_started_generation[sid] = generation
-            self._condition.notify_all()
+            self._notify_all_locked("inflight_probe_started")
             return generation
 
     def finish_inflight_probe(self, sid: int, generation: int) -> None:
         with self._condition:
             if self._inflight_probe_started_generation.get(sid) == generation:
                 self._inflight_probe_completed_generation[sid] = generation
-                self._condition.notify_all()
+                self._notify_all_locked("inflight_probe_completed")
 
     def open_inflight_probe_launch(self, generation: int) -> None:
         with self._condition:
             self._inflight_probe_open_generation[generation] = True
-            self._condition.notify_all()
+            self._notify_all_locked("inflight_probe_launch_opened")
 
     def close_inflight_probe_launch(self, generation: int) -> None:
         with self._condition:
             self._inflight_probe_closed_generation[generation] = True
-            self._condition.notify_all()
+            self._notify_all_locked("inflight_probe_launch_closed")
 
     def mark_drain_command_started(self, generation: int) -> None:
         with self._condition:
             self._drain_command_started_generation[generation] = True
-            self._condition.notify_all()
+            self._notify_all_locked("drain_command_started")
 
     def drain_command_started(self, generation: int) -> bool:
         with self._condition:
@@ -1617,6 +2210,11 @@ class MySQLRuntime:
         down_since: Optional[float] = None
         quiet_period = self.config.shutdown_quiet_period_s
         last_error: Optional[BaseException] = None
+        pid_file = (
+            Path(self.config.server_pid_file).expanduser()
+            if self.config.server_pid_file
+            else None
+        )
         while time.monotonic() < deadline:
             try:
                 conn = self.connect(database=False)
@@ -1627,7 +2225,9 @@ class MySQLRuntime:
                 now = time.monotonic()
                 if down_since is None:
                     down_since = now
-                if now - down_since >= quiet_period:
+                if now - down_since >= quiet_period and (
+                    pid_file is None or not pid_file.exists()
+                ):
                     return
             time.sleep(min(0.1, max(0.01, deadline - time.monotonic())))
         detail = f": {last_error}" if last_error is not None else ""
@@ -1642,6 +2242,17 @@ class MySQLRuntime:
             rows = ()
         cursor.close()
         return rows
+
+    def execute_discarding_result(self, conn, sql: str, fetchmany_size: int = 4096) -> None:
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        try:
+            while getattr(cursor, "with_rows", False):
+                rows = cursor.fetchmany(fetchmany_size)
+                if not rows:
+                    break
+        finally:
+            cursor.close()
 
 
 class BusinessWorker(threading.Thread):
@@ -1669,6 +2280,7 @@ class BusinessWorker(threading.Thread):
         conn = None
         try:
             conn = self.runtime.connect(database=True, autocommit=False)
+            self._configure_connection(conn)
             self._initialize_temp_table(conn)
             tx_id = 0
             while not self.stop_event.is_set():
@@ -1691,6 +2303,7 @@ class BusinessWorker(threading.Thread):
                 conn = self._run_transaction(conn, tx_id)
                 self.transactions_completed += 1
         except BaseException as exc:
+            LOG.exception("worker sid=%s failed", self.sid)
             self.coordinator.errors.put(exc)
         finally:
             self.coordinator.mark_in_transaction(self.sid, False)
@@ -1700,6 +2313,14 @@ class BusinessWorker(threading.Thread):
                     conn.close()
                 except Exception:
                     pass
+
+    def _configure_connection(self, conn) -> None:
+        if self.plan.config.lockset_batch_size <= 0:
+            return
+        self.runtime.execute(
+            conn,
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        )
 
     def _initialize_temp_table(self, conn) -> None:
         if not self.plan.config.temp_table_workload:
@@ -1736,17 +2357,32 @@ class BusinessWorker(threading.Thread):
         self.coordinator.mark_drainable_transaction(self.sid, False)
 
         ops = self.plan.transaction_operations(self.sid, tx_id)
-        tx_expected = (
-            self.expected_state.transaction_view(self.sid)
-            if self.expected_state is not None
-            else None
-        )
+        tx_expected = None
+        if (
+            self.expected_state is not None
+            and not self.expected_state.uses_compact_bulk_model()
+        ):
+            tx_expected = self.expected_state.transaction_view(self.sid)
         stmt_index = 0
         pause_log_generation = 0
         while stmt_index < len(ops):
             op = ops[stmt_index]
             try:
-                rows = self.runtime.execute(conn, op.sql, fetch=op.validator is not None)
+                try:
+                    if op.discard_result:
+                        self.runtime.execute_discarding_result(conn, op.sql)
+                        rows = ()
+                    else:
+                        rows = self.runtime.execute(
+                            conn, op.sql, fetch=op.validator is not None
+                        )
+                except BaseException as exc:
+                    if not self.runtime.is_connection_error(exc):
+                        raise RuntimeError(
+                            f"worker sid={self.sid} tx={tx_id} stmt={stmt_index} "
+                            f"op={op.kind.value} table={op.table} failed: {op.sql}"
+                        ) from exc
+                    raise
                 if op.validator is not None:
                     if tx_expected is not None:
                         tx_expected.validate_query_result(tx_id, stmt_index, rows)
@@ -1759,17 +2395,20 @@ class BusinessWorker(threading.Thread):
                 )
                 self.statements_completed += 1
                 stmt_index += 1
-                self.coordinator.mark_drainable_transaction(self.sid, True)
+                can_pause_for_drain = self._can_pause_current_transaction_for_drain(
+                    large_bucket_mb,
+                    completed_stmt_count=stmt_index,
+                )
+                self.coordinator.mark_drainable_transaction(
+                    self.sid, can_pause_for_drain
+                )
                 self._run_inflight_probe_if_requested(conn)
                 if (
                     self.plan.is_inflight_probe_waiter(self.sid)
                     and self.coordinator.inflight_probe_pending_for_sid(self.sid)
                 ):
                     continue
-                if self._can_pause_current_transaction_for_drain(
-                    large_bucket_mb,
-                    completed_stmt_count=stmt_index,
-                ):
+                if can_pause_for_drain:
                     generation = self.coordinator.current_drain_generation()
                     if generation > 0 and generation != pause_log_generation:
                         LOG.debug(
@@ -1843,6 +2482,35 @@ class BusinessWorker(threading.Thread):
         return target_bucket <= 0 or large_bucket_mb == target_bucket
 
     def _verify_committed_transaction(self, conn, tx_id: int) -> None:
+        if self.plan.config.lockset_batch_size > 0:
+            table, low, high = self.plan.bulk_lockset_operation_range(self.sid, 0)
+            if (
+                self.plan.config.lockset_noop_update
+                or self.plan.config.lockset_select_for_update
+            ):
+                rows = self.runtime.execute(
+                    conn,
+                    f"SELECT COUNT(*) FROM `{table}` WHERE sid = {self.sid} "
+                    f"AND k >= {low} AND k < {high}",
+                    fetch=True,
+                )
+            else:
+                note_prefix = f"bulk-s{self.sid:03d}-t{tx_id:05d}-"
+                rows = self.runtime.execute(
+                    conn,
+                    f"SELECT COUNT(*) FROM `{table}` WHERE sid = {self.sid} "
+                    f"AND note LIKE '{note_prefix}%'",
+                    fetch=True,
+                )
+            if len(rows) != 1:
+                raise AssertionError("bulk lockset commit verification returned no row")
+            if int(rows[0][0]) <= 0:
+                raise AssertionError(
+                    f"bulk lockset commit verification found no rows for "
+                    f"sid {self.sid} tx {tx_id}"
+                )
+            return
+
         table = self.plan.commit_verification_table(self.sid, tx_id)
         tx_low = 100000 + tx_id * self.plan.config.statements_per_tx
         tx_high = tx_low + self.plan.config.statements_per_tx
@@ -2341,23 +3009,96 @@ class BusinessE2ERunner:
             cur.execute(f"USE `{self.config.database}`")
             for table in self.plan.table_names():
                 cur.execute(self.plan.create_table_sql(table))
-            insert_sql_by_table = {
-                table: (
-                    f"INSERT INTO `{table}` "
-                    "(sid,k,v,counter,amount,d,note,js,deleted) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,JSON_OBJECT('seed_sid',%s,'seed_k',%s),0)"
-                )
-                for table in self.plan.table_names()
-            }
-            rows_by_table: Dict[str, List[Tuple]] = {table: [] for table in self.plan.table_names()}
+            if self.plan.uses_compact_bulk_expected_state():
+                self._setup_schema_with_server_side_seed(cur)
+                conn.commit()
+                cur.close()
+                return
+            if self.config.lockset_minimal_table:
+                insert_sql_by_table = {
+                    table: f"INSERT INTO `{table}` (sid,k,counter) VALUES (%s,%s,%s)"
+                    for table in self.plan.table_names()
+                }
+            else:
+                insert_sql_by_table = {
+                    table: (
+                        f"INSERT INTO `{table}` "
+                        "(sid,k,v,counter,amount,d,note,js,deleted) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,JSON_OBJECT('seed_sid',%s,'seed_k',%s),0)"
+                    )
+                    for table in self.plan.table_names()
+                }
+            batch: List[Tuple] = []
+            current_table: Optional[str] = None
+
+            def flush_batch() -> None:
+                nonlocal batch
+                if current_table is not None and batch:
+                    cur.executemany(insert_sql_by_table[current_table], batch)
+                    batch = []
+
             for table, row in self.plan.seed_rows():
-                rows_by_table[table].append(row)
-            for table, rows in rows_by_table.items():
-                cur.executemany(insert_sql_by_table[table], rows)
+                if current_table is None:
+                    current_table = table
+                elif table != current_table:
+                    flush_batch()
+                    current_table = table
+                batch.append(row)
+                if len(batch) >= self.config.seed_insert_batch_size:
+                    flush_batch()
+            flush_batch()
             conn.commit()
             cur.close()
         finally:
             conn.close()
+
+    def _setup_schema_with_server_side_seed(self, cur) -> None:
+        cur.execute(
+            "CREATE TEMPORARY TABLE rtx_seed_sid("
+            "sid INT NOT NULL PRIMARY KEY) ENGINE=MEMORY"
+        )
+        cur.execute(
+            "CREATE TEMPORARY TABLE rtx_seed_k("
+            "k INT NOT NULL PRIMARY KEY) ENGINE=MEMORY"
+        )
+        cur.executemany(
+            "INSERT INTO rtx_seed_sid(sid) VALUES (%s)",
+            [(sid,) for sid in range(1, self.config.sessions + 1)],
+        )
+        cur.executemany(
+            "INSERT INTO rtx_seed_k(k) VALUES (%s)",
+            [
+                (key,)
+                for key in range(self.config.seed_rows_per_table_per_session)
+            ],
+        )
+        tables = self.plan.table_names()
+        for table_index, table in enumerate(tables):
+            sid_filter = ""
+            if self.plan.bulk_lockset_uses_session_sharded_tables():
+                sid_filter = (
+                    f"WHERE MOD(s.sid - 1, {len(tables)}) = {table_index} "
+                )
+            if self.config.lockset_minimal_table:
+                cur.execute(
+                    f"INSERT INTO `{table}` "
+                    "(sid,k,counter) "
+                    "SELECT s.sid, k.k, 0 "
+                    "FROM rtx_seed_sid s JOIN rtx_seed_k k "
+                    f"{sid_filter}"
+                    "ORDER BY s.sid, k.k"
+                )
+                continue
+            cur.execute(
+                f"INSERT INTO `{table}` "
+                "(sid,k,v,counter,amount,d,note,js,deleted) "
+                "SELECT s.sid, k.k, s.sid * 1000 + k.k, 0, 10.00, "
+                "DATE '2026-05-21', CONCAT('seed-', s.sid, '-', k.k), "
+                "JSON_OBJECT('seed_sid', s.sid, 'seed_k', k.k), 0 "
+                "FROM rtx_seed_sid s JOIN rtx_seed_k k "
+                f"{sid_filter}"
+                "ORDER BY s.sid, k.k"
+            )
 
     def drop_schema(self) -> None:
         conn = self.runtime.connect(database=False)
@@ -2384,6 +3125,7 @@ class BusinessE2ERunner:
                 f"SET GLOBAL preserve_trx_max_total={batch_capacity}",
                 f"SET GLOBAL preserve_trx_max_pending_per_user={batch_capacity}",
                 f"SET GLOBAL preserve_trx_batch_max_transactions={batch_capacity}",
+                f"SET GLOBAL preserve_trx_max_binlog_cache_bytes={self.config.preserve_max_binlog_cache_bytes}",
                 f"SET GLOBAL preserve_trx_max_modified_tables={self.config.preserve_max_modified_tables}",
                 f"SET GLOBAL preserve_trx_max_lock_count={self.config.preserve_max_lock_count}",
                 f"SET GLOBAL preserve_trx_max_scan_pages={self.config.preserve_max_scan_pages}",
@@ -2391,6 +3133,14 @@ class BusinessE2ERunner:
             ]
             if self.config.temp_table_workload:
                 commands.append("SET GLOBAL preserve_trx_temp_table_enable=ON")
+            if self.config.lock_warmcopy_mode == "on":
+                commands.append("SET GLOBAL preserve_trx_lock_warmcopy_enable=ON")
+                commands.append(
+                    "SET GLOBAL preserve_trx_lock_warmcopy_max_journal_bytes="
+                    f"{self.config.preserve_lock_warmcopy_max_journal_bytes}"
+                )
+            elif self.config.lock_warmcopy_mode == "off":
+                commands.append("SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF")
             if self.config.scenario == "binlog_equivalence":
                 commands.append("SET GLOBAL binlog_format=ROW")
             if self.config.warmcopy_required:
@@ -2503,17 +3253,10 @@ class BusinessE2ERunner:
                     phase="before DRAIN",
                 )
                 self.coordinator.close_inflight_probe_launch(generation)
-            elif not self.coordinator.wait_all_paused_for_drain(
-                generation, max(self.config.drain_interval_s, self.config.resume_timeout_s)
-            ):
-                self._raise_worker_error_if_any()
-                snapshot = self.coordinator.paused_drain_snapshot(generation)
-                raise TimeoutError(
-                    "not all workers paused inside transactions before drain: "
-                    f"missing_paused={snapshot['missing_paused'][:20]} "
-                    f"not_in_transaction={snapshot['not_in_transaction'][:20]} "
-                    f"not_drainable={snapshot['not_drainable'][:20]} "
-                    f"completed={snapshot['completed'][:20]}"
+            else:
+                self._wait_all_paused_for_drain_or_raise(
+                    generation,
+                    max(self.config.drain_interval_s, self.config.resume_timeout_s),
                 )
             LOG.info("cycle %s issuing DRAIN TRANSACTIONS PRESERVE", cycle)
             phase2_started_at = time.monotonic()
@@ -2638,6 +3381,13 @@ class BusinessE2ERunner:
                 for bucket_mb in observed_large_buckets
             )
             if (
+                not observed_large_buckets
+                and self.config.lock_warmcopy_mode in ("on", "off")
+            ):
+                self.phase2_pause_samples.append(
+                    Phase2PauseSample(bucket_mb=0, phase2_pause_ms=phase2_pause_ms)
+                )
+            if (
                 self.config.warmcopy_required
                 and not self.binlog_event_validation_enabled()
             ):
@@ -2654,6 +3404,36 @@ class BusinessE2ERunner:
         except BaseException:
             self.coordinator.cancel_drain_checkpoint(generation)
             raise
+
+    def _wait_all_paused_for_drain_or_raise(
+        self, generation: int, timeout_s: float
+    ) -> None:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            self._raise_worker_error_if_any()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if self.coordinator.wait_all_paused_for_drain(
+                generation, min(0.5, remaining)
+            ):
+                return
+        self._raise_worker_error_if_any()
+        snapshot = self.coordinator.paused_drain_snapshot(generation)
+        missing_paused = set(snapshot["missing_paused"])
+        failed_before_pause = [
+            worker.sid
+            for worker in getattr(self, "workers", [])
+            if not worker.is_alive() and worker.sid in missing_paused
+        ]
+        raise TimeoutError(
+            "not all workers paused inside transactions before drain: "
+            f"missing_paused={snapshot['missing_paused'][:20]} "
+            f"not_in_transaction={snapshot['not_in_transaction'][:20]} "
+            f"not_drainable={snapshot['not_drainable'][:20]} "
+            f"completed={snapshot['completed'][:20]} "
+            f"failed_before_pause={failed_before_pause[:20]}"
+        )
 
     def purge_old_binary_logs_after_resume(self) -> None:
         conn = self.runtime.connect(database=False)
@@ -3021,6 +3801,28 @@ class BusinessE2ERunner:
             conn.close()
 
     def _actual_table_fingerprint(self, conn, table: str) -> RowFingerprint:
+        if self.config.lockset_minimal_table:
+            rows = self.runtime.execute(
+                conn,
+                "SELECT "
+                "COUNT(*), "
+                "COALESCE(SUM(sid),0), "
+                "COALESCE(SUM(k),0), "
+                "COALESCE(SUM(counter),0) "
+                f"FROM {quote_identifier(self.config.database)}.{quote_identifier(table)}",
+                fetch=True,
+            )
+            if len(rows) != 1:
+                raise AssertionError(
+                    f"minimal fingerprint query for {table} returned {len(rows)} rows"
+                )
+            return RowFingerprint(
+                row_count=int(rows[0][0] or 0),
+                sum_sid=int(rows[0][1] or 0),
+                sum_k=int(rows[0][2] or 0),
+                sum_counter=int(rows[0][3] or 0),
+                row_digest="",
+            )
         rows = self.runtime.execute(
             conn,
             "SELECT "
@@ -3046,9 +3848,13 @@ class BusinessE2ERunner:
         )
         if len(rows) != 1:
             raise AssertionError(f"fingerprint query for {table} returned {len(rows)} rows")
+        skip_row_digest = (
+            hasattr(self, "expected_state")
+            and self.expected_state.uses_compact_bulk_model()
+        )
         return dataclasses.replace(
             RowFingerprint.from_sql_row(rows[0]),
-            row_digest=self._actual_table_row_digest(conn, table),
+            row_digest="" if skip_row_digest else self._actual_table_row_digest(conn, table),
         )
 
     def _actual_table_row_digest(self, conn, table: str) -> str:
@@ -3080,11 +3886,139 @@ class BusinessE2ERunner:
             _digest_update_fields(hasher, _row_digest_fields_from_sql(row))
         return hasher.hexdigest()
 
+    def validate_compact_bulk_spot_checks(self) -> None:
+        if not self.expected_state.uses_compact_bulk_model():
+            return
+        expectations = self.expected_state.compact_bulk_spot_expectations()
+        if not expectations:
+            return
+        conn = self.runtime.connect(database=False)
+        try:
+            for table, expected_rows in expectations.items():
+                actual_rows = self._actual_compact_bulk_spot_rows(
+                    conn, table, expected_rows
+                )
+                self._assert_compact_bulk_spot_rows_match(
+                    table,
+                    expected_rows,
+                    actual_rows,
+                )
+        finally:
+            conn.close()
+
+    def _actual_compact_bulk_spot_rows(
+        self,
+        conn,
+        table: str,
+        expected_rows: Dict[Tuple[int, int], RowState],
+    ) -> Dict[Tuple[int, int], Tuple[object, ...]]:
+        keys_by_sid: Dict[int, List[int]] = {}
+        for sid, key in expected_rows:
+            keys_by_sid.setdefault(sid, []).append(key)
+        predicates = []
+        for sid in sorted(keys_by_sid):
+            key_list = ",".join(str(key) for key in sorted(set(keys_by_sid[sid])))
+            predicates.append(f"(sid = {sid} AND k IN ({key_list}))")
+        if self.config.lockset_minimal_table:
+            rows = self.runtime.execute(
+                conn,
+                "SELECT sid, k, counter "
+                f"FROM {quote_identifier(self.config.database)}.{quote_identifier(table)} "
+                f"WHERE {' OR '.join(predicates)} "
+                "ORDER BY sid, k",
+                fetch=True,
+            )
+            return {
+                (int(row[0] or 0), int(row[1] or 0)): row
+                for row in rows
+            }
+        rows = self.runtime.execute(
+            conn,
+            "SELECT "
+            "sid, "
+            "k, "
+            "v, "
+            "counter, "
+            "CAST(amount * 100 AS SIGNED), "
+            "DATE_FORMAT(d, '%Y-%m-%d'), "
+            "COALESCE(note,''), "
+            "deleted, "
+            "g, "
+            "COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(js, '$.sid')) AS SIGNED),0), "
+            "COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(js, '$.tx')) AS SIGNED),0), "
+            "COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(js, '$.stmt')) AS SIGNED),0), "
+            "COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(js, '$.seed_sid')) AS SIGNED),0), "
+            "COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(js, '$.seed_k')) AS SIGNED),0), "
+            "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(js, '$.op')),''), "
+            "COALESCE(OCTET_LENGTH(payload),0) "
+            f"FROM {quote_identifier(self.config.database)}.{quote_identifier(table)} "
+            f"WHERE {' OR '.join(predicates)} "
+            "ORDER BY sid, k",
+            fetch=True,
+        )
+        return {
+            (int(row[0] or 0), int(row[1] or 0)): _row_digest_fields_from_sql(row)
+            for row in rows
+        }
+
+    def _assert_compact_bulk_spot_rows_match(
+        self,
+        table: str,
+        expected_rows: Dict[Tuple[int, int], RowState],
+        actual_rows: Dict[Tuple[int, int], Tuple[object, ...]],
+    ) -> None:
+        if self.config.lockset_minimal_table:
+            expected_keys = set(expected_rows)
+            actual_keys = set(actual_rows)
+            if expected_keys != actual_keys:
+                missing = sorted(expected_keys - actual_keys)
+                extra = sorted(actual_keys - expected_keys)
+                raise AssertionError(
+                    f"minimal compact spot mismatch for {table}: "
+                    f"missing={missing[:10]} extra={extra[:10]}"
+                )
+            counter_mismatch = [
+                key for key, expected in expected_rows.items()
+                if int(actual_rows[key][2] or 0) != expected.counter
+            ]
+            if counter_mismatch:
+                raise AssertionError(
+                    f"minimal compact spot counter mismatch for {table}: "
+                    f"keys={sorted(counter_mismatch)[:10]}"
+                )
+            return
+        expected = {
+            key: _row_digest_fields_from_state(row)
+            for key, row in expected_rows.items()
+        }
+        if set(expected) != set(actual_rows):
+            missing = sorted(set(expected) - set(actual_rows))
+            extra = sorted(set(actual_rows) - set(expected))
+            raise AssertionError(
+                f"compact bulk spot mismatch for {table}: "
+                f"missing={missing[:10]} extra={extra[:10]}"
+            )
+        mismatches = [
+            key for key in sorted(expected)
+            if expected[key] != actual_rows[key]
+        ]
+        if mismatches:
+            key = mismatches[0]
+            raise AssertionError(
+                f"compact bulk spot mismatch for {table} key={key}: "
+                f"expected={expected[key]} actual={actual_rows[key]}"
+            )
+
     def final_validation(self) -> None:
         completed = [worker.transactions_completed for worker in self.workers]
         if min(completed) < 1:
             raise AssertionError(f"each worker must complete at least one transaction: {completed[:10]}")
         self.expected_state.assert_matches(self.actual_table_fingerprints())
+        if (
+            hasattr(self.expected_state, "uses_compact_bulk_model")
+            and self.expected_state.uses_compact_bulk_model()
+        ):
+            self.validate_compact_bulk_spot_checks()
         phase2_pause_samples = getattr(self, "phase2_pause_samples", [])
         plan = getattr(self, "plan", WorkloadPlan(self.config))
         large_cache_gate_required = (
@@ -3359,7 +4293,7 @@ class BusinessE2ERunner:
             exc = self.coordinator.errors.get_nowait()
         except queue.Empty:
             return
-        raise RuntimeError("worker failed") from exc
+        raise RuntimeError(f"worker failed: {exc}") from exc
 
 
 def quote_sql_string(value: str) -> str:
@@ -3658,19 +4592,28 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--password", default="", help="MySQL password")
     parser.add_argument("--database", default="resumable_trx_e2e", help="schema used by this harness")
     parser.add_argument("--unix-socket", help="use a Unix socket instead of TCP")
-    parser.add_argument("--sessions", "--workers", dest="sessions", type=int, default=100, help="application sessions; default and required shape is 100")
-    parser.add_argument("--tables", dest="table_count", type=int, default=30, help="business table count; this E2E requires exactly 30")
-    parser.add_argument("--statements-per-tx", type=int, default=100, help="business SQL statements per transaction; this E2E requires exactly 100")
+    parser.add_argument("--sessions", "--workers", dest="sessions", type=int, default=100, help="application sessions")
+    parser.add_argument("--tables", dest="table_count", type=int, default=30, help="business table count")
+    parser.add_argument("--statements-per-tx", type=int, default=100, help="business SQL statements per transaction")
+    parser.add_argument("--seed-rows-per-table-per-session", type=int, default=12, help="seed rows per table/session; large bulk-lockset runs need enough existing rows per touched range")
     parser.add_argument("--cycles", "--drain-cycles", dest="cycles", type=int, default=3, help="number of drain/restart/resume maintenance cycles")
     parser.add_argument("--drain-interval", dest="drain_interval_s", type=float, default=30.0, help="seconds between maintenance cycles")
     parser.add_argument("--duration", dest="duration_s", type=float, default=0.0, help="total business workload seconds; workers continue after the last drain until this duration is reached")
     parser.add_argument("--max-transactions-per-worker", type=int, default=0, help="stop each worker after this many committed transactions; 0 means unbounded")
     parser.add_argument("--min-statements-before-drain-pause", type=int, default=0, help="when a drain is requested, let workers execute at least this many statements in the current transaction before pausing")
+    parser.add_argument("--lockset-batch-size", type=int, default=0, help="when positive, replace the semantic matrix with batched range UPDATE statements that form this many row locks per statement")
+    parser.add_argument("--lockset-session-table-shards", action="store_true", help="for bulk lockset workloads, pin each session to one table and seed only that table's assigned sessions")
+    parser.add_argument("--lockset-noop-update", action="store_true", help="for bulk lockset workloads, use no-op UPDATE statements that acquire record locks without changing row contents")
+    parser.add_argument("--lockset-touch-one-row", action="store_true", help="with --lockset-noop-update, update the first row in each batch so the transaction has minimal undo while retaining range lock pressure")
+    parser.add_argument("--lockset-select-for-update", action="store_true", help="for bulk lockset workloads, use SELECT ... FOR UPDATE statements that acquire record locks without changing row contents")
+    parser.add_argument("--lockset-minimal-table", action="store_true", help="for bulk lockset workloads, create narrow sid/k/counter tables so the gate measures lock preservation rather than wide-row data updates")
     parser.add_argument("--preserve-timeout", dest="preserve_timeout_s", type=int, default=86400, help="WITH TIMEOUT value for DRAIN TRANSACTIONS PRESERVE")
+    parser.add_argument("--preserve-max-binlog-cache-bytes", dest="preserve_max_binlog_cache_bytes", type=int, default=1_073_741_824, help="preserve_trx_max_binlog_cache_bytes for high-cardinality preserve artifacts")
     parser.add_argument("--preserve-max-lock-count", dest="preserve_max_lock_count", type=int, default=1_000_000, help="preserve_trx_max_lock_count for this high-cardinality E2E")
     parser.add_argument("--preserve-max-scan-pages", dest="preserve_max_scan_pages", type=int, default=1_000_000, help="preserve_trx_max_scan_pages for this high-cardinality E2E")
     parser.add_argument("--preserve-materialize-timeout-ms", dest="preserve_materialize_timeout_ms", type=int, default=60_000, help="preserve_trx_materialize_timeout_ms for this high-cardinality E2E")
     parser.add_argument("--preserve-max-modified-tables", dest="preserve_max_modified_tables", type=int, default=512, help="preserve_trx_max_modified_tables for this high-cardinality E2E")
+    parser.add_argument("--preserve-lock-warmcopy-max-journal-bytes", dest="preserve_lock_warmcopy_max_journal_bytes", type=int, default=1_073_741_824, help="preserve_trx_lock_warmcopy_max_journal_bytes for high-cardinality lock warmcopy gates")
     parser.add_argument("--inflight-drain-probe", action="store_true", help="allow even-numbered workers to enter real UPDATE lock waits before each DRAIN")
     parser.add_argument("--inflight-probe-min-waits", dest="inflight_probe_min_waits", type=int, default=1, help="minimum simultaneous harness data_lock_waits required before issuing DRAIN in in-flight probe mode")
     parser.add_argument("--inflight-probe-timeout", dest="inflight_probe_timeout_s", type=int, default=5, help="innodb_lock_wait_timeout used by in-flight probe statements")
@@ -3687,6 +4630,7 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--server-error-log", help="mysqld error log used for server-side warm-copy binlog-cache phase2 timing; defaults to mysqld.err next to the Unix socket")
     parser.add_argument("--warmcopy-required", action="store_true", help="enable warm-copy globals and enforce warm-copy phase2 pause gate")
     parser.add_argument("--warmcopy-mode", choices=("required", "optional", "off"), help="compatibility alias for warm-copy E2E mode; 'required' is equivalent to --warmcopy-required")
+    parser.add_argument("--lock-warmcopy-mode", choices=("default", "on", "off"), default="default", help="explicitly set preserve_trx_lock_warmcopy_enable for this run")
     parser.add_argument("--two-phase", action="store_true", help="compatibility flag documenting that the warmcopy_two_phase_large_cache_equivalence scenario must use the two-phase warm-copy path")
     parser.add_argument("--max-phase2-pause-ms", type=int, default=5000, help="maximum allowed median warm-copy binlog-cache phase2 pause per large-cache bucket")
     parser.add_argument("--warmcopy-disabled-baseline-slope-ms-per-mb", type=float, help="optional warmcopy-disabled pause slope baseline; warm-copy slope may be at most 25%% of it")
@@ -3696,6 +4640,7 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--shutdown-quiet-period", dest="shutdown_quiet_period_s", type=float, default=2.0, help="seconds mysqld must remain unreachable before restart is attempted")
     parser.add_argument("--resume-timeout", dest="resume_timeout_s", type=float, default=120.0, help="seconds a worker waits for its resumed connection")
     parser.add_argument("--restart-command", help="shell command used to start release mysqld after each drain")
+    parser.add_argument("--server-pid-file", help="optional mysqld pid file; when set, shutdown waits for it to disappear before restart")
     parser.add_argument("--allow-partial-tokens", action="store_true", help="do not require exactly one preserved token per session")
     parser.add_argument("--no-setup-schema", dest="setup_schema", action="store_false", help="reuse an existing schema instead of recreating it")
     parser.add_argument("--keep-schema", action="store_true", help="leave the harness schema behind after completion")
@@ -3735,16 +4680,25 @@ command is used after each DRAIN command shuts that server down.
         sessions=args.sessions,
         table_count=args.table_count,
         statements_per_tx=args.statements_per_tx,
+        seed_rows_per_table_per_session=args.seed_rows_per_table_per_session,
         cycles=args.cycles,
         drain_interval_s=args.drain_interval_s,
         duration_s=args.duration_s,
         max_transactions_per_worker=max_transactions_per_worker,
         min_statements_before_drain_pause=args.min_statements_before_drain_pause,
+        lockset_batch_size=args.lockset_batch_size,
+        lockset_session_table_shards=args.lockset_session_table_shards,
+        lockset_noop_update=args.lockset_noop_update,
+        lockset_touch_one_row=args.lockset_touch_one_row,
+        lockset_select_for_update=args.lockset_select_for_update,
+        lockset_minimal_table=args.lockset_minimal_table,
         preserve_timeout_s=args.preserve_timeout_s,
+        preserve_max_binlog_cache_bytes=args.preserve_max_binlog_cache_bytes,
         preserve_max_lock_count=args.preserve_max_lock_count,
         preserve_max_scan_pages=args.preserve_max_scan_pages,
         preserve_materialize_timeout_ms=args.preserve_materialize_timeout_ms,
         preserve_max_modified_tables=args.preserve_max_modified_tables,
+        preserve_lock_warmcopy_max_journal_bytes=args.preserve_lock_warmcopy_max_journal_bytes,
         inflight_drain_probe=args.inflight_drain_probe,
         inflight_probe_min_waits=args.inflight_probe_min_waits,
         inflight_probe_timeout_s=args.inflight_probe_timeout_s,
@@ -3757,7 +4711,9 @@ command is used after each DRAIN command shuts that server down.
         strict_binlog_transaction_order=args.strict_binlog_transaction_order,
         no_preserve_baseline=args.no_preserve_baseline,
         server_error_log=args.server_error_log,
+        server_pid_file=args.server_pid_file,
         warmcopy_required=warmcopy_required,
+        lock_warmcopy_mode=args.lock_warmcopy_mode,
         two_phase=args.two_phase,
         max_phase2_pause_ms=args.max_phase2_pause_ms,
         warmcopy_disabled_baseline_slope_ms_per_mb=args.warmcopy_disabled_baseline_slope_ms_per_mb,

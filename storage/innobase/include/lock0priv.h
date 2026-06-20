@@ -42,6 +42,7 @@ those functions in lock/ */
 
 #include "dict0types.h"
 #include "hash0hash.h"
+#include "lock0warmcopy.h"
 #include "trx0types.h"
 #include "univ.i"
 

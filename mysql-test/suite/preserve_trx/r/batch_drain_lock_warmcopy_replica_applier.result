@@ -1,0 +1,8 @@
+# Lint-only source-shape guard for replica/applier fail-closed
+# handling. MTR cannot cheaply create a true applier THD here; this test
+# verifies that lock-warmcopy batch target discovery and attach-time
+# preserve both use the common context predicate that rejects real
+# replica/applier/group-replication states.
+SELECT 'ok' AS batch_drain_lock_warmcopy_replica_applier;
+batch_drain_lock_warmcopy_replica_applier
+ok

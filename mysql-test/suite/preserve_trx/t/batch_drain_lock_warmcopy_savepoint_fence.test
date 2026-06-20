@@ -1,0 +1,54 @@
+--source include/have_debug.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_lock_warmcopy_savepoint_fence;
+--enable_warnings
+
+--let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
+--let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_fallback= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_fallback_to_live_export`
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=ON;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+
+CREATE TABLE t_lock_warmcopy_savepoint_fence(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+--connect(lock_wc_savepoint_app, localhost, root,,test)
+START TRANSACTION;
+SAVEPOINT s1;
+SET SESSION debug="+d,preserve_trx_lock_warmcopy_force_savepoint_final_fence_changed";
+
+--connection default
+SET SESSION debug="+d,preserve_trx_lock_warmcopy_force_savepoint_final_fence_changed";
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET SESSION debug="-d,preserve_trx_lock_warmcopy_force_savepoint_final_fence_changed";
+SELECT COUNT(*) AS preserved_count_after_savepoint_fence_reject
+  FROM performance_schema.preserved_transactions;
+
+--connection lock_wc_savepoint_app
+SET SESSION debug="-d,preserve_trx_lock_warmcopy_force_savepoint_final_fence_changed";
+INSERT INTO t_lock_warmcopy_savepoint_fence VALUES(1,11);
+COMMIT;
+--disconnect lock_wc_savepoint_app
+
+--connection default
+SELECT id, v FROM t_lock_warmcopy_savepoint_fence ORDER BY id;
+
+DROP TABLE t_lock_warmcopy_savepoint_fence;
+--disable_query_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback
+--eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
+--eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
+--eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--enable_query_log

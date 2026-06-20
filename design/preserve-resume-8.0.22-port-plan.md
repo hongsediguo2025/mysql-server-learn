@@ -4,6 +4,9 @@
 > `codex/preserve-resume-8.0.22-port`.  It is the current checklist for the
 > in-progress port and must stay aligned with the source branch handoff plan,
 > the 8.0.22-specific manifests, and the evidence produced in this worktree.
+>
+> Operator/user manual:
+> `design/preserve-resume-8.0.22-user-manual.md`.
 
 ## 1. Goal
 

@@ -715,6 +715,29 @@ struct trx_lock_t {
   It is read with exclusive lock_sys latch. */
   std::atomic<ulint> n_rec_locks;
 
+  /** True while Preserve/Resume lock warmcopy is between final fence sampling
+  and prepare completion, during which implicit-to-explicit conversion for this
+  transaction must not install new explicit record locks.
+  Protected by trx->mutex. */
+  bool lock_warmcopy_conversion_frozen;
+
+  /** Incremented every time lock_warmcopy_conversion_frozen is set.
+  Protected by trx->mutex. */
+  uint64_t lock_warmcopy_freeze_generation;
+
+  /** Epoch used by conversion callers to wait/retry while freeze is active.
+  Protected by trx->mutex. */
+  uint64_t lock_warmcopy_conversion_freeze_wait_epoch;
+
+  /** Set when a conflicting session observes the conversion freeze.
+  Protected by trx->mutex. */
+  bool lock_warmcopy_conversion_attempt_after_freeze;
+
+  /** Set until the caller proves it propagated the frozen conversion status
+  instead of continuing as if conversion succeeded.
+  Protected by trx->mutex. */
+  bool lock_warmcopy_conversion_unhandled_after_freeze;
+
   /** Used to indicate that every lock of this transaction placed on a record
   which is being purged should be inherited to the gap.
   Readers should hold a latch on the lock they'd like to learn about whether or

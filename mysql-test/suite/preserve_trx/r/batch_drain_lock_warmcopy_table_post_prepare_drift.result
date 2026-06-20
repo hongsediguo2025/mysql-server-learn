@@ -1,0 +1,30 @@
+DROP TABLE IF EXISTS t_lock_warmcopy_table_drift;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=ON;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+CREATE TABLE t_lock_warmcopy_table_drift(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_table_drift VALUES(1,10);
+START TRANSACTION;
+UPDATE t_lock_warmcopy_table_drift SET v=11 WHERE id=1;
+SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_table_post_prepare_drift";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+include/assert_grep.inc [table post-prepare drift falls back to live table export]
+SELECT COUNT(*) AS preserved_count_after_table_drift_fallback
+FROM performance_schema.preserved_transactions;
+preserved_count_after_table_drift_fallback
+1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+SELECT COUNT(*) AS preserved_count_after_table_drift_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_table_drift_resume
+0
+SELECT id, v FROM t_lock_warmcopy_table_drift ORDER BY id;
+id	v
+1	11
+DROP TABLE t_lock_warmcopy_table_drift;

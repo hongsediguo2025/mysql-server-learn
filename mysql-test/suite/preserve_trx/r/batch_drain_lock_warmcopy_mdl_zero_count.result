@@ -1,0 +1,7 @@
+# Lint-only source-shape guard for legal zero-count MDL descriptor
+# payloads. Ordinary SQL DML transactions normally hold transaction
+# duration MDL; this named plan item guards the participant and exporter
+# contract directly.
+SELECT 'ok' AS batch_drain_lock_warmcopy_mdl_zero_count;
+batch_drain_lock_warmcopy_mdl_zero_count
+ok

@@ -37,6 +37,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "db0err.h"
 #include "sql/preserve_trx_xid.h"
+#include "storage/innobase/include/lock0warmcopy.h"
 
 class THD;
 struct trx_rseg_t;
@@ -100,6 +101,15 @@ dberr_t trx_preserve_export_record_locks(trx_t *trx, std::string *payload,
                                          uint32_t max_lock_count);
 dberr_t trx_preserve_export_record_locks(THD *thd, std::string *payload,
                                          uint32_t max_lock_count);
+bool trx_preserve_sample_lock_warmcopy_fence(
+    THD *thd, lock_warmcopy_trx_lock_fence_t *fence);
+bool trx_preserve_sample_lock_warmcopy_fence(
+    trx_t *trx, lock_warmcopy_trx_lock_fence_t *fence);
+bool trx_preserve_lock_warmcopy_conversion_freeze(
+    THD *thd, lock_warmcopy_trx_lock_fence_t *fence, trx_t **frozen_trx);
+void trx_preserve_lock_warmcopy_conversion_thaw(trx_t *trx);
+bool trx_preserve_lock_warmcopy_note_conversion_attempt_after_freeze(trx_t *trx);
+bool trx_preserve_has_predicate_locks(THD *thd, bool *has_predicate_locks);
 const char *trx_preserve_last_record_lock_export_error();
 dberr_t trx_preserve_import_record_locks(trx_t *trx,
                                          const std::string &payload);

@@ -1,0 +1,112 @@
+--echo # Lint-only source-shape guard for ordinary implicit-to-explicit
+--echo # conversion wait/retry. Runtime command-barrier behavior is covered by
+--echo # batch_drain_lock_warmcopy_conversion_nowait_skiplocked; the low-level
+--echo # wait success and timeout cases are covered by lock0warmcopy GUnit.
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_source {
+  my (@parts) = @_;
+  my $path = File::Spec->catfile($source_root, @parts);
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $src = do { local $/; <$fh> };
+  close($fh);
+  return $src;
+}
+
+sub extract_function {
+  my ($src, $signature_re, $label) = @_;
+  $src =~ /$signature_re/s or die "could not find $label signature\n";
+  my $sig_pos = $-[0];
+  my $brace_pos = index($src, '{', $sig_pos);
+  die "could not find $label body start\n" if $brace_pos < 0;
+
+  my $depth = 0;
+  for (my $i = $brace_pos; $i < length($src); ++$i) {
+    my $ch = substr($src, $i, 1);
+    ++$depth if $ch eq '{';
+    --$depth if $ch eq '}';
+    if ($depth == 0 && $ch eq '}') {
+      return substr($src, $sig_pos, $i - $sig_pos + 1);
+    }
+  }
+  die "could not parse $label body\n";
+}
+
+my $lock = read_source('storage', 'innobase', 'lock', 'lock0lock.cc');
+my $lock_warmcopy = read_source('storage', 'innobase', 'lock',
+                                'lock0warmcopy.cc');
+my $lock_warmcopy_header = read_source('storage', 'innobase', 'include',
+                                       'lock0warmcopy.h');
+my $gunit = read_source('unittest', 'gunit', 'innodb',
+                        'lock0warmcopy-t.cc');
+my $runtime_mtr = read_source('mysql-test', 'suite', 'preserve_trx', 't',
+                              'batch_drain_lock_warmcopy_conversion_nowait_skiplocked.test');
+
+die "wait/retry implementation must live in lock0warmcopy.cc, not lock0lock.cc\n"
+  if $lock =~ /lock_warmcopy_wait_for_conversion_thaw_impl\s*\(/s;
+die "wait/retry helper declarations must stay in lock0warmcopy.h\n"
+  unless $lock_warmcopy_header =~ /lock_warmcopy_wait_for_conversion_thaw\s*\(\s*trx_t\s+\*trx\s*\)/s &&
+         $lock_warmcopy_header =~ /lock_warmcopy_wait_for_conversion_thaw_for_unit_test\s*\(/s;
+
+my $wait_impl = extract_function(
+  $lock_warmcopy,
+  qr/dberr_t\s+lock_warmcopy_wait_for_conversion_thaw_impl\s*\(/,
+  'lock_warmcopy_wait_for_conversion_thaw_impl');
+die "wait/retry helper must return success after the frozen state clears\n"
+  unless $wait_impl =~ /if\s*\(\s*!\s*is_frozen\s*\(\s*\)\s*\)\s*\{\s*return\s+DB_SUCCESS/s;
+die "wait/retry helper must honor zero timeout as DB_LOCK_WAIT_TIMEOUT\n"
+  unless $wait_impl =~ /timeout_ms\s*==\s*0[\s\S]*return\s+DB_LOCK_WAIT_TIMEOUT/s;
+die "wait/retry helper must expose waiter registration and avoid busy spin\n"
+  unless $wait_impl =~ /DEBUG_SYNC_C\s*\(\s*"lock_warmcopy_conversion_waiter_registered"\s*\)/s &&
+         $wait_impl =~ /os_thread_sleep\s*\(\s*1000\s*\)/s;
+
+my $wait_public = extract_function(
+  $lock_warmcopy,
+  qr/dberr_t\s+lock_warmcopy_wait_for_conversion_thaw\s*\(/,
+  'lock_warmcopy_wait_for_conversion_thaw');
+die "public wait helper must count waits and sample frozen state under trx mutex\n"
+  unless $wait_public =~ /lock_warmcopy_conversion_freeze_wait_note\s*\(\s*\)/s &&
+         $wait_public =~ /trx_mutex_enter\s*\(\s*trx\s*\)[\s\S]*lock_warmcopy_trx_conversion_is_frozen\s*\(\s*&trx->lock\s*\)[\s\S]*trx_mutex_exit\s*\(\s*trx\s*\)/s &&
+         $wait_public =~ /preserve_trx_lock_warmcopy_conversion_wait_timeout_ms/s;
+
+my $impl_to_expl = extract_function(
+  $lock,
+  qr/static\s+dberr_t\s+lock_rec_convert_impl_to_expl_for_trx\s*\(/,
+  'lock_rec_convert_impl_to_expl_for_trx');
+die "ordinary frozen conversion must return retryable DB_SUCCESS, not install explicit lock immediately\n"
+  unless $impl_to_expl =~ /lock_warmcopy_frozen_conversion_result\s*\(\s*sel_mode\s*\)[\s\S]*wait_for_thaw\s*=\s*err\s*==\s*DB_SUCCESS/s;
+die "ordinary frozen conversion must wait for thaw and loop back to retry\n"
+  unless $impl_to_expl =~ /if\s*\(\s*!\s*wait_for_thaw\s*\)[\s\S]*break[\s\S]*err\s*=\s*lock_warmcopy_wait_for_conversion_thaw\s*\(\s*trx\s*\)[\s\S]*if\s*\(\s*err\s*!=\s*DB_SUCCESS\s*\)[\s\S]*break/s;
+die "frozen conversion must expose deterministic sync points for MTR stress\n"
+  unless $impl_to_expl =~ /DEBUG_SYNC_C\s*\(\s*"lock_warmcopy_impl_to_expl_after_freeze_check"\s*\)/s &&
+         $impl_to_expl =~ /DEBUG_SYNC_C\s*\(\s*"lock_warmcopy_impl_to_expl_before_return_frozen"\s*\)/s;
+
+die "GUnit must cover wait success after thaw\n"
+  unless $gunit =~ /WaitForThawReturnsSuccessAfterThaw/s &&
+         $gunit =~ /lock_warmcopy_wait_for_conversion_thaw_for_unit_test\s*\(\s*&trx,\s*1000\s*\)/s &&
+         $gunit =~ /EXPECT_EQ\s*\(\s*DB_SUCCESS/s;
+die "GUnit must cover timeout while frozen\n"
+  unless $gunit =~ /WaitForThawTimesOutWhenStillFrozen/s &&
+         $gunit =~ /lock_warmcopy_wait_for_conversion_thaw_for_unit_test\s*\(\s*&trx,\s*0\s*\)/s &&
+         $gunit =~ /EXPECT_EQ\s*\(\s*DB_LOCK_WAIT_TIMEOUT/s;
+die "GUnit must assert conversion wait status accounting\n"
+  unless $gunit =~ /lock_warmcopy_conversion_freeze_wait_count/s &&
+         $gunit =~ /EXPECT_EQ\s*\(\s*wait_count_before\s*\+\s*1/s;
+
+die "runtime MTR must keep the command-barrier no-wait/skip-locked coverage\n"
+  unless $runtime_mtr =~ /FOR UPDATE SKIP LOCKED/s &&
+         $runtime_mtr =~ /FOR UPDATE NOWAIT/s &&
+         $runtime_mtr =~ /PRESERVE_LOCK_WARMCOPY.*action=warmcopy_success.*reason=ok/s;
+
+EOF
+
+SELECT 'ok' AS batch_drain_lock_warmcopy_conversion_wait_retry;

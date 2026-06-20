@@ -1,0 +1,36 @@
+DROP TABLE IF EXISTS t_lock_warmcopy_spill_budget;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_max_memory_bytes=1;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+CREATE TABLE t_lock_warmcopy_spill_budget(
+id INT PRIMARY KEY,
+v INT,
+pad VARBINARY(128)
+) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_spill_budget VALUES
+(1,10,REPEAT('a',64)),
+(2,20,REPEAT('b',64));
+START TRANSACTION;
+UPDATE t_lock_warmcopy_spill_budget SET v=21, pad=REPEAT('c',64)
+WHERE id=2;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SELECT COUNT(*) AS preserved_count_after_spill
+FROM performance_schema.preserved_transactions;
+preserved_count_after_spill
+1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+SELECT COUNT(*) AS preserved_count_after_spill_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_spill_resume
+0
+SELECT id, v, pad=REPEAT('c',64) AS pad_ok
+FROM t_lock_warmcopy_spill_budget
+ORDER BY id;
+id	v	pad_ok
+1	10	0
+2	21	1
+DROP TABLE t_lock_warmcopy_spill_budget;
