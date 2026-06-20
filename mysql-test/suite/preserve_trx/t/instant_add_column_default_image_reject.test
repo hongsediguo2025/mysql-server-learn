@@ -8,6 +8,7 @@ DROP TABLE IF EXISTS t_instant_default_marker;
 SET GLOBAL preserve_trx_enable=ON;
 --disable_query_log
 CALL mtr.add_suppression("PRESERVE rejected.*record_lock_identity_build_failed");
+CALL mtr.add_suppression("Preserve record lock identity rebuild failed: reason=record_image_failed");
 --enable_query_log
 
 CREATE TABLE t_instant_default_image(

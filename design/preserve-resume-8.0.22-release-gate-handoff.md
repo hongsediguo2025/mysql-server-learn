@@ -570,3 +570,117 @@ ps scan:
   no residual lock-warmcopy-nfr2, resumable_trx_nfr2_benchmark.py,
   resumable_trx_business_e2e.py, or NFR mysqld process
 ```
+
+## Lock Warmcopy Correctness Fix Addendum, 2026-06-21
+
+This addendum tracks the follow-up fixes on the same branch after the deeper
+record payload, store lifetime, spill ownership, and rollback/conversion review:
+
+```text
+worktree: /Users/a1234/project/mysql-server-8022-preserve-port
+branch: codex/preserve-trx-lock-warmcopy
+starting HEAD for this fix round: 9a53ce15f2ed06b638aadaaa4efa493e14ffec8d
+rule: keep MySQL 8.0.22 native hot-path changes narrow and auditable
+```
+
+Correctness changes in this round:
+
+- phase 2 now builds the artifact `record_locks_payload` from the sealed
+  InnoDB record warmcopy store result; quiesced live export is retained for
+  canonical equivalence and fallback, not as the default artifact source;
+- record warmcopy store state is cleared when targets are prepared, finalized,
+  or aborted, preventing thread-id reuse or consecutive drain contamination;
+- lock warmcopy spill files now live under an instance-private root derived from
+  datadir/server UUID/port, with an owner marker; orphan cleanup only scans the
+  current instance root and does not delete foreign owner artifacts;
+- partial rollback implicit-to-explicit conversion no longer propagates transient
+  warmcopy conversion freeze timeout/interruption as a rollback fatal path;
+- sysvar text and documentation now state that
+  `preserve_trx_lock_warmcopy_max_memory_bytes` is an artifact payload memory
+  budget, not a process heap cap, and that `preserve_trx_lock_warmcopy_seal_threads`
+  is currently reserved/serial.
+
+Fresh local evidence for this fix round:
+
+```text
+debug GUnit:
+  build-debug/runtime_output_directory/preserve_trx_lock_warmcopy-t
+  status: passed 45 tests
+
+  build-debug/runtime_output_directory/lock0warmcopy-t
+  status: passed 33 tests
+
+targeted debug MTR:
+  build-debug/mysql-test/mysql-test-run.pl --suite=preserve_trx
+    batch_drain_lock_warmcopy_conversion_wait_retry --debug-server --parallel=1
+  status: passed
+
+  build-debug/mysql-test/mysql-test-run.pl --suite=preserve_trx
+    <all lock_warmcopy/preserve_trx_lock_warmcopy named tests>
+    --debug-server --parallel=4
+  status: passed 44 tests
+
+full preserve_trx debug MTR, log-bin default:
+  build-debug/mysql-test/mysql-test-run.pl --suite=preserve_trx
+    --debug-server --parallel=4
+  status: passed 274 executed tests, 138 skipped
+  evidence: /tmp/preserve_trx_logbin_full.log
+
+full preserve_trx debug MTR, no-bin:
+  build-debug/mysql-test/mysql-test-run.pl --suite=preserve_trx
+    --debug-server --parallel=4 --mysqld=--skip-log-bin
+  status: passed 295 executed tests, 117 skipped
+  evidence: /tmp/preserve_trx_nobin_full.log
+
+release build and lock warmcopy GUnit:
+  cmake --build build-release --target lock0warmcopy-t preserve_trx_lock_warmcopy-t mysqld -j4
+  status: passed; warnings observed are existing macOS/MySQL 8.0.22 warnings
+
+  build-release/runtime_output_directory/lock0warmcopy-t
+  status: passed 33 tests
+  evidence: build-release/lock-warmcopy-reports/lock0warmcopy-release-current.log
+
+  build-release/runtime_output_directory/preserve_trx_lock_warmcopy-t
+  status: passed 45 tests
+  evidence: build-release/lock-warmcopy-reports/preserve_trx_lock_warmcopy-release-current.log
+
+release hot-path gate:
+  scripts/resumable_trx_nfr2_benchmark.py --scenario none
+    --hotpath-benchmark-log build-release/lock-warmcopy-reports/lock0warmcopy-release-current.log
+    --require-hotpath-benchmark-gates
+  status: passed; baseline=2ns/iter, disabled=2ns/iter, disabled regression=0.0%, enabled=21ns/iter
+  evidence: build-release/lock-warmcopy-reports/hotpath-gate-current.json
+
+scaled release NFR:
+  scripts/lock_warmcopy_nfr2_runner.py run-scaled --build-dir build-release
+    --work-dir /tmp/lwc-nfr2-current --clean --stop-after
+    --sessions 16 --tables 8 --statements-per-tx 1000
+    --seed-rows-per-table-per-session 1000 --lockset-batch-size 1000
+    --cycles 1 --drain-interval 0.1 --preserve-timeout 600
+  status: passed; live phase2 p95=1322.212916ms, lock warmcopy phase2 p95=30.955750ms,
+    warmcopy_success=16, sealed_valid=16
+  evidence: build-release/lock-warmcopy-reports/nfr2-scaled-current.json
+
+full 1000-session large-lockset NFR:
+  status: not run on this host; runner requires 48GiB available and this volume
+    had about 46GiB free at the check time
+
+invasive-surface and helper tests:
+  python3 scripts/lock_warmcopy_invasive_surface.py --fail-on-expanded-high-risk
+  status: passed; `storage/innobase/row/row0undo.cc` is classified as a
+    high-risk but approved warmcopy-related undo conversion point, with the
+    disabled-warmcopy legacy-semantics requirement still called out
+
+  python3 -m unittest scripts.tests.test_lock_warmcopy_invasive_surface \
+    scripts.tests.test_lock_warmcopy_nfr2_runner \
+    scripts.tests.test_resumable_trx_nfr2_benchmark
+  status: passed 41 tests using stdlib unittest; system Python did not have
+    pytest installed
+```
+
+This addendum closes the local debug preserve/resume regression gate for this
+fix round and adds release-build, hot-path, and scaled NFR evidence. It does not
+close the full release gate by itself: the branch still needs the full
+1000-session large-lock workload on a host with enough disk space, plus the
+broader release-farm/full-MySQL gate before the default-ON lock warmcopy posture
+can be called production-ready.

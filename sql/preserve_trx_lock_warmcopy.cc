@@ -534,8 +534,60 @@ bool sync_directory(const std::string &dir) {
   return !error;
 }
 
-std::string lock_warmcopy_spill_root_dir() {
+std::string lock_warmcopy_spill_base_dir() {
   return join_path(mysql_tmpdir, "preserve-lock-warmcopy");
+}
+
+std::string lock_warmcopy_spill_owner_id() {
+  std::string seed;
+  const char *data_home =
+      mysql_real_data_home_ptr != nullptr ? mysql_real_data_home_ptr
+                                          : mysql_real_data_home;
+  if (data_home != nullptr) seed.append(data_home);
+  seed.push_back('\0');
+  if (server_uuid[0] != '\0') seed.append(server_uuid);
+  seed.push_back('\0');
+  seed.append(std::to_string(mysqld_port));
+  return "instance-" + std::to_string(fnv1a64(seed));
+}
+
+std::string lock_warmcopy_spill_root_dir() {
+  return join_path(lock_warmcopy_spill_base_dir(),
+                   lock_warmcopy_spill_owner_id());
+}
+
+std::string lock_warmcopy_spill_owner_marker_path(
+    const std::string &root) {
+  return join_path(root, "owner");
+}
+
+bool write_lock_warmcopy_spill_owner_marker(const std::string &root) {
+  const std::string marker = lock_warmcopy_spill_owner_marker_path(root);
+  const std::string payload = lock_warmcopy_spill_owner_id() + "\n";
+  File file =
+      my_create(marker.c_str(), 0600, O_WRONLY | O_TRUNC, MYF(0));
+  if (file < 0) return false;
+  bool error = !write_all(file, reinterpret_cast<const unsigned char *>(
+                                    payload.data()),
+                          payload.size());
+  if (my_close(file, MYF(0))) error = true;
+  return !error;
+}
+
+bool lock_warmcopy_spill_root_has_owner_marker(const std::string &root) {
+  const std::string marker = lock_warmcopy_spill_owner_marker_path(root);
+  File file = my_open(marker.c_str(), O_RDONLY, MYF(0));
+  if (file < 0) return false;
+
+  char buffer[128];
+  const size_t bytes = my_read(file, reinterpret_cast<uchar *>(buffer),
+                               sizeof(buffer), MYF(0));
+  const bool close_failed = my_close(file, MYF(0)) != 0;
+  if (close_failed || bytes == MY_FILE_ERROR) return false;
+
+  std::string payload(buffer, bytes);
+  if (!payload.empty() && payload.back() == '\n') payload.pop_back();
+  return payload == lock_warmcopy_spill_owner_id();
 }
 
 std::string lock_warmcopy_spill_batch_dir(uint64_t epoch) {
@@ -638,11 +690,13 @@ bool cleanup_spill_batch_dir(const std::string &batch_dir) {
 bool ensure_lock_warmcopy_spill_dir(uint64_t epoch, uint64_t thread_id,
                                     std::string *dir) {
   if (dir == nullptr) return false;
+  const std::string base = lock_warmcopy_spill_base_dir();
   const std::string root = lock_warmcopy_spill_root_dir();
   const std::string batch = lock_warmcopy_spill_batch_dir(epoch);
   const std::string target = lock_warmcopy_spill_target_dir(epoch, thread_id);
-  if (!ensure_directory(root) || !ensure_directory(batch) ||
-      !ensure_directory(target)) {
+  if (!ensure_directory(base) || !ensure_directory(root) ||
+      !write_lock_warmcopy_spill_owner_marker(root) ||
+      !ensure_directory(batch) || !ensure_directory(target)) {
     return false;
   }
   *dir = target;
@@ -1052,7 +1106,7 @@ class Lock_warmcopy_target_fence_sampler final : public Do_THD_Impl {
         (record_locks_payload.empty() ||
          trx_preserve_record_locks_payload_lock_count(record_locks_payload,
                                                       &record_lock_count))) {
-      m_record_locks.emplace(thread_id, record_locks_payload);
+      m_record_locks.emplace(thread_id, std::move(record_locks_payload));
       m_record_lock_counts.emplace(thread_id, record_lock_count);
     } else {
       m_record_locks_failed.insert(thread_id);
@@ -1064,7 +1118,7 @@ class Lock_warmcopy_target_fence_sampler final : public Do_THD_Impl {
                                         m_max_lock_count, 0) == DB_SUCCESS &&
         trx_preserve_table_locks_payload_lock_count(table_locks_payload,
                                                     &table_lock_count)) {
-      m_table_locks.emplace(thread_id, table_locks_payload);
+      m_table_locks.emplace(thread_id, std::move(table_locks_payload));
       m_table_lock_counts.emplace(thread_id, table_lock_count);
       m_autoinc_locks.emplace(
           thread_id,
@@ -1078,7 +1132,7 @@ class Lock_warmcopy_target_fence_sampler final : public Do_THD_Impl {
     if (!candidate->mdl_context.export_preserved_locks(
             &mdl_descriptors_payload, &mdl_descriptor_count) &&
         mdl_descriptor_count <= std::numeric_limits<uint32_t>::max()) {
-      m_mdl_descriptors.emplace(thread_id, mdl_descriptors_payload);
+      m_mdl_descriptors.emplace(thread_id, std::move(mdl_descriptors_payload));
       m_mdl_descriptor_counts.emplace(
           thread_id, static_cast<uint32_t>(mdl_descriptor_count));
     } else {
@@ -1094,8 +1148,8 @@ class Lock_warmcopy_target_fence_sampler final : public Do_THD_Impl {
     return true;
   }
 
-  bool record_locks_for_thread(uint64_t thread_id, std::string *payload,
-                               uint32_t *lock_count) const {
+  bool take_record_locks_for_thread(uint64_t thread_id, std::string *payload,
+                                    uint32_t *lock_count) {
     if (payload == nullptr || lock_count == nullptr ||
         m_record_locks_failed.count(thread_id) != 0) {
       return false;
@@ -1108,8 +1162,10 @@ class Lock_warmcopy_target_fence_sampler final : public Do_THD_Impl {
       return false;
     }
 
-    *payload = payload_it->second;
+    *payload = std::move(payload_it->second);
     *lock_count = count_it->second;
+    m_record_locks.erase(payload_it);
+    m_record_lock_counts.erase(count_it);
     return true;
   }
 
@@ -1179,6 +1235,9 @@ preserve_trx_lock_warmcopy_current_options() {
   options.enabled = preserve_trx_lock_warmcopy_enable;
   options.fallback_to_live_export =
       preserve_trx_lock_warmcopy_fallback_to_live_export;
+  DBUG_EXECUTE_IF(
+      "preserve_trx_lock_warmcopy_validate_canonical_equivalence",
+      { options.validate_canonical_equivalence = true; });
   options.max_memory_bytes = preserve_trx_lock_warmcopy_max_memory_bytes;
   options.max_journal_bytes = preserve_trx_lock_warmcopy_max_journal_bytes;
   options.max_dirty_shards = preserve_trx_lock_warmcopy_max_dirty_shards;
@@ -1207,6 +1266,10 @@ bool preserve_trx_lock_warmcopy_cleanup_orphan_spill_files() {
   const std::string root = lock_warmcopy_spill_root_dir();
   MY_DIR *dir = my_dir(root.c_str(), MYF(MY_DONT_SORT | MY_WANT_STAT));
   if (dir == nullptr) return !directory_exists(root);
+  if (!lock_warmcopy_spill_root_has_owner_marker(root)) {
+    my_dirend(dir);
+    return true;
+  }
 
   bool ok = true;
   for (uint idx = 0; idx < dir->number_off_files; ++idx) {
@@ -1227,6 +1290,17 @@ bool preserve_trx_lock_warmcopy_cleanup_orphan_spill_files() {
 
   (void)rmdir(root.c_str());
   return true;
+}
+
+std::string preserve_trx_lock_warmcopy_spill_root_dir_for_unit_test() {
+  return lock_warmcopy_spill_root_dir();
+}
+
+bool preserve_trx_lock_warmcopy_write_spill_owner_marker_for_unit_test() {
+  const std::string base = lock_warmcopy_spill_base_dir();
+  const std::string root = lock_warmcopy_spill_root_dir();
+  return ensure_directory(base) && ensure_directory(root) &&
+         write_lock_warmcopy_spill_owner_marker(root);
 }
 
 const char *preserve_trx_lock_warmcopy_reason_name(
@@ -1500,6 +1574,7 @@ Preserve_trx_lock_warmcopy_drain_participant::
 }
 
 bool Preserve_trx_lock_warmcopy_drain_participant::open_phase1() {
+  m_record_store_cleanup_deferred_for_shutdown = false;
   if (!preserve_trx_lock_warmcopy_cleanup_orphan_spill_files()) return false;
   m_epoch = lock_warmcopy_sql_epoch.fetch_add(1, std::memory_order_relaxed) + 1;
   lock_warmcopy_open_epoch(m_epoch);
@@ -1644,7 +1719,8 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
       continue;
     }
 
-    if (target->record_locks_payload.size() > m_options.max_journal_bytes) {
+    if (seal_result.record_locks_payload.size() >
+        m_options.max_journal_bytes) {
       seal_invalid_target(
           thread_id, target,
           Preserve_trx_lock_warmcopy_reason::RESOURCE_LIMIT_EXCEEDED,
@@ -1652,8 +1728,8 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
       continue;
     }
 
-    if (target->record_lock_count > m_options.max_lock_count ||
-        target->record_lock_count + target->table_lock_count >
+    if (seal_result.record_lock_count > m_options.max_lock_count ||
+        seal_result.record_lock_count + target->table_lock_count >
             m_options.max_lock_count) {
       seal_invalid_target(
           thread_id, target,
@@ -1671,13 +1747,13 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
     }
 
     Preserve_trx_lock_warmcopy_artifact artifact;
-    artifact.record_locks_payload = target->record_locks_payload;
+    artifact.record_locks_payload = seal_result.record_locks_payload;
     artifact.table_locks_payload = target->table_locks_payload;
     artifact.mdl_descriptors_payload = target->mdl_descriptors_payload;
     artifact.autoinc_lock_owned = target->autoinc_lock_owned;
     artifact.record_live_seal_fence_valid = true;
     artifact.record_live_seal_fence = target->record_live_seal_fence;
-    artifact.record_lock_count = target->record_lock_count;
+    artifact.record_lock_count = seal_result.record_lock_count;
     artifact.table_lock_count = target->table_lock_count;
     artifact.record_predicate_table_lock_count =
         artifact.record_lock_count + artifact.table_lock_count;
@@ -1749,9 +1825,18 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
   return true;
 }
 
+void Preserve_trx_lock_warmcopy_drain_participant::
+    clear_record_stores_for_targets() {
+  for (const uint64_t thread_id : m_target_thread_ids) {
+    lock_warmcopy_record_store_clear_for_target(thread_id);
+  }
+  m_record_store_cleanup_deferred_for_shutdown = false;
+}
+
 void Preserve_trx_lock_warmcopy_drain_participant::abort_phase() {
   lock_warmcopy_close_epoch();
   cleanup_spill_paths(&m_spill_paths);
+  clear_record_stores_for_targets();
   m_observation.state = Preserve_trx_drain_participant_state::ABANDONED;
   m_observation.owns_artifact = false;
 }
@@ -1759,8 +1844,31 @@ void Preserve_trx_lock_warmcopy_drain_participant::abort_phase() {
 void Preserve_trx_lock_warmcopy_drain_participant::finalize_phase() {
   lock_warmcopy_close_epoch();
   cleanup_spill_paths(&m_spill_paths);
+  clear_record_stores_for_targets();
   m_observation.state = Preserve_trx_drain_participant_state::FINALIZED;
   m_observation.owns_artifact = false;
+}
+
+void Preserve_trx_lock_warmcopy_drain_participant::
+    finalize_phase_for_shutdown() {
+  lock_warmcopy_close_epoch();
+  cleanup_spill_paths(&m_spill_paths);
+  /*
+    On the successful DRAIN ... PRESERVE path the server immediately enters
+    shutdown after finalize. The record warm-copy store is process-local and
+    no longer part of the durable preserve artifact, so walking huge per-target
+    maps here only extends phase-2 pause. Keep abort/failure paths explicit.
+  */
+  m_record_store_cleanup_deferred_for_shutdown = !m_target_thread_ids.empty();
+  m_observation.state = Preserve_trx_drain_participant_state::FINALIZED;
+  m_observation.owns_artifact = false;
+}
+
+void Preserve_trx_lock_warmcopy_drain_participant::
+    cleanup_after_failed_shutdown() {
+  if (m_record_store_cleanup_deferred_for_shutdown) {
+    clear_record_stores_for_targets();
+  }
 }
 
 Preserve_trx_drain_participant_observation
@@ -1799,6 +1907,9 @@ Preserve_trx_lock_warmcopy_drain_participant::artifact_for_thread(
 
 bool Preserve_trx_lock_warmcopy_drain_participant::prepare_quiesced_targets(
     const std::vector<uint64_t> &thread_ids) {
+  for (const uint64_t old_thread_id : m_target_thread_ids) {
+    lock_warmcopy_record_store_clear_for_target(old_thread_id);
+  }
   m_target_thread_ids = thread_ids;
   m_artifacts.clear();
   m_targets.clear();
@@ -1820,9 +1931,22 @@ bool Preserve_trx_lock_warmcopy_drain_participant::prepare_quiesced_targets(
           fence_sampler.fence_for_thread(
               target.first, &target.second.record_live_seal_fence);
       target.second.record_locks_candidate_valid =
-          fence_sampler.record_locks_for_thread(
+          fence_sampler.take_record_locks_for_thread(
               target.first, &target.second.record_locks_payload,
               &target.second.record_lock_count);
+      if (target.second.record_locks_candidate_valid) {
+        uint32_t seeded_record_lock_count = 0;
+        if (!lock_warmcopy_record_store_seed_payload_for_target(
+                target.first, target.second.record_locks_payload,
+                &seeded_record_lock_count) ||
+            seeded_record_lock_count != target.second.record_lock_count) {
+          target.second.record_locks_candidate_valid = false;
+          target.second.record_lock_count = 0;
+          lock_warmcopy_record_store_clear_for_target(target.first);
+        }
+        target.second.record_locks_payload.clear();
+        target.second.record_locks_payload.shrink_to_fit();
+      }
       target.second.table_locks_candidate_valid =
           fence_sampler.table_locks_for_thread(
               target.first, &target.second.table_locks_payload,

@@ -8076,55 +8076,58 @@ bool preserve_trx_kernel_preserve_attached_transaction(
 
   if (use_lock_warmcopy_artifact) {
     /*
-      Lock warmcopy compares the explicit record-lock family here.  Do not
-      materialize implicit X-locks before this comparison: implicit native
-      continuity is a separate family, and forcing it into explicit live export
-      would make every native implicit-only writer fail canonical equivalence.
-      The live fallback path still materializes before exporting.
+      The production warmcopy path trusts the sealed artifact plus final fences.
+      Re-exporting every explicit record lock here would put the phase-2 pause
+      back on the same O(lock count) path as live export. Debug/test builds may
+      opt into the canonical comparator to prove equivalence without making it
+      part of the default runtime contract.
     */
-    const char *record_failure = export_live_record_locks_preflight();
-    if (record_failure != nullptr) {
-      return reject_after_binlog_export(record_failure);
-    }
-    const Preserve_trx_lock_warmcopy_canonical_compare_result record_compare =
-        preserve_trx_lock_warmcopy_compare_record_payloads_canonical(
-            record_locks_preflight_payload,
-            lock_warmcopy_artifact->record_locks_payload);
-    if (!record_compare.equivalent) {
-      DBUG_EXECUTE_IF(
-          "preserve_trx_lock_warmcopy_log_record_compare",
-          {
-            const std::string message =
-                "PRESERVE: lock warmcopy record canonical mismatch"
-                " difference=" +
-                record_compare.difference +
-                " live_bytes=" +
-                std::to_string(record_locks_preflight_payload.size()) +
-                " warmcopy_bytes=" +
-                std::to_string(
-                    lock_warmcopy_artifact->record_locks_payload.size()) +
-                " live_count=" +
-                std::to_string(record_locks_preflight_count) +
-                " warmcopy_count=" +
-                std::to_string(lock_warmcopy_artifact->record_lock_count);
-            LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
-          });
-      preserve_trx_lock_warmcopy_note_canonical_mismatch("record");
-      if (!lock_warmcopy_options.fallback_to_live_export) {
-        preserve_trx_lock_warmcopy_note_route_reject(
-            Preserve_trx_lock_warmcopy_reason::
-                CANONICAL_EQUIVALENCE_FAILED);
-        return reject_after_binlog_export(
-            preserve_trx_lock_warmcopy_reason_name(
-                Preserve_trx_lock_warmcopy_reason::
-                    CANONICAL_EQUIVALENCE_FAILED));
+    record_locks_preflight_count = lock_warmcopy_artifact->record_lock_count;
+    if (lock_warmcopy_options.validate_canonical_equivalence) {
+      const char *record_failure = export_live_record_locks_preflight();
+      if (record_failure != nullptr) {
+        return reject_after_binlog_export(record_failure);
       }
-      preserve_trx_lock_warmcopy_note_route_fallback(
-          Preserve_trx_lock_warmcopy_reason::CANONICAL_EQUIVALENCE_FAILED);
-      const char *fallback_failure =
-          switch_lock_warmcopy_to_live_export_for_preflight();
-      if (fallback_failure != nullptr) {
-        return reject_after_binlog_export(fallback_failure);
+      const Preserve_trx_lock_warmcopy_canonical_compare_result record_compare =
+          preserve_trx_lock_warmcopy_compare_record_payloads_canonical(
+              record_locks_preflight_payload,
+              lock_warmcopy_artifact->record_locks_payload);
+      if (!record_compare.equivalent) {
+        DBUG_EXECUTE_IF(
+            "preserve_trx_lock_warmcopy_log_record_compare",
+            {
+              const std::string message =
+                  "PRESERVE: lock warmcopy record canonical mismatch"
+                  " difference=" +
+                  record_compare.difference +
+                  " live_bytes=" +
+                  std::to_string(record_locks_preflight_payload.size()) +
+                  " warmcopy_bytes=" +
+                  std::to_string(
+                      lock_warmcopy_artifact->record_locks_payload.size()) +
+                  " live_count=" +
+                  std::to_string(record_locks_preflight_count) +
+                  " warmcopy_count=" +
+                  std::to_string(lock_warmcopy_artifact->record_lock_count);
+              LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
+            });
+        preserve_trx_lock_warmcopy_note_canonical_mismatch("record");
+        if (!lock_warmcopy_options.fallback_to_live_export) {
+          preserve_trx_lock_warmcopy_note_route_reject(
+              Preserve_trx_lock_warmcopy_reason::
+                  CANONICAL_EQUIVALENCE_FAILED);
+          return reject_after_binlog_export(
+              preserve_trx_lock_warmcopy_reason_name(
+                  Preserve_trx_lock_warmcopy_reason::
+                      CANONICAL_EQUIVALENCE_FAILED));
+        }
+        preserve_trx_lock_warmcopy_note_route_fallback(
+            Preserve_trx_lock_warmcopy_reason::CANONICAL_EQUIVALENCE_FAILED);
+        const char *fallback_failure =
+            switch_lock_warmcopy_to_live_export_for_preflight();
+        if (fallback_failure != nullptr) {
+          return reject_after_binlog_export(fallback_failure);
+        }
       }
     }
   }
@@ -9214,8 +9217,8 @@ bool Preserve_trx_drain_service::execute(
                                                     INFORMATION_LEVEL);
   };
 
-  auto finalize_drain_participants = [&](const char *stage) {
-    drain_orchestrator.finalize_participants();
+  auto finalize_drain_participants_for_shutdown = [&](const char *stage) {
+    drain_orchestrator.finalize_participants_for_shutdown();
     log_preserve_trx_drain_participant_observations(
         drain_orchestrator, stage, INFORMATION_LEVEL);
   };
@@ -9269,7 +9272,7 @@ bool Preserve_trx_drain_service::execute(
         return false;
       }
     });
-    finalize_drain_participants("finish");
+    finalize_drain_participants_for_shutdown("finish");
     draining.transition_to(Preserve_trx_manager_state::SHUTDOWN_REQUESTED);
 
     const bool shutdown_success = shutdown(thd, SHUTDOWN_DEFAULT);
@@ -9278,6 +9281,7 @@ bool Preserve_trx_drain_service::execute(
       return false;
     }
 
+    drain_orchestrator.cleanup_after_failed_shutdown();
     return true;
   };
 

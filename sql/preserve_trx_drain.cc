@@ -114,6 +114,18 @@ void Preserve_trx_drain_orchestrator::finalize_participants() {
   }
 }
 
+void Preserve_trx_drain_orchestrator::finalize_participants_for_shutdown() {
+  for (Preserve_trx_drain_participant *participant : m_participants) {
+    participant->finalize_phase_for_shutdown();
+  }
+}
+
+void Preserve_trx_drain_orchestrator::cleanup_after_failed_shutdown() {
+  for (Preserve_trx_drain_participant *participant : m_participants) {
+    participant->cleanup_after_failed_shutdown();
+  }
+}
+
 std::vector<Preserve_trx_drain_participant_observation>
 Preserve_trx_drain_orchestrator::observations() const {
   std::vector<Preserve_trx_drain_participant_observation> result;

@@ -35,6 +35,7 @@
 struct Preserve_trx_lock_warmcopy_options {
   bool enabled{true};
   bool fallback_to_live_export{true};
+  bool validate_canonical_equivalence{false};
   uint64_t max_memory_bytes{268435456ULL};
   uint64_t max_journal_bytes{1073741824ULL};
   uint32_t max_dirty_shards{100000};
@@ -141,6 +142,8 @@ bool preserve_trx_lock_warmcopy_effective();
 bool preserve_trx_lock_warmcopy_requires_two_phase(
     bool binlog_warmcopy_effective);
 bool preserve_trx_lock_warmcopy_cleanup_orphan_spill_files();
+std::string preserve_trx_lock_warmcopy_spill_root_dir_for_unit_test();
+bool preserve_trx_lock_warmcopy_write_spill_owner_marker_for_unit_test();
 const char *preserve_trx_lock_warmcopy_reason_name(
     Preserve_trx_lock_warmcopy_reason reason);
 Preserve_trx_lock_warmcopy_route preserve_trx_lock_warmcopy_route_artifact(
@@ -188,6 +191,8 @@ class Preserve_trx_lock_warmcopy_drain_participant final
   bool phase2_preflight(Preserve_trx_drain_phase_mode mode) override;
   void abort_phase() override;
   void finalize_phase() override;
+  void finalize_phase_for_shutdown() override;
+  void cleanup_after_failed_shutdown() override;
   Preserve_trx_drain_participant_observation observation() const override;
 
   const Preserve_trx_lock_warmcopy_artifact *artifact_for_thread(
@@ -235,6 +240,9 @@ class Preserve_trx_lock_warmcopy_drain_participant final
   std::vector<std::string> m_spill_paths;
   std::vector<uint64_t> m_target_thread_ids;
   uint64_t m_epoch{0};
+  bool m_record_store_cleanup_deferred_for_shutdown{false};
+
+  void clear_record_stores_for_targets();
 };
 
 #endif  // SQL_PRESERVE_TRX_LOCK_WARMCOPY_INCLUDED

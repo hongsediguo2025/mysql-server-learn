@@ -1324,8 +1324,9 @@ static Sys_var_bool Sys_preserve_trx_lock_warmcopy_fallback_to_live_export(
 
 static Sys_var_ulonglong Sys_preserve_trx_lock_warmcopy_max_memory_bytes(
     "preserve_trx_lock_warmcopy_max_memory_bytes",
-    "Maximum heap bytes for Preserve/Resume lock warm-copy state in one drain "
-    "epoch before spill or fail-closed handling is required.",
+    "Maximum Preserve/Resume lock warm-copy artifact payload bytes retained "
+    "in memory in one drain epoch before spill or fail-closed handling is "
+    "required. This is not a total process heap limit.",
     GLOBAL_VAR(preserve_trx_lock_warmcopy_max_memory_bytes),
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, ULLONG_MAX), DEFAULT(268435456ULL),
     BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
@@ -1356,8 +1357,8 @@ static Sys_var_uint Sys_preserve_trx_lock_warmcopy_max_mdl_descriptors(
 
 static Sys_var_uint Sys_preserve_trx_lock_warmcopy_seal_threads(
     "preserve_trx_lock_warmcopy_seal_threads",
-    "Number of lock warm-copy phase-2 seal worker threads. Zero lets the "
-    "implementation choose bounded automatic parallelism.",
+    "Reserved lock warm-copy phase-2 seal worker thread setting. Current "
+    "8.0.22 implementation seals targets serially; keep this at 0.",
     GLOBAL_VAR(preserve_trx_lock_warmcopy_seal_threads),
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 1024), DEFAULT(0), BLOCK_SIZE(1),
     NO_MUTEX_GUARD, NOT_IN_BINLOG);

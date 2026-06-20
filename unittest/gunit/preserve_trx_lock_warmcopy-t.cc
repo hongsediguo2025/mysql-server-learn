@@ -97,6 +97,17 @@ void create_file_for_test(const std::string &path) {
   ASSERT_EQ(0, my_close(file, MYF(0))) << path;
 }
 
+void create_file_with_payload_for_test(const std::string &path,
+                                       const std::string &payload) {
+  File file = my_create(path.c_str(), 0600, O_WRONLY | O_TRUNC, MYF(0));
+  ASSERT_GE(file, 0) << path;
+  ASSERT_EQ(payload.size(),
+            my_write(file, reinterpret_cast<const uchar *>(payload.data()),
+                     payload.size(), MYF(0)))
+      << path;
+  ASSERT_EQ(0, my_close(file, MYF(0))) << path;
+}
+
 std::string make_heap_offsets(uint32_t heap_no) {
   std::string offsets;
   append_u32(&offsets, heap_no * 10);
@@ -313,6 +324,62 @@ TEST(PreserveTrxLockWarmcopyDrainParticipant,
       participant.observation();
   EXPECT_TRUE(observation.owns_artifact);
   EXPECT_GT(observation.bytes_used, 0ULL);
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     Phase2PreflightUsesSealedRecordStorePayloadNotLiveCandidate) {
+  lock_warmcopy_reset_for_unit_test();
+  lock_warmcopy_record_shard_key_t key_a;
+  key_a.table_id = 100;
+  key_a.index_id = 200;
+  key_a.space_id = 7;
+  key_a.page_no = 11;
+  key_a.lock_type_mode = 3;
+  key_a.n_bits = 8;
+  lock_warmcopy_record_shard_key_t key_b = key_a;
+  key_b.table_id = 101;
+  key_b.index_id = 201;
+  key_b.page_no = 12;
+
+  lock_warmcopy_record_image_digest_t digest_a;
+  digest_a.bytes[0] = 0xa0;
+  lock_warmcopy_record_image_digest_t digest_b;
+  digest_b.bytes[0] = 0xb0;
+  ASSERT_TRUE(
+      lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
+          42, key_a, 2, digest_a, 20, make_record_image('a')));
+
+  Preserve_trx_lock_warmcopy_drain_participant participant(
+      preserve_trx_lock_warmcopy_current_options());
+  ASSERT_TRUE(participant.open_phase1());
+  ASSERT_TRUE(participant.prepare_quiesced_targets_for_unit_test({42}));
+
+  std::string live_candidate_payload;
+  ASSERT_TRUE(lock_warmcopy_record_store_export_record_payload_for_target(
+      42, &live_candidate_payload, nullptr));
+
+  ASSERT_TRUE(
+      lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
+          42, key_b, 4, digest_b, 40, make_record_image('b')));
+  std::string sealed_store_payload;
+  uint32_t sealed_store_count = 0;
+  ASSERT_TRUE(lock_warmcopy_record_store_export_record_payload_for_target(
+      42, &sealed_store_payload, &sealed_store_count));
+  ASSERT_NE(live_candidate_payload, sealed_store_payload);
+  ASSERT_EQ(2U, sealed_store_count);
+
+  ASSERT_TRUE(participant.close_phase1());
+  ASSERT_TRUE(participant.phase2_preflight(
+      Preserve_trx_drain_phase_mode::TWO_PHASE));
+
+  const Preserve_trx_lock_warmcopy_artifact *artifact =
+      participant.artifact_for_thread(42);
+  ASSERT_NE(nullptr, artifact);
+  EXPECT_TRUE(artifact->valid);
+  EXPECT_EQ(Preserve_trx_lock_warmcopy_reason::OK, artifact->reason);
+  EXPECT_EQ(sealed_store_payload, artifact->record_locks_payload);
+  EXPECT_EQ(2U, artifact->record_lock_count);
+  EXPECT_EQ(2U, artifact->record_predicate_table_lock_count);
 }
 
 TEST(PreserveTrxLockWarmcopyDrainParticipant,
@@ -603,17 +670,20 @@ TEST(PreserveTrxLockWarmcopyDrainParticipant,
 TEST(PreserveTrxLockWarmcopyDrainParticipant,
      OrphanSpillCleanupRemovesKnownBatchTargetArtifacts) {
   const std::string root =
-      join_path_for_test(mysql_tmpdir, "preserve-lock-warmcopy");
+      preserve_trx_lock_warmcopy_spill_root_dir_for_unit_test();
   const std::string batch_dir = join_path_for_test(root, "batch-987654");
   const std::string target_dir = join_path_for_test(batch_dir, "target-42");
   const std::string ignored_dir = join_path_for_test(root, "not-a-batch");
   const std::string ignored_file =
       join_path_for_test(ignored_dir, "segment-000001.dat");
+  const std::string owner_path = join_path_for_test(root, "owner");
 
+  ensure_dir_for_test(parent_path_for_test(root));
   ensure_dir_for_test(root);
   ensure_dir_for_test(batch_dir);
   ensure_dir_for_test(target_dir);
   ensure_dir_for_test(ignored_dir);
+  ASSERT_TRUE(preserve_trx_lock_warmcopy_write_spill_owner_marker_for_unit_test());
   create_file_for_test(join_path_for_test(target_dir, "manifest"));
   create_file_for_test(join_path_for_test(target_dir, "manifest.tmp"));
   create_file_for_test(join_path_for_test(target_dir, "segment-000001.dat"));
@@ -630,7 +700,73 @@ TEST(PreserveTrxLockWarmcopyDrainParticipant,
   EXPECT_EQ(0, my_access(ignored_file.c_str(), F_OK));
 
   (void)my_delete(ignored_file.c_str(), MYF(0));
+  (void)my_delete(owner_path.c_str(), MYF(0));
   (void)rmdir(ignored_dir.c_str());
+  (void)rmdir(root.c_str());
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     OrphanSpillCleanupPreservesForeignOwnerArtifacts) {
+  const std::string root =
+      join_path_for_test(mysql_tmpdir, "preserve-lock-warmcopy");
+  const std::string batch_dir = join_path_for_test(root, "batch-777001");
+  const std::string target_dir = join_path_for_test(batch_dir, "target-42");
+  const std::string owner_path = join_path_for_test(root, "owner");
+  const std::string manifest_path = join_path_for_test(target_dir, "manifest");
+  const std::string segment_path =
+      join_path_for_test(target_dir, "segment-000001.dat");
+
+  ensure_dir_for_test(root);
+  ensure_dir_for_test(batch_dir);
+  ensure_dir_for_test(target_dir);
+  create_file_for_test(owner_path);
+  create_file_for_test(manifest_path);
+  create_file_for_test(segment_path);
+
+  ASSERT_TRUE(preserve_trx_lock_warmcopy_cleanup_orphan_spill_files());
+
+  EXPECT_EQ(0, my_access(owner_path.c_str(), F_OK));
+  EXPECT_EQ(0, my_access(manifest_path.c_str(), F_OK));
+  EXPECT_EQ(0, my_access(segment_path.c_str(), F_OK));
+
+  (void)my_delete(manifest_path.c_str(), MYF(0));
+  (void)my_delete(segment_path.c_str(), MYF(0));
+  (void)my_delete(owner_path.c_str(), MYF(0));
+  (void)rmdir(target_dir.c_str());
+  (void)rmdir(batch_dir.c_str());
+  (void)rmdir(root.c_str());
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     OrphanSpillCleanupPreservesMismatchedOwnerRoot) {
+  const std::string root =
+      preserve_trx_lock_warmcopy_spill_root_dir_for_unit_test();
+  const std::string batch_dir = join_path_for_test(root, "batch-777002");
+  const std::string target_dir = join_path_for_test(batch_dir, "target-42");
+  const std::string owner_path = join_path_for_test(root, "owner");
+  const std::string manifest_path = join_path_for_test(target_dir, "manifest");
+  const std::string segment_path =
+      join_path_for_test(target_dir, "segment-000001.dat");
+
+  ensure_dir_for_test(parent_path_for_test(root));
+  ensure_dir_for_test(root);
+  ensure_dir_for_test(batch_dir);
+  ensure_dir_for_test(target_dir);
+  create_file_with_payload_for_test(owner_path, "foreign-owner\n");
+  create_file_for_test(manifest_path);
+  create_file_for_test(segment_path);
+
+  ASSERT_TRUE(preserve_trx_lock_warmcopy_cleanup_orphan_spill_files());
+
+  EXPECT_EQ(0, my_access(owner_path.c_str(), F_OK));
+  EXPECT_EQ(0, my_access(manifest_path.c_str(), F_OK));
+  EXPECT_EQ(0, my_access(segment_path.c_str(), F_OK));
+
+  (void)my_delete(manifest_path.c_str(), MYF(0));
+  (void)my_delete(segment_path.c_str(), MYF(0));
+  (void)my_delete(owner_path.c_str(), MYF(0));
+  (void)rmdir(target_dir.c_str());
+  (void)rmdir(batch_dir.c_str());
   (void)rmdir(root.c_str());
 }
 
@@ -957,6 +1093,90 @@ TEST(PreserveTrxLockWarmcopyDrainParticipant, AbortMarksArtifactAbandoned) {
   EXPECT_EQ(Preserve_trx_drain_participant_state::ABANDONED,
             observation.state);
   EXPECT_FALSE(observation.owns_artifact);
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     FinalizeAndAbortClearRecordStoreForPreparedTargets) {
+  lock_warmcopy_reset_for_unit_test();
+  lock_warmcopy_record_shard_key_t key;
+  key.table_id = 100;
+  key.index_id = 200;
+  key.space_id = 7;
+  key.page_no = 11;
+  key.lock_type_mode = 3;
+  key.n_bits = 8;
+  lock_warmcopy_record_image_digest_t digest;
+  digest.bytes[0] = 0xa0;
+
+  ASSERT_TRUE(
+      lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
+          42, key, 2, digest, 20, make_record_image('a')));
+  {
+    Preserve_trx_lock_warmcopy_drain_participant participant(
+        preserve_trx_lock_warmcopy_current_options());
+    ASSERT_TRUE(participant.open_phase1());
+    ASSERT_TRUE(participant.prepare_quiesced_targets_for_unit_test({42}));
+    ASSERT_TRUE(participant.close_phase1());
+    ASSERT_TRUE(participant.phase2_preflight(
+        Preserve_trx_drain_phase_mode::TWO_PHASE));
+    participant.finalize_phase();
+  }
+  lock_warmcopy_record_shard_snapshot_t snapshot;
+  EXPECT_FALSE(lock_warmcopy_record_shard_snapshot_for_target_for_unit_test(
+      42, key, &snapshot));
+
+  ASSERT_TRUE(
+      lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
+          43, key, 3, digest, 30, make_record_image('b')));
+  {
+    Preserve_trx_lock_warmcopy_drain_participant participant(
+        preserve_trx_lock_warmcopy_current_options());
+    ASSERT_TRUE(participant.open_phase1());
+    ASSERT_TRUE(participant.prepare_quiesced_targets_for_unit_test({43}));
+    participant.abort_phase();
+  }
+  EXPECT_FALSE(lock_warmcopy_record_shard_snapshot_for_target_for_unit_test(
+      43, key, &snapshot));
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     ShutdownFinalizeDefersRecordStoreClearUntilShutdownFailure) {
+  lock_warmcopy_reset_for_unit_test();
+  lock_warmcopy_record_shard_key_t key;
+  key.table_id = 100;
+  key.index_id = 200;
+  key.space_id = 7;
+  key.page_no = 11;
+  key.lock_type_mode = 3;
+  key.n_bits = 8;
+  lock_warmcopy_record_image_digest_t digest;
+  digest.bytes[0] = 0xa0;
+
+  ASSERT_TRUE(
+      lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
+          42, key, 2, digest, 20, make_record_image('a')));
+
+  Preserve_trx_lock_warmcopy_drain_participant participant(
+      preserve_trx_lock_warmcopy_current_options());
+  ASSERT_TRUE(participant.open_phase1());
+  ASSERT_TRUE(participant.prepare_quiesced_targets_for_unit_test({42}));
+  ASSERT_TRUE(participant.close_phase1());
+  ASSERT_TRUE(participant.phase2_preflight(
+      Preserve_trx_drain_phase_mode::TWO_PHASE));
+
+  participant.finalize_phase_for_shutdown();
+
+  lock_warmcopy_record_shard_snapshot_t snapshot;
+  EXPECT_TRUE(lock_warmcopy_record_shard_snapshot_for_target_for_unit_test(
+      42, key, &snapshot));
+  ASSERT_EQ(1U, snapshot.normalized_bitmap.size());
+  EXPECT_NE(0U,
+            static_cast<unsigned char>(snapshot.normalized_bitmap[0]) &
+                (1U << 2));
+
+  participant.cleanup_after_failed_shutdown();
+  EXPECT_FALSE(lock_warmcopy_record_shard_snapshot_for_target_for_unit_test(
+      42, key, &snapshot));
 }
 
 TEST(PreserveTrxLockWarmcopyDrainParticipant,

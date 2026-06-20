@@ -46,6 +46,7 @@ my $lock_warmcopy = read_source('storage', 'innobase', 'lock',
                                 'lock0warmcopy.cc');
 my $lock_warmcopy_header = read_source('storage', 'innobase', 'include',
                                        'lock0warmcopy.h');
+my $row_undo = read_source('storage', 'innobase', 'row', 'row0undo.cc');
 my $gunit = read_source('unittest', 'gunit', 'innodb',
                         'lock0warmcopy-t.cc');
 my $runtime_mtr = read_source('mysql-test', 'suite', 'preserve_trx', 't',
@@ -89,6 +90,13 @@ die "ordinary frozen conversion must wait for thaw and loop back to retry\n"
 die "frozen conversion must expose deterministic sync points for MTR stress\n"
   unless $impl_to_expl =~ /DEBUG_SYNC_C\s*\(\s*"lock_warmcopy_impl_to_expl_after_freeze_check"\s*\)/s &&
          $impl_to_expl =~ /DEBUG_SYNC_C\s*\(\s*"lock_warmcopy_impl_to_expl_before_return_frozen"\s*\)/s;
+
+my $row_convert = extract_function(
+  $row_undo,
+  qr/dberr_t\s+row_convert_impl_to_expl_if_needed\s*\(/,
+  'row_convert_impl_to_expl_if_needed');
+die "partial rollback conversion must not propagate warmcopy freeze wait timeout/interruption into row_undo_step fatal\n"
+  unless $row_convert =~ /lock_rec_convert_active_impl_to_expl[\s\S]*if\s*\(\s*err\s*==\s*DB_LOCK_WAIT_TIMEOUT\s*\|\|\s*err\s*==\s*DB_INTERRUPTED\s*\)[\s\S]*return\s+DB_SUCCESS/s;
 
 die "GUnit must cover wait success after thaw\n"
   unless $gunit =~ /WaitForThawReturnsSuccessAfterThaw/s &&

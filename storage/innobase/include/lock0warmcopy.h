@@ -173,6 +173,9 @@ bool lock_warmcopy_record_store_export_record_payload(std::string *payload,
                                                       uint32_t *lock_count);
 bool lock_warmcopy_record_store_export_record_payload_for_target(
     uint64_t target_id, std::string *payload, uint32_t *lock_count);
+bool lock_warmcopy_record_store_seed_payload_for_target(
+    uint64_t target_id, const std::string &payload, uint32_t *lock_count);
+void lock_warmcopy_record_store_clear_for_target(uint64_t target_id);
 bool lock_warmcopy_record_store_fence_for_target(
     uint64_t target_id, lock_warmcopy_record_store_fence_t *fence);
 bool lock_warmcopy_record_store_fence_equal(

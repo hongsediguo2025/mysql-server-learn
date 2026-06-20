@@ -35,6 +35,7 @@
 #include <openssl/hmac.h>
 
 #include "my_sys.h"
+#include "my_dbug.h"
 #include "mysql_version.h"
 #include "sha2.h"
 #include "sql/field.h"
@@ -930,16 +931,13 @@ bool record_lock_type_mode_is_predicate(uint32_t type_mode) {
   return (type_mode & (kRecordLockPredicate | kRecordLockPredicatePage)) != 0;
 }
 
-bool read_record_lock_entry_bytes(const std::string &payload, size_t *offset,
-                                  std::string *entry_bytes,
-                                  bool *is_predicate) {
-  if (offset == nullptr || entry_bytes == nullptr || is_predicate == nullptr ||
-      *offset > payload.size() ||
+bool advance_record_lock_entry(const std::string &payload, size_t *offset,
+                               bool *is_predicate) {
+  if (offset == nullptr || is_predicate == nullptr || *offset > payload.size() ||
       payload.size() - *offset < kRecordLockEntryHeaderLength) {
     return true;
   }
 
-  const size_t start = *offset;
   *offset += 8;  // table_id
   *offset += 8;  // index_id
   *offset += 4;  // space_id
@@ -961,9 +959,39 @@ bool read_record_lock_entry_bytes(const std::string &payload, size_t *offset,
   if (variable_len > payload.size() - *offset) return true;
 
   *offset += static_cast<size_t>(variable_len);
-  entry_bytes->assign(payload.data() + start, *offset - start);
   *is_predicate = record_lock_type_mode_is_predicate(type_mode);
   return false;
+}
+
+bool read_record_lock_entry_bytes(const std::string &payload, size_t *offset,
+                                  std::string *entry_bytes,
+                                  bool *is_predicate) {
+  if (offset == nullptr || entry_bytes == nullptr || is_predicate == nullptr) {
+    return true;
+  }
+
+  const size_t start = *offset;
+  if (advance_record_lock_entry(payload, offset, is_predicate)) return true;
+  entry_bytes->assign(payload.data() + start, *offset - start);
+  return false;
+}
+
+bool record_lock_payload_has_only_family(const std::string &payload,
+                                         bool expected_predicate) {
+  if (payload.size() < 4) return false;
+
+  const uint32_t count = read_le32(payload, 0);
+  if (count == 0) return false;
+
+  size_t offset = 4;
+  for (uint32_t i = 0; i < count; ++i) {
+    bool is_predicate = false;
+    if (advance_record_lock_entry(payload, &offset, &is_predicate) ||
+        is_predicate != expected_predicate) {
+      return false;
+    }
+  }
+  return offset == payload.size();
 }
 
 void serialize_record_lock_entries(const std::vector<std::string> &entries,
@@ -977,6 +1005,8 @@ void serialize_record_lock_entries(const std::vector<std::string> &entries,
 bool split_record_and_predicate_locks_payload(
     const std::string &payload, std::string *record_locks_payload,
     std::string *predicate_locks_payload) {
+  DBUG_EXECUTE_IF("preserve_trx_fail_legacy_record_predicate_split",
+                  return false;);
   if (record_locks_payload == nullptr || predicate_locks_payload == nullptr)
     return false;
 
@@ -1484,23 +1514,14 @@ bool metadata_payloads_are_valid(const Preserve_snapshot_metadata &metadata,
   if (!metadata.has_read_view && !metadata.read_view_payload.empty())
     return false;
   if (!metadata.record_locks_payload.empty()) {
-    std::string record_locks;
-    std::string predicate_locks;
-    if (!split_record_and_predicate_locks_payload(
-            metadata.record_locks_payload, &record_locks, &predicate_locks) ||
-        record_locks.empty() || !predicate_locks.empty() ||
-        record_locks != metadata.record_locks_payload) {
+    if (!record_lock_payload_has_only_family(metadata.record_locks_payload,
+                                             false)) {
       return false;
     }
   }
   if (!metadata.predicate_locks_payload.empty()) {
-    std::string record_locks;
-    std::string predicate_locks;
-    if (!split_record_and_predicate_locks_payload(
-            metadata.predicate_locks_payload, &record_locks,
-            &predicate_locks) ||
-        !record_locks.empty() || predicate_locks.empty() ||
-        predicate_locks != metadata.predicate_locks_payload) {
+    if (!record_lock_payload_has_only_family(metadata.predicate_locks_payload,
+                                             true)) {
       return false;
     }
   }
@@ -1674,24 +1695,30 @@ bool apply_bundle_semantics(std::vector<Preserve_snapshot_tlv> *tlvs,
   metadata->record_locks_payload.clear();
   metadata->predicate_locks_payload.clear();
   if (record_locks != nullptr) {
-    std::string split_record_locks;
-    std::string split_predicate_locks;
-    if (!split_record_and_predicate_locks_payload(
-            record_locks->value, &split_record_locks,
-            &split_predicate_locks)) {
-      return true;
+    if (allow_legacy_no_deadline) {
+      std::string split_record_locks;
+      std::string split_predicate_locks;
+      if (!split_record_and_predicate_locks_payload(
+              record_locks->value, &split_record_locks,
+              &split_predicate_locks)) {
+        return true;
+      }
+      metadata->record_locks_payload = std::move(split_record_locks);
+      metadata->predicate_locks_payload = std::move(split_predicate_locks);
+    } else {
+      if (!record_lock_payload_has_only_family(record_locks->value, false)) {
+        return true;
+      }
+      metadata->record_locks_payload = record_locks->value;
     }
-    if (!allow_legacy_no_deadline && !split_predicate_locks.empty()) {
-      return true;
-    }
-    metadata->record_locks_payload = std::move(split_record_locks);
-    metadata->predicate_locks_payload = std::move(split_predicate_locks);
   }
 
   const Preserve_snapshot_tlv *predicate_locks =
       find_tlv(*tlvs, kTlvPredicateLocks);
   if (predicate_locks != nullptr) {
     if (allow_legacy_no_deadline || !metadata->predicate_locks_payload.empty())
+      return true;
+    if (!record_lock_payload_has_only_family(predicate_locks->value, true))
       return true;
     metadata->predicate_locks_payload = predicate_locks->value;
   }

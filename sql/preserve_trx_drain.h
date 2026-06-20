@@ -73,6 +73,8 @@ class Preserve_trx_drain_participant {
   virtual bool phase2_preflight(Preserve_trx_drain_phase_mode mode) = 0;
   virtual void abort_phase() = 0;
   virtual void finalize_phase() = 0;
+  virtual void finalize_phase_for_shutdown() { finalize_phase(); }
+  virtual void cleanup_after_failed_shutdown() {}
   virtual Preserve_trx_drain_participant_observation observation() const {
     return {};
   }
@@ -91,6 +93,8 @@ class Preserve_trx_drain_orchestrator {
   Preserve_trx_drain_status prepare_before_quiesce();
   void abort_participants();
   void finalize_participants();
+  void finalize_participants_for_shutdown();
+  void cleanup_after_failed_shutdown();
   std::vector<Preserve_trx_drain_participant_observation> observations() const;
 
  private:

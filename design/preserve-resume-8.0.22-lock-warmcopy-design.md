@@ -163,6 +163,13 @@ identity 重验、lock count 校验和 payload validator 校验，才能把它�
 warmcopy 结果并回到当前 live export；fallback `OFF` 时必须在 prepare 前 fail
 closed。
 
+当前实现要求 phase 2 artifact 中的 `record_locks_payload` 来自
+`lock_warmcopy_record_store_seal_for_target()` 返回的 sealed store payload；quiesced
+live export 只用于 canonical equivalence comparator 和 fallback 路径。也就是说，不能
+把 live export candidate 默认塞回 artifact 再声称 record warmcopy 生效。canonical
+comparison 失败时，按 `preserve_trx_lock_warmcopy_fallback_to_live_export` 选择整
+target fallback 或 reject。
+
 ### 2.3.2 table_locks_payload 是 post-prepare current-parity family
 
 record locks 和 table locks 在当前 8.0.22 preserve 代码中的事实点并不相同：
@@ -235,6 +242,11 @@ prepare 前 reject。这样避免同一条记录既被 native continuity 声明�
 当 native implicit validation 失败且 `fallback_to_live_export=ON` 时，可以在
 `LOCK_PREFLIGHT`、`ha_prepare_low()` 前走当前现场物化与导出；如果 fallback 关闭，
 则 fail closed。
+
+实现状态必须如实反映这一边界：如果代码尚未实现 exact implicit coverage 枚举和
+validation，不得把 artifact / observation 中的 `implicit_native_validated` 标为 true。
+这种阶段只能声明“explicit record payload 使用 lock warmcopy，implicit X-lock 依赖
+InnoDB 原生 trx 连续性”，而不是声明 implicit exact set 已经 warm-validated。
 
 ### 2.5 场景约束：只保存事务，不保存 SQL session/global state
 
@@ -509,11 +521,11 @@ warmcopy 能力的总开关。
 |---|---:|---|---|
 | `preserve_trx_lock_warmcopy_enable` | `ON` | boolean | 启用锁语义 warmcopy。 |
 | `preserve_trx_lock_warmcopy_fallback_to_live_export` | `ON` | boolean | 锁 warmcopy 校验失败时，是否在 phase 2 回退当前现场导出路径。 |
-| `preserve_trx_lock_warmcopy_max_memory_bytes` | `268435456` | `1..ULLONG_MAX` | 锁 warmcopy 内存状态上限。 |
+| `preserve_trx_lock_warmcopy_max_memory_bytes` | `268435456` | `1..ULLONG_MAX` | lock warmcopy artifact payload 在内存中保留的预算；超出后优先 spill artifact。它不是 mysqld 进程堆内存总上限，也不覆盖 record store、journal、candidate 采集的全部常驻成本。 |
 | `preserve_trx_lock_warmcopy_max_journal_bytes` | `1073741824` | `1..ULLONG_MAX` | 单次 drain epoch 锁 warmcopy journal 字节上限。 |
 | `preserve_trx_lock_warmcopy_max_dirty_shards` | `100000` | `0..UINT_MAX32` | phase 2 可重验 dirty record shards 上限。 |
 | `preserve_trx_lock_warmcopy_max_mdl_descriptors` | `100000` | `0..UINT_MAX32` | MDL warmcopy 可接受的 transaction-duration descriptors 上限。 |
-| `preserve_trx_lock_warmcopy_seal_threads` | `0` | `0..1024` | phase 2 seal/validation 并行度；`0` 表示按 target 数和 CPU 自动选择有界并行度。 |
+| `preserve_trx_lock_warmcopy_seal_threads` | `0` | `0..1024` | 预留参数；当前 8.0.22 实现按 target 串行 seal，保持 `0`。后续若实现 bounded worker pool，必须先补并发正确性和测试门禁。 |
 | `preserve_trx_lock_warmcopy_conversion_wait_timeout_ms` | `30000` | `0..UINT_MAX32` | 其它会话撞到目标事务 conversion freeze 后，释放 latch/mtr 并等待 freeze 清除再重试的上限；实际等待还受 drain 剩余超时、KILL、shutdown 约束。 |
 
 这些参数只影响 lock participant。比如：
@@ -1021,6 +1033,11 @@ clustered record DB_TRX_ID / secondary page max trx id / undo version chain
 phase 1 可以做非侵入式 native validation exact coverage / proof metadata，但它只用于
 证明 resume 后原生判断可继续成立，不用于生成显式锁 payload。
 
+当前实现尚未完成 exact implicit coverage store 时，`implicit_native_validated` 必须保持
+false；release handoff 和用户手册也必须把能力边界写成“显式 record/table/MDL payload
+warmcopy + implicit 依赖原生连续性”。不能用 page/table 级近似观察、空 summary 或
+“未发现异常”来替代 exact set validation success。
+
 implicit coverage 必须是 exact record-key set，不允许 page/table 级近似集合被标记为
 validation success。每个 implicit entry 至少包含：
 
@@ -1134,6 +1151,16 @@ admission 必须明确覆盖范围：
 5. 对未覆盖 target，fallback `ON` 时直接 live export，fallback `OFF` 时 prepare 前
    reject；
 6. 预算耗尽或 admission gap 只影响对应 target，除非是 epoch-level 基础设施失败。
+
+当前 8.0.22 分支实现采用一个保守的 base-seed 变体：target quiesce 时，现有
+live record export 被解析并 seed 到 InnoDB record warmcopy store，phase 2 artifact
+只使用该 store 的 sealed payload。如果 seed 前这个 target 已经有 phase 1 delta，
+当前实现不会静默覆盖这些变化；seed 成功且存在 record shard 时，把这些 shard 标成
+dirty，后续受 `preserve_trx_lock_warmcopy_max_dirty_shards` 和 canonical equivalence
+约束。若 seed 前已有 delta 但 seed 后没有可验证 shard，则 target invalid，按
+fallback/reject 处理。这样 `ROLLBACK TO SAVEPOINT` 释放显式锁后可以由 quiesced live
+base 重新基线化，而普通 page/record drift 在 dirty budget 为 0 或重验失败时仍会
+fail closed。
 
 每条 delta 至少携带：
 
@@ -1829,6 +1856,13 @@ record locks 应优先按 page bitmap 聚合，而不是每个 row lock 建一�
 - journal bytes；
 - spill bytes。
 
+当前实现里，`preserve_trx_lock_warmcopy_max_memory_bytes` 只约束最终
+`record_locks_payload`、`table_locks_payload`、`mdl_descriptors_payload` 等
+artifact payload 在内存中的保留量；超过预算时把 artifact spill 到实例私有临时目录。
+它不是 record shard map、journal、candidate payload、record image 采集成本的总 heap
+cap。若要把它升级成“锁 warmcopy 总堆内存上限”，必须新增 store / journal /
+candidate 的独立记账，并把这些记账纳入 release gate。
+
 对于 1000 个大事务、每个事务 10 万锁的场景，仅开启 lock warmcopy 不够。还需要
 评估并调大：
 
@@ -1842,10 +1876,11 @@ record locks 应优先按 page bitmap 聚合，而不是每个 row lock 建一�
 - `preserve_trx_lock_warmcopy_max_mdl_descriptors`；
 - spill file quota / filesystem budget。
 
-v1 要求支持 spill-to-file。内存预算耗尽时必须先把 journal/object store 的可 spill
-部分落盘；spill 仍失败、超出 spill 预算或无法保证顺序/完整性时，才 degrade target 并
-根据 fallback 策略处理。任何情况下都不能无界增长内存，也不能在 spill 后丢失 seq /
-dirty / fence 信息。
+v1 要求支持 spill-to-file。当前实现先 spill 最终 artifact payload；record store /
+journal 仍以内存结构存在，并受 dirty shard、journal bytes 和 snapshot payload 等门禁
+约束。若后续要 spill journal/object store，必须保证 spill 后不丢失 seq / dirty /
+fence 信息。spill 失败、超出 spill 预算或无法保证顺序/完整性时，degrade target 并
+根据 fallback 策略处理，不能无界增长内存。
 
 spill 文件是 drain 过程内的临时资产，不是跨重启恢复事实源。每个 spill segment 必须
 携带 length、sequence range、checksum 和 target id；读取时校验 checksum 与 sequence
@@ -1856,16 +1891,18 @@ spill cleanup 失败，都必须让对应 target invalid 并按 fallback/reject 
 spill 布局必须避免跨 target 共享可写 segment。推荐形态：
 
 ```text
-<server-local-preserve-tmp>/
-  lock-warmcopy/
-    batch-<batch_id>/
-      target-<target_id>/
-        manifest.tmp
-        manifest
-        segment-000001.tmp
-        segment-000001.dat
-        segment-000002.tmp
-        segment-000002.dat
+<mysql_tmpdir>/
+  preserve-lock-warmcopy/
+    instance-<datadir-server_uuid-port-hash>/
+      owner
+      batch-<epoch>/
+        target-<target_id>/
+          manifest.tmp
+          manifest
+          segment-000001.tmp
+          segment-000001.dat
+          segment-000002.tmp
+          segment-000002.dat
 ```
 
 写入协议：
@@ -1882,8 +1919,10 @@ spill 布局必须避免跨 target 共享可写 segment。推荐形态：
 
 - target 成功 seal 并写入 snapshot 后立即删除本 target spill 目录；
 - target invalid / fallback / reject / command abort 时删除本 target spill 目录；
-- mysqld 重启或下一次 drain 初始化时扫描 `lock-warmcopy/batch-*`，清理没有活动 batch
-  持有的 orphan spill；
+- mysqld 重启或下一次 drain 初始化时只扫描当前实例私有 root 下的 `batch-*`，且 root
+  必须存在本实例 owner marker；
+- 其它实例的 `instance-*` 目录、缺失 owner marker 的目录、owner marker 不匹配的目录均
+  不删除，避免多个 mysqld 共用 tmpdir 时误删 foreign spill；
 - cleanup 失败要进入 observation 和 status，不能静默忽略。如果 cleanup 失败发生在
   seal 前，target invalid；发生在 seal 后，不影响已写 snapshot，但必须可审计。
 
@@ -1893,27 +1932,27 @@ spill 布局必须避免跨 target 共享可写 segment。推荐形态：
 bytes、digest bytes、durable bytes、provider full-copy count 和 binlog warmcopy phase2
 pause。它们不应混入 lock warmcopy 统计。
 
-新增 lock warmcopy 状态变量统一使用 `Preserve_trx_lock_warmcopy_*` 前缀：
+当前实现已经注册的 lock warmcopy 状态变量统一使用
+`Preserve_trx_lock_warmcopy_*` 前缀。它们是进程生命周期累计计数/累计字节/累计耗时，
+当前不是 per-drain counter，`FLUSH STATUS` 不应被当作 drain-local report 替代品：
 
 ```text
+Preserve_trx_lock_warmcopy_artifact_bytes
 Preserve_trx_lock_warmcopy_attempts
-Preserve_trx_lock_warmcopy_success
-Preserve_trx_lock_warmcopy_fallback_to_live_export
-Preserve_trx_lock_warmcopy_rejects
-Preserve_trx_lock_warmcopy_eligibility_rejects
-Preserve_trx_lock_warmcopy_memory_bytes
-Preserve_trx_lock_warmcopy_journal_bytes
-Preserve_trx_lock_warmcopy_spill_bytes
+Preserve_trx_lock_warmcopy_canonical_mismatch
+Preserve_trx_lock_warmcopy_conversion_freeze_waits
 Preserve_trx_lock_warmcopy_dirty_shards
-Preserve_trx_lock_warmcopy_fence_mismatches
+Preserve_trx_lock_warmcopy_final_fence_mismatch
+Preserve_trx_lock_warmcopy_journal_bytes
+Preserve_trx_lock_warmcopy_live_fallback
 Preserve_trx_lock_warmcopy_phase2_pause_us
-Preserve_trx_lock_warmcopy_record_shards
-Preserve_trx_lock_warmcopy_predicate_unsupported
-Preserve_trx_lock_warmcopy_table_locks
-Preserve_trx_lock_warmcopy_mdl_descriptors
-Preserve_trx_lock_warmcopy_implicit_native_validated
-Preserve_trx_lock_warmcopy_implicit_native_rejects
-Preserve_trx_lock_warmcopy_payload_equivalence_failures
+Preserve_trx_lock_warmcopy_resource_limit
+Preserve_trx_lock_warmcopy_sealed_invalid
+Preserve_trx_lock_warmcopy_sealed_valid
+Preserve_trx_lock_warmcopy_spill_bytes
+Preserve_trx_lock_warmcopy_spill_failures
+Preserve_trx_lock_warmcopy_strict_reject
+Preserve_trx_lock_warmcopy_unsupported_family
 ```
 
 drain participant observation 中增加：

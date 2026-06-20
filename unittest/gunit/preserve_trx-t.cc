@@ -48,6 +48,7 @@
 #include <openssl/sha.h>
 
 #include "lex_string.h"
+#include "my_dbug.h"
 #include "my_sys.h"  // my_checksum
 #include "my_dir.h"
 #include "my_io.h"
@@ -4619,6 +4620,33 @@ TEST_F(PreserveSnapshotTest, BundleCodecNoCacheRoundTripsWithoutFileIo) {
             decoded.header_metadata.mod_tables_count);
   EXPECT_EQ(bundle.tlvs.size(), decoded.tlvs.size());
   EXPECT_TRUE(decoded.blob_descriptors.empty());
+}
+
+TEST_F(PreserveSnapshotTest,
+       BundleCodecKeepsSeparatedLockPayloadsOffLegacySplitPath) {
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  input.metadata.created_at_us = 1000;
+  input.metadata.expires_at_us = 2000;
+  input.metadata.record_locks_payload = record_locks_payload();
+  input.metadata.predicate_locks_payload = predicate_record_locks_payload(9);
+
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserved_trx_encoded_bundle encoded;
+  Preserve_snapshot_metadata written_metadata;
+  DBUG_SET("+d,preserve_trx_fail_legacy_record_predicate_split");
+  const Preserve_snapshot_status status = encode_preserved_trx_bundle(
+      codec_context(), bundle, &encoded, &written_metadata);
+  DBUG_SET("-d,preserve_trx_fail_legacy_record_predicate_split");
+
+  EXPECT_EQ(Preserve_snapshot_status::OK, status);
+  EXPECT_EQ(input.metadata.record_locks_payload,
+            written_metadata.record_locks_payload);
+  EXPECT_EQ(input.metadata.predicate_locks_payload,
+            written_metadata.predicate_locks_payload);
 }
 
 TEST_F(PreserveSnapshotTest, BundleCodecRejectsTamperedSnapshotBytes) {

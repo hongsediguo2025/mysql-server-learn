@@ -336,8 +336,13 @@ dberr_t row_convert_impl_to_expl_if_needed(btr_cur_t *cursor, undo_node_t *node)
 
   if (heap_no != PAGE_HEAP_NO_SUPREMUM && !dict_index_is_spatial(index) &&
       !index->table->is_temporary() && !index->table->is_intrinsic()) {
-    return lock_rec_convert_active_impl_to_expl(block, rec, index, offsets,
-                                                node->trx, heap_no);
+    const dberr_t err = lock_rec_convert_active_impl_to_expl(
+        block, rec, index, offsets, node->trx, heap_no);
+    if (err == DB_LOCK_WAIT_TIMEOUT || err == DB_INTERRUPTED) {
+      /* Do not let a transient warmcopy conversion freeze abort rollback. */
+      return DB_SUCCESS;
+    }
+    return err;
   }
 
   return DB_SUCCESS;

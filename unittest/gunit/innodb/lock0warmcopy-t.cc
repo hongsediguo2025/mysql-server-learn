@@ -336,6 +336,139 @@ TEST(LockWarmcopyRecordShard, ExportsImportableRecordPayloadWireFormat) {
   EXPECT_EQ(expected, payload);
 }
 
+TEST(LockWarmcopyRecordShard, BaseSeedPayloadExportsAsSealedStorePayload) {
+  lock_warmcopy_reset_for_unit_test();
+
+  const uint64_t source_target_id = 3131;
+  const uint64_t seeded_target_id = 3132;
+  lock_warmcopy_record_shard_key_t key = make_record_shard_key(8);
+  key.lock_type_mode = 3;  // LOCK_REC | LOCK_X
+  const lock_warmcopy_record_image_digest_t digest2 = make_digest(0x20);
+  const lock_warmcopy_record_image_digest_t digest4 = make_digest(0x40);
+
+  ASSERT_TRUE(
+      lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
+          source_target_id, key, 2, digest2, 20,
+          make_encoded_record_image("seed-rec2")));
+  ASSERT_TRUE(
+      lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
+          source_target_id, key, 4, digest4, 40,
+          make_encoded_record_image("seed-rec4")));
+
+  std::string source_payload;
+  uint32_t source_lock_count = 0;
+  ASSERT_TRUE(lock_warmcopy_record_store_export_record_payload_for_target(
+      source_target_id, &source_payload, &source_lock_count));
+  ASSERT_EQ(2U, source_lock_count);
+
+  uint32_t seeded_lock_count = 0;
+  ASSERT_TRUE(lock_warmcopy_record_store_seed_payload_for_target(
+      seeded_target_id, source_payload, &seeded_lock_count));
+  EXPECT_EQ(2U, seeded_lock_count);
+
+  std::string seeded_payload;
+  uint32_t exported_seeded_lock_count = 0;
+  ASSERT_TRUE(lock_warmcopy_record_store_export_record_payload_for_target(
+      seeded_target_id, &seeded_payload, &exported_seeded_lock_count));
+  EXPECT_EQ(2U, exported_seeded_lock_count);
+  EXPECT_EQ(source_payload, seeded_payload);
+
+  lock_warmcopy_record_store_fence_t phase1_fence;
+  ASSERT_TRUE(lock_warmcopy_record_store_fence_for_target(seeded_target_id,
+                                                          &phase1_fence));
+
+  lock_warmcopy_record_seal_result_t result;
+  ASSERT_TRUE(lock_warmcopy_record_store_seal_for_target(
+      seeded_target_id, phase1_fence, UINT32_MAX, UINT64_MAX, UINT32_MAX,
+      &result));
+  EXPECT_EQ(lock_warmcopy_record_seal_status_t::SEALED_VALID, result.status);
+  EXPECT_TRUE(result.sealed);
+  EXPECT_EQ(2U, result.record_lock_count);
+  EXPECT_EQ(source_payload, result.record_locks_payload);
+}
+
+TEST(LockWarmcopyRecordShard, BaseSeedRejectsMalformedPayloadWithoutStore) {
+  lock_warmcopy_reset_for_unit_test();
+
+  const uint64_t target_id = 3133;
+  lock_warmcopy_record_shard_key_t key = make_record_shard_key(8);
+  key.lock_type_mode = 3;  // LOCK_REC | LOCK_X
+  const lock_warmcopy_record_image_digest_t digest = make_digest(0x20);
+  ASSERT_TRUE(
+      lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
+          target_id, key, 2, digest, 20, make_encoded_record_image("rec2")));
+
+  std::string payload;
+  ASSERT_TRUE(lock_warmcopy_record_store_export_record_payload_for_target(
+      target_id, &payload, nullptr));
+  ASSERT_FALSE(payload.empty());
+  payload.pop_back();
+
+  lock_warmcopy_record_store_clear_for_target(target_id);
+  uint32_t seeded_lock_count = 999;
+  EXPECT_FALSE(lock_warmcopy_record_store_seed_payload_for_target(
+      target_id, payload, &seeded_lock_count));
+  EXPECT_EQ(0U, seeded_lock_count);
+
+  std::string after_payload;
+  uint32_t after_lock_count = 999;
+  ASSERT_TRUE(lock_warmcopy_record_store_export_record_payload_for_target(
+      target_id, &after_payload, &after_lock_count));
+  EXPECT_TRUE(after_payload.empty());
+  EXPECT_EQ(0U, after_lock_count);
+}
+
+TEST(LockWarmcopyRecordShard, BaseSeedAfterDeltaMarksDirtyShard) {
+  lock_warmcopy_reset_for_unit_test();
+
+  const uint64_t source_target_id = 3134;
+  const uint64_t dirty_target_id = 3135;
+  lock_warmcopy_record_shard_key_t key = make_record_shard_key(8);
+  key.lock_type_mode = 3;  // LOCK_REC | LOCK_X
+  const lock_warmcopy_record_image_digest_t digest = make_digest(0x20);
+
+  ASSERT_TRUE(
+      lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
+          source_target_id, key, 2, digest, 20,
+          make_encoded_record_image("source-rec")));
+  std::string source_payload;
+  ASSERT_TRUE(lock_warmcopy_record_store_export_record_payload_for_target(
+      source_target_id, &source_payload, nullptr));
+  ASSERT_FALSE(source_payload.empty());
+
+  ASSERT_TRUE(
+      lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
+          dirty_target_id, key, 4, digest, 40,
+          make_encoded_record_image("phase1-delta")));
+
+  uint32_t seeded_lock_count = 0;
+  ASSERT_TRUE(lock_warmcopy_record_store_seed_payload_for_target(
+      dirty_target_id, source_payload, &seeded_lock_count));
+  EXPECT_EQ(1U, seeded_lock_count);
+
+  lock_warmcopy_record_store_fence_t phase1_fence;
+  ASSERT_TRUE(lock_warmcopy_record_store_fence_for_target(dirty_target_id,
+                                                          &phase1_fence));
+
+  lock_warmcopy_record_seal_result_t result;
+  ASSERT_TRUE(lock_warmcopy_record_store_seal_for_target(
+      dirty_target_id, phase1_fence, UINT32_MAX, UINT64_MAX, 0,
+      &result));
+  EXPECT_EQ(lock_warmcopy_record_seal_status_t::RESOURCE_LIMIT_EXCEEDED,
+            result.status);
+  EXPECT_FALSE(result.sealed);
+  EXPECT_TRUE(result.record_locks_payload.empty());
+  EXPECT_EQ("record_dirty_shard_limit_exceeded", result.diagnostic_reason);
+
+  ASSERT_TRUE(lock_warmcopy_record_store_seal_for_target(
+      dirty_target_id, phase1_fence, UINT32_MAX, UINT64_MAX, UINT32_MAX,
+      &result));
+  EXPECT_EQ(lock_warmcopy_record_seal_status_t::SEALED_VALID, result.status);
+  EXPECT_TRUE(result.sealed);
+  EXPECT_EQ(1U, result.record_lock_count);
+  EXPECT_EQ(source_payload, result.record_locks_payload);
+}
+
 TEST(LockWarmcopyRecordShard, PerTargetStoresAreIsolated) {
   lock_warmcopy_reset_for_unit_test();
 

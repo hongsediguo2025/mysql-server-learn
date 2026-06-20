@@ -337,6 +337,39 @@ transaction binlog cache 但没有可用 warmcopy provider 时，preserve 才走
 single-phase copy，并受 `preserve_trx_single_phase_max_binlog_cache_bytes` 和
 `preserve_trx_max_binlog_cache_bytes` 同时约束。
 
+### 4.9 lock warmcopy
+
+lock warmcopy 与 binlog warmcopy 独立。`preserve_trx_warmcopy_enable` 只控制 binlog
+cache warmcopy；锁语义 warmcopy 由下面这组参数控制。
+
+| 参数 | 默认值 | 范围/单位 | 作用域 | 含义 |
+|---|---:|---|---|---|
+| `preserve_trx_lock_warmcopy_enable` | `ON` | `ON`/`OFF` | global | 启用锁语义 warmcopy。当前目标默认是 ON；发布前仍以完整测试和 NFR 门禁为准。 |
+| `preserve_trx_lock_warmcopy_fallback_to_live_export` | `ON` | `ON`/`OFF` | global | lock warmcopy artifact 无效时，是否丢弃该 target 的全部 warmcopy artifact 并回退现有 live export。关闭时 fail closed/reject。 |
+| `preserve_trx_lock_warmcopy_max_memory_bytes` | `268435456` | `1..ULLONG_MAX` 字节 | global | lock warmcopy artifact payload 在内存中的保留预算；超出后优先 spill artifact。它不是 mysqld 堆内存总上限，也不覆盖 record store、journal、candidate 采集成本。 |
+| `preserve_trx_lock_warmcopy_max_journal_bytes` | `1073741824` | `1..ULLONG_MAX` 字节 | global | 单次 drain epoch lock warmcopy journal 字节上限。 |
+| `preserve_trx_lock_warmcopy_max_dirty_shards` | `100000` | `0..UINT_MAX32` 个 | global | phase 2 可重验 dirty record shards 上限。 |
+| `preserve_trx_lock_warmcopy_max_mdl_descriptors` | `100000` | `0..UINT_MAX32` 个 | global | MDL transaction-duration descriptors 上限。 |
+| `preserve_trx_lock_warmcopy_seal_threads` | `0` | `0..1024` | global | 预留参数；当前实现按 target 串行 seal，保持 0。 |
+| `preserve_trx_lock_warmcopy_conversion_wait_timeout_ms` | `30000` | `0..UINT_MAX32` 毫秒 | global | 其它会话撞到目标事务 conversion freeze 后，释放 latch/mtr 并等待 freeze 清除再重试的上限；实际等待还受 drain deadline、KILL 和 shutdown 约束。 |
+
+当前实现的真实边界：
+
+- phase 2 artifact 中的 `record_locks_payload` 来自 lock warmcopy record store 的 sealed
+  payload；live export 只用于 canonical equivalence comparator 和 fallback。
+- target quiesce 时，当前 live record export 会作为 base seed 写入 record warmcopy
+  store；如果 phase 1 中已经观察到该 target 的 record-lock delta，seed 后对应 shard
+  会被视为 dirty，受 `preserve_trx_lock_warmcopy_max_dirty_shards` 限制。无法形成可验证
+  base shard 时，target 会 invalid 并按 fallback/reject 处理。
+- 如果 record/table/MDL 任一 required family invalid，fallback 开启时按 per-target
+  all-or-live 回退，关闭时 reject，不能混用同一个 target 的部分 warmcopy 和部分 live
+  payload。
+- R-tree / spatial predicate locks 不做 lock warmcopy 优化；fallback 开启时走现有 live
+  export/import 的 `predicate_locks_payload`，关闭时 reject。
+- 当前尚未实现 exact implicit coverage store 时，不应把 `implicit_native_validated` 当作
+  true 能力；显式 record payload 使用 warmcopy，implicit record X-lock 依赖 preserved
+  trx id 和 InnoDB 原生 running-trx 连续性。
+
 ## 5. warmcopy 资源和内存模型
 
 warmcopy 的关键结论：`preserve_trx_warmcopy_max_total_bytes` 是 warm external
@@ -772,6 +805,7 @@ warmcopy fail closed 的常见原因：
 
 ```sql
 SHOW GLOBAL STATUS LIKE 'Preserve_trx_warmcopy_%';
+SHOW GLOBAL STATUS LIKE 'Preserve_trx_lock_warmcopy_%';
 SHOW GLOBAL STATUS LIKE 'Preserve_trx_memory_%';
 SHOW GLOBAL STATUS LIKE 'Preserve_trx_spill_%';
 ```
@@ -788,6 +822,27 @@ SHOW GLOBAL STATUS LIKE 'Preserve_trx_spill_%';
 | `Preserve_trx_spill_bytes` | 通用 spill 写入字节数。 |
 | `Preserve_trx_spill_failures` | 通用 spill 失败次数。 |
 
+lock warmcopy 状态变量是进程生命周期累计口径，不是单次 drain report：
+
+| 状态变量 | 含义 |
+|---|---|
+| `Preserve_trx_lock_warmcopy_attempts` | lock warmcopy target 尝试次数。 |
+| `Preserve_trx_lock_warmcopy_sealed_valid` | seal 后可用的 warmcopy artifact 次数。 |
+| `Preserve_trx_lock_warmcopy_sealed_invalid` | seal/validation 后 artifact invalid 次数。 |
+| `Preserve_trx_lock_warmcopy_live_fallback` | warmcopy invalid 后回退 live export 次数。 |
+| `Preserve_trx_lock_warmcopy_strict_reject` | fallback 关闭或不可回退时 strict reject 次数。 |
+| `Preserve_trx_lock_warmcopy_artifact_bytes` | 已生成/计入的 lock warmcopy artifact payload 字节。 |
+| `Preserve_trx_lock_warmcopy_journal_bytes` | lock warmcopy journal 字节累计。 |
+| `Preserve_trx_lock_warmcopy_spill_bytes` | lock warmcopy spill 写入字节累计。 |
+| `Preserve_trx_lock_warmcopy_spill_failures` | lock warmcopy spill 失败次数。 |
+| `Preserve_trx_lock_warmcopy_canonical_mismatch` | warmcopy payload 与 live export canonical comparator 不等价次数。 |
+| `Preserve_trx_lock_warmcopy_conversion_freeze_waits` | 其它会话因目标事务 conversion freeze 等待/重试次数。 |
+| `Preserve_trx_lock_warmcopy_dirty_shards` | seal 过程中记录的 dirty shards 累计。 |
+| `Preserve_trx_lock_warmcopy_final_fence_mismatch` | final fence recheck 不一致次数。 |
+| `Preserve_trx_lock_warmcopy_phase2_pause_us` | lock warmcopy phase 2 pause 累计微秒。 |
+| `Preserve_trx_lock_warmcopy_resource_limit` | 资源预算导致 invalid/reject 的次数。 |
+| `Preserve_trx_lock_warmcopy_unsupported_family` | 不支持锁族导致 invalid/reject 的次数。 |
+
 这些指标要分开看：`Preserve_trx_warmcopy_prefix_bytes` 很大，不代表
 `Preserve_trx_memory_current_bytes` 同样大，因为 prefix bytes 是 external blob
 payload，不是 heap lease。
@@ -800,12 +855,17 @@ payload，不是 heap lease。
 
 - `preserve_trx_warmcopy_pending_range_limit`
 - `preserve_trx_warmcopy_pending_bytes_limit`
+- `preserve_trx_lock_warmcopy_max_memory_bytes`
+- `preserve_trx_lock_warmcopy_max_journal_bytes`
+- `preserve_trx_lock_warmcopy_max_dirty_shards`
 - `preserve_trx_memory_budget_bytes`
 - `preserve_trx_memory_per_token_bytes`
 - `preserve_trx_batch_max_transactions`
 
 不要把 `preserve_trx_warmcopy_max_total_bytes` 当成内存上限。它主要是磁盘
-artifact admission 上限。
+artifact admission 上限。也不要把 `preserve_trx_lock_warmcopy_max_memory_bytes`
+理解成 mysqld 堆内存总上限；它约束 lock warmcopy 最终 artifact payload 在内存中的
+保留量。
 
 ### 9.2 想支持更大的 binlog cache
 
@@ -871,11 +931,16 @@ snapshot、binlog 和 warmcopy artifact：
 - `preserve_trx_single_phase_max_binlog_cache_bytes`
 - `preserve_trx_warmcopy_tail_budget_bytes`
 - `preserve_trx_warmcopy_close_timeout_ms`
+- `preserve_trx_lock_warmcopy_max_memory_bytes`
+- `preserve_trx_lock_warmcopy_max_journal_bytes`
+- `preserve_trx_lock_warmcopy_max_dirty_shards`
+- `preserve_trx_lock_warmcopy_max_mdl_descriptors`
 - `preserve_trx_drain_grace_ms`
 - `preserve_trx_drain_hard_timeout_ms`
 
 这些参数控制 metadata、binlog sidecar、warmcopy 总 artifact、phase 2 tail 和等待
-窗口。它们不提高 InnoDB lock 导出能力。
+窗口。它们不提高 InnoDB lock 导出能力；lock warmcopy 的 memory bytes 仍只是 artifact
+payload 内存预算，不是 record store / journal 的总 heap cap。
 
 示例方向：
 
@@ -959,6 +1024,12 @@ drain 仍然会 fail closed。
 - `preserve_trx_warmcopy_chunk_bytes`：phase 1 copy 的外层 chunk，不改变总量。
 - `preserve_trx_warmcopy_pending_*`：out-of-order mirror writes 的单 participant
   堆内存保护。
+- `preserve_trx_lock_warmcopy_max_memory_bytes`：lock warmcopy 最终 artifact payload
+  在内存中的保留预算，超出后优先 spill；不是 record store / journal / candidate 的
+  总堆内存 cap。
+- `preserve_trx_lock_warmcopy_max_journal_bytes`、`preserve_trx_lock_warmcopy_max_dirty_shards`、
+  `preserve_trx_lock_warmcopy_max_mdl_descriptors`：分别约束 lock warmcopy journal、
+  dirty shard 重验和 MDL descriptor 数量。
 - `preserve_trx_memory_*`：通用 Preserve/Resume heap lease 保护。
 - `preserve_trx_batch_max_transactions` 和 `preserve_trx_max_total`：数量准入。
 
@@ -981,4 +1052,4 @@ drain 仍然会 fail closed。
 | 临时表 sidecar | `preserve_trx_temp_table_preflight_preserve()`、`preserve_trx_temp_table_build_preserve_manifest()`、`preserve_trx_temp_table_validate_sidecars()`、`preserve_trx_temp_table_materialize_for_resume()` | 只支持当前实现可导出/可 materialize 的用户 InnoDB transactional temporary table；unsupported temp row history/no-redo undo 走 fail closed。 |
 | P_S/SHOW 可见性 | `preserved_trx_snapshot()`、`Sql_cmd_show_preserved_transactions::execute()` | owner 可见自己的 token；`PROCESS` 或 `RESUME_ANY_PRESERVED_TRANSACTION` 可见其他账号记录；没有 `PROCESS` 时 token 字段脱敏。 |
 | P_S 字段 | `storage/perfschema/table_preserved_transactions.cc` | 表 8.1 字段与 P_S 插件表定义一致。 |
-| 状态变量 | `sql/mysqld.cc` | 表 8.2 只列当前实现注册的 `Preserve_trx_warmcopy_*`、`Preserve_trx_memory_*`、`Preserve_trx_spill_*` 状态变量。 |
+| 状态变量 | `sql/mysqld.cc` | 表 8.2 只列当前实现注册的 `Preserve_trx_warmcopy_*`、`Preserve_trx_lock_warmcopy_*`、`Preserve_trx_memory_*`、`Preserve_trx_spill_*` 状态变量。 |
