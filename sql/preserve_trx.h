@@ -83,7 +83,9 @@ extern uint preserve_trx_lock_warmcopy_max_dirty_shards;
 extern uint preserve_trx_lock_warmcopy_max_mdl_descriptors;
 extern uint preserve_trx_lock_warmcopy_seal_threads;
 extern uint preserve_trx_lock_warmcopy_conversion_wait_timeout_ms;
+extern uint preserve_trx_parallel_preserve_threads;
 
+uint preserve_trx_auto_parallel_preserve_threads(uint hardware_threads);
 bool preserve_trx_is_enabled();
 void preserve_trx_set_enable_value(bool enabled);
 bool preserve_trx_execute_command(THD *thd);
@@ -93,6 +95,19 @@ ulonglong preserve_trx_warmcopy_digest_bytes_status();
 ulonglong preserve_trx_warmcopy_durable_bytes_status();
 ulonglong preserve_trx_warmcopy_provider_full_copy_to_count_status();
 ulonglong preserve_trx_warmcopy_phase2_pause_us_status();
+ulonglong preserve_trx_phase2_total_us_status();
+ulonglong preserve_trx_phase2_target_wait_us_status();
+ulonglong preserve_trx_phase2_participant_prepare_us_status();
+ulonglong preserve_trx_phase2_participant_close_us_status();
+ulonglong preserve_trx_phase2_participant_preflight_us_status();
+ulonglong preserve_trx_phase2_lock_seal_us_status();
+ulonglong preserve_trx_phase2_target_preserve_us_status();
+ulonglong preserve_trx_phase2_lock_preflight_us_status();
+ulonglong preserve_trx_phase2_prepare_us_status();
+ulonglong preserve_trx_phase2_detach_claim_us_status();
+ulonglong preserve_trx_phase2_snapshot_write_us_status();
+ulonglong preserve_trx_phase2_register_us_status();
+ulonglong preserve_trx_phase2_slo_miss_count_status();
 ulonglong preserve_trx_lock_warmcopy_attempts_status();
 ulonglong preserve_trx_lock_warmcopy_sealed_valid_status();
 ulonglong preserve_trx_lock_warmcopy_sealed_invalid_status();
@@ -178,6 +193,28 @@ struct Preserve_trx_preserve_result {
   const char *failure_reason{nullptr};
   Preserve_trx_preserve_stage stage{
       Preserve_trx_preserve_stage::VALIDATION};
+  uint64_t binlog_preflight_us{0};
+  uint64_t lock_preflight_us{0};
+  uint64_t lock_preflight_read_view_us{0};
+  uint64_t lock_preflight_mdl_us{0};
+  uint64_t lock_preflight_modified_tables_us{0};
+  uint64_t lock_preflight_savepoints_us{0};
+  uint64_t lock_preflight_predicate_us{0};
+  uint64_t lock_preflight_table_us{0};
+  uint64_t prepare_us{0};
+  uint64_t detach_claim_us{0};
+  uint64_t snapshot_write_us{0};
+  uint64_t snapshot_write_prebuilt_binlog_us{0};
+  uint64_t snapshot_write_temp_manifest_us{0};
+  uint64_t snapshot_write_bundle_build_us{0};
+  uint64_t snapshot_write_store_us{0};
+  uint64_t snapshot_write_store_token_state_us{0};
+  uint64_t snapshot_write_store_adopt_warm_blob_us{0};
+  uint64_t snapshot_write_store_write_new_blobs_us{0};
+  uint64_t snapshot_write_store_encode_us{0};
+  uint64_t snapshot_write_store_write_snapshot_us{0};
+  uint64_t record_register_us{0};
+  uint64_t phase2_savepoint_live_export_target_count{0};
   bool durable_point_crossed{false};
   bool detached_from_original_thd{false};
   bool reattached_to_original_thd{false};
@@ -334,7 +371,8 @@ bool preserve_trx_preserve_attached_transaction(
     PreserveBinlogBlobProvider *binlog_blob_provider = nullptr,
     const Preserve_trx_lock_warmcopy_artifact *lock_warmcopy_artifact = nullptr,
     bool debug_fail_ha_prepare_low = false,
-    bool debug_fail_temp_only_prepare = false);
+    bool debug_fail_temp_only_prepare = false,
+    bool defer_snapshot_directory_fsync = false);
 
 class Sql_cmd_prepare_shutdown_preserve_transaction final : public Sql_cmd {
  public:

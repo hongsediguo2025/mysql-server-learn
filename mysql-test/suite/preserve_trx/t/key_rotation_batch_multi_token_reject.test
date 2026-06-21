@@ -38,14 +38,16 @@ use Digest::SHA qw(sha256);
 use File::Copy qw(copy);
 use File::Spec;
 
+require File::Spec->catfile($ENV{'MYSQL_TEST_DIR'}, 'suite',
+                            'preserve_trx', 'include',
+                            'preserve_snapshot_files.pl');
+
 my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
 my $key = File::Spec->catfile($dir, '.key');
 my $key_backup = File::Spec->catfile(
   $ENV{'MYSQLTEST_VARDIR'}, 'tmp', 'key_rotation_batch_original.key');
 
-opendir(my $dh, $dir) or die "cannot open preserve dir: $dir: $!";
-my @snapshots = grep { /\.bin$/ } readdir($dh);
-closedir($dh);
+my @snapshots = PreserveSnapshotFiles::preserve_snapshot_bin_files($dir);
 die "expected two old-key snapshots before key replacement, found "
   . scalar(@snapshots) . "\n" unless @snapshots == 2;
 

@@ -46,6 +46,9 @@ WARMCOPY_METRIC_LINE_RE = re.compile(
     r"PRESERVE: warm-copy drain metrics\b(?P<body>.*)"
 )
 WARMCOPY_METRIC_KV_RE = re.compile(r"\b([A-Za-z0-9_]+)=(\d+)\b")
+WARMCOPY_METRIC_STRING_KV_RE = re.compile(
+    r"\b(phase2_slo_reason)=([A-Za-z0-9_]+)\b"
+)
 WARMCOPY_ACTION_LINE_RE = re.compile(
     r"PRESERVE_LOCK_WARMCOPY\b(?P<body>.*)"
 )
@@ -84,16 +87,17 @@ def _parse_positive_mb_list(value: str) -> List[int]:
     return buckets
 
 
-def parse_warmcopy_metric_lines(text: str) -> List[Dict[str, int]]:
-    metrics: List[Dict[str, int]] = []
+def parse_warmcopy_metric_lines(text: str) -> List[Dict[str, object]]:
+    metrics: List[Dict[str, object]] = []
     for line in text.splitlines():
         match = WARMCOPY_METRIC_LINE_RE.search(line)
         if match is None:
             continue
-        parsed = {
+        parsed: Dict[str, object] = {
             key: int(value)
             for key, value in WARMCOPY_METRIC_KV_RE.findall(match.group("body"))
         }
+        parsed.update(WARMCOPY_METRIC_STRING_KV_RE.findall(match.group("body")))
         if parsed:
             metrics.append(parsed)
     return metrics
@@ -261,6 +265,10 @@ def _base_config(
         preserve_lock_warmcopy_max_journal_bytes=(
             args.preserve_lock_warmcopy_max_journal_bytes
         ),
+        preserve_lock_warmcopy_seal_threads=(
+            args.preserve_lock_warmcopy_seal_threads
+        ),
+        preserve_parallel_preserve_threads=args.preserve_parallel_preserve_threads,
         large_binlog_cache_sessions=0,
         large_binlog_cache_buckets_mb=[],
         artifact_dir=args.artifact_dir,
@@ -467,13 +475,32 @@ def summarize_phase2_pause_samples(
     }
 
 
+def _metric_us_samples_ms(metrics: Sequence[Dict[str, object]], key: str) -> List[float]:
+    return [
+        float(metric[key]) / 1000.0
+        for metric in metrics
+        if key in metric
+    ]
+
+
 def _scenario_summary(
+    scenario_reports: Sequence[Dict[str, object]], scenario_name: str
+) -> Optional[Dict[str, object]]:
+    report = _scenario_report(scenario_reports, scenario_name)
+    if report is not None:
+        summary = report.get("phase2_total_summary_ms")
+        if not isinstance(summary, dict) or int(summary.get("sample_count") or 0) <= 0:
+            summary = report.get("phase2_pause_summary_ms")
+        return summary if isinstance(summary, dict) else None
+    return None
+
+
+def _scenario_report(
     scenario_reports: Sequence[Dict[str, object]], scenario_name: str
 ) -> Optional[Dict[str, object]]:
     for report in scenario_reports:
         if report.get("name") == scenario_name:
-            summary = report.get("phase2_pause_summary_ms")
-            return summary if isinstance(summary, dict) else None
+            return report
     return None
 
 
@@ -497,7 +524,7 @@ def build_phase2_pause_comparison(
     warmcopy_p95 = _summary_p95(warmcopy_summary)
 
     base = {
-        "requirement": "warmcopy phase2 p95 must be below live export baseline p95",
+        "requirement": "warmcopy phase2 p95 must be below live export baseline p95; phase2_total_summary_ms is preferred when available",
         "live_baseline_scenario": live_baseline_scenario,
         "warmcopy_scenario": warmcopy_scenario,
         "live_baseline_summary_ms": live_summary,
@@ -528,6 +555,135 @@ def build_phase2_pause_comparison(
     }
 
 
+def build_phase2_absolute_p95_gate(
+    scenario_reports: Sequence[Dict[str, object]],
+    warmcopy_scenario: str = "warmcopy-large-cache",
+    max_p95_ms: float = 1000.0,
+) -> Dict[str, object]:
+    warmcopy_summary = _scenario_summary(scenario_reports, warmcopy_scenario)
+    warmcopy_p95 = _summary_p95(warmcopy_summary)
+    max_p95_ms = float(max_p95_ms)
+
+    base = {
+        "requirement": "warmcopy phase2_total p95 must be <= configured max milliseconds",
+        "warmcopy_scenario": warmcopy_scenario,
+        "warmcopy_summary_ms": warmcopy_summary,
+        "warmcopy_p95_ms": warmcopy_p95,
+        "max_p95_ms": max_p95_ms,
+    }
+    if warmcopy_p95 is None:
+        return {
+            **base,
+            "status": "not_available",
+            "reason": "missing_warmcopy_samples",
+            "warmcopy_p95_under_max": None,
+        }
+    warmcopy_under_max = warmcopy_p95 <= max_p95_ms
+    return {
+        **base,
+        "status": "pass" if warmcopy_under_max else "fail",
+        "reason": None if warmcopy_under_max else "warmcopy_p95_exceeds_max",
+        "warmcopy_p95_under_max": warmcopy_under_max,
+    }
+
+
+def build_warmcopy_no_fallback_gate(
+    scenario_reports: Sequence[Dict[str, object]],
+    warmcopy_scenario: str = "warmcopy-large-cache",
+) -> Dict[str, object]:
+    report = _scenario_report(scenario_reports, warmcopy_scenario)
+    action_summary = (
+        report.get("warmcopy_action_summary") if isinstance(report, dict) else None
+    )
+    by_action = (
+        action_summary.get("by_action") if isinstance(action_summary, dict) else None
+    )
+    if not isinstance(by_action, dict):
+        return {
+            "requirement": "strict warmcopy release gate requires zero fallback actions",
+            "warmcopy_scenario": warmcopy_scenario,
+            "warmcopy_action_summary": action_summary,
+            "status": "not_available",
+            "reason": "missing_warmcopy_action_summary",
+            "live_fallback_count": None,
+        }
+
+    total_actions = int(
+        action_summary.get("total")
+        if isinstance(action_summary, dict) and action_summary.get("total") is not None
+        else sum(int(value) for value in by_action.values())
+    )
+    fallback_actions = {
+        str(action): int(count)
+        for action, count in by_action.items()
+        if "fallback" in str(action)
+    }
+    fallback_count = sum(fallback_actions.values())
+    if total_actions <= 0:
+        return {
+            "requirement": "strict warmcopy release gate requires zero fallback actions",
+            "warmcopy_scenario": warmcopy_scenario,
+            "warmcopy_action_summary": action_summary,
+            "status": "not_available",
+            "reason": "missing_warmcopy_actions",
+            "live_fallback_count": None,
+        }
+    return {
+        "requirement": "strict warmcopy release gate requires zero fallback actions",
+        "warmcopy_scenario": warmcopy_scenario,
+        "warmcopy_action_summary": action_summary,
+        "fallback_actions": fallback_actions,
+        "live_fallback_count": fallback_count,
+        "status": "pass" if fallback_count == 0 else "fail",
+        "reason": None if fallback_count == 0 else "live_fallback_observed",
+    }
+
+
+def build_phase2_slo_guarantee_gate(
+    scenario_reports: Sequence[Dict[str, object]],
+    warmcopy_scenario: str = "warmcopy-large-cache",
+) -> Dict[str, object]:
+    report = _scenario_report(scenario_reports, warmcopy_scenario)
+    metrics = report.get("warmcopy_metrics") if isinstance(report, dict) else None
+    if not isinstance(metrics, list) or not metrics:
+        return {
+            "requirement": "strict warmcopy release gate requires every phase2_total sample to be SLO-guaranteed by mirrored artifacts",
+            "warmcopy_scenario": warmcopy_scenario,
+            "status": "not_available",
+            "reason": "missing_warmcopy_metrics",
+            "phase2_slo_not_guaranteed_count": None,
+        }
+
+    missing_flag = 0
+    not_guaranteed_count = 0
+    for metric in metrics:
+        if not isinstance(metric, dict) or "phase2_slo_guaranteed" not in metric:
+            missing_flag += 1
+            not_guaranteed_count += 1
+            continue
+        if int(metric.get("phase2_slo_guaranteed", 0)) != 1:
+            reported = int(metric.get("phase2_slo_not_guaranteed_count", 0) or 0)
+            not_guaranteed_count += reported if reported > 0 else 1
+
+    if missing_flag:
+        return {
+            "requirement": "strict warmcopy release gate requires every phase2_total sample to be SLO-guaranteed by mirrored artifacts",
+            "warmcopy_scenario": warmcopy_scenario,
+            "status": "not_available",
+            "reason": "missing_phase2_slo_guaranteed_field",
+            "missing_metric_count": missing_flag,
+            "phase2_slo_not_guaranteed_count": not_guaranteed_count,
+        }
+
+    return {
+        "requirement": "strict warmcopy release gate requires every phase2_total sample to be SLO-guaranteed by mirrored artifacts",
+        "warmcopy_scenario": warmcopy_scenario,
+        "status": "pass" if not_guaranteed_count == 0 else "fail",
+        "reason": None if not_guaranteed_count == 0 else "phase2_slo_not_guaranteed",
+        "phase2_slo_not_guaranteed_count": not_guaranteed_count,
+    }
+
+
 def _ensure_initial_server_available(runner: BusinessE2ERunner) -> None:
     unix_socket = runner.config.unix_socket
     if unix_socket and not Path(unix_socket).expanduser().exists():
@@ -550,6 +706,79 @@ def run_scenario(scenario: BenchmarkScenario) -> Dict[str, object]:
     phase2_samples = [
         sample.phase2_pause_ms for sample in getattr(runner, "phase2_pause_samples", [])
     ]
+    phase2_total_samples = _metric_us_samples_ms(warmcopy_metrics, "phase2_total_us")
+    phase2_target_preserve_samples = _metric_us_samples_ms(
+        warmcopy_metrics, "phase2_target_preserve_us"
+    )
+    phase2_lock_seal_samples = _metric_us_samples_ms(
+        warmcopy_metrics, "phase2_lock_seal_us"
+    )
+    phase2_lock_preflight_samples = _metric_us_samples_ms(
+        warmcopy_metrics, "phase2_lock_preflight_us"
+    )
+    phase2_slo_not_guaranteed_count = sum(
+        int(metric.get("phase2_slo_not_guaranteed_count", 0) or 0)
+        for metric in warmcopy_metrics
+        if int(metric.get("phase2_slo_guaranteed", 1) or 0) != 1
+    )
+    phase1_record_prebuilt_target_count = sum(
+        int(metric.get("phase1_record_prebuilt_target_count", 0) or 0)
+        for metric in warmcopy_metrics
+    )
+    phase1_record_active_scan_target_count = sum(
+        int(metric.get("phase1_record_active_scan_target_count", 0) or 0)
+        for metric in warmcopy_metrics
+    )
+    phase2_record_prebuilt_target_count = sum(
+        int(metric.get("phase2_record_prebuilt_target_count", 0) or 0)
+        for metric in warmcopy_metrics
+    )
+    phase2_record_materialized_target_count = sum(
+        int(metric.get("phase2_record_materialized_target_count", 0) or 0)
+        for metric in warmcopy_metrics
+    )
+    phase2_record_lock_count = sum(
+        int(metric.get("phase2_record_lock_count", 0) or 0)
+        for metric in warmcopy_metrics
+    )
+    phase2_table_lock_count = sum(
+        int(metric.get("phase2_table_lock_count", 0) or 0)
+        for metric in warmcopy_metrics
+    )
+    phase2_mdl_descriptor_count = sum(
+        int(metric.get("phase2_mdl_descriptor_count", 0) or 0)
+        for metric in warmcopy_metrics
+    )
+    phase2_table_live_export_target_count = sum(
+        int(metric.get("phase2_table_live_export_target_count", 0) or 0)
+        for metric in warmcopy_metrics
+    )
+    phase2_mdl_live_export_target_count = sum(
+        int(metric.get("phase2_mdl_live_export_target_count", 0) or 0)
+        for metric in warmcopy_metrics
+    )
+    phase2_savepoint_live_export_target_count = sum(
+        int(metric.get("phase2_savepoint_live_export_target_count", 0) or 0)
+        for metric in warmcopy_metrics
+    )
+    phase2_slo_reasons: Dict[str, int] = {}
+    for metric in warmcopy_metrics:
+        reason = metric.get("phase2_slo_reason")
+        if isinstance(reason, str) and reason:
+            phase2_slo_reasons[reason] = phase2_slo_reasons.get(reason, 0) + 1
+    phase2_seal_worker_count_max = max(
+        (int(metric.get("phase2_seal_worker_count", 0) or 0)
+         for metric in warmcopy_metrics),
+        default=0,
+    )
+    phase2_preserve_worker_count_max = max(
+        (int(metric.get("phase2_preserve_worker_count", 0) or 0)
+         for metric in warmcopy_metrics),
+        default=0,
+    )
+    preserve_lock_warmcopy_seal_threads = getattr(
+        scenario.config, "preserve_lock_warmcopy_seal_threads", 0
+    )
 
     return {
         "name": scenario.name,
@@ -577,17 +806,89 @@ def run_scenario(scenario: BenchmarkScenario) -> Dict[str, object]:
         "preserve_lock_warmcopy_max_journal_bytes": (
             scenario.config.preserve_lock_warmcopy_max_journal_bytes
         ),
+        "preserve_lock_warmcopy_seal_threads": (
+            preserve_lock_warmcopy_seal_threads
+        ),
+        "preserve_parallel_preserve_threads": (
+            scenario.config.preserve_parallel_preserve_threads
+        ),
         "latency_scope": {
             "wall_ms": "whole E2E scenario, including workload, DRAIN, restart, RESUME, and validation",
             "warmcopy_metrics.phase1_us": "server-side warm-copy phase 1 before phase-2 preserve",
-            "warmcopy_metrics.phase2_pause_us": "server-side phase-2 pause during preserve handoff",
+            "warmcopy_metrics.phase2_pause_us": "legacy participant-specific phase-2 pause metric",
+            "warmcopy_metrics.phase2_total_us": "server-side blocked business window from WARMCOPY_CLOSING to preserved snapshot registration",
+            "warmcopy_metrics.phase2_lock_seal_us": "time spent sealing lock-warmcopy record artifacts inside phase2_total_us",
+            "warmcopy_metrics.phase2_target_preserve_us": "time spent preserving quiesced targets inside phase2_total_us",
+            "warmcopy_metrics.phase2_lock_preflight_us": "time spent in per-target lock metadata preflight and warmcopy canonical/fence checks before or during phase2_total_us; current late phase-1 record scans are reported here but are not included in phase2_total_us until WARMCOPY_CLOSING starts",
+            "warmcopy_metrics.phase2_participant_preflight_us": "time spent in participant preflight inside phase2_total_us",
+            "warmcopy_metrics.phase2_snapshot_write_us": "snapshot write portion inside per-target preserve",
+            "warmcopy_metrics.phase1_record_prebuilt_target_count": "number of lock-warmcopy targets whose record-lock artifact was prebuilt before the phase-2 blocked window",
+            "warmcopy_metrics.phase1_record_active_scan_target_count": "number of non-idle active targets whose record-lock artifact was scanned and prebuilt before the phase-2 blocked window",
+            "warmcopy_metrics.phase2_record_lock_count": "server-side record lock entries represented by warmcopy artifacts for the drain sample",
+            "warmcopy_metrics.phase2_table_lock_count": "server-side table or AUTO_INC lock entries represented by warmcopy artifacts for the drain sample",
+            "warmcopy_metrics.phase2_mdl_descriptor_count": "server-side transaction-duration MDL descriptors represented by warmcopy artifacts for the drain sample",
+            "warmcopy_metrics.phase2_table_live_export_target_count": "number of targets whose table/AUTO_INC family still used live export/final compare, so strict phase2 SLO is not yet proven",
+            "warmcopy_metrics.phase2_mdl_live_export_target_count": "number of targets whose transaction-duration MDL family still used live export/final compare, so strict phase2 SLO is not yet proven",
+            "warmcopy_metrics.phase2_savepoint_live_export_target_count": "number of targets whose SQL savepoint family still used live export/final compare, so strict phase2 SLO is not yet proven",
+            "warmcopy_metrics.phase2_record_prebuilt_target_count": "number of lock-warmcopy targets whose record-lock artifact used a phase-1 prebuilt external blob",
+            "warmcopy_metrics.phase2_record_materialized_target_count": "number of lock-warmcopy targets that still materialized record-lock payload in phase 2",
+            "warmcopy_metrics.phase2_seal_worker_count": "maximum lock-warmcopy record seal worker count used by the server for a drain sample",
+            "warmcopy_metrics.phase2_preserve_worker_count": "maximum target preserve worker count used by the server for a drain sample",
+            "warmcopy_metrics.phase2_slo_guaranteed": "1 only when the server declares the sample covered by mirrored artifacts for the full phase2 SLO",
+            "warmcopy_metrics.phase2_slo_not_guaranteed_count": "number of targets that preserved functionally but do not yet satisfy the strict 1s SLO proof",
+            "warmcopy_metrics.phase2_slo_reason": "first server-side reason explaining why strict phase2 SLO is not yet proven for a sample",
             "phase2_pause_samples_ms": "runner-observed warm-copy phase-2 pause samples by large-cache bucket",
+            "phase2_total_samples_ms": "server-side phase2_total_us samples converted to milliseconds",
         },
         "warmcopy_metrics": warmcopy_metrics,
         "warmcopy_action_summary": warmcopy_action_summary,
         "phase2_pause_samples_ms": phase2_samples,
         "phase2_pause_median_ms": _median(phase2_samples),
         "phase2_pause_summary_ms": summarize_phase2_pause_samples(phase2_samples),
+        "phase2_total_samples_ms": phase2_total_samples,
+        "phase2_total_median_ms": _median(phase2_total_samples),
+        "phase2_total_summary_ms": summarize_phase2_pause_samples(phase2_total_samples),
+        "phase2_target_preserve_samples_ms": phase2_target_preserve_samples,
+        "phase2_target_preserve_summary_ms": summarize_phase2_pause_samples(
+            phase2_target_preserve_samples
+        ),
+        "phase2_lock_seal_samples_ms": phase2_lock_seal_samples,
+        "phase2_lock_seal_summary_ms": summarize_phase2_pause_samples(
+            phase2_lock_seal_samples
+        ),
+        "phase2_lock_preflight_samples_ms": phase2_lock_preflight_samples,
+        "phase2_lock_preflight_summary_ms": summarize_phase2_pause_samples(
+            phase2_lock_preflight_samples
+        ),
+        "phase2_slo_guaranteed": bool(
+            warmcopy_metrics and phase2_slo_not_guaranteed_count == 0 and
+            all(int(metric.get("phase2_slo_guaranteed", 0) or 0) == 1
+                for metric in warmcopy_metrics)
+        ),
+        "phase2_slo_not_guaranteed_count": phase2_slo_not_guaranteed_count,
+        "phase2_slo_reasons": phase2_slo_reasons,
+        "phase1_record_prebuilt_target_count": phase1_record_prebuilt_target_count,
+        "phase1_record_active_scan_target_count": (
+            phase1_record_active_scan_target_count
+        ),
+        "phase2_record_prebuilt_target_count": phase2_record_prebuilt_target_count,
+        "phase2_record_materialized_target_count": (
+            phase2_record_materialized_target_count
+        ),
+        "phase2_record_lock_count": phase2_record_lock_count,
+        "phase2_table_lock_count": phase2_table_lock_count,
+        "phase2_mdl_descriptor_count": phase2_mdl_descriptor_count,
+        "phase2_table_live_export_target_count": (
+            phase2_table_live_export_target_count
+        ),
+        "phase2_mdl_live_export_target_count": (
+            phase2_mdl_live_export_target_count
+        ),
+        "phase2_savepoint_live_export_target_count": (
+            phase2_savepoint_live_export_target_count
+        ),
+        "phase2_seal_worker_count_max": phase2_seal_worker_count_max,
+        "phase2_preserve_worker_count_max": phase2_preserve_worker_count_max,
     }
 
 
@@ -642,6 +943,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         default=1_073_741_824,
     )
+    parser.add_argument(
+        "--preserve-parallel-preserve-threads",
+        type=int,
+        default=0,
+        help="preserve_trx_parallel_preserve_threads for lock warmcopy target-preserve tuning; 0 keeps server auto",
+    )
+    parser.add_argument(
+        "--preserve-lock-warmcopy-seal-threads",
+        type=int,
+        default=0,
+        help="preserve_trx_lock_warmcopy_seal_threads for lock warmcopy seal tuning; 0 keeps server auto",
+    )
     parser.add_argument("--large-binlog-cache-sessions", type=int, default=1)
     parser.add_argument(
         "--large-binlog-cache-buckets-mb",
@@ -680,6 +993,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="return nonzero unless warmcopy phase-2 p95 is below live baseline p95",
     )
     parser.add_argument(
+        "--require-phase2-p95-under-ms",
+        type=float,
+        help="return nonzero unless warmcopy server-side phase2_total p95 is at or below this many ms",
+    )
+    parser.add_argument(
+        "--require-no-warmcopy-fallback",
+        action="store_true",
+        help="return nonzero unless the warmcopy scenario reports zero live fallback actions",
+    )
+    parser.add_argument(
+        "--require-phase2-slo-guaranteed",
+        action="store_true",
+        help="return nonzero unless the warmcopy scenario reports every phase2_total sample as SLO-guaranteed",
+    )
+    parser.add_argument(
         "--hotpath-benchmark-log",
         help="parse gunit microbenchmark stdout/stderr from this file and include lock warmcopy hot-path gates",
     )
@@ -714,22 +1042,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     if "none" not in set(args.scenario) and not args.restart_command:
         parser.error("--restart-command is required when workload scenarios run")
     requested_scenarios = set(args.scenario)
-    if {
-        "live-export-large-lockset",
-        "lock-warmcopy-large-lockset",
-    }.issubset(requested_scenarios):
-        if args.phase2_live_baseline_scenario == "baseline":
-            args.phase2_live_baseline_scenario = "live-export-large-lockset"
-        if args.phase2_warmcopy_scenario == "warmcopy-large-cache":
-            args.phase2_warmcopy_scenario = "lock-warmcopy-large-lockset"
-    if {
-        "scaled-live-lockset",
-        "scaled-lock-warmcopy-lockset",
-    }.issubset(requested_scenarios):
-        if args.phase2_live_baseline_scenario == "baseline":
-            args.phase2_live_baseline_scenario = "scaled-live-lockset"
-        if args.phase2_warmcopy_scenario == "warmcopy-large-cache":
-            args.phase2_warmcopy_scenario = "scaled-lock-warmcopy-lockset"
+    if (
+        args.phase2_live_baseline_scenario == "baseline"
+        and "live-export-large-lockset" in requested_scenarios
+    ):
+        args.phase2_live_baseline_scenario = "live-export-large-lockset"
+    if (
+        args.phase2_warmcopy_scenario == "warmcopy-large-cache"
+        and "lock-warmcopy-large-lockset" in requested_scenarios
+    ):
+        args.phase2_warmcopy_scenario = "lock-warmcopy-large-lockset"
+    if (
+        args.phase2_live_baseline_scenario == "baseline"
+        and "scaled-live-lockset" in requested_scenarios
+    ):
+        args.phase2_live_baseline_scenario = "scaled-live-lockset"
+    if (
+        args.phase2_warmcopy_scenario == "warmcopy-large-cache"
+        and "scaled-lock-warmcopy-lockset" in requested_scenarios
+    ):
+        args.phase2_warmcopy_scenario = "scaled-lock-warmcopy-lockset"
     if "temp-image" in set(args.scenario):
         parser.error(
             "temp-image is unsupported in the current P1 contract: "
@@ -756,6 +1088,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         live_baseline_scenario=args.phase2_live_baseline_scenario,
         warmcopy_scenario=args.phase2_warmcopy_scenario,
     )
+    phase2_absolute_gate: Optional[Dict[str, object]] = None
+    if args.require_phase2_p95_under_ms is not None:
+        phase2_absolute_gate = build_phase2_absolute_p95_gate(
+            scenario_reports,
+            warmcopy_scenario=args.phase2_warmcopy_scenario,
+            max_p95_ms=args.require_phase2_p95_under_ms,
+        )
+    warmcopy_no_fallback_gate = build_warmcopy_no_fallback_gate(
+        scenario_reports,
+        warmcopy_scenario=args.phase2_warmcopy_scenario,
+    )
+    phase2_slo_guarantee_gate = build_phase2_slo_guarantee_gate(
+        scenario_reports,
+        warmcopy_scenario=args.phase2_warmcopy_scenario,
+    )
     hotpath_benchmarks: List[Dict[str, object]] = []
     hotpath_gate: Optional[Dict[str, object]] = None
     if args.hotpath_benchmark_log:
@@ -773,6 +1120,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report = {
         "scenarios": scenario_reports,
         "phase2_pause_comparison": phase2_comparison,
+        "phase2_absolute_p95_gate": phase2_absolute_gate,
+        "phase2_slo_guarantee_gate": phase2_slo_guarantee_gate,
+        "warmcopy_no_fallback_gate": warmcopy_no_fallback_gate,
         "hotpath_benchmarks": hotpath_benchmarks,
         "hotpath_benchmark_gate": hotpath_gate,
     }
@@ -782,6 +1132,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         print(rendered)
     if args.require_phase2_p95_below_baseline and phase2_comparison["status"] != "pass":
+        return 1
+    if (
+        phase2_absolute_gate is not None
+        and phase2_absolute_gate["status"] != "pass"
+    ):
+        return 1
+    if (
+        args.require_no_warmcopy_fallback
+        and warmcopy_no_fallback_gate["status"] != "pass"
+    ):
+        return 1
+    if (
+        args.require_phase2_slo_guaranteed
+        and phase2_slo_guarantee_gate["status"] != "pass"
+    ):
         return 1
     if args.require_hotpath_benchmark_gates and (
         hotpath_gate is None or hotpath_gate["status"] != "pass"

@@ -191,6 +191,7 @@ struct Mysql_binlog_preserve_snapshot {
 };
 
 static constexpr const char kPreservedTrxBlobBinlogCache[] = "binlog_cache";
+static constexpr const char kPreservedTrxBlobRecordLocks[] = "record_locks";
 
 struct Preserved_trx_external_blob_descriptor {
   std::string name;
@@ -204,14 +205,24 @@ struct Preserved_trx_external_blob {
   Preserved_trx_external_blob_descriptor descriptor;
   bool prebuilt{false};
   std::string warmcopy_id;
+  uint64_t warmcopy_epoch{0};
 };
 
 struct PrebuiltBinlogCacheBlob {
   std::string warmcopy_id;
   std::string name{kPreservedTrxBlobBinlogCache};
+  uint64_t warmcopy_epoch{0};
   uint64_t size{0};
   std::array<unsigned char, kPreservedTrxSha256Length> digest{};
   Mysql_binlog_preserve_snapshot metadata;
+};
+
+struct PrebuiltRecordLocksBlob {
+  std::string warmcopy_id;
+  std::string name{kPreservedTrxBlobRecordLocks};
+  uint64_t warmcopy_epoch{0};
+  uint64_t size{0};
+  std::array<unsigned char, kPreservedTrxSha256Length> digest{};
 };
 
 class PreserveBinlogBlobProvider {
@@ -253,12 +264,16 @@ struct Preserved_trx_decoded_snapshot {
 struct Preserved_trx_bundle_build_options {
   uint64_t max_snapshot_bytes{std::numeric_limits<uint64_t>::max()};
   uint64_t max_external_blob_bytes{std::numeric_limits<uint64_t>::max()};
+  uint64_t max_record_locks_external_blob_bytes{
+      std::numeric_limits<uint64_t>::max()};
 };
 
 struct Preserved_trx_bundle_build_input {
   Preserve_snapshot_metadata metadata;
   const Mysql_binlog_preserve_snapshot *logged_binlog_snapshot{nullptr};
   const PrebuiltBinlogCacheBlob *prebuilt_binlog_cache_blob{nullptr};
+  const PrebuiltRecordLocksBlob *prebuilt_record_locks_blob{nullptr};
+  bool externalize_record_locks_payload{false};
   Preserved_trx_bundle_build_options options;
 };
 

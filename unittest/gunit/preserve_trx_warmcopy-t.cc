@@ -1617,7 +1617,7 @@ TEST_F(PreservedTrxWarmcopyCarrierTest, PositionedWritesCanArriveOutOfOrder) {
 
   ASSERT_EQ(Preserved_trx_carrier_status::OK,
             m_carrier->adopt_warm_external_blob(
-                "warmcopy_1", "token_1", kPreservedTrxBlobBinlogCache,
+                "warmcopy_1", "token_1", kPreservedTrxBlobBinlogCache, 0,
                 descriptor_for_payload(expected)));
 
   const std::string contents = read_file("token_1.binlog_cache");
@@ -1639,7 +1639,7 @@ TEST_F(PreservedTrxWarmcopyCarrierTest, AdoptRejectsOpenWriter) {
 
   EXPECT_EQ(Preserved_trx_carrier_status::IO_ERROR,
             m_carrier->adopt_warm_external_blob(
-                "warmcopy_1", "token_1", kPreservedTrxBlobBinlogCache,
+                "warmcopy_1", "token_1", kPreservedTrxBlobBinlogCache, 0,
                 descriptor(payload.size())));
   EXPECT_TRUE(exists("warmcopy_1.binlog_cache.warm.7"));
   EXPECT_FALSE(exists("token_1.binlog_cache"));
@@ -1647,7 +1647,7 @@ TEST_F(PreservedTrxWarmcopyCarrierTest, AdoptRejectsOpenWriter) {
   close_and_seal_writer(writer, payload);
   EXPECT_EQ(Preserved_trx_carrier_status::OK,
             m_carrier->adopt_warm_external_blob(
-                "warmcopy_1", "token_1", kPreservedTrxBlobBinlogCache,
+                "warmcopy_1", "token_1", kPreservedTrxBlobBinlogCache, 0,
                 descriptor_for_payload(payload)));
   EXPECT_EQ(payload, read_file("token_1.binlog_cache"));
 }
@@ -1664,7 +1664,7 @@ TEST_F(PreservedTrxWarmcopyCarrierTest, TruncateRemovesTailBytes) {
   close_and_seal_writer(writer, "abc");
   ASSERT_EQ(Preserved_trx_carrier_status::OK,
             m_carrier->adopt_warm_external_blob(
-                "warmcopy_1", "token_1", kPreservedTrxBlobBinlogCache,
+                "warmcopy_1", "token_1", kPreservedTrxBlobBinlogCache, 0,
                 descriptor_for_payload("abc")));
 
   EXPECT_EQ("abc", read_file("token_1.binlog_cache"));
@@ -1737,7 +1737,7 @@ TEST_F(PreservedTrxWarmcopyCarrierTest, AdoptUsesValidatedCallerDescriptor) {
 
   EXPECT_EQ(Preserved_trx_carrier_status::OK,
             m_carrier->adopt_warm_external_blob(
-                "warmcopy_1", "token_1", kPreservedTrxBlobBinlogCache,
+                "warmcopy_1", "token_1", kPreservedTrxBlobBinlogCache, 0,
                 caller_descriptor));
   EXPECT_EQ("abc", read_file("token_1.binlog_cache"));
 }
@@ -1758,7 +1758,7 @@ TEST_F(PreservedTrxWarmcopyCarrierTest,
 
   EXPECT_EQ(Preserved_trx_carrier_status::CORRUPT,
             m_carrier->adopt_warm_external_blob(
-                "warmcopy_bad", "token_bad", kPreservedTrxBlobBinlogCache,
+                "warmcopy_bad", "token_bad", kPreservedTrxBlobBinlogCache, 0,
                 caller_descriptor));
   EXPECT_TRUE(exists("warmcopy_bad.binlog_cache.warm.7"));
   EXPECT_FALSE(exists("token_bad.binlog_cache"));
@@ -1778,7 +1778,7 @@ TEST_F(PreservedTrxWarmcopyCarrierTest,
 
   EXPECT_EQ(Preserved_trx_carrier_status::ALREADY_EXISTS,
             m_carrier->adopt_warm_external_blob(
-                "warmcopy_1", "token_1", kPreservedTrxBlobBinlogCache,
+                "warmcopy_1", "token_1", kPreservedTrxBlobBinlogCache, 0,
                 descriptor(payload.size())));
   EXPECT_EQ("existing snapshot", read_file("token_1.bin"));
   EXPECT_EQ("existing cache", read_file("token_1.binlog_cache"));
@@ -1803,7 +1803,7 @@ TEST_F(PreservedTrxWarmcopyCarrierTest, DuplicateWarmArtifactsAreCorrupt) {
 
   EXPECT_EQ(Preserved_trx_carrier_status::CORRUPT,
             m_carrier->adopt_warm_external_blob(
-                "warmcopy_1", "token_1", kPreservedTrxBlobBinlogCache,
+                "warmcopy_1", "token_1", kPreservedTrxBlobBinlogCache, 0,
                 descriptor(payload.size())));
   EXPECT_TRUE(exists("warmcopy_1.binlog_cache.warm.7"));
   EXPECT_TRUE(exists("warmcopy_1.binlog_cache.warm.8"));

@@ -38,8 +38,9 @@ SELECT TOKEN, BINLOG_STATE, WROTE_TO_CACHE,
        SESSION_SQL_LOG_BIN, GLOBAL_LOG_BIN
   FROM performance_schema.preserved_transactions;
 
---file_exists $PRESERVED_SNAPSHOT_FILE
---file_exists $PRESERVED_BINLOG_CACHE_FILE
+--let $expect_bin= 1
+--let $expect_binlog_cache= 1
+--source suite/preserve_trx/include/assert_preserve_dir_files.inc
 
 --connection batch_logged_cache_failure_app
 --error ER_PRESERVE_TRX_SESSION_DRAINED

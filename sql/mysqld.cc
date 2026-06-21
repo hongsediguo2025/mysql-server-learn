@@ -9047,6 +9047,120 @@ static int show_preserve_trx_lock_warmcopy_live_fallback(THD *, SHOW_VAR *var,
   return 0;
 }
 
+static int show_preserve_trx_phase2_total_us(THD *, SHOW_VAR *var,
+                                             char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) = (long long)preserve_trx_phase2_total_us_status();
+  return 0;
+}
+
+static int show_preserve_trx_phase2_target_wait_us(THD *, SHOW_VAR *var,
+                                                   char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_phase2_target_wait_us_status();
+  return 0;
+}
+
+static int show_preserve_trx_phase2_participant_prepare_us(THD *,
+                                                           SHOW_VAR *var,
+                                                           char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_phase2_participant_prepare_us_status();
+  return 0;
+}
+
+static int show_preserve_trx_phase2_participant_close_us(THD *, SHOW_VAR *var,
+                                                         char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_phase2_participant_close_us_status();
+  return 0;
+}
+
+static int show_preserve_trx_phase2_participant_preflight_us(
+    THD *, SHOW_VAR *var, char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_phase2_participant_preflight_us_status();
+  return 0;
+}
+
+static int show_preserve_trx_phase2_lock_seal_us(THD *, SHOW_VAR *var,
+                                                 char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) = (long long)preserve_trx_phase2_lock_seal_us_status();
+  return 0;
+}
+
+static int show_preserve_trx_phase2_target_preserve_us(THD *, SHOW_VAR *var,
+                                                       char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_phase2_target_preserve_us_status();
+  return 0;
+}
+
+static int show_preserve_trx_phase2_lock_preflight_us(THD *, SHOW_VAR *var,
+                                                      char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_phase2_lock_preflight_us_status();
+  return 0;
+}
+
+static int show_preserve_trx_phase2_prepare_us(THD *, SHOW_VAR *var,
+                                               char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) = (long long)preserve_trx_phase2_prepare_us_status();
+  return 0;
+}
+
+static int show_preserve_trx_phase2_detach_claim_us(THD *, SHOW_VAR *var,
+                                                    char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_phase2_detach_claim_us_status();
+  return 0;
+}
+
+static int show_preserve_trx_phase2_snapshot_write_us(THD *, SHOW_VAR *var,
+                                                      char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_phase2_snapshot_write_us_status();
+  return 0;
+}
+
+static int show_preserve_trx_phase2_register_us(THD *, SHOW_VAR *var,
+                                                char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) = (long long)preserve_trx_phase2_register_us_status();
+  return 0;
+}
+
+static int show_preserve_trx_phase2_slo_miss_count(THD *, SHOW_VAR *var,
+                                                   char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) =
+      (long long)preserve_trx_phase2_slo_miss_count_status();
+  return 0;
+}
+
 static int show_preserve_trx_lock_warmcopy_phase2_pause_us(
     THD *, SHOW_VAR *var, char *buf) {
   var->type = SHOW_LONGLONG;
@@ -9234,6 +9348,45 @@ SHOW_VAR status_vars[] = {
      SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_memory_peak_bytes",
      (char *)&show_preserve_trx_memory_peak_bytes, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_phase2_detach_claim_us",
+     (char *)&show_preserve_trx_phase2_detach_claim_us, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_phase2_lock_preflight_us",
+     (char *)&show_preserve_trx_phase2_lock_preflight_us, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_phase2_lock_seal_us",
+     (char *)&show_preserve_trx_phase2_lock_seal_us, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_phase2_participant_close_us",
+     (char *)&show_preserve_trx_phase2_participant_close_us, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_phase2_participant_preflight_us",
+     (char *)&show_preserve_trx_phase2_participant_preflight_us, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_phase2_participant_prepare_us",
+     (char *)&show_preserve_trx_phase2_participant_prepare_us, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_phase2_prepare_us",
+     (char *)&show_preserve_trx_phase2_prepare_us, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_phase2_register_us",
+     (char *)&show_preserve_trx_phase2_register_us, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_phase2_slo_miss_count",
+     (char *)&show_preserve_trx_phase2_slo_miss_count, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_phase2_snapshot_write_us",
+     (char *)&show_preserve_trx_phase2_snapshot_write_us, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_phase2_target_preserve_us",
+     (char *)&show_preserve_trx_phase2_target_preserve_us, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_phase2_target_wait_us",
+     (char *)&show_preserve_trx_phase2_target_wait_us, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_phase2_total_us",
+     (char *)&show_preserve_trx_phase2_total_us, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_spill_bytes", (char *)&show_preserve_trx_spill_bytes,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},

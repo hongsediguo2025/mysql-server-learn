@@ -30,7 +30,9 @@
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
+#include <memory>
 #include <set>
+#include <thread>
 #include <tuple>
 #include <unistd.h>
 #include <vector>
@@ -42,9 +44,11 @@
 #include "sql/mdl.h"
 #include "sql/mysqld.h"
 #include "sql/mysqld_thd_manager.h"
+#include "sql/preserve_trx_carrier.h"
 #include "sql/preserve_trx.h"
 #include "sql/sql_class.h"
 #include "my_dbug.h"
+#include "sha2.h"
 #include "storage/innobase/include/lock0warmcopy.h"
 #include "storage/innobase/include/trx0preserve.h"
 
@@ -480,6 +484,18 @@ Preserve_trx_lock_warmcopy_artifact invalid_artifact(
 }
 
 uint64_t artifact_payload_bytes(
+    const Preserve_trx_lock_warmcopy_artifact &artifact) {
+  const uint64_t record_bytes =
+      artifact.has_prebuilt_record_locks_blob
+          ? artifact.prebuilt_record_locks_blob.size
+          : artifact.record_locks_payload.size();
+  return record_bytes +
+         artifact.predicate_locks_payload.size() +
+         artifact.table_locks_payload.size() +
+         artifact.mdl_descriptors_payload.size();
+}
+
+uint64_t artifact_resident_payload_bytes(
     const Preserve_trx_lock_warmcopy_artifact &artifact) {
   return artifact.record_locks_payload.size() +
          artifact.predicate_locks_payload.size() +
@@ -1003,7 +1019,7 @@ bool spill_artifact_to_file(Preserve_trx_lock_warmcopy_artifact *artifact,
   }
 
   artifact->spill_path = segment_path;
-  artifact->spill_payload_bytes = artifact_payload_bytes(*artifact);
+  artifact->spill_payload_bytes = artifact_resident_payload_bytes(*artifact);
   artifact->spill_checksum = fnv1a64(serialized.substr(0, serialized.size() - 8));
   artifact->spilled_to_file = true;
   artifact->spill_materialized = false;
@@ -1081,12 +1097,29 @@ Preserve_trx_lock_warmcopy_target_state prepared_target_state(
              : Preserve_trx_lock_warmcopy_target_state::NEW;
 }
 
+uint32_t effective_lock_warmcopy_seal_thread_count(uint32_t configured,
+                                                   size_t target_count) {
+  if (target_count <= 1) return 1;
+
+  uint32_t requested = configured;
+  if (requested == 0) {
+    requested = std::thread::hardware_concurrency();
+    if (requested == 0) requested = 2;
+  }
+
+  const size_t bounded =
+      std::min<size_t>(static_cast<size_t>(requested), target_count);
+  return static_cast<uint32_t>(std::max<size_t>(1, bounded));
+}
+
 class Lock_warmcopy_target_fence_sampler final : public Do_THD_Impl {
  public:
   explicit Lock_warmcopy_target_fence_sampler(
-      const std::vector<uint64_t> &target_thread_ids, uint32_t max_lock_count)
+      const std::vector<uint64_t> &target_thread_ids, uint32_t max_lock_count,
+      const std::set<uint64_t> &skip_record_export_thread_ids = {})
       : m_target_thread_ids(target_thread_ids.begin(),
                             target_thread_ids.end()),
+        m_skip_record_export_thread_ids(skip_record_export_thread_ids),
         m_max_lock_count(max_lock_count) {}
 
   void operator()(THD *candidate) override {
@@ -1099,17 +1132,19 @@ class Lock_warmcopy_target_fence_sampler final : public Do_THD_Impl {
       m_fences.emplace(thread_id, fence);
     }
 
-    std::string record_locks_payload;
-    uint32_t record_lock_count = 0;
-    if (trx_preserve_export_record_locks(candidate, &record_locks_payload,
-                                         m_max_lock_count) == DB_SUCCESS &&
-        (record_locks_payload.empty() ||
-         trx_preserve_record_locks_payload_lock_count(record_locks_payload,
-                                                      &record_lock_count))) {
-      m_record_locks.emplace(thread_id, std::move(record_locks_payload));
-      m_record_lock_counts.emplace(thread_id, record_lock_count);
-    } else {
-      m_record_locks_failed.insert(thread_id);
+    if (m_skip_record_export_thread_ids.count(thread_id) == 0) {
+      std::string record_locks_payload;
+      uint32_t record_lock_count = 0;
+      if (trx_preserve_export_record_locks(candidate, &record_locks_payload,
+                                           m_max_lock_count) == DB_SUCCESS &&
+          (record_locks_payload.empty() ||
+           trx_preserve_record_locks_payload_lock_count(record_locks_payload,
+                                                        &record_lock_count))) {
+        m_record_locks.emplace(thread_id, std::move(record_locks_payload));
+        m_record_lock_counts.emplace(thread_id, record_lock_count);
+      } else {
+        m_record_locks_failed.insert(thread_id);
+      }
     }
 
     std::string table_locks_payload;
@@ -1118,11 +1153,11 @@ class Lock_warmcopy_target_fence_sampler final : public Do_THD_Impl {
                                         m_max_lock_count, 0) == DB_SUCCESS &&
         trx_preserve_table_locks_payload_lock_count(table_locks_payload,
                                                     &table_lock_count)) {
+      const bool autoinc_lock_owned =
+          trx_preserve_table_locks_payload_has_autoinc(table_locks_payload);
       m_table_locks.emplace(thread_id, std::move(table_locks_payload));
       m_table_lock_counts.emplace(thread_id, table_lock_count);
-      m_autoinc_locks.emplace(
-          thread_id,
-          trx_preserve_table_locks_payload_has_autoinc(table_locks_payload));
+      m_autoinc_locks.emplace(thread_id, autoinc_lock_owned);
     } else {
       m_table_locks_failed.insert(thread_id);
     }
@@ -1214,6 +1249,7 @@ class Lock_warmcopy_target_fence_sampler final : public Do_THD_Impl {
 
  private:
   std::set<uint64_t> m_target_thread_ids;
+  std::set<uint64_t> m_skip_record_export_thread_ids;
   uint32_t m_max_lock_count;
   std::map<uint64_t, lock_warmcopy_trx_lock_fence_t> m_fences;
   std::map<uint64_t, std::string> m_record_locks;
@@ -1378,8 +1414,10 @@ preserve_trx_lock_warmcopy_verify_record_final_fence(
 
   if (current_fence.conversion_attempt_after_freeze ||
       current_fence.conversion_unhandled_after_freeze ||
-      !lock_warmcopy_trx_lock_fence_equal(artifact.record_live_seal_fence,
-                                          current_fence)) {
+      artifact.record_live_seal_fence.trx_locks_version !=
+          current_fence.trx_locks_version ||
+      artifact.record_live_seal_fence.n_rec_locks !=
+          current_fence.n_rec_locks) {
     return Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED;
   }
 
@@ -1581,8 +1619,25 @@ bool Preserve_trx_lock_warmcopy_drain_participant::open_phase1() {
   m_observation.state = Preserve_trx_drain_participant_state::OPEN;
   m_observation.owns_artifact = false;
   m_observation.bytes_used = 0;
+  m_observation.phase1_record_prebuilt_target_count = 0;
+  m_observation.phase1_record_active_scan_target_count = 0;
+  m_observation.phase2_lock_seal_us = 0;
+  m_observation.phase2_full_lock_scan_count = 0;
+  m_observation.materialized_lock_payload_bytes_in_phase2 = 0;
+  m_observation.phase2_record_lock_count = 0;
+  m_observation.phase2_table_lock_count = 0;
+  m_observation.phase2_mdl_descriptor_count = 0;
+  m_observation.phase2_table_live_export_target_count = 0;
+  m_observation.phase2_mdl_live_export_target_count = 0;
+  m_observation.phase2_record_prebuilt_target_count = 0;
+  m_observation.phase2_record_materialized_target_count = 0;
+  m_observation.phase2_seal_worker_count = 0;
+  m_observation.phase2_slo_guaranteed = true;
+  m_observation.phase2_slo_not_guaranteed_target_count = 0;
   m_observation.phase1_progress = 0;
   m_observation.failure_reason.clear();
+  m_observation.phase2_slo_reason.clear();
+  m_phase1_record_active_scan_targets.clear();
   return true;
 }
 
@@ -1623,11 +1678,48 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
   m_artifacts.clear();
   m_observation.owns_artifact = false;
   m_observation.bytes_used = 0;
+  refresh_phase1_record_prebuilt_observation();
+  m_observation.phase2_lock_seal_us = 0;
+  m_observation.phase2_full_lock_scan_count = 0;
+  m_observation.materialized_lock_payload_bytes_in_phase2 = 0;
+  m_observation.phase2_record_lock_count = 0;
+  m_observation.phase2_table_lock_count = 0;
+  m_observation.phase2_mdl_descriptor_count = 0;
+  m_observation.phase2_table_live_export_target_count = 0;
+  m_observation.phase2_mdl_live_export_target_count = 0;
+  m_observation.phase2_record_prebuilt_target_count = 0;
+  m_observation.phase2_record_materialized_target_count = 0;
+  m_observation.phase2_seal_worker_count = 0;
+  m_observation.phase2_slo_guaranteed = true;
+  m_observation.phase2_slo_not_guaranteed_target_count = 0;
   m_observation.failure_reason.clear();
+  m_observation.phase2_slo_reason.clear();
   cleanup_spill_paths(&m_spill_paths);
 
   bool degraded = false;
   uint64_t total_memory_bytes = 0;
+  uint64_t phase2_full_lock_scan_count = 0;
+  uint64_t materialized_lock_payload_bytes_in_phase2 = 0;
+  uint64_t phase2_record_lock_count = 0;
+  uint64_t phase2_table_lock_count = 0;
+  uint64_t phase2_mdl_descriptor_count = 0;
+  uint64_t phase2_table_live_export_target_count = 0;
+  uint64_t phase2_mdl_live_export_target_count = 0;
+  uint64_t phase2_non_record_live_export_target_count = 0;
+  uint64_t phase2_record_prebuilt_target_count = 0;
+  uint64_t phase2_record_materialized_target_count = 0;
+
+  auto mark_phase2_slo_not_guaranteed = [&](const std::string &reason,
+                                            uint64_t target_count = 0) {
+    m_observation.phase2_slo_guaranteed = false;
+    m_observation.phase2_slo_not_guaranteed_target_count =
+        std::max<uint64_t>(m_observation.phase2_slo_not_guaranteed_target_count,
+                           target_count == 0 ? m_target_thread_ids.size()
+                                             : target_count);
+    if (m_observation.phase2_slo_reason.empty()) {
+      m_observation.phase2_slo_reason = reason;
+    }
+  };
 
   auto set_first_failure_reason = [&](const std::string &reason) {
     if (m_observation.failure_reason.empty()) {
@@ -1657,7 +1749,90 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
         set_first_failure_reason(failure_reason);
       };
 
-  for (const uint64_t thread_id : m_target_thread_ids) {
+  struct Record_seal_job_result {
+    bool target_ready{false};
+    bool use_prebuilt_record_blob{false};
+    bool seal_ok{true};
+    lock_warmcopy_record_seal_result_t seal_result;
+  };
+
+  std::vector<Record_seal_job_result> record_seal_results(
+      m_target_thread_ids.size());
+  auto seal_record_for_index = [&](size_t target_index) {
+    const uint64_t thread_id = m_target_thread_ids[target_index];
+    auto target_it = m_targets.find(thread_id);
+    const Target_session *target =
+        target_it == m_targets.end() ? nullptr : &target_it->second;
+    Record_seal_job_result &job = record_seal_results[target_index];
+    if (target == nullptr || !target->phase1_record_fence_valid ||
+        !target->record_locks_candidate_valid ||
+        !target->table_locks_candidate_valid || !target->mdl_candidate_valid) {
+      return;
+    }
+
+    job.target_ready = true;
+    job.use_prebuilt_record_blob =
+        target->has_phase1_record_prebuilt_blob &&
+        !target->phase1_record_prebuilt_blob.warmcopy_id.empty() &&
+        target->phase1_record_prebuilt_fence_valid &&
+        lock_warmcopy_record_store_fence_equal(
+            target->phase1_record_prebuilt_fence,
+            target->phase1_record_fence);
+    job.seal_ok =
+        job.use_prebuilt_record_blob
+            ? lock_warmcopy_record_store_seal_metadata_for_target(
+                  thread_id, target->phase1_record_fence,
+                  target->record_lock_count, m_options.max_lock_count,
+                  m_options.max_journal_bytes, m_options.max_dirty_shards,
+                  &job.seal_result)
+            : lock_warmcopy_record_store_seal_for_target(
+                  thread_id, target->phase1_record_fence,
+                  m_options.max_lock_count, m_options.max_journal_bytes,
+                  m_options.max_dirty_shards, &job.seal_result);
+  };
+
+  const uint32_t seal_worker_count =
+      effective_lock_warmcopy_seal_thread_count(m_options.seal_threads,
+                                                m_target_thread_ids.size());
+  const ulonglong lock_seal_started_us = my_micro_time();
+  if (seal_worker_count <= 1) {
+    for (size_t target_index = 0; target_index < m_target_thread_ids.size();
+         ++target_index) {
+      seal_record_for_index(target_index);
+    }
+  } else {
+    std::atomic<size_t> next_target_index{0};
+    std::vector<std::thread> workers;
+    workers.reserve(seal_worker_count);
+    for (uint32_t worker_index = 0; worker_index < seal_worker_count;
+         ++worker_index) {
+      workers.emplace_back([&]() {
+        for (;;) {
+          const size_t target_index =
+              next_target_index.fetch_add(1, std::memory_order_relaxed);
+          if (target_index >= m_target_thread_ids.size()) break;
+          seal_record_for_index(target_index);
+        }
+      });
+    }
+    for (std::thread &worker : workers) {
+      worker.join();
+    }
+  }
+  const ulonglong lock_seal_finished_us = my_micro_time();
+  m_observation.phase2_lock_seal_us =
+      lock_seal_finished_us >= lock_seal_started_us
+          ? lock_seal_finished_us - lock_seal_started_us
+          : 0;
+  m_observation.phase2_seal_worker_count = seal_worker_count;
+
+  for (const Record_seal_job_result &job : record_seal_results) {
+    if (!job.seal_ok) return false;
+  }
+
+  for (size_t target_index = 0; target_index < m_target_thread_ids.size();
+       ++target_index) {
+    const uint64_t thread_id = m_target_thread_ids[target_index];
     preserve_trx_lock_warmcopy_note_target_attempt();
     auto target_it = m_targets.find(thread_id);
     Target_session *target =
@@ -1685,15 +1860,29 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
       continue;
     }
 
-    lock_warmcopy_record_seal_result_t seal_result;
-    if (!lock_warmcopy_record_store_seal_for_target(
-            thread_id, target->phase1_record_fence, m_options.max_lock_count,
-            m_options.max_journal_bytes, m_options.max_dirty_shards,
-            &seal_result)) {
-      return false;
+    const Record_seal_job_result &record_seal =
+        record_seal_results[target_index];
+    if (!record_seal.target_ready) {
+      seal_invalid_target(
+          thread_id, target, Preserve_trx_lock_warmcopy_reason::ARTIFACT_INVALID,
+          "lock_warmcopy_record_seal_not_ready");
+      continue;
     }
+    const bool use_prebuilt_record_blob =
+        record_seal.use_prebuilt_record_blob;
+    if (!use_prebuilt_record_blob) {
+      mark_phase2_slo_not_guaranteed("record_payload_materialized_in_phase2");
+      ++phase2_record_materialized_target_count;
+    } else {
+      ++phase2_record_prebuilt_target_count;
+    }
+    const lock_warmcopy_record_seal_result_t &seal_result =
+        record_seal.seal_result;
     preserve_trx_lock_warmcopy_note_record_store_observation(
         seal_result.journal_bytes, seal_result.dirty_shard_count);
+    phase2_full_lock_scan_count += seal_result.scanned_shard_count;
+    materialized_lock_payload_bytes_in_phase2 +=
+        seal_result.materialized_payload_bytes;
 
     if (seal_result.status != lock_warmcopy_record_seal_status_t::EMPTY &&
         seal_result.status !=
@@ -1719,8 +1908,10 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
       continue;
     }
 
-    if (seal_result.record_locks_payload.size() >
-        m_options.max_journal_bytes) {
+    const uint64_t record_payload_budget_bytes =
+        use_prebuilt_record_blob ? target->phase1_record_prebuilt_blob.size
+                                 : seal_result.record_locks_payload.size();
+    if (record_payload_budget_bytes > m_options.max_journal_bytes) {
       seal_invalid_target(
           thread_id, target,
           Preserve_trx_lock_warmcopy_reason::RESOURCE_LIMIT_EXCEEDED,
@@ -1747,7 +1938,12 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
     }
 
     Preserve_trx_lock_warmcopy_artifact artifact;
-    artifact.record_locks_payload = seal_result.record_locks_payload;
+    if (use_prebuilt_record_blob) {
+      artifact.has_prebuilt_record_locks_blob = true;
+      artifact.prebuilt_record_locks_blob = target->phase1_record_prebuilt_blob;
+    } else {
+      artifact.record_locks_payload = seal_result.record_locks_payload;
+    }
     artifact.table_locks_payload = target->table_locks_payload;
     artifact.mdl_descriptors_payload = target->mdl_descriptors_payload;
     artifact.autoinc_lock_owned = target->autoinc_lock_owned;
@@ -1765,19 +1961,23 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
     DBUG_EXECUTE_IF(
         "preserve_trx_lock_warmcopy_corrupt_record_payload_for_equivalence_test",
         {
-          if (artifact.record_locks_payload.empty()) {
-            artifact.record_locks_payload.push_back(
-                static_cast<char>(0xffU));
-          } else {
-            artifact.record_locks_payload[0] ^=
-                static_cast<char>(0x01U);
+          if (!artifact.has_prebuilt_record_locks_blob) {
+            if (artifact.record_locks_payload.empty()) {
+              artifact.record_locks_payload.push_back(
+                  static_cast<char>(0xffU));
+            } else {
+              artifact.record_locks_payload[0] ^=
+                  static_cast<char>(0x01U);
+            }
           }
         });
 
     const uint64_t payload_bytes = artifact_payload_bytes(artifact);
+    const uint64_t resident_payload_bytes =
+        artifact_resident_payload_bytes(artifact);
     const bool exceeds_memory_budget =
-        payload_bytes > m_options.max_memory_bytes ||
-        total_memory_bytes > m_options.max_memory_bytes - payload_bytes;
+        resident_payload_bytes > m_options.max_memory_bytes ||
+        total_memory_bytes > m_options.max_memory_bytes - resident_payload_bytes;
     if (exceeds_memory_budget) {
       bool spill_failed = false;
       DBUG_EXECUTE_IF("preserve_trx_lock_warmcopy_force_spill_failure",
@@ -1799,10 +1999,28 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
         continue;
       }
     } else {
-      total_memory_bytes += payload_bytes;
+      total_memory_bytes += resident_payload_bytes;
     }
 
     preserve_trx_lock_warmcopy_note_target_sealed_valid(payload_bytes);
+    phase2_record_lock_count += artifact.record_lock_count;
+    phase2_table_lock_count += artifact.table_lock_count;
+    phase2_mdl_descriptor_count += artifact.mdl_descriptor_count;
+    const bool table_family_uses_live_export =
+        (artifact.table_lock_count != 0 || artifact.autoinc_lock_owned) &&
+        !target->table_locks_phase1_fingerprint_valid;
+    const bool mdl_family_uses_live_export =
+        artifact.mdl_descriptor_count != 0 &&
+        !target->mdl_phase1_fingerprint_valid;
+    if (table_family_uses_live_export) {
+      ++phase2_table_live_export_target_count;
+    }
+    if (mdl_family_uses_live_export) {
+      ++phase2_mdl_live_export_target_count;
+    }
+    if (table_family_uses_live_export || mdl_family_uses_live_export) {
+      ++phase2_non_record_live_export_target_count;
+    }
     m_observation.owns_artifact = true;
     m_artifacts[thread_id] = artifact;
     target->observation.state =
@@ -1817,6 +2035,31 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
   }
 
   m_observation.bytes_used = total_memory_bytes;
+  m_observation.phase2_full_lock_scan_count = phase2_full_lock_scan_count;
+  m_observation.materialized_lock_payload_bytes_in_phase2 =
+      materialized_lock_payload_bytes_in_phase2;
+  m_observation.phase2_record_lock_count = phase2_record_lock_count;
+  m_observation.phase2_table_lock_count = phase2_table_lock_count;
+  m_observation.phase2_mdl_descriptor_count = phase2_mdl_descriptor_count;
+  m_observation.phase2_table_live_export_target_count =
+      phase2_table_live_export_target_count;
+  m_observation.phase2_mdl_live_export_target_count =
+      phase2_mdl_live_export_target_count;
+  m_observation.phase2_record_prebuilt_target_count =
+      phase2_record_prebuilt_target_count;
+  m_observation.phase2_record_materialized_target_count =
+      phase2_record_materialized_target_count;
+  if (phase2_table_live_export_target_count != 0 ||
+      phase2_mdl_live_export_target_count != 0) {
+    const char *reason =
+        phase2_table_live_export_target_count != 0 &&
+                phase2_mdl_live_export_target_count != 0
+            ? "table_mdl_live_export"
+            : phase2_table_live_export_target_count != 0 ? "table_live_export"
+                                                         : "mdl_live_export";
+    mark_phase2_slo_not_guaranteed(
+        reason, phase2_non_record_live_export_target_count);
+  }
   if (degraded) {
     m_observation.state = Preserve_trx_drain_participant_state::DEGRADED;
   } else {
@@ -1829,6 +2072,9 @@ void Preserve_trx_lock_warmcopy_drain_participant::
     clear_record_stores_for_targets() {
   for (const uint64_t thread_id : m_target_thread_ids) {
     lock_warmcopy_record_store_clear_for_target(thread_id);
+  }
+  for (auto &target : m_targets) {
+    discard_phase1_record_blob(&target.second);
   }
   m_record_store_cleanup_deferred_for_shutdown = false;
 }
@@ -1876,6 +2122,219 @@ Preserve_trx_lock_warmcopy_drain_participant::observation() const {
   return m_observation;
 }
 
+Preserve_trx_lock_warmcopy_drain_participant::Target_session *
+Preserve_trx_lock_warmcopy_drain_participant::ensure_target_session(
+    uint64_t thread_id) {
+  auto it = m_targets.find(thread_id);
+  if (it == m_targets.end()) {
+    Target_session session;
+    session.observation.thread_id = thread_id;
+    session.observation.state = prepared_target_state(m_observation.state);
+    session.observation.reason =
+        Preserve_trx_lock_warmcopy_reason::NOT_ATTEMPTED;
+    it = m_targets.emplace(thread_id, std::move(session)).first;
+  } else {
+    it->second.observation.thread_id = thread_id;
+    it->second.observation.state = prepared_target_state(m_observation.state);
+    it->second.observation.reason =
+        Preserve_trx_lock_warmcopy_reason::NOT_ATTEMPTED;
+  }
+
+  if (std::find(m_target_thread_ids.begin(), m_target_thread_ids.end(),
+                thread_id) == m_target_thread_ids.end()) {
+    m_target_thread_ids.push_back(thread_id);
+  }
+
+  return &it->second;
+}
+
+void Preserve_trx_lock_warmcopy_drain_participant::
+    refresh_phase1_record_prebuilt_observation() {
+  uint64_t count = 0;
+  uint64_t active_count = 0;
+  for (const auto &target : m_targets) {
+    const Target_session &session = target.second;
+    if (session.record_locks_seeded_in_phase1 &&
+        session.record_locks_candidate_valid &&
+        session.has_phase1_record_prebuilt_blob) {
+      ++count;
+      if (m_phase1_record_active_scan_targets.count(target.first) != 0) {
+        ++active_count;
+      }
+    }
+  }
+  m_observation.phase1_record_prebuilt_target_count = count;
+  m_observation.phase1_record_active_scan_target_count = active_count;
+}
+
+bool Preserve_trx_lock_warmcopy_drain_participant::
+    build_phase1_record_blob_for_target(uint64_t thread_id,
+                                        Target_session *target,
+                                        const std::string &payload) {
+  if (target == nullptr) return false;
+  discard_phase1_record_blob(target);
+  /*
+    Debug canonical-equivalence validation compares the sealed record payload
+    bytes. Keep that path materialized so the test gate does not hydrate the
+    phase-1 warm file inside the production preserve kernel.
+  */
+  if (payload.empty() || m_options.preserve_dir.empty() ||
+      m_options.validate_canonical_equivalence)
+    return true;
+
+  lock_warmcopy_record_store_fence_t prebuilt_fence;
+  if (!lock_warmcopy_record_store_fence_for_target(thread_id,
+                                                   &prebuilt_fence)) {
+    return false;
+  }
+
+  std::unique_ptr<Preserved_trx_warm_external_blob_carrier> carrier =
+      create_preserved_trx_default_warm_external_blob_carrier(
+          m_options.preserve_dir);
+  if (carrier == nullptr) return false;
+
+  const std::string warmcopy_id = "lockrec_" + std::to_string(m_epoch) + "_" +
+                                  std::to_string(thread_id);
+  std::unique_ptr<Preserved_trx_external_blob_writer> writer;
+  Preserved_trx_carrier_status carrier_status =
+      carrier->create_warm_external_blob_writer(
+          warmcopy_id, kPreservedTrxBlobRecordLocks, m_epoch, &writer);
+  if (carrier_status != Preserved_trx_carrier_status::OK || writer == nullptr)
+    return false;
+
+  Preserved_trx_external_blob_descriptor descriptor;
+  descriptor.name = kPreservedTrxBlobRecordLocks;
+  descriptor.size = static_cast<uint64_t>(payload.size());
+  SHA_EVP256(reinterpret_cast<const unsigned char *>(payload.data()),
+             payload.size(), descriptor.digest.data());
+
+  auto abort_writer = [&]() {
+    if (writer != nullptr) (void)writer->abort();
+    (void)carrier->remove_warm_external_blob(warmcopy_id,
+                                             kPreservedTrxBlobRecordLocks);
+  };
+
+  carrier_status = writer->write_at(
+      0, reinterpret_cast<const unsigned char *>(payload.data()),
+      payload.size());
+  if (carrier_status != Preserved_trx_carrier_status::OK) {
+    abort_writer();
+    return false;
+  }
+  carrier_status = writer->truncate(descriptor.size);
+  if (carrier_status != Preserved_trx_carrier_status::OK) {
+    abort_writer();
+    return false;
+  }
+  carrier_status = writer->close();
+  if (carrier_status != Preserved_trx_carrier_status::OK) {
+    abort_writer();
+    return false;
+  }
+  carrier_status = writer->seal_descriptor(descriptor);
+  if (carrier_status != Preserved_trx_carrier_status::OK) {
+    abort_writer();
+    return false;
+  }
+
+  target->phase1_record_prebuilt_blob.warmcopy_id = warmcopy_id;
+  target->phase1_record_prebuilt_blob.name = kPreservedTrxBlobRecordLocks;
+  target->phase1_record_prebuilt_blob.warmcopy_epoch = m_epoch;
+  target->phase1_record_prebuilt_blob.size = descriptor.size;
+  target->phase1_record_prebuilt_blob.digest = descriptor.digest;
+  target->phase1_record_prebuilt_fence = prebuilt_fence;
+  target->phase1_record_prebuilt_fence_valid = true;
+  target->has_phase1_record_prebuilt_blob = true;
+  return true;
+}
+
+void Preserve_trx_lock_warmcopy_drain_participant::discard_phase1_record_blob(
+    Target_session *target) {
+  if (target == nullptr || !target->has_phase1_record_prebuilt_blob) return;
+
+  if (!m_options.preserve_dir.empty() &&
+      !target->phase1_record_prebuilt_blob.warmcopy_id.empty()) {
+    std::unique_ptr<Preserved_trx_warm_external_blob_carrier> carrier =
+        create_preserved_trx_default_warm_external_blob_carrier(
+            m_options.preserve_dir);
+    if (carrier != nullptr) {
+      (void)carrier->remove_warm_external_blob(
+          target->phase1_record_prebuilt_blob.warmcopy_id,
+          target->phase1_record_prebuilt_blob.name);
+    }
+  }
+  target->has_phase1_record_prebuilt_blob = false;
+  target->phase1_record_prebuilt_blob = PrebuiltRecordLocksBlob{};
+  target->phase1_record_prebuilt_fence_valid = false;
+  target->phase1_record_prebuilt_fence = lock_warmcopy_record_store_fence_t{};
+}
+
+bool Preserve_trx_lock_warmcopy_drain_participant::
+    seed_phase1_record_payload_for_thread(uint64_t thread_id,
+                                          const std::string &payload) {
+  uint32_t seeded_record_lock_count = 0;
+  if (!lock_warmcopy_record_store_seed_payload_for_target(
+          thread_id, payload, &seeded_record_lock_count)) {
+    lock_warmcopy_record_store_clear_for_target(thread_id);
+    return false;
+  }
+
+  Target_session *target = ensure_target_session(thread_id);
+  if (!build_phase1_record_blob_for_target(thread_id, target, payload)) {
+    lock_warmcopy_record_store_clear_for_target(thread_id);
+    return false;
+  }
+  target->record_locks_candidate_valid = true;
+  target->record_locks_seeded_in_phase1 = true;
+  target->record_lock_count = seeded_record_lock_count;
+  target->record_locks_payload.clear();
+  target->record_locks_payload.shrink_to_fit();
+  refresh_phase1_record_prebuilt_observation();
+  return true;
+}
+
+void Preserve_trx_lock_warmcopy_drain_participant::
+    seed_phase1_non_record_payloads_for_thread(
+        uint64_t thread_id, const std::string &table_payload,
+        uint32_t table_lock_count, bool autoinc_lock_owned,
+        const std::string &mdl_payload, uint32_t mdl_descriptor_count) {
+  Target_session *target = ensure_target_session(thread_id);
+  target->phase1_table_locks_candidate_valid = true;
+  target->phase1_table_locks_payload = table_payload;
+  target->phase1_table_lock_count = table_lock_count;
+  target->phase1_autoinc_lock_owned = autoinc_lock_owned;
+  target->phase1_mdl_candidate_valid = true;
+  target->phase1_mdl_descriptors_payload = mdl_payload;
+  target->phase1_mdl_descriptor_count = mdl_descriptor_count;
+  refresh_phase1_non_record_fingerprints(target);
+}
+
+void Preserve_trx_lock_warmcopy_drain_participant::
+    refresh_phase1_non_record_fingerprints(Target_session *target) {
+  if (target == nullptr) return;
+
+  target->table_locks_phase1_fingerprint_valid = false;
+  if (target->phase1_table_locks_candidate_valid &&
+      target->table_locks_candidate_valid &&
+      target->phase1_table_lock_count == target->table_lock_count &&
+      target->phase1_autoinc_lock_owned == target->autoinc_lock_owned) {
+    const Preserve_trx_lock_warmcopy_canonical_compare_result compare =
+        preserve_trx_lock_warmcopy_compare_table_payloads_canonical(
+            target->phase1_table_locks_payload, target->table_locks_payload);
+    target->table_locks_phase1_fingerprint_valid = compare.equivalent;
+  }
+
+  target->mdl_phase1_fingerprint_valid = false;
+  if (target->phase1_mdl_candidate_valid && target->mdl_candidate_valid &&
+      target->phase1_mdl_descriptor_count == target->mdl_descriptor_count) {
+    const Preserve_trx_lock_warmcopy_canonical_compare_result compare =
+        preserve_trx_lock_warmcopy_compare_mdl_payloads_canonical(
+            target->phase1_mdl_descriptors_payload,
+            target->mdl_descriptors_payload);
+    target->mdl_phase1_fingerprint_valid = compare.equivalent;
+  }
+}
+
 const Preserve_trx_lock_warmcopy_artifact *
 Preserve_trx_lock_warmcopy_drain_participant::artifact_for_thread(
     uint64_t thread_id) {
@@ -1905,47 +2364,203 @@ Preserve_trx_lock_warmcopy_drain_participant::artifact_for_thread(
   return it == m_artifacts.end() ? nullptr : &it->second;
 }
 
+bool Preserve_trx_lock_warmcopy_drain_participant::prepare_phase1_idle_target(
+    THD *target) {
+  return prepare_phase1_record_scan_target(target);
+}
+
+bool Preserve_trx_lock_warmcopy_drain_participant::
+    prepare_phase1_record_scan_target(THD *target, bool active_scan) {
+  if (!m_options.enabled || m_observation.state !=
+                                Preserve_trx_drain_participant_state::OPEN ||
+      target == nullptr) {
+    return true;
+  }
+
+  std::string record_locks_payload;
+  if (trx_preserve_export_record_locks(target, &record_locks_payload,
+                                       m_options.max_lock_count) !=
+      DB_SUCCESS) {
+    return true;
+  }
+
+  const uint64_t thread_id = static_cast<uint64_t>(target->thread_id());
+  std::string table_locks_payload;
+  uint32_t table_lock_count = 0;
+  const bool table_candidate_valid =
+      trx_preserve_export_table_locks(target, &table_locks_payload,
+                                      m_options.max_lock_count, 0) ==
+          DB_SUCCESS &&
+      trx_preserve_table_locks_payload_lock_count(table_locks_payload,
+                                                  &table_lock_count);
+  std::string mdl_descriptors_payload;
+  size_t mdl_descriptor_count = 0;
+  const bool mdl_candidate_valid =
+      !target->mdl_context.export_preserved_locks(&mdl_descriptors_payload,
+                                                  &mdl_descriptor_count) &&
+      mdl_descriptor_count <= std::numeric_limits<uint32_t>::max();
+  if (table_candidate_valid && mdl_candidate_valid) {
+    seed_phase1_non_record_payloads_for_thread(
+        thread_id, table_locks_payload, table_lock_count,
+        trx_preserve_table_locks_payload_has_autoinc(table_locks_payload),
+        mdl_descriptors_payload,
+        static_cast<uint32_t>(mdl_descriptor_count));
+  }
+  if (!seed_phase1_record_payload_for_thread(thread_id, record_locks_payload)) {
+    lock_warmcopy_record_store_clear_for_target(thread_id);
+  } else if (active_scan) {
+    m_phase1_record_active_scan_targets.insert(thread_id);
+    refresh_phase1_record_prebuilt_observation();
+  }
+  return true;
+}
+
+bool Preserve_trx_lock_warmcopy_drain_participant::
+    prepare_phase1_record_store_targets() {
+  if (!m_options.enabled ||
+      m_observation.state != Preserve_trx_drain_participant_state::OPEN) {
+    return true;
+  }
+
+  std::vector<uint64_t> target_ids;
+  lock_warmcopy_record_store_target_ids(&target_ids);
+  for (const uint64_t target_id : target_ids) {
+    if (target_id == 0) continue;
+
+    std::string record_locks_payload;
+    uint32_t record_lock_count = 0;
+    if (!lock_warmcopy_record_store_export_record_payload_for_target(
+            target_id, &record_locks_payload, &record_lock_count) ||
+        record_locks_payload.empty()) {
+      continue;
+    }
+
+    if (!seed_phase1_record_payload_for_thread(target_id,
+                                               record_locks_payload)) {
+      lock_warmcopy_record_store_clear_for_target(target_id);
+    }
+  }
+  if (!target_ids.empty() && Global_THD_manager::get_instance() != nullptr) {
+    const std::set<uint64_t> skip_record_export_thread_ids(target_ids.begin(),
+                                                           target_ids.end());
+    Lock_warmcopy_target_fence_sampler non_record_sampler(
+        target_ids, m_options.max_lock_count, skip_record_export_thread_ids);
+    Global_THD_manager::get_instance()->do_for_all_thd_copy(
+        &non_record_sampler);
+    for (const uint64_t target_id : target_ids) {
+      std::string table_locks_payload;
+      uint32_t table_lock_count = 0;
+      bool autoinc_lock_owned = false;
+      std::string mdl_descriptors_payload;
+      uint32_t mdl_descriptor_count = 0;
+      if (non_record_sampler.table_locks_for_thread(
+              target_id, &table_locks_payload, &table_lock_count,
+              &autoinc_lock_owned) &&
+          non_record_sampler.mdl_descriptors_for_thread(
+              target_id, &mdl_descriptors_payload, &mdl_descriptor_count)) {
+        seed_phase1_non_record_payloads_for_thread(
+            target_id, table_locks_payload, table_lock_count,
+            autoinc_lock_owned, mdl_descriptors_payload,
+            mdl_descriptor_count);
+      }
+    }
+  }
+  refresh_phase1_record_prebuilt_observation();
+  return true;
+}
+
 bool Preserve_trx_lock_warmcopy_drain_participant::prepare_quiesced_targets(
     const std::vector<uint64_t> &thread_ids) {
+  const std::set<uint64_t> final_thread_ids(thread_ids.begin(),
+                                            thread_ids.end());
   for (const uint64_t old_thread_id : m_target_thread_ids) {
-    lock_warmcopy_record_store_clear_for_target(old_thread_id);
+    if (final_thread_ids.count(old_thread_id) == 0) {
+      auto old_it = m_targets.find(old_thread_id);
+      if (old_it != m_targets.end()) discard_phase1_record_blob(&old_it->second);
+      lock_warmcopy_record_store_clear_for_target(old_thread_id);
+    }
+  }
+  for (auto it = m_targets.begin(); it != m_targets.end();) {
+    if (final_thread_ids.count(it->first) == 0) {
+      discard_phase1_record_blob(&it->second);
+      lock_warmcopy_record_store_clear_for_target(it->first);
+      it = m_targets.erase(it);
+    } else {
+      ++it;
+    }
   }
   m_target_thread_ids = thread_ids;
   m_artifacts.clear();
-  m_targets.clear();
+  std::set<uint64_t> phase1_record_seeded_targets;
   for (const uint64_t thread_id : m_target_thread_ids) {
+    auto old_it = m_targets.find(thread_id);
     Target_session session;
+    if (old_it != m_targets.end()) {
+      session.phase1_table_locks_candidate_valid =
+          old_it->second.phase1_table_locks_candidate_valid;
+      session.phase1_table_locks_payload =
+          old_it->second.phase1_table_locks_payload;
+      session.phase1_table_lock_count =
+          old_it->second.phase1_table_lock_count;
+      session.phase1_autoinc_lock_owned =
+          old_it->second.phase1_autoinc_lock_owned;
+      session.phase1_mdl_candidate_valid =
+          old_it->second.phase1_mdl_candidate_valid;
+      session.phase1_mdl_descriptors_payload =
+          old_it->second.phase1_mdl_descriptors_payload;
+      session.phase1_mdl_descriptor_count =
+          old_it->second.phase1_mdl_descriptor_count;
+    }
+    if (old_it != m_targets.end() &&
+        old_it->second.record_locks_seeded_in_phase1 &&
+        old_it->second.record_locks_candidate_valid) {
+      session.record_locks_candidate_valid = true;
+      session.record_locks_seeded_in_phase1 = true;
+      session.has_phase1_record_prebuilt_blob =
+          old_it->second.has_phase1_record_prebuilt_blob;
+      session.phase1_record_prebuilt_blob =
+          old_it->second.phase1_record_prebuilt_blob;
+      session.phase1_record_prebuilt_fence_valid =
+          old_it->second.phase1_record_prebuilt_fence_valid;
+      session.phase1_record_prebuilt_fence =
+          old_it->second.phase1_record_prebuilt_fence;
+      session.record_lock_count = old_it->second.record_lock_count;
+      phase1_record_seeded_targets.insert(thread_id);
+    }
     session.observation.thread_id = thread_id;
     session.observation.state = prepared_target_state(m_observation.state);
     session.observation.reason =
         Preserve_trx_lock_warmcopy_reason::NOT_ATTEMPTED;
-    m_targets.emplace(thread_id, session);
+    m_targets[thread_id] = std::move(session);
   }
 
   if (Global_THD_manager::get_instance() != nullptr) {
     Lock_warmcopy_target_fence_sampler fence_sampler(
-        m_target_thread_ids, m_options.max_lock_count);
+        m_target_thread_ids, m_options.max_lock_count,
+        phase1_record_seeded_targets);
     Global_THD_manager::get_instance()->do_for_all_thd_copy(&fence_sampler);
     for (auto &target : m_targets) {
       target.second.record_live_seal_fence_valid =
           fence_sampler.fence_for_thread(
               target.first, &target.second.record_live_seal_fence);
-      target.second.record_locks_candidate_valid =
-          fence_sampler.take_record_locks_for_thread(
-              target.first, &target.second.record_locks_payload,
-              &target.second.record_lock_count);
-      if (target.second.record_locks_candidate_valid) {
-        uint32_t seeded_record_lock_count = 0;
-        if (!lock_warmcopy_record_store_seed_payload_for_target(
-                target.first, target.second.record_locks_payload,
-                &seeded_record_lock_count) ||
-            seeded_record_lock_count != target.second.record_lock_count) {
-          target.second.record_locks_candidate_valid = false;
-          target.second.record_lock_count = 0;
-          lock_warmcopy_record_store_clear_for_target(target.first);
+      if (!target.second.record_locks_seeded_in_phase1) {
+        target.second.record_locks_candidate_valid =
+            fence_sampler.take_record_locks_for_thread(
+                target.first, &target.second.record_locks_payload,
+                &target.second.record_lock_count);
+        if (target.second.record_locks_candidate_valid) {
+          uint32_t seeded_record_lock_count = 0;
+          if (!lock_warmcopy_record_store_seed_payload_for_target(
+                  target.first, target.second.record_locks_payload,
+                  &seeded_record_lock_count) ||
+              seeded_record_lock_count != target.second.record_lock_count) {
+            target.second.record_locks_candidate_valid = false;
+            target.second.record_lock_count = 0;
+            lock_warmcopy_record_store_clear_for_target(target.first);
+          }
+          target.second.record_locks_payload.clear();
+          target.second.record_locks_payload.shrink_to_fit();
         }
-        target.second.record_locks_payload.clear();
-        target.second.record_locks_payload.shrink_to_fit();
       }
       target.second.table_locks_candidate_valid =
           fence_sampler.table_locks_for_thread(
@@ -1956,11 +2571,13 @@ bool Preserve_trx_lock_warmcopy_drain_participant::prepare_quiesced_targets(
           fence_sampler.mdl_descriptors_for_thread(
               target.first, &target.second.mdl_descriptors_payload,
               &target.second.mdl_descriptor_count);
+      refresh_phase1_non_record_fingerprints(&target.second);
     }
   }
 
   m_observation.owns_artifact = false;
   m_observation.bytes_used = 0;
+  refresh_phase1_record_prebuilt_observation();
   m_observation.failure_reason.clear();
   return true;
 }
@@ -2000,8 +2617,25 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
       append_le32(&target.second.mdl_descriptors_payload, 0);
       target.second.mdl_descriptor_count = 0;
     }
+    refresh_phase1_non_record_fingerprints(&target.second);
   }
   return true;
+}
+
+bool Preserve_trx_lock_warmcopy_drain_participant::
+    prepare_phase1_record_payload_for_thread_for_unit_test(
+        uint64_t thread_id, const std::string &payload) {
+  return seed_phase1_record_payload_for_thread(thread_id, payload);
+}
+
+void Preserve_trx_lock_warmcopy_drain_participant::
+    prepare_phase1_non_record_payloads_for_thread_for_unit_test(
+        uint64_t thread_id, const std::string &table_payload,
+        uint32_t table_lock_count, bool autoinc_lock_owned,
+        const std::string &mdl_payload, uint32_t mdl_descriptor_count) {
+  seed_phase1_non_record_payloads_for_thread(
+      thread_id, table_payload, table_lock_count, autoinc_lock_owned,
+      mdl_payload, mdl_descriptor_count);
 }
 
 bool Preserve_trx_lock_warmcopy_drain_participant::
@@ -2025,6 +2659,20 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
 }
 
 void Preserve_trx_lock_warmcopy_drain_participant::
+    set_table_locks_for_thread_for_unit_test(
+        uint64_t thread_id, const std::string &payload, uint32_t lock_count,
+        bool autoinc_lock_owned) {
+  auto it = m_targets.find(thread_id);
+  if (it == m_targets.end()) return;
+
+  it->second.table_locks_candidate_valid = true;
+  it->second.table_locks_payload = payload;
+  it->second.table_lock_count = lock_count;
+  it->second.autoinc_lock_owned = autoinc_lock_owned;
+  refresh_phase1_non_record_fingerprints(&it->second);
+}
+
+void Preserve_trx_lock_warmcopy_drain_participant::
     set_mdl_descriptors_for_thread_for_unit_test(
         uint64_t thread_id, const std::string &payload,
         uint32_t descriptor_count) {
@@ -2034,6 +2682,7 @@ void Preserve_trx_lock_warmcopy_drain_participant::
   it->second.mdl_candidate_valid = true;
   it->second.mdl_descriptors_payload = payload;
   it->second.mdl_descriptor_count = descriptor_count;
+  refresh_phase1_non_record_fingerprints(&it->second);
 }
 
 void Preserve_trx_lock_warmcopy_drain_participant::

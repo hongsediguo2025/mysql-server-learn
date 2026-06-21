@@ -25,6 +25,7 @@
 #include "storage/innobase/include/lock0warmcopy.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -116,18 +117,21 @@ struct lock_warmcopy_record_shard_state_t {
   std::string last_diagnostic_reason;
 };
 
-std::mutex lock_warmcopy_record_store_mutex;
 using lock_warmcopy_record_shard_map_t =
     std::map<lock_warmcopy_record_shard_key_t,
              lock_warmcopy_record_shard_state_t,
              lock_warmcopy_record_shard_key_less>;
-std::map<uint64_t, lock_warmcopy_record_shard_map_t>
-    lock_warmcopy_record_store_by_target;
-std::map<uint64_t, uint64_t> lock_warmcopy_record_journal_sequence_by_target;
-std::map<uint64_t, uint64_t>
-    lock_warmcopy_record_expected_delta_sequence_by_target;
-std::map<uint64_t, std::string>
-    lock_warmcopy_record_target_invalid_reason_by_target;
+struct lock_warmcopy_record_store_partition_t {
+  std::mutex mutex;
+  std::map<uint64_t, lock_warmcopy_record_shard_map_t> store_by_target;
+  std::map<uint64_t, uint64_t> journal_sequence_by_target;
+  std::map<uint64_t, uint64_t> expected_delta_sequence_by_target;
+  std::map<uint64_t, std::string> target_invalid_reason_by_target;
+};
+constexpr size_t k_lock_warmcopy_record_store_partition_count = 64;
+std::array<lock_warmcopy_record_store_partition_t,
+           k_lock_warmcopy_record_store_partition_count>
+    lock_warmcopy_record_store_partitions;
 
 enum class record_journal_delta_kind_t {
   UPSERT,
@@ -365,32 +369,48 @@ bool read_encoded_record_image_slot(const std::string &record_images,
   return true;
 }
 
+size_t record_store_partition_index(uint64_t target_id) {
+  return static_cast<size_t>(mix_u64(target_id) %
+                             k_lock_warmcopy_record_store_partition_count);
+}
+
+lock_warmcopy_record_store_partition_t &record_store_partition_for_target(
+    uint64_t target_id) {
+  return lock_warmcopy_record_store_partitions[
+      record_store_partition_index(target_id)];
+}
+
 lock_warmcopy_record_shard_map_t &record_store_for_target_locked(
     uint64_t target_id) {
-  return lock_warmcopy_record_store_by_target[target_id];
+  return record_store_partition_for_target(target_id)
+      .store_by_target[target_id];
 }
 
 const lock_warmcopy_record_shard_map_t *record_store_for_target_if_exists_locked(
     uint64_t target_id) {
-  const auto it = lock_warmcopy_record_store_by_target.find(target_id);
-  if (it == lock_warmcopy_record_store_by_target.end()) return nullptr;
+  const auto &partition = record_store_partition_for_target(target_id);
+  const auto it = partition.store_by_target.find(target_id);
+  if (it == partition.store_by_target.end()) return nullptr;
   return &it->second;
 }
 
 lock_warmcopy_record_shard_map_t *mutable_record_store_for_target_if_exists_locked(
     uint64_t target_id) {
-  const auto it = lock_warmcopy_record_store_by_target.find(target_id);
-  if (it == lock_warmcopy_record_store_by_target.end()) return nullptr;
+  auto &partition = record_store_partition_for_target(target_id);
+  const auto it = partition.store_by_target.find(target_id);
+  if (it == partition.store_by_target.end()) return nullptr;
   return &it->second;
 }
 
 uint64_t next_record_journal_sequence_for_target_locked(uint64_t target_id) {
-  return ++lock_warmcopy_record_journal_sequence_by_target[target_id];
+  return ++record_store_partition_for_target(target_id)
+               .journal_sequence_by_target[target_id];
 }
 
 uint64_t &expected_record_delta_sequence_for_target_locked(uint64_t target_id) {
   uint64_t &expected =
-      lock_warmcopy_record_expected_delta_sequence_by_target[target_id];
+      record_store_partition_for_target(target_id)
+          .expected_delta_sequence_by_target[target_id];
   if (expected == 0) expected = 1;
   return expected;
 }
@@ -420,29 +440,6 @@ uint64_t record_journal_delta_bytes(
 void add_record_shard_journal_bytes_locked(
     lock_warmcopy_record_shard_state_t *shard, uint64_t bytes) {
   shard->journal_bytes = saturating_add_u64(shard->journal_bytes, bytes);
-}
-
-uint64_t record_store_journal_bytes_locked(
-    const lock_warmcopy_record_shard_map_t *store) {
-  uint64_t bytes = 0;
-  if (store == nullptr) return bytes;
-  for (const auto &entry : *store) {
-    bytes = saturating_add_u64(bytes, entry.second.journal_bytes);
-  }
-  return bytes;
-}
-
-uint32_t record_store_dirty_shard_count_locked(
-    const lock_warmcopy_record_shard_map_t *store) {
-  uint32_t count = 0;
-  if (store == nullptr) return count;
-  for (const auto &entry : *store) {
-    if ((entry.second.shard_state_flags & LOCK_WARMCOPY_RECORD_SHARD_DIRTY) !=
-        0) {
-      ++count;
-    }
-  }
-  return count;
 }
 
 uint64_t record_target_id_for_trx(const trx_t *trx) {
@@ -514,7 +511,8 @@ void mark_record_shard_invalid_locked(lock_warmcopy_record_shard_state_t *shard,
 void mark_record_target_invalid_locked(uint64_t target_id,
                                        uint64_t journal_cursor,
                                        const char *reason) {
-  lock_warmcopy_record_target_invalid_reason_by_target[target_id] =
+  record_store_partition_for_target(target_id)
+      .target_invalid_reason_by_target[target_id] =
       reason == nullptr ? "" : reason;
   lock_warmcopy_record_shard_map_t *store =
       mutable_record_store_for_target_if_exists_locked(target_id);
@@ -543,8 +541,10 @@ void mark_record_store_dirty_after_base_seed_locked(
 }
 
 bool record_target_is_invalid_locked(uint64_t target_id) {
-  return lock_warmcopy_record_target_invalid_reason_by_target.find(target_id) !=
-         lock_warmcopy_record_target_invalid_reason_by_target.end();
+  const auto &invalid_map =
+      record_store_partition_for_target(target_id)
+          .target_invalid_reason_by_target;
+  return invalid_map.find(target_id) != invalid_map.end();
 }
 
 bool record_bitmap_set_locked(
@@ -681,7 +681,8 @@ bool apply_record_journal_delta_locked(
           shard.record_images.find(heap_no) == shard.record_images.end()) {
         mark_record_shard_invalid_locked(&shard, journal_sequence,
                                          "journal_patch_missing_record");
-        lock_warmcopy_record_target_invalid_reason_by_target[target_id] =
+        record_store_partition_for_target(target_id)
+            .target_invalid_reason_by_target[target_id] =
             "journal_patch_missing_record";
         expected_sequence = journal_sequence + 1;
         return false;
@@ -835,8 +836,10 @@ bool append_record_payload_entry_locked(
 
 bool export_record_payload_from_store_locked(
     uint64_t target_id, const lock_warmcopy_record_shard_map_t *store,
-    std::string *payload, uint32_t *lock_count) {
+    std::string *payload, uint32_t *lock_count,
+    uint32_t *scanned_shard_count) {
   if (payload == nullptr) return false;
+  if (scanned_shard_count != nullptr) *scanned_shard_count = 0;
   if (record_target_is_invalid_locked(target_id)) {
     payload->clear();
     if (lock_count != nullptr) *lock_count = 0;
@@ -847,6 +850,12 @@ bool export_record_payload_from_store_locked(
   uint32_t entry_count = 0;
   uint32_t exported_lock_count = 0;
   if (store != nullptr) {
+    if (scanned_shard_count != nullptr) {
+      const size_t bounded_scan_count =
+          std::min(store->size(),
+                   static_cast<size_t>(std::numeric_limits<uint32_t>::max()));
+      *scanned_shard_count = static_cast<uint32_t>(bounded_scan_count);
+    }
     for (const auto &entry : *store) {
       const size_t before = entries_payload.size();
       if (!append_record_payload_entry_locked(entry.second, &entries_payload,
@@ -888,26 +897,60 @@ void append_record_fence_shard_locked(
   }
 }
 
-bool record_store_fence_for_target_locked(
+bool record_store_metadata_for_target_locked(
     const lock_warmcopy_record_shard_map_t *store,
-    lock_warmcopy_record_store_fence_t *fence) {
+    lock_warmcopy_record_store_fence_t *fence,
+    uint64_t *journal_bytes,
+    uint32_t *dirty_shard_count,
+    uint32_t *lock_count,
+    bool *lock_count_overflow) {
   if (fence == nullptr) return false;
   *fence = lock_warmcopy_record_store_fence_t{};
+  if (journal_bytes != nullptr) *journal_bytes = 0;
+  if (dirty_shard_count != nullptr) *dirty_shard_count = 0;
+  if (lock_count != nullptr) *lock_count = 0;
+  if (lock_count_overflow != nullptr) *lock_count_overflow = false;
 
   std::string fence_bytes;
   append_u32_le(&fence_bytes, 1);  // record_store_fence_v1
   append_u32_le(&fence_bytes, store == nullptr ? 0U
                                                : static_cast<uint32_t>(
                                                      store->size()));
+  uint64_t local_lock_count = 0;
   if (store != nullptr) {
     for (const auto &entry : *store) {
       append_record_fence_shard_locked(entry.second, &fence_bytes, fence);
+      if (journal_bytes != nullptr) {
+        *journal_bytes =
+            saturating_add_u64(*journal_bytes, entry.second.journal_bytes);
+      }
+      if (dirty_shard_count != nullptr &&
+          (entry.second.shard_state_flags & LOCK_WARMCOPY_RECORD_SHARD_DIRTY) !=
+              0) {
+        ++(*dirty_shard_count);
+      }
+      if (lock_count != nullptr) {
+        local_lock_count += entry.second.set_bit_count;
+        if (local_lock_count > std::numeric_limits<uint32_t>::max()) {
+          if (lock_count_overflow != nullptr) *lock_count_overflow = true;
+          local_lock_count = std::numeric_limits<uint32_t>::max();
+        }
+      }
     }
   }
+  if (lock_count != nullptr)
+    *lock_count = static_cast<uint32_t>(local_lock_count);
 
   SHA_EVP256(reinterpret_cast<const unsigned char *>(fence_bytes.data()),
              fence_bytes.size(), fence->canonical_fingerprint);
   return true;
+}
+
+bool record_store_fence_for_target_locked(
+    const lock_warmcopy_record_shard_map_t *store,
+    lock_warmcopy_record_store_fence_t *fence) {
+  return record_store_metadata_for_target_locked(store, fence, nullptr, nullptr,
+                                                nullptr, nullptr);
 }
 
 bool record_shard_key_from_lock(const lock_t *lock,
@@ -952,7 +995,9 @@ bool lock_warmcopy_record_bitmap_set(
   }
 
   lock_warmcopy_observed_hook_events.fetch_add(1, std::memory_order_relaxed);
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(k_lock_warmcopy_default_target_id)
+          .mutex);
   return record_bitmap_set_locked(k_lock_warmcopy_default_target_id, key,
                                   heap_no, nullptr, 0, nullptr);
 }
@@ -964,7 +1009,9 @@ bool lock_warmcopy_record_bitmap_reset(
   }
 
   lock_warmcopy_observed_hook_events.fetch_add(1, std::memory_order_relaxed);
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(k_lock_warmcopy_default_target_id)
+          .mutex);
   return record_bitmap_reset_locked(k_lock_warmcopy_default_target_id, key,
                                     heap_no);
 }
@@ -977,9 +1024,11 @@ bool lock_warmcopy_record_bitmap_set_for_trx(
   }
 
   lock_warmcopy_observed_hook_events.fetch_add(1, std::memory_order_relaxed);
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
-  return record_bitmap_set_locked(record_target_id_for_trx(trx), key, heap_no,
-                                  nullptr, 0, nullptr);
+  const uint64_t target_id = record_target_id_for_trx(trx);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
+  return record_bitmap_set_locked(target_id, key, heap_no, nullptr, 0,
+                                  nullptr);
 }
 
 bool lock_warmcopy_record_bitmap_reset_for_trx(
@@ -990,9 +1039,10 @@ bool lock_warmcopy_record_bitmap_reset_for_trx(
   }
 
   lock_warmcopy_observed_hook_events.fetch_add(1, std::memory_order_relaxed);
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
-  return record_bitmap_reset_locked(record_target_id_for_trx(trx), key,
-                                    heap_no);
+  const uint64_t target_id = record_target_id_for_trx(trx);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
+  return record_bitmap_reset_locked(target_id, key, heap_no);
 }
 
 bool lock_warmcopy_record_bitmap_set_for_lock(const lock_t *lock,
@@ -1027,9 +1077,10 @@ bool lock_warmcopy_record_bitmap_set_with_image_for_trx(
   }
 
   lock_warmcopy_observed_hook_events.fetch_add(1, std::memory_order_relaxed);
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
-  return record_bitmap_set_locked(record_target_id_for_trx(trx), key, heap_no,
-                                  &digest, heap_offset,
+  const uint64_t target_id = record_target_id_for_trx(trx);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
+  return record_bitmap_set_locked(target_id, key, heap_no, &digest, heap_offset,
                                   &encoded_record_image);
 }
 
@@ -1070,7 +1121,9 @@ bool lock_warmcopy_record_bitmap_set_for_unit_test(
     const lock_warmcopy_record_image_digest_t &digest) {
   if (!record_heap_no_is_valid(key, heap_no)) return false;
 
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(k_lock_warmcopy_default_target_id)
+          .mutex);
   return record_bitmap_set_locked(k_lock_warmcopy_default_target_id, key,
                                   heap_no, &digest, 0, nullptr);
 }
@@ -1080,7 +1133,8 @@ bool lock_warmcopy_record_bitmap_set_for_target_for_unit_test(
     uint32_t heap_no, const lock_warmcopy_record_image_digest_t &digest) {
   if (!record_heap_no_is_valid(key, heap_no)) return false;
 
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
   return record_bitmap_set_locked(target_id, key, heap_no, &digest, 0,
                                   nullptr);
 }
@@ -1093,7 +1147,9 @@ bool lock_warmcopy_record_bitmap_set_with_image_for_unit_test(
     return false;
   }
 
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(k_lock_warmcopy_default_target_id)
+          .mutex);
   return record_bitmap_set_locked(k_lock_warmcopy_default_target_id, key,
                                   heap_no, &digest, heap_offset,
                                   &encoded_record_image);
@@ -1107,7 +1163,8 @@ bool lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
     return false;
   }
 
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
   return record_bitmap_set_locked(target_id, key, heap_no, &digest,
                                   heap_offset, &encoded_record_image);
 }
@@ -1116,7 +1173,9 @@ bool lock_warmcopy_record_bitmap_reset_for_unit_test(
     const lock_warmcopy_record_shard_key_t &key, uint32_t heap_no) {
   if (!record_heap_no_is_valid(key, heap_no)) return false;
 
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(k_lock_warmcopy_default_target_id)
+          .mutex);
   return record_bitmap_reset_locked(k_lock_warmcopy_default_target_id, key,
                                     heap_no);
 }
@@ -1130,7 +1189,8 @@ bool lock_warmcopy_record_journal_upsert_for_target_for_unit_test(
     return false;
   }
 
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
   return apply_record_journal_delta_locked(
       target_id, journal_sequence, record_journal_delta_kind_t::UPSERT, key,
       heap_no, &digest, heap_offset, &encoded_record_image);
@@ -1145,7 +1205,8 @@ bool lock_warmcopy_record_journal_patch_for_target_for_unit_test(
     return false;
   }
 
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
   return apply_record_journal_delta_locked(
       target_id, journal_sequence, record_journal_delta_kind_t::PATCH, key,
       heap_no, &digest, heap_offset, &encoded_record_image);
@@ -1156,7 +1217,8 @@ bool lock_warmcopy_record_journal_delete_for_target_for_unit_test(
     const lock_warmcopy_record_shard_key_t &key, uint32_t heap_no) {
   if (!record_heap_no_is_valid(key, heap_no)) return false;
 
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
   return apply_record_journal_delta_locked(
       target_id, journal_sequence, record_journal_delta_kind_t::DELETE, key,
       heap_no, nullptr, 0, nullptr);
@@ -1165,13 +1227,15 @@ bool lock_warmcopy_record_journal_delete_for_target_for_unit_test(
 bool lock_warmcopy_record_mark_unsupported_mutation_for_target_for_unit_test(
     uint64_t target_id, uint64_t journal_sequence,
     const lock_warmcopy_record_shard_key_t &key, const std::string &reason) {
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
   lock_warmcopy_record_shard_state_t &shard =
       find_or_create_record_shard(target_id, key);
   mark_record_shard_invalid_locked(
       &shard, journal_sequence,
       reason.empty() ? "unsupported_mutation" : reason.c_str());
-  lock_warmcopy_record_target_invalid_reason_by_target[target_id] =
+  record_store_partition_for_target(target_id)
+      .target_invalid_reason_by_target[target_id] =
       shard.last_diagnostic_reason;
   return true;
 }
@@ -1188,7 +1252,8 @@ bool lock_warmcopy_record_shard_snapshot_for_target_for_unit_test(
     lock_warmcopy_record_shard_snapshot_t *snapshot) {
   if (snapshot == nullptr) return false;
 
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
   const lock_warmcopy_record_shard_map_t *store =
       record_store_for_target_if_exists_locked(target_id);
   if (store == nullptr) return false;
@@ -1201,7 +1266,9 @@ bool lock_warmcopy_record_shard_snapshot_for_target_for_unit_test(
 
 std::string lock_warmcopy_record_shard_canonical_bytes_for_unit_test(
     const lock_warmcopy_record_shard_key_t &key) {
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(k_lock_warmcopy_default_target_id)
+          .mutex);
   const lock_warmcopy_record_shard_map_t *store =
       record_store_for_target_if_exists_locked(k_lock_warmcopy_default_target_id);
   if (store == nullptr) return std::string();
@@ -1221,11 +1288,27 @@ bool lock_warmcopy_record_store_export_record_payload_for_target(
     uint64_t target_id, std::string *payload, uint32_t *lock_count) {
   if (payload == nullptr) return false;
 
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
   const lock_warmcopy_record_shard_map_t *store =
       record_store_for_target_if_exists_locked(target_id);
   return export_record_payload_from_store_locked(target_id, store, payload,
-                                                 lock_count);
+                                                 lock_count, nullptr);
+}
+
+void lock_warmcopy_record_store_target_ids(std::vector<uint64_t> *target_ids) {
+  if (target_ids == nullptr) return;
+
+  target_ids->clear();
+  for (auto &partition : lock_warmcopy_record_store_partitions) {
+    std::lock_guard<std::mutex> guard(partition.mutex);
+    for (const auto &entry : partition.store_by_target) {
+      if (!entry.second.empty()) target_ids->push_back(entry.first);
+    }
+  }
+  std::sort(target_ids->begin(), target_ids->end());
+  target_ids->erase(std::unique(target_ids->begin(), target_ids->end()),
+                    target_ids->end());
 }
 
 bool seed_record_payload_into_store(const std::string &payload,
@@ -1242,39 +1325,44 @@ bool lock_warmcopy_record_store_seed_payload_for_target(
     return false;
   }
 
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
+  auto &partition = record_store_partition_for_target(target_id);
   const bool had_preexisting_state =
-      lock_warmcopy_record_target_invalid_reason_by_target.find(target_id) !=
-          lock_warmcopy_record_target_invalid_reason_by_target.end() ||
-      lock_warmcopy_record_journal_sequence_by_target.find(target_id) !=
-          lock_warmcopy_record_journal_sequence_by_target.end() ||
-      lock_warmcopy_record_expected_delta_sequence_by_target.find(target_id) !=
-          lock_warmcopy_record_expected_delta_sequence_by_target.end() ||
+      partition.target_invalid_reason_by_target.find(target_id) !=
+          partition.target_invalid_reason_by_target.end() ||
+      partition.journal_sequence_by_target.find(target_id) !=
+          partition.journal_sequence_by_target.end() ||
+      partition.expected_delta_sequence_by_target.find(target_id) !=
+          partition.expected_delta_sequence_by_target.end() ||
       (record_store_for_target_if_exists_locked(target_id) != nullptr &&
        !record_store_for_target_if_exists_locked(target_id)->empty());
-  lock_warmcopy_record_store_by_target[target_id] = std::move(seeded_store);
-  lock_warmcopy_record_journal_sequence_by_target.erase(target_id);
-  lock_warmcopy_record_expected_delta_sequence_by_target.erase(target_id);
-  lock_warmcopy_record_target_invalid_reason_by_target.erase(target_id);
+  partition.store_by_target[target_id] = std::move(seeded_store);
+  partition.journal_sequence_by_target.erase(target_id);
+  partition.expected_delta_sequence_by_target.erase(target_id);
+  partition.target_invalid_reason_by_target.erase(target_id);
   if (had_preexisting_state) {
     mark_record_store_dirty_after_base_seed_locked(
-        target_id, &lock_warmcopy_record_store_by_target[target_id]);
+        target_id, &partition.store_by_target[target_id]);
   }
   if (lock_count != nullptr) *lock_count = seeded_lock_count;
   return true;
 }
 
 void lock_warmcopy_record_store_clear_for_target(uint64_t target_id) {
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
-  lock_warmcopy_record_store_by_target.erase(target_id);
-  lock_warmcopy_record_journal_sequence_by_target.erase(target_id);
-  lock_warmcopy_record_expected_delta_sequence_by_target.erase(target_id);
-  lock_warmcopy_record_target_invalid_reason_by_target.erase(target_id);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
+  auto &partition = record_store_partition_for_target(target_id);
+  partition.store_by_target.erase(target_id);
+  partition.journal_sequence_by_target.erase(target_id);
+  partition.expected_delta_sequence_by_target.erase(target_id);
+  partition.target_invalid_reason_by_target.erase(target_id);
 }
 
 bool lock_warmcopy_record_store_fence_for_target(
     uint64_t target_id, lock_warmcopy_record_store_fence_t *fence) {
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
   const lock_warmcopy_record_shard_map_t *store =
       record_store_for_target_if_exists_locked(target_id);
   return record_store_fence_for_target_locked(store, fence);
@@ -1436,16 +1524,17 @@ bool lock_warmcopy_record_store_seal_for_target(
   if (result == nullptr) return false;
 
   *result = lock_warmcopy_record_seal_result_t{};
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
   const lock_warmcopy_record_shard_map_t *store =
       record_store_for_target_if_exists_locked(target_id);
-  if (!record_store_fence_for_target_locked(store, &result->seal_fence)) {
+  if (!record_store_metadata_for_target_locked(
+          store, &result->seal_fence, &result->journal_bytes,
+          &result->dirty_shard_count, nullptr, nullptr)) {
     result->status = lock_warmcopy_record_seal_status_t::TARGET_INVALID;
     result->diagnostic_reason = "record_seal_fence_unavailable";
     return true;
   }
-  result->journal_bytes = record_store_journal_bytes_locked(store);
-  result->dirty_shard_count = record_store_dirty_shard_count_locked(store);
 
   if (!lock_warmcopy_record_store_fence_equal(phase1_fence,
                                               result->seal_fence)) {
@@ -1470,16 +1559,19 @@ bool lock_warmcopy_record_store_seal_for_target(
 
   if (!export_record_payload_from_store_locked(
           target_id, store, &result->record_locks_payload,
-          &result->record_lock_count)) {
+          &result->record_lock_count, &result->scanned_shard_count)) {
     result->record_locks_payload.clear();
     result->record_lock_count = 0;
+    result->materialized_payload_bytes = 0;
     result->status = lock_warmcopy_record_seal_status_t::TARGET_INVALID;
     result->diagnostic_reason = "record_payload_invalid";
     return true;
   }
+  result->materialized_payload_bytes = result->record_locks_payload.size();
 
   if (result->record_lock_count > max_lock_count) {
     result->record_locks_payload.clear();
+    result->materialized_payload_bytes = 0;
     result->status =
         lock_warmcopy_record_seal_status_t::RESOURCE_LIMIT_EXCEEDED;
     result->diagnostic_reason = "record_lock_count_limit_exceeded";
@@ -1488,6 +1580,71 @@ bool lock_warmcopy_record_store_seal_for_target(
 
   result->sealed = true;
   result->status = result->record_locks_payload.empty()
+                       ? lock_warmcopy_record_seal_status_t::EMPTY
+                       : lock_warmcopy_record_seal_status_t::SEALED_VALID;
+  return true;
+}
+
+bool lock_warmcopy_record_store_seal_metadata_for_target(
+    uint64_t target_id, const lock_warmcopy_record_store_fence_t &phase1_fence,
+    uint32_t expected_record_lock_count, uint32_t max_lock_count,
+    uint64_t max_journal_bytes, uint32_t max_dirty_shards,
+    lock_warmcopy_record_seal_result_t *result) {
+  if (result == nullptr) return false;
+
+  *result = lock_warmcopy_record_seal_result_t{};
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
+  const lock_warmcopy_record_shard_map_t *store =
+      record_store_for_target_if_exists_locked(target_id);
+  bool lock_count_overflow = false;
+  if (!record_store_metadata_for_target_locked(
+          store, &result->seal_fence, &result->journal_bytes,
+          &result->dirty_shard_count, &result->record_lock_count,
+          &lock_count_overflow)) {
+    result->status = lock_warmcopy_record_seal_status_t::TARGET_INVALID;
+    result->diagnostic_reason = "record_seal_fence_unavailable";
+    return true;
+  }
+
+  if (!lock_warmcopy_record_store_fence_equal(phase1_fence,
+                                              result->seal_fence)) {
+    result->status = lock_warmcopy_record_seal_status_t::SEAL_FENCE_CHANGED;
+    result->diagnostic_reason = "record_seal_fence_changed";
+    return true;
+  }
+
+  if (result->journal_bytes > max_journal_bytes) {
+    result->status =
+        lock_warmcopy_record_seal_status_t::RESOURCE_LIMIT_EXCEEDED;
+    result->diagnostic_reason = "record_journal_budget_exceeded";
+    return true;
+  }
+
+  if (result->dirty_shard_count > max_dirty_shards) {
+    result->status =
+        lock_warmcopy_record_seal_status_t::RESOURCE_LIMIT_EXCEEDED;
+    result->diagnostic_reason = "record_dirty_shard_limit_exceeded";
+    return true;
+  }
+
+  if (lock_count_overflow ||
+      result->record_lock_count != expected_record_lock_count) {
+    result->status = lock_warmcopy_record_seal_status_t::SEAL_FENCE_CHANGED;
+    result->diagnostic_reason = "record_seal_lock_count_changed";
+    return true;
+  }
+
+  result->record_lock_count = expected_record_lock_count;
+  if (result->record_lock_count > max_lock_count) {
+    result->status =
+        lock_warmcopy_record_seal_status_t::RESOURCE_LIMIT_EXCEEDED;
+    result->diagnostic_reason = "record_lock_count_limit_exceeded";
+    return true;
+  }
+
+  result->sealed = true;
+  result->status = result->record_lock_count == 0
                        ? lock_warmcopy_record_seal_status_t::EMPTY
                        : lock_warmcopy_record_seal_status_t::SEALED_VALID;
   return true;
@@ -1630,11 +1787,13 @@ bool lock_warmcopy_record_store_export_record_payload_for_target_for_unit_test(
 }
 
 void lock_warmcopy_record_store_reset_for_unit_test() {
-  std::lock_guard<std::mutex> guard(lock_warmcopy_record_store_mutex);
-  lock_warmcopy_record_store_by_target.clear();
-  lock_warmcopy_record_journal_sequence_by_target.clear();
-  lock_warmcopy_record_expected_delta_sequence_by_target.clear();
-  lock_warmcopy_record_target_invalid_reason_by_target.clear();
+  for (auto &partition : lock_warmcopy_record_store_partitions) {
+    std::lock_guard<std::mutex> guard(partition.mutex);
+    partition.store_by_target.clear();
+    partition.journal_sequence_by_target.clear();
+    partition.expected_delta_sequence_by_target.clear();
+    partition.target_invalid_reason_by_target.clear();
+  }
 }
 
 void lock_warmcopy_trx_conversion_freeze_for_unit_test(

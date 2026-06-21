@@ -1,0 +1,6 @@
+# Lint-only source-shape guard for lock warmcopy correctness gates.
+# Runtime table-drift behavior is covered by
+# batch_drain_lock_warmcopy_table_post_prepare_drift.
+SELECT 'ok' AS batch_drain_lock_warmcopy_no_partial_fallback_lint;
+batch_drain_lock_warmcopy_no_partial_fallback_lint
+ok

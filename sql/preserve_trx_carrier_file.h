@@ -30,21 +30,6 @@
 
 #include "sql/preserve_trx_carrier.h"
 
-enum class Preserve_snapshot_io_step {
-  WRITE_TEMP_FILE,
-  FSYNC_TEMP_FILE,
-  RENAME_TEMP_FILE,
-  FSYNC_DIRECTORY
-};
-
-using Preserve_snapshot_io_observer = void (*)(Preserve_snapshot_io_step step,
-                                               void *context);
-
-struct Preserve_snapshot_write_options {
-  Preserve_snapshot_io_observer observer{nullptr};
-  void *observer_context{nullptr};
-};
-
 class Local_file_preserved_trx_carrier final
     : public Preserved_trx_carrier,
       public Preserved_trx_warm_external_blob_carrier {
@@ -83,6 +68,9 @@ class Local_file_preserved_trx_carrier final
   Preserved_trx_carrier_status remove_taint(const std::string &token) override;
   Preserved_trx_carrier_status list_tokens(
       Preserved_trx_carrier_listing *listing) override;
+  Preserved_trx_carrier_status token_state(
+      const std::string &token,
+      Preserved_trx_carrier_token_state *state) override;
   Preserved_trx_carrier_status remove_warm_external_blob_artifact(
       const std::string &artifact_filename) override;
   Preserved_trx_carrier_status create_warm_external_blob_writer(
@@ -92,6 +80,7 @@ class Local_file_preserved_trx_carrier final
   Preserved_trx_carrier_status adopt_warm_external_blob(
       const std::string &warmcopy_id, const std::string &token,
       const std::string &blob_name,
+      uint64_t warmcopy_epoch,
       const Preserved_trx_external_blob_descriptor &descriptor) override;
   Preserved_trx_carrier_status remove_warm_external_blob(
       const std::string &warmcopy_id, const std::string &blob_name) override;

@@ -1496,10 +1496,10 @@ class PreserveSnapshotTest : public ::testing::Test {
 
   void create_warm_prebuilt_binlog_blob(
       Local_file_preserved_trx_carrier *carrier, const std::string &warmcopy_id,
-      const std::string &payload, PrebuiltBinlogCacheBlob *prebuilt) {
+      const std::string &payload, PrebuiltBinlogCacheBlob *prebuilt,
+      uint64_t warmcopy_epoch = 1) {
     ASSERT_NE(nullptr, carrier);
     ASSERT_NE(nullptr, prebuilt);
-    const uint64_t warmcopy_epoch = 1;
     std::unique_ptr<Preserved_trx_external_blob_writer> writer;
     ASSERT_EQ(Preserved_trx_carrier_status::OK,
               carrier->create_warm_external_blob_writer(
@@ -1515,6 +1515,7 @@ class PreserveSnapshotTest : public ::testing::Test {
 
     *prebuilt = {};
     prebuilt->warmcopy_id = warmcopy_id;
+    prebuilt->warmcopy_epoch = warmcopy_epoch;
     prebuilt->size = payload.length();
     SHA_EVP256(reinterpret_cast<const unsigned char *>(payload.data()),
                payload.length(), prebuilt->digest.data());
@@ -1523,6 +1524,40 @@ class PreserveSnapshotTest : public ::testing::Test {
     prebuilt->metadata.with_rbr = true;
     prebuilt->metadata.with_start = true;
     prebuilt->metadata.with_content = true;
+
+    Preserved_trx_external_blob_descriptor descriptor;
+    descriptor.name = prebuilt->name;
+    descriptor.size = prebuilt->size;
+    descriptor.digest = prebuilt->digest;
+    ASSERT_EQ(Preserved_trx_carrier_status::OK,
+              writer->seal_descriptor(descriptor));
+  }
+
+  void create_warm_prebuilt_record_locks_blob(
+      Local_file_preserved_trx_carrier *carrier, const std::string &warmcopy_id,
+      const std::string &payload, PrebuiltRecordLocksBlob *prebuilt,
+      uint64_t warmcopy_epoch = 1) {
+    ASSERT_NE(nullptr, carrier);
+    ASSERT_NE(nullptr, prebuilt);
+    std::unique_ptr<Preserved_trx_external_blob_writer> writer;
+    ASSERT_EQ(Preserved_trx_carrier_status::OK,
+              carrier->create_warm_external_blob_writer(
+                  warmcopy_id, kPreservedTrxBlobRecordLocks, warmcopy_epoch,
+                  &writer));
+    ASSERT_NE(nullptr, writer);
+    ASSERT_EQ(Preserved_trx_carrier_status::OK,
+              writer->write_at(
+                  0, reinterpret_cast<const unsigned char *>(payload.data()),
+                  payload.length()));
+    ASSERT_EQ(Preserved_trx_carrier_status::OK, writer->flush());
+    ASSERT_EQ(Preserved_trx_carrier_status::OK, writer->close());
+
+    *prebuilt = {};
+    prebuilt->warmcopy_id = warmcopy_id;
+    prebuilt->warmcopy_epoch = warmcopy_epoch;
+    prebuilt->size = payload.length();
+    SHA_EVP256(reinterpret_cast<const unsigned char *>(payload.data()),
+               payload.length(), prebuilt->digest.data());
 
     Preserved_trx_external_blob_descriptor descriptor;
     descriptor.name = prebuilt->name;
@@ -2018,6 +2053,7 @@ class InMemoryPreservedTrxCarrier final : public Preserved_trx_carrier {
 
   Preserved_trx_carrier_status list_tokens(
       Preserved_trx_carrier_listing *listing) override {
+    ++list_token_reads;
     if (listing == nullptr) return Preserved_trx_carrier_status::CORRUPT;
     listing->snapshot_tokens.clear();
     listing->external_blob_tokens.clear();
@@ -2034,6 +2070,18 @@ class InMemoryPreservedTrxCarrier final : public Preserved_trx_carrier {
     return Preserved_trx_carrier_status::OK;
   }
 
+  Preserved_trx_carrier_status token_state(
+      const std::string &token,
+      Preserved_trx_carrier_token_state *state) override {
+    if (state == nullptr) return Preserved_trx_carrier_status::CORRUPT;
+    ++token_state_reads;
+    state->snapshot = snapshots.count(token) != 0;
+    state->external_blob = blobs.count(token) != 0;
+    state->temp_sidecar = temp_sidecar_tokens.count(token) != 0;
+    state->tainted = tainted_tokens.count(token) != 0;
+    return Preserved_trx_carrier_status::OK;
+  }
+
   Preserved_trx_carrier_status remove_warm_external_blob_artifact(
       const std::string &artifact_filename) override {
     warm_artifacts.erase(artifact_filename);
@@ -2047,6 +2095,8 @@ class InMemoryPreservedTrxCarrier final : public Preserved_trx_carrier {
   std::set<std::string> warm_artifacts;
   Preserved_trx_codec_context context;
   size_t context_reads{0};
+  size_t list_token_reads{0};
+  size_t token_state_reads{0};
   bool fail_codec_context{false};
   bool fail_external_blob_write{false};
   bool fail_external_blob_remove{false};
@@ -2091,6 +2141,22 @@ TEST_F(PreserveSnapshotTest, InMemoryStoreWritesAndReadsNoCacheBundle) {
   EXPECT_EQ(1U, listing.snapshot_tokens.count(input.metadata.token));
   EXPECT_TRUE(listing.external_blob_tokens.empty());
   EXPECT_GE(carrier.context_reads, 2U);
+}
+
+TEST_F(PreserveSnapshotTest, StoreWriteAvoidsFullTokenListingForNewToken) {
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  InMemoryPreservedTrxCarrier carrier(codec_context());
+  Preserved_trx_store store(&carrier);
+
+  Preserve_snapshot_metadata written;
+  ASSERT_EQ(Preserve_snapshot_status::OK, store.write(bundle, 300, &written));
+  EXPECT_EQ(1U, carrier.token_state_reads);
+  EXPECT_EQ(0U, carrier.list_token_reads);
 }
 
 TEST_F(PreserveSnapshotTest, InMemoryStoreReadRestoresFullMetadataPayloads) {
@@ -3071,6 +3137,40 @@ TEST_F(PreserveSnapshotTest, DefaultCarrierTokenExistsSeesGenericBlobSidecars) {
 }
 
 TEST_F(PreserveSnapshotTest,
+       DefaultCarrierGeneratedTokenExistsUsesExactCurrentArtifacts) {
+  const std::string token = "exact_generated_token";
+
+  EXPECT_FALSE(preserved_trx_default_carrier_generated_token_exists(m_dir,
+                                                                    token));
+
+  write_file(m_dir + token + ".blob.temp_image", "temp-image");
+  EXPECT_TRUE(preserved_trx_default_carrier_token_exists(m_dir, token));
+  EXPECT_FALSE(preserved_trx_default_carrier_generated_token_exists(m_dir,
+                                                                    token));
+
+  write_file(m_dir + token + ".bin", "snapshot");
+  EXPECT_TRUE(preserved_trx_default_carrier_generated_token_exists(m_dir,
+                                                                   token));
+  ASSERT_EQ(0, my_delete((m_dir + token + ".bin").c_str(), MYF(0)));
+
+  write_file(m_dir + token + ".binlog_cache.tmp", "binlog-cache-tmp");
+  EXPECT_TRUE(preserved_trx_default_carrier_generated_token_exists(m_dir,
+                                                                   token));
+  ASSERT_EQ(0,
+            my_delete((m_dir + token + ".binlog_cache.tmp").c_str(), MYF(0)));
+
+  const std::string shard_root = m_dir + "blob_shards";
+  const std::string shard_dir =
+      shard_root + FN_DIRSEP + token.substr(0, 1) + FN_DIRSEP;
+  ASSERT_EQ(0, my_mkdir(shard_root.c_str(), 0700, MYF(0)));
+  ASSERT_EQ(0, my_mkdir(shard_dir.c_str(), 0700, MYF(0)));
+  write_file(shard_dir + token + ".blob." + kPreservedTrxBlobRecordLocks,
+             "record-locks");
+  EXPECT_TRUE(preserved_trx_default_carrier_generated_token_exists(m_dir,
+                                                                   token));
+}
+
+TEST_F(PreserveSnapshotTest,
        InMemoryStoreCleansExternalBlobAfterPostBlobWriteFailure) {
   Mysql_binlog_preserve_snapshot snapshot;
   snapshot.cache_payload = "binlog-cache-payload";
@@ -3294,6 +3394,98 @@ TEST_F(PreserveSnapshotTest,
           Preserve_snapshot_io_step::RENAME_TEMP_FILE,
           Preserve_snapshot_io_step::FSYNC_DIRECTORY}),
       steps);
+}
+
+TEST_F(PreserveSnapshotTest, LocalFileStoreWriteCanDeferDirectoryFsync) {
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  std::vector<Preserve_snapshot_io_step> steps;
+  Preserve_snapshot_write_options options;
+  options.defer_directory_fsync = true;
+  options.observer = [](Preserve_snapshot_io_step step, void *ctx) {
+    auto *out = static_cast<std::vector<Preserve_snapshot_io_step> *>(ctx);
+    out->push_back(step);
+  };
+  options.observer_context = &steps;
+
+  Local_file_preserved_trx_carrier carrier(m_dir, options);
+  Preserved_trx_store store(&carrier);
+  Preserve_snapshot_metadata written_metadata;
+  EXPECT_EQ(Preserve_snapshot_status::OK,
+            store.write(std::move(bundle), 300, &written_metadata));
+  EXPECT_EQ(
+      (std::vector<Preserve_snapshot_io_step>{
+          Preserve_snapshot_io_step::WRITE_TEMP_FILE,
+          Preserve_snapshot_io_step::FSYNC_TEMP_FILE,
+          Preserve_snapshot_io_step::RENAME_TEMP_FILE}),
+      steps);
+  EXPECT_EQ(Preserve_snapshot_status::OK,
+            preserve_trx_fsync_default_store_directory(m_dir));
+
+  Preserved_trx_bundle out;
+  EXPECT_EQ(Preserve_snapshot_status::OK,
+            store.read(input.metadata.token, true, &out));
+}
+
+TEST_F(PreserveSnapshotTest, LocalFileStoreWriteCanDeferFileAndDirectoryFsync) {
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  std::vector<Preserve_snapshot_io_step> steps;
+  Preserve_snapshot_write_options options;
+  options.defer_file_fsync = true;
+  options.defer_directory_fsync = true;
+  options.observer = [](Preserve_snapshot_io_step step, void *ctx) {
+    auto *out = static_cast<std::vector<Preserve_snapshot_io_step> *>(ctx);
+    out->push_back(step);
+  };
+  options.observer_context = &steps;
+
+  Local_file_preserved_trx_carrier carrier(m_dir, options);
+  Preserved_trx_store store(&carrier);
+  Preserve_snapshot_metadata written_metadata;
+  EXPECT_EQ(Preserve_snapshot_status::OK,
+            store.write(std::move(bundle), 300, &written_metadata));
+  EXPECT_EQ((std::vector<Preserve_snapshot_io_step>{
+                Preserve_snapshot_io_step::WRITE_TEMP_FILE,
+                Preserve_snapshot_io_step::RENAME_TEMP_FILE}),
+            steps);
+  EXPECT_EQ(Preserve_snapshot_status::OK,
+            preserve_trx_fsync_default_store_directory(m_dir));
+
+  Preserved_trx_bundle out;
+  EXPECT_EQ(Preserve_snapshot_status::OK,
+            store.read(input.metadata.token, true, &out));
+}
+
+TEST_F(PreserveSnapshotTest,
+       LocalFileStoreFastNewTokenStillRejectsExistingSnapshot) {
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_snapshot_write_options options;
+  options.fast_new_token_state = true;
+  options.defer_file_fsync = true;
+  options.defer_directory_fsync = true;
+  options.shard_snapshot_files = true;
+
+  Local_file_preserved_trx_carrier carrier(m_dir, options);
+  Preserved_trx_store store(&carrier);
+  Preserve_snapshot_metadata written_metadata;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            store.write(bundle, 300, &written_metadata));
+  EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
+            store.write(bundle, 300, nullptr));
 }
 
 TEST_F(PreserveSnapshotTest, LocalFileStoreWriteDoesNotOverwriteRacedToken) {
@@ -4352,6 +4544,321 @@ TEST_F(PreserveSnapshotTest, BundleBuilderNoCacheProducesTlvsWithoutBlob) {
                          [](const Preserve_snapshot_tlv &tlv) {
                            return tlv.tag == 0x20;
                          }));
+}
+
+TEST_F(PreserveSnapshotTest,
+       BundleBuilderCanExternalizeRecordLocksPayload) {
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  input.metadata.record_locks_payload = record_locks_payload();
+  input.metadata.mdl_descriptors_payload = empty_mdl_descriptors_payload();
+  input.externalize_record_locks_payload = true;
+
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  EXPECT_TRUE(bundle.metadata.record_locks_payload.empty());
+  ASSERT_EQ(1U, bundle.external_blobs.size());
+  EXPECT_EQ(kPreservedTrxBlobRecordLocks, bundle.external_blobs[0].name);
+  EXPECT_EQ(input.metadata.record_locks_payload,
+            bundle.external_blobs[0].payload);
+  ASSERT_EQ(1U, bundle.blob_descriptors.size());
+  EXPECT_EQ(kPreservedTrxBlobRecordLocks, bundle.blob_descriptors[0].name);
+  EXPECT_EQ(input.metadata.record_locks_payload.size(),
+            bundle.blob_descriptors[0].size);
+  EXPECT_EQ(
+      bundle.tlvs.end(),
+      std::find_if(bundle.tlvs.begin(), bundle.tlvs.end(),
+                   [](const Preserve_snapshot_tlv &tlv) {
+                     return tlv.tag == kTestRecordLocksTlv;
+                   }));
+}
+
+TEST_F(PreserveSnapshotTest,
+       BundleBuilderRejectsOversizedExternalRecordLocksPayload) {
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  input.metadata.record_locks_payload = record_locks_payload();
+  input.metadata.mdl_descriptors_payload = empty_mdl_descriptors_payload();
+  input.externalize_record_locks_payload = true;
+  input.options.max_record_locks_external_blob_bytes =
+      input.metadata.record_locks_payload.size() - 1;
+
+  EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
+            build_preserved_trx_bundle(input, &bundle));
+}
+
+TEST_F(PreserveSnapshotTest,
+       BundleBuilderUsesRecordLockExternalBlobBudgetIndependently) {
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  input.metadata.record_locks_payload = record_locks_payload();
+  input.metadata.mdl_descriptors_payload = empty_mdl_descriptors_payload();
+  input.externalize_record_locks_payload = true;
+  input.options.max_external_blob_bytes = 1;
+  input.options.max_record_locks_external_blob_bytes =
+      input.metadata.record_locks_payload.size();
+
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+  ASSERT_EQ(1U, bundle.external_blobs.size());
+  EXPECT_EQ(kPreservedTrxBlobRecordLocks, bundle.external_blobs[0].name);
+}
+
+TEST_F(PreserveSnapshotTest, InMemoryStoreHydratesExternalRecordLocksPayload) {
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  input.metadata.record_locks_payload = record_locks_payload();
+  input.metadata.mdl_descriptors_payload = empty_mdl_descriptors_payload();
+  input.externalize_record_locks_payload = true;
+
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  InMemoryPreservedTrxCarrier carrier(codec_context());
+  Preserved_trx_store store(&carrier);
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            store.write(std::move(bundle), 300, nullptr));
+
+  Preserved_trx_bundle out;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            store.read(input.metadata.token, true, &out));
+  EXPECT_EQ(input.metadata.record_locks_payload,
+            out.metadata.record_locks_payload);
+  ASSERT_EQ(1U, out.blob_descriptors.size());
+  EXPECT_EQ(kPreservedTrxBlobRecordLocks, out.blob_descriptors[0].name);
+}
+
+TEST_F(PreserveSnapshotTest,
+       InMemoryStoreMetadataOnlyDoesNotHydrateExternalRecordLocksPayload) {
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  input.metadata.record_locks_payload = record_locks_payload();
+  input.metadata.mdl_descriptors_payload = empty_mdl_descriptors_payload();
+  input.externalize_record_locks_payload = true;
+
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  InMemoryPreservedTrxCarrier carrier(codec_context());
+  Preserved_trx_store store(&carrier);
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            store.write(std::move(bundle), 300, nullptr));
+
+  Preserved_trx_bundle out;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            store.read(input.metadata.token, true,
+                       Preserved_trx_carrier::Payload_read_mode::METADATA_ONLY,
+                       &out));
+  EXPECT_TRUE(out.metadata.record_locks_payload.empty());
+  ASSERT_EQ(1U, out.blob_descriptors.size());
+  EXPECT_EQ(kPreservedTrxBlobRecordLocks, out.blob_descriptors[0].name);
+}
+
+TEST_F(PreserveSnapshotTest,
+       BundleBuilderCanAttachPrebuiltRecordLocksBlobWithoutPayload) {
+  PrebuiltRecordLocksBlob prebuilt;
+  prebuilt.warmcopy_id = "record-warmcopy";
+  prebuilt.size = record_locks_payload().size();
+  SHA_EVP256(reinterpret_cast<const unsigned char *>(
+                 record_locks_payload().data()),
+             record_locks_payload().size(), prebuilt.digest.data());
+
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  input.metadata.mdl_descriptors_payload = empty_mdl_descriptors_payload();
+  input.prebuilt_record_locks_blob = &prebuilt;
+
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  EXPECT_TRUE(bundle.metadata.record_locks_payload.empty());
+  ASSERT_EQ(1U, bundle.external_blobs.size());
+  EXPECT_EQ(kPreservedTrxBlobRecordLocks, bundle.external_blobs[0].name);
+  EXPECT_TRUE(bundle.external_blobs[0].prebuilt);
+  EXPECT_TRUE(bundle.external_blobs[0].payload.empty());
+  EXPECT_EQ(prebuilt.warmcopy_id, bundle.external_blobs[0].warmcopy_id);
+  ASSERT_EQ(1U, bundle.blob_descriptors.size());
+  EXPECT_EQ(kPreservedTrxBlobRecordLocks, bundle.blob_descriptors[0].name);
+  EXPECT_EQ(prebuilt.size, bundle.blob_descriptors[0].size);
+}
+
+TEST_F(PreserveSnapshotTest, LocalStoreAdoptsPrebuiltRecordLocksBlob) {
+  const std::string payload = record_locks_payload();
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  PrebuiltRecordLocksBlob prebuilt;
+  create_warm_prebuilt_record_locks_blob(&carrier, "record-warmcopy", payload,
+                                         &prebuilt);
+
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  input.metadata.mdl_descriptors_payload = empty_mdl_descriptors_payload();
+  input.prebuilt_record_locks_blob = &prebuilt;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+  ASSERT_EQ(1U, bundle.external_blobs.size());
+  ASSERT_TRUE(bundle.external_blobs[0].prebuilt);
+
+  Preserved_trx_store store(&carrier);
+  ASSERT_EQ(Preserve_snapshot_status::OK, store.write(bundle, 300, nullptr));
+
+  Preserved_trx_bundle out;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            store.read(input.metadata.token, true, &out));
+  EXPECT_EQ(payload, out.metadata.record_locks_payload);
+  ASSERT_EQ(1U, out.blob_descriptors.size());
+  EXPECT_EQ(kPreservedTrxBlobRecordLocks, out.blob_descriptors[0].name);
+
+  Preserved_trx_carrier_listing listing;
+  ASSERT_EQ(Preserve_snapshot_status::OK, store.list_tokens(&listing));
+  EXPECT_EQ(1U, listing.snapshot_tokens.count(input.metadata.token));
+  EXPECT_EQ(1U, listing.external_blob_tokens.count(input.metadata.token));
+  EXPECT_TRUE(listing.warm_external_blob_artifacts.empty());
+}
+
+TEST_F(PreserveSnapshotTest,
+       LocalStoreFastAdoptsPrebuiltRecordLocksBlobWithoutDescriptor) {
+  const std::string payload = record_locks_payload();
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  PrebuiltRecordLocksBlob prebuilt;
+  create_warm_prebuilt_record_locks_blob(&carrier, "record-warmcopy", payload,
+                                         &prebuilt);
+  ASSERT_EQ(0, my_delete((m_dir + "record-warmcopy.record_locks.warm.1.desc")
+                             .c_str(),
+                         MYF(0)));
+
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  input.metadata.mdl_descriptors_payload = empty_mdl_descriptors_payload();
+  input.prebuilt_record_locks_blob = &prebuilt;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserved_trx_store store(&carrier);
+  EXPECT_EQ(Preserve_snapshot_status::NOT_FOUND,
+            store.write(bundle, 300, nullptr));
+
+  Preserve_snapshot_write_options fast_options;
+  fast_options.fast_prebuilt_blob_adopt = true;
+  Local_file_preserved_trx_carrier fast_carrier(m_dir, fast_options);
+  Preserved_trx_store fast_store(&fast_carrier);
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            fast_store.write(bundle, 300, nullptr));
+
+  Preserved_trx_bundle out;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            fast_store.read(input.metadata.token, true, &out));
+  EXPECT_EQ(payload, out.metadata.record_locks_payload);
+  ASSERT_EQ(1U, out.blob_descriptors.size());
+  EXPECT_EQ(kPreservedTrxBlobRecordLocks, out.blob_descriptors[0].name);
+}
+
+TEST_F(PreserveSnapshotTest,
+       LocalStoreShardsPrebuiltRecordLocksExternalBlob) {
+  const std::string payload = record_locks_payload();
+  Local_file_preserved_trx_carrier warm_carrier(m_dir);
+  PrebuiltRecordLocksBlob prebuilt;
+  create_warm_prebuilt_record_locks_blob(&warm_carrier, "record-warmcopy",
+                                         payload, &prebuilt);
+
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  input.metadata.mdl_descriptors_payload = empty_mdl_descriptors_payload();
+  input.prebuilt_record_locks_blob = &prebuilt;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_snapshot_write_options options;
+  options.shard_snapshot_files = true;
+  options.shard_generic_external_blobs = true;
+  Local_file_preserved_trx_carrier carrier(m_dir, options);
+  Preserved_trx_store store(&carrier);
+  ASSERT_EQ(Preserve_snapshot_status::OK, store.write(bundle, 300, nullptr));
+
+  const std::string root_snapshot_path = m_dir + input.metadata.token + ".bin";
+  const std::string root_blob_path =
+      m_dir + input.metadata.token + ".blob." + kPreservedTrxBlobRecordLocks;
+  const std::string shard_dir = m_dir + "blob_shards" + FN_DIRSEP +
+                                input.metadata.token.substr(0, 1) + FN_DIRSEP;
+  const std::string shard_snapshot_path =
+      shard_dir + input.metadata.token + ".bin";
+  const std::string shard_blob_path =
+      shard_dir + input.metadata.token + ".blob." + kPreservedTrxBlobRecordLocks;
+  MY_STAT stat_area;
+  EXPECT_EQ(nullptr, my_stat(root_snapshot_path.c_str(), &stat_area, MYF(0)));
+  EXPECT_NE(nullptr, my_stat(shard_snapshot_path.c_str(), &stat_area, MYF(0)));
+  EXPECT_EQ(nullptr, my_stat(root_blob_path.c_str(), &stat_area, MYF(0)));
+  EXPECT_NE(nullptr, my_stat(shard_blob_path.c_str(), &stat_area, MYF(0)));
+
+  Preserved_trx_bundle out;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            store.read(input.metadata.token, true, &out));
+  EXPECT_EQ(payload, out.metadata.record_locks_payload);
+
+  Preserved_trx_carrier_listing listing;
+  ASSERT_EQ(Preserve_snapshot_status::OK, store.list_tokens(&listing));
+  EXPECT_EQ(1U, listing.snapshot_tokens.count(input.metadata.token));
+  EXPECT_EQ(1U, listing.external_blob_tokens.count(input.metadata.token));
+
+  ASSERT_EQ(Preserve_snapshot_delete_status::OK,
+            store.remove_with_status(input.metadata.token));
+  EXPECT_EQ(nullptr, my_stat(shard_snapshot_path.c_str(), &stat_area, MYF(0)));
+  EXPECT_EQ(nullptr, my_stat(shard_blob_path.c_str(), &stat_area, MYF(0)));
+}
+
+TEST_F(PreserveSnapshotTest,
+       LocalStoreAdoptsPrebuiltRecordLocksBlobByEpochHint) {
+  const std::string stale_payload = record_locks_payload() + "stale";
+  const std::string payload = record_locks_payload();
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  PrebuiltRecordLocksBlob stale_prebuilt;
+  create_warm_prebuilt_record_locks_blob(
+      &carrier, "record-warmcopy", stale_payload, &stale_prebuilt, 1);
+  PrebuiltRecordLocksBlob prebuilt;
+  create_warm_prebuilt_record_locks_blob(&carrier, "record-warmcopy", payload,
+                                         &prebuilt, 2);
+
+  Preserved_trx_carrier_listing warm_listing;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.list_tokens(&warm_listing));
+  EXPECT_EQ(4U, warm_listing.warm_external_blob_artifacts.size());
+  EXPECT_EQ(1U, warm_listing.warm_external_blob_artifacts.count(
+                    "record-warmcopy.record_locks.warm.1"));
+  EXPECT_EQ(1U, warm_listing.warm_external_blob_artifacts.count(
+                    "record-warmcopy.record_locks.warm.1.desc"));
+  EXPECT_EQ(1U, warm_listing.warm_external_blob_artifacts.count(
+                    "record-warmcopy.record_locks.warm.2"));
+  EXPECT_EQ(1U, warm_listing.warm_external_blob_artifacts.count(
+                    "record-warmcopy.record_locks.warm.2.desc"));
+
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  input.metadata.mdl_descriptors_payload = empty_mdl_descriptors_payload();
+  input.prebuilt_record_locks_blob = &prebuilt;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserved_trx_store store(&carrier);
+  ASSERT_EQ(Preserve_snapshot_status::OK, store.write(bundle, 300, nullptr));
+
+  Preserved_trx_bundle out;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            store.read(input.metadata.token, true, &out));
+  EXPECT_EQ(payload, out.metadata.record_locks_payload);
+
+  Preserved_trx_carrier_listing listing;
+  ASSERT_EQ(Preserve_snapshot_status::OK, store.list_tokens(&listing));
+  EXPECT_EQ(1U, listing.external_blob_tokens.count(input.metadata.token));
 }
 
 TEST_F(PreserveSnapshotTest, BundleBuilderLoggedCacheAttachesExternalBlob) {
@@ -6775,5 +7282,12 @@ TEST_F(PreserveSnapshotTest, LocalFileStoreRejectsPreexistingKeyTmpSymlink) {
   EXPECT_EQ(nullptr, my_stat((m_dir + ".key").c_str(), &key_stat, MYF(0)));
 }
 #endif
+
+TEST(PreserveBatchParallelPreserveThreads, AutoResolverCapsIoHeavyWorkerCount) {
+  EXPECT_EQ(8U, preserve_trx_auto_parallel_preserve_threads(0));
+  EXPECT_EQ(4U, preserve_trx_auto_parallel_preserve_threads(2));
+  EXPECT_EQ(8U, preserve_trx_auto_parallel_preserve_threads(8));
+  EXPECT_EQ(10U, preserve_trx_auto_parallel_preserve_threads(64));
+}
 
 }  // namespace preserve_trx_unittest

@@ -132,20 +132,40 @@ use strict;
 use warnings;
 use File::Spec;
 
+require File::Spec->catfile($ENV{'MYSQL_TEST_DIR'}, 'suite',
+                            'preserve_trx', 'include',
+                            'preserve_snapshot_files.pl');
+
 my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
 my $preserve_dir = File::Spec->catdir($datadir, 'preserve');
-opendir(my $dh, $preserve_dir)
-  or die "cannot open preserve dir $preserve_dir: $!";
-my @tokens = sort map {
-  s/\.bin$//r;
-} grep {
-  /\.bin$/ && -f File::Spec->catfile($preserve_dir, $_);
-} readdir($dh);
-closedir($dh);
+my @tokens = PreserveSnapshotFiles::preserve_snapshot_tokens($preserve_dir);
 
 die "expected 100 preserved snapshots, found " . scalar(@tokens) . "\n"
   unless scalar(@tokens) == 100;
 EOF
+
+--let $batch_long_app_disconnect_file= $MYSQLTEST_VARDIR/tmp/batch_drain_100_long_app_disconnect.inc
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $file = File::Spec->catfile($vardir, 'tmp',
+                               'batch_drain_100_long_app_disconnect.inc');
+open(my $fh, '>', $file) or die "cannot open $file for write: $!";
+for my $idx (1 .. 100) {
+  my $name = sprintf("batch_long_app_%03d", $idx);
+  print $fh "--disconnect $name\n";
+}
+print $fh "--connection default\n";
+close($fh);
+EOF
+--disable_query_log
+--disable_result_log
+--source $batch_long_app_disconnect_file
+--enable_result_log
+--enable_query_log
 
 --disable_query_log
 SET SESSION group_concat_max_len=1000000;
@@ -236,6 +256,8 @@ if ($batch_long_verify_file)
 --remove_file $batch_long_apps_file
 --remove_file $batch_long_post_apps_file
 --let $batch_long_post_apps_file=
+--remove_file $batch_long_app_disconnect_file
+--let $batch_long_app_disconnect_file=
 --remove_file $batch_long_resume_file
 --remove_file $batch_long_resume_finalize_file
 --let $batch_long_resume_finalize_file=

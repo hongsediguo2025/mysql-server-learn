@@ -39,6 +39,7 @@ struct Preserve_trx_kernel_request {
   bool debug_fail_ha_prepare_low{false};
   bool debug_fail_temp_only_prepare{false};
   const Preserve_trx_lock_warmcopy_artifact *lock_warmcopy_artifact{nullptr};
+  bool defer_snapshot_directory_fsync{false};
 };
 
 struct Preserve_trx_kernel_result {

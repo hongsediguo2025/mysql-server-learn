@@ -55,18 +55,29 @@ use strict;
 use warnings;
 use File::Spec;
 
+require File::Spec->catfile($ENV{'MYSQL_TEST_DIR'}, 'suite',
+                            'preserve_trx', 'include',
+                            'preserve_snapshot_files.pl');
+
 my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
 opendir(my $dh, $dir) or die "cannot open preserve dir: $dir: $!";
 my @entries = readdir($dh);
 closedir($dh);
-my @snapshots = sort grep { /\.bin$/ } @entries;
+my @snapshot_paths = PreserveSnapshotFiles::preserve_snapshot_bin_files($dir);
 my @caches = sort grep { /\.binlog_cache$/ } @entries;
-die "expected two preserved snapshots in $dir, found " . scalar(@snapshots) . "\n"
-  unless scalar(@snapshots) == 2;
+die "expected two preserved snapshots in $dir, found " .
+    scalar(@snapshot_paths) . "\n"
+  unless scalar(@snapshot_paths) == 2;
 die "expected two preserved binlog caches in $dir, found " . scalar(@caches) . "\n"
   unless scalar(@caches) == 2;
 
-my @snapshot_tokens = map { s/\.bin$//r } @snapshots;
+my %snapshot_paths_by_token;
+for my $snapshot_path (@snapshot_paths) {
+  my (undef, undef, $snapshot_name) = File::Spec->splitpath($snapshot_path);
+  next unless $snapshot_name =~ s/\.bin$//;
+  $snapshot_paths_by_token{$snapshot_name} = $snapshot_path;
+}
+my @snapshot_tokens = sort keys %snapshot_paths_by_token;
 my @cache_tokens = map { s/\.binlog_cache$//r } @caches;
 die "snapshot/cache token mismatch\n"
   unless join(",", @snapshot_tokens) eq join(",", @cache_tokens);
@@ -79,7 +90,7 @@ open(my $out, ">", $include_path)
 for my $i (0 .. $#snapshot_tokens) {
   my $n = $i + 1;
   my $token = $snapshot_tokens[$i];
-  my $snapshot_path = File::Spec->catfile($dir, "$token.bin");
+  my $snapshot_path = $snapshot_paths_by_token{$token};
   my $cache_path = File::Spec->catfile($dir, "$token.binlog_cache");
   print $out "--let \$batch_force_token_$n= $token\n";
   print $out "--let \$batch_force_snapshot_$n= $snapshot_path\n";

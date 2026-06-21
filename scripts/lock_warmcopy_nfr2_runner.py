@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import errno
+import hashlib
 import json
 import os
 import shlex
@@ -23,6 +24,8 @@ from typing import List, Optional, Sequence
 
 
 FULL_LOCKSET_REQUIRED_FREE_BYTES = 48 * 1024 * 1024 * 1024
+FULL_PHASE2_P95_TARGET_MS = 1000
+FULL_PHASE2_P95_AROUND_MAX_MS = 1500
 
 
 @dataclasses.dataclass(frozen=True)
@@ -56,8 +59,17 @@ class Nfr2Paths:
         return self.work_dir / "reports"
 
     @property
+    def socket_dir(self) -> Path:
+        digest = hashlib.sha1(str(self.work_dir).encode("utf-8")).hexdigest()[:16]
+        return Path("/tmp") / f"mysql-nfr2-{digest}"
+
+    @property
     def socket(self) -> Path:
-        return self.run_dir / "mysql.sock"
+        return self.socket_dir / "mysql.sock"
+
+    @property
+    def mysqlx_socket(self) -> Path:
+        return self.socket_dir / "mysqlx.sock"
 
     @property
     def pid_file(self) -> Path:
@@ -136,10 +148,10 @@ def render_my_cnf(paths: Nfr2Paths, options: ServerOptions) -> str:
         f"log-error={paths.error_log}",
         "log-error-verbosity=3",
         "skip-networking",
-        "skip-log-bin",
+        f"log-bin={paths.run_dir / 'mysql-bin'}",
         "server-id=1",
         "loose-mysqlx=0",
-        f"loose-mysqlx-socket={paths.run_dir / 'mysqlx.sock'}",
+        f"loose-mysqlx-socket={paths.mysqlx_socket}",
         "loose-mysqlx-port=0",
         f"plugin-dir={paths.plugin_dir}",
         f"lc-messages-dir={paths.messages_dir}",
@@ -188,6 +200,7 @@ def write_config(paths: Nfr2Paths, options: ServerOptions) -> None:
         paths.work_dir,
         paths.datadir,
         paths.run_dir,
+        paths.socket_dir,
         paths.tmp_dir,
         paths.reports_dir,
         paths.work_dir / "secure-file-priv",
@@ -388,7 +401,12 @@ def build_business_smoke_command(
 
 
 def build_full_benchmark_command(
-    paths: Nfr2Paths, output: Path, warmcopy_only: bool = False
+    paths: Nfr2Paths,
+    output: Path,
+    warmcopy_only: bool = False,
+    preserve_parallel_preserve_threads: int = 0,
+    preserve_lock_warmcopy_seal_threads: int = 0,
+    phase2_p95_max_ms: int = FULL_PHASE2_P95_AROUND_MAX_MS,
 ) -> List[str]:
     command = [
         sys.executable,
@@ -417,10 +435,28 @@ def build_full_benchmark_command(
             str(paths.pid_file),
             "--restart-command",
             restart_command(paths),
+            "--require-phase2-p95-under-ms",
+            str(phase2_p95_max_ms),
+            "--require-no-warmcopy-fallback",
+            "--require-phase2-slo-guaranteed",
         ]
     )
     if not warmcopy_only:
         command.append("--require-phase2-p95-below-baseline")
+    if preserve_parallel_preserve_threads > 0:
+        command.extend(
+            [
+                "--preserve-parallel-preserve-threads",
+                str(preserve_parallel_preserve_threads),
+            ]
+        )
+    if preserve_lock_warmcopy_seal_threads > 0:
+        command.extend(
+            [
+                "--preserve-lock-warmcopy-seal-threads",
+                str(preserve_lock_warmcopy_seal_threads),
+            ]
+        )
     command.extend(["--output", str(output)])
     return command
 
@@ -436,18 +472,28 @@ def build_scaled_benchmark_command(
     cycles: int,
     drain_interval_s: float,
     preserve_timeout_s: int,
+    warmcopy_only: bool = False,
+    preserve_parallel_preserve_threads: int = 0,
+    preserve_lock_warmcopy_seal_threads: int = 0,
 ) -> List[str]:
-    return [
+    command = [
         sys.executable,
         str(paths.repo_root / "scripts" / "resumable_trx_nfr2_benchmark.py"),
         "--unix-socket",
         str(paths.socket),
         "--user",
         "root",
-        "--scenario",
-        "scaled-live-lockset",
-        "--scenario",
-        "scaled-lock-warmcopy-lockset",
+    ]
+    if not warmcopy_only:
+        command.extend(["--scenario", "scaled-live-lockset"])
+    command.extend(
+        [
+            "--scenario",
+            "scaled-lock-warmcopy-lockset",
+        ]
+    )
+    command.extend(
+        [
         "--sessions",
         str(sessions),
         "--table-count",
@@ -470,10 +516,27 @@ def build_scaled_benchmark_command(
         str(paths.pid_file),
         "--restart-command",
         restart_command(paths),
-        "--require-phase2-p95-below-baseline",
         "--output",
         str(output),
-    ]
+        ]
+    )
+    if not warmcopy_only:
+        command.append("--require-phase2-p95-below-baseline")
+    if preserve_parallel_preserve_threads > 0:
+        command.extend(
+            [
+                "--preserve-parallel-preserve-threads",
+                str(preserve_parallel_preserve_threads),
+            ]
+        )
+    if preserve_lock_warmcopy_seal_threads > 0:
+        command.extend(
+            [
+                "--preserve-lock-warmcopy-seal-threads",
+                str(preserve_lock_warmcopy_seal_threads),
+            ]
+        )
+    return command
 
 
 def run_command(command: Sequence[str]) -> None:
@@ -497,6 +560,19 @@ def add_scaled_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--drain-interval", type=float, default=0.1)
     parser.add_argument("--preserve-timeout", type=int, default=300)
     parser.add_argument("--output", type=Path)
+
+
+def add_full_phase2_gate_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--phase2-p95-max-ms",
+        type=int,
+        default=FULL_PHASE2_P95_AROUND_MAX_MS,
+        help=(
+            "full workload release tolerance for the around-1s phase2 p95 "
+            f"goal; default {FULL_PHASE2_P95_AROUND_MAX_MS}ms, target "
+            f"{FULL_PHASE2_P95_TARGET_MS}ms"
+        ),
+    )
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -550,10 +626,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="JSON report path; defaults under the NFR2 work directory",
     )
     full_parser.add_argument("--warmcopy-only", action="store_true")
+    full_parser.add_argument("--preserve-parallel-preserve-threads", type=int, default=0)
+    full_parser.add_argument("--preserve-lock-warmcopy-seal-threads", type=int, default=0)
+    add_full_phase2_gate_arg(full_parser)
 
     scaled_parser = subparsers.add_parser("scaled-command")
     add_common_args(scaled_parser)
     add_scaled_args(scaled_parser)
+    scaled_parser.add_argument("--warmcopy-only", action="store_true")
+    scaled_parser.add_argument("--preserve-parallel-preserve-threads", type=int, default=0)
+    scaled_parser.add_argument("--preserve-lock-warmcopy-seal-threads", type=int, default=0)
 
     run_full_parser = subparsers.add_parser("run-full")
     add_common_args(run_full_parser)
@@ -563,6 +645,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     run_full_parser.add_argument("--shutdown-timeout", type=float, default=120.0)
     run_full_parser.add_argument("--output", type=Path)
     run_full_parser.add_argument("--warmcopy-only", action="store_true")
+    run_full_parser.add_argument("--preserve-parallel-preserve-threads", type=int, default=0)
+    run_full_parser.add_argument("--preserve-lock-warmcopy-seal-threads", type=int, default=0)
+    add_full_phase2_gate_arg(run_full_parser)
 
     run_scaled_parser = subparsers.add_parser("run-scaled")
     add_common_args(run_scaled_parser)
@@ -571,6 +656,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     run_scaled_parser.add_argument("--startup-timeout", type=float, default=120.0)
     run_scaled_parser.add_argument("--shutdown-timeout", type=float, default=120.0)
     add_scaled_args(run_scaled_parser)
+    run_scaled_parser.add_argument("--warmcopy-only", action="store_true")
+    run_scaled_parser.add_argument("--preserve-parallel-preserve-threads", type=int, default=0)
+    run_scaled_parser.add_argument("--preserve-lock-warmcopy-seal-threads", type=int, default=0)
     return parser.parse_args(argv)
 
 
@@ -623,7 +711,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "full-command":
         output = args.output or (paths.reports_dir / "large-lockset-full.json")
         print(shell_join(build_full_benchmark_command(
-            paths, output, warmcopy_only=args.warmcopy_only)))
+            paths,
+            output,
+            warmcopy_only=args.warmcopy_only,
+            preserve_parallel_preserve_threads=args.preserve_parallel_preserve_threads,
+            preserve_lock_warmcopy_seal_threads=args.preserve_lock_warmcopy_seal_threads,
+            phase2_p95_max_ms=args.phase2_p95_max_ms,
+        )))
         return 0
     if args.command == "scaled-command":
         output = args.output or (paths.reports_dir / "large-lockset-scaled.json")
@@ -640,6 +734,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     cycles=args.cycles,
                     drain_interval_s=args.drain_interval,
                     preserve_timeout_s=args.preserve_timeout,
+                    warmcopy_only=args.warmcopy_only,
+                    preserve_parallel_preserve_threads=args.preserve_parallel_preserve_threads,
+                    preserve_lock_warmcopy_seal_threads=args.preserve_lock_warmcopy_seal_threads,
                 )
             )
         )
@@ -651,7 +748,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         start_server(paths, args.startup_timeout)
         try:
             run_command(build_full_benchmark_command(
-                paths, output, warmcopy_only=args.warmcopy_only))
+                paths,
+                output,
+                warmcopy_only=args.warmcopy_only,
+                preserve_parallel_preserve_threads=args.preserve_parallel_preserve_threads,
+                preserve_lock_warmcopy_seal_threads=args.preserve_lock_warmcopy_seal_threads,
+                phase2_p95_max_ms=args.phase2_p95_max_ms,
+            ))
         finally:
             if args.stop_after:
                 stop_server(paths, args.shutdown_timeout)
@@ -673,6 +776,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     cycles=args.cycles,
                     drain_interval_s=args.drain_interval,
                     preserve_timeout_s=args.preserve_timeout,
+                    warmcopy_only=args.warmcopy_only,
+                    preserve_parallel_preserve_threads=args.preserve_parallel_preserve_threads,
+                    preserve_lock_warmcopy_seal_threads=args.preserve_lock_warmcopy_seal_threads,
                 )
             )
         finally:

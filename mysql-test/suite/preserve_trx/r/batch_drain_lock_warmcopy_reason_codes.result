@@ -30,7 +30,7 @@ WHERE VARIABLE_NAME IN (
 ORDER BY VARIABLE_NAME;
 VARIABLE_NAME	positive
 Preserve_trx_lock_warmcopy_attempts	1
-Preserve_trx_lock_warmcopy_dirty_shards	0
+Preserve_trx_lock_warmcopy_dirty_shards	1
 Preserve_trx_lock_warmcopy_journal_bytes	0
 Preserve_trx_lock_warmcopy_phase2_pause_us	1
 Preserve_trx_lock_warmcopy_resource_limit	1

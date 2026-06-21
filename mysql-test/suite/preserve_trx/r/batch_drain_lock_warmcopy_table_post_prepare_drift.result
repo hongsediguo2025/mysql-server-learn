@@ -13,18 +13,15 @@ START TRANSACTION;
 UPDATE t_lock_warmcopy_table_drift SET v=11 WHERE id=1;
 SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_table_post_prepare_drift";
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
-include/assert_grep.inc [table post-prepare drift falls back to live table export]
-SELECT COUNT(*) AS preserved_count_after_table_drift_fallback
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug="-d,preserve_trx_lock_warmcopy_simulate_table_post_prepare_drift";
+include/assert_grep.inc [table post-prepare drift rejects partial-family fallback]
+SELECT COUNT(*) AS preserved_count_after_table_drift_reject
 FROM performance_schema.preserved_transactions;
-preserved_count_after_table_drift_fallback
-1
-RESUME PRESERVED TRANSACTION 'TOKEN';
-COMMIT;
-SELECT COUNT(*) AS preserved_count_after_table_drift_resume
-FROM performance_schema.preserved_transactions;
-preserved_count_after_table_drift_resume
+preserved_count_after_table_drift_reject
 0
+ROLLBACK;
 SELECT id, v FROM t_lock_warmcopy_table_drift ORDER BY id;
 id	v
-1	11
+1	10
 DROP TABLE t_lock_warmcopy_table_drift;

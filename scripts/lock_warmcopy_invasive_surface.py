@@ -58,6 +58,35 @@ BUILD_INTEGRATION_POINTS = {
     "unittest/gunit/innodb/CMakeLists.txt",
 }
 
+ARTIFACT_SUPPORT_INTEGRATION_POINTS = {
+    "sql/binlog.cc": (
+        "external artifact prebuilt binlog warmcopy descriptor handoff only; "
+        "no binlog execution semantics"
+    ),
+    "sql/preserve_trx_bundle.cc": (
+        "external artifact descriptor encode/decode only; preserve semantics "
+        "must stay in lock warmcopy or bundle validators"
+    ),
+    "sql/preserve_trx_bundle.h": (
+        "external artifact descriptor declarations only"
+    ),
+    "sql/preserve_trx_carrier.cc": (
+        "external artifact carrier handoff only; no preserve policy"
+    ),
+    "sql/preserve_trx_carrier.h": (
+        "external artifact carrier declarations/options/statistics only"
+    ),
+    "sql/preserve_trx_carrier_file.cc": (
+        "external artifact file lifecycle only; no lock semantics"
+    ),
+    "sql/preserve_trx_carrier_file.h": (
+        "external artifact file carrier declarations/options only"
+    ),
+    "sql/preserve_trx_drain.h": (
+        "external artifact/phase2 observation fields only"
+    ),
+}
+
 HIGH_RISK_CORE_HOT_PATHS = {
     "storage/innobase/lock/lock0lock.cc": (
         "record-lock hot path; require epoch/sysvar guard, disabled-path no "
@@ -159,6 +188,15 @@ def classify_path(path: str, state: str) -> SurfaceFinding:
             "necessary_integration_point",
             "medium",
             NECESSARY_INTEGRATION_POINTS[path],
+        )
+
+    if path in ARTIFACT_SUPPORT_INTEGRATION_POINTS:
+        return SurfaceFinding(
+            path,
+            state,
+            "artifact_support_integration_point",
+            "medium",
+            ARTIFACT_SUPPORT_INTEGRATION_POINTS[path],
         )
 
     if path in HIGH_RISK_CORE_HOT_PATHS:

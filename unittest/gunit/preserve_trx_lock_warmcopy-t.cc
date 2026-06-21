@@ -108,6 +108,13 @@ void create_file_with_payload_for_test(const std::string &path,
   ASSERT_EQ(0, my_close(file, MYF(0))) << path;
 }
 
+std::string unique_dir_for_test(const std::string &prefix) {
+  static uint64_t counter = 0;
+  return join_path_for_test(mysql_tmpdir,
+                            prefix + "-" + std::to_string(getpid()) + "-" +
+                                std::to_string(++counter));
+}
+
 std::string make_heap_offsets(uint32_t heap_no) {
   std::string offsets;
   append_u32(&offsets, heap_no * 10);
@@ -252,8 +259,11 @@ TEST(PreserveTrxLockWarmcopyDrainParticipant,
   EXPECT_FALSE(observation.owns_artifact);
   EXPECT_EQ(268435456ULL, observation.bytes_budget);
   EXPECT_EQ(0ULL, observation.bytes_used);
+  EXPECT_TRUE(observation.phase2_slo_guaranteed);
+  EXPECT_EQ(0ULL, observation.phase2_slo_not_guaranteed_target_count);
   EXPECT_EQ(0U, observation.phase1_progress);
   EXPECT_TRUE(observation.failure_reason.empty());
+  EXPECT_TRUE(observation.phase2_slo_reason.empty());
 
   EXPECT_TRUE(participant.open_phase1());
   EXPECT_TRUE(lock_warmcopy_hooks_enabled());
@@ -324,6 +334,9 @@ TEST(PreserveTrxLockWarmcopyDrainParticipant,
       participant.observation();
   EXPECT_TRUE(observation.owns_artifact);
   EXPECT_GT(observation.bytes_used, 0ULL);
+  EXPECT_EQ(1ULL, observation.phase2_record_lock_count);
+  EXPECT_EQ(0ULL, observation.phase2_table_lock_count);
+  EXPECT_EQ(0ULL, observation.phase2_mdl_descriptor_count);
 }
 
 TEST(PreserveTrxLockWarmcopyDrainParticipant,
@@ -380,6 +393,320 @@ TEST(PreserveTrxLockWarmcopyDrainParticipant,
   EXPECT_EQ(sealed_store_payload, artifact->record_locks_payload);
   EXPECT_EQ(2U, artifact->record_lock_count);
   EXPECT_EQ(2U, artifact->record_predicate_table_lock_count);
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     Phase1RecordSeedSurvivesQuiescedPrepareAndFeedsSeal) {
+  lock_warmcopy_reset_for_unit_test();
+  const std::string phase1_payload = make_record_payload(
+      {make_record_entry(100, 200, 11, 2, 'p')});
+
+  Preserve_trx_lock_warmcopy_drain_participant participant(
+      preserve_trx_lock_warmcopy_current_options());
+  ASSERT_TRUE(participant.open_phase1());
+  ASSERT_TRUE(participant.prepare_phase1_record_payload_for_thread_for_unit_test(
+      42, phase1_payload));
+
+  ASSERT_TRUE(participant.prepare_quiesced_targets_for_unit_test({42}));
+  ASSERT_TRUE(participant.close_phase1());
+  ASSERT_TRUE(participant.phase2_preflight(
+      Preserve_trx_drain_phase_mode::TWO_PHASE));
+
+  const Preserve_trx_lock_warmcopy_artifact *artifact =
+      participant.artifact_for_thread(42);
+  ASSERT_NE(nullptr, artifact);
+  EXPECT_TRUE(artifact->valid);
+  EXPECT_EQ(Preserve_trx_lock_warmcopy_reason::OK, artifact->reason);
+  const Preserve_trx_lock_warmcopy_canonical_compare_result compare =
+      preserve_trx_lock_warmcopy_compare_record_payloads_canonical(
+          phase1_payload, artifact->record_locks_payload);
+  EXPECT_TRUE(compare.equivalent) << compare.difference;
+  EXPECT_EQ(1U, artifact->record_lock_count);
+
+  const Preserve_trx_drain_participant_observation observation =
+      participant.observation();
+  EXPECT_EQ(0ULL, observation.phase1_record_prebuilt_target_count);
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     Phase1RecordSeedCanSealAsPrebuiltBlobWithoutPhase2Payload) {
+  lock_warmcopy_reset_for_unit_test();
+  const std::string phase1_payload = make_record_payload(
+      {make_record_entry(100, 200, 11, 2, 'p')});
+
+  Preserve_trx_lock_warmcopy_options options =
+      preserve_trx_lock_warmcopy_current_options();
+  options.preserve_dir =
+      unique_dir_for_test("preserve-lock-warmcopy-prebuilt-record");
+  Preserve_trx_lock_warmcopy_drain_participant participant(options);
+
+  ASSERT_TRUE(participant.open_phase1());
+  ASSERT_TRUE(participant.prepare_phase1_record_payload_for_thread_for_unit_test(
+      42, phase1_payload));
+
+  ASSERT_TRUE(participant.prepare_quiesced_targets_for_unit_test({42}));
+  ASSERT_TRUE(participant.close_phase1());
+  ASSERT_TRUE(participant.phase2_preflight(
+      Preserve_trx_drain_phase_mode::TWO_PHASE));
+
+  const Preserve_trx_lock_warmcopy_artifact *artifact =
+      participant.artifact_for_thread(42);
+  ASSERT_NE(nullptr, artifact);
+  EXPECT_TRUE(artifact->valid);
+  EXPECT_EQ(Preserve_trx_lock_warmcopy_reason::OK, artifact->reason);
+  EXPECT_TRUE(artifact->record_locks_payload.empty());
+  EXPECT_TRUE(artifact->has_prebuilt_record_locks_blob);
+  EXPECT_EQ(kPreservedTrxBlobRecordLocks,
+            artifact->prebuilt_record_locks_blob.name);
+  EXPECT_EQ(phase1_payload.size(), artifact->prebuilt_record_locks_blob.size);
+  EXPECT_FALSE(artifact->prebuilt_record_locks_blob.warmcopy_id.empty());
+  EXPECT_EQ(1U, artifact->record_lock_count);
+
+  const Preserve_trx_drain_participant_observation observation =
+      participant.observation();
+  EXPECT_EQ(1ULL, observation.phase1_record_prebuilt_target_count);
+  EXPECT_EQ(0ULL, observation.materialized_lock_payload_bytes_in_phase2);
+  EXPECT_EQ(1ULL, observation.phase2_record_prebuilt_target_count);
+  EXPECT_EQ(0ULL, observation.phase2_record_materialized_target_count);
+  EXPECT_EQ(0ULL, observation.phase2_table_live_export_target_count);
+  EXPECT_EQ(0ULL, observation.phase2_mdl_live_export_target_count);
+  EXPECT_TRUE(observation.phase2_slo_guaranteed);
+  EXPECT_EQ(0ULL, observation.phase2_slo_not_guaranteed_target_count);
+  EXPECT_TRUE(observation.phase2_slo_reason.empty());
+  participant.finalize_phase();
+  (void)rmdir(options.preserve_dir.c_str());
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     Phase2SloBlockerObservationCountsNonRecordLiveExportTargets) {
+  lock_warmcopy_reset_for_unit_test();
+  const std::string phase1_payload = make_record_payload(
+      {make_record_entry(100, 200, 11, 2, 'p')});
+
+  Preserve_trx_lock_warmcopy_options options =
+      preserve_trx_lock_warmcopy_current_options();
+  options.preserve_dir =
+      unique_dir_for_test("preserve-lock-warmcopy-non-record-blockers");
+  Preserve_trx_lock_warmcopy_drain_participant participant(options);
+
+  ASSERT_TRUE(participant.open_phase1());
+  ASSERT_TRUE(participant.prepare_phase1_record_payload_for_thread_for_unit_test(
+      42, phase1_payload));
+  ASSERT_TRUE(participant.prepare_phase1_record_payload_for_thread_for_unit_test(
+      43, phase1_payload));
+  ASSERT_TRUE(participant.prepare_quiesced_targets_for_unit_test({42, 43}));
+  participant.set_table_locks_for_thread_for_unit_test(
+      42, make_table_payload({make_table_entry(301, 16)}), 1, false);
+  participant.set_mdl_descriptors_for_thread_for_unit_test(
+      43,
+      make_mdl_payload({make_mdl_entry(MDL_key::TABLE, MDL_SHARED_WRITE, "db",
+                                       "t1", 1)}),
+      1);
+
+  ASSERT_TRUE(participant.close_phase1());
+  ASSERT_TRUE(participant.phase2_preflight(
+      Preserve_trx_drain_phase_mode::TWO_PHASE));
+
+  const Preserve_trx_drain_participant_observation observation =
+      participant.observation();
+  EXPECT_EQ(1ULL, observation.phase2_table_live_export_target_count);
+  EXPECT_EQ(1ULL, observation.phase2_mdl_live_export_target_count);
+  EXPECT_FALSE(observation.phase2_slo_guaranteed);
+  EXPECT_EQ(2ULL, observation.phase2_slo_not_guaranteed_target_count);
+  EXPECT_STREQ("table_mdl_live_export",
+               observation.phase2_slo_reason.c_str());
+
+  participant.finalize_phase();
+  (void)rmdir(options.preserve_dir.c_str());
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     Phase1NonRecordFingerprintsAvoidLiveExportSloBlocker) {
+  lock_warmcopy_reset_for_unit_test();
+  const std::string phase1_payload = make_record_payload(
+      {make_record_entry(100, 200, 11, 2, 'p')});
+  const std::string table_payload =
+      make_table_payload({make_table_entry(301, 1)});
+  const std::string mdl_payload =
+      make_mdl_payload({make_mdl_entry(MDL_key::TABLE, MDL_SHARED_WRITE, "db",
+                                       "t1", 1)});
+
+  Preserve_trx_lock_warmcopy_options options =
+      preserve_trx_lock_warmcopy_current_options();
+  options.preserve_dir =
+      unique_dir_for_test("preserve-lock-warmcopy-non-record-fingerprint");
+  Preserve_trx_lock_warmcopy_drain_participant participant(options);
+
+  ASSERT_TRUE(participant.open_phase1());
+  ASSERT_TRUE(participant.prepare_phase1_record_payload_for_thread_for_unit_test(
+      42, phase1_payload));
+  participant.prepare_phase1_non_record_payloads_for_thread_for_unit_test(
+      42, table_payload, 1, false, mdl_payload, 1);
+  ASSERT_TRUE(participant.prepare_quiesced_targets_for_unit_test({42}));
+  participant.set_table_locks_for_thread_for_unit_test(42, table_payload, 1,
+                                                       false);
+  participant.set_mdl_descriptors_for_thread_for_unit_test(42, mdl_payload, 1);
+
+  ASSERT_TRUE(participant.close_phase1());
+  ASSERT_TRUE(participant.phase2_preflight(
+      Preserve_trx_drain_phase_mode::TWO_PHASE));
+
+  const Preserve_trx_drain_participant_observation observation =
+      participant.observation();
+  EXPECT_EQ(1ULL, observation.phase2_table_lock_count);
+  EXPECT_EQ(1ULL, observation.phase2_mdl_descriptor_count);
+  EXPECT_EQ(0ULL, observation.phase2_table_live_export_target_count);
+  EXPECT_EQ(0ULL, observation.phase2_mdl_live_export_target_count);
+  EXPECT_TRUE(observation.phase2_slo_guaranteed);
+  EXPECT_EQ(0ULL, observation.phase2_slo_not_guaranteed_target_count);
+  EXPECT_TRUE(observation.phase2_slo_reason.empty());
+
+  participant.finalize_phase();
+  (void)rmdir(options.preserve_dir.c_str());
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     Phase1HookBuiltRecordStoreCanBePrebuiltBeforeQuiesce) {
+  lock_warmcopy_reset_for_unit_test();
+  lock_warmcopy_record_shard_key_t key;
+  key.table_id = 100;
+  key.index_id = 200;
+  key.space_id = 7;
+  key.page_no = 11;
+  key.lock_type_mode = 3;
+  key.n_bits = 8;
+  lock_warmcopy_record_image_digest_t digest;
+  digest.bytes[0] = 0xa7;
+
+  Preserve_trx_lock_warmcopy_options options =
+      preserve_trx_lock_warmcopy_current_options();
+  options.preserve_dir =
+      unique_dir_for_test("preserve-lock-warmcopy-hook-prebuilt-record");
+  Preserve_trx_lock_warmcopy_drain_participant participant(options);
+
+  ASSERT_TRUE(participant.open_phase1());
+  ASSERT_TRUE(
+      lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
+          42, key, 2, digest, 20, make_record_image('h')));
+  ASSERT_TRUE(participant.prepare_phase1_record_store_targets());
+  {
+    const Preserve_trx_drain_participant_observation observation =
+        participant.observation();
+    EXPECT_EQ(1ULL, observation.phase1_record_prebuilt_target_count);
+  }
+
+  ASSERT_TRUE(participant.prepare_quiesced_targets_for_unit_test({42}));
+  ASSERT_TRUE(participant.close_phase1());
+  ASSERT_TRUE(participant.phase2_preflight(
+      Preserve_trx_drain_phase_mode::TWO_PHASE));
+
+  const Preserve_trx_lock_warmcopy_artifact *artifact =
+      participant.artifact_for_thread(42);
+  ASSERT_NE(nullptr, artifact);
+  EXPECT_TRUE(artifact->valid);
+  EXPECT_TRUE(artifact->record_locks_payload.empty());
+  EXPECT_TRUE(artifact->has_prebuilt_record_locks_blob);
+  EXPECT_EQ(1U, artifact->record_lock_count);
+
+  const Preserve_trx_drain_participant_observation observation =
+      participant.observation();
+  EXPECT_EQ(1ULL, observation.phase1_record_prebuilt_target_count);
+  EXPECT_EQ(0ULL, observation.materialized_lock_payload_bytes_in_phase2);
+  EXPECT_EQ(1ULL, observation.phase2_record_prebuilt_target_count);
+  EXPECT_EQ(0ULL, observation.phase2_record_materialized_target_count);
+  participant.finalize_phase();
+  (void)rmdir(options.preserve_dir.c_str());
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     Phase1PrebuiltRecordBlobIsNotUsedAfterStoreDelta) {
+  lock_warmcopy_reset_for_unit_test();
+  const std::string phase1_payload = make_record_payload(
+      {make_record_entry(100, 200, 11, 2, 'p')});
+  const std::string final_payload = make_record_payload(
+      {make_record_entry(100, 200, 11, 4, 'q')});
+
+  Preserve_trx_lock_warmcopy_options options =
+      preserve_trx_lock_warmcopy_current_options();
+  options.preserve_dir =
+      unique_dir_for_test("preserve-lock-warmcopy-stale-prebuilt-record");
+  Preserve_trx_lock_warmcopy_drain_participant participant(options);
+
+  ASSERT_TRUE(participant.open_phase1());
+  ASSERT_TRUE(participant.prepare_phase1_record_payload_for_thread_for_unit_test(
+      42, phase1_payload));
+
+  lock_warmcopy_record_shard_key_t key;
+  key.table_id = 100;
+  key.index_id = 200;
+  key.space_id = 7;
+  key.page_no = 11;
+  key.lock_type_mode = 3;
+  key.n_bits = 8;
+  lock_warmcopy_record_image_digest_t digest;
+  digest.bytes[0] = 0xd4;
+  ASSERT_TRUE(lock_warmcopy_record_journal_upsert_for_target_for_unit_test(
+      42, 1, key, 4, digest, 40, make_record_image('q')));
+  ASSERT_TRUE(lock_warmcopy_record_journal_delete_for_target_for_unit_test(
+      42, 2, key, 2));
+
+  ASSERT_TRUE(participant.prepare_quiesced_targets_for_unit_test({42}));
+  ASSERT_TRUE(participant.close_phase1());
+  ASSERT_TRUE(participant.phase2_preflight(
+      Preserve_trx_drain_phase_mode::TWO_PHASE));
+
+  const Preserve_trx_lock_warmcopy_artifact *artifact =
+      participant.artifact_for_thread(42);
+  ASSERT_NE(nullptr, artifact);
+  EXPECT_TRUE(artifact->valid);
+  EXPECT_FALSE(artifact->has_prebuilt_record_locks_blob);
+  EXPECT_FALSE(artifact->record_locks_payload.empty());
+  const Preserve_trx_lock_warmcopy_canonical_compare_result compare =
+      preserve_trx_lock_warmcopy_compare_record_payloads_canonical(
+          final_payload, artifact->record_locks_payload);
+  EXPECT_TRUE(compare.equivalent) << compare.difference;
+  EXPECT_EQ(1U, artifact->record_lock_count);
+
+  const Preserve_trx_drain_participant_observation observation =
+      participant.observation();
+  EXPECT_GT(observation.materialized_lock_payload_bytes_in_phase2, 0ULL);
+  EXPECT_EQ(0ULL, observation.phase2_record_prebuilt_target_count);
+  EXPECT_EQ(1ULL, observation.phase2_record_materialized_target_count);
+  EXPECT_FALSE(observation.phase2_slo_guaranteed);
+  participant.finalize_phase();
+  (void)rmdir(options.preserve_dir.c_str());
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     Phase1RecordSeedForNonFinalTargetIsCleared) {
+  lock_warmcopy_reset_for_unit_test();
+  const std::string phase1_payload = make_record_payload(
+      {make_record_entry(100, 200, 11, 2, 'p')});
+
+  Preserve_trx_lock_warmcopy_drain_participant participant(
+      preserve_trx_lock_warmcopy_current_options());
+  ASSERT_TRUE(participant.open_phase1());
+  ASSERT_TRUE(participant.prepare_phase1_record_payload_for_thread_for_unit_test(
+      42, phase1_payload));
+
+  ASSERT_TRUE(participant.prepare_quiesced_targets_for_unit_test({43}));
+  ASSERT_TRUE(participant.close_phase1());
+  ASSERT_TRUE(participant.phase2_preflight(
+      Preserve_trx_drain_phase_mode::TWO_PHASE));
+
+  EXPECT_EQ(nullptr, participant.artifact_for_thread(42));
+  const Preserve_trx_lock_warmcopy_artifact *artifact =
+      participant.artifact_for_thread(43);
+  ASSERT_NE(nullptr, artifact);
+  EXPECT_TRUE(artifact->valid);
+  EXPECT_TRUE(artifact->record_locks_payload.empty());
+
+  std::string stale_payload;
+  uint32_t stale_count = 999;
+  ASSERT_TRUE(lock_warmcopy_record_store_export_record_payload_for_target(
+      42, &stale_payload, &stale_count));
+  EXPECT_TRUE(stale_payload.empty());
+  EXPECT_EQ(0U, stale_count);
 }
 
 TEST(PreserveTrxLockWarmcopyDrainParticipant,
@@ -510,8 +837,10 @@ TEST(PreserveTrxLockWarmcopyDrainParticipant,
       lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
           43, key_b, 4, digest_b, 40, make_record_image('b')));
 
-  Preserve_trx_lock_warmcopy_drain_participant participant(
-      preserve_trx_lock_warmcopy_current_options());
+  Preserve_trx_lock_warmcopy_options options =
+      preserve_trx_lock_warmcopy_current_options();
+  options.seal_threads = 2;
+  Preserve_trx_lock_warmcopy_drain_participant participant(options);
   EXPECT_TRUE(participant.open_phase1());
   ASSERT_TRUE(participant.prepare_quiesced_targets_for_unit_test({42, 43}));
   EXPECT_TRUE(participant.close_phase1());
@@ -553,6 +882,7 @@ TEST(PreserveTrxLockWarmcopyDrainParticipant,
       participant.observation();
   EXPECT_TRUE(observation.owns_artifact);
   EXPECT_GT(observation.bytes_used, 0ULL);
+  EXPECT_EQ(2U, observation.phase2_seal_worker_count);
   EXPECT_TRUE(observation.failure_reason.empty());
 }
 
@@ -1637,6 +1967,55 @@ TEST(PreserveTrxLockWarmcopyCanonicalPayload,
 
   EXPECT_FALSE(result.equivalent);
   EXPECT_NE(std::string::npos, result.difference.find("parse_failed"));
+}
+
+TEST(PreserveTrxLockWarmcopyFinalFence,
+     FrozenFenceIgnoresFreezeGenerationButRejectsLockDrift) {
+  Preserve_trx_lock_warmcopy_artifact artifact;
+  artifact.valid = true;
+  artifact.record_live_seal_fence_valid = true;
+  artifact.record_live_seal_fence.trx_locks_version = 10;
+  artifact.record_live_seal_fence.n_rec_locks = 3;
+  artifact.record_live_seal_fence.freeze_generation = 0;
+
+  lock_warmcopy_trx_lock_fence_t frozen_fence;
+  frozen_fence.trx_locks_version = 10;
+  frozen_fence.n_rec_locks = 3;
+  frozen_fence.freeze_generation = 1;
+
+  EXPECT_EQ(Preserve_trx_lock_warmcopy_reason::OK,
+            preserve_trx_lock_warmcopy_verify_record_final_fence(
+                artifact, frozen_fence));
+
+  frozen_fence.n_rec_locks = 4;
+  EXPECT_EQ(Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED,
+            preserve_trx_lock_warmcopy_verify_record_final_fence(
+                artifact, frozen_fence));
+
+  frozen_fence.n_rec_locks = 3;
+  frozen_fence.trx_locks_version = 11;
+  EXPECT_EQ(Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED,
+            preserve_trx_lock_warmcopy_verify_record_final_fence(
+                artifact, frozen_fence));
+}
+
+TEST(PreserveTrxLockWarmcopyFinalFence,
+     FrozenFenceRejectsConversionDuringFreeze) {
+  Preserve_trx_lock_warmcopy_artifact artifact;
+  artifact.valid = true;
+  artifact.record_live_seal_fence_valid = true;
+  artifact.record_live_seal_fence.trx_locks_version = 10;
+  artifact.record_live_seal_fence.n_rec_locks = 3;
+
+  lock_warmcopy_trx_lock_fence_t frozen_fence;
+  frozen_fence.trx_locks_version = 10;
+  frozen_fence.n_rec_locks = 3;
+  frozen_fence.freeze_generation = 1;
+  frozen_fence.conversion_attempt_after_freeze = true;
+
+  EXPECT_EQ(Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED,
+            preserve_trx_lock_warmcopy_verify_record_final_fence(
+                artifact, frozen_fence));
 }
 
 }  // namespace preserve_trx_lock_warmcopy_unittest

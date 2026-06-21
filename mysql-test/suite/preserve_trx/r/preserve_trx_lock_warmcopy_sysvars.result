@@ -19,6 +19,9 @@ lock_warmcopy_max_mdl_descriptors_default
 SELECT @@global.preserve_trx_lock_warmcopy_seal_threads AS lock_warmcopy_seal_threads_default;
 lock_warmcopy_seal_threads_default
 0
+SELECT @@global.preserve_trx_parallel_preserve_threads AS parallel_preserve_threads_default;
+parallel_preserve_threads_default
+0
 SELECT @@global.preserve_trx_lock_warmcopy_conversion_wait_timeout_ms AS lock_warmcopy_conversion_wait_default;
 lock_warmcopy_conversion_wait_default
 30000
@@ -29,6 +32,7 @@ SET GLOBAL preserve_trx_lock_warmcopy_max_journal_bytes=2097152;
 SET GLOBAL preserve_trx_lock_warmcopy_max_dirty_shards=7;
 SET GLOBAL preserve_trx_lock_warmcopy_max_mdl_descriptors=11;
 SET GLOBAL preserve_trx_lock_warmcopy_seal_threads=3;
+SET GLOBAL preserve_trx_parallel_preserve_threads=4;
 SET GLOBAL preserve_trx_lock_warmcopy_conversion_wait_timeout_ms=5;
 SELECT @@global.preserve_trx_lock_warmcopy_enable AS lock_warmcopy_enable_after_set;
 lock_warmcopy_enable_after_set
@@ -51,6 +55,9 @@ lock_warmcopy_max_mdl_descriptors_after_set
 SELECT @@global.preserve_trx_lock_warmcopy_seal_threads AS lock_warmcopy_seal_threads_after_set;
 lock_warmcopy_seal_threads_after_set
 3
+SELECT @@global.preserve_trx_parallel_preserve_threads AS parallel_preserve_threads_after_set;
+parallel_preserve_threads_after_set
+4
 SELECT @@global.preserve_trx_lock_warmcopy_conversion_wait_timeout_ms AS lock_warmcopy_conversion_wait_after_set;
 lock_warmcopy_conversion_wait_after_set
 5
@@ -80,7 +87,20 @@ WHERE VARIABLE_NAME IN (
 'Preserve_trx_lock_warmcopy_spill_bytes',
 'Preserve_trx_lock_warmcopy_spill_failures',
 'Preserve_trx_lock_warmcopy_strict_reject',
-'Preserve_trx_lock_warmcopy_unsupported_family')
+'Preserve_trx_lock_warmcopy_unsupported_family',
+'Preserve_trx_phase2_detach_claim_us',
+'Preserve_trx_phase2_lock_preflight_us',
+'Preserve_trx_phase2_lock_seal_us',
+'Preserve_trx_phase2_participant_close_us',
+'Preserve_trx_phase2_participant_preflight_us',
+'Preserve_trx_phase2_participant_prepare_us',
+'Preserve_trx_phase2_prepare_us',
+'Preserve_trx_phase2_register_us',
+'Preserve_trx_phase2_slo_miss_count',
+'Preserve_trx_phase2_snapshot_write_us',
+'Preserve_trx_phase2_target_preserve_us',
+'Preserve_trx_phase2_target_wait_us',
+'Preserve_trx_phase2_total_us')
 ORDER BY VARIABLE_NAME;
 VARIABLE_NAME	numeric_status
 Preserve_trx_lock_warmcopy_artifact_bytes	1
@@ -99,6 +119,19 @@ Preserve_trx_lock_warmcopy_spill_bytes	1
 Preserve_trx_lock_warmcopy_spill_failures	1
 Preserve_trx_lock_warmcopy_strict_reject	1
 Preserve_trx_lock_warmcopy_unsupported_family	1
+Preserve_trx_phase2_detach_claim_us	1
+Preserve_trx_phase2_lock_preflight_us	1
+Preserve_trx_phase2_lock_seal_us	1
+Preserve_trx_phase2_participant_close_us	1
+Preserve_trx_phase2_participant_preflight_us	1
+Preserve_trx_phase2_participant_prepare_us	1
+Preserve_trx_phase2_prepare_us	1
+Preserve_trx_phase2_register_us	1
+Preserve_trx_phase2_slo_miss_count	1
+Preserve_trx_phase2_snapshot_write_us	1
+Preserve_trx_phase2_target_preserve_us	1
+Preserve_trx_phase2_target_wait_us	1
+Preserve_trx_phase2_total_us	1
 SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=ON;
@@ -107,4 +140,5 @@ SET GLOBAL preserve_trx_lock_warmcopy_max_journal_bytes=1073741824;
 SET GLOBAL preserve_trx_lock_warmcopy_max_dirty_shards=100000;
 SET GLOBAL preserve_trx_lock_warmcopy_max_mdl_descriptors=100000;
 SET GLOBAL preserve_trx_lock_warmcopy_seal_threads=0;
+SET GLOBAL preserve_trx_parallel_preserve_threads=0;
 SET GLOBAL preserve_trx_lock_warmcopy_conversion_wait_timeout_ms=30000;

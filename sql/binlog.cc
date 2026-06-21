@@ -3530,6 +3530,7 @@ class Mysql_binlog_warmcopy_session final
     *blob = PrebuiltBinlogCacheBlob{};
     blob->warmcopy_id = m_warmcopy_id;
     blob->name = kPreservedTrxBlobBinlogCache;
+    blob->warmcopy_epoch = m_epoch;
     blob->size = current_length;
     blob->digest = digest;
     if (mysql_binlog_preserve_export_metadata_only(thd, &blob->metadata)) {
@@ -3830,6 +3831,7 @@ bool mysql_binlog_preserve_warmcopy_build_blob(
   *blob = PrebuiltBinlogCacheBlob{};
   blob->warmcopy_id = warmcopy_id;
   blob->name = kPreservedTrxBlobBinlogCache;
+  blob->warmcopy_epoch = epoch;
   blob->size = cache_length;
   blob->digest = digest;
   blob->metadata = std::move(metadata);

@@ -482,6 +482,15 @@ Preserved_trx_external_blob_descriptor descriptor_from_prebuilt_blob(
   return descriptor;
 }
 
+Preserved_trx_external_blob_descriptor descriptor_from_prebuilt_blob(
+    const PrebuiltRecordLocksBlob &blob) {
+  Preserved_trx_external_blob_descriptor descriptor;
+  descriptor.name = blob.name;
+  descriptor.size = blob.size;
+  descriptor.digest = blob.digest;
+  return descriptor;
+}
+
 std::string binlog_cache_metadata_tlv_value(
     const Preserve_snapshot_metadata &metadata,
     const Mysql_binlog_preserve_snapshot &snapshot) {
@@ -1912,6 +1921,74 @@ bool append_temp_table_manifest_tlv(const Preserve_snapshot_metadata &metadata,
   return false;
 }
 
+Preserve_snapshot_status externalize_record_locks_payload_if_requested(
+    const Preserved_trx_bundle_build_input &input,
+    Preserved_trx_bundle *built) {
+  if (!input.externalize_record_locks_payload ||
+      input.metadata.record_locks_payload.empty() || built == nullptr) {
+    return Preserve_snapshot_status::OK;
+  }
+  if (input.metadata.record_locks_payload.length() >
+      input.options.max_record_locks_external_blob_bytes) {
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
+
+  built->tlvs.erase(std::remove_if(built->tlvs.begin(), built->tlvs.end(),
+                                   [](const Preserve_snapshot_tlv &tlv) {
+                                     return tlv.tag == kTlvRecordLocks;
+                                   }),
+                    built->tlvs.end());
+
+  Preserved_trx_external_blob blob;
+  blob.name = kPreservedTrxBlobRecordLocks;
+  blob.payload = input.metadata.record_locks_payload;
+  built->blob_descriptors.push_back(
+      descriptor_from_payload(blob.name, blob.payload));
+  built->external_blobs.push_back(std::move(blob));
+  built->metadata.record_locks_payload.clear();
+  return Preserve_snapshot_status::OK;
+}
+
+Preserve_snapshot_status attach_prebuilt_record_locks_blob_if_requested(
+    const Preserved_trx_bundle_build_input &input,
+    Preserved_trx_bundle *built) {
+  if (input.prebuilt_record_locks_blob == nullptr) {
+    return Preserve_snapshot_status::OK;
+  }
+  if (built == nullptr || input.externalize_record_locks_payload ||
+      !input.metadata.record_locks_payload.empty()) {
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
+
+  const PrebuiltRecordLocksBlob &prebuilt =
+      *input.prebuilt_record_locks_blob;
+  if (prebuilt.name != kPreservedTrxBlobRecordLocks ||
+      prebuilt.warmcopy_id.empty() || prebuilt.size == 0 ||
+      prebuilt.size > input.options.max_record_locks_external_blob_bytes) {
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
+
+  built->tlvs.erase(std::remove_if(built->tlvs.begin(), built->tlvs.end(),
+                                   [](const Preserve_snapshot_tlv &tlv) {
+                                     return tlv.tag == kTlvRecordLocks;
+                                   }),
+                    built->tlvs.end());
+
+  const Preserved_trx_external_blob_descriptor descriptor =
+      descriptor_from_prebuilt_blob(prebuilt);
+  built->blob_descriptors.push_back(descriptor);
+
+  Preserved_trx_external_blob external_blob;
+  external_blob.name = prebuilt.name;
+  external_blob.descriptor = descriptor;
+  external_blob.prebuilt = true;
+  external_blob.warmcopy_id = prebuilt.warmcopy_id;
+  external_blob.warmcopy_epoch = prebuilt.warmcopy_epoch;
+  built->external_blobs.push_back(std::move(external_blob));
+  built->metadata.record_locks_payload.clear();
+  return Preserve_snapshot_status::OK;
+}
+
 }  // namespace
 
 Preserve_snapshot_status build_preserved_trx_bundle(
@@ -2002,6 +2079,7 @@ Preserve_snapshot_status build_preserved_trx_bundle(
     external_blob.descriptor = descriptor;
     external_blob.prebuilt = true;
     external_blob.warmcopy_id = prebuilt.warmcopy_id;
+    external_blob.warmcopy_epoch = prebuilt.warmcopy_epoch;
     built.external_blobs.push_back(std::move(external_blob));
   } else {
     if (built.metadata.binlog_state ==
@@ -2014,6 +2092,16 @@ Preserve_snapshot_status build_preserved_trx_bundle(
     }
     built.tlvs = no_cache_tlvs(built.metadata);
   }
+
+  const Preserve_snapshot_status prebuilt_record_locks_status =
+      attach_prebuilt_record_locks_blob_if_requested(input, &built);
+  if (prebuilt_record_locks_status != Preserve_snapshot_status::OK)
+    return prebuilt_record_locks_status;
+
+  const Preserve_snapshot_status record_locks_external_status =
+      externalize_record_locks_payload_if_requested(input, &built);
+  if (record_locks_external_status != Preserve_snapshot_status::OK)
+    return record_locks_external_status;
 
   if (append_temp_table_manifest_tlv(built.metadata, &built.tlvs))
     return Preserve_snapshot_status::INVALID_ARGUMENT;
@@ -2056,7 +2144,15 @@ Preserve_snapshot_status encode_preserved_trx_bundle(
       binlog_blob = &blob;
       continue;
     }
-    if (blob.prebuilt || blob.payload.empty()) {
+    if (blob.prebuilt) {
+      if (!blob.payload.empty() || blob.warmcopy_id.empty() ||
+          blob.descriptor.name != blob.name || blob.descriptor.size == 0) {
+        return Preserve_snapshot_status::INVALID_ARGUMENT;
+      }
+      extra_descriptors.push_back(blob.descriptor);
+      continue;
+    }
+    if (blob.payload.empty()) {
       return Preserve_snapshot_status::INVALID_ARGUMENT;
     }
     extra_descriptors.push_back(descriptor_from_payload(blob.name, blob.payload));

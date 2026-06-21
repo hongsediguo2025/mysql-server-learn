@@ -1409,6 +1409,17 @@ class WorkloadPlanTest(unittest.TestCase):
             on_runner.runtime.sql,
         )
 
+    def test_parallel_preserve_threads_controls_preserve_global(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(preserve_parallel_preserve_threads=32)
+        runner.runtime = _FakeRuntime()
+        runner.configure_preserve_globals()
+
+        self.assertIn(
+            "SET GLOBAL preserve_trx_parallel_preserve_threads=32",
+            runner.runtime.sql,
+        )
+
     def test_expected_state_tracks_exact_committed_fingerprints_across_all_tables(self):
         cfg = HarnessConfig(sessions=2)
         plan = WorkloadPlan(cfg)

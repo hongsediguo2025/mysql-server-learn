@@ -47,18 +47,32 @@ my %seen = (
   temp_sidecars => 0,
 );
 
-if (-d $dir) {
+sub walk_files {
+  my ($dir, $callback) = @_;
+  return unless -d $dir;
   opendir(my $dh, $dir) or die "cannot open preserve dir $dir: $!";
-  while (defined(my $name = readdir($dh))) {
-    my $path = File::Spec->catfile($dir, $name);
-    next unless -f $path;
+  my @entries = grep { $_ ne '.' && $_ ne '..' } readdir($dh);
+  closedir($dh);
+
+  for my $entry (@entries) {
+    my $path = File::Spec->catfile($dir, $entry);
+    if (-d $path) {
+      walk_files($path, $callback);
+      next;
+    }
+    $callback->($path, $entry) if -f $path;
+  }
+}
+
+if (-d $dir) {
+  walk_files($dir, sub {
+    my ($path, $name) = @_;
     $seen{bin}++ if $name eq "$token.bin";
     $seen{bin_tmp}++ if $name eq "$token.bin.tmp";
     $seen{binlog_cache}++ if $name eq "$token.binlog_cache";
     $seen{temp_sidecars}++
       if $name =~ /^\Q$token\E\.tempts\.\d+\.(?:image|undo|warm|undo\.warm)(?:\.tmp)?$/;
-  }
-  closedir($dh);
+  });
 }
 
 die "preserve dir file mismatch for token $token: " .

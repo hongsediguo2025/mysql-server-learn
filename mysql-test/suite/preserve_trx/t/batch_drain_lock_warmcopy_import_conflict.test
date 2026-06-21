@@ -49,28 +49,115 @@ DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 use strict;
 use warnings;
 use Compress::Zlib qw(crc32);
-use Digest::SHA qw(hmac_sha256);
+use Digest::SHA qw(hmac_sha256 sha256);
 use File::Spec;
+
+require File::Spec->catfile($ENV{'MYSQL_TEST_DIR'}, 'suite',
+                            'preserve_trx', 'include',
+                            'preserve_snapshot_files.pl');
 
 my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
 my $preserve_dir = File::Spec->catdir($datadir, 'preserve');
-opendir(my $dh, $preserve_dir) or die "cannot open preserve dir: $!";
-my @bins = sort grep { /\.bin$/ } readdir($dh);
-closedir($dh);
-die "expected two preserved snapshots, found " . scalar(@bins) unless @bins == 2;
+my @bin_paths = PreserveSnapshotFiles::preserve_snapshot_bin_files($preserve_dir);
+die "expected two preserved snapshots, found " . scalar(@bin_paths)
+  unless @bin_paths == 2;
 
 sub read_le16_at { return unpack('v', substr($_[0], $_[1], 2)); }
 sub read_le32_at { return unpack('V', substr($_[0], $_[1], 4)); }
 sub read_le64_at { return unpack('Q<', substr($_[0], $_[1], 8)); }
 sub write_le32_at { substr($_[0], $_[1], 4) = pack('V', $_[2]); }
+sub write_le64_at { substr($_[0], $_[1], 8) = pack('Q<', $_[2]); }
 sub le32 { return pack('V', $_[0]); }
 
 my $LOCK_MODE_MASK = 0x0f;
 my $LOCK_S = 2;
 my $LOCK_X = 3;
+
+sub mutate_record_payload {
+  my ($value_ref) = @_;
+  my $off = 0;
+  return 0 if length($$value_ref) < 4;
+  my $count = read_le32_at($$value_ref, $off); $off += 4;
+  for (my $i = 0; $i < $count; ++$i) {
+    return 0 if $off + 56 > length($$value_ref);
+    $off += 8 + 8 + 4 + 4;
+    my $type_mode_off = $off;
+    my $type_mode = read_le32_at($$value_ref, $type_mode_off);
+    $off += 4;
+    $off += 4 + 8 + 4;
+    my $heap_offsets_len = read_le32_at($$value_ref, $off); $off += 4;
+    my $record_images_len = read_le32_at($$value_ref, $off); $off += 4;
+    my $bitmap_len = read_le32_at($$value_ref, $off); $off += 4;
+    die "bad record-lock entry" if $off + $heap_offsets_len +
+                                  $record_images_len + $bitmap_len >
+                                  length($$value_ref);
+    if (($type_mode & $LOCK_MODE_MASK) == $LOCK_S) {
+      my $new_type_mode = ($type_mode & ~$LOCK_MODE_MASK) | $LOCK_X;
+      write_le32_at($$value_ref, $type_mode_off, $new_type_mode);
+      return 1;
+    }
+    $off += $heap_offsets_len + $record_images_len + $bitmap_len;
+  }
+  return 0;
+}
+
+sub resign_snapshot {
+  my ($snapshot_ref, $preserve_dir) = @_;
+  open(my $kh, '<:raw', File::Spec->catfile($preserve_dir, '.key'))
+    or die "cannot read preserve key: $!";
+  my $key = do { local $/; <$kh> };
+  close($kh);
+  $key = substr($key, -32) if length($key) == 110;
+  die "bad key length" unless length($key) == 32;
+  substr($$snapshot_ref, 516, 32) = "\0" x 32;
+  substr($$snapshot_ref, 548, 4) = "\0" x 4;
+  substr($$snapshot_ref, 516, 32) = hmac_sha256($$snapshot_ref, $key);
+  substr($$snapshot_ref, 548, 4) = le32(crc32($$snapshot_ref));
+}
+
+sub update_record_blob_descriptor {
+  my ($snapshot_ref, $header_len, $payload_len, $digest, $size) = @_;
+  my $payload = substr($$snapshot_ref, $header_len, $payload_len);
+  my $pos = 0;
+  while ($pos < length($payload)) {
+    die "bad tlv boundary" if $pos + 6 > length($payload);
+    my $tag = read_le16_at($payload, $pos);
+    my $len = read_le32_at($payload, $pos + 2);
+    my $value_pos = $pos + 6;
+    die "bad tlv length" if $value_pos + $len > length($payload);
+    if ($tag == 0x81) {
+      my $value = substr($payload, $value_pos, $len);
+      die "bad external descriptor header" if length($value) < 4;
+      my $count = read_le32_at($value, 0);
+      my $off = 4;
+      for (my $i = 0; $i < $count; ++$i) {
+        die "bad external descriptor name" if $off + 2 > length($value);
+        my $name_len = read_le16_at($value, $off); $off += 2;
+        die "bad external descriptor name length"
+          if $off + $name_len + 40 > length($value);
+        my $name = substr($value, $off, $name_len); $off += $name_len;
+        if ($name eq 'record_locks') {
+          write_le64_at($value, $off, $size);
+          substr($value, $off + 8, 32) = $digest;
+          substr($payload, $value_pos, $len) = $value;
+          substr($$snapshot_ref, $header_len, $payload_len) = $payload;
+          return 1;
+        }
+        $off += 40;
+      }
+    }
+    $pos = $value_pos + $len;
+  }
+  return 0;
+}
+
 my $mutated = 0;
-for my $bin_name (@bins) {
-  my $bin_path = File::Spec->catfile($preserve_dir, $bin_name);
+for my $bin_path (@bin_paths) {
+  my (undef, undef, $bin_name) = File::Spec->splitpath($bin_path);
+  my ($volume, $dir) = File::Spec->splitpath($bin_path);
+  my $snapshot_dir = File::Spec->catpath($volume, $dir, '');
+  my $token = $bin_name;
+  $token =~ s/\.bin\z//;
   open(my $fh, '<:raw', $bin_path) or die "cannot read $bin_path: $!";
   my $snapshot = do { local $/; <$fh> };
   close($fh);
@@ -78,6 +165,33 @@ for my $bin_name (@bins) {
   die "bad preserve magic in $bin_name" unless substr($snapshot, 0, 8) eq 'MSP_PRES';
   my $header_len = read_le16_at($snapshot, 10);
   my $payload_len = read_le64_at($snapshot, 48);
+
+  my $record_blob_path =
+      File::Spec->catfile($snapshot_dir, $token . ".blob.record_locks");
+  if (-f $record_blob_path) {
+    open(my $bfh, '<:raw', $record_blob_path)
+      or die "cannot read $record_blob_path: $!";
+    my $record_blob = do { local $/; <$bfh> };
+    close($bfh);
+    if (mutate_record_payload(\$record_blob)) {
+      my $digest = sha256($record_blob);
+      die "could not update record lock blob descriptor"
+        unless update_record_blob_descriptor(\$snapshot, $header_len,
+                                             $payload_len, $digest,
+                                             length($record_blob));
+      resign_snapshot(\$snapshot, $preserve_dir);
+      open(my $bout, '>:raw', $record_blob_path)
+        or die "cannot rewrite $record_blob_path: $!";
+      print {$bout} $record_blob;
+      close($bout);
+      open(my $out, '>:raw', $bin_path) or die "cannot rewrite $bin_path: $!";
+      print {$out} $snapshot;
+      close($out);
+      $mutated = 1;
+      last;
+    }
+  }
+
   my $payload = substr($snapshot, $header_len, $payload_len);
 
   my $pos = 0;
@@ -89,44 +203,15 @@ for my $bin_name (@bins) {
     die "bad tlv length" if $value_pos + $len > length($payload);
     if ($tag == 0x30) {
       my $value = substr($payload, $value_pos, $len);
-      my $off = 0;
-      my $count = read_le32_at($value, $off); $off += 4;
-      for (my $i = 0; $i < $count; ++$i) {
-        $off += 8 + 8 + 4 + 4;
-        my $type_mode_off = $off;
-        my $type_mode = read_le32_at($value, $type_mode_off);
-        $off += 4;
-        $off += 4 + 8 + 4;
-        my $heap_offsets_len = read_le32_at($value, $off); $off += 4;
-        my $record_images_len = read_le32_at($value, $off); $off += 4;
-        my $bitmap_len = read_le32_at($value, $off); $off += 4;
-        die "bad record-lock entry" if $off + $heap_offsets_len +
-                                      $record_images_len + $bitmap_len >
-                                      length($value);
-        if (($type_mode & $LOCK_MODE_MASK) == $LOCK_S) {
-          my $new_type_mode = ($type_mode & ~$LOCK_MODE_MASK) | $LOCK_X;
-          write_le32_at($value, $type_mode_off, $new_type_mode);
-          substr($payload, $value_pos, $len) = $value;
-          substr($snapshot, $header_len, $payload_len) = $payload;
-
-          open(my $kh, '<:raw', File::Spec->catfile($preserve_dir, '.key'))
-            or die "cannot read preserve key: $!";
-          my $key = do { local $/; <$kh> };
-          close($kh);
-          $key = substr($key, -32) if length($key) == 110;
-          die "bad key length" unless length($key) == 32;
-          substr($snapshot, 516, 32) = "\0" x 32;
-          substr($snapshot, 548, 4) = "\0" x 4;
-          substr($snapshot, 516, 32) = hmac_sha256($snapshot, $key);
-          substr($snapshot, 548, 4) = le32(crc32($snapshot));
-
-          open(my $out, '>:raw', $bin_path) or die "cannot rewrite $bin_path: $!";
-          print {$out} $snapshot;
-          close($out);
-          $mutated = 1;
-          last;
-        }
-        $off += $heap_offsets_len + $record_images_len + $bitmap_len;
+      if (mutate_record_payload(\$value)) {
+        substr($payload, $value_pos, $len) = $value;
+        substr($snapshot, $header_len, $payload_len) = $payload;
+        resign_snapshot(\$snapshot, $preserve_dir);
+        open(my $out, '>:raw', $bin_path) or die "cannot rewrite $bin_path: $!";
+        print {$out} $snapshot;
+        close($out);
+        $mutated = 1;
+        last;
       }
     }
     last if $mutated;

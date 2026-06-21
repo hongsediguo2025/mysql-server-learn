@@ -167,6 +167,8 @@ class HarnessConfig:
     preserve_materialize_timeout_ms: int = 60_000
     preserve_max_modified_tables: int = 512
     preserve_lock_warmcopy_max_journal_bytes: int = 1_073_741_824
+    preserve_lock_warmcopy_seal_threads: int = 0
+    preserve_parallel_preserve_threads: int = 0
     inflight_drain_probe: bool = False
     inflight_probe_min_waits: int = 1
     inflight_probe_timeout_s: int = 5
@@ -296,6 +298,10 @@ class HarnessConfig:
             raise ValueError(
                 "preserve_lock_warmcopy_max_journal_bytes must be positive"
             )
+        if self.preserve_lock_warmcopy_seal_threads < 0:
+            raise ValueError("preserve_lock_warmcopy_seal_threads must be non-negative")
+        if self.preserve_parallel_preserve_threads < 0:
+            raise ValueError("preserve_parallel_preserve_threads must be non-negative")
         if self.inflight_drain_probe and self.sessions < 2:
             raise ValueError("inflight_drain_probe requires at least 2 sessions")
         if self.inflight_probe_min_waits <= 0:
@@ -3131,6 +3137,16 @@ class BusinessE2ERunner:
                 f"SET GLOBAL preserve_trx_max_scan_pages={self.config.preserve_max_scan_pages}",
                 f"SET GLOBAL preserve_trx_materialize_timeout_ms={self.config.preserve_materialize_timeout_ms}",
             ]
+            if self.config.preserve_parallel_preserve_threads > 0:
+                commands.append(
+                    "SET GLOBAL preserve_trx_parallel_preserve_threads="
+                    f"{self.config.preserve_parallel_preserve_threads}"
+                )
+            if self.config.preserve_lock_warmcopy_seal_threads > 0:
+                commands.append(
+                    "SET GLOBAL preserve_trx_lock_warmcopy_seal_threads="
+                    f"{self.config.preserve_lock_warmcopy_seal_threads}"
+                )
             if self.config.temp_table_workload:
                 commands.append("SET GLOBAL preserve_trx_temp_table_enable=ON")
             if self.config.lock_warmcopy_mode == "on":
@@ -4614,6 +4630,8 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--preserve-materialize-timeout-ms", dest="preserve_materialize_timeout_ms", type=int, default=60_000, help="preserve_trx_materialize_timeout_ms for this high-cardinality E2E")
     parser.add_argument("--preserve-max-modified-tables", dest="preserve_max_modified_tables", type=int, default=512, help="preserve_trx_max_modified_tables for this high-cardinality E2E")
     parser.add_argument("--preserve-lock-warmcopy-max-journal-bytes", dest="preserve_lock_warmcopy_max_journal_bytes", type=int, default=1_073_741_824, help="preserve_trx_lock_warmcopy_max_journal_bytes for high-cardinality lock warmcopy gates")
+    parser.add_argument("--preserve-lock-warmcopy-seal-threads", dest="preserve_lock_warmcopy_seal_threads", type=int, default=0, help="preserve_trx_lock_warmcopy_seal_threads for lock warmcopy seal tuning; 0 keeps server auto")
+    parser.add_argument("--preserve-parallel-preserve-threads", dest="preserve_parallel_preserve_threads", type=int, default=0, help="preserve_trx_parallel_preserve_threads for lock warmcopy target-preserve tuning; 0 keeps server auto")
     parser.add_argument("--inflight-drain-probe", action="store_true", help="allow even-numbered workers to enter real UPDATE lock waits before each DRAIN")
     parser.add_argument("--inflight-probe-min-waits", dest="inflight_probe_min_waits", type=int, default=1, help="minimum simultaneous harness data_lock_waits required before issuing DRAIN in in-flight probe mode")
     parser.add_argument("--inflight-probe-timeout", dest="inflight_probe_timeout_s", type=int, default=5, help="innodb_lock_wait_timeout used by in-flight probe statements")
@@ -4699,6 +4717,8 @@ command is used after each DRAIN command shuts that server down.
         preserve_materialize_timeout_ms=args.preserve_materialize_timeout_ms,
         preserve_max_modified_tables=args.preserve_max_modified_tables,
         preserve_lock_warmcopy_max_journal_bytes=args.preserve_lock_warmcopy_max_journal_bytes,
+        preserve_lock_warmcopy_seal_threads=args.preserve_lock_warmcopy_seal_threads,
+        preserve_parallel_preserve_threads=args.preserve_parallel_preserve_threads,
         inflight_drain_probe=args.inflight_drain_probe,
         inflight_probe_min_waits=args.inflight_probe_min_waits,
         inflight_probe_timeout_s=args.inflight_probe_timeout_s,

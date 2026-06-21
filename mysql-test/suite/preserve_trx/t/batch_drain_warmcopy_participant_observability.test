@@ -32,7 +32,7 @@ DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 
 --let $assert_text= warmcopy participant observation is emitted by production drain
 --let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
---let $assert_select= PRESERVE: drain participant observation stage=target_preserve_failed index=0 state=ABANDONED owns_artifact=(YES|NO) bytes_used=[0-9]+ bytes_budget=[0-9]+ phase1_progress=[0-9]+ failure_reason=aborted
+--let $assert_select= PRESERVE: drain participant observation stage=target_preserve_failed index=0 state=ABANDONED owns_artifact=(YES|NO) bytes_used=[0-9]+ bytes_budget=[0-9]+ .*phase1_progress=[0-9]+ failure_reason=aborted
 --let $assert_count_condition= >= 1
 --source include/assert_grep.inc
 --let $assert_count_condition=

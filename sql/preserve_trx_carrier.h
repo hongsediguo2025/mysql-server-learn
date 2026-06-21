@@ -51,6 +51,13 @@ struct Preserved_trx_carrier_listing {
   std::set<std::string> warm_external_blob_artifacts;
 };
 
+struct Preserved_trx_carrier_token_state {
+  bool snapshot{false};
+  bool external_blob{false};
+  bool temp_sidecar{false};
+  bool tainted{false};
+};
+
 struct Preserved_trx_carrier_read_limits {
   uint64_t max_snapshot_bytes{std::numeric_limits<uint64_t>::max()};
   uint64_t max_external_blob_bytes{std::numeric_limits<uint64_t>::max()};
@@ -68,6 +75,27 @@ enum class Preserved_trx_carrier_status {
 enum class Preserved_trx_codec_context_purpose {
   READ_EXISTING,
   WRITE_NEW
+};
+
+enum class Preserve_snapshot_io_step {
+  WRITE_TEMP_FILE,
+  FSYNC_TEMP_FILE,
+  RENAME_TEMP_FILE,
+  FSYNC_DIRECTORY
+};
+
+using Preserve_snapshot_io_observer = void (*)(Preserve_snapshot_io_step step,
+                                               void *context);
+
+struct Preserve_snapshot_write_options {
+  Preserve_snapshot_io_observer observer{nullptr};
+  void *observer_context{nullptr};
+  bool defer_file_fsync{false};
+  bool defer_directory_fsync{false};
+  bool fast_new_token_state{false};
+  bool fast_prebuilt_blob_adopt{false};
+  bool shard_snapshot_files{false};
+  bool shard_generic_external_blobs{false};
 };
 
 class Preserved_trx_carrier {
@@ -93,6 +121,7 @@ class Preserved_trx_carrier {
 
   enum class Payload_read_mode {
     WITH_EXTERNAL_BLOBS,
+    WITH_SEMANTIC_EXTERNAL_BLOBS,
     METADATA_ONLY,
     SNAPSHOT_ONLY
   };
@@ -121,6 +150,9 @@ class Preserved_trx_carrier {
 
   virtual Preserved_trx_carrier_status list_tokens(
       Preserved_trx_carrier_listing *listing) = 0;
+
+  virtual Preserved_trx_carrier_status token_state(
+      const std::string &token, Preserved_trx_carrier_token_state *state);
 
   virtual Preserved_trx_carrier_status remove_warm_external_blob_artifact(
       const std::string &artifact_filename) = 0;
@@ -159,10 +191,19 @@ class Preserved_trx_warm_external_blob_carrier {
   virtual Preserved_trx_carrier_status adopt_warm_external_blob(
       const std::string &warmcopy_id, const std::string &token,
       const std::string &blob_name,
+      uint64_t warmcopy_epoch,
       const Preserved_trx_external_blob_descriptor &descriptor) = 0;
 
   virtual Preserved_trx_carrier_status remove_warm_external_blob(
       const std::string &warmcopy_id, const std::string &blob_name) = 0;
+};
+
+struct Preserved_trx_store_write_stats {
+  uint64_t token_state_us{0};
+  uint64_t adopt_warm_blob_us{0};
+  uint64_t write_new_blobs_us{0};
+  uint64_t encode_us{0};
+  uint64_t write_snapshot_us{0};
 };
 
 class Preserved_trx_store {
@@ -177,7 +218,9 @@ class Preserved_trx_store {
                                  Preserve_snapshot_metadata *written_metadata,
                                  bool *durable_snapshot_may_exist = nullptr,
                                  Preserve_snapshot_delete_status
-                                     *write_failure_delete_status = nullptr);
+                                     *write_failure_delete_status = nullptr,
+                                 Preserved_trx_store_write_stats
+                                     *write_stats = nullptr);
 
   Preserve_snapshot_status read(const std::string &token, bool validate_identity,
                                 Preserved_trx_bundle *bundle);
@@ -233,8 +276,15 @@ class Preserved_trx_store_handle {
 Preserved_trx_store_handle create_preserved_trx_default_store(
     const std::string &dir);
 
+Preserved_trx_store_handle create_preserved_trx_default_store(
+    const std::string &dir,
+    const Preserve_snapshot_write_options &write_options);
+
 std::unique_ptr<Preserved_trx_warm_external_blob_carrier>
 create_preserved_trx_default_warm_external_blob_carrier(const std::string &dir);
+
+Preserve_snapshot_status preserve_trx_fsync_default_store_directory(
+    const std::string &dir);
 
 enum class Preserved_trx_carrier_support_status {
   OK,
@@ -253,5 +303,8 @@ bool preserved_trx_default_carrier_support_is_valid(
 
 bool preserved_trx_default_carrier_token_exists(const std::string &dir,
                                                 const std::string &token);
+
+bool preserved_trx_default_carrier_generated_token_exists(
+    const std::string &dir, const std::string &token);
 
 #endif  // SQL_PRESERVE_TRX_CARRIER_INCLUDED

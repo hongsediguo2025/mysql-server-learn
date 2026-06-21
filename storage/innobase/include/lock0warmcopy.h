@@ -102,6 +102,8 @@ struct lock_warmcopy_record_seal_result_t {
   std::string record_locks_payload;
   uint32_t record_lock_count{0};
   uint64_t journal_bytes{0};
+  uint64_t materialized_payload_bytes{0};
+  uint32_t scanned_shard_count{0};
   uint32_t dirty_shard_count{0};
   lock_warmcopy_record_store_fence_t seal_fence;
   std::string diagnostic_reason;
@@ -173,6 +175,7 @@ bool lock_warmcopy_record_store_export_record_payload(std::string *payload,
                                                       uint32_t *lock_count);
 bool lock_warmcopy_record_store_export_record_payload_for_target(
     uint64_t target_id, std::string *payload, uint32_t *lock_count);
+void lock_warmcopy_record_store_target_ids(std::vector<uint64_t> *target_ids);
 bool lock_warmcopy_record_store_seed_payload_for_target(
     uint64_t target_id, const std::string &payload, uint32_t *lock_count);
 void lock_warmcopy_record_store_clear_for_target(uint64_t target_id);
@@ -185,6 +188,11 @@ bool lock_warmcopy_record_store_seal_for_target(
     uint64_t target_id, const lock_warmcopy_record_store_fence_t &phase1_fence,
     uint32_t max_lock_count, uint64_t max_journal_bytes,
     uint32_t max_dirty_shards, lock_warmcopy_record_seal_result_t *result);
+bool lock_warmcopy_record_store_seal_metadata_for_target(
+    uint64_t target_id, const lock_warmcopy_record_store_fence_t &phase1_fence,
+    uint32_t expected_record_lock_count, uint32_t max_lock_count,
+    uint64_t max_journal_bytes, uint32_t max_dirty_shards,
+    lock_warmcopy_record_seal_result_t *result);
 bool lock_warmcopy_trx_lock_fence_sample(
     const trx_lock_t *trx_lock, lock_warmcopy_trx_lock_fence_t *fence);
 bool lock_warmcopy_trx_lock_fence_equal(

@@ -30,35 +30,23 @@ UPDATE t_lock_warmcopy_table_drift SET v=11 WHERE id=1;
 
 --connection default
 SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_table_post_prepare_drift";
---exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--error ER_PRESERVE_TRX_UNSUPPORTED
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
---source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
-
---exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---enable_reconnect
---source include/wait_until_connected_again.inc
---disable_reconnect
+SET SESSION debug="-d,preserve_trx_lock_warmcopy_simulate_table_post_prepare_drift";
 
 --let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
---let $assert_text= table post-prepare drift falls back to live table export
---let $assert_select= PRESERVE_LOCK_WARMCOPY.*action=live_fallback.*reason=table_lock_warmcopy_post_prepare_drift
+--let $assert_text= table post-prepare drift rejects partial-family fallback
+--let $assert_select= PRESERVE_LOCK_WARMCOPY.*action=strict_reject.*reason=table_lock_warmcopy_post_prepare_drift
 --let $assert_count_condition= >= 1
 --source include/assert_grep.inc
 
-SELECT COUNT(*) AS preserved_count_after_table_drift_fallback
+SELECT COUNT(*) AS preserved_count_after_table_drift_reject
   FROM performance_schema.preserved_transactions;
---source suite/preserve_trx/include/get_preserved_token.inc
 
---connect(lock_wc_table_drift_resume, localhost, root,,test)
---connection lock_wc_table_drift_resume
---replace_result $preserved_token TOKEN
---eval RESUME PRESERVED TRANSACTION '$preserved_token'
-COMMIT;
---disconnect lock_wc_table_drift_resume
+--connection lock_wc_table_drift_app
+ROLLBACK;
 
 --connection default
-SELECT COUNT(*) AS preserved_count_after_table_drift_resume
-  FROM performance_schema.preserved_transactions;
 SELECT id, v FROM t_lock_warmcopy_table_drift ORDER BY id;
 
 DROP TABLE t_lock_warmcopy_table_drift;

@@ -22,9 +22,13 @@ INSERT INTO t_batch_inflight VALUES(3,30,'c-idle',NULL);
 SET DEBUG_SYNC = 'now WAIT_FOR batch_inflight_a_blocked TIMEOUT 10';
 SET DEBUG_SYNC = 'now WAIT_FOR batch_inflight_b_blocked TIMEOUT 10';
 SET GLOBAL preserve_trx_batch_max_transactions=2;
+SET DEBUG_SYNC =
+'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL batch_inflight_drain_closing WAIT_FOR continue_batch_inflight_drain';
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET DEBUG_SYNC = 'now WAIT_FOR batch_inflight_drain_closing TIMEOUT 10';
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_inflight_a';
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_inflight_b';
+SET DEBUG_SYNC = 'now SIGNAL continue_batch_inflight_drain';
 SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;
 preserved_count

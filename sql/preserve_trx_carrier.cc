@@ -46,6 +46,19 @@ constexpr size_t kCrcOffset = preserve_trx_bundle_crc_offset();
 constexpr size_t kCrcLength = preserve_trx_bundle_crc_length();
 constexpr size_t kMicrosecondsPerSecond = 1000000ULL;
 
+bool prebuilt_external_blob_name_is_supported(const std::string &name) {
+  return name == kPreservedTrxBlobBinlogCache ||
+         name == kPreservedTrxBlobRecordLocks;
+}
+
+bool carrier_token_filename_safe(const std::string &token) {
+  if (token.empty() || token.length() > 128) return false;
+  return std::all_of(token.begin(), token.end(), [](unsigned char ch) {
+    return (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') ||
+           (ch >= 'a' && ch <= 'z') || ch == '_' || ch == '-';
+  });
+}
+
 Preserve_snapshot_status map_carrier_status(
     Preserved_trx_carrier_status status) {
   switch (status) {
@@ -191,14 +204,39 @@ Preserve_snapshot_status cleanup_external_blobs_after_write_failure(
   return original_status;
 }
 
+void add_store_write_elapsed(uint64_t Preserved_trx_store_write_stats::*field,
+                             uint64_t started_us,
+                             Preserved_trx_store_write_stats *stats) {
+  if (stats == nullptr || started_us == 0) return;
+  const uint64_t now_us = my_micro_time();
+  if (now_us >= started_us) (*stats).*field += now_us - started_us;
+}
+
 }  // namespace
+
+Preserved_trx_carrier_status Preserved_trx_carrier::token_state(
+    const std::string &token, Preserved_trx_carrier_token_state *state) {
+  if (state == nullptr) return Preserved_trx_carrier_status::CORRUPT;
+  *state = {};
+  Preserved_trx_carrier_listing listing;
+  const Preserved_trx_carrier_status status = list_tokens(&listing);
+  if (status != Preserved_trx_carrier_status::OK) return status;
+  state->snapshot = listing.snapshot_tokens.count(token) != 0;
+  state->external_blob = listing.external_blob_tokens.count(token) != 0;
+  state->temp_sidecar = listing.temp_sidecar_tokens.count(token) != 0;
+  state->tainted = listing.tainted_tokens.count(token) != 0;
+  return Preserved_trx_carrier_status::OK;
+}
 
 Preserve_snapshot_status Preserved_trx_store::write(
     Preserved_trx_bundle bundle, uint64_t timeout_seconds,
     Preserve_snapshot_metadata *written_metadata,
     bool *durable_snapshot_may_exist,
-    Preserve_snapshot_delete_status *write_failure_delete_status) {
+    Preserve_snapshot_delete_status *write_failure_delete_status,
+    Preserved_trx_store_write_stats *write_stats) {
   if (m_carrier == nullptr || bundle.metadata.token.empty())
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  if (!carrier_token_filename_safe(bundle.metadata.token))
     return Preserve_snapshot_status::INVALID_ARGUMENT;
   if (durable_snapshot_may_exist != nullptr)
     *durable_snapshot_may_exist = false;
@@ -214,20 +252,24 @@ Preserve_snapshot_status Preserved_trx_store::write(
   std::set<std::string> external_blob_names;
   for (const Preserved_trx_external_blob &blob : bundle.external_blobs) {
     if (blob.name.empty() || !external_blob_names.insert(blob.name).second ||
-        (blob.prebuilt && blob.name != kPreservedTrxBlobBinlogCache)) {
+        (blob.prebuilt &&
+         (!prebuilt_external_blob_name_is_supported(blob.name) ||
+          !blob.payload.empty() || blob.warmcopy_id.empty() ||
+          blob.descriptor.name != blob.name || blob.descriptor.size == 0))) {
       return Preserve_snapshot_status::INVALID_ARGUMENT;
     }
   }
 
-  Preserved_trx_carrier_listing listing;
-  carrier_status = m_carrier->list_tokens(&listing);
+  Preserved_trx_carrier_token_state token_state;
+  uint64_t store_step_started_us = my_micro_time();
+  carrier_status = m_carrier->token_state(bundle.metadata.token, &token_state);
+  add_store_write_elapsed(&Preserved_trx_store_write_stats::token_state_us,
+                          store_step_started_us, write_stats);
   if (carrier_status != Preserved_trx_carrier_status::OK)
     return map_carrier_status(carrier_status);
-  if (listing.snapshot_tokens.count(bundle.metadata.token) != 0 ||
-      listing.external_blob_tokens.count(bundle.metadata.token) != 0 ||
-      (listing.temp_sidecar_tokens.count(bundle.metadata.token) != 0 &&
-       !bundle.owns_current_temp_sidecars) ||
-      listing.tainted_tokens.count(bundle.metadata.token) != 0) {
+  if (token_state.snapshot || token_state.external_blob ||
+      (token_state.temp_sidecar && !bundle.owns_current_temp_sidecars) ||
+      token_state.tainted) {
     return map_carrier_status(Preserved_trx_carrier_status::ALREADY_EXISTS);
   }
 
@@ -239,9 +281,6 @@ Preserve_snapshot_status Preserved_trx_store::write(
       new_external_blobs.push_back(blob);
       continue;
     }
-    if (blob.name != kPreservedTrxBlobBinlogCache) {
-      return Preserve_snapshot_status::INVALID_ARGUMENT;
-    }
     auto *warm_carrier =
         dynamic_cast<Preserved_trx_warm_external_blob_carrier *>(m_carrier);
     if (warm_carrier == nullptr) {
@@ -250,8 +289,12 @@ Preserve_snapshot_status Preserved_trx_store::write(
     std::vector<Preserved_trx_external_blob> possibly_adopted_external_blobs =
         written_external_blobs;
     possibly_adopted_external_blobs.push_back(blob);
+    store_step_started_us = my_micro_time();
     carrier_status = warm_carrier->adopt_warm_external_blob(
-        blob.warmcopy_id, bundle.metadata.token, blob.name, blob.descriptor);
+        blob.warmcopy_id, bundle.metadata.token, blob.name,
+        blob.warmcopy_epoch, blob.descriptor);
+    add_store_write_elapsed(&Preserved_trx_store_write_stats::adopt_warm_blob_us,
+                            store_step_started_us, write_stats);
     if (carrier_status == Preserved_trx_carrier_status::ALREADY_EXISTS) {
       (void)warm_carrier->remove_warm_external_blob(blob.warmcopy_id,
                                                     blob.name);
@@ -270,10 +313,13 @@ Preserve_snapshot_status Preserved_trx_store::write(
     const std::vector<Preserved_trx_external_blob> &blobs_to_write =
         adopted_prebuilt_blob ? bundle.external_blobs : new_external_blobs;
     std::vector<Preserved_trx_external_blob> newly_written_external_blobs;
+    store_step_started_us = my_micro_time();
     carrier_status =
         m_carrier->write_external_blobs_new(bundle.metadata.token,
                                             blobs_to_write,
                                             &newly_written_external_blobs);
+    add_store_write_elapsed(&Preserved_trx_store_write_stats::write_new_blobs_us,
+                            store_step_started_us, write_stats);
     written_external_blobs.insert(written_external_blobs.end(),
                                   newly_written_external_blobs.begin(),
                                   newly_written_external_blobs.end());
@@ -306,8 +352,11 @@ Preserve_snapshot_status Preserved_trx_store::write(
 
   Preserved_trx_encoded_bundle encoded;
   Preserve_snapshot_metadata encoded_metadata;
+  store_step_started_us = my_micro_time();
   const Preserve_snapshot_status encode_status =
       encode_preserved_trx_bundle(context, bundle, &encoded, &encoded_metadata);
+  add_store_write_elapsed(&Preserved_trx_store_write_stats::encode_us,
+                          store_step_started_us, write_stats);
   if (encode_status != Preserve_snapshot_status::OK) {
     return cleanup_external_blobs_after_write_failure(
         m_carrier, bundle.metadata.token, written_external_blobs, encode_status,
@@ -321,8 +370,11 @@ Preserve_snapshot_status Preserved_trx_store::write(
   }
   if (written_metadata != nullptr) *written_metadata = encoded_metadata;
 
+  store_step_started_us = my_micro_time();
   carrier_status = m_carrier->write_snapshot_new(encoded_metadata.token,
                                                  encoded.snapshot_bytes);
+  add_store_write_elapsed(&Preserved_trx_store_write_stats::write_snapshot_us,
+                          store_step_started_us, write_stats);
   if (carrier_status == Preserved_trx_carrier_status::
                             IO_ERROR_DURABLE_SNAPSHOT_MAY_EXIST) {
     if (durable_snapshot_may_exist != nullptr)
@@ -384,8 +436,12 @@ Preserve_snapshot_status Preserved_trx_store::read(
   const bool read_external_blobs =
       payload_read_mode ==
       Preserved_trx_carrier::Payload_read_mode::WITH_EXTERNAL_BLOBS;
+  const bool read_semantic_external_blobs =
+      payload_read_mode ==
+      Preserved_trx_carrier::Payload_read_mode::WITH_SEMANTIC_EXTERNAL_BLOBS;
   const bool validate_external_blob_metadata =
-      payload_read_mode == Preserved_trx_carrier::Payload_read_mode::METADATA_ONLY;
+      payload_read_mode == Preserved_trx_carrier::Payload_read_mode::METADATA_ONLY ||
+      read_semantic_external_blobs;
   if (read_external_blobs) {
     if (!external_blobs_match_descriptors(encoded.external_blobs,
                                           decoded.blob_descriptors)) {
@@ -414,6 +470,18 @@ Preserve_snapshot_status Preserved_trx_store::read(
     if (blob == out.external_blobs.end())
       return Preserve_snapshot_status::CORRUPT;
     out.metadata.binlog_cache_payload = blob->payload;
+  }
+  if (read_external_blobs || read_semantic_external_blobs) {
+    const auto blob = std::find_if(
+        out.external_blobs.begin(), out.external_blobs.end(),
+        [](const Preserved_trx_external_blob &candidate) {
+          return candidate.name == kPreservedTrxBlobRecordLocks;
+        });
+    if (blob != out.external_blobs.end()) {
+      if (!out.metadata.record_locks_payload.empty())
+        return Preserve_snapshot_status::CORRUPT;
+      out.metadata.record_locks_payload = blob->payload;
+    }
   }
   *bundle = std::move(out);
   return Preserve_snapshot_status::OK;

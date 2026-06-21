@@ -1357,9 +1357,18 @@ static Sys_var_uint Sys_preserve_trx_lock_warmcopy_max_mdl_descriptors(
 
 static Sys_var_uint Sys_preserve_trx_lock_warmcopy_seal_threads(
     "preserve_trx_lock_warmcopy_seal_threads",
-    "Reserved lock warm-copy phase-2 seal worker thread setting. Current "
-    "8.0.22 implementation seals targets serially; keep this at 0.",
+    "Number of lock warm-copy phase-2 record seal worker threads. 0 selects "
+    "an automatic worker count bounded by the number of targets.",
     GLOBAL_VAR(preserve_trx_lock_warmcopy_seal_threads),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 1024), DEFAULT(0), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_parallel_preserve_threads(
+    "preserve_trx_parallel_preserve_threads",
+    "Number of DRAIN TRANSACTIONS PRESERVE phase-2 target preserve worker "
+    "threads. 0 selects an automatic worker count for lock warm-copy batch "
+    "drains; 1 forces the legacy serial target preserve loop.",
+    GLOBAL_VAR(preserve_trx_parallel_preserve_threads),
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 1024), DEFAULT(0), BLOCK_SIZE(1),
     NO_MUTEX_GUARD, NOT_IN_BINLOG);
 

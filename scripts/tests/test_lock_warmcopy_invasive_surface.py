@@ -27,6 +27,29 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
         self.assertFalse(finding.blocks_release)
         self.assertIn("orchestration glue", finding.requirement)
 
+    def test_external_artifact_support_files_are_classified(self):
+        for path in (
+            "sql/binlog.cc",
+            "sql/preserve_trx_bundle.cc",
+            "sql/preserve_trx_bundle.h",
+            "sql/preserve_trx_carrier.cc",
+            "sql/preserve_trx_carrier.h",
+            "sql/preserve_trx_carrier_file.cc",
+            "sql/preserve_trx_carrier_file.h",
+            "sql/preserve_trx_drain.h",
+        ):
+            with self.subTest(path=path):
+                finding = invasive_surface.classify_path(
+                    path,
+                    state="modified",
+                )
+
+                self.assertEqual("artifact_support_integration_point",
+                                 finding.category)
+                self.assertEqual("medium", finding.severity)
+                self.assertFalse(finding.blocks_release)
+                self.assertIn("external artifact", finding.requirement)
+
     def test_lock0lock_is_high_risk_hot_path(self):
         finding = invasive_surface.classify_path(
             "storage/innobase/lock/lock0lock.cc",

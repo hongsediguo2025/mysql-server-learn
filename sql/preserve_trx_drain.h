@@ -59,8 +59,24 @@ struct Preserve_trx_drain_participant_observation {
   bool owns_artifact{false};
   uint64_t bytes_budget{0};
   uint64_t bytes_used{0};
+  uint64_t phase1_record_prebuilt_target_count{0};
+  uint64_t phase1_record_active_scan_target_count{0};
+  uint64_t phase2_lock_seal_us{0};
+  uint64_t phase2_full_lock_scan_count{0};
+  uint64_t materialized_lock_payload_bytes_in_phase2{0};
+  uint64_t phase2_record_lock_count{0};
+  uint64_t phase2_table_lock_count{0};
+  uint64_t phase2_mdl_descriptor_count{0};
+  uint64_t phase2_table_live_export_target_count{0};
+  uint64_t phase2_mdl_live_export_target_count{0};
+  uint64_t phase2_record_prebuilt_target_count{0};
+  uint64_t phase2_record_materialized_target_count{0};
+  uint32_t phase2_seal_worker_count{0};
+  bool phase2_slo_guaranteed{true};
+  uint64_t phase2_slo_not_guaranteed_target_count{0};
   uint32_t phase1_progress{0};
   std::string failure_reason;
+  std::string phase2_slo_reason;
 };
 
 class Preserve_trx_drain_participant {

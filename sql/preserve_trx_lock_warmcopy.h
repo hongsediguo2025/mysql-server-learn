@@ -26,11 +26,15 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
+#include "sql/preserve_trx_bundle.h"
 #include "sql/preserve_trx_drain.h"
 #include "storage/innobase/include/lock0warmcopy.h"
+
+class THD;
 
 struct Preserve_trx_lock_warmcopy_options {
   bool enabled{true};
@@ -43,6 +47,7 @@ struct Preserve_trx_lock_warmcopy_options {
   uint32_t max_lock_count{2000};
   uint32_t seal_threads{0};
   uint32_t conversion_wait_timeout_ms{30000};
+  std::string preserve_dir;
 };
 
 enum class Preserve_trx_lock_warmcopy_reason {
@@ -91,11 +96,13 @@ struct Preserve_trx_lock_warmcopy_artifact {
   std::string table_locks_payload;
   std::string mdl_descriptors_payload;
   std::string spill_path;
+  PrebuiltRecordLocksBlob prebuilt_record_locks_blob;
   uint64_t spill_payload_bytes{0};
   uint64_t spill_checksum{0};
   bool autoinc_lock_owned{false};
   bool implicit_native_validated{false};
   bool record_live_seal_fence_valid{false};
+  bool has_prebuilt_record_locks_blob{false};
   bool spilled_to_file{false};
   bool spill_materialized{false};
   lock_warmcopy_trx_lock_fence_t record_live_seal_fence;
@@ -197,15 +204,28 @@ class Preserve_trx_lock_warmcopy_drain_participant final
 
   const Preserve_trx_lock_warmcopy_artifact *artifact_for_thread(
       uint64_t thread_id);
+  bool prepare_phase1_idle_target(THD *target);
+  bool prepare_phase1_record_scan_target(THD *target,
+                                         bool active_scan = false);
+  bool prepare_phase1_record_store_targets();
   bool prepare_quiesced_targets(const std::vector<uint64_t> &thread_ids);
   bool prepare_quiesced_targets_for_unit_test(
       const std::vector<uint64_t> &thread_ids);
+  bool prepare_phase1_record_payload_for_thread_for_unit_test(
+      uint64_t thread_id, const std::string &payload);
+  void prepare_phase1_non_record_payloads_for_thread_for_unit_test(
+      uint64_t thread_id, const std::string &table_payload,
+      uint32_t table_lock_count, bool autoinc_lock_owned,
+      const std::string &mdl_payload, uint32_t mdl_descriptor_count);
   bool target_observation_for_thread(
       uint64_t thread_id,
       Preserve_trx_lock_warmcopy_target_observation *observation) const;
   bool target_observation_for_thread_for_unit_test(
       uint64_t thread_id,
       Preserve_trx_lock_warmcopy_target_observation *observation) const;
+  void set_table_locks_for_thread_for_unit_test(
+      uint64_t thread_id, const std::string &payload, uint32_t lock_count,
+      bool autoinc_lock_owned);
   void set_mdl_descriptors_for_thread_for_unit_test(
       uint64_t thread_id, const std::string &payload,
       uint32_t descriptor_count);
@@ -222,15 +242,29 @@ class Preserve_trx_lock_warmcopy_drain_participant final
     bool record_live_seal_fence_valid{false};
     lock_warmcopy_trx_lock_fence_t record_live_seal_fence;
     bool record_locks_candidate_valid{false};
+    bool record_locks_seeded_in_phase1{false};
+    bool has_phase1_record_prebuilt_blob{false};
+    PrebuiltRecordLocksBlob phase1_record_prebuilt_blob;
+    bool phase1_record_prebuilt_fence_valid{false};
+    lock_warmcopy_record_store_fence_t phase1_record_prebuilt_fence;
     std::string record_locks_payload;
     uint32_t record_lock_count{0};
     bool table_locks_candidate_valid{false};
     std::string table_locks_payload;
     uint32_t table_lock_count{0};
     bool autoinc_lock_owned{false};
+    bool phase1_table_locks_candidate_valid{false};
+    std::string phase1_table_locks_payload;
+    uint32_t phase1_table_lock_count{0};
+    bool phase1_autoinc_lock_owned{false};
+    bool table_locks_phase1_fingerprint_valid{false};
     bool mdl_candidate_valid{false};
     std::string mdl_descriptors_payload;
     uint32_t mdl_descriptor_count{0};
+    bool phase1_mdl_candidate_valid{false};
+    std::string phase1_mdl_descriptors_payload;
+    uint32_t phase1_mdl_descriptor_count{0};
+    bool mdl_phase1_fingerprint_valid{false};
   };
 
   Preserve_trx_lock_warmcopy_options m_options;
@@ -239,9 +273,23 @@ class Preserve_trx_lock_warmcopy_drain_participant final
   std::map<uint64_t, Target_session> m_targets;
   std::vector<std::string> m_spill_paths;
   std::vector<uint64_t> m_target_thread_ids;
+  std::set<uint64_t> m_phase1_record_active_scan_targets;
   uint64_t m_epoch{0};
   bool m_record_store_cleanup_deferred_for_shutdown{false};
 
+  Target_session *ensure_target_session(uint64_t thread_id);
+  void refresh_phase1_record_prebuilt_observation();
+  bool seed_phase1_record_payload_for_thread(uint64_t thread_id,
+                                             const std::string &payload);
+  void seed_phase1_non_record_payloads_for_thread(
+      uint64_t thread_id, const std::string &table_payload,
+      uint32_t table_lock_count, bool autoinc_lock_owned,
+      const std::string &mdl_payload, uint32_t mdl_descriptor_count);
+  void refresh_phase1_non_record_fingerprints(Target_session *target);
+  bool build_phase1_record_blob_for_target(uint64_t thread_id,
+                                           Target_session *target,
+                                           const std::string &payload);
+  void discard_phase1_record_blob(Target_session *target);
   void clear_record_stores_for_targets();
 };
 

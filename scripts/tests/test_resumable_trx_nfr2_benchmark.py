@@ -10,8 +10,11 @@ from scripts.resumable_trx_nfr2_benchmark import (
     _ensure_initial_server_available,
     _read_file_from_offset,
     build_hotpath_benchmark_gate,
+    build_phase2_absolute_p95_gate,
     build_phase2_pause_comparison,
+    build_phase2_slo_guarantee_gate,
     build_scenarios,
+    build_warmcopy_no_fallback_gate,
     main,
     parse_gunit_microbenchmark_output,
     parse_warmcopy_action_summary,
@@ -66,6 +69,26 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
                 "participants_ready=2 prefix_bytes=4096 mirrored_bytes=8192 "
                 "tail_bytes=128 digested_bytes=8192 durable_bytes=4096 "
                 "phase1_us=12000 phase2_pause_us=3000 "
+                "phase2_total_us=1000000 phase2_target_preserve_us=700000 "
+                "phase2_lock_seal_us=120000 phase2_seal_worker_count=4 "
+                "phase2_lock_preflight_us=300000 "
+                "phase2_preserve_worker_count=8 "
+                "phase2_prepare_us=100000 phase2_snapshot_write_us=50000 "
+                "phase1_record_prebuilt_target_count=997 "
+                "phase1_record_active_scan_target_count=17 "
+                "phase2_full_lock_scan_count=42 "
+                "materialized_lock_payload_bytes_in_phase2=8192 "
+                "phase2_record_lock_count=123456 "
+                "phase2_table_lock_count=321 "
+                "phase2_mdl_descriptor_count=654 "
+                "phase2_table_live_export_target_count=3 "
+                "phase2_mdl_live_export_target_count=4 "
+                "phase2_savepoint_live_export_target_count=1 "
+                "phase2_record_prebuilt_target_count=998 "
+                "phase2_record_materialized_target_count=2 "
+                "phase2_slo_guaranteed=0 "
+                "phase2_slo_not_guaranteed_count=2 "
+                "phase2_slo_reason=table_mdl_live_export "
                 "phase2_copy_bytes=256 phase2_digest_bytes=128 "
                 "phase2_durable_bytes=64 phase2_scan_bytes=32",
                 "PRESERVE: warm-copy drain metrics phase2_pause_us=4000",
@@ -78,6 +101,38 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
         self.assertEqual(4096, metrics[0]["prefix_bytes"])
         self.assertEqual(12000, metrics[0]["phase1_us"])
         self.assertEqual(3000, metrics[0]["phase2_pause_us"])
+        self.assertEqual(1000000, metrics[0]["phase2_total_us"])
+        self.assertEqual(700000, metrics[0]["phase2_target_preserve_us"])
+        self.assertEqual(120000, metrics[0]["phase2_lock_seal_us"])
+        self.assertEqual(300000, metrics[0]["phase2_lock_preflight_us"])
+        self.assertEqual(4, metrics[0]["phase2_seal_worker_count"])
+        self.assertEqual(8, metrics[0]["phase2_preserve_worker_count"])
+        self.assertEqual(100000, metrics[0]["phase2_prepare_us"])
+        self.assertEqual(50000, metrics[0]["phase2_snapshot_write_us"])
+        self.assertEqual(997, metrics[0]["phase1_record_prebuilt_target_count"])
+        self.assertEqual(
+            17, metrics[0]["phase1_record_active_scan_target_count"]
+        )
+        self.assertEqual(42, metrics[0]["phase2_full_lock_scan_count"])
+        self.assertEqual(
+            8192,
+            metrics[0]["materialized_lock_payload_bytes_in_phase2"],
+        )
+        self.assertEqual(123456, metrics[0]["phase2_record_lock_count"])
+        self.assertEqual(321, metrics[0]["phase2_table_lock_count"])
+        self.assertEqual(654, metrics[0]["phase2_mdl_descriptor_count"])
+        self.assertEqual(
+            3, metrics[0]["phase2_table_live_export_target_count"]
+        )
+        self.assertEqual(4, metrics[0]["phase2_mdl_live_export_target_count"])
+        self.assertEqual(
+            1, metrics[0]["phase2_savepoint_live_export_target_count"]
+        )
+        self.assertEqual(998, metrics[0]["phase2_record_prebuilt_target_count"])
+        self.assertEqual(2, metrics[0]["phase2_record_materialized_target_count"])
+        self.assertEqual(0, metrics[0]["phase2_slo_guaranteed"])
+        self.assertEqual(2, metrics[0]["phase2_slo_not_guaranteed_count"])
+        self.assertEqual("table_mdl_live_export", metrics[0]["phase2_slo_reason"])
         self.assertEqual(4000, metrics[1]["phase2_pause_us"])
 
     def test_parse_warmcopy_action_summary_counts_actions_and_bytes(self):
@@ -148,6 +203,195 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
         self.assertTrue(comparison["warmcopy_p95_below_live_baseline"])
         self.assertEqual(220.0, comparison["live_baseline_p95_ms"])
         self.assertEqual(120.0, comparison["warmcopy_p95_ms"])
+
+    def test_phase2_comparison_prefers_server_side_phase2_total_summary(self):
+        comparison = build_phase2_pause_comparison(
+            [
+                {
+                    "name": "live-export-large-lockset",
+                    "phase2_pause_summary_ms": {
+                        "sample_count": 3,
+                        "p50_ms": 10.0,
+                        "p95_ms": 10.0,
+                        "p99_ms": 10.0,
+                        "max_ms": 10.0,
+                    },
+                    "phase2_total_summary_ms": {
+                        "sample_count": 3,
+                        "p50_ms": 180000.0,
+                        "p95_ms": 220000.0,
+                        "p99_ms": 220000.0,
+                        "max_ms": 220000.0,
+                    },
+                },
+                {
+                    "name": "lock-warmcopy-large-lockset",
+                    "phase2_pause_summary_ms": {
+                        "sample_count": 3,
+                        "p50_ms": 5.0,
+                        "p95_ms": 5.0,
+                        "p99_ms": 5.0,
+                        "max_ms": 5.0,
+                    },
+                    "phase2_total_summary_ms": {
+                        "sample_count": 3,
+                        "p50_ms": 900.0,
+                        "p95_ms": 1000.0,
+                        "p99_ms": 1000.0,
+                        "max_ms": 1000.0,
+                    },
+                },
+            ],
+            live_baseline_scenario="live-export-large-lockset",
+            warmcopy_scenario="lock-warmcopy-large-lockset",
+        )
+
+        self.assertEqual("pass", comparison["status"])
+        self.assertEqual(220000.0, comparison["live_baseline_p95_ms"])
+        self.assertEqual(1000.0, comparison["warmcopy_p95_ms"])
+
+    def test_phase2_absolute_p95_gate_accepts_warmcopy_at_configured_limit(self):
+        gate = build_phase2_absolute_p95_gate(
+            [
+                {
+                    "name": "lock-warmcopy-large-lockset",
+                    "phase2_pause_summary_ms": {
+                        "sample_count": 3,
+                        "p50_ms": 5.0,
+                        "p95_ms": 5.0,
+                        "p99_ms": 5.0,
+                        "max_ms": 5.0,
+                    },
+                    "phase2_total_summary_ms": {
+                        "sample_count": 3,
+                        "p50_ms": 900.0,
+                        "p95_ms": 1000.0,
+                        "p99_ms": 1000.0,
+                        "max_ms": 1000.0,
+                    },
+                },
+            ],
+            warmcopy_scenario="lock-warmcopy-large-lockset",
+            max_p95_ms=1000.0,
+        )
+
+        self.assertEqual("pass", gate["status"])
+        self.assertTrue(gate["warmcopy_p95_under_max"])
+        self.assertEqual(1000.0, gate["warmcopy_p95_ms"])
+        self.assertEqual(1000.0, gate["max_p95_ms"])
+
+    def test_phase2_absolute_p95_gate_fails_warmcopy_above_configured_limit(self):
+        gate = build_phase2_absolute_p95_gate(
+            [
+                {
+                    "name": "lock-warmcopy-large-lockset",
+                    "phase2_total_summary_ms": {
+                        "sample_count": 3,
+                        "p50_ms": 800.0,
+                        "p95_ms": 1000.1,
+                        "p99_ms": 1000.1,
+                        "max_ms": 1000.1,
+                    },
+                },
+            ],
+            warmcopy_scenario="lock-warmcopy-large-lockset",
+            max_p95_ms=1000.0,
+        )
+
+        self.assertEqual("fail", gate["status"])
+        self.assertFalse(gate["warmcopy_p95_under_max"])
+        self.assertEqual("warmcopy_p95_exceeds_max", gate["reason"])
+
+    def test_warmcopy_no_fallback_gate_fails_when_live_fallback_is_observed(self):
+        gate = build_warmcopy_no_fallback_gate(
+            [
+                {
+                    "name": "lock-warmcopy-large-lockset",
+                    "warmcopy_action_summary": {
+                        "total": 3,
+                        "by_action": {
+                            "warmcopy_success": 2,
+                            "live_fallback": 1,
+                        },
+                    },
+                },
+            ],
+            warmcopy_scenario="lock-warmcopy-large-lockset",
+        )
+
+        self.assertEqual("fail", gate["status"])
+        self.assertEqual("live_fallback_observed", gate["reason"])
+        self.assertEqual(1, gate["live_fallback_count"])
+
+    def test_warmcopy_no_fallback_gate_accepts_all_warmcopy_success(self):
+        gate = build_warmcopy_no_fallback_gate(
+            [
+                {
+                    "name": "lock-warmcopy-large-lockset",
+                    "warmcopy_action_summary": {
+                        "total": 3,
+                        "by_action": {
+                            "warmcopy_success": 3,
+                        },
+                    },
+                },
+            ],
+            warmcopy_scenario="lock-warmcopy-large-lockset",
+        )
+
+        self.assertEqual("pass", gate["status"])
+        self.assertEqual(0, gate["live_fallback_count"])
+
+    def test_phase2_slo_guarantee_gate_accepts_all_guaranteed_samples(self):
+        gate = build_phase2_slo_guarantee_gate(
+            [
+                {
+                    "name": "lock-warmcopy-large-lockset",
+                    "warmcopy_metrics": [
+                        {
+                            "phase2_total_us": 900000,
+                            "phase2_slo_guaranteed": 1,
+                            "phase2_slo_not_guaranteed_count": 0,
+                        },
+                        {
+                            "phase2_total_us": 800000,
+                            "phase2_slo_guaranteed": 1,
+                            "phase2_slo_not_guaranteed_count": 0,
+                        },
+                    ],
+                },
+            ],
+            warmcopy_scenario="lock-warmcopy-large-lockset",
+        )
+
+        self.assertEqual("pass", gate["status"])
+        self.assertEqual(0, gate["phase2_slo_not_guaranteed_count"])
+
+    def test_phase2_slo_guarantee_gate_fails_when_any_sample_not_guaranteed(self):
+        gate = build_phase2_slo_guarantee_gate(
+            [
+                {
+                    "name": "lock-warmcopy-large-lockset",
+                    "warmcopy_metrics": [
+                        {
+                            "phase2_total_us": 900000,
+                            "phase2_slo_guaranteed": 1,
+                            "phase2_slo_not_guaranteed_count": 0,
+                        },
+                        {
+                            "phase2_total_us": 800000,
+                            "phase2_slo_guaranteed": 0,
+                            "phase2_slo_not_guaranteed_count": 3,
+                        },
+                    ],
+                },
+            ],
+            warmcopy_scenario="lock-warmcopy-large-lockset",
+        )
+
+        self.assertEqual("fail", gate["status"])
+        self.assertEqual("phase2_slo_not_guaranteed", gate["reason"])
+        self.assertEqual(3, gate["phase2_slo_not_guaranteed_count"])
 
     def test_parse_gunit_microbenchmark_output_extracts_lock_warmcopy_hotpath(self):
         output = "\n".join(
@@ -300,8 +544,33 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
                 preserve_max_scan_pages=200_000_000,
                 preserve_max_modified_tables=2000,
                 preserve_lock_warmcopy_max_journal_bytes=8 * 1024 * 1024 * 1024,
+                preserve_lock_warmcopy_seal_threads=16,
+                preserve_parallel_preserve_threads=32,
                 lock_warmcopy_mode="on",
                 append_log_during_run=(
+                    "PRESERVE: warm-copy drain metrics phase2_total_us=1000000 "
+                    "phase2_target_preserve_us=700000 "
+                    "phase2_participant_preflight_us=100000 "
+                    "phase2_lock_seal_us=120000 "
+                    "phase2_lock_preflight_us=300000 "
+                    "phase2_seal_worker_count=4 "
+                    "phase2_preserve_worker_count=8 "
+                    "phase2_snapshot_write_us=50000 "
+                    "phase1_record_prebuilt_target_count=997 "
+                    "phase1_record_active_scan_target_count=900 "
+                    "phase2_full_lock_scan_count=42 "
+                    "materialized_lock_payload_bytes_in_phase2=8192 "
+                    "phase2_record_lock_count=123456 "
+                    "phase2_table_lock_count=321 "
+                    "phase2_mdl_descriptor_count=654 "
+                    "phase2_table_live_export_target_count=3 "
+                    "phase2_mdl_live_export_target_count=4 "
+                    "phase2_savepoint_live_export_target_count=1 "
+                    "phase2_record_prebuilt_target_count=998 "
+                    "phase2_record_materialized_target_count=2 "
+                    "phase2_slo_guaranteed=0 "
+                    "phase2_slo_not_guaranteed_count=1000 "
+                    "phase2_slo_reason=table_mdl_live_export\n"
                     "PRESERVE_LOCK_WARMCOPY action=warmcopy_success "
                     "reason=ok detail=sealed_valid value=4027438\n"
                 ),
@@ -331,6 +600,8 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
             8 * 1024 * 1024 * 1024,
             report["preserve_lock_warmcopy_max_journal_bytes"],
         )
+        self.assertEqual(16, report["preserve_lock_warmcopy_seal_threads"])
+        self.assertEqual(32, report["preserve_parallel_preserve_threads"])
         self.assertEqual(
             {"warmcopy_success": 1},
             report["warmcopy_action_summary"]["by_action"],
@@ -342,6 +613,90 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
             ],
         )
         self.assertEqual(2, report["phase2_pause_summary_ms"]["sample_count"])
+        self.assertEqual(
+            {
+                "sample_count": 1,
+                "p50_ms": 1000.0,
+                "p95_ms": 1000.0,
+                "p99_ms": 1000.0,
+                "max_ms": 1000.0,
+            },
+            report["phase2_total_summary_ms"],
+        )
+        self.assertEqual(
+            {
+                "sample_count": 1,
+                "p50_ms": 700.0,
+                "p95_ms": 700.0,
+                "p99_ms": 700.0,
+                "max_ms": 700.0,
+            },
+            report["phase2_target_preserve_summary_ms"],
+        )
+        self.assertEqual(
+            {
+                "sample_count": 1,
+                "p50_ms": 120.0,
+                "p95_ms": 120.0,
+                "p99_ms": 120.0,
+                "max_ms": 120.0,
+            },
+            report["phase2_lock_seal_summary_ms"],
+        )
+        self.assertEqual(
+            {
+                "sample_count": 1,
+                "p50_ms": 300.0,
+                "p95_ms": 300.0,
+                "p99_ms": 300.0,
+                "max_ms": 300.0,
+            },
+            report["phase2_lock_preflight_summary_ms"],
+        )
+        self.assertEqual(42, report["warmcopy_metrics"][0]["phase2_full_lock_scan_count"])
+        self.assertEqual(4, report["phase2_seal_worker_count_max"])
+        self.assertEqual(8, report["phase2_preserve_worker_count_max"])
+        self.assertEqual(
+            997,
+            report["warmcopy_metrics"][0]["phase1_record_prebuilt_target_count"],
+        )
+        self.assertEqual(
+            900,
+            report["warmcopy_metrics"][0][
+                "phase1_record_active_scan_target_count"
+            ],
+        )
+        self.assertEqual(
+            8192,
+            report["warmcopy_metrics"][0][
+                "materialized_lock_payload_bytes_in_phase2"
+            ],
+        )
+        self.assertEqual(123456, report["phase2_record_lock_count"])
+        self.assertEqual(321, report["phase2_table_lock_count"])
+        self.assertEqual(654, report["phase2_mdl_descriptor_count"])
+        self.assertEqual(3, report["phase2_table_live_export_target_count"])
+        self.assertEqual(4, report["phase2_mdl_live_export_target_count"])
+        self.assertEqual(1, report["phase2_savepoint_live_export_target_count"])
+        self.assertEqual(
+            998,
+            report["warmcopy_metrics"][0]["phase2_record_prebuilt_target_count"],
+        )
+        self.assertEqual(
+            2,
+            report["warmcopy_metrics"][0][
+                "phase2_record_materialized_target_count"
+            ],
+        )
+        self.assertFalse(report["phase2_slo_guaranteed"])
+        self.assertEqual(1000, report["phase2_slo_not_guaranteed_count"])
+        self.assertEqual(
+            {"table_mdl_live_export": 1}, report["phase2_slo_reasons"]
+        )
+        self.assertEqual(997, report["phase1_record_prebuilt_target_count"])
+        self.assertEqual(900, report["phase1_record_active_scan_target_count"])
+        self.assertEqual(998, report["phase2_record_prebuilt_target_count"])
+        self.assertEqual(2, report["phase2_record_materialized_target_count"])
 
     def test_required_phase2_pause_gate_returns_nonzero_on_failed_comparison(self):
         def fake_run_scenario(scenario):
@@ -394,6 +749,128 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
             rendered = output.read_text(encoding="utf-8")
             self.assertIn('"status": "fail"', rendered)
             self.assertIn('"warmcopy_p95_below_live_baseline": false', rendered)
+
+    def test_required_phase2_absolute_gate_returns_nonzero_on_failed_warmcopy_p95(self):
+        def fake_run_scenario(scenario):
+            return {
+                "name": "warmcopy",
+                "phase2_total_summary_ms": {
+                    "sample_count": 3,
+                    "p50_ms": 900.0,
+                    "p95_ms": 1000.1,
+                    "p99_ms": 1000.1,
+                    "max_ms": 1000.1,
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "report.json"
+            scenarios = [SimpleNamespace(name="warmcopy")]
+            with mock.patch.object(nfr2_benchmark, "build_scenarios", return_value=scenarios):
+                with mock.patch.object(
+                    nfr2_benchmark, "run_scenario", side_effect=fake_run_scenario
+                ):
+                    exit_code = main(
+                        [
+                            "--restart-command",
+                            "mysqld --defaults-file=/tmp/nfr2.cnf",
+                            "--scenario",
+                            "baseline",
+                            "--phase2-warmcopy-scenario",
+                            "warmcopy",
+                            "--require-phase2-p95-under-ms",
+                            "1000",
+                            "--output",
+                            str(output),
+                        ]
+                    )
+
+            self.assertEqual(1, exit_code)
+            rendered = output.read_text(encoding="utf-8")
+            self.assertIn('"phase2_absolute_p95_gate"', rendered)
+            self.assertIn('"warmcopy_p95_under_max": false', rendered)
+
+    def test_required_no_fallback_gate_returns_nonzero_when_live_fallback_seen(self):
+        def fake_run_scenario(scenario):
+            return {
+                "name": "warmcopy",
+                "phase2_total_summary_ms": {
+                    "sample_count": 3,
+                    "p50_ms": 900.0,
+                    "p95_ms": 900.0,
+                    "p99_ms": 900.0,
+                    "max_ms": 900.0,
+                },
+                "warmcopy_action_summary": {
+                    "total": 1,
+                    "by_action": {"live_fallback": 1},
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "report.json"
+            scenarios = [SimpleNamespace(name="warmcopy")]
+            with mock.patch.object(nfr2_benchmark, "build_scenarios", return_value=scenarios):
+                with mock.patch.object(
+                    nfr2_benchmark, "run_scenario", side_effect=fake_run_scenario
+                ):
+                    exit_code = main(
+                        [
+                            "--restart-command",
+                            "mysqld --defaults-file=/tmp/nfr2.cnf",
+                            "--scenario",
+                            "baseline",
+                            "--phase2-warmcopy-scenario",
+                            "warmcopy",
+                            "--require-no-warmcopy-fallback",
+                            "--output",
+                            str(output),
+                        ]
+                    )
+
+            self.assertEqual(1, exit_code)
+            rendered = output.read_text(encoding="utf-8")
+            self.assertIn('"warmcopy_no_fallback_gate"', rendered)
+            self.assertIn('"live_fallback_count": 1', rendered)
+
+    def test_required_phase2_slo_guarantee_gate_returns_nonzero_when_uncovered(self):
+        def fake_run_scenario(scenario):
+            return {
+                "name": "warmcopy",
+                "warmcopy_metrics": [
+                    {
+                        "phase2_total_us": 900000,
+                        "phase2_slo_guaranteed": 0,
+                        "phase2_slo_not_guaranteed_count": 2,
+                    },
+                ],
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "report.json"
+            scenarios = [SimpleNamespace(name="warmcopy")]
+            with mock.patch.object(nfr2_benchmark, "build_scenarios", return_value=scenarios):
+                with mock.patch.object(
+                    nfr2_benchmark, "run_scenario", side_effect=fake_run_scenario
+                ):
+                    exit_code = main(
+                        [
+                            "--restart-command",
+                            "mysqld --defaults-file=/tmp/nfr2.cnf",
+                            "--scenario",
+                            "baseline",
+                            "--phase2-warmcopy-scenario",
+                            "warmcopy",
+                            "--require-phase2-slo-guaranteed",
+                            "--output",
+                            str(output),
+                        ]
+                    )
+
+            self.assertEqual(1, exit_code)
+            rendered = output.read_text(encoding="utf-8")
+            self.assertIn('"phase2_slo_guarantee_gate"', rendered)
+            self.assertIn('"phase2_slo_not_guaranteed_count": 2', rendered)
 
     def test_hotpath_gate_can_run_without_workload_scenario(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -587,6 +1064,21 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
             args.phase2_warmcopy_scenario,
         )
 
+    def test_single_large_lockset_warmcopy_scenario_drives_warmcopy_gate(self):
+        args = parse_args(
+            [
+                "--restart-command",
+                "mysqld --defaults-file=/tmp/nfr2.cnf",
+                "--scenario",
+                "lock-warmcopy-large-lockset",
+            ]
+        )
+
+        self.assertEqual(
+            "lock-warmcopy-large-lockset",
+            args.phase2_warmcopy_scenario,
+        )
+
     def test_build_scenarios_adds_scaled_lockset_live_and_warmcopy(self):
         args = parse_args(
             [
@@ -604,6 +1096,8 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
                 "40",
                 "--cycles",
                 "2",
+                "--preserve-parallel-preserve-threads",
+                "32",
                 "--server-pid-file",
                 "/tmp/nfr2.pid",
             ]
@@ -632,10 +1126,26 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
             self.assertGreaterEqual(scenario.config.preserve_max_lock_count, 960)
             self.assertGreaterEqual(scenario.config.preserve_max_scan_pages, 960)
             self.assertGreaterEqual(scenario.config.preserve_max_modified_tables, 12)
+            self.assertEqual(32, scenario.config.preserve_parallel_preserve_threads)
             self.assertEqual("/tmp/nfr2.pid", scenario.config.server_pid_file)
         self.assertEqual("off", scenarios[0].config.lock_warmcopy_mode)
         self.assertEqual("on", scenarios[1].config.lock_warmcopy_mode)
         self.assertEqual("scaled-live-lockset", args.phase2_live_baseline_scenario)
+        self.assertEqual(
+            "scaled-lock-warmcopy-lockset",
+            args.phase2_warmcopy_scenario,
+        )
+
+    def test_single_scaled_lockset_warmcopy_scenario_drives_warmcopy_gate(self):
+        args = parse_args(
+            [
+                "--restart-command",
+                "mysqld --defaults-file=/tmp/nfr2.cnf",
+                "--scenario",
+                "scaled-lock-warmcopy-lockset",
+            ]
+        )
+
         self.assertEqual(
             "scaled-lock-warmcopy-lockset",
             args.phase2_warmcopy_scenario,

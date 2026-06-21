@@ -65,6 +65,8 @@ namespace {
 enum class Preserve_key_status { OK, MISSING, CORRUPT, IO_ERROR };
 enum class Atomic_write_status { OK, ALREADY_EXISTS, IO_ERROR };
 
+constexpr char kGenericExternalBlobShardRoot[] = "blob_shards";
+
 std::string normalize_dir(std::string dir) {
   if (dir.empty() || dir.back() != FN_LIBCHAR) {
     dir.push_back(FN_LIBCHAR);
@@ -122,10 +124,89 @@ bool external_blob_name_is_filename_safe(const std::string &name) {
   });
 }
 
+bool prebuilt_external_blob_name_is_supported(const std::string &name) {
+  return name == kPreservedTrxBlobBinlogCache ||
+         name == kPreservedTrxBlobRecordLocks;
+}
+
+bool ensure_directory(const std::string &dir);
+bool file_exists(const std::string &path, MY_STAT *stat_area = nullptr);
+
 std::string external_blob_filename(const std::string &token,
                                    const std::string &blob_name) {
   if (blob_name == kPreservedTrxBlobBinlogCache) return token + ".binlog_cache";
   return token + ".blob." + blob_name;
+}
+
+bool generic_external_blob_uses_shard(const std::string &blob_name) {
+  return blob_name != kPreservedTrxBlobBinlogCache;
+}
+
+std::string generic_external_blob_shard_name(const std::string &token) {
+  return token.empty() ? std::string("0") : token.substr(0, 1);
+}
+
+std::string generic_external_blob_shard_dir(const std::string &dir,
+                                            const std::string &token) {
+  return join_path(join_path(dir, kGenericExternalBlobShardRoot),
+                   generic_external_blob_shard_name(token));
+}
+
+bool ensure_generic_external_blob_shard_dir(const std::string &dir,
+                                            const std::string &token) {
+  const std::string root = join_path(dir, kGenericExternalBlobShardRoot);
+  if (ensure_directory(root)) return true;
+  if (path_is_symlink(root)) return true;
+  const std::string shard_dir = generic_external_blob_shard_dir(dir, token);
+  if (ensure_directory(shard_dir)) return true;
+  return path_is_symlink(shard_dir);
+}
+
+std::vector<std::string> generic_external_blob_dirs_for_token(
+    const std::string &dir, const std::string &token) {
+  std::vector<std::string> dirs;
+  dirs.push_back(normalize_dir(dir));
+  dirs.push_back(generic_external_blob_shard_dir(dir, token));
+  return dirs;
+}
+
+std::string external_blob_dir_for_new_write(
+    const std::string &dir, const std::string &token,
+    const std::string &blob_name,
+    const Preserve_snapshot_write_options &options) {
+  if (options.shard_generic_external_blobs &&
+      generic_external_blob_uses_shard(blob_name)) {
+    return generic_external_blob_shard_dir(dir, token);
+  }
+  return normalize_dir(dir);
+}
+
+std::string external_blob_path_for_new_write(
+    const std::string &dir, const std::string &token,
+    const std::string &blob_name,
+    const Preserve_snapshot_write_options &options) {
+  return join_path(external_blob_dir_for_new_write(dir, token, blob_name,
+                                                   options),
+                   external_blob_filename(token, blob_name));
+}
+
+std::vector<std::string> snapshot_dirs_for_token(const std::string &dir,
+                                                 const std::string &token) {
+  return generic_external_blob_dirs_for_token(dir, token);
+}
+
+std::string snapshot_dir_for_new_write(
+    const std::string &dir, const std::string &token,
+    const Preserve_snapshot_write_options &options) {
+  return options.shard_snapshot_files ? generic_external_blob_shard_dir(dir, token)
+                                      : normalize_dir(dir);
+}
+
+std::string snapshot_path_for_existing_token(const std::string &dir,
+                                             const std::string &token) {
+  const std::string root_path = join_path(dir, token + ".bin");
+  if (file_exists(root_path)) return root_path;
+  return join_path(generic_external_blob_shard_dir(dir, token), token + ".bin");
 }
 
 std::string warm_external_blob_filename(const std::string &warmcopy_id,
@@ -165,20 +246,24 @@ bool filename_is_warm_external_blob(const char *filename,
       name.length() >= 4 && name.compare(name.length() - 4, 4, ".tmp") == 0;
   const std::string base_name =
       tmp_suffix ? name.substr(0, name.length() - 4) : name;
-  const std::string marker = "." + std::string(kPreservedTrxBlobBinlogCache) +
-                             ".warm.";
-  const size_t marker_pos = base_name.find(marker);
-  if (marker_pos == std::string::npos || marker_pos == 0) return false;
-  const std::string warmcopy_id = base_name.substr(0, marker_pos);
-  if (!token_is_filename_safe(warmcopy_id)) return false;
-  const std::string epoch = base_name.substr(marker_pos + marker.length());
-  if (epoch.empty()) return false;
-  if (!std::all_of(epoch.begin(), epoch.end(),
-                   [](unsigned char ch) { return std::isdigit(ch); })) {
-    return false;
+
+  for (const char *blob_name :
+       {kPreservedTrxBlobBinlogCache, kPreservedTrxBlobRecordLocks}) {
+    const std::string marker = "." + std::string(blob_name) + ".warm.";
+    const size_t marker_pos = base_name.find(marker);
+    if (marker_pos == std::string::npos || marker_pos == 0) continue;
+    const std::string warmcopy_id = base_name.substr(0, marker_pos);
+    if (!token_is_filename_safe(warmcopy_id)) continue;
+    const std::string epoch = base_name.substr(marker_pos + marker.length());
+    if (epoch.empty()) continue;
+    if (!std::all_of(epoch.begin(), epoch.end(),
+                     [](unsigned char ch) { return std::isdigit(ch); })) {
+      continue;
+    }
+    if (matched_filename != nullptr) *matched_filename = name;
+    return true;
   }
-  if (matched_filename != nullptr) *matched_filename = name;
-  return true;
+  return false;
 }
 
 bool filename_is_warm_external_blob_descriptor(
@@ -271,7 +356,7 @@ Preserved_trx_carrier_support_status ensure_directory_support_status(
              : Preserved_trx_carrier_support_status::PERMISSION_PATH_ERROR;
 }
 
-bool file_exists(const std::string &path, MY_STAT *stat_area = nullptr) {
+bool file_exists(const std::string &path, MY_STAT *stat_area) {
   MY_STAT local_stat;
   return my_stat(path.c_str(), stat_area != nullptr ? stat_area : &local_stat,
                  MYF(0)) != nullptr;
@@ -583,8 +668,10 @@ Atomic_write_status atomic_write_file(
     DBUG_EXECUTE_IF("preserve_trx_fail_before_snapshot_fsync",
                     error = true;);
   }
-  if (!error && my_sync(file, MYF(0))) error = true;
-  notify_step(options, Preserve_snapshot_io_step::FSYNC_TEMP_FILE);
+  if (!error && !options.defer_file_fsync && my_sync(file, MYF(0)))
+    error = true;
+  if (!options.defer_file_fsync)
+    notify_step(options, Preserve_snapshot_io_step::FSYNC_TEMP_FILE);
   if (my_close(file, MYF(0))) error = true;
   if (!error && binlog_cache_file) {
     DEBUG_SYNC_C("preserve_trx_before_binlog_cache_rename");
@@ -615,9 +702,10 @@ Atomic_write_status atomic_write_file(
     DBUG_EXECUTE_IF("preserve_trx_fail_binlog_cache_directory_fsync",
                     status = Atomic_write_status::IO_ERROR;);
   }
-  if (status == Atomic_write_status::OK && fsync_directory(dir))
-    status = Atomic_write_status::IO_ERROR;
-  notify_step(options, Preserve_snapshot_io_step::FSYNC_DIRECTORY);
+  if (status == Atomic_write_status::OK && !options.defer_directory_fsync) {
+    if (fsync_directory(dir)) status = Atomic_write_status::IO_ERROR;
+    notify_step(options, Preserve_snapshot_io_step::FSYNC_DIRECTORY);
+  }
 
   if (status != Atomic_write_status::OK) (void)my_delete(tmp_path.c_str(), MYF(0));
   return status;
@@ -715,7 +803,7 @@ class Local_file_external_blob_writer final
       const Preserved_trx_external_blob_descriptor &descriptor) override {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_closed || m_file >= 0 ||
-        descriptor.name != kPreservedTrxBlobBinlogCache) {
+        !prebuilt_external_blob_name_is_supported(descriptor.name)) {
       return Preserved_trx_carrier_status::CORRUPT;
     }
     MY_STAT stat_area;
@@ -1034,6 +1122,10 @@ Preserve_snapshot_delete_status remove_generic_external_blobs_for_token(
     const std::string &dir, const std::string &token, bool remove_tmp,
     bool remove_final, bool *removed_any);
 
+Preserve_snapshot_delete_status remove_generic_external_blobs_for_token_all_dirs(
+    const std::string &dir, const std::string &token, bool remove_tmp,
+    bool remove_final, bool *removed_any);
+
 Preserve_snapshot_delete_status remove_stale_tmp_files_for_token(
     const std::string &dir, const std::string &token, bool fsync_after,
     bool *removed_any) {
@@ -1054,12 +1146,14 @@ Preserve_snapshot_delete_status remove_stale_tmp_files_for_token(
 
   delete_optional_tmp(join_path(dir, token + ".binlog_cache.tmp"));
   delete_optional_tmp(join_path(dir, token + ".tainted.tmp"));
-  delete_optional_tmp(join_path(dir, token + ".bin.tmp"));
+  for (const std::string &candidate_dir : snapshot_dirs_for_token(dir, token)) {
+    delete_optional_tmp(join_path(candidate_dir, token + ".bin.tmp"));
+  }
 
   bool removed_generic = false;
   const Preserve_snapshot_delete_status generic_tmp_status =
-      remove_generic_external_blobs_for_token(dir, token, true, false,
-                                              &removed_generic);
+      remove_generic_external_blobs_for_token_all_dirs(dir, token, true, false,
+                                                       &removed_generic);
   if (generic_tmp_status != Preserve_snapshot_delete_status::OK) error = true;
   removed = removed || removed_generic;
 
@@ -1087,7 +1181,6 @@ Preserve_snapshot_delete_status delete_snapshot_files_with_status(
     return Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE;
   }
   const std::string dir = normalize_dir(dir_arg);
-  const std::string snapshot_path = join_path(dir, token + ".bin");
   const std::string binlog_cache_path = join_path(dir, token + ".binlog_cache");
   const std::string tainted_path = join_path(dir, token + ".tainted");
   bool error = false;
@@ -1105,13 +1198,31 @@ Preserve_snapshot_delete_status delete_snapshot_files_with_status(
   if (error) return Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE;
 
   bool snapshot_file_removed = false;
-  if (my_delete(snapshot_path.c_str(), MYF(0))) {
-    if (my_errno() == ENOENT) {
-      snapshot_file_removed = true;
+  bool snapshot_file_missing_everywhere = true;
+  bool snapshot_delete_error = false;
+  for (const std::string &candidate_dir : snapshot_dirs_for_token(dir, token)) {
+    const std::string snapshot_path = join_path(candidate_dir, token + ".bin");
+    if (my_delete(snapshot_path.c_str(), MYF(0))) {
+      if (my_errno() != ENOENT) {
+        error = true;
+        snapshot_delete_error = true;
+        snapshot_file_missing_everywhere = false;
+      }
     } else {
-      error = true;
+      snapshot_file_removed = true;
+      snapshot_file_missing_everywhere = false;
     }
-  } else {
+    const std::string snapshot_tmp_path =
+        join_path(candidate_dir, token + ".bin.tmp");
+    if (my_delete(snapshot_tmp_path.c_str(), MYF(0)) && my_errno() != ENOENT)
+      error = true;
+  }
+  if (snapshot_delete_error) {
+    return snapshot_file_removed
+               ? Preserve_snapshot_delete_status::ERROR_AFTER_SNAPSHOT_DELETE
+               : Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE;
+  }
+  if (snapshot_file_missing_everywhere) {
     snapshot_file_removed = true;
   }
   if (!snapshot_file_removed) {
@@ -1126,8 +1237,8 @@ Preserve_snapshot_delete_status delete_snapshot_files_with_status(
   delete_optional_sidecar(tainted_path);
   bool removed_generic_sidecar = false;
   const Preserve_snapshot_delete_status generic_final_status =
-      remove_generic_external_blobs_for_token(dir, token, false, true,
-                                              &removed_generic_sidecar);
+      remove_generic_external_blobs_for_token_all_dirs(
+          dir, token, false, true, &removed_generic_sidecar);
   if (generic_final_status != Preserve_snapshot_delete_status::OK) error = true;
   removed_sidecar = removed_sidecar || removed_generic_sidecar;
   bool removed_temp_sidecar = false;
@@ -1143,7 +1254,7 @@ Preserve_snapshot_delete_status delete_snapshot_files_with_status(
     error = true;
   if (!error) return Preserve_snapshot_delete_status::OK;
 
-  return snapshot_file_removed || !file_exists(snapshot_path)
+  return snapshot_file_removed
              ? Preserve_snapshot_delete_status::ERROR_AFTER_SNAPSHOT_DELETE
              : Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE;
 }
@@ -1234,6 +1345,27 @@ Preserve_snapshot_delete_status remove_generic_external_blobs_for_token(
                : Preserve_snapshot_delete_status::OK;
 }
 
+Preserve_snapshot_delete_status remove_generic_external_blobs_for_token_all_dirs(
+    const std::string &dir, const std::string &token, bool remove_tmp,
+    bool remove_final, bool *removed_any) {
+  bool any_removed = false;
+  bool error = false;
+  for (const std::string &candidate_dir :
+       generic_external_blob_dirs_for_token(dir, token)) {
+    bool removed_in_dir = false;
+    const Preserve_snapshot_delete_status status =
+        remove_generic_external_blobs_for_token(candidate_dir, token,
+                                                remove_tmp, remove_final,
+                                                &removed_in_dir);
+    if (status != Preserve_snapshot_delete_status::OK) error = true;
+    if (removed_in_dir && fsync_directory(candidate_dir)) error = true;
+    any_removed = any_removed || removed_in_dir;
+  }
+  if (removed_any != nullptr) *removed_any = any_removed;
+  return error ? Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE
+               : Preserve_snapshot_delete_status::OK;
+}
+
 bool token_has_unexpected_external_blob(
     const std::string &dir, const std::string &token,
     const std::set<std::string> &expected_blob_names,
@@ -1250,32 +1382,40 @@ bool token_has_unexpected_external_blob(
     return true;
   }
 
-  MY_DIR *dir_info = my_dir(dir.c_str(), MYF(MY_DONT_SORT | MY_WANT_STAT));
-  if (dir_info == nullptr) return my_errno() != ENOENT;
+  for (const std::string &candidate_dir :
+       generic_external_blob_dirs_for_token(dir, token)) {
+    MY_DIR *dir_info =
+        my_dir(candidate_dir.c_str(), MYF(MY_DONT_SORT | MY_WANT_STAT));
+    if (dir_info == nullptr) {
+      if (my_errno() == ENOENT) continue;
+      return true;
+    }
 
-  bool unexpected = false;
-  for (uint i = 0; i < static_cast<uint>(dir_info->number_off_files); ++i) {
-    FILEINFO *file = dir_info->dir_entry + i;
-    if (file->mystat != nullptr && MY_S_ISDIR(file->mystat->st_mode)) {
-      continue;
+    bool unexpected = false;
+    for (uint i = 0; i < static_cast<uint>(dir_info->number_off_files); ++i) {
+      FILEINFO *file = dir_info->dir_entry + i;
+      if (file->mystat != nullptr && MY_S_ISDIR(file->mystat->st_mode)) {
+        continue;
+      }
+      std::string sidecar_token;
+      std::string blob_name;
+      bool tmp_artifact = false;
+      if (!filename_to_generic_external_blob(file->name, &sidecar_token,
+                                             &blob_name, &tmp_artifact) ||
+          sidecar_token != token || tmp_artifact) {
+        continue;
+      }
+      if (expected_blob_names.find(blob_name) == expected_blob_names.end() ||
+          allowed_existing_blob_names.find(blob_name) ==
+              allowed_existing_blob_names.end()) {
+        unexpected = true;
+        break;
+      }
     }
-    std::string sidecar_token;
-    std::string blob_name;
-    bool tmp_artifact = false;
-    if (!filename_to_generic_external_blob(file->name, &sidecar_token,
-                                           &blob_name, &tmp_artifact) ||
-        sidecar_token != token || tmp_artifact) {
-      continue;
-    }
-    if (expected_blob_names.find(blob_name) == expected_blob_names.end() ||
-        allowed_existing_blob_names.find(blob_name) ==
-            allowed_existing_blob_names.end()) {
-      unexpected = true;
-      break;
-    }
+    my_dirend(dir_info);
+    if (unexpected) return true;
   }
-  my_dirend(dir_info);
-  return unexpected;
+  return false;
 }
 
 bool filename_to_temp_sidecar_token(const char *filename, std::string *token,
@@ -1431,21 +1571,28 @@ Local_file_preserved_trx_carrier::write_external_blobs_new(
     return Preserved_trx_carrier_status::CORRUPT;
   }
   if (ensure_directory(m_dir)) return Preserved_trx_carrier_status::IO_ERROR;
-  if (file_exists(join_path(m_dir, token + ".bin"))) {
-    return Preserved_trx_carrier_status::ALREADY_EXISTS;
+  if (!m_write_options.fast_new_token_state) {
+    for (const std::string &candidate_dir :
+         snapshot_dirs_for_token(m_dir, token)) {
+      if (file_exists(join_path(candidate_dir, token + ".bin"))) {
+        return Preserved_trx_carrier_status::ALREADY_EXISTS;
+      }
+    }
   }
   std::set<std::string> blob_names;
   std::set<std::string> allowed_existing_blob_names;
   for (const Preserved_trx_external_blob &blob : external_blobs) {
     if (!external_blob_name_is_filename_safe(blob.name) ||
         !blob_names.insert(blob.name).second ||
-        (blob.prebuilt && blob.name != kPreservedTrxBlobBinlogCache) ||
+        (blob.prebuilt &&
+         !prebuilt_external_blob_name_is_supported(blob.name)) ||
         (!blob.prebuilt && blob.payload.empty())) {
       return Preserved_trx_carrier_status::CORRUPT;
     }
     if (blob.prebuilt) allowed_existing_blob_names.insert(blob.name);
   }
-  if (token_has_unexpected_external_blob(m_dir, token, blob_names,
+  if (!m_write_options.fast_new_token_state &&
+      token_has_unexpected_external_blob(m_dir, token, blob_names,
                                          allowed_existing_blob_names)) {
     return Preserved_trx_carrier_status::ALREADY_EXISTS;
   }
@@ -1455,12 +1602,20 @@ Local_file_preserved_trx_carrier::write_external_blobs_new(
       return Preserved_trx_carrier_status::CORRUPT;
     }
     std::vector<unsigned char> bytes(blob.payload.begin(), blob.payload.end());
+    if (m_write_options.shard_generic_external_blobs &&
+        generic_external_blob_uses_shard(blob.name) &&
+        ensure_generic_external_blob_shard_dir(m_dir, token)) {
+      return Preserved_trx_carrier_status::IO_ERROR;
+    }
     const std::string filename = external_blob_filename(token, blob.name);
+    const std::string write_dir = external_blob_dir_for_new_write(
+        m_dir, token, blob.name, m_write_options);
     const Preserved_trx_carrier_status status = map_atomic_write_status(
-        atomic_write_file(m_dir, filename, bytes, 0600, m_write_options, true));
+        atomic_write_file(write_dir, filename, bytes, 0600, m_write_options,
+                          true));
     if (status != Preserved_trx_carrier_status::OK) {
       if (status == Preserved_trx_carrier_status::IO_ERROR &&
-          file_exists(join_path(m_dir, filename)) &&
+          file_exists(join_path(write_dir, filename)) &&
           written_external_blobs != nullptr) {
         written_external_blobs->push_back(blob);
       }
@@ -1479,12 +1634,23 @@ Local_file_preserved_trx_carrier::write_snapshot_new(
   if (!token_is_filename_safe(token)) {
     return Preserved_trx_carrier_status::CORRUPT;
   }
-  if (file_exists(join_path(m_dir, token + ".bin"))) {
-    return Preserved_trx_carrier_status::ALREADY_EXISTS;
+  if (m_write_options.shard_snapshot_files &&
+      ensure_generic_external_blob_shard_dir(m_dir, token)) {
+    return Preserved_trx_carrier_status::IO_ERROR;
   }
+  if (!m_write_options.fast_new_token_state) {
+    for (const std::string &candidate_dir :
+         snapshot_dirs_for_token(m_dir, token)) {
+      if (file_exists(join_path(candidate_dir, token + ".bin"))) {
+        return Preserved_trx_carrier_status::ALREADY_EXISTS;
+      }
+    }
+  }
+  const std::string write_dir =
+      snapshot_dir_for_new_write(m_dir, token, m_write_options);
   bool final_file_installed = false;
   const Atomic_write_status status =
-      atomic_write_file(m_dir, token + ".bin", snapshot_bytes, 0600,
+      atomic_write_file(write_dir, token + ".bin", snapshot_bytes, 0600,
                         m_write_options, true, false,
                         &final_file_installed);
   if (status == Atomic_write_status::IO_ERROR && final_file_installed) {
@@ -1502,22 +1668,36 @@ Local_file_preserved_trx_carrier::remove_external_blobs(
     return Preserved_trx_carrier_status::CORRUPT;
   }
   bool removed_any = false;
+  std::set<std::string> dirs_with_removals;
   for (const Preserved_trx_external_blob &blob : external_blobs) {
     if (!external_blob_name_is_filename_safe(blob.name)) {
       return Preserved_trx_carrier_status::CORRUPT;
     }
-    const std::string path = join_path(m_dir,
-                                       external_blob_filename(token, blob.name));
-    for (const std::string &candidate : {path, path + ".tmp"}) {
-      if (my_delete(candidate.c_str(), MYF(0))) {
-        if (my_errno() != ENOENT) return Preserved_trx_carrier_status::IO_ERROR;
-      } else {
-        removed_any = true;
+    std::vector<std::string> candidate_dirs;
+    if (generic_external_blob_uses_shard(blob.name)) {
+      candidate_dirs = generic_external_blob_dirs_for_token(m_dir, token);
+    } else {
+      candidate_dirs.push_back(normalize_dir(m_dir));
+    }
+    for (const std::string &candidate_dir : candidate_dirs) {
+      const std::string path =
+          join_path(candidate_dir, external_blob_filename(token, blob.name));
+      for (const std::string &candidate : {path, path + ".tmp"}) {
+        if (my_delete(candidate.c_str(), MYF(0))) {
+          if (my_errno() != ENOENT)
+            return Preserved_trx_carrier_status::IO_ERROR;
+        } else {
+          removed_any = true;
+          dirs_with_removals.insert(candidate_dir);
+        }
       }
     }
   }
-  if (removed_any && fsync_directory(m_dir)) {
-    return Preserved_trx_carrier_status::IO_ERROR;
+  if (removed_any) {
+    dirs_with_removals.insert(normalize_dir(m_dir));
+    for (const std::string &dir : dirs_with_removals) {
+      if (fsync_directory(dir)) return Preserved_trx_carrier_status::IO_ERROR;
+    }
   }
   return Preserved_trx_carrier_status::OK;
 }
@@ -1529,7 +1709,7 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::read_existing(
   if (encoded == nullptr || !token_is_filename_safe(token)) {
     return Preserved_trx_carrier_status::CORRUPT;
   }
-  const std::string snapshot_path = join_path(m_dir, token + ".bin");
+  const std::string snapshot_path = snapshot_path_for_existing_token(m_dir, token);
   if (!file_exists(snapshot_path)) {
     return Preserved_trx_carrier_status::NOT_FOUND;
   }
@@ -1543,13 +1723,16 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::read_existing(
   if (payload_read_mode == Payload_read_mode::SNAPSHOT_ONLY) {
     return Preserved_trx_carrier_status::OK;
   }
-  const bool metadata_only = payload_read_mode == Payload_read_mode::METADATA_ONLY;
+  const bool metadata_only =
+      payload_read_mode == Payload_read_mode::METADATA_ONLY;
+  const bool semantic_external_blobs =
+      payload_read_mode == Payload_read_mode::WITH_SEMANTIC_EXTERNAL_BLOBS;
 
   const std::string binlog_cache_path =
       join_path(m_dir, token + ".binlog_cache");
   if (file_exists(binlog_cache_path)) {
     Preserved_trx_external_blob blob;
-    if (metadata_only) {
+    if (metadata_only || semantic_external_blobs) {
       read_status = read_external_blob_metadata(
           binlog_cache_path, kPreservedTrxBlobBinlogCache,
           read_limits.max_external_blob_bytes, &blob);
@@ -1567,48 +1750,51 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::read_existing(
     if (read_status != Preserved_trx_carrier_status::OK) return read_status;
     encoded->external_blobs.push_back(std::move(blob));
   }
-  MY_DIR *dir_info = my_dir(m_dir.c_str(), MYF(MY_DONT_SORT | MY_WANT_STAT));
-  if (dir_info == nullptr) {
-    return my_errno() == ENOENT ? Preserved_trx_carrier_status::OK
-                                : Preserved_trx_carrier_status::IO_ERROR;
-  }
-  for (uint i = 0; i < static_cast<uint>(dir_info->number_off_files); ++i) {
-    FILEINFO *file = dir_info->dir_entry + i;
-    if (file->mystat != nullptr && MY_S_ISDIR(file->mystat->st_mode)) {
-      continue;
+  for (const std::string &candidate_dir :
+       generic_external_blob_dirs_for_token(m_dir, token)) {
+    MY_DIR *dir_info =
+        my_dir(candidate_dir.c_str(), MYF(MY_DONT_SORT | MY_WANT_STAT));
+    if (dir_info == nullptr) {
+      if (my_errno() == ENOENT) continue;
+      return Preserved_trx_carrier_status::IO_ERROR;
     }
-    std::string sidecar_token;
-    std::string blob_name;
-    bool tmp_artifact = false;
-    if (!filename_to_generic_external_blob(file->name, &sidecar_token,
-                                           &blob_name, &tmp_artifact) ||
-        sidecar_token != token || tmp_artifact) {
-      continue;
-    }
-    Preserved_trx_external_blob blob;
-    if (metadata_only) {
-      read_status = read_external_blob_metadata(
-          join_path(m_dir, file->name), blob_name,
-          read_limits.max_external_blob_bytes, &blob);
-    } else {
-      std::vector<unsigned char> bytes;
-      read_status = read_file_limited(
-          join_path(m_dir, file->name), read_limits.max_external_blob_bytes,
-          &bytes);
-      if (read_status == Preserved_trx_carrier_status::OK) {
-        blob.name = std::move(blob_name);
-        blob.payload.assign(reinterpret_cast<const char *>(bytes.data()),
-                            bytes.size());
-        set_blob_descriptor_from_payload(&blob);
+    for (uint i = 0; i < static_cast<uint>(dir_info->number_off_files); ++i) {
+      FILEINFO *file = dir_info->dir_entry + i;
+      if (file->mystat != nullptr && MY_S_ISDIR(file->mystat->st_mode)) {
+        continue;
       }
+      std::string sidecar_token;
+      std::string blob_name;
+      bool tmp_artifact = false;
+      if (!filename_to_generic_external_blob(file->name, &sidecar_token,
+                                             &blob_name, &tmp_artifact) ||
+          sidecar_token != token || tmp_artifact) {
+        continue;
+      }
+      Preserved_trx_external_blob blob;
+      const std::string blob_path = join_path(candidate_dir, file->name);
+      if (metadata_only) {
+        read_status = read_external_blob_metadata(
+            blob_path, blob_name, read_limits.max_external_blob_bytes, &blob);
+      } else {
+        std::vector<unsigned char> bytes;
+        read_status = read_file_limited(
+            blob_path, read_limits.max_external_blob_bytes, &bytes);
+        if (read_status == Preserved_trx_carrier_status::OK) {
+          blob.name = std::move(blob_name);
+          blob.payload.assign(reinterpret_cast<const char *>(bytes.data()),
+                              bytes.size());
+          set_blob_descriptor_from_payload(&blob);
+        }
+      }
+      if (read_status != Preserved_trx_carrier_status::OK) {
+        my_dirend(dir_info);
+        return read_status;
+      }
+      encoded->external_blobs.push_back(std::move(blob));
     }
-    if (read_status != Preserved_trx_carrier_status::OK) {
-      my_dirend(dir_info);
-      return read_status;
-    }
-    encoded->external_blobs.push_back(std::move(blob));
+    my_dirend(dir_info);
   }
-  my_dirend(dir_info);
   return Preserved_trx_carrier_status::OK;
 }
 
@@ -1617,13 +1803,17 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::rewrite_existing(
   if (!token_is_filename_safe(token)) {
     return Preserved_trx_carrier_status::CORRUPT;
   }
-  if (!file_exists(join_path(m_dir, token + ".bin"))) {
+  const std::string snapshot_path = snapshot_path_for_existing_token(m_dir, token);
+  if (!file_exists(snapshot_path)) {
     return Preserved_trx_carrier_status::NOT_FOUND;
   }
+  const std::string snapshot_dir =
+      snapshot_path.substr(0, snapshot_path.find_last_of(FN_DIRSEP));
+  const std::string snapshot_filename = filename_from_path(snapshot_path);
   const bool remove_stale_tmp_before_create = true;
   return map_atomic_write_status(
-      atomic_write_file(m_dir, token + ".bin", snapshot_bytes, 0600, {}, false,
-                        remove_stale_tmp_before_create));
+      atomic_write_file(snapshot_dir, snapshot_filename, snapshot_bytes, 0600,
+                        {}, false, remove_stale_tmp_before_create));
 }
 
 Preserve_snapshot_delete_status
@@ -1671,48 +1861,141 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::list_tokens(
   listing->tainted_tokens.clear();
   listing->warm_external_blob_artifacts.clear();
 
-  MY_DIR *dir_info = my_dir(m_dir.c_str(), MYF(MY_DONT_SORT | MY_WANT_STAT));
+  auto scan_listing_dir = [&](const std::string &scan_dir,
+                              bool include_warm_artifacts) {
+    MY_DIR *dir_info = my_dir(scan_dir.c_str(), MYF(MY_DONT_SORT | MY_WANT_STAT));
+    if (dir_info == nullptr) {
+      return my_errno() == ENOENT ? Preserved_trx_carrier_status::OK
+                                  : Preserved_trx_carrier_status::IO_ERROR;
+    }
+
+    for (uint i = 0; i < static_cast<uint>(dir_info->number_off_files); ++i) {
+      FILEINFO *file = dir_info->dir_entry + i;
+      if (file->mystat != nullptr && MY_S_ISDIR(file->mystat->st_mode)) {
+        continue;
+      }
+
+      std::string token;
+      if (filename_to_token(file->name, ".bin", &token)) {
+        listing->snapshot_tokens.insert(token);
+        continue;
+      }
+      if (filename_to_token(file->name, ".binlog_cache", &token)) {
+        listing->external_blob_tokens.insert(token);
+        continue;
+      }
+      std::string blob_name;
+      bool tmp_artifact = false;
+      if (filename_to_generic_external_blob(file->name, &token, &blob_name,
+                                            &tmp_artifact)) {
+        listing->external_blob_tokens.insert(token);
+        continue;
+      }
+      if (filename_to_token(file->name, ".tainted", &token)) {
+        listing->tainted_tokens.insert(token);
+        continue;
+      }
+      if (filename_to_temp_sidecar_token(file->name, &token)) {
+        listing->temp_sidecar_tokens.insert(token);
+        continue;
+      }
+      if (include_warm_artifacts) {
+        std::string warm_artifact;
+        if (filename_is_warm_external_blob_artifact(file->name,
+                                                    &warm_artifact)) {
+          listing->warm_external_blob_artifacts.insert(warm_artifact);
+        }
+      }
+    }
+    my_dirend(dir_info);
+    return Preserved_trx_carrier_status::OK;
+  };
+
+  Preserved_trx_carrier_status status = scan_listing_dir(m_dir, true);
+  if (status != Preserved_trx_carrier_status::OK) return status;
+
+  const std::string shard_root = join_path(m_dir, kGenericExternalBlobShardRoot);
+  MY_DIR *dir_info = my_dir(shard_root.c_str(), MYF(MY_DONT_SORT | MY_WANT_STAT));
   if (dir_info == nullptr) {
     return my_errno() == ENOENT ? Preserved_trx_carrier_status::OK
                                 : Preserved_trx_carrier_status::IO_ERROR;
   }
-
   for (uint i = 0; i < static_cast<uint>(dir_info->number_off_files); ++i) {
     FILEINFO *file = dir_info->dir_entry + i;
-    if (file->mystat != nullptr && MY_S_ISDIR(file->mystat->st_mode)) {
+    if (file->mystat == nullptr || !MY_S_ISDIR(file->mystat->st_mode))
       continue;
-    }
-
-    std::string token;
-    if (filename_to_token(file->name, ".bin", &token)) {
-      listing->snapshot_tokens.insert(token);
-      continue;
-    }
-    if (filename_to_token(file->name, ".binlog_cache", &token)) {
-      listing->external_blob_tokens.insert(token);
-      continue;
-    }
-    std::string blob_name;
-    bool tmp_artifact = false;
-    if (filename_to_generic_external_blob(file->name, &token, &blob_name,
-                                          &tmp_artifact)) {
-      listing->external_blob_tokens.insert(token);
-      continue;
-    }
-    if (filename_to_token(file->name, ".tainted", &token)) {
-      listing->tainted_tokens.insert(token);
-      continue;
-    }
-    if (filename_to_temp_sidecar_token(file->name, &token)) {
-      listing->temp_sidecar_tokens.insert(token);
-      continue;
-    }
-    std::string warm_artifact;
-    if (filename_is_warm_external_blob_artifact(file->name, &warm_artifact)) {
-      listing->warm_external_blob_artifacts.insert(warm_artifact);
+    status = scan_listing_dir(join_path(shard_root, file->name), false);
+    if (status != Preserved_trx_carrier_status::OK) {
+      my_dirend(dir_info);
+      return status;
     }
   }
   my_dirend(dir_info);
+  return Preserved_trx_carrier_status::OK;
+}
+
+Preserved_trx_carrier_status Local_file_preserved_trx_carrier::token_state(
+    const std::string &token, Preserved_trx_carrier_token_state *state) {
+  if (state == nullptr) return Preserved_trx_carrier_status::CORRUPT;
+  *state = {};
+  if (!token_is_filename_safe(token)) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  if (m_write_options.fast_new_token_state) {
+    return Preserved_trx_carrier_status::OK;
+  }
+
+  state->snapshot = false;
+  for (const std::string &candidate_dir : snapshot_dirs_for_token(m_dir, token)) {
+    if (file_exists(join_path(candidate_dir, token + ".bin"))) {
+      state->snapshot = true;
+      break;
+    }
+  }
+  state->external_blob =
+      file_exists(join_path(m_dir, external_blob_filename(
+                                      token, kPreservedTrxBlobBinlogCache))) ||
+      file_exists(join_path(m_dir, external_blob_filename(
+                                      token, kPreservedTrxBlobRecordLocks))) ||
+      file_exists(join_path(generic_external_blob_shard_dir(m_dir, token),
+                            external_blob_filename(
+                                token, kPreservedTrxBlobRecordLocks)));
+  state->tainted = file_exists(join_path(m_dir, token + ".tainted"));
+
+  for (const std::string &candidate_dir :
+       generic_external_blob_dirs_for_token(m_dir, token)) {
+    MY_DIR *dir_info =
+        my_dir(candidate_dir.c_str(), MYF(MY_DONT_SORT | MY_WANT_STAT));
+    if (dir_info == nullptr) {
+      if (my_errno() == ENOENT) continue;
+      return Preserved_trx_carrier_status::IO_ERROR;
+    }
+    for (uint i = 0; i < static_cast<uint>(dir_info->number_off_files); ++i) {
+      FILEINFO *file = dir_info->dir_entry + i;
+      if (file->mystat != nullptr && MY_S_ISDIR(file->mystat->st_mode)) {
+        continue;
+      }
+      std::string sidecar_token;
+      if (candidate_dir == normalize_dir(m_dir) &&
+          filename_to_temp_sidecar_token(file->name, &sidecar_token) &&
+          sidecar_token == token) {
+        state->temp_sidecar = true;
+        break;
+      }
+      if (!state->external_blob) {
+        std::string blob_token;
+        std::string blob_name;
+        bool tmp_artifact = false;
+        if (filename_to_generic_external_blob(file->name, &blob_token,
+                                              &blob_name, &tmp_artifact) &&
+            blob_token == token && !tmp_artifact) {
+          state->external_blob = true;
+        }
+      }
+    }
+    my_dirend(dir_info);
+    if (state->temp_sidecar && state->external_blob) break;
+  }
   return Preserved_trx_carrier_status::OK;
 }
 
@@ -1747,7 +2030,7 @@ Local_file_preserved_trx_carrier::create_warm_external_blob_writer(
     uint64_t epoch,
     std::unique_ptr<Preserved_trx_external_blob_writer> *writer) {
   if (writer == nullptr || !token_is_filename_safe(warmcopy_id) ||
-      blob_name != kPreservedTrxBlobBinlogCache) {
+      !prebuilt_external_blob_name_is_supported(blob_name)) {
     return Preserved_trx_carrier_status::CORRUPT;
   }
   if (ensure_directory(m_dir)) return Preserved_trx_carrier_status::IO_ERROR;
@@ -1766,44 +2049,74 @@ Preserved_trx_carrier_status
 Local_file_preserved_trx_carrier::adopt_warm_external_blob(
     const std::string &warmcopy_id, const std::string &token,
     const std::string &blob_name,
+    uint64_t warmcopy_epoch,
     const Preserved_trx_external_blob_descriptor &descriptor) {
   if (!token_is_filename_safe(warmcopy_id) || !token_is_filename_safe(token) ||
-      blob_name != kPreservedTrxBlobBinlogCache ||
+      !prebuilt_external_blob_name_is_supported(blob_name) ||
       descriptor.name != blob_name) {
     return Preserved_trx_carrier_status::CORRUPT;
   }
-  if (file_exists(join_path(m_dir, token + ".bin")) ||
-      file_exists(join_path(m_dir, token + ".binlog_cache"))) {
-    return Preserved_trx_carrier_status::ALREADY_EXISTS;
+  if (m_write_options.shard_generic_external_blobs &&
+      generic_external_blob_uses_shard(blob_name) &&
+      ensure_generic_external_blob_shard_dir(m_dir, token)) {
+    return Preserved_trx_carrier_status::IO_ERROR;
   }
-
-  MY_DIR *dir_info = my_dir(m_dir.c_str(), MYF(MY_DONT_SORT | MY_WANT_STAT));
-  if (dir_info == nullptr) {
-    return my_errno() == ENOENT ? Preserved_trx_carrier_status::NOT_FOUND
-                                : Preserved_trx_carrier_status::IO_ERROR;
+  const std::string final_blob_path =
+      external_blob_path_for_new_write(m_dir, token, blob_name,
+                                       m_write_options);
+  if (!m_write_options.fast_prebuilt_blob_adopt) {
+    bool existing_external_blob = file_exists(final_blob_path);
+    if (generic_external_blob_uses_shard(blob_name)) {
+      for (const std::string &candidate_dir :
+           generic_external_blob_dirs_for_token(m_dir, token)) {
+        existing_external_blob =
+            existing_external_blob ||
+            file_exists(join_path(candidate_dir,
+                                  external_blob_filename(token, blob_name)));
+      }
+    }
+    bool existing_snapshot = false;
+    for (const std::string &candidate_dir :
+         snapshot_dirs_for_token(m_dir, token)) {
+      existing_snapshot = existing_snapshot ||
+                          file_exists(join_path(candidate_dir, token + ".bin"));
+    }
+    if (existing_snapshot || existing_external_blob) {
+      return Preserved_trx_carrier_status::ALREADY_EXISTS;
+    }
   }
 
   std::string warm_filename;
-  bool duplicate = false;
-  for (uint i = 0; i < static_cast<uint>(dir_info->number_off_files); ++i) {
-    FILEINFO *file = dir_info->dir_entry + i;
-    if (file->mystat != nullptr && MY_S_ISDIR(file->mystat->st_mode)) {
-      continue;
+  if (warmcopy_epoch > 0) {
+    warm_filename =
+        warm_external_blob_filename(warmcopy_id, blob_name, warmcopy_epoch);
+  } else {
+    MY_DIR *dir_info = my_dir(m_dir.c_str(), MYF(MY_DONT_SORT | MY_WANT_STAT));
+    if (dir_info == nullptr) {
+      return my_errno() == ENOENT ? Preserved_trx_carrier_status::NOT_FOUND
+                                  : Preserved_trx_carrier_status::IO_ERROR;
     }
-    std::string candidate;
-    if (!filename_is_warm_external_blob_for(file->name, warmcopy_id, blob_name,
-                                            &candidate)) {
-      continue;
+    bool duplicate = false;
+    for (uint i = 0; i < static_cast<uint>(dir_info->number_off_files); ++i) {
+      FILEINFO *file = dir_info->dir_entry + i;
+      if (file->mystat != nullptr && MY_S_ISDIR(file->mystat->st_mode)) {
+        continue;
+      }
+      std::string candidate;
+      if (!filename_is_warm_external_blob_for(file->name, warmcopy_id, blob_name,
+                                              &candidate)) {
+        continue;
+      }
+      if (!warm_filename.empty()) {
+        duplicate = true;
+        break;
+      }
+      warm_filename = candidate;
     }
-    if (!warm_filename.empty()) {
-      duplicate = true;
-      break;
-    }
-    warm_filename = candidate;
+    my_dirend(dir_info);
+    if (duplicate) return Preserved_trx_carrier_status::CORRUPT;
   }
-  my_dirend(dir_info);
 
-  if (duplicate) return Preserved_trx_carrier_status::CORRUPT;
   if (warm_filename.empty()) return Preserved_trx_carrier_status::NOT_FOUND;
 
   MY_STAT stat_area;
@@ -1818,17 +2131,20 @@ Local_file_preserved_trx_carrier::adopt_warm_external_blob(
       static_cast<uint64_t>(stat_area.st_size) != descriptor.size) {
     return Preserved_trx_carrier_status::CORRUPT;
   }
-  Preserved_trx_external_blob_descriptor sealed_descriptor;
-  const Preserved_trx_carrier_status descriptor_status =
-      read_warm_external_blob_descriptor(
-          join_path(m_dir, warm_external_blob_descriptor_filename(warm_filename)),
-          blob_name, &sealed_descriptor);
-  if (descriptor_status != Preserved_trx_carrier_status::OK)
-    return descriptor_status;
-  if (sealed_descriptor.name != descriptor.name ||
-      sealed_descriptor.size != descriptor.size ||
-      sealed_descriptor.digest != descriptor.digest) {
-    return Preserved_trx_carrier_status::CORRUPT;
+  if (!m_write_options.fast_prebuilt_blob_adopt) {
+    Preserved_trx_external_blob_descriptor sealed_descriptor;
+    const Preserved_trx_carrier_status descriptor_status =
+        read_warm_external_blob_descriptor(
+            join_path(m_dir,
+                      warm_external_blob_descriptor_filename(warm_filename)),
+            blob_name, &sealed_descriptor);
+    if (descriptor_status != Preserved_trx_carrier_status::OK)
+      return descriptor_status;
+    if (sealed_descriptor.name != descriptor.name ||
+        sealed_descriptor.size != descriptor.size ||
+        sealed_descriptor.digest != descriptor.digest) {
+      return Preserved_trx_carrier_status::CORRUPT;
+    }
   }
 
   DBUG_EXECUTE_IF("preserve_trx_corrupt_warmcopy_blob_after_descriptor", {
@@ -1841,37 +2157,42 @@ Local_file_preserved_trx_carrier::adopt_warm_external_blob(
     }
   });
 
-  Preserved_trx_external_blob verified_blob;
-  const Preserved_trx_carrier_status verify_status =
-      read_external_blob_metadata(warm_path, blob_name, descriptor.size,
-                                  &verified_blob);
-  if (verify_status != Preserved_trx_carrier_status::OK) return verify_status;
-  if (verified_blob.descriptor.name != descriptor.name ||
-      verified_blob.descriptor.size != descriptor.size ||
-      verified_blob.descriptor.digest != descriptor.digest) {
-    return Preserved_trx_carrier_status::CORRUPT;
-  }
-
+  /*
+    The writer sealed and fsynced both the warm blob and its descriptor during
+    phase 1.  Re-hashing the full blob here moves O(blob size) I/O back into
+    the phase-2 blocked window.  Keep the phase-2 adopt path bounded to file
+    shape + sealed descriptor checks; recovery/resume reads the external body
+    and validates its digest against the snapshot descriptor before import.
+  */
   const Preserved_trx_carrier_status status = map_atomic_write_status(
-      install_temp_file(warm_path, join_path(m_dir, token + ".binlog_cache"),
-                        true, nullptr));
+      install_temp_file(warm_path, final_blob_path, true, nullptr));
   if (status != Preserved_trx_carrier_status::OK) return status;
-  if (my_delete(join_path(
-                    m_dir, warm_external_blob_descriptor_filename(warm_filename))
-                    .c_str(),
-                MYF(0)) &&
-      my_errno() != ENOENT) {
-    return Preserved_trx_carrier_status::IO_ERROR;
+  if (!m_write_options.fast_prebuilt_blob_adopt) {
+    if (my_delete(join_path(
+                      m_dir,
+                      warm_external_blob_descriptor_filename(warm_filename))
+                      .c_str(),
+                  MYF(0)) &&
+        my_errno() != ENOENT) {
+      return Preserved_trx_carrier_status::IO_ERROR;
+    }
   }
-  return fsync_directory(m_dir) ? Preserved_trx_carrier_status::IO_ERROR
-                                : Preserved_trx_carrier_status::OK;
+  /*
+    Preserved_trx_store::write() adopts prebuilt blobs before installing the
+    snapshot .bin file. The subsequent snapshot write fsyncs this same
+    directory, making the adopted sidecar and descriptor removal durable at the
+    point where a recoverable snapshot can first exist. If the server exits
+    before that snapshot fsync, no .bin references the sidecar and recovery may
+    treat it as an orphan artifact.
+  */
+  return Preserved_trx_carrier_status::OK;
 }
 
 Preserved_trx_carrier_status
 Local_file_preserved_trx_carrier::remove_warm_external_blob(
     const std::string &warmcopy_id, const std::string &blob_name) {
   if (!token_is_filename_safe(warmcopy_id) ||
-      blob_name != kPreservedTrxBlobBinlogCache) {
+      !prebuilt_external_blob_name_is_supported(blob_name)) {
     return Preserved_trx_carrier_status::CORRUPT;
   }
 
@@ -1920,6 +2241,40 @@ Preserved_trx_store_handle create_preserved_trx_default_store(
   read_limits.max_external_blob_bytes = preserve_trx_max_binlog_cache_bytes;
   return Preserved_trx_store_handle(
       std::make_unique<Local_file_preserved_trx_carrier>(dir), read_limits);
+}
+
+Preserved_trx_store_handle create_preserved_trx_default_store(
+    const std::string &dir,
+    const Preserve_snapshot_write_options &write_options) {
+  Preserved_trx_carrier_read_limits read_limits;
+  read_limits.max_snapshot_bytes = preserve_trx_max_snapshot_bytes;
+  read_limits.max_external_blob_bytes = preserve_trx_max_binlog_cache_bytes;
+  return Preserved_trx_store_handle(
+      std::make_unique<Local_file_preserved_trx_carrier>(dir, write_options),
+      read_limits);
+}
+
+Preserve_snapshot_status preserve_trx_fsync_default_store_directory(
+    const std::string &dir) {
+  const std::string root = normalize_dir(dir);
+  if (fsync_directory(root)) return Preserve_snapshot_status::IO_ERROR;
+
+  const std::string shard_root = join_path(root, kGenericExternalBlobShardRoot);
+  MY_DIR *dir_info = my_dir(shard_root.c_str(), MYF(MY_DONT_SORT | MY_WANT_STAT));
+  if (dir_info == nullptr) {
+    return my_errno() == ENOENT ? Preserve_snapshot_status::OK
+                                : Preserve_snapshot_status::IO_ERROR;
+  }
+  bool error = fsync_directory(shard_root);
+  for (uint i = 0; i < static_cast<uint>(dir_info->number_off_files); ++i) {
+    FILEINFO *file = dir_info->dir_entry + i;
+    if (file->mystat == nullptr || !MY_S_ISDIR(file->mystat->st_mode))
+      continue;
+    if (fsync_directory(join_path(shard_root, file->name))) error = true;
+  }
+  my_dirend(dir_info);
+  return error ? Preserve_snapshot_status::IO_ERROR
+               : Preserve_snapshot_status::OK;
 }
 
 std::unique_ptr<Preserved_trx_warm_external_blob_carrier>
@@ -2018,31 +2373,72 @@ bool preserved_trx_default_carrier_token_exists(const std::string &dir,
                                                 const std::string &token) {
   if (!token_is_filename_safe(token)) return false;
   const std::string normalized_dir = normalize_dir(dir);
-  if (file_exists(join_path(normalized_dir, token + ".bin")) ||
-      file_exists(join_path(normalized_dir, token + ".binlog_cache"))) {
+  if (file_exists(join_path(normalized_dir, token + ".binlog_cache"))) {
+    return true;
+  }
+  for (const std::string &candidate_dir :
+       snapshot_dirs_for_token(normalized_dir, token)) {
+    if (file_exists(join_path(candidate_dir, token + ".bin"))) return true;
+  }
+
+  bool found = false;
+  for (const std::string &candidate_dir :
+       generic_external_blob_dirs_for_token(normalized_dir, token)) {
+    MY_DIR *dir_info =
+        my_dir(candidate_dir.c_str(), MYF(MY_DONT_SORT | MY_WANT_STAT));
+    if (dir_info == nullptr) continue;
+
+    for (uint i = 0; i < static_cast<uint>(dir_info->number_off_files); ++i) {
+      FILEINFO *file = dir_info->dir_entry + i;
+      if (file->mystat != nullptr && MY_S_ISDIR(file->mystat->st_mode)) {
+        continue;
+      }
+      std::string sidecar_token;
+      std::string blob_name;
+      bool tmp_artifact = false;
+      if (filename_to_generic_external_blob(file->name, &sidecar_token,
+                                            &blob_name, &tmp_artifact) &&
+          sidecar_token == token) {
+        found = true;
+        break;
+      }
+    }
+    my_dirend(dir_info);
+    if (found) break;
+  }
+  return found;
+}
+
+bool preserved_trx_default_carrier_generated_token_exists(
+    const std::string &dir, const std::string &token) {
+  if (!token_is_filename_safe(token)) return false;
+  const std::string normalized_dir = normalize_dir(dir);
+
+  if (file_exists(join_path(normalized_dir, token + ".binlog_cache")) ||
+      file_exists(join_path(normalized_dir, token + ".binlog_cache.tmp")) ||
+      file_exists(join_path(normalized_dir, token + ".tainted")) ||
+      file_exists(join_path(normalized_dir, token + ".tainted.tmp"))) {
     return true;
   }
 
-  MY_DIR *dir_info =
-      my_dir(normalized_dir.c_str(), MYF(MY_DONT_SORT | MY_WANT_STAT));
-  if (dir_info == nullptr) return false;
-
-  bool found = false;
-  for (uint i = 0; i < static_cast<uint>(dir_info->number_off_files); ++i) {
-    FILEINFO *file = dir_info->dir_entry + i;
-    if (file->mystat != nullptr && MY_S_ISDIR(file->mystat->st_mode)) {
-      continue;
-    }
-    std::string sidecar_token;
-    std::string blob_name;
-    bool tmp_artifact = false;
-    if (filename_to_generic_external_blob(file->name, &sidecar_token,
-                                          &blob_name, &tmp_artifact) &&
-        sidecar_token == token) {
-      found = true;
-      break;
+  for (const std::string &candidate_dir :
+       snapshot_dirs_for_token(normalized_dir, token)) {
+    if (file_exists(join_path(candidate_dir, token + ".bin")) ||
+        file_exists(join_path(candidate_dir, token + ".bin.tmp"))) {
+      return true;
     }
   }
-  my_dirend(dir_info);
-  return found;
+
+  for (const std::string &candidate_dir :
+       generic_external_blob_dirs_for_token(normalized_dir, token)) {
+    const std::string record_locks_path =
+        join_path(candidate_dir,
+                  external_blob_filename(token, kPreservedTrxBlobRecordLocks));
+    if (file_exists(record_locks_path) ||
+        file_exists(record_locks_path + ".tmp")) {
+      return true;
+    }
+  }
+
+  return false;
 }

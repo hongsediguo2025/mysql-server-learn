@@ -32,6 +32,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "sql/sql_class.h"
 #include "storage/innobase/include/lock0lock.h"
@@ -385,6 +386,55 @@ TEST(LockWarmcopyRecordShard, BaseSeedPayloadExportsAsSealedStorePayload) {
   EXPECT_TRUE(result.sealed);
   EXPECT_EQ(2U, result.record_lock_count);
   EXPECT_EQ(source_payload, result.record_locks_payload);
+  EXPECT_EQ(1U, result.scanned_shard_count);
+  EXPECT_EQ(source_payload.size(), result.materialized_payload_bytes);
+}
+
+TEST(LockWarmcopyRecordShard, BaseSeedPayloadCanSealMetadataWithoutPayload) {
+  lock_warmcopy_reset_for_unit_test();
+
+  const uint64_t source_target_id = 3134;
+  const uint64_t seeded_target_id = 3135;
+  lock_warmcopy_record_shard_key_t key = make_record_shard_key(8);
+  key.lock_type_mode = 3;  // LOCK_REC | LOCK_X
+  const lock_warmcopy_record_image_digest_t digest2 = make_digest(0x20);
+  const lock_warmcopy_record_image_digest_t digest4 = make_digest(0x40);
+
+  ASSERT_TRUE(
+      lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
+          source_target_id, key, 2, digest2, 20,
+          make_encoded_record_image("seed-rec2")));
+  ASSERT_TRUE(
+      lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
+          source_target_id, key, 4, digest4, 40,
+          make_encoded_record_image("seed-rec4")));
+
+  std::string source_payload;
+  uint32_t source_lock_count = 0;
+  ASSERT_TRUE(lock_warmcopy_record_store_export_record_payload_for_target(
+      source_target_id, &source_payload, &source_lock_count));
+  ASSERT_EQ(2U, source_lock_count);
+  ASSERT_FALSE(source_payload.empty());
+
+  uint32_t seeded_lock_count = 0;
+  ASSERT_TRUE(lock_warmcopy_record_store_seed_payload_for_target(
+      seeded_target_id, source_payload, &seeded_lock_count));
+  ASSERT_EQ(2U, seeded_lock_count);
+
+  lock_warmcopy_record_store_fence_t phase1_fence;
+  ASSERT_TRUE(lock_warmcopy_record_store_fence_for_target(seeded_target_id,
+                                                          &phase1_fence));
+
+  lock_warmcopy_record_seal_result_t result;
+  ASSERT_TRUE(lock_warmcopy_record_store_seal_metadata_for_target(
+      seeded_target_id, phase1_fence, seeded_lock_count, UINT32_MAX,
+      UINT64_MAX, UINT32_MAX, &result));
+  EXPECT_EQ(lock_warmcopy_record_seal_status_t::SEALED_VALID, result.status);
+  EXPECT_TRUE(result.sealed);
+  EXPECT_EQ(2U, result.record_lock_count);
+  EXPECT_TRUE(result.record_locks_payload.empty());
+  EXPECT_EQ(0U, result.scanned_shard_count);
+  EXPECT_EQ(0ULL, result.materialized_payload_bytes);
 }
 
 TEST(LockWarmcopyRecordShard, BaseSeedRejectsMalformedPayloadWithoutStore) {
@@ -518,6 +568,50 @@ TEST(LockWarmcopyRecordShard, PerTargetStoresAreIsolated) {
   ASSERT_TRUE(lock_warmcopy_record_store_export_record_payload_for_unit_test(
       &default_target_payload));
   EXPECT_TRUE(default_target_payload.empty());
+}
+
+TEST(LockWarmcopyRecordShard, ConcurrentTargetStoresRemainIsolated) {
+  lock_warmcopy_reset_for_unit_test();
+
+  constexpr size_t kThreadCount = 8;
+  constexpr uint32_t kLocksPerTarget = 6;
+  std::atomic<bool> ok{true};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreadCount);
+
+  for (size_t i = 0; i < kThreadCount; ++i) {
+    threads.emplace_back([i, &ok]() {
+      const uint64_t target_id = 1000 + i;
+      lock_warmcopy_record_shard_key_t key = make_record_shard_key(32);
+      key.lock_type_mode = 3;  // LOCK_REC | LOCK_X
+      key.page_no += static_cast<uint32_t>(i);
+      for (uint32_t heap_no = 1; heap_no <= kLocksPerTarget; ++heap_no) {
+        const lock_warmcopy_record_image_digest_t digest =
+            make_digest(static_cast<unsigned char>(0x20 + i + heap_no));
+        if (!lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
+                target_id, key, heap_no, digest, heap_no * 10,
+                make_encoded_record_image("concurrent-target"))) {
+          ok.store(false, std::memory_order_relaxed);
+          return;
+        }
+      }
+    });
+  }
+
+  for (std::thread &thread : threads) {
+    thread.join();
+  }
+  ASSERT_TRUE(ok.load(std::memory_order_relaxed));
+
+  for (size_t i = 0; i < kThreadCount; ++i) {
+    const uint64_t target_id = 1000 + i;
+    std::string payload;
+    uint32_t lock_count = 0;
+    ASSERT_TRUE(lock_warmcopy_record_store_export_record_payload_for_target(
+        target_id, &payload, &lock_count));
+    EXPECT_EQ(kLocksPerTarget, lock_count);
+    EXPECT_FALSE(payload.empty());
+  }
 }
 
 TEST(LockWarmcopyRecordShard,

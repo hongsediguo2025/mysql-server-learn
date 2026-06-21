@@ -114,16 +114,13 @@ use strict;
 use warnings;
 use File::Spec;
 
+require File::Spec->catfile($ENV{'MYSQL_TEST_DIR'}, 'suite',
+                            'preserve_trx', 'include',
+                            'preserve_snapshot_files.pl');
+
 my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
 my $preserve_dir = File::Spec->catdir($datadir, 'preserve');
-opendir(my $dh, $preserve_dir)
-  or die "cannot open preserve dir $preserve_dir: $!";
-my @tokens = sort map {
-  s/\.bin$//r;
-} grep {
-  /\.bin$/ && -f File::Spec->catfile($preserve_dir, $_);
-} readdir($dh);
-closedir($dh);
+my @tokens = PreserveSnapshotFiles::preserve_snapshot_tokens($preserve_dir);
 
 die "expected 100 preserved snapshots, found " . scalar(@tokens) . "\n"
   unless scalar(@tokens) == 100;
