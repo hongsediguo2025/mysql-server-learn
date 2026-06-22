@@ -1859,6 +1859,8 @@ Preserve_snapshot_metadata make_no_cache_metadata(
   metadata.tx_isolation = static_cast<uint8_t>(thd->tx_isolation);
   metadata.session_tx_isolation =
       static_cast<uint8_t>(thd->variables.transaction_isolation);
+  metadata.tx_read_only = thd->tx_read_only;
+  metadata.session_tx_read_only = thd->variables.transaction_read_only;
   metadata.has_extended_session_state = true;
   metadata.sql_mode = thd->variables.sql_mode;
   if (thd->variables.time_zone != nullptr &&
@@ -1923,6 +1925,16 @@ void reset_preserve_xid_to_active_transaction_xid(THD *thd) {
   thd->variables.option_bits |= OPTION_BEGIN;
   thd->server_status |= SERVER_STATUS_IN_TRANS;
   if (thd->tx_read_only) thd->server_status |= SERVER_STATUS_IN_TRANS_READONLY;
+}
+
+void restore_preserved_transaction_access_mode(
+    THD *thd, const Preserve_snapshot_metadata &metadata) {
+  thd->tx_read_only = metadata.tx_read_only;
+  thd->variables.transaction_read_only = metadata.session_tx_read_only;
+  if (metadata.tx_read_only)
+    thd->server_status |= SERVER_STATUS_IN_TRANS_READONLY;
+  else
+    thd->server_status &= ~SERVER_STATUS_IN_TRANS_READONLY;
 }
 
 void reset_preserve_statement_transaction_scope(THD *thd) {
@@ -2665,6 +2677,7 @@ class Resume_thd_state_guard {
         m_binlog_trx_compression_level_zstd(
             thd->variables.binlog_trx_compression_level_zstd),
         m_tx_read_only(thd->tx_read_only),
+        m_session_tx_read_only(thd->variables.transaction_read_only),
         m_sql_mode(thd->variables.sql_mode),
         m_time_zone(thd->variables.time_zone),
         m_character_set_client(thd->variables.character_set_client),
@@ -2710,6 +2723,7 @@ class Resume_thd_state_guard {
     m_thd->variables.binlog_trx_compression_level_zstd =
         m_binlog_trx_compression_level_zstd;
     m_thd->tx_read_only = m_tx_read_only;
+    m_thd->variables.transaction_read_only = m_session_tx_read_only;
     m_thd->variables.sql_mode = m_sql_mode;
     m_thd->variables.time_zone = m_time_zone;
     m_thd->variables.character_set_client = m_character_set_client;
@@ -2748,6 +2762,7 @@ class Resume_thd_state_guard {
   decltype(THD::variables.binlog_trx_compression_level_zstd)
       m_binlog_trx_compression_level_zstd;
   bool m_tx_read_only;
+  bool m_session_tx_read_only;
   sql_mode_t m_sql_mode;
   Time_zone *m_time_zone;
   const CHARSET_INFO *m_character_set_client;
@@ -7138,6 +7153,7 @@ static bool restore_batch_record_to_original_thd(
     thd->variables.option_bits &= ~OPTION_BIN_LOG;
   thd->variables.option_bits |= OPTION_BEGIN;
   thd->server_status |= SERVER_STATUS_IN_TRANS;
+  restore_preserved_transaction_access_mode(thd, record.metadata);
   restore_last_insert_id_state(thd, record.metadata);
   restore_forced_insert_id_state(thd, record.metadata);
   DBUG_EXECUTE_IF("preserve_trx_batch_clear_user_vars_before_reattach_restore", {
@@ -10639,6 +10655,7 @@ bool Sql_cmd_resume_preserved_transaction::execute(THD *thd) {
     thd->variables.option_bits &= ~OPTION_BIN_LOG;
   thd->variables.option_bits |= OPTION_BEGIN;
   thd->server_status |= SERVER_STATUS_IN_TRANS;
+  restore_preserved_transaction_access_mode(thd, record.metadata);
   restore_last_insert_id_state(thd, record.metadata);
   restore_forced_insert_id_state(thd, record.metadata);
   if (import_user_vars_payload(thd, record.metadata.user_vars_payload)) {

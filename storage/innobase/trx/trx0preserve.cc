@@ -1055,6 +1055,7 @@ bool trx_preserve_sample_lock_warmcopy_fence(
   if (trx == nullptr || fence == nullptr) return false;
 
   trx_mutex_enter(trx);
+  ut_ad(trx_mutex_own(trx));
   const bool sampled = lock_warmcopy_trx_lock_fence_sample(&trx->lock, fence);
   trx_mutex_exit(trx);
   return sampled;
@@ -1086,6 +1087,7 @@ bool trx_preserve_lock_warmcopy_conversion_freeze(
   if (trx == nullptr) return false;
 
   trx_mutex_enter(trx);
+  ut_ad(trx_mutex_own(trx));
   const uint64_t wait_epoch = trx->lock.lock_warmcopy_freeze_generation + 1;
   lock_warmcopy_trx_conversion_freeze(&trx->lock, wait_epoch);
   const bool sampled = lock_warmcopy_trx_lock_fence_sample(&trx->lock, fence);

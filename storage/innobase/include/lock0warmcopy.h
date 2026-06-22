@@ -193,6 +193,8 @@ bool lock_warmcopy_record_store_seal_metadata_for_target(
     uint32_t expected_record_lock_count, uint32_t max_lock_count,
     uint64_t max_journal_bytes, uint32_t max_dirty_shards,
     lock_warmcopy_record_seal_result_t *result);
+/* Caller must serialize against trx_lock mutations; preserve wrappers hold
+   trx->mutex before sampling. */
 bool lock_warmcopy_trx_lock_fence_sample(
     const trx_lock_t *trx_lock, lock_warmcopy_trx_lock_fence_t *fence);
 bool lock_warmcopy_trx_lock_fence_equal(

@@ -117,6 +117,7 @@ constexpr uint16_t kTlvInnodbSavepoints = 0x41;
 constexpr uint16_t kTlvSessionState = 0x50;
 constexpr uint16_t kTlvMdlDescriptors = 0x51;
 constexpr uint16_t kTlvUserVariables = 0x52;
+constexpr uint16_t kTlvTxAccessMode = 0x53;
 constexpr uint16_t kTlvBinlogCacheMetadata = 0x60;
 constexpr uint16_t kTlvBinlogNoCacheMetadata = 0x61;
 constexpr uint16_t kTlvAutoincState = 0x62;
@@ -306,6 +307,14 @@ std::string autoinc_state_tlv_value(
   return value;
 }
 
+std::string transaction_access_mode_tlv_value(
+    const Preserve_snapshot_metadata &metadata) {
+  std::string value;
+  value.push_back(static_cast<char>(metadata.tx_read_only ? 1 : 0));
+  value.push_back(static_cast<char>(metadata.session_tx_read_only ? 1 : 0));
+  return value;
+}
+
 bool modified_table_name_is_valid(
     const Preserve_snapshot_modified_table_name &name) {
   return !name.schema_name.empty() && !name.table_name.empty() &&
@@ -337,6 +346,7 @@ std::vector<Preserve_snapshot_tlv> no_cache_tlvs(
       {kTlvInnodbCore, "no-cache"},
       {kTlvModifiedTables, modified_tables_tlv_value(metadata)},
       {kTlvSessionState, session_state_tlv_value(metadata)},
+      {kTlvTxAccessMode, transaction_access_mode_tlv_value(metadata)},
       {kTlvAutoincState, autoinc_state_tlv_value(metadata)},
       {kTlvMdlDescriptors, metadata.mdl_descriptors_payload}};
 
@@ -933,6 +943,18 @@ bool parse_autoinc_state_tlv(const std::string &value,
     metadata->has_forced_insert_id = has_forced != 0;
     metadata->forced_insert_id = read_le64(value, 2);
   }
+  return false;
+}
+
+bool parse_transaction_access_mode_tlv(const std::string &value,
+                                       Preserve_snapshot_metadata *metadata) {
+  if (metadata == nullptr || value.length() != 2) return true;
+  const unsigned char tx_read_only = static_cast<unsigned char>(value[0]);
+  const unsigned char session_tx_read_only =
+      static_cast<unsigned char>(value[1]);
+  if (tx_read_only > 1 || session_tx_read_only > 1) return true;
+  metadata->tx_read_only = tx_read_only != 0;
+  metadata->session_tx_read_only = session_tx_read_only != 0;
   return false;
 }
 
@@ -1675,6 +1697,15 @@ bool apply_bundle_semantics(std::vector<Preserve_snapshot_tlv> *tlvs,
   const Preserve_snapshot_tlv *session = find_tlv(*tlvs, kTlvSessionState);
   if (session == nullptr || parse_session_state_tlv(session->value, metadata))
     return true;
+
+  const Preserve_snapshot_tlv *tx_access_mode =
+      find_tlv(*tlvs, kTlvTxAccessMode);
+  metadata->tx_read_only = false;
+  metadata->session_tx_read_only = false;
+  if (tx_access_mode != nullptr &&
+      parse_transaction_access_mode_tlv(tx_access_mode->value, metadata)) {
+    return true;
+  }
 
   const Preserve_snapshot_tlv *autoinc_state = find_tlv(*tlvs, kTlvAutoincState);
   metadata->autoinc_lock_owned = false;

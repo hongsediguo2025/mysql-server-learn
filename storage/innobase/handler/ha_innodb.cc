@@ -3762,8 +3762,8 @@ static void innobase_post_recover() {
              "PRESERVE: recovery completed before purge thread start"););
   DBUG_EXECUTE_IF("preserve_trx_assert_recovered_before_recovery_rollback",
                   LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
-                         "PRESERVE: recovery completed before recovery "
-                         "rollback thread start"););
+                         "PRESERVE: preserved transactions recovered before "
+                         "recovery rollback can observe them"););
 
   srv_start_threads_after_ddl_recovery();
 }

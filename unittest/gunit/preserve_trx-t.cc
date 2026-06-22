@@ -106,6 +106,7 @@ constexpr uint16_t kTestSqlSavepointsTlv = 0x40;
 constexpr uint16_t kTestInnodbSavepointsTlv = 0x41;
 constexpr uint16_t kTestMdlDescriptorsTlv = 0x51;
 constexpr uint16_t kTestUserVariablesTlv = 0x52;
+constexpr uint16_t kTestTxAccessModeTlv = 0x53;
 constexpr uint16_t kTestBinlogNoCacheMetadataTlv = 0x61;
 constexpr uint16_t kTestAutoincStateTlv = 0x62;
 constexpr uint16_t kTestBinlogCachePayloadTlv = 0x70;
@@ -562,6 +563,14 @@ std::string extended_session_state_payload(
   append_le16(&payload, collation_connection_number);
   append_le16(&payload, static_cast<uint16_t>(time_zone_name.length()));
   payload.append(time_zone_name);
+  return payload;
+}
+
+std::string tx_access_mode_payload(bool tx_read_only,
+                                   bool session_tx_read_only) {
+  std::string payload;
+  payload.push_back(static_cast<char>(tx_read_only ? 1 : 0));
+  payload.push_back(static_cast<char>(session_tx_read_only ? 1 : 0));
   return payload;
 }
 
@@ -2175,6 +2184,8 @@ TEST_F(PreserveSnapshotTest, InMemoryStoreReadRestoresFullMetadataPayloads) {
                                          {"db", "tab8"}};
   input.metadata.tx_isolation = 1;
   input.metadata.session_tx_isolation = 3;
+  input.metadata.tx_read_only = true;
+  input.metadata.session_tx_read_only = true;
   input.metadata.has_extended_session_state = true;
   input.metadata.sql_mode = 1024;
   input.metadata.character_set_client_number = 33;
@@ -2223,6 +2234,9 @@ TEST_F(PreserveSnapshotTest, InMemoryStoreReadRestoresFullMetadataPayloads) {
   EXPECT_EQ(input.metadata.tx_isolation, out.metadata.tx_isolation);
   EXPECT_EQ(input.metadata.session_tx_isolation,
             out.metadata.session_tx_isolation);
+  EXPECT_EQ(input.metadata.tx_read_only, out.metadata.tx_read_only);
+  EXPECT_EQ(input.metadata.session_tx_read_only,
+            out.metadata.session_tx_read_only);
   EXPECT_TRUE(out.metadata.has_extended_session_state);
   EXPECT_EQ(input.metadata.sql_mode, out.metadata.sql_mode);
   EXPECT_EQ(input.metadata.character_set_client_number,
@@ -4533,12 +4547,13 @@ TEST_F(PreserveSnapshotTest, BundleBuilderNoCacheProducesTlvsWithoutBlob) {
   EXPECT_EQ(input.metadata.token, bundle.metadata.token);
   EXPECT_EQ(input.metadata.mod_tables_count, bundle.metadata.mod_tables_count);
   EXPECT_TRUE(bundle.external_blobs.empty());
-  ASSERT_GE(bundle.tlvs.size(), 6U);
+  ASSERT_GE(bundle.tlvs.size(), 7U);
   EXPECT_EQ(0x10, bundle.tlvs[0].tag);
   EXPECT_EQ(0x11, bundle.tlvs[1].tag);
   EXPECT_EQ(0x50, bundle.tlvs[2].tag);
-  EXPECT_EQ(kTestAutoincStateTlv, bundle.tlvs[3].tag);
-  EXPECT_EQ(kTestMdlDescriptorsTlv, bundle.tlvs[4].tag);
+  EXPECT_EQ(kTestTxAccessModeTlv, bundle.tlvs[3].tag);
+  EXPECT_EQ(kTestAutoincStateTlv, bundle.tlvs[4].tag);
+  EXPECT_EQ(kTestMdlDescriptorsTlv, bundle.tlvs[5].tag);
   EXPECT_NE(bundle.tlvs.end(),
             std::find_if(bundle.tlvs.begin(), bundle.tlvs.end(),
                          [](const Preserve_snapshot_tlv &tlv) {
@@ -6025,6 +6040,53 @@ TEST_F(PreserveSnapshotTest, ExtendedSessionStateRoundTrips) {
   EXPECT_EQ(225U, out.first_successful_insert_id_in_cur_stmt);
   EXPECT_TRUE(out.arg_of_last_insert_id_function);
   EXPECT_TRUE(out.stmt_depends_on_first_successful_insert_id_in_prev_stmt);
+}
+
+TEST_F(PreserveSnapshotTest, TransactionAccessModeRoundTrips) {
+  Preserve_snapshot_metadata input = metadata();
+  input.tx_read_only = true;
+  input.session_tx_read_only = true;
+
+  std::vector<Preserve_snapshot_tlv> tlvs = required_tlvs();
+  tlvs.push_back({kTestTxAccessModeTlv, tx_access_mode_payload(true, true)});
+
+  Preserve_snapshot_metadata out;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            test_write_snapshot(m_dir, input, tlvs));
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            test_read_snapshot(m_dir, "msp_snapshot_gunit", &out));
+
+  EXPECT_TRUE(out.tx_read_only);
+  EXPECT_TRUE(out.session_tx_read_only);
+}
+
+TEST_F(PreserveSnapshotTest,
+       LegacySnapshotDefaultsTransactionAccessModeToReadWrite) {
+  Preserve_snapshot_metadata out;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            test_write_snapshot(m_dir, metadata(), required_tlvs()));
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            test_read_snapshot(m_dir, "msp_snapshot_gunit", &out));
+
+  EXPECT_FALSE(out.tx_read_only);
+  EXPECT_FALSE(out.session_tx_read_only);
+}
+
+TEST_F(PreserveSnapshotTest, InvalidTransactionAccessModeTlvRejectsSnapshot) {
+  std::vector<Preserve_snapshot_tlv> tlvs = required_tlvs();
+  tlvs.push_back({kTestTxAccessModeTlv, std::string("\2\0", 2)});
+
+  EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
+            test_write_snapshot(m_dir, metadata(), tlvs));
+}
+
+TEST_F(PreserveSnapshotTest,
+       ShortTransactionAccessModeTlvRejectsSnapshot) {
+  std::vector<Preserve_snapshot_tlv> tlvs = required_tlvs();
+  tlvs.push_back({kTestTxAccessModeTlv, std::string(1, '\0')});
+
+  EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
+            test_write_snapshot(m_dir, metadata(), tlvs));
 }
 
 TEST_F(PreserveSnapshotTest, LegacySessionStateRoundTripsIsolationOnly) {

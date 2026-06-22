@@ -135,6 +135,8 @@ struct Preserve_snapshot_metadata {
   uint8_t binlog_gtid_mode{0};
   uint8_t tx_isolation{2};
   uint8_t session_tx_isolation{2};
+  bool tx_read_only{false};
+  bool session_tx_read_only{false};
   bool has_extended_session_state{false};
   uint64_t sql_mode{0};
   std::string time_zone_name;

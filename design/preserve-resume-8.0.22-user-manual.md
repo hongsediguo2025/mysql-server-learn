@@ -351,6 +351,7 @@ cache warmcopy；锁语义 warmcopy 由下面这组参数控制。
 | `preserve_trx_lock_warmcopy_max_dirty_shards` | `100000` | `0..UINT_MAX32` 个 | global | phase 2 可重验 dirty record shards 上限。 |
 | `preserve_trx_lock_warmcopy_max_mdl_descriptors` | `100000` | `0..UINT_MAX32` 个 | global | MDL transaction-duration descriptors 上限。 |
 | `preserve_trx_lock_warmcopy_seal_threads` | `0` | `0..1024` | global | 预留参数；当前实现按 target 串行 seal，保持 0。 |
+| `preserve_trx_parallel_preserve_threads` | `0` | `0..1024` | global | batch drain phase 2 target preserve worker 数。`0=auto`，`1=legacy serial`，大于 1 时允许并行 preserve 目标事务；只有 lock warmcopy batch drain 会使用自动并行，普通单事务 preserve 不依赖它。 |
 | `preserve_trx_lock_warmcopy_conversion_wait_timeout_ms` | `30000` | `0..UINT_MAX32` 毫秒 | global | 其它会话撞到目标事务 conversion freeze 后，释放 latch/mtr 并等待 freeze 清除再重试的上限；实际等待还受 drain deadline、KILL 和 shutdown 约束。 |
 
 当前实现的真实边界：
