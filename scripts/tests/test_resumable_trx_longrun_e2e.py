@@ -3079,6 +3079,103 @@ class ResumableTrxLongRunE2ETest(unittest.TestCase):
                 ReportLedger(root).latest_event("failures")["event_type"],
             )
 
+    def test_cycle_controller_marks_expected_inconsistent_kill_as_disruption_contract(self):
+        class DisruptedRuntime:
+            def __init__(self, minimum_hits):
+                self.minimum_hits = dict(minimum_hits)
+
+            def start_worker(self, assignment):
+                return None
+
+            def stop_worker(self, assignment):
+                return None
+
+            def active_worker_connection_count(self):
+                return 0
+
+            def drain(self, config, manifest, cycle_id):
+                return {
+                    "status": "pass",
+                    "token_count": 0,
+                    "tokens_deferred": True,
+                    "kill_scenario_results": self.run_kill_scenarios("drain"),
+                }
+
+            def restart(self, config, cycle_id):
+                return {"status": "pass"}
+
+            def resume(self, config, manifest, cycle_id, drain_result):
+                return {"status": "pass", "resumed_count": 0}
+
+            def validate(self, config, manifest, cycle_id):
+                return {
+                    "status": "fail",
+                    "coverage_hits": self.minimum_hits,
+                    "global_state_digest": "disrupted-kill-digest",
+                    "failure_contracts": {
+                        "expected": 3,
+                        "passed": 1,
+                        "failures": [
+                            {
+                                "contract_id": "wrong_user",
+                                "status": "fail",
+                                "last_error": "no token available",
+                            }
+                        ],
+                    },
+                }
+
+        class ExpectedInconsistentKillHarness:
+            def execute_due_scenarios(self, cycle_id, phase):
+                if phase != "drain":
+                    return []
+                return [
+                    {
+                        "status": "pass",
+                        "scenario_id": "kill_mysqld_during_drain",
+                        "target": "mysqld",
+                        "phase": "drain",
+                        "expected_audit_status": "inconsistent",
+                        "expected_tail_status": "has_tail",
+                        "sent_count": 1,
+                    }
+                ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = LongRunConfig.for_profile(
+                "medium", root, seed=187, cycles=1
+            )
+            manifest = WorkloadManifest(config)
+            controller = CycleController(
+                config=config,
+                manifest=manifest,
+                ledger=ReportLedger(root),
+                runtime=DisruptedRuntime(manifest.minimum_hits()),
+                resource_sampler=ResourceSampler(root),
+                kill_harness=ExpectedInconsistentKillHarness(),
+            )
+
+            report_path = controller.run_cycle(1)
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual("fail", report["validation_status"])
+            self.assertEqual("fail", report["native_cycle_status"])
+            self.assertEqual("pass", report["kill_scenario_status"])
+            self.assertEqual("pass", report["expected_disruption_status"])
+            self.assertEqual(
+                ["kill_mysqld_during_drain"],
+                report["expected_disruption_results"]["scenario_ids"],
+            )
+            audit = AuditTool(root, stale_after_s=999999).audit()
+            self.assertEqual("inconsistent", audit["audit_status"])
+            self.assertEqual("pass", audit["expected_disruption_status"])
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    0,
+                    audit_main(["--artifact-dir", tmpdir, "--stale-after-s", "999999"]),
+                )
+
     def test_long_run_controller_native_cycle_uses_injected_runtime(self):
         class FakeCycleRuntime:
             def __init__(self, minimum_hits):

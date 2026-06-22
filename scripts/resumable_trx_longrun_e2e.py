@@ -3135,6 +3135,61 @@ def kill_scenarios_passed(results: Sequence[Dict[str, object]]) -> bool:
     return all(result.get("status") == "pass" for result in results)
 
 
+def evaluate_expected_disruption(
+    kill_results: Sequence[Dict[str, object]],
+    *,
+    native_cycle_status: str,
+    validation_status: str,
+    resource_status: str,
+    kill_scenario_status: str,
+    token_lifecycle_status: str,
+    contract_status: str,
+) -> Tuple[str, Dict[str, object]]:
+    expected_inconsistent = [
+        result for result in kill_results
+        if result.get("status") == "pass"
+        and result.get("expected_audit_status") == "inconsistent"
+    ]
+    if not expected_inconsistent:
+        return "not_applicable", {"scenario_ids": []}
+
+    scenario_ids = [
+        str(result.get("scenario_id", "")) for result in expected_inconsistent
+    ]
+    observed_statuses = {
+        "native_cycle_status": native_cycle_status,
+        "validation_status": validation_status,
+        "resource_status": resource_status,
+        "kill_scenario_status": kill_scenario_status,
+        "token_lifecycle_status": token_lifecycle_status,
+        "contract_status": contract_status,
+    }
+    details: Dict[str, object] = {
+        "scenario_ids": scenario_ids,
+        "observed_statuses": observed_statuses,
+    }
+    failures: Dict[str, object] = {}
+    if kill_scenario_status != "pass":
+        failures["kill_scenario_status"] = kill_scenario_status
+    if resource_status != "pass":
+        failures["resource_status"] = resource_status
+    if native_cycle_status == "pass" and validation_status == "pass":
+        details["reason"] = "cycle completed normally despite expected disruption"
+        return "not_applicable", details
+    if failures:
+        details["failures"] = failures
+        return "fail", details
+    details["reason"] = "expected inconsistent kill scenario disrupted the cycle"
+    return "pass", details
+
+
+def audit_result_is_successful(result: Dict[str, object]) -> bool:
+    return (
+        result.get("audit_status") == "complete"
+        or result.get("expected_disruption_status") == "pass"
+    )
+
+
 
 class CycleController:
     """Runs one native long-run phase cycle through an injected runtime.
@@ -3499,6 +3554,17 @@ class CycleController:
             if native_cycle_status == "pass" and resource_status == "pass"
             else "fail"
         )
+        expected_disruption_status, expected_disruption_results = (
+            evaluate_expected_disruption(
+                kill_scenario_results,
+                native_cycle_status=native_cycle_status,
+                validation_status=validation_status,
+                resource_status=resource_status,
+                kill_scenario_status=kill_scenario_status,
+                token_lifecycle_status=token_lifecycle_status,
+                contract_status=contract_status,
+            )
+        )
         if validation_status != "pass":
             self.ledger.append_event(
                 "failures",
@@ -3514,6 +3580,8 @@ class CycleController:
                     "token_lifecycle_failures": token_lifecycle_failures,
                     "contract_status": contract_status,
                     "contract_failures": contract_failures,
+                    "expected_disruption_status": expected_disruption_status,
+                    "expected_disruption_results": expected_disruption_results,
                     "wall_time": utc_now(),
                 },
             )
@@ -3566,6 +3634,8 @@ class CycleController:
                 "token_lifecycle_failures": token_lifecycle_failures,
                 "contract_status": contract_status,
                 "contract_failures": contract_failures,
+                "expected_disruption_status": expected_disruption_status,
+                "expected_disruption_results": expected_disruption_results,
                 "global_state_digest": phase_results.get(
                     "validate", {}
                 ).get("global_state_digest", ""),
@@ -3666,13 +3736,19 @@ class AuditTool:
             name: value for name, value in status_fields.items() if value != "pass"
         }
         if failed_statuses:
-            return {
+            result = {
                 "audit_status": "inconsistent",
                 "reason": "latest complete cycle has failing status fields",
                 "latest_complete_cycle": report.get("cycle_id"),
                 "age_s": age,
                 **status_fields,
             }
+            if report.get("expected_disruption_status") == "pass":
+                result["expected_disruption_status"] = "pass"
+                result["expected_disruption_results"] = report.get(
+                    "expected_disruption_results", {}
+                )
+            return result
         missing_fields = [
             field for field in REQUIRED_COMPLETE_CYCLE_FIELDS
             if field not in report
@@ -4634,8 +4710,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(canonical_json(audit))
         if rc == LIVE_SMOKE_SKIP_RETURN_CODE:
             return rc
-        if audit["audit_status"] not in ("complete",):
+        if not audit_result_is_successful(audit):
             return 1
+        if audit.get("expected_disruption_status") == "pass":
+            return 0
     return rc
 
 

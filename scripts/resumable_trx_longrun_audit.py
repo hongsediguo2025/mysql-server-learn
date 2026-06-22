@@ -10,9 +10,15 @@ import sys
 from typing import Optional, Sequence
 
 try:
-    from scripts.resumable_trx_longrun_e2e import AuditTool
+    from scripts.resumable_trx_longrun_e2e import (
+        AuditTool,
+        audit_result_is_successful,
+    )
 except ImportError:
-    from resumable_trx_longrun_e2e import AuditTool  # type: ignore
+    from resumable_trx_longrun_e2e import (  # type: ignore
+        AuditTool,
+        audit_result_is_successful,
+    )
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -26,7 +32,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     result = AuditTool(Path(args.artifact_dir), args.stale_after_s).audit()
     print(json.dumps(result, sort_keys=True))
-    return 0 if result.get("audit_status") == "complete" else 1
+    return 0 if audit_result_is_successful(result) else 1
 
 
 if __name__ == "__main__":
