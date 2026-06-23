@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+from pathlib import Path
 import subprocess
 import sys
 from typing import Iterable, List, Sequence, Tuple
@@ -28,9 +29,12 @@ class SurfaceFinding:
 
 
 NEW_LOCK_WARMCOPY_MODULES = {
+    "sql/binlog_warmcopy.cc",
+    "sql/binlog_warmcopy.h",
     "sql/preserve_trx_lock_warmcopy.cc",
     "sql/preserve_trx_lock_warmcopy.h",
     "storage/innobase/include/lock0warmcopy.h",
+    "storage/innobase/lock/lock0preserve.cc",
     "storage/innobase/lock/lock0warmcopy.cc",
     "unittest/gunit/innodb/lock0warmcopy-t.cc",
     "unittest/gunit/preserve_trx_lock_warmcopy-t.cc",
@@ -119,6 +123,62 @@ HIGH_RISK_CORE_HOT_PATHS = {
 }
 
 APPROVED_HIGH_RISK_CORE_HOT_PATH_BASELINE = frozenset(HIGH_RISK_CORE_HOT_PATHS)
+
+LOCK0LOCK_FORBIDDEN_CONTENT = (
+    (
+        "lock_preserve_append_",
+        "forbidden_payload_encoder",
+        "move preserve payload encoding out of lock0lock.cc",
+    ),
+    (
+        "lock_preserve_parse_",
+        "forbidden_payload_parser",
+        "move preserve payload parsing out of lock0lock.cc",
+    ),
+    (
+        "lock_preserve_read_",
+        "forbidden_payload_reader",
+        "move preserve wire-format readers out of lock0lock.cc",
+    ),
+    (
+        "lock_preserve_serialize_",
+        "forbidden_payload_serializer",
+        "move preserve payload serialization out of lock0lock.cc",
+    ),
+    (
+        "encoded_record_image",
+        "forbidden_record_image_encoder",
+        "do not construct record images in the lock hot-path file",
+    ),
+    (
+        "lock_preserve_append_record_image",
+        "forbidden_record_image_encoder",
+        "do not construct record images in the lock hot-path file",
+    ),
+)
+
+BINLOG_CC_FORBIDDEN_CONTENT = (
+    (
+        "class Mysql_binlog_warmcopy_session",
+        "forbidden_binlog_warmcopy_session",
+        "move binlog warmcopy session implementation out of binlog.cc",
+    ),
+    (
+        "descriptor_from_prebuilt_warmcopy_blob",
+        "forbidden_binlog_warmcopy_descriptor_helper",
+        "move warmcopy descriptor construction out of binlog.cc",
+    ),
+    (
+        "Prefix_digest_ostream",
+        "forbidden_binlog_warmcopy_digest_ostream",
+        "move warmcopy digest stream implementation out of binlog.cc",
+    ),
+    (
+        "Warmcopy_blob_copy_ostream",
+        "forbidden_binlog_warmcopy_blob_copy",
+        "move warmcopy blob copy stream implementation out of binlog.cc",
+    ),
+)
 
 MEDIUM_RISK_CORE_WRAPPERS = {
     "storage/innobase/include/lock0lock.h": (
@@ -249,6 +309,62 @@ def audit_paths(paths: Iterable[Tuple[str, str]]) -> List[SurfaceFinding]:
     return [classify_path(path, state) for path, state in paths]
 
 
+def audit_lock0lock_content(
+    content: str,
+    path: str = "storage/innobase/lock/lock0lock.cc",
+) -> List[SurfaceFinding]:
+    findings: List[SurfaceFinding] = []
+    seen_categories = set()
+    for needle, category, requirement in LOCK0LOCK_FORBIDDEN_CONTENT:
+        if needle not in content or category in seen_categories:
+            continue
+        seen_categories.add(category)
+        findings.append(
+            SurfaceFinding(
+                path,
+                "modified",
+                category,
+                "blocker",
+                requirement,
+                blocks_release=True,
+            )
+        )
+    return findings
+
+
+def audit_lock0lock_file(
+    path: str = "storage/innobase/lock/lock0lock.cc",
+) -> List[SurfaceFinding]:
+    return audit_lock0lock_content(Path(path).read_text(encoding="utf-8"), path)
+
+
+def audit_binlog_content(
+    content: str,
+    path: str = "sql/binlog.cc",
+) -> List[SurfaceFinding]:
+    findings: List[SurfaceFinding] = []
+    seen_categories = set()
+    for needle, category, requirement in BINLOG_CC_FORBIDDEN_CONTENT:
+        if needle not in content or category in seen_categories:
+            continue
+        seen_categories.add(category)
+        findings.append(
+            SurfaceFinding(
+                path,
+                "modified",
+                category,
+                "blocker",
+                requirement,
+                blocks_release=True,
+            )
+        )
+    return findings
+
+
+def audit_binlog_file(path: str = "sql/binlog.cc") -> List[SurfaceFinding]:
+    return audit_binlog_content(Path(path).read_text(encoding="utf-8"), path)
+
+
 def expanded_high_risk_findings(
     findings: Sequence[SurfaceFinding],
 ) -> List[SurfaceFinding]:
@@ -334,6 +450,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     findings = audit_paths(git_changed_paths())
+    findings.extend(audit_lock0lock_file())
+    findings.extend(audit_binlog_file())
 
     if args.format == "json":
         print(json.dumps(findings_as_dicts(findings), indent=2, sort_keys=True))

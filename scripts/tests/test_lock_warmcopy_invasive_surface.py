@@ -7,14 +7,21 @@ import scripts.lock_warmcopy_invasive_surface as invasive_surface
 
 class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
     def test_new_lock_warmcopy_modules_are_not_core_invasive(self):
-        finding = invasive_surface.classify_path(
+        for path in (
+            "sql/binlog_warmcopy.cc",
+            "sql/binlog_warmcopy.h",
             "sql/preserve_trx_lock_warmcopy.cc",
-            state="untracked",
-        )
+            "storage/innobase/lock/lock0preserve.cc",
+        ):
+            with self.subTest(path=path):
+                finding = invasive_surface.classify_path(
+                    path,
+                    state="untracked",
+                )
 
-        self.assertEqual("new_lock_warmcopy_module", finding.category)
-        self.assertEqual("info", finding.severity)
-        self.assertFalse(finding.blocks_release)
+                self.assertEqual("new_lock_warmcopy_module", finding.category)
+                self.assertEqual("info", finding.severity)
+                self.assertFalse(finding.blocks_release)
 
     def test_sql_preserve_trx_is_a_necessary_integration_point(self):
         finding = invasive_surface.classify_path(
@@ -60,6 +67,62 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
         self.assertEqual("high", finding.severity)
         self.assertFalse(finding.blocks_release)
         self.assertIn("disabled-path", finding.requirement)
+
+    def test_lock0lock_hot_path_content_rejects_payload_logic(self):
+        findings = invasive_surface.audit_lock0lock_content(
+            "\n".join(
+                [
+                    "static void lock_preserve_append_le32(std::string *payload);",
+                    "static bool lock_preserve_parse_record_locks_payload();",
+                    "std::string encoded_record_image;",
+                ]
+            )
+        )
+
+        self.assertEqual(
+            [
+                "forbidden_payload_encoder",
+                "forbidden_payload_parser",
+                "forbidden_record_image_encoder",
+            ],
+            [finding.category for finding in findings],
+        )
+        self.assertTrue(all(finding.blocks_release for finding in findings))
+
+    def test_current_lock0lock_hot_path_content_is_audited(self):
+        findings = invasive_surface.audit_lock0lock_file(
+            "storage/innobase/lock/lock0lock.cc"
+        )
+
+        self.assertEqual([], [finding.category for finding in findings])
+
+    def test_binlog_cc_content_rejects_warmcopy_session_logic(self):
+        findings = invasive_surface.audit_binlog_content(
+            "\n".join(
+                [
+                    "class Mysql_binlog_warmcopy_session final {};",
+                    "auto descriptor = descriptor_from_prebuilt_warmcopy_blob(blob);",
+                    "class Prefix_digest_ostream final : public Basic_ostream {};",
+                    "class Warmcopy_blob_copy_ostream final : public Basic_ostream {};",
+                ]
+            )
+        )
+
+        self.assertEqual(
+            [
+                "forbidden_binlog_warmcopy_session",
+                "forbidden_binlog_warmcopy_descriptor_helper",
+                "forbidden_binlog_warmcopy_digest_ostream",
+                "forbidden_binlog_warmcopy_blob_copy",
+            ],
+            [finding.category for finding in findings],
+        )
+        self.assertTrue(all(finding.blocks_release for finding in findings))
+
+    def test_current_binlog_cc_has_no_warmcopy_session_implementation(self):
+        findings = invasive_surface.audit_binlog_file("sql/binlog.cc")
+
+        self.assertEqual([], [finding.category for finding in findings])
 
     def test_unclassified_core_change_blocks_release(self):
         finding = invasive_surface.classify_path(
@@ -128,6 +191,61 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
         finally:
             invasive_surface.git_changed_paths = original_git_changed_paths
             invasive_surface.audit_paths = original_audit_paths
+
+    def test_cli_unclassified_gate_includes_lock0lock_content_findings(self):
+        original_git_changed_paths = invasive_surface.git_changed_paths
+        original_audit_paths = invasive_surface.audit_paths
+        original_audit_lock0lock_file = invasive_surface.audit_lock0lock_file
+        try:
+            invasive_surface.git_changed_paths = lambda: []
+            invasive_surface.audit_paths = lambda paths: []
+            invasive_surface.audit_lock0lock_file = lambda: [
+                invasive_surface.SurfaceFinding(
+                    path="storage/innobase/lock/lock0lock.cc",
+                    state="modified",
+                    category="forbidden_payload_parser",
+                    severity="blocker",
+                    requirement="simulated forbidden payload parser",
+                    blocks_release=True,
+                )
+            ]
+
+            with redirect_stdout(StringIO()):
+                exit_code = invasive_surface.main(["--fail-on-unclassified"])
+            self.assertEqual(1, exit_code)
+        finally:
+            invasive_surface.git_changed_paths = original_git_changed_paths
+            invasive_surface.audit_paths = original_audit_paths
+            invasive_surface.audit_lock0lock_file = original_audit_lock0lock_file
+
+    def test_cli_unclassified_gate_includes_binlog_content_findings(self):
+        original_git_changed_paths = invasive_surface.git_changed_paths
+        original_audit_paths = invasive_surface.audit_paths
+        original_audit_lock0lock_file = invasive_surface.audit_lock0lock_file
+        original_audit_binlog_file = invasive_surface.audit_binlog_file
+        try:
+            invasive_surface.git_changed_paths = lambda: []
+            invasive_surface.audit_paths = lambda paths: []
+            invasive_surface.audit_lock0lock_file = lambda: []
+            invasive_surface.audit_binlog_file = lambda: [
+                invasive_surface.SurfaceFinding(
+                    path="sql/binlog.cc",
+                    state="modified",
+                    category="forbidden_binlog_warmcopy_session",
+                    severity="blocker",
+                    requirement="simulated forbidden warmcopy session",
+                    blocks_release=True,
+                )
+            ]
+
+            with redirect_stdout(StringIO()):
+                exit_code = invasive_surface.main(["--fail-on-unclassified"])
+            self.assertEqual(1, exit_code)
+        finally:
+            invasive_surface.git_changed_paths = original_git_changed_paths
+            invasive_surface.audit_paths = original_audit_paths
+            invasive_surface.audit_lock0lock_file = original_audit_lock0lock_file
+            invasive_surface.audit_binlog_file = original_audit_binlog_file
 
 
 if __name__ == "__main__":

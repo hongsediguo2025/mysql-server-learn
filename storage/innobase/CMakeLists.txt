@@ -141,6 +141,7 @@ SET(INNOBASE_SOURCES
   lock/lock0prdt.cc
   lock/lock0latches.cc
   lock/lock0lock.cc
+  lock/lock0preserve.cc
   lock/lock0warmcopy.cc
   lock/lock0wait.cc
   log/log0buf.cc

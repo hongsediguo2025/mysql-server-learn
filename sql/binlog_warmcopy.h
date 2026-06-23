@@ -26,6 +26,16 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <string>
+
+class Basic_ostream;
+class Binlog_cache_warmcopy_lease;
+class Mysql_binlog_warmcopy_session;
+class Preserved_trx_warm_external_blob_carrier;
+class THD;
+
+struct PrebuiltBinlogCacheBlob;
 
 enum class Binlog_warmcopy_mirror_status { OK, ERROR };
 
@@ -45,5 +55,44 @@ class Binlog_cache_warmcopy_mirror {
   virtual void note_non_lifecycle_reset() = 0;
   virtual void note_source_cache_closed() {}
 };
+
+/*
+  Narrow source-cache adapter implemented by sql/binlog.cc.  The warmcopy
+  module owns mirror/session/artifact policy; binlog.cc owns access to private
+  binlog_cache_mngr internals.
+*/
+bool mysql_binlog_warmcopy_source_eligible(THD *thd, bool require_nonempty,
+                                           uint64_t *cache_length,
+                                           bool *has_blob, bool *eligible);
+bool mysql_binlog_warmcopy_source_install_mirror(
+    THD *thd, Binlog_cache_warmcopy_mirror *mirror, uint64_t *prefix_end,
+    uint64_t *truncate_generation,
+    std::shared_ptr<Binlog_cache_warmcopy_lease> *lease, bool *installed);
+bool mysql_binlog_warmcopy_source_copy_range(
+    THD *thd, uint64_t offset, size_t length, Basic_ostream *ostream,
+    uint64_t expected_truncate_generation, bool *stale_generation);
+bool mysql_binlog_warmcopy_source_truncate_generation(
+    THD *thd, uint64_t *truncate_generation);
+
+bool mysql_binlog_preserve_warmcopy_build_blob(
+    THD *thd, const std::string &warmcopy_id, uint64_t epoch,
+    Preserved_trx_warm_external_blob_carrier *carrier,
+    uint64_t max_blob_bytes, PrebuiltBinlogCacheBlob *blob, bool *has_blob);
+bool mysql_binlog_preserve_warmcopy_begin_session(
+    THD *thd, const std::string &warmcopy_id, uint64_t epoch,
+    Preserved_trx_warm_external_blob_carrier *carrier,
+    uint64_t max_blob_bytes, Mysql_binlog_warmcopy_session **session,
+    bool *has_blob, uint64_t *prefix_bytes);
+bool mysql_binlog_preserve_warmcopy_finalize_session(
+    THD *thd, Mysql_binlog_warmcopy_session *session,
+    uint64_t tail_budget_bytes, PrebuiltBinlogCacheBlob *blob,
+    bool *has_blob);
+bool mysql_binlog_preserve_warmcopy_tail_budget_exceeded(
+    THD *thd, Mysql_binlog_warmcopy_session *session,
+    uint64_t tail_budget_bytes, bool *exceeded);
+void mysql_binlog_preserve_warmcopy_abort_session(
+    Mysql_binlog_warmcopy_session *session);
+bool mysql_binlog_preserve_warmcopy_cache_length(THD *thd, uint64_t *length,
+                                                 bool *has_blob);
 
 #endif  // SQL_BINLOG_WARMCOPY_INCLUDED
