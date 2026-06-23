@@ -1,0 +1,7 @@
+--disable_query_log
+--disable_result_log
+SELECT @@GLOBAL.preserve_trx_lock_warmcopy_seal_threads;
+SET @@GLOBAL.preserve_trx_lock_warmcopy_seal_threads=DEFAULT;
+--enable_result_log
+--enable_query_log
+--echo ok

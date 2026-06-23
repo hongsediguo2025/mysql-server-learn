@@ -11,6 +11,8 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
             "sql/binlog_warmcopy.cc",
             "sql/binlog_warmcopy.h",
             "sql/preserve_trx_lock_warmcopy.cc",
+            "sql/preserve_trx_resource.cc",
+            "sql/preserve_trx_resource.h",
             "storage/innobase/lock/lock0preserve.cc",
         ):
             with self.subTest(path=path):
@@ -142,6 +144,49 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
 
     def test_current_sql_parse_does_not_own_preserve_guard_definition(self):
         findings = invasive_surface.audit_sql_parse_file("sql/sql_parse.cc")
+
+        self.assertEqual([], [finding.category for finding in findings])
+
+    def test_sys_vars_content_rejects_preserve_runtime_policy(self):
+        findings = invasive_surface.audit_sys_vars_content(
+            "\n".join(
+                [
+                    "preserved_trx_try_disable_feature_for_update();",
+                    "preserved_trx_ensure_snapshot_support();",
+                    "preserve_trx_set_enable_value(true);",
+                ]
+            )
+        )
+
+        self.assertEqual(
+            ["forbidden_sysvar_runtime_policy"],
+            [finding.category for finding in findings],
+        )
+        self.assertTrue(all(finding.blocks_release for finding in findings))
+
+    def test_current_sys_vars_does_not_own_preserve_runtime_policy(self):
+        findings = invasive_surface.audit_sys_vars_file("sql/sys_vars.cc")
+
+        self.assertEqual([], [finding.category for finding in findings])
+
+    def test_mysqld_content_rejects_preserve_status_show_func(self):
+        findings = invasive_surface.audit_mysqld_content(
+            "\n".join(
+                [
+                    "static int show_preserve_trx_memory_current_bytes(",
+                    "static int show_preserve_trx_lock_warmcopy_attempts(",
+                ]
+            )
+        )
+
+        self.assertEqual(
+            ["forbidden_preserve_status_show_func"],
+            [finding.category for finding in findings],
+        )
+        self.assertTrue(all(finding.blocks_release for finding in findings))
+
+    def test_current_mysqld_does_not_own_preserve_status_show_func(self):
+        findings = invasive_surface.audit_mysqld_file("sql/mysqld.cc")
 
         self.assertEqual([], [finding.category for finding in findings])
 
@@ -300,6 +345,82 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
             invasive_surface.audit_lock0lock_file = original_audit_lock0lock_file
             invasive_surface.audit_binlog_file = original_audit_binlog_file
             invasive_surface.audit_sql_parse_file = original_audit_sql_parse_file
+
+    def test_cli_unclassified_gate_includes_sysvar_content_findings(self):
+        original_git_changed_paths = invasive_surface.git_changed_paths
+        original_audit_paths = invasive_surface.audit_paths
+        original_audit_lock0lock_file = invasive_surface.audit_lock0lock_file
+        original_audit_binlog_file = invasive_surface.audit_binlog_file
+        original_audit_sql_parse_file = invasive_surface.audit_sql_parse_file
+        original_audit_sys_vars_file = invasive_surface.audit_sys_vars_file
+        original_audit_mysqld_file = invasive_surface.audit_mysqld_file
+        try:
+            invasive_surface.git_changed_paths = lambda: []
+            invasive_surface.audit_paths = lambda paths: []
+            invasive_surface.audit_lock0lock_file = lambda: []
+            invasive_surface.audit_binlog_file = lambda: []
+            invasive_surface.audit_sql_parse_file = lambda: []
+            invasive_surface.audit_sys_vars_file = lambda: [
+                invasive_surface.SurfaceFinding(
+                    path="sql/sys_vars.cc",
+                    state="modified",
+                    category="forbidden_sysvar_runtime_policy",
+                    severity="blocker",
+                    requirement="simulated sysvar policy",
+                    blocks_release=True,
+                )
+            ]
+            invasive_surface.audit_mysqld_file = lambda: []
+
+            with redirect_stdout(StringIO()):
+                exit_code = invasive_surface.main(["--fail-on-unclassified"])
+            self.assertEqual(1, exit_code)
+        finally:
+            invasive_surface.git_changed_paths = original_git_changed_paths
+            invasive_surface.audit_paths = original_audit_paths
+            invasive_surface.audit_lock0lock_file = original_audit_lock0lock_file
+            invasive_surface.audit_binlog_file = original_audit_binlog_file
+            invasive_surface.audit_sql_parse_file = original_audit_sql_parse_file
+            invasive_surface.audit_sys_vars_file = original_audit_sys_vars_file
+            invasive_surface.audit_mysqld_file = original_audit_mysqld_file
+
+    def test_cli_unclassified_gate_includes_mysqld_content_findings(self):
+        original_git_changed_paths = invasive_surface.git_changed_paths
+        original_audit_paths = invasive_surface.audit_paths
+        original_audit_lock0lock_file = invasive_surface.audit_lock0lock_file
+        original_audit_binlog_file = invasive_surface.audit_binlog_file
+        original_audit_sql_parse_file = invasive_surface.audit_sql_parse_file
+        original_audit_sys_vars_file = invasive_surface.audit_sys_vars_file
+        original_audit_mysqld_file = invasive_surface.audit_mysqld_file
+        try:
+            invasive_surface.git_changed_paths = lambda: []
+            invasive_surface.audit_paths = lambda paths: []
+            invasive_surface.audit_lock0lock_file = lambda: []
+            invasive_surface.audit_binlog_file = lambda: []
+            invasive_surface.audit_sql_parse_file = lambda: []
+            invasive_surface.audit_sys_vars_file = lambda: []
+            invasive_surface.audit_mysqld_file = lambda: [
+                invasive_surface.SurfaceFinding(
+                    path="sql/mysqld.cc",
+                    state="modified",
+                    category="forbidden_preserve_status_show_func",
+                    severity="blocker",
+                    requirement="simulated status show func",
+                    blocks_release=True,
+                )
+            ]
+
+            with redirect_stdout(StringIO()):
+                exit_code = invasive_surface.main(["--fail-on-unclassified"])
+            self.assertEqual(1, exit_code)
+        finally:
+            invasive_surface.git_changed_paths = original_git_changed_paths
+            invasive_surface.audit_paths = original_audit_paths
+            invasive_surface.audit_lock0lock_file = original_audit_lock0lock_file
+            invasive_surface.audit_binlog_file = original_audit_binlog_file
+            invasive_surface.audit_sql_parse_file = original_audit_sql_parse_file
+            invasive_surface.audit_sys_vars_file = original_audit_sys_vars_file
+            invasive_surface.audit_mysqld_file = original_audit_mysqld_file
 
 
 if __name__ == "__main__":

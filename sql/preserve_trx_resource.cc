@@ -28,6 +28,11 @@
 #include <mutex>
 #include <utility>
 
+#include "my_sys.h"
+#include "mysqld_error.h"
+#include "sql/preserve_trx.h"
+#include "sql/preserve_trx_lock_warmcopy.h"
+
 ulonglong preserve_trx_memory_budget_bytes = 256ULL * 1024ULL * 1024ULL;
 ulonglong preserve_trx_memory_per_token_bytes = 64ULL * 1024ULL * 1024ULL;
 uint preserve_trx_spill_chunk_bytes = 4U * 1024U * 1024U;
@@ -147,7 +152,147 @@ class Preserve_resource_manager {
 
 Preserve_resource_manager g_preserve_resource_manager;
 
+int show_preserve_trx_ulonglong_status(ulonglong value, SHOW_VAR *var,
+                                       char *buf) {
+  var->type = SHOW_LONGLONG;
+  var->value = buf;
+  *((long long *)buf) = static_cast<long long>(value);
+  return 0;
+}
+
 }  // namespace
+
+bool preserve_trx_sysvar_check_enable(sys_var *, THD *, set_var *var) {
+  if (var->save_result.ulonglong_value == 0) {
+    if (preserved_trx_can_disable_feature()) return false;
+    my_error(ER_WRONG_ARGUMENTS, MYF(0),
+             "preserve_trx_enable=OFF while preserve/drain is active");
+    return true;
+  }
+  if (!preserved_trx_ensure_snapshot_support()) return false;
+  my_error(ER_WRONG_ARGUMENTS, MYF(0), "SET");
+  return true;
+}
+
+bool preserve_trx_sysvar_update_enable(sys_var *, THD *, enum_var_type) {
+  if (!preserve_trx_enable) {
+    if (!preserved_trx_try_disable_feature_for_update()) {
+      preserve_trx_set_enable_value(true);
+      my_error(ER_WRONG_ARGUMENTS, MYF(0),
+               "preserve_trx_enable=OFF while preserve/drain is active");
+      return true;
+    }
+    return false;
+  }
+
+  preserve_trx_set_enable_value(true);
+  return false;
+}
+
+#define DEFINE_PRESERVE_TRX_SHOW_FUNC(name, status_expr)        \
+  int name(THD *, SHOW_VAR *var, char *buf) {                   \
+    return show_preserve_trx_ulonglong_status(status_expr, var, \
+                                              buf);             \
+  }
+
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_warmcopy_prefix_bytes,
+    preserve_trx_warmcopy_prefix_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_warmcopy_digest_bytes,
+    preserve_trx_warmcopy_digest_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_warmcopy_durable_bytes,
+    preserve_trx_warmcopy_durable_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_warmcopy_provider_full_copy_to_count,
+    preserve_trx_warmcopy_provider_full_copy_to_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_warmcopy_phase2_pause_us,
+    preserve_trx_warmcopy_phase2_pause_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_lock_warmcopy_attempts,
+    preserve_trx_lock_warmcopy_attempts_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_lock_warmcopy_artifact_bytes,
+    preserve_trx_lock_warmcopy_artifact_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_lock_warmcopy_canonical_mismatch,
+    preserve_trx_lock_warmcopy_canonical_mismatch_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_lock_warmcopy_conversion_freeze_waits,
+    preserve_trx_lock_warmcopy_conversion_freeze_waits_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_lock_warmcopy_dirty_shards,
+    preserve_trx_lock_warmcopy_dirty_shards_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_lock_warmcopy_final_fence_mismatch,
+    preserve_trx_lock_warmcopy_final_fence_mismatch_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_lock_warmcopy_journal_bytes,
+    preserve_trx_lock_warmcopy_journal_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_lock_warmcopy_live_fallback,
+    preserve_trx_lock_warmcopy_live_fallback_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_total_us,
+                              preserve_trx_phase2_total_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_target_wait_us,
+                              preserve_trx_phase2_target_wait_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_phase2_participant_prepare_us,
+    preserve_trx_phase2_participant_prepare_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_phase2_participant_close_us,
+    preserve_trx_phase2_participant_close_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_phase2_participant_preflight_us,
+    preserve_trx_phase2_participant_preflight_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_lock_seal_us,
+                              preserve_trx_phase2_lock_seal_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_target_preserve_us,
+                              preserve_trx_phase2_target_preserve_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_lock_preflight_us,
+                              preserve_trx_phase2_lock_preflight_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_prepare_us,
+                              preserve_trx_phase2_prepare_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_detach_claim_us,
+                              preserve_trx_phase2_detach_claim_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_snapshot_write_us,
+                              preserve_trx_phase2_snapshot_write_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_register_us,
+                              preserve_trx_phase2_register_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_slo_miss_count,
+                              preserve_trx_phase2_slo_miss_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_lock_warmcopy_phase2_pause_us,
+    preserve_trx_lock_warmcopy_phase2_pause_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_lock_warmcopy_spill_bytes,
+                              preserve_trx_lock_warmcopy_spill_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_lock_warmcopy_spill_failures,
+    preserve_trx_lock_warmcopy_spill_failures_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_lock_warmcopy_resource_limit,
+    preserve_trx_lock_warmcopy_resource_limit_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_lock_warmcopy_sealed_invalid,
+                              preserve_trx_lock_warmcopy_sealed_invalid_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_lock_warmcopy_sealed_valid,
+                              preserve_trx_lock_warmcopy_sealed_valid_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_lock_warmcopy_strict_reject,
+                              preserve_trx_lock_warmcopy_strict_reject_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_lock_warmcopy_unsupported_family,
+    preserve_trx_lock_warmcopy_unsupported_family_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_memory_current_bytes,
+                              preserve_trx_memory_current_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_memory_peak_bytes,
+                              preserve_trx_memory_peak_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_spill_bytes,
+                              preserve_trx_spill_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_spill_failures,
+                              preserve_trx_spill_failures_status())
+
+#undef DEFINE_PRESERVE_TRX_SHOW_FUNC
 
 Preserve_memory_lease::Preserve_memory_lease(
     std::string token, Preserve_trx_memory_kind kind, uint64_t bytes,

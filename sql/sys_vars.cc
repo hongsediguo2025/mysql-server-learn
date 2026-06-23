@@ -108,6 +108,7 @@
 #include "sql/protocol_classic.h"
 #include "sql/psi_memory_key.h"
 #include "sql/preserve_trx.h"
+#include "sql/preserve_trx_resource.h"
 #include "sql/query_options.h"
 #include "sql/rpl_group_replication.h"  // is_group_replication_running
 #include "sql/rpl_info_factory.h"       // Rpl_info_factory
@@ -1035,33 +1036,6 @@ class Sys_var_preserve_trx_dir final : public Sys_var_charptr_func {
 
 static Sys_var_preserve_trx_dir Sys_preserve_trx_dir;
 
-static bool check_preserve_trx_enable(sys_var *, THD *, set_var *var) {
-  if (var->save_result.ulonglong_value == 0) {
-    if (preserved_trx_can_disable_feature()) return false;
-    my_error(ER_WRONG_ARGUMENTS, MYF(0),
-             "preserve_trx_enable=OFF while preserve/drain is active");
-    return true;
-  }
-  if (!preserved_trx_ensure_snapshot_support()) return false;
-  my_error(ER_WRONG_ARGUMENTS, MYF(0), "SET");
-  return true;
-}
-
-static bool update_preserve_trx_enable(sys_var *, THD *, enum_var_type) {
-  if (!preserve_trx_enable) {
-    if (!preserved_trx_try_disable_feature_for_update()) {
-      preserve_trx_set_enable_value(true);
-      my_error(ER_WRONG_ARGUMENTS, MYF(0),
-               "preserve_trx_enable=OFF while preserve/drain is active");
-      return true;
-    }
-    return false;
-  }
-
-  preserve_trx_set_enable_value(true);
-  return false;
-}
-
 static Sys_var_bool Sys_preserve_trx_temp_table_enable(
     "preserve_trx_temp_table_enable",
     "Enable user InnoDB temporary table preserve/resume support for tables "
@@ -1658,8 +1632,9 @@ static Sys_var_bool Sys_preserve_trx_enable(
     "server restart; unsupported cases fail closed before a durable token is "
     "published.",
     GLOBAL_VAR(preserve_trx_enable), CMD_LINE(OPT_ARG), DEFAULT(true),
-    NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(check_preserve_trx_enable),
-    ON_UPDATE(update_preserve_trx_enable));
+    NO_MUTEX_GUARD, NOT_IN_BINLOG,
+    ON_CHECK(preserve_trx_sysvar_check_enable),
+    ON_UPDATE(preserve_trx_sysvar_update_enable));
 
 static Sys_var_enum Sys_binlog_format(
     "binlog_format",

@@ -33,6 +33,8 @@ NEW_LOCK_WARMCOPY_MODULES = {
     "sql/binlog_warmcopy.h",
     "sql/preserve_trx_lock_warmcopy.cc",
     "sql/preserve_trx_lock_warmcopy.h",
+    "sql/preserve_trx_resource.cc",
+    "sql/preserve_trx_resource.h",
     "storage/innobase/include/lock0warmcopy.h",
     "storage/innobase/lock/lock0preserve.cc",
     "storage/innobase/lock/lock0warmcopy.cc",
@@ -194,6 +196,37 @@ SQL_PARSE_FORBIDDEN_CONTENT = (
         "class Preserve_trx_inflight_statement_guard",
         "forbidden_sql_parse_preserve_guard_definition",
         "move preserve command-boundary RAII guard out of sql_parse.cc",
+    ),
+)
+
+SYS_VARS_CC_FORBIDDEN_CONTENT = (
+    (
+        "preserved_trx_try_disable_feature_for_update",
+        "forbidden_sysvar_runtime_policy",
+        "move preserve sysvar runtime policy out of sys_vars.cc",
+    ),
+    (
+        "preserved_trx_ensure_snapshot_support",
+        "forbidden_sysvar_runtime_policy",
+        "move preserve sysvar runtime policy out of sys_vars.cc",
+    ),
+    (
+        "preserve_trx_set_enable_value",
+        "forbidden_sysvar_runtime_policy",
+        "move preserve sysvar runtime policy out of sys_vars.cc",
+    ),
+)
+
+MYSQLD_CC_FORBIDDEN_CONTENT = (
+    (
+        "static int show_preserve_trx_",
+        "forbidden_preserve_status_show_func",
+        "move Preserve/Resume SHOW_FUNC implementations out of mysqld.cc",
+    ),
+    (
+        "static int show_preserve_trx_lock_warmcopy_",
+        "forbidden_preserve_status_show_func",
+        "move Preserve/Resume SHOW_FUNC implementations out of mysqld.cc",
     ),
 )
 
@@ -407,6 +440,52 @@ def audit_sql_parse_file(path: str = "sql/sql_parse.cc") -> List[SurfaceFinding]
     return audit_sql_parse_content(Path(path).read_text(encoding="utf-8"), path)
 
 
+def audit_content_forbidden_tokens(
+    content: str,
+    path: str,
+    forbidden_content: Sequence[Tuple[str, str, str]],
+) -> List[SurfaceFinding]:
+    findings: List[SurfaceFinding] = []
+    seen_categories = set()
+    for needle, category, requirement in forbidden_content:
+        if needle not in content or category in seen_categories:
+            continue
+        seen_categories.add(category)
+        findings.append(
+            SurfaceFinding(
+                path,
+                "modified",
+                category,
+                "blocker",
+                requirement,
+                blocks_release=True,
+            )
+        )
+    return findings
+
+
+def audit_sys_vars_content(
+    content: str,
+    path: str = "sql/sys_vars.cc",
+) -> List[SurfaceFinding]:
+    return audit_content_forbidden_tokens(content, path, SYS_VARS_CC_FORBIDDEN_CONTENT)
+
+
+def audit_sys_vars_file(path: str = "sql/sys_vars.cc") -> List[SurfaceFinding]:
+    return audit_sys_vars_content(Path(path).read_text(encoding="utf-8"), path)
+
+
+def audit_mysqld_content(
+    content: str,
+    path: str = "sql/mysqld.cc",
+) -> List[SurfaceFinding]:
+    return audit_content_forbidden_tokens(content, path, MYSQLD_CC_FORBIDDEN_CONTENT)
+
+
+def audit_mysqld_file(path: str = "sql/mysqld.cc") -> List[SurfaceFinding]:
+    return audit_mysqld_content(Path(path).read_text(encoding="utf-8"), path)
+
+
 def expanded_high_risk_findings(
     findings: Sequence[SurfaceFinding],
 ) -> List[SurfaceFinding]:
@@ -495,6 +574,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     findings.extend(audit_lock0lock_file())
     findings.extend(audit_binlog_file())
     findings.extend(audit_sql_parse_file())
+    findings.extend(audit_sys_vars_file())
+    findings.extend(audit_mysqld_file())
 
     if args.format == "json":
         print(json.dumps(findings_as_dicts(findings), indent=2, sort_keys=True))

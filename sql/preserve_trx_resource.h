@@ -28,6 +28,12 @@
 #include <string>
 
 #include "my_inttypes.h"
+#include "mysql/status_var.h"
+#include "sql/set_var.h"
+
+class THD;
+class sys_var;
+class set_var;
 
 extern ulonglong preserve_trx_memory_budget_bytes;
 extern ulonglong preserve_trx_memory_per_token_bytes;
@@ -94,5 +100,82 @@ ulonglong preserve_trx_spill_failures_status();
 void preserve_trx_resource_manager_reset_for_unit_test();
 void preserve_trx_resource_manager_set_limits_for_unit_test(
     const Preserve_trx_resource_limits &limits);
+
+bool preserve_trx_sysvar_check_enable(sys_var *self, THD *thd, set_var *var);
+bool preserve_trx_sysvar_update_enable(sys_var *self, THD *thd,
+                                       enum_var_type type);
+
+int show_preserve_trx_warmcopy_prefix_bytes(THD *thd, SHOW_VAR *var,
+                                            char *buf);
+int show_preserve_trx_warmcopy_digest_bytes(THD *thd, SHOW_VAR *var,
+                                            char *buf);
+int show_preserve_trx_warmcopy_durable_bytes(THD *thd, SHOW_VAR *var,
+                                             char *buf);
+int show_preserve_trx_warmcopy_provider_full_copy_to_count(THD *thd,
+                                                           SHOW_VAR *var,
+                                                           char *buf);
+int show_preserve_trx_warmcopy_phase2_pause_us(THD *thd, SHOW_VAR *var,
+                                               char *buf);
+int show_preserve_trx_lock_warmcopy_attempts(THD *thd, SHOW_VAR *var,
+                                             char *buf);
+int show_preserve_trx_lock_warmcopy_artifact_bytes(THD *thd, SHOW_VAR *var,
+                                                   char *buf);
+int show_preserve_trx_lock_warmcopy_canonical_mismatch(THD *thd,
+                                                       SHOW_VAR *var,
+                                                       char *buf);
+int show_preserve_trx_lock_warmcopy_conversion_freeze_waits(THD *thd,
+                                                            SHOW_VAR *var,
+                                                            char *buf);
+int show_preserve_trx_lock_warmcopy_dirty_shards(THD *thd, SHOW_VAR *var,
+                                                 char *buf);
+int show_preserve_trx_lock_warmcopy_final_fence_mismatch(THD *thd,
+                                                         SHOW_VAR *var,
+                                                         char *buf);
+int show_preserve_trx_lock_warmcopy_journal_bytes(THD *thd, SHOW_VAR *var,
+                                                  char *buf);
+int show_preserve_trx_lock_warmcopy_live_fallback(THD *thd, SHOW_VAR *var,
+                                                  char *buf);
+int show_preserve_trx_phase2_total_us(THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_phase2_target_wait_us(THD *thd, SHOW_VAR *var,
+                                            char *buf);
+int show_preserve_trx_phase2_participant_prepare_us(THD *thd, SHOW_VAR *var,
+                                                    char *buf);
+int show_preserve_trx_phase2_participant_close_us(THD *thd, SHOW_VAR *var,
+                                                  char *buf);
+int show_preserve_trx_phase2_participant_preflight_us(THD *thd, SHOW_VAR *var,
+                                                      char *buf);
+int show_preserve_trx_phase2_lock_seal_us(THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_phase2_target_preserve_us(THD *thd, SHOW_VAR *var,
+                                                char *buf);
+int show_preserve_trx_phase2_lock_preflight_us(THD *thd, SHOW_VAR *var,
+                                               char *buf);
+int show_preserve_trx_phase2_prepare_us(THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_phase2_detach_claim_us(THD *thd, SHOW_VAR *var,
+                                             char *buf);
+int show_preserve_trx_phase2_snapshot_write_us(THD *thd, SHOW_VAR *var,
+                                               char *buf);
+int show_preserve_trx_phase2_register_us(THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_phase2_slo_miss_count(THD *thd, SHOW_VAR *var,
+                                            char *buf);
+int show_preserve_trx_lock_warmcopy_phase2_pause_us(THD *thd, SHOW_VAR *var,
+                                                    char *buf);
+int show_preserve_trx_lock_warmcopy_spill_bytes(THD *thd, SHOW_VAR *var,
+                                                char *buf);
+int show_preserve_trx_lock_warmcopy_spill_failures(THD *thd, SHOW_VAR *var,
+                                                   char *buf);
+int show_preserve_trx_lock_warmcopy_resource_limit(THD *thd, SHOW_VAR *var,
+                                                   char *buf);
+int show_preserve_trx_lock_warmcopy_sealed_invalid(THD *thd, SHOW_VAR *var,
+                                                   char *buf);
+int show_preserve_trx_lock_warmcopy_sealed_valid(THD *thd, SHOW_VAR *var,
+                                                 char *buf);
+int show_preserve_trx_lock_warmcopy_strict_reject(THD *thd, SHOW_VAR *var,
+                                                  char *buf);
+int show_preserve_trx_lock_warmcopy_unsupported_family(THD *thd, SHOW_VAR *var,
+                                                       char *buf);
+int show_preserve_trx_memory_current_bytes(THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_memory_peak_bytes(THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_spill_bytes(THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_spill_failures(THD *thd, SHOW_VAR *var, char *buf);
 
 #endif  // SQL_PRESERVE_TRX_RESOURCE_INCLUDED
