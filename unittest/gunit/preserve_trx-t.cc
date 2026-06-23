@@ -63,6 +63,7 @@
 #include "sql/preserve_trx_carrier_file.h"
 #include "sql/preserve_trx_bundle.h"
 #include "sql/preserve_trx.h"
+#include "sql/preserve_trx_lock_warmcopy.h"
 #include "sql/preserve_trx_resource.h"
 #include "sql/preserve_trx_temp_table_carrier.h"
 #include "sql/preserve_trx_xid.h"
@@ -1355,7 +1356,8 @@ TEST_F(PreservedTrxMdlSavepoint,
 
   std::string payload;
   size_t lock_count = 0;
-  ASSERT_FALSE(m_context.export_preserved_locks(&payload, &lock_count));
+  ASSERT_FALSE(preserve_trx_lock_warmcopy_export_mdl_descriptors(
+      m_context, &payload, &lock_count));
   ASSERT_EQ(1U, lock_count);
   ASSERT_GE(payload.length(), 16U);
   EXPECT_EQ(static_cast<unsigned char>(MDL_key::FUNCTION),

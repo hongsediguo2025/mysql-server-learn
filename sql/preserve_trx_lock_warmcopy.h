@@ -35,6 +35,7 @@
 #include "storage/innobase/include/lock0warmcopy.h"
 
 class THD;
+class MDL_context;
 
 struct Preserve_trx_lock_warmcopy_options {
   bool enabled{true};
@@ -185,6 +186,10 @@ Preserve_trx_lock_warmcopy_canonical_compare_result
 preserve_trx_lock_warmcopy_compare_mdl_payloads_canonical(
     const std::string &live_export_payload,
     const std::string &warmcopy_payload);
+bool preserve_trx_lock_warmcopy_export_mdl_descriptors(
+    const MDL_context &mdl_context, std::string *payload, size_t *lock_count);
+bool preserve_trx_lock_warmcopy_mdl_namespace_supported(
+    unsigned int raw_namespace);
 
 class Preserve_trx_lock_warmcopy_drain_participant final
     : public Preserve_trx_drain_participant {

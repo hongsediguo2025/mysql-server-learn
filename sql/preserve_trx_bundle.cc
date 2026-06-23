@@ -41,6 +41,7 @@
 #include "sql/field.h"
 #include "sql/mdl.h"
 #include "sql/my_decimal.h"
+#include "sql/preserve_trx_lock_warmcopy.h"
 #include "sql/rpl_gtid.h"
 #include "sql/sql_const.h"
 #include "sql/preserve_trx_temp_table_carrier.h"
@@ -1318,7 +1319,7 @@ bool mdl_descriptors_payload_is_valid(const std::string &payload,
         static_cast<MDL_key::enum_mdl_namespace>(raw_namespace);
     const auto type = static_cast<enum_mdl_type>(raw_type);
     const char *part_key = payload.data() + offset;
-    if (!mdl_preserve_namespace_supported(mdl_namespace) ||
+    if (!preserve_trx_lock_warmcopy_mdl_namespace_supported(raw_namespace) ||
         !mdl_preserve_type_supported(mdl_namespace, type) ||
         !mdl_preserve_part_key_is_valid(mdl_namespace, part_key, db_length,
                                         part_key_length)) {

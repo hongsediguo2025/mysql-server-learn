@@ -31,6 +31,8 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
             "sql/preserve_trx_drain.cc",
             "sql/preserve_trx_drain.h",
             "sql/sql_parse.cc",
+            "sql/mdl.cc",
+            "sql/mdl.h",
         ):
             with self.subTest(path=path):
                 finding = invasive_surface.classify_path(
@@ -187,6 +189,32 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
 
     def test_current_mysqld_does_not_own_preserve_status_show_func(self):
         findings = invasive_surface.audit_mysqld_file("sql/mysqld.cc")
+
+        self.assertEqual([], [finding.category for finding in findings])
+
+    def test_mdl_content_rejects_preserve_wire_format(self):
+        findings = invasive_surface.audit_mdl_content(
+            "\n".join(
+                [
+                    "mdl_preserve_append_le32(&payload, count);",
+                    "bool MDL_context::export_preserved_locks(std::string *payload,",
+                    "mdl_descriptors_payload.append(bytes);",
+                ]
+            )
+        )
+
+        self.assertEqual(
+            [
+                "forbidden_mdl_wire_encoder",
+                "forbidden_mdl_payload_exporter",
+                "forbidden_mdl_payload_builder",
+            ],
+            [finding.category for finding in findings],
+        )
+        self.assertTrue(all(finding.blocks_release for finding in findings))
+
+    def test_current_mdl_does_not_own_preserve_wire_format(self):
+        findings = invasive_surface.audit_mdl_file("sql/mdl.cc")
 
         self.assertEqual([], [finding.category for finding in findings])
 
@@ -392,6 +420,7 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
         original_audit_sql_parse_file = invasive_surface.audit_sql_parse_file
         original_audit_sys_vars_file = invasive_surface.audit_sys_vars_file
         original_audit_mysqld_file = invasive_surface.audit_mysqld_file
+        original_audit_mdl_file = invasive_surface.audit_mdl_file
         try:
             invasive_surface.git_changed_paths = lambda: []
             invasive_surface.audit_paths = lambda paths: []
@@ -409,6 +438,7 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
                     blocks_release=True,
                 )
             ]
+            invasive_surface.audit_mdl_file = lambda: []
 
             with redirect_stdout(StringIO()):
                 exit_code = invasive_surface.main(["--fail-on-unclassified"])
@@ -421,6 +451,48 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
             invasive_surface.audit_sql_parse_file = original_audit_sql_parse_file
             invasive_surface.audit_sys_vars_file = original_audit_sys_vars_file
             invasive_surface.audit_mysqld_file = original_audit_mysqld_file
+            invasive_surface.audit_mdl_file = original_audit_mdl_file
+
+    def test_cli_unclassified_gate_includes_mdl_content_findings(self):
+        original_git_changed_paths = invasive_surface.git_changed_paths
+        original_audit_paths = invasive_surface.audit_paths
+        original_audit_lock0lock_file = invasive_surface.audit_lock0lock_file
+        original_audit_binlog_file = invasive_surface.audit_binlog_file
+        original_audit_sql_parse_file = invasive_surface.audit_sql_parse_file
+        original_audit_sys_vars_file = invasive_surface.audit_sys_vars_file
+        original_audit_mysqld_file = invasive_surface.audit_mysqld_file
+        original_audit_mdl_file = invasive_surface.audit_mdl_file
+        try:
+            invasive_surface.git_changed_paths = lambda: []
+            invasive_surface.audit_paths = lambda paths: []
+            invasive_surface.audit_lock0lock_file = lambda: []
+            invasive_surface.audit_binlog_file = lambda: []
+            invasive_surface.audit_sql_parse_file = lambda: []
+            invasive_surface.audit_sys_vars_file = lambda: []
+            invasive_surface.audit_mysqld_file = lambda: []
+            invasive_surface.audit_mdl_file = lambda: [
+                invasive_surface.SurfaceFinding(
+                    path="sql/mdl.cc",
+                    state="modified",
+                    category="forbidden_mdl_payload_exporter",
+                    severity="blocker",
+                    requirement="simulated mdl exporter",
+                    blocks_release=True,
+                )
+            ]
+
+            with redirect_stdout(StringIO()):
+                exit_code = invasive_surface.main(["--fail-on-unclassified"])
+            self.assertEqual(1, exit_code)
+        finally:
+            invasive_surface.git_changed_paths = original_git_changed_paths
+            invasive_surface.audit_paths = original_audit_paths
+            invasive_surface.audit_lock0lock_file = original_audit_lock0lock_file
+            invasive_surface.audit_binlog_file = original_audit_binlog_file
+            invasive_surface.audit_sql_parse_file = original_audit_sql_parse_file
+            invasive_surface.audit_sys_vars_file = original_audit_sys_vars_file
+            invasive_surface.audit_mysqld_file = original_audit_mysqld_file
+            invasive_surface.audit_mdl_file = original_audit_mdl_file
 
 
 if __name__ == "__main__":

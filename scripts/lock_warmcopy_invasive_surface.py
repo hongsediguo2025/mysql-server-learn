@@ -65,6 +65,14 @@ NECESSARY_INTEGRATION_POINTS = {
         "command-boundary adapter calls only; no preserve state machine or "
         "local guard implementation"
     ),
+    "sql/mdl.cc": (
+        "MDL ticket visitor and savepoint ordinal helpers only; no "
+        "Preserve/Resume wire format or payload export"
+    ),
+    "sql/mdl.h": (
+        "MDL visitor/savepoint helper declarations only; no Preserve/Resume "
+        "payload types"
+    ),
     "sql/sys_vars.cc": "sysvar registration only",
     "sql/mysqld.cc": "status-var registration only",
 }
@@ -227,6 +235,24 @@ MYSQLD_CC_FORBIDDEN_CONTENT = (
         "static int show_preserve_trx_lock_warmcopy_",
         "forbidden_preserve_status_show_func",
         "move Preserve/Resume SHOW_FUNC implementations out of mysqld.cc",
+    ),
+)
+
+MDL_CC_FORBIDDEN_CONTENT = (
+    (
+        "mdl_preserve_append_",
+        "forbidden_mdl_wire_encoder",
+        "move Preserve/Resume MDL wire encoding out of mdl.cc",
+    ),
+    (
+        "export_preserved_locks(std::string",
+        "forbidden_mdl_payload_exporter",
+        "move Preserve/Resume MDL payload export out of mdl.cc",
+    ),
+    (
+        "mdl_descriptors_payload.append",
+        "forbidden_mdl_payload_builder",
+        "move Preserve/Resume MDL payload construction out of mdl.cc",
     ),
 )
 
@@ -486,6 +512,17 @@ def audit_mysqld_file(path: str = "sql/mysqld.cc") -> List[SurfaceFinding]:
     return audit_mysqld_content(Path(path).read_text(encoding="utf-8"), path)
 
 
+def audit_mdl_content(
+    content: str,
+    path: str = "sql/mdl.cc",
+) -> List[SurfaceFinding]:
+    return audit_content_forbidden_tokens(content, path, MDL_CC_FORBIDDEN_CONTENT)
+
+
+def audit_mdl_file(path: str = "sql/mdl.cc") -> List[SurfaceFinding]:
+    return audit_mdl_content(Path(path).read_text(encoding="utf-8"), path)
+
+
 def expanded_high_risk_findings(
     findings: Sequence[SurfaceFinding],
 ) -> List[SurfaceFinding]:
@@ -576,6 +613,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     findings.extend(audit_sql_parse_file())
     findings.extend(audit_sys_vars_file())
     findings.extend(audit_mysqld_file())
+    findings.extend(audit_mdl_file())
 
     if args.format == "json":
         print(json.dumps(findings_as_dicts(findings), indent=2, sort_keys=True))

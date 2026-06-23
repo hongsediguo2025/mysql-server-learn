@@ -1097,6 +1097,94 @@ Preserve_trx_lock_warmcopy_target_state prepared_target_state(
              : Preserve_trx_lock_warmcopy_target_state::NEW;
 }
 
+bool mdl_preserve_namespace_supported(
+    MDL_key::enum_mdl_namespace mdl_namespace) {
+  switch (mdl_namespace) {
+    case MDL_key::GLOBAL:
+    case MDL_key::TABLESPACE:
+    case MDL_key::SCHEMA:
+    case MDL_key::TABLE:
+    case MDL_key::COMMIT:
+    case MDL_key::FOREIGN_KEY:
+    case MDL_key::CHECK_CONSTRAINT:
+    case MDL_key::FUNCTION:
+    case MDL_key::PROCEDURE:
+    case MDL_key::TRIGGER:
+      return true;
+    case MDL_key::BACKUP_LOCK:
+    case MDL_key::EVENT:
+    case MDL_key::USER_LEVEL_LOCK:
+    case MDL_key::LOCKING_SERVICE:
+    case MDL_key::SRID:
+    case MDL_key::ACL_CACHE:
+    case MDL_key::COLUMN_STATISTICS:
+    case MDL_key::RESOURCE_GROUPS:
+    case MDL_key::NAMESPACE_END:
+      return false;
+  }
+  return false;
+}
+
+bool mdl_preserve_normalized_namespace(
+    MDL_key::enum_mdl_namespace mdl_namespace) {
+  switch (mdl_namespace) {
+    case MDL_key::FUNCTION:
+    case MDL_key::PROCEDURE:
+    case MDL_key::TRIGGER:
+      return true;
+    default:
+      return false;
+  }
+}
+
+uint mdl_preserve_key_payload_length(const MDL_key *key) {
+  if (key == nullptr) return 0;
+  uint length = key->length();
+  if (mdl_preserve_normalized_namespace(key->mdl_namespace()))
+    length += key->name_length() + 1;
+  return length;
+}
+
+struct Mdl_descriptor_export_context {
+  std::string bytes;
+  uint32_t count{0};
+};
+
+bool export_mdl_descriptor_ticket(const MDL_ticket *ticket, void *arg) {
+  Mdl_descriptor_export_context *context =
+      static_cast<Mdl_descriptor_export_context *>(arg);
+  if (ticket == nullptr || context == nullptr) return true;
+
+  const MDL_key *key = ticket->get_key();
+  if (key == nullptr || key->length() == 0 ||
+      ticket->get_type() >= MDL_TYPE_END) {
+    return true;
+  }
+
+  const MDL_key::enum_mdl_namespace mdl_namespace = key->mdl_namespace();
+  if (!mdl_preserve_namespace_supported(mdl_namespace)) return true;
+
+  const uint key_length = mdl_preserve_key_payload_length(key);
+  const uint part_key_length = key_length - 1;
+  if (part_key_length > std::numeric_limits<uint16_t>::max() ||
+      key->db_name_length() > std::numeric_limits<uint16_t>::max() ||
+      context->count == std::numeric_limits<uint32_t>::max()) {
+    return true;
+  }
+
+  context->bytes.push_back(static_cast<char>(mdl_namespace));
+  context->bytes.push_back(static_cast<char>(ticket->get_type()));
+  context->bytes.push_back(static_cast<char>(MDL_TRANSACTION));
+  context->bytes.push_back(0);
+  append_le32(&context->bytes, context->count + 1);
+  append_le16(&context->bytes, static_cast<uint16_t>(key->db_name_length()));
+  append_le16(&context->bytes, static_cast<uint16_t>(part_key_length));
+  context->bytes.append(reinterpret_cast<const char *>(key->ptr() + 1),
+                        part_key_length);
+  ++context->count;
+  return false;
+}
+
 uint32_t effective_lock_warmcopy_seal_thread_count(uint32_t configured,
                                                    size_t target_count) {
   if (target_count <= 1) return 1;
@@ -1164,8 +1252,9 @@ class Lock_warmcopy_target_fence_sampler final : public Do_THD_Impl {
 
     std::string mdl_descriptors_payload;
     size_t mdl_descriptor_count = 0;
-    if (!candidate->mdl_context.export_preserved_locks(
-            &mdl_descriptors_payload, &mdl_descriptor_count) &&
+    if (!preserve_trx_lock_warmcopy_export_mdl_descriptors(
+            candidate->mdl_context, &mdl_descriptors_payload,
+            &mdl_descriptor_count) &&
         mdl_descriptor_count <= std::numeric_limits<uint32_t>::max()) {
       m_mdl_descriptors.emplace(thread_id, std::move(mdl_descriptors_payload));
       m_mdl_descriptor_counts.emplace(
@@ -1284,6 +1373,39 @@ preserve_trx_lock_warmcopy_current_options() {
   options.conversion_wait_timeout_ms =
       preserve_trx_lock_warmcopy_conversion_wait_timeout_ms;
   return options;
+}
+
+bool preserve_trx_lock_warmcopy_export_mdl_descriptors(
+    const MDL_context &mdl_context, std::string *payload, size_t *lock_count) {
+  if (payload == nullptr || lock_count == nullptr) return true;
+  if (mdl_context.has_locks(MDL_STATEMENT) ||
+      mdl_context.has_locks(MDL_EXPLICIT)) {
+    return true;
+  }
+
+  Mdl_descriptor_export_context context;
+  context.bytes.reserve(64);
+  append_le32(&context.bytes, 0);
+
+  if (mdl_context.visit_tickets(MDL_TRANSACTION, export_mdl_descriptor_ticket,
+                                &context)) {
+    return true;
+  }
+
+  for (size_t i = 0; i < 4; ++i) {
+    context.bytes[i] =
+        static_cast<char>((context.count >> (i * 8)) & 0xffU);
+  }
+  *lock_count = context.count;
+  *payload = std::move(context.bytes);
+  return false;
+}
+
+bool preserve_trx_lock_warmcopy_mdl_namespace_supported(
+    unsigned int raw_namespace) {
+  if (raw_namespace >= MDL_key::NAMESPACE_END) return false;
+  return mdl_preserve_namespace_supported(
+      static_cast<MDL_key::enum_mdl_namespace>(raw_namespace));
 }
 
 bool preserve_trx_lock_warmcopy_effective() {
@@ -2396,8 +2518,9 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
   std::string mdl_descriptors_payload;
   size_t mdl_descriptor_count = 0;
   const bool mdl_candidate_valid =
-      !target->mdl_context.export_preserved_locks(&mdl_descriptors_payload,
-                                                  &mdl_descriptor_count) &&
+      !preserve_trx_lock_warmcopy_export_mdl_descriptors(
+          target->mdl_context, &mdl_descriptors_payload,
+          &mdl_descriptor_count) &&
       mdl_descriptor_count <= std::numeric_limits<uint32_t>::max();
   if (table_candidate_valid && mdl_candidate_valid) {
     seed_phase1_non_record_payloads_for_thread(

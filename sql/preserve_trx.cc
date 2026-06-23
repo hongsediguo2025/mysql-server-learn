@@ -2149,7 +2149,7 @@ bool mdl_descriptors_payload_is_valid(const std::string &payload,
         static_cast<MDL_key::enum_mdl_namespace>(raw_namespace);
     const auto type = static_cast<enum_mdl_type>(raw_type);
     const char *part_key = payload.data() + offset;
-    if (!mdl_preserve_namespace_supported(mdl_namespace) ||
+    if (!preserve_trx_lock_warmcopy_mdl_namespace_supported(raw_namespace) ||
         !mdl_preserve_type_supported(mdl_namespace, type) ||
         !mdl_preserve_part_key_is_valid(mdl_namespace, part_key, db_length,
                                         part_key_length)) {
@@ -8240,8 +8240,9 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   auto export_live_mdl_descriptors = [&]() -> const char * {
     mdl_descriptors_payload.clear();
     mdl_descriptors_count = 0;
-    if (thd->mdl_context.export_preserved_locks(&mdl_descriptors_payload,
-                                                &mdl_descriptors_count)) {
+    if (preserve_trx_lock_warmcopy_export_mdl_descriptors(
+            thd->mdl_context, &mdl_descriptors_payload,
+            &mdl_descriptors_count)) {
       return "mdl_export_failed";
     }
     if (preserve_trx_recheck_mdl_object_privileges(thd,

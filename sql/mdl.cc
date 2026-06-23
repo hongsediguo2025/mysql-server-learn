@@ -26,7 +26,6 @@
 #include <algorithm>
 #include <atomic>
 #include <functional>
-#include <limits>
 
 #include "lf.h"
 #include "m_ctype.h"
@@ -3629,34 +3628,6 @@ err:
   return true;
 }
 
-bool mdl_preserve_namespace_supported(
-    MDL_key::enum_mdl_namespace mdl_namespace) {
-  switch (mdl_namespace) {
-    case MDL_key::GLOBAL:
-    case MDL_key::TABLESPACE:
-    case MDL_key::SCHEMA:
-    case MDL_key::TABLE:
-    case MDL_key::COMMIT:
-    case MDL_key::FOREIGN_KEY:
-    case MDL_key::CHECK_CONSTRAINT:
-    case MDL_key::FUNCTION:
-    case MDL_key::PROCEDURE:
-    case MDL_key::TRIGGER:
-      return true;
-    case MDL_key::BACKUP_LOCK:
-    case MDL_key::EVENT:
-    case MDL_key::USER_LEVEL_LOCK:
-    case MDL_key::LOCKING_SERVICE:
-    case MDL_key::SRID:
-    case MDL_key::ACL_CACHE:
-    case MDL_key::COLUMN_STATISTICS:
-    case MDL_key::RESOURCE_GROUPS:
-    case MDL_key::NAMESPACE_END:
-      return false;
-  }
-  return false;
-}
-
 bool MDL_context::clone_tickets(const MDL_context *ticket_owner,
                                 enum_mdl_duration duration) {
   MDL_ticket *ticket;
@@ -4438,92 +4409,14 @@ bool MDL_ticket::has_pending_conflicting_lock() const {
 
 const MDL_key *MDL_ticket::get_key() const { return &m_lock->key; }
 
-namespace {
+bool MDL_context::visit_tickets(enum_mdl_duration duration,
+                                Ticket_visitor visitor, void *arg) const {
+  if (visitor == nullptr) return true;
 
-void mdl_preserve_append_le16(std::string *bytes, uint16 value) {
-  bytes->push_back(static_cast<char>(value & 0xff));
-  bytes->push_back(static_cast<char>((value >> 8) & 0xff));
-}
-
-void mdl_preserve_append_le32(std::string *bytes, uint32 value) {
-  for (size_t i = 0; i < 4; ++i)
-    bytes->push_back(static_cast<char>((value >> (i * 8)) & 0xff));
-}
-
-bool mdl_preserve_normalized_namespace(
-    MDL_key::enum_mdl_namespace mdl_namespace) {
-  switch (mdl_namespace) {
-    case MDL_key::FUNCTION:
-    case MDL_key::PROCEDURE:
-    case MDL_key::TRIGGER:
-      return true;
-    default:
-      return false;
-  }
-}
-
-uint mdl_preserve_key_payload_length(const MDL_key *key) {
-  if (key == nullptr) return 0;
-  uint length = key->length();
-  if (mdl_preserve_normalized_namespace(key->mdl_namespace()))
-    length += key->name_length() + 1;
-  return length;
-}
-
-}  // namespace
-
-bool MDL_context::export_preserved_locks(std::string *payload,
-                                         size_t *lock_count) const {
-  if (payload == nullptr || lock_count == nullptr) return true;
-  if (!m_ticket_store.is_empty(MDL_STATEMENT) ||
-      !m_ticket_store.is_empty(MDL_EXPLICIT)) {
-    return true;
-  }
-
-  std::string bytes;
-  bytes.reserve(64);
-  mdl_preserve_append_le32(&bytes, 0);
-
-  uint32 count = 0;
-  MDL_ticket_store::List_iterator it =
-      m_ticket_store.list_iterator(MDL_TRANSACTION);
+  MDL_ticket_store::List_iterator it = m_ticket_store.list_iterator(duration);
   for (MDL_ticket *ticket = it++; ticket != nullptr; ticket = it++) {
-    const MDL_key *key = ticket->get_key();
-    if (key == nullptr || key->length() == 0 ||
-        ticket->get_type() >= MDL_TYPE_END) {
-      return true;
-    }
-
-    const MDL_key::enum_mdl_namespace mdl_namespace = key->mdl_namespace();
-    if (!mdl_preserve_namespace_supported(mdl_namespace)) {
-      return true;
-    }
-
-    const uint key_length = mdl_preserve_key_payload_length(key);
-    const uint part_key_length = key_length - 1;
-    if (part_key_length > std::numeric_limits<uint16>::max() ||
-        key->db_name_length() > std::numeric_limits<uint16>::max() ||
-        count == std::numeric_limits<uint32>::max()) {
-      return true;
-    }
-
-    bytes.push_back(static_cast<char>(mdl_namespace));
-    bytes.push_back(static_cast<char>(ticket->get_type()));
-    bytes.push_back(static_cast<char>(MDL_TRANSACTION));
-    bytes.push_back(0);
-    mdl_preserve_append_le32(&bytes, count + 1);
-    mdl_preserve_append_le16(&bytes, static_cast<uint16>(key->db_name_length()));
-    mdl_preserve_append_le16(&bytes, static_cast<uint16>(part_key_length));
-    bytes.append(reinterpret_cast<const char *>(key->ptr() + 1),
-                 part_key_length);
-    ++count;
+    if (visitor(ticket, arg)) return true;
   }
-
-  for (size_t i = 0; i < 4; ++i) {
-    bytes[i] = static_cast<char>((count >> (i * 8)) & 0xff);
-  }
-  *lock_count = count;
-  *payload = std::move(bytes);
   return false;
 }
 

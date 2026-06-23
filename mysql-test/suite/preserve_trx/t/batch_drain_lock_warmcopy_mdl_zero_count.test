@@ -46,21 +46,28 @@ my $mdl = read_source('sql', 'mdl.cc');
 my $gunit = read_source('unittest', 'gunit',
                         'preserve_trx_lock_warmcopy-t.cc');
 
-my $export = extract_function(
+my $visit_tickets = extract_function(
   $mdl,
-  qr/bool\s+MDL_context::export_preserved_locks\s*\(/,
-  'MDL_context::export_preserved_locks');
+  qr/bool\s+MDL_context::visit_tickets\s*\(/,
+  'MDL_context::visit_tickets');
+die "MDL native code must only expose ticket iteration, not payload export\n"
+  unless $visit_tickets =~ /m_ticket_store\.list_iterator\s*\(\s*duration\s*\)/s &&
+         $visit_tickets =~ /visitor\s*\(\s*ticket,\s*arg\s*\)/s;
+
+my $export = extract_function(
+  $participant,
+  qr/bool\s+preserve_trx_lock_warmcopy_export_mdl_descriptors\s*\(/,
+  'preserve_trx_lock_warmcopy_export_mdl_descriptors');
 die "MDL export must reject statement/explicit duration locks\n"
-  unless $export =~ /!\s*m_ticket_store\.is_empty\s*\(\s*MDL_STATEMENT\s*\)/s &&
-         $export =~ /!\s*m_ticket_store\.is_empty\s*\(\s*MDL_EXPLICIT\s*\)/s;
+  unless $export =~ /has_locks\s*\(\s*MDL_STATEMENT\s*\)/s &&
+         $export =~ /has_locks\s*\(\s*MDL_EXPLICIT\s*\)/s;
 die "MDL export must start with a legal little-endian zero-count payload\n"
-  unless $export =~ /std::string\s+bytes[\s\S]*mdl_preserve_append_le32\s*\(\s*&bytes,\s*0\s*\)/s;
+  unless $export =~ /Mdl_descriptor_export_context\s+context[\s\S]*append_le32\s*\(\s*&context\.bytes,\s*0\s*\)/s;
 die "MDL export must only walk transaction-duration tickets\n"
-  unless $export =~ /m_ticket_store\.list_iterator\s*\(\s*MDL_TRANSACTION\s*\)/s &&
-         $export =~ /static_cast<char>\s*\(\s*MDL_TRANSACTION\s*\)/s;
+  unless $export =~ /visit_tickets\s*\(\s*MDL_TRANSACTION/s;
 die "MDL export must rewrite the leading count after walking the list\n"
-  unless $export =~ /for\s*\(\s*size_t\s+i\s*=\s*0;\s*i\s*<\s*4;\s*\+\+i\s*\)[\s\S]*bytes\s*\[\s*i\s*\][\s\S]*count\s*>>/s &&
-         $export =~ /\*lock_count\s*=\s*count/s;
+  unless $export =~ /for\s*\(\s*size_t\s+i\s*=\s*0;\s*i\s*<\s*4;\s*\+\+i\s*\)[\s\S]*context\.bytes\s*\[\s*i\s*\][\s\S]*context\.count\s*>>/s &&
+         $export =~ /\*lock_count\s*=\s*context\.count/s;
 
 my $unit_prepare = extract_function(
   $participant,
