@@ -37,8 +37,10 @@ NEW_LOCK_WARMCOPY_MODULES = {
     "sql/preserve_trx_resource.h",
     "sql/preserve_trx_rewrite.cc",
     "storage/innobase/include/lock0warmcopy.h",
+    "storage/innobase/include/trx0temp_preserve.h",
     "storage/innobase/lock/lock0preserve.cc",
     "storage/innobase/lock/lock0warmcopy.cc",
+    "storage/innobase/trx/trx0temp_preserve.cc",
     "unittest/gunit/innodb/lock0warmcopy-t.cc",
     "unittest/gunit/preserve_trx_lock_warmcopy-t.cc",
     "scripts/lock_warmcopy_nfr2_runner.py",
@@ -83,6 +85,10 @@ NECESSARY_INTEGRATION_POINTS = {
     ),
     "sql/sys_vars.cc": "sysvar registration only",
     "sql/mysqld.cc": "status-var registration only",
+    "storage/innobase/handler/ha_innodb.cc": (
+        "InnoDB handler adapter calls only; Preserve/Resume temporary-table "
+        "naming and lifecycle policy must stay in trx0temp_preserve.*"
+    ),
 }
 
 BUILD_INTEGRATION_POINTS = {
@@ -289,6 +295,14 @@ MDL_CC_FORBIDDEN_CONTENT = (
         "mdl_descriptors_payload.append",
         "forbidden_mdl_payload_builder",
         "move Preserve/Resume MDL payload construction out of mdl.cc",
+    ),
+)
+
+HA_INNODB_CC_FORBIDDEN_CONTENT = (
+    (
+        "_preserved_space_",
+        "forbidden_ha_innodb_preserve_temp_name_parser",
+        "move Preserve/Resume temporary table name parsing out of ha_innodb.cc",
     ),
 )
 
@@ -589,6 +603,21 @@ def audit_mdl_file(path: str = "sql/mdl.cc") -> List[SurfaceFinding]:
     return audit_mdl_content(Path(path).read_text(encoding="utf-8"), path)
 
 
+def audit_ha_innodb_content(
+    content: str,
+    path: str = "storage/innobase/handler/ha_innodb.cc",
+) -> List[SurfaceFinding]:
+    return audit_content_forbidden_tokens(
+        content, path, HA_INNODB_CC_FORBIDDEN_CONTENT
+    )
+
+
+def audit_ha_innodb_file(
+    path: str = "storage/innobase/handler/ha_innodb.cc",
+) -> List[SurfaceFinding]:
+    return audit_ha_innodb_content(Path(path).read_text(encoding="utf-8"), path)
+
+
 def expanded_high_risk_findings(
     findings: Sequence[SurfaceFinding],
 ) -> List[SurfaceFinding]:
@@ -682,6 +711,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     findings.extend(audit_sys_vars_file())
     findings.extend(audit_mysqld_file())
     findings.extend(audit_mdl_file())
+    findings.extend(audit_ha_innodb_file())
 
     if args.format == "json":
         print(json.dumps(findings_as_dicts(findings), indent=2, sort_keys=True))

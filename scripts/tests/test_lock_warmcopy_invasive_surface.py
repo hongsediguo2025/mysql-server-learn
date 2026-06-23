@@ -14,7 +14,9 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
             "sql/preserve_trx_resource.cc",
             "sql/preserve_trx_resource.h",
             "sql/preserve_trx_rewrite.cc",
+            "storage/innobase/include/trx0temp_preserve.h",
             "storage/innobase/lock/lock0preserve.cc",
+            "storage/innobase/trx/trx0temp_preserve.cc",
         ):
             with self.subTest(path=path):
                 finding = invasive_surface.classify_path(
@@ -36,6 +38,7 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
             "sql/sql_rewrite.h",
             "sql/mdl.cc",
             "sql/mdl.h",
+            "storage/innobase/handler/ha_innodb.cc",
         ):
             with self.subTest(path=path):
                 finding = invasive_surface.classify_path(
@@ -262,6 +265,24 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
 
     def test_current_mdl_does_not_own_preserve_wire_format(self):
         findings = invasive_surface.audit_mdl_file("sql/mdl.cc")
+
+        self.assertEqual([], [finding.category for finding in findings])
+
+    def test_ha_innodb_content_rejects_preserve_temp_name_parser(self):
+        findings = invasive_surface.audit_ha_innodb_content(
+            'const char marker[] = "_preserved_space_";'
+        )
+
+        self.assertEqual(
+            ["forbidden_ha_innodb_preserve_temp_name_parser"],
+            [finding.category for finding in findings],
+        )
+        self.assertTrue(all(finding.blocks_release for finding in findings))
+
+    def test_current_ha_innodb_does_not_own_preserve_temp_name_parser(self):
+        findings = invasive_surface.audit_ha_innodb_file(
+            "storage/innobase/handler/ha_innodb.cc"
+        )
 
         self.assertEqual([], [finding.category for finding in findings])
 

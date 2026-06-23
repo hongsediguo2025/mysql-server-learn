@@ -6826,42 +6826,7 @@ int ha_innobase::open(const char *name, int, uint open_flags,
       }
     }
   } else {
-    bool preserved_user_temp_table = false;
-    if (ib_table->is_temporary()) {
-      const char marker[] = "_preserved_space_";
-      const char table_suffix[] = "_table_";
-      const char *table_name = strrchr(ib_table->name.m_name, '/');
-      table_name = table_name == nullptr ? ib_table->name.m_name : table_name + 1;
-      const char *suffix = nullptr;
-      for (const char *candidate = strstr(table_name, marker);
-           candidate != nullptr;
-           candidate = strstr(candidate + sizeof(marker) - 1, marker)) {
-        suffix = candidate;
-      }
-      if (suffix != nullptr) {
-        suffix += sizeof(marker) - 1;
-        if (*suffix >= '0' && *suffix <= '9') {
-          char *end = nullptr;
-          const unsigned long parsed_space_id = strtoul(suffix, &end, 10);
-          bool generated_name = false;
-          if (end != suffix && end != nullptr &&
-              strncmp(end, table_suffix, sizeof(table_suffix) - 1) == 0) {
-            const char *table_id = end + sizeof(table_suffix) - 1;
-            const char *table_id_end = table_id;
-            while (*table_id_end >= '0' && *table_id_end <= '9') {
-              ++table_id_end;
-            }
-            generated_name = table_id_end != table_id && *table_id_end == '\0';
-          }
-          preserved_user_temp_table =
-              generated_name &&
-              parsed_space_id <= std::numeric_limits<space_id_t>::max() &&
-              ibt::is_preserved_space_id_reserved(
-                  static_cast<space_id_t>(parsed_space_id));
-        }
-      }
-    }
-    if (preserved_user_temp_table) {
+    if (trx_preserve_temp_space_image_is_reserved_generated_table(ib_table)) {
       mutex_enter(&dict_sys->mutex);
       ib_table->acquire_with_lock();
       mutex_exit(&dict_sys->mutex);

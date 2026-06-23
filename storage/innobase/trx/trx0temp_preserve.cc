@@ -31,6 +31,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -4460,6 +4461,47 @@ bool trx_preserve_temp_space_image_fil_space_adopted_by_space_id(
       trx_preserve_temp_adopted_fil_spaces_mutex};
   return trx_preserve_temp_adopted_fil_spaces.find(source_space_id) !=
          trx_preserve_temp_adopted_fil_spaces.end();
+}
+
+bool trx_preserve_temp_space_image_is_reserved_generated_table(
+    const dict_table_t *table) {
+  if (table == nullptr || !table->is_temporary() ||
+      table->name.m_name == nullptr) {
+    return false;
+  }
+
+  const char marker[] = "_preserved_space_";
+  const char table_suffix[] = "_table_";
+  const char *table_name = strrchr(table->name.m_name, '/');
+  table_name = table_name == nullptr ? table->name.m_name : table_name + 1;
+
+  const char *suffix = nullptr;
+  for (const char *candidate = strstr(table_name, marker); candidate != nullptr;
+       candidate = strstr(candidate + sizeof(marker) - 1, marker)) {
+    suffix = candidate;
+  }
+  if (suffix == nullptr) return false;
+
+  suffix += sizeof(marker) - 1;
+  if (*suffix < '0' || *suffix > '9') return false;
+
+  char *end = nullptr;
+  const unsigned long parsed_space_id = strtoul(suffix, &end, 10);
+  if (end == suffix || end == nullptr ||
+      strncmp(end, table_suffix, sizeof(table_suffix) - 1) != 0) {
+    return false;
+  }
+
+  const char *table_id = end + sizeof(table_suffix) - 1;
+  const char *table_id_end = table_id;
+  while (*table_id_end >= '0' && *table_id_end <= '9') {
+    ++table_id_end;
+  }
+  if (table_id_end == table_id || *table_id_end != '\0') return false;
+
+  return parsed_space_id <= std::numeric_limits<space_id_t>::max() &&
+         ibt::is_preserved_space_id_reserved(
+             static_cast<space_id_t>(parsed_space_id));
 }
 
 dberr_t trx_preserve_temp_space_image_release_preserved_fil_space_for_retry(

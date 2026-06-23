@@ -455,6 +455,9 @@ dberr_t trx_preserve_temp_space_image_drop_bound_table_by_space_id(
 bool trx_preserve_temp_space_image_fil_space_adopted_by_space_id(
     uint32_t source_space_id);
 
+bool trx_preserve_temp_space_image_is_reserved_generated_table(
+    const dict_table_t *table);
+
 dberr_t trx_preserve_temp_space_image_release_preserved_fil_space_for_retry(
     trx_preserve_temp_space_image_descriptor *descriptor);
 
