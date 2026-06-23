@@ -2014,7 +2014,10 @@ def business_live_large_cache_buckets_mb(config: LongRunConfig) -> List[int]:
 
 
 def business_live_default_baseline_compare(config: LongRunConfig) -> bool:
-    return config.cycle_interval_s <= BUSINESS_LIVE_BASELINE_COMPARE_MAX_INTERVAL_S
+    return (
+        config.warmcopy_enabled
+        and config.cycle_interval_s <= BUSINESS_LIVE_BASELINE_COMPARE_MAX_INTERVAL_S
+    )
 
 
 def business_live_covered_large_cache_buckets_mb(

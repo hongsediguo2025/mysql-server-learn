@@ -1068,11 +1068,10 @@ class ResumableTrxLongRunE2ETest(unittest.TestCase):
             self.assertEqual(3, parsed.large_binlog_cache_sessions)
             self.assertEqual([1], parsed.large_binlog_cache_buckets_mb)
 
-    def test_business_live_single_phase_uses_baseline_compare_by_default(self):
+    def test_business_live_smoke_single_phase_does_not_emit_binlog_baseline(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
             config = LongRunConfig.for_profile(
-                "smoke", root, seed=33, cycles=1, cycle_interval_s=0.5
+                "smoke", Path(tmpdir), seed=33, cycles=1, cycle_interval_s=0.5
             )
             options = BusinessLiveOptions(
                 restart_command="mysqld --defaults-file=/tmp/preserve.cnf",
@@ -1083,36 +1082,21 @@ class ResumableTrxLongRunE2ETest(unittest.TestCase):
 
             plan = build_business_live_plan(config, options)
 
-            self.assertEqual(["baseline", "preserve"], [
-                phase.phase for phase in plan
+            self.assertEqual(["run"], [phase.phase for phase in plan])
+            self.assertEqual(["none"], [
+                phase.binlog_validation_mode for phase in plan
             ])
-            self.assertEqual(
-                ["baseline_capture", "binlog_equivalence"],
-                [phase.binlog_validation_mode for phase in plan],
-            )
-            self.assertEqual([[], []], [
+            self.assertEqual([[]], [
                 list(phase.covered_large_cache_buckets_mb) for phase in plan
             ])
-            baseline_command = plan[0].command
-            command = plan[1].command
-            baseline_path = root / "business-live-baseline-binlog-events.txt"
+            command = plan[0].command
 
             self.assertIn("--scenario hundred_session_semantic_matrix", command)
             self.assertNotIn("--warmcopy-required", command)
             self.assertNotIn("--two-phase", command)
-            self.assertIn("--max-transactions-per-worker 1", baseline_command)
-            self.assertIn("--max-transactions-per-worker 1", command)
-            self.assertIn("--canonical-binlog-transaction-order", baseline_command)
-            self.assertIn("--canonical-binlog-transaction-order", command)
-            self.assertIn("--no-preserve-baseline", baseline_command)
-            self.assertIn(
-                "--write-binlog-events-file " + str(baseline_path),
-                baseline_command,
-            )
-            self.assertIn(
-                "--expected-binlog-events-file " + str(baseline_path),
-                command,
-            )
+            self.assertNotIn("--write-binlog-events-file", command)
+            self.assertNotIn("--expected-binlog-events-file", command)
+            self.assertNotIn("--no-preserve-baseline", command)
             self.assertNotIn("--write-binlog-events-file", command)
 
     def test_business_live_warmcopy_uses_expected_baseline_when_provided(self):
@@ -4742,7 +4726,7 @@ class ResumableTrxLongRunE2ETest(unittest.TestCase):
             report = ReportLedger(root).latest_complete_cycle()
             self.assertIsNotNone(report)
             self.assertEqual(
-                "binlog_equivalence",
+                "none",
                 report["business_live_binlog_validation_mode"],
             )
             self.assertEqual(
@@ -4756,14 +4740,14 @@ class ResumableTrxLongRunE2ETest(unittest.TestCase):
                 .splitlines()
             ]
             self.assertEqual(
-                [
-                    "business_live_baseline_command",
-                    "business_live_command",
-                ],
-                [event["event_type"] for event in events[-2:]],
+                ["business_live_command"],
+                [event["event_type"] for event in events[-1:]],
             )
             self.assertIn("fake_business_e2e.py", events[-1]["command"])
-            self.assertIn("--expected-binlog-events-file", events[-1]["command"])
+            self.assertNotIn("--expected-binlog-events-file",
+                             events[-1]["command"])
+            self.assertNotIn("--write-binlog-events-file",
+                             events[-1]["command"])
             self.assertEqual(0, events[-1]["returncode"])
 
     def test_business_live_warmcopy_runs_baseline_then_preserve_by_default(self):
@@ -4853,7 +4837,7 @@ class ResumableTrxLongRunE2ETest(unittest.TestCase):
                              preserve_event["command"])
             self.assertTrue(baseline_path.exists())
 
-    def test_business_live_single_phase_report_marks_binlog_equivalence(self):
+    def test_business_live_single_phase_report_marks_no_binlog_validation(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             fake_harness = root / "fake_business_e2e.py"
@@ -4893,7 +4877,7 @@ class ResumableTrxLongRunE2ETest(unittest.TestCase):
             report = ReportLedger(root).latest_complete_cycle()
             self.assertIsNotNone(report)
             self.assertEqual(
-                "binlog_equivalence",
+                "none",
                 report["business_live_binlog_validation_mode"],
             )
             self.assertEqual(
@@ -4907,33 +4891,18 @@ class ResumableTrxLongRunE2ETest(unittest.TestCase):
                 .splitlines()
             ]
             self.assertEqual(
-                [
-                    "business_live_baseline_command",
-                    "business_live_command",
-                ],
-                [event["event_type"] for event in events[-2:]],
+                ["business_live_command"],
+                [event["event_type"] for event in events[-1:]],
             )
-            baseline_event, preserve_event = events[-2:]
-            baseline_path = (
-                root.resolve() / "business-live-baseline-binlog-events.txt"
-            )
-            self.assertIn("--no-preserve-baseline", baseline_event["command"])
-            self.assertIn(
-                "--write-binlog-events-file " + str(baseline_path),
-                baseline_event["command"],
-            )
-            self.assertIn(
-                "--expected-binlog-events-file " + str(baseline_path),
-                preserve_event["command"],
-            )
+            preserve_event = events[-1]
+            self.assertNotIn("--no-preserve-baseline",
+                             preserve_event["command"])
+            self.assertNotIn("--write-binlog-events-file",
+                             preserve_event["command"])
+            self.assertNotIn("--expected-binlog-events-file",
+                             preserve_event["command"])
             self.assertNotIn("--warmcopy-required", preserve_event["command"])
-            self.assertEqual(
-                "baseline_capture", baseline_event["binlog_validation_mode"]
-            )
-            self.assertEqual(
-                "binlog_equivalence", preserve_event["binlog_validation_mode"]
-            )
-            self.assertEqual([], baseline_event["covered_large_cache_buckets_mb"])
+            self.assertEqual("none", preserve_event["binlog_validation_mode"])
             self.assertEqual([], preserve_event["covered_large_cache_buckets_mb"])
 
     def test_business_live_timed_warmcopy_report_marks_capture_only(self):
