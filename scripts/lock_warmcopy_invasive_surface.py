@@ -89,6 +89,13 @@ ARTIFACT_SUPPORT_INTEGRATION_POINTS = {
         "external artifact prebuilt binlog warmcopy descriptor handoff only; "
         "no binlog execution semantics"
     ),
+    "sql/binlog_ostream.cc": (
+        "external artifact source-cache range copy and thin mirror dispatch "
+        "only; no warmcopy session or lease policy"
+    ),
+    "sql/binlog_ostream.h": (
+        "external artifact source-cache adapter declarations only"
+    ),
     "sql/preserve_trx_bundle.cc": (
         "external artifact descriptor encode/decode only; preserve semantics "
         "must stay in lock warmcopy or bundle validators"
@@ -196,6 +203,14 @@ BINLOG_CC_FORBIDDEN_CONTENT = (
         "Warmcopy_blob_copy_ostream",
         "forbidden_binlog_warmcopy_blob_copy",
         "move warmcopy blob copy stream implementation out of binlog.cc",
+    ),
+)
+
+BINLOG_OSTREAM_CC_FORBIDDEN_CONTENT = (
+    (
+        "Binlog_cache_warmcopy_lease::",
+        "forbidden_binlog_ostream_warmcopy_lease_impl",
+        "move warmcopy mirror lease implementation out of binlog_ostream.cc",
     ),
 )
 
@@ -441,6 +456,21 @@ def audit_binlog_file(path: str = "sql/binlog.cc") -> List[SurfaceFinding]:
     return audit_binlog_content(Path(path).read_text(encoding="utf-8"), path)
 
 
+def audit_binlog_ostream_content(
+    content: str,
+    path: str = "sql/binlog_ostream.cc",
+) -> List[SurfaceFinding]:
+    return audit_content_forbidden_tokens(
+        content, path, BINLOG_OSTREAM_CC_FORBIDDEN_CONTENT
+    )
+
+
+def audit_binlog_ostream_file(
+    path: str = "sql/binlog_ostream.cc",
+) -> List[SurfaceFinding]:
+    return audit_binlog_ostream_content(Path(path).read_text(encoding="utf-8"), path)
+
+
 def audit_sql_parse_content(
     content: str,
     path: str = "sql/sql_parse.cc",
@@ -610,6 +640,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     findings = audit_paths(git_changed_paths())
     findings.extend(audit_lock0lock_file())
     findings.extend(audit_binlog_file())
+    findings.extend(audit_binlog_ostream_file())
     findings.extend(audit_sql_parse_file())
     findings.extend(audit_sys_vars_file())
     findings.extend(audit_mysqld_file())

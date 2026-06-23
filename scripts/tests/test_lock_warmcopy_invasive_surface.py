@@ -47,6 +47,8 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
     def test_external_artifact_support_files_are_classified(self):
         for path in (
             "sql/binlog.cc",
+            "sql/binlog_ostream.cc",
+            "sql/binlog_ostream.h",
             "sql/preserve_trx_bundle.cc",
             "sql/preserve_trx_bundle.h",
             "sql/preserve_trx_carrier.cc",
@@ -130,6 +132,24 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
 
     def test_current_binlog_cc_has_no_warmcopy_session_implementation(self):
         findings = invasive_surface.audit_binlog_file("sql/binlog.cc")
+
+        self.assertEqual([], [finding.category for finding in findings])
+
+    def test_binlog_ostream_content_rejects_warmcopy_lease_implementation(self):
+        findings = invasive_surface.audit_binlog_ostream_content(
+            "bool Binlog_cache_warmcopy_lease::install_if_absent(...) { return false; }"
+        )
+
+        self.assertEqual(
+            ["forbidden_binlog_ostream_warmcopy_lease_impl"],
+            [finding.category for finding in findings],
+        )
+        self.assertTrue(all(finding.blocks_release for finding in findings))
+
+    def test_current_binlog_ostream_does_not_own_warmcopy_lease_implementation(self):
+        findings = invasive_surface.audit_binlog_ostream_file(
+            "sql/binlog_ostream.cc"
+        )
 
         self.assertEqual([], [finding.category for finding in findings])
 
@@ -318,6 +338,9 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
         original_audit_paths = invasive_surface.audit_paths
         original_audit_lock0lock_file = invasive_surface.audit_lock0lock_file
         original_audit_binlog_file = invasive_surface.audit_binlog_file
+        original_audit_binlog_ostream_file = (
+            invasive_surface.audit_binlog_ostream_file
+        )
         try:
             invasive_surface.git_changed_paths = lambda: []
             invasive_surface.audit_paths = lambda paths: []
@@ -332,6 +355,7 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
                     blocks_release=True,
                 )
             ]
+            invasive_surface.audit_binlog_ostream_file = lambda: []
 
             with redirect_stdout(StringIO()):
                 exit_code = invasive_surface.main(["--fail-on-unclassified"])
@@ -341,18 +365,61 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
             invasive_surface.audit_paths = original_audit_paths
             invasive_surface.audit_lock0lock_file = original_audit_lock0lock_file
             invasive_surface.audit_binlog_file = original_audit_binlog_file
+            invasive_surface.audit_binlog_ostream_file = (
+                original_audit_binlog_ostream_file
+            )
+
+    def test_cli_unclassified_gate_includes_binlog_ostream_content_findings(self):
+        original_git_changed_paths = invasive_surface.git_changed_paths
+        original_audit_paths = invasive_surface.audit_paths
+        original_audit_lock0lock_file = invasive_surface.audit_lock0lock_file
+        original_audit_binlog_file = invasive_surface.audit_binlog_file
+        original_audit_binlog_ostream_file = (
+            invasive_surface.audit_binlog_ostream_file
+        )
+        try:
+            invasive_surface.git_changed_paths = lambda: []
+            invasive_surface.audit_paths = lambda paths: []
+            invasive_surface.audit_lock0lock_file = lambda: []
+            invasive_surface.audit_binlog_file = lambda: []
+            invasive_surface.audit_binlog_ostream_file = lambda: [
+                invasive_surface.SurfaceFinding(
+                    path="sql/binlog_ostream.cc",
+                    state="modified",
+                    category="forbidden_binlog_ostream_warmcopy_lease_impl",
+                    severity="blocker",
+                    requirement="simulated binlog ostream lease implementation",
+                    blocks_release=True,
+                )
+            ]
+
+            with redirect_stdout(StringIO()):
+                exit_code = invasive_surface.main(["--fail-on-unclassified"])
+            self.assertEqual(1, exit_code)
+        finally:
+            invasive_surface.git_changed_paths = original_git_changed_paths
+            invasive_surface.audit_paths = original_audit_paths
+            invasive_surface.audit_lock0lock_file = original_audit_lock0lock_file
+            invasive_surface.audit_binlog_file = original_audit_binlog_file
+            invasive_surface.audit_binlog_ostream_file = (
+                original_audit_binlog_ostream_file
+            )
 
     def test_cli_unclassified_gate_includes_sql_parse_content_findings(self):
         original_git_changed_paths = invasive_surface.git_changed_paths
         original_audit_paths = invasive_surface.audit_paths
         original_audit_lock0lock_file = invasive_surface.audit_lock0lock_file
         original_audit_binlog_file = invasive_surface.audit_binlog_file
+        original_audit_binlog_ostream_file = (
+            invasive_surface.audit_binlog_ostream_file
+        )
         original_audit_sql_parse_file = invasive_surface.audit_sql_parse_file
         try:
             invasive_surface.git_changed_paths = lambda: []
             invasive_surface.audit_paths = lambda paths: []
             invasive_surface.audit_lock0lock_file = lambda: []
             invasive_surface.audit_binlog_file = lambda: []
+            invasive_surface.audit_binlog_ostream_file = lambda: []
             invasive_surface.audit_sql_parse_file = lambda: [
                 invasive_surface.SurfaceFinding(
                     path="sql/sql_parse.cc",
@@ -372,6 +439,9 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
             invasive_surface.audit_paths = original_audit_paths
             invasive_surface.audit_lock0lock_file = original_audit_lock0lock_file
             invasive_surface.audit_binlog_file = original_audit_binlog_file
+            invasive_surface.audit_binlog_ostream_file = (
+                original_audit_binlog_ostream_file
+            )
             invasive_surface.audit_sql_parse_file = original_audit_sql_parse_file
 
     def test_cli_unclassified_gate_includes_sysvar_content_findings(self):

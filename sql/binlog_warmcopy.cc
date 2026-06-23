@@ -30,6 +30,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -120,6 +121,73 @@ Preserved_trx_external_blob_descriptor descriptor_from_prebuilt_warmcopy_blob(
 
 }  // namespace
 
+bool Binlog_cache_warmcopy_lease::active() const {
+  return m_active.load(std::memory_order_acquire);
+}
+
+bool Binlog_cache_warmcopy_lease::install_if_absent(
+    Binlog_cache_warmcopy_mirror *mirror) {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (mirror == nullptr || m_mirror != nullptr) return true;
+  m_mirror = mirror;
+  m_active.store(true, std::memory_order_release);
+  return false;
+}
+
+void Binlog_cache_warmcopy_lease::clear_if_owner(
+    Binlog_cache_warmcopy_mirror *mirror) {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (m_mirror == mirror) {
+    m_mirror = nullptr;
+    m_active.store(false, std::memory_order_release);
+  }
+}
+
+void Binlog_cache_warmcopy_lease::close_source_cache() {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  Binlog_cache_warmcopy_mirror *const mirror = m_mirror;
+  m_mirror = nullptr;
+  m_active.store(false, std::memory_order_release);
+  if (mirror != nullptr) mirror->note_source_cache_closed();
+}
+
+void Binlog_cache_warmcopy_lease::note_source_write_failed() {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (m_mirror != nullptr) m_mirror->note_source_write_failed();
+}
+
+void Binlog_cache_warmcopy_lease::note_non_lifecycle_reset() {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  Binlog_cache_warmcopy_mirror *const mirror = m_mirror;
+  if (mirror == nullptr) return;
+  mirror->note_non_lifecycle_reset();
+  if (mirror->truncate(0) == Binlog_warmcopy_mirror_status::ERROR) {
+    mirror->mark_degraded("mirror truncate failed");
+  }
+  if (m_mirror == mirror) {
+    m_mirror = nullptr;
+    m_active.store(false, std::memory_order_release);
+  }
+}
+
+Binlog_warmcopy_mirror_status Binlog_cache_warmcopy_lease::write_at(
+    uint64_t offset, const unsigned char *data, size_t length) {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (m_mirror == nullptr) return Binlog_warmcopy_mirror_status::OK;
+  return m_mirror->write_at(offset, data, length);
+}
+
+Binlog_warmcopy_mirror_status Binlog_cache_warmcopy_lease::truncate(
+    uint64_t length) {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (m_mirror == nullptr) return Binlog_warmcopy_mirror_status::OK;
+  return m_mirror->truncate(length);
+}
+
+void Binlog_cache_warmcopy_lease::mark_degraded(const char *reason) {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (m_mirror != nullptr) m_mirror->mark_degraded(reason);
+}
 
 class Mysql_binlog_warmcopy_session final
     : public Binlog_cache_warmcopy_mirror {
