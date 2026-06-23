@@ -129,4 +129,22 @@ class Preserve_trx_drain_service {
   bool execute(THD *thd, const Preserve_trx_drain_request &request);
 };
 
+class Preserve_trx_inflight_statement_guard {
+ public:
+  Preserve_trx_inflight_statement_guard() = default;
+  Preserve_trx_inflight_statement_guard(
+      const Preserve_trx_inflight_statement_guard &) = delete;
+  Preserve_trx_inflight_statement_guard &operator=(
+      const Preserve_trx_inflight_statement_guard &) = delete;
+  ~Preserve_trx_inflight_statement_guard();
+
+  void mark(THD *thd, enum_sql_command sql_command);
+  void mark_unknown_query(THD *thd);
+
+ private:
+  THD *m_thd{nullptr};
+  bool m_active{false};
+  bool m_unknown_query{false};
+};
+
 #endif  // SQL_PRESERVE_TRX_DRAIN_INCLUDED

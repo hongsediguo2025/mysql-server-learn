@@ -120,6 +120,7 @@
 #include "sql/protocol.h"
 #include "sql/protocol_classic.h"
 #include "sql/preserve_trx.h"
+#include "sql/preserve_trx_drain.h"
 #include "sql/psi_memory_key.h"
 #include "sql/query_options.h"
 #include "sql/query_result.h"
@@ -198,44 +199,6 @@ class Abstract_table;
 
 using Mysql::Nullable;
 using std::max;
-
-class Preserve_trx_inflight_statement_guard {
- public:
-  Preserve_trx_inflight_statement_guard() = default;
-  Preserve_trx_inflight_statement_guard(
-      const Preserve_trx_inflight_statement_guard &) = delete;
-  Preserve_trx_inflight_statement_guard &operator=(
-      const Preserve_trx_inflight_statement_guard &) = delete;
-  ~Preserve_trx_inflight_statement_guard() {
-    if (!m_active) return;
-    if (m_unknown_query)
-      preserved_trx_clear_inflight_unknown_query(m_thd);
-    else
-      preserved_trx_clear_inflight_risky_statement(m_thd);
-  }
-
-  void mark(THD *thd, enum_sql_command sql_command) {
-    assert(!m_active);
-    if (preserved_trx_mark_inflight_risky_statement(thd, sql_command)) {
-      m_thd = thd;
-      m_active = true;
-    }
-  }
-
-  void mark_unknown_query(THD *thd) {
-    assert(!m_active);
-    if (preserved_trx_mark_inflight_unknown_query(thd)) {
-      m_thd = thd;
-      m_active = true;
-      m_unknown_query = true;
-    }
-  }
-
- private:
-  THD *m_thd{nullptr};
-  bool m_active{false};
-  bool m_unknown_query{false};
-};
 
 /**
   @defgroup Runtime_Environment Runtime Environment

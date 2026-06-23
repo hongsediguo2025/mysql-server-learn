@@ -49,8 +49,20 @@ NECESSARY_INTEGRATION_POINTS = {
         "orchestration glue only; policy/state must stay in "
         "preserve_trx_lock_warmcopy.*"
     ),
+    "sql/preserve_trx_drain.cc": (
+        "drain orchestration and command-boundary guard implementation only; "
+        "feature policy/state must stay in preserve_trx.* modules"
+    ),
+    "sql/preserve_trx_drain.h": (
+        "drain orchestration declarations, observation fields, and "
+        "command-boundary guard declaration only"
+    ),
     "sql/preserve_trx.h": "sysvar/status declarations only",
     "sql/preserve_trx_kernel.h": "artifact pointer handoff only",
+    "sql/sql_parse.cc": (
+        "command-boundary adapter calls only; no preserve state machine or "
+        "local guard implementation"
+    ),
     "sql/sys_vars.cc": "sysvar registration only",
     "sql/mysqld.cc": "status-var registration only",
 }
@@ -85,9 +97,6 @@ ARTIFACT_SUPPORT_INTEGRATION_POINTS = {
     ),
     "sql/preserve_trx_carrier_file.h": (
         "external artifact file carrier declarations/options only"
-    ),
-    "sql/preserve_trx_drain.h": (
-        "external artifact/phase2 observation fields only"
     ),
 }
 
@@ -177,6 +186,14 @@ BINLOG_CC_FORBIDDEN_CONTENT = (
         "Warmcopy_blob_copy_ostream",
         "forbidden_binlog_warmcopy_blob_copy",
         "move warmcopy blob copy stream implementation out of binlog.cc",
+    ),
+)
+
+SQL_PARSE_FORBIDDEN_CONTENT = (
+    (
+        "class Preserve_trx_inflight_statement_guard",
+        "forbidden_sql_parse_preserve_guard_definition",
+        "move preserve command-boundary RAII guard out of sql_parse.cc",
     ),
 )
 
@@ -365,6 +382,31 @@ def audit_binlog_file(path: str = "sql/binlog.cc") -> List[SurfaceFinding]:
     return audit_binlog_content(Path(path).read_text(encoding="utf-8"), path)
 
 
+def audit_sql_parse_content(
+    content: str,
+    path: str = "sql/sql_parse.cc",
+) -> List[SurfaceFinding]:
+    findings: List[SurfaceFinding] = []
+    for needle, category, requirement in SQL_PARSE_FORBIDDEN_CONTENT:
+        if needle not in content:
+            continue
+        findings.append(
+            SurfaceFinding(
+                path,
+                "modified",
+                category,
+                "blocker",
+                requirement,
+                blocks_release=True,
+            )
+        )
+    return findings
+
+
+def audit_sql_parse_file(path: str = "sql/sql_parse.cc") -> List[SurfaceFinding]:
+    return audit_sql_parse_content(Path(path).read_text(encoding="utf-8"), path)
+
+
 def expanded_high_risk_findings(
     findings: Sequence[SurfaceFinding],
 ) -> List[SurfaceFinding]:
@@ -452,6 +494,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     findings = audit_paths(git_changed_paths())
     findings.extend(audit_lock0lock_file())
     findings.extend(audit_binlog_file())
+    findings.extend(audit_sql_parse_file())
 
     if args.format == "json":
         print(json.dumps(findings_as_dicts(findings), indent=2, sort_keys=True))

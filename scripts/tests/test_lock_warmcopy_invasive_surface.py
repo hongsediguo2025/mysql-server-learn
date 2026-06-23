@@ -24,15 +24,21 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
                 self.assertFalse(finding.blocks_release)
 
     def test_sql_preserve_trx_is_a_necessary_integration_point(self):
-        finding = invasive_surface.classify_path(
+        for path in (
             "sql/preserve_trx.cc",
-            state="modified",
-        )
+            "sql/preserve_trx_drain.cc",
+            "sql/preserve_trx_drain.h",
+            "sql/sql_parse.cc",
+        ):
+            with self.subTest(path=path):
+                finding = invasive_surface.classify_path(
+                    path,
+                    state="modified",
+                )
 
-        self.assertEqual("necessary_integration_point", finding.category)
-        self.assertEqual("medium", finding.severity)
-        self.assertFalse(finding.blocks_release)
-        self.assertIn("orchestration glue", finding.requirement)
+                self.assertEqual("necessary_integration_point", finding.category)
+                self.assertEqual("medium", finding.severity)
+                self.assertFalse(finding.blocks_release)
 
     def test_external_artifact_support_files_are_classified(self):
         for path in (
@@ -43,7 +49,6 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
             "sql/preserve_trx_carrier.h",
             "sql/preserve_trx_carrier_file.cc",
             "sql/preserve_trx_carrier_file.h",
-            "sql/preserve_trx_drain.h",
         ):
             with self.subTest(path=path):
                 finding = invasive_surface.classify_path(
@@ -124,9 +129,25 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
 
         self.assertEqual([], [finding.category for finding in findings])
 
+    def test_sql_parse_content_rejects_preserve_guard_definition(self):
+        findings = invasive_surface.audit_sql_parse_content(
+            "class Preserve_trx_inflight_statement_guard { /* sql_parse local */ };"
+        )
+
+        self.assertEqual(
+            ["forbidden_sql_parse_preserve_guard_definition"],
+            [finding.category for finding in findings],
+        )
+        self.assertTrue(all(finding.blocks_release for finding in findings))
+
+    def test_current_sql_parse_does_not_own_preserve_guard_definition(self):
+        findings = invasive_surface.audit_sql_parse_file("sql/sql_parse.cc")
+
+        self.assertEqual([], [finding.category for finding in findings])
+
     def test_unclassified_core_change_blocks_release(self):
         finding = invasive_surface.classify_path(
-            "sql/sql_parse.cc",
+            "sql/sql_lex.cc",
             state="modified",
         )
 
@@ -139,12 +160,13 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
             [
                 ("sql/preserve_trx.cc", "modified"),
                 ("sql/sql_parse.cc", "modified"),
+                ("sql/sql_lex.cc", "modified"),
                 ("sql/preserve_trx_lock_warmcopy.cc", "untracked"),
             ]
         )
 
         blocked = invasive_surface.blocking_findings(findings)
-        self.assertEqual(["sql/sql_parse.cc"], [finding.path for finding in blocked])
+        self.assertEqual(["sql/sql_lex.cc"], [finding.path for finding in blocked])
 
     def test_expanded_high_risk_core_hot_path_blocks_when_gate_enabled(self):
         findings = [
@@ -246,6 +268,38 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
             invasive_surface.audit_paths = original_audit_paths
             invasive_surface.audit_lock0lock_file = original_audit_lock0lock_file
             invasive_surface.audit_binlog_file = original_audit_binlog_file
+
+    def test_cli_unclassified_gate_includes_sql_parse_content_findings(self):
+        original_git_changed_paths = invasive_surface.git_changed_paths
+        original_audit_paths = invasive_surface.audit_paths
+        original_audit_lock0lock_file = invasive_surface.audit_lock0lock_file
+        original_audit_binlog_file = invasive_surface.audit_binlog_file
+        original_audit_sql_parse_file = invasive_surface.audit_sql_parse_file
+        try:
+            invasive_surface.git_changed_paths = lambda: []
+            invasive_surface.audit_paths = lambda paths: []
+            invasive_surface.audit_lock0lock_file = lambda: []
+            invasive_surface.audit_binlog_file = lambda: []
+            invasive_surface.audit_sql_parse_file = lambda: [
+                invasive_surface.SurfaceFinding(
+                    path="sql/sql_parse.cc",
+                    state="modified",
+                    category="forbidden_sql_parse_preserve_guard_definition",
+                    severity="blocker",
+                    requirement="simulated sql_parse preserve guard",
+                    blocks_release=True,
+                )
+            ]
+
+            with redirect_stdout(StringIO()):
+                exit_code = invasive_surface.main(["--fail-on-unclassified"])
+            self.assertEqual(1, exit_code)
+        finally:
+            invasive_surface.git_changed_paths = original_git_changed_paths
+            invasive_surface.audit_paths = original_audit_paths
+            invasive_surface.audit_lock0lock_file = original_audit_lock0lock_file
+            invasive_surface.audit_binlog_file = original_audit_binlog_file
+            invasive_surface.audit_sql_parse_file = original_audit_sql_parse_file
 
 
 if __name__ == "__main__":

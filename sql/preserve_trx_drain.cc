@@ -23,6 +23,34 @@
 
 #include "sql/preserve_trx_drain.h"
 
+#include <cassert>
+
+Preserve_trx_inflight_statement_guard::~Preserve_trx_inflight_statement_guard() {
+  if (!m_active) return;
+  if (m_unknown_query)
+    preserved_trx_clear_inflight_unknown_query(m_thd);
+  else
+    preserved_trx_clear_inflight_risky_statement(m_thd);
+}
+
+void Preserve_trx_inflight_statement_guard::mark(
+    THD *thd, enum_sql_command sql_command) {
+  assert(!m_active);
+  if (preserved_trx_mark_inflight_risky_statement(thd, sql_command)) {
+    m_thd = thd;
+    m_active = true;
+  }
+}
+
+void Preserve_trx_inflight_statement_guard::mark_unknown_query(THD *thd) {
+  assert(!m_active);
+  if (preserved_trx_mark_inflight_unknown_query(thd)) {
+    m_thd = thd;
+    m_active = true;
+    m_unknown_query = true;
+  }
+}
+
 Preserve_trx_drain_orchestrator::Preserve_trx_drain_orchestrator(
     Preserve_trx_drain_phase_mode mode)
     : m_mode(mode) {}
