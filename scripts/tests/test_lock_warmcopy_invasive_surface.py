@@ -13,6 +13,7 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
             "sql/preserve_trx_lock_warmcopy.cc",
             "sql/preserve_trx_resource.cc",
             "sql/preserve_trx_resource.h",
+            "sql/preserve_trx_rewrite.cc",
             "storage/innobase/lock/lock0preserve.cc",
         ):
             with self.subTest(path=path):
@@ -31,6 +32,8 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
             "sql/preserve_trx_drain.cc",
             "sql/preserve_trx_drain.h",
             "sql/sql_parse.cc",
+            "sql/sql_rewrite.cc",
+            "sql/sql_rewrite.h",
             "sql/mdl.cc",
             "sql/mdl.h",
         ):
@@ -166,6 +169,30 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
 
     def test_current_sql_parse_does_not_own_preserve_guard_definition(self):
         findings = invasive_surface.audit_sql_parse_file("sql/sql_parse.cc")
+
+        self.assertEqual([], [finding.category for finding in findings])
+
+    def test_sql_rewrite_content_rejects_preserve_raw_parser(self):
+        findings = invasive_surface.audit_sql_rewrite_content(
+            "\n".join(
+                [
+                    "bool raw_sql_parse_resume_token();",
+                    "auto token = preserved_trx_redacted_token(raw);",
+                ]
+            )
+        )
+
+        self.assertEqual(
+            [
+                "forbidden_sql_rewrite_preserve_raw_parser",
+                "forbidden_sql_rewrite_preserve_redaction_policy",
+            ],
+            [finding.category for finding in findings],
+        )
+        self.assertTrue(all(finding.blocks_release for finding in findings))
+
+    def test_current_sql_rewrite_does_not_own_preserve_raw_parser(self):
+        findings = invasive_surface.audit_sql_rewrite_file("sql/sql_rewrite.cc")
 
         self.assertEqual([], [finding.category for finding in findings])
 

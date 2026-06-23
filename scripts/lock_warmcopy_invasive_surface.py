@@ -35,6 +35,7 @@ NEW_LOCK_WARMCOPY_MODULES = {
     "sql/preserve_trx_lock_warmcopy.h",
     "sql/preserve_trx_resource.cc",
     "sql/preserve_trx_resource.h",
+    "sql/preserve_trx_rewrite.cc",
     "storage/innobase/include/lock0warmcopy.h",
     "storage/innobase/lock/lock0preserve.cc",
     "storage/innobase/lock/lock0warmcopy.cc",
@@ -64,6 +65,13 @@ NECESSARY_INTEGRATION_POINTS = {
     "sql/sql_parse.cc": (
         "command-boundary adapter calls only; no preserve state machine or "
         "local guard implementation"
+    ),
+    "sql/sql_rewrite.cc": (
+        "rewrite dispatch adapter only; Preserve/Resume raw token parsing and "
+        "redaction must stay in preserve modules"
+    ),
+    "sql/sql_rewrite.h": (
+        "rewrite interface declaration only; no Preserve/Resume parser state"
     ),
     "sql/mdl.cc": (
         "MDL ticket visitor and savepoint ordinal helpers only; no "
@@ -219,6 +227,19 @@ SQL_PARSE_FORBIDDEN_CONTENT = (
         "class Preserve_trx_inflight_statement_guard",
         "forbidden_sql_parse_preserve_guard_definition",
         "move preserve command-boundary RAII guard out of sql_parse.cc",
+    ),
+)
+
+SQL_REWRITE_CC_FORBIDDEN_CONTENT = (
+    (
+        "raw_sql_",
+        "forbidden_sql_rewrite_preserve_raw_parser",
+        "move Preserve/Resume raw SQL token parser out of sql_rewrite.cc",
+    ),
+    (
+        "preserved_trx_redacted_token",
+        "forbidden_sql_rewrite_preserve_redaction_policy",
+        "move Preserve/Resume token redaction policy out of sql_rewrite.cc",
     ),
 )
 
@@ -496,6 +517,21 @@ def audit_sql_parse_file(path: str = "sql/sql_parse.cc") -> List[SurfaceFinding]
     return audit_sql_parse_content(Path(path).read_text(encoding="utf-8"), path)
 
 
+def audit_sql_rewrite_content(
+    content: str,
+    path: str = "sql/sql_rewrite.cc",
+) -> List[SurfaceFinding]:
+    return audit_content_forbidden_tokens(
+        content, path, SQL_REWRITE_CC_FORBIDDEN_CONTENT
+    )
+
+
+def audit_sql_rewrite_file(
+    path: str = "sql/sql_rewrite.cc",
+) -> List[SurfaceFinding]:
+    return audit_sql_rewrite_content(Path(path).read_text(encoding="utf-8"), path)
+
+
 def audit_content_forbidden_tokens(
     content: str,
     path: str,
@@ -642,6 +678,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     findings.extend(audit_binlog_file())
     findings.extend(audit_binlog_ostream_file())
     findings.extend(audit_sql_parse_file())
+    findings.extend(audit_sql_rewrite_file())
     findings.extend(audit_sys_vars_file())
     findings.extend(audit_mysqld_file())
     findings.extend(audit_mdl_file())
