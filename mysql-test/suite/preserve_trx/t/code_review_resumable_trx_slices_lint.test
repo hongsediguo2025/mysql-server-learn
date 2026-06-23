@@ -29,12 +29,17 @@ my $preserve_path = File::Spec->catfile($source_root, 'sql', 'preserve_trx.cc');
 my $preserve_header_path = File::Spec->catfile($source_root, 'sql',
                                               'preserve_trx.h');
 my $binlog_path = File::Spec->catfile($source_root, 'sql', 'binlog.cc');
+my $binlog_warmcopy_path = File::Spec->catfile($source_root, 'sql',
+                                               'binlog_warmcopy.cc');
 my $binlog_ostream_path = File::Spec->catfile($source_root, 'sql',
                                               'binlog_ostream.cc');
 my $bundle_path = File::Spec->catfile($source_root, 'sql',
                                       'preserve_trx_bundle.cc');
 my $lock_path = File::Spec->catfile($source_root, 'storage', 'innobase',
                                     'lock', 'lock0lock.cc');
+my $lock_preserve_path = File::Spec->catfile($source_root, 'storage',
+                                             'innobase', 'lock',
+                                             'lock0preserve.cc');
 my $lock_header_path = File::Spec->catfile($source_root, 'storage', 'innobase',
                                            'include', 'lock0lock.h');
 my $lock_priv_ic_path = File::Spec->catfile($source_root, 'storage',
@@ -82,9 +87,11 @@ my $sql_parse_path = File::Spec->catfile($source_root, 'sql', 'sql_parse.cc');
 my $preserve = read_source($preserve_path);
 my $preserve_header = read_source($preserve_header_path);
 my $binlog = read_source($binlog_path);
+my $binlog_warmcopy = read_source($binlog_warmcopy_path);
 my $binlog_ostream = read_source($binlog_ostream_path);
 my $bundle = read_source($bundle_path);
 my $lock = read_source($lock_path);
+my $lock_preserve = read_source($lock_preserve_path);
 my $lock_header = read_source($lock_header_path);
 my $lock_priv_ic = read_source($lock_priv_ic_path);
 my $lock_warmcopy = read_source($lock_warmcopy_path);
@@ -108,7 +115,7 @@ my $handler = read_source($handler_path);
 my $gunit = read_source($gunit_path);
 my $sql_parse = read_source($sql_parse_path);
 
-$lock =~ /static bool lock_preserve_page_identity_matches[\s\S]*?^}/m
+$lock_preserve =~ /static bool lock_preserve_page_identity_matches[\s\S]*?^}/m
   or die "could not isolate lock_preserve_page_identity_matches\n";
 my $page_identity = $&;
 die "predicate lock identity must fail closed when the persisted identity is empty\n"
@@ -124,33 +131,40 @@ die "ordinary record lock identity must not reject solely on page_n_heap drift\n
   if $page_identity =~
      /entry\.page_n_heap\s*!=\s*page_dir_get_n_heap\s*\(\s*page\s*\)[\s\S]*return\s+false\s*;/s;
 
-die "preserved temp-table acquire must parse the final generated _preserved_space_<id>_table_<id> suffix and require an active reservation\n"
+$trx_temp_preserve =~
+  /bool trx_preserve_temp_space_image_is_reserved_generated_table\s*\([^)]*\)\s*\{[\s\S]*?^}/m
+  or die "could not isolate preserved generated temp-table helper\n";
+my $reserved_generated_temp_table = $&;
+die "preserved temp-table acquire must delegate generated-name recognition out of ha_innodb hot code\n"
   unless $ha_innodb =~
-         /for\s*\(\s*const char \*candidate\s*=\s*(?:std::)?strstr\s*\(\s*table_name,\s*marker\s*\)[\s\S]*suffix\s*=\s*candidate[\s\S]*table_suffix[\s\S]*generated_name[\s\S]*is_preserved_space_id_reserved/s;
+         /trx_preserve_temp_space_image_is_reserved_generated_table\s*\(\s*ib_table\s*\)/s;
+die "preserved temp-table generated-name helper must parse the final generated _preserved_space_<id>_table_<id> suffix and require an active reservation\n"
+  unless $reserved_generated_temp_table =~
+         /for\s*\(\s*const char \*candidate\s*=\s*(?:std::)?strstr\s*\(\s*table_name,\s*marker\s*\)[\s\S]*suffix\s*=\s*candidate[\s\S]*table_suffix[\s\S]*is_preserved_space_id_reserved/s;
 
-$lock =~ /static dberr_t lock_preserve_resurrect_table_lock\s*\([^)]*\)\s*\{[\s\S]*?^}/m
-  or die "could not isolate lock_preserve_resurrect_table_lock\n";
+$lock =~ /dberr_t lock_preserve_create_table_lock_for_import\s*\([^)]*\)\s*\{[\s\S]*?^}/m
+  or die "could not isolate lock_preserve_create_table_lock_for_import\n";
 my $preserve_resurrect_table_lock = $&;
 die "preserved table-lock resurrect must fail closed instead of assert-aborting on incompatible locks\n"
   unless $preserve_resurrect_table_lock =~
          /lock_table_other_has_incompatible[\s\S]*return\s+DB_LOCK_WAIT\s*;/s &&
          $preserve_resurrect_table_lock !~ /ut_a\s*\(\s*!\s*lock_table_other_has_incompatible/s;
 
-$lock =~ /static dberr_t lock_preserve_import_one_table_lock\s*\([^)]*\)\s*\{[\s\S]*?^}/m
+$lock_preserve =~ /static dberr_t lock_preserve_import_one_table_lock\s*\([^)]*\)\s*\{[\s\S]*?^}/m
   or die "could not isolate lock_preserve_import_one_table_lock\n";
 my $preserve_import_table_lock = $&;
 die "preserved table-lock import must delegate resurrection errors to the caller\n"
   unless $preserve_import_table_lock =~
-         /return\s+lock_preserve_resurrect_table_lock\s*\(\s*table\s*,\s*trx\s*,\s*mode\s*\)\s*;/s;
+         /return\s+lock_preserve_create_table_lock_for_import\s*\(\s*table\s*,\s*trx\s*,\s*mode\s*\)\s*;/s;
 
-$lock =~ /static dberr_t lock_preserve_import_record_lock[\s\S]*?^}/m
+$lock_preserve =~ /static dberr_t lock_preserve_import_record_lock[\s\S]*?^}/m
   or die "could not isolate lock_preserve_import_record_lock\n";
 my $preserve_import_record_lock = $&;
 die "preserved record-lock import must fail closed when intention-lock resurrect sees an incompatible table lock\n"
   unless $preserve_import_record_lock =~
-         /lock_preserve_resurrect_table_lock[\s\S]*if\s*\(\s*table_err\s*!=\s*DB_SUCCESS\s*\)[\s\S]*return\s+table_err/s;
+         /lock_preserve_create_table_lock_for_import[\s\S]*if\s*\(\s*table_err\s*!=\s*DB_SUCCESS\s*\)[\s\S]*return\s+table_err/s;
 
-$lock =~ /static bool lock_preserve_append_record_image[\s\S]*?^}/m
+$lock_preserve =~ /static bool lock_preserve_append_record_image[\s\S]*?^}/m
   or die "could not isolate lock_preserve_append_record_image\n";
 my $preserve_record_image = $&;
 die "record-lock export must explicitly fail closed on unsupported field-length sentinels\n"
@@ -159,15 +173,15 @@ die "record-lock export must explicitly fail closed on unsupported field-length 
          $preserve_record_image =~ /UNIV_MULTI_VALUE_ARRAY_MARKER/s &&
          $preserve_record_image =~ /UNIV_EXTERN_STORAGE_FIELD/s;
 die "record-lock export must explicitly fail closed on instant-drop column sentinels when this source tree defines them\n"
-  if $lock =~ /UNIV_SQL_INSTANT_DROP_COL/s &&
+  if $lock_preserve =~ /UNIV_SQL_INSTANT_DROP_COL/s &&
      $preserve_record_image !~ /UNIV_SQL_INSTANT_DROP_COL/s;
 
-$lock =~ /static dberr_t lock_preserve_import_predicate_lock[\s\S]*?^}/m
+$lock_preserve =~ /static dberr_t lock_preserve_import_predicate_lock[\s\S]*?^}/m
   or die "could not isolate lock_preserve_import_predicate_lock\n";
 my $preserve_import_predicate_lock = $&;
 die "preserved predicate-lock import must fail closed when intention-lock resurrect sees an incompatible table lock\n"
   unless $preserve_import_predicate_lock =~
-         /lock_preserve_resurrect_table_lock[\s\S]*if\s*\(\s*table_err\s*!=\s*DB_SUCCESS\s*\)[\s\S]*return\s+table_err/s;
+         /lock_preserve_create_table_lock_for_import[\s\S]*if\s*\(\s*table_err\s*!=\s*DB_SUCCESS\s*\)[\s\S]*return\s+table_err/s;
 
 $mdl_context_backup =~
   /bool MDL_context_backup_manager::create_backup\(const MDL_context \*context[\s\S]*?^}/m
@@ -198,7 +212,7 @@ die "metadata-only binlog export must expose warmcopy failure injection\n"
   unless $binlog_export_metadata_only =~
          /preserve_trx_fail_warmcopy_export_metadata[\s\S]*return\s+true/s;
 
-$binlog =~ /bool mysql_binlog_preserve_warmcopy_build_blob[\s\S]*?^}/m
+$binlog_warmcopy =~ /bool mysql_binlog_preserve_warmcopy_build_blob[\s\S]*?^}/m
   or die "could not isolate mysql_binlog_preserve_warmcopy_build_blob\n";
 my $warmcopy_build_blob = $&;
 die "warmcopy build must fail closed when metadata export fails\n"
@@ -207,15 +221,15 @@ die "warmcopy build must fail closed when metadata export fails\n"
 die "warmcopy full-build path must compute and publish the external blob digest\n"
   unless $warmcopy_build_blob =~ /ostream\.finish\s*\(\s*&digest\s*\)/s &&
          $warmcopy_build_blob =~ /blob->digest\s*=\s*digest/s;
-my $warmcopy_finalize_start = index($binlog, 'bool finalize(THD *thd');
+my $warmcopy_finalize_start = index($binlog_warmcopy, 'bool finalize(THD *thd');
 my $warmcopy_finalize_end =
-  index($binlog, 'Binlog_warmcopy_mirror_status write_at',
+  index($binlog_warmcopy, 'Binlog_warmcopy_mirror_status write_at',
         $warmcopy_finalize_start);
 die "could not isolate warmcopy live-session finalize\n"
   if $warmcopy_finalize_start < 0 || $warmcopy_finalize_end < 0 ||
      $warmcopy_finalize_end <= $warmcopy_finalize_start;
 my $warmcopy_finalize =
-  substr($binlog, $warmcopy_finalize_start,
+  substr($binlog_warmcopy, $warmcopy_finalize_start,
          $warmcopy_finalize_end - $warmcopy_finalize_start);
 die "warmcopy live session must fail closed until every mirrored byte is digested\n"
   unless $warmcopy_finalize =~ /m_digest_until\s*!=\s*current_length/s &&
