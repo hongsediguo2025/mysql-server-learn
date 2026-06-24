@@ -1255,6 +1255,12 @@ bool do_command(THD *thd) {
     In particular, a new instrumented statement is started.
     See init_net_server_extension()
   */
+  /*
+    Preserve batch drain tracks command-read boundaries so it can distinguish a
+    selected in-flight target from a new command that must be blocked after the
+    closing state is published. With preserve_trx_enable=OFF these calls return
+    through the original command path.
+  */
   if (!preserved_trx_begin_command_read(thd)) {
     rc = 1;
   }
@@ -2717,6 +2723,11 @@ int mysql_execute_command(THD *thd, bool first_level) {
               thd->in_active_multi_stmt_transaction());
 
   Preserve_trx_inflight_statement_guard preserve_trx_inflight_guard;
+  /*
+    Prepared-statement execution enters here after packet dispatch, so the
+    inflight guard mirrors the command-read bookkeeping used by the text
+    protocol path before the drain command gate is evaluated.
+  */
   if (thd->get_command() == COM_STMT_EXECUTE)
     preserve_trx_inflight_guard.mark(thd, lex->sql_command);
 

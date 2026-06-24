@@ -168,6 +168,11 @@ Preserve_snapshot_status cleanup_after_write_failure(
     Preserve_snapshot_status original_status,
     bool snapshot_write_started, bool *durable_snapshot_may_exist,
     Preserve_snapshot_delete_status *write_failure_delete_status) {
+  /*
+    Snapshot write failure cleanup must preserve ambiguity. Once the snapshot
+    write has started, a delete failure means a durable snapshot may still be
+    visible after restart and the caller must not assume the token is gone.
+  */
   const Preserve_snapshot_delete_status delete_status =
       carrier->remove_with_status(token);
   if (write_failure_delete_status != nullptr)
@@ -189,6 +194,11 @@ Preserve_snapshot_status cleanup_external_blobs_after_write_failure(
     bool *durable_snapshot_may_exist,
     Preserve_snapshot_delete_status *write_failure_delete_status) {
   if (external_blobs.empty()) return original_status;
+  /*
+    External blobs are written before the snapshot descriptor that names them.
+    If blob cleanup fails, report IO_ERROR and keep the durable-snapshot flag
+    conservative so recovery can audit or clean the leftover token state.
+  */
   const Preserved_trx_carrier_status status =
       carrier->remove_external_blobs(token, external_blobs);
   if (status != Preserved_trx_carrier_status::OK) {
@@ -273,6 +283,11 @@ Preserve_snapshot_status Preserved_trx_store::write(
     return map_carrier_status(Preserved_trx_carrier_status::ALREADY_EXISTS);
   }
 
+  /*
+    Store ordering is: adopt or write external bodies, encode an authenticated
+    snapshot descriptor, then publish the snapshot. Until the snapshot is
+    durable, external blobs are cleanup candidates rather than visible tokens.
+  */
   std::vector<Preserved_trx_external_blob> new_external_blobs;
   std::vector<Preserved_trx_external_blob> written_external_blobs;
   bool adopted_prebuilt_blob = false;
@@ -296,6 +311,10 @@ Preserve_snapshot_status Preserved_trx_store::write(
     add_store_write_elapsed(&Preserved_trx_store_write_stats::adopt_warm_blob_us,
                             store_step_started_us, write_stats);
     if (carrier_status == Preserved_trx_carrier_status::ALREADY_EXISTS) {
+      /*
+        The final token already owns this blob name. Remove only the warmcopy
+        staging artifact; the existing published token must remain untouched.
+      */
       (void)warm_carrier->remove_warm_external_blob(blob.warmcopy_id,
                                                     blob.name);
       return map_carrier_status(carrier_status);
@@ -310,6 +329,11 @@ Preserve_snapshot_status Preserved_trx_store::write(
   }
 
   if (!new_external_blobs.empty()) {
+    /*
+      When any prebuilt blob was adopted, write_external_blobs_new validates the
+      complete descriptor set so the snapshot never references a mixture of
+      adopted and newly written bodies that the carrier cannot list together.
+    */
     const std::vector<Preserved_trx_external_blob> &blobs_to_write =
         adopted_prebuilt_blob ? bundle.external_blobs : new_external_blobs;
     std::vector<Preserved_trx_external_blob> newly_written_external_blobs;
@@ -377,6 +401,11 @@ Preserve_snapshot_status Preserved_trx_store::write(
                           store_step_started_us, write_stats);
   if (carrier_status == Preserved_trx_carrier_status::
                             IO_ERROR_DURABLE_SNAPSHOT_MAY_EXIST) {
+    /*
+      The carrier crossed the publish boundary but cannot prove whether the
+      snapshot is durable. Preserve the ambiguity for recovery instead of
+      deleting external artifacts that the snapshot may now reference.
+    */
     if (durable_snapshot_may_exist != nullptr)
       *durable_snapshot_may_exist = true;
     if (write_failure_delete_status != nullptr) {
@@ -442,6 +471,11 @@ Preserve_snapshot_status Preserved_trx_store::read(
   const bool validate_external_blob_metadata =
       payload_read_mode == Preserved_trx_carrier::Payload_read_mode::METADATA_ONLY ||
       read_semantic_external_blobs;
+  /*
+    Read modes separate identity validation from payload hydration. Metadata
+    scans only compare descriptors; semantic reads hydrate blobs needed by
+    resume validation; full reads hydrate every external body.
+  */
   if (read_external_blobs) {
     if (!external_blobs_match_descriptors(encoded.external_blobs,
                                           decoded.blob_descriptors)) {
@@ -462,6 +496,11 @@ Preserve_snapshot_status Preserved_trx_store::read(
   if (read_external_blobs &&
       out.metadata.binlog_state ==
           Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE) {
+    /*
+      The bundle metadata is the semantic view used by resume. External blob
+      payloads are copied back into metadata only after descriptor validation
+      proves the carrier body matches the authenticated snapshot descriptor.
+    */
     const auto blob = std::find_if(
         out.external_blobs.begin(), out.external_blobs.end(),
         [](const Preserved_trx_external_blob &candidate) {

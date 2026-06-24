@@ -51,6 +51,11 @@ static inline bool trx_preserve_temp_space_image_dirty_page_hook_enabled() {
   return preserve_trx_is_enabled() && preserve_trx_temp_table_enable;
 }
 
+/*
+  Dictionary bindings are the InnoDB-side counterpart of the serialized SQL DD
+  table. They describe the physical image that will be adopted during resume,
+  including column/index layout and root pages inside the sidecar.
+*/
 struct trx_preserve_temp_dict_column_binding {
   std::string name;
   uint32_t mtype{0};
@@ -103,6 +108,7 @@ struct trx_preserve_temp_bound_dict_column {
 };
 
 struct trx_preserve_temp_dirty_page_image {
+  /* Last captured version of a changed page, ordered by capture_sequence. */
   uint32_t page_no{0};
   uint64_t capture_sequence{0};
   std::vector<unsigned char> bytes;
@@ -120,6 +126,11 @@ enum class trx_preserve_temp_no_redo_undo_page_kind : uint8_t {
   UNDO_LOG = 4
 };
 
+/*
+  No-redo undo sidecars store only the pages needed to reconnect the preserved
+  transaction's temporary undo graph. Unknown or incomplete pages make the image
+  unsupported rather than allowing resume to rebuild partial undo state.
+*/
 struct trx_preserve_temp_no_redo_undo_page_image {
   trx_preserve_temp_no_redo_undo_page_kind kind{
       trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG};
@@ -139,6 +150,13 @@ struct trx_preserve_temp_no_redo_undo_log_anchor {
 };
 
 struct trx_preserve_temp_space_image_descriptor {
+  /*
+    Descriptor lifecycle:
+      - baseline copy and dirty-page stream are phase-1 capture state;
+      - sealed/image_digest describe the durable image sidecar;
+      - fil_space_adopted and bound_dict_tables are resume-time attachments.
+    A caller must not treat an unsealed descriptor as recoverable.
+  */
   uint32_t source_space_id{0};
   uint32_t page_size{0};
   uint32_t space_flags{0};
@@ -192,6 +210,10 @@ struct trx_preserve_temp_table_exported_index_metadata {
 };
 
 struct trx_preserve_temp_table_exported_metadata {
+  /*
+    SQL exports table and DD metadata, while InnoDB fills the physical image
+    identity. Both halves must agree before a temp-table manifest is written.
+  */
   uint32_t source_space_id{0};
   uint32_t page_size{0};
   uint32_t space_flags{0};
@@ -253,6 +275,11 @@ dberr_t trx_preserve_temp_space_image_begin_initial_copy(
     trx_preserve_temp_space_image_descriptor *descriptor,
     Temp_table_warmcopy_participant *participant);
 
+/*
+  Dirty-page capture API. arm/register publishes the descriptor to page-write
+  hooks; finish/mark_streamed_sidecar_sealed converts the captured stream into a
+  durable sidecar descriptor. Reset or unregister before discarding the owner.
+*/
 dberr_t trx_preserve_temp_space_image_apply_dirty_page_stream(
     trx_preserve_temp_space_image_descriptor *descriptor);
 
@@ -420,6 +447,12 @@ dberr_t trx_preserve_temp_space_image_bind_dict_table(
     trx_preserve_temp_space_image_descriptor *descriptor,
     const trx_preserve_temp_dict_table_binding &binding);
 
+/*
+  Resume attachment API. adopt_preserved_fil_space attaches the physical image;
+  bind/register exposes generated dictionary tables to the THD; drop/release
+  removes or forgets the attachment depending on whether the token remains
+  retryable.
+*/
 dberr_t trx_preserve_temp_space_image_load_no_redo_undo_sidecar(
     trx_preserve_temp_space_image_descriptor *descriptor,
     const unsigned char *payload, size_t payload_length);

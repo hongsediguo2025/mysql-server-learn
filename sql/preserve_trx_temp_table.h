@@ -56,6 +56,11 @@ enum class Temp_table_participant_state {
 };
 
 struct Temp_table_journal_record {
+  /*
+    Logical tail record for temp-table metadata and row-level changes that
+    occur after baseline discovery. Physical page images are carried by the
+    InnoDB sidecar path; this journal preserves SQL-visible ordering.
+  */
   uint64_t seq{0};
   uint32_t table_ordinal{0};
   uint32_t generation{0};
@@ -132,6 +137,10 @@ class Temp_table_warmcopy_participant {
 
  private:
   struct Table_state {
+    /*
+      generation changes on DROP/TRUNCATE so a later row event for a reused
+      logical name cannot be applied to the previous temp-table incarnation.
+    */
     uint32_t table_ordinal{0};
     uint32_t generation{1};
     uint64_t next_row_sequence{1};
@@ -247,6 +256,11 @@ enum class Preserve_trx_temp_table_materialize_source {
 };
 
 struct Preserve_trx_temp_table_materialize_plan {
+  /*
+    Resume chooses one materialization plan per snapshot. PHYSICAL_SIDECARS
+    means the SQL row journal is not replayed; the sidecar image and dict
+    binding are the source of truth.
+  */
   Preserve_trx_temp_table_materialize_source source{
       Preserve_trx_temp_table_materialize_source::NONE};
   bool requires_sealed_image_sidecars{false};

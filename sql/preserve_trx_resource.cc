@@ -55,6 +55,12 @@ class Preserve_resource_manager {
                uint64_t bytes) {
     std::lock_guard<std::mutex> guard(m_mutex);
     if (token.empty()) return false;
+    /*
+      Resource accounting is scoped by preserved token and memory kind. It
+      protects preserve/resume staging buffers from exhausting the process, but
+      it is not used by ordinary transaction execution when no preserve token is
+      being built or resumed.
+    */
     const uint64_t global_budget = preserve_trx_memory_budget_bytes;
     const uint64_t per_token_budget = preserve_trx_memory_per_token_bytes;
     if (bytes > global_budget || bytes > per_token_budget) return false;
@@ -74,6 +80,11 @@ class Preserve_resource_manager {
                uint64_t bytes) {
     std::lock_guard<std::mutex> guard(m_mutex);
     if (token.empty()) return;
+    /*
+      Release is tolerant of oversized cleanup requests because failure paths
+      may have already released part of the staging buffer. Counters are clipped
+      at zero rather than turning cleanup into a second preserve failure.
+    */
     if (bytes > m_current_bytes) {
       m_current_bytes = 0;
     } else {
@@ -164,6 +175,11 @@ int show_preserve_trx_ulonglong_status(ulonglong value, SHOW_VAR *var,
 
 bool preserve_trx_sysvar_check_enable(sys_var *, THD *, set_var *var) {
   if (var->save_result.ulonglong_value == 0) {
+    /*
+      The feature can be disabled only when no preserved token, drain or active
+      resume path depends on its in-memory state. Otherwise disabling the gate
+      would leave existing tokens without their cleanup/recovery machinery.
+    */
     if (preserved_trx_can_disable_feature()) return false;
     my_error(ER_WRONG_ARGUMENTS, MYF(0),
              "preserve_trx_enable=OFF while preserve/drain is active");
@@ -176,6 +192,11 @@ bool preserve_trx_sysvar_check_enable(sys_var *, THD *, set_var *var) {
 
 bool preserve_trx_sysvar_update_enable(sys_var *, THD *, enum_var_type) {
   if (!preserve_trx_enable) {
+    /*
+      The update hook repeats the disable check under the runtime transition
+      helper. If the state changed after validation, restore the sysvar to ON
+      and report the same user-visible rejection.
+    */
     if (!preserved_trx_try_disable_feature_for_update()) {
       preserve_trx_set_enable_value(true);
       my_error(ER_WRONG_ARGUMENTS, MYF(0),

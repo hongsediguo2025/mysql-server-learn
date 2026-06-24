@@ -7841,6 +7841,11 @@ int handler::ha_write_row(uchar *buf) {
   if (unlikely((error = binlog_log_row(table, nullptr, buf, log_func))))
     return error; /* purecov: inspected */
 
+  /*
+    Temporary-table preserve hooks are gated by preserve_trx_enable and only
+    record journal history after the native row operation and binlog hook have
+    succeeded. They must not change the row operation result.
+  */
   if (preserve_trx_temp_table_row_hooks_enabled() &&
       preserve_trx_temp_table_row_capture_candidate(ha_thd(), table))
     (void)preserve_trx_temp_table_note_row_write(
@@ -7875,6 +7880,11 @@ int handler::ha_update_row(const uchar *old_data, uchar *new_data) {
   if (unlikely(error)) return error;
   if (unlikely((error = binlog_log_row(table, old_data, new_data, log_func))))
     return error;
+  /*
+    Mark the transaction before building the optional row image. Allocation or
+    payload failures then degrade preserve instead of making an incomplete
+    temp-table history look valid.
+  */
   if (preserve_trx_temp_table_row_hooks_enabled() &&
       preserve_trx_temp_table_row_capture_candidate(ha_thd(), table)) {
     preserve_trx_temp_table_note_untracked_change(ha_thd());

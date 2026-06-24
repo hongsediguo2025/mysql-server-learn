@@ -666,6 +666,10 @@ byte lock_rec_reset_nth_bit(lock_t *lock, ulint i) {
     ut_ad(lock->trx->lock.n_rec_locks.load() > 0);
     lock->trx->lock.n_rec_locks.fetch_sub(1, std::memory_order_relaxed);
     if (lock_warmcopy_hooks_enabled()) {
+      /*
+        Preserve hook only mirrors the bitmap mutation; lock ownership above
+        remains the native InnoDB state.
+      */
       (void)lock_warmcopy_record_bitmap_reset_for_lock(lock,
                                                        static_cast<uint32_t>(i));
     }
@@ -6331,6 +6335,10 @@ void lock_trx_release_locks(trx_t *trx) /*!< in/out: transaction */
   trx_mutex_enter(trx);
   trx->lock.table_locks.clear();
   trx->lock.n_rec_locks.store(0);
+  /*
+    Conversion freeze is preserve-only bookkeeping and must not survive
+    transaction lock-state reinitialization.
+  */
   trx->lock.lock_warmcopy_conversion_frozen = false;
   trx->lock.lock_warmcopy_conversion_freeze_wait_epoch = 0;
   trx->lock.lock_warmcopy_conversion_attempt_after_freeze = false;

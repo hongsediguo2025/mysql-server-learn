@@ -143,6 +143,11 @@ struct Preserved_trx_column_metadata {
 enum class Preserve_trx_user_vars_mode { DEFAULT, INCLUDE, EXCLUDE };
 
 enum class Preserve_trx_manager_state {
+  /*
+    Public manager state is intentionally coarse. Detailed participant progress
+    is reported through drain observations so command admission can depend on a
+    small stable state machine.
+  */
   IDLE,
   DISABLING,
   SOFT_DRAINING,
@@ -189,6 +194,11 @@ enum class Preserve_trx_preserve_stage {
 };
 
 struct Preserve_trx_preserve_result {
+  /*
+    Per-target timing fields are measured inside the blocked phase. They are
+    kept in the result object until the batch drain aggregator records both
+    functional outcome and SLO diagnostics for the same target.
+  */
   std::string token;
   const char *failure_reason{nullptr};
   Preserve_trx_preserve_stage stage{

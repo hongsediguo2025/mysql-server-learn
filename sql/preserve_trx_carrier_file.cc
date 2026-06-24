@@ -645,6 +645,12 @@ Atomic_write_status atomic_write_file(
     const Preserve_snapshot_write_options &options,
     bool fail_if_exists = false, bool remove_stale_tmp_before_create = false,
     bool *final_file_installed = nullptr) {
+  /*
+    Carrier files are installed as temp-file -> fsync -> link/rename -> dir
+    fsync. The final snapshot file is the durable ownership point; failures
+    before and after the install are reported differently so upper layers know
+    whether a retry must treat the token as possibly existing.
+  */
   const std::string final_path = join_path(dir, filename);
   const std::string tmp_path = final_path + ".tmp";
   if (final_file_installed != nullptr) *final_file_installed = false;
@@ -736,6 +742,11 @@ class Local_file_external_blob_writer final
   }
 
   Preserved_trx_carrier_status open() {
+    /*
+      Warm external blobs are phase-1 staging files. They are registered while
+      open so phase-2 adoption never races a writer that has not closed or
+      sealed its descriptor yet.
+    */
     m_file = my_create(m_path.c_str(), 0600, O_WRONLY | O_TRUNC | O_EXCL,
                        MYF(0));
     if (m_file < 0) {
@@ -802,6 +813,12 @@ class Local_file_external_blob_writer final
   Preserved_trx_carrier_status seal_descriptor(
       const Preserved_trx_external_blob_descriptor &descriptor) override {
     std::lock_guard<std::mutex> lock(m_mutex);
+    /*
+      The descriptor is the compact fact that phase 2 adopts. Size is checked
+      here, while the digest is verified when the snapshot is later read for
+      resume; re-hashing the full body during adopt would move blob-sized work
+      back into the blocked window.
+    */
     if (!m_closed || m_file >= 0 ||
         !prebuilt_external_blob_name_is_supported(descriptor.name)) {
       return Preserved_trx_carrier_status::CORRUPT;
@@ -1185,6 +1202,12 @@ Preserve_snapshot_delete_status delete_snapshot_files_with_status(
   const std::string tainted_path = join_path(dir, token + ".tainted");
   bool error = false;
   bool removed_sidecar = false;
+  /*
+    Deletion is staged around the snapshot file. Sidecar failures before the
+    snapshot file is removed leave the token retryable; failures after snapshot
+    removal are reported separately because the durable token body is already
+    gone and cleanup must continue best-effort.
+  */
   const Preserve_snapshot_delete_status stale_tmp_status =
       remove_stale_tmp_files_for_token(dir, token, false, &removed_sidecar);
   if (stale_tmp_status != Preserve_snapshot_delete_status::OK) error = true;
@@ -1596,6 +1619,12 @@ Local_file_preserved_trx_carrier::write_external_blobs_new(
                                          allowed_existing_blob_names)) {
     return Preserved_trx_carrier_status::ALREADY_EXISTS;
   }
+  /*
+    Inline external blobs are written before the snapshot body. If a write
+    succeeds but a later blob fails, written_external_blobs lets the caller
+    clean up only the files owned by this attempt; prebuilt warm blobs are
+    adopted separately and are not rewritten here.
+  */
   for (const Preserved_trx_external_blob &blob : external_blobs) {
     if (blob.prebuilt) continue;
     if (!external_blob_name_is_filename_safe(blob.name) || blob.payload.empty()) {
@@ -1653,6 +1682,11 @@ Local_file_preserved_trx_carrier::write_snapshot_new(
       atomic_write_file(write_dir, token + ".bin", snapshot_bytes, 0600,
                         m_write_options, true, false,
                         &final_file_installed);
+  /*
+    A post-install I/O error can leave a valid snapshot file on disk. Returning
+    IO_ERROR_DURABLE_SNAPSHOT_MAY_EXIST forces callers to reconcile the token
+    state instead of generating a second token with ambiguous ownership.
+  */
   if (status == Atomic_write_status::IO_ERROR && final_file_installed) {
     return Preserved_trx_carrier_status::
         IO_ERROR_DURABLE_SNAPSHOT_MAY_EXIST;
@@ -1728,6 +1762,11 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::read_existing(
   const bool semantic_external_blobs =
       payload_read_mode == Payload_read_mode::WITH_SEMANTIC_EXTERNAL_BLOBS;
 
+  /*
+    Snapshot-only reads are used for lightweight token discovery. Metadata-only
+    reads keep external blob descriptors without materializing large payloads;
+    full reads are reserved for resume/import paths that need the bytes.
+  */
   const std::string binlog_cache_path =
       join_path(m_dir, token + ".binlog_cache");
   if (file_exists(binlog_cache_path)) {
@@ -1834,6 +1873,11 @@ Local_file_preserved_trx_carrier::remove_stale_tmp_files(
 
 Preserved_trx_carrier_status Local_file_preserved_trx_carrier::mark_tainted(
     const std::string &token) {
+  /*
+    Taint is a durable warning that a previous operation crossed a point where
+    retrying blindly could resurrect a partially consumed token. It is stored as
+    a separate sidecar so the snapshot body remains immutable.
+  */
   return write_tainted_marker(m_dir, token)
              ? Preserved_trx_carrier_status::IO_ERROR
              : Preserved_trx_carrier_status::OK;
@@ -1861,6 +1905,12 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::list_tokens(
   listing->tainted_tokens.clear();
   listing->warm_external_blob_artifacts.clear();
 
+  /*
+    Listing intentionally separates durable snapshot tokens from external
+    blobs, temp sidecars, taint markers, and warm artifacts. Recovery and
+    orphan cleanup use these sets differently; merging them would hide whether
+    a file is committed or still belongs to phase-1 staging.
+  */
   auto scan_listing_dir = [&](const std::string &scan_dir,
                               bool include_warm_artifacts) {
     MY_DIR *dir_info = my_dir(scan_dir.c_str(), MYF(MY_DONT_SORT | MY_WANT_STAT));
@@ -2035,6 +2085,11 @@ Local_file_preserved_trx_carrier::create_warm_external_blob_writer(
   }
   if (ensure_directory(m_dir)) return Preserved_trx_carrier_status::IO_ERROR;
 
+  /*
+    warmcopy_id and epoch name a phase-1 artifact before a user-visible token
+    exists. The artifact is adopted into the token namespace only after the
+    snapshot path has decided to consume it.
+  */
   auto local_writer = std::make_unique<Local_file_external_blob_writer>(
       m_dir, join_path(m_dir, warm_external_blob_filename(warmcopy_id,
                                                           blob_name, epoch)));
@@ -2061,6 +2116,12 @@ Local_file_preserved_trx_carrier::adopt_warm_external_blob(
       ensure_generic_external_blob_shard_dir(m_dir, token)) {
     return Preserved_trx_carrier_status::IO_ERROR;
   }
+  /*
+    Adoption is a bounded phase-2 operation: verify the sealed descriptor and
+    file shape, then install the already-fsynced warm body under the final
+    token name. The final blob path is protected with fail-if-exists so an old
+    token cannot be overwritten by a new drain attempt.
+  */
   const std::string final_blob_path =
       external_blob_path_for_new_write(m_dir, token, blob_name,
                                        m_write_options);

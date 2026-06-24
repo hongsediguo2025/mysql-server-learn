@@ -38,6 +38,11 @@ class THD;
 class MDL_context;
 
 struct Preserve_trx_lock_warmcopy_options {
+  /*
+    These options are copied at drain start. Per-target routing later uses this
+    immutable snapshot so sysvar changes during a drain cannot make one target
+    strict and another target fallback-capable.
+  */
   bool enabled{true};
   bool fallback_to_live_export{true};
   bool validate_canonical_equivalence{false};
@@ -92,6 +97,11 @@ enum class Preserve_trx_lock_warmcopy_target_state {
 };
 
 struct Preserve_trx_lock_warmcopy_artifact {
+  /*
+    A valid artifact represents one consistent lock-family snapshot for a
+    target. If any required family becomes invalid, callers must discard the
+    whole artifact and route the target through live export or reject it.
+  */
   std::string record_locks_payload;
   std::string predicate_locks_payload;
   std::string table_locks_payload;
@@ -131,6 +141,11 @@ struct Preserve_trx_lock_warmcopy_canonical_compare_result {
 };
 
 struct Preserve_trx_lock_warmcopy_target_observation {
+  /*
+    Observations describe one target inside the current drain epoch. bytes_used
+    covers warmcopy-owned artifact bytes, not the complete server heap usage of
+    the transaction.
+  */
   uint64_t thread_id{0};
   Preserve_trx_lock_warmcopy_target_state state{
       Preserve_trx_lock_warmcopy_target_state::NEW};
@@ -241,6 +256,11 @@ class Preserve_trx_lock_warmcopy_drain_participant final
 
  private:
   struct Target_session {
+    /*
+      Target_session is the participant's phase-1/phase-2 handoff object. The
+      phase1_* fields are candidates; only artifact_for_thread() exposes the
+      sealed route chosen after final fence checks.
+    */
     Preserve_trx_lock_warmcopy_target_observation observation;
     bool phase1_record_fence_valid{false};
     lock_warmcopy_record_store_fence_t phase1_record_fence;

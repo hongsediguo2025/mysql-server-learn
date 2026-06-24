@@ -344,6 +344,11 @@ bool canonical_table_payload(const std::string &payload,
   canonical->clear();
   if (payload.empty()) return true;
 
+  /*
+    Live export and warmcopy can enumerate table locks in different container
+    orders. Canonicalization validates entry shape first, then sorts by stable
+    table identity and mode before comparing semantics.
+  */
   size_t offset = 0;
   uint32_t count = 0;
   if (read_le32(payload, &offset, &count) || count == 0 ||
@@ -438,6 +443,11 @@ bool canonical_mdl_payload(const std::string &payload, std::string *canonical) {
   canonical->clear();
   if (payload.size() < 4) return false;
 
+  /*
+    MDL payload order is part of the transaction-duration list contract. The
+    ordinal is validated while parsing, then re-encoded so comparisons reject
+    missing, duplicated or reordered transaction-duration tickets.
+  */
   size_t offset = 0;
   uint32_t count = 0;
   if (read_le32(payload, &offset, &count)) return false;
@@ -459,12 +469,22 @@ bool canonical_mdl_payload(const std::string &payload, std::string *canonical) {
 
 bool artifact_contains_unsupported_family(
     const Preserve_trx_lock_warmcopy_artifact &artifact) {
+  /*
+    Predicate/spatial locks are not optimized by lock warmcopy in this version.
+    A target that owns them must use the existing live export path when
+    fallback is allowed, or be rejected when strict warmcopy is requested.
+  */
   return !artifact.predicate_locks_payload.empty();
 }
 
 Preserve_trx_lock_warmcopy_route route_invalid_artifact(
     Preserve_trx_lock_warmcopy_reason reason,
     const Preserve_trx_lock_warmcopy_options &options) {
+  /*
+    Eligibility rejects describe transaction shapes this participant must not
+    preserve. Seal failures describe stale or over-budget artifacts and may
+    fall back to live export if the configured policy allows it.
+  */
   if (reason == Preserve_trx_lock_warmcopy_reason::ELIGIBILITY_REJECT) {
     return {Preserve_trx_lock_warmcopy_route_action::REJECT, reason};
   }
@@ -706,6 +726,11 @@ bool cleanup_spill_batch_dir(const std::string &batch_dir) {
 bool ensure_lock_warmcopy_spill_dir(uint64_t epoch, uint64_t thread_id,
                                     std::string *dir) {
   if (dir == nullptr) return false;
+  /*
+    Spill files are drain-epoch scratch space used to reduce resident memory
+    while the server is still running. They are not a cross-restart source of
+    truth; durable snapshots reference only blobs adopted through the carrier.
+  */
   const std::string base = lock_warmcopy_spill_base_dir();
   const std::string root = lock_warmcopy_spill_root_dir();
   const std::string batch = lock_warmcopy_spill_batch_dir(epoch);
@@ -934,6 +959,12 @@ bool materialize_spilled_artifact_payloads(
     return artifact != nullptr;
   }
 
+  /*
+    A spilled artifact is hydrated only when a phase-2 consumer still needs the
+    resident payload. Any manifest mismatch, checksum failure or wrong
+    epoch/thread identity invalidates the artifact and routes the target through
+    fallback or rejection.
+  */
   std::string serialized;
   const std::string manifest_path =
       join_path(parent_path(artifact->spill_path), "manifest");
@@ -1736,6 +1767,11 @@ Preserve_trx_lock_warmcopy_drain_participant::
 bool Preserve_trx_lock_warmcopy_drain_participant::open_phase1() {
   m_record_store_cleanup_deferred_for_shutdown = false;
   if (!preserve_trx_lock_warmcopy_cleanup_orphan_spill_files()) return false;
+  /*
+    The epoch is the admission boundary for phase-1 lock observations. Hooks
+    and prebuilt artifacts from older epochs are ignored so consecutive drains
+    cannot contaminate each other's target state.
+  */
   m_epoch = lock_warmcopy_sql_epoch.fetch_add(1, std::memory_order_relaxed) + 1;
   lock_warmcopy_open_epoch(m_epoch);
   m_observation.state = Preserve_trx_drain_participant_state::OPEN;
@@ -1764,6 +1800,11 @@ bool Preserve_trx_lock_warmcopy_drain_participant::open_phase1() {
 }
 
 bool Preserve_trx_lock_warmcopy_drain_participant::close_phase1() {
+  /*
+    Closing the epoch stops new hook admission before phase-2 seal starts. The
+    per-target fence sampled here is the contract later used to decide whether a
+    prebuilt or mirrored record-lock artifact is still usable.
+  */
   lock_warmcopy_close_epoch();
   for (const uint64_t thread_id : m_target_thread_ids) {
     auto target_it = m_targets.find(thread_id);
@@ -1800,6 +1841,11 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
   m_artifacts.clear();
   m_observation.owns_artifact = false;
   m_observation.bytes_used = 0;
+  /*
+    The SLO flag reports whether phase 2 stayed on the fast path. It does not
+    decide correctness: stale or over-budget artifacts still use the configured
+    fallback/reject route, and a SLO miss must not turn into a silent success.
+  */
   refresh_phase1_record_prebuilt_observation();
   m_observation.phase2_lock_seal_us = 0;
   m_observation.phase2_full_lock_scan_count = 0;
@@ -1893,6 +1939,11 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
     }
 
     job.target_ready = true;
+    /*
+      A phase-1 prebuilt record blob can be adopted only if the final fence
+      still matches the fence captured with that blob. Otherwise phase 2 seals
+      the current record store and records that the fast SLO was not guaranteed.
+    */
     job.use_prebuilt_record_blob =
         target->has_phase1_record_prebuilt_blob &&
         !target->phase1_record_prebuilt_blob.warmcopy_id.empty() &&
@@ -2101,6 +2152,11 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
         resident_payload_bytes > m_options.max_memory_bytes ||
         total_memory_bytes > m_options.max_memory_bytes - resident_payload_bytes;
     if (exceeds_memory_budget) {
+      /*
+        The memory budget applies to resident phase-2 artifact payloads. Spill
+        keeps the target eligible, but a spill failure degrades only that target
+        through the normal all-or-live route.
+      */
       bool spill_failed = false;
       DBUG_EXECUTE_IF("preserve_trx_lock_warmcopy_force_spill_failure",
                       { spill_failed = true; });
@@ -2134,6 +2190,11 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
     const bool mdl_family_uses_live_export =
         artifact.mdl_descriptor_count != 0 &&
         !target->mdl_phase1_fingerprint_valid;
+    /*
+      Non-record families can be valid through live export while still missing
+      the 1s fast-path guarantee. Track that separately from correctness so the
+      drain can succeed but report SLO_NOT_GUARANTEED.
+    */
     if (table_family_uses_live_export) {
       ++phase2_table_live_export_target_count;
     }
@@ -2192,6 +2253,11 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
 
 void Preserve_trx_lock_warmcopy_drain_participant::
     clear_record_stores_for_targets() {
+  /*
+    Record stores and phase-1 blobs are process-local working state. Cleanup is
+    required on abort/failure and after a failed shutdown; successful shutdown
+    can defer it because the process exits immediately.
+  */
   for (const uint64_t thread_id : m_target_thread_ids) {
     lock_warmcopy_record_store_clear_for_target(thread_id);
   }
@@ -2465,6 +2531,11 @@ Preserve_trx_lock_warmcopy_drain_participant::artifact_for_thread(
       !it->second.spill_materialized &&
       !materialize_spilled_artifact_payloads(&it->second, m_epoch,
                                              thread_id)) {
+    /*
+      A failed spill hydration is equivalent to a stale artifact. Clear every
+      family payload before marking it invalid so callers cannot accidentally
+      mix a partially recovered warmcopy artifact with live-exported state.
+    */
     it->second.record_locks_payload.clear();
     it->second.predicate_locks_payload.clear();
     it->second.table_locks_payload.clear();
@@ -2499,6 +2570,11 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
     return true;
   }
 
+  /*
+    Phase-1 scan seeds the record store while the target is still attached.
+    This is an optimization candidate only: phase-2 fences decide whether the
+    seeded payload can be adopted, resealed, or must fall back to live export.
+  */
   std::string record_locks_payload;
   if (trx_preserve_export_record_locks(target, &record_locks_payload,
                                        m_options.max_lock_count) !=
@@ -2596,6 +2672,11 @@ bool Preserve_trx_lock_warmcopy_drain_participant::prepare_quiesced_targets(
     const std::vector<uint64_t> &thread_ids) {
   const std::set<uint64_t> final_thread_ids(thread_ids.begin(),
                                             thread_ids.end());
+  /*
+    Phase 1 can see targets that do not survive the final quiesce pass. Discard
+    their store entries and prebuilt blobs before rebuilding the target map, so
+    no stale artifact can be selected by thread id reuse in a later drain.
+  */
   for (const uint64_t old_thread_id : m_target_thread_ids) {
     if (final_thread_ids.count(old_thread_id) == 0) {
       auto old_it = m_targets.find(old_thread_id);

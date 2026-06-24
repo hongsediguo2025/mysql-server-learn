@@ -53,6 +53,11 @@ enum class Preserve_trx_drain_participant_state {
   FINALIZED,
 };
 
+/*
+  Participant observations are the stable reporting surface for one drain
+  attempt. Values are cumulative within that attempt; callers must not infer
+  process lifetime counters from them.
+*/
 struct Preserve_trx_drain_participant_observation {
   Preserve_trx_drain_participant_state state{
       Preserve_trx_drain_participant_state::NOT_STARTED};
@@ -83,6 +88,11 @@ class Preserve_trx_drain_participant {
  public:
   virtual ~Preserve_trx_drain_participant() = default;
 
+  /*
+    The phase contract is ordered by Preserve_trx_drain_orchestrator. A
+    participant may degrade itself and later request live fallback, but it must
+    not publish a durable artifact before the carrier adopts it.
+  */
   virtual bool open_phase1() = 0;
   virtual bool close_phase1() = 0;
   virtual bool phase1_ready() const = 0;
@@ -114,6 +124,7 @@ class Preserve_trx_drain_orchestrator {
   std::vector<Preserve_trx_drain_participant_observation> observations() const;
 
  private:
+  /* Non-owning participant list; lifetime is bound to the enclosing drain. */
   Preserve_trx_drain_phase_mode m_mode;
   std::vector<Preserve_trx_drain_participant *> m_participants;
 };
@@ -142,6 +153,11 @@ class Preserve_trx_inflight_statement_guard {
   void mark_unknown_query(THD *thd);
 
  private:
+  /*
+    The guard records either a known risky command or an unknown query marker,
+    never both. This keeps command-boundary drain races visible without adding
+    state to ordinary statement execution after the scope exits.
+  */
   THD *m_thd{nullptr};
   bool m_active{false};
   bool m_unknown_query{false};

@@ -343,6 +343,11 @@ std::string modified_tables_tlv_value(
 
 std::vector<Preserve_snapshot_tlv> no_cache_tlvs(
     const Preserve_snapshot_metadata &metadata) {
+  /*
+    A no-cache snapshot still carries transaction semantics. Only the binlog
+    cache payload is absent; read view, locks, savepoints and session state must
+    remain available to resume the transaction faithfully.
+  */
   std::vector<Preserve_snapshot_tlv> tlvs{
       {kTlvInnodbCore, "no-cache"},
       {kTlvModifiedTables, modified_tables_tlv_value(metadata)},
@@ -1736,6 +1741,11 @@ bool apply_bundle_semantics(std::vector<Preserve_snapshot_tlv> *tlvs,
   metadata->record_locks_payload.clear();
   metadata->predicate_locks_payload.clear();
   if (record_locks != nullptr) {
+    /*
+      Old snapshots stored record and predicate lock entries in one TLV. New
+      snapshots keep predicate locks separate so spatial/predicate support can
+      fail closed without changing the record lock import path.
+    */
     if (allow_legacy_no_deadline) {
       std::string split_record_locks;
       std::string split_predicate_locks;
@@ -1965,6 +1975,11 @@ Preserve_snapshot_status externalize_record_locks_payload_if_requested(
     return Preserve_snapshot_status::INVALID_ARGUMENT;
   }
 
+  /*
+    External record-lock blobs keep the snapshot body small. The inline TLV is
+    removed once the blob descriptor is attached, so readers have exactly one
+    source of record-lock payload for this bundle.
+  */
   built->tlvs.erase(std::remove_if(built->tlvs.begin(), built->tlvs.end(),
                                    [](const Preserve_snapshot_tlv &tlv) {
                                      return tlv.tag == kTlvRecordLocks;
@@ -1992,6 +2007,11 @@ Preserve_snapshot_status attach_prebuilt_record_locks_blob_if_requested(
     return Preserve_snapshot_status::INVALID_ARGUMENT;
   }
 
+  /*
+    Prebuilt record-lock blobs are already durable artifacts produced by a
+    warmcopy participant. They are referenced by descriptor only and must never
+    be paired with an inline record-lock TLV in the same snapshot.
+  */
   const PrebuiltRecordLocksBlob &prebuilt =
       *input.prebuilt_record_locks_blob;
   if (prebuilt.name != kPreservedTrxBlobRecordLocks ||
@@ -2172,6 +2192,11 @@ Preserve_snapshot_status encode_preserved_trx_bundle(
         !external_blob_names.insert(blob.name).second) {
       return Preserve_snapshot_status::INVALID_ARGUMENT;
     }
+    /*
+      External blob descriptors are the authoritative references written into
+      the snapshot. Prebuilt blobs only contribute a descriptor; non-prebuilt
+      blobs are serialized by this encoder and described from their payload.
+    */
     if (blob.name == kPreservedTrxBlobBinlogCache) {
       binlog_blob = &blob;
       continue;

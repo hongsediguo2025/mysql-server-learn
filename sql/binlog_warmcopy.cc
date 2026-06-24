@@ -125,6 +125,11 @@ bool Binlog_cache_warmcopy_lease::active() const {
   return m_active.load(std::memory_order_acquire);
 }
 
+/*
+  The lease is the only handle ordinary binlog cache writes see. When no mirror
+  is installed the callbacks below are no-ops, so the non-preserve path keeps
+  the original cache ownership and write ordering.
+*/
 bool Binlog_cache_warmcopy_lease::install_if_absent(
     Binlog_cache_warmcopy_mirror *mirror) {
   std::lock_guard<std::mutex> lock(m_mutex);
@@ -252,6 +257,12 @@ class Mysql_binlog_warmcopy_session final
       return true;
     }
 
+    /*
+      Copy the stable prefix in configured chunks. The truncate generation is
+      sampled when the mirror is installed; a generation change while copying
+      means the prefix no longer describes the same source cache and the mirror
+      must degrade instead of guessing.
+    */
     uint64_t copied = 0;
     Warmcopy_blob_copy_ostream ostream(m_writer.get());
     bool stale_generation = false;
@@ -280,6 +291,11 @@ class Mysql_binlog_warmcopy_session final
     }
     DEBUG_SYNC(current_thd, "preserve_trx_warmcopy_before_prefix_digest_replay");
 
+    /*
+      Replay the copied prefix through the mirror digest. Tail writes admitted
+      after the mirror was installed are then absorbed from the pending range
+      list, preserving byte order without blocking the source cache writer.
+    */
     copied = 0;
     while (copied < m_prefix_end) {
       const uint64_t remaining = m_prefix_end - copied;
@@ -372,6 +388,12 @@ class Mysql_binlog_warmcopy_session final
     }
     const uint64_t tail_bytes =
         current_length >= m_prefix_end ? current_length - m_prefix_end : 0;
+    /*
+      Finalize accepts only a fully mirrored cache at the current source length.
+      Any remaining pending range, incomplete digest/durable watermark, or tail
+      beyond the configured phase-2 budget means this warm blob cannot replace
+      the live binlog cache export.
+    */
     const bool finalize_invariant_failed =
         m_degraded || current_length > m_max_blob_bytes ||
         current_length < m_prefix_end || tail_bytes > tail_budget_bytes ||
@@ -464,6 +486,11 @@ class Mysql_binlog_warmcopy_session final
     const bool pending_range = length != 0 && offset > m_digest_until;
     uint64_t next_pending_range_bytes = m_pending_range_bytes;
     if (pending_range) {
+      /*
+        Source writes may arrive ahead of digest order. Keep bounded pending
+        ranges so the mirror can absorb them when the contiguous digest window
+        reaches their offset; unbounded gaps degrade the participant.
+      */
       if (m_pending_ranges.find(offset) != m_pending_ranges.end()) {
         mark_degraded("duplicate warm-copy pending mirror range");
         return Binlog_warmcopy_mirror_status::ERROR;
@@ -662,6 +689,11 @@ bool mysql_binlog_preserve_warmcopy_build_blob(
   if (!cache_has_blob) return false;
   if (cache_length > max_blob_bytes) return true;
 
+  /*
+    This one-shot path builds a durable binlog-cache blob before snapshot
+    encoding. max_blob_bytes is the external artifact budget for this cache; it
+    is not a bound on total process memory.
+  */
   std::unique_ptr<Preserved_trx_external_blob_writer> writer;
   if (carrier->create_warm_external_blob_writer(
           warmcopy_id, kPreservedTrxBlobBinlogCache, epoch, &writer) !=

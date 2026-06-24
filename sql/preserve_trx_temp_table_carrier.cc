@@ -200,6 +200,12 @@ Preserved_trx_carrier_status install_temp_file(const std::string &tmp_path,
 Preserved_trx_carrier_status atomic_write_file(
     const std::string &dir, const std::string &filename,
     const unsigned char *bytes, size_t length) {
+  /*
+    Temp-table sidecars use the same publication rule as snapshots: create a
+    private tmp file, fsync its contents, install it under the final name, then
+    fsync the directory. Until the install succeeds, the file is only staging
+    and must not be referenced by a manifest.
+  */
   if (bytes == nullptr && length != 0)
     return Preserved_trx_carrier_status::CORRUPT;
   if (ensure_directory(dir)) return Preserved_trx_carrier_status::IO_ERROR;
@@ -941,6 +947,11 @@ Preserved_trx_carrier_status read_and_validate_file(
     const std::string &path, uint64_t expected_size,
     const std::array<unsigned char, 32> &expected_sha256,
     std::string *payload) {
+  /*
+    A manifest descriptor is authoritative only if the sidecar still has the
+    expected length and digest. Validate both before returning bytes to resume
+    so stale files from a failed drain cannot be attached to a new transaction.
+  */
   if (payload == nullptr) return Preserved_trx_carrier_status::CORRUPT;
   if (temp_sidecar_expected_size_exceeds_read_limit(expected_size))
     return Preserved_trx_carrier_status::CORRUPT;
@@ -1003,6 +1014,11 @@ class Local_file_temp_table_image_writer final
   }
 
   Preserved_trx_carrier_status open() {
+    /*
+      The streaming writer builds a warm image before a token is assigned.
+      close() is the only path that publishes the warm file; destruction without
+      close is treated as abort and removes both tmp and warm names.
+    */
     if (ensure_directory(m_dir)) return Preserved_trx_carrier_status::IO_ERROR;
     if (file_exists(m_warm_path))
       return Preserved_trx_carrier_status::ALREADY_EXISTS;
@@ -1079,6 +1095,10 @@ class Local_file_temp_table_image_writer final
 
   Preserved_trx_carrier_status result(
       Preserved_temp_table_image_writer_result *result) override {
+    /*
+      The digest returned here becomes the manifest descriptor. Callers must
+      read it only after close(), when the warm sidecar is durable.
+    */
     if (!m_closed || m_file >= 0) return Preserved_trx_carrier_status::CORRUPT;
     return file_size_and_digest(m_warm_path, result);
   }
@@ -1124,6 +1144,11 @@ Local_file_preserved_temp_table_image_carrier::create_warm_image_writer(
     return Preserved_trx_carrier_status::CORRUPT;
   }
   writer->reset();
+  /*
+    The writer name is scoped by warmcopy_id and source space id, not by the
+    final token. That lets phase 1 stream a large temp image before the drain
+    command chooses the durable token name.
+  */
   auto local_writer = std::make_unique<Local_file_temp_table_image_writer>(
       m_dir, join_path(m_dir, warm_image_filename(warmcopy_id,
                                                  source_space_id)));
@@ -1179,6 +1204,11 @@ Local_file_preserved_temp_table_image_carrier::seal_warm_image(
   if (file_exists(sealed_path))
     return Preserved_trx_carrier_status::ALREADY_EXISTS;
 
+  /*
+    Sealing converts the phase-1 warm image into a token-owned sidecar. The
+    manifest descriptor is checked before install so a caller cannot seal a
+    different warm file under a valid token.
+  */
   MY_STAT stat_area;
   if (!file_exists(warm_path, &stat_area))
     return Preserved_trx_carrier_status::NOT_FOUND;
@@ -1215,6 +1245,11 @@ Local_file_preserved_temp_table_image_carrier::seal_warm_undo(
   if (file_exists(sealed_path))
     return Preserved_trx_carrier_status::ALREADY_EXISTS;
 
+  /*
+    No-redo undo sidecars are optional but all-or-nothing for a temp table that
+    modified data. Seal only a digest-matching warm undo body; resume later
+    rejects manifests whose undo descriptor cannot be read back.
+  */
   const Preserved_trx_carrier_status digest_status =
       validate_file_digest(warm_path, descriptor.size, descriptor.sha256);
   if (digest_status != Preserved_trx_carrier_status::OK) return digest_status;
@@ -1260,6 +1295,10 @@ Local_file_preserved_temp_table_image_carrier::remove_warm_sidecars(
   if (!token_is_filename_safe(warmcopy_id) || source_space_id == 0)
     return Preserved_trx_carrier_status::CORRUPT;
 
+  /*
+    Warm sidecars belong to an unfinished phase-1 attempt. Removing them must
+    include .tmp files because a failed writer may leave only the staging name.
+  */
   bool deleted_any = false;
   bool deleted = false;
   Preserved_trx_carrier_status status = delete_file_and_tmp_if_exists(
@@ -1349,6 +1388,11 @@ Local_file_preserved_temp_table_image_carrier::remove_sealed_sidecars(
   if (!token_is_filename_safe(token) || source_space_id == 0)
     return Preserved_trx_carrier_status::CORRUPT;
 
+  /*
+    Sealed sidecars are token-owned. They are removed with the token snapshot or
+    after rollback of a materialized resume attempt, never as generic phase-1
+    cleanup.
+  */
   bool deleted_any = false;
   bool deleted = false;
   Preserved_trx_carrier_status status = delete_file_and_tmp_if_exists(
@@ -1396,6 +1440,11 @@ Local_file_preserved_temp_table_image_carrier::remove_sealed_undo(
 
 bool preserve_trx_encode_temp_table_manifest(
     const Preserved_temp_table_manifest &manifest, std::string *payload) {
+  /*
+    The manifest is the semantic join between SQL temp-table metadata and the
+    physical sidecars. It stores logical names, serialized DD state, image
+    descriptors, and InnoDB dictionary binding in one versioned payload.
+  */
   if (payload == nullptr || manifest.tables.empty()) return false;
   if (manifest.tables.size() > kMaxTempTableManifestTables)
     return false;
@@ -1432,6 +1481,10 @@ bool preserve_trx_encode_temp_table_manifest(
 
 bool preserve_trx_decode_temp_table_manifest(
     std::string_view payload, Preserved_temp_table_manifest *manifest) {
+  /*
+    Decode defensively: a corrupt manifest must fail before any sidecar is
+    opened or any dictionary table is registered for resume.
+  */
   if (manifest == nullptr) return false;
   size_t offset = 0;
   uint32_t version = 0;

@@ -47,6 +47,11 @@ struct lock_warmcopy_debug_stats_t {
 };
 
 struct lock_warmcopy_record_shard_key_t {
+  /*
+    Physical shard identity for the record-lock mirror. n_bits is retained for
+    bitmap shape validation; durable record identity is the record image entry,
+    not the heap bitmap alone.
+  */
   uint64_t table_id{0};
   uint64_t index_id{0};
   uint32_t space_id{0};
@@ -60,6 +65,11 @@ struct lock_warmcopy_record_image_digest_t {
 };
 
 struct lock_warmcopy_record_image_entry_t {
+  /*
+    A record image entry pins one locked record inside a shard. heap_no locates
+    the bitmap bit for the current page image, while digest and encoded image
+    protect against page compaction or reuse during seal/import.
+  */
   uint32_t heap_no{0};
   uint32_t heap_offset{0};
   lock_warmcopy_record_image_digest_t digest;
@@ -67,6 +77,11 @@ struct lock_warmcopy_record_image_entry_t {
 };
 
 struct lock_warmcopy_record_shard_snapshot_t {
+  /*
+    Shard snapshots are seal inputs. Dirty/invalid/tombstone flags describe the
+    mirror state at the journal cursor; callers must recheck the store fence
+    before adopting a payload built from this snapshot.
+  */
   lock_warmcopy_record_shard_key_t key;
   std::vector<unsigned char> normalized_bitmap;
   std::vector<lock_warmcopy_record_image_entry_t> record_images;
@@ -80,6 +95,12 @@ struct lock_warmcopy_record_shard_snapshot_t {
 };
 
 struct lock_warmcopy_record_store_fence_t {
+  /*
+    Store fences are inexpensive consistency samples for one target. Equality
+    means the shard set, generations, and canonical fingerprint did not change
+    across the checked window; it is not a replacement for the final trx-lock
+    fence held around prepare.
+  */
   uint32_t shard_count{0};
   uint64_t total_mutation_generation{0};
   uint64_t dirty_generation{0};
@@ -96,6 +117,12 @@ enum class lock_warmcopy_record_seal_status_t {
 };
 
 struct lock_warmcopy_record_seal_result_t {
+  /*
+    Seal result is the only record payload that may become a preserve artifact.
+    materialized_payload_bytes records phase-2 string materialization so NFR
+    tests can detect regressions that move large payload work back into the
+    blocked window.
+  */
   lock_warmcopy_record_seal_status_t status{
       lock_warmcopy_record_seal_status_t::NOT_ATTEMPTED};
   bool sealed{false};
@@ -110,6 +137,11 @@ struct lock_warmcopy_record_seal_result_t {
 };
 
 struct lock_warmcopy_trx_lock_fence_t {
+  /*
+    Trx-lock fences are sampled under trx->mutex by the SQL-side wrappers. They
+    catch native lock-list changes and implicit-to-explicit conversion attempts
+    that can occur after the warm mirror was sealed.
+  */
   uint64_t trx_locks_version{0};
   uint64_t n_rec_locks{0};
   uint64_t freeze_generation{0};

@@ -128,6 +128,11 @@ struct lock_warmcopy_record_store_partition_t {
   std::map<uint64_t, uint64_t> expected_delta_sequence_by_target;
   std::map<uint64_t, std::string> target_invalid_reason_by_target;
 };
+/*
+  The record mirror is partitioned by target transaction id. Native lock code
+  calls thin hooks; all heavy ordering, payload and diagnostic state stays in
+  this preserve-only store.
+*/
 constexpr size_t k_lock_warmcopy_record_store_partition_count = 64;
 std::array<lock_warmcopy_record_store_partition_t,
            k_lock_warmcopy_record_store_partition_count>
@@ -140,6 +145,12 @@ enum class record_journal_delta_kind_t {
 };
 
 constexpr lock_warmcopy_hook_coverage_site_t k_lock_warmcopy_hook_sites[] = {
+    /*
+      Hook coverage is an executable contract for source-shape tests. Sites
+      marked JOURNAL_DELTA must describe object-level set/reset/add/remove
+      changes; DIRTY_SHARD sites invalidate fast reuse when the native lock code
+      moves or inherits locks without a direct one-record delta.
+    */
     {"lock_rec_add_to_queue", "storage/innobase/lock/lock0lock.cc",
      lock_warmcopy_hook_family_t::RECORD,
      lock_warmcopy_hook_action_t::JOURNAL_DELTA},
@@ -275,6 +286,11 @@ void update_record_shard_rolling_fingerprint_locked(
     lock_warmcopy_record_shard_state_t *shard, uint32_t op_code,
     uint32_t heap_no, const lock_warmcopy_record_image_digest_t *digest,
     uint32_t heap_offset) {
+  /*
+    The rolling fingerprint is a seal-time consistency fence and diagnostic
+    value. It is updated while the record-store partition lock is held together
+    with the bitmap, image digest and generation fields it summarizes.
+  */
   uint64_t base = mix_u64(shard->key.table_id) ^
                   mix_u64(shard->key.index_id + 0x9e3779b97f4a7c15ULL) ^
                   mix_u64((static_cast<uint64_t>(shard->key.space_id) << 32) |
@@ -551,6 +567,12 @@ bool record_bitmap_set_locked(
     uint64_t target_id, const lock_warmcopy_record_shard_key_t &key,
     uint32_t heap_no, const lock_warmcopy_record_image_digest_t *digest,
     uint32_t heap_offset, const std::string *encoded_record_image) {
+  /*
+    Set/reset operations keep the normalized bitmap, optional record image,
+    journal accounting and generation in one store critical section. Seal can
+    then reject a target on any sequence gap or fence change instead of trying
+    to reconstruct missing lock mutations.
+  */
   const uint64_t journal_cursor =
       next_record_journal_sequence_for_target_locked(target_id);
   lock_warmcopy_record_shard_state_t &shard =
@@ -636,6 +658,11 @@ bool apply_record_journal_delta_locked(
     const lock_warmcopy_record_shard_key_t &key, uint32_t heap_no,
     const lock_warmcopy_record_image_digest_t *digest, uint32_t heap_offset,
     const std::string *encoded_record_image) {
+  /*
+    Journal deltas are applied in strict sequence. A gap means the mirror no
+    longer proves the exact lock set for this target, so the target is marked
+    invalid and must use fallback or reject during drain.
+  */
   uint64_t &expected_sequence =
       expected_record_delta_sequence_for_target_locked(target_id);
   if (journal_sequence < expected_sequence) return false;
@@ -976,6 +1003,11 @@ struct lock_warmcopy_prepare_guard_t {
 };
 
 void lock_warmcopy_open_epoch(uint64_t epoch) {
+  /*
+    Epoch zero means hooks are disabled. A non-zero epoch admits lightweight
+    record-hook bookkeeping; target selection and final seal still decide
+    whether any observed state is usable.
+  */
   lock_warmcopy_epoch.store(epoch == 0 ? 1 : epoch, std::memory_order_release);
 }
 
@@ -1023,6 +1055,11 @@ bool lock_warmcopy_record_bitmap_set_for_trx(
     return false;
   }
 
+  /*
+    Hot hooks do not parse record images or serialize payloads. They identify
+    the target and record bit, then update the mirror under the target
+    partition lock.
+  */
   lock_warmcopy_observed_hook_events.fetch_add(1, std::memory_order_relaxed);
   const uint64_t target_id = record_target_id_for_trx(trx);
   std::lock_guard<std::mutex> guard(
@@ -1093,6 +1130,11 @@ bool lock_warmcopy_record_bitmap_set_with_image_for_lock(
     return false;
   }
 
+  /*
+    Image-bearing updates are used by phase-1 builders and validation paths, not
+    by the minimal hot hook. The digest becomes the durable record identity for
+    the exact heap slot represented in the mirror.
+  */
   lock_warmcopy_record_image_digest_t digest;
   SHA_EVP256(reinterpret_cast<const unsigned char *>(
                  encoded_record_image.data()),
@@ -1342,6 +1384,11 @@ bool lock_warmcopy_record_store_seed_payload_for_target(
   partition.expected_delta_sequence_by_target.erase(target_id);
   partition.target_invalid_reason_by_target.erase(target_id);
   if (had_preexisting_state) {
+    /*
+      A base payload that lands after hook state already exists is still useful,
+      but it is not clean. Mark every shard dirty so seal must prove the final
+      fence or reject the target.
+    */
     mark_record_store_dirty_after_base_seed_locked(
         target_id, &partition.store_by_target[target_id]);
   }
@@ -1371,6 +1418,11 @@ bool lock_warmcopy_record_store_fence_for_target(
 bool seed_record_payload_entry_into_store(
     const std::string &payload, size_t *offset,
     lock_warmcopy_record_shard_map_t *store, uint32_t *lock_count) {
+  /*
+    Seeding parses the same payload shape that resume imports later. Rejecting
+    malformed bitmaps, duplicate shard keys, or missing record images here keeps
+    the mirror store from accepting a payload that cannot be restored.
+  */
   lock_warmcopy_record_shard_key_t key;
   uint64_t page_lsn = 0;
   uint32_t page_n_heap = 0;
@@ -1523,6 +1575,11 @@ bool lock_warmcopy_record_store_seal_for_target(
     uint32_t max_dirty_shards, lock_warmcopy_record_seal_result_t *result) {
   if (result == nullptr) return false;
 
+  /*
+    Seal trusts a phase-1 record mirror only if its fence is unchanged at the
+    quiesced boundary. Resource limits are checked before the payload is
+    accepted so an oversized mirror does not become a partial artifact.
+  */
   *result = lock_warmcopy_record_seal_result_t{};
   std::lock_guard<std::mutex> guard(
       record_store_partition_for_target(target_id).mutex);
@@ -1592,6 +1649,11 @@ bool lock_warmcopy_record_store_seal_metadata_for_target(
     lock_warmcopy_record_seal_result_t *result) {
   if (result == nullptr) return false;
 
+  /*
+    Metadata-only seal is used when phase 1 already wrote a durable record-lock
+    blob. It rechecks the fence and counts without rebuilding the payload, which
+    keeps phase 2 away from O(lock count) materialization.
+  */
   *result = lock_warmcopy_record_seal_result_t{};
   std::lock_guard<std::mutex> guard(
       record_store_partition_for_target(target_id).mutex);
@@ -1654,6 +1716,11 @@ bool lock_warmcopy_trx_lock_fence_sample(
     const trx_lock_t *trx_lock, lock_warmcopy_trx_lock_fence_t *fence) {
   if (trx_lock == nullptr || fence == nullptr) return false;
 
+  /*
+    This fence is sampled by callers that already own the required transaction
+    or quiesce protection. It cross-checks native lock-list changes and
+    implicit-to-explicit conversion attempts observed after a freeze.
+  */
   fence->trx_locks_version = trx_lock->trx_locks_version;
   fence->n_rec_locks = trx_lock->n_rec_locks.load(std::memory_order_relaxed);
   fence->freeze_generation = trx_lock->lock_warmcopy_freeze_generation;
@@ -1690,6 +1757,11 @@ void lock_warmcopy_trx_conversion_freeze(trx_lock_t *trx_lock,
                                          uint64_t wait_epoch) {
   if (trx_lock == nullptr) return;
 
+  /*
+    Freezing closes the implicit-to-explicit conversion window for a target
+    until prepare observes the same fence. Other sessions that collide with the
+    target must wait, retry, or return their native NOWAIT/SKIP LOCKED result.
+  */
   DEBUG_SYNC_C("lock_warmcopy_conversion_freeze_before_broadcast");
   trx_lock->lock_warmcopy_conversion_frozen = true;
   ++trx_lock->lock_warmcopy_freeze_generation;

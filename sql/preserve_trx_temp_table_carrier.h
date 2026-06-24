@@ -36,6 +36,11 @@
 #include "storage/innobase/include/trx0temp_preserve.h"
 
 struct Preserved_temp_table_image_descriptor {
+  /*
+    Descriptor for the sealed physical image of one user temporary table. The
+    blob_name must match the token/source-space naming rule, and size/sha256 are
+    validated before the sidecar is used for resume.
+  */
   struct Index_descriptor {
     uint64_t image_index_id{0};
     uint32_t root_page_no{0};
@@ -60,6 +65,11 @@ struct Preserved_temp_table_image_descriptor {
 };
 
 struct Preserved_temp_table_undo_descriptor {
+  /*
+    Optional no-redo undo sidecar for temp-DML. It is keyed by the same source
+    space id as the image and by the no-redo rollback segment identity captured
+    during preserve.
+  */
   uint32_t source_space_id{0};
   std::string blob_name;
   uint64_t size{0};
@@ -70,6 +80,11 @@ struct Preserved_temp_table_undo_descriptor {
 };
 
 struct Preserved_temp_table_manifest_entry {
+  /*
+    One logical temporary table in the preserved transaction. SQL state,
+    physical image descriptor, and InnoDB dictionary binding are kept together
+    so resume can validate them before opening the uncached TABLE.
+  */
   uint32_t table_ordinal{0};
   std::string schema_name;
   std::string table_name;
@@ -95,6 +110,11 @@ class Preserved_temp_table_image_writer {
  public:
   virtual ~Preserved_temp_table_image_writer() = default;
 
+  /*
+    Writer calls are offset based because phase 1 may stream the baseline image,
+    overlay buffer-pool pages, and then append tail dirty pages without keeping
+    the full image in memory.
+  */
   virtual Preserved_trx_carrier_status write_at(
       uint64_t offset, const unsigned char *data, size_t length) = 0;
 
@@ -114,6 +134,11 @@ class Preserved_temp_table_image_carrier {
  public:
   virtual ~Preserved_temp_table_image_carrier() = default;
 
+  /*
+    Warm sidecars are phase-1 artifacts addressed by warmcopy_id. Sealed
+    sidecars are token-owned and may be referenced from a durable snapshot
+    manifest. Implementations must not mix the two cleanup scopes.
+  */
   virtual Preserved_trx_carrier_status create_warm_image_writer(
       const std::string &warmcopy_id, uint32_t source_space_id,
       std::unique_ptr<Preserved_temp_table_image_writer> *writer) = 0;

@@ -3819,6 +3819,14 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
         return;
       }
 
+      /*
+        Batch drain classifies sessions before it starts waiting. Idle explicit
+        transactions can publish QUIESCED immediately; sessions that are inside
+        a command or have an unclassified classic packet are admitted as pending
+        targets and must publish their final state at the command boundary.
+        Unsupported or unstable sessions fail the whole batch instead of being
+        silently skipped.
+      */
       if (active_explicit_transaction) ++m_transaction_count;
       const bool unstable_unsupported =
           candidate->preserve_trx_batch_state !=
@@ -3894,6 +3902,12 @@ static bool preserve_trx_publish_pending_quiesce_at_idle_boundary(THD *thd) {
       !thd->m_server_idle)
     return false;
 
+  /*
+    A pending target is allowed to finish the command that was already in
+    flight when the drain selected it. Once the command reaches an idle
+    boundary, the target either becomes a quiesced transaction or is removed
+    from the batch if the command ended without an explicit transaction.
+  */
   if (preserve_trx_has_explicit_active_transaction(thd)) {
     thd->preserve_trx_batch_state = Preserve_trx_batch_thd_state::QUIESCED;
   } else {
@@ -5924,6 +5938,13 @@ Preserve_trx_command_block_result preserved_trx_command_block_result(
     return Preserve_trx_command_block_result::ALLOW;
   }
 
+  /*
+    WARMCOPY_DRAINING keeps normal work running while phase-1 mirrors are open.
+    WARMCOPY_CLOSING is the user-visible blocking boundary: new commands that
+    can create transactions or locks are rejected, while already admitted
+    pending targets are allowed above to finish and publish their quiesced
+    state.
+  */
   if (state == Preserve_trx_manager_state::WARMCOPY_CLOSING &&
       preserve_trx_sql_command_may_create_trx_or_lock(thd, sql_command)) {
     return Preserve_trx_command_block_result::BLOCK_DRAINING;
@@ -6658,6 +6679,11 @@ bool preserved_trx_resume_deadline_expired(
 
 static bool restore_record_after_resume_failure(
     Preserved_trx_record &record, const std::string &reason) {
+  /*
+    Resume failure before activation must put the record back with the reason
+    attached. The preserved transaction remains observable and eligible for
+    later cleanup instead of disappearing from SHOW/PFS state.
+  */
   if (!preserved_trx_add_record_with_last_error(record, reason)) {
     preserve_trx_set_record_last_error(&record, reason);
     DEBUG_SYNC(current_thd,
@@ -7313,6 +7339,11 @@ class Preserve_batch_reattach_item final : public Do_THD_Impl {
 
 static bool restore_preserved_batch_items_to_original_thds(
     ulonglong generation, const std::vector<Preserve_trx_batch_item> &items) {
+  /*
+    Roll back a partially successful batch in reverse preserve order. Later
+    targets may depend on earlier batch state being held drained until their
+    own token has been restored or cleaned up.
+  */
   for (auto it = items.rbegin(); it != items.rend(); ++it) {
     Preserve_batch_reattach_item reattach(generation, *it);
     Global_THD_manager::get_instance()->do_for_all_thd_copy(&reattach);
@@ -7338,6 +7369,12 @@ static bool reattach_current_batch_preserve_failure_to_original_thd(
 
   auto preserve_detached_snapshot_after_cleanup_failure =
       [&](const std::string &reason) {
+        /*
+          If cleanup fails after a snapshot may exist, keep an in-memory record
+          pointing at the claimed transaction. That gives recovery and operators
+          a durable token to resolve instead of losing ownership of a prepared
+          trx.
+        */
         if (!snapshot_files_may_exist || metadata == nullptr) return true;
 
         std::vector<Preserved_trx_external_blob_descriptor> descriptors;
@@ -7356,6 +7393,11 @@ static bool reattach_current_batch_preserve_failure_to_original_thd(
       };
 
   auto delete_snapshot_after_activation = [&]() {
+    /*
+      Once the transaction is active again in the original THD, the snapshot is
+      stale. A pre-unlink failure leaves the token tainted; a post-unlink fsync
+      failure is logged but the active transaction remains with the session.
+    */
     if (!snapshot_files_may_exist) return Preserve_snapshot_delete_status::OK;
     const Preserve_snapshot_delete_status delete_status =
         delete_snapshot_files_with_status(preserve_trx_default_dir(), token);
@@ -7479,6 +7521,12 @@ void preserved_trx_finalize_statement_response(THD *thd) {
 
   DEBUG_SYNC(thd, "preserve_trx_finalize_token_delivery");
 
+  /*
+    Single-session PRESERVE returns the token to the client before shutdown.
+    The record becomes resumable only after that OK packet is finalized; if
+    delivery fails, the pending token is rolled back so a hidden preserved
+    transaction is not left behind.
+  */
   std::string token;
   bool ok_delivered = false;
   if (!preserved_trx_begin_pending_token_delivery_finalization(
@@ -7545,6 +7593,11 @@ static bool recover_preserved_snapshot(const std::string &dir,
                                        uint64_t recovery_anchor_monotonic_us) {
   auto store = create_preserved_trx_default_store(dir);
   Preserved_trx_bundle bundle;
+  /*
+    Recovery reads only the semantic external blobs required to reconstruct
+    transaction state. Large non-semantic bodies can remain descriptor-only
+    until resume needs them.
+  */
   Preserve_snapshot_status status =
       store->read(token, true,
                   Preserved_trx_carrier::Payload_read_mode::
@@ -7639,6 +7692,11 @@ static bool recover_preserved_snapshot(const std::string &dir,
 
   trx_t *trx = trx_preserve_claim_prepared(xid);
   if (trx == nullptr && !metadata.temp_table_manifest_payload.empty()) {
+    /*
+      A preserved transaction that touched only user temporary tables may not
+      have a normal prepared InnoDB transaction to claim. Recreate a temp-only
+      claimed transaction when the manifest names the original owner trx id.
+    */
     const uint64_t temp_owner_trx_id =
         preserve_trx_temp_table_owner_trx_id(metadata);
     if (temp_owner_trx_id != 0) {
@@ -7665,6 +7723,11 @@ static bool recover_preserved_snapshot(const std::string &dir,
   }
 
   const auto rollback_semantics_failure = [&](const char *component) {
+    /*
+      Once a prepared transaction is claimed, every semantic import failure must
+      roll it back through the preserve token. Leaving a claimed transaction
+      registered without its locks/read view would be unsafe to resume.
+    */
     std::string reason =
         std::string("failed to restore durable transaction semantics: ") +
         component;
@@ -7732,6 +7795,11 @@ bool preserved_trx_preflight_recoverability() {
   if (!preserve_trx_is_enabled()) return false;
   if (srv_force_recovery > 0) return false;
 
+  /*
+    Startup preflight avoids entering crash recovery with snapshots that this
+    binary cannot parse or whose binlog mode is incompatible. It uses
+    SNAPSHOT_ONLY reads because no transaction is claimed during this scan.
+  */
   const std::string dir = normalize_dir(preserve_trx_default_dir());
   auto store = create_preserved_trx_default_store(dir);
   Preserved_trx_carrier_listing listing;
@@ -7780,6 +7848,11 @@ bool preserved_temp_images_bootstrap_preamble() {
   if (!preserve_trx_is_enabled()) return false;
   if (srv_force_recovery > 0) return false;
 
+  /*
+    Temporary tablespace bootstrap must reserve source space ids before InnoDB
+    starts assigning them to new temp spaces. Corrupt sidecars are tainted here,
+    but rollback/deletion stays with normal preserve recovery.
+  */
   const std::string dir = normalize_dir(preserve_trx_default_dir());
   auto store = create_preserved_trx_default_store(dir);
   Preserved_trx_carrier_listing listing;
@@ -7895,6 +7968,12 @@ bool preserved_trx_recover_all() {
     return false;
   }
 
+  /*
+    Recovery owns every durable token left by the previous server: valid
+    snapshots are imported, tainted snapshots are rolled back, orphan prepared
+    transactions without snapshots are rolled back, and staging artifacts that
+    were never published are removed.
+  */
   const std::string dir = normalize_dir(preserve_trx_default_dir());
   auto store = create_preserved_trx_default_store(dir);
   const uint64_t recovery_anchor_wall_us = my_micro_time();
@@ -8189,6 +8268,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   const Preserve_trx_lock_warmcopy_route lock_warmcopy_route =
       preserve_trx_lock_warmcopy_route_artifact(request.lock_warmcopy_artifact,
                                                 lock_warmcopy_options);
+  /*
+    Lock warmcopy is routed per target before any destructive preserve step.
+    Unsupported transaction shapes reject immediately; stale or over-budget
+    artifacts may fall back to live export only when the policy allows it.
+  */
   if (lock_warmcopy_route.action ==
       Preserve_trx_lock_warmcopy_route_action::REJECT) {
     if (batch_delivery && lock_warmcopy_options.enabled) {
@@ -8228,6 +8312,12 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   bool materialized_any_implicit_lock = false;
   auto materialize_implicit_locks_for_live_export = [&]() -> const char * {
     materialized_any_implicit_lock = false;
+    /*
+      Live export must convert implicit record locks into explicit lock objects
+      before it can serialize them. If conversion fails after materializing
+      some locks, the transaction stays attached and remains valid with
+      equivalent or stronger InnoDB lock coverage.
+    */
     if (trx_preserve_materialize_implicit_locks(
             thd, lock_limits, &materialized_any_implicit_lock) ==
         DB_SUCCESS) {
@@ -8293,6 +8383,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     if (!mdl_compare.equivalent ||
         mdl_descriptors_count !=
             lock_warmcopy_artifact->mdl_descriptor_count) {
+      /*
+        MDL is currently verified against a live descriptor snapshot. A
+        mismatch invalidates the whole lock artifact; keeping record warmcopy
+        while replacing only MDL would mix lock families from different points.
+      */
       preserve_trx_lock_warmcopy_note_canonical_mismatch("mdl");
       if (!lock_warmcopy_options.fallback_to_live_export) {
         preserve_trx_lock_warmcopy_note_route_reject(
@@ -8404,6 +8499,12 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   };
   auto switch_lock_warmcopy_to_live_export_for_preflight =
       [&]() -> const char * {
+    /*
+      Fallback is all-or-live for the target. Rebuild every lock-family payload
+      from the live transaction so the preserved artifact has one consistent
+      source instead of mixing warmcopy record state with live table or MDL
+      state.
+    */
     const char *materialize_failure =
         materialize_implicit_locks_for_live_export();
     if (materialize_failure != nullptr) return materialize_failure;
@@ -8564,6 +8665,12 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   if (preserve_trx_token_to_xid(token, &xid))
     return reject_after_binlog_export("token_to_xid_failed");
 
+  /*
+    From this point on, preserve failure handling depends on whether the
+    transaction has crossed prepare/detach durability boundaries. The cleanup
+    lambdas below keep single-session and batch delivery paths explicit so a
+    failure cannot accidentally leave both an active THD and a preserved token.
+  */
   auto mark_single_detached_cleanup_failure =
       [&](const char *reason,
           const Preserve_snapshot_metadata *observable_metadata = nullptr) {
@@ -8703,6 +8810,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   };
   auto switch_lock_warmcopy_to_live_export_before_prepare =
       [&]() -> const char * {
+    /*
+      Final-fence fallback still happens before ha_prepare_low(). It must
+      release the conversion freeze, materialize implicit locks for live export
+      and rebuild all lock payloads before prepare observes the final state.
+    */
     const char *materialize_failure =
         materialize_implicit_locks_for_live_export();
     if (materialize_failure != nullptr) return materialize_failure;
@@ -8720,6 +8832,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   auto verify_lock_warmcopy_frozen_fence = [&]() -> bool {
     if (!use_lock_warmcopy_artifact) return true;
 
+    /*
+      The frozen fence is a narrow race detector for engine-side
+      implicit-to-explicit conversion after the artifact was sealed. Any change
+      before prepare means the warmcopy payload is no longer authoritative.
+    */
     lock_warmcopy_trx_lock_fence_t current_frozen_fence;
     return lock_warmcopy_frozen_fence_valid &&
            trx_preserve_sample_lock_warmcopy_fence(lock_warmcopy_frozen_trx,
@@ -8735,6 +8852,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   auto handle_lock_warmcopy_final_fence_failure =
       [&](Preserve_trx_lock_warmcopy_reason reason,
           const char *strict_failure_reason) -> bool {
+    /*
+      Final-fence failure is the last point where live fallback is still safe.
+      After ha_prepare_low(), preserve must either continue with the chosen
+      payload or run the prepared cleanup path; it cannot rebuild lock state.
+    */
     preserve_trx_lock_warmcopy_note_final_fence_mismatch();
     const Preserve_trx_lock_warmcopy_route route =
         preserve_trx_lock_warmcopy_route_final_fence(reason,
@@ -8824,6 +8946,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     if (current_savepoint_count != savepoint_count ||
         current_sql_innodb_savepoint_count != sql_innodb_savepoint_count ||
         current_sql_savepoints_payload != sql_savepoints_payload) {
+      /*
+        Savepoint changes can alter rollback-to-savepoint lock ownership. Until
+        savepoint warmcopy has its own generation hook, a changed final payload
+        must fail before prepare instead of preserving stale lock semantics.
+      */
       thaw_lock_warmcopy_conversion();
       set_failure_reason("savepoint_final_fence_changed");
       return restore_unprepared_batch_prepare_failure_or_rollback();
@@ -8895,6 +9022,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   }
   if (result != nullptr) result->detached_from_original_thd = true;
 
+  /*
+    Detach moves the prepared transaction out of the session. Until it is
+    claimed and the snapshot is durable, every later failure must either
+    reattach it to the original THD or roll it back under the preserve token.
+  */
   DBUG_EXECUTE_IF(
       "preserve_trx_assert_read_view_pinned_after_detach",
       if (trx_preserve_trx_has_read_view(trx)) {
@@ -8964,6 +9096,12 @@ bool preserve_trx_kernel_preserve_attached_transaction(
 
   Preserve_snapshot_metadata metadata =
       make_no_cache_metadata(thd, token, binlog_state);
+  /*
+    Metadata is assembled only after the prepared transaction is claimed. Values
+    exported before prepare are copied in deliberately below when their
+    semantics must reflect the pre-prepare user transaction rather than the
+    internal prepared state.
+  */
   metadata.mod_tables_count = trx_preserve_modified_table_count(trx);
   metadata.modified_table_names.reserve(modified_tables.size());
   for (const Preserve_modified_table_name &name : modified_tables) {
@@ -9034,6 +9172,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
         trx_preserve_table_locks_payload_has_autoinc(
             warmcopy_table_locks_payload_for_compare) !=
             lock_warmcopy_artifact->autoinc_lock_owned) {
+      /*
+        Post-prepare table drift cannot be repaired by replacing only the table
+        family with live export. Reject or fall back before prepare when
+        possible; after prepare this path must roll back or reattach as a whole.
+      */
       preserve_trx_lock_warmcopy_note_canonical_mismatch("table_post_prepare");
       preserve_trx_lock_warmcopy_note_route_reject(
           Preserve_trx_lock_warmcopy_reason::TABLE_POST_PREPARE_DRIFT);
@@ -9098,6 +9241,12 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       [&](bool snapshot_files_may_exist,
           Preserve_snapshot_delete_status write_failure_delete_status =
               Preserve_snapshot_delete_status::OK) {
+    /*
+      Snapshot-write failure happens after detach. Batch delivery first tries to
+      reattach the transaction to its original session; if the snapshot may be
+      durable, cleanup must either leave a registered observable record or mark
+      the token tainted for recovery.
+    */
     thaw_lock_warmcopy_conversion();
     const bool effective_snapshot_files_may_exist =
         snapshot_files_may_exist ||
@@ -9197,6 +9346,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
 
   bool prebuilt_binlog_blob_finalized = false;
   auto discard_prebuilt_binlog_blob_if_needed = [&]() {
+    /*
+      A prebuilt binlog blob is still a warm artifact until store->write adopts
+      it under the final token. If snapshot build fails before adoption, remove
+      the warm artifact through its provider.
+    */
     if (use_prebuilt_binlog_cache && prebuilt_binlog_blob_finalized) {
       binlog_blob_provider->discard_for_preserve(thd, token,
                                                  prebuilt_binlog_blob);
@@ -9254,6 +9408,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       use_lock_warmcopy_artifact &&
       bundle_input.prebuilt_record_locks_blob == nullptr &&
       !metadata.record_locks_payload.empty();
+  /*
+    Lock warmcopy snapshots should not carry large record payloads inline when
+    a prebuilt descriptor is unavailable. The bundle builder moves that payload
+    into an external blob and leaves metadata as the semantic view.
+  */
   Preserved_trx_bundle bundle;
   substep_started_us = preserve_trx_monotonic_us();
   const Preserve_snapshot_status bundle_status =
@@ -9320,6 +9479,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
         "preserve_trx_lock_warmcopy_simulate_conversion_after_snapshot_write",
         { inject_lock_warmcopy_conversion_after_freeze(); });
     if (!verify_lock_warmcopy_frozen_fence()) {
+      /*
+        The snapshot is already durable, so this final check cannot fall back to
+        rebuilding lock payloads. The failure path below treats the snapshot as
+        possibly visible and cleans up through the post-detach rules.
+      */
       preserve_trx_lock_warmcopy_note_final_fence_mismatch();
       preserve_trx_lock_warmcopy_note_route_reject(
           Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED);
@@ -9332,6 +9496,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   const Preserved_trx_lifecycle_state registered_state =
       batch_delivery ? Preserved_trx_lifecycle_state::DRAINING
                      : Preserved_trx_lifecycle_state::SNAPSHOTTING;
+  /*
+    Registration is the in-memory handoff from a durable snapshot to runtime
+    ownership. Batch preserve keeps the record in DRAINING until every target
+    succeeds; single preserve waits for token delivery before marking resumable.
+  */
   if (preserved_trx_add_record(metadata, trx, batch_delivery,
                                registered_state,
                                blob_descriptors)) {
@@ -9886,6 +10055,11 @@ bool Preserve_trx_drain_service::execute(
   Preserve_batch_quiesced_target_counter ready_counter(
       thd, generation, quiesced_target_thread_ids);
   Global_THD_manager::get_instance()->do_for_all_thd_copy(&ready_counter);
+  /*
+    Recheck the quiesced set after every pending target reached its boundary.
+    The second pass protects the capacity and account limits from preserving a
+    different set than the one that was counted before the wait.
+  */
   if (static_cast<size_t>(ready_counter.target_count()) !=
           quiesced_target_thread_ids.size() ||
       ready_counter.target_count() > preserve_trx_batch_max_transactions ||
@@ -9898,6 +10072,11 @@ bool Preserve_trx_drain_service::execute(
   }
 
   if (warmcopy_participant != nullptr) {
+    /*
+      Phase-2 participant prepare consumes only the final quiesced target list.
+      Any participant that cannot seal its artifacts must fail before the
+      transaction prepare path observes a mixed preserve artifact.
+    */
     timed_started_us = preserve_trx_monotonic_us();
     if (!warmcopy_participant->prepare_quiesced_targets(
             quiesced_target_thread_ids, warmcopy_close_deadline_us)) {
@@ -9916,6 +10095,11 @@ bool Preserve_trx_drain_service::execute(
       lock_warmcopy_target_thread_ids.push_back(
           static_cast<uint64_t>(target_thread_id));
     }
+    /*
+      Lock warmcopy follows the same fail-closed boundary. A rejected or stale
+      lock artifact is handled before target prepare, either by per-target live
+      fallback or by rejecting the batch according to the configured policy.
+    */
     timed_started_us = preserve_trx_monotonic_us();
     if (!lock_warmcopy_participant->prepare_quiesced_targets(
             lock_warmcopy_target_thread_ids)) {
@@ -10173,6 +10357,11 @@ bool Preserve_trx_drain_service::execute(
   }
   if (failed_execution != nullptr) {
     const Preserve_trx_preserve_result &batch_result = failed_execution->result;
+    /*
+      Batch preserve is all-or-nothing. If any target fails, targets that were
+      already detached and registered by this batch are restored to their
+      original THDs unless the cleanup itself crosses a durable failure point.
+    */
     const std::string message =
         "PRESERVE: batch target preserve failed visited=" +
         std::to_string(failed_execution->visited_target ? 1 : 0) +

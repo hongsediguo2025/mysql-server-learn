@@ -57,6 +57,11 @@ void Warmcopy_descriptor_tracker::note_range_covered(
     uint64_t offset, uint64_t length, uint64_t truncate_generation) {
   if (length == 0 || uint64_add_overflows(offset, length)) return;
 
+  /*
+    Covered ranges are accepted only within one truncate generation. A truncate
+    changes the byte identity of later offsets, so ranges from an older
+    generation are ignored rather than merged into the descriptor window.
+  */
   if (!m_generation_initialized) {
     m_truncate_generation = truncate_generation;
     m_generation_initialized = true;
@@ -92,6 +97,11 @@ void Warmcopy_descriptor_tracker::note_truncate(
   if (m_generation_initialized && truncate_generation < m_truncate_generation) {
     return;
   }
+  /*
+    Truncate rewinds all high-water marks because bytes past the new source
+    length are no longer part of the cache. The descriptor can advance again
+    only after coverage, digest and durable watermarks catch up.
+  */
   m_truncate_generation = truncate_generation;
   m_generation_initialized = true;
 
@@ -116,6 +126,11 @@ void Warmcopy_descriptor_tracker::note_flush_durable(uint64_t durable_until) {
 
 bool Warmcopy_descriptor_tracker::advance_descriptor_hwm(
     uint64_t target_length) {
+  /*
+    The descriptor is publishable only for bytes that are both copied into the
+    warm artifact and durable in the carrier. Digest progress is advanced with
+    the descriptor so phase-2 accounting can report remaining historical work.
+  */
   if (target_length > m_covered_until || target_length > m_durable_until) {
     return false;
   }
@@ -155,6 +170,11 @@ void Warmcopy_descriptor_tracker::recompute_covered_until() {
 }
 
 Binlog_warmcopy_participant_state WarmcopyParticipant::state() const {
+  /*
+    State is derived from metadata while the participant is non-terminal. This
+    keeps observations current even when mirror progress advances without an
+    explicit state transition call.
+  */
   if (terminal()) return m_state;
   if (ready_requirements_met()) return Binlog_warmcopy_participant_state::READY;
   if (m_metadata.mirror_active) {
@@ -218,6 +238,11 @@ void WarmcopyParticipant::mark_finalized() {
 }
 
 bool WarmcopyParticipant::ready_requirements_met() const {
+  /*
+    READY means the warm artifact is a complete byte-for-byte stand-in for the
+    source cache at the sampled source length. Metadata and savepoint/cache
+    flags are part of the contract, not just byte counts.
+  */
   if (terminal()) return false;
   const uint64_t source_length = m_metadata.source_length;
   return m_metadata.destination_length == source_length &&
@@ -258,6 +283,11 @@ bool WarmcopyDrainCoordinator::open_epoch(THD *coordinator_thd) {
 bool WarmcopyDrainCoordinator::publish_open_gate_before_enumeration() {
   std::lock_guard<std::mutex> guard(m_mutex);
   if (m_state != Binlog_warmcopy_coordinator_state::OPEN) return false;
+  /*
+    The open gate is published before target enumeration so sessions that enter
+    warmcopy-capable code during enumeration can be assigned a participant id
+    instead of being discovered only after phase 2 starts.
+  */
   if (!m_admission_open) {
     m_admission_open = true;
     ++m_admission_sequence;
@@ -274,6 +304,11 @@ bool WarmcopyDrainCoordinator::reconcile_open_admission_sequence() {
       !m_admission_open) {
     return false;
   }
+  /*
+    A sequence change during enumeration means admission raced with the scanner.
+    The caller must retry the enumeration pass so every admitted participant is
+    represented before phase 1 can be considered complete.
+  */
   if (m_admission_sequence != m_enumeration_started_sequence) {
     m_enumeration_started_sequence = m_admission_sequence;
     return false;
@@ -319,6 +354,11 @@ bool WarmcopyDrainCoordinator::admit_participant_for_test(
 bool WarmcopyDrainCoordinator::begin_closing(unsigned long timeout_ms) {
   std::lock_guard<std::mutex> guard(m_mutex);
   if (m_state != Binlog_warmcopy_coordinator_state::OPEN) return false;
+  /*
+    Closing is the transition from background copying to the blocking boundary.
+    New participants are no longer admitted, and command gates can start
+    rejecting work that would create a new cache tail after the final seal.
+  */
   m_admission_open = false;
   m_commands_blocked = true;
   m_closing_deadline_us =
@@ -350,6 +390,11 @@ bool WarmcopyDrainCoordinator::has_active_degraded_participant() const {
 void WarmcopyDrainCoordinator::abort_and_cleanup(
     WarmcopyParticipantCleanup *cleanup) {
   std::lock_guard<std::mutex> guard(m_mutex);
+  /*
+    Abort removes only warm artifacts that were never finalized into a snapshot.
+    Published snapshots are owned by the carrier/token lifecycle and are not
+    cleaned through the drain coordinator.
+  */
   for (const WarmcopyParticipant *participant : m_participants) {
     if (cleanup == nullptr || participant == nullptr) continue;
     const Binlog_warmcopy_participant_state state = participant->state();
@@ -435,6 +480,11 @@ bool WarmcopyDrainParticipantAdapter::phase1_ready() const {
 
 bool WarmcopyDrainParticipantAdapter::phase2_preflight(
     Preserve_trx_drain_phase_mode mode) {
+  /*
+    The drain orchestrator treats the binlog participant like any other phase-2
+    dependency: by preflight, admission is closed and every active participant
+    must either be READY or the whole warmcopy route degrades.
+  */
   return mode == Preserve_trx_drain_phase_mode::TWO_PHASE &&
          m_coordinator != nullptr &&
          m_coordinator->state() == Binlog_warmcopy_coordinator_state::CLOSING &&
@@ -516,6 +566,11 @@ bool warmcopy_effective_entry_blob_limit(uint64_t total_reserved_bytes,
                                          uint64_t max_total_bytes,
                                          uint64_t max_entry_blob_bytes,
                                          uint64_t *entry_blob_limit) {
+  /*
+    Entry limit is the remaining global blob budget after accounting for other
+    sessions, capped again by the per-entry maximum. It is a byte-budget for
+    external artifacts, not an estimate of heap memory.
+  */
   if (warmcopy_entry_blob_limit(total_reserved_bytes, entry_reserved_bytes,
                                 max_total_bytes, entry_blob_limit)) {
     return true;

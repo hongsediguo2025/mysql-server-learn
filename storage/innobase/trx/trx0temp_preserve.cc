@@ -74,6 +74,12 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 namespace {
 
+/*
+  Dirty page streams track phase-1 copies of user temporary tables. The maps are
+  keyed by the original temporary tablespace id; the atomic buckets provide a
+  cheap negative test for hot page-write paths before taking the global stream
+  mutex.
+*/
 std::mutex trx_preserve_temp_dirty_page_streams_mutex;
 std::atomic<uint32_t> trx_preserve_temp_active_dirty_page_streams{0};
 std::atomic<uint32_t> trx_preserve_temp_staged_dirty_page_count{0};
@@ -96,6 +102,11 @@ std::unordered_map<uint32_t, uint32_t>
 std::unordered_map<uint32_t, uint32_t>
     trx_preserve_temp_stage_admission_close_depth_by_space;
 std::mutex trx_preserve_temp_adopted_fil_spaces_mutex;
+/*
+  Adopted fil spaces are resume-time attachments of sealed temp-table images.
+  They stay outside the normal temp-space pool until the resumed transaction
+  commits, rolls back, or the retry path explicitly forgets the attachment.
+*/
 std::unordered_map<uint32_t, trx_preserve_temp_space_image_descriptor *>
     trx_preserve_temp_adopted_fil_spaces;
 std::unordered_map<uint32_t,
@@ -395,6 +406,11 @@ class trx_preserve_temp_stage_admission_close_guard {
  public:
   explicit trx_preserve_temp_stage_admission_close_guard(
       uint32_t source_space_id, uint32_t second_source_space_id = 0) {
+    /*
+      Seal and reset paths close admission before touching the stream map. Page
+      writers that arrive after the close mark the image degraded instead of
+      appending a dirty page that the sealing thread may never observe.
+    */
     add_space(source_space_id);
     add_space(second_source_space_id);
 
@@ -553,6 +569,11 @@ bool trx_preserve_temp_space_image_trace_undo_page_list(
     const trx_preserve_temp_space_image_descriptor &descriptor,
     const trx_preserve_temp_no_redo_undo_log_anchor &anchor,
     ulint persisted_size) {
+  /*
+    No-redo undo pages are not discoverable from redo after restart. The sidecar
+    therefore stores enough page images to reconstruct the undo page list, and
+    this validation walks the list before any resume path trusts it.
+  */
   const trx_preserve_temp_no_redo_undo_page_image *header =
       trx_preserve_temp_space_image_complete_no_redo_page(
           descriptor, trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER,
@@ -677,6 +698,11 @@ bool trx_preserve_temp_space_image_dict_binding_page_in_image(
 bool trx_preserve_temp_space_image_dict_binding_is_valid(
     const trx_preserve_temp_space_image_descriptor &descriptor,
     const trx_preserve_temp_dict_table_binding &binding) {
+  /*
+    The DD table is serialized by SQL, but InnoDB still needs a dictionary
+    binding that matches the physical image: table id, clustered root, index
+    roots, and columns must all refer to pages present in the sidecar image.
+  */
   if (binding.source_space_id != descriptor.source_space_id ||
       binding.image_table_id == 0 || binding.clustered_root_page_no == 0 ||
       binding.schema_name.empty() || binding.table_name.empty() ||
@@ -786,6 +812,12 @@ dict_col_t *trx_preserve_temp_space_image_dict_col_by_name(
 dict_table_t *trx_preserve_temp_space_image_create_dict_table(
     const trx_preserve_temp_space_image_descriptor &descriptor,
     const trx_preserve_temp_dict_table_binding &binding) {
+  /*
+    Resume registers an in-memory temporary dictionary table that points at the
+    adopted image space. The generated name keeps it separate from the user's
+    logical temporary table name while still letting handler lookup find it for
+    this THD.
+  */
   std::string table_name =
       trx_preserve_temp_space_image_dict_table_name(binding);
   mutex_enter(&dict_sys->mutex);
@@ -926,6 +958,11 @@ void trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
     const char *reason) {
   if (descriptor == nullptr) return;
 
+  /*
+    Degradation is fail-closed. Once a stream cannot prove it captured every
+    dirty page, remove it from the active map so later page writes do not append
+    to an artifact that must no longer be used for preserve.
+  */
   descriptor->dirty_page_stream_degraded = true;
   descriptor->dirty_page_stream_degraded_reason =
       reason == nullptr ? "" : reason;
@@ -989,6 +1026,11 @@ bool trx_preserve_temp_space_image_reserve_dirty_page_memory_locked(
       descriptor->dirty_page_resource_token.empty()) {
     return false;
   }
+  /*
+    Dirty page queues are bounded by the preserve resource budget. Exceeding the
+    budget invalidates this warm image; it does not spill implicitly from the
+    page write path, because that path must remain small and predictable.
+  */
   if (descriptor->dirty_page_memory_reserved_bytes >
       std::numeric_limits<uint64_t>::max() - bytes) {
     trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
@@ -1079,6 +1121,11 @@ void trx_preserve_temp_space_image_mark_no_redo_undo_degraded_locked(
     const char *reason) {
   if (descriptor == nullptr) return;
 
+  /*
+    A no-redo undo capture error makes the whole temp-DML image unusable for
+    resume. Drop the stream first so subsequent page writes cannot make a
+    partially classified undo sidecar look complete.
+  */
   trx_preserve_temp_space_image_unregister_no_redo_undo_stream_locked(
       descriptor);
   descriptor->no_redo_undo_capture_degraded = true;
@@ -2543,6 +2590,12 @@ dberr_t trx_preserve_temp_space_image_begin(
   trx_preserve_temp_space_image_reset_dirty_page_stream(descriptor);
   trx_preserve_temp_space_image_reset_shadow(descriptor);
 
+  /*
+    Physical temp-table image capture is only valid after SQL has exported the
+    table metadata and InnoDB has an armed dirty-page stream. Returning
+    DB_UNSUPPORTED here keeps callers on the conservative path until that
+    integration explicitly hands in the missing context.
+  */
   return DB_UNSUPPORTED;
 }
 
@@ -2560,6 +2613,12 @@ dberr_t trx_preserve_temp_space_image_note_page(
   if (descriptor->sealed) return DB_ERROR;
   if (!descriptor->initial_copy_started) return DB_ERROR;
 
+  /*
+    The initial copy records one page image per page number. Dirty-page capture
+    later overlays newer versions; storing the baseline without page identity
+    checks would let an unrelated temp space reuse the descriptor after space-id
+    churn.
+  */
   return trx_preserve_temp_space_image_store_shadow_page(
       descriptor, page_no, page, page_bytes);
 }
@@ -2599,6 +2658,11 @@ dberr_t trx_preserve_temp_space_image_copy_initial_file_pages(
     return DB_ERROR;
   }
 
+  /*
+    File copy reads the on-disk temp tablespace as the baseline. Buffer-pool
+    overlays and dirty-page stream replay are applied afterwards to cover pages
+    that changed while phase 1 was still allowing the owning transaction to run.
+  */
   File file = my_open(path, O_RDONLY, MYF(0));
   if (file < 0) {
     trx_preserve_temp_space_image_reset_shadow(descriptor);
@@ -2842,6 +2906,11 @@ dberr_t trx_preserve_temp_space_image_begin_initial_copy(
     }
   }
 
+  /*
+    Begin copy only after both metadata and dirty-page capture are armed for the
+    same epoch. Otherwise a CREATE/DROP/TRUNCATE event or page write could fall
+    between baseline copy and journal admission.
+  */
   descriptor->initial_copy_started = true;
   descriptor->shadow_image_bytes = 0;
   descriptor->shadow_pages.clear();
@@ -2863,6 +2932,11 @@ dberr_t trx_preserve_temp_space_image_apply_dirty_page_stream(
     return DB_ERROR;
   }
 
+  /*
+    Applying the dirty stream folds phase-1 page writes over the baseline image.
+    Capture sequence is retained in the images so later streamed builders can
+    reproduce the same last-writer-wins order.
+  */
   return trx_preserve_temp_space_image_apply_dirty_page_images(
       descriptor, descriptor->dirty_pages);
 }
@@ -2915,6 +2989,11 @@ dberr_t trx_preserve_temp_space_image_finish_streamed_sidecar(
     return DB_ERROR;
   }
 
+  /*
+    Streamed sidecar finish is the bounded tail of phase 1. It freezes
+    admission, copies the remaining dirty pages to the writer, and leaves the
+    descriptor unsealed until the carrier reports the final size and digest.
+  */
   std::vector<trx_preserve_temp_dirty_page_image> dirty_pages;
   dberr_t err =
       trx_preserve_temp_space_image_freeze_dirty_stream_for_seal(descriptor,
@@ -2984,6 +3063,11 @@ dberr_t trx_preserve_temp_space_image_arm_dirty_page_stream(
     return DB_ERROR;
   }
 
+  /*
+    Arming only prepares descriptor-local accounting. The stream becomes visible
+    to page-write hooks after register_dirty_page_stream(), which gives SQL a
+    chance to establish the matching metadata-capture epoch first.
+  */
   trx_preserve_temp_space_image_release_dirty_page_memory(descriptor);
   descriptor->dirty_page_queue_limit_bytes = queue_limit_bytes;
   descriptor->dirty_page_bytes = 0;
@@ -3011,6 +3095,11 @@ dberr_t trx_preserve_temp_space_image_register_dirty_page_stream(
     return DB_ERROR;
   }
 
+  /*
+    Registration publishes this descriptor to the page-write hook. Only one
+    active descriptor may own a source space id; a duplicate would make dirty
+    page ordering ambiguous.
+  */
   std::lock_guard<std::mutex> guard{
       trx_preserve_temp_dirty_page_streams_mutex};
   trx_preserve_temp_active_dirty_page_stream_bucket_add(
@@ -3099,6 +3188,11 @@ dberr_t trx_preserve_temp_space_image_capture_dirty_page(
     return DB_ERROR;
   }
 
+  /*
+    Record only the latest image for each page, but bump the capture sequence on
+    every update. This gives the final replay a stable last-writer-wins view
+    without keeping every intermediate page version.
+  */
   auto existing = std::find_if(
       descriptor->dirty_pages.begin(), descriptor->dirty_pages.end(),
       [page_no](const trx_preserve_temp_dirty_page_image &image) {
@@ -3162,6 +3256,11 @@ dberr_t trx_preserve_temp_space_image_stage_dirty_page(
           source_space_id)) {
     return DB_SUCCESS;
   }
+  /*
+    Hot page-write paths stage into thread-local memory before taking the stream
+    mutex. If admission closes during that window, the target is marked
+    degraded rather than letting a page disappear from the final image.
+  */
   if (trx_preserve_temp_stage_admission_closed_for_space(source_space_id)) {
     trx_preserve_temp_space_image_mark_stage_rejected_during_close(
         source_space_id);
@@ -3374,6 +3473,11 @@ dberr_t trx_preserve_temp_space_image_begin_no_redo_undo_capture(
     return DB_ERROR;
   }
 
+  /*
+    A temp-DML transaction can use no-redo undo pages in srv_tmp_space. Capture
+    is tied to the rseg identity so later resume cannot attach undo pages from
+    another rollback segment slot.
+  */
   trx_preserve_temp_stage_admission_close_guard close_stage_admission(
       descriptor->no_redo_undo_rseg_space_id, rseg_space_id);
   {
@@ -3425,6 +3529,11 @@ dberr_t trx_preserve_temp_space_image_capture_no_redo_undo_from_trx(
     return DB_UNSUPPORTED;
   }
 
+  /*
+    Anchors come from the live trx undo objects, while body pages may already be
+    in memory or on the temp file. Capture both sources before seal so a later
+    restart does not depend on srv_tmp_space contents that are normally removed.
+  */
   const uint32_t rseg_space_id =
       static_cast<uint32_t>(trx->rsegs.m_noredo.rseg->space_id);
   const uint32_t rseg_page_no =
@@ -3570,6 +3679,11 @@ dberr_t trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(
     return DB_ERROR;
   }
 
+  /*
+    Seal resolves all pending no-redo pages while admission is closed. Unknown
+    pages either wait for a peer descriptor that can classify them or degrade
+    the image; the resume path must never import an incomplete undo graph.
+  */
   trx_preserve_temp_stage_admission_close_guard close_stage_admission(
       descriptor->no_redo_undo_rseg_space_id);
   std::lock_guard<std::mutex> guard{
@@ -3615,6 +3729,11 @@ dberr_t trx_preserve_temp_space_image_build_no_redo_undo_sidecar_payload(
     return DB_ERROR;
   }
 
+  /*
+    The sidecar payload is self-verifying: it carries rseg identity, undo
+    anchors, classified pages, and a trailing digest. Loading code validates the
+    whole object into a temporary descriptor before mutating the caller.
+  */
   payload->append(kTempNoRedoUndoSidecarMagic,
                   kTempNoRedoUndoSidecarMagicBytes);
   trx_preserve_temp_append_le32(payload, kTempNoRedoUndoSidecarVersion);
@@ -3763,9 +3882,11 @@ dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
     }
     return DB_SUCCESS;
   }
-  /* Current release contract rejects temp-DML/no-redo undo resume.  Keep this
-  fail-closed guard before any rseg lookup, undo-cache mutation, or page
-  materialization so legacy/crafted sidecars cannot write into srv_tmp_space. */
+  /*
+    Current release contract rejects temp-DML/no-redo undo resume. Keep this
+    fail-closed guard before any rseg lookup, undo-cache mutation, or page
+    materialization so legacy/crafted sidecars cannot write into srv_tmp_space.
+  */
   return DB_UNSUPPORTED;
 }
 
@@ -3869,6 +3990,11 @@ dberr_t trx_preserve_temp_space_image_bind_dict_table(
     return DB_CORRUPTION;
   }
 
+  /*
+    Binding is resume-local. It creates dictionary objects that reference the
+    adopted image but does not expose a persistent DD object; cleanup removes
+    these generated tables when the preserved transaction leaves the session.
+  */
   std::lock_guard<std::mutex> dict_bind_guard{
       trx_preserve_temp_dict_bind_mutex};
   if (trx_preserve_temp_space_image_bound_dict_table_collides(*descriptor,
@@ -3937,6 +4063,11 @@ dberr_t trx_preserve_temp_space_image_load_no_redo_undo_sidecar(
     return DB_CORRUPTION;
   }
 
+  /*
+    Parse into a copy and swap only after every page and anchor has validated.
+    This keeps a corrupt sidecar from partially mutating the descriptor that may
+    still need to be cleaned up or retried.
+  */
   const trx_preserve_temp_space_image_descriptor original = *descriptor;
   const auto fail_corrupt_without_mutation = [&]() {
     *descriptor = original;
@@ -4092,6 +4223,11 @@ dberr_t trx_preserve_temp_space_image_adopt_preserved_fil_space(
           descriptor->source_space_id)) {
     return DB_UNSUPPORTED;
   }
+  /*
+    Adoption attaches the sealed image as an InnoDB fil space using the original
+    temp space id. The id is reserved first so ordinary temporary tables cannot
+    reuse it while a preserved token is retryable.
+  */
   MY_STAT stat_area;
   if (my_stat(image_path, &stat_area, MYF(0)) == nullptr) return DB_ERROR;
   if (descriptor->page_size == 0 || descriptor->image_bytes == 0 ||
@@ -4240,6 +4376,11 @@ dberr_t trx_preserve_temp_space_image_attach_to_thd(
     return DB_ERROR;
   }
 
+  /*
+    After dictionary binding, the descriptor is copied into session-owned
+    tracking. The adopted fil-space map is redirected to that copy so later
+    close/drop paths see the same state that the THD is using.
+  */
   auto owned =
       std::make_unique<trx_preserve_temp_space_image_descriptor>(descriptor);
   trx_preserve_temp_space_image_descriptor *owned_descriptor = owned.get();
@@ -4289,6 +4430,11 @@ dberr_t trx_preserve_temp_space_image_drop_preserved_fil_space(
   if (!target->fil_space_adopted || target->adopted_fil_space_path.empty()) {
     return DB_ERROR;
   }
+  /*
+    Drop detaches the adopted fil space before deleting the sidecar files. Once
+    this succeeds the source space id reservation can be released because no
+    retry path should be able to attach the token again.
+  */
   trx_preserve_temp_space_image_release_bound_dict_table(target);
 
   trx_preserve_temp_space_image_notify_drop_event(
@@ -4525,6 +4671,11 @@ dberr_t trx_preserve_temp_space_image_release_preserved_fil_space_for_retry(
   if (!target->fil_space_adopted || target->adopted_fil_space_path.empty()) {
     return DB_SUCCESS;
   }
+  /*
+    Retry cleanup forgets the live fil-space attachment but preserves the disk
+    sidecar and reservation. A later RESUME of the same durable token must be
+    able to reattach the same source space id.
+  */
   trx_preserve_temp_space_image_release_bound_dict_table(target);
   const dberr_t undo_err =
       trx_preserve_temp_space_image_disconnect_no_redo_undo_for_retry(target);

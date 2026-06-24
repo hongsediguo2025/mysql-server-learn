@@ -750,6 +750,11 @@ Preserve_snapshot_status temp_table_metadata_preflight(THD *thd) {
     return Preserve_snapshot_status::OK;
   }
 
+  /*
+    Temporary-table preserve can proceed only when the table metadata and its
+    physical sidecar can be proven before the snapshot is built. Unsupported
+    engines, missing dictionary bindings or oversized sidecars fail closed.
+  */
   Temp_table_warmcopy_participant *participant =
       preserve_trx_temp_table_get_participant(thd);
 
@@ -839,6 +844,11 @@ bool append_row_event(THD *thd, const TABLE *table,
   }
   if (!temp_table_candidate(table)) return true;
 
+  /*
+    Row hooks record logical changes only for multi-statement transactions. The
+    transaction is first marked as having temp-table history so allocation or
+    journal failures cannot be misinterpreted as a complete history.
+  */
   preserve_trx_temp_table_note_untracked_change(thd);
 
   Temp_table_warmcopy_participant *participant =
@@ -1150,6 +1160,11 @@ Preserve_snapshot_status preserve_trx_temp_table_preflight_preserve(THD *thd) {
     return Preserve_snapshot_status::OK;
   }
 
+  /*
+    The current implementation requires a complete logical temp-table history
+    plus supported physical sidecars. No-redo undo changes observed after the
+    baseline are rejected because replay cannot prove the exact table image.
+  */
   Temp_table_warmcopy_participant *participant =
       preserve_trx_temp_table_get_participant(thd);
   const bool participant_degraded =
@@ -1177,6 +1192,10 @@ Preserve_snapshot_status preserve_trx_temp_table_preflight_preserve(THD *thd) {
 }
 
 bool preserve_trx_temp_table_row_hooks_enabled() {
+  /*
+    The top-level preserve_trx_enable gate keeps these hot row hooks inert when
+    the feature is disabled, independent of the temp-table subfeature setting.
+  */
   return preserve_trx_is_enabled();
 }
 
@@ -1244,6 +1263,11 @@ Temp_table_warmcopy_participant *preserve_trx_temp_table_ensure_participant(
       thd == nullptr)
     return nullptr;
 
+  /*
+    Savepoints that existed before the participant was created are not in the
+    temp-table journal. Mark that history as incomplete so preserve later fails
+    closed instead of replaying a partial savepoint view.
+  */
   const bool has_existing_savepoints =
       thd->get_transaction()->m_savepoints != nullptr;
   bool fail_participant_alloc = false;
@@ -1313,6 +1337,11 @@ bool preserve_trx_temp_table_note_table_create(
   if (!thd->in_multi_stmt_transaction_mode()) return true;
   if (!preserve_trx_temp_table_row_hooks_enabled()) return true;
   if (!preserve_trx_temp_table_enable) {
+    /*
+      The top-level feature is active but temp-table preserve is disabled. Mark
+      the transaction as having untracked temp-table changes so preserve fails
+      closed instead of pretending the table history is complete.
+    */
     preserve_trx_temp_table_note_untracked_change(thd);
     return true;
   }
@@ -1365,6 +1394,11 @@ bool preserve_trx_temp_table_note_table_drop(THD *thd, const TABLE *table) {
   }
   if (!temp_table_candidate(table)) return true;
 
+  /*
+    Drop and truncate are table-generation barriers. Later row events for the
+    same logical name must be associated with a new generation so replay does
+    not apply old rows to a recreated temporary table.
+  */
   Temp_table_warmcopy_participant *participant =
       preserve_trx_temp_table_ensure_participant(thd);
   if (participant == nullptr) {
@@ -1468,6 +1502,11 @@ bool preserve_trx_temp_table_note_row_write(THD *thd,
   }
   if (!participant->has_table(table_ordinal))
     participant->register_table(table_ordinal, "unknown");
+  /*
+    Ordinal-based row hooks are used by lower layers that no longer have the
+    TABLE object. Register an unknown name if needed, then rely on later
+    manifest validation to reject incomplete or inconsistent metadata.
+  */
   preserve_trx_temp_table_note_untracked_change(thd);
   Temp_table_journal_record record;
   record.table_ordinal = table_ordinal;

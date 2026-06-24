@@ -34,6 +34,11 @@ class Local_file_preserved_trx_carrier final
     : public Preserved_trx_carrier,
       public Preserved_trx_warm_external_blob_carrier {
  public:
+  /*
+    Local-file carrier owns snapshot files, generic external blobs, taint
+    markers, and phase-1 warm blob artifacts under one preserve directory. The
+    caller controls durability tradeoffs through Preserve_snapshot_write_options.
+  */
   explicit Local_file_preserved_trx_carrier(
       const std::string &dir,
       const Preserve_snapshot_write_options &write_options = {});
