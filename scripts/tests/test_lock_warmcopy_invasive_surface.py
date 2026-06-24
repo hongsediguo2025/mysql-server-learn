@@ -14,6 +14,13 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
             "sql/preserve_trx_resource.cc",
             "sql/preserve_trx_resource.h",
             "sql/preserve_trx_rewrite.cc",
+            "sql/preserve_trx_temp_table.cc",
+            "sql/preserve_trx_temp_table.h",
+            "sql/preserve_trx_temp_table_carrier.cc",
+            "sql/preserve_trx_temp_table_carrier.h",
+            "sql/preserve_trx_warmcopy.cc",
+            "sql/preserve_trx_warmcopy.h",
+            "sql/preserve_trx_xid.h",
             "storage/innobase/include/trx0temp_preserve.h",
             "storage/innobase/lock/lock0preserve.cc",
             "storage/innobase/trx/trx0temp_preserve.cc",
@@ -26,6 +33,75 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
 
                 self.assertEqual("new_lock_warmcopy_module", finding.category)
                 self.assertEqual("info", finding.severity)
+                self.assertFalse(finding.blocks_release)
+
+    def test_preserve_sql_integration_points_are_classified(self):
+        for path in (
+            "sql/auth/dynamic_privileges_impl.cc",
+            "sql/conn_handler/init_net_server_extension.cc",
+            "sql/handler.cc",
+            "sql/mdl_context_backup.cc",
+            "sql/sql_base.cc",
+            "sql/sql_class.cc",
+            "sql/sql_class.h",
+            "sql/sql_prepare.cc",
+            "sql/sql_table.cc",
+            "sql/sql_thd_internal_api.cc",
+            "sql/sql_truncate.cc",
+            "sql/system_variables.h",
+            "sql/xa.cc",
+        ):
+            with self.subTest(path=path):
+                finding = invasive_surface.classify_path(path, state="modified")
+
+                self.assertEqual("preserve_sql_integration_point",
+                                 finding.category)
+                self.assertFalse(finding.blocks_release)
+
+    def test_preserve_parser_integration_points_are_classified(self):
+        for path in (
+            "sql/lex.h",
+            "sql/parser_yystype.h",
+            "sql/sql_lex.cc",
+            "sql/sql_lex.h",
+            "sql/sql_yacc.yy",
+        ):
+            with self.subTest(path=path):
+                finding = invasive_surface.classify_path(path, state="modified")
+
+                self.assertEqual("preserve_parser_integration_point",
+                                 finding.category)
+                self.assertFalse(finding.blocks_release)
+
+    def test_preserve_innodb_integration_points_are_classified(self):
+        for path in (
+            "storage/innobase/clone/clone0repl.cc",
+            "storage/innobase/fil/fil0fil.cc",
+            "storage/innobase/handler/ha_innodb.h",
+            "storage/innobase/include/fil0fil.h",
+            "storage/innobase/include/read0read.h",
+            "storage/innobase/include/read0types.h",
+            "storage/innobase/include/srv0tmp.h",
+            "storage/innobase/include/trx0sys.h",
+            "storage/innobase/include/trx0sys.ic",
+            "storage/innobase/include/trx0trx.ic",
+            "storage/innobase/include/trx0types.h",
+            "storage/innobase/include/trx0undo.h",
+            "storage/innobase/mtr/mtr0mtr.cc",
+            "storage/innobase/read/read0read.cc",
+            "storage/innobase/srv/srv0start.cc",
+            "storage/innobase/srv/srv0tmp.cc",
+            "storage/innobase/trx/trx0purge.cc",
+            "storage/innobase/trx/trx0roll.cc",
+            "storage/innobase/trx/trx0sys.cc",
+            "storage/innobase/trx/trx0undo.cc",
+        ):
+            with self.subTest(path=path):
+                finding = invasive_surface.classify_path(path, state="modified")
+
+                self.assertEqual("preserve_innodb_integration_point",
+                                 finding.category)
+                self.assertEqual("high", finding.severity)
                 self.assertFalse(finding.blocks_release)
 
     def test_sql_preserve_trx_is_a_necessary_integration_point(self):
@@ -53,6 +129,7 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
     def test_external_artifact_support_files_are_classified(self):
         for path in (
             "sql/binlog.cc",
+            "sql/binlog.h",
             "sql/binlog_ostream.cc",
             "sql/binlog_ostream.h",
             "sql/preserve_trx_bundle.cc",
@@ -288,7 +365,7 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
 
     def test_unclassified_core_change_blocks_release(self):
         finding = invasive_surface.classify_path(
-            "sql/sql_lex.cc",
+            "sql/unregistered_preserve_hook.cc",
             state="modified",
         )
 
@@ -301,13 +378,14 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
             [
                 ("sql/preserve_trx.cc", "modified"),
                 ("sql/sql_parse.cc", "modified"),
-                ("sql/sql_lex.cc", "modified"),
+                ("sql/unregistered_preserve_hook.cc", "modified"),
                 ("sql/preserve_trx_lock_warmcopy.cc", "untracked"),
             ]
         )
 
         blocked = invasive_surface.blocking_findings(findings)
-        self.assertEqual(["sql/sql_lex.cc"], [finding.path for finding in blocked])
+        self.assertEqual(["sql/unregistered_preserve_hook.cc"],
+                         [finding.path for finding in blocked])
 
     def test_expanded_high_risk_core_hot_path_blocks_when_gate_enabled(self):
         findings = [

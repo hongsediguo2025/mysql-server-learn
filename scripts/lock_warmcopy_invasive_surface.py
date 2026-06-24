@@ -36,6 +36,13 @@ NEW_LOCK_WARMCOPY_MODULES = {
     "sql/preserve_trx_resource.cc",
     "sql/preserve_trx_resource.h",
     "sql/preserve_trx_rewrite.cc",
+    "sql/preserve_trx_temp_table.cc",
+    "sql/preserve_trx_temp_table.h",
+    "sql/preserve_trx_temp_table_carrier.cc",
+    "sql/preserve_trx_temp_table_carrier.h",
+    "sql/preserve_trx_warmcopy.cc",
+    "sql/preserve_trx_warmcopy.h",
+    "sql/preserve_trx_xid.h",
     "storage/innobase/include/lock0warmcopy.h",
     "storage/innobase/include/trx0temp_preserve.h",
     "storage/innobase/lock/lock0preserve.cc",
@@ -103,6 +110,10 @@ ARTIFACT_SUPPORT_INTEGRATION_POINTS = {
         "external artifact prebuilt binlog warmcopy descriptor handoff only; "
         "no binlog execution semantics"
     ),
+    "sql/binlog.h": (
+        "external artifact prebuilt binlog warmcopy declarations only; no "
+        "binlog execution semantics"
+    ),
     "sql/binlog_ostream.cc": (
         "external artifact source-cache range copy and thin mirror dispatch "
         "only; no warmcopy session or lease policy"
@@ -128,6 +139,125 @@ ARTIFACT_SUPPORT_INTEGRATION_POINTS = {
     ),
     "sql/preserve_trx_carrier_file.h": (
         "external artifact file carrier declarations/options only"
+    ),
+}
+
+PRESERVE_SQL_INTEGRATION_POINTS = {
+    "sql/auth/dynamic_privileges_impl.cc": (
+        "dynamic privilege registration only; no Preserve/Resume runtime policy"
+    ),
+    "sql/conn_handler/init_net_server_extension.cc": (
+        "command-read idle adapter calls only; helpers must own OFF fast returns"
+    ),
+    "sql/handler.cc": (
+        "transaction and temporary-table adapter calls only; row hooks must be "
+        "gated before payload construction"
+    ),
+    "sql/mdl_context_backup.cc": (
+        "MDL context transfer adapter only; no payload wire format"
+    ),
+    "sql/sql_base.cc": (
+        "temporary-table close/drop lifecycle hook only; policy must stay in "
+        "preserve_trx_temp_table.*"
+    ),
+    "sql/sql_class.cc": (
+        "THD cleanup/resource-release adapter calls and cursor inspection only"
+    ),
+    "sql/sql_class.h": (
+        "THD preserve state fields and declarations only; runtime policy must "
+        "stay in preserve modules"
+    ),
+    "sql/sql_prepare.cc": (
+        "prepared-statement rejection for preserve SQL commands only"
+    ),
+    "sql/sql_table.cc": (
+        "temporary-table create lifecycle hook only; policy must stay in "
+        "preserve_trx_temp_table.*"
+    ),
+    "sql/sql_thd_internal_api.cc": (
+        "internal THD API preserve adapter only; no preserve state machine"
+    ),
+    "sql/sql_truncate.cc": (
+        "temporary-table truncate lifecycle hook only; policy must stay in "
+        "preserve_trx_temp_table.*"
+    ),
+    "sql/system_variables.h": (
+        "preserve sysvar storage declarations only"
+    ),
+    "sql/xa.cc": (
+        "reject user XA access to preserve magic XIDs only"
+    ),
+}
+
+PRESERVE_PARSER_INTEGRATION_POINTS = {
+    "sql/lex.h": "SQL command token declaration only",
+    "sql/parser_yystype.h": "parser semantic value declaration only",
+    "sql/sql_lex.cc": "LEX preserve command field reset only",
+    "sql/sql_lex.h": "LEX preserve command fields only",
+    "sql/sql_yacc.yy": "Preserve/Resume grammar production only",
+}
+
+PRESERVE_INNODB_INTEGRATION_POINTS = {
+    "storage/innobase/clone/clone0repl.cc": (
+        "clone/recovery adapter for preserved transaction state only"
+    ),
+    "storage/innobase/fil/fil0fil.cc": (
+        "temporary tablespace preserve adapter only"
+    ),
+    "storage/innobase/handler/ha_innodb.h": (
+        "InnoDB handler preserve declarations only"
+    ),
+    "storage/innobase/include/fil0fil.h": (
+        "temporary tablespace preserve declarations only"
+    ),
+    "storage/innobase/include/read0read.h": (
+        "read-view preserve export/import declarations only"
+    ),
+    "storage/innobase/include/read0types.h": (
+        "read-view preserve snapshot type declarations only"
+    ),
+    "storage/innobase/include/srv0tmp.h": (
+        "temporary tablespace preserve reservation declarations only"
+    ),
+    "storage/innobase/include/trx0sys.h": (
+        "transaction-system preserve declarations only"
+    ),
+    "storage/innobase/include/trx0sys.ic": (
+        "transaction-system preserve inline helpers only"
+    ),
+    "storage/innobase/include/trx0trx.ic": (
+        "trx preserve inline helpers only"
+    ),
+    "storage/innobase/include/trx0types.h": (
+        "trx preserve type declarations only"
+    ),
+    "storage/innobase/include/trx0undo.h": (
+        "undo preserve declarations only"
+    ),
+    "storage/innobase/mtr/mtr0mtr.cc": (
+        "mini-transaction preserve adapter only"
+    ),
+    "storage/innobase/read/read0read.cc": (
+        "read-view preserve export/import implementation only"
+    ),
+    "storage/innobase/srv/srv0start.cc": (
+        "startup/shutdown preserve adapter calls only; helpers must own OFF "
+        "fast returns"
+    ),
+    "storage/innobase/srv/srv0tmp.cc": (
+        "temporary tablespace preserve reservation implementation only"
+    ),
+    "storage/innobase/trx/trx0purge.cc": (
+        "purge preserve adapter only"
+    ),
+    "storage/innobase/trx/trx0roll.cc": (
+        "rollback preserve adapter only"
+    ),
+    "storage/innobase/trx/trx0sys.cc": (
+        "transaction-system preserve recovery adapter only"
+    ),
+    "storage/innobase/trx/trx0undo.cc": (
+        "undo preserve no-redo/temp-table adapter only"
     ),
 }
 
@@ -196,6 +326,9 @@ LOCK0LOCK_FORBIDDEN_CONTENT = (
         "do not construct record images in the lock hot-path file",
     ),
 )
+
+LOCK0LOCK_RECORD_IMAGE_CAPTURE = "lock_warmcopy_capture_record_image_for_lock("
+LOCK0LOCK_RECORD_IMAGE_GUARD = "lock_warmcopy_hooks_enabled()"
 
 BINLOG_CC_FORBIDDEN_CONTENT = (
     (
@@ -306,6 +439,31 @@ HA_INNODB_CC_FORBIDDEN_CONTENT = (
     ),
 )
 
+ROW0UNDO_CC_FORBIDDEN_CONTENT = (
+    (
+        "if (err == DB_LOCK_WAIT_TIMEOUT || err == DB_INTERRUPTED)",
+        "forbidden_rollback_error_swallow",
+        "do not convert warmcopy conversion freeze timeout/interruption into rollback success in row0undo.cc",
+    ),
+)
+
+OFF_GUARDED_HELPERS = {
+    "sql/preserve_trx.cc": (
+        "bool preserved_trx_begin_command_read(",
+        "bool preserved_trx_command_read_is_idle(",
+        "bool preserved_trx_end_idle_for_command_packet(",
+        "bool preserved_trx_end_command_read(",
+        "bool preserved_trx_wait_if_batch_session_quiesced(",
+        "bool preserved_trx_reject_if_batch_session_drained(",
+        "Preserve_trx_command_block_result preserved_trx_command_block_result(",
+        "Preserve_trx_command_block_result preserved_trx_protocol_command_block_result(",
+        "bool preserved_trx_preflight_recoverability(",
+        "bool preserved_temp_images_bootstrap_preamble(",
+        "bool preserved_trx_recover_all(",
+        "Preserved_trx_view_rows preserved_trx_snapshot(",
+    ),
+}
+
 MEDIUM_RISK_CORE_WRAPPERS = {
     "storage/innobase/include/lock0lock.h": (
         "InnoDB preserve wrapper declarations only"
@@ -385,6 +543,33 @@ def classify_path(path: str, state: str) -> SurfaceFinding:
             ARTIFACT_SUPPORT_INTEGRATION_POINTS[path],
         )
 
+    if path in PRESERVE_SQL_INTEGRATION_POINTS:
+        return SurfaceFinding(
+            path,
+            state,
+            "preserve_sql_integration_point",
+            "medium",
+            PRESERVE_SQL_INTEGRATION_POINTS[path],
+        )
+
+    if path in PRESERVE_PARSER_INTEGRATION_POINTS:
+        return SurfaceFinding(
+            path,
+            state,
+            "preserve_parser_integration_point",
+            "medium",
+            PRESERVE_PARSER_INTEGRATION_POINTS[path],
+        )
+
+    if path in PRESERVE_INNODB_INTEGRATION_POINTS:
+        return SurfaceFinding(
+            path,
+            state,
+            "preserve_innodb_integration_point",
+            "high",
+            PRESERVE_INNODB_INTEGRATION_POINTS[path],
+        )
+
     if path in HIGH_RISK_CORE_HOT_PATHS:
         return SurfaceFinding(
             path,
@@ -455,6 +640,26 @@ def audit_lock0lock_content(
                 blocks_release=True,
             )
         )
+    lines = content.splitlines()
+    for index, line in enumerate(lines):
+        if LOCK0LOCK_RECORD_IMAGE_CAPTURE not in line:
+            continue
+        if line.lstrip().startswith("bool "):
+            continue
+        preceding = "\n".join(lines[max(0, index - 4) : index + 1])
+        if LOCK0LOCK_RECORD_IMAGE_GUARD in preceding:
+            continue
+        findings.append(
+            SurfaceFinding(
+                path,
+                "modified",
+                "unguarded_record_image_capture",
+                "blocker",
+                "lock0lock.cc may call lock_warmcopy_capture_record_image_for_lock only inside a lock_warmcopy_hooks_enabled() branch",
+                blocks_release=True,
+            )
+        )
+        break
     return findings
 
 
@@ -618,6 +823,67 @@ def audit_ha_innodb_file(
     return audit_ha_innodb_content(Path(path).read_text(encoding="utf-8"), path)
 
 
+def audit_row0undo_content(
+    content: str,
+    path: str = "storage/innobase/row/row0undo.cc",
+) -> List[SurfaceFinding]:
+    return audit_content_forbidden_tokens(content, path, ROW0UNDO_CC_FORBIDDEN_CONTENT)
+
+
+def audit_row0undo_file(
+    path: str = "storage/innobase/row/row0undo.cc",
+) -> List[SurfaceFinding]:
+    return audit_row0undo_content(Path(path).read_text(encoding="utf-8"), path)
+
+
+def helper_has_top_level_off_guard(content: str, signature: str) -> bool:
+    signature_offset = content.find(signature)
+    if signature_offset < 0:
+        return True
+    body_offset = content.find("{", signature_offset)
+    if body_offset < 0:
+        return False
+
+    body_prefix = content[body_offset + 1 : body_offset + 600]
+    guard_offset = body_prefix.find("!preserve_trx_is_enabled()")
+    if guard_offset < 0:
+        return False
+
+    first_side_effect_offsets = [
+        offset
+        for token in (
+            "mysql_mutex_lock",
+            "preserve_trx_batch_state(",
+            "preserve_trx_manager_state_owner_snapshot(",
+            "create_preserved_trx_default_store(",
+            "preserved_trx_wait_recovery_complete(",
+        )
+        for offset in [body_prefix.find(token)]
+        if offset >= 0
+    ]
+    return not first_side_effect_offsets or guard_offset < min(first_side_effect_offsets)
+
+
+def audit_off_path_helper_guards() -> List[SurfaceFinding]:
+    findings: List[SurfaceFinding] = []
+    for path, signatures in OFF_GUARDED_HELPERS.items():
+        content = Path(path).read_text(encoding="utf-8")
+        for signature in signatures:
+            if helper_has_top_level_off_guard(content, signature):
+                continue
+            findings.append(
+                SurfaceFinding(
+                    path,
+                    "modified",
+                    "missing_preserve_off_fast_return",
+                    "blocker",
+                    f"{signature} must return before lock/state/I/O work when preserve_trx_enable=OFF",
+                    blocks_release=True,
+                )
+            )
+    return findings
+
+
 def expanded_high_risk_findings(
     findings: Sequence[SurfaceFinding],
 ) -> List[SurfaceFinding]:
@@ -665,6 +931,33 @@ def git_changed_paths(cwd: str = ".") -> List[Tuple[str, str]]:
     return paths
 
 
+def parse_git_diff_name_status_line(line: str) -> Tuple[str, str]:
+    parts = line.split("\t")
+    if len(parts) < 2:
+        return line, "modified"
+    status = parts[0]
+    path = parts[-1]
+    normalized_state = "deleted" if status == "D" else "modified"
+    return path, normalized_state
+
+
+def git_diff_paths(diff_args: Sequence[str], cwd: str = ".") -> List[Tuple[str, str]]:
+    result = subprocess.run(
+        ["git", "diff", "--name-status", *diff_args],
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    paths: List[Tuple[str, str]] = []
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        paths.append(parse_git_diff_name_status_line(line))
+    return paths
+
+
 def findings_as_dicts(findings: Sequence[SurfaceFinding]) -> List[dict]:
     return [dataclasses.asdict(finding) for finding in findings]
 
@@ -695,6 +988,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         description="Audit lock warmcopy invasive surface in the current worktree"
     )
     parser.add_argument("--format", choices=("markdown", "json"), default="markdown")
+    parser.add_argument("--base", default=None)
+    parser.add_argument("--range", dest="diff_range", default=None)
     parser.add_argument("--fail-on-unclassified", action="store_true")
     parser.add_argument("--fail-on-expanded-high-risk", action="store_true")
     return parser.parse_args(argv)
@@ -702,7 +997,14 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    findings = audit_paths(git_changed_paths())
+    if args.base is not None:
+        paths = git_diff_paths([f"{args.base}..HEAD"])
+    elif args.diff_range is not None:
+        paths = git_diff_paths([args.diff_range])
+    else:
+        paths = git_changed_paths()
+
+    findings = audit_paths(paths)
     findings.extend(audit_lock0lock_file())
     findings.extend(audit_binlog_file())
     findings.extend(audit_binlog_ostream_file())
@@ -712,6 +1014,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     findings.extend(audit_mysqld_file())
     findings.extend(audit_mdl_file())
     findings.extend(audit_ha_innodb_file())
+    findings.extend(audit_row0undo_file())
+    findings.extend(audit_off_path_helper_guards())
 
     if args.format == "json":
         print(json.dumps(findings_as_dicts(findings), indent=2, sort_keys=True))

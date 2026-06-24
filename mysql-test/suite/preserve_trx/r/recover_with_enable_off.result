@@ -14,8 +14,15 @@ enable_after_restart
 SELECT COUNT(*) AS recovered_while_disabled
 FROM performance_schema.preserved_transactions;
 recovered_while_disabled
+0
+# restart: --preserve-trx-enable=ON --skip-log-bin
+SELECT @@global.preserve_trx_enable AS enable_after_enabled_restart;
+enable_after_enabled_restart
 1
-SET GLOBAL preserve_trx_enable=ON;
+SELECT COUNT(*) AS recovered_after_enabled_restart
+FROM performance_schema.preserved_transactions;
+recovered_after_enabled_restart
+1
 RESUME PRESERVED TRANSACTION 'TOKEN';
 COMMIT;
 SELECT * FROM t_recover_enable_off ORDER BY a;

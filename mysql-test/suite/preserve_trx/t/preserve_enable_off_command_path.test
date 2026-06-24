@@ -1,0 +1,11 @@
+--source include/have_debug.inc
+
+SET GLOBAL preserve_trx_enable=OFF;
+SELECT @@global.preserve_trx_enable;
+
+CREATE TABLE t_off_command_path (id INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO t_off_command_path VALUES (1);
+SELECT * FROM t_off_command_path;
+DROP TABLE t_off_command_path;
+
+SET GLOBAL preserve_trx_enable=ON;

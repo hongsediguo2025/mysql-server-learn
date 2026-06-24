@@ -1478,8 +1478,10 @@ static void lock_rec_add_to_queue(ulint type_mode, const buf_block_t *block,
               (ULINT_UNDEFINED == lock_rec_find_set_bit(lock)));
 
         lock_rec_set_nth_bit(lock, heap_no);
-        (void)lock_warmcopy_capture_record_image_for_lock(lock, block,
-                                                          heap_no);
+        if (lock_warmcopy_hooks_enabled()) {
+          (void)lock_warmcopy_capture_record_image_for_lock(lock, block,
+                                                            heap_no);
+        }
         if (found_waiter_before_lock) {
           lock_rec_move_granted_to_front(lock, RecID{lock, heap_no});
         }
@@ -1494,8 +1496,10 @@ static void lock_rec_add_to_queue(ulint type_mode, const buf_block_t *block,
     trx_mutex_enter(trx);
   }
   lock_t *created_lock = rec_lock.create(trx);
-  (void)lock_warmcopy_capture_record_image_for_lock(created_lock, block,
-                                                    heap_no);
+  if (lock_warmcopy_hooks_enabled()) {
+    (void)lock_warmcopy_capture_record_image_for_lock(created_lock, block,
+                                                      heap_no);
+  }
   if (!we_own_trx_mutex) {
     trx_mutex_exit(trx);
   }
@@ -1561,8 +1565,10 @@ lock_rec_req_status lock_rec_lock_fast(
 
       trx_mutex_enter(trx);
       lock_t *created_lock = rec_lock.create(trx);
-      (void)lock_warmcopy_capture_record_image_for_lock(created_lock, block,
-                                                        heap_no);
+      if (lock_warmcopy_hooks_enabled()) {
+        (void)lock_warmcopy_capture_record_image_for_lock(created_lock, block,
+                                                          heap_no);
+      }
       trx_mutex_exit(trx);
 
       status = LOCK_REC_SUCCESS_CREATED;
@@ -1580,8 +1586,10 @@ lock_rec_req_status lock_rec_lock_fast(
       set */
       if (!lock_rec_get_nth_bit(lock, heap_no)) {
         lock_rec_set_nth_bit(lock, heap_no);
-        (void)lock_warmcopy_capture_record_image_for_lock(lock, block,
-                                                          heap_no);
+        if (lock_warmcopy_hooks_enabled()) {
+          (void)lock_warmcopy_capture_record_image_for_lock(lock, block,
+                                                            heap_no);
+        }
         status = LOCK_REC_SUCCESS_CREATED;
       }
     }

@@ -1,0 +1,5 @@
+SET GLOBAL preserve_trx_enable=OFF;
+SELECT COUNT(*) FROM performance_schema.preserved_transactions;
+COUNT(*)
+0
+SET GLOBAL preserve_trx_enable=ON;

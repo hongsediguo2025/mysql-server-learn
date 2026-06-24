@@ -1,0 +1,16 @@
+SET GLOBAL preserve_trx_enable=OFF;
+CREATE TABLE t_pr_off_iodku (id INT PRIMARY KEY, v INT UNIQUE) ENGINE=InnoDB;
+INSERT INTO t_pr_off_iodku VALUES (1, 10), (2, 20);
+START TRANSACTION;
+INSERT INTO t_pr_off_iodku VALUES (3, 30)
+  ON DUPLICATE KEY UPDATE v = 30;
+SAVEPOINT s1;
+--error ER_DUP_ENTRY
+INSERT INTO t_pr_off_iodku VALUES (1, 99)
+  ON DUPLICATE KEY UPDATE v = 20;
+ROLLBACK TO SAVEPOINT s1;
+UPDATE t_pr_off_iodku SET v = 31 WHERE id = 3;
+COMMIT;
+SELECT * FROM t_pr_off_iodku ORDER BY id;
+DROP TABLE t_pr_off_iodku;
+SET GLOBAL preserve_trx_enable=ON;

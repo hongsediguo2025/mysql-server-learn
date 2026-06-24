@@ -116,6 +116,8 @@ class _SchemaSeedRuntime:
 
 
 def _fake_fetch_rows(sql):
+    if sql == "SELECT @@global.preserve_trx_enable":
+        return [(0,)]
     if "COUNT(*), COALESCE(SUM(v),0)" in sql:
         return [(1, 1)]
     if sql.startswith("SELECT k FROM") and "AND k IN (" in sql:
@@ -3464,7 +3466,9 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         runner.configure_no_preserve_baseline_globals()
 
         self.assertIn("SET GLOBAL binlog_format=ROW", runner.runtime.sql)
+        self.assertIn("SET GLOBAL preserve_trx_enable=OFF", runner.runtime.sql)
         self.assertIn("SET GLOBAL preserve_trx_warmcopy_enable=OFF", runner.runtime.sql)
+        self.assertIn("SELECT @@global.preserve_trx_enable", runner.runtime.sql)
         self.assertFalse(
             any(
                 sql.startswith("SET GLOBAL preserve_trx_warmcopy_max_total_bytes=")

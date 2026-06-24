@@ -27,7 +27,13 @@ SELECT @@global.preserve_trx_enable AS enable_after_restart;
 SELECT COUNT(*) AS recovered_while_disabled
   FROM performance_schema.preserved_transactions;
 
-SET GLOBAL preserve_trx_enable=ON;
+--let $restart_parameters= restart: --preserve-trx-enable=ON --skip-log-bin
+--source include/restart_mysqld.inc
+
+SELECT @@global.preserve_trx_enable AS enable_after_enabled_restart;
+
+SELECT COUNT(*) AS recovered_after_enabled_restart
+  FROM performance_schema.preserved_transactions;
 
 --source suite/preserve_trx/include/get_preserved_token.inc
 

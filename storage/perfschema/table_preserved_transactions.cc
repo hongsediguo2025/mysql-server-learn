@@ -101,7 +101,7 @@ PFS_engine_table *table_preserved_transactions::create(
 }
 
 ha_rows table_preserved_transactions::get_row_count() {
-  return static_cast<ha_rows>(preserved_trx_snapshot(current_thd).size());
+  return static_cast<ha_rows>(preserved_trx_record_count());
 }
 
 table_preserved_transactions::table_preserved_transactions()

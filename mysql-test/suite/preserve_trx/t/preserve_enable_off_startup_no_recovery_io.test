@@ -1,0 +1,22 @@
+--source include/force_restart.inc
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+--exec mkdir -p "$MYSQLD_DATADIR/preserve"
+--exec printf stale > "$MYSQLD_DATADIR/preserve/off_path_orphan.binlog_cache.warm.9"
+--exec printf descriptor > "$MYSQLD_DATADIR/preserve/off_path_orphan.binlog_cache.warm.9.desc"
+--exec printf temp > "$MYSQLD_DATADIR/preserve/off_path_orphan.binlog_cache.warm.9.tmp"
+
+--let $restart_parameters= restart: --preserve-trx-enable=OFF
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
+SELECT @@global.preserve_trx_enable;
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+--exec test -e "$MYSQLD_DATADIR/preserve/off_path_orphan.binlog_cache.warm.9"
+--exec test -e "$MYSQLD_DATADIR/preserve/off_path_orphan.binlog_cache.warm.9.desc"
+--exec test -e "$MYSQLD_DATADIR/preserve/off_path_orphan.binlog_cache.warm.9.tmp"
+--exec rm -f "$MYSQLD_DATADIR/preserve/off_path_orphan.binlog_cache.warm.9" "$MYSQLD_DATADIR/preserve/off_path_orphan.binlog_cache.warm.9.desc" "$MYSQLD_DATADIR/preserve/off_path_orphan.binlog_cache.warm.9.tmp"
+
+SET GLOBAL preserve_trx_enable=ON;

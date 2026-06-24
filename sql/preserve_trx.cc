@@ -5727,6 +5727,7 @@ static bool preserve_trx_wait_target_timed_out(THD *thd,
 
 bool preserved_trx_begin_command_read(THD *thd) {
   if (thd == nullptr) return false;
+  if (!preserve_trx_is_enabled()) return true;
 
   uint64_t hard_deadline_us = 0;
   uint quiesced_wait_loops = 0;
@@ -5760,6 +5761,7 @@ bool preserved_trx_begin_command_read(THD *thd) {
 
 bool preserved_trx_command_read_is_idle(THD *thd) {
   if (thd == nullptr) return false;
+  if (!preserve_trx_is_enabled()) return false;
 
   uint64_t hard_deadline_us = 0;
   uint quiesced_wait_loops = 0;
@@ -5781,6 +5783,7 @@ bool preserved_trx_command_read_is_idle(THD *thd) {
 
 bool preserved_trx_end_idle_for_command_packet(THD *thd) {
   if (thd == nullptr) return false;
+  if (!preserve_trx_is_enabled()) return false;
 
   uint64_t hard_deadline_us = 0;
   uint quiesced_wait_loops = 0;
@@ -5803,6 +5806,7 @@ bool preserved_trx_end_idle_for_command_packet(THD *thd) {
 
 bool preserved_trx_end_command_read(THD *thd) {
   if (thd == nullptr) return false;
+  if (!preserve_trx_is_enabled()) return true;
 
   uint64_t hard_deadline_us = 0;
   uint quiesced_wait_loops = 0;
@@ -5824,6 +5828,7 @@ bool preserved_trx_end_command_read(THD *thd) {
 
 bool preserved_trx_wait_if_batch_session_quiesced(THD *thd) {
   if (thd == nullptr) return false;
+  if (!preserve_trx_is_enabled()) return false;
 
   uint64_t hard_deadline_us = 0;
   uint quiesced_wait_loops = 0;
@@ -5840,6 +5845,7 @@ bool preserved_trx_wait_if_batch_session_quiesced(THD *thd) {
 
 bool preserved_trx_reject_if_batch_session_drained(THD *thd) {
   if (thd == nullptr) return false;
+  if (!preserve_trx_is_enabled()) return false;
 
   if (preserve_trx_batch_state(thd) ==
       Preserve_trx_batch_thd_state::PRESERVED_DRAINED) {
@@ -5862,6 +5868,8 @@ bool preserved_trx_reject_if_batch_session_drained(THD *thd) {
 Preserve_trx_command_block_result preserved_trx_command_block_result(
     THD *thd, enum_sql_command sql_command) {
   if (thd == nullptr) return Preserve_trx_command_block_result::ALLOW;
+  if (!preserve_trx_is_enabled())
+    return Preserve_trx_command_block_result::ALLOW;
   if (preserve_trx_batch_state(thd) ==
       Preserve_trx_batch_thd_state::PRESERVED_DRAINED)
     return Preserve_trx_command_block_result::BLOCK_SESSION_DRAINED;
@@ -5926,6 +5934,8 @@ Preserve_trx_command_block_result preserved_trx_command_block_result(
 Preserve_trx_command_block_result preserved_trx_protocol_command_block_result(
     THD *thd, enum enum_server_command command) {
   if (thd == nullptr) return Preserve_trx_command_block_result::ALLOW;
+  if (!preserve_trx_is_enabled())
+    return Preserve_trx_command_block_result::ALLOW;
   if (preserve_trx_batch_state(thd) ==
       Preserve_trx_batch_thd_state::PRESERVED_DRAINED)
     return Preserve_trx_command_block_result::BLOCK_SESSION_DRAINED;
@@ -6069,6 +6079,7 @@ static bool preserved_trx_row_visible_for_account_internal(
 }
 
 Preserved_trx_view_rows preserved_trx_snapshot(THD *thd) {
+  if (!preserve_trx_is_enabled()) return {};
   preserved_trx_wait_recovery_complete();
   Security_context *sctx = thd != nullptr ? thd->security_context() : nullptr;
   const bool has_process_acl =
@@ -6121,6 +6132,7 @@ Preserved_trx_view_rows preserved_trx_snapshot(THD *thd) {
 }
 
 size_t preserved_trx_record_count() {
+  if (!preserve_trx_is_enabled()) return 0;
   preserved_trx_wait_recovery_complete();
 
   std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
@@ -7712,6 +7724,7 @@ static bool recover_preserved_snapshot(const std::string &dir,
 }
 
 bool preserved_trx_preflight_recoverability() {
+  if (!preserve_trx_is_enabled()) return false;
   if (srv_force_recovery > 0) return false;
 
   const std::string dir = normalize_dir(preserve_trx_default_dir());
@@ -7759,6 +7772,7 @@ bool preserved_trx_preflight_recoverability() {
 }
 
 bool preserved_temp_images_bootstrap_preamble() {
+  if (!preserve_trx_is_enabled()) return false;
   if (srv_force_recovery > 0) return false;
 
   const std::string dir = normalize_dir(preserve_trx_default_dir());
@@ -7871,6 +7885,11 @@ bool preserved_temp_images_bootstrap_preamble() {
 }
 
 bool preserved_trx_recover_all() {
+  if (!preserve_trx_is_enabled()) {
+    preserved_trx_mark_recovery_complete();
+    return false;
+  }
+
   const std::string dir = normalize_dir(preserve_trx_default_dir());
   auto store = create_preserved_trx_default_store(dir);
   const uint64_t recovery_anchor_wall_us = my_micro_time();

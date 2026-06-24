@@ -6276,13 +6276,15 @@ static int init_server_components() {
   }
   preserve_trx_set_enable_value(preserve_trx_enable);
 
-  if (!opt_initialize && !is_help_or_validate_option() &&
+  if (!opt_initialize && preserve_trx_is_enabled() &&
+      !is_help_or_validate_option() &&
       !preserve_trx_lock_warmcopy_cleanup_orphan_spill_files()) {
     LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
            "failed to clean orphan preserve lock warmcopy spill files");
   }
 
-  if (!opt_initialize && preserved_trx_preflight_recoverability()) {
+  if (!opt_initialize && preserve_trx_is_enabled() &&
+      preserved_trx_preflight_recoverability()) {
     unireg_abort(MYSQLD_ABORT_EXIT);
   }
 

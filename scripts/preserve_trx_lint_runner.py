@@ -45,6 +45,9 @@ LEGACY_LINT_RULE_IDS: Sequence[str] = (
 SOURCE_LINT_RULE_IDS: Sequence[str] = (
     *LEGACY_LINT_RULE_IDS,
     "carrier_read_no_follow_lint",
+    "batch_drain_lock_warmcopy_hook_coverage_lint",
+    "batch_drain_lock_warmcopy_no_partial_fallback_lint",
+    "preserve_trx_off_path_invasive_surface_lint",
     "preserve_sql_command_flags_lint",
 )
 
