@@ -95,8 +95,10 @@ my $row_convert = extract_function(
   $row_undo,
   qr/dberr_t\s+row_convert_impl_to_expl_if_needed\s*\(/,
   'row_convert_impl_to_expl_if_needed');
-die "partial rollback conversion must not propagate warmcopy freeze wait timeout/interruption into row_undo_step fatal\n"
-  unless $row_convert =~ /lock_rec_convert_active_impl_to_expl[\s\S]*if\s*\(\s*err\s*==\s*DB_LOCK_WAIT_TIMEOUT\s*\|\|\s*err\s*==\s*DB_INTERRUPTED\s*\)[\s\S]*return\s+DB_SUCCESS/s;
+die "partial rollback conversion must call the active implicit-to-explicit conversion helper\n"
+  unless $row_convert =~ /return\s+lock_rec_convert_active_impl_to_expl\s*\(/s;
+die "partial rollback conversion must not swallow native timeout/interruption as success\n"
+  if $row_convert =~ /DB_LOCK_WAIT_TIMEOUT[\s\S]{0,200}DB_INTERRUPTED[\s\S]{0,200}return\s+DB_SUCCESS/s;
 
 die "GUnit must cover wait success after thaw\n"
   unless $gunit =~ /WaitForThawReturnsSuccessAfterThaw/s &&

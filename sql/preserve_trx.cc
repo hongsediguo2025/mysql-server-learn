@@ -143,15 +143,20 @@ uint preserve_trx_lock_warmcopy_conversion_wait_timeout_ms = 30000;
 uint preserve_trx_parallel_preserve_threads = 0;
 extern ulong srv_force_recovery;
 
-static std::atomic<bool> g_preserve_trx_enable_cached{false};
+static std::atomic<bool> g_preserve_trx_enable_cached{true};
+static std::atomic<bool> g_preserve_trx_enable_cache_initialized{false};
 
 bool preserve_trx_is_enabled() {
+  if (!g_preserve_trx_enable_cache_initialized.load(std::memory_order_acquire)) {
+    return preserve_trx_enable;
+  }
   return g_preserve_trx_enable_cached.load(std::memory_order_acquire);
 }
 
 void preserve_trx_set_enable_value(bool enabled) {
   preserve_trx_enable = enabled;
   g_preserve_trx_enable_cached.store(enabled, std::memory_order_release);
+  g_preserve_trx_enable_cache_initialized.store(true, std::memory_order_release);
 }
 
 uint preserve_trx_auto_parallel_preserve_threads(uint hardware_threads) {

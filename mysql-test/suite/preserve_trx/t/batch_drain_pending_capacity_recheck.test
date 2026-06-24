@@ -1,4 +1,3 @@
---source include/have_debug_sync.inc
 --source include/not_log_bin.inc
 
 --disable_warnings
@@ -10,47 +9,34 @@ SET GLOBAL preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_pending_capacity(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
 
+# Keep this test scoped to the quiesced-target capacity recheck. Command
+# boundary/inflight races have dedicated coverage in
+# batch_drain_packet_before_dispatch, batch_drain_waits_inflight_statements and
+# batch_drain_all_pending_no_tokens.
 --connect(batch_pending_capacity_a,localhost,root,,test)
 --connection batch_pending_capacity_a
-SET DEBUG_SYNC =
-  'before_execute_sql_command SIGNAL batch_pending_capacity_a_ready WAIT_FOR continue_batch_pending_capacity_a';
---send START TRANSACTION; INSERT INTO t_batch_pending_capacity VALUES(1,10)
+START TRANSACTION;
+INSERT INTO t_batch_pending_capacity VALUES(1,10);
 
 --connect(batch_pending_capacity_b,localhost,root,,test)
 --connection batch_pending_capacity_b
-SET DEBUG_SYNC =
-  'before_execute_sql_command SIGNAL batch_pending_capacity_b_ready WAIT_FOR continue_batch_pending_capacity_b';
---send START TRANSACTION; INSERT INTO t_batch_pending_capacity VALUES(2,20)
+START TRANSACTION;
+INSERT INTO t_batch_pending_capacity VALUES(2,20);
 
 --connection default
-SET DEBUG_SYNC = 'now WAIT_FOR batch_pending_capacity_a_ready TIMEOUT 10';
-SET DEBUG_SYNC = 'now WAIT_FOR batch_pending_capacity_b_ready TIMEOUT 10';
 SET GLOBAL preserve_trx_batch_max_transactions=1;
 
 --connect(batch_pending_capacity_owner,localhost,root,,test)
 --connection batch_pending_capacity_owner
---send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
-
---connection default
-SET DEBUG_SYNC = 'now SIGNAL continue_batch_pending_capacity_a';
-SET DEBUG_SYNC = 'now SIGNAL continue_batch_pending_capacity_b';
-
---connection batch_pending_capacity_owner
 --error ER_PRESERVE_TRX_UNSUPPORTED
---reap
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 --disconnect batch_pending_capacity_owner
 
 --connection batch_pending_capacity_a
---disable_result_log
---reap
---enable_result_log
 COMMIT;
 --disconnect batch_pending_capacity_a
 
 --connection batch_pending_capacity_b
---disable_result_log
---reap
---enable_result_log
 ROLLBACK;
 --disconnect batch_pending_capacity_b
 

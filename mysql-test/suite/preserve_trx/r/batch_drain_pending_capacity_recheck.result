@@ -1,18 +1,12 @@
 DROP TABLE IF EXISTS t_batch_pending_capacity;
 SET GLOBAL preserve_trx_enable=ON;
 CREATE TABLE t_batch_pending_capacity(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
-SET DEBUG_SYNC =
-'before_execute_sql_command SIGNAL batch_pending_capacity_a_ready WAIT_FOR continue_batch_pending_capacity_a';
-START TRANSACTION; INSERT INTO t_batch_pending_capacity VALUES(1,10);
-SET DEBUG_SYNC =
-'before_execute_sql_command SIGNAL batch_pending_capacity_b_ready WAIT_FOR continue_batch_pending_capacity_b';
-START TRANSACTION; INSERT INTO t_batch_pending_capacity VALUES(2,20);
-SET DEBUG_SYNC = 'now WAIT_FOR batch_pending_capacity_a_ready TIMEOUT 10';
-SET DEBUG_SYNC = 'now WAIT_FOR batch_pending_capacity_b_ready TIMEOUT 10';
+START TRANSACTION;
+INSERT INTO t_batch_pending_capacity VALUES(1,10);
+START TRANSACTION;
+INSERT INTO t_batch_pending_capacity VALUES(2,20);
 SET GLOBAL preserve_trx_batch_max_transactions=1;
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
-SET DEBUG_SYNC = 'now SIGNAL continue_batch_pending_capacity_a';
-SET DEBUG_SYNC = 'now SIGNAL continue_batch_pending_capacity_b';
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 COMMIT;
 ROLLBACK;

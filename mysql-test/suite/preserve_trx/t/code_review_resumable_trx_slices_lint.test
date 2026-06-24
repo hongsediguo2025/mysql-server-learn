@@ -818,7 +818,7 @@ die "force recovery taint marker failure must retain snapshot evidence\n"
 my $preflight_pos = index($mysqld, 'preserved_trx_preflight_recoverability()');
 die "could not isolate startup preserve-trx preflight call\n"
   if $preflight_pos < 0;
-$mysqld =~ /if\s*\([^)]*preserved_trx_preflight_recoverability\s*\(\s*\)[^)]*\)\s*\{\s*unireg_abort/m
+$mysqld =~ /if\s*\([\s\S]{0,240}preserved_trx_preflight_recoverability\s*\(\s*\)[\s\S]{0,80}\)\s*\{\s*unireg_abort/m
   or die "could not isolate startup preserve-trx preflight condition\n";
 my $preflight_window = $&;
 die "startup preserve-trx preflight must run even when --skip-log-bin is used\n"
@@ -1464,7 +1464,7 @@ die "Slice 2 bootstrap temp orphan cleanup must route through Preserved_trx_stor
          $preserve =~ /delete_orphan_temp_table_sidecars_or_log\s*\(\s*store\.store\(\)\s*,\s*listing\s*\)/s;
 die "temporary tablespace bootstrap must skip force recovery before carrier scan\n"
   unless $preserve =~
-         /bool preserved_temp_images_bootstrap_preamble\s*\(\s*\)\s*\{\s*if\s*\(srv_force_recovery\s*>\s*0\)\s*return\s+false;\s*const std::string dir[\s\S]*create_preserved_trx_default_store/s;
+         /bool preserved_temp_images_bootstrap_preamble\s*\(\s*\)\s*\{\s*if\s*\(\s*!\s*preserve_trx_is_enabled\s*\(\s*\)\s*\)\s*return\s+false;\s*if\s*\(srv_force_recovery\s*>\s*0\)\s*return\s+false;\s*const std::string dir[\s\S]*create_preserved_trx_default_store/s;
 die "temporary tablespace bootstrap must snapshot-read headers before validating temp sidecars\n"
   unless $preserve =~
          /bool preserved_temp_images_bootstrap_preamble[\s\S]*store->read\s*\(\s*token\s*,\s*true\s*,\s*Preserved_trx_carrier::Payload_read_mode::SNAPSHOT_ONLY[\s\S]*validate_temp_sidecars_for_bootstrap/s &&
