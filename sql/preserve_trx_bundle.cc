@@ -1662,6 +1662,15 @@ bool count_prefixed_payload_is_structurally_valid(const std::string &payload,
   return true;
 }
 
+/*
+  Normalize and validate semantic TLVs after encode input assembly or decode.
+
+  The fixed metadata header is not enough to resume by itself; optional TLVs add
+  access mode, session state, lock payloads, external blob descriptors, and
+  legacy compatibility markers. This helper rejects duplicate/illegal TLV
+  combinations, folds valid TLV values back into metadata, and keeps explicit
+  legacy allowances local to the old snapshot readers.
+*/
 bool apply_bundle_semantics(std::vector<Preserve_snapshot_tlv> *tlvs,
                             Preserve_snapshot_metadata *metadata,
                             bool allow_legacy_no_deadline = false,
@@ -2315,6 +2324,11 @@ Preserve_snapshot_status encode_preserved_trx_bundle(
   std::copy(payload.begin(), payload.end(),
             bytes.begin() + kSnapshotHeaderLength);
 
+  /*
+    Authentication is computed over the final snapshot layout with mutable
+    authentication fields cleared. HMAC is written first, then CRC covers the
+    HMAC-bearing bytes with the CRC field zeroed.
+  */
   std::array<unsigned char, kHmacLength> digest{};
   if (hmac_sha256(context.hmac_key, bytes, &digest)) {
     return Preserve_snapshot_status::IO_ERROR;
@@ -2354,6 +2368,11 @@ Preserve_snapshot_status decode_preserved_trx_snapshot_bytes(
 
   std::vector<unsigned char> crc_bytes = snapshot_bytes;
   const uint32_t stored_crc = read_le32(crc_bytes, kCrcOffset);
+  /*
+    Decode mirrors encode: first prove the cheap transport checksum over the
+    HMAC-bearing snapshot, then clear the HMAC field and verify the keyed digest
+    over the authenticated metadata and payload.
+  */
   std::fill(crc_bytes.begin() + kCrcOffset,
             crc_bytes.begin() + kCrcOffset + kCrcLength, 0);
   if (my_checksum(0, crc_bytes.data(), crc_bytes.size()) != stored_crc) {

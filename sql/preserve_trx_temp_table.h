@@ -46,21 +46,30 @@ class Table;
 extern bool preserve_trx_temp_table_enable;
 
 enum class Temp_table_participant_state {
+  /* Participant found temp-table state that may need preserve handling. */
   DISCOVERED,
+  /* Baseline physical image or metadata capture is being built. */
   COPYING_BASELINE,
+  /* Tail metadata/history is being checked for supported shape/fail-closed. */
   APPLYING_JOURNAL,
+  /* Captured state is complete enough to build a preserve manifest. */
   READY,
+  /* Unsupported shape or incomplete history; preserve must fail closed. */
   DEGRADED,
+  /* Caller discarded this participant before publication. */
   ABANDONED,
+  /* Manifest/sidecars have been consumed or discarded. */
   FINALIZED
 };
 
 struct Temp_table_journal_record {
-  /*
-    Logical tail record for temp-table metadata and row-level changes that
-    occur after baseline discovery. Physical page images are carried by the
-    InnoDB sidecar path; this journal preserves SQL-visible ordering.
-  */
+	  /*
+	    Logical tail record for temp-table metadata and row-level changes that
+	    occur after baseline discovery. Physical page images are carried by the
+	    InnoDB sidecar path; preserve-time validation uses these records to prove
+	    whether history is complete and to reject unsupported row history before a
+	    manifest is built. They are not serialized as a resume-time replay log.
+	  */
   uint64_t seq{0};
   uint32_t table_ordinal{0};
   uint32_t generation{0};
@@ -79,6 +88,16 @@ struct Temp_table_journal_record {
   std::string payload;
 };
 
+/*
+  Phase-1 model for user temporary table warmcopy.
+
+  The participant tracks DDL-like temp-table events, row-history evidence,
+  savepoint barriers, and whether physical dirty-page capture has been armed. It
+  is not a durable artifact by itself; preserve later builds a manifest and
+  sidecars only if the history is complete and the table shape is still
+  supported. Row-history records currently protect fail-closed decisions; they
+  do not make arbitrary temp-DML replayable on resume.
+*/
 class Temp_table_warmcopy_participant {
  public:
   explicit Temp_table_warmcopy_participant(
@@ -91,6 +110,7 @@ class Temp_table_warmcopy_participant {
   const std::vector<Temp_table_journal_record> &journal() const {
     return m_journal;
   }
+  /* True when DDL-like or row-changing temp-table tail history exists. */
   bool has_row_history() const;
 
   void begin_baseline_copy();
@@ -136,11 +156,12 @@ class Temp_table_warmcopy_participant {
   static constexpr size_t kDefaultMaxTailBytes = 1024 * 1024;
 
  private:
-  struct Table_state {
-    /*
-      generation changes on DROP/TRUNCATE so a later row event for a reused
-      logical name cannot be applied to the previous temp-table incarnation.
-    */
+	  struct Table_state {
+	    /*
+	      TRUNCATE bumps the generation for the same table ordinal. DROP removes
+	      the table state entirely, so a later same-name CREATE receives a fresh
+	      ordinal and cannot inherit row events from the previous incarnation.
+	    */
     uint32_t table_ordinal{0};
     uint32_t generation{1};
     uint64_t next_row_sequence{1};
@@ -152,17 +173,32 @@ class Temp_table_warmcopy_participant {
   const Table_state *find_table(uint32_t table_ordinal) const;
   Temp_table_participant_state m_state{
       Temp_table_participant_state::DISCOVERED};
+  /*
+    History starts only after the participant has enough metadata to order row
+    and savepoint events. Any untracked change before that point degrades the
+    participant because the manifest would be missing part of the transaction.
+  */
   bool m_history_started{false};
   bool m_untracked_change_before_history{false};
+  /* Statement touch tracking lets commit/rollback hooks clear per-statement state. */
   bool m_current_statement_touched{false};
+  /*
+    Capture epoch readiness requires both SQL metadata mutation hooks and InnoDB
+    dirty-page capture. A baseline copy taken before both are armed is not
+    authoritative.
+  */
   bool m_dirty_page_capture_armed{false};
   bool m_metadata_mutation_capture_armed{false};
   bool m_capture_epoch_started{false};
   uint64_t m_capture_epoch_start_sequence{0};
+  /* Monotonic sequence for logical journal records. */
   uint64_t m_next_sequence{1};
+  /* Logical table ids remain stable across the journal for one participant. */
   uint32_t m_next_table_ordinal{1};
+  /* Tail budget bounds the amount of logical history inspected for support. */
   size_t m_max_tail_bytes{kDefaultMaxTailBytes};
   size_t m_tail_bytes{0};
+  /* Latest reason that made this participant unusable for warmcopy preserve. */
   std::string m_degraded_reason;
   std::vector<Table_state> m_tables;
   std::vector<Temp_table_journal_record> m_journal;
@@ -170,6 +206,7 @@ class Temp_table_warmcopy_participant {
 
 Temp_table_warmcopy_participant *preserve_trx_temp_table_get_participant(
     THD *thd);
+/* Session-level form of has_row_history(); includes DDL-like or row history. */
 bool preserve_trx_temp_table_has_row_history(THD *thd);
 Preserve_snapshot_status preserve_trx_temp_table_preflight_preserve(THD *thd);
 bool preserve_trx_temp_table_row_hooks_enabled();
@@ -225,6 +262,12 @@ void preserve_trx_temp_table_note_statement_commit(THD *thd);
 void preserve_trx_temp_table_note_statement_rollback(THD *thd);
 bool preserve_trx_temp_table_begin_capture_epoch(THD *thd);
 
+/*
+  Build the sealed physical image for one user temporary table from the initial
+  file copy plus buffer-pool overlays and dirty-page stream. max_rows is kept
+  for SQL-level budget compatibility but is applied by the InnoDB image path as
+  the dirty-page queue limit for the sidecar capture.
+*/
 bool preserve_trx_temp_table_build_baseline_image(
     THD *thd, TABLE *table, Temp_table_warmcopy_participant *participant,
     uint32_t table_ordinal, uint64_t max_rows, trx_t *trx = nullptr,
@@ -238,13 +281,33 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
     Preserve_snapshot_metadata *metadata);
 
 struct Preserve_trx_temp_table_resume_policy {
+  /*
+    Resume policy is computed from the manifest before claiming the preserved
+    transaction. It is a shape gate, not sidecar I/O validation: missing,
+    corrupt, or digest-mismatched sidecars are detected later when materializing
+    the image for resume. Unsupported shapes detected here remain retryable
+    because ownership has not changed yet.
+  */
   bool supported{true};
+  /* retryable means resume can report unsupported without consuming the token. */
   bool retryable{false};
+	  /*
+	    These two fields split "may claim the preserved trx" from "may mutate engine
+	    state". Unsupported manifest shapes, for example required no-redo undo
+	    sidecars that current SQL resume cannot replay, should fail before either
+	    boundary whenever possible.
+	  */
   bool may_claim_preserved_transaction{true};
   bool may_mutate_base_transaction{true};
 };
 
 struct Preserve_trx_temp_table_preclaim_decision {
+  /*
+    Preclaim decision is the narrow version of resume policy used by the SQL
+    resume path. It tells the caller whether it may claim/detach the preserved
+    trx before temp-table sidecars are materialized; it does not prove that the
+    sidecar file already exists or that its digest will validate.
+  */
   bool retryable_unsupported{false};
   bool claim_preserved_transaction{true};
   bool mutate_base_transaction{true};
@@ -256,11 +319,14 @@ enum class Preserve_trx_temp_table_materialize_source {
 };
 
 struct Preserve_trx_temp_table_materialize_plan {
-  /*
-    Resume chooses one materialization plan per snapshot. PHYSICAL_SIDECARS
-    means the SQL row journal is not replayed; the sidecar image and dict
-    binding are the source of truth.
-  */
+	  /*
+	    Resume chooses one materialization plan per snapshot. PHYSICAL_SIDECARS
+	    means the SQL row journal is not replayed; the sidecar image and dict
+	    binding are the source of truth. If requires_no_redo_undo_sidecars is true
+	    today, the plan is recognized but rejected before mutation; scans_sql_rows
+	    and replays_logical_row_journal document unsupported alternatives and must
+	    remain false for the physical-sidecar path.
+	  */
   Preserve_trx_temp_table_materialize_source source{
       Preserve_trx_temp_table_materialize_source::NONE};
   bool requires_sealed_image_sidecars{false};
@@ -276,6 +342,12 @@ struct Preserve_trx_temp_table_deserialized_dd {
 };
 
 struct Preserve_trx_temp_table_staged_open {
+  /*
+    table is owned by the staged-open list until linked=true, then by THD/TABLE
+    cleanup. tmp_table_def is released into TABLE_SHARE during link; unlinked
+    cleanup must delete it. binlog_drop_if_temp preserves the original table
+    drop-on-close semantics across resume.
+  */
   TABLE *table{nullptr};
   dd::Table *tmp_table_def{nullptr};
   bool binlog_drop_if_temp{false};

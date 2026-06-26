@@ -137,6 +137,18 @@ struct timeval;
 struct User_level_lock;
 struct YYLTYPE;
 
+/*
+  Per-THD state while a batch drain owns or observes the session.
+
+  NONE means the THD is not participating in the current drain generation. An
+  idle target can be marked QUIESCED by the drain owner during enumeration; a
+  target with a command already in flight is marked PENDING_QUIESCE until it
+  reaches a command boundary and can report QUIESCED or DRAINED_NO_TRANSACTION.
+  ATTACHING is the short window where preserve borrows the target THD. The
+  PRESERVED_DRAINED state keeps the target blocked after successful token
+  registration, and also after unresolved detach/cleanup failures where
+  ownership must remain visible instead of letting the session run again.
+*/
 enum class Preserve_trx_batch_thd_state {
   NONE,
   PENDING_QUIESCE,
@@ -1314,9 +1326,13 @@ class THD : public MDL_context_owner,
 #endif
   bool is_killable;
   /**
-    Non-zero while this THD is executing a statement that may create
-    transaction state or locks blocked by preserve-trx soft drain.
-    Protected by LOCK_thd_data.
+    Preserve/drain command-boundary state, protected by LOCK_thd_data.
+
+    risky_statement_depth marks a parsed statement known to create transaction
+    state or locks. unknown_query_depth is used both for COM_QUERY text before
+    parse classification and for the packet marker between get_command() and
+    dispatch. batch_generation ties this THD to one drain attempt so stale
+    quiesce/drained state is not reused by a later batch.
   */
   uint preserve_trx_inflight_risky_statement_depth{0};
   uint preserve_trx_inflight_unknown_query_depth{0};
@@ -1324,26 +1340,55 @@ class THD : public MDL_context_owner,
   Preserve_trx_batch_thd_state preserve_trx_batch_state{
       Preserve_trx_batch_thd_state::NONE};
   /**
-    Warm-copy participant id assigned by the preserve/drain coordinator while
-    this THD is admitted to an open warm-copy epoch. Protected by
-    LOCK_thd_data. The 8.0.22 port connects this field to the production
-    binlog warm-copy mirror and drain participant lifecycle.
+    Warmcopy participant id assigned by the preserve/drain coordinator while
+    this THD is admitted to an open warmcopy epoch. The id lets mirror callbacks
+    prove they belong to the current drain generation. Protected by
+    LOCK_thd_data.
   */
   uint preserve_trx_warmcopy_participant_id{0};
   /**
-    Optional user temporary-table preserve participant. The 8.0.22 port
-    connects this state to the user temporary-table image/rebind runtime; temp
-    row-history/no-redo undo cases still fail closed before a durable token is
-    generated. Protected by LOCK_thd_data where it is read together with
+    Optional user temporary-table preserve participant. It owns SQL-side
+    temp-table history and coordinates with the InnoDB image/rebind runtime;
+    temp row-history/no-redo undo cases still fail closed before a durable token
+    is generated. Protected by LOCK_thd_data where it is read together with
     per-session preserve/drain state.
   */
   Temp_table_warmcopy_participant *preserve_trx_temp_table_participant{
       nullptr};
+  /**
+    Hot-path predicate for temporary-table hooks. The pointer above is protected
+    by LOCK_thd_data; this flag lets row/metadata hooks avoid taking that mutex
+    for sessions that have never created a participant.
+  */
   std::atomic<bool> preserve_trx_temp_table_has_participant{false};
+  /**
+    Sticky fail-closed marker for temp-table activity that could not be ordered
+    in the participant journal. Preserve preflight rejects such sessions before
+    publishing a token.
+  */
   std::atomic<bool> preserve_trx_temp_table_untracked_change{false};
+  /**
+    true after the transaction-start sampler has decided whether a no-redo undo
+    baseline exists. Preserve uses the baseline to detect temp-table undo tail
+    changes that current resume support cannot reconnect safely; false means
+    callers must not interpret the present/top fields yet.
+  */
   bool preserve_trx_temp_table_no_redo_baseline_valid{false};
+  /**
+    true when the sampled session actually had a no-redo undo stream to compare
+    against; false with valid=true means "sampled and absent".
+  */
   bool preserve_trx_temp_table_no_redo_baseline_present{false};
+  /**
+    Top value sampled from the active no-redo undo stream when present=true.
+    The value is meaningful only while valid is true.
+  */
   uint64_t preserve_trx_temp_table_no_redo_baseline_top{0};
+  /**
+    Participant identity cleared with the THD preserve state. The current
+    temp-table hooks use the has_participant fast path above rather than this
+    field as an admission key.
+  */
   uint preserve_trx_temp_table_participant_id{0};
   /**
     Mutex protecting access to current_mutex and current_cond.

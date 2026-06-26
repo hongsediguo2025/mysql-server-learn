@@ -75,10 +75,13 @@ this program; if not, write to the Free Software Foundation, Inc.,
 namespace {
 
 /*
-  Dirty page streams track phase-1 copies of user temporary tables. The maps are
-  keyed by the original temporary tablespace id; the atomic buckets provide a
-  cheap negative test for hot page-write paths before taking the global stream
-  mutex.
+	  Dirty page streams track phase-1 copies of user temporary tables. The same
+	  admission and byte-accounting mutex also protects no-redo undo page streams.
+	  Dirty-page maps are keyed by original temporary tablespace id; no-redo undo
+	  maps are keyed by rseg_space_id, while each descriptor carries the full
+	  page/slot rollback-segment identity for validation. The atomic buckets provide
+	  a cheap negative test for hot page-write paths before taking the global stream
+	  mutex.
 */
 std::mutex trx_preserve_temp_dirty_page_streams_mutex;
 std::atomic<uint32_t> trx_preserve_temp_active_dirty_page_streams{0};
@@ -2934,8 +2937,9 @@ dberr_t trx_preserve_temp_space_image_apply_dirty_page_stream(
 
   /*
     Applying the dirty stream folds phase-1 page writes over the baseline image.
-    Capture sequence is retained in the images so later streamed builders can
-    reproduce the same last-writer-wins order.
+    Each page keeps only its latest image; capture_sequence records recency for
+    diagnostics and future streaming builders, while the final sidecar applies
+    the latest page image by page number instead of replaying every version.
   */
   return trx_preserve_temp_space_image_apply_dirty_page_images(
       descriptor, descriptor->dirty_pages);
@@ -3190,8 +3194,8 @@ dberr_t trx_preserve_temp_space_image_capture_dirty_page(
 
   /*
     Record only the latest image for each page, but bump the capture sequence on
-    every update. This gives the final replay a stable last-writer-wins view
-    without keeping every intermediate page version.
+    every update. The final sidecar still applies one image per page number; the
+    sequence records recency without keeping every intermediate page version.
   */
   auto existing = std::find_if(
       descriptor->dirty_pages.begin(), descriptor->dirty_pages.end(),

@@ -102,17 +102,26 @@ struct lock_warmcopy_record_shard_key_less {
 
 struct lock_warmcopy_record_shard_state_t {
   lock_warmcopy_record_shard_key_t key;
+  /* Current explicit record-lock bitmap for this target/table/index/page. */
   std::vector<unsigned char> normalized_bitmap;
+  /*
+    Per-heap record identity captured by gated image hooks or by payload seed
+    parsing. Bitmap set/reset hooks remain thin and do not build these images.
+  */
   std::map<uint32_t, lock_warmcopy_record_image_entry_t> record_images;
   uint32_t set_bit_count{0};
   uint32_t shard_state_flags{0};
+  /* Nonzero means at least one set bit could not be tied to a record image. */
   uint32_t missing_record_image_count{0};
+  /* Sticky per-shard invalid marker; seal must reject or route to fallback. */
   bool forced_invalid{false};
+  /* Changes whenever bitmap/object state mutates, even if final bits match. */
   uint64_t mutation_generation{0};
   uint64_t implicit_exclusion_generation{0};
   uint64_t journal_cursor{0};
   uint64_t last_applied_journal_seq{0};
   uint64_t journal_bytes{0};
+  /* Rolling payload fingerprint used for cheap phase-boundary comparisons. */
   uint64_t rolling_fingerprint[4]{};
   std::string last_diagnostic_reason;
 };
@@ -125,13 +134,24 @@ struct lock_warmcopy_record_store_partition_t {
   std::mutex mutex;
   std::map<uint64_t, lock_warmcopy_record_shard_map_t> store_by_target;
   std::map<uint64_t, uint64_t> journal_sequence_by_target;
+  /*
+    Expected sequence tracks whether every hook delta for a target was observed
+    in order. A gap makes the target invalid even if the reconstructed bitmap is
+    otherwise parseable.
+  */
   std::map<uint64_t, uint64_t> expected_delta_sequence_by_target;
+  /*
+    Target-level invalidation diagnostic. Once present, SQL must route the target
+    through live export or reject it; the string is best-effort reporting detail,
+    not a correctness decision.
+  */
   std::map<uint64_t, std::string> target_invalid_reason_by_target;
 };
 /*
-  The record mirror is partitioned by target transaction id. Native lock code
+  The record mirror is partitioned by target SQL thread id. Native lock code
   calls thin hooks; all heavy ordering, payload and diagnostic state stays in
-  this preserve-only store.
+  this preserve-only store. SQL rebuilds and clears the final target set for
+  each drain epoch so thread-id reuse cannot carry old state into a later drain.
 */
 constexpr size_t k_lock_warmcopy_record_store_partition_count = 64;
 std::array<lock_warmcopy_record_store_partition_t,
@@ -459,6 +479,11 @@ void add_record_shard_journal_bytes_locked(
 }
 
 uint64_t record_target_id_for_trx(const trx_t *trx) {
+  /*
+    Normal SQL-owned transactions are partitioned by SQL thread id. A missing
+    mysql_thd can only be reported in the default bucket, which is useful for
+    diagnostics but cannot form a resumable per-session warm artifact.
+  */
   if (trx == nullptr || trx->mysql_thd == nullptr) {
     return k_lock_warmcopy_default_target_id;
   }
@@ -931,6 +956,13 @@ bool record_store_metadata_for_target_locked(
     uint32_t *dirty_shard_count,
     uint32_t *lock_count,
     bool *lock_count_overflow) {
+  /*
+    Metadata seal samples only the store shape: shard keys, generations,
+    invalid/dirty flags, journal cursors, and aggregate lock counts. It does not
+    export record images or payload bytes. Payload export later rechecks target
+    invalid markers and per-shard state before returning bytes, so callers must
+    keep both the metadata fence and payload status in the route decision.
+  */
   if (fence == nullptr) return false;
   *fence = lock_warmcopy_record_store_fence_t{};
   if (journal_bytes != nullptr) *journal_bytes = 0;
@@ -1758,9 +1790,12 @@ void lock_warmcopy_trx_conversion_freeze(trx_lock_t *trx_lock,
   if (trx_lock == nullptr) return;
 
   /*
-    Freezing closes the implicit-to-explicit conversion window for a target
-    until prepare observes the same fence. Other sessions that collide with the
-    target must wait, retry, or return their native NOWAIT/SKIP LOCKED result.
+    Freezing closes the implicit-to-explicit conversion window for a target. SQL
+    performs a final fence check before prepare, but the freeze itself remains
+    active until the preserve path explicitly thaws it after prepare/snapshot
+    cleanup has passed the ownership boundary. Other sessions that collide with
+    the target must wait, retry, or return their native NOWAIT/SKIP LOCKED
+    result, and every conversion attempt marks the fence as changed.
   */
   DEBUG_SYNC_C("lock_warmcopy_conversion_freeze_before_broadcast");
   trx_lock->lock_warmcopy_conversion_frozen = true;

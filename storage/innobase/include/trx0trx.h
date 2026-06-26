@@ -715,9 +715,11 @@ struct trx_lock_t {
   It is read with exclusive lock_sys latch. */
   std::atomic<ulint> n_rec_locks;
 
-  /** True while Preserve/Resume lock warmcopy is between final fence sampling
-  and prepare completion, during which implicit-to-explicit conversion for this
-  transaction must not install new explicit record locks.
+  /** True while Preserve/Resume lock warmcopy has frozen this transaction's
+  record-lock conversion window. The freeze spans prepare and later preserve
+  ownership checks until SQL explicitly thaws it. It prevents
+  implicit-to-explicit record-lock conversion from installing new explicit
+  record locks; it is not a freeze for table locks, MDL, or other lock families.
   Protected by trx->mutex. */
   bool lock_warmcopy_conversion_frozen;
 

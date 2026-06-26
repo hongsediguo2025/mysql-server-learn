@@ -147,6 +147,21 @@ enum class Preserve_trx_manager_state {
     Public manager state is intentionally coarse. Detailed participant progress
     is reported through drain observations so command admission can depend on a
     small stable state machine.
+
+    Active states:
+      IDLE                      no preserve/drain owner
+      DISABLING                 preserve feature is being disabled
+      SOFT_DRAINING             single preserve is draining other active trx
+      WARMCOPY_DRAINING         phase-1 participants may capture live work
+      WARMCOPY_CLOSING          command admission is closing for phase 2
+      BATCH_DRAINING            batch admission/target-quiesce/preserve window
+      EXPIRED_ROLLBACK          expired token reaper owns manager work
+      DRAIN_CLEANUP_FAILED      cleanup left observable state for operators
+      SHUTDOWN_REQUESTED        shutdown/token-delivery handoff is in progress
+
+    HARD_DRAINING and SNAPSHOTTING are retained for state compatibility and
+    diagnostics; current batch preserve does not use them as manager-level
+    transition points.
   */
   IDLE,
   DISABLING,
@@ -181,6 +196,14 @@ enum class Preserve_trx_delivery_mode {
   BATCH_MANAGER_DELIVERY
 };
 
+/*
+  High-level stage of a single target preserve.
+
+  The stage is stored in Preserve_trx_preserve_result so failure reporting can
+  say where ownership stopped: before engine prepare, after detach, during
+  snapshot write, or after the token became visible. Cleanup rules depend on
+  that durable boundary.
+*/
 enum class Preserve_trx_preserve_stage {
   VALIDATION,
   BINLOG_PREFLIGHT,
@@ -195,14 +218,22 @@ enum class Preserve_trx_preserve_stage {
 
 struct Preserve_trx_preserve_result {
   /*
-    Per-target timing fields are measured inside the blocked phase. They are
-    kept in the result object until the batch drain aggregator records both
-    functional outcome and SLO diagnostics for the same target.
+    Result and ownership boundary for one target. token is allocated before
+    engine prepare so later stages can name the snapshot, but it is not
+    necessarily visible or resumable. failure_reason/stage and the cleanup flags
+    describe where preserve stopped; durable_point_crossed means the engine or
+    temp-only prepare boundary was crossed, not that a snapshot has been
+    published.
   */
   std::string token;
   const char *failure_reason{nullptr};
   Preserve_trx_preserve_stage stage{
       Preserve_trx_preserve_stage::VALIDATION};
+  /*
+    Timings below are per-target measurements. The drain path aggregates them to
+    explain where the blocked window was spent; single-transaction preserve uses
+    the same fields for diagnostics.
+  */
   uint64_t binlog_preflight_us{0};
   uint64_t lock_preflight_us{0};
   uint64_t lock_preflight_read_view_us{0};
@@ -224,27 +255,46 @@ struct Preserve_trx_preserve_result {
   uint64_t snapshot_write_store_encode_us{0};
   uint64_t snapshot_write_store_write_snapshot_us{0};
   uint64_t record_register_us{0};
+  /* Live-export fallback counters used to flag non-warmcopy phase-2 work. */
   uint64_t phase2_savepoint_live_export_target_count{0};
+  /*
+    Ownership flags drive cleanup after partial failure. durable_point_crossed
+    means engine/temp prepare crossed a boundary that may require explicit
+    rollback/reactivation; detached_from_original_thd means the original session
+    no longer owns the engine trx.
+  */
   bool durable_point_crossed{false};
   bool detached_from_original_thd{false};
   bool reattached_to_original_thd{false};
+  /* Cleanup outcome flags keep ambiguous prepared-trx ownership observable. */
   bool cleanup_completed_after_detach_failure{false};
   bool cleanup_failed_after_reattach{false};
   bool left_preserved_after_cleanup_failure{false};
+  /* True when binlog cache semantics were logged into the snapshot. */
   bool logged_binlog_cache{false};
 };
 
+/*
+  Row shape used by SHOW PRESERVED TRANSACTIONS and P_S population.
+
+  The row is intentionally denormalized: it combines snapshot metadata,
+  recovered in-memory state, lock/binlog/temp summaries, and the last error so a
+  DBA can diagnose a token without reading carrier files directly.
+*/
 struct Preserved_trx_view_row {
+  /* Token and account fields after redaction/visibility filtering. */
   std::string token;
   std::string user;
   std::string host;
   std::string owner_user;
   std::string owner_host;
+  /* Lifecycle and deadline fields shown to operators. */
   std::string state;
   std::string created_at;
   std::string expires_at;
   ulonglong recovered_count{0};
   ulonglong age_seconds{0};
+  /* Transaction semantic summary restored or validated by resume. */
   std::string schema_name;
   std::string isolation;
   ulonglong mod_tables_count{0};
@@ -253,6 +303,7 @@ struct Preserved_trx_view_row {
   bool has_read_view{false};
   ulonglong rv_low_limit_no{0};
   ulonglong savepoint_count{0};
+  /* Binlog and warmcopy state for logged transactions. */
   std::string binlog_state;
   bool wrote_to_cache{false};
   ulonglong binlog_cache_size{0};
@@ -261,6 +312,7 @@ struct Preserved_trx_view_row {
   bool global_log_bin{false};
   std::string gtid_next;
   bool autoinc_lock_owned{false};
+  /* Temporary table sidecar summary and last error context. */
   std::string temp_table_state;
   ulonglong temp_image_bytes{0};
   ulonglong temp_undo_bytes{0};
@@ -318,6 +370,16 @@ bool preserved_trx_expired_reaper_claim_releases_manager_state_for_unit_test(
     const std::string &token);
 bool preserved_trx_expired_reaper_empty_claim_keeps_manager_idle_for_unit_test(
     const std::string &token);
+/*
+  Command-boundary tracking for batch drain.
+
+  begin_command_read marks the protocol command-read window before get_command()
+  returns a concrete packet. mark_inflight_command_packet records that packet
+  after it is read, and consume_inflight_command_packet consumes the marker
+  before statement dispatch. Risky/unknown query markers are statement-scope
+  guards cleared by the RAII/end helpers. Drain uses these marks to wait for
+  already admitted work and to reject later work deterministically.
+*/
 bool preserved_trx_begin_command_read(THD *thd);
 bool preserved_trx_command_read_is_idle(THD *thd);
 bool preserved_trx_end_idle_for_command_packet(THD *thd);
@@ -384,6 +446,14 @@ bool preserve_trx_preserve_attached_transaction(
     bool debug_fail_temp_only_prepare = false,
     bool defer_snapshot_directory_fsync = false);
 
+/*
+  SQL command for preserving the current transaction before shutdown.
+
+  The command stores parser options only. Validation, timeout resolution,
+  binlog/lock/temp-table export, engine prepare, and token delivery all happen
+  in the preserve service so batch drain and single-transaction preserve share
+  one correctness path.
+*/
 class Sql_cmd_prepare_shutdown_preserve_transaction final : public Sql_cmd {
  public:
   explicit Sql_cmd_prepare_shutdown_preserve_transaction(
@@ -400,6 +470,15 @@ class Sql_cmd_prepare_shutdown_preserve_transaction final : public Sql_cmd {
   Preserve_trx_options m_options;
 };
 
+/*
+  SQL command for batch drain preserve.
+
+  The command starts the drain service, which enumerates eligible sessions,
+  opens optional warmcopy participants, quiesces targets, preserves each target,
+  records token outcomes through BATCH_MANAGER_DELIVERY for post-restart visibility,
+  and requests shutdown after auditing the preserved records. Tokens are not
+  returned to each target client connection by this command.
+*/
 class Sql_cmd_drain_transactions_preserve final : public Sql_cmd {
  public:
   explicit Sql_cmd_drain_transactions_preserve(
@@ -416,6 +495,14 @@ class Sql_cmd_drain_transactions_preserve final : public Sql_cmd {
   Preserve_trx_options m_options;
 };
 
+/*
+  SQL command for resuming one durable token.
+
+  The token is an opaque durable resume handle, but possession alone is not
+  authorization. execute() rechecks token ownership, RESUME_ANY privilege, object
+  privileges, binlog mode, and session eligibility before importing SQL/InnoDB
+  state and attaching the preserved transaction to the current THD.
+*/
 class Sql_cmd_resume_preserved_transaction final : public Sql_cmd {
  public:
   explicit Sql_cmd_resume_preserved_transaction(LEX_CSTRING token)
@@ -435,6 +522,13 @@ class Sql_cmd_resume_preserved_transaction final : public Sql_cmd {
   LEX_CSTRING m_token;
 };
 
+/*
+  SQL command for operational visibility.
+
+  It reads the in-memory preserved-record view rather than parsing snapshot files
+  directly, so recovered, failed, expired, and cleanup-pending tokens are shown
+  through the same visibility and redaction rules.
+*/
 class Sql_cmd_show_preserved_transactions final : public Sql_cmd {
  public:
   enum_sql_command sql_command_code() const override {

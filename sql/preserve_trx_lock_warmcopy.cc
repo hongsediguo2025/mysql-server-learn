@@ -1233,6 +1233,13 @@ uint32_t effective_lock_warmcopy_seal_thread_count(uint32_t configured,
 
 class Lock_warmcopy_target_fence_sampler final : public Do_THD_Impl {
  public:
+  /*
+    Quiesced/final target sampler for lock warmcopy. Record export may be
+    skipped for targets that already have a pre-seeded record-store candidate or
+    a trusted prebuilt record blob. Phase 2 still samples table locks, MDL
+    descriptors, and the transaction lock fence live so the route decision sees
+    one final target boundary before prepare.
+  */
   explicit Lock_warmcopy_target_fence_sampler(
       const std::vector<uint64_t> &target_thread_ids, uint32_t max_lock_count,
       const std::set<uint64_t> &skip_record_export_thread_ids = {})
@@ -1452,6 +1459,12 @@ bool preserve_trx_lock_warmcopy_cleanup_orphan_spill_files() {
   DBUG_EXECUTE_IF("preserve_trx_lock_warmcopy_spill_orphan_cleanup_failure",
                   { return false; });
 
+  /*
+    Spill cleanup is scoped to this instance's warmcopy scratch root. The owner
+    marker prevents deleting a foreign root, and only drain-local spill files are
+    removed here; durable token snapshots and adopted external blobs live under
+    the carrier cleanup contract.
+  */
   const std::string root = lock_warmcopy_spill_root_dir();
   MY_DIR *dir = my_dir(root.c_str(), MYF(MY_DONT_SORT | MY_WANT_STAT));
   if (dir == nullptr) return !directory_exists(root);
@@ -2289,7 +2302,7 @@ void Preserve_trx_lock_warmcopy_drain_participant::
   cleanup_spill_paths(&m_spill_paths);
   /*
     On the successful DRAIN ... PRESERVE path the server immediately enters
-    shutdown after finalize. The record warm-copy store is process-local and
+	    shutdown after finalize. The record warmcopy store is process-local and
     no longer part of the durable preserve artifact, so walking huge per-target
     maps here only extends phase-2 pause. Keep abort/failure paths explicit.
   */

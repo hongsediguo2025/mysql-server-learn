@@ -76,9 +76,13 @@ inline constexpr size_t preserve_trx_bundle_snapshot_header_length() {
 }
 
 enum class Preserve_snapshot_binlog_state : uint8_t {
+  /* Binary logging was globally off; no trx cache is expected on resume. */
   GLOBAL_OFF_NO_CACHE = 1,
+  /* This session did not log the transaction, although the server may log. */
   SESSION_OFF_NO_CACHE = 2,
+  /* The session logged, but the trx cache was empty at the preserve boundary. */
   LOGGED_EMPTY = 3,
+  /* The session logged and an inline or external trx cache must be imported. */
   LOGGED_WITH_CACHE = 4
 };
 
@@ -96,23 +100,61 @@ struct Preserve_snapshot_modified_table_name {
   std::string table_name;
 };
 
+/*
+  Durable semantic header for a preserved transaction.
+
+  Metadata is the resume contract, not just display information. It captures the
+  SQL session state, binlog cache state, InnoDB read view, lock payload families,
+  savepoints, and temp-table manifest that must be revalidated before a token is
+  allowed to become an active transaction again. Large byte ranges may be stored
+  in external blobs; metadata stores the semantic flags that make those bytes
+  meaningful, while blob descriptors live in authenticated TLVs and are exposed
+  through Preserved_trx_bundle::blob_descriptors after decode.
+*/
 struct Preserve_snapshot_metadata {
+  /* Token identity, ownership, default schema, and wall-clock lifetime. */
   std::string token;
   std::string owner_user;
   std::string owner_host;
   std::string schema_name;
   uint64_t created_at_us{0};
   uint64_t expires_at_us{0};
+  /*
+    Startup recovery increments this after a snapshot is decoded and admitted
+    for semantic recovery. Corrupt snapshots fail before this counter is bumped;
+    the counter limits repeated recovery attempts for snapshots that were
+    readable but could not complete recovery/resume handling. The in-memory bump
+    happens during recovery admission; the authenticated header rewrite happens
+    only after claim, so early reject/rollback may not persist a new count.
+  */
   uint32_t recovered_count{0};
+  /*
+    Binlog state is split into environment flags and cache-content flags.
+    Resume must restore both the bytes and the write semantics that produced
+    them; for example, an empty logged cache is different from a session that
+    had logging disabled.
+  */
   Preserve_snapshot_binlog_state binlog_state{
       Preserve_snapshot_binlog_state::GLOBAL_OFF_NO_CACHE};
   bool wrote_to_cache{false};
+  /*
+    Logging environment at preserve time. session_sql_log_bin is the session
+    setting, option_bin_log is the THD option bit view, and global_log_bin is the
+    server mode. Resume compares these with the current server before importing
+    cache bytes.
+  */
   bool session_sql_log_bin{false};
   bool option_bin_log{false};
   bool global_log_bin{false};
+  /* Byte length and modified table summary for the transaction cache. */
   uint64_t binlog_cache_size{0};
   uint32_t mod_tables_count{0};
   std::vector<Preserve_snapshot_modified_table_name> modified_table_names;
+  /*
+    Cache-content semantics. The event counter and with_* flags distinguish an
+    empty logged cache from a cache that contains statements, row events, start
+    or end markers, or an XID-bearing boundary.
+  */
   uint64_t binlog_cache_event_counter{0};
   bool binlog_cache_immediate{false};
   bool binlog_cache_with_xid{false};
@@ -121,22 +163,45 @@ struct Preserve_snapshot_metadata {
   bool binlog_cache_with_start{false};
   bool binlog_cache_with_end{false};
   bool binlog_cache_with_content{false};
+  /*
+    Import/compatibility state for rollback/savepoint-aware cache shapes. Current
+    preserve export accepts only a clean statement boundary and rejects an active
+    prev_position; savepoint rollback details that are supported today are carried
+    by savepoint payloads and the cache_state_map.
+  */
   bool binlog_cache_has_prev_position{false};
   uint64_t binlog_cache_prev_position{0};
   bool binlog_cache_has_compression_session_state{false};
   bool binlog_cache_compression{false};
   uint32_t binlog_cache_compression_type{0};
   uint32_t binlog_cache_compression_level_zstd{0};
+  /* True when the body came from a sealed warm external blob descriptor. */
   bool binlog_cache_warmcopy{false};
+  /*
+    Live capture and full-read hydration buffer for binlog cache bytes. Durable
+    logged cache content is normally named by a descriptor TLV plus an external
+    blob; metadata keeps the size, GTID, logging flags, compression state, and
+    warmcopy semantics that make those bytes meaningful.
+  */
   std::string binlog_cache_payload;
   std::string binlog_gtid_next;
   std::string binlog_owned_gtid;
   bool has_binlog_gtid_mode{false};
   uint8_t binlog_gtid_mode{0};
+  /*
+    Transaction access mode and isolation are captured separately for the active
+    transaction and session defaults. Resume must restore both so COMMIT/ROLLBACK
+    and later statements see the same SQL contract as before preserve.
+  */
   uint8_t tx_isolation{2};
   uint8_t session_tx_isolation{2};
   bool tx_read_only{false};
   bool session_tx_read_only{false};
+  /*
+    Extended session state contains statement-visible execution context. It is
+    optional for legacy snapshots, but new snapshots set the flag when the fields
+    below were captured and should be restored.
+  */
   bool has_extended_session_state{false};
   uint64_t sql_mode{0};
   std::string time_zone_name;
@@ -151,25 +216,57 @@ struct Preserve_snapshot_metadata {
   bool autoinc_lock_owned{false};
   bool has_forced_insert_id{false};
   uint64_t forced_insert_id{0};
+  /*
+    Read-view fields preserve consistent-read visibility. rv_low_limit_no is
+    exposed for observability, while read_view_payload carries the engine-level
+    import body used during resume.
+  */
   bool has_read_view{false};
   uint64_t rv_low_limit_no{0};
   std::string read_view_payload;
+  /*
+    Lock payload families must represent one consistent target state. If
+    warmcopy invalidates any required family, preserve must discard the whole
+    warm artifact and use live export or reject instead of mixing payloads.
+  */
   std::string record_locks_payload;
   std::string predicate_locks_payload;
   std::string table_locks_payload;
   std::string mdl_descriptors_payload;
   std::string user_vars_payload;
+  /* SQL savepoints and InnoDB savepoints are both needed for ROLLBACK TO. */
   uint32_t savepoint_count{0};
   std::string sql_savepoints_payload;
   std::string innodb_savepoints_payload;
+  /*
+    Temp-table manifest names physical sidecars and DD/dict bindings. Its
+    presence changes resume ordering because sidecars may need to be materialized
+    before the preserved trx is claimed.
+  */
   std::string temp_table_manifest_payload;
 };
 
+/*
+  Generic extension record inside the snapshot body.
+
+  TLVs let newer versions add optional semantic sections without changing the
+  fixed metadata layout. Unknown or malformed required semantics must still be
+  rejected by decode/validation; this structure is only the transport envelope.
+*/
 struct Preserve_snapshot_tlv {
   uint16_t tag{0};
   std::string value;
 };
 
+/*
+  Binlog-cache snapshot after SQL/binlog validation.
+
+  cache_payload is the live-export/in-memory representation. Durable snapshots
+  write logged cache bytes through a descriptor TLV and external blob, or adopt a
+  prebuilt warmcopy blob. The flags preserve the original cache meaning so
+  resume can restore logged transaction state without inferring it from raw
+  bytes alone.
+*/
 struct Mysql_binlog_preserve_snapshot {
   std::string cache_payload;
   std::string gtid_next;
@@ -195,21 +292,43 @@ struct Mysql_binlog_preserve_snapshot {
 static constexpr const char kPreservedTrxBlobBinlogCache[] = "binlog_cache";
 static constexpr const char kPreservedTrxBlobRecordLocks[] = "record_locks";
 
+/* Descriptor stored in the snapshot for a payload body outside the snapshot. */
 struct Preserved_trx_external_blob_descriptor {
   std::string name;
   uint64_t size{0};
   std::array<unsigned char, kPreservedTrxSha256Length> digest{};
 };
 
+/*
+  External blob passed to the carrier during snapshot build.
+
+  prebuilt=true means the bytes were already written by a warmcopy participant
+  and should be adopted atomically under the final token name. prebuilt=false
+  means the carrier still owns the write of payload to durable storage.
+*/
 struct Preserved_trx_external_blob {
+  /* Logical blob family name, such as binlog_cache or record_locks. */
   std::string name;
+  /* Inline body used when prebuilt is false. */
   std::string payload;
   Preserved_trx_external_blob_descriptor descriptor;
+  /*
+    Prebuilt bodies were created before snapshot write by a warmcopy provider.
+    warmcopy_id/epoch locate the scratch artifact that must be adopted or
+    discarded as one unit.
+  */
   bool prebuilt{false};
   std::string warmcopy_id;
   uint64_t warmcopy_epoch{0};
 };
 
+/*
+  Warmcopy-produced binlog cache body and the metadata needed to adopt it.
+
+  The warmcopy_id/epoch identify an already written scratch artifact. size and
+  digest become the snapshot descriptor; metadata carries semantic flags and
+  must not contain an inline cache_payload for the same body.
+*/
 struct PrebuiltBinlogCacheBlob {
   std::string warmcopy_id;
   std::string name{kPreservedTrxBlobBinlogCache};
@@ -219,6 +338,7 @@ struct PrebuiltBinlogCacheBlob {
   Mysql_binlog_preserve_snapshot metadata;
 };
 
+/* Warmcopy-produced record-lock body for descriptor-only snapshot storage. */
 struct PrebuiltRecordLocksBlob {
   std::string warmcopy_id;
   std::string name{kPreservedTrxBlobRecordLocks};
@@ -227,6 +347,13 @@ struct PrebuiltRecordLocksBlob {
   std::array<unsigned char, kPreservedTrxSha256Length> digest{};
 };
 
+/*
+  Provider used by preserve to consume a binlog warmcopy artifact.
+
+  The provider boundary prevents preserve_trx.cc from knowing the storage layout
+  of warm external blobs. It can ask whether a THD has a candidate, finalize that
+  candidate for a token, or discard it when the preserve route falls back.
+*/
 class PreserveBinlogBlobProvider {
  public:
   virtual ~PreserveBinlogBlobProvider() = default;
@@ -238,25 +365,47 @@ class PreserveBinlogBlobProvider {
                                     const PrebuiltBinlogCacheBlob &blob) = 0;
 };
 
+/*
+  In-memory bundle before it is encoded by the snapshot codec.
+
+  The bundle is intentionally split into metadata, TLVs, and external blobs so
+  callers can validate semantic state separately from durable file placement.
+  owns_current_temp_sidecars tells the carrier that temp sidecars sealed earlier
+  for this token are allowed during the pre-write conflict check.
+*/
 struct Preserved_trx_bundle {
   Preserve_snapshot_metadata metadata;
   std::vector<Preserve_snapshot_tlv> tlvs;
   std::vector<Preserved_trx_external_blob> external_blobs;
+  /*
+    Builder/decoder descriptor view. Encode writes the authoritative descriptor
+    TLVs from external_blobs; callers should not populate this vector to drive
+    new blob publication.
+  */
   std::vector<Preserved_trx_external_blob_descriptor> blob_descriptors;
   bool owns_current_temp_sidecars{false};
 };
 
+/* Result of encoding: authenticated snapshot bytes plus blobs to write or adopt. */
 struct Preserved_trx_encoded_bundle {
   std::vector<unsigned char> snapshot_bytes;
   std::vector<Preserved_trx_external_blob> external_blobs;
 };
 
+/*
+  Codec identity material.
+
+  The datadir fingerprint and server UUID bind a snapshot to the instance that
+  created it. Cross-machine schemes must introduce their own transfer contract
+  instead of silently treating a local snapshot as portable.
+*/
 struct Preserved_trx_codec_context {
   std::array<unsigned char, kPreservedTrxKeyLength> hmac_key{};
   std::array<unsigned char, kPreservedTrxSha256Length> datadir_fingerprint{};
   std::string server_uuid;
 };
 
+/* Parsed snapshot envelope before semantic import recreates engine objects. */
 struct Preserved_trx_decoded_snapshot {
   Preserve_snapshot_metadata header_metadata;
   std::vector<Preserve_snapshot_tlv> tlvs;
@@ -264,17 +413,43 @@ struct Preserved_trx_decoded_snapshot {
 };
 
 struct Preserved_trx_bundle_build_options {
+  /* Hard cap for the authenticated snapshot envelope, in bytes. */
   uint64_t max_snapshot_bytes{std::numeric_limits<uint64_t>::max()};
+  /* Per external blob cap shared by binlog, lock and temp-table bodies. */
   uint64_t max_external_blob_bytes{std::numeric_limits<uint64_t>::max()};
+  /*
+    Optional tighter cap for prebuilt record-lock blobs. When set lower than the
+    generic external-blob cap, record locks must satisfy this family-specific
+    limit before the builder adopts the descriptor.
+  */
   uint64_t max_record_locks_external_blob_bytes{
       std::numeric_limits<uint64_t>::max()};
 };
 
 struct Preserved_trx_bundle_build_input {
+  /*
+    The builder accepts either live payloads in metadata or prebuilt warmcopy
+    blobs. It must not silently combine incompatible representations of the same
+    family; callers choose externalization explicitly through the input flags.
+  */
   Preserve_snapshot_metadata metadata;
+  /*
+    logged_binlog_snapshot is the live-export representation. The prebuilt blob
+    fields name data already written by warmcopy. A live binlog snapshot is
+    mutually exclusive with prebuilt_binlog_cache_blob. A prebuilt record-lock
+    blob is mutually exclusive with inline/externalized record_locks_payload.
+    Binlog and record-lock prebuilt blobs may both appear in the same bundle.
+  */
   const Mysql_binlog_preserve_snapshot *logged_binlog_snapshot{nullptr};
   const PrebuiltBinlogCacheBlob *prebuilt_binlog_cache_blob{nullptr};
   const PrebuiltRecordLocksBlob *prebuilt_record_locks_blob{nullptr};
+  /*
+    externalize_record_locks_payload moves the live
+    metadata.record_locks_payload into an external blob. It is not the prebuilt
+    warmcopy path: prebuilt_record_locks_blob already names a durable descriptor
+    and is intentionally incompatible with this flag. Size options only bound
+    the external payload; they do not automatically choose externalization.
+  */
   bool externalize_record_locks_payload{false};
   Preserved_trx_bundle_build_options options;
 };

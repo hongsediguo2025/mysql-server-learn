@@ -46,6 +46,14 @@ struct lock_warmcopy_debug_stats_t {
   uint64_t observed_hook_events{0};
 };
 
+/*
+  Record-lock mirror identity.
+
+  The key groups bits that live in the same native record-lock bitmap. It is a
+  storage shard, not the durable identity of an individual record; seal/import
+  still need record image entries to prove the page slot has not been reused for
+  a different row.
+*/
 struct lock_warmcopy_record_shard_key_t {
   /*
     Physical shard identity for the record-lock mirror. n_bits is retained for
@@ -60,6 +68,7 @@ struct lock_warmcopy_record_shard_key_t {
   uint32_t n_bits{0};
 };
 
+/* SHA-256 digest of the record image captured for warmcopy validation. */
 struct lock_warmcopy_record_image_digest_t {
   unsigned char bytes[32]{};
 };
@@ -83,12 +92,29 @@ struct lock_warmcopy_record_shard_snapshot_t {
     before adopting a payload built from this snapshot.
   */
   lock_warmcopy_record_shard_key_t key;
+  /*
+    normalized_bitmap is the native bitmap shape after trimming to the current
+    shard. record_images provide durable row identity for each set bit that the
+    snapshot intends to export; they may be captured by gated lock-creation or
+    conversion hooks rather than by bitmap set/reset hooks.
+  */
   std::vector<unsigned char> normalized_bitmap;
   std::vector<lock_warmcopy_record_image_entry_t> record_images;
   uint32_t set_bit_count{0};
+  /*
+    State flags and generations distinguish clean reuse from dirty rescan and
+    fail-closed invalidation. implicit_exclusion_generation is reserved for a
+    future explicit/native implicit overlap hook; current mirrors leave it at
+    zero and rely on the transaction lock fence for conversion safety.
+  */
   uint32_t shard_state_flags{0};
   uint64_t mutation_generation{0};
   uint64_t implicit_exclusion_generation{0};
+  /*
+    Journal positions describe how far this snapshot has replayed per-shard
+    changes. A clean shard can be reused only when the final store fence proves
+    there was no gap after these cursors.
+  */
   uint64_t journal_cursor{0};
   uint64_t last_applied_journal_seq{0};
   std::string last_diagnostic_reason;
@@ -101,9 +127,13 @@ struct lock_warmcopy_record_store_fence_t {
     across the checked window; it is not a replacement for the final trx-lock
     fence held around prepare.
   */
+  /* Number of record shards visible for the target at sample time. */
   uint32_t shard_count{0};
+  /* Aggregate mutation counter used to detect any set/reset/object change. */
   uint64_t total_mutation_generation{0};
+  /* Aggregate dirty counter used to force rescan when clean reuse is unsafe. */
   uint64_t dirty_generation{0};
+  /* Stable digest over shard keys, generations, and record identity state. */
   unsigned char canonical_fingerprint[LOCK_WARMCOPY_SHA256_DIGEST_LENGTH]{};
 };
 
@@ -118,20 +148,28 @@ enum class lock_warmcopy_record_seal_status_t {
 
 struct lock_warmcopy_record_seal_result_t {
   /*
-    Seal result is the only record payload that may become a preserve artifact.
-    materialized_payload_bytes records phase-2 string materialization so NFR
-    tests can detect regressions that move large payload work back into the
-    blocked window.
+    Seal result is the only inline/materialized phase-2 record payload that may
+    become a preserve artifact. A separate prebuilt blob descriptor may be
+    adopted without copying the body into record_locks_payload.
+    materialized_payload_bytes records phase-2 string materialization so
+    performance tests can detect regressions that move large payload work back
+    into the blocked window.
   */
   lock_warmcopy_record_seal_status_t status{
       lock_warmcopy_record_seal_status_t::NOT_ATTEMPTED};
+  /* sealed=true means status was computed from a completed seal attempt. */
   bool sealed{false};
+  /* Serialized record-lock payload returned to SQL preserve when inline. */
   std::string record_locks_payload;
   uint32_t record_lock_count{0};
+  /* Journal bytes consumed while sealing this target. */
   uint64_t journal_bytes{0};
+  /* Inline payload bytes materialized during phase 2 for performance accounting. */
   uint64_t materialized_payload_bytes{0};
+  /* Scan counts separate total shard work from dirty-shard repair work. */
   uint32_t scanned_shard_count{0};
   uint32_t dirty_shard_count{0};
+  /* Fence that must still match when SQL adopts the result. */
   lock_warmcopy_record_store_fence_t seal_fence;
   std::string diagnostic_reason;
 };
@@ -142,9 +180,24 @@ struct lock_warmcopy_trx_lock_fence_t {
     catch native lock-list changes and implicit-to-explicit conversion attempts
     that can occur after the warm mirror was sealed.
   */
+  /* Incremented by native lock-list mutations on the target trx. */
   uint64_t trx_locks_version{0};
+  /* Native record-lock count sampled under trx->mutex. */
   uint64_t n_rec_locks{0};
+  /* Freeze generation active while prepare must reject late conversions. */
   uint64_t freeze_generation{0};
+  /*
+    Conversion flags tell SQL whether another session attempted to materialize an
+    implicit lock after the target was frozen, and whether that attempt escaped
+    the bounded wait path. conversion_attempt_after_freeze is enough for final
+    preserve to fail closed; conversion_unhandled_after_freeze is diagnostic
+    evidence that a caller reached a conversion path without proving the frozen
+    status was propagated safely. SQL's record final-fence check compares the
+    pre-freeze seal sample with the frozen sample and intentionally ignores the
+    new freeze_generation and any pre-freeze conversion flags. The frozen sample's
+    conversion flags are fail-closed signals for the current freeze epoch; full
+    fence equality is used only for same-freeze stability checks.
+  */
   bool conversion_attempt_after_freeze{false};
   bool conversion_unhandled_after_freeze{false};
 };
@@ -166,6 +219,16 @@ enum class lock_warmcopy_hook_action_t {
   UNREACHABLE
 };
 
+/*
+  Source-shape coverage marker for native lock hooks.
+
+  Each entry records what a hook site is allowed to do. Tests use the table to
+  prevent heavy payload work, file I/O, or long scans from drifting back into
+  InnoDB hot paths that should remain thin when preserve is disabled. Table and
+  AUTO_INC entries are source-shape classifications; current table/MDL routing
+  still depends on SQL-side sampling and comparison until native delta hooks are
+  implemented for those families.
+*/
 struct lock_warmcopy_hook_coverage_site_t {
   const char *symbol;
   const char *source_path;
@@ -180,6 +243,11 @@ inline bool lock_warmcopy_hooks_enabled() {
 void lock_warmcopy_open_epoch(uint64_t epoch);
 void lock_warmcopy_close_epoch();
 void lock_warmcopy_record_hook_event();
+/*
+  Native lock hooks report warmcopy bookkeeping only. A false return means the
+  hook was disabled, unsupported, or unable to record the event; it must not be
+  interpreted as failure of the native lock mutation that triggered the hook.
+*/
 bool lock_warmcopy_record_bitmap_set(
     const lock_warmcopy_record_shard_key_t &key, uint32_t heap_no);
 bool lock_warmcopy_record_bitmap_reset(

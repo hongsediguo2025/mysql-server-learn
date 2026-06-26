@@ -44,8 +44,12 @@ class Binlog_cache_warmcopy_mirror {
   virtual ~Binlog_cache_warmcopy_mirror() = default;
 
   /*
-    These callbacks are invoked while the source cache holds its warm-copy
+    These callbacks are invoked while the source cache holds its warmcopy
     latch. Implementations must not call back into the same Binlog_cache_storage.
+    Source writes are already part of the binlog cache operation before the
+    mirror is notified; a mirror error degrades warmcopy for preserve, but must
+    not roll back the source cache write. Reset/close callbacks detach or
+    degrade the session so finalize cannot name a stale mirror.
   */
   virtual Binlog_warmcopy_mirror_status write_at(
       uint64_t offset, const unsigned char *data, size_t length) = 0;
@@ -74,24 +78,55 @@ bool mysql_binlog_warmcopy_source_copy_range(
 bool mysql_binlog_warmcopy_source_truncate_generation(
     THD *thd, uint64_t *truncate_generation);
 
+/*
+  One-shot warmcopy path for an already quiesced cache. It is not the batch drain
+  session API: it does not install a live mirror or track tail writes. The helper
+  copies the current cache under a truncate-generation check, flushes/closes the
+  warm body, seals the descriptor, and leaves adoption to snapshot write.
+  has_blob=false means the source cache had no resumable bytes. On failure the
+  writer is aborted, or the warm artifact is removed after a post-close digest
+  failure.
+*/
 bool mysql_binlog_preserve_warmcopy_build_blob(
     THD *thd, const std::string &warmcopy_id, uint64_t epoch,
     Preserved_trx_warm_external_blob_carrier *carrier,
     uint64_t max_blob_bytes, PrebuiltBinlogCacheBlob *blob, bool *has_blob);
+/*
+  Begin installs a mirror on an eligible binlog cache, samples the prefix end
+  and truncate generation, and copies the stable prefix into warm storage.
+  A non-null returned session must be completed by finalize_session() or
+  abort_session(); callers must not leak it across drain epochs. has_blob reports
+  whether a non-empty prefix existed at begin time. A zero-prefix session can
+  still be returned so later tail writes are mirrored and must be finalized or
+  aborted normally.
+*/
 bool mysql_binlog_preserve_warmcopy_begin_session(
     THD *thd, const std::string &warmcopy_id, uint64_t epoch,
     Preserved_trx_warm_external_blob_carrier *carrier,
     uint64_t max_blob_bytes, Mysql_binlog_warmcopy_session **session,
     bool *has_blob, uint64_t *prefix_bytes);
+/*
+  Finalize verifies that the live-mirrored tail is bounded and complete, checks
+  digest/durable high-water marks and pending ranges, then detaches the mirror
+  and returns a descriptor for preserve. has_blob is false when the source no
+  longer has a resumable binlog cache.
+*/
 bool mysql_binlog_preserve_warmcopy_finalize_session(
     THD *thd, Mysql_binlog_warmcopy_session *session,
     uint64_t tail_budget_bytes, PrebuiltBinlogCacheBlob *blob,
     bool *has_blob);
+/* Check whether the current tail would exceed the caller's phase-2 budget. */
 bool mysql_binlog_preserve_warmcopy_tail_budget_exceeded(
     THD *thd, Mysql_binlog_warmcopy_session *session,
     uint64_t tail_budget_bytes, bool *exceeded);
+/* Abort detaches the mirror and releases the session without publishing a blob. */
 void mysql_binlog_preserve_warmcopy_abort_session(
     Mysql_binlog_warmcopy_session *session);
+/*
+  Probe the current transaction cache length without deciding eligibility.
+  has_blob=false is a clean "no cache body" result, not an I/O error; callers
+  still have to apply their own binlog state, timeout, and fallback rules.
+*/
 bool mysql_binlog_preserve_warmcopy_cache_length(THD *thd, uint64_t *length,
                                                  bool *has_blob);
 

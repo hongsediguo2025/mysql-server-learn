@@ -57,8 +57,9 @@ void Preserve_trx_inflight_statement_guard::mark_unknown_query(THD *thd) {
   assert(!m_active);
   /*
     COM_QUERY text is not always parsed at the point where drain admission is
-    checked. Mark it as unknown first; the later parser/command path either
-    refines it or lets drain treat the session conservatively.
+    checked. Mark it as unknown first; text protocol keeps that conservative
+    marker while command admission uses the parsed LEX, whereas prepared
+    statement paths may install a known risky-command guard directly.
   */
   if (preserved_trx_mark_inflight_unknown_query(thd)) {
     m_thd = thd;
@@ -84,8 +85,8 @@ Preserve_trx_drain_orchestrator::open_phase1_participants() {
 
   /*
     Phase 1 opens every participant before any participant is allowed to close
-    admission. This gives binlog, lock, and temp-table warmcopy code the same
-    epoch boundary for background capture work.
+    admission. This gives current orchestrator participants, such as binlog and
+    lock warmcopy, the same epoch boundary for background capture work.
   */
   for (Preserve_trx_drain_participant *participant : m_participants) {
     if (!participant->open_phase1()) {
@@ -103,9 +104,11 @@ Preserve_trx_drain_orchestrator::close_phase1_participants() {
   }
 
   /*
-    Closing phase 1 is the admission fence. After this point participants must
-    either have a sealable artifact or report that the target must fall back to
-    the live path. No later step may silently add a new warmcopy target.
+    Closing phase 1 is the participant/warmcopy epoch fence. SQL command
+    admission has already been tightened by the manager state before production
+    drain reaches this point. After close, participants must either have a
+    sealable artifact or report that the target must fall back to the live path.
+    No later step may silently add a new warmcopy target.
   */
   for (Preserve_trx_drain_participant *participant : m_participants) {
     if (!participant->close_phase1()) {
@@ -139,10 +142,12 @@ Preserve_trx_drain_orchestrator::ensure_phase1_ready() {
 Preserve_trx_drain_status
 Preserve_trx_drain_orchestrator::phase2_preflight_participants() {
   /*
-    Phase-2 preflight is the last participant hook before target quiesce and
-    preserve. A failure here must abort or route to a live fallback; continuing
-    with a partial participant set would mix artifacts from different time
-    points.
+    Phase-2 preflight is the final orchestrator-level hook after the target set
+    has quiesced and before per-target preserve consumes participant artifacts.
+    A failure here must abort or route to a live fallback; continuing with a
+    partial participant set would mix artifacts from different time points. Unit
+    helpers may call the phase sequence without real targets, but production
+    batch drain reaches this hook only for the closed/quiesced target set.
   */
   for (Preserve_trx_drain_participant *participant : m_participants) {
     if (!participant->phase2_preflight(m_mode)) {

@@ -1248,7 +1248,10 @@ Local_file_preserved_temp_table_image_carrier::seal_warm_undo(
   /*
     No-redo undo sidecars are optional but all-or-nothing for a temp table that
     modified data. Seal only a digest-matching warm undo body; resume later
-    rejects manifests whose undo descriptor cannot be read back.
+    rejects manifests whose undo descriptor cannot be read back. Current SQL
+    resume policy still rejects transactions that require using a valid no-redo
+    undo sidecar; the sidecar is captured for durable evidence and future
+    reconnect support, not as an enabled replay path.
   */
   const Preserved_trx_carrier_status digest_status =
       validate_file_digest(warm_path, descriptor.size, descriptor.sha256);
@@ -1390,8 +1393,9 @@ Local_file_preserved_temp_table_image_carrier::remove_sealed_sidecars(
 
   /*
     Sealed sidecars are token-owned. They are removed with the token snapshot or
-    after rollback of a materialized resume attempt, never as generic phase-1
-    cleanup.
+    final token cleanup, never as generic phase-1 cleanup. Retry rollback of a
+    materialized resume attempt only releases the live attachment so the token
+    can be retried with its disk sidecar intact.
   */
   bool deleted_any = false;
   bool deleted = false;

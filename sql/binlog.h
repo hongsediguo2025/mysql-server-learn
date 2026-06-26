@@ -75,6 +75,11 @@ struct Mysql_binlog_preserve_snapshot;
 struct PrebuiltBinlogCacheBlob;
 
 struct Mysql_binlog_preserve_cache_state {
+  /*
+    Savepoint checkpoint for a binlog cache handler. Resume stores it in the
+    cache_state_map so a later ROLLBACK TO SAVEPOINT can restore the cache
+    offset, event count, and statement/row flags that existed at the savepoint.
+  */
   uint64_t position{0};
   uint64_t event_counter{0};
   bool with_sbr{false};
@@ -961,6 +966,15 @@ bool stmt_has_updated_trans_table(Ha_trx_info *ha_list);
 bool ending_trans(THD *thd, const bool all);
 bool ending_single_stmt_trans(THD *thd, const bool all);
 bool mysql_binlog_preserve_no_cache_boundary_is_clean(const THD *thd);
+/*
+  Preserve/resume binlog-cache helpers.
+
+  export() copies metadata and cache bytes for snapshot build. metadata_only()
+  samples the same semantic flags when a warmcopy provider will supply the body.
+  import() recreates the cache during RESUME. reactivate_after_* restores the
+  source THD when preserve fails before a durable token can own the cache, and
+  discard() clears preserved binlog state after cleanup paths no longer need it.
+*/
 bool mysql_binlog_preserve_export(THD *thd,
                                   Mysql_binlog_preserve_snapshot *snapshot);
 bool mysql_binlog_preserve_export_metadata_only(
@@ -969,6 +983,15 @@ bool mysql_binlog_preserve_warmcopy_build_blob(
     THD *thd, const std::string &warmcopy_id, uint64_t epoch,
     Preserved_trx_warm_external_blob_carrier *carrier,
     uint64_t max_blob_bytes, PrebuiltBinlogCacheBlob *blob, bool *has_blob);
+/*
+  Warmcopy session API used by batch drain. begin_session installs a mirror and
+  copies the stable prefix; finalize_session closes the mirror, validates the
+  already mirrored bounded tail, and returns a prebuilt blob descriptor. Every
+  non-null returned session must be paired with finalize_session or
+  abort_session. has_blob from begin_session reports whether the initial prefix
+  was non-empty; a zero-prefix session may still be returned to mirror later
+  tail writes.
+*/
 bool mysql_binlog_preserve_warmcopy_begin_session(
     THD *thd, const std::string &warmcopy_id, uint64_t epoch,
     Preserved_trx_warm_external_blob_carrier *carrier,

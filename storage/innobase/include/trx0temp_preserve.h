@@ -57,21 +57,27 @@ static inline bool trx_preserve_temp_space_image_dirty_page_hook_enabled() {
   including column/index layout and root pages inside the sidecar.
 */
 struct trx_preserve_temp_dict_column_binding {
+  /* Serialized SQL/DD column name used to match the rebuilt dict column. */
   std::string name;
+  /* InnoDB main type, precise type and length copied from the source column. */
   uint32_t mtype{0};
   uint32_t prtype{0};
   uint32_t len{0};
+  /* Invisible/generated column shape must match before the sidecar is adopted. */
   bool visible{true};
 };
 
 struct trx_preserve_temp_dict_index_field_binding {
+  /* Column name in SQL/DD order; prefix and direction must match the dict index. */
   std::string column_name;
   uint32_t prefix_len{0};
   bool ascending{true};
 };
 
 struct trx_preserve_temp_dict_index_binding {
+  /* Index id inside the sidecar image, not the original source table id. */
   uint64_t image_index_id{0};
+  /* Root page in the sidecar tablespace image. */
   uint32_t root_page_no{0};
   bool clustered{false};
   bool unique{false};
@@ -81,8 +87,11 @@ struct trx_preserve_temp_dict_index_binding {
 };
 
 struct trx_preserve_temp_dict_table_binding {
+  /* Original temporary tablespace id named by SQL metadata and carrier sidecars. */
   uint32_t source_space_id{0};
+  /* Table id assigned inside the sidecar image that will be adopted on resume. */
   uint64_t image_table_id{0};
+  /* Clustered root page and flags must match the rebuilt InnoDB dict object. */
   uint32_t clustered_root_page_no{0};
   uint32_t table_flags{0};
   std::string schema_name;
@@ -108,7 +117,10 @@ struct trx_preserve_temp_bound_dict_column {
 };
 
 struct trx_preserve_temp_dirty_page_image {
-  /* Last captured version of a changed page, ordered by capture_sequence. */
+  /*
+    Last captured version of a changed page. capture_sequence records recency;
+    the vector stores one latest image per page and is not ordered by sequence.
+  */
   uint32_t page_no{0};
   uint64_t capture_sequence{0};
   std::vector<unsigned char> bytes;
@@ -129,7 +141,9 @@ enum class trx_preserve_temp_no_redo_undo_page_kind : uint8_t {
 /*
   No-redo undo sidecars store only the pages needed to reconnect the preserved
   transaction's temporary undo graph. Unknown or incomplete pages make the image
-  unsupported rather than allowing resume to rebuild partial undo state.
+  unsupported rather than allowing resume to rebuild partial undo state. The
+  capture format is defined here, while current SQL-level resume policy still
+  rejects transactions that would require no-redo temp undo replay.
 */
 struct trx_preserve_temp_no_redo_undo_page_image {
   trx_preserve_temp_no_redo_undo_page_kind kind{
@@ -157,24 +171,42 @@ struct trx_preserve_temp_space_image_descriptor {
       - fil_space_adopted and bound_dict_tables are resume-time attachments.
     A caller must not treat an unsealed descriptor as recoverable.
   */
+  /* Source temp tablespace id; used as the stream/adoption lookup key. */
   uint32_t source_space_id{0};
+  /* Physical image identity and format copied from the source temp tablespace. */
   uint32_t page_size{0};
   uint32_t space_flags{0};
+  /* Durable physical image sidecar after baseline copy and page overlays. */
   uint64_t image_bytes{0};
   unsigned char image_digest[32]{};
   bool sealed{false};
+  /* Phase-1 dirty-page stream state; not recoverable until sealed above. */
   uint64_t dirty_page_queue_limit_bytes{0};
   uint64_t dirty_page_bytes{0};
   uint64_t dirty_page_next_sequence{1};
+  /*
+    dirty_page_stream_armed reserves descriptor-local accounting; registered
+    publishes the descriptor to page-write hooks.
+  */
   bool dirty_page_stream_armed{false};
   bool dirty_page_stream_registered{false};
   bool dirty_page_stream_degraded{false};
   std::string dirty_page_stream_degraded_reason;
   Temp_table_warmcopy_participant *dirty_page_participant{nullptr};
+  /*
+    Resource token and reservation bytes for the dirty-page queue. They must be
+    released when the stream is sealed, degraded, or discarded.
+  */
   std::string dirty_page_resource_token;
   uint64_t dirty_page_memory_reserved_bytes{0};
   std::vector<trx_preserve_temp_dirty_page_image> dirty_pages;
+  /* True after queued latest-page images have been folded into the sidecar. */
   bool dirty_page_queue_durable{false};
+  /*
+    No-redo undo capture stores rseg identity, undo anchors, and classified
+    pages for audit and future reconnect work. Current SQL resume policy still
+    rejects transactions that need no-redo temp undo replay.
+  */
   bool no_redo_undo_capture_required{false};
   bool no_redo_undo_sidecar_sealed{false};
   bool no_redo_undo_capture_degraded{false};
@@ -188,15 +220,32 @@ struct trx_preserve_temp_space_image_descriptor {
   trx_preserve_temp_no_redo_undo_log_anchor no_redo_update_undo;
   trx_t *no_redo_undo_reconnected_trx{nullptr};
   std::vector<trx_preserve_temp_no_redo_undo_page_image> no_redo_undo_pages;
+  /*
+    Pages captured before the undo anchor is known. Seal must either classify
+    every pending page or degrade the image; peer markers prevent shared-rseg
+    pages known by another descriptor from being treated as unknown data loss.
+  */
   std::vector<trx_preserve_temp_no_redo_undo_page_image>
       no_redo_undo_pending_pages;
   std::vector<uint32_t> no_redo_undo_peer_known_page_nos;
+  /* Set after the baseline image copy begins; copy must finish before seal. */
   bool initial_copy_started{false};
+  /*
+    Shadow baseline file state. The initial copy accumulates bytes and per-page
+    shadow records before dirty-page overlays produce the sealed image sidecar.
+  */
   uint64_t shadow_image_bytes{0};
   std::vector<trx_preserve_temp_shadow_page_image> shadow_pages;
+  /* Path of the sealed sidecar after it is adopted as an InnoDB fil_space. */
   std::string adopted_fil_space_path;
+  /* Resume-time fil_space attachment state for the adopted temp tablespace. */
   bool fil_space_adopted{false};
+  /*
+    Reserved for a future handoff back to the normal temp pool. Current resume
+    keeps adopted spaces outside that pool and leaves this false.
+  */
   bool normal_temp_pool_member{false};
+  /* Dict/table bindings to release or link during resume cleanup. */
   dict_table_t *bound_dict_table{nullptr};
   std::vector<dict_table_t *> bound_dict_tables;
 };
@@ -276,9 +325,10 @@ dberr_t trx_preserve_temp_space_image_begin_initial_copy(
     Temp_table_warmcopy_participant *participant);
 
 /*
-  Dirty-page capture API. arm/register publishes the descriptor to page-write
-  hooks; finish/mark_streamed_sidecar_sealed converts the captured stream into a
-  durable sidecar descriptor. Reset or unregister before discarding the owner.
+  Dirty-page capture API. arm prepares descriptor-local accounting, register
+  publishes the descriptor to page-write hooks, and finish/
+  mark_streamed_sidecar_sealed converts the captured stream into a durable
+  sidecar descriptor. Reset or unregister before discarding the owner.
 */
 dberr_t trx_preserve_temp_space_image_apply_dirty_page_stream(
     trx_preserve_temp_space_image_descriptor *descriptor);
@@ -309,6 +359,11 @@ dberr_t trx_preserve_temp_space_image_begin_no_redo_undo_capture(
     trx_preserve_temp_space_image_descriptor *descriptor,
     uint32_t rseg_space_id, uint32_t rseg_page_no, uint32_t rseg_slot);
 
+/*
+  Active no-redo undo capture disables trx_undo_reuse_cached() for the matching
+  rseg_space_id. Reusing cached temp undo could hide pages or anchors that the
+  preserve sidecar must either copy completely or reject fail-closed.
+*/
 bool trx_preserve_temp_space_image_should_disable_undo_cache(
     uint32_t rseg_space_id);
 

@@ -298,6 +298,12 @@ Preserved_temp_table_image_descriptor image_descriptor_from_exported_metadata(
 }
 
 struct Shared_temp_table_sidecar {
+  /*
+    Several SQL temporary table entries can share one InnoDB temp tablespace.
+    Build/seal the physical sidecar once per source_space_id and require later
+    entries to match the descriptor exactly; a mismatch means the manifest would
+    name inconsistent physical bytes and must fail closed.
+  */
   bool has_image{false};
   uint64_t image_size{0};
   std::array<unsigned char, 32> image_sha256{};
@@ -699,6 +705,13 @@ bool temp_table_dd_metadata_is_supportable(
     const trx_preserve_temp_table_exported_metadata &source,
     const std::string &schema_name, const std::string &table_name,
     std::string *reason) {
+  /*
+    This is a supported-shape gate, not a complete DD replay contract. Preserve
+    currently accepts only DD metadata that can be matched to the exported InnoDB
+    dict/table binding: visible or SE-hidden stored columns, supported column
+    types, supported index types, stable root pages, and matching table/index
+    flags. Any unsupported shape fails closed before the manifest is published.
+  */
   if (table.columns().empty() || table.indexes().empty()) {
     assign_reason(reason, "temp-table dictionary metadata unavailable");
     return false;
@@ -1161,9 +1174,10 @@ Preserve_snapshot_status preserve_trx_temp_table_preflight_preserve(THD *thd) {
   }
 
   /*
-    The current implementation requires a complete logical temp-table history
-    plus supported physical sidecars. No-redo undo changes observed after the
-    baseline are rejected because replay cannot prove the exact table image.
+    The current supported path requires no DDL-like or row-changing temp-table
+    tail history. The SQL journal is used to detect unsupported history and fail
+    closed; it is not replayed to rebuild temp rows during resume. No-redo undo
+    changes observed after the baseline are rejected for the same reason.
   */
   Temp_table_warmcopy_participant *participant =
       preserve_trx_temp_table_get_participant(thd);
@@ -1266,7 +1280,7 @@ Temp_table_warmcopy_participant *preserve_trx_temp_table_ensure_participant(
   /*
     Savepoints that existed before the participant was created are not in the
     temp-table journal. Mark that history as incomplete so preserve later fails
-    closed instead of replaying a partial savepoint view.
+    closed instead of treating the temp-table history as complete.
   */
   const bool has_existing_savepoints =
       thd->get_transaction()->m_savepoints != nullptr;
@@ -1396,8 +1410,9 @@ bool preserve_trx_temp_table_note_table_drop(THD *thd, const TABLE *table) {
 
   /*
     Drop and truncate are table-generation barriers. Later row events for the
-    same logical name must be associated with a new generation so replay does
-    not apply old rows to a recreated temporary table.
+    same logical name must be associated with a new generation so preserve can
+    detect unsupported history instead of treating old and recreated temporary
+    table contents as one continuous image.
   */
   Temp_table_warmcopy_participant *participant =
       preserve_trx_temp_table_ensure_participant(thd);
@@ -1504,8 +1519,9 @@ bool preserve_trx_temp_table_note_row_write(THD *thd,
     participant->register_table(table_ordinal, "unknown");
   /*
     Ordinal-based row hooks are used by lower layers that no longer have the
-    TABLE object. Register an unknown name if needed, then rely on later
-    manifest validation to reject incomplete or inconsistent metadata.
+    TABLE object. Register an unknown name if needed and mark the history
+    untracked immediately; preflight rejects this participant before preserve.
+    Manifest validation remains a backstop for inconsistent metadata.
   */
   preserve_trx_temp_table_note_untracked_change(thd);
   Temp_table_journal_record record;
@@ -1929,6 +1945,11 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
         shared_sidecars[source_metadata.source_space_id];
     const bool first_image_for_space = !shared.has_image;
 
+    /*
+      The first table for a source_space_id builds the physical sidecar. Later
+      tables in the same temp tablespace reuse that sealed image and must match
+      the remembered descriptor exactly.
+    */
     trx_preserve_temp_space_image_descriptor descriptor;
     if (first_image_for_space) {
       if (!preserve_trx_temp_table_build_baseline_image(
@@ -2288,6 +2309,17 @@ Preserve_snapshot_status preserve_trx_temp_table_deserialize_dd_table(
   return Preserve_snapshot_status::OK;
 }
 
+/*
+  Materialize user temporary tables for a claimed resume attempt.
+
+  The manifest is first reduced to a materialization plan. For the supported
+  physical-sidecar path, the function validates sidecar descriptors, adopts the
+  fil space, rebuilds and registers the InnoDB dictionary binding, stages table
+  opens, attaches the image to the target trx, and only then links the staged
+  TABLE objects into the SQL session. Failures before the final link release live
+  attachments and staged objects, but leave token-owned sidecars on disk so a
+  later retry or operator cleanup can inspect the same durable evidence.
+*/
 Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume(
     THD *thd, trx_t *trx, const std::string &dir, const std::string &token,
     const Preserve_snapshot_metadata &metadata) {

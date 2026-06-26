@@ -48,11 +48,20 @@ struct Preserved_temp_table_image_descriptor {
     std::string name;
   };
 
+  /* SQL participant identity and source temp tablespace captured at preserve. */
   uint32_t table_ordinal{0};
   uint32_t source_space_id{0};
+  /* Carrier blob identity, size, and digest for the sealed physical image. */
   std::string blob_name;
   uint64_t size{0};
   std::array<unsigned char, 32> sha256{};
+  /*
+    Seal metadata used by resume validation. image_space_id mirrors the sealed
+    source/adopted space identity; resume primarily keys the sidecar by
+    source_space_id, page size, and space flags, then validates table id, root
+    page, and table flags against the serialized DD/dict binding before the
+    uncached TABLE is opened.
+  */
   uint64_t sealed_temp_op_seq{0};
   uint64_t image_space_id{0};
   uint64_t image_table_id{0};
@@ -68,7 +77,9 @@ struct Preserved_temp_table_undo_descriptor {
   /*
     Optional no-redo undo sidecar for temp-DML. It is keyed by the same source
     space id as the image and by the no-redo rollback segment identity captured
-    during preserve.
+    during preserve. The descriptor format is present for capture/audit, but
+    current SQL resume support rejects transactions that require replaying
+    no-redo temp undo.
   */
   uint32_t source_space_id{0};
   std::string blob_name;
@@ -96,6 +107,11 @@ struct Preserved_temp_table_manifest_entry {
 };
 
 struct Preserved_temp_table_manifest {
+  /*
+    Original owner transaction id captured when the temp-table image was sealed.
+    A non-empty manifest with owner_trx_id == 0 cannot be claimed safely because
+    resume would not know which preserved trx owns the temp-only state.
+  */
   uint64_t owner_trx_id{0};
   std::vector<Preserved_temp_table_manifest_entry> tables;
   std::vector<Preserved_temp_table_undo_descriptor> undo_images;
@@ -112,8 +128,8 @@ class Preserved_temp_table_image_writer {
 
   /*
     Writer calls are offset based because phase 1 may stream the baseline image,
-    overlay buffer-pool pages, and then append tail dirty pages without keeping
-    the full image in memory.
+    overlay buffer-pool pages, and write later dirty images at their page
+    offsets without keeping the full image in memory.
   */
   virtual Preserved_trx_carrier_status write_at(
       uint64_t offset, const unsigned char *data, size_t length) = 0;

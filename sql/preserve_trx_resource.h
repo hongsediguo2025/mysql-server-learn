@@ -40,10 +40,19 @@ extern ulonglong preserve_trx_memory_per_token_bytes;
 extern uint preserve_trx_spill_chunk_bytes;
 
 enum class Preserve_trx_memory_kind {
+  /* Temporary-table physical image streaming buffer. */
   TEMP_IMAGE_STREAM_BUFFER,
+  /* In-memory dirty-page queue before sidecar sealing. */
   TEMP_DIRTY_PAGE_QUEUE,
+  /* Buffer used while reading temp-table sidecars during resume. */
   TEMP_SIDECAR_READ_BUFFER,
+  /*
+    Reserved for a future binlog warmcopy heap lease. Current binlog warmcopy
+    capacity accounting is the warm external blob byte budget, not this resource
+    manager kind.
+  */
   BINLOG_WARMCOPY_BUFFER,
+  /* Snapshot encode/decode working memory. */
   SNAPSHOT_CODEC_BUFFER
 };
 
@@ -79,16 +88,26 @@ class Preserve_memory_lease {
       const std::string &token, Preserve_trx_memory_kind kind, uint64_t bytes);
 };
 
+/*
+  Acquire a token/kind scoped memory lease. The returned RAII object releases on
+  destruction; an empty token or over-budget request returns an unacquired lease.
+*/
 Preserve_memory_lease preserve_trx_acquire_memory_lease(
     const std::string &token, Preserve_trx_memory_kind kind, uint64_t bytes);
 
+/* Manual acquire/release helpers for callers that cannot hold an RAII object. */
 bool preserve_trx_resource_acquire_memory(const std::string &token,
                                           Preserve_trx_memory_kind kind,
                                           uint64_t bytes);
+/*
+  Release is tolerant of repeated or oversized release attempts and clips the
+  token/kind accounting at zero so cleanup error paths can remain idempotent.
+*/
 void preserve_trx_resource_release_memory(const std::string &token,
                                           Preserve_trx_memory_kind kind,
                                           uint64_t bytes);
 
+/* Process-lifetime spill counters exposed through SHOW STATUS. */
 void preserve_trx_resource_note_spill_bytes(uint64_t bytes);
 void preserve_trx_resource_note_spill_failure();
 

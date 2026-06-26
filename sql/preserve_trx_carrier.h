@@ -35,15 +35,32 @@
 
 enum class Preserve_snapshot_delete_status {
   OK,
+  /* Delete did not reach the durable snapshot; token may still be visible. */
   ERROR_BEFORE_SNAPSHOT_DELETE,
+  /*
+    Cleanup crossed a snapshot-delete boundary, but later candidate snapshot,
+    sidecar, blob or fsync cleanup failed. At least one visible snapshot path may
+    have been deleted, while other token artifacts may still require audit; call
+    token_state() again when a visibility decision is needed.
+  */
   ERROR_AFTER_SNAPSHOT_DELETE
 };
 
 struct Preserve_snapshot_remove_options {
+  /*
+    Source-space ids for temp-table sidecars that must survive this token remove
+    because a resumed transaction committed and still owns the adopted temp
+    tablespace. Other token-owned sidecars are cleanup candidates.
+  */
   std::set<uint32_t> preserve_committed_temp_sidecar_source_space_ids;
 };
 
 struct Preserved_trx_carrier_listing {
+  /*
+    Snapshot tokens are durable resume records. The other sets describe
+    token-owned or phase-1 artifacts that may need recovery cleanup, taint
+    handling, or orphan deletion.
+  */
   std::set<std::string> snapshot_tokens;
   std::set<std::string> external_blob_tokens;
   std::set<std::string> temp_sidecar_tokens;
@@ -52,6 +69,11 @@ struct Preserved_trx_carrier_listing {
 };
 
 struct Preserved_trx_carrier_token_state {
+  /*
+    Existence summary for carrier-managed artifacts under one token. snapshot
+    means a durable token body is visible; the remaining flags identify related
+    payload/sidecar/taint files that cleanup or recovery must reconcile.
+  */
   bool snapshot{false};
   bool external_blob{false};
   bool temp_sidecar{false};
@@ -59,6 +81,11 @@ struct Preserved_trx_carrier_token_state {
 };
 
 struct Preserved_trx_carrier_read_limits {
+  /*
+    Per-read byte caps for snapshot and external payload validation. Metadata
+    reads may still scan blob bodies to verify descriptors without hydrating the
+    payload into memory.
+  */
   uint64_t max_snapshot_bytes{std::numeric_limits<uint64_t>::max()};
   uint64_t max_external_blob_bytes{std::numeric_limits<uint64_t>::max()};
 };
@@ -69,6 +96,11 @@ enum class Preserved_trx_carrier_status {
   ALREADY_EXISTS,
   CORRUPT,
   IO_ERROR,
+  /*
+    A snapshot write/publish path hit I/O after the snapshot may already be
+    durable. The caller must preserve an observable record rather than assuming
+    rollback can make ownership disappear.
+  */
   IO_ERROR_DURABLE_SNAPSHOT_MAY_EXIST
 };
 
@@ -87,17 +119,45 @@ enum class Preserve_snapshot_io_step {
 using Preserve_snapshot_io_observer = void (*)(Preserve_snapshot_io_step step,
                                                void *context);
 
+/*
+  Carrier write knobs used by tests and performance paths.
+
+  The defaults prefer a fully durable write. Deferred fsync and fast-path flags
+  are explicit because they change when a test can observe file-system effects;
+  production callers should use them only when a higher-level durable point is
+  still preserved.
+*/
 struct Preserve_snapshot_write_options {
   Preserve_snapshot_io_observer observer{nullptr};
   void *observer_context{nullptr};
+  /*
+    The defer flags leave durability to a surrounding test or caller-controlled
+    fsync point. They must not be used when the snapshot itself is the only
+    durable boundary for prepared-transaction ownership.
+  */
   bool defer_file_fsync{false};
   bool defer_directory_fsync{false};
+  /*
+    Fast-path flags bypass expensive existence/adoption checks only when the
+    caller already holds an equivalent invariant, such as a freshly allocated
+    token or a verified warmcopy descriptor.
+  */
   bool fast_new_token_state{false};
   bool fast_prebuilt_blob_adopt{false};
+  /* Sharding options spread many-token workloads across subdirectories. */
   bool shard_snapshot_files{false};
   bool shard_generic_external_blobs{false};
 };
 
+/*
+  Abstract storage carrier for preserved transaction artifacts.
+
+  Implementations provide file layout, authentication context, snapshot publish,
+  external blob placement, taint markers, token listing, and cleanup. The
+  interface separates storage mechanics from preserve semantics: callers decide
+  whether a token is valid or expired; the carrier only makes the corresponding
+  bytes durable and discoverable.
+*/
 class Preserved_trx_carrier {
  public:
   virtual ~Preserved_trx_carrier() = default;
@@ -120,12 +180,30 @@ class Preserved_trx_carrier {
       const std::vector<Preserved_trx_external_blob> &external_blobs) = 0;
 
   enum class Payload_read_mode {
+    /* Hydrate every external blob body; used by full validation/import paths. */
     WITH_EXTERNAL_BLOBS,
+    /*
+      Hydrate import-relevant external state without forcing every stored body.
+      The file carrier keeps binlog cache bodies descriptor-only here and reads
+      generic external blobs that currently carry semantic payloads such as
+      record-lock bodies.
+    */
     WITH_SEMANTIC_EXTERNAL_BLOBS,
+    /*
+      Decode metadata and descriptors without hydrating blob.payload. A carrier
+      may still scan blob bodies to compute and verify descriptor digests.
+    */
     METADATA_ONLY,
+    /* Read raw snapshot bytes only; skip descriptor/body validation. */
     SNAPSHOT_ONLY
   };
 
+  /*
+    Payload read mode determines how much data is hydrated from storage. Resume
+    needs semantic external blobs, observability may need only metadata, and
+    cleanup paths sometimes read the raw snapshot without expensive payload
+    materialization.
+  */
   virtual Preserved_trx_carrier_status read_existing(
       const std::string &token, Preserved_trx_encoded_bundle *encoded,
       const Preserved_trx_carrier_read_limits &read_limits,
@@ -158,6 +236,14 @@ class Preserved_trx_carrier {
       const std::string &artifact_filename) = 0;
 };
 
+/*
+  Streaming writer for warmcopy-produced external blobs.
+
+  Warmcopy may write large binlog or lock bodies before a token exists. The
+  writer therefore supports random-range writes, truncation, flush/close, and a
+  final descriptor seal. Until seal_descriptor succeeds, the artifact must remain
+  cleanup-only and must not be referenced by a snapshot.
+*/
 class Preserved_trx_external_blob_writer {
  public:
   virtual ~Preserved_trx_external_blob_writer() = default;
@@ -167,18 +253,42 @@ class Preserved_trx_external_blob_writer {
 
   virtual Preserved_trx_carrier_status truncate(uint64_t length) = 0;
 
+  /*
+    Flush makes body bytes durable enough for later descriptor sealing. Streaming
+    finalize paths may call flush before close_without_sync() so they do not pay
+    a second fsync while the descriptor high-water mark is already durable.
+  */
   virtual Preserved_trx_carrier_status flush() = 0;
 
+  /* Close the body and sync it as part of the close operation. */
   virtual Preserved_trx_carrier_status close() = 0;
 
+  /*
+    Close without syncing; valid only when the caller already established body
+    durability with flush() or an equivalent higher-level guarantee.
+  */
   virtual Preserved_trx_carrier_status close_without_sync() = 0;
 
+  /*
+    Publish the compact descriptor after the body is closed. The descriptor size
+    is checked here; full digest validation is deferred to read/import so adopt
+    does not re-hash blob-sized bodies in the blocked preserve path.
+  */
   virtual Preserved_trx_carrier_status seal_descriptor(
       const Preserved_trx_external_blob_descriptor &descriptor) = 0;
 
   virtual Preserved_trx_carrier_status abort() = 0;
 };
 
+/*
+  Carrier extension for warm external blobs.
+
+  A warm artifact is first named by warmcopy_id/blob_name/epoch. During preserve
+  it is adopted under the final token after the provider accepts the sealed
+  descriptor and file shape. Body digest verification happens when the descriptor
+  is hydrated for resume/import, keeping phase-1 scratch files separate from
+  durable token state without rereading the whole blob on adopt.
+*/
 class Preserved_trx_warm_external_blob_carrier {
  public:
   virtual ~Preserved_trx_warm_external_blob_carrier() = default;
@@ -194,11 +304,21 @@ class Preserved_trx_warm_external_blob_carrier {
       uint64_t warmcopy_epoch,
       const Preserved_trx_external_blob_descriptor &descriptor) = 0;
 
+  /*
+    Cleanup wildcard for one warmcopy id/blob family. It removes staged bodies
+    and descriptors that match that scratch identity, regardless of epoch, and
+    must not touch already adopted token-owned blobs.
+  */
   virtual Preserved_trx_carrier_status remove_warm_external_blob(
       const std::string &warmcopy_id, const std::string &blob_name) = 0;
 };
 
 struct Preserved_trx_store_write_stats {
+  /*
+    Microsecond breakdown for one store write attempt. Fields are accumulated
+    only for steps the write path actually reaches; failure paths may leave later
+    stages at zero.
+  */
   uint64_t token_state_us{0};
   uint64_t adopt_warm_blob_us{0};
   uint64_t write_new_blobs_us{0};
@@ -206,6 +326,15 @@ struct Preserved_trx_store_write_stats {
   uint64_t write_snapshot_us{0};
 };
 
+/*
+  Semantic store on top of a carrier.
+
+  Preserved_trx_store enforces the durable publish ordering: inspect existing
+  token state, adopt or write external bodies, encode the authenticated snapshot,
+  then publish the snapshot. If cleanup fails after the snapshot may exist, the
+  caller gets an explicit durable_snapshot_may_exist signal so ownership of a
+  prepared transaction is not lost.
+*/
 class Preserved_trx_store {
  public:
   explicit Preserved_trx_store(
@@ -251,6 +380,13 @@ class Preserved_trx_store {
   Preserved_trx_carrier_read_limits m_read_limits;
 };
 
+/*
+  Convenience owner that keeps the carrier alive for the store facade.
+
+  The handle is movable but not assignable because callers must not accidentally
+  rebind a store to a different carrier while preserve/recovery code still holds
+  references to the facade.
+*/
 class Preserved_trx_store_handle {
  public:
   explicit Preserved_trx_store_handle(

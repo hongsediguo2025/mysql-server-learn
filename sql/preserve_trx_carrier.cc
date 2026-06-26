@@ -330,9 +330,10 @@ Preserve_snapshot_status Preserved_trx_store::write(
 
   if (!new_external_blobs.empty()) {
     /*
-      When any prebuilt blob was adopted, write_external_blobs_new validates the
-      complete descriptor set so the snapshot never references a mixture of
+      When any prebuilt blob was adopted, write_external_blobs_new receives the
+      complete blob-name namespace so the snapshot never references a mixture of
       adopted and newly written bodies that the carrier cannot list together.
+      Descriptor digest validation happens on adopt/read paths.
     */
     const std::vector<Preserved_trx_external_blob> &blobs_to_write =
         adopted_prebuilt_blob ? bundle.external_blobs : new_external_blobs;
@@ -557,6 +558,10 @@ Preserve_snapshot_status Preserved_trx_store::rewrite_recovered_count(
 
   store_le32(&encoded.snapshot_bytes,
              preserve_trx_bundle_recovered_count_offset(), recovered_count);
+  /*
+    recovered_count is an authenticated header field. Rewriting it in place must
+    refresh both HMAC and CRC before the carrier publishes the modified snapshot.
+  */
   if (refresh_snapshot_authentication(context, &encoded.snapshot_bytes))
     return Preserve_snapshot_status::IO_ERROR;
 

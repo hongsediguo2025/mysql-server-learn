@@ -26,7 +26,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 *****************************************************************************/
 
 /** @file trx/trx0preserve.cc
- Preserve transaction bridge helpers for the 8.0.22 port. */
+ Preserve transaction bridge helpers between SQL and InnoDB state. */
 
 #include "trx0preserve.h"
 
@@ -630,6 +630,14 @@ bool trx_preserve_is_active_attached_to_thd(trx_t *trx, THD *thd) {
   return attached;
 }
 
+/*
+  Prepare a transaction that only changed no-redo temporary-table state.
+
+  Such a transaction may not have a normal redo rseg update, but preserve still
+  needs a prepared boundary so snapshot cleanup can own or roll back its temp
+  sidecars consistently. If the transaction has no temp rseg updates this is a
+  no-op; if it has redo updates the normal ha_prepare_low() path must handle it.
+*/
 dberr_t trx_preserve_prepare_current_temp_only(THD *thd, const XID &xid) {
   if (thd == nullptr || !xid_is_preserve_magic(xid)) return DB_ERROR;
 
@@ -675,6 +683,18 @@ static void trx_preserve_add_to_rw_trx_list_ordered(trx_t *trx) {
   ut_d(trx->in_rw_trx_list = true);
 }
 
+/*
+	  Recreate a claimed preserved trx for a temp-only snapshot.
+
+	  Startup recovery can find a token whose only durable engine state is the
+	  temporary-table manifest. There is no recovered prepared trx to claim, so this
+	  helper allocates a background trx with the preserved owner id, inserts it into
+	  the rw trx list in trx-id order, and marks it claimed/PRESERVED. The durable
+	  rseg assignment below is trx bookkeeping needed for rollback/rw-list
+	  invariants; it does not mean the snapshot contains ordinary redo undo for the
+	  transaction. Any failure rolls the partially allocated trx back to NOT_STARTED
+	  before freeing it.
+*/
 trx_t *trx_preserve_create_temp_only_claimed(const XID &xid, uint64_t trx_id) {
   if (!xid_is_preserve_magic(xid) || trx_id == 0 || trx_id >= TRX_ID_MAX) {
     return nullptr;
@@ -865,6 +885,14 @@ dberr_t trx_preserve_export_modified_table_names(
                                                  max_modified_tables);
 }
 
+/*
+  Close live ReadView handles before shutdown after their payloads were captured.
+
+  Once a transaction is preserved, resume must import from the serialized
+  snapshot instead of keeping an in-memory ReadView pointer alive across process
+  exit. Claimed prepared-preserve transactions are included because they may be
+  waiting for snapshot cleanup or resume handling.
+*/
 void trx_preserve_close_read_views_for_shutdown() {
   if (trx_sys == nullptr || trx_sys->mvcc == nullptr) return;
 
@@ -898,6 +926,12 @@ dberr_t trx_preserve_materialize_implicit_locks(
                                                  materialized_any);
 }
 
+/*
+  Serialize the active ReadView as low/up/creator limits plus the active rw-trx
+  id array captured in the view. low_limit_no is returned separately for
+  observability. An empty payload means the transaction had no active consistent
+  read view.
+*/
 dberr_t trx_preserve_export_read_view(THD *thd, std::string *payload,
                                       uint64_t *low_limit_no) {
   if (thd == nullptr || payload == nullptr || low_limit_no == nullptr) {
@@ -968,6 +1002,15 @@ static bool trx_preserve_parse_read_view_payload(
   return offset == payload.size();
 }
 
+/*
+  Import a serialized ReadView into the resumed trx.
+
+  The payload is trusted only if its structural count matches, low_limit_no is
+  nonzero, purge is not running past the preserved visibility window, and the
+  saved limits do not exceed the current trx-id/no horizon. Otherwise resume
+  fails closed rather than installing a view that could expose purged versions or
+  future transaction ids.
+*/
 dberr_t trx_preserve_import_read_view(trx_t *trx, const std::string &payload) {
   if (payload.empty()) {
     return DB_SUCCESS;
@@ -1497,6 +1540,13 @@ void trx_preserve_debug_current_thd_rseg_collection(
   result->contains_noredo = contains(trx->rsegs.m_noredo.rseg);
 }
 
+/*
+  Detach a freshly prepared preserve trx from its original THD.
+
+  The caller still owns cleanup on failure. On success the trx is removed from
+  mysql_trx_list, thd_to_trx() and ha_info are cleared, and the original THD no
+  longer has a transaction scope for this engine trx.
+*/
 trx_t *trx_preserve_detach_current_thd(THD *thd) {
   if (thd == nullptr || innodb_hton == nullptr ||
       innodb_hton->replace_native_transaction_in_thd == nullptr) {
@@ -1540,6 +1590,13 @@ trx_t *trx_preserve_detach_current_thd(THD *thd) {
   return trx;
 }
 
+/*
+  Attach a claimed PRESERVED trx to the RESUME THD.
+
+  The target THD must not already own an active InnoDB transaction. On success
+  the trx leaves claimed/PRESERVED state, enters ACTIVE, is inserted into
+  mysql_trx_list, and is registered in the THD's handler transaction state.
+*/
 dberr_t trx_preserve_attach_to_thd(trx_t *trx, THD *thd) {
   if (trx == nullptr || thd == nullptr || trx->xid == nullptr ||
       !xid_is_preserve_magic(*trx->xid) || innodb_hton == nullptr ||
@@ -1592,6 +1649,14 @@ dberr_t trx_preserve_attach_to_thd(trx_t *trx, THD *thd) {
   return DB_SUCCESS;
 }
 
+/*
+  Reattach a preserve candidate to its original THD after preserve fails.
+
+  This is the recovery path before a durable snapshot has taken ownership. It
+  accepts a PREPARED candidate that still needs to leave n_prepared_trx, or a
+  PRESERVED candidate left by a later failure, and restores ACTIVE handler state
+  on the original THD so normal rollback/error handling can continue.
+*/
 dberr_t trx_preserve_reattach_preserved_to_original_thd(trx_t *trx, THD *thd) {
   if (trx == nullptr || thd == nullptr || trx->xid == nullptr ||
       !xid_is_preserve_magic(*trx->xid) || innodb_hton == nullptr ||
@@ -1650,6 +1715,14 @@ dberr_t trx_preserve_reattach_preserved_to_original_thd(trx_t *trx, THD *thd) {
   return DB_SUCCESS;
 }
 
+/*
+  Detach an already resumed ACTIVE trx back into a claimed PRESERVED record.
+
+  Resume failure and cleanup paths use this after attach has succeeded but the
+  token must remain recoverable. The function removes THD ownership and handler
+  registration, marks the trx claimed, and stores PRESERVED state; callers decide
+  whether to restore the record, roll it back, or expose cleanup failure.
+*/
 static dberr_t trx_preserve_detach_resumed_from_thd_low(trx_t *trx, THD *thd) {
   if (trx == nullptr || thd == nullptr || trx->xid == nullptr ||
       !xid_is_preserve_magic(*trx->xid) || thd_to_trx(thd) != trx ||

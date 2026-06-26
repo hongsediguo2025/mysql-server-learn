@@ -559,6 +559,13 @@ static bool lock_preserve_encoded_pseudo_record_heap_no(
 bool lock_warmcopy_capture_record_image_for_lock(
     const lock_t *lock, const buf_block_t *block, ulint heap_no) {
   if (!lock_warmcopy_hooks_enabled()) return true;
+  /*
+    The warmcopy mirror records ordinary record-lock images only. Predicate
+    locks are preserved by the live-export payload and cause warmcopy routing to
+    fallback or reject rather than trying to synthesize spatial predicate state
+    from a record image. A false return only means warmcopy did not record this
+    image; native lock mutation call sites intentionally ignore it.
+  */
   if (lock == nullptr || block == nullptr || lock->trx == nullptr ||
       lock->index == nullptr || lock->index->table == nullptr ||
       lock_get_type_low(lock) != LOCK_REC ||
@@ -1630,6 +1637,12 @@ static void lock_preserve_serialize_record_locks_payload(
 bool lock_preserve_split_record_and_predicate_locks(
     const std::string &payload, std::string *record_locks_payload,
     std::string *predicate_locks_payload) {
+  /*
+    Live export may contain both ordinary record locks and predicate locks. Lock
+    warmcopy optimizes only the ordinary record family; a non-empty predicate
+    payload remains available to the preserve route for live fallback or
+    fail-closed rejection.
+  */
   if (record_locks_payload == nullptr || predicate_locks_payload == nullptr) {
     return false;
   }
@@ -1976,8 +1989,16 @@ static bool lock_preserve_record_belongs_to_trx(const rec_t *rec,
   return true;
 }
 
-/** Scan one index and convert implicit X-locks owned by trx into explicit
-record locks so they can later be exported. */
+/**
+  Scan one index and convert implicit X-locks owned by trx into explicit record
+  locks for the live-export path.
+
+  This is not native implicit-lock warmcopy. It is the fallback/preflight path
+  that makes the current InnoDB lock state serializable before record locks are
+  exported. The scan is bounded by table/page/lock/time limits and fails closed
+  on unsupported shapes, conversion conflicts, or timeout so preserve never
+  writes a snapshot missing implicit X-lock ownership.
+*/
 static dberr_t lock_preserve_materialize_one_index(
     trx_t *trx, dict_index_t *index, const Preserve_lock_limits &limits,
     bool *materialized_any, uint32_t *materialized_locks,

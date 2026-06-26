@@ -213,6 +213,13 @@ std::atomic<ulonglong> g_warmcopy_provider_full_copy_to_count{0};
 std::atomic<ulonglong> g_warmcopy_phase2_pause_us{0};
 std::mutex g_warmcopy_status_mutex;
 
+/*
+  Latest two-phase batch-drain timing snapshot.
+
+  These fields describe one drain attempt's blocked-window breakdown and are
+  published only when the attempt recorded a phase-2 start time. They are not
+  process-lifetime counters; cumulative SLO misses are tracked separately.
+*/
 struct Preserve_trx_phase2_metrics {
   uint64_t total_us{0};
   uint64_t target_wait_us{0};
@@ -400,6 +407,19 @@ void preserve_trx_store_manager_state_owner(Preserve_trx_manager_state state,
       preserve_trx_pack_manager_state_owner(state, owner_thread_id));
 }
 
+/*
+  Internal token lifecycle.
+
+  The lifecycle state is the operator-visible phase of a preserved record; the
+  resumable flag is the separate claim gate. Batch delivery can publish a
+  DRAINING record with resumable=true after the durable token exists, while the
+  drain manager and command gates still prevent ordinary concurrent resume until
+  shutdown/recovery hands ownership to the next server instance. PRESERVED is
+  the normal steady state. RESUMING and ROLLING_BACK claim the record so only
+  one owner can attach or clean up the prepared trx. EXPIRED_* states are owned
+  by the reaper and remain observable if cleanup cannot finish. FAILED records
+  are diagnostic-only and are removed by the observable-record GC deadline.
+*/
 enum class Preserved_trx_lifecycle_state {
   DRAINING,
   SNAPSHOTTING,
@@ -439,6 +459,13 @@ struct Preserve_trx_batch_item {
 };
 
 struct Pending_token_delivery {
+  /*
+    Single-transaction preserve does not expose a resumable token until the OK
+    packet carrying that token is known to have been delivered. The statement
+    finalizer flips the preserved record to resumable after OK delivery, or
+    rolls it back if delivery failed. finalizing prevents duplicate finalizers
+    from racing with shutdown/resource cleanup.
+  */
   std::string token;
   bool response_observed{false};
   bool ok_delivered{false};
@@ -2533,6 +2560,15 @@ bool sql_savepoints_payload_is_valid(const std::string &payload,
   return true;
 }
 
+/*
+  RAII owner for transitions of the global preserve manager state.
+
+  Construction performs the compare-exchange from the expected state and records
+  the owner thread id when requested. transition_to() publishes an intermediate
+  or final state while the guard remains active; it does not cancel rollback.
+  Destruction restores the original state unless dismiss() has explicitly handed
+  ownership to a later path such as shutdown handoff or cleanup-failed recovery.
+*/
 class Preserve_trx_manager_state_guard {
  public:
   Preserve_trx_manager_state_guard(Preserve_trx_manager_state from,
@@ -2600,6 +2636,16 @@ class Preserved_trx_observable_state_guard {
   bool m_active;
 };
 
+/*
+  Temporarily execute preserve work on a quiesced batch target THD.
+
+  The drain owner or a worker enters only after the target belongs to the same
+  generation, is QUIESCED, idle in the server loop, and not killed. While active,
+  the guard marks ATTACHING, installs the target THD globals/thread stack, and
+  restores the target THD on destruction; when an owner THD is present, owner
+  globals are restored as well. It is an ownership boundary for batch preserve,
+  not a generic THD context switch helper.
+*/
 class Preserve_thd_context_switch {
  public:
   Preserve_thd_context_switch(THD *current_thd_arg, THD *target_thd,
@@ -2666,6 +2712,15 @@ class Preserve_thd_context_switch {
   bool m_active{false};
 };
 
+/*
+  Rollback guard for SQL/session state restored during RESUME.
+
+  RESUME restores session-visible state before the preserved InnoDB transaction
+  is fully attached. If a later import, MDL, temp-table materialization, or
+  attach step fails, this guard returns the caller's THD variables and status to
+  the pre-RESUME values. dismiss() is called only after the resumed transaction
+  has taken ownership of those restored values.
+*/
 class Resume_thd_state_guard {
  public:
   explicit Resume_thd_state_guard(THD *thd)
@@ -3560,6 +3615,14 @@ class Preserve_drain_active_transactions final : public Do_THD_Impl {
   bool m_owner_killed{false};
 };
 
+/*
+  Single-transaction preserve must first make the rest of the server quiet enough
+  that the owner can be prepared without concurrent user transactions changing
+  shared state. The soft interval gives active sessions time to finish; after it
+  expires, or immediately in HARD mode, the drain visitor starts killing active
+  user sessions until either no active transaction remains, an unsupported thread
+  is found, the owner is killed, or the hard timeout expires.
+*/
 bool preserve_trx_drain_other_active_transactions(THD *thd) {
   const bool hard_configured =
       preserve_trx_drain_mode == PRESERVE_TRX_DRAIN_MODE_HARD;
@@ -4266,7 +4329,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
   Preserve_snapshot_status finalize_for_preserve(
       THD *thd, const std::string &, PrebuiltBinlogCacheBlob *blob) override {
     /*
-      This metric is scoped to warm-copy's binlog-cache phase-2 work
+	      This metric is scoped to warmcopy's binlog-cache phase-2 work
       (tail validation/refresh/adoption). It intentionally excludes the rest
       of batch preserve, which is dominated by lock/read-view/MDL/undo work and
       is not the large binlog-cache copy regression this gate measures.
@@ -4326,7 +4389,7 @@ class Warmcopy_batch_blob_provider final : public PreserveBinlogBlobProvider {
     /*
       m_close_deadline_us bounds the admission-closing and quiesced-target
       preparation window.  Once phase-2 target preserve has started, rejecting a
-      ready warm-copy artifact solely because that earlier deadline elapsed can
+	      ready warmcopy artifact solely because that earlier deadline elapsed can
       turn a large but otherwise consistent batch into a cleanup failure.  The
       session finalize path itself is bounded by its tail budget and by the
       surrounding batch drain lifecycle.
@@ -4808,6 +4871,16 @@ static bool prepare_lock_warmcopy_active_record_targets(
   return false;
 }
 
+/*
+  Preserve one already-quiesced batch target.
+
+  The wrapper revalidates the target's generation/state, temporarily runs the
+  preserve kernel under the target THD context, maps the result to
+  PRESERVED_DRAINED on success, or clears the batch state back to NONE on
+  failure. The recorded flags let the outer all-or-nothing batch path decide
+  whether it must roll back a claimed prepared trx, delete a token, or only
+  release in-memory quiesce ownership.
+*/
 class Preserve_batch_quiesced_idle_target final {
  public:
   Preserve_batch_quiesced_idle_target(THD *owner,
@@ -8098,6 +8171,17 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     const Preserve_trx_kernel_request &request) {
   DBUG_TRACE;
 
+  /*
+    Kernel preserve owns the correctness path shared by single-transaction
+    preserve and batch drain targets:
+      1. validate SQL/session/engine eligibility and preflight participants;
+      2. prepare undo/temp/lock/binlog state until the engine prepare boundary;
+      3. detach or claim the prepared trx from the original THD;
+      4. write the authenticated snapshot and external blobs;
+      5. register the token or return ownership to cleanup/fallback paths.
+    The wrapper decides how the token is delivered to a client or batch manager.
+  */
+
   THD *target_thd = request.target_thd;
   const Preserve_trx_options &options = request.options;
   const ulonglong timeout_seconds = request.timeout_seconds;
@@ -9772,6 +9856,16 @@ bool Sql_cmd_prepare_shutdown_preserve_transaction::execute(THD *thd) {
 bool Preserve_trx_drain_service::execute(
     THD *thd, const Preserve_trx_drain_request &request) {
   DBUG_TRACE;
+  /*
+    Batch drain is the multi-target command path. In two-phase mode it opens
+    warmcopy participants while target sessions may still run, then publishes
+    WARMCOPY_CLOSING to block new transaction-capable work. After target
+    enumeration and quiesce, participant preflight/seal and per-target preserve
+    run inside the blocked window. The command succeeds only after all selected
+    targets are preserved and audited, and the final shutdown request is
+    accepted. Partial preserve failures or shutdown failure route through
+    participant cleanup and fail closed instead of publishing a mixed batch.
+  */
   const Preserve_trx_options &options = request.options;
 
   if (!preserve_trx_is_enabled()) {
@@ -10629,6 +10723,11 @@ static Preserve_trx_options preserve_trx_options_from_lex(const LEX *lex) {
   if (lex == nullptr) return options;
   options.has_timeout = lex->preserve_trx_has_timeout;
   options.timeout_seconds = lex->preserve_trx_timeout_seconds;
+  /*
+    The parser stores Preserve_trx_user_vars_mode as a small integer because LEX
+    cannot include this runtime enum. Keep this mapping aligned with the grammar
+    actions that assign INCLUDE=1 and EXCLUDE=2.
+  */
   switch (lex->preserve_trx_user_vars_mode) {
     case 1:
       options.user_vars_mode = Preserve_trx_user_vars_mode::INCLUDE;
@@ -10670,6 +10769,21 @@ bool preserve_trx_execute_command(THD *thd) {
 
 bool Sql_cmd_resume_preserved_transaction::execute(THD *thd) {
   DBUG_TRACE;
+
+  /*
+    Resume is intentionally staged so a failure cannot consume a token without a
+    recoverable record:
+      1. reject unsupported server/session modes and check token ownership;
+      2. reread durable metadata before claiming the in-memory record;
+      3. restore SQL session state under Resume_thd_state_guard;
+      4. import binlog, MDL, GTID and temp-table state that lives outside the
+         claimed InnoDB trx;
+      5. attach the preserved trx, rebuild SQL savepoints, then remove the
+         snapshot.
+    Failures before attach restore the record through
+    restore_preserved_record_after_failure(); failures after attach either detach
+    again or mark the record so reaper/operator cleanup remains possible.
+  */
 
   if (!preserve_trx_is_enabled()) {
     my_error(ER_PRESERVE_TRX_DISABLED, MYF(0));
