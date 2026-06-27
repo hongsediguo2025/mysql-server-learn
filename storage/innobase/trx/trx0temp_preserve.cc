@@ -269,6 +269,13 @@ void trx_preserve_temp_staged_dirty_page_count_release_locked(
   --staged_it->second;
 }
 
+void trx_preserve_temp_staged_dirty_page_count_release(
+    uint32_t source_space_id) {
+  std::lock_guard<std::mutex> guard{
+      trx_preserve_temp_dirty_page_streams_mutex};
+  trx_preserve_temp_staged_dirty_page_count_release_locked(source_space_id);
+}
+
 uint64_t trx_preserve_temp_staged_dirty_page_bytes_for_space_locked(
     uint32_t source_space_id) {
   const auto staged_it =
@@ -355,29 +362,29 @@ void trx_preserve_temp_space_image_wait_for_staged_dirty_pages_to_drain(
   }
 }
 
-void trx_preserve_temp_space_image_mark_stage_rejected_during_close(
+bool trx_preserve_temp_space_image_mark_stage_rejected_during_close(
     uint32_t source_space_id) {
   std::lock_guard<std::mutex> guard{
       trx_preserve_temp_dirty_page_streams_mutex};
 
+  bool rejected_data_stream = false;
   auto stream_it = trx_preserve_temp_dirty_page_streams.find(source_space_id);
   if (stream_it != trx_preserve_temp_dirty_page_streams.end()) {
     trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
         stream_it->second,
         "temp-table dirty page observed while image stream is closing");
+    rejected_data_stream = true;
   }
 
-  auto no_redo_stream_it =
-      trx_preserve_temp_no_redo_undo_page_streams.find(source_space_id);
-  if (no_redo_stream_it != trx_preserve_temp_no_redo_undo_page_streams.end()) {
-    const std::vector<trx_preserve_temp_space_image_descriptor *> descriptors =
-        no_redo_stream_it->second;
-    for (trx_preserve_temp_space_image_descriptor *descriptor : descriptors) {
-      trx_preserve_temp_space_image_mark_no_redo_undo_degraded_locked(
-          descriptor,
-          "temp-table no-redo undo page observed while image stream is closing");
-    }
-  }
+  /*
+    The data-page stream observes table-space page images and cannot prove that
+    a write racing with close is redundant, so it remains fail-closed. The
+    no-redo undo stream is keyed by a shared rollback-segment space and is later
+    validated from each transaction's undo anchors; a flush observed while one
+    descriptor is sealing must not poison every peer descriptor that happens to
+    share the rseg space.
+  */
+  return rejected_data_stream;
 }
 
 void trx_preserve_temp_space_image_mark_stage_allocation_failed(
@@ -666,6 +673,153 @@ void trx_preserve_temp_space_image_free_reconnected_undo(trx_undo_t *undo) {
     }
   }
   trx_undo_mem_free(undo);
+}
+
+trx_rseg_t *trx_preserve_temp_space_image_find_no_redo_rseg(
+    const trx_preserve_temp_space_image_descriptor &descriptor) {
+  if (!descriptor.no_redo_undo_rseg_identity_present ||
+      trx_sys == nullptr ||
+      descriptor.no_redo_undo_rseg_slot >= trx_sys->tmp_rsegs.size()) {
+    return nullptr;
+  }
+
+  trx_rseg_t *rseg =
+      trx_sys->tmp_rsegs.at(descriptor.no_redo_undo_rseg_slot);
+  if (rseg == nullptr ||
+      rseg->space_id != descriptor.no_redo_undo_rseg_space_id ||
+      rseg->page_no != descriptor.no_redo_undo_rseg_page_no ||
+      rseg->id != descriptor.no_redo_undo_rseg_slot ||
+      !fsp_is_system_temporary(rseg->space_id)) {
+    return nullptr;
+  }
+  return rseg;
+}
+
+bool trx_preserve_temp_space_image_rseg_slot_in_use(trx_rseg_t *rseg,
+                                                    ulint slot) {
+  if (rseg == nullptr) return true;
+  for (trx_undo_t *undo = UT_LIST_GET_FIRST(rseg->insert_undo_list);
+       undo != nullptr; undo = UT_LIST_GET_NEXT(undo_list, undo)) {
+    if (undo->id == slot) return true;
+  }
+  for (trx_undo_t *undo = UT_LIST_GET_FIRST(rseg->update_undo_list);
+       undo != nullptr; undo = UT_LIST_GET_NEXT(undo_list, undo)) {
+    if (undo->id == slot) return true;
+  }
+  return false;
+}
+
+dberr_t trx_preserve_temp_space_image_materialize_no_redo_undo_pages(
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    trx_rseg_t *rseg) {
+  if (rseg == nullptr ||
+      !trx_preserve_temp_space_image_no_redo_undo_sidecar_ready(descriptor)) {
+    return DB_ERROR;
+  }
+
+  page_no_t max_page_no = 0;
+  for (const trx_preserve_temp_no_redo_undo_page_image &page :
+       descriptor.no_redo_undo_pages) {
+    if (page.bytes.size() != descriptor.page_size ||
+        !trx_preserve_temp_space_image_valid_no_redo_undo_page_kind(
+            page.kind)) {
+      return DB_CORRUPTION;
+    }
+    max_page_no = std::max(max_page_no, static_cast<page_no_t>(page.page_no));
+  }
+
+  fil_space_t *space = fil_space_get(rseg->space_id);
+  if (space == nullptr || !fil_space_extend(space, max_page_no + 1)) {
+    return DB_ERROR;
+  }
+
+  dberr_t err = DB_SUCCESS;
+  for (const trx_preserve_temp_no_redo_undo_page_image &page :
+       descriptor.no_redo_undo_pages) {
+    /*
+      The rseg header and FSP/XDES/INODE allocator pages describe shared
+      system-temporary tablespace state. They are captured and validated so the
+      sidecar proves the undo graph shape, but replaying them per token would
+      overwrite the allocator state rebuilt by the restarted server and by
+      other preserved transactions. The restored transaction only needs its
+      own undo segment pages to finish commit or rollback; those pages are
+      linked through trx_undo_t below and are deliberately skipped by the
+      normal no-redo undo cache/history/free paths.
+    */
+    if (page.kind ==
+            trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER ||
+        page.kind ==
+            trx_preserve_temp_no_redo_undo_page_kind::RSEG_ALLOCATOR) {
+      continue;
+    }
+
+    mtr_t mtr;
+    mtr_start(&mtr);
+    mtr_set_log_mode(&mtr, MTR_LOG_NO_REDO);
+
+    buf_block_t *block = buf_page_get_gen(
+        page_id_t(rseg->space_id, static_cast<page_no_t>(page.page_no)),
+        rseg->page_size, RW_X_LATCH, nullptr, Page_fetch::NORMAL, __FILE__,
+        __LINE__, &mtr);
+    if (block == nullptr) {
+      mtr_commit(&mtr);
+      err = DB_ERROR;
+      break;
+    }
+
+    /*
+      The no-redo undo space may already have freshly initialized pages in the
+      buffer pool after startup. Restoring only the backing file would leave
+      trx_undo_report_row_operation() reading those stale in-memory pages when
+      the resumed transaction appends more temporary-table undo records.
+    */
+    byte *frame = buf_block_get_frame(block);
+    ut_memcpy(frame, page.bytes.data(), page.bytes.size());
+    mtr.set_modified();
+    mtr_commit(&mtr);
+  }
+  return err;
+}
+
+trx_undo_t *trx_preserve_temp_space_image_create_reconnected_undo(
+    trx_t *trx, trx_rseg_t *rseg,
+    const trx_preserve_temp_no_redo_undo_log_anchor &anchor, ulint type,
+    ulint size) {
+  if (trx == nullptr || rseg == nullptr || !anchor.present || size == 0 ||
+      anchor.undo_slot >= TRX_RSEG_N_SLOTS ||
+      (type != TRX_UNDO_INSERT && type != TRX_UNDO_UPDATE)) {
+    return nullptr;
+  }
+
+  trx_undo_t *undo =
+      static_cast<trx_undo_t *>(ut_malloc_nokey(sizeof(*undo)));
+  if (undo == nullptr) return nullptr;
+
+  XID empty_xid;
+  empty_xid.reset();
+  undo->id = anchor.undo_slot;
+  undo->type = type;
+  undo->state = TRX_UNDO_PREPARED;
+  undo->del_marks = type == TRX_UNDO_UPDATE;
+  undo->trx_id = trx->id;
+  undo->xid = trx->xid == nullptr ? empty_xid : *trx->xid;
+  undo->flag = 0;
+  undo->preserve_restored_no_redo_undo = true;
+  undo->gtid_allocated = false;
+  undo->dict_operation = FALSE;
+  undo->rseg = rseg;
+  undo->space = rseg->space_id;
+  undo->page_size.copy_from(rseg->page_size);
+  undo->hdr_page_no = anchor.hdr_page_no;
+  undo->hdr_offset = anchor.hdr_offset;
+  undo->last_page_no = anchor.last_page_no;
+  undo->size = size;
+  undo->empty = FALSE;
+  undo->top_page_no = anchor.top_page_no;
+  undo->top_offset = anchor.top_offset;
+  undo->top_undo_no = static_cast<undo_no_t>(anchor.top_undo_no);
+  undo->guess_block = nullptr;
+  return undo;
 }
 
 void trx_preserve_temp_space_image_notify_drop_event(uint32_t source_space_id,
@@ -1180,6 +1334,19 @@ trx_preserve_temp_space_image_find_no_redo_undo_page(
                                                           : &*existing;
 }
 
+trx_preserve_temp_no_redo_undo_page_image *
+trx_preserve_temp_space_image_find_no_redo_undo_page_by_page_no(
+    trx_preserve_temp_space_image_descriptor *descriptor, uint32_t page_no) {
+  auto existing = std::find_if(
+      descriptor->no_redo_undo_pages.begin(),
+      descriptor->no_redo_undo_pages.end(),
+      [page_no](const trx_preserve_temp_no_redo_undo_page_image &image) {
+        return image.page_no == page_no;
+      });
+  return existing == descriptor->no_redo_undo_pages.end() ? nullptr
+                                                          : &*existing;
+}
+
 dberr_t trx_preserve_temp_space_image_store_no_redo_undo_page(
     trx_preserve_temp_space_image_descriptor *descriptor,
     trx_preserve_temp_no_redo_undo_page_kind kind, uint32_t page_no,
@@ -1293,6 +1460,12 @@ bool trx_preserve_temp_space_image_no_redo_undo_page_type_is_rseg_header(
   return page_type == FIL_PAGE_TYPE_SYS;
 }
 
+uint16_t trx_preserve_temp_space_image_no_redo_undo_page_type_for_reason(
+    const unsigned char *page, size_t page_bytes) {
+  if (page == nullptr || page_bytes < FIL_PAGE_TYPE + 2) return 0xffff;
+  return mach_read_from_2(page + FIL_PAGE_TYPE);
+}
+
 bool trx_preserve_temp_space_image_no_redo_undo_page_identity_matches(
     const trx_preserve_temp_space_image_descriptor &descriptor,
     uint32_t page_no, const unsigned char *page, size_t page_bytes) {
@@ -1306,6 +1479,20 @@ bool trx_preserve_temp_space_image_no_redo_undo_page_identity_matches(
   return actual_page_no == page_no &&
          (actual_space_id == descriptor.no_redo_undo_rseg_space_id ||
           (page_no == 0 && actual_space_id == 0));
+}
+
+bool trx_preserve_temp_space_image_no_redo_undo_page_is_non_owner_candidate(
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    uint32_t page_no, const unsigned char *page, size_t page_bytes) {
+  if (!trx_preserve_temp_space_image_no_redo_undo_page_identity_matches(
+          descriptor, page_no, page, page_bytes)) {
+    return false;
+  }
+
+  const uint16_t page_type =
+      trx_preserve_temp_space_image_no_redo_undo_page_type_for_reason(
+          page, page_bytes);
+  return page_type == FIL_PAGE_UNDO_LOG || page_type == FIL_PAGE_TYPE_SYS;
 }
 
 bool trx_preserve_temp_space_image_classify_no_redo_undo_page(
@@ -1468,21 +1655,65 @@ dberr_t trx_preserve_temp_space_image_classify_pending_no_redo_undo_pages(
     if (!trx_preserve_temp_space_image_classify_no_redo_undo_page(
             *descriptor, pending.page_no, pending.bytes.data(),
             pending.bytes.size(), &kind)) {
-      if (trx_preserve_temp_space_image_no_redo_undo_page_known_by_peer_marker(
-              *descriptor, pending.page_no) ||
-          trx_preserve_temp_space_image_no_redo_undo_page_known_by_active_peer_locked(
-              *descriptor, pending.page_no, pending.bytes.data(),
-              pending.bytes.size()) ||
-          !fail_on_unknown) {
-        continue;
+      trx_preserve_temp_no_redo_undo_page_image *existing =
+          trx_preserve_temp_space_image_find_no_redo_undo_page_by_page_no(
+              descriptor, pending.page_no);
+      if (existing != nullptr &&
+          existing->bytes.size() == descriptor->page_size) {
+        /*
+          A long undo log can contain body pages between the header and the
+          last/top pages named by trx_undo_t. The phase-2 body-page walk captures
+          those pages from the undo page list before seal. If one is dirtied
+          again while the stream is open, the dirty-page hook only knows the page
+          identity. Treat it as a latest-wins refresh of the already proven undo
+          graph page; do not classify it as an unknown peer page.
+        */
+        kind = existing->kind;
+        dberr_t err =
+            trx_preserve_temp_space_image_validate_no_redo_undo_page_for_kind_locked(
+                descriptor, kind, pending.page_no, pending.bytes.data(),
+                pending.bytes.size());
+        if (err != DB_SUCCESS) return err;
+      } else {
+        if (trx_preserve_temp_space_image_no_redo_undo_page_is_non_owner_candidate(
+                *descriptor, pending.page_no, pending.bytes.data(),
+                pending.bytes.size())) {
+          /*
+            All active descriptors attached to the same temporary no-redo rseg
+            observe the same dirty page stream. A FIL_PAGE_UNDO_LOG or rseg SYS
+            page that is not part of this descriptor's captured undo graph must
+            be left for its owning transaction descriptor. Keeping it out of the
+            current sidecar avoids serial batch preserve deadlock without
+            accepting random unknown bytes.
+          */
+          continue;
+        }
+        if (trx_preserve_temp_space_image_no_redo_undo_page_known_by_peer_marker(
+                *descriptor, pending.page_no) ||
+            trx_preserve_temp_space_image_no_redo_undo_page_known_by_active_peer_locked(
+                *descriptor, pending.page_no, pending.bytes.data(),
+                pending.bytes.size()) ||
+            !fail_on_unknown) {
+          continue;
+        }
+        if (trx_preserve_temp_space_image_has_active_no_redo_undo_peer_locked(
+                *descriptor, pending.bytes.size())) {
+          return DB_LOCK_WAIT;
+        }
+        char reason[256];
+        snprintf(reason, sizeof(reason),
+                 "unknown no-redo temporary undo dirty page page_no=%u "
+                 "page_type=%u stored_pages=%zu pending_pages=%zu",
+                 pending.page_no,
+                 static_cast<unsigned int>(
+                     trx_preserve_temp_space_image_no_redo_undo_page_type_for_reason(
+                         pending.bytes.data(), pending.bytes.size())),
+                 descriptor->no_redo_undo_pages.size(),
+                 descriptor->no_redo_undo_pending_pages.size());
+        trx_preserve_temp_space_image_mark_no_redo_undo_degraded_locked(
+            descriptor, reason);
+        return DB_UNSUPPORTED;
       }
-      if (trx_preserve_temp_space_image_has_active_no_redo_undo_peer_locked(
-              *descriptor, pending.bytes.size())) {
-        return DB_LOCK_WAIT;
-      }
-      trx_preserve_temp_space_image_mark_no_redo_undo_degraded_locked(
-          descriptor, "unknown no-redo temporary undo dirty page");
-      return DB_UNSUPPORTED;
     }
     dberr_t err = trx_preserve_temp_space_image_store_no_redo_undo_page(
         descriptor, kind, pending.page_no, pending.bytes.data(),
@@ -1913,10 +2144,6 @@ trx_preserve_temp_space_image_try_reserve_staged_dirty_page_bytes(
       "temp-table no-redo undo page queue budget exceeded";
   std::lock_guard<std::mutex> guard{
       trx_preserve_temp_dirty_page_streams_mutex};
-  if (trx_preserve_temp_stage_admission_closed_for_space_locked(
-          source_space_id)) {
-    return trx_preserve_temp_staged_dirty_page_budget_result::CLOSED;
-  }
 
   auto stream_it = trx_preserve_temp_dirty_page_streams.find(source_space_id);
   bool has_active_stream = false;
@@ -2010,7 +2237,6 @@ trx_preserve_temp_space_image_try_reserve_staged_dirty_page_bytes(
   }
   trx_preserve_temp_staged_dirty_page_bytes_reserve_locked(source_space_id,
                                                           page_bytes);
-  trx_preserve_temp_staged_dirty_page_count_reserve_locked(source_space_id);
   return trx_preserve_temp_staged_dirty_page_budget_result::RESERVED;
 }
 
@@ -2141,6 +2367,33 @@ dberr_t trx_preserve_temp_space_image_write_file_page_to_callback(
   } catch (const std::bad_alloc &) {
     return DB_OUT_OF_MEMORY;
   }
+}
+
+void trx_preserve_temp_space_image_mark_page_copy_failure(
+    trx_preserve_temp_space_image_descriptor *descriptor, const char *prefix,
+    uint64_t expected_page_no, size_t bytes_read, size_t expected_bytes,
+    const unsigned char *page, size_t page_bytes, my_off_t file_bytes) {
+  if (descriptor == nullptr) return;
+
+  constexpr size_t kFilPageOffset = 4;
+  constexpr size_t kFilPageSpaceIdOffset = 34;
+  uint32_t actual_page_no = 0;
+  uint32_t actual_space_id = 0;
+  if (page != nullptr && page_bytes >= kFilPageSpaceIdOffset + sizeof(uint32_t)) {
+    actual_page_no = mach_read_from_4(page + kFilPageOffset);
+    actual_space_id = mach_read_from_4(page + kFilPageSpaceIdOffset);
+  }
+
+  char reason[256];
+  snprintf(reason, sizeof(reason),
+           "%s expected_page=%llu actual_page=%u expected_space=%u "
+           "actual_space=%u bytes_read=%zu expected_bytes=%zu file_bytes=%lld",
+           prefix == nullptr ? "temp-table initial file copy failed" : prefix,
+           static_cast<unsigned long long>(expected_page_no), actual_page_no,
+           descriptor->source_space_id, actual_space_id, bytes_read,
+           expected_bytes, static_cast<long long>(file_bytes));
+  trx_preserve_temp_space_image_mark_dirty_page_stream_degraded(descriptor,
+                                                                reason);
 }
 
 dberr_t trx_preserve_temp_space_image_build_raw_sidecar_payload_low(
@@ -2693,10 +2946,20 @@ dberr_t trx_preserve_temp_space_image_copy_initial_file_pages(
       }
       const size_t bytes_read =
           my_read(file, page.data(), page.size(), MYF(0));
-      if (bytes_read != page.size() ||
-          !trx_preserve_temp_space_image_page_identity_matches(
+      if (bytes_read != page.size()) {
+        trx_preserve_temp_space_image_mark_page_copy_failure(
+            descriptor, "temp-table initial file short read", page_no,
+            bytes_read, page.size(), page.data(), page.size(), file_bytes);
+        err = DB_ERROR;
+        break;
+      }
+      if (!trx_preserve_temp_space_image_page_identity_matches(
               *descriptor, page.data(), page.size(),
               static_cast<uint32_t>(page_no))) {
+        trx_preserve_temp_space_image_mark_page_copy_failure(
+            descriptor, "temp-table initial file page identity mismatch",
+            page_no, bytes_read, page.size(), page.data(), page.size(),
+            file_bytes);
         err = DB_ERROR;
         break;
       }
@@ -2712,8 +2975,10 @@ dberr_t trx_preserve_temp_space_image_copy_initial_file_pages(
   }
   if (err != DB_SUCCESS) {
     trx_preserve_temp_space_image_reset_shadow(descriptor);
-    trx_preserve_temp_space_image_mark_dirty_page_stream_degraded(
-        descriptor, "temp-table initial file copy failed");
+    if (!descriptor->dirty_page_stream_degraded) {
+      trx_preserve_temp_space_image_mark_dirty_page_stream_degraded(
+          descriptor, "temp-table initial file copy failed");
+    }
   }
   return err;
 }
@@ -2757,10 +3022,20 @@ dberr_t trx_preserve_temp_space_image_copy_initial_file_pages_to_writer(
       }
       const size_t bytes_read =
           my_read(file, page.data(), page.size(), MYF(0));
-      if (bytes_read != page.size() ||
-          !trx_preserve_temp_space_image_page_identity_matches(
+      if (bytes_read != page.size()) {
+        trx_preserve_temp_space_image_mark_page_copy_failure(
+            descriptor, "temp-table initial file short read", page_no,
+            bytes_read, page.size(), page.data(), page.size(), file_bytes);
+        err = DB_ERROR;
+        break;
+      }
+      if (!trx_preserve_temp_space_image_page_identity_matches(
               *descriptor, page.data(), page.size(),
               static_cast<uint32_t>(page_no))) {
+        trx_preserve_temp_space_image_mark_page_copy_failure(
+            descriptor, "temp-table initial file page identity mismatch",
+            page_no, bytes_read, page.size(), page.data(), page.size(),
+            file_bytes);
         err = DB_ERROR;
         break;
       }
@@ -2775,8 +3050,10 @@ dberr_t trx_preserve_temp_space_image_copy_initial_file_pages_to_writer(
     err = DB_ERROR;
   }
   if (err != DB_SUCCESS) {
-    trx_preserve_temp_space_image_mark_dirty_page_stream_degraded(
-        descriptor, "temp-table initial file copy failed");
+    if (!descriptor->dirty_page_stream_degraded) {
+      trx_preserve_temp_space_image_mark_dirty_page_stream_degraded(
+          descriptor, "temp-table initial file copy failed");
+    }
     return err;
   }
 
@@ -3266,21 +3543,22 @@ dberr_t trx_preserve_temp_space_image_stage_dirty_page(
     degraded rather than letting a page disappear from the final image.
   */
   if (trx_preserve_temp_stage_admission_closed_for_space(source_space_id)) {
-    trx_preserve_temp_space_image_mark_stage_rejected_during_close(
-        source_space_id);
-    return DB_ERROR;
+    return trx_preserve_temp_space_image_mark_stage_rejected_during_close(
+               source_space_id)
+               ? DB_ERROR
+               : DB_SUCCESS;
   }
 
   trx_preserve_temp_staged_dirty_page_count.fetch_add(
       1, std::memory_order_acq_rel);
-  if (trx_preserve_temp_stage_admission_closed_for_space(source_space_id)) {
-    trx_preserve_temp_staged_dirty_page_count_sub(1);
-    trx_preserve_temp_space_image_mark_stage_rejected_during_close(
-        source_space_id);
-    return DB_ERROR;
+  {
+    std::lock_guard<std::mutex> guard{
+        trx_preserve_temp_dirty_page_streams_mutex};
+    trx_preserve_temp_staged_dirty_page_count_reserve_locked(source_space_id);
   }
 
   if (!trx_preserve_temp_space_image_may_have_active_stream(source_space_id)) {
+    trx_preserve_temp_staged_dirty_page_count_release(source_space_id);
     trx_preserve_temp_staged_dirty_page_count_sub(1);
     return DB_SUCCESS;
   }
@@ -3289,20 +3567,24 @@ dberr_t trx_preserve_temp_space_image_stage_dirty_page(
           source_space_id, page_bytes);
   if (budget_result ==
       trx_preserve_temp_staged_dirty_page_budget_result::NO_STREAM) {
+    trx_preserve_temp_staged_dirty_page_count_release(source_space_id);
     trx_preserve_temp_staged_dirty_page_count_sub(1);
     return DB_SUCCESS;
   }
   if (budget_result ==
       trx_preserve_temp_staged_dirty_page_budget_result::EXCEEDED) {
+    trx_preserve_temp_staged_dirty_page_count_release(source_space_id);
     trx_preserve_temp_staged_dirty_page_count_sub(1);
     return DB_OUT_OF_MEMORY;
   }
   if (budget_result ==
       trx_preserve_temp_staged_dirty_page_budget_result::CLOSED) {
+    trx_preserve_temp_staged_dirty_page_count_release(source_space_id);
     trx_preserve_temp_staged_dirty_page_count_sub(1);
-    trx_preserve_temp_space_image_mark_stage_rejected_during_close(
-        source_space_id);
-    return DB_ERROR;
+    return trx_preserve_temp_space_image_mark_stage_rejected_during_close(
+               source_space_id)
+               ? DB_ERROR
+               : DB_SUCCESS;
   }
 
   try {
@@ -3886,12 +4168,87 @@ dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
     }
     return DB_SUCCESS;
   }
+
+  if (trx->rsegs.m_noredo.rseg != nullptr ||
+      trx->rsegs.m_noredo.insert_undo != nullptr ||
+      trx->rsegs.m_noredo.update_undo != nullptr || trx->id == 0) {
+    return DB_ERROR;
+  }
+
+  trx_rseg_t *rseg = trx_preserve_temp_space_image_find_no_redo_rseg(
+      *descriptor);
+  if (rseg == nullptr) return DB_ERROR;
+
+  rseg->latch();
+  const bool insert_slot_busy =
+      descriptor->no_redo_insert_undo.present &&
+      trx_preserve_temp_space_image_rseg_slot_in_use(
+          rseg, descriptor->no_redo_insert_undo.undo_slot);
+  const bool update_slot_busy =
+      descriptor->no_redo_update_undo.present &&
+      trx_preserve_temp_space_image_rseg_slot_in_use(
+          rseg, descriptor->no_redo_update_undo.undo_slot);
+  rseg->unlatch();
+  if (insert_slot_busy || update_slot_busy) return DB_ERROR;
+
+  dberr_t err =
+      trx_preserve_temp_space_image_materialize_no_redo_undo_pages(*descriptor,
+                                                                  rseg);
+  if (err != DB_SUCCESS) return err;
+
+  trx_undo_t *insert_undo = nullptr;
+  trx_undo_t *update_undo = nullptr;
+  const ulint insert_size =
+      descriptor->no_redo_insert_undo.present
+          ? trx_preserve_temp_space_image_reconnected_undo_size(
+                *descriptor, descriptor->no_redo_insert_undo)
+          : 0;
+  const ulint update_size =
+      descriptor->no_redo_update_undo.present
+          ? trx_preserve_temp_space_image_reconnected_undo_size(
+                *descriptor, descriptor->no_redo_update_undo)
+          : 0;
+
+  if (descriptor->no_redo_insert_undo.present) {
+    insert_undo = trx_preserve_temp_space_image_create_reconnected_undo(
+        trx, rseg, descriptor->no_redo_insert_undo, TRX_UNDO_INSERT,
+        insert_size);
+    if (insert_undo == nullptr) return DB_ERROR;
+  }
+  if (descriptor->no_redo_update_undo.present) {
+    update_undo = trx_preserve_temp_space_image_create_reconnected_undo(
+        trx, rseg, descriptor->no_redo_update_undo, TRX_UNDO_UPDATE,
+        update_size);
+    if (update_undo == nullptr) {
+      trx_undo_mem_free(insert_undo);
+      return DB_ERROR;
+    }
+  }
+
   /*
-    Current release contract rejects temp-DML/no-redo undo resume. Keep this
-    fail-closed guard before any rseg lookup, undo-cache mutation, or page
-    materialization so legacy/crafted sidecars cannot write into srv_tmp_space.
+    Do not copy the historical rollback-segment header into the live system
+    temporary tablespace. The rseg belongs to the restarted server; its header,
+    slot bitmap and curr_size must stay consistent with the current allocator.
+    Restored no-redo undo objects are kept only in memory and their cleanup path
+    skips history/cache/file-segment free, so linking them does not require a
+    corresponding slot in the live rseg header.
   */
-  return DB_UNSUPPORTED;
+  mutex_enter(&rseg->mutex);
+  if (insert_undo != nullptr) {
+    UT_LIST_ADD_LAST(rseg->insert_undo_list, insert_undo);
+  }
+  if (update_undo != nullptr) {
+    UT_LIST_ADD_LAST(rseg->update_undo_list, update_undo);
+  }
+  ut_ad(rseg->validate_curr_size(false));
+  mutex_exit(&rseg->mutex);
+
+  trx->rsegs.m_noredo.rseg = rseg;
+  trx->rsegs.m_noredo.insert_undo = insert_undo;
+  trx->rsegs.m_noredo.update_undo = update_undo;
+  descriptor->no_redo_undo_pointers_reconnected = true;
+  descriptor->no_redo_undo_reconnected_trx = trx;
+  return DB_SUCCESS;
 }
 
 dberr_t trx_preserve_temp_space_image_disconnect_no_redo_undo_for_retry(

@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Preserve/Resume 8.0.22 用户手册</title>
+  <style>
+    :root { --ink:#18202a; --muted:#5f6b7a; --line:#d7dde6; --panel:#f7f9fc; --accent:#0f6b7a; --warn:#fff7e8; --danger:#fff7f8; --code:#eef3f8; }
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); line-height:1.65; background:#fff; }
+    main { max-width:1180px; margin:0 auto; padding:32px 36px 64px; }
+    h1,h2,h3 { line-height:1.25; color:#111827; }
+    h1 { font-size:32px; margin:0 0 8px; }
+    h2 { margin-top:34px; padding-top:16px; border-top:1px solid var(--line); }
+    h3 { margin-top:24px; }
+    code { font-family:"SFMono-Regular",Consolas,monospace; background:var(--code); padding:1px 5px; border-radius:4px; font-size:.92em; }
+    pre { background:#111827; color:#f8fafc; border-radius:8px; padding:14px 16px; overflow:auto; }
+    table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+    th,td { border:1px solid var(--line); padding:8px 10px; vertical-align:top; }
+    th { background:#eef3f8; text-align:left; }
+    .meta,.note,.warn,.review { border:1px solid var(--line); background:var(--panel); border-radius:8px; padding:14px 16px; margin:16px 0; }
+    .warn { background:var(--warn); border-color:#e6c27c; }
+    .danger { background:var(--danger); border-color:#e6b8c0; }
+    .diagram { margin:18px 0 26px; border:1px solid var(--line); border-radius:8px; overflow-x:auto; background:#fff; }
+    .diagram svg { display:block; min-width:900px; width:100%; height:auto; }
+    .box { fill:#f8fbff; stroke:#406078; stroke-width:1.3; rx:8; }
+    .box2 { fill:#f6fbf7; stroke:#3f7a52; stroke-width:1.3; rx:8; }
+    .box3 { fill:#fffaf0; stroke:#9a6a20; stroke-width:1.3; rx:8; }
+    .box4 { fill:#fff6f7; stroke:#a73a4b; stroke-width:1.3; rx:8; }
+    .arrow { stroke:#445566; stroke-width:1.6; fill:none; marker-end:url(#arrow); }
+    .dash { stroke-dasharray:5 4; }
+    .label { font-size:13px; fill:#17202a; }
+    .small { font-size:12px; fill:#4b5563; }
+    .title { font-size:15px; font-weight:700; fill:#111827; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#e6f4f6; color:var(--accent); font-weight:600; font-size:12px; }
+    .toc a { color:var(--accent); text-decoration:none; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Preserve/Resume 8.0.22 用户手册</h1>
+  <div class="meta">
+    <p><strong>读者对象：</strong>DBA、运维平台、内核支持、业务接入方。</p>
+    <p><strong>适用版本：</strong>当前 MySQL 8.0.22 preserve-port worktree；参数默认值和命令语法以当前源码为准。</p>
+    <p><strong>目标：</strong>说明如何使用 Preserve/Resume、如何配置参数、如何理解资源占用、如何处理失败和限制。</p>
+    <p><strong>事实源：</strong>命令语法来自 <code>sql/sql_yacc.yy</code> 和 <code>sql/sql_parse.cc</code>；参数来自 <code>sql/sys_vars.cc</code>；实现逻辑来自 preserve、binlog warmcopy、lock warmcopy、InnoDB preserve 和 P_S 相关源码。</p>
+  </div>
+
+  <div class="meta">
+    <p><strong>文档套件导航：</strong>
+      <a href="preserve-resume-8.0.22-detailed-design.html">全面详细设计</a> ·
+      <a href="preserve-resume-8.0.22-user-manual.html">用户手册</a> ·
+      <a href="preserve-resume-8.0.22-engineer-handoff.html">新同事交接</a> ·
+      <a href="preserve-resume-8.0.22-replica-drain-resume-design.html">物理复制集群接入方案</a> ·
+      <a href="preserve-resume-8.0.22-code-analysis.html">代码详解</a>
+    </p>
+  </div>
+
+  <h2>覆盖清单</h2>
+  <table>
+    <thead><tr><th>计划要求</th><th>本文覆盖位置</th><th>核对方式</th></tr></thead>
+    <tbody>
+      <tr><td>四条用户命令</td><td>第 2 节：单事务 preserve、batch drain、resume、show</td><td>与 <code>sql/sql_yacc.yy</code>、<code>include/my_sqlcommand.h</code> 对照</td></tr>
+      <tr><td>全量 <code>preserve_trx_*</code> 参数</td><td>第 4 节参数总表</td><td>与 <code>sql/sys_vars.cc</code> 的 42 个参数对照</td></tr>
+      <tr><td>权限、可见性、P_S 查询</td><td>第 3 节和第 2.4 节</td><td>与 P_S 表和 resume 权限逻辑对照</td></tr>
+      <tr><td>大事务、大锁、binlog cache、临时表场景</td><td>第 5 节</td><td>与 warmcopy、lock export、temp sidecar 实现对照</td></tr>
+      <tr><td>约束和排障</td><td>第 6 节</td><td>按 fail-closed、fallback、unsupported family 和 release gate 边界核对</td></tr>
+    </tbody>
+  </table>
+
+  <h2>目录</h2>
+  <ol class="toc">
+    <li><a href="#quick">快速理解</a></li>
+    <li><a href="#commands">命令用法</a></li>
+    <li><a href="#privileges">权限与可见性</a></li>
+    <li><a href="#params">参数总表</a></li>
+    <li><a href="#scenarios">典型场景</a></li>
+    <li><a href="#trouble">排障与限制</a></li>
+    <li><a href="#review">文档 Review 记录</a></li>
+  </ol>
+
+  <h2 id="quick">1. 快速理解</h2>
+  <p>Preserve/Resume 允许把未提交的显式事务保存为 token，重启后用 token 恢复到新连接。保存的是事务语义，不是自动提交结果；恢复后用户仍要执行 <code>COMMIT</code> 或 <code>ROLLBACK</code>。</p>
+  <div class="diagram" aria-label="快速流程">
+    <svg viewBox="0 0 1000 300" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">用户视角快速流程</text>
+      <rect x="50" y="90" width="150" height="58" class="box"/><text x="82" y="124" class="label">事务执行中</text>
+      <rect x="250" y="90" width="170" height="58" class="box2"/><text x="280" y="114" class="label">Preserve / Drain</text><text x="280" y="136" class="small">返回 token</text>
+      <rect x="470" y="90" width="150" height="58" class="box3"/><text x="512" y="124" class="label">重启</text>
+      <rect x="670" y="90" width="170" height="58" class="box2"/><text x="700" y="114" class="label">RESUME token</text><text x="700" y="136" class="small">继续事务</text>
+      <rect x="670" y="205" width="170" height="58" class="box"/><text x="705" y="239" class="label">COMMIT / ROLLBACK</text>
+      <path d="M200 119 L250 119" class="arrow"/><path d="M420 119 L470 119" class="arrow"/><path d="M620 119 L670 119" class="arrow"/><path d="M755 148 L755 205" class="arrow"/>
+    </svg>
+  </div>
+
+  <div class="warn">
+    <strong>核心原则：</strong>Preserve/Resume 是 fail closed 能力。事务无法完整保存时，命令应失败或回退安全路径，而不是生成语义不完整的 token。
+  </div>
+
+  <h2 id="commands">2. 命令用法</h2>
+  <h3>2.1 单事务 Preserve</h3>
+  <pre><code>START TRANSACTION;
+UPDATE t SET v = v + 1 WHERE id = 1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;</code></pre>
+  <p>可选项包括 <code>WITH TIMEOUT n</code>、<code>WITH USER VARS</code>、<code>WITH NO USER VARS</code>。成功后服务端返回 token，并触发 shutdown 流程。token 应安全保存，后续用于 resume。</p>
+
+  <h3>2.2 Batch Drain Preserve</h3>
+  <pre><code>DR&#65;IN TRANSACTIONS PRESERVE WITH TIMEOUT 1800 WITH USER VARS;</code></pre>
+  <p>该命令由控制连接执行，用于停机前批量保存实例上的 eligible 事务。控制连接自身不能处于显式事务中。SOFT 模式先等待活跃事务自然收敛，超时后按配置升级；HARD 模式会杀掉其他活跃用户事务以收敛停机。</p>
+
+  <div class="diagram" aria-label="batch drain操作图">
+    <svg viewBox="0 0 1050 360" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">DBA 执行 DR&#65;IN TRANSACTIONS PRESERVE</text>
+      <rect x="45" y="90" width="160" height="58" class="box"/><text x="82" y="124" class="label">控制连接</text>
+      <rect x="255" y="90" width="160" height="58" class="box2"/><text x="288" y="113" class="label">进入 drain</text><text x="288" y="135" class="small">阻止新高风险命令</text>
+      <rect x="465" y="90" width="160" height="58" class="box2"/><text x="488" y="113" class="label">收敛目标事务</text><text x="488" y="135" class="small">idle / quiesced</text>
+      <rect x="675" y="90" width="160" height="58" class="box3"/><text x="710" y="113" class="label">写 snapshot</text><text x="710" y="135" class="small">token published</text>
+      <rect x="465" y="235" width="370" height="58" class="box4"/><text x="500" y="269" class="label">容量不足、目标不支持或 artifact 无效：fail closed 或 fallback</text>
+      <path d="M205 119 L255 119" class="arrow"/><path d="M415 119 L465 119" class="arrow"/><path d="M625 119 L675 119" class="arrow"/><path d="M545 148 L610 235" class="arrow dash"/>
+    </svg>
+  </div>
+
+  <h3>2.3 Resume</h3>
+  <pre><code>RESUME PRESERVED TRANSACTION '&lt;token&gt;';
+COMMIT;</code></pre>
+  <p>Resume 成功后，当前连接持有恢复后的事务。用户可以继续执行 SQL，然后提交或回滚。默认只能恢复自己账号创建的 token；跨账号恢复需要动态权限。</p>
+
+  <h3>2.4 查看 token</h3>
+  <pre><code>SHOW PRESERVED TRANSACTIONS;
+
+SELECT TOKEN, USER, HOST, STATE, EXPIRES_AT, BINLOG_STATE,
+       BINLOG_CACHE_SIZE, BINLOG_WARMCOPY_STATE, TEMP_TABLE_STATE, LAST_ERROR
+  FROM performance_schema.preserved_transactions;</code></pre>
+
+  <h2 id="privileges">3. 权限与可见性</h2>
+  <table>
+    <thead><tr><th>操作</th><th>权限要求</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>单事务 preserve</td><td><code>SHUTDOWN</code></td><td>当前连接必须有显式活跃事务。</td></tr>
+      <tr><td>batch drain preserve</td><td><code>SHUTDOWN</code></td><td>控制连接不能处于显式事务。</td></tr>
+      <tr><td>resume 自己的 token</td><td>token owner</td><td>仍会检查当前连接能否接收事务和对象权限。</td></tr>
+      <tr><td>跨账号 resume</td><td><code>RESUME_ANY_PRESERVED_TRANSACTION</code></td><td>不绕过对象权限复检。</td></tr>
+      <tr><td>查看他人 token</td><td><code>PROCESS</code> 或 <code>RESUME_ANY_PRESERVED_TRANSACTION</code></td><td>无足够权限时 token 会脱敏或不可见。</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="params">4. 参数总表</h2>
+  <p>以下参数全部来自 <code>sql/sys_vars.cc</code>。用户手册按用途分组说明，避免把 binlog warmcopy、lock warmcopy、通用内存预算混为一类。</p>
+
+  <h3>4.1 基础开关、目录与容量</h3>
+  <table>
+    <thead><tr><th>参数</th><th>默认值</th><th>含义与注意事项</th></tr></thead>
+    <tbody>
+      <tr><td><code>preserve_trx_enable</code></td><td>ON</td><td>总开关。关闭时 preserve、drain、resume 拒绝；已有 preserve/drain 活动时不能随意关闭。</td></tr>
+      <tr><td><code>preserve_trx_dir</code></td><td>datadir 派生目录</td><td>保存 snapshot、sidecar、warm external blob；不是普通运行时调参项。</td></tr>
+      <tr><td><code>preserve_trx_max_total</code></td><td>256</td><td>实例最多保留 token 数。</td></tr>
+      <tr><td><code>preserve_trx_max_pending_per_user</code></td><td>256</td><td>单账号最多 pending token 数。</td></tr>
+      <tr><td><code>preserve_trx_batch_max_transactions</code></td><td>256</td><td>单次 batch drain 最多保存目标事务数。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>4.2 Timeout、Recovery 与文件大小</h3>
+  <table>
+    <thead><tr><th>参数</th><th>默认值</th><th>含义与注意事项</th></tr></thead>
+    <tbody>
+      <tr><td><code>preserve_trx_default_timeout</code></td><td>300 秒</td><td>未显式 <code>WITH TIMEOUT</code> 时使用。</td></tr>
+      <tr><td><code>preserve_trx_min_timeout</code></td><td>60 秒</td><td>用户指定 timeout 下限。</td></tr>
+      <tr><td><code>preserve_trx_max_timeout</code></td><td>86400 秒</td><td>用户指定 timeout 上限。</td></tr>
+      <tr><td><code>preserve_trx_recovery_max_count</code></td><td>3</td><td>同一 token 最多经历 startup recovery 次数。</td></tr>
+      <tr><td><code>preserve_trx_recovery_grace_seconds</code></td><td>120 秒</td><td>首次 recovery 处理已过期 token 的宽限期。</td></tr>
+      <tr><td><code>preserve_trx_max_snapshot_bytes</code></td><td>16 MiB</td><td>snapshot metadata 最大大小。</td></tr>
+      <tr><td><code>preserve_trx_max_binlog_cache_bytes</code></td><td>1 GiB</td><td>单事务 binlog cache sidecar 上限。</td></tr>
+      <tr><td><code>preserve_trx_max_temp_sidecar_bytes</code></td><td>1 GiB</td><td>单个临时表 image 或 undo sidecar 上限。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>4.3 内存、Spill、锁与 Drain</h3>
+  <table>
+    <thead><tr><th>参数</th><th>默认值</th><th>含义与注意事项</th></tr></thead>
+    <tbody>
+      <tr><td><code>preserve_trx_memory_budget_bytes</code></td><td>256 MiB</td><td>通用 heap lease 总预算，不是 MySQL 总内存。</td></tr>
+      <tr><td><code>preserve_trx_memory_per_token_bytes</code></td><td>64 MiB</td><td>单 token 通用 heap lease 预算。</td></tr>
+      <tr><td><code>preserve_trx_spill_chunk_bytes</code></td><td>4 MiB</td><td>大 artifact 流式写入 scratch chunk。</td></tr>
+      <tr><td><code>preserve_trx_max_lock_count</code></td><td>2000</td><td>单事务 record/table/materialized implicit lock 合计预算。</td></tr>
+      <tr><td><code>preserve_trx_max_modified_tables</code></td><td>64</td><td>单事务 modified table 上限，也影响 implicit lock 扫描准入。</td></tr>
+      <tr><td><code>preserve_trx_max_scan_pages</code></td><td>20000</td><td>implicit lock materialization 最多扫描页数。</td></tr>
+      <tr><td><code>preserve_trx_materialize_timeout_ms</code></td><td>5000 ms</td><td>implicit lock materialization 最大耗时。</td></tr>
+      <tr><td><code>preserve_trx_drain_mode</code></td><td>SOFT</td><td>SOFT 先等待活跃事务，HARD 直接杀其他活跃用户事务。</td></tr>
+      <tr><td><code>preserve_trx_drain_grace_ms</code></td><td>30000 ms</td><td>SOFT 等待时间。</td></tr>
+      <tr><td><code>preserve_trx_drain_hard_timeout_ms</code></td><td>30000 ms</td><td>HARD 等待活跃事务消失的最长时间。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>4.4 Binlog Warmcopy</h3>
+  <table>
+    <thead><tr><th>参数</th><th>默认值</th><th>含义与注意事项</th></tr></thead>
+    <tbody>
+      <tr><td><code>preserve_trx_warmcopy_enable</code></td><td>ON</td><td>控制 binlog cache warmcopy，不控制 lock warmcopy。</td></tr>
+      <tr><td><code>preserve_trx_warmcopy_min_open_ms</code></td><td>1000 ms</td><td>phase 1 admission 最少保持时间。</td></tr>
+      <tr><td><code>preserve_trx_warmcopy_close_timeout_ms</code></td><td>30000 ms</td><td>关闭 admission 并等待 mirror 收敛的上限。</td></tr>
+      <tr><td><code>preserve_trx_warmcopy_chunk_bytes</code></td><td>1 MiB</td><td>phase 1 prefix copy 外层循环 chunk。</td></tr>
+      <tr><td><code>preserve_trx_warmcopy_tail_budget_bytes</code></td><td>1 MiB</td><td>phase 2 tail 预算。</td></tr>
+      <tr><td><code>preserve_trx_warmcopy_max_total_bytes</code></td><td>10 GiB</td><td>单个 drain epoch warm external blob 总预算，不是堆内存总量。</td></tr>
+      <tr><td><code>preserve_trx_warmcopy_pending_range_limit</code></td><td>1024</td><td>单 participant out-of-order mirror ranges 数量限制。</td></tr>
+      <tr><td><code>preserve_trx_warmcopy_pending_bytes_limit</code></td><td>64 MiB</td><td>单 participant pending mirror payload 字节限制。</td></tr>
+      <tr><td><code>preserve_trx_single_phase_max_binlog_cache_bytes</code></td><td>ULLONG_MAX</td><td>没有 warmcopy provider 时，允许单阶段复制的 logged binlog cache 上限。</td></tr>
+    </tbody>
+  </table>
+
+  <div class="diagram" aria-label="warmcopy资源模型">
+    <svg viewBox="0 0 1040 380" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">Binlog Warmcopy 资源模型</text>
+      <rect x="55" y="85" width="190" height="70" class="box"/><text x="85" y="116" class="label">Source binlog cache</text><text x="85" y="138" class="small">已有内存/磁盘 cache</text>
+      <rect x="310" y="85" width="190" height="70" class="box2"/><text x="342" y="116" class="label">Phase 1 prefix copy</text><text x="342" y="138" class="small">chunk 流式复制</text>
+      <rect x="565" y="85" width="190" height="70" class="box3"/><text x="600" y="116" class="label">Warm external blob</text><text x="600" y="138" class="small">总预算 10 GiB 默认</text>
+      <rect x="565" y="230" width="190" height="70" class="box4"/><text x="598" y="260" class="label">Phase 2 tail</text><text x="598" y="282" class="small">默认 1 MiB</text>
+      <path d="M245 120 L310 120" class="arrow"/><path d="M500 120 L565 120" class="arrow"/><path d="M660 155 L660 230" class="arrow dash"/>
+      <text x="120" y="220" class="small">reservation = copied prefix + tail budget</text>
+      <text x="120" y="246" class="small">不会因为 max_total=1TiB 就预分配 1TiB 堆内存</text>
+    </svg>
+  </div>
+
+  <h3>4.5 Lock Warmcopy 与并行 Preserve</h3>
+  <table>
+    <thead><tr><th>参数</th><th>默认值</th><th>含义与注意事项</th></tr></thead>
+    <tbody>
+      <tr><td><code>preserve_trx_lock_warmcopy_enable</code></td><td>ON</td><td>控制锁语义 warmcopy，与 binlog warmcopy 独立。</td></tr>
+      <tr><td><code>preserve_trx_lock_warmcopy_fallback_to_live_export</code></td><td>ON</td><td>artifact 无效时整 target 回退 live export；OFF 时 fail closed。</td></tr>
+      <tr><td><code>preserve_trx_lock_warmcopy_max_memory_bytes</code></td><td>256 MiB</td><td>lock artifact payload 内存保留预算，不是所有 lock store/journal 堆内存总上限。</td></tr>
+      <tr><td><code>preserve_trx_lock_warmcopy_max_journal_bytes</code></td><td>1 GiB</td><td>单次 drain epoch lock journal 字节上限。</td></tr>
+      <tr><td><code>preserve_trx_lock_warmcopy_max_dirty_shards</code></td><td>100000</td><td>phase 2 可重验 dirty record shards 上限。</td></tr>
+      <tr><td><code>preserve_trx_lock_warmcopy_max_mdl_descriptors</code></td><td>100000</td><td>MDL transaction-duration descriptor 上限。</td></tr>
+      <tr><td><code>preserve_trx_lock_warmcopy_seal_threads</code></td><td>0</td><td>当前按 reserved/serial 理解；只有底层大锁拆除后才有并行收益。</td></tr>
+      <tr><td><code>preserve_trx_parallel_preserve_threads</code></td><td>0</td><td>0=auto，1=legacy serial，大于 1 允许 batch phase 2 target preserve worker。</td></tr>
+      <tr><td><code>preserve_trx_lock_warmcopy_conversion_wait_timeout_ms</code></td><td>30000 ms</td><td>其它会话撞到 conversion freeze 后等待重试的上限，仍受 drain deadline、KILL、shutdown 约束。</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="scenarios">5. 典型场景</h2>
+  <h3>5.1 维护窗口保存一个长事务</h3>
+  <pre><code>START TRANSACTION;
+UPDATE orders SET state = 'processing' WHERE id = 1001;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 3600 WITH USER VARS;</code></pre>
+  <p>重启后执行：</p>
+  <pre><code>RESUME PRESERVED TRANSACTION '&lt;token&gt;';
+COMMIT;</code></pre>
+
+  <h3>5.2 停机前批量保存空闲事务</h3>
+  <pre><code>SET GLOBAL preserve_trx_drain_mode = 'SOFT';
+SET GLOBAL preserve_trx_batch_max_transactions = 1000;
+DR&#65;IN TRANSACTIONS PRESERVE WITH TIMEOUT 1800;</code></pre>
+  <p>如果需要更强收敛，可改用 HARD，但要接受活跃用户事务被杀。</p>
+
+  <h3>5.3 大 binlog cache</h3>
+  <p>大事务启用 binlog 时，需要同时关注普通 MySQL binlog cache、单事务 sidecar 上限和 warmcopy 总预算。<code>preserve_trx_warmcopy_max_total_bytes</code> 控制单个 drain epoch 可接收的 warm external blob 总量；调大它主要增加允许接收的 artifact 容量和磁盘 IO，不表示预分配同等堆内存。</p>
+
+  <h3>5.4 锁很多的大事务</h3>
+  <p>锁预算首先受 <code>preserve_trx_max_lock_count</code> 控制。这里的锁包括 record locks、table locks、predicate locks、AUTO_INC locks 和 materialized implicit locks；read view、savepoint、MDL 也会进入恢复语义校验。当前 full 1s 目标要求大锁对象尽量在 phase 1 mirror 和 external artifact 中处理；如果 phase 2 仍重扫、排序、编码大量锁，就只能保证功能正确，不能宣称 1s SLO。</p>
+
+  <h3>5.5 用户临时表</h3>
+  <p><code>preserve_trx_temp_table_enable=ON</code> 时支持受约束的用户 InnoDB temporary table。临时表 sidecar 包含 DD metadata、physical image、dict binding 和必要的 undo 描述。遇到 no-redo undo resume 当前不支持的形态时，应 fail closed。</p>
+
+  <h2 id="trouble">6. 排障与限制</h2>
+  <div class="diagram" aria-label="排障决策树">
+    <svg viewBox="0 0 1030 420" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">Preserve/Resume 排障决策树</text>
+      <rect x="70" y="80" width="180" height="58" class="box"/><text x="102" y="114" class="label">命令失败</text>
+      <rect x="310" y="45" width="180" height="58" class="box2"/><text x="340" y="79" class="label">权限 / 开关</text>
+      <rect x="310" y="145" width="180" height="58" class="box2"/><text x="342" y="179" class="label">容量 / timeout</text>
+      <rect x="550" y="45" width="180" height="58" class="box3"/><text x="582" y="79" class="label">对象不支持</text>
+      <rect x="550" y="145" width="180" height="58" class="box3"/><text x="584" y="179" class="label">artifact 无效</text>
+      <rect x="790" y="95" width="180" height="58" class="box4"/><text x="820" y="129" class="label">看 P_S / LAST_ERROR</text>
+      <path d="M250 109 L310 74" class="arrow"/><path d="M250 109 L310 174" class="arrow"/><path d="M490 74 L550 74" class="arrow"/><path d="M490 174 L550 174" class="arrow"/><path d="M730 74 L790 124" class="arrow"/><path d="M730 174 L790 124" class="arrow"/>
+      <rect x="310" y="285" width="420" height="58" class="box4"/><text x="342" y="319" class="label">已越过 durable point 的失败：不要手工删文件，先看 token 状态与错误原因</text>
+    </svg>
+  </div>
+
+  <table>
+    <thead><tr><th>症状</th><th>优先检查</th><th>处理建议</th></tr></thead>
+    <tbody>
+      <tr><td>Preserve 命令被拒绝</td><td>总开关、权限、是否显式事务、XA/复制/升级/force recovery 状态。</td><td>先修正环境；不要绕过 fail-closed 检查。</td></tr>
+      <tr><td>Batch drain 不收敛</td><td><code>preserve_trx_drain_mode</code>、grace、hard timeout、活跃事务列表。</td><td>SOFT 适合温和维护，HARD 适合强停机。</td></tr>
+      <tr><td>Warmcopy 预算耗尽</td><td>binlog cache 大小、warmcopy total、tail budget、pending range。</td><td>调大预算前先确认 preserve 目录磁盘空间和 IO 能力。</td></tr>
+      <tr><td>锁导出失败</td><td>lock count、modified table、scan pages、materialize timeout、spatial predicate。</td><td>调参只能放宽已支持形态；unsupported shape 仍会失败。</td></tr>
+      <tr><td>Resume 失败</td><td>token owner、read_only、binlog/GTID 模式、对象权限、snapshot integrity。</td><td>保留 token 和 sidecar，查看 P_S <code>LAST_ERROR</code>。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>6.1 当前不支持或不承诺的范围</h3>
+  <ul>
+    <li>不支持把 <code>LOCK TABLES</code>、<code>GET_LOCK()</code>、global read lock、backup lock、HANDLER 等会话/全局状态作为 v1 preserve 目标。</li>
+    <li>R-tree/spatial predicate locks 不做 lock warmcopy 优化，fallback ON 走 live export，fallback OFF reject。</li>
+    <li>物理复制集群中的跨机 artifact 同步和备机自动 resume 是接入方案，不是当前代码已经完成的能力。</li>
+    <li>phase 2 约 1 秒是性能目标；超过后功能仍应按正确语义继续，除非测试以 strict SLO 模式判失败。</li>
+  </ul>
+
+  <h2 id="review">7. 文档 Review 记录</h2>
+  <div class="review">
+    <p><span class="pill">Source correctness</span> 命令、权限、参数列表已按 <code>sql/sql_yacc.yy</code>、<code>sql/sql_parse.cc</code>、<code>sql/sys_vars.cc</code> 和现有用户手册核对。</p>
+    <p><span class="pill">Completeness</span> 覆盖 42 个 <code>preserve_trx_*</code> 参数、4 条用户命令、P_S 查询、典型大事务/大锁/binlog/临时表场景。</p>
+    <p><span class="pill">Reader usability</span> 操作路径按 DBA 使用顺序组织，并把资源预算和失败处理分开说明。</p>
+    <p><span class="pill">Diagram consistency</span> 4 张 SVG 图均为内联图，无外部依赖。</p>
+    <p><strong>剩余限制：</strong>本文不是发布验收报告；最终是否可对外宣称 phase 2 约 1 秒，以 NFR 和 release gate 证据为准。</p>
+  </div>
+</main>
+</body>
+</html>

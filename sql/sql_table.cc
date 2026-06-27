@@ -17067,6 +17067,7 @@ bool mysql_alter_table(THD *thd, const char *new_db, const char *new_name,
   }
 
   if (table->s->tmp_table != NO_TMP_TABLE) {
+    (void)preserve_trx_temp_table_note_table_alter(thd, table);
     /* Close lock if this is a transactional table */
     if (thd->lock) {
       if (thd->locked_tables_mode != LTM_LOCK_TABLES &&

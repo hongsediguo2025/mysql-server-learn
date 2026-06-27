@@ -14,9 +14,9 @@ INSERT INTO t_temp_unsupported_column_base VALUES(1, 10);
 
 CREATE TEMPORARY TABLE tmp_temp_unsupported_column(
   id INT PRIMARY KEY,
-  payload BLOB
+  payload DECIMAL(10,2) NOT NULL
 ) ENGINE=InnoDB;
-INSERT INTO tmp_temp_unsupported_column VALUES(1, 'payload');
+INSERT INTO tmp_temp_unsupported_column VALUES(1, 12.34);
 
 START TRANSACTION;
 UPDATE t_temp_unsupported_column_base SET v = 11 WHERE id = 1;

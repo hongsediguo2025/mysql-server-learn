@@ -659,6 +659,8 @@ void Sql_cmd_truncate_table::truncate_temporary(THD *thd,
   /* Note that a temporary table cannot be partitioned. */
   if (hton->flags & HTON_CAN_RECREATE) {
     tmp_table->file->info(HA_STATUS_AUTO | HA_STATUS_NO_LOCK);
+    if (preserve_temp_truncate)
+      (void)preserve_trx_temp_table_note_table_truncate(thd, tmp_table);
     /*
       If LOCK TABLES list is not empty and contains this table
       then unlock the table and remove it from this list.
@@ -706,11 +708,11 @@ void Sql_cmd_truncate_table::truncate_temporary(THD *thd,
       return;
     }
 
-    /* Only binlog if truncate-by-recreate succeeds. */
     if (preserve_temp_truncate)
       (void)preserve_trx_temp_table_note_table_truncate(
           thd, table_ref->db, strlen(table_ref->db), table_ref->table_name,
           strlen(table_ref->table_name));
+    /* Only binlog if truncate-by-recreate succeeds. */
     /* In RBR, the statement is not binlogged if the table is temporary. */
     binlog_stmt = !thd->is_current_stmt_binlog_format_row();
     return;

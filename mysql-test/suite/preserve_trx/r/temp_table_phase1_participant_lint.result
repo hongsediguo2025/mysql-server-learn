@@ -1,0 +1,6 @@
+# Lint-only source-shape guard for temp-table phase-1 drain wiring.
+# User temporary-table DML support needs an early capture epoch in
+# WARMCOPY_DRAINING, before quiesced snapshot writing begins.
+SELECT 'ok' AS temp_table_phase1_participant_lint;
+temp_table_phase1_participant_lint
+ok

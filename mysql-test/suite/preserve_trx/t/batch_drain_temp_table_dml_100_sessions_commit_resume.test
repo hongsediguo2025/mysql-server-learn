@@ -1,0 +1,162 @@
+--source include/big_test.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $setup_file = File::Spec->catfile($vardir, 'tmp', 'batch_temp_100_setup.inc');
+my $apps_file = File::Spec->catfile($vardir, 'tmp', 'batch_temp_100_apps.inc');
+my $disconnect_file = File::Spec->catfile($vardir, 'tmp', 'batch_temp_100_disconnect.inc');
+my $cleanup_file = File::Spec->catfile($vardir, 'tmp', 'batch_temp_100_cleanup.inc');
+
+open(my $setup, '>', $setup_file) or die $!;
+open(my $apps, '>', $apps_file) or die $!;
+open(my $disconnect, '>', $disconnect_file) or die $!;
+open(my $cleanup, '>', $cleanup_file) or die $!;
+
+print $cleanup "DROP TABLE IF EXISTS t_batch_temp_base;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_temp_check;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_temp_tokens;\n";
+print $setup "CREATE TABLE t_batch_temp_base(" .
+             "sid INT PRIMARY KEY, v INT NOT NULL) ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_batch_temp_check(" .
+             "sid INT PRIMARY KEY, temp_rows INT NOT NULL, " .
+             "temp_sum BIGINT NOT NULL) ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_batch_temp_tokens(" .
+             "session_id INT PRIMARY KEY AUTO_INCREMENT, " .
+             "token VARBINARY(64) NOT NULL) ENGINE=InnoDB;\n";
+
+for my $sid (1 .. 100) {
+  my $app_name = sprintf("batch_temp_app_%03d", $sid);
+  print $apps "--connect($app_name,localhost,root,,test)\n";
+  print $apps "--connection $app_name\n";
+  print $apps "CREATE TEMPORARY TABLE tmp_batch_temp(" .
+              "id INT PRIMARY KEY, v INT NOT NULL, KEY(v)) ENGINE=InnoDB;\n";
+  print $apps "START TRANSACTION;\n";
+  print $apps "INSERT INTO tmp_batch_temp VALUES(1, " . ($sid * 100 + 1) .
+              "),(2, " . ($sid * 100 + 2) . ");\n";
+  print $apps "UPDATE tmp_batch_temp SET v = v + 10 WHERE id = 1;\n";
+  print $apps "INSERT INTO t_batch_temp_base VALUES($sid, " .
+              ($sid * 10) . ");\n";
+  print $apps "UPDATE t_batch_temp_base SET v = v + 1 WHERE sid = $sid;\n";
+  print $disconnect "--disconnect $app_name\n";
+}
+print $apps "--connection default\n";
+print $disconnect "--connection default\n";
+
+close($setup);
+close($apps);
+close($disconnect);
+close($cleanup);
+EOF
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/batch_temp_100_cleanup.inc
+--source $MYSQLTEST_VARDIR/tmp/batch_temp_100_setup.inc
+--enable_result_log
+--enable_query_log
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+--let $old_preserve_trx_max_temp_sidecar_bytes= `SELECT @@GLOBAL.preserve_trx_max_temp_sidecar_bytes`
+SET GLOBAL preserve_trx_recovery_max_count=200;
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/batch_temp_100_apps.inc
+--enable_result_log
+--enable_query_log
+
+--let $wait_condition= SELECT COUNT(*) = 100 FROM performance_schema.threads WHERE PROCESSLIST_USER = 'root' AND PROCESSLIST_DB = 'test' AND PROCESSLIST_COMMAND = 'Sleep'
+--source include/wait_condition.inc
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON --preserve-trx-lock-warmcopy-enable=OFF --preserve-trx-recovery-max-count=200 --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+INSERT INTO t_batch_temp_tokens(token)
+SELECT TOKEN
+  FROM performance_schema.preserved_transactions
+ ORDER BY TOKEN;
+
+SELECT COUNT(*) AS mapped_token_count
+  FROM t_batch_temp_tokens;
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+--disable_query_log
+SET SESSION group_concat_max_len=1000000;
+--let $write_to_file= $MYSQLTEST_VARDIR/tmp/batch_temp_100_resume.inc
+--let $write_var= `SELECT GROUP_CONCAT(CONCAT('--connect(batch_temp_resume_', LPAD(session_id, 3, '0'), ',localhost,root,,test)\\n', '--connection batch_temp_resume_', LPAD(session_id, 3, '0'), '\\n', 'RESUME PRESERVED TRANSACTION \"', token, '\";\\n', 'SET @batch_temp_sid = NULL;\\n', 'SELECT FLOOR(MIN(v) / 100) INTO @batch_temp_sid FROM tmp_batch_temp;\\n', 'INSERT INTO t_batch_temp_check SELECT @batch_temp_sid, COUNT(*), SUM(v) FROM tmp_batch_temp;\\n', 'COMMIT;\\n') ORDER BY session_id SEPARATOR '') FROM t_batch_temp_tokens`
+--source include/write_var_to_file.inc
+--enable_query_log
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/batch_temp_100_disconnect.inc
+--source $MYSQLTEST_VARDIR/tmp/batch_temp_100_resume.inc
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $file = File::Spec->catfile($vardir, 'tmp',
+                               'batch_temp_100_resume_disconnect.inc');
+open(my $fh, '>', $file) or die "cannot open $file for write: $!";
+for my $idx (1 .. 100) {
+  my $name = sprintf("batch_temp_resume_%03d", $idx);
+  print $fh "--disconnect $name\n";
+}
+print $fh "--connection default\n";
+close($fh);
+EOF
+--source $MYSQLTEST_VARDIR/tmp/batch_temp_100_resume_disconnect.inc
+--enable_result_log
+--enable_query_log
+
+SELECT COUNT(*) AS preserved_count_after_resume
+  FROM performance_schema.preserved_transactions;
+
+SELECT COUNT(*) AS base_rows, SUM(v) AS base_sum
+  FROM t_batch_temp_base;
+
+SELECT COUNT(*) AS checked_sessions,
+       SUM(temp_rows) AS checked_temp_rows,
+       SUM(temp_sum) AS checked_temp_sum
+  FROM t_batch_temp_check;
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/batch_temp_100_cleanup.inc
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_max_temp_sidecar_bytes=$old_preserve_trx_max_temp_sidecar_bytes
+--enable_result_log
+--enable_query_log
+
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+
+--remove_file $MYSQLTEST_VARDIR/tmp/batch_temp_100_setup.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/batch_temp_100_apps.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/batch_temp_100_disconnect.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/batch_temp_100_cleanup.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/batch_temp_100_resume.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/batch_temp_100_resume_disconnect.inc

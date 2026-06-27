@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Preserve/Resume 8.0.22 新同事交接文档</title>
+  <style>
+    :root { --ink:#18202a; --muted:#5f6b7a; --line:#d7dde6; --panel:#f7f9fc; --accent:#0f6b7a; --code:#eef3f8; }
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); line-height:1.65; background:#fff; }
+    main { max-width:1180px; margin:0 auto; padding:32px 36px 64px; }
+    h1,h2,h3 { color:#111827; line-height:1.25; }
+    h1 { font-size:32px; margin:0 0 8px; }
+    h2 { margin-top:34px; padding-top:16px; border-top:1px solid var(--line); }
+    h3 { margin-top:24px; }
+    code { font-family:"SFMono-Regular",Consolas,monospace; background:var(--code); padding:1px 5px; border-radius:4px; font-size:.92em; }
+    pre { background:#111827; color:#f8fafc; border-radius:8px; padding:14px 16px; overflow:auto; }
+    table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+    th,td { border:1px solid var(--line); padding:8px 10px; vertical-align:top; }
+    th { background:#eef3f8; text-align:left; }
+    .meta,.note,.review { border:1px solid var(--line); background:var(--panel); border-radius:8px; padding:14px 16px; margin:16px 0; }
+    .diagram { margin:18px 0 26px; border:1px solid var(--line); border-radius:8px; overflow-x:auto; background:#fff; }
+    .diagram svg { display:block; min-width:900px; width:100%; height:auto; }
+    .box { fill:#f8fbff; stroke:#406078; stroke-width:1.3; rx:8; }
+    .box2 { fill:#f6fbf7; stroke:#3f7a52; stroke-width:1.3; rx:8; }
+    .box3 { fill:#fffaf0; stroke:#9a6a20; stroke-width:1.3; rx:8; }
+    .box4 { fill:#fff6f7; stroke:#a73a4b; stroke-width:1.3; rx:8; }
+    .arrow { stroke:#445566; stroke-width:1.6; fill:none; marker-end:url(#arrow); }
+    .dash { stroke-dasharray:5 4; }
+    .label { font-size:13px; fill:#17202a; }
+    .small { font-size:12px; fill:#4b5563; }
+    .title { font-size:15px; font-weight:700; fill:#111827; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#e6f4f6; color:var(--accent); font-weight:600; font-size:12px; }
+    .toc a { color:var(--accent); text-decoration:none; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Preserve/Resume 8.0.22 新同事交接文档</h1>
+  <div class="meta">
+    <p><strong>读者对象：</strong>后续接手 Preserve/Resume 特性的内核开发、测试负责人和维护负责人。</p>
+    <p><strong>适用版本：</strong>当前 MySQL 8.0.22 preserve-port worktree，分支上的后续 phase 2 优化和低侵入改造仍应以当前源码为准。</p>
+    <p><strong>目标：</strong>把这个特性的背景、架构、算法、内核对象、限制、代码阅读路线和后续工作讲清楚，使接手者能独立继续开发、修复和评审。</p>
+    <p><strong>事实源：</strong>本文以 <code>sql/preserve_trx.cc</code>、<code>sql/preserve_trx_drain.cc</code>、<code>sql/preserve_trx_bundle.*</code>、<code>sql/preserve_trx_carrier*</code>、<code>sql/binlog_warmcopy.*</code>、<code>sql/preserve_trx_lock_warmcopy.*</code>、<code>storage/innobase/trx/trx0preserve.cc</code>、<code>storage/innobase/lock/lock0preserve.cc</code>、<code>storage/innobase/trx/trx0temp_preserve.cc</code> 和现有设计文档为事实源。</p>
+    <p><strong>当前边界：</strong>本文按当前 worktree 事实编写；phase 2 约 1 秒和物理复制集群接入属于目标路线，需继续实现和验证。</p>
+  </div>
+
+  <div class="meta">
+    <p><strong>文档套件导航：</strong>
+      <a href="preserve-resume-8.0.22-detailed-design.html">全面详细设计</a> ·
+      <a href="preserve-resume-8.0.22-user-manual.html">用户手册</a> ·
+      <a href="preserve-resume-8.0.22-engineer-handoff.html">新同事交接</a> ·
+      <a href="preserve-resume-8.0.22-replica-drain-resume-design.html">物理复制集群接入方案</a> ·
+      <a href="preserve-resume-8.0.22-code-analysis.html">代码详解</a>
+    </p>
+  </div>
+
+  <h2>覆盖清单</h2>
+  <table>
+    <thead><tr><th>计划要求</th><th>本文覆盖位置</th><th>交接价值</th></tr></thead>
+    <tbody>
+      <tr><td>背景和来龙去脉</td><td>第 1 节</td><td>解释为什么不能只依赖普通 XA，为什么要做 8.0.22 对象级 port。</td></tr>
+      <tr><td>框架和算法</td><td>第 2、3 节</td><td>说明 SQL surface、manager/drain、kernel、bundle/carrier、warmcopy、InnoDB adapter 的边界。</td></tr>
+      <tr><td>内核对象不能遗漏</td><td>第 4 节</td><td>列出 THD/LEX、token/XID、trx_t、record locks、MDL、read view、savepoint、temporary table、sidecar、resource lease、P_S。</td></tr>
+      <tr><td>功能点、命令、参数和后续原则</td><td>第 5、7 节</td><td>接手者可从命令入口和参数入口继续追踪实现。</td></tr>
+      <tr><td>测试与交付</td><td>第 6 节</td><td>说明 MTR、GUnit、lint、E2E/NFR 和 release gate 的阅读入口。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>目录</h2>
+  <ol class="toc">
+    <li><a href="#story">背景和来龙去脉</a></li>
+    <li><a href="#framework">框架分层</a></li>
+    <li><a href="#algorithms">关键算法与状态机</a></li>
+    <li><a href="#objects">内核对象清单</a></li>
+    <li><a href="#reading">代码阅读路线</a></li>
+    <li><a href="#tests">测试与发布门禁</a></li>
+    <li><a href="#risks">约束、风险和后续工作</a></li>
+    <li><a href="#review">文档 Review 记录</a></li>
+  </ol>
+
+  <h2 id="story">1. 背景和来龙去脉</h2>
+  <p>Preserve/Resume 的目标来自受控维护窗口：业务中存在未提交长事务，传统重启会迫使事务回滚，而普通 XA recovery 只能保留 prepared transaction，不足以还原完整 SQL session 语义。该特性选择把事务转换成 durable token，并保存恢复所需语义，重启后由用户显式 resume。</p>
+  <p>8.0.22 port 的特殊点是：源实现来自较新的 8.0 代码结构，而目标分支保留 8.0.22 的 XA、协议、parser、handler 和 InnoDB 组织方式。因此移植不是逐文件复制，而是对象级映射：SQL 命令、THD 状态、InnoDB trx、锁、MDL、binlog cache、临时表 sidecar 都要在 8.0.22 对应位置落地。</p>
+  <p>后续重点从“功能可保存/恢复”扩展到两件事：第一，降低对原生 8.0.22 热路径的侵入，保持 <code>preserve_trx_enable=OFF</code> 时原路径只剩轻量分支；第二，优化 batch drain phase 2 阻塞窗口，让大锁数 workload 目标接近 1 秒，同时功能上即使超过 1 秒也继续正确执行。</p>
+
+  <div class="diagram" aria-label="背景演进">
+    <svg viewBox="0 0 1080 360" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">特性演进路线</text>
+      <rect x="45" y="85" width="160" height="66" class="box"/><text x="78" y="113" class="label">问题背景</text><text x="78" y="135" class="small">长事务维护窗口</text>
+      <rect x="255" y="85" width="170" height="66" class="box2"/><text x="288" y="113" class="label">功能闭环</text><text x="288" y="135" class="small">preserve / resume</text>
+      <rect x="475" y="85" width="170" height="66" class="box2"/><text x="506" y="113" class="label">8.0.22 Port</text><text x="506" y="135" class="small">对象级映射</text>
+      <rect x="695" y="85" width="170" height="66" class="box3"/><text x="728" y="113" class="label">Warmcopy</text><text x="728" y="135" class="small">binlog / locks / temp</text>
+      <rect x="475" y="235" width="390" height="66" class="box4"/><text x="508" y="263" class="label">后续重点：低侵入、phase 2 约 1 秒、复制集群接入</text>
+      <path d="M205 118 L255 118" class="arrow"/><path d="M425 118 L475 118" class="arrow"/><path d="M645 118 L695 118" class="arrow"/><path d="M780 151 C760 195 720 220 670 235" class="arrow"/>
+    </svg>
+  </div>
+
+  <h2 id="framework">2. 框架分层</h2>
+  <div class="diagram" aria-label="框架分层图">
+    <svg viewBox="0 0 1080 500" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">代码框架分层</text>
+      <rect x="65" y="70" width="220" height="58" class="box"/><text x="96" y="104" class="label">SQL Surface / Parser</text>
+      <rect x="360" y="70" width="220" height="58" class="box2"/><text x="405" y="104" class="label">Manager / Drain</text>
+      <rect x="655" y="70" width="220" height="58" class="box3"/><text x="692" y="104" class="label">Preserve Kernel</text>
+      <rect x="65" y="190" width="220" height="58" class="box2"/><text x="97" y="224" class="label">Bundle / Carrier</text>
+      <rect x="360" y="190" width="220" height="58" class="box2"/><text x="398" y="224" class="label">Binlog Warmcopy</text>
+      <rect x="655" y="190" width="220" height="58" class="box2"/><text x="698" y="224" class="label">Lock Warmcopy</text>
+      <rect x="65" y="310" width="220" height="58" class="box2"/><text x="105" y="344" class="label">InnoDB Trx</text>
+      <rect x="360" y="310" width="220" height="58" class="box2"/><text x="405" y="344" class="label">Temp Table</text>
+      <rect x="655" y="310" width="220" height="58" class="box2"/><text x="710" y="344" class="label">P_S / Status</text>
+      <path d="M285 99 L360 99" class="arrow"/><path d="M580 99 L655 99" class="arrow"/><path d="M765 128 L765 190" class="arrow"/><path d="M655 220 L580 220" class="arrow dash"/><path d="M470 248 L470 310" class="arrow"/><path d="M175 248 L175 310" class="arrow"/><path d="M765 248 L765 310" class="arrow"/>
+    </svg>
+  </div>
+  <table>
+    <thead><tr><th>层</th><th>主要文件</th><th>职责</th></tr></thead>
+    <tbody>
+      <tr><td>SQL Surface</td><td><code>sql/sql_yacc.yy</code>、<code>sql/sql_parse.cc</code>、<code>include/my_sqlcommand.h</code></td><td>新增命令、协议边界、drain gate、PS/文本协议一致策略。</td></tr>
+      <tr><td>Manager / Drain</td><td><code>sql/preserve_trx.cc</code>、<code>sql/preserve_trx_drain.cc</code></td><td>全局状态、target 分类、batch drain、错误收敛、token 注册。</td></tr>
+      <tr><td>Kernel</td><td><code>sql/preserve_trx.cc</code>、<code>sql/preserve_trx_kernel.h</code></td><td>单事务 preserve 的 preflight、prepare、detach、snapshot write。</td></tr>
+      <tr><td>Bundle / Carrier</td><td><code>sql/preserve_trx_bundle.*</code>、<code>sql/preserve_trx_carrier*</code></td><td>snapshot 编解码、HMAC、CRC、文件 lifecycle、外部 blob 描述符。</td></tr>
+      <tr><td>Binlog Warmcopy</td><td><code>sql/binlog.cc</code>、<code>sql/binlog_ostream.cc</code>、<code>sql/binlog_warmcopy.*</code></td><td>事务 binlog cache 预复制、digest、tail、sidecar。</td></tr>
+      <tr><td>Lock Warmcopy / Locks</td><td><code>sql/preserve_trx_lock_warmcopy.*</code>、<code>storage/innobase/lock/lock0preserve.cc</code>、<code>lock0warmcopy.cc</code></td><td>record/table/MDL payload、canonical compare、fallback、conversion freeze。</td></tr>
+      <tr><td>InnoDB Trx / Temp</td><td><code>trx0preserve.cc</code>、<code>read0read.cc</code>、<code>trx0temp_preserve.cc</code></td><td>claim、attach、read view、savepoint、临时表 image 与 no-redo undo sidecar。</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="algorithms">3. 关键算法与状态机</h2>
+  <h3>3.1 Preserve Kernel 算法</h3>
+  <ol>
+    <li>检查开关、权限、协议、显式事务、XA/复制/升级/force recovery。</li>
+    <li>导出 binlog state、read view、lock payload、MDL descriptors、savepoint、临时表 manifest。</li>
+    <li>把 token 映射为 magic XID，调用 prepare。</li>
+    <li>从 THD detach InnoDB transaction，使 prepared trx 由 preserve token 持有。</li>
+    <li>写 snapshot 和 sidecar，注册内存 record。</li>
+    <li>响应 token；响应失败或 cleanup 失败时按 durable point 语义处理。</li>
+  </ol>
+
+  <div class="diagram" aria-label="错误收敛状态图">
+    <svg viewBox="0 0 1080 380" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">失败点与收敛策略</text>
+      <rect x="55" y="90" width="180" height="58" class="box"/><text x="82" y="124" class="label">prepare 前失败</text>
+      <rect x="305" y="90" width="180" height="58" class="box3"/><text x="330" y="124" class="label">prepare 后失败</text>
+      <rect x="555" y="90" width="180" height="58" class="box3"/><text x="580" y="124" class="label">snapshot 可能存在</text>
+      <rect x="805" y="90" width="180" height="58" class="box2"/><text x="835" y="124" class="label">token 已发布</text>
+      <rect x="55" y="235" width="180" height="58" class="box2"/><text x="82" y="269" class="label">返回错误，保留事务</text>
+      <rect x="305" y="235" width="180" height="58" class="box4"/><text x="335" y="269" class="label">reattach / rollback</text>
+      <rect x="555" y="235" width="180" height="58" class="box4"/><text x="588" y="269" class="label">taint / record</text>
+      <rect x="805" y="235" width="180" height="58" class="box2"/><text x="835" y="269" class="label">resume / reaper</text>
+      <path d="M145 148 L145 235" class="arrow"/><path d="M395 148 L395 235" class="arrow"/><path d="M645 148 L645 235" class="arrow"/><path d="M895 148 L895 235" class="arrow"/>
+      <path d="M235 119 L305 119" class="arrow"/><path d="M485 119 L555 119" class="arrow"/><path d="M735 119 L805 119" class="arrow"/>
+    </svg>
+  </div>
+
+  <h3>3.2 Warmcopy 算法</h3>
+  <p>Warmcopy 的核心思路是把大对象工作提前到 drain 第一阶段。binlog warmcopy 复制 transaction binlog cache prefix，phase 2 只补 tail。lock warmcopy 当前已有 record store、canonical compare、fallback、conversion freeze 等基础；要达到 1 秒目标，需要发展为 phase 1 authoritative mirror 和 external artifact。</p>
+
+  <div class="diagram" aria-label="warmcopy算法">
+    <svg viewBox="0 0 1060 380" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">Warmcopy 工作模型</text>
+      <rect x="55" y="80" width="180" height="64" class="box2"/><text x="88" y="108" class="label">Phase 1 Open</text><text x="88" y="130" class="small">admission + epoch</text>
+      <rect x="295" y="80" width="180" height="64" class="box2"/><text x="328" y="108" class="label">Mirror / Copy</text><text x="328" y="130" class="small">prefix、journal、builder</text>
+      <rect x="535" y="80" width="180" height="64" class="box3"/><text x="568" y="108" class="label">Close / Tail</text><text x="568" y="130" class="small">bounded delta</text>
+      <rect x="775" y="80" width="180" height="64" class="box3"/><text x="810" y="108" class="label">Seal / Adopt</text><text x="810" y="130" class="small">descriptor to snapshot</text>
+      <path d="M235 112 L295 112" class="arrow"/><path d="M475 112 L535 112" class="arrow"/><path d="M715 112 L775 112" class="arrow"/>
+      <rect x="295" y="235" width="420" height="64" class="box4"/><text x="322" y="263" class="label">若无法证明线性化或预算超限：SLO_NOT_GUARANTEED，fallback 或 reject</text>
+    </svg>
+  </div>
+
+  <h2 id="objects">4. 内核对象清单</h2>
+  <p>接手该特性时，最容易遗漏的是“事务不仅是 InnoDB trx”。下面列出必须同时理解和维护的对象。</p>
+  <table>
+    <thead><tr><th>对象</th><th>所在层</th><th>为什么重要</th></tr></thead>
+    <tbody>
+      <tr><td><code>THD</code> / <code>LEX</code></td><td>SQL 层</td><td>承载命令选项、batch 状态、inflight 语句、用户变量、session state 和当前事务绑定。</td></tr>
+      <tr><td>preserved record</td><td>Manager/P_S</td><td>内存中的 token 可见性、状态、错误原因、到期时间、owner 和 trx 指针。</td></tr>
+      <tr><td>token / XID</td><td>SQL + InnoDB</td><td>token 与 magic XID 映射用于 claim prepared transaction 和防止标准 XA 误操作。</td></tr>
+      <tr><td><code>trx_t</code></td><td>InnoDB</td><td>真实事务对象，包含状态、锁、read view、savepoint、undo、claimed 标记和 THD 绑定。</td></tr>
+      <tr><td>read view</td><td>InnoDB MVCC</td><td>保证 resume 后一致性读语义。</td></tr>
+      <tr><td>SQL / InnoDB savepoint</td><td>SQL + InnoDB</td><td>决定回滚边界，也影响 MDL savepoint ordinal。</td></tr>
+      <tr><td>record/table/predicate/AUTO_INC locks</td><td>InnoDB lock_sys</td><td>保证冲突语义和表级约束；implicit lock 需要特别处理。</td></tr>
+      <tr><td>MDL context / tickets</td><td>SQL MDL</td><td>保证对象元数据访问、DDL 冲突和权限复检。</td></tr>
+      <tr><td>binlog cache / GTID state</td><td>Binlog</td><td>保证最终 COMMIT 时复制和崩溃恢复语义一致。</td></tr>
+      <tr><td>temporary table DD/dict/fil space/no-redo undo</td><td>SQL + InnoDB</td><td>用户临时表跨重启恢复的核心对象。</td></tr>
+      <tr><td>snapshot bundle / external blobs</td><td>Carrier</td><td>durable 恢复事实源，包含校验、digest、sidecar 描述。</td></tr>
+      <tr><td>resource leases</td><td>Resource</td><td>防止大事务、大锁、大 sidecar 无界消耗内存和磁盘。</td></tr>
+      <tr><td>P_S records / status counters</td><td>Observability</td><td>用于运维查询、失败定位和 release gate 证据。</td></tr>
+    </tbody>
+  </table>
+
+  <div class="diagram" aria-label="内核对象关系图">
+    <svg viewBox="0 0 1120 480" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">核心对象关系</text>
+      <rect x="60" y="85" width="150" height="54" class="box"/><text x="105" y="118" class="label">THD</text>
+      <rect x="280" y="85" width="150" height="54" class="box2"/><text x="330" y="118" class="label">trx_t</text>
+      <rect x="500" y="85" width="150" height="54" class="box2"/><text x="540" y="118" class="label">Locks</text>
+      <rect x="720" y="85" width="150" height="54" class="box2"/><text x="765" y="118" class="label">MDL</text>
+      <rect x="280" y="210" width="150" height="54" class="box3"/><text x="315" y="243" class="label">Token / XID</text>
+      <rect x="500" y="210" width="150" height="54" class="box3"/><text x="535" y="243" class="label">Snapshot</text>
+      <rect x="720" y="210" width="150" height="54" class="box3"/><text x="760" y="243" class="label">Sidecars</text>
+      <rect x="390" y="340" width="180" height="54" class="box4"/><text x="430" y="373" class="label">P_S / SHOW</text>
+      <path d="M210 112 L280 112" class="arrow"/><path d="M430 112 L500 112" class="arrow"/><path d="M650 112 L720 112" class="arrow"/><path d="M355 139 L355 210" class="arrow"/><path d="M355 237 L500 237" class="arrow"/><path d="M650 237 L720 237" class="arrow"/><path d="M575 264 C550 300 520 320 480 340" class="arrow"/><path d="M355 264 C390 310 420 325 480 340" class="arrow"/>
+    </svg>
+  </div>
+
+  <h2 id="reading">5. 代码阅读路线</h2>
+  <p>建议按“用户命令到 durable artifact，再到 InnoDB 对象”的顺序阅读，避免一开始陷入某个单文件细节。</p>
+  <p>用户命令从 <code>PREPARE SHUTDOWN PRESERVE TRANSACTION</code>、<code>DR&#65;IN TRANSACTIONS PRESERVE</code>、<code>RESUME PRESERVED TRANSACTION</code> 和 <code>SHOW PRESERVED TRANSACTIONS</code> 开始追踪。参数入口重点关注 <code>preserve_trx_enable</code>、<code>preserve_trx_warmcopy_max_total_bytes</code>、<code>preserve_trx_lock_warmcopy_enable</code>、<code>preserve_trx_parallel_preserve_threads</code>。</p>
+  <ol>
+    <li>先读 <code>sql/sql_yacc.yy</code>、<code>include/my_sqlcommand.h</code>、<code>sql/sql_parse.cc</code>，理解命令入口和 gate。</li>
+    <li>读 <code>sql/preserve_trx.cc</code> 中单事务 preserve、batch drain、resume、recovery 的主流程。</li>
+    <li>读 <code>sql/preserve_trx_bundle.*</code> 和 <code>sql/preserve_trx_carrier*</code>，理解 snapshot 格式和文件生命周期。</li>
+    <li>读 <code>sql/binlog_warmcopy.*</code>、<code>sql/binlog.cc</code>、<code>sql/binlog_ostream.cc</code>，理解 logged transaction cache 的保存和 warmcopy。</li>
+    <li>读 <code>sql/preserve_trx_lock_warmcopy.*</code>、<code>storage/innobase/lock/lock0preserve.cc</code>、<code>lock0warmcopy.cc</code>，理解锁 payload、fallback 和 conversion freeze。</li>
+    <li>读 <code>storage/innobase/trx/trx0preserve.cc</code>、<code>read0read.cc</code>，理解 trx claim、attach、read view、savepoint。</li>
+    <li>读 <code>sql/preserve_trx_temp_table.*</code>、<code>trx0temp_preserve.cc</code>，理解用户临时表 sidecar。</li>
+    <li>最后读 P_S、status、lint、MTR 和 NFR 脚本，理解发布证据和回归边界。</li>
+  </ol>
+
+  <div class="diagram" aria-label="阅读路线图">
+    <svg viewBox="0 0 1060 390" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">建议阅读路线</text>
+      <rect x="55" y="80" width="180" height="58" class="box"/><text x="85" y="114" class="label">命令入口</text>
+      <rect x="285" y="80" width="180" height="58" class="box2"/><text x="315" y="114" class="label">主流程</text>
+      <rect x="515" y="80" width="180" height="58" class="box2"/><text x="545" y="114" class="label">Bundle/Carrier</text>
+      <rect x="745" y="80" width="180" height="58" class="box2"/><text x="790" y="114" class="label">InnoDB</text>
+      <rect x="285" y="230" width="180" height="58" class="box3"/><text x="322" y="264" class="label">Warmcopy</text>
+      <rect x="515" y="230" width="180" height="58" class="box3"/><text x="552" y="264" class="label">Temp Table</text>
+      <rect x="745" y="230" width="180" height="58" class="box4"/><text x="783" y="264" class="label">Tests / NFR</text>
+      <path d="M235 109 L285 109" class="arrow"/><path d="M465 109 L515 109" class="arrow"/><path d="M695 109 L745 109" class="arrow"/><path d="M375 138 L375 230" class="arrow"/><path d="M605 138 L605 230" class="arrow"/><path d="M835 138 L835 230" class="arrow"/>
+    </svg>
+  </div>
+
+  <h2 id="tests">6. 测试与发布门禁</h2>
+  <table>
+    <thead><tr><th>类别</th><th>重点</th><th>接手时先看</th></tr></thead>
+    <tbody>
+      <tr><td>MTR</td><td>语法、权限、preserve/resume、batch drain、warmcopy、locks、temp table、failure injection。</td><td><code>mysql-test/suite/preserve_trx/t</code></td></tr>
+      <tr><td>GUnit</td><td>bundle/carrier/resource/warmcopy comparator/lock warmcopy/temp table 单元行为。</td><td><code>unittest/gunit/preserve_trx*</code>、<code>unittest/gunit/innodb/*preserve*</code></td></tr>
+      <tr><td>Source-shape lint</td><td>防止热路径侵入、delivery ownership 错误、fallback 混用。</td><td><code>scripts/*preserve*</code>、<code>scripts/lock_warmcopy_invasive_surface.py</code></td></tr>
+      <tr><td>E2E/NFR</td><td>长连接、多事务、warmcopy、phase2 latency、内容校验、强杀/重启。</td><td><code>scripts/resumable_trx_business_e2e.py</code>、<code>scripts/lock_warmcopy_nfr2_runner.py</code></td></tr>
+      <tr><td>Release Gate</td><td>全 preserve/resume 本地证据、full MySQL MTR 或 release farm 证据。</td><td><code>design/preserve-resume-8.0.22-release-gate-handoff.md</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="risks">7. 约束、风险和后续工作</h2>
+  <ul>
+    <li><strong>低侵入原则：</strong><code>preserve_trx_enable=OFF</code> 时原生路径应只留下轻量分支，不能有 payload 构造、文件 I/O、大扫描或错误语义变化。</li>
+    <li><strong>All-or-live：</strong>同一 target 的 record/table/MDL/savepoint 不能混用不同时间点 payload。</li>
+    <li><strong>Phase 2 1 秒：</strong>当前是目标路线；需要 phase 1 authoritative mirror、external lock artifact、bounded tail 和并行 target preserve。</li>
+    <li><strong>Temp table：</strong>用户临时表恢复涉及 DD、dict、fil space、dirty page、no-redo undo，任何不完整形态都应 fail closed。</li>
+    <li><strong>复制集群：</strong>跨机 sidecar 同步、promotion 编排、GTID/位点协议、旧主隔离还需单独实现。</li>
+    <li><strong>Release Gate：</strong>本地 preserve/resume 证据不等于全 MySQL release gate 关闭；最终仍需要 full all-suite 或发布负责人接受的等价证据。</li>
+  </ul>
+
+  <h2 id="review">8. 文档 Review 记录</h2>
+  <div class="review">
+    <p><span class="pill">Source correctness</span> 文档按当前源码模块划分，不把复制集群方案和 phase 2 1 秒路线写成当前已完成能力。</p>
+    <p><span class="pill">Completeness</span> 覆盖背景、框架、算法、内核对象、代码阅读路线、测试门禁和后续风险。</p>
+    <p><span class="pill">Reader usability</span> 接手者可按阅读路线从命令入口推进到 InnoDB 对象，再看测试与 NFR。</p>
+    <p><span class="pill">Diagram consistency</span> 6 张 SVG 图覆盖演进、分层、失败收敛、对象关系和阅读路线。</p>
+    <p><strong>剩余限制：</strong>本文是交接入口，不替代逐文件 code review；涉及热路径或持久化格式变更时仍必须回到源码和测试证据。</p>
+  </div>
+</main>
+</body>
+</html>

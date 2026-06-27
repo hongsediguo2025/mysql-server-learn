@@ -81,11 +81,13 @@ The tablespace memory cache */
 #include <array>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <list>
 #include <mutex>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <vector>
 
 using Dirs = std::vector<std::string>;
 using Space_id_set = std::set<space_id_t>;
@@ -3256,6 +3258,27 @@ dberr_t fil_preserve_temp_space_adopt(space_id_t space_id, const char *name,
 
   if (fil_space_get(space_id) != nullptr) return DB_TABLESPACE_EXISTS;
 
+  std::vector<byte> page_storage(UNIV_PAGE_SIZE);
+  byte *page = page_storage.data();
+  std::ifstream image(path, std::ios::binary);
+  if (!image.is_open()) return DB_IO_ERROR;
+  image.read(reinterpret_cast<char *>(page), UNIV_PAGE_SIZE);
+  if (image.gcount() != static_cast<std::streamsize>(UNIV_PAGE_SIZE)) {
+    return DB_IO_ERROR;
+  }
+
+  const space_id_t header_space_id = fsp_header_get_space_id(page);
+  const uint32_t header_flags = fsp_header_get_flags(page);
+  const page_no_t size_in_header = fsp_header_get_field(page, FSP_SIZE);
+  const page_no_t free_limit = fsp_header_get_field(page, FSP_FREE_LIMIT);
+  const ulint free_len = flst_get_len(FSP_HEADER_OFFSET + FSP_FREE + page);
+
+  if (header_space_id != space_id || header_flags != flags ||
+      size_in_header != size ||
+      free_len >= std::numeric_limits<uint32_t>::max()) {
+    return DB_CORRUPTION;
+  }
+
   fil_space_t *space =
       fil_space_create(name, space_id, flags, FIL_TYPE_TEMPORARY);
   if (space == nullptr) return DB_ERROR;
@@ -3269,7 +3292,9 @@ dberr_t fil_preserve_temp_space_adopt(space_id_t space_id, const char *name,
     fil_space_free(space_id, false);
     return DB_ERROR;
   }
-  space->size_in_header = size;
+  space->size_in_header = size_in_header;
+  space->free_limit = free_limit;
+  space->free_len = static_cast<uint32_t>(free_len);
 
   return DB_SUCCESS;
 }

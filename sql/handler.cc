@@ -1273,6 +1273,8 @@ void trans_register_ha(THD *thd, bool all, handlerton *ht_arg,
   Transaction_ctx *trn_ctx = thd->get_transaction();
   Transaction_ctx::enum_trx_scope trx_scope =
       all ? Transaction_ctx::SESSION : Transaction_ctx::STMT;
+  const bool first_session_ha =
+      all && trn_ctx->ha_trx_info(Transaction_ctx::SESSION) == nullptr;
 
   DBUG_TRACE;
   DBUG_PRINT("enter", ("%s", all ? "all" : "stmt"));
@@ -1303,6 +1305,12 @@ void trans_register_ha(THD *thd, bool all, handlerton *ht_arg,
 
   trn_ctx->register_ha(trx_scope, ha_info, ht_arg);
   trn_ctx->set_ha_trx_info(trx_scope, ha_info);
+  /*
+    Autocommit=0 and implicit multi-statement transactions do not pass through
+    trans_begin(). Capture their no-redo undo baseline exactly once, on the
+    first session-scope engine participant.
+  */
+  if (first_session_ha) preserve_trx_temp_table_mark_transaction_start(thd);
 
   if (ht_arg->prepare == nullptr) trn_ctx->set_no_2pc(trx_scope, true);
 
@@ -7826,6 +7834,8 @@ int handler::ha_write_row(uchar *buf) {
   DBUG_EXECUTE_IF("inject_error_ha_write_row", return HA_ERR_INTERNAL_ERROR;);
   DBUG_EXECUTE_IF("simulate_storage_engine_out_of_memory",
                   return HA_ERR_SE_OUT_OF_MEMORY;);
+  if (unlikely(!preserve_trx_temp_table_precheck_row_write(ha_thd(), table)))
+    return HA_ERR_UNSUPPORTED;
   mark_trx_read_write();
 
   DBUG_EXECUTE_IF(
@@ -7843,14 +7853,13 @@ int handler::ha_write_row(uchar *buf) {
 
   /*
     Temporary-table preserve hooks are gated by preserve_trx_enable and only
-    record journal history after the native row operation and binlog hook have
-    succeeded. They must not change the row operation result.
+    mark temp DML after the native row operation and binlog hook have succeeded.
+    Physical page capture and no-redo undo sidecars are the recovery source, so
+    the hot row path must not copy row bytes or build SQL replay payloads.
   */
   if (preserve_trx_temp_table_row_hooks_enabled() &&
       preserve_trx_temp_table_row_capture_candidate(ha_thd(), table))
-    (void)preserve_trx_temp_table_note_row_write(
-        ha_thd(), table, reinterpret_cast<const char *>(buf),
-        static_cast<size_t>(table->s->reclength));
+    (void)preserve_trx_temp_table_note_row_write(ha_thd(), table, nullptr, 0);
   DEBUG_SYNC_C("ha_write_row_end");
   return 0;
 }
@@ -7867,6 +7876,8 @@ int handler::ha_update_row(const uchar *old_data, uchar *new_data) {
   DBUG_ASSERT(new_data == table->record[0]);
   DBUG_ASSERT(old_data == table->record[1]);
 
+  if (unlikely(!preserve_trx_temp_table_precheck_row_write(ha_thd(), table)))
+    return HA_ERR_UNSUPPORTED;
   mark_trx_read_write();
 
   DBUG_EXECUTE_IF(
@@ -7881,25 +7892,13 @@ int handler::ha_update_row(const uchar *old_data, uchar *new_data) {
   if (unlikely((error = binlog_log_row(table, old_data, new_data, log_func))))
     return error;
   /*
-    Mark the transaction before building the optional row image. Allocation or
-    payload failures then degrade preserve instead of making an incomplete
-    temp-table history look valid.
+    Mark temp DML only. Reconstructing row images here would add allocation and
+    row-buffer copying to every eligible temporary-table UPDATE; the preserve
+    path must instead rely on page after-images plus no-redo undo sidecars.
   */
   if (preserve_trx_temp_table_row_hooks_enabled() &&
-      preserve_trx_temp_table_row_capture_candidate(ha_thd(), table)) {
-    preserve_trx_temp_table_note_untracked_change(ha_thd());
-    if (!preserve_trx_temp_table_enable) {
-      (void)preserve_trx_temp_table_note_row_update(ha_thd(), table, nullptr, 0);
-    } else {
-      const size_t row_length = static_cast<size_t>(table->s->reclength);
-      std::string payload;
-      payload.reserve(row_length * 2);
-      payload.append(reinterpret_cast<const char *>(old_data), row_length);
-      payload.append(reinterpret_cast<const char *>(new_data), row_length);
-      (void)preserve_trx_temp_table_note_row_update(
-          ha_thd(), table, payload.data(), payload.size());
-    }
-  }
+      preserve_trx_temp_table_row_capture_candidate(ha_thd(), table))
+    (void)preserve_trx_temp_table_note_row_update(ha_thd(), table, nullptr, 0);
   return 0;
 }
 
@@ -7912,6 +7911,8 @@ int handler::ha_delete_row(const uchar *buf) {
   */
   DBUG_ASSERT(buf == table->record[0] || buf == table->record[1]);
   DBUG_EXECUTE_IF("inject_error_ha_delete_row", return HA_ERR_INTERNAL_ERROR;);
+  if (unlikely(!preserve_trx_temp_table_precheck_row_write(ha_thd(), table)))
+    return HA_ERR_UNSUPPORTED;
 
   DBUG_EXECUTE_IF(
       "handler_crashed_table_on_usage",
@@ -7928,9 +7929,7 @@ int handler::ha_delete_row(const uchar *buf) {
     return error;
   if (preserve_trx_temp_table_row_hooks_enabled() &&
       preserve_trx_temp_table_row_capture_candidate(ha_thd(), table))
-    (void)preserve_trx_temp_table_note_row_delete(
-        ha_thd(), table, reinterpret_cast<const char *>(buf),
-        static_cast<size_t>(table->s->reclength));
+    (void)preserve_trx_temp_table_note_row_delete(ha_thd(), table, nullptr, 0);
   return 0;
 }
 

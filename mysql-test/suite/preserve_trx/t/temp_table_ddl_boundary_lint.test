@@ -1,0 +1,42 @@
+--echo # Lint-only source-shape guard for unsupported temporary-table DDL.
+--echo # DDL-like changes during a preserve target transaction or capture epoch
+--echo # must be marked explicitly and rejected fail-closed.
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_source {
+  my (@parts) = @_;
+  my $path = File::Spec->catfile($source_root, @parts);
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $contents = do { local $/; <$fh> };
+  close($fh);
+  return $contents;
+}
+
+my $temp_h = read_source('sql', 'preserve_trx_temp_table.h');
+my $temp_cc = read_source('sql', 'preserve_trx_temp_table.cc');
+my $sql_table = read_source('sql', 'sql_table.cc');
+my $sql_base = read_source('sql', 'sql_base.cc');
+
+die "temp-table journal must define ALTER_TABLE and RENAME_TABLE markers\n"
+  unless $temp_h =~ /ALTER_TABLE/s && $temp_h =~ /RENAME_TABLE/s;
+die "temp-table preserve API must expose ALTER and RENAME marker helpers\n"
+  unless $temp_h =~ /preserve_trx_temp_table_note_table_alter/s &&
+         $temp_h =~ /preserve_trx_temp_table_note_table_rename/s;
+die "has_row_history must reject ALTER_TABLE and RENAME_TABLE history\n"
+  unless $temp_cc =~ /Kind::ALTER_TABLE/s && $temp_cc =~ /Kind::RENAME_TABLE/s;
+die "temporary ALTER TABLE path must mark unsupported preserve history before replacing the table\n"
+  unless $sql_table =~
+         /if\s*\(\s*table->s->tmp_table\s*!=\s*NO_TMP_TABLE\s*\)\s*\{[\s\S]*preserve_trx_temp_table_note_table_alter\s*\(\s*thd\s*,\s*table\s*\)[\s\S]*close_temporary_table\s*\(\s*thd\s*,\s*table\s*,\s*true\s*,\s*true\s*\)/s;
+die "temporary rename helper must mark unsupported preserve history\n"
+  unless $sql_base =~ /rename_temporary_table\s*\([^)]*\)\s*\{[\s\S]*preserve_trx_temp_table_note_table_rename\s*\(\s*thd\s*,\s*table\s*,/s;
+EOF
+
+SELECT 'ok' AS temp_table_ddl_boundary_lint;

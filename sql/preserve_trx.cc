@@ -3809,6 +3809,8 @@ void preserve_trx_set_batch_state(THD *thd, ulonglong generation,
   mysql_mutex_lock(&thd->LOCK_thd_data);
   thd->preserve_trx_batch_generation = generation;
   thd->preserve_trx_batch_state = state;
+  if (generation == 0 || state == Preserve_trx_batch_thd_state::NONE)
+    preserve_trx_temp_table_clear_batch_unsupported_boundary(thd);
   mysql_mutex_unlock(&thd->LOCK_thd_data);
 }
 
@@ -4006,18 +4008,25 @@ class Preserve_batch_target_state_reader final : public Do_THD_Impl {
       (void)preserve_trx_publish_pending_quiesce_at_idle_boundary(candidate);
       m_seen = true;
       m_state = candidate->preserve_trx_batch_state;
+      m_temp_unsupported_boundary_seen =
+          preserve_trx_temp_table_has_untracked_change(candidate) ||
+          preserve_trx_temp_table_has_batch_unsupported_boundary(candidate);
     }
     mysql_mutex_unlock(&candidate->LOCK_thd_data);
   }
 
   bool seen() const { return m_seen; }
   Preserve_trx_batch_thd_state state() const { return m_state; }
+  bool temp_unsupported_boundary_seen() const {
+    return m_temp_unsupported_boundary_seen;
+  }
 
  private:
   ulonglong m_generation;
   my_thread_id m_target_thread_id;
   bool m_seen{false};
   Preserve_trx_batch_thd_state m_state{Preserve_trx_batch_thd_state::NONE};
+  bool m_temp_unsupported_boundary_seen{false};
 };
 
 bool preserve_trx_batch_thread_id_in_targets(
@@ -4040,6 +4049,7 @@ bool preserve_trx_quiesced_batch_target_is_valid_locked(
          !candidate->release_resources_done() && !candidate->is_system_thread() &&
          candidate->killed == THD::NOT_KILLED && candidate->m_server_idle &&
          preserve_trx_has_explicit_active_transaction(candidate) &&
+         !preserve_trx_temp_table_has_batch_unsupported_boundary(candidate) &&
          !preserve_trx_is_unsupported_common_context(candidate);
 }
 
@@ -4204,6 +4214,7 @@ class Preserve_batch_clear_target_generation final : public Do_THD_Impl {
             Preserve_trx_batch_thd_state::PRESERVED_DRAINED) {
       candidate->preserve_trx_batch_generation = 0;
       candidate->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
+      preserve_trx_temp_table_clear_batch_unsupported_boundary(candidate);
       m_cleared = true;
     }
     mysql_mutex_unlock(&candidate->LOCK_thd_data);
@@ -4217,7 +4228,8 @@ class Preserve_batch_clear_target_generation final : public Do_THD_Impl {
 
 bool preserve_trx_batch_wait_target_ready(
     THD *owner, ulonglong generation, my_thread_id target_thread_id,
-    Preserve_trx_batch_thd_state *state, ulonglong close_deadline_us) {
+    Preserve_trx_batch_thd_state *state, bool *temp_unsupported_boundary_seen,
+    ulonglong close_deadline_us) {
   for (;;) {
     if (owner != nullptr && owner->killed) return true;
     if (preserve_trx_monotonic_deadline_expired_at(
@@ -4231,6 +4243,10 @@ bool preserve_trx_batch_wait_target_ready(
     const Preserve_trx_batch_thd_state current_state = reader.state();
     if (current_state != Preserve_trx_batch_thd_state::PENDING_QUIESCE) {
       *state = current_state;
+      if (temp_unsupported_boundary_seen != nullptr) {
+        *temp_unsupported_boundary_seen =
+            reader.temp_unsupported_boundary_seen();
+      }
       return false;
     }
     my_sleep(10000);
@@ -4256,12 +4272,25 @@ class Preserve_batch_clear_generation final : public Do_THD_Impl {
             Preserve_trx_batch_thd_state::PRESERVED_DRAINED) {
       candidate->preserve_trx_batch_generation = 0;
       candidate->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
+      preserve_trx_temp_table_clear_batch_unsupported_boundary(candidate);
     }
     mysql_mutex_unlock(&candidate->LOCK_thd_data);
   }
 
  private:
   ulonglong m_generation;
+};
+
+class Preserve_batch_clear_temp_table_unsupported_boundaries final
+    : public Do_THD_Impl {
+ public:
+  void operator()(THD *candidate) override {
+    if (candidate == nullptr) return;
+
+    mysql_mutex_lock(&candidate->LOCK_thd_data);
+    preserve_trx_temp_table_clear_batch_unsupported_boundary(candidate);
+    mysql_mutex_unlock(&candidate->LOCK_thd_data);
+  }
 };
 
 bool warmcopy_close_deadline_expired(ulonglong close_deadline_us);
@@ -4985,6 +5014,7 @@ class Preserve_batch_quiesced_idle_target final {
             Preserve_trx_batch_thd_state::PRESERVED_DRAINED) {
       candidate->preserve_trx_batch_generation = 0;
       candidate->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
+      preserve_trx_temp_table_clear_batch_unsupported_boundary(candidate);
     }
     mysql_mutex_unlock(&candidate->LOCK_thd_data);
   }
@@ -5362,6 +5392,94 @@ class Warmcopy_batch_drain_participant final
   std::shared_ptr<Warmcopy_batch_blob_provider> m_provider;
   std::unique_ptr<Warmcopy_open_admission_scope> m_admission_scope;
   ulonglong m_closing_deadline_us{0};
+  bool m_closed{false};
+  Preserve_trx_drain_participant_observation m_observation;
+};
+
+class Temp_table_phase1_drain_participant final
+    : public Preserve_trx_drain_participant {
+ public:
+  explicit Temp_table_phase1_drain_participant(THD *owner) : m_owner(owner) {}
+
+  bool open_phase1() override {
+    m_observation = {};
+    m_observation.state = Preserve_trx_drain_participant_state::OPEN;
+    m_observation.phase1_progress = 1;
+
+    /*
+      Temporary-table DML support needs the capture epoch to exist before the
+      user-visible quiesce. Both idle transactions and transactions currently
+      inside a statement are scanned here; later command gates and preflight
+      still fail closed if a target has unsupported DDL/savepoint/rollback
+      history or incomplete no-redo undo capture.
+    */
+    Warmcopy_prepare_idle_participants idle_targets(m_owner);
+    Global_THD_manager::get_instance()->do_for_all_thd_copy(&idle_targets);
+    if (!begin_capture_for_targets(idle_targets.targets())) return false;
+
+    Lock_warmcopy_prepare_active_record_participants active_targets(m_owner);
+    Global_THD_manager::get_instance()->do_for_all_thd_copy(&active_targets);
+    if (!begin_capture_for_targets(active_targets.targets())) return false;
+
+    m_closed = true;
+    m_observation.state = Preserve_trx_drain_participant_state::READY;
+    m_observation.phase1_progress = 100;
+    return true;
+  }
+
+  bool close_phase1() override {
+    m_closed = true;
+    m_observation.state = Preserve_trx_drain_participant_state::READY;
+    m_observation.phase1_progress = 100;
+    return true;
+  }
+
+  bool phase1_ready() const override { return m_closed; }
+
+  bool phase2_preflight(Preserve_trx_drain_phase_mode mode) override {
+    if (mode != Preserve_trx_drain_phase_mode::TWO_PHASE) {
+      mark_degraded("temp-table phase1 capture requires two-phase drain");
+      return false;
+    }
+    if (!phase1_ready()) {
+      mark_degraded("temp-table phase1 capture not ready");
+      return false;
+    }
+    return true;
+  }
+
+  void abort_phase() override {
+    m_observation.state = Preserve_trx_drain_participant_state::ABANDONED;
+    if (m_observation.failure_reason.empty())
+      m_observation.failure_reason = "aborted";
+  }
+
+  void finalize_phase() override {
+    m_observation.state = Preserve_trx_drain_participant_state::FINALIZED;
+  }
+
+  Preserve_trx_drain_participant_observation observation() const override {
+    return m_observation;
+  }
+
+ private:
+  bool begin_capture_for_targets(std::vector<Preserve_trx_pinned_thd> &targets) {
+    for (const Preserve_trx_pinned_thd &target : targets) {
+      if (target.thd == nullptr) continue;
+      if (!preserve_trx_temp_table_begin_capture_epoch(target.thd)) {
+        mark_degraded("temp-table phase1 capture epoch open failed");
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void mark_degraded(const char *reason) {
+    m_observation.state = Preserve_trx_drain_participant_state::DEGRADED;
+    if (reason != nullptr) m_observation.failure_reason = reason;
+  }
+
+  THD *m_owner;
   bool m_closed{false};
   Preserve_trx_drain_participant_observation m_observation;
 };
@@ -8339,7 +8457,17 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   const Preserve_snapshot_status temp_preflight_status =
       preserve_trx_temp_table_preflight_preserve(thd);
   if (temp_preflight_status != Preserve_snapshot_status::OK) {
-    return reject_after_binlog_export("temp_table_no_redo_undo_unsupported");
+    const std::string temp_reason =
+        preserve_trx_temp_table_degraded_reason(thd);
+    if (!temp_reason.empty()) {
+      LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+             ("PRESERVE: temp-table preflight rejected preserve: " +
+              temp_reason)
+                 .c_str());
+    }
+    return reject_after_binlog_export(
+        temp_reason.empty() ? "temp_table_no_redo_undo_unsupported"
+                            : temp_reason.c_str());
   }
 
   DBUG_EXECUTE_IF("preserve_trx_fail_after_binlog_mode_validation",
@@ -9059,8 +9187,13 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   }
   if (result != nullptr) result->durable_point_crossed = true;
   auto restore_prepared_batch_or_rollback = [&]() {
-    if (batch_delivery &&
-        !reactivate_current_batch_prepared_failure_to_original_thd(thd)) {
+    if (batch_delivery) {
+      if (reactivate_current_batch_prepared_failure_to_original_thd(thd)) {
+        if (result != nullptr) {
+          result->cleanup_failed_after_reattach = true;
+        }
+        return reject_unsupported_for_delivery();
+      }
       if (has_logged_binlog_cache) {
         if (mysql_binlog_preserve_reactivate_after_prepare_failure(
                 thd, binlog_snapshot)) {
@@ -9466,6 +9599,15 @@ bool preserve_trx_kernel_preserve_attached_transaction(
                             snapshot_write_temp_manifest_us,
                         substep_started_us);
   if (temp_manifest_status != Preserve_snapshot_status::OK) {
+    const std::string temp_reason =
+        preserve_trx_temp_table_degraded_reason(thd);
+    if (!temp_reason.empty()) {
+      LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+             ("PRESERVE: temp-table manifest build rejected preserve: " +
+              temp_reason)
+                 .c_str());
+    }
+    set_failure_reason("temp_table_manifest_failed");
     discard_prebuilt_binlog_blob_if_needed();
     return reject_after_snapshot_failure(false);
   }
@@ -9891,10 +10033,15 @@ bool Preserve_trx_drain_service::execute(
     return preserve_trx_reject_unsupported();
 
   const ulonglong generation = g_batch_generation.fetch_add(1) + 1;
+  Preserve_batch_clear_temp_table_unsupported_boundaries clear_temp_boundaries;
+  Global_THD_manager::get_instance()->do_for_all_thd_copy(
+      &clear_temp_boundaries);
   const bool binlog_warmcopy_enabled =
       preserve_trx_warmcopy_enable && opt_bin_log && mysql_bin_log.is_open();
   const bool lock_warmcopy_enabled = preserve_trx_lock_warmcopy_effective();
+  const bool temp_table_phase1_enabled = preserve_trx_temp_table_enable;
   const bool two_phase_enabled =
+      temp_table_phase1_enabled ||
       preserve_trx_lock_warmcopy_requires_two_phase(binlog_warmcopy_enabled);
   Preserve_trx_drain_orchestrator drain_orchestrator(
       two_phase_enabled ? Preserve_trx_drain_phase_mode::TWO_PHASE
@@ -9915,6 +10062,12 @@ bool Preserve_trx_drain_service::execute(
         std::make_unique<Preserve_trx_lock_warmcopy_drain_participant>(
             lock_warmcopy_options);
     drain_orchestrator.add_participant(lock_warmcopy_participant.get());
+  }
+  std::unique_ptr<Temp_table_phase1_drain_participant> temp_table_participant;
+  if (temp_table_phase1_enabled) {
+    temp_table_participant =
+        std::make_unique<Temp_table_phase1_drain_participant>(thd);
+    drain_orchestrator.add_participant(temp_table_participant.get());
   }
   PreserveBinlogBlobProvider *warmcopy_provider = nullptr;
   Preserve_trx_manager_state_guard draining(
@@ -10110,14 +10263,23 @@ bool Preserve_trx_drain_service::execute(
   for (const my_thread_id target_thread_id : counter.target_thread_ids()) {
     Preserve_trx_batch_thd_state target_state{
         Preserve_trx_batch_thd_state::NONE};
+    bool temp_unsupported_boundary_seen = false;
     if (preserve_trx_batch_wait_target_ready(
             thd, generation, target_thread_id, &target_state,
+            &temp_unsupported_boundary_seen,
             target_wait_deadline_us) ||
         target_state == Preserve_trx_batch_thd_state::PENDING_QUIESCE ||
         target_state == Preserve_trx_batch_thd_state::NONE) {
       Preserve_batch_clear_generation clear(generation);
       Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
       abort_drain_participants("target_wait_failed");
+      return preserve_trx_reject_unsupported();
+    }
+
+    if (temp_unsupported_boundary_seen) {
+      Preserve_batch_clear_generation clear(generation);
+      Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
+      abort_drain_participants("temp_unsupported_boundary");
       return preserve_trx_reject_unsupported();
     }
 

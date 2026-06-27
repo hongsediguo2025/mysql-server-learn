@@ -1,0 +1,59 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+CREATE TABLE t_batch_temp_replace(
+sid INT NOT NULL,
+k INT NOT NULL,
+v BIGINT NOT NULL,
+counter INT NOT NULL DEFAULT 0,
+amount DECIMAL(18,2) NOT NULL DEFAULT 0.00,
+d DATE NOT NULL,
+note VARCHAR(96),
+js JSON,
+payload VARCHAR(96),
+deleted TINYINT NOT NULL DEFAULT 0,
+g BIGINT GENERATED ALWAYS AS (v + sid) STORED,
+PRIMARY KEY(sid, k),
+UNIQUE KEY uq_sid_note(sid, note),
+KEY idx_sid_v(sid, v),
+KEY idx_sid_g(sid, g),
+KEY idx_sid_deleted(sid, deleted)
+) ENGINE=InnoDB;
+INSERT INTO t_batch_temp_replace
+(sid,k,v,counter,amount,d,note,js,deleted)
+VALUES
+(1,33,1033,0,10.00,DATE '2026-05-21','seed-1-33',
+JSON_OBJECT('seed_sid',1,'seed_k',33),0);
+CREATE TEMPORARY TABLE tmp_batch_temp_replace(
+id INT PRIMARY KEY,
+v INT NOT NULL,
+KEY(v)
+) ENGINE=InnoDB;
+SET @batch_temp_sid = 1;
+START TRANSACTION;
+INSERT INTO tmp_batch_temp_replace VALUES(1, 10);
+UPDATE tmp_batch_temp_replace SET v = 11 WHERE id = 1;
+REPLACE INTO t_batch_temp_replace
+(sid,k,v,counter,amount,d,note,js,deleted)
+VALUES
+(1,100003,10000003,3,33.33,DATE '2026-05-23',
+'s001-t00001-n003',JSON_OBJECT('op','replace','stmt',3),0);
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+SELECT COUNT(*), COALESCE(SUM(v),0) FROM tmp_batch_temp_replace;
+COUNT(*)	COALESCE(SUM(v),0)
+1	11
+REPLACE INTO t_batch_temp_replace
+(sid,k,v,counter,amount,d,note,js,deleted)
+VALUES
+(1,100093,10000093,93,33.33,DATE '2026-05-23',
+'s001-t00001-n093',JSON_OBJECT('op','replace','stmt',93),0);
+COMMIT;
+SELECT sid,k,v,counter,note FROM t_batch_temp_replace ORDER BY sid,k;
+sid	k	v	counter	note
+1	33	1033	0	seed-1-33
+1	100003	10000003	3	s001-t00001-n003
+1	100093	10000093	93	s001-t00001-n093
+DROP TEMPORARY TABLE tmp_batch_temp_replace;
+DROP TABLE t_batch_temp_replace;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

@@ -65,6 +65,7 @@ class OperationKind(enum.Enum):
     BULK_LOCKSET_UPDATE = "bulk_lockset_update"
     TEMP_INSERT = "temp_insert"
     TEMP_UPDATE = "temp_update"
+    TEMP_DELETE = "temp_delete"
     TEMP_SELECT = "temp_select"
 
 
@@ -188,6 +189,9 @@ class HarnessConfig:
     max_phase2_pause_ms: int = 5000
     warmcopy_disabled_baseline_slope_ms_per_mb: Optional[float] = None
     temp_table_workload: bool = False
+    temp_table_target_mb: int = 0
+    temp_table_fill_chunk_kb: int = 64
+    temp_table_resume_action: str = "commit"
     startup_timeout_s: float = 120.0
     shutdown_timeout_s: float = 120.0
     shutdown_quiet_period_s: float = 2.0
@@ -318,6 +322,22 @@ class HarnessConfig:
             raise ValueError("large_binlog_cache_sessions cannot exceed sessions")
         if any(bucket <= 0 for bucket in self.large_binlog_cache_buckets_mb):
             raise ValueError("large_binlog_cache_buckets_mb values must be positive")
+        if self.temp_table_target_mb < 0:
+            raise ValueError("temp_table_target_mb must be non-negative")
+        if self.temp_table_fill_chunk_kb <= 0:
+            raise ValueError("temp_table_fill_chunk_kb must be positive")
+        if self.temp_table_resume_action not in ("commit", "rollback", "continue"):
+            raise ValueError("temp_table_resume_action must be commit, rollback, or continue")
+        if self.temp_table_target_mb > 0 and not self.temp_table_workload:
+            raise ValueError("temp_table_target_mb requires temp_table_workload")
+        temp_fill_rows = math.ceil(
+            (self.temp_table_target_mb * 1024) / self.temp_table_fill_chunk_kb
+        ) if self.temp_table_target_mb > 0 else 0
+        if temp_fill_rows > 10_000:
+            raise ValueError(
+                "temp_table_target_mb and temp_table_fill_chunk_kb require more "
+                "than 10000 generated prefill rows"
+            )
         if self.lock_warmcopy_mode not in ("default", "on", "off"):
             raise ValueError("lock_warmcopy_mode must be default, on, or off")
         if self.max_phase2_pause_ms <= 0:
@@ -431,6 +451,9 @@ CREATE TABLE `{table}` (
 
     def create_temp_table_sql(self, sid: int) -> str:
         table = self.temp_table_name(sid)
+        payload_column = ""
+        if self.config.temp_table_target_mb > 0:
+            payload_column = ",\n  payload LONGBLOB NOT NULL"
         return f"""
 CREATE TEMPORARY TABLE `{table}` (
   id BIGINT NOT NULL PRIMARY KEY,
@@ -438,10 +461,69 @@ CREATE TEMPORARY TABLE `{table}` (
   tx_id INT NOT NULL,
   stmt_no INT NOT NULL,
   v BIGINT NOT NULL,
-  note VARCHAR(96),
+  note VARCHAR(96){payload_column},
   KEY idx_sid_v(sid, v)
 ) ENGINE=InnoDB
 """.strip()
+
+    def temp_table_target_bytes(self) -> int:
+        return self.config.temp_table_target_mb * 1024 * 1024
+
+    def temp_table_fill_chunk_bytes(self) -> int:
+        return self.config.temp_table_fill_chunk_kb * 1024
+
+    def temp_table_fill_row_count(self) -> int:
+        target = self.temp_table_target_bytes()
+        if target <= 0:
+            return 0
+        return math.ceil(target / self.temp_table_fill_chunk_bytes())
+
+    def temp_table_prefill_sql(self, sid: int) -> List[str]:
+        row_count = self.temp_table_fill_row_count()
+        if row_count <= 0:
+            return []
+        table = self.temp_table_name(sid)
+        chunk_bytes = self.temp_table_fill_chunk_bytes()
+        return [
+            f"""
+INSERT INTO `{table}` (id,sid,tx_id,stmt_no,v,note,payload)
+SELECT n + 1,{sid},0,-1,n,'prefill',REPEAT('x', {chunk_bytes})
+FROM (
+  SELECT ones.i + tens.i * 10 + hundreds.i * 100 + thousands.i * 1000 AS n
+  FROM
+    (SELECT 0 i UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4
+     UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) ones
+    CROSS JOIN
+    (SELECT 0 i UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4
+     UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) tens
+    CROSS JOIN
+    (SELECT 0 i UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4
+     UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) hundreds
+    CROSS JOIN
+    (SELECT 0 i UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4
+     UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) thousands
+) seq
+WHERE n < {row_count}
+""".strip()
+        ]
+
+    def temp_table_sidecar_budget_bytes(self) -> int:
+        target = self.temp_table_target_bytes() * self.config.sessions
+        if target <= 0:
+            return 0
+        return target * 2 + max(1024 * 1024 * 1024, target // 5)
+
+    def finish_temp_transaction_after_resume(self) -> bool:
+        return (
+            self.config.temp_table_workload
+            and self.config.temp_table_resume_action in ("commit", "rollback")
+        )
+
+    def rollback_temp_transaction_after_resume(self) -> bool:
+        return (
+            self.config.temp_table_workload
+            and self.config.temp_table_resume_action == "rollback"
+        )
 
     def seed_rows(self) -> Iterable[Tuple[str, Tuple]]:
         rows = self.config.seed_rows_per_table_per_session
@@ -552,6 +634,21 @@ CREATE TEMPORARY TABLE `{table}` (
             parent = Path(self.config.unix_socket).expanduser().parent
             return str(parent) if str(parent) else "."
         return "."
+
+    def temp_table_disk_usage_path(self) -> str:
+        if self.config.artifact_dir:
+            return self.config.artifact_dir
+        if self.config.unix_socket:
+            parent = Path(self.config.unix_socket).expanduser().parent
+            return str(parent) if str(parent) else "."
+        return "."
+
+    @staticmethod
+    def existing_disk_usage_path(path: str) -> str:
+        candidate = Path(path).expanduser()
+        while not candidate.exists() and candidate != candidate.parent:
+            candidate = candidate.parent
+        return str(candidate) if str(candidate) else "."
 
     def large_payload_statement_count(self) -> int:
         return sum(
@@ -918,8 +1015,13 @@ CREATE TEMPORARY TABLE `{table}` (
                 )
         return ops
 
-    def commit_verification_table(self, sid: int, tx_id: int) -> str:
-        for op in self.transaction_operations(sid, tx_id):
+    def commit_verification_table(
+        self, sid: int, tx_id: int, completed_stmt_count: Optional[int] = None
+    ) -> Optional[str]:
+        ops = self.transaction_operations(sid, tx_id)
+        if completed_stmt_count is not None:
+            ops = ops[:completed_stmt_count]
+        for op in ops:
             if op.kind in (
                 OperationKind.INSERT,
                 OperationKind.REPLACE,
@@ -927,11 +1029,18 @@ CREATE TEMPORARY TABLE `{table}` (
                 OperationKind.INSERT_SELECT,
             ):
                 return op.table
+        if completed_stmt_count is not None:
+            return None
         raise AssertionError(f"no persistent DML verification table for sid={sid} tx={tx_id}")
 
-    def commit_verification_keys_by_table(self, sid: int, tx_id: int) -> Dict[str, List[int]]:
+    def commit_verification_keys_by_table(
+        self, sid: int, tx_id: int, completed_stmt_count: Optional[int] = None
+    ) -> Dict[str, List[int]]:
         keys_by_table: Dict[str, List[int]] = {}
-        for stmt_no, op in enumerate(self.transaction_operations(sid, tx_id)):
+        ops = self.transaction_operations(sid, tx_id)
+        if completed_stmt_count is not None:
+            ops = ops[:completed_stmt_count]
+        for stmt_no, op in enumerate(ops):
             if op.kind not in (
                 OperationKind.INSERT,
                 OperationKind.REPLACE,
@@ -946,10 +1055,13 @@ CREATE TEMPORARY TABLE `{table}` (
         return keys_by_table
 
     def is_temp_statement(self, stmt_no: int) -> bool:
-        return self.config.temp_table_workload and stmt_no % 20 in (0, 1, 2)
+        if not self.config.temp_table_workload:
+            return False
+        slots = (0, 1, 2, 3) if self.config.temp_table_target_mb > 0 else (0, 1, 2)
+        return stmt_no % 20 in slots
 
     def temp_row_id(self, tx_id: int, stmt_no: int) -> int:
-        return tx_id * 1000 + stmt_no // 20
+        return self.temp_table_fill_row_count() + tx_id * 1000 + stmt_no // 20
 
     def temp_row_value_after_insert(self, sid: int, tx_id: int, stmt_no: int) -> int:
         return sid * 1_000_000_000 + tx_id * 10_000 + stmt_no
@@ -964,21 +1076,37 @@ CREATE TEMPORARY TABLE `{table}` (
         slot = stmt_no % 20
         if slot == 0:
             value = self.temp_row_value_after_insert(sid, tx_id, stmt_no)
+            payload_column = ""
+            payload_value = ""
+            if self.config.temp_table_target_mb > 0:
+                payload_column = ",payload"
+                payload_value = f",REPEAT('i', {self.temp_table_fill_chunk_bytes()})"
             return Operation(
                 OperationKind.TEMP_INSERT,
                 table,
-                f"INSERT IGNORE INTO `{table}` (id,sid,tx_id,stmt_no,v,note) VALUES "
+                f"INSERT IGNORE INTO `{table}` (id,sid,tx_id,stmt_no,v,note{payload_column}) VALUES "
                 f"({row_id},{sid},{tx_id},{stmt_no},{value},"
-                f"'tmp-s{sid:03d}-t{tx_id:05d}-n{stmt_no:03d}')",
+                f"'tmp-s{sid:03d}-t{tx_id:05d}-n{stmt_no:03d}'{payload_value})",
             )
         if slot == 1:
             insert_stmt_no = stmt_no - 1
             value = self.temp_row_value_after_update(sid, tx_id, stmt_no)
+            payload_update = ""
+            if self.config.temp_table_target_mb > 0:
+                payload_update = ", payload = CONCAT(payload, 'u')"
             return Operation(
                 OperationKind.TEMP_UPDATE,
                 table,
-                f"UPDATE `{table}` SET v = {value}, stmt_no = {stmt_no} "
+                f"UPDATE `{table}` SET v = {value}, stmt_no = {stmt_no}{payload_update} "
                 f"WHERE id = {self.temp_row_id(tx_id, insert_stmt_no)}",
+            )
+        if slot == 3:
+            delete_id = (tx_id - 1) * 100 + stmt_no
+            delete_id = (delete_id % max(1, self.temp_table_fill_row_count())) + 1
+            return Operation(
+                OperationKind.TEMP_DELETE,
+                table,
+                f"DELETE FROM `{table}` WHERE id = {delete_id} AND tx_id = 0",
             )
         return Operation(
             OperationKind.TEMP_SELECT,
@@ -1126,7 +1254,9 @@ class ExpectedDatabaseState:
     def uses_compact_bulk_model(self) -> bool:
         return self._compact_bulk
 
-    def record_committed_transaction(self, sid: int, tx_id: int) -> None:
+    def record_committed_transaction(
+        self, sid: int, tx_id: int, completed_stmt_count: Optional[int] = None
+    ) -> None:
         with self._lock:
             if self._compact_bulk:
                 self._compact_committed_tx_by_sid[sid] = tx_id
@@ -1136,6 +1266,8 @@ class ExpectedDatabaseState:
                 if self._plan.config.lockset_batch_size > 0
                 else self._plan.config.statements_per_tx
             )
+            if completed_stmt_count is not None:
+                statement_count = min(statement_count, completed_stmt_count)
             for stmt_no in range(statement_count):
                 self._apply_statement(sid, tx_id, stmt_no)
 
@@ -2332,6 +2464,8 @@ class BusinessWorker(threading.Thread):
         if not self.plan.config.temp_table_workload:
             return
         self.runtime.execute(conn, self.plan.create_temp_table_sql(self.sid))
+        for sql in self.plan.temp_table_prefill_sql(self.sid):
+            self.runtime.execute_discarding_result(conn, sql)
         conn.commit()
 
     def _run_transaction(self, conn, tx_id: int):
@@ -2371,6 +2505,8 @@ class BusinessWorker(threading.Thread):
             tx_expected = self.expected_state.transaction_view(self.sid)
         stmt_index = 0
         pause_log_generation = 0
+        finish_after_resume = False
+        rollback_after_resume = False
         while stmt_index < len(ops):
             op = ops[stmt_index]
             try:
@@ -2430,6 +2566,12 @@ class BusinessWorker(threading.Thread):
                     )
                     if resumed_conn is not None:
                         conn = resumed_conn
+                        if self.plan.finish_temp_transaction_after_resume():
+                            finish_after_resume = True
+                            rollback_after_resume = (
+                                self.plan.rollback_temp_transaction_after_resume()
+                            )
+                            break
             except BaseException as exc:
                 if not self.runtime.is_connection_error(exc):
                     raise
@@ -2437,15 +2579,27 @@ class BusinessWorker(threading.Thread):
                 conn = self.coordinator.wait_for_resumed_connection(
                     self.sid, self.plan.resume_connection_wait_timeout_s()
                 )
+                if self.plan.finish_temp_transaction_after_resume():
+                    finish_after_resume = True
+                    rollback_after_resume = (
+                        self.plan.rollback_temp_transaction_after_resume()
+                    )
+                    break
 
         while True:
             try:
                 self.coordinator.mark_in_transaction(self.sid, False)
                 self.coordinator.mark_drainable_transaction(self.sid, False)
+                if finish_after_resume and rollback_after_resume:
+                    conn.rollback()
+                    return conn
                 conn.commit()
-                self._verify_committed_transaction(conn, tx_id)
+                completed_stmt_count = stmt_index if finish_after_resume else None
+                self._verify_committed_transaction(conn, tx_id, completed_stmt_count)
                 if self.expected_state is not None:
-                    self.expected_state.record_committed_transaction(self.sid, tx_id)
+                    self.expected_state.record_committed_transaction(
+                        self.sid, tx_id, completed_stmt_count
+                    )
                 return conn
             except BaseException as exc:
                 if not self.runtime.is_connection_error(exc):
@@ -2487,7 +2641,9 @@ class BusinessWorker(threading.Thread):
         target_bucket = self.coordinator.drain_large_bucket_mb(generation)
         return target_bucket <= 0 or large_bucket_mb == target_bucket
 
-    def _verify_committed_transaction(self, conn, tx_id: int) -> None:
+    def _verify_committed_transaction(
+        self, conn, tx_id: int, completed_stmt_count: Optional[int] = None
+    ) -> None:
         if self.plan.config.lockset_batch_size > 0:
             table, low, high = self.plan.bulk_lockset_operation_range(self.sid, 0)
             if (
@@ -2517,7 +2673,15 @@ class BusinessWorker(threading.Thread):
                 )
             return
 
-        table = self.plan.commit_verification_table(self.sid, tx_id)
+        keys_by_table = self.plan.commit_verification_keys_by_table(
+            self.sid, tx_id, completed_stmt_count
+        )
+        table = self.plan.commit_verification_table(
+            self.sid, tx_id, completed_stmt_count
+        )
+        if table is None or not keys_by_table:
+            conn.commit()
+            return
         tx_low = 100000 + tx_id * self.plan.config.statements_per_tx
         tx_high = tx_low + self.plan.config.statements_per_tx
         rows = self.runtime.execute(
@@ -2532,9 +2696,7 @@ class BusinessWorker(threading.Thread):
             raise AssertionError(
                 f"commit verification found no transaction rows for sid {self.sid} tx {tx_id}"
             )
-        for table_name, expected_keys in self.plan.commit_verification_keys_by_table(
-            self.sid, tx_id
-        ).items():
+        for table_name, expected_keys in keys_by_table.items():
             key_list = ",".join(str(key) for key in expected_keys)
             actual_rows = self.runtime.execute(
                 conn,
@@ -2611,6 +2773,7 @@ class BusinessE2ERunner:
             self.run_purge_readview_visibility()
             return
 
+        self.preflight_disk_budgets()
         self.runtime.wait_until_up(self.config.startup_timeout_s)
         if self.config.setup_schema:
             self.setup_schema()
@@ -2665,6 +2828,30 @@ class BusinessE2ERunner:
                     self.drop_schema()
                 except Exception as exc:
                     LOG.warning("schema cleanup failed: %s", exc)
+
+    def preflight_disk_budgets(self) -> None:
+        plan = getattr(self, "plan", None)
+        if plan is None:
+            plan = WorkloadPlan(self.config)
+        required_bytes = plan.temp_table_sidecar_budget_bytes()
+        if required_bytes <= 0:
+            return
+
+        disk_usage_path = WorkloadPlan.existing_disk_usage_path(
+            plan.temp_table_disk_usage_path()
+        )
+        free_bytes = shutil.disk_usage(disk_usage_path).free
+        usable_bytes = (free_bytes * 9) // 10
+        if required_bytes <= usable_bytes:
+            return
+
+        raise RuntimeError(
+            "temp-table sidecar disk budget exceeded: "
+            f"required_bytes={required_bytes} usable_bytes={usable_bytes} "
+            f"free_bytes={free_bytes} path={disk_usage_path} "
+            f"sessions={self.config.sessions} "
+            f"temp_table_target_mb={self.config.temp_table_target_mb}"
+        )
 
     def run_no_preserve_baseline(self) -> None:
         self.runtime.wait_until_up(self.config.startup_timeout_s)
@@ -3117,7 +3304,9 @@ class BusinessE2ERunner:
         conn = self.runtime.connect(database=False)
         try:
             plan = getattr(self, "plan", None)
-            if plan is None and self.config.warmcopy_required:
+            if plan is None and (
+                self.config.warmcopy_required or self.config.temp_table_workload
+            ):
                 plan = WorkloadPlan(self.config)
             drain_hard_timeout_ms = (
                 plan.drain_hard_timeout_ms() if plan is not None else 120_000
@@ -3149,6 +3338,12 @@ class BusinessE2ERunner:
                 )
             if self.config.temp_table_workload:
                 commands.append("SET GLOBAL preserve_trx_temp_table_enable=ON")
+                temp_sidecar_budget = plan.temp_table_sidecar_budget_bytes()
+                if temp_sidecar_budget > 0:
+                    commands.append(
+                        "SET GLOBAL preserve_trx_max_temp_sidecar_bytes="
+                        f"{temp_sidecar_budget}"
+                    )
             if self.config.lock_warmcopy_mode == "on":
                 commands.append("SET GLOBAL preserve_trx_lock_warmcopy_enable=ON")
                 commands.append(
@@ -4661,6 +4856,9 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--max-phase2-pause-ms", type=int, default=5000, help="maximum allowed median warm-copy binlog-cache phase2 pause per large-cache bucket")
     parser.add_argument("--warmcopy-disabled-baseline-slope-ms-per-mb", type=float, help="optional warmcopy-disabled pause slope baseline; warm-copy slope may be at most 25%% of it")
     parser.add_argument("--temp-table-workload", action="store_true", help="mix InnoDB user temporary-table operations into each 100-statement transaction; restart command must keep preserve_trx_temp_table_enable available")
+    parser.add_argument("--temp-table-target-mb", type=int, default=0, help="pre-fill each user temporary table to this many MiB before the drainable transaction starts")
+    parser.add_argument("--temp-table-fill-chunk-kb", type=int, default=64, help="payload bytes per generated temporary-table prefill row, in KiB")
+    parser.add_argument("--temp-table-resume-action", choices=("commit", "rollback", "continue"), default="commit", help="action for a temp-table worker after RESUME returns inside a transaction; commit and rollback are the supported v1 paths")
     parser.add_argument("--startup-timeout", dest="startup_timeout_s", type=float, default=120.0, help="seconds to wait for mysqld to become reachable")
     parser.add_argument("--shutdown-timeout", dest="shutdown_timeout_s", type=float, default=120.0, help="seconds to wait for DRAIN-triggered shutdown")
     parser.add_argument("--shutdown-quiet-period", dest="shutdown_quiet_period_s", type=float, default=2.0, help="seconds mysqld must remain unreachable before restart is attempted")
@@ -4683,7 +4881,7 @@ command is used after each DRAIN command shuts that server down.
         parser.error("--two-phase is only valid with warmcopy_two_phase_large_cache_equivalence")
     large_binlog_cache_sessions = args.large_binlog_cache_sessions
     large_binlog_cache_buckets_mb = args.large_binlog_cache_buckets_mb
-    temp_table_workload = args.temp_table_workload
+    temp_table_workload = args.temp_table_workload or args.temp_table_target_mb > 0
     if args.scenario == "warmcopy_two_phase_large_cache_equivalence":
         warmcopy_required = True
         if large_binlog_cache_sessions == 0:
@@ -4746,6 +4944,9 @@ command is used after each DRAIN command shuts that server down.
         max_phase2_pause_ms=args.max_phase2_pause_ms,
         warmcopy_disabled_baseline_slope_ms_per_mb=args.warmcopy_disabled_baseline_slope_ms_per_mb,
         temp_table_workload=temp_table_workload,
+        temp_table_target_mb=args.temp_table_target_mb,
+        temp_table_fill_chunk_kb=args.temp_table_fill_chunk_kb,
+        temp_table_resume_action=args.temp_table_resume_action,
         startup_timeout_s=args.startup_timeout_s,
         shutdown_timeout_s=args.shutdown_timeout_s,
         shutdown_quiet_period_s=args.shutdown_quiet_period_s,

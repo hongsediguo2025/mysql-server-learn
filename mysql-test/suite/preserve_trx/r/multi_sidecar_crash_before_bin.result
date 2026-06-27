@@ -21,21 +21,14 @@ WHERE id = 1;
 INSERT INTO tmp_multi_sidecar_crash VALUES(1, 100), (2, 200);
 UPDATE tmp_multi_sidecar_crash SET v = v + 1 WHERE id = 1;
 PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
-ERROR HY000: Resumable transactions across shutdown do not support this operation
-SET SESSION debug="-d,preserve_trx_crash_before_snapshot_rename";
+ERROR HY000: Lost connection to MySQL server during query
 SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;
 preserved_count
 0
-SELECT COUNT(*) AS temp_rows, SUM(v) AS temp_sum
-FROM tmp_multi_sidecar_crash;
-temp_rows	temp_sum
-2	301
-COMMIT;
 SELECT id, v, payload FROM t_multi_sidecar_crash_before_bin ORDER BY id;
 id	v	payload
-1	11	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-DROP TEMPORARY TABLE tmp_multi_sidecar_crash;
+1	10	seed
 DROP TABLE t_multi_sidecar_crash_before_bin;
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_temp_table_enable=ON;

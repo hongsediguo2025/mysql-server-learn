@@ -1126,7 +1126,7 @@ static Sys_var_ulonglong Sys_preserve_trx_max_temp_sidecar_bytes(
     "Maximum size in bytes of a preserved temporary table image or undo "
     "sidecar file.",
     GLOBAL_VAR(preserve_trx_max_temp_sidecar_bytes), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, 1073741824ULL), DEFAULT(1073741824), BLOCK_SIZE(1),
+    VALID_RANGE(1, ULLONG_MAX), DEFAULT(1073741824), BLOCK_SIZE(1),
     NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
 static Sys_var_ulonglong Sys_preserve_trx_memory_budget_bytes(

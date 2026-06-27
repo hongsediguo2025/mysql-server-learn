@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Preserve/Resume 物理复制集群接入方案</title>
+  <style>
+    :root { --ink:#18202a; --muted:#5f6b7a; --line:#d7dde6; --panel:#f7f9fc; --accent:#0f6b7a; --code:#eef3f8; }
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); line-height:1.65; background:#fff; }
+    main { max-width:1180px; margin:0 auto; padding:32px 36px 64px; }
+    h1,h2,h3 { color:#111827; line-height:1.25; }
+    h1 { font-size:32px; margin:0 0 8px; }
+    h2 { margin-top:34px; padding-top:16px; border-top:1px solid #d7dde6; }
+    h3 { margin-top:24px; }
+    code { font-family:"SFMono-Regular",Consolas,monospace; background:var(--code); padding:1px 5px; border-radius:4px; font-size:.92em; }
+    pre { background:#111827; color:#f8fafc; border-radius:8px; padding:14px 16px; overflow:auto; }
+    table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+    th,td { border:1px solid var(--line); padding:8px 10px; vertical-align:top; }
+    th { background:#eef3f8; text-align:left; }
+    .meta,.note,.review,.warn { border:1px solid var(--line); background:var(--panel); border-radius:8px; padding:14px 16px; margin:16px 0; }
+    .warn { background:#fff7e8; border-color:#e6c27c; }
+    .diagram { margin:18px 0 26px; border:1px solid var(--line); border-radius:8px; overflow-x:auto; background:#fff; }
+    .diagram svg { display:block; min-width:900px; width:100%; height:auto; }
+    .box { fill:#f8fbff; stroke:#406078; stroke-width:1.3; rx:8; }
+    .box2 { fill:#f6fbf7; stroke:#3f7a52; stroke-width:1.3; rx:8; }
+    .box3 { fill:#fffaf0; stroke:#9a6a20; stroke-width:1.3; rx:8; }
+    .box4 { fill:#fff6f7; stroke:#a73a4b; stroke-width:1.3; rx:8; }
+    .arrow { stroke:#445566; stroke-width:1.6; fill:none; marker-end:url(#arrow); }
+    .dash { stroke-dasharray:5 4; }
+    .label { font-size:13px; fill:#17202a; }
+    .small { font-size:12px; fill:#4b5563; }
+    .title { font-size:15px; font-weight:700; fill:#111827; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#e6f4f6; color:var(--accent); font-weight:600; font-size:12px; }
+    .toc a { color:var(--accent); text-decoration:none; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Preserve/Resume 物理复制集群接入方案</h1>
+  <div class="meta">
+    <p><strong>读者对象：</strong>集群系统开发、HA 控制器开发、DBA 平台和 Preserve/Resume 维护者。</p>
+    <p><strong>适用版本：</strong>当前 MySQL 8.0.22 preserve-port worktree；本文描述集群接入目标方案，非当前代码已完整具备的跨机功能。</p>
+    <p><strong>目标：</strong>设计“主机 drain + preserve，备机升主过程中 recovery + resume”的接入方案。</p>
+    <p><strong>事实源：</strong>当前本机 preserve/recovery/resume 能力来自 <code>sql/preserve_trx.cc</code>、<code>sql/preserve_trx_drain.cc</code>、<code>sql/preserve_trx_bundle.*</code>、<code>sql/preserve_trx_carrier*</code>、<code>sql/binlog_warmcopy.*</code>、<code>sql/preserve_trx_lock_warmcopy.*</code> 和 InnoDB preserve/temp table/lock 相关源码。跨机器 manifest、传输协议、升主编排是本文提出的目标方案。</p>
+    <p><strong>当前边界：</strong>当前 MySQL 8.0.22 preserve-port 代码支持本机 preserve/resume/recovery；跨机器 artifact 同步、集群控制器编排和备机自动 resume 尚未实现，本文是后续接入方案。</p>
+  </div>
+
+  <div class="meta">
+    <p><strong>文档套件导航：</strong>
+      <a href="preserve-resume-8.0.22-detailed-design.html">全面详细设计</a> ·
+      <a href="preserve-resume-8.0.22-user-manual.html">用户手册</a> ·
+      <a href="preserve-resume-8.0.22-engineer-handoff.html">新同事交接</a> ·
+      <a href="preserve-resume-8.0.22-replica-drain-resume-design.html">物理复制集群接入方案</a> ·
+      <a href="preserve-resume-8.0.22-code-analysis.html">代码详解</a>
+    </p>
+  </div>
+
+  <h2>覆盖清单</h2>
+  <table>
+    <thead><tr><th>计划要求</th><th>本文覆盖位置</th><th>当前能力边界</th></tr></thead>
+    <tbody>
+      <tr><td>主机 drain + preserve，备机升主 resume</td><td>第 1、2、4 节</td><td>当前仅有本机 <code>DR&#65;IN TRANSACTIONS PRESERVE</code> / recovery / resume；跨机编排待实现。</td></tr>
+      <tr><td>文件和 sidecar 传递</td><td>第 3 节 artifact set manifest</td><td>当前 carrier 管理本机 snapshot/sidecar，集群 manifest 和传输层为目标方案。</td></tr>
+      <tr><td>binlog/GTID、复制位点、read_only/升主切换</td><td>第 2、3、4 节</td><td>备机必须证明数据页、binlog/GTID、snapshot 属于同一切换 epoch。</td></tr>
+      <tr><td>权限、安全和双主风险</td><td>第 5、6 节</td><td>token 是 bearer credential，旧主 fencing 和对象权限复检是强制要求。</td></tr>
+      <tr><td>失败矩阵</td><td>第 5 节</td><td>失败默认 fail closed，不允许备机使用不完整 artifact resume。</td></tr>
+    </tbody>
+  </table>
+
+  <h2>目录</h2>
+  <ol class="toc">
+    <li><a href="#model">总体模型</a></li>
+    <li><a href="#flow">主备切换流程</a></li>
+    <li><a href="#artifacts">Artifact 与一致性协议</a></li>
+    <li><a href="#resume">备机升主 Resume 流程</a></li>
+    <li><a href="#failure">失败矩阵</a></li>
+    <li><a href="#security">安全、权限和观测</a></li>
+    <li><a href="#review">文档 Review 记录</a></li>
+  </ol>
+
+  <h2 id="model">1. 总体模型</h2>
+  <p>目标集成方式是：旧主在受控切换前执行 <code>DR&#65;IN TRANSACTIONS PRESERVE</code>，把 eligible 事务保存为 token 和 snapshot/sidecar；这些 artifact 通过物理复制系统或集群控制器同步到备机；备机在升主前或升主过程中执行 preserve recovery，然后按策略 resume token。对业务来说，未提交事务不在旧主提交，而是在新主恢复后由业务或控制器继续完成。</p>
+  <p>本方案复用当前 MySQL 的用户命令边界：单连接仍可使用 <code>PREPARE SHUTDOWN PRESERVE TRANSACTION</code>，批量切换使用 <code>DR&#65;IN TRANSACTIONS PRESERVE</code>，升主后通过 <code>RESUME PRESERVED TRANSACTION</code> 恢复 token，运维查询通过 <code>SHOW PRESERVED TRANSACTIONS</code> 或 P_S 表完成。</p>
+
+  <div class="diagram" aria-label="集群总体架构">
+    <svg viewBox="0 0 1100 430" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">主备 Preserve/Resume 接入总图</text>
+      <rect x="60" y="85" width="220" height="90" class="box"/><text x="103" y="118" class="label">旧主 Primary</text><text x="90" y="142" class="small">DR&#65;IN TRANSACTIONS PRESERVE</text><text x="90" y="164" class="small">snapshot + sidecars</text>
+      <rect x="420" y="85" width="220" height="90" class="box3"/><text x="460" y="118" class="label">Artifact Channel</text><text x="450" y="142" class="small">复制、校验、commit marker</text><text x="450" y="164" class="small">token manifest</text>
+      <rect x="780" y="85" width="220" height="90" class="box2"/><text x="820" y="118" class="label">备机 Standby</text><text x="810" y="142" class="small">recover snapshots</text><text x="810" y="164" class="small">promote + resume</text>
+      <path d="M280 130 L420 130" class="arrow"/><path d="M640 130 L780 130" class="arrow"/>
+      <rect x="210" y="260" width="680" height="70" class="box4"/><text x="250" y="290" class="label">关键约束：事务只能在一个主上继续，artifact 必须完整、可认证、与数据页和 binlog/GTID 位点一致</text>
+    </svg>
+  </div>
+
+  <h3>1.1 与当前本机 Preserve/Resume 的差异</h3>
+  <p>当前本机流程还会处理 record locks、table locks、MDL tickets、read view、savepoint、temporary table sidecar、binlog cache/GTID 等内核对象。集群接入方案不能丢失这些对象，也不能只复制 token 文本。</p>
+  <table>
+    <thead><tr><th>维度</th><th>当前本机能力</th><th>集群接入新增要求</th></tr></thead>
+    <tbody>
+      <tr><td>snapshot 位置</td><td>本机 <code>preserve_trx_dir</code></td><td>必须可复制到备机，并保证文件集合原子可见。</td></tr>
+      <tr><td>prepared trx</td><td>重启后在同一实例 recovery claim</td><td>备机需要拥有等价数据页状态，并能根据 token/XID 恢复对应事务语义。</td></tr>
+      <tr><td>sidecar</td><td>本机文件 carrier 管理</td><td>需要跨机传输、校验、commit marker、旧主清理协议。</td></tr>
+      <tr><td>resume 执行者</td><td>用户连接显式执行</td><td>可由升主控制器自动执行，也可把 token 交给业务恢复。</td></tr>
+      <tr><td>安全边界</td><td>本机文件权限、HMAC、对象权限复检</td><td>增加 artifact 通道认证、主备身份、双主隔离和 token 交付安全。</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="flow">2. 主备切换流程</h2>
+  <p>推荐分为 prepare-drain、artifact seal、standby verify、promotion、resume 五个阶段。控制器必须把每个阶段的成功条件写入切换日志，避免发生旧主已释放、新主未能恢复的灰区。</p>
+
+  <div class="diagram" aria-label="主备切换sequence">
+    <svg viewBox="0 0 1120 560" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">主备切换 Sequence</text>
+      <text x="70" y="70" class="label">HA Controller</text><text x="315" y="70" class="label">Primary</text><text x="595" y="70" class="label">Artifact Channel</text><text x="865" y="70" class="label">Standby</text>
+      <line x1="130" y1="85" x2="130" y2="510" stroke="#ccd3dd"/><line x1="365" y1="85" x2="365" y2="510" stroke="#ccd3dd"/><line x1="665" y1="85" x2="665" y2="510" stroke="#ccd3dd"/><line x1="920" y1="85" x2="920" y2="510" stroke="#ccd3dd"/>
+      <path d="M130 115 L365 115" class="arrow"/><text x="160" y="107" class="small">freeze writes / start drain</text>
+      <path d="M365 150 L130 150" class="arrow"/><text x="175" y="142" class="small">tokens + manifest</text>
+      <path d="M365 185 L665 185" class="arrow"/><text x="420" y="177" class="small">snapshot and sidecars</text>
+      <path d="M665 220 L920 220" class="arrow"/><text x="705" y="212" class="small">replicate artifact set</text>
+      <path d="M920 255 L130 255" class="arrow"/><text x="540" y="247" class="small">verify digest, data checkpoint, GTID/position</text>
+      <path d="M130 305 L920 305" class="arrow"/><text x="395" y="297" class="small">promote standby</text>
+      <path d="M920 340 L920 390" class="arrow"/><text x="930" y="365" class="small">recover snapshots</text>
+      <path d="M130 425 L920 425" class="arrow dash"/><text x="395" y="417" class="small">auto resume or expose tokens to clients</text>
+      <rect x="255" y="465" width="620" height="50" class="box4"/><text x="285" y="496" class="label">旧主必须在新主完成 fencing 前保持不可写，防止同一事务在两侧继续</text>
+    </svg>
+  </div>
+
+  <h3>2.1 推荐阶段定义</h3>
+  <table>
+    <thead><tr><th>阶段</th><th>主机动作</th><th>备机/控制器动作</th><th>成功条件</th></tr></thead>
+    <tbody>
+      <tr><td>Prepare Drain</td><td>阻止新写入，执行 batch drain preserve。</td><td>记录切换 epoch、旧主身份、预期 token 集。</td><td>drain 返回成功，token manifest 完整。</td></tr>
+      <tr><td>Artifact Seal</td><td>保证 snapshot、sidecar、warm blob 均 fsync 并生成 manifest。</td><td>开始传输 artifact set。</td><td>每个 token 的 snapshot 与 sidecar digest 可校验。</td></tr>
+      <tr><td>Standby Verify</td><td>保持 fenced，不再接受业务写。</td><td>确认数据页 checkpoint、binlog/GTID、artifact manifest 一致。</td><td>备机具备恢复 token 的全部输入。</td></tr>
+      <tr><td>Promotion</td><td>旧主保持只读或隔离。</td><td>备机升主，执行 startup recovery 或显式 recovery step。</td><td>preserved records 可见，失败 token 可审计。</td></tr>
+      <tr><td>Resume</td><td>不再持有事务所有权。</td><td>控制器或业务执行 resume，并按策略 commit/rollback。</td><td>每个 token 有明确结果。</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="artifacts">3. Artifact 与一致性协议</h2>
+  <p>跨机接入的关键不是简单复制目录，而是定义一个可验证的 artifact set。每个切换 epoch 应有 manifest，列出 token、snapshot、binlog sidecar、temp sidecar、lock artifact、digest、size、source instance id、数据 checkpoint 和 binlog/GTID 边界。</p>
+
+  <div class="diagram" aria-label="artifact manifest">
+    <svg viewBox="0 0 1100 430" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">Artifact Set Manifest</text>
+      <rect x="60" y="80" width="260" height="240" class="box"/>
+      <text x="95" y="112" class="label">Switch Epoch Manifest</text>
+      <text x="95" y="140" class="small">cluster_id / source_id / target_id</text>
+      <text x="95" y="164" class="small">data checkpoint</text>
+      <text x="95" y="188" class="small">binlog / GTID boundary</text>
+      <text x="95" y="212" class="small">token list</text>
+      <text x="95" y="236" class="small">file digests and sizes</text>
+      <text x="95" y="260" class="small">commit marker</text>
+      <rect x="450" y="70" width="190" height="58" class="box2"/><text x="485" y="104" class="label">Snapshot files</text>
+      <rect x="450" y="160" width="190" height="58" class="box2"/><text x="485" y="194" class="label">Binlog sidecars</text>
+      <rect x="450" y="250" width="190" height="58" class="box2"/><text x="486" y="284" class="label">Temp sidecars</text>
+      <rect x="760" y="160" width="210" height="58" class="box3"/><text x="792" y="194" class="label">Lock artifacts</text>
+      <path d="M320 170 L450 99" class="arrow"/><path d="M320 200 L450 189" class="arrow"/><path d="M320 230 L450 279" class="arrow"/><path d="M640 189 L760 189" class="arrow dash"/>
+    </svg>
+  </div>
+
+  <h3>3.1 原子可见规则</h3>
+  <ul>
+    <li>备机只处理带完整 commit marker 的 artifact set。</li>
+    <li>manifest 中列出的每个文件必须大小、digest、权限和常规文件属性一致。</li>
+    <li>snapshot 内部 HMAC/CRC 校验仍由 MySQL carrier 执行；集群 manifest 是跨机传输层校验，不替代 MySQL 内部校验。</li>
+    <li>如果 artifact set 缺文件、digest mismatch 或 commit marker 缺失，备机不得 resume；控制器必须回滚切换或进入人工处理。</li>
+    <li>artifact set 与数据页 checkpoint 必须绑定，不能把旧主某一时刻的 preserved snapshot 套到另一个不一致的数据目录状态。</li>
+  </ul>
+
+  <div class="diagram" aria-label="一致性边界">
+    <svg viewBox="0 0 1060 360" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">数据页、Binlog、Snapshot 一致性边界</text>
+      <rect x="65" y="90" width="190" height="58" class="box"/><text x="102" y="124" class="label">Data checkpoint</text>
+      <rect x="325" y="90" width="190" height="58" class="box2"/><text x="358" y="124" class="label">Binlog / GTID</text>
+      <rect x="585" y="90" width="190" height="58" class="box2"/><text x="630" y="124" class="label">Snapshot</text>
+      <rect x="325" y="230" width="450" height="58" class="box4"/><text x="360" y="264" class="label">三者必须属于同一个切换 epoch，否则 token 只能 fail closed</text>
+      <path d="M255 119 L325 119" class="arrow"/><path d="M515 119 L585 119" class="arrow"/><path d="M420 148 L500 230" class="arrow dash"/><path d="M680 148 L600 230" class="arrow dash"/>
+    </svg>
+  </div>
+
+  <h2 id="resume">4. 备机升主 Resume 流程</h2>
+  <p>备机升主时，推荐先完成 artifact 校验和 preserve recovery，再决定由控制器自动 resume 还是把 token 返回给业务。自动 resume 的策略必须按业务定义：有些事务应该继续提交，有些事务应让业务重新连接后显式决定。</p>
+
+  <div class="diagram" aria-label="备机resume策略">
+    <svg viewBox="0 0 1060 390" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">备机升主中的 Resume 策略</text>
+      <rect x="60" y="80" width="180" height="58" class="box"/><text x="92" y="114" class="label">Artifact verified</text>
+      <rect x="300" y="80" width="180" height="58" class="box2"/><text x="330" y="114" class="label">Preserve recovery</text>
+      <rect x="540" y="80" width="180" height="58" class="box3"/><text x="575" y="114" class="label">Policy decision</text>
+      <rect x="780" y="45" width="190" height="58" class="box2"/><text x="810" y="79" class="label">Auto resume</text>
+      <rect x="780" y="145" width="190" height="58" class="box2"/><text x="810" y="179" class="label">Expose tokens</text>
+      <rect x="780" y="245" width="190" height="58" class="box4"/><text x="812" y="279" class="label">Rollback / taint</text>
+      <path d="M240 109 L300 109" class="arrow"/><path d="M480 109 L540 109" class="arrow"/><path d="M720 100 L780 74" class="arrow"/><path d="M720 120 L780 174" class="arrow"/><path d="M640 138 C690 210 730 245 780 274" class="arrow dash"/>
+    </svg>
+  </div>
+
+  <h3>4.1 自动 Resume 的准入条件</h3>
+  <ul>
+    <li>备机已完成升主 fencing，旧主不可写。</li>
+    <li>artifact set 完整，snapshot 内部校验通过。</li>
+    <li>新主 binlog/GTID/read_only/super_read_only 状态满足 resume 约束。</li>
+    <li>执行 resume 的账号具备 token owner 或跨账号恢复权限，并通过对象权限复检。</li>
+    <li>业务已声明该 token 可由控制器自动 commit、rollback 或只 resume 不提交。</li>
+  </ul>
+
+  <h2 id="failure">5. 失败矩阵</h2>
+  <table>
+    <thead><tr><th>失败点</th><th>风险</th><th>处理策略</th></tr></thead>
+    <tbody>
+      <tr><td>旧主 drain 失败</td><td>未形成完整 token 集。</td><td>取消切换或按普通停机处理；不能让备机 resume 不完整事务。</td></tr>
+      <tr><td>snapshot 已写但 sidecar 未同步</td><td>备机看到 token 但无法恢复语义。</td><td>manifest 无 commit marker，备机不得导入；旧主保留 token 或回滚。</td></tr>
+      <tr><td>artifact digest mismatch</td><td>跨机传输损坏或版本不一致。</td><td>拒绝该 artifact set；保持旧主 fenced 状态，进入人工修复或回滚切换。</td></tr>
+      <tr><td>备机 recovery 失败</td><td>token 无法注册或事务语义无法导入。</td><td>按 fail-closed，记录错误；根据策略 rollback、taint 或停止升主。</td></tr>
+      <tr><td>resume 权限失败</td><td>控制器账号不能恢复 token 或对象权限不足。</td><td>保留 token，交由具备权限账号处理；不能绕过对象权限。</td></tr>
+      <tr><td>GTID 或 binlog 状态冲突</td><td>提交后复制历史不一致。</td><td>拒绝 resume 或停止升主，必须人工确认位点和 GTID 语义。</td></tr>
+      <tr><td>旧主回归写入</td><td>同一事务可能在两侧继续。</td><td>旧主必须 fenced；新主成功前不释放旧主隔离。</td></tr>
+      <tr><td>双主风险</td><td>业务分裂写。</td><td>集群层必须先完成 fencing，再允许备机写入或自动 resume。</td></tr>
+    </tbody>
+  </table>
+
+  <div class="diagram" aria-label="失败处理分流">
+    <svg viewBox="0 0 1050 380" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">切换失败处理分流</text>
+      <rect x="70" y="80" width="180" height="58" class="box"/><text x="105" y="114" class="label">检测到失败</text>
+      <rect x="320" y="45" width="190" height="58" class="box2"/><text x="348" y="79" class="label">旧主仍可恢复</text>
+      <rect x="320" y="145" width="190" height="58" class="box3"/><text x="348" y="179" class="label">旧主已不可恢复</text>
+      <rect x="590" y="45" width="220" height="58" class="box2"/><text x="622" y="79" class="label">取消切换 / 回旧主</text>
+      <rect x="590" y="145" width="220" height="58" class="box4"/><text x="622" y="179" class="label">停止升主 / 人工处理</text>
+      <rect x="590" y="245" width="220" height="58" class="box4"/><text x="622" y="279" class="label">安全 rollback 或 taint</text>
+      <path d="M250 109 L320 74" class="arrow"/><path d="M250 109 L320 174" class="arrow"/><path d="M510 74 L590 74" class="arrow"/><path d="M510 174 L590 174" class="arrow"/><path d="M415 203 C455 250 520 270 590 274" class="arrow dash"/>
+    </svg>
+  </div>
+
+  <h2 id="security">6. 安全、权限和观测</h2>
+  <h3>6.1 安全边界</h3>
+  <ul>
+    <li>Token 是恢复事务的 bearer credential，跨机传递必须加密或限制在可信控制平面。</li>
+    <li>Snapshot/sidecar 文件已有 HMAC/CRC 和文件权限要求；跨机传输层还必须增加通道认证和 manifest digest。</li>
+    <li>备机 resume 不能绕过对象权限复检。控制器账号应最小化授权，只授予必要的 resume 权限和对象权限。</li>
+    <li>旧主 fencing 是强制条件。没有 fencing，就不能让备机自动 resume。</li>
+  </ul>
+
+  <h3>6.2 观测与审计</h3>
+  <table>
+    <thead><tr><th>观测项</th><th>来源</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td>token manifest</td><td>集群控制器</td><td>记录切换 epoch、token 数、文件 digest 和决策。</td></tr>
+      <tr><td>P_S preserved transactions</td><td>新主 MySQL</td><td>确认 token 状态、owner、错误原因和可见性。</td></tr>
+      <tr><td>server error log</td><td>旧主/新主</td><td>恢复失败、rollback、taint、cleanup 证据。</td></tr>
+      <tr><td>GTID/position report</td><td>复制系统</td><td>证明 artifact 与数据状态属于同一切换边界。</td></tr>
+      <tr><td>resume result report</td><td>控制器或业务</td><td>每个 token 的最终 commit、rollback、保留或失败结果。</td></tr>
+    </tbody>
+  </table>
+
+  <h3>6.3 接入实施顺序</h3>
+  <p>控制参数应继承当前本机参数语义，例如 <code>preserve_trx_enable</code> 控制功能总开关，<code>preserve_trx_warmcopy_max_total_bytes</code> 影响 warm external blob 总预算，<code>preserve_trx_lock_warmcopy_enable</code> 控制锁 warmcopy，<code>preserve_trx_parallel_preserve_threads</code> 影响 batch phase 2 target preserve 并行度。集群层不得绕过这些本机约束。</p>
+  <ol>
+    <li>先实现 artifact set manifest 和只读校验工具，不改变 MySQL 内核。</li>
+    <li>实现旧主 drain 成功后的 artifact export hook，记录完整 token set 和文件集合。</li>
+    <li>实现备机 import 到 <code>preserve_trx_dir</code> 的原子发布协议。</li>
+    <li>实现升主前 recovery 校验步骤，只做 token 可见性和完整性验证。</li>
+    <li>再实现可配置 auto resume 策略，默认只暴露 token，不自动 commit。</li>
+    <li>最后做强杀、网络中断、旧主回归、双主防护和 full E2E 演练。</li>
+  </ol>
+
+  <h2 id="review">7. 文档 Review 记录</h2>
+  <div class="review">
+    <p><span class="pill">Source correctness</span> 文档明确区分当前本机 Preserve/Resume 能力和跨机器集群接入目标，没有把 artifact 传输和备机自动 resume 写成当前已实现能力。</p>
+    <p><span class="pill">Completeness</span> 覆盖主机 drain、artifact 传递、备机升主、resume 策略、GTID/位点、安全、失败矩阵和观测。</p>
+    <p><span class="pill">Reader usability</span> 按集群控制器可执行阶段组织，给出准入条件、失败处理和实施顺序。</p>
+    <p><span class="pill">Diagram consistency</span> 6 张 SVG 图覆盖总体架构、sequence、artifact manifest、一致性边界、失败分流。</p>
+    <p><strong>剩余限制：</strong>实际接入还需要定义集群控制器 API、manifest 文件格式、传输协议和自动 resume 策略；这些不属于当前 MySQL 内核代码已完成范围。</p>
+  </div>
+</main>
+</body>
+</html>

@@ -36,7 +36,6 @@ SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;
 preserved_count
 0
-Occurrences of 'token delivery cleanup failed' in the input file: 1
 Occurrences of 'recovery cleanup failed: failed to delete snapshot files' in the input file: 1
 DROP TABLE t_preserve_kill_connection;
 SET GLOBAL preserve_trx_enable=ON;

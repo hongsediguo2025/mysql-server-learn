@@ -2407,6 +2407,8 @@ bool rename_temporary_table(THD *thd, TABLE *table, const char *db,
   if (!(key = (char *)share->mem_root.Alloc(MAX_DBKEY_LENGTH)))
     return true; /* purecov: inspected */
 
+  (void)preserve_trx_temp_table_note_table_rename(thd, table, table_name,
+                                                  strlen(table_name));
   key_length = create_table_def_key_tmp(thd, db, table_name, key);
   share->set_table_cache_key(key, key_length);
   /* Also update table name in DD object. Database name is kept reset. */

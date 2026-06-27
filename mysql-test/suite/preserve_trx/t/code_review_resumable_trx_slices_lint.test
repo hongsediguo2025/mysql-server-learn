@@ -382,6 +382,16 @@ $preserve =~ /ha_prepare_low\s*\(\s*thd\s*,\s*true\s*\)[\s\S]*?return\s+restore_
 $preserve =~ /DBUG_EXECUTE_IF\s*\(\s*"pfx_temp_prepare"[\s\S]*?temp_prepare_failed\s*=\s*true[\s\S]*?if\s*\(\s*temp_prepare_failed\s*\)\s*\{[\s\S]*?return\s+restore_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
   or die "temp-only prepare failure hook must route through batch restore helper\n";
 
+$preserve =~ /auto restore_prepared_batch_or_rollback = \[\&\]\(\) \{[\s\S]*?^\s*\};/m
+  or die "could not isolate restore_prepared_batch_or_rollback\n";
+my $prepared_batch_restore = $&;
+die "post-prepare batch cleanup must not fall through to single-session cleanup when batch reactivation fails\n"
+  if $prepared_batch_restore =~
+     /if\s*\(\s*batch_delivery\s*&&\s*!\s*reactivate_current_batch_prepared_failure_to_original_thd\s*\(\s*thd\s*\)\s*\)/s;
+die "post-prepare batch cleanup must handle batch reactivation failure before the single-session fallback\n"
+  unless $prepared_batch_restore =~
+         /if\s*\(\s*batch_delivery\s*\)\s*\{[\s\S]*?if\s*\(\s*reactivate_current_batch_prepared_failure_to_original_thd\s*\(\s*thd\s*\)\s*\)[\s\S]*?cleanup_failed_after_reattach\s*=\s*true[\s\S]*?return\s+reject_unsupported_for_delivery\s*\(\s*\)/s;
+
 $preserve =~ /auto reject_after_binlog_export = \[\&\]\(const char \*reason\) \{[\s\S]*?^\s*\};/m
   or die "could not isolate reject_after_binlog_export\n";
 my $reject_after_binlog_export = $&;
@@ -406,11 +416,11 @@ die "pre-prepare reject paths after logged binlog export must route through reje
 $temp_table =~ /bool preserve_trx_temp_table_build_baseline_image[\s\S]*?^}/m
   or die "could not isolate preserve_trx_temp_table_build_baseline_image\n";
 my $temp_baseline_builder = $&;
-die "temp no-redo undo preserve must fail closed before physical page capture\n"
-  unless $temp_baseline_builder =~ /has_row_history\s*\(\s*\)[\s\S]*no-redo undo sidecars are unsupported/s &&
-         index($temp_baseline_builder, 'no-redo undo sidecars are unsupported') <
-         index($temp_baseline_builder,
-               'trx_preserve_temp_space_image_arm_dirty_page_stream');
+die "temp DML preserve must build physical pages and no-redo undo sidecar together\n"
+  unless $temp_baseline_builder =~
+         /trx_preserve_temp_space_image_arm_dirty_page_stream[\s\S]*capture_no_redo_undo[\s\S]*seal_no_redo_undo_sidecar/s;
+die "temp no-redo undo preserve must not keep the old blanket unsupported branch\n"
+  if $temp_baseline_builder =~ /no-redo undo sidecars are unsupported/s;
 
 die "temp sidecar read limit must use the temp-sidecar sysvar, not binlog cache cap\n"
   unless $temp_table_carrier =~ /temp_sidecar_max_read_bytes[\s\S]*preserve_trx_max_temp_sidecar_bytes/s &&
@@ -433,8 +443,12 @@ die "temp preserve must reject row history lost while the feature gate was disab
 $temp_table =~ /Preserve_snapshot_status preserve_trx_temp_table_preflight_preserve[\s\S]*?^}/m
   or die "could not isolate preserve_trx_temp_table_preflight_preserve\n";
 my $temp_preflight_preserve = $&;
+die "temp preflight may skip no-temp sessions only after proving there is no dropped-temp history\n"
+  unless $temp_preflight_preserve =~
+         /temporary_tables\s*==\s*nullptr[\s\S]*!\s*untracked_change[\s\S]*!\s*batch_unsupported_boundary[\s\S]*!\s*participant_degraded[\s\S]*has_temp_dml_history[\s\S]*has_temp_ddl_history/s;
 die "temp preflight must reject dropped-temp row history even when no temp tables remain linked\n"
-  if $temp_preflight_preserve =~ /temporary_tables\s*==\s*nullptr/s;
+  unless $temp_preflight_preserve =~
+         /unsupported_history\s*=[\s\S]*untracked_change[\s\S]*batch_unsupported_boundary[\s\S]*has_unsupported_history/s;
 
 $handler =~ /int handler::ha_write_row[\s\S]*?^}/m
   or die "could not isolate handler::ha_write_row\n";
@@ -455,11 +469,15 @@ die "temp delete hook must run for transactional temp rows even when the feature
 $temp_table =~ /Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume[\s\S]*?^}/m
   or die "could not isolate preserve_trx_temp_table_materialize_for_resume\n";
 my $temp_materialize = $&;
-die "temp no-redo undo resume must fail closed before sidecar read/materialize\n"
-  unless $temp_materialize =~
-         /plan\.requires_no_redo_undo_sidecars[\s\S]*Preserve_snapshot_status::UNSUPPORTED/s &&
-         index($temp_materialize, 'plan.requires_no_redo_undo_sidecars') <
-         index($temp_materialize, 'preserve_trx_temp_table_validate_sidecars');
+die "temp no-redo undo resume must validate sidecars before reading undo payloads\n"
+  unless $temp_materialize =~ /preserve_trx_temp_table_validate_sidecars/s &&
+         $temp_materialize =~ /carrier\.read_sealed_undo/s &&
+         $temp_materialize =~ /trx_preserve_temp_space_image_load_no_redo_undo_sidecar/s &&
+         index($temp_materialize, 'preserve_trx_temp_table_validate_sidecars') <
+         index($temp_materialize, 'carrier.read_sealed_undo') &&
+         index($temp_materialize, 'carrier.read_sealed_undo') <
+         index($temp_materialize,
+               'trx_preserve_temp_space_image_load_no_redo_undo_sidecar');
 
 $temp_table =~ /auto cleanup_sidecars = \[\&\]\(\) \{[\s\S]*?^\s*\};/m
   or die "could not isolate temp cleanup_sidecars\n";
@@ -467,8 +485,8 @@ my $temp_cleanup_sidecars = $&;
 die "temp sidecar cleanup must delete only sidecars sealed by this attempt\n"
   unless $temp_cleanup_sidecars =~ /remove_warm_image/s &&
          $temp_cleanup_sidecars =~ /remove_sealed_image/s &&
-         $temp_cleanup_sidecars !~ /remove_warm_undo/s &&
-         $temp_cleanup_sidecars !~ /remove_sealed_undo/s &&
+         $temp_cleanup_sidecars =~ /remove_warm_undo/s &&
+         $temp_cleanup_sidecars =~ /remove_sealed_undo/s &&
          $temp_cleanup_sidecars !~ /remove_sealed_sidecars/s;
 $temp_table_carrier =~ /Preserved_trx_carrier_status fsync_directory_after_install[\s\S]*?^}/m
   or die "could not isolate fsync_directory_after_install\n";
@@ -523,17 +541,16 @@ die "temp dirty-page staging must resolve source-space membership and staged-byt
 $handler =~ /int handler::ha_update_row[\s\S]*?^}/m
   or die "could not isolate handler::ha_update_row\n";
 my $handler_update_row = $&;
-die "ha_update_row must gate temp-table payload copy before allocating old+new payload\n"
+die "ha_update_row temp hook must stay marker-only and avoid row payload allocation\n"
   unless $handler_update_row =~ /preserve_trx_temp_table_row_capture_candidate/s &&
+         $handler_update_row =~ /preserve_trx_temp_table_row_hooks_enabled/s &&
          index($handler_update_row, 'preserve_trx_temp_table_row_capture_candidate') >= 0 &&
-         index($handler_update_row, 'preserve_trx_temp_table_enable') >= 0 &&
-         index($handler_update_row, 'std::string payload') >= 0 &&
-         index($handler_update_row, 'preserve_trx_temp_table_row_capture_candidate') <
-         index($handler_update_row, 'preserve_trx_temp_table_enable') &&
-         index($handler_update_row, 'preserve_trx_temp_table_enable') <
-         index($handler_update_row, 'std::string payload') &&
+         index($handler_update_row, 'preserve_trx_temp_table_row_hooks_enabled') <
+         index($handler_update_row, 'preserve_trx_temp_table_row_capture_candidate') &&
          $handler_update_row =~
-           /!\s*preserve_trx_temp_table_enable[\s\S]*preserve_trx_temp_table_note_row_update\s*\(\s*ha_thd\(\)\s*,\s*table\s*,\s*nullptr\s*,\s*0\s*\)/s;
+           /preserve_trx_temp_table_note_row_update\s*\(\s*ha_thd\(\)\s*,\s*table\s*,\s*nullptr\s*,\s*0\s*\)/s;
+die "ha_update_row temp hook must not allocate SQL row payloads\n"
+  if $handler_update_row =~ /std::string\s+payload|old_data\s*,\s*table->s->reclength/s;
 
 $binlog_ostream =~ /bool Binlog_cache_storage::write[\s\S]*?^}/m
   or die "could not isolate Binlog_cache_storage::write\n";
@@ -726,9 +743,9 @@ my $prelock_preserve_window =
 die "unsupported transaction contents must fail closed before preserve lock/prepare flow\n"
   unless $prelock_preserve_window =~
          /return\s+reject_after_binlog_export\s*\(\s*"unsupported_transaction_contents"\s*\)/s;
-die "temp-table no-redo undo preflight must fail closed before preserve lock/prepare flow\n"
+die "temp-table preflight failure must fail closed before preserve lock/prepare flow\n"
   unless $prelock_preserve_window =~
-         /temp_preflight_status\s*!=\s*Preserve_snapshot_status::OK[\s\S]*return\s+reject_after_binlog_export\s*\(\s*"temp_table_no_redo_undo_unsupported"\s*\)/s;
+         /temp_preflight_status\s*!=\s*Preserve_snapshot_status::OK[\s\S]*return\s+reject_after_binlog_export\s*\(/s;
 
 $preserve =~ /bool no_cache_gtid_state_is_clean[\s\S]*?^}/m
   or die "could not isolate no_cache_gtid_state_is_clean\n";
@@ -1462,9 +1479,17 @@ die "Slice 2 bootstrap temp orphan cleanup must route through Preserved_trx_stor
   unless $preserve =~
          /delete_orphan_temp_table_sidecars_or_log[\s\S]*Preserved_trx_store\s*&store[\s\S]*store\.remove_with_status/s &&
          $preserve =~ /delete_orphan_temp_table_sidecars_or_log\s*\(\s*store\.store\(\)\s*,\s*listing\s*\)/s;
+my $temp_bootstrap_start =
+  index($preserve, 'bool preserved_temp_images_bootstrap_preamble()');
+my $temp_bootstrap_force_recovery = $temp_bootstrap_start < 0 ? -1 :
+  index($preserve, 'if (srv_force_recovery > 0) return false;',
+        $temp_bootstrap_start);
+my $temp_bootstrap_store_scan = $temp_bootstrap_start < 0 ? -1 :
+  index($preserve, 'create_preserved_trx_default_store', $temp_bootstrap_start);
 die "temporary tablespace bootstrap must skip force recovery before carrier scan\n"
-  unless $preserve =~
-         /bool preserved_temp_images_bootstrap_preamble\s*\(\s*\)\s*\{\s*if\s*\(\s*!\s*preserve_trx_is_enabled\s*\(\s*\)\s*\)\s*return\s+false;\s*if\s*\(srv_force_recovery\s*>\s*0\)\s*return\s+false;\s*const std::string dir[\s\S]*create_preserved_trx_default_store/s;
+  unless $temp_bootstrap_start >= 0 &&
+         $temp_bootstrap_force_recovery > $temp_bootstrap_start &&
+         $temp_bootstrap_store_scan > $temp_bootstrap_force_recovery;
 die "temporary tablespace bootstrap must snapshot-read headers before validating temp sidecars\n"
   unless $preserve =~
          /bool preserved_temp_images_bootstrap_preamble[\s\S]*store->read\s*\(\s*token\s*,\s*true\s*,\s*Preserved_trx_carrier::Payload_read_mode::SNAPSHOT_ONLY[\s\S]*validate_temp_sidecars_for_bootstrap/s &&

@@ -63,13 +63,14 @@ enum class Temp_table_participant_state {
 };
 
 struct Temp_table_journal_record {
-	  /*
-	    Logical tail record for temp-table metadata and row-level changes that
-	    occur after baseline discovery. Physical page images are carried by the
-	    InnoDB sidecar path; preserve-time validation uses these records to prove
-	    whether history is complete and to reject unsupported row history before a
-	    manifest is built. They are not serialized as a resume-time replay log.
-	  */
+  /*
+    Logical tail record for temp-table metadata and row-level changes that
+    occur after baseline discovery. Physical page images are carried by the
+    InnoDB sidecar path; preserve-time validation uses these records to prove
+    whether history is complete and to reject unsupported metadata/savepoint
+    history before a manifest is built. They are not serialized as a resume-time
+    replay log.
+  */
   uint64_t seq{0};
   uint32_t table_ordinal{0};
   uint32_t generation{0};
@@ -78,6 +79,8 @@ struct Temp_table_journal_record {
     CREATE_TABLE,
     DROP_TABLE,
     TRUNCATE_TABLE,
+    ALTER_TABLE,
+    RENAME_TABLE,
     INSERT_ROW,
     UPDATE_ROW,
     DELETE_ROW,
@@ -95,8 +98,9 @@ struct Temp_table_journal_record {
   savepoint barriers, and whether physical dirty-page capture has been armed. It
   is not a durable artifact by itself; preserve later builds a manifest and
   sidecars only if the history is complete and the table shape is still
-  supported. Row-history records currently protect fail-closed decisions; they
-  do not make arbitrary temp-DML replayable on resume.
+  supported. Row-history records distinguish supported DML from fail-closed
+  DDL/savepoint/rollback boundaries; SQL row payloads are not replayed on
+  resume.
 */
 class Temp_table_warmcopy_participant {
  public:
@@ -110,8 +114,14 @@ class Temp_table_warmcopy_participant {
   const std::vector<Temp_table_journal_record> &journal() const {
     return m_journal;
   }
-  /* True when DDL-like or row-changing temp-table tail history exists. */
+  /* True when any DDL-like or row-changing temp-table tail history exists. */
   bool has_row_history() const;
+  /* True when supported phase-1 temp DML markers exist. */
+  bool has_temp_dml_history() const;
+  /* True when CREATE/DROP/TRUNCATE/ALTER/RENAME temp-table history exists. */
+  bool has_temp_ddl_history() const;
+  /* True when DDL/savepoint/statement rollback history forces fail-closed. */
+  bool has_unsupported_history() const;
 
   void begin_baseline_copy();
   void begin_journal_apply();
@@ -156,12 +166,12 @@ class Temp_table_warmcopy_participant {
   static constexpr size_t kDefaultMaxTailBytes = 1024 * 1024;
 
  private:
-	  struct Table_state {
-	    /*
-	      TRUNCATE bumps the generation for the same table ordinal. DROP removes
-	      the table state entirely, so a later same-name CREATE receives a fresh
-	      ordinal and cannot inherit row events from the previous incarnation.
-	    */
+  struct Table_state {
+    /*
+      TRUNCATE bumps the generation for the same table ordinal. DROP removes
+      the table state entirely, so a later same-name CREATE receives a fresh
+      ordinal and cannot inherit row events from the previous incarnation.
+    */
     uint32_t table_ordinal{0};
     uint32_t generation{1};
     uint64_t next_row_sequence{1};
@@ -206,6 +216,7 @@ class Temp_table_warmcopy_participant {
 
 Temp_table_warmcopy_participant *preserve_trx_temp_table_get_participant(
     THD *thd);
+std::string preserve_trx_temp_table_degraded_reason(THD *thd);
 /* Session-level form of has_row_history(); includes DDL-like or row history. */
 bool preserve_trx_temp_table_has_row_history(THD *thd);
 Preserve_snapshot_status preserve_trx_temp_table_preflight_preserve(THD *thd);
@@ -214,6 +225,8 @@ bool preserve_trx_temp_table_capture_enabled(THD *thd, const TABLE *table);
 bool preserve_trx_temp_table_row_capture_candidate(THD *thd,
                                                    const TABLE *table);
 bool preserve_trx_temp_table_has_untracked_change(THD *thd);
+bool preserve_trx_temp_table_has_batch_unsupported_boundary(THD *thd);
+void preserve_trx_temp_table_clear_batch_unsupported_boundary(THD *thd);
 void preserve_trx_temp_table_note_untracked_change(THD *thd);
 void preserve_trx_temp_table_mark_transaction_start(THD *thd);
 Temp_table_warmcopy_participant *preserve_trx_temp_table_ensure_participant(
@@ -221,6 +234,8 @@ Temp_table_warmcopy_participant *preserve_trx_temp_table_ensure_participant(
 void preserve_trx_temp_table_clear_participant(THD *thd);
 bool preserve_trx_temp_table_transaction_state_needs_clear(const THD *thd);
 void preserve_trx_temp_table_clear_transaction_state(THD *thd);
+bool preserve_trx_temp_table_precheck_row_write(THD *thd,
+                                                const TABLE *table);
 
 bool preserve_trx_temp_table_note_table_create(THD *thd,
                                                uint32_t table_ordinal,
@@ -238,6 +253,10 @@ bool preserve_trx_temp_table_note_table_truncate(THD *thd,
                                                  size_t schema_length,
                                                  const char *table_name,
                                                  size_t table_name_length);
+bool preserve_trx_temp_table_note_table_alter(THD *thd, const TABLE *table);
+bool preserve_trx_temp_table_note_table_rename(THD *thd, const TABLE *table,
+                                               const char *new_name,
+                                               size_t new_name_length);
 bool preserve_trx_temp_table_note_row_write(THD *thd,
                                             uint32_t table_ordinal,
                                             const char *payload,
@@ -319,14 +338,13 @@ enum class Preserve_trx_temp_table_materialize_source {
 };
 
 struct Preserve_trx_temp_table_materialize_plan {
-	  /*
-	    Resume chooses one materialization plan per snapshot. PHYSICAL_SIDECARS
-	    means the SQL row journal is not replayed; the sidecar image and dict
-	    binding are the source of truth. If requires_no_redo_undo_sidecars is true
-	    today, the plan is recognized but rejected before mutation; scans_sql_rows
-	    and replays_logical_row_journal document unsupported alternatives and must
-	    remain false for the physical-sidecar path.
-	  */
+  /*
+    Resume chooses one materialization plan per snapshot. PHYSICAL_SIDECARS
+    means the SQL row journal is not replayed; the image sidecar, undo sidecar
+    and dict binding are the source of truth. scans_sql_rows and
+    replays_logical_row_journal document unsupported alternatives and must
+    remain false for the physical-sidecar path.
+  */
   Preserve_trx_temp_table_materialize_source source{
       Preserve_trx_temp_table_materialize_source::NONE};
   bool requires_sealed_image_sidecars{false};

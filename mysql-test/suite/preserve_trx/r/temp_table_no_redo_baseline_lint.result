@@ -1,0 +1,6 @@
+# Lint-only source-shape guard for no-redo temp undo baseline capture.
+# Explicit and implicit multi-statement transaction starts must mark the
+# baseline before temp DML can be compared against preserve-time state.
+SELECT 'ok' AS temp_table_no_redo_baseline_lint;
+temp_table_no_redo_baseline_lint
+ok

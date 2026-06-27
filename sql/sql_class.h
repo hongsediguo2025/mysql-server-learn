@@ -1368,6 +1368,15 @@ class THD : public MDL_context_owner,
   */
   std::atomic<bool> preserve_trx_temp_table_untracked_change{false};
   /**
+    Sticky marker for unsupported temporary-table DDL/savepoint/rollback
+    boundaries observed while a batch drain capture epoch is open. It is not
+    tied to the SQL transaction lifetime because commands such as TRUNCATE
+    TEMPORARY TABLE can end the old transaction before the drain owner samples
+    the target state. The batch cleanup path clears this flag together with the
+    batch generation.
+  */
+  std::atomic<bool> preserve_trx_temp_table_batch_unsupported_boundary{false};
+  /**
     true after the transaction-start sampler has decided whether a no-redo undo
     baseline exists. Preserve uses the baseline to detect temp-table undo tail
     changes that current resume support cannot reconnect safely; false means
@@ -1384,6 +1393,16 @@ class THD : public MDL_context_owner,
     The value is meaningful only while valid is true.
   */
   uint64_t preserve_trx_temp_table_no_redo_baseline_top{0};
+  /**
+    True after RESUME materialized no-redo undo sidecars for user temporary
+    tables. The current implementation restores the transaction's undo pages
+    and in-memory undo objects, but it does not restore the global temporary
+    rseg/FSP allocator state that would let the resumed transaction append more
+    temp-table undo safely. Row-write entry points reject further temp-table DML
+    while this flag is set; COMMIT and ROLLBACK clear it with the rest of the
+    temp-table preserve transaction state.
+  */
+  bool preserve_trx_temp_table_restored_no_redo_undo_active{false};
   /**
     Participant identity cleared with the THD preserve state. The current
     temp-table hooks use the has_participant fast path above rather than this

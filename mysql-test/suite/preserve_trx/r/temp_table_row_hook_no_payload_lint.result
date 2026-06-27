@@ -1,0 +1,6 @@
+# Lint-only source-shape guard for user temporary-table row hooks.
+# Runtime support is based on physical page capture plus no-redo undo
+# sidecars; SQL row hooks must only mark that temp DML happened.
+SELECT 'ok' AS temp_table_row_hook_no_payload_lint;
+temp_table_row_hook_no_payload_lint
+ok

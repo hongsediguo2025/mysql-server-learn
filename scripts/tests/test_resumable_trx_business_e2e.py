@@ -43,10 +43,14 @@ from scripts.resumable_trx_business_e2e import (
 class _FakeConnection:
     def __init__(self):
         self.commit_count = 0
+        self.rollback_count = 0
         self.closed = False
 
     def commit(self):
         self.commit_count += 1
+
+    def rollback(self):
+        self.rollback_count += 1
 
     def close(self):
         self.closed = True
@@ -596,7 +600,7 @@ class _InspectingWorker(BusinessWorker):
         super().__init__(*args, **kwargs)
         self.marked_active_during_verify = None
 
-    def _verify_committed_transaction(self, conn, tx_id):
+    def _verify_committed_transaction(self, conn, tx_id, completed_stmt_count=None):
         with self.coordinator._condition:
             self.marked_active_during_verify = self.coordinator._in_transaction.get(self.sid)
 
@@ -800,6 +804,18 @@ class _RecordingDrainableCoordinator:
 
     def pause_for_drain_if_requested(self, sid, timeout_s):
         self.pause_calls += 1
+        return None
+
+
+class _ResumeOnceDrainableCoordinator(_RecordingDrainableCoordinator):
+    def __init__(self, resumed):
+        super().__init__()
+        self.resumed = resumed
+
+    def pause_for_drain_if_requested(self, sid, timeout_s):
+        self.pause_calls += 1
+        if self.pause_calls == 1:
+            return self.resumed
         return None
 
 
@@ -1252,6 +1268,66 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertEqual([False, False, True, False], coordinator.drainable_flags)
         self.assertEqual(1, coordinator.pause_calls)
 
+    def test_temp_table_worker_commits_after_resume_without_more_temp_dml(self):
+        cfg = HarnessConfig(
+            sessions=1,
+            table_count=1,
+            statements_per_tx=4,
+            seed_rows_per_table_per_session=8,
+            temp_table_workload=True,
+            min_statements_before_drain_pause=1,
+        ).validate()
+        runtime = _FakeRuntime()
+        resumed = _FakeConnection()
+        worker = BusinessWorker(
+            1,
+            WorkloadPlan(cfg),
+            runtime,
+            _ResumeOnceDrainableCoordinator(resumed),
+            threading.Event(),
+        )
+
+        result = worker._run_transaction(_FakeConnection(), tx_id=1)
+
+        self.assertIs(result, resumed)
+        self.assertGreater(resumed.commit_count, 0)
+        self.assertEqual(resumed.rollback_count, 0)
+        self.assertTrue(
+            any(sql.startswith("INSERT IGNORE INTO `rtx_e2e_tmp_001`") for sql in runtime.sql)
+        )
+        self.assertFalse(
+            any(sql.startswith("UPDATE `rtx_e2e_tmp_001`") for sql in runtime.sql)
+        )
+
+    def test_temp_table_worker_can_rollback_after_resume(self):
+        cfg = HarnessConfig(
+            sessions=1,
+            table_count=1,
+            statements_per_tx=4,
+            seed_rows_per_table_per_session=8,
+            temp_table_workload=True,
+            temp_table_resume_action="rollback",
+            min_statements_before_drain_pause=1,
+        ).validate()
+        runtime = _FakeRuntime()
+        resumed = _FakeConnection()
+        worker = BusinessWorker(
+            1,
+            WorkloadPlan(cfg),
+            runtime,
+            _ResumeOnceDrainableCoordinator(resumed),
+            threading.Event(),
+        )
+
+        result = worker._run_transaction(_FakeConnection(), tx_id=1)
+
+        self.assertIs(result, resumed)
+        self.assertEqual(resumed.commit_count, 0)
+        self.assertEqual(resumed.rollback_count, 1)
+        self.assertFalse(
+            any(sql.startswith("UPDATE `rtx_e2e_tmp_001`") for sql in runtime.sql)
+        )
+
     def test_compact_bulk_spot_check_rejects_note_mismatch(self):
         cfg = HarnessConfig(
             sessions=2,
@@ -1375,6 +1451,29 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertIn("rtx_e2e_tmp_007", temp_sql)
         self.assertIn("INSERT IGNORE INTO `rtx_e2e_tmp_007`", temp_sql)
         self.assertIn("ENGINE=InnoDB", plan.create_temp_table_sql(7))
+
+    def test_temp_table_large_workload_generates_prefill_and_delete_dml(self):
+        cfg = HarnessConfig(
+            temp_table_workload=True,
+            temp_table_target_mb=200,
+            temp_table_fill_chunk_kb=64,
+        )
+        plan = WorkloadPlan(cfg)
+        ops = plan.transaction_operations(sid=7, tx_id=11)
+        temp_sql = "\n".join(op.sql for op in ops if op.kind.name.startswith("TEMP_"))
+
+        self.assertEqual(plan.temp_table_target_bytes(), 200 * 1024 * 1024)
+        self.assertEqual(plan.temp_table_fill_row_count(), 3200)
+        self.assertGreater(plan.temp_row_id(1, 0), plan.temp_table_fill_row_count())
+        self.assertIn("payload LONGBLOB NOT NULL", plan.create_temp_table_sql(7))
+        self.assertIn("DELETE FROM `rtx_e2e_tmp_007`", temp_sql)
+        self.assertIn("payload = CONCAT(payload, 'u')", temp_sql)
+        self.assertEqual(len(plan.temp_table_prefill_sql(7)), 1)
+        self.assertIn(
+            "REPEAT('x', 65536)",
+            plan.temp_table_prefill_sql(7)[0],
+        )
+        self.assertIn("WHERE n < 3200", plan.temp_table_prefill_sql(7)[0])
 
     def test_temp_table_workload_is_isolated_by_default(self):
         cfg = HarnessConfig()
@@ -2024,6 +2123,101 @@ class WorkloadPlanTest(unittest.TestCase):
 
         sql_text = "\n".join(runner.runtime.sql)
         self.assertIn("SET GLOBAL preserve_trx_temp_table_enable=ON", sql_text)
+
+    def test_large_temp_table_workload_configures_sidecar_budget(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            sessions=20,
+            temp_table_workload=True,
+            temp_table_target_mb=200,
+        )
+        runner.runtime = _FakeRuntime()
+
+        runner.configure_preserve_globals()
+
+        sql_text = "\n".join(runner.runtime.sql)
+        self.assertIn("SET GLOBAL preserve_trx_temp_table_enable=ON", sql_text)
+        expected_target = 20 * 200 * 1024 * 1024
+        expected_budget = expected_target * 2 + max(
+            1024 * 1024 * 1024, expected_target // 5
+        )
+        self.assertIn(
+            f"SET GLOBAL preserve_trx_max_temp_sidecar_bytes={expected_budget}",
+            sql_text,
+        )
+
+    def test_large_temp_table_workload_rejects_when_disk_budget_exceeds_usable_space(self):
+        cfg = HarnessConfig(
+            sessions=20,
+            temp_table_workload=True,
+            temp_table_target_mb=200,
+            artifact_dir="/tmp/e2e-artifacts",
+        )
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = cfg
+        runner.plan = WorkloadPlan(cfg)
+        fake_usage = type("Usage", (), {"free": 8 * 1024 * 1024 * 1024})()
+
+        with mock.patch(
+            "scripts.resumable_trx_business_e2e.shutil.disk_usage",
+            return_value=fake_usage,
+        ), self.assertRaisesRegex(RuntimeError, "temp-table sidecar disk budget"):
+            runner.preflight_disk_budgets()
+
+    def test_run_checks_large_temp_table_disk_budget_before_connecting(self):
+        cfg = HarnessConfig(
+            sessions=20,
+            cycles=1,
+            temp_table_workload=True,
+            temp_table_target_mb=200,
+            artifact_dir="/tmp/e2e-artifacts",
+        )
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = cfg
+        runner.plan = WorkloadPlan(cfg)
+        runner.runtime = _FakeRuntime()
+        runner.runtime.wait_until_up = mock.Mock(
+            side_effect=AssertionError("server should not be contacted")
+        )
+        runner.coordinator = ResumeCoordinator(cfg.sessions)
+        runner.expected_state = _NoopExpectedState()
+        runner.stop_event = threading.Event()
+        runner.workers = []
+        runner.server_processes = []
+        runner.phase2_pause_samples = []
+        fake_usage = type("Usage", (), {"free": 8 * 1024 * 1024 * 1024})()
+
+        with mock.patch(
+            "scripts.resumable_trx_business_e2e.shutil.disk_usage",
+            return_value=fake_usage,
+        ), self.assertRaisesRegex(RuntimeError, "temp-table sidecar disk budget"):
+            runner.run()
+
+        runner.runtime.wait_until_up.assert_not_called()
+
+    def test_temp_table_disk_budget_uses_existing_parent_for_new_artifact_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_dir = str(Path(tmpdir) / "new-artifacts" / "nested")
+            cfg = HarnessConfig(
+                sessions=20,
+                temp_table_workload=True,
+                temp_table_target_mb=200,
+                artifact_dir=artifact_dir,
+            )
+            runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+            runner.config = cfg
+            runner.plan = WorkloadPlan(cfg)
+            fake_usage = type("Usage", (), {"free": 8 * 1024 * 1024 * 1024})()
+
+            with mock.patch(
+                "scripts.resumable_trx_business_e2e.shutil.disk_usage",
+                return_value=fake_usage,
+            ) as disk_usage, self.assertRaisesRegex(
+                RuntimeError, "temp-table sidecar disk budget"
+            ):
+                runner.preflight_disk_budgets()
+
+            disk_usage.assert_called_once_with(tmpdir)
 
     def test_inflight_drain_observation_timeout_is_shorter_than_lock_wait_timeout(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -2738,6 +2932,24 @@ class WorkloadPlanTest(unittest.TestCase):
         cfg = parse_args(["--temp-table-workload"])
 
         self.assertTrue(cfg.temp_table_workload)
+
+    def test_cli_large_temp_table_options_are_applied(self):
+        cfg = parse_args(
+            [
+                "--sessions",
+                "20",
+                "--temp-table-workload",
+                "--temp-table-target-mb",
+                "200",
+                "--temp-table-fill-chunk-kb",
+                "64",
+            ]
+        )
+
+        self.assertTrue(cfg.temp_table_workload)
+        self.assertEqual(cfg.sessions, 20)
+        self.assertEqual(cfg.temp_table_target_mb, 200)
+        self.assertEqual(cfg.temp_table_fill_chunk_kb, 64)
 
     def test_cli_deterministic_e2e_bounds_are_applied(self):
         cfg = parse_args(

@@ -1,0 +1,29 @@
+--echo # Lint-only source-shape guard for temp-table phase-1 drain wiring.
+--echo # User temporary-table DML support needs an early capture epoch in
+--echo # WARMCOPY_DRAINING, before quiesced snapshot writing begins.
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+my $preserve_path = File::Spec->catfile($source_root, 'sql', 'preserve_trx.cc');
+
+open(my $fh, '<', $preserve_path) or die "cannot open $preserve_path: $!";
+my $preserve = do { local $/; <$fh> };
+close($fh);
+
+die "preserve_trx.cc must define a temp-table drain participant\n"
+  unless $preserve =~ /class\s+Temp_table_phase1_drain_participant\s+final\s*:\s*public\s+Preserve_trx_drain_participant/s;
+die "temp-table enable must force two-phase drain so capture opens before quiesce\n"
+  unless $preserve =~ /temp_table_phase1_enabled[\s\S]*const\s+bool\s+two_phase_enabled\s*=[\s\S]*temp_table_phase1_enabled/s;
+die "drain execute must register the temp-table phase-1 participant\n"
+  unless $preserve =~ /std::unique_ptr<Temp_table_phase1_drain_participant>[\s\S]*drain_orchestrator\.add_participant\s*\(\s*temp_table_participant\.get\(\)\s*\)/s;
+die "temp-table participant must call preserve_trx_temp_table_begin_capture_epoch\n"
+  unless $preserve =~ /preserve_trx_temp_table_begin_capture_epoch\s*\(/s;
+EOF
+
+SELECT 'ok' AS temp_table_phase1_participant_lint;

@@ -141,9 +141,10 @@ enum class trx_preserve_temp_no_redo_undo_page_kind : uint8_t {
 /*
   No-redo undo sidecars store only the pages needed to reconnect the preserved
   transaction's temporary undo graph. Unknown or incomplete pages make the image
-  unsupported rather than allowing resume to rebuild partial undo state. The
-  capture format is defined here, while current SQL-level resume policy still
-  rejects transactions that would require no-redo temp undo replay.
+  unsupported rather than allowing resume to rebuild partial undo state. Resume
+  validates the shared rseg/FSP evidence but only materializes the transaction's
+  undo log pages, so one token cannot overwrite allocator state owned by the
+  restarted server or by another preserved transaction.
 */
 struct trx_preserve_temp_no_redo_undo_page_image {
   trx_preserve_temp_no_redo_undo_page_kind kind{
@@ -204,8 +205,10 @@ struct trx_preserve_temp_space_image_descriptor {
   bool dirty_page_queue_durable{false};
   /*
     No-redo undo capture stores rseg identity, undo anchors, and classified
-    pages for audit and future reconnect work. Current SQL resume policy still
-    rejects transactions that need no-redo temp undo replay.
+    pages. RSEG_HEADER and allocator pages are proof material: they are required
+    for sidecar completeness, but reconnect applies only UNDO_HEADER/UNDO_LOG
+    pages to the live temporary tablespace and links trx_undo_t objects in
+    memory.
   */
   bool no_redo_undo_capture_required{false};
   bool no_redo_undo_sidecar_sealed{false};

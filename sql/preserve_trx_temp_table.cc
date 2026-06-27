@@ -46,6 +46,7 @@
 #include "my_sys.h"
 #include "mysql/psi/mysql_mutex.h"
 #include "mysql_version.h"
+#include "mysqld_error.h"
 #include <rapidjson/document.h>
 #include "sql/dd/dd.h"
 #include "sql/dd/impl/sdi.h"
@@ -53,12 +54,14 @@
 #include "sql/dd/types/index.h"
 #include "sql/dd/types/index_element.h"
 #include "sql/dd/types/table.h"
+#include "sql/field.h"
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_resource.h"
 #include "sql/sql_base.h"
 #include "sql/sql_class.h"
 #include "sql/sql_table.h"
 #include "my_dbug.h"
+#include "sha2.h"
 #include "sql/preserve_trx_xid.h"
 #include "sql/table.h"
 
@@ -68,8 +71,10 @@ constexpr uint32_t kInnodbDataNotNull = 256;
 constexpr uint32_t kInnodbDataUnsigned = 512;
 constexpr uint32_t kInnodbDataBinaryType = 1024;
 constexpr uint32_t kInnodbDataLongTrueVarchar = 4096;
+constexpr uint32_t kInnodbDataBlob = 5;
 constexpr uint32_t kInnodbDataInt = 6;
 constexpr uint32_t kInnodbDataVarmysql = 12;
+constexpr uint32_t kMysqlBinaryCollationId = 63;
 
 std::string table_schema_from_table(const TABLE *table) {
   if (table == nullptr || table->s == nullptr || table->s->db.str == nullptr)
@@ -216,6 +221,41 @@ void assign_reason(std::string *reason, const char *message) {
   if (reason != nullptr) *reason = message;
 }
 
+bool thd_in_preserve_batch_epoch(const THD *thd) {
+  return thd != nullptr && thd->preserve_trx_batch_generation != 0 &&
+         thd->preserve_trx_batch_state != Preserve_trx_batch_thd_state::NONE;
+}
+
+bool thd_in_temp_table_capture_epoch(THD *thd) {
+  if (thd == nullptr) return false;
+  const Preserve_trx_manager_state manager_state = preserved_trx_manager_state();
+  return thd_in_preserve_batch_epoch(thd) ||
+         thd->preserve_trx_temp_table_has_participant.load(
+             std::memory_order_acquire) ||
+         manager_state == Preserve_trx_manager_state::WARMCOPY_DRAINING ||
+         manager_state == Preserve_trx_manager_state::WARMCOPY_CLOSING;
+}
+
+void mark_batch_unsupported_temp_boundary(THD *thd) {
+  if (thd_in_temp_table_capture_epoch(thd)) {
+    thd->preserve_trx_temp_table_batch_unsupported_boundary.store(
+        true, std::memory_order_release);
+  }
+}
+
+void note_untracked_temp_boundary(THD *thd, bool in_multi_stmt,
+                                  bool in_capture_epoch) {
+  if (in_multi_stmt && thd != nullptr) {
+    thd->preserve_trx_temp_table_untracked_change.store(
+        true, std::memory_order_release);
+  }
+  if (in_capture_epoch && thd != nullptr) {
+    thd->preserve_trx_temp_table_untracked_change.store(
+        true, std::memory_order_release);
+    mark_batch_unsupported_temp_boundary(thd);
+  }
+}
+
 std::string dd_string_to_std_string(const dd::String_type &value) {
   return std::string(value.data(), value.length());
 }
@@ -263,6 +303,11 @@ std::string temp_table_sealed_image_filename(const std::string &token,
   return token + ".tempts." + std::to_string(source_space_id) + ".image";
 }
 
+std::string temp_table_sealed_undo_filename(const std::string &token,
+                                            uint32_t source_space_id) {
+  return token + ".tempts." + std::to_string(source_space_id) + ".undo";
+}
+
 Preserved_temp_table_image_descriptor image_descriptor_from_exported_metadata(
     const std::string &token, uint32_t table_ordinal,
     uint64_t sealed_temp_op_seq,
@@ -295,6 +340,24 @@ Preserved_temp_table_image_descriptor image_descriptor_from_exported_metadata(
   }
   (void)descriptor;
   return image;
+}
+
+Preserved_temp_table_undo_descriptor undo_descriptor_from_image_descriptor(
+    const std::string &token,
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    const std::string &payload) {
+  Preserved_temp_table_undo_descriptor undo;
+  undo.source_space_id = descriptor.source_space_id;
+  undo.blob_name =
+      temp_table_sealed_undo_filename(token, descriptor.source_space_id);
+  undo.size = payload.length();
+  SHA_EVP256(reinterpret_cast<const unsigned char *>(payload.data()),
+             payload.length(), undo.sha256.data());
+  undo.no_redo_undo_rseg_space_id =
+      descriptor.no_redo_undo_rseg_space_id;
+  undo.no_redo_undo_rseg_page_no = descriptor.no_redo_undo_rseg_page_no;
+  undo.no_redo_undo_rseg_slot = descriptor.no_redo_undo_rseg_slot;
+  return undo;
 }
 
 struct Shared_temp_table_sidecar {
@@ -440,6 +503,25 @@ bool dd_column_to_temp_dict_binding(
         extra_prtype |= kInnodbDataLongTrueVarchar;
       }
       break;
+    case dd::enum_column_types::TINY_BLOB:
+    case dd::enum_column_types::MEDIUM_BLOB:
+    case dd::enum_column_types::LONG_BLOB:
+    case dd::enum_column_types::BLOB:
+      /*
+        User temporary tables with large payload columns are restored from the
+        physical page image, not from SQL row replay. The DD binding still has to
+        match the InnoDB dictionary column exactly, so use the same SQL-layer
+        helpers that build Field_blob metadata for the original table.
+      */
+      mtype = kInnodbDataBlob;
+      mysql_type = MYSQL_TYPE_BLOB;
+      len = static_cast<uint32_t>(
+          calc_pack_length(column.type(), column.char_length(), 0, true,
+                           column.numeric_scale(), column.is_unsigned()));
+      string_type = true;
+      if (column.collation_id() == kMysqlBinaryCollationId)
+        extra_prtype |= kInnodbDataBinaryType;
+      break;
     default:
       return false;
   }
@@ -498,6 +580,14 @@ bool temp_dict_column_bindings_equal(
   return left.name == right.name && left.mtype == right.mtype &&
          left.prtype == right.prtype && left.len == right.len &&
          left.visible == right.visible;
+}
+
+std::string temp_dict_column_binding_debug_string(
+    const trx_preserve_temp_dict_column_binding &column) {
+  return column.name + "(mtype=" + std::to_string(column.mtype) +
+         ",prtype=" + std::to_string(column.prtype) +
+         ",len=" + std::to_string(column.len) +
+         ",visible=" + (column.visible ? "1" : "0") + ")";
 }
 
 bool temp_dict_index_field_bindings_equal(
@@ -571,7 +661,12 @@ bool temp_table_dd_metadata_matches_manifest_binding(
   }
   for (size_t i = 0; i < binding.columns.size(); ++i) {
     if (!temp_dict_column_bindings_equal(dd_columns[i], binding.columns[i])) {
-      assign_reason(reason, "temp-table DD column binding mismatch");
+      const std::string message =
+          "temp-table DD column binding mismatch: dd=" +
+          temp_dict_column_binding_debug_string(dd_columns[i]) +
+          " manifest=" +
+          temp_dict_column_binding_debug_string(binding.columns[i]);
+      assign_reason(reason, message.c_str());
       return false;
     }
   }
@@ -858,12 +953,11 @@ bool append_row_event(THD *thd, const TABLE *table,
   if (!temp_table_candidate(table)) return true;
 
   /*
-    Row hooks record logical changes only for multi-statement transactions. The
-    transaction is first marked as having temp-table history so allocation or
-    journal failures cannot be misinterpreted as a complete history.
+    TABLE-based row hooks carry stable SQL identity, so they are tracked DML
+    markers. The physical page image and no-redo undo sidecar are the recovery
+    source; this journal entry only proves that temp-DML occurred after the
+    baseline and that the sidecar path is required.
   */
-  preserve_trx_temp_table_note_untracked_change(thd);
-
   Temp_table_warmcopy_participant *participant =
       preserve_trx_temp_table_ensure_participant(thd);
   if (participant == nullptr) {
@@ -882,6 +976,7 @@ bool append_row_event(THD *thd, const TABLE *table,
     fail_row_payload_alloc = true;
   });
   if (fail_row_payload_alloc) {
+    participant->mark_degraded("temp-table row marker allocation failed");
     return false;
   }
   if (payload != nullptr && payload_length != 0)
@@ -899,7 +994,12 @@ bool append_savepoint_event(THD *thd, Temp_table_journal_record::Kind kind,
   Temp_table_warmcopy_participant *participant =
       preserve_trx_temp_table_get_participant(thd);
   if (participant == nullptr) return true;
+  if (!participant->has_temp_dml_history() &&
+      !participant->current_statement_touched()) {
+    return true;
+  }
 
+  mark_batch_unsupported_temp_boundary(thd);
   Temp_table_journal_record record;
   record.kind = kind;
   if (payload != nullptr && payload_length != 0)
@@ -1009,18 +1109,90 @@ bool Temp_table_warmcopy_participant::append_journal(
 bool Temp_table_warmcopy_participant::has_row_history() const {
   return std::any_of(m_journal.begin(), m_journal.end(),
                      [](const Temp_table_journal_record &record) {
-                       return record.kind ==
-                                  Temp_table_journal_record::Kind::CREATE_TABLE ||
-                              record.kind ==
-                                  Temp_table_journal_record::Kind::DROP_TABLE ||
-                              record.kind ==
-                                  Temp_table_journal_record::Kind::TRUNCATE_TABLE ||
-                              record.kind ==
-                                  Temp_table_journal_record::Kind::INSERT_ROW ||
-                              record.kind ==
-                                  Temp_table_journal_record::Kind::UPDATE_ROW ||
-                              record.kind ==
-                                  Temp_table_journal_record::Kind::DELETE_ROW;
+                       switch (record.kind) {
+                         case Temp_table_journal_record::Kind::CREATE_TABLE:
+                         case Temp_table_journal_record::Kind::DROP_TABLE:
+                         case Temp_table_journal_record::Kind::TRUNCATE_TABLE:
+                         case Temp_table_journal_record::Kind::ALTER_TABLE:
+                         case Temp_table_journal_record::Kind::RENAME_TABLE:
+                         case Temp_table_journal_record::Kind::INSERT_ROW:
+                         case Temp_table_journal_record::Kind::UPDATE_ROW:
+                         case Temp_table_journal_record::Kind::DELETE_ROW:
+                           return true;
+                         case Temp_table_journal_record::Kind::SAVEPOINT_MARK:
+                         case Temp_table_journal_record::Kind::RELEASE_SAVEPOINT:
+                         case Temp_table_journal_record::Kind::ROLLBACK_TO_SAVEPOINT:
+                           return false;
+                       }
+                       return false;
+                     });
+}
+
+bool Temp_table_warmcopy_participant::has_temp_dml_history() const {
+  return std::any_of(m_journal.begin(), m_journal.end(),
+                     [](const Temp_table_journal_record &record) {
+                       switch (record.kind) {
+                         case Temp_table_journal_record::Kind::INSERT_ROW:
+                         case Temp_table_journal_record::Kind::UPDATE_ROW:
+                         case Temp_table_journal_record::Kind::DELETE_ROW:
+                           return true;
+                         case Temp_table_journal_record::Kind::CREATE_TABLE:
+                         case Temp_table_journal_record::Kind::DROP_TABLE:
+                         case Temp_table_journal_record::Kind::TRUNCATE_TABLE:
+                         case Temp_table_journal_record::Kind::ALTER_TABLE:
+                         case Temp_table_journal_record::Kind::RENAME_TABLE:
+                         case Temp_table_journal_record::Kind::SAVEPOINT_MARK:
+                         case Temp_table_journal_record::Kind::RELEASE_SAVEPOINT:
+                         case Temp_table_journal_record::Kind::ROLLBACK_TO_SAVEPOINT:
+                           return false;
+                       }
+                       return false;
+                     });
+}
+
+bool Temp_table_warmcopy_participant::has_temp_ddl_history() const {
+  return std::any_of(m_journal.begin(), m_journal.end(),
+                     [](const Temp_table_journal_record &record) {
+                       switch (record.kind) {
+                         case Temp_table_journal_record::Kind::CREATE_TABLE:
+                         case Temp_table_journal_record::Kind::DROP_TABLE:
+                         case Temp_table_journal_record::Kind::TRUNCATE_TABLE:
+                         case Temp_table_journal_record::Kind::ALTER_TABLE:
+                         case Temp_table_journal_record::Kind::RENAME_TABLE:
+                           return true;
+                         case Temp_table_journal_record::Kind::INSERT_ROW:
+                         case Temp_table_journal_record::Kind::UPDATE_ROW:
+                         case Temp_table_journal_record::Kind::DELETE_ROW:
+                         case Temp_table_journal_record::Kind::SAVEPOINT_MARK:
+                         case Temp_table_journal_record::Kind::RELEASE_SAVEPOINT:
+                         case Temp_table_journal_record::Kind::ROLLBACK_TO_SAVEPOINT:
+                           return false;
+                       }
+                       return false;
+                     });
+}
+
+bool Temp_table_warmcopy_participant::has_unsupported_history() const {
+  if (m_untracked_change_before_history) return true;
+
+  return std::any_of(m_journal.begin(), m_journal.end(),
+                     [](const Temp_table_journal_record &record) {
+                       switch (record.kind) {
+                         case Temp_table_journal_record::Kind::CREATE_TABLE:
+                         case Temp_table_journal_record::Kind::DROP_TABLE:
+                         case Temp_table_journal_record::Kind::TRUNCATE_TABLE:
+                         case Temp_table_journal_record::Kind::ALTER_TABLE:
+                         case Temp_table_journal_record::Kind::RENAME_TABLE:
+                         case Temp_table_journal_record::Kind::SAVEPOINT_MARK:
+                         case Temp_table_journal_record::Kind::RELEASE_SAVEPOINT:
+                         case Temp_table_journal_record::Kind::ROLLBACK_TO_SAVEPOINT:
+                           return true;
+                         case Temp_table_journal_record::Kind::INSERT_ROW:
+                         case Temp_table_journal_record::Kind::UPDATE_ROW:
+                         case Temp_table_journal_record::Kind::DELETE_ROW:
+                           return false;
+                       }
+                       return false;
                      });
 }
 
@@ -1144,6 +1316,13 @@ Temp_table_warmcopy_participant *preserve_trx_temp_table_get_participant(
   return participant;
 }
 
+std::string preserve_trx_temp_table_degraded_reason(THD *thd) {
+  Temp_table_warmcopy_participant *participant =
+      preserve_trx_temp_table_get_participant(thd);
+  if (participant == nullptr) return std::string();
+  return participant->degraded_reason();
+}
+
 bool preserve_trx_temp_table_has_row_history(THD *thd) {
   if (thd == nullptr) return false;
   if (preserve_trx_temp_table_has_untracked_change(thd)) return true;
@@ -1174,33 +1353,47 @@ Preserve_snapshot_status preserve_trx_temp_table_preflight_preserve(THD *thd) {
   }
 
   /*
-    The current supported path requires no DDL-like or row-changing temp-table
-    tail history. The SQL journal is used to detect unsupported history and fail
-    closed; it is not replayed to rebuild temp rows during resume. No-redo undo
-    changes observed after the baseline are rejected for the same reason.
+    Supported temp-table DML is preserved from the physical image sidecar plus
+    no-redo undo sidecar. The SQL journal is still a marker stream only: it
+    proves whether the no-redo undo change came from tracked temp DML and
+    records DDL/savepoint/statement-rollback boundaries that remain fail-closed.
+    No SQL row payload is replayed during resume.
   */
   Temp_table_warmcopy_participant *participant =
       preserve_trx_temp_table_get_participant(thd);
+  const bool untracked_change = preserve_trx_temp_table_has_untracked_change(thd);
+  const bool batch_unsupported_boundary =
+      preserve_trx_temp_table_has_batch_unsupported_boundary(thd);
   const bool participant_degraded =
       participant != nullptr &&
       participant->state() == Temp_table_participant_state::DEGRADED;
-  const bool row_history = preserve_trx_temp_table_has_row_history(thd);
+  if (thd->temporary_tables == nullptr && !untracked_change &&
+      !batch_unsupported_boundary && !participant_degraded &&
+      (participant == nullptr ||
+       (!participant->has_temp_dml_history() &&
+        !participant->has_temp_ddl_history()))) {
+    return Preserve_snapshot_status::OK;
+  }
+  const bool temp_dml_history =
+      participant != nullptr && participant->has_temp_dml_history();
+  const bool unsupported_history =
+      untracked_change || batch_unsupported_boundary ||
+      (participant != nullptr && participant->has_unsupported_history());
   const bool no_redo_added =
       preserve_trx_temp_table_no_redo_undo_added_since_baseline(thd);
-  if (participant_degraded || row_history) {
+  if (participant_degraded || unsupported_history) {
     if (participant != nullptr) {
-      participant->mark_degraded(
-          "temp-table no-redo undo sidecars are unsupported");
+      participant->mark_degraded("unsupported temp-table DDL/savepoint history");
     }
     return Preserve_snapshot_status::UNSUPPORTED;
   }
 
-  if (!no_redo_added) {
+  if (!no_redo_added || temp_dml_history) {
     return temp_table_metadata_preflight(thd);
   }
   if (participant != nullptr) {
     participant->mark_degraded(
-        "temp-table no-redo undo sidecars are unsupported");
+        "temp-table no-redo undo changed without tracked DML marker");
   }
   return Preserve_snapshot_status::UNSUPPORTED;
 }
@@ -1224,6 +1417,18 @@ bool preserve_trx_temp_table_has_untracked_change(THD *thd) {
   return thd != nullptr &&
          thd->preserve_trx_temp_table_untracked_change.load(
              std::memory_order_acquire);
+}
+
+bool preserve_trx_temp_table_has_batch_unsupported_boundary(THD *thd) {
+  return thd != nullptr &&
+         thd->preserve_trx_temp_table_batch_unsupported_boundary.load(
+             std::memory_order_acquire);
+}
+
+void preserve_trx_temp_table_clear_batch_unsupported_boundary(THD *thd) {
+  if (thd == nullptr) return;
+  thd->preserve_trx_temp_table_batch_unsupported_boundary.store(
+      false, std::memory_order_release);
 }
 
 void preserve_trx_temp_table_note_untracked_change(THD *thd) {
@@ -1332,7 +1537,8 @@ bool preserve_trx_temp_table_transaction_state_needs_clear(const THD *thd) {
               std::memory_order_acquire) ||
           thd->preserve_trx_temp_table_untracked_change.load(
               std::memory_order_acquire) ||
-          thd->preserve_trx_temp_table_no_redo_baseline_valid);
+          thd->preserve_trx_temp_table_no_redo_baseline_valid ||
+          thd->preserve_trx_temp_table_restored_no_redo_undo_active);
 }
 
 void preserve_trx_temp_table_clear_transaction_state(THD *thd) {
@@ -1343,13 +1549,36 @@ void preserve_trx_temp_table_clear_transaction_state(THD *thd) {
   thd->preserve_trx_temp_table_no_redo_baseline_valid = false;
   thd->preserve_trx_temp_table_no_redo_baseline_present = false;
   thd->preserve_trx_temp_table_no_redo_baseline_top = 0;
+  thd->preserve_trx_temp_table_restored_no_redo_undo_active = false;
+}
+
+bool preserve_trx_temp_table_precheck_row_write(THD *thd,
+                                                const TABLE *table) {
+  if (thd == nullptr ||
+      !thd->preserve_trx_temp_table_restored_no_redo_undo_active ||
+      !temp_table_candidate(table)) {
+    return true;
+  }
+
+  /*
+    A resumed transaction with temp-table no-redo undo sidecars can be finished
+    by COMMIT or ROLLBACK, but appending more temp-table undo is unsafe until
+    the global temp rseg allocator/header state is also restored. Reject before
+    entering the storage engine so the native undo append path cannot reuse or
+    overwrite restored undo pages.
+  */
+  my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
+  return false;
 }
 
 bool preserve_trx_temp_table_note_table_create(
     THD *thd, uint32_t table_ordinal, const std::string &table_name) {
   if (thd == nullptr) return true;
-  if (!thd->in_multi_stmt_transaction_mode()) return true;
+  if (!thd->in_multi_stmt_transaction_mode() &&
+      !thd_in_temp_table_capture_epoch(thd))
+    return true;
   if (!preserve_trx_temp_table_row_hooks_enabled()) return true;
+  mark_batch_unsupported_temp_boundary(thd);
   if (!preserve_trx_temp_table_enable) {
     /*
       The top-level feature is active but temp-table preserve is disabled. Mark
@@ -1377,13 +1606,16 @@ bool preserve_trx_temp_table_note_table_create(
 
 bool preserve_trx_temp_table_note_table_create(THD *thd, const TABLE *table) {
   if (thd == nullptr) return true;
-  if (!thd->in_multi_stmt_transaction_mode()) return true;
+  if (!thd->in_multi_stmt_transaction_mode() &&
+      !thd_in_temp_table_capture_epoch(thd))
+    return true;
   if (!preserve_trx_temp_table_row_hooks_enabled()) return true;
   if (!preserve_trx_temp_table_enable) {
     if (table != nullptr) preserve_trx_temp_table_note_untracked_change(thd);
     return true;
   }
   if (!temp_table_candidate(table)) return true;
+  mark_batch_unsupported_temp_boundary(thd);
 
   Temp_table_warmcopy_participant *participant =
       preserve_trx_temp_table_ensure_participant(thd);
@@ -1400,13 +1632,16 @@ bool preserve_trx_temp_table_note_table_create(THD *thd, const TABLE *table) {
 
 bool preserve_trx_temp_table_note_table_drop(THD *thd, const TABLE *table) {
   if (thd == nullptr) return true;
-  if (!thd->in_multi_stmt_transaction_mode()) return true;
+  if (!thd->in_multi_stmt_transaction_mode() &&
+      !thd_in_temp_table_capture_epoch(thd))
+    return true;
   if (!preserve_trx_temp_table_row_hooks_enabled()) return true;
   if (!preserve_trx_temp_table_enable) {
     if (table != nullptr) preserve_trx_temp_table_note_untracked_change(thd);
     return true;
   }
   if (!temp_table_candidate(table)) return true;
+  mark_batch_unsupported_temp_boundary(thd);
 
   /*
     Drop and truncate are table-generation barriers. Later row events for the
@@ -1430,8 +1665,11 @@ bool preserve_trx_temp_table_note_table_drop(THD *thd, const char *schema_name,
                                              const char *table_name,
                                              size_t table_name_length) {
   if (thd == nullptr) return true;
-  if (!thd->in_multi_stmt_transaction_mode()) return true;
+  if (!thd->in_multi_stmt_transaction_mode() &&
+      !thd_in_temp_table_capture_epoch(thd))
+    return true;
   if (!preserve_trx_temp_table_row_hooks_enabled()) return true;
+  mark_batch_unsupported_temp_boundary(thd);
   if (!preserve_trx_temp_table_enable) {
     preserve_trx_temp_table_note_untracked_change(thd);
     return true;
@@ -1453,18 +1691,28 @@ bool preserve_trx_temp_table_note_table_drop(THD *thd, const char *schema_name,
 bool preserve_trx_temp_table_note_table_truncate(THD *thd,
                                                  const TABLE *table) {
   if (thd == nullptr) return true;
-  if (!thd->in_multi_stmt_transaction_mode()) return true;
+  const bool in_multi_stmt = thd->in_multi_stmt_transaction_mode();
+  const bool in_capture_epoch = thd_in_temp_table_capture_epoch(thd);
+  if (!in_multi_stmt &&
+      !thd->preserve_trx_temp_table_has_participant.load(
+          std::memory_order_acquire) &&
+      !in_capture_epoch) {
+    return true;
+  }
   if (!preserve_trx_temp_table_row_hooks_enabled()) return true;
   if (!preserve_trx_temp_table_enable) {
-    if (table != nullptr) preserve_trx_temp_table_note_untracked_change(thd);
+    if (table != nullptr)
+      note_untracked_temp_boundary(thd, in_multi_stmt, in_capture_epoch);
     return true;
   }
   if (!temp_table_candidate(table)) return true;
+  mark_batch_unsupported_temp_boundary(thd);
 
   Temp_table_warmcopy_participant *participant =
-      preserve_trx_temp_table_ensure_participant(thd);
+      in_multi_stmt ? preserve_trx_temp_table_ensure_participant(thd)
+                    : preserve_trx_temp_table_get_participant(thd);
   if (participant == nullptr) {
-    preserve_trx_temp_table_note_untracked_change(thd);
+    note_untracked_temp_boundary(thd, in_multi_stmt, in_capture_epoch);
     return false;
   }
   const uint32_t table_ordinal = participant->ordinal_for_table_key(
@@ -1478,16 +1726,25 @@ bool preserve_trx_temp_table_note_table_truncate(THD *thd,
                                                  const char *table_name,
                                                  size_t table_name_length) {
   if (thd == nullptr) return true;
-  if (!thd->in_multi_stmt_transaction_mode()) return true;
-  if (!preserve_trx_temp_table_row_hooks_enabled()) return true;
-  if (!preserve_trx_temp_table_enable) {
-    preserve_trx_temp_table_note_untracked_change(thd);
+  const bool in_multi_stmt = thd->in_multi_stmt_transaction_mode();
+  const bool in_capture_epoch = thd_in_temp_table_capture_epoch(thd);
+  if (!in_multi_stmt &&
+      !thd->preserve_trx_temp_table_has_participant.load(
+          std::memory_order_acquire) &&
+      !in_capture_epoch) {
     return true;
   }
+  if (!preserve_trx_temp_table_row_hooks_enabled()) return true;
+  if (!preserve_trx_temp_table_enable) {
+    note_untracked_temp_boundary(thd, in_multi_stmt, in_capture_epoch);
+    return true;
+  }
+  mark_batch_unsupported_temp_boundary(thd);
   Temp_table_warmcopy_participant *participant =
-      preserve_trx_temp_table_ensure_participant(thd);
+      in_multi_stmt ? preserve_trx_temp_table_ensure_participant(thd)
+                    : preserve_trx_temp_table_get_participant(thd);
   if (participant == nullptr) {
-    preserve_trx_temp_table_note_untracked_change(thd);
+    note_untracked_temp_boundary(thd, in_multi_stmt, in_capture_epoch);
     return false;
   }
   const uint32_t table_ordinal = participant->ordinal_for_table_key(
@@ -1496,6 +1753,61 @@ bool preserve_trx_temp_table_note_table_truncate(THD *thd,
       table_name == nullptr ? std::string()
                             : std::string(table_name, table_name_length));
   return participant->note_truncate_table(table_ordinal);
+}
+
+bool preserve_trx_temp_table_note_table_alter(THD *thd, const TABLE *table) {
+  if (thd == nullptr) return true;
+  if (!thd->in_multi_stmt_transaction_mode() &&
+      !thd_in_temp_table_capture_epoch(thd))
+    return true;
+  if (!preserve_trx_temp_table_row_hooks_enabled()) return true;
+  if (!preserve_trx_temp_table_enable) {
+    if (table != nullptr) preserve_trx_temp_table_note_untracked_change(thd);
+    return true;
+  }
+  if (!temp_table_candidate(table)) return true;
+  mark_batch_unsupported_temp_boundary(thd);
+
+  Temp_table_warmcopy_participant *participant =
+      preserve_trx_temp_table_ensure_participant(thd);
+  if (participant == nullptr) {
+    preserve_trx_temp_table_note_untracked_change(thd);
+    return false;
+  }
+  const uint32_t table_ordinal = participant->ordinal_for_table_key(
+      table_schema_from_table(table), table_name_from_table(table));
+  return participant->append_table_event(
+      table_ordinal, Temp_table_journal_record::Kind::ALTER_TABLE, "");
+}
+
+bool preserve_trx_temp_table_note_table_rename(THD *thd, const TABLE *table,
+                                               const char *new_name,
+                                               size_t new_name_length) {
+  if (thd == nullptr) return true;
+  if (!thd->in_multi_stmt_transaction_mode() &&
+      !thd_in_temp_table_capture_epoch(thd))
+    return true;
+  if (!preserve_trx_temp_table_row_hooks_enabled()) return true;
+  if (!preserve_trx_temp_table_enable) {
+    if (table != nullptr) preserve_trx_temp_table_note_untracked_change(thd);
+    return true;
+  }
+  if (!temp_table_candidate(table)) return true;
+  mark_batch_unsupported_temp_boundary(thd);
+
+  Temp_table_warmcopy_participant *participant =
+      preserve_trx_temp_table_ensure_participant(thd);
+  if (participant == nullptr) {
+    preserve_trx_temp_table_note_untracked_change(thd);
+    return false;
+  }
+  const uint32_t table_ordinal = participant->ordinal_for_table_key(
+      table_schema_from_table(table), table_name_from_table(table));
+  const std::string new_name_string =
+      new_name == nullptr ? std::string() : std::string(new_name, new_name_length);
+  return participant->append_table_event(
+      table_ordinal, Temp_table_journal_record::Kind::RENAME_TABLE,
+      new_name_string);
 }
 
 bool preserve_trx_temp_table_note_row_write(THD *thd,
@@ -1609,6 +1921,7 @@ void preserve_trx_temp_table_note_statement_rollback(THD *thd) {
   if (participant == nullptr || !participant->current_statement_touched())
     return;
 
+  mark_batch_unsupported_temp_boundary(thd);
   participant->mark_degraded("temp-table statement rollback");
   participant->clear_current_statement_touch();
 }
@@ -1616,6 +1929,7 @@ void preserve_trx_temp_table_note_statement_rollback(THD *thd) {
 bool preserve_trx_temp_table_begin_capture_epoch(THD *thd) {
   if (!preserve_trx_temp_table_enable) return true;
   if (thd == nullptr) return false;
+  if (thd->temporary_tables == nullptr) return true;
 
   Temp_table_warmcopy_participant *participant =
       preserve_trx_temp_table_ensure_participant(thd);
@@ -1656,7 +1970,6 @@ bool preserve_trx_temp_table_build_baseline_image(
     Preserved_temp_table_image_carrier *carrier,
     const std::string *warmcopy_id) {
   if (!preserve_trx_temp_table_enable) return true;
-  (void)trx;
   if (thd == nullptr || table == nullptr || participant == nullptr ||
       table_ordinal == 0 || max_rows == 0) {
     return false;
@@ -1681,16 +1994,23 @@ bool preserve_trx_temp_table_build_baseline_image(
   local_descriptor.source_space_id = source_metadata.source_space_id;
   local_descriptor.page_size = source_metadata.page_size;
   local_descriptor.space_flags = source_metadata.space_flags;
-  if (participant->has_row_history()) {
-    participant->mark_degraded(
-        "temp-table no-redo undo sidecars are unsupported");
-    return false;
-  }
+  const bool temp_dml_history = participant->has_temp_dml_history();
   bool dirty_page_stream_registered = false;
   auto unregister_dirty_page_stream_if_needed = [&]() {
     if (!dirty_page_stream_registered) return;
     trx_preserve_temp_space_image_unregister_dirty_page_stream(
         &local_descriptor);
+    dirty_page_stream_registered = false;
+  };
+  auto cleanup_failed_capture_streams = [&]() {
+    /*
+      A failed baseline capture must remove both published streams before the
+      transaction is reattached to the original THD. Reattach can dirty no-redo
+      undo pages while activating trx state; leaving a no-redo stream pointing at
+      this stack descriptor would let that page-write hook dereference stale
+      capture state.
+    */
+    trx_preserve_temp_space_image_reset_dirty_page_stream(&local_descriptor);
     dirty_page_stream_registered = false;
   };
   const bool use_streaming_writer =
@@ -1777,6 +2097,25 @@ bool preserve_trx_temp_table_build_baseline_image(
     err = trx_preserve_temp_space_image_mark_dirty_queue_durable(
         &local_descriptor);
   }
+  std::string local_undo_payload;
+  if (err == DB_SUCCESS && temp_dml_history) {
+    failure_step = "capture_no_redo_undo";
+    err = trx == nullptr
+              ? DB_ERROR
+              : trx_preserve_temp_space_image_capture_no_redo_undo_from_trx(
+                    &local_descriptor, trx);
+  }
+  if (err == DB_SUCCESS && temp_dml_history) {
+    failure_step = "seal_no_redo_undo_sidecar";
+    err =
+        trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(
+            &local_descriptor);
+  }
+  if (err == DB_SUCCESS && temp_dml_history) {
+    failure_step = "build_no_redo_undo_sidecar_payload";
+    err = trx_preserve_temp_space_image_build_no_redo_undo_sidecar_payload(
+        local_descriptor, &local_undo_payload);
+  }
   if (err == DB_SUCCESS && use_streaming_writer) {
     failure_step = "finish_streamed_sidecar";
     err = trx_preserve_temp_space_image_finish_streamed_sidecar(
@@ -1820,11 +2159,16 @@ bool preserve_trx_temp_table_build_baseline_image(
         static_cast<uint64_t>(preserve_trx_max_temp_sidecar_bytes));
   }
   if (err != DB_SUCCESS) {
+    const std::string &dirty_reason =
+        local_descriptor.dirty_page_stream_degraded_reason;
+    const std::string &undo_reason =
+        local_descriptor.no_redo_undo_capture_degraded_reason;
+    const char *reason =
+        !dirty_reason.empty() ? dirty_reason.c_str() : undo_reason.c_str();
     char message[512];
     snprintf(message, sizeof(message),
              "temp-table physical image capture failed at %s err=%d reason=%s",
-             failure_step, static_cast<int>(err),
-             local_descriptor.no_redo_undo_capture_degraded_reason.c_str());
+             failure_step, static_cast<int>(err), reason);
     participant->mark_degraded(message);
     if (image_writer != nullptr) {
       const Preserved_trx_carrier_status abort_status = image_writer->abort();
@@ -1832,14 +2176,14 @@ bool preserve_trx_temp_table_build_baseline_image(
         preserve_trx_resource_note_spill_failure();
       }
     }
-    unregister_dirty_page_stream_if_needed();
+    cleanup_failed_capture_streams();
     return false;
   }
 
   unregister_dirty_page_stream_if_needed();
   if (descriptor != nullptr) *descriptor = local_descriptor;
   if (image_payload != nullptr) *image_payload = std::move(local_image_payload);
-  if (undo_payload != nullptr) undo_payload->clear();
+  if (undo_payload != nullptr) *undo_payload = std::move(local_undo_payload);
   participant->mark_ready();
   return true;
 }
@@ -1851,15 +2195,6 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
   if (thd == nullptr || trx == nullptr || metadata == nullptr) {
     return Preserve_snapshot_status::INVALID_ARGUMENT;
   }
-  if (preserve_trx_temp_table_has_row_history(thd)) {
-    Temp_table_warmcopy_participant *participant =
-        preserve_trx_temp_table_get_participant(thd);
-    if (participant != nullptr) {
-      participant->mark_degraded(
-          "temp-table no-redo undo sidecars are unsupported");
-    }
-    return Preserve_snapshot_status::UNSUPPORTED;
-  }
   if (thd->temporary_tables == nullptr) return Preserve_snapshot_status::OK;
   if (!token_is_filename_safe(token)) {
     return Preserve_snapshot_status::INVALID_ARGUMENT;
@@ -1868,6 +2203,12 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
   Temp_table_warmcopy_participant *participant =
       preserve_trx_temp_table_ensure_participant(thd);
   if (participant == nullptr) return Preserve_snapshot_status::IO_ERROR;
+  if (preserve_trx_temp_table_has_untracked_change(thd) ||
+      preserve_trx_temp_table_has_batch_unsupported_boundary(thd) ||
+      participant->has_unsupported_history()) {
+    participant->mark_degraded("unsupported temp-table DDL/savepoint history");
+    return Preserve_snapshot_status::UNSUPPORTED;
+  }
   if (!participant->arm_dirty_page_capture() ||
       !participant->arm_metadata_mutation_capture() ||
       !participant->begin_capture_epoch()) {
@@ -1884,14 +2225,22 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
   const std::string warmcopy_id = token;
   std::vector<uint32_t> staged_image_source_space_ids;
   std::vector<uint32_t> sealed_image_source_space_ids;
+  std::vector<uint32_t> staged_undo_source_space_ids;
+  std::vector<uint32_t> sealed_undo_source_space_ids;
   std::map<uint32_t, Shared_temp_table_sidecar> shared_sidecars;
 
   auto cleanup_sidecars = [&]() {
     for (uint32_t source_space_id : staged_image_source_space_ids) {
       (void)carrier.remove_warm_image(warmcopy_id, source_space_id);
     }
+    for (uint32_t source_space_id : staged_undo_source_space_ids) {
+      (void)carrier.remove_warm_undo(warmcopy_id, source_space_id);
+    }
     for (uint32_t source_space_id : sealed_image_source_space_ids) {
       (void)carrier.remove_sealed_image(token, source_space_id);
+    }
+    for (uint32_t source_space_id : sealed_undo_source_space_ids) {
+      (void)carrier.remove_sealed_undo(token, source_space_id);
     }
   };
 
@@ -1951,10 +2300,11 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
       the remembered descriptor exactly.
     */
     trx_preserve_temp_space_image_descriptor descriptor;
+    std::string undo_payload;
     if (first_image_for_space) {
       if (!preserve_trx_temp_table_build_baseline_image(
               thd, table, participant, table_ordinal, 64ULL * 1024 * 1024, trx,
-              &descriptor, nullptr, nullptr, &carrier, &warmcopy_id)) {
+              &descriptor, nullptr, &undo_payload, &carrier, &warmcopy_id)) {
         cleanup_sidecars();
         return Preserve_snapshot_status::UNSUPPORTED;
       }
@@ -1968,12 +2318,6 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
                 descriptor.image_digest);
       descriptor.sealed = true;
       participant->mark_ready();
-    }
-    if (participant->has_row_history()) {
-      participant->mark_degraded(
-          "temp-table no-redo undo sidecars are unsupported");
-      cleanup_sidecars();
-      return Preserve_snapshot_status::UNSUPPORTED;
     }
     if (descriptor.image_bytes == 0) {
       participant->mark_degraded("temp-table physical sidecar missing");
@@ -2020,6 +2364,35 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
         return map_temp_carrier_status(image_seal_status);
       }
       sealed_image_source_space_ids.push_back(source_metadata.source_space_id);
+
+      if (!undo_payload.empty()) {
+        Preserved_temp_table_undo_descriptor undo =
+            undo_descriptor_from_image_descriptor(token, descriptor,
+                                                  undo_payload);
+        const Preserved_trx_carrier_status undo_write_status =
+            carrier.write_warm_undo(
+                warmcopy_id, source_metadata.source_space_id,
+                reinterpret_cast<const unsigned char *>(undo_payload.data()),
+                undo_payload.length());
+        if (undo_write_status != Preserved_trx_carrier_status::OK) {
+          participant->mark_degraded("temp-table undo sidecar write failed");
+          cleanup_sidecars();
+          return map_temp_carrier_status(undo_write_status);
+        }
+        staged_undo_source_space_ids.push_back(
+            source_metadata.source_space_id);
+
+        const Preserved_trx_carrier_status undo_seal_status =
+            carrier.seal_warm_undo(warmcopy_id, token, undo);
+        if (undo_seal_status != Preserved_trx_carrier_status::OK) {
+          participant->mark_degraded("temp-table undo sidecar seal failed");
+          cleanup_sidecars();
+          return map_temp_carrier_status(undo_seal_status);
+        }
+        sealed_undo_source_space_ids.push_back(
+            source_metadata.source_space_id);
+        manifest.undo_images.push_back(std::move(undo));
+      }
     }
 
     manifest.tables.push_back(std::move(entry));
@@ -2044,8 +2417,7 @@ Preserve_trx_temp_table_resume_policy preserve_trx_temp_table_resume_policy(
 
   const Preserve_trx_temp_table_materialize_plan plan =
       preserve_trx_temp_table_materialize_plan(metadata);
-  if (preserve_trx_temp_table_enable && materialize_plan_is_claimable(plan) &&
-      !plan.requires_no_redo_undo_sidecars) {
+  if (preserve_trx_temp_table_enable && materialize_plan_is_claimable(plan)) {
     return policy;
   }
 
@@ -2338,9 +2710,6 @@ Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume(
   if (!materialize_plan_is_claimable(plan)) {
     return Preserve_snapshot_status::CORRUPT;
   }
-  if (plan.requires_no_redo_undo_sidecars) {
-    return Preserve_snapshot_status::UNSUPPORTED;
-  }
 
   std::string reason;
   const Preserve_snapshot_status sidecar_status =
@@ -2513,6 +2882,8 @@ Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume(
     cleanup_for_retry();
     return link_status;
   }
+  thd->preserve_trx_temp_table_restored_no_redo_undo_active =
+      !plan.manifest.undo_images.empty();
   return Preserve_snapshot_status::OK;
 }
 
@@ -2523,6 +2894,8 @@ preserve_trx_temp_table_rollback_materialized_for_resume(
     return Preserve_snapshot_status::OK;
   }
   if (!preserve_trx_temp_table_enable) {
+    if (thd != nullptr)
+      thd->preserve_trx_temp_table_restored_no_redo_undo_active = false;
     return Preserve_snapshot_status::OK;
   }
   if (thd == nullptr) return Preserve_snapshot_status::INVALID_ARGUMENT;
@@ -2583,6 +2956,7 @@ preserve_trx_temp_table_rollback_materialized_for_resume(
       status = release_status;
     }
   }
+  thd->preserve_trx_temp_table_restored_no_redo_undo_active = false;
   return status;
 }
 

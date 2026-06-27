@@ -812,19 +812,20 @@ class PreservedTrxCommandRead : public ::testing::Test {
 };
 
 TEST_F(PreservedTrxCommandRead,
-       DisabledFeatureStillHonorsExistingQuiescedBatchState) {
+       DisabledFeatureDoesNotWaitOnSyntheticQuiescedBatchState) {
   THD *target = thd();
   target->m_server_idle = true;
   target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::QUIESCED;
-  const uint saved_timeout = preserve_trx_drain_hard_timeout_ms;
-  preserve_trx_drain_hard_timeout_ms = 1;
 
-  set_expected_error(ER_PRESERVE_TRX_DRAIN_TIMEOUT);
-  EXPECT_FALSE(preserved_trx_begin_command_read(target));
-  set_expected_error(0);
+  /*
+    A real disable transition is rejected while preserve/drain owns runtime
+    state. If a unit test constructs the impossible combination of
+    preserve_trx_enable=OFF plus a batch state, the top-level gate must remain
+    inert and must not wait, emit preserve errors, or alter idle bookkeeping.
+  */
+  EXPECT_TRUE(preserved_trx_begin_command_read(target));
   EXPECT_TRUE(target->m_server_idle);
 
-  preserve_trx_drain_hard_timeout_ms = saved_timeout;
   mysql_mutex_lock(&target->LOCK_thd_data);
   target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
   mysql_mutex_unlock(&target->LOCK_thd_data);
@@ -859,29 +860,29 @@ TEST_F(PreservedTrxCommandRead, TimeoutsWhenTargetStateCannotDrainWithinHardLimi
 }
 
 TEST_F(PreservedTrxCommandRead,
-       DisabledFeatureUsesOriginalCommandReadIdleTransitionsWithoutBatchState) {
+       DisabledFeatureLeavesCommandReadIdleStateUntouched) {
   THD *target = thd();
   target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
 
   target->m_server_idle = false;
   EXPECT_TRUE(preserved_trx_begin_command_read(target));
-  EXPECT_TRUE(target->m_server_idle);
+  EXPECT_FALSE(target->m_server_idle);
 
   EXPECT_TRUE(preserved_trx_end_command_read(target));
   EXPECT_FALSE(target->m_server_idle);
 
   target->m_server_idle = true;
-  EXPECT_TRUE(preserved_trx_end_idle_for_command_packet(target));
-  EXPECT_FALSE(target->m_server_idle);
+  EXPECT_FALSE(preserved_trx_end_idle_for_command_packet(target));
+  EXPECT_TRUE(target->m_server_idle);
 }
 
 TEST_F(PreservedTrxCommandRead,
-       DisabledFeatureStillBlocksPreservedDrainedDispatch) {
+       DisabledFeatureAllowsSyntheticPreservedDrainedDispatch) {
   THD *target = thd();
   target->preserve_trx_batch_state =
       Preserve_trx_batch_thd_state::PRESERVED_DRAINED;
 
-  EXPECT_EQ(Preserve_trx_command_block_result::BLOCK_SESSION_DRAINED,
+  EXPECT_EQ(Preserve_trx_command_block_result::ALLOW,
             preserved_trx_command_block_result(target, SQLCOM_UPDATE));
 }
 

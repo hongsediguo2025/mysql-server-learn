@@ -1,0 +1,51 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_max_temp_sidecar_bytes=1073741824;
+
+CREATE TEMPORARY TABLE tmp_preserve_blob(
+  id BIGINT PRIMARY KEY,
+  v BIGINT NOT NULL,
+  payload LONGBLOB NOT NULL,
+  KEY(v)
+) ENGINE=InnoDB;
+
+INSERT INTO tmp_preserve_blob VALUES
+  (1, 10, REPEAT('a', 65536)),
+  (2, 20, REPEAT('b', 65536));
+
+START TRANSACTION;
+INSERT INTO tmp_preserve_blob VALUES(3, 30, REPEAT('c', 65536));
+UPDATE tmp_preserve_blob
+   SET v = 31, payload = CONCAT(payload, 'd')
+ WHERE id = 3;
+DELETE FROM tmp_preserve_blob WHERE id = 1;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+
+SELECT id, v, LENGTH(payload) AS payload_len
+  FROM tmp_preserve_blob
+ ORDER BY id;
+COMMIT;
+SELECT id, v, LENGTH(payload) AS payload_len
+  FROM tmp_preserve_blob
+ ORDER BY id;
+
+DROP TEMPORARY TABLE tmp_preserve_blob;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+SET GLOBAL preserve_trx_max_temp_sidecar_bytes=1073741824;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_enable=ON;

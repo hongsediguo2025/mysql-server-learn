@@ -1,0 +1,76 @@
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+--source include/not_windows.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_ps_warmcopy_temp_obs;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1024;
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=8192;
+
+CREATE TABLE t_ps_warmcopy_temp_obs(
+  id INT PRIMARY KEY,
+  payload VARBINARY(4096)
+) ENGINE=InnoDB;
+INSERT INTO t_ps_warmcopy_temp_obs VALUES(1, REPEAT('a', 1024));
+
+--connect(ps_warmcopy_temp_app, localhost, root,,test)
+CREATE TEMPORARY TABLE tmp_ps_warmcopy_temp_obs(
+  id INT PRIMARY KEY,
+  v INT,
+  KEY(v)
+) ENGINE=InnoDB;
+
+START TRANSACTION;
+INSERT INTO tmp_ps_warmcopy_temp_obs VALUES(1, 10), (2, 20);
+UPDATE tmp_ps_warmcopy_temp_obs SET v = v + 1 WHERE id = 1;
+UPDATE t_ps_warmcopy_temp_obs
+   SET payload = REPEAT('b', 2048)
+ WHERE id = 1;
+
+--connection default
+--let $wait_condition= SELECT COUNT(*) = 1 FROM performance_schema.threads WHERE PROCESSLIST_USER = 'root' AND PROCESSLIST_DB = 'test' AND PROCESSLIST_COMMAND = 'Sleep'
+--source include/wait_condition.inc
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON --preserve-trx-warmcopy-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_column 1 TOKEN
+SELECT TOKEN, BINLOG_WARMCOPY_STATE, TEMP_TABLE_STATE,
+       TEMP_IMAGE_BYTES > 0 AS temp_image_bytes_positive,
+       TEMP_UNDO_BYTES > 0 AS temp_undo_bytes_positive,
+       TEMP_SIDECARS_COMPLETE
+  FROM performance_schema.preserved_transactions;
+
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+SELECT COUNT(*) AS temp_rows, SUM(v) AS temp_sum
+  FROM tmp_ps_warmcopy_temp_obs;
+COMMIT;
+SELECT * FROM tmp_ps_warmcopy_temp_obs ORDER BY id;
+DROP TEMPORARY TABLE tmp_ps_warmcopy_temp_obs;
+
+--connection default
+SELECT payload = REPEAT('b', 2048) AS persistent_payload_ok
+  FROM t_ps_warmcopy_temp_obs
+ WHERE id = 1;
+
+DROP TABLE t_ps_warmcopy_temp_obs;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+SET GLOBAL preserve_trx_warmcopy_tail_budget_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_chunk_bytes=1048576;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_enable=ON;
