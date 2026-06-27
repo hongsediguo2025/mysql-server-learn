@@ -1,0 +1,61 @@
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+
+--connect(temp_alter_target, localhost, root,,test)
+--connection temp_alter_target
+CREATE TEMPORARY TABLE tmp_preserve_alter(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+START TRANSACTION;
+INSERT INTO tmp_preserve_alter VALUES(1, 10);
+
+--connect(temp_alter_owner, localhost, root,,test)
+--connection temp_alter_owner
+SET DEBUG_SYNC =
+  'preserve_trx_warmcopy_open SIGNAL temp_alter_warmcopy_open WAIT_FOR temp_alter_continue_warmcopy';
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR temp_alter_warmcopy_open TIMEOUT 10';
+
+--connection temp_alter_target
+ALTER TABLE tmp_preserve_alter ADD COLUMN c INT DEFAULT 7;
+START TRANSACTION;
+INSERT INTO tmp_preserve_alter(id, v, c) VALUES(2, 20, 8);
+
+--connection default
+SET DEBUG_SYNC = 'now SIGNAL temp_alter_continue_warmcopy';
+
+--connection temp_alter_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+--disconnect temp_alter_owner
+
+--connection default
+--remove_file $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+--connection temp_alter_target
+SELECT * FROM tmp_preserve_alter ORDER BY id;
+COMMIT;
+DROP TEMPORARY TABLE tmp_preserve_alter;
+--disconnect temp_alter_target
+--connection default
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET DEBUG_SYNC = 'RESET';

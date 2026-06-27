@@ -610,9 +610,12 @@ no-cache binlog state 还要求当前 GTID state clean：`GTID_NEXT` 必须是
 - preserve 前会检查临时表 schema/table name、InnoDB source metadata、DD metadata
   clone、column/index metadata 是否可支持；任一项不可导出都会 fail closed。
 - 单个 temp image/undo sidecar 受 `preserve_trx_max_temp_sidecar_bytes` 限制。
-- 当前不支持 temp row history 或 no-redo undo sidecar。事务期间对用户临时表做过
-  无法用当前实现完整重放的 DML、DDL、truncate/drop/create 变化时，会在 preserve
-  preflight 中 fail closed。
+- 已存在用户 InnoDB 临时表的事务型 DML 可以通过 physical image、dirty page
+  overlay 和 no-redo undo sidecar 保持事务语义；resume 后继续 `COMMIT` 或
+  `ROLLBACK` 时，临时表和持久表的可见性应与未 preserve 的事务一致。
+- 用户临时表 DDL/元数据变更仍不支持：`CREATE/DROP/TRUNCATE/ALTER/RENAME
+  TEMPORARY TABLE`、无法完整捕获的 savepoint/statement rollback 交叠、缺失或
+  损坏的 no-redo undo sidecar，都会在 preserve 或 resume 阶段 fail closed。
 - sidecar 写入、digest、bootstrap 读取、materialize for resume 任一步缺失或损坏，
   都会 fail closed；bootstrap IO 失败属于启动恢复严重故障路径，不能当作可忽略
   的普通 unsupported token。
@@ -1050,7 +1053,7 @@ drain 仍然会 fail closed。
 | warmcopy admission 和内存模型 | `Warmcopy_batch_blob_provider::prepare_thd()`、`Mysql_binlog_warmcopy_session::begin()`、`Mysql_binlog_warmcopy_session::finalize()` | `m_total_bytes`、`reserved_size`、`session_blob_limit` 是 warm external blob artifact 记账，不是等量 heap 分配；phase 1 copy 受 chunk 控制，phase 2 受 tail budget 和 pending range 限制。 |
 | binlog copy buffer | `IO_CACHE_binlog_cache_storage::copy_range_to()` | 磁盘部分使用 8192 字节 buffer；`preserve_trx_warmcopy_chunk_bytes` 是外层 copy loop 目标 chunk。 |
 | 用户变量 | `export_user_vars_payload()`、`import_user_vars_payload()` | 只有 `WITH USER VARS` 才导出；空集合 payload 会在 resume 时清空当前 session 用户变量；无 payload 不导入。 |
-| 临时表 sidecar | `preserve_trx_temp_table_preflight_preserve()`、`preserve_trx_temp_table_build_preserve_manifest()`、`preserve_trx_temp_table_validate_sidecars()`、`preserve_trx_temp_table_materialize_for_resume()` | 只支持当前实现可导出/可 materialize 的用户 InnoDB transactional temporary table；unsupported temp row history/no-redo undo 走 fail closed。 |
+| 临时表 sidecar | `preserve_trx_temp_table_preflight_preserve()`、`preserve_trx_temp_table_build_preserve_manifest()`、`preserve_trx_temp_table_validate_sidecars()`、`preserve_trx_temp_table_materialize_for_resume()` | 支持当前实现可导出/可 materialize 的用户 InnoDB transactional temporary table DML；DDL、元数据变更、缺失/损坏 no-redo undo 或 sidecar 走 fail closed。 |
 | P_S/SHOW 可见性 | `preserved_trx_snapshot()`、`Sql_cmd_show_preserved_transactions::execute()` | owner 可见自己的 token；`PROCESS` 或 `RESUME_ANY_PRESERVED_TRANSACTION` 可见其他账号记录；没有 `PROCESS` 时 token 字段脱敏。 |
 | P_S 字段 | `storage/perfschema/table_preserved_transactions.cc` | 表 8.1 字段与 P_S 插件表定义一致。 |
 | 状态变量 | `sql/mysqld.cc` | 表 8.2 只列当前实现注册的 `Preserve_trx_warmcopy_*`、`Preserve_trx_lock_warmcopy_*`、`Preserve_trx_memory_*`、`Preserve_trx_spill_*` 状态变量。 |

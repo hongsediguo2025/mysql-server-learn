@@ -370,6 +370,19 @@ dberr_t trx_preserve_temp_space_image_begin_no_redo_undo_capture(
 bool trx_preserve_temp_space_image_should_disable_undo_cache(
     uint32_t rseg_space_id);
 
+/*
+  A resumed transaction reconnects no-redo undo objects from the preserved
+  sidecar before the token is committed or rolled back. Those undo objects are
+  linked only in memory, so the live rollback-segment header still looks free.
+  The reservation API keeps the normal temporary undo allocator from reusing
+  the same slot while the preserved transaction remains retryable.
+*/
+bool trx_preserve_temp_space_image_no_redo_undo_slot_reserved(
+    uint32_t rseg_space_id, uint32_t slot);
+
+void trx_preserve_temp_space_image_release_no_redo_undo_slot(
+    uint32_t rseg_space_id, uint32_t slot);
+
 dberr_t trx_preserve_temp_space_image_capture_no_redo_undo_from_trx(
     trx_preserve_temp_space_image_descriptor *descriptor, const trx_t *trx);
 

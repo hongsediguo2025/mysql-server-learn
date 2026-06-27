@@ -2592,6 +2592,7 @@ class BusinessWorker(threading.Thread):
                 self.coordinator.mark_drainable_transaction(self.sid, False)
                 if finish_after_resume and rollback_after_resume:
                     conn.rollback()
+                    self._verify_temp_table_rollback(conn, tx_id)
                     return conn
                 conn.commit()
                 completed_stmt_count = stmt_index if finish_after_resume else None
@@ -2608,6 +2609,21 @@ class BusinessWorker(threading.Thread):
                 conn = self.coordinator.wait_for_resumed_connection(
                     self.sid, self.plan.resume_connection_wait_timeout_s()
                 )
+
+    def _verify_temp_table_rollback(self, conn, tx_id: int) -> None:
+        if not self.plan.config.temp_table_workload:
+            return
+        table = self.plan.temp_table_name(self.sid)
+        rows = self.runtime.execute(
+            conn,
+            f"SELECT COUNT(*) FROM `{table}` WHERE tx_id = {tx_id}",
+            fetch=True,
+        )
+        if rows and int(rows[0][0]) != 0:
+            raise AssertionError(
+                "temporary table rollback left current transaction rows: "
+                f"sid={self.sid} tx_id={tx_id} rows={rows[0][0]}"
+            )
 
     def _next_tx_id(self, previous_tx_id: int) -> int:
         tx_id = previous_tx_id + 1

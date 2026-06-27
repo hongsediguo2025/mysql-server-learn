@@ -3809,8 +3809,14 @@ void preserve_trx_set_batch_state(THD *thd, ulonglong generation,
   mysql_mutex_lock(&thd->LOCK_thd_data);
   thd->preserve_trx_batch_generation = generation;
   thd->preserve_trx_batch_state = state;
-  if (generation == 0 || state == Preserve_trx_batch_thd_state::NONE)
+  if (generation == 0 || state == Preserve_trx_batch_thd_state::NONE) {
+    thd->preserve_trx_temp_table_batch_capture_epoch.store(
+        false, std::memory_order_release);
     preserve_trx_temp_table_clear_batch_unsupported_boundary(thd);
+  } else {
+    thd->preserve_trx_temp_table_batch_capture_epoch.store(
+        true, std::memory_order_release);
+  }
   mysql_mutex_unlock(&thd->LOCK_thd_data);
 }
 
@@ -3918,6 +3924,8 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
         candidate->preserve_trx_batch_generation = m_generation;
         candidate->preserve_trx_batch_state =
             Preserve_trx_batch_thd_state::QUIESCED;
+        candidate->preserve_trx_temp_table_batch_capture_epoch.store(
+            true, std::memory_order_release);
       } else if (pending_target) {
         ++m_target_count;
         m_target_thread_ids.push_back(candidate->thread_id());
@@ -3926,6 +3934,8 @@ class Preserve_batch_target_counter final : public Do_THD_Impl {
         candidate->preserve_trx_batch_generation = m_generation;
         candidate->preserve_trx_batch_state =
             Preserve_trx_batch_thd_state::PENDING_QUIESCE;
+        candidate->preserve_trx_temp_table_batch_capture_epoch.store(
+            true, std::memory_order_release);
       } else {
         ++m_nonidle_transaction_count;
       }
@@ -4214,6 +4224,8 @@ class Preserve_batch_clear_target_generation final : public Do_THD_Impl {
             Preserve_trx_batch_thd_state::PRESERVED_DRAINED) {
       candidate->preserve_trx_batch_generation = 0;
       candidate->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
+      candidate->preserve_trx_temp_table_batch_capture_epoch.store(
+          false, std::memory_order_release);
       preserve_trx_temp_table_clear_batch_unsupported_boundary(candidate);
       m_cleared = true;
     }
@@ -4272,6 +4284,8 @@ class Preserve_batch_clear_generation final : public Do_THD_Impl {
             Preserve_trx_batch_thd_state::PRESERVED_DRAINED) {
       candidate->preserve_trx_batch_generation = 0;
       candidate->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
+      candidate->preserve_trx_temp_table_batch_capture_epoch.store(
+          false, std::memory_order_release);
       preserve_trx_temp_table_clear_batch_unsupported_boundary(candidate);
     }
     mysql_mutex_unlock(&candidate->LOCK_thd_data);
@@ -5014,6 +5028,8 @@ class Preserve_batch_quiesced_idle_target final {
             Preserve_trx_batch_thd_state::PRESERVED_DRAINED) {
       candidate->preserve_trx_batch_generation = 0;
       candidate->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
+      candidate->preserve_trx_temp_table_batch_capture_epoch.store(
+          false, std::memory_order_release);
       preserve_trx_temp_table_clear_batch_unsupported_boundary(candidate);
     }
     mysql_mutex_unlock(&candidate->LOCK_thd_data);
@@ -5449,12 +5465,14 @@ class Temp_table_phase1_drain_participant final
   }
 
   void abort_phase() override {
+    clear_capture_epochs();
     m_observation.state = Preserve_trx_drain_participant_state::ABANDONED;
     if (m_observation.failure_reason.empty())
       m_observation.failure_reason = "aborted";
   }
 
   void finalize_phase() override {
+    clear_capture_epochs();
     m_observation.state = Preserve_trx_drain_participant_state::FINALIZED;
   }
 
@@ -5463,9 +5481,62 @@ class Temp_table_phase1_drain_participant final
   }
 
  private:
+  bool capture_target_recorded(my_thread_id thread_id) const {
+    for (my_thread_id recorded : m_capture_target_thread_ids) {
+      if (recorded == thread_id) return true;
+    }
+    return false;
+  }
+
+  void mark_capture_epoch_target(THD *target) {
+    if (target == nullptr) return;
+    mysql_mutex_lock(&target->LOCK_thd_data);
+    target->preserve_trx_temp_table_batch_capture_epoch.store(
+        true, std::memory_order_release);
+    const my_thread_id thread_id = target->thread_id();
+    if (!capture_target_recorded(thread_id))
+      m_capture_target_thread_ids.push_back(thread_id);
+    mysql_mutex_unlock(&target->LOCK_thd_data);
+  }
+
+  class Clear_capture_epoch_targets final : public Do_THD_Impl {
+   public:
+    explicit Clear_capture_epoch_targets(
+        const std::vector<my_thread_id> &target_thread_ids)
+        : m_target_thread_ids(target_thread_ids) {}
+
+    void operator()(THD *candidate) override {
+      if (candidate == nullptr) return;
+      bool target = false;
+      for (my_thread_id thread_id : m_target_thread_ids) {
+        if (candidate->thread_id() == thread_id) {
+          target = true;
+          break;
+        }
+      }
+      if (!target) return;
+
+      mysql_mutex_lock(&candidate->LOCK_thd_data);
+      candidate->preserve_trx_temp_table_batch_capture_epoch.store(
+          false, std::memory_order_release);
+      mysql_mutex_unlock(&candidate->LOCK_thd_data);
+    }
+
+   private:
+    const std::vector<my_thread_id> &m_target_thread_ids;
+  };
+
+  void clear_capture_epochs() {
+    if (m_capture_target_thread_ids.empty()) return;
+    Clear_capture_epoch_targets clear(m_capture_target_thread_ids);
+    Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
+    m_capture_target_thread_ids.clear();
+  }
+
   bool begin_capture_for_targets(std::vector<Preserve_trx_pinned_thd> &targets) {
     for (const Preserve_trx_pinned_thd &target : targets) {
       if (target.thd == nullptr) continue;
+      mark_capture_epoch_target(target.thd);
       if (!preserve_trx_temp_table_begin_capture_epoch(target.thd)) {
         mark_degraded("temp-table phase1 capture epoch open failed");
         return false;
@@ -5481,6 +5552,7 @@ class Temp_table_phase1_drain_participant final
 
   THD *m_owner;
   bool m_closed{false};
+  std::vector<my_thread_id> m_capture_target_thread_ids;
   Preserve_trx_drain_participant_observation m_observation;
 };
 
@@ -10046,6 +10118,12 @@ bool Preserve_trx_drain_service::execute(
   Preserve_trx_drain_orchestrator drain_orchestrator(
       two_phase_enabled ? Preserve_trx_drain_phase_mode::TWO_PHASE
                         : Preserve_trx_drain_phase_mode::SINGLE_PHASE);
+  std::unique_ptr<Temp_table_phase1_drain_participant> temp_table_participant;
+  if (temp_table_phase1_enabled) {
+    temp_table_participant =
+        std::make_unique<Temp_table_phase1_drain_participant>(thd);
+    drain_orchestrator.add_participant(temp_table_participant.get());
+  }
   std::unique_ptr<Warmcopy_batch_drain_participant> warmcopy_participant;
   if (binlog_warmcopy_enabled) {
     warmcopy_participant = std::make_unique<Warmcopy_batch_drain_participant>(
@@ -10062,12 +10140,6 @@ bool Preserve_trx_drain_service::execute(
         std::make_unique<Preserve_trx_lock_warmcopy_drain_participant>(
             lock_warmcopy_options);
     drain_orchestrator.add_participant(lock_warmcopy_participant.get());
-  }
-  std::unique_ptr<Temp_table_phase1_drain_participant> temp_table_participant;
-  if (temp_table_phase1_enabled) {
-    temp_table_participant =
-        std::make_unique<Temp_table_phase1_drain_participant>(thd);
-    drain_orchestrator.add_participant(temp_table_participant.get());
   }
   PreserveBinlogBlobProvider *warmcopy_provider = nullptr;
   Preserve_trx_manager_state_guard draining(

@@ -1362,6 +1362,14 @@ class THD : public MDL_context_owner,
   */
   std::atomic<bool> preserve_trx_temp_table_has_participant{false};
   /**
+    True while this THD is an admitted target of a batch drain phase-1 capture
+    epoch. It is set by the drain owner when the target list is selected and
+    cleared with the batch generation, so temporary-table DDL/DML hooks can
+    reject unsupported boundaries for target sessions without treating every
+    session as a target just because the global manager is draining.
+  */
+  std::atomic<bool> preserve_trx_temp_table_batch_capture_epoch{false};
+  /**
     Sticky fail-closed marker for temp-table activity that could not be ordered
     in the participant journal. Preserve preflight rejects such sessions before
     publishing a token.

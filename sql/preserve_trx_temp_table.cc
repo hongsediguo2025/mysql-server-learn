@@ -228,12 +228,19 @@ bool thd_in_preserve_batch_epoch(const THD *thd) {
 
 bool thd_in_temp_table_capture_epoch(THD *thd) {
   if (thd == nullptr) return false;
-  const Preserve_trx_manager_state manager_state = preserved_trx_manager_state();
+  /*
+    Batch drain is a global manager state, but a temporary-table boundary is a
+    THD-local fact. Non-target sessions may still execute statements while the
+    manager is in WARMCOPY_DRAINING/CLOSING; marking those sessions would leak
+    unsupported history into a later unrelated drain. Only a THD that has been
+    admitted to the batch generation, or already owns a temp-table participant,
+    is inside the capture epoch.
+  */
   return thd_in_preserve_batch_epoch(thd) ||
-         thd->preserve_trx_temp_table_has_participant.load(
+         thd->preserve_trx_temp_table_batch_capture_epoch.load(
              std::memory_order_acquire) ||
-         manager_state == Preserve_trx_manager_state::WARMCOPY_DRAINING ||
-         manager_state == Preserve_trx_manager_state::WARMCOPY_CLOSING;
+         thd->preserve_trx_temp_table_has_participant.load(
+             std::memory_order_acquire);
 }
 
 void mark_batch_unsupported_temp_boundary(THD *thd) {

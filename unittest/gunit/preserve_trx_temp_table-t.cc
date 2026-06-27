@@ -487,6 +487,52 @@ TEST(TempTablePhysicalContractTest, DoesNotExposeLogicalAppendRowApi) {
             trx_preserve_temp_space_image_seal(&descriptor));
 }
 
+TEST(TempTablePhysicalContractTest,
+     CaptureEpochIsTargetScopedNotGlobalDrainState) {
+  const std::string implementation = read_source_file_for_temp_table_test(
+      "sql/preserve_trx_temp_table.cc");
+  ASSERT_FALSE(implementation.empty());
+
+  const std::string epoch_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          implementation, "bool thd_in_temp_table_capture_epoch(");
+  ASSERT_FALSE(epoch_body.empty());
+  EXPECT_NE(std::string::npos,
+            epoch_body.find("thd_in_preserve_batch_epoch(thd)"));
+  EXPECT_NE(std::string::npos,
+            epoch_body.find(
+                "preserve_trx_temp_table_batch_capture_epoch.load("));
+  EXPECT_NE(std::string::npos,
+            epoch_body.find("preserve_trx_temp_table_has_participant.load("));
+  EXPECT_EQ(std::string::npos,
+            epoch_body.find("Preserve_trx_manager_state::WARMCOPY_DRAINING"));
+  EXPECT_EQ(std::string::npos,
+            epoch_body.find("Preserve_trx_manager_state::WARMCOPY_CLOSING"));
+}
+
+TEST(TempTablePhysicalContractTest, TemporaryTruncateRecordsSingleBarrier) {
+  const std::string implementation =
+      read_source_file_for_temp_table_test("sql/sql_truncate.cc");
+  ASSERT_FALSE(implementation.empty());
+
+  const std::string truncate_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          implementation,
+          "void Sql_cmd_truncate_table::truncate_temporary(");
+  ASSERT_FALSE(truncate_body.empty());
+  size_t marker_count = 0;
+  size_t pos = 0;
+  constexpr char kMarker[] =
+      "preserve_trx_temp_table_note_table_truncate(";
+  while ((pos = truncate_body.find(kMarker, pos)) != std::string::npos) {
+    ++marker_count;
+    pos += sizeof(kMarker) - 1;
+  }
+  EXPECT_EQ(2U, marker_count)
+      << "temporary TRUNCATE should record one preserve barrier for the "
+         "recreate path and one for the handler-truncate path";
+}
+
 TEST(TempResumeMaterializerContractTest, ResumeMaterializerEntryPointsExist) {
   const std::string sql_header = read_source_file_for_temp_table_test(
       "sql/preserve_trx_temp_table.h");
@@ -1614,6 +1660,20 @@ TEST(TempResumeMaterializerContractTest,
   EXPECT_NE(std::string::npos,
             innodb_impl.find("trx->rsegs.m_noredo.update_undo = nullptr;",
                              disconnect_body));
+  EXPECT_NE(std::string::npos,
+            innodb_impl.find("trx->rsegs.m_noredo.rseg = nullptr;",
+                             disconnect_body))
+      << "retry cleanup must fully detach the restored no-redo rseg so a later "
+         "RESUME retry does not fail the reconnect precondition";
+  EXPECT_NE(std::string::npos,
+            innodb_impl.find("mutex_enter(&rseg->mutex)", disconnect_body))
+      << "restored undo removal mutates rseg lists and must hold rseg->mutex";
+  EXPECT_NE(std::string::npos,
+            innodb_impl.find("mutex_exit(&rseg->mutex)", disconnect_body));
+  EXPECT_LT(innodb_impl.find("mutex_enter(&rseg->mutex)", disconnect_body),
+            innodb_impl.find(
+                "trx_preserve_temp_space_image_free_reconnected_undo(",
+                disconnect_body));
 }
 
 TEST(TempResumeMaterializerContractTest,
@@ -1635,6 +1695,71 @@ TEST(TempResumeMaterializerContractTest,
   EXPECT_NE(std::string::npos, adopt_body.find("space->size_in_header"));
   EXPECT_NE(std::string::npos, adopt_body.find("space->free_limit"));
   EXPECT_NE(std::string::npos, adopt_body.find("space->free_len"));
+}
+
+TEST(TempResumeMaterializerContractTest,
+     RestoredNoRedoUndoSlotsAreReservedFromLiveAllocator) {
+  const std::string innodb_header = read_source_file_for_temp_table_test(
+      "storage/innobase/include/trx0temp_preserve.h");
+  const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+  const std::string undo_impl =
+      read_source_file_for_temp_table_test("storage/innobase/trx/trx0undo.cc");
+
+  ASSERT_FALSE(innodb_header.empty());
+  ASSERT_FALSE(temp_preserve_impl.empty());
+  ASSERT_FALSE(undo_impl.empty());
+
+  EXPECT_NE(std::string::npos,
+            innodb_header.find(
+                "trx_preserve_temp_space_image_no_redo_undo_slot_reserved("));
+  EXPECT_NE(std::string::npos,
+            temp_preserve_impl.find(
+                "trx_preserve_temp_space_image_reserve_no_redo_undo_slot("));
+  EXPECT_NE(std::string::npos,
+            temp_preserve_impl.find(
+                "trx_preserve_temp_space_image_release_no_redo_undo_reservations("));
+
+  const std::string reconnect_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t "
+          "trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(");
+  ASSERT_FALSE(reconnect_body.empty());
+  EXPECT_NE(std::string::npos,
+            reconnect_body.find(
+                "trx_preserve_temp_space_image_reserve_no_redo_undo_slot("))
+      << "RESUME must reserve restored undo slots before exposing the resumed "
+         "transaction to normal temp undo allocation";
+
+  const std::string disconnect_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t "
+          "trx_preserve_temp_space_image_disconnect_no_redo_undo_for_retry(");
+  ASSERT_FALSE(disconnect_body.empty());
+  EXPECT_NE(std::string::npos,
+            disconnect_body.find(
+                "trx_preserve_temp_space_image_release_no_redo_undo_reservations("));
+
+  const std::string seg_create_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          undo_impl, "static MY_ATTRIBUTE((warn_unused_result)) dberr_t "
+                     "trx_undo_seg_create(");
+  ASSERT_FALSE(seg_create_body.empty());
+  EXPECT_NE(std::string::npos,
+            seg_create_body.find("trx_undo_find_free_non_reserved_slot("))
+      << "normal temp undo creation must not reuse a slot reserved by a "
+         "retryable preserved transaction";
+  const std::string reserved_helper_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          undo_impl, "static bool trx_undo_temp_preserve_slot_reserved(");
+  ASSERT_FALSE(reserved_helper_body.empty());
+  EXPECT_NE(std::string::npos,
+            reserved_helper_body.find(
+                "trx_preserve_temp_space_image_no_redo_undo_slot_reserved("))
+      << "the local allocator helper must delegate to the preserve reservation "
+         "set";
 }
 
 TEST(TempResumeMaterializerContractTest,

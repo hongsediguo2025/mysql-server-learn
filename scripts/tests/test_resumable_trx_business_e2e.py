@@ -1300,6 +1300,18 @@ class WorkloadPlanTest(unittest.TestCase):
         )
 
     def test_temp_table_worker_can_rollback_after_resume(self):
+        class TempRollbackRuntime(_FakeRuntime):
+            def execute(self, conn, sql, fetch=False):
+                self.sql.append(sql)
+                self.calls.append((sql, fetch))
+                if fetch and sql.startswith(
+                    "SELECT COUNT(*) FROM `rtx_e2e_tmp_001` WHERE tx_id = 1"
+                ):
+                    return [(0,)]
+                if fetch:
+                    return _fake_fetch_rows(sql)
+                return ()
+
         cfg = HarnessConfig(
             sessions=1,
             table_count=1,
@@ -1309,7 +1321,7 @@ class WorkloadPlanTest(unittest.TestCase):
             temp_table_resume_action="rollback",
             min_statements_before_drain_pause=1,
         ).validate()
-        runtime = _FakeRuntime()
+        runtime = TempRollbackRuntime()
         resumed = _FakeConnection()
         worker = BusinessWorker(
             1,
@@ -1327,6 +1339,41 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertFalse(
             any(sql.startswith("UPDATE `rtx_e2e_tmp_001`") for sql in runtime.sql)
         )
+
+    def test_temp_table_worker_rejects_rollback_that_leaves_current_tx_rows(self):
+        class TempRollbackRuntime(_FakeRuntime):
+            def execute(self, conn, sql, fetch=False):
+                self.sql.append(sql)
+                self.calls.append((sql, fetch))
+                if fetch and sql.startswith(
+                    "SELECT COUNT(*) FROM `rtx_e2e_tmp_001` WHERE tx_id = 1"
+                ):
+                    return [(1,)]
+                if fetch:
+                    return _fake_fetch_rows(sql)
+                return ()
+
+        cfg = HarnessConfig(
+            sessions=1,
+            table_count=1,
+            statements_per_tx=4,
+            seed_rows_per_table_per_session=8,
+            temp_table_workload=True,
+            temp_table_resume_action="rollback",
+            min_statements_before_drain_pause=1,
+        ).validate()
+        worker = BusinessWorker(
+            1,
+            WorkloadPlan(cfg),
+            TempRollbackRuntime(),
+            _ResumeOnceDrainableCoordinator(_FakeConnection()),
+            threading.Event(),
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError, "temporary table rollback left current transaction rows"
+        ):
+            worker._run_transaction(_FakeConnection(), tx_id=1)
 
     def test_compact_bulk_spot_check_rejects_note_mismatch(self):
         cfg = HarnessConfig(

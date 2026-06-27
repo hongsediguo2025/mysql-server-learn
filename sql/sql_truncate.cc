@@ -708,10 +708,6 @@ void Sql_cmd_truncate_table::truncate_temporary(THD *thd,
       return;
     }
 
-    if (preserve_temp_truncate)
-      (void)preserve_trx_temp_table_note_table_truncate(
-          thd, table_ref->db, strlen(table_ref->db), table_ref->table_name,
-          strlen(table_ref->table_name));
     /* Only binlog if truncate-by-recreate succeeds. */
     /* In RBR, the statement is not binlogged if the table is temporary. */
     binlog_stmt = !thd->is_current_stmt_binlog_format_row();

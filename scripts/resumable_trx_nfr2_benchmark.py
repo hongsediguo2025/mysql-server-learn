@@ -3,14 +3,15 @@
 
 This wrapper reuses the business E2E workload because it already drives real
 100-session, 30-table transactions through DRAIN, shutdown, recovery, RESUME,
-and data validation. It runs two current-contract scenarios:
+and data validation. It runs two latency scenarios:
 
 * baseline: no warm-copy, no user temporary-table workload;
 * warmcopy-large-cache: large binlog cache with warm-copy enabled.
 
-The older temp-image benchmark shape is intentionally not a current-contract
-scenario because the business workload mutates temporary-table rows, and
-temp-DML preserve/resume is currently fail-closed rather than supported.
+Temporary-table DML preserve/resume is covered by the business E2E harness and
+preserve_trx MTR suite. It is not part of this NFR-2 latency wrapper by default
+because this wrapper measures binlog warm-copy and drain/resume latency rather
+than temporary-table sidecar throughput.
 
 The output is JSON. Scenario wall time measures the whole E2E run. Warm-copy
 phase-1 and phase-2 details come from the server "PRESERVE: warm-copy drain
