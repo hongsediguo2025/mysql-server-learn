@@ -206,6 +206,16 @@ class Preserved_temp_table_image_carrier {
       const std::string &warmcopy_id, const std::string &token,
       const Preserved_temp_table_image_descriptor &descriptor) = 0;
 
+  /*
+    Fast seal is only for a warm image whose writer was closed and digested by
+    the phase-1 builder. The method still validates the token, descriptor,
+    source file identity and file size before the atomic install, but it does
+    not re-read the whole image in the user-blocking phase.
+  */
+  virtual Preserved_trx_carrier_status seal_prevalidated_warm_image(
+      const std::string &warmcopy_id, const std::string &token,
+      const Preserved_temp_table_image_descriptor &descriptor) = 0;
+
   virtual Preserved_trx_carrier_status seal_warm_undo(
       const std::string &warmcopy_id, const std::string &token,
       const Preserved_temp_table_undo_descriptor &descriptor) = 0;
@@ -257,6 +267,10 @@ class Local_file_preserved_temp_table_image_carrier final
       const unsigned char *bytes, size_t length) override;
 
   Preserved_trx_carrier_status seal_warm_image(
+      const std::string &warmcopy_id, const std::string &token,
+      const Preserved_temp_table_image_descriptor &descriptor) override;
+
+  Preserved_trx_carrier_status seal_prevalidated_warm_image(
       const std::string &warmcopy_id, const std::string &token,
       const Preserved_temp_table_image_descriptor &descriptor) override;
 

@@ -104,6 +104,25 @@ struct Temp_table_journal_record {
 */
 class Temp_table_warmcopy_participant {
  public:
+  struct Prebuilt_sidecar {
+    /*
+      Phase-1 sidecar body that has been written under a warmcopy id but has
+      not yet been attached to the final preserve token. The journal counters
+      describe the temp-table history observed when the body was sealed; phase 2
+      may adopt it only if no later temp DML/DDL/savepoint history invalidated
+      that physical image.
+    */
+    uint32_t source_space_id{0};
+    std::string warmcopy_id;
+    std::string preserve_dir;
+    trx_preserve_temp_space_image_descriptor descriptor;
+    std::unique_ptr<Preserved_temp_table_image_writer> image_writer;
+    bool has_undo{false};
+    Preserved_temp_table_undo_descriptor undo;
+    size_t journal_record_count{0};
+    bool tail_sealed{false};
+  };
+
   explicit Temp_table_warmcopy_participant(
       size_t max_tail_bytes = kDefaultMaxTailBytes);
 
@@ -158,6 +177,15 @@ class Temp_table_warmcopy_participant {
   bool append_table_event(uint32_t table_ordinal,
                           Temp_table_journal_record::Kind kind,
                           std::string payload);
+  bool remember_prebuilt_sidecar(std::unique_ptr<Prebuilt_sidecar> sidecar);
+  Prebuilt_sidecar *find_prebuilt_sidecar(uint32_t source_space_id);
+  const Prebuilt_sidecar *find_prebuilt_sidecar(
+      uint32_t source_space_id) const;
+  const std::vector<std::unique_ptr<Prebuilt_sidecar>> &prebuilt_sidecars()
+      const {
+    return m_prebuilt_sidecars;
+  }
+  void clear_prebuilt_sidecars() { m_prebuilt_sidecars.clear(); }
   bool current_statement_touched() const {
     return m_current_statement_touched;
   }
@@ -212,6 +240,7 @@ class Temp_table_warmcopy_participant {
   std::string m_degraded_reason;
   std::vector<Table_state> m_tables;
   std::vector<Temp_table_journal_record> m_journal;
+  std::vector<std::unique_ptr<Prebuilt_sidecar>> m_prebuilt_sidecars;
 };
 
 Temp_table_warmcopy_participant *preserve_trx_temp_table_get_participant(
@@ -280,6 +309,20 @@ bool preserve_trx_temp_table_note_rollback_to_savepoint(
 void preserve_trx_temp_table_note_statement_commit(THD *thd);
 void preserve_trx_temp_table_note_statement_rollback(THD *thd);
 bool preserve_trx_temp_table_begin_capture_epoch(THD *thd);
+bool preserve_trx_temp_table_prebuild_phase1_sidecars(
+    THD *thd, trx_t *trx, const std::string &dir,
+    const std::string &warmcopy_id);
+bool preserve_trx_temp_table_adopt_phase1_sidecar(
+    THD *thd, uint32_t source_space_id, const std::string &token,
+    trx_preserve_temp_space_image_descriptor *descriptor,
+    Preserved_temp_table_undo_descriptor *undo, std::string *warmcopy_id);
+bool preserve_trx_temp_table_seal_phase1_tail_sidecar(
+    THD *thd, trx_t *trx, uint32_t source_space_id,
+    const std::string &token, Preserved_temp_table_image_carrier *carrier,
+    trx_preserve_temp_space_image_descriptor *descriptor,
+    Preserved_temp_table_undo_descriptor *undo, std::string *warmcopy_id);
+void preserve_trx_temp_table_discard_phase1_sidecars(THD *thd,
+                                                     const std::string &dir);
 
 /*
   Build the sealed physical image for one user temporary table from the initial

@@ -734,6 +734,43 @@ ulint trx_preserve_temp_space_image_reconnected_undo_size(
   return persisted_size;
 }
 
+dberr_t trx_preserve_temp_space_image_collect_undo_page_list(
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    const trx_preserve_temp_no_redo_undo_log_anchor &anchor,
+    std::vector<const trx_preserve_temp_no_redo_undo_page_image *> *pages) {
+  if (pages == nullptr) return DB_ERROR;
+  pages->clear();
+
+  const ulint persisted_size =
+      trx_preserve_temp_space_image_read_undo_page_list_len(descriptor, anchor);
+  if (!trx_preserve_temp_space_image_trace_undo_page_list(
+          descriptor, anchor, persisted_size)) {
+    return DB_CORRUPTION;
+  }
+
+  page_no_t current_page_no = anchor.hdr_page_no;
+  for (ulint i = 0; i < persisted_size; ++i) {
+    const trx_preserve_temp_no_redo_undo_page_image *image =
+        trx_preserve_temp_space_image_complete_no_redo_page(
+            descriptor,
+            current_page_no == anchor.hdr_page_no
+                ? trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER
+                : trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG,
+            current_page_no);
+    if (image == nullptr) return DB_CORRUPTION;
+
+    pages->push_back(image);
+
+    const auto *page = reinterpret_cast<const byte *>(image->bytes.data());
+    const size_t next_offset =
+        TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_NODE + FLST_NEXT;
+    current_page_no =
+        trx_preserve_temp_space_image_read_fil_addr(page, next_offset).page;
+  }
+
+  return current_page_no == FIL_NULL ? DB_SUCCESS : DB_CORRUPTION;
+}
+
 bool trx_preserve_temp_space_image_anchor_offsets_in_page(
     const trx_preserve_temp_no_redo_undo_log_anchor &anchor,
     uint32_t page_size) {
@@ -1045,6 +1082,98 @@ dberr_t trx_preserve_temp_space_image_materialize_no_redo_undo_pages(
     mtr_commit(&mtr);
   }
   return err;
+}
+
+dberr_t trx_preserve_temp_space_image_copy_no_redo_undo_image_to_block(
+    const trx_preserve_temp_no_redo_undo_page_image &page, buf_block_t *block,
+    bool keep_live_fseg_header, mtr_t *mtr) {
+  if (block == nullptr || mtr == nullptr || page.bytes.empty()) return DB_ERROR;
+
+  byte *frame = buf_block_get_frame(block);
+  std::array<byte, FSEG_HEADER_SIZE> live_fseg_header{};
+  if (keep_live_fseg_header) {
+    std::memcpy(live_fseg_header.data(),
+                frame + TRX_UNDO_SEG_HDR + TRX_UNDO_FSEG_HEADER,
+                live_fseg_header.size());
+  }
+
+  std::memcpy(frame, page.bytes.data(), page.bytes.size());
+
+  if (keep_live_fseg_header) {
+    std::memcpy(frame + TRX_UNDO_SEG_HDR + TRX_UNDO_FSEG_HEADER,
+                live_fseg_header.data(), live_fseg_header.size());
+  }
+  mtr->set_modified();
+  return DB_SUCCESS;
+}
+
+dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership_for_anchor(
+    const trx_preserve_temp_space_image_descriptor &descriptor, trx_rseg_t *rseg,
+    const trx_preserve_temp_no_redo_undo_log_anchor &anchor) {
+  if (!anchor.present) return DB_SUCCESS;
+
+  std::vector<const trx_preserve_temp_no_redo_undo_page_image *> pages;
+  dberr_t err = trx_preserve_temp_space_image_collect_undo_page_list(
+      descriptor, anchor, &pages);
+  if (err != DB_SUCCESS || pages.empty()) return err == DB_SUCCESS ? DB_ERROR : err;
+
+  mtr_t mtr;
+  mtr_start(&mtr);
+  mtr_set_log_mode(&mtr, MTR_LOG_NO_REDO);
+
+  buf_block_t *header_block = fseg_create_at_reserved_page_for_temp_preserve(
+      rseg->space_id, anchor.hdr_page_no,
+      TRX_UNDO_SEG_HDR + TRX_UNDO_FSEG_HEADER, &mtr);
+  if (header_block == nullptr) {
+    mtr_commit(&mtr);
+    return DB_ERROR;
+  }
+
+  err = trx_preserve_temp_space_image_copy_no_redo_undo_image_to_block(
+      *pages.front(), header_block, true, &mtr);
+  if (err != DB_SUCCESS) {
+    mtr_commit(&mtr);
+    return err;
+  }
+
+  fseg_header_t *file_seg = buf_block_get_frame(header_block) + TRX_UNDO_SEG_HDR +
+                            TRX_UNDO_FSEG_HEADER;
+
+  for (size_t i = 1; i < pages.size(); ++i) {
+    const trx_preserve_temp_no_redo_undo_page_image *page = pages[i];
+    buf_block_t *block = fseg_alloc_reserved_page_for_temp_preserve(
+        file_seg, static_cast<page_no_t>(page->page_no), &mtr);
+    if (block == nullptr) {
+      mtr_commit(&mtr);
+      return DB_ERROR;
+    }
+    err = trx_preserve_temp_space_image_copy_no_redo_undo_image_to_block(
+        *page, block, false, &mtr);
+    if (err != DB_SUCCESS) {
+      mtr_commit(&mtr);
+      return err;
+    }
+  }
+
+  mtr_commit(&mtr);
+  return DB_SUCCESS;
+}
+
+dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership(
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    trx_rseg_t *rseg) {
+  if (rseg == nullptr ||
+      !trx_preserve_temp_space_image_no_redo_undo_sidecar_ready(descriptor)) {
+    return DB_ERROR;
+  }
+
+  dberr_t err =
+      trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership_for_anchor(
+          descriptor, rseg, descriptor.no_redo_insert_undo);
+  if (err != DB_SUCCESS) return err;
+
+  return trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership_for_anchor(
+      descriptor, rseg, descriptor.no_redo_update_undo);
 }
 
 trx_undo_t *trx_preserve_temp_space_image_create_reconnected_undo(
@@ -5111,9 +5240,8 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume
   }
   if (err != DB_SUCCESS) return err;
 
-  err =
-      trx_preserve_temp_space_image_materialize_no_redo_undo_pages(*descriptor,
-                                                                  rseg);
+  err = trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership(
+      *descriptor, rseg);
   if (err != DB_SUCCESS) return err;
 
   mtr_t mtr;

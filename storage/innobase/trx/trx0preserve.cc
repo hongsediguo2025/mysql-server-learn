@@ -69,6 +69,10 @@ static bool trx_preserve_token_to_xid(const char *token, XID *xid) {
   return true;
 }
 
+trx_t *trx_preserve_current_thd_trx(THD *thd) {
+  return thd == nullptr ? nullptr : thd_to_trx(thd);
+}
+
 static void trx_preserve_append_le32(std::string *payload, uint32_t value) {
   for (size_t i = 0; i < 4; ++i) {
     payload->push_back(static_cast<char>((value >> (i * 8)) & 0xff));

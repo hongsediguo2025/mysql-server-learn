@@ -5417,7 +5417,8 @@ class Warmcopy_batch_drain_participant final
 class Temp_table_phase1_drain_participant final
     : public Preserve_trx_drain_participant {
  public:
-  explicit Temp_table_phase1_drain_participant(THD *owner) : m_owner(owner) {}
+  Temp_table_phase1_drain_participant(THD *owner, ulonglong generation)
+      : m_owner(owner), m_generation(generation) {}
 
   bool open_phase1() override {
     m_observation = {};
@@ -5433,11 +5434,11 @@ class Temp_table_phase1_drain_participant final
     */
     Warmcopy_prepare_idle_participants idle_targets(m_owner);
     Global_THD_manager::get_instance()->do_for_all_thd_copy(&idle_targets);
-    if (!begin_capture_for_targets(idle_targets.targets())) return false;
+    if (!begin_capture_for_targets(idle_targets.targets(), true)) return false;
 
     Lock_warmcopy_prepare_active_record_participants active_targets(m_owner);
     Global_THD_manager::get_instance()->do_for_all_thd_copy(&active_targets);
-    if (!begin_capture_for_targets(active_targets.targets())) return false;
+    if (!begin_capture_for_targets(active_targets.targets(), false)) return false;
 
     m_closed = true;
     m_observation.state = Preserve_trx_drain_participant_state::READY;
@@ -5464,6 +5465,19 @@ class Temp_table_phase1_drain_participant final
       return false;
     }
     return true;
+  }
+
+  bool prepare_late_phase1_idle_targets() {
+    /*
+      Active statements selected during the first phase-1 sweep may reach an
+      idle transaction boundary before WARMCOPY_CLOSING blocks new work. Re-sweep
+      idle targets here so their temp-table physical sidecars can be streamed
+      while the drain is still non-blocking. Targets that are still active remain
+      on the conservative phase-2 fallback path.
+    */
+    Warmcopy_prepare_idle_participants idle_targets(m_owner);
+    Global_THD_manager::get_instance()->do_for_all_thd_copy(&idle_targets);
+    return begin_capture_for_targets(idle_targets.targets(), true);
   }
 
   void abort_phase() override {
@@ -5523,6 +5537,8 @@ class Temp_table_phase1_drain_participant final
           false, std::memory_order_release);
       preserve_trx_temp_table_clear_batch_unsupported_boundary(candidate);
       mysql_mutex_unlock(&candidate->LOCK_thd_data);
+      preserve_trx_temp_table_discard_phase1_sidecars(
+          candidate, preserve_trx_default_dir());
     }
 
    private:
@@ -5536,13 +5552,26 @@ class Temp_table_phase1_drain_participant final
     m_capture_target_thread_ids.clear();
   }
 
-  bool begin_capture_for_targets(std::vector<Preserve_trx_pinned_thd> &targets) {
+  bool begin_capture_for_targets(std::vector<Preserve_trx_pinned_thd> &targets,
+                                 bool prebuild_sidecars) {
     for (const Preserve_trx_pinned_thd &target : targets) {
       if (target.thd == nullptr) continue;
       mark_capture_epoch_target(target.thd);
       if (!preserve_trx_temp_table_begin_capture_epoch(target.thd)) {
         mark_degraded("temp-table phase1 capture epoch open failed");
         return false;
+      }
+      if (prebuild_sidecars) {
+        const std::string warmcopy_id =
+            "tempwarm_" + std::to_string(m_generation) + "_" +
+            std::to_string(
+                static_cast<unsigned long long>(target.thd->thread_id()));
+        if (!preserve_trx_temp_table_prebuild_phase1_sidecars(
+                target.thd, trx_preserve_current_thd_trx(target.thd),
+                preserve_trx_default_dir(), warmcopy_id)) {
+          mark_degraded("temp-table phase1 sidecar prebuild failed");
+          return false;
+        }
       }
     }
     return true;
@@ -5554,6 +5583,7 @@ class Temp_table_phase1_drain_participant final
   }
 
   THD *m_owner;
+  ulonglong m_generation;
   bool m_closed{false};
   std::vector<my_thread_id> m_capture_target_thread_ids;
   Preserve_trx_drain_participant_observation m_observation;
@@ -10286,7 +10316,8 @@ bool Preserve_trx_drain_service::execute(
   std::unique_ptr<Temp_table_phase1_drain_participant> temp_table_participant;
   if (temp_table_phase1_enabled) {
     temp_table_participant =
-        std::make_unique<Temp_table_phase1_drain_participant>(thd);
+        std::make_unique<Temp_table_phase1_drain_participant>(thd,
+                                                              generation);
     drain_orchestrator.add_participant(temp_table_participant.get());
   }
   std::unique_ptr<Warmcopy_batch_drain_participant> warmcopy_participant;
@@ -10397,6 +10428,11 @@ bool Preserve_trx_drain_service::execute(
     if (lock_warmcopy_participant != nullptr &&
         !lock_warmcopy_participant->prepare_phase1_record_store_targets()) {
       abort_drain_participants("lock_warmcopy_phase1_store_prepare_rejected");
+      return preserve_trx_reject_unsupported();
+    }
+    if (temp_table_participant != nullptr &&
+        !temp_table_participant->prepare_late_phase1_idle_targets()) {
+      abort_drain_participants("temp_table_late_phase1_prepare_rejected");
       return preserve_trx_reject_unsupported();
     }
   }

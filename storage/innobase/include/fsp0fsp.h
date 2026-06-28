@@ -528,6 +528,27 @@ buf_block_t *fseg_create_general(space_id_t space_id, page_no_t page,
                                  ulint byte_offset, ibool has_done_reservation,
                                  mtr_t *mtr);
 
+#ifndef UNIV_HOTBACKUP
+/** Create a file segment on a system-temporary page reserved for preserved
+transaction resume.
+@param[in]	space_id	tablespace identifier
+@param[in]	page_no		exact reserved page to become the segment header
+@param[in]	byte_offset	offset of the file segment header on page_no
+@param[in,out]	mtr		mini-transaction
+@return x-latched page block, or nullptr if the exact page cannot be claimed */
+buf_block_t *fseg_create_at_reserved_page_for_temp_preserve(
+    space_id_t space_id, page_no_t page_no, ulint byte_offset, mtr_t *mtr);
+
+/** Allocate an exact system-temporary page reserved for preserved transaction
+resume into an existing file segment.
+@param[in,out]	seg_header	file segment header
+@param[in]	page_no		exact reserved page to claim
+@param[in,out]	mtr		mini-transaction
+@return x-latched page block, or nullptr if the exact page cannot be claimed */
+buf_block_t *fseg_alloc_reserved_page_for_temp_preserve(
+    fseg_header_t *seg_header, page_no_t page_no, mtr_t *mtr);
+#endif /* !UNIV_HOTBACKUP */
+
 /** Calculates the number of pages reserved by a segment, and how many pages are
  currently used.
  @return number of reserved pages */

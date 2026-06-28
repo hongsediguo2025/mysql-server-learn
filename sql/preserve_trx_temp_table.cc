@@ -1447,6 +1447,39 @@ bool Temp_table_warmcopy_participant::append_table_event(
   return append_journal(std::move(record));
 }
 
+bool Temp_table_warmcopy_participant::remember_prebuilt_sidecar(
+    std::unique_ptr<Prebuilt_sidecar> sidecar) {
+  if (sidecar == nullptr || sidecar->source_space_id == 0 ||
+      sidecar->warmcopy_id.empty())
+    return false;
+  if (find_prebuilt_sidecar(sidecar->source_space_id) != nullptr)
+    return false;
+  m_prebuilt_sidecars.push_back(std::move(sidecar));
+  return true;
+}
+
+Temp_table_warmcopy_participant::Prebuilt_sidecar *
+Temp_table_warmcopy_participant::find_prebuilt_sidecar(
+    uint32_t source_space_id) {
+  auto it = std::find_if(
+      m_prebuilt_sidecars.begin(), m_prebuilt_sidecars.end(),
+      [source_space_id](const std::unique_ptr<Prebuilt_sidecar> &sidecar) {
+        return sidecar != nullptr && sidecar->source_space_id == source_space_id;
+      });
+  return it == m_prebuilt_sidecars.end() ? nullptr : it->get();
+}
+
+const Temp_table_warmcopy_participant::Prebuilt_sidecar *
+Temp_table_warmcopy_participant::find_prebuilt_sidecar(
+    uint32_t source_space_id) const {
+  auto it = std::find_if(
+      m_prebuilt_sidecars.begin(), m_prebuilt_sidecars.end(),
+      [source_space_id](const std::unique_ptr<Prebuilt_sidecar> &sidecar) {
+        return sidecar != nullptr && sidecar->source_space_id == source_space_id;
+      });
+  return it == m_prebuilt_sidecars.end() ? nullptr : it->get();
+}
+
 Temp_table_warmcopy_participant *preserve_trx_temp_table_get_participant(
     THD *thd) {
   if (thd == nullptr) return nullptr;
@@ -1670,6 +1703,35 @@ void preserve_trx_temp_table_clear_participant(THD *thd) {
       false, std::memory_order_release);
   mysql_mutex_unlock(&thd->LOCK_thd_data);
 
+  /*
+    A target may hit an unsupported temp-table DDL boundary after phase 1 has
+    written warm sidecars but before DRAIN reaches the normal participant abort
+    path. Clear the files while the participant still remembers their warmcopy
+    ids; otherwise a later state reset would orphan tempwarm artifacts.
+  */
+  if (participant != nullptr && !participant->prebuilt_sidecars().empty()) {
+    for (const std::unique_ptr<Temp_table_warmcopy_participant::Prebuilt_sidecar>
+             &sidecar :
+         participant->prebuilt_sidecars()) {
+      if (sidecar == nullptr) continue;
+      if (sidecar->image_writer != nullptr) {
+        const Preserved_trx_carrier_status abort_status =
+            sidecar->image_writer->abort();
+        if (abort_status != Preserved_trx_carrier_status::OK) {
+          preserve_trx_resource_note_spill_failure();
+        }
+      }
+      trx_preserve_temp_space_image_reset_dirty_page_stream(
+          &sidecar->descriptor);
+      if (!sidecar->preserve_dir.empty()) {
+        Local_file_preserved_temp_table_image_carrier carrier(
+            normalize_dir(sidecar->preserve_dir));
+        (void)carrier.remove_warm_sidecars(sidecar->warmcopy_id,
+                                           sidecar->source_space_id);
+      }
+    }
+    participant->clear_prebuilt_sidecars();
+  }
   delete participant;
 }
 
@@ -2330,6 +2392,465 @@ bool preserve_trx_temp_table_build_baseline_image(
   return true;
 }
 
+bool preserve_trx_temp_table_prebuild_phase1_sidecars(
+    THD *thd, trx_t *trx, const std::string &dir,
+    const std::string &warmcopy_id) {
+  if (!preserve_trx_temp_table_enable) return true;
+  if (thd == nullptr) return false;
+  if (thd->temporary_tables == nullptr) return true;
+  if (!token_is_filename_safe(warmcopy_id)) return false;
+
+  Temp_table_warmcopy_participant *participant =
+      preserve_trx_temp_table_ensure_participant(thd);
+  if (participant == nullptr) return false;
+  if (preserve_trx_temp_table_has_untracked_change(thd) ||
+      preserve_trx_temp_table_has_batch_unsupported_boundary(thd) ||
+      participant->has_unsupported_history()) {
+    participant->mark_degraded("unsupported temp-table history before prebuild");
+    return false;
+  }
+  if (!preserve_trx_temp_table_begin_capture_epoch(thd)) return false;
+
+  const std::string normalized_dir = normalize_dir(dir);
+  Local_file_preserved_temp_table_image_carrier carrier(normalized_dir);
+  std::vector<uint32_t> staged_image_source_space_ids;
+  std::set<uint32_t> visited_source_space_ids;
+
+  auto cleanup_warm_sidecars = [&]() {
+    for (const std::unique_ptr<
+             Temp_table_warmcopy_participant::Prebuilt_sidecar> &sidecar :
+         participant->prebuilt_sidecars()) {
+      if (sidecar == nullptr) continue;
+      if (sidecar->image_writer != nullptr) {
+        const Preserved_trx_carrier_status abort_status =
+            sidecar->image_writer->abort();
+        if (abort_status != Preserved_trx_carrier_status::OK) {
+          preserve_trx_resource_note_spill_failure();
+        }
+      }
+      trx_preserve_temp_space_image_reset_dirty_page_stream(
+          &sidecar->descriptor);
+      (void)carrier.remove_warm_sidecars(sidecar->warmcopy_id,
+                                         sidecar->source_space_id);
+    }
+    participant->clear_prebuilt_sidecars();
+    for (uint32_t source_space_id : staged_image_source_space_ids) {
+      (void)carrier.remove_warm_image(warmcopy_id, source_space_id);
+    }
+  };
+
+  for (TABLE *table = thd->temporary_tables; table != nullptr;
+       table = table->next) {
+    if (!temp_table_candidate(table)) {
+      participant->mark_degraded("unsupported temporary table type");
+      cleanup_warm_sidecars();
+      return false;
+    }
+
+    const std::string schema_name = table_schema_from_table(table);
+    const std::string table_name = table_name_from_table(table);
+    if (schema_name.empty() || table_name.empty()) {
+      participant->mark_degraded("temp-table metadata unavailable");
+      cleanup_warm_sidecars();
+      return false;
+    }
+
+    trx_preserve_temp_table_exported_metadata source_metadata;
+    if (trx_preserve_temp_table_export_source_metadata(table, &source_metadata) !=
+        DB_SUCCESS) {
+      participant->mark_degraded("temp-table source metadata unavailable");
+      cleanup_warm_sidecars();
+      return false;
+    }
+    if (source_metadata.source_space_id == 0 ||
+        visited_source_space_ids.find(source_metadata.source_space_id) !=
+            visited_source_space_ids.end()) {
+      continue;
+    }
+    visited_source_space_ids.insert(source_metadata.source_space_id);
+    if (participant->find_prebuilt_sidecar(source_metadata.source_space_id) !=
+        nullptr) {
+      continue;
+    }
+
+    participant->begin_baseline_copy();
+
+    auto sidecar =
+        std::make_unique<Temp_table_warmcopy_participant::Prebuilt_sidecar>();
+    if (sidecar == nullptr) {
+      participant->mark_degraded("temp-table phase1 sidecar allocation failed");
+      cleanup_warm_sidecars();
+      return false;
+    }
+    sidecar->source_space_id = source_metadata.source_space_id;
+    sidecar->warmcopy_id = warmcopy_id;
+    sidecar->preserve_dir = normalized_dir;
+    sidecar->descriptor.source_space_id = source_metadata.source_space_id;
+    sidecar->descriptor.page_size = source_metadata.page_size;
+    sidecar->descriptor.space_flags = source_metadata.space_flags;
+
+    const auto fail_prebuild = [&](const char *reason) {
+      participant->mark_degraded(reason);
+      if (sidecar->image_writer != nullptr) {
+        const Preserved_trx_carrier_status abort_status =
+            sidecar->image_writer->abort();
+        if (abort_status != Preserved_trx_carrier_status::OK) {
+          preserve_trx_resource_note_spill_failure();
+        }
+      }
+      trx_preserve_temp_space_image_reset_dirty_page_stream(
+          &sidecar->descriptor);
+      cleanup_warm_sidecars();
+      return false;
+    };
+
+    dberr_t err = trx_preserve_temp_space_image_arm_dirty_page_stream(
+        &sidecar->descriptor, participant, 64ULL * 1024 * 1024,
+        warmcopy_id.c_str());
+    if (err == DB_SUCCESS) {
+      err = trx_preserve_temp_space_image_register_dirty_page_stream(
+          &sidecar->descriptor);
+    }
+    if (err == DB_SUCCESS) {
+      err = trx_preserve_temp_space_image_flush_dirty_pages_for_copy(
+          &sidecar->descriptor);
+    }
+    if (err == DB_SUCCESS) {
+      err = trx_preserve_temp_space_image_begin_initial_copy(
+          &sidecar->descriptor, participant);
+    }
+    if (err != DB_SUCCESS) {
+      return fail_prebuild("temp-table phase1 dirty stream open failed");
+    }
+
+    const uint64_t stream_buffer_bytes =
+        std::max<uint64_t>(source_metadata.page_size,
+                           preserve_trx_spill_chunk_bytes);
+    Preserve_memory_lease stream_buffer_lease = preserve_trx_acquire_memory_lease(
+        warmcopy_id, Preserve_trx_memory_kind::TEMP_IMAGE_STREAM_BUFFER,
+        stream_buffer_bytes);
+    if (!stream_buffer_lease.acquired()) {
+      return fail_prebuild("temp-table phase1 stream buffer budget exceeded");
+    }
+
+    const Preserved_trx_carrier_status writer_status =
+        carrier.create_warm_image_writer(warmcopy_id,
+                                         source_metadata.source_space_id,
+                                         &sidecar->image_writer);
+    if (writer_status != Preserved_trx_carrier_status::OK) {
+      preserve_trx_resource_note_spill_failure();
+      return fail_prebuild("temp-table phase1 warm image writer failed");
+    }
+    staged_image_source_space_ids.push_back(source_metadata.source_space_id);
+
+    Temp_table_image_stream_writer_context writer_context;
+    writer_context.writer = sidecar->image_writer.get();
+    writer_context.page_size = source_metadata.page_size;
+
+    err = trx_preserve_temp_space_image_copy_initial_file_pages_to_writer(
+        &sidecar->descriptor, source_metadata.source_path.c_str(),
+        &writer_context, temp_table_image_stream_write_page);
+    if (err == DB_SUCCESS) {
+      err = trx_preserve_temp_space_image_overlay_buffer_pool_pages_to_writer(
+          &sidecar->descriptor, &writer_context,
+          temp_table_image_stream_write_page);
+    }
+    if (err == DB_SUCCESS) {
+      err = trx_preserve_temp_space_image_mark_dirty_queue_durable(
+          &sidecar->descriptor);
+    }
+    if (err != DB_SUCCESS) {
+      return fail_prebuild("temp-table phase1 baseline stream failed");
+    }
+
+    std::string undo_payload;
+    if (participant->has_temp_dml_history()) {
+      err = trx == nullptr
+                ? DB_ERROR
+                : trx_preserve_temp_space_image_capture_no_redo_undo_from_trx(
+                      &sidecar->descriptor, trx);
+      if (err == DB_SUCCESS) {
+        err = trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(
+            &sidecar->descriptor);
+      }
+      if (err == DB_SUCCESS) {
+        err = trx_preserve_temp_space_image_build_no_redo_undo_sidecar_payload(
+            sidecar->descriptor, &undo_payload);
+      }
+      if (err != DB_SUCCESS) {
+        return fail_prebuild(
+            "temp-table phase1 no-redo undo sidecar capture failed");
+      }
+      const Preserved_trx_carrier_status undo_status =
+          carrier.write_warm_undo(
+              warmcopy_id, source_metadata.source_space_id,
+              reinterpret_cast<const unsigned char *>(undo_payload.data()),
+              undo_payload.length());
+      if (undo_status != Preserved_trx_carrier_status::OK) {
+        preserve_trx_resource_note_spill_failure();
+        return fail_prebuild("temp-table phase1 warm undo writer failed");
+      }
+      sidecar->undo =
+          undo_descriptor_from_image_descriptor(warmcopy_id,
+                                                sidecar->descriptor,
+                                                undo_payload);
+      sidecar->has_undo = true;
+    }
+
+    Temp_table_image_stream_writer_context final_writer_context;
+    final_writer_context.writer = sidecar->image_writer.get();
+    final_writer_context.page_size = source_metadata.page_size;
+    err = trx_preserve_temp_space_image_finish_streamed_sidecar(
+        &sidecar->descriptor, &final_writer_context,
+        temp_table_image_stream_write_page);
+    if (err != DB_SUCCESS) {
+      return fail_prebuild("temp-table phase1 stream finalization failed");
+    }
+
+    Preserved_trx_carrier_status final_writer_status =
+        sidecar->image_writer->close();
+    if (final_writer_status != Preserved_trx_carrier_status::OK) {
+      preserve_trx_resource_note_spill_failure();
+      return fail_prebuild("temp-table phase1 warm image close failed");
+    }
+
+    Preserved_temp_table_image_writer_result writer_result;
+    final_writer_status = sidecar->image_writer->result(&writer_result);
+    if (final_writer_status != Preserved_trx_carrier_status::OK) {
+      preserve_trx_resource_note_spill_failure();
+      return fail_prebuild("temp-table phase1 warm image digest failed");
+    }
+
+    err = trx_preserve_temp_space_image_mark_streamed_sidecar_sealed(
+        &sidecar->descriptor, writer_result.size, writer_result.sha256.data());
+    if (err != DB_SUCCESS) {
+      return fail_prebuild("temp-table phase1 stream seal failed");
+    }
+    preserve_trx_resource_note_spill_bytes(writer_result.size);
+    sidecar->image_writer.reset();
+    sidecar->tail_sealed = true;
+    sidecar->journal_record_count = participant->journal().size();
+    if (!participant->remember_prebuilt_sidecar(std::move(sidecar))) {
+      participant->mark_degraded("temp-table phase1 sidecar duplicate");
+      cleanup_warm_sidecars();
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool preserve_trx_temp_table_adopt_phase1_sidecar(
+    THD *thd, uint32_t source_space_id, const std::string &token,
+    trx_preserve_temp_space_image_descriptor *descriptor,
+    Preserved_temp_table_undo_descriptor *undo, std::string *warmcopy_id) {
+  if (!preserve_trx_temp_table_enable || thd == nullptr ||
+      source_space_id == 0 || !token_is_filename_safe(token)) {
+    return false;
+  }
+
+  Temp_table_warmcopy_participant *participant =
+      preserve_trx_temp_table_get_participant(thd);
+  if (participant == nullptr ||
+      preserve_trx_temp_table_has_untracked_change(thd) ||
+      preserve_trx_temp_table_has_batch_unsupported_boundary(thd) ||
+      participant->has_unsupported_history() ||
+      participant->current_statement_touched()) {
+    return false;
+  }
+
+  const Temp_table_warmcopy_participant::Prebuilt_sidecar *sidecar =
+      participant->find_prebuilt_sidecar(source_space_id);
+  if (sidecar == nullptr) return false;
+
+  if (descriptor != nullptr) *descriptor = sidecar->descriptor;
+  if (undo != nullptr) {
+    *undo = sidecar->has_undo ? sidecar->undo
+                              : Preserved_temp_table_undo_descriptor{};
+    if (sidecar->has_undo) {
+      undo->blob_name =
+          temp_table_sealed_undo_filename(token, sidecar->source_space_id);
+    }
+  }
+  if (warmcopy_id != nullptr) *warmcopy_id = sidecar->warmcopy_id;
+  return true;
+}
+
+bool preserve_trx_temp_table_seal_phase1_tail_sidecar(
+    THD *thd, trx_t *trx, uint32_t source_space_id,
+    const std::string &token, Preserved_temp_table_image_carrier *carrier,
+    trx_preserve_temp_space_image_descriptor *descriptor,
+    Preserved_temp_table_undo_descriptor *undo, std::string *warmcopy_id) {
+  if (!preserve_trx_temp_table_enable || thd == nullptr || carrier == nullptr ||
+      source_space_id == 0 || !token_is_filename_safe(token)) {
+    return false;
+  }
+
+  Temp_table_warmcopy_participant *participant =
+      preserve_trx_temp_table_get_participant(thd);
+  if (participant == nullptr ||
+      preserve_trx_temp_table_has_untracked_change(thd) ||
+      preserve_trx_temp_table_has_batch_unsupported_boundary(thd) ||
+      participant->has_unsupported_history() ||
+      participant->current_statement_touched()) {
+    return false;
+  }
+
+  Temp_table_warmcopy_participant::Prebuilt_sidecar *sidecar =
+      participant->find_prebuilt_sidecar(source_space_id);
+  if (sidecar == nullptr) return false;
+
+  auto abandon_prebuilt = [&]() {
+    if (sidecar->image_writer != nullptr) {
+      const Preserved_trx_carrier_status abort_status =
+          sidecar->image_writer->abort();
+      if (abort_status != Preserved_trx_carrier_status::OK) {
+        preserve_trx_resource_note_spill_failure();
+      }
+      sidecar->image_writer.reset();
+    }
+    trx_preserve_temp_space_image_reset_dirty_page_stream(
+        &sidecar->descriptor);
+    (void)carrier->remove_warm_sidecars(sidecar->warmcopy_id,
+                                        sidecar->source_space_id);
+  };
+
+  if (sidecar->tail_sealed &&
+      sidecar->journal_record_count != participant->journal().size()) {
+    abandon_prebuilt();
+    return false;
+  }
+
+  if (!sidecar->tail_sealed) {
+    if (sidecar->image_writer == nullptr) return false;
+
+    std::string undo_payload;
+    const bool undo_sidecar_current =
+        sidecar->has_undo &&
+        sidecar->journal_record_count == participant->journal().size();
+    if (participant->has_temp_dml_history() && !undo_sidecar_current) {
+      if (sidecar->has_undo) {
+        const Preserved_trx_carrier_status remove_status =
+            carrier->remove_warm_undo(sidecar->warmcopy_id, source_space_id);
+        if (remove_status != Preserved_trx_carrier_status::OK) {
+          preserve_trx_resource_note_spill_failure();
+          abandon_prebuilt();
+          return false;
+        }
+        sidecar->has_undo = false;
+        sidecar->undo = Preserved_temp_table_undo_descriptor{};
+      }
+      dberr_t err = trx == nullptr
+                        ? DB_ERROR
+                        : trx_preserve_temp_space_image_capture_no_redo_undo_from_trx(
+                              &sidecar->descriptor, trx);
+      if (err == DB_SUCCESS) {
+        err = trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(
+            &sidecar->descriptor);
+      }
+      if (err == DB_SUCCESS) {
+        err = trx_preserve_temp_space_image_build_no_redo_undo_sidecar_payload(
+            sidecar->descriptor, &undo_payload);
+      }
+      if (err != DB_SUCCESS) {
+        abandon_prebuilt();
+        return false;
+      }
+
+      sidecar->undo =
+          undo_descriptor_from_image_descriptor(token, sidecar->descriptor,
+                                                undo_payload);
+      sidecar->has_undo = true;
+      const Preserved_trx_carrier_status undo_status =
+          carrier->write_warm_undo(
+              sidecar->warmcopy_id, source_space_id,
+              reinterpret_cast<const unsigned char *>(undo_payload.data()),
+              undo_payload.length());
+      if (undo_status != Preserved_trx_carrier_status::OK) {
+        preserve_trx_resource_note_spill_failure();
+        abandon_prebuilt();
+        return false;
+      }
+    }
+
+    Temp_table_image_stream_writer_context writer_context;
+    writer_context.writer = sidecar->image_writer.get();
+    writer_context.page_size = sidecar->descriptor.page_size;
+    dberr_t err = trx_preserve_temp_space_image_finish_streamed_sidecar(
+        &sidecar->descriptor, &writer_context,
+        temp_table_image_stream_write_page);
+    if (err != DB_SUCCESS) {
+      abandon_prebuilt();
+      return false;
+    }
+
+    Preserved_trx_carrier_status writer_status =
+        sidecar->image_writer->close();
+    if (writer_status != Preserved_trx_carrier_status::OK) {
+      preserve_trx_resource_note_spill_failure();
+      abandon_prebuilt();
+      return false;
+    }
+
+    Preserved_temp_table_image_writer_result writer_result;
+    writer_status = sidecar->image_writer->result(&writer_result);
+    if (writer_status != Preserved_trx_carrier_status::OK) {
+      preserve_trx_resource_note_spill_failure();
+      abandon_prebuilt();
+      return false;
+    }
+
+    err = trx_preserve_temp_space_image_mark_streamed_sidecar_sealed(
+        &sidecar->descriptor, writer_result.size, writer_result.sha256.data());
+    if (err != DB_SUCCESS) {
+      abandon_prebuilt();
+      return false;
+    }
+    preserve_trx_resource_note_spill_bytes(writer_result.size);
+    sidecar->image_writer.reset();
+    sidecar->tail_sealed = true;
+  }
+
+  if (descriptor != nullptr) *descriptor = sidecar->descriptor;
+  if (undo != nullptr) {
+    if (sidecar->has_undo) {
+      sidecar->undo.blob_name =
+          temp_table_sealed_undo_filename(token, sidecar->source_space_id);
+    }
+    *undo = sidecar->has_undo ? sidecar->undo
+                              : Preserved_temp_table_undo_descriptor{};
+  }
+  if (warmcopy_id != nullptr) *warmcopy_id = sidecar->warmcopy_id;
+  return true;
+}
+
+void preserve_trx_temp_table_discard_phase1_sidecars(THD *thd,
+                                                     const std::string &dir) {
+  Temp_table_warmcopy_participant *participant =
+      preserve_trx_temp_table_get_participant(thd);
+  if (participant == nullptr || participant->prebuilt_sidecars().empty())
+    return;
+
+  Local_file_preserved_temp_table_image_carrier carrier(normalize_dir(dir));
+  for (const std::unique_ptr<Temp_table_warmcopy_participant::Prebuilt_sidecar>
+           &sidecar :
+       participant->prebuilt_sidecars()) {
+    if (sidecar == nullptr) continue;
+    if (sidecar->image_writer != nullptr) {
+      const Preserved_trx_carrier_status abort_status =
+          sidecar->image_writer->abort();
+      if (abort_status != Preserved_trx_carrier_status::OK) {
+        preserve_trx_resource_note_spill_failure();
+      }
+    }
+    trx_preserve_temp_space_image_reset_dirty_page_stream(
+        &sidecar->descriptor);
+    (void)carrier.remove_warm_sidecars(sidecar->warmcopy_id,
+                                       sidecar->source_space_id);
+  }
+  participant->clear_prebuilt_sidecars();
+}
+
 Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
     THD *thd, trx_t *trx, const std::string &dir, const std::string &token,
     Preserve_snapshot_metadata *metadata) {
@@ -2349,12 +2870,14 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
       preserve_trx_temp_table_has_batch_unsupported_boundary(thd) ||
       participant->has_unsupported_history()) {
     participant->mark_degraded("unsupported temp-table DDL/savepoint history");
+    preserve_trx_temp_table_discard_phase1_sidecars(thd, dir);
     return Preserve_snapshot_status::UNSUPPORTED;
   }
   if (!participant->arm_dirty_page_capture() ||
       !participant->arm_metadata_mutation_capture() ||
       !participant->begin_capture_epoch()) {
     participant->mark_degraded("temp-table capture epoch not armed");
+    preserve_trx_temp_table_discard_phase1_sidecars(thd, dir);
     return Preserve_snapshot_status::UNSUPPORTED;
   }
   Local_file_preserved_temp_table_image_carrier carrier(normalize_dir(dir));
@@ -2362,21 +2885,26 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
   manifest.owner_trx_id = trx_preserve_trx_id(trx);
   if (manifest.owner_trx_id == 0) {
     participant->mark_degraded("temp-table transaction id unavailable");
+    preserve_trx_temp_table_discard_phase1_sidecars(thd, dir);
     return Preserve_snapshot_status::UNSUPPORTED;
   }
-  const std::string warmcopy_id = token;
-  std::vector<uint32_t> staged_image_source_space_ids;
+  struct Warm_sidecar_ref {
+    std::string warmcopy_id;
+    uint32_t source_space_id{0};
+  };
+  const std::string phase2_warmcopy_id = token;
+  std::vector<Warm_sidecar_ref> staged_image_source_space_ids;
   std::vector<uint32_t> sealed_image_source_space_ids;
-  std::vector<uint32_t> staged_undo_source_space_ids;
+  std::vector<Warm_sidecar_ref> staged_undo_source_space_ids;
   std::vector<uint32_t> sealed_undo_source_space_ids;
   std::map<uint32_t, Shared_temp_table_sidecar> shared_sidecars;
 
   auto cleanup_sidecars = [&]() {
-    for (uint32_t source_space_id : staged_image_source_space_ids) {
-      (void)carrier.remove_warm_image(warmcopy_id, source_space_id);
+    for (const Warm_sidecar_ref &ref : staged_image_source_space_ids) {
+      (void)carrier.remove_warm_image(ref.warmcopy_id, ref.source_space_id);
     }
-    for (uint32_t source_space_id : staged_undo_source_space_ids) {
-      (void)carrier.remove_warm_undo(warmcopy_id, source_space_id);
+    for (const Warm_sidecar_ref &ref : staged_undo_source_space_ids) {
+      (void)carrier.remove_warm_undo(ref.warmcopy_id, ref.source_space_id);
     }
     for (uint32_t source_space_id : sealed_image_source_space_ids) {
       (void)carrier.remove_sealed_image(token, source_space_id);
@@ -2443,14 +2971,39 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
     */
     trx_preserve_temp_space_image_descriptor descriptor;
     std::string undo_payload;
+    Preserved_temp_table_undo_descriptor adopted_undo;
+    std::string image_warmcopy_id = phase2_warmcopy_id;
+    bool adopted_phase1_sidecar = false;
     if (first_image_for_space) {
-      if (!preserve_trx_temp_table_build_baseline_image(
-              thd, table, participant, table_ordinal, 64ULL * 1024 * 1024, trx,
-              &descriptor, nullptr, &undo_payload, &carrier, &warmcopy_id)) {
-        cleanup_sidecars();
-        return Preserve_snapshot_status::UNSUPPORTED;
+      adopted_phase1_sidecar = preserve_trx_temp_table_adopt_phase1_sidecar(
+          thd, source_metadata.source_space_id, token, &descriptor,
+          &adopted_undo, &image_warmcopy_id);
+      if (adopted_phase1_sidecar) {
+        adopted_phase1_sidecar =
+            preserve_trx_temp_table_seal_phase1_tail_sidecar(
+                thd, trx, source_metadata.source_space_id, token, &carrier,
+                &descriptor, &adopted_undo, &image_warmcopy_id);
       }
-      staged_image_source_space_ids.push_back(source_metadata.source_space_id);
+      if (!adopted_phase1_sidecar) {
+        image_warmcopy_id = phase2_warmcopy_id;
+        if (!preserve_trx_temp_table_build_baseline_image(
+                thd, table, participant, table_ordinal, 64ULL * 1024 * 1024,
+                trx, &descriptor, nullptr, &undo_payload, &carrier,
+                &image_warmcopy_id)) {
+          cleanup_sidecars();
+          return Preserve_snapshot_status::UNSUPPORTED;
+        }
+        staged_image_source_space_ids.push_back(
+            {image_warmcopy_id, source_metadata.source_space_id});
+      } else {
+        staged_image_source_space_ids.push_back(
+            {image_warmcopy_id, source_metadata.source_space_id});
+        if (adopted_undo.source_space_id != 0) {
+          staged_undo_source_space_ids.push_back(
+              {image_warmcopy_id, source_metadata.source_space_id});
+        }
+        participant->mark_ready();
+      }
     } else {
       descriptor.source_space_id = source_metadata.source_space_id;
       descriptor.page_size = source_metadata.page_size;
@@ -2499,7 +3052,10 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
 
     if (first_image_for_space) {
       const Preserved_trx_carrier_status image_seal_status =
-          carrier.seal_warm_image(warmcopy_id, token, entry.image);
+          adopted_phase1_sidecar
+              ? carrier.seal_prevalidated_warm_image(image_warmcopy_id, token,
+                                                     entry.image)
+              : carrier.seal_warm_image(image_warmcopy_id, token, entry.image);
       if (image_seal_status != Preserved_trx_carrier_status::OK) {
         participant->mark_degraded("temp-table image sidecar seal failed");
         cleanup_sidecars();
@@ -2507,13 +3063,26 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
       }
       sealed_image_source_space_ids.push_back(source_metadata.source_space_id);
 
-      if (!undo_payload.empty()) {
+      if (adopted_phase1_sidecar && adopted_undo.source_space_id != 0) {
+        const Preserved_trx_carrier_status undo_seal_status =
+            carrier.seal_warm_undo(image_warmcopy_id, token, adopted_undo);
+        if (undo_seal_status != Preserved_trx_carrier_status::OK) {
+          participant->mark_degraded("temp-table undo sidecar seal failed");
+          cleanup_sidecars();
+          return map_temp_carrier_status(undo_seal_status);
+        }
+        sealed_undo_source_space_ids.push_back(
+            source_metadata.source_space_id);
+        (void)preserve_trx_temp_table_append_ownership_claims_from_descriptor(
+            token, adopted_undo, descriptor, &manifest);
+        manifest.undo_images.push_back(std::move(adopted_undo));
+      } else if (!undo_payload.empty()) {
         Preserved_temp_table_undo_descriptor undo =
             undo_descriptor_from_image_descriptor(token, descriptor,
                                                   undo_payload);
         const Preserved_trx_carrier_status undo_write_status =
             carrier.write_warm_undo(
-                warmcopy_id, source_metadata.source_space_id,
+                image_warmcopy_id, source_metadata.source_space_id,
                 reinterpret_cast<const unsigned char *>(undo_payload.data()),
                 undo_payload.length());
         if (undo_write_status != Preserved_trx_carrier_status::OK) {
@@ -2522,10 +3091,10 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
           return map_temp_carrier_status(undo_write_status);
         }
         staged_undo_source_space_ids.push_back(
-            source_metadata.source_space_id);
+            {image_warmcopy_id, source_metadata.source_space_id});
 
         const Preserved_trx_carrier_status undo_seal_status =
-            carrier.seal_warm_undo(warmcopy_id, token, undo);
+            carrier.seal_warm_undo(image_warmcopy_id, token, undo);
         if (undo_seal_status != Preserved_trx_carrier_status::OK) {
           participant->mark_degraded("temp-table undo sidecar seal failed");
           cleanup_sidecars();

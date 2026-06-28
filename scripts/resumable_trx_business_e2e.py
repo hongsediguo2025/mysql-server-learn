@@ -513,17 +513,32 @@ WHERE n < {row_count}
 """.strip()
         ]
 
-    def temp_deleted_prefill_ids(self, tx_id: int, completed_stmt_no: int) -> List[int]:
+    def temp_deleted_prefill_ids(
+        self,
+        tx_id: int,
+        completed_stmt_no: int,
+        include_prior_transactions: bool = True,
+    ) -> List[int]:
         row_count = self.temp_table_fill_row_count()
         if row_count <= 0:
             return []
         deleted = set()
-        for stmt_no in range(max(0, completed_stmt_no) + 1):
-            if stmt_no % 20 != 3:
-                continue
-            delete_id = (tx_id - 1) * 100 + stmt_no
-            delete_id = (delete_id % row_count) + 1
-            deleted.add(delete_id)
+
+        def record_deletes_for_transaction(tx: int, max_stmt_no: int) -> None:
+            if tx <= 0 or max_stmt_no < 0:
+                return
+            for stmt_no in range(max_stmt_no + 1):
+                if stmt_no % 20 != 3:
+                    continue
+                delete_id = (tx - 1) * 100 + stmt_no
+                delete_id = (delete_id % row_count) + 1
+                deleted.add(delete_id)
+
+        if include_prior_transactions:
+            last_full_stmt = self.config.statements_per_tx - 1
+            for prior_tx in range(1, max(1, tx_id)):
+                record_deletes_for_transaction(prior_tx, last_full_stmt)
+        record_deletes_for_transaction(tx_id, completed_stmt_no)
         return sorted(deleted)
 
     def temp_prefill_fingerprint_after_resume(
@@ -547,17 +562,25 @@ WHERE n < {row_count}
         )
 
     def temp_prefill_fingerprint_after_rollback(
-        self, sid: int = 0
+        self, sid: int = 0, tx_id: int = 1
     ) -> Tuple[int, int, int, int, int, int]:
         row_count = self.temp_table_fill_row_count()
         if row_count <= 0:
             return (0, 0, 0, 0, 0, 0)
-        digest_hi, digest_lo = self._temp_prefill_payload_digest_xor([], sid)
+        deleted = self.temp_deleted_prefill_ids(
+            tx_id, -1, include_prior_transactions=True
+        )
+        remaining = row_count - len(deleted)
+        full_sum_id = row_count * (row_count + 1) // 2
+        full_sum_v = row_count * (row_count - 1) // 2
+        digest_hi, digest_lo = self._temp_prefill_payload_digest_xor(
+            deleted, sid
+        )
         return (
-            row_count,
-            row_count * (row_count + 1) // 2,
-            row_count * (row_count - 1) // 2,
-            row_count * self.temp_table_fill_chunk_bytes(),
+            remaining,
+            full_sum_id - sum(deleted),
+            full_sum_v - sum(row_id - 1 for row_id in deleted),
+            remaining * self.temp_table_fill_chunk_bytes(),
             digest_hi,
             digest_lo,
         )
@@ -1941,16 +1964,19 @@ def _apply_expected_statement(
                 payload_len=payload_len,
             )
     elif op_case == 6:
+        counter_value = stmt_no
+        if table == peer and (sid, base_k) in rows[table]:
+            counter_value = rows[table][(sid, base_k)].counter
         _replace_expected_existing(
             rows,
             table,
             sid,
             base_k,
             v=value,
-            counter=stmt_no,
+            counter=counter_value,
             **payload_changes,
         )
-        if (sid, base_k) in rows[peer]:
+        if table != peer and (sid, base_k) in rows[peer]:
             _replace_expected_existing(
                 rows,
                 peer,
@@ -2723,7 +2749,9 @@ class BusinessWorker(threading.Thread):
             f"FROM `{table}` WHERE tx_id = 0",
             fetch=True,
         )
-        expected = self.plan.temp_prefill_fingerprint_after_rollback(self.sid)
+        expected = self.plan.temp_prefill_fingerprint_after_rollback(
+            self.sid, tx_id
+        )
         actual = tuple(int(value or 0) for value in prefill_rows[0])
         if actual != expected:
             raise AssertionError(

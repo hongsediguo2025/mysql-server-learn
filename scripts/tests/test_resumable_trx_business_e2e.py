@@ -1688,6 +1688,49 @@ class WorkloadPlanTest(unittest.TestCase):
         )
         self.assertIn("WHERE n < 3200", plan.temp_table_prefill_sql(7)[0])
 
+    def test_large_temp_prefill_fingerprint_accumulates_prior_committed_deletes(self):
+        cfg = HarnessConfig(
+            statements_per_tx=20,
+            temp_table_workload=True,
+            temp_table_target_mb=8,
+            temp_table_fill_chunk_kb=256,
+        )
+        plan = WorkloadPlan(cfg)
+
+        expected_deleted = {4, 8, 12, 16, 20, 24, 28, 32}
+        self.assertEqual(
+            sorted(expected_deleted),
+            plan.temp_deleted_prefill_ids(tx_id=17, completed_stmt_no=12),
+        )
+        self.assertEqual(
+            (
+                24,
+                384,
+                360,
+                24 * plan.temp_table_fill_chunk_bytes(),
+            ),
+            plan.temp_prefill_fingerprint_after_resume(
+                tx_id=17, completed_stmt_no=12, sid=1
+            )[:4],
+        )
+
+    def test_single_table_self_join_update_does_not_change_counter_model(self):
+        cfg = HarnessConfig(
+            sessions=1,
+            table_count=1,
+            statements_per_tx=20,
+            temp_table_workload=True,
+            temp_table_target_mb=8,
+            temp_table_fill_chunk_kb=256,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+        state = ExpectedDatabaseState(plan)
+
+        state.record_committed_transaction(1, 1, 20)
+        fingerprint = state.table_fingerprints()[plan.table_names()[0]]
+
+        self.assertEqual(76, fingerprint.sum_counter)
+
     def test_temp_table_workload_is_isolated_by_default(self):
         cfg = HarnessConfig()
         plan = WorkloadPlan(cfg)

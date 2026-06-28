@@ -1064,6 +1064,74 @@ TEST(TempResumeMaterializerContractTest,
 }
 
 TEST(TempResumeMaterializerContractTest,
+     NativeSlotAdoptionClaimsFsegOwnershipBeforePublishingProof) {
+  const std::string fsp_header = read_source_file_for_temp_table_test(
+      "storage/innobase/include/fsp0fsp.h");
+  const std::string fsp_impl =
+      read_source_file_for_temp_table_test("storage/innobase/fsp/fsp0fsp.cc");
+  const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+  ASSERT_FALSE(fsp_header.empty());
+  ASSERT_FALSE(fsp_impl.empty());
+  ASSERT_FALSE(temp_preserve_impl.empty());
+
+  EXPECT_NE(std::string::npos,
+            fsp_header.find("fseg_create_at_reserved_page_for_temp_preserve("))
+      << "native-owned no-redo undo adoption must be able to create the live "
+         "undo file segment on the preserved undo header page instead of only "
+         "copying bytes into a free page";
+  EXPECT_NE(std::string::npos,
+            fsp_header.find("fseg_alloc_reserved_page_for_temp_preserve("))
+      << "multi-page preserved no-redo undo needs an exact-page allocator path "
+         "so every restored UNDO_LOG page belongs to the live undo file segment";
+  EXPECT_NE(std::string::npos,
+            fsp_impl.find("const page_no_t free_hint ="))
+      << "when a preserved page lives in a still-free extent, the temporary "
+         "tablespace allocator must choose the preserved page offset within "
+         "that extent rather than silently allocating bit 0";
+  const std::string exact_claim_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          fsp_impl,
+          "static buf_block_t *fseg_claim_reserved_page_for_temp_preserve(");
+  ASSERT_FALSE(exact_claim_body.empty());
+  EXPECT_EQ(std::string::npos,
+            exact_claim_body.find("fseg_alloc_free_page_low("))
+      << "the ordinary FSEG allocator treats its page argument as a hint; "
+         "preserved no-redo undo must claim the exact page named by the sidecar";
+  EXPECT_NE(std::string::npos,
+            exact_claim_body.find("fsp_alloc_from_free_frag("))
+      << "exact claim should mark the selected XDES bit used directly";
+  EXPECT_NE(std::string::npos,
+            exact_claim_body.find("fseg_set_nth_frag_page_no("))
+      << "exact claim should publish the selected page as a fragment page of "
+         "the rebuilt undo file segment";
+
+  const std::string adopt_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_"
+          "native_resume(");
+  ASSERT_FALSE(adopt_body.empty());
+
+  const size_t ownership_adoption = adopt_body.find(
+      "trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership(");
+  const size_t write_slot = adopt_body.find("write_adopted_anchor_slot(");
+  const size_t publish_proof =
+      adopt_body.find("no_redo_undo_native_slots_adopted = true");
+  ASSERT_NE(std::string::npos, ownership_adoption)
+      << "slot publication is not enough: trx_undo_seg_free() later relies on "
+         "the live FSEG inode and XDES bits owning the undo header/log pages";
+  ASSERT_NE(std::string::npos, write_slot);
+  ASSERT_NE(std::string::npos, publish_proof);
+  EXPECT_LT(ownership_adoption, write_slot)
+      << "the live rollback-segment header must not reference preserved undo "
+         "pages until their file-segment ownership has been rebuilt";
+  EXPECT_LT(ownership_adoption, publish_proof)
+      << "no_redo_undo_native_slots_adopted is a cleanup-safety proof, so it "
+         "must be published only after exact FSEG/XDES ownership is established";
+}
+
+TEST(TempResumeMaterializerContractTest,
      NativeOwnedReconnectPreparesUndoForPostResumeDml) {
   const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
       "storage/innobase/trx/trx0temp_preserve.cc");
@@ -1140,17 +1208,17 @@ TEST(TempResumeMaterializerContractTest,
       normalize_whitespace_for_temp_table_test(adopt_body);
 
   const size_t materialize_pages = normalized_adopt_body.find(
-      "trx_preserve_temp_space_image_materialize_no_redo_undo_pages("
-      "*descriptor, rseg)");
+      "trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership(");
   const size_t publish_slot =
       normalized_adopt_body.find("write_adopted_anchor_slot(rseg_header");
   ASSERT_NE(std::string::npos, materialize_pages)
-      << "native adoption must restore token-owned undo pages before the live "
-         "rseg header points at them";
+      << "native adoption must claim exact FSEG ownership and restore "
+         "token-owned undo pages before the live rseg header points at them";
   ASSERT_NE(std::string::npos, publish_slot);
   EXPECT_LT(materialize_pages, publish_slot)
       << "the live rseg header must not reference a preserved undo page until "
-         "that page has been materialized into the temporary tablespace";
+         "that page has been materialized and made native-owned in the "
+         "temporary tablespace";
 
   const std::string reconnect_body =
       extract_function_body_after_signature_for_temp_table_test(
@@ -1698,6 +1766,272 @@ TEST(TempLivePreserveManifestContractTest,
 }
 
 TEST(TempLivePreserveManifestContractTest,
+     Phase1PrebuildsAndPhase2AdoptsTempSidecars) {
+  const std::string sql_header = read_source_file_for_temp_table_test(
+      "sql/preserve_trx_temp_table.h");
+  const std::string sql_impl = read_source_file_for_temp_table_test(
+      "sql/preserve_trx_temp_table.cc");
+  const std::string preserve_impl =
+      read_source_file_for_temp_table_test("sql/preserve_trx.cc");
+
+  ASSERT_FALSE(sql_header.empty());
+  ASSERT_FALSE(sql_impl.empty());
+  ASSERT_FALSE(preserve_impl.empty());
+
+  EXPECT_TRUE(source_contains_exact_signature_for_temp_table_test(
+      sql_header,
+      "bool preserve_trx_temp_table_prebuild_phase1_sidecars("));
+  EXPECT_TRUE(source_contains_exact_signature_for_temp_table_test(
+      sql_impl,
+      "bool preserve_trx_temp_table_prebuild_phase1_sidecars("));
+  EXPECT_TRUE(source_contains_exact_signature_for_temp_table_test(
+      sql_impl,
+      "bool preserve_trx_temp_table_adopt_phase1_sidecar("));
+
+  const std::string participant_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          preserve_impl, "bool begin_capture_for_targets(");
+  ASSERT_FALSE(participant_body.empty());
+  EXPECT_NE(std::string::npos,
+            participant_body.find(
+                "preserve_trx_temp_table_prebuild_phase1_sidecars("))
+      << "phase 1 must move the O(temp image size) sidecar build out of the "
+         "user-blocking snapshot write window when the target can be safely "
+         "sampled";
+
+  const std::string builder_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          sql_impl,
+          "Preserve_snapshot_status "
+          "preserve_trx_temp_table_build_preserve_manifest(");
+  ASSERT_FALSE(builder_body.empty());
+  const size_t adopt_call =
+      builder_body.find("preserve_trx_temp_table_adopt_phase1_sidecar(");
+  const size_t fallback_build =
+      builder_body.find("preserve_trx_temp_table_build_baseline_image(");
+  ASSERT_NE(std::string::npos, adopt_call);
+  ASSERT_NE(std::string::npos, fallback_build);
+  EXPECT_LT(adopt_call, fallback_build)
+      << "phase 2 must first adopt a prebuilt phase-1 sidecar and use the "
+         "full baseline copy only as the correctness fallback";
+}
+
+TEST(TempLivePreserveManifestContractTest,
+     LatePhase1PrebuildRunsBeforeBlockingDrainBoundary) {
+  const std::string preserve_impl =
+      read_source_file_for_temp_table_test("sql/preserve_trx.cc");
+  ASSERT_FALSE(preserve_impl.empty());
+
+  const std::string participant_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          preserve_impl, "bool prepare_late_phase1_idle_targets()");
+  ASSERT_FALSE(participant_body.empty())
+      << "temp-table warmcopy needs a late phase-1 idle sweep so active "
+         "statements that reached an idle transaction boundary before "
+         "WARMCOPY_CLOSING can prebuild their physical sidecars outside the "
+         "blocked phase";
+  EXPECT_NE(std::string::npos,
+            participant_body.find(
+                "begin_capture_for_targets(idle_targets.targets(), true)"))
+      << "the late sweep must request the prebuild path, not only open the "
+         "capture epoch";
+
+  const size_t late_prepare = preserve_impl.find(
+      "temp_table_participant->prepare_late_phase1_idle_targets()");
+  const size_t closing_transition = preserve_impl.find(
+      "draining.transition_to(Preserve_trx_manager_state::WARMCOPY_CLOSING)");
+  ASSERT_NE(std::string::npos, late_prepare);
+  ASSERT_NE(std::string::npos, closing_transition);
+  EXPECT_LT(late_prepare, closing_transition)
+      << "late temp-table prebuild must finish before command admission enters "
+         "the user-visible blocking state";
+}
+
+TEST(TempLivePreserveManifestContractTest,
+     Phase1PrebuildSealsStableImageBeforePhase2TailSeal) {
+  const std::string sql_header = read_source_file_for_temp_table_test(
+      "sql/preserve_trx_temp_table.h");
+  const std::string sql_impl = read_source_file_for_temp_table_test(
+      "sql/preserve_trx_temp_table.cc");
+
+  ASSERT_FALSE(sql_header.empty());
+  ASSERT_FALSE(sql_impl.empty());
+
+  const size_t sidecar_struct = sql_header.find("struct Prebuilt_sidecar");
+  ASSERT_NE(std::string::npos, sidecar_struct);
+  const size_t sidecar_struct_end =
+      sql_header.find("explicit Temp_table_warmcopy_participant",
+                      sidecar_struct);
+  ASSERT_NE(std::string::npos, sidecar_struct_end);
+  const std::string sidecar_body =
+      sql_header.substr(sidecar_struct, sidecar_struct_end - sidecar_struct);
+  EXPECT_NE(std::string::npos,
+            sidecar_body.find(
+                "std::unique_ptr<Preserved_temp_table_image_writer>"))
+      << "phase 1 uses the streaming writer while building the warm image, but "
+         "the writer should be closed before the user-blocking phase when the "
+         "observed temp-table history is stable";
+
+  const std::string prebuild_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          sql_impl, "bool preserve_trx_temp_table_prebuild_phase1_sidecars(");
+  ASSERT_FALSE(prebuild_body.empty());
+  EXPECT_EQ(std::string::npos,
+            prebuild_body.find("preserve_trx_temp_table_build_baseline_image("))
+      << "phase 1 prebuild must not call the old full baseline builder because "
+         "that builder finishes and unregisters the dirty stream immediately";
+  EXPECT_NE(std::string::npos,
+            prebuild_body.find("create_warm_image_writer("));
+  EXPECT_NE(std::string::npos,
+            prebuild_body.find(
+                "trx_preserve_temp_space_image_copy_initial_file_pages_to_writer("));
+  EXPECT_NE(std::string::npos,
+            prebuild_body.find(
+                "trx_preserve_temp_space_image_overlay_buffer_pool_pages_to_writer("));
+  const size_t prebuild_finish = prebuild_body.find(
+      "trx_preserve_temp_space_image_finish_streamed_sidecar(");
+  const size_t prebuild_close = prebuild_body.find("sidecar->image_writer->close()");
+  const size_t prebuild_result =
+      prebuild_body.find("sidecar->image_writer->result(");
+  const size_t prebuild_mark = prebuild_body.find(
+      "trx_preserve_temp_space_image_mark_streamed_sidecar_sealed(");
+  const size_t prebuild_remember =
+      prebuild_body.find("participant->remember_prebuilt_sidecar(");
+  ASSERT_NE(std::string::npos, prebuild_finish);
+  ASSERT_NE(std::string::npos, prebuild_close);
+  ASSERT_NE(std::string::npos, prebuild_result);
+  ASSERT_NE(std::string::npos, prebuild_mark);
+  ASSERT_NE(std::string::npos, prebuild_remember);
+  EXPECT_LT(prebuild_finish, prebuild_close);
+  EXPECT_LT(prebuild_close, prebuild_result);
+  EXPECT_LT(prebuild_result, prebuild_mark);
+  EXPECT_LT(prebuild_mark, prebuild_remember)
+      << "phase 1 must compute the image size/digest before the blocked phase; "
+         "phase 2 may still reject the sidecar if later journal entries make it "
+         "stale";
+
+  const std::string builder_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          sql_impl,
+          "Preserve_snapshot_status "
+          "preserve_trx_temp_table_build_preserve_manifest(");
+  ASSERT_FALSE(builder_body.empty());
+  const size_t tail_seal =
+      builder_body.find("preserve_trx_temp_table_seal_phase1_tail_sidecar(");
+  const size_t image_seal = builder_body.find("carrier.seal_warm_image(");
+  const size_t prevalidated_image_seal =
+      builder_body.find("carrier.seal_prevalidated_warm_image(");
+  ASSERT_NE(std::string::npos, tail_seal);
+  ASSERT_NE(std::string::npos, image_seal);
+  ASSERT_NE(std::string::npos, prevalidated_image_seal);
+  EXPECT_LT(tail_seal, image_seal)
+      << "phase 2 must freeze/apply the tail stream before sealing the warm "
+         "sidecar under the final token";
+  EXPECT_LT(tail_seal, prevalidated_image_seal)
+      << "phase 2 may adopt a phase-1 validated image only after the tail "
+         "stream has been proven stable";
+
+  const std::string tail_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          sql_impl, "bool preserve_trx_temp_table_seal_phase1_tail_sidecar(");
+  ASSERT_FALSE(tail_body.empty());
+  const std::string normalized_tail_body =
+      normalize_whitespace_for_temp_table_test(tail_body);
+  EXPECT_NE(std::string::npos,
+            normalized_tail_body.find(
+                "if (sidecar->tail_sealed && sidecar->journal_record_count != "
+                "participant->journal().size())"))
+      << "a phase-1 sealed image becomes stale if the target performs more "
+         "temp-table work before phase 2; in that case phase 2 must discard it "
+         "and use the correctness fallback";
+}
+
+TEST(TempLivePreserveManifestContractTest,
+     Phase1PrebuildCapturesStableNoRedoUndoBeforeTailSeal) {
+  const std::string sql_impl = read_source_file_for_temp_table_test(
+      "sql/preserve_trx_temp_table.cc");
+  ASSERT_FALSE(sql_impl.empty());
+
+  const std::string prebuild_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          sql_impl, "bool preserve_trx_temp_table_prebuild_phase1_sidecars(");
+  ASSERT_FALSE(prebuild_body.empty());
+
+  EXPECT_EQ(std::string::npos, prebuild_body.find("(void)trx;"))
+      << "phase 1 prebuild receives trx so it can move stable no-redo undo "
+         "capture out of the phase-2 blocked window";
+
+  const size_t undo_capture = prebuild_body.find(
+      "trx_preserve_temp_space_image_capture_no_redo_undo_from_trx(");
+  const size_t undo_seal = prebuild_body.find(
+      "trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(");
+  const size_t undo_payload = prebuild_body.find(
+      "trx_preserve_temp_space_image_build_no_redo_undo_sidecar_payload(");
+  const size_t write_warm_undo = prebuild_body.find("carrier.write_warm_undo(");
+  const size_t mark_has_undo = prebuild_body.find("sidecar->has_undo = true");
+  const size_t journal_count =
+      prebuild_body.find("sidecar->journal_record_count = "
+                         "participant->journal().size()");
+  const size_t remember_sidecar =
+      prebuild_body.find("participant->remember_prebuilt_sidecar(");
+  ASSERT_NE(std::string::npos, undo_capture);
+  ASSERT_NE(std::string::npos, undo_seal);
+  ASSERT_NE(std::string::npos, undo_payload);
+  ASSERT_NE(std::string::npos, write_warm_undo);
+  ASSERT_NE(std::string::npos, mark_has_undo);
+  ASSERT_NE(std::string::npos, journal_count);
+  ASSERT_NE(std::string::npos, remember_sidecar);
+  EXPECT_LT(undo_capture, write_warm_undo);
+  EXPECT_LT(write_warm_undo, journal_count);
+  EXPECT_LT(journal_count, remember_sidecar)
+      << "the journal count must describe the exact history covered by both "
+         "the phase-1 image stream and the phase-1 undo sidecar";
+
+  const std::string tail_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          sql_impl, "bool preserve_trx_temp_table_seal_phase1_tail_sidecar(");
+  ASSERT_FALSE(tail_body.empty());
+  const std::string normalized_tail_body =
+      normalize_whitespace_for_temp_table_test(tail_body);
+  EXPECT_NE(std::string::npos,
+            normalized_tail_body.find("sidecar->has_undo && "
+                                      "sidecar->journal_record_count == "
+                                      "participant->journal().size()"))
+      << "phase 2 must not rebuild a no-redo undo sidecar that phase 1 already "
+         "captured after the last temp-DML journal record";
+  const size_t reuse_marker = tail_body.find("undo_sidecar_current");
+  const size_t tail_capture = tail_body.find(
+      "trx_preserve_temp_space_image_capture_no_redo_undo_from_trx(");
+  ASSERT_NE(std::string::npos, reuse_marker);
+  ASSERT_NE(std::string::npos, tail_capture);
+  EXPECT_LT(reuse_marker, tail_capture)
+      << "the stable-undo reuse check must happen before the phase-2 fallback "
+         "capture path";
+}
+
+TEST(TempLivePreserveManifestContractTest,
+     Phase1PrebuildFailureCleansRememberedSidecars) {
+  const std::string sql_impl = read_source_file_for_temp_table_test(
+      "sql/preserve_trx_temp_table.cc");
+  ASSERT_FALSE(sql_impl.empty());
+
+  const std::string prebuild_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          sql_impl, "bool preserve_trx_temp_table_prebuild_phase1_sidecars(");
+  ASSERT_FALSE(prebuild_body.empty());
+
+  EXPECT_NE(std::string::npos,
+            prebuild_body.find("participant->prebuilt_sidecars()"))
+      << "a later phase-1 prebuild failure must also visit sidecars already "
+         "remembered for this target, not only the sidecar currently being "
+         "constructed";
+  EXPECT_NE(std::string::npos,
+            prebuild_body.find("participant->clear_prebuilt_sidecars()"))
+      << "a failed phase-1 prebuild must leave no open writer or dirty stream "
+         "behind for a later fallback or retry";
+}
+
+TEST(TempLivePreserveManifestContractTest,
      PreserveFailureAfterManifestRemovesSealedSidecarsByToken) {
   const std::string preserve_impl =
       read_source_file_for_temp_table_test("sql/preserve_trx.cc");
@@ -1872,14 +2206,14 @@ TEST(TempLivePreserveManifestContractTest,
   ASSERT_FALSE(builder_body.empty());
 
   EXPECT_NE(std::string::npos,
-            builder_body.find(
-                "std::vector<uint32_t> staged_image_source_space_ids"));
+            builder_body.find("std::vector<Warm_sidecar_ref> "
+                              "staged_image_source_space_ids"));
   EXPECT_NE(std::string::npos,
             builder_body.find(
                 "std::vector<uint32_t> sealed_image_source_space_ids"));
   EXPECT_NE(std::string::npos,
-            builder_body.find(
-                "std::vector<uint32_t> staged_undo_source_space_ids"));
+            builder_body.find("std::vector<Warm_sidecar_ref> "
+                              "staged_undo_source_space_ids"));
   EXPECT_NE(std::string::npos,
             builder_body.find(
                 "std::vector<uint32_t> sealed_undo_source_space_ids"));
@@ -1890,6 +2224,8 @@ TEST(TempLivePreserveManifestContractTest,
   const std::string cleanup_body =
       builder_body.substr(cleanup_pos, cleanup_end - cleanup_pos);
   EXPECT_NE(std::string::npos, cleanup_body.find("remove_warm_image"));
+  EXPECT_NE(std::string::npos, cleanup_body.find("ref.warmcopy_id"));
+  EXPECT_NE(std::string::npos, cleanup_body.find("ref.source_space_id"));
   EXPECT_NE(std::string::npos, cleanup_body.find("remove_sealed_image"));
   EXPECT_NE(std::string::npos, cleanup_body.find("remove_warm_undo"));
   EXPECT_NE(std::string::npos, cleanup_body.find("remove_sealed_undo"));
@@ -1922,6 +2258,23 @@ TEST(TempLivePreserveManifestContractTest,
   ASSERT_FALSE(image_seal_body.empty());
   EXPECT_NE(std::string::npos,
             image_seal_body.find(
+                "fsync_directory_after_install(m_dir, sealed_path)"));
+
+  const std::string prevalidated_image_seal_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          carrier_impl,
+          "Local_file_preserved_temp_table_image_carrier::"
+          "seal_prevalidated_warm_image(");
+  ASSERT_FALSE(prevalidated_image_seal_body.empty());
+  EXPECT_EQ(std::string::npos,
+            prevalidated_image_seal_body.find("validate_file_digest("))
+      << "phase-1 prebuild already computed the image digest; the user-blocking "
+         "phase may stat and atomically install the warm file, but must not "
+         "re-read the whole image";
+  EXPECT_NE(std::string::npos,
+            prevalidated_image_seal_body.find("stat_area.st_size"));
+  EXPECT_NE(std::string::npos,
+            prevalidated_image_seal_body.find(
                 "fsync_directory_after_install(m_dir, sealed_path)"));
 
   const std::string undo_seal_body =

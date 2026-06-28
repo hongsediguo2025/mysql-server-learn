@@ -1760,7 +1760,13 @@ static MY_ATTRIBUTE((warn_unused_result)) buf_block_t *fsp_alloc_free_page(
       xdes_set_state(descr, XDES_FREE_FRAG, mtr);
       flst_add_last(header + FSP_FREE_FRAG, descr + XDES_FLST_NODE, mtr);
 
-      free = xdes_find_free_bit_for_temp_preserve(space, descr, 0, false, mtr);
+      const page_no_t descr_start = xdes_get_offset(descr);
+      const page_no_t free_hint =
+          descr_start <= hint && hint < descr_start + FSP_EXTENT_SIZE
+              ? hint % FSP_EXTENT_SIZE
+              : 0;
+      free = xdes_find_free_bit_for_temp_preserve(space, descr, free_hint,
+                                                  false, mtr);
 
       if (free == FIL_NULL) {
         descr = nullptr;
@@ -2467,6 +2473,155 @@ funct_exit:
 
   return block;
 }
+
+#ifndef UNIV_HOTBACKUP
+/** Claim one exact page that was reserved for preserved temporary-table resume.
+The caller must already have created or located the file segment inode. The
+reservation is released only while the tablespace latch is held, immediately
+before the ordinary FSEG allocator consumes the same page. */
+static buf_block_t *fseg_claim_reserved_page_for_temp_preserve(
+    fil_space_t *space, const page_size_t &page_size, fseg_inode_t *inode,
+    page_no_t page_no, rw_lock_type_t rw_latch, mtr_t *mtr) {
+  ut_ad(space != nullptr);
+  ut_ad(inode != nullptr);
+  ut_ad(mtr != nullptr);
+  ut_ad(fsp_is_system_temporary(space->id));
+  ut_ad(mach_read_from_4(inode + FSEG_MAGIC_N) == FSEG_MAGIC_N_VALUE);
+
+  if (!trx_preserve_temp_space_image_page_reserved(
+          static_cast<uint32_t>(space->id), static_cast<uint32_t>(page_no))) {
+    return nullptr;
+  }
+
+  mtr_x_lock_space(space, mtr);
+
+  fsp_header_t *header = fsp_get_space_header(space->id, page_size, mtr);
+  xdes_t *descr = xdes_get_descriptor(space->id, page_no, page_size, mtr);
+  if (descr == nullptr ||
+      !xdes_mtr_get_bit(descr, XDES_FREE_BIT, page_no % FSP_EXTENT_SIZE, mtr)) {
+    return nullptr;
+  }
+
+  const xdes_state_t state = xdes_get_state(descr, mtr);
+  if (state != XDES_FREE && state != XDES_FREE_FRAG) {
+    return nullptr;
+  }
+
+  const ulint frag_slot = fseg_find_free_frag_page_slot(inode, mtr);
+  if (frag_slot == ULINT_UNDEFINED) {
+    return nullptr;
+  }
+
+  trx_preserve_temp_space_image_release_page_reservation(
+      static_cast<uint32_t>(space->id), static_cast<uint32_t>(page_no));
+
+  /*
+    The ordinary segment allocator treats its page argument as a hint, not a
+    contract. Native no-redo undo adoption is stricter: the undo header and log
+    page numbers are already serialized in the sidecar, so the rebuilt FSEG
+    must own those exact pages before the rseg slot is published.
+  */
+  if (state == XDES_FREE) {
+    flst_remove(header + FSP_FREE, descr + XDES_FLST_NODE, mtr);
+    ut_a(space->free_len > 0);
+    --space->free_len;
+    xdes_set_state(descr, XDES_FREE_FRAG, mtr);
+    flst_add_last(header + FSP_FREE_FRAG, descr + XDES_FLST_NODE, mtr);
+  }
+
+  fsp_alloc_from_free_frag(header, descr, page_no % FSP_EXTENT_SIZE, mtr);
+  fseg_set_nth_frag_page_no(inode, frag_slot, page_no, mtr);
+
+  return fsp_page_create(page_id_t(space->id, page_no), page_size, rw_latch, mtr,
+                         mtr);
+}
+
+buf_block_t *fseg_create_at_reserved_page_for_temp_preserve(
+    space_id_t space_id, page_no_t page_no, ulint byte_offset, mtr_t *mtr) {
+  if (!fsp_is_system_temporary(space_id) || page_no == FIL_NULL ||
+      byte_offset + FSEG_HEADER_SIZE > UNIV_PAGE_SIZE - FIL_PAGE_DATA_END ||
+      mtr == nullptr) {
+    return nullptr;
+  }
+
+  fil_space_t *space = fil_space_get(space_id);
+  if (space == nullptr) return nullptr;
+
+  mtr_x_lock_space(space, mtr);
+
+  const page_size_t page_size(space->flags);
+  ulint n_reserved = 0;
+  if (!fsp_reserve_free_extents(&n_reserved, space_id, 2, FSP_NORMAL, mtr)) {
+    return nullptr;
+  }
+
+  fsp_header_t *space_header = fsp_get_space_header(space_id, page_size, mtr);
+  fseg_inode_t *inode = fsp_alloc_seg_inode(space_header, mtr);
+  if (inode == nullptr) {
+    fil_space_release_free_extents(space_id, n_reserved);
+    return nullptr;
+  }
+
+  const ib_id_t seg_id = mach_read_from_8(space_header + FSP_SEG_ID);
+  mlog_write_ull(space_header + FSP_SEG_ID, seg_id + 1, mtr);
+  mlog_write_ull(inode + FSEG_ID, seg_id, mtr);
+  {
+    File_segment_inode fseg_inode(space_id, page_size, inode, mtr);
+    fseg_inode.write_not_full_n_used(0);
+  }
+  flst_init(inode + FSEG_FREE, mtr);
+  flst_init(inode + FSEG_NOT_FULL, mtr);
+  flst_init(inode + FSEG_FULL, mtr);
+  mlog_write_ulint(inode + FSEG_MAGIC_N, FSEG_MAGIC_N_VALUE, MLOG_4BYTES, mtr);
+  for (ulint i = 0; i < FSEG_FRAG_ARR_N_SLOTS; ++i) {
+    fseg_set_nth_frag_page_no(inode, i, FIL_NULL, mtr);
+  }
+
+  buf_block_t *block = fseg_claim_reserved_page_for_temp_preserve(
+      space, page_size, inode, page_no, RW_X_LATCH, mtr);
+  if (block == nullptr) {
+    fsp_free_seg_inode(space_id, page_size, inode, mtr);
+    fil_space_release_free_extents(space_id, n_reserved);
+    return nullptr;
+  }
+
+  byte *frame = buf_block_get_frame(block);
+  fseg_header_t *header = frame + byte_offset;
+  mlog_write_ulint(frame + FIL_PAGE_TYPE, FIL_PAGE_TYPE_SYS, MLOG_2BYTES, mtr);
+  mlog_write_ulint(header + FSEG_HDR_OFFSET, page_offset(inode), MLOG_2BYTES,
+                   mtr);
+  mlog_write_ulint(header + FSEG_HDR_PAGE_NO, page_get_page_no(page_align(inode)),
+                   MLOG_4BYTES, mtr);
+  mlog_write_ulint(header + FSEG_HDR_SPACE, space_id, MLOG_4BYTES, mtr);
+
+  fil_space_release_free_extents(space_id, n_reserved);
+  return block;
+}
+
+buf_block_t *fseg_alloc_reserved_page_for_temp_preserve(
+    fseg_header_t *seg_header, page_no_t page_no, mtr_t *mtr) {
+  if (seg_header == nullptr || page_no == FIL_NULL || mtr == nullptr) {
+    return nullptr;
+  }
+
+  const space_id_t space_id = page_get_space_id(page_align(seg_header));
+  if (!fsp_is_system_temporary(space_id)) return nullptr;
+
+  fil_space_t *space = fil_space_get(space_id);
+  if (space == nullptr) return nullptr;
+
+  mtr_x_lock_space(space, mtr);
+
+  const page_size_t page_size(space->flags);
+  buf_block_t *inode_block = nullptr;
+  fseg_inode_t *inode =
+      fseg_inode_get(seg_header, space_id, page_size, mtr, &inode_block);
+  fil_block_check_type(inode_block, FIL_PAGE_INODE, mtr);
+
+  return fseg_claim_reserved_page_for_temp_preserve(space, page_size, inode,
+                                                    page_no, RW_X_LATCH, mtr);
+}
+#endif /* !UNIV_HOTBACKUP */
 
 /** Creates a new segment.
  @return the block where the segment header is placed, x-latched, NULL

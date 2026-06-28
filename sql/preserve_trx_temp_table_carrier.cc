@@ -1494,6 +1494,45 @@ Local_file_preserved_temp_table_image_carrier::seal_warm_image(
 }
 
 Preserved_trx_carrier_status
+Local_file_preserved_temp_table_image_carrier::seal_prevalidated_warm_image(
+    const std::string &warmcopy_id, const std::string &token,
+    const Preserved_temp_table_image_descriptor &descriptor) {
+  if (!token_is_filename_safe(warmcopy_id) || !token_is_filename_safe(token) ||
+      !descriptor_is_valid(descriptor) ||
+      descriptor.blob_name !=
+          sealed_image_filename(token, descriptor.source_space_id)) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+
+  const std::string warm_path = join_path(
+      m_dir, warm_image_filename(warmcopy_id, descriptor.source_space_id));
+  const std::string sealed_path = join_path(
+      m_dir, sealed_image_filename(token, descriptor.source_space_id));
+  if (file_exists(sealed_path))
+    return Preserved_trx_carrier_status::ALREADY_EXISTS;
+
+  /*
+    The phase-1 builder already closed the writer and computed descriptor.sha256
+    over the warm file. Re-reading a large image here would put O(image size)
+    work back into the phase-2 blocked window. Seal only after verifying the
+    same warm file still exists with the expected size; resume/open paths still
+    validate the descriptor digest before consuming the sealed body.
+  */
+  MY_STAT stat_area;
+  if (!file_exists(warm_path, &stat_area))
+    return Preserved_trx_carrier_status::NOT_FOUND;
+  if (stat_area.st_size < 0 ||
+      static_cast<uint64_t>(stat_area.st_size) != descriptor.size) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+
+  const Preserved_trx_carrier_status status =
+      install_temp_file(warm_path, sealed_path);
+  if (status != Preserved_trx_carrier_status::OK) return status;
+  return fsync_directory_after_install(m_dir, sealed_path);
+}
+
+Preserved_trx_carrier_status
 Local_file_preserved_temp_table_image_carrier::seal_warm_undo(
     const std::string &warmcopy_id, const std::string &token,
     const Preserved_temp_table_undo_descriptor &descriptor) {
