@@ -407,18 +407,23 @@ bool trx_preserve_temp_space_image_should_disable_undo_cache(
     uint32_t rseg_space_id);
 
 /*
-  Startup page reservations are a native-adoption primitive. They describe
-  preserved no-redo pages and expose a fast query/skip API, but Task 2 does not
-  wire this into FSP/fseg page allocation; allocator enforcement belongs to the
-  later native-adoption allocator slice. The no-redo undo slot reservation below
-  is already connected to temporary undo slot selection.
+  Startup page reservations protect preserved no-redo undo pages while a token
+  waits for RESUME. The FSP/fseg allocator consults the fast query below for
+  system temporary tablespaces, so ordinary temporary-table activity cannot
+  reuse a page that still belongs to a preserved transaction. The query returns
+  immediately when no preserved page reservation is active.
 */
 bool trx_preserve_temp_space_image_reserve_page(
     uint32_t space_id, uint32_t page_no,
     const trx_preserve_temp_reservation_owner &owner);
 
+bool trx_preserve_temp_space_image_has_page_reservations();
+
 bool trx_preserve_temp_space_image_page_reserved(uint32_t space_id,
                                                  uint32_t page_no);
+
+void trx_preserve_temp_space_image_release_page_reservation(uint32_t space_id,
+                                                            uint32_t page_no);
 
 size_t trx_preserve_temp_space_image_release_page_reservations_for_owner(
     const trx_preserve_temp_reservation_owner &owner);

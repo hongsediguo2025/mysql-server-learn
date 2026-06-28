@@ -412,6 +412,19 @@ static ulint trx_undo_find_free_non_reserved_slot(
   return ULINT_UNDEFINED;
 }
 
+static void trx_undo_temp_preserve_release_slot_if_reserved(
+    const trx_rseg_t *rseg, ulint slot_no) {
+  if (rseg == nullptr || slot_no >= TRX_RSEG_N_SLOTS ||
+      !fsp_is_system_temporary(rseg->space_id)) {
+    return;
+  }
+
+  trx_preserve_temp_space_image_release_no_redo_undo_slot(
+      static_cast<uint32_t>(rseg->space_id),
+      static_cast<uint32_t>(rseg->page_no),
+      static_cast<uint32_t>(rseg->id), static_cast<uint32_t>(slot_no));
+}
+
 /** Creates a new undo log segment in file.
  @return DB_SUCCESS if page creation OK possible error codes are:
  DB_TOO_MANY_CONCURRENT_TRXS DB_OUT_OF_FILE_SPACE */
@@ -1963,15 +1976,14 @@ void trx_undo_update_cleanup(trx_t *trx, trx_undo_ptr_t *undo_ptr,
   if (trx_undo_preserve_magic_no_redo_should_skip_cache(undo)) {
     UT_LIST_REMOVE(rseg->update_undo_list, undo);
     undo_ptr->update_undo = nullptr;
-    trx_preserve_temp_space_image_release_no_redo_undo_slot(
-        static_cast<uint32_t>(rseg->space_id), static_cast<uint32_t>(rseg->page_no),
-        static_cast<uint32_t>(rseg->id), static_cast<uint32_t>(undo->id));
+    trx_undo_temp_preserve_release_slot_if_reserved(rseg, undo->id);
     trx_undo_mem_free(undo);
     return;
   }
 
   trx_purge_add_update_undo_to_history(
       trx, undo_ptr, undo_page, update_rseg_history_len, n_added_logs, mtr);
+  trx_undo_temp_preserve_release_slot_if_reserved(rseg, undo->id);
 
   UT_LIST_REMOVE(rseg->update_undo_list, undo);
 
@@ -2010,12 +2022,11 @@ void trx_undo_insert_cleanup(trx_undo_ptr_t *undo_ptr, bool noredo) {
   undo_ptr->insert_undo = nullptr;
 
   if (trx_undo_preserve_magic_no_redo_should_skip_cache(undo)) {
-    trx_preserve_temp_space_image_release_no_redo_undo_slot(
-        static_cast<uint32_t>(rseg->space_id), static_cast<uint32_t>(rseg->page_no),
-        static_cast<uint32_t>(rseg->id), static_cast<uint32_t>(undo->id));
+    trx_undo_temp_preserve_release_slot_if_reserved(rseg, undo->id);
     trx_undo_mem_free(undo);
   } else if (undo->state == TRX_UNDO_CACHED) {
     UT_LIST_ADD_FIRST(rseg->insert_undo_cached, undo);
+    trx_undo_temp_preserve_release_slot_if_reserved(rseg, undo->id);
 
     MONITOR_INC(MONITOR_NUM_UNDO_SLOT_CACHED);
   } else {
@@ -2026,6 +2037,7 @@ void trx_undo_insert_cleanup(trx_undo_ptr_t *undo_ptr, bool noredo) {
     rseg->unlatch();
 
     trx_undo_seg_free(undo, noredo);
+    trx_undo_temp_preserve_release_slot_if_reserved(rseg, undo->id);
 
     rseg->latch();
 

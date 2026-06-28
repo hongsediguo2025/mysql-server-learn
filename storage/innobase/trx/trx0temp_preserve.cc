@@ -766,7 +766,6 @@ trx_rseg_t *trx_preserve_temp_space_image_find_no_redo_rseg(
       trx_sys->tmp_rsegs.at(descriptor.no_redo_undo_rseg_slot);
   if (rseg == nullptr ||
       rseg->space_id != descriptor.no_redo_undo_rseg_space_id ||
-      rseg->page_no != descriptor.no_redo_undo_rseg_page_no ||
       rseg->id != descriptor.no_redo_undo_rseg_slot ||
       !fsp_is_system_temporary(rseg->space_id)) {
     return nullptr;
@@ -2978,10 +2977,14 @@ bool trx_preserve_temp_space_image_reserve_page(
   return trx_preserve_temp_space_image_reserve_page_locked(key, owner, nullptr);
 }
 
+bool trx_preserve_temp_space_image_has_page_reservations() {
+  return trx_preserve_temp_active_page_reservations.load(
+             std::memory_order_acquire) != 0;
+}
+
 bool trx_preserve_temp_space_image_page_reserved(uint32_t space_id,
                                                  uint32_t page_no) {
-  if (trx_preserve_temp_active_page_reservations.load(
-          std::memory_order_acquire) == 0) {
+  if (!trx_preserve_temp_space_image_has_page_reservations()) {
     return false;
   }
   if (!trx_preserve_temp_space_image_page_reservation_key_valid(space_id,
@@ -2997,6 +3000,26 @@ bool trx_preserve_temp_space_image_page_reserved(uint32_t space_id,
       trx_preserve_temp_space_image_page_reservation_key(space_id, page_no);
   return trx_preserve_temp_reserved_pages.find(key) !=
          trx_preserve_temp_reserved_pages.end();
+}
+
+void trx_preserve_temp_space_image_release_page_reservation(uint32_t space_id,
+                                                            uint32_t page_no) {
+  if (trx_preserve_temp_active_page_reservations.load(
+          std::memory_order_acquire) == 0) {
+    return;
+  }
+  if (!trx_preserve_temp_space_image_page_reservation_key_valid(space_id,
+                                                               page_no)) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> guard{
+      trx_preserve_temp_no_redo_undo_reservations_mutex};
+  const trx_preserve_temp_page_reservation_key key =
+      trx_preserve_temp_space_image_page_reservation_key(space_id, page_no);
+  if (trx_preserve_temp_reserved_pages.erase(key) != 0) {
+    trx_preserve_temp_active_page_reservations_sub();
+  }
 }
 
 size_t trx_preserve_temp_space_image_release_page_reservations_for_owner(
@@ -3256,8 +3279,15 @@ bool trx_rseg_preserve_bootstrap_tmp_rsegs(
       unresolved = true;
       continue;
     }
+    /*
+      The temporary tablespace is recreated at startup, so ordinary rseg
+      bootstrap may place the same logical rseg slot on a different header
+      page. Preserve keeps the slot identity stable and protects the captured
+      no-redo undo pages with page reservations; resume-time adoption binds
+      slot reservations to the live rseg header page before making the trx
+      executable again.
+    */
     if (rseg->space_id != requirement.identity.rseg_space_id ||
-        rseg->page_no != requirement.identity.rseg_page_no ||
         rseg->id != requirement.identity.rseg_slot) {
       mismatch = true;
       break;
@@ -5037,13 +5067,13 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume
                            mtr);
   };
   auto reserve_anchor_slot =
-      [descriptor](
+      [descriptor, rseg](
           const trx_preserve_temp_no_redo_undo_log_anchor &anchor) -> bool {
     if (!anchor.present) return true;
     return trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
         descriptor->source_space_id, descriptor->no_redo_undo_rseg_space_id,
-        descriptor->no_redo_undo_rseg_page_no, descriptor->no_redo_undo_rseg_slot,
-        anchor.undo_slot);
+        static_cast<uint32_t>(rseg->page_no),
+        descriptor->no_redo_undo_rseg_slot, anchor.undo_slot);
   };
 
   dberr_t err = DB_SUCCESS;
@@ -5180,7 +5210,7 @@ dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
       reservation_failed =
           !trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
               descriptor->source_space_id, descriptor->no_redo_undo_rseg_space_id,
-              descriptor->no_redo_undo_rseg_page_no,
+              static_cast<uint32_t>(rseg->page_no),
               descriptor->no_redo_undo_rseg_slot,
               descriptor->no_redo_insert_undo.undo_slot);
     }
@@ -5188,7 +5218,7 @@ dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
       reservation_failed =
           !trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
               descriptor->source_space_id, descriptor->no_redo_undo_rseg_space_id,
-              descriptor->no_redo_undo_rseg_page_no,
+              static_cast<uint32_t>(rseg->page_no),
               descriptor->no_redo_undo_rseg_slot,
               descriptor->no_redo_update_undo.undo_slot);
     }

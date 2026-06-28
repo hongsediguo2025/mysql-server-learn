@@ -204,6 +204,9 @@ PRESERVE_INNODB_INTEGRATION_POINTS = {
     "storage/innobase/fil/fil0fil.cc": (
         "temporary tablespace preserve adapter only"
     ),
+    "storage/innobase/fsp/fsp0fsp.cc": (
+        "system temporary tablespace preserve page-reservation adapter only"
+    ),
     "storage/innobase/handler/ha_innodb.h": (
         "InnoDB handler preserve declarations only"
     ),
