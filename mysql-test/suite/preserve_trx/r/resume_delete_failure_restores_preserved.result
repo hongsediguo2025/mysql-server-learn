@@ -17,6 +17,7 @@ FROM performance_schema.preserved_transactions;
 remaining_preserved
 0
 COMMIT;
+# restart: --preserve-trx-enable=ON --skip-log-bin
 SELECT * FROM t_resume_delete_failure ORDER BY a;
 a	b
 1	11

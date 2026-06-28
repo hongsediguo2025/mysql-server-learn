@@ -4,7 +4,7 @@
 
 CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to fsync preserved transaction directory after unlink");
 CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files");
-CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted by innodb_force_recovery");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted");
 CALL mtr.add_suppression("Preserved transaction batch cleanup failed after debug injected target error");
 
 --disable_warnings

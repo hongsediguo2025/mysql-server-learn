@@ -10,6 +10,7 @@ SET GLOBAL preserve_trx_enable=ON;
 
 --disable_query_log
 CALL mtr.add_suppression("Preserved transaction .* snapshot cleanup failed after resume; transaction remains attached");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted");
 --enable_query_log
 
 CREATE TABLE t_resume_delete_failure(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
@@ -61,6 +62,26 @@ EOF
 --let _TAINTED_FILE=
 
 COMMIT;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON --skip-log-bin
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
+--let _ERROR_LOG= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--perl
+use strict;
+use warnings;
+my $path = $ENV{'_ERROR_LOG'} or die "missing error log path";
+open(my $fh, '<', $path) or die "cannot open error log $path: $!";
+my $content = do { local $/; <$fh> };
+close($fh);
+die "expected resume cleanup taint reason in recovery log"
+  unless $content =~ /recovery forced rollback: .*resume_cleanup_failure/;
+EOF
+--let _ERROR_LOG=
+
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
 SELECT * FROM t_resume_delete_failure ORDER BY a;
 
 DROP TABLE t_resume_delete_failure;

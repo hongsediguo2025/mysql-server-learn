@@ -9,7 +9,7 @@ DROP TABLE IF EXISTS t_batch_force_recovery;
 CALL mtr.add_suppression("Skip updating information_schema metadata in InnoDB read-only mode");
 CALL mtr.add_suppression("Skip re-populating collations and character sets tables in InnoDB read-only mode");
 CALL mtr.add_suppression("PRESERVE: preserved transaction recovery is not supported while innodb_force_recovery is enabled; snapshot and binlog-cache files are retained and marked tainted");
-CALL mtr.add_suppression("Preserved transaction '.*' recovery forced rollback: preserved transaction snapshot tainted by innodb_force_recovery");
+CALL mtr.add_suppression("Preserved transaction '.*' recovery forced rollback: preserved transaction snapshot tainted");
 --enable_query_log
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`

@@ -1272,6 +1272,36 @@ bool token_is_filename_safe(const std::string &token) {
   });
 }
 
+std::string preserved_trx_tainted_reason(const std::string &dir,
+                                         const std::string &token) {
+  constexpr size_t kMaxTaintedReasonBytes = 256;
+  const std::string fallback("preserved transaction snapshot tainted");
+  if (!token_is_filename_safe(token)) return fallback;
+
+  const std::string path = normalize_dir(dir) + token + ".tainted";
+  File file = my_open(path.c_str(), O_RDONLY | O_NOFOLLOW, MYF(0));
+  if (file < 0) return fallback;
+
+  unsigned char buffer[kMaxTaintedReasonBytes + 1]{};
+  const size_t read_len =
+      my_read(file, buffer, kMaxTaintedReasonBytes, MYF(0));
+  const bool close_failed = my_close(file, MYF(0)) != 0;
+  if (read_len == MY_FILE_ERROR || close_failed) return fallback;
+
+  std::string reason(reinterpret_cast<char *>(buffer), read_len);
+  while (!reason.empty() &&
+         (reason.back() == '\n' || reason.back() == '\r' ||
+          reason.back() == '\0')) {
+    reason.pop_back();
+  }
+  for (char &ch : reason) {
+    const unsigned char value = static_cast<unsigned char>(ch);
+    if (value < 0x20 || value > 0x7e) ch = '_';
+  }
+  if (reason.empty()) return fallback;
+  return fallback + ": " + reason;
+}
+
 bool preserve_trx_token_to_xid(const std::string &token, XID *xid) {
   if (xid == nullptr || !token_is_filename_safe(token) ||
       token.length() >
@@ -8530,8 +8560,7 @@ bool preserved_trx_recover_all() {
         cleanup_metadata = &cleanup_bundle.metadata;
       }
       if (rollback_preserved_snapshot_or_log(
-              dir, token,
-              "preserved transaction snapshot tainted by innodb_force_recovery",
+              dir, token, preserved_trx_tainted_reason(dir, token),
               cleanup_metadata, Temp_sidecar_cleanup_mode::RAW_UNLINK))
         error = true;
       continue;

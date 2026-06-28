@@ -1,7 +1,7 @@
 DROP TABLE IF EXISTS t_batch_log_bin_cleanup;
 CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files before reattach");
 CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files");
-CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted by innodb_force_recovery");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted");
 CALL mtr.add_suppression("Preserved transaction batch cleanup failed after target preserve error");
 SET GLOBAL preserve_trx_enable=ON;
 CREATE TABLE t_batch_log_bin_cleanup(
