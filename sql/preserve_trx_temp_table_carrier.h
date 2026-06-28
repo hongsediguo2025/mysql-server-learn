@@ -77,9 +77,9 @@ struct Preserved_temp_table_undo_descriptor {
   /*
     Optional no-redo undo sidecar for temp-DML. It is keyed by the same source
     space id as the image and by the no-redo rollback segment identity captured
-    during preserve. The descriptor format is present for capture/audit, but
-    current SQL resume support rejects transactions that require replaying
-    no-redo temp undo.
+    during preserve. Newer manifests pair it with ownership claims so SQL resume
+    can reconnect those pages as native temporary undo. Older descriptors remain
+    readable for compatibility but do not by themselves prove native adoption.
   */
   uint32_t source_space_id{0};
   std::string blob_name;

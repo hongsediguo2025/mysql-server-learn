@@ -394,9 +394,9 @@ struct Preserve_trx_temp_table_materialize_plan {
   bool requires_no_redo_undo_sidecars{false};
   /*
     True only when the manifest carries ownership evidence for native no-redo
-    undo adoption. Restored-only sidecars remain claimable for COMMIT/ROLLBACK
-    compatibility, but they must keep post-resume temp DML rejected until native
-    adoption is actually implemented and applied.
+    undo adoption. Legacy/restored-only sidecars remain claimable for older
+    token compatibility, but only native-capable manifests may reconnect no-redo
+    undo as allocator-owned state and allow post-resume temporary-table DML.
   */
   bool native_adoption_capable{false};
   bool scans_sql_rows{false};
