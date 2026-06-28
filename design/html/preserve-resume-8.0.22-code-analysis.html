@@ -247,7 +247,7 @@
       <rect x="330" y="346" width="430" height="38" class="box red"/><text x="354" y="370" class="txt">unsupported shape, corrupt payload, budget exceed, or identity mismatch must fail closed</text>
     </svg>
   </div>
-  <p>临时表路径是最容易误判的部分。<code>sql/preserve_trx_temp_table.cc</code> 负责 SQL 层 manifest、resume policy、open/materialize；<code>storage/innobase/trx/trx0temp_preserve.cc</code> 处理 physical image、dict table register/unregister、fil space attach/detach、no-redo undo reconnect。当前代码明确把不支持的 no-redo undo resume 形态按 fail closed 处理，不应在文档或运维说明里描述成完全通用的临时表事务迁移。</p>
+  <p>临时表路径是最容易误判的部分。<code>sql/preserve_trx_temp_table.cc</code> 负责 SQL 层 manifest、resume policy、open/materialize；<code>storage/innobase/trx/trx0temp_preserve.cc</code> 处理 physical image、dict table register/unregister、fil space attach/detach、no-redo undo reconnect 和 native-owned adoption。native-adopted token 可以在 resume 后继续执行受支持的临时表 DML；旧 manifest、restored-only reconnect 或无法证明 ownership 的 no-redo undo resume 形态必须按 fail closed 处理，不应在文档或运维说明里描述成完全通用的临时表事务迁移。</p>
 
   <h2>9. Resume、startup recovery 与 expired-token cleanup</h2>
   <p>Resume 从 token 读取 snapshot，校验 identity、权限、状态和 payload，然后重建 THD/session 状态并 attach InnoDB trx。startup recovery 的目标不是自动继续业务，而是把磁盘 snapshot 转回可观测 record，使 operator 或后续编排能处理 token。expired-token cleanup 需要区分普通过期、已准备但 snapshot 不明确、cleanup 失败后仍需保留 ownership 的场景。</p>

@@ -21,7 +21,9 @@ Preserve/Resume 的目标是在受控停机、重启或维护窗口中，把一�
 的显式事务转换成可恢复的 durable token。服务端重启后，客户端可以用该
 token 把事务恢复到新的连接上。普通 preserved transaction 可以继续执行
 SQL，然后由用户 `COMMIT` 或 `ROLLBACK`；带用户临时表 no-redo undo sidecar
-的事务第一版只允许恢复后继续 `COMMIT` 或 `ROLLBACK`。
+且已经进入 native-adopted 状态的事务，也可以在 resume 后继续执行受支持的
+用户临时表 DML。旧 manifest 或 restored-only 路径仍只能完成读、`COMMIT`
+或 `ROLLBACK`，不能继续写临时表。
 
 它不是普通 XA 的用户接口包装，也不是自动提交机制。它保留的是一个仍处于
 事务语义中的未提交事务，包括 InnoDB prepared transaction、可恢复的锁/读
@@ -617,8 +619,10 @@ no-cache binlog state 还要求当前 GTID state clean：`GTID_NEXT` 必须是
   clone、column/index metadata 是否可支持；任一项不可导出都会 fail closed。
 - 单个 temp image/undo sidecar 受 `preserve_trx_max_temp_sidecar_bytes` 限制。
 - 已存在用户 InnoDB 临时表的事务型 DML 可以通过 physical image、dirty page
-  overlay 和 no-redo undo sidecar 保持事务语义；resume 后继续 `COMMIT` 或
-  `ROLLBACK` 时，临时表和持久表的可见性应与未 preserve 的事务一致。
+  overlay、no-redo undo sidecar 和 ownership manifest 保持事务语义；native-
+  adopted token 在 resume 后可以继续执行受支持的临时表 `INSERT/UPDATE/DELETE`
+  并最终 `COMMIT` 或 `ROLLBACK`。旧 manifest 或 restored-only token 仍按保护
+  路径拒绝继续写临时表。
 - 用户临时表 DDL/元数据变更仍不支持：`CREATE/DROP/TRUNCATE/ALTER/RENAME
   TEMPORARY TABLE`、无法完整捕获的 savepoint/statement rollback 交叠、缺失或
   损坏的 no-redo undo sidecar，都会在 preserve 或 resume 阶段 fail closed。

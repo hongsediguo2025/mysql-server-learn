@@ -128,7 +128,7 @@
     <thead><tr><th>术语</th><th>含义</th></tr></thead>
     <tbody>
       <tr><td>preserve</td><td>把一个未提交显式事务转换为 durable token 和 snapshot，使它可以跨重启恢复。</td></tr>
-      <tr><td>resume</td><td>用 token 在新连接中重新绑定 preserved transaction，并继续提交、回滚或执行后续 SQL；带用户临时表 no-redo undo sidecar 的事务恢复后仅允许完成 COMMIT/ROLLBACK。</td></tr>
+      <tr><td>resume</td><td>用 token 在新连接中重新绑定 preserved transaction，并继续提交、回滚或执行后续 SQL；带用户临时表 no-redo undo sidecar 且已经 native-adopted 的事务，恢复后也可以继续执行受支持的用户临时表 DML。旧 manifest 或 restored-only 路径仍只能读、COMMIT 或 ROLLBACK。</td></tr>
       <tr><td>drain</td><td>停机前收敛实例中的目标事务，批量执行 preserve。</td></tr>
       <tr><td>snapshot</td><td>durable metadata 文件，记录 token、账号、binlog、锁、read view、savepoint、临时表 manifest 等恢复所需语义。</td></tr>
       <tr><td>sidecar</td><td>大对象外置文件，例如 binlog cache、用户临时表 image、no-redo undo、warm external blob。</td></tr>
@@ -347,7 +347,7 @@
       <tr><td>MDL</td><td>导出 transaction-duration MDL descriptors，resume 前做权限复检。</td><td>不支持 session/global 状态 preserve；LOCK TABLES、GET_LOCK、global read lock、backup lock 不纳入当前 v1。</td></tr>
       <tr><td>read view</td><td>导出/导入 InnoDB MVCC read view。</td><td>需要确保 purge/read view 状态可恢复，失败则拒绝或保留 token。</td></tr>
       <tr><td>savepoint</td><td>保存 SQL savepoint 与 InnoDB savepoint payload。</td><td>ROLLBACK TO SAVEPOINT 会影响锁和 MDL ordinal，warmcopy 目标需要 fence。</td></tr>
-      <tr><td>用户临时表</td><td>支持受约束的 InnoDB 用户临时表 image、DD/dict binding、fil space adoption 和 no-redo undo sidecar reconnect。</td><td>缺失/损坏 sidecar、DDL/metadata/savepoint/statement rollback 边界、恢复后继续写临时表等不支持形态必须拒绝。</td></tr>
+      <tr><td>用户临时表</td><td>支持受约束的 InnoDB 用户临时表 image、DD/dict binding、fil space adoption、no-redo undo sidecar reconnect 和 native-owned undo adoption。</td><td>native-adopted 路径允许恢复后继续受支持的临时表 DML；旧 manifest/restored-only、缺失/损坏 sidecar、DDL/metadata/savepoint/statement rollback 边界仍必须拒绝。</td></tr>
     </tbody>
   </table>
 

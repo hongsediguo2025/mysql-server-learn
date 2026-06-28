@@ -79,7 +79,7 @@
   </ol>
 
   <h2 id="quick">1. 快速理解</h2>
-  <p>Preserve/Resume 允许把未提交的显式事务保存为 token，重启后用 token 恢复到新连接。保存的是事务语义，不是自动提交结果；普通 token 可以继续执行 SQL 后再 <code>COMMIT</code> 或 <code>ROLLBACK</code>，带用户临时表 no-redo undo sidecar 的 token 第一版只允许恢复后继续 <code>COMMIT</code> 或 <code>ROLLBACK</code>。</p>
+  <p>Preserve/Resume 允许把未提交的显式事务保存为 token，重启后用 token 恢复到新连接。保存的是事务语义，不是自动提交结果；普通 token 可以继续执行 SQL 后再 <code>COMMIT</code> 或 <code>ROLLBACK</code>。带用户临时表 no-redo undo sidecar 且已经进入 native-adopted 状态的 token，也可以在 resume 后继续执行受支持的用户临时表 DML；旧 manifest 或 restored-only 路径仍只能完成读、<code>COMMIT</code> 或 <code>ROLLBACK</code>，不能继续写临时表。</p>
   <div class="diagram" aria-label="快速流程">
     <svg viewBox="0 0 1000 300" role="img">
       <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
@@ -261,7 +261,7 @@ DR&#65;IN TRANSACTIONS PRESERVE WITH TIMEOUT 1800;</code></pre>
   <p>锁预算首先受 <code>preserve_trx_max_lock_count</code> 控制。这里的锁包括 record locks、table locks、predicate locks、AUTO_INC locks 和 materialized implicit locks；read view、savepoint、MDL 也会进入恢复语义校验。当前 full 1s 目标要求大锁对象尽量在 phase 1 mirror 和 external artifact 中处理；如果 phase 2 仍重扫、排序、编码大量锁，就只能保证功能正确，不能宣称 1s SLO。</p>
 
   <h3>5.5 用户临时表</h3>
-  <p><code>preserve_trx_temp_table_enable=ON</code> 时支持受约束的用户 InnoDB temporary table。已存在临时表的事务型 DML 通过 physical image、dirty page overlay、dict binding 和 no-redo undo sidecar 保持语义；resume 后继续 <code>COMMIT</code> 或 <code>ROLLBACK</code> 时，临时表和持久表的可见性应与未 preserve 的事务一致。用户临时表 DDL/元数据变更、缺失或损坏的 sidecar/undo 信息仍 fail closed。若该变量在 resume 前被关闭，普通 token 不受影响，但带 temp manifest 的 token 不会被消费，会返回可重试的 unsupported 状态，恢复时需重新打开该子功能。</p>
+  <p><code>preserve_trx_temp_table_enable=ON</code> 时支持受约束的用户 InnoDB temporary table。已存在临时表的事务型 DML 通过 physical image、dirty page overlay、dict binding、no-redo undo sidecar 和 ownership manifest 保持语义；native-adopted token 在 resume 后可以继续执行受支持的临时表 <code>INSERT/UPDATE/DELETE</code>，再 <code>COMMIT</code> 或 <code>ROLLBACK</code>。旧 manifest 或 restored-only token 仍按保护路径拒绝继续写临时表。用户临时表 DDL/元数据变更、缺失或损坏的 sidecar/undo 信息仍 fail closed。若该变量在 resume 前被关闭，普通 token 不受影响，但带 temp manifest 的 token 不会被消费，会返回可重试的 unsupported 状态，恢复时需重新打开该子功能。</p>
 
   <h2 id="trouble">6. 排障与限制</h2>
   <div class="diagram" aria-label="排障决策树">
