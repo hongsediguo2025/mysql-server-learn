@@ -3593,6 +3593,23 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertEqual(cfg.temp_table_target_mb, 200)
         self.assertEqual(cfg.temp_table_fill_chunk_kb, 64)
 
+    def test_cli_temp_table_resume_action_help_mentions_continue(self):
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit) as cm:
+            parse_args(["--help"])
+
+        self.assertEqual(cm.exception.code, 0)
+        help_text = stdout.getvalue()
+        normalized_help = " ".join(help_text.split())
+        self.assertIn("{commit,rollback,continue}", help_text)
+        self.assertIn(
+            "continue keeps the resumed transaction open", normalized_help
+        )
+        self.assertNotIn(
+            "commit and rollback are the supported v1 paths", help_text
+        )
+
     def test_cli_deterministic_e2e_bounds_are_applied(self):
         cfg = parse_args(
             [
