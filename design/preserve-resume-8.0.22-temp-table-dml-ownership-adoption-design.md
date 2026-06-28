@@ -75,13 +75,13 @@ Preserve/Resume 的目标是在受控停机或主备切换过程中，把仍未�
 
 ### 2.5 当前实现与目标版本边界
 
-本文档描述的是用户临时表 DML Preserve/Resume 的目标实现和当前分支实现之间的对照。当前 HEAD 已经具备 phase 1 sidecar prebuild、ownership claim 编解码、page/slot reservation registry、exact FSEG claim、native-owned no-redo undo reconnect、post-resume temp DML 正向路径和 20 sessions x 200MiB E2E 证据；尚未完全闭环的是独立 durable activation ledger/tombstone、startup 前置 reservation 对所有 crash 窗口的覆盖，以及更细粒度的长期异常/资源趋势报告。
+本文档描述的是用户临时表 DML Preserve/Resume 的目标实现和当前分支实现之间的对照。当前 HEAD 已经具备 phase 1 sidecar prebuild、ownership claim 编解码、startup page/slot reservation registry、exact FSEG claim、native-owned no-redo undo reconnect、post-resume temp DML 正向路径和 20 sessions x 200MiB E2E 证据；尚未完全闭环的是独立 durable activation ledger/tombstone、activation 后 cleanup/crash 窗口的最终状态机，以及更细粒度的长期异常/资源趋势报告。
 
 | 能力 | 当前实现边界 | 目标版本行为 | 发布门禁 |
 |---|---|---|---|
 | 已存在用户 InnoDB 临时表 DML preserve | phase 1 prebuild + phase 2 adopt 主路径已落地，unsupported/stale 时 fail closed 或 fallback | phase 1 捕获页镜像和 no-redo undo ownership，phase 2 尾部封口后可 preserve | 正向 commit/rollback MTR 与 E2E 通过 |
 | resume 后继续写临时表 | native-capable manifest 允许继续 DML；legacy/restored-only 路径仍必须拒绝继续写临时表 | no-redo undo 进入 native-adopted 状态后允许继续 DML | post-resume write/rollback/commit 覆盖 |
-| no-redo undo ownership | 当前已具备 no-redo undo slot reservation、page reservation、exact FSEG claim、sidecar reconnect 与 native adoption 主路径，后续仍需扩展 crash/cleanup gate | startup 预留 undo slot，resume 精确 adopt page/fseg/rseg/undo-slot | slot/page 冲突和 crash fault injection 覆盖 |
+| no-redo undo ownership | 当前已具备 startup page/slot reservation、no-redo undo slot reservation、exact FSEG claim、sidecar reconnect 与 native adoption 主路径，后续仍需扩展 activation 后 crash/cleanup gate | startup 从 durable manifest 预留 page/undo slot，resume 精确 adopt page/fseg/rseg/undo-slot | startup 顺序、slot/page 冲突和 crash fault injection 覆盖 |
 | phase 1 ownership manifest | 当前 manifest 已包含 ownership claims 并以缺失 ownership claim 区分 legacy/restored-only | page/fseg/slot/segment 的可验证 ownership manifest | manifest GUnit、旧格式兼容测试 |
 | phase 2 约 1s 目标 | phase 1 prebuild 已把 image/undo 大对象工作移出 phase 2；仍需确保所有 fallback/SLO reason 语义准确 | phase 1 完成 baseline、dirty overlay、undo sidecar、checksum/fsync；phase 2 只做 tail seal；1s 左右为目标，2s 为可接受上界 | phase2 breakdown 与 20x200MiB NFR |
 | 临时表 DDL/savepoint/statement rollback | 当前主要覆盖成功 DDL/部分边界，attempt 级 DDL、savepoint-before-temp-DML、pre-engine in-flight marker 仍是目标缺口 | capture epoch 内任何相关不确定语义触发 unsupported marker | source-shape lint 与负向 MTR |
@@ -484,7 +484,7 @@ registry 按 `{space_id, page_no}` 与 `{rseg_space_id,rseg_page_no,rseg_id,undo
 
 active-count 必须按 page reservation 与 undo-slot reservation 分开维护。普通 page allocator 只需要读取 page-reservation active count；no-redo undo slot create/reuse 只需要读取 slot-reservation active count。两个 active count 都为 0 时，即使 `preserve_trx_temp_table_enable` 编译存在，普通 MySQL 临时表路径也不能进入 reservation mutex/map。这是 `preserve_trx_enable=OFF` 和无 preserved token 场景下的低侵入边界。
 
-当前实现更接近“按 preserved temp space / reconnect-time undo slot 做保护”，还不是完整 page-level registry。目标实现必须在 startup 阶段从 durable manifest 建立 page 与 undo slot 两个维度的 reservation；只在 resume/reconnect 时临时检查 slot 不足以防止普通 allocator 在 resume 前复用 preserved pages。
+当前实现已经在 `preserved_temp_images_bootstrap_preamble()` 中读取 durable snapshot 引用的 final manifest，并在普通 temp rollback segment 初始化前注册 page reservation、no-redo undo slot reservation 和 temp rseg bootstrap identity。`trx_preserve_temp_space_image_page_reserved()` 与 `trx_preserve_temp_space_image_no_redo_undo_slot_reserved()` 都有 active-count 快速路径；active count 为 0 时普通 allocator 不进入 reservation mutex/map。继续需要保持的约束是：任何新增 allocator 分支都必须查询相同 registry，且 startup 失败、manifest 冲突或 sidecar 损坏必须 fail closed/taint，不能绕过 reservation 后继续启动成可误用状态。
 
 startup reservation 的顺序是硬约束：
 
@@ -1183,7 +1183,7 @@ release gate 只能使用第二类 adoption-enabled 正向用例。第一类 rej
 
 ## 17. 实施顺序
 
-截至当前 HEAD，Slice 1/2/3/5/6/7 的主路径已经落地并有 GUnit、MTR、E2E 证据；Slice 4 的 page/slot registry 和 resume-time reservation 主路径已落地，但 startup 阶段从 durable snapshot 预装所有 reservation 的 crash 窗口还需要继续收敛；Slice 8 中 cleanup taint 和 retry cleanup 已有现有机制覆盖，独立 activation ledger/tombstone 仍是发布前需要明确取舍或补齐的缺口。本节保留为开发路线图，阅读时应按“已落地主路径 + 剩余上线门禁”理解，而不是从零开始的计划。
+截至当前 HEAD，Slice 1/2/3/4/5/6/7 的主路径已经落地并有 GUnit、MTR、E2E 证据：startup preamble 会在普通 temp rseg 调整前解析 durable manifest、读取 sealed no-redo undo sidecar、注册 page/slot reservation，并把 rseg bootstrap identity 交给 InnoDB。Slice 8 中 cleanup taint 和 retry cleanup 已有现有机制覆盖，独立 activation ledger/tombstone 仍是发布前需要明确取舍或补齐的缺口。本节保留为开发路线图，阅读时应按“已落地主路径 + 剩余上线门禁”理解，而不是从零开始的计划。
 
 ### Slice 1：测试与 guard 先行
 
