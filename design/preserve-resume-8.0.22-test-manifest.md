@@ -27,6 +27,60 @@ real topology checks were added upstream.  The 8.0.22 port now also carries:
 
 ## Current Gate Evidence
 
+### Exact-Current Native Temp-Table DML Adoption Gate: 2026-06-28
+
+This checkpoint was collected on branch
+`codex/user-temp-table-phase1-drain-resume` at commit
+`aa8f5fbc57b9024029f4c393843070ec17d9cb07`. It covers the native
+temporary-table DML adoption follow-up after the no-redo undo ownership,
+startup reservation, cleanup, and resume-after-DML changes were committed and
+pushed to both `xmm` and `mxx`.
+
+- Python unit and source lint:
+  `python3 -m unittest scripts.tests.test_preserve_trx_lint_runner
+  scripts.tests.test_preserve_trx_mtr_accelerator
+  scripts.tests.test_resumable_trx_business_e2e` ran 205 tests and passed.
+  The embedded source lint runner passed 26 rules with zero findings.
+- Debug build and temp-table GUnit:
+  `cmake --build build-debug --target mysqld preserve_trx_temp_table-t -j 8`
+  completed, and `build-debug/runtime_output_directory/preserve_trx_temp_table-t`
+  passed 302 tests.
+- Accelerated debug behavior MTR, default-ON normal-binlog:
+  `/tmp/preserve-mtr-shards/codex-full-normal-20260628180000/summary.txt`,
+  copied to
+  `/tmp/preserve-temp-native-current-20260628/full-normal-summary.txt`,
+  reported `status: pass`, 23 behavior shards, source lint status 0, and all
+  shard status files 0.
+- Accelerated debug behavior MTR, `--skip-log-bin`:
+  `/tmp/preserve-mtr-shards/codex-full-skipbin-20260628182000/summary.txt`,
+  copied to
+  `/tmp/preserve-temp-native-current-20260628/full-skipbin-summary.txt`,
+  reported `status: pass`, 23 behavior shards, source lint status 0, and all
+  shard status files 0.
+- Release build and release temp-table GUnit:
+  `cmake --build build-release --target mysqld preserve_trx_temp_table-t -j 8`
+  completed with `EXIT_STATUS=0`; evidence is
+  `/tmp/preserve-temp-native-current-20260628/release-build.log`.
+  `build-release/runtime_output_directory/preserve_trx_temp_table-t` ran 302
+  tests with 294 passed and 8 expected release-only skips for debug/fault
+  injection cases; evidence is
+  `/tmp/preserve-temp-native-current-20260628/release-gunit-temp-table.log`.
+- Live temp-table DML E2E, normal binlog:
+  `scripts/resumable_trx_business_e2e.py` ran 20 sessions with
+  `--temp-table-workload`, `--temp-table-target-mb 200`, and
+  `--temp-table-resume-action continue`. All 20 preserved transactions resumed
+  at `completed_stmt=79`, then continued inside the resumed transaction and
+  finished with `completed_tx_min=1` and `completed_stmt_total=2000`. Evidence:
+  `/tmp/preserve-temp-native-current-20260628/temp20-200mb-logbin-e2e.log`;
+  original run root recorded in
+  `/tmp/preserve-temp-native-current-20260628/temp20-200mb-logbin-root.txt`.
+- Live temp-table DML E2E, `--skip-log-bin`:
+  the same 20-session, 200MiB-per-temporary-table workload completed with all
+  20 tokens resumed and `completed_stmt_total=2000`. Evidence:
+  `/tmp/preserve-temp-native-current-20260628/temp20-200mb-nobin-e2e.log`;
+  original run root recorded in
+  `/tmp/preserve-temp-native-current-20260628/temp20-200mb-nobin-root.txt`.
+
 ### Temp-Table Phase-1 DML Follow-Up Targeted Gate: 2026-06-28
 
 The `codex/user-temp-table-phase1-drain-resume` follow-up fixed no-redo undo
