@@ -11000,6 +11000,21 @@ bool Preserve_trx_drain_service::execute(
             phase2_metrics.savepoint_live_export_target_count;
       }
     }
+    if (phase2_metrics.snapshot_write_temp_manifest_us != 0) {
+      phase2_slo_guaranteed = 0;
+      if (phase2_slo_reason.empty() ||
+          phase2_slo_reason == "non_record_lock_family_live_export" ||
+          phase2_slo_reason == "savepoint_live_export" ||
+          phase2_slo_reason == "record_payload_materialized_in_phase2") {
+        phase2_slo_reason = "temp_table_manifest_phase2_build";
+      }
+      const uint64_t temp_manifest_slo_target_count =
+          std::max<uint64_t>(uint64_t{1}, phase2_metrics.target_count);
+      if (phase2_slo_not_guaranteed_count <
+          temp_manifest_slo_target_count) {
+        phase2_slo_not_guaranteed_count = temp_manifest_slo_target_count;
+      }
+    }
     std::string message =
         "PRESERVE: warm-copy drain metrics prefix_bytes=" +
         std::to_string(preserve_trx_warmcopy_prefix_bytes_status()) +

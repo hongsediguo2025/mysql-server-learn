@@ -43,6 +43,7 @@ LEGACY_LINT_RULE_IDS: Sequence[str] = (
     "temp_table_ddl_boundary_lint",
     "temp_table_no_redo_baseline_lint",
     "temp_table_phase1_participant_lint",
+    "temp_table_phase2_slo_manifest_lint",
     "temp_table_row_hook_no_payload_lint",
     "test_layering_doc_contract_lint",
     "wide_error_masks_lint",

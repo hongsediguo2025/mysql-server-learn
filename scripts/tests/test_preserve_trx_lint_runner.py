@@ -35,13 +35,15 @@ class PreserveTrxLintRunnerTest(unittest.TestCase):
         return tmp
 
     def test_registers_current_legacy_lint_rules(self):
-        self.assertEqual(23, len(LEGACY_LINT_RULE_IDS))
+        self.assertEqual(24, len(LEGACY_LINT_RULE_IDS))
         self.assertIn("batch_drain_lock_warmcopy_hook_coverage_lint",
                       LEGACY_LINT_RULE_IDS)
         self.assertIn("temp_table_ddl_boundary_lint", LEGACY_LINT_RULE_IDS)
         self.assertIn("temp_table_no_redo_baseline_lint",
                       LEGACY_LINT_RULE_IDS)
         self.assertIn("temp_table_phase1_participant_lint",
+                      LEGACY_LINT_RULE_IDS)
+        self.assertIn("temp_table_phase2_slo_manifest_lint",
                       LEGACY_LINT_RULE_IDS)
         self.assertIn("temp_table_row_hook_no_payload_lint",
                       LEGACY_LINT_RULE_IDS)

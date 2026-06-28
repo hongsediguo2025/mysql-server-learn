@@ -1,0 +1,37 @@
+--echo # Lint-only source-shape guard for temp-table phase-2 SLO reporting.
+--echo # If temp-table image/undo manifest construction still runs inside the
+--echo # phase-2 snapshot-write window, strict phase-2 SLO must be reported as
+--echo # not guaranteed. Functional preserve may still succeed.
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+my $preserve_path = File::Spec->catfile($source_root, 'sql', 'preserve_trx.cc');
+
+open(my $fh, '<', $preserve_path) or die "cannot open $preserve_path: $!";
+my $preserve = do { local $/; <$fh> };
+close($fh);
+
+die "drain metrics must report temp-table manifest phase-2 build time\n"
+  unless $preserve =~ /phase2_snapshot_write_temp_manifest_us/s;
+
+die "phase-2 temp-table manifest build must make strict SLO not guaranteed\n"
+  unless $preserve =~
+    /if\s*\(\s*phase2_metrics\.snapshot_write_temp_manifest_us\s*!=\s*0\s*\)\s*\{[\s\S]{0,800}phase2_slo_guaranteed\s*=\s*0[\s\S]{0,800}temp_table_manifest_phase2_build/s;
+
+die "temp-table phase-2 SLO reason must not be hidden behind savepoint fallback\n"
+  unless $preserve =~
+    /phase2_slo_reason\s*=\s*"temp_table_manifest_phase2_build"/s;
+
+die "temp-table phase-2 SLO reason must not be hidden behind record payload materialization\n"
+  unless $preserve =~
+    /phase2_slo_reason\s*==\s*"record_payload_materialized_in_phase2"[\s\S]{0,320}phase2_slo_reason\s*=\s*"temp_table_manifest_phase2_build"/s;
+EOF
+
+SELECT 'ok' AS temp_table_phase2_slo_manifest_lint;

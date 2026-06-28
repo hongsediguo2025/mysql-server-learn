@@ -187,6 +187,7 @@ class HarnessConfig:
     lock_warmcopy_mode: str = "default"
     two_phase: bool = False
     max_phase2_pause_ms: int = 5000
+    max_phase2_total_ms: int = 0
     warmcopy_disabled_baseline_slope_ms_per_mb: Optional[float] = None
     temp_table_workload: bool = False
     temp_table_target_mb: int = 0
@@ -342,6 +343,8 @@ class HarnessConfig:
             raise ValueError("lock_warmcopy_mode must be default, on, or off")
         if self.max_phase2_pause_ms <= 0:
             raise ValueError("max_phase2_pause_ms must be positive")
+        if self.max_phase2_total_ms < 0:
+            raise ValueError("max_phase2_total_ms must be non-negative")
         if (
             self.two_phase
             and self.scenario != "warmcopy_two_phase_large_cache_equivalence"
@@ -405,6 +408,9 @@ class Phase2PauseSample:
 class WarmcopyDrainMetrics:
     phase2_pause_ms: float
     full_copy_to_count: Optional[int]
+    phase2_total_ms: Optional[float] = None
+    phase2_slo_guaranteed: Optional[int] = None
+    phase2_slo_reason: Optional[str] = None
 
 
 class WorkloadPlan:
@@ -3697,9 +3703,13 @@ class BusinessE2ERunner:
     def drain_restart_resume(self, cycle: int) -> None:
         if not hasattr(self, "phase2_pause_samples"):
             self.phase2_pause_samples = []
+        phase2_total_gate_required = self.config.max_phase2_total_ms > 0
+        warmcopy_metrics_required = (
+            self.config.warmcopy_required or phase2_total_gate_required
+        )
         warmcopy_error_log_offset = (
             self.warmcopy_error_log_offset()
-            if self.config.warmcopy_required
+            if warmcopy_metrics_required
             else None
         )
         generation = self.coordinator.request_drain_checkpoint()
@@ -3759,15 +3769,19 @@ class BusinessE2ERunner:
             self.runtime.wait_until_down(self.config.shutdown_timeout_s)
             self.restart_server()
             self.runtime.wait_until_up(self.config.startup_timeout_s)
-            if self.config.warmcopy_required:
+            if warmcopy_metrics_required:
                 observed_metrics = self.read_latest_warmcopy_metrics_since(
                     warmcopy_error_log_offset
                 )
                 if observed_metrics is None:
+                    if self.config.warmcopy_required:
+                        raise AssertionError(
+                            "warm-copy phase2_pause_us metric was not found in the server error log"
+                        )
                     raise AssertionError(
-                        "warm-copy phase2_pause_us metric was not found in the server error log"
+                        "warm-copy drain metrics were not found in the server error log"
                     )
-                if self.config.two_phase:
+                if self.config.warmcopy_required and self.config.two_phase:
                     if observed_metrics.full_copy_to_count is None:
                         raise AssertionError(
                             "warm-copy full-copy fallback metric was not found in the server error log"
@@ -3776,6 +3790,19 @@ class BusinessE2ERunner:
                         raise AssertionError(
                             "warm-copy full-copy fallback occurred in a two-phase run: "
                             f"full_copy_to_count={observed_metrics.full_copy_to_count}"
+                        )
+                if phase2_total_gate_required:
+                    if observed_metrics.phase2_total_ms is None:
+                        raise AssertionError(
+                            "warm-copy phase2_total_us metric was not found in the server error log"
+                        )
+                    if observed_metrics.phase2_total_ms > self.config.max_phase2_total_ms:
+                        raise AssertionError(
+                            "phase2_total_ms exceeded: "
+                            f"observed_ms={observed_metrics.phase2_total_ms:.3f} "
+                            f"limit_ms={self.config.max_phase2_total_ms} "
+                            f"slo_guaranteed={observed_metrics.phase2_slo_guaranteed} "
+                            f"reason={observed_metrics.phase2_slo_reason or 'unknown'}"
                         )
                 phase2_pause_ms = observed_metrics.phase2_pause_ms
             self.configure_preserve_globals()
@@ -3974,10 +4001,23 @@ class BusinessE2ERunner:
             r"\bfull_copy_to_count=(\d+)\b",
             metric_line,
         )
+        total_match = re.search(r"\bphase2_total_us=(\d+)\b", metric_line)
+        slo_match = re.search(r"\bphase2_slo_guaranteed=(\d+)\b", metric_line)
+        reason_match = re.search(r"\bphase2_slo_reason=([A-Za-z0-9_]+)\b",
+                                 metric_line)
         return WarmcopyDrainMetrics(
             phase2_pause_ms=int(pause_match.group(1)) / 1000.0,
             full_copy_to_count=(
                 int(full_copy_match.group(1)) if full_copy_match is not None else None
+            ),
+            phase2_total_ms=(
+                int(total_match.group(1)) / 1000.0 if total_match is not None else None
+            ),
+            phase2_slo_guaranteed=(
+                int(slo_match.group(1)) if slo_match is not None else None
+            ),
+            phase2_slo_reason=(
+                reason_match.group(1) if reason_match is not None else None
             ),
         )
 
@@ -5165,6 +5205,7 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--lock-warmcopy-mode", choices=("default", "on", "off"), default="default", help="explicitly set preserve_trx_lock_warmcopy_enable for this run")
     parser.add_argument("--two-phase", action="store_true", help="compatibility flag documenting that the warmcopy_two_phase_large_cache_equivalence scenario must use the two-phase warm-copy path")
     parser.add_argument("--max-phase2-pause-ms", type=int, default=5000, help="maximum allowed median warm-copy binlog-cache phase2 pause per large-cache bucket")
+    parser.add_argument("--max-phase2-total-ms", type=int, default=0, help="optional maximum server-side phase2_total_ms per drain cycle; 0 disables this gate")
     parser.add_argument("--warmcopy-disabled-baseline-slope-ms-per-mb", type=float, help="optional warmcopy-disabled pause slope baseline; warm-copy slope may be at most 25%% of it")
     parser.add_argument("--temp-table-workload", action="store_true", help="mix InnoDB user temporary-table operations into each 100-statement transaction; restart command must keep preserve_trx_temp_table_enable available")
     parser.add_argument("--temp-table-target-mb", type=int, default=0, help="pre-fill each user temporary table to this many MiB before the drainable transaction starts")
@@ -5253,6 +5294,7 @@ command is used after each DRAIN command shuts that server down.
         lock_warmcopy_mode=args.lock_warmcopy_mode,
         two_phase=args.two_phase,
         max_phase2_pause_ms=args.max_phase2_pause_ms,
+        max_phase2_total_ms=args.max_phase2_total_ms,
         warmcopy_disabled_baseline_slope_ms_per_mb=args.warmcopy_disabled_baseline_slope_ms_per_mb,
         temp_table_workload=temp_table_workload,
         temp_table_target_mb=args.temp_table_target_mb,

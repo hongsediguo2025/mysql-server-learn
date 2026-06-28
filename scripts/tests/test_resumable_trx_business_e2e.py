@@ -4056,6 +4056,8 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
                 "--warmcopy-required",
                 "--max-phase2-pause-ms",
                 "5000",
+                "--max-phase2-total-ms",
+                "2000",
             ]
         )
 
@@ -4065,6 +4067,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertEqual(cfg.large_binlog_cache_buckets_mb, [64, 512, 2048])
         self.assertTrue(cfg.warmcopy_required)
         self.assertEqual(cfg.max_phase2_pause_ms, 5000)
+        self.assertEqual(cfg.max_phase2_total_ms, 2000)
         self.assertEqual(cfg.warmcopy_disabled_baseline_slope_ms_per_mb, 24.5)
 
     def test_cli_two_phase_flag_enables_full_copy_fallback_check(self):
@@ -4606,6 +4609,31 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
                 333.0,
             )
 
+    def test_warmcopy_error_log_metric_parser_reads_phase2_total(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as error_log:
+            error_log.write("noise before offset\n")
+            error_log.flush()
+            offset = error_log.tell()
+            error_log.write(
+                "PRESERVE: warm-copy drain metrics "
+                "phase2_pause_us=123000 phase2_total_us=2500000 "
+                "phase2_slo_guaranteed=0 "
+                "phase2_slo_reason=temp_table_manifest_phase2_build\n"
+            )
+            error_log.flush()
+            runner.config = HarnessConfig(server_error_log=error_log.name)
+
+            metrics = runner.read_latest_warmcopy_metrics_since(offset)
+
+        self.assertIsNotNone(metrics)
+        self.assertEqual(metrics.phase2_pause_ms, 123.0)
+        self.assertEqual(metrics.phase2_total_ms, 2500.0)
+        self.assertEqual(metrics.phase2_slo_guaranteed, 0)
+        self.assertEqual(
+            metrics.phase2_slo_reason, "temp_table_manifest_phase2_build"
+        )
+
     def test_drain_restart_resume_uses_error_log_phase2_metric(self):
         with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as error_log:
             runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -4639,6 +4667,40 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             self.assertEqual(len(runner.phase2_pause_samples), 1)
             self.assertEqual(runner.phase2_pause_samples[0].bucket_mb, 64)
             self.assertEqual(runner.phase2_pause_samples[0].phase2_pause_ms, 123.456)
+
+    def test_drain_restart_resume_rejects_phase2_total_over_gate(self):
+        with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as error_log:
+            runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+            runner.config = HarnessConfig(
+                sessions=2,
+                strict_token_count=True,
+                lock_warmcopy_mode="on",
+                server_error_log=error_log.name,
+                max_phase2_total_ms=2000,
+            )
+            runner.plan = WorkloadPlan(runner.config)
+            runner.runtime = _ResumeMappingRuntime([(1, 10, 0), (2, 10, 0)])
+            runner.coordinator = _ReadyCoordinator()
+            runner.phase2_pause_samples = []
+            runner.restart_server = lambda: None
+            runner.configure_preserve_globals = lambda: None
+            runner.read_preserved_tokens = lambda: ["tok-a", "tok-b"]
+
+            def write_drain_metric():
+                with open(error_log.name, "a", encoding="utf-8") as writer:
+                    writer.write(
+                        "PRESERVE: warm-copy drain metrics "
+                        "phase2_pause_us=123456 phase2_total_us=2500000 "
+                        "phase2_slo_guaranteed=0 "
+                        "phase2_slo_reason=temp_table_manifest_phase2_build\n"
+                    )
+
+            runner._execute_drain_preserve = write_drain_metric
+
+            with self.assertRaisesRegex(
+                AssertionError, "phase2_total_ms exceeded"
+            ):
+                runner.drain_restart_resume(cycle=1)
 
     def test_drain_restart_resume_two_phase_rejects_full_copy_fallback_metric(self):
         with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as error_log:
