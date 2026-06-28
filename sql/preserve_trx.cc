@@ -8471,7 +8471,8 @@ bool preserved_trx_recover_all() {
                               binlog_cache_tokens.end());
       bool taint_error = false;
       for (const std::string &token : preserved_tokens) {
-        if (store->mark_tainted(token) != Preserve_snapshot_status::OK) {
+        if (store->mark_tainted(token, "innodb_force_recovery") !=
+            Preserve_snapshot_status::OK) {
           taint_error = true;
           LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                  "PRESERVE: failed to mark preserved transaction snapshot "
@@ -11608,6 +11609,25 @@ bool Sql_cmd_resume_preserved_transaction::execute(THD *thd) {
       delete_snapshot_files_with_status(preserve_trx_default_dir(), token,
                                         remove_options);
   if (delete_status != Preserve_snapshot_delete_status::OK) {
+    if (delete_status ==
+        Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE) {
+      /*
+        The transaction is already attached to this THD, so the in-memory
+        preserved record has intentionally been consumed. If the snapshot file
+        may still exist, mark it tainted before returning success so a later
+        startup treats the file as cleanup-only evidence rather than a normal
+        resumable token.
+      */
+      auto store =
+          create_preserved_trx_default_store(preserve_trx_default_dir());
+      if (store->mark_tainted(token, "resume_cleanup_failure") !=
+          Preserve_snapshot_status::OK) {
+        const std::string taint_message =
+            redacted_preserved_trx_log_subject(token) +
+            " failed to mark snapshot tainted after resume cleanup failure";
+        LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG, taint_message.c_str());
+      }
+    }
     const std::string message =
         redacted_preserved_trx_log_subject(token) +
         " snapshot cleanup failed after resume; transaction remains attached";

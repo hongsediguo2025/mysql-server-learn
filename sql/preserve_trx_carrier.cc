@@ -577,9 +577,9 @@ Preserve_snapshot_status Preserved_trx_store::list_tokens(
 }
 
 Preserve_snapshot_status Preserved_trx_store::mark_tainted(
-    const std::string &token) {
+    const std::string &token, const std::string &reason) {
   if (m_carrier == nullptr) return Preserve_snapshot_status::INVALID_ARGUMENT;
-  return map_carrier_status(m_carrier->mark_tainted(token));
+  return map_carrier_status(m_carrier->mark_tainted(token, reason));
 }
 
 Preserve_snapshot_status Preserved_trx_store::remove_taint(

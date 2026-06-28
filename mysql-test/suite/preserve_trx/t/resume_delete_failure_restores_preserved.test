@@ -28,6 +28,7 @@ PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
 --disable_reconnect
 
 --source suite/preserve_trx/include/get_preserved_token.inc
+--let $PRESERVED_TAINTED_FILE= `SELECT CONCAT(@@global.preserve_trx_dir, '$preserved_token', '.tainted')`
 
 SET SESSION debug="+d,preserve_trx_fail_delete_snapshot_files";
 
@@ -44,6 +45,20 @@ SET SESSION debug="-d,preserve_trx_fail_delete_snapshot_files";
 SELECT COUNT(*) AS remaining_preserved
   FROM performance_schema.preserved_transactions;
 --file_exists $PRESERVED_SNAPSHOT_FILE
+--file_exists $PRESERVED_TAINTED_FILE
+
+--let _TAINTED_FILE= $PRESERVED_TAINTED_FILE
+--perl
+use strict;
+use warnings;
+my $path = $ENV{'_TAINTED_FILE'} or die "missing tainted file path";
+open(my $fh, '<', $path) or die "cannot open tainted marker $path: $!";
+my $content = do { local $/; <$fh> };
+close($fh);
+die "unexpected tainted marker reason: $content"
+  unless $content =~ /resume_cleanup_failure/;
+EOF
+--let _TAINTED_FILE=
 
 COMMIT;
 SELECT * FROM t_resume_delete_failure ORDER BY a;

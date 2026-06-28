@@ -221,7 +221,7 @@ class Preserved_trx_carrier {
       const std::string &token) = 0;
 
   virtual Preserved_trx_carrier_status mark_tainted(
-      const std::string &token) = 0;
+      const std::string &token, const std::string &reason) = 0;
 
   virtual Preserved_trx_carrier_status remove_taint(
       const std::string &token) = 0;
@@ -363,7 +363,8 @@ class Preserved_trx_store {
 
   Preserve_snapshot_status list_tokens(Preserved_trx_carrier_listing *listing);
 
-  Preserve_snapshot_status mark_tainted(const std::string &token);
+  Preserve_snapshot_status mark_tainted(const std::string &token,
+                                        const std::string &reason = "tainted");
 
   Preserve_snapshot_status remove_taint(const std::string &token);
 

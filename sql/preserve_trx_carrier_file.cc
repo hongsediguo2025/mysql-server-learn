@@ -1542,11 +1542,14 @@ Preserve_snapshot_delete_status remove_temp_sidecars_for_token(
                : Preserve_snapshot_delete_status::OK;
 }
 
-bool write_tainted_marker(const std::string &dir, const std::string &token) {
+bool write_tainted_marker(const std::string &dir, const std::string &token,
+                          const std::string &reason) {
   if (!token_is_filename_safe(token)) return true;
   DBUG_EXECUTE_IF("preserve_trx_fail_write_tainted_marker", return true;);
-  const std::string reason("innodb_force_recovery\n");
-  std::vector<unsigned char> bytes(reason.begin(), reason.end());
+  std::string marker_reason = reason.empty() ? "tainted" : reason;
+  marker_reason.push_back('\n');
+  std::vector<unsigned char> bytes(marker_reason.begin(),
+                                   marker_reason.end());
   return atomic_write_file(normalize_dir(dir), token + ".tainted", bytes, 0600,
                            {}) != Atomic_write_status::OK;
 }
@@ -1872,13 +1875,13 @@ Local_file_preserved_trx_carrier::remove_stale_tmp_files(
 }
 
 Preserved_trx_carrier_status Local_file_preserved_trx_carrier::mark_tainted(
-    const std::string &token) {
+    const std::string &token, const std::string &reason) {
   /*
     Taint is a durable warning that a previous operation crossed a point where
     retrying blindly could resurrect a partially consumed token. It is stored as
     a separate sidecar so the snapshot body remains immutable.
   */
-  return write_tainted_marker(m_dir, token)
+  return write_tainted_marker(m_dir, token, reason)
              ? Preserved_trx_carrier_status::IO_ERROR
              : Preserved_trx_carrier_status::OK;
 }

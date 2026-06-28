@@ -69,7 +69,8 @@ class Local_file_preserved_trx_carrier final
       Preserve_snapshot_remove_options options = {}) override;
   Preserved_trx_carrier_status remove_stale_tmp_files(
       const std::string &token) override;
-  Preserved_trx_carrier_status mark_tainted(const std::string &token) override;
+  Preserved_trx_carrier_status mark_tainted(
+      const std::string &token, const std::string &reason) override;
   Preserved_trx_carrier_status remove_taint(const std::string &token) override;
   Preserved_trx_carrier_status list_tokens(
       Preserved_trx_carrier_listing *listing) override;

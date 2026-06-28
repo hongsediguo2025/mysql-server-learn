@@ -2052,7 +2052,7 @@ class InMemoryPreservedTrxCarrier final : public Preserved_trx_carrier {
   }
 
   Preserved_trx_carrier_status mark_tainted(
-      const std::string &token) override {
+      const std::string &token, const std::string &) override {
     tainted_tokens.insert(token);
     return Preserved_trx_carrier_status::OK;
   }
