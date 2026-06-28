@@ -1115,6 +1115,15 @@ my $warmcopy_participant_abort = $&;
 die "warm-copy abort must not clear last observed bytes after a degraded failure\n"
   if $warmcopy_participant_abort =~ /bytes_used\s*=\s*0/s;
 
+$preserve =~ /class Temp_table_phase1_drain_participant[\s\S]*?^};/m
+  or die "could not isolate Temp_table_phase1_drain_participant\n";
+my $temp_phase1_participant = $&;
+die "temp-table phase1 sidecar prebuild failure must preserve target degraded reason in drain observation\n"
+  unless $temp_phase1_participant =~
+         /preserve_trx_temp_table_prebuild_phase1_sidecars[\s\S]*preserve_trx_temp_table_degraded_reason\s*\(\s*target\.thd\s*\)/s &&
+         $temp_phase1_participant =~
+         /prebuild_reason\.empty\s*\(\s*\)[\s\S]*"temp-table phase1 sidecar prebuild failed"/s;
+
 my $preserve_attached_start =
   index($preserve, 'bool preserve_trx_preserve_attached_transaction(');
 die "could not isolate preserve_trx_preserve_attached_transaction\n"

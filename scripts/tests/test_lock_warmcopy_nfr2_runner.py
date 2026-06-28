@@ -40,6 +40,21 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
         self.assertIn("preserve-trx-lock-warmcopy-enable=ON", rendered)
         self.assertIn("max-connections=17", rendered)
 
+    def test_skip_log_bin_common_arg_renders_no_bin_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            build = repo / "build-release"
+            work = build / "lock-warmcopy-nfr2"
+            paths = resolve_paths(repo, build, work)
+
+            args = nfr2_runner.parse_args(["start", "--skip-log-bin"])
+            rendered = render_my_cnf(
+                paths, nfr2_runner.server_options_from_args(args)
+            )
+
+        self.assertIn("skip-log-bin", rendered)
+        self.assertNotIn("log-bin=", rendered)
+
     def test_resolve_paths_uses_short_socket_paths_for_deep_workdirs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = (

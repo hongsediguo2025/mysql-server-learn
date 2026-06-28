@@ -102,6 +102,7 @@ class Nfr2Paths:
 
 @dataclasses.dataclass(frozen=True)
 class ServerOptions:
+    log_bin: bool = True
     max_connections: int = 1400
     innodb_buffer_pool_size: str = "2G"
     innodb_log_file_size: str = "512M"
@@ -148,7 +149,11 @@ def render_my_cnf(paths: Nfr2Paths, options: ServerOptions) -> str:
         f"log-error={paths.error_log}",
         "log-error-verbosity=3",
         "skip-networking",
-        f"log-bin={paths.run_dir / 'mysql-bin'}",
+        (
+            f"log-bin={paths.run_dir / 'mysql-bin'}"
+            if options.log_bin
+            else "skip-log-bin"
+        ),
         "server-id=1",
         "loose-mysqlx=0",
         f"loose-mysqlx-socket={paths.mysqlx_socket}",
@@ -207,6 +212,10 @@ def write_config(paths: Nfr2Paths, options: ServerOptions) -> None:
     ):
         directory.mkdir(parents=True, exist_ok=True)
     paths.my_cnf.write_text(render_my_cnf(paths, options), encoding="utf-8")
+
+
+def server_options_from_args(args: argparse.Namespace) -> ServerOptions:
+    return ServerOptions(log_bin=not getattr(args, "skip_log_bin", False))
 
 
 def initialize_datadir(paths: Nfr2Paths) -> None:
@@ -548,6 +557,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--build-dir", type=Path, default=Path("build-release"))
     parser.add_argument("--work-dir", type=Path)
+    parser.add_argument(
+        "--skip-log-bin",
+        action="store_true",
+        help="render and preserve a no-binlog my.cnf for no-bin E2E gates",
+    )
 
 
 def add_scaled_args(parser: argparse.ArgumentParser) -> None:
@@ -665,7 +679,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     paths = resolve_paths(args.repo_root, args.build_dir, args.work_dir)
-    options = ServerOptions()
+    options = server_options_from_args(args)
 
     if args.command == "prepare":
         prepare(paths, options, clean=args.clean)

@@ -5599,7 +5599,11 @@ class Temp_table_phase1_drain_participant final
         if (!preserve_trx_temp_table_prebuild_phase1_sidecars(
                 target.thd, trx_preserve_current_thd_trx(target.thd),
                 preserve_trx_default_dir(), warmcopy_id)) {
-          mark_degraded("temp-table phase1 sidecar prebuild failed");
+          const std::string prebuild_reason =
+              preserve_trx_temp_table_degraded_reason(target.thd);
+          mark_degraded(prebuild_reason.empty()
+                            ? "temp-table phase1 sidecar prebuild failed"
+                            : prebuild_reason.c_str());
           return false;
         }
       }
