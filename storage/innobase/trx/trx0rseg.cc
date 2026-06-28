@@ -43,6 +43,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "srv0start.h"
 #include "trx0purge.h"
 #include "trx0undo.h"
+#include "trx0temp_preserve.h"
 
 /** Creates a rollback segment header.
 This function is called only when a new rollback segment is created in
@@ -702,10 +703,24 @@ bool trx_rseg_adjust_rollback_segments(ulong target_rollback_segments) {
   /** The number of rollback segments created in the datafile. */
   ulint n_total_created = 0;
 
+  if (!trx_rseg_preserve_bootstrap_tmp_rsegs(target_rollback_segments, false)) {
+    ib::error(ER_IB_MSG_1192)
+        << "Could not register preserved temporary rollback segments before "
+           "ordinary temporary rollback segment creation.";
+    return (false);
+  }
+
   /* Make sure Temporary Tablespace has enough rsegs. */
   if (!trx_rseg_add_rollback_segments(srv_tmp_space.space_id(),
                                       target_rollback_segments,
                                       &(trx_sys->tmp_rsegs), nullptr)) {
+    return (false);
+  }
+
+  if (!trx_rseg_preserve_bootstrap_tmp_rsegs(target_rollback_segments, true)) {
+    ib::error(ER_IB_MSG_1192)
+        << "Could not validate preserved temporary rollback segments after "
+           "ordinary temporary rollback segment creation.";
     return (false);
   }
 

@@ -425,9 +425,18 @@ void Sql_cmd_truncate_table::cleanup_temporary(THD *thd, handlerton *hton,
                                                const std::string &saved_path) {
   DBUG_ASSERT(m_ticket_downgrade == nullptr);
 
+  auto note_successful_preserve_temp_truncate = [&]() {
+    if (m_preserve_temp_truncate && !m_error)
+      (void)preserve_trx_temp_table_note_table_truncate(
+          thd, table_ref.db, strlen(table_ref.db), table_ref.table_name,
+          strlen(table_ref.table_name));
+    m_preserve_temp_truncate = false;
+  };
+
   if ((hton->flags & HTON_CAN_RECREATE) == 0 || !(*tdef_holder_ptr)) {
     // For the non-recreate case, or if we bailed before closing the table
     // (e.g. if thd->decide_logging_format() returns true)
+    note_successful_preserve_temp_truncate();
     return;
   }
 
@@ -451,6 +460,7 @@ void Sql_cmd_truncate_table::cleanup_temporary(THD *thd, handlerton *hton,
   // table definition at this point.
   new_table->s->tmp_table_def = tdef_holder_ptr->release();
   thd->thread_specific_used = true;
+  note_successful_preserve_temp_truncate();
 }
 
 /**
@@ -476,6 +486,7 @@ void Sql_cmd_truncate_table::truncate_base(THD *thd, TABLE_LIST *table_ref) {
   bool binlog_stmt = false;
   bool binlog_is_trans = false;
   handlerton *hton = nullptr;
+  m_preserve_temp_truncate = false;
 
   DBUG_ASSERT((!table_ref->table) || (table_ref->table && table_ref->table->s));
   DBUG_ASSERT(m_ticket_downgrade == nullptr);
@@ -647,7 +658,7 @@ void Sql_cmd_truncate_table::truncate_temporary(THD *thd,
 
   TABLE *tmp_table = table_ref->table;
   hton = tmp_table->s->db_type();
-  const bool preserve_temp_truncate =
+  m_preserve_temp_truncate =
       tmp_table->s->tmp_table == TRANSACTIONAL_TMP_TABLE;
 
   /*
@@ -659,8 +670,6 @@ void Sql_cmd_truncate_table::truncate_temporary(THD *thd,
   /* Note that a temporary table cannot be partitioned. */
   if (hton->flags & HTON_CAN_RECREATE) {
     tmp_table->file->info(HA_STATUS_AUTO | HA_STATUS_NO_LOCK);
-    if (preserve_temp_truncate)
-      (void)preserve_trx_temp_table_note_table_truncate(thd, tmp_table);
     /*
       If LOCK TABLES list is not empty and contains this table
       then unlock the table and remove it from this list.
@@ -707,7 +716,6 @@ void Sql_cmd_truncate_table::truncate_temporary(THD *thd,
     if (m_error) {
       return;
     }
-
     /* Only binlog if truncate-by-recreate succeeds. */
     /* In RBR, the statement is not binlogged if the table is temporary. */
     binlog_stmt = !thd->is_current_stmt_binlog_format_row();
@@ -725,7 +733,6 @@ void Sql_cmd_truncate_table::truncate_temporary(THD *thd,
   if (tr != Truncate_result::OK) {
     return;
   }
-  (void)preserve_trx_temp_table_note_table_truncate(thd, table_ref->table);
   m_error = false;
   /* Only binlog if truncate succeeds. */
   /* In RBR, the statement is not binlogged if the table is temporary. */

@@ -515,6 +515,11 @@ TEST(TempTablePhysicalContractTest, TemporaryTruncateRecordsSingleBarrier) {
       read_source_file_for_temp_table_test("sql/sql_truncate.cc");
   ASSERT_FALSE(implementation.empty());
 
+  const std::string cleanup_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          implementation,
+          "void Sql_cmd_truncate_table::cleanup_temporary(");
+  ASSERT_FALSE(cleanup_body.empty());
   const std::string truncate_body =
       extract_function_body_after_signature_for_temp_table_test(
           implementation,
@@ -528,9 +533,18 @@ TEST(TempTablePhysicalContractTest, TemporaryTruncateRecordsSingleBarrier) {
     ++marker_count;
     pos += sizeof(kMarker) - 1;
   }
-  EXPECT_EQ(2U, marker_count)
-      << "temporary TRUNCATE should record one preserve barrier for the "
-         "recreate path and one for the handler-truncate path";
+  EXPECT_EQ(0U, marker_count)
+      << "temporary TRUNCATE should not mark preserve history before the "
+         "cleanup guard has completed commit and reopen work";
+  EXPECT_NE(std::string::npos,
+            cleanup_body.find("note_successful_preserve_temp_truncate"))
+      << "temporary TRUNCATE should centralize preserve marking in cleanup";
+  EXPECT_NE(std::string::npos, cleanup_body.find(kMarker))
+      << "temporary TRUNCATE must still record one successful DDL boundary";
+  EXPECT_NE(std::string::npos,
+            cleanup_body.find("new_table->s->tmp_table_def"))
+      << "recreate cleanup must reopen and hand off the table definition before "
+         "marking the preserve boundary";
 }
 
 TEST(TempResumeMaterializerContractTest, ResumeMaterializerEntryPointsExist) {
@@ -685,10 +699,13 @@ TEST(TempResumeMaterializerContractTest,
 }
 
 TEST(TempResumeMaterializerContractTest,
-     ReconnectedNoRedoUndoIsNotPutBackIntoGenericCache) {
+     ReconnectedNoRedoUndoUsesExplicitReconnectMode) {
   const std::string undo_impl =
       read_source_file_for_temp_table_test("storage/innobase/trx/trx0undo.cc");
+  const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
   ASSERT_FALSE(undo_impl.empty());
+  ASSERT_FALSE(temp_preserve_impl.empty());
 
   const std::string finish_body =
       extract_function_body_after_signature_for_temp_table_test(
@@ -736,6 +753,25 @@ TEST(TempResumeMaterializerContractTest,
                 "void trx_undo_discard_cached_for_header_page("));
   EXPECT_NE(std::string::npos,
             undo_impl.find("void trx_undo_discard_cached_for_rseg("));
+  const std::string create_reconnected_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "trx_undo_t *trx_preserve_temp_space_image_create_reconnected_undo(");
+  ASSERT_FALSE(create_reconnected_body.empty());
+  EXPECT_NE(std::string::npos,
+            temp_preserve_impl.find(
+                "trx_preserve_temp_no_redo_undo_reconnect_mode mode)"))
+      << "native no-redo undo adoption needs an explicit reconnect mode; a "
+         "bare bool makes restored-only cleanup too easy to confuse with "
+         "allocator-owned undo";
+  EXPECT_NE(std::string::npos,
+            create_reconnected_body.find(
+                "mode == trx_preserve_temp_no_redo_undo_reconnect_mode::"
+                "RESTORED_ONLY"));
+  EXPECT_NE(std::string::npos,
+            temp_preserve_impl.find(
+                "trx_preserve_temp_no_redo_undo_reconnect_mode::"
+                "RESTORED_ONLY"));
   const std::string undo_header = read_source_file_for_temp_table_test(
       "storage/innobase/include/trx0undo.h");
   ASSERT_FALSE(undo_header.empty());
@@ -782,9 +818,6 @@ TEST(TempResumeMaterializerContractTest,
             write_history_body.find(
                 "bool update_rseg_len = temp_rseg_undo_ptr == nullptr;"));
 
-  const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
-      "storage/innobase/trx/trx0temp_preserve.cc");
-  ASSERT_FALSE(temp_preserve_impl.empty());
   const std::string reconnect_body =
       extract_function_body_after_signature_for_temp_table_test(
           temp_preserve_impl,
@@ -820,6 +853,323 @@ TEST(TempResumeMaterializerContractTest,
      NoRedoUndoSkipHistoryRequiresRestoredFlag) {
   EXPECT_FALSE(trx_preserve_temp_no_redo_undo_skip_history_for_test(false));
   EXPECT_TRUE(trx_preserve_temp_no_redo_undo_skip_history_for_test(true));
+}
+
+TEST(TempResumeMaterializerContractTest,
+     NativeOwnedReconnectModeDoesNotSkipHistory) {
+  EXPECT_TRUE(
+      trx_preserve_temp_no_redo_undo_reconnect_mode_skips_history_for_test(
+          true));
+  EXPECT_FALSE(
+      trx_preserve_temp_no_redo_undo_reconnect_mode_skips_history_for_test(
+          false));
+}
+
+TEST(TempResumeMaterializerContractTest,
+     ResumeReconnectApiTakesExplicitReconnectMode) {
+  const std::string temp_preserve_header = read_source_file_for_temp_table_test(
+      "storage/innobase/include/trx0temp_preserve.h");
+  const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+
+  ASSERT_FALSE(temp_preserve_header.empty());
+  ASSERT_FALSE(temp_preserve_impl.empty());
+
+  EXPECT_NE(std::string::npos,
+            temp_preserve_header.find(
+                "enum class trx_preserve_temp_no_redo_undo_reconnect_mode"))
+      << "SQL resume must be able to request restored-only or native-owned "
+         "no-redo undo reconnect explicitly";
+  EXPECT_NE(std::string::npos,
+            temp_preserve_header.find(
+                "trx_preserve_temp_no_redo_undo_reconnect_mode mode"))
+      << "the public reconnect API must carry the selected reconnect mode";
+
+  const std::string reconnect_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_"
+          "before_resume(");
+  ASSERT_FALSE(reconnect_body.empty());
+
+  const std::string normalized_impl =
+      normalize_whitespace_for_temp_table_test(temp_preserve_impl);
+  EXPECT_NE(std::string::npos,
+            normalized_impl.find(
+                "trx_preserve_temp_space_image_descriptor *descriptor, trx_t "
+                "*trx, trx_preserve_temp_no_redo_undo_reconnect_mode mode"))
+      << "the reconnect implementation must not hard-code restored-only mode";
+  EXPECT_NE(std::string::npos, reconnect_body.find("insert_size, mode"));
+  EXPECT_NE(std::string::npos, reconnect_body.find("update_size, mode"));
+  EXPECT_EQ(
+      std::string::npos,
+      reconnect_body.find(
+          "trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY);"))
+      << "before_resume() must pass through the caller-selected mode to each "
+         "reconnected undo object";
+}
+
+TEST(TempResumeMaterializerContractTest,
+     NativeReconnectRequiresExplicitSlotAdoptionProof) {
+  const std::string temp_preserve_header = read_source_file_for_temp_table_test(
+      "storage/innobase/include/trx0temp_preserve.h");
+  const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+
+  ASSERT_FALSE(temp_preserve_header.empty());
+  ASSERT_FALSE(temp_preserve_impl.empty());
+
+  EXPECT_NE(std::string::npos,
+            temp_preserve_header.find("no_redo_undo_native_slots_adopted"))
+      << "NATIVE_OWNED reconnect needs an explicit proof that the live "
+         "temporary rollback segment owns the restored no-redo undo slots";
+
+  const std::string reconnect_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_"
+          "before_resume(");
+  ASSERT_FALSE(reconnect_body.empty());
+
+  const size_t native_mode_guard = reconnect_body.find(
+      "mode == trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED");
+  const size_t native_slot_proof =
+      reconnect_body.find("no_redo_undo_native_slots_adopted");
+  const size_t materialize_pages = reconnect_body.find(
+      "trx_preserve_temp_space_image_materialize_no_redo_undo_pages(");
+
+  ASSERT_NE(std::string::npos, native_mode_guard);
+  ASSERT_NE(std::string::npos, native_slot_proof);
+  ASSERT_NE(std::string::npos, materialize_pages);
+  EXPECT_LT(native_mode_guard, materialize_pages)
+      << "native-owned reconnect must fail closed before materializing pages "
+         "through the restored-only path";
+  EXPECT_LT(native_slot_proof, materialize_pages)
+      << "native-owned reconnect must prove live slot adoption before pages "
+         "are linked to trx->rsegs.m_noredo";
+}
+
+TEST(TempResumeMaterializerContractTest,
+     NativeSlotAdoptionWritesLiveRsegHeaderBeforeReconnect) {
+  const std::string temp_preserve_header = read_source_file_for_temp_table_test(
+      "storage/innobase/include/trx0temp_preserve.h");
+  const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+
+  ASSERT_FALSE(temp_preserve_header.empty());
+  ASSERT_FALSE(temp_preserve_impl.empty());
+
+  EXPECT_NE(std::string::npos,
+            temp_preserve_header.find(
+                "trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_"
+                "native_resume("))
+      << "native-owned reconnect must be preceded by a dedicated adoption API "
+         "that proves and writes live rollback-segment slots";
+
+  const std::string adopt_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_"
+          "native_resume(");
+  ASSERT_FALSE(adopt_body.empty());
+
+  EXPECT_NE(std::string::npos,
+            adopt_body.find("trx_preserve_temp_space_image_find_no_redo_rseg("));
+  EXPECT_NE(std::string::npos, adopt_body.find("trx_rsegf_get("))
+      << "adoption must inspect the live rollback-segment header";
+  EXPECT_NE(std::string::npos, adopt_body.find("trx_rsegf_get_nth_undo("))
+      << "adoption must reject occupied or mismatched live undo slots";
+  EXPECT_NE(std::string::npos, adopt_body.find("trx_rsegf_set_nth_undo("))
+      << "adoption must make preserved undo slots native-owned in the live "
+         "rollback-segment header";
+  EXPECT_NE(std::string::npos, adopt_body.find("mtr_set_log_mode(&mtr, "
+                                               "MTR_LOG_NO_REDO)"))
+      << "temporary rollback-segment slot adoption must remain no-redo";
+
+  const size_t write_slot = adopt_body.find("trx_rsegf_set_nth_undo(");
+  const size_t publish_proof =
+      adopt_body.find("no_redo_undo_native_slots_adopted = true");
+  ASSERT_NE(std::string::npos, write_slot);
+  ASSERT_NE(std::string::npos, publish_proof);
+  EXPECT_LT(write_slot, publish_proof)
+      << "the native-owned proof flag must be published only after live slots "
+         "have been written";
+
+  const std::string reconnect_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_"
+          "before_resume(");
+  ASSERT_FALSE(reconnect_body.empty());
+  EXPECT_EQ(std::string::npos,
+            reconnect_body.find("no_redo_undo_native_slots_adopted = true"))
+      << "reconnect must consume the adoption proof, not manufacture it";
+}
+
+TEST(TempResumeMaterializerContractTest,
+     NativeSlotAdoptionUsesRsegLatchAsTheOnlyRsegMutexOwner) {
+  const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+  ASSERT_FALSE(temp_preserve_impl.empty());
+
+  const std::string adopt_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_"
+          "native_resume(");
+  ASSERT_FALSE(adopt_body.empty());
+
+  EXPECT_NE(std::string::npos, adopt_body.find("rseg->latch()"))
+      << "native adoption must use the rollback-segment latch before reading or "
+         "publishing live undo slots";
+  EXPECT_EQ(std::string::npos, adopt_body.find("mutex_enter(&rseg->mutex)"))
+      << "trx_rseg_t::latch() already enters rseg->mutex; entering it outside "
+         "the latch causes a debug-build recursive mutex assertion during "
+         "RESUME";
+  EXPECT_EQ(std::string::npos, adopt_body.find("mutex_exit(&rseg->mutex)"))
+      << "native adoption must pair rollback-segment ownership through "
+         "rseg->latch()/unlatch(), not a mixed direct-mutex/latch protocol";
+}
+
+TEST(TempResumeMaterializerContractTest,
+     NativeSlotAdoptionKeepsRsegCurrSizeConsistentWithPublishedSlots) {
+  const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+  ASSERT_FALSE(temp_preserve_impl.empty());
+
+  const std::string adopt_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_"
+          "native_resume(");
+  ASSERT_FALSE(adopt_body.empty());
+
+  EXPECT_NE(std::string::npos,
+            adopt_body.find(
+                "trx_preserve_temp_space_image_reconnected_undo_size("))
+      << "native adoption must derive the preserved undo segment page count "
+         "before publishing slots into the live rollback segment";
+  EXPECT_NE(std::string::npos, adopt_body.find("rseg->set_curr_size("))
+      << "debug builds recompute rseg curr_size from the live rollback-segment "
+         "header; adoption must update curr_size in the same latch window that "
+         "publishes preserved undo slots";
+
+  const size_t publish_slot =
+      adopt_body.find("write_adopted_anchor_slot(rseg_header");
+  const size_t update_curr_size = adopt_body.find("rseg->set_curr_size(");
+  ASSERT_NE(std::string::npos, publish_slot);
+  ASSERT_NE(std::string::npos, update_curr_size);
+  EXPECT_LT(publish_slot, update_curr_size)
+      << "curr_size must describe slots after they are published, not before";
+}
+
+TEST(TempResumeMaterializerContractTest,
+     NativeOwnedReconnectPreparesUndoForPostResumeDml) {
+  const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+  ASSERT_FALSE(temp_preserve_impl.empty());
+
+  const std::string create_undo_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "trx_undo_t *trx_preserve_temp_space_image_create_reconnected_undo(");
+  ASSERT_FALSE(create_undo_body.empty());
+
+  EXPECT_NE(std::string::npos, create_undo_body.find("TRX_UNDO_ACTIVE"))
+      << "native-owned no-redo undo must resume as ACTIVE so post-resume temp "
+         "DML can append undo records through the native path";
+  EXPECT_NE(std::string::npos,
+            create_undo_body.find(
+                "mode == trx_preserve_temp_no_redo_undo_reconnect_mode::"
+                "NATIVE_OWNED"))
+      << "restored-only reconnect may stay PREPARED, but native-owned reconnect "
+         "must choose ACTIVE explicitly";
+
+  const std::string reconnect_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_"
+          "before_resume(");
+  ASSERT_FALSE(reconnect_body.empty());
+  EXPECT_NE(std::string::npos,
+            reconnect_body.find(
+                "trx_preserve_temp_space_image_advance_trx_undo_no_for_native_"
+                "resume("))
+      << "reconnect must advance trx->undo_no beyond restored no-redo undo "
+         "anchors before the transaction can execute more row operations";
+}
+
+TEST(TempResumeMaterializerContractTest,
+     NativeOwnedNoRedoUndoDoesNotRunPreparedRollbackActivation) {
+  const std::string trx_preserve_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0preserve.cc");
+  ASSERT_FALSE(trx_preserve_impl.empty());
+
+  const std::string activate_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          trx_preserve_impl,
+          "static dberr_t trx_preserve_activate_undo_ptr_state(");
+  ASSERT_FALSE(activate_body.empty());
+
+  EXPECT_NE(std::string::npos,
+            activate_body.find(
+                "no_redo && undo_ptr->insert_undo->state == TRX_UNDO_ACTIVE"))
+      << "native-adopted temporary insert undo is already ACTIVE; activating a "
+         "resumed transaction must not pass it to the PREPARED->ACTIVE rollback "
+         "transition";
+  EXPECT_NE(std::string::npos,
+            activate_body.find(
+                "no_redo && undo_ptr->update_undo->state == TRX_UNDO_ACTIVE"))
+      << "native-adopted temporary update undo is already ACTIVE; activating a "
+         "resumed transaction must preserve that state";
+}
+
+TEST(TempResumeMaterializerContractTest,
+     NativeSlotAdoptionMaterializesPagesBeforePublishingSlots) {
+  const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+  ASSERT_FALSE(temp_preserve_impl.empty());
+
+  const std::string adopt_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_"
+          "native_resume(");
+  ASSERT_FALSE(adopt_body.empty());
+  const std::string normalized_adopt_body =
+      normalize_whitespace_for_temp_table_test(adopt_body);
+
+  const size_t materialize_pages = normalized_adopt_body.find(
+      "trx_preserve_temp_space_image_materialize_no_redo_undo_pages("
+      "*descriptor, rseg)");
+  const size_t publish_slot =
+      normalized_adopt_body.find("write_adopted_anchor_slot(rseg_header");
+  ASSERT_NE(std::string::npos, materialize_pages)
+      << "native adoption must restore token-owned undo pages before the live "
+         "rseg header points at them";
+  ASSERT_NE(std::string::npos, publish_slot);
+  EXPECT_LT(materialize_pages, publish_slot)
+      << "the live rseg header must not reference a preserved undo page until "
+         "that page has been materialized into the temporary tablespace";
+
+  const std::string reconnect_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_"
+          "before_resume(");
+  ASSERT_FALSE(reconnect_body.empty());
+  const std::string normalized_reconnect_body =
+      normalize_whitespace_for_temp_table_test(reconnect_body);
+  const size_t restored_only_materialize_guard = normalized_reconnect_body.find(
+      "mode == trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY");
+  const size_t reconnect_materialize = normalized_reconnect_body.find(
+      "trx_preserve_temp_space_image_materialize_no_redo_undo_pages(*descriptor,"
+      " rseg)");
+  ASSERT_NE(std::string::npos, restored_only_materialize_guard);
+  ASSERT_NE(std::string::npos, reconnect_materialize);
+  EXPECT_LT(restored_only_materialize_guard, reconnect_materialize)
+      << "native-owned reconnect must consume pages materialized by adoption; "
+         "only restored-only reconnect may materialize through the legacy path";
 }
 
 TEST(TempResumeMaterializerContractTest,
@@ -1035,6 +1385,15 @@ TEST(TempResumeMaterializerContractTest,
   EXPECT_NE(std::string::npos,
             materialize_body.find(
                 "trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume("));
+  EXPECT_NE(std::string::npos,
+            materialize_body.find(
+                "trx_preserve_temp_space_image_no_redo_undo_restored_only_reconnected("))
+      << "post-resume temp DML rejection must come from the actual InnoDB "
+         "reconnect mode, not from manifest undo-sidecar presence";
+  EXPECT_EQ(std::string::npos,
+            materialize_body.find("!plan.manifest.undo_images.empty()"))
+      << "native-owned no-redo undo adoption will still have an undo sidecar, "
+         "so manifest presence cannot be the SQL-layer reject predicate";
   const std::string normalized_materialize_body =
       normalize_whitespace_for_temp_table_test(materialize_body);
   const size_t validate_sidecars =
@@ -1057,6 +1416,49 @@ TEST(TempResumeMaterializerContractTest,
                 "const std::string &token,\n"
                 "    const Preserve_snapshot_metadata &metadata) {\n"
                 "  return Preserve_snapshot_status::UNSUPPORTED;"));
+}
+
+TEST(TempResumeMaterializerContractTest,
+     NativeManifestAdoptsNoRedoUndoBeforeReconnect) {
+  const std::string sql_impl = read_source_file_for_temp_table_test(
+      "sql/preserve_trx_temp_table.cc");
+  ASSERT_FALSE(sql_impl.empty());
+
+  const std::string materialize_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          sql_impl,
+          "Preserve_snapshot_status "
+          "preserve_trx_temp_table_materialize_for_resume(");
+  ASSERT_FALSE(materialize_body.empty());
+
+  const std::string normalized_materialize_body =
+      normalize_whitespace_for_temp_table_test(materialize_body);
+  const size_t mode_from_plan = normalized_materialize_body.find(
+      "preserve_trx_temp_table_no_redo_reconnect_mode_for_resume(plan)");
+  const size_t native_adopt_call = normalized_materialize_body.find(
+      "trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume("
+      " descriptor.second.get())");
+  const size_t reconnect_call = normalized_materialize_body.find(
+      "trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume( "
+      "descriptor.second.get(), trx, no_redo_undo_reconnect_mode)");
+  const size_t restored_flag = normalized_materialize_body.find(
+      "trx_preserve_temp_space_image_no_redo_undo_restored_only_reconnected( "
+      "*descriptor.second)");
+
+  ASSERT_NE(std::string::npos, mode_from_plan)
+      << "resume must derive RESTORED_ONLY vs NATIVE_OWNED from the decoded "
+         "manifest plan, rather than hard-coding restored-only reconnect";
+  ASSERT_NE(std::string::npos, native_adopt_call)
+      << "native-capable manifests must publish their no-redo undo slots into "
+         "the live temp rseg before reconnecting undo objects";
+  ASSERT_NE(std::string::npos, reconnect_call)
+      << "the materializer must pass the selected reconnect mode into InnoDB";
+  ASSERT_NE(std::string::npos, restored_flag)
+      << "post-resume temp DML rejection must stay tied to actual restored-only "
+         "reconnect evidence";
+  EXPECT_LT(mode_from_plan, native_adopt_call);
+  EXPECT_LT(native_adopt_call, reconnect_call);
+  EXPECT_LT(reconnect_call, restored_flag);
 }
 
 TEST(TempResumeMaterializerContractTest,
@@ -1091,7 +1493,12 @@ TEST(TempResumeMaterializerContractTest,
             normalized_resume_body.find("bool temp_tables_materialized = false"));
   EXPECT_NE(std::string::npos,
             normalized_resume_body.find(
-                "temp_tables_materialized = !record.metadata.temp_table_manifest_payload.empty() && preserve_trx_temp_table_enable"));
+                "temp_tables_materialized = !record.metadata.temp_table_manifest_payload.empty()"));
+  EXPECT_EQ(std::string::npos,
+            normalized_resume_body.find(
+                "temp_tables_materialized = !record.metadata.temp_table_manifest_payload.empty() && preserve_trx_temp_table_enable"))
+      << "resume cleanup must be driven by successful materialization state, "
+         "not by the current value of the temp-table feature switch";
   const size_t rollback_call = normalized_resume_body.find(
       "preserve_trx_temp_table_rollback_materialized_for_resume(");
   const size_t restore_record_call = normalized_resume_body.find(
@@ -1705,10 +2112,13 @@ TEST(TempResumeMaterializerContractTest,
       "storage/innobase/trx/trx0temp_preserve.cc");
   const std::string undo_impl =
       read_source_file_for_temp_table_test("storage/innobase/trx/trx0undo.cc");
+  const std::string sql_impl =
+      read_source_file_for_temp_table_test("sql/preserve_trx_temp_table.cc");
 
   ASSERT_FALSE(innodb_header.empty());
   ASSERT_FALSE(temp_preserve_impl.empty());
   ASSERT_FALSE(undo_impl.empty());
+  ASSERT_FALSE(sql_impl.empty());
 
   EXPECT_NE(std::string::npos,
             innodb_header.find(
@@ -1716,9 +2126,14 @@ TEST(TempResumeMaterializerContractTest,
   EXPECT_NE(std::string::npos,
             temp_preserve_impl.find(
                 "trx_preserve_temp_space_image_reserve_no_redo_undo_slot("));
-  EXPECT_NE(std::string::npos,
-            temp_preserve_impl.find(
-                "trx_preserve_temp_space_image_release_no_redo_undo_reservations("));
+  EXPECT_NE(
+      std::string::npos,
+      temp_preserve_impl.find(
+          "trx_preserve_temp_space_image_release_no_redo_undo_reservations_from_sidecar("));
+  EXPECT_NE(std::string::npos, innodb_header.find("uint32_t rseg_page_no"));
+  EXPECT_NE(std::string::npos, innodb_header.find("uint32_t rseg_id"))
+      << "reservation lookups must include the rollback segment identity, not "
+         "only temp tablespace id and slot";
 
   const std::string reconnect_body =
       extract_function_body_after_signature_for_temp_table_test(
@@ -1731,6 +2146,38 @@ TEST(TempResumeMaterializerContractTest,
                 "trx_preserve_temp_space_image_reserve_no_redo_undo_slot("))
       << "RESUME must reserve restored undo slots before exposing the resumed "
          "transaction to normal temp undo allocation";
+  const std::string slot_in_use_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "bool trx_preserve_temp_space_image_rseg_slot_in_use(");
+  ASSERT_FALSE(slot_in_use_body.empty());
+  EXPECT_NE(std::string::npos, slot_in_use_body.find("insert_undo_cached"))
+      << "reconnect must reject a restored no-redo undo slot that is already "
+         "held by a cached insert undo object";
+  EXPECT_NE(std::string::npos, slot_in_use_body.find("update_undo_cached"))
+      << "reconnect must reject a restored no-redo undo slot that is already "
+         "held by a cached update undo object";
+  const std::string reservation_query_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "bool trx_preserve_temp_space_image_no_redo_undo_slot_reserved(");
+  ASSERT_FALSE(reservation_query_body.empty());
+  EXPECT_NE(std::string::npos, reservation_query_body.find("rseg_page_no"));
+  EXPECT_NE(std::string::npos, reservation_query_body.find("rseg_id"));
+  EXPECT_EQ(std::string::npos,
+            reservation_query_body.find("preserve_trx_temp_table_enable"))
+      << "restored no-redo undo reservations must remain visible after the "
+         "user disables new temp-table preserve work";
+  const std::string sidecar_release_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "trx_preserve_temp_space_image_release_no_redo_undo_reservations_from_sidecar(");
+  ASSERT_FALSE(sidecar_release_body.empty());
+  EXPECT_NE(std::string::npos,
+            sidecar_release_body.find(
+                "trx_preserve_temp_space_image_release_no_redo_undo_slot_for_owner("))
+      << "token sidecar deletion must release only reservations owned by that "
+         "sidecar's source space id";
 
   const std::string disconnect_body =
       extract_function_body_after_signature_for_temp_table_test(
@@ -1738,9 +2185,96 @@ TEST(TempResumeMaterializerContractTest,
           "dberr_t "
           "trx_preserve_temp_space_image_disconnect_no_redo_undo_for_retry(");
   ASSERT_FALSE(disconnect_body.empty());
-  EXPECT_NE(std::string::npos,
+  EXPECT_EQ(std::string::npos,
             disconnect_body.find(
-                "trx_preserve_temp_space_image_release_no_redo_undo_reservations("));
+                "trx_preserve_temp_space_image_release_no_redo_undo_reservations"))
+      << "retry cleanup must keep token-owned no-redo undo reservations until "
+         "the durable token sidecars are removed or the resumed trx cleans up";
+  EXPECT_EQ(std::string::npos,
+            disconnect_body.find("preserve_trx_temp_table_enable"))
+      << "retry cleanup of already materialized state must not become a no-op "
+         "when new temp-table preserve work is disabled";
+  const std::string remove_sidecars_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          sql_impl,
+          "Preserve_snapshot_status preserve_trx_temp_table_remove_token_sidecars(");
+  ASSERT_FALSE(remove_sidecars_body.empty());
+  EXPECT_NE(std::string::npos,
+            remove_sidecars_body.find(
+                "preserve_trx_temp_table_release_no_redo_undo_reservations_from_manifest("))
+      << "token deletion is the retryable-token boundary that may release "
+         "reserved no-redo undo slots";
+  const size_t collect_pos = remove_sidecars_body.find(
+      "preserve_trx_temp_table_collect_no_redo_undo_reservations_from_manifest(");
+  const size_t release_pos = remove_sidecars_body.find(
+      "preserve_trx_temp_table_release_no_redo_undo_reservations_from_manifest(");
+  const size_t remove_pos = remove_sidecars_body.find(
+      "carrier.remove_sealed_sidecars(");
+  ASSERT_NE(std::string::npos, collect_pos);
+  ASSERT_NE(std::string::npos, release_pos);
+  ASSERT_NE(std::string::npos, remove_pos);
+  EXPECT_LT(collect_pos, release_pos)
+      << "token cleanup must read undo sidecars before releasing reservations";
+  EXPECT_LT(release_pos, remove_pos)
+      << "token cleanup must release no-redo undo reservations before deleting "
+         "the sidecar evidence needed to retry a failed release";
+  const std::string resume_impl =
+      read_source_file_for_temp_table_test("sql/preserve_trx.cc");
+  ASSERT_FALSE(resume_impl.empty());
+  const std::string delete_snapshot_and_sidecars_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          resume_impl,
+          "static bool delete_preserved_snapshot_files_and_sidecars_or_log(");
+  ASSERT_FALSE(delete_snapshot_and_sidecars_body.empty());
+  EXPECT_NE(std::string::npos,
+            delete_snapshot_and_sidecars_body.find(
+                "preserve_committed_temp_sidecar_source_space_ids"))
+      << "generic snapshot deletion must preserve temp sidecars until the "
+         "temp-table cleanup path has read no-redo undo sidecars and released "
+         "their allocator reservations";
+  EXPECT_NE(std::string::npos,
+            delete_snapshot_and_sidecars_body.find(
+                "delete_preserved_temp_table_sidecars_or_log("))
+      << "temp-table cleanup must remain responsible for deleting temp "
+         "sidecars after reservation release";
+  const std::string rollback_materialized_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          sql_impl,
+          "preserve_trx_temp_table_rollback_materialized_for_resume(");
+  ASSERT_FALSE(rollback_materialized_body.empty());
+  EXPECT_EQ(std::string::npos,
+            rollback_materialized_body.find("if (!preserve_trx_temp_table_enable)"))
+      << "resume cleanup must rollback already materialized temp state even when "
+         "new temp-table preserve work is disabled";
+  const std::string unregister_tables_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t "
+          "trx_preserve_temp_space_image_unregister_dict_tables_for_resume(");
+  ASSERT_FALSE(unregister_tables_body.empty());
+  EXPECT_EQ(std::string::npos,
+            unregister_tables_body.find("preserve_trx_temp_table_enable"))
+      << "retry cleanup must unregister already materialized session handlers "
+         "even after new temp-table preserve work is disabled";
+  const std::string unregister_name_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t "
+          "trx_preserve_temp_space_image_unregister_dict_table_name_for_resume(");
+  ASSERT_FALSE(unregister_name_body.empty());
+  EXPECT_EQ(std::string::npos,
+            unregister_name_body.find("preserve_trx_temp_table_enable"))
+      << "name-based retry cleanup must not become a no-op after dynamic "
+         "feature disable";
+  const std::string close_staged_tables_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          sql_impl,
+          "void preserve_trx_temp_table_close_staged_tables(");
+  ASSERT_FALSE(close_staged_tables_body.empty());
+  EXPECT_EQ(std::string::npos,
+            close_staged_tables_body.find("preserve_trx_temp_table_enable"))
+      << "retry cleanup must close already opened staged TABLE objects even "
+         "after new temp-table preserve work is disabled";
 
   const std::string seg_create_body =
       extract_function_body_after_signature_for_temp_table_test(
@@ -1760,6 +2294,16 @@ TEST(TempResumeMaterializerContractTest,
                 "trx_preserve_temp_space_image_no_redo_undo_slot_reserved("))
       << "the local allocator helper must delegate to the preserve reservation "
          "set";
+  EXPECT_NE(std::string::npos, reserved_helper_body.find("rseg->page_no"));
+  EXPECT_NE(std::string::npos, reserved_helper_body.find("rseg->id"));
+  const std::string reuse_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          undo_impl, "static trx_undo_t *trx_undo_reuse_cached(");
+  ASSERT_FALSE(reuse_body.empty());
+  EXPECT_NE(std::string::npos,
+            reuse_body.find("UT_LIST_GET_NEXT(undo_list"))
+      << "cached temp undo reuse must scan past reserved cached slots instead "
+         "of treating a reserved head element as an empty cache";
 }
 
 TEST(TempResumeMaterializerContractTest,
@@ -2196,6 +2740,20 @@ void make_temp_update_undo_chain_for_test(
                                       log_page_no);
   write_temp_undo_next_for_test(undo_header, log_page_no, node_offset);
   write_temp_undo_null_next_for_test(undo_log);
+}
+
+void make_temp_update_undo_three_page_chain_for_test(
+    std::vector<unsigned char> *undo_header,
+    std::vector<unsigned char> *middle_undo_log,
+    std::vector<unsigned char> *last_undo_log, uint32_t header_page_no,
+    uint32_t middle_page_no, uint32_t last_page_no) {
+  const uint16_t node_offset =
+      kTempUndoPageHdrOffsetForTest + kTempUndoPageNodeOffsetForTest;
+  write_temp_undo_flist_base_for_test(undo_header, 3, header_page_no,
+                                      last_page_no);
+  write_temp_undo_next_for_test(undo_header, middle_page_no, node_offset);
+  write_temp_undo_next_for_test(middle_undo_log, last_page_no, node_offset);
+  write_temp_undo_null_next_for_test(last_undo_log);
 }
 
 struct TempNoRedoUndoSidecarPageForTest {
@@ -5553,7 +6111,8 @@ TEST(TempNoRedoUndoCaptureTest, RejectsUnknownUndoPage) {
                 &descriptor));
   EXPECT_EQ(DB_ERROR,
             trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-                &descriptor, nullptr));
+                &descriptor, nullptr,
+                trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY));
 }
 
 TEST(TempNoRedoUndoCaptureTest, SealRejectsManualSidecarFlagWithoutRsegIdentity) {
@@ -5657,7 +6216,8 @@ TEST(TempNoRedoUndoCaptureTest, ReconnectApiRequiresRecoveredTransaction) {
                 &descriptor, false, 12, 128, 90, 90, 90, 512, 1234));
   EXPECT_EQ(DB_ERROR,
             trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-                &descriptor, nullptr));
+                &descriptor, nullptr,
+                trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY));
 
   ASSERT_EQ(DB_SUCCESS,
             trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(
@@ -5667,7 +6227,8 @@ TEST(TempNoRedoUndoCaptureTest, ReconnectApiRequiresRecoveredTransaction) {
           descriptor));
   EXPECT_EQ(DB_ERROR,
             trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-                &descriptor, nullptr));
+                &descriptor, nullptr,
+                trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY));
   EXPECT_FALSE(
       trx_preserve_temp_space_image_no_redo_undo_pointers_reconnected(
           descriptor));
@@ -5722,7 +6283,8 @@ TEST(TempNoRedoUndoCaptureTest, ExplicitTempFeatureOffNoRedoUndoApiIsNoop) {
                 &descriptor));
   EXPECT_EQ(DB_SUCCESS,
             trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-                &descriptor, nullptr));
+                &descriptor, nullptr,
+                trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY));
 
   EXPECT_FALSE(
       trx_preserve_temp_space_image_no_redo_undo_capture_required(descriptor));
@@ -6385,6 +6947,436 @@ TEST_F(TempSpaceReservationTest,
   EXPECT_FALSE(ibt::is_preserved_space_id_reserved(active_id));
 }
 
+class TempStartupReservationRegistryTest : public ::testing::Test {
+ public:
+  void SetUp() override {
+    trx_preserve_temp_space_image_clear_reservation_registries_for_test();
+  }
+
+  void TearDown() override {
+    trx_preserve_temp_space_image_clear_reservation_registries_for_test();
+  }
+
+ protected:
+  static trx_preserve_temp_reservation_owner owner(
+      uint32_t source_space_id, const std::string &token,
+      const std::string &domain) {
+    trx_preserve_temp_reservation_owner out;
+    out.source_space_id = source_space_id;
+    out.token = token;
+    out.domain = domain;
+    return out;
+  }
+
+  static trx_preserve_temp_page_reservation page_reservation(
+      uint32_t space_id, uint32_t page_no,
+      const trx_preserve_temp_reservation_owner &reservation_owner) {
+    trx_preserve_temp_page_reservation out;
+    out.space_id = space_id;
+    out.page_no = page_no;
+    out.owner = reservation_owner;
+    return out;
+  }
+
+  static trx_preserve_temp_ownership_page_claim ownership_claim(
+      const std::string &token, uint32_t source_space_id,
+      uint32_t rseg_space_id, uint32_t rseg_page_no, uint32_t rseg_id,
+      uint32_t undo_slot, uint32_t page_no,
+      trx_preserve_temp_no_redo_undo_page_kind page_role) {
+    trx_preserve_temp_ownership_page_claim out;
+    out.token = token;
+    out.source_space_id = source_space_id;
+    out.rseg_space_id = rseg_space_id;
+    out.rseg_page_no = rseg_page_no;
+    out.rseg_id = rseg_id;
+    out.undo_slot = undo_slot;
+    out.page_no = page_no;
+    out.page_role = page_role;
+    return out;
+  }
+};
+
+TEST_F(TempStartupReservationRegistryTest,
+       PageReservationFastPathSkipsSlowLookupWhenInactive) {
+  EXPECT_EQ(0U,
+            trx_preserve_temp_space_image_active_page_reservations_for_test());
+  EXPECT_EQ(0U,
+            trx_preserve_temp_space_image_page_reservation_slow_lookups_for_test());
+
+  EXPECT_FALSE(trx_preserve_temp_space_image_page_reserved(77, 19));
+
+  EXPECT_EQ(0U,
+            trx_preserve_temp_space_image_page_reservation_slow_lookups_for_test());
+}
+
+TEST_F(TempStartupReservationRegistryTest,
+       PageReservationAllowsSameOwnerRetryAndRejectsAnotherOwner) {
+  const trx_preserve_temp_reservation_owner owner_a =
+      owner(5, "token_a", "exclusive_undo");
+  const trx_preserve_temp_reservation_owner owner_b =
+      owner(6, "token_b", "exclusive_undo");
+
+  EXPECT_TRUE(trx_preserve_temp_space_image_reserve_page(77, 19, owner_a));
+  EXPECT_EQ(1U,
+            trx_preserve_temp_space_image_active_page_reservations_for_test());
+  EXPECT_TRUE(trx_preserve_temp_space_image_page_reserved(77, 19));
+
+  EXPECT_TRUE(trx_preserve_temp_space_image_reserve_page(77, 19, owner_a));
+  EXPECT_EQ(1U,
+            trx_preserve_temp_space_image_active_page_reservations_for_test());
+  EXPECT_FALSE(trx_preserve_temp_space_image_reserve_page(77, 19, owner_b));
+  EXPECT_EQ(1U,
+            trx_preserve_temp_space_image_active_page_reservations_for_test());
+}
+
+TEST_F(TempStartupReservationRegistryTest,
+       PageReservationReleaseOwnerRemovesReservationAndActiveCount) {
+  const trx_preserve_temp_reservation_owner owner_a =
+      owner(5, "token_a", "exclusive_undo");
+  ASSERT_TRUE(trx_preserve_temp_space_image_reserve_page(77, 19, owner_a));
+  ASSERT_EQ(1U,
+            trx_preserve_temp_space_image_active_page_reservations_for_test());
+
+  EXPECT_EQ(1U,
+            trx_preserve_temp_space_image_release_page_reservations_for_owner(
+                owner_a));
+  EXPECT_EQ(0U,
+            trx_preserve_temp_space_image_active_page_reservations_for_test());
+  EXPECT_FALSE(trx_preserve_temp_space_image_page_reserved(77, 19));
+}
+
+TEST_F(TempStartupReservationRegistryTest,
+       ReservationOwnershipSlotKeyValidityRejectsInvalidRsegPageAndSlot) {
+  EXPECT_FALSE(trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
+      5, 77, 0, 4, 1));
+  EXPECT_FALSE(trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
+      5, 77, std::numeric_limits<uint32_t>::max(), 4, 1));
+  EXPECT_FALSE(trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
+      5, 77, 3, 4, std::numeric_limits<uint32_t>::max()));
+  EXPECT_EQ(
+      0U,
+      trx_preserve_temp_space_image_active_no_redo_undo_slot_reservations_for_test());
+
+  EXPECT_EQ(
+      0U,
+      trx_preserve_temp_space_image_no_redo_undo_slot_reservation_slow_lookups_for_test());
+  EXPECT_FALSE(trx_preserve_temp_space_image_no_redo_undo_slot_reserved(
+      77, 3, 4, 1));
+  EXPECT_EQ(
+      0U,
+      trx_preserve_temp_space_image_no_redo_undo_slot_reservation_slow_lookups_for_test());
+}
+
+TEST_F(TempStartupReservationRegistryTest,
+       NoRedoUndoSlotReservationFastPathOwnerConflictAndRelease) {
+  EXPECT_EQ(
+      0U,
+      trx_preserve_temp_space_image_active_no_redo_undo_slot_reservations_for_test());
+  EXPECT_EQ(
+      0U,
+      trx_preserve_temp_space_image_no_redo_undo_slot_reservation_slow_lookups_for_test());
+  EXPECT_FALSE(trx_preserve_temp_space_image_no_redo_undo_slot_reserved(
+      77, 3, 4, 1));
+  EXPECT_EQ(
+      0U,
+      trx_preserve_temp_space_image_no_redo_undo_slot_reservation_slow_lookups_for_test());
+
+  EXPECT_TRUE(trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
+      5, 77, 3, 4, 1));
+  EXPECT_EQ(
+      1U,
+      trx_preserve_temp_space_image_active_no_redo_undo_slot_reservations_for_test());
+
+  EXPECT_TRUE(trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
+      5, 77, 3, 4, 1));
+  EXPECT_EQ(
+      1U,
+      trx_preserve_temp_space_image_active_no_redo_undo_slot_reservations_for_test());
+
+  EXPECT_FALSE(trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
+      6, 77, 3, 4, 1));
+  EXPECT_EQ(
+      1U,
+      trx_preserve_temp_space_image_active_no_redo_undo_slot_reservations_for_test());
+
+  EXPECT_TRUE(trx_preserve_temp_space_image_no_redo_undo_slot_reserved(
+      77, 3, 4, 1));
+  EXPECT_EQ(
+      1U,
+      trx_preserve_temp_space_image_no_redo_undo_slot_reservation_slow_lookups_for_test());
+
+  trx_preserve_temp_space_image_release_no_redo_undo_slot(77, 3, 4, 1);
+  EXPECT_EQ(
+      0U,
+      trx_preserve_temp_space_image_active_no_redo_undo_slot_reservations_for_test());
+  EXPECT_FALSE(trx_preserve_temp_space_image_no_redo_undo_slot_reserved(
+      77, 3, 4, 1));
+  EXPECT_EQ(
+      1U,
+      trx_preserve_temp_space_image_no_redo_undo_slot_reservation_slow_lookups_for_test());
+}
+
+TEST(TempStartupReservationRegistrySourceTest,
+     ReservationPublishesActiveCountBeforeMapEntry) {
+  const std::string impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+
+  const std::string page_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          impl, "bool trx_preserve_temp_space_image_reserve_page_locked(");
+  ASSERT_FALSE(page_body.empty());
+  const size_t page_active =
+      page_body.find("trx_preserve_temp_active_page_reservations_add();");
+  const size_t page_insert =
+      page_body.find("trx_preserve_temp_reserved_pages.emplace(");
+  ASSERT_NE(std::string::npos, page_active);
+  ASSERT_NE(std::string::npos, page_insert);
+  EXPECT_LT(page_active, page_insert)
+      << "page reservations must publish active count before making the map "
+         "entry visible to slow lookup";
+
+  const std::string slot_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          impl,
+          "bool trx_preserve_temp_space_image_reserve_no_redo_undo_slot_impl(");
+  ASSERT_FALSE(slot_body.empty());
+  const size_t slot_active = slot_body.find(
+      "trx_preserve_temp_active_no_redo_undo_slot_reservations_add();");
+  const size_t slot_insert =
+      slot_body.find("trx_preserve_temp_no_redo_undo_reserved_slots.emplace(");
+  ASSERT_NE(std::string::npos, slot_active);
+  ASSERT_NE(std::string::npos, slot_insert);
+  EXPECT_LT(slot_active, slot_insert)
+      << "slot reservations must publish active count before making the map "
+         "entry visible to slow lookup";
+}
+
+TEST_F(TempStartupReservationRegistryTest,
+       OwnershipClaimsRegisterSharedMetadataAndExclusiveUndoAtomically) {
+  const trx_preserve_temp_reservation_owner shared_owner =
+      owner(77, "", "shared_metadata");
+  const trx_preserve_temp_reservation_owner token_owner =
+      owner(5, "token_a", "exclusive_undo");
+  std::vector<trx_preserve_temp_page_reservation> claims;
+  claims.push_back(page_reservation(77, 3, shared_owner));
+  claims.push_back(page_reservation(77, 3, shared_owner));
+  claims.push_back(page_reservation(77, 19, token_owner));
+
+  EXPECT_TRUE(trx_preserve_temp_space_image_register_page_reservations(claims));
+  EXPECT_EQ(2U,
+            trx_preserve_temp_space_image_active_page_reservations_for_test());
+  EXPECT_TRUE(trx_preserve_temp_space_image_page_reserved(77, 3));
+  EXPECT_TRUE(trx_preserve_temp_space_image_page_reserved(77, 19));
+
+  const trx_preserve_temp_reservation_owner conflicting_owner =
+      owner(6, "token_b", "exclusive_undo");
+  ASSERT_TRUE(
+      trx_preserve_temp_space_image_reserve_page(77, 20, conflicting_owner));
+
+  const trx_preserve_temp_reservation_owner later_owner =
+      owner(7, "token_c", "exclusive_undo");
+  std::vector<trx_preserve_temp_page_reservation> conflicting_claims;
+  conflicting_claims.push_back(page_reservation(77, 21, token_owner));
+  conflicting_claims.push_back(page_reservation(77, 20, token_owner));
+  conflicting_claims.push_back(page_reservation(77, 22, later_owner));
+
+  EXPECT_FALSE(trx_preserve_temp_space_image_register_page_reservations(
+      conflicting_claims));
+  EXPECT_FALSE(trx_preserve_temp_space_image_page_reserved(77, 21));
+  EXPECT_FALSE(trx_preserve_temp_space_image_page_reserved(77, 22));
+  EXPECT_EQ(3U,
+            trx_preserve_temp_space_image_active_page_reservations_for_test());
+}
+
+TEST_F(TempStartupReservationRegistryTest,
+       OwnershipClaimsHelperRegistersSharedAndExclusivePages) {
+  std::vector<trx_preserve_temp_ownership_page_claim> claims;
+  claims.push_back(ownership_claim(
+      "token_a", 5, 77, 3, 4, 1, 3,
+      trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER));
+  claims.push_back(ownership_claim(
+      "token_b", 6, 77, 3, 4, 2, 3,
+      trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER));
+  claims.push_back(ownership_claim(
+      "token_a", 5, 77, 3, 4, 1, 19,
+      trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER));
+
+  EXPECT_TRUE(
+      trx_preserve_temp_space_image_register_page_reservations_from_claims(
+          claims));
+  EXPECT_EQ(2U,
+            trx_preserve_temp_space_image_active_page_reservations_for_test());
+  EXPECT_TRUE(trx_preserve_temp_space_image_page_reserved(77, 3));
+  EXPECT_TRUE(trx_preserve_temp_space_image_page_reserved(77, 19));
+
+  std::vector<trx_preserve_temp_ownership_page_claim> conflicting_claims;
+  conflicting_claims.push_back(ownership_claim(
+      "token_a", 5, 77, 3, 4, 1, 20,
+      trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG));
+  conflicting_claims.push_back(ownership_claim(
+      "token_b", 6, 77, 3, 4, 2, 19,
+      trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG));
+  conflicting_claims.push_back(ownership_claim(
+      "token_c", 7, 77, 3, 4, 3, 21,
+      trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG));
+
+  EXPECT_FALSE(
+      trx_preserve_temp_space_image_register_page_reservations_from_claims(
+          conflicting_claims));
+  EXPECT_FALSE(trx_preserve_temp_space_image_page_reserved(77, 20));
+  EXPECT_FALSE(trx_preserve_temp_space_image_page_reserved(77, 21));
+  EXPECT_EQ(2U,
+            trx_preserve_temp_space_image_active_page_reservations_for_test());
+}
+
+TEST_F(TempStartupReservationRegistryTest,
+       TmpRsegBootstrapRequirementIsIdempotentForSharedIdentity) {
+  EXPECT_TRUE(trx_rseg_preserve_bootstrap_tmp_rseg_required(77, 3, 4));
+  EXPECT_TRUE(trx_rseg_preserve_bootstrap_tmp_rseg_required(77, 3, 4));
+  EXPECT_EQ(1U, trx_rseg_preserve_bootstrap_tmp_rseg_count_for_test());
+}
+
+TEST_F(TempStartupReservationRegistryTest,
+       TmpRsegBootstrapOwnershipClaimsAreIdempotentAcrossTokens) {
+  std::vector<trx_preserve_temp_ownership_page_claim> claims;
+  claims.push_back(ownership_claim(
+      "token_a", 5, 77, 3, 4, 1, 3,
+      trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER));
+  claims.push_back(ownership_claim(
+      "token_b", 6, 77, 3, 4, 2, 3,
+      trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER));
+
+  EXPECT_TRUE(
+      trx_rseg_preserve_bootstrap_tmp_rsegs_required_from_claims(claims));
+  EXPECT_EQ(1U, trx_rseg_preserve_bootstrap_tmp_rseg_count_for_test());
+}
+
+TEST_F(TempStartupReservationRegistryTest,
+       TmpRsegBootstrapRejectsSameSlotDifferentIdentity) {
+  ASSERT_TRUE(trx_rseg_preserve_bootstrap_tmp_rseg_required(77, 3, 4));
+
+  EXPECT_FALSE(trx_rseg_preserve_bootstrap_tmp_rseg_required(77, 9, 4));
+  EXPECT_FALSE(trx_rseg_preserve_bootstrap_tmp_rseg_required(78, 3, 4));
+  EXPECT_EQ(1U, trx_rseg_preserve_bootstrap_tmp_rseg_count_for_test());
+}
+
+TEST_F(TempStartupReservationRegistryTest,
+       TmpRsegBootstrapRejectsRequiredSlotBeyondTarget) {
+  ASSERT_TRUE(trx_rseg_preserve_bootstrap_tmp_rseg_required(77, 3, 4));
+
+  EXPECT_FALSE(trx_rseg_preserve_bootstrap_tmp_rsegs(4, false))
+      << "required preserved temp rseg slot 4 is outside target slots 0..3";
+  EXPECT_EQ(1U, trx_rseg_preserve_bootstrap_tmp_rseg_count_for_test());
+}
+
+TEST_F(TempStartupReservationRegistryTest,
+       TmpRsegBootstrapDescriptorCarriesSharedProofPages) {
+  constexpr uint32_t kPageSize = 1024;
+  constexpr uint32_t kRsegSpaceId = 300037;
+  constexpr uint32_t kRsegPageNo = 15;
+  constexpr uint32_t kRsegSlot = 3;
+  trx_preserve_temp_space_image_descriptor descriptor =
+      make_attach_candidate_for_no_redo_undo_sidecar_test(37, kPageSize);
+  const std::string payload = valid_no_redo_undo_sidecar_payload_for_test(
+      kPageSize, kRsegSpaceId, kRsegPageNo, kRsegSlot);
+  ASSERT_EQ(DB_SUCCESS,
+            trx_preserve_temp_space_image_load_no_redo_undo_sidecar(
+                &descriptor,
+                reinterpret_cast<const unsigned char *>(payload.data()),
+                payload.length()));
+
+  EXPECT_TRUE(
+      trx_rseg_preserve_bootstrap_tmp_rseg_required_from_descriptor(
+          descriptor));
+  EXPECT_EQ(1U, trx_rseg_preserve_bootstrap_tmp_rseg_count_for_test());
+  EXPECT_TRUE(
+      trx_rseg_preserve_bootstrap_tmp_rseg_has_shared_pages_for_test(
+          kRsegSpaceId, kRsegPageNo, kRsegSlot))
+      << "startup bootstrap needs the captured shared rseg/FSP proof pages; "
+         "identity-only requirements can only fail closed later";
+}
+
+TEST(TempStartupReservationRegistrySourceTest,
+     AdjustConsumesTmpRsegBootstrapBeforeOrdinaryTempRsegCreation) {
+  const std::string rseg_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0rseg.cc");
+  ASSERT_FALSE(rseg_impl.empty());
+
+  const std::string adjust_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          rseg_impl, "bool trx_rseg_adjust_rollback_segments(");
+  ASSERT_FALSE(adjust_body.empty());
+
+  const size_t bootstrap_pos =
+      adjust_body.find("trx_rseg_preserve_bootstrap_tmp_rsegs("
+                       "target_rollback_segments, false)");
+  const size_t ordinary_create_pos =
+      adjust_body.find("trx_rseg_add_rollback_segments("
+                       "srv_tmp_space.space_id()");
+  const size_t verify_pos =
+      adjust_body.find("trx_rseg_preserve_bootstrap_tmp_rsegs("
+                       "target_rollback_segments, true)");
+  ASSERT_NE(std::string::npos, bootstrap_pos);
+  ASSERT_NE(std::string::npos, ordinary_create_pos);
+  ASSERT_NE(std::string::npos, verify_pos);
+  EXPECT_LT(bootstrap_pos, ordinary_create_pos)
+      << "preserved temp rseg requirements must be registered before ordinary "
+         "temp rseg creation can allocate the requested slot";
+  EXPECT_LT(ordinary_create_pos, verify_pos)
+      << "ordinary temp rseg creation must be followed by a strict preserved "
+         "rseg identity check before startup can continue";
+}
+
+TEST(TempStartupReservationRegistrySourceTest,
+     StartupPreambleRegistersTmpRsegRequirementsBeforeRsegAdjust) {
+  const std::string srv_start = read_source_file_for_temp_table_test(
+      "storage/innobase/srv/srv0start.cc");
+  const std::string preserve_impl =
+      read_source_file_for_temp_table_test("sql/preserve_trx.cc");
+  ASSERT_FALSE(srv_start.empty());
+  ASSERT_FALSE(preserve_impl.empty());
+
+  const size_t preamble_pos =
+      srv_start.find("preserved_temp_images_bootstrap_preamble()");
+  const size_t adjust_pos =
+      srv_start.find("trx_rseg_adjust_rollback_segments(srv_rollback_segments)");
+  ASSERT_NE(std::string::npos, preamble_pos);
+  ASSERT_NE(std::string::npos, adjust_pos);
+  EXPECT_LT(preamble_pos, adjust_pos);
+
+  const std::string preamble_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          preserve_impl, "bool preserved_temp_images_bootstrap_preamble()");
+  ASSERT_FALSE(preamble_body.empty());
+  EXPECT_NE(std::string::npos,
+            preamble_body.find(
+                "trx_rseg_preserve_bootstrap_tmp_rsegs_required_from_claims("))
+      << "startup must register native-adoption temp rseg identities from the "
+         "durable manifest before InnoDB adjusts temp rollback segments";
+  EXPECT_NE(std::string::npos,
+            preamble_body.find(
+                "trx_preserve_temp_space_image_register_page_reservations_from_claims("))
+      << "startup must reserve manifest-owned temporary pages before the "
+         "ordinary temp allocator can reuse them";
+  EXPECT_NE(std::string::npos, preamble_body.find("read_sealed_undo("))
+      << "identity claims are not enough for exact rseg bootstrap; startup "
+         "must read the sealed no-redo undo sidecar";
+  EXPECT_NE(std::string::npos,
+            preamble_body.find(
+                "trx_preserve_temp_space_image_load_no_redo_undo_sidecar("))
+      << "startup must parse shared rseg/FSP proof pages from the sealed "
+         "no-redo undo sidecar";
+  EXPECT_NE(std::string::npos,
+            preamble_body.find(
+                "trx_rseg_preserve_bootstrap_tmp_rseg_required_from_descriptor("))
+      << "startup must hand a loaded descriptor to the rseg bootstrap registry, "
+         "not only the manifest identity claim";
+  EXPECT_NE(std::string::npos, preamble_body.find("claim.rseg_slot"));
+  EXPECT_NE(std::string::npos, preamble_body.find("srv_rollback_segments"))
+      << "slot/count mismatch must be logged against the durable token before "
+         "ordinary temp rseg adjustment aborts startup";
+}
+
 TEST_F(PreserveTrxTempTableGateTest,
        ExplicitTempFeatureOffCapturePredicateIsNoop) {
   preserve_trx_temp_table_enable = false;
@@ -6566,6 +7558,57 @@ TEST_F(PreserveTrxTempTableGateTest,
             preserve_trx_temp_table_preflight_preserve(&m_thd));
 
   preserve_trx_temp_table_clear_transaction_state(&m_thd);
+  preserve_trx_set_enable_value(false);
+}
+
+TEST_F(PreserveTrxTempTableGateTest,
+       NonBatchMetadataBoundaryDoesNotLeaveBatchDrainFlag) {
+  preserve_trx_set_enable_value(true);
+  preserve_trx_temp_table_enable = true;
+  mark_active_transaction(&m_thd);
+
+  TABLE table;
+  TABLE_SHARE share;
+  init_fake_table(&table, &share, TRANSACTIONAL_TMP_TABLE);
+
+  ASSERT_TRUE(
+      preserve_trx_temp_table_note_row_write(&m_thd, &table, nullptr, 0));
+  ASSERT_NE(nullptr, preserve_trx_temp_table_get_participant(&m_thd));
+  ASSERT_TRUE(preserve_trx_temp_table_note_table_truncate(&m_thd, &table));
+
+  EXPECT_FALSE(preserve_trx_temp_table_has_batch_unsupported_boundary(&m_thd));
+  EXPECT_EQ(Preserve_snapshot_status::UNSUPPORTED,
+            preserve_trx_temp_table_preflight_preserve(&m_thd));
+
+  preserve_trx_temp_table_clear_transaction_state(&m_thd);
+  EXPECT_FALSE(preserve_trx_temp_table_has_batch_unsupported_boundary(&m_thd));
+  preserve_trx_set_enable_value(false);
+}
+
+TEST_F(PreserveTrxTempTableGateTest,
+       BatchMetadataBoundarySurvivesTransactionCleanupUntilDrainClearsIt) {
+  preserve_trx_set_enable_value(true);
+  preserve_trx_temp_table_enable = true;
+  mark_active_transaction(&m_thd);
+  m_thd.preserve_trx_temp_table_batch_capture_epoch.store(
+      true, std::memory_order_release);
+
+  TABLE table;
+  TABLE_SHARE share;
+  init_fake_table(&table, &share, TRANSACTIONAL_TMP_TABLE);
+
+  ASSERT_TRUE(
+      preserve_trx_temp_table_note_row_write(&m_thd, &table, nullptr, 0));
+  ASSERT_TRUE(preserve_trx_temp_table_note_table_truncate(&m_thd, &table));
+  ASSERT_TRUE(preserve_trx_temp_table_has_batch_unsupported_boundary(&m_thd));
+
+  preserve_trx_temp_table_clear_transaction_state(&m_thd);
+  EXPECT_TRUE(preserve_trx_temp_table_has_batch_unsupported_boundary(&m_thd));
+
+  preserve_trx_temp_table_clear_batch_unsupported_boundary(&m_thd);
+  m_thd.preserve_trx_temp_table_batch_capture_epoch.store(
+      false, std::memory_order_release);
+  EXPECT_FALSE(preserve_trx_temp_table_has_batch_unsupported_boundary(&m_thd));
   preserve_trx_set_enable_value(false);
 }
 
@@ -9011,6 +10054,7 @@ TEST_F(TempPhysicalTlvTest, ResumeFeatureOnWithNoRedoUndoSidecarPlanCanClaim) {
             plan.source);
   EXPECT_TRUE(plan.requires_sealed_image_sidecars);
   EXPECT_TRUE(plan.requires_no_redo_undo_sidecars);
+  EXPECT_FALSE(plan.native_adoption_capable);
   EXPECT_FALSE(plan.scans_sql_rows);
   EXPECT_FALSE(plan.replays_logical_row_journal);
 
@@ -9026,6 +10070,224 @@ TEST_F(TempPhysicalTlvTest, ResumeFeatureOnWithNoRedoUndoSidecarPlanCanClaim) {
   EXPECT_FALSE(preclaim.retryable_unsupported);
   EXPECT_TRUE(preclaim.claim_preserved_transaction);
   EXPECT_TRUE(preclaim.mutate_base_transaction);
+}
+
+TEST_F(TempPhysicalTlvTest,
+       OwnershipClaimsAreDerivedFromLoadedNoRedoUndoDescriptor) {
+  PreserveTrxTempTableEnableGuard enable_guard(true);
+  constexpr uint32_t kPageSize = 1024;
+  constexpr uint32_t kRsegSpaceId = 500077;
+  constexpr uint32_t kRsegPageNo = 15;
+  constexpr uint32_t kRsegSlot = 3;
+  const std::string token = "temp_tlv_token";
+  const std::string payload = valid_no_redo_undo_sidecar_payload_for_test(
+      kPageSize, kRsegSpaceId, kRsegPageNo, kRsegSlot);
+
+  trx_preserve_temp_space_image_descriptor descriptor =
+      make_attach_candidate_for_no_redo_undo_sidecar_test(77, kPageSize);
+  ASSERT_EQ(DB_SUCCESS,
+            trx_preserve_temp_space_image_load_no_redo_undo_sidecar(
+                &descriptor,
+                reinterpret_cast<const unsigned char *>(payload.data()),
+                payload.length()));
+
+  Preserved_temp_table_undo_descriptor undo =
+      undo_descriptor(descriptor.source_space_id, payload,
+                      token + ".tempts.77.undo");
+  undo.no_redo_undo_rseg_space_id = kRsegSpaceId;
+  undo.no_redo_undo_rseg_page_no = kRsegPageNo;
+  undo.no_redo_undo_rseg_slot = kRsegSlot;
+
+  Preserved_temp_table_manifest manifest;
+  manifest.undo_images.push_back(undo);
+  ASSERT_TRUE(preserve_trx_temp_table_append_ownership_claims_from_descriptor(
+      token, undo, descriptor, &manifest));
+
+  ASSERT_EQ(4U, manifest.ownership_claims.size());
+  std::map<uint32_t, Preserved_temp_table_ownership_claim> by_page;
+  for (const auto &claim : manifest.ownership_claims) {
+    EXPECT_EQ(token, claim.token);
+    EXPECT_EQ(descriptor.source_space_id, claim.source_space_id);
+    EXPECT_EQ(kRsegSpaceId, claim.rseg_space_id);
+    EXPECT_EQ(kRsegPageNo, claim.rseg_page_no);
+    EXPECT_EQ(kRsegSlot, claim.rseg_slot);
+    EXPECT_EQ(7U, claim.undo_slot);
+    EXPECT_TRUE(by_page.emplace(claim.page_no, claim).second);
+  }
+
+  ASSERT_NE(by_page.end(), by_page.find(kRsegPageNo));
+  EXPECT_EQ(trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER,
+            by_page[kRsegPageNo].page_role);
+  ASSERT_NE(by_page.end(), by_page.find(16));
+  EXPECT_EQ(trx_preserve_temp_no_redo_undo_page_kind::RSEG_ALLOCATOR,
+            by_page[16].page_role);
+  ASSERT_NE(by_page.end(), by_page.find(30));
+  EXPECT_EQ(trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER,
+            by_page[30].page_role);
+  ASSERT_NE(by_page.end(), by_page.find(31));
+  EXPECT_EQ(trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG,
+            by_page[31].page_role);
+
+  std::string page31;
+  const trx_preserve_temp_no_redo_undo_page_image *image31 = nullptr;
+  for (size_t i = 0;
+       i < trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor);
+       ++i) {
+    const trx_preserve_temp_no_redo_undo_page_image *image =
+        trx_preserve_temp_space_image_no_redo_undo_page_at(descriptor, i);
+    ASSERT_NE(nullptr, image);
+    if (image->page_no == 31) image31 = image;
+  }
+  ASSERT_NE(nullptr, image31);
+  page31.assign(reinterpret_cast<const char *>(image31->bytes.data()),
+                image31->bytes.size());
+  EXPECT_EQ(digest(page31), by_page[31].page_digest);
+}
+
+TEST_F(TempPhysicalTlvTest,
+       OwnershipClaimsFromDescriptorEncodeAsNativeCapableManifest) {
+  PreserveTrxTempTableEnableGuard enable_guard(true);
+  constexpr uint32_t kPageSize = 1024;
+  constexpr uint32_t kRsegSpaceId = 500079;
+  constexpr uint32_t kRsegPageNo = 15;
+  constexpr uint32_t kRsegSlot = 3;
+  const std::string token = "temp_tlv_token";
+  const std::string payload = valid_no_redo_undo_sidecar_payload_for_test(
+      kPageSize, kRsegSpaceId, kRsegPageNo, kRsegSlot);
+
+  trx_preserve_temp_space_image_descriptor image_descriptor =
+      make_attach_candidate_for_no_redo_undo_sidecar_test(79, kPageSize);
+  ASSERT_EQ(DB_SUCCESS,
+            trx_preserve_temp_space_image_load_no_redo_undo_sidecar(
+                &image_descriptor,
+                reinterpret_cast<const unsigned char *>(payload.data()),
+                payload.length()));
+  const uint32_t source_space_id = image_descriptor.source_space_id;
+
+  Preserved_temp_table_manifest manifest;
+  Preserved_temp_table_manifest_entry entry;
+  entry.table_ordinal = 79;
+  entry.schema_name = "test";
+  entry.table_name = "tmp_native_claims";
+  entry.engine_name = "InnoDB";
+  entry.image = descriptor(79, std::string(kPageSize, 'I'),
+                           token + ".tempts." + std::to_string(source_space_id) +
+                               ".image");
+  entry.image.source_space_id = source_space_id;
+  entry.serialized_dd_table = serialized_temp_dd_table_for_test(
+      entry.schema_name, entry.table_name, entry.engine_name,
+      entry.image.image_table_id);
+  attach_dict_binding(&entry);
+  manifest.tables.push_back(entry);
+
+  Preserved_temp_table_undo_descriptor undo =
+      undo_descriptor(image_descriptor.source_space_id, payload,
+                      token + ".tempts." + std::to_string(source_space_id) +
+                          ".undo");
+  undo.no_redo_undo_rseg_space_id = kRsegSpaceId;
+  undo.no_redo_undo_rseg_page_no = kRsegPageNo;
+  undo.no_redo_undo_rseg_slot = kRsegSlot;
+  manifest.undo_images.push_back(undo);
+  ASSERT_TRUE(preserve_trx_temp_table_append_ownership_claims_from_descriptor(
+      token, undo, image_descriptor, &manifest));
+
+  std::string encoded;
+  ASSERT_TRUE(preserve_trx_encode_temp_table_manifest(manifest, &encoded));
+  Preserved_temp_table_manifest decoded;
+  ASSERT_TRUE(preserve_trx_decode_temp_table_manifest(encoded, &decoded));
+  EXPECT_TRUE(decoded.native_adoption_capable);
+  EXPECT_EQ(manifest.ownership_claims.size(), decoded.ownership_claims.size());
+  Preserve_snapshot_metadata snapshot_metadata = metadata();
+  snapshot_metadata.temp_table_manifest_payload = encoded;
+  const Preserve_trx_temp_table_materialize_plan plan =
+      preserve_trx_temp_table_materialize_plan(snapshot_metadata);
+  EXPECT_TRUE(plan.native_adoption_capable);
+}
+
+TEST_F(TempPhysicalTlvTest,
+       OwnershipClaimsCoverSingleAnchorIntermediateUndoLogPages) {
+  PreserveTrxTempTableEnableGuard enable_guard(true);
+  constexpr uint32_t kPageSize = 1024;
+  constexpr uint32_t kRsegSpaceId = 500078;
+  constexpr uint32_t kRsegPageNo = 15;
+  constexpr uint32_t kRsegSlot = 3;
+  const std::string token = "temp_tlv_token";
+
+  trx_preserve_temp_no_redo_undo_log_anchor update_anchor;
+  update_anchor.present = true;
+  update_anchor.undo_slot = 7;
+  update_anchor.hdr_page_no = 30;
+  update_anchor.hdr_offset = 160;
+  update_anchor.last_page_no = 32;
+  update_anchor.top_page_no = 32;
+  update_anchor.top_offset = 512;
+  update_anchor.top_undo_no = 9876;
+
+  const std::vector<unsigned char> rseg_header =
+      make_temp_rseg_header_page(kPageSize, 0xA1, kRsegSpaceId,
+                                 kRsegPageNo);
+  const std::vector<unsigned char> allocator =
+      make_temp_allocator_page(kPageSize, 0xA2, kRsegSpaceId, 16);
+  std::vector<unsigned char> undo_header =
+      make_temp_undo_page(kPageSize, 0xA3, kRsegSpaceId, 30);
+  std::vector<unsigned char> middle_undo_log =
+      make_temp_undo_page(kPageSize, 0xA4, kRsegSpaceId, 31);
+  std::vector<unsigned char> last_undo_log =
+      make_temp_undo_page(kPageSize, 0xA5, kRsegSpaceId, 32);
+  make_temp_update_undo_three_page_chain_for_test(
+      &undo_header, &middle_undo_log, &last_undo_log, 30, 31, 32);
+
+  const std::string payload = build_no_redo_undo_sidecar_payload_for_test(
+      kPageSize, kRsegSpaceId, kRsegPageNo, kRsegSlot, {}, update_anchor,
+      {{static_cast<uint8_t>(
+            trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER),
+        kRsegPageNo, rseg_header},
+       {static_cast<uint8_t>(
+            trx_preserve_temp_no_redo_undo_page_kind::RSEG_ALLOCATOR),
+        16, allocator},
+       {static_cast<uint8_t>(
+            trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER),
+        30, undo_header},
+       {static_cast<uint8_t>(
+            trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG),
+        31, middle_undo_log},
+       {static_cast<uint8_t>(
+            trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG),
+        32, last_undo_log}});
+
+  trx_preserve_temp_space_image_descriptor descriptor =
+      make_attach_candidate_for_no_redo_undo_sidecar_test(78, kPageSize);
+  ASSERT_EQ(DB_SUCCESS,
+            trx_preserve_temp_space_image_load_no_redo_undo_sidecar(
+                &descriptor,
+                reinterpret_cast<const unsigned char *>(payload.data()),
+                payload.length()));
+
+  Preserved_temp_table_undo_descriptor undo =
+      undo_descriptor(descriptor.source_space_id, payload,
+                      token + ".tempts.78.undo");
+  undo.no_redo_undo_rseg_space_id = kRsegSpaceId;
+  undo.no_redo_undo_rseg_page_no = kRsegPageNo;
+  undo.no_redo_undo_rseg_slot = kRsegSlot;
+
+  Preserved_temp_table_manifest manifest;
+  manifest.undo_images.push_back(undo);
+  ASSERT_TRUE(preserve_trx_temp_table_append_ownership_claims_from_descriptor(
+      token, undo, descriptor, &manifest));
+
+  ASSERT_EQ(5U, manifest.ownership_claims.size());
+  std::map<uint32_t, Preserved_temp_table_ownership_claim> by_page;
+  for (const auto &claim : manifest.ownership_claims) {
+    EXPECT_TRUE(by_page.emplace(claim.page_no, claim).second);
+  }
+  ASSERT_NE(by_page.end(), by_page.find(31));
+  EXPECT_EQ(7U, by_page[31].undo_slot);
+  EXPECT_EQ(trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG,
+            by_page[31].page_role);
+  EXPECT_EQ(digest(std::string(reinterpret_cast<const char *>(
+                                   middle_undo_log.data()),
+                               middle_undo_log.size())),
+            by_page[31].page_digest);
 }
 
 TEST_F(TempPhysicalTlvTest, FeatureOffNewPreserveDoesNotEmitTlv80OrSidecars) {
@@ -10031,6 +11293,7 @@ TEST_F(PreserveTrxTempTableManifestTest, ManifestRoundTrips) {
 
   std::string payload;
   ASSERT_TRUE(preserve_trx_encode_temp_table_manifest(manifest, &payload));
+  EXPECT_EQ(6U, read_le32(payload, 0));
   Preserved_temp_table_manifest decoded;
   ASSERT_TRUE(preserve_trx_decode_temp_table_manifest(payload, &decoded));
 
@@ -10065,6 +11328,312 @@ TEST_F(PreserveTrxTempTableManifestTest, ManifestRoundTrips) {
   EXPECT_EQ(undo.blob_name, decoded.undo_images[0].blob_name);
   EXPECT_EQ(undo.size, decoded.undo_images[0].size);
   EXPECT_EQ(undo.sha256, decoded.undo_images[0].sha256);
+  EXPECT_FALSE(decoded.native_adoption_capable);
+}
+
+TEST_F(PreserveTrxTempTableManifestTest,
+       LegacyManifestWithoutOwnershipExtensionIsDecodedNotNativeCapable) {
+  Preserved_temp_table_manifest manifest;
+  Preserved_temp_table_manifest_entry entry;
+  entry.table_ordinal = 5;
+  entry.schema_name = "test";
+  entry.table_name = "tmp_legacy_ownership";
+  entry.engine_name = "InnoDB";
+  entry.binlog_drop_if_temp = true;
+  entry.serialized_dd_table = "serialized-dd-table";
+  entry.image = descriptor(5, "legacy-ownership-image",
+                           "tok.tempts.5.image");
+  attach_dict_binding(&entry);
+  manifest.tables.push_back(entry);
+  manifest.undo_images.push_back(
+      undo_descriptor(5, "legacy-ownership-undo", "tok.tempts.5.undo"));
+
+  std::string payload;
+  ASSERT_TRUE(preserve_trx_encode_temp_table_manifest(manifest, &payload));
+  Preserved_temp_table_manifest decoded;
+  ASSERT_TRUE(preserve_trx_decode_temp_table_manifest(payload, &decoded));
+
+  EXPECT_FALSE(decoded.native_adoption_capable);
+  EXPECT_TRUE(decoded.ownership_claims.empty());
+}
+
+TEST_F(PreserveTrxTempTableManifestTest,
+       SharedRsegHeaderSameDigestDifferentUndoSlotsHasNoOwnershipConflict) {
+  Preserved_temp_table_ownership_claim first;
+  first.token = "token_a";
+  first.source_space_id = 5;
+  first.rseg_space_id = 77;
+  first.rseg_page_no = 3;
+  first.rseg_slot = 4;
+  first.undo_slot = 1;
+  first.page_no = 3;
+  first.page_role = trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER;
+  first.page_digest = digest("shared-rseg-header");
+
+  Preserved_temp_table_ownership_claim second = first;
+  second.token = "token_b";
+  second.source_space_id = 6;
+  second.undo_slot = 2;
+
+  EXPECT_EQ(Preserved_temp_table_ownership_conflict::NONE,
+            preserve_trx_temp_table_check_ownership_conflicts(
+                std::vector<Preserved_temp_table_ownership_claim>{first},
+                std::vector<Preserved_temp_table_ownership_claim>{second}));
+}
+
+TEST_F(PreserveTrxTempTableManifestTest,
+       ManifestWithValidOwnershipExtensionIsNativeAdoptionCapable) {
+  Preserved_temp_table_manifest manifest;
+  Preserved_temp_table_manifest_entry entry;
+  entry.table_ordinal = 5;
+  entry.schema_name = "test";
+  entry.table_name = "tmp_native_capable";
+  entry.engine_name = "InnoDB";
+  entry.binlog_drop_if_temp = true;
+  entry.serialized_dd_table = "serialized-dd-table";
+  entry.image = descriptor(5, "native-capable-image", "tok.tempts.5.image");
+  attach_dict_binding(&entry);
+  manifest.tables.push_back(entry);
+  const Preserved_temp_table_undo_descriptor undo =
+      undo_descriptor(5, "native-capable-undo", "tok.tempts.5.undo");
+  manifest.undo_images.push_back(undo);
+
+  Preserved_temp_table_ownership_claim rseg_header;
+  rseg_header.token = "tok";
+  rseg_header.source_space_id = entry.image.source_space_id;
+  rseg_header.rseg_space_id = undo.no_redo_undo_rseg_space_id;
+  rseg_header.rseg_page_no = undo.no_redo_undo_rseg_page_no;
+  rseg_header.rseg_slot = undo.no_redo_undo_rseg_slot;
+  rseg_header.undo_slot = 1;
+  rseg_header.page_no = undo.no_redo_undo_rseg_page_no;
+  rseg_header.page_role =
+      trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER;
+  rseg_header.page_digest = digest("native-rseg-header");
+  manifest.ownership_claims.push_back(rseg_header);
+
+  Preserved_temp_table_ownership_claim undo_header = rseg_header;
+  undo_header.page_no = 19;
+  undo_header.page_role =
+      trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER;
+  undo_header.page_digest = digest("native-undo-header");
+  manifest.ownership_claims.push_back(undo_header);
+
+  std::string payload;
+  ASSERT_TRUE(preserve_trx_encode_temp_table_manifest(manifest, &payload));
+  EXPECT_EQ(7U, read_le32(payload, 0));
+  Preserved_temp_table_manifest decoded;
+  ASSERT_TRUE(preserve_trx_decode_temp_table_manifest(payload, &decoded));
+
+  EXPECT_TRUE(decoded.native_adoption_capable);
+  ASSERT_EQ(2U, decoded.ownership_claims.size());
+  EXPECT_EQ(entry.image.source_space_id,
+            decoded.ownership_claims[0].source_space_id);
+  EXPECT_EQ(trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER,
+            decoded.ownership_claims[0].page_role);
+  EXPECT_EQ(trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER,
+            decoded.ownership_claims[1].page_role);
+
+  Preserve_snapshot_metadata snapshot_metadata;
+  snapshot_metadata.temp_table_manifest_payload = payload;
+  const Preserve_trx_temp_table_materialize_plan plan =
+      preserve_trx_temp_table_materialize_plan(snapshot_metadata);
+  EXPECT_TRUE(plan.requires_no_redo_undo_sidecars);
+  EXPECT_TRUE(plan.native_adoption_capable);
+}
+
+TEST_F(PreserveTrxTempTableManifestTest,
+       OwnershipClaimsMustMatchUndoDescriptorIdentity) {
+  Preserved_temp_table_manifest manifest;
+  Preserved_temp_table_manifest_entry entry;
+  entry.table_ordinal = 5;
+  entry.schema_name = "test";
+  entry.table_name = "tmp_claim_identity";
+  entry.engine_name = "InnoDB";
+  entry.binlog_drop_if_temp = true;
+  entry.serialized_dd_table = "serialized-dd-table";
+  entry.image = descriptor(5, "claim-identity-image", "tok.tempts.5.image");
+  attach_dict_binding(&entry);
+  manifest.tables.push_back(entry);
+  const Preserved_temp_table_undo_descriptor undo =
+      undo_descriptor(5, "claim-identity-undo", "tok.tempts.5.undo");
+  manifest.undo_images.push_back(undo);
+
+  Preserved_temp_table_ownership_claim claim;
+  claim.token = "tok";
+  claim.source_space_id = undo.source_space_id;
+  claim.rseg_space_id = undo.no_redo_undo_rseg_space_id;
+  claim.rseg_page_no = undo.no_redo_undo_rseg_page_no;
+  claim.rseg_slot = undo.no_redo_undo_rseg_slot;
+  claim.undo_slot = 1;
+  claim.page_no = undo.no_redo_undo_rseg_page_no;
+  claim.page_role = trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER;
+  claim.page_digest = digest("claim-identity-rseg-header");
+  manifest.ownership_claims.push_back(claim);
+
+  std::string payload;
+  ASSERT_TRUE(preserve_trx_encode_temp_table_manifest(manifest, &payload));
+
+  manifest.ownership_claims[0].source_space_id = undo.source_space_id + 1;
+  EXPECT_FALSE(preserve_trx_encode_temp_table_manifest(manifest, &payload));
+
+  manifest.ownership_claims[0] = claim;
+  manifest.ownership_claims[0].token = "other";
+  EXPECT_FALSE(preserve_trx_encode_temp_table_manifest(manifest, &payload));
+
+  manifest.ownership_claims[0] = claim;
+  manifest.ownership_claims[0].rseg_space_id =
+      undo.no_redo_undo_rseg_space_id + 1;
+  EXPECT_FALSE(preserve_trx_encode_temp_table_manifest(manifest, &payload));
+}
+
+TEST_F(PreserveTrxTempTableManifestTest,
+       OwnershipClaimWithoutSourceSpaceOwnerIsInvalid) {
+  Preserved_temp_table_ownership_claim claim;
+  claim.token = "token_a";
+  claim.source_space_id = 0;
+  claim.rseg_space_id = 77;
+  claim.rseg_page_no = 3;
+  claim.rseg_slot = 4;
+  claim.undo_slot = 1;
+  claim.page_no = 19;
+  claim.page_role = trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER;
+  claim.page_digest = digest("undo-header");
+
+  EXPECT_EQ(Preserved_temp_table_ownership_conflict::INVALID_CLAIM,
+            preserve_trx_temp_table_check_ownership_conflicts(
+                std::vector<Preserved_temp_table_ownership_claim>{claim},
+                std::vector<Preserved_temp_table_ownership_claim>{}));
+}
+
+TEST_F(PreserveTrxTempTableManifestTest,
+       PageZeroOwnershipClaimIsValidForTempTablespaceImage) {
+  Preserved_temp_table_ownership_claim claim;
+  claim.token = "token_a";
+  claim.source_space_id = 5;
+  claim.rseg_space_id = 77;
+  claim.rseg_page_no = 3;
+  claim.rseg_slot = 4;
+  claim.undo_slot = 1;
+  claim.page_no = 0;
+  claim.page_role = trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER;
+  claim.page_digest = digest("undo-header-page-zero");
+
+  EXPECT_EQ(Preserved_temp_table_ownership_conflict::NONE,
+            preserve_trx_temp_table_check_ownership_conflicts(
+                std::vector<Preserved_temp_table_ownership_claim>{claim},
+                std::vector<Preserved_temp_table_ownership_claim>{}));
+}
+
+TEST_F(PreserveTrxTempTableManifestTest,
+       EmptyVersionSevenOwnershipExtensionIsRejected) {
+  Preserved_temp_table_manifest manifest;
+  Preserved_temp_table_manifest_entry entry;
+  entry.table_ordinal = 5;
+  entry.schema_name = "test";
+  entry.table_name = "tmp_empty_v7_ownership";
+  entry.engine_name = "InnoDB";
+  entry.binlog_drop_if_temp = true;
+  entry.serialized_dd_table = "serialized-dd-table";
+  entry.image = descriptor(5, "empty-v7-image", "tok.tempts.5.image");
+  attach_dict_binding(&entry);
+  manifest.tables.push_back(entry);
+  manifest.undo_images.push_back(
+      undo_descriptor(5, "empty-v7-undo", "tok.tempts.5.undo"));
+
+  std::string payload;
+  ASSERT_TRUE(preserve_trx_encode_temp_table_manifest(manifest, &payload));
+  ASSERT_EQ(6U, read_le32(payload, 0));
+  overwrite_le32(&payload, 0, 7);
+  append_le32_for_temp_undo_sidecar(&payload, 0);
+
+  Preserved_temp_table_manifest decoded;
+  EXPECT_FALSE(preserve_trx_decode_temp_table_manifest(payload, &decoded));
+}
+
+TEST_F(PreserveTrxTempTableManifestTest,
+       SameUndoSlotOrForeignExclusiveUndoHeaderPageHasOwnershipConflict) {
+  Preserved_temp_table_ownership_claim first;
+  first.token = "token_a";
+  first.source_space_id = 5;
+  first.rseg_space_id = 77;
+  first.rseg_page_no = 3;
+  first.rseg_slot = 4;
+  first.undo_slot = 1;
+  first.page_no = 19;
+  first.page_role = trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER;
+  first.page_digest = digest("undo-header");
+
+  Preserved_temp_table_ownership_claim same_slot = first;
+  same_slot.token = "token_b";
+  same_slot.source_space_id = 6;
+  same_slot.page_no = 20;
+  same_slot.page_digest = digest("other-undo-header");
+  EXPECT_EQ(Preserved_temp_table_ownership_conflict::EXCLUSIVE_OWNER,
+            preserve_trx_temp_table_check_ownership_conflicts(
+                std::vector<Preserved_temp_table_ownership_claim>{first},
+                std::vector<Preserved_temp_table_ownership_claim>{same_slot}));
+
+  Preserved_temp_table_ownership_claim same_page = first;
+  same_page.token = "token_c";
+  same_page.source_space_id = 7;
+  same_page.undo_slot = 2;
+  EXPECT_EQ(Preserved_temp_table_ownership_conflict::EXCLUSIVE_OWNER,
+            preserve_trx_temp_table_check_ownership_conflicts(
+                std::vector<Preserved_temp_table_ownership_claim>{first},
+                std::vector<Preserved_temp_table_ownership_claim>{same_page}));
+
+  Preserved_temp_table_ownership_claim same_owner_different_digest = first;
+  same_owner_different_digest.page_digest = digest("changed-undo-header");
+  EXPECT_EQ(Preserved_temp_table_ownership_conflict::EXCLUSIVE_OWNER,
+            preserve_trx_temp_table_check_ownership_conflicts(
+                std::vector<Preserved_temp_table_ownership_claim>{
+                    first, same_owner_different_digest},
+                std::vector<Preserved_temp_table_ownership_claim>{}));
+
+  Preserved_temp_table_ownership_claim same_owner_different_role = first;
+  same_owner_different_role.page_role =
+      trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG;
+  EXPECT_EQ(Preserved_temp_table_ownership_conflict::NONE,
+            preserve_trx_temp_table_check_ownership_conflicts(
+                std::vector<Preserved_temp_table_ownership_claim>{first},
+                std::vector<Preserved_temp_table_ownership_claim>{
+                    same_owner_different_role}));
+
+  Preserved_temp_table_ownership_claim same_token_different_slot = first;
+  same_token_different_slot.undo_slot = 2;
+  same_token_different_slot.page_role =
+      trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG;
+  EXPECT_EQ(Preserved_temp_table_ownership_conflict::NONE,
+            preserve_trx_temp_table_check_ownership_conflicts(
+                std::vector<Preserved_temp_table_ownership_claim>{first},
+                std::vector<Preserved_temp_table_ownership_claim>{
+                    same_token_different_slot}));
+}
+
+TEST_F(PreserveTrxTempTableManifestTest,
+       SharedMetadataPageSameKeyDifferentDigestHasOwnershipConflict) {
+  Preserved_temp_table_ownership_claim first;
+  first.token = "token_a";
+  first.source_space_id = 5;
+  first.rseg_space_id = 77;
+  first.rseg_page_no = 3;
+  first.rseg_slot = 4;
+  first.undo_slot = 1;
+  first.page_no = 3;
+  first.page_role = trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER;
+  first.page_digest = digest("shared-rseg-header");
+
+  Preserved_temp_table_ownership_claim different_digest = first;
+  different_digest.token = "token_b";
+  different_digest.source_space_id = 6;
+  different_digest.undo_slot = 2;
+  different_digest.page_digest = digest("different-rseg-header");
+
+  EXPECT_EQ(Preserved_temp_table_ownership_conflict::SHARED_DIGEST,
+            preserve_trx_temp_table_check_ownership_conflicts(
+                std::vector<Preserved_temp_table_ownership_claim>{first},
+                std::vector<Preserved_temp_table_ownership_claim>{
+                    different_digest}));
 }
 
 TEST_F(PreserveTrxTempTableManifestTest,
@@ -10209,6 +11778,42 @@ TEST_F(PreserveTrxTempTableManifestTest,
 
   std::string payload;
   EXPECT_FALSE(preserve_trx_encode_temp_table_manifest(manifest, &payload));
+}
+
+TEST_F(PreserveTrxTempTableManifestTest,
+       RejectsMultipleNoRedoUndoSourceSpacesInOneTransaction) {
+  Preserved_temp_table_manifest manifest;
+
+  Preserved_temp_table_manifest_entry first;
+  first.table_ordinal = 5;
+  first.schema_name = "test";
+  first.table_name = "tmp_first_undo_space";
+  first.engine_name = "InnoDB";
+  first.serialized_dd_table = "serialized-dd-table-1";
+  first.image = descriptor(5, "first-image", "tok.tempts.5.image");
+  attach_dict_binding(&first);
+  manifest.tables.push_back(first);
+
+  Preserved_temp_table_manifest_entry second;
+  second.table_ordinal = 6;
+  second.schema_name = "test";
+  second.table_name = "tmp_second_undo_space";
+  second.engine_name = "InnoDB";
+  second.serialized_dd_table = "serialized-dd-table-2";
+  second.image = descriptor(6, "second-image", "tok.tempts.6.image");
+  attach_dict_binding(&second);
+  manifest.tables.push_back(second);
+
+  manifest.undo_images.push_back(
+      undo_descriptor(5, "first-undo", "tok.tempts.5.undo"));
+  manifest.undo_images.push_back(
+      undo_descriptor(6, "second-undo", "tok.tempts.6.undo"));
+
+  std::string payload;
+  EXPECT_FALSE(preserve_trx_encode_temp_table_manifest(manifest, &payload))
+      << "v1 reconnects no-redo undo at transaction scope; a token with "
+         "multiple undo source spaces would pass preserve but fail during "
+         "second reconnect on resume";
 }
 
 TEST_F(PreserveTrxTempTableManifestTest,

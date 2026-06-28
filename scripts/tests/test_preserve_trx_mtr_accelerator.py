@@ -39,7 +39,45 @@ class PreserveTrxMtrAcceleratorTest(unittest.TestCase):
         )
         (root / "build-debug/mysql-test").mkdir(parents=True)
         (root / "build-release/mysql-test").mkdir(parents=True)
+        (root / "scripts").mkdir()
         return tmp
+
+    def install_fake_mtr(self, root: Path, marker: Path = None):
+        mtr = root / "build-debug/mysql-test/mtr"
+        marker_line = ""
+        if marker is not None:
+            marker_line = f"Path({str(marker)!r}).write_text('mtr ran\\n')\n"
+        mtr.write_text(
+            "#!/usr/bin/env python3\n"
+            "from pathlib import Path\n"
+            "import sys\n"
+            f"{marker_line}"
+            "print('fake mtr passed')\n"
+            "sys.exit(0)\n"
+        )
+        mtr.chmod(0o755)
+
+    def install_fake_source_lint(self, root: Path, return_code: int = 0):
+        runner = root / "scripts/preserve_trx_lint_runner.py"
+        status = repr("pass" if return_code == 0 else "fail")
+        runner.write_text(
+            "#!/usr/bin/env python3\n"
+            "import argparse, json, sys\n"
+            "from pathlib import Path\n"
+            "parser = argparse.ArgumentParser()\n"
+            "parser.add_argument('--repo-root')\n"
+            "parser.add_argument('--output-dir')\n"
+            "args = parser.parse_args()\n"
+            "out = Path(args.output_dir)\n"
+            "out.mkdir(parents=True, exist_ok=True)\n"
+            "summary = {'validation_mode': 'source_lint', "
+            f"'status': {status}, "
+            "'rule_count': 1, 'findings': []}\n"
+            "(out / 'lint-summary.json').write_text(json.dumps(summary))\n"
+            f"print('fake source lint rc={return_code}')\n"
+            f"sys.exit({return_code})\n"
+        )
+        runner.chmod(0o755)
 
     def test_lint_tests_are_excluded_from_behavior_shards_by_default(self):
         tmp = self.make_repo()
@@ -223,6 +261,80 @@ class PreserveTrxMtrAcceleratorTest(unittest.TestCase):
             self.assertEqual("debug", manifest["build_profile"])
             self.assertIn("debug behavior MTR", summary)
             self.assertIn("source lint", summary)
+
+    def test_main_run_executes_standalone_source_lint_by_default(self):
+        tmp = self.make_repo()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.install_fake_mtr(root)
+        self.install_fake_source_lint(root)
+        with tempfile.TemporaryDirectory() as outdir:
+            rc = accelerator_main([
+                "--repo-root",
+                tmp.name,
+                "--build-profile",
+                "debug",
+                "--build-dir",
+                str(root / "build-debug"),
+                "--mode",
+                "normal",
+                "--big-test",
+                "--run-root",
+                outdir,
+                "--run-id",
+                "unit-run",
+            ])
+
+            self.assertEqual(0, rc)
+            run_dir = Path(outdir) / "unit-run"
+            manifest = json.loads((run_dir / "manifest.json").read_text())
+            self.assertEqual("pass", manifest["status"])
+            self.assertTrue(manifest["source_lint"]["required"])
+            source_lint_results = [
+                item for item in manifest["shard_results"]
+                if item["id"] == "source_lint"
+            ]
+            self.assertEqual(1, len(source_lint_results))
+            self.assertEqual(0, source_lint_results[0]["return_code"])
+            self.assertIn(
+                "fake source lint rc=0",
+                (run_dir / "logs/source_lint.log").read_text(),
+            )
+
+    def test_source_lint_failure_fails_before_mtr_shards(self):
+        tmp = self.make_repo()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        marker = root / "mtr-ran.txt"
+        self.install_fake_mtr(root, marker)
+        self.install_fake_source_lint(root, return_code=7)
+        with tempfile.TemporaryDirectory() as outdir:
+            rc = accelerator_main([
+                "--repo-root",
+                tmp.name,
+                "--build-profile",
+                "debug",
+                "--build-dir",
+                str(root / "build-debug"),
+                "--mode",
+                "normal",
+                "--big-test",
+                "--run-root",
+                outdir,
+                "--run-id",
+                "unit-lint-fails",
+            ])
+
+            self.assertEqual(1, rc)
+            run_dir = Path(outdir) / "unit-lint-fails"
+            manifest = json.loads((run_dir / "manifest.json").read_text())
+            self.assertEqual("fail", manifest["status"])
+            self.assertEqual(
+                7,
+                next(item for item in manifest["shard_results"]
+                     if item["id"] == "source_lint")["return_code"],
+            )
+            self.assertFalse(marker.exists())
 
 
 if __name__ == "__main__":

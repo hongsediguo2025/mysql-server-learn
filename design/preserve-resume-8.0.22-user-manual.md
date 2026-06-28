@@ -19,8 +19,9 @@ Preserve/Resume transaction 特性的使用方式、实现原理、参数体系�
 
 Preserve/Resume 的目标是在受控停机、重启或维护窗口中，把一个尚未提交
 的显式事务转换成可恢复的 durable token。服务端重启后，客户端可以用该
-token 把事务恢复到新的连接上，然后继续执行 `COMMIT`、`ROLLBACK` 或后续
-SQL。
+token 把事务恢复到新的连接上。普通 preserved transaction 可以继续执行
+SQL，然后由用户 `COMMIT` 或 `ROLLBACK`；带用户临时表 no-redo undo sidecar
+的事务第一版只允许恢复后继续 `COMMIT` 或 `ROLLBACK`。
 
 它不是普通 XA 的用户接口包装，也不是自动提交机制。它保留的是一个仍处于
 事务语义中的未提交事务，包括 InnoDB prepared transaction、可恢复的锁/读
@@ -209,6 +210,11 @@ token 的 timeout 是 wall-clock 语义。重启恢复时：
 - 如果 rollback 或 cleanup 失败，P_S 会记录 `EXPIRED_CLEANUP_FAILED`、`FAILED`
   或带 `LAST_ERROR` 的 observable record。
 
+启动时必须保持 `preserve_trx_enable=ON` 才会执行 preserved snapshot startup
+recovery。若实例以 `--preserve-trx-enable=OFF` 启动，代码不会扫描和恢复
+preserve 目录中已有 token；运行中再把该变量设为 `ON` 也不会补做 startup
+recovery。需要恢复既有 token 时，应以 `preserve_trx_enable=ON` 重新启动实例。
+
 ## 4. 完整参数表
 
 ### 4.1 功能开关和存储目录
@@ -251,8 +257,8 @@ batch max 或容量不足 fail closed。
 |---|---:|---|---|---|
 | `preserve_trx_max_snapshot_bytes` | `16777216` | `1..ULLONG_MAX` 字节 | global | snapshot metadata 文件最大 16 MiB。 |
 | `preserve_trx_max_binlog_cache_bytes` | `1073741824` | `1..ULLONG_MAX` 字节 | global | 单个 preserved binlog cache sidecar 最大 1 GiB。warmcopy 和非 warmcopy 最终 sidecar 都受它约束。 |
-| `preserve_trx_temp_table_enable` | `ON` | `ON`/`OFF` | global | 开启受支持的用户 InnoDB 临时表 preserve/resume。 |
-| `preserve_trx_max_temp_sidecar_bytes` | `1073741824` | `1..1073741824` 字节 | global | 单个临时表 image 或 undo sidecar 最大 1 GiB。 |
+| `preserve_trx_temp_table_enable` | `ON` | `ON`/`OFF` | global | 开启受约束的用户 InnoDB 临时表 preserve/resume；tracked Temp-DML 通过 physical image 和 no-redo undo sidecar 恢复，DDL/metadata/savepoint/statement rollback 边界仍 fail closed。关闭该子开关不会关闭普通 preserved transaction；新 preserve 遇到用户临时表历史会 fail closed，已有 temp manifest token 在 resume 前返回 retryable unsupported，重新打开后可继续 retry。 |
+| `preserve_trx_max_temp_sidecar_bytes` | `1073741824` | `1..ULLONG_MAX` 字节 | global | 单个临时表 image 或 undo sidecar 最大字节数，默认 1 GiB。 |
 
 这些都是 artifact/文件尺寸限制，不是堆内存上限。
 

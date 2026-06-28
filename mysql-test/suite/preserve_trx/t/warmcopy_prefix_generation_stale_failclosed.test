@@ -50,7 +50,7 @@ SET DEBUG_SYNC = 'RESET';
 --connection default
 --let $assert_text= stale warmcopy generation fails during phase1
 --let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
---let $assert_select= PRESERVE: drain participant observation stage=open_phase1_failed index=0 state=ABANDONED owns_artifact=(YES|NO) bytes_used=[0-9]+ bytes_budget=[0-9]+ .*phase1_progress=[0-9]+ failure_reason=warm-copy phase1 preparation failed
+--let $assert_select= PRESERVE: drain participant observation stage=open_phase1_failed index=[0-9]+ state=ABANDONED owns_artifact=(YES|NO) bytes_used=[0-9]+ bytes_budget=[0-9]+ .*phase1_progress=[0-9]+ failure_reason=warm-copy phase1 preparation failed
 --let $assert_count_condition= >= 1
 --source include/assert_grep.inc
 --let $assert_count_condition=

@@ -34,6 +34,7 @@
 #include <cstring>
 #include <ctime>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -142,6 +143,7 @@ uint preserve_trx_lock_warmcopy_seal_threads = 0;
 uint preserve_trx_lock_warmcopy_conversion_wait_timeout_ms = 30000;
 uint preserve_trx_parallel_preserve_threads = 0;
 extern ulong srv_force_recovery;
+extern ulong srv_rollback_segments;
 
 static std::atomic<bool> g_preserve_trx_enable_cached{true};
 static std::atomic<bool> g_preserve_trx_enable_cache_initialized{false};
@@ -5519,6 +5521,7 @@ class Temp_table_phase1_drain_participant final
       mysql_mutex_lock(&candidate->LOCK_thd_data);
       candidate->preserve_trx_temp_table_batch_capture_epoch.store(
           false, std::memory_order_release);
+      preserve_trx_temp_table_clear_batch_unsupported_boundary(candidate);
       mysql_mutex_unlock(&candidate->LOCK_thd_data);
     }
 
@@ -6769,13 +6772,6 @@ bool preserved_trx_preflight_read_failure_requires_startup_abort_for_unit_test(
   return preserved_trx_preflight_read_failure_requires_startup_abort(status);
 }
 
-static bool delete_preserved_snapshot_files_or_log(const std::string &dir,
-                                                   const std::string &token) {
-  if (!delete_snapshot_files(dir, token)) return false;
-  return log_preserved_trx_cleanup_failure(token,
-                                           "failed to delete snapshot files");
-}
-
 static bool delete_orphan_binlog_cache_or_log(const std::string &dir,
                                               const std::string &token) {
   auto store = create_preserved_trx_default_store(dir);
@@ -6821,14 +6817,48 @@ static bool delete_preserved_temp_table_sidecars_or_log(
       token, "failed to delete preserved temporary table sidecars");
 }
 
+enum class Temp_sidecar_cleanup_mode {
+  METADATA_AWARE,
+  RAW_UNLINK
+};
+
 static bool delete_preserved_snapshot_files_and_sidecars_or_log(
     const std::string &dir, const std::string &token,
-    const Preserve_snapshot_metadata *metadata) {
-  if (delete_preserved_snapshot_files_or_log(dir, token)) return true;
+    const Preserve_snapshot_metadata *metadata,
+    Temp_sidecar_cleanup_mode temp_sidecar_cleanup_mode =
+        Temp_sidecar_cleanup_mode::METADATA_AWARE) {
+  Preserve_snapshot_remove_options remove_options;
+  if (metadata != nullptr && !metadata->temp_table_manifest_payload.empty() &&
+      temp_sidecar_cleanup_mode == Temp_sidecar_cleanup_mode::METADATA_AWARE) {
+    /*
+      Temp-table sidecars may contain no-redo undo reservation evidence.  Keep
+      them through the generic snapshot removal so the temp cleanup path can
+      read the undo sidecar, release allocator reservations, and then remove the
+      token-owned sidecars in one metadata-aware step.
+    */
+    remove_options.preserve_committed_temp_sidecar_source_space_ids =
+        preserve_trx_temp_table_sidecar_source_space_ids(*metadata);
+  }
+  if (delete_snapshot_files_with_status(dir, token, remove_options) !=
+      Preserve_snapshot_delete_status::OK) {
+    return log_preserved_trx_cleanup_failure(
+        token, "failed to delete snapshot files");
+  }
 
   if (metadata == nullptr) return false;
   release_temp_sidecar_space_id_reservations(*metadata);
   if (metadata->temp_table_manifest_payload.empty()) return false;
+  if (temp_sidecar_cleanup_mode == Temp_sidecar_cleanup_mode::RAW_UNLINK) {
+    /*
+      Recovery reaches RAW_UNLINK only after the sidecar has already been
+      classified as corrupt/unsupported, or the token has been tainted. Do not
+      parse the sidecar again during cleanup; remove token-owned files by name
+      and release any manifest-declared ownership reservations that do not
+      require sidecar bytes.
+    */
+    preserve_trx_temp_table_release_ownership_reservations(*metadata);
+    return false;
+  }
 
   return delete_preserved_temp_table_sidecars_or_log(dir, token, *metadata);
 }
@@ -6864,7 +6894,9 @@ static bool restore_record_after_resume_failure(Preserved_trx_record &record,
 static bool rollback_preserved_snapshot_or_log(
     const std::string &dir, const std::string &token,
     const std::string &reason,
-    const Preserve_snapshot_metadata *metadata = nullptr) {
+    const Preserve_snapshot_metadata *metadata = nullptr,
+    Temp_sidecar_cleanup_mode temp_sidecar_cleanup_mode =
+        Temp_sidecar_cleanup_mode::METADATA_AWARE) {
   const std::string message =
       redacted_preserved_trx_log_subject(token) +
       " recovery forced rollback: " + reason;
@@ -6887,14 +6919,16 @@ static bool rollback_preserved_snapshot_or_log(
       reason.find("timeout") != std::string::npos ? "timeout" : "failure",
       reason.c_str());
   delete_detached_mdl_context(token);
-  return delete_preserved_snapshot_files_and_sidecars_or_log(dir, token,
-                                                             metadata);
+  return delete_preserved_snapshot_files_and_sidecars_or_log(
+      dir, token, metadata, temp_sidecar_cleanup_mode);
 }
 
 static bool rollback_claimed_preserved_snapshot_or_log(
     const std::string &dir, const std::string &token, trx_t *trx,
     const std::string &reason,
-    const Preserve_snapshot_metadata *metadata = nullptr) {
+    const Preserve_snapshot_metadata *metadata = nullptr,
+    Temp_sidecar_cleanup_mode temp_sidecar_cleanup_mode =
+        Temp_sidecar_cleanup_mode::METADATA_AWARE) {
   const std::string message =
       redacted_preserved_trx_log_subject(token) +
       " recovery forced rollback: " + reason;
@@ -6910,8 +6944,8 @@ static bool rollback_claimed_preserved_snapshot_or_log(
       reason.find("timeout") != std::string::npos ? "timeout" : "failure",
       reason.c_str());
   delete_detached_mdl_context(token);
-  return delete_preserved_snapshot_files_and_sidecars_or_log(dir, token,
-                                                             metadata);
+  return delete_preserved_snapshot_files_and_sidecars_or_log(
+      dir, token, metadata, temp_sidecar_cleanup_mode);
 }
 
 static bool preserve_trx_recovery_deadline_expired(
@@ -7889,25 +7923,31 @@ static bool recover_preserved_snapshot(const std::string &dir,
       const std::string failure_reason =
           reason.empty() ? "invalid preserved temporary table sidecars" : reason;
       return rollback_preserved_snapshot_or_log(dir, token, failure_reason,
-                                                &metadata);
+                                                &metadata,
+                                                Temp_sidecar_cleanup_mode::
+                                                    RAW_UNLINK);
     }
   }
 
   if (!recoverable_binlog_state(metadata.binlog_state)) {
     return rollback_preserved_snapshot_or_log(
-        dir, token, "unsupported durable transaction binlog state", &metadata);
+        dir, token, "unsupported durable transaction binlog state", &metadata,
+        Temp_sidecar_cleanup_mode::RAW_UNLINK);
   }
 
   if (!binlog_state_matches_configured_mode(metadata)) {
     log_preserved_trx_rejected_binlog_mode(token, metadata);
     return rollback_preserved_snapshot_or_log(dir, token,
                                               "binlog mode mismatch",
-                                              &metadata);
+                                              &metadata,
+                                              Temp_sidecar_cleanup_mode::
+                                                  RAW_UNLINK);
   }
 
   if (metadata.recovered_count == UINT32_MAX) {
     return rollback_preserved_snapshot_or_log(
-        dir, token, "durable transaction recovery count overflow");
+        dir, token, "durable transaction recovery count overflow", &metadata,
+        Temp_sidecar_cleanup_mode::RAW_UNLINK);
   }
   /*
     Evaluate the timeout before bumping recovered_count. The first recovery
@@ -7923,14 +7963,18 @@ static bool recover_preserved_snapshot(const std::string &dir,
         metadata, "recovery max count exceeded");
     return rollback_preserved_snapshot_or_log(dir, token,
                                               "recovery max count exceeded",
-                                              &metadata);
+                                              &metadata,
+                                              Temp_sidecar_cleanup_mode::
+                                                  RAW_UNLINK);
   }
   if (recovery_deadline_expired) {
     preserved_trx_add_failed_observable_record(metadata,
                                                "recovery timeout expired");
     return rollback_preserved_snapshot_or_log(dir, token,
                                               "recovery timeout expired",
-                                              &metadata);
+                                              &metadata,
+                                              Temp_sidecar_cleanup_mode::
+                                                  RAW_UNLINK);
   }
 
   XID xid;
@@ -7967,8 +8011,8 @@ static bool recover_preserved_snapshot(const std::string &dir,
     }
   }
   if (trx == nullptr) {
-    return delete_preserved_snapshot_files_and_sidecars_or_log(dir, token,
-                                                               &metadata);
+    return delete_preserved_snapshot_files_and_sidecars_or_log(
+        dir, token, &metadata, Temp_sidecar_cleanup_mode::RAW_UNLINK);
   }
 
   bool fail_recovered_count_rewrite = false;
@@ -8220,6 +8264,130 @@ bool preserved_temp_images_bootstrap_preamble() {
       */
       continue;
     }
+
+    Preserved_temp_table_manifest manifest;
+    if (!preserve_trx_decode_temp_table_manifest(
+            bundle.metadata.temp_table_manifest_payload, &manifest)) {
+      release_temp_sidecar_space_id_reservations(bundle.metadata);
+      taint_bootstrap_token_or_warn(
+          token,
+          "corrupt temporary table manifest during rollback segment "
+          "bootstrap");
+      continue;
+    }
+
+    std::vector<trx_preserve_temp_ownership_page_claim> claims;
+    claims.reserve(manifest.ownership_claims.size());
+    for (const Preserved_temp_table_ownership_claim &claim :
+         manifest.ownership_claims) {
+      if (claim.rseg_slot >= srv_rollback_segments) {
+        release_temp_sidecar_space_id_reservations(bundle.metadata);
+        std::ostringstream reason;
+        reason << "preserved temporary rollback segment slot "
+               << claim.rseg_slot
+               << " is outside configured innodb_rollback_segments "
+               << srv_rollback_segments << " during bootstrap";
+        return log_preserved_trx_recovery_failure(token, reason.str());
+      }
+      trx_preserve_temp_ownership_page_claim innodb_claim;
+      innodb_claim.token = claim.token;
+      innodb_claim.source_space_id = claim.source_space_id;
+      innodb_claim.rseg_space_id = claim.rseg_space_id;
+      innodb_claim.rseg_page_no = claim.rseg_page_no;
+      innodb_claim.rseg_id = claim.rseg_slot;
+      innodb_claim.undo_slot = claim.undo_slot;
+      innodb_claim.page_no = claim.page_no;
+      innodb_claim.page_role = claim.page_role;
+      claims.push_back(std::move(innodb_claim));
+    }
+    if (manifest.native_adoption_capable && !manifest.undo_images.empty()) {
+      bool temp_undo_bootstrap_failed = false;
+      std::map<uint32_t, trx_preserve_temp_space_image_descriptor>
+          descriptors_by_space;
+      for (const Preserved_temp_table_manifest_entry &entry :
+           manifest.tables) {
+        trx_preserve_temp_space_image_descriptor descriptor;
+        descriptor.source_space_id = entry.image.source_space_id;
+        descriptor.page_size = entry.image.page_size;
+        descriptor.space_flags = entry.image.space_flags;
+        descriptor.image_bytes = entry.image.size;
+        std::copy(entry.image.sha256.begin(), entry.image.sha256.end(),
+                  descriptor.image_digest);
+        descriptor.sealed = true;
+        descriptors_by_space.emplace(entry.image.source_space_id,
+                                     std::move(descriptor));
+      }
+
+      Local_file_preserved_temp_table_image_carrier carrier(dir);
+      for (const Preserved_temp_table_undo_descriptor &undo :
+           manifest.undo_images) {
+        auto descriptor_it = descriptors_by_space.find(undo.source_space_id);
+        if (descriptor_it == descriptors_by_space.end()) {
+          release_temp_sidecar_space_id_reservations(bundle.metadata);
+          taint_bootstrap_token_or_warn(
+              token,
+              "temporary no-redo undo manifest references missing image "
+              "during bootstrap");
+          temp_undo_bootstrap_failed = true;
+          break;
+        }
+
+        std::string undo_payload;
+        const Preserved_trx_carrier_status read_status =
+            carrier.read_sealed_undo(token, undo, &undo_payload);
+        if (read_status != Preserved_trx_carrier_status::OK) {
+          release_temp_sidecar_space_id_reservations(bundle.metadata);
+          if (read_status == Preserved_trx_carrier_status::IO_ERROR ||
+              read_status == Preserved_trx_carrier_status::
+                                 IO_ERROR_DURABLE_SNAPSHOT_MAY_EXIST) {
+            return log_preserved_trx_recovery_failure(
+                token, "preserved temporary no-redo undo sidecar read failed "
+                       "during bootstrap");
+          }
+          taint_bootstrap_token_or_warn(
+              token,
+              "corrupt temporary no-redo undo sidecar during bootstrap");
+          temp_undo_bootstrap_failed = true;
+          break;
+        }
+        if (!preserve_trx_temp_table_apply_manifest_undo_identity_for_resume(
+                undo, &descriptor_it->second) ||
+            trx_preserve_temp_space_image_load_no_redo_undo_sidecar(
+                &descriptor_it->second,
+                reinterpret_cast<const unsigned char *>(undo_payload.data()),
+                undo_payload.length()) != DB_SUCCESS ||
+            !trx_rseg_preserve_bootstrap_tmp_rseg_required_from_descriptor(
+                descriptor_it->second)) {
+          release_temp_sidecar_space_id_reservations(bundle.metadata);
+          taint_bootstrap_token_or_warn(
+              token,
+              "invalid temporary no-redo undo bootstrap descriptor");
+          temp_undo_bootstrap_failed = true;
+          break;
+        }
+      }
+      if (temp_undo_bootstrap_failed) continue;
+    }
+
+    if (!claims.empty()) {
+      if (!trx_preserve_temp_space_image_register_page_reservations_from_claims(
+              claims)) {
+        release_temp_sidecar_space_id_reservations(bundle.metadata);
+        taint_bootstrap_token_or_warn(
+            token,
+            "conflicting preserved temporary page ownership during bootstrap");
+        continue;
+      }
+      if (!trx_rseg_preserve_bootstrap_tmp_rsegs_required_from_claims(
+              claims)) {
+        release_temp_sidecar_space_id_reservations(bundle.metadata);
+        taint_bootstrap_token_or_warn(
+            token,
+            "conflicting preserved temporary rollback segment identity during "
+            "bootstrap");
+        continue;
+      }
+    }
   }
 
   return false;
@@ -8333,7 +8501,7 @@ bool preserved_trx_recover_all() {
       if (rollback_preserved_snapshot_or_log(
               dir, token,
               "preserved transaction snapshot tainted by innodb_force_recovery",
-              cleanup_metadata))
+              cleanup_metadata, Temp_sidecar_cleanup_mode::RAW_UNLINK))
         error = true;
       continue;
     }
@@ -10105,9 +10273,6 @@ bool Preserve_trx_drain_service::execute(
     return preserve_trx_reject_unsupported();
 
   const ulonglong generation = g_batch_generation.fetch_add(1) + 1;
-  Preserve_batch_clear_temp_table_unsupported_boundaries clear_temp_boundaries;
-  Global_THD_manager::get_instance()->do_for_all_thd_copy(
-      &clear_temp_boundaries);
   const bool binlog_warmcopy_enabled =
       preserve_trx_warmcopy_enable && opt_bin_log && mysql_bin_log.is_open();
   const bool lock_warmcopy_enabled = preserve_trx_lock_warmcopy_effective();
@@ -10148,6 +10313,9 @@ bool Preserve_trx_drain_service::execute(
                         : Preserve_trx_manager_state::BATCH_DRAINING,
       thd->thread_id());
   if (!draining.active()) return preserve_trx_reject_unsupported();
+  Preserve_batch_clear_temp_table_unsupported_boundaries clear_temp_boundaries;
+  Global_THD_manager::get_instance()->do_for_all_thd_copy(
+      &clear_temp_boundaries);
   std::unique_lock<std::mutex> warmcopy_status_guard;
 
   auto abort_drain_participants = [&](const char *stage) {
@@ -10264,6 +10432,7 @@ bool Preserve_trx_drain_service::execute(
         static_cast<longlong>(preserved_token_count));
     DBUG_EXECUTE_IF("preserve_trx_drain_skip_shutdown_after_audit_no_targets", {
       if (counter.target_count() == 0) {
+        finalize_drain_participants("finish_no_targets");
         my_ok(thd);
         return false;
       }
@@ -11337,9 +11506,7 @@ bool Sql_cmd_resume_preserved_transaction::execute(THD *thd) {
         "temporary table materialization failure");
     return preserve_trx_reject_unsupported();
   }
-  temp_tables_materialized =
-      !record.metadata.temp_table_manifest_payload.empty() &&
-      preserve_trx_temp_table_enable;
+  temp_tables_materialized = !record.metadata.temp_table_manifest_payload.empty();
 
   if (trx_preserve_attach_to_thd(record.trx, thd) != DB_SUCCESS) {
     (void)restore_preserved_record_after_failure("attach failure");

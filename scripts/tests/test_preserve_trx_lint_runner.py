@@ -35,7 +35,16 @@ class PreserveTrxLintRunnerTest(unittest.TestCase):
         return tmp
 
     def test_registers_current_legacy_lint_rules(self):
-        self.assertEqual(17, len(LEGACY_LINT_RULE_IDS))
+        self.assertEqual(23, len(LEGACY_LINT_RULE_IDS))
+        self.assertIn("batch_drain_lock_warmcopy_hook_coverage_lint",
+                      LEGACY_LINT_RULE_IDS)
+        self.assertIn("temp_table_ddl_boundary_lint", LEGACY_LINT_RULE_IDS)
+        self.assertIn("temp_table_no_redo_baseline_lint",
+                      LEGACY_LINT_RULE_IDS)
+        self.assertIn("temp_table_phase1_participant_lint",
+                      LEGACY_LINT_RULE_IDS)
+        self.assertIn("temp_table_row_hook_no_payload_lint",
+                      LEGACY_LINT_RULE_IDS)
         self.assertIn("test_layering_doc_contract_lint", LEGACY_LINT_RULE_IDS)
         self.assertIn("wide_error_masks_lint", LEGACY_LINT_RULE_IDS)
         self.assertIn("code_review_resumable_trx_slices_lint",
@@ -188,6 +197,51 @@ class PreserveTrxLintRunnerTest(unittest.TestCase):
         self.assertEqual("fail", summary["status"])
         self.assertTrue(any(item["rule"] == "carrier_read_no_follow_lint"
                             for item in summary["findings"]))
+
+    def test_off_path_invasive_surface_requires_top_level_gates(self):
+        tmp = self.make_repo()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "sql").mkdir()
+        (root / "storage/innobase/include").mkdir(parents=True)
+        (root / "storage/innobase/trx").mkdir(parents=True)
+        (root / "sql/preserve_trx_temp_table.cc").write_text(
+            "bool preserve_trx_temp_table_row_hooks_enabled() {\n"
+            "  return preserve_trx_temp_table_enable;\n"
+            "}\n"
+            "Temp_table_warmcopy_participant *"
+            "preserve_trx_temp_table_ensure_participant(THD *thd) {\n"
+            "  if (!preserve_trx_temp_table_enable || thd == nullptr)\n"
+            "    return nullptr;\n"
+            "}\n"
+        )
+        (root / "storage/innobase/include/trx0temp_preserve.h").write_text(
+            "static inline bool "
+            "trx_preserve_temp_space_image_dirty_page_hook_enabled() {\n"
+            "  return preserve_trx_temp_table_enable;\n"
+            "}\n"
+        )
+        (root / "storage/innobase/trx/trx0temp_preserve.cc").write_text(
+            "dberr_t trx_preserve_temp_space_image_stage_dirty_page() {\n"
+            "  validate_before_gate();\n"
+            "  if (!trx_preserve_temp_space_image_dirty_page_hook_enabled())\n"
+            "    return DB_SUCCESS;\n"
+            "}\n"
+        )
+        (root / "sql/handler.cc").write_text(
+            "void handler::ha_write_row() {\n"
+            "  preserve_trx_temp_table_note_row_write(ha_thd(), table, "
+            "nullptr, 0);\n"
+            "}\n"
+        )
+
+        summary = run_lint_checks(root)
+
+        self.assertEqual("fail", summary["status"])
+        self.assertTrue(any(
+            item["rule"] == "preserve_trx_off_path_invasive_surface_lint"
+            for item in summary["findings"]
+        ))
 
     def test_main_writes_lint_summary_json(self):
         tmp = self.make_repo()

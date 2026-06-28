@@ -243,8 +243,15 @@ bool thd_in_temp_table_capture_epoch(THD *thd) {
              std::memory_order_acquire);
 }
 
+bool thd_in_temp_table_batch_capture_epoch(THD *thd) {
+  return thd != nullptr &&
+         (thd_in_preserve_batch_epoch(thd) ||
+          thd->preserve_trx_temp_table_batch_capture_epoch.load(
+              std::memory_order_acquire));
+}
+
 void mark_batch_unsupported_temp_boundary(THD *thd) {
-  if (thd_in_temp_table_capture_epoch(thd)) {
+  if (thd_in_temp_table_batch_capture_epoch(thd)) {
     thd->preserve_trx_temp_table_batch_unsupported_boundary.store(
         true, std::memory_order_release);
   }
@@ -365,6 +372,126 @@ Preserved_temp_table_undo_descriptor undo_descriptor_from_image_descriptor(
   undo.no_redo_undo_rseg_page_no = descriptor.no_redo_undo_rseg_page_no;
   undo.no_redo_undo_rseg_slot = descriptor.no_redo_undo_rseg_slot;
   return undo;
+}
+
+bool no_redo_undo_anchor_names_page(
+    const trx_preserve_temp_no_redo_undo_log_anchor *anchor,
+    uint32_t page_no) {
+  return anchor != nullptr && anchor->present &&
+         (page_no == anchor->hdr_page_no || page_no == anchor->last_page_no ||
+          page_no == anchor->top_page_no);
+}
+
+bool no_redo_undo_descriptor_first_slot(
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    uint32_t *undo_slot) {
+  if (undo_slot == nullptr) return false;
+  const trx_preserve_temp_no_redo_undo_log_anchor *insert_anchor =
+      trx_preserve_temp_space_image_no_redo_insert_undo_anchor(descriptor);
+  if (insert_anchor != nullptr && insert_anchor->present) {
+    *undo_slot = insert_anchor->undo_slot;
+    return true;
+  }
+  const trx_preserve_temp_no_redo_undo_log_anchor *update_anchor =
+      trx_preserve_temp_space_image_no_redo_update_undo_anchor(descriptor);
+  if (update_anchor != nullptr && update_anchor->present) {
+    *undo_slot = update_anchor->undo_slot;
+    return true;
+  }
+  return false;
+}
+
+bool no_redo_undo_descriptor_slot_for_page(
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    const trx_preserve_temp_no_redo_undo_page_image &page,
+    uint32_t *undo_slot) {
+  if (undo_slot == nullptr) return false;
+
+  switch (page.kind) {
+    case trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER:
+    case trx_preserve_temp_no_redo_undo_page_kind::RSEG_ALLOCATOR:
+      return no_redo_undo_descriptor_first_slot(descriptor, undo_slot);
+    case trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER:
+    case trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG:
+      break;
+  }
+
+  const trx_preserve_temp_no_redo_undo_log_anchor *insert_anchor =
+      trx_preserve_temp_space_image_no_redo_insert_undo_anchor(descriptor);
+  const trx_preserve_temp_no_redo_undo_log_anchor *update_anchor =
+      trx_preserve_temp_space_image_no_redo_update_undo_anchor(descriptor);
+  const bool insert_present =
+      insert_anchor != nullptr && insert_anchor->present;
+  const bool update_present =
+      update_anchor != nullptr && update_anchor->present;
+  if (insert_present != update_present) {
+    *undo_slot =
+        insert_present ? insert_anchor->undo_slot : update_anchor->undo_slot;
+    return true;
+  }
+
+  const bool insert_names_page =
+      no_redo_undo_anchor_names_page(insert_anchor, page.page_no);
+  const bool update_names_page =
+      no_redo_undo_anchor_names_page(update_anchor, page.page_no);
+  if (insert_names_page == update_names_page) {
+    return false;
+  }
+  *undo_slot =
+      insert_names_page ? insert_anchor->undo_slot : update_anchor->undo_slot;
+  return true;
+}
+
+bool append_ownership_claims_from_descriptor_impl(
+    const std::string &token, const Preserved_temp_table_undo_descriptor &undo,
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    Preserved_temp_table_manifest *manifest) {
+  if (token.empty() || manifest == nullptr ||
+      !descriptor.no_redo_undo_sidecar_sealed ||
+      !descriptor.no_redo_undo_rseg_identity_present ||
+      descriptor.no_redo_undo_capture_degraded ||
+      undo.source_space_id != descriptor.source_space_id ||
+      undo.no_redo_undo_rseg_space_id !=
+          descriptor.no_redo_undo_rseg_space_id ||
+      undo.no_redo_undo_rseg_page_no !=
+          descriptor.no_redo_undo_rseg_page_no ||
+      undo.no_redo_undo_rseg_slot != descriptor.no_redo_undo_rseg_slot) {
+    return false;
+  }
+
+  std::vector<Preserved_temp_table_ownership_claim> claims;
+  claims.reserve(
+      trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor));
+  for (size_t i = 0;
+       i < trx_preserve_temp_space_image_no_redo_undo_page_count(descriptor);
+       ++i) {
+    const trx_preserve_temp_no_redo_undo_page_image *page =
+        trx_preserve_temp_space_image_no_redo_undo_page_at(descriptor, i);
+    if (page == nullptr || page->bytes.empty()) return false;
+
+    uint32_t undo_slot = 0;
+    if (!no_redo_undo_descriptor_slot_for_page(descriptor, *page,
+                                               &undo_slot)) {
+      return false;
+    }
+
+    Preserved_temp_table_ownership_claim claim;
+    claim.token = token;
+    claim.source_space_id = descriptor.source_space_id;
+    claim.rseg_space_id = descriptor.no_redo_undo_rseg_space_id;
+    claim.rseg_page_no = descriptor.no_redo_undo_rseg_page_no;
+    claim.rseg_slot = descriptor.no_redo_undo_rseg_slot;
+    claim.undo_slot = undo_slot;
+    claim.page_no = page->page_no;
+    claim.page_role = page->kind;
+    SHA_EVP256(page->bytes.data(), page->bytes.size(),
+               claim.page_digest.data());
+    claims.push_back(std::move(claim));
+  }
+
+  manifest->ownership_claims.insert(manifest->ownership_claims.end(),
+                                    claims.begin(), claims.end());
+  return true;
 }
 
 struct Shared_temp_table_sidecar {
@@ -1015,6 +1142,14 @@ bool append_savepoint_event(THD *thd, Temp_table_journal_record::Kind kind,
 }
 
 }  // namespace
+
+bool preserve_trx_temp_table_append_ownership_claims_from_descriptor(
+    const std::string &token, const Preserved_temp_table_undo_descriptor &undo,
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    Preserved_temp_table_manifest *manifest) {
+  return append_ownership_claims_from_descriptor_impl(token, undo, descriptor,
+                                                      manifest);
+}
 
 Temp_table_warmcopy_participant::Temp_table_warmcopy_participant(
     size_t max_tail_bytes)
@@ -2398,6 +2533,8 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
         }
         sealed_undo_source_space_ids.push_back(
             source_metadata.source_space_id);
+        (void)preserve_trx_temp_table_append_ownership_claims_from_descriptor(
+            token, undo, descriptor, &manifest);
         manifest.undo_images.push_back(std::move(undo));
       }
     }
@@ -2465,10 +2602,19 @@ preserve_trx_temp_table_materialize_plan(
   plan.source = Preserve_trx_temp_table_materialize_source::PHYSICAL_SIDECARS;
   plan.requires_sealed_image_sidecars = true;
   plan.requires_no_redo_undo_sidecars = !manifest.undo_images.empty();
+  plan.native_adoption_capable = manifest.native_adoption_capable;
   plan.scans_sql_rows = false;
   plan.replays_logical_row_journal = false;
   plan.manifest = std::move(manifest);
   return plan;
+}
+
+trx_preserve_temp_no_redo_undo_reconnect_mode
+preserve_trx_temp_table_no_redo_reconnect_mode_for_resume(
+    const Preserve_trx_temp_table_materialize_plan &plan) {
+  return plan.native_adoption_capable
+             ? trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED
+             : trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY;
 }
 
 bool preserve_trx_temp_table_apply_manifest_undo_identity_for_resume(
@@ -2624,7 +2770,7 @@ Preserve_snapshot_status preserve_trx_temp_table_link_staged_tables(
 
 void preserve_trx_temp_table_close_staged_tables(
     THD *thd, Preserve_trx_temp_table_staged_tables *staged) {
-  if (!preserve_trx_temp_table_enable || staged == nullptr) return;
+  if (staged == nullptr) return;
 
   for (auto it = staged->tables.rbegin(); it != staged->tables.rend(); ++it) {
     TABLE *table = it->table;
@@ -2863,17 +3009,37 @@ Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume(
     }
   }
 
+  bool restored_only_no_redo_undo_active = false;
+  const trx_preserve_temp_no_redo_undo_reconnect_mode
+      no_redo_undo_reconnect_mode =
+          preserve_trx_temp_table_no_redo_reconnect_mode_for_resume(plan);
   for (auto &descriptor : descriptors) {
     if (descriptor.second == nullptr) {
       cleanup_for_retry();
       return Preserve_snapshot_status::CORRUPT;
     }
+    if (no_redo_undo_reconnect_mode ==
+            trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED &&
+        trx_preserve_temp_space_image_no_redo_undo_sidecar_sealed(
+            *descriptor.second)) {
+      Preserve_snapshot_status status = map_temp_dberr(
+          trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume(
+              descriptor.second.get()));
+      if (status != Preserve_snapshot_status::OK) {
+        cleanup_for_retry();
+        return status;
+      }
+    }
     Preserve_snapshot_status status = map_temp_dberr(
         trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-            descriptor.second.get(), trx));
+            descriptor.second.get(), trx, no_redo_undo_reconnect_mode));
     if (status != Preserve_snapshot_status::OK) {
       cleanup_for_retry();
       return status;
+    }
+    if (trx_preserve_temp_space_image_no_redo_undo_restored_only_reconnected(
+            *descriptor.second)) {
+      restored_only_no_redo_undo_active = true;
     }
     status = map_temp_dberr(
         trx_preserve_temp_space_image_attach_to_thd(thd, *descriptor.second));
@@ -2890,7 +3056,7 @@ Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume(
     return link_status;
   }
   thd->preserve_trx_temp_table_restored_no_redo_undo_active =
-      !plan.manifest.undo_images.empty();
+      restored_only_no_redo_undo_active;
   return Preserve_snapshot_status::OK;
 }
 
@@ -2898,11 +3064,6 @@ Preserve_snapshot_status
 preserve_trx_temp_table_rollback_materialized_for_resume(
     THD *thd, const Preserve_snapshot_metadata &metadata) {
   if (metadata.temp_table_manifest_payload.empty()) {
-    return Preserve_snapshot_status::OK;
-  }
-  if (!preserve_trx_temp_table_enable) {
-    if (thd != nullptr)
-      thd->preserve_trx_temp_table_restored_no_redo_undo_active = false;
     return Preserve_snapshot_status::OK;
   }
   if (thd == nullptr) return Preserve_snapshot_status::INVALID_ARGUMENT;
@@ -3079,17 +3240,125 @@ Preserve_snapshot_status preserve_trx_temp_table_check_sidecars_present(
   return Preserve_snapshot_status::OK;
 }
 
+struct Temp_table_no_redo_undo_reservation_release {
+  uint32_t source_space_id{0};
+  uint32_t page_size{0};
+  std::string payload;
+};
+
+Preserve_snapshot_status
+preserve_trx_temp_table_collect_no_redo_undo_reservations_from_manifest(
+    Local_file_preserved_temp_table_image_carrier *carrier,
+    const std::string &token, const Preserved_temp_table_manifest &manifest,
+    std::vector<Temp_table_no_redo_undo_reservation_release> *releases) {
+  if (carrier == nullptr || releases == nullptr) {
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
+
+  std::map<uint32_t, uint32_t> page_size_by_source_space_id;
+  for (const Preserved_temp_table_manifest_entry &entry : manifest.tables) {
+    page_size_by_source_space_id.emplace(entry.image.source_space_id,
+                                         entry.image.page_size);
+  }
+
+  for (const Preserved_temp_table_undo_descriptor &undo :
+       manifest.undo_images) {
+    const auto page_size =
+        page_size_by_source_space_id.find(undo.source_space_id);
+    if (page_size == page_size_by_source_space_id.end()) {
+      return Preserve_snapshot_status::CORRUPT;
+    }
+
+    Temp_table_no_redo_undo_reservation_release release;
+    release.source_space_id = undo.source_space_id;
+    release.page_size = page_size->second;
+    const Preserved_trx_carrier_status read_status =
+        carrier->read_sealed_undo(token, undo, &release.payload);
+    if (read_status != Preserved_trx_carrier_status::OK) {
+      return map_temp_carrier_status(read_status);
+    }
+    releases->push_back(std::move(release));
+  }
+  return Preserve_snapshot_status::OK;
+}
+
+Preserve_snapshot_status
+preserve_trx_temp_table_release_no_redo_undo_reservations_from_manifest(
+    const std::vector<Temp_table_no_redo_undo_reservation_release> &releases) {
+  for (const Temp_table_no_redo_undo_reservation_release &release : releases) {
+    const dberr_t err =
+        trx_preserve_temp_space_image_release_no_redo_undo_reservations_from_sidecar(
+            release.source_space_id, release.page_size,
+            reinterpret_cast<const unsigned char *>(release.payload.data()),
+            release.payload.length());
+    if (err != DB_SUCCESS) return map_temp_dberr(err);
+  }
+  return Preserve_snapshot_status::OK;
+}
+
+void preserve_trx_temp_table_release_ownership_reservations(
+    const Preserve_snapshot_metadata &metadata) {
+  if (metadata.temp_table_manifest_payload.empty()) return;
+
+  Preserved_temp_table_manifest manifest;
+  if (!preserve_trx_decode_temp_table_manifest(
+          metadata.temp_table_manifest_payload, &manifest)) {
+    return;
+  }
+
+  for (const Preserved_temp_table_ownership_claim &claim :
+       manifest.ownership_claims) {
+    trx_preserve_temp_reservation_owner owner;
+    switch (claim.page_role) {
+      case trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER:
+      case trx_preserve_temp_no_redo_undo_page_kind::RSEG_ALLOCATOR:
+        owner.source_space_id = claim.rseg_space_id;
+        owner.domain = "shared_no_redo_metadata";
+        break;
+      case trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER:
+      case trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG:
+        owner.source_space_id = claim.source_space_id;
+        owner.token = claim.token;
+        owner.domain = "exclusive_no_redo_undo";
+        break;
+    }
+
+    (void)trx_preserve_temp_space_image_release_page_reservations_for_owner(
+        owner);
+    trx_preserve_temp_space_image_release_no_redo_undo_slot(
+        claim.rseg_space_id, claim.rseg_page_no, claim.rseg_slot,
+        claim.undo_slot);
+  }
+}
+
 Preserve_snapshot_status preserve_trx_temp_table_remove_token_sidecars(
     const std::string &dir, const std::string &token,
     const Preserve_snapshot_metadata &metadata) {
   if (metadata.temp_table_manifest_payload.empty())
     return Preserve_snapshot_status::OK;
 
+  Preserved_temp_table_manifest manifest;
+  if (!preserve_trx_decode_temp_table_manifest(
+          metadata.temp_table_manifest_payload, &manifest)) {
+    return Preserve_snapshot_status::CORRUPT;
+  }
+
   const std::set<uint32_t> source_space_ids =
       preserve_trx_temp_table_sidecar_source_space_ids(metadata);
   if (source_space_ids.empty()) return Preserve_snapshot_status::CORRUPT;
 
   Local_file_preserved_temp_table_image_carrier carrier(dir);
+  std::vector<Temp_table_no_redo_undo_reservation_release> undo_releases;
+  const Preserve_snapshot_status collect_status =
+      preserve_trx_temp_table_collect_no_redo_undo_reservations_from_manifest(
+          &carrier, token, manifest, &undo_releases);
+  if (collect_status != Preserve_snapshot_status::OK) return collect_status;
+
+  const Preserve_snapshot_status release_status =
+      preserve_trx_temp_table_release_no_redo_undo_reservations_from_manifest(
+          undo_releases);
+  if (release_status != Preserve_snapshot_status::OK) return release_status;
+
   for (const uint32_t source_space_id : source_space_ids) {
     const Preserve_snapshot_status status = map_temp_carrier_status(
         carrier.remove_sealed_sidecars(token, source_space_id));

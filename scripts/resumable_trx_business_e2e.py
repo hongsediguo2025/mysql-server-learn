@@ -507,6 +507,77 @@ WHERE n < {row_count}
 """.strip()
         ]
 
+    def temp_deleted_prefill_ids(self, tx_id: int, completed_stmt_no: int) -> List[int]:
+        row_count = self.temp_table_fill_row_count()
+        if row_count <= 0:
+            return []
+        deleted = set()
+        for stmt_no in range(max(0, completed_stmt_no) + 1):
+            if stmt_no % 20 != 3:
+                continue
+            delete_id = (tx_id - 1) * 100 + stmt_no
+            delete_id = (delete_id % row_count) + 1
+            deleted.add(delete_id)
+        return sorted(deleted)
+
+    def temp_prefill_fingerprint_after_resume(
+        self, tx_id: int, completed_stmt_no: int, sid: int = 0
+    ) -> Tuple[int, int, int, int, int, int]:
+        row_count = self.temp_table_fill_row_count()
+        if row_count <= 0:
+            return (0, 0, 0, 0, 0, 0)
+        deleted = self.temp_deleted_prefill_ids(tx_id, completed_stmt_no)
+        remaining = row_count - len(deleted)
+        full_sum_id = row_count * (row_count + 1) // 2
+        full_sum_v = row_count * (row_count - 1) // 2
+        digest_hi, digest_lo = self._temp_prefill_payload_digest_xor(deleted, sid)
+        return (
+            remaining,
+            full_sum_id - sum(deleted),
+            full_sum_v - sum(row_id - 1 for row_id in deleted),
+            remaining * self.temp_table_fill_chunk_bytes(),
+            digest_hi,
+            digest_lo,
+        )
+
+    def temp_prefill_fingerprint_after_rollback(
+        self, sid: int = 0
+    ) -> Tuple[int, int, int, int, int, int]:
+        row_count = self.temp_table_fill_row_count()
+        if row_count <= 0:
+            return (0, 0, 0, 0, 0, 0)
+        digest_hi, digest_lo = self._temp_prefill_payload_digest_xor([], sid)
+        return (
+            row_count,
+            row_count * (row_count + 1) // 2,
+            row_count * (row_count - 1) // 2,
+            row_count * self.temp_table_fill_chunk_bytes(),
+            digest_hi,
+            digest_lo,
+        )
+
+    def _temp_prefill_payload_digest_xor(
+        self, deleted_ids: Iterable[int], sid: int
+    ) -> Tuple[int, int]:
+        row_count = self.temp_table_fill_row_count()
+        if row_count <= 0:
+            return (0, 0)
+        deleted = set(deleted_ids)
+        payload_digest = hashlib.sha256(
+            b"x" * self.temp_table_fill_chunk_bytes()
+        ).hexdigest()
+        digest_hi = 0
+        digest_lo = 0
+        for row_id in range(1, row_count + 1):
+            if row_id in deleted:
+                continue
+            row_digest = hashlib.sha256(
+                f"{row_id}#{sid}#0#-1#{row_id - 1}#prefill#{payload_digest}".encode("utf8")
+            ).hexdigest()
+            digest_hi ^= int(row_digest[:16], 16)
+            digest_lo ^= int(row_digest[16:32], 16)
+        return (digest_hi, digest_lo)
+
     def temp_table_sidecar_budget_bytes(self) -> int:
         target = self.temp_table_target_bytes() * self.config.sessions
         if target <= 0:
@@ -2597,6 +2668,10 @@ class BusinessWorker(threading.Thread):
                 conn.commit()
                 completed_stmt_count = stmt_index if finish_after_resume else None
                 self._verify_committed_transaction(conn, tx_id, completed_stmt_count)
+                if finish_after_resume:
+                    self._verify_temp_table_commit(
+                        conn, tx_id, completed_stmt_count
+                    )
                 if self.expected_state is not None:
                     self.expected_state.record_committed_transaction(
                         self.sid, tx_id, completed_stmt_count
@@ -2623,6 +2698,161 @@ class BusinessWorker(threading.Thread):
             raise AssertionError(
                 "temporary table rollback left current transaction rows: "
                 f"sid={self.sid} tx_id={tx_id} rows={rows[0][0]}"
+            )
+        if self.plan.config.temp_table_target_mb <= 0:
+            return
+        prefill_rows = self.runtime.execute(
+            conn,
+            "SELECT "
+            "COUNT(*), "
+            "COALESCE(SUM(id),0), "
+            "COALESCE(SUM(v),0), "
+            "COALESCE(SUM(OCTET_LENGTH(payload)),0), "
+            "COALESCE(BIT_XOR(CAST(CONV(SUBSTR(SHA2(CONCAT("
+            "id,'#',sid,'#',tx_id,'#',stmt_no,'#',v,'#',COALESCE(note,''),'#',"
+            "SHA2(payload, 256)), 256), 1, 16), 16, 10) AS UNSIGNED)),0), "
+            "COALESCE(BIT_XOR(CAST(CONV(SUBSTR(SHA2(CONCAT("
+            "id,'#',sid,'#',tx_id,'#',stmt_no,'#',v,'#',COALESCE(note,''),'#',"
+            "SHA2(payload, 256)), 256), 17, 16), 16, 10) AS UNSIGNED)),0) "
+            f"FROM `{table}` WHERE tx_id = 0",
+            fetch=True,
+        )
+        expected = self.plan.temp_prefill_fingerprint_after_rollback(self.sid)
+        actual = tuple(int(value or 0) for value in prefill_rows[0])
+        if actual != expected:
+            raise AssertionError(
+                "temporary table rollback did not restore prefill rows: "
+                f"sid={self.sid} tx_id={tx_id} expected={expected} actual={actual}"
+            )
+
+    def _verify_temp_table_commit(
+        self, conn, tx_id: int, completed_stmt_count: Optional[int]
+    ) -> None:
+        if not self.plan.config.temp_table_workload:
+            return
+        if completed_stmt_count is None or completed_stmt_count <= 0:
+            return
+
+        completed_stmt_no = completed_stmt_count - 1
+        table = self.plan.temp_table_name(self.sid)
+        payload_projection = (
+            ", COALESCE(OCTET_LENGTH(payload),0), "
+            "COALESCE(SHA2(payload, 256),'')"
+            if self.plan.config.temp_table_target_mb > 0
+            else ""
+        )
+        rows = self.runtime.execute(
+            conn,
+            f"SELECT id, sid, tx_id, stmt_no, v, note{payload_projection} "
+            f"FROM `{table}` WHERE tx_id = {tx_id} ORDER BY id",
+            fetch=True,
+        )
+
+        expected_rows = {}
+        for base_stmt_no in range(
+            0,
+            min(completed_stmt_no, self.plan.config.statements_per_tx - 1) + 1,
+            20,
+        ):
+            row_id = self.plan.temp_row_id(tx_id, base_stmt_no)
+            if completed_stmt_no >= base_stmt_no + 1:
+                expected_stmt_no = base_stmt_no + 1
+                expected_value = self.plan.temp_row_value_after_update(
+                    self.sid, tx_id, expected_stmt_no
+                )
+            else:
+                expected_stmt_no = base_stmt_no
+                expected_value = self.plan.temp_row_value_after_insert(
+                    self.sid, tx_id, base_stmt_no
+                )
+            expected_payload_len = 0
+            expected_payload_sha256 = ""
+            if self.plan.config.temp_table_target_mb > 0:
+                expected_payload = b"i" * self.plan.temp_table_fill_chunk_bytes()
+                if completed_stmt_no >= base_stmt_no + 1:
+                    expected_payload += b"u"
+                expected_payload_len = len(expected_payload)
+                expected_payload_sha256 = hashlib.sha256(
+                    expected_payload
+                ).hexdigest()
+            expected_rows[row_id] = (
+                self.sid,
+                tx_id,
+                expected_stmt_no,
+                expected_value,
+                f"tmp-s{self.sid:03d}-t{tx_id:05d}-n{base_stmt_no:03d}",
+                expected_payload_len,
+                expected_payload_sha256,
+            )
+
+        actual_row_ids = set()
+        for row in rows:
+            expected_width = 8 if self.plan.config.temp_table_target_mb > 0 else 6
+            if len(row) != expected_width:
+                raise AssertionError(
+                    f"temporary table committed row mismatch: malformed row {row!r}"
+                )
+            row_id, row_sid, row_tx_id, stmt_no, value, note = row[:6]
+            payload_len = int(row[6] or 0) if expected_width == 8 else 0
+            payload_sha256 = (
+                str(row[7] or "").lower() if expected_width == 8 else ""
+            )
+            row_id = int(row_id)
+            actual_row_ids.add(row_id)
+            expected = expected_rows.get(row_id)
+            if expected is None:
+                raise AssertionError(
+                    "temporary table committed row mismatch: "
+                    f"unexpected row id={row_id} completed_stmt_no={completed_stmt_no}"
+                )
+            if (
+                int(row_sid),
+                int(row_tx_id),
+                int(stmt_no),
+                int(value),
+                note,
+                payload_len,
+                payload_sha256,
+            ) != expected:
+                raise AssertionError(
+                    "temporary table committed row mismatch: "
+                    f"id={row_id} expected={expected} actual="
+                    f"{(int(row_sid), int(row_tx_id), int(stmt_no), int(value), note, payload_len, payload_sha256)}"
+                )
+
+        missing = set(expected_rows) - actual_row_ids
+        if missing:
+            raise AssertionError(
+                "temporary table committed row mismatch: "
+                f"missing row ids {sorted(missing)}"
+            )
+
+        if self.plan.config.temp_table_target_mb <= 0:
+            return
+        prefill_rows = self.runtime.execute(
+            conn,
+            "SELECT "
+            "COUNT(*), "
+            "COALESCE(SUM(id),0), "
+            "COALESCE(SUM(v),0), "
+            "COALESCE(SUM(OCTET_LENGTH(payload)),0), "
+            "COALESCE(BIT_XOR(CAST(CONV(SUBSTR(SHA2(CONCAT("
+            "id,'#',sid,'#',tx_id,'#',stmt_no,'#',v,'#',COALESCE(note,''),'#',"
+            "SHA2(payload, 256)), 256), 1, 16), 16, 10) AS UNSIGNED)),0), "
+            "COALESCE(BIT_XOR(CAST(CONV(SUBSTR(SHA2(CONCAT("
+            "id,'#',sid,'#',tx_id,'#',stmt_no,'#',v,'#',COALESCE(note,''),'#',"
+            "SHA2(payload, 256)), 256), 17, 16), 16, 10) AS UNSIGNED)),0) "
+            f"FROM `{table}` WHERE tx_id = 0",
+            fetch=True,
+        )
+        expected_prefill = self.plan.temp_prefill_fingerprint_after_resume(
+            tx_id, completed_stmt_no, self.sid
+        )
+        actual_prefill = tuple(int(value or 0) for value in prefill_rows[0])
+        if actual_prefill != expected_prefill:
+            raise AssertionError(
+                "temporary table committed prefill mismatch: "
+                f"expected={expected_prefill} actual={actual_prefill}"
             )
 
     def _next_tx_id(self, previous_tx_id: int) -> int:
@@ -3952,9 +4182,16 @@ class BusinessE2ERunner:
     ) -> None:
         plan = getattr(self, "plan", WorkloadPlan(self.config))
         table = plan.temp_table_name(sid)
+        payload_projection = (
+            ", COALESCE(OCTET_LENGTH(payload),0), "
+            "COALESCE(SHA2(payload, 256),'')"
+            if plan.config.temp_table_target_mb > 0
+            else ""
+        )
         rows = self.runtime.execute(
             conn,
-            f"SELECT id, sid, tx_id, stmt_no, v, note FROM `{table}` "
+            f"SELECT id, sid, tx_id, stmt_no, v, note{payload_projection} "
+            f"FROM `{table}` "
             f"WHERE tx_id = {tx_id} ORDER BY id",
             fetch=True,
         )
@@ -3976,21 +4213,36 @@ class BusinessE2ERunner:
                 expected_value = plan.temp_row_value_after_insert(
                     sid, tx_id, base_stmt_no
                 )
+            expected_payload_len = 0
+            if plan.config.temp_table_target_mb > 0:
+                expected_payload_len = plan.temp_table_fill_chunk_bytes()
+                if completed_stmt_no >= base_stmt_no + 1:
+                    expected_payload_len += 1
             expected_rows[row_id] = (
                 sid,
                 tx_id,
                 expected_stmt_no,
                 expected_value,
                 f"tmp-s{sid:03d}-t{tx_id:05d}-n{base_stmt_no:03d}",
+                expected_payload_len,
+                hashlib.sha256(
+                    (b"i" * plan.temp_table_fill_chunk_bytes()) +
+                    (b"u" if completed_stmt_no >= base_stmt_no + 1 else b"")
+                ).hexdigest()
+                if plan.config.temp_table_target_mb > 0
+                else "",
             )
 
         actual_row_ids = set()
         for row in rows:
-            if len(row) != 6:
+            expected_width = 8 if plan.config.temp_table_target_mb > 0 else 6
+            if len(row) != expected_width:
                 raise AssertionError(
                     f"temporary table row mismatch for token {token}: malformed row {row!r}"
                 )
-            row_id, row_sid, row_tx_id, stmt_no, value, note = row
+            row_id, row_sid, row_tx_id, stmt_no, value, note = row[:6]
+            payload_len = int(row[6] or 0) if expected_width == 8 else 0
+            payload_sha256 = str(row[7] or "").lower() if expected_width == 8 else ""
             row_id = int(row_id)
             row_sid = int(row_sid)
             row_tx_id = int(row_tx_id)
@@ -4003,19 +4255,35 @@ class BusinessE2ERunner:
                     f"row={(row_id, row_sid, row_tx_id, stmt_no, value, note)!r} "
                     f"completed_stmt_no={completed_stmt_no}"
                 )
-            expected_sid, expected_tx_id, expected_stmt_no, expected_value, expected_note = (
-                expected_rows[row_id]
-            )
+            (
+                expected_sid,
+                expected_tx_id,
+                expected_stmt_no,
+                expected_value,
+                expected_note,
+                expected_payload_len,
+                expected_payload_sha256,
+            ) = expected_rows[row_id]
             if row_sid != expected_sid or row_tx_id != expected_tx_id:
                 raise AssertionError(
                     f"temporary table row mismatch for token {token}: "
                     f"row={(row_id, row_sid, row_tx_id, stmt_no, value, note)!r}"
                 )
-            if stmt_no != expected_stmt_no or note != expected_note or value != expected_value:
+            if (
+                stmt_no != expected_stmt_no
+                or note != expected_note
+                or value != expected_value
+                or payload_len != expected_payload_len
+                or payload_sha256 != expected_payload_sha256
+            ):
                 raise AssertionError(
                     f"temporary table row mismatch for token {token}: "
                     f"id={row_id} expected_stmt={expected_stmt_no} actual_stmt={stmt_no} "
-                    f"expected_v={expected_value} actual_v={value}"
+                    f"expected_v={expected_value} actual_v={value} "
+                    f"expected_payload_len={expected_payload_len} "
+                    f"actual_payload_len={payload_len} "
+                    f"expected_payload_sha256={expected_payload_sha256} "
+                    f"actual_payload_sha256={payload_sha256}"
                 )
 
         missing_row_ids = set(expected_rows) - actual_row_ids
@@ -4023,6 +4291,33 @@ class BusinessE2ERunner:
             raise AssertionError(
                 f"temporary table row mismatch for token {token}: "
                 f"missing row ids {sorted(missing_row_ids)}"
+            )
+        if plan.config.temp_table_target_mb <= 0:
+            return
+        prefill_rows = self.runtime.execute(
+            conn,
+            "SELECT "
+            "COUNT(*), "
+            "COALESCE(SUM(id),0), "
+            "COALESCE(SUM(v),0), "
+            "COALESCE(SUM(OCTET_LENGTH(payload)),0), "
+            "COALESCE(BIT_XOR(CAST(CONV(SUBSTR(SHA2(CONCAT("
+            "id,'#',sid,'#',tx_id,'#',stmt_no,'#',v,'#',COALESCE(note,''),'#',"
+            "SHA2(payload, 256)), 256), 1, 16), 16, 10) AS UNSIGNED)),0), "
+            "COALESCE(BIT_XOR(CAST(CONV(SUBSTR(SHA2(CONCAT("
+            "id,'#',sid,'#',tx_id,'#',stmt_no,'#',v,'#',COALESCE(note,''),'#',"
+            "SHA2(payload, 256)), 256), 17, 16), 16, 10) AS UNSIGNED)),0) "
+            f"FROM `{table}` WHERE tx_id = 0",
+            fetch=True,
+        )
+        expected_prefill = plan.temp_prefill_fingerprint_after_resume(
+            tx_id, completed_stmt_no, sid
+        )
+        actual_prefill = tuple(int(value or 0) for value in prefill_rows[0])
+        if actual_prefill != expected_prefill:
+            raise AssertionError(
+                f"temporary table prefill mismatch for token {token}: "
+                f"expected={expected_prefill} actual={actual_prefill}"
             )
 
     def actual_table_fingerprints(self) -> Dict[str, RowFingerprint]:

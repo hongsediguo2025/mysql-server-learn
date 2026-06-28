@@ -128,7 +128,7 @@
     <thead><tr><th>术语</th><th>含义</th></tr></thead>
     <tbody>
       <tr><td>preserve</td><td>把一个未提交显式事务转换为 durable token 和 snapshot，使它可以跨重启恢复。</td></tr>
-      <tr><td>resume</td><td>用 token 在新连接中重新绑定 preserved transaction，并继续提交、回滚或执行后续 SQL。</td></tr>
+      <tr><td>resume</td><td>用 token 在新连接中重新绑定 preserved transaction，并继续提交、回滚或执行后续 SQL；带用户临时表 no-redo undo sidecar 的事务恢复后仅允许完成 COMMIT/ROLLBACK。</td></tr>
       <tr><td>drain</td><td>停机前收敛实例中的目标事务，批量执行 preserve。</td></tr>
       <tr><td>snapshot</td><td>durable metadata 文件，记录 token、账号、binlog、锁、read view、savepoint、临时表 manifest 等恢复所需语义。</td></tr>
       <tr><td>sidecar</td><td>大对象外置文件，例如 binlog cache、用户临时表 image、no-redo undo、warm external blob。</td></tr>
@@ -251,7 +251,7 @@
   <p>当前 full warmcopy-only NFR 证据显示大锁数场景仍可能达到分钟级阻塞，原因是大 payload 生产、编码、写入和 per-target preserve 仍集中在 phase 2。目标架构必须把 O(lock count) 的扫描、排序、编码、checksum、外部 artifact 写入移到 phase 1，并在 phase 2 只做 bounded tail、final fence 和 descriptor adopt。超过 1 秒是性能 SLO miss，不能改变功能正确性。</p>
 
   <h2 id="resume">6. Resume 与 Startup Recovery</h2>
-  <p>Resume 从 durable snapshot 中恢复语义，并把 claimed transaction 重新绑定到当前 THD。Startup recovery 扫描 preserve 目录，导入有效 token，回滚过期或不可恢复 token，清理 staging/orphan 文件。</p>
+  <p>Resume 从 durable snapshot 中恢复语义，并把 claimed transaction 重新绑定到当前 THD。Startup recovery 只在 mysqld 启动且 <code>preserve_trx_enable=ON</code> 时扫描 preserve 目录，导入有效 token，回滚过期或不可恢复 token，清理 staging/orphan 文件；实例以 <code>--preserve-trx-enable=OFF</code> 启动时不会扫描，运行中再 <code>SET GLOBAL preserve_trx_enable=ON</code> 也不会补扫既有 snapshot。</p>
 
   <div class="diagram" aria-label="resume sequence">
     <svg viewBox="0 0 1080 430" role="img">
@@ -274,7 +274,7 @@
     <svg viewBox="0 0 1050 360" role="img">
       <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
       <text x="24" y="30" class="title">Startup Recovery Flow</text>
-      <rect x="45" y="90" width="150" height="58" class="box"/><text x="77" y="124" class="label">扫描目录</text>
+      <rect x="45" y="90" width="150" height="58" class="box"/><text x="64" y="113" class="label">启动开关检查</text><text x="62" y="135" class="small">preserve_trx_enable=ON</text>
       <rect x="245" y="90" width="160" height="58" class="box2"/><text x="270" y="113" class="label">解析 snapshot</text><text x="270" y="135" class="small">版本、HMAC、CRC</text>
       <rect x="455" y="90" width="160" height="58" class="box2"/><text x="484" y="113" class="label">校验 timeout</text><text x="484" y="135" class="small">grace / recover count</text>
       <rect x="665" y="90" width="160" height="58" class="box3"/><text x="694" y="113" class="label">claim prepared</text><text x="694" y="135" class="small">token / XID</text>
@@ -347,7 +347,7 @@
       <tr><td>MDL</td><td>导出 transaction-duration MDL descriptors，resume 前做权限复检。</td><td>不支持 session/global 状态 preserve；LOCK TABLES、GET_LOCK、global read lock、backup lock 不纳入当前 v1。</td></tr>
       <tr><td>read view</td><td>导出/导入 InnoDB MVCC read view。</td><td>需要确保 purge/read view 状态可恢复，失败则拒绝或保留 token。</td></tr>
       <tr><td>savepoint</td><td>保存 SQL savepoint 与 InnoDB savepoint payload。</td><td>ROLLBACK TO SAVEPOINT 会影响锁和 MDL ordinal，warmcopy 目标需要 fence。</td></tr>
-      <tr><td>用户临时表</td><td>支持受约束的 InnoDB 用户临时表 image、DD/dict binding、fil space adoption。</td><td>no-redo undo resume 当前 fail closed；不支持形态必须拒绝。</td></tr>
+      <tr><td>用户临时表</td><td>支持受约束的 InnoDB 用户临时表 image、DD/dict binding、fil space adoption 和 no-redo undo sidecar reconnect。</td><td>缺失/损坏 sidecar、DDL/metadata/savepoint/statement rollback 边界、恢复后继续写临时表等不支持形态必须拒绝。</td></tr>
     </tbody>
   </table>
 
@@ -360,7 +360,7 @@
       <rect x="495" y="85" width="170" height="64" class="box2"/><text x="526" y="112" class="label">Sidecar</text><text x="526" y="134" class="small">image / undo / digest</text>
       <rect x="720" y="85" width="190" height="64" class="box3"/><text x="752" y="112" class="label">Resume Materialize</text><text x="752" y="134" class="small">fil space + dict binding</text>
       <path d="M215 117 L270 117" class="arrow"/><path d="M440 117 L495 117" class="arrow"/><path d="M665 117 L720 117" class="arrow"/>
-      <rect x="270" y="220" width="420" height="56" class="box4"/><text x="305" y="253" class="label">不支持 no-redo undo resume 时 fail closed，不写入不完整 srv_tmp_space</text>
+      <rect x="270" y="220" width="420" height="56" class="box4"/><text x="305" y="253" class="label">no-redo undo sidecar 可恢复；缺失/损坏或边界不支持时 fail closed</text>
     </svg>
   </div>
 

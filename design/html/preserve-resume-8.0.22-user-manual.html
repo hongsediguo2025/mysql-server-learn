@@ -79,7 +79,7 @@
   </ol>
 
   <h2 id="quick">1. 快速理解</h2>
-  <p>Preserve/Resume 允许把未提交的显式事务保存为 token，重启后用 token 恢复到新连接。保存的是事务语义，不是自动提交结果；恢复后用户仍要执行 <code>COMMIT</code> 或 <code>ROLLBACK</code>。</p>
+  <p>Preserve/Resume 允许把未提交的显式事务保存为 token，重启后用 token 恢复到新连接。保存的是事务语义，不是自动提交结果；普通 token 可以继续执行 SQL 后再 <code>COMMIT</code> 或 <code>ROLLBACK</code>，带用户临时表 no-redo undo sidecar 的 token 第一版只允许恢复后继续 <code>COMMIT</code> 或 <code>ROLLBACK</code>。</p>
   <div class="diagram" aria-label="快速流程">
     <svg viewBox="0 0 1000 300" role="img">
       <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
@@ -124,7 +124,7 @@ PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;</code></pre>
   <h3>2.3 Resume</h3>
   <pre><code>RESUME PRESERVED TRANSACTION '&lt;token&gt;';
 COMMIT;</code></pre>
-  <p>Resume 成功后，当前连接持有恢复后的事务。用户可以继续执行 SQL，然后提交或回滚。默认只能恢复自己账号创建的 token；跨账号恢复需要动态权限。</p>
+  <p>Resume 成功后，当前连接持有恢复后的事务。普通 preserved transaction 可以继续执行 SQL，然后提交或回滚。带用户临时表 no-redo undo sidecar 的事务只能继续 <code>COMMIT</code> 或 <code>ROLLBACK</code>；继续写恢复出的临时表会被拒绝。默认只能恢复自己账号创建的 token；跨账号恢复需要动态权限。</p>
 
   <h3>2.4 查看 token</h3>
   <pre><code>SHOW PRESERVED TRANSACTIONS;
@@ -171,7 +171,8 @@ SELECT TOKEN, USER, HOST, STATE, EXPIRES_AT, BINLOG_STATE,
       <tr><td><code>preserve_trx_recovery_grace_seconds</code></td><td>120 秒</td><td>首次 recovery 处理已过期 token 的宽限期。</td></tr>
       <tr><td><code>preserve_trx_max_snapshot_bytes</code></td><td>16 MiB</td><td>snapshot metadata 最大大小。</td></tr>
       <tr><td><code>preserve_trx_max_binlog_cache_bytes</code></td><td>1 GiB</td><td>单事务 binlog cache sidecar 上限。</td></tr>
-      <tr><td><code>preserve_trx_max_temp_sidecar_bytes</code></td><td>1 GiB</td><td>单个临时表 image 或 undo sidecar 上限。</td></tr>
+      <tr><td><code>preserve_trx_temp_table_enable</code></td><td>ON</td><td>开启受约束的用户 InnoDB 临时表 preserve/resume；tracked Temp-DML 通过 physical image、dirty page overlay 和 no-redo undo sidecar 恢复。关闭该子功能不会关闭普通 preserved transaction；包含用户 InnoDB temporary table sidecar 或历史的 preserve 会 fail closed，带 temp manifest 的 resume 返回 retryable unsupported。</td></tr>
+      <tr><td><code>preserve_trx_max_temp_sidecar_bytes</code></td><td>1 GiB</td><td>单个临时表 image 或 undo sidecar 上限；范围为 <code>1..ULLONG_MAX</code> 字节，默认 1 GiB。</td></tr>
     </tbody>
   </table>
 
@@ -260,7 +261,7 @@ DR&#65;IN TRANSACTIONS PRESERVE WITH TIMEOUT 1800;</code></pre>
   <p>锁预算首先受 <code>preserve_trx_max_lock_count</code> 控制。这里的锁包括 record locks、table locks、predicate locks、AUTO_INC locks 和 materialized implicit locks；read view、savepoint、MDL 也会进入恢复语义校验。当前 full 1s 目标要求大锁对象尽量在 phase 1 mirror 和 external artifact 中处理；如果 phase 2 仍重扫、排序、编码大量锁，就只能保证功能正确，不能宣称 1s SLO。</p>
 
   <h3>5.5 用户临时表</h3>
-  <p><code>preserve_trx_temp_table_enable=ON</code> 时支持受约束的用户 InnoDB temporary table。已存在临时表的事务型 DML 通过 physical image、dirty page overlay、dict binding 和 no-redo undo sidecar 保持语义；resume 后继续 <code>COMMIT</code> 或 <code>ROLLBACK</code> 时，临时表和持久表的可见性应与未 preserve 的事务一致。用户临时表 DDL/元数据变更、缺失或损坏的 sidecar/undo 信息仍 fail closed。</p>
+  <p><code>preserve_trx_temp_table_enable=ON</code> 时支持受约束的用户 InnoDB temporary table。已存在临时表的事务型 DML 通过 physical image、dirty page overlay、dict binding 和 no-redo undo sidecar 保持语义；resume 后继续 <code>COMMIT</code> 或 <code>ROLLBACK</code> 时，临时表和持久表的可见性应与未 preserve 的事务一致。用户临时表 DDL/元数据变更、缺失或损坏的 sidecar/undo 信息仍 fail closed。若该变量在 resume 前被关闭，普通 token 不受影响，但带 temp manifest 的 token 不会被消费，会返回可重试的 unsupported 状态，恢复时需重新打开该子功能。</p>
 
   <h2 id="trouble">6. 排障与限制</h2>
   <div class="diagram" aria-label="排障决策树">
@@ -286,6 +287,7 @@ DR&#65;IN TRANSACTIONS PRESERVE WITH TIMEOUT 1800;</code></pre>
       <tr><td>Warmcopy 预算耗尽</td><td>binlog cache 大小、warmcopy total、tail budget、pending range。</td><td>调大预算前先确认 preserve 目录磁盘空间和 IO 能力。</td></tr>
       <tr><td>锁导出失败</td><td>lock count、modified table、scan pages、materialize timeout、spatial predicate。</td><td>调参只能放宽已支持形态；unsupported shape 仍会失败。</td></tr>
       <tr><td>Resume 失败</td><td>token owner、read_only、binlog/GTID 模式、对象权限、snapshot integrity。</td><td>保留 token 和 sidecar，查看 P_S <code>LAST_ERROR</code>。</td></tr>
+      <tr><td>重启后看不到已有 token</td><td>实例是否以 <code>--preserve-trx-enable=OFF</code> 启动。</td><td>startup recovery 只在启动时且总开关为 ON 时扫描 preserve 目录；运行中改 ON 不会补扫，应以 ON 重新启动。</td></tr>
     </tbody>
   </table>
 

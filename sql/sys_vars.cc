@@ -1038,9 +1038,10 @@ static Sys_var_preserve_trx_dir Sys_preserve_trx_dir;
 
 static Sys_var_bool Sys_preserve_trx_temp_table_enable(
     "preserve_trx_temp_table_enable",
-    "Enable user InnoDB temporary table preserve/resume support for tables "
-    "without temp row history. Temp-DML and unsupported table metadata remain "
-    "fail-closed before durable token creation.",
+    "Enable constrained user InnoDB temporary table preserve/resume support. "
+    "Tracked Temp-DML is preserved through physical image and no-redo undo "
+    "sidecars; DDL, unsupported metadata, savepoint and statement-rollback "
+    "boundaries remain fail-closed before durable token creation.",
     GLOBAL_VAR(preserve_trx_temp_table_enable), CMD_LINE(OPT_ARG),
     DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 

@@ -11,10 +11,15 @@ my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
 my $source_root = File::Spec->rel2abs(
   File::Spec->catdir($mysql_test_dir, '..'));
 my $preserve_path = File::Spec->catfile($source_root, 'sql', 'preserve_trx.cc');
+my $temp_table_path =
+  File::Spec->catfile($source_root, 'sql', 'preserve_trx_temp_table.cc');
 
 open(my $fh, '<', $preserve_path) or die "cannot open $preserve_path: $!";
 my $preserve = do { local $/; <$fh> };
 close($fh);
+open(my $tfh, '<', $temp_table_path) or die "cannot open $temp_table_path: $!";
+my $temp_table = do { local $/; <$tfh> };
+close($tfh);
 
 die "preserve_trx.cc must define a temp-table drain participant\n"
   unless $preserve =~ /class\s+Temp_table_phase1_drain_participant\s+final\s*:\s*public\s+Preserve_trx_drain_participant/s;
@@ -24,6 +29,23 @@ die "drain execute must register the temp-table phase-1 participant\n"
   unless $preserve =~ /std::unique_ptr<Temp_table_phase1_drain_participant>[\s\S]*drain_orchestrator\.add_participant\s*\(\s*temp_table_participant\.get\(\)\s*\)/s;
 die "temp-table participant must call preserve_trx_temp_table_begin_capture_epoch\n"
   unless $preserve =~ /preserve_trx_temp_table_begin_capture_epoch\s*\(/s;
+die "temp-table participant cleanup must clear unsupported capture boundaries\n"
+  unless $preserve =~ /class\s+Clear_capture_epoch_targets[\s\S]*preserve_trx_temp_table_clear_batch_unsupported_boundary\s*\(\s*candidate\s*\)/s;
+my $active_guard = index($preserve,
+  'if (!draining.active()) return preserve_trx_reject_unsupported();');
+my $boundary_sweep = index($preserve,
+  'Preserve_batch_clear_temp_table_unsupported_boundaries clear_temp_boundaries');
+die "batch temp-table boundary sweep must happen only after active drain guard\n"
+  if $active_guard < 0 || $boundary_sweep < 0 || $boundary_sweep < $active_guard;
+die "no-target debug drain path must finalize participants before returning OK\n"
+  unless $preserve =~
+     /preserve_trx_drain_skip_shutdown_after_audit_no_targets[\s\S]{0,240}finalize_drain_participants\s*\(\s*"finish_no_targets"\s*\)[\s\S]{0,240}my_ok\s*\(\s*thd\s*\)/s;
+die "transaction cleanup must not clear the batch unsupported boundary\n"
+  if $temp_table =~
+     /void\s+preserve_trx_temp_table_clear_transaction_state\s*\([^)]*\)\s*\{[\s\S]{0,800}preserve_trx_temp_table_clear_batch_unsupported_boundary/s;
+die "transaction cleanup must not clear the batch capture epoch\n"
+  if $temp_table =~
+     /void\s+preserve_trx_temp_table_clear_transaction_state\s*\([^)]*\)\s*\{[\s\S]{0,800}preserve_trx_temp_table_batch_capture_epoch\.store/s;
 EOF
 
 SELECT 'ok' AS temp_table_phase1_participant_lint;

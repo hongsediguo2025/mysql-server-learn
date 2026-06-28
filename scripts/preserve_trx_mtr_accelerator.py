@@ -406,6 +406,17 @@ def build_execution_plan(config: MtrAcceleratorConfig) -> MtrExecutionPlan:
             "runner": "scripts/preserve_trx_lint_runner.py",
             "required": not config.include_mtr_lint,
             "mtr_lint_included": config.include_mtr_lint,
+            "log_path": str(run_dir / "logs" / "source_lint.log"),
+            "status_path": str(run_dir / "status" / "source_lint.status"),
+            "output_dir": str(run_dir / "source-lint"),
+            "command": [
+                sys.executable,
+                str(repo_root / "scripts/preserve_trx_lint_runner.py"),
+                "--repo-root",
+                str(repo_root),
+                "--output-dir",
+                str(run_dir / "source-lint"),
+            ],
         },
         slowest_tests=slowest,
         status="dry_run" if config.dry_run else "planned",
@@ -471,6 +482,33 @@ def _run_shard(shard: MtrShard) -> int:
     return proc.returncode
 
 
+def _run_source_lint(plan: MtrExecutionPlan) -> Dict[str, object]:
+    source_lint = plan.source_lint
+    log_path = Path(str(source_lint["log_path"]))
+    status_path = Path(str(source_lint["status_path"]))
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    start = time.monotonic()
+    with log_path.open("w") as log:
+        proc = subprocess.run(
+            [str(item) for item in source_lint["command"]],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    status_path.write_text(str(proc.returncode) + "\n")
+    return {
+        "id": "source_lint",
+        "kind": "source_lint",
+        "mode": "source_lint",
+        "return_code": proc.returncode,
+        "duration_s": round(time.monotonic() - start, 3),
+        "log_path": str(log_path),
+        "status_path": str(status_path),
+    }
+
+
 def _write_final_result(plan: MtrExecutionPlan,
                         results: Sequence[Dict[str, object]]) -> None:
     status = "pass" if all(item["return_code"] == 0 for item in results) \
@@ -495,6 +533,13 @@ def _write_final_result(plan: MtrExecutionPlan,
 def execute_plan(plan: MtrExecutionPlan) -> int:
     heavy_gate = threading.Semaphore(max(1, plan.max_heavy_100))
     results: List[Dict[str, object]] = []
+
+    if plan.source_lint.get("required"):
+        source_lint_result = _run_source_lint(plan)
+        results.append(source_lint_result)
+        if source_lint_result["return_code"] != 0:
+            _write_final_result(plan, results)
+            return 1
 
     def run_one(shard: MtrShard) -> Dict[str, object]:
         start = time.monotonic()

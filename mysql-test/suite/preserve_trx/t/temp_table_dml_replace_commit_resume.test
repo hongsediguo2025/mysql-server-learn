@@ -18,6 +18,7 @@ CREATE TABLE t_preserve_replace_insert(
 INSERT INTO tmp_preserve_replace_insert VALUES(1, 10);
 START TRANSACTION;
 UPDATE tmp_preserve_replace_insert SET v = 11 WHERE id = 1;
+REPLACE INTO tmp_preserve_replace_insert VALUES(1, 12);
 REPLACE INTO t_preserve_replace_insert VALUES(1, 100);
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect

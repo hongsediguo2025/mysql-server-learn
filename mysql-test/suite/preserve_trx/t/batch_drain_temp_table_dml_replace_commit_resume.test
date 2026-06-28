@@ -38,6 +38,7 @@ SET @batch_temp_sid = 1;
 START TRANSACTION;
 INSERT INTO tmp_batch_temp_replace VALUES(1, 10);
 UPDATE tmp_batch_temp_replace SET v = 11 WHERE id = 1;
+REPLACE INTO tmp_batch_temp_replace VALUES(1, 12);
 REPLACE INTO t_batch_temp_replace
   (sid,k,v,counter,amount,d,note,js,deleted)
 VALUES

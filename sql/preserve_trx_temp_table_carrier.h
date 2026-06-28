@@ -90,6 +90,38 @@ struct Preserved_temp_table_undo_descriptor {
   uint32_t no_redo_undo_rseg_slot{0};
 };
 
+struct Preserved_temp_table_ownership_claim {
+  /*
+    Ownership claims describe page-level authority in the no-redo undo sidecar.
+    RSEG_HEADER/RSEG_ALLOCATOR pages are shared proof metadata. UNDO_HEADER and
+    UNDO_LOG pages are exclusive to one token/rollback-segment slot owner.
+  */
+  std::string token;
+  /* Source temp tablespace whose sealed undo sidecar owns this claim. */
+  uint32_t source_space_id{0};
+  /* No-redo rollback segment tablespace id recorded in the undo sidecar. */
+  uint32_t rseg_space_id{0};
+  /* No-redo rollback segment header page recorded in the undo sidecar. */
+  uint32_t rseg_page_no{0};
+  /* Rollback segment slot/id recorded in the undo sidecar descriptor. */
+  uint32_t rseg_slot{0};
+  /* Transaction-owned undo segment slot within the rollback segment. */
+  uint32_t undo_slot{0};
+  uint32_t page_no{0};
+  trx_preserve_temp_no_redo_undo_page_kind page_role{
+      trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG};
+  /* Digest of the claimed no-redo undo page image. */
+  std::array<unsigned char, 32> page_digest{};
+};
+
+enum class Preserved_temp_table_ownership_conflict {
+  NONE = 0,
+  INVALID_CLAIM = 1,
+  SHARED_DIGEST = 2,
+  SHARED_RSEG_IDENTITY = 3,
+  EXCLUSIVE_OWNER = 4
+};
+
 struct Preserved_temp_table_manifest_entry {
   /*
     One logical temporary table in the preserved transaction. SQL state,
@@ -113,8 +145,11 @@ struct Preserved_temp_table_manifest {
     resume would not know which preserved trx owns the temp-only state.
   */
   uint64_t owner_trx_id{0};
+  /* Decode-derived capability; callers must not set this as intent. */
+  bool native_adoption_capable{false};
   std::vector<Preserved_temp_table_manifest_entry> tables;
   std::vector<Preserved_temp_table_undo_descriptor> undo_images;
+  std::vector<Preserved_temp_table_ownership_claim> ownership_claims;
 };
 
 struct Preserved_temp_table_image_writer_result {
@@ -274,5 +309,15 @@ bool preserve_trx_encode_temp_table_manifest(
 
 bool preserve_trx_decode_temp_table_manifest(
     std::string_view payload, Preserved_temp_table_manifest *manifest);
+
+Preserved_temp_table_ownership_conflict
+preserve_trx_temp_table_check_ownership_conflicts(
+    const std::vector<Preserved_temp_table_ownership_claim> &lhs,
+    const std::vector<Preserved_temp_table_ownership_claim> &rhs);
+
+Preserved_temp_table_ownership_conflict
+preserve_trx_temp_table_check_ownership_conflicts(
+    const Preserved_temp_table_manifest &lhs,
+    const Preserved_temp_table_manifest &rhs);
 
 #endif  // SQL_PRESERVE_TRX_TEMP_TABLE_CARRIER_INCLUDED

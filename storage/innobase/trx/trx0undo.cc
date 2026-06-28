@@ -388,6 +388,7 @@ static bool trx_undo_temp_preserve_slot_reserved(const trx_rseg_t *rseg,
          fsp_is_system_temporary(rseg->space_id) &&
          trx_preserve_temp_space_image_no_redo_undo_slot_reserved(
              static_cast<uint32_t>(rseg->space_id),
+             static_cast<uint32_t>(rseg->page_no), static_cast<uint32_t>(rseg->id),
              static_cast<uint32_t>(slot_no));
 }
 
@@ -1664,11 +1665,11 @@ static trx_undo_t *trx_undo_reuse_cached(trx_t *trx, trx_rseg_t *rseg,
   }
 
   if (type == TRX_UNDO_INSERT) {
-    undo = UT_LIST_GET_FIRST(rseg->insert_undo_cached);
-    if (undo == nullptr) {
-      return (nullptr);
+    for (undo = UT_LIST_GET_FIRST(rseg->insert_undo_cached); undo != nullptr;
+         undo = UT_LIST_GET_NEXT(undo_list, undo)) {
+      if (!trx_undo_temp_preserve_slot_reserved(rseg, undo->id)) break;
     }
-    if (trx_undo_temp_preserve_slot_reserved(rseg, undo->id)) {
+    if (undo == nullptr) {
       return (nullptr);
     }
 
@@ -1678,11 +1679,11 @@ static trx_undo_t *trx_undo_reuse_cached(trx_t *trx, trx_rseg_t *rseg,
   } else {
     ut_ad(type == TRX_UNDO_UPDATE);
 
-    undo = UT_LIST_GET_FIRST(rseg->update_undo_cached);
-    if (undo == nullptr) {
-      return (nullptr);
+    for (undo = UT_LIST_GET_FIRST(rseg->update_undo_cached); undo != nullptr;
+         undo = UT_LIST_GET_NEXT(undo_list, undo)) {
+      if (!trx_undo_temp_preserve_slot_reserved(rseg, undo->id)) break;
     }
-    if (trx_undo_temp_preserve_slot_reserved(rseg, undo->id)) {
+    if (undo == nullptr) {
       return (nullptr);
     }
 
@@ -1963,7 +1964,8 @@ void trx_undo_update_cleanup(trx_t *trx, trx_undo_ptr_t *undo_ptr,
     UT_LIST_REMOVE(rseg->update_undo_list, undo);
     undo_ptr->update_undo = nullptr;
     trx_preserve_temp_space_image_release_no_redo_undo_slot(
-        static_cast<uint32_t>(undo->space), static_cast<uint32_t>(undo->id));
+        static_cast<uint32_t>(rseg->space_id), static_cast<uint32_t>(rseg->page_no),
+        static_cast<uint32_t>(rseg->id), static_cast<uint32_t>(undo->id));
     trx_undo_mem_free(undo);
     return;
   }
@@ -2009,7 +2011,8 @@ void trx_undo_insert_cleanup(trx_undo_ptr_t *undo_ptr, bool noredo) {
 
   if (trx_undo_preserve_magic_no_redo_should_skip_cache(undo)) {
     trx_preserve_temp_space_image_release_no_redo_undo_slot(
-        static_cast<uint32_t>(undo->space), static_cast<uint32_t>(undo->id));
+        static_cast<uint32_t>(rseg->space_id), static_cast<uint32_t>(rseg->page_no),
+        static_cast<uint32_t>(rseg->id), static_cast<uint32_t>(undo->id));
     trx_undo_mem_free(undo);
   } else if (undo->state == TRX_UNDO_CACHED) {
     UT_LIST_ADD_FIRST(rseg->insert_undo_cached, undo);
@@ -2065,7 +2068,9 @@ void trx_undo_free_trx_with_prepared_or_active_logs(trx_t *trx,
     if (trx_undo_preserve_magic_no_redo_should_skip_cache(
             trx->rsegs.m_noredo.update_undo)) {
       trx_preserve_temp_space_image_release_no_redo_undo_slot(
-          static_cast<uint32_t>(trx->rsegs.m_noredo.update_undo->space),
+          static_cast<uint32_t>(trx->rsegs.m_noredo.rseg->space_id),
+          static_cast<uint32_t>(trx->rsegs.m_noredo.rseg->page_no),
+          static_cast<uint32_t>(trx->rsegs.m_noredo.rseg->id),
           static_cast<uint32_t>(trx->rsegs.m_noredo.update_undo->id));
     }
     trx_undo_mem_free(trx->rsegs.m_noredo.update_undo);
@@ -2080,7 +2085,9 @@ void trx_undo_free_trx_with_prepared_or_active_logs(trx_t *trx,
     if (trx_undo_preserve_magic_no_redo_should_skip_cache(
             trx->rsegs.m_noredo.insert_undo)) {
       trx_preserve_temp_space_image_release_no_redo_undo_slot(
-          static_cast<uint32_t>(trx->rsegs.m_noredo.insert_undo->space),
+          static_cast<uint32_t>(trx->rsegs.m_noredo.rseg->space_id),
+          static_cast<uint32_t>(trx->rsegs.m_noredo.rseg->page_no),
+          static_cast<uint32_t>(trx->rsegs.m_noredo.rseg->id),
           static_cast<uint32_t>(trx->rsegs.m_noredo.insert_undo->id));
     }
     trx_undo_mem_free(trx->rsegs.m_noredo.insert_undo);

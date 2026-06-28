@@ -164,6 +164,35 @@ struct trx_preserve_temp_no_redo_undo_log_anchor {
   uint64_t top_undo_no{0};
 };
 
+enum class trx_preserve_temp_no_redo_undo_reconnect_mode {
+  RESTORED_ONLY,
+  NATIVE_OWNED
+};
+
+struct trx_preserve_temp_reservation_owner {
+  uint32_t source_space_id{0};
+  std::string token;
+  std::string domain;
+};
+
+struct trx_preserve_temp_page_reservation {
+  uint32_t space_id{0};
+  uint32_t page_no{0};
+  trx_preserve_temp_reservation_owner owner;
+};
+
+struct trx_preserve_temp_ownership_page_claim {
+  std::string token;
+  uint32_t source_space_id{0};
+  uint32_t rseg_space_id{0};
+  uint32_t rseg_page_no{0};
+  uint32_t rseg_id{0};
+  uint32_t undo_slot{0};
+  uint32_t page_no{0};
+  trx_preserve_temp_no_redo_undo_page_kind page_role{
+      trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG};
+};
+
 struct trx_preserve_temp_space_image_descriptor {
   /*
     Descriptor lifecycle:
@@ -215,6 +244,13 @@ struct trx_preserve_temp_space_image_descriptor {
   bool no_redo_undo_capture_degraded{false};
   std::string no_redo_undo_capture_degraded_reason;
   bool no_redo_undo_pointers_reconnected{false};
+  bool no_redo_undo_restored_only_reconnected{false};
+  /*
+    NATIVE_OWNED reconnect may use the ordinary no-redo undo cleanup path only
+    after a later adoption slice has proved that live rseg slots and allocator
+    metadata own these pages. Restored-only reconnect leaves this false.
+  */
+  bool no_redo_undo_native_slots_adopted{false};
   bool no_redo_undo_rseg_identity_present{false};
   uint32_t no_redo_undo_rseg_space_id{0};
   uint32_t no_redo_undo_rseg_page_no{0};
@@ -371,17 +407,63 @@ bool trx_preserve_temp_space_image_should_disable_undo_cache(
     uint32_t rseg_space_id);
 
 /*
+  Startup page reservations are a native-adoption primitive. They describe
+  preserved no-redo pages and expose a fast query/skip API, but Task 2 does not
+  wire this into FSP/fseg page allocation; allocator enforcement belongs to the
+  later native-adoption allocator slice. The no-redo undo slot reservation below
+  is already connected to temporary undo slot selection.
+*/
+bool trx_preserve_temp_space_image_reserve_page(
+    uint32_t space_id, uint32_t page_no,
+    const trx_preserve_temp_reservation_owner &owner);
+
+bool trx_preserve_temp_space_image_page_reserved(uint32_t space_id,
+                                                 uint32_t page_no);
+
+size_t trx_preserve_temp_space_image_release_page_reservations_for_owner(
+    const trx_preserve_temp_reservation_owner &owner);
+
+bool trx_preserve_temp_space_image_register_page_reservations(
+    const std::vector<trx_preserve_temp_page_reservation> &reservations);
+
+bool trx_preserve_temp_space_image_register_page_reservations_from_claims(
+    const std::vector<trx_preserve_temp_ownership_page_claim> &claims);
+
+bool trx_rseg_preserve_bootstrap_tmp_rseg_required(uint32_t rseg_space_id,
+                                                   uint32_t rseg_page_no,
+                                                   uint32_t rseg_slot);
+
+bool trx_rseg_preserve_bootstrap_tmp_rsegs_required_from_claims(
+    const std::vector<trx_preserve_temp_ownership_page_claim> &claims);
+
+bool trx_rseg_preserve_bootstrap_tmp_rseg_required_from_descriptor(
+    const trx_preserve_temp_space_image_descriptor &descriptor);
+
+bool trx_rseg_preserve_bootstrap_tmp_rsegs(
+    unsigned long target_rollback_segments, bool require_resolved);
+
+/*
   A resumed transaction reconnects no-redo undo objects from the preserved
   sidecar before the token is committed or rolled back. Those undo objects are
   linked only in memory, so the live rollback-segment header still looks free.
   The reservation API keeps the normal temporary undo allocator from reusing
   the same slot while the preserved transaction remains retryable.
 */
+bool trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
+    uint32_t owner_source_space_id, uint32_t rseg_space_id,
+    uint32_t rseg_page_no, uint32_t rseg_id, uint32_t slot);
+
 bool trx_preserve_temp_space_image_no_redo_undo_slot_reserved(
-    uint32_t rseg_space_id, uint32_t slot);
+    uint32_t rseg_space_id, uint32_t rseg_page_no, uint32_t rseg_id,
+    uint32_t slot);
 
 void trx_preserve_temp_space_image_release_no_redo_undo_slot(
-    uint32_t rseg_space_id, uint32_t slot);
+    uint32_t rseg_space_id, uint32_t rseg_page_no, uint32_t rseg_id,
+    uint32_t slot);
+
+dberr_t trx_preserve_temp_space_image_release_no_redo_undo_reservations_from_sidecar(
+    uint32_t source_space_id, uint32_t page_size, const unsigned char *payload,
+    size_t payload_length);
 
 dberr_t trx_preserve_temp_space_image_capture_no_redo_undo_from_trx(
     trx_preserve_temp_space_image_descriptor *descriptor, const trx_t *trx);
@@ -425,6 +507,9 @@ trx_preserve_temp_space_image_no_redo_undo_capture_degraded_reason(
 bool trx_preserve_temp_space_image_no_redo_undo_pointers_reconnected(
     const trx_preserve_temp_space_image_descriptor &descriptor);
 
+bool trx_preserve_temp_space_image_no_redo_undo_restored_only_reconnected(
+    const trx_preserve_temp_space_image_descriptor &descriptor);
+
 size_t trx_preserve_temp_space_image_no_redo_undo_page_count(
     const trx_preserve_temp_space_image_descriptor &descriptor);
 
@@ -440,8 +525,19 @@ const trx_preserve_temp_no_redo_undo_log_anchor *
 trx_preserve_temp_space_image_no_redo_update_undo_anchor(
     const trx_preserve_temp_space_image_descriptor &descriptor);
 
+/*
+  Native-owned reconnect is allowed only after this step has made the restored
+  no-redo undo anchors visible in the live temporary rollback-segment header.
+  The function validates the captured rseg identity and claims each preserved
+  undo slot in the current server's no-redo rseg. It does not attach the undo
+  objects to a trx; reconnect does that after this proof is available.
+*/
+dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume(
+    trx_preserve_temp_space_image_descriptor *descriptor);
+
 dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-    trx_preserve_temp_space_image_descriptor *descriptor, trx_t *trx);
+    trx_preserve_temp_space_image_descriptor *descriptor, trx_t *trx,
+    trx_preserve_temp_no_redo_undo_reconnect_mode mode);
 
 dberr_t trx_preserve_temp_space_image_disconnect_no_redo_undo_for_retry(
     trx_preserve_temp_space_image_descriptor *descriptor);
@@ -486,10 +582,30 @@ uint32_t trx_preserve_temp_space_image_staged_dirty_pages_for_test();
 
 uint64_t trx_preserve_temp_space_image_staged_dirty_page_bytes_for_test();
 
+uint32_t trx_preserve_temp_space_image_active_page_reservations_for_test();
+
+uint32_t trx_preserve_temp_space_image_page_reservation_slow_lookups_for_test();
+
+uint32_t
+trx_preserve_temp_space_image_active_no_redo_undo_slot_reservations_for_test();
+
+uint32_t
+trx_preserve_temp_space_image_no_redo_undo_slot_reservation_slow_lookups_for_test();
+
+uint32_t trx_rseg_preserve_bootstrap_tmp_rseg_count_for_test();
+
+bool trx_rseg_preserve_bootstrap_tmp_rseg_has_shared_pages_for_test(
+    uint32_t rseg_space_id, uint32_t rseg_page_no, uint32_t rseg_slot);
+
+void trx_preserve_temp_space_image_clear_reservation_registries_for_test();
+
 void trx_preserve_temp_space_image_set_stage_admission_closed_for_test(
     uint32_t source_space_id, bool closed);
 
 bool trx_preserve_temp_no_redo_undo_skip_history_for_test(bool restored);
+
+bool trx_preserve_temp_no_redo_undo_reconnect_mode_skips_history_for_test(
+    bool restored_only);
 
 size_t trx_preserve_temp_space_image_dirty_page_count(
     const trx_preserve_temp_space_image_descriptor &descriptor);

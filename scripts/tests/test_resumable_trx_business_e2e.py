@@ -8,6 +8,7 @@ come from running scripts/resumable_trx_business_e2e.py against a real server.
 
 import unittest
 import contextlib
+import hashlib
 import io
 import queue
 import tempfile
@@ -295,9 +296,10 @@ class _ResumeMappingBinaryLogRuntime(_ResumeMappingRuntime):
 
 
 class _TempRowsResumeRuntime(_ResumeMappingRuntime):
-    def __init__(self, sid_rows, temp_rows):
+    def __init__(self, sid_rows, temp_rows, prefill_rows=None):
         super().__init__(sid_rows)
         self._temp_rows = list(temp_rows)
+        self._prefill_rows = list(prefill_rows or [])
 
     def execute(self, conn, sql, fetch=False):
         self.sql.append(sql)
@@ -311,13 +313,46 @@ class _TempRowsResumeRuntime(_ResumeMappingRuntime):
             if len(row) == 3:
                 return [(row[0], row[1], row[2], 99)]
             return [(row[0], row[1], 0, 99)]
-        if fetch and sql.startswith("SELECT id, sid, tx_id, stmt_no, v, note FROM"):
+        if fetch and sql.startswith("SELECT id, sid, tx_id, stmt_no, v, note"):
             if self._temp_rows and isinstance(self._temp_rows[0], list):
                 return list(self._temp_rows.pop(0))
             return list(self._temp_rows)
+        if fetch and "WHERE tx_id = 0" in sql:
+            return list(self._prefill_rows)
         if fetch:
             return _fake_fetch_rows(sql)
         return ()
+
+
+def _large_temp_payload_digest(plan, updated=True):
+    payload = b"i" * plan.temp_table_fill_chunk_bytes()
+    if updated:
+        payload += b"u"
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _large_temp_prefill_fingerprint(plan, tx_id=10, completed_stmt_no=1, sid=2):
+    base = plan.temp_prefill_fingerprint_after_resume(
+        tx_id, completed_stmt_no, sid
+    )
+    if len(base) == 6:
+        return base
+    row_count = plan.temp_table_fill_row_count()
+    deleted = set(plan.temp_deleted_prefill_ids(tx_id, completed_stmt_no))
+    payload_digest = hashlib.sha256(
+        b"x" * plan.temp_table_fill_chunk_bytes()
+    ).hexdigest()
+    digest_hi = 0
+    digest_lo = 0
+    for row_id in range(1, row_count + 1):
+        if row_id in deleted:
+            continue
+        row_digest = hashlib.sha256(
+            f"{row_id}#{sid}#0#-1#{row_id - 1}#prefill#{payload_digest}".encode("utf8")
+        ).hexdigest()
+        digest_hi ^= int(row_digest[:16], 16)
+        digest_lo ^= int(row_digest[16:32], 16)
+    return (*base, digest_hi, digest_lo)
 
 
 class _BinaryLogRuntime(_FakeRuntime):
@@ -1269,6 +1304,31 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertEqual(1, coordinator.pause_calls)
 
     def test_temp_table_worker_commits_after_resume_without_more_temp_dml(self):
+        class TempCommitRuntime(_FakeRuntime):
+            def __init__(self, plan):
+                super().__init__()
+                self.plan = plan
+
+            def execute(self, conn, sql, fetch=False):
+                self.sql.append(sql)
+                self.calls.append((sql, fetch))
+                if fetch and sql.startswith(
+                    "SELECT id, sid, tx_id, stmt_no, v, note FROM `rtx_e2e_tmp_001`"
+                ):
+                    return [
+                        (
+                            self.plan.temp_row_id(1, 0),
+                            1,
+                            1,
+                            0,
+                            self.plan.temp_row_value_after_insert(1, 1, 0),
+                            "tmp-s001-t00001-n000",
+                        )
+                    ]
+                if fetch:
+                    return _fake_fetch_rows(sql)
+                return ()
+
         cfg = HarnessConfig(
             sessions=1,
             table_count=1,
@@ -1277,11 +1337,12 @@ class WorkloadPlanTest(unittest.TestCase):
             temp_table_workload=True,
             min_statements_before_drain_pause=1,
         ).validate()
-        runtime = _FakeRuntime()
+        plan = WorkloadPlan(cfg)
+        runtime = TempCommitRuntime(plan)
         resumed = _FakeConnection()
         worker = BusinessWorker(
             1,
-            WorkloadPlan(cfg),
+            plan,
             runtime,
             _ResumeOnceDrainableCoordinator(resumed),
             threading.Event(),
@@ -1339,6 +1400,111 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertFalse(
             any(sql.startswith("UPDATE `rtx_e2e_tmp_001`") for sql in runtime.sql)
         )
+
+    def test_large_temp_table_rollback_checks_prefill_fingerprint(self):
+        class TempRollbackRuntime(_FakeRuntime):
+            def __init__(self, expected_prefill):
+                super().__init__()
+                self.expected_prefill = expected_prefill
+
+            def execute(self, conn, sql, fetch=False):
+                self.sql.append(sql)
+                self.calls.append((sql, fetch))
+                if fetch and sql.startswith(
+                    "SELECT COUNT(*) FROM `rtx_e2e_tmp_001` WHERE tx_id = 1"
+                ):
+                    return [(0,)]
+                if fetch and "FROM `rtx_e2e_tmp_001` WHERE tx_id = 0" in sql:
+                    return [self.expected_prefill]
+                if fetch:
+                    return _fake_fetch_rows(sql)
+                return ()
+
+        cfg = HarnessConfig(
+            sessions=1,
+            table_count=1,
+            statements_per_tx=4,
+            seed_rows_per_table_per_session=8,
+            temp_table_workload=True,
+            temp_table_target_mb=1,
+            temp_table_resume_action="rollback",
+            min_statements_before_drain_pause=1,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+        runtime = TempRollbackRuntime(
+            _large_temp_prefill_fingerprint(
+                plan, tx_id=1, completed_stmt_no=-1, sid=1
+            )
+        )
+        worker = BusinessWorker(
+            1,
+            plan,
+            runtime,
+            _ResumeOnceDrainableCoordinator(_FakeConnection()),
+            threading.Event(),
+        )
+
+        worker._run_transaction(_FakeConnection(), tx_id=1)
+
+        sql_text = "\n".join(runtime.sql)
+        self.assertIn("WHERE tx_id = 0", sql_text)
+        self.assertIn("OCTET_LENGTH(payload)", sql_text)
+        self.assertIn("BIT_XOR", sql_text)
+
+    def test_large_temp_table_rollback_rejects_prefill_fingerprint_mismatch(self):
+        class TempRollbackRuntime(_FakeRuntime):
+            def __init__(self, observed_prefill):
+                super().__init__()
+                self.observed_prefill = observed_prefill
+
+            def execute(self, conn, sql, fetch=False):
+                self.sql.append(sql)
+                self.calls.append((sql, fetch))
+                if fetch and sql.startswith(
+                    "SELECT COUNT(*) FROM `rtx_e2e_tmp_001` WHERE tx_id = 1"
+                ):
+                    return [(0,)]
+                if fetch and "FROM `rtx_e2e_tmp_001` WHERE tx_id = 0" in sql:
+                    return [self.observed_prefill]
+                if fetch:
+                    return _fake_fetch_rows(sql)
+                return ()
+
+        cfg = HarnessConfig(
+            sessions=1,
+            table_count=1,
+            statements_per_tx=4,
+            seed_rows_per_table_per_session=8,
+            temp_table_workload=True,
+            temp_table_target_mb=1,
+            temp_table_resume_action="rollback",
+            min_statements_before_drain_pause=1,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+        expected_prefill = _large_temp_prefill_fingerprint(
+            plan, tx_id=1, completed_stmt_no=-1, sid=1
+        )
+        corrupted_prefill = (
+            expected_prefill[0],
+            expected_prefill[1],
+            expected_prefill[2],
+            expected_prefill[3] + 1,
+            expected_prefill[4],
+            expected_prefill[5],
+        )
+        runtime = TempRollbackRuntime(corrupted_prefill)
+        worker = BusinessWorker(
+            1,
+            plan,
+            runtime,
+            _ResumeOnceDrainableCoordinator(_FakeConnection()),
+            threading.Event(),
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError, "temporary table rollback did not restore prefill rows"
+        ):
+            worker._run_transaction(_FakeConnection(), tx_id=1)
 
     def test_temp_table_worker_rejects_rollback_that_leaves_current_tx_rows(self):
         class TempRollbackRuntime(_FakeRuntime):
@@ -2861,6 +3027,435 @@ class WorkloadPlanTest(unittest.TestCase):
             runner._validate_resumed_temp_table(
                 _FakeConnection(), "tok-temp", sid=2, tx_id=10, completed_stmt_no=1
             )
+
+    def test_large_temp_table_validation_checks_prefill_and_payload(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            sessions=2,
+            temp_table_workload=True,
+            temp_table_target_mb=1,
+            temp_table_fill_chunk_kb=64,
+        )
+        plan = WorkloadPlan(runner.config)
+        runner.plan = plan
+        runner.runtime = _TempRowsResumeRuntime(
+            [],
+            [
+                (
+                    plan.temp_row_id(10, 0),
+                    2,
+                    10,
+                    1,
+                    plan.temp_row_value_after_update(2, 10, 1),
+                    "tmp-s002-t00010-n000",
+                    plan.temp_table_fill_chunk_bytes() + 1,
+                    _large_temp_payload_digest(plan),
+                )
+            ],
+            [_large_temp_prefill_fingerprint(plan, tx_id=10, completed_stmt_no=1)],
+        )
+
+        runner._validate_resumed_temp_table(
+            _FakeConnection(), "tok-temp", sid=2, tx_id=10, completed_stmt_no=1
+        )
+
+        sql_text = "\n".join(runner.runtime.sql)
+        self.assertIn("OCTET_LENGTH(payload)", sql_text)
+        self.assertIn("SHA2(payload, 256)", sql_text)
+        self.assertIn("BIT_XOR", sql_text)
+        self.assertIn("WHERE tx_id = 0", sql_text)
+
+    def test_large_temp_table_prefill_digest_hashes_full_row_metadata(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            sessions=2,
+            temp_table_workload=True,
+            temp_table_target_mb=1,
+            temp_table_fill_chunk_kb=64,
+        )
+        plan = WorkloadPlan(runner.config)
+        runner.plan = plan
+        runner.runtime = _TempRowsResumeRuntime(
+            [],
+            [
+                (
+                    plan.temp_row_id(10, 0),
+                    2,
+                    10,
+                    1,
+                    plan.temp_row_value_after_update(2, 10, 1),
+                    "tmp-s002-t00010-n000",
+                    plan.temp_table_fill_chunk_bytes() + 1,
+                    _large_temp_payload_digest(plan),
+                )
+            ],
+            [_large_temp_prefill_fingerprint(plan, tx_id=10, completed_stmt_no=1)],
+        )
+
+        runner._validate_resumed_temp_table(
+            _FakeConnection(), "tok-temp", sid=2, tx_id=10, completed_stmt_no=1
+        )
+
+        prefill_sql = "\n".join(
+            sql for sql in runner.runtime.sql if "WHERE tx_id = 0" in sql
+        )
+        self.assertIn("id,'#',sid,'#',tx_id,'#',stmt_no", prefill_sql)
+        self.assertIn("v,'#',COALESCE(note,'')", prefill_sql)
+
+    def test_temp_table_commit_after_resume_rechecks_temp_rows(self):
+        class TempCommitRuntime(_FakeRuntime):
+            def execute(self, conn, sql, fetch=False):
+                self.sql.append(sql)
+                self.calls.append((sql, fetch))
+                if fetch and sql.startswith(
+                    "SELECT id, sid, tx_id, stmt_no, v, note FROM `rtx_e2e_tmp_001`"
+                ):
+                    return [(1000, 1, 1, 0, -1, "corrupt-after-commit")]
+                if fetch:
+                    return _fake_fetch_rows(sql)
+                return ()
+
+        cfg = HarnessConfig(
+            sessions=1,
+            table_count=1,
+            statements_per_tx=4,
+            seed_rows_per_table_per_session=8,
+            temp_table_workload=True,
+            min_statements_before_drain_pause=1,
+        ).validate()
+        runtime = TempCommitRuntime()
+        worker = BusinessWorker(
+            1,
+            WorkloadPlan(cfg),
+            runtime,
+            _ResumeOnceDrainableCoordinator(_FakeConnection()),
+            threading.Event(),
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError, "temporary table committed row mismatch"
+        ):
+            worker._run_transaction(_FakeConnection(), tx_id=1)
+
+    def test_large_temp_table_commit_after_resume_rechecks_prefill_fingerprint(self):
+        class LargeTempCommitRuntime(_FakeRuntime):
+            def __init__(self, plan):
+                super().__init__()
+                self.plan = plan
+                self.expected_prefill = _large_temp_prefill_fingerprint(
+                    plan, tx_id=1, completed_stmt_no=0, sid=1
+                )
+
+            def execute(self, conn, sql, fetch=False):
+                self.sql.append(sql)
+                self.calls.append((sql, fetch))
+                if fetch and sql.startswith(
+                    "SELECT id, sid, tx_id, stmt_no, v, note"
+                ):
+                    return [
+                        (
+                            self.plan.temp_row_id(1, 0),
+                            1,
+                            1,
+                            0,
+                            self.plan.temp_row_value_after_insert(1, 1, 0),
+                            "tmp-s001-t00001-n000",
+                            self.plan.temp_table_fill_chunk_bytes(),
+                            _large_temp_payload_digest(self.plan, updated=False),
+                        )
+                    ]
+                if fetch and "WHERE tx_id = 0" in sql:
+                    return [
+                        (
+                            self.expected_prefill[0],
+                            self.expected_prefill[1],
+                            self.expected_prefill[2],
+                            self.expected_prefill[3],
+                            self.expected_prefill[4] ^ 1,
+                            self.expected_prefill[5],
+                        )
+                    ]
+                if fetch:
+                    return _fake_fetch_rows(sql)
+                return ()
+
+        cfg = HarnessConfig(
+            sessions=1,
+            table_count=1,
+            statements_per_tx=4,
+            seed_rows_per_table_per_session=8,
+            temp_table_workload=True,
+            temp_table_target_mb=1,
+            temp_table_fill_chunk_kb=64,
+            min_statements_before_drain_pause=1,
+        ).validate()
+        plan = WorkloadPlan(cfg)
+        runtime = LargeTempCommitRuntime(plan)
+        worker = BusinessWorker(
+            1,
+            plan,
+            runtime,
+            _ResumeOnceDrainableCoordinator(_FakeConnection()),
+            threading.Event(),
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError, "temporary table committed prefill mismatch"
+        ):
+            worker._run_transaction(_FakeConnection(), tx_id=1)
+
+        post_commit_prefill_queries = [
+            sql for sql in runtime.sql if "WHERE tx_id = 0" in sql
+        ]
+        self.assertTrue(post_commit_prefill_queries)
+        self.assertIn("id,'#',sid,'#',tx_id,'#',stmt_no",
+                      post_commit_prefill_queries[-1])
+
+    def test_large_temp_table_validation_rejects_payload_length_mismatch(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            sessions=2,
+            temp_table_workload=True,
+            temp_table_target_mb=1,
+            temp_table_fill_chunk_kb=64,
+        )
+        plan = WorkloadPlan(runner.config)
+        runner.plan = plan
+        runner.runtime = _TempRowsResumeRuntime(
+            [],
+            [
+                (
+                    plan.temp_row_id(10, 0),
+                    2,
+                    10,
+                    1,
+                    plan.temp_row_value_after_update(2, 10, 1),
+                    "tmp-s002-t00010-n000",
+                    plan.temp_table_fill_chunk_bytes(),
+                    _large_temp_payload_digest(plan),
+                )
+            ],
+            [_large_temp_prefill_fingerprint(plan, tx_id=10, completed_stmt_no=1)],
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError, "expected_payload_len=.*actual_payload_len"
+        ):
+            runner._validate_resumed_temp_table(
+                _FakeConnection(), "tok-temp", sid=2, tx_id=10, completed_stmt_no=1
+            )
+
+    def test_large_temp_table_validation_rejects_equal_length_payload_digest_mismatch(self):
+        class DigestAwareRuntime(_TempRowsResumeRuntime):
+            def __init__(self, plan):
+                super().__init__(
+                    [],
+                    [],
+                    [_large_temp_prefill_fingerprint(plan, tx_id=10, completed_stmt_no=1)],
+                )
+                self.plan = plan
+
+            def execute(self, conn, sql, fetch=False):
+                if fetch and sql.startswith(
+                    "SELECT id, sid, tx_id, stmt_no, v, note"
+                ):
+                    if "SHA2(payload, 256)" in sql:
+                        return [
+                            (
+                                self.plan.temp_row_id(10, 0),
+                                2,
+                                10,
+                                1,
+                                self.plan.temp_row_value_after_update(2, 10, 1),
+                                "tmp-s002-t00010-n000",
+                                self.plan.temp_table_fill_chunk_bytes() + 1,
+                                "0" * 64,
+                            )
+                        ]
+                    return [
+                        (
+                            self.plan.temp_row_id(10, 0),
+                            2,
+                            10,
+                            1,
+                            self.plan.temp_row_value_after_update(2, 10, 1),
+                            "tmp-s002-t00010-n000",
+                            self.plan.temp_table_fill_chunk_bytes() + 1,
+                            )
+                        ]
+                if fetch and "FROM `rtx_e2e_tmp_002` WHERE tx_id = 0" in sql:
+                    expected = _large_temp_prefill_fingerprint(
+                        self.plan, tx_id=10, completed_stmt_no=1
+                    )
+                    return [expected if "BIT_XOR" in sql else expected[:4]]
+                return super().execute(conn, sql, fetch=fetch)
+
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            sessions=2,
+            temp_table_workload=True,
+            temp_table_target_mb=1,
+            temp_table_fill_chunk_kb=64,
+        )
+        plan = WorkloadPlan(runner.config)
+        runner.plan = plan
+        runner.runtime = DigestAwareRuntime(plan)
+
+        with self.assertRaisesRegex(
+            AssertionError, "expected_payload_sha256=.*actual_payload_sha256"
+        ):
+            runner._validate_resumed_temp_table(
+                _FakeConnection(), "tok-temp", sid=2, tx_id=10, completed_stmt_no=1
+            )
+
+    def test_large_temp_table_validation_rejects_prefill_fingerprint_mismatch(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            sessions=2,
+            temp_table_workload=True,
+            temp_table_target_mb=1,
+            temp_table_fill_chunk_kb=64,
+        )
+        plan = WorkloadPlan(runner.config)
+        expected_prefill = _large_temp_prefill_fingerprint(
+            plan, tx_id=10, completed_stmt_no=1
+        )
+        runner.plan = plan
+        runner.runtime = _TempRowsResumeRuntime(
+            [],
+            [
+                (
+                    plan.temp_row_id(10, 0),
+                    2,
+                    10,
+                    1,
+                    plan.temp_row_value_after_update(2, 10, 1),
+                    "tmp-s002-t00010-n000",
+                    plan.temp_table_fill_chunk_bytes() + 1,
+                    _large_temp_payload_digest(plan),
+                )
+            ],
+            [
+                (
+                    expected_prefill[0],
+                    expected_prefill[1],
+                    expected_prefill[2],
+                    expected_prefill[3] + 1,
+                    expected_prefill[4],
+                    expected_prefill[5],
+                )
+            ],
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError, "temporary table prefill mismatch"
+        ):
+            runner._validate_resumed_temp_table(
+                _FakeConnection(), "tok-temp", sid=2, tx_id=10, completed_stmt_no=1
+            )
+
+    def test_large_temp_table_validation_rejects_equal_size_prefill_digest_mismatch(self):
+        class PrefillDigestAwareRuntime(_TempRowsResumeRuntime):
+            def __init__(self, plan):
+                super().__init__(
+                    [],
+                    [
+                        (
+                            plan.temp_row_id(10, 0),
+                            2,
+                            10,
+                            1,
+                            plan.temp_row_value_after_update(2, 10, 1),
+                            "tmp-s002-t00010-n000",
+                            plan.temp_table_fill_chunk_bytes() + 1,
+                            _large_temp_payload_digest(plan),
+                        )
+                    ],
+                    [],
+                )
+                self.plan = plan
+
+            def execute(self, conn, sql, fetch=False):
+                if fetch and sql.startswith(
+                    "SELECT id, sid, tx_id, stmt_no, v, note"
+                ) and "SHA2(payload, 256)" not in sql:
+                    return [
+                        (
+                            self.plan.temp_row_id(10, 0),
+                            2,
+                            10,
+                            1,
+                            self.plan.temp_row_value_after_update(2, 10, 1),
+                            "tmp-s002-t00010-n000",
+                            self.plan.temp_table_fill_chunk_bytes() + 1,
+                        )
+                    ]
+                if fetch and "FROM `rtx_e2e_tmp_002` WHERE tx_id = 0" in sql:
+                    expected = _large_temp_prefill_fingerprint(
+                        self.plan, tx_id=10, completed_stmt_no=1
+                    )
+                    if "BIT_XOR" in sql:
+                        return [
+                            (
+                                expected[0],
+                                expected[1],
+                                expected[2],
+                                expected[3],
+                                expected[4] ^ 1,
+                                expected[5],
+                            )
+                        ]
+                    return [expected[:4]]
+                return super().execute(conn, sql, fetch=fetch)
+
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            sessions=2,
+            temp_table_workload=True,
+            temp_table_target_mb=1,
+            temp_table_fill_chunk_kb=64,
+        )
+        plan = WorkloadPlan(runner.config)
+        runner.plan = plan
+        runner.runtime = PrefillDigestAwareRuntime(plan)
+
+        with self.assertRaisesRegex(
+            AssertionError, "temporary table prefill mismatch"
+        ):
+            runner._validate_resumed_temp_table(
+                _FakeConnection(), "tok-temp", sid=2, tx_id=10, completed_stmt_no=1
+            )
+
+    def test_large_temp_table_validation_accepts_deleted_prefill_digest(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            sessions=2,
+            temp_table_workload=True,
+            temp_table_target_mb=1,
+            temp_table_fill_chunk_kb=64,
+        )
+        plan = WorkloadPlan(runner.config)
+        runner.plan = plan
+        runner.runtime = _TempRowsResumeRuntime(
+            [],
+            [
+                (
+                    plan.temp_row_id(10, 0),
+                    2,
+                    10,
+                    1,
+                    plan.temp_row_value_after_update(2, 10, 1),
+                    "tmp-s002-t00010-n000",
+                    plan.temp_table_fill_chunk_bytes() + 1,
+                    _large_temp_payload_digest(plan),
+                )
+            ],
+            [_large_temp_prefill_fingerprint(plan, tx_id=10, completed_stmt_no=3)],
+        )
+
+        runner._validate_resumed_temp_table(
+            _FakeConnection(), "tok-temp", sid=2, tx_id=10, completed_stmt_no=3
+        )
 
     def test_drain_restart_resume_resumes_all_temp_tokens_before_validation(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)

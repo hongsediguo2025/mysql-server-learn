@@ -15847,10 +15847,6 @@ bool mysql_alter_table(THD *thd, const char *new_db, const char *new_name,
   table->use_all_columns();
   MDL_ticket *mdl_ticket = table->mdl_ticket;
 
-  if (table->s->tmp_table != NO_TMP_TABLE) {
-    (void)preserve_trx_temp_table_note_table_alter(thd, table);
-  }
-
   /*
     Prohibit changing of the UNION list of a non-temporary MERGE table
     under LOCK tables. It would be quite difficult to reuse a shrinked
@@ -17091,6 +17087,7 @@ bool mysql_alter_table(THD *thd, const char *new_db, const char *new_name,
     if (rename_temporary_table(thd, new_table, alter_ctx.new_db,
                                alter_ctx.new_name))
       goto err_new_table_cleanup;
+    (void)preserve_trx_temp_table_note_table_alter(thd, new_table);
     /*
       We don't replicate alter table statement on temporary tables
       in RBR mode.

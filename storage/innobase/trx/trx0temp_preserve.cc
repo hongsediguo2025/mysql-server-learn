@@ -34,6 +34,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -117,8 +118,82 @@ std::unordered_map<uint32_t,
     trx_preserve_temp_attached_fil_space_descriptors;
 std::set<uint32_t> trx_preserve_temp_last_evicted_drop_space_ids;
 std::mutex trx_preserve_temp_no_redo_undo_reservations_mutex;
-std::unordered_map<uint32_t, std::set<uint32_t>>
+
+struct trx_preserve_temp_page_reservation_key {
+  uint32_t space_id{0};
+  uint32_t page_no{0};
+
+  bool operator<(const trx_preserve_temp_page_reservation_key &rhs) const {
+    if (space_id != rhs.space_id) {
+      return space_id < rhs.space_id;
+    }
+    return page_no < rhs.page_no;
+  }
+};
+
+bool operator==(const trx_preserve_temp_reservation_owner &lhs,
+                const trx_preserve_temp_reservation_owner &rhs) {
+  return lhs.source_space_id == rhs.source_space_id && lhs.token == rhs.token &&
+         lhs.domain == rhs.domain;
+}
+
+struct trx_preserve_temp_no_redo_undo_slot_key {
+  uint32_t rseg_space_id{0};
+  uint32_t rseg_page_no{0};
+  uint32_t rseg_id{0};
+  uint32_t slot{0};
+
+  bool operator<(const trx_preserve_temp_no_redo_undo_slot_key &rhs) const {
+    if (rseg_space_id != rhs.rseg_space_id) {
+      return rseg_space_id < rhs.rseg_space_id;
+    }
+    if (rseg_page_no != rhs.rseg_page_no) {
+      return rseg_page_no < rhs.rseg_page_no;
+    }
+    if (rseg_id != rhs.rseg_id) {
+      return rseg_id < rhs.rseg_id;
+    }
+    return slot < rhs.slot;
+  }
+};
+
+struct trx_rseg_preserve_bootstrap_tmp_rseg_identity {
+  uint32_t rseg_space_id{0};
+  uint32_t rseg_page_no{0};
+  uint32_t rseg_slot{0};
+};
+
+struct trx_rseg_preserve_bootstrap_tmp_rseg_entry {
+  trx_rseg_preserve_bootstrap_tmp_rseg_identity identity;
+  /*
+    Shared rseg/FSP evidence is captured from the sealed no-redo undo sidecar.
+    It is not replayed as whole allocator pages here; later native adoption must
+    rebuild allocator ownership under target-space latches instead of copying
+    source global allocator state into the restarted temporary tablespace.
+  */
+  std::vector<trx_preserve_temp_no_redo_undo_page_image> shared_pages;
+};
+
+bool operator==(const trx_rseg_preserve_bootstrap_tmp_rseg_identity &lhs,
+                const trx_rseg_preserve_bootstrap_tmp_rseg_identity &rhs) {
+  return lhs.rseg_space_id == rhs.rseg_space_id &&
+         lhs.rseg_page_no == rhs.rseg_page_no &&
+         lhs.rseg_slot == rhs.rseg_slot;
+}
+
+std::map<trx_preserve_temp_page_reservation_key,
+         trx_preserve_temp_reservation_owner>
+    trx_preserve_temp_reserved_pages;
+std::atomic<uint32_t> trx_preserve_temp_active_page_reservations{0};
+std::atomic<uint32_t> trx_preserve_temp_page_reservation_slow_lookups{0};
+std::map<trx_preserve_temp_no_redo_undo_slot_key, uint32_t>
     trx_preserve_temp_no_redo_undo_reserved_slots;
+std::map<uint32_t, trx_rseg_preserve_bootstrap_tmp_rseg_entry>
+    trx_rseg_preserve_bootstrap_tmp_rseg_map;
+std::atomic<uint32_t> trx_preserve_temp_active_no_redo_undo_slot_reservations{
+    0};
+std::atomic<uint32_t>
+    trx_preserve_temp_no_redo_undo_slot_reservation_slow_lookups{0};
 std::mutex trx_preserve_temp_dict_bind_mutex;
 trx_preserve_temp_space_image_drop_observer_for_test_t
     trx_preserve_temp_drop_observer_for_test = nullptr;
@@ -711,37 +786,194 @@ bool trx_preserve_temp_space_image_rseg_slot_in_use(trx_rseg_t *rseg,
        undo != nullptr; undo = UT_LIST_GET_NEXT(undo_list, undo)) {
     if (undo->id == slot) return true;
   }
+  for (trx_undo_t *undo = UT_LIST_GET_FIRST(rseg->insert_undo_cached);
+       undo != nullptr; undo = UT_LIST_GET_NEXT(undo_list, undo)) {
+    if (undo->id == slot) return true;
+  }
+  for (trx_undo_t *undo = UT_LIST_GET_FIRST(rseg->update_undo_cached);
+       undo != nullptr; undo = UT_LIST_GET_NEXT(undo_list, undo)) {
+    if (undo->id == slot) return true;
+  }
   return false;
 }
 
-bool trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
-    uint32_t rseg_space_id, uint32_t slot) {
-  if (rseg_space_id == 0 || slot >= TRX_RSEG_N_SLOTS) return false;
+bool trx_preserve_temp_space_image_page_reservation_owner_valid(
+    const trx_preserve_temp_reservation_owner &owner) {
+  return owner.source_space_id != 0 && !owner.domain.empty();
+}
+
+bool trx_preserve_temp_space_image_page_reservation_key_valid(
+    uint32_t space_id, uint32_t page_no) {
+  return space_id != 0 && page_no != FIL_NULL;
+}
+
+trx_preserve_temp_page_reservation_key
+trx_preserve_temp_space_image_page_reservation_key(uint32_t space_id,
+                                                   uint32_t page_no) {
+  trx_preserve_temp_page_reservation_key key;
+  key.space_id = space_id;
+  key.page_no = page_no;
+  return key;
+}
+
+void trx_preserve_temp_active_page_reservations_add() {
+  trx_preserve_temp_active_page_reservations.fetch_add(
+      1, std::memory_order_release);
+}
+
+void trx_preserve_temp_active_page_reservations_sub() {
+  uint32_t current = trx_preserve_temp_active_page_reservations.load(
+      std::memory_order_acquire);
+  while (current > 0 &&
+         !trx_preserve_temp_active_page_reservations.compare_exchange_weak(
+             current, current - 1, std::memory_order_acq_rel,
+             std::memory_order_acquire)) {
+  }
+}
+
+bool trx_preserve_temp_space_image_reserve_page_locked(
+    const trx_preserve_temp_page_reservation_key &key,
+    const trx_preserve_temp_reservation_owner &owner, bool *created) {
+  if (created != nullptr) *created = false;
+  auto reservation = trx_preserve_temp_reserved_pages.find(key);
+  if (reservation == trx_preserve_temp_reserved_pages.end()) {
+    /*
+      Publish the active count before making the map entry visible. A racing
+      query that observes active==0 may fast-return only because every new
+      reservation transitions active to nonzero before insertion under this
+      mutex.
+    */
+    trx_preserve_temp_active_page_reservations_add();
+    trx_preserve_temp_reserved_pages.emplace(key, owner);
+    if (created != nullptr) *created = true;
+    return true;
+  }
+  return reservation->second == owner;
+}
+
+void trx_preserve_temp_active_no_redo_undo_slot_reservations_add() {
+  trx_preserve_temp_active_no_redo_undo_slot_reservations.fetch_add(
+      1, std::memory_order_release);
+}
+
+void trx_preserve_temp_active_no_redo_undo_slot_reservations_sub() {
+  uint32_t current =
+      trx_preserve_temp_active_no_redo_undo_slot_reservations.load(
+          std::memory_order_acquire);
+  while (current > 0 &&
+         !trx_preserve_temp_active_no_redo_undo_slot_reservations
+              .compare_exchange_weak(current, current - 1,
+                                     std::memory_order_acq_rel,
+                                     std::memory_order_acquire)) {
+  }
+}
+
+bool trx_preserve_temp_space_image_no_redo_undo_slot_key_valid(
+    uint32_t rseg_space_id, uint32_t rseg_page_no, uint32_t rseg_id,
+    uint32_t slot) {
+  return rseg_space_id != 0 && rseg_page_no != 0 && rseg_page_no != FIL_NULL &&
+         rseg_id < TRX_SYS_N_RSEGS && slot < TRX_RSEG_N_SLOTS;
+}
+
+bool trx_rseg_preserve_bootstrap_tmp_rseg_identity_valid(
+    uint32_t rseg_space_id, uint32_t rseg_page_no, uint32_t rseg_slot) {
+  return rseg_space_id != 0 && rseg_page_no != 0 && rseg_page_no != FIL_NULL &&
+         rseg_slot < TRX_SYS_N_RSEGS;
+}
+
+trx_rseg_preserve_bootstrap_tmp_rseg_identity
+trx_rseg_preserve_bootstrap_tmp_rseg_identity_create(uint32_t rseg_space_id,
+                                                     uint32_t rseg_page_no,
+                                                     uint32_t rseg_slot) {
+  trx_rseg_preserve_bootstrap_tmp_rseg_identity identity;
+  identity.rseg_space_id = rseg_space_id;
+  identity.rseg_page_no = rseg_page_no;
+  identity.rseg_slot = rseg_slot;
+  return identity;
+}
+
+bool trx_rseg_preserve_bootstrap_tmp_rseg_shared_page_equal(
+    const trx_preserve_temp_no_redo_undo_page_image &lhs,
+    const trx_preserve_temp_no_redo_undo_page_image &rhs) {
+  return lhs.kind == rhs.kind && lhs.page_no == rhs.page_no &&
+         lhs.bytes == rhs.bytes;
+}
+
+bool trx_rseg_preserve_bootstrap_tmp_rseg_shared_pages_equal(
+    std::vector<trx_preserve_temp_no_redo_undo_page_image> lhs,
+    std::vector<trx_preserve_temp_no_redo_undo_page_image> rhs) {
+  const auto less = [](const trx_preserve_temp_no_redo_undo_page_image &a,
+                       const trx_preserve_temp_no_redo_undo_page_image &b) {
+    if (a.page_no != b.page_no) return a.page_no < b.page_no;
+    return static_cast<uint8_t>(a.kind) < static_cast<uint8_t>(b.kind);
+  };
+  std::sort(lhs.begin(), lhs.end(), less);
+  std::sort(rhs.begin(), rhs.end(), less);
+  return lhs.size() == rhs.size() &&
+         std::equal(lhs.begin(), lhs.end(), rhs.begin(),
+                    trx_rseg_preserve_bootstrap_tmp_rseg_shared_page_equal);
+}
+
+bool trx_rseg_preserve_bootstrap_tmp_rseg_entry_add_shared_pages(
+    trx_rseg_preserve_bootstrap_tmp_rseg_entry *entry,
+    const std::vector<trx_preserve_temp_no_redo_undo_page_image>
+        &shared_pages) {
+  if (entry == nullptr || shared_pages.empty()) return false;
+  if (entry->shared_pages.empty()) {
+    entry->shared_pages = shared_pages;
+    return true;
+  }
+  return trx_rseg_preserve_bootstrap_tmp_rseg_shared_pages_equal(
+      entry->shared_pages, shared_pages);
+}
+
+trx_preserve_temp_no_redo_undo_slot_key
+trx_preserve_temp_space_image_no_redo_undo_slot_key(
+    uint32_t rseg_space_id, uint32_t rseg_page_no, uint32_t rseg_id,
+    uint32_t slot) {
+  trx_preserve_temp_no_redo_undo_slot_key key;
+  key.rseg_space_id = rseg_space_id;
+  key.rseg_page_no = rseg_page_no;
+  key.rseg_id = rseg_id;
+  key.slot = slot;
+  return key;
+}
+
+bool trx_preserve_temp_space_image_reserve_no_redo_undo_slot_impl(
+    uint32_t owner_source_space_id, uint32_t rseg_space_id,
+    uint32_t rseg_page_no, uint32_t rseg_id, uint32_t slot) {
+  if (owner_source_space_id == 0 ||
+      !trx_preserve_temp_space_image_no_redo_undo_slot_key_valid(
+          rseg_space_id, rseg_page_no, rseg_id, slot)) {
+    return false;
+  }
 
   std::lock_guard<std::mutex> guard{
       trx_preserve_temp_no_redo_undo_reservations_mutex};
-  return trx_preserve_temp_no_redo_undo_reserved_slots[rseg_space_id]
-      .insert(slot)
-      .second;
-}
-
-void trx_preserve_temp_space_image_release_no_redo_undo_reservations(
-    const trx_preserve_temp_space_image_descriptor &descriptor) {
-  if (!descriptor.no_redo_undo_rseg_identity_present ||
-      descriptor.no_redo_undo_rseg_space_id == 0) {
-    return;
+  const trx_preserve_temp_no_redo_undo_slot_key key =
+      trx_preserve_temp_space_image_no_redo_undo_slot_key(
+          rseg_space_id, rseg_page_no, rseg_id, slot);
+  auto reservation =
+      trx_preserve_temp_no_redo_undo_reserved_slots.find(key);
+  if (reservation == trx_preserve_temp_no_redo_undo_reserved_slots.end()) {
+    /*
+      Publish the active count before making the map entry visible. This keeps
+      allocator-facing fast-path queries linear: active==0 means no slot entry
+      can already be visible in the map.
+    */
+    trx_preserve_temp_active_no_redo_undo_slot_reservations_add();
+    trx_preserve_temp_no_redo_undo_reserved_slots.emplace(
+        key, owner_source_space_id);
+    return true;
   }
 
-  if (descriptor.no_redo_insert_undo.present) {
-    trx_preserve_temp_space_image_release_no_redo_undo_slot(
-        descriptor.no_redo_undo_rseg_space_id,
-        descriptor.no_redo_insert_undo.undo_slot);
-  }
-  if (descriptor.no_redo_update_undo.present) {
-    trx_preserve_temp_space_image_release_no_redo_undo_slot(
-        descriptor.no_redo_undo_rseg_space_id,
-        descriptor.no_redo_update_undo.undo_slot);
-  }
+  /*
+    A retryable token may reconnect after an earlier failed RESUME detached its
+    live undo objects but kept the slot reservation. Re-accept the same source
+    space id; reject every other owner so normal temp undo allocation and other
+    tokens cannot claim the preserved slot.
+  */
+  return reservation->second == owner_source_space_id;
 }
 
 dberr_t trx_preserve_temp_space_image_materialize_no_redo_undo_pages(
@@ -819,7 +1051,7 @@ dberr_t trx_preserve_temp_space_image_materialize_no_redo_undo_pages(
 trx_undo_t *trx_preserve_temp_space_image_create_reconnected_undo(
     trx_t *trx, trx_rseg_t *rseg,
     const trx_preserve_temp_no_redo_undo_log_anchor &anchor, ulint type,
-    ulint size) {
+    ulint size, trx_preserve_temp_no_redo_undo_reconnect_mode mode) {
   if (trx == nullptr || rseg == nullptr || !anchor.present || size == 0 ||
       anchor.undo_slot >= TRX_RSEG_N_SLOTS ||
       (type != TRX_UNDO_INSERT && type != TRX_UNDO_UPDATE)) {
@@ -832,14 +1064,17 @@ trx_undo_t *trx_preserve_temp_space_image_create_reconnected_undo(
 
   XID empty_xid;
   empty_xid.reset();
+  const bool native_owned =
+      mode == trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED;
   undo->id = anchor.undo_slot;
   undo->type = type;
-  undo->state = TRX_UNDO_PREPARED;
+  undo->state = native_owned ? TRX_UNDO_ACTIVE : TRX_UNDO_PREPARED;
   undo->del_marks = type == TRX_UNDO_UPDATE;
   undo->trx_id = trx->id;
   undo->xid = trx->xid == nullptr ? empty_xid : *trx->xid;
   undo->flag = 0;
-  undo->preserve_restored_no_redo_undo = true;
+  undo->preserve_restored_no_redo_undo =
+      mode == trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY;
   undo->gtid_allocated = false;
   undo->dict_operation = FALSE;
   undo->rseg = rseg;
@@ -855,6 +1090,27 @@ trx_undo_t *trx_preserve_temp_space_image_create_reconnected_undo(
   undo->top_undo_no = static_cast<undo_no_t>(anchor.top_undo_no);
   undo->guess_block = nullptr;
   return undo;
+}
+
+void trx_preserve_temp_space_image_advance_trx_undo_no_for_native_resume(
+    trx_t *trx, const trx_preserve_temp_space_image_descriptor &descriptor,
+    trx_preserve_temp_no_redo_undo_reconnect_mode mode) {
+  if (trx == nullptr ||
+      mode != trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED) {
+    return;
+  }
+
+  auto advance_from_anchor =
+      [trx](const trx_preserve_temp_no_redo_undo_log_anchor &anchor) {
+    if (!anchor.present) return;
+    const undo_no_t next_undo_no =
+        static_cast<undo_no_t>(anchor.top_undo_no) + 1;
+    if (next_undo_no > trx->undo_no) {
+      trx->undo_no = next_undo_no;
+    }
+  };
+  advance_from_anchor(descriptor.no_redo_insert_undo);
+  advance_from_anchor(descriptor.no_redo_update_undo);
 }
 
 void trx_preserve_temp_space_image_notify_drop_event(uint32_t source_space_id,
@@ -1276,6 +1532,8 @@ void trx_preserve_temp_space_image_reset_dirty_page_stream_impl(
   descriptor->no_redo_undo_capture_degraded = false;
   descriptor->no_redo_undo_capture_degraded_reason.clear();
   descriptor->no_redo_undo_pointers_reconnected = false;
+  descriptor->no_redo_undo_restored_only_reconnected = false;
+  descriptor->no_redo_undo_native_slots_adopted = false;
   descriptor->no_redo_undo_reconnected_trx = nullptr;
   descriptor->no_redo_undo_rseg_identity_present = false;
   descriptor->no_redo_undo_rseg_space_id = 0;
@@ -1325,6 +1583,8 @@ void trx_preserve_temp_space_image_mark_no_redo_undo_degraded_locked(
       reason == nullptr ? "" : reason;
   descriptor->no_redo_undo_sidecar_sealed = false;
   descriptor->no_redo_undo_pointers_reconnected = false;
+  descriptor->no_redo_undo_restored_only_reconnected = false;
+  descriptor->no_redo_undo_native_slots_adopted = false;
   descriptor->no_redo_undo_reconnected_trx = nullptr;
 }
 
@@ -2702,36 +2962,461 @@ bool trx_preserve_temp_space_image_should_disable_undo_cache(
       rseg_space_id);
 }
 
-bool trx_preserve_temp_space_image_no_redo_undo_slot_reserved(
-    uint32_t rseg_space_id, uint32_t slot) {
-  if (!preserve_trx_temp_table_enable || rseg_space_id == 0 ||
-      slot >= TRX_RSEG_N_SLOTS) {
+bool trx_preserve_temp_space_image_reserve_page(
+    uint32_t space_id, uint32_t page_no,
+    const trx_preserve_temp_reservation_owner &owner) {
+  if (!trx_preserve_temp_space_image_page_reservation_key_valid(space_id,
+                                                               page_no) ||
+      !trx_preserve_temp_space_image_page_reservation_owner_valid(owner)) {
     return false;
   }
 
   std::lock_guard<std::mutex> guard{
       trx_preserve_temp_no_redo_undo_reservations_mutex};
-  auto reservations =
-      trx_preserve_temp_no_redo_undo_reserved_slots.find(rseg_space_id);
-  return reservations != trx_preserve_temp_no_redo_undo_reserved_slots.end() &&
-         reservations->second.find(slot) != reservations->second.end();
+  const trx_preserve_temp_page_reservation_key key =
+      trx_preserve_temp_space_image_page_reservation_key(space_id, page_no);
+  return trx_preserve_temp_space_image_reserve_page_locked(key, owner, nullptr);
 }
 
-void trx_preserve_temp_space_image_release_no_redo_undo_slot(
-    uint32_t rseg_space_id, uint32_t slot) {
-  if (rseg_space_id == 0 || slot >= TRX_RSEG_N_SLOTS) return;
+bool trx_preserve_temp_space_image_page_reserved(uint32_t space_id,
+                                                 uint32_t page_no) {
+  if (trx_preserve_temp_active_page_reservations.load(
+          std::memory_order_acquire) == 0) {
+    return false;
+  }
+  if (!trx_preserve_temp_space_image_page_reservation_key_valid(space_id,
+                                                               page_no)) {
+    return false;
+  }
+
+  trx_preserve_temp_page_reservation_slow_lookups.fetch_add(
+      1, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> guard{
+      trx_preserve_temp_no_redo_undo_reservations_mutex};
+  const trx_preserve_temp_page_reservation_key key =
+      trx_preserve_temp_space_image_page_reservation_key(space_id, page_no);
+  return trx_preserve_temp_reserved_pages.find(key) !=
+         trx_preserve_temp_reserved_pages.end();
+}
+
+size_t trx_preserve_temp_space_image_release_page_reservations_for_owner(
+    const trx_preserve_temp_reservation_owner &owner) {
+  if (!trx_preserve_temp_space_image_page_reservation_owner_valid(owner)) {
+    return 0;
+  }
+
+  size_t released = 0;
+  std::lock_guard<std::mutex> guard{
+      trx_preserve_temp_no_redo_undo_reservations_mutex};
+  for (auto it = trx_preserve_temp_reserved_pages.begin();
+       it != trx_preserve_temp_reserved_pages.end();) {
+    if (it->second == owner) {
+      it = trx_preserve_temp_reserved_pages.erase(it);
+      trx_preserve_temp_active_page_reservations_sub();
+      ++released;
+      continue;
+    }
+    ++it;
+  }
+  return released;
+}
+
+bool trx_preserve_temp_space_image_register_page_reservations(
+    const std::vector<trx_preserve_temp_page_reservation> &reservations) {
+  std::vector<trx_preserve_temp_page_reservation_key> created;
+  std::lock_guard<std::mutex> guard{
+      trx_preserve_temp_no_redo_undo_reservations_mutex};
+
+  for (const trx_preserve_temp_page_reservation &reservation : reservations) {
+    if (!trx_preserve_temp_space_image_page_reservation_key_valid(
+            reservation.space_id, reservation.page_no) ||
+        !trx_preserve_temp_space_image_page_reservation_owner_valid(
+            reservation.owner)) {
+      for (const trx_preserve_temp_page_reservation_key &key : created) {
+        trx_preserve_temp_reserved_pages.erase(key);
+        trx_preserve_temp_active_page_reservations_sub();
+      }
+      return false;
+    }
+
+    bool was_created = false;
+    const trx_preserve_temp_page_reservation_key key =
+        trx_preserve_temp_space_image_page_reservation_key(
+            reservation.space_id, reservation.page_no);
+    if (!trx_preserve_temp_space_image_reserve_page_locked(
+            key, reservation.owner, &was_created)) {
+      for (const trx_preserve_temp_page_reservation_key &created_key :
+           created) {
+        trx_preserve_temp_reserved_pages.erase(created_key);
+        trx_preserve_temp_active_page_reservations_sub();
+      }
+      return false;
+    }
+    if (was_created) created.push_back(key);
+  }
+  return true;
+}
+
+bool trx_preserve_temp_space_image_register_page_reservations_from_claims(
+    const std::vector<trx_preserve_temp_ownership_page_claim> &claims) {
+  std::vector<trx_preserve_temp_page_reservation> reservations;
+  reservations.reserve(claims.size());
+
+  for (const trx_preserve_temp_ownership_page_claim &claim : claims) {
+    if (claim.source_space_id == 0 ||
+        !trx_preserve_temp_space_image_no_redo_undo_slot_key_valid(
+            claim.rseg_space_id, claim.rseg_page_no, claim.rseg_id,
+            claim.undo_slot) ||
+        !trx_preserve_temp_space_image_valid_no_redo_undo_page_kind(
+            claim.page_role) ||
+        !trx_preserve_temp_space_image_page_reservation_key_valid(
+            claim.rseg_space_id, claim.page_no)) {
+      return false;
+    }
+
+    trx_preserve_temp_page_reservation reservation;
+    reservation.space_id = claim.rseg_space_id;
+    reservation.page_no = claim.page_no;
+
+    switch (claim.page_role) {
+      case trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER:
+      case trx_preserve_temp_no_redo_undo_page_kind::RSEG_ALLOCATOR:
+        reservation.owner.source_space_id = claim.rseg_space_id;
+        reservation.owner.domain = "shared_no_redo_metadata";
+        break;
+      case trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER:
+      case trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG:
+        if (claim.token.empty()) return false;
+        reservation.owner.source_space_id = claim.source_space_id;
+        reservation.owner.token = claim.token;
+        reservation.owner.domain = "exclusive_no_redo_undo";
+        break;
+    }
+    reservations.push_back(reservation);
+  }
+
+  return trx_preserve_temp_space_image_register_page_reservations(
+      reservations);
+}
+
+bool trx_rseg_preserve_bootstrap_tmp_rseg_required(uint32_t rseg_space_id,
+                                                   uint32_t rseg_page_no,
+                                                   uint32_t rseg_slot) {
+  if (!trx_rseg_preserve_bootstrap_tmp_rseg_identity_valid(
+          rseg_space_id, rseg_page_no, rseg_slot)) {
+    return false;
+  }
+
+  const trx_rseg_preserve_bootstrap_tmp_rseg_identity identity =
+      trx_rseg_preserve_bootstrap_tmp_rseg_identity_create(
+          rseg_space_id, rseg_page_no, rseg_slot);
 
   std::lock_guard<std::mutex> guard{
       trx_preserve_temp_no_redo_undo_reservations_mutex};
-  auto reservations =
-      trx_preserve_temp_no_redo_undo_reserved_slots.find(rseg_space_id);
-  if (reservations == trx_preserve_temp_no_redo_undo_reserved_slots.end()) {
+  const auto existing =
+      trx_rseg_preserve_bootstrap_tmp_rseg_map.find(rseg_slot);
+  if (existing == trx_rseg_preserve_bootstrap_tmp_rseg_map.end()) {
+    trx_rseg_preserve_bootstrap_tmp_rseg_entry entry;
+    entry.identity = identity;
+    trx_rseg_preserve_bootstrap_tmp_rseg_map.emplace(rseg_slot,
+                                                     std::move(entry));
+    return true;
+  }
+  return existing->second.identity == identity;
+}
+
+bool trx_rseg_preserve_bootstrap_tmp_rsegs_required_from_claims(
+    const std::vector<trx_preserve_temp_ownership_page_claim> &claims) {
+  std::vector<uint32_t> created_slots;
+  std::lock_guard<std::mutex> guard{
+      trx_preserve_temp_no_redo_undo_reservations_mutex};
+
+  for (const trx_preserve_temp_ownership_page_claim &claim : claims) {
+    if (claim.source_space_id == 0 ||
+        !trx_preserve_temp_space_image_no_redo_undo_slot_key_valid(
+            claim.rseg_space_id, claim.rseg_page_no, claim.rseg_id,
+            claim.undo_slot) ||
+        !trx_preserve_temp_space_image_valid_no_redo_undo_page_kind(
+            claim.page_role) ||
+        !trx_rseg_preserve_bootstrap_tmp_rseg_identity_valid(
+            claim.rseg_space_id, claim.rseg_page_no, claim.rseg_id)) {
+      for (uint32_t slot : created_slots) {
+        trx_rseg_preserve_bootstrap_tmp_rseg_map.erase(slot);
+      }
+      return false;
+    }
+
+    const trx_rseg_preserve_bootstrap_tmp_rseg_identity identity =
+        trx_rseg_preserve_bootstrap_tmp_rseg_identity_create(
+            claim.rseg_space_id, claim.rseg_page_no, claim.rseg_id);
+    const auto existing =
+        trx_rseg_preserve_bootstrap_tmp_rseg_map.find(claim.rseg_id);
+    if (existing == trx_rseg_preserve_bootstrap_tmp_rseg_map.end()) {
+      trx_rseg_preserve_bootstrap_tmp_rseg_entry entry;
+      entry.identity = identity;
+      trx_rseg_preserve_bootstrap_tmp_rseg_map.emplace(claim.rseg_id,
+                                                       std::move(entry));
+      created_slots.push_back(claim.rseg_id);
+      continue;
+    }
+    if (!(existing->second.identity == identity)) {
+      for (uint32_t slot : created_slots) {
+        trx_rseg_preserve_bootstrap_tmp_rseg_map.erase(slot);
+      }
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool trx_rseg_preserve_bootstrap_tmp_rseg_required_from_descriptor(
+    const trx_preserve_temp_space_image_descriptor &descriptor) {
+  if (!trx_preserve_temp_space_image_no_redo_undo_sidecar_ready(descriptor) ||
+      !trx_rseg_preserve_bootstrap_tmp_rseg_identity_valid(
+          descriptor.no_redo_undo_rseg_space_id,
+          descriptor.no_redo_undo_rseg_page_no,
+          descriptor.no_redo_undo_rseg_slot)) {
+    return false;
+  }
+
+  std::vector<trx_preserve_temp_no_redo_undo_page_image> shared_pages;
+  for (const trx_preserve_temp_no_redo_undo_page_image &page :
+       descriptor.no_redo_undo_pages) {
+    if (page.bytes.size() != descriptor.page_size) return false;
+    switch (page.kind) {
+      case trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER:
+      case trx_preserve_temp_no_redo_undo_page_kind::RSEG_ALLOCATOR:
+        shared_pages.push_back(page);
+        break;
+      case trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER:
+      case trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG:
+        break;
+    }
+  }
+  if (shared_pages.empty()) return false;
+
+  const trx_rseg_preserve_bootstrap_tmp_rseg_identity identity =
+      trx_rseg_preserve_bootstrap_tmp_rseg_identity_create(
+          descriptor.no_redo_undo_rseg_space_id,
+          descriptor.no_redo_undo_rseg_page_no,
+          descriptor.no_redo_undo_rseg_slot);
+  std::lock_guard<std::mutex> guard{
+      trx_preserve_temp_no_redo_undo_reservations_mutex};
+  auto existing = trx_rseg_preserve_bootstrap_tmp_rseg_map.find(
+      descriptor.no_redo_undo_rseg_slot);
+  if (existing == trx_rseg_preserve_bootstrap_tmp_rseg_map.end()) {
+    trx_rseg_preserve_bootstrap_tmp_rseg_entry entry;
+    entry.identity = identity;
+    entry.shared_pages = std::move(shared_pages);
+    trx_rseg_preserve_bootstrap_tmp_rseg_map.emplace(
+        descriptor.no_redo_undo_rseg_slot, std::move(entry));
+    return true;
+  }
+  if (!(existing->second.identity == identity)) return false;
+  return trx_rseg_preserve_bootstrap_tmp_rseg_entry_add_shared_pages(
+      &existing->second, shared_pages);
+}
+
+bool trx_rseg_preserve_bootstrap_tmp_rsegs(
+    unsigned long target_rollback_segments, bool require_resolved) {
+  std::vector<trx_rseg_preserve_bootstrap_tmp_rseg_entry> requirements;
+  {
+    std::lock_guard<std::mutex> guard{
+        trx_preserve_temp_no_redo_undo_reservations_mutex};
+    requirements.reserve(trx_rseg_preserve_bootstrap_tmp_rseg_map.size());
+    for (const auto &requirement : trx_rseg_preserve_bootstrap_tmp_rseg_map) {
+      requirements.push_back(requirement.second);
+    }
+  }
+
+  if (requirements.empty()) {
+    return true;
+  }
+
+  for (const trx_rseg_preserve_bootstrap_tmp_rseg_entry &requirement :
+       requirements) {
+    if (requirement.identity.rseg_slot >= target_rollback_segments ||
+        requirement.shared_pages.empty()) {
+      return false;
+    }
+  }
+
+  if (trx_sys == nullptr) {
+    return !require_resolved;
+  }
+
+  bool mismatch = false;
+  bool unresolved = false;
+  trx_sys->tmp_rsegs.s_lock();
+  for (const trx_rseg_preserve_bootstrap_tmp_rseg_entry &requirement :
+       requirements) {
+    trx_rseg_t *rseg = trx_sys->tmp_rsegs.find(requirement.identity.rseg_slot);
+    if (rseg == nullptr) {
+      unresolved = true;
+      continue;
+    }
+    if (rseg->space_id != requirement.identity.rseg_space_id ||
+        rseg->page_no != requirement.identity.rseg_page_no ||
+        rseg->id != requirement.identity.rseg_slot) {
+      mismatch = true;
+      break;
+    }
+  }
+  trx_sys->tmp_rsegs.s_unlock();
+
+  if (mismatch || (require_resolved && unresolved)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
+    uint32_t owner_source_space_id, uint32_t rseg_space_id,
+    uint32_t rseg_page_no, uint32_t rseg_id, uint32_t slot) {
+  return trx_preserve_temp_space_image_reserve_no_redo_undo_slot_impl(
+      owner_source_space_id, rseg_space_id, rseg_page_no, rseg_id, slot);
+}
+
+bool trx_preserve_temp_space_image_no_redo_undo_slot_reserved(
+    uint32_t rseg_space_id, uint32_t rseg_page_no, uint32_t rseg_id,
+    uint32_t slot) {
+  if (trx_preserve_temp_active_no_redo_undo_slot_reservations.load(
+          std::memory_order_acquire) == 0) {
+    return false;
+  }
+  if (!trx_preserve_temp_space_image_no_redo_undo_slot_key_valid(
+          rseg_space_id, rseg_page_no, rseg_id, slot)) {
+    return false;
+  }
+
+  trx_preserve_temp_no_redo_undo_slot_reservation_slow_lookups.fetch_add(
+      1, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> guard{
+      trx_preserve_temp_no_redo_undo_reservations_mutex};
+  const trx_preserve_temp_no_redo_undo_slot_key key =
+      trx_preserve_temp_space_image_no_redo_undo_slot_key(
+          rseg_space_id, rseg_page_no, rseg_id, slot);
+  return trx_preserve_temp_no_redo_undo_reserved_slots.find(key) !=
+         trx_preserve_temp_no_redo_undo_reserved_slots.end();
+}
+
+void trx_preserve_temp_space_image_release_no_redo_undo_slot(
+    uint32_t rseg_space_id, uint32_t rseg_page_no, uint32_t rseg_id,
+    uint32_t slot) {
+  if (!trx_preserve_temp_space_image_no_redo_undo_slot_key_valid(
+          rseg_space_id, rseg_page_no, rseg_id, slot)) {
     return;
   }
-  reservations->second.erase(slot);
-  if (reservations->second.empty()) {
-    trx_preserve_temp_no_redo_undo_reserved_slots.erase(reservations);
+
+  std::lock_guard<std::mutex> guard{
+      trx_preserve_temp_no_redo_undo_reservations_mutex};
+  const trx_preserve_temp_no_redo_undo_slot_key key =
+      trx_preserve_temp_space_image_no_redo_undo_slot_key(
+          rseg_space_id, rseg_page_no, rseg_id, slot);
+  if (trx_preserve_temp_no_redo_undo_reserved_slots.erase(key) != 0) {
+    trx_preserve_temp_active_no_redo_undo_slot_reservations_sub();
   }
+}
+
+static bool trx_preserve_temp_space_image_release_no_redo_undo_slot_for_owner(
+    uint32_t owner_source_space_id, uint32_t rseg_space_id,
+    uint32_t rseg_page_no, uint32_t rseg_id, uint32_t slot) {
+  if (owner_source_space_id == 0 ||
+      !trx_preserve_temp_space_image_no_redo_undo_slot_key_valid(
+          rseg_space_id, rseg_page_no, rseg_id, slot)) {
+    return false;
+  }
+
+  std::lock_guard<std::mutex> guard{
+      trx_preserve_temp_no_redo_undo_reservations_mutex};
+  const trx_preserve_temp_no_redo_undo_slot_key key =
+      trx_preserve_temp_space_image_no_redo_undo_slot_key(
+          rseg_space_id, rseg_page_no, rseg_id, slot);
+  auto reservation =
+      trx_preserve_temp_no_redo_undo_reserved_slots.find(key);
+  if (reservation == trx_preserve_temp_no_redo_undo_reserved_slots.end()) {
+    return true;
+  }
+  if (reservation->second != owner_source_space_id) return false;
+  trx_preserve_temp_no_redo_undo_reserved_slots.erase(reservation);
+  trx_preserve_temp_active_no_redo_undo_slot_reservations_sub();
+  return true;
+}
+
+dberr_t
+trx_preserve_temp_space_image_release_no_redo_undo_reservations_from_sidecar(
+    uint32_t source_space_id, uint32_t page_size, const unsigned char *payload,
+    size_t payload_length) {
+  if (source_space_id == 0 || page_size == 0 || payload == nullptr ||
+      payload_length < kTempNoRedoUndoSidecarMagicBytes + 4 +
+                           kTempNoRedoUndoSidecarDigestBytes) {
+    return DB_ERROR;
+  }
+  if (std::memcmp(payload, kTempNoRedoUndoSidecarMagic,
+                  kTempNoRedoUndoSidecarMagicBytes) != 0 ||
+      !trx_preserve_temp_no_redo_undo_sidecar_digest_matches(payload,
+                                                             payload_length)) {
+    return DB_CORRUPTION;
+  }
+
+  const size_t body_length =
+      payload_length - kTempNoRedoUndoSidecarDigestBytes;
+  size_t offset = kTempNoRedoUndoSidecarMagicBytes;
+  uint32_t version = 0;
+  uint32_t sidecar_page_size = 0;
+  uint32_t rseg_space_id = 0;
+  uint32_t rseg_page_no = 0;
+  uint32_t rseg_id = 0;
+  if (!trx_preserve_temp_read_le32(payload, body_length, &offset, &version) ||
+      !trx_preserve_temp_read_le32(payload, body_length, &offset,
+                                  &sidecar_page_size) ||
+      !trx_preserve_temp_read_le32(payload, body_length, &offset,
+                                  &rseg_space_id) ||
+      !trx_preserve_temp_read_le32(payload, body_length, &offset,
+                                  &rseg_page_no) ||
+      !trx_preserve_temp_read_le32(payload, body_length, &offset, &rseg_id)) {
+    return DB_CORRUPTION;
+  }
+  if (version != kTempNoRedoUndoSidecarVersion ||
+      sidecar_page_size != page_size ||
+      !trx_preserve_temp_space_image_no_redo_undo_slot_key_valid(
+          rseg_space_id, rseg_page_no, rseg_id, 0)) {
+    return DB_CORRUPTION;
+  }
+
+  trx_preserve_temp_no_redo_undo_log_anchor insert_anchor;
+  trx_preserve_temp_no_redo_undo_log_anchor update_anchor;
+  if (!trx_preserve_temp_read_no_redo_undo_anchor(payload, body_length, &offset,
+                                                  &insert_anchor) ||
+      !trx_preserve_temp_read_no_redo_undo_anchor(payload, body_length, &offset,
+                                                  &update_anchor)) {
+    return DB_CORRUPTION;
+  }
+  if (!trx_preserve_temp_no_redo_undo_anchor_identity_valid(insert_anchor,
+                                                           page_size) ||
+      !trx_preserve_temp_no_redo_undo_anchor_identity_valid(update_anchor,
+                                                           page_size) ||
+      (!insert_anchor.present && !update_anchor.present)) {
+    return DB_CORRUPTION;
+  }
+
+  if (insert_anchor.present) {
+    if (!trx_preserve_temp_space_image_release_no_redo_undo_slot_for_owner(
+            source_space_id, rseg_space_id, rseg_page_no, rseg_id,
+            insert_anchor.undo_slot)) {
+      return DB_ERROR;
+    }
+  }
+  if (update_anchor.present) {
+    if (!trx_preserve_temp_space_image_release_no_redo_undo_slot_for_owner(
+            source_space_id, rseg_space_id, rseg_page_no, rseg_id,
+            update_anchor.undo_slot)) {
+      return DB_ERROR;
+    }
+  }
+  return DB_SUCCESS;
 }
 
 void trx_preserve_temp_space_image_reset_dirty_page_stream(
@@ -3710,6 +4395,63 @@ uint64_t trx_preserve_temp_space_image_staged_dirty_page_bytes_for_test() {
   return trx_preserve_temp_staged_dirty_page_bytes;
 }
 
+uint32_t trx_preserve_temp_space_image_active_page_reservations_for_test() {
+  return trx_preserve_temp_active_page_reservations.load(
+      std::memory_order_acquire);
+}
+
+uint32_t trx_preserve_temp_space_image_page_reservation_slow_lookups_for_test() {
+  return trx_preserve_temp_page_reservation_slow_lookups.load(
+      std::memory_order_acquire);
+}
+
+uint32_t
+trx_preserve_temp_space_image_active_no_redo_undo_slot_reservations_for_test() {
+  return trx_preserve_temp_active_no_redo_undo_slot_reservations.load(
+      std::memory_order_acquire);
+}
+
+uint32_t
+trx_preserve_temp_space_image_no_redo_undo_slot_reservation_slow_lookups_for_test() {
+  return trx_preserve_temp_no_redo_undo_slot_reservation_slow_lookups.load(
+      std::memory_order_acquire);
+}
+
+uint32_t trx_rseg_preserve_bootstrap_tmp_rseg_count_for_test() {
+  std::lock_guard<std::mutex> guard{
+      trx_preserve_temp_no_redo_undo_reservations_mutex};
+  return static_cast<uint32_t>(
+      trx_rseg_preserve_bootstrap_tmp_rseg_map.size());
+}
+
+bool trx_rseg_preserve_bootstrap_tmp_rseg_has_shared_pages_for_test(
+    uint32_t rseg_space_id, uint32_t rseg_page_no, uint32_t rseg_slot) {
+  std::lock_guard<std::mutex> guard{
+      trx_preserve_temp_no_redo_undo_reservations_mutex};
+  const auto it = trx_rseg_preserve_bootstrap_tmp_rseg_map.find(rseg_slot);
+  if (it == trx_rseg_preserve_bootstrap_tmp_rseg_map.end()) return false;
+  const trx_rseg_preserve_bootstrap_tmp_rseg_identity expected =
+      trx_rseg_preserve_bootstrap_tmp_rseg_identity_create(
+          rseg_space_id, rseg_page_no, rseg_slot);
+  return it->second.identity == expected && !it->second.shared_pages.empty();
+}
+
+void trx_preserve_temp_space_image_clear_reservation_registries_for_test() {
+  std::lock_guard<std::mutex> guard{
+      trx_preserve_temp_no_redo_undo_reservations_mutex};
+  trx_preserve_temp_reserved_pages.clear();
+  trx_preserve_temp_no_redo_undo_reserved_slots.clear();
+  trx_rseg_preserve_bootstrap_tmp_rseg_map.clear();
+  trx_preserve_temp_active_page_reservations.store(0,
+                                                   std::memory_order_release);
+  trx_preserve_temp_active_no_redo_undo_slot_reservations.store(
+      0, std::memory_order_release);
+  trx_preserve_temp_page_reservation_slow_lookups.store(
+      0, std::memory_order_release);
+  trx_preserve_temp_no_redo_undo_slot_reservation_slow_lookups.store(
+      0, std::memory_order_release);
+}
+
 void trx_preserve_temp_space_image_set_stage_admission_closed_for_test(
     uint32_t source_space_id, bool closed) {
   if (source_space_id == 0) return;
@@ -3744,6 +4486,18 @@ bool trx_preserve_temp_no_redo_undo_skip_history_for_test(bool restored) {
   alignas(trx_undo_t) unsigned char undo_storage[sizeof(trx_undo_t)]{};
   auto *undo = reinterpret_cast<trx_undo_t *>(undo_storage);
   undo->preserve_restored_no_redo_undo = restored;
+  return trx_undo_preserve_magic_no_redo_should_skip_history(undo);
+}
+
+bool trx_preserve_temp_no_redo_undo_reconnect_mode_skips_history_for_test(
+    bool restored_only) {
+  alignas(trx_undo_t) unsigned char undo_storage[sizeof(trx_undo_t)]{};
+  auto *undo = reinterpret_cast<trx_undo_t *>(undo_storage);
+  const trx_preserve_temp_no_redo_undo_reconnect_mode mode =
+      restored_only ? trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY
+                    : trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED;
+  undo->preserve_restored_no_redo_undo =
+      mode == trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY;
   return trx_undo_preserve_magic_no_redo_should_skip_history(undo);
 }
 
@@ -3840,6 +4594,8 @@ dberr_t trx_preserve_temp_space_image_begin_no_redo_undo_capture(
         descriptor);
     descriptor->no_redo_undo_capture_required = true;
     descriptor->no_redo_undo_pointers_reconnected = false;
+    descriptor->no_redo_undo_restored_only_reconnected = false;
+    descriptor->no_redo_undo_native_slots_adopted = false;
     descriptor->no_redo_undo_reconnected_trx = nullptr;
     descriptor->no_redo_undo_rseg_identity_present = true;
     descriptor->no_redo_undo_rseg_space_id = rseg_space_id;
@@ -4151,6 +4907,8 @@ dberr_t trx_preserve_temp_space_image_cancel_no_redo_undo_capture(
   descriptor->no_redo_undo_capture_degraded = false;
   descriptor->no_redo_undo_capture_degraded_reason.clear();
   descriptor->no_redo_undo_pointers_reconnected = false;
+  descriptor->no_redo_undo_restored_only_reconnected = false;
+  descriptor->no_redo_undo_native_slots_adopted = false;
   descriptor->no_redo_undo_reconnected_trx = nullptr;
   descriptor->no_redo_undo_rseg_identity_present = false;
   descriptor->no_redo_undo_rseg_space_id = 0;
@@ -4190,6 +4948,11 @@ bool trx_preserve_temp_space_image_no_redo_undo_pointers_reconnected(
   return descriptor.no_redo_undo_pointers_reconnected;
 }
 
+bool trx_preserve_temp_space_image_no_redo_undo_restored_only_reconnected(
+    const trx_preserve_temp_space_image_descriptor &descriptor) {
+  return descriptor.no_redo_undo_restored_only_reconnected;
+}
+
 size_t trx_preserve_temp_space_image_no_redo_undo_page_count(
     const trx_preserve_temp_space_image_descriptor &descriptor) {
   return descriptor.no_redo_undo_pages.size();
@@ -4214,8 +4977,151 @@ trx_preserve_temp_space_image_no_redo_update_undo_anchor(
   return &descriptor.no_redo_update_undo;
 }
 
+dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume(
+    trx_preserve_temp_space_image_descriptor *descriptor) {
+  if (!preserve_trx_temp_table_enable) return DB_SUCCESS;
+  if (descriptor == nullptr ||
+      !trx_preserve_temp_space_image_descriptor_has_identity(*descriptor) ||
+      !trx_preserve_temp_space_image_no_redo_undo_sidecar_ready(*descriptor) ||
+      !trx_preserve_temp_space_image_has_no_redo_undo_anchor(*descriptor)) {
+    return DB_ERROR;
+  }
+  if (descriptor->no_redo_undo_native_slots_adopted) return DB_SUCCESS;
+  if (!trx_preserve_temp_no_redo_undo_anchor_identity_valid(
+          descriptor->no_redo_insert_undo, descriptor->page_size) ||
+      !trx_preserve_temp_no_redo_undo_anchor_identity_valid(
+          descriptor->no_redo_update_undo, descriptor->page_size)) {
+    return DB_ERROR;
+  }
+  if (descriptor->no_redo_insert_undo.present &&
+      descriptor->no_redo_update_undo.present &&
+      descriptor->no_redo_insert_undo.undo_slot ==
+          descriptor->no_redo_update_undo.undo_slot) {
+    return DB_ERROR;
+  }
+
+  trx_rseg_t *rseg = trx_preserve_temp_space_image_find_no_redo_rseg(
+      *descriptor);
+  if (rseg == nullptr) return DB_ERROR;
+
+  const ulint insert_size =
+      descriptor->no_redo_insert_undo.present
+          ? trx_preserve_temp_space_image_reconnected_undo_size(
+                *descriptor, descriptor->no_redo_insert_undo)
+          : 0;
+  const ulint update_size =
+      descriptor->no_redo_update_undo.present
+          ? trx_preserve_temp_space_image_reconnected_undo_size(
+                *descriptor, descriptor->no_redo_update_undo)
+          : 0;
+  if ((descriptor->no_redo_insert_undo.present && insert_size == 0) ||
+      (descriptor->no_redo_update_undo.present && update_size == 0)) {
+    return DB_ERROR;
+  }
+  const page_no_t adopted_size = static_cast<page_no_t>(insert_size + update_size);
+
+  auto can_adopt_anchor_slot =
+      [](trx_rsegf_t *rseg_header,
+         const trx_preserve_temp_no_redo_undo_log_anchor &anchor,
+         mtr_t *mtr) -> bool {
+    if (!anchor.present) return true;
+    const page_no_t current =
+        trx_rsegf_get_nth_undo(rseg_header, anchor.undo_slot, mtr);
+    return current == FIL_NULL || current == anchor.hdr_page_no;
+  };
+  auto write_adopted_anchor_slot =
+      [](trx_rsegf_t *rseg_header,
+         const trx_preserve_temp_no_redo_undo_log_anchor &anchor, mtr_t *mtr) {
+    if (!anchor.present) return;
+    trx_rsegf_set_nth_undo(rseg_header, anchor.undo_slot, anchor.hdr_page_no,
+                           mtr);
+  };
+  auto reserve_anchor_slot =
+      [descriptor](
+          const trx_preserve_temp_no_redo_undo_log_anchor &anchor) -> bool {
+    if (!anchor.present) return true;
+    return trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
+        descriptor->source_space_id, descriptor->no_redo_undo_rseg_space_id,
+        descriptor->no_redo_undo_rseg_page_no, descriptor->no_redo_undo_rseg_slot,
+        anchor.undo_slot);
+  };
+
+  dberr_t err = DB_SUCCESS;
+  if (!reserve_anchor_slot(descriptor->no_redo_insert_undo) ||
+      !reserve_anchor_slot(descriptor->no_redo_update_undo)) {
+    return DB_ERROR;
+  }
+
+  {
+    mtr_t mtr;
+    mtr_start(&mtr);
+    mtr_set_log_mode(&mtr, MTR_LOG_NO_REDO);
+    rseg->latch();
+    if ((descriptor->no_redo_insert_undo.present &&
+         trx_preserve_temp_space_image_rseg_slot_in_use(
+             rseg, descriptor->no_redo_insert_undo.undo_slot)) ||
+        (descriptor->no_redo_update_undo.present &&
+         trx_preserve_temp_space_image_rseg_slot_in_use(
+             rseg, descriptor->no_redo_update_undo.undo_slot)) ||
+        adopted_size > rseg->max_size ||
+        rseg->get_curr_size() > rseg->max_size - adopted_size) {
+      err = DB_ERROR;
+    } else {
+      trx_rsegf_t *rseg_header =
+          trx_rsegf_get(rseg->space_id, rseg->page_no, rseg->page_size, &mtr);
+      if (!can_adopt_anchor_slot(rseg_header, descriptor->no_redo_insert_undo,
+                                 &mtr) ||
+          !can_adopt_anchor_slot(rseg_header, descriptor->no_redo_update_undo,
+                                 &mtr)) {
+        err = DB_ERROR;
+      }
+    }
+    rseg->unlatch();
+    mtr_commit(&mtr);
+  }
+  if (err != DB_SUCCESS) return err;
+
+  err =
+      trx_preserve_temp_space_image_materialize_no_redo_undo_pages(*descriptor,
+                                                                  rseg);
+  if (err != DB_SUCCESS) return err;
+
+  mtr_t mtr;
+  mtr_start(&mtr);
+  mtr_set_log_mode(&mtr, MTR_LOG_NO_REDO);
+  rseg->latch();
+  trx_rsegf_t *rseg_header =
+      trx_rsegf_get(rseg->space_id, rseg->page_no, rseg->page_size, &mtr);
+  if ((descriptor->no_redo_insert_undo.present &&
+       trx_preserve_temp_space_image_rseg_slot_in_use(
+           rseg, descriptor->no_redo_insert_undo.undo_slot)) ||
+      (descriptor->no_redo_update_undo.present &&
+       trx_preserve_temp_space_image_rseg_slot_in_use(
+           rseg, descriptor->no_redo_update_undo.undo_slot)) ||
+      adopted_size > rseg->max_size ||
+      rseg->get_curr_size() > rseg->max_size - adopted_size ||
+      !can_adopt_anchor_slot(rseg_header, descriptor->no_redo_insert_undo,
+                             &mtr) ||
+      !can_adopt_anchor_slot(rseg_header, descriptor->no_redo_update_undo,
+                             &mtr)) {
+    err = DB_ERROR;
+  } else {
+    write_adopted_anchor_slot(rseg_header, descriptor->no_redo_insert_undo,
+                              &mtr);
+    write_adopted_anchor_slot(rseg_header, descriptor->no_redo_update_undo,
+                              &mtr);
+    rseg->set_curr_size(rseg->get_curr_size() + adopted_size);
+  }
+  rseg->unlatch();
+  mtr_commit(&mtr);
+
+  if (err == DB_SUCCESS) descriptor->no_redo_undo_native_slots_adopted = true;
+  return err;
+}
+
 dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-    trx_preserve_temp_space_image_descriptor *descriptor, trx_t *trx) {
+    trx_preserve_temp_space_image_descriptor *descriptor, trx_t *trx,
+    trx_preserve_temp_no_redo_undo_reconnect_mode mode) {
   if (!preserve_trx_temp_table_enable) return DB_SUCCESS;
   if (descriptor == nullptr ||
       !trx_preserve_temp_space_image_descriptor_has_identity(*descriptor) ||
@@ -4236,6 +5142,11 @@ dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
     return DB_SUCCESS;
   }
 
+  if (mode == trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED &&
+      !descriptor->no_redo_undo_native_slots_adopted) {
+    return DB_ERROR;
+  }
+
   if (trx->rsegs.m_noredo.rseg != nullptr ||
       trx->rsegs.m_noredo.insert_undo != nullptr ||
       trx->rsegs.m_noredo.update_undo != nullptr || trx->id == 0) {
@@ -4249,55 +5160,51 @@ dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
   bool insert_slot_busy = false;
   bool update_slot_busy = false;
   bool reservation_failed = false;
-  bool reservations_created = false;
   mutex_enter(&rseg->mutex);
   insert_slot_busy =
       descriptor->no_redo_insert_undo.present &&
-      (trx_preserve_temp_space_image_rseg_slot_in_use(
-           rseg, descriptor->no_redo_insert_undo.undo_slot) ||
-       trx_preserve_temp_space_image_no_redo_undo_slot_reserved(
-           descriptor->no_redo_undo_rseg_space_id,
-           descriptor->no_redo_insert_undo.undo_slot));
+      trx_preserve_temp_space_image_rseg_slot_in_use(
+          rseg, descriptor->no_redo_insert_undo.undo_slot);
   update_slot_busy =
       descriptor->no_redo_update_undo.present &&
-      (trx_preserve_temp_space_image_rseg_slot_in_use(
-           rseg, descriptor->no_redo_update_undo.undo_slot) ||
-       trx_preserve_temp_space_image_no_redo_undo_slot_reserved(
-           descriptor->no_redo_undo_rseg_space_id,
-           descriptor->no_redo_update_undo.undo_slot));
+      trx_preserve_temp_space_image_rseg_slot_in_use(
+          rseg, descriptor->no_redo_update_undo.undo_slot);
   if (!insert_slot_busy && !update_slot_busy) {
+    /*
+      Register token-owned slots before materializing no-redo undo pages. If a
+      later staged reconnect step fails, these reservations intentionally remain
+      until token sidecar cleanup or resumed-trx cleanup releases them, so normal
+      temp undo allocation cannot reuse a retryable preserved slot.
+    */
     if (descriptor->no_redo_insert_undo.present) {
-      reservations_created =
-          trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
-              descriptor->no_redo_undo_rseg_space_id,
+      reservation_failed =
+          !trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
+              descriptor->source_space_id, descriptor->no_redo_undo_rseg_space_id,
+              descriptor->no_redo_undo_rseg_page_no,
+              descriptor->no_redo_undo_rseg_slot,
               descriptor->no_redo_insert_undo.undo_slot);
-      reservation_failed = !reservations_created;
     }
     if (!reservation_failed && descriptor->no_redo_update_undo.present) {
-      const bool update_reserved =
-          trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
-              descriptor->no_redo_undo_rseg_space_id,
+      reservation_failed =
+          !trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
+              descriptor->source_space_id, descriptor->no_redo_undo_rseg_space_id,
+              descriptor->no_redo_undo_rseg_page_no,
+              descriptor->no_redo_undo_rseg_slot,
               descriptor->no_redo_update_undo.undo_slot);
-      reservation_failed = !update_reserved;
-      reservations_created = reservations_created || update_reserved;
     }
   }
   mutex_exit(&rseg->mutex);
   if (insert_slot_busy || update_slot_busy || reservation_failed) {
-    if (reservations_created) {
-      trx_preserve_temp_space_image_release_no_redo_undo_reservations(
-          *descriptor);
-    }
     return DB_ERROR;
   }
 
-  dberr_t err =
-      trx_preserve_temp_space_image_materialize_no_redo_undo_pages(*descriptor,
-                                                                  rseg);
-  if (err != DB_SUCCESS) {
-    trx_preserve_temp_space_image_release_no_redo_undo_reservations(
-        *descriptor);
-    return err;
+  if (mode == trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY) {
+    dberr_t err =
+        trx_preserve_temp_space_image_materialize_no_redo_undo_pages(*descriptor,
+                                                                    rseg);
+    if (err != DB_SUCCESS) {
+      return err;
+    }
   }
 
   trx_undo_t *insert_undo = nullptr;
@@ -4316,21 +5223,17 @@ dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
   if (descriptor->no_redo_insert_undo.present) {
     insert_undo = trx_preserve_temp_space_image_create_reconnected_undo(
         trx, rseg, descriptor->no_redo_insert_undo, TRX_UNDO_INSERT,
-        insert_size);
+        insert_size, mode);
     if (insert_undo == nullptr) {
-      trx_preserve_temp_space_image_release_no_redo_undo_reservations(
-          *descriptor);
       return DB_ERROR;
     }
   }
   if (descriptor->no_redo_update_undo.present) {
     update_undo = trx_preserve_temp_space_image_create_reconnected_undo(
         trx, rseg, descriptor->no_redo_update_undo, TRX_UNDO_UPDATE,
-        update_size);
+        update_size, mode);
     if (update_undo == nullptr) {
       trx_undo_mem_free(insert_undo);
-      trx_preserve_temp_space_image_release_no_redo_undo_reservations(
-          *descriptor);
       return DB_ERROR;
     }
   }
@@ -4356,14 +5259,17 @@ dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
   trx->rsegs.m_noredo.rseg = rseg;
   trx->rsegs.m_noredo.insert_undo = insert_undo;
   trx->rsegs.m_noredo.update_undo = update_undo;
+  trx_preserve_temp_space_image_advance_trx_undo_no_for_native_resume(
+      trx, *descriptor, mode);
   descriptor->no_redo_undo_pointers_reconnected = true;
+  descriptor->no_redo_undo_restored_only_reconnected =
+      mode == trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY;
   descriptor->no_redo_undo_reconnected_trx = trx;
   return DB_SUCCESS;
 }
 
 dberr_t trx_preserve_temp_space_image_disconnect_no_redo_undo_for_retry(
     trx_preserve_temp_space_image_descriptor *descriptor) {
-  if (!preserve_trx_temp_table_enable) return DB_SUCCESS;
   if (descriptor == nullptr) return DB_ERROR;
   if (!descriptor->no_redo_undo_pointers_reconnected) return DB_SUCCESS;
 
@@ -4388,11 +5294,12 @@ dberr_t trx_preserve_temp_space_image_disconnect_no_redo_undo_for_retry(
   trx->rsegs.m_noredo.insert_undo = nullptr;
   trx->rsegs.m_noredo.update_undo = nullptr;
   trx->rsegs.m_noredo.rseg = nullptr;
-  trx_preserve_temp_space_image_release_no_redo_undo_reservations(*descriptor);
   if (rseg != nullptr) {
     mutex_exit(&rseg->mutex);
   }
   descriptor->no_redo_undo_pointers_reconnected = false;
+  descriptor->no_redo_undo_restored_only_reconnected = false;
+  descriptor->no_redo_undo_native_slots_adopted = false;
   descriptor->no_redo_undo_reconnected_trx = nullptr;
   return DB_SUCCESS;
 }
@@ -4566,6 +5473,8 @@ dberr_t trx_preserve_temp_space_image_load_no_redo_undo_sidecar(
   loaded.no_redo_undo_capture_degraded = false;
   loaded.no_redo_undo_capture_degraded_reason.clear();
   loaded.no_redo_undo_pointers_reconnected = false;
+  loaded.no_redo_undo_restored_only_reconnected = false;
+  loaded.no_redo_undo_native_slots_adopted = false;
   loaded.no_redo_undo_reconnected_trx = nullptr;
   loaded.no_redo_undo_rseg_identity_present = true;
   loaded.no_redo_undo_rseg_space_id = rseg_space_id;
@@ -4668,7 +5577,6 @@ dberr_t trx_preserve_temp_space_image_register_dict_tables_for_resume(
 
 dberr_t trx_preserve_temp_space_image_unregister_dict_tables_for_resume(
     THD *thd, const trx_preserve_temp_space_image_descriptor &descriptor) {
-  if (!preserve_trx_temp_table_enable) return DB_SUCCESS;
   if (thd == nullptr) return DB_ERROR;
 
   innodb_session_t *session = thd_to_innodb_session(thd);
@@ -4683,7 +5591,6 @@ dberr_t trx_preserve_temp_space_image_unregister_dict_tables_for_resume(
 
 dberr_t trx_preserve_temp_space_image_unregister_dict_table_name_for_resume(
     THD *thd, const char *table_name) {
-  if (!preserve_trx_temp_table_enable) return DB_SUCCESS;
   if (thd == nullptr || table_name == nullptr || table_name[0] == '\0') {
     return DB_ERROR;
   }
@@ -4992,9 +5899,13 @@ dberr_t trx_preserve_temp_space_image_drop_preserved_fil_space(
   target->bound_dict_table = nullptr;
   target->bound_dict_tables.clear();
   target->no_redo_undo_pointers_reconnected = false;
+  target->no_redo_undo_restored_only_reconnected = false;
+  target->no_redo_undo_native_slots_adopted = false;
   target->no_redo_undo_reconnected_trx = nullptr;
   if (target != descriptor) {
     descriptor->no_redo_undo_pointers_reconnected = false;
+    descriptor->no_redo_undo_restored_only_reconnected = false;
+    descriptor->no_redo_undo_native_slots_adopted = false;
     descriptor->no_redo_undo_reconnected_trx = nullptr;
   }
 
@@ -5201,9 +6112,13 @@ dberr_t trx_preserve_temp_space_image_release_preserved_fil_space_for_retry(
     descriptor->bound_dict_table = nullptr;
     descriptor->bound_dict_tables.clear();
     descriptor->no_redo_undo_pointers_reconnected = false;
+    descriptor->no_redo_undo_restored_only_reconnected = false;
+    descriptor->no_redo_undo_native_slots_adopted = false;
     descriptor->no_redo_undo_reconnected_trx = nullptr;
   } else {
     descriptor->no_redo_undo_pointers_reconnected = false;
+    descriptor->no_redo_undo_restored_only_reconnected = false;
+    descriptor->no_redo_undo_native_slots_adopted = false;
     descriptor->no_redo_undo_reconnected_trx = nullptr;
   }
   /*
@@ -5251,7 +6166,16 @@ void trx_preserve_temp_space_image_clear_adopted_fil_spaces_for_test() {
   {
     std::lock_guard<std::mutex> reservation_guard{
         trx_preserve_temp_no_redo_undo_reservations_mutex};
+    trx_preserve_temp_reserved_pages.clear();
     trx_preserve_temp_no_redo_undo_reserved_slots.clear();
+    trx_preserve_temp_active_page_reservations.store(
+        0, std::memory_order_release);
+    trx_preserve_temp_active_no_redo_undo_slot_reservations.store(
+        0, std::memory_order_release);
+    trx_preserve_temp_page_reservation_slow_lookups.store(
+        0, std::memory_order_release);
+    trx_preserve_temp_no_redo_undo_slot_reservation_slow_lookups.store(
+        0, std::memory_order_release);
   }
 }
 

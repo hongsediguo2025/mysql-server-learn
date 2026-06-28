@@ -47,6 +47,9 @@ class Sql_cmd_truncate_table : public Sql_cmd {
   /** Track error status from functions called. */
   bool m_error = true;
 
+  /** Mark successful transactional temporary-table truncate for preserve. */
+  bool m_preserve_temp_truncate = false;
+
  public:
   /**
     Constructor, used to represent a TRUNCATE statement.

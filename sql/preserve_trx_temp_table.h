@@ -349,6 +349,13 @@ struct Preserve_trx_temp_table_materialize_plan {
       Preserve_trx_temp_table_materialize_source::NONE};
   bool requires_sealed_image_sidecars{false};
   bool requires_no_redo_undo_sidecars{false};
+  /*
+    True only when the manifest carries ownership evidence for native no-redo
+    undo adoption. Restored-only sidecars remain claimable for COMMIT/ROLLBACK
+    compatibility, but they must keep post-resume temp DML rejected until native
+    adoption is actually implemented and applied.
+  */
+  bool native_adoption_capable{false};
   bool scans_sql_rows{false};
   bool replays_logical_row_journal{false};
   Preserved_temp_table_manifest manifest;
@@ -390,6 +397,11 @@ preserve_trx_temp_table_materialize_plan(
 bool preserve_trx_temp_table_apply_manifest_undo_identity_for_resume(
     const Preserved_temp_table_undo_descriptor &undo,
     trx_preserve_temp_space_image_descriptor *descriptor);
+
+bool preserve_trx_temp_table_append_ownership_claims_from_descriptor(
+    const std::string &token, const Preserved_temp_table_undo_descriptor &undo,
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    Preserved_temp_table_manifest *manifest);
 
 uint64_t preserve_trx_temp_table_owner_trx_id(
     const Preserve_snapshot_metadata &metadata);
@@ -436,6 +448,9 @@ Preserve_snapshot_status preserve_trx_temp_table_remove_token_sidecars(
     const Preserve_snapshot_metadata &metadata);
 
 std::set<uint32_t> preserve_trx_temp_table_sidecar_source_space_ids(
+    const Preserve_snapshot_metadata &metadata);
+
+void preserve_trx_temp_table_release_ownership_reservations(
     const Preserve_snapshot_metadata &metadata);
 
 Preserve_snapshot_status preserve_trx_temp_table_remove_token_sidecars(

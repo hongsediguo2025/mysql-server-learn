@@ -24,6 +24,7 @@ my $temp_h = read_source('sql', 'preserve_trx_temp_table.h');
 my $temp_cc = read_source('sql', 'preserve_trx_temp_table.cc');
 my $sql_table = read_source('sql', 'sql_table.cc');
 my $sql_base = read_source('sql', 'sql_base.cc');
+my $sql_truncate = read_source('sql', 'sql_truncate.cc');
 
 die "temp-table journal must define ALTER_TABLE and RENAME_TABLE markers\n"
   unless $temp_h =~ /ALTER_TABLE/s && $temp_h =~ /RENAME_TABLE/s;
@@ -32,11 +33,30 @@ die "temp-table preserve API must expose ALTER and RENAME marker helpers\n"
          $temp_h =~ /preserve_trx_temp_table_note_table_rename/s;
 die "has_row_history must reject ALTER_TABLE and RENAME_TABLE history\n"
   unless $temp_cc =~ /Kind::ALTER_TABLE/s && $temp_cc =~ /Kind::RENAME_TABLE/s;
-die "temporary ALTER TABLE path must mark unsupported preserve history before replacing the table\n"
+die "temporary ALTER TABLE path must record preserve history only after successful replacement\n"
   unless $sql_table =~
-         /if\s*\(\s*table->s->tmp_table\s*!=\s*NO_TMP_TABLE\s*\)\s*\{[\s\S]*preserve_trx_temp_table_note_table_alter\s*\(\s*thd\s*,\s*table\s*\)[\s\S]*close_temporary_table\s*\(\s*thd\s*,\s*table\s*,\s*true\s*,\s*true\s*\)/s;
+         /if\s*\(\s*rename_temporary_table\s*\(\s*thd\s*,\s*new_table[\s\S]*\)\s*\)\s*goto\s+err_new_table_cleanup\s*;[\s\S]{0,700}preserve_trx_temp_table_note_table_alter\s*\(\s*thd\s*,\s*new_table\s*\)/s;
 die "temporary rename helper must mark unsupported preserve history\n"
   unless $sql_base =~ /rename_temporary_table\s*\([^)]*\)\s*\{[\s\S]*preserve_trx_temp_table_note_table_rename\s*\(\s*thd\s*,\s*table\s*,/s;
+my $truncate_marker_count =
+  () = $sql_truncate =~ /preserve_trx_temp_table_note_table_truncate\s*\(/g;
+die "temporary TRUNCATE marker must be emitted exactly once from cleanup_temporary\n"
+  unless $truncate_marker_count == 1;
+die "temporary TRUNCATE marker must be centralized in cleanup_temporary\n"
+  unless $sql_truncate =~
+         /cleanup_temporary\s*\([^)]*\)[\s\S]*note_successful_preserve_temp_truncate\s*=[\s\S]*preserve_trx_temp_table_note_table_truncate\s*\(/s;
+die "temporary TRUNCATE marker must only fire after the native path succeeded\n"
+  unless $sql_truncate =~
+         /note_successful_preserve_temp_truncate\s*=\s*\[\s*&\s*\]\s*\(\s*\)\s*\{[\s\S]{0,180}if\s*\(\s*m_preserve_temp_truncate\s*&&\s*!m_error\s*\)[\s\S]{0,240}preserve_trx_temp_table_note_table_truncate\s*\(/s;
+die "temporary TRUNCATE marker must be called after successful reopen cleanup\n"
+  unless $sql_truncate =~
+         /open_table_uncached\s*\([\s\S]*if\s*\(\s*new_table\s*==\s*nullptr\s*\)\s*\{[\s\S]*m_error\s*=\s*true\s*;[\s\S]*return\s*;[\s\S]*\}[\s\S]*new_table->s->tmp_table_def\s*=[\s\S]*note_successful_preserve_temp_truncate\s*\(\s*\)\s*;/s;
+die "temporary TRUNCATE cleanup must commit or roll back native work before preserve marker cleanup\n"
+  unless $sql_truncate =~
+         /create_scope_guard\s*\(\s*\[\s*&\s*\]\s*\(\s*\)\s*\{[\s\S]{0,220}end_transaction\s*\(\s*thd\s*,\s*binlog_stmt\s*,\s*binlog_is_trans\s*\)\s*;[\s\S]{0,220}cleanup_temporary\s*\(\s*thd\s*,\s*hton\s*,\s*\*table_ref\s*,\s*&tdef_holder\s*,\s*saved_path\s*\)/s;
+die "temporary DROP marker documents SQL unlink boundary before close_temporary\n"
+  unless $sql_base =~
+         /if\s*\(\s*delete_table\s*\)\s*[\r\n ]*\(void\)preserve_trx_temp_table_note_table_drop\s*\(\s*thd\s*,\s*table\s*\)\s*;[\s\S]{0,160}close_temporary\s*\(\s*thd\s*,\s*table\s*,\s*free_share\s*,\s*delete_table\s*\)/s;
 EOF
 
 SELECT 'ok' AS temp_table_ddl_boundary_lint;

@@ -29,6 +29,8 @@ LEGACY_LINT_RULE_IDS: Sequence[str] = (
     "batch_drain_drained_session_command_matrix_lint",
     "batch_drain_nonidle_autocommit_no_token_lint",
     "batch_drain_unknown_query_quiesce_boundary_lint",
+    "batch_drain_lock_warmcopy_hook_coverage_lint",
+    "batch_drain_lock_warmcopy_no_partial_fallback_lint",
     "batch_drain_warmcopy_recovery_abandoned_cleanup_lint",
     "batch_drain_warmcopy_two_phase_protection_lint",
     "code_review_resumable_trx_slices_lint",
@@ -38,6 +40,10 @@ LEGACY_LINT_RULE_IDS: Sequence[str] = (
     "temp_table_resume_materialize_partial_failure_cleanup_matrix_lint",
     "temp_table_sidecar_already_exists_preserves_durable_lint",
     "temp_table_sidecar_pair_mismatch_rollback_lint",
+    "temp_table_ddl_boundary_lint",
+    "temp_table_no_redo_baseline_lint",
+    "temp_table_phase1_participant_lint",
+    "temp_table_row_hook_no_payload_lint",
     "test_layering_doc_contract_lint",
     "wide_error_masks_lint",
 )
@@ -45,8 +51,6 @@ LEGACY_LINT_RULE_IDS: Sequence[str] = (
 SOURCE_LINT_RULE_IDS: Sequence[str] = (
     *LEGACY_LINT_RULE_IDS,
     "carrier_read_no_follow_lint",
-    "batch_drain_lock_warmcopy_hook_coverage_lint",
-    "batch_drain_lock_warmcopy_no_partial_fallback_lint",
     "preserve_trx_off_path_invasive_surface_lint",
     "preserve_sql_command_flags_lint",
 )
@@ -424,6 +428,105 @@ def _check_carrier_read_no_follow(repo_root: Path,
             ))
 
 
+def _require_source_pattern(
+    findings: List[LintFinding],
+    *,
+    rule: str,
+    repo_root: Path,
+    rel: str,
+    pattern: re.Pattern[str],
+    message: str,
+) -> None:
+    path = repo_root / rel
+    if not path.is_file():
+        return
+    text = _read_text(path)
+    if pattern.search(text):
+        return
+    findings.append(LintFinding(
+        rule=rule,
+        path=rel,
+        line=1,
+        message=message,
+    ))
+
+
+def _check_off_path_invasive_surface(repo_root: Path,
+                                     findings: List[LintFinding]) -> None:
+    rule = "preserve_trx_off_path_invasive_surface_lint"
+    _require_source_pattern(
+        findings,
+        rule=rule,
+        repo_root=repo_root,
+        rel="sql/preserve_trx_temp_table.cc",
+        pattern=re.compile(
+            r"bool\s+preserve_trx_temp_table_row_hooks_enabled\s*\(\s*\)"
+            r"\s*\{[\s\S]{0,260}return\s+preserve_trx_is_enabled\s*\(\s*\)"
+            r"\s*;",
+            re.S,
+        ),
+        message="temporary-table row hooks must be inert when "
+                "preserve_trx_enable is OFF",
+    )
+    _require_source_pattern(
+        findings,
+        rule=rule,
+        repo_root=repo_root,
+        rel="sql/preserve_trx_temp_table.cc",
+        pattern=re.compile(
+            r"Temp_table_warmcopy_participant\s*\*"
+            r"preserve_trx_temp_table_ensure_participant\s*\([^)]*\)\s*\{"
+            r"[\s\S]{0,260}if\s*\(\s*!preserve_trx_is_enabled\s*\(\s*\)"
+            r"\s*\|\|\s*!preserve_trx_temp_table_enable",
+            re.S,
+        ),
+        message="temporary-table participant allocation must be gated by both "
+                "preserve_trx_enable and preserve_trx_temp_table_enable",
+    )
+    _require_source_pattern(
+        findings,
+        rule=rule,
+        repo_root=repo_root,
+        rel="storage/innobase/include/trx0temp_preserve.h",
+        pattern=re.compile(
+            r"trx_preserve_temp_space_image_dirty_page_hook_enabled\s*\(\s*\)"
+            r"\s*\{[\s\S]{0,180}return\s+preserve_trx_is_enabled\s*\(\s*\)"
+            r"\s*&&\s*preserve_trx_temp_table_enable\s*;",
+            re.S,
+        ),
+        message="InnoDB temporary dirty-page hook must be inert unless both "
+                "the top-level feature and temp-table subfeature are enabled",
+    )
+    _require_source_pattern(
+        findings,
+        rule=rule,
+        repo_root=repo_root,
+        rel="storage/innobase/trx/trx0temp_preserve.cc",
+        pattern=re.compile(
+            r"trx_preserve_temp_space_image_stage_dirty_page\s*\([^)]*\)"
+            r"\s*\{[\s\S]{0,180}if\s*\(\s*!"
+            r"trx_preserve_temp_space_image_dirty_page_hook_enabled\s*\(\s*\)"
+            r"\s*\)\s*return\s+DB_SUCCESS\s*;",
+            re.S,
+        ),
+        message="InnoDB temporary dirty-page capture hot path must return "
+                "before validation, allocation, or stream lookup when disabled",
+    )
+    _require_source_pattern(
+        findings,
+        rule=rule,
+        repo_root=repo_root,
+        rel="sql/handler.cc",
+        pattern=re.compile(
+            r"preserve_trx_temp_table_row_hooks_enabled\s*\(\s*\)\s*&&"
+            r"\s*preserve_trx_temp_table_row_capture_candidate",
+            re.S,
+        ),
+        message="handler row hooks must call temporary-table capture only "
+                "behind the row-hook enabled gate",
+    )
+
+
 def run_lint_checks(repo_root: Path,
                     output_dir: Optional[Path] = None) -> Dict[str, object]:
     repo_root = repo_root.resolve()
@@ -434,6 +537,7 @@ def run_lint_checks(repo_root: Path,
     _check_test_layering(repo_root, findings)
     _check_wide_error_masks(repo_root, findings)
     _check_carrier_read_no_follow(repo_root, findings)
+    _check_off_path_invasive_surface(repo_root, findings)
     _check_preserve_sql_command_flags(repo_root, findings)
 
     summary: Dict[str, object] = {
