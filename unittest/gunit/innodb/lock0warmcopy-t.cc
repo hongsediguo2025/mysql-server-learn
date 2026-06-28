@@ -88,7 +88,16 @@ std::string make_encoded_record_image(const std::string &raw_image) {
 }
 
 std::string read_source_file(const char *path) {
-  std::ifstream input(path);
+  std::string root = __FILE__;
+  const std::string suffix = "unittest/gunit/innodb/lock0warmcopy-t.cc";
+  const size_t suffix_pos = root.rfind(suffix);
+  if (suffix_pos != std::string::npos) {
+    root.resize(suffix_pos);
+  } else {
+    root.clear();
+  }
+
+  std::ifstream input(root + path);
   if (!input) return std::string();
   return std::string(std::istreambuf_iterator<char>(input),
                      std::istreambuf_iterator<char>());
