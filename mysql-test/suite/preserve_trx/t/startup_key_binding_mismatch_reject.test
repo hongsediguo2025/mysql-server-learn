@@ -3,7 +3,6 @@
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_enable=OFF;
 
 --perl
 use strict;
@@ -47,7 +46,8 @@ my $key = File::Spec->catfile($ENV{'MYSQLD_DATADIR'}, 'preserve', '.key');
 unlink($key) or die "cannot remove mismatched preserve key: $!";
 EOF
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=
 
 --remove_file $error_log

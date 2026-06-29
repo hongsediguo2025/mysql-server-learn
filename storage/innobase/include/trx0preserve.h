@@ -43,6 +43,9 @@ class THD;
 struct trx_rseg_t;
 struct trx_t;
 
+bool trx_preserve_feature_enabled();
+bool trx_preserve_xid_is_magic_active(const XID &xid);
+
 struct Preserve_lock_limits {
   uint32_t max_lock_count;
   uint32_t max_modified_tables;

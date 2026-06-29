@@ -278,7 +278,7 @@ $trx =~ /static trx_t \*trx_resurrect_insert[\s\S]*?^}/m
 my $trx_resurrect_insert = $&;
 die "force recovery must keep preserve magic XA transactions prepared\n"
   unless $trx_resurrect_insert =~
-         /preserve_magic_xid\s*=\s*xid_is_preserve_magic[\s\S]*srv_force_recovery\s*==\s*0\s*\|\|\s*preserve_magic_xid/s &&
+         /preserve_magic_xid\s*=\s*trx_preserve_xid_is_magic_active[\s\S]*srv_force_recovery\s*==\s*0\s*\|\|\s*preserve_magic_xid/s &&
          $trx_resurrect_insert =~ /\+\+trx_sys->n_prepared_trx/s;
 
 $carrier_file =~ /Preserved_trx_carrier_status read_file_limited[\s\S]*?^}/m

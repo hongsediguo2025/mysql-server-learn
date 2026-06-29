@@ -3477,6 +3477,10 @@ bool trx_preserve_temp_space_image_no_redo_undo_slot_reserved(
 void trx_preserve_temp_space_image_release_no_redo_undo_slot(
     uint32_t rseg_space_id, uint32_t rseg_page_no, uint32_t rseg_id,
     uint32_t slot) {
+  if (trx_preserve_temp_active_no_redo_undo_slot_reservations.load(
+          std::memory_order_acquire) == 0) {
+    return;
+  }
   if (!trx_preserve_temp_space_image_no_redo_undo_slot_key_valid(
           rseg_space_id, rseg_page_no, rseg_id, slot)) {
     return;

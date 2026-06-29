@@ -4,7 +4,10 @@
 --let $error_log= $MYSQLTEST_VARDIR/log/preserve_trx_startup_option.err
 
 SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_enable=OFF;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=
 
 --perl
 use strict;
@@ -49,8 +52,9 @@ unlink($dir) or die "cannot remove preserve directory symlink: $!";
 remove_tree($target) if -e $target;
 EOF
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_enable=OFF;
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=
 
 --perl
 use strict;
@@ -90,8 +94,9 @@ my $key = File::Spec->catfile($dir, '.key');
 unlink($key) or die "cannot remove malformed key: $!";
 EOF
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_enable=OFF;
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=
 
 --perl
 use strict;
@@ -131,8 +136,9 @@ my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
 unlink($dir) or die "cannot remove preserve file: $!";
 EOF
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_enable=OFF;
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=
 
 --perl
 use strict;
@@ -172,8 +178,9 @@ chmod(0700, $dir) or die "cannot restore preserve dir access: $!";
 unlink($key) or die "cannot remove inaccessible key after restore: $!";
 EOF
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_enable=OFF;
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=
 
 --perl
 use strict;
@@ -211,8 +218,9 @@ my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
 unlink($dir) or die "cannot remove preserve symlink: $!";
 EOF
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_enable=OFF;
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=
 
 --perl
 use strict;
@@ -249,7 +257,8 @@ my $key = File::Spec->catfile($ENV{'MYSQLD_DATADIR'}, 'preserve', '.key');
 unlink($key) or die "cannot remove dangling key symlink: $!";
 EOF
 
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=
 
 --remove_file $error_log

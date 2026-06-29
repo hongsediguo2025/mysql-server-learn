@@ -1,4 +1,4 @@
-SET GLOBAL preserve_trx_enable=OFF;
+# restart: --preserve-trx-enable=OFF
 SELECT @@global.preserve_trx_enable;
 @@global.preserve_trx_enable
 0
@@ -12,4 +12,4 @@ SELECT COUNT(*) AS rows_seen
 FROM performance_schema.preserved_transactions;
 rows_seen
 0
-SET GLOBAL preserve_trx_enable=ON;
+# restart: --preserve-trx-enable=ON

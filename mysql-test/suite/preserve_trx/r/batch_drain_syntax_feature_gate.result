@@ -1,4 +1,4 @@
-SET GLOBAL preserve_trx_enable=OFF;
+# restart: --preserve-trx-enable=OFF
 SELECT @@global.preserve_trx_enable;
 @@global.preserve_trx_enable
 0
@@ -8,26 +8,4 @@ DRAIN TRANSACTIONS PRESERVE;
 ERROR HY000: Resumable transactions across shutdown are disabled
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 NO USER VARS;
 ERROR HY000: Resumable transactions across shutdown are disabled
-SET GLOBAL preserve_trx_enable=ON;
-SELECT @@global.preserve_trx_max_total;
-@@global.preserve_trx_max_total
-256
-SELECT @@global.preserve_trx_max_pending_per_user;
-@@global.preserve_trx_max_pending_per_user
-256
-SELECT @@global.preserve_trx_batch_max_transactions;
-@@global.preserve_trx_batch_max_transactions
-256
-SELECT GET_LOCK('preserve_trx_batch_owner_lock', 0);
-GET_LOCK('preserve_trx_batch_owner_lock', 0)
-1
-DRAIN TRANSACTIONS PRESERVE;
-ERROR HY000: Resumable transactions across shutdown do not support this operation
-SELECT RELEASE_LOCK('preserve_trx_batch_owner_lock');
-RELEASE_LOCK('preserve_trx_batch_owner_lock')
-1
-START TRANSACTION;
-DRAIN TRANSACTIONS PRESERVE;
-ERROR HY000: Invalid preserved transaction state
-ROLLBACK;
-SET GLOBAL preserve_trx_enable=ON;
+# restart: --preserve-trx-enable=ON

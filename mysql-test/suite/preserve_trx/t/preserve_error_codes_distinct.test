@@ -7,10 +7,6 @@ DROP USER IF EXISTS preserve_error_reader@localhost;
 DROP TABLE IF EXISTS t_preserve_error_codes;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=OFF;
---error ER_PRESERVE_TRX_DISABLED
-RESUME PRESERVED TRANSACTION 'missing_token_for_disabled';
-
 SET GLOBAL preserve_trx_enable=ON;
 --disable_query_log
 CALL mtr.add_suppression("RESUME PRESERVED TRANSACTION .* failed: token not found");

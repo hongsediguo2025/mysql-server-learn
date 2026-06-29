@@ -4,7 +4,6 @@
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_enable=OFF;
 
 --let $error_log= $MYSQLTEST_VARDIR/log/preserve_trx_startup_transient_key_io_retry.err
 --perl

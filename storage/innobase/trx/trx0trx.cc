@@ -819,7 +819,8 @@ static trx_t *trx_resurrect_insert(
       ib::info(ER_IB_MSG_1204) << "Transaction " << trx_get_id_for_print(trx)
                                << " was in the XA prepared state.";
 
-      const bool preserve_magic_xid = xid_is_preserve_magic(*trx->xid);
+      const bool preserve_magic_xid =
+          trx_preserve_xid_is_magic_active(*trx->xid);
 
       if (srv_force_recovery == 0 || preserve_magic_xid) {
         if (srv_force_recovery > 0) {
@@ -3031,7 +3032,7 @@ int trx_recover_for_mysql(
     trx_sys->mutex. It may change to PREPARED, but not if
     trx->is_recovered. */
     if (trx_state_eq(trx, TRX_STATE_PREPARED) &&
-        !xid_is_preserve_magic(*trx->xid)) {
+        !trx_preserve_xid_is_magic_active(*trx->xid)) {
       if (get_info_about_prepared_transaction(&txn_list[count], trx, mem_root))
         break;
 
@@ -3101,7 +3102,7 @@ static MY_ATTRIBUTE((warn_unused_result)) trx_t *trx_get_trx_by_xid_low(
 trx_t *trx_get_trx_by_xid(const XID *xid) {
   trx_t *trx;
 
-  if (xid == nullptr || xid_is_preserve_magic(*xid)) {
+  if (xid == nullptr || trx_preserve_xid_is_magic_active(*xid)) {
     return (nullptr);
   }
 

@@ -1,0 +1,40 @@
+--source include/force_restart.inc
+
+--let $old_log_output= `SELECT @@global.log_output`
+--let $old_general_log= `SELECT @@global.general_log`
+--let $old_log_raw= `SELECT @@global.log_raw`
+
+--let $restart_parameters= restart: --preserve-trx-enable=OFF
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
+SET GLOBAL log_output='TABLE';
+SET GLOBAL log_raw=ON;
+SET GLOBAL general_log=ON;
+TRUNCATE TABLE mysql.general_log;
+
+--disable_query_log
+--error ER_PRESERVE_TRX_DISABLED
+RESUME PRESERVED TRANSACTION 'msp_off_raw_visible_abcd';
+--enable_query_log
+
+SELECT COUNT(*) AS raw_token_in_general_log
+  FROM mysql.general_log
+ WHERE command_type = 'Query'
+   AND argument LIKE 'RESUME PRESERVED TRANSACTION%'
+   AND argument LIKE '%msp_off_raw_visible_abcd%';
+SELECT COUNT(*) AS redacted_token_in_general_log
+  FROM mysql.general_log
+ WHERE command_type = 'Query'
+   AND argument LIKE 'RESUME PRESERVED TRANSACTION%'
+   AND argument LIKE '%****abcd%';
+
+SET GLOBAL general_log=OFF;
+TRUNCATE TABLE mysql.general_log;
+--eval SET GLOBAL log_raw=$old_log_raw
+--eval SET GLOBAL log_output='$old_log_output'
+--eval SET GLOBAL general_log=$old_general_log
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=

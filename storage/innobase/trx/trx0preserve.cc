@@ -41,6 +41,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "sess0sess.h"
 #include "sql/handler.h"
 #include "sql/mysqld.h"
+#include "sql/preserve_trx.h"
 #include "sql/sql_class.h"
 #include "sql/transaction_info.h"
 #include "storage/innobase/handler/ha_innodb.h"
@@ -67,6 +68,14 @@ static bool trx_preserve_token_to_xid(const char *token, XID *xid) {
            PRESERVE_TRX_XID_GTRID_LENGTH, token,
            static_cast<long>(token_length));
   return true;
+}
+
+bool trx_preserve_feature_enabled() { return preserve_trx_is_enabled(); }
+
+bool trx_preserve_xid_is_magic_active(const XID &xid) {
+  return xid_is_preserve_magic(xid) &&
+         (trx_preserve_feature_enabled() ||
+          preserve_trx_magic_xid_has_snapshot(xid));
 }
 
 trx_t *trx_preserve_current_thd_trx(THD *thd) {

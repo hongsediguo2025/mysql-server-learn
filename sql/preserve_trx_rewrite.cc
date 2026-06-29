@@ -315,6 +315,7 @@ bool raw_sql_parse_resume_token(const char *query, size_t query_length,
 
 bool mysql_rewrite_resume_preserved_transaction_raw(
     THD *, const char *query, size_t query_length, String *rewritten_query) {
+  if (!preserve_trx_is_enabled()) return false;
   if (query == nullptr || rewritten_query == nullptr) return false;
 
   size_t literal_start = 0;

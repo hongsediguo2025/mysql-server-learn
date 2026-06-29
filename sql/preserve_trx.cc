@@ -1354,6 +1354,18 @@ bool preserved_trx_file_exists_for_token(const std::string &token) {
       preserve_trx_default_dir(), token);
 }
 
+bool preserve_trx_magic_xid_has_snapshot_impl(const XID &xid) {
+  if (!xid_is_preserve_magic(xid)) return false;
+
+  const char *token =
+      xid.get_data() + static_cast<size_t>(PRESERVE_TRX_XID_GTRID_LENGTH);
+  const size_t token_length = static_cast<size_t>(xid.get_bqual_length());
+  const std::string token_string(token, token_length);
+  if (!token_is_filename_safe(token_string)) return false;
+
+  return preserved_trx_file_exists_for_token(token_string);
+}
+
 bool generate_preserve_trx_token(std::string *token) {
   static constexpr size_t kRandomTokenBytes = 16;
   static constexpr char kHexDigits[] = "0123456789abcdef";
@@ -5696,6 +5708,10 @@ void preserve_trx_warmcopy_admit_current_thd_binlog_write_impl(THD *thd) {
 
 }  // namespace
 
+bool preserve_trx_magic_xid_has_snapshot(const XID &xid) {
+  return preserve_trx_magic_xid_has_snapshot_impl(xid);
+}
+
 bool preserve_trx_temp_table_session_needs_eligibility_check(const THD *thd) {
   return preserve_trx_temp_table_enable && thd != nullptr &&
          thd->temporary_tables != nullptr;
@@ -6110,7 +6126,10 @@ static bool preserve_trx_wait_target_timed_out(THD *thd,
 
 bool preserved_trx_begin_command_read(THD *thd) {
   if (thd == nullptr) return false;
-  if (!preserve_trx_is_enabled()) return true;
+  if (!preserve_trx_is_enabled()) {
+    thd->m_server_idle = true;
+    return true;
+  }
 
   uint64_t hard_deadline_us = 0;
   uint quiesced_wait_loops = 0;
@@ -6189,7 +6208,10 @@ bool preserved_trx_end_idle_for_command_packet(THD *thd) {
 
 bool preserved_trx_end_command_read(THD *thd) {
   if (thd == nullptr) return false;
-  if (!preserve_trx_is_enabled()) return true;
+  if (!preserve_trx_is_enabled()) {
+    thd->m_server_idle = false;
+    return true;
+  }
 
   uint64_t hard_deadline_us = 0;
   uint quiesced_wait_loops = 0;

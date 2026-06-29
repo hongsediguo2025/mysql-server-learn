@@ -6,4 +6,4 @@ SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;
 preserved_count
 0
-SET GLOBAL preserve_trx_enable=ON;
+# restart: --preserve-trx-enable=ON

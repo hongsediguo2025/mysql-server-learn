@@ -35,6 +35,7 @@
 #include "my_thread_local.h"
 #include "my_sqlcommand.h"
 #include "sql/preserve_trx_bundle.h"
+#include "sql/preserve_trx_xid.h"
 #include "sql/sql_cmd.h"
 
 class THD;
@@ -88,6 +89,7 @@ extern uint preserve_trx_parallel_preserve_threads;
 uint preserve_trx_auto_parallel_preserve_threads(uint hardware_threads);
 bool preserve_trx_is_enabled();
 void preserve_trx_set_enable_value(bool enabled);
+bool preserve_trx_magic_xid_has_snapshot(const XID &xid);
 bool preserve_trx_execute_command(THD *thd);
 
 ulonglong preserve_trx_warmcopy_prefix_bytes_status();

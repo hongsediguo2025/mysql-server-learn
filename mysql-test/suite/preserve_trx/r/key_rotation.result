@@ -28,12 +28,7 @@ snapshot stub exists
 RESUME PRESERVED TRANSACTION 'msp_key_rotation_token';
 ERROR HY000: Preserved transaction snapshot is corrupt
 snapshot cleaned after corrupt resume
-SET GLOBAL preserve_trx_enable=OFF;
 key malformed
-SET GLOBAL preserve_trx_enable=ON;
-ERROR HY000: Incorrect arguments to SET
-SELECT @@global.preserve_trx_enable;
-@@global.preserve_trx_enable
-0
+Pattern "preserve_trx_enable=ON requires valid snapshot support" found
 DROP USER preserve_key_reader@localhost;
-SET GLOBAL preserve_trx_enable=ON;
+# restart: --preserve-trx-enable=ON

@@ -16,7 +16,7 @@ WHERE STATE = 'DRAINING';
 draining_rows
 1
 SET GLOBAL preserve_trx_enable=OFF;
-ERROR HY000: Incorrect arguments to preserve_trx_enable=OFF while preserve/drain is active
+ERROR HY000: Incorrect arguments to preserve_trx_enable is a startup-only option
 SELECT @@global.preserve_trx_enable AS preserve_enable_still_on;
 preserve_enable_still_on
 1

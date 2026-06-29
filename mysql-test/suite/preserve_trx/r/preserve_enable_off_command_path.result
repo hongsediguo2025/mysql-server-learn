@@ -1,4 +1,4 @@
-SET GLOBAL preserve_trx_enable=OFF;
+# restart: --preserve-trx-enable=OFF
 SELECT @@global.preserve_trx_enable;
 @@global.preserve_trx_enable
 0
@@ -8,4 +8,11 @@ SELECT * FROM t_off_command_path;
 id
 1
 DROP TABLE t_off_command_path;
-SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_off_command_path_xa (id INT PRIMARY KEY) ENGINE=InnoDB;
+XA START X'4d53505f50524553', X'746f6b656e', 1836281843;
+INSERT INTO t_off_command_path_xa VALUES (1);
+XA END X'4d53505f50524553', X'746f6b656e', 1836281843;
+XA PREPARE X'4d53505f50524553', X'746f6b656e', 1836281843;
+XA ROLLBACK X'4d53505f50524553', X'746f6b656e', 1836281843;
+DROP TABLE t_off_command_path_xa;
+# restart: --preserve-trx-enable=ON

@@ -860,13 +860,13 @@ TEST_F(PreservedTrxCommandRead, TimeoutsWhenTargetStateCannotDrainWithinHardLimi
 }
 
 TEST_F(PreservedTrxCommandRead,
-       DisabledFeatureLeavesCommandReadIdleStateUntouched) {
+       DisabledFeaturePreservesNativeCommandReadIdleState) {
   THD *target = thd();
   target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
 
   target->m_server_idle = false;
   EXPECT_TRUE(preserved_trx_begin_command_read(target));
-  EXPECT_FALSE(target->m_server_idle);
+  EXPECT_TRUE(target->m_server_idle);
 
   EXPECT_TRUE(preserved_trx_end_command_read(target));
   EXPECT_FALSE(target->m_server_idle);

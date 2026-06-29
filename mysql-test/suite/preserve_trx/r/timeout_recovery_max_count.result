@@ -23,4 +23,4 @@ a	b
 1	10
 DROP TABLE t_recovery_max_count;
 SET GLOBAL preserve_trx_enable=ON;
-# restart: --preserve-trx-enable=OFF --skip-log-bin
+# restart: --preserve-trx-enable=ON --skip-log-bin

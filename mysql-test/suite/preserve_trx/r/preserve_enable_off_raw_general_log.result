@@ -1,0 +1,26 @@
+# restart: --preserve-trx-enable=OFF
+SET GLOBAL log_output='TABLE';
+SET GLOBAL log_raw=ON;
+SET GLOBAL general_log=ON;
+TRUNCATE TABLE mysql.general_log;
+ERROR HY000: Resumable transactions across shutdown are disabled
+SELECT COUNT(*) AS raw_token_in_general_log
+FROM mysql.general_log
+WHERE command_type = 'Query'
+   AND argument LIKE 'RESUME PRESERVED TRANSACTION%'
+   AND argument LIKE '%msp_off_raw_visible_abcd%';
+raw_token_in_general_log
+1
+SELECT COUNT(*) AS redacted_token_in_general_log
+FROM mysql.general_log
+WHERE command_type = 'Query'
+   AND argument LIKE 'RESUME PRESERVED TRANSACTION%'
+   AND argument LIKE '%****abcd%';
+redacted_token_in_general_log
+0
+SET GLOBAL general_log=OFF;
+TRUNCATE TABLE mysql.general_log;
+SET GLOBAL log_raw=0;
+SET GLOBAL log_output='FILE';
+SET GLOBAL general_log=1;
+# restart: --preserve-trx-enable=ON

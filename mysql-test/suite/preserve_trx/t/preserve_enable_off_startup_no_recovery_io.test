@@ -19,4 +19,6 @@ SELECT COUNT(*) AS preserved_count
 --exec test -e "$MYSQLD_DATADIR/preserve/off_path_orphan.binlog_cache.warm.9.tmp"
 --exec rm -f "$MYSQLD_DATADIR/preserve/off_path_orphan.binlog_cache.warm.9" "$MYSQLD_DATADIR/preserve/off_path_orphan.binlog_cache.warm.9.desc" "$MYSQLD_DATADIR/preserve/off_path_orphan.binlog_cache.warm.9.tmp"
 
-SET GLOBAL preserve_trx_enable=ON;
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=

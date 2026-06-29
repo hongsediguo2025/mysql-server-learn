@@ -50,7 +50,7 @@ SELECT * FROM t_recovery_max_count ORDER BY a;
 DROP TABLE t_recovery_max_count;
 SET GLOBAL preserve_trx_enable=ON;
 
---let $restart_parameters= restart: --preserve-trx-enable=OFF --skip-log-bin
+--let $restart_parameters= restart: --preserve-trx-enable=ON --skip-log-bin
 --let $do_not_echo_parameters= 1
 --source include/restart_mysqld.inc
 --let $do_not_echo_parameters=

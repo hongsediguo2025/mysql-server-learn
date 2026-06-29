@@ -173,6 +173,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "sql/preserve_trx_xid.h"
 #include "sql_base.h"
 #include "srv0tmp.h"
+#include "trx0preserve.h"
 #include "trx0rec.h"
 #include "trx0roll.h"
 #include "trx0rseg.h"
@@ -19297,7 +19298,7 @@ static xa_status_code innobase_commit_by_xid(
 {
   DBUG_ASSERT(hton == innodb_hton_ptr);
 
-  if (xid != nullptr && xid_is_preserve_magic(*xid)) {
+  if (xid != nullptr && trx_preserve_xid_is_magic_active(*xid)) {
     return (XAER_NOTA);
   }
 
@@ -19329,7 +19330,7 @@ static xa_status_code innobase_rollback_by_xid(
 {
   DBUG_ASSERT(hton == innodb_hton_ptr);
 
-  if (xid != nullptr && xid_is_preserve_magic(*xid)) {
+  if (xid != nullptr && trx_preserve_xid_is_magic_active(*xid)) {
     return (XAER_NOTA);
   }
 

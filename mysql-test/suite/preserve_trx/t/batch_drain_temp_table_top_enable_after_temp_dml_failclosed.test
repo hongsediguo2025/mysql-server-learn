@@ -1,8 +1,13 @@
+--source include/force_restart.inc
+
+--let $restart_parameters= restart: --preserve-trx-enable=OFF
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
 --disable_warnings
 DROP TABLE IF EXISTS t_batch_temp_top_enable_after_temp_dml;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=OFF;
 SET GLOBAL preserve_trx_temp_table_enable=ON;
 
 CREATE TABLE t_batch_temp_top_enable_after_temp_dml(
@@ -24,6 +29,7 @@ START TRANSACTION;
 INSERT INTO t_batch_temp_top_enable_after_temp_dml VALUES(2, 20);
 
 --connection default
+--error ER_WRONG_ARGUMENTS
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_temp_table_enable=ON;
 
@@ -33,7 +39,7 @@ INSERT INTO t_batch_temp_top_enable_after_temp_dml VALUES(1, 10);
 --connection default
 --let $wait_condition= SELECT COUNT(*) = 2 FROM performance_schema.threads WHERE PROCESSLIST_USER = 'root' AND PROCESSLIST_DB = 'test' AND PROCESSLIST_COMMAND = 'Sleep'
 --source include/wait_condition.inc
---error ER_PRESERVE_TRX_UNSUPPORTED
+--error ER_PRESERVE_TRX_DISABLED
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 
 SELECT COUNT(*) AS preserved_count
@@ -54,4 +60,7 @@ COMMIT;
 SELECT * FROM t_batch_temp_top_enable_after_temp_dml ORDER BY sid;
 
 DROP TABLE t_batch_temp_top_enable_after_temp_dml;
-SET GLOBAL preserve_trx_enable=ON;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=

@@ -1,3 +1,11 @@
-SET GLOBAL preserve_trx_enable=OFF;
+--source include/force_restart.inc
+
+--let $restart_parameters= restart: --preserve-trx-enable=OFF
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
 SELECT COUNT(*) FROM performance_schema.preserved_transactions;
-SET GLOBAL preserve_trx_enable=ON;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=

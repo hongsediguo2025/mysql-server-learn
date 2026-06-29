@@ -1,5 +1,5 @@
-SET GLOBAL preserve_trx_enable=OFF;
+# restart: --preserve-trx-enable=OFF
 SELECT COUNT(*) FROM performance_schema.preserved_transactions;
 COUNT(*)
 0
-SET GLOBAL preserve_trx_enable=ON;
+# restart: --preserve-trx-enable=ON

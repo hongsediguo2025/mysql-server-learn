@@ -1,3 +1,9 @@
+--source include/force_restart.inc
+
+--let $restart_parameters= restart: --preserve-trx-enable=OFF
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
 --disable_warnings
 DROP USER IF EXISTS preserve_pfs_denied@localhost;
 --enable_warnings
@@ -9,7 +15,6 @@ SELECT COUNT(*) FROM performance_schema.preserved_transactions;
 --disconnect preserve_pfs_denied_con
 --connection default
 
-SET GLOBAL preserve_trx_enable=OFF;
 --error ER_PRESERVE_TRX_DISABLED
 PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 60;
 
@@ -37,5 +42,8 @@ PREPARE SHUTDOWN PRESERVE TRANSACTION WITH USER VARS WITH NO USER VARS;
 --error ER_PARSE_ERROR
 PREPARE SHUTDOWN PRESERVE TRANSACTION WITH NO USER VARS WITH USER VARS;
 
-SET GLOBAL preserve_trx_enable=ON;
 DROP USER preserve_pfs_denied@localhost;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=

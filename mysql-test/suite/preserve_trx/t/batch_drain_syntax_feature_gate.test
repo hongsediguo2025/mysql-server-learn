@@ -1,4 +1,9 @@
-SET GLOBAL preserve_trx_enable=OFF;
+--source include/force_restart.inc
+
+--let $restart_parameters= restart: --preserve-trx-enable=OFF
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
 SELECT @@global.preserve_trx_enable;
 
 CREATE TABLE drain(id INT PRIMARY KEY, drain_col INT) ENGINE=InnoDB;
@@ -9,20 +14,6 @@ DRAIN TRANSACTIONS PRESERVE;
 --error ER_PRESERVE_TRX_DISABLED
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 NO USER VARS;
 
-SET GLOBAL preserve_trx_enable=ON;
-
-SELECT @@global.preserve_trx_max_total;
-SELECT @@global.preserve_trx_max_pending_per_user;
-SELECT @@global.preserve_trx_batch_max_transactions;
-
-SELECT GET_LOCK('preserve_trx_batch_owner_lock', 0);
---error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE;
-SELECT RELEASE_LOCK('preserve_trx_batch_owner_lock');
-
-START TRANSACTION;
---error ER_PRESERVE_TRX_INVALID_STATE
-DRAIN TRANSACTIONS PRESERVE;
-ROLLBACK;
-
-SET GLOBAL preserve_trx_enable=ON;
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=

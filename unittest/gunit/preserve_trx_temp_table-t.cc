@@ -7504,6 +7504,26 @@ TEST(TempStartupReservationRegistrySourceTest,
          "entry visible to slow lookup";
 }
 
+TEST(TempStartupReservationRegistrySourceTest,
+     ReleaseNoRedoUndoSlotUsesActiveCountFastPath) {
+  const std::string impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+  const std::string release_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          impl,
+          "void trx_preserve_temp_space_image_release_no_redo_undo_slot(");
+  ASSERT_FALSE(release_body.empty());
+
+  const size_t active_check = release_body.find(
+      "trx_preserve_temp_active_no_redo_undo_slot_reservations.load(");
+  const size_t mutex_lock = release_body.find("std::lock_guard<std::mutex>");
+  ASSERT_NE(std::string::npos, active_check);
+  ASSERT_NE(std::string::npos, mutex_lock);
+  EXPECT_LT(active_check, mutex_lock)
+      << "normal temp undo release must skip reservation mutex/map work when "
+         "no preserved temp undo slots are active";
+}
+
 TEST_F(TempStartupReservationRegistryTest,
        OwnershipClaimsRegisterSharedMetadataAndExclusiveUndoAtomically) {
   const trx_preserve_temp_reservation_owner shared_owner =

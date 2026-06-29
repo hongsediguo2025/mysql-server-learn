@@ -33,10 +33,10 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "clone0clone.h"
 #include "sql/field.h"
 #include "sql/mysqld.h"
-#include "sql/preserve_trx_xid.h"
 #include "sql/rpl_gtid_persist.h"
 #include "sql/sql_class.h"
 #include "sql/sql_thd_internal_api.h"
+#include "trx0preserve.h"
 
 /* To get current session thread default THD */
 THD *thd_get_current_thd();
@@ -193,7 +193,7 @@ bool Clone_persist_gtid::check_gtid_prepare(THD *thd, trx_t *trx,
     must not allocate the XA-prepare GTID persistence slot; the preserved
     binlog/GTID metadata is restored and committed on RESUME.
   */
-  if (trx->xid != nullptr && xid_is_preserve_magic(*trx->xid)) {
+  if (trx->xid != nullptr && trx_preserve_xid_is_magic_active(*trx->xid)) {
     return (false);
   }
   /* Skip GTID if External XA transaction is not in IDLE state. */

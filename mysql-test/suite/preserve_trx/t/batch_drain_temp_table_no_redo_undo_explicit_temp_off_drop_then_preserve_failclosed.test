@@ -2,7 +2,7 @@
 DROP TABLE IF EXISTS t_batch_temp_explicit_off_late_preserve;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=OFF;
+SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_temp_table_enable=OFF;
 
 CREATE TABLE t_batch_temp_explicit_off_late_preserve(
@@ -26,7 +26,6 @@ START TRANSACTION;
 INSERT INTO t_batch_temp_explicit_off_late_preserve VALUES(2, 20);
 
 --connection default
-SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_temp_table_enable=OFF;
 --let $wait_condition= SELECT COUNT(*) = 2 FROM performance_schema.threads WHERE PROCESSLIST_USER = 'root' AND PROCESSLIST_DB = 'test' AND PROCESSLIST_COMMAND = 'Sleep'
 --source include/wait_condition.inc

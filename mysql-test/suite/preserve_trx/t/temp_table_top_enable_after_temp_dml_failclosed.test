@@ -1,8 +1,13 @@
+--source include/force_restart.inc
+
+--let $restart_parameters= restart: --preserve-trx-enable=OFF
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
 --disable_warnings
 DROP TABLE IF EXISTS t_temp_top_enable_after_temp_dml;
 --enable_warnings
 
-SET GLOBAL preserve_trx_enable=OFF;
 SET GLOBAL preserve_trx_temp_table_enable=ON;
 
 CREATE TABLE t_temp_top_enable_after_temp_dml(
@@ -20,13 +25,12 @@ INSERT INTO tmp_temp_top_enable_after_temp_dml VALUES(1, 100);
 UPDATE tmp_temp_top_enable_after_temp_dml SET v = 101 WHERE id = 1;
 
 --connection default
+--error ER_WRONG_ARGUMENTS
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_temp_table_enable=ON;
 
 --connection temp_top_enable_app
 INSERT INTO t_temp_top_enable_after_temp_dml VALUES(1, 10);
---error ER_PRESERVE_TRX_UNSUPPORTED
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
 INSERT INTO t_temp_top_enable_after_temp_dml VALUES(2, 20);
 COMMIT;
 --disconnect temp_top_enable_app
@@ -38,4 +42,7 @@ SELECT COUNT(*) AS preserved_count
 SELECT * FROM t_temp_top_enable_after_temp_dml ORDER BY id;
 
 DROP TABLE t_temp_top_enable_after_temp_dml;
-SET GLOBAL preserve_trx_enable=ON;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=

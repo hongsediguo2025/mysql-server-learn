@@ -169,8 +169,6 @@ die "corrupt snapshot was not cleaned" if -e $snapshot;
 print "snapshot cleaned after corrupt resume\n";
 EOF
 
-SET GLOBAL preserve_trx_enable=OFF;
-
 --perl
 use strict;
 use warnings;
@@ -185,9 +183,20 @@ close($key_fh);
 print "key malformed\n";
 EOF
 
---error ER_WRONG_ARGUMENTS
-SET GLOBAL preserve_trx_enable=ON;
-SELECT @@global.preserve_trx_enable;
+--let $error_log= $MYSQLTEST_VARDIR/log/preserve_trx_key_rotation_malformed.err
+--perl
+use strict;
+use warnings;
+my $path = $ENV{'error_log'} || '';
+unlink $path if $path ne '';
+EOF
+
+--error 1
+--exec $MYSQLD_CMD --validate-config --preserve-trx-enable=ON --log-error=$error_log > $error_log 2>&1
+
+--let SEARCH_FILE= $error_log
+--let SEARCH_PATTERN= preserve_trx_enable=ON requires valid snapshot support
+--source include/search_pattern.inc
 
 --perl
 use strict;
@@ -200,4 +209,8 @@ unlink($key) or die "cannot remove malformed key: $!";
 EOF
 
 DROP USER preserve_key_reader@localhost;
-SET GLOBAL preserve_trx_enable=ON;
+--remove_file $error_log
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=

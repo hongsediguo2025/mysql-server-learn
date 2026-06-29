@@ -174,39 +174,17 @@ int show_preserve_trx_ulonglong_status(ulonglong value, SHOW_VAR *var,
 }  // namespace
 
 bool preserve_trx_sysvar_check_enable(sys_var *, THD *, set_var *var) {
-  if (var->save_result.ulonglong_value == 0) {
-    /*
-      The feature can be disabled only when no preserved token, drain or active
-      resume path depends on its in-memory state. Otherwise disabling the gate
-      would leave existing tokens without their cleanup/recovery machinery.
-    */
-    if (preserved_trx_can_disable_feature()) return false;
+  const bool requested_enabled = var->save_result.ulonglong_value != 0;
+  if (requested_enabled != preserve_trx_is_enabled()) {
     my_error(ER_WRONG_ARGUMENTS, MYF(0),
-             "preserve_trx_enable=OFF while preserve/drain is active");
+             "preserve_trx_enable is a startup-only option");
     return true;
   }
-  if (!preserved_trx_ensure_snapshot_support()) return false;
-  my_error(ER_WRONG_ARGUMENTS, MYF(0), "SET");
-  return true;
+  return false;
 }
 
 bool preserve_trx_sysvar_update_enable(sys_var *, THD *, enum_var_type) {
-  if (!preserve_trx_enable) {
-    /*
-      The update hook repeats the disable check under the runtime transition
-      helper. If the state changed after validation, restore the sysvar to ON
-      and report the same user-visible rejection.
-    */
-    if (!preserved_trx_try_disable_feature_for_update()) {
-      preserve_trx_set_enable_value(true);
-      my_error(ER_WRONG_ARGUMENTS, MYF(0),
-               "preserve_trx_enable=OFF while preserve/drain is active");
-      return true;
-    }
-    return false;
-  }
-
-  preserve_trx_set_enable_value(true);
+  preserve_trx_set_enable_value(preserve_trx_enable);
   return false;
 }
 

@@ -236,6 +236,18 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
 
         self.assertEqual([], [finding.category for finding in findings])
 
+    def test_current_binlog_cache_storage_lease_is_lazy(self):
+        with open("sql/binlog_ostream.h", encoding="utf-8") as source:
+            content = source.read()
+
+        field_position = content.find(
+            "std::shared_ptr<Binlog_cache_warmcopy_lease> m_warmcopy_lease"
+        )
+        self.assertNotEqual(-1, field_position)
+        field_block = content[field_position:content.find("};", field_position)]
+        self.assertNotIn("std::make_shared<Binlog_cache_warmcopy_lease>()",
+                         field_block)
+
     def test_sql_parse_content_rejects_preserve_guard_definition(self):
         findings = invasive_surface.audit_sql_parse_content(
             "class Preserve_trx_inflight_statement_guard { /* sql_parse local */ };"

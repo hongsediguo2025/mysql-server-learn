@@ -1,5 +1,5 @@
+# restart: --preserve-trx-enable=OFF
 DROP TABLE IF EXISTS t_temp_top_enable_after_temp_dml;
-SET GLOBAL preserve_trx_enable=OFF;
 SET GLOBAL preserve_trx_temp_table_enable=ON;
 CREATE TABLE t_temp_top_enable_after_temp_dml(
 id INT PRIMARY KEY,
@@ -13,10 +13,9 @@ START TRANSACTION;
 INSERT INTO tmp_temp_top_enable_after_temp_dml VALUES(1, 100);
 UPDATE tmp_temp_top_enable_after_temp_dml SET v = 101 WHERE id = 1;
 SET GLOBAL preserve_trx_enable=ON;
+ERROR HY000: Incorrect arguments to preserve_trx_enable is a startup-only option
 SET GLOBAL preserve_trx_temp_table_enable=ON;
 INSERT INTO t_temp_top_enable_after_temp_dml VALUES(1, 10);
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
-ERROR HY000: Resumable transactions across shutdown do not support this operation
 INSERT INTO t_temp_top_enable_after_temp_dml VALUES(2, 20);
 COMMIT;
 SELECT COUNT(*) AS preserved_count
@@ -28,4 +27,4 @@ id	v
 1	10
 2	20
 DROP TABLE t_temp_top_enable_after_temp_dml;
-SET GLOBAL preserve_trx_enable=ON;
+# restart: --preserve-trx-enable=ON

@@ -1,6 +1,4 @@
 SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_enable=OFF;
 preserve key binding mismatch
 Pattern "preserve_trx_enable=ON requires valid snapshot support" found
-SET GLOBAL preserve_trx_enable=ON;
-SET GLOBAL preserve_trx_enable=ON;
+# restart: --preserve-trx-enable=ON
