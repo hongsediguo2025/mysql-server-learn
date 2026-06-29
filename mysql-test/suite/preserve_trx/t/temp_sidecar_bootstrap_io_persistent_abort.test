@@ -45,6 +45,7 @@ SHUTDOWN;
 --source suite/preserve_trx/include/wait_for_expected_crash.inc
 --source suite/preserve_trx/include/assert_one_snapshot_file.inc
 
+--source suite/preserve_trx/include/ha_crash_abandon_preserve_artifacts.inc
 --exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc

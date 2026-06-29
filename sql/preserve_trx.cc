@@ -144,6 +144,7 @@ uint preserve_trx_lock_warmcopy_conversion_wait_timeout_ms = 30000;
 uint preserve_trx_parallel_preserve_threads = 0;
 extern ulong srv_force_recovery;
 extern ulong srv_rollback_segments;
+extern bool recv_needed_recovery;
 
 static std::atomic<bool> g_preserve_trx_enable_cached{true};
 static std::atomic<bool> g_preserve_trx_enable_cache_initialized{false};
@@ -207,6 +208,39 @@ constexpr uint16_t kMinReadableUserVariablesVersion = 1;
 constexpr uint16_t kUserVariablesVersion = 2;
 constexpr size_t kUserVariablesHeaderLength = 6;
 constexpr size_t kUserVariableEntryFixedLength = 12;
+
+bool preserved_trx_startup_needed_crash_recovery() {
+  DBUG_EXECUTE_IF("preserve_trx_force_crash_recovery_abandon_guard",
+                  return true;);
+  return recv_needed_recovery;
+}
+
+bool preserved_trx_listing_has_crash_abandon_artifacts(
+    const Preserved_trx_carrier_listing &listing) {
+  return !listing.snapshot_tokens.empty() ||
+         !listing.external_blob_tokens.empty() ||
+         !listing.temp_sidecar_tokens.empty() ||
+         !listing.tainted_tokens.empty() ||
+         !listing.warm_external_blob_artifacts.empty();
+}
+
+bool preserved_trx_crash_recovery_artifacts_forbidden(
+    const Preserved_trx_carrier_listing &listing, const char *phase) {
+  if (!preserved_trx_startup_needed_crash_recovery() ||
+      !preserved_trx_listing_has_crash_abandon_artifacts(listing)) {
+    return false;
+  }
+
+  std::string message =
+      "PRESERVE: crash recovery requires external cleanup of preserved "
+      "transaction artifacts before mysqld starts";
+  if (phase != nullptr && phase[0] != '\0') {
+    message.append(" during ");
+    message.append(phase);
+  }
+  LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
+  return true;
+}
 
 std::atomic<ulonglong> g_warmcopy_prefix_bytes{0};
 std::atomic<ulonglong> g_warmcopy_digest_bytes{0};
@@ -7155,7 +7189,8 @@ static bool rollback_expired_resumable_record_by_reaper(
     auto store =
         create_preserved_trx_default_store(preserve_trx_default_dir());
     const bool taint_failed =
-        store->mark_tainted(token) != Preserve_snapshot_status::OK;
+        store->mark_tainted(token, "expired-token reaper cleanup failure") !=
+        Preserve_snapshot_status::OK;
     if (taint_failed) {
       log_preserved_trx_cleanup_failure(
           token,
@@ -7622,7 +7657,8 @@ static bool restore_batch_record_to_original_thd(
     log_preserved_trx_cleanup_failure(item.token,
                                       "failed to delete snapshot files");
     auto store = create_preserved_trx_default_store(preserve_trx_default_dir());
-    if (store->mark_tainted(item.token) != Preserve_snapshot_status::OK) {
+    if (store->mark_tainted(item.token, "batch stale snapshot delete failure") !=
+        Preserve_snapshot_status::OK) {
       return restore_record_after_failure("failed to mark stale snapshot tainted");
     }
     delete_detached_mdl_context(item.token);
@@ -7840,7 +7876,8 @@ static bool reattach_current_batch_preserve_failure_to_original_thd(
   if (delete_status ==
       Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE) {
     auto store = create_preserved_trx_default_store(preserve_trx_default_dir());
-    if (store->mark_tainted(token) != Preserve_snapshot_status::OK) {
+    if (store->mark_tainted(token, "batch cleanup snapshot delete failure") !=
+        Preserve_snapshot_status::OK) {
       LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
              "Preserved transaction batch cleanup failed to mark stale "
              "snapshot tainted after delete failure");
@@ -8048,7 +8085,7 @@ static bool recover_preserved_snapshot(const std::string &dir,
   }
 
   [[maybe_unused]] auto fail_closed_without_claim = [&](const char *reason) {
-    if (store->mark_tainted(token) != Preserve_snapshot_status::OK) {
+    if (store->mark_tainted(token, reason) != Preserve_snapshot_status::OK) {
       return log_preserved_trx_recovery_failure(
           token, "failed to mark snapshot tainted after recovery failure");
     }
@@ -8235,13 +8272,18 @@ bool preserved_temp_images_bootstrap_preamble() {
     return true;
   }
 
+  if (preserved_trx_crash_recovery_artifacts_forbidden(
+          listing, "temporary tablespace bootstrap")) {
+    return true;
+  }
+
   if (delete_orphan_temp_table_sidecars_or_log(store.store(), listing))
     return true;
 
   auto taint_bootstrap_token_or_warn = [&](const std::string &token,
                                            const std::string &reason) {
     log_preserved_trx_recovery_warning(token, reason);
-    if (store->mark_tainted(token) != Preserve_snapshot_status::OK) {
+    if (store->mark_tainted(token, reason) != Preserve_snapshot_status::OK) {
       (void)log_preserved_trx_cleanup_failure(
           token, "failed to mark snapshot tainted during temporary tablespace "
                  "bootstrap");
@@ -8497,6 +8539,12 @@ bool preserved_trx_recover_all() {
   std::set<std::string> tainted_tokens = listing.tainted_tokens;
   std::set<std::string> warm_external_blob_artifacts =
       listing.warm_external_blob_artifacts;
+
+  if (preserved_trx_crash_recovery_artifacts_forbidden(
+          listing, "preserved transaction recovery")) {
+    preserved_trx_mark_recovery_complete();
+    return true;
+  }
 
   if (srv_force_recovery > 0) {
     if (!snapshot_tokens.empty() || !binlog_cache_tokens.empty()) {
@@ -9847,7 +9895,8 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       if (delete_failed) {
         auto store =
             create_preserved_trx_default_store(preserve_trx_default_dir());
-        if (store->mark_tainted(token) != Preserve_snapshot_status::OK) {
+        if (store->mark_tainted(token, "snapshot write cleanup failure") !=
+            Preserve_snapshot_status::OK) {
           log_preserved_trx_cleanup_failure(
               token,
               "failed to taint snapshot after snapshot write cleanup failure");

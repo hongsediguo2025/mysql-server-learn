@@ -29,6 +29,7 @@ PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
 --disable_reconnect
 
 --source suite/preserve_trx/include/get_preserved_token.inc
+--let PRESERVE_TRX_DIR= `SELECT @@global.preserve_trx_dir`
 --file_exists $PRESERVED_SNAPSHOT_FILE
 
 SET SESSION debug="+d,preserve_trx_crash_after_resume_activate_before_snapshot_delete";
@@ -40,6 +41,7 @@ SET SESSION debug="+d,preserve_trx_crash_after_resume_activate_before_snapshot_d
 
 --source include/wait_until_disconnected.inc
 
+--source suite/preserve_trx/include/ha_crash_abandon_preserve_artifacts.inc
 --exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc

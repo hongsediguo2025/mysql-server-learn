@@ -1372,7 +1372,7 @@ die "batch reattach attached-detach failure must restore token or terminate afte
      /else\s*\{\s*thd_state_guard\.dismiss\s*\(\s*\)\s*;\s*return true\s*;\s*\}/s;
 die "batch restore delete-before-unlink cleanup failure after activation must taint the stale snapshot\n"
   unless $wi29_batch_restore =~
-         /ERROR_BEFORE_SNAPSHOT_DELETE[\s\S]*mark_tainted\s*\(\s*item\.token\s*\)/s;
+         /ERROR_BEFORE_SNAPSHOT_DELETE[\s\S]*mark_tainted\s*\(\s*item\.token\s*,\s*"[^"]+"\s*\)/s;
 die "batch restore delete-after-unlink cleanup failure must clear the target batch state\n"
   unless $wi29_batch_restore =~
          /ERROR_AFTER_SNAPSHOT_DELETE[\s\S]*preserve_trx_set_batch_state\s*\(\s*thd\s*,\s*0\s*,\s*Preserve_trx_batch_thd_state::NONE\s*\)/s;
@@ -1389,10 +1389,10 @@ die "current batch cleanup must activate reattached undo state before durable sn
          $wi29_current_activate_pos < $wi29_current_delete_pos;
 die "current batch cleanup snapshot delete-before-unlink failure after activation must taint the stale snapshot\n"
   unless $wi29_current_reattach =~
-         /ERROR_BEFORE_SNAPSHOT_DELETE[\s\S]*mark_tainted\s*\(\s*token\s*\)/s;
+         /ERROR_BEFORE_SNAPSHOT_DELETE[\s\S]*mark_tainted\s*\(\s*token\s*,\s*"[^"]+"\s*\)/s;
 die "current batch cleanup snapshot delete-before-unlink failure must restore SQL transaction state before returning to the app session\n"
   unless $wi29_current_reattach =~
-         /ERROR_BEFORE_SNAPSHOT_DELETE[\s\S]*mark_tainted\s*\(\s*token\s*\)[\s\S]*reset_preserve_xid_to_active_transaction_xid\s*\(\s*thd\s*\)[\s\S]*preserve_trx_set_batch_state\s*\(\s*thd\s*,\s*0\s*,\s*Preserve_trx_batch_thd_state::NONE\s*\)/s;
+         /ERROR_BEFORE_SNAPSHOT_DELETE[\s\S]*mark_tainted\s*\(\s*token\s*,\s*"[^"]+"\s*\)[\s\S]*reset_preserve_xid_to_active_transaction_xid\s*\(\s*thd\s*\)[\s\S]*preserve_trx_set_batch_state\s*\(\s*thd\s*,\s*0\s*,\s*Preserve_trx_batch_thd_state::NONE\s*\)/s;
 die "current batch cleanup snapshot delete-after-unlink failure must not keep the target drained\n"
   unless $preserve =~
          /restored_active_to_original_thd[\s\S]*unresolved_detached_state[\s\S]*must_keep_target_drained\s*=\s*!m_error\s*\|\|\s*unresolved_detached_state/s;
@@ -1479,7 +1479,7 @@ die "Slice 2 snapshot-failure cleanup must use unified token removal, not direct
   unless $preserve =~
          /reject_after_snapshot_failure[\s\S]*delete_preserved_snapshot_files_and_sidecars_or_log\s*\(\s*preserve_trx_default_dir\(\)\s*,\s*token\s*,\s*&metadata\s*\)/s &&
          $preserve =~
-         /reject_after_snapshot_failure[\s\S]*store->mark_tainted\s*\(\s*token\s*\)/s &&
+         /reject_after_snapshot_failure[\s\S]*store->mark_tainted\s*\(\s*token\s*,\s*"[^"]+"\s*\)/s &&
          $preserve !~
          /reject_after_snapshot_failure[\s\S]*write_failure_delete_status\s*==\s*Preserve_snapshot_delete_status::OK[\s\S]*delete_snapshot_files/s &&
          $preserve !~

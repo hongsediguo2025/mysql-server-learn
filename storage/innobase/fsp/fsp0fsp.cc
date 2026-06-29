@@ -684,6 +684,13 @@ page_no_t xdes_get_offset(const xdes_t *descr) /*!< in: extent descriptor */
               FSP_EXTENT_SIZE));
 }
 
+/*
+  Find a free fragment page while honoring preserved temp-page reservations.
+  When no reservation is active this is the original xdes_find_bit() lookup.
+  The reservation-aware scan is used only for the system temporary tablespace,
+  where a preserved token may still own no-redo undo pages that look free in
+  the freshly restarted allocator.
+*/
 static page_no_t xdes_find_free_bit_for_temp_preserve(
     space_id_t space_id, xdes_t *descr, page_no_t hint, bool scan_down,
     mtr_t *mtr) {
@@ -710,6 +717,12 @@ static page_no_t xdes_find_free_bit_for_temp_preserve(
   return (FIL_NULL);
 }
 
+/*
+  Locate a FREE_FRAG extent with at least one non-reserved page.  A preserved
+  token can reserve sparse pages in otherwise reusable extents; this helper lets
+  ordinary temporary-table allocation skip those holes instead of consuming a
+  page that resume still has to claim.
+*/
 static xdes_t *fsp_find_free_frag_for_temp_preserve(
     space_id_t space_id, const page_size_t &page_size, fsp_header_t *header,
     page_no_t hint, page_no_t *free, mtr_t *mtr) {
@@ -1747,6 +1760,11 @@ static MY_ATTRIBUTE((warn_unused_result)) buf_block_t *fsp_alloc_free_page(
   header = fsp_get_space_header(space, page_size, mtr);
 
   if (fsp_temp_preserve_page_reservation_active(space)) {
+    /*
+      Preserve reservations are rare and scoped to restart/resume windows.  Keep
+      the normal allocation path byte-for-byte local below; only when a
+      reservation is active do we scan FREE_FRAG while skipping reserved pages.
+    */
     descr = fsp_find_free_frag_for_temp_preserve(space, page_size, header, hint,
                                                  &free, mtr);
 
@@ -1921,6 +1939,11 @@ static void fsp_free_page(const page_id_t &page_id,
   xdes_set_bit(descr, XDES_FREE_BIT, bit, TRUE, mtr);
   xdes_set_bit(descr, XDES_CLEAN_BIT, bit, TRUE, mtr);
   if (fsp_is_system_temporary(page_id.space())) {
+    /*
+      A page released by native undo cleanup no longer belongs to the preserved
+      token. Drop the reservation at the same point the FSP bitmap marks it
+      free, so ordinary temporary allocation can reuse it afterwards.
+    */
     trx_preserve_temp_space_image_release_page_reservation(
         static_cast<uint32_t>(page_id.space()),
         static_cast<uint32_t>(page_id.page_no()));

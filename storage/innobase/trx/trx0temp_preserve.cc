@@ -117,6 +117,19 @@ std::unordered_map<uint32_t,
                    std::unique_ptr<trx_preserve_temp_space_image_descriptor>>
     trx_preserve_temp_attached_fil_space_descriptors;
 std::set<uint32_t> trx_preserve_temp_last_evicted_drop_space_ids;
+/*
+  Reservation registries protect no-redo temporary undo that belongs to a
+  preserved token but is not yet owned by a live trx_undo_t after restart.
+
+  - page reservations keep the FSP/fseg allocator from reusing exact undo pages;
+  - slot reservations keep trx_undo_seg_create() and cached undo reuse away from
+    rollback-segment slots that RESUME may adopt;
+  - the rseg bootstrap map records which temporary rollback segment slots must
+    exist before normal temp-rseg creation can safely proceed.
+
+  The active counters are the hot-path guard: when they are zero, allocator-side
+  queries return without taking this mutex or touching the maps.
+*/
 std::mutex trx_preserve_temp_no_redo_undo_reservations_mutex;
 
 struct trx_preserve_temp_page_reservation_key {

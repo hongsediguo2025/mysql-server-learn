@@ -69,6 +69,7 @@ my $image = File::Spec->catfile($datadir, 'preserve',
 chmod 0600, $image or die "cannot restore image sidecar permissions: $!";
 EOF
 
+--source suite/preserve_trx/include/ha_crash_abandon_preserve_artifacts.inc
 --exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=OFF" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc

@@ -12,6 +12,7 @@ SET GLOBAL preserve_trx_enable=ON;
 --disable_query_log
 CALL mtr.add_suppression("Failed to scan preserved transaction directory .* during recovery");
 CALL mtr.add_suppression("PRESERVE: recovery failed before InnoDB background threads could start");
+CALL mtr.add_suppression("PRESERVE: rolled back prepared transaction without snapshot during recovery");
 CALL mtr.add_suppression("Assertion failure: ha_innodb.cc:.*ib::fatal triggered");
 CALL mtr.add_suppression("\\[FATAL\\] Error in DDL Log recovery during Post-Recovery processing");
 CALL mtr.add_suppression("Assertion failure: ut0ut.cc:.*");
@@ -43,17 +44,14 @@ PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
 --source suite/preserve_trx/include/wait_for_expected_crash.inc
 --source suite/preserve_trx/include/assert_one_snapshot_file.inc
 
+--source suite/preserve_trx/include/ha_crash_abandon_preserve_artifacts.inc
 --exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
 
---source suite/preserve_trx/include/get_preserved_token.inc
-
---replace_result $preserved_token TOKEN
---eval RESUME PRESERVED TRANSACTION '$preserved_token'
-
-COMMIT;
+SELECT COUNT(*) AS remaining_preserved
+  FROM performance_schema.preserved_transactions;
 SELECT * FROM t_recover_scan_failure ORDER BY a;
 
 DROP TABLE t_recover_scan_failure;

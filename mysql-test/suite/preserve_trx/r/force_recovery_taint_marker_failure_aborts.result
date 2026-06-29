@@ -12,12 +12,10 @@ include/wait_for_expected_crash.inc [safe_process]
 SELECT COUNT(*) AS preserved_count_after_failed_taint
 FROM performance_schema.preserved_transactions;
 preserved_count_after_failed_taint
-1
-RESUME PRESERVED TRANSACTION 'TOKEN';
-COMMIT;
+0
 SELECT * FROM t_force_recovery_taint_fail ORDER BY a;
 a	b
-1	11
+1	10
 SELECT COUNT(*) AS preserved_count_after_resume_commit
 FROM performance_schema.preserved_transactions;
 preserved_count_after_resume_commit

@@ -17,9 +17,7 @@ include/wait_for_expected_crash.inc [safe_process]
 SELECT COUNT(*) AS recovered_count
 FROM performance_schema.preserved_transactions;
 recovered_count
-1
-RESUME PRESERVED TRANSACTION 'TOKEN';
-ROLLBACK;
+0
 SELECT COUNT(*) AS remaining_preserved
 FROM performance_schema.preserved_transactions;
 remaining_preserved

@@ -75,7 +75,7 @@ Preserve/Resume 的目标是在受控停机或主备切换过程中，把仍未�
 
 ### 2.5 当前实现与目标版本边界
 
-本文档描述的是用户临时表 DML Preserve/Resume 的目标实现和当前分支实现之间的对照。当前 HEAD 已经具备 phase 1 sidecar prebuild、ownership claim 编解码、startup page/slot reservation registry、exact FSEG claim、native-owned no-redo undo reconnect、post-resume temp DML 正向路径和 20 sessions x 200MiB E2E 证据；尚未完全闭环的是独立 durable activation ledger/tombstone、activation 后 cleanup/crash 窗口的最终状态机，以及更细粒度的长期异常/资源趋势报告。
+本文档描述的是用户临时表 DML Preserve/Resume 的目标实现和当前分支实现之间的对照。当前 HEAD 已经具备 phase 1 sidecar prebuild、ownership claim 编解码、startup page/slot reservation registry、exact FSEG claim、native-owned no-redo undo reconnect、post-resume temp DML 正向路径和 20 sessions x 200MiB E2E 证据。当前发布边界明确限定为计划内 shutdown/preserve/resume；如果 mysqld 发生非计划崩溃，外部 HA 必须在重启 mysqld 前清理 preserve artifacts，使实例走原生 crash recovery 和事务回滚，不再 resume 旧 token。独立 durable activation ledger/tombstone 仅属于未来“崩溃后仍可审计/续恢复 token”的增强方向，不作为当前 planned-shutdown 能力的上线前置。
 
 | 能力 | 当前实现边界 | 目标版本行为 | 发布门禁 |
 |---|---|---|---|
@@ -85,10 +85,10 @@ Preserve/Resume 的目标是在受控停机或主备切换过程中，把仍未�
 | phase 1 ownership manifest | 当前 manifest 已包含 ownership claims 并以缺失 ownership claim 区分 legacy/restored-only | page/fseg/slot/segment 的可验证 ownership manifest | manifest GUnit、旧格式兼容测试 |
 | phase 2 约 1s 目标 | phase 1 prebuild 已把 image/undo 大对象工作移出 phase 2；仍需确保所有 fallback/SLO reason 语义准确 | phase 1 完成 baseline、dirty overlay、undo sidecar、checksum/fsync；phase 2 只做 tail seal；1s 左右为目标，2s 为可接受上界 | phase2 breakdown 与 20x200MiB NFR |
 | 临时表 DDL/savepoint/statement rollback | 当前主要覆盖成功 DDL/部分边界，attempt 级 DDL、savepoint-before-temp-DML、pre-engine in-flight marker 仍是目标缺口 | capture epoch 内任何相关不确定语义触发 unsupported marker | source-shape lint 与负向 MTR |
-| activation ledger / consumed token | 当前 carrier 能列出 snapshot、blob、temp sidecar 和 taint，但没有“已激活但 cleanup 未完成”的 durable token 状态 | resume claim、activation、cleanup、taint 都由 carrier-backed ledger/tombstone 表达 | activation 前后 crash FI 与二次 resume 拒绝 |
-| release gate 证据 | 已有 adoption-enabled post-resume DML、preserve_trx 全量 MTR、GUnit、20x200MiB strict 2s E2E 证据；仍需长期 crash/soak 与 activation ledger 后的最终门禁 | adoption-enabled post-resume DML 成功、temp tail-only 指标、真实 20x200MiB 报告同时满足 | release gate 不允许用保护测试替代正向能力测试 |
+| crash-abandon / consumed token | 当前 carrier 能列出 snapshot、blob、temp sidecar 和 taint；crash restart 依赖 HA 在 mysqld 启动前删除 preserve artifacts，mysqld 侧有 startup guard 防止残留 snapshot 被误恢复 | planned shutdown 路径内 resume 成功后清理 token；非计划 crash 后不 resume 旧 token，而是走原生 crash recovery/rollback | HA cleanup helper、startup guard、activate-before-delete crash MTR |
+| release gate 证据 | 已有 adoption-enabled post-resume DML、preserve_trx 全量 MTR、GUnit、20x200MiB strict 2s E2E 证据；仍需长期 crash-abandon/soak 与资源趋势报告 | adoption-enabled post-resume DML 成功、temp tail-only 指标、真实 20x200MiB 报告同时满足 | release gate 不允许用保护测试替代正向能力测试 |
 
-因此，`preserve_trx_temp_table_enable=ON` 当前已经可以覆盖 native-capable 用户临时表 DML 主路径，但生产级发布口径仍必须受 activation/crash/cleanup、长期稳定性和 `preserve_trx_enable=OFF` 隔离门禁约束。
+因此，`preserve_trx_temp_table_enable=ON` 当前已经可以覆盖 native-capable 用户临时表 DML 主路径，但生产级发布口径仍必须受 planned-shutdown 边界、crash-abandon cleanup、长期稳定性和 `preserve_trx_enable=OFF` 隔离门禁约束。
 
 ## 3. 支持范围与明确不支持范围
 
@@ -283,10 +283,10 @@ candidate/final 分类必须通过 carrier 可见的 metadata 表达，而不是
 
 - `TEMP_CANDIDATE`: phase 1 生成、尚未被 snapshot 引用，只允许 owner epoch cleanup。
 - `TEMP_FINAL_REFERENCED`: 已被 durable snapshot 引用，可作为 startup reservation 输入。
-- `TEMP_CONSUMED_CLEANUP_PENDING`: token 已进入 activation 或 cleanup，不能再作为可 resume token。
+- `TEMP_ABANDON_CANDIDATE`: crash-abandon cleanup 可删除的 preserve artifact；该状态只在外部 HA cleanup helper 里使用，mysqld 正常 planned-shutdown recovery 不应把它当作可 resume token state。
 - `TEMP_ORPHAN_UNVERIFIED`: owner marker、checksum 或 snapshot 引用关系无法证明，禁止自动删除。
 
-这些状态可以由独立 candidate manifest artifact、final descriptor 或 activation ledger 组合表达，但必须被 startup/recovery 统一识别。不能新增一个 recovery 不扫描的私有目录或私有格式。
+这些状态可以由独立 candidate manifest artifact、final descriptor 或 crash-abandon helper 的 artifact classifier 表达，但必须被 startup/recovery 或 HA cleanup 统一识别。不能新增一个 recovery 不扫描、cleanup 不认识的私有目录或私有格式。
 
 ## 6. Ownership Manifest
 
@@ -377,7 +377,7 @@ Preserved_temp_no_redo_ownership_manifest
 
 `expected_trx_undo_no` 是事务全局值，不能在每个 segment 中各自维护一个 after 值。每个 undo segment 只记录自己的 `top_undo_no`；解析时计算所有 insert/update undo 的 `max(top_undo_no) + 1`，并与全局 `expected_trx_undo_no` 比对。若二者不一致，说明 manifest 与事务级 undo 序列不一致，必须 fail closed。
 
-`proposed_or_source_segment_id` 与 `adopted_segment_id` 必须区分。phase 1 在源端构建 manifest 时只能记录源端或候选 segment id；真正的 `adopted_segment_id` 只有在目标端 adoption mtr 中成功分配或认领后才成立，并应写入 activation ledger。实现可以选择复用源端 segment id，但必须经过目标端 `FSP_SEG_ID` high-water 与 XDES/FSEG 冲突检测，不能把 source id 直接当成已采用的 target id。
+`proposed_or_source_segment_id` 与 `adopted_segment_id` 必须区分。phase 1 在源端构建 manifest 时只能记录源端或候选 segment id；真正的 `adopted_segment_id` 只有在目标端 adoption mtr 中成功分配或认领后才成立，并应写入 adoption result / in-memory reservation owner，用于后续 native cleanup 与诊断。实现可以选择复用源端 segment id，但必须经过目标端 `FSP_SEG_ID` high-water 与 XDES/FSEG 冲突检测，不能把 source id 直接当成已采用的 target id。
 
 ### 6.1 manifest 的作用
 
@@ -520,7 +520,7 @@ no-redo undo slot key 依赖 `{rseg_space_id,rseg_page_no,rseg_id,undo_slot}`，
 - 保留 snapshot/sidecar 供人工诊断或后续 cleanup。
 - 不允许普通 allocator 使用这些 pages 或 undo slots，除非管理员显式清理相关 preserved records。
 
-`RESERVATION_CONFLICT` 与 `CLEANUP_TAINTED` 不是同一种状态。前者表示 startup 阶段无法建立唯一 ownership，事务从未被安全激活；后者表示事务可能已经被激活或 cleanup 过程中出现残留，需要按 activation ledger 的 cleanup/audit 规则处理。
+`RESERVATION_CONFLICT` 与 `CLEANUP_TAINTED` 不是同一种状态。前者表示 startup 阶段无法建立唯一 ownership，事务从未被安全激活；后者表示 planned-shutdown 路径内 cleanup 过程中出现残留，需要通过 preserved record、taint marker 和错误原因做 cleanup/audit。非计划 crash 后不沿用 `CLEANUP_TAINTED` 继续 resume；HA 必须先执行 crash-abandon cleanup。
 
 ### 7.4 reservation 与 durable snapshot 的关系
 
@@ -844,7 +844,7 @@ preserved record / token claim
   -> trx undo/rseg mutex and undo slot claim
   -> mtr latches for rseg header, fseg inode, XDES/FSP pages
   -> SQL TABLE / THD attach
-  -> snapshot cleanup / ledger update
+  -> snapshot cleanup / taint marker on planned-path failure
 ```
 
 fil space reference pin 可以在进入 engine 临界区前完成，但不能持有会与 rseg/trx 路径反向等待的 page/space latch。任何需要调用外部文件 I/O、checksum 或并行 worker join 的步骤，都应在不持有 InnoDB page/space latch、rseg mutex 或 trx mutex 的区域完成。phase 2 和 resume worker 只能在锁外完成 sidecar body read/digest，再进入短临界区做 adoption。
@@ -885,64 +885,14 @@ staged adoption 的回滚顺序必须与写入顺序相反，不能只清理内�
 - token 必须进入 consumed-or-activated 语义：startup/recovery 不能再把同一个 token 当作未激活事务重复恢复。
 - 若 snapshot/sidecar 删除失败，保留可观测 taint 记录和已激活事务关联；后续只能做 cleanup/audit，不能再次 claim 该 token。
 
-这里的 consumed-or-activated 不能只依赖内存状态。目标实现必须有 durable activation ledger 或等价 tombstone，至少表达如下状态：
+当前版本不把 activation 后的非计划 crash 作为“继续 resume 同一 token”的支持场景。原因是 Preserve/Resume 的产品边界是计划内运维：HA 或管控面知道本次启动属于 crash restart 时，应在 mysqld 启动前调用 crash-abandon cleanup，删除 preserve snapshot、binlog cache、temp sidecar、blob、warmcopy artifact 和 taint 临时文件。随后 mysqld 只执行原生 InnoDB crash recovery，尚未提交的事务按原生规则回滚。
 
-```text
-Temp_preserve_activation_ledger
-  token
-  manifest_digest
-  activation_epoch
-  state:
-    CLAIMED_STAGING
-    ACTIVATING
-    ACTIVATED
-    CLAIMED_NATIVE_OWNED
-    HISTORY_PENDING
-    PURGE_PENDING
-    CLEANUP_DONE
-    CLEANUP_TAINTED
-  activated_trx_id
-  adopted_page_count
-  adopted_undo_slot_count
-  cleanup_error
-```
+这个选择把 durable activation ledger 从当前上线前置中移除，但增加两个硬要求：
 
-推荐 ordering：
+1. 外部 HA cleanup 必须在 mysqld 进程启动前完成，不能等 `preserved_trx_recover_all()` 扫描到 snapshot 后再删除。
+2. mysqld startup guard 必须在检测到 crash recovery 需要执行且 preserve artifacts 仍存在时 fail closed，拒绝继续把旧 snapshot 当作合法 token 恢复。
 
-1. claim token 后写 `CLAIMED_STAGING`，表示已有 resume 过程持有该 token，但事务尚未对用户可见。
-2. allocator adoption 全部完成、准备把事务挂到 THD 前写 `ACTIVATING`。
-3. SQL 层完成 THD/trx/table 绑定并允许用户继续执行前写 `ACTIVATED`。
-4. 在删除或 unlink snapshot/token 文件前，先写 cleanup tombstone 或更新 ledger 到可恢复状态，使 startup 能知道该 token 已进入 consumed-or-activated 语义。
-5. native adoption 完成后写 `CLAIMED_NATIVE_OWNED` 或在 `ACTIVATED` 中记录等价子状态，表示 page 已归原生 allocator 管理，但不代表已释放。
-6. update undo 进入 history/purge 生命周期时记录 `HISTORY_PENDING` 或 `PURGE_PENDING`，直到原生 free/truncate 事件释放对应 page/slot。
-7. token snapshot 和 sidecar cleanup 成功，且所有必须释放的 reservation 已达到 `Released` 或已被 ledger 证明由 native purge 后续负责时，写 `CLEANUP_DONE`。
-8. cleanup 失败、reservation release 不完整或 native lifecycle 状态无法证明时写 `CLEANUP_TAINTED`，保留 token、manifest digest、adopted page/slot 数量和错误码。
-
-ledger 本身必须是 carrier-backed durable artifact，写入规则与 snapshot publish 同级别保守：
-
-- temp file 写入完整 record。
-- fsync file。
-- atomic rename 到 ledger final path。
-- fsync parent directory。
-- startup 只承认 checksum、length、manifest digest、token 都匹配的 ledger record。
-- ledger 与 snapshot 同时存在且状态冲突时，按 fail-closed 处理，不得选择性相信较新的 mtime。
-
-carrier contract 必须显式扩展，而不是只在 resume 代码旁路读写 ledger 文件：
-
-- `list_tokens()` 或等价 listing 需要返回 snapshot、temp final sidecar、candidate artifact、activation ledger、cleanup tombstone 的分类。
-- token state 需要能表达 `RESUMABLE`、`CLAIMED_STAGING`、`ACTIVATING`、`ACTIVATED_CLEANUP_PENDING`、`CLAIMED_NATIVE_OWNED`、`HISTORY_PENDING`、`PURGE_PENDING`、`CLEANUP_DONE`、`CLEANUP_TAINTED`、`RESERVATION_CONFLICT`。
-- startup orphan cleanup 必须先读取 ledger 和 snapshot 引用关系，再决定 candidate/final sidecar 是否可删。
-- resume claim 必须在写入 `CLAIMED_STAGING` 并 fsync 后才进入 allocator adoption，避免两个 session 同时 claim 同一 token。
-- activation 后 snapshot delete 失败不能只打印 warning；必须留下 carrier 可观测的 cleanup pending/tainted 状态。
-
-startup/recovery 规则：
-
-- startup 应先加载 activation ledger/tombstone，再恢复可 resume snapshot 列表，然后做 orphan sidecar cleanup。否则可能先把已激活但 cleanup 未完成的 token 当作可 resume token，或者把仍需审计的 sidecar 当 orphan 删除。
-- 看到 `ACTIVATED`、`CLAIMED_NATIVE_OWNED`、`HISTORY_PENDING`、`PURGE_PENDING`、`CLEANUP_DONE` 或 `CLEANUP_TAINTED` 时，不能把同一 token 当作可 resume token 再次 claim。`CLEANUP_TAINTED` 只允许 cleanup/audit。
-- 看到 `CLAIMED_STAGING` 或 `ACTIVATING` 且没有 live owner 进程时，按 adoption 前或 activation 中失败处理：释放 staged reservation，保留 snapshot/sidecar，并把 preserved record 置为 retryable failure。
-- 看到 snapshot 存在但没有 ledger 时，按未 claim token 处理。
-
-snapshot 与 sidecar cleanup 必须是最后阶段，或者在删除 snapshot 前先写可独立恢复的 cleanup tombstone。不能先删除 snapshot，再依赖内存 record 解释 adopted page 与 token 的关系。
+计划内路径内仍要保留现有 fail-closed/taint 语义：如果 resume 过程中 cleanup 失败但 mysqld 未崩溃，内存 preserved record、taint marker 和错误原因必须可观测；如果 cleanup 成功，snapshot 与 sidecar 被删除，token 不再可 resume。未来如果要支持“非计划 crash 后继续审计或续恢复已激活 token”，需要重新引入 carrier-backed durable activation ledger 或等价 tombstone，并明确定义 `CLAIMED_STAGING`、`ACTIVATING`、`ACTIVATED`、`CLEANUP_TAINTED` 等状态。
 
 ### 11.3 crash 窗口
 
@@ -955,7 +905,7 @@ snapshot 与 sidecar cleanup 必须是最后阶段，或者在删除 snapshot �
 - resume 已 claim token，allocator adoption 部分完成，事务未激活。
 - 事务已激活，token cleanup 未完成。
 
-每个窗口的原则是：不能双分配 page，不能丢 token，不能把部分恢复事务暴露给用户。
+前四类发生在 preserve artifact publish/recovery 边界内，原则是不能双分配 page，不能丢 token，不能把部分恢复事务暴露给用户。后两类属于 resume 过程中 mysqld 非计划崩溃：当前版本按 crash-abandon contract 处理，HA 在重启前删除 preserve artifacts，mysqld 通过原生 crash recovery 回滚未提交事务；如果 HA 漏删 artifacts，startup guard 必须阻止旧 snapshot 被扫描恢复。
 
 ## 12. 参数与隔离
 
@@ -1053,7 +1003,8 @@ source-shape lint 需要显式检查：
 - temp preserve SLO miss reason。
 - temp preserve fail-closed reason。
 - temp resume native-adopted undo count。
-- temp resume activation ledger state。
+- temp resume cleanup/taint state。
+- crash-abandon cleanup artifacts removed / errors。
 - temp cleanup tainted token count。
 - temp reservation active count。
 - temp page reservation conflict count。
@@ -1099,7 +1050,8 @@ P_S/SHOW 层的状态也要区分当前保护路径与目标 adoption 路径。�
 - staged adoption rollback：undo header、FSEG inode、XDES、undo slot、page reservation 的反序回滚。
 - structured materialization：undo semantic bytes preserved，allocator metadata 不直接复制源全局页。
 - cleanup：adoption 前失败释放 staged claim；activation 后按 `ClaimedNativeOwned`、`HistoryPending/PurgePending`、`Released` 推进。
-- durable activation ledger：`CLAIMED_STAGING`、`ACTIVATING`、`ACTIVATED`、`CLAIMED_NATIVE_OWNED`、`HISTORY_PENDING`、`PURGE_PENDING`、`CLEANUP_DONE`、`CLEANUP_TAINTED` 的 startup 恢复规则。
+- crash-abandon helper artifact classification：snapshot、binlog cache、temp sidecar、blob、warmcopy artifact、taint temp file 全部可删除，非 preserve 原生文件不得删除。
+- startup crash guard：需要 InnoDB crash recovery 且 preserve artifacts 仍存在时 fail closed，不能继续 recover preserved token。
 - startup reservation：只登记 durable snapshot 引用的 final manifest，且在普通 temp allocator 可分配前解析到有界 page/slot claim 列表。
 - source-shape lint：热路径无 sidecar 编码、无大字符串、无文件 I/O，reservation lookup 有 active-count 快速返回。
 
@@ -1152,10 +1104,9 @@ release gate 只能使用第二类 adoption-enabled 正向用例。第一类 rej
 - crash during exact page adoption。
 - crash after adoption before transaction activation。
 - crash after activation before token cleanup。
-- torn/partial activation ledger write。
-- cleanup tombstone written before/after snapshot unlink 的双向故障注入。
-- startup 看到 ledger 与 snapshot 冲突时 fail-closed。
-- startup 看到 activation ledger 为 `ACTIVATED_CLEANUP_PENDING` 且 snapshot 仍存在时，不能二次 resume，只允许 cleanup/audit。
+- crash-abandon cleanup helper 漏删/误删矩阵：漏删 preserve artifact 时 mysqld startup guard fail closed；误删 native InnoDB 文件必须由脚本单测阻止。
+- activate-before-delete crash：普通 snapshot、binlog-cache snapshot、temp sidecar snapshot 都必须在 HA cleanup 后正常启动，且旧 token 不再 resume。
+- HA 未执行 cleanup 的 crash restart：startup guard 必须拒绝旧 snapshot 进入 preserved recovery。
 - candidate finalize 前后崩溃：未被 snapshot 引用的 candidate 不得登记 reservation；已被 snapshot 引用的 final sidecar 不得被 orphan cleanup 删除。
 
 ### 16.5 E2E 与 NFR
@@ -1183,7 +1134,7 @@ release gate 只能使用第二类 adoption-enabled 正向用例。第一类 rej
 
 ## 17. 实施顺序
 
-截至当前 HEAD，Slice 1/2/3/4/5/6/7 的主路径已经落地并有 GUnit、MTR、E2E 证据：startup preamble 会在普通 temp rseg 调整前解析 durable manifest、读取 sealed no-redo undo sidecar、注册 page/slot reservation，并把 rseg bootstrap identity 交给 InnoDB。Slice 8 中 cleanup taint 和 retry cleanup 已有现有机制覆盖，独立 activation ledger/tombstone 仍是发布前需要明确取舍或补齐的缺口。本节保留为开发路线图，阅读时应按“已落地主路径 + 剩余上线门禁”理解，而不是从零开始的计划。
+截至当前 HEAD，Slice 1/2/3/4/5/6/7 的主路径已经落地并有 GUnit、MTR、E2E 证据：startup preamble 会在普通 temp rseg 调整前解析 durable manifest、读取 sealed no-redo undo sidecar、注册 page/slot reservation，并把 rseg bootstrap identity 交给 InnoDB。Slice 8 当前采用 planned-shutdown + crash-abandon contract：cleanup taint 和 retry cleanup 覆盖计划内失败；非计划 crash 由 HA 在 mysqld 启动前清理 preserve artifacts，mysqld guard 防止旧 snapshot 被误恢复。独立 activation ledger/tombstone 是未来 crash-resumable/审计增强，不是当前 planned-shutdown 能力的发布前置。本节保留为开发路线图，阅读时应按“已落地主路径 + 当前上线边界 + 后续增强”理解，而不是从零开始的计划。
 
 ### Slice 1：测试与 guard 先行
 
@@ -1248,13 +1199,14 @@ release gate 只能使用第二类 adoption-enabled 正向用例。第一类 rej
 - resume 后执行新的 temp DML，并验证 native undo append/free。
 - 将 post-resume write reject 测试拆分为 manifest/GUnit 的 restored-only reject 边界，以及 MTR 的 adoption-enabled COMMIT/ROLLBACK 正向路径。
 
-### Slice 8：cleanup、retry 与 crash recovery
+### Slice 8：cleanup、retry 与 crash-abandon
 
 - 完成 adoption 前失败、activation 后失败、token cleanup、reservation release。
-- 完成 consumed-or-activated token 语义，避免 activation 后 snapshot cleanup 失败导致 token 被二次恢复。
-- activation ledger 使用 carrier-backed atomic write/fsync/rename/dir-fsync；删除 snapshot 前先写 cleanup tombstone。
-- 扩展 carrier listing/token state，使 startup 能识别 candidate、final sidecar、activation ledger、cleanup taint，并按 ledger 优先级做 recovery。
-- fault injection 覆盖所有 durable transition。
+- 计划内失败使用现有 preserved record、taint marker 和 retry cleanup 表达，不能静默丢失 root cause。
+- 新增 HA crash-abandon cleanup helper：在 crash restart 前删除 snapshot、binlog cache、temp sidecar、blob、warmcopy artifact 和 taint 临时文件。
+- mysqld startup guard 在需要 crash recovery 且 preserve artifacts 仍存在时 fail closed，避免旧 snapshot 被误恢复。
+- activate-before-delete crash FI 覆盖普通 snapshot、binlog-cache snapshot 和 temp sidecar snapshot；测试必须显式执行 HA cleanup 后再重启。
+- 如果未来要支持 crash 后继续审计/续恢复已激活 token，再扩展 carrier-backed activation ledger/tombstone；该能力不混入当前 planned-shutdown v1。
 
 ### Slice 9：全量回归与性能门禁
 

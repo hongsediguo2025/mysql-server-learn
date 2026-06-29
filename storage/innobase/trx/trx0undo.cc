@@ -382,6 +382,13 @@ static void trx_undo_page_init(
 }
 
 #ifndef UNIV_HOTBACKUP
+/*
+  Preserve/resume reserves no-redo undo slots that belong to a durable token.
+  The live temporary rseg header may show those slots as free after restart, so
+  normal undo allocation and cached-undo reuse must consult the reservation map
+  before taking a slot. When no reservation is active the lookup returns through
+  its active-count fast path and the original allocation behavior is unchanged.
+*/
 static bool trx_undo_temp_preserve_slot_reserved(const trx_rseg_t *rseg,
                                                  ulint slot_no) {
   return rseg != nullptr && slot_no < TRX_RSEG_N_SLOTS &&
@@ -396,6 +403,11 @@ static ulint trx_undo_find_free_non_reserved_slot(
     trx_rseg_t *rseg, trx_rsegf_t *rseg_hdr, ulint slot_no, mtr_t *mtr) {
   if (!trx_undo_temp_preserve_slot_reserved(rseg, slot_no)) return slot_no;
 
+  /*
+    trx_rsegf_undo_find_free() returns one candidate. If that slot is reserved
+    for a preserved transaction, continue through the same rseg header looking
+    for another free slot instead of failing the ordinary transaction.
+  */
   ulint max_slots = TRX_RSEG_N_SLOTS;
 #ifdef UNIV_DEBUG
   if (trx_rseg_n_slots_debug) {
@@ -460,6 +472,11 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t trx_undo_seg_create(
   {
     slot_no = trx_rsegf_undo_find_free(rseg_hdr, mtr);
   }
+  /*
+    A reserved slot is logically owned by the preserved token even though the
+    restarted no-redo rseg header may not yet point to a live trx_undo_t. Skip
+    it until RESUME either adopts the slot or releases the reservation.
+  */
   slot_no = trx_undo_find_free_non_reserved_slot(rseg, rseg_hdr, slot_no, mtr);
   if (slot_no == ULINT_UNDEFINED) {
     ib::error(ER_IB_MSG_1212)
@@ -1678,6 +1695,11 @@ static trx_undo_t *trx_undo_reuse_cached(trx_t *trx, trx_rseg_t *rseg,
   }
 
   if (type == TRX_UNDO_INSERT) {
+    /*
+      Cached no-redo undo pages can carry a slot that is reserved for a
+      preserved token. Walk past such cached objects; taking them would let a
+      new transaction overwrite undo pages that resume still needs.
+    */
     for (undo = UT_LIST_GET_FIRST(rseg->insert_undo_cached); undo != nullptr;
          undo = UT_LIST_GET_NEXT(undo_list, undo)) {
       if (!trx_undo_temp_preserve_slot_reserved(rseg, undo->id)) break;
@@ -1692,6 +1714,11 @@ static trx_undo_t *trx_undo_reuse_cached(trx_t *trx, trx_rseg_t *rseg,
   } else {
     ut_ad(type == TRX_UNDO_UPDATE);
 
+    /*
+      Update undo uses the same slot namespace as insert undo. Keep the
+      reservation check symmetrical so a preserved update undo graph cannot be
+      hidden by cached reuse before resume.
+    */
     for (undo = UT_LIST_GET_FIRST(rseg->update_undo_cached); undo != nullptr;
          undo = UT_LIST_GET_NEXT(undo_list, undo)) {
       if (!trx_undo_temp_preserve_slot_reserved(rseg, undo->id)) break;

@@ -71,9 +71,19 @@ struct Temp_table_journal_record {
     history before a manifest is built. They are not serialized as a resume-time
     replay log.
   */
+  /* Monotonic participant-local order for all temp-table tail records. */
   uint64_t seq{0};
+  /*
+    Stable SQL-side table identity within one participant. DROP removes the
+    table state; a later same-name CREATE receives another ordinal.
+  */
   uint32_t table_ordinal{0};
+  /*
+    Current incarnation of the table ordinal. TRUNCATE keeps the ordinal but
+    bumps generation so older row markers cannot attach to the new contents.
+  */
   uint32_t generation{0};
+  /* Monotonic order for row DML markers belonging to one table generation. */
   uint64_t row_seq{0};
   enum class Kind {
     CREATE_TABLE,
@@ -88,6 +98,11 @@ struct Temp_table_journal_record {
     RELEASE_SAVEPOINT,
     ROLLBACK_TO_SAVEPOINT
   } kind{Kind::CREATE_TABLE};
+  /*
+    Optional small metadata/savepoint text. Row DML hooks must not copy record
+    bytes here; resume relies on physical sidecars and no-redo undo evidence,
+    not on SQL row replay.
+  */
   std::string payload;
 };
 

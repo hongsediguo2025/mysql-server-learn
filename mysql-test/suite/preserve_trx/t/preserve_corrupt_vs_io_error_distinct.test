@@ -22,6 +22,7 @@ CALL mtr.add_suppression("Assertion failure: ha_innodb.cc:.*ib::fatal triggered"
 CALL mtr.add_suppression("\\[FATAL\\] Error in DDL Log recovery during Post-Recovery processing");
 CALL mtr.add_suppression("Assertion failure: ut0ut.cc:.*");
 CALL mtr.add_suppression("Aborting");
+CALL mtr.add_suppression("PRESERVE: rolled back prepared transaction without snapshot during recovery");
 CALL mtr.add_suppression("Attempting backtrace");
 CALL mtr.add_suppression("You can use the following information to find out");
 --enable_query_log
@@ -94,16 +95,14 @@ PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
 --source suite/preserve_trx/include/wait_for_expected_crash.inc
 --source suite/preserve_trx/include/assert_one_snapshot_file.inc
 
+--source suite/preserve_trx/include/ha_crash_abandon_preserve_artifacts.inc
 --exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc
 --disable_reconnect
 
---source suite/preserve_trx/include/get_preserved_token.inc
---replace_result $preserved_token TOKEN
---eval RESUME PRESERVED TRANSACTION '$preserved_token'
-ROLLBACK;
---source suite/preserve_trx/include/assert_no_snapshot_file.inc
+SELECT COUNT(*) AS preserved_count_after_io_read
+  FROM performance_schema.preserved_transactions;
 
 SELECT * FROM t_preserve_read_error_distinct ORDER BY a;
 

@@ -7,6 +7,7 @@ DROP TABLE IF EXISTS t_lock_warmcopy_crash_prepare;
 --enable_warnings
 
 --let $MYSQLD_DATADIR= `SELECT @@datadir`
+--let PRESERVE_TRX_DIR= `SELECT @@global.preserve_trx_dir`
 
 --let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
 --let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
@@ -43,6 +44,7 @@ SET SESSION debug="+d,preserve_trx_crash_after_undo_prepared_before_snapshot";
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 --source include/wait_until_disconnected.inc
 
+--source suite/preserve_trx/include/ha_crash_abandon_preserve_artifacts.inc
 --exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10 --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
 --source include/wait_until_connected_again.inc

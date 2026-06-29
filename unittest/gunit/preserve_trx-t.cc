@@ -4318,6 +4318,24 @@ TEST_F(PreserveSnapshotTest, LocalFileStoreListsAndRemovesTempSidecars) {
   EXPECT_EQ(1U, listing.temp_sidecar_tokens.count("warm_undo_only"));
 }
 
+TEST_F(PreserveSnapshotTest, LocalFileTaintMarkerPreservesRootCause) {
+  const std::string token = metadata().token;
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            store.mark_tainted(token, "bootstrap sidecar digest mismatch"));
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            store.mark_tainted(token, "innodb_force_recovery"));
+
+  const std::string marker = read_file(m_dir + token + ".tainted");
+  EXPECT_NE(std::string::npos,
+            marker.find("bootstrap sidecar digest mismatch"));
+  EXPECT_NE(std::string::npos, marker.find("innodb_force_recovery"));
+  EXPECT_LT(marker.find("bootstrap sidecar digest mismatch"),
+            marker.find("innodb_force_recovery"));
+}
+
 TEST_F(PreserveSnapshotTest,
        LocalFileStoreRemoveCanPreserveCommittedTempSidecars) {
   const std::string token = metadata().token;

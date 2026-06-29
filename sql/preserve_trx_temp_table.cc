@@ -3073,8 +3073,13 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
         }
         sealed_undo_source_space_ids.push_back(
             source_metadata.source_space_id);
-        (void)preserve_trx_temp_table_append_ownership_claims_from_descriptor(
-            token, adopted_undo, descriptor, &manifest);
+        if (!preserve_trx_temp_table_append_ownership_claims_from_descriptor(
+                token, adopted_undo, descriptor, &manifest)) {
+          participant->mark_degraded(
+              "temp-table ownership manifest build failed");
+          cleanup_sidecars();
+          return Preserve_snapshot_status::UNSUPPORTED;
+        }
         manifest.undo_images.push_back(std::move(adopted_undo));
       } else if (!undo_payload.empty()) {
         Preserved_temp_table_undo_descriptor undo =
@@ -3102,8 +3107,13 @@ Preserve_snapshot_status preserve_trx_temp_table_build_preserve_manifest(
         }
         sealed_undo_source_space_ids.push_back(
             source_metadata.source_space_id);
-        (void)preserve_trx_temp_table_append_ownership_claims_from_descriptor(
-            token, undo, descriptor, &manifest);
+        if (!preserve_trx_temp_table_append_ownership_claims_from_descriptor(
+                token, undo, descriptor, &manifest)) {
+          participant->mark_degraded(
+              "temp-table ownership manifest build failed");
+          cleanup_sidecars();
+          return Preserve_snapshot_status::UNSUPPORTED;
+        }
         manifest.undo_images.push_back(std::move(undo));
       }
     }

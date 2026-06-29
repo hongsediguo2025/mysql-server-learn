@@ -1,0 +1,3 @@
+SELECT 'ok' AS preserve_review_fix_contract_lint;
+preserve_review_fix_contract_lint
+ok

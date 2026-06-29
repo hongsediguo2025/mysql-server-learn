@@ -1,0 +1,31 @@
+--perl
+use strict;
+use warnings;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $src = "$mysql_test_dir/..";
+
+sub read_source {
+  my ($path) = @_;
+  open(my $fh, '<', "$src/$path") or die "cannot open $src/$path: $!";
+  local $/;
+  my $body = <$fh>;
+  close($fh);
+  return $body;
+}
+
+my $temp_table = read_source('sql/preserve_trx_temp_table.cc');
+die "ownership claim append result must be checked, not discarded\n"
+  if $temp_table =~
+       /\(void\)\s*preserve_trx_temp_table_append_ownership_claims_from_descriptor\s*\(/s;
+
+my $preserve = read_source('sql/preserve_trx.cc');
+while ($preserve =~ /store->mark_tainted\s*\(([^;]+?)\)/sg) {
+  my $args = $1;
+  die "preserve_trx.cc mark_tainted call must pass explicit reason: $args\n"
+    unless $args =~ /,/s;
+}
+EOF
+
+SELECT 'ok' AS preserve_review_fix_contract_lint;

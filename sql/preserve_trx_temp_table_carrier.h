@@ -115,10 +115,24 @@ struct Preserved_temp_table_ownership_claim {
 };
 
 enum class Preserved_temp_table_ownership_conflict {
+  /* No conflict was found in the ownership manifest. */
   NONE = 0,
+  /* Claim is missing required token/rseg/page identity or uses an unknown role. */
   INVALID_CLAIM = 1,
+  /*
+    Shared rseg/FSP proof pages may be referenced by multiple tokens only when
+    every descriptor names the same page digest.
+  */
   SHARED_DIGEST = 2,
+  /*
+    Claims for one source space disagree about the no-redo rollback segment
+    identity. Resume cannot know which live rseg slot owns the preserved pages.
+  */
   SHARED_RSEG_IDENTITY = 3,
+  /*
+    UNDO_HEADER/UNDO_LOG pages are transaction-private. A second token claiming
+    the same page would allow two resumed transactions to own one undo segment.
+  */
   EXCLUSIVE_OWNER = 4
 };
 

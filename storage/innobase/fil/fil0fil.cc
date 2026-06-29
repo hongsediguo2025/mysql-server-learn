@@ -3247,6 +3247,18 @@ bool meb_fil_space_free(space_id_t space_id) {
 }
 #endif /* UNIV_HOTBACKUP */
 
+/** Attach a sealed user temporary-table sidecar as an InnoDB temporary space.
+The image was copied during preserve and is adopted only during RESUME.  This is
+not the normal temp-space creation path: the first page is treated as the
+authoritative FSP header, and the in-memory fil_space_t is initialized from that
+header so later no-redo undo adoption and page allocation see the same
+size/free-list state as the preserved image.
+@param[in]	space_id	Space id stored in the sidecar header
+@param[in]	name		Unique fil_space name for the adopted image
+@param[in]	path		Sealed sidecar file path
+@param[in]	flags		Expected tablespace flags
+@param[in]	size		Expected page count
+@return DB_SUCCESS on success, error code otherwise */
 dberr_t fil_preserve_temp_space_adopt(space_id_t space_id, const char *name,
                                       const char *path, uint32_t flags,
                                       page_no_t size) {

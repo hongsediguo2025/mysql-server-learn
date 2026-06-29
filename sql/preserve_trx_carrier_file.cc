@@ -1546,11 +1546,28 @@ bool write_tainted_marker(const std::string &dir, const std::string &token,
                           const std::string &reason) {
   if (!token_is_filename_safe(token)) return true;
   DBUG_EXECUTE_IF("preserve_trx_fail_write_tainted_marker", return true;);
-  std::string marker_reason = reason.empty() ? "tainted" : reason;
-  marker_reason.push_back('\n');
-  std::vector<unsigned char> bytes(marker_reason.begin(),
-                                   marker_reason.end());
-  return atomic_write_file(normalize_dir(dir), token + ".tainted", bytes, 0600,
+  const std::string normalized_dir = normalize_dir(dir);
+  const std::string marker_path = join_path(normalized_dir, token + ".tainted");
+  const std::string marker_reason = reason.empty() ? "tainted" : reason;
+
+  std::string marker;
+  std::vector<unsigned char> existing;
+  const Preserved_trx_carrier_status read_status =
+      read_file_limited(marker_path, 4096, &existing);
+  if (read_status == Preserved_trx_carrier_status::OK) {
+    marker.assign(existing.begin(), existing.end());
+  } else if (read_status != Preserved_trx_carrier_status::NOT_FOUND &&
+             read_status != Preserved_trx_carrier_status::CORRUPT) {
+    return true;
+  }
+
+  if (marker.find(marker_reason) == std::string::npos) {
+    if (!marker.empty() && marker.back() != '\n') marker.push_back('\n');
+    marker.append(marker_reason);
+    marker.push_back('\n');
+  }
+  std::vector<unsigned char> bytes(marker.begin(), marker.end());
+  return atomic_write_file(normalized_dir, token + ".tainted", bytes, 0600,
                            {}) != Atomic_write_status::OK;
 }
 
