@@ -83,8 +83,11 @@ my $handler_path = File::Spec->catfile($source_root, 'sql', 'handler.cc');
 my $gunit_path = File::Spec->catfile($source_root, 'unittest', 'gunit',
                                      'preserve_trx-t.cc');
 my $sql_parse_path = File::Spec->catfile($source_root, 'sql', 'sql_parse.cc');
+my $sys_vars_path = File::Spec->catfile($source_root, 'sql', 'sys_vars.cc');
 my $transfer_path = File::Spec->catfile($source_root, 'sql',
                                         'preserve_trx_transfer.cc');
+my $standby_transfer_doc_path = File::Spec->catfile(
+  $source_root, 'design', 'preserve-resume-8.0.22-standby-transfer-design.md');
 
 my $preserve = read_source($preserve_path);
 my $preserve_header = read_source($preserve_header_path);
@@ -116,7 +119,9 @@ my $drain = read_source($drain_path);
 my $handler = read_source($handler_path);
 my $gunit = read_source($gunit_path);
 my $sql_parse = read_source($sql_parse_path);
+my $sys_vars = read_source($sys_vars_path);
 my $transfer = read_source($transfer_path);
+my $standby_transfer_doc = read_optional_source($standby_transfer_doc_path);
 
 $lock_preserve =~ /static bool lock_preserve_page_identity_matches[\s\S]*?^}/m
   or die "could not isolate lock_preserve_page_identity_matches\n";
@@ -1613,6 +1618,20 @@ die "standby transfer receiver dispatch must require PRESERVE_TRX_TRANSFER_ADMIN
          $transfer_dispatch_command =~ /has_global_grant/s &&
          index($transfer_dispatch_command, 'has_global_grant') <
          index($transfer_dispatch_command, 'preserve_trx_transfer_handle_receiver_payload');
+die "standby transfer production source client must stay explicitly fail-closed until the credential resolver is implemented\n"
+  unless $transfer =~
+         /default_transfer_client_connect[\s\S]*credential-name resolver[\s\S]*UNSUPPORTED/s &&
+         $gunit =~ /ConfiguredFrameSinkDefaultsToUnsupported/s;
+die "standby transfer worker sysvars must be documented as reserved until real source and receiver worker pools exist\n"
+  unless $sys_vars =~
+         /preserve_trx_transfer_sender_workers[\s\S]*reserved[\s\S]*planned source worker pool/s &&
+         $sys_vars =~
+         /preserve_trx_transfer_receiver_workers[\s\S]*reserved[\s\S]*planned receiver worker pool/s;
+die "standby transfer design doc must not claim production client transport and worker pools are complete in this milestone\n"
+  unless $standby_transfer_doc =~
+         /当前实现状态[\s\S]*source transport[\s\S]*fail-closed/s &&
+         $standby_transfer_doc =~
+         /sender_workers[\s\S]*reserved[\s\S]*receiver_workers[\s\S]*reserved/s;
 EOF
 
 SELECT 'ok' AS code_review_resumable_trx_slices_lint;

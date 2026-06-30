@@ -1484,16 +1484,18 @@ static Sys_var_uint Sys_preserve_trx_transfer_data_sessions(
 
 static Sys_var_uint Sys_preserve_trx_transfer_sender_workers(
     "preserve_trx_transfer_sender_workers",
-    "Number of Preserve/Resume standby direct-transfer source workers that "
-    "read and chunk transfer objects.",
+    "reserved count for a planned source worker pool in Preserve/Resume "
+    "standby direct-transfer. The current sender path builds frames "
+    "synchronously and does not start production worker threads.",
     GLOBAL_VAR(preserve_trx_transfer_sender_workers), CMD_LINE(REQUIRED_ARG),
     VALID_RANGE(1, 1024), DEFAULT(3), BLOCK_SIZE(1), NO_MUTEX_GUARD,
     NOT_IN_BINLOG);
 
 static Sys_var_uint Sys_preserve_trx_transfer_receiver_workers(
     "preserve_trx_transfer_receiver_workers",
-    "Number of Preserve/Resume standby direct-transfer receiver workers that "
-    "stage and validate transfer object chunks.",
+    "reserved count for a planned receiver worker pool in Preserve/Resume "
+    "standby direct-transfer. The current receiver validates and stages each "
+    "command frame on the dispatching session.",
     GLOBAL_VAR(preserve_trx_transfer_receiver_workers),
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 1024), DEFAULT(3), BLOCK_SIZE(1),
     NO_MUTEX_GUARD, NOT_IN_BINLOG);

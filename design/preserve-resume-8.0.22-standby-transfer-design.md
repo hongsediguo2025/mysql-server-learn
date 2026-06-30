@@ -1,8 +1,9 @@
 # MySQL 8.0.22 Preserve/Resume 备机直传保存设计
 
-本文档描述 `DRAIN TRANSACTIONS PRESERVE` 阶段把 preserve 序列化对象直接发送到
-未来物理备机，并由备机在线接收、校验、保存的设计。本文只覆盖“发送、接收、保存”
-能力，不覆盖后续在线升主 apply/resume 的实现。
+本文档描述 `DRAIN TRANSACTIONS PRESERVE` 阶段把 preserve 序列化对象发送到未来物理
+备机，并由备机在线接收、校验、保存的设计。本文把“当前已实现的协议/receiver/save
+骨架”和“后续生产 source transport/worker pool”明确分层；不覆盖后续在线升主
+apply/resume 的实现。
 
 核心结论：
 
@@ -15,12 +16,50 @@
   transaction，不导入锁、read view、MDL，也不注册普通 resumable token。
 - 本物理主备直传模式下，mysqld startup 阶段绝不执行 preserve/resume/preflight/recovery
   处理；直传 artifact 只能由运行期 receiver 或未来在线升主 apply 流程识别。
-- 本轮设计和实现即支持参数化并行：源端并行处理和发送，备机并行接收、校验和落盘；
-  默认并行度为 3；并行度可以显式调为 1 做保守验证，但代码结构必须按多 session /
-  worker pool 实现。
+- 当前实现状态：portable bundle/frame、receiver staging、target-side re-encode、
+  `.standby_pending` 发布、普通 startup/recovery 过滤 standby pending token，以及
+  test-injected source sender 边界已经具备；默认 production source transport 仍然
+  fail-closed，等待 credential-name resolver 和真实 classic-protocol client 接入。
+- 并行参数已经预留，`data_sessions` 当前只影响 test-injected encoded-frame sink 的
+  connection slot 选择；`sender_workers` 和 `receiver_workers` 是 reserved 配置，真实
+  worker pool 尚未实现。
 - 代码实现必须松耦合，但不能重复实现 preserve_trx 已有能力：内核对象序列化、
   snapshot encode/decode、external blob descriptor、carrier 文件布局、持久化写入、
   读取和反序列化都应通过现有边界复用或小幅扩展。
+
+### 0.1 当前实现状态与发布边界
+
+当前代码已经落地了以下能力：
+
+- `Preserve_trx_artifact_sink` 分流点，支持 local carrier 与 standby-transfer-save 决策。
+- portable transfer manifest、bundle object、encoded frame codec。
+- receiver 侧 `COM_PRESERVE_TRX_TRANSFER` 分发，要求
+  `PRESERVE_TRX_TRANSFER_ADMIN` 动态权限，并受 receiver enable/source UUID/target UUID
+  配置约束。
+- receiver staging、object seal、digest 校验、target-side snapshot re-encode、最终
+  `.bin` 与 `.standby_pending` marker 发布。
+- 多 token 同 epoch 的 `COMMIT_EPOCH` 屏障：同一 epoch 内所有 receiving token 都 sealed
+  后才发布 epoch commit marker。
+- 普通 startup recovery、temporary tablespace bootstrap 和 local recovery 过滤
+  standby-pending token，不把它们当成本机可 resume/rollback token。
+
+当前仍未实现的生产能力：
+
+- 默认 production source transport 是 fail-closed：`default_transfer_client_connect()` 和
+  `default_transfer_client_send()` 返回 `UNSUPPORTED`。GUnit 通过注入 client ops 验证
+  sender 边界，但真实 mysqld 还不能凭配置主动连接另一台 mysqld 发送 frame。
+- `preserve_trx_transfer_credential_name` 尚未接入 credential resolver；因此不能把
+  target user/credential 当成可工作的生产连接凭据。
+- `sender_workers` reserved、`receiver_workers` reserved；当前没有生产 source worker
+  pool，也没有 receiver worker pool。receiver 在执行 `COM_PRESERVE_TRX_TRANSFER` 的
+  dispatch session 上解析、校验并落盘单个 frame。
+- `HELLO`、`BEGIN_EPOCH`、`JOIN_EPOCH`、`BEGIN_TOKEN`、`OBJECT_HEADER`、
+  `PUT_OBJECT_CHUNK`、`SEAL_TOKEN` 作为下一阶段完整协议名保留；当前代码使用更小的
+  frame set：`BEGIN`、`OBJECT_CHUNK`、`SEAL_OBJECT`、`COMMIT_EPOCH`、`ABORT`。
+
+因此，本阶段可以作为 receiver/protocol/publish 骨架和 fail-closed source boundary
+交付；不能宣称已具备生产环境主机到备机的自动直传能力。生产直传闭环需要后续补齐
+credential resolver、classic-protocol client、worker pool 和双 mysqld E2E。
 
 ## 1. 背景与当前代码边界
 
@@ -53,9 +92,8 @@ portable envelope，备机用自己的 codec context 重新编码成备机本地
 - 传输中的半成品不可被当成普通 preserved token。
 - 保存完成的 token 有明确 `STANDBY_SAVED` 或 `PENDING_APPLY` 状态，区别于本机
   recovery 产生的 `PRESERVED` token。
-- 本轮实现参数化并行处理：源端 worker pool 生成/读取 object chunk，多个后台
-  classic-protocol session 可并行发送；备机 receiver worker pool 并行接收、校验和写
-  staging。默认并行度为 3，必要时可通过参数降到 1 个 session/worker 验证退化路径。
+- 当前阶段实现 receiver/protocol/publish 骨架和 test-injected sender boundary；生产
+  source transport 与 source/receiver worker pool 是下一阶段目标。
 
 ### 2.2 非目标
 
@@ -66,7 +104,8 @@ portable envelope，备机用自己的 codec context 重新编码成备机本地
 - 不把 token 放入 `g_preserved_trx_records`，也不让普通 `RESUME PRESERVED
   TRANSACTION` 消费这些 token。
 - 不设计 HA 控制器、旧主 fencing、业务连接迁移策略。
-- 不在本轮实现自适应调度、动态扩缩容或跨备机多目标复制；并行度由显式参数控制。
+- 不在当前阶段实现生产 source transport、credential resolver、source/receiver worker
+  pool、自适应调度、动态扩缩容或跨备机多目标复制。
 
 ## 3. 总体架构
 
@@ -289,9 +328,9 @@ COM_PRESERVE_TRX_TRANSFER
 server uuid、target server uuid、transfer epoch 和权限检查，再进入 receiver 状态机；检查
 失败不得创建 staging 目录。
 
-### 5.2 本轮参数化并行模型
+### 5.2 当前协议模型与后续参数化并行模型
 
-本轮实现不再把多 session 放到后续阶段。协议按 control/data 分层设计：
+后续生产直传协议按 control/data 分层设计：
 
 - control session 管理 `HELLO`、`BEGIN_EPOCH`、token manifest、`SEAL_TOKEN`、
   `COMMIT_EPOCH` 和 `ABORT_EPOCH`。
@@ -301,7 +340,7 @@ server uuid、target server uuid、transfer epoch 和权限检查，再进入 re
 - 源端 sender workers 并行从 bundle/object providers 读取、切分和校验 object chunk。
 - 备机 receiver workers 并行接收、写 staging、更新 object range map 和计算 digest。
 
-单 session 和多 session 使用同一套 frame：
+完整生产协议计划使用以下 frame：
 
 ```text
 HELLO
@@ -339,6 +378,12 @@ worker_id
 `epoch_id + token + object_id + chunk_offset + chunk_length` 是 chunk 的幂等身份。重复
 chunk 内容一致时可接受；同一 range 内容或 digest 不一致时必须拒绝整个 epoch。
 
+当前代码先落地一个更小的 encoded-frame set：`BEGIN` 携带 token manifest，
+`OBJECT_CHUNK` 携带 object range，`SEAL_OBJECT` 做 object 级 seal，`COMMIT_EPOCH`
+做 epoch 级 publish，`ABORT` 清理 staging。这个 frame set 已经覆盖 receiver staging、
+digest 校验、target-side re-encode 和 standby-pending publish；但还没有生产
+classic-protocol source client、HELLO/JOIN_EPOCH 握手或真实 worker pool。
+
 ### 5.3 参数控制
 
 本轮新增参数分为模式、连接、并行和限流四类。它们应同时控制主机并行处理/发送和备机
@@ -373,13 +418,16 @@ preserve_trx_transfer_credential_name
   credential 的落地方式应复用 MySQL 现有安全存储或启动配置约束。
 
 preserve_trx_transfer_data_sessions
-  源端到备机的后台 data session 数。默认 3；设为 1 时仍走同一套状态机。
+  源端到备机的后台 data session 数。默认 3；当前只影响 encoded-frame sink 的连接槽
+  选择，真实 production source transport 接入前不代表 mysqld 已经会自动建立 3 条后台
+  连接。设为 1 可验证同一状态机的单槽路径。
 
 preserve_trx_transfer_sender_workers
-  源端 object/chunk 生产 worker 数。默认等于 data_sessions；可单独调小以限制源端 CPU/I/O。
+  reserved，计划用于 source worker pool；当前 sender 同步构建 frame，不启动生产 worker。
 
 preserve_trx_transfer_receiver_workers
-  备机接收和 staging 写入 worker 数。默认等于 data_sessions；可按备机磁盘能力调节。
+  reserved，计划用于 receiver worker pool；当前 receiver 在 dispatch session 上处理
+  单个 frame。
 
 preserve_trx_transfer_chunk_bytes
   单个 PUT_OBJECT_CHUNK 的目标大小。
@@ -391,8 +439,10 @@ preserve_trx_transfer_commit_timeout_ms
   源端等待备机 seal/commit 的超时。
 ```
 
-默认配置把 `data_sessions/sender_workers/receiver_workers` 都设为 3。保守验证或故障定位时
-可以显式设为 1，但实现不能把单 session 写成特殊串行路径；1 只是参数取值，不是另一套代码。
+默认配置把 `data_sessions/sender_workers/receiver_workers` 都设为 3，是为了固定未来
+并行协议的配置面。当前只有 `data_sessions` 对 injected frame sink 有实际路由效果；
+`sender_workers` 和 `receiver_workers` 在真实 worker pool 落地前不得作为生产并行能力
+对外宣称。
 
 ### 5.4 并行状态机约束
 
@@ -605,22 +655,32 @@ mark token SAVED_ONLINE
   receiver 运行期审计或未来在线升主 apply 按 marker 审计；startup 不处理。
 - token 已有普通 `.bin` 或 standby pending marker：拒绝重复 token，不能覆盖。
 
-## 10. 本轮验证范围
+## 10. 当前验证范围与后续 E2E 范围
 
-本轮目标是证明端到端能力，同时把并行处理/发送/接收框架做进实现。默认并行度为 3，
-测试必须同时覆盖默认并行路径和显式降到 1 的路径：
+当前阶段目标是证明 receiver/protocol/publish 骨架成立，并明确 production source
+transport fail-closed。已覆盖和必须保持的范围：
 
-- 参数化后台 transfer sessions；`data_sessions=1` 和 `data_sessions>1` 走同一套状态机。
-- 一个 epoch 中支持多个 token，多个 object 可按参数并行发送和接收。
+- portable manifest/frame codec。
+- 一个 epoch 中支持多个 token，`COMMIT_EPOCH` 等待同 epoch 内所有 receiving token
+  sealed 后再发布。
 - 每个 object 按 chunk frame 发送，chunk 字段完整保留。
-- 源端 sender workers 并行读取/切分 object，备机 receiver workers 并行写 staging。
 - 备机接收后保存到 `preserve_trx_default_dir()`，带 `.standby_pending` marker。
 - 目标端 `.bin` 由备机 codec context 重新编码。
 - 不注册普通 preserved record。
 - 不触发 resume。
-- 不影响备机并发只读查询。
+- 普通 startup recovery 和 temp bootstrap 不处理 standby-pending token。
+- 默认 production source client 返回 `UNSUPPORTED`，避免把未接入 credential resolver 的
+  配置误当成可用网络发送能力。
 
-本轮可以采用保守限制：
+后续完整生产直传 E2E 还需要覆盖：
+
+- 参数化后台 transfer sessions；`data_sessions=1` 和 `data_sessions>1` 走同一套状态机。
+- source sender workers 并行读取/切分 object，receiver workers 并行写 staging。
+- 双 mysqld 下源端 `DRAIN TRANSACTIONS PRESERVE` 真正通过 classic protocol 把 token
+  发送到备机。
+- transfer 期间备机并发只读查询持续成功。
+
+当前可以采用保守限制：
 
 - 不启用自动在线升主 apply。
 - 不做自适应带宽调度；并发度只由静态参数控制。
@@ -628,9 +688,9 @@ mark token SAVED_ONLINE
 - 若某类对象当前只能通过本地 writer 生成，允许源端使用临时工作文件作为发送来源，但不允许
   把本地 durable token publication 作为传输前置条件。
 
-## 11. 并行执行细节
+## 11. 后续并行执行细节
 
-本轮并行实现按以下模型落地：
+后续生产并行实现按以下模型落地：
 
 - source side worker pool 按 token/object/range 分配 chunk。
 - data session pool 从 source worker 输出队列取 chunk 并发送。
@@ -744,7 +804,22 @@ mark token SAVED_ONLINE
   `RESUME_ANY_PRESERVED_TRANSACTION` 在 221 行附近注册。receiver 若新增
   `PRESERVE_TRX_TRANSFER_ADMIN`，应沿用同一注册机制。
 
-## 14. 实施顺序建议
+## 14. 实施顺序建议与当前完成度
+
+1. 已完成：定义 portable transfer manifest 和 frame codec。
+2. 已完成：定义 transfer 参数、epoch/token/object/range 状态机和 inflight 上限。
+3. 已完成：增加 standby-pending marker 过滤，确保普通 mysqld startup 不进入 standby
+   pending token 的 local recovery/resume。
+4. 已完成：实现 receiver staging、object seal、target-side snapshot re-encode、final publish。
+5. 已完成：实现 `COM_PRESERVE_TRX_TRANSFER` receiver dispatch 和权限门禁。
+6. 待完成：实现 production source classic-protocol client、credential-name resolver 和
+   HELLO/endpoint 校验。
+7. 待完成：实现 source sender worker pool 和 receiver worker pool；当前
+   `sender_workers`/`receiver_workers` reserved。
+8. 已完成：在 preserve kernel 中增加 artifact sink 分流点。
+9. 待完成：增加双 mysqld MTR，覆盖显式并行度 1 和默认并行度 3。
+
+原始顺序仍作为后续完整生产直传参考：
 
 1. 定义 portable transfer manifest 和 frame codec。
 2. 定义 transfer 参数、epoch/session/object/range 状态机和 inflight 反压。
@@ -766,8 +841,9 @@ mark token SAVED_ONLINE
 - 新增代码必须通过 artifact sink、portable envelope、receiver publish helper 与现有
   preserve_trx 能力组合；不得重复实现 bundle codec、carrier 布局或 temp-table sidecar
   descriptor 语义。
-- 本轮实现参数化并行；默认并行度为 3，但代码路径必须支持多个 data sessions、
-  sender workers 和 receiver workers。
+- 当前 `data_sessions` 只为 encoded-frame sink 的连接槽预留并行形态；
+  `sender_workers` reserved、`receiver_workers` reserved。生产 worker pool 不能在实现前
+  作为已交付能力描述。
 - 备机运行期不做 resume/activation，也不改变只读查询语义。
 - 物理主备 transfer 模式下，mysqld startup 阶段不做任何 preserve/resume/preflight/recovery
   处理，也不解析 standby pending artifact。
