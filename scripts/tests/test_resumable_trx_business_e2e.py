@@ -10,6 +10,7 @@ import unittest
 import contextlib
 import hashlib
 import io
+import json
 import queue
 import tempfile
 import threading
@@ -28,6 +29,7 @@ from scripts.resumable_trx_business_e2e import (
     Phase2PauseSample,
     ResumeCoordinator,
     WARMCOPY_TAIL_BUDGET_BYTES,
+    WarmcopyDrainMetrics,
     WorkloadPlan,
     canonicalize_normalized_binlog_table_events,
     comparable_binlog_table_events,
@@ -4127,6 +4129,11 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertTrue(cfg.two_phase)
         self.assertTrue(cfg.warmcopy_required)
 
+    def test_cli_report_json_path_is_applied(self):
+        cfg = parse_args(["--report-json", "/tmp/preserve-temp-e2e.json"])
+
+        self.assertEqual(cfg.report_json, "/tmp/preserve-temp-e2e.json")
+
     def test_invalid_large_cache_runtime_parameters_are_rejected(self):
         with self.assertRaises(ValueError):
             HarnessConfig(
@@ -4938,6 +4945,58 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
 
         with self.assertRaises(AssertionError):
             runner.final_validation()
+
+    def test_final_validation_writes_temp_table_nfr_report_json(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "temp-e2e-report.json"
+            runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+            runner.config = HarnessConfig(
+                sessions=20,
+                cycles=1,
+                statements_per_tx=100,
+                temp_table_workload=True,
+                temp_table_target_mb=200,
+                temp_table_resume_action="continue",
+                lock_warmcopy_mode="on",
+                max_phase2_total_ms=2000,
+                report_json=str(report_path),
+            )
+            runner.plan = WorkloadPlan(runner.config)
+            runner.runtime = _NoPreservedRuntime()
+            runner.workers = [_CompletedWorker()]
+            runner.expected_state = _NoopExpectedState()
+            runner.actual_table_fingerprints = lambda: {}
+            runner.phase2_pause_samples = [
+                Phase2PauseSample(bucket_mb=0, phase2_pause_ms=321.0),
+            ]
+            runner.warmcopy_drain_metrics = [
+                WarmcopyDrainMetrics(
+                    phase2_pause_ms=321.0,
+                    full_copy_to_count=0,
+                    phase2_total_ms=1500.0,
+                    phase2_slo_guaranteed=0,
+                    phase2_slo_reason="temp_table_manifest_phase2_build",
+                )
+            ]
+            runner.post_resume_temp_dml_executed = True
+
+            runner.final_validation()
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["sessions"], 20)
+            self.assertEqual(report["temp_table_target_mb"], 200)
+            self.assertEqual(report["temp_table_total_target_bytes"], 20 * 200 * 1024 * 1024)
+            self.assertEqual(report["phase2_total_samples_ms"], [1500.0])
+            self.assertEqual(
+                report["phase2_slo_reasons"],
+                {"temp_table_manifest_phase2_build": 1},
+            )
+            self.assertTrue(report["post_resume_temp_dml_executed"])
+            self.assertIsNone(report["temp_sidecar_bytes"])
+            self.assertIsNone(report["temp_undo_pages"])
+            self.assertIsNone(report["temp_tail_dirty_pages"])
+            self.assertIsNone(report["temp_tail_undo_pages"])
+            self.assertIsNone(report["temp_resume_adoption_ms"])
 
     def test_final_validation_fails_when_required_large_cache_samples_are_missing(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)

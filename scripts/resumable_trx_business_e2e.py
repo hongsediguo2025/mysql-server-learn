@@ -18,6 +18,7 @@ import dataclasses
 import datetime
 import enum
 import hashlib
+import json
 import logging
 import math
 from pathlib import Path
@@ -193,6 +194,7 @@ class HarnessConfig:
     temp_table_target_mb: int = 0
     temp_table_fill_chunk_kb: int = 64
     temp_table_resume_action: str = "commit"
+    report_json: Optional[str] = None
     startup_timeout_s: float = 120.0
     shutdown_timeout_s: float = 120.0
     shutdown_quiet_period_s: float = 2.0
@@ -3041,6 +3043,8 @@ class BusinessE2ERunner:
         self.workers: List[BusinessWorker] = []
         self.server_processes: List[subprocess.Popen] = []
         self.phase2_pause_samples: List[Phase2PauseSample] = []
+        self.warmcopy_drain_metrics: List[WarmcopyDrainMetrics] = []
+        self.post_resume_temp_dml_executed = False
 
     def run(self) -> None:
         if self.config.no_preserve_baseline:
@@ -3833,6 +3837,7 @@ class BusinessE2ERunner:
                             f"reason={observed_metrics.phase2_slo_reason or 'unknown'}"
                         )
                 phase2_pause_ms = observed_metrics.phase2_pause_ms
+                self._record_warmcopy_drain_metrics(observed_metrics)
             self.configure_preserve_globals()
             tokens = self.read_preserved_tokens()
             if self.config.strict_token_count and len(tokens) != self.config.sessions:
@@ -3856,6 +3861,8 @@ class BusinessE2ERunner:
                 resumed_large_buckets[sid] = bucket_mb
                 resumed_tx_ids[sid] = tx_id
                 resumed_completed_stmt[sid] = completed_stmt_no
+                if self._will_execute_temp_dml_after_resume(completed_stmt_no):
+                    self.post_resume_temp_dml_executed = True
             if self.config.strict_token_count:
                 expected_sids = set(range(1, self.config.sessions + 1))
                 resumed_sids = set(resumed_connections)
@@ -3924,6 +3931,26 @@ class BusinessE2ERunner:
         except BaseException:
             self.coordinator.cancel_drain_checkpoint(generation)
             raise
+
+    def _record_warmcopy_drain_metrics(
+        self, observed_metrics: WarmcopyDrainMetrics
+    ) -> None:
+        if not hasattr(self, "warmcopy_drain_metrics"):
+            self.warmcopy_drain_metrics = []
+        self.warmcopy_drain_metrics.append(observed_metrics)
+
+    def _will_execute_temp_dml_after_resume(self, completed_stmt_no: int) -> bool:
+        if (
+            not self.config.temp_table_workload
+            or self.config.temp_table_resume_action != "continue"
+        ):
+            return False
+        plan = getattr(self, "plan", WorkloadPlan(self.config))
+        next_stmt = max(0, completed_stmt_no + 1)
+        return any(
+            plan.is_temp_statement(stmt_no)
+            for stmt_no in range(next_stmt, self.config.statements_per_tx)
+        )
 
     def _wait_all_paused_for_drain_or_raise(
         self, generation: int, timeout_s: float
@@ -4675,6 +4702,12 @@ class BusinessE2ERunner:
         finally:
             conn.close()
         self.validate_scenario_postconditions()
+        self.write_report_json_if_requested(
+            completed_tx_min=min(completed),
+            completed_stmt_total=sum(
+                worker.statements_completed for worker in self.workers
+            ),
+        )
         LOG.info(
             "E2E finished: workers=%s cycles=%s completed_tx_min=%s completed_stmt_total=%s",
             self.config.sessions,
@@ -4682,6 +4715,89 @@ class BusinessE2ERunner:
             min(completed),
             sum(worker.statements_completed for worker in self.workers),
         )
+
+    def write_report_json_if_requested(
+        self, completed_tx_min: int, completed_stmt_total: int
+    ) -> None:
+        if not self.config.report_json:
+            return
+        report_path = Path(self.config.report_json).expanduser()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(
+                self.e2e_report(
+                    completed_tx_min=completed_tx_min,
+                    completed_stmt_total=completed_stmt_total,
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def e2e_report(
+        self, completed_tx_min: int, completed_stmt_total: int
+    ) -> Dict[str, object]:
+        plan = getattr(self, "plan", WorkloadPlan(self.config))
+        metrics = list(getattr(self, "warmcopy_drain_metrics", []))
+        phase2_slo_reasons: Dict[str, int] = {}
+        for metric in metrics:
+            if metric.phase2_slo_reason:
+                reason = metric.phase2_slo_reason
+                phase2_slo_reasons[reason] = phase2_slo_reasons.get(reason, 0) + 1
+
+        return {
+            "generated_at_utc": datetime.datetime.utcnow()
+            .replace(microsecond=0)
+            .isoformat()
+            + "Z",
+            "scenario": self.config.scenario,
+            "sessions": self.config.sessions,
+            "cycles": self.config.cycles,
+            "statements_per_tx": self.config.statements_per_tx,
+            "completed_tx_min": completed_tx_min,
+            "completed_stmt_total": completed_stmt_total,
+            "temp_table_workload": self.config.temp_table_workload,
+            "temp_table_target_mb": self.config.temp_table_target_mb,
+            "temp_table_target_bytes_per_session": plan.temp_table_target_bytes(),
+            "temp_table_total_target_bytes": (
+                plan.temp_table_target_bytes() * self.config.sessions
+            ),
+            "temp_table_sidecar_budget_bytes": plan.temp_table_sidecar_budget_bytes(),
+            "temp_table_resume_action": self.config.temp_table_resume_action,
+            "post_resume_temp_dml_executed": bool(
+                getattr(self, "post_resume_temp_dml_executed", False)
+            ),
+            "phase2_pause_samples_ms": [
+                sample.phase2_pause_ms
+                for sample in getattr(self, "phase2_pause_samples", [])
+            ],
+            "phase2_total_samples_ms": [
+                metric.phase2_total_ms
+                for metric in metrics
+                if metric.phase2_total_ms is not None
+            ],
+            "phase2_slo_guaranteed": (
+                None
+                if not metrics
+                else all(metric.phase2_slo_guaranteed == 1 for metric in metrics)
+            ),
+            "phase2_slo_reasons": phase2_slo_reasons,
+            "max_phase2_total_ms": self.config.max_phase2_total_ms,
+            "temp_sidecar_bytes": None,
+            "temp_undo_pages": None,
+            "temp_tail_dirty_pages": None,
+            "temp_tail_undo_pages": None,
+            "temp_resume_adoption_ms": None,
+            "metric_gaps": [
+                "temp_sidecar_bytes",
+                "temp_undo_pages",
+                "temp_tail_dirty_pages",
+                "temp_tail_undo_pages",
+                "temp_resume_adoption_ms",
+            ],
+        }
 
     def validate_scenario_postconditions(self) -> None:
         if self.config.scenario not in (
@@ -5239,6 +5355,7 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--temp-table-target-mb", type=int, default=0, help="pre-fill each user temporary table to this many MiB before the drainable transaction starts")
     parser.add_argument("--temp-table-fill-chunk-kb", type=int, default=64, help="payload bytes per generated temporary-table prefill row, in KiB")
     parser.add_argument("--temp-table-resume-action", choices=("commit", "rollback", "continue"), default="commit", help="action for a temp-table worker after RESUME returns inside a transaction; continue keeps the resumed transaction open for more temporary-table DML before the worker commits")
+    parser.add_argument("--report-json", help="write a JSON summary for release-gate and NFR evidence after a successful run")
     parser.add_argument("--startup-timeout", dest="startup_timeout_s", type=float, default=120.0, help="seconds to wait for mysqld to become reachable")
     parser.add_argument("--shutdown-timeout", dest="shutdown_timeout_s", type=float, default=120.0, help="seconds to wait for DRAIN-triggered shutdown")
     parser.add_argument("--shutdown-quiet-period", dest="shutdown_quiet_period_s", type=float, default=2.0, help="seconds mysqld must remain unreachable before restart is attempted")
@@ -5328,6 +5445,7 @@ command is used after each DRAIN command shuts that server down.
         temp_table_target_mb=args.temp_table_target_mb,
         temp_table_fill_chunk_kb=args.temp_table_fill_chunk_kb,
         temp_table_resume_action=args.temp_table_resume_action,
+        report_json=args.report_json,
         startup_timeout_s=args.startup_timeout_s,
         shutdown_timeout_s=args.shutdown_timeout_s,
         shutdown_quiet_period_s=args.shutdown_quiet_period_s,
