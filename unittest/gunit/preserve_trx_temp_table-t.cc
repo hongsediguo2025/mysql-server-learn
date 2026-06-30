@@ -2067,9 +2067,10 @@ TEST(TempLivePreserveManifestContractTest,
 
   const size_t bundle_failure =
       normalized_preserve_body.find("build_preserved_trx_bundle(");
-  const size_t store_failure = normalized_preserve_body.find("store->write(");
+  const size_t publish_failure =
+      normalized_preserve_body.find("artifact_sink->publish_bundle(");
   ASSERT_NE(std::string::npos, bundle_failure);
-  ASSERT_NE(std::string::npos, store_failure);
+  ASSERT_NE(std::string::npos, publish_failure);
   EXPECT_NE(std::string::npos,
             normalized_preserve_body.find(
                 "return reject_after_snapshot_failure(false)",
@@ -2077,7 +2078,7 @@ TEST(TempLivePreserveManifestContractTest,
   EXPECT_NE(std::string::npos,
             normalized_preserve_body.find(
                 "return reject_after_snapshot_failure(durable_snapshot_may_exist",
-                store_failure));
+                publish_failure));
 }
 
 TEST(TempLivePreserveManifestContractTest,
