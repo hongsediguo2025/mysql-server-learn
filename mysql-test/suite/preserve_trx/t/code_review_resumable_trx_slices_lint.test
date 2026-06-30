@@ -1176,6 +1176,18 @@ die "preserve kernel path must publish snapshots through the default store facto
          $preserve_kernel =~ /preserve_trx_transfer_make_configured_frame_sink/s &&
          $preserve_kernel =~ /preserve_trx_make_artifact_sink_for_decision\s*\(/s &&
          $preserve_kernel =~ /artifact_sink->publish_bundle\s*\(/s;
+my $transfer_decision_pos =
+  index($preserve_kernel,
+        'preserve_trx_transfer_artifact_decision_for_request');
+my $token_select_pos =
+  index($preserve_kernel, 'preserve_trx_select_token_for_request');
+my $xid_pos = index($preserve_kernel, 'preserve_trx_token_to_xid');
+die "standby-transfer artifact decision must be request-aware and happen before token/XID selection\n"
+  unless $transfer_decision_pos >= 0 && $token_select_pos > $transfer_decision_pos &&
+         $xid_pos > $token_select_pos;
+die "standby-transfer sink factory must receive the selected numeric transfer token\n"
+  unless $preserve_kernel =~
+         /preserve_trx_make_artifact_sink_for_decision\s*\([\s\S]*token_selection\.transfer_token[\s\S]*transfer_frame_sink\.get\(\)/s;
 die "unsupported standby-transfer artifact mode must fail closed before artifact publish\n"
   unless $preserve_kernel =~
          /preserve_trx_make_artifact_sink_for_decision[\s\S]*artifact_sink_status[\s\S]*standby_transfer_publish_unsupported[\s\S]*reject_after_snapshot_failure\s*\(\s*false\s*\)[\s\S]*artifact_sink->publish_bundle/s;
@@ -1601,6 +1613,18 @@ die "standby-transfer artifact decision must require a configured source endpoin
          /preserve_trx_transfer_source_endpoint_ready\s*\(\s*\)[\s\S]*UNSUPPORTED[\s\S]*STANDBY_TRANSFER_SAVE/s &&
          $transfer =~
          /preserve_trx_transfer_make_configured_frame_sink[\s\S]*preserve_trx_transfer_source_endpoint_ready\s*\(\s*\)[\s\S]*UNSUPPORTED/s;
+$transfer =~
+  /Preserve_trx_transfer_artifact_decision\s+preserve_trx_transfer_artifact_decision_for_request[\s\S]*?^}/m
+  or die "could not isolate preserve_trx_transfer_artifact_decision_for_request\n";
+my $transfer_artifact_decision_for_request = $&;
+die "standby-transfer request decision must allow STANDBY_TRANSFER_SAVE only for batch manager delivery\n"
+  unless $transfer_artifact_decision_for_request =~
+         /STANDBY_TRANSFER_SAVE[\s\S]*BATCH_MANAGER_DELIVERY[\s\S]*UNSUPPORTED/s;
+die "portable transfer manifest must use the explicit numeric transfer token, not bundle metadata token\n"
+  if $transfer =~ /built_manifest\.token\s*=\s*bundle\.metadata\.token/s;
+die "portable transfer manifest must assign the caller-selected transfer token\n"
+  unless $transfer =~
+         /preserve_trx_transfer_build_portable_objects[\s\S]*uint64_t transfer_token[\s\S]*transfer_token\s*==\s*0[\s\S]*built_manifest\.token\s*=\s*transfer_token/s;
 $sql_parse =~
   /case\s+COM_PRESERVE_TRX_TRANSFER\s*:\s*\{[\s\S]*?break\s*;\s*\}/
   or die "could not isolate COM_PRESERVE_TRX_TRANSFER dispatch case\n";

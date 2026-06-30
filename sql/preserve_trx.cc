@@ -1397,6 +1397,64 @@ bool generate_preserve_trx_token(std::string *token) {
   return true;
 }
 
+struct Preserve_trx_token_selection {
+  std::string preserve_token_string;
+  uint64_t transfer_token{0};
+  bool is_transfer_token{false};
+  const char *failure_reason{nullptr};
+};
+
+static bool preserve_trx_select_token_for_request(
+    THD *target_thd, Preserve_trx_transfer_artifact_decision artifact_decision,
+    Preserve_trx_token_selection *selection) {
+  if (selection == nullptr) return true;
+  *selection = Preserve_trx_token_selection{};
+
+  if (artifact_decision !=
+      Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE) {
+    if (generate_preserve_trx_token(&selection->preserve_token_string)) {
+      selection->failure_reason = "token_generation_failed";
+      return true;
+    }
+    return false;
+  }
+
+  if (target_thd == nullptr) {
+    selection->failure_reason = "standby_transfer_missing_target_thd";
+    return true;
+  }
+
+  const uint64_t transfer_token =
+      static_cast<uint64_t>(target_thd->thread_id());
+  if (transfer_token == 0) {
+    selection->failure_reason = "standby_transfer_invalid_token";
+    return true;
+  }
+
+  const std::string token_string = std::to_string(transfer_token);
+  if (!token_is_filename_safe(token_string)) {
+    selection->failure_reason = "standby_transfer_invalid_token";
+    return true;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
+    if (preserved_trx_record_exists_locked(token_string)) {
+      selection->failure_reason = "standby_transfer_token_collision";
+      return true;
+    }
+  }
+  if (preserved_trx_file_exists_for_token(token_string)) {
+    selection->failure_reason = "standby_transfer_token_collision";
+    return true;
+  }
+
+  selection->preserve_token_string = token_string;
+  selection->transfer_token = transfer_token;
+  selection->is_transfer_token = true;
+  return false;
+}
+
 void append_le64(std::string *bytes, uint64_t value) {
   for (size_t i = 0; i < 8; ++i) {
     bytes->push_back(static_cast<char>((value >> (i * 8)) & 0xff));
@@ -8787,6 +8845,16 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   if (timeout_seconds == 0)
     return reject_unsupported_for_delivery("timeout_zero");
 
+  const Preserve_trx_transfer_artifact_decision artifact_decision =
+      preserve_trx_transfer_artifact_decision_for_request(delivery_mode);
+  if (artifact_decision ==
+      Preserve_trx_transfer_artifact_decision::UNSUPPORTED) {
+    return reject_unsupported_for_delivery(
+        delivery_mode == Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY
+            ? "standby_transfer_publish_unsupported"
+            : "standby_transfer_requires_batch_drain");
+  }
+
   set_stage(Preserve_trx_preserve_stage::BINLOG_PREFLIGHT);
   Preserve_snapshot_binlog_state binlog_state =
       Preserve_snapshot_binlog_state::GLOBAL_OFF_NO_CACHE;
@@ -9258,9 +9326,15 @@ bool preserve_trx_kernel_preserve_attached_transaction(
                           substep_started_us);
   }
 
-  std::string token;
-  if (generate_preserve_trx_token(&token))
-    return reject_after_binlog_export("token_generation_failed");
+  Preserve_trx_token_selection token_selection;
+  if (preserve_trx_select_token_for_request(thd, artifact_decision,
+                                            &token_selection)) {
+    return reject_after_binlog_export(
+        token_selection.failure_reason == nullptr
+            ? "token_generation_failed"
+            : token_selection.failure_reason);
+  }
+  std::string token = token_selection.preserve_token_string;
   if (result != nullptr) result->token = token;
 
   XID xid;
@@ -10065,8 +10139,6 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   Preserve_snapshot_delete_status write_failure_delete_status =
       Preserve_snapshot_delete_status::OK;
   Preserved_trx_store_write_stats store_write_stats;
-  const Preserve_trx_transfer_artifact_decision artifact_decision =
-      preserve_trx_transfer_artifact_decision();
   std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> transfer_frame_sink;
   if (artifact_decision ==
       Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE) {
@@ -10088,7 +10160,8 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   const Preserve_snapshot_status artifact_sink_status =
       preserve_trx_make_artifact_sink_for_decision(
           artifact_decision, &store.store(), metadata.token, source_server_uuid,
-          target_server_uuid, preserve_trx_transfer_chunk_bytes,
+          target_server_uuid, token_selection.transfer_token,
+          preserve_trx_transfer_chunk_bytes,
           transfer_frame_sink.get(), &artifact_sink);
   if (artifact_sink_status != Preserve_snapshot_status::OK ||
       artifact_sink == nullptr) {

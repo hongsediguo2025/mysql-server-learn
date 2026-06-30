@@ -42,6 +42,7 @@
 #include "my_thread_local.h"
 #include "mysqld_error.h"
 #include "sql/mysqld.h"
+#include "sql/preserve_trx.h"
 #include "sql/protocol_classic.h"
 #include "sql/sql_class.h"
 
@@ -98,6 +99,18 @@ preserve_trx_transfer_artifact_decision() {
     return Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE;
   }
   return Preserve_trx_transfer_artifact_decision::UNSUPPORTED;
+}
+
+Preserve_trx_transfer_artifact_decision
+preserve_trx_transfer_artifact_decision_for_request(
+    Preserve_trx_delivery_mode delivery_mode) {
+  const Preserve_trx_transfer_artifact_decision decision =
+      preserve_trx_transfer_artifact_decision();
+  if (decision != Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE)
+    return decision;
+  return delivery_mode == Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY
+             ? decision
+             : Preserve_trx_transfer_artifact_decision::UNSUPPORTED;
 }
 
 namespace {
@@ -253,6 +266,10 @@ bool transfer_component_safe(const std::string &component) {
   });
 }
 
+std::string transfer_token_component(uint64_t token) {
+  return token == 0 ? std::string() : std::to_string(token);
+}
+
 bool is_dot_or_dotdot(const char *name) {
   return name != nullptr &&
          ((name[0] == '.' && name[1] == '\0') ||
@@ -285,7 +302,8 @@ std::string transfer_epoch_dir(const std::string &root_dir,
 
 std::string transfer_token_dir(const std::string &root_dir,
                                const Preserve_trx_transfer_manifest &manifest) {
-  return join_path(transfer_epoch_dir(root_dir, manifest), manifest.token);
+  return join_path(transfer_epoch_dir(root_dir, manifest),
+                   transfer_token_component(manifest.token));
 }
 
 std::string transfer_epoch_commit_path(
@@ -310,7 +328,7 @@ std::string transfer_object_range_path(
 Preserve_trx_transfer_status ensure_transfer_token_dir(
     const std::string &root_dir, const Preserve_trx_transfer_manifest &manifest) {
   if (root_dir.empty() || !transfer_component_safe(manifest.epoch_id) ||
-      !transfer_component_safe(manifest.token)) {
+      manifest.token == 0) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
   const std::string transfer_root = join_path(root_dir, ".transfer");
@@ -324,15 +342,16 @@ Preserve_trx_transfer_status ensure_transfer_token_dir(
 
 Preserve_trx_transfer_status cleanup_transfer_token_staging(
     const std::string &root_dir, const std::string &epoch_id,
-    const std::string &token) {
+    uint64_t token) {
+  const std::string token_component = transfer_token_component(token);
   if (root_dir.empty() || !transfer_component_safe(epoch_id) ||
-      !transfer_component_safe(token)) {
+      !transfer_component_safe(token_component)) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
 
   const std::string epoch_dir =
       join_path(join_path(root_dir, ".transfer"), epoch_id);
-  const std::string token_dir = join_path(epoch_dir, token);
+  const std::string token_dir = join_path(epoch_dir, token_component);
   MY_DIR *dir_info =
       my_dir(token_dir.c_str(), MYF(MY_DONT_SORT | MY_WANT_STAT));
   if (dir_info == nullptr) {
@@ -379,7 +398,7 @@ Preserve_trx_transfer_status validate_manifest_components(
   if (!transfer_component_safe(manifest.epoch_id) ||
       !transfer_component_safe(manifest.source_server_uuid) ||
       !transfer_component_safe(manifest.target_server_uuid) ||
-      !transfer_component_safe(manifest.token) ||
+      manifest.token == 0 ||
       manifest.objects.size() > kMaxTransferManifestObjects) {
     return decoded_remote_manifest ? Preserve_trx_transfer_status::CORRUPT
                                    : Preserve_trx_transfer_status::
@@ -532,7 +551,8 @@ Preserve_trx_transfer_status write_commit_marker_file(
   if (marker_status != Preserve_trx_transfer_status::OK) return marker_status;
   if (already_committed) return Preserve_trx_transfer_status::OK;
 
-  const std::string tmp_path = final_path + "." + manifest.token + ".tmp";
+  const std::string tmp_path =
+      final_path + "." + transfer_token_component(manifest.token) + ".tmp";
   const std::string payload = commit_marker_payload(manifest);
   File file = my_create(tmp_path.c_str(), 0600, O_WRONLY | O_TRUNC, MYF(0));
   if (file < 0) return Preserve_trx_transfer_status::IO_ERROR;
@@ -768,7 +788,7 @@ Preserve_trx_transfer_status validate_frame_components(
 
   if (frame.protocol_version != kPreserveTrxTransferProtocolVersion ||
       !transfer_component_safe(frame.epoch_id) ||
-      !transfer_component_safe(frame.token)) {
+      frame.token == 0) {
     return frame_error();
   }
 
@@ -940,10 +960,10 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_manifest(
   append_u64(&out, manifest.frame_sequence);
   if (append_string(&out, manifest.epoch_id) ||
       append_string(&out, manifest.source_server_uuid) ||
-      append_string(&out, manifest.target_server_uuid) ||
-      append_string(&out, manifest.token)) {
+      append_string(&out, manifest.target_server_uuid)) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
+  append_u64(&out, manifest.token);
   append_u32(&out, static_cast<uint32_t>(manifest.objects.size()));
   for (const Preserve_trx_transfer_object_descriptor &object :
        manifest.objects) {
@@ -979,7 +999,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_manifest(
       reader.read_string(&parsed.epoch_id) ||
       reader.read_string(&parsed.source_server_uuid) ||
       reader.read_string(&parsed.target_server_uuid) ||
-      reader.read_string(&parsed.token)) {
+      reader.read_u64(&parsed.token)) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
 
@@ -1030,8 +1050,11 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_frame(
   append_u16(&out, frame.protocol_version);
   append_u16(&out, static_cast<uint16_t>(frame.type));
   append_u64(&out, frame.sequence);
-  if (append_string(&out, frame.epoch_id) || append_string(&out, frame.token) ||
-      append_string(&out, frame.object_id)) {
+  if (append_string(&out, frame.epoch_id)) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  append_u64(&out, frame.token);
+  if (append_string(&out, frame.object_id)) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
   append_u64(&out, frame.chunk_offset);
@@ -1063,7 +1086,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_frame(
       !frame_type_supported(raw_type, &parsed.type) ||
       reader.read_u64(&parsed.sequence) ||
       reader.read_string(&parsed.epoch_id) ||
-      reader.read_string(&parsed.token) ||
+      reader.read_u64(&parsed.token) ||
       reader.read_string(&parsed.object_id) ||
       reader.read_u64(&parsed.chunk_offset) ||
       reader.read_string(&parsed.manifest_payload) ||
@@ -1171,7 +1194,7 @@ Preserve_trx_transfer_receiver_registry::begin_receive(
 
 Preserve_trx_transfer_status
 Preserve_trx_transfer_receiver_registry::mark_saved_online(
-    const std::string &epoch_id, const std::string &token) {
+    const std::string &epoch_id, uint64_t token) {
   std::lock_guard<std::mutex> guard(m_mutex);
   return mark_terminal_locked(Token_key(epoch_id, token),
                               Preserve_trx_transfer_receiver_state::SAVED_ONLINE,
@@ -1180,7 +1203,7 @@ Preserve_trx_transfer_receiver_registry::mark_saved_online(
 
 Preserve_trx_transfer_status
 Preserve_trx_transfer_receiver_registry::mark_corrupt(
-    const std::string &epoch_id, const std::string &token,
+    const std::string &epoch_id, uint64_t token,
     const std::string &reason) {
   std::lock_guard<std::mutex> guard(m_mutex);
   return mark_terminal_locked(Token_key(epoch_id, token),
@@ -1190,7 +1213,7 @@ Preserve_trx_transfer_receiver_registry::mark_corrupt(
 
 Preserve_trx_transfer_status
 Preserve_trx_transfer_receiver_registry::mark_aborted(
-    const std::string &epoch_id, const std::string &token,
+    const std::string &epoch_id, uint64_t token,
     const std::string &reason) {
   std::lock_guard<std::mutex> guard(m_mutex);
   return mark_terminal_locked(Token_key(epoch_id, token),
@@ -1200,7 +1223,7 @@ Preserve_trx_transfer_receiver_registry::mark_aborted(
 
 Preserve_trx_transfer_status
 Preserve_trx_transfer_receiver_registry::mark_object_sealed(
-    const std::string &epoch_id, const std::string &token,
+    const std::string &epoch_id, uint64_t token,
     const std::string &object_id) {
   std::lock_guard<std::mutex> guard(m_mutex);
   const Token_key key(epoch_id, token);
@@ -1222,7 +1245,7 @@ Preserve_trx_transfer_receiver_registry::mark_object_sealed(
 }
 
 bool Preserve_trx_transfer_receiver_registry::all_objects_sealed(
-    const std::string &epoch_id, const std::string &token) const {
+    const std::string &epoch_id, uint64_t token) const {
   std::lock_guard<std::mutex> guard(m_mutex);
   const auto found = m_records.find(Token_key(epoch_id, token));
   if (found == m_records.end() ||
@@ -1280,7 +1303,7 @@ Preserve_trx_transfer_receiver_registry::sealed_receiving_records_for_epoch(
 }
 
 bool Preserve_trx_transfer_receiver_registry::lookup(
-    const std::string &epoch_id, const std::string &token,
+    const std::string &epoch_id, uint64_t token,
     Preserve_trx_transfer_receiver_record *record) const {
   if (record == nullptr) return false;
   std::lock_guard<std::mutex> guard(m_mutex);
@@ -1372,9 +1395,9 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_portable_bundle(
 Preserve_trx_transfer_status preserve_trx_transfer_build_portable_objects(
     const std::string &epoch_id, const std::string &source_server_uuid,
     const std::string &target_server_uuid, const Preserved_trx_bundle &bundle,
-    Preserve_trx_transfer_manifest *manifest,
+    uint64_t transfer_token, Preserve_trx_transfer_manifest *manifest,
     std::vector<Preserve_trx_transfer_object_payload> *objects) {
-  if (manifest == nullptr || objects == nullptr) {
+  if (manifest == nullptr || objects == nullptr || transfer_token == 0) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
 
@@ -1387,7 +1410,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_build_portable_objects(
   built_manifest.epoch_id = epoch_id;
   built_manifest.source_server_uuid = source_server_uuid;
   built_manifest.target_server_uuid = target_server_uuid;
-  built_manifest.token = bundle.metadata.token;
+  built_manifest.token = transfer_token;
 
   std::vector<Preserve_trx_transfer_object_payload> built_objects;
   std::set<std::string> object_ids;
@@ -1513,7 +1536,8 @@ Preserve_trx_transfer_status
 preserve_trx_transfer_build_encoded_frame_sequence(
     const std::string &epoch_id, const std::string &source_server_uuid,
     const std::string &target_server_uuid, const Preserved_trx_bundle &bundle,
-    uint32_t chunk_bytes, std::vector<std::string> *encoded_frames,
+    uint64_t transfer_token, uint32_t chunk_bytes,
+    std::vector<std::string> *encoded_frames,
     Preserve_trx_transfer_manifest *manifest) {
   if (encoded_frames == nullptr) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
@@ -1524,6 +1548,7 @@ preserve_trx_transfer_build_encoded_frame_sequence(
   Preserve_trx_transfer_status status =
       preserve_trx_transfer_build_portable_objects(
           epoch_id, source_server_uuid, target_server_uuid, bundle,
+          transfer_token,
           &built_manifest, &objects);
   if (status != Preserve_trx_transfer_status::OK) return status;
 
@@ -1578,7 +1603,8 @@ void preserve_trx_transfer_set_frame_sink_factory_for_unit_test(
 Preserve_trx_transfer_status preserve_trx_transfer_send_bundle_frames(
     const std::string &epoch_id, const std::string &source_server_uuid,
     const std::string &target_server_uuid, const Preserved_trx_bundle &bundle,
-    uint32_t chunk_bytes, Preserve_trx_transfer_encoded_frame_sink *sink,
+    uint64_t transfer_token, uint32_t chunk_bytes,
+    Preserve_trx_transfer_encoded_frame_sink *sink,
     Preserve_trx_transfer_manifest *manifest) {
   if (sink == nullptr) return Preserve_trx_transfer_status::INVALID_ARGUMENT;
 
@@ -1587,6 +1613,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_send_bundle_frames(
   Preserve_trx_transfer_status status =
       preserve_trx_transfer_build_portable_objects(
           epoch_id, source_server_uuid, target_server_uuid, bundle,
+          transfer_token,
           &built_manifest, &objects);
   if (status != Preserve_trx_transfer_status::OK) return status;
 
@@ -1640,10 +1667,12 @@ Preserve_trx_transfer_status preserve_trx_transfer_send_bundle_frames(
 Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_bundles(
     const std::string &epoch_id, const std::string &source_server_uuid,
     const std::string &target_server_uuid,
-    const std::vector<Preserved_trx_bundle> &bundles, uint32_t chunk_bytes,
+    const std::vector<Preserved_trx_bundle> &bundles,
+    const std::vector<uint64_t> &transfer_tokens, uint32_t chunk_bytes,
     Preserve_trx_transfer_encoded_frame_sink *sink,
     std::vector<Preserve_trx_transfer_manifest> *manifests) {
-  if (sink == nullptr || chunk_bytes == 0 || bundles.empty()) {
+  if (sink == nullptr || chunk_bytes == 0 || bundles.empty() ||
+      bundles.size() != transfer_tokens.size()) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
 
@@ -1655,13 +1684,14 @@ Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_bundles(
 
   std::vector<Token_payload> tokens;
   tokens.reserve(bundles.size());
-  std::set<std::string> token_names;
+  std::set<uint64_t> token_names;
   uint64_t inflight_bytes = 0;
   for (const Preserved_trx_bundle &bundle : bundles) {
     Token_payload token;
     Preserve_trx_transfer_status status =
         preserve_trx_transfer_build_portable_objects(
             epoch_id, source_server_uuid, target_server_uuid, bundle,
+            transfer_tokens[tokens.size()],
             &token.manifest, &token.objects);
     if (status != Preserve_trx_transfer_status::OK) return status;
     if (!token_names.insert(token.manifest.token).second) {
@@ -1690,7 +1720,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_bundles(
   }
 
   uint64_t sequence = 1;
-  std::vector<std::string> begun_tokens;
+  std::vector<uint64_t> begun_tokens;
   auto send_frame = [&](const Preserve_trx_transfer_frame &frame) {
     std::string encoded_frame;
     Preserve_trx_transfer_status status =
@@ -1699,7 +1729,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_bundles(
     return sink->send_encoded_frame(encoded_frame);
   };
   auto abort_begun_tokens = [&](Preserve_trx_transfer_status original_status) {
-    for (const std::string &token : begun_tokens) {
+    for (uint64_t token : begun_tokens) {
       Preserve_trx_transfer_frame abort;
       abort.type = Preserve_trx_transfer_frame_type::ABORT;
       abort.sequence = sequence++;
@@ -1816,7 +1846,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_stage_object_chunk(
   const Preserve_trx_transfer_object_descriptor *object =
       find_object(manifest, object_id);
   if (root_dir.empty() || !transfer_component_safe(manifest.epoch_id) ||
-      !transfer_component_safe(manifest.token) || object == nullptr ||
+      manifest.token == 0 || object == nullptr ||
       !transfer_component_safe(object_id)) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
@@ -1863,7 +1893,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_seal_staged_object(
   const Preserve_trx_transfer_object_descriptor *object =
       find_object(manifest, object_id);
   if (root_dir.empty() || !transfer_component_safe(manifest.epoch_id) ||
-      !transfer_component_safe(manifest.token) || object == nullptr ||
+      manifest.token == 0 || object == nullptr ||
       !transfer_component_safe(object_id)) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
@@ -2004,7 +2034,8 @@ Preserve_trx_transfer_status preserve_trx_transfer_publish_standby_bundle(
     const Preserve_trx_transfer_manifest &manifest, Preserved_trx_bundle bundle,
     Preserved_trx_store *store, uint64_t timeout_seconds,
     Preserve_snapshot_metadata *written_metadata) {
-  if (store == nullptr || bundle.metadata.token != manifest.token) {
+  const std::string token_component = transfer_token_component(manifest.token);
+  if (store == nullptr || bundle.metadata.token != token_component) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
 
@@ -2086,8 +2117,9 @@ Preserve_trx_transfer_status preserve_trx_transfer_commit_epoch(
   if (list_status != Preserve_snapshot_status::OK) {
     return map_snapshot_status_to_transfer(list_status);
   }
-  if (listing.snapshot_tokens.count(manifest.token) == 0 ||
-      listing.standby_pending_tokens.count(manifest.token) == 0) {
+  const std::string token_component = transfer_token_component(manifest.token);
+  if (listing.snapshot_tokens.count(token_component) == 0 ||
+      listing.standby_pending_tokens.count(token_component) == 0) {
     return Preserve_trx_transfer_status::CORRUPT;
   }
 
@@ -2353,7 +2385,7 @@ Preserve_snapshot_status Preserve_trx_transfer_artifact_sink::publish_bundle(
   const Preserve_trx_transfer_status status =
       preserve_trx_transfer_send_bundle_frames(
           m_epoch_id, m_source_server_uuid, m_target_server_uuid, bundle,
-          m_chunk_bytes, m_frame_sink, nullptr);
+          m_transfer_token, m_chunk_bytes, m_frame_sink, nullptr);
   if (status != Preserve_trx_transfer_status::OK) {
     return map_transfer_status_to_snapshot(status);
   }
@@ -2378,8 +2410,8 @@ Preserve_trx_standby_pending_artifact_sink::publish_bundle(
 Preserve_snapshot_status preserve_trx_make_artifact_sink_for_decision(
     Preserve_trx_transfer_artifact_decision decision, Preserved_trx_store *store,
     const std::string &epoch_id, const std::string &source_server_uuid,
-    const std::string &target_server_uuid, uint32_t chunk_bytes,
-    Preserve_trx_transfer_encoded_frame_sink *frame_sink,
+    const std::string &target_server_uuid, uint64_t transfer_token,
+    uint32_t chunk_bytes, Preserve_trx_transfer_encoded_frame_sink *frame_sink,
     std::unique_ptr<Preserve_trx_artifact_sink> *sink) {
   if (sink == nullptr) return Preserve_snapshot_status::INVALID_ARGUMENT;
   sink->reset();
@@ -2390,14 +2422,14 @@ Preserve_snapshot_status preserve_trx_make_artifact_sink_for_decision(
       sink->reset(new Preserve_trx_local_carrier_artifact_sink(store));
       return Preserve_snapshot_status::OK;
     case Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE:
-      if (frame_sink == nullptr || epoch_id.empty() ||
+      if (frame_sink == nullptr || transfer_token == 0 || epoch_id.empty() ||
           source_server_uuid.empty() || target_server_uuid.empty() ||
           chunk_bytes == 0) {
         return Preserve_snapshot_status::INVALID_ARGUMENT;
       }
       sink->reset(new Preserve_trx_transfer_artifact_sink(
-          epoch_id, source_server_uuid, target_server_uuid, chunk_bytes,
-          frame_sink));
+          epoch_id, source_server_uuid, target_server_uuid, transfer_token,
+          chunk_bytes, frame_sink));
       return Preserve_snapshot_status::OK;
     case Preserve_trx_transfer_artifact_decision::UNSUPPORTED:
       return Preserve_snapshot_status::UNSUPPORTED;
