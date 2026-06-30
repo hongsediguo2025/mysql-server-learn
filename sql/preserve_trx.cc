@@ -85,6 +85,7 @@
 #include "sql/preserve_trx_kernel.h"
 #include "sql/preserve_trx_lock_warmcopy.h"
 #include "sql/preserve_trx_temp_table.h"
+#include "sql/preserve_trx_transfer.h"
 #include "sql/preserve_trx_warmcopy.h"
 #include "sql/preserve_trx_xid.h"
 #include "sql/sql_const.h"
@@ -8241,7 +8242,9 @@ bool preserved_trx_preflight_recoverability() {
     return true;
   }
 
-  for (const std::string &token : listing.snapshot_tokens) {
+  const std::set<std::string> snapshot_tokens =
+      preserved_trx_local_recoverable_snapshot_tokens(listing);
+  for (const std::string &token : snapshot_tokens) {
     Preserved_trx_bundle bundle;
     Preserve_snapshot_status status =
         store->read(token, false,
@@ -8312,7 +8315,9 @@ bool preserved_temp_images_bootstrap_preamble() {
     }
   };
 
-  for (const std::string &token : listing.snapshot_tokens) {
+  const std::set<std::string> snapshot_tokens =
+      preserved_trx_local_recoverable_snapshot_tokens(listing);
+  for (const std::string &token : snapshot_tokens) {
     Preserved_trx_bundle bundle;
     Preserve_snapshot_status status =
         store->read(token, true,
@@ -8556,9 +8561,20 @@ bool preserved_trx_recover_all() {
     return true;
   }
 
-  std::set<std::string> snapshot_tokens = listing.snapshot_tokens;
-  std::set<std::string> binlog_cache_tokens = listing.external_blob_tokens;
-  std::set<std::string> tainted_tokens = listing.tainted_tokens;
+  /*
+    Standby-transfer artifacts are published as durable files but are not local
+    resume tokens yet. Promotion-side code must explicitly adopt them; ordinary
+    startup recovery must not import or roll them back as if this server created
+    the preserved transaction.
+  */
+  std::set<std::string> snapshot_tokens =
+      preserved_trx_local_recoverable_snapshot_tokens(listing);
+  std::set<std::string> binlog_cache_tokens =
+      preserved_trx_filter_standby_pending_tokens_for_local_recovery(
+          listing.external_blob_tokens, listing);
+  std::set<std::string> tainted_tokens =
+      preserved_trx_filter_standby_pending_tokens_for_local_recovery(
+          listing.tainted_tokens, listing);
   std::set<std::string> warm_external_blob_artifacts =
       listing.warm_external_blob_artifacts;
 
@@ -10049,11 +10065,43 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   Preserve_snapshot_delete_status write_failure_delete_status =
       Preserve_snapshot_delete_status::OK;
   Preserved_trx_store_write_stats store_write_stats;
+  const Preserve_trx_transfer_artifact_decision artifact_decision =
+      preserve_trx_transfer_artifact_decision();
+  std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> transfer_frame_sink;
+  if (artifact_decision ==
+      Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE) {
+    const Preserve_trx_transfer_status frame_sink_status =
+        preserve_trx_transfer_make_configured_frame_sink(&transfer_frame_sink);
+    if (frame_sink_status != Preserve_trx_transfer_status::OK ||
+        transfer_frame_sink == nullptr) {
+      set_failure_reason("standby_transfer_publish_unsupported");
+      discard_prebuilt_binlog_blob_if_needed();
+      return reject_after_snapshot_failure(false);
+    }
+  }
+  std::unique_ptr<Preserve_trx_artifact_sink> artifact_sink;
+  const std::string source_server_uuid(server_uuid);
+  const std::string target_server_uuid =
+      preserve_trx_transfer_target_server_uuid == nullptr
+          ? std::string()
+          : std::string(preserve_trx_transfer_target_server_uuid);
+  const Preserve_snapshot_status artifact_sink_status =
+      preserve_trx_make_artifact_sink_for_decision(
+          artifact_decision, &store.store(), metadata.token, source_server_uuid,
+          target_server_uuid, preserve_trx_transfer_chunk_bytes,
+          transfer_frame_sink.get(), &artifact_sink);
+  if (artifact_sink_status != Preserve_snapshot_status::OK ||
+      artifact_sink == nullptr) {
+    set_failure_reason("standby_transfer_publish_unsupported");
+    discard_prebuilt_binlog_blob_if_needed();
+    return reject_after_snapshot_failure(false);
+  }
   substep_started_us = preserve_trx_monotonic_us();
   const Preserve_snapshot_status status =
-      store->write(std::move(bundle), timeout_seconds, &metadata,
-                   &durable_snapshot_may_exist, &write_failure_delete_status,
-                   &store_write_stats);
+      artifact_sink->publish_bundle(
+          std::move(bundle), timeout_seconds, &metadata,
+          &durable_snapshot_may_exist, &write_failure_delete_status,
+          &store_write_stats);
   add_result_elapsed_us(&Preserve_trx_preserve_result::snapshot_write_store_us,
                         substep_started_us);
   if (result != nullptr) {

@@ -1571,6 +1571,18 @@ bool write_tainted_marker(const std::string &dir, const std::string &token,
                            {}) != Atomic_write_status::OK;
 }
 
+bool write_standby_pending_marker(const std::string &dir,
+                                  const std::string &token) {
+  if (!token_is_filename_safe(token)) return true;
+  DBUG_EXECUTE_IF("preserve_trx_fail_write_standby_pending_marker",
+                  return true;);
+  const std::string normalized_dir = normalize_dir(dir);
+  const std::string marker = "standby_pending\n";
+  const std::vector<unsigned char> bytes(marker.begin(), marker.end());
+  return atomic_write_file(normalized_dir, token + ".standby_pending", bytes,
+                           0600, {}) != Atomic_write_status::OK;
+}
+
 }  // namespace
 
 bool preserve_trx_errno_is_transient_io_for_unit_test(int err) {
@@ -1916,6 +1928,20 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::remove_taint(
   return Preserved_trx_carrier_status::OK;
 }
 
+Preserved_trx_carrier_status
+Local_file_preserved_trx_carrier::mark_standby_pending(
+    const std::string &token) {
+  /*
+    A standby-pending marker makes a transferred artifact visible to the future
+    promotion path while keeping it out of the ordinary local resume registry.
+    It is stored beside the immutable snapshot so transfer cleanup can reason
+    about the publish boundary without rewriting the snapshot body.
+  */
+  return write_standby_pending_marker(m_dir, token)
+             ? Preserved_trx_carrier_status::IO_ERROR
+             : Preserved_trx_carrier_status::OK;
+}
+
 Preserved_trx_carrier_status Local_file_preserved_trx_carrier::list_tokens(
     Preserved_trx_carrier_listing *listing) {
   if (listing == nullptr) return Preserved_trx_carrier_status::CORRUPT;
@@ -1923,6 +1949,7 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::list_tokens(
   listing->external_blob_tokens.clear();
   listing->temp_sidecar_tokens.clear();
   listing->tainted_tokens.clear();
+  listing->standby_pending_tokens.clear();
   listing->warm_external_blob_artifacts.clear();
 
   /*
@@ -1963,6 +1990,10 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::list_tokens(
       }
       if (filename_to_token(file->name, ".tainted", &token)) {
         listing->tainted_tokens.insert(token);
+        continue;
+      }
+      if (filename_to_token(file->name, ".standby_pending", &token)) {
+        listing->standby_pending_tokens.insert(token);
         continue;
       }
       if (filename_to_temp_sidecar_token(file->name, &token)) {
@@ -2031,6 +2062,8 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::token_state(
                             external_blob_filename(
                                 token, kPreservedTrxBlobRecordLocks)));
   state->tainted = file_exists(join_path(m_dir, token + ".tainted"));
+  state->standby_pending =
+      file_exists(join_path(m_dir, token + ".standby_pending"));
 
   for (const std::string &candidate_dir :
        generic_external_blob_dirs_for_token(m_dir, token)) {

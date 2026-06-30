@@ -446,6 +446,7 @@ SET(SQL_SHARED_SOURCES
   preserve_trx_rewrite.cc
   preserve_trx_temp_table.cc
   preserve_trx_temp_table_carrier.cc
+  preserve_trx_transfer.cc
   preserve_trx_warmcopy.cc
   persisted_variable.cc
   protocol_classic.cc

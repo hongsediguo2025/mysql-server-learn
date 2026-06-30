@@ -1,0 +1,1 @@
+--preserve-trx-transfer-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE

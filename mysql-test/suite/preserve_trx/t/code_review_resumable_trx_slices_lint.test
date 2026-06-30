@@ -83,6 +83,8 @@ my $handler_path = File::Spec->catfile($source_root, 'sql', 'handler.cc');
 my $gunit_path = File::Spec->catfile($source_root, 'unittest', 'gunit',
                                      'preserve_trx-t.cc');
 my $sql_parse_path = File::Spec->catfile($source_root, 'sql', 'sql_parse.cc');
+my $transfer_path = File::Spec->catfile($source_root, 'sql',
+                                        'preserve_trx_transfer.cc');
 
 my $preserve = read_source($preserve_path);
 my $preserve_header = read_source($preserve_header_path);
@@ -114,6 +116,7 @@ my $drain = read_source($drain_path);
 my $handler = read_source($handler_path);
 my $gunit = read_source($gunit_path);
 my $sql_parse = read_source($sql_parse_path);
+my $transfer = read_source($transfer_path);
 
 $lock_preserve =~ /static bool lock_preserve_page_identity_matches[\s\S]*?^}/m
   or die "could not isolate lock_preserve_page_identity_matches\n";
@@ -973,6 +976,11 @@ die "recovery preflight must list snapshots through Preserved_trx_store\n"
          $preflight_recovery =~ /->read\s*\(/s;
 die "recovery preflight must read snapshot-only so sidecar corruption is handled by recovery proper\n"
   unless $preflight_recovery =~ /Payload_read_mode::SNAPSHOT_ONLY/s;
+die "recovery preflight must exclude standby-pending transfer artifacts from local startup checks\n"
+  unless $preflight_recovery =~
+         /preserved_trx_local_recoverable_snapshot_tokens\s*\(\s*listing\s*\)/s &&
+         $preflight_recovery =~
+         /for\s*\(\s*const std::string &token\s*:\s*snapshot_tokens\s*\)/s;
 die "recovery preflight must fail fast on unreadable durable snapshots\n"
   unless $preflight_recovery =~
          /status\s*!=\s*Preserve_snapshot_status::OK[\s\S]*?return\s+log_preserved_trx_recovery_failure/s;
@@ -1158,9 +1166,14 @@ die "could not find preserve_trx_kernel_preserve_attached_transaction end\n"
 my $preserve_kernel =
   substr($preserve, $preserve_kernel_start,
          $preserve_kernel_end - $preserve_kernel_start);
-die "preserve kernel path must write snapshots through the default store factory until store/carrier slice splits it\n"
+die "preserve kernel path must publish snapshots through the default store factory and artifact-sink factory\n"
   unless $preserve_kernel =~ /create_preserved_trx_default_store/s &&
-         $preserve_kernel =~ /->write\s*\(/s;
+         $preserve_kernel =~ /preserve_trx_transfer_make_configured_frame_sink/s &&
+         $preserve_kernel =~ /preserve_trx_make_artifact_sink_for_decision\s*\(/s &&
+         $preserve_kernel =~ /artifact_sink->publish_bundle\s*\(/s;
+die "unsupported standby-transfer artifact mode must fail closed before artifact publish\n"
+  unless $preserve_kernel =~
+         /preserve_trx_make_artifact_sink_for_decision[\s\S]*artifact_sink_status[\s\S]*standby_transfer_publish_unsupported[\s\S]*reject_after_snapshot_failure\s*\(\s*false\s*\)[\s\S]*artifact_sink->publish_bundle/s;
 die "preserve kernel must not send client OK packets\n"
   if $preserve_kernel =~ /\bmy_ok\s*\(/s;
 die "preserve kernel must not register pending token delivery\n"
@@ -1283,7 +1296,7 @@ die "lock warmcopy conversion freeze must be released only after preserved recor
 die "lock warmcopy must recheck the frozen fence after snapshot write and before preserved record registration\n"
   unless $preserve =~ /auto verify_lock_warmcopy_frozen_fence[\s\S]*lock_warmcopy_trx_lock_fence_equal\s*\(\s*lock_warmcopy_frozen_fence/s &&
          $preserve =~
-         /store->write\s*\([\s\S]*?preserve_trx_lock_warmcopy_after_snapshot_write_before_final_fence[\s\S]*?preserve_trx_lock_warmcopy_simulate_conversion_after_snapshot_write[\s\S]*?verify_lock_warmcopy_frozen_fence\s*\(\s*\)[\s\S]*?reject_after_snapshot_failure[\s\S]*?preserved_trx_add_record/s;
+         /artifact_sink->publish_bundle\s*\([\s\S]*?preserve_trx_lock_warmcopy_after_snapshot_write_before_final_fence[\s\S]*?preserve_trx_lock_warmcopy_simulate_conversion_after_snapshot_write[\s\S]*?verify_lock_warmcopy_frozen_fence\s*\(\s*\)[\s\S]*?reject_after_snapshot_failure[\s\S]*?preserved_trx_add_record/s;
 $lock =~ /static dberr_t lock_rec_convert_impl_to_expl_for_trx[\s\S]*?^}/m
   or die "could not isolate lock_rec_convert_impl_to_expl_for_trx\n";
 my $impl_to_expl_for_trx = $&;
@@ -1499,6 +1512,9 @@ die "temporary tablespace bootstrap must skip force recovery before carrier scan
   unless $temp_bootstrap_start >= 0 &&
          $temp_bootstrap_force_recovery > $temp_bootstrap_start &&
          $temp_bootstrap_store_scan > $temp_bootstrap_force_recovery;
+die "temporary tablespace bootstrap must exclude standby-pending transfer artifacts from local startup reservations\n"
+  unless $preserve =~
+         /bool preserved_temp_images_bootstrap_preamble[\s\S]*preserved_trx_local_recoverable_snapshot_tokens\s*\(\s*listing\s*\)[\s\S]*for\s*\(\s*const std::string &token\s*:\s*snapshot_tokens\s*\)/s;
 die "temporary tablespace bootstrap must snapshot-read headers before validating temp sidecars\n"
   unless $preserve =~
          /bool preserved_temp_images_bootstrap_preamble[\s\S]*store->read\s*\(\s*token\s*,\s*true\s*,\s*Preserved_trx_carrier::Payload_read_mode::SNAPSHOT_ONLY[\s\S]*validate_temp_sidecars_for_bootstrap/s &&
@@ -1565,6 +1581,38 @@ die "resume-timeout rollback must emit an audit event\n"
 die "resume corrupt-snapshot rollback must emit an audit event\n"
   unless $preserve =~
          /static bool rollback_resumable_record_after_corrupt_snapshot[\s\S]*?audit_preserved_trx_event\s*\(\s*current_thd\s*,\s*record\.metadata\.token\s*,\s*"rollback"\s*,\s*"failure"/s;
+$transfer =~
+  /static bool preserve_trx_transfer_source_endpoint_ready\(\)[\s\S]*?^}/m
+  or die "could not isolate preserve_trx_transfer_source_endpoint_ready\n";
+my $transfer_endpoint_ready = $&;
+$transfer =~
+  /Preserve_trx_transfer_artifact_decision\s+preserve_trx_transfer_artifact_decision\(\)[\s\S]*?^}/m
+  or die "could not isolate preserve_trx_transfer_artifact_decision\n";
+my $transfer_artifact_decision = $&;
+die "standby-transfer artifact decision must require a configured source endpoint before entering STANDBY_TRANSFER_SAVE\n"
+  unless $transfer_endpoint_ready =~
+         /preserve_trx_transfer_target_host[\s\S]*preserve_trx_transfer_target_port[\s\S]*preserve_trx_transfer_target_socket[\s\S]*preserve_trx_transfer_target_server_uuid[\s\S]*preserve_trx_transfer_target_user[\s\S]*preserve_trx_transfer_credential_name/s &&
+         $transfer_artifact_decision =~
+         /preserve_trx_transfer_source_endpoint_ready\s*\(\s*\)[\s\S]*UNSUPPORTED[\s\S]*STANDBY_TRANSFER_SAVE/s &&
+         $transfer =~
+         /preserve_trx_transfer_make_configured_frame_sink[\s\S]*preserve_trx_transfer_source_endpoint_ready\s*\(\s*\)[\s\S]*UNSUPPORTED/s;
+$sql_parse =~
+  /case\s+COM_PRESERVE_TRX_TRANSFER\s*:\s*\{[\s\S]*?break\s*;\s*\}/
+  or die "could not isolate COM_PRESERVE_TRX_TRANSFER dispatch case\n";
+my $transfer_com_case = $&;
+die "standby transfer COM command must route through the transfer module handler instead of keeping protocol logic in sql_parse.cc\n"
+  unless $transfer_com_case =~ /preserve_trx_transfer_dispatch_command\s*\(/s;
+die "standby transfer COM command must not directly return ER_UNKNOWN_COM_ERROR from sql_parse.cc\n"
+  if $transfer_com_case =~ /ER_UNKNOWN_COM_ERROR/s;
+$transfer =~
+  /void\s+preserve_trx_transfer_dispatch_command\(THD \*thd\)[\s\S]*?^}/m
+  or die "could not isolate preserve_trx_transfer_dispatch_command\n";
+my $transfer_dispatch_command = $&;
+die "standby transfer receiver dispatch must require PRESERVE_TRX_TRANSFER_ADMIN before staging frames\n"
+  unless $transfer_dispatch_command =~ /PRESERVE_TRX_TRANSFER_ADMIN/s &&
+         $transfer_dispatch_command =~ /has_global_grant/s &&
+         index($transfer_dispatch_command, 'has_global_grant') <
+         index($transfer_dispatch_command, 'preserve_trx_transfer_handle_receiver_payload');
 EOF
 
 SELECT 'ok' AS code_review_resumable_trx_slices_lint;

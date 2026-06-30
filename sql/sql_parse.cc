@@ -121,6 +121,7 @@
 #include "sql/protocol_classic.h"
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_drain.h"
+#include "sql/preserve_trx_transfer.h"
 #include "sql/psi_memory_key.h"
 #include "sql/query_options.h"
 #include "sql/query_result.h"
@@ -250,6 +251,7 @@ const LEX_CSTRING command_name[] = {
     {STRING_WITH_LEN("Binlog Dump GTID")},
     {STRING_WITH_LEN("Reset Connection")},
     {STRING_WITH_LEN("clone")},
+    {STRING_WITH_LEN("Preserve Trx Transfer")},
     {STRING_WITH_LEN("Error")}  // Last command number
 };
 
@@ -1672,6 +1674,11 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
       thd->lex->m_sql_cmd = clone_cmd;
       thd->lex->sql_command = SQLCOM_CLONE;
 
+      break;
+    }
+    case COM_PRESERVE_TRX_TRANSFER: {
+      thd->status_var.com_other++;
+      preserve_trx_transfer_dispatch_command(thd);
       break;
     }
     case COM_CHANGE_USER: {

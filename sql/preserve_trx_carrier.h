@@ -65,6 +65,7 @@ struct Preserved_trx_carrier_listing {
   std::set<std::string> external_blob_tokens;
   std::set<std::string> temp_sidecar_tokens;
   std::set<std::string> tainted_tokens;
+  std::set<std::string> standby_pending_tokens;
   std::set<std::string> warm_external_blob_artifacts;
 };
 
@@ -78,7 +79,16 @@ struct Preserved_trx_carrier_token_state {
   bool external_blob{false};
   bool temp_sidecar{false};
   bool tainted{false};
+  bool standby_pending{false};
 };
+
+std::set<std::string>
+preserved_trx_filter_standby_pending_tokens_for_local_recovery(
+    const std::set<std::string> &tokens,
+    const Preserved_trx_carrier_listing &listing);
+
+std::set<std::string> preserved_trx_local_recoverable_snapshot_tokens(
+    const Preserved_trx_carrier_listing &listing);
 
 struct Preserved_trx_carrier_read_limits {
   /*
@@ -226,6 +236,9 @@ class Preserved_trx_carrier {
   virtual Preserved_trx_carrier_status remove_taint(
       const std::string &token) = 0;
 
+  virtual Preserved_trx_carrier_status mark_standby_pending(
+      const std::string &token) = 0;
+
   virtual Preserved_trx_carrier_status list_tokens(
       Preserved_trx_carrier_listing *listing) = 0;
 
@@ -351,6 +364,13 @@ class Preserved_trx_store {
                                  Preserved_trx_store_write_stats
                                      *write_stats = nullptr);
 
+  Preserve_snapshot_status write_standby_pending(
+      Preserved_trx_bundle bundle, uint64_t timeout_seconds,
+      Preserve_snapshot_metadata *written_metadata,
+      bool *durable_snapshot_may_exist = nullptr,
+      Preserve_snapshot_delete_status *write_failure_delete_status = nullptr,
+      Preserved_trx_store_write_stats *write_stats = nullptr);
+
   Preserve_snapshot_status read(const std::string &token, bool validate_identity,
                                 Preserved_trx_bundle *bundle);
   Preserve_snapshot_status read(const std::string &token, bool validate_identity,
@@ -377,6 +397,14 @@ class Preserved_trx_store {
   Preserve_snapshot_status remove_stale_tmp_files(const std::string &token);
 
  private:
+  Preserve_snapshot_status write_impl(
+      Preserved_trx_bundle bundle, uint64_t timeout_seconds,
+      Preserve_snapshot_metadata *written_metadata,
+      bool *durable_snapshot_may_exist,
+      Preserve_snapshot_delete_status *write_failure_delete_status,
+      Preserved_trx_store_write_stats *write_stats,
+      bool publish_standby_pending);
+
   Preserved_trx_carrier *m_carrier{nullptr};
   Preserved_trx_carrier_read_limits m_read_limits;
 };

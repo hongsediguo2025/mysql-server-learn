@@ -1,0 +1,8 @@
+DROP USER IF EXISTS preserve_transfer_receiver@localhost;
+CREATE USER preserve_transfer_receiver@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO preserve_transfer_receiver@localhost;
+SHOW GRANTS FOR preserve_transfer_receiver@localhost;
+Grants for preserve_transfer_receiver@localhost
+GRANT USAGE ON *.* TO `preserve_transfer_receiver`@`localhost`
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO `preserve_transfer_receiver`@`localhost`
+DROP USER preserve_transfer_receiver@localhost;

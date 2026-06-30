@@ -224,6 +224,23 @@ void add_store_write_elapsed(uint64_t Preserved_trx_store_write_stats::*field,
 
 }  // namespace
 
+std::set<std::string> preserved_trx_local_recoverable_snapshot_tokens(
+    const Preserved_trx_carrier_listing &listing) {
+  return preserved_trx_filter_standby_pending_tokens_for_local_recovery(
+      listing.snapshot_tokens, listing);
+}
+
+std::set<std::string>
+preserved_trx_filter_standby_pending_tokens_for_local_recovery(
+    const std::set<std::string> &candidate_tokens,
+    const Preserved_trx_carrier_listing &listing) {
+  std::set<std::string> tokens = candidate_tokens;
+  for (const std::string &token : listing.standby_pending_tokens) {
+    tokens.erase(token);
+  }
+  return tokens;
+}
+
 Preserved_trx_carrier_status Preserved_trx_carrier::token_state(
     const std::string &token, Preserved_trx_carrier_token_state *state) {
   if (state == nullptr) return Preserved_trx_carrier_status::CORRUPT;
@@ -235,6 +252,7 @@ Preserved_trx_carrier_status Preserved_trx_carrier::token_state(
   state->external_blob = listing.external_blob_tokens.count(token) != 0;
   state->temp_sidecar = listing.temp_sidecar_tokens.count(token) != 0;
   state->tainted = listing.tainted_tokens.count(token) != 0;
+  state->standby_pending = listing.standby_pending_tokens.count(token) != 0;
   return Preserved_trx_carrier_status::OK;
 }
 
@@ -244,6 +262,28 @@ Preserve_snapshot_status Preserved_trx_store::write(
     bool *durable_snapshot_may_exist,
     Preserve_snapshot_delete_status *write_failure_delete_status,
     Preserved_trx_store_write_stats *write_stats) {
+  return write_impl(std::move(bundle), timeout_seconds, written_metadata,
+                    durable_snapshot_may_exist, write_failure_delete_status,
+                    write_stats, false);
+}
+
+Preserve_snapshot_status Preserved_trx_store::write_standby_pending(
+    Preserved_trx_bundle bundle, uint64_t timeout_seconds,
+    Preserve_snapshot_metadata *written_metadata,
+    bool *durable_snapshot_may_exist,
+    Preserve_snapshot_delete_status *write_failure_delete_status,
+    Preserved_trx_store_write_stats *write_stats) {
+  return write_impl(std::move(bundle), timeout_seconds, written_metadata,
+                    durable_snapshot_may_exist, write_failure_delete_status,
+                    write_stats, true);
+}
+
+Preserve_snapshot_status Preserved_trx_store::write_impl(
+    Preserved_trx_bundle bundle, uint64_t timeout_seconds,
+    Preserve_snapshot_metadata *written_metadata,
+    bool *durable_snapshot_may_exist,
+    Preserve_snapshot_delete_status *write_failure_delete_status,
+    Preserved_trx_store_write_stats *write_stats, bool publish_standby_pending) {
   if (m_carrier == nullptr || bundle.metadata.token.empty())
     return Preserve_snapshot_status::INVALID_ARGUMENT;
   if (!carrier_token_filename_safe(bundle.metadata.token))
@@ -279,7 +319,7 @@ Preserve_snapshot_status Preserved_trx_store::write(
     return map_carrier_status(carrier_status);
   if (token_state.snapshot || token_state.external_blob ||
       (token_state.temp_sidecar && !bundle.owns_current_temp_sidecars) ||
-      token_state.tainted) {
+      token_state.tainted || token_state.standby_pending) {
     return map_carrier_status(Preserved_trx_carrier_status::ALREADY_EXISTS);
   }
 
@@ -394,6 +434,21 @@ Preserve_snapshot_status Preserved_trx_store::write(
         durable_snapshot_may_exist, write_failure_delete_status);
   }
   if (written_metadata != nullptr) *written_metadata = encoded_metadata;
+
+  if (publish_standby_pending) {
+    /*
+      A standby token must be visibly marked before its target-local snapshot
+      appears. Startup recovery and ordinary RESUME filter this marker, while a
+      future promotion apply path can adopt the token explicitly.
+    */
+    carrier_status = m_carrier->mark_standby_pending(encoded_metadata.token);
+    if (carrier_status != Preserved_trx_carrier_status::OK) {
+      return cleanup_external_blobs_after_write_failure(
+          m_carrier, encoded_metadata.token, written_external_blobs,
+          map_carrier_status(carrier_status), false,
+          durable_snapshot_may_exist, write_failure_delete_status);
+    }
+  }
 
   store_step_started_us = my_micro_time();
   carrier_status = m_carrier->write_snapshot_new(encoded_metadata.token,

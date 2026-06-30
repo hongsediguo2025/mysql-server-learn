@@ -109,6 +109,7 @@
 #include "sql/psi_memory_key.h"
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_resource.h"
+#include "sql/preserve_trx_transfer.h"
 #include "sql/query_options.h"
 #include "sql/rpl_group_replication.h"  // is_group_replication_running
 #include "sql/rpl_info_factory.h"       // Rpl_info_factory
@@ -1354,6 +1355,171 @@ static Sys_var_uint Sys_preserve_trx_lock_warmcopy_conversion_wait_timeout_ms(
     "target transaction.",
     GLOBAL_VAR(preserve_trx_lock_warmcopy_conversion_wait_timeout_ms),
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT_MAX32), DEFAULT(30000),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static const char *preserve_trx_transfer_artifact_mode_names[] = {
+    "LOCAL_CARRIER", "STANDBY_TRANSFER_SAVE", nullptr};
+
+static bool check_preserve_trx_transfer_enable(sys_var *, THD *,
+                                               set_var *var) {
+  const bool requested_enabled = var->save_result.ulonglong_value != 0;
+  if (requested_enabled != preserve_trx_transfer_enable) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0),
+             "preserve_trx_transfer_enable is a startup-only option");
+    return true;
+  }
+  return false;
+}
+
+static bool check_preserve_trx_transfer_receiver_enable(sys_var *, THD *,
+                                                        set_var *var) {
+  const bool requested_enabled = var->save_result.ulonglong_value != 0;
+  if (requested_enabled != preserve_trx_transfer_receiver_enable) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0),
+             "preserve_trx_transfer_receiver_enable is a startup-only option");
+    return true;
+  }
+  return false;
+}
+
+static bool check_preserve_trx_transfer_artifact_mode(sys_var *, THD *,
+                                                      set_var *var) {
+  const ulong requested_mode =
+      static_cast<ulong>(var->save_result.ulonglong_value);
+  if (requested_mode != preserve_trx_transfer_artifact_mode) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0),
+             "preserve_trx_transfer_artifact_mode is a startup-only option");
+    return true;
+  }
+  return false;
+}
+
+static Sys_var_bool Sys_preserve_trx_transfer_enable(
+    "preserve_trx_transfer_enable",
+    "Enable Preserve/Resume standby direct-transfer source support. When "
+    "disabled, DRAIN TRANSACTIONS PRESERVE continues to publish through the "
+    "ordinary local carrier path.",
+    GLOBAL_VAR(preserve_trx_transfer_enable), CMD_LINE(OPT_ARG),
+    DEFAULT(false), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+    ON_CHECK(check_preserve_trx_transfer_enable));
+
+static Sys_var_bool Sys_preserve_trx_transfer_receiver_enable(
+    "preserve_trx_transfer_receiver_enable",
+    "Allow this server to accept Preserve/Resume standby direct-transfer "
+    "receiver traffic. The receiver path is independent from ordinary local "
+    "startup recovery and resume.",
+    GLOBAL_VAR(preserve_trx_transfer_receiver_enable), CMD_LINE(OPT_ARG),
+    DEFAULT(false), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+    ON_CHECK(check_preserve_trx_transfer_receiver_enable));
+
+static Sys_var_charptr Sys_preserve_trx_transfer_allowed_source_uuid(
+    "preserve_trx_transfer_allowed_source_uuid",
+    "Source server UUID accepted by the Preserve/Resume standby "
+    "direct-transfer receiver. An empty value rejects receiver manifests.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_allowed_source_uuid),
+    CMD_LINE(REQUIRED_ARG), IN_SYSTEM_CHARSET, DEFAULT(""));
+
+static Sys_var_charptr Sys_preserve_trx_transfer_target_server_uuid(
+    "preserve_trx_transfer_target_server_uuid",
+    "Target server UUID expected by the Preserve/Resume standby "
+    "direct-transfer receiver. An empty value rejects receiver manifests.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_target_server_uuid),
+    CMD_LINE(REQUIRED_ARG), IN_SYSTEM_CHARSET, DEFAULT(""));
+
+static Sys_var_charptr Sys_preserve_trx_transfer_target_host(
+    "preserve_trx_transfer_target_host",
+    "Host name or address used by Preserve/Resume standby direct-transfer "
+    "source background sessions. Empty means no TCP target is configured.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_target_host),
+    CMD_LINE(REQUIRED_ARG), IN_FS_CHARSET, DEFAULT(""));
+
+static Sys_var_uint Sys_preserve_trx_transfer_target_port(
+    "preserve_trx_transfer_target_port",
+    "TCP port used by Preserve/Resume standby direct-transfer source "
+    "background sessions. 0 means no TCP target port is configured.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_target_port),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 65535), DEFAULT(0), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_charptr Sys_preserve_trx_transfer_target_socket(
+    "preserve_trx_transfer_target_socket",
+    "Unix socket used by Preserve/Resume standby direct-transfer source "
+    "background sessions. Empty means no socket target is configured.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_target_socket),
+    CMD_LINE(REQUIRED_ARG), IN_FS_CHARSET, DEFAULT(""));
+
+static Sys_var_charptr Sys_preserve_trx_transfer_target_user(
+    "preserve_trx_transfer_target_user",
+    "Account name used by Preserve/Resume standby direct-transfer source "
+    "background sessions. The password material is referenced separately.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_target_user),
+    CMD_LINE(REQUIRED_ARG), IN_SYSTEM_CHARSET, DEFAULT(""));
+
+static Sys_var_charptr Sys_preserve_trx_transfer_credential_name(
+    "preserve_trx_transfer_credential_name",
+    "Credential reference used by Preserve/Resume standby direct-transfer "
+    "source background sessions. The variable stores a credential name, not a "
+    "plain-text password.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_credential_name),
+    CMD_LINE(REQUIRED_ARG), IN_SYSTEM_CHARSET, DEFAULT(""));
+
+static Sys_var_enum Sys_preserve_trx_transfer_artifact_mode(
+    "preserve_trx_transfer_artifact_mode",
+    "Artifact publication mode for Preserve/Resume. LOCAL_CARRIER preserves "
+    "the current local carrier path; STANDBY_TRANSFER_SAVE is reserved for "
+    "direct standby transfer publishing.",
+    GLOBAL_VAR(preserve_trx_transfer_artifact_mode), CMD_LINE(REQUIRED_ARG),
+    preserve_trx_transfer_artifact_mode_names,
+    DEFAULT(PRESERVE_TRX_TRANSFER_ARTIFACT_LOCAL_CARRIER), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG, ON_CHECK(check_preserve_trx_transfer_artifact_mode));
+
+static Sys_var_uint Sys_preserve_trx_transfer_data_sessions(
+    "preserve_trx_transfer_data_sessions",
+    "Number of background data sessions used by Preserve/Resume standby "
+    "direct-transfer. 1 exercises the same state machine without parallel data "
+    "sessions.",
+    GLOBAL_VAR(preserve_trx_transfer_data_sessions), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, 1024), DEFAULT(3), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_transfer_sender_workers(
+    "preserve_trx_transfer_sender_workers",
+    "Number of Preserve/Resume standby direct-transfer source workers that "
+    "read and chunk transfer objects.",
+    GLOBAL_VAR(preserve_trx_transfer_sender_workers), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, 1024), DEFAULT(3), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_transfer_receiver_workers(
+    "preserve_trx_transfer_receiver_workers",
+    "Number of Preserve/Resume standby direct-transfer receiver workers that "
+    "stage and validate transfer object chunks.",
+    GLOBAL_VAR(preserve_trx_transfer_receiver_workers),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 1024), DEFAULT(3), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_transfer_chunk_bytes(
+    "preserve_trx_transfer_chunk_bytes",
+    "Target chunk size in bytes for Preserve/Resume standby direct-transfer "
+    "object payloads.",
+    GLOBAL_VAR(preserve_trx_transfer_chunk_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(1048576), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_transfer_max_inflight_bytes(
+    "preserve_trx_transfer_max_inflight_bytes",
+    "Maximum unsealed bytes allowed in one Preserve/Resume standby "
+    "direct-transfer epoch before backpressure or fail-closed handling.",
+    GLOBAL_VAR(preserve_trx_transfer_max_inflight_bytes),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, ULLONG_MAX),
+    DEFAULT(1073741824ULL), BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_transfer_commit_timeout_ms(
+    "preserve_trx_transfer_commit_timeout_ms",
+    "Maximum milliseconds the source waits for a Preserve/Resume standby "
+    "direct-transfer epoch commit acknowledgment.",
+    GLOBAL_VAR(preserve_trx_transfer_commit_timeout_ms),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, UINT_MAX32), DEFAULT(30000),
     BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
 static bool fix_binlog_cache_size(sys_var *, THD *thd, enum_var_type) {
