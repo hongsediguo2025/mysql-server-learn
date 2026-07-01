@@ -428,6 +428,16 @@ bool preserved_trx_preflight_recoverability();
 bool preserved_temp_images_bootstrap_preamble();
 bool preserved_trx_recover_all();
 void preserved_trx_mark_recovery_complete();
+
+struct Preserved_trx_promotion_ready_adopt_result {
+  bool claimed{false};
+  bool rolled_back{false};
+  std::string reason;
+};
+
+bool preserved_trx_adopt_ready_bundle_for_promotion(
+    const std::string &dir, Preserved_trx_bundle bundle,
+    Preserved_trx_promotion_ready_adopt_result *result);
 void preserved_trx_start_expired_reaper();
 void preserved_trx_start_expired_reaper_if_ready();
 void preserved_trx_stop_expired_reaper();

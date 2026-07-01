@@ -958,6 +958,10 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_manifest(
   out.append(kTransferManifestMagic, kTransferManifestMagicLength);
   append_u16(&out, manifest.protocol_version);
   append_u64(&out, manifest.frame_sequence);
+  if (manifest.protocol_version != 2) {
+    append_u64(&out, manifest.source_prepare_lsn);
+    append_u64(&out, manifest.source_epoch_commit_lsn);
+  }
   if (append_string(&out, manifest.epoch_id) ||
       append_string(&out, manifest.source_server_uuid) ||
       append_string(&out, manifest.target_server_uuid)) {
@@ -995,8 +999,15 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_manifest(
 
   Preserve_trx_transfer_manifest parsed;
   if (reader.read_u16(&parsed.protocol_version) ||
-      reader.read_u64(&parsed.frame_sequence) ||
-      reader.read_string(&parsed.epoch_id) ||
+      reader.read_u64(&parsed.frame_sequence)) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  if (parsed.protocol_version != 2 &&
+      (reader.read_u64(&parsed.source_prepare_lsn) ||
+       reader.read_u64(&parsed.source_epoch_commit_lsn))) {
+    return Preserve_trx_transfer_status::CORRUPT;
+  }
+  if (reader.read_string(&parsed.epoch_id) ||
       reader.read_string(&parsed.source_server_uuid) ||
       reader.read_string(&parsed.target_server_uuid) ||
       reader.read_u64(&parsed.token)) {
@@ -1025,7 +1036,8 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_manifest(
   }
 
   if (!reader.eof()) return Preserve_trx_transfer_status::CORRUPT;
-  if (parsed.protocol_version != kPreserveTrxTransferProtocolVersion) {
+  if (parsed.protocol_version != 2 &&
+      parsed.protocol_version != kPreserveTrxTransferProtocolVersion) {
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
   const Preserve_trx_transfer_status validation_status =

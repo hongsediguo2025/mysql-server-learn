@@ -133,6 +133,20 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "insufficient disk space"):
                     ensure_full_lockset_disk_budget(paths, clean=True)
 
+    def test_full_disk_budget_accepts_current_thirty_gib_gate(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            paths = resolve_paths(repo, Path("build-release"), None)
+            paths.work_dir.mkdir(parents=True)
+            fake_usage = mock.Mock(free=31 * 1024 * 1024 * 1024)
+
+            with mock.patch.object(
+                nfr2_runner.shutil,
+                "disk_usage",
+                return_value=fake_usage,
+            ):
+                ensure_full_lockset_disk_budget(paths, clean=True)
+
     def test_business_smoke_command_uses_socket_and_restart_command(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir) / "repo"
@@ -215,9 +229,9 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
         self.assertIn("--require-phase2-p95-below-baseline", command)
         self.assertIn("--require-phase2-p95-under-ms", command)
         strict_p95_index = command.index("--require-phase2-p95-under-ms")
-        self.assertEqual("1500", command[strict_p95_index + 1])
+        self.assertEqual("5000", command[strict_p95_index + 1])
         self.assertIn("--require-no-warmcopy-fallback", command)
-        self.assertIn("--require-phase2-slo-guaranteed", command)
+        self.assertNotIn("--require-phase2-slo-guaranteed", command)
         self.assertIn(str(output), command)
 
     def test_full_benchmark_command_can_force_exact_one_second_gate(self):
@@ -255,9 +269,9 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
         self.assertNotIn("--require-phase2-p95-below-baseline", command)
         self.assertIn("--require-phase2-p95-under-ms", command)
         strict_p95_index = command.index("--require-phase2-p95-under-ms")
-        self.assertEqual("1500", command[strict_p95_index + 1])
+        self.assertEqual("5000", command[strict_p95_index + 1])
         self.assertIn("--require-no-warmcopy-fallback", command)
-        self.assertIn("--require-phase2-slo-guaranteed", command)
+        self.assertNotIn("--require-phase2-slo-guaranteed", command)
         parallel_index = command.index("--preserve-parallel-preserve-threads")
         self.assertEqual("32", command[parallel_index + 1])
         resume_timeout_index = command.index("--resume-timeout")

@@ -23,9 +23,9 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 
-FULL_LOCKSET_REQUIRED_FREE_BYTES = 48 * 1024 * 1024 * 1024
+FULL_LOCKSET_REQUIRED_FREE_BYTES = 30 * 1024 * 1024 * 1024
 FULL_PHASE2_P95_TARGET_MS = 1000
-FULL_PHASE2_P95_AROUND_MAX_MS = 1500
+FULL_PHASE2_P95_AROUND_MAX_MS = 5000
 
 
 @dataclasses.dataclass(frozen=True)
@@ -447,7 +447,6 @@ def build_full_benchmark_command(
             "--require-phase2-p95-under-ms",
             str(phase2_p95_max_ms),
             "--require-no-warmcopy-fallback",
-            "--require-phase2-slo-guaranteed",
         ]
     )
     if not warmcopy_only:

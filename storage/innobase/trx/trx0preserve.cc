@@ -282,6 +282,29 @@ trx_t *trx_preserve_claim_prepared(const XID &xid) {
   return claimed;
 }
 
+bool trx_preserve_probe_detached_prepared(const XID &xid) {
+  if (!xid_is_preserve_magic(xid) || trx_sys == nullptr) return false;
+
+  bool found = false;
+
+  trx_sys_mutex_enter();
+
+  for (trx_t *trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
+       trx = UT_LIST_GET_NEXT(trx_list, trx)) {
+    assert_trx_in_rw_list(trx);
+
+    if (trx->mysql_thd == nullptr && !trx->preserve_trx_claimed &&
+        trx_state_eq(trx, TRX_STATE_PREPARED) && xid.eq(trx->xid)) {
+      found = true;
+      break;
+    }
+  }
+
+  trx_sys_mutex_exit();
+
+  return found;
+}
+
 dberr_t trx_preserve_claim_detached_prepared(trx_t *trx) {
   dberr_t err;
 

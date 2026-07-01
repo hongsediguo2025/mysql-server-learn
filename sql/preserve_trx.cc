@@ -8280,6 +8280,109 @@ static bool recover_preserved_snapshot(const std::string &dir,
   return false;
 }
 
+bool preserved_trx_adopt_ready_bundle_for_promotion(
+    const std::string &dir, Preserved_trx_bundle bundle,
+    Preserved_trx_promotion_ready_adopt_result *result) {
+  if (result == nullptr) return false;
+  *result = {};
+
+  Preserve_snapshot_metadata metadata = std::move(bundle.metadata);
+  const std::string token = metadata.token;
+  auto fail_before_claim = [&](const std::string &reason) {
+    result->reason = reason;
+    return false;
+  };
+  if (dir.empty() || token.empty()) {
+    return fail_before_claim("invalid promotion ready record");
+  }
+
+  if (!recoverable_binlog_state(metadata.binlog_state)) {
+    return fail_before_claim("unsupported durable transaction binlog state");
+  }
+  if (!binlog_state_matches_configured_mode(metadata)) {
+    log_preserved_trx_rejected_binlog_mode(token, metadata);
+    return fail_before_claim("binlog mode mismatch");
+  }
+
+  XID xid;
+  if (preserve_trx_token_to_xid(token, &xid)) {
+    return fail_before_claim(
+        "failed to map promotion standby token to XID");
+  }
+
+  trx_t *trx = trx_preserve_claim_prepared(xid);
+  if (trx == nullptr && !metadata.temp_table_manifest_payload.empty()) {
+    const uint64_t temp_owner_trx_id =
+        preserve_trx_temp_table_owner_trx_id(metadata);
+    if (temp_owner_trx_id != 0) {
+      trx = trx_preserve_create_temp_only_claimed(xid, temp_owner_trx_id);
+    }
+  }
+  if (trx == nullptr) {
+    return fail_before_claim("prepared trx not found for promotion adopt");
+  }
+  result->claimed = true;
+
+  auto rollback_after_claim = [&](const std::string &reason) {
+    result->reason = reason;
+    delete_detached_mdl_context(token);
+    if (trx_preserve_rollback_claimed(trx) == DB_SUCCESS) {
+      result->rolled_back = true;
+    } else {
+      result->rolled_back = false;
+      result->reason = reason + "; rollback failed";
+    }
+    return false;
+  };
+
+  const auto rollback_semantics_failure = [&](const char *component) {
+    std::string reason =
+        std::string("failed to restore promotion transaction semantics: ") +
+        component;
+    if (strcmp(component, "record locks") == 0) {
+      const char *detail = trx_preserve_last_record_lock_export_error();
+      if (detail != nullptr && detail[0] != '\0') {
+        reason.append(": ");
+        reason.append(detail);
+      }
+    }
+    return rollback_after_claim(reason);
+  };
+
+  if (trx_preserve_set_isolation(trx, metadata.tx_isolation) != DB_SUCCESS) {
+    return rollback_semantics_failure("isolation level");
+  }
+  if (trx_preserve_import_read_view(trx, metadata.read_view_payload) !=
+      DB_SUCCESS) {
+    return rollback_semantics_failure("read view");
+  }
+  if (trx_preserve_import_table_locks(trx, metadata.table_locks_payload) !=
+      DB_SUCCESS) {
+    return rollback_semantics_failure("table locks");
+  }
+  if (trx_preserve_import_record_locks(trx, metadata.record_locks_payload) !=
+      DB_SUCCESS) {
+    return rollback_semantics_failure("record locks");
+  }
+  if (trx_preserve_import_record_locks(trx, metadata.predicate_locks_payload) !=
+      DB_SUCCESS) {
+    return rollback_semantics_failure("predicate locks");
+  }
+  if (create_detached_mdl_context(metadata)) {
+    return rollback_after_claim(
+        "failed to restore promotion transaction MDL context");
+  }
+  if (preserved_trx_add_record(metadata, trx, true,
+                               Preserved_trx_lifecycle_state::PRESERVED,
+                               std::move(bundle.blob_descriptors))) {
+    return rollback_after_claim(
+        "failed to register promotion adopted transaction");
+  }
+
+  audit_preserved_trx_event(current_thd, token, "promotion-adopt", "success");
+  return true;
+}
+
 bool preserved_trx_preflight_recoverability() {
   if (!preserve_trx_is_enabled()) return false;
   if (srv_force_recovery > 0) return false;

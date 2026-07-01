@@ -66,6 +66,9 @@ enum class Preserve_key_status { OK, MISSING, CORRUPT, IO_ERROR };
 enum class Atomic_write_status { OK, ALREADY_EXISTS, IO_ERROR };
 
 constexpr char kGenericExternalBlobShardRoot[] = "blob_shards";
+constexpr char kPromotionAdoptedMarkerMagic[] =
+    "PTRX_PROMOTION_ADOPTED_EPOCH_V1";
+constexpr size_t kPromotionDigestBytes = 32;
 
 std::string normalize_dir(std::string dir) {
   if (dir.empty() || dir.back() != FN_LIBCHAR) {
@@ -501,6 +504,94 @@ void set_blob_descriptor_from_payload(Preserved_trx_external_blob *blob) {
   blob->descriptor.size = blob->payload.length();
   SHA_EVP256(reinterpret_cast<const unsigned char *>(blob->payload.data()),
              blob->payload.length(), blob->descriptor.digest.data());
+}
+
+std::string sha256_hex(const std::string &payload) {
+  std::array<unsigned char, kPromotionDigestBytes> digest{};
+  SHA_EVP256(reinterpret_cast<const unsigned char *>(payload.data()),
+             payload.length(), digest.data());
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string hex;
+  hex.reserve(digest.size() * 2);
+  for (unsigned char byte : digest) {
+    hex.push_back(kHex[(byte >> 4) & 0x0f]);
+    hex.push_back(kHex[byte & 0x0f]);
+  }
+  return hex;
+}
+
+bool parse_uint64_strict(const std::string &text, uint64_t *value) {
+  if (value == nullptr || text.empty()) return false;
+  uint64_t result = 0;
+  for (char ch : text) {
+    if (ch < '0' || ch > '9') return false;
+    const uint64_t digit = static_cast<uint64_t>(ch - '0');
+    if (result >
+        (std::numeric_limits<uint64_t>::max() - digit) / 10ULL) {
+      return false;
+    }
+    result = result * 10ULL + digit;
+  }
+  *value = result;
+  return true;
+}
+
+bool parse_adopted_marker_token_list(const std::string &encoded,
+                                     std::set<std::string> *tokens) {
+  if (tokens == nullptr || encoded.empty()) return false;
+  size_t start = 0;
+  while (start <= encoded.length()) {
+    const size_t comma = encoded.find(',', start);
+    const size_t end = comma == std::string::npos ? encoded.length() : comma;
+    if (end == start) return false;
+    uint64_t token = 0;
+    if (!parse_uint64_strict(encoded.substr(start, end - start), &token) ||
+        token == 0) {
+      return false;
+    }
+    tokens->insert(std::to_string(token));
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  return true;
+}
+
+bool adopted_marker_tokens_from_payload(const std::vector<unsigned char> &bytes,
+                                        std::set<std::string> *tokens) {
+  if (tokens == nullptr) return false;
+  const std::string encoded(bytes.begin(), bytes.end());
+  const size_t digest_pos = encoded.rfind("digest=");
+  if (digest_pos == std::string::npos ||
+      (digest_pos > 0 && encoded[digest_pos - 1] != '\n')) {
+    return false;
+  }
+  const std::string body = encoded.substr(0, digest_pos);
+  const std::string expected_digest_line = "digest=" + sha256_hex(body) + "\n";
+  if (encoded.substr(digest_pos) != expected_digest_line) return false;
+  if (body.compare(0, sizeof(kPromotionAdoptedMarkerMagic) - 1,
+                   kPromotionAdoptedMarkerMagic) != 0 ||
+      body.size() <= sizeof(kPromotionAdoptedMarkerMagic) - 1 ||
+      body[sizeof(kPromotionAdoptedMarkerMagic) - 1] != '\n') {
+    return false;
+  }
+
+  size_t line_start = sizeof(kPromotionAdoptedMarkerMagic);
+  while (line_start < body.size()) {
+    const size_t line_end = body.find('\n', line_start);
+    if (line_end == std::string::npos) return false;
+    static constexpr char kTokensPrefix[] = "tokens=";
+    const size_t line_len = line_end - line_start;
+    if (line_len >= sizeof(kTokensPrefix) - 1 &&
+        body.compare(line_start, sizeof(kTokensPrefix) - 1, kTokensPrefix) ==
+            0) {
+      return parse_adopted_marker_token_list(
+          body.substr(line_start + sizeof(kTokensPrefix) - 1,
+                      line_len - (sizeof(kTokensPrefix) - 1)),
+          tokens);
+    }
+    line_start = line_end + 1;
+  }
+  return false;
 }
 
 void append_le16(std::vector<unsigned char> *bytes, uint16_t value) {
@@ -1973,6 +2064,8 @@ Local_file_preserved_trx_carrier::write_promotion_abandoned_epoch(
       marker_payload.empty()) {
     return Preserved_trx_carrier_status::CORRUPT;
   }
+  DBUG_EXECUTE_IF("preserve_trx_fail_write_promotion_abandoned_epoch",
+                  return Preserved_trx_carrier_status::IO_ERROR;);
   if (ensure_directory(m_dir)) return Preserved_trx_carrier_status::IO_ERROR;
   const std::vector<unsigned char> bytes(marker_payload.begin(),
                                          marker_payload.end());
@@ -1980,6 +2073,23 @@ Local_file_preserved_trx_carrier::write_promotion_abandoned_epoch(
       atomic_write_file(m_dir, epoch_id + ".promotion_abandoned", bytes, 0600,
                         {});
   return map_atomic_write_status(status);
+}
+
+Preserved_trx_carrier_status
+Local_file_preserved_trx_carrier::read_promotion_abandoned_epoch(
+    const std::string &epoch_id, std::string *marker_payload) {
+  if (!promotion_epoch_component_is_filename_safe(epoch_id) ||
+      marker_payload == nullptr) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  const std::string path = join_path(m_dir, epoch_id + ".promotion_abandoned");
+  std::vector<unsigned char> bytes;
+  const Preserved_trx_carrier_status status =
+      read_file_limited(path, 1024 * 1024, &bytes);
+  if (status != Preserved_trx_carrier_status::OK) return status;
+  marker_payload->assign(reinterpret_cast<const char *>(bytes.data()),
+                         bytes.size());
+  return Preserved_trx_carrier_status::OK;
 }
 
 Preserved_trx_carrier_status Local_file_preserved_trx_carrier::list_tokens(
@@ -1990,6 +2100,7 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::list_tokens(
   listing->temp_sidecar_tokens.clear();
   listing->tainted_tokens.clear();
   listing->standby_pending_tokens.clear();
+  listing->promotion_adopted_tokens.clear();
   listing->warm_external_blob_artifacts.clear();
 
   /*
@@ -2035,6 +2146,26 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::list_tokens(
       if (filename_to_token(file->name, ".standby_pending", &token)) {
         listing->standby_pending_tokens.insert(token);
         continue;
+      }
+      if (include_warm_artifacts) {
+        std::string adopted_epoch;
+        if (filename_to_token(file->name, ".promotion_adopted",
+                              &adopted_epoch)) {
+          std::vector<unsigned char> bytes;
+          const Preserved_trx_carrier_status read_status =
+              read_file_limited(join_path(scan_dir, file->name), 1024 * 1024,
+                                &bytes);
+          if (read_status != Preserved_trx_carrier_status::OK) {
+            my_dirend(dir_info);
+            return read_status;
+          }
+          if (!adopted_marker_tokens_from_payload(
+                  bytes, &listing->promotion_adopted_tokens)) {
+            my_dirend(dir_info);
+            return Preserved_trx_carrier_status::CORRUPT;
+          }
+          continue;
+        }
       }
       if (filename_to_temp_sidecar_token(file->name, &token)) {
         listing->temp_sidecar_tokens.insert(token);

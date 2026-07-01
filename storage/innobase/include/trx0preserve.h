@@ -59,6 +59,7 @@ struct Preserve_modified_table_name {
 };
 
 trx_t *trx_preserve_claim_prepared(const XID &xid);
+bool trx_preserve_probe_detached_prepared(const XID &xid);
 trx_t *trx_preserve_current_thd_trx(THD *thd);
 dberr_t trx_preserve_claim_detached_prepared(trx_t *trx);
 dberr_t trx_preserve_rollback_by_token(const char *token);

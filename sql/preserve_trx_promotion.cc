@@ -26,6 +26,8 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <utility>
@@ -36,6 +38,7 @@
 #include "sha2.h"
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_carrier.h"
+#include "storage/innobase/include/trx0preserve.h"
 
 namespace {
 
@@ -46,6 +49,32 @@ constexpr char kPromotionAbandonedMarkerMagic[] =
 constexpr size_t kPromotionDigestBytes = 32;
 
 Preserve_trx_promotion_apply_state_provider g_apply_state_provider = nullptr;
+Preserve_trx_promotion_adopt_executor g_adopt_executor = nullptr;
+
+struct Promotion_ready_cache_key {
+  std::string preserve_dir;
+  std::string epoch_id;
+  uint64_t token{0};
+
+  bool operator<(const Promotion_ready_cache_key &other) const {
+    if (preserve_dir != other.preserve_dir) {
+      return preserve_dir < other.preserve_dir;
+    }
+    if (epoch_id != other.epoch_id) return epoch_id < other.epoch_id;
+    return token < other.token;
+  }
+};
+
+struct Promotion_ready_cache_entry {
+  Preserve_trx_promotion_ready_state state{
+      Preserve_trx_promotion_ready_state::NOT_FOUND};
+  uint64_t required_apply_lsn{0};
+  bool has_ready_bundle{false};
+  Preserved_trx_bundle ready_bundle;
+};
+
+std::mutex g_ready_cache_mutex;
+std::map<Promotion_ready_cache_key, Promotion_ready_cache_entry> g_ready_cache;
 
 bool parse_uint64_strict(const std::string &text, uint64_t *value) {
   if (value == nullptr || text.empty()) return false;
@@ -96,6 +125,66 @@ bool marker_tokens_are_valid(const std::vector<uint64_t> &tokens) {
                      [](uint64_t token) { return token != 0; });
 }
 
+bool ready_cache_lookup(const std::string &preserve_dir,
+                        const std::string &epoch_id, uint64_t token,
+                        Promotion_ready_cache_entry *entry) {
+  std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+  const auto found =
+      g_ready_cache.find(Promotion_ready_cache_key{preserve_dir, epoch_id,
+                                                   token});
+  if (found == g_ready_cache.end()) return false;
+  if (entry != nullptr) *entry = found->second;
+  return true;
+}
+
+bool promotion_adopt_ready_bundle_default(
+    const std::string &preserve_dir, const Preserved_trx_bundle &ready_bundle,
+    Preserve_trx_promotion_token_result *token_result) {
+  if (token_result == nullptr) return false;
+  *token_result = {};
+  uint64_t token = 0;
+  if (!parse_uint64_strict(ready_bundle.metadata.token, &token) ||
+      token == 0) {
+    token_result->status =
+        Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT;
+    token_result->cleanup_state =
+        Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED;
+    token_result->reason = "ready record has invalid token";
+    return false;
+  }
+  token_result->token = token;
+
+  Preserved_trx_promotion_ready_adopt_result adopt_result;
+  Preserved_trx_bundle bundle_copy = ready_bundle;
+  if (preserved_trx_adopt_ready_bundle_for_promotion(
+          preserve_dir, std::move(bundle_copy), &adopt_result)) {
+    token_result->status = Preserve_trx_promotion_adopt_status::OK;
+    token_result->claimed = true;
+    token_result->cleanup_state = Preserve_trx_promotion_cleanup_state::NONE;
+    token_result->reason = "adopted";
+    return true;
+  }
+
+  token_result->claimed = adopt_result.claimed;
+  token_result->reason =
+      adopt_result.reason.empty() ? "promotion adopt failed"
+                                  : adopt_result.reason;
+  if (adopt_result.claimed) {
+    token_result->status =
+        Preserve_trx_promotion_adopt_status::CLAIMED_IMPORT_FAILED;
+    token_result->cleanup_state =
+        adopt_result.rolled_back
+            ? Preserve_trx_promotion_cleanup_state::CLEANUP_ROLLED_BACK
+            : Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED;
+    return false;
+  }
+
+  token_result->status = Preserve_trx_promotion_adopt_status::TOKEN_NOT_FOUND;
+  token_result->cleanup_state =
+      Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING;
+  return false;
+}
+
 bool field_value_is_safe(const std::string &value) {
   return !value.empty() && value.find('\n') == std::string::npos &&
          value.find('|') == std::string::npos;
@@ -109,6 +198,10 @@ const char *cleanup_state_name(Preserve_trx_promotion_cleanup_state state) {
       return "NOT_CLAIMED";
     case Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING:
       return "CLEANUP_PENDING";
+    case Preserve_trx_promotion_cleanup_state::CLEANUP_ROLLED_BACK:
+      return "CLEANUP_ROLLED_BACK";
+    case Preserve_trx_promotion_cleanup_state::CLEANUP_NOT_FOUND:
+      return "CLEANUP_NOT_FOUND";
     case Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED:
       return "CLEANUP_TAINTED";
   }
@@ -128,6 +221,14 @@ bool parse_cleanup_state(const std::string &text,
   }
   if (text == "CLEANUP_PENDING") {
     *state = Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING;
+    return true;
+  }
+  if (text == "CLEANUP_ROLLED_BACK") {
+    *state = Preserve_trx_promotion_cleanup_state::CLEANUP_ROLLED_BACK;
+    return true;
+  }
+  if (text == "CLEANUP_NOT_FOUND") {
+    *state = Preserve_trx_promotion_cleanup_state::CLEANUP_NOT_FOUND;
     return true;
   }
   if (text == "CLEANUP_TAINTED") {
@@ -153,6 +254,7 @@ bool parse_adopt_status(const std::string &text,
       Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
       Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT,
       Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT,
+      Preserve_trx_promotion_adopt_status::CLAIMED_IMPORT_FAILED,
       Preserve_trx_promotion_adopt_status::TOKEN_ABANDONED,
       Preserve_trx_promotion_adopt_status::CLEANUP_PENDING,
       Preserve_trx_promotion_adopt_status::CLEANUP_TAINTED};
@@ -167,10 +269,51 @@ bool parse_adopt_status(const std::string &text,
 
 bool abandoned_token_is_valid(
     const Preserve_trx_promotion_token_result &token) {
-  return token.token != 0 && token.status != Preserve_trx_promotion_adopt_status::OK &&
-         token.status !=
-             Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS &&
-         field_value_is_safe(token.reason);
+  if (token.token == 0 ||
+      token.status == Preserve_trx_promotion_adopt_status::OK ||
+      token.status ==
+          Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS ||
+      !field_value_is_safe(token.reason)) {
+    return false;
+  }
+
+  switch (token.cleanup_state) {
+    case Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING:
+    case Preserve_trx_promotion_cleanup_state::CLEANUP_NOT_FOUND:
+    case Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED:
+      break;
+    case Preserve_trx_promotion_cleanup_state::CLEANUP_ROLLED_BACK:
+      if (!token.claimed) return false;
+      if (token.status !=
+              Preserve_trx_promotion_adopt_status::CLAIMED_IMPORT_FAILED &&
+          token.status != Preserve_trx_promotion_adopt_status::TOKEN_ABANDONED) {
+        return false;
+      }
+      break;
+    case Preserve_trx_promotion_cleanup_state::NONE:
+    case Preserve_trx_promotion_cleanup_state::NOT_CLAIMED:
+      return false;
+  }
+
+  if (token.claimed) {
+    if (token.cleanup_state !=
+            Preserve_trx_promotion_cleanup_state::CLEANUP_ROLLED_BACK &&
+        token.cleanup_state !=
+            Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED) {
+      return false;
+    }
+    if (token.status !=
+            Preserve_trx_promotion_adopt_status::CLAIMED_IMPORT_FAILED &&
+        token.status != Preserve_trx_promotion_adopt_status::TOKEN_ABANDONED) {
+      return false;
+    }
+  }
+  if (token.status ==
+          Preserve_trx_promotion_adopt_status::CLAIMED_IMPORT_FAILED &&
+      !token.claimed) {
+    return false;
+  }
+  return true;
 }
 
 std::string encode_abandoned_token(
@@ -244,6 +387,34 @@ void add_abandoned_token(Preserve_trx_promotion_adopt_result *result,
   if (cleanup_state == Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING) {
     ++result->cleanup_pending_count;
   } else if (cleanup_state ==
+             Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED) {
+    ++result->cleanup_failed_count;
+  }
+}
+
+void add_abandoned_token_result(
+    Preserve_trx_promotion_adopt_result *result,
+    const Preserve_trx_promotion_token_result &token_result) {
+  if (result == nullptr) return;
+  if (!abandoned_token_is_valid(token_result)) {
+    Preserve_trx_promotion_token_result tainted = token_result;
+    if (tainted.token == 0) tainted.token = 1;
+    tainted.status = Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT;
+    tainted.claimed = false;
+    tainted.cleanup_state =
+        Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED;
+    tainted.reason = "invalid abandoned token result";
+    result->token_results.push_back(std::move(tainted));
+    ++result->abandoned_count;
+    ++result->cleanup_failed_count;
+    return;
+  }
+  result->token_results.push_back(token_result);
+  ++result->abandoned_count;
+  if (token_result.cleanup_state ==
+      Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING) {
+    ++result->cleanup_pending_count;
+  } else if (token_result.cleanup_state ==
              Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED) {
     ++result->cleanup_failed_count;
   }
@@ -337,6 +508,90 @@ void finish_result(Preserve_trx_promotion_adopt_result *result,
   result->elapsed_us = my_micro_time() - started_us;
 }
 
+void append_result_message(Preserve_trx_promotion_adopt_result *result,
+                           const std::string &message) {
+  if (result == nullptr || message.empty()) return;
+  if (!result->message.empty()) result->message.append("; ");
+  result->message.append(message);
+}
+
+void write_abandoned_marker_for_result(
+    Preserved_trx_store *store,
+    const Preserve_trx_promotion_adopt_all_request &request,
+    Preserve_trx_promotion_adopt_result *result) {
+  if (store == nullptr || result == nullptr || result->abandoned_count == 0) {
+    return;
+  }
+
+  Preserve_trx_promotion_abandoned_epoch_marker marker;
+  marker.epoch_id = request.epoch_id;
+  marker.source_server_uuid = "unknown-source";
+  marker.target_server_uuid = "local-promotion-target";
+  marker.applied_lsn = request.required_apply_lsn;
+  marker.generated_at_us = my_micro_time();
+
+  for (const Preserve_trx_promotion_token_result &token :
+       result->token_results) {
+    if (!abandoned_token_is_valid(token)) {
+      ++result->cleanup_failed_count;
+      append_result_message(result,
+                            "abandoned token result could not be persisted");
+      continue;
+    }
+    marker.tokens.push_back(token);
+  }
+  if (marker.tokens.empty()) return;
+
+  std::string encoded;
+  const uint64_t marker_started_us = my_micro_time();
+  if (!preserved_trx_encode_promotion_abandoned_epoch_marker(marker,
+                                                             &encoded)) {
+    result->marker_us += my_micro_time() - marker_started_us;
+    ++result->cleanup_failed_count;
+    append_result_message(result, "failed to encode abandoned marker");
+    return;
+  }
+  const Preserve_snapshot_status write_status =
+      store->write_promotion_abandoned_epoch(request.epoch_id, encoded);
+  result->marker_us += my_micro_time() - marker_started_us;
+  if (write_status != Preserve_snapshot_status::OK) {
+    ++result->cleanup_failed_count;
+    append_result_message(result, "failed to write abandoned marker");
+  }
+}
+
+void write_adopted_marker_for_tokens(
+    Preserved_trx_store *store,
+    const Preserve_trx_promotion_adopt_all_request &request,
+    const std::vector<uint64_t> &adopted_tokens,
+    Preserve_trx_promotion_adopt_result *result) {
+  if (store == nullptr || result == nullptr || adopted_tokens.empty()) return;
+
+  Preserve_trx_promotion_adopted_epoch_marker marker;
+  marker.epoch_id = request.epoch_id;
+  marker.tokens = adopted_tokens;
+  marker.source_server_uuid = "unknown-source";
+  marker.target_server_uuid = "local-promotion-target";
+  marker.applied_lsn = request.required_apply_lsn;
+  marker.generated_at_us = my_micro_time();
+
+  std::string encoded;
+  const uint64_t marker_started_us = my_micro_time();
+  if (!preserved_trx_encode_promotion_adopted_epoch_marker(marker, &encoded)) {
+    result->marker_us += my_micro_time() - marker_started_us;
+    ++result->cleanup_failed_count;
+    append_result_message(result, "failed to encode adopted marker");
+    return;
+  }
+  const Preserve_snapshot_status write_status =
+      store->write_promotion_adopted_epoch(request.epoch_id, encoded);
+  result->marker_us += my_micro_time() - marker_started_us;
+  if (write_status != Preserve_snapshot_status::OK) {
+    ++result->cleanup_failed_count;
+    append_result_message(result, "failed to write adopted marker");
+  }
+}
+
 }  // namespace
 
 const char *preserve_trx_promotion_adopt_status_name(
@@ -366,6 +621,8 @@ const char *preserve_trx_promotion_adopt_status_name(
       return "CORRUPT_ARTIFACT";
     case Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT:
       return "UNSUPPORTED_ARTIFACT";
+    case Preserve_trx_promotion_adopt_status::CLAIMED_IMPORT_FAILED:
+      return "CLAIMED_IMPORT_FAILED";
     case Preserve_trx_promotion_adopt_status::TOKEN_ABANDONED:
       return "TOKEN_ABANDONED";
     case Preserve_trx_promotion_adopt_status::CLEANUP_PENDING:
@@ -379,6 +636,91 @@ const char *preserve_trx_promotion_adopt_status_name(
 void preserved_trx_set_promotion_apply_state_provider_for_unit_test(
     Preserve_trx_promotion_apply_state_provider provider) {
   g_apply_state_provider = provider;
+}
+
+void preserved_trx_set_promotion_adopt_executor_for_unit_test(
+    Preserve_trx_promotion_adopt_executor executor) {
+  g_adopt_executor = executor;
+}
+
+void preserved_trx_promotion_ready_cache_clear_for_unit_test() {
+  std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+  g_ready_cache.clear();
+}
+
+void preserved_trx_promotion_ready_cache_put_for_unit_test(
+    const std::string &preserve_dir, const std::string &epoch_id,
+    uint64_t token, Preserve_trx_promotion_ready_state state,
+    uint64_t required_apply_lsn) {
+  if (preserve_dir.empty() || epoch_id.empty() || token == 0) return;
+  std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+  g_ready_cache[Promotion_ready_cache_key{preserve_dir, epoch_id, token}] =
+      Promotion_ready_cache_entry{state, required_apply_lsn};
+}
+
+void preserved_trx_promotion_ready_cache_put_bundle_for_unit_test(
+    const std::string &preserve_dir, const std::string &epoch_id,
+    uint64_t token, Preserve_trx_promotion_ready_state state,
+    uint64_t required_apply_lsn, const Preserved_trx_bundle &ready_bundle) {
+  if (preserve_dir.empty() || epoch_id.empty() || token == 0) return;
+  std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+  Promotion_ready_cache_entry entry;
+  entry.state = state;
+  entry.required_apply_lsn = required_apply_lsn;
+  entry.has_ready_bundle = true;
+  entry.ready_bundle = ready_bundle;
+  g_ready_cache[Promotion_ready_cache_key{preserve_dir, epoch_id, token}] =
+      std::move(entry);
+}
+
+Preserve_trx_promotion_adopt_status
+preserved_trx_promotion_prewarm_standby_pending_token(
+    const std::string &preserve_dir, const std::string &epoch_id,
+    uint64_t token, uint64_t required_apply_lsn) {
+  if (preserve_dir.empty() || epoch_id.empty() || token == 0) {
+    return Preserve_trx_promotion_adopt_status::INVALID_ARGUMENT;
+  }
+  if (!preserve_trx_is_enabled()) {
+    return Preserve_trx_promotion_adopt_status::NOT_ENABLED;
+  }
+
+  auto store = create_preserved_trx_default_store(preserve_dir);
+  Preserved_trx_carrier_listing listing;
+  const Preserve_snapshot_status list_status = store->list_tokens(&listing);
+  if (list_status != Preserve_snapshot_status::OK) {
+    return carrier_status_to_promotion_status(list_status);
+  }
+
+  const std::string token_string = std::to_string(token);
+  if (listing.standby_pending_tokens.count(token_string) == 0) {
+    return listing.snapshot_tokens.count(token_string) != 0
+               ? Preserve_trx_promotion_adopt_status::NOT_STANDBY_PENDING
+               : Preserve_trx_promotion_adopt_status::TOKEN_NOT_FOUND;
+  }
+
+  Preserved_trx_bundle bundle;
+  const Preserve_snapshot_status read_status =
+      store->read(token_string, true,
+                  Preserved_trx_carrier::Payload_read_mode::
+                      WITH_SEMANTIC_EXTERNAL_BLOBS,
+                  &bundle);
+  if (read_status != Preserve_snapshot_status::OK) {
+    if (read_status == Preserve_snapshot_status::CORRUPT ||
+        read_status == Preserve_snapshot_status::UNSUPPORTED) {
+      std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+      Promotion_ready_cache_entry entry;
+      entry.state = Preserve_trx_promotion_ready_state::CORRUPT;
+      entry.required_apply_lsn = required_apply_lsn;
+      g_ready_cache[Promotion_ready_cache_key{preserve_dir, epoch_id, token}] =
+          std::move(entry);
+    }
+    return carrier_status_to_promotion_status(read_status);
+  }
+
+  preserved_trx_promotion_ready_cache_put_bundle_for_unit_test(
+      preserve_dir, epoch_id, token, Preserve_trx_promotion_ready_state::READY,
+      required_apply_lsn, bundle);
+  return Preserve_trx_promotion_adopt_status::OK;
 }
 
 Preserve_trx_promotion_adopt_status
@@ -406,12 +748,43 @@ preserved_trx_promotion_ready_summary_for_epoch(
       summary->corrupt_tokens.push_back(token);
       continue;
     }
-    summary->pending_tokens.push_back(token);
+    Promotion_ready_cache_entry cache_entry;
+    if (!ready_cache_lookup(preserve_dir, epoch_id, token, &cache_entry)) {
+      summary->pending_tokens.push_back(token);
+      continue;
+    }
+    if (cache_entry.state == Preserve_trx_promotion_ready_state::READY) {
+      summary->ready_tokens.push_back(token);
+      summary->max_required_apply_lsn =
+          std::max(summary->max_required_apply_lsn,
+                   cache_entry.required_apply_lsn);
+    } else if (cache_entry.state ==
+               Preserve_trx_promotion_ready_state::CORRUPT) {
+      summary->corrupt_tokens.push_back(token);
+    } else {
+      summary->pending_tokens.push_back(token);
+      summary->max_required_apply_lsn =
+          std::max(summary->max_required_apply_lsn,
+                   cache_entry.required_apply_lsn);
+    }
   }
+  std::sort(summary->ready_tokens.begin(), summary->ready_tokens.end());
   std::sort(summary->pending_tokens.begin(), summary->pending_tokens.end());
-  summary->state = summary->pending_tokens.empty()
-                       ? Preserve_trx_promotion_ready_state::NOT_FOUND
-                       : Preserve_trx_promotion_ready_state::RECEIVED_DURABLE;
+  std::sort(summary->corrupt_tokens.begin(), summary->corrupt_tokens.end());
+  if (summary->ready_tokens.empty() && summary->pending_tokens.empty() &&
+      summary->corrupt_tokens.empty()) {
+    summary->state = Preserve_trx_promotion_ready_state::NOT_FOUND;
+    return Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY;
+  }
+  if (!summary->corrupt_tokens.empty()) {
+    summary->state = Preserve_trx_promotion_ready_state::CORRUPT;
+    return Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY;
+  }
+  if (summary->pending_tokens.empty()) {
+    summary->state = Preserve_trx_promotion_ready_state::READY;
+    return Preserve_trx_promotion_adopt_status::OK;
+  }
+  summary->state = Preserve_trx_promotion_ready_state::RECEIVED_DURABLE;
   return Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY;
 }
 
@@ -447,6 +820,20 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
   }
 
   auto store = create_preserved_trx_default_store(preserve_dir);
+  std::vector<uint64_t> adopted_tokens;
+  auto finish_with_optional_abandoned_marker =
+      [&](Preserve_trx_promotion_adopt_status status) {
+        if (!adopted_tokens.empty()) {
+          write_adopted_marker_for_tokens(&store.store(), request,
+                                          adopted_tokens, result);
+        }
+        if (status ==
+            Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS) {
+          write_abandoned_marker_for_result(&store.store(), request, result);
+        }
+        finish_result(result, status, started_us);
+        return result->status;
+      };
   Preserved_trx_carrier_listing listing;
   const Preserve_snapshot_status list_status = store->list_tokens(&listing);
   if (list_status != Preserve_snapshot_status::OK) {
@@ -464,7 +851,7 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
             result, 0,
             Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT,
             "non-numeric standby-pending token",
-            Preserve_trx_promotion_cleanup_state::NOT_CLAIMED);
+            Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED);
         continue;
       }
       requested_tokens.insert(token);
@@ -474,11 +861,8 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
   }
   if (requested_tokens.empty()) {
     if (result->abandoned_count > 0) {
-      finish_result(
-          result,
-          Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS,
-          started_us);
-      return result->status;
+      return finish_with_optional_abandoned_marker(
+          Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS);
     }
     finish_result(result, Preserve_trx_promotion_adopt_status::TOKEN_NOT_FOUND,
                   started_us);
@@ -497,7 +881,7 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
           status == Preserve_trx_promotion_adopt_status::NOT_STANDBY_PENDING
               ? "token is local, not standby-pending"
               : "standby-pending token not found",
-          Preserve_trx_promotion_cleanup_state::NOT_CLAIMED);
+          Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING);
       continue;
     }
     result->seen_tokens.push_back(token);
@@ -505,11 +889,8 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
   std::sort(result->seen_tokens.begin(), result->seen_tokens.end());
   if (result->seen_tokens.empty()) {
     if (result->abandoned_count > 0) {
-      finish_result(
-          result,
-          Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS,
-          started_us);
-      return result->status;
+      return finish_with_optional_abandoned_marker(
+          Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS);
     }
     finish_result(result, Preserve_trx_promotion_adopt_status::TOKEN_NOT_FOUND,
                   started_us);
@@ -522,55 +903,196 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
           result, token,
           Preserve_trx_promotion_adopt_status::EPOCH_NOT_COMMITTED,
           "promotion epoch commit marker not found",
-          Preserve_trx_promotion_cleanup_state::NOT_CLAIMED);
+          Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING);
     }
-    finish_result(
-        result,
-        Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS,
-        started_us);
-    return result->status;
+    return finish_with_optional_abandoned_marker(
+        Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS);
   }
   if (request.require_apply_barrier) {
+    uint64_t effective_required_apply_lsn = request.required_apply_lsn;
+    if (request.require_promotion_ready_cache) {
+      for (uint64_t token : result->seen_tokens) {
+        Promotion_ready_cache_entry cache_entry;
+        if (ready_cache_lookup(preserve_dir, request.epoch_id, token,
+                               &cache_entry)) {
+          effective_required_apply_lsn =
+              std::max(effective_required_apply_lsn,
+                       cache_entry.required_apply_lsn);
+        }
+      }
+    }
     Preserve_trx_promotion_apply_state apply_state;
     if (g_apply_state_provider == nullptr ||
         !g_apply_state_provider(&apply_state) || !apply_state.apply_frozen ||
-        apply_state.applied_lsn < request.required_apply_lsn) {
+        apply_state.applied_lsn < effective_required_apply_lsn) {
       for (uint64_t token : result->seen_tokens) {
         add_abandoned_token(
             result, token,
             Preserve_trx_promotion_adopt_status::APPLY_BARRIER_NOT_REACHED,
             "apply barrier not reached",
-            Preserve_trx_promotion_cleanup_state::NOT_CLAIMED);
+            Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING);
       }
-      finish_result(
-          result,
-          Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS,
-          started_us);
-      return result->status;
+      return finish_with_optional_abandoned_marker(
+          Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS);
     }
   }
   if (request.require_promotion_ready_cache) {
+    uint64_t ready_count = 0;
     for (uint64_t token : result->seen_tokens) {
+      Promotion_ready_cache_entry cache_entry;
+      if (ready_cache_lookup(preserve_dir, request.epoch_id, token,
+                             &cache_entry) &&
+          cache_entry.state == Preserve_trx_promotion_ready_state::READY) {
+        if (request.execute_adopt) {
+          if (!cache_entry.has_ready_bundle) {
+            add_abandoned_token(
+                result, token,
+                Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+                "promotion-ready record not built",
+                Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING);
+            continue;
+          }
+
+          Preserve_trx_promotion_token_result token_result;
+          const Preserve_trx_promotion_adopt_executor executor =
+              g_adopt_executor == nullptr
+                  ? promotion_adopt_ready_bundle_default
+                  : g_adopt_executor;
+          if (executor(preserve_dir, cache_entry.ready_bundle,
+                       &token_result)) {
+            ++result->adopted_count;
+            adopted_tokens.push_back(token);
+          } else {
+            if (token_result.token == 0) token_result.token = token;
+            add_abandoned_token_result(result, token_result);
+          }
+          continue;
+        }
+        ++ready_count;
+        continue;
+      }
+      const bool corrupt_cache =
+          cache_entry.state == Preserve_trx_promotion_ready_state::CORRUPT;
       add_abandoned_token(
           result, token,
-          Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
-          "promotion-ready cache not built",
-          Preserve_trx_promotion_cleanup_state::NOT_CLAIMED);
+          corrupt_cache ? Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT
+                        : Preserve_trx_promotion_adopt_status::
+                              READY_CACHE_NOT_READY,
+          corrupt_cache ? "promotion-ready cache is corrupt"
+                        : "promotion-ready cache not built",
+          Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING);
     }
-    finish_result(
-        result,
-        Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS,
-        started_us);
-    return result->status;
+    result->skipped_count = ready_count;
+    if (result->abandoned_count > 0) {
+      return finish_with_optional_abandoned_marker(
+          Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS);
+    }
+    return finish_with_optional_abandoned_marker(
+        Preserve_trx_promotion_adopt_status::OK);
   }
 
   result->skipped_count = result->seen_tokens.size();
-  finish_result(result,
-                result->abandoned_count > 0
-                    ? Preserve_trx_promotion_adopt_status::
-                          OK_WITH_ABANDONED_TOKENS
-                    : Preserve_trx_promotion_adopt_status::OK,
-                started_us);
+  return finish_with_optional_abandoned_marker(
+      result->abandoned_count > 0
+          ? Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS
+          : Preserve_trx_promotion_adopt_status::OK);
+}
+
+Preserve_trx_promotion_adopt_status
+preserved_trx_cleanup_abandoned_standby_promotion_epoch(
+    const std::string &preserve_dir, const std::string &epoch_id,
+    Preserve_trx_promotion_adopt_result *result) {
+  const uint64_t started_us = my_micro_time();
+  if (result == nullptr) {
+    return Preserve_trx_promotion_adopt_status::INVALID_ARGUMENT;
+  }
+  *result = {};
+  if (preserve_dir.empty() || epoch_id.empty()) {
+    finish_result(result, Preserve_trx_promotion_adopt_status::INVALID_ARGUMENT,
+                  started_us);
+    return result->status;
+  }
+  if (!preserve_trx_is_enabled()) {
+    finish_result(result, Preserve_trx_promotion_adopt_status::NOT_ENABLED,
+                  started_us);
+    return result->status;
+  }
+
+  auto store = create_preserved_trx_default_store(preserve_dir);
+  std::string encoded;
+  Preserve_snapshot_status read_status =
+      store->read_promotion_abandoned_epoch(epoch_id, &encoded);
+  if (read_status != Preserve_snapshot_status::OK) {
+    finish_result(result, carrier_status_to_promotion_status(read_status),
+                  started_us);
+    return result->status;
+  }
+
+  Preserve_trx_promotion_abandoned_epoch_marker marker;
+  if (!preserved_trx_decode_promotion_abandoned_epoch_marker(encoded,
+                                                             &marker)) {
+    finish_result(result,
+                  Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT,
+                  started_us);
+    return result->status;
+  }
+
+  Preserve_trx_promotion_abandoned_epoch_marker rewritten = marker;
+  rewritten.tokens.clear();
+  rewritten.generated_at_us = my_micro_time();
+
+  for (Preserve_trx_promotion_token_result token : marker.tokens) {
+    if (token.cleanup_state !=
+        Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING) {
+      rewritten.tokens.push_back(token);
+      result->token_results.push_back(token);
+      ++result->abandoned_count;
+      if (token.cleanup_state ==
+          Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED) {
+        ++result->cleanup_failed_count;
+      }
+      continue;
+    }
+
+    const std::string token_string = std::to_string(token.token);
+    const dberr_t rollback_status =
+        trx_preserve_rollback_by_token(token_string.c_str());
+    token.status = Preserve_trx_promotion_adopt_status::TOKEN_ABANDONED;
+    token.claimed = rollback_status == DB_SUCCESS;
+    if (rollback_status == DB_SUCCESS) {
+      token.cleanup_state =
+          Preserve_trx_promotion_cleanup_state::CLEANUP_ROLLED_BACK;
+      token.reason = "prepared trx rolled back";
+    } else if (rollback_status == DB_NOT_FOUND) {
+      token.cleanup_state =
+          Preserve_trx_promotion_cleanup_state::CLEANUP_NOT_FOUND;
+      token.reason = "prepared trx not found";
+    } else {
+      token.cleanup_state =
+          Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED;
+      token.reason = "prepared trx rollback failed";
+      ++result->cleanup_failed_count;
+    }
+    rewritten.tokens.push_back(token);
+    result->token_results.push_back(token);
+    ++result->abandoned_count;
+  }
+
+  std::string rewritten_payload;
+  if (!preserved_trx_encode_promotion_abandoned_epoch_marker(
+          rewritten, &rewritten_payload)) {
+    finish_result(result, Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT,
+                  started_us);
+    return result->status;
+  }
+  const Preserve_snapshot_status write_status =
+      store->write_promotion_abandoned_epoch(epoch_id, rewritten_payload);
+  if (write_status != Preserve_snapshot_status::OK) {
+    ++result->cleanup_failed_count;
+    append_result_message(result, "failed to rewrite abandoned marker");
+  }
+
+  finish_result(result, Preserve_trx_promotion_adopt_status::OK, started_us);
   return result->status;
 }
 

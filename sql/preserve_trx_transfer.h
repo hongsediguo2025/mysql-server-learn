@@ -41,7 +41,7 @@
 class THD;
 enum class Preserve_trx_delivery_mode;
 
-static constexpr uint16_t kPreserveTrxTransferProtocolVersion = 2;
+static constexpr uint16_t kPreserveTrxTransferProtocolVersion = 3;
 
 enum Preserve_trx_transfer_artifact_mode : uint {
   PRESERVE_TRX_TRANSFER_ARTIFACT_LOCAL_CARRIER = 0,
@@ -136,6 +136,8 @@ struct Preserve_trx_transfer_manifest {
   std::string target_server_uuid;
   uint64_t token{0};
   uint64_t frame_sequence{0};
+  uint64_t source_prepare_lsn{0};
+  uint64_t source_epoch_commit_lsn{0};
   std::vector<Preserve_trx_transfer_object_descriptor> objects;
 };
 

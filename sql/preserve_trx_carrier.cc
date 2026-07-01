@@ -236,7 +236,7 @@ preserved_trx_filter_standby_pending_tokens_for_local_recovery(
     const Preserved_trx_carrier_listing &listing) {
   std::set<std::string> tokens = candidate_tokens;
   for (const std::string &token : listing.standby_pending_tokens) {
-    tokens.erase(token);
+    if (listing.promotion_adopted_tokens.count(token) == 0) tokens.erase(token);
   }
   return tokens;
 }
@@ -254,6 +254,14 @@ Preserved_trx_carrier_status Preserved_trx_carrier::token_state(
   state->tainted = listing.tainted_tokens.count(token) != 0;
   state->standby_pending = listing.standby_pending_tokens.count(token) != 0;
   return Preserved_trx_carrier_status::OK;
+}
+
+Preserved_trx_carrier_status
+Preserved_trx_carrier::read_promotion_abandoned_epoch(
+    const std::string &epoch_id, std::string *marker_payload) {
+  (void)epoch_id;
+  if (marker_payload != nullptr) marker_payload->clear();
+  return Preserved_trx_carrier_status::NOT_FOUND;
 }
 
 Preserve_snapshot_status Preserved_trx_store::write(
@@ -655,6 +663,15 @@ Preserve_snapshot_status Preserved_trx_store::write_promotion_abandoned_epoch(
   if (m_carrier == nullptr) return Preserve_snapshot_status::INVALID_ARGUMENT;
   return map_carrier_status(
       m_carrier->write_promotion_abandoned_epoch(epoch_id, marker_payload));
+}
+
+Preserve_snapshot_status Preserved_trx_store::read_promotion_abandoned_epoch(
+    const std::string &epoch_id, std::string *marker_payload) {
+  if (m_carrier == nullptr || marker_payload == nullptr) {
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
+  return map_carrier_status(
+      m_carrier->read_promotion_abandoned_epoch(epoch_id, marker_payload));
 }
 
 Preserve_snapshot_status Preserved_trx_store::remove_warm_external_blob_artifact(

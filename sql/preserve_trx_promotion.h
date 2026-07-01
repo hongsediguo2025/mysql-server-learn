@@ -28,6 +28,8 @@
 #include <string>
 #include <vector>
 
+#include "sql/preserve_trx_bundle.h"
+
 enum class Preserve_trx_promotion_adopt_status {
   OK,
   OK_WITH_ABANDONED_TOKENS,
@@ -41,6 +43,7 @@ enum class Preserve_trx_promotion_adopt_status {
   READY_CACHE_NOT_READY,
   CORRUPT_ARTIFACT,
   UNSUPPORTED_ARTIFACT,
+  CLAIMED_IMPORT_FAILED,
   TOKEN_ABANDONED,
   CLEANUP_PENDING,
   CLEANUP_TAINTED
@@ -48,6 +51,9 @@ enum class Preserve_trx_promotion_adopt_status {
 
 const char *preserve_trx_promotion_adopt_status_name(
     Preserve_trx_promotion_adopt_status status);
+
+enum class Preserve_trx_promotion_ready_state;
+struct Preserve_trx_promotion_token_result;
 
 struct Preserve_trx_promotion_apply_state {
   bool apply_frozen{false};
@@ -57,6 +63,11 @@ struct Preserve_trx_promotion_apply_state {
 using Preserve_trx_promotion_apply_state_provider =
     bool (*)(Preserve_trx_promotion_apply_state *state);
 
+using Preserve_trx_promotion_adopt_executor =
+    bool (*)(const std::string &preserve_dir,
+             const Preserved_trx_bundle &ready_bundle,
+             Preserve_trx_promotion_token_result *token_result);
+
 /*
   Unit tests use this hook to model the SQL-thread/apply barrier without
   connecting Phase A to failover orchestration. Production code leaves it unset
@@ -65,6 +76,31 @@ using Preserve_trx_promotion_apply_state_provider =
 void preserved_trx_set_promotion_apply_state_provider_for_unit_test(
     Preserve_trx_promotion_apply_state_provider provider);
 
+void preserved_trx_set_promotion_adopt_executor_for_unit_test(
+    Preserve_trx_promotion_adopt_executor executor);
+
+/*
+  Unit-test hook for the Phase B promotion-ready cache. The cache is a
+  performance layer above durable standby-pending artifacts; ordinary local
+  recovery never consults it.
+*/
+void preserved_trx_promotion_ready_cache_clear_for_unit_test();
+
+void preserved_trx_promotion_ready_cache_put_for_unit_test(
+    const std::string &preserve_dir, const std::string &epoch_id,
+    uint64_t token, Preserve_trx_promotion_ready_state state,
+    uint64_t required_apply_lsn);
+
+void preserved_trx_promotion_ready_cache_put_bundle_for_unit_test(
+    const std::string &preserve_dir, const std::string &epoch_id,
+    uint64_t token, Preserve_trx_promotion_ready_state state,
+    uint64_t required_apply_lsn, const Preserved_trx_bundle &ready_bundle);
+
+Preserve_trx_promotion_adopt_status
+preserved_trx_promotion_prewarm_standby_pending_token(
+    const std::string &preserve_dir, const std::string &epoch_id,
+    uint64_t token, uint64_t required_apply_lsn);
+
 struct Preserve_trx_promotion_adopt_all_request {
   std::string epoch_id;
   std::vector<uint64_t> tokens;
@@ -72,6 +108,13 @@ struct Preserve_trx_promotion_adopt_all_request {
   bool require_epoch_committed{true};
   bool require_apply_barrier{true};
   bool require_promotion_ready_cache{true};
+  /*
+    Phase B callers use the gate as a dry-run/readiness check and may leave
+    READY tokens skipped. Phase D promotion must set execute_adopt so a READY
+    token is either registered as a local preserved transaction or abandoned
+    for cleanup; it must never be reported as success by skipping work.
+  */
+  bool execute_adopt{false};
   bool fail_on_first_error{true};
   uint32_t worker_count{3};
   uint64_t gate_timeout_ms{1000};
@@ -81,6 +124,8 @@ enum class Preserve_trx_promotion_cleanup_state {
   NONE,
   NOT_CLAIMED,
   CLEANUP_PENDING,
+  CLEANUP_ROLLED_BACK,
+  CLEANUP_NOT_FOUND,
   CLEANUP_TAINTED
 };
 
@@ -141,6 +186,11 @@ Preserve_trx_promotion_adopt_status
 preserved_trx_adopt_standby_pending_all_for_promotion(
     const std::string &preserve_dir,
     const Preserve_trx_promotion_adopt_all_request &request,
+    Preserve_trx_promotion_adopt_result *result);
+
+Preserve_trx_promotion_adopt_status
+preserved_trx_cleanup_abandoned_standby_promotion_epoch(
+    const std::string &preserve_dir, const std::string &epoch_id,
     Preserve_trx_promotion_adopt_result *result);
 
 struct Preserve_trx_promotion_adopted_epoch_marker {
