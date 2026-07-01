@@ -242,6 +242,9 @@ class Preserved_trx_carrier {
   virtual Preserved_trx_carrier_status write_promotion_adopted_epoch(
       const std::string &epoch_id, const std::string &marker_payload) = 0;
 
+  virtual Preserved_trx_carrier_status write_promotion_abandoned_epoch(
+      const std::string &epoch_id, const std::string &marker_payload) = 0;
+
   virtual Preserved_trx_carrier_status list_tokens(
       Preserved_trx_carrier_listing *listing) = 0;
 
@@ -392,6 +395,9 @@ class Preserved_trx_store {
   Preserve_snapshot_status remove_taint(const std::string &token);
 
   Preserve_snapshot_status write_promotion_adopted_epoch(
+      const std::string &epoch_id, const std::string &marker_payload);
+
+  Preserve_snapshot_status write_promotion_abandoned_epoch(
       const std::string &epoch_id, const std::string &marker_payload);
 
   Preserve_snapshot_status remove_warm_external_blob_artifact(

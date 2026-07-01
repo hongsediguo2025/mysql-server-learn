@@ -1446,6 +1446,78 @@ TEST(PreservedTrxPromotion, AdoptedEpochMarkerRejectsInvalidFields) {
       encoded.substr(0, encoded.find("digest=")), &marker));
 }
 
+TEST(PreservedTrxPromotion, AbandonedEpochMarkerRoundTrips) {
+  Preserve_trx_promotion_abandoned_epoch_marker marker;
+  marker.epoch_id = "epoch-1";
+  marker.source_server_uuid = "source-uuid";
+  marker.target_server_uuid = "target-uuid";
+  marker.applied_lsn = 123;
+  marker.generated_at_us = 456;
+  marker.tokens.push_back({7, Preserve_trx_promotion_adopt_status::
+                                  READY_CACHE_NOT_READY,
+                           false,
+                           Preserve_trx_promotion_cleanup_state::NOT_CLAIMED,
+                           "promotion-ready cache not built"});
+  marker.tokens.push_back({8, Preserve_trx_promotion_adopt_status::
+                                  APPLY_BARRIER_NOT_REACHED,
+                           false,
+                           Preserve_trx_promotion_cleanup_state::NOT_CLAIMED,
+                           "apply barrier not reached"});
+
+  std::string encoded;
+  ASSERT_TRUE(preserved_trx_encode_promotion_abandoned_epoch_marker(marker,
+                                                                    &encoded));
+
+  Preserve_trx_promotion_abandoned_epoch_marker decoded;
+  ASSERT_TRUE(preserved_trx_decode_promotion_abandoned_epoch_marker(encoded,
+                                                                    &decoded));
+  EXPECT_EQ(marker.epoch_id, decoded.epoch_id);
+  EXPECT_EQ(marker.source_server_uuid, decoded.source_server_uuid);
+  EXPECT_EQ(marker.target_server_uuid, decoded.target_server_uuid);
+  EXPECT_EQ(marker.applied_lsn, decoded.applied_lsn);
+  EXPECT_EQ(marker.generated_at_us, decoded.generated_at_us);
+  ASSERT_EQ(2U, decoded.tokens.size());
+  EXPECT_EQ(7U, decoded.tokens[0].token);
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+            decoded.tokens[0].status);
+  EXPECT_FALSE(decoded.tokens[0].claimed);
+  EXPECT_EQ(Preserve_trx_promotion_cleanup_state::NOT_CLAIMED,
+            decoded.tokens[0].cleanup_state);
+  EXPECT_EQ("promotion-ready cache not built", decoded.tokens[0].reason);
+  EXPECT_EQ(8U, decoded.tokens[1].token);
+
+  encoded[encoded.find("applied_lsn=123")] = 'x';
+  EXPECT_FALSE(preserved_trx_decode_promotion_abandoned_epoch_marker(
+      encoded, &decoded));
+}
+
+TEST(PreservedTrxPromotion, AbandonedEpochMarkerRejectsInvalidFields) {
+  Preserve_trx_promotion_abandoned_epoch_marker marker;
+  marker.epoch_id = "epoch-1";
+  marker.source_server_uuid = "source-uuid";
+  marker.target_server_uuid = "target-uuid";
+  marker.applied_lsn = 123;
+  marker.generated_at_us = 456;
+  marker.tokens.push_back({0, Preserve_trx_promotion_adopt_status::
+                                  READY_CACHE_NOT_READY,
+                           false,
+                           Preserve_trx_promotion_cleanup_state::NOT_CLAIMED,
+                           "bad token"});
+
+  std::string encoded;
+  EXPECT_FALSE(preserved_trx_encode_promotion_abandoned_epoch_marker(marker,
+                                                                     &encoded));
+
+  marker.tokens.clear();
+  marker.tokens.push_back({7, Preserve_trx_promotion_adopt_status::
+                                  READY_CACHE_NOT_READY,
+                           false,
+                           Preserve_trx_promotion_cleanup_state::NOT_CLAIMED,
+                           "bad|reason"});
+  EXPECT_FALSE(preserved_trx_encode_promotion_abandoned_epoch_marker(marker,
+                                                                     &encoded));
+}
+
 TEST(PreservedTrxPromotion, RejectsInvalidTokenZero) {
   Preserve_trx_promotion_adopt_all_request request;
   request.epoch_id = "epoch-1";
@@ -2645,6 +2717,38 @@ TEST_F(PreserveSnapshotTest, PromotionAdoptedEpochMarkerDoesNotDeleteStandby) {
                     MYF(0)));
 }
 
+TEST_F(PreserveSnapshotTest, PromotionAbandonedEpochMarkerDoesNotDeleteStandby) {
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  const std::string token = "912";
+  write_file(m_dir + token + ".standby_pending", "standby_pending\n");
+
+  Preserve_trx_promotion_abandoned_epoch_marker marker;
+  marker.epoch_id = "epoch-1";
+  marker.source_server_uuid = "source-uuid";
+  marker.target_server_uuid = "target-uuid";
+  marker.applied_lsn = 123;
+  marker.generated_at_us = 456;
+  marker.tokens.push_back({912, Preserve_trx_promotion_adopt_status::
+                                    READY_CACHE_NOT_READY,
+                           false,
+                           Preserve_trx_promotion_cleanup_state::NOT_CLAIMED,
+                           "promotion-ready cache not built"});
+  std::string encoded;
+  ASSERT_TRUE(preserved_trx_encode_promotion_abandoned_epoch_marker(marker,
+                                                                    &encoded));
+
+  EXPECT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.write_promotion_abandoned_epoch(marker.epoch_id, encoded));
+
+  MY_STAT stat_area;
+  EXPECT_NE(nullptr,
+            my_stat((m_dir + "epoch-1.promotion_abandoned").c_str(),
+                    &stat_area, MYF(0)));
+  EXPECT_NE(nullptr,
+            my_stat((m_dir + token + ".standby_pending").c_str(), &stat_area,
+                    MYF(0)));
+}
+
 TEST_F(PreserveSnapshotTest, PromotionDisabledDoesNotCreateCarrierDirectory) {
   preserve_trx_set_enable_value(false);
   const std::string disabled_dir = m_dir + "disabled_promotion";
@@ -2689,13 +2793,20 @@ TEST_F(PreserveSnapshotTest,
   request.require_promotion_ready_cache = true;
 
   Preserve_trx_promotion_adopt_result result;
-  EXPECT_EQ(Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS,
             preserved_trx_adopt_standby_pending_all_for_promotion(
                 m_dir, request, &result));
   EXPECT_EQ(0U, result.adopted_count);
-  EXPECT_EQ(1U, result.failed_count);
+  EXPECT_EQ(0U, result.failed_count);
+  EXPECT_EQ(1U, result.abandoned_count);
   ASSERT_EQ(1U, result.seen_tokens.size());
   EXPECT_EQ(902U, result.seen_tokens[0]);
+  ASSERT_EQ(1U, result.token_results.size());
+  EXPECT_EQ(902U, result.token_results[0].token);
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+            result.token_results[0].status);
+  EXPECT_EQ(Preserve_trx_promotion_cleanup_state::NOT_CLAIMED,
+            result.token_results[0].cleanup_state);
 
   Preserved_trx_carrier_token_state state;
   ASSERT_EQ(Preserved_trx_carrier_status::OK,
@@ -2769,11 +2880,15 @@ TEST_F(PreserveSnapshotTest, PromotionDefaultRequestRequiresEpochCommit) {
   request.tokens.push_back(907);
 
   Preserve_trx_promotion_adopt_result result;
-  EXPECT_EQ(Preserve_trx_promotion_adopt_status::EPOCH_NOT_COMMITTED,
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS,
             preserved_trx_adopt_standby_pending_all_for_promotion(
                 m_dir, request, &result));
   EXPECT_EQ(0U, result.adopted_count);
-  EXPECT_EQ(1U, result.failed_count);
+  EXPECT_EQ(0U, result.failed_count);
+  EXPECT_EQ(1U, result.abandoned_count);
+  ASSERT_EQ(1U, result.token_results.size());
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::EPOCH_NOT_COMMITTED,
+            result.token_results[0].status);
   preserve_trx_set_enable_value(true);
 }
 
@@ -2801,11 +2916,15 @@ TEST_F(PreserveSnapshotTest, PromotionRejectsLocalTokenWithoutStandbyMarker) {
   request.require_promotion_ready_cache = false;
 
   Preserve_trx_promotion_adopt_result result;
-  EXPECT_EQ(Preserve_trx_promotion_adopt_status::NOT_STANDBY_PENDING,
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS,
             preserved_trx_adopt_standby_pending_all_for_promotion(
                 m_dir, request, &result));
   EXPECT_EQ(0U, result.adopted_count);
-  EXPECT_EQ(1U, result.failed_count);
+  EXPECT_EQ(0U, result.failed_count);
+  EXPECT_EQ(1U, result.abandoned_count);
+  ASSERT_EQ(1U, result.token_results.size());
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::NOT_STANDBY_PENDING,
+            result.token_results[0].status);
   preserve_trx_set_enable_value(true);
 }
 
@@ -2819,11 +2938,15 @@ TEST_F(PreserveSnapshotTest, PromotionRejectsMissingRequestedToken) {
   request.require_promotion_ready_cache = false;
 
   Preserve_trx_promotion_adopt_result result;
-  EXPECT_EQ(Preserve_trx_promotion_adopt_status::TOKEN_NOT_FOUND,
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS,
             preserved_trx_adopt_standby_pending_all_for_promotion(
                 m_dir, request, &result));
   EXPECT_EQ(0U, result.adopted_count);
-  EXPECT_EQ(1U, result.failed_count);
+  EXPECT_EQ(0U, result.failed_count);
+  EXPECT_EQ(1U, result.abandoned_count);
+  ASSERT_EQ(1U, result.token_results.size());
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::TOKEN_NOT_FOUND,
+            result.token_results[0].status);
   preserve_trx_set_enable_value(true);
 }
 
@@ -2913,11 +3036,15 @@ TEST_F(PreserveSnapshotTest, PromotionRejectsNonNumericStandbyToken) {
   request.require_promotion_ready_cache = false;
 
   Preserve_trx_promotion_adopt_result result;
-  EXPECT_EQ(Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT,
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS,
             preserved_trx_adopt_standby_pending_all_for_promotion(
                 m_dir, request, &result));
   EXPECT_EQ(0U, result.adopted_count);
-  EXPECT_EQ(1U, result.failed_count);
+  EXPECT_EQ(0U, result.failed_count);
+  EXPECT_EQ(1U, result.abandoned_count);
+  ASSERT_EQ(1U, result.token_results.size());
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT,
+            result.token_results[0].status);
   preserve_trx_set_enable_value(true);
 }
 
@@ -2949,11 +3076,15 @@ TEST_F(PreserveSnapshotTest, PromotionApplyBarrierFailsBeforeReadyCache) {
   request.require_promotion_ready_cache = true;
 
   Preserve_trx_promotion_adopt_result result;
-  EXPECT_EQ(Preserve_trx_promotion_adopt_status::APPLY_BARRIER_NOT_REACHED,
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS,
             preserved_trx_adopt_standby_pending_all_for_promotion(
                 m_dir, request, &result));
   EXPECT_EQ(0U, result.adopted_count);
-  EXPECT_EQ(1U, result.failed_count);
+  EXPECT_EQ(0U, result.failed_count);
+  EXPECT_EQ(1U, result.abandoned_count);
+  ASSERT_EQ(1U, result.token_results.size());
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::APPLY_BARRIER_NOT_REACHED,
+            result.token_results[0].status);
   preserved_trx_set_promotion_apply_state_provider_for_unit_test(nullptr);
   preserve_trx_set_enable_value(true);
 }
@@ -2984,11 +3115,15 @@ TEST_F(PreserveSnapshotTest, PromotionMissingApplyProviderFailsClosed) {
   request.require_promotion_ready_cache = true;
 
   Preserve_trx_promotion_adopt_result result;
-  EXPECT_EQ(Preserve_trx_promotion_adopt_status::APPLY_BARRIER_NOT_REACHED,
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS,
             preserved_trx_adopt_standby_pending_all_for_promotion(
                 m_dir, request, &result));
   EXPECT_EQ(0U, result.adopted_count);
-  EXPECT_EQ(1U, result.failed_count);
+  EXPECT_EQ(0U, result.failed_count);
+  EXPECT_EQ(1U, result.abandoned_count);
+  ASSERT_EQ(1U, result.token_results.size());
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::APPLY_BARRIER_NOT_REACHED,
+            result.token_results[0].status);
   preserve_trx_set_enable_value(true);
 }
 
@@ -3020,11 +3155,15 @@ TEST_F(PreserveSnapshotTest, PromotionApplyReachedStillNeedsReadyCache) {
   request.require_promotion_ready_cache = true;
 
   Preserve_trx_promotion_adopt_result result;
-  EXPECT_EQ(Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS,
             preserved_trx_adopt_standby_pending_all_for_promotion(
                 m_dir, request, &result));
   EXPECT_EQ(0U, result.adopted_count);
-  EXPECT_EQ(1U, result.failed_count);
+  EXPECT_EQ(0U, result.failed_count);
+  EXPECT_EQ(1U, result.abandoned_count);
+  ASSERT_EQ(1U, result.token_results.size());
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+            result.token_results[0].status);
   preserved_trx_set_promotion_apply_state_provider_for_unit_test(nullptr);
   preserve_trx_set_enable_value(true);
 }
@@ -3181,6 +3320,13 @@ class InMemoryPreservedTrxCarrier final : public Preserved_trx_carrier {
     return Preserved_trx_carrier_status::OK;
   }
 
+  Preserved_trx_carrier_status write_promotion_abandoned_epoch(
+      const std::string &epoch_id,
+      const std::string &marker_payload) override {
+    promotion_abandoned_epoch_markers[epoch_id] = marker_payload;
+    return Preserved_trx_carrier_status::OK;
+  }
+
   Preserved_trx_carrier_status list_tokens(
       Preserved_trx_carrier_listing *listing) override {
     ++list_token_reads;
@@ -3228,6 +3374,7 @@ class InMemoryPreservedTrxCarrier final : public Preserved_trx_carrier {
   std::set<std::string> standby_pending_tokens;
   std::set<std::string> warm_artifacts;
   std::map<std::string, std::string> promotion_adopted_epoch_markers;
+  std::map<std::string, std::string> promotion_abandoned_epoch_markers;
   Preserved_trx_codec_context context;
   size_t context_reads{0};
   size_t list_token_reads{0};

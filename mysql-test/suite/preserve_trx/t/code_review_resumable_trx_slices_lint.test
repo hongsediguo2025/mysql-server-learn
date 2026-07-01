@@ -1679,6 +1679,13 @@ die "standby promotion Phase A must not import semantic transaction state\n"
 die "standby promotion Phase A must fail closed while promotion-ready cache is missing\n"
   unless $promotion =~ /READY_CACHE_NOT_READY/s &&
          $promotion =~ /require_promotion_ready_cache/s;
+die "standby promotion must report token-level abandoned outcomes without failing service promotion\n"
+  unless $promotion =~ /OK_WITH_ABANDONED_TOKENS/s &&
+         $promotion =~ /abandoned_count/s &&
+         $promotion =~ /promotion-ready cache not built/s;
+die "standby promotion abandoned marker must be an epoch-level side artifact\n"
+  unless $promotion =~ /PTRX_PROMOTION_ABANDONED_EPOCH_V1/s &&
+         $carrier_file =~ /promotion_abandoned/s;
 die "standby transfer design doc must not claim production client transport and worker pools are complete in this milestone\n"
   unless $standby_transfer_doc =~
          /当前实现状态[\s\S]*source transport[\s\S]*fail-closed/s &&

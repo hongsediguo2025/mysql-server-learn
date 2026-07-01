@@ -1966,6 +1966,22 @@ Local_file_preserved_trx_carrier::write_promotion_adopted_epoch(
   return map_atomic_write_status(status);
 }
 
+Preserved_trx_carrier_status
+Local_file_preserved_trx_carrier::write_promotion_abandoned_epoch(
+    const std::string &epoch_id, const std::string &marker_payload) {
+  if (!promotion_epoch_component_is_filename_safe(epoch_id) ||
+      marker_payload.empty()) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  if (ensure_directory(m_dir)) return Preserved_trx_carrier_status::IO_ERROR;
+  const std::vector<unsigned char> bytes(marker_payload.begin(),
+                                         marker_payload.end());
+  const Atomic_write_status status =
+      atomic_write_file(m_dir, epoch_id + ".promotion_abandoned", bytes, 0600,
+                        {});
+  return map_atomic_write_status(status);
+}
+
 Preserved_trx_carrier_status Local_file_preserved_trx_carrier::list_tokens(
     Preserved_trx_carrier_listing *listing) {
   if (listing == nullptr) return Preserved_trx_carrier_status::CORRUPT;
