@@ -116,6 +116,14 @@ bool token_is_filename_safe(const std::string &token) {
   });
 }
 
+bool promotion_epoch_component_is_filename_safe(const std::string &epoch_id) {
+  if (epoch_id.empty() || epoch_id.length() > 128) return false;
+  return std::all_of(epoch_id.begin(), epoch_id.end(), [](unsigned char ch) {
+    return (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') ||
+           (ch >= 'a' && ch <= 'z') || ch == '_' || ch == '-' || ch == '.';
+  });
+}
+
 bool external_blob_name_is_filename_safe(const std::string &name) {
   if (name.empty() || name.length() > 128) return false;
   return std::all_of(name.begin(), name.end(), [](unsigned char ch) {
@@ -1940,6 +1948,22 @@ Local_file_preserved_trx_carrier::mark_standby_pending(
   return write_standby_pending_marker(m_dir, token)
              ? Preserved_trx_carrier_status::IO_ERROR
              : Preserved_trx_carrier_status::OK;
+}
+
+Preserved_trx_carrier_status
+Local_file_preserved_trx_carrier::write_promotion_adopted_epoch(
+    const std::string &epoch_id, const std::string &marker_payload) {
+  if (!promotion_epoch_component_is_filename_safe(epoch_id) ||
+      marker_payload.empty()) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  if (ensure_directory(m_dir)) return Preserved_trx_carrier_status::IO_ERROR;
+  const std::vector<unsigned char> bytes(marker_payload.begin(),
+                                         marker_payload.end());
+  const Atomic_write_status status =
+      atomic_write_file(m_dir, epoch_id + ".promotion_adopted", bytes, 0600,
+                        {});
+  return map_atomic_write_status(status);
 }
 
 Preserved_trx_carrier_status Local_file_preserved_trx_carrier::list_tokens(

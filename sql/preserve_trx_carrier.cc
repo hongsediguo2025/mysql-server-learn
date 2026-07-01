@@ -643,6 +643,13 @@ Preserve_snapshot_status Preserved_trx_store::remove_taint(
   return map_carrier_status(m_carrier->remove_taint(token));
 }
 
+Preserve_snapshot_status Preserved_trx_store::write_promotion_adopted_epoch(
+    const std::string &epoch_id, const std::string &marker_payload) {
+  if (m_carrier == nullptr) return Preserve_snapshot_status::INVALID_ARGUMENT;
+  return map_carrier_status(
+      m_carrier->write_promotion_adopted_epoch(epoch_id, marker_payload));
+}
+
 Preserve_snapshot_status Preserved_trx_store::remove_warm_external_blob_artifact(
     const std::string &artifact_filename) {
   if (m_carrier == nullptr) return Preserve_snapshot_status::INVALID_ARGUMENT;

@@ -74,6 +74,9 @@ class Local_file_preserved_trx_carrier final
   Preserved_trx_carrier_status remove_taint(const std::string &token) override;
   Preserved_trx_carrier_status mark_standby_pending(
       const std::string &token) override;
+  Preserved_trx_carrier_status write_promotion_adopted_epoch(
+      const std::string &epoch_id,
+      const std::string &marker_payload) override;
   Preserved_trx_carrier_status list_tokens(
       Preserved_trx_carrier_listing *listing) override;
   Preserved_trx_carrier_status token_state(

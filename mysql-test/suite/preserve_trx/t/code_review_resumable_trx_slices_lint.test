@@ -86,6 +86,10 @@ my $sql_parse_path = File::Spec->catfile($source_root, 'sql', 'sql_parse.cc');
 my $sys_vars_path = File::Spec->catfile($source_root, 'sql', 'sys_vars.cc');
 my $transfer_path = File::Spec->catfile($source_root, 'sql',
                                         'preserve_trx_transfer.cc');
+my $transfer_header_path = File::Spec->catfile($source_root, 'sql',
+                                               'preserve_trx_transfer.h');
+my $promotion_path = File::Spec->catfile($source_root, 'sql',
+                                         'preserve_trx_promotion.cc');
 my $standby_transfer_doc_path = File::Spec->catfile(
   $source_root, 'design', 'preserve-resume-8.0.22-standby-transfer-design.md');
 
@@ -121,6 +125,8 @@ my $gunit = read_source($gunit_path);
 my $sql_parse = read_source($sql_parse_path);
 my $sys_vars = read_source($sys_vars_path);
 my $transfer = read_source($transfer_path);
+my $transfer_header = read_source($transfer_header_path);
+my $promotion = read_source($promotion_path);
 my $standby_transfer_doc = read_optional_source($standby_transfer_doc_path);
 
 $lock_preserve =~ /static bool lock_preserve_page_identity_matches[\s\S]*?^}/m
@@ -1651,6 +1657,28 @@ die "standby transfer worker sysvars must be documented as reserved until real s
          /preserve_trx_transfer_sender_workers[\s\S]*reserved[\s\S]*planned source worker pool/s &&
          $sys_vars =~
          /preserve_trx_transfer_receiver_workers[\s\S]*reserved[\s\S]*planned receiver worker pool/s;
+die "standby promotion Phase A must not change the standby-transfer wire protocol version\n"
+  unless $transfer_header =~
+         /kPreserveTrxTransferProtocolVersion\s*=\s*2\s*;/s;
+die "standby promotion Phase A must expose a single promotion adopt entry point\n"
+  unless $promotion =~
+         /preserved_trx_adopt_standby_pending_all_for_promotion/s;
+die "standby promotion Phase A entry must stay out of local preserve recovery\n"
+  if $preserve =~ /preserved_trx_adopt_standby_pending_all_for_promotion/s;
+die "standby promotion Phase A entry must stay out of mysqld startup\n"
+  if $mysqld =~ /preserved_trx_adopt_standby_pending_all_for_promotion/s;
+die "standby promotion Phase A entry must not be exposed through ordinary SQL dispatch\n"
+  if $sql_parse =~ /preserved_trx_adopt_standby_pending_all_for_promotion/s;
+die "standby promotion Phase A must stay out of local startup recovery\n"
+  if $promotion =~ /preserved_trx_recover_all\s*\(|recover_preserved_snapshot\s*\(/s;
+die "standby promotion Phase A must not claim or register prepared transactions\n"
+  if $promotion =~ /trx_preserve_claim_prepared\s*\(|preserved_trx_add_record\s*\(/s;
+die "standby promotion Phase A must not import semantic transaction state\n"
+  if $promotion =~
+     /trx_preserve_import_(read_view|record_locks|table_locks|predicate_locks)\s*\(|create_detached_mdl_context\s*\(/s;
+die "standby promotion Phase A must fail closed while promotion-ready cache is missing\n"
+  unless $promotion =~ /READY_CACHE_NOT_READY/s &&
+         $promotion =~ /require_promotion_ready_cache/s;
 die "standby transfer design doc must not claim production client transport and worker pools are complete in this milestone\n"
   unless $standby_transfer_doc =~
          /当前实现状态[\s\S]*source transport[\s\S]*fail-closed/s &&
