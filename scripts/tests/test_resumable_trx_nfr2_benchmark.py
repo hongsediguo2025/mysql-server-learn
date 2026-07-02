@@ -750,6 +750,44 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
             self.assertIn('"status": "fail"', rendered)
             self.assertIn('"warmcopy_p95_below_live_baseline": false', rendered)
 
+    def test_output_path_parent_directory_is_created(self):
+        def fake_run_scenario(scenario):
+            return {
+                "name": "warmcopy",
+                "phase2_total_summary_ms": {
+                    "sample_count": 1,
+                    "p50_ms": 10.0,
+                    "p95_ms": 10.0,
+                    "p99_ms": 10.0,
+                    "max_ms": 10.0,
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "missing" / "nested" / "report.json"
+            scenarios = [SimpleNamespace(name="warmcopy")]
+            with mock.patch.object(nfr2_benchmark, "build_scenarios", return_value=scenarios):
+                with mock.patch.object(
+                    nfr2_benchmark, "run_scenario", side_effect=fake_run_scenario
+                ):
+                    exit_code = main(
+                        [
+                            "--restart-command",
+                            "mysqld --defaults-file=/tmp/nfr2.cnf",
+                            "--scenario",
+                            "baseline",
+                            "--phase2-warmcopy-scenario",
+                            "warmcopy",
+                            "--output",
+                            str(output),
+                        ]
+                    )
+
+            self.assertEqual(0, exit_code)
+            self.assertTrue(output.exists())
+            rendered = output.read_text(encoding="utf-8")
+            self.assertIn('"warmcopy"', rendered)
+
     def test_required_phase2_absolute_gate_returns_nonzero_on_failed_warmcopy_p95(self):
         def fake_run_scenario(scenario):
             return {

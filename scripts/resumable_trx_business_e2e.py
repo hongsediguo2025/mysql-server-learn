@@ -3675,14 +3675,13 @@ class BusinessE2ERunner:
         try:
             if self.config.scenario in BINLOG_SCENARIOS:
                 self.runtime.execute(conn, "SET GLOBAL binlog_format=ROW")
-            self.runtime.execute(conn, "SET GLOBAL preserve_trx_enable=OFF")
-            self.runtime.execute(conn, "SET GLOBAL preserve_trx_warmcopy_enable=OFF")
             rows = self.runtime.execute(
                 conn, "SELECT @@global.preserve_trx_enable", fetch=True
             )
             if not rows or str(rows[0][0]).upper() not in {"0", "OFF"}:
                 raise AssertionError(
-                    f"no-preserve baseline failed to disable preserve_trx_enable: {rows!r}"
+                    "no-preserve baseline requires mysqld to be started with "
+                    f"preserve_trx_enable=OFF; observed {rows!r}"
                 )
         finally:
             conn.close()

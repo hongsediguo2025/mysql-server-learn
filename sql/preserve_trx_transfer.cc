@@ -1412,6 +1412,15 @@ Preserve_trx_transfer_status preserve_trx_transfer_build_portable_objects(
   if (manifest == nullptr || objects == nullptr || transfer_token == 0) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
+  if (!bundle.metadata.temp_table_manifest_payload.empty()) {
+    /*
+      User temporary table state is not portable until the receiver can install
+      both image and no-redo-undo sidecars before publishing .standby_pending.
+      Rejecting here prevents a marker from advertising an artifact whose
+      snapshot references local-only sidecar paths.
+    */
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
 
   std::string portable_snapshot;
   Preserve_trx_transfer_status status =

@@ -886,22 +886,39 @@ die "recovery must read durable snapshots through Preserved_trx_store\n"
          $recover_snapshot =~ /->read\s*\(/s;
 die "recovery must read semantic external payloads without eager-loading logged binlog cache payload while registering preserved snapshots\n"
   unless $recover_snapshot =~ /store->read\s*\(\s*token\s*,\s*true\s*,[\s\S]*Payload_read_mode::[\s\S]*WITH_SEMANTIC_EXTERNAL_BLOBS[\s\S]*&bundle\s*\)/s;
+die "recovery must pass recovered_count rewrite through an after-claim hook\n"
+  unless $recover_snapshot =~ /Preserved_trx_recovered_count_rewrite_context/s &&
+         $recover_snapshot =~ /recovered_count_rewrite_after_claim/s;
+$preserve =~ /static bool recovered_count_rewrite_after_claim[\s\S]*?^}/m
+  or die "could not isolate recovered_count_rewrite_after_claim\n";
+my $recovered_count_after_claim_hook = $&;
 die "recovery must rewrite recovered_count through Preserved_trx_store\n"
-  unless $recover_snapshot =~ /->rewrite_recovered_count\s*\(/s;
+  unless $recovered_count_after_claim_hook =~ /->rewrite_recovered_count\s*\(/s;
+my $shared_recover_adopt_start =
+  index($preserve, 'static bool preserved_trx_recover_or_adopt_bundle_shared');
+my $recover_snapshot_start =
+  index($preserve, 'static bool recover_preserved_snapshot');
+die "could not isolate preserved_trx_recover_or_adopt_bundle_shared\n"
+  unless $shared_recover_adopt_start >= 0 &&
+         $recover_snapshot_start > $shared_recover_adopt_start;
+my $shared_recover_adopt_kernel =
+  substr($preserve, $shared_recover_adopt_start,
+         $recover_snapshot_start - $shared_recover_adopt_start);
 my $recover_add_record_pos =
-  index($recover_snapshot, 'preserved_trx_add_record');
+  index($shared_recover_adopt_kernel, 'preserved_trx_add_record');
 my $recover_rewrite_count_pos =
-  index($recover_snapshot, '->rewrite_recovered_count');
-my $recover_claim_pos = index($recover_snapshot, 'trx_preserve_claim_prepared');
+  index($shared_recover_adopt_kernel, 'after_claim_hook(token, trx');
+my $recover_claim_pos =
+  index($shared_recover_adopt_kernel, 'trx_preserve_claim_prepared');
 die "recovery must rewrite durable recovered_count after claiming but before publishing the recovered record\n"
   unless $recover_add_record_pos >= 0 && $recover_rewrite_count_pos >= 0 &&
          $recover_claim_pos >= 0 &&
          $recover_claim_pos < $recover_rewrite_count_pos &&
          $recover_rewrite_count_pos < $recover_add_record_pos;
 die "recovery recovered_count rewrite failure must rollback the claimed transaction before registration\n"
-  unless $recover_snapshot =~
-         /rewrite_recovered_count[\s\S]*rollback_claimed_preserved_snapshot_or_log/s &&
-         $recover_snapshot !~ /rewrite_recovered_count[\s\S]*preserved_trx_add_record[\s\S]*preserved_trx_update_record_last_error/s;
+  unless $shared_recover_adopt_kernel =~
+         /after_claim_hook[\s\S]*rollback_after_claim/s &&
+         $recover_snapshot !~ /recovered_count_rewrite_after_claim[\s\S]*preserved_trx_add_record[\s\S]*preserved_trx_update_record_last_error/s;
 die "recovery must not call legacy raw snapshot read/rewrite helpers\n"
   if $recover_snapshot =~ /preserved_trx_read_snapshot|read_snapshot_with_identity_check|rewrite_snapshot_recovered_count/s;
 die "recovery max-count cleanup must leave a FAILED observable P_S record\n"
@@ -1567,8 +1584,8 @@ die "SQL savepoint validator must bound binlog positions and event counters by s
          $gunit =~ /BinlogSavepointPositionCannotExceedPayload/s &&
          $gunit =~ /BinlogSavepointEventCounterCannotExceedCache/s;
 die "startup recovery success must emit an audit event\n"
-  unless $recover_snapshot =~
-         /audit_preserved_trx_event\s*\(\s*current_thd\s*,\s*token\s*,\s*"recover"\s*,\s*"success"\s*\)/s;
+  unless $shared_recover_adopt_kernel =~
+         /audit_preserved_trx_event\s*\(\s*current_thd\s*,\s*token\s*,\s*local_startup\s*\?\s*"recover"\s*:\s*"promotion-adopt"\s*,\s*"success"\s*\)/s;
 
 $preserve =~ /bool Sql_cmd_resume_preserved_transaction::execute[\s\S]*?^}/m
   or die "could not isolate Sql_cmd_resume_preserved_transaction::execute\n";
@@ -1715,14 +1732,15 @@ $preserve =~
   /bool preserved_trx_adopt_ready_bundle_for_promotion\s*\([\s\S]*?^}/m
   or die "could not isolate preserved_trx_adopt_ready_bundle_for_promotion\n";
 my $promotion_ready_adopt_helper = $&;
-die "standby promotion Phase D helper must claim, import semantic state, register, and rollback post-claim failures\n"
-  unless $promotion_ready_adopt_helper =~ /trx_preserve_claim_prepared/s &&
-         $promotion_ready_adopt_helper =~ /trx_preserve_import_read_view/s &&
-         $promotion_ready_adopt_helper =~ /trx_preserve_import_table_locks/s &&
-         $promotion_ready_adopt_helper =~ /trx_preserve_import_record_locks/s &&
-         $promotion_ready_adopt_helper =~ /create_detached_mdl_context/s &&
-         $promotion_ready_adopt_helper =~ /preserved_trx_add_record/s &&
-         $promotion_ready_adopt_helper =~ /trx_preserve_rollback_claimed/s;
+die "standby promotion Phase D helper must delegate claim/import/register to the shared startup recover/adopt kernel\n"
+  unless $promotion_ready_adopt_helper =~
+         /preserved_trx_recover_or_adopt_bundle_shared/s;
+die "standby promotion Phase D helper must not directly claim, import semantic state, or register preserved records\n"
+  if $promotion_ready_adopt_helper =~
+     /trx_preserve_claim_prepared\s*\(|trx_preserve_import_read_view\s*\(|trx_preserve_import_table_locks\s*\(|trx_preserve_import_record_locks\s*\(|create_detached_mdl_context\s*\(|preserved_trx_add_record\s*\(/s;
+die "shared startup recover/adopt kernel must contain claim/import/register and post-claim rollback\n"
+  unless $preserve =~
+         /preserved_trx_recover_or_adopt_bundle_shared[\s\S]*trx_preserve_claim_prepared[\s\S]*trx_preserve_import_read_view[\s\S]*trx_preserve_import_table_locks[\s\S]*trx_preserve_import_record_locks[\s\S]*create_detached_mdl_context[\s\S]*preserved_trx_add_record[\s\S]*trx_preserve_rollback_claimed/s;
 die "standby promotion Phase D helper must not delete standby artifacts inside the promotion gate\n"
   if $promotion_ready_adopt_helper =~
      /delete_preserved_snapshot_files_and_sidecars_or_log|remove_with_status|remove_standby_pending/s;

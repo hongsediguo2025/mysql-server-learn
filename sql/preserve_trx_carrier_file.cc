@@ -68,6 +68,8 @@ enum class Atomic_write_status { OK, ALREADY_EXISTS, IO_ERROR };
 constexpr char kGenericExternalBlobShardRoot[] = "blob_shards";
 constexpr char kPromotionAdoptedMarkerMagic[] =
     "PTRX_PROMOTION_ADOPTED_EPOCH_V1";
+constexpr char kPromotionIntentMarkerMagic[] =
+    "PTRX_PROMOTION_INTENT_EPOCH_V1";
 constexpr size_t kPromotionDigestBytes = 32;
 
 std::string normalize_dir(std::string dir) {
@@ -592,6 +594,49 @@ bool adopted_marker_tokens_from_payload(const std::vector<unsigned char> &bytes,
     line_start = line_end + 1;
   }
   return false;
+}
+
+bool intent_marker_tokens_from_payload(const std::vector<unsigned char> &bytes,
+                                       std::set<std::string> *tokens) {
+  if (tokens == nullptr) return false;
+  const std::string encoded(bytes.begin(), bytes.end());
+  const size_t digest_pos = encoded.rfind("digest=");
+  if (digest_pos == std::string::npos ||
+      (digest_pos > 0 && encoded[digest_pos - 1] != '\n')) {
+    return false;
+  }
+  const std::string body = encoded.substr(0, digest_pos);
+  const std::string expected_digest_line = "digest=" + sha256_hex(body) + "\n";
+  if (encoded.substr(digest_pos) != expected_digest_line) return false;
+  if (body.compare(0, sizeof(kPromotionIntentMarkerMagic) - 1,
+                   kPromotionIntentMarkerMagic) != 0 ||
+      body.size() <= sizeof(kPromotionIntentMarkerMagic) - 1 ||
+      body[sizeof(kPromotionIntentMarkerMagic) - 1] != '\n') {
+    return false;
+  }
+
+  size_t line_start = sizeof(kPromotionIntentMarkerMagic);
+  while (line_start < body.size()) {
+    const size_t line_end = body.find('\n', line_start);
+    if (line_end == std::string::npos) return false;
+    const size_t line_len = line_end - line_start;
+    if (line_len > 6 && body.compare(line_start, 6, "token_") == 0) {
+      const size_t equals = body.find('=', line_start);
+      if (equals == std::string::npos || equals >= line_end) return false;
+      const std::string token_text =
+          body.substr(equals + 1, line_end - equals - 1);
+      const size_t sep = token_text.find('|');
+      const std::string token_component =
+          sep == std::string::npos ? token_text : token_text.substr(0, sep);
+      uint64_t token = 0;
+      if (!parse_uint64_strict(token_component, &token) || token == 0) {
+        return false;
+      }
+      tokens->insert(std::to_string(token));
+    }
+    line_start = line_end + 1;
+  }
+  return !tokens->empty();
 }
 
 void append_le16(std::vector<unsigned char> *bytes, uint16_t value) {
@@ -1299,6 +1344,8 @@ Preserve_snapshot_delete_status delete_snapshot_files_with_status(
   const std::string dir = normalize_dir(dir_arg);
   const std::string binlog_cache_path = join_path(dir, token + ".binlog_cache");
   const std::string tainted_path = join_path(dir, token + ".tainted");
+  const std::string standby_pending_path =
+      join_path(dir, token + ".standby_pending");
   bool error = false;
   bool removed_sidecar = false;
   /*
@@ -1357,6 +1404,7 @@ Preserve_snapshot_delete_status delete_snapshot_files_with_status(
 
   delete_optional_sidecar(binlog_cache_path);
   delete_optional_sidecar(tainted_path);
+  delete_optional_sidecar(standby_pending_path);
   bool removed_generic_sidecar = false;
   const Preserve_snapshot_delete_status generic_final_status =
       remove_generic_external_blobs_for_token_all_dirs(
@@ -2076,6 +2124,24 @@ Local_file_preserved_trx_carrier::write_promotion_abandoned_epoch(
 }
 
 Preserved_trx_carrier_status
+Local_file_preserved_trx_carrier::write_promotion_intent_epoch(
+    const std::string &epoch_id, const std::string &marker_payload) {
+  if (!promotion_epoch_component_is_filename_safe(epoch_id) ||
+      marker_payload.empty()) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  DBUG_EXECUTE_IF("preserve_trx_fail_write_promotion_intent_epoch",
+                  return Preserved_trx_carrier_status::IO_ERROR;);
+  if (ensure_directory(m_dir)) return Preserved_trx_carrier_status::IO_ERROR;
+  const std::vector<unsigned char> bytes(marker_payload.begin(),
+                                         marker_payload.end());
+  const Atomic_write_status status =
+      atomic_write_file(m_dir, epoch_id + ".promotion_intent", bytes, 0600,
+                        {});
+  return map_atomic_write_status(status);
+}
+
+Preserved_trx_carrier_status
 Local_file_preserved_trx_carrier::read_promotion_abandoned_epoch(
     const std::string &epoch_id, std::string *marker_payload) {
   if (!promotion_epoch_component_is_filename_safe(epoch_id) ||
@@ -2083,6 +2149,23 @@ Local_file_preserved_trx_carrier::read_promotion_abandoned_epoch(
     return Preserved_trx_carrier_status::CORRUPT;
   }
   const std::string path = join_path(m_dir, epoch_id + ".promotion_abandoned");
+  std::vector<unsigned char> bytes;
+  const Preserved_trx_carrier_status status =
+      read_file_limited(path, 1024 * 1024, &bytes);
+  if (status != Preserved_trx_carrier_status::OK) return status;
+  marker_payload->assign(reinterpret_cast<const char *>(bytes.data()),
+                         bytes.size());
+  return Preserved_trx_carrier_status::OK;
+}
+
+Preserved_trx_carrier_status
+Local_file_preserved_trx_carrier::read_promotion_intent_epoch(
+    const std::string &epoch_id, std::string *marker_payload) {
+  if (!promotion_epoch_component_is_filename_safe(epoch_id) ||
+      marker_payload == nullptr) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  const std::string path = join_path(m_dir, epoch_id + ".promotion_intent");
   std::vector<unsigned char> bytes;
   const Preserved_trx_carrier_status status =
       read_file_limited(path, 1024 * 1024, &bytes);
@@ -2101,6 +2184,7 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::list_tokens(
   listing->tainted_tokens.clear();
   listing->standby_pending_tokens.clear();
   listing->promotion_adopted_tokens.clear();
+  listing->promotion_intent_tokens.clear();
   listing->warm_external_blob_artifacts.clear();
 
   /*
@@ -2161,6 +2245,24 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::list_tokens(
           }
           if (!adopted_marker_tokens_from_payload(
                   bytes, &listing->promotion_adopted_tokens)) {
+            my_dirend(dir_info);
+            return Preserved_trx_carrier_status::CORRUPT;
+          }
+          continue;
+        }
+        std::string intent_epoch;
+        if (filename_to_token(file->name, ".promotion_intent",
+                              &intent_epoch)) {
+          std::vector<unsigned char> bytes;
+          const Preserved_trx_carrier_status read_status =
+              read_file_limited(join_path(scan_dir, file->name), 1024 * 1024,
+                                &bytes);
+          if (read_status != Preserved_trx_carrier_status::OK) {
+            my_dirend(dir_info);
+            return read_status;
+          }
+          if (!intent_marker_tokens_from_payload(
+                  bytes, &listing->promotion_intent_tokens)) {
             my_dirend(dir_info);
             return Preserved_trx_carrier_status::CORRUPT;
           }

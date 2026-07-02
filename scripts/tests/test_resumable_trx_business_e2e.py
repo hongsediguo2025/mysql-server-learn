@@ -4374,7 +4374,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         configured_total = int(total_settings[0].split("=")[1])
         self.assertGreaterEqual(configured_total, 200 * 1024 * 1024)
 
-    def test_no_preserve_baseline_globals_disable_warmcopy_state(self):
+    def test_no_preserve_baseline_globals_require_startup_disabled_preserve(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.config = HarnessConfig(
             scenario="warmcopy_two_phase_large_cache_equivalence",
@@ -4390,15 +4390,39 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         runner.configure_no_preserve_baseline_globals()
 
         self.assertIn("SET GLOBAL binlog_format=ROW", runner.runtime.sql)
-        self.assertIn("SET GLOBAL preserve_trx_enable=OFF", runner.runtime.sql)
-        self.assertIn("SET GLOBAL preserve_trx_warmcopy_enable=OFF", runner.runtime.sql)
         self.assertIn("SELECT @@global.preserve_trx_enable", runner.runtime.sql)
+        self.assertNotIn("SET GLOBAL preserve_trx_enable=OFF", runner.runtime.sql)
+        self.assertNotIn("SET GLOBAL preserve_trx_warmcopy_enable=OFF", runner.runtime.sql)
         self.assertFalse(
             any(
                 sql.startswith("SET GLOBAL preserve_trx_warmcopy_max_total_bytes=")
                 for sql in runner.runtime.sql
             )
         )
+
+    def test_no_preserve_baseline_rejects_dynamic_preserve_disable(self):
+        class PreserveEnabledRuntime(_FakeRuntime):
+            def execute(self, conn, sql, fetch=False):
+                self.sql.append(sql)
+                self.calls.append((sql, fetch))
+                if fetch and sql == "SELECT @@global.preserve_trx_enable":
+                    return [(1,)]
+                if fetch:
+                    return _fake_fetch_rows(sql)
+                return ()
+
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="binlog_equivalence",
+            no_preserve_baseline=True,
+            write_binlog_events_file="baseline.events",
+        )
+        runner.runtime = PreserveEnabledRuntime()
+
+        with self.assertRaisesRegex(AssertionError, "started with preserve_trx_enable=OFF"):
+            runner.configure_no_preserve_baseline_globals()
+
+        self.assertNotIn("SET GLOBAL preserve_trx_enable=OFF", runner.runtime.sql)
 
     def test_binlog_equivalence_configures_row_binlog_format(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)

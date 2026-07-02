@@ -1394,6 +1394,26 @@ TEST(PreservedTrxRecovery, StandbyPendingSideArtifactsAreNotLocalOrphans) {
   EXPECT_EQ(0U, recoverable.count("standby-token"));
 }
 
+TEST(PreservedTrxRecovery, StandbyPendingRetainedForOrphanRollbackExclusion) {
+  Preserved_trx_carrier_listing listing;
+  listing.snapshot_tokens.insert("local-token");
+  listing.snapshot_tokens.insert("standby-token");
+  listing.standby_pending_tokens.insert("standby-token");
+  listing.promotion_adopted_tokens.insert("adopted-token");
+
+  const std::set<std::string> import_tokens =
+      preserved_trx_local_import_snapshot_tokens(listing);
+  const std::set<std::string> retained_tokens =
+      preserved_trx_orphan_rollback_retained_tokens(listing);
+
+  EXPECT_EQ(1U, import_tokens.count("local-token"));
+  EXPECT_EQ(0U, import_tokens.count("standby-token"));
+  EXPECT_EQ(1U, import_tokens.count("adopted-token"));
+  EXPECT_EQ(1U, retained_tokens.count("local-token"));
+  EXPECT_EQ(1U, retained_tokens.count("standby-token"));
+  EXPECT_EQ(1U, retained_tokens.count("adopted-token"));
+}
+
 TEST(PreservedTrxPromotion, AdoptedEpochMarkerRoundTripsAndRejectsCorruption) {
   Preserve_trx_promotion_adopted_epoch_marker marker;
   marker.epoch_id = "epoch-1";
@@ -1566,6 +1586,111 @@ TEST(PreservedTrxPromotion, AbandonedEpochMarkerRejectsInvalidFields) {
                            "claimed token cannot become not-found"});
   EXPECT_FALSE(preserved_trx_encode_promotion_abandoned_epoch_marker(marker,
                                                                      &encoded));
+}
+
+TEST(PreservedTrxPromotion, IntentEpochMarkerRoundTripsEveryTokenState) {
+  Preserve_trx_promotion_intent_epoch_marker marker;
+  marker.epoch_id = "epoch-1";
+  marker.source_server_uuid = "source-uuid";
+  marker.target_server_uuid = "target-uuid";
+  marker.required_apply_lsn = 321;
+  marker.generated_at_us = 654;
+  marker.tokens.push_back({11, Preserve_trx_promotion_intent_state::CANDIDATE,
+                           Preserve_trx_promotion_cleanup_state::NONE,
+                           "candidate"});
+  marker.tokens.push_back({12, Preserve_trx_promotion_intent_state::ADOPTING,
+                           Preserve_trx_promotion_cleanup_state::NONE,
+                           "adopting"});
+  marker.tokens.push_back({13, Preserve_trx_promotion_intent_state::ADOPTED,
+                           Preserve_trx_promotion_cleanup_state::NONE,
+                           "adopted"});
+  marker.tokens.push_back({14, Preserve_trx_promotion_intent_state::ABANDONED,
+                           Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING,
+                           "abandoned"});
+  marker.tokens.push_back({15,
+                           Preserve_trx_promotion_intent_state::
+                               CLEANUP_ROLLED_BACK,
+                           Preserve_trx_promotion_cleanup_state::
+                               CLEANUP_ROLLED_BACK,
+                           "rolled back"});
+  marker.tokens.push_back({16,
+                           Preserve_trx_promotion_intent_state::
+                               CLEANUP_NOT_FOUND,
+                           Preserve_trx_promotion_cleanup_state::
+                               CLEANUP_NOT_FOUND,
+                           "not found"});
+  marker.tokens.push_back({17,
+                           Preserve_trx_promotion_intent_state::
+                               CLEANUP_TAINTED,
+                           Preserve_trx_promotion_cleanup_state::
+                               CLEANUP_TAINTED,
+                           "tainted"});
+
+  std::string encoded;
+  ASSERT_TRUE(preserved_trx_encode_promotion_intent_epoch_marker(marker,
+                                                                 &encoded));
+
+  Preserve_trx_promotion_intent_epoch_marker decoded;
+  ASSERT_TRUE(preserved_trx_decode_promotion_intent_epoch_marker(encoded,
+                                                                 &decoded));
+  EXPECT_EQ(marker.epoch_id, decoded.epoch_id);
+  EXPECT_EQ(marker.source_server_uuid, decoded.source_server_uuid);
+  EXPECT_EQ(marker.target_server_uuid, decoded.target_server_uuid);
+  EXPECT_EQ(marker.required_apply_lsn, decoded.required_apply_lsn);
+  EXPECT_EQ(marker.generated_at_us, decoded.generated_at_us);
+  ASSERT_EQ(marker.tokens.size(), decoded.tokens.size());
+  EXPECT_EQ(Preserve_trx_promotion_intent_state::CANDIDATE,
+            decoded.tokens[0].state);
+  EXPECT_EQ(Preserve_trx_promotion_intent_state::ADOPTING,
+            decoded.tokens[1].state);
+  EXPECT_EQ(Preserve_trx_promotion_intent_state::ADOPTED,
+            decoded.tokens[2].state);
+  EXPECT_EQ(Preserve_trx_promotion_intent_state::ABANDONED,
+            decoded.tokens[3].state);
+  EXPECT_EQ(Preserve_trx_promotion_intent_state::CLEANUP_ROLLED_BACK,
+            decoded.tokens[4].state);
+  EXPECT_EQ(Preserve_trx_promotion_intent_state::CLEANUP_NOT_FOUND,
+            decoded.tokens[5].state);
+  EXPECT_EQ(Preserve_trx_promotion_intent_state::CLEANUP_TAINTED,
+            decoded.tokens[6].state);
+
+  encoded[encoded.find("required_apply_lsn=321")] = 'x';
+  EXPECT_FALSE(preserved_trx_decode_promotion_intent_epoch_marker(encoded,
+                                                                  &decoded));
+}
+
+TEST(PreservedTrxPromotion, IntentEpochMarkerRejectsInvalidStatePairs) {
+  Preserve_trx_promotion_intent_epoch_marker marker;
+  marker.epoch_id = "epoch-1";
+  marker.source_server_uuid = "source-uuid";
+  marker.target_server_uuid = "target-uuid";
+  marker.required_apply_lsn = 1;
+  marker.generated_at_us = 2;
+  marker.tokens.push_back({0, Preserve_trx_promotion_intent_state::CANDIDATE,
+                           Preserve_trx_promotion_cleanup_state::NONE,
+                           "bad token"});
+
+  std::string encoded;
+  EXPECT_FALSE(preserved_trx_encode_promotion_intent_epoch_marker(marker,
+                                                                  &encoded));
+
+  marker.tokens.clear();
+  marker.tokens.push_back({7, Preserve_trx_promotion_intent_state::CANDIDATE,
+                           Preserve_trx_promotion_cleanup_state::
+                               CLEANUP_PENDING,
+                           "candidate cannot be cleanup pending"});
+  EXPECT_FALSE(preserved_trx_encode_promotion_intent_epoch_marker(marker,
+                                                                  &encoded));
+
+  marker.tokens.clear();
+  marker.tokens.push_back({7,
+                           Preserve_trx_promotion_intent_state::
+                               CLEANUP_TAINTED,
+                           Preserve_trx_promotion_cleanup_state::
+                               CLEANUP_PENDING,
+                           "tainted state must carry tainted cleanup"});
+  EXPECT_FALSE(preserved_trx_encode_promotion_intent_epoch_marker(marker,
+                                                                  &encoded));
 }
 
 TEST(PreservedTrxPromotion, RejectsInvalidTokenZero) {
@@ -1763,6 +1888,75 @@ TEST(PreservedTrxTransfer, ManifestRejectsMissingEndpointIdentity) {
   manifest.target_server_uuid = "";
   EXPECT_EQ(Preserve_trx_transfer_status::INVALID_ARGUMENT,
             preserve_trx_transfer_encode_manifest(manifest, &encoded));
+}
+
+TEST(PreservedTrxTransfer,
+     PortableBuildRejectsTempManifestWithoutSidecarObjects) {
+  Preserve_snapshot_metadata meta;
+  meta.token = "777";
+  meta.owner_user = "root";
+  meta.owner_host = "localhost";
+  meta.schema_name = "test";
+  meta.created_at_us = 111;
+  meta.expires_at_us = 222;
+  meta.binlog_state = Preserve_snapshot_binlog_state::GLOBAL_OFF_NO_CACHE;
+  meta.session_sql_log_bin = false;
+  meta.option_bin_log = false;
+  meta.global_log_bin = false;
+  meta.mdl_descriptors_payload.assign(4, '\0');
+  Preserved_temp_table_image_descriptor image;
+  image.table_ordinal = 1;
+  image.source_space_id = 42;
+  image.blob_name = "777.tempts.42.image";
+  image.size = 128;
+  image.sha256[0] = 0x42;
+  image.sealed_temp_op_seq = 7;
+  image.image_space_id = 100;
+  image.image_table_id = 200;
+  image.image_format_version = 1;
+  image.clustered_root_page_no = 3;
+  image.page_size = 16384;
+  image.indexes.push_back({300, 3, 0, "PRIMARY"});
+  Preserved_temp_table_manifest manifest_payload;
+  manifest_payload.owner_trx_id = 9;
+  Preserved_temp_table_manifest_entry entry;
+  entry.table_ordinal = image.table_ordinal;
+  entry.schema_name = "test";
+  entry.table_name = "tmp";
+  entry.engine_name = "InnoDB";
+  entry.serialized_dd_table = "serialized-temp-dd";
+  entry.image = image;
+  entry.dict_binding.source_space_id = image.source_space_id;
+  entry.dict_binding.image_table_id = image.image_table_id;
+  entry.dict_binding.clustered_root_page_no = image.clustered_root_page_no;
+  entry.dict_binding.table_flags = image.table_flags;
+  entry.dict_binding.schema_name = entry.schema_name;
+  entry.dict_binding.table_name = entry.table_name;
+  entry.dict_binding.columns.push_back({"id", 6, 256 | 512, 4, true});
+  trx_preserve_temp_dict_index_binding primary;
+  primary.image_index_id = 300;
+  primary.root_page_no = 3;
+  primary.clustered = true;
+  primary.name = "PRIMARY";
+  trx_preserve_temp_dict_index_field_binding id_field;
+  id_field.column_name = "id";
+  primary.fields.push_back(id_field);
+  entry.dict_binding.indexes.push_back(primary);
+  manifest_payload.tables.push_back(entry);
+  ASSERT_TRUE(preserve_trx_encode_temp_table_manifest(
+      manifest_payload, &meta.temp_table_manifest_payload));
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-temp", "source-uuid", "target-uuid", bundle, 777,
+                &manifest, &objects));
 }
 
 TEST(PreservedTrxTransfer, ArtifactDecisionDistinguishesEnabledStandbyMode) {
@@ -3335,6 +3529,18 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_EQ(1U, adopted_marker.tokens.size());
   EXPECT_EQ(919U, adopted_marker.tokens[0]);
 
+  const std::string intent_payload =
+      read_file(m_dir + "epoch-1.promotion_intent");
+  Preserve_trx_promotion_intent_epoch_marker intent_marker;
+  ASSERT_TRUE(preserved_trx_decode_promotion_intent_epoch_marker(
+      intent_payload, &intent_marker));
+  ASSERT_EQ(1U, intent_marker.tokens.size());
+  EXPECT_EQ(919U, intent_marker.tokens[0].token);
+  EXPECT_EQ(Preserve_trx_promotion_intent_state::ADOPTING,
+            intent_marker.tokens[0].state);
+  EXPECT_EQ(Preserve_trx_promotion_cleanup_state::NONE,
+            intent_marker.tokens[0].cleanup_state);
+
   Preserved_trx_carrier_listing listing;
   ASSERT_EQ(Preserve_snapshot_status::OK, store.list_tokens(&listing));
   const std::set<std::string> recoverable_tokens =
@@ -3583,6 +3789,24 @@ TEST_F(PreserveSnapshotTest, PromotionRejectsNonNumericStandbyToken) {
   ASSERT_EQ(1U, result.token_results.size());
   EXPECT_EQ(Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT,
             result.token_results[0].status);
+  preserve_trx_set_enable_value(true);
+}
+
+TEST_F(PreserveSnapshotTest, PromotionPrewarmRejectsMarkerOnlyStandbyToken) {
+  preserve_trx_set_enable_value(true);
+  write_file(m_dir + "922.standby_pending", "standby_pending\n");
+
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT,
+            preserved_trx_promotion_prewarm_standby_pending_token(
+                m_dir, "epoch-1", 922, 0));
+
+  Preserve_trx_promotion_ready_summary summary;
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+            preserved_trx_promotion_ready_summary_for_epoch(
+                m_dir, "epoch-1", &summary));
+  EXPECT_TRUE(summary.ready_tokens.empty());
+  ASSERT_EQ(1U, summary.corrupt_tokens.size());
+  EXPECT_EQ(922U, summary.corrupt_tokens[0]);
   preserve_trx_set_enable_value(true);
 }
 
@@ -3966,6 +4190,31 @@ class InMemoryPreservedTrxCarrier final : public Preserved_trx_carrier {
     return Preserved_trx_carrier_status::OK;
   }
 
+  Preserved_trx_carrier_status write_promotion_intent_epoch(
+      const std::string &epoch_id,
+      const std::string &marker_payload) override {
+    promotion_intent_epoch_markers[epoch_id] = marker_payload;
+    Preserve_trx_promotion_intent_epoch_marker marker;
+    if (preserved_trx_decode_promotion_intent_epoch_marker(marker_payload,
+                                                           &marker)) {
+      for (const Preserve_trx_promotion_intent_token &token : marker.tokens) {
+        promotion_intent_tokens.insert(std::to_string(token.token));
+      }
+    }
+    return Preserved_trx_carrier_status::OK;
+  }
+
+  Preserved_trx_carrier_status read_promotion_intent_epoch(
+      const std::string &epoch_id, std::string *marker_payload) override {
+    if (marker_payload == nullptr) return Preserved_trx_carrier_status::CORRUPT;
+    const auto found = promotion_intent_epoch_markers.find(epoch_id);
+    if (found == promotion_intent_epoch_markers.end()) {
+      return Preserved_trx_carrier_status::NOT_FOUND;
+    }
+    *marker_payload = found->second;
+    return Preserved_trx_carrier_status::OK;
+  }
+
   Preserved_trx_carrier_status list_tokens(
       Preserved_trx_carrier_listing *listing) override {
     ++list_token_reads;
@@ -3976,6 +4225,7 @@ class InMemoryPreservedTrxCarrier final : public Preserved_trx_carrier {
     listing->tainted_tokens.clear();
     listing->standby_pending_tokens.clear();
     listing->promotion_adopted_tokens.clear();
+    listing->promotion_intent_tokens.clear();
     listing->warm_external_blob_artifacts.clear();
     for (const auto &entry : snapshots)
       listing->snapshot_tokens.insert(entry.first);
@@ -3985,6 +4235,7 @@ class InMemoryPreservedTrxCarrier final : public Preserved_trx_carrier {
     listing->tainted_tokens = tainted_tokens;
     listing->standby_pending_tokens = standby_pending_tokens;
     listing->promotion_adopted_tokens = promotion_adopted_tokens;
+    listing->promotion_intent_tokens = promotion_intent_tokens;
     listing->warm_external_blob_artifacts = warm_artifacts;
     return Preserved_trx_carrier_status::OK;
   }
@@ -4014,9 +4265,11 @@ class InMemoryPreservedTrxCarrier final : public Preserved_trx_carrier {
   std::set<std::string> tainted_tokens;
   std::set<std::string> standby_pending_tokens;
   std::set<std::string> promotion_adopted_tokens;
+  std::set<std::string> promotion_intent_tokens;
   std::set<std::string> warm_artifacts;
   std::map<std::string, std::string> promotion_adopted_epoch_markers;
   std::map<std::string, std::string> promotion_abandoned_epoch_markers;
+  std::map<std::string, std::string> promotion_intent_epoch_markers;
   Preserved_trx_codec_context context;
   size_t context_reads{0};
   size_t list_token_reads{0};

@@ -226,8 +226,29 @@ void add_store_write_elapsed(uint64_t Preserved_trx_store_write_stats::*field,
 
 std::set<std::string> preserved_trx_local_recoverable_snapshot_tokens(
     const Preserved_trx_carrier_listing &listing) {
-  return preserved_trx_filter_standby_pending_tokens_for_local_recovery(
-      listing.snapshot_tokens, listing);
+  return preserved_trx_local_import_snapshot_tokens(listing);
+}
+
+std::set<std::string> preserved_trx_local_import_snapshot_tokens(
+    const Preserved_trx_carrier_listing &listing) {
+  std::set<std::string> tokens =
+      preserved_trx_filter_standby_pending_tokens_for_local_recovery(
+          listing.snapshot_tokens, listing);
+  tokens.insert(listing.promotion_adopted_tokens.begin(),
+                listing.promotion_adopted_tokens.end());
+  return tokens;
+}
+
+std::set<std::string> preserved_trx_orphan_rollback_retained_tokens(
+    const Preserved_trx_carrier_listing &listing) {
+  std::set<std::string> tokens = listing.snapshot_tokens;
+  tokens.insert(listing.standby_pending_tokens.begin(),
+                listing.standby_pending_tokens.end());
+  tokens.insert(listing.promotion_adopted_tokens.begin(),
+                listing.promotion_adopted_tokens.end());
+  tokens.insert(listing.promotion_intent_tokens.begin(),
+                listing.promotion_intent_tokens.end());
+  return tokens;
 }
 
 std::set<std::string>
@@ -258,6 +279,14 @@ Preserved_trx_carrier_status Preserved_trx_carrier::token_state(
 
 Preserved_trx_carrier_status
 Preserved_trx_carrier::read_promotion_abandoned_epoch(
+    const std::string &epoch_id, std::string *marker_payload) {
+  (void)epoch_id;
+  if (marker_payload != nullptr) marker_payload->clear();
+  return Preserved_trx_carrier_status::NOT_FOUND;
+}
+
+Preserved_trx_carrier_status
+Preserved_trx_carrier::read_promotion_intent_epoch(
     const std::string &epoch_id, std::string *marker_payload) {
   (void)epoch_id;
   if (marker_payload != nullptr) marker_payload->clear();
@@ -665,6 +694,13 @@ Preserve_snapshot_status Preserved_trx_store::write_promotion_abandoned_epoch(
       m_carrier->write_promotion_abandoned_epoch(epoch_id, marker_payload));
 }
 
+Preserve_snapshot_status Preserved_trx_store::write_promotion_intent_epoch(
+    const std::string &epoch_id, const std::string &marker_payload) {
+  if (m_carrier == nullptr) return Preserve_snapshot_status::INVALID_ARGUMENT;
+  return map_carrier_status(
+      m_carrier->write_promotion_intent_epoch(epoch_id, marker_payload));
+}
+
 Preserve_snapshot_status Preserved_trx_store::read_promotion_abandoned_epoch(
     const std::string &epoch_id, std::string *marker_payload) {
   if (m_carrier == nullptr || marker_payload == nullptr) {
@@ -672,6 +708,15 @@ Preserve_snapshot_status Preserved_trx_store::read_promotion_abandoned_epoch(
   }
   return map_carrier_status(
       m_carrier->read_promotion_abandoned_epoch(epoch_id, marker_payload));
+}
+
+Preserve_snapshot_status Preserved_trx_store::read_promotion_intent_epoch(
+    const std::string &epoch_id, std::string *marker_payload) {
+  if (m_carrier == nullptr || marker_payload == nullptr) {
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
+  return map_carrier_status(
+      m_carrier->read_promotion_intent_epoch(epoch_id, marker_payload));
 }
 
 Preserve_snapshot_status Preserved_trx_store::remove_warm_external_blob_artifact(

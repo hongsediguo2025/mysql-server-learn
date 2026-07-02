@@ -8066,6 +8066,188 @@ bool preserved_trx_thd_has_external_use(THD *thd) {
          g_preserved_trx_thd_pin_counts.end();
 }
 
+enum class Preserved_trx_recover_or_adopt_policy {
+  LOCAL_STARTUP_RECOVERY,
+  STANDBY_PROMOTION_ADOPT
+};
+
+struct Preserved_trx_recover_or_adopt_result {
+  bool claimed{false};
+  bool rolled_back{false};
+  bool cleanup_error{false};
+  bool prepared_missing{false};
+  std::string reason;
+};
+
+using Preserved_trx_after_claim_hook = bool (*)(
+    const std::string &token, trx_t *trx, Preserve_snapshot_metadata *metadata,
+    void *context, std::string *reason);
+
+struct Preserved_trx_recovered_count_rewrite_context {
+  Preserved_trx_store *store{nullptr};
+  bool fail_rewrite{false};
+};
+
+static bool recovered_count_rewrite_after_claim(
+    const std::string &token, trx_t *, Preserve_snapshot_metadata *metadata,
+    void *context, std::string *reason) {
+  auto *rewrite_context =
+      static_cast<Preserved_trx_recovered_count_rewrite_context *>(context);
+  if (rewrite_context == nullptr || rewrite_context->store == nullptr ||
+      metadata == nullptr) {
+    if (reason != nullptr)
+      *reason = "failed to update durable transaction recovery count";
+    return true;
+  }
+  const Preserve_snapshot_status status =
+      rewrite_context->fail_rewrite
+          ? Preserve_snapshot_status::IO_ERROR
+          : rewrite_context->store->rewrite_recovered_count(
+                token, metadata->recovered_count);
+  if (status == Preserve_snapshot_status::OK) return false;
+  if (reason != nullptr)
+    *reason = "failed to update durable transaction recovery count";
+  return true;
+}
+
+static bool preserved_trx_recover_or_adopt_bundle_shared(
+    const std::string &dir, Preserved_trx_bundle bundle,
+    Preserved_trx_recover_or_adopt_policy policy,
+    Preserved_trx_after_claim_hook after_claim_hook, void *after_claim_context,
+    Preserved_trx_recover_or_adopt_result *result) {
+  if (result == nullptr) return false;
+  *result = {};
+  Preserve_snapshot_metadata metadata = std::move(bundle.metadata);
+  const std::string token = metadata.token;
+  const bool local_startup =
+      policy == Preserved_trx_recover_or_adopt_policy::LOCAL_STARTUP_RECOVERY;
+
+  auto fail_before_claim = [&](const std::string &reason) {
+    result->reason = reason;
+    return false;
+  };
+  if (dir.empty() || token.empty()) {
+    return fail_before_claim(local_startup ? "invalid durable transaction "
+                                             "snapshot"
+                                           : "invalid promotion ready record");
+  }
+  if (!recoverable_binlog_state(metadata.binlog_state)) {
+    return fail_before_claim("unsupported durable transaction binlog state");
+  }
+  if (!binlog_state_matches_configured_mode(metadata)) {
+    log_preserved_trx_rejected_binlog_mode(token, metadata);
+    return fail_before_claim("binlog mode mismatch");
+  }
+
+  XID xid;
+  if (preserve_trx_token_to_xid(token, &xid)) {
+    return fail_before_claim(local_startup
+                                 ? "failed to map durable transaction token "
+                                   "to XID"
+                                 : "failed to map promotion standby token "
+                                   "to XID");
+  }
+
+  trx_t *trx = trx_preserve_claim_prepared(xid);
+  if (trx == nullptr && !metadata.temp_table_manifest_payload.empty()) {
+    const uint64_t temp_owner_trx_id =
+        preserve_trx_temp_table_owner_trx_id(metadata);
+    if (temp_owner_trx_id != 0) {
+      trx = trx_preserve_create_temp_only_claimed(xid, temp_owner_trx_id);
+    }
+  }
+  if (trx == nullptr) {
+    result->prepared_missing = true;
+    return fail_before_claim(local_startup
+                                 ? "prepared trx not found"
+                                 : "prepared trx not found for promotion "
+                                   "adopt");
+  }
+  result->claimed = true;
+
+  auto rollback_after_claim = [&](const std::string &reason) {
+    result->reason = reason;
+    delete_detached_mdl_context(token);
+    if (local_startup) {
+      const bool cleanup_error = rollback_claimed_preserved_snapshot_or_log(
+          dir, token, trx, reason, &metadata);
+      result->cleanup_error = cleanup_error;
+      result->rolled_back = !cleanup_error;
+    } else if (trx_preserve_rollback_claimed(trx) == DB_SUCCESS) {
+      result->rolled_back = true;
+    } else {
+      result->rolled_back = false;
+      result->cleanup_error = true;
+      result->reason = reason + "; rollback failed";
+    }
+    return false;
+  };
+
+  if (after_claim_hook != nullptr) {
+    std::string after_claim_reason;
+    if (after_claim_hook(token, trx, &metadata, after_claim_context,
+                         &after_claim_reason)) {
+      return rollback_after_claim(
+          after_claim_reason.empty()
+              ? "failed to update durable transaction recovery count"
+              : after_claim_reason);
+    }
+  }
+
+  const auto rollback_semantics_failure = [&](const char *component) {
+    std::string reason =
+        std::string(local_startup
+                        ? "failed to restore durable transaction semantics: "
+                        : "failed to restore promotion transaction semantics: ") +
+        component;
+    if (strcmp(component, "record locks") == 0) {
+      const char *detail = trx_preserve_last_record_lock_export_error();
+      if (detail != nullptr && detail[0] != '\0') {
+        reason.append(": ");
+        reason.append(detail);
+      }
+    }
+    return rollback_after_claim(reason);
+  };
+
+  if (trx_preserve_set_isolation(trx, metadata.tx_isolation) != DB_SUCCESS) {
+    return rollback_semantics_failure("isolation level");
+  }
+  if (trx_preserve_import_read_view(trx, metadata.read_view_payload) !=
+      DB_SUCCESS) {
+    return rollback_semantics_failure("read view");
+  }
+  if (trx_preserve_import_table_locks(trx, metadata.table_locks_payload) !=
+      DB_SUCCESS) {
+    return rollback_semantics_failure("table locks");
+  }
+  if (trx_preserve_import_record_locks(trx, metadata.record_locks_payload) !=
+      DB_SUCCESS) {
+    return rollback_semantics_failure("record locks");
+  }
+  if (trx_preserve_import_record_locks(trx, metadata.predicate_locks_payload) !=
+      DB_SUCCESS) {
+    return rollback_semantics_failure("predicate locks");
+  }
+  if (create_detached_mdl_context(metadata)) {
+    return rollback_after_claim(
+        local_startup ? "failed to restore durable transaction MDL context"
+                      : "failed to restore promotion transaction MDL context");
+  }
+  if (preserved_trx_add_record(metadata, trx, true,
+                               Preserved_trx_lifecycle_state::PRESERVED,
+                               std::move(bundle.blob_descriptors))) {
+    return rollback_after_claim(
+        local_startup ? "failed to register recovered durable transaction"
+                      : "failed to register promotion adopted transaction");
+  }
+
+  audit_preserved_trx_event(
+      current_thd, token, local_startup ? "recover" : "promotion-adopt",
+      "success");
+  return true;
+}
+
 static bool recover_preserved_snapshot(const std::string &dir,
                                        const std::string &token,
                                        uint64_t recovery_anchor_wall_us,
@@ -8159,12 +8341,6 @@ static bool recover_preserved_snapshot(const std::string &dir,
                                                   RAW_UNLINK);
   }
 
-  XID xid;
-  if (preserve_trx_token_to_xid(token, &xid)) {
-    return log_preserved_trx_recovery_failure(
-        token, "failed to map durable transaction token to XID");
-  }
-
   [[maybe_unused]] auto fail_closed_without_claim = [&](const char *reason) {
     if (store->mark_tainted(token, reason) != Preserve_snapshot_status::OK) {
       return log_preserved_trx_recovery_failure(
@@ -8179,86 +8355,6 @@ static bool recover_preserved_snapshot(const std::string &dir,
                   return fail_closed_without_claim(
                       "encrypted tablespace key unavailable"););
 
-  trx_t *trx = trx_preserve_claim_prepared(xid);
-  if (trx == nullptr && !metadata.temp_table_manifest_payload.empty()) {
-    /*
-      A preserved transaction that touched only user temporary tables may not
-      have a normal prepared InnoDB transaction to claim. Recreate a temp-only
-      claimed transaction when the manifest names the original owner trx id.
-    */
-    const uint64_t temp_owner_trx_id =
-        preserve_trx_temp_table_owner_trx_id(metadata);
-    if (temp_owner_trx_id != 0) {
-      trx = trx_preserve_create_temp_only_claimed(xid, temp_owner_trx_id);
-    }
-  }
-  if (trx == nullptr) {
-    return delete_preserved_snapshot_files_and_sidecars_or_log(
-        dir, token, &metadata, Temp_sidecar_cleanup_mode::RAW_UNLINK);
-  }
-
-  bool fail_recovered_count_rewrite = false;
-  DBUG_EXECUTE_IF("preserve_trx_fail_recovered_count_rewrite", {
-    fail_recovered_count_rewrite = true;
-  });
-  const Preserve_snapshot_status recovered_count_rewrite_status =
-      fail_recovered_count_rewrite
-          ? Preserve_snapshot_status::IO_ERROR
-          : store->rewrite_recovered_count(token, metadata.recovered_count);
-  if (recovered_count_rewrite_status != Preserve_snapshot_status::OK) {
-    return rollback_claimed_preserved_snapshot_or_log(
-        dir, token, trx, "failed to update durable transaction recovery count",
-        &metadata);
-  }
-
-  const auto rollback_semantics_failure = [&](const char *component) {
-    /*
-      Once a prepared transaction is claimed, every semantic import failure must
-      roll it back through the preserve token. Leaving a claimed transaction
-      registered without its locks/read view would be unsafe to resume.
-    */
-    std::string reason =
-        std::string("failed to restore durable transaction semantics: ") +
-        component;
-    if (strcmp(component, "record locks") == 0) {
-      const char *detail = trx_preserve_last_record_lock_export_error();
-      if (detail != nullptr && detail[0] != '\0') {
-        reason.append(": ");
-        reason.append(detail);
-      }
-    }
-    return rollback_claimed_preserved_snapshot_or_log(
-        dir, token, trx, reason, &metadata);
-  };
-  if (trx_preserve_set_isolation(trx, metadata.tx_isolation) != DB_SUCCESS) {
-    return rollback_semantics_failure("isolation level");
-  }
-  if (trx_preserve_import_read_view(trx, metadata.read_view_payload) !=
-      DB_SUCCESS) {
-    return rollback_semantics_failure("read view");
-  }
-  if (trx_preserve_import_table_locks(trx, metadata.table_locks_payload) !=
-      DB_SUCCESS) {
-    return rollback_semantics_failure("table locks");
-  }
-  if (trx_preserve_import_record_locks(trx, metadata.record_locks_payload) !=
-      DB_SUCCESS) {
-    return rollback_semantics_failure("record locks");
-  }
-  if (trx_preserve_import_record_locks(trx, metadata.predicate_locks_payload) !=
-      DB_SUCCESS) {
-    return rollback_claimed_preserved_snapshot_or_log(
-        dir, token, trx,
-        "failed to restore durable transaction semantics: predicate locks",
-        &metadata);
-  }
-
-  if (create_detached_mdl_context(metadata)) {
-    return rollback_claimed_preserved_snapshot_or_log(
-        dir, token, trx, "failed to restore durable transaction MDL context",
-        &metadata);
-  }
-
   DBUG_EXECUTE_IF(
       "preserve_trx_crash_after_recover_import_before_register", {
         LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
@@ -8267,17 +8363,27 @@ static bool recover_preserved_snapshot(const std::string &dir,
         DBUG_SUICIDE();
       });
 
-  if (preserved_trx_add_record(metadata, trx, true,
-                               Preserved_trx_lifecycle_state::PRESERVED,
-                               std::move(bundle.blob_descriptors))) {
-    delete_detached_mdl_context(token);
-    return rollback_claimed_preserved_snapshot_or_log(
-        dir, token, trx, "failed to register recovered durable transaction",
-        &metadata);
+  Preserve_snapshot_metadata cleanup_metadata = metadata;
+  Preserved_trx_recovered_count_rewrite_context rewrite_context;
+  rewrite_context.store = &store.store();
+  DBUG_EXECUTE_IF("preserve_trx_fail_recovered_count_rewrite", {
+    rewrite_context.fail_rewrite = true;
+  });
+  bundle.metadata = std::move(metadata);
+  Preserved_trx_recover_or_adopt_result kernel_result;
+  if (preserved_trx_recover_or_adopt_bundle_shared(
+          dir, std::move(bundle),
+          Preserved_trx_recover_or_adopt_policy::LOCAL_STARTUP_RECOVERY,
+          recovered_count_rewrite_after_claim, &rewrite_context,
+          &kernel_result)) {
+    return false;
   }
-
-  audit_preserved_trx_event(current_thd, token, "recover", "success");
-  return false;
+  if (kernel_result.prepared_missing) {
+    return delete_preserved_snapshot_files_and_sidecars_or_log(
+        dir, token, &cleanup_metadata, Temp_sidecar_cleanup_mode::RAW_UNLINK);
+  }
+  if (kernel_result.claimed) return kernel_result.cleanup_error;
+  return log_preserved_trx_recovery_failure(token, kernel_result.reason);
 }
 
 bool preserved_trx_adopt_ready_bundle_for_promotion(
@@ -8286,101 +8392,15 @@ bool preserved_trx_adopt_ready_bundle_for_promotion(
   if (result == nullptr) return false;
   *result = {};
 
-  Preserve_snapshot_metadata metadata = std::move(bundle.metadata);
-  const std::string token = metadata.token;
-  auto fail_before_claim = [&](const std::string &reason) {
-    result->reason = reason;
-    return false;
-  };
-  if (dir.empty() || token.empty()) {
-    return fail_before_claim("invalid promotion ready record");
-  }
-
-  if (!recoverable_binlog_state(metadata.binlog_state)) {
-    return fail_before_claim("unsupported durable transaction binlog state");
-  }
-  if (!binlog_state_matches_configured_mode(metadata)) {
-    log_preserved_trx_rejected_binlog_mode(token, metadata);
-    return fail_before_claim("binlog mode mismatch");
-  }
-
-  XID xid;
-  if (preserve_trx_token_to_xid(token, &xid)) {
-    return fail_before_claim(
-        "failed to map promotion standby token to XID");
-  }
-
-  trx_t *trx = trx_preserve_claim_prepared(xid);
-  if (trx == nullptr && !metadata.temp_table_manifest_payload.empty()) {
-    const uint64_t temp_owner_trx_id =
-        preserve_trx_temp_table_owner_trx_id(metadata);
-    if (temp_owner_trx_id != 0) {
-      trx = trx_preserve_create_temp_only_claimed(xid, temp_owner_trx_id);
-    }
-  }
-  if (trx == nullptr) {
-    return fail_before_claim("prepared trx not found for promotion adopt");
-  }
-  result->claimed = true;
-
-  auto rollback_after_claim = [&](const std::string &reason) {
-    result->reason = reason;
-    delete_detached_mdl_context(token);
-    if (trx_preserve_rollback_claimed(trx) == DB_SUCCESS) {
-      result->rolled_back = true;
-    } else {
-      result->rolled_back = false;
-      result->reason = reason + "; rollback failed";
-    }
-    return false;
-  };
-
-  const auto rollback_semantics_failure = [&](const char *component) {
-    std::string reason =
-        std::string("failed to restore promotion transaction semantics: ") +
-        component;
-    if (strcmp(component, "record locks") == 0) {
-      const char *detail = trx_preserve_last_record_lock_export_error();
-      if (detail != nullptr && detail[0] != '\0') {
-        reason.append(": ");
-        reason.append(detail);
-      }
-    }
-    return rollback_after_claim(reason);
-  };
-
-  if (trx_preserve_set_isolation(trx, metadata.tx_isolation) != DB_SUCCESS) {
-    return rollback_semantics_failure("isolation level");
-  }
-  if (trx_preserve_import_read_view(trx, metadata.read_view_payload) !=
-      DB_SUCCESS) {
-    return rollback_semantics_failure("read view");
-  }
-  if (trx_preserve_import_table_locks(trx, metadata.table_locks_payload) !=
-      DB_SUCCESS) {
-    return rollback_semantics_failure("table locks");
-  }
-  if (trx_preserve_import_record_locks(trx, metadata.record_locks_payload) !=
-      DB_SUCCESS) {
-    return rollback_semantics_failure("record locks");
-  }
-  if (trx_preserve_import_record_locks(trx, metadata.predicate_locks_payload) !=
-      DB_SUCCESS) {
-    return rollback_semantics_failure("predicate locks");
-  }
-  if (create_detached_mdl_context(metadata)) {
-    return rollback_after_claim(
-        "failed to restore promotion transaction MDL context");
-  }
-  if (preserved_trx_add_record(metadata, trx, true,
-                               Preserved_trx_lifecycle_state::PRESERVED,
-                               std::move(bundle.blob_descriptors))) {
-    return rollback_after_claim(
-        "failed to register promotion adopted transaction");
-  }
-
-  audit_preserved_trx_event(current_thd, token, "promotion-adopt", "success");
-  return true;
+  Preserved_trx_recover_or_adopt_result kernel_result;
+  const bool adopted = preserved_trx_recover_or_adopt_bundle_shared(
+      dir, std::move(bundle),
+      Preserved_trx_recover_or_adopt_policy::STANDBY_PROMOTION_ADOPT,
+      nullptr, nullptr, &kernel_result);
+  result->claimed = kernel_result.claimed;
+  result->rolled_back = kernel_result.rolled_back;
+  result->reason = kernel_result.reason;
+  return adopted;
 }
 
 bool preserved_trx_preflight_recoverability() {
@@ -8773,8 +8793,10 @@ bool preserved_trx_recover_all() {
     return false;
   }
 
-  std::vector<std::string> retained_snapshot_tokens(snapshot_tokens.begin(),
-                                                    snapshot_tokens.end());
+  const std::set<std::string> retained_token_set =
+      preserved_trx_orphan_rollback_retained_tokens(listing);
+  std::vector<std::string> retained_snapshot_tokens(
+      retained_token_set.begin(), retained_token_set.end());
   uint32_t orphan_rollback_count = 0;
   if (trx_preserve_rollback_prepared_without_snapshot(
           retained_snapshot_tokens, &orphan_rollback_count) != DB_SUCCESS) {

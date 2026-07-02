@@ -1129,7 +1129,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if args.output:
-        Path(args.output).expanduser().write_text(rendered + "\n", encoding="utf-8")
+        output_path = Path(args.output).expanduser()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(rendered + "\n", encoding="utf-8")
     else:
         print(rendered)
     if args.require_phase2_p95_below_baseline and phase2_comparison["status"] != "pass":

@@ -211,6 +211,35 @@ struct Preserve_trx_promotion_abandoned_epoch_marker {
   uint64_t generated_at_us{0};
 };
 
+enum class Preserve_trx_promotion_intent_state {
+  CANDIDATE,
+  ADOPTING,
+  ADOPTED,
+  ABANDONED,
+  CLEANUP_PENDING,
+  CLEANUP_ROLLED_BACK,
+  CLEANUP_NOT_FOUND,
+  CLEANUP_TAINTED
+};
+
+struct Preserve_trx_promotion_intent_token {
+  uint64_t token{0};
+  Preserve_trx_promotion_intent_state state{
+      Preserve_trx_promotion_intent_state::CANDIDATE};
+  Preserve_trx_promotion_cleanup_state cleanup_state{
+      Preserve_trx_promotion_cleanup_state::NONE};
+  std::string reason;
+};
+
+struct Preserve_trx_promotion_intent_epoch_marker {
+  std::string epoch_id;
+  std::vector<Preserve_trx_promotion_intent_token> tokens;
+  std::string source_server_uuid;
+  std::string target_server_uuid;
+  uint64_t required_apply_lsn{0};
+  uint64_t generated_at_us{0};
+};
+
 bool preserved_trx_encode_promotion_adopted_epoch_marker(
     const Preserve_trx_promotion_adopted_epoch_marker &marker,
     std::string *encoded);
@@ -226,5 +255,13 @@ bool preserved_trx_encode_promotion_abandoned_epoch_marker(
 bool preserved_trx_decode_promotion_abandoned_epoch_marker(
     const std::string &encoded,
     Preserve_trx_promotion_abandoned_epoch_marker *marker);
+
+bool preserved_trx_encode_promotion_intent_epoch_marker(
+    const Preserve_trx_promotion_intent_epoch_marker &marker,
+    std::string *encoded);
+
+bool preserved_trx_decode_promotion_intent_epoch_marker(
+    const std::string &encoded,
+    Preserve_trx_promotion_intent_epoch_marker *marker);
 
 #endif  // SQL_PRESERVE_TRX_PROMOTION_INCLUDED

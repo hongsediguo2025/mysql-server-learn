@@ -80,7 +80,12 @@ class Local_file_preserved_trx_carrier final
   Preserved_trx_carrier_status write_promotion_abandoned_epoch(
       const std::string &epoch_id,
       const std::string &marker_payload) override;
+  Preserved_trx_carrier_status write_promotion_intent_epoch(
+      const std::string &epoch_id,
+      const std::string &marker_payload) override;
   Preserved_trx_carrier_status read_promotion_abandoned_epoch(
+      const std::string &epoch_id, std::string *marker_payload) override;
+  Preserved_trx_carrier_status read_promotion_intent_epoch(
       const std::string &epoch_id, std::string *marker_payload) override;
   Preserved_trx_carrier_status list_tokens(
       Preserved_trx_carrier_listing *listing) override;

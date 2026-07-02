@@ -46,6 +46,8 @@ constexpr char kPromotionAdoptedMarkerMagic[] =
     "PTRX_PROMOTION_ADOPTED_EPOCH_V1";
 constexpr char kPromotionAbandonedMarkerMagic[] =
     "PTRX_PROMOTION_ABANDONED_EPOCH_V1";
+constexpr char kPromotionIntentMarkerMagic[] =
+    "PTRX_PROMOTION_INTENT_EPOCH_V1";
 constexpr size_t kPromotionDigestBytes = 32;
 
 Preserve_trx_promotion_apply_state_provider g_apply_state_provider = nullptr;
@@ -238,6 +240,66 @@ bool parse_cleanup_state(const std::string &text,
   return false;
 }
 
+const char *intent_state_name(Preserve_trx_promotion_intent_state state) {
+  switch (state) {
+    case Preserve_trx_promotion_intent_state::CANDIDATE:
+      return "CANDIDATE";
+    case Preserve_trx_promotion_intent_state::ADOPTING:
+      return "ADOPTING";
+    case Preserve_trx_promotion_intent_state::ADOPTED:
+      return "ADOPTED";
+    case Preserve_trx_promotion_intent_state::ABANDONED:
+      return "ABANDONED";
+    case Preserve_trx_promotion_intent_state::CLEANUP_PENDING:
+      return "CLEANUP_PENDING";
+    case Preserve_trx_promotion_intent_state::CLEANUP_ROLLED_BACK:
+      return "CLEANUP_ROLLED_BACK";
+    case Preserve_trx_promotion_intent_state::CLEANUP_NOT_FOUND:
+      return "CLEANUP_NOT_FOUND";
+    case Preserve_trx_promotion_intent_state::CLEANUP_TAINTED:
+      return "CLEANUP_TAINTED";
+  }
+  return "UNKNOWN";
+}
+
+bool parse_intent_state(const std::string &text,
+                        Preserve_trx_promotion_intent_state *state) {
+  if (state == nullptr) return false;
+  if (text == "CANDIDATE") {
+    *state = Preserve_trx_promotion_intent_state::CANDIDATE;
+    return true;
+  }
+  if (text == "ADOPTING") {
+    *state = Preserve_trx_promotion_intent_state::ADOPTING;
+    return true;
+  }
+  if (text == "ADOPTED") {
+    *state = Preserve_trx_promotion_intent_state::ADOPTED;
+    return true;
+  }
+  if (text == "ABANDONED") {
+    *state = Preserve_trx_promotion_intent_state::ABANDONED;
+    return true;
+  }
+  if (text == "CLEANUP_PENDING") {
+    *state = Preserve_trx_promotion_intent_state::CLEANUP_PENDING;
+    return true;
+  }
+  if (text == "CLEANUP_ROLLED_BACK") {
+    *state = Preserve_trx_promotion_intent_state::CLEANUP_ROLLED_BACK;
+    return true;
+  }
+  if (text == "CLEANUP_NOT_FOUND") {
+    *state = Preserve_trx_promotion_intent_state::CLEANUP_NOT_FOUND;
+    return true;
+  }
+  if (text == "CLEANUP_TAINTED") {
+    *state = Preserve_trx_promotion_intent_state::CLEANUP_TAINTED;
+    return true;
+  }
+  return false;
+}
+
 bool parse_adopt_status(const std::string &text,
                         Preserve_trx_promotion_adopt_status *status) {
   if (status == nullptr) return false;
@@ -313,6 +375,71 @@ bool abandoned_token_is_valid(
       !token.claimed) {
     return false;
   }
+  return true;
+}
+
+bool intent_token_is_valid(
+    const Preserve_trx_promotion_intent_token &token) {
+  if (token.token == 0 || !field_value_is_safe(token.reason)) return false;
+
+  switch (token.state) {
+    case Preserve_trx_promotion_intent_state::CANDIDATE:
+    case Preserve_trx_promotion_intent_state::ADOPTING:
+    case Preserve_trx_promotion_intent_state::ADOPTED:
+      return token.cleanup_state == Preserve_trx_promotion_cleanup_state::NONE;
+    case Preserve_trx_promotion_intent_state::ABANDONED:
+    case Preserve_trx_promotion_intent_state::CLEANUP_PENDING:
+      return token.cleanup_state ==
+             Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING;
+    case Preserve_trx_promotion_intent_state::CLEANUP_ROLLED_BACK:
+      return token.cleanup_state ==
+             Preserve_trx_promotion_cleanup_state::CLEANUP_ROLLED_BACK;
+    case Preserve_trx_promotion_intent_state::CLEANUP_NOT_FOUND:
+      return token.cleanup_state ==
+             Preserve_trx_promotion_cleanup_state::CLEANUP_NOT_FOUND;
+    case Preserve_trx_promotion_intent_state::CLEANUP_TAINTED:
+      return token.cleanup_state ==
+             Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED;
+  }
+  return false;
+}
+
+std::string encode_intent_token(
+    const Preserve_trx_promotion_intent_token &token) {
+  std::string encoded = std::to_string(token.token);
+  encoded.push_back('|');
+  encoded.append(intent_state_name(token.state));
+  encoded.push_back('|');
+  encoded.append(cleanup_state_name(token.cleanup_state));
+  encoded.push_back('|');
+  encoded.append(token.reason);
+  return encoded;
+}
+
+bool parse_intent_token(const std::string &encoded,
+                        Preserve_trx_promotion_intent_token *token) {
+  if (token == nullptr) return false;
+  const size_t first = encoded.find('|');
+  if (first == std::string::npos) return false;
+  const size_t second = encoded.find('|', first + 1);
+  if (second == std::string::npos) return false;
+  const size_t third = encoded.find('|', second + 1);
+  if (third == std::string::npos ||
+      encoded.find('|', third + 1) != std::string::npos) {
+    return false;
+  }
+
+  Preserve_trx_promotion_intent_token parsed;
+  if (!parse_uint64_strict(encoded.substr(0, first), &parsed.token) ||
+      !parse_intent_state(encoded.substr(first + 1, second - first - 1),
+                          &parsed.state) ||
+      !parse_cleanup_state(encoded.substr(second + 1, third - second - 1),
+                           &parsed.cleanup_state)) {
+    return false;
+  }
+  parsed.reason = encoded.substr(third + 1);
+  if (!intent_token_is_valid(parsed)) return false;
+  *token = std::move(parsed);
   return true;
 }
 
@@ -592,6 +719,44 @@ void write_adopted_marker_for_tokens(
   }
 }
 
+bool write_intent_marker_for_tokens(
+    Preserved_trx_store *store,
+    const Preserve_trx_promotion_adopt_all_request &request,
+    const std::vector<uint64_t> &tokens,
+    Preserve_trx_promotion_adopt_result *result) {
+  if (store == nullptr || result == nullptr || tokens.empty()) return false;
+
+  Preserve_trx_promotion_intent_epoch_marker marker;
+  marker.epoch_id = request.epoch_id;
+  marker.source_server_uuid = "unknown-source";
+  marker.target_server_uuid = "local-promotion-target";
+  marker.required_apply_lsn = request.required_apply_lsn;
+  marker.generated_at_us = my_micro_time();
+  for (uint64_t token : tokens) {
+    marker.tokens.push_back(
+        {token, Preserve_trx_promotion_intent_state::ADOPTING,
+         Preserve_trx_promotion_cleanup_state::NONE, "adopting"});
+  }
+
+  std::string encoded;
+  const uint64_t marker_started_us = my_micro_time();
+  if (!preserved_trx_encode_promotion_intent_epoch_marker(marker, &encoded)) {
+    result->marker_us += my_micro_time() - marker_started_us;
+    ++result->cleanup_failed_count;
+    append_result_message(result, "failed to encode promotion intent marker");
+    return false;
+  }
+  const Preserve_snapshot_status write_status =
+      store->write_promotion_intent_epoch(request.epoch_id, encoded);
+  result->marker_us += my_micro_time() - marker_started_us;
+  if (write_status != Preserve_snapshot_status::OK) {
+    ++result->cleanup_failed_count;
+    append_result_message(result, "failed to write promotion intent marker");
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 const char *preserve_trx_promotion_adopt_status_name(
@@ -654,8 +819,11 @@ void preserved_trx_promotion_ready_cache_put_for_unit_test(
     uint64_t required_apply_lsn) {
   if (preserve_dir.empty() || epoch_id.empty() || token == 0) return;
   std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+  Promotion_ready_cache_entry entry;
+  entry.state = state;
+  entry.required_apply_lsn = required_apply_lsn;
   g_ready_cache[Promotion_ready_cache_key{preserve_dir, epoch_id, token}] =
-      Promotion_ready_cache_entry{state, required_apply_lsn};
+      std::move(entry);
 }
 
 void preserved_trx_promotion_ready_cache_put_bundle_for_unit_test(
@@ -705,7 +873,8 @@ preserved_trx_promotion_prewarm_standby_pending_token(
                       WITH_SEMANTIC_EXTERNAL_BLOBS,
                   &bundle);
   if (read_status != Preserve_snapshot_status::OK) {
-    if (read_status == Preserve_snapshot_status::CORRUPT ||
+    if (read_status == Preserve_snapshot_status::NOT_FOUND ||
+        read_status == Preserve_snapshot_status::CORRUPT ||
         read_status == Preserve_snapshot_status::UNSUPPORTED) {
       std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
       Promotion_ready_cache_entry entry;
@@ -713,6 +882,9 @@ preserved_trx_promotion_prewarm_standby_pending_token(
       entry.required_apply_lsn = required_apply_lsn;
       g_ready_cache[Promotion_ready_cache_key{preserve_dir, epoch_id, token}] =
           std::move(entry);
+    }
+    if (read_status == Preserve_snapshot_status::NOT_FOUND) {
+      return Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT;
     }
     return carrier_status_to_promotion_status(read_status);
   }
@@ -935,6 +1107,18 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
       return finish_with_optional_abandoned_marker(
           Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS);
     }
+  }
+  if (request.execute_adopt &&
+      !write_intent_marker_for_tokens(&store.store(), request,
+                                      result->seen_tokens, result)) {
+    for (uint64_t token : result->seen_tokens) {
+      add_abandoned_token(
+          result, token, Preserve_trx_promotion_adopt_status::IO_ERROR,
+          "promotion intent marker not durable before claim",
+          Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED);
+    }
+    return finish_with_optional_abandoned_marker(
+        Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS);
   }
   if (request.require_promotion_ready_cache) {
     uint64_t ready_count = 0;
@@ -1261,6 +1445,111 @@ bool preserved_trx_decode_promotion_abandoned_epoch_marker(
     if (!read_marker_field(lines, "abandoned_" + std::to_string(i),
                            &encoded_token) ||
         !parse_abandoned_token(encoded_token, &token)) {
+      return false;
+    }
+    parsed.tokens.push_back(std::move(token));
+  }
+
+  *marker = std::move(parsed);
+  return true;
+}
+
+bool preserved_trx_encode_promotion_intent_epoch_marker(
+    const Preserve_trx_promotion_intent_epoch_marker &marker,
+    std::string *encoded) {
+  if (encoded == nullptr || marker.epoch_id.empty() ||
+      marker.source_server_uuid.empty() || marker.target_server_uuid.empty() ||
+      marker.tokens.empty()) {
+    return false;
+  }
+
+  std::vector<Preserve_trx_promotion_intent_token> tokens = marker.tokens;
+  std::sort(tokens.begin(), tokens.end(),
+            [](const Preserve_trx_promotion_intent_token &left,
+               const Preserve_trx_promotion_intent_token &right) {
+              return left.token < right.token;
+            });
+  for (const Preserve_trx_promotion_intent_token &token : tokens) {
+    if (!intent_token_is_valid(token)) return false;
+  }
+
+  std::string body;
+  body.append(kPromotionIntentMarkerMagic);
+  body.push_back('\n');
+  if (!append_required_field("epoch_id", marker.epoch_id, &body) ||
+      !append_required_field("source_server_uuid", marker.source_server_uuid,
+                             &body) ||
+      !append_required_field("target_server_uuid", marker.target_server_uuid,
+                             &body) ||
+      !append_required_field("required_apply_lsn",
+                             std::to_string(marker.required_apply_lsn),
+                             &body) ||
+      !append_required_field("generated_at_us",
+                             std::to_string(marker.generated_at_us), &body) ||
+      !append_required_field("token_count", std::to_string(tokens.size()),
+                             &body)) {
+    return false;
+  }
+
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    if (!append_required_field("token_" + std::to_string(i),
+                               encode_intent_token(tokens[i]), &body)) {
+      return false;
+    }
+  }
+
+  *encoded = body;
+  encoded->append("digest=");
+  encoded->append(sha256_hex(body));
+  encoded->push_back('\n');
+  return true;
+}
+
+bool preserved_trx_decode_promotion_intent_epoch_marker(
+    const std::string &encoded,
+    Preserve_trx_promotion_intent_epoch_marker *marker) {
+  if (marker == nullptr) return false;
+  const size_t digest_pos = encoded.rfind("digest=");
+  if (digest_pos == std::string::npos ||
+      (digest_pos > 0 && encoded[digest_pos - 1] != '\n')) {
+    return false;
+  }
+  const std::string body = encoded.substr(0, digest_pos);
+  const std::string expected_digest_line = "digest=" + sha256_hex(body) + "\n";
+  if (encoded.substr(digest_pos) != expected_digest_line) return false;
+
+  const std::vector<std::string> lines = split_lines(body);
+  if (lines.empty() || lines[0] != kPromotionIntentMarkerMagic) {
+    return false;
+  }
+
+  Preserve_trx_promotion_intent_epoch_marker parsed;
+  std::string required_apply_lsn;
+  std::string generated_at_us;
+  std::string token_count_string;
+  uint64_t token_count = 0;
+  if (!read_marker_field(lines, "epoch_id", &parsed.epoch_id) ||
+      !read_marker_field(lines, "source_server_uuid",
+                         &parsed.source_server_uuid) ||
+      !read_marker_field(lines, "target_server_uuid",
+                         &parsed.target_server_uuid) ||
+      !read_marker_field(lines, "required_apply_lsn",
+                         &required_apply_lsn) ||
+      !read_marker_field(lines, "generated_at_us", &generated_at_us) ||
+      !read_marker_field(lines, "token_count", &token_count_string) ||
+      !parse_uint64_strict(required_apply_lsn, &parsed.required_apply_lsn) ||
+      !parse_uint64_strict(generated_at_us, &parsed.generated_at_us) ||
+      !parse_uint64_strict(token_count_string, &token_count) ||
+      token_count == 0) {
+    return false;
+  }
+
+  for (uint64_t i = 0; i < token_count; ++i) {
+    std::string encoded_token;
+    Preserve_trx_promotion_intent_token token;
+    if (!read_marker_field(lines, "token_" + std::to_string(i),
+                           &encoded_token) ||
+        !parse_intent_token(encoded_token, &token)) {
       return false;
     }
     parsed.tokens.push_back(std::move(token));

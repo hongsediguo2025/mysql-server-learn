@@ -72,6 +72,12 @@ struct Preserved_trx_carrier_listing {
     not yet been removed by background cleanup.
   */
   std::set<std::string> promotion_adopted_tokens;
+  /*
+    Tokens mentioned by a promotion intent are not necessarily local resume
+    records yet, but startup orphan cleanup must still treat their preserve XID
+    as owned by the promotion workflow.
+  */
+  std::set<std::string> promotion_intent_tokens;
   std::set<std::string> warm_external_blob_artifacts;
 };
 
@@ -93,7 +99,13 @@ preserved_trx_filter_standby_pending_tokens_for_local_recovery(
     const std::set<std::string> &tokens,
     const Preserved_trx_carrier_listing &listing);
 
+std::set<std::string> preserved_trx_local_import_snapshot_tokens(
+    const Preserved_trx_carrier_listing &listing);
+
 std::set<std::string> preserved_trx_local_recoverable_snapshot_tokens(
+    const Preserved_trx_carrier_listing &listing);
+
+std::set<std::string> preserved_trx_orphan_rollback_retained_tokens(
     const Preserved_trx_carrier_listing &listing);
 
 struct Preserved_trx_carrier_read_limits {
@@ -251,7 +263,13 @@ class Preserved_trx_carrier {
   virtual Preserved_trx_carrier_status write_promotion_abandoned_epoch(
       const std::string &epoch_id, const std::string &marker_payload) = 0;
 
+  virtual Preserved_trx_carrier_status write_promotion_intent_epoch(
+      const std::string &epoch_id, const std::string &marker_payload) = 0;
+
   virtual Preserved_trx_carrier_status read_promotion_abandoned_epoch(
+      const std::string &epoch_id, std::string *marker_payload);
+
+  virtual Preserved_trx_carrier_status read_promotion_intent_epoch(
       const std::string &epoch_id, std::string *marker_payload);
 
   virtual Preserved_trx_carrier_status list_tokens(
@@ -409,7 +427,13 @@ class Preserved_trx_store {
   Preserve_snapshot_status write_promotion_abandoned_epoch(
       const std::string &epoch_id, const std::string &marker_payload);
 
+  Preserve_snapshot_status write_promotion_intent_epoch(
+      const std::string &epoch_id, const std::string &marker_payload);
+
   Preserve_snapshot_status read_promotion_abandoned_epoch(
+      const std::string &epoch_id, std::string *marker_payload);
+
+  Preserve_snapshot_status read_promotion_intent_epoch(
       const std::string &epoch_id, std::string *marker_payload);
 
   Preserve_snapshot_status remove_warm_external_blob_artifact(
