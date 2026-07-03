@@ -32,6 +32,12 @@ INSERT INTO tmp_preserve_staged_link_b VALUES(11, 110), (12, 122);
 
 START TRANSACTION;
 UPDATE t_preserve_staged_link_base SET v = 11 WHERE id = 1;
+UPDATE tmp_preserve_staged_link_a SET v = v + 1 WHERE id = 1;
+INSERT INTO tmp_preserve_staged_link_a VALUES(3, 30);
+DELETE FROM tmp_preserve_staged_link_a WHERE id = 2;
+UPDATE tmp_preserve_staged_link_b SET v = v + 1 WHERE id = 11;
+INSERT INTO tmp_preserve_staged_link_b VALUES(13, 130);
+DELETE FROM tmp_preserve_staged_link_b WHERE id = 12;
 
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
@@ -44,7 +50,7 @@ PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
 
 --source suite/preserve_trx/include/get_preserved_token.inc
 --let $expect_bin= 1
---let $expect_temp_sidecar_count= 1
+--let $expect_temp_sidecar_count= 2
 --source suite/preserve_trx/include/assert_preserve_dir_files.inc
 
 SET SESSION debug="+d,preserve_temp_fail_after_first_staged_link";
@@ -66,7 +72,7 @@ SELECT COUNT(*) FROM tmp_preserve_staged_link_a;
 SELECT COUNT(*) FROM tmp_preserve_staged_link_b;
 
 --let $expect_bin= 1
---let $expect_temp_sidecar_count= 1
+--let $expect_temp_sidecar_count= 2
 --source suite/preserve_trx/include/assert_preserve_dir_files.inc
 
 --replace_result $preserved_token TOKEN
@@ -78,8 +84,8 @@ SELECT COUNT(*) AS staged_link_a_rows, SUM(v) AS staged_link_a_sum
 SELECT COUNT(*) AS staged_link_b_rows, SUM(v) AS staged_link_b_sum
   FROM tmp_preserve_staged_link_b;
 
-INSERT INTO tmp_preserve_staged_link_a VALUES(3, 30);
-INSERT INTO tmp_preserve_staged_link_b VALUES(13, 130);
+INSERT INTO tmp_preserve_staged_link_a VALUES(4, 40);
+INSERT INTO tmp_preserve_staged_link_b VALUES(14, 140);
 COMMIT;
 SELECT * FROM t_preserve_staged_link_base ORDER BY id;
 SELECT COUNT(*) AS a_rows_after_commit, SUM(v) AS a_sum_after_commit

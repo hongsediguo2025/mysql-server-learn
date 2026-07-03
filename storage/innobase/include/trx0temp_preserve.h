@@ -543,7 +543,8 @@ bool trx_preserve_temp_space_image_no_redo_undo_page_claim_slot(
   objects to a trx; reconnect does that after this proof is available.
 */
 dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume(
-    trx_preserve_temp_space_image_descriptor *descriptor);
+    trx_preserve_temp_space_image_descriptor *descriptor,
+    std::string *failure_reason = nullptr);
 
 dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
     trx_preserve_temp_space_image_descriptor *descriptor, trx_t *trx,

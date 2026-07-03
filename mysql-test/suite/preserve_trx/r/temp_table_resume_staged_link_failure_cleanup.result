@@ -20,6 +20,12 @@ INSERT INTO tmp_preserve_staged_link_a VALUES(1, 10), (2, 21);
 INSERT INTO tmp_preserve_staged_link_b VALUES(11, 110), (12, 122);
 START TRANSACTION;
 UPDATE t_preserve_staged_link_base SET v = 11 WHERE id = 1;
+UPDATE tmp_preserve_staged_link_a SET v = v + 1 WHERE id = 1;
+INSERT INTO tmp_preserve_staged_link_a VALUES(3, 30);
+DELETE FROM tmp_preserve_staged_link_a WHERE id = 2;
+UPDATE tmp_preserve_staged_link_b SET v = v + 1 WHERE id = 11;
+INSERT INTO tmp_preserve_staged_link_b VALUES(13, 130);
+DELETE FROM tmp_preserve_staged_link_b WHERE id = 12;
 PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
 SET SESSION debug="+d,preserve_temp_fail_after_first_staged_link";
 RESUME PRESERVED TRANSACTION 'TOKEN';
@@ -50,13 +56,13 @@ preserved_count_after_retry_resume
 SELECT COUNT(*) AS staged_link_a_rows, SUM(v) AS staged_link_a_sum
 FROM tmp_preserve_staged_link_a;
 staged_link_a_rows	staged_link_a_sum
-2	31
+2	41
 SELECT COUNT(*) AS staged_link_b_rows, SUM(v) AS staged_link_b_sum
 FROM tmp_preserve_staged_link_b;
 staged_link_b_rows	staged_link_b_sum
-2	232
-INSERT INTO tmp_preserve_staged_link_a VALUES(3, 30);
-INSERT INTO tmp_preserve_staged_link_b VALUES(13, 130);
+2	241
+INSERT INTO tmp_preserve_staged_link_a VALUES(4, 40);
+INSERT INTO tmp_preserve_staged_link_b VALUES(14, 140);
 COMMIT;
 SELECT * FROM t_preserve_staged_link_base ORDER BY id;
 id	v
@@ -64,11 +70,11 @@ id	v
 SELECT COUNT(*) AS a_rows_after_commit, SUM(v) AS a_sum_after_commit
 FROM tmp_preserve_staged_link_a;
 a_rows_after_commit	a_sum_after_commit
-3	61
+3	81
 SELECT COUNT(*) AS b_rows_after_commit, SUM(v) AS b_sum_after_commit
 FROM tmp_preserve_staged_link_b;
 b_rows_after_commit	b_sum_after_commit
-3	362
+3	381
 DROP TEMPORARY TABLE tmp_preserve_staged_link_a;
 DROP TEMPORARY TABLE tmp_preserve_staged_link_b;
 DROP TABLE t_preserve_staged_link_base;

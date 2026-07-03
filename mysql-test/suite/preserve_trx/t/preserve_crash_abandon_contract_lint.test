@@ -27,6 +27,11 @@ die "could not isolate preserved_trx_crash_recovery_artifacts_forbidden\n"
 
 die "temp sidecar bootstrap must refuse crash-recovery artifacts\n"
   unless $preamble =~ /preserved_trx_crash_recovery_artifacts_forbidden/s;
+die "temp sidecar bootstrap must keep crash-abandon checks before the temp subfeature gate\n"
+  unless index($preamble, 'preserved_trx_crash_recovery_artifacts_forbidden') <
+         index($preamble, 'if (!preserve_trx_temp_table_enable) continue;');
+die "temp sidecar bootstrap must skip no-redo/page adoption when preserve_trx_temp_table_enable is OFF\n"
+  unless $preamble =~ /if\s*\(\s*!preserve_trx_temp_table_enable\s*\)\s*continue\s*;/s;
 
 die "preserved trx recovery must refuse crash-recovery artifacts\n"
   unless $recover =~ /preserved_trx_crash_recovery_artifacts_forbidden/s;

@@ -148,17 +148,12 @@ bool raw_sql_decode_hex(const char *literal, size_t length,
                         std::string *decoded) {
   if (literal == nullptr || decoded == nullptr) return false;
   decoded->clear();
-  decoded->reserve((length + 1) / 2);
-
-  size_t position = 0;
   if ((length % 2) != 0) {
-    const int low = raw_sql_hex_digit_value(literal[0]);
-    if (low < 0) return false;
-    decoded->push_back(static_cast<char>(low));
-    position = 1;
+    return false;
   }
+  decoded->reserve(length / 2);
 
-  for (; position < length; position += 2) {
+  for (size_t position = 0; position < length; position += 2) {
     const int high = raw_sql_hex_digit_value(literal[position]);
     const int low = raw_sql_hex_digit_value(literal[position + 1]);
     if (high < 0 || low < 0) return false;

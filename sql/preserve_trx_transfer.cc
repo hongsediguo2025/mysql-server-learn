@@ -39,10 +39,13 @@
 
 #include "my_dir.h"
 #include "my_io.h"
+#include "my_loglevel.h"
 #include "my_sys.h"
 #include "my_thread_local.h"
 #include "mysqld_error.h"
+#include "mysql/components/services/log_builtins.h"
 #include "sql/mysqld.h"
+#include "sql/log.h"
 #include "sql/preserve_trx.h"
 #include "sql/protocol_classic.h"
 #include "sql/sql_class.h"
@@ -162,6 +165,19 @@ const Preserve_trx_transfer_client_ops *configured_transfer_client_ops() {
   return ops == nullptr ? &kDefault_transfer_client_ops : ops;
 }
 
+Preserve_trx_transfer_codec_context_provider &unit_codec_context_provider() {
+  static Preserve_trx_transfer_codec_context_provider provider = nullptr;
+  return provider;
+}
+
+bool transfer_bundle_codec_context(Preserved_trx_codec_context *context) {
+  if (context == nullptr) return false;
+  Preserve_trx_transfer_codec_context_provider provider =
+      unit_codec_context_provider();
+  if (provider == nullptr) return false;
+  return provider(context);
+}
+
 Preserve_trx_transfer_client_endpoint configured_transfer_client_endpoint() {
   Preserve_trx_transfer_client_endpoint endpoint;
   if (preserve_trx_transfer_target_server_uuid != nullptr) {
@@ -215,6 +231,11 @@ class Preserve_trx_transfer_client_frame_sink final
       const Preserve_trx_transfer_status connect_status =
           m_ops->connect(m_endpoint, &new_connection);
       if (connect_status != Preserve_trx_transfer_status::OK) {
+        if (connect_status == Preserve_trx_transfer_status::UNSUPPORTED) {
+          LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+                 "preserve standby transfer client transport is not "
+                 "configured; transfer artifact send is unsupported");
+        }
         return connect_status;
       }
       if (new_connection == nullptr) {
@@ -984,15 +1005,6 @@ std::string transfer_status_name(Preserve_trx_transfer_status status) {
   return "UNKNOWN";
 }
 
-Preserved_trx_codec_context transfer_bundle_codec_context() {
-  Preserved_trx_codec_context context;
-  std::fill(context.hmac_key.begin(), context.hmac_key.end(), 0x74);
-  std::fill(context.datadir_fingerprint.begin(),
-            context.datadir_fingerprint.end(), 0x72);
-  context.server_uuid = "00000000-0000-0000-0000-000000000000";
-  return context;
-}
-
 Preserve_trx_transfer_manifest receiver_record_manifest(
     const Preserve_trx_transfer_receiver_record &record) {
   Preserve_trx_transfer_manifest manifest;
@@ -1710,9 +1722,14 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_portable_bundle(
     if (blob.prebuilt) return Preserve_trx_transfer_status::UNSUPPORTED;
   }
 
+  Preserved_trx_codec_context context;
+  if (!transfer_bundle_codec_context(&context)) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+
   Preserved_trx_encoded_bundle snapshot;
   const Preserve_snapshot_status encode_status = encode_preserved_trx_bundle(
-      transfer_bundle_codec_context(), bundle, &snapshot, nullptr);
+      context, bundle, &snapshot, nullptr);
   if (encode_status != Preserve_snapshot_status::OK) {
     return map_snapshot_status_to_transfer(encode_status);
   }
@@ -1743,10 +1760,15 @@ Preserve_trx_transfer_status preserve_trx_transfer_decode_portable_bundle(
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
 
+  Preserved_trx_codec_context context;
+  if (!transfer_bundle_codec_context(&context)) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+
   Preserved_trx_decoded_snapshot decoded;
   const Preserve_snapshot_status decode_status =
-      decode_preserved_trx_snapshot_bytes(transfer_bundle_codec_context(),
-                                          snapshot_bytes, false, &decoded);
+      decode_preserved_trx_snapshot_bytes(context, snapshot_bytes, false,
+                                          &decoded);
   if (decode_status != Preserve_snapshot_status::OK) {
     return map_snapshot_status_to_transfer(decode_status);
   }
@@ -1971,6 +1993,11 @@ Preserve_trx_transfer_status preserve_trx_transfer_make_configured_frame_sink(
 void preserve_trx_transfer_set_client_ops_for_unit_test(
     const Preserve_trx_transfer_client_ops *ops) {
   unit_transfer_client_ops() = ops;
+}
+
+void preserve_trx_transfer_set_codec_context_provider_for_unit_test(
+    Preserve_trx_transfer_codec_context_provider provider) {
+  unit_codec_context_provider() = provider;
 }
 
 void preserve_trx_transfer_set_frame_sink_factory_for_unit_test(

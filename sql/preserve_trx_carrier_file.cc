@@ -2670,7 +2670,7 @@ create_preserved_trx_default_warm_external_blob_carrier(
   return std::make_unique<Local_file_preserved_trx_carrier>(dir);
 }
 
-bool preserved_trx_default_carrier_support_is_valid(
+bool preserved_trx_default_carrier_support_has_error(
     const std::string &dir, bool allow_create_missing) {
   return preserved_trx_default_carrier_support_status(dir,
                                                       allow_create_missing) !=

@@ -242,6 +242,38 @@ Preserved_trx_carrier_status atomic_write_file(
   return fsync_directory_after_install(dir, final_path);
 }
 
+Preserved_trx_carrier_status atomic_replace_file(
+    const std::string &dir, const std::string &filename,
+    const unsigned char *bytes, size_t length) {
+  if (bytes == nullptr && length != 0)
+    return Preserved_trx_carrier_status::CORRUPT;
+  if (ensure_directory(dir)) return Preserved_trx_carrier_status::IO_ERROR;
+
+  const std::string final_path = join_path(dir, filename);
+  if (!file_exists(final_path)) return Preserved_trx_carrier_status::NOT_FOUND;
+
+  const std::string tmp_path = final_path + ".retry_restore.tmp";
+  (void)my_delete(tmp_path.c_str(), MYF(0));
+  File file =
+      my_create(tmp_path.c_str(), 0600, O_WRONLY | O_TRUNC | O_EXCL, MYF(0));
+  if (file < 0) {
+    return Preserved_trx_carrier_status::IO_ERROR;
+  }
+
+  bool error = !write_all(file, bytes, length);
+  if (!error && my_sync(file, MYF(0))) error = true;
+  if (my_close(file, MYF(0))) error = true;
+  if (!error && my_rename(tmp_path.c_str(), final_path.c_str(), MYF(0))) {
+    error = true;
+  }
+  if (!error && fsync_directory(dir)) error = true;
+  if (error) {
+    (void)my_delete(tmp_path.c_str(), MYF(0));
+    return Preserved_trx_carrier_status::IO_ERROR;
+  }
+  return Preserved_trx_carrier_status::OK;
+}
+
 std::string warm_image_filename(const std::string &warmcopy_id,
                                 uint32_t source_space_id) {
   return warmcopy_id + ".tempts." + std::to_string(source_space_id) + ".warm";
@@ -1640,6 +1672,24 @@ Local_file_preserved_temp_table_image_carrier::read_sealed_image(
       join_path(m_dir,
                 sealed_image_filename(token, descriptor.source_space_id)),
       descriptor.size, descriptor.sha256, payload);
+}
+
+Preserved_trx_carrier_status
+Local_file_preserved_temp_table_image_carrier::restore_sealed_image_for_retry(
+    const std::string &token,
+    const Preserved_temp_table_image_descriptor &descriptor,
+    const std::string &payload) {
+  if (!token_is_filename_safe(token) || !descriptor_is_valid(descriptor) ||
+      descriptor.blob_name !=
+          sealed_image_filename(token, descriptor.source_space_id) ||
+      payload.length() != descriptor.size ||
+      sha256_digest(payload) != descriptor.sha256) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  return atomic_replace_file(
+      m_dir, sealed_image_filename(token, descriptor.source_space_id),
+      reinterpret_cast<const unsigned char *>(payload.data()),
+      payload.length());
 }
 
 Preserved_trx_carrier_status

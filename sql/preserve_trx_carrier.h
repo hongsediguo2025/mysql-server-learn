@@ -108,6 +108,9 @@ std::set<std::string> preserved_trx_local_recoverable_snapshot_tokens(
 std::set<std::string> preserved_trx_orphan_rollback_retained_tokens(
     const Preserved_trx_carrier_listing &listing);
 
+Preserved_trx_carrier_listing preserved_trx_local_crash_abandon_listing(
+    const Preserved_trx_carrier_listing &listing);
+
 struct Preserved_trx_carrier_read_limits {
   /*
     Per-read byte caps for snapshot and external payload validation. Metadata
@@ -511,7 +514,7 @@ Preserved_trx_carrier_support_status
 preserved_trx_default_carrier_support_status(const std::string &dir,
                                              bool allow_create_missing);
 
-bool preserved_trx_default_carrier_support_is_valid(
+bool preserved_trx_default_carrier_support_has_error(
     const std::string &dir, bool allow_create_missing);
 
 bool preserved_trx_default_carrier_token_exists(const std::string &dir,

@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "my_dir.h"
+#include "my_dbug.h"
 #include "my_inttypes.h"
 #include "my_systime.h"
 #include "my_sys.h"
@@ -714,12 +715,13 @@ void write_abandoned_marker_for_result(
   }
 }
 
-void write_adopted_marker_for_tokens(
+bool write_adopted_marker_for_tokens(
     Preserved_trx_store *store,
     const Preserve_trx_promotion_adopt_all_request &request,
     const std::vector<uint64_t> &adopted_tokens,
     Preserve_trx_promotion_adopt_result *result) {
-  if (store == nullptr || result == nullptr || adopted_tokens.empty()) return;
+  if (store == nullptr || result == nullptr) return false;
+  if (adopted_tokens.empty()) return true;
 
   Preserve_trx_promotion_adopted_epoch_marker marker;
   marker.epoch_id = request.epoch_id;
@@ -735,7 +737,7 @@ void write_adopted_marker_for_tokens(
     result->marker_us += my_micro_time() - marker_started_us;
     ++result->cleanup_failed_count;
     append_result_message(result, "failed to encode adopted marker");
-    return;
+    return false;
   }
   const Preserve_snapshot_status write_status =
       store->write_promotion_adopted_epoch(request.epoch_id, encoded);
@@ -743,7 +745,9 @@ void write_adopted_marker_for_tokens(
   if (write_status != Preserve_snapshot_status::OK) {
     ++result->cleanup_failed_count;
     append_result_message(result, "failed to write adopted marker");
+    return false;
   }
+  return true;
 }
 
 bool write_intent_marker(
@@ -832,7 +836,28 @@ bool write_final_intent_marker_for_result(
         {token_result.token, intent_state_from_cleanup(token_result.cleanup_state),
          token_result.cleanup_state, token_result.reason});
   }
+  DBUG_EXECUTE_IF("preserve_trx_fail_write_final_promotion_intent_epoch",
+                  return false;);
   return write_intent_marker(store, request, intent_tokens, result);
+}
+
+void taint_adopted_tokens_after_marker_failure(
+    Preserve_trx_promotion_adopt_result *result, std::vector<uint64_t> *tokens,
+    const std::string &reason) {
+  if (result == nullptr || tokens == nullptr || tokens->empty()) return;
+  if (result->adopted_count >= tokens->size()) {
+    result->adopted_count -= tokens->size();
+  } else {
+    result->adopted_count = 0;
+  }
+  for (uint64_t token : *tokens) {
+    add_abandoned_token(result, token,
+                        Preserve_trx_promotion_adopt_status::CLEANUP_TAINTED,
+                        reason,
+                        Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED);
+  }
+  append_result_message(result, reason);
+  tokens->clear();
 }
 
 }  // namespace
@@ -1126,12 +1151,25 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
   auto finish_with_optional_abandoned_marker =
       [&](Preserve_trx_promotion_adopt_status status) {
         if (request.execute_adopt) {
-          write_final_intent_marker_for_result(&store.store(), request,
-                                               adopted_tokens, result);
+          if (!write_final_intent_marker_for_result(&store.store(), request,
+                                                    adopted_tokens, result)) {
+            taint_adopted_tokens_after_marker_failure(
+                result, &adopted_tokens,
+                "promotion intent marker not durable after adopt");
+            status =
+                Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS;
+          }
         }
-        if (!adopted_tokens.empty()) {
-          write_adopted_marker_for_tokens(&store.store(), request,
-                                          adopted_tokens, result);
+        if (!adopted_tokens.empty() &&
+            !write_adopted_marker_for_tokens(&store.store(), request,
+                                             adopted_tokens, result)) {
+          taint_adopted_tokens_after_marker_failure(
+              result, &adopted_tokens,
+              "promotion adopted marker not durable after adopt");
+          status =
+              Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS;
+          (void)write_final_intent_marker_for_result(&store.store(), request,
+                                                     adopted_tokens, result);
         }
         if (status ==
             Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS) {

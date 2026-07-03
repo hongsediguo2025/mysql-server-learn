@@ -466,7 +466,8 @@ uint64_t preserve_trx_temp_table_owner_trx_id(
 
 Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume(
     THD *thd, trx_t *trx, const std::string &dir, const std::string &token,
-    const Preserve_snapshot_metadata &metadata);
+    const Preserve_snapshot_metadata &metadata,
+    std::string *failure_reason = nullptr);
 
 Preserve_snapshot_status
 preserve_trx_temp_table_rollback_materialized_for_resume(

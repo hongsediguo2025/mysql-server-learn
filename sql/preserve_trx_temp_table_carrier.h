@@ -248,6 +248,17 @@ class Preserved_temp_table_image_carrier {
       const Preserved_temp_table_image_descriptor &descriptor,
       std::string *payload) = 0;
 
+  /*
+    Restore a token-owned image sidecar after a resume attempt used it as a live
+    InnoDB fil space but failed before activation. The payload must be the
+    original sealed bytes read before adoption; the implementation validates the
+    descriptor and digest before atomically replacing the on-disk sidecar.
+  */
+  virtual Preserved_trx_carrier_status restore_sealed_image_for_retry(
+      const std::string &token,
+      const Preserved_temp_table_image_descriptor &descriptor,
+      const std::string &payload) = 0;
+
   virtual Preserved_trx_carrier_status read_sealed_undo(
       const std::string &token,
       const Preserved_temp_table_undo_descriptor &descriptor,
@@ -305,6 +316,11 @@ class Local_file_preserved_temp_table_image_carrier final
       const std::string &token,
       const Preserved_temp_table_image_descriptor &descriptor,
       std::string *payload) override;
+
+  Preserved_trx_carrier_status restore_sealed_image_for_retry(
+      const std::string &token,
+      const Preserved_temp_table_image_descriptor &descriptor,
+      const std::string &payload) override;
 
   Preserved_trx_carrier_status read_sealed_undo(
       const std::string &token,

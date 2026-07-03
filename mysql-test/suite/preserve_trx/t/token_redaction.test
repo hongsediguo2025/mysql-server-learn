@@ -115,6 +115,23 @@ SELECT COUNT(*) AS hex_literal_wrong_last4_in_slow_log
   FROM mysql.slow_log
  WHERE sql_text = "RESUME PRESERVED TRANSACTION '****6364'";
 
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+--error ER_PRESERVE_TRX_NOT_FOUND
+RESUME PRESERVED TRANSACTION 0xF;
+SELECT COUNT(*) > 0 AS odd_hex_literal_raw_in_general_log
+  FROM mysql.general_log
+ WHERE argument = 'RESUME PRESERVED TRANSACTION 0xF';
+SELECT COUNT(*) AS odd_hex_literal_redacted_in_general_log
+  FROM mysql.general_log
+ WHERE argument LIKE "RESUME PRESERVED TRANSACTION '****%";
+SELECT COUNT(*) > 0 AS odd_hex_literal_raw_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text = 'RESUME PRESERVED TRANSACTION 0xF';
+SELECT COUNT(*) AS odd_hex_literal_redacted_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text LIKE "RESUME PRESERVED TRANSACTION '****%";
+
 --let $binary_redaction_token_bits= `SELECT CONCAT('0b', LPAD(BIN(ASCII('m')), 8, '0'), LPAD(BIN(ASCII('s')), 8, '0'), LPAD(BIN(ASCII('p')), 8, '0'), LPAD(BIN(ASCII('_')), 8, '0'), LPAD(BIN(ASCII('r')), 8, '0'), LPAD(BIN(ASCII('e')), 8, '0'), LPAD(BIN(ASCII('d')), 8, '0'), LPAD(BIN(ASCII('a')), 8, '0'), LPAD(BIN(ASCII('c')), 8, '0'), LPAD(BIN(ASCII('t')), 8, '0'), LPAD(BIN(ASCII('i')), 8, '0'), LPAD(BIN(ASCII('o')), 8, '0'), LPAD(BIN(ASCII('n')), 8, '0'), LPAD(BIN(ASCII('_')), 8, '0'), LPAD(BIN(ASCII('w')), 8, '0'), LPAD(BIN(ASCII('x')), 8, '0'), LPAD(BIN(ASCII('y')), 8, '0'), LPAD(BIN(ASCII('z')), 8, '0'))`
 TRUNCATE TABLE mysql.general_log;
 TRUNCATE TABLE mysql.slow_log;

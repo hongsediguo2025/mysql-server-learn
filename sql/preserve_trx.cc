@@ -5931,8 +5931,8 @@ void preserved_trx_mark_recovery_complete() {
 
 bool preserved_trx_validate_snapshot_support(bool allow_create_missing) {
   const std::string dir = preserve_trx_default_dir();
-  return preserved_trx_default_carrier_support_is_valid(dir,
-                                                        allow_create_missing);
+  return preserved_trx_default_carrier_support_has_error(dir,
+                                                         allow_create_missing);
 }
 
 bool preserved_trx_ensure_snapshot_support() {
@@ -6145,6 +6145,7 @@ bool preserved_trx_shutdown_requested() {
 }
 
 void preserved_trx_note_statement_response(THD *thd) {
+  if (!preserve_trx_is_enabled()) return;
   note_pending_token_delivery_statement_response(thd);
 }
 
@@ -7996,6 +7997,7 @@ static bool reactivate_current_batch_prepared_failure_to_original_thd(THD *thd) 
 }
 
 void preserved_trx_finalize_statement_response(THD *thd) {
+  if (!preserve_trx_is_enabled()) return;
   if (!preserved_trx_has_pending_token_delivery(thd)) return;
 
   DEBUG_SYNC(thd, "preserve_trx_finalize_token_delivery");
@@ -8478,8 +8480,10 @@ bool preserved_temp_images_bootstrap_preamble() {
     return true;
   }
 
+  const Preserved_trx_carrier_listing local_crash_listing =
+      preserved_trx_local_crash_abandon_listing(listing);
   if (preserved_trx_crash_recovery_artifacts_forbidden(
-          listing, "temporary tablespace bootstrap")) {
+          local_crash_listing, "temporary tablespace bootstrap")) {
     return true;
   }
 
@@ -8578,6 +8582,14 @@ bool preserved_temp_images_bootstrap_preamble() {
       */
       continue;
     }
+
+    /*
+      Even with the temp-table subfeature disabled, existing local sidecars are
+      still checked and their source space ids are reserved so a new temporary
+      table cannot reuse a preserved image identity. No-redo undo bootstrap,
+      page ownership adoption, and native adoption stay inert.
+    */
+    if (!preserve_trx_temp_table_enable) continue;
 
     Preserved_temp_table_manifest manifest;
     if (!preserve_trx_decode_temp_table_manifest(
@@ -8759,8 +8771,10 @@ bool preserved_trx_recover_all() {
   std::set<std::string> warm_external_blob_artifacts =
       listing.warm_external_blob_artifacts;
 
+  const Preserved_trx_carrier_listing local_crash_listing =
+      preserved_trx_local_crash_abandon_listing(listing);
   if (preserved_trx_crash_recovery_artifacts_forbidden(
-          listing, "preserved transaction recovery")) {
+          local_crash_listing, "preserved transaction recovery")) {
     preserved_trx_mark_recovery_complete();
     return true;
   }
@@ -11900,12 +11914,17 @@ bool Sql_cmd_resume_preserved_transaction::execute(THD *thd) {
     }
   }
 
+  std::string temp_materialize_reason;
   const Preserve_snapshot_status temp_materialize_status =
       preserve_trx_temp_table_materialize_for_resume(
-          thd, record.trx, preserve_trx_default_dir(), token, record.metadata);
+          thd, record.trx, preserve_trx_default_dir(), token, record.metadata,
+          &temp_materialize_reason);
   if (temp_materialize_status != Preserve_snapshot_status::OK) {
     (void)restore_preserved_record_after_failure(
-        "temporary table materialization failure");
+        temp_materialize_reason.empty()
+            ? "temporary table materialization failure"
+            : "temporary table materialization failure: " +
+                  temp_materialize_reason);
     return preserve_trx_reject_unsupported();
   }
   temp_tables_materialized = !record.metadata.temp_table_manifest_payload.empty();

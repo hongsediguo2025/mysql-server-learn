@@ -101,6 +101,30 @@ hex_literal_wrong_last4_in_slow_log
 0
 TRUNCATE TABLE mysql.general_log;
 TRUNCATE TABLE mysql.slow_log;
+RESUME PRESERVED TRANSACTION 0xF;
+ERROR HY000: Preserved transaction was not found
+SELECT COUNT(*) > 0 AS odd_hex_literal_raw_in_general_log
+FROM mysql.general_log
+WHERE argument = 'RESUME PRESERVED TRANSACTION 0xF';
+odd_hex_literal_raw_in_general_log
+1
+SELECT COUNT(*) AS odd_hex_literal_redacted_in_general_log
+FROM mysql.general_log
+WHERE argument LIKE "RESUME PRESERVED TRANSACTION '****%";
+odd_hex_literal_redacted_in_general_log
+0
+SELECT COUNT(*) > 0 AS odd_hex_literal_raw_in_slow_log
+FROM mysql.slow_log
+WHERE sql_text = 'RESUME PRESERVED TRANSACTION 0xF';
+odd_hex_literal_raw_in_slow_log
+1
+SELECT COUNT(*) AS odd_hex_literal_redacted_in_slow_log
+FROM mysql.slow_log
+WHERE sql_text LIKE "RESUME PRESERVED TRANSACTION '****%";
+odd_hex_literal_redacted_in_slow_log
+0
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
 ERROR HY000: Preserved transaction was not found
 SELECT COUNT(*) > 0 AS binary_literal_last4_in_general_log
 FROM mysql.general_log

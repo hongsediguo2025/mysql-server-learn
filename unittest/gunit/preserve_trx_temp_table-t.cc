@@ -1504,8 +1504,7 @@ TEST(TempResumeMaterializerContractTest,
   const size_t mode_from_plan = normalized_materialize_body.find(
       "preserve_trx_temp_table_no_redo_reconnect_mode_for_resume(plan)");
   const size_t native_adopt_call = normalized_materialize_body.find(
-      "trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume("
-      " descriptor.second.get())");
+      "trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume(");
   const size_t reconnect_call = normalized_materialize_body.find(
       "trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume( "
       "descriptor.second.get(), trx, no_redo_undo_reconnect_mode)");
@@ -8314,7 +8313,7 @@ TEST(TempTableParticipantTest, TailBudgetOverflowBlocksClosing) {
   EXPECT_FALSE(participant.can_close_phase1());
 }
 
-TEST(TempTableParticipantTest, FirstRowTouchCreatesParticipant) {
+TEST(TempTableParticipantTest, OrdinalRowTouchMarksUntrackedOnly) {
   PreserveTrxEnableGuard preserve_guard(true);
   PreserveTrxTempTableEnableGuard enable_guard(true);
   THD thd(false);
@@ -8323,20 +8322,10 @@ TEST(TempTableParticipantTest, FirstRowTouchCreatesParticipant) {
   EXPECT_TRUE(
       preserve_trx_temp_table_note_row_write(&thd, 11, "payload", 7));
 
-  Temp_table_warmcopy_participant *participant =
-      preserve_trx_temp_table_get_participant(&thd);
-  ASSERT_NE(nullptr, participant);
-  EXPECT_TRUE(thd.preserve_trx_temp_table_has_participant.load(
-      std::memory_order_acquire));
-  EXPECT_TRUE(participant->has_table(11));
-  ASSERT_EQ(1U, participant->journal().size());
-  EXPECT_EQ(11U, participant->journal()[0].table_ordinal);
-  EXPECT_EQ(Temp_table_journal_record::Kind::INSERT_ROW,
-            participant->journal()[0].kind);
-
-  preserve_trx_temp_table_clear_participant(&thd);
+  EXPECT_EQ(nullptr, preserve_trx_temp_table_get_participant(&thd));
   EXPECT_FALSE(thd.preserve_trx_temp_table_has_participant.load(
       std::memory_order_acquire));
+  EXPECT_TRUE(preserve_trx_temp_table_has_untracked_change(&thd));
 }
 
 TEST(TempTableParticipantTest, UnsupportedTableRowHooksAreNoop) {
@@ -8374,9 +8363,12 @@ TEST(TempTableParticipantTest, ExistingSavepointMakesFirstTouchUnsupported) {
   savepoint.name = nullptr;
   savepoint.length = 0;
   thd.get_transaction()->m_savepoints = &savepoint;
+  TABLE table;
+  TABLE_SHARE share;
+  init_fake_table(&table, &share, TRANSACTIONAL_TMP_TABLE);
 
-  EXPECT_FALSE(
-      preserve_trx_temp_table_note_row_write(&thd, 12, "payload", 7));
+  EXPECT_FALSE(preserve_trx_temp_table_note_row_write(&thd, &table, nullptr,
+                                                      0));
 
   Temp_table_warmcopy_participant *participant =
       preserve_trx_temp_table_get_participant(&thd);
@@ -8393,8 +8385,11 @@ TEST(TempTableParticipantTest, StatementRollbackMarksJournalDegraded) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
   THD thd(false);
   mark_active_transaction(&thd);
-  ASSERT_TRUE(
-      preserve_trx_temp_table_note_row_write(&thd, 13, "payload", 7));
+  TABLE table;
+  TABLE_SHARE share;
+  init_fake_table(&table, &share, TRANSACTIONAL_TMP_TABLE);
+  ASSERT_TRUE(preserve_trx_temp_table_note_row_write(&thd, &table, nullptr,
+                                                     0));
 
   preserve_trx_temp_table_note_statement_rollback(&thd);
 
@@ -8412,8 +8407,11 @@ TEST(TempTableParticipantTest, StatementCommitClearsRollbackPoison) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
   THD thd(false);
   mark_active_transaction(&thd);
-  ASSERT_TRUE(
-      preserve_trx_temp_table_note_row_write(&thd, 14, "payload", 7));
+  TABLE table;
+  TABLE_SHARE share;
+  init_fake_table(&table, &share, TRANSACTIONAL_TMP_TABLE);
+  ASSERT_TRUE(preserve_trx_temp_table_note_row_write(&thd, &table, nullptr,
+                                                     0));
 
   preserve_trx_temp_table_note_statement_commit(&thd);
   preserve_trx_temp_table_note_statement_rollback(&thd);

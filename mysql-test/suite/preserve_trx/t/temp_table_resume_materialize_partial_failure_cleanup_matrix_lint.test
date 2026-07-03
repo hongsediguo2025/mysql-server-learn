@@ -44,8 +44,9 @@ die "temp-table resume materializer must centralize retry cleanup\n"
          $materializer =~ /preserve_trx_temp_table_close_staged_tables/s &&
          $materializer =~ /trx_preserve_temp_space_image_release_preserved_fil_space_for_retry/s;
 my $cleanup_calls = () = $materializer =~ /cleanup_for_retry\s*\(\s*\)/g;
+my $cleanup_wrapper_calls = () = $materializer =~ /return\s+fail_after_cleanup\s*\(/g;
 die "temp-table resume materializer must call retry cleanup on staged failure branches\n"
-  unless $cleanup_calls >= 10;
+  unless $cleanup_calls >= 1 && $cleanup_wrapper_calls >= 10;
 die "debug hook for open-before-link partial materialization must remain available\n"
   unless $temp_src =~ /preserve_temp_fail_after_open_before_link/s &&
          $gunit =~ /StagedOpenFailureHookIsReservedForAfterOneOpenBeforeNext/s;

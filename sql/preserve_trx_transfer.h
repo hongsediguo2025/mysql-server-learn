@@ -321,6 +321,12 @@ struct Preserve_trx_transfer_client_ops {
 void preserve_trx_transfer_set_client_ops_for_unit_test(
     const Preserve_trx_transfer_client_ops *ops);
 
+using Preserve_trx_transfer_codec_context_provider =
+    bool (*)(Preserved_trx_codec_context *context);
+
+void preserve_trx_transfer_set_codec_context_provider_for_unit_test(
+    Preserve_trx_transfer_codec_context_provider provider);
+
 using Preserve_trx_transfer_frame_sink_factory =
     Preserve_trx_transfer_status (*)(
         std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> *sink);

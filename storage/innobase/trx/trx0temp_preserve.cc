@@ -605,6 +605,10 @@ bool trx_preserve_temp_space_image_page_identity_matches(
     const trx_preserve_temp_space_image_descriptor &descriptor,
     const unsigned char *page, size_t page_bytes, uint32_t page_no);
 
+bool trx_preserve_temp_space_image_no_redo_undo_page_identity_matches(
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    uint32_t page_no, const unsigned char *page, size_t page_bytes);
+
 bool trx_preserve_temp_space_image_valid_no_redo_undo_page_kind(
     trx_preserve_temp_no_redo_undo_page_kind kind);
 
@@ -802,6 +806,42 @@ void trx_preserve_temp_space_image_free_reconnected_undo(trx_undo_t *undo) {
     }
   }
   trx_undo_mem_free(undo);
+}
+
+void trx_preserve_temp_space_image_scrub_reconnected_undo_from_rseg(
+    trx_rseg_t *rseg, const trx_preserve_temp_no_redo_undo_log_anchor &anchor,
+    trx_id_t trx_id, ulint type) {
+  if (rseg == nullptr || !anchor.present ||
+      (type != TRX_UNDO_INSERT && type != TRX_UNDO_UPDATE)) {
+    return;
+  }
+  ut_ad(mutex_own(&rseg->mutex));
+  trx_undo_t *undo =
+      type == TRX_UNDO_INSERT ? UT_LIST_GET_FIRST(rseg->insert_undo_list)
+                              : UT_LIST_GET_FIRST(rseg->update_undo_list);
+  while (undo != nullptr) {
+    trx_undo_t *next = UT_LIST_GET_NEXT(undo_list, undo);
+    /*
+      A failed RESUME may already have closed staged SQL temporary tables before
+      retry cleanup reaches the no-redo undo graph. At that point the claimed
+      trx can have lost its direct m_noredo pointers, so the retry path must be
+      able to scrub by the token-owned native slot identity instead of relying
+      solely on the current trx id. The slot is still reserved for this
+      preserved source space until cleanup completes, so matching the slot and
+      header page is the precise retry residue we are allowed to remove.
+    */
+    const bool trx_matches = trx_id == 0 || undo->trx_id == trx_id;
+    if (undo->id == anchor.undo_slot && undo->hdr_page_no == anchor.hdr_page_no &&
+        trx_matches) {
+      if (type == TRX_UNDO_INSERT) {
+        UT_LIST_REMOVE(rseg->insert_undo_list, undo);
+      } else {
+        UT_LIST_REMOVE(rseg->update_undo_list, undo);
+      }
+      trx_undo_mem_free(undo);
+    }
+    undo = next;
+  }
 }
 
 trx_rseg_t *trx_preserve_temp_space_image_find_no_redo_rseg(
@@ -1120,6 +1160,62 @@ dberr_t trx_preserve_temp_space_image_copy_no_redo_undo_image_to_block(
   return DB_SUCCESS;
 }
 
+dberr_t trx_preserve_temp_space_image_recopy_existing_no_redo_undo_page(
+    const trx_preserve_temp_space_image_descriptor &descriptor, trx_rseg_t *rseg,
+    const trx_preserve_temp_no_redo_undo_page_image &page,
+    bool keep_live_fseg_header) {
+  if (rseg == nullptr ||
+      !trx_preserve_temp_space_image_page_reserved(
+          rseg->space_id, static_cast<uint32_t>(page.page_no))) {
+    return DB_ERROR;
+  }
+
+  mtr_t mtr;
+  mtr_start(&mtr);
+  mtr_set_log_mode(&mtr, MTR_LOG_NO_REDO);
+  buf_block_t *block = buf_page_get_gen(
+      page_id_t(rseg->space_id, static_cast<page_no_t>(page.page_no)),
+      rseg->page_size, RW_X_LATCH, nullptr, Page_fetch::NORMAL, __FILE__,
+      __LINE__, &mtr);
+  if (block == nullptr) {
+    mtr_commit(&mtr);
+    return DB_ERROR;
+  }
+
+  const unsigned char *frame =
+      reinterpret_cast<const unsigned char *>(buf_block_get_frame(block));
+  if (!trx_preserve_temp_space_image_no_redo_undo_page_identity_matches(
+          descriptor, page.page_no, frame, rseg->page_size.physical())) {
+    mtr_commit(&mtr);
+    return DB_ERROR;
+  }
+
+  const dberr_t err = trx_preserve_temp_space_image_copy_no_redo_undo_image_to_block(
+      page, block, keep_live_fseg_header, &mtr);
+  mtr_commit(&mtr);
+  if (err == DB_SUCCESS) {
+    trx_preserve_temp_space_image_release_page_reservation(
+        rseg->space_id, static_cast<uint32_t>(page.page_no));
+  }
+  return err;
+}
+
+dberr_t trx_preserve_temp_space_image_recopy_existing_no_redo_undo_fseg_pages(
+    const trx_preserve_temp_space_image_descriptor &descriptor, trx_rseg_t *rseg,
+    const std::vector<const trx_preserve_temp_no_redo_undo_page_image *> &pages) {
+  if (rseg == nullptr || pages.empty()) return DB_ERROR;
+
+  for (size_t i = 0; i < pages.size(); ++i) {
+    const trx_preserve_temp_no_redo_undo_page_image *page = pages[i];
+    if (page == nullptr) return DB_ERROR;
+    const dberr_t err =
+        trx_preserve_temp_space_image_recopy_existing_no_redo_undo_page(
+            descriptor, rseg, *page, i == 0);
+    if (err != DB_SUCCESS) return err;
+  }
+  return DB_SUCCESS;
+}
+
 dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership_for_anchor(
     const trx_preserve_temp_space_image_descriptor &descriptor, trx_rseg_t *rseg,
     const trx_preserve_temp_no_redo_undo_log_anchor &anchor) {
@@ -1139,7 +1235,8 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership_for_anch
       TRX_UNDO_SEG_HDR + TRX_UNDO_FSEG_HEADER, &mtr);
   if (header_block == nullptr) {
     mtr_commit(&mtr);
-    return DB_ERROR;
+    return trx_preserve_temp_space_image_recopy_existing_no_redo_undo_fseg_pages(
+        descriptor, rseg, pages);
   }
 
   err = trx_preserve_temp_space_image_copy_no_redo_undo_image_to_block(
@@ -1158,7 +1255,8 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership_for_anch
         file_seg, static_cast<page_no_t>(page->page_no), &mtr);
     if (block == nullptr) {
       mtr_commit(&mtr);
-      return DB_ERROR;
+      return trx_preserve_temp_space_image_recopy_existing_no_redo_undo_fseg_pages(
+          descriptor, rseg, pages);
     }
     err = trx_preserve_temp_space_image_copy_no_redo_undo_image_to_block(
         *page, block, false, &mtr);
@@ -3522,6 +3620,89 @@ static bool trx_preserve_temp_space_image_release_no_redo_undo_slot_for_owner(
   return true;
 }
 
+static dberr_t
+trx_preserve_temp_space_image_release_native_no_redo_undo_slots_for_retry(
+    trx_preserve_temp_space_image_descriptor *descriptor) {
+  if (descriptor == nullptr ||
+      !trx_preserve_temp_space_image_descriptor_has_identity(*descriptor) ||
+      !descriptor->no_redo_undo_native_slots_adopted) {
+    return DB_SUCCESS;
+  }
+
+  trx_rseg_t *rseg =
+      trx_preserve_temp_space_image_find_no_redo_rseg(*descriptor);
+  if (rseg == nullptr) return DB_ERROR;
+
+  const ulint insert_size =
+      descriptor->no_redo_insert_undo.present
+          ? trx_preserve_temp_space_image_reconnected_undo_size(
+                *descriptor, descriptor->no_redo_insert_undo)
+          : 0;
+  const ulint update_size =
+      descriptor->no_redo_update_undo.present
+          ? trx_preserve_temp_space_image_reconnected_undo_size(
+                *descriptor, descriptor->no_redo_update_undo)
+          : 0;
+  dberr_t err = DB_SUCCESS;
+  page_no_t released_size = 0;
+  auto clear_anchor_slot =
+      [&err, &released_size](
+          trx_rsegf_t *rseg_header,
+          const trx_preserve_temp_no_redo_undo_log_anchor &anchor,
+          page_no_t anchor_size, mtr_t *mtr) {
+        if (!anchor.present || err != DB_SUCCESS) return;
+        const page_no_t current =
+            trx_rsegf_get_nth_undo(rseg_header, anchor.undo_slot, mtr);
+        if (current == anchor.hdr_page_no) {
+          trx_rsegf_set_nth_undo(rseg_header, anchor.undo_slot, FIL_NULL, mtr);
+          released_size += anchor_size;
+        } else if (current != FIL_NULL) {
+          err = DB_ERROR;
+        }
+      };
+
+  mtr_t mtr;
+  mtr_start(&mtr);
+  mtr_set_log_mode(&mtr, MTR_LOG_NO_REDO);
+  rseg->latch();
+  trx_rsegf_t *rseg_header =
+      trx_rsegf_get(rseg->space_id, rseg->page_no, rseg->page_size, &mtr);
+  clear_anchor_slot(rseg_header, descriptor->no_redo_insert_undo,
+                    static_cast<page_no_t>(insert_size), &mtr);
+  clear_anchor_slot(rseg_header, descriptor->no_redo_update_undo,
+                    static_cast<page_no_t>(update_size), &mtr);
+  if (err == DB_SUCCESS && released_size > 0) {
+    const page_no_t current_size = rseg->get_curr_size();
+    if (released_size <= current_size) {
+      rseg->set_curr_size(current_size - released_size);
+    } else {
+      err = DB_ERROR;
+    }
+  }
+  rseg->unlatch();
+  mtr_commit(&mtr);
+  if (err != DB_SUCCESS) return err;
+
+  if (descriptor->no_redo_insert_undo.present &&
+      !trx_preserve_temp_space_image_release_no_redo_undo_slot_for_owner(
+          descriptor->source_space_id, descriptor->no_redo_undo_rseg_space_id,
+          descriptor->no_redo_undo_rseg_page_no,
+          descriptor->no_redo_undo_rseg_slot,
+          descriptor->no_redo_insert_undo.undo_slot)) {
+    return DB_ERROR;
+  }
+  if (descriptor->no_redo_update_undo.present &&
+      !trx_preserve_temp_space_image_release_no_redo_undo_slot_for_owner(
+          descriptor->source_space_id, descriptor->no_redo_undo_rseg_space_id,
+          descriptor->no_redo_undo_rseg_page_no,
+          descriptor->no_redo_undo_rseg_slot,
+          descriptor->no_redo_update_undo.undo_slot)) {
+    return DB_ERROR;
+  }
+  descriptor->no_redo_undo_native_slots_adopted = false;
+  return DB_SUCCESS;
+}
+
 dberr_t
 trx_preserve_temp_space_image_release_no_redo_undo_reservations_from_sidecar(
     uint32_t source_space_id, uint32_t page_size, const unsigned char *payload,
@@ -5226,31 +5407,39 @@ bool trx_preserve_temp_space_image_no_redo_undo_page_claim_slot(
 }
 
 dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume(
-    trx_preserve_temp_space_image_descriptor *descriptor) {
+    trx_preserve_temp_space_image_descriptor *descriptor,
+    std::string *failure_reason) {
+  auto fail = [failure_reason](const char *reason) {
+    if (failure_reason != nullptr) {
+      failure_reason->assign(reason == nullptr ? "" : reason);
+    }
+    return DB_ERROR;
+  };
+  if (failure_reason != nullptr) failure_reason->clear();
   if (!preserve_trx_temp_table_enable) return DB_SUCCESS;
   if (descriptor == nullptr ||
       !trx_preserve_temp_space_image_descriptor_has_identity(*descriptor) ||
       !trx_preserve_temp_space_image_no_redo_undo_sidecar_ready(*descriptor) ||
       !trx_preserve_temp_space_image_has_no_redo_undo_anchor(*descriptor)) {
-    return DB_ERROR;
+    return fail("descriptor or no-redo undo sidecar is incomplete");
   }
   if (descriptor->no_redo_undo_native_slots_adopted) return DB_SUCCESS;
   if (!trx_preserve_temp_no_redo_undo_anchor_identity_valid(
           descriptor->no_redo_insert_undo, descriptor->page_size) ||
       !trx_preserve_temp_no_redo_undo_anchor_identity_valid(
           descriptor->no_redo_update_undo, descriptor->page_size)) {
-    return DB_ERROR;
+    return fail("no-redo undo anchor identity is invalid");
   }
   if (descriptor->no_redo_insert_undo.present &&
       descriptor->no_redo_update_undo.present &&
       descriptor->no_redo_insert_undo.undo_slot ==
           descriptor->no_redo_update_undo.undo_slot) {
-    return DB_ERROR;
+    return fail("insert and update undo anchors use the same rseg slot");
   }
 
   trx_rseg_t *rseg = trx_preserve_temp_space_image_find_no_redo_rseg(
       *descriptor);
-  if (rseg == nullptr) return DB_ERROR;
+  if (rseg == nullptr) return fail("no matching no-redo rseg found");
 
   const ulint insert_size =
       descriptor->no_redo_insert_undo.present
@@ -5264,7 +5453,7 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume
           : 0;
   if ((descriptor->no_redo_insert_undo.present && insert_size == 0) ||
       (descriptor->no_redo_update_undo.present && update_size == 0)) {
-    return DB_ERROR;
+    return fail("captured no-redo undo size is zero");
   }
   const page_no_t adopted_size = static_cast<page_no_t>(insert_size + update_size);
 
@@ -5297,7 +5486,7 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume
   dberr_t err = DB_SUCCESS;
   if (!reserve_anchor_slot(descriptor->no_redo_insert_undo) ||
       !reserve_anchor_slot(descriptor->no_redo_update_undo)) {
-    return DB_ERROR;
+    return fail("no-redo undo slot reservation failed");
   }
 
   {
@@ -5327,11 +5516,15 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume
     rseg->unlatch();
     mtr_commit(&mtr);
   }
-  if (err != DB_SUCCESS) return err;
+  if (err != DB_SUCCESS) {
+    return fail("no-redo undo rseg precheck failed");
+  }
 
   err = trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership(
       *descriptor, rseg);
-  if (err != DB_SUCCESS) return err;
+  if (err != DB_SUCCESS) {
+    return fail("no-redo undo fseg ownership adoption failed");
+  }
 
   mtr_t mtr;
   mtr_start(&mtr);
@@ -5363,6 +5556,9 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume
   mtr_commit(&mtr);
 
   if (err == DB_SUCCESS) descriptor->no_redo_undo_native_slots_adopted = true;
+  if (err != DB_SUCCESS) {
+    return fail("no-redo undo rseg final adoption failed");
+  }
   return err;
 }
 
@@ -5523,12 +5719,16 @@ dberr_t trx_preserve_temp_space_image_disconnect_no_redo_undo_for_retry(
   trx_t *trx = descriptor->no_redo_undo_reconnected_trx;
   if (trx == nullptr) return DB_ERROR;
 
+  const trx_id_t trx_id = trx->id;
   trx_rseg_t *rseg = trx->rsegs.m_noredo.rseg;
   if (rseg == nullptr && trx->rsegs.m_noredo.insert_undo != nullptr) {
     rseg = trx->rsegs.m_noredo.insert_undo->rseg;
   }
   if (rseg == nullptr && trx->rsegs.m_noredo.update_undo != nullptr) {
     rseg = trx->rsegs.m_noredo.update_undo->rseg;
+  }
+  if (rseg == nullptr) {
+    rseg = trx_preserve_temp_space_image_find_no_redo_rseg(*descriptor);
   }
 
   if (rseg != nullptr) {
@@ -5538,6 +5738,12 @@ dberr_t trx_preserve_temp_space_image_disconnect_no_redo_undo_for_retry(
       trx->rsegs.m_noredo.insert_undo);
   trx_preserve_temp_space_image_free_reconnected_undo(
       trx->rsegs.m_noredo.update_undo);
+  if (rseg != nullptr) {
+    trx_preserve_temp_space_image_scrub_reconnected_undo_from_rseg(
+        rseg, descriptor->no_redo_insert_undo, trx_id, TRX_UNDO_INSERT);
+    trx_preserve_temp_space_image_scrub_reconnected_undo_from_rseg(
+        rseg, descriptor->no_redo_update_undo, trx_id, TRX_UNDO_UPDATE);
+  }
   trx->rsegs.m_noredo.insert_undo = nullptr;
   trx->rsegs.m_noredo.update_undo = nullptr;
   trx->rsegs.m_noredo.rseg = nullptr;
@@ -5546,7 +5752,6 @@ dberr_t trx_preserve_temp_space_image_disconnect_no_redo_undo_for_retry(
   }
   descriptor->no_redo_undo_pointers_reconnected = false;
   descriptor->no_redo_undo_restored_only_reconnected = false;
-  descriptor->no_redo_undo_native_slots_adopted = false;
   descriptor->no_redo_undo_reconnected_trx = nullptr;
   return DB_SUCCESS;
 }
@@ -6326,6 +6531,12 @@ dberr_t trx_preserve_temp_space_image_release_preserved_fil_space_for_retry(
       trx_preserve_temp_space_image_disconnect_no_redo_undo_for_retry(target);
   if (undo_err != DB_SUCCESS) {
     return undo_err;
+  }
+  const dberr_t native_slot_err =
+      trx_preserve_temp_space_image_release_native_no_redo_undo_slots_for_retry(
+          target);
+  if (native_slot_err != DB_SUCCESS) {
+    return native_slot_err;
   }
   trx_preserve_temp_space_image_notify_drop_event(
       target->source_space_id, "evict_buffer_pool_pages");

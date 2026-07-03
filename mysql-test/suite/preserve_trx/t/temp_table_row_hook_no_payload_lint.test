@@ -11,9 +11,14 @@ my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
 my $source_root = File::Spec->rel2abs(
   File::Spec->catdir($mysql_test_dir, '..'));
 my $handler_path = File::Spec->catfile($source_root, 'sql', 'handler.cc');
+my $temp_table_path = File::Spec->catfile($source_root, 'sql',
+                                          'preserve_trx_temp_table.cc');
 
 open(my $fh, '<', $handler_path) or die "cannot open $handler_path: $!";
 my $handler = do { local $/; <$fh> };
+close($fh);
+open($fh, '<', $temp_table_path) or die "cannot open $temp_table_path: $!";
+my $temp_table = do { local $/; <$fh> };
 close($fh);
 
 sub function_body {
@@ -46,6 +51,16 @@ die "ha_update_row must not pass row bytes into temp-table preserve hook\n"
 die "ha_delete_row must not pass row bytes into temp-table preserve hook\n"
   unless $delete_body =~
          /preserve_trx_temp_table_note_row_delete\s*\(\s*ha_thd\(\)\s*,\s*table\s*,\s*nullptr\s*,\s*0\s*\)/s;
+
+$temp_table =~
+  /(bool\s+preserve_trx_temp_table_note_row_write\s*\(\s*THD\s*\*thd\s*,\s*uint32_t\s+table_ordinal[\s\S]*?^})\n\nbool\s+preserve_trx_temp_table_note_row_write\s*\(\s*THD\s*\*thd\s*,\s*const\s+TABLE/sm
+  or die "could not isolate ordinal temp-table row-write wrapper\n";
+my $ordinal_wrapper = $1;
+
+die "ordinal temp-table row-write wrapper must not copy SQL row payload bytes\n"
+  if $ordinal_wrapper =~ /payload\.assign|payload\.append|std::string\s+payload/s;
+die "ordinal temp-table row-write wrapper must not append row journal records\n"
+  if $ordinal_wrapper =~ /Temp_table_journal_record\s+record|append_journal/s;
 EOF
 
 SELECT 'ok' AS temp_table_row_hook_no_payload_lint;

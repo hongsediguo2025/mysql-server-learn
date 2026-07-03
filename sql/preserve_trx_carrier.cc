@@ -251,6 +251,32 @@ std::set<std::string> preserved_trx_orphan_rollback_retained_tokens(
   return tokens;
 }
 
+Preserved_trx_carrier_listing preserved_trx_local_crash_abandon_listing(
+    const Preserved_trx_carrier_listing &listing) {
+  auto local_token = [&](const std::string &token) {
+    return listing.standby_pending_tokens.count(token) == 0 ||
+           listing.promotion_adopted_tokens.count(token) != 0;
+  };
+  auto filter_tokens = [&](const std::set<std::string> &candidate_tokens) {
+    std::set<std::string> filtered;
+    for (const std::string &token : candidate_tokens) {
+      if (local_token(token)) filtered.insert(token);
+    }
+    return filtered;
+  };
+
+  Preserved_trx_carrier_listing local;
+  local.snapshot_tokens = filter_tokens(listing.snapshot_tokens);
+  local.external_blob_tokens = filter_tokens(listing.external_blob_tokens);
+  local.temp_sidecar_tokens = filter_tokens(listing.temp_sidecar_tokens);
+  local.tainted_tokens = filter_tokens(listing.tainted_tokens);
+  local.standby_pending_tokens = listing.standby_pending_tokens;
+  local.promotion_adopted_tokens = listing.promotion_adopted_tokens;
+  local.promotion_intent_tokens = listing.promotion_intent_tokens;
+  local.warm_external_blob_artifacts = listing.warm_external_blob_artifacts;
+  return local;
+}
+
 std::set<std::string>
 preserved_trx_filter_standby_pending_tokens_for_local_recovery(
     const std::set<std::string> &candidate_tokens,

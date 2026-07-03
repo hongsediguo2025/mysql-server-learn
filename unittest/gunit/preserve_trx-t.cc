@@ -1453,6 +1453,41 @@ TEST(PreservedTrxRecovery, StandbyPendingRetainedForOrphanRollbackExclusion) {
   EXPECT_EQ(1U, retained_tokens.count("adopted-token"));
 }
 
+TEST(PreservedTrxRecovery, LocalCrashAbandonListingFiltersStandbyPending) {
+  Preserved_trx_carrier_listing listing;
+  listing.snapshot_tokens.insert("local-token");
+  listing.snapshot_tokens.insert("standby-token");
+  listing.external_blob_tokens.insert("standby-token");
+  listing.temp_sidecar_tokens.insert("standby-token");
+  listing.tainted_tokens.insert("standby-token");
+  listing.standby_pending_tokens.insert("standby-token");
+
+  const Preserved_trx_carrier_listing local_listing =
+      preserved_trx_local_crash_abandon_listing(listing);
+
+  EXPECT_EQ(1U, local_listing.snapshot_tokens.count("local-token"));
+  EXPECT_EQ(0U, local_listing.snapshot_tokens.count("standby-token"));
+  EXPECT_EQ(0U, local_listing.external_blob_tokens.count("standby-token"));
+  EXPECT_EQ(0U, local_listing.temp_sidecar_tokens.count("standby-token"));
+  EXPECT_EQ(0U, local_listing.tainted_tokens.count("standby-token"));
+}
+
+TEST(PreservedTrxRecovery, LocalCrashAbandonListingKeepsAdoptedStandby) {
+  Preserved_trx_carrier_listing listing;
+  listing.snapshot_tokens.insert("standby-token");
+  listing.external_blob_tokens.insert("standby-token");
+  listing.temp_sidecar_tokens.insert("standby-token");
+  listing.standby_pending_tokens.insert("standby-token");
+  listing.promotion_adopted_tokens.insert("standby-token");
+
+  const Preserved_trx_carrier_listing local_listing =
+      preserved_trx_local_crash_abandon_listing(listing);
+
+  EXPECT_EQ(1U, local_listing.snapshot_tokens.count("standby-token"));
+  EXPECT_EQ(1U, local_listing.external_blob_tokens.count("standby-token"));
+  EXPECT_EQ(1U, local_listing.temp_sidecar_tokens.count("standby-token"));
+}
+
 TEST(PreservedTrxPromotion, AdoptedEpochMarkerRoundTripsAndRejectsCorruption) {
   Preserve_trx_promotion_adopted_epoch_marker marker;
   marker.epoch_id = "epoch-1";
@@ -2298,6 +2333,28 @@ class Transfer_frame_sink_factory_guard {
 
   ~Transfer_frame_sink_factory_guard() {
     preserve_trx_transfer_set_frame_sink_factory_for_unit_test(nullptr);
+  }
+};
+
+bool test_transfer_codec_context_provider(
+    Preserved_trx_codec_context *context) {
+  if (context == nullptr) return false;
+  std::fill(context->hmac_key.begin(), context->hmac_key.end(), 0x5a);
+  std::fill(context->datadir_fingerprint.begin(),
+            context->datadir_fingerprint.end(), 0x7b);
+  context->server_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  return true;
+}
+
+class Transfer_codec_context_guard {
+ public:
+  Transfer_codec_context_guard() {
+    preserve_trx_transfer_set_codec_context_provider_for_unit_test(
+        test_transfer_codec_context_provider);
+  }
+
+  ~Transfer_codec_context_guard() {
+    preserve_trx_transfer_set_codec_context_provider_for_unit_test(nullptr);
   }
 };
 
@@ -3568,6 +3625,7 @@ TEST_F(PreserveSnapshotTest, PromotionRejectsEpochFactTokenSetMismatch) {
 }
 
 TEST_F(PreserveSnapshotTest, PromotionEpochCommitMarkerSatisfiesGate) {
+  Transfer_codec_context_guard codec_guard;
   preserve_trx_set_enable_value(true);
   const uint64_t transfer_token = 922;
   Preserve_snapshot_metadata meta = metadata();
@@ -3657,6 +3715,7 @@ TEST_F(PreserveSnapshotTest, PromotionEpochCommitMarkerSatisfiesGate) {
 }
 
 TEST_F(PreserveSnapshotTest, PromotionRejectsReadyCacheFactDigestDrift) {
+  Transfer_codec_context_guard codec_guard;
   preserve_trx_set_enable_value(true);
   const uint64_t transfer_token = 926;
   Preserve_snapshot_metadata meta = metadata();
@@ -4022,6 +4081,126 @@ TEST_F(PreserveSnapshotTest,
   const std::set<std::string> recoverable_tokens =
       preserved_trx_local_recoverable_snapshot_tokens(listing);
   EXPECT_EQ(1U, recoverable_tokens.count(meta.token));
+
+  preserved_trx_set_promotion_adopt_executor_for_unit_test(nullptr);
+  preserved_trx_promotion_ready_cache_clear_for_unit_test();
+  preserve_trx_set_enable_value(true);
+}
+
+TEST_F(PreserveSnapshotTest,
+       PromotionExecuteAdoptFailsClosedWhenFinalIntentCannotBeRewritten) {
+  preserve_trx_set_enable_value(true);
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = "922";
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_snapshot_metadata written_metadata;
+  Preserved_trx_bundle durable_bundle = bundle;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            store.write_standby_pending(std::move(durable_bundle), 300,
+                                        &written_metadata));
+
+  preserved_trx_promotion_ready_cache_clear_for_unit_test();
+  preserved_trx_promotion_ready_cache_put_bundle_for_unit_test(
+      m_dir, "epoch-1", 922, Preserve_trx_promotion_ready_state::READY, 0,
+      bundle);
+  preserved_trx_set_promotion_adopt_executor_for_unit_test(
+      promotion_adopt_success_for_test);
+
+  Preserve_trx_promotion_adopt_all_request request;
+  request.epoch_id = "epoch-1";
+  request.tokens.push_back(922);
+  request.require_epoch_committed = false;
+  request.require_apply_barrier = false;
+  request.require_promotion_ready_cache = true;
+  request.execute_adopt = true;
+
+  DBUG_SET("+d,preserve_trx_fail_write_final_promotion_intent_epoch");
+  Preserve_trx_promotion_adopt_result result;
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS,
+            preserved_trx_adopt_standby_pending_all_for_promotion(
+                m_dir, request, &result));
+  DBUG_SET("-d,preserve_trx_fail_write_final_promotion_intent_epoch");
+
+  EXPECT_EQ(0U, result.adopted_count);
+  EXPECT_EQ(1U, result.abandoned_count);
+  ASSERT_EQ(1U, result.token_results.size());
+  EXPECT_EQ(922U, result.token_results[0].token);
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::CLEANUP_TAINTED,
+            result.token_results[0].status);
+  EXPECT_EQ(Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED,
+            result.token_results[0].cleanup_state);
+  EXPECT_NE(std::string::npos,
+            result.message.find("promotion intent marker not durable"));
+
+  MY_STAT stat_area;
+  EXPECT_EQ(nullptr,
+            my_stat((m_dir + "epoch-1.promotion_adopted").c_str(), &stat_area,
+                    MYF(0)));
+
+  preserved_trx_set_promotion_adopt_executor_for_unit_test(nullptr);
+  preserved_trx_promotion_ready_cache_clear_for_unit_test();
+  preserve_trx_set_enable_value(true);
+}
+
+TEST_F(PreserveSnapshotTest,
+       PromotionExecuteAdoptFailsClosedWhenAdoptedMarkerCannotBeWritten) {
+  preserve_trx_set_enable_value(true);
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = "923";
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_snapshot_metadata written_metadata;
+  Preserved_trx_bundle durable_bundle = bundle;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            store.write_standby_pending(std::move(durable_bundle), 300,
+                                        &written_metadata));
+
+  preserved_trx_promotion_ready_cache_clear_for_unit_test();
+  preserved_trx_promotion_ready_cache_put_bundle_for_unit_test(
+      m_dir, "epoch-1", 923, Preserve_trx_promotion_ready_state::READY, 0,
+      bundle);
+  preserved_trx_set_promotion_adopt_executor_for_unit_test(
+      promotion_adopt_success_for_test);
+
+  ASSERT_EQ(0, my_mkdir((m_dir + "epoch-1.promotion_adopted").c_str(), 0700,
+                        MYF(0)));
+
+  Preserve_trx_promotion_adopt_all_request request;
+  request.epoch_id = "epoch-1";
+  request.tokens.push_back(923);
+  request.require_epoch_committed = false;
+  request.require_apply_barrier = false;
+  request.require_promotion_ready_cache = true;
+  request.execute_adopt = true;
+
+  Preserve_trx_promotion_adopt_result result;
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS,
+            preserved_trx_adopt_standby_pending_all_for_promotion(
+                m_dir, request, &result));
+
+  EXPECT_EQ(0U, result.adopted_count);
+  EXPECT_EQ(1U, result.abandoned_count);
+  ASSERT_EQ(1U, result.token_results.size());
+  EXPECT_EQ(923U, result.token_results[0].token);
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::CLEANUP_TAINTED,
+            result.token_results[0].status);
+  EXPECT_EQ(Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED,
+            result.token_results[0].cleanup_state);
+  EXPECT_NE(std::string::npos,
+            result.message.find("promotion adopted marker not durable"));
 
   preserved_trx_set_promotion_adopt_executor_for_unit_test(nullptr);
   preserved_trx_promotion_ready_cache_clear_for_unit_test();
@@ -7175,6 +7354,7 @@ TEST(PreservedTrxTransfer, FrameCodecRejectsFieldsForWrongFrameType) {
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverApplyFramesPublishesStandbyPendingToken) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 101;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -7286,6 +7466,7 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest, TransferReceiverFrameRequiresMainPreserveEnable) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 102;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -7333,6 +7514,7 @@ TEST_F(PreserveSnapshotTest, TransferReceiverFrameRequiresMainPreserveEnable) {
 }
 
 TEST_F(PreserveSnapshotTest, TransferReceiverBeginRejectsInflightBudget) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 102;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -7380,6 +7562,7 @@ TEST_F(PreserveSnapshotTest, TransferReceiverBeginRejectsInflightBudget) {
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverBeginRejectsEpochInflightBudget) {
+  Transfer_codec_context_guard codec_guard;
   auto build_begin = [&](uint64_t transfer_token,
                          Preserve_trx_transfer_frame *begin,
                          uint64_t *inflight_bytes) {
@@ -7447,6 +7630,7 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest, TransferReceiverBeginRejectsEmptyRootDir) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 105;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -7490,6 +7674,7 @@ TEST_F(PreserveSnapshotTest, TransferReceiverBeginRejectsEmptyRootDir) {
 }
 
 TEST_F(PreserveSnapshotTest, TransferReceiverAbortRemovesStagedTokenFiles) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 106;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -7591,6 +7776,7 @@ TEST_F(PreserveSnapshotTest, TransferReceiverAbortRemovesStagedTokenFiles) {
 }
 
 TEST_F(PreserveSnapshotTest, TransferReceiverCorruptFrameRemovesStagedTokenFiles) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 107;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -7687,6 +7873,7 @@ TEST_F(PreserveSnapshotTest, TransferReceiverCorruptFrameRemovesStagedTokenFiles
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverHandlePayloadDecodesAndAppliesFrames) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 108;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -7774,6 +7961,7 @@ TEST_F(PreserveSnapshotTest,
 
 TEST_F(PreserveSnapshotTest,
        TransferSourceFrameSequenceChunksAndPublishesThroughReceiver) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 109;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -8157,7 +8345,22 @@ TEST_F(PreserveSnapshotTest, TransferReceiverSnapshotPayloadRejectsAmbiguousSet)
   EXPECT_EQ("unchanged", payload);
 }
 
+TEST_F(PreserveSnapshotTest,
+       TransferPortableBundleRequiresConfiguredCodecContext) {
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  std::string payload("unchanged");
+  EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED,
+            preserve_trx_transfer_encode_portable_bundle(bundle, &payload));
+  EXPECT_EQ("unchanged", payload);
+}
+
 TEST_F(PreserveSnapshotTest, TransferPortableBundleRoundTripsMetadata) {
+  Transfer_codec_context_guard codec_guard;
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = metadata();
@@ -8320,6 +8523,7 @@ TEST_F(PreserveSnapshotTest, TransferReceiverPublishWritesStandbyPendingBundle) 
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverPublishDecodesPortableStagedSnapshot) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 117;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -8372,6 +8576,7 @@ TEST_F(PreserveSnapshotTest,
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverPublishHydratesExternalBlobFromStaging) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 118;
   Mysql_binlog_preserve_snapshot snapshot;
   snapshot.cache_payload = "portable-binlog-cache";
@@ -8443,6 +8648,7 @@ TEST_F(PreserveSnapshotTest,
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverPublishFromStagingMarksRegistrySavedOnline) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 110;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -8482,6 +8688,7 @@ TEST_F(PreserveSnapshotTest,
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverPublishFromStagingMarksRegistryCorruptOnFailure) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 111;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -8515,6 +8722,7 @@ TEST_F(PreserveSnapshotTest,
 
 TEST_F(PreserveSnapshotTest,
        TransferBuildsPortableObjectsFromBundleForReceiverPublish) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t source_thread_token = 987654321ULL;
   Mysql_binlog_preserve_snapshot snapshot;
   snapshot.cache_payload = "portable-object-binlog-cache";
@@ -8574,6 +8782,7 @@ TEST_F(PreserveSnapshotTest,
 
 TEST_F(PreserveSnapshotTest,
        TransferBuildsPortableManifestFromExplicitTransferToken) {
+  Transfer_codec_context_guard codec_guard;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = "random-local-token";
   Preserved_trx_bundle bundle;
@@ -8594,6 +8803,7 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest, TransferCommitEpochRequiresPublishedStandbyToken) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 112;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -8632,6 +8842,7 @@ TEST_F(PreserveSnapshotTest, TransferCommitEpochRequiresPublishedStandbyToken) {
 }
 
 TEST_F(PreserveSnapshotTest, TransferCommitEpochRejectsCorruptMarker) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 113;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -8672,6 +8883,7 @@ TEST_F(PreserveSnapshotTest, TransferCommitEpochRejectsCorruptMarker) {
 
 TEST_F(PreserveSnapshotTest,
        TransferSourceEncodedFrameSequenceFeedsReceiverPayloadHandler) {
+  Transfer_codec_context_guard codec_guard;
   Mysql_binlog_preserve_snapshot snapshot;
   snapshot.cache_payload = "portable-encoded-frame-binlog-cache";
   snapshot.gtid_next = "AUTOMATIC";
@@ -8725,6 +8937,7 @@ TEST_F(PreserveSnapshotTest,
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverCommitRequiresExplicitObjectSealFrame) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 115;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -8778,6 +8991,7 @@ TEST_F(PreserveSnapshotTest,
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverCommitWaitsForEveryTokenInEpoch) {
+  Transfer_codec_context_guard codec_guard;
   auto build_bundle = [&](uint64_t transfer_token, Preserved_trx_bundle *bundle,
                           Preserve_trx_transfer_manifest *manifest,
                           std::vector<Preserve_trx_transfer_object_payload>
@@ -8911,6 +9125,7 @@ class Transfer_receiver_payload_test_sink final
 };
 
 TEST_F(PreserveSnapshotTest, TransferSourceSendsBundleThroughFrameSink) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 401;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -8948,6 +9163,7 @@ TEST_F(PreserveSnapshotTest, TransferSourceSendsBundleThroughFrameSink) {
 
 TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSenderCommitsOnlyAfterAllTokensSealed) {
+  Transfer_codec_context_guard codec_guard;
   auto build_bundle = [&](uint64_t transfer_token) {
     Preserve_snapshot_metadata meta = metadata();
     meta.token = test_transfer_token_string(transfer_token);
@@ -9012,6 +9228,7 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest, TransferReceiverCommitEpochPublishesEverySealedToken) {
+  Transfer_codec_context_guard codec_guard;
   auto build_bundle = [&](uint64_t transfer_token, Preserved_trx_bundle *bundle,
                           Preserve_trx_transfer_manifest *manifest,
                           std::vector<Preserve_trx_transfer_object_payload>
@@ -9165,6 +9382,7 @@ TEST_F(PreserveSnapshotTest, TransferReceiverCommitEpochPublishesEverySealedToke
 }
 
 TEST_F(PreserveSnapshotTest, TransferSourceRejectsBundleOverInflightBudget) {
+  Transfer_codec_context_guard codec_guard;
   Mysql_binlog_preserve_snapshot snapshot;
   snapshot.cache_payload.assign(128, 'x');
   snapshot.gtid_next = "AUTOMATIC";
@@ -9192,6 +9410,7 @@ TEST_F(PreserveSnapshotTest, TransferSourceRejectsBundleOverInflightBudget) {
 }
 
 TEST_F(PreserveSnapshotTest, TransferSourceSendsAbortAfterFrameSendFailure) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 802;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -9218,6 +9437,7 @@ TEST_F(PreserveSnapshotTest, TransferSourceSendsAbortAfterFrameSendFailure) {
 }
 
 TEST_F(PreserveSnapshotTest, TransferSourceUsesConfiguredDataSessionForChunks) {
+  Transfer_codec_context_guard codec_guard;
   Mysql_binlog_preserve_snapshot snapshot;
   snapshot.cache_payload.assign(128, 'x');
   snapshot.gtid_next = "AUTOMATIC";
@@ -9258,6 +9478,7 @@ TEST_F(PreserveSnapshotTest, TransferSourceUsesConfiguredDataSessionForChunks) {
 }
 
 TEST_F(PreserveSnapshotTest, TransferArtifactSinkPublishesThroughFrameSink) {
+  Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 601;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
