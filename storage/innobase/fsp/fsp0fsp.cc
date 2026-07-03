@@ -2498,6 +2498,49 @@ funct_exit:
 }
 
 #ifndef UNIV_HOTBACKUP
+/** Make a reserved preserved temporary-table page visible to the FSP extent
+descriptor layer before exact-page adoption tries to claim it. A restarted
+system temporary tablespace can be physically extendable while its FSP free
+limit still stops below a preserved no-redo undo page. Native adoption must
+advance the ordinary FSP metadata first; otherwise xdes_get_descriptor() would
+correctly report that the page has no initialized descriptor yet.
+@param[in,out]	space	Tablespace
+@param[in,out]	header	Tablespace header
+@param[in]	page_no	Exact reserved page to claim
+@param[in,out]	mtr	Mini-transaction
+@return true if the page is covered by initialized FSP metadata */
+static bool fsp_prepare_reserved_temp_page_for_claim(fil_space_t *space,
+                                                     fsp_header_t *header,
+                                                     page_no_t page_no,
+                                                     mtr_t *mtr) {
+  ut_ad(space != nullptr);
+  ut_ad(header != nullptr);
+  ut_ad(mtr != nullptr);
+  ut_ad(fsp_is_system_temporary(space->id));
+  ut_d(fsp_space_modify_check(space->id, mtr));
+
+  for (;;) {
+    const page_no_t size = mach_read_from_4(header + FSP_SIZE);
+    const page_no_t limit = mach_read_from_4(header + FSP_FREE_LIMIT);
+
+    ut_ad(size == space->size_in_header);
+    ut_ad(limit == space->free_limit ||
+          (space->free_limit == 0 && space->purpose == FIL_TYPE_TEMPORARY));
+
+    if (page_no < size && page_no < limit) {
+      return true;
+    }
+
+    const page_no_t old_size = space->size_in_header;
+    const page_no_t old_limit = space->free_limit;
+    fsp_fill_free_list(false, space, header, mtr);
+
+    if (old_size == space->size_in_header && old_limit == space->free_limit) {
+      return false;
+    }
+  }
+}
+
 /** Claim one exact page that was reserved for preserved temporary-table resume.
 The caller must already have created or located the file segment inode. The
 reservation is released only while the tablespace latch is held, immediately
@@ -2519,9 +2562,13 @@ static buf_block_t *fseg_claim_reserved_page_for_temp_preserve(
   mtr_x_lock_space(space, mtr);
 
   fsp_header_t *header = fsp_get_space_header(space->id, page_size, mtr);
+  if (!fsp_prepare_reserved_temp_page_for_claim(space, header, page_no, mtr)) {
+    return nullptr;
+  }
+
   xdes_t *descr = xdes_get_descriptor(space->id, page_no, page_size, mtr);
-  if (descr == nullptr ||
-      !xdes_mtr_get_bit(descr, XDES_FREE_BIT, page_no % FSP_EXTENT_SIZE, mtr)) {
+  if (descr == nullptr) return nullptr;
+  if (!xdes_mtr_get_bit(descr, XDES_FREE_BIT, page_no % FSP_EXTENT_SIZE, mtr)) {
     return nullptr;
   }
 
@@ -2531,9 +2578,7 @@ static buf_block_t *fseg_claim_reserved_page_for_temp_preserve(
   }
 
   const ulint frag_slot = fseg_find_free_frag_page_slot(inode, mtr);
-  if (frag_slot == ULINT_UNDEFINED) {
-    return nullptr;
-  }
+  if (frag_slot == ULINT_UNDEFINED) return nullptr;
 
   trx_preserve_temp_space_image_release_page_reservation(
       static_cast<uint32_t>(space->id), static_cast<uint32_t>(page_no));

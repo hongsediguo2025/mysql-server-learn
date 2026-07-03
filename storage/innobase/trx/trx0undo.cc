@@ -234,9 +234,9 @@ static trx_undo_rec_t *trx_undo_get_next_rec_from_next_page(
     }
   }
 
-  next_page_no = flst_get_next_addr(
-                     undo_page + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_NODE, mtr)
-                     .page;
+  const flst_node_t *page_node =
+      undo_page + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_NODE;
+  next_page_no = flst_get_next_addr(page_node, mtr).page;
   if (next_page_no == FIL_NULL) {
     return (nullptr);
   }
@@ -271,7 +271,6 @@ trx_undo_rec_t *trx_undo_get_next_rec(
   }
 
   space = page_get_space_id(page_align(rec));
-
   bool found;
   const page_size_t &page_size = fil_space_get_page_size(space, &found);
 
@@ -1498,6 +1497,7 @@ static trx_undo_t *trx_undo_mem_create(trx_rseg_t *rseg, ulint id, ulint type,
   undo->dict_operation = FALSE;
   undo->flag = 0;
   undo->preserve_restored_no_redo_undo = false;
+  undo->preserve_no_redo_undo_disable_cache = false;
   undo->gtid_allocated = false;
 
   undo->rseg = rseg;
@@ -1536,6 +1536,7 @@ static void trx_undo_mem_init_for_reuse(
   undo->dict_operation = FALSE;
   undo->flag = 0;
   undo->preserve_restored_no_redo_undo = false;
+  undo->preserve_no_redo_undo_disable_cache = false;
   undo->gtid_allocated = false;
 
   undo->hdr_offset = offset;
@@ -1547,9 +1548,10 @@ bool trx_undo_preserve_magic_no_redo_should_skip_history(
   return undo != nullptr && undo->preserve_restored_no_redo_undo;
 }
 
-static bool trx_undo_preserve_magic_no_redo_should_skip_cache(
+bool trx_undo_preserve_magic_no_redo_should_skip_cache(
     const trx_undo_t *undo) {
-  return trx_undo_preserve_magic_no_redo_should_skip_history(undo);
+  return trx_undo_preserve_magic_no_redo_should_skip_history(undo) ||
+         (undo != nullptr && undo->preserve_no_redo_undo_disable_cache);
 }
 
 /** Frees an undo log memory copy. */
@@ -2000,12 +2002,29 @@ void trx_undo_update_cleanup(trx_t *trx, trx_undo_ptr_t *undo_ptr,
 
   ut_ad(mutex_own(&(rseg->mutex)));
 
-  if (trx_undo_preserve_magic_no_redo_should_skip_cache(undo)) {
+  if (trx_undo_preserve_magic_no_redo_should_skip_history(undo)) {
     UT_LIST_REMOVE(rseg->update_undo_list, undo);
     undo_ptr->update_undo = nullptr;
     trx_undo_temp_preserve_release_slot_if_reserved(rseg, undo->id);
     trx_undo_mem_free(undo);
     return;
+  }
+
+  const bool skip_cache =
+      trx_undo_preserve_magic_no_redo_should_skip_cache(undo);
+
+  /*
+    Native-owned preserved no-redo undo must be released through the normal
+    history-list machinery so the adopted file segment is not left as an active
+    rollback segment. The record payload was restored from a temp-table sidecar,
+    however, and can contain page/list shapes that are valid for rollback and
+    post-resume DML but unsafe for background purge to re-parse record by record.
+    Temporary tables are session-private, so commit only needs the segment to
+    become reclaimable; it does not need delete-mark purge visibility for other
+    transactions.
+  */
+  if (undo->preserve_no_redo_undo_disable_cache) {
+    undo->del_marks = false;
   }
 
   trx_purge_add_update_undo_to_history(
@@ -2016,7 +2035,7 @@ void trx_undo_update_cleanup(trx_t *trx, trx_undo_ptr_t *undo_ptr,
 
   undo_ptr->update_undo = nullptr;
 
-  if (undo->state == TRX_UNDO_CACHED) {
+  if (!skip_cache && undo->state == TRX_UNDO_CACHED) {
     UT_LIST_ADD_FIRST(rseg->update_undo_cached, undo);
 
     MONITOR_INC(MONITOR_NUM_UNDO_SLOT_CACHED);
@@ -2048,10 +2067,13 @@ void trx_undo_insert_cleanup(trx_undo_ptr_t *undo_ptr, bool noredo) {
   UT_LIST_REMOVE(rseg->insert_undo_list, undo);
   undo_ptr->insert_undo = nullptr;
 
-  if (trx_undo_preserve_magic_no_redo_should_skip_cache(undo)) {
+  const bool skip_cache =
+      trx_undo_preserve_magic_no_redo_should_skip_cache(undo);
+
+  if (trx_undo_preserve_magic_no_redo_should_skip_history(undo)) {
     trx_undo_temp_preserve_release_slot_if_reserved(rseg, undo->id);
     trx_undo_mem_free(undo);
-  } else if (undo->state == TRX_UNDO_CACHED) {
+  } else if (!skip_cache && undo->state == TRX_UNDO_CACHED) {
     UT_LIST_ADD_FIRST(rseg->insert_undo_cached, undo);
     trx_undo_temp_preserve_release_slot_if_reserved(rseg, undo->id);
 
@@ -2104,7 +2126,7 @@ void trx_undo_free_trx_with_prepared_or_active_logs(trx_t *trx,
 
     UT_LIST_REMOVE(trx->rsegs.m_noredo.rseg->update_undo_list,
                    trx->rsegs.m_noredo.update_undo);
-    if (trx_undo_preserve_magic_no_redo_should_skip_cache(
+    if (trx_undo_preserve_magic_no_redo_should_skip_history(
             trx->rsegs.m_noredo.update_undo)) {
       trx_preserve_temp_space_image_release_no_redo_undo_slot(
           static_cast<uint32_t>(trx->rsegs.m_noredo.rseg->space_id),
@@ -2121,7 +2143,7 @@ void trx_undo_free_trx_with_prepared_or_active_logs(trx_t *trx,
 
     UT_LIST_REMOVE(trx->rsegs.m_noredo.rseg->insert_undo_list,
                    trx->rsegs.m_noredo.insert_undo);
-    if (trx_undo_preserve_magic_no_redo_should_skip_cache(
+    if (trx_undo_preserve_magic_no_redo_should_skip_history(
             trx->rsegs.m_noredo.insert_undo)) {
       trx_preserve_temp_space_image_release_no_redo_undo_slot(
           static_cast<uint32_t>(trx->rsegs.m_noredo.rseg->space_id),

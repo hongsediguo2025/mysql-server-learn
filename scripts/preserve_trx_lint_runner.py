@@ -36,6 +36,8 @@ LEGACY_LINT_RULE_IDS: Sequence[str] = (
     "code_review_resumable_trx_slices_lint",
     "mdl_duplicate_backup_failclosed_standard_xa_lint",
     "preserve_mdl_privilege_all_namespaces_lint",
+    "preserve_crash_abandon_contract_lint",
+    "preserve_review_fix_contract_lint",
     "readview_low_limit_system_floor_lint",
     "temp_table_resume_materialize_partial_failure_cleanup_matrix_lint",
     "temp_table_sidecar_already_exists_preserves_durable_lint",

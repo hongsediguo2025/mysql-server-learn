@@ -530,6 +530,11 @@ const trx_preserve_temp_no_redo_undo_log_anchor *
 trx_preserve_temp_space_image_no_redo_update_undo_anchor(
     const trx_preserve_temp_space_image_descriptor &descriptor);
 
+bool trx_preserve_temp_space_image_no_redo_undo_page_claim_slot(
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    const trx_preserve_temp_no_redo_undo_page_image &page,
+    uint32_t *undo_slot, bool *claim_page);
+
 /*
   Native-owned reconnect is allowed only after this step has made the restored
   no-redo undo anchors visible in the live temporary rollback-segment header.
@@ -610,6 +615,9 @@ void trx_preserve_temp_space_image_set_stage_admission_closed_for_test(
 bool trx_preserve_temp_no_redo_undo_skip_history_for_test(bool restored);
 
 bool trx_preserve_temp_no_redo_undo_reconnect_mode_skips_history_for_test(
+    bool restored_only);
+
+bool trx_preserve_temp_no_redo_undo_reconnect_mode_skips_cache_for_test(
     bool restored_only);
 
 size_t trx_preserve_temp_space_image_dirty_page_count(

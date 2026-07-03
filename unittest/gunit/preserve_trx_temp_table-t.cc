@@ -718,7 +718,7 @@ TEST(TempResumeMaterializerContractTest,
   const std::string cache_guard_body =
       extract_function_body_after_signature_for_temp_table_test(
           undo_impl,
-          "static bool trx_undo_preserve_magic_no_redo_should_skip_cache(");
+          "bool trx_undo_preserve_magic_no_redo_should_skip_cache(");
   ASSERT_FALSE(cache_guard_body.empty());
   const std::string history_guard_body =
       extract_function_body_after_signature_for_temp_table_test(

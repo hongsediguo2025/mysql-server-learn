@@ -33,11 +33,14 @@
 #include <utility>
 #include <vector>
 
+#include "my_dir.h"
 #include "my_inttypes.h"
 #include "my_systime.h"
+#include "my_sys.h"
 #include "sha2.h"
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_carrier.h"
+#include "sql/preserve_trx_transfer.h"
 #include "storage/innobase/include/trx0preserve.h"
 
 namespace {
@@ -71,6 +74,8 @@ struct Promotion_ready_cache_entry {
   Preserve_trx_promotion_ready_state state{
       Preserve_trx_promotion_ready_state::NOT_FOUND};
   uint64_t required_apply_lsn{0};
+  bool has_epoch_fact{false};
+  std::array<unsigned char, kPromotionDigestBytes> epoch_fact_digest{};
   bool has_ready_bundle{false};
   Preserved_trx_bundle ready_bundle;
 };
@@ -137,6 +142,28 @@ bool ready_cache_lookup(const std::string &preserve_dir,
   if (found == g_ready_cache.end()) return false;
   if (entry != nullptr) *entry = found->second;
   return true;
+}
+
+std::string promotion_epoch_fact_path(const std::string &preserve_dir,
+                                      const std::string &epoch_id) {
+  constexpr char kPathSeparator = '/';
+  std::string root = preserve_dir;
+  if (!root.empty() && root.back() != kPathSeparator) {
+    root.push_back(kPathSeparator);
+  }
+  root.append(".transfer");
+  root.push_back(kPathSeparator);
+  root.append(epoch_id);
+  root.push_back(kPathSeparator);
+  root.append("epoch.fact");
+  return root;
+}
+
+bool promotion_epoch_fact_file_exists(const std::string &preserve_dir,
+                                      const std::string &epoch_id) {
+  MY_STAT stat_area;
+  return my_stat(promotion_epoch_fact_path(preserve_dir, epoch_id).c_str(),
+                 &stat_area, MYF(0)) != nullptr;
 }
 
 bool promotion_adopt_ready_bundle_default(
@@ -719,10 +746,10 @@ void write_adopted_marker_for_tokens(
   }
 }
 
-bool write_intent_marker_for_tokens(
+bool write_intent_marker(
     Preserved_trx_store *store,
     const Preserve_trx_promotion_adopt_all_request &request,
-    const std::vector<uint64_t> &tokens,
+    const std::vector<Preserve_trx_promotion_intent_token> &tokens,
     Preserve_trx_promotion_adopt_result *result) {
   if (store == nullptr || result == nullptr || tokens.empty()) return false;
 
@@ -732,11 +759,7 @@ bool write_intent_marker_for_tokens(
   marker.target_server_uuid = "local-promotion-target";
   marker.required_apply_lsn = request.required_apply_lsn;
   marker.generated_at_us = my_micro_time();
-  for (uint64_t token : tokens) {
-    marker.tokens.push_back(
-        {token, Preserve_trx_promotion_intent_state::ADOPTING,
-         Preserve_trx_promotion_cleanup_state::NONE, "adopting"});
-  }
+  marker.tokens = tokens;
 
   std::string encoded;
   const uint64_t marker_started_us = my_micro_time();
@@ -755,6 +778,61 @@ bool write_intent_marker_for_tokens(
     return false;
   }
   return true;
+}
+
+bool write_intent_marker_for_tokens(
+    Preserved_trx_store *store,
+    const Preserve_trx_promotion_adopt_all_request &request,
+    const std::vector<uint64_t> &tokens,
+    Preserve_trx_promotion_adopt_result *result) {
+  std::vector<Preserve_trx_promotion_intent_token> intent_tokens;
+  intent_tokens.reserve(tokens.size());
+  for (uint64_t token : tokens) {
+    intent_tokens.push_back(
+        {token, Preserve_trx_promotion_intent_state::ADOPTING,
+         Preserve_trx_promotion_cleanup_state::NONE, "adopting"});
+  }
+  return write_intent_marker(store, request, intent_tokens, result);
+}
+
+Preserve_trx_promotion_intent_state intent_state_from_cleanup(
+    Preserve_trx_promotion_cleanup_state cleanup_state) {
+  switch (cleanup_state) {
+    case Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING:
+      return Preserve_trx_promotion_intent_state::CLEANUP_PENDING;
+    case Preserve_trx_promotion_cleanup_state::CLEANUP_ROLLED_BACK:
+      return Preserve_trx_promotion_intent_state::CLEANUP_ROLLED_BACK;
+    case Preserve_trx_promotion_cleanup_state::CLEANUP_NOT_FOUND:
+      return Preserve_trx_promotion_intent_state::CLEANUP_NOT_FOUND;
+    case Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED:
+      return Preserve_trx_promotion_intent_state::CLEANUP_TAINTED;
+    case Preserve_trx_promotion_cleanup_state::NONE:
+    case Preserve_trx_promotion_cleanup_state::NOT_CLAIMED:
+      return Preserve_trx_promotion_intent_state::ABANDONED;
+  }
+  return Preserve_trx_promotion_intent_state::CLEANUP_TAINTED;
+}
+
+bool write_final_intent_marker_for_result(
+    Preserved_trx_store *store,
+    const Preserve_trx_promotion_adopt_all_request &request,
+    const std::vector<uint64_t> &adopted_tokens,
+    Preserve_trx_promotion_adopt_result *result) {
+  if (result == nullptr) return false;
+  std::vector<Preserve_trx_promotion_intent_token> intent_tokens;
+  intent_tokens.reserve(adopted_tokens.size() + result->token_results.size());
+  for (uint64_t token : adopted_tokens) {
+    intent_tokens.push_back(
+        {token, Preserve_trx_promotion_intent_state::ADOPTED,
+         Preserve_trx_promotion_cleanup_state::NONE, "adopted"});
+  }
+  for (const Preserve_trx_promotion_token_result &token_result :
+       result->token_results) {
+    intent_tokens.push_back(
+        {token_result.token, intent_state_from_cleanup(token_result.cleanup_state),
+         token_result.cleanup_state, token_result.reason});
+  }
+  return write_intent_marker(store, request, intent_tokens, result);
 }
 
 }  // namespace
@@ -889,9 +967,56 @@ preserved_trx_promotion_prewarm_standby_pending_token(
     return carrier_status_to_promotion_status(read_status);
   }
 
-  preserved_trx_promotion_ready_cache_put_bundle_for_unit_test(
-      preserve_dir, epoch_id, token, Preserve_trx_promotion_ready_state::READY,
-      required_apply_lsn, bundle);
+  Promotion_ready_cache_entry entry;
+  entry.state = Preserve_trx_promotion_ready_state::READY;
+  entry.required_apply_lsn = required_apply_lsn;
+  entry.has_ready_bundle = true;
+  entry.ready_bundle = bundle;
+
+  /*
+    A ready record is a cache of facts that were checked before promotion.
+    When an epoch fact exists, bind the cache entry to its digest so the gate
+    can reject stale prewarm results if the durable epoch fact is rewritten.
+  */
+  if (promotion_epoch_fact_file_exists(preserve_dir, epoch_id)) {
+    Preserve_trx_transfer_epoch_fact fact;
+    const Preserve_trx_transfer_status fact_status =
+        preserve_trx_transfer_read_epoch_fact(preserve_dir, epoch_id, &fact);
+    if (fact_status == Preserve_trx_transfer_status::OK) {
+      bool token_found = false;
+      for (const Preserve_trx_transfer_epoch_fact_token &fact_token :
+           fact.tokens) {
+        if (fact_token.token == token) {
+          token_found = true;
+          break;
+        }
+      }
+      if (!token_found) {
+        entry.state = Preserve_trx_promotion_ready_state::CORRUPT;
+        entry.has_ready_bundle = false;
+        std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+        g_ready_cache
+            [Promotion_ready_cache_key{preserve_dir, epoch_id, token}] =
+                std::move(entry);
+        return Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT;
+      }
+      entry.has_epoch_fact = true;
+      entry.epoch_fact_digest = fact.fact_digest;
+    } else {
+      entry.state = Preserve_trx_promotion_ready_state::CORRUPT;
+      entry.has_ready_bundle = false;
+      std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+      g_ready_cache[Promotion_ready_cache_key{preserve_dir, epoch_id, token}] =
+          std::move(entry);
+      return Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT;
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+    g_ready_cache[Promotion_ready_cache_key{preserve_dir, epoch_id, token}] =
+        std::move(entry);
+  }
   return Preserve_trx_promotion_adopt_status::OK;
 }
 
@@ -976,6 +1101,11 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
                   started_us);
     return result->status;
   }
+  if (request.execute_adopt && !request.require_promotion_ready_cache) {
+    finish_result(result, Preserve_trx_promotion_adopt_status::INVALID_ARGUMENT,
+                  started_us);
+    return result->status;
+  }
   for (uint64_t token : request.tokens) {
     if (token == 0) {
       result->failed_count = 1;
@@ -995,6 +1125,10 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
   std::vector<uint64_t> adopted_tokens;
   auto finish_with_optional_abandoned_marker =
       [&](Preserve_trx_promotion_adopt_status status) {
+        if (request.execute_adopt) {
+          write_final_intent_marker_for_result(&store.store(), request,
+                                               adopted_tokens, result);
+        }
         if (!adopted_tokens.empty()) {
           write_adopted_marker_for_tokens(&store.store(), request,
                                           adopted_tokens, result);
@@ -1069,16 +1203,55 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
     return result->status;
   }
 
+  bool epoch_fact_verified = false;
+  std::array<unsigned char, kPromotionDigestBytes> epoch_fact_digest{};
   if (request.require_epoch_committed) {
-    for (uint64_t token : result->seen_tokens) {
-      add_abandoned_token(
-          result, token,
-          Preserve_trx_promotion_adopt_status::EPOCH_NOT_COMMITTED,
-          "promotion epoch commit marker not found",
-          Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING);
+    if (!preserve_trx_transfer_epoch_committed(preserve_dir,
+                                               request.epoch_id)) {
+      for (uint64_t token : result->seen_tokens) {
+        add_abandoned_token(
+            result, token,
+            Preserve_trx_promotion_adopt_status::EPOCH_NOT_COMMITTED,
+            "promotion epoch commit marker not found",
+            Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING);
+      }
+      return finish_with_optional_abandoned_marker(
+          Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS);
     }
-    return finish_with_optional_abandoned_marker(
-        Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS);
+    Preserve_trx_transfer_epoch_fact fact;
+    const Preserve_trx_transfer_status fact_status =
+        preserve_trx_transfer_read_epoch_fact(preserve_dir, request.epoch_id,
+                                              &fact);
+    if (fact_status != Preserve_trx_transfer_status::OK) {
+      for (uint64_t token : result->seen_tokens) {
+        add_abandoned_token(
+            result, token,
+            Preserve_trx_promotion_adopt_status::EPOCH_NOT_COMMITTED,
+            "promotion epoch transfer fact not readable",
+            Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING);
+      }
+      return finish_with_optional_abandoned_marker(
+          Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS);
+    }
+    std::set<uint64_t> fact_tokens;
+    for (const Preserve_trx_transfer_epoch_fact_token &token : fact.tokens) {
+      fact_tokens.insert(token.token);
+    }
+    for (uint64_t token : result->seen_tokens) {
+      if (fact_tokens.count(token) == 0) {
+        add_abandoned_token(
+            result, token,
+            Preserve_trx_promotion_adopt_status::EPOCH_NOT_COMMITTED,
+            "promotion epoch transfer fact does not contain token",
+            Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING);
+      }
+    }
+    if (result->abandoned_count > 0) {
+      return finish_with_optional_abandoned_marker(
+          Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS);
+    }
+    epoch_fact_verified = true;
+    epoch_fact_digest = fact.fact_digest;
   }
   if (request.require_apply_barrier) {
     uint64_t effective_required_apply_lsn = request.required_apply_lsn;
@@ -1127,6 +1300,16 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
       if (ready_cache_lookup(preserve_dir, request.epoch_id, token,
                              &cache_entry) &&
           cache_entry.state == Preserve_trx_promotion_ready_state::READY) {
+        if (request.require_epoch_committed &&
+            (!epoch_fact_verified || !cache_entry.has_epoch_fact ||
+             cache_entry.epoch_fact_digest != epoch_fact_digest)) {
+          add_abandoned_token(
+              result, token,
+              Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+              "promotion-ready cache does not match durable epoch fact",
+              Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING);
+          continue;
+        }
         if (request.execute_adopt) {
           if (!cache_entry.has_ready_bundle) {
             add_abandoned_token(
@@ -1249,8 +1432,11 @@ preserved_trx_cleanup_abandoned_standby_promotion_epoch(
       token.reason = "prepared trx rolled back";
     } else if (rollback_status == DB_NOT_FOUND) {
       token.cleanup_state =
-          Preserve_trx_promotion_cleanup_state::CLEANUP_NOT_FOUND;
-      token.reason = "prepared trx not found";
+          Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING;
+      token.reason =
+          "prepared trx not found; cleanup remains pending until terminal "
+          "absence is proven";
+      ++result->cleanup_pending_count;
     } else {
       token.cleanup_state =
           Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED;

@@ -264,6 +264,12 @@ not be linked to the generic update undo history.
 bool trx_undo_preserve_magic_no_redo_should_skip_history(
     const trx_undo_t *undo);
 
+/** Checks whether a preserved no-redo undo log must not be cached for reuse.
+@param[in] undo  undo log memory copy
+@return true if cache reuse must be skipped */
+bool trx_undo_preserve_magic_no_redo_should_skip_cache(
+    const trx_undo_t *undo);
+
 /** Adds the update undo log header as the first in the history list, and
  frees the memory object, or puts it to the list of cached update undo log
  segments.
@@ -391,6 +397,11 @@ struct trx_undo_t {
       false}; /*!< true iff this no-redo undo object was restored from a
                  preserved temporary-table sidecar image and must not be linked
                  to normal history/cache lists. */
+  bool preserve_no_redo_undo_disable_cache{
+      false}; /*!< true iff this preserved no-redo undo object must not be cached
+                 for reuse after transaction finish. Native-owned preserved undo
+                 still enters history/purge, but is not reused before purge has
+                 released the adopted file segment. */
 
   /** Set if space for GTID is allocated. */
   bool gtid_allocated;

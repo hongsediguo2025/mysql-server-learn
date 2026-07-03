@@ -374,74 +374,6 @@ Preserved_temp_table_undo_descriptor undo_descriptor_from_image_descriptor(
   return undo;
 }
 
-bool no_redo_undo_anchor_names_page(
-    const trx_preserve_temp_no_redo_undo_log_anchor *anchor,
-    uint32_t page_no) {
-  return anchor != nullptr && anchor->present &&
-         (page_no == anchor->hdr_page_no || page_no == anchor->last_page_no ||
-          page_no == anchor->top_page_no);
-}
-
-bool no_redo_undo_descriptor_first_slot(
-    const trx_preserve_temp_space_image_descriptor &descriptor,
-    uint32_t *undo_slot) {
-  if (undo_slot == nullptr) return false;
-  const trx_preserve_temp_no_redo_undo_log_anchor *insert_anchor =
-      trx_preserve_temp_space_image_no_redo_insert_undo_anchor(descriptor);
-  if (insert_anchor != nullptr && insert_anchor->present) {
-    *undo_slot = insert_anchor->undo_slot;
-    return true;
-  }
-  const trx_preserve_temp_no_redo_undo_log_anchor *update_anchor =
-      trx_preserve_temp_space_image_no_redo_update_undo_anchor(descriptor);
-  if (update_anchor != nullptr && update_anchor->present) {
-    *undo_slot = update_anchor->undo_slot;
-    return true;
-  }
-  return false;
-}
-
-bool no_redo_undo_descriptor_slot_for_page(
-    const trx_preserve_temp_space_image_descriptor &descriptor,
-    const trx_preserve_temp_no_redo_undo_page_image &page,
-    uint32_t *undo_slot) {
-  if (undo_slot == nullptr) return false;
-
-  switch (page.kind) {
-    case trx_preserve_temp_no_redo_undo_page_kind::RSEG_HEADER:
-    case trx_preserve_temp_no_redo_undo_page_kind::RSEG_ALLOCATOR:
-      return no_redo_undo_descriptor_first_slot(descriptor, undo_slot);
-    case trx_preserve_temp_no_redo_undo_page_kind::UNDO_HEADER:
-    case trx_preserve_temp_no_redo_undo_page_kind::UNDO_LOG:
-      break;
-  }
-
-  const trx_preserve_temp_no_redo_undo_log_anchor *insert_anchor =
-      trx_preserve_temp_space_image_no_redo_insert_undo_anchor(descriptor);
-  const trx_preserve_temp_no_redo_undo_log_anchor *update_anchor =
-      trx_preserve_temp_space_image_no_redo_update_undo_anchor(descriptor);
-  const bool insert_present =
-      insert_anchor != nullptr && insert_anchor->present;
-  const bool update_present =
-      update_anchor != nullptr && update_anchor->present;
-  if (insert_present != update_present) {
-    *undo_slot =
-        insert_present ? insert_anchor->undo_slot : update_anchor->undo_slot;
-    return true;
-  }
-
-  const bool insert_names_page =
-      no_redo_undo_anchor_names_page(insert_anchor, page.page_no);
-  const bool update_names_page =
-      no_redo_undo_anchor_names_page(update_anchor, page.page_no);
-  if (insert_names_page == update_names_page) {
-    return false;
-  }
-  *undo_slot =
-      insert_names_page ? insert_anchor->undo_slot : update_anchor->undo_slot;
-  return true;
-}
-
 bool append_ownership_claims_from_descriptor_impl(
     const std::string &token, const Preserved_temp_table_undo_descriptor &undo,
     const trx_preserve_temp_space_image_descriptor &descriptor,
@@ -470,10 +402,12 @@ bool append_ownership_claims_from_descriptor_impl(
     if (page == nullptr || page->bytes.empty()) return false;
 
     uint32_t undo_slot = 0;
-    if (!no_redo_undo_descriptor_slot_for_page(descriptor, *page,
-                                               &undo_slot)) {
+    bool claim_page = false;
+    if (!trx_preserve_temp_space_image_no_redo_undo_page_claim_slot(
+            descriptor, *page, &undo_slot, &claim_page)) {
       return false;
     }
+    if (!claim_page) continue;
 
     Preserved_temp_table_ownership_claim claim;
     claim.token = token;

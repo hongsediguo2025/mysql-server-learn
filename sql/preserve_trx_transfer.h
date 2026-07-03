@@ -141,6 +141,22 @@ struct Preserve_trx_transfer_manifest {
   std::vector<Preserve_trx_transfer_object_descriptor> objects;
 };
 
+struct Preserve_trx_transfer_epoch_fact_token {
+  uint64_t token{0};
+  uint64_t source_prepare_lsn{0};
+  uint64_t source_epoch_commit_lsn{0};
+  std::array<unsigned char, kPreservedTrxSha256Length> manifest_digest{};
+  std::vector<Preserve_trx_transfer_object_descriptor> objects;
+};
+
+struct Preserve_trx_transfer_epoch_fact {
+  std::string epoch_id;
+  std::string source_server_uuid;
+  std::string target_server_uuid;
+  std::vector<Preserve_trx_transfer_epoch_fact_token> tokens;
+  std::array<unsigned char, kPreservedTrxSha256Length> fact_digest{};
+};
+
 struct Preserve_trx_transfer_frame {
   /*
     One classic-protocol transfer frame. BEGIN carries a complete encoded
@@ -229,6 +245,12 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_manifest(
 
 Preserve_trx_transfer_status preserve_trx_transfer_decode_manifest(
     const std::string &encoded, Preserve_trx_transfer_manifest *manifest);
+
+Preserve_trx_transfer_status preserve_trx_transfer_encode_epoch_fact(
+    const Preserve_trx_transfer_epoch_fact &fact, std::string *encoded);
+
+Preserve_trx_transfer_status preserve_trx_transfer_decode_epoch_fact(
+    const std::string &encoded, Preserve_trx_transfer_epoch_fact *fact);
 
 Preserve_trx_transfer_status preserve_trx_transfer_encode_frame(
     const Preserve_trx_transfer_frame &frame, std::string *encoded);
@@ -376,6 +398,13 @@ Preserve_trx_transfer_status preserve_trx_transfer_commit_epoch(
 bool preserve_trx_transfer_epoch_committed(
     const std::string &root_dir,
     const Preserve_trx_transfer_manifest &manifest);
+
+bool preserve_trx_transfer_epoch_committed(const std::string &root_dir,
+                                           const std::string &epoch_id);
+
+Preserve_trx_transfer_status preserve_trx_transfer_read_epoch_fact(
+    const std::string &root_dir, const std::string &epoch_id,
+    Preserve_trx_transfer_epoch_fact *fact);
 
 Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
     const std::string &root_dir, const Preserve_trx_transfer_frame &frame,

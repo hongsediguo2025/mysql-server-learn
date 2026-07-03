@@ -310,6 +310,7 @@ Preserve_snapshot_status Preserved_trx_store::write_standby_pending(
     bool *durable_snapshot_may_exist,
     Preserve_snapshot_delete_status *write_failure_delete_status,
     Preserved_trx_store_write_stats *write_stats) {
+  if (!preserve_trx_is_enabled()) return Preserve_snapshot_status::UNSUPPORTED;
   return write_impl(std::move(bundle), timeout_seconds, written_metadata,
                     durable_snapshot_may_exist, write_failure_delete_status,
                     write_stats, true);
