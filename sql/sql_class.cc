@@ -937,7 +937,8 @@ void THD::cleanup(void) {
       connection is gone. Log the error and continue.
     */
     if (MDL_context_backup_manager::instance().create_backup(
-            &mdl_context, xs->get_xid()->key(), xs->get_xid()->key_length())) {
+            &mdl_context, xs->get_xid()->key(), xs->get_xid()->key_length(),
+            MDL_context_backup_manager::MDL_context_backup_policy::STANDARD_XA)) {
       LogErr(ERROR_LEVEL, ER_XA_CANT_CREATE_MDL_BACKUP);
     }
     transaction_cache_detach(trn_ctx);

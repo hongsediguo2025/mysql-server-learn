@@ -154,7 +154,8 @@ bool MDL_context_backup_manager::check_key_exist(
 
 bool MDL_context_backup_manager::create_backup(const MDL_context *context,
                                                const uchar *key,
-                                               const size_t keylen) {
+                                               const size_t keylen,
+                                               MDL_context_backup_policy policy) {
   DBUG_TRACE;
 
   bool result = false;
@@ -167,7 +168,8 @@ bool MDL_context_backup_manager::create_backup(const MDL_context *context,
       In other words, it mustn't be present any element for specified xid
       when this method called. Check that this invariant is satisfied.
     */
-    if (check_key_exist(key_obj)) return true;
+    if (check_key_exist(key_obj))
+      return policy == MDL_context_backup_policy::PRESERVE_STRICT;
 
     std::unique_ptr<MDL_context_backup> element(new (std::nothrow)
                                                     MDL_context_backup());
@@ -234,7 +236,8 @@ bool MDL_context_backup_manager::create_backup(MDL_request_list *mdl_requests,
 
 bool MDL_context_backup_manager::restore_backup(MDL_context *mdl_context,
                                                 const uchar *key,
-                                                const size_t keylen) {
+                                                const size_t keylen,
+                                                MDL_context_backup_policy policy) {
   bool res = false;
   MDL_context_backup *element;
   DBUG_TRACE;
@@ -246,7 +249,7 @@ bool MDL_context_backup_manager::restore_backup(MDL_context *mdl_context,
     element = result->second.get();
     res = mdl_context->clone_tickets(element->get_context(), MDL_TRANSACTION);
   } else {
-    res = true;
+    res = policy == MDL_context_backup_policy::PRESERVE_STRICT;
   }
 
   return res;

@@ -565,7 +565,8 @@ static bool acquire_mandatory_metadata_locks(THD *thd, xid_t *external_xid) {
   */
 
   if (MDL_context_backup_manager::instance().restore_backup(
-          &thd->mdl_context, external_xid->key(), external_xid->key_length())) {
+          &thd->mdl_context, external_xid->key(), external_xid->key_length(),
+          MDL_context_backup_manager::MDL_context_backup_policy::STANDARD_XA)) {
     return true;
   }
 
@@ -1099,9 +1100,7 @@ bool Sql_cmd_xa_start::trans_xa_start(THD *thd) {
     my_error(ER_XAER_RMFAIL, MYF(0), xid_state->state_name());
   else if (thd->locked_tables_mode || thd->in_active_multi_stmt_transaction())
     my_error(ER_XAER_OUTSIDE, MYF(0));
-  else if (xid_is_preserve_magic(*m_xid) &&
-           (preserve_trx_is_enabled() ||
-            preserve_trx_magic_xid_has_snapshot(*m_xid)))
+  else if (preserve_trx_magic_xid_should_be_protected(*m_xid))
     my_error(ER_XAER_INVAL, MYF(0));
   else if (!trans_begin(thd)) {
     xid_state->start_normal_xa(m_xid);
@@ -1181,9 +1180,7 @@ bool Sql_cmd_xa_prepare::trans_xa_prepare(THD *thd) {
   XID_STATE *xid_state = thd->get_transaction()->xid_state();
   DBUG_TRACE;
 
-  if (xid_is_preserve_magic(*m_xid) &&
-      (preserve_trx_is_enabled() ||
-       preserve_trx_magic_xid_has_snapshot(*m_xid)))
+  if (preserve_trx_magic_xid_should_be_protected(*m_xid))
     my_error(ER_XAER_INVAL, MYF(0));
   else if (!xid_state->has_state(XID_STATE::XA_IDLE))
     my_error(ER_XAER_RMFAIL, MYF(0), xid_state->state_name());
@@ -1674,7 +1671,8 @@ bool applier_reset_xa_trans(THD *thd) {
   */
   if (MDL_context_backup_manager::instance().create_backup(
           &thd->mdl_context, xid_state->get_xid()->key(),
-          xid_state->get_xid()->key_length())) {
+          xid_state->get_xid()->key_length(),
+          MDL_context_backup_manager::MDL_context_backup_policy::STANDARD_XA)) {
     LogErr(ERROR_LEVEL, ER_XA_CANT_CREATE_MDL_BACKUP);
   }
   /*

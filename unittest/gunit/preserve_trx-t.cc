@@ -1007,7 +1007,7 @@ TEST_F(PreservedTrxCommandRead, TimeoutsWhenTargetStateCannotDrainWithinHardLimi
 }
 
 TEST_F(PreservedTrxCommandRead,
-       DisabledFeaturePreservesNativeCommandReadIdleState) {
+       DisabledFeatureMatchesNativeCommandReadIdleState) {
   THD *target = thd();
   target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
 
@@ -1019,8 +1019,64 @@ TEST_F(PreservedTrxCommandRead,
   EXPECT_FALSE(target->m_server_idle);
 
   target->m_server_idle = true;
-  EXPECT_FALSE(preserved_trx_end_idle_for_command_packet(target));
-  EXPECT_TRUE(target->m_server_idle);
+  EXPECT_TRUE(preserved_trx_end_idle_for_command_packet(target));
+  EXPECT_FALSE(target->m_server_idle);
+}
+
+static XID preserve_magic_xid_for_test(const char *token) {
+  XID xid;
+  xid.set(PRESERVE_TRX_XID_FORMAT_ID, PRESERVE_TRX_XID_GTRID,
+          PRESERVE_TRX_XID_GTRID_LENGTH, token,
+          static_cast<long>(std::strlen(token)));
+  return xid;
+}
+
+class PreserveMagicXidPolicy : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    m_saved_enable = preserve_trx_enable;
+    m_saved_policy = preserve_trx_off_artifact_policy;
+  }
+
+  void TearDown() override {
+    preserve_trx_off_artifact_policy = m_saved_policy;
+    preserve_trx_set_enable_value(m_saved_enable);
+  }
+
+ private:
+  bool m_saved_enable{false};
+  ulong m_saved_policy{PRESERVE_TRX_OFF_ARTIFACT_POLICY_FAIL_IF_PRESENT};
+};
+
+TEST_F(PreserveMagicXidPolicy, EnabledFeatureProtectsMagicXid) {
+  preserve_trx_set_enable_value(true);
+  preserve_trx_off_artifact_policy = PRESERVE_TRX_OFF_ARTIFACT_POLICY_IGNORE;
+
+  const XID xid = preserve_magic_xid_for_test("policy_enabled");
+  EXPECT_TRUE(preserve_trx_magic_xid_should_be_protected(xid));
+  EXPECT_TRUE(trx_preserve_xid_should_be_protected(xid));
+}
+
+TEST_F(PreserveMagicXidPolicy, IgnoreDoesNotProtectMagicXid) {
+  preserve_trx_set_enable_value(false);
+  preserve_trx_off_artifact_policy = PRESERVE_TRX_OFF_ARTIFACT_POLICY_IGNORE;
+
+  const XID xid = preserve_magic_xid_for_test("policy_ignore");
+  EXPECT_FALSE(preserve_trx_magic_xid_should_be_protected(xid));
+  EXPECT_FALSE(trx_preserve_xid_should_be_protected(xid));
+}
+
+TEST_F(PreserveMagicXidPolicy, OffPoliciesRequireBackedArtifact) {
+  preserve_trx_set_enable_value(false);
+  const XID xid = preserve_magic_xid_for_test("policy_missing_token");
+
+  preserve_trx_off_artifact_policy =
+      PRESERVE_TRX_OFF_ARTIFACT_POLICY_FAIL_IF_PRESENT;
+  EXPECT_FALSE(preserve_trx_magic_xid_should_be_protected(xid));
+  preserve_trx_off_artifact_policy = PRESERVE_TRX_OFF_ARTIFACT_POLICY_RECOVER;
+  EXPECT_FALSE(preserve_trx_magic_xid_should_be_protected(xid));
+  preserve_trx_off_artifact_policy = PRESERVE_TRX_OFF_ARTIFACT_POLICY_ABANDON;
+  EXPECT_FALSE(preserve_trx_magic_xid_should_be_protected(xid));
 }
 
 TEST_F(PreservedTrxCommandRead,
@@ -2545,7 +2601,23 @@ TEST(PreservedTrxTransfer, ReceiverRegistryRecordsCorruptAndAbortReasons) {
   EXPECT_EQ("client disconnect", record.last_error);
 }
 
-TEST(PreservedTrxMdlBackup, MissingBackupRestoreFailsClosed) {
+TEST(PreservedTrxMdlBackup, StandardXaMissingBackupNoops) {
+  ASSERT_FALSE(MDL_context_backup_manager::init());
+
+  PreserveTrxMdlContextOwner owner;
+  MDL_context context;
+  context.init(&owner);
+
+  const uchar key[] = "missing-standard-xa-mdl";
+  EXPECT_FALSE(MDL_context_backup_manager::instance().restore_backup(
+      &context, key, sizeof(key) - 1,
+      MDL_context_backup_manager::MDL_context_backup_policy::STANDARD_XA));
+
+  context.destroy();
+  MDL_context_backup_manager::destroy();
+}
+
+TEST(PreservedTrxMdlBackup, PreserveStrictMissingBackupFailsClosed) {
   ASSERT_FALSE(MDL_context_backup_manager::init());
 
   PreserveTrxMdlContextOwner owner;
@@ -2554,7 +2626,8 @@ TEST(PreservedTrxMdlBackup, MissingBackupRestoreFailsClosed) {
 
   const uchar key[] = "missing-preserved-mdl";
   EXPECT_TRUE(MDL_context_backup_manager::instance().restore_backup(
-      &context, key, sizeof(key) - 1));
+      &context, key, sizeof(key) - 1,
+      MDL_context_backup_manager::MDL_context_backup_policy::PRESERVE_STRICT));
 
   context.destroy();
   MDL_context_backup_manager::destroy();
@@ -2569,9 +2642,11 @@ TEST(PreservedTrxMdlBackup, DuplicateSessionBackupFailsClosed) {
 
   const uchar key[] = "duplicate-preserved-mdl";
   EXPECT_FALSE(MDL_context_backup_manager::instance().create_backup(
-      &context, key, sizeof(key) - 1));
+      &context, key, sizeof(key) - 1,
+      MDL_context_backup_manager::MDL_context_backup_policy::PRESERVE_STRICT));
   EXPECT_TRUE(MDL_context_backup_manager::instance().create_backup(
-      &context, key, sizeof(key) - 1));
+      &context, key, sizeof(key) - 1,
+      MDL_context_backup_manager::MDL_context_backup_policy::PRESERVE_STRICT));
 
   MDL_context_backup_manager::instance().delete_backup(key, sizeof(key) - 1);
   context.destroy();
@@ -4676,6 +4751,62 @@ TEST_F(PreserveSnapshotTest, PromotionCleanupAbandonedMarksMissingPreparedTrx) {
   ASSERT_EQ(1U, decoded.tokens.size());
   EXPECT_EQ(Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING,
             decoded.tokens[0].cleanup_state);
+  preserve_trx_set_enable_value(true);
+}
+
+TEST_F(PreserveSnapshotTest,
+       PromotionCleanupMarksNotFoundOnlyAfterTerminalAbsenceProof) {
+  preserve_trx_set_enable_value(true);
+  Preserve_trx_promotion_abandoned_epoch_marker marker;
+  marker.epoch_id = "epoch-1";
+  marker.source_server_uuid = "source-uuid";
+  marker.target_server_uuid = "target-uuid";
+  marker.applied_lsn = 250;
+  marker.generated_at_us = 1;
+  Preserve_trx_promotion_token_result abandoned;
+  abandoned.token = 919;
+  abandoned.status = Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY;
+  abandoned.claimed = false;
+  abandoned.cleanup_state =
+      Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING;
+  abandoned.reason = "promotion-ready cache not built";
+  marker.tokens.push_back(abandoned);
+
+  std::string encoded;
+  ASSERT_TRUE(
+      preserved_trx_encode_promotion_abandoned_epoch_marker(marker, &encoded));
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            store.write_promotion_abandoned_epoch("epoch-1", encoded));
+
+  Preserve_trx_promotion_adopt_result result;
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::OK,
+            preserved_trx_cleanup_abandoned_standby_promotion_epoch(
+                m_dir, "epoch-1", &result));
+  ASSERT_EQ(1U, result.token_results.size());
+  EXPECT_EQ(Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING,
+            result.token_results[0].cleanup_state);
+
+  preserved_trx_set_recovery_complete_for_unit_test(true);
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::OK,
+            preserved_trx_cleanup_abandoned_standby_promotion_epoch(
+                m_dir, "epoch-1", &result));
+  ASSERT_EQ(1U, result.token_results.size());
+  EXPECT_EQ(Preserve_trx_promotion_cleanup_state::CLEANUP_NOT_FOUND,
+            result.token_results[0].cleanup_state);
+  EXPECT_EQ(0U, result.cleanup_pending_count);
+
+  std::string rewritten;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            store.read_promotion_abandoned_epoch("epoch-1", &rewritten));
+  Preserve_trx_promotion_abandoned_epoch_marker decoded;
+  ASSERT_TRUE(preserved_trx_decode_promotion_abandoned_epoch_marker(
+      rewritten, &decoded));
+  ASSERT_EQ(1U, decoded.tokens.size());
+  EXPECT_EQ(Preserve_trx_promotion_cleanup_state::CLEANUP_NOT_FOUND,
+            decoded.tokens[0].cleanup_state);
+  preserved_trx_set_recovery_complete_for_unit_test(false);
   preserve_trx_set_enable_value(true);
 }
 
@@ -9092,6 +9223,116 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_TRUE(
       registry.lookup(first_manifest.epoch_id, first_manifest.token, &record));
   EXPECT_EQ(Preserve_trx_transfer_receiver_state::RECEIVING, record.state);
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverCommitFailureDoesNotLeavePartialStandbyPending) {
+  Transfer_codec_context_guard codec_guard;
+  auto build_bundle = [&](uint64_t transfer_token, Preserved_trx_bundle *bundle,
+                          Preserve_trx_transfer_manifest *manifest,
+                          std::vector<Preserve_trx_transfer_object_payload>
+                              *objects) {
+    Preserve_snapshot_metadata meta = metadata();
+    meta.token = test_transfer_token_string(transfer_token);
+    Preserved_trx_bundle_build_input input;
+    input.metadata = meta;
+    ASSERT_EQ(Preserve_snapshot_status::OK,
+              build_preserved_trx_bundle(input, bundle));
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_build_portable_objects(
+                  "epoch-partial-publish", "source-uuid", "target-uuid",
+                  *bundle, transfer_token, manifest, objects));
+  };
+
+  Preserved_trx_bundle first_bundle;
+  Preserve_trx_transfer_manifest first_manifest;
+  std::vector<Preserve_trx_transfer_object_payload> first_objects;
+  build_bundle(203, &first_bundle, &first_manifest, &first_objects);
+
+  Preserved_trx_bundle second_bundle;
+  Preserve_trx_transfer_manifest second_manifest;
+  std::vector<Preserve_trx_transfer_object_payload> second_objects;
+  build_bundle(204, &second_bundle, &second_manifest, &second_objects);
+
+  auto begin_frame = [](const Preserve_trx_transfer_manifest &manifest) {
+    std::string manifest_payload;
+    EXPECT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_encode_manifest(manifest,
+                                                    &manifest_payload));
+    Preserve_trx_transfer_frame begin;
+    begin.type = Preserve_trx_transfer_frame_type::BEGIN;
+    begin.sequence = 1;
+    begin.epoch_id = manifest.epoch_id;
+    begin.token = manifest.token;
+    begin.manifest_payload = manifest_payload;
+    return begin;
+  };
+  auto stage_objects =
+      [&](const Preserve_trx_transfer_manifest &manifest,
+          const std::vector<Preserve_trx_transfer_object_payload> &objects,
+          Preserve_trx_transfer_receiver_registry *registry,
+          Preserved_trx_store *store) {
+        for (const Preserve_trx_transfer_object_payload &object : objects) {
+          Preserve_trx_transfer_frame chunk;
+          chunk.type = Preserve_trx_transfer_frame_type::OBJECT_CHUNK;
+          chunk.sequence = 2;
+          chunk.epoch_id = manifest.epoch_id;
+          chunk.token = manifest.token;
+          chunk.object_id = object.descriptor.object_id;
+          chunk.chunk_payload = object.payload;
+          ASSERT_EQ(Preserve_trx_transfer_status::OK,
+                    preserve_trx_transfer_apply_receiver_frame(
+                        m_dir, chunk, store, registry, 300, nullptr));
+
+          Preserve_trx_transfer_frame seal;
+          seal.type = Preserve_trx_transfer_frame_type::SEAL_OBJECT;
+          seal.sequence = 3;
+          seal.epoch_id = manifest.epoch_id;
+          seal.token = manifest.token;
+          seal.object_id = object.descriptor.object_id;
+          ASSERT_EQ(Preserve_trx_transfer_status::OK,
+                    preserve_trx_transfer_apply_receiver_frame(
+                        m_dir, seal, store, registry, 300, nullptr));
+        }
+      };
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, begin_frame(first_manifest), &store, &registry, 300,
+                nullptr));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, begin_frame(second_manifest), &store, &registry, 300,
+                nullptr));
+  stage_objects(first_manifest, first_objects, &registry, &store);
+  stage_objects(second_manifest, second_objects, &registry, &store);
+
+  write_file(m_dir + test_transfer_token_string(second_manifest.token) + ".bin",
+             "pre-existing snapshot");
+
+  Preserve_trx_transfer_frame commit;
+  commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
+  commit.sequence = 4;
+  commit.epoch_id = first_manifest.epoch_id;
+  commit.token = first_manifest.token;
+  EXPECT_NE(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, commit, &store, &registry, 300, nullptr));
+
+  Preserved_trx_carrier_token_state first_state;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(test_transfer_token_string(first_manifest.token),
+                                &first_state));
+  EXPECT_FALSE(first_state.snapshot);
+  EXPECT_FALSE(first_state.standby_pending);
+  EXPECT_FALSE(preserve_trx_transfer_epoch_committed(m_dir, first_manifest));
 }
 
 class Transfer_receiver_payload_test_sink final

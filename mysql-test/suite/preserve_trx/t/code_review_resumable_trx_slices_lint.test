@@ -77,9 +77,12 @@ my $temp_table_carrier_path = File::Spec->catfile(
   $source_root, 'sql', 'preserve_trx_temp_table_carrier.cc');
 my $mdl_context_backup_path = File::Spec->catfile(
   $source_root, 'sql', 'mdl_context_backup.cc');
+my $mdl_context_backup_header_path = File::Spec->catfile(
+  $source_root, 'sql', 'mdl_context_backup.h');
 my $drain_path = File::Spec->catfile($source_root, 'sql',
                                      'preserve_trx_drain.cc');
 my $handler_path = File::Spec->catfile($source_root, 'sql', 'handler.cc');
+my $xa_path = File::Spec->catfile($source_root, 'sql', 'xa.cc');
 my $gunit_path = File::Spec->catfile($source_root, 'unittest', 'gunit',
                                      'preserve_trx-t.cc');
 my $sql_parse_path = File::Spec->catfile($source_root, 'sql', 'sql_parse.cc');
@@ -121,8 +124,10 @@ my $bundle_doc = read_optional_source($bundle_doc_path);
 my $temp_table = read_source($temp_table_path);
 my $temp_table_carrier = read_source($temp_table_carrier_path);
 my $mdl_context_backup = read_source($mdl_context_backup_path);
+my $mdl_context_backup_header = read_source($mdl_context_backup_header_path);
 my $drain = read_source($drain_path);
 my $handler = read_source($handler_path);
+my $xa = read_source($xa_path);
 my $gunit = read_source($gunit_path);
 my $sql_parse = read_source($sql_parse_path);
 my $sys_vars = read_source($sys_vars_path);
@@ -138,6 +143,12 @@ die "standby transfer portable bundle codec must not use a production hard-coded
   if $transfer =~ /std::fill\s*\([^;]*datadir_fingerprint[^;]*0x72[^;]*\)/s;
 die "standby transfer portable bundle codec must not use a production zero server uuid\n"
   if $transfer =~ /server_uuid\s*=\s*"00000000-0000-0000-0000-000000000000"/s;
+die "standby transfer commit marker publication must not truncate an existing temp file\n"
+  if $transfer =~
+     /write_commit_marker_file[\s\S]*my_create\s*\([^;]*O_WRONLY\s*\|\s*O_TRUNC[^;]*\)/s;
+die "standby transfer epoch fact publication must not truncate an existing temp file\n"
+  if $transfer =~
+     /write_epoch_fact_file[\s\S]*my_create\s*\([^;]*O_WRONLY\s*\|\s*O_TRUNC[^;]*\)/s;
 
 $lock_preserve =~ /static bool lock_preserve_page_identity_matches[\s\S]*?^}/m
   or die "could not isolate lock_preserve_page_identity_matches\n";
@@ -211,8 +222,23 @@ $mdl_context_backup =~
   /bool MDL_context_backup_manager::create_backup\(const MDL_context \*context[\s\S]*?^}/m
   or die "could not isolate session MDL create_backup overload\n";
 my $session_mdl_backup = $&;
-die "duplicate session MDL backup must fail closed instead of reporting success\n"
-  unless $session_mdl_backup =~ /if\s*\(\s*check_key_exist\s*\(\s*key_obj\s*\)\s*\)\s*return\s+true\s*;/s;
+die "session MDL backup must expose an explicit preserve-strict duplicate policy\n"
+  unless $mdl_context_backup_header =~
+         /enum\s+class\s+MDL_context_backup_policy/s &&
+         $mdl_context_backup_header =~ /PRESERVE_STRICT/s &&
+         $session_mdl_backup =~ /MDL_context_backup_policy\s+policy/s &&
+         $session_mdl_backup =~ /policy\s*==\s*MDL_context_backup_policy::PRESERVE_STRICT/s;
+die "ordinary XA MDL restore must use the standard no-op-on-missing backup policy\n"
+  unless $xa =~ /restore_backup\s*\([^;]*MDL_context_backup_policy::STANDARD_XA/s;
+die "preserve MDL restore must use the preserve-strict backup policy\n"
+  unless $preserve =~ /restore_backup\s*\([^;]*MDL_context_backup_policy::PRESERVE_STRICT/s;
+die "OFF artifact policy sysvar must exist and default to FAIL_IF_PRESENT\n"
+  unless $preserve_header =~ /preserve_trx_off_artifact_policy/s &&
+         $sys_vars =~ /preserve_trx_off_artifact_policy/s &&
+         $sys_vars =~ /FAIL_IF_PRESENT/s;
+die "magic XID checks must route through the policy-aware protection helper\n"
+  unless $trx_preserve =~ /trx_preserve_xid_should_be_protected/s &&
+         $ha_innodb =~ /trx_preserve_xid_should_be_protected/s;
 
 $binlog =~ /bool mysql_binlog_preserve_export[\s\S]*?^}/m
   or die "could not isolate mysql_binlog_preserve_export\n";
@@ -302,7 +328,7 @@ $trx =~ /static trx_t \*trx_resurrect_insert[\s\S]*?^}/m
 my $trx_resurrect_insert = $&;
 die "force recovery must keep preserve magic XA transactions prepared\n"
   unless $trx_resurrect_insert =~
-         /preserve_magic_xid\s*=\s*trx_preserve_xid_is_magic_active[\s\S]*srv_force_recovery\s*==\s*0\s*\|\|\s*preserve_magic_xid/s &&
+         /preserve_magic_xid\s*=\s*trx_preserve_xid_should_be_protected[\s\S]*srv_force_recovery\s*==\s*0\s*\|\|\s*preserve_magic_xid/s &&
          $trx_resurrect_insert =~ /\+\+trx_sys->n_prepared_trx/s;
 
 $carrier_file =~ /Preserved_trx_carrier_status read_file_limited[\s\S]*?^}/m
@@ -1299,6 +1325,13 @@ die "successful live PRESERVE token delivery must emit an audit event\n"
 die "batch preserve target success must emit an audit event\n"
   unless $preserve =~
          /batch_delivery[\s\S]*?audit_preserved_trx_event\s*\(\s*thd\s*,\s*token\s*,\s*"preserve"\s*,\s*"success"\s*\)/s;
+$preserve =~ /std::atomic<bool>\s+worker_init_failed[\s\S]*?for\s*\(std::thread\s+&worker\s*:\s*workers\)/m
+  or die "could not isolate parallel preserve worker pool\n";
+my $parallel_preserve_worker_pool = $&;
+die "parallel preserve worker must catch exceptions and still call my_thread_end\n"
+  unless $parallel_preserve_worker_pool =~ /try\s*\{/s &&
+         $parallel_preserve_worker_pool =~ /catch\s*\(/s &&
+         $parallel_preserve_worker_pool =~ /my_thread_end\s*\(\s*\)/s;
 die "manager state and drain owner must be published as one packed snapshot\n"
   unless $preserve =~ /std::atomic<uint64_t>\s+g_manager_state_owner/s &&
          $preserve =~ /preserve_trx_manager_state_owner_snapshot/s;
@@ -1685,6 +1718,8 @@ die "standby transfer receiver dispatch must require PRESERVE_TRX_TRANSFER_ADMIN
          $transfer_dispatch_command =~ /has_global_grant/s &&
          index($transfer_dispatch_command, 'has_global_grant') <
          index($transfer_dispatch_command, 'preserve_trx_transfer_handle_receiver_payload');
+die "standby transfer receiver dispatch must not require source-side preserve_trx_transfer_enable\n"
+  if $transfer_dispatch_command =~ /!preserve_trx_transfer_enable/s;
 die "standby transfer production source client must stay explicitly fail-closed until the credential resolver is implemented\n"
   unless $transfer =~
          /default_transfer_client_connect[\s\S]*credential-name resolver[\s\S]*UNSUPPORTED/s &&

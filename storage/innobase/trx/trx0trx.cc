@@ -820,7 +820,7 @@ static trx_t *trx_resurrect_insert(
                                << " was in the XA prepared state.";
 
       const bool preserve_magic_xid =
-          trx_preserve_xid_is_magic_active(*trx->xid);
+          trx_preserve_xid_should_be_protected(*trx->xid);
 
       if (srv_force_recovery == 0 || preserve_magic_xid) {
         if (srv_force_recovery > 0) {
@@ -1834,7 +1834,10 @@ static void trx_release_impl_and_expl_locks(trx_t *trx, bool serialized) {
       lock_rec_convert_impl_to_expl_for_trx() when deciding for the final time
       if we really want to create explicit lock on behalf of implicit lock
       holder. */
+  const trx_state_t old_state = trx->state;
   trx->state = TRX_STATE_COMMITTED_IN_MEMORY;
+  trx_preserve_note_rseg_owner_state_change(
+      trx, old_state, TRX_STATE_COMMITTED_IN_MEMORY);
   trx_mutex_exit(trx);
 
   if (trx_sys_latch_is_needed) {
@@ -2859,7 +2862,10 @@ static void trx_prepare(trx_t *trx) /*!< in/out: transaction */
   /*--------------------------------------*/
   ut_a(trx->state == TRX_STATE_ACTIVE);
   trx_sys_mutex_enter();
+  const trx_state_t old_state = trx->state;
   trx->state = TRX_STATE_PREPARED;
+  trx_preserve_note_rseg_owner_state_change(trx, old_state,
+                                            TRX_STATE_PREPARED);
   trx_sys->n_prepared_trx++;
   /* Add GTID to be persisted to disk table, if needed. */
   if (gtid_desc.m_is_set) {
@@ -3032,7 +3038,7 @@ int trx_recover_for_mysql(
     trx_sys->mutex. It may change to PREPARED, but not if
     trx->is_recovered. */
     if (trx_state_eq(trx, TRX_STATE_PREPARED) &&
-        !trx_preserve_xid_is_magic_active(*trx->xid)) {
+        !trx_preserve_xid_should_be_protected(*trx->xid)) {
       if (get_info_about_prepared_transaction(&txn_list[count], trx, mem_root))
         break;
 
@@ -3102,7 +3108,7 @@ static MY_ATTRIBUTE((warn_unused_result)) trx_t *trx_get_trx_by_xid_low(
 trx_t *trx_get_trx_by_xid(const XID *xid) {
   trx_t *trx;
 
-  if (xid == nullptr || trx_preserve_xid_is_magic_active(*xid)) {
+  if (xid == nullptr || trx_preserve_xid_should_be_protected(*xid)) {
     return (nullptr);
   }
 

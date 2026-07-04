@@ -684,6 +684,19 @@ page_no_t xdes_get_offset(const xdes_t *descr) /*!< in: extent descriptor */
               FSP_EXTENT_SIZE));
 }
 
+static bool fsp_extent_has_temp_preserve_page_reservation(space_id_t space_id,
+                                                          const xdes_t *descr) {
+  if (!fsp_temp_preserve_page_reservation_active(space_id)) return false;
+
+  const page_no_t extent_start = xdes_get_offset(descr);
+  for (page_no_t bit = 0; bit < FSP_EXTENT_SIZE; ++bit) {
+    if (fsp_temp_preserve_page_reserved(space_id, extent_start + bit)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /*
   Find a free fragment page while honoring preserved temp-page reservations.
   When no reservation is active this is the original xdes_find_bit() lookup.
@@ -758,6 +771,22 @@ static xdes_t *fsp_find_free_frag_for_temp_preserve(
   }
 
   return (nullptr);
+}
+
+static xdes_t *fsp_find_free_extent_for_temp_preserve(
+    space_id_t space_id, const page_size_t &page_size, fsp_header_t *header,
+    mtr_t *mtr) {
+  fil_addr_t node = flst_get_first(header + FSP_FREE, mtr);
+
+  while (!fil_addr_is_null(node)) {
+    xdes_t *descr = xdes_lst_get_descriptor(space_id, page_size, node, mtr);
+    if (!fsp_extent_has_temp_preserve_page_reservation(space_id, descr)) {
+      return descr;
+    }
+    node = flst_get_next_addr(descr + XDES_FLST_NODE, mtr);
+  }
+
+  return nullptr;
 }
 #endif /* !UNIV_HOTBACKUP */
 
@@ -1643,23 +1672,38 @@ static xdes_t *fsp_alloc_free_extent(space_id_t space_id,
     fil_block_check_type(desc_block, FIL_PAGE_TYPE_XDES, mtr);
   }
 
-  if (descr && (xdes_get_state(descr, mtr) == XDES_FREE)) {
+  if (descr && (xdes_get_state(descr, mtr) == XDES_FREE) &&
+      !fsp_extent_has_temp_preserve_page_reservation(space_id, descr)) {
     /* Ok, we can take this extent */
   } else {
     /* Take the first extent in the free list */
-    first = flst_get_first(header + FSP_FREE, mtr);
+    if (fsp_temp_preserve_page_reservation_active(space_id)) {
+      descr = fsp_find_free_extent_for_temp_preserve(space_id, page_size, header,
+                                                     mtr);
+    } else {
+      first = flst_get_first(header + FSP_FREE, mtr);
+      descr = fil_addr_is_null(first)
+                  ? nullptr
+                  : xdes_lst_get_descriptor(space_id, page_size, first, mtr);
+    }
 
-    if (fil_addr_is_null(first)) {
+    if (descr == nullptr) {
       fsp_fill_free_list(false, space, header, mtr);
 
-      first = flst_get_first(header + FSP_FREE, mtr);
+      if (fsp_temp_preserve_page_reservation_active(space_id)) {
+        descr = fsp_find_free_extent_for_temp_preserve(space_id, page_size,
+                                                       header, mtr);
+      } else {
+        first = flst_get_first(header + FSP_FREE, mtr);
+        descr = fil_addr_is_null(first)
+                    ? nullptr
+                    : xdes_lst_get_descriptor(space_id, page_size, first, mtr);
+      }
     }
 
-    if (fil_addr_is_null(first)) {
+    if (descr == nullptr) {
       return (nullptr); /* No free extents left */
     }
-
-    descr = xdes_lst_get_descriptor(space_id, page_size, first, mtr);
   }
 
   flst_remove(header + FSP_FREE, descr + XDES_FLST_NODE, mtr);
@@ -3090,6 +3134,7 @@ static buf_block_t *fseg_alloc_free_page_low(fil_space_t *space,
       (xdes_mtr_get_bit(descr, XDES_FREE_BIT, hint % FSP_EXTENT_SIZE, mtr) ==
        TRUE) &&
       !fsp_temp_preserve_page_reserved(space_id, hint)) {
+  take_hinted_page:
     /* 1. We can take the hinted page
     =================================*/
     ret_descr = descr;
@@ -3116,6 +3161,9 @@ static buf_block_t *fseg_alloc_free_page_low(fil_space_t *space,
     /* Try to fill the segment free list */
     fseg_fill_free_list(seg_inode, space_id, page_size, hint + FSP_EXTENT_SIZE,
                         mtr);
+    if (!fsp_temp_preserve_page_reservation_active(space_id)) {
+      goto take_hinted_page;
+    }
     const page_no_t free_bit = xdes_find_free_bit_for_temp_preserve(
         space_id, ret_descr, hint % FSP_EXTENT_SIZE, false, mtr);
     ret_page = free_bit == FIL_NULL ? FIL_NULL
@@ -3132,11 +3180,20 @@ static buf_block_t *fseg_alloc_free_page_low(fil_space_t *space,
     ========================================================
     highest page in it, depending on the direction
     ==============================================*/
-    const page_no_t free_bit = xdes_find_free_bit_for_temp_preserve(
-        space_id, ret_descr, direction == FSP_DOWN ? FSP_EXTENT_SIZE - 1 : 0,
-        direction == FSP_DOWN, mtr);
-    ret_page = free_bit == FIL_NULL ? FIL_NULL
-                                    : xdes_get_offset(ret_descr) + free_bit;
+    ret_page = xdes_get_offset(ret_descr);
+    if (!fsp_temp_preserve_page_reservation_active(space_id)) {
+      if (direction == FSP_DOWN) {
+        ret_page += FSP_EXTENT_SIZE - 1;
+      } else if (xdes_get_state(ret_descr, mtr) == XDES_FSEG_FRAG) {
+        ret_page += xdes_find_bit(ret_descr, XDES_FREE_BIT, TRUE, 0, mtr);
+      }
+    } else {
+      const page_no_t free_bit = xdes_find_free_bit_for_temp_preserve(
+          space_id, ret_descr, direction == FSP_DOWN ? FSP_EXTENT_SIZE - 1 : 0,
+          direction == FSP_DOWN, mtr);
+      ret_page = free_bit == FIL_NULL ? FIL_NULL
+                                      : xdes_get_offset(ret_descr) + free_bit;
+    }
 
     ut_ad(!has_done_reservation || ret_page != FIL_NULL);
     /*-----------------------------------------------------------*/
@@ -3149,8 +3206,12 @@ static buf_block_t *fseg_alloc_free_page_low(fil_space_t *space,
     segment)
     ========*/
     ret_descr = descr;
-    const page_no_t free_bit = xdes_find_free_bit_for_temp_preserve(
-        space_id, ret_descr, hint % FSP_EXTENT_SIZE, false, mtr);
+    const page_no_t free_bit =
+        fsp_temp_preserve_page_reservation_active(space_id)
+            ? xdes_find_free_bit_for_temp_preserve(
+                  space_id, ret_descr, hint % FSP_EXTENT_SIZE, false, mtr)
+            : xdes_find_bit(ret_descr, XDES_FREE_BIT, TRUE,
+                            hint % FSP_EXTENT_SIZE, mtr);
     ret_page = free_bit == FIL_NULL ? FIL_NULL
                                     : xdes_get_offset(ret_descr) + free_bit;
     ut_ad(!has_done_reservation || ret_page != FIL_NULL);
@@ -3170,8 +3231,11 @@ static buf_block_t *fseg_alloc_free_page_low(fil_space_t *space,
     }
 
     ret_descr = xdes_lst_get_descriptor(space_id, page_size, first, mtr);
-    const page_no_t free_bit = xdes_find_free_bit_for_temp_preserve(
-        space_id, ret_descr, 0, false, mtr);
+    const page_no_t free_bit =
+        fsp_temp_preserve_page_reservation_active(space_id)
+            ? xdes_find_free_bit_for_temp_preserve(space_id, ret_descr, 0,
+                                                   false, mtr)
+            : xdes_find_bit(ret_descr, XDES_FREE_BIT, TRUE, 0, mtr);
     ret_page = free_bit == FIL_NULL ? FIL_NULL
                                     : xdes_get_offset(ret_descr) + free_bit;
     ut_ad(!has_done_reservation || ret_page != FIL_NULL);

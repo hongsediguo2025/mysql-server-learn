@@ -5007,6 +5007,8 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             runner.final_validation()
 
             report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "success")
+            self.assertTrue(report["success"])
             self.assertEqual(report["sessions"], 20)
             self.assertEqual(report["temp_table_target_mb"], 200)
             self.assertEqual(report["temp_table_total_target_bytes"], 20 * 200 * 1024 * 1024)

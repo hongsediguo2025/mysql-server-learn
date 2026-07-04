@@ -26,6 +26,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "srv0tmp.h"
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <set>
 #include "dict0dict.h"
@@ -69,6 +70,7 @@ namespace {
 
 std::mutex preserved_space_id_reservations_mutex;
 std::set<space_id_t> preserved_space_id_reservations;
+std::atomic<uint32_t> preserved_space_id_reservation_active_count{0};
 
 bool temp_space_id_in_reservable_range(space_id_t space_id) {
   return space_id > dict_sys_t::s_min_temp_space_id &&
@@ -91,6 +93,8 @@ bool reserve_preserved_space_id(space_id_t space_id) {
     return false;
   }
 
+  preserved_space_id_reservation_active_count.fetch_add(
+      1, std::memory_order_release);
   preserved_space_id_reservations.insert(space_id);
   return true;
 }
@@ -111,18 +115,39 @@ bool reserve_or_keep_preserved_space_id(space_id_t space_id, bool *created) {
     return false;
   }
 
+  preserved_space_id_reservation_active_count.fetch_add(
+      1, std::memory_order_release);
   std::pair<std::set<space_id_t>::iterator, bool> result =
       preserved_space_id_reservations.insert(space_id);
+  if (!result.second) {
+    preserved_space_id_reservation_active_count.fetch_sub(
+        1, std::memory_order_acq_rel);
+  }
   if (created != nullptr) *created = result.second;
   return true;
 }
 
 bool release_preserved_space_id(space_id_t space_id) {
   std::lock_guard<std::mutex> guard(preserved_space_id_reservations_mutex);
-  return preserved_space_id_reservations.erase(space_id) != 0;
+  const bool erased = preserved_space_id_reservations.erase(space_id) != 0;
+  if (erased) {
+    uint32_t current =
+        preserved_space_id_reservation_active_count.load(
+            std::memory_order_acquire);
+    while (current != 0 &&
+           !preserved_space_id_reservation_active_count.compare_exchange_weak(
+               current, current - 1, std::memory_order_acq_rel,
+               std::memory_order_acquire)) {
+    }
+  }
+  return erased;
 }
 
 bool is_preserved_space_id_reserved(space_id_t space_id) {
+  if (preserved_space_id_reservation_active_count.load(
+          std::memory_order_acquire) == 0) {
+    return false;
+  }
   std::lock_guard<std::mutex> guard(preserved_space_id_reservations_mutex);
   return is_preserved_space_id_reserved_low(space_id);
 }
@@ -130,11 +155,18 @@ bool is_preserved_space_id_reserved(space_id_t space_id) {
 void clear_preserved_space_id_reservations_for_test() {
   std::lock_guard<std::mutex> guard(preserved_space_id_reservations_mutex);
   preserved_space_id_reservations.clear();
+  preserved_space_id_reservation_active_count.store(
+      0, std::memory_order_release);
 }
 
 void reset_temp_space_id_allocator_for_test() {
   std::lock_guard<std::mutex> guard(preserved_space_id_reservations_mutex);
   Tablespace::m_last_used_space_id = dict_sys_t::s_min_temp_space_id;
+}
+
+uint32_t preserved_space_id_reservation_active_count_for_test() {
+  return preserved_space_id_reservation_active_count.load(
+      std::memory_order_acquire);
 }
 
 space_id_t min_temp_space_id_for_test() {
@@ -257,6 +289,12 @@ std::string Tablespace::path() const {
 }
 
 space_id_t Tablespace::next_space_id() {
+  if (preserved_space_id_reservation_active_count.load(
+          std::memory_order_acquire) == 0) {
+    ut_a(m_last_used_space_id < dict_sys_t::s_max_temp_space_id);
+    return ++m_last_used_space_id;
+  }
+
   std::lock_guard<std::mutex> guard(preserved_space_id_reservations_mutex);
 
   space_id_t candidate = m_last_used_space_id;

@@ -65,6 +65,13 @@ enum Preserve_trx_drain_mode {
   PRESERVE_TRX_DRAIN_MODE_SOFT = 0,
   PRESERVE_TRX_DRAIN_MODE_HARD = 1
 };
+enum Preserve_trx_off_artifact_policy {
+  PRESERVE_TRX_OFF_ARTIFACT_POLICY_FAIL_IF_PRESENT = 0,
+  PRESERVE_TRX_OFF_ARTIFACT_POLICY_IGNORE = 1,
+  PRESERVE_TRX_OFF_ARTIFACT_POLICY_RECOVER = 2,
+  PRESERVE_TRX_OFF_ARTIFACT_POLICY_ABANDON = 3
+};
+extern ulong preserve_trx_off_artifact_policy;
 extern ulong preserve_trx_drain_mode;
 extern uint preserve_trx_drain_grace_ms;
 extern uint preserve_trx_drain_hard_timeout_ms;
@@ -90,6 +97,11 @@ uint preserve_trx_auto_parallel_preserve_threads(uint hardware_threads);
 bool preserve_trx_is_enabled();
 void preserve_trx_set_enable_value(bool enabled);
 bool preserve_trx_magic_xid_has_snapshot(const XID &xid);
+bool preserve_trx_magic_xid_should_be_protected(const XID &xid);
+bool preserve_trx_off_artifact_policy_ignore();
+bool preserve_trx_off_artifact_policy_recover();
+bool preserve_trx_off_artifact_policy_abandon();
+bool preserve_trx_off_artifact_policy_fail_if_present();
 bool preserve_trx_execute_command(THD *thd);
 
 ulonglong preserve_trx_warmcopy_prefix_bytes_status();
@@ -337,6 +349,7 @@ void preserved_trx_set_manager_state_publication_probe_for_unit_test(
     Preserved_trx_manager_state_publication_probe probe, void *arg);
 void preserved_trx_set_manager_state_for_unit_test(
     Preserve_trx_manager_state state, my_thread_id owner_thread_id);
+void preserved_trx_set_recovery_complete_for_unit_test(bool complete);
 bool preserved_trx_probe_manager_state_guard_for_unit_test(
     Preserve_trx_manager_state to, my_thread_id owner_thread_id);
 void preserved_trx_add_record_for_unit_test(const std::string &token,
@@ -427,6 +440,8 @@ bool preserved_trx_resolve_timeout_seconds(const Preserve_trx_options &options,
 bool preserved_trx_preflight_recoverability();
 bool preserved_temp_images_bootstrap_preamble();
 bool preserved_trx_recover_all();
+bool preserved_trx_recovery_complete();
+bool preserved_trx_local_record_exists(const std::string &token);
 void preserved_trx_mark_recovery_complete();
 
 struct Preserved_trx_promotion_ready_adopt_result {

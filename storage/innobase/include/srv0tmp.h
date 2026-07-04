@@ -64,6 +64,10 @@ bool release_preserved_space_id(space_id_t space_id);
 @return true if the id is reserved */
 bool is_preserved_space_id_reserved(space_id_t space_id);
 
+/** Return the number of active preserved session temporary tablespace id
+reservations. Test-only helper for the allocator fast path. */
+uint32_t preserved_space_id_reservation_active_count_for_test();
+
 /** Create the session temporary tablespaces on startup
 @param[in] create_new_db	true if bootstrapping
 @return DB_SUCCESS on success, else DB_ERROR on failure */

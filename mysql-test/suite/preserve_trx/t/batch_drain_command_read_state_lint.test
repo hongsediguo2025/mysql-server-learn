@@ -56,6 +56,8 @@ die "target-state reader must use the shared pending-quiesce helper\n"
 
 my $begin_read =
   extract_function_body($preserve_src, 'bool preserved_trx_begin_command_read(THD *thd)');
+die "command-read boundary must restore native m_server_idle=true when preserve_trx_enable is OFF\n"
+  unless $begin_read =~ /if\s*\(\s*!\s*preserve_trx_is_enabled\s*\(\s*\)\s*\)\s*\{[^}]*m_server_idle\s*=\s*true/s;
 die "command-read boundary must use the shared pending-quiesce helper\n"
   unless $begin_read =~ /preserve_trx_publish_pending_quiesce_at_idle_boundary/s;
 die "command-read boundary must not compare counters to zero immediately after resetting them\n"

@@ -85,9 +85,11 @@ void btr_search_sys_free();
 
 namespace ibt {
 bool reserve_preserved_space_id(uint32_t space_id);
+bool release_preserved_space_id(uint32_t space_id);
 bool is_preserved_space_id_reserved(uint32_t space_id);
 void clear_preserved_space_id_reservations_for_test();
 void reset_temp_space_id_allocator_for_test();
+uint32_t preserved_space_id_reservation_active_count_for_test();
 uint32_t min_temp_space_id_for_test();
 uint32_t max_temp_space_id_for_test();
 uint32_t allocate_temp_tablespace_object_for_test();
@@ -1129,6 +1131,110 @@ TEST(TempResumeMaterializerContractTest,
   EXPECT_LT(ownership_adoption, publish_proof)
       << "no_redo_undo_native_slots_adopted is a cleanup-safety proof, so it "
          "must be published only after exact FSEG/XDES ownership is established";
+}
+
+TEST(TempResumeMaterializerContractTest,
+     NativeFsegOwnershipFailureIsFailClosedNotRecopy) {
+  const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+  ASSERT_FALSE(temp_preserve_impl.empty());
+
+  const std::string adopt_anchor_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_"
+          "ownership_for_anchor(");
+  ASSERT_FALSE(adopt_anchor_body.empty());
+
+  EXPECT_EQ(std::string::npos,
+            adopt_anchor_body.find(
+                "trx_preserve_temp_space_image_recopy_existing_no_redo_undo_"
+                "fseg_pages("))
+      << "native-owned no-redo undo adoption must fail closed if live FSEG "
+         "ownership cannot be claimed. Recopying bytes can leave trx_undo_t "
+         "native-owned while the allocator still does not own the pages.";
+}
+
+TEST(TempResumeMaterializerContractTest,
+     NativeSlotAdoptionUnwindsStagedReservationsBeforePublish) {
+  const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+  ASSERT_FALSE(temp_preserve_impl.empty());
+
+  const std::string adopt_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_"
+          "native_resume(");
+  ASSERT_FALSE(adopt_body.empty());
+
+  const size_t reserve = adopt_body.find(
+      "trx_preserve_temp_space_image_reserve_staged_no_redo_undo_slots");
+  const size_t cleanup =
+      adopt_body.find("trx_preserve_temp_space_image_release_staged_no_redo_undo_slots");
+  const size_t publish =
+      adopt_body.find("no_redo_undo_native_slots_adopted = true");
+  ASSERT_NE(std::string::npos, reserve)
+      << "native adoption must stage slot reservations before mutating live "
+         "rseg state";
+  ASSERT_NE(std::string::npos, cleanup)
+      << "native adoption must have an explicit unwind path for staged slot "
+         "reservations";
+  ASSERT_NE(std::string::npos, publish);
+  EXPECT_LT(reserve, publish);
+  EXPECT_LT(cleanup, publish)
+      << "staged reservations must be releasable on every failure before the "
+         "native-adopted proof is published";
+}
+
+TEST(TempResumeMaterializerContractTest,
+     NativeRetryCleanupUsesAdoptedLiveRsegIdentity) {
+  const std::string temp_preserve_header = read_source_file_for_temp_table_test(
+      "storage/innobase/include/trx0temp_preserve.h");
+  const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+  ASSERT_FALSE(temp_preserve_header.empty());
+  ASSERT_FALSE(temp_preserve_impl.empty());
+
+  EXPECT_NE(std::string::npos,
+            temp_preserve_header.find("no_redo_undo_adopted_rseg_page_no"))
+      << "descriptor identity names the source manifest rseg, while cleanup "
+         "must release the live rseg page used during native adoption";
+
+  const std::string cleanup_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "trx_preserve_temp_space_image_release_native_no_redo_undo_slots_for_"
+          "retry(");
+  ASSERT_FALSE(cleanup_body.empty());
+
+  EXPECT_NE(std::string::npos,
+            cleanup_body.find("no_redo_undo_adopted_rseg_page_no"))
+      << "retry cleanup must release reservations by the live adopted rseg "
+         "identity, not the source manifest rseg page";
+  EXPECT_EQ(std::string::npos,
+            cleanup_body.find("descriptor->no_redo_undo_rseg_page_no,"))
+      << "using the source manifest rseg page can leak live slot reservations "
+         "when restart creates the temp rseg on a different page";
+}
+
+TEST(TempResumeMaterializerContractTest,
+     TempAllocatorSkipsFreeExtentsContainingPreservedPages) {
+  const std::string fsp_impl =
+      read_source_file_for_temp_table_test("storage/innobase/fsp/fsp0fsp.cc");
+  ASSERT_FALSE(fsp_impl.empty());
+
+  EXPECT_NE(std::string::npos,
+            fsp_impl.find("fsp_extent_has_temp_preserve_page_reservation("))
+      << "page-level skip is not sufficient: an entire FREE extent containing "
+         "a preserved page must not be assigned to a normal file segment";
+  const std::string alloc_body = extract_function_body_after_signature_for_temp_table_test(
+      fsp_impl, "static xdes_t *fsp_alloc_free_extent(");
+  ASSERT_FALSE(alloc_body.empty());
+  EXPECT_NE(std::string::npos,
+            alloc_body.find("fsp_extent_has_temp_preserve_page_reservation("))
+      << "all free-extent allocation paths must avoid extents containing "
+         "preserved temp pages while a reservation is active";
 }
 
 TEST(TempResumeMaterializerContractTest,
@@ -2956,6 +3062,124 @@ TEST(TempDirtyPageHookSourceLintTest, DrainsStagedPagesAfterLatchRelease) {
      drain. */
   EXPECT_LT(push_pos, bytes_add_pos);
   EXPECT_LT(count_add_pos, push_pos);
+}
+
+TEST(TempDirtyPageHookSourceLintTest,
+     CommitChecksStagedDirtyPageCountBeforeDrain) {
+  const std::string mtr_source =
+      read_source_file_for_temp_table_test("storage/innobase/mtr/mtr0mtr.cc");
+  ASSERT_FALSE(mtr_source.empty());
+
+  const std::string execute_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          mtr_source, "void mtr_t::Command::execute()");
+  ASSERT_FALSE(execute_body.empty());
+
+  const size_t release_pos = execute_body.find("release_all();");
+  const size_t has_staged_pos = execute_body.find(
+      "trx_preserve_temp_space_image_has_staged_dirty_pages()");
+  const size_t drain_pos = execute_body.find(
+      "trx_preserve_temp_space_image_drain_staged_dirty_pages();");
+  const size_t release_resources_pos = execute_body.find("release_resources();");
+  ASSERT_NE(std::string::npos, release_pos);
+  ASSERT_NE(std::string::npos, has_staged_pos);
+  ASSERT_NE(std::string::npos, drain_pos);
+  ASSERT_NE(std::string::npos, release_resources_pos);
+  EXPECT_LT(release_pos, has_staged_pos);
+  EXPECT_LT(has_staged_pos, drain_pos);
+  EXPECT_LT(drain_pos, release_resources_pos);
+
+  const std::string preserve_source = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+  ASSERT_FALSE(preserve_source.empty());
+  const std::string drain_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          preserve_source,
+          "dberr_t trx_preserve_temp_space_image_drain_staged_dirty_pages()");
+  ASSERT_FALSE(drain_body.empty());
+  EXPECT_NE(std::string::npos,
+            drain_body.find(
+                "trx_preserve_temp_space_image_has_staged_dirty_pages()"));
+}
+
+TEST(TempFspAllocationSourceLintTest,
+     InactiveReservationUsesNativeExtentSelection) {
+  const std::string fsp_source =
+      read_source_file_for_temp_table_test("storage/innobase/fsp/fsp0fsp.cc");
+  ASSERT_FALSE(fsp_source.empty());
+
+  const size_t helper_pos =
+      fsp_source.find("static page_no_t xdes_find_free_bit_for_temp_preserve(");
+  ASSERT_NE(std::string::npos, helper_pos);
+  const size_t alloc_signature_pos =
+      fsp_source.find("static buf_block_t *fseg_alloc_free_page_low(",
+                      helper_pos);
+  ASSERT_NE(std::string::npos, alloc_signature_pos);
+  const std::string alloc_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          fsp_source.substr(alloc_signature_pos),
+          "static buf_block_t *fseg_alloc_free_page_low(");
+  ASSERT_FALSE(alloc_body.empty());
+
+  const size_t branch2_pos = alloc_body.find(
+      "2. We allocate the free extent from space and can take");
+  const size_t branch3_pos =
+      alloc_body.find("3. We take any free extent", branch2_pos);
+  const size_t branch4_pos =
+      alloc_body.find("4. We can take the page", branch3_pos);
+  ASSERT_NE(std::string::npos, branch2_pos);
+  ASSERT_NE(std::string::npos, branch3_pos);
+  ASSERT_NE(std::string::npos, branch4_pos);
+
+  const std::string branch2 =
+      alloc_body.substr(branch2_pos, branch3_pos - branch2_pos);
+  const size_t branch2_inactive = branch2.find(
+      "if (!fsp_temp_preserve_page_reservation_active(space_id))");
+  ASSERT_NE(std::string::npos, branch2_inactive);
+  const size_t branch2_native = branch2.find("goto take_hinted_page;",
+                                             branch2_inactive);
+  const size_t branch2_reservation =
+      branch2.find("xdes_find_free_bit_for_temp_preserve(", branch2_inactive);
+  ASSERT_NE(std::string::npos, branch2_native);
+  ASSERT_NE(std::string::npos, branch2_reservation);
+  EXPECT_LT(branch2_native, branch2_reservation);
+
+  const std::string branch3 =
+      alloc_body.substr(branch3_pos, branch4_pos - branch3_pos);
+  const size_t branch3_inactive = branch3.find(
+      "if (!fsp_temp_preserve_page_reservation_active(space_id))");
+  ASSERT_NE(std::string::npos, branch3_inactive);
+  const size_t native_down =
+      branch3.find("ret_page += FSP_EXTENT_SIZE - 1", branch3_inactive);
+  const size_t native_frag =
+      branch3.find("xdes_find_bit(ret_descr, XDES_FREE_BIT, TRUE, 0, mtr)",
+                   branch3_inactive);
+  const size_t reservation_scan =
+      branch3.find("xdes_find_free_bit_for_temp_preserve(", branch3_inactive);
+  ASSERT_NE(std::string::npos, native_down);
+  ASSERT_NE(std::string::npos, native_frag);
+  ASSERT_NE(std::string::npos, reservation_scan);
+  EXPECT_LT(native_down, reservation_scan);
+  EXPECT_LT(native_frag, reservation_scan);
+}
+
+TEST(TempRsegCollectionSourceLintTest,
+     PreservedRsegCollectHasInactiveFastPath) {
+  const std::string source = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0preserve.cc");
+  ASSERT_FALSE(source.empty());
+
+  const std::string body =
+      extract_function_body_after_signature_for_temp_table_test(
+          source, "void trx_preserve_collect_preserved_rsegs(");
+  ASSERT_FALSE(body.empty());
+
+  const size_t active_count_pos =
+      body.find("trx_preserve_active_preserved_rseg_owners.load(");
+  const size_t mutex_pos = body.find("trx_sys_mutex_enter();");
+  ASSERT_NE(std::string::npos, active_count_pos);
+  ASSERT_NE(std::string::npos, mutex_pos);
+  EXPECT_LT(active_count_pos, mutex_pos);
 }
 
 std::vector<unsigned char> make_temp_dirty_page(size_t page_size,
@@ -7241,6 +7465,40 @@ TEST_F(TempSpaceReservationTest, TempPoolSkipsReservedSpaceId) {
   EXPECT_EQ(first_id + 1, ibt::allocate_temp_tablespace_object_for_test());
 
   EXPECT_EQ(first_id + 3, ibt::allocate_temp_tablespace_object_for_test());
+}
+
+TEST_F(TempSpaceReservationTest, ActiveCountTracksOnlyLiveReservations) {
+  const uint32_t first_id = first_temp_space_id();
+
+  EXPECT_EQ(0U, ibt::preserved_space_id_reservation_active_count_for_test());
+  ASSERT_TRUE(ibt::reserve_preserved_space_id(first_id));
+  EXPECT_EQ(1U, ibt::preserved_space_id_reservation_active_count_for_test());
+  EXPECT_FALSE(ibt::reserve_preserved_space_id(first_id));
+  EXPECT_EQ(1U, ibt::preserved_space_id_reservation_active_count_for_test());
+
+  EXPECT_TRUE(ibt::release_preserved_space_id(first_id));
+  EXPECT_EQ(0U, ibt::preserved_space_id_reservation_active_count_for_test());
+  EXPECT_FALSE(ibt::release_preserved_space_id(first_id));
+  EXPECT_EQ(0U, ibt::preserved_space_id_reservation_active_count_for_test());
+}
+
+TEST_F(TempSpaceReservationTest, NextSpaceIdHasInactiveFastPath) {
+  const std::string source =
+      read_source_file_for_temp_table_test("storage/innobase/srv/srv0tmp.cc");
+  ASSERT_FALSE(source.empty());
+
+  const std::string body =
+      extract_function_body_after_signature_for_temp_table_test(
+          source, "space_id_t Tablespace::next_space_id()");
+  ASSERT_FALSE(body.empty());
+
+  const size_t active_count_pos =
+      body.find("preserved_space_id_reservation_active_count.load(");
+  const size_t first_lock_pos =
+      body.find("std::lock_guard<std::mutex> guard(");
+  ASSERT_NE(std::string::npos, active_count_pos);
+  ASSERT_NE(std::string::npos, first_lock_pos);
+  EXPECT_LT(active_count_pos, first_lock_pos);
 }
 
 TEST_F(TempSpaceReservationTest,

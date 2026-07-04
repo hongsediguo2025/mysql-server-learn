@@ -6,7 +6,7 @@
 --exec printf descriptor > "$MYSQLD_DATADIR/preserve/off_path_orphan.binlog_cache.warm.9.desc"
 --exec printf temp > "$MYSQLD_DATADIR/preserve/off_path_orphan.binlog_cache.warm.9.tmp"
 
---let $restart_parameters= restart: --preserve-trx-enable=OFF
+--let $restart_parameters= restart: --preserve-trx-enable=OFF --preserve-trx-off-artifact-policy=IGNORE
 --source include/restart_mysqld.inc
 --let $restart_parameters=
 

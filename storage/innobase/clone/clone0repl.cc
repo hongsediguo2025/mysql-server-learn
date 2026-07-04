@@ -193,7 +193,7 @@ bool Clone_persist_gtid::check_gtid_prepare(THD *thd, trx_t *trx,
     must not allocate the XA-prepare GTID persistence slot; the preserved
     binlog/GTID metadata is restored and committed on RESUME.
   */
-  if (trx->xid != nullptr && trx_preserve_xid_is_magic_active(*trx->xid)) {
+  if (trx->xid != nullptr && trx_preserve_xid_should_be_protected(*trx->xid)) {
     return (false);
   }
   /* Skip GTID if External XA transaction is not in IDLE state. */

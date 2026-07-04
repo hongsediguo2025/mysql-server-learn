@@ -217,6 +217,17 @@ TEST(LockWarmcopyRecordShard, ProductionBitmapHookMarksMissingDigestInvalid) {
             snapshot.shard_state_flags & LOCK_WARMCOPY_RECORD_SHARD_INVALID);
 }
 
+TEST(LockWarmcopyRecordShard, RejectsOverflowSizedBitmapBeforeStoreMutation) {
+  lock_warmcopy_reset_for_unit_test();
+
+  lock_warmcopy_record_shard_key_t key = make_record_shard_key(UINT32_MAX);
+  const lock_warmcopy_record_image_digest_t digest = make_digest(0x20);
+
+  EXPECT_FALSE(lock_warmcopy_record_bitmap_set_for_unit_test(key, 0, digest));
+  lock_warmcopy_record_shard_snapshot_t snapshot;
+  EXPECT_FALSE(lock_warmcopy_record_shard_snapshot_for_unit_test(key, &snapshot));
+}
+
 TEST(LockWarmcopyRecordShard,
      ProductionImageHookStoresPayloadUnderOwningThreadId) {
   lock_warmcopy_reset_for_unit_test();
@@ -1137,6 +1148,23 @@ TEST(LockWarmcopyConversionFreeze, WaitForThawTimesOutWhenStillFrozen) {
 
   EXPECT_EQ(DB_LOCK_WAIT_TIMEOUT,
             lock_warmcopy_wait_for_conversion_thaw_for_unit_test(&trx, 0));
+  EXPECT_EQ(wait_count_before + 1,
+            lock_warmcopy_conversion_freeze_wait_count());
+
+  lock_warmcopy_trx_conversion_thaw_for_unit_test(&trx.lock);
+}
+
+TEST(LockWarmcopyConversionFreeze, WaitForThawReturnsInterruptedOnAbort) {
+  lock_warmcopy_reset_for_unit_test();
+
+  trx_t trx{};
+  lock_warmcopy_trx_conversion_freeze_for_unit_test(&trx.lock, 9003);
+  const uint64_t wait_count_before =
+      lock_warmcopy_conversion_freeze_wait_count();
+
+  EXPECT_EQ(DB_INTERRUPTED,
+            lock_warmcopy_wait_for_conversion_thaw_abort_for_unit_test(
+                &trx, 1000, true));
   EXPECT_EQ(wait_count_before + 1,
             lock_warmcopy_conversion_freeze_wait_count());
 

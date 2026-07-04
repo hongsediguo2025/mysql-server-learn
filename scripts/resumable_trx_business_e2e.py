@@ -4751,6 +4751,8 @@ class BusinessE2ERunner:
             .replace(microsecond=0)
             .isoformat()
             + "Z",
+            "status": "success",
+            "success": True,
             "scenario": self.config.scenario,
             "sessions": self.config.sessions,
             "cycles": self.config.cycles,

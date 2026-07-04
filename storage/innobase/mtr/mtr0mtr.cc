@@ -827,7 +827,9 @@ void mtr_t::Command::execute() {
 
   release_all();
 #ifndef UNIV_HOTBACKUP
-  (void)trx_preserve_temp_space_image_drain_staged_dirty_pages();
+  if (trx_preserve_temp_space_image_has_staged_dirty_pages()) {
+    (void)trx_preserve_temp_space_image_drain_staged_dirty_pages();
+  }
 #endif /* !UNIV_HOTBACKUP */
   release_resources();
 }

@@ -39,12 +39,14 @@
 #include "sql_thd_internal_api.h"
 #include "debug_sync.h"
 #include "dict0mem.h"
+#include "mysql/plugin.h"
 #include "storage/innobase/include/lock0lock.h"
 #include "storage/innobase/include/lock0priv.h"
 #include "sha2.h"
 #include "storage/innobase/include/lock0guards.h"
 #include "storage/innobase/include/lock0types.h"
 #include "storage/innobase/include/os0thread.h"
+#include "storage/innobase/include/srv0start.h"
 #include "storage/innobase/include/trx0trx.h"
 
 std::atomic<uint64_t> lock_warmcopy_epoch{0};
@@ -56,14 +58,19 @@ std::atomic<uint64_t> lock_warmcopy_observed_hook_events{0};
 std::atomic<uint64_t> lock_warmcopy_conversion_freeze_waits{0};
 constexpr uint64_t k_lock_warmcopy_default_target_id = 0;
 
-template <typename IsFrozen>
+template <typename IsFrozen, typename ShouldAbort>
 dberr_t lock_warmcopy_wait_for_conversion_thaw_impl(IsFrozen is_frozen,
+                                                    ShouldAbort should_abort,
                                                     uint timeout_ms) {
   using Clock = std::chrono::steady_clock;
   const auto started_at = Clock::now();
   bool sync_registered = false;
 
   for (;;) {
+    if (should_abort()) {
+      return DB_INTERRUPTED;
+    }
+
     if (!is_frozen()) {
       return DB_SUCCESS;
     }
@@ -229,11 +236,19 @@ constexpr lock_warmcopy_hook_coverage_site_t k_lock_warmcopy_hook_sites[] = {
      lock_warmcopy_hook_action_t::DIRTY_SHARD},
 };
 
-size_t record_bitmap_len(uint32_t n_bits) { return (n_bits + 7U) / 8U; }
+const uint32_t k_record_bitmap_max_bits = 1024U * 1024U;
+
+size_t record_bitmap_len(uint32_t n_bits) {
+  if (n_bits == 0 || n_bits > k_record_bitmap_max_bits ||
+      n_bits > UINT32_MAX - 7U) {
+    return 0;
+  }
+  return (n_bits + 7U) / 8U;
+}
 
 bool record_heap_no_is_valid(const lock_warmcopy_record_shard_key_t &key,
                              uint32_t heap_no) {
-  return key.n_bits != 0 && heap_no < key.n_bits;
+  return record_bitmap_len(key.n_bits) != 0 && heap_no < key.n_bits;
 }
 
 void normalize_record_bitmap(std::vector<unsigned char> *bitmap,
@@ -1859,6 +1874,11 @@ dberr_t lock_warmcopy_wait_for_conversion_thaw(trx_t *trx) {
         trx_mutex_exit(trx);
         return frozen;
       },
+      [trx]() {
+        if (srv_shutdown_state.load() != SRV_SHUTDOWN_NONE) return true;
+        return trx != nullptr && trx->mysql_thd != nullptr &&
+               thd_killed(trx->mysql_thd) != 0;
+      },
       preserve_trx_lock_warmcopy_conversion_wait_timeout_ms);
 }
 
@@ -1870,7 +1890,19 @@ dberr_t lock_warmcopy_wait_for_conversion_thaw_for_unit_test(
         return trx != nullptr &&
                lock_warmcopy_trx_conversion_is_frozen(&trx->lock);
       },
+      []() { return false; },
       timeout_ms);
+}
+
+dberr_t lock_warmcopy_wait_for_conversion_thaw_abort_for_unit_test(
+    const trx_t *trx, uint timeout_ms, bool abort_now) {
+  lock_warmcopy_conversion_freeze_wait_note();
+  return lock_warmcopy_wait_for_conversion_thaw_impl(
+      [trx]() {
+        return trx != nullptr &&
+               lock_warmcopy_trx_conversion_is_frozen(&trx->lock);
+      },
+      [abort_now]() { return abort_now; }, timeout_ms);
 }
 
 void lock_warmcopy_conversion_freeze_wait_note() {

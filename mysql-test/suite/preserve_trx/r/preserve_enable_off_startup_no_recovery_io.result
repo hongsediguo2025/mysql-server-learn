@@ -1,4 +1,4 @@
-# restart: --preserve-trx-enable=OFF
+# restart: --preserve-trx-enable=OFF --preserve-trx-off-artifact-policy=IGNORE
 SELECT @@global.preserve_trx_enable;
 @@global.preserve_trx_enable
 0

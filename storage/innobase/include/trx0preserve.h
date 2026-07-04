@@ -45,6 +45,7 @@ struct trx_t;
 
 bool trx_preserve_feature_enabled();
 bool trx_preserve_xid_is_magic_active(const XID &xid);
+bool trx_preserve_xid_should_be_protected(const XID &xid);
 
 struct Preserve_lock_limits {
   uint32_t max_lock_count;
@@ -65,6 +66,7 @@ dberr_t trx_preserve_claim_detached_prepared(trx_t *trx);
 dberr_t trx_preserve_rollback_by_token(const char *token);
 dberr_t trx_preserve_rollback_by_token_for_thd(const char *token, THD *thd);
 dberr_t trx_preserve_rollback_claimed(trx_t *trx);
+bool trx_preserve_token_has_any_owner(const char *token);
 dberr_t trx_preserve_rollback_prepared_without_snapshot(
     const std::vector<std::string> &snapshot_tokens, uint32_t *rolled_back);
 dberr_t trx_preserve_prepare_resumed_rollback_gtid(trx_t *trx);
@@ -170,6 +172,10 @@ bool trx_preserve_thd_can_accept_preserved_trx(THD *thd);
 bool trx_preserve_rseg_has_preserved_trx(const trx_rseg_t *rseg);
 void trx_preserve_collect_preserved_rsegs(
     std::vector<const trx_rseg_t *> *rsegs);
+void trx_preserve_note_rseg_owner_state_change(
+    trx_t *trx, int old_state, int new_state);
+void trx_preserve_note_rseg_owner_xid_reset(trx_t *trx);
+void trx_preserve_note_rseg_owner_xid_restore(trx_t *trx);
 
 struct Preserve_rseg_collection_debug_result {
   bool contains_redo{false};

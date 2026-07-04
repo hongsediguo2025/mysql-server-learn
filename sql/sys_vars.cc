@@ -1805,6 +1805,22 @@ static Sys_var_bool Sys_preserve_trx_enable(
     ON_CHECK(preserve_trx_sysvar_check_enable),
     ON_UPDATE(preserve_trx_sysvar_update_enable));
 
+static const char *preserve_trx_off_artifact_policy_names[] = {
+    "FAIL_IF_PRESENT", "IGNORE", "RECOVER", "ABANDON", nullptr};
+
+static Sys_var_enum Sys_preserve_trx_off_artifact_policy(
+    "preserve_trx_off_artifact_policy",
+    "Startup-only policy used when preserve_trx_enable is OFF and historical "
+    "Preserve/Resume artifacts exist in the datadir. FAIL_IF_PRESENT rejects "
+    "startup if artifacts are present; IGNORE keeps the strict native OFF "
+    "path and leaves cleanup to external tooling; RECOVER handles local "
+    "preserve artifacts without allowing new preserve work; ABANDON attempts "
+    "auditable rollback/cleanup of historical artifacts.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_off_artifact_policy),
+    CMD_LINE(REQUIRED_ARG), preserve_trx_off_artifact_policy_names,
+    DEFAULT(PRESERVE_TRX_OFF_ARTIFACT_POLICY_FAIL_IF_PRESENT), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
 static Sys_var_enum Sys_binlog_format(
     "binlog_format",
     "What form of binary logging the master will "

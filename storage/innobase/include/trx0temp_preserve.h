@@ -251,6 +251,16 @@ struct trx_preserve_temp_space_image_descriptor {
     metadata own these pages. Restored-only reconnect leaves this false.
   */
   bool no_redo_undo_native_slots_adopted{false};
+  /*
+    Source rseg identity comes from the sidecar manifest. Native adoption may
+    bind the token to a live temporary rollback segment created on a different
+    page after restart; retry cleanup must release reservations with this live
+    identity once the adoption proof is published.
+  */
+  bool no_redo_undo_adopted_rseg_identity_present{false};
+  uint32_t no_redo_undo_adopted_rseg_space_id{0};
+  uint32_t no_redo_undo_adopted_rseg_page_no{0};
+  uint32_t no_redo_undo_adopted_rseg_slot{0};
   bool no_redo_undo_rseg_identity_present{false};
   uint32_t no_redo_undo_rseg_space_id{0};
   uint32_t no_redo_undo_rseg_page_no{0};
@@ -318,6 +328,9 @@ bool trx_preserve_temp_space_image_preserves_source_space_id(
 
 bool trx_preserve_temp_space_image_reserve_space_id(
     const trx_preserve_temp_space_image_descriptor &descriptor);
+
+bool trx_preserve_temp_space_image_reserve_or_keep_space_id(
+    const trx_preserve_temp_space_image_descriptor &descriptor, bool *created);
 
 bool trx_preserve_temp_space_image_release_reserved_space_id(
     uint32_t source_space_id);
@@ -584,6 +597,8 @@ dberr_t trx_preserve_temp_space_image_capture_dirty_page(
 dberr_t trx_preserve_temp_space_image_stage_dirty_page(
     uint32_t source_space_id, uint32_t page_no, const unsigned char *page,
     size_t page_bytes);
+
+bool trx_preserve_temp_space_image_has_staged_dirty_pages();
 
 dberr_t trx_preserve_temp_space_image_drain_staged_dirty_pages();
 

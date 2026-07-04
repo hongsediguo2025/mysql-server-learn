@@ -31,6 +31,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0preserve.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 #include "log0log.h"
@@ -72,10 +73,61 @@ static bool trx_preserve_token_to_xid(const char *token, XID *xid) {
 
 bool trx_preserve_feature_enabled() { return preserve_trx_is_enabled(); }
 
+bool trx_preserve_xid_should_be_protected(const XID &xid) {
+  return preserve_trx_magic_xid_should_be_protected(xid);
+}
+
 bool trx_preserve_xid_is_magic_active(const XID &xid) {
-  return xid_is_preserve_magic(xid) &&
-         (trx_preserve_feature_enabled() ||
-          preserve_trx_magic_xid_has_snapshot(xid));
+  return trx_preserve_xid_should_be_protected(xid);
+}
+
+static std::atomic<uint32_t> trx_preserve_active_preserved_rseg_owners{0};
+
+static bool trx_preserve_rseg_owner_counts(const trx_t *trx, int state) {
+  return trx != nullptr &&
+         (state == TRX_STATE_PREPARED || state == TRX_STATE_PRESERVED) &&
+         trx->xid != nullptr && trx_preserve_xid_is_magic_active(*trx->xid);
+}
+
+static void trx_preserve_active_preserved_rseg_owners_inc() {
+  trx_preserve_active_preserved_rseg_owners.fetch_add(
+      1, std::memory_order_release);
+}
+
+static void trx_preserve_active_preserved_rseg_owners_dec() {
+  uint32_t current = trx_preserve_active_preserved_rseg_owners.load(
+      std::memory_order_acquire);
+  while (current != 0 &&
+         !trx_preserve_active_preserved_rseg_owners.compare_exchange_weak(
+             current, current - 1, std::memory_order_acq_rel,
+             std::memory_order_acquire)) {
+  }
+}
+
+void trx_preserve_note_rseg_owner_state_change(trx_t *trx,
+                                               int old_state,
+                                               int new_state) {
+  const bool old_counted = trx_preserve_rseg_owner_counts(trx, old_state);
+  const bool new_counted = trx_preserve_rseg_owner_counts(trx, new_state);
+  if (!old_counted && new_counted) {
+    trx_preserve_active_preserved_rseg_owners_inc();
+  } else if (old_counted && !new_counted) {
+    trx_preserve_active_preserved_rseg_owners_dec();
+  }
+}
+
+void trx_preserve_note_rseg_owner_xid_reset(trx_t *trx) {
+  if (trx_preserve_rseg_owner_counts(trx, trx != nullptr ? trx->state
+                                                         : TRX_STATE_NOT_STARTED)) {
+    trx_preserve_active_preserved_rseg_owners_dec();
+  }
+}
+
+void trx_preserve_note_rseg_owner_xid_restore(trx_t *trx) {
+  if (trx_preserve_rseg_owner_counts(trx, trx != nullptr ? trx->state
+                                                         : TRX_STATE_NOT_STARTED)) {
+    trx_preserve_active_preserved_rseg_owners_inc();
+  }
 }
 
 trx_t *trx_preserve_current_thd_trx(THD *thd) {
@@ -150,16 +202,19 @@ static void trx_preserve_store_state_trx_sys_locked(trx_t *trx,
     beside these stores.
   */
   trx->state = state;
+  trx_preserve_note_rseg_owner_state_change(trx, old_state, state);
 }
 
 static void trx_preserve_store_private_state(trx_t *trx, trx_state_t state) {
   ut_ad(trx != nullptr);
+  const trx_state_t old_state = trx->state;
 #ifdef UNIV_DEBUG
   ut_ad(!trx->in_rw_trx_list);
   ut_ad(!trx->in_mysql_trx_list);
 #endif /* UNIV_DEBUG */
 
   trx->state = state;
+  trx_preserve_note_rseg_owner_state_change(trx, old_state, state);
 }
 
 static dberr_t trx_preserve_mark_preserved(trx_t *trx) {
@@ -239,6 +294,7 @@ static trx_t *trx_preserve_find_for_token_rollback(
     }
 
     *claimed_xid = *trx->xid;
+    trx_preserve_note_rseg_owner_xid_reset(trx);
     trx->xid->reset();
     return trx;
   }
@@ -251,6 +307,7 @@ static void trx_preserve_release_token_rollback_claim(trx_t *trx,
   trx_sys_mutex_enter();
   if (trx->xid->is_null()) {
     *trx->xid = xid;
+    trx_preserve_note_rseg_owner_xid_restore(trx);
   }
   trx_sys_mutex_exit();
 }
@@ -417,6 +474,7 @@ dberr_t trx_preserve_rollback_claimed(trx_t *trx) {
       return DB_ERROR;
     }
     claimed_xid = *trx->xid;
+    trx_preserve_note_rseg_owner_xid_reset(trx);
     trx->xid->reset();
     trx->preserve_trx_claimed = false;
     claimed = true;
@@ -436,12 +494,38 @@ dberr_t trx_preserve_rollback_claimed(trx_t *trx) {
     trx_sys_mutex_enter();
     if (trx->xid->is_null()) {
       *trx->xid = claimed_xid;
+      trx_preserve_note_rseg_owner_xid_restore(trx);
       trx->preserve_trx_claimed = true;
     }
     trx_sys_mutex_exit();
   }
 
   return err;
+}
+
+bool trx_preserve_token_has_any_owner(const char *token) {
+  XID xid;
+
+  if (!trx_preserve_token_to_xid(token, &xid) || trx_sys == nullptr) {
+    return false;
+  }
+
+  bool found = false;
+  trx_sys_mutex_enter();
+
+  for (trx_t *trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
+       trx = UT_LIST_GET_NEXT(trx_list, trx)) {
+    assert_trx_in_rw_list(trx);
+
+    if (trx->xid != nullptr && xid.eq(trx->xid) &&
+        trx_preserve_state_allows_token_rollback(trx->state)) {
+      found = true;
+      break;
+    }
+  }
+
+  trx_sys_mutex_exit();
+  return found;
 }
 
 static bool trx_preserve_xid_token_in(
@@ -1511,6 +1595,10 @@ bool trx_preserve_thd_can_accept_preserved_trx(THD *thd) {
 
 bool trx_preserve_rseg_has_preserved_trx(const trx_rseg_t *rseg) {
   if (rseg == nullptr) return false;
+  if (trx_preserve_active_preserved_rseg_owners.load(
+          std::memory_order_acquire) == 0) {
+    return false;
+  }
 
   bool found = false;
   trx_sys_mutex_enter();
@@ -1538,6 +1626,11 @@ void trx_preserve_collect_preserved_rsegs(
   if (rsegs == nullptr) return;
 
   rsegs->clear();
+  if (trx_preserve_active_preserved_rseg_owners.load(
+          std::memory_order_acquire) == 0) {
+    return;
+  }
+
   auto remember_rseg = [rsegs](const trx_rseg_t *rseg) {
     if (rseg != nullptr &&
         std::find(rsegs->begin(), rsegs->end(), rseg) == rsegs->end()) {

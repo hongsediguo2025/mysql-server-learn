@@ -663,6 +663,12 @@ void finish_result(Preserve_trx_promotion_adopt_result *result,
   result->elapsed_us = my_micro_time() - started_us;
 }
 
+bool promotion_cleanup_terminal_absence_proven(const std::string &token) {
+  return preserved_trx_recovery_complete() &&
+         !preserved_trx_local_record_exists(token) &&
+         !trx_preserve_token_has_any_owner(token.c_str());
+}
+
 void append_result_message(Preserve_trx_promotion_adopt_result *result,
                            const std::string &message) {
   if (result == nullptr || message.empty()) return;
@@ -1469,12 +1475,18 @@ preserved_trx_cleanup_abandoned_standby_promotion_epoch(
           Preserve_trx_promotion_cleanup_state::CLEANUP_ROLLED_BACK;
       token.reason = "prepared trx rolled back";
     } else if (rollback_status == DB_NOT_FOUND) {
-      token.cleanup_state =
-          Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING;
-      token.reason =
-          "prepared trx not found; cleanup remains pending until terminal "
-          "absence is proven";
-      ++result->cleanup_pending_count;
+      if (promotion_cleanup_terminal_absence_proven(token_string)) {
+        token.cleanup_state =
+            Preserve_trx_promotion_cleanup_state::CLEANUP_NOT_FOUND;
+        token.reason = "prepared trx not found after terminal absence proof";
+      } else {
+        token.cleanup_state =
+            Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING;
+        token.reason =
+            "prepared trx not found; cleanup remains pending until terminal "
+            "absence is proven";
+        ++result->cleanup_pending_count;
+      }
     } else {
       token.cleanup_state =
           Preserve_trx_promotion_cleanup_state::CLEANUP_TAINTED;

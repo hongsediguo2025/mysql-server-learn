@@ -64,6 +64,11 @@ class MDL_context_backup_manager {
   static MDL_context_backup_manager *m_single;
 
  public:
+  enum class MDL_context_backup_policy {
+    STANDARD_XA,
+    PRESERVE_STRICT
+  };
+
   /* Not copyable. */
   MDL_context_backup_manager(const MDL_context_backup_manager &) = delete;
 
@@ -110,14 +115,19 @@ class MDL_context_backup_manager {
     @param[in]  context      MDL_context from which backup is created.
     @param[in]  key          Key to identity MDL_context
     @param[in]  keylen       Key Length
+    @param[in]  policy       Duplicate handling policy. Standard XA keeps the
+                             original idempotent behavior; preserve restore
+                             paths use PRESERVE_STRICT to fail closed.
 
     @retval     true         Error, e.g. Fail to create backup object, fail
                              to clone locks.
-    @retval     false        Success  or a backup already exist for this key.
+    @retval     false        Success, or duplicate key under STANDARD_XA.
   */
 
   bool create_backup(const MDL_context *context, const uchar *key,
-                     const size_t keylen);
+                     const size_t keylen,
+                     MDL_context_backup_policy policy =
+                         MDL_context_backup_policy::STANDARD_XA);
 
   /**
     Create backup MDL_context, process request on it and add to backup context
@@ -149,15 +159,17 @@ class MDL_context_backup_manager {
     @param[out]  mdl_context  MDL_context to which backup is restored.
     @param[in]  key           Key to identity MDL_context
     @param[in]  keylen        Key Length
+    @param[in]  policy        Missing-backup handling policy.
 
-    @retval     true          Error, e.g. There is no element in the
-                              collection matching given key, fail
-                              to retore locks.
+    @retval     true          Error, e.g. fail to restore locks, or missing
+                              key under PRESERVE_STRICT.
     @retval     false         Success
   */
 
   bool restore_backup(MDL_context *mdl_context, const uchar *key,
-                      const size_t keylen);
+                      const size_t keylen,
+                      MDL_context_backup_policy policy =
+                          MDL_context_backup_policy::STANDARD_XA);
 
   /**
     Delete backup context and release associated locks.

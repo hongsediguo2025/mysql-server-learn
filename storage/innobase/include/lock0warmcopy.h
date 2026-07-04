@@ -312,6 +312,8 @@ dberr_t lock_warmcopy_frozen_conversion_result(int sel_mode);
 dberr_t lock_warmcopy_wait_for_conversion_thaw(trx_t *trx);
 dberr_t lock_warmcopy_wait_for_conversion_thaw_for_unit_test(
     const trx_t *trx, uint timeout_ms);
+dberr_t lock_warmcopy_wait_for_conversion_thaw_abort_for_unit_test(
+    const trx_t *trx, uint timeout_ms, bool abort_now);
 void lock_warmcopy_conversion_freeze_wait_note();
 uint64_t lock_warmcopy_conversion_freeze_wait_count();
 

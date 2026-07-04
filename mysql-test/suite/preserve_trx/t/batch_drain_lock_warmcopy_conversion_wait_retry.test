@@ -66,6 +66,8 @@ die "wait/retry helper must return success after the frozen state clears\n"
   unless $wait_impl =~ /if\s*\(\s*!\s*is_frozen\s*\(\s*\)\s*\)\s*\{\s*return\s+DB_SUCCESS/s;
 die "wait/retry helper must honor zero timeout as DB_LOCK_WAIT_TIMEOUT\n"
   unless $wait_impl =~ /timeout_ms\s*==\s*0[\s\S]*return\s+DB_LOCK_WAIT_TIMEOUT/s;
+die "wait/retry helper must support interrupted aborts\n"
+  unless $wait_impl =~ /should_abort\s*\(\s*\)[\s\S]*return\s+DB_INTERRUPTED/s;
 die "wait/retry helper must expose waiter registration and avoid busy spin\n"
   unless $wait_impl =~ /DEBUG_SYNC_C\s*\(\s*"lock_warmcopy_conversion_waiter_registered"\s*\)/s &&
          $wait_impl =~ /os_thread_sleep\s*\(\s*1000\s*\)/s;
@@ -78,6 +80,9 @@ die "public wait helper must count waits and sample frozen state under trx mutex
   unless $wait_public =~ /lock_warmcopy_conversion_freeze_wait_note\s*\(\s*\)/s &&
          $wait_public =~ /trx_mutex_enter\s*\(\s*trx\s*\)[\s\S]*lock_warmcopy_trx_conversion_is_frozen\s*\(\s*&trx->lock\s*\)[\s\S]*trx_mutex_exit\s*\(\s*trx\s*\)/s &&
          $wait_public =~ /preserve_trx_lock_warmcopy_conversion_wait_timeout_ms/s;
+die "public wait helper must abort on KILL or shutdown instead of waiting for the full conversion timeout\n"
+  unless $wait_public =~ /thd_killed\s*\(\s*trx->mysql_thd\s*\)/s &&
+         $wait_public =~ /srv_shutdown_state\.load\s*\(\s*\)\s*!=\s*SRV_SHUTDOWN_NONE/s;
 
 my $impl_to_expl = extract_function(
   $lock,
@@ -108,6 +113,10 @@ die "GUnit must cover timeout while frozen\n"
   unless $gunit =~ /WaitForThawTimesOutWhenStillFrozen/s &&
          $gunit =~ /lock_warmcopy_wait_for_conversion_thaw_for_unit_test\s*\(\s*&trx,\s*0\s*\)/s &&
          $gunit =~ /EXPECT_EQ\s*\(\s*DB_LOCK_WAIT_TIMEOUT/s;
+die "GUnit must cover interrupted wait while frozen\n"
+  unless $gunit =~ /WaitForThawReturnsInterruptedOnAbort/s &&
+         $gunit =~ /lock_warmcopy_wait_for_conversion_thaw_abort_for_unit_test\s*\(\s*&trx,\s*1000,\s*true\s*\)/s &&
+         $gunit =~ /EXPECT_EQ\s*\(\s*DB_INTERRUPTED/s;
 die "GUnit must assert conversion wait status accounting\n"
   unless $gunit =~ /lock_warmcopy_conversion_freeze_wait_count/s &&
          $gunit =~ /EXPECT_EQ\s*\(\s*wait_count_before\s*\+\s*1/s;

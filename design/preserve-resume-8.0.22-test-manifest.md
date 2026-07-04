@@ -25,6 +25,71 @@ real topology checks were added upstream.  The 8.0.22 port now also carries:
   this is collected by MTR and skips when the Group Replication plugin is not
   available in the local build.
 
+## 2026-07-03 Current Suite Snapshot
+
+This file remains a migration manifest, not a complete current-suite index.
+For review and release planning, use the current snapshot below before reading
+the historical table:
+
+- `mysql-test/suite/preserve_trx/t` currently contains 439 `.test` files.
+- 26 files are named `*_lint.test`; these are source-shape/static guard tests
+  and must not be counted as behavior coverage.
+- 43 files are named `*lock_warmcopy*.test`; these cover lock-warmcopy
+  source-shape, fallback, canonical-equivalence, and phase-2 behavior paths.
+- 21 files are named `*temp_table_dml*.test`; these cover the native
+  temporary-table DML adoption paths in addition to older temp-table sidecar
+  and fail-closed tests.
+- Transfer/promotion is currently targeted readiness: the MTR suite includes
+  `standby_transfer_mode_rejects_local_preserve`,
+  `standby_transfer_receiver_privilege`, `fault_injection_resume_transfer_mdl`,
+  and `resume_transfer_mdl_binlog_cache_cleanup`, while most protocol,
+  receiver, and promotion-adopt mechanics are covered in GUnit/source-shape
+  tests. There is still no complete source drain -> receiver durable write ->
+  prewarm -> promotion adopt -> ordinary resume E2E, so standby
+  transfer/promotion must not be described as production-complete.
+
+Current branch additions after the 2026-06-28 gates include:
+
+- `batch_drain_temp_table_dml_two_temp_spaces_commit_resume` and
+  `batch_drain_temp_table_dml_two_temp_spaces_rollback_resume`, proving that
+  two existing user InnoDB temporary tables in one transaction can both receive
+  phase-1 DML, survive preserve/restart/resume, and continue DML before final
+  commit or rollback.
+- `temp_table_resume_staged_link_failure_cleanup` now covers native no-redo
+  undo reconnect followed by staged table link failure, retry cleanup, second
+  RESUME, continued temp DML, and final COMMIT.
+- `temp_table_row_hook_no_payload_lint` now guards both the production `TABLE*`
+  row hook and the ordinal compatibility wrapper: row hooks must not copy row
+  payload, encode sidecars, or append SQL row journal data.
+- `code_review_resumable_trx_slices_lint` now rejects hardcoded portable
+  transfer codec context constants in production code.
+- `token_redaction` now covers odd-length hex literals such as `0xF`; those
+  literals are not valid token encodings and should remain visible as raw user
+  input rather than being redacted as if they were a valid token.
+
+Current 2026-07-03 targeted gate evidence:
+
+- `cmake --build build-debug --target mysqld preserve_trx-t
+  preserve_trx_temp_table-t -j4` passed.
+- `build-debug/runtime_output_directory/preserve_trx-t` passed, 389/389
+  tests.
+- `build-debug/runtime_output_directory/preserve_trx_temp_table-t` passed,
+  309/309 runtime test instances.
+- Targeted `preserve_trx` MTR no-bin passed for transfer/promotion, lint,
+  odd-hex token redaction, staged temp-table link-failure cleanup, and the
+  two-temp-space DML commit/rollback tests.
+- Targeted `preserve_trx` MTR log-bin passed for transfer/promotion, lint,
+  odd-hex token redaction, and `resume_transfer_mdl_binlog_cache_cleanup`.
+- The original temp-table continue smoke E2E crash shape was rerun at
+  `/tmp/preserve_e2e_reports/temp_continue_smoke_20260703_141802.json`; it
+  completed with `post_resume_temp_dml_executed=true`.
+- Full `preserve_trx` MTR no-bin passed with
+  `--mysqld=--skip-log-bin`: 325/325 collected tests successful, 115 skipped
+  by suite requirements.
+- Full `preserve_trx` MTR log-bin passed with
+  `--mysqld=--log-bin=mysql-bin`: 287/287 collected tests successful, 153
+  skipped by suite requirements.
+
 ## Current Gate Evidence
 
 ### Exact-Current Native Temp-Table DML Adoption Gate: 2026-06-28

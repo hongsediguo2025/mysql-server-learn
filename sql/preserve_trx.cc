@@ -124,6 +124,8 @@ uint preserve_trx_max_modified_tables = 64;
 uint preserve_trx_max_scan_pages = 20000;
 uint preserve_trx_materialize_timeout_ms = 5000;
 ulong preserve_trx_drain_mode = PRESERVE_TRX_DRAIN_MODE_SOFT;
+ulong preserve_trx_off_artifact_policy =
+    PRESERVE_TRX_OFF_ARTIFACT_POLICY_FAIL_IF_PRESENT;
 uint preserve_trx_drain_grace_ms = 30000;
 uint preserve_trx_drain_hard_timeout_ms = 30000;
 bool preserve_trx_warmcopy_enable = true;
@@ -161,6 +163,26 @@ void preserve_trx_set_enable_value(bool enabled) {
   preserve_trx_enable = enabled;
   g_preserve_trx_enable_cached.store(enabled, std::memory_order_release);
   g_preserve_trx_enable_cache_initialized.store(true, std::memory_order_release);
+}
+
+bool preserve_trx_off_artifact_policy_ignore() {
+  return preserve_trx_off_artifact_policy ==
+         PRESERVE_TRX_OFF_ARTIFACT_POLICY_IGNORE;
+}
+
+bool preserve_trx_off_artifact_policy_recover() {
+  return preserve_trx_off_artifact_policy ==
+         PRESERVE_TRX_OFF_ARTIFACT_POLICY_RECOVER;
+}
+
+bool preserve_trx_off_artifact_policy_abandon() {
+  return preserve_trx_off_artifact_policy ==
+         PRESERVE_TRX_OFF_ARTIFACT_POLICY_ABANDON;
+}
+
+bool preserve_trx_off_artifact_policy_fail_if_present() {
+  return preserve_trx_off_artifact_policy ==
+         PRESERVE_TRX_OFF_ARTIFACT_POLICY_FAIL_IF_PRESENT;
 }
 
 uint preserve_trx_auto_parallel_preserve_threads(uint hardware_threads) {
@@ -210,6 +232,9 @@ constexpr uint16_t kUserVariablesVersion = 2;
 constexpr size_t kUserVariablesHeaderLength = 6;
 constexpr size_t kUserVariableEntryFixedLength = 12;
 
+std::string normalize_dir(std::string dir);
+std::string preserve_trx_default_dir();
+
 bool preserved_trx_startup_needed_crash_recovery() {
   DBUG_EXECUTE_IF("preserve_trx_force_crash_recovery_abandon_guard",
                   return true;);
@@ -223,6 +248,71 @@ bool preserved_trx_listing_has_crash_abandon_artifacts(
          !listing.temp_sidecar_tokens.empty() ||
          !listing.tainted_tokens.empty() ||
          !listing.warm_external_blob_artifacts.empty();
+}
+
+bool preserved_trx_listing_has_any_artifact(
+    const Preserved_trx_carrier_listing &listing) {
+  return preserved_trx_listing_has_crash_abandon_artifacts(listing) ||
+         !listing.standby_pending_tokens.empty() ||
+         !listing.promotion_adopted_tokens.empty() ||
+         !listing.promotion_intent_tokens.empty();
+}
+
+static std::string preserved_trx_listing_artifact_summary(
+    const Preserved_trx_carrier_listing &listing) {
+  return "snapshots=" + std::to_string(listing.snapshot_tokens.size()) +
+         ", external_blobs=" +
+         std::to_string(listing.external_blob_tokens.size()) +
+         ", temp_sidecars=" +
+         std::to_string(listing.temp_sidecar_tokens.size()) +
+         ", tainted=" + std::to_string(listing.tainted_tokens.size()) +
+         ", standby_pending=" +
+         std::to_string(listing.standby_pending_tokens.size()) +
+         ", promotion_adopted=" +
+         std::to_string(listing.promotion_adopted_tokens.size()) +
+         ", promotion_intent=" +
+         std::to_string(listing.promotion_intent_tokens.size()) +
+         ", warm_external=" +
+         std::to_string(listing.warm_external_blob_artifacts.size());
+}
+
+static bool preserve_trx_off_artifact_preflight(const char *phase) {
+  if (preserve_trx_is_enabled()) return false;
+  if (preserve_trx_off_artifact_policy_ignore() ||
+      preserve_trx_off_artifact_policy_recover() ||
+      preserve_trx_off_artifact_policy_abandon()) {
+    return false;
+  }
+
+  const std::string dir = normalize_dir(preserve_trx_default_dir());
+  auto store = create_preserved_trx_default_store(dir);
+  Preserved_trx_carrier_listing listing;
+  if (store->list_tokens(&listing) != Preserve_snapshot_status::OK) {
+    const std::string message =
+        "PRESERVE: preserve_trx_enable=OFF and "
+        "preserve_trx_off_artifact_policy=FAIL_IF_PRESENT, but failed to "
+        "scan preserved transaction directory '" +
+        dir + "'";
+    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
+    return true;
+  }
+
+  if (!preserved_trx_listing_has_any_artifact(listing)) return false;
+
+  std::string message =
+      "PRESERVE: preserve_trx_enable=OFF found historical Preserve/Resume "
+      "artifacts under '" +
+      dir + "' (" + preserved_trx_listing_artifact_summary(listing) +
+      "). Start with preserve_trx_enable=ON to recover them, use "
+      "preserve_trx_off_artifact_policy=ABANDON for explicit rollback/"
+      "cleanup, or use IGNORE only after external HA tooling has removed or "
+      "intentionally isolated the artifacts";
+  if (phase != nullptr && phase[0] != '\0') {
+    message.append(" during ");
+    message.append(phase);
+  }
+  LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
+  return true;
 }
 
 bool preserved_trx_crash_recovery_artifacts_forbidden(
@@ -5771,6 +5861,20 @@ bool preserve_trx_magic_xid_has_snapshot(const XID &xid) {
   return preserve_trx_magic_xid_has_snapshot_impl(xid);
 }
 
+bool preserve_trx_magic_xid_should_be_protected(const XID &xid) {
+  if (!xid_is_preserve_magic(xid)) return false;
+  if (preserve_trx_is_enabled()) return true;
+  if (preserve_trx_off_artifact_policy_ignore()) return false;
+
+  /*
+    FAIL_IF_PRESENT rejects preserved artifacts before the server starts
+    serving. RECOVER and ABANDON are explicit artifact-handling modes. In all
+    three modes a live magic XID backed by a token file must stay out of normal
+    XA/InnoDB commit and rollback paths.
+  */
+  return preserve_trx_magic_xid_has_snapshot_impl(xid);
+}
+
 bool preserve_trx_temp_table_session_needs_eligibility_check(const THD *thd) {
   return preserve_trx_temp_table_enable && thd != nullptr &&
          thd->temporary_tables != nullptr;
@@ -5929,6 +6033,15 @@ void preserved_trx_mark_recovery_complete() {
   mark_preserved_trx_recovery_complete();
 }
 
+bool preserved_trx_recovery_complete() {
+  std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
+  return g_preserved_trx_recovery_done;
+}
+
+bool preserved_trx_local_record_exists(const std::string &token) {
+  return preserved_trx_find_record(token, nullptr);
+}
+
 bool preserved_trx_validate_snapshot_support(bool allow_create_missing) {
   const std::string dir = preserve_trx_default_dir();
   return preserved_trx_default_carrier_support_has_error(dir,
@@ -5982,6 +6095,14 @@ void preserved_trx_set_manager_state_publication_probe_for_unit_test(
 void preserved_trx_set_manager_state_for_unit_test(
     Preserve_trx_manager_state state, my_thread_id owner_thread_id) {
   preserve_trx_store_manager_state_owner(state, owner_thread_id);
+}
+
+void preserved_trx_set_recovery_complete_for_unit_test(bool complete) {
+  {
+    std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
+    g_preserved_trx_recovery_done = complete;
+  }
+  g_preserved_trx_recovery_cond.notify_all();
 }
 
 void preserved_trx_add_record_for_unit_test(const std::string &token,
@@ -6223,7 +6344,7 @@ bool preserved_trx_begin_command_read(THD *thd) {
 
 bool preserved_trx_command_read_is_idle(THD *thd) {
   if (thd == nullptr) return false;
-  if (!preserve_trx_is_enabled()) return false;
+  if (!preserve_trx_is_enabled()) return thd->m_server_idle;
 
   uint64_t hard_deadline_us = 0;
   uint quiesced_wait_loops = 0;
@@ -6245,7 +6366,11 @@ bool preserved_trx_command_read_is_idle(THD *thd) {
 
 bool preserved_trx_end_idle_for_command_packet(THD *thd) {
   if (thd == nullptr) return false;
-  if (!preserve_trx_is_enabled()) return false;
+  if (!preserve_trx_is_enabled()) {
+    const bool was_idle = thd->m_server_idle;
+    if (was_idle) thd->m_server_idle = false;
+    return was_idle;
+  }
 
   uint64_t hard_deadline_us = 0;
   uint quiesced_wait_loops = 0;
@@ -6942,6 +7067,57 @@ static Preserve_snapshot_status validate_temp_sidecars_for_bootstrap(
   return status;
 }
 
+static Preserve_snapshot_status reserve_temp_sidecars_for_resume_retry(
+    const std::string &dir, const std::string &token,
+    const Preserve_snapshot_metadata &metadata, std::string *reason) {
+  if (metadata.temp_table_manifest_payload.empty()) {
+    if (reason != nullptr) reason->clear();
+    return Preserve_snapshot_status::OK;
+  }
+
+  std::vector<trx_preserve_temp_space_image_descriptor> descriptors;
+  if (!build_temp_bootstrap_descriptors(metadata, &descriptors, reason)) {
+    return Preserve_snapshot_status::CORRUPT;
+  }
+
+  /*
+    Startup normally reserves preserved source space ids before InnoDB starts
+    handing out session temporary tablespaces. If the temp-table subfeature was
+    explicitly disabled at startup, RESUME may still become valid after the DBA
+    enables it again. In that retry path, reserve any still-free source ids
+    before claiming the preserved record. A conflict remains fail-closed and
+    leaves the token untouched for operator recovery.
+  */
+  std::vector<uint32_t> created_space_ids;
+  for (const trx_preserve_temp_space_image_descriptor &descriptor :
+       descriptors) {
+    bool created = false;
+    if (!trx_preserve_temp_space_image_reserve_or_keep_space_id(descriptor,
+                                                                &created)) {
+      for (uint32_t source_space_id : created_space_ids) {
+        (void)trx_preserve_temp_space_image_release_reserved_space_id(
+            source_space_id);
+      }
+      if (reason != nullptr) {
+        *reason =
+            "failed to reserve preserved temporary tablespace id during resume";
+      }
+      return Preserve_snapshot_status::UNSUPPORTED;
+    }
+    if (created) created_space_ids.push_back(descriptor.source_space_id);
+  }
+
+  const Preserve_snapshot_status sidecar_status =
+      validate_temp_sidecars_for_bootstrap(dir, token, metadata, reason);
+  if (sidecar_status != Preserve_snapshot_status::OK) {
+    for (uint32_t source_space_id : created_space_ids) {
+      (void)trx_preserve_temp_space_image_release_reserved_space_id(
+          source_space_id);
+    }
+  }
+  return sidecar_status;
+}
+
 bool preserved_trx_recovery_read_failure_requires_startup_abort_for_unit_test(
     Preserve_snapshot_status status) {
   return preserved_trx_recovery_read_failure_requires_startup_abort(status);
@@ -7543,7 +7719,8 @@ static bool create_detached_mdl_context(
 
   if (!error) {
     error = MDL_context_backup_manager::instance().create_backup(
-        &context, preserve_mdl_key_data(metadata.token), metadata.token.length());
+        &context, preserve_mdl_key_data(metadata.token), metadata.token.length(),
+        MDL_context_backup_manager::MDL_context_backup_policy::PRESERVE_STRICT);
   }
 
   context.release_transactional_locks();
@@ -7553,13 +7730,15 @@ static bool create_detached_mdl_context(
 
 static bool create_detached_mdl_context(THD *thd, const std::string &token) {
   return MDL_context_backup_manager::instance().create_backup(
-      &thd->mdl_context, preserve_mdl_key_data(token), token.length());
+      &thd->mdl_context, preserve_mdl_key_data(token), token.length(),
+      MDL_context_backup_manager::MDL_context_backup_policy::PRESERVE_STRICT);
 }
 
 static bool restore_detached_mdl_context(THD *thd, const std::string &token) {
   DBUG_EXECUTE_IF("preserve_trx_fail_resume_transfer_mdl", return true;);
   return MDL_context_backup_manager::instance().restore_backup(
-      &thd->mdl_context, preserve_mdl_key_data(token), token.length());
+      &thd->mdl_context, preserve_mdl_key_data(token), token.length(),
+      MDL_context_backup_manager::MDL_context_backup_policy::PRESERVE_STRICT);
 }
 
 static void delete_detached_mdl_context(const std::string &token) {
@@ -8406,7 +8585,12 @@ bool preserved_trx_adopt_ready_bundle_for_promotion(
 }
 
 bool preserved_trx_preflight_recoverability() {
-  if (!preserve_trx_is_enabled()) return false;
+  if (!preserve_trx_is_enabled()) {
+    if (!preserve_trx_off_artifact_policy_recover()) {
+      return preserve_trx_off_artifact_preflight(
+          "preserved transaction preflight");
+    }
+  }
   if (srv_force_recovery > 0) return false;
 
   /*
@@ -8461,7 +8645,10 @@ bool preserved_trx_preflight_recoverability() {
 }
 
 bool preserved_temp_images_bootstrap_preamble() {
-  if (!preserve_trx_is_enabled()) return false;
+  if (!preserve_trx_is_enabled() &&
+      !preserve_trx_off_artifact_policy_recover()) {
+    return false;
+  }
   if (srv_force_recovery > 0) return false;
 
   /*
@@ -8538,11 +8725,13 @@ bool preserved_temp_images_bootstrap_preamble() {
     bool reserve_failed = false;
     for (const trx_preserve_temp_space_image_descriptor &descriptor :
          descriptors) {
-      if (!trx_preserve_temp_space_image_reserve_space_id(descriptor)) {
+      bool created = false;
+      if (!trx_preserve_temp_space_image_reserve_or_keep_space_id(descriptor,
+                                                                  &created)) {
         reserve_failed = true;
         break;
       }
-      reserved_space_ids.push_back(descriptor.source_space_id);
+      if (created) reserved_space_ids.push_back(descriptor.source_space_id);
     }
     if (reserve_failed) {
       for (uint32_t reserved_space_id : reserved_space_ids) {
@@ -8720,9 +8909,27 @@ bool preserved_temp_images_bootstrap_preamble() {
 }
 
 bool preserved_trx_recover_all() {
+  const bool off_recover_mode =
+      !preserve_trx_is_enabled() && preserve_trx_off_artifact_policy_recover();
+  const bool off_abandon_mode =
+      !preserve_trx_is_enabled() && preserve_trx_off_artifact_policy_abandon();
+
   if (!preserve_trx_is_enabled()) {
-    preserved_trx_mark_recovery_complete();
-    return false;
+    if (preserve_trx_off_artifact_preflight(
+            "preserved transaction recovery")) {
+      preserved_trx_mark_recovery_complete();
+      return true;
+    }
+    if (off_recover_mode || off_abandon_mode) {
+      /*
+        Explicit OFF artifact-handling modes reuse the startup recovery
+        scan below while the SQL surface still rejects new preserve, drain,
+        resume, transfer, and promotion commands.
+      */
+    } else {
+      preserved_trx_mark_recovery_complete();
+      return false;
+    }
   }
 
   /*
@@ -8770,6 +8977,66 @@ bool preserved_trx_recover_all() {
           listing.tainted_tokens, listing);
   std::set<std::string> warm_external_blob_artifacts =
       listing.warm_external_blob_artifacts;
+
+  if (off_abandon_mode) {
+    bool error = false;
+    for (const std::string &token : listing.snapshot_tokens) {
+      Preserved_trx_bundle cleanup_bundle;
+      Preserve_snapshot_metadata *cleanup_metadata = nullptr;
+      if (store->read(token, true,
+                      Preserved_trx_carrier::Payload_read_mode::METADATA_ONLY,
+                      &cleanup_bundle) == Preserve_snapshot_status::OK) {
+        cleanup_metadata = &cleanup_bundle.metadata;
+      }
+      if (rollback_preserved_snapshot_or_log(
+              dir, token, "preserve_trx_enable=OFF abandon policy",
+              cleanup_metadata,
+              cleanup_metadata == nullptr
+                  ? Temp_sidecar_cleanup_mode::RAW_UNLINK
+                  : Temp_sidecar_cleanup_mode::METADATA_AWARE)) {
+        error = true;
+      }
+    }
+
+    uint32_t orphan_rollback_count = 0;
+    if (trx_preserve_rollback_prepared_without_snapshot(
+            std::vector<std::string>(), &orphan_rollback_count) != DB_SUCCESS) {
+      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: failed to rollback preserved prepared transaction "
+             "during preserve_trx_enable=OFF abandon");
+      error = true;
+    }
+    if (orphan_rollback_count != 0) {
+      LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: rolled back preserved prepared transaction during "
+             "preserve_trx_enable=OFF abandon");
+    }
+
+    for (const std::string &artifact_filename : warm_external_blob_artifacts) {
+      if (delete_orphan_warm_external_blob_artifact_or_log(store.store(),
+                                                           artifact_filename)) {
+        error = true;
+      }
+    }
+    if (delete_orphan_temp_table_sidecars_or_log(store.store(), listing)) {
+      error = true;
+    }
+    for (const std::string &token : listing.external_blob_tokens) {
+      if (listing.snapshot_tokens.find(token) != listing.snapshot_tokens.end())
+        continue;
+      if (delete_orphan_binlog_cache_or_log(dir, token)) error = true;
+    }
+    for (const std::string &token : listing.tainted_tokens) {
+      if (listing.snapshot_tokens.find(token) != listing.snapshot_tokens.end())
+        continue;
+      if (store->remove_taint(token) != Preserve_snapshot_status::OK) {
+        error = true;
+      }
+    }
+
+    preserved_trx_mark_recovery_complete();
+    return error;
+  }
 
   const Preserved_trx_carrier_listing local_crash_listing =
       preserved_trx_local_crash_abandon_listing(listing);
@@ -11184,6 +11451,7 @@ bool Preserve_trx_drain_service::execute(
     } else {
       std::atomic<size_t> next_target_index{0};
       std::atomic<bool> worker_init_failed{false};
+      std::atomic<bool> worker_exception_failed{false};
       std::vector<std::thread> workers;
       workers.reserve(preserve_worker_count);
       for (uint worker_index = 0; worker_index < preserve_worker_count;
@@ -11193,20 +11461,24 @@ bool Preserve_trx_drain_service::execute(
             worker_init_failed.store(true, std::memory_order_relaxed);
             return;
           }
-          char worker_thread_stack_anchor = 0;
-          for (;;) {
-            const size_t target_index =
-                next_target_index.fetch_add(1, std::memory_order_relaxed);
-            if (target_index >= quiesced_target_thread_ids.size()) break;
-            const my_thread_id target_thread_id =
-                quiesced_target_thread_ids[target_index];
-            auto target_it = pinned_by_thread_id.find(target_thread_id);
-            preserve_one_target(
-                target_thread_id,
-                target_it == pinned_by_thread_id.end() ? nullptr
-                                                       : target_it->second,
-                nullptr, &worker_thread_stack_anchor,
-                &target_results[target_index]);
+          try {
+            char worker_thread_stack_anchor = 0;
+            for (;;) {
+              const size_t target_index =
+                  next_target_index.fetch_add(1, std::memory_order_relaxed);
+              if (target_index >= quiesced_target_thread_ids.size()) break;
+              const my_thread_id target_thread_id =
+                  quiesced_target_thread_ids[target_index];
+              auto target_it = pinned_by_thread_id.find(target_thread_id);
+              preserve_one_target(
+                  target_thread_id,
+                  target_it == pinned_by_thread_id.end() ? nullptr
+                                                         : target_it->second,
+                  nullptr, &worker_thread_stack_anchor,
+                  &target_results[target_index]);
+            }
+          } catch (...) {
+            worker_exception_failed.store(true, std::memory_order_relaxed);
           }
           my_thread_end();
         });
@@ -11214,7 +11486,8 @@ bool Preserve_trx_drain_service::execute(
       for (std::thread &worker : workers) {
         worker.join();
       }
-      if (worker_init_failed.load(std::memory_order_relaxed)) {
+      if (worker_init_failed.load(std::memory_order_relaxed) ||
+          worker_exception_failed.load(std::memory_order_relaxed)) {
         for (Preserve_batch_target_execution &execution : target_results) {
           if (!execution.visited_target) execution.pin_error = true;
         }
@@ -11686,6 +11959,20 @@ bool Sql_cmd_resume_preserved_transaction::execute(THD *thd) {
         record.metadata.token,
         "temporary table resume is unsupported until enabled and fully "
         "materialized");
+    return preserve_trx_reject_unsupported();
+  }
+  std::string temp_bootstrap_reason;
+  const Preserve_snapshot_status temp_bootstrap_status =
+      reserve_temp_sidecars_for_resume_retry(preserve_trx_default_dir(), token,
+                                             record.metadata,
+                                             &temp_bootstrap_reason);
+  if (temp_bootstrap_status != Preserve_snapshot_status::OK) {
+    (void)preserved_trx_update_record_last_error(
+        record.metadata.token,
+        temp_bootstrap_reason.empty()
+            ? "temporary table resume bootstrap failed"
+            : "temporary table resume bootstrap failed: " +
+                  temp_bootstrap_reason);
     return preserve_trx_reject_unsupported();
   }
 

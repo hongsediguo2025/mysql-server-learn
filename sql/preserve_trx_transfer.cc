@@ -552,6 +552,12 @@ std::string commit_marker_payload(
          "\n";
 }
 
+std::string transfer_unique_tmp_path(const std::string &final_path,
+                                     const std::string &component) {
+  return final_path + "." + component + "." + std::to_string(my_micro_time()) +
+         ".tmp";
+}
+
 Preserve_trx_transfer_status read_commit_marker(
     const std::string &root_dir,
     const Preserve_trx_transfer_manifest &manifest, bool *committed) {
@@ -588,9 +594,10 @@ Preserve_trx_transfer_status write_commit_marker_file(
   if (already_committed) return Preserve_trx_transfer_status::OK;
 
   const std::string tmp_path =
-      final_path + "." + transfer_token_component(manifest.token) + ".tmp";
+      transfer_unique_tmp_path(final_path, transfer_token_component(manifest.token));
   const std::string payload = commit_marker_payload(manifest);
-  File file = my_create(tmp_path.c_str(), 0600, O_WRONLY | O_TRUNC, MYF(0));
+  File file =
+      my_create(tmp_path.c_str(), 0600, O_WRONLY | O_CREAT | O_EXCL, MYF(0));
   if (file < 0) return Preserve_trx_transfer_status::IO_ERROR;
 
   bool error =
@@ -1399,8 +1406,10 @@ Preserve_trx_transfer_status write_epoch_fact_file(
                                                             fact.epoch_id);
   if (ensure_dir_exists(epoch_dir)) return Preserve_trx_transfer_status::IO_ERROR;
   const std::string final_path = transfer_epoch_fact_path(root_dir, fact.epoch_id);
-  const std::string tmp_path = final_path + ".tmp";
-  File file = my_create(tmp_path.c_str(), 0600, O_WRONLY | O_TRUNC, MYF(0));
+  const std::string tmp_path =
+      transfer_unique_tmp_path(final_path, fact.epoch_id);
+  File file =
+      my_create(tmp_path.c_str(), 0600, O_WRONLY | O_CREAT | O_EXCL, MYF(0));
   if (file < 0) return Preserve_trx_transfer_status::IO_ERROR;
   bool error =
       my_write(file, reinterpret_cast<const unsigned char *>(encoded.data()),
@@ -2706,6 +2715,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
           break;
         }
         std::vector<Preserve_trx_transfer_manifest> epoch_manifests;
+        std::vector<uint64_t> published_tokens;
         epoch_manifests.reserve(records.size());
         for (const Preserve_trx_transfer_receiver_record &epoch_record :
              records) {
@@ -2717,6 +2727,10 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
           status = preserve_trx_transfer_publish_standby_bundle_from_staging(
               root_dir, epoch_manifest, store, timeout_seconds, metadata_out);
           if (status != Preserve_trx_transfer_status::OK) {
+            for (uint64_t published_token : published_tokens) {
+              (void)store->remove_with_status(
+                  transfer_token_component(published_token));
+            }
             (void)cleanup_transfer_token_staging(
                 root_dir, epoch_manifest.epoch_id, epoch_manifest.token);
             const Preserve_trx_transfer_status mark_status =
@@ -2727,10 +2741,17 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
                        ? status
                        : mark_status;
           }
+          published_tokens.push_back(epoch_manifest.token);
         }
         if (status == Preserve_trx_transfer_status::OK) {
-          status =
-              commit_epoch_manifests(root_dir, epoch_manifests, manifest, store);
+          status = commit_epoch_manifests(root_dir, epoch_manifests, manifest,
+                                          store);
+          if (status != Preserve_trx_transfer_status::OK) {
+            for (uint64_t published_token : published_tokens) {
+              (void)store->remove_with_status(
+                  transfer_token_component(published_token));
+            }
+          }
         }
       }
       if (status == Preserve_trx_transfer_status::OK) {
@@ -2793,13 +2814,12 @@ Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload(
 
 void preserve_trx_transfer_dispatch_command(THD *thd) {
   /*
-    The classic command is intentionally invisible unless both the transfer
-    feature and the receiver endpoint are enabled at startup. That keeps normal
-    MySQL clients on the historical unknown-command path when Preserve/Resume
-    transfer is not in use.
+    The classic command is intentionally invisible unless Preserve/Resume and
+    the receiver endpoint are enabled at startup. The source-side transfer
+    switch controls artifact generation and sending on a primary; a standby may
+    run as a receiver-only endpoint.
   */
   if (thd == nullptr || !preserve_trx_is_enabled() ||
-      !preserve_trx_transfer_enable ||
       !preserve_trx_transfer_receiver_enable) {
     my_error(ER_UNKNOWN_COM_ERROR, MYF(0));
     return;

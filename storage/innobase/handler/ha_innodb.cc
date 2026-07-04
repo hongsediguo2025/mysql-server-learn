@@ -19298,7 +19298,7 @@ static xa_status_code innobase_commit_by_xid(
 {
   DBUG_ASSERT(hton == innodb_hton_ptr);
 
-  if (xid != nullptr && trx_preserve_xid_is_magic_active(*xid)) {
+  if (xid != nullptr && trx_preserve_xid_should_be_protected(*xid)) {
     return (XAER_NOTA);
   }
 
@@ -19330,7 +19330,7 @@ static xa_status_code innobase_rollback_by_xid(
 {
   DBUG_ASSERT(hton == innodb_hton_ptr);
 
-  if (xid != nullptr && trx_preserve_xid_is_magic_active(*xid)) {
+  if (xid != nullptr && trx_preserve_xid_should_be_protected(*xid)) {
     return (XAER_NOTA);
   }
 

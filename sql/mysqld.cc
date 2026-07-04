@@ -6283,7 +6283,7 @@ static int init_server_components() {
            "failed to clean orphan preserve lock warmcopy spill files");
   }
 
-  if (!opt_initialize && preserve_trx_is_enabled() &&
+  if (!opt_initialize && !is_help_or_validate_option() &&
       preserved_trx_preflight_recoverability()) {
     unireg_abort(MYSQLD_ABORT_EXIT);
   }
