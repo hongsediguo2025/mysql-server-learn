@@ -135,6 +135,16 @@ die "record bitmap reset hot hook must delegate through lock0warmcopy.cc wrapper
 die "record bitmap reset hot hook must not build shard keys inline\n"
   if $reset_bit =~ /lock_warmcopy_record_shard_key_t/s;
 
+my $discard = extract_function(
+  $lock,
+  qr/void\s+lock_rec_discard\s*\(/,
+  'lock_rec_discard');
+die "record lock discard must mark the warmcopy shard dirty through a thin wrapper\n"
+  unless $discard =~ /lock_warmcopy_hooks_enabled\s*\(\s*\)/s &&
+         $discard =~ /lock_warmcopy_record_mark_discard_for_lock\s*\(/s;
+die "record lock discard hot hook must not build shard keys inline\n"
+  if $discard =~ /lock_warmcopy_record_shard_key_t/s;
+
 my $add_to_queue = extract_function(
   $lock,
   qr/static\s+void\s+lock_rec_add_to_queue\s*\(/,

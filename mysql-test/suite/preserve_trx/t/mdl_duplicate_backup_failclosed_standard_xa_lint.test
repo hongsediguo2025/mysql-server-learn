@@ -38,6 +38,13 @@ my $session_backup = $&;
 die "duplicate session MDL backup must fail closed only for preserve strict policy\n"
   unless $session_backup =~
          /if\s*\(\s*check_key_exist\s*\(\s*key_obj\s*\)\s*\)\s*return\s+policy\s*==\s*MDL_context_backup_policy::PRESERVE_STRICT\s*;/s;
+die "session MDL backup must check the final emplace result under LOCK_mdl_context_backup\n"
+  unless $session_backup =~
+         /auto\s+(?:insert_result|emplace_result)\s*=\s*m_backup_map\.emplace\s*\(\s*key_obj\s*,\s*std::move\s*\(\s*element\s*\)\s*\)/s &&
+         $session_backup =~
+         /(?:insert_result|emplace_result)\.second/s &&
+         $session_backup =~
+         /return\s+policy\s*==\s*MDL_context_backup_policy::PRESERVE_STRICT\s*;/s;
 
 $mdl =~ /bool MDL_context_backup_manager::create_backup\(MDL_request_list \*mdl_requests[\s\S]*?^}/m
   or die "could not isolate recovery MDL create_backup overload\n";

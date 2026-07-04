@@ -13,12 +13,16 @@ my $source_root = File::Spec->rel2abs(
 my $handler_path = File::Spec->catfile($source_root, 'sql', 'handler.cc');
 my $temp_table_path = File::Spec->catfile($source_root, 'sql',
                                           'preserve_trx_temp_table.cc');
+my $sql_class_path = File::Spec->catfile($source_root, 'sql', 'sql_class.h');
 
 open(my $fh, '<', $handler_path) or die "cannot open $handler_path: $!";
 my $handler = do { local $/; <$fh> };
 close($fh);
 open($fh, '<', $temp_table_path) or die "cannot open $temp_table_path: $!";
 my $temp_table = do { local $/; <$fh> };
+close($fh);
+open($fh, '<', $sql_class_path) or die "cannot open $sql_class_path: $!";
+my $sql_class = do { local $/; <$fh> };
 close($fh);
 
 sub function_body {
@@ -61,6 +65,11 @@ die "ordinal temp-table row-write wrapper must not copy SQL row payload bytes\n"
   if $ordinal_wrapper =~ /payload\.assign|payload\.append|std::string\s+payload/s;
 die "ordinal temp-table row-write wrapper must not append row journal records\n"
   if $ordinal_wrapper =~ /Temp_table_journal_record\s+record|append_journal/s;
+
+die "RESTORED_ONLY no-redo undo write gate must not remain after native adoption became mandatory\n"
+  if $handler =~ /restored_no_redo_undo_active/s ||
+     $temp_table =~ /restored_no_redo_undo_active/s ||
+     $sql_class =~ /restored_no_redo_undo_active/s;
 EOF
 
 SELECT 'ok' AS temp_table_row_hook_no_payload_lint;

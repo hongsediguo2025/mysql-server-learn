@@ -1982,16 +1982,6 @@ static void fsp_free_page(const page_id_t &page_id,
 
   xdes_set_bit(descr, XDES_FREE_BIT, bit, TRUE, mtr);
   xdes_set_bit(descr, XDES_CLEAN_BIT, bit, TRUE, mtr);
-  if (fsp_is_system_temporary(page_id.space())) {
-    /*
-      A page released by native undo cleanup no longer belongs to the preserved
-      token. Drop the reservation at the same point the FSP bitmap marks it
-      free, so ordinary temporary allocation can reuse it afterwards.
-    */
-    trx_preserve_temp_space_image_release_page_reservation(
-        static_cast<uint32_t>(page_id.space()),
-        static_cast<uint32_t>(page_id.page_no()));
-  }
 
   frag_n_used = mtr_read_ulint(header + FSP_FRAG_N_USED, MLOG_4BYTES, mtr);
   if (state == XDES_FULL_FRAG) {
@@ -2878,6 +2868,9 @@ static void fseg_fill_free_list(fseg_inode_t *inode, space_id_t space,
     }
 
     descr = fsp_alloc_free_extent(space, page_size, hint, mtr);
+    if (descr == nullptr) {
+      return;
+    }
 
     seg_id = mach_read_from_8(inode + FSEG_ID);
     ut_ad(mach_read_from_4(inode + FSEG_MAGIC_N) == FSEG_MAGIC_N_VALUE);
@@ -3234,6 +3227,9 @@ static buf_block_t *fseg_alloc_free_page_low(fil_space_t *space,
     the hinted page
     ===============*/
     ret_descr = fsp_alloc_free_extent(space_id, page_size, hint, mtr);
+    if (ret_descr == nullptr) {
+      return (nullptr);
+    }
 
     xdes_set_segment_id(ret_descr, seg_id, XDES_FSEG, mtr);
     flst_add_last(seg_inode + FSEG_FREE, ret_descr + XDES_FLST_NODE, mtr);

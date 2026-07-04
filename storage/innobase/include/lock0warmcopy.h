@@ -263,6 +263,7 @@ bool lock_warmcopy_record_bitmap_set_for_lock(const ib_lock_t *lock,
                                               uint32_t heap_no);
 bool lock_warmcopy_record_bitmap_reset_for_lock(const ib_lock_t *lock,
                                                 uint32_t heap_no);
+bool lock_warmcopy_record_mark_discard_for_lock(const ib_lock_t *lock);
 bool lock_warmcopy_record_bitmap_set_with_image_for_trx(
     const trx_t *trx, const lock_warmcopy_record_shard_key_t &key,
     uint32_t heap_no, const lock_warmcopy_record_image_digest_t &digest,

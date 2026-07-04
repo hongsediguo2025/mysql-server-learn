@@ -2299,6 +2299,9 @@ void lock_rec_discard(lock_t *in_lock) {
 
   ut_ad(in_lock->index->table->n_rec_locks.load() > 0);
   in_lock->index->table->n_rec_locks.fetch_sub(1, std::memory_order_relaxed);
+  if (lock_warmcopy_hooks_enabled()) {
+    (void)lock_warmcopy_record_mark_discard_for_lock(in_lock);
+  }
 
   /* We want the state of lock queue and trx_locks list to be synchronized
   atomically from the point of view of people using trx->mutex, so we perform

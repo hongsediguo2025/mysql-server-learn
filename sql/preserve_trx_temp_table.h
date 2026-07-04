@@ -278,8 +278,6 @@ Temp_table_warmcopy_participant *preserve_trx_temp_table_ensure_participant(
 void preserve_trx_temp_table_clear_participant(THD *thd);
 bool preserve_trx_temp_table_transaction_state_needs_clear(const THD *thd);
 void preserve_trx_temp_table_clear_transaction_state(THD *thd);
-bool preserve_trx_temp_table_precheck_row_write(THD *thd,
-                                                const TABLE *table);
 
 bool preserve_trx_temp_table_note_table_create(THD *thd,
                                                uint32_t table_ordinal,

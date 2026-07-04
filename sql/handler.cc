@@ -7834,8 +7834,6 @@ int handler::ha_write_row(uchar *buf) {
   DBUG_EXECUTE_IF("inject_error_ha_write_row", return HA_ERR_INTERNAL_ERROR;);
   DBUG_EXECUTE_IF("simulate_storage_engine_out_of_memory",
                   return HA_ERR_SE_OUT_OF_MEMORY;);
-  if (unlikely(!preserve_trx_temp_table_precheck_row_write(ha_thd(), table)))
-    return HA_ERR_UNSUPPORTED;
   mark_trx_read_write();
 
   DBUG_EXECUTE_IF(
@@ -7876,8 +7874,6 @@ int handler::ha_update_row(const uchar *old_data, uchar *new_data) {
   DBUG_ASSERT(new_data == table->record[0]);
   DBUG_ASSERT(old_data == table->record[1]);
 
-  if (unlikely(!preserve_trx_temp_table_precheck_row_write(ha_thd(), table)))
-    return HA_ERR_UNSUPPORTED;
   mark_trx_read_write();
 
   DBUG_EXECUTE_IF(
@@ -7911,9 +7907,6 @@ int handler::ha_delete_row(const uchar *buf) {
   */
   DBUG_ASSERT(buf == table->record[0] || buf == table->record[1]);
   DBUG_EXECUTE_IF("inject_error_ha_delete_row", return HA_ERR_INTERNAL_ERROR;);
-  if (unlikely(!preserve_trx_temp_table_precheck_row_write(ha_thd(), table)))
-    return HA_ERR_UNSUPPORTED;
-
   DBUG_EXECUTE_IF(
       "handler_crashed_table_on_usage",
       my_error(HA_ERR_CRASHED, MYF(ME_ERRORLOG), table_share->table_name.str);

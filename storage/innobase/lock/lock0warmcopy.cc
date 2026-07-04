@@ -692,6 +692,32 @@ bool record_bitmap_reset_locked(uint64_t target_id,
   return true;
 }
 
+bool record_lock_discard_locked(uint64_t target_id,
+                                const lock_warmcopy_record_shard_key_t &key) {
+  if (record_bitmap_len(key.n_bits) == 0) return false;
+
+  const uint64_t journal_cursor =
+      next_record_journal_sequence_for_target_locked(target_id);
+  lock_warmcopy_record_shard_state_t &shard =
+      find_or_create_record_shard(target_id, key);
+
+  std::fill(shard.normalized_bitmap.begin(), shard.normalized_bitmap.end(), 0);
+  shard.record_images.clear();
+  shard.set_bit_count = 0;
+  shard.missing_record_image_count = 0;
+  shard.forced_invalid = false;
+  shard.shard_state_flags = LOCK_WARMCOPY_RECORD_SHARD_DIRTY |
+                            LOCK_WARMCOPY_RECORD_SHARD_TOMBSTONE;
+  shard.last_diagnostic_reason = "record_lock_discard";
+  ++shard.mutation_generation;
+  add_record_shard_journal_bytes_locked(&shard,
+                                        record_journal_delta_bytes(nullptr));
+  shard.journal_cursor = journal_cursor;
+  shard.last_applied_journal_seq = journal_cursor;
+  update_record_shard_rolling_fingerprint_locked(&shard, 9, 0, nullptr, 0);
+  return true;
+}
+
 bool apply_record_journal_delta_locked(
     uint64_t target_id, uint64_t journal_sequence,
     record_journal_delta_kind_t delta_kind,
@@ -1149,6 +1175,21 @@ bool lock_warmcopy_record_bitmap_reset_for_lock(const lock_t *lock,
   }
 
   return lock_warmcopy_record_bitmap_reset_for_trx(lock->trx, key, heap_no);
+}
+
+bool lock_warmcopy_record_mark_discard_for_lock(const lock_t *lock) {
+  lock_warmcopy_record_shard_key_t key;
+  if (!record_shard_key_from_lock(lock, &key)) {
+    lock_warmcopy_record_hook_event();
+    return false;
+  }
+  if (!lock_warmcopy_hooks_enabled()) return false;
+
+  lock_warmcopy_observed_hook_events.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t target_id = record_target_id_for_trx(lock->trx);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
+  return record_lock_discard_locked(target_id, key);
 }
 
 bool lock_warmcopy_record_bitmap_set_with_image_for_trx(

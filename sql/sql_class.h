@@ -1402,16 +1402,6 @@ class THD : public MDL_context_owner,
   */
   uint64_t preserve_trx_temp_table_no_redo_baseline_top{0};
   /**
-    True after RESUME materialized no-redo undo sidecars for user temporary
-    tables. The current implementation restores the transaction's undo pages
-    and in-memory undo objects, but it does not restore the global temporary
-    rseg/FSP allocator state that would let the resumed transaction append more
-    temp-table undo safely. Row-write entry points reject further temp-table DML
-    while this flag is set; COMMIT and ROLLBACK clear it with the rest of the
-    temp-table preserve transaction state.
-  */
-  bool preserve_trx_temp_table_restored_no_redo_undo_active{false};
-  /**
     Participant identity cleared with the THD preserve state. The current
     temp-table hooks use the has_participant fast path above rather than this
     field as an admission key.

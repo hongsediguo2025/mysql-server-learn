@@ -167,7 +167,7 @@ Preserved_trx_carrier_status fsync_directory_after_install(
   if (!fsync_directory(dir)) return Preserved_trx_carrier_status::OK;
   (void)my_delete(installed_path.c_str(), MYF(0));
   (void)fsync_directory(dir);
-  return Preserved_trx_carrier_status::IO_ERROR;
+  return Preserved_trx_carrier_status::IO_ERROR_DURABLE_SNAPSHOT_MAY_EXIST;
 }
 
 bool write_all(File file, const unsigned char *bytes, size_t size) {

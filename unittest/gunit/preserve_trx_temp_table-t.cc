@@ -2478,6 +2478,12 @@ TEST(TempLivePreserveManifestContractTest,
             fsync_after_install_body.find("fsync_directory(dir)"));
   EXPECT_NE(std::string::npos,
             fsync_after_install_body.find("my_delete(installed_path.c_str()"));
+  EXPECT_NE(std::string::npos,
+            fsync_after_install_body.find(
+                "Preserved_trx_carrier_status::"
+                "IO_ERROR_DURABLE_SNAPSHOT_MAY_EXIST"))
+      << "once the final sidecar path has been linked or renamed, a directory "
+         "fsync failure must report that durable state may already exist";
 
   const std::string image_seal_body =
       extract_function_body_after_signature_for_temp_table_test(
@@ -3353,6 +3359,92 @@ TEST(TempFspAllocationSourceLintTest,
   EXPECT_NE(std::string::npos, branch2.find("xdes_get_offset(ret_descr)"))
       << "when reservation is active, branch 2 must choose the returned extent's "
          "own non-reserved free page instead of the original hint page";
+}
+
+TEST(TempFspAllocationSourceLintTest,
+     FreeExtentAllocatorsHandleReservationExhaustion) {
+  const std::string fsp_source =
+      read_source_file_for_temp_table_test("storage/innobase/fsp/fsp0fsp.cc");
+  ASSERT_FALSE(fsp_source.empty());
+
+  const std::string fill_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          fsp_source, "static void fseg_fill_free_list(");
+  ASSERT_FALSE(fill_body.empty());
+  const size_t fill_alloc =
+      fill_body.find("descr = fsp_alloc_free_extent(");
+  const size_t fill_publish =
+      fill_body.find("xdes_set_segment_id(descr", fill_alloc);
+  ASSERT_NE(std::string::npos, fill_alloc);
+  ASSERT_NE(std::string::npos, fill_publish);
+  const std::string fill_between =
+      fill_body.substr(fill_alloc, fill_publish - fill_alloc);
+  EXPECT_NE(std::string::npos, fill_between.find("descr == nullptr"))
+      << "reservation-aware free-extent lookup can return nullptr after "
+         "skipping preserved pages, so the background FSEG free-list filler "
+         "must stop before publishing a null descriptor";
+
+  const size_t helper_pos =
+      fsp_source.find("static page_no_t xdes_find_free_bit_for_temp_preserve(");
+  ASSERT_NE(std::string::npos, helper_pos);
+  const size_t alloc_signature_pos =
+      fsp_source.find("static buf_block_t *fseg_alloc_free_page_low(",
+                      helper_pos);
+  ASSERT_NE(std::string::npos, alloc_signature_pos);
+  const std::string alloc_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          fsp_source.substr(alloc_signature_pos),
+          "static buf_block_t *fseg_alloc_free_page_low(");
+  ASSERT_FALSE(alloc_body.empty());
+
+  const size_t branch2_pos = alloc_body.find(
+      "2. We allocate the free extent from space and can take");
+  const size_t branch3_pos =
+      alloc_body.find("3. We take any free extent", branch2_pos);
+  ASSERT_NE(std::string::npos, branch2_pos);
+  ASSERT_NE(std::string::npos, branch3_pos);
+  const std::string branch2 =
+      alloc_body.substr(branch2_pos, branch3_pos - branch2_pos);
+  const size_t branch2_alloc =
+      branch2.find("ret_descr = fsp_alloc_free_extent(");
+  const size_t branch2_publish =
+      branch2.find("xdes_set_segment_id(ret_descr", branch2_alloc);
+  ASSERT_NE(std::string::npos, branch2_alloc);
+  ASSERT_NE(std::string::npos, branch2_publish);
+  const std::string branch2_between =
+      branch2.substr(branch2_alloc, branch2_publish - branch2_alloc);
+  EXPECT_NE(std::string::npos, branch2_between.find("ret_descr == nullptr"))
+      << "branch 2 must return nullptr when reservation-aware extent selection "
+         "finds no safe free extent instead of dereferencing ret_descr";
+}
+
+TEST(TempFspAllocationSourceLintTest,
+     GenericFreePageDoesNotReleasePreserveReservations) {
+  const std::string fsp_source =
+      read_source_file_for_temp_table_test("storage/innobase/fsp/fsp0fsp.cc");
+  ASSERT_FALSE(fsp_source.empty());
+
+  const std::string generic_free_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          fsp_source, "static void fsp_free_page(");
+  ASSERT_FALSE(generic_free_body.empty());
+  EXPECT_EQ(std::string::npos,
+            generic_free_body.find(
+                "trx_preserve_temp_space_image_release_page_reservation("))
+      << "generic page free is used by retry cleanup that must keep startup "
+         "page reservations in place; preserve reservation release must happen "
+         "only in exact-claim success or explicit token cleanup paths";
+
+  const std::string exact_claim_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          fsp_source,
+          "static buf_block_t *fseg_claim_reserved_page_for_temp_preserve(");
+  ASSERT_FALSE(exact_claim_body.empty());
+  EXPECT_NE(std::string::npos,
+            exact_claim_body.find(
+                "trx_preserve_temp_space_image_release_page_reservation("))
+      << "successful exact-page native adoption still owns the point where the "
+         "startup reservation can be released";
 }
 
 TEST(TempFspAllocationSourceLintTest,

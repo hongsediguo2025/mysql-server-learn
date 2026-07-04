@@ -1706,8 +1706,7 @@ bool preserve_trx_temp_table_transaction_state_needs_clear(const THD *thd) {
               std::memory_order_acquire) ||
           thd->preserve_trx_temp_table_untracked_change.load(
               std::memory_order_acquire) ||
-          thd->preserve_trx_temp_table_no_redo_baseline_valid ||
-          thd->preserve_trx_temp_table_restored_no_redo_undo_active);
+          thd->preserve_trx_temp_table_no_redo_baseline_valid);
 }
 
 void preserve_trx_temp_table_clear_transaction_state(THD *thd) {
@@ -1718,26 +1717,6 @@ void preserve_trx_temp_table_clear_transaction_state(THD *thd) {
   thd->preserve_trx_temp_table_no_redo_baseline_valid = false;
   thd->preserve_trx_temp_table_no_redo_baseline_present = false;
   thd->preserve_trx_temp_table_no_redo_baseline_top = 0;
-  thd->preserve_trx_temp_table_restored_no_redo_undo_active = false;
-}
-
-bool preserve_trx_temp_table_precheck_row_write(THD *thd,
-                                                const TABLE *table) {
-  if (thd == nullptr ||
-      !thd->preserve_trx_temp_table_restored_no_redo_undo_active ||
-      !temp_table_candidate(table)) {
-    return true;
-  }
-
-  /*
-    A resumed transaction with temp-table no-redo undo sidecars can be finished
-    by COMMIT or ROLLBACK, but appending more temp-table undo is unsafe until
-    the global temp rseg allocator/header state is also restored. Reject before
-    entering the storage engine so the native undo append path cannot reuse or
-    overwrite restored undo pages.
-  */
-  my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
-  return false;
 }
 
 bool preserve_trx_temp_table_note_table_create(
@@ -3619,7 +3598,6 @@ Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume(
   if (link_status != Preserve_snapshot_status::OK) {
     return fail_after_cleanup(link_status, "temp-table staged link failed");
   }
-  thd->preserve_trx_temp_table_restored_no_redo_undo_active = false;
   assign_reason(failure_reason, "");
   return Preserve_snapshot_status::OK;
 }
@@ -3688,7 +3666,6 @@ preserve_trx_temp_table_rollback_materialized_for_resume(
       status = release_status;
     }
   }
-  thd->preserve_trx_temp_table_restored_no_redo_undo_active = false;
   return status;
 }
 

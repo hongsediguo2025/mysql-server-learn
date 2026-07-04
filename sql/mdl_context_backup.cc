@@ -183,7 +183,9 @@ bool MDL_context_backup_manager::create_backup(const MDL_context *context,
       return true;
 
     MUTEX_LOCK(guard, &m_LOCK_mdl_context_backup);
-    m_backup_map.emplace(key_obj, std::move(element));
+    auto emplace_result = m_backup_map.emplace(key_obj, std::move(element));
+    if (!emplace_result.second)
+      return policy == MDL_context_backup_policy::PRESERVE_STRICT;
   } catch (std::bad_alloc &ex) {
     result = true;
   }
