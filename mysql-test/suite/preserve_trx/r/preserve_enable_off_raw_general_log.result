@@ -8,16 +8,16 @@ SELECT COUNT(*) AS raw_token_in_general_log
 FROM mysql.general_log
 WHERE command_type = 'Query'
    AND argument LIKE 'RESUME PRESERVED TRANSACTION%'
-   AND argument LIKE '%msp_off_raw_visible_abcd%';
+   AND argument LIKE '%msp_off_redacted_abcd%';
 raw_token_in_general_log
-1
+0
 SELECT COUNT(*) AS redacted_token_in_general_log
 FROM mysql.general_log
 WHERE command_type = 'Query'
    AND argument LIKE 'RESUME PRESERVED TRANSACTION%'
    AND argument LIKE '%****abcd%';
 redacted_token_in_general_log
-0
+1
 SET GLOBAL general_log=OFF;
 TRUNCATE TABLE mysql.general_log;
 SET GLOBAL log_raw=0;

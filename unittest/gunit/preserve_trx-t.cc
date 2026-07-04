@@ -73,6 +73,7 @@
 #include "sql/sql_base.h"
 #include "sql/sql_class.h"
 #include "sql/sql_parse.h"
+#include "sql/sql_rewrite.h"
 #include "storage/innobase/include/trx0preserve.h"
 #include "unittest/gunit/test_mdl_context_owner.h"
 #include "unittest/gunit/test_utils.h"
@@ -873,6 +874,21 @@ TEST(PreservedTrxRedaction, UsesPlaceholderForEmptyTokenAndKeepsLastFourCharacte
   EXPECT_EQ("****????", preserved_trx_redacted_token(""));
   EXPECT_EQ("****abc", preserved_trx_redacted_token("abc"));
   EXPECT_EQ("****wxyz", preserved_trx_redacted_token("abcdefghijklmnwxyz"));
+}
+
+TEST(PreservedTrxRedaction, RawResumeRewriteRedactsWhenFeatureDisabled) {
+  const bool old_enable = preserve_trx_enable;
+  preserve_trx_enable = false;
+
+  String rewritten;
+  const char query[] =
+      "RESUME PRESERVED TRANSACTION 'msp_feature_off_redaction_abcd'";
+  EXPECT_TRUE(mysql_rewrite_resume_preserved_transaction_raw(
+      nullptr, query, strlen(query), &rewritten));
+  EXPECT_EQ("RESUME PRESERVED TRANSACTION '****abcd'",
+            std::string(rewritten.ptr(), rewritten.length()));
+
+  preserve_trx_enable = old_enable;
 }
 
 TEST(PreservedTrxResourceBudget, LeaseTracksCurrentPeakAndPerTokenLimits) {

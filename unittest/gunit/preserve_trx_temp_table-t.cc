@@ -1282,6 +1282,30 @@ TEST(TempResumeMaterializerContractTest,
 }
 
 TEST(TempResumeMaterializerContractTest,
+     ExactPageClaimReleasesReservationOnlyAfterNativeOwnership) {
+  const std::string fsp_impl =
+      read_source_file_for_temp_table_test("storage/innobase/fsp/fsp0fsp.cc");
+  ASSERT_FALSE(fsp_impl.empty());
+
+  const std::string exact_claim_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          fsp_impl,
+          "static buf_block_t *fseg_claim_reserved_page_for_temp_preserve(");
+  ASSERT_FALSE(exact_claim_body.empty());
+
+  const size_t create_page = exact_claim_body.find("fsp_page_create(");
+  const size_t release_reservation =
+      exact_claim_body.find("trx_preserve_temp_space_image_release_page_reservation(");
+  ASSERT_NE(std::string::npos, create_page);
+  ASSERT_NE(std::string::npos, release_reservation);
+  EXPECT_LT(create_page, release_reservation)
+      << "the preserved-page reservation must remain active until XDES, FSEG "
+         "fragment slot, and the buffer page are all owned by the native "
+         "allocator; otherwise a failed exact claim can lose the only guard "
+         "that keeps ordinary temp allocation away from the page";
+}
+
+TEST(TempResumeMaterializerContractTest,
      NativeOwnedReconnectPreparesUndoForPostResumeDml) {
   const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
       "storage/innobase/trx/trx0temp_preserve.cc");

@@ -15,14 +15,14 @@ TRUNCATE TABLE mysql.general_log;
 
 --disable_query_log
 --error ER_PRESERVE_TRX_DISABLED
-RESUME PRESERVED TRANSACTION 'msp_off_raw_visible_abcd';
+RESUME PRESERVED TRANSACTION 'msp_off_redacted_abcd';
 --enable_query_log
 
 SELECT COUNT(*) AS raw_token_in_general_log
   FROM mysql.general_log
  WHERE command_type = 'Query'
    AND argument LIKE 'RESUME PRESERVED TRANSACTION%'
-   AND argument LIKE '%msp_off_raw_visible_abcd%';
+   AND argument LIKE '%msp_off_redacted_abcd%';
 SELECT COUNT(*) AS redacted_token_in_general_log
   FROM mysql.general_log
  WHERE command_type = 'Query'

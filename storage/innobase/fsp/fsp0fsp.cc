@@ -2587,8 +2587,10 @@ static bool fsp_prepare_reserved_temp_page_for_claim(fil_space_t *space,
 
 /** Claim one exact page that was reserved for preserved temporary-table resume.
 The caller must already have created or located the file segment inode. The
-reservation is released only while the tablespace latch is held, immediately
-before the ordinary FSEG allocator consumes the same page. */
+reservation is released only after XDES, FSEG fragment metadata, and the buffer
+page have all accepted the exact page. If any native ownership step fails, the
+reservation remains as the retry/cleanup guard that keeps ordinary temporary
+allocation away from the preserved page. */
 static buf_block_t *fseg_claim_reserved_page_for_temp_preserve(
     fil_space_t *space, const page_size_t &page_size, fseg_inode_t *inode,
     page_no_t page_no, rw_lock_type_t rw_latch, mtr_t *mtr) {
@@ -2624,9 +2626,6 @@ static buf_block_t *fseg_claim_reserved_page_for_temp_preserve(
   const ulint frag_slot = fseg_find_free_frag_page_slot(inode, mtr);
   if (frag_slot == ULINT_UNDEFINED) return nullptr;
 
-  trx_preserve_temp_space_image_release_page_reservation(
-      static_cast<uint32_t>(space->id), static_cast<uint32_t>(page_no));
-
   /*
     The ordinary segment allocator treats its page argument as a hint, not a
     contract. Native no-redo undo adoption is stricter: the undo header and log
@@ -2644,8 +2643,14 @@ static buf_block_t *fseg_claim_reserved_page_for_temp_preserve(
   fsp_alloc_from_free_frag(header, descr, page_no % FSP_EXTENT_SIZE, mtr);
   fseg_set_nth_frag_page_no(inode, frag_slot, page_no, mtr);
 
-  return fsp_page_create(page_id_t(space->id, page_no), page_size, rw_latch, mtr,
-                         mtr);
+  buf_block_t *block =
+      fsp_page_create(page_id_t(space->id, page_no), page_size, rw_latch, mtr,
+                      mtr);
+  if (block != nullptr) {
+    trx_preserve_temp_space_image_release_page_reservation(
+        static_cast<uint32_t>(space->id), static_cast<uint32_t>(page_no));
+  }
+  return block;
 }
 
 buf_block_t *fseg_create_at_reserved_page_for_temp_preserve(
