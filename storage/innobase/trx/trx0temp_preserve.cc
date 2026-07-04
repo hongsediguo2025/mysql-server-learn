@@ -66,12 +66,16 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "sql/preserve_trx_resource.h"
 #include "sql/preserve_trx_temp_table.h"
 #include "sql/table.h"
+#include "srv0start.h"
 #include "srv0tmp.h"
 #include "trx0rseg.h"
 #include "trx0sys.h"
 #include "trx0trx.h"
 #include "trx0undo.h"
 #include "ut0rnd.h"
+#include "ut0ut.h"
+
+extern uint preserve_trx_warmcopy_close_timeout_ms;
 
 namespace {
 
@@ -437,17 +441,35 @@ void trx_preserve_temp_space_image_mark_dirty_page_stream_degraded_locked(
 void trx_preserve_temp_space_image_mark_no_redo_undo_degraded_locked(
     trx_preserve_temp_space_image_descriptor *descriptor, const char *reason);
 
-void trx_preserve_temp_space_image_wait_for_staged_dirty_pages_to_drain(
+dberr_t trx_preserve_temp_space_image_wait_for_staged_dirty_pages_to_drain(
     uint32_t source_space_id) {
+  const uint timeout_ms = preserve_trx_warmcopy_close_timeout_ms == 0
+                              ? 30000
+                              : preserve_trx_warmcopy_close_timeout_ms;
+  const ib_time_monotonic_us_t started_us = ut_time_monotonic_us();
+  const ib_time_monotonic_us_t timeout_us =
+      static_cast<ib_time_monotonic_us_t>(timeout_ms) * 1000ULL;
+  const ib_time_monotonic_us_t deadline_us =
+      std::numeric_limits<ib_time_monotonic_us_t>::max() - started_us <
+              timeout_us
+          ? std::numeric_limits<ib_time_monotonic_us_t>::max()
+          : started_us + timeout_us;
+
   for (;;) {
+    if (srv_shutdown_state.load() != SRV_SHUTDOWN_NONE) {
+      return DB_INTERRUPTED;
+    }
     (void)trx_preserve_temp_space_image_drain_staged_dirty_pages();
     {
       std::lock_guard<std::mutex> guard{
           trx_preserve_temp_dirty_page_streams_mutex};
       if (trx_preserve_temp_staged_dirty_page_count_for_space_locked(
               source_space_id) == 0) {
-        return;
+        return DB_SUCCESS;
       }
+    }
+    if (ut_time_monotonic_us() >= deadline_us) {
+      return DB_LOCK_WAIT_TIMEOUT;
     }
     std::this_thread::yield();
   }
@@ -526,8 +548,11 @@ class trx_preserve_temp_stage_admission_close_guard {
     }
     DEBUG_SYNC_C("preserve_temp_stage_admission_close_entered");
     for (size_t i = 0; i < m_space_count; ++i) {
-      trx_preserve_temp_space_image_wait_for_staged_dirty_pages_to_drain(
-          m_source_space_ids[i]);
+      if (trx_preserve_temp_space_image_wait_for_staged_dirty_pages_to_drain(
+              m_source_space_ids[i]) != DB_SUCCESS) {
+        (void)trx_preserve_temp_space_image_mark_stage_rejected_during_close(
+            m_source_space_ids[i]);
+      }
     }
   }
 
@@ -1160,6 +1185,33 @@ dberr_t trx_preserve_temp_space_image_copy_no_redo_undo_image_to_block(
   return DB_SUCCESS;
 }
 
+static dberr_t
+trx_preserve_temp_space_image_release_no_redo_undo_fseg_ownership_for_anchor(
+    trx_rseg_t *rseg,
+    const trx_preserve_temp_no_redo_undo_log_anchor &anchor) {
+  if (!anchor.present) return DB_SUCCESS;
+  if (rseg == nullptr) return DB_ERROR;
+
+  ibool finished = false;
+  do {
+    mtr_t mtr;
+    mtr_start(&mtr);
+    mtr_set_log_mode(&mtr, MTR_LOG_NO_REDO);
+
+    rseg->latch();
+    page_t *seg_header =
+        trx_undo_page_get(page_id_t(rseg->space_id, anchor.hdr_page_no),
+                          rseg->page_size, &mtr) +
+        TRX_UNDO_SEG_HDR;
+    fseg_header_t *file_seg = seg_header + TRX_UNDO_FSEG_HEADER;
+    finished = fseg_free_step(file_seg, false, &mtr);
+    rseg->unlatch();
+    mtr_commit(&mtr);
+  } while (!finished);
+
+  return DB_SUCCESS;
+}
+
 dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership_for_anchor(
     const trx_preserve_temp_space_image_descriptor &descriptor, trx_rseg_t *rseg,
     const trx_preserve_temp_no_redo_undo_log_anchor &anchor) {
@@ -1186,6 +1238,8 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership_for_anch
       *pages.front(), header_block, true, &mtr);
   if (err != DB_SUCCESS) {
     mtr_commit(&mtr);
+    (void)trx_preserve_temp_space_image_release_no_redo_undo_fseg_ownership_for_anchor(
+        rseg, anchor);
     return err;
   }
 
@@ -1198,12 +1252,16 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership_for_anch
         file_seg, static_cast<page_no_t>(page->page_no), &mtr);
     if (block == nullptr) {
       mtr_commit(&mtr);
+      (void)trx_preserve_temp_space_image_release_no_redo_undo_fseg_ownership_for_anchor(
+          rseg, anchor);
       return DB_ERROR;
     }
     err = trx_preserve_temp_space_image_copy_no_redo_undo_image_to_block(
         *page, block, false, &mtr);
     if (err != DB_SUCCESS) {
       mtr_commit(&mtr);
+      (void)trx_preserve_temp_space_image_release_no_redo_undo_fseg_ownership_for_anchor(
+          rseg, anchor);
       return err;
     }
   }
@@ -1225,8 +1283,17 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership(
           descriptor, rseg, descriptor.no_redo_insert_undo);
   if (err != DB_SUCCESS) return err;
 
-  return trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership_for_anchor(
+  bool insert_anchor_adopted = false;
+  if (descriptor.no_redo_insert_undo.present) {
+    insert_anchor_adopted = true;
+  }
+  err = trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership_for_anchor(
       descriptor, rseg, descriptor.no_redo_update_undo);
+  if (err != DB_SUCCESS && insert_anchor_adopted) {
+    (void)trx_preserve_temp_space_image_release_no_redo_undo_fseg_ownership_for_anchor(
+        rseg, descriptor.no_redo_insert_undo);
+  }
+  return err;
 }
 
 trx_undo_t *trx_preserve_temp_space_image_create_reconnected_undo(

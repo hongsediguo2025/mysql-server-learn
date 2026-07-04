@@ -672,6 +672,14 @@ die "single-trx drain failure must preserve a specific hard-timeout error\n"
   unless $single_drain_failure_branch =~
          /target_thd->is_error\s*\(\s*\)[\s\S]*return\s+true/s;
 
+$preserve =~
+  /bool preserve_trx_kernel_preserve_attached_transaction\([\s\S]*?^}/m
+  or die "could not isolate preserve_trx_kernel_preserve_attached_transaction\n";
+my $preserve_kernel_kill_branch = $&;
+die "preserve kernel kill checks must route through binlog/export cleanup helpers\n"
+  if $preserve_kernel_kill_branch =~
+     /if\s*\(\s*thd->killed\s*\)\s*\{\s*thd->send_kill_message\s*\(\s*\)\s*;\s*return\s+true\s*;\s*\}/s;
+
 $preserve =~ /class Preserve_thd_context_switch[\s\S]*?^};/m
   or die "could not isolate Preserve_thd_context_switch\n";
 my $context_switch = $&;

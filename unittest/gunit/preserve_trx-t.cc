@@ -3385,7 +3385,7 @@ TEST_F(PreserveSnapshotTest, PromotionDisabledDoesNotCreateCarrierDirectory) {
 }
 
 TEST_F(PreserveSnapshotTest,
-       PromotionDryRunSeesStandbyTokenButStopsBeforeReadyCache) {
+       PromotionDryRunSeesStandbyTokenWithoutWritingCleanupMarker) {
   preserve_trx_set_enable_value(true);
   Preserve_snapshot_metadata meta = metadata();
   meta.token = "902";
@@ -3427,21 +3427,9 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(1U, result.cleanup_pending_count);
 
   MY_STAT stat_area;
-  EXPECT_NE(nullptr,
+  EXPECT_EQ(nullptr,
             my_stat((m_dir + "epoch-1.promotion_abandoned").c_str(),
                     &stat_area, MYF(0)));
-  const std::string abandoned_payload =
-      read_file(m_dir + "epoch-1.promotion_abandoned");
-  Preserve_trx_promotion_abandoned_epoch_marker abandoned_marker;
-  ASSERT_TRUE(preserved_trx_decode_promotion_abandoned_epoch_marker(
-      abandoned_payload, &abandoned_marker));
-  EXPECT_EQ("epoch-1", abandoned_marker.epoch_id);
-  ASSERT_EQ(1U, abandoned_marker.tokens.size());
-  EXPECT_EQ(902U, abandoned_marker.tokens[0].token);
-  EXPECT_EQ(Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
-            abandoned_marker.tokens[0].status);
-  EXPECT_EQ(Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING,
-            abandoned_marker.tokens[0].cleanup_state);
 
   Preserved_trx_carrier_token_state state;
   ASSERT_EQ(Preserved_trx_carrier_status::OK,
@@ -3451,7 +3439,8 @@ TEST_F(PreserveSnapshotTest,
   preserve_trx_set_enable_value(true);
 }
 
-TEST_F(PreserveSnapshotTest, PromotionAbandonedMarkerWriteFailureDoesNotAbort) {
+TEST_F(PreserveSnapshotTest,
+       PromotionDryRunDoesNotAttemptAbandonedMarkerWrite) {
   preserve_trx_set_enable_value(true);
   Preserve_snapshot_metadata meta = metadata();
   meta.token = "913";
@@ -3483,8 +3472,8 @@ TEST_F(PreserveSnapshotTest, PromotionAbandonedMarkerWriteFailureDoesNotAbort) {
   DBUG_SET("-d,preserve_trx_fail_write_promotion_abandoned_epoch");
 
   EXPECT_EQ(1U, result.abandoned_count);
-  EXPECT_EQ(1U, result.cleanup_failed_count);
-  EXPECT_NE(std::string::npos,
+  EXPECT_EQ(0U, result.cleanup_failed_count);
+  EXPECT_EQ(std::string::npos,
             result.message.find("failed to write abandoned marker"));
   MY_STAT stat_area;
   EXPECT_EQ(nullptr,
@@ -4443,13 +4432,13 @@ TEST_F(PreserveSnapshotTest, PromotionReadyCacheMixedTokensAbandonsMissing) {
   EXPECT_EQ(Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING,
             result.token_results[0].cleanup_state);
 
-  const std::string abandoned_payload =
-      read_file(m_dir + "epoch-1.promotion_abandoned");
-  Preserve_trx_promotion_abandoned_epoch_marker abandoned_marker;
-  ASSERT_TRUE(preserved_trx_decode_promotion_abandoned_epoch_marker(
-      abandoned_payload, &abandoned_marker));
-  ASSERT_EQ(1U, abandoned_marker.tokens.size());
-  EXPECT_EQ(916U, abandoned_marker.tokens[0].token);
+  MY_STAT stat_area;
+  EXPECT_EQ(nullptr,
+            my_stat((m_dir + "epoch-1.promotion_abandoned").c_str(),
+                    &stat_area, MYF(0)))
+      << "readiness dry-run may report abandoned diagnostics, but only a real "
+         "promotion adopt or explicit destructive abandon may persist cleanup "
+         "markers";
 
   preserved_trx_promotion_ready_cache_clear_for_unit_test();
   preserve_trx_set_enable_value(true);
@@ -7302,6 +7291,51 @@ TEST_F(PreserveSnapshotTest, LocalFileStoreWritesStandbyPendingMarker) {
   EXPECT_TRUE(state.standby_pending);
 }
 
+TEST_F(PreserveSnapshotTest, LocalFileStoreRejectsSymlinkDirectory) {
+#ifdef _WIN32
+  GTEST_SKIP() << "directory symlink behavior is POSIX-specific";
+#else
+  const std::string real_dir = m_dir + "real";
+  const std::string link_dir = m_dir + "link";
+  ASSERT_EQ(0, my_mkdir(real_dir.c_str(), 0700, MYF(0)));
+  ASSERT_EQ(0, symlink(real_dir.c_str(), link_dir.c_str()));
+
+  Local_file_preserved_trx_carrier carrier(link_dir + FN_LIBCHAR);
+  EXPECT_NE(Preserved_trx_carrier_status::OK,
+            carrier.mark_standby_pending("symlink_token"));
+
+  MY_STAT stat_area;
+  EXPECT_EQ(nullptr, my_stat((real_dir + FN_LIBCHAR + "symlink_token"
+                              ".standby_pending")
+                                 .c_str(),
+                             &stat_area, MYF(0)));
+#endif
+}
+
+TEST_F(PreserveSnapshotTest, LocalFileAtomicWriteUsesNoFollowTempCreate) {
+  std::string source_path = __FILE__;
+  const std::string suffix = "unittest/gunit/preserve_trx-t.cc";
+  const size_t suffix_pos = source_path.rfind(suffix);
+  ASSERT_NE(std::string::npos, suffix_pos);
+  source_path.resize(suffix_pos);
+  source_path.append("sql/preserve_trx_carrier_file.cc");
+  const std::string source = read_file(source_path);
+  const size_t atomic_pos = source.find("Atomic_write_status atomic_write_file(");
+  ASSERT_NE(std::string::npos, atomic_pos);
+  const size_t map_pos = source.find("Preserved_trx_carrier_status "
+                                     "map_atomic_write_status",
+                                     atomic_pos);
+  ASSERT_NE(std::string::npos, map_pos);
+  const std::string body = source.substr(atomic_pos, map_pos - atomic_pos);
+
+  EXPECT_NE(std::string::npos, body.find("O_NOFOLLOW"))
+      << "carrier temp files must not follow symlinks during create";
+  EXPECT_EQ(std::string::npos,
+            body.find("O_WRONLY | O_TRUNC | O_EXCL,\n                        "
+                      "MYF(0)"))
+      << "atomic temp create must include O_NOFOLLOW in the access flags";
+}
+
 TEST_F(PreserveSnapshotTest, LocalFileStoreRejectsStandbyPendingTokenReuse) {
   const std::string token = metadata().token;
   Local_file_preserved_trx_carrier carrier(m_dir);
@@ -8207,6 +8241,41 @@ TEST_F(PreserveSnapshotTest, TransferReceiverStagingRejectsConflictingChunk) {
   EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
             preserve_trx_transfer_stage_object_chunk(m_dir, manifest,
                                                      "snapshot", 0, "xyz"));
+}
+
+TEST_F(PreserveSnapshotTest, TransferReceiverStageAndSealShareObjectMutex) {
+  std::string source_path = __FILE__;
+  const std::string suffix = "unittest/gunit/preserve_trx-t.cc";
+  const size_t suffix_pos = source_path.rfind(suffix);
+  ASSERT_NE(std::string::npos, suffix_pos);
+  source_path.resize(suffix_pos);
+  source_path.append("sql/preserve_trx_transfer.cc");
+  const std::string source = read_file(source_path);
+
+  const size_t stage_pos = source.find(
+      "Preserve_trx_transfer_status preserve_trx_transfer_stage_object_chunk(");
+  ASSERT_NE(std::string::npos, stage_pos);
+  const size_t seal_pos = source.find(
+      "Preserve_trx_transfer_status preserve_trx_transfer_seal_staged_object(",
+      stage_pos);
+  ASSERT_NE(std::string::npos, seal_pos);
+  const size_t next_pos = source.find(
+      "Preserve_trx_transfer_status preserve_trx_transfer_seal_manifest_objects(",
+      seal_pos);
+  ASSERT_NE(std::string::npos, next_pos);
+
+  const std::string stage_body = source.substr(stage_pos, seal_pos - stage_pos);
+  const std::string seal_body = source.substr(seal_pos, next_pos - seal_pos);
+  EXPECT_NE(std::string::npos,
+            source.find("std::mutex &transfer_object_stage_mutex("));
+  EXPECT_NE(std::string::npos,
+            stage_body.find("transfer_object_stage_mutex(root_dir, manifest, "
+                            "object_id)"));
+  EXPECT_NE(std::string::npos, stage_body.find("std::lock_guard<std::mutex>"));
+  EXPECT_NE(std::string::npos,
+            seal_body.find("transfer_object_stage_mutex(root_dir, manifest, "
+                           "object_id)"));
+  EXPECT_NE(std::string::npos, seal_body.find("std::lock_guard<std::mutex>"));
 }
 
 TEST_F(PreserveSnapshotTest, TransferReceiverStagingRejectsSparseZeroHole) {
@@ -9332,6 +9401,24 @@ TEST_F(PreserveSnapshotTest,
                                 &first_state));
   EXPECT_FALSE(first_state.snapshot);
   EXPECT_FALSE(first_state.standby_pending);
+  Preserved_trx_carrier_token_state second_state;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(
+                test_transfer_token_string(second_manifest.token),
+                &second_state));
+  EXPECT_TRUE(second_state.snapshot);
+  EXPECT_FALSE(second_state.standby_pending);
+
+  Preserve_trx_transfer_receiver_record first_record;
+  ASSERT_TRUE(
+      registry.lookup(first_manifest.epoch_id, first_manifest.token, &first_record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::CORRUPT, first_record.state);
+
+  Preserve_trx_transfer_receiver_record second_record;
+  ASSERT_TRUE(registry.lookup(second_manifest.epoch_id, second_manifest.token,
+                              &second_record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::CORRUPT,
+            second_record.state);
   EXPECT_FALSE(preserve_trx_transfer_epoch_committed(m_dir, first_manifest));
 }
 

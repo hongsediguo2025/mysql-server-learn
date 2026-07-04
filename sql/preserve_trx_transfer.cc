@@ -24,10 +24,13 @@
 #include "sql/preserve_trx_transfer.h"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <sys/stat.h>
@@ -176,6 +179,26 @@ bool transfer_bundle_codec_context(Preserved_trx_codec_context *context) {
       unit_codec_context_provider();
   if (provider == nullptr) return false;
   return provider(context);
+}
+
+std::mutex &transfer_object_stage_mutex(
+    const std::string &root_dir,
+    const Preserve_trx_transfer_manifest &manifest,
+    const std::string &object_id) {
+  static std::array<std::mutex, 64> object_mutexes;
+  std::string key;
+  key.reserve(root_dir.length() + manifest.epoch_id.length() +
+              object_id.length() + 48);
+  key.append(root_dir);
+  key.push_back('\0');
+  key.append(manifest.epoch_id);
+  key.push_back('\0');
+  key.append(std::to_string(manifest.token));
+  key.push_back('\0');
+  key.append(object_id);
+  const size_t shard =
+      std::hash<std::string>{}(key) % object_mutexes.size();
+  return object_mutexes[shard];
 }
 
 Preserve_trx_transfer_client_endpoint configured_transfer_client_endpoint() {
@@ -2272,6 +2295,10 @@ Preserve_trx_transfer_status preserve_trx_transfer_stage_object_chunk(
       ensure_transfer_token_dir(root_dir, manifest);
   if (dir_status != Preserve_trx_transfer_status::OK) return dir_status;
 
+  std::mutex &object_mutex =
+      transfer_object_stage_mutex(root_dir, manifest, object_id);
+  std::lock_guard<std::mutex> object_guard(object_mutex);
+
   const std::string path = transfer_object_path(root_dir, manifest, *object);
   MY_STAT stat_area;
   if (file_exists(path, &stat_area) &&
@@ -2311,6 +2338,10 @@ Preserve_trx_transfer_status preserve_trx_transfer_seal_staged_object(
       !transfer_component_safe(object_id)) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
+  std::mutex &object_mutex =
+      transfer_object_stage_mutex(root_dir, manifest, object_id);
+  std::lock_guard<std::mutex> object_guard(object_mutex);
+
   const std::string path = transfer_object_path(root_dir, manifest, *object);
   std::string payload;
   const Preserve_trx_transfer_status read_status =
@@ -2550,6 +2581,31 @@ Preserve_trx_transfer_status commit_epoch_manifests(
   return write_commit_marker_file(root_dir, commit_manifest);
 }
 
+Preserve_trx_transfer_status mark_epoch_records_corrupt(
+    Preserve_trx_transfer_receiver_registry *registry,
+    const std::vector<Preserve_trx_transfer_receiver_record> &records,
+    const std::string &reason) {
+  Preserve_trx_transfer_status first_status = Preserve_trx_transfer_status::OK;
+  for (const Preserve_trx_transfer_receiver_record &record : records) {
+    const Preserve_trx_transfer_status status =
+        registry->mark_corrupt(record.epoch_id, record.token, reason);
+    if (status != Preserve_trx_transfer_status::OK &&
+        first_status == Preserve_trx_transfer_status::OK) {
+      first_status = status;
+    }
+  }
+  return first_status;
+}
+
+void cleanup_epoch_transfer_staging(
+    const std::string &root_dir,
+    const std::vector<Preserve_trx_transfer_receiver_record> &records) {
+  for (const Preserve_trx_transfer_receiver_record &record : records) {
+    (void)cleanup_transfer_token_staging(root_dir, record.epoch_id,
+                                         record.token);
+  }
+}
+
 Preserve_trx_transfer_status preserve_trx_transfer_commit_epoch(
     const std::string &root_dir,
     const Preserve_trx_transfer_manifest &manifest, Preserved_trx_store *store) {
@@ -2731,11 +2787,10 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
               (void)store->remove_with_status(
                   transfer_token_component(published_token));
             }
-            (void)cleanup_transfer_token_staging(
-                root_dir, epoch_manifest.epoch_id, epoch_manifest.token);
+            cleanup_epoch_transfer_staging(root_dir, records);
             const Preserve_trx_transfer_status mark_status =
-                registry->mark_corrupt(
-                    epoch_manifest.epoch_id, epoch_manifest.token,
+                mark_epoch_records_corrupt(
+                    registry, records,
                     "commit_epoch_publish:" + transfer_status_name(status));
             return mark_status == Preserve_trx_transfer_status::OK
                        ? status
@@ -2751,6 +2806,14 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
               (void)store->remove_with_status(
                   transfer_token_component(published_token));
             }
+            cleanup_epoch_transfer_staging(root_dir, records);
+            const Preserve_trx_transfer_status mark_status =
+                mark_epoch_records_corrupt(
+                    registry, records,
+                    "commit_epoch_finalize:" + transfer_status_name(status));
+            return mark_status == Preserve_trx_transfer_status::OK
+                       ? status
+                       : mark_status;
           }
         }
       }

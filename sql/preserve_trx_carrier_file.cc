@@ -331,8 +331,15 @@ bool warm_external_blob_path_is_active(const std::string &path) {
 }
 
 bool ensure_directory(const std::string &dir) {
-  if (my_mkdir(normalize_dir(dir).c_str(), 0700, MYF(0)) == 0) return false;
-  if (my_errno() == EEXIST) return false;
+  const std::string normalized = normalize_dir(dir);
+  if (my_mkdir(normalized.c_str(), 0700, MYF(0)) == 0) return false;
+  if (my_errno() == EEXIST) {
+    if (path_is_symlink(normalized)) return true;
+    MY_STAT stat_area;
+    if (my_stat(normalized.c_str(), &stat_area, MYF(0)) == nullptr)
+      return true;
+    return !MY_S_ISDIR(stat_area.st_mode);
+  }
   return true;
 }
 
@@ -798,13 +805,15 @@ Atomic_write_status atomic_write_file(
   const std::string final_path = join_path(dir, filename);
   const std::string tmp_path = final_path + ".tmp";
   if (final_file_installed != nullptr) *final_file_installed = false;
+  if (ensure_directory(dir)) return Atomic_write_status::IO_ERROR;
 
   if (remove_stale_tmp_before_create && file_exists(final_path)) {
+    if (path_is_symlink(tmp_path)) return Atomic_write_status::IO_ERROR;
     (void)my_delete(tmp_path.c_str(), MYF(0));
   }
 
   File file = my_create(tmp_path.c_str(), create_mode,
-                        O_WRONLY | O_TRUNC | O_EXCL,
+                        O_WRONLY | O_TRUNC | O_EXCL | O_NOFOLLOW,
                         MYF(0));
   if (file < 0) return Atomic_write_status::IO_ERROR;
 

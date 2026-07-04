@@ -1156,6 +1156,50 @@ TEST(TempResumeMaterializerContractTest,
 }
 
 TEST(TempResumeMaterializerContractTest,
+     NativeFsegOwnershipFailureUnwindsClaimedFsegBeforePublish) {
+  const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+  ASSERT_FALSE(temp_preserve_impl.empty());
+
+  const std::string adopt_anchor_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_"
+          "ownership_for_anchor(");
+  ASSERT_FALSE(adopt_anchor_body.empty());
+  EXPECT_NE(std::string::npos,
+            adopt_anchor_body.find(
+                "trx_preserve_temp_space_image_release_no_redo_undo_fseg_"
+                "ownership_for_anchor("))
+      << "if exact-page FSEG adoption fails after creating the undo file "
+         "segment, the partially claimed FSEG must be freed before the caller "
+         "releases staged slot reservations";
+
+  const std::string adopt_fseg_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_"
+          "ownership(");
+  ASSERT_FALSE(adopt_fseg_body.empty());
+  const size_t insert_adopted =
+      adopt_fseg_body.find("insert_anchor_adopted = true");
+  const size_t update_failure =
+      adopt_fseg_body.find("descriptor.no_redo_update_undo");
+  const size_t insert_unwind = adopt_fseg_body.find(
+      "trx_preserve_temp_space_image_release_no_redo_undo_fseg_ownership_for_"
+      "anchor(");
+  ASSERT_NE(std::string::npos, insert_adopted)
+      << "top-level FSEG adoption must remember when the insert undo anchor "
+         "has already been claimed";
+  ASSERT_NE(std::string::npos, update_failure);
+  ASSERT_NE(std::string::npos, insert_unwind)
+      << "if update undo adoption fails after insert undo adoption succeeds, "
+         "the insert undo FSEG must be released before native adoption fails";
+  EXPECT_LT(insert_adopted, insert_unwind);
+  EXPECT_LT(update_failure, insert_unwind);
+}
+
+TEST(TempResumeMaterializerContractTest,
      NativeSlotAdoptionUnwindsStagedReservationsBeforePublish) {
   const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
       "storage/innobase/trx/trx0temp_preserve.cc");
@@ -3100,6 +3144,40 @@ TEST(TempDirtyPageHookSourceLintTest,
   EXPECT_NE(std::string::npos,
             drain_body.find(
                 "trx_preserve_temp_space_image_has_staged_dirty_pages()"));
+}
+
+TEST(TempDirtyPageHookSourceLintTest,
+     StageAdmissionCloseWaitIsBoundedAndDegradesOnFailure) {
+  const std::string preserve_source = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+  ASSERT_FALSE(preserve_source.empty());
+
+  const std::string wait_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          preserve_source,
+          "dberr_t trx_preserve_temp_space_image_wait_for_staged_dirty_pages_"
+          "to_drain(");
+  ASSERT_FALSE(wait_body.empty())
+      << "stage-admission close wait must report timeout/shutdown instead of "
+         "spinning forever";
+  EXPECT_NE(std::string::npos,
+            wait_body.find("preserve_trx_warmcopy_close_timeout_ms"));
+  EXPECT_NE(std::string::npos, wait_body.find("ut_time_monotonic_us()"));
+  EXPECT_NE(std::string::npos, wait_body.find("srv_shutdown_state.load()"));
+  EXPECT_NE(std::string::npos, wait_body.find("DB_LOCK_WAIT_TIMEOUT"));
+  EXPECT_NE(std::string::npos, wait_body.find("DB_INTERRUPTED"));
+
+  const std::string guard_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          preserve_source,
+          "explicit trx_preserve_temp_stage_admission_close_guard(");
+  ASSERT_FALSE(guard_body.empty());
+  EXPECT_NE(std::string::npos,
+            guard_body.find(
+                "trx_preserve_temp_space_image_mark_stage_rejected_during_"
+                "close("))
+      << "if close cannot drain already-staged pages before the deadline, the "
+         "stream must be marked degraded so preserve fails closed";
 }
 
 TEST(TempFspAllocationSourceLintTest,

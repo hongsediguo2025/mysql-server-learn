@@ -90,8 +90,16 @@ std::string table_name_from_table(const TABLE *table) {
 }
 
 bool temp_table_candidate(const TABLE *table) {
+  /*
+    User temporary-table DML preserve restores physical pages and no-redo undo.
+    It does not yet capture SQL-layer AUTO_INCREMENT reservation state for
+    temporary TABLE objects, so preserving such tables would let post-resume
+    inserts allocate from an unproven counter. Reject them as unsupported until
+    the counter state is part of the temp-table manifest.
+  */
   return table != nullptr && table->s != nullptr &&
-         table->s->tmp_table == TRANSACTIONAL_TMP_TABLE;
+         table->s->tmp_table == TRANSACTIONAL_TMP_TABLE &&
+         table->next_number_field == nullptr;
 }
 
 std::string normalize_dir(std::string dir) {

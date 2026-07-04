@@ -1177,7 +1177,7 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
           (void)write_final_intent_marker_for_result(&store.store(), request,
                                                      adopted_tokens, result);
         }
-        if (status ==
+        if (request.execute_adopt && status ==
             Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS) {
           write_abandoned_marker_for_result(&store.store(), request, result);
         }

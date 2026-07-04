@@ -184,8 +184,8 @@ static void trx_preserve_store_state_trx_sys_locked(trx_t *trx,
                                                     trx_state_t state) {
   ut_ad(trx != nullptr);
   ut_ad(trx_sys_mutex_own());
-#ifdef UNIV_DEBUG
   const trx_state_t old_state = trx->state;
+#ifdef UNIV_DEBUG
   ut_ad(old_state == TRX_STATE_ACTIVE || old_state == TRX_STATE_PREPARED ||
         old_state == TRX_STATE_PRESERVED);
   ut_ad(state == TRX_STATE_ACTIVE || state == TRX_STATE_PREPARED ||
@@ -754,6 +754,8 @@ bool trx_preserve_is_active_attached_to_thd(trx_t *trx, THD *thd) {
   return attached;
 }
 
+static dberr_t trx_preserve_make_temp_only_claimable(trx_t *trx);
+
 /*
   Prepare a transaction that only changed no-redo temporary-table state.
 
@@ -778,6 +780,9 @@ dberr_t trx_preserve_prepare_current_temp_only(THD *thd, const XID &xid) {
       !trx_is_temp_rseg_updated(trx) || trx_is_redo_rseg_updated(trx)) {
     return DB_SUCCESS;
   }
+
+  const dberr_t claimable_err = trx_preserve_make_temp_only_claimable(trx);
+  if (claimable_err != DB_SUCCESS) return claimable_err;
 
   *trx->xid = xid;
   return trx_prepare_for_mysql(trx);
@@ -807,6 +812,49 @@ static void trx_preserve_add_to_rw_trx_list_ordered(trx_t *trx) {
   ut_d(trx->in_rw_trx_list = true);
 }
 
+static bool trx_preserve_rw_trx_list_contains(trx_t *trx) {
+  ut_ad(trx_sys_mutex_own());
+  ut_ad(trx != nullptr);
+
+  for (trx_t *candidate = UT_LIST_GET_FIRST(trx_sys->rw_trx_list);
+       candidate != nullptr; candidate = UT_LIST_GET_NEXT(trx_list, candidate)) {
+    if (candidate == trx) return true;
+  }
+  return false;
+}
+
+static dberr_t trx_preserve_make_temp_only_claimable(trx_t *trx) {
+  if (trx == nullptr || trx->id == 0) return DB_ERROR;
+
+  /*
+    MySQL permits READ ONLY transactions to modify user temporary tables.
+    InnoDB gives such a transaction a no-redo rseg and trx id, but keeps it off
+    rw_trx_list because ordinary read-only execution does not need prepared
+    recovery ownership. Preserve does need that ownership: once the temp-only
+    trx is prepared and detached, claim/rollback/resume all find it through the
+    preserved rw list. Add it only for this explicit preserve boundary.
+
+    SQL read-only state has already been captured in the preserve metadata.
+    From this point on the InnoDB object is a preserve-owned prepared/rollback
+    object, and rw_trx_list debug invariants require !trx->read_only and a
+    durable rseg bookkeeping assignment. The durable rseg does not mean the
+    snapshot has ordinary redo undo for user data; it gives InnoDB's prepared
+    owner lists the same shape as non-read-only temp-only preserve.
+  */
+  if (trx->rsegs.m_redo.rseg == nullptr) {
+    trx_assign_rseg_durable(trx);
+    if (trx->rsegs.m_redo.rseg == nullptr) return DB_ERROR;
+  }
+
+  trx_sys_mutex_enter();
+  trx->read_only = false;
+  if (!trx_preserve_rw_trx_list_contains(trx)) {
+    trx_preserve_add_to_rw_trx_list_ordered(trx);
+  }
+  trx_sys_mutex_exit();
+  return DB_SUCCESS;
+}
+
 /*
 	  Recreate a claimed preserved trx for a temp-only snapshot.
 
@@ -830,6 +878,12 @@ trx_t *trx_preserve_create_temp_only_claimed(const XID &xid, uint64_t trx_id) {
 
   *trx->xid = xid;
   trx->id = recovered_trx_id;
+  /*
+    SQL transaction access mode is restored on THD/session metadata. This
+    synthetic InnoDB trx must remain rw-list-compatible because temp-only
+    sidecar cleanup, rollback and prepared ownership all use rw_trx_list
+    invariants that assert !trx->read_only for listed transactions.
+  */
   trx->read_only = false;
   trx->auto_commit = false;
   trx->will_lock = 1;

@@ -9422,7 +9422,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
                       "debug_after_lock_materialization"););
   if (thd->killed) {
     thd->send_kill_message();
-    return true;
+    return reject_after_binlog_export("killed_after_lock_materialization");
   }
 
   std::string mdl_descriptors_payload;
@@ -9869,7 +9869,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   DEBUG_SYNC(thd, "preserve_trx_before_undo_prepare");
   if (thd->killed) {
     thd->send_kill_message();
-    return true;
+    return restore_unprepared_batch_prepare_failure_or_rollback();
   }
 
   *thd->get_transaction()->xid_state()->get_xid() = xid;
