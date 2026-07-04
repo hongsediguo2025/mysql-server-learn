@@ -137,7 +137,7 @@ SELECT * FROM t_resume_any_lock_only ORDER BY a;
 
 CREATE USER preserve_resume_owner_revoke@localhost;
 GRANT SHUTDOWN ON *.* TO preserve_resume_owner_revoke@localhost;
-GRANT SELECT, UPDATE ON preserve_resume_any_obj_db.t_resume_any_obj_priv TO
+GRANT SELECT, INSERT, UPDATE, DELETE ON preserve_resume_any_obj_db.t_resume_any_obj_priv TO
   preserve_resume_owner_revoke@localhost;
 
 --connect(resume_owner_revoke_con, localhost, preserve_resume_owner_revoke,,preserve_resume_any_obj_db)

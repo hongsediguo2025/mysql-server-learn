@@ -1496,7 +1496,6 @@ static trx_undo_t *trx_undo_mem_create(trx_rseg_t *rseg, ulint id, ulint type,
 
   undo->dict_operation = FALSE;
   undo->flag = 0;
-  undo->preserve_restored_no_redo_undo = false;
   undo->preserve_no_redo_undo_disable_cache = false;
   undo->gtid_allocated = false;
 
@@ -1535,7 +1534,6 @@ static void trx_undo_mem_init_for_reuse(
 
   undo->dict_operation = FALSE;
   undo->flag = 0;
-  undo->preserve_restored_no_redo_undo = false;
   undo->preserve_no_redo_undo_disable_cache = false;
   undo->gtid_allocated = false;
 
@@ -1544,14 +1542,13 @@ static void trx_undo_mem_init_for_reuse(
 }
 
 bool trx_undo_preserve_magic_no_redo_should_skip_history(
-    const trx_undo_t *undo) {
-  return undo != nullptr && undo->preserve_restored_no_redo_undo;
+    const trx_undo_t *) {
+  return false;
 }
 
 bool trx_undo_preserve_magic_no_redo_should_skip_cache(
     const trx_undo_t *undo) {
-  return trx_undo_preserve_magic_no_redo_should_skip_history(undo) ||
-         (undo != nullptr && undo->preserve_no_redo_undo_disable_cache);
+  return undo != nullptr && undo->preserve_no_redo_undo_disable_cache;
 }
 
 /** Frees an undo log memory copy. */

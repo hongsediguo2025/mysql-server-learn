@@ -98,6 +98,7 @@ enum class Preserve_snapshot_status {
 struct Preserve_snapshot_modified_table_name {
   std::string schema_name;
   std::string table_name;
+  uint32_t required_write_acls{0};
 };
 
 /*

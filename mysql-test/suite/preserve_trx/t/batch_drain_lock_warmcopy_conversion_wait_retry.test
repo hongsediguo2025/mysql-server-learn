@@ -55,7 +55,7 @@ my $runtime_mtr = read_source('mysql-test', 'suite', 'preserve_trx', 't',
 die "wait/retry implementation must live in lock0warmcopy.cc, not lock0lock.cc\n"
   if $lock =~ /lock_warmcopy_wait_for_conversion_thaw_impl\s*\(/s;
 die "wait/retry helper declarations must stay in lock0warmcopy.h\n"
-  unless $lock_warmcopy_header =~ /lock_warmcopy_wait_for_conversion_thaw\s*\(\s*trx_t\s+\*trx\s*\)/s &&
+  unless $lock_warmcopy_header =~ /lock_warmcopy_wait_for_conversion_thaw\s*\(\s*trx_t\s+\*trx\s*,\s*THD\s+\*wait_thd\s*\)/s &&
          $lock_warmcopy_header =~ /lock_warmcopy_wait_for_conversion_thaw_for_unit_test\s*\(/s;
 
 my $wait_impl = extract_function(
@@ -80,8 +80,8 @@ die "public wait helper must count waits and sample frozen state under trx mutex
   unless $wait_public =~ /lock_warmcopy_conversion_freeze_wait_note\s*\(\s*\)/s &&
          $wait_public =~ /trx_mutex_enter\s*\(\s*trx\s*\)[\s\S]*lock_warmcopy_trx_conversion_is_frozen\s*\(\s*&trx->lock\s*\)[\s\S]*trx_mutex_exit\s*\(\s*trx\s*\)/s &&
          $wait_public =~ /preserve_trx_lock_warmcopy_conversion_wait_timeout_ms/s;
-die "public wait helper must abort on KILL or shutdown instead of waiting for the full conversion timeout\n"
-  unless $wait_public =~ /thd_killed\s*\(\s*trx->mysql_thd\s*\)/s &&
+die "public wait helper must abort on waiting-session KILL or shutdown instead of waiting for the full conversion timeout\n"
+  unless $wait_public =~ /thd_killed\s*\(\s*wait_thd\s*\)/s &&
          $wait_public =~ /srv_shutdown_state\.load\s*\(\s*\)\s*!=\s*SRV_SHUTDOWN_NONE/s;
 
 my $impl_to_expl = extract_function(
@@ -91,7 +91,7 @@ my $impl_to_expl = extract_function(
 die "ordinary frozen conversion must return retryable DB_SUCCESS, not install explicit lock immediately\n"
   unless $impl_to_expl =~ /lock_warmcopy_frozen_conversion_result\s*\(\s*sel_mode\s*\)[\s\S]*wait_for_thaw\s*=\s*err\s*==\s*DB_SUCCESS/s;
 die "ordinary frozen conversion must wait for thaw and loop back to retry\n"
-  unless $impl_to_expl =~ /if\s*\(\s*!\s*wait_for_thaw\s*\)[\s\S]*break[\s\S]*err\s*=\s*lock_warmcopy_wait_for_conversion_thaw\s*\(\s*trx\s*\)[\s\S]*if\s*\(\s*err\s*!=\s*DB_SUCCESS\s*\)[\s\S]*break/s;
+  unless $impl_to_expl =~ /if\s*\(\s*!\s*wait_for_thaw\s*\)[\s\S]*break[\s\S]*err\s*=\s*lock_warmcopy_wait_for_conversion_thaw\s*\(\s*trx\s*,\s*current_thd\s*\)[\s\S]*if\s*\(\s*err\s*!=\s*DB_SUCCESS\s*\)[\s\S]*break/s;
 die "frozen conversion must expose deterministic sync points for MTR stress\n"
   unless $impl_to_expl =~ /DEBUG_SYNC_C\s*\(\s*"lock_warmcopy_impl_to_expl_after_freeze_check"\s*\)/s &&
          $impl_to_expl =~ /DEBUG_SYNC_C\s*\(\s*"lock_warmcopy_impl_to_expl_before_return_frozen"\s*\)/s;

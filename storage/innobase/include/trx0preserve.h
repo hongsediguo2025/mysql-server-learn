@@ -57,6 +57,7 @@ struct Preserve_lock_limits {
 struct Preserve_modified_table_name {
   std::string schema_name;
   std::string table_name;
+  uint32_t required_write_acls{0};
 };
 
 trx_t *trx_preserve_claim_prepared(const XID &xid);

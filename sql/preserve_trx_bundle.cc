@@ -38,6 +38,7 @@
 #include "my_dbug.h"
 #include "mysql_version.h"
 #include "sha2.h"
+#include "sql/auth/auth_acls.h"
 #include "sql/field.h"
 #include "sql/mdl.h"
 #include "sql/my_decimal.h"
@@ -109,6 +110,7 @@ constexpr uint16_t kBinlogNoCacheMetadataVersion = 2;
 constexpr uint16_t kBinlogNoCacheMetadataLegacyVersion = 1;
 constexpr uint16_t kTlvInnodbCore = 0x10;
 constexpr uint16_t kTlvModifiedTables = 0x11;
+constexpr uint16_t kTlvModifiedTableAccess = 0x12;
 constexpr uint16_t kTlvReadView = 0x20;
 constexpr uint16_t kTlvRecordLocks = 0x30;
 constexpr uint16_t kTlvTableLocks = 0x31;
@@ -139,6 +141,8 @@ constexpr uint32_t kBinlogCacheKnownFlags =
     kBinlogCacheFlagWithSbr | kBinlogCacheFlagWithRbr |
     kBinlogCacheFlagWithStart | kBinlogCacheFlagWithEnd |
     kBinlogCacheFlagWithContent | kBinlogCacheFlagHasPrevPosition;
+constexpr uint32_t kModifiedTableKnownWriteAcls =
+    static_cast<uint32_t>(INSERT_ACL | UPDATE_ACL | DELETE_ACL);
 constexpr uint32_t kBinlogSavepointCheckpointKnownFlags =
     kBinlogCacheFlagWithSbr | kBinlogCacheFlagWithRbr |
     kBinlogCacheFlagWithStart | kBinlogCacheFlagWithEnd |
@@ -341,6 +345,18 @@ std::string modified_tables_tlv_value(
   return value;
 }
 
+std::string modified_table_access_tlv_value(
+    const Preserve_snapshot_metadata &metadata) {
+  std::string value;
+  append_le32(&value,
+              static_cast<uint32_t>(metadata.modified_table_names.size()));
+  for (const Preserve_snapshot_modified_table_name &name :
+       metadata.modified_table_names) {
+    append_le32(&value, name.required_write_acls);
+  }
+  return value;
+}
+
 std::vector<Preserve_snapshot_tlv> no_cache_tlvs(
     const Preserve_snapshot_metadata &metadata) {
   /*
@@ -355,6 +371,11 @@ std::vector<Preserve_snapshot_tlv> no_cache_tlvs(
       {kTlvTxAccessMode, transaction_access_mode_tlv_value(metadata)},
       {kTlvAutoincState, autoinc_state_tlv_value(metadata)},
       {kTlvMdlDescriptors, metadata.mdl_descriptors_payload}};
+
+  if (!metadata.modified_table_names.empty()) {
+    tlvs.push_back(
+        {kTlvModifiedTableAccess, modified_table_access_tlv_value(metadata)});
+  }
 
   if (metadata.has_read_view) {
     tlvs.push_back({kTlvReadView, metadata.read_view_payload});
@@ -842,6 +863,33 @@ bool apply_modified_tables_tlv(const std::vector<Preserve_snapshot_tlv> &tlvs,
     metadata->modified_table_names.push_back(std::move(name));
   }
   if (offset != modified->value.length()) return true;
+  return false;
+}
+
+bool apply_modified_table_access_tlv(
+    const std::vector<Preserve_snapshot_tlv> &tlvs,
+    Preserve_snapshot_metadata *metadata) {
+  const Preserve_snapshot_tlv *access =
+      find_tlv(tlvs, kTlvModifiedTableAccess);
+  if (access == nullptr) return false;
+  if (metadata == nullptr || access->value.length() < 4) return true;
+
+  const std::vector<unsigned char> payload(access->value.begin(),
+                                           access->value.end());
+  const uint32_t count = read_le32(payload, 0);
+  if (count != metadata->modified_table_names.size() ||
+      access->value.length() != 4 + (static_cast<size_t>(count) * 4)) {
+    return true;
+  }
+
+  size_t offset = 4;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t mask = read_le32(payload, offset);
+    offset += 4;
+    if ((mask & ~kModifiedTableKnownWriteAcls) != 0) return true;
+    metadata->modified_table_names[i].required_write_acls = mask;
+  }
+
   return false;
 }
 
@@ -1545,7 +1593,10 @@ bool metadata_payloads_are_valid(const Preserve_snapshot_metadata &metadata,
       return false;
     for (const Preserve_snapshot_modified_table_name &name :
          metadata.modified_table_names) {
-      if (!modified_table_name_is_valid(name)) return false;
+      if (!modified_table_name_is_valid(name) ||
+          (name.required_write_acls & ~kModifiedTableKnownWriteAcls) != 0) {
+        return false;
+      }
     }
   }
   if (!metadata.has_read_view && !metadata.read_view_payload.empty())
@@ -1707,7 +1758,10 @@ bool apply_bundle_semantics(std::vector<Preserve_snapshot_tlv> *tlvs,
     return true;
   }
 
-  if (apply_modified_tables_tlv(*tlvs, metadata)) return true;
+  if (apply_modified_tables_tlv(*tlvs, metadata) ||
+      apply_modified_table_access_tlv(*tlvs, metadata)) {
+    return true;
+  }
 
   const Preserve_snapshot_tlv *session = find_tlv(*tlvs, kTlvSessionState);
   if (session == nullptr || parse_session_state_tlv(session->value, metadata))

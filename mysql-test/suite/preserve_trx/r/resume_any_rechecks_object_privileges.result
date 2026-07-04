@@ -83,7 +83,7 @@ a	b
 1	100
 CREATE USER preserve_resume_owner_revoke@localhost;
 GRANT SHUTDOWN ON *.* TO preserve_resume_owner_revoke@localhost;
-GRANT SELECT, UPDATE ON preserve_resume_any_obj_db.t_resume_any_obj_priv TO
+GRANT SELECT, INSERT, UPDATE, DELETE ON preserve_resume_any_obj_db.t_resume_any_obj_priv TO
 preserve_resume_owner_revoke@localhost;
 START TRANSACTION;
 UPDATE t_resume_any_obj_priv SET b=12 WHERE a=1;

@@ -1864,7 +1864,7 @@ dberr_t lock_warmcopy_frozen_conversion_result(int sel_mode) {
   return DB_ERROR;
 }
 
-dberr_t lock_warmcopy_wait_for_conversion_thaw(trx_t *trx) {
+dberr_t lock_warmcopy_wait_for_conversion_thaw(trx_t *trx, THD *wait_thd) {
   lock_warmcopy_conversion_freeze_wait_note();
   return lock_warmcopy_wait_for_conversion_thaw_impl(
       [trx]() {
@@ -1874,8 +1874,9 @@ dberr_t lock_warmcopy_wait_for_conversion_thaw(trx_t *trx) {
         trx_mutex_exit(trx);
         return frozen;
       },
-      [trx]() {
+      [trx, wait_thd]() {
         if (srv_shutdown_state.load() != SRV_SHUTDOWN_NONE) return true;
+        if (wait_thd != nullptr && thd_killed(wait_thd) != 0) return true;
         return trx != nullptr && trx->mysql_thd != nullptr &&
                thd_killed(trx->mysql_thd) != 0;
       },

@@ -500,6 +500,9 @@ bool remember_or_match_shared_image(
 
 bool materialize_plan_is_claimable(
     const Preserve_trx_temp_table_materialize_plan &plan) {
+  if (plan.requires_no_redo_undo_sidecars && !plan.native_adoption_capable) {
+    return false;
+  }
   return plan.source ==
              Preserve_trx_temp_table_materialize_source::PHYSICAL_SIDECARS &&
          plan.requires_sealed_image_sidecars && !plan.scans_sql_rows &&
@@ -3128,14 +3131,6 @@ preserve_trx_temp_table_materialize_plan(
   return plan;
 }
 
-trx_preserve_temp_no_redo_undo_reconnect_mode
-preserve_trx_temp_table_no_redo_reconnect_mode_for_resume(
-    const Preserve_trx_temp_table_materialize_plan &plan) {
-  return plan.native_adoption_capable
-             ? trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED
-             : trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY;
-}
-
 bool preserve_trx_temp_table_apply_manifest_undo_identity_for_resume(
     const Preserved_temp_table_undo_descriptor &undo,
     trx_preserve_temp_space_image_descriptor *descriptor) {
@@ -3388,6 +3383,11 @@ Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume(
 
   const Preserve_trx_temp_table_materialize_plan plan =
       preserve_trx_temp_table_materialize_plan(metadata);
+  if (plan.requires_no_redo_undo_sidecars && !plan.native_adoption_capable) {
+    return fail_without_cleanup(
+        Preserve_snapshot_status::UNSUPPORTED,
+        "temp-table no-redo undo sidecar lacks native adoption proof");
+  }
   if (!materialize_plan_is_claimable(plan)) {
     return fail_without_cleanup(Preserve_snapshot_status::CORRUPT,
                                 "temp-table materialize plan is not claimable");
@@ -3575,19 +3575,16 @@ Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume(
     }
   }
 
-  bool restored_only_no_redo_undo_active = false;
   const trx_preserve_temp_no_redo_undo_reconnect_mode
       no_redo_undo_reconnect_mode =
-          preserve_trx_temp_table_no_redo_reconnect_mode_for_resume(plan);
+          trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED;
   for (auto &descriptor : descriptors) {
     if (descriptor.second == nullptr) {
       return fail_after_cleanup(Preserve_snapshot_status::CORRUPT,
                                 "temp-table reconnect references missing "
                                 "image descriptor");
     }
-    if (no_redo_undo_reconnect_mode ==
-            trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED &&
-        trx_preserve_temp_space_image_no_redo_undo_sidecar_sealed(
+    if (trx_preserve_temp_space_image_no_redo_undo_sidecar_sealed(
             *descriptor.second)) {
       std::string adoption_reason;
       Preserve_snapshot_status status = map_temp_dberr(
@@ -3610,10 +3607,6 @@ Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume(
       return fail_after_cleanup(status,
                                 "temp-table no-redo undo reconnect failed");
     }
-    if (trx_preserve_temp_space_image_no_redo_undo_restored_only_reconnected(
-            *descriptor.second)) {
-      restored_only_no_redo_undo_active = true;
-    }
     status = map_temp_dberr(
         trx_preserve_temp_space_image_attach_to_thd(thd, *descriptor.second));
     if (status != Preserve_snapshot_status::OK) {
@@ -3626,8 +3619,7 @@ Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume(
   if (link_status != Preserve_snapshot_status::OK) {
     return fail_after_cleanup(link_status, "temp-table staged link failed");
   }
-  thd->preserve_trx_temp_table_restored_no_redo_undo_active =
-      restored_only_no_redo_undo_active;
+  thd->preserve_trx_temp_table_restored_no_redo_undo_active = false;
   assign_reason(failure_reason, "");
   return Preserve_snapshot_status::OK;
 }

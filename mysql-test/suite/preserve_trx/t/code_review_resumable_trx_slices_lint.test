@@ -1406,7 +1406,7 @@ die "implicit-to-explicit conversion must check lock warmcopy freeze before inst
          /lock_warmcopy_trx_conversion_is_frozen\s*\(\s*&trx->lock\s*\)[\s\S]*lock_warmcopy_trx_conversion_note_attempt\s*\(\s*&trx->lock\s*\)[\s\S]*lock_rec_add_to_queue/s;
 die "frozen conversion must use lock warmcopy wait/retry, not ordinary DB_LOCK_WAIT\n"
   unless $impl_to_expl_for_trx =~
-         /lock_warmcopy_wait_for_conversion_thaw\s*\(\s*trx\s*\)/s &&
+         /lock_warmcopy_wait_for_conversion_thaw\s*\(\s*trx\s*,\s*current_thd\s*\)/s &&
          $impl_to_expl_for_trx !~
          /lock_warmcopy_trx_conversion_is_frozen\s*\(\s*&trx->lock\s*\)[\s\S]{0,300}err\s*=\s*DB_LOCK_WAIT/s;
 die "implicit-to-explicit conversion must expose a DEBUG_SYNC point after the freeze check\n"
@@ -1424,10 +1424,10 @@ die "lock warmcopy conversion freeze must expose a DEBUG_SYNC point before publi
 die "lock0lock.cc must delegate lock warmcopy thaw waiting to the new warmcopy module\n"
   if $lock =~ /lock_warmcopy_wait_for_conversion_thaw_impl\s*\(/s;
 die "lock warmcopy thaw wait helper must live in lock0warmcopy.cc\n"
-  unless $lock_warmcopy =~ /lock_warmcopy_wait_for_conversion_thaw\s*\(\s*trx_t\s+\*trx\s*\)/s &&
+  unless $lock_warmcopy =~ /lock_warmcopy_wait_for_conversion_thaw\s*\(\s*trx_t\s+\*trx\s*,\s*THD\s+\*wait_thd\s*\)/s &&
          $lock_warmcopy =~ /lock_warmcopy_wait_for_conversion_thaw_for_unit_test\s*\(/s;
 die "lock warmcopy thaw wait helper declarations must live in lock0warmcopy.h\n"
-  unless $lock_warmcopy_header =~ /lock_warmcopy_wait_for_conversion_thaw\s*\(\s*trx_t\s+\*trx\s*\)/s &&
+  unless $lock_warmcopy_header =~ /lock_warmcopy_wait_for_conversion_thaw\s*\(\s*trx_t\s+\*trx\s*,\s*THD\s+\*wait_thd\s*\)/s &&
          $lock_warmcopy_header =~ /lock_warmcopy_wait_for_conversion_thaw_for_unit_test\s*\(/s;
 die "record bitmap set hot hook must delegate key construction to lock0warmcopy.cc\n"
   if $lock_priv_ic =~ /lock_warmcopy_record_shard_key_t\s+key/s;

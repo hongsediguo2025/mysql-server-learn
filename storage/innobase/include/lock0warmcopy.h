@@ -32,6 +32,7 @@
 #include "db0err.h"
 
 struct ib_lock_t;
+class THD;
 struct trx_lock_t;
 struct trx_t;
 
@@ -309,7 +310,7 @@ bool lock_warmcopy_trx_conversion_is_frozen(const trx_lock_t *trx_lock);
 bool lock_warmcopy_trx_conversion_note_attempt(trx_lock_t *trx_lock);
 bool lock_warmcopy_trx_conversion_note_handled(trx_lock_t *trx_lock);
 dberr_t lock_warmcopy_frozen_conversion_result(int sel_mode);
-dberr_t lock_warmcopy_wait_for_conversion_thaw(trx_t *trx);
+dberr_t lock_warmcopy_wait_for_conversion_thaw(trx_t *trx, THD *wait_thd);
 dberr_t lock_warmcopy_wait_for_conversion_thaw_for_unit_test(
     const trx_t *trx, uint timeout_ms);
 dberr_t lock_warmcopy_wait_for_conversion_thaw_abort_for_unit_test(

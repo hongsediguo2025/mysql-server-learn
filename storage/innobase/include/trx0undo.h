@@ -257,10 +257,9 @@ page_t *trx_undo_set_state_at_finish(
 page_t *trx_undo_set_state_at_prepare(trx_t *trx, trx_undo_t *undo,
                                       bool rollback, mtr_t *mtr);
 
-/** Checks whether a preserved no-redo undo log is a temp-table image that must
-not be linked to the generic update undo history.
+/** Checks whether a preserved no-redo undo log must skip update history.
 @param[in] undo  undo log memory copy
-@return true if history/cache reuse must be skipped */
+@return false; no supported reconnect mode skips history */
 bool trx_undo_preserve_magic_no_redo_should_skip_history(
     const trx_undo_t *undo);
 
@@ -393,10 +392,6 @@ struct trx_undo_t {
                    identification */
   ulint flag;      /*!< flag for current transaction XID and GTID.
                    Persisted in TRX_UNDO_FLAGS flag of undo header. */
-  bool preserve_restored_no_redo_undo{
-      false}; /*!< true iff this no-redo undo object was restored from a
-                 preserved temporary-table sidecar image and must not be linked
-                 to normal history/cache lists. */
   bool preserve_no_redo_undo_disable_cache{
       false}; /*!< true iff this preserved no-redo undo object must not be cached
                  for reuse after transaction finish. Native-owned preserved undo

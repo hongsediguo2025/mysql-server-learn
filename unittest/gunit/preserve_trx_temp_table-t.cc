@@ -732,14 +732,16 @@ TEST(TempResumeMaterializerContractTest,
             finish_body.find(
                 "trx_undo_preserve_magic_no_redo_should_skip_cache"));
   EXPECT_NE(std::string::npos, finish_body.find("TRX_UNDO_CACHED"));
-  EXPECT_NE(std::string::npos,
+  EXPECT_EQ(std::string::npos,
             history_guard_body.find("preserve_restored_no_redo_undo"));
   EXPECT_EQ(std::string::npos, history_guard_body.find("xid_is_preserve_magic"));
   EXPECT_EQ(std::string::npos,
             history_guard_body.find("fsp_is_system_temporary"));
-  EXPECT_NE(std::string::npos,
+  EXPECT_EQ(std::string::npos,
             cache_guard_body.find(
                 "trx_undo_preserve_magic_no_redo_should_skip_history"));
+  EXPECT_NE(std::string::npos,
+            cache_guard_body.find("preserve_no_redo_undo_disable_cache"));
   const size_t undo_cache_disable_predicate_pos =
       reuse_body.find(
           "trx_preserve_temp_space_image_should_disable_undo_cache");
@@ -763,17 +765,17 @@ TEST(TempResumeMaterializerContractTest,
   EXPECT_NE(std::string::npos,
             temp_preserve_impl.find(
                 "trx_preserve_temp_no_redo_undo_reconnect_mode mode)"))
-      << "native no-redo undo adoption needs an explicit reconnect mode; a "
-         "bare bool makes restored-only cleanup too easy to confuse with "
-         "allocator-owned undo";
-  EXPECT_NE(std::string::npos,
-            create_reconnected_body.find(
-                "mode == trx_preserve_temp_no_redo_undo_reconnect_mode::"
-                "RESTORED_ONLY"));
-  EXPECT_NE(std::string::npos,
+      << "native no-redo undo adoption keeps an explicit reconnect mode so "
+         "callers cannot replace it with an ambiguous boolean";
+  EXPECT_EQ(std::string::npos,
+            create_reconnected_body.find("TRX_UNDO_PREPARED"))
+      << "resume no-redo undo objects are supported only after native "
+         "adoption, so they must reconnect as ACTIVE";
+  EXPECT_EQ(std::string::npos,
             temp_preserve_impl.find(
                 "trx_preserve_temp_no_redo_undo_reconnect_mode::"
-                "RESTORED_ONLY"));
+                "RESTORED_ONLY"))
+      << "RESTORED_ONLY is not a supported reconnect mode";
   const std::string undo_header = read_source_file_for_temp_table_test(
       "storage/innobase/include/trx0undo.h");
   ASSERT_FALSE(undo_header.empty());
@@ -829,9 +831,10 @@ TEST(TempResumeMaterializerContractTest,
   EXPECT_EQ(std::string::npos, reconnect_body.find("return DB_UNSUPPORTED;"));
   EXPECT_EQ(std::string::npos,
             reconnect_body.find("trx_undo_discard_cached_for_rseg"));
-  EXPECT_NE(std::string::npos,
+  EXPECT_EQ(std::string::npos,
             reconnect_body.find(
-                "trx_preserve_temp_space_image_materialize_no_redo_undo_pages"));
+                "trx_preserve_temp_space_image_materialize_no_redo_undo_pages"))
+      << "reconnect must not expose a restored-only page materialize path";
   EXPECT_NE(std::string::npos,
             reconnect_body.find("trx->rsegs.m_noredo.rseg ="));
   EXPECT_NE(std::string::npos,
@@ -852,14 +855,14 @@ TEST(TempResumeMaterializerContractTest,
 }
 
 TEST(TempResumeMaterializerContractTest,
-     NoRedoUndoSkipHistoryRequiresRestoredFlag) {
+     NoRedoUndoNeverSkipsHistory) {
   EXPECT_FALSE(trx_preserve_temp_no_redo_undo_skip_history_for_test(false));
-  EXPECT_TRUE(trx_preserve_temp_no_redo_undo_skip_history_for_test(true));
+  EXPECT_FALSE(trx_preserve_temp_no_redo_undo_skip_history_for_test(true));
 }
 
 TEST(TempResumeMaterializerContractTest,
-     NativeOwnedReconnectModeDoesNotSkipHistory) {
-  EXPECT_TRUE(
+     ReconnectModeNeverSkipsHistoryWithoutExplicitRestoredFlag) {
+  EXPECT_FALSE(
       trx_preserve_temp_no_redo_undo_reconnect_mode_skips_history_for_test(
           true));
   EXPECT_FALSE(
@@ -880,8 +883,12 @@ TEST(TempResumeMaterializerContractTest,
   EXPECT_NE(std::string::npos,
             temp_preserve_header.find(
                 "enum class trx_preserve_temp_no_redo_undo_reconnect_mode"))
-      << "SQL resume must be able to request restored-only or native-owned "
-         "no-redo undo reconnect explicitly";
+      << "SQL resume must request the supported no-redo undo reconnect mode "
+         "explicitly";
+  EXPECT_EQ(std::string::npos,
+            temp_preserve_header.find("RESTORED_ONLY"))
+      << "tokens without native adoption proof must fail closed before "
+         "reconnect instead of selecting a restored-only mode";
   EXPECT_NE(std::string::npos,
             temp_preserve_header.find(
                 "trx_preserve_temp_no_redo_undo_reconnect_mode mode"))
@@ -900,15 +907,11 @@ TEST(TempResumeMaterializerContractTest,
             normalized_impl.find(
                 "trx_preserve_temp_space_image_descriptor *descriptor, trx_t "
                 "*trx, trx_preserve_temp_no_redo_undo_reconnect_mode mode"))
-      << "the reconnect implementation must not hard-code restored-only mode";
+      << "the reconnect implementation must keep an explicit supported mode";
   EXPECT_NE(std::string::npos, reconnect_body.find("insert_size, mode"));
   EXPECT_NE(std::string::npos, reconnect_body.find("update_size, mode"));
-  EXPECT_EQ(
-      std::string::npos,
-      reconnect_body.find(
-          "trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY);"))
-      << "before_resume() must pass through the caller-selected mode to each "
-         "reconnected undo object";
+  EXPECT_EQ(std::string::npos, reconnect_body.find("RESTORED_ONLY"))
+      << "before_resume() must not expose a restored-only reconnect branch";
 }
 
 TEST(TempResumeMaterializerContractTest,
@@ -939,14 +942,16 @@ TEST(TempResumeMaterializerContractTest,
       reconnect_body.find("no_redo_undo_native_slots_adopted");
   const size_t materialize_pages = reconnect_body.find(
       "trx_preserve_temp_space_image_materialize_no_redo_undo_pages(");
+  const size_t link_rseg = reconnect_body.find("trx->rsegs.m_noredo.rseg =");
 
   ASSERT_NE(std::string::npos, native_mode_guard);
   ASSERT_NE(std::string::npos, native_slot_proof);
-  ASSERT_NE(std::string::npos, materialize_pages);
-  EXPECT_LT(native_mode_guard, materialize_pages)
-      << "native-owned reconnect must fail closed before materializing pages "
-         "through the restored-only path";
-  EXPECT_LT(native_slot_proof, materialize_pages)
+  ASSERT_NE(std::string::npos, link_rseg);
+  EXPECT_EQ(std::string::npos, materialize_pages)
+      << "native-owned reconnect must not materialize pages through a "
+         "restored-only path";
+  EXPECT_LT(native_mode_guard, link_rseg);
+  EXPECT_LT(native_slot_proof, link_rseg)
       << "native-owned reconnect must prove live slot adoption before pages "
          "are linked to trx->rsegs.m_noredo";
 }
@@ -1232,6 +1237,56 @@ TEST(TempResumeMaterializerContractTest,
 }
 
 TEST(TempResumeMaterializerContractTest,
+     NativeSlotAdoptionUnwindsFsegOwnershipAfterFinalPublishFailure) {
+  const std::string temp_preserve_impl = read_source_file_for_temp_table_test(
+      "storage/innobase/trx/trx0temp_preserve.cc");
+  ASSERT_FALSE(temp_preserve_impl.empty());
+
+  const std::string adopt_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_preserve_impl,
+          "dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_"
+          "native_resume(");
+  ASSERT_FALSE(adopt_body.empty());
+
+  const size_t fail_helper = adopt_body.find("auto fail_after_staged");
+  const size_t first_real_step = adopt_body.find("dberr_t err", fail_helper);
+  ASSERT_NE(std::string::npos, fail_helper);
+  ASSERT_NE(std::string::npos, first_real_step);
+  const std::string fail_helper_body =
+      adopt_body.substr(fail_helper, first_real_step - fail_helper);
+
+  EXPECT_NE(std::string::npos,
+            fail_helper_body.find("fseg_ownership_adopted"))
+      << "the failure helper must know whether this call has already claimed "
+         "no-redo undo FSEG ownership";
+  EXPECT_NE(std::string::npos,
+            fail_helper_body.find(
+                "trx_preserve_temp_space_image_release_no_redo_undo_fseg_"
+                "ownership("))
+      << "if final rseg publish fails after FSEG adoption, the claimed FSEG "
+         "ownership must be released before the staged slot reservation is "
+         "unwound";
+
+  const size_t adopt_fseg = adopt_body.find(
+      "trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership(");
+  const size_t mark_claimed =
+      adopt_body.find("fseg_ownership_adopted = true", adopt_fseg);
+  const size_t final_failure =
+      adopt_body.find("no-redo undo rseg final adoption failed");
+  const size_t publish =
+      adopt_body.find("no_redo_undo_native_slots_adopted = true");
+  ASSERT_NE(std::string::npos, adopt_fseg);
+  ASSERT_NE(std::string::npos, mark_claimed);
+  ASSERT_NE(std::string::npos, final_failure);
+  ASSERT_NE(std::string::npos, publish);
+  EXPECT_LT(mark_claimed, final_failure);
+  EXPECT_LT(final_failure, publish)
+      << "the final-publish failure path must run before the native-adopted "
+         "proof is published";
+}
+
+TEST(TempResumeMaterializerContractTest,
      NativeRetryCleanupUsesAdoptedLiveRsegIdentity) {
   const std::string temp_preserve_header = read_source_file_for_temp_table_test(
       "storage/innobase/include/trx0temp_preserve.h");
@@ -1320,12 +1375,9 @@ TEST(TempResumeMaterializerContractTest,
   EXPECT_NE(std::string::npos, create_undo_body.find("TRX_UNDO_ACTIVE"))
       << "native-owned no-redo undo must resume as ACTIVE so post-resume temp "
          "DML can append undo records through the native path";
-  EXPECT_NE(std::string::npos,
-            create_undo_body.find(
-                "mode == trx_preserve_temp_no_redo_undo_reconnect_mode::"
-                "NATIVE_OWNED"))
-      << "restored-only reconnect may stay PREPARED, but native-owned reconnect "
-         "must choose ACTIVE explicitly";
+  EXPECT_EQ(std::string::npos, create_undo_body.find("TRX_UNDO_PREPARED"))
+      << "tokens without native ownership proof fail closed before reconnect; "
+         "there is no restored-only PREPARED reconnect mode";
 
   const std::string reconnect_body =
       extract_function_body_after_signature_for_temp_table_test(
@@ -1402,16 +1454,15 @@ TEST(TempResumeMaterializerContractTest,
   ASSERT_FALSE(reconnect_body.empty());
   const std::string normalized_reconnect_body =
       normalize_whitespace_for_temp_table_test(reconnect_body);
-  const size_t restored_only_materialize_guard = normalized_reconnect_body.find(
-      "mode == trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY");
   const size_t reconnect_materialize = normalized_reconnect_body.find(
       "trx_preserve_temp_space_image_materialize_no_redo_undo_pages(*descriptor,"
       " rseg)");
-  ASSERT_NE(std::string::npos, restored_only_materialize_guard);
-  ASSERT_NE(std::string::npos, reconnect_materialize);
-  EXPECT_LT(restored_only_materialize_guard, reconnect_materialize)
+  EXPECT_EQ(std::string::npos,
+            normalized_reconnect_body.find("RESTORED_ONLY"))
+      << "native-owned reconnect is the only supported resume path";
+  EXPECT_EQ(std::string::npos, reconnect_materialize)
       << "native-owned reconnect must consume pages materialized by adoption; "
-         "only restored-only reconnect may materialize through the legacy path";
+         "there is no restored-only materialize branch";
 }
 
 TEST(TempResumeMaterializerContractTest,
@@ -1627,11 +1678,10 @@ TEST(TempResumeMaterializerContractTest,
   EXPECT_NE(std::string::npos,
             materialize_body.find(
                 "trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume("));
-  EXPECT_NE(std::string::npos,
+  EXPECT_EQ(std::string::npos,
             materialize_body.find(
                 "trx_preserve_temp_space_image_no_redo_undo_restored_only_reconnected("))
-      << "post-resume temp DML rejection must come from the actual InnoDB "
-         "reconnect mode, not from manifest undo-sidecar presence";
+      << "SQL materialize must not accept restored-only no-redo undo reconnect";
   EXPECT_EQ(std::string::npos,
             materialize_body.find("!plan.manifest.undo_images.empty()"))
       << "native-owned no-redo undo adoption will still have an undo sidecar, "
@@ -1675,31 +1725,35 @@ TEST(TempResumeMaterializerContractTest,
 
   const std::string normalized_materialize_body =
       normalize_whitespace_for_temp_table_test(materialize_body);
-  const size_t mode_from_plan = normalized_materialize_body.find(
-      "preserve_trx_temp_table_no_redo_reconnect_mode_for_resume(plan)");
+  const size_t unsupported_without_native_proof =
+      materialize_body.find(
+          "temp-table no-redo undo sidecar lacks native adoption proof");
+  const size_t native_mode = normalized_materialize_body.find(
+      "trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED");
   const size_t native_adopt_call = normalized_materialize_body.find(
       "trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume(");
   const size_t reconnect_call = normalized_materialize_body.find(
       "trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume( "
       "descriptor.second.get(), trx, no_redo_undo_reconnect_mode)");
-  const size_t restored_flag = normalized_materialize_body.find(
-      "trx_preserve_temp_space_image_no_redo_undo_restored_only_reconnected( "
-      "*descriptor.second)");
 
-  ASSERT_NE(std::string::npos, mode_from_plan)
-      << "resume must derive RESTORED_ONLY vs NATIVE_OWNED from the decoded "
-         "manifest plan, rather than hard-coding restored-only reconnect";
+  ASSERT_NE(std::string::npos, unsupported_without_native_proof)
+      << "manifest with no-redo undo sidecars but no native ownership proof "
+         "must fail before materialize/reconnect";
+  ASSERT_NE(std::string::npos, native_mode)
+      << "SQL materialize must request the only supported reconnect mode";
   ASSERT_NE(std::string::npos, native_adopt_call)
       << "native-capable manifests must publish their no-redo undo slots into "
          "the live temp rseg before reconnecting undo objects";
   ASSERT_NE(std::string::npos, reconnect_call)
       << "the materializer must pass the selected reconnect mode into InnoDB";
-  ASSERT_NE(std::string::npos, restored_flag)
-      << "post-resume temp DML rejection must stay tied to actual restored-only "
-         "reconnect evidence";
-  EXPECT_LT(mode_from_plan, native_adopt_call);
+  EXPECT_EQ(std::string::npos, materialize_body.find("RESTORED_ONLY"))
+      << "SQL materialize must not select restored-only reconnect";
+  EXPECT_EQ(std::string::npos,
+            materialize_body.find(
+                "trx_preserve_temp_space_image_no_redo_undo_restored_only_reconnected"))
+      << "post-resume temp DML must not depend on restored-only evidence";
+  EXPECT_LT(native_mode, native_adopt_call);
   EXPECT_LT(native_adopt_call, reconnect_call);
-  EXPECT_LT(reconnect_call, restored_flag);
 }
 
 TEST(TempResumeMaterializerContractTest,
@@ -3263,6 +3317,68 @@ TEST(TempFspAllocationSourceLintTest,
   ASSERT_NE(std::string::npos, reservation_scan);
   EXPECT_LT(native_down, reservation_scan);
   EXPECT_LT(native_frag, reservation_scan);
+}
+
+TEST(TempFspAllocationSourceLintTest,
+     ReservationAwareBranch2DoesNotAssumeHintedExtent) {
+  const std::string fsp_source =
+      read_source_file_for_temp_table_test("storage/innobase/fsp/fsp0fsp.cc");
+  ASSERT_FALSE(fsp_source.empty());
+
+  const size_t helper_pos =
+      fsp_source.find("static page_no_t xdes_find_free_bit_for_temp_preserve(");
+  ASSERT_NE(std::string::npos, helper_pos);
+  const size_t alloc_signature_pos =
+      fsp_source.find("static buf_block_t *fseg_alloc_free_page_low(",
+                      helper_pos);
+  ASSERT_NE(std::string::npos, alloc_signature_pos);
+  const std::string alloc_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          fsp_source.substr(alloc_signature_pos),
+          "static buf_block_t *fseg_alloc_free_page_low(");
+  ASSERT_FALSE(alloc_body.empty());
+
+  const size_t branch2_pos = alloc_body.find(
+      "2. We allocate the free extent from space and can take");
+  const size_t branch3_pos =
+      alloc_body.find("3. We take any free extent", branch2_pos);
+  ASSERT_NE(std::string::npos, branch2_pos);
+  ASSERT_NE(std::string::npos, branch3_pos);
+
+  const std::string branch2 =
+      alloc_body.substr(branch2_pos, branch3_pos - branch2_pos);
+  EXPECT_EQ(std::string::npos, branch2.find("ut_a(ret_descr == descr)"))
+      << "reservation-aware free-extent selection may legally skip the hinted "
+         "extent, so branch 2 must not assert descriptor identity";
+  EXPECT_NE(std::string::npos, branch2.find("xdes_get_offset(ret_descr)"))
+      << "when reservation is active, branch 2 must choose the returned extent's "
+         "own non-reserved free page instead of the original hint page";
+}
+
+TEST(TempFspAllocationSourceLintTest,
+     FreeFragExtentLeaseSkipsReservedPages) {
+  const std::string fsp_source =
+      read_source_file_for_temp_table_test("storage/innobase/fsp/fsp0fsp.cc");
+  ASSERT_FALSE(fsp_source.empty());
+
+  const std::string free_frag_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          fsp_source, "static xdes_t *fsp_alloc_xdes_free_frag(");
+  ASSERT_FALSE(free_frag_body.empty());
+
+  const size_t active_check =
+      free_frag_body.find("fsp_temp_preserve_page_reservation_active(space)");
+  const size_t extent_reservation_check =
+      free_frag_body.find("fsp_extent_has_temp_preserve_page_reservation(");
+  const size_t remove_from_list =
+      free_frag_body.find("flst_remove(header + FSP_FREE_FRAG");
+  ASSERT_NE(std::string::npos, active_check);
+  ASSERT_NE(std::string::npos, extent_reservation_check);
+  ASSERT_NE(std::string::npos, remove_from_list);
+  EXPECT_LT(active_check, remove_from_list);
+  EXPECT_LT(extent_reservation_check, remove_from_list)
+      << "leasing a FREE_FRAG extent to a segment must skip any extent that "
+         "contains preserved temp-page reservations";
 }
 
 TEST(TempRsegCollectionSourceLintTest,
@@ -6791,7 +6907,7 @@ TEST(TempNoRedoUndoCaptureTest, RejectsUnknownUndoPage) {
   EXPECT_EQ(DB_ERROR,
             trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
                 &descriptor, nullptr,
-                trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY));
+                trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED));
 }
 
 TEST(TempNoRedoUndoCaptureTest, SealRejectsManualSidecarFlagWithoutRsegIdentity) {
@@ -6896,7 +7012,7 @@ TEST(TempNoRedoUndoCaptureTest, ReconnectApiRequiresRecoveredTransaction) {
   EXPECT_EQ(DB_ERROR,
             trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
                 &descriptor, nullptr,
-                trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY));
+                trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED));
 
   ASSERT_EQ(DB_SUCCESS,
             trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(
@@ -6907,7 +7023,7 @@ TEST(TempNoRedoUndoCaptureTest, ReconnectApiRequiresRecoveredTransaction) {
   EXPECT_EQ(DB_ERROR,
             trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
                 &descriptor, nullptr,
-                trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY));
+                trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED));
   EXPECT_FALSE(
       trx_preserve_temp_space_image_no_redo_undo_pointers_reconnected(
           descriptor));
@@ -6963,7 +7079,7 @@ TEST(TempNoRedoUndoCaptureTest, ExplicitTempFeatureOffNoRedoUndoApiIsNoop) {
   EXPECT_EQ(DB_SUCCESS,
             trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
                 &descriptor, nullptr,
-                trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY));
+                trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED));
 
   EXPECT_FALSE(
       trx_preserve_temp_space_image_no_redo_undo_capture_required(descriptor));
@@ -10731,7 +10847,8 @@ TEST_F(TempPhysicalTlvTest,
   EXPECT_FALSE(with_manifest.may_mutate_base_transaction);
 }
 
-TEST_F(TempPhysicalTlvTest, ResumeFeatureOnWithNoRedoUndoSidecarPlanCanClaim) {
+TEST_F(TempPhysicalTlvTest,
+       ResumeFeatureOnWithNonNativeNoRedoUndoSidecarCannotClaim) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
 
   const std::string token = "temp_tlv_token";
@@ -10792,16 +10909,16 @@ TEST_F(TempPhysicalTlvTest, ResumeFeatureOnWithNoRedoUndoSidecarPlanCanClaim) {
 
   const Preserve_trx_temp_table_resume_policy policy =
       preserve_trx_temp_table_resume_policy(snapshot_metadata);
-  EXPECT_TRUE(policy.supported);
-  EXPECT_FALSE(policy.retryable);
-  EXPECT_TRUE(policy.may_claim_preserved_transaction);
-  EXPECT_TRUE(policy.may_mutate_base_transaction);
+  EXPECT_FALSE(policy.supported);
+  EXPECT_TRUE(policy.retryable);
+  EXPECT_FALSE(policy.may_claim_preserved_transaction);
+  EXPECT_FALSE(policy.may_mutate_base_transaction);
 
   const Preserve_trx_temp_table_preclaim_decision preclaim =
       preserve_trx_temp_table_preclaim_decision(snapshot_metadata);
-  EXPECT_FALSE(preclaim.retryable_unsupported);
-  EXPECT_TRUE(preclaim.claim_preserved_transaction);
-  EXPECT_TRUE(preclaim.mutate_base_transaction);
+  EXPECT_TRUE(preclaim.retryable_unsupported);
+  EXPECT_FALSE(preclaim.claim_preserved_transaction);
+  EXPECT_FALSE(preclaim.mutate_base_transaction);
 }
 
 TEST_F(TempPhysicalTlvTest,

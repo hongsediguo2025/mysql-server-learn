@@ -165,7 +165,6 @@ struct trx_preserve_temp_no_redo_undo_log_anchor {
 };
 
 enum class trx_preserve_temp_no_redo_undo_reconnect_mode {
-  RESTORED_ONLY,
   NATIVE_OWNED
 };
 
@@ -244,11 +243,10 @@ struct trx_preserve_temp_space_image_descriptor {
   bool no_redo_undo_capture_degraded{false};
   std::string no_redo_undo_capture_degraded_reason;
   bool no_redo_undo_pointers_reconnected{false};
-  bool no_redo_undo_restored_only_reconnected{false};
   /*
     NATIVE_OWNED reconnect may use the ordinary no-redo undo cleanup path only
-    after a later adoption slice has proved that live rseg slots and allocator
-    metadata own these pages. Restored-only reconnect leaves this false.
+    after adoption has proved that live rseg slots and allocator metadata own
+    these pages. Tokens without that proof fail closed before reconnect.
   */
   bool no_redo_undo_native_slots_adopted{false};
   /*
@@ -525,9 +523,6 @@ trx_preserve_temp_space_image_no_redo_undo_capture_degraded_reason(
 bool trx_preserve_temp_space_image_no_redo_undo_pointers_reconnected(
     const trx_preserve_temp_space_image_descriptor &descriptor);
 
-bool trx_preserve_temp_space_image_no_redo_undo_restored_only_reconnected(
-    const trx_preserve_temp_space_image_descriptor &descriptor);
-
 size_t trx_preserve_temp_space_image_no_redo_undo_page_count(
     const trx_preserve_temp_space_image_descriptor &descriptor);
 
@@ -631,10 +626,10 @@ void trx_preserve_temp_space_image_set_stage_admission_closed_for_test(
 bool trx_preserve_temp_no_redo_undo_skip_history_for_test(bool restored);
 
 bool trx_preserve_temp_no_redo_undo_reconnect_mode_skips_history_for_test(
-    bool restored_only);
+    bool ignored);
 
 bool trx_preserve_temp_no_redo_undo_reconnect_mode_skips_cache_for_test(
-    bool restored_only);
+    bool ignored);
 
 size_t trx_preserve_temp_space_image_dirty_page_count(
     const trx_preserve_temp_space_image_descriptor &descriptor);

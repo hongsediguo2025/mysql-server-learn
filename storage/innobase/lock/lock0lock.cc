@@ -5544,7 +5544,7 @@ static dberr_t lock_rec_convert_impl_to_expl_for_trx(
       break;
     }
 
-    err = lock_warmcopy_wait_for_conversion_thaw(trx);
+    err = lock_warmcopy_wait_for_conversion_thaw(trx, current_thd);
     if (err != DB_SUCCESS) {
       break;
     }

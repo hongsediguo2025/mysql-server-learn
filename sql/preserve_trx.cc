@@ -2629,47 +2629,76 @@ bool preserve_trx_recheck_mdl_object_privileges(
   return offset != payload.length();
 }
 
+constexpr Access_bitmask kModifiedTableWriteAcls =
+    INSERT_ACL | UPDATE_ACL | DELETE_ACL;
+
+bool preserve_trx_modified_table_write_access_mask(
+    THD *thd, const std::string &schema_name, const std::string &table_name,
+    Access_bitmask *write_access) {
+  if (thd == nullptr || write_access == nullptr) return true;
+
+  Security_context *sctx = thd->security_context();
+  Access_bitmask access = sctx->master_access(schema_name);
+
+  if (sctx->get_active_roles()->size() > 0) {
+    const LEX_CSTRING db{schema_name.c_str(), schema_name.length()};
+    const LEX_CSTRING table{table_name.c_str(), table_name.length()};
+    access |= sctx->db_acl(db, true) | sctx->table_acl(db, table);
+  } else {
+    const Access_bitmask db_access =
+        acl_get(thd, sctx->host().str, sctx->ip().str,
+                sctx->priv_user().str, schema_name.c_str(), false);
+    access |= db_access;
+
+    Acl_cache_lock_guard acl_cache_lock(thd, Acl_cache_lock_mode::READ_MODE);
+    if (!acl_cache_lock.lock(false)) return true;
+
+    GRANT_TABLE *grant_table =
+        table_hash_search(sctx->host().str, sctx->ip().str,
+                          schema_name.c_str(), sctx->priv_user().str,
+                          table_name.c_str(), false);
+    const Access_bitmask table_access =
+        grant_table == nullptr ? 0 : grant_table->privs;
+    access |= table_access;
+  }
+
+  *write_access = access & kModifiedTableWriteAcls;
+  return false;
+}
+
+bool preserve_trx_populate_modified_table_write_masks(
+    THD *thd, std::vector<Preserve_modified_table_name> *tables) {
+  if (thd == nullptr || tables == nullptr) return true;
+
+  for (Preserve_modified_table_name &name : *tables) {
+    Access_bitmask write_access = 0;
+    if (preserve_trx_modified_table_write_access_mask(
+            thd, name.schema_name, name.table_name, &write_access) ||
+        write_access == 0) {
+      return true;
+    }
+    name.required_write_acls = static_cast<uint32_t>(write_access);
+  }
+
+  return false;
+}
+
 bool preserve_trx_recheck_modified_table_privileges(
     THD *thd, const std::vector<Preserve_modified_table_name> &tables,
     bool require_all_write_acls = false) {
   if (thd == nullptr) return true;
 
-  constexpr Access_bitmask kModifiedTableWriteAcls =
-      INSERT_ACL | UPDATE_ACL | DELETE_ACL;
-  Security_context *sctx = thd->security_context();
-  const auto recheck_one = [&](const std::string &schema_name,
-                               const std::string &table_name) {
-    Access_bitmask access = sctx->master_access(schema_name);
-
-    if (sctx->get_active_roles()->size() > 0) {
-      const LEX_CSTRING db{schema_name.c_str(), schema_name.length()};
-      const LEX_CSTRING table{table_name.c_str(), table_name.length()};
-      access |= sctx->db_acl(db, true) | sctx->table_acl(db, table);
-    } else {
-      const Access_bitmask db_access =
-          acl_get(thd, sctx->host().str, sctx->ip().str,
-                  sctx->priv_user().str, schema_name.c_str(), false);
-      access |= db_access;
-
-      Acl_cache_lock_guard acl_cache_lock(thd, Acl_cache_lock_mode::READ_MODE);
-      if (!acl_cache_lock.lock(false)) return true;
-
-      GRANT_TABLE *grant_table =
-          table_hash_search(sctx->host().str, sctx->ip().str,
-                            schema_name.c_str(), sctx->priv_user().str,
-                            table_name.c_str(), false);
-      const Access_bitmask table_access =
-          grant_table == nullptr ? 0 : grant_table->privs;
-      access |= table_access;
-    }
-
-    return require_all_write_acls
-               ? (access & kModifiedTableWriteAcls) != kModifiedTableWriteAcls
-               : (access & kModifiedTableWriteAcls) == 0;
-  };
-
   for (const Preserve_modified_table_name &name : tables) {
-    if (recheck_one(name.schema_name, name.table_name)) return true;
+    Access_bitmask write_access = 0;
+    if (preserve_trx_modified_table_write_access_mask(
+            thd, name.schema_name, name.table_name, &write_access)) {
+      return true;
+    }
+    if (require_all_write_acls
+            ? write_access != kModifiedTableWriteAcls
+            : write_access == 0) {
+      return true;
+    }
   }
 
   return false;
@@ -2681,13 +2710,23 @@ bool preserve_trx_recheck_modified_table_privileges(
     bool require_all_write_acls = false) {
   if (thd == nullptr) return true;
 
-  std::vector<Preserve_modified_table_name> converted;
-  converted.reserve(tables.size());
   for (const Preserve_snapshot_modified_table_name &name : tables) {
-    converted.push_back({name.schema_name, name.table_name});
+    Access_bitmask write_access = 0;
+    if (preserve_trx_modified_table_write_access_mask(
+            thd, name.schema_name, name.table_name, &write_access)) {
+      return true;
+    }
+    const Access_bitmask required =
+        name.required_write_acls & kModifiedTableWriteAcls;
+    if (required != 0) {
+      if ((write_access & required) != required) return true;
+    } else if (require_all_write_acls
+                   ? write_access != kModifiedTableWriteAcls
+                   : write_access == 0) {
+      return true;
+    }
   }
-  return preserve_trx_recheck_modified_table_privileges(
-      thd, converted, require_all_write_acls);
+  return false;
 }
 
 bool preserve_trx_recheck_resume_object_privileges(
@@ -9496,7 +9535,8 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   if (trx_preserve_export_modified_table_names(
           thd, &modified_tables, lock_limits.max_modified_tables) !=
           DB_SUCCESS ||
-      preserve_trx_recheck_modified_table_privileges(thd, modified_tables)) {
+      preserve_trx_populate_modified_table_write_masks(thd,
+                                                       &modified_tables)) {
     return reject_after_binlog_export("modified_table_export_or_privilege_failed");
   }
   add_result_elapsed_us(&Preserve_trx_preserve_result::
@@ -10170,9 +10210,20 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     thaw_lock_warmcopy_conversion();
     if (batch_reattached_after_detach_failure())
       return reject_unsupported_for_delivery();
-    (void)trx_preserve_rollback_by_token(token.c_str());
+    const dberr_t rollback_status =
+        trx_preserve_rollback_by_token(token.c_str());
     reset_thd_after_preserve_detach(thd);
     cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
+    if (!batch_delivery && rollback_status != DB_SUCCESS) {
+      mark_single_detached_cleanup_failure(
+          "single preserve detached claim rollback failure");
+      return true;
+    }
+    if (result != nullptr && batch_delivery) {
+      result->cleanup_completed_after_detach_failure =
+          rollback_status == DB_SUCCESS;
+      result->cleanup_failed_after_reattach = rollback_status != DB_SUCCESS;
+    }
     return reject_unsupported_for_delivery();
   }
 
@@ -10193,7 +10244,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   metadata.modified_table_names.reserve(modified_tables.size());
   for (const Preserve_modified_table_name &name : modified_tables) {
     metadata.modified_table_names.push_back(
-        {name.schema_name, name.table_name});
+        {name.schema_name, name.table_name, name.required_write_acls});
   }
   metadata.autoinc_lock_owned =
       use_lock_warmcopy_artifact

@@ -1296,6 +1296,23 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_fseg_ownership(
   return err;
 }
 
+static dberr_t trx_preserve_temp_space_image_release_no_redo_undo_fseg_ownership(
+    const trx_preserve_temp_space_image_descriptor &descriptor,
+    trx_rseg_t *rseg) {
+  dberr_t first_err = DB_SUCCESS;
+
+  dberr_t err =
+      trx_preserve_temp_space_image_release_no_redo_undo_fseg_ownership_for_anchor(
+          rseg, descriptor.no_redo_insert_undo);
+  if (err != DB_SUCCESS && first_err == DB_SUCCESS) first_err = err;
+
+  err = trx_preserve_temp_space_image_release_no_redo_undo_fseg_ownership_for_anchor(
+      rseg, descriptor.no_redo_update_undo);
+  if (err != DB_SUCCESS && first_err == DB_SUCCESS) first_err = err;
+
+  return first_err;
+}
+
 trx_undo_t *trx_preserve_temp_space_image_create_reconnected_undo(
     trx_t *trx, trx_rseg_t *rseg,
     const trx_preserve_temp_no_redo_undo_log_anchor &anchor, ulint type,
@@ -1312,17 +1329,14 @@ trx_undo_t *trx_preserve_temp_space_image_create_reconnected_undo(
 
   XID empty_xid;
   empty_xid.reset();
-  const bool native_owned =
-      mode == trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED;
+  ut_ad(mode == trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED);
   undo->id = anchor.undo_slot;
   undo->type = type;
-  undo->state = native_owned ? TRX_UNDO_ACTIVE : TRX_UNDO_PREPARED;
+  undo->state = TRX_UNDO_ACTIVE;
   undo->del_marks = type == TRX_UNDO_UPDATE;
   undo->trx_id = trx->id;
   undo->xid = trx->xid == nullptr ? empty_xid : *trx->xid;
   undo->flag = 0;
-  undo->preserve_restored_no_redo_undo =
-      mode == trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY;
   undo->preserve_no_redo_undo_disable_cache = true;
   undo->gtid_allocated = false;
   undo->dict_operation = FALSE;
@@ -1781,7 +1795,6 @@ void trx_preserve_temp_space_image_reset_dirty_page_stream_impl(
   descriptor->no_redo_undo_capture_degraded = false;
   descriptor->no_redo_undo_capture_degraded_reason.clear();
   descriptor->no_redo_undo_pointers_reconnected = false;
-  descriptor->no_redo_undo_restored_only_reconnected = false;
   descriptor->no_redo_undo_native_slots_adopted = false;
   descriptor->no_redo_undo_adopted_rseg_identity_present = false;
   descriptor->no_redo_undo_adopted_rseg_space_id = 0;
@@ -1836,7 +1849,6 @@ void trx_preserve_temp_space_image_mark_no_redo_undo_degraded_locked(
       reason == nullptr ? "" : reason;
   descriptor->no_redo_undo_sidecar_sealed = false;
   descriptor->no_redo_undo_pointers_reconnected = false;
-  descriptor->no_redo_undo_restored_only_reconnected = false;
   descriptor->no_redo_undo_native_slots_adopted = false;
   descriptor->no_redo_undo_adopted_rseg_identity_present = false;
   descriptor->no_redo_undo_adopted_rseg_space_id = 0;
@@ -4985,34 +4997,19 @@ void trx_preserve_temp_space_image_set_stage_admission_closed_for_test(
   trx_preserve_temp_stage_admission_close_bucket_sub(source_space_id);
 }
 
-bool trx_preserve_temp_no_redo_undo_skip_history_for_test(bool restored) {
-  alignas(trx_undo_t) unsigned char undo_storage[sizeof(trx_undo_t)]{};
-  auto *undo = reinterpret_cast<trx_undo_t *>(undo_storage);
-  undo->preserve_restored_no_redo_undo = restored;
-  return trx_undo_preserve_magic_no_redo_should_skip_history(undo);
+bool trx_preserve_temp_no_redo_undo_skip_history_for_test(bool) {
+  return trx_undo_preserve_magic_no_redo_should_skip_history(nullptr);
 }
 
 bool trx_preserve_temp_no_redo_undo_reconnect_mode_skips_history_for_test(
-    bool restored_only) {
-  alignas(trx_undo_t) unsigned char undo_storage[sizeof(trx_undo_t)]{};
-  auto *undo = reinterpret_cast<trx_undo_t *>(undo_storage);
-  const trx_preserve_temp_no_redo_undo_reconnect_mode mode =
-      restored_only ? trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY
-                    : trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED;
-  undo->preserve_restored_no_redo_undo =
-      mode == trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY;
-  return trx_undo_preserve_magic_no_redo_should_skip_history(undo);
+    bool) {
+  return trx_undo_preserve_magic_no_redo_should_skip_history(nullptr);
 }
 
 bool trx_preserve_temp_no_redo_undo_reconnect_mode_skips_cache_for_test(
-    bool restored_only) {
+    bool) {
   alignas(trx_undo_t) unsigned char undo_storage[sizeof(trx_undo_t)]{};
   auto *undo = reinterpret_cast<trx_undo_t *>(undo_storage);
-  const trx_preserve_temp_no_redo_undo_reconnect_mode mode =
-      restored_only ? trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY
-                    : trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED;
-  undo->preserve_restored_no_redo_undo =
-      mode == trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY;
   undo->preserve_no_redo_undo_disable_cache = true;
   return trx_undo_preserve_magic_no_redo_should_skip_cache(undo);
 }
@@ -5110,7 +5107,6 @@ dberr_t trx_preserve_temp_space_image_begin_no_redo_undo_capture(
         descriptor);
     descriptor->no_redo_undo_capture_required = true;
     descriptor->no_redo_undo_pointers_reconnected = false;
-    descriptor->no_redo_undo_restored_only_reconnected = false;
     descriptor->no_redo_undo_native_slots_adopted = false;
     descriptor->no_redo_undo_adopted_rseg_identity_present = false;
     descriptor->no_redo_undo_adopted_rseg_space_id = 0;
@@ -5427,7 +5423,6 @@ dberr_t trx_preserve_temp_space_image_cancel_no_redo_undo_capture(
   descriptor->no_redo_undo_capture_degraded = false;
   descriptor->no_redo_undo_capture_degraded_reason.clear();
   descriptor->no_redo_undo_pointers_reconnected = false;
-  descriptor->no_redo_undo_restored_only_reconnected = false;
   descriptor->no_redo_undo_native_slots_adopted = false;
   descriptor->no_redo_undo_adopted_rseg_identity_present = false;
   descriptor->no_redo_undo_adopted_rseg_space_id = 0;
@@ -5470,11 +5465,6 @@ trx_preserve_temp_space_image_no_redo_undo_capture_degraded_reason(
 bool trx_preserve_temp_space_image_no_redo_undo_pointers_reconnected(
     const trx_preserve_temp_space_image_descriptor &descriptor) {
   return descriptor.no_redo_undo_pointers_reconnected;
-}
-
-bool trx_preserve_temp_space_image_no_redo_undo_restored_only_reconnected(
-    const trx_preserve_temp_space_image_descriptor &descriptor) {
-  return descriptor.no_redo_undo_restored_only_reconnected;
 }
 
 size_t trx_preserve_temp_space_image_no_redo_undo_page_count(
@@ -5629,8 +5619,18 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume
   const uint32_t live_rseg_space_id = static_cast<uint32_t>(rseg->space_id);
   const uint32_t live_rseg_page_no = static_cast<uint32_t>(rseg->page_no);
   const uint32_t live_rseg_slot = descriptor->no_redo_undo_rseg_slot;
+  bool fseg_ownership_adopted = false;
   bool staged_slots_reserved = false;
   auto fail_after_staged = [&](const char *reason) {
+    if (fseg_ownership_adopted) {
+      const dberr_t release_err =
+          trx_preserve_temp_space_image_release_no_redo_undo_fseg_ownership(
+              *descriptor, rseg);
+      fseg_ownership_adopted = false;
+      if (release_err != DB_SUCCESS) {
+        return fail("no-redo undo fseg ownership release failed");
+      }
+    }
     if (staged_slots_reserved) {
       (void)trx_preserve_temp_space_image_release_staged_no_redo_undo_slots(
           descriptor, live_rseg_page_no);
@@ -5683,6 +5683,7 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume
   if (err != DB_SUCCESS) {
     return fail_after_staged("no-redo undo fseg ownership adoption failed");
   }
+  fseg_ownership_adopted = true;
 
   mtr_t mtr;
   mtr_start(&mtr);
@@ -5720,6 +5721,7 @@ dberr_t trx_preserve_temp_space_image_adopt_no_redo_undo_slots_for_native_resume
   descriptor->no_redo_undo_adopted_rseg_space_id = live_rseg_space_id;
   descriptor->no_redo_undo_adopted_rseg_page_no = live_rseg_page_no;
   descriptor->no_redo_undo_adopted_rseg_slot = live_rseg_slot;
+  fseg_ownership_adopted = false;
   descriptor->no_redo_undo_native_slots_adopted = true;
   return err;
 }
@@ -5803,15 +5805,6 @@ dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
     return DB_ERROR;
   }
 
-  if (mode == trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY) {
-    dberr_t err =
-        trx_preserve_temp_space_image_materialize_no_redo_undo_pages(*descriptor,
-                                                                    rseg);
-    if (err != DB_SUCCESS) {
-      return err;
-    }
-  }
-
   trx_undo_t *insert_undo = nullptr;
   trx_undo_t *update_undo = nullptr;
   const ulint insert_size =
@@ -5847,9 +5840,8 @@ dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
     Do not copy the historical rollback-segment header into the live system
     temporary tablespace. The rseg belongs to the restarted server; its header,
     slot bitmap and curr_size must stay consistent with the current allocator.
-    Restored no-redo undo objects are kept only in memory and their cleanup path
-    skips history/cache/file-segment free, so linking them does not require a
-    corresponding slot in the live rseg header.
+    The restored no-redo undo objects are linked only after native adoption has
+    written the live rseg header and claimed exact FSEG ownership.
   */
   mutex_enter(&rseg->mutex);
   if (insert_undo != nullptr) {
@@ -5867,8 +5859,6 @@ dberr_t trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
   trx_preserve_temp_space_image_advance_trx_undo_no_for_native_resume(
       trx, *descriptor, mode);
   descriptor->no_redo_undo_pointers_reconnected = true;
-  descriptor->no_redo_undo_restored_only_reconnected =
-      mode == trx_preserve_temp_no_redo_undo_reconnect_mode::RESTORED_ONLY;
   descriptor->no_redo_undo_reconnected_trx = trx;
   return DB_SUCCESS;
 }
@@ -5913,7 +5903,6 @@ dberr_t trx_preserve_temp_space_image_disconnect_no_redo_undo_for_retry(
     mutex_exit(&rseg->mutex);
   }
   descriptor->no_redo_undo_pointers_reconnected = false;
-  descriptor->no_redo_undo_restored_only_reconnected = false;
   descriptor->no_redo_undo_reconnected_trx = nullptr;
   return DB_SUCCESS;
 }
@@ -6087,7 +6076,6 @@ dberr_t trx_preserve_temp_space_image_load_no_redo_undo_sidecar(
   loaded.no_redo_undo_capture_degraded = false;
   loaded.no_redo_undo_capture_degraded_reason.clear();
   loaded.no_redo_undo_pointers_reconnected = false;
-  loaded.no_redo_undo_restored_only_reconnected = false;
   loaded.no_redo_undo_native_slots_adopted = false;
   loaded.no_redo_undo_adopted_rseg_identity_present = false;
   loaded.no_redo_undo_adopted_rseg_space_id = 0;
@@ -6517,7 +6505,6 @@ dberr_t trx_preserve_temp_space_image_drop_preserved_fil_space(
   target->bound_dict_table = nullptr;
   target->bound_dict_tables.clear();
   target->no_redo_undo_pointers_reconnected = false;
-  target->no_redo_undo_restored_only_reconnected = false;
   target->no_redo_undo_native_slots_adopted = false;
   target->no_redo_undo_adopted_rseg_identity_present = false;
   target->no_redo_undo_adopted_rseg_space_id = 0;
@@ -6526,7 +6513,6 @@ dberr_t trx_preserve_temp_space_image_drop_preserved_fil_space(
   target->no_redo_undo_reconnected_trx = nullptr;
   if (target != descriptor) {
     descriptor->no_redo_undo_pointers_reconnected = false;
-    descriptor->no_redo_undo_restored_only_reconnected = false;
     descriptor->no_redo_undo_native_slots_adopted = false;
     descriptor->no_redo_undo_adopted_rseg_identity_present = false;
     descriptor->no_redo_undo_adopted_rseg_space_id = 0;
@@ -6744,7 +6730,6 @@ dberr_t trx_preserve_temp_space_image_release_preserved_fil_space_for_retry(
     descriptor->bound_dict_table = nullptr;
     descriptor->bound_dict_tables.clear();
     descriptor->no_redo_undo_pointers_reconnected = false;
-    descriptor->no_redo_undo_restored_only_reconnected = false;
     descriptor->no_redo_undo_native_slots_adopted = false;
     descriptor->no_redo_undo_adopted_rseg_identity_present = false;
     descriptor->no_redo_undo_adopted_rseg_space_id = 0;
@@ -6753,7 +6738,6 @@ dberr_t trx_preserve_temp_space_image_release_preserved_fil_space_for_retry(
     descriptor->no_redo_undo_reconnected_trx = nullptr;
   } else {
     descriptor->no_redo_undo_pointers_reconnected = false;
-    descriptor->no_redo_undo_restored_only_reconnected = false;
     descriptor->no_redo_undo_native_slots_adopted = false;
     descriptor->no_redo_undo_adopted_rseg_identity_present = false;
     descriptor->no_redo_undo_adopted_rseg_space_id = 0;
