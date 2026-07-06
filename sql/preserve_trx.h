@@ -71,6 +71,41 @@ enum Preserve_trx_off_artifact_policy {
   PRESERVE_TRX_OFF_ARTIFACT_POLICY_RECOVER = 2,
   PRESERVE_TRX_OFF_ARTIFACT_POLICY_ABANDON = 3
 };
+enum class Preserved_trx_recover_load_profile {
+  SNAPSHOT_ONLY,
+  WITH_SEMANTIC_EXTERNAL_BLOBS
+};
+struct Preserved_trx_operation_deadline {
+  uint64_t deadline_us{0};
+};
+
+class Preserved_trx_peer_thd_handle {
+ public:
+  Preserved_trx_peer_thd_handle() = default;
+  ~Preserved_trx_peer_thd_handle() { release(); }
+
+  THD *get() const { return m_thd; }
+  bool valid() const { return m_thd != nullptr; }
+  bool thd_data_locked() const { return m_thd_data_locked; }
+  void reset_for_internal_use(THD *thd, bool thd_data_locked) {
+    release();
+    m_thd = thd;
+    m_thd_data_locked = thd_data_locked;
+  }
+  void unlock_thd_data_after_pin() { m_thd_data_locked = false; }
+  void release() {
+    m_thd = nullptr;
+    m_thd_data_locked = false;
+  }
+
+ private:
+  THD *m_thd{nullptr};
+  bool m_thd_data_locked{false};
+};
+
+using Preserved_trx_peer_thd_resolver = bool (*)(
+    uint64_t source_connection_id, Preserved_trx_operation_deadline deadline,
+    Preserved_trx_peer_thd_handle *target_handle);
 extern ulong preserve_trx_off_artifact_policy;
 extern ulong preserve_trx_drain_mode;
 extern uint preserve_trx_drain_grace_ms;
@@ -92,6 +127,9 @@ extern uint preserve_trx_lock_warmcopy_max_mdl_descriptors;
 extern uint preserve_trx_lock_warmcopy_seal_threads;
 extern uint preserve_trx_lock_warmcopy_conversion_wait_timeout_ms;
 extern uint preserve_trx_parallel_preserve_threads;
+extern uint preserve_trx_startup_recovery_threads;
+extern bool preserve_trx_recover_lock_page_prefetch;
+extern uint preserve_trx_recover_lock_page_prefetch_io_bytes_per_sec;
 
 uint preserve_trx_auto_parallel_preserve_threads(uint hardware_threads);
 bool preserve_trx_is_enabled();
@@ -103,6 +141,8 @@ bool preserve_trx_off_artifact_policy_recover();
 bool preserve_trx_off_artifact_policy_abandon();
 bool preserve_trx_off_artifact_policy_fail_if_present();
 bool preserve_trx_execute_command(THD *thd);
+bool preserved_trx_resume_adopted_for_promotion_on_thd(
+    Preserved_trx_peer_thd_handle *target_handle, const std::string &token);
 
 ulonglong preserve_trx_warmcopy_prefix_bytes_status();
 ulonglong preserve_trx_warmcopy_digest_bytes_status();
@@ -122,6 +162,55 @@ ulonglong preserve_trx_phase2_detach_claim_us_status();
 ulonglong preserve_trx_phase2_snapshot_write_us_status();
 ulonglong preserve_trx_phase2_register_us_status();
 ulonglong preserve_trx_phase2_slo_miss_count_status();
+ulonglong preserve_trx_resume_total_us_status();
+ulonglong preserve_trx_startup_recovery_elapsed_us_status();
+ulonglong preserve_trx_startup_recovery_error_status();
+ulonglong preserve_trx_startup_recovery_snapshot_tokens_status();
+ulonglong preserve_trx_startup_recovery_local_snapshot_tokens_status();
+ulonglong preserve_trx_startup_recovery_binlog_cache_tokens_status();
+ulonglong preserve_trx_startup_recovery_tainted_tokens_status();
+ulonglong preserve_trx_startup_recovery_standby_pending_tokens_status();
+ulonglong preserve_trx_startup_recovery_promotion_intent_tokens_status();
+ulonglong preserve_trx_startup_recovery_orphan_rollback_count_status();
+ulonglong preserve_trx_startup_recovery_phase_snapshot_load_us_status();
+ulonglong preserve_trx_startup_recovery_phase_snapshot_validate_us_status();
+ulonglong preserve_trx_startup_recovery_phase_snapshot_kernel_us_status();
+ulonglong preserve_trx_startup_recovery_phase_snapshot_claim_us_status();
+ulonglong preserve_trx_startup_recovery_phase_snapshot_read_view_us_status();
+ulonglong preserve_trx_startup_recovery_phase_snapshot_table_locks_us_status();
+ulonglong preserve_trx_startup_recovery_phase_snapshot_record_locks_us_status();
+ulonglong
+preserve_trx_startup_recovery_phase_snapshot_record_lock_entries_status();
+ulonglong
+preserve_trx_startup_recovery_phase_snapshot_record_lock_stable_page_hits_status();
+ulonglong
+preserve_trx_startup_recovery_phase_snapshot_record_lock_image_resolves_status();
+ulonglong
+preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_pages_status();
+ulonglong
+preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_bits_status();
+ulonglong
+preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_us_status();
+ulonglong
+preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_count_status();
+ulonglong
+preserve_trx_startup_recovery_phase_snapshot_record_lock_table_open_us_status();
+ulonglong
+preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_pages_status();
+ulonglong
+preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_bytes_status();
+ulonglong
+preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_residency_pages_status();
+ulonglong
+preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_resident_pages_status();
+ulonglong
+preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_io_pending_pages_status();
+ulonglong
+preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_missing_pages_status();
+ulonglong
+preserve_trx_startup_recovery_phase_snapshot_predicate_locks_us_status();
+ulonglong preserve_trx_startup_recovery_phase_snapshot_mdl_us_status();
+ulonglong preserve_trx_startup_recovery_phase_snapshot_register_us_status();
 ulonglong preserve_trx_lock_warmcopy_attempts_status();
 ulonglong preserve_trx_lock_warmcopy_sealed_valid_status();
 ulonglong preserve_trx_lock_warmcopy_sealed_invalid_status();
@@ -371,6 +460,9 @@ unsigned long preserved_trx_monotonic_timeout_ms_until_deadline_for_unit_test(
 bool preserved_trx_recovery_deadline_expired_for_unit_test(
     const Preserve_snapshot_metadata &metadata, uint64_t anchor_wall_us,
     uint64_t anchor_monotonic_us, uint64_t now_monotonic_us);
+bool preserved_trx_startup_record_lock_pages_prewarmed_for_unit_test(
+    uint64_t record_lock_page_count, uint64_t prefetch_submitted_pages,
+    uint64_t resident_pages);
 void preserved_trx_add_failed_observable_record_for_unit_test(
     const std::string &token, uint64_t anchor_monotonic_us);
 size_t preserved_trx_gc_failed_observable_records_for_unit_test(
@@ -381,6 +473,12 @@ bool preserved_trx_recovery_read_failure_requires_startup_abort_for_unit_test(
     Preserve_snapshot_status status);
 bool preserved_trx_preflight_read_failure_requires_startup_abort_for_unit_test(
     Preserve_snapshot_status status);
+Preserve_snapshot_status preserved_trx_load_bundle_for_recover_or_prewarm(
+    const std::string &dir, const std::string &token,
+    Preserved_trx_recover_load_profile profile, Preserved_trx_bundle *bundle);
+Preserve_snapshot_status preserved_trx_dry_validate_loaded_bundle(
+    const std::string &dir, const std::string &token,
+    const Preserved_trx_bundle &bundle, std::string *reason);
 bool preserved_trx_expired_reaper_claim_releases_manager_state_for_unit_test(
     const std::string &token);
 bool preserved_trx_expired_reaper_empty_claim_keeps_manager_idle_for_unit_test(
@@ -452,7 +550,8 @@ struct Preserved_trx_promotion_ready_adopt_result {
 
 bool preserved_trx_adopt_ready_bundle_for_promotion(
     const std::string &dir, Preserved_trx_bundle bundle,
-    Preserved_trx_promotion_ready_adopt_result *result);
+    Preserved_trx_promotion_ready_adopt_result *result,
+    uint64_t deadline_us = 0);
 void preserved_trx_start_expired_reaper();
 void preserved_trx_start_expired_reaper_if_ready();
 void preserved_trx_stop_expired_reaper();

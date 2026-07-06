@@ -1957,6 +1957,10 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
       still matches the fence captured with that blob. Otherwise phase 2 seals
       the current record store and records that the fast SLO was not guaranteed.
     */
+    const bool use_debug_materialized_payload =
+        m_options.validate_canonical_equivalence &&
+        target->record_locks_seeded_in_phase1 &&
+        !target->record_locks_payload.empty();
     job.use_prebuilt_record_blob =
         target->has_phase1_record_prebuilt_blob &&
         !target->phase1_record_prebuilt_blob.warmcopy_id.empty() &&
@@ -1965,7 +1969,7 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
             target->phase1_record_prebuilt_fence,
             target->phase1_record_fence);
     job.seal_ok =
-        job.use_prebuilt_record_blob
+        (job.use_prebuilt_record_blob || use_debug_materialized_payload)
             ? lock_warmcopy_record_store_seal_metadata_for_target(
                   thread_id, target->phase1_record_fence,
                   target->record_lock_count, m_options.max_lock_count,
@@ -1975,6 +1979,18 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
                   thread_id, target->phase1_record_fence,
                   m_options.max_lock_count, m_options.max_journal_bytes,
                   m_options.max_dirty_shards, &job.seal_result);
+    if (job.seal_ok && use_debug_materialized_payload &&
+        job.seal_result.status ==
+            lock_warmcopy_record_seal_status_t::SEALED_VALID) {
+      /*
+        Canonical-equivalence tests need the phase-1 record bytes in memory so
+        the comparator can prove live export and warmcopy encode the same
+        logical locks. This path is gated by the debug option above; production
+        phase-1 payloads use prebuilt blobs or the normal seal result.
+      */
+      job.seal_result.record_locks_payload = target->record_locks_payload;
+      job.seal_result.materialized_payload_bytes = 0;
+    }
   };
 
   const uint32_t seal_worker_count =
@@ -2379,9 +2395,16 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
     bytes. Keep that path materialized so the test gate does not hydrate the
     phase-1 warm file inside the production preserve kernel.
   */
-  if (payload.empty() || m_options.preserve_dir.empty() ||
-      m_options.validate_canonical_equivalence)
+  if (payload.empty() || m_options.preserve_dir.empty()) return true;
+  if (m_options.validate_canonical_equivalence) {
+    /*
+      Keep a materialized phase-1 payload only for the debug canonical
+      comparator.  The phase-2 seal still validates the record-store metadata
+      before this payload can become an artifact candidate.
+    */
+    target->record_locks_payload = payload;
     return true;
+  }
 
   lock_warmcopy_record_store_fence_t prebuilt_fence;
   if (!lock_warmcopy_record_store_fence_for_target(thread_id,
@@ -2474,8 +2497,9 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
     seed_phase1_record_payload_for_thread(uint64_t thread_id,
                                           const std::string &payload) {
   uint32_t seeded_record_lock_count = 0;
-  if (!lock_warmcopy_record_store_seed_payload_for_target(
-          thread_id, payload, &seeded_record_lock_count)) {
+  const bool store_seeded = lock_warmcopy_record_store_seed_payload_for_target(
+      thread_id, payload, &seeded_record_lock_count);
+  if (!store_seeded) {
     lock_warmcopy_record_store_clear_for_target(thread_id);
     return false;
   }
@@ -2488,8 +2512,10 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
   target->record_locks_candidate_valid = true;
   target->record_locks_seeded_in_phase1 = true;
   target->record_lock_count = seeded_record_lock_count;
-  target->record_locks_payload.clear();
-  target->record_locks_payload.shrink_to_fit();
+  if (!m_options.validate_canonical_equivalence) {
+    target->record_locks_payload.clear();
+    target->record_locks_payload.shrink_to_fit();
+  }
   refresh_phase1_record_prebuilt_observation();
   return true;
 }
@@ -2589,9 +2615,9 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
     seeded payload can be adopted, resealed, or must fall back to live export.
   */
   std::string record_locks_payload;
-  if (trx_preserve_export_record_locks(target, &record_locks_payload,
-                                       m_options.max_lock_count) !=
-      DB_SUCCESS) {
+  const dberr_t export_err = trx_preserve_export_record_locks_stable_page_only(
+      target, &record_locks_payload, m_options.max_lock_count);
+  if (export_err != DB_SUCCESS) {
     return true;
   }
 
@@ -2741,6 +2767,9 @@ bool Preserve_trx_lock_warmcopy_drain_participant::prepare_quiesced_targets(
           old_it->second.phase1_record_prebuilt_fence_valid;
       session.phase1_record_prebuilt_fence =
           old_it->second.phase1_record_prebuilt_fence;
+      if (m_options.validate_canonical_equivalence) {
+        session.record_locks_payload = old_it->second.record_locks_payload;
+      }
       session.record_lock_count = old_it->second.record_lock_count;
       phase1_record_seeded_targets.insert(thread_id);
     }

@@ -97,7 +97,9 @@ enum class Preserve_trx_transfer_frame_type : uint16_t {
   OBJECT_CHUNK = 2,
   SEAL_OBJECT = 3,
   COMMIT_EPOCH = 4,
-  ABORT = 5
+  ABORT = 5,
+  PROMOTION_PREWARM_TOKEN = 6,
+  PROMOTION_GATE_EPOCH = 7
 };
 
 struct Preserve_trx_transfer_object_descriptor {
@@ -162,7 +164,9 @@ struct Preserve_trx_transfer_frame {
     One classic-protocol transfer frame. BEGIN carries a complete encoded
     manifest, OBJECT_CHUNK carries a byte range for one manifest object, and the
     remaining frame types advance receiver-side state without interpreting the
-    existing snapshot bundle format.
+    existing snapshot bundle format. Promotion control frames are intentionally
+    small: PREWARM targets one token and GATE targets the whole epoch so the
+    promotion gate can stay free of cold snapshot reads.
   */
   Preserve_trx_transfer_frame_type type{Preserve_trx_transfer_frame_type::BEGIN};
   uint16_t protocol_version{kPreserveTrxTransferProtocolVersion};
@@ -194,6 +198,8 @@ struct Preserve_trx_transfer_receiver_record {
   uint64_t token{0};
   std::string source_server_uuid;
   std::string target_server_uuid;
+  uint64_t source_prepare_lsn{0};
+  uint64_t source_epoch_commit_lsn{0};
   Preserve_trx_transfer_receiver_state state{
       Preserve_trx_transfer_receiver_state::RECEIVING};
   std::vector<Preserve_trx_transfer_object_descriptor> objects;
@@ -327,6 +333,12 @@ using Preserve_trx_transfer_codec_context_provider =
 void preserve_trx_transfer_set_codec_context_provider_for_unit_test(
     Preserve_trx_transfer_codec_context_provider provider);
 
+using Preserve_trx_transfer_source_lsn_provider =
+    bool (*)(uint64_t *source_prepare_lsn, uint64_t *source_epoch_commit_lsn);
+
+void preserve_trx_transfer_set_source_lsn_provider_for_unit_test(
+    Preserve_trx_transfer_source_lsn_provider provider);
+
 using Preserve_trx_transfer_frame_sink_factory =
     Preserve_trx_transfer_status (*)(
         std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> *sink);
@@ -424,6 +436,20 @@ Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload(
     uint64_t timeout_seconds,
     Preserve_snapshot_metadata *written_metadata = nullptr);
 
+Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch(
+    const std::string &root_dir, const std::vector<std::string> &encoded_frames,
+    Preserved_trx_store *store, Preserve_trx_transfer_receiver_registry *registry,
+    uint64_t timeout_seconds, uint worker_count);
+
+using Preserve_trx_transfer_frame_apply_callback =
+    Preserve_trx_transfer_status (*)(const Preserve_trx_transfer_frame &frame,
+                                     void *context);
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_apply_receiver_frame_batch_with_workers(
+    const std::vector<Preserve_trx_transfer_frame> &frames, uint worker_count,
+    Preserve_trx_transfer_frame_apply_callback apply_frame, void *context);
+
 void preserve_trx_transfer_dispatch_command(THD *thd);
 
 /*
@@ -469,13 +495,15 @@ class Preserve_trx_transfer_artifact_sink final
       std::string epoch_id, std::string source_server_uuid,
       std::string target_server_uuid, uint64_t transfer_token,
       uint32_t chunk_bytes,
-      Preserve_trx_transfer_encoded_frame_sink *frame_sink)
+      Preserve_trx_transfer_encoded_frame_sink *frame_sink,
+      std::string preserve_dir = "")
       : m_epoch_id(std::move(epoch_id)),
         m_source_server_uuid(std::move(source_server_uuid)),
         m_target_server_uuid(std::move(target_server_uuid)),
         m_transfer_token(transfer_token),
         m_chunk_bytes(chunk_bytes),
-        m_frame_sink(frame_sink) {}
+        m_frame_sink(frame_sink),
+        m_preserve_dir(std::move(preserve_dir)) {}
 
   Preserve_snapshot_status publish_bundle(
       Preserved_trx_bundle bundle, uint64_t timeout_seconds,
@@ -491,6 +519,7 @@ class Preserve_trx_transfer_artifact_sink final
   uint64_t m_transfer_token{0};
   uint32_t m_chunk_bytes{0};
   Preserve_trx_transfer_encoded_frame_sink *m_frame_sink{nullptr};
+  std::string m_preserve_dir;
 };
 
 class Preserve_trx_standby_pending_artifact_sink final

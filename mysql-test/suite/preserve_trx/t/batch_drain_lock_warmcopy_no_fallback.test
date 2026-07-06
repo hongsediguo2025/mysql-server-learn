@@ -1,4 +1,5 @@
 --source include/have_debug.inc
+--source include/have_debug_sync.inc
 --source include/not_log_bin.inc
 
 --disable_warnings
@@ -26,14 +27,52 @@ INSERT INTO t_lock_warmcopy_no_fallback VALUES(1,10,REPEAT('a',32));
 
 --connect(lock_wc_no_fallback_app, localhost, root,,test)
 START TRANSACTION;
+--disable_query_log
+--disable_result_log
+SELECT id FROM t_lock_warmcopy_no_fallback WHERE id=1 FOR UPDATE;
+--enable_result_log
+--enable_query_log
 UPDATE t_lock_warmcopy_no_fallback
   SET v=11, pad=REPEAT('b',32)
   WHERE id=1;
+--disable_query_log
+--send SET DEBUG_SYNC = 'now SIGNAL lock_wc_no_fallback_target_waiting WAIT_FOR lock_wc_no_fallback_target_continue'
+--enable_query_log
 
 --connection default
+--disable_query_log
+SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_no_fallback_target_waiting TIMEOUT 10';
+--enable_query_log
+
+--connect(lock_wc_no_fallback_owner, localhost, root,,test)
+--connection lock_wc_no_fallback_owner
 SET SESSION debug='+d,preserve_trx_lock_warmcopy_validate_canonical_equivalence,preserve_trx_lock_warmcopy_corrupt_record_payload_for_equivalence_test';
+--disable_query_log
+SET DEBUG_SYNC =
+  'preserve_trx_lock_warmcopy_after_active_record_scan SIGNAL lock_wc_no_fallback_active_scan_done WAIT_FOR lock_wc_no_fallback_active_scan_continue';
+--enable_query_log
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+--disable_query_log
+SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_no_fallback_active_scan_done TIMEOUT 10';
+SET DEBUG_SYNC = 'now SIGNAL lock_wc_no_fallback_target_continue';
+--enable_query_log
+
+--connection lock_wc_no_fallback_app
+--reap
+
+--connection default
+--disable_query_log
+SET DEBUG_SYNC = 'now SIGNAL lock_wc_no_fallback_active_scan_continue';
+--enable_query_log
+
+--connection lock_wc_no_fallback_owner
 --error ER_PRESERVE_TRX_UNSUPPORTED
-DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+--reap
+--disconnect lock_wc_no_fallback_owner
+
+--connection default
 --let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
 --let $assert_text= lock warmcopy no fallback strict reject is logged
 --let $assert_select= PRESERVE_LOCK_WARMCOPY.*action=strict_reject.*reason=canonical_equivalence_failed
@@ -66,4 +105,7 @@ DROP TABLE t_lock_warmcopy_no_fallback;
 --eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
 --eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
 --eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--enable_query_log
+--disable_query_log
+SET DEBUG_SYNC = 'RESET';
 --enable_query_log

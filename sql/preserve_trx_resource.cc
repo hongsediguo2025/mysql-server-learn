@@ -32,6 +32,7 @@
 #include "mysqld_error.h"
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_lock_warmcopy.h"
+#include "sql/preserve_trx_promotion.h"
 
 ulonglong preserve_trx_memory_budget_bytes = 256ULL * 1024ULL * 1024ULL;
 ulonglong preserve_trx_memory_per_token_bytes = 64ULL * 1024ULL * 1024ULL;
@@ -262,6 +263,149 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_register_us,
                               preserve_trx_phase2_register_us_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_slo_miss_count,
                               preserve_trx_phase2_slo_miss_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_resume_total_us,
+                              preserve_trx_resume_total_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_elapsed_us,
+    preserve_trx_startup_recovery_elapsed_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_error,
+    preserve_trx_startup_recovery_error_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_snapshot_tokens,
+    preserve_trx_startup_recovery_snapshot_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_local_snapshot_tokens,
+    preserve_trx_startup_recovery_local_snapshot_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_binlog_cache_tokens,
+    preserve_trx_startup_recovery_binlog_cache_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_tainted_tokens,
+    preserve_trx_startup_recovery_tainted_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_standby_pending_tokens,
+    preserve_trx_startup_recovery_standby_pending_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_promotion_intent_tokens,
+    preserve_trx_startup_recovery_promotion_intent_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_orphan_rollback_count,
+    preserve_trx_startup_recovery_orphan_rollback_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_load_us,
+    preserve_trx_startup_recovery_phase_snapshot_load_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_validate_us,
+    preserve_trx_startup_recovery_phase_snapshot_validate_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_kernel_us,
+    preserve_trx_startup_recovery_phase_snapshot_kernel_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_claim_us,
+    preserve_trx_startup_recovery_phase_snapshot_claim_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_read_view_us,
+    preserve_trx_startup_recovery_phase_snapshot_read_view_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_table_locks_us,
+    preserve_trx_startup_recovery_phase_snapshot_table_locks_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_record_locks_us,
+    preserve_trx_startup_recovery_phase_snapshot_record_locks_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_record_lock_entries,
+    preserve_trx_startup_recovery_phase_snapshot_record_lock_entries_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_record_lock_stable_page_hits,
+    preserve_trx_startup_recovery_phase_snapshot_record_lock_stable_page_hits_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_record_lock_image_resolves,
+    preserve_trx_startup_recovery_phase_snapshot_record_lock_image_resolves_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_pages,
+    preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_pages_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_bits,
+    preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_bits_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_us,
+    preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_count,
+    preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_record_lock_table_open_us,
+    preserve_trx_startup_recovery_phase_snapshot_record_lock_table_open_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_pages,
+    preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_pages_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_bytes,
+    preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_residency_pages,
+    preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_residency_pages_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_resident_pages,
+    preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_resident_pages_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_io_pending_pages,
+    preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_io_pending_pages_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_missing_pages,
+    preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_missing_pages_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_predicate_locks_us,
+    preserve_trx_startup_recovery_phase_snapshot_predicate_locks_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_mdl_us,
+    preserve_trx_startup_recovery_phase_snapshot_mdl_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_recovery_phase_snapshot_register_us,
+    preserve_trx_startup_recovery_phase_snapshot_register_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_gate_elapsed_us,
+    preserve_trx_promotion_gate_elapsed_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_gate_token_count,
+    preserve_trx_promotion_gate_token_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_gate_adopted_count,
+    preserve_trx_promotion_gate_adopted_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_gate_abandoned_count,
+    preserve_trx_promotion_gate_abandoned_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_gate_skipped_count,
+    preserve_trx_promotion_gate_skipped_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_gate_max_worker_elapsed_us,
+    preserve_trx_promotion_gate_max_worker_elapsed_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_gate_p50_worker_elapsed_us,
+    preserve_trx_promotion_gate_p50_worker_elapsed_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_gate_p95_worker_elapsed_us,
+    preserve_trx_promotion_gate_p95_worker_elapsed_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_gate_status_code,
+    preserve_trx_promotion_gate_status_code_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_gate_record_lock_page_count,
+    preserve_trx_promotion_gate_record_lock_page_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_gate_record_lock_resident_pages,
+    preserve_trx_promotion_gate_record_lock_resident_pages_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_gate_record_lock_cold_page_gets,
+    preserve_trx_promotion_gate_record_lock_cold_page_gets_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_gate_ready_cache_miss_count,
+    preserve_trx_promotion_gate_ready_cache_miss_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_gate_over_budget_count,
+    preserve_trx_promotion_gate_over_budget_count_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_lock_warmcopy_phase2_pause_us,
     preserve_trx_lock_warmcopy_phase2_pause_us_status())

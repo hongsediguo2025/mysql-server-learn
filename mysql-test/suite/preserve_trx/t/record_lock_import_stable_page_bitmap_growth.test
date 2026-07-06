@@ -1,0 +1,99 @@
+--source include/have_debug_sync.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_record_lock_bitmap_growth;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+
+CREATE TABLE t_record_lock_bitmap_growth(
+  id INT PRIMARY KEY,
+  v INT,
+  pad VARBINARY(16)
+) ENGINE=InnoDB;
+
+INSERT INTO t_record_lock_bitmap_growth
+  VALUES(1,10,REPEAT('a',8));
+
+--connect(bitmap_growth_app,localhost,root,,test)
+--connection bitmap_growth_app
+START TRANSACTION;
+--disable_query_log
+--disable_result_log
+SELECT id FROM t_record_lock_bitmap_growth WHERE id=1 FOR UPDATE;
+--enable_result_log
+--enable_query_log
+UPDATE t_record_lock_bitmap_growth
+  SET v=11
+  WHERE id=1;
+SET DEBUG_SYNC =
+  'preserve_trx_after_begin_before_command_read SIGNAL bitmap_growth_idle WAIT_FOR bitmap_growth_continue';
+
+--connect(bitmap_growth_writer,localhost,root,,test)
+--connection bitmap_growth_writer
+INSERT INTO t_record_lock_bitmap_growth
+SELECT seq, seq, REPEAT('b',8)
+FROM (
+  SELECT 2 AS seq UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+  UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9
+  UNION ALL SELECT 10 UNION ALL SELECT 11 UNION ALL SELECT 12 UNION ALL SELECT 13
+  UNION ALL SELECT 14 UNION ALL SELECT 15 UNION ALL SELECT 16 UNION ALL SELECT 17
+  UNION ALL SELECT 18 UNION ALL SELECT 19 UNION ALL SELECT 20 UNION ALL SELECT 21
+  UNION ALL SELECT 22 UNION ALL SELECT 23 UNION ALL SELECT 24 UNION ALL SELECT 25
+  UNION ALL SELECT 26 UNION ALL SELECT 27 UNION ALL SELECT 28 UNION ALL SELECT 29
+  UNION ALL SELECT 30 UNION ALL SELECT 31 UNION ALL SELECT 32 UNION ALL SELECT 33
+) AS generated_rows;
+--disconnect bitmap_growth_writer
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR bitmap_growth_idle TIMEOUT 10';
+
+--connect(bitmap_growth_owner,localhost,root,,test)
+--connection bitmap_growth_owner
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now SIGNAL bitmap_growth_continue';
+
+--connection bitmap_growth_owner
+--reap
+--disconnect bitmap_growth_owner
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10 --debug=d,preserve_trx_corrupt_import_record_lock_identity,preserve_trx_corrupt_import_record_lock_page_lsn" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count_after_bitmap_growth
+  FROM performance_schema.preserved_transactions;
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+
+COMMIT;
+--disconnect bitmap_growth_app
+
+--connection default
+SELECT COUNT(*) AS preserved_count_after_resume
+  FROM performance_schema.preserved_transactions;
+
+SELECT id, v
+  FROM t_record_lock_bitmap_growth
+  WHERE id IN (1, 33)
+  ORDER BY id;
+
+DROP TABLE t_record_lock_bitmap_growth;
+SET GLOBAL preserve_trx_enable=ON;
+SET DEBUG_SYNC = 'RESET';

@@ -26,6 +26,7 @@ import queue
 import re
 import shutil
 import statistics
+import struct
 import subprocess
 import sys
 import threading
@@ -37,6 +38,231 @@ from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence,
 LOG = logging.getLogger("resumable_trx_business_e2e")
 
 WARMCOPY_TAIL_BUDGET_BYTES = 1024 * 1024
+COM_PRESERVE_TRX_TRANSFER = 33
+TRANSFER_FRAME_MAGIC = b"PTRXFRM1"
+TRANSFER_PROTOCOL_VERSION = 3
+MAX_TRANSFER_FRAME_STRING_BYTES = 1024 * 1024
+FULL_LOCK_HEAVY_MIN_RECORD_LOCK_PAGES = 2000
+FULL_LOCK_HEAVY_MIN_PHASE2_RECORD_LOCKS = 1000000
+REQUIRED_LOCK_HEAVY_STARTUP_FIELDS = [
+    "startup_recovery_elapsed_samples_ms",
+    "startup_recovery_snapshot_record_locks_samples_ms",
+    "startup_recovery_snapshot_record_lock_page_get_us_samples",
+    "startup_recovery_snapshot_record_lock_page_get_count_samples",
+    "startup_recovery_snapshot_record_lock_table_open_us_samples",
+    "startup_recovery_snapshot_record_lock_prefetch_pages_samples",
+    "startup_recovery_snapshot_record_lock_prefetch_resident_pages_samples",
+]
+
+
+def _max_numeric_report_value(value: object) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, list):
+        numeric = [item for item in value if isinstance(item, (int, float))]
+        return float(max(numeric)) if numeric else 0.0
+    return 0.0
+
+
+def _int_report_value(report: Dict[str, object], key: str) -> int:
+    value = report.get(key)
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return 0
+
+
+def _validate_lock_heavy_startup_report_fields(report: Dict[str, object]) -> None:
+    missing = [
+        field
+        for field in REQUIRED_LOCK_HEAVY_STARTUP_FIELDS
+        if field not in report or report.get(field) in (None, [])
+    ]
+    if missing:
+        raise AssertionError(
+            "lock-heavy startup report is missing required fields: "
+            + ", ".join(missing)
+        )
+
+
+def annotate_record_lock_import_report(
+    report: Dict[str, object], *, require_lock_heavy_startup_fields: bool = False
+) -> None:
+    """Classify record-lock import evidence without changing pass/fail semantics.
+
+    Small promotion-gate smoke runs prove plumbing only.  Full lock-heavy
+    closure needs enough record-lock page coverage plus ready-cache residency
+    proof and no cold gate reads.
+    """
+
+    scenario = str(report.get("scenario", ""))
+    report_class = "standard_preserve_resume_e2e"
+    promotion_gate_evidence_class = "not_promotion_gate"
+    closure_candidate = False
+    release_gate_ready = False
+
+    if scenario in (
+        "physical_standby_promotion_gate_scaled",
+        "receiver_drain_then_promotion_gate",
+        "promotion_warm_gate_simulator",
+    ):
+        debug_apply_reached = str(
+            report.get("promotion_gate_debug_apply_reached", "")
+        ).lower() in ("1", "true", "yes")
+        page_count = _int_report_value(
+            report, "server_promotion_gate_record_lock_page_count"
+        )
+        resident_pages = _int_report_value(
+            report, "server_promotion_gate_record_lock_resident_pages"
+        )
+        cold_page_gets = _int_report_value(
+            report, "server_promotion_gate_record_lock_cold_page_gets"
+        )
+        ready_misses = _int_report_value(
+            report, "server_promotion_gate_ready_cache_miss_count"
+        )
+        abandoned = _int_report_value(report, "server_promotion_gate_abandoned_count")
+        elapsed_us = _int_report_value(report, "server_promotion_gate_elapsed_us")
+        phase2_record_locks = _max_numeric_report_value(
+            report.get("phase2_record_lock_count_samples")
+        )
+
+        if (
+            page_count >= FULL_LOCK_HEAVY_MIN_RECORD_LOCK_PAGES
+            or phase2_record_locks >= FULL_LOCK_HEAVY_MIN_PHASE2_RECORD_LOCKS
+        ):
+            report_class = "warm_promotion_gate_lock_heavy"
+            gate_metrics_ready = (
+                page_count > 0
+                and resident_pages == page_count
+                and cold_page_gets == 0
+                and ready_misses == 0
+                and abandoned == 0
+                and elapsed_us > 0
+                and elapsed_us <= 1000000
+            )
+            if debug_apply_reached:
+                promotion_gate_evidence_class = "debug_apply_simulator"
+            elif gate_metrics_ready:
+                promotion_gate_evidence_class = "release_candidate_warm_gate"
+                closure_candidate = True
+                release_gate_ready = True
+            else:
+                promotion_gate_evidence_class = "not_ready_or_degraded"
+        else:
+            report_class = "small_promotion_gate_plumbing"
+            promotion_gate_evidence_class = (
+                "debug_apply_simulator"
+                if debug_apply_reached
+                else "small_promotion_gate_plumbing"
+            )
+    elif (
+        require_lock_heavy_startup_fields
+        or _max_numeric_report_value(
+            report.get("startup_recovery_snapshot_record_locks_samples_ms")
+        )
+        > 0
+        or _max_numeric_report_value(
+            report.get("startup_recovery_snapshot_record_lock_page_get_count_samples")
+        )
+        > 0
+    ):
+        report_class = "cold_startup_lock_heavy_diagnostic"
+        _validate_lock_heavy_startup_report_fields(report)
+
+    if require_lock_heavy_startup_fields:
+        _validate_lock_heavy_startup_report_fields(report)
+
+    report["report_class"] = report_class
+    report["lock_heavy_closure_candidate"] = closure_candidate
+    report["promotion_gate_evidence_class"] = promotion_gate_evidence_class
+    report["release_gate_ready"] = release_gate_ready
+
+
+class TransferFrameType(enum.IntEnum):
+    BEGIN = 1
+    OBJECT_CHUNK = 2
+    SEAL_OBJECT = 3
+    COMMIT_EPOCH = 4
+    ABORT = 5
+    PROMOTION_PREWARM_TOKEN = 6
+    PROMOTION_GATE_EPOCH = 7
+
+
+def _transfer_string_payload(value: str) -> bytes:
+    payload = value.encode("utf-8")
+    if len(payload) > MAX_TRANSFER_FRAME_STRING_BYTES:
+        raise ValueError("transfer frame string is too large")
+    return struct.pack("<I", len(payload)) + payload
+
+
+def encode_transfer_frame(
+    frame_type: TransferFrameType,
+    *,
+    sequence: int,
+    epoch_id: str,
+    token: int = 0,
+    object_id: str = "",
+    chunk_offset: int = 0,
+    manifest_payload: str = "",
+    chunk_payload: str = "",
+    reason: str = "",
+) -> bytes:
+    if not epoch_id:
+        raise ValueError("epoch_id is required")
+    if frame_type != TransferFrameType.PROMOTION_GATE_EPOCH and token == 0:
+        raise ValueError("token is required for this transfer frame")
+    return b"".join(
+        [
+            TRANSFER_FRAME_MAGIC,
+            struct.pack("<H", TRANSFER_PROTOCOL_VERSION),
+            struct.pack("<H", int(frame_type)),
+            struct.pack("<Q", sequence),
+            _transfer_string_payload(epoch_id),
+            struct.pack("<Q", token),
+            _transfer_string_payload(object_id),
+            struct.pack("<Q", chunk_offset),
+            _transfer_string_payload(manifest_payload),
+            _transfer_string_payload(chunk_payload),
+            _transfer_string_payload(reason),
+        ]
+    )
+
+
+def encode_promotion_prewarm_frame(
+    *,
+    epoch_id: str,
+    token: int,
+    required_apply_lsn: int,
+    sequence: int = 0,
+) -> bytes:
+    return encode_transfer_frame(
+        TransferFrameType.PROMOTION_PREWARM_TOKEN,
+        sequence=sequence,
+        epoch_id=epoch_id,
+        token=token,
+        chunk_offset=required_apply_lsn,
+    )
+
+
+def encode_promotion_gate_frame(
+    *,
+    epoch_id: str,
+    required_apply_lsn: int,
+    sequence: int = 0,
+) -> bytes:
+    return encode_transfer_frame(
+        TransferFrameType.PROMOTION_GATE_EPOCH,
+        sequence=sequence,
+        epoch_id=epoch_id,
+        token=0,
+        chunk_offset=required_apply_lsn,
+    )
 
 SCENARIOS = {
     "hundred_session_semantic_matrix",
@@ -44,6 +270,9 @@ SCENARIOS = {
     "purge_readview_visibility",
     "warmcopy_two_phase_large_cache_equivalence",
     "temp_table_retryable_unsupported",
+    "standby_transfer_receiver_drain_metrics",
+    "receiver_drain_then_promotion_gate",
+    "physical_standby_promotion_gate_scaled",
 }
 BINLOG_SCENARIOS = (
     "binlog_equivalence",
@@ -152,6 +381,7 @@ class HarnessConfig:
     seed_insert_batch_size: int = 1000
     cycles: int = 3
     drain_interval_s: float = 30.0
+    business_run_before_drain_s: float = 0.0
     duration_s: float = 0.0
     max_transactions_per_worker: int = 0
     min_statements_before_drain_pause: int = 0
@@ -171,6 +401,7 @@ class HarnessConfig:
     preserve_lock_warmcopy_max_journal_bytes: int = 1_073_741_824
     preserve_lock_warmcopy_seal_threads: int = 0
     preserve_parallel_preserve_threads: int = 0
+    preserve_startup_recovery_threads: int = 0
     inflight_drain_probe: bool = False
     inflight_probe_min_waits: int = 1
     inflight_probe_timeout_s: int = 5
@@ -195,6 +426,25 @@ class HarnessConfig:
     temp_table_fill_chunk_kb: int = 64
     temp_table_resume_action: str = "commit"
     report_json: Optional[str] = None
+    promotion_gate_epoch_id: Optional[str] = None
+    promotion_gate_tokens: List[int] = dataclasses.field(default_factory=list)
+    promotion_gate_required_apply_lsn: int = 0
+    promotion_gate_execute: bool = False
+    promotion_gate_debug_apply_reached: bool = False
+    receiver_host: str = "127.0.0.1"
+    receiver_port: int = 3306
+    receiver_user: str = "root"
+    receiver_password: str = ""
+    receiver_unix_socket: Optional[str] = None
+    receiver_preserve_dir: Optional[str] = None
+    source_datadir: Optional[str] = None
+    receiver_datadir: Optional[str] = None
+    source_start_command: Optional[str] = None
+    receiver_start_command: Optional[str] = None
+    receiver_restart_command: Optional[str] = None
+    standby_transfer_user: str = "preserve_transfer_receiver"
+    standby_transfer_password: str = "preserve_transfer_secret"
+    standby_transfer_credential_name: str = "preserve_transfer_credential"
     startup_timeout_s: float = 120.0
     shutdown_timeout_s: float = 120.0
     shutdown_quiet_period_s: float = 2.0
@@ -217,6 +467,65 @@ class HarnessConfig:
             raise ValueError("sessions must be positive")
         if self.table_count <= 0:
             raise ValueError("table_count must be positive")
+        if self.promotion_gate_required_apply_lsn < 0:
+            raise ValueError("promotion gate required apply LSN must be non-negative")
+        if self.scenario == "standby_transfer_receiver_drain_metrics":
+            if not self.receiver_preserve_dir:
+                raise ValueError(
+                    "standby_transfer_receiver_drain_metrics requires "
+                    "--receiver-preserve-dir"
+                )
+            if not (self.receiver_unix_socket or (self.receiver_host and self.receiver_port)):
+                raise ValueError(
+                    "standby_transfer_receiver_drain_metrics requires a receiver "
+                    "socket or host/port"
+                )
+            if not self.standby_transfer_credential_name:
+                raise ValueError("standby transfer credential name is required")
+        if self.scenario == "receiver_drain_then_promotion_gate":
+            if not self.receiver_preserve_dir:
+                raise ValueError(
+                    "receiver_drain_then_promotion_gate requires "
+                    "--receiver-preserve-dir"
+                )
+            if not (self.receiver_unix_socket or (self.receiver_host and self.receiver_port)):
+                raise ValueError(
+                    "receiver_drain_then_promotion_gate requires a receiver "
+                    "socket or host/port"
+                )
+            if self.promotion_gate_tokens:
+                raise ValueError(
+                    "receiver_drain_then_promotion_gate discovers tokens from "
+                    "receiver artifacts; do not pass --promotion-gate-tokens"
+                )
+            if not self.standby_transfer_credential_name:
+                raise ValueError("standby transfer credential name is required")
+        if self.scenario == "physical_standby_promotion_gate_scaled":
+            if not self.source_datadir:
+                raise ValueError(
+                    "physical_standby_promotion_gate_scaled requires "
+                    "--source-datadir"
+                )
+            if not self.receiver_datadir:
+                raise ValueError(
+                    "physical_standby_promotion_gate_scaled requires "
+                    "--receiver-datadir"
+                )
+            if not self.receiver_preserve_dir:
+                raise ValueError(
+                    "physical_standby_promotion_gate_scaled requires "
+                    "--receiver-preserve-dir"
+                )
+            if not (self.receiver_unix_socket or (self.receiver_host and self.receiver_port)):
+                raise ValueError(
+                    "physical_standby_promotion_gate_scaled requires a receiver "
+                    "socket or host/port"
+                )
+            if not self.receiver_restart_command:
+                raise ValueError(
+                    "physical_standby_promotion_gate_scaled requires "
+                    "--receiver-restart-command"
+                )
         if self.statements_per_tx <= 0:
             raise ValueError("statements_per_tx must be positive")
         if self.seed_rows_per_table_per_session < 8:
@@ -227,6 +536,13 @@ class HarnessConfig:
             raise ValueError("cycles must be non-negative")
         if self.drain_interval_s < 0:
             raise ValueError("drain_interval_s must be non-negative")
+        if self.business_run_before_drain_s < 0:
+            raise ValueError("business_run_before_drain_s must be non-negative")
+        if self.business_run_before_drain_s > 0 and self.inflight_drain_probe:
+            raise ValueError(
+                "business_run_before_drain_s cannot be combined with "
+                "inflight_drain_probe"
+            )
         if self.duration_s < 0:
             raise ValueError("duration_s must be non-negative")
         if self.max_transactions_per_worker < 0:
@@ -309,6 +625,8 @@ class HarnessConfig:
             raise ValueError("preserve_lock_warmcopy_seal_threads must be non-negative")
         if self.preserve_parallel_preserve_threads < 0:
             raise ValueError("preserve_parallel_preserve_threads must be non-negative")
+        if self.preserve_startup_recovery_threads < 0:
+            raise ValueError("preserve_startup_recovery_threads must be non-negative")
         if self.inflight_drain_probe and self.sessions < 2:
             raise ValueError("inflight_drain_probe requires at least 2 sessions")
         if self.inflight_probe_min_waits <= 0:
@@ -413,6 +731,102 @@ class WarmcopyDrainMetrics:
     phase2_total_ms: Optional[float] = None
     phase2_slo_guaranteed: Optional[int] = None
     phase2_slo_reason: Optional[str] = None
+    phase2_target_count: Optional[int] = None
+    phase2_record_lock_count: Optional[int] = None
+    phase2_record_prebuilt_target_count: Optional[int] = None
+    phase2_record_materialized_target_count: Optional[int] = None
+    phase2_full_lock_scan_count: Optional[int] = None
+    materialized_lock_payload_bytes_in_phase2: Optional[int] = None
+    phase2_table_live_export_target_count: Optional[int] = None
+    phase2_mdl_live_export_target_count: Optional[int] = None
+    phase2_savepoint_live_export_target_count: Optional[int] = None
+
+    def lock_warmcopy_live_fallback_count(self) -> Optional[int]:
+        counts = (
+            self.phase2_record_materialized_target_count,
+            self.phase2_table_live_export_target_count,
+            self.phase2_mdl_live_export_target_count,
+            self.phase2_savepoint_live_export_target_count,
+        )
+        if any(count is None for count in counts):
+            return None
+        return sum(count or 0 for count in counts)
+
+
+@dataclasses.dataclass(frozen=True)
+class DrainTargetCounterRejectionMetrics:
+    transaction_count: int
+    target_count: int
+    nonidle_transaction_count: int
+    has_unsupported_transaction: int
+
+
+def format_drain_target_counter_rejection(
+    metrics: DrainTargetCounterRejectionMetrics,
+) -> str:
+    return (
+        "target_counter_rejected "
+        f"transaction_count={metrics.transaction_count} "
+        f"target_count={metrics.target_count} "
+        f"nonidle_transaction_count={metrics.nonidle_transaction_count} "
+        f"has_unsupported_transaction={metrics.has_unsupported_transaction}"
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class StartupRecoveryMetrics:
+    elapsed_ms: float
+    error: int
+    outcome: str
+    snapshot_tokens: int
+    local_snapshot_tokens: int
+    binlog_cache_tokens: int
+    tainted_tokens: int
+    standby_pending_tokens: int
+    promotion_intent_tokens: int
+    orphan_rollback_count: int
+    snapshot_load_ms: float = 0.0
+    snapshot_validate_ms: float = 0.0
+    snapshot_kernel_ms: float = 0.0
+    snapshot_claim_ms: float = 0.0
+    snapshot_read_view_ms: float = 0.0
+    snapshot_table_locks_ms: float = 0.0
+    snapshot_record_locks_ms: float = 0.0
+    snapshot_record_lock_entries: int = 0
+    snapshot_record_lock_stable_page_hits: int = 0
+    snapshot_record_lock_image_resolves: int = 0
+    snapshot_record_lock_bitmap_pages: int = 0
+    snapshot_record_lock_bitmap_bits: int = 0
+    snapshot_record_lock_page_get_us: int = 0
+    snapshot_record_lock_page_get_count: int = 0
+    snapshot_record_lock_table_open_us: int = 0
+    snapshot_record_lock_prefetch_pages: int = 0
+    snapshot_record_lock_prefetch_bytes: int = 0
+    snapshot_record_lock_prefetch_residency_pages: int = 0
+    snapshot_record_lock_prefetch_resident_pages: int = 0
+    snapshot_record_lock_prefetch_io_pending_pages: int = 0
+    snapshot_record_lock_prefetch_missing_pages: int = 0
+    snapshot_predicate_locks_ms: float = 0.0
+    snapshot_mdl_ms: float = 0.0
+    snapshot_register_ms: float = 0.0
+
+
+@dataclasses.dataclass(frozen=True)
+class PromotionGateMetrics:
+    elapsed_us: int
+    token_count: int
+    adopted_count: int
+    abandoned_count: int
+    skipped_count: int
+    max_worker_elapsed_us: int
+    p50_worker_elapsed_us: int
+    p95_worker_elapsed_us: int
+    record_lock_page_count: int
+    record_lock_resident_pages: int
+    record_lock_cold_page_gets: int
+    ready_cache_miss_count: int
+    over_budget_count: int
+    status_code: int
 
 
 class WorkloadPlan:
@@ -2364,6 +2778,7 @@ class ResumeCoordinator:
             while True:
                 resumed = self._resumed_connections.get(sid)
                 if resumed is not None and resumed[0] == generation:
+                    self._completed_generation[sid] = generation
                     return self._resumed_connections.pop(sid)[1]
                 if resumed is not None and resumed[0] < generation:
                     stale = self._resumed_connections.pop(sid)[1]
@@ -2393,21 +2808,55 @@ class MySQLRuntime:
         self.mysql_connector = mysql.connector
 
     def connect(self, database: bool = True, autocommit: bool = True):
+        return self.connect_endpoint(
+            user=self.config.user,
+            password=self.config.password,
+            host=self.config.host,
+            port=self.config.port,
+            unix_socket=self.config.unix_socket,
+            database=self.config.database if database else None,
+            autocommit=autocommit,
+        )
+
+    def connect_endpoint(
+        self,
+        *,
+        user: str,
+        password: str,
+        host: str,
+        port: int,
+        unix_socket: Optional[str] = None,
+        database: Optional[str] = None,
+        autocommit: bool = True,
+    ):
         kwargs = {
-            "user": self.config.user,
-            "password": self.config.password,
+            "user": user,
+            "password": password,
             "connection_timeout": self.config.connect_timeout_s,
             "autocommit": autocommit,
             "ssl_disabled": True,
+            "use_pure": True,
         }
-        if self.config.unix_socket:
-            kwargs["unix_socket"] = self.config.unix_socket
+        if unix_socket:
+            kwargs["unix_socket"] = unix_socket
         else:
-            kwargs["host"] = self.config.host
-            kwargs["port"] = self.config.port
+            kwargs["host"] = host
+            kwargs["port"] = port
         if database:
-            kwargs["database"] = self.config.database
+            kwargs["database"] = database
         return self.mysql_connector.connect(**kwargs)
+
+    def send_preserve_transfer_frame(self, conn, encoded_frame: bytes):
+        if not isinstance(encoded_frame, (bytes, bytearray)):
+            raise TypeError("encoded transfer frame must be bytes")
+        send_cmd = getattr(conn, "_send_cmd", None)
+        handle_ok = getattr(conn, "_handle_ok", None)
+        if not callable(send_cmd) or not callable(handle_ok):
+            raise RuntimeError(
+                "mysql.connector connection does not expose raw command sender"
+            )
+        packet = send_cmd(COM_PRESERVE_TRX_TRANSFER, bytes(encoded_frame))
+        return handle_ok(packet)
 
     def is_connection_error(self, exc: BaseException) -> bool:
         errno = getattr(exc, "errno", None)
@@ -3044,9 +3493,24 @@ class BusinessE2ERunner:
         self.server_processes: List[subprocess.Popen] = []
         self.phase2_pause_samples: List[Phase2PauseSample] = []
         self.warmcopy_drain_metrics: List[WarmcopyDrainMetrics] = []
+        self.startup_recovery_metrics: List[StartupRecoveryMetrics] = []
+        self.promotion_gate_elapsed_samples_us: List[int] = []
+        self.promotion_gate_server_metrics: List[PromotionGateMetrics] = []
         self.post_resume_temp_dml_executed = False
 
     def run(self) -> None:
+        if self.config.promotion_gate_epoch_id:
+            self.run_promotion_warm_gate_simulator()
+            return
+        if self.config.scenario == "receiver_drain_then_promotion_gate":
+            self.run_receiver_drain_then_promotion_gate()
+            return
+        if self.config.scenario == "physical_standby_promotion_gate_scaled":
+            self.run_physical_standby_promotion_gate_scaled()
+            return
+        if self.config.scenario == "standby_transfer_receiver_drain_metrics":
+            self.run_standby_transfer_receiver_drain_metrics()
+            return
         if self.config.no_preserve_baseline:
             self.run_no_preserve_baseline()
             return
@@ -3064,7 +3528,10 @@ class BusinessE2ERunner:
         if self.binlog_event_validation_enabled():
             self.reset_binary_logs_for_event_validation()
         self.configure_preserve_globals()
-        if self.config.max_transactions_per_worker > 0:
+        if (
+            self.config.max_transactions_per_worker > 0
+            and self.config.business_run_before_drain_s <= 0
+        ):
             self.coordinator.hold_transaction_starts_until_next_checkpoint()
         self.start_workers()
         started_at = time.monotonic()
@@ -3080,8 +3547,11 @@ class BusinessE2ERunner:
                 self.coordinator.set_desired_large_bucket_mb(
                     self.plan.large_cache_bucket_for_cycle(cycle)
                 )
-                LOG.info("cycle %s/%s sleeping %.3fs before drain", cycle, self.config.cycles, self.config.drain_interval_s)
-                time.sleep(self.config.drain_interval_s)
+                if self.config.business_run_before_drain_s > 0:
+                    self._run_business_before_drain(cycle)
+                else:
+                    LOG.info("cycle %s/%s sleeping %.3fs before drain", cycle, self.config.cycles, self.config.drain_interval_s)
+                    time.sleep(self.config.drain_interval_s)
                 self.drain_restart_resume(cycle)
             if self.config.duration_s > 0:
                 remaining = self.config.duration_s - (time.monotonic() - started_at)
@@ -3112,6 +3582,856 @@ class BusinessE2ERunner:
                     self.drop_schema()
                 except Exception as exc:
                     LOG.warning("schema cleanup failed: %s", exc)
+
+    def run_promotion_warm_gate_simulator(
+        self,
+        *,
+        connection_factory: Optional[Callable[[], object]] = None,
+        wait_until_up: bool = True,
+    ) -> None:
+        if wait_until_up:
+            self.runtime.wait_until_up(self.config.startup_timeout_s)
+        if connection_factory is None:
+            connection_factory = lambda: self.runtime.connect(database=False)
+        conn = connection_factory()
+        sequence = 1
+        gate_elapsed_us: Optional[int] = None
+        server_metrics: Optional[PromotionGateMetrics] = None
+        try:
+            for token in self.config.promotion_gate_tokens:
+                frame = encode_promotion_prewarm_frame(
+                    epoch_id=self.config.promotion_gate_epoch_id or "",
+                    token=token,
+                    required_apply_lsn=self.config.promotion_gate_required_apply_lsn,
+                    sequence=sequence,
+                )
+                self.runtime.send_preserve_transfer_frame(conn, frame)
+                sequence += 1
+            if self.config.promotion_gate_execute:
+                if self.config.promotion_gate_debug_apply_reached:
+                    self.runtime.execute(
+                        conn,
+                        "SET SESSION debug='+d,preserve_trx_promotion_debug_apply_reached'",
+                    )
+                frame = encode_promotion_gate_frame(
+                    epoch_id=self.config.promotion_gate_epoch_id or "",
+                    required_apply_lsn=self.config.promotion_gate_required_apply_lsn,
+                    sequence=sequence,
+                )
+                started = time.monotonic()
+                self.runtime.send_preserve_transfer_frame(conn, frame)
+                gate_elapsed_us = int((time.monotonic() - started) * 1_000_000)
+                server_metrics = self.read_promotion_gate_metrics_from_status(
+                    connection_factory=connection_factory
+                )
+        except BaseException as exc:
+            self.write_promotion_warm_gate_report(
+                gate_elapsed_us, server_metrics, error=str(exc)
+            )
+            raise
+        finally:
+            conn.close()
+        if gate_elapsed_us is not None:
+            if not hasattr(self, "promotion_gate_elapsed_samples_us"):
+                self.promotion_gate_elapsed_samples_us = []
+            self.promotion_gate_elapsed_samples_us.append(gate_elapsed_us)
+        if server_metrics is not None:
+            if not hasattr(self, "promotion_gate_server_metrics"):
+                self.promotion_gate_server_metrics = []
+            self.promotion_gate_server_metrics.append(server_metrics)
+        self.write_promotion_warm_gate_report(gate_elapsed_us, server_metrics)
+
+    def run_standby_transfer_receiver_drain_metrics(self) -> None:
+        self.preflight_disk_budgets()
+        self.runtime.wait_until_up(self.config.startup_timeout_s)
+        receiver_conn = self._receiver_admin_connection()
+        receiver_conn.close()
+        if self.config.setup_schema:
+            self.setup_schema()
+        self.configure_standby_transfer_credentials()
+        self.configure_preserve_globals()
+        if (
+            self.config.max_transactions_per_worker > 0
+            and self.config.business_run_before_drain_s <= 0
+        ):
+            self.coordinator.hold_transaction_starts_until_next_checkpoint()
+        self.start_workers()
+        generation = 0
+        completed_stmt_total = 0
+        try:
+            if self.config.business_run_before_drain_s > 0:
+                self._run_business_before_drain(cycle=1)
+                generation = self.coordinator.request_drain_checkpoint()
+            else:
+                generation = self.coordinator.request_drain_checkpoint()
+                self._wait_all_paused_for_drain_or_raise(
+                    generation,
+                    max(self.config.drain_interval_s, self.config.resume_timeout_s),
+                )
+            error_log_offset = self.warmcopy_error_log_offset()
+            LOG.info(
+                "issuing standby-transfer DRAIN TRANSACTIONS PRESERVE for receiver metrics"
+            )
+            try:
+                drain_will_restart = self._execute_drain_preserve()
+            except BaseException as exc:
+                counter_metrics = (
+                    self.read_latest_drain_target_counter_rejection_since(
+                        error_log_offset
+                    )
+                )
+                if counter_metrics is not None:
+                    raise AssertionError(
+                        "standby transfer DRAIN failed before receiver metrics: "
+                        f"{format_drain_target_counter_rejection(counter_metrics)}"
+                    ) from exc
+                raise
+            if drain_will_restart is False:
+                counter_metrics = self.read_latest_drain_target_counter_rejection_since(
+                    error_log_offset
+                )
+                suffix = (
+                    ": " + format_drain_target_counter_rejection(counter_metrics)
+                    if counter_metrics is not None
+                    else ""
+                )
+                raise AssertionError(
+                    "standby transfer DRAIN returned retryable unsupported" + suffix
+                )
+            self.runtime.wait_until_down(self.config.shutdown_timeout_s)
+            metrics = self.read_latest_warmcopy_metrics_since(error_log_offset)
+            if metrics is None or metrics.phase2_total_ms is None:
+                raise AssertionError(
+                    "standby transfer receiver scenario did not observe phase2_total_us"
+                )
+            lock_fallback_count = metrics.lock_warmcopy_live_fallback_count()
+            if lock_fallback_count is None:
+                raise AssertionError(
+                    "standby transfer receiver scenario did not observe lock fallback count"
+                )
+            if lock_fallback_count != 0:
+                raise AssertionError(
+                    "standby transfer receiver scenario observed live fallback: "
+                    f"lock_warmcopy_live_fallback_count={lock_fallback_count}"
+                )
+            self._record_warmcopy_drain_metrics(metrics)
+            self.receiver_artifact_counts = self.wait_for_receiver_artifacts(
+                expected_standby_pending=(
+                    self.config.sessions if self.config.strict_token_count else 1
+                ),
+                timeout_s=self.config.resume_timeout_s,
+            )
+            completed_stmt_total = sum(
+                worker.statements_completed for worker in self.workers
+            )
+            self.write_standby_transfer_receiver_report(
+                status="success",
+                completed_stmt_total=completed_stmt_total,
+            )
+        except BaseException as exc:
+            self.write_standby_transfer_receiver_report(
+                status="failed",
+                completed_stmt_total=completed_stmt_total,
+                error=str(exc),
+            )
+            raise
+        finally:
+            self.stop_event.set()
+            self.coordinator.release_transaction_start_hold()
+            if generation:
+                self.coordinator.cancel_drain_checkpoint(generation)
+            try:
+                self.join_workers()
+            except Exception as exc:
+                LOG.warning("worker cleanup after standby transfer drain did not finish: %s", exc)
+
+    def run_receiver_drain_then_promotion_gate(self) -> None:
+        self.run_standby_transfer_receiver_drain_metrics()
+        epoch_id, tokens, required_lsn = self.read_latest_receiver_epoch_fact()
+        if not tokens:
+            raise AssertionError("receiver epoch fact did not contain standby tokens")
+        self.config.promotion_gate_epoch_id = epoch_id
+        self.config.promotion_gate_tokens = tokens
+        self.config.promotion_gate_required_apply_lsn = required_lsn
+        self.config.promotion_gate_execute = True
+        self.run_promotion_warm_gate_simulator(
+            connection_factory=self._receiver_admin_connection,
+            wait_until_up=False,
+        )
+        self.write_receiver_promotion_gate_report(epoch_id, tokens)
+
+    def run_physical_standby_promotion_gate_scaled(self) -> None:
+        self.start_source_server_if_configured()
+        self.start_receiver_server_if_configured()
+        self.run_standby_transfer_receiver_drain_metrics()
+        self.shutdown_receiver_for_physical_standby_copy()
+        self.materialize_physical_standby_datadir_for_promotion()
+        self.restart_receiver_server()
+        epoch_facts = self.read_all_receiver_epoch_facts()
+        all_epoch_ids: List[str] = []
+        all_tokens: List[int] = []
+        for epoch_id, tokens, required_lsn in epoch_facts:
+            if not tokens:
+                raise AssertionError(
+                    f"receiver epoch fact {epoch_id} did not contain standby tokens"
+                )
+            self.config.promotion_gate_epoch_id = epoch_id
+            self.config.promotion_gate_tokens = tokens
+            self.config.promotion_gate_required_apply_lsn = required_lsn
+            self.config.promotion_gate_execute = True
+            self.run_promotion_warm_gate_simulator(
+                connection_factory=self._receiver_admin_connection,
+                wait_until_up=False,
+            )
+            all_epoch_ids.append(epoch_id)
+            all_tokens.extend(tokens)
+        if not all_tokens:
+            raise AssertionError("receiver epoch facts did not contain standby tokens")
+        self.write_receiver_promotion_gate_report(
+            ",".join(all_epoch_ids),
+            sorted(all_tokens),
+            scenario_name="physical_standby_promotion_gate_scaled",
+        )
+
+    def start_source_server_if_configured(self) -> None:
+        if not self.config.source_start_command:
+            return
+        LOG.info("starting source mysqld with command: %s",
+                 self.config.source_start_command)
+        process = subprocess.Popen(self.config.source_start_command, shell=True)
+        if not hasattr(self, "server_processes"):
+            self.server_processes = []
+        self.server_processes.append(process)
+        self.runtime.wait_until_up(self.config.startup_timeout_s)
+
+    def start_receiver_server_if_configured(self) -> None:
+        if not self.config.receiver_start_command:
+            return
+        LOG.info("starting receiver mysqld with command: %s",
+                 self.config.receiver_start_command)
+        process = subprocess.Popen(self.config.receiver_start_command, shell=True)
+        if not hasattr(self, "server_processes"):
+            self.server_processes = []
+        self.server_processes.append(process)
+        self.wait_until_receiver_up(self.config.startup_timeout_s)
+
+    def shutdown_receiver_for_physical_standby_copy(self) -> None:
+        receiver_conn = self._receiver_admin_connection()
+        try:
+            self.runtime.execute(receiver_conn, "SHUTDOWN")
+        finally:
+            receiver_conn.close()
+        self.wait_until_receiver_down(self.config.shutdown_timeout_s)
+
+    def wait_until_receiver_down(self, timeout_s: float) -> None:
+        deadline = time.monotonic() + timeout_s
+        down_since: Optional[float] = None
+        quiet_period = self.config.shutdown_quiet_period_s
+        last_error: Optional[BaseException] = None
+        while time.monotonic() < deadline:
+            try:
+                conn = self._receiver_admin_connection()
+                conn.close()
+                down_since = None
+            except BaseException as exc:  # pragma: no cover - needs mysqld
+                last_error = exc
+                now = time.monotonic()
+                if down_since is None:
+                    down_since = now
+                if now - down_since >= quiet_period:
+                    return
+            time.sleep(min(0.1, max(0.01, deadline - time.monotonic())))
+        detail = f": {last_error}" if last_error is not None else ""
+        raise TimeoutError(f"receiver mysqld did not shut down{detail}")
+
+    def wait_until_receiver_up(self, timeout_s: float) -> None:
+        deadline = time.monotonic() + timeout_s
+        last_error: Optional[BaseException] = None
+        while time.monotonic() < deadline:
+            try:
+                conn = self._receiver_admin_connection()
+                conn.close()
+                return
+            except BaseException as exc:  # pragma: no cover - needs mysqld
+                last_error = exc
+                time.sleep(0.5)
+        raise TimeoutError(f"receiver mysqld did not become reachable: {last_error}")
+
+    def restart_receiver_server(self) -> None:
+        if not self.config.receiver_restart_command:
+            raise RuntimeError(
+                "--receiver-restart-command is required after receiver shutdown"
+            )
+        LOG.info(
+            "starting receiver mysqld with restart command: %s",
+            self.config.receiver_restart_command,
+        )
+        process = subprocess.Popen(self.config.receiver_restart_command, shell=True)
+        if not hasattr(self, "server_processes"):
+            self.server_processes = []
+        self.server_processes.append(process)
+        self.wait_until_receiver_up(self.config.startup_timeout_s)
+
+    def materialize_physical_standby_datadir_for_promotion(self) -> None:
+        source_datadir = Path(self.config.source_datadir or "").expanduser().resolve()
+        receiver_datadir = Path(
+            self.config.receiver_datadir or ""
+        ).expanduser().resolve()
+        receiver_preserve_dir = Path(
+            self.config.receiver_preserve_dir or ""
+        ).expanduser().resolve()
+        if source_datadir == receiver_datadir:
+            raise ValueError("source and receiver datadir must be different")
+        if not source_datadir.is_dir():
+            raise FileNotFoundError(f"source datadir does not exist: {source_datadir}")
+        if not receiver_datadir.is_dir():
+            raise FileNotFoundError(
+                f"receiver datadir does not exist: {receiver_datadir}"
+            )
+        try:
+            preserve_relative = receiver_preserve_dir.relative_to(receiver_datadir)
+        except ValueError as exc:
+            raise ValueError(
+                "receiver preserve dir must be inside receiver datadir"
+            ) from exc
+
+        parent = receiver_datadir.parent
+        preserved_overlay = parent / f".{receiver_datadir.name}.preserve-overlay.tmp"
+        auto_cnf_overlay = parent / f".{receiver_datadir.name}.auto-cnf-overlay.tmp"
+        staged_datadir = parent / f".{receiver_datadir.name}.physical-standby.tmp"
+        if preserved_overlay.exists():
+            shutil.rmtree(preserved_overlay)
+        if auto_cnf_overlay.exists():
+            auto_cnf_overlay.unlink()
+        if staged_datadir.exists():
+            shutil.rmtree(staged_datadir)
+        if receiver_preserve_dir.exists():
+            shutil.copytree(receiver_preserve_dir, preserved_overlay, symlinks=True)
+        receiver_auto_cnf = receiver_datadir / "auto.cnf"
+        if receiver_auto_cnf.exists():
+            shutil.copy2(receiver_auto_cnf, auto_cnf_overlay)
+        try:
+            shutil.copytree(source_datadir, staged_datadir, symlinks=True)
+            if preserved_overlay.exists():
+                staged_preserve_dir = staged_datadir / preserve_relative
+                if staged_preserve_dir.exists():
+                    shutil.rmtree(staged_preserve_dir)
+                staged_preserve_dir.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(
+                    preserved_overlay, staged_preserve_dir, symlinks=True
+                )
+            if auto_cnf_overlay.exists():
+                shutil.copy2(auto_cnf_overlay, staged_datadir / "auto.cnf")
+            shutil.rmtree(receiver_datadir)
+            staged_datadir.rename(receiver_datadir)
+        finally:
+            if preserved_overlay.exists():
+                shutil.rmtree(preserved_overlay)
+            if auto_cnf_overlay.exists():
+                auto_cnf_overlay.unlink()
+            if staged_datadir.exists():
+                shutil.rmtree(staged_datadir)
+
+    def read_latest_receiver_epoch_fact(self) -> Tuple[str, List[int], int]:
+        epoch_facts = self.read_all_receiver_epoch_facts()
+        return epoch_facts[-1]
+
+    def read_all_receiver_epoch_facts(self) -> List[Tuple[str, List[int], int]]:
+        preserve_dir = Path(self.config.receiver_preserve_dir or "").expanduser()
+        transfer_root = preserve_dir / ".transfer"
+        fact_paths = sorted(
+            transfer_root.glob("*/epoch.fact"),
+            key=lambda path: (
+                path.stat().st_mtime if path.exists() else 0.0,
+                path.parent.name,
+            ),
+        )
+        if not fact_paths:
+            raise AssertionError(
+                f"receiver preserve dir {preserve_dir} does not contain an epoch fact"
+            )
+        epoch_facts: List[Tuple[str, List[int], int]] = []
+        for fact_path in fact_paths:
+            epoch_id, tokens, required_lsn = self.parse_receiver_epoch_fact(fact_path)
+            epoch_facts.append(
+                (epoch_id or fact_path.parent.name, sorted(tokens), required_lsn)
+            )
+        if not any(tokens for _, tokens, _ in epoch_facts):
+            tokens = self.receiver_standby_pending_tokens()
+            if tokens:
+                fact_path = fact_paths[-1]
+                epoch_id, _, required_lsn = self.parse_receiver_epoch_fact(fact_path)
+                epoch_facts[-1] = (
+                    epoch_id or fact_path.parent.name,
+                    sorted(tokens),
+                    required_lsn,
+                )
+        if not any(tokens for _, tokens, _ in epoch_facts):
+            raise AssertionError(
+                f"receiver preserve dir {preserve_dir} does not contain standby tokens"
+            )
+        return epoch_facts
+
+    def parse_receiver_epoch_fact(self, fact_path: Path) -> Tuple[str, List[int], int]:
+        payload = fact_path.read_text(encoding="utf-8")
+        stripped = payload.strip()
+        if stripped.startswith("{"):
+            fact = json.loads(stripped)
+            tokens = [int(token) for token in fact.get("tokens", [])]
+            required_lsn = int(
+                fact.get(
+                    "required_apply_lsn",
+                    fact.get("source_epoch_commit_lsn", 0),
+                )
+            )
+            return str(fact.get("epoch", fact_path.parent.name)), tokens, required_lsn
+
+        epoch_id = fact_path.parent.name
+        tokens: List[int] = []
+        required_lsn = 0
+        for line in payload.splitlines():
+            if line.startswith("epoch="):
+                epoch_id = line.split("=", 1)[1]
+            elif line.startswith("token="):
+                token = int(line.split("=", 1)[1])
+                if token > 0:
+                    tokens.append(token)
+            elif line.startswith("source_epoch_commit_lsn="):
+                required_lsn = max(required_lsn, int(line.split("=", 1)[1]))
+        return epoch_id, tokens, required_lsn
+
+    def receiver_standby_pending_tokens(self) -> List[int]:
+        preserve_dir = Path(self.config.receiver_preserve_dir or "").expanduser()
+        tokens: List[int] = []
+        for marker in preserve_dir.glob("*.standby_pending"):
+            token_text = marker.name[: -len(".standby_pending")]
+            if re.fullmatch(r"[1-9][0-9]*", token_text):
+                tokens.append(int(token_text))
+        return sorted(tokens)
+
+    def write_receiver_promotion_gate_report(
+        self,
+        epoch_id: str,
+        tokens: Sequence[int],
+        *,
+        scenario_name: str = "receiver_drain_then_promotion_gate",
+    ) -> None:
+        if not self.config.report_json:
+            return
+        report_path = Path(self.config.report_json).expanduser()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_counts = self.receiver_preserve_artifact_counts()
+        gate_elapsed_us = (
+            sum(self.promotion_gate_elapsed_samples_us)
+            if self.promotion_gate_elapsed_samples_us
+            else None
+        )
+        server_metrics = self.aggregate_promotion_gate_server_metrics()
+        report = {
+            "generated_at_utc": datetime.datetime.utcnow()
+            .replace(microsecond=0)
+            .isoformat()
+            + "Z",
+            "status": "success",
+            "success": True,
+            "scenario": scenario_name,
+            "promotion_gate_epoch_id": epoch_id,
+            "promotion_gate_token_count": len(tokens),
+            "promotion_gate_tokens": list(tokens),
+            "promotion_gate_required_apply_lsn": (
+                self.config.promotion_gate_required_apply_lsn
+            ),
+            "promotion_gate_execute": self.config.promotion_gate_execute,
+            "promotion_gate_debug_apply_reached": (
+                self.config.promotion_gate_debug_apply_reached
+            ),
+            "promotion_gate_elapsed_us": gate_elapsed_us,
+            "receiver_snapshot_tokens": artifact_counts.get("snapshot_tokens", 0),
+            "receiver_standby_pending_tokens": artifact_counts.get(
+                "standby_pending_tokens", 0
+            ),
+            "receiver_external_blob_tokens": artifact_counts.get(
+                "external_blob_tokens", 0
+            ),
+            "receiver_epoch_fact_count": artifact_counts.get("epoch_fact_count", 0),
+            "receiver_epoch_commit_count": artifact_counts.get(
+                "epoch_commit_count", 0
+            ),
+        }
+        metrics = list(getattr(self, "warmcopy_drain_metrics", []))
+        if metrics:
+            report.update(
+                {
+                    "phase2_pause_samples_ms": [
+                        metric.phase2_pause_ms for metric in metrics
+                    ],
+                    "phase2_total_samples_ms": [
+                        metric.phase2_total_ms
+                        for metric in metrics
+                        if metric.phase2_total_ms is not None
+                    ],
+                    "phase2_slo_guaranteed": all(
+                        metric.phase2_slo_guaranteed == 1 for metric in metrics
+                    ),
+                    "phase2_target_count_samples": [
+                        metric.phase2_target_count
+                        for metric in metrics
+                        if metric.phase2_target_count is not None
+                    ],
+                    "phase2_record_lock_count_samples": [
+                        metric.phase2_record_lock_count
+                        for metric in metrics
+                        if metric.phase2_record_lock_count is not None
+                    ],
+                    "phase2_record_prebuilt_target_count_samples": [
+                        metric.phase2_record_prebuilt_target_count
+                        for metric in metrics
+                        if metric.phase2_record_prebuilt_target_count is not None
+                    ],
+                    "phase2_record_materialized_target_count_samples": [
+                        metric.phase2_record_materialized_target_count
+                        for metric in metrics
+                        if metric.phase2_record_materialized_target_count
+                        is not None
+                    ],
+                    "phase2_full_lock_scan_count_samples": [
+                        metric.phase2_full_lock_scan_count
+                        for metric in metrics
+                        if metric.phase2_full_lock_scan_count is not None
+                    ],
+                    "materialized_lock_payload_bytes_in_phase2_samples": [
+                        metric.materialized_lock_payload_bytes_in_phase2
+                        for metric in metrics
+                        if metric.materialized_lock_payload_bytes_in_phase2
+                        is not None
+                    ],
+                    "warmcopy_provider_full_copy_count": sum(
+                        metric.full_copy_to_count or 0 for metric in metrics
+                    ),
+                    "lock_warmcopy_live_fallback_count": sum(
+                        metric.lock_warmcopy_live_fallback_count() or 0
+                        for metric in metrics
+                    ),
+                }
+            )
+        if server_metrics is not None:
+            report.update(
+                {
+                    "server_promotion_gate_elapsed_us": server_metrics.elapsed_us,
+                    "server_promotion_gate_token_count": server_metrics.token_count,
+                    "server_promotion_gate_adopted_count": (
+                        server_metrics.adopted_count
+                    ),
+                    "server_promotion_gate_abandoned_count": (
+                        server_metrics.abandoned_count
+                    ),
+                    "server_promotion_gate_skipped_count": (
+                        server_metrics.skipped_count
+                    ),
+                    "server_promotion_gate_max_worker_elapsed_us": (
+                        server_metrics.max_worker_elapsed_us
+                    ),
+                    "server_promotion_gate_p50_worker_elapsed_us": (
+                        server_metrics.p50_worker_elapsed_us
+                    ),
+                    "server_promotion_gate_p95_worker_elapsed_us": (
+                        server_metrics.p95_worker_elapsed_us
+                    ),
+                    "server_promotion_gate_record_lock_page_count": (
+                        server_metrics.record_lock_page_count
+                    ),
+                    "server_promotion_gate_record_lock_resident_pages": (
+                        server_metrics.record_lock_resident_pages
+                    ),
+                    "server_promotion_gate_record_lock_cold_page_gets": (
+                        server_metrics.record_lock_cold_page_gets
+                    ),
+                    "server_promotion_gate_ready_cache_miss_count": (
+                        server_metrics.ready_cache_miss_count
+                    ),
+                    "server_promotion_gate_over_budget_count": (
+                        server_metrics.over_budget_count
+                    ),
+                    "server_promotion_gate_status_code": (
+                        server_metrics.status_code
+                    ),
+                }
+            )
+        annotate_record_lock_import_report(report)
+        report_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def aggregate_promotion_gate_server_metrics(
+        self,
+    ) -> Optional[PromotionGateMetrics]:
+        metrics = getattr(self, "promotion_gate_server_metrics", [])
+        if not metrics:
+            return None
+        return PromotionGateMetrics(
+            elapsed_us=sum(metric.elapsed_us for metric in metrics),
+            token_count=sum(metric.token_count for metric in metrics),
+            adopted_count=sum(metric.adopted_count for metric in metrics),
+            abandoned_count=sum(metric.abandoned_count for metric in metrics),
+            skipped_count=sum(metric.skipped_count for metric in metrics),
+            max_worker_elapsed_us=max(
+                metric.max_worker_elapsed_us for metric in metrics
+            ),
+            p50_worker_elapsed_us=max(
+                metric.p50_worker_elapsed_us for metric in metrics
+            ),
+            p95_worker_elapsed_us=max(
+                metric.p95_worker_elapsed_us for metric in metrics
+            ),
+            record_lock_page_count=sum(
+                metric.record_lock_page_count for metric in metrics
+            ),
+            record_lock_resident_pages=sum(
+                metric.record_lock_resident_pages for metric in metrics
+            ),
+            record_lock_cold_page_gets=sum(
+                metric.record_lock_cold_page_gets for metric in metrics
+            ),
+            ready_cache_miss_count=sum(
+                metric.ready_cache_miss_count for metric in metrics
+            ),
+            over_budget_count=sum(metric.over_budget_count for metric in metrics),
+            status_code=next(
+                (metric.status_code for metric in metrics if metric.status_code != 0),
+                0,
+            ),
+        )
+
+    def write_promotion_warm_gate_report(
+        self, gate_elapsed_us: Optional[int],
+        server_metrics: Optional[PromotionGateMetrics],
+        error: Optional[str] = None,
+    ) -> None:
+        if not self.config.report_json:
+            return
+        report_path = Path(self.config.report_json).expanduser()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report = {
+            "generated_at_utc": datetime.datetime.utcnow()
+            .replace(microsecond=0)
+            .isoformat()
+            + "Z",
+            "status": "failed" if error else "success",
+            "success": error is None,
+            "scenario": "promotion_warm_gate_simulator",
+            "promotion_gate_epoch_id": self.config.promotion_gate_epoch_id,
+            "promotion_gate_token_count": len(self.config.promotion_gate_tokens),
+            "promotion_gate_tokens": self.config.promotion_gate_tokens,
+            "promotion_gate_required_apply_lsn": (
+                self.config.promotion_gate_required_apply_lsn
+            ),
+            "promotion_gate_execute": self.config.promotion_gate_execute,
+            "promotion_gate_debug_apply_reached": (
+                self.config.promotion_gate_debug_apply_reached
+            ),
+            "promotion_gate_elapsed_us": gate_elapsed_us,
+        }
+        if error:
+            report["error"] = error
+        if server_metrics is not None:
+            report.update(
+                {
+                    "server_promotion_gate_elapsed_us": server_metrics.elapsed_us,
+                    "server_promotion_gate_token_count": server_metrics.token_count,
+                    "server_promotion_gate_adopted_count": (
+                        server_metrics.adopted_count
+                    ),
+                    "server_promotion_gate_abandoned_count": (
+                        server_metrics.abandoned_count
+                    ),
+                    "server_promotion_gate_skipped_count": (
+                        server_metrics.skipped_count
+                    ),
+                    "server_promotion_gate_max_worker_elapsed_us": (
+                        server_metrics.max_worker_elapsed_us
+                    ),
+                    "server_promotion_gate_p50_worker_elapsed_us": (
+                        server_metrics.p50_worker_elapsed_us
+                    ),
+                    "server_promotion_gate_p95_worker_elapsed_us": (
+                        server_metrics.p95_worker_elapsed_us
+                    ),
+                    "server_promotion_gate_record_lock_page_count": (
+                        server_metrics.record_lock_page_count
+                    ),
+                    "server_promotion_gate_record_lock_resident_pages": (
+                        server_metrics.record_lock_resident_pages
+                    ),
+                    "server_promotion_gate_record_lock_cold_page_gets": (
+                        server_metrics.record_lock_cold_page_gets
+                    ),
+                    "server_promotion_gate_ready_cache_miss_count": (
+                        server_metrics.ready_cache_miss_count
+                    ),
+                    "server_promotion_gate_over_budget_count": (
+                        server_metrics.over_budget_count
+                    ),
+                    "server_promotion_gate_status_code": (
+                        server_metrics.status_code
+                    ),
+                }
+            )
+        annotate_record_lock_import_report(report)
+        report_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def receiver_preserve_artifact_counts(self) -> Dict[str, int]:
+        preserve_dir = Path(self.config.receiver_preserve_dir or "").expanduser()
+        counts = {
+            "snapshot_tokens": 0,
+            "standby_pending_tokens": 0,
+            "external_blob_tokens": 0,
+            "epoch_fact_count": 0,
+            "epoch_commit_count": 0,
+        }
+        if not preserve_dir.exists():
+            return counts
+
+        for entry in preserve_dir.iterdir():
+            if not entry.is_file():
+                continue
+            name = entry.name
+            if name.endswith(".standby_pending"):
+                counts["standby_pending_tokens"] += 1
+            elif name.endswith(".bin"):
+                counts["snapshot_tokens"] += 1
+            elif name.endswith(".binlog_cache") or ".blob." in name:
+                counts["external_blob_tokens"] += 1
+
+        transfer_root = preserve_dir / ".transfer"
+        if transfer_root.exists():
+            counts["epoch_fact_count"] = sum(
+                1 for path in transfer_root.glob("*/epoch.fact") if path.is_file()
+            )
+            counts["epoch_commit_count"] = sum(
+                1 for path in transfer_root.glob("*/epoch.commit") if path.is_file()
+            )
+        return counts
+
+    def wait_for_receiver_artifacts(
+        self, expected_standby_pending: int, timeout_s: float
+    ) -> Dict[str, int]:
+        deadline = time.monotonic() + timeout_s
+        last_counts = self.receiver_preserve_artifact_counts()
+        while True:
+            if (
+                last_counts.get("standby_pending_tokens", 0)
+                >= expected_standby_pending
+                and last_counts.get("epoch_fact_count", 0) >= 1
+            ):
+                return last_counts
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "receiver did not publish expected standby transfer artifacts: "
+                    f"expected_standby_pending={expected_standby_pending} "
+                    f"observed={last_counts}"
+                )
+            time.sleep(min(0.2, remaining))
+            last_counts = self.receiver_preserve_artifact_counts()
+
+    def write_standby_transfer_receiver_report(
+        self, status: str, completed_stmt_total: int, error: Optional[str] = None
+    ) -> None:
+        if not self.config.report_json:
+            return
+        report_path = Path(self.config.report_json).expanduser()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics = list(getattr(self, "warmcopy_drain_metrics", []))
+        artifact_counts = dict(
+            getattr(self, "receiver_artifact_counts", {})
+            or self.receiver_preserve_artifact_counts()
+        )
+        report = {
+            "generated_at_utc": datetime.datetime.utcnow()
+            .replace(microsecond=0)
+            .isoformat()
+            + "Z",
+            "status": status,
+            "success": status == "success",
+            "scenario": "standby_transfer_receiver_drain_metrics",
+            "sessions": self.config.sessions,
+            "cycles": self.config.cycles,
+            "completed_stmt_total": completed_stmt_total,
+            "phase2_pause_samples_ms": [
+                metric.phase2_pause_ms for metric in metrics
+            ],
+            "phase2_total_samples_ms": [
+                metric.phase2_total_ms
+                for metric in metrics
+                if metric.phase2_total_ms is not None
+            ],
+            "phase2_slo_guaranteed": (
+                None
+                if not metrics
+                else all(metric.phase2_slo_guaranteed == 1 for metric in metrics)
+            ),
+            "phase2_target_count_samples": [
+                metric.phase2_target_count
+                for metric in metrics
+                if metric.phase2_target_count is not None
+            ],
+            "phase2_record_lock_count_samples": [
+                metric.phase2_record_lock_count
+                for metric in metrics
+                if metric.phase2_record_lock_count is not None
+            ],
+            "phase2_record_prebuilt_target_count_samples": [
+                metric.phase2_record_prebuilt_target_count
+                for metric in metrics
+                if metric.phase2_record_prebuilt_target_count is not None
+            ],
+            "phase2_record_materialized_target_count_samples": [
+                metric.phase2_record_materialized_target_count
+                for metric in metrics
+                if metric.phase2_record_materialized_target_count is not None
+            ],
+            "phase2_full_lock_scan_count_samples": [
+                metric.phase2_full_lock_scan_count
+                for metric in metrics
+                if metric.phase2_full_lock_scan_count is not None
+            ],
+            "materialized_lock_payload_bytes_in_phase2_samples": [
+                metric.materialized_lock_payload_bytes_in_phase2
+                for metric in metrics
+                if metric.materialized_lock_payload_bytes_in_phase2 is not None
+            ],
+            "warmcopy_provider_full_copy_count": sum(
+                metric.full_copy_to_count or 0 for metric in metrics
+            ),
+            "lock_warmcopy_live_fallback_count": sum(
+                metric.lock_warmcopy_live_fallback_count() or 0
+                for metric in metrics
+            ),
+            "receiver_snapshot_tokens": artifact_counts.get("snapshot_tokens", 0),
+            "receiver_standby_pending_tokens": artifact_counts.get(
+                "standby_pending_tokens", 0
+            ),
+            "receiver_external_blob_tokens": artifact_counts.get(
+                "external_blob_tokens", 0
+            ),
+            "receiver_epoch_fact_count": artifact_counts.get("epoch_fact_count", 0),
+            "receiver_epoch_commit_count": artifact_counts.get(
+                "epoch_commit_count", 0
+            ),
+        }
+        if error:
+            report["error"] = error
+        report_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
 
     def preflight_disk_budgets(self) -> None:
         plan = getattr(self, "plan", None)
@@ -3670,6 +4990,42 @@ class BusinessE2ERunner:
         finally:
             conn.close()
 
+    def _receiver_admin_connection(self):
+        return self.runtime.connect_endpoint(
+            user=self.config.receiver_user,
+            password=self.config.receiver_password,
+            host=self.config.receiver_host,
+            port=self.config.receiver_port,
+            unix_socket=self.config.receiver_unix_socket,
+            database=None,
+        )
+
+    def configure_standby_transfer_credentials(self) -> None:
+        receiver_conn = self._receiver_admin_connection()
+        try:
+            user = self.config.standby_transfer_user
+            password = self.config.standby_transfer_password
+            hosts = ["localhost", "127.0.0.1", "%"]
+            for host in hosts:
+                account = (
+                    f"{quote_sql_string(user)}@{quote_sql_string(host)}"
+                )
+                self.runtime.execute(
+                    receiver_conn,
+                    "CREATE USER IF NOT EXISTS "
+                    f"{account} IDENTIFIED BY {quote_sql_string(password)}",
+                )
+                self.runtime.execute(
+                    receiver_conn,
+                    f"ALTER USER {account} IDENTIFIED BY {quote_sql_string(password)}",
+                )
+                self.runtime.execute(
+                    receiver_conn,
+                    f"GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO {account}",
+                )
+        finally:
+            receiver_conn.close()
+
     def configure_no_preserve_baseline_globals(self) -> None:
         conn = self.runtime.connect(database=False)
         try:
@@ -3743,6 +5099,7 @@ class BusinessE2ERunner:
             if warmcopy_metrics_required
             else None
         )
+        startup_recovery_log_offset = self.warmcopy_error_log_offset()
         generation = self.coordinator.request_drain_checkpoint()
         try:
             if self.config.inflight_drain_probe:
@@ -3759,6 +5116,12 @@ class BusinessE2ERunner:
                     phase="before DRAIN",
                 )
                 self.coordinator.close_inflight_probe_launch(generation)
+            elif self.config.business_run_before_drain_s > 0:
+                LOG.info(
+                    "cycle %s issuing DRAIN without harness pre-pause after %.3fs business run",
+                    cycle,
+                    self.config.business_run_before_drain_s,
+                )
             else:
                 self._wait_all_paused_for_drain_or_raise(
                     generation,
@@ -3800,6 +5163,13 @@ class BusinessE2ERunner:
             self.runtime.wait_until_down(self.config.shutdown_timeout_s)
             self.restart_server()
             self.runtime.wait_until_up(self.config.startup_timeout_s)
+            startup_metrics = self.read_startup_recovery_metrics_from_status()
+            if startup_metrics is None:
+                startup_metrics = self.read_latest_startup_recovery_metrics_since(
+                    startup_recovery_log_offset
+                )
+            if startup_metrics is not None:
+                self._record_startup_recovery_metrics(startup_metrics)
             if warmcopy_metrics_required:
                 observed_metrics = self.read_latest_warmcopy_metrics_since(
                     warmcopy_error_log_offset
@@ -3924,6 +5294,7 @@ class BusinessE2ERunner:
                 hold_transaction_starts=(
                     bool(resumed_connections)
                     and self.config.max_transactions_per_worker > 0
+                    and self.config.business_run_before_drain_s <= 0
                     and cycle < self.config.cycles
                 ),
             )
@@ -3937,6 +5308,13 @@ class BusinessE2ERunner:
         if not hasattr(self, "warmcopy_drain_metrics"):
             self.warmcopy_drain_metrics = []
         self.warmcopy_drain_metrics.append(observed_metrics)
+
+    def _record_startup_recovery_metrics(
+        self, observed_metrics: StartupRecoveryMetrics
+    ) -> None:
+        if not hasattr(self, "startup_recovery_metrics"):
+            self.startup_recovery_metrics = []
+        self.startup_recovery_metrics.append(observed_metrics)
 
     def _will_execute_temp_dml_after_resume(self, completed_stmt_no: int) -> bool:
         if (
@@ -3980,6 +5358,29 @@ class BusinessE2ERunner:
             f"completed={snapshot['completed'][:20]} "
             f"failed_before_pause={failed_before_pause[:20]}"
         )
+
+    def _run_business_before_drain(self, cycle: int) -> None:
+        timeout_s = max(
+            self.config.resume_timeout_s,
+            self.config.business_run_before_drain_s + self.config.resume_timeout_s,
+        )
+        if not self.coordinator.wait_all_in_transaction(timeout_s):
+            raise TimeoutError(
+                "not all workers entered transactions before business-run drain"
+            )
+        LOG.info(
+            "cycle %s/%s running business workload %.3fs before direct drain",
+            cycle,
+            self.config.cycles,
+            self.config.business_run_before_drain_s,
+        )
+        deadline = time.monotonic() + self.config.business_run_before_drain_s
+        while True:
+            self._raise_worker_error_if_any()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(1.0, remaining))
 
     def purge_old_binary_logs_after_resume(self) -> None:
         conn = self.runtime.connect(database=False)
@@ -4059,6 +5460,42 @@ class BusinessE2ERunner:
         slo_match = re.search(r"\bphase2_slo_guaranteed=(\d+)\b", metric_line)
         reason_match = re.search(r"\bphase2_slo_reason=([A-Za-z0-9_]+)\b",
                                  metric_line)
+        target_count_match = re.search(
+            r"\bphase2_target_count=(\d+)\b",
+            metric_line,
+        )
+        record_lock_count_match = re.search(
+            r"\bphase2_record_lock_count=(\d+)\b",
+            metric_line,
+        )
+        record_prebuilt_match = re.search(
+            r"\bphase2_record_prebuilt_target_count=(\d+)\b",
+            metric_line,
+        )
+        record_materialized_match = re.search(
+            r"\bphase2_record_materialized_target_count=(\d+)\b",
+            metric_line,
+        )
+        full_lock_scan_match = re.search(
+            r"\bphase2_full_lock_scan_count=(\d+)\b",
+            metric_line,
+        )
+        materialized_bytes_match = re.search(
+            r"\bmaterialized_lock_payload_bytes_in_phase2=(\d+)\b",
+            metric_line,
+        )
+        table_live_match = re.search(
+            r"\bphase2_table_live_export_target_count=(\d+)\b",
+            metric_line,
+        )
+        mdl_live_match = re.search(
+            r"\bphase2_mdl_live_export_target_count=(\d+)\b",
+            metric_line,
+        )
+        savepoint_live_match = re.search(
+            r"\bphase2_savepoint_live_export_target_count=(\d+)\b",
+            metric_line,
+        )
         return WarmcopyDrainMetrics(
             phase2_pause_ms=int(pause_match.group(1)) / 1000.0,
             full_copy_to_count=(
@@ -4073,6 +5510,541 @@ class BusinessE2ERunner:
             phase2_slo_reason=(
                 reason_match.group(1) if reason_match is not None else None
             ),
+            phase2_target_count=(
+                int(target_count_match.group(1))
+                if target_count_match is not None
+                else None
+            ),
+            phase2_record_lock_count=(
+                int(record_lock_count_match.group(1))
+                if record_lock_count_match is not None
+                else None
+            ),
+            phase2_record_prebuilt_target_count=(
+                int(record_prebuilt_match.group(1))
+                if record_prebuilt_match is not None
+                else None
+            ),
+            phase2_record_materialized_target_count=(
+                int(record_materialized_match.group(1))
+                if record_materialized_match is not None
+                else None
+            ),
+            phase2_full_lock_scan_count=(
+                int(full_lock_scan_match.group(1))
+                if full_lock_scan_match is not None
+                else None
+            ),
+            materialized_lock_payload_bytes_in_phase2=(
+                int(materialized_bytes_match.group(1))
+                if materialized_bytes_match is not None
+                else None
+            ),
+            phase2_table_live_export_target_count=(
+                int(table_live_match.group(1))
+                if table_live_match is not None
+                else None
+            ),
+            phase2_mdl_live_export_target_count=(
+                int(mdl_live_match.group(1))
+                if mdl_live_match is not None
+                else None
+            ),
+            phase2_savepoint_live_export_target_count=(
+                int(savepoint_live_match.group(1))
+                if savepoint_live_match is not None
+                else None
+            ),
+        )
+
+    def read_latest_drain_target_counter_rejection_since(
+        self, offset: Optional[int]
+    ) -> Optional[DrainTargetCounterRejectionMetrics]:
+        path = self.warmcopy_error_log_path()
+        if path is None or offset is None:
+            return None
+        log_path = Path(path)
+        try:
+            size = log_path.stat().st_size
+        except FileNotFoundError:
+            return None
+        safe_offset = offset if offset <= size else 0
+        with log_path.open("r", encoding="utf-8", errors="replace") as reader:
+            reader.seek(safe_offset)
+            text = reader.read()
+        matches = re.findall(
+            r"PRESERVE: batch target counter rejected\b[^\n]*",
+            text,
+        )
+        if not matches:
+            return None
+        metric_line = matches[-1]
+        transaction_match = re.search(
+            r"\btransaction_count=(\d+)\b", metric_line
+        )
+        target_match = re.search(r"\btarget_count=(\d+)\b", metric_line)
+        nonidle_match = re.search(
+            r"\bnonidle_transaction_count=(\d+)\b", metric_line
+        )
+        unsupported_match = re.search(
+            r"\bhas_unsupported_transaction=(\d+)\b", metric_line
+        )
+        if (
+            transaction_match is None
+            or target_match is None
+            or nonidle_match is None
+            or unsupported_match is None
+        ):
+            return None
+        return DrainTargetCounterRejectionMetrics(
+            transaction_count=int(transaction_match.group(1)),
+            target_count=int(target_match.group(1)),
+            nonidle_transaction_count=int(nonidle_match.group(1)),
+            has_unsupported_transaction=int(unsupported_match.group(1)),
+        )
+
+    def read_startup_recovery_metrics_from_status(
+        self,
+    ) -> Optional[StartupRecoveryMetrics]:
+        fields = {
+            "Preserve_trx_startup_recovery_binlog_cache_tokens",
+            "Preserve_trx_startup_recovery_elapsed_us",
+            "Preserve_trx_startup_recovery_error",
+            "Preserve_trx_startup_recovery_local_snapshot_tokens",
+            "Preserve_trx_startup_recovery_orphan_rollback_count",
+            "Preserve_trx_startup_recovery_phase_snapshot_claim_us",
+            "Preserve_trx_startup_recovery_phase_snapshot_kernel_us",
+            "Preserve_trx_startup_recovery_phase_snapshot_load_us",
+            "Preserve_trx_startup_recovery_phase_snapshot_mdl_us",
+            "Preserve_trx_startup_recovery_phase_snapshot_predicate_locks_us",
+            "Preserve_trx_startup_recovery_phase_snapshot_read_view_us",
+            "Preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_bits",
+            "Preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_pages",
+            "Preserve_trx_startup_recovery_phase_snapshot_record_lock_entries",
+            "Preserve_trx_startup_recovery_phase_snapshot_record_lock_image_resolves",
+            "Preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_us",
+            "Preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_count",
+            "Preserve_trx_startup_recovery_phase_snapshot_record_lock_table_open_us",
+            "Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_pages",
+            "Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_bytes",
+            "Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_residency_pages",
+            "Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_resident_pages",
+            "Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_io_pending_pages",
+            "Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_missing_pages",
+            "Preserve_trx_startup_recovery_phase_snapshot_record_lock_stable_page_hits",
+            "Preserve_trx_startup_recovery_phase_snapshot_record_locks_us",
+            "Preserve_trx_startup_recovery_phase_snapshot_register_us",
+            "Preserve_trx_startup_recovery_phase_snapshot_table_locks_us",
+            "Preserve_trx_startup_recovery_phase_snapshot_validate_us",
+            "Preserve_trx_startup_recovery_promotion_intent_tokens",
+            "Preserve_trx_startup_recovery_snapshot_tokens",
+            "Preserve_trx_startup_recovery_standby_pending_tokens",
+            "Preserve_trx_startup_recovery_tainted_tokens",
+        }
+        quoted_fields = ", ".join(f"'{field}'" for field in sorted(fields))
+        sql = (
+            "SELECT VARIABLE_NAME, VARIABLE_VALUE "
+            "FROM performance_schema.global_status "
+            f"WHERE VARIABLE_NAME IN ({quoted_fields})"
+        )
+        conn = None
+        try:
+            conn = self.runtime.connect(database=False)
+            rows = self.runtime.execute(conn, sql, fetch=True)
+        except BaseException as exc:
+            if self.runtime.is_connection_error(exc):
+                return None
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
+        values: Dict[str, str] = {}
+        for row in rows:
+            if len(row) != 2:
+                return None
+            name, value = row
+            values[str(name)] = str(value)
+        if any(field not in values for field in fields):
+            return None
+
+        def metric(field: str) -> int:
+            return int(values[field])
+
+        try:
+            elapsed_us = metric("Preserve_trx_startup_recovery_elapsed_us")
+            error = metric("Preserve_trx_startup_recovery_error")
+            snapshot_tokens = metric(
+                "Preserve_trx_startup_recovery_snapshot_tokens"
+            )
+            local_snapshot_tokens = metric(
+                "Preserve_trx_startup_recovery_local_snapshot_tokens"
+            )
+            binlog_cache_tokens = metric(
+                "Preserve_trx_startup_recovery_binlog_cache_tokens"
+            )
+            tainted_tokens = metric("Preserve_trx_startup_recovery_tainted_tokens")
+            standby_pending_tokens = metric(
+                "Preserve_trx_startup_recovery_standby_pending_tokens"
+            )
+            promotion_intent_tokens = metric(
+                "Preserve_trx_startup_recovery_promotion_intent_tokens"
+            )
+            orphan_rollback_count = metric(
+                "Preserve_trx_startup_recovery_orphan_rollback_count"
+            )
+            snapshot_load_us = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_load_us"
+            )
+            snapshot_validate_us = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_validate_us"
+            )
+            snapshot_kernel_us = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_kernel_us"
+            )
+            snapshot_claim_us = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_claim_us"
+            )
+            snapshot_read_view_us = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_read_view_us"
+            )
+            snapshot_table_locks_us = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_table_locks_us"
+            )
+            snapshot_record_locks_us = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_record_locks_us"
+            )
+            snapshot_record_lock_entries = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_record_lock_entries"
+            )
+            snapshot_record_lock_stable_page_hits = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_record_lock_stable_page_hits"
+            )
+            snapshot_record_lock_image_resolves = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_record_lock_image_resolves"
+            )
+            snapshot_record_lock_bitmap_pages = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_pages"
+            )
+            snapshot_record_lock_bitmap_bits = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_bits"
+            )
+            snapshot_record_lock_page_get_us = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_us"
+            )
+            snapshot_record_lock_page_get_count = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_count"
+            )
+            snapshot_record_lock_table_open_us = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_record_lock_table_open_us"
+            )
+            snapshot_record_lock_prefetch_pages = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_pages"
+            )
+            snapshot_record_lock_prefetch_bytes = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_bytes"
+            )
+            snapshot_record_lock_prefetch_residency_pages = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_residency_pages"
+            )
+            snapshot_record_lock_prefetch_resident_pages = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_resident_pages"
+            )
+            snapshot_record_lock_prefetch_io_pending_pages = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_io_pending_pages"
+            )
+            snapshot_record_lock_prefetch_missing_pages = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_missing_pages"
+            )
+            snapshot_predicate_locks_us = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_predicate_locks_us"
+            )
+            snapshot_mdl_us = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_mdl_us"
+            )
+            snapshot_register_us = metric(
+                "Preserve_trx_startup_recovery_phase_snapshot_register_us"
+            )
+        except ValueError:
+            return None
+
+        return StartupRecoveryMetrics(
+            elapsed_ms=elapsed_us / 1000.0,
+            error=error,
+            outcome="error" if error else "completed",
+            snapshot_tokens=snapshot_tokens,
+            local_snapshot_tokens=local_snapshot_tokens,
+            binlog_cache_tokens=binlog_cache_tokens,
+            tainted_tokens=tainted_tokens,
+            standby_pending_tokens=standby_pending_tokens,
+            promotion_intent_tokens=promotion_intent_tokens,
+            orphan_rollback_count=orphan_rollback_count,
+            snapshot_load_ms=snapshot_load_us / 1000.0,
+            snapshot_validate_ms=snapshot_validate_us / 1000.0,
+            snapshot_kernel_ms=snapshot_kernel_us / 1000.0,
+            snapshot_claim_ms=snapshot_claim_us / 1000.0,
+            snapshot_read_view_ms=snapshot_read_view_us / 1000.0,
+            snapshot_table_locks_ms=snapshot_table_locks_us / 1000.0,
+            snapshot_record_locks_ms=snapshot_record_locks_us / 1000.0,
+            snapshot_record_lock_entries=snapshot_record_lock_entries,
+            snapshot_record_lock_stable_page_hits=(
+                snapshot_record_lock_stable_page_hits
+            ),
+            snapshot_record_lock_image_resolves=(
+                snapshot_record_lock_image_resolves
+            ),
+            snapshot_record_lock_bitmap_pages=snapshot_record_lock_bitmap_pages,
+            snapshot_record_lock_bitmap_bits=snapshot_record_lock_bitmap_bits,
+            snapshot_record_lock_page_get_us=snapshot_record_lock_page_get_us,
+            snapshot_record_lock_page_get_count=snapshot_record_lock_page_get_count,
+            snapshot_record_lock_table_open_us=snapshot_record_lock_table_open_us,
+            snapshot_record_lock_prefetch_pages=snapshot_record_lock_prefetch_pages,
+            snapshot_record_lock_prefetch_bytes=snapshot_record_lock_prefetch_bytes,
+            snapshot_record_lock_prefetch_residency_pages=snapshot_record_lock_prefetch_residency_pages,
+            snapshot_record_lock_prefetch_resident_pages=snapshot_record_lock_prefetch_resident_pages,
+            snapshot_record_lock_prefetch_io_pending_pages=snapshot_record_lock_prefetch_io_pending_pages,
+            snapshot_record_lock_prefetch_missing_pages=snapshot_record_lock_prefetch_missing_pages,
+            snapshot_predicate_locks_ms=snapshot_predicate_locks_us / 1000.0,
+            snapshot_mdl_ms=snapshot_mdl_us / 1000.0,
+            snapshot_register_ms=snapshot_register_us / 1000.0,
+        )
+
+    def read_promotion_gate_metrics_from_status(
+        self,
+        *,
+        connection_factory: Optional[Callable[[], object]] = None,
+    ) -> Optional[PromotionGateMetrics]:
+        fields = {
+            "Preserve_trx_promotion_gate_abandoned_count",
+            "Preserve_trx_promotion_gate_adopted_count",
+            "Preserve_trx_promotion_gate_elapsed_us",
+            "Preserve_trx_promotion_gate_max_worker_elapsed_us",
+            "Preserve_trx_promotion_gate_p50_worker_elapsed_us",
+            "Preserve_trx_promotion_gate_p95_worker_elapsed_us",
+            "Preserve_trx_promotion_gate_record_lock_cold_page_gets",
+            "Preserve_trx_promotion_gate_record_lock_page_count",
+            "Preserve_trx_promotion_gate_record_lock_resident_pages",
+            "Preserve_trx_promotion_gate_ready_cache_miss_count",
+            "Preserve_trx_promotion_gate_over_budget_count",
+            "Preserve_trx_promotion_gate_skipped_count",
+            "Preserve_trx_promotion_gate_status_code",
+            "Preserve_trx_promotion_gate_token_count",
+        }
+        quoted_fields = ", ".join(f"'{field}'" for field in sorted(fields))
+        sql = (
+            "SELECT VARIABLE_NAME, VARIABLE_VALUE "
+            "FROM performance_schema.global_status "
+            f"WHERE VARIABLE_NAME IN ({quoted_fields})"
+        )
+        conn = None
+        try:
+            if connection_factory is None:
+                connection_factory = lambda: self.runtime.connect(database=False)
+            conn = connection_factory()
+            rows = self.runtime.execute(conn, sql, fetch=True)
+        except BaseException as exc:
+            if self.runtime.is_connection_error(exc):
+                return None
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
+        values: Dict[str, str] = {}
+        for row in rows:
+            if len(row) != 2:
+                return None
+            name, value = row
+            values[str(name)] = str(value)
+        if any(field not in values for field in fields):
+            return None
+
+        def metric(field: str) -> int:
+            return int(values[field])
+
+        try:
+            return PromotionGateMetrics(
+                elapsed_us=metric("Preserve_trx_promotion_gate_elapsed_us"),
+                token_count=metric("Preserve_trx_promotion_gate_token_count"),
+                adopted_count=metric(
+                    "Preserve_trx_promotion_gate_adopted_count"
+                ),
+                abandoned_count=metric(
+                    "Preserve_trx_promotion_gate_abandoned_count"
+                ),
+                skipped_count=metric(
+                    "Preserve_trx_promotion_gate_skipped_count"
+                ),
+                max_worker_elapsed_us=metric(
+                    "Preserve_trx_promotion_gate_max_worker_elapsed_us"
+                ),
+                p50_worker_elapsed_us=metric(
+                    "Preserve_trx_promotion_gate_p50_worker_elapsed_us"
+                ),
+                p95_worker_elapsed_us=metric(
+                    "Preserve_trx_promotion_gate_p95_worker_elapsed_us"
+                ),
+                record_lock_page_count=metric(
+                    "Preserve_trx_promotion_gate_record_lock_page_count"
+                ),
+                record_lock_resident_pages=metric(
+                    "Preserve_trx_promotion_gate_record_lock_resident_pages"
+                ),
+                record_lock_cold_page_gets=metric(
+                    "Preserve_trx_promotion_gate_record_lock_cold_page_gets"
+                ),
+                ready_cache_miss_count=metric(
+                    "Preserve_trx_promotion_gate_ready_cache_miss_count"
+                ),
+                over_budget_count=metric(
+                    "Preserve_trx_promotion_gate_over_budget_count"
+                ),
+                status_code=metric("Preserve_trx_promotion_gate_status_code"),
+            )
+        except ValueError:
+            return None
+
+    def read_latest_startup_recovery_metrics_since(
+        self, offset: Optional[int]
+    ) -> Optional[StartupRecoveryMetrics]:
+        path = self.warmcopy_error_log_path()
+        if path is None or offset is None:
+            return None
+        log_path = Path(path)
+        try:
+            size = log_path.stat().st_size
+        except FileNotFoundError:
+            return None
+        safe_offset = offset if offset <= size else 0
+        with log_path.open("r", encoding="utf-8", errors="replace") as reader:
+            reader.seek(safe_offset)
+            text = reader.read()
+        matches = re.findall(
+            r"PRESERVE: preserved transaction recovery end\b[^\n]*",
+            text,
+        )
+        if not matches:
+            return None
+        metric_line = matches[-1]
+
+        def required_int(field: str) -> Optional[int]:
+            match = re.search(rf"\b{field}=(\d+)\b", metric_line)
+            return int(match.group(1)) if match is not None else None
+
+        elapsed_us = required_int("elapsed_us")
+        error = required_int("error")
+        snapshot_tokens = required_int("snapshot_tokens")
+        local_snapshot_tokens = required_int("local_snapshot_tokens")
+        binlog_cache_tokens = required_int("binlog_cache_tokens")
+        tainted_tokens = required_int("tainted_tokens")
+        standby_pending_tokens = required_int("standby_pending_tokens")
+        promotion_intent_tokens = required_int("promotion_intent_tokens")
+        orphan_rollback_count = required_int("orphan_rollback_count")
+        snapshot_load_us = required_int("phase_snapshot_load_us") or 0
+        snapshot_validate_us = required_int("phase_snapshot_validate_us") or 0
+        snapshot_kernel_us = required_int("phase_snapshot_kernel_us") or 0
+        snapshot_claim_us = required_int("phase_snapshot_claim_us") or 0
+        snapshot_read_view_us = required_int("phase_snapshot_read_view_us") or 0
+        snapshot_table_locks_us = required_int("phase_snapshot_table_locks_us") or 0
+        snapshot_record_locks_us = (
+            required_int("phase_snapshot_record_locks_us") or 0
+        )
+        snapshot_record_lock_entries = (
+            required_int("phase_snapshot_record_lock_entries") or 0
+        )
+        snapshot_record_lock_stable_page_hits = (
+            required_int("phase_snapshot_record_lock_stable_page_hits") or 0
+        )
+        snapshot_record_lock_image_resolves = (
+            required_int("phase_snapshot_record_lock_image_resolves") or 0
+        )
+        snapshot_record_lock_bitmap_pages = (
+            required_int("phase_snapshot_record_lock_bitmap_pages") or 0
+        )
+        snapshot_record_lock_bitmap_bits = (
+            required_int("phase_snapshot_record_lock_bitmap_bits") or 0
+        )
+        snapshot_record_lock_page_get_us = (
+            required_int("phase_snapshot_record_lock_page_get_us") or 0
+        )
+        snapshot_record_lock_page_get_count = (
+            required_int("phase_snapshot_record_lock_page_get_count") or 0
+        )
+        snapshot_record_lock_table_open_us = (
+            required_int("phase_snapshot_record_lock_table_open_us") or 0
+        )
+        snapshot_record_lock_prefetch_pages = (
+            required_int("phase_snapshot_record_lock_prefetch_pages") or 0
+        )
+        snapshot_record_lock_prefetch_bytes = (
+            required_int("phase_snapshot_record_lock_prefetch_bytes") or 0
+        )
+        snapshot_record_lock_prefetch_residency_pages = (
+            required_int("phase_snapshot_record_lock_prefetch_residency_pages") or 0
+        )
+        snapshot_record_lock_prefetch_resident_pages = (
+            required_int("phase_snapshot_record_lock_prefetch_resident_pages") or 0
+        )
+        snapshot_record_lock_prefetch_io_pending_pages = (
+            required_int("phase_snapshot_record_lock_prefetch_io_pending_pages") or 0
+        )
+        snapshot_record_lock_prefetch_missing_pages = (
+            required_int("phase_snapshot_record_lock_prefetch_missing_pages") or 0
+        )
+        snapshot_predicate_locks_us = (
+            required_int("phase_snapshot_predicate_locks_us") or 0
+        )
+        snapshot_mdl_us = required_int("phase_snapshot_mdl_us") or 0
+        snapshot_register_us = required_int("phase_snapshot_register_us") or 0
+        outcome_match = re.search(r"\boutcome=([A-Za-z0-9_]+)\b", metric_line)
+        required_values = (
+            elapsed_us,
+            error,
+            snapshot_tokens,
+            local_snapshot_tokens,
+            binlog_cache_tokens,
+            tainted_tokens,
+            standby_pending_tokens,
+            promotion_intent_tokens,
+            orphan_rollback_count,
+        )
+        if outcome_match is None or any(value is None for value in required_values):
+            return None
+        return StartupRecoveryMetrics(
+            elapsed_ms=elapsed_us / 1000.0,
+            error=error,
+            outcome=outcome_match.group(1),
+            snapshot_tokens=snapshot_tokens,
+            local_snapshot_tokens=local_snapshot_tokens,
+            binlog_cache_tokens=binlog_cache_tokens,
+            tainted_tokens=tainted_tokens,
+            standby_pending_tokens=standby_pending_tokens,
+            promotion_intent_tokens=promotion_intent_tokens,
+            orphan_rollback_count=orphan_rollback_count,
+            snapshot_load_ms=snapshot_load_us / 1000.0,
+            snapshot_validate_ms=snapshot_validate_us / 1000.0,
+            snapshot_kernel_ms=snapshot_kernel_us / 1000.0,
+            snapshot_claim_ms=snapshot_claim_us / 1000.0,
+            snapshot_read_view_ms=snapshot_read_view_us / 1000.0,
+            snapshot_table_locks_ms=snapshot_table_locks_us / 1000.0,
+            snapshot_record_locks_ms=snapshot_record_locks_us / 1000.0,
+            snapshot_record_lock_entries=snapshot_record_lock_entries,
+            snapshot_record_lock_stable_page_hits=(
+                snapshot_record_lock_stable_page_hits
+            ),
+            snapshot_record_lock_image_resolves=snapshot_record_lock_image_resolves,
+            snapshot_record_lock_bitmap_pages=snapshot_record_lock_bitmap_pages,
+            snapshot_record_lock_bitmap_bits=snapshot_record_lock_bitmap_bits,
+            snapshot_record_lock_page_get_us=snapshot_record_lock_page_get_us,
+            snapshot_record_lock_page_get_count=snapshot_record_lock_page_get_count,
+            snapshot_record_lock_table_open_us=snapshot_record_lock_table_open_us,
+            snapshot_record_lock_prefetch_pages=snapshot_record_lock_prefetch_pages,
+            snapshot_record_lock_prefetch_bytes=snapshot_record_lock_prefetch_bytes,
+            snapshot_record_lock_prefetch_residency_pages=snapshot_record_lock_prefetch_residency_pages,
+            snapshot_record_lock_prefetch_resident_pages=snapshot_record_lock_prefetch_resident_pages,
+            snapshot_record_lock_prefetch_io_pending_pages=snapshot_record_lock_prefetch_io_pending_pages,
+            snapshot_record_lock_prefetch_missing_pages=snapshot_record_lock_prefetch_missing_pages,
+            snapshot_predicate_locks_ms=snapshot_predicate_locks_us / 1000.0,
+            snapshot_mdl_ms=snapshot_mdl_us / 1000.0,
+            snapshot_register_ms=snapshot_register_us / 1000.0,
         )
 
     def read_latest_warmcopy_phase2_pause_ms_since(
@@ -4740,13 +6712,19 @@ class BusinessE2ERunner:
     ) -> Dict[str, object]:
         plan = getattr(self, "plan", WorkloadPlan(self.config))
         metrics = list(getattr(self, "warmcopy_drain_metrics", []))
+        startup_metrics = list(getattr(self, "startup_recovery_metrics", []))
         phase2_slo_reasons: Dict[str, int] = {}
         for metric in metrics:
             if metric.phase2_slo_reason:
                 reason = metric.phase2_slo_reason
                 phase2_slo_reasons[reason] = phase2_slo_reasons.get(reason, 0) + 1
+        startup_recovery_outcomes: Dict[str, int] = {}
+        for metric in startup_metrics:
+            startup_recovery_outcomes[metric.outcome] = (
+                startup_recovery_outcomes.get(metric.outcome, 0) + 1
+            )
 
-        return {
+        report = {
             "generated_at_utc": datetime.datetime.utcnow()
             .replace(microsecond=0)
             .isoformat()
@@ -4785,6 +6763,102 @@ class BusinessE2ERunner:
                 else all(metric.phase2_slo_guaranteed == 1 for metric in metrics)
             ),
             "phase2_slo_reasons": phase2_slo_reasons,
+            "startup_recovery_elapsed_samples_ms": [
+                metric.elapsed_ms for metric in startup_metrics
+            ],
+            "startup_recovery_token_samples": [
+                metric.snapshot_tokens for metric in startup_metrics
+            ],
+            "startup_recovery_local_snapshot_token_samples": [
+                metric.local_snapshot_tokens for metric in startup_metrics
+            ],
+            "startup_recovery_binlog_cache_token_samples": [
+                metric.binlog_cache_tokens for metric in startup_metrics
+            ],
+            "startup_recovery_error_samples": [
+                metric.error for metric in startup_metrics
+            ],
+            "startup_recovery_outcomes": startup_recovery_outcomes,
+            "startup_recovery_snapshot_load_samples_ms": [
+                metric.snapshot_load_ms for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_validate_samples_ms": [
+                metric.snapshot_validate_ms for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_kernel_samples_ms": [
+                metric.snapshot_kernel_ms for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_claim_samples_ms": [
+                metric.snapshot_claim_ms for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_read_view_samples_ms": [
+                metric.snapshot_read_view_ms for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_table_locks_samples_ms": [
+                metric.snapshot_table_locks_ms for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_record_locks_samples_ms": [
+                metric.snapshot_record_locks_ms for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_record_lock_entries_samples": [
+                metric.snapshot_record_lock_entries for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_record_lock_stable_page_hits_samples": [
+                metric.snapshot_record_lock_stable_page_hits
+                for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_record_lock_image_resolves_samples": [
+                metric.snapshot_record_lock_image_resolves for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_record_lock_bitmap_pages_samples": [
+                metric.snapshot_record_lock_bitmap_pages for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_record_lock_bitmap_bits_samples": [
+                metric.snapshot_record_lock_bitmap_bits for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_record_lock_page_get_us_samples": [
+                metric.snapshot_record_lock_page_get_us for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_record_lock_page_get_count_samples": [
+                metric.snapshot_record_lock_page_get_count
+                for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_record_lock_table_open_us_samples": [
+                metric.snapshot_record_lock_table_open_us for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_record_lock_prefetch_pages_samples": [
+                metric.snapshot_record_lock_prefetch_pages
+                for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_record_lock_prefetch_bytes_samples": [
+                metric.snapshot_record_lock_prefetch_bytes
+                for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_record_lock_prefetch_residency_pages_samples": [
+                metric.snapshot_record_lock_prefetch_residency_pages
+                for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_record_lock_prefetch_resident_pages_samples": [
+                metric.snapshot_record_lock_prefetch_resident_pages
+                for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_record_lock_prefetch_io_pending_pages_samples": [
+                metric.snapshot_record_lock_prefetch_io_pending_pages
+                for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_record_lock_prefetch_missing_pages_samples": [
+                metric.snapshot_record_lock_prefetch_missing_pages
+                for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_predicate_locks_samples_ms": [
+                metric.snapshot_predicate_locks_ms for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_mdl_samples_ms": [
+                metric.snapshot_mdl_ms for metric in startup_metrics
+            ],
+            "startup_recovery_snapshot_register_samples_ms": [
+                metric.snapshot_register_ms for metric in startup_metrics
+            ],
             "max_phase2_total_ms": self.config.max_phase2_total_ms,
             "temp_sidecar_bytes": None,
             "temp_undo_pages": None,
@@ -4799,6 +6873,8 @@ class BusinessE2ERunner:
                 "temp_resume_adoption_ms",
             ],
         }
+        annotate_record_lock_import_report(report)
+        return report
 
     def validate_scenario_postconditions(self) -> None:
         if self.config.scenario not in (
@@ -5144,6 +7220,21 @@ def _parse_positive_mb_list(value: str) -> List[int]:
     return buckets
 
 
+def _parse_uint64_list(value: str) -> List[int]:
+    if not value:
+        return []
+    values: List[int] = []
+    for item in value.split(","):
+        text = item.strip()
+        if not text:
+            continue
+        parsed = int(text, 10)
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError("token values must be positive")
+        values.append(parsed)
+    return values
+
+
 def normalize_mysqlbinlog_table_events(
     text: str, *, preserve_gtid_numbers: bool = False
 ) -> List[str]:
@@ -5313,6 +7404,7 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--seed-rows-per-table-per-session", type=int, default=12, help="seed rows per table/session; large bulk-lockset runs need enough existing rows per touched range")
     parser.add_argument("--cycles", "--drain-cycles", dest="cycles", type=int, default=3, help="number of drain/restart/resume maintenance cycles")
     parser.add_argument("--drain-interval", dest="drain_interval_s", type=float, default=30.0, help="seconds between maintenance cycles")
+    parser.add_argument("--business-run-before-drain", dest="business_run_before_drain_s", type=float, default=0.0, help="seconds to let workers run real business DML before issuing DRAIN directly; 0 keeps the deterministic pre-paused mode")
     parser.add_argument("--duration", dest="duration_s", type=float, default=0.0, help="total business workload seconds; workers continue after the last drain until this duration is reached")
     parser.add_argument("--max-transactions-per-worker", type=int, default=0, help="stop each worker after this many committed transactions; 0 means unbounded")
     parser.add_argument("--min-statements-before-drain-pause", type=int, default=0, help="when a drain is requested, let workers execute at least this many statements in the current transaction before pausing")
@@ -5331,6 +7423,7 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--preserve-lock-warmcopy-max-journal-bytes", dest="preserve_lock_warmcopy_max_journal_bytes", type=int, default=1_073_741_824, help="preserve_trx_lock_warmcopy_max_journal_bytes for high-cardinality lock warmcopy gates")
     parser.add_argument("--preserve-lock-warmcopy-seal-threads", dest="preserve_lock_warmcopy_seal_threads", type=int, default=0, help="preserve_trx_lock_warmcopy_seal_threads for lock warmcopy seal tuning; 0 keeps server auto")
     parser.add_argument("--preserve-parallel-preserve-threads", dest="preserve_parallel_preserve_threads", type=int, default=0, help="preserve_trx_parallel_preserve_threads for lock warmcopy target-preserve tuning; 0 keeps server auto")
+    parser.add_argument("--preserve-startup-recovery-threads", dest="preserve_startup_recovery_threads", type=int, default=0, help="preserve_trx_startup_recovery_threads configured at mysqld startup; 0 keeps server auto")
     parser.add_argument("--inflight-drain-probe", action="store_true", help="allow even-numbered workers to enter real UPDATE lock waits before each DRAIN")
     parser.add_argument("--inflight-probe-min-waits", dest="inflight_probe_min_waits", type=int, default=1, help="minimum simultaneous harness data_lock_waits required before issuing DRAIN in in-flight probe mode")
     parser.add_argument("--inflight-probe-timeout", dest="inflight_probe_timeout_s", type=int, default=5, help="innodb_lock_wait_timeout used by in-flight probe statements")
@@ -5356,6 +7449,25 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--temp-table-target-mb", type=int, default=0, help="pre-fill each user temporary table to this many MiB before the drainable transaction starts")
     parser.add_argument("--temp-table-fill-chunk-kb", type=int, default=64, help="payload bytes per generated temporary-table prefill row, in KiB")
     parser.add_argument("--temp-table-resume-action", choices=("commit", "rollback", "continue"), default="commit", help="action for a temp-table worker after RESUME returns inside a transaction; continue keeps the resumed transaction open for more temporary-table DML before the worker commits")
+    parser.add_argument("--promotion-gate-epoch-id", help="run only the standby-promotion warm-gate simulator for this transfer epoch")
+    parser.add_argument("--promotion-gate-tokens", type=_parse_uint64_list, default=[], help="comma-separated standby transfer tokens to prewarm before the promotion gate")
+    parser.add_argument("--promotion-gate-required-apply-lsn", type=int, default=0, help="required physical redo LSN carried by simulator prewarm/gate control frames")
+    parser.add_argument("--promotion-gate-execute", action="store_true", help="after prewarming listed tokens, send a promotion gate control frame for the epoch")
+    parser.add_argument("--promotion-gate-debug-apply-reached", action="store_true", help="debug-build only: set the promotion apply barrier DBUG flag before the execute gate frame")
+    parser.add_argument("--receiver-host", default="127.0.0.1", help="receiver MySQL host for standby-transfer E2E evidence")
+    parser.add_argument("--receiver-port", type=int, default=3306, help="receiver MySQL TCP port for standby-transfer E2E evidence")
+    parser.add_argument("--receiver-user", default="root", help="receiver admin user used by standby-transfer E2E setup")
+    parser.add_argument("--receiver-password", default="", help="receiver admin password used by standby-transfer E2E setup")
+    parser.add_argument("--receiver-unix-socket", help="receiver Unix socket for standby-transfer E2E evidence")
+    parser.add_argument("--receiver-preserve-dir", help="receiver preserve artifact directory used to count standby-pending transfer output")
+    parser.add_argument("--source-datadir", help="source mysqld datadir used by physical-standby-equivalent promotion-gate scenarios")
+    parser.add_argument("--receiver-datadir", help="receiver mysqld datadir used by physical-standby-equivalent promotion-gate scenarios")
+    parser.add_argument("--source-start-command", help="optional shell command used to start source mysqld before physical-standby transfer/drain")
+    parser.add_argument("--receiver-start-command", help="optional shell command used to start receiver mysqld before physical-standby transfer/drain")
+    parser.add_argument("--receiver-restart-command", help="shell command used to restart the receiver mysqld after physical-standby datadir materialization")
+    parser.add_argument("--standby-transfer-user", default="preserve_transfer_receiver", help="receiver account used by source-side standby transfer sessions")
+    parser.add_argument("--standby-transfer-password", default="preserve_transfer_secret", help="shared secret stored in source/receiver credential stores for standby-transfer E2E")
+    parser.add_argument("--standby-transfer-credential-name", default="preserve_transfer_credential", help="credential name used by source/receiver transfer codec and source client")
     parser.add_argument("--report-json", help="write a JSON summary for release-gate and NFR evidence after a successful run")
     parser.add_argument("--startup-timeout", dest="startup_timeout_s", type=float, default=120.0, help="seconds to wait for mysqld to become reachable")
     parser.add_argument("--shutdown-timeout", dest="shutdown_timeout_s", type=float, default=120.0, help="seconds to wait for DRAIN-triggered shutdown")
@@ -5405,6 +7517,7 @@ command is used after each DRAIN command shuts that server down.
         seed_rows_per_table_per_session=args.seed_rows_per_table_per_session,
         cycles=args.cycles,
         drain_interval_s=args.drain_interval_s,
+        business_run_before_drain_s=args.business_run_before_drain_s,
         duration_s=args.duration_s,
         max_transactions_per_worker=max_transactions_per_worker,
         min_statements_before_drain_pause=args.min_statements_before_drain_pause,
@@ -5423,6 +7536,7 @@ command is used after each DRAIN command shuts that server down.
         preserve_lock_warmcopy_max_journal_bytes=args.preserve_lock_warmcopy_max_journal_bytes,
         preserve_lock_warmcopy_seal_threads=args.preserve_lock_warmcopy_seal_threads,
         preserve_parallel_preserve_threads=args.preserve_parallel_preserve_threads,
+        preserve_startup_recovery_threads=args.preserve_startup_recovery_threads,
         inflight_drain_probe=args.inflight_drain_probe,
         inflight_probe_min_waits=args.inflight_probe_min_waits,
         inflight_probe_timeout_s=args.inflight_probe_timeout_s,
@@ -5447,6 +7561,25 @@ command is used after each DRAIN command shuts that server down.
         temp_table_fill_chunk_kb=args.temp_table_fill_chunk_kb,
         temp_table_resume_action=args.temp_table_resume_action,
         report_json=args.report_json,
+        promotion_gate_epoch_id=args.promotion_gate_epoch_id,
+        promotion_gate_tokens=args.promotion_gate_tokens,
+        promotion_gate_required_apply_lsn=args.promotion_gate_required_apply_lsn,
+        promotion_gate_execute=args.promotion_gate_execute,
+        promotion_gate_debug_apply_reached=args.promotion_gate_debug_apply_reached,
+        receiver_host=args.receiver_host,
+        receiver_port=args.receiver_port,
+        receiver_user=args.receiver_user,
+        receiver_password=args.receiver_password,
+        receiver_unix_socket=args.receiver_unix_socket,
+        receiver_preserve_dir=args.receiver_preserve_dir,
+        source_datadir=args.source_datadir,
+        receiver_datadir=args.receiver_datadir,
+        source_start_command=args.source_start_command,
+        receiver_start_command=args.receiver_start_command,
+        receiver_restart_command=args.receiver_restart_command,
+        standby_transfer_user=args.standby_transfer_user,
+        standby_transfer_password=args.standby_transfer_password,
+        standby_transfer_credential_name=args.standby_transfer_credential_name,
         startup_timeout_s=args.startup_timeout_s,
         shutdown_timeout_s=args.shutdown_timeout_s,
         shutdown_quiet_period_s=args.shutdown_quiet_period_s,

@@ -1,0 +1,154 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_plain_lock_tokens;
+DROP TABLE IF EXISTS t_plain_lock_modified;
+DROP TABLE IF EXISTS t_plain_lock_source;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_plain_lock_modified(
+  id INT PRIMARY KEY,
+  v INT,
+  note VARCHAR(32)
+) ENGINE=InnoDB;
+CREATE TABLE t_plain_lock_source(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+CREATE TABLE t_plain_lock_tokens(
+  session_id INT PRIMARY KEY,
+  token VARCHAR(255) NOT NULL UNIQUE
+) ENGINE=InnoDB;
+INSERT INTO t_plain_lock_modified VALUES
+  (1,10,'base'),(2,20,'base'),(3,30,'base'),(4,40,'base');
+INSERT INTO t_plain_lock_source VALUES(1,100),(2,200),(3,300),(4,400);
+
+--disable_query_log
+--disable_result_log
+--connect(plain_lock_app_1,localhost,root,,test)
+--connection plain_lock_app_1
+START TRANSACTION;
+UPDATE t_plain_lock_modified SET v=11 WHERE id=1;
+INSERT INTO t_plain_lock_modified
+  SELECT 100 + id, v + 10, 'plain-read-source'
+    FROM t_plain_lock_source
+   WHERE id=1;
+
+--connect(plain_lock_app_2,localhost,root,,test)
+--connection plain_lock_app_2
+START TRANSACTION;
+UPDATE t_plain_lock_modified SET v=21 WHERE id=2;
+INSERT INTO t_plain_lock_modified
+  SELECT 100 + id, v + 10, 'plain-read-source'
+    FROM t_plain_lock_source
+   WHERE id=2;
+
+--connect(plain_lock_app_3,localhost,root,,test)
+--connection plain_lock_app_3
+START TRANSACTION;
+UPDATE t_plain_lock_modified SET v=31 WHERE id=3;
+INSERT INTO t_plain_lock_modified
+  SELECT 100 + id, v + 10, 'plain-read-source'
+    FROM t_plain_lock_source
+   WHERE id=3;
+
+--connect(plain_lock_app_4,localhost,root,,test)
+--connection plain_lock_app_4
+START TRANSACTION;
+UPDATE t_plain_lock_modified SET v=41 WHERE id=4;
+INSERT INTO t_plain_lock_modified
+  SELECT 100 + id, v + 10, 'plain-read-source'
+    FROM t_plain_lock_source
+   WHERE id=4;
+
+--connection default
+--enable_result_log
+--enable_query_log
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-startup-recovery-threads=4" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+INSERT INTO t_plain_lock_tokens(session_id, token)
+SELECT ROW_NUMBER() OVER (ORDER BY TOKEN), TOKEN
+  FROM performance_schema.preserved_transactions;
+
+SELECT COUNT(*) AS mapped_token_count
+  FROM t_plain_lock_tokens;
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+--disable_query_log
+SET SESSION group_concat_max_len=1000000;
+--let $write_to_file= $MYSQLTEST_VARDIR/tmp/plain_lock_resume.inc
+--let $write_var= `SELECT GROUP_CONCAT(CONCAT('--connect(plain_lock_resume_', session_id, ',localhost,root,,test)\\n', '--connection plain_lock_resume_', session_id, '\\n', 'RESUME PRESERVED TRANSACTION \"', token, '\";\\n', 'COMMIT;\\n') ORDER BY session_id SEPARATOR '') FROM t_plain_lock_tokens`
+--source include/write_var_to_file.inc
+--enable_query_log
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+require File::Spec->catfile($ENV{'MYSQL_TEST_DIR'}, 'suite',
+                            'preserve_trx', 'include',
+                            'preserve_snapshot_files.pl');
+
+my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
+my $preserve_dir = File::Spec->catdir($datadir, 'preserve');
+my @tokens = PreserveSnapshotFiles::preserve_snapshot_tokens($preserve_dir);
+
+die "expected 4 preserved snapshots, found " . scalar(@tokens) . "\n"
+  unless scalar(@tokens) == 4;
+EOF
+
+--disable_query_log
+--disable_result_log
+--source $MYSQLTEST_VARDIR/tmp/plain_lock_resume.inc
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $file = File::Spec->catfile($ENV{'MYSQLTEST_VARDIR'}, 'tmp',
+                               'plain_lock_resume_disconnect.inc');
+open(my $fh, '>', $file) or die "cannot open $file for write: $!";
+for my $idx (1 .. 4) {
+  print $fh "--disconnect plain_lock_resume_$idx\n";
+}
+print $fh "--connection default\n";
+close($fh);
+EOF
+--source $MYSQLTEST_VARDIR/tmp/plain_lock_resume_disconnect.inc
+--enable_result_log
+--enable_query_log
+
+SELECT COUNT(*) AS preserved_count_after_resume
+  FROM performance_schema.preserved_transactions;
+
+SELECT COUNT(*) AS row_count,
+       SUM(id BETWEEN 1 AND 4) AS base_rows,
+       SUM(id BETWEEN 101 AND 104) AS copied_rows,
+       SUM(note = 'plain-read-source') AS copied_note_rows
+  FROM t_plain_lock_modified;
+
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+--remove_file $MYSQLTEST_VARDIR/tmp/plain_lock_resume.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/plain_lock_resume_disconnect.inc
+
+DROP TABLE t_plain_lock_tokens;
+DROP TABLE t_plain_lock_modified;
+DROP TABLE t_plain_lock_source;
+SET GLOBAL preserve_trx_enable=ON;

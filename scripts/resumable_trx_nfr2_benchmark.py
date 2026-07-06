@@ -256,6 +256,7 @@ def _base_config(
         seed_rows_per_table_per_session=args.seed_rows_per_table_per_session,
         cycles=args.cycles,
         drain_interval_s=args.drain_interval,
+        business_run_before_drain_s=args.business_run_before_drain,
         duration_s=args.duration,
         preserve_timeout_s=args.preserve_timeout,
         preserve_max_binlog_cache_bytes=args.preserve_max_binlog_cache_bytes,
@@ -270,6 +271,7 @@ def _base_config(
             args.preserve_lock_warmcopy_seal_threads
         ),
         preserve_parallel_preserve_threads=args.preserve_parallel_preserve_threads,
+        preserve_startup_recovery_threads=args.preserve_startup_recovery_threads,
         large_binlog_cache_sessions=0,
         large_binlog_cache_buckets_mb=[],
         artifact_dir=args.artifact_dir,
@@ -717,6 +719,182 @@ def run_scenario(scenario: BenchmarkScenario) -> Dict[str, object]:
     phase2_lock_preflight_samples = _metric_us_samples_ms(
         warmcopy_metrics, "phase2_lock_preflight_us"
     )
+    startup_recovery_metrics = list(
+        getattr(runner, "startup_recovery_metrics", [])
+    )
+    promotion_gate_elapsed_samples = [
+        round(float(elapsed_us) / 1000.0, 3)
+        for elapsed_us in getattr(runner, "promotion_gate_elapsed_samples_us", [])
+    ]
+    promotion_gate_server_metrics = list(
+        getattr(runner, "promotion_gate_server_metrics", [])
+    )
+    server_promotion_gate_elapsed_samples = [
+        round(float(metric.elapsed_us) / 1000.0, 3)
+        for metric in promotion_gate_server_metrics
+    ]
+    server_promotion_gate_max_worker_samples = [
+        round(float(metric.max_worker_elapsed_us) / 1000.0, 3)
+        for metric in promotion_gate_server_metrics
+    ]
+    server_promotion_gate_p50_worker_samples = [
+        round(float(metric.p50_worker_elapsed_us) / 1000.0, 3)
+        for metric in promotion_gate_server_metrics
+    ]
+    server_promotion_gate_p95_worker_samples = [
+        round(float(metric.p95_worker_elapsed_us) / 1000.0, 3)
+        for metric in promotion_gate_server_metrics
+    ]
+    server_promotion_gate_token_samples = [
+        int(metric.token_count) for metric in promotion_gate_server_metrics
+    ]
+    server_promotion_gate_adopted_samples = [
+        int(metric.adopted_count) for metric in promotion_gate_server_metrics
+    ]
+    server_promotion_gate_abandoned_samples = [
+        int(metric.abandoned_count) for metric in promotion_gate_server_metrics
+    ]
+    server_promotion_gate_skipped_samples = [
+        int(metric.skipped_count) for metric in promotion_gate_server_metrics
+    ]
+    server_promotion_gate_status_code_samples = [
+        int(metric.status_code) for metric in promotion_gate_server_metrics
+    ]
+    server_promotion_gate_record_lock_page_samples = [
+        int(metric.record_lock_page_count) for metric in promotion_gate_server_metrics
+    ]
+    server_promotion_gate_record_lock_resident_page_samples = [
+        int(metric.record_lock_resident_pages)
+        for metric in promotion_gate_server_metrics
+    ]
+    server_promotion_gate_record_lock_cold_page_get_samples = [
+        int(metric.record_lock_cold_page_gets)
+        for metric in promotion_gate_server_metrics
+    ]
+    server_promotion_gate_ready_cache_miss_samples = [
+        int(metric.ready_cache_miss_count) for metric in promotion_gate_server_metrics
+    ]
+    server_promotion_gate_over_budget_samples = [
+        int(metric.over_budget_count) for metric in promotion_gate_server_metrics
+    ]
+    startup_recovery_elapsed_samples = [
+        float(metric.elapsed_ms) for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_load_samples = [
+        float(getattr(metric, "snapshot_load_ms", 0.0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_validate_samples = [
+        float(getattr(metric, "snapshot_validate_ms", 0.0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_kernel_samples = [
+        float(getattr(metric, "snapshot_kernel_ms", 0.0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_claim_samples = [
+        float(getattr(metric, "snapshot_claim_ms", 0.0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_read_view_samples = [
+        float(getattr(metric, "snapshot_read_view_ms", 0.0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_table_locks_samples = [
+        float(getattr(metric, "snapshot_table_locks_ms", 0.0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_record_locks_samples = [
+        float(getattr(metric, "snapshot_record_locks_ms", 0.0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_record_lock_entries_samples = [
+        int(getattr(metric, "snapshot_record_lock_entries", 0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_record_lock_stable_page_hits_samples = [
+        int(getattr(metric, "snapshot_record_lock_stable_page_hits", 0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_record_lock_image_resolves_samples = [
+        int(getattr(metric, "snapshot_record_lock_image_resolves", 0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_record_lock_bitmap_pages_samples = [
+        int(getattr(metric, "snapshot_record_lock_bitmap_pages", 0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_record_lock_bitmap_bits_samples = [
+        int(getattr(metric, "snapshot_record_lock_bitmap_bits", 0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_record_lock_page_get_us_samples = [
+        int(getattr(metric, "snapshot_record_lock_page_get_us", 0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_record_lock_page_get_count_samples = [
+        int(getattr(metric, "snapshot_record_lock_page_get_count", 0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_record_lock_table_open_us_samples = [
+        int(getattr(metric, "snapshot_record_lock_table_open_us", 0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_record_lock_prefetch_pages_samples = [
+        int(getattr(metric, "snapshot_record_lock_prefetch_pages", 0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_record_lock_prefetch_bytes_samples = [
+        int(getattr(metric, "snapshot_record_lock_prefetch_bytes", 0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_record_lock_prefetch_residency_pages_samples = [
+        int(getattr(metric, "snapshot_record_lock_prefetch_residency_pages", 0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_record_lock_prefetch_resident_pages_samples = [
+        int(getattr(metric, "snapshot_record_lock_prefetch_resident_pages", 0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_record_lock_prefetch_io_pending_pages_samples = [
+        int(getattr(metric, "snapshot_record_lock_prefetch_io_pending_pages", 0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_record_lock_prefetch_missing_pages_samples = [
+        int(getattr(metric, "snapshot_record_lock_prefetch_missing_pages", 0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_predicate_locks_samples = [
+        float(getattr(metric, "snapshot_predicate_locks_ms", 0.0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_mdl_samples = [
+        float(getattr(metric, "snapshot_mdl_ms", 0.0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_snapshot_register_samples = [
+        float(getattr(metric, "snapshot_register_ms", 0.0))
+        for metric in startup_recovery_metrics
+    ]
+    startup_recovery_token_samples = [
+        int(metric.snapshot_tokens) for metric in startup_recovery_metrics
+    ]
+    startup_recovery_local_snapshot_token_samples = [
+        int(metric.local_snapshot_tokens) for metric in startup_recovery_metrics
+    ]
+    startup_recovery_binlog_cache_token_samples = [
+        int(metric.binlog_cache_tokens) for metric in startup_recovery_metrics
+    ]
+    startup_recovery_error_samples = [
+        int(metric.error) for metric in startup_recovery_metrics
+    ]
+    startup_recovery_outcomes: Dict[str, int] = {}
+    for metric in startup_recovery_metrics:
+        outcome = getattr(metric, "outcome", "")
+        if outcome:
+            startup_recovery_outcomes[outcome] = (
+                startup_recovery_outcomes.get(outcome, 0) + 1
+            )
     phase2_slo_not_guaranteed_count = sum(
         int(metric.get("phase2_slo_not_guaranteed_count", 0) or 0)
         for metric in warmcopy_metrics
@@ -780,6 +958,9 @@ def run_scenario(scenario: BenchmarkScenario) -> Dict[str, object]:
     preserve_lock_warmcopy_seal_threads = getattr(
         scenario.config, "preserve_lock_warmcopy_seal_threads", 0
     )
+    preserve_startup_recovery_threads = getattr(
+        scenario.config, "preserve_startup_recovery_threads", 0
+    )
 
     return {
         "name": scenario.name,
@@ -813,6 +994,9 @@ def run_scenario(scenario: BenchmarkScenario) -> Dict[str, object]:
         "preserve_parallel_preserve_threads": (
             scenario.config.preserve_parallel_preserve_threads
         ),
+        "preserve_startup_recovery_threads": (
+            preserve_startup_recovery_threads
+        ),
         "latency_scope": {
             "wall_ms": "whole E2E scenario, including workload, DRAIN, restart, RESUME, and validation",
             "warmcopy_metrics.phase1_us": "server-side warm-copy phase 1 before phase-2 preserve",
@@ -838,6 +1022,10 @@ def run_scenario(scenario: BenchmarkScenario) -> Dict[str, object]:
             "warmcopy_metrics.phase2_slo_guaranteed": "1 only when the server declares the sample covered by mirrored artifacts for the full phase2 SLO",
             "warmcopy_metrics.phase2_slo_not_guaranteed_count": "number of targets that preserved functionally but do not yet satisfy the strict 1s SLO proof",
             "warmcopy_metrics.phase2_slo_reason": "first server-side reason explaining why strict phase2 SLO is not yet proven for a sample",
+            "startup_recovery_elapsed_summary_ms": "server-side preserved transaction recovery elapsed time during mysqld startup",
+            "startup_recovery_token_samples": "snapshot token count seen by preserved transaction recovery during startup",
+            "promotion_gate_elapsed_summary_ms": "runner-observed standby promotion gate control-frame elapsed time",
+            "server_promotion_gate_elapsed_summary_ms": "server-side standby promotion gate elapsed time from Preserve_trx_promotion_gate_elapsed_us",
             "phase2_pause_samples_ms": "runner-observed warm-copy phase-2 pause samples by large-cache bucket",
             "phase2_total_samples_ms": "server-side phase2_total_us samples converted to milliseconds",
         },
@@ -860,6 +1048,183 @@ def run_scenario(scenario: BenchmarkScenario) -> Dict[str, object]:
         "phase2_lock_preflight_samples_ms": phase2_lock_preflight_samples,
         "phase2_lock_preflight_summary_ms": summarize_phase2_pause_samples(
             phase2_lock_preflight_samples
+        ),
+        "startup_recovery_elapsed_samples_ms": startup_recovery_elapsed_samples,
+        "startup_recovery_elapsed_summary_ms": summarize_phase2_pause_samples(
+            startup_recovery_elapsed_samples
+        ),
+        "startup_recovery_snapshot_load_samples_ms": (
+            startup_recovery_snapshot_load_samples
+        ),
+        "startup_recovery_snapshot_load_summary_ms": (
+            summarize_phase2_pause_samples(startup_recovery_snapshot_load_samples)
+        ),
+        "startup_recovery_snapshot_validate_samples_ms": (
+            startup_recovery_snapshot_validate_samples
+        ),
+        "startup_recovery_snapshot_validate_summary_ms": (
+            summarize_phase2_pause_samples(
+                startup_recovery_snapshot_validate_samples
+            )
+        ),
+        "startup_recovery_snapshot_kernel_samples_ms": (
+            startup_recovery_snapshot_kernel_samples
+        ),
+        "startup_recovery_snapshot_kernel_summary_ms": (
+            summarize_phase2_pause_samples(startup_recovery_snapshot_kernel_samples)
+        ),
+        "startup_recovery_snapshot_claim_samples_ms": (
+            startup_recovery_snapshot_claim_samples
+        ),
+        "startup_recovery_snapshot_claim_summary_ms": (
+            summarize_phase2_pause_samples(startup_recovery_snapshot_claim_samples)
+        ),
+        "startup_recovery_snapshot_read_view_samples_ms": (
+            startup_recovery_snapshot_read_view_samples
+        ),
+        "startup_recovery_snapshot_read_view_summary_ms": (
+            summarize_phase2_pause_samples(
+                startup_recovery_snapshot_read_view_samples
+            )
+        ),
+        "startup_recovery_snapshot_table_locks_samples_ms": (
+            startup_recovery_snapshot_table_locks_samples
+        ),
+        "startup_recovery_snapshot_table_locks_summary_ms": (
+            summarize_phase2_pause_samples(
+                startup_recovery_snapshot_table_locks_samples
+            )
+        ),
+        "startup_recovery_snapshot_record_locks_samples_ms": (
+            startup_recovery_snapshot_record_locks_samples
+        ),
+        "startup_recovery_snapshot_record_locks_summary_ms": (
+            summarize_phase2_pause_samples(
+                startup_recovery_snapshot_record_locks_samples
+            )
+        ),
+        "startup_recovery_snapshot_record_lock_entries_samples": (
+            startup_recovery_snapshot_record_lock_entries_samples
+        ),
+        "startup_recovery_snapshot_record_lock_stable_page_hits_samples": (
+            startup_recovery_snapshot_record_lock_stable_page_hits_samples
+        ),
+        "startup_recovery_snapshot_record_lock_image_resolves_samples": (
+            startup_recovery_snapshot_record_lock_image_resolves_samples
+        ),
+        "startup_recovery_snapshot_record_lock_bitmap_pages_samples": (
+            startup_recovery_snapshot_record_lock_bitmap_pages_samples
+        ),
+        "startup_recovery_snapshot_record_lock_bitmap_bits_samples": (
+            startup_recovery_snapshot_record_lock_bitmap_bits_samples
+        ),
+        "startup_recovery_snapshot_record_lock_page_get_us_samples": (
+            startup_recovery_snapshot_record_lock_page_get_us_samples
+        ),
+        "startup_recovery_snapshot_record_lock_page_get_count_samples": (
+            startup_recovery_snapshot_record_lock_page_get_count_samples
+        ),
+        "startup_recovery_snapshot_record_lock_table_open_us_samples": (
+            startup_recovery_snapshot_record_lock_table_open_us_samples
+        ),
+        "startup_recovery_snapshot_record_lock_prefetch_pages_samples": (
+            startup_recovery_snapshot_record_lock_prefetch_pages_samples
+        ),
+        "startup_recovery_snapshot_record_lock_prefetch_bytes_samples": (
+            startup_recovery_snapshot_record_lock_prefetch_bytes_samples
+        ),
+        "startup_recovery_snapshot_record_lock_prefetch_residency_pages_samples": (
+            startup_recovery_snapshot_record_lock_prefetch_residency_pages_samples
+        ),
+        "startup_recovery_snapshot_record_lock_prefetch_resident_pages_samples": (
+            startup_recovery_snapshot_record_lock_prefetch_resident_pages_samples
+        ),
+        "startup_recovery_snapshot_record_lock_prefetch_io_pending_pages_samples": (
+            startup_recovery_snapshot_record_lock_prefetch_io_pending_pages_samples
+        ),
+        "startup_recovery_snapshot_record_lock_prefetch_missing_pages_samples": (
+            startup_recovery_snapshot_record_lock_prefetch_missing_pages_samples
+        ),
+        "startup_recovery_snapshot_predicate_locks_samples_ms": (
+            startup_recovery_snapshot_predicate_locks_samples
+        ),
+        "startup_recovery_snapshot_predicate_locks_summary_ms": (
+            summarize_phase2_pause_samples(
+                startup_recovery_snapshot_predicate_locks_samples
+            )
+        ),
+        "startup_recovery_snapshot_mdl_samples_ms": (
+            startup_recovery_snapshot_mdl_samples
+        ),
+        "startup_recovery_snapshot_mdl_summary_ms": (
+            summarize_phase2_pause_samples(startup_recovery_snapshot_mdl_samples)
+        ),
+        "startup_recovery_snapshot_register_samples_ms": (
+            startup_recovery_snapshot_register_samples
+        ),
+        "startup_recovery_snapshot_register_summary_ms": (
+            summarize_phase2_pause_samples(
+                startup_recovery_snapshot_register_samples
+            )
+        ),
+        "startup_recovery_token_samples": startup_recovery_token_samples,
+        "startup_recovery_local_snapshot_token_samples": (
+            startup_recovery_local_snapshot_token_samples
+        ),
+        "startup_recovery_binlog_cache_token_samples": (
+            startup_recovery_binlog_cache_token_samples
+        ),
+        "startup_recovery_error_samples": startup_recovery_error_samples,
+        "startup_recovery_outcomes": startup_recovery_outcomes,
+        "promotion_gate_elapsed_samples_ms": promotion_gate_elapsed_samples,
+        "promotion_gate_elapsed_summary_ms": summarize_phase2_pause_samples(
+            promotion_gate_elapsed_samples
+        ),
+        "server_promotion_gate_elapsed_samples_ms": (
+            server_promotion_gate_elapsed_samples
+        ),
+        "server_promotion_gate_elapsed_summary_ms": (
+            summarize_phase2_pause_samples(server_promotion_gate_elapsed_samples)
+        ),
+        "server_promotion_gate_max_worker_samples_ms": (
+            server_promotion_gate_max_worker_samples
+        ),
+        "server_promotion_gate_max_worker_summary_ms": (
+            summarize_phase2_pause_samples(server_promotion_gate_max_worker_samples)
+        ),
+        "server_promotion_gate_p50_worker_samples_ms": (
+            server_promotion_gate_p50_worker_samples
+        ),
+        "server_promotion_gate_p95_worker_samples_ms": (
+            server_promotion_gate_p95_worker_samples
+        ),
+        "server_promotion_gate_token_samples": server_promotion_gate_token_samples,
+        "server_promotion_gate_adopted_samples": (
+            server_promotion_gate_adopted_samples
+        ),
+        "server_promotion_gate_abandoned_samples": (
+            server_promotion_gate_abandoned_samples
+        ),
+        "server_promotion_gate_skipped_samples": (
+            server_promotion_gate_skipped_samples
+        ),
+        "server_promotion_gate_record_lock_page_samples": (
+            server_promotion_gate_record_lock_page_samples
+        ),
+        "server_promotion_gate_record_lock_resident_page_samples": (
+            server_promotion_gate_record_lock_resident_page_samples
+        ),
+        "server_promotion_gate_record_lock_cold_page_get_samples": (
+            server_promotion_gate_record_lock_cold_page_get_samples
+        ),
+        "server_promotion_gate_ready_cache_miss_samples": (
+            server_promotion_gate_ready_cache_miss_samples
+        ),
+        "server_promotion_gate_over_budget_samples": (
+            server_promotion_gate_over_budget_samples
+        ),
+        "server_promotion_gate_status_code_samples": (
+            server_promotion_gate_status_code_samples
         ),
         "phase2_slo_guaranteed": bool(
             warmcopy_metrics and phase2_slo_not_guaranteed_count == 0 and
@@ -932,6 +1297,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--lockset-minimal-table", action="store_true")
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--drain-interval", type=float, default=20.0)
+    parser.add_argument("--business-run-before-drain", type=float, default=0.0)
     parser.add_argument("--duration", type=float, default=0.0)
     parser.add_argument("--preserve-timeout", type=int, default=86400)
     parser.add_argument("--preserve-max-binlog-cache-bytes", type=int, default=1_073_741_824)
@@ -949,6 +1315,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=int,
         default=0,
         help="preserve_trx_parallel_preserve_threads for lock warmcopy target-preserve tuning; 0 keeps server auto",
+    )
+    parser.add_argument(
+        "--preserve-startup-recovery-threads",
+        type=int,
+        default=0,
+        help="preserve_trx_startup_recovery_threads configured at mysqld startup; 0 keeps server auto",
     )
     parser.add_argument(
         "--preserve-lock-warmcopy-seal-threads",

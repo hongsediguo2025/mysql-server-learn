@@ -33,16 +33,26 @@ PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
 --let $restart_parameters= restart: --preserve-trx-enable=ON --debug=d,preserve_trx_fail_recovered_count_rewrite
 --source include/start_mysqld.inc
 
-SELECT COUNT(*) AS preserved_count_after_rewrite_failure
+SELECT COUNT(*) AS preserved_count_after_legacy_rewrite_debug
+  FROM performance_schema.preserved_transactions;
+--replace_column 1 TOKEN
+SELECT TOKEN, RECOVERED_COUNT AS recovered_count_after_legacy_rewrite_debug
   FROM performance_schema.preserved_transactions;
 
---source suite/preserve_trx/include/assert_no_preserve_residue.inc
+--source suite/preserve_trx/include/get_preserved_token.inc
 
 --exec echo "restart" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --source include/restart_mysqld.inc
 
 SELECT COUNT(*) AS preserved_count_after_second_restart
   FROM performance_schema.preserved_transactions;
+--replace_column 1 TOKEN
+SELECT TOKEN, RECOVERED_COUNT AS recovered_count_after_second_restart
+  FROM performance_schema.preserved_transactions;
+
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+COMMIT;
 SELECT * FROM t_recovered_count_rewrite_failclosed ORDER BY a;
 
 DROP TABLE t_recovered_count_rewrite_failclosed;

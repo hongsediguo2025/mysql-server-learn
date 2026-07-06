@@ -69,6 +69,8 @@ my $carrier_file_path = File::Spec->catfile($source_root, 'sql',
                                             'preserve_trx_carrier_file.cc');
 my $carrier_path = File::Spec->catfile($source_root, 'sql',
                                        'preserve_trx_carrier.cc');
+my $carrier_header_path = File::Spec->catfile($source_root, 'sql',
+                                              'preserve_trx_carrier.h');
 my $bundle_doc_path = File::Spec->catfile(
   $source_root, 'design', 'resumable-trx-bundle-carrier-decoupling.md');
 my $temp_table_path = File::Spec->catfile($source_root, 'sql',
@@ -91,6 +93,8 @@ my $transfer_path = File::Spec->catfile($source_root, 'sql',
                                         'preserve_trx_transfer.cc');
 my $transfer_header_path = File::Spec->catfile($source_root, 'sql',
                                                'preserve_trx_transfer.h');
+my $sql_lock_warmcopy_path = File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_lock_warmcopy.cc');
 my $promotion_path = File::Spec->catfile($source_root, 'sql',
                                          'preserve_trx_promotion.cc');
 my $promotion_header_path = File::Spec->catfile($source_root, 'sql',
@@ -120,6 +124,7 @@ my $ha_innodb = read_source($ha_innodb_path);
 my $mysqld = read_source($mysqld_path);
 my $carrier_file = read_source($carrier_file_path);
 my $carrier = read_source($carrier_path);
+my $carrier_header = read_source($carrier_header_path);
 my $bundle_doc = read_optional_source($bundle_doc_path);
 my $temp_table = read_source($temp_table_path);
 my $temp_table_carrier = read_source($temp_table_carrier_path);
@@ -133,6 +138,7 @@ my $sql_parse = read_source($sql_parse_path);
 my $sys_vars = read_source($sys_vars_path);
 my $transfer = read_source($transfer_path);
 my $transfer_header = read_source($transfer_header_path);
+my $sql_lock_warmcopy = read_source($sql_lock_warmcopy_path);
 my $promotion = read_source($promotion_path);
 my $promotion_header = read_source($promotion_header_path);
 my $standby_transfer_doc = read_optional_source($standby_transfer_doc_path);
@@ -191,13 +197,109 @@ my $preserve_import_table_lock = $&;
 die "preserved table-lock import must delegate resurrection errors to the caller\n"
   unless $preserve_import_table_lock =~
          /return\s+lock_preserve_create_table_lock_for_import\s*\(\s*table\s*,\s*trx\s*,\s*mode\s*\)\s*;/s;
+$lock_preserve =~ /dberr_t lock_preserve_export_table_locks[\s\S]*?^}/m
+  or die "could not isolate lock_preserve_export_table_locks\n";
+my $preserve_export_table_locks = $&;
+die "table-lock export must use trx->lock.table_locks instead of scanning every record lock in trx_locks\n"
+  if $preserve_export_table_locks =~ /trx->lock\.trx_locks/s;
+die "table-lock export must explicitly iterate the per-transaction table_locks vector\n"
+  unless $preserve_export_table_locks =~ /trx->lock\.table_locks/s;
 
 $lock_preserve =~ /static dberr_t lock_preserve_import_record_lock[\s\S]*?^}/m
   or die "could not isolate lock_preserve_import_record_lock\n";
 my $preserve_import_record_lock = $&;
+die "preserved record-lock entry must cache bitmap set-bit stats for startup import; full lock-heavy recovery cannot repeatedly rescan each page bitmap\n"
+  unless $lock_preserve =~
+         /struct\s+Preserve_record_lock_entry\s*\{[\s\S]*set_bits[\s\S]*first_set_heap_no[\s\S]*max_set_heap_no[\s\S]*\};/s;
 die "preserved record-lock import must fail closed when intention-lock resurrect sees an incompatible table lock\n"
   unless $preserve_import_record_lock =~
          /lock_preserve_create_table_lock_for_import[\s\S]*if\s*\(\s*table_err\s*!=\s*DB_SUCCESS\s*\)[\s\S]*return\s+table_err/s;
+die "preserved record-lock import must not open the DD table once per page entry; lock-heavy startup needs import-scope table handle memoization\n"
+  if $preserve_import_record_lock =~ /Lock_preserve_table_handle/s;
+die "preserved record-lock import must sort parsed entries before import to keep table/index cache locality stable\n"
+  unless $lock_preserve =~
+         /lock_preserve_import_record_locks[\s\S]*lock_preserve_sort_record_lock_entries_for_import\s*\(\s*&entries\s*\)/s;
+die "preserved record-lock import must bulk-adopt a validated page bitmap instead of replaying every set bit through the runtime queue path\n"
+  if $preserve_import_record_lock =~
+     /for\s*\([^)]*heap_no[\s\S]*lock_preserve_bitmap_get_nth_bit[\s\S]*lock_preserve_add_record_lock_for_import/s;
+die "preserved record-lock import must expose an import-only page bitmap helper in lock0lock.cc\n"
+  unless $lock =~ /lock_preserve_add_record_bitmap_for_import\s*\(/s;
+die "record-lock startup prefetch must have an explicit preserve_trx_recover_lock_page_prefetch sysvar\n"
+  unless $sys_vars =~ /preserve_trx_recover_lock_page_prefetch/s &&
+         $preserve_header =~ /preserve_trx_recover_lock_page_prefetch/s;
+die "record-lock startup prefetch must live in the preserve-owned lock prefetch helper\n"
+  unless $lock_preserve =~
+         /lock_preserve_prefetch_record_lock_pages[\s\S]*buf_read_page_background/s;
+die "record-lock startup prefetch helper must be gated by preserve_trx_recover_lock_page_prefetch\n"
+  unless $preserve =~
+         /preserve_trx_recover_lock_page_prefetch[\s\S]*trx_preserve_prefetch_record_lock_pages/s;
+die "record-lock residency probe must be preserve-owned and nonblocking\n"
+  unless $lock_preserve =~
+         /lock_preserve_record_lock_pages_residency[\s\S]*buf_page_hash_get_s_locked/s &&
+         $lock_preserve !~
+         /lock_preserve_record_lock_pages_residency[\s\S]*buf_page_get\s*\(/s;
+$promotion =~
+  /preserved_trx_promotion_prewarm_standby_pending_token\s*\([^)]*\)\s*\{[\s\S]*?^}/m
+  or die "could not isolate promotion standby-pending prewarm\n";
+my $promotion_prewarm = $&;
+die "promotion prewarm must sample record-lock page residency before marking a record-lock token ready\n"
+  unless $promotion =~
+         /preserved_trx_promotion_prewarm_standby_pending_token[\s\S]*wait_for_record_lock_pages_to_be_gate_ready/s &&
+         $promotion =~
+         /wait_for_record_lock_pages_to_be_gate_ready[\s\S]*record_lock_pages_are_gate_ready/s &&
+         $promotion =~
+         /wait_for_record_lock_pages_to_be_gate_ready[\s\S]*trx_preserve_record_lock_residency_t/s;
+die "promotion prewarm failure log must include record-lock residency counters\n"
+  unless $promotion =~
+         /promotion prewarm token=[\s\S]*record_lock_page_count[\s\S]*record_lock_prefetch_submitted_pages[\s\S]*record_lock_resident_pages[\s\S]*record_lock_io_pending_pages[\s\S]*record_lock_missing_pages/s;
+die "promotion prewarm must use the gate record-lock page prefetch helper that waits for resident pages\n"
+  unless $promotion =~
+         /preserved_trx_promotion_prewarm_standby_pending_token[\s\S]*trx_preserve_prefetch_record_lock_pages_for_gate/s;
+die "startup recovery must globally prewarm record-lock pages before starting recovery workers\n"
+  unless $preserve =~
+         /prewarm_record_lock_pages_for_startup_recovery/s &&
+         $preserve =~
+         /prewarm_record_lock_pages_for_startup_recovery[\s\S]*preserved_trx_load_bundle_for_recover_or_prewarm[\s\S]*trx_preserve_prefetch_record_lock_pages/s &&
+         $preserve =~
+         /prewarm_record_lock_pages_for_startup_recovery\s*\([^;]*startup_recovery_tasks[\s\S]*?auto\s+recover_startup_task/s &&
+         $preserve =~
+         /prewarm_record_lock_pages_for_startup_recovery\s*\([^;]*startup_recovery_tasks[\s\S]*?startup_recovery_workers\.emplace_back/s;
+die "record-lock import must expose an optional per-loop deadline callback in the InnoDB import API\n"
+  unless $lock_header =~
+         /lock_preserve_import_record_locks[\s\S]*bool\s*\(\s*\*\s*deadline_expired\s*\)\s*\(\s*void\s*\*\s*\)[\s\S]*void\s*\*\s*deadline_ctx/s &&
+         $trx_preserve =~
+         /trx_preserve_import_record_locks[\s\S]*bool\s*\(\s*\*\s*deadline_expired\s*\)\s*\(\s*void\s*\*\s*\)[\s\S]*void\s*\*\s*deadline_ctx/s;
+die "record-lock import loop must fail closed with DB_INTERRUPTED when its deadline callback expires\n"
+  unless $lock_preserve =~
+         /preserve_trx_slow_record_lock_import_loop/s &&
+         $lock_preserve =~ /record_lock_import_deadline_expired/s &&
+         $lock_preserve =~ /return\s+DB_INTERRUPTED\s*;/s &&
+         $lock_preserve =~ /deadline_expired\s*\(\s*deadline_ctx\s*\)/s;
+die "promotion shared recover/adopt kernel must pass its deadline callback into record-lock import\n"
+  unless $preserve =~
+         /trx_preserve_import_record_locks\s*\([\s\S]*metadata\.record_locks_payload[\s\S]*recover_or_adopt_deadline_expired_callback[\s\S]*&options/s;
+die "phase1 record warmcopy seed must use compact stable-page record payloads\n"
+  unless $sql_lock_warmcopy =~
+         /prepare_phase1_record_scan_target[\s\S]*trx_preserve_export_record_locks_stable_page_only\s*\(/s;
+die "compact stable-page record export must keep ordinary live export on the legacy image-bearing path\n"
+  unless $lock_preserve =~
+         /static\s+dberr_t\s+lock_preserve_export_record_locks_low[\s\S]*bool\s+stable_page_only/s &&
+         $lock_preserve =~
+         /dberr_t\s+lock_preserve_export_record_locks_stable_page_only[\s\S]*lock_preserve_export_record_locks_low[\s\S]*true/s &&
+         $lock_preserve =~
+         /dberr_t\s+lock_preserve_export_record_locks\s*\([^)]*uint32_t max_lock_count\)[\s\S]*lock_preserve_export_record_locks_low[\s\S]*false/s;
+$lock_preserve =~ /static bool lock_preserve_record_entry_has_conflict[\s\S]*?^}/m
+  or die "could not isolate lock_preserve_record_entry_has_conflict\n";
+my $preserve_record_conflict = $&;
+die "record-lock import conflict check must skip per-bit scan when the page has no existing record locks\n"
+  unless $preserve_record_conflict =~
+         /if\s*\(\s*!\s*lock_preserve_page_has_record_locks\s*\(\s*block\s*\)\s*\)\s*\{?\s*return\s+false\s*;/s;
+die "record-lock import conflict check must compare imported and existing page bitmaps in bulk\n"
+  if $preserve_record_conflict =~
+     /for\s*\([^)]*heap_no[\s\S]*lock_preserve_bitmap_get_nth_bit[\s\S]*lock_preserve_record_lock_has_conflict/s;
+die "record-lock import conflict check must use lock object conflict adapter after bitmap intersection\n"
+  unless $preserve_record_conflict =~
+         /lock_preserve_bitmap_intersects_lock[\s\S]*lock_preserve_record_lock_object_has_conflict/s;
 
 $lock_preserve =~ /static bool lock_preserve_append_record_image[\s\S]*?^}/m
   or die "could not isolate lock_preserve_append_record_image\n";
@@ -357,6 +459,9 @@ die "carrier snapshot-only read must not scan external sidecars\n"
   unless index($carrier_read_existing, 'Payload_read_mode::SNAPSHOT_ONLY') >= 0 &&
          index($carrier_read_existing, 'Payload_read_mode::SNAPSHOT_ONLY') <
          index($carrier_read_existing, 'binlog_cache_path');
+die "carrier startup read_existing must direct-probe known generic blobs instead of scanning token directories\n"
+  unless $carrier_read_existing =~ /read_known_generic_external_blob_for_token/s &&
+         $carrier_read_existing !~ /\bmy_dir\s*\(/s;
 
 $temp_table_carrier =~ /Preserved_trx_carrier_status validate_file_digest[\s\S]*?^}/m
   or die "could not isolate temp sidecar streaming digest validator\n";
@@ -699,10 +804,17 @@ die "second resume deadline branch must preserve timeout as LAST_ERROR before ro
 $preserve =~ /bool Sql_cmd_resume_preserved_transaction::execute\(THD \*thd\)[\s\S]*?^}/m
   or die "could not isolate Sql_cmd_resume_preserved_transaction::execute\n";
 my $resume_execute = $&;
-my $deadline_pos = index($resume_execute,
+die "SQL RESUME wrapper must delegate to preserved_trx_resume_record_on_thd\n"
+  unless $resume_execute =~ /preserved_trx_resume_record_on_thd\s*\(/s;
+die "SQL RESUME wrapper must not directly run the large resume core\n"
+  if $resume_execute =~ /preserved_trx_take_resumable_record\s*\(|restore_detached_mdl_context\s*\(|trx_preserve_attach_to_thd\s*\(/s;
+$preserve =~ /static bool preserved_trx_resume_record_on_thd[\s\S]*?^}/m
+  or die "could not isolate preserved_trx_resume_record_on_thd\n";
+my $resume_core = $&;
+my $deadline_pos = index($resume_core,
                          "preserved_trx_record_resume_deadline_expired(record)");
-my $not_resumable_pos = index($resume_execute, "if (!record.resumable)");
-my $temp_preclaim_pos = index($resume_execute,
+my $not_resumable_pos = index($resume_core, "if (!record.resumable)");
+my $temp_preclaim_pos = index($resume_core,
                               "preserve_trx_temp_table_preclaim_decision");
 die "resume deadline cleanup must run before non-resumable pending-token rejection\n"
   unless $deadline_pos >= 0 &&
@@ -743,9 +855,7 @@ die "token delivery rollback failure must atomically publish LAST_ERROR with the
   if $rollback_pending_token_delivery_record =~
      /preserved_trx_add_record[\s\S]*preserved_trx_update_record_error/s;
 
-$preserve =~ /bool Sql_cmd_resume_preserved_transaction::execute[\s\S]*?^}/m
-  or die "could not isolate Sql_cmd_resume_preserved_transaction::execute\n";
-my $resume_execute_for_failure_guards = $&;
+my $resume_execute_for_failure_guards = $resume_core;
 
 $resume_execute_for_failure_guards =~ /if\s*\(restore_savepoints_to_thd[\s\S]*?return preserve_trx_reject_unsupported\(\);/m
   or die "could not isolate RESUME savepoint failure branch\n";
@@ -923,18 +1033,17 @@ $preserve =~ /static bool recover_preserved_snapshot[\s\S]*?^}/m
   or die "could not isolate recover_preserved_snapshot\n";
 my $recover_snapshot = $&;
 die "recovery must read durable snapshots through Preserved_trx_store\n"
-  unless $recover_snapshot =~ /create_preserved_trx_default_store/s &&
-         $recover_snapshot =~ /->read\s*\(/s;
+  unless $preserve =~
+         /Preserve_snapshot_status\s+preserved_trx_load_bundle_for_recover_or_prewarm[\s\S]*create_preserved_trx_default_store[\s\S]*->read\s*\(/s &&
+         $recover_snapshot =~ /preserved_trx_load_bundle_for_recover_or_prewarm/s;
 die "recovery must read semantic external payloads without eager-loading logged binlog cache payload while registering preserved snapshots\n"
-  unless $recover_snapshot =~ /store->read\s*\(\s*token\s*,\s*true\s*,[\s\S]*Payload_read_mode::[\s\S]*WITH_SEMANTIC_EXTERNAL_BLOBS[\s\S]*&bundle\s*\)/s;
-die "recovery must pass recovered_count rewrite through an after-claim hook\n"
-  unless $recover_snapshot =~ /Preserved_trx_recovered_count_rewrite_context/s &&
-         $recover_snapshot =~ /recovered_count_rewrite_after_claim/s;
-$preserve =~ /static bool recovered_count_rewrite_after_claim[\s\S]*?^}/m
-  or die "could not isolate recovered_count_rewrite_after_claim\n";
-my $recovered_count_after_claim_hook = $&;
-die "recovery must rewrite recovered_count through Preserved_trx_store\n"
-  unless $recovered_count_after_claim_hook =~ /->rewrite_recovered_count\s*\(/s;
+  unless $recover_snapshot =~
+         /preserved_trx_load_bundle_for_recover_or_prewarm[\s\S]*Preserved_trx_recover_load_profile::WITH_SEMANTIC_EXTERNAL_BLOBS[\s\S]*&bundle/s;
+die "startup recovery must persist recovery attempts through a batch ledger\n"
+  unless $preserve =~ /preserved_trx_recovery_attempt_ledger/s &&
+         $recover_snapshot =~ /recovery_attempt_count/s;
+die "startup recovery must not rewrite each snapshot recovered_count in the hot path\n"
+  if $recover_snapshot =~ /recovered_count_rewrite_after_claim/s;
 my $shared_recover_adopt_start =
   index($preserve, 'static bool preserved_trx_recover_or_adopt_bundle_shared');
 my $recover_snapshot_start =
@@ -947,19 +1056,11 @@ my $shared_recover_adopt_kernel =
          $recover_snapshot_start - $shared_recover_adopt_start);
 my $recover_add_record_pos =
   index($shared_recover_adopt_kernel, 'preserved_trx_add_record');
-my $recover_rewrite_count_pos =
-  index($shared_recover_adopt_kernel, 'after_claim_hook(token, trx');
 my $recover_claim_pos =
   index($shared_recover_adopt_kernel, 'trx_preserve_claim_prepared');
-die "recovery must rewrite durable recovered_count after claiming but before publishing the recovered record\n"
-  unless $recover_add_record_pos >= 0 && $recover_rewrite_count_pos >= 0 &&
-         $recover_claim_pos >= 0 &&
-         $recover_claim_pos < $recover_rewrite_count_pos &&
-         $recover_rewrite_count_pos < $recover_add_record_pos;
-die "recovery recovered_count rewrite failure must rollback the claimed transaction before registration\n"
-  unless $shared_recover_adopt_kernel =~
-         /after_claim_hook[\s\S]*rollback_after_claim/s &&
-         $recover_snapshot !~ /recovered_count_rewrite_after_claim[\s\S]*preserved_trx_add_record[\s\S]*preserved_trx_update_record_last_error/s;
+die "recovery must claim the prepared transaction before publishing the recovered record\n"
+  unless $recover_add_record_pos >= 0 && $recover_claim_pos >= 0 &&
+         $recover_claim_pos < $recover_add_record_pos;
 die "recovery must not call legacy raw snapshot read/rewrite helpers\n"
   if $recover_snapshot =~ /preserved_trx_read_snapshot|read_snapshot_with_identity_check|rewrite_snapshot_recovered_count/s;
 die "recovery max-count cleanup must leave a FAILED observable P_S record\n"
@@ -1028,6 +1129,9 @@ $drain_execute_without_observation_helpers =~
 die "DRAIN service must not bypass observation helpers for participant abort/finalize\n"
   if $drain_execute_without_observation_helpers =~
      /drain_orchestrator\.(?:abort_participants|finalize_participants)\s*\(/s;
+die "target-counter rejection must log transaction/target/nonidle/unsupported counters before returning generic unsupported\n"
+  unless $drain_execute =~
+     /target_counter_rejected[\s\S]*transaction_count[\s\S]*target_count[\s\S]*nonidle_transaction_count[\s\S]*has_unsupported_transaction/s;
 
 $preserve =~ /bool Sql_cmd_drain_transactions_preserve::execute[\s\S]*?^}/m
   or die "could not isolate DRAIN SQL command execute\n";
@@ -1340,6 +1444,17 @@ die "parallel preserve worker must catch exceptions and still call my_thread_end
   unless $parallel_preserve_worker_pool =~ /try\s*\{/s &&
          $parallel_preserve_worker_pool =~ /catch\s*\(/s &&
          $parallel_preserve_worker_pool =~ /my_thread_end\s*\(\s*\)/s;
+$preserve =~ /std::atomic<size_t>\s+next_startup_recovery_index[\s\S]*?for\s*\(std::thread\s+&worker\s*:\s*startup_recovery_workers\)/m
+  or die "could not isolate startup recovery worker pool\n";
+my $startup_recovery_worker_pool = $&;
+die "startup recovery worker must catch exceptions and still call my_thread_end\n"
+  unless $startup_recovery_worker_pool =~ /my_thread_init\s*\(\s*\)/s &&
+         $startup_recovery_worker_pool =~ /try\s*\{/s &&
+         $startup_recovery_worker_pool =~ /catch\s*\(/s &&
+         $startup_recovery_worker_pool =~ /my_thread_end\s*\(\s*\)/s;
+die "startup recovery must provide a serial override for recovery worker count\n"
+  unless $preserve =~ /preserve_trx_effective_startup_recovery_threads/s &&
+         $preserve =~ /preserve_trx_startup_recovery_threads\s*==\s*1/s;
 die "manager state and drain owner must be published as one packed snapshot\n"
   unless $preserve =~ /std::atomic<uint64_t>\s+g_manager_state_owner/s &&
          $preserve =~ /preserve_trx_manager_state_owner_snapshot/s;
@@ -1623,7 +1738,12 @@ die "temporary tablespace bootstrap must snapshot-read headers before validating
          /Preserve_snapshot_status validate_temp_sidecars_for_bootstrap[\s\S]*preserve_trx_temp_table_validate_sidecars/s;
 die "startup recovery must delete stale tmp files for durable snapshot tokens without deleting final artifacts\n"
   unless $preserve =~
-         /for\s*\(\s*const std::string &token\s*:\s*snapshot_tokens\s*\)[\s\S]*delete_stale_tmp_files_or_log\s*\(\s*store\.store\(\)\s*,\s*token\s*\)[\s\S]*recover_preserved_snapshot/s;
+         /for\s*\(\s*const std::string &token\s*:\s*snapshot_tokens\s*\)[\s\S]*delete_stale_tmp_files_or_log\s*\(\s*store\.store\(\)\s*,\s*token\s*,\s*heavy_cleanup\s*\)[\s\S]*recover_preserved_snapshot/s;
+die "startup recovery stale tmp cleanup must use listing-derived tmp tokens to avoid per-token directory scans\n"
+  unless $carrier_header =~ /stale_tmp_tokens/s &&
+         $carrier_file =~ /listing->stale_tmp_tokens/s &&
+         $preserve =~ /listing\.stale_tmp_tokens/s &&
+         $preserve =~ /delete_stale_tmp_files_or_log[\s\S]*heavy_cleanup/s;
 my $bundle_doc_matches =
   $bundle_doc eq '' ||
   ($bundle_doc =~ /Format Version 8 and TLV Extensions/s &&
@@ -1644,10 +1764,22 @@ die "SQL savepoint validator must bound binlog positions and event counters by s
 die "startup recovery success must emit an audit event\n"
   unless $shared_recover_adopt_kernel =~
          /audit_preserved_trx_event\s*\(\s*current_thd\s*,\s*token\s*,\s*local_startup\s*\?\s*"recover"\s*:\s*"promotion-adopt"\s*,\s*"success"\s*\)/s;
+die "startup recovery and promotion prewarm must share bundle load helper\n"
+  unless $preserve =~
+         /Preserve_snapshot_status\s+preserved_trx_load_bundle_for_recover_or_prewarm/s &&
+         $preserve =~
+         /recover_preserved_snapshot[\s\S]*preserved_trx_load_bundle_for_recover_or_prewarm/s &&
+         $promotion =~
+         /preserved_trx_promotion_prewarm_standby_pending_token[\s\S]*preserved_trx_load_bundle_for_recover_or_prewarm/s;
+die "startup recovery and promotion prewarm must share side-effect-free dry validation\n"
+  unless $preserve =~
+         /Preserve_snapshot_status\s+preserved_trx_dry_validate_loaded_bundle/s &&
+         $preserve =~
+         /recover_preserved_snapshot[\s\S]*preserved_trx_dry_validate_loaded_bundle/s &&
+         $promotion =~
+         /preserved_trx_promotion_prewarm_standby_pending_token[\s\S]*preserved_trx_dry_validate_loaded_bundle/s;
 
-$preserve =~ /bool Sql_cmd_resume_preserved_transaction::execute[\s\S]*?^}/m
-  or die "could not isolate Sql_cmd_resume_preserved_transaction::execute\n";
-my $resume_execute_audit = $&;
+my $resume_execute_audit = $resume_core;
 die "successful RESUME must emit an audit event\n"
   unless $resume_execute_audit =~
          /audit_preserved_trx_event\s*\(\s*thd\s*,\s*token\s*,\s*"resume"\s*,\s*"success"\s*\)/s;
@@ -1728,15 +1860,62 @@ die "standby transfer receiver dispatch must require PRESERVE_TRX_TRANSFER_ADMIN
          index($transfer_dispatch_command, 'preserve_trx_transfer_handle_receiver_payload');
 die "standby transfer receiver dispatch must not require source-side preserve_trx_transfer_enable\n"
   if $transfer_dispatch_command =~ /!preserve_trx_transfer_enable/s;
-die "standby transfer production source client must stay explicitly fail-closed until the credential resolver is implemented\n"
+die "standby transfer receiver dispatch must log non-OK frame status before mapping to generic SQL errors\n"
+  unless $transfer_dispatch_command =~
+         /status\s*!=\s*Preserve_trx_transfer_status::OK[\s\S]*PRESERVE: standby transfer receiver frame failed[\s\S]*transfer_status_name\s*\(\s*status\s*\)/s;
+die "standby transfer receiver dispatch failure log must include decoded frame type when available\n"
+  unless $transfer_dispatch_command =~
+         /preserve_trx_transfer_decode_frame\s*\(\s*encoded_frame[\s\S]*frame_type[\s\S]*std::to_string\s*\(\s*static_cast<int>\s*\(\s*decoded_frame\.type\s*\)\s*\)/s;
+$transfer =~
+  /Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame\([\s\S]*?^}/m
+  or die "could not isolate preserve_trx_transfer_apply_receiver_frame\n";
+my $transfer_apply_receiver_frame = $&;
+$transfer_apply_receiver_frame =~
+  /case Preserve_trx_transfer_frame_type::COMMIT_EPOCH:[\s\S]*?case Preserve_trx_transfer_frame_type::BEGIN:/m
+  or die "could not isolate standby transfer COMMIT_EPOCH receiver branch\n";
+my $transfer_commit_epoch_branch = $&;
+die "standby transfer COMMIT_EPOCH publish failures must log the publish substage\n"
+  unless $transfer_commit_epoch_branch =~
+         /standby transfer receiver commit epoch publish failed[\s\S]*transfer_status_name\s*\(\s*status\s*\)/s &&
+         $transfer_commit_epoch_branch =~
+         /standby transfer receiver commit epoch finalize failed[\s\S]*transfer_status_name\s*\(\s*status\s*\)/s;
+die "standby transfer production source client must resolve credential-name before opening a socket\n"
   unless $transfer =~
-         /default_transfer_client_connect[\s\S]*credential-name resolver[\s\S]*UNSUPPORTED/s &&
-         $gunit =~ /ConfiguredFrameSinkDefaultsToUnsupported/s;
-die "standby transfer worker sysvars must be documented as reserved until real source and receiver worker pools exist\n"
+         /default_transfer_client_connect[\s\S]*resolve_transfer_credential[\s\S]*mysql_real_connect/s &&
+         $gunit =~ /ConfiguredFrameSinkDefaultClientUsesCredentialStore/s;
+die "standby transfer production source client must send frames through COM_PRESERVE_TRX_TRANSFER\n"
+  unless $transfer =~
+         /default_transfer_client_send[\s\S]*simple_command[\s\S]*COM_PRESERVE_TRX_TRANSFER/s;
+die "standby transfer sender worker sysvar must stay reserved until a real source worker pool exists\n"
   unless $sys_vars =~
-         /preserve_trx_transfer_sender_workers[\s\S]*reserved[\s\S]*planned source worker pool/s &&
-         $sys_vars =~
-         /preserve_trx_transfer_receiver_workers[\s\S]*reserved[\s\S]*planned receiver worker pool/s;
+         /preserve_trx_transfer_sender_workers[\s\S]*reserved[\s\S]*planned source worker pool/s;
+die "standby transfer receiver worker sysvar must document the batch receiver worker path\n"
+  unless $sys_vars =~
+         /preserve_trx_transfer_receiver_workers[\s\S]*batch receiver[\s\S]*classic single-frame dispatch/s;
+die "standby transfer receiver batch payload path must use the bounded frame worker helper\n"
+  unless $transfer_header =~ /preserve_trx_transfer_handle_receiver_payload_batch/s &&
+         $transfer_header =~ /preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s &&
+         $transfer =~ /preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*preserve_trx_transfer_decode_frame[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
+die "standby promotion simulator must expose transfer control frames for prewarm and gate only through COM_PRESERVE_TRX_TRANSFER\n"
+  unless $transfer_header =~ /PROMOTION_PREWARM_TOKEN/s &&
+         $transfer_header =~ /PROMOTION_GATE_EPOCH/s &&
+         $transfer =~ /PROMOTION_PREWARM_TOKEN[\s\S]*preserved_trx_promotion_prewarm_standby_pending_tokens/s &&
+         $transfer =~ /PROMOTION_GATE_EPOCH[\s\S]*preserved_trx_adopt_standby_pending_all_for_promotion/s;
+$transfer =~
+  /Preserve_trx_transfer_status\s+preserve_trx_transfer_apply_receiver_frame_batch_with_workers\s*\([\s\S]*?^}/m
+  or die "could not isolate receiver frame batch worker helper\n";
+my $transfer_batch_worker_helper = $&;
+die "standby promotion gate frame must be a receiver batch barrier after prewarm worker segments complete\n"
+  unless $transfer_batch_worker_helper =~
+         /is_batch_barrier[\s\S]*COMMIT_EPOCH[\s\S]*PROMOTION_GATE_EPOCH/s &&
+         $transfer_batch_worker_helper =~ /flush_segment\s*\(\s*\)[\s\S]*apply_frame\s*\(\s*frame\s*,\s*context\s*\)/s;
+$transfer =~ /Preserve_trx_transfer_status preserve_trx_transfer_seal_staged_object[\s\S]*?^}/m
+  or die "could not isolate preserve_trx_transfer_seal_staged_object\n";
+my $transfer_seal_staged_object = $&;
+die "standby transfer SEAL_OBJECT must verify object digest with streaming IO, not read the full object into memory\n"
+  unless $transfer =~ /sha256_digest_file_streaming/s &&
+         $transfer_seal_staged_object =~ /sha256_digest_file_streaming/s &&
+         $transfer_seal_staged_object !~ /read_whole_file/s;
 die "standby promotion Phase C must use transfer manifest protocol version 3\n"
   unless $transfer_header =~
          /kPreserveTrxTransferProtocolVersion\s*=\s*3\s*;/s &&
@@ -1773,9 +1952,28 @@ my $promotion_gate = $&;
 die "standby promotion Phase B gate must not hydrate snapshot payloads when ready-cache gating is required\n"
   if $promotion_gate =~
      /store->read\s*\(|Payload_read_mode|WITH_SEMANTIC_EXTERNAL_BLOBS/s;
+die "standby promotion simulator must only bypass apply-barrier readiness through a DBUG-only seam\n"
+  unless $promotion_gate =~ /g_apply_state_provider\s*!=\s*nullptr/s &&
+         $promotion_gate =~
+         /DBUG_EXECUTE_IF\s*\(\s*"preserve_trx_promotion_debug_apply_reached"/s &&
+         $promotion_gate =~ /apply_state_available\s*=\s*true/s;
+die "standby promotion must expose an explicit apply-state provider registration for HA promotion\n"
+  unless $promotion_header =~
+         /preserved_trx_set_promotion_apply_state_provider\s*\(/s &&
+         $promotion =~
+         /preserved_trx_set_promotion_apply_state_provider_for_unit_test[\s\S]*preserved_trx_set_promotion_apply_state_provider\s*\(\s*provider\s*\)/s;
+die "standby promotion must not synthesize apply-reached from local redo without a provider or DBUG seam\n"
+  if $promotion_gate =~
+     /apply_state\.apply_frozen\s*=\s*true[\s\S]{0,240}trx_preserve_current_redo_lsn/s;
 die "standby promotion prewarm may hydrate standby-pending artifacts only outside the gate\n"
   unless $promotion =~ /preserved_trx_promotion_prewarm_standby_pending_token/s &&
          $promotion =~ /WITH_SEMANTIC_EXTERNAL_BLOBS/s;
+die "standby promotion batch prewarm must use a bounded worker pool over the shared single-token prewarm helper\n"
+  unless $promotion_header =~ /preserved_trx_promotion_prewarm_standby_pending_tokens/s &&
+         $promotion =~ /preserved_trx_promotion_prewarm_standby_pending_tokens[\s\S]*std::atomic<size_t>\s+next_token/s &&
+         $promotion =~ /preserved_trx_promotion_prewarm_standby_pending_tokens[\s\S]*worker_count/s &&
+         $promotion =~ /preserved_trx_promotion_prewarm_standby_pending_tokens[\s\S]*workers\.emplace_back\s*\(\s*run_worker\s*\)/s &&
+         $promotion =~ /preserved_trx_promotion_prewarm_standby_pending_tokens[\s\S]*preserved_trx_promotion_prewarm_standby_pending_token/s;
 die "standby promotion Phase D execute mode must not report READY tokens as skipped success\n"
   unless $promotion_header =~ /execute_adopt/s &&
          $promotion_header =~ /Preserve_trx_promotion_adopt_executor/s &&
@@ -1801,6 +1999,47 @@ die "standby promotion Phase D helper must not directly claim, import semantic s
 die "shared startup recover/adopt kernel must contain claim/import/register and post-claim rollback\n"
   unless $preserve =~
          /preserved_trx_recover_or_adopt_bundle_shared[\s\S]*trx_preserve_claim_prepared[\s\S]*trx_preserve_import_read_view[\s\S]*trx_preserve_import_table_locks[\s\S]*trx_preserve_import_record_locks[\s\S]*create_detached_mdl_context[\s\S]*preserved_trx_add_record[\s\S]*trx_preserve_rollback_claimed/s;
+die "promotion-adopted records must be registered as promotion-owned and non-resumable until the promotion resume core consumes them\n"
+  unless $preserve =~ /ADOPTED_FOR_PROMOTION/s &&
+         $shared_recover_adopt_kernel =~
+         /preserved_trx_add_record\s*\(\s*metadata\s*,\s*trx\s*,\s*local_startup\s*,[\s\S]*local_startup\s*\?\s*Preserved_trx_lifecycle_state::PRESERVED\s*:\s*Preserved_trx_lifecycle_state::ADOPTED_FOR_PROMOTION/s;
+$resume_core =~ /if\s*\(\s*!record\.resumable\s*\)[\s\S]*?return preserve_trx_reject_unsupported\s*\(\s*\);/m
+  or die "could not isolate SQL RESUME non-resumable branch\n";
+my $non_resumable_resume_branch = $&;
+die "ordinary SQL RESUME must not turn non-resumable promotion-owned records into FAILED records\n"
+  unless $non_resumable_resume_branch =~ /preserved_trx_update_record_last_error/s &&
+         $non_resumable_resume_branch !~ /preserved_trx_update_record_error/s;
+die "resume core must be policy-scoped so SQL users cannot construct PROMOTION_RESUME_ON_THD\n"
+  unless $preserve =~ /enum\s+class\s+Preserved_trx_resume_policy[\s\S]*SQL_RESUME[\s\S]*PROMOTION_RESUME_ON_THD/s &&
+         $resume_core =~ /const\s+Preserved_trx_resume_options\s*&options/s &&
+         $resume_execute =~ /Preserved_trx_resume_policy::SQL_RESUME/s &&
+         $resume_execute !~ /PROMOTION_RESUME_ON_THD/s;
+die "promotion-owned records must have a dedicated take helper guarded by ADOPTED_FOR_PROMOTION and non-resumable state\n"
+  unless $preserve =~ /preserved_trx_take_promotion_adopted_record[\s\S]*ADOPTED_FOR_PROMOTION[\s\S]*!it->resumable/s &&
+         $resume_core =~ /preserved_trx_take_promotion_adopted_record/s;
+die "promotion resume-on-THD must be exposed only through a protected peer THD handle\n"
+  unless $preserve_header =~ /class\s+Preserved_trx_peer_thd_handle[\s\S]*THD\s*\*\s*get\s*\(\s*\)\s*const/s &&
+         $preserve_header =~ /using\s+Preserved_trx_peer_thd_resolver\s*=[\s\S]*Preserved_trx_peer_thd_handle\s*\*/s &&
+         $preserve =~ /preserved_trx_resume_adopted_for_promotion_on_thd\s*\(\s*Preserved_trx_peer_thd_handle\s*\*/s &&
+         $preserve !~ /preserved_trx_resume_adopted_for_promotion_on_thd\s*\(\s*THD\s*\*/s;
+die "shared startup recover/adopt kernel must accept operation options with a monotonic deadline\n"
+  unless $preserve =~ /struct Preserved_trx_recover_or_adopt_options[\s\S]*deadline_us/s &&
+         $shared_recover_adopt_kernel =~ /const Preserved_trx_recover_or_adopt_options\s*&options/s &&
+         $shared_recover_adopt_kernel =~ /recover_or_adopt_deadline_expired/s;
+die "promotion default adopt path must pass gate_timeout_ms as the shared-kernel deadline\n"
+  unless $promotion =~
+         /promotion_adopt_ready_bundle_default[\s\S]*gate_deadline_us[\s\S]*preserved_trx_adopt_ready_bundle_for_promotion\s*\([\s\S]*gate_deadline_us/s &&
+         $promotion_gate =~ /gate_deadline_us\s*=\s*my_micro_time\s*\(\s*\)\s*\+\s*request\.gate_timeout_ms\s*\*\s*1000/s;
+die "promotion gate must fail closed when the requested token count exceeds the batch budget\n"
+  unless $promotion_header =~ /gate_batch_tokens/s &&
+         $promotion_gate =~
+         /requested_tokens\.size\s*\(\s*\)\s*>\s*request\.gate_batch_tokens/s &&
+         $promotion_gate =~ /TOO_MANY_PROMOTION_TOKENS/s;
+die "promotion gate worker_count must drive a bounded adopt worker pool\n"
+  unless $promotion =~ /#include\s+<thread>/s &&
+         $promotion_gate =~ /std::atomic<size_t>\s+next_task/s &&
+         $promotion_gate =~ /request\.worker_count/s &&
+         $promotion_gate =~ /workers\.emplace_back\s*\(\s*run_worker\s*\)/s;
 die "standby promotion Phase D helper must not delete standby artifacts inside the promotion gate\n"
   if $promotion_ready_adopt_helper =~
      /delete_preserved_snapshot_files_and_sidecars_or_log|remove_with_status|remove_standby_pending/s;

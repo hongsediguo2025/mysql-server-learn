@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "sql_thd_internal_api.h"
+#include "buf0buf.h"
 #include "debug_sync.h"
 #include "dict0mem.h"
 #include "mysql/plugin.h"
@@ -116,6 +117,8 @@ struct lock_warmcopy_record_shard_state_t {
     parsing. Bitmap set/reset hooks remain thin and do not build these images.
   */
   std::map<uint32_t, lock_warmcopy_record_image_entry_t> record_images;
+  uint64_t page_lsn{0};
+  uint32_t page_n_heap{0};
   uint32_t set_bit_count{0};
   uint32_t shard_state_flags{0};
   /* Nonzero means at least one set bit could not be tied to a record image. */
@@ -603,10 +606,19 @@ bool record_target_is_invalid_locked(uint64_t target_id) {
   return invalid_map.find(target_id) != invalid_map.end();
 }
 
+void update_record_shard_page_identity_locked(
+    lock_warmcopy_record_shard_state_t *shard, uint64_t page_lsn,
+    uint32_t page_n_heap) {
+  if (shard == nullptr || page_n_heap == 0) return;
+  shard->page_lsn = page_lsn;
+  shard->page_n_heap = page_n_heap;
+}
+
 bool record_bitmap_set_locked(
     uint64_t target_id, const lock_warmcopy_record_shard_key_t &key,
     uint32_t heap_no, const lock_warmcopy_record_image_digest_t *digest,
-    uint32_t heap_offset, const std::string *encoded_record_image) {
+    uint32_t heap_offset, const std::string *encoded_record_image,
+    uint64_t page_lsn = 0, uint32_t page_n_heap = 0) {
   /*
     Set/reset operations keep the normalized bitmap, optional record image,
     journal accounting and generation in one store critical section. Seal can
@@ -617,6 +629,7 @@ bool record_bitmap_set_locked(
       next_record_journal_sequence_for_target_locked(target_id);
   lock_warmcopy_record_shard_state_t &shard =
       find_or_create_record_shard(target_id, key);
+  update_record_shard_page_identity_locked(&shard, page_lsn, page_n_heap);
   const bool was_set = record_bitmap_bit_is_set(shard, heap_no);
   const bool had_digest = shard.record_images.find(heap_no) !=
                           shard.record_images.end();
@@ -834,6 +847,8 @@ void copy_record_shard_snapshot(
   for (const auto &entry : shard.record_images) {
     snapshot->record_images.push_back(entry.second);
   }
+  snapshot->page_lsn = shard.page_lsn;
+  snapshot->page_n_heap = shard.page_n_heap;
   snapshot->set_bit_count = shard.set_bit_count;
   snapshot->shard_state_flags = shard.shard_state_flags;
   snapshot->mutation_generation = shard.mutation_generation;
@@ -857,6 +872,8 @@ std::string record_shard_canonical_bytes_locked(
   append_u32_le(&out, snapshot.key.page_no);
   append_u32_le(&out, snapshot.key.lock_type_mode);
   append_u32_le(&out, snapshot.key.n_bits);
+  append_u64_le(&out, snapshot.page_lsn);
+  append_u32_le(&out, snapshot.page_n_heap);
   append_u32_le(&out,
                 static_cast<uint32_t>(snapshot.normalized_bitmap.size()));
   for (const unsigned char bitmap_byte : snapshot.normalized_bitmap) {
@@ -913,8 +930,9 @@ bool append_record_payload_entry_locked(
   append_u32_le(payload, shard.key.page_no);
   append_u32_le(payload, shard.key.lock_type_mode);
   append_u32_le(payload, shard.key.n_bits);
-  append_u64_le(payload, 0);  // page_lsn is verified by the seal scan.
-  append_u32_le(payload, shard.key.n_bits);
+  append_u64_le(payload, shard.page_lsn);
+  append_u32_le(payload, shard.page_n_heap == 0 ? shard.key.n_bits
+                                                : shard.page_n_heap);
   append_u32_le(payload, static_cast<uint32_t>(heap_offsets.size()));
   append_u32_le(payload, static_cast<uint32_t>(record_images.size()));
   append_u32_le(payload, static_cast<uint32_t>(bitmap.size()));
@@ -1210,10 +1228,10 @@ bool lock_warmcopy_record_bitmap_set_with_image_for_trx(
 }
 
 bool lock_warmcopy_record_bitmap_set_with_image_for_lock(
-    const lock_t *lock, uint32_t heap_no, uint32_t heap_offset,
-    const std::string &encoded_record_image) {
+    const lock_t *lock, const buf_block_t *block, uint32_t heap_no,
+    uint32_t heap_offset, const std::string &encoded_record_image) {
   lock_warmcopy_record_shard_key_t key;
-  if (!record_shard_key_from_lock(lock, &key)) {
+  if (!record_shard_key_from_lock(lock, &key) || block == nullptr) {
     lock_warmcopy_record_hook_event();
     return false;
   }
@@ -1228,8 +1246,65 @@ bool lock_warmcopy_record_bitmap_set_with_image_for_lock(
                  encoded_record_image.data()),
              encoded_record_image.size(), digest.bytes);
 
-  return lock_warmcopy_record_bitmap_set_with_image_for_trx(
-      lock->trx, key, heap_no, digest, heap_offset, encoded_record_image);
+  const uint64_t page_lsn = mach_read_from_8(block->frame + FIL_PAGE_LSN);
+  const uint32_t page_n_heap = page_dir_get_n_heap(block->frame);
+  if (!lock_warmcopy_hooks_enabled() ||
+      !record_heap_no_is_valid(key, heap_no) || encoded_record_image.empty()) {
+    return false;
+  }
+
+  lock_warmcopy_observed_hook_events.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t target_id = record_target_id_for_trx(lock->trx);
+  std::lock_guard<std::mutex> guard(
+      record_store_partition_for_target(target_id).mutex);
+  return record_bitmap_set_locked(target_id, key, heap_no, &digest, heap_offset,
+                                  &encoded_record_image, page_lsn,
+                                  page_n_heap);
+}
+
+bool lock_warmcopy_record_store_refresh_record_image_for_trx(
+    const trx_t *trx, const dict_index_t *index, const buf_block_t *block,
+    uint32_t heap_no, uint32_t heap_offset,
+    const std::string &encoded_record_image) {
+  if (!lock_warmcopy_hooks_enabled() || trx == nullptr || index == nullptr ||
+      index->table == nullptr || block == nullptr ||
+      encoded_record_image.empty()) {
+    return false;
+  }
+
+  lock_warmcopy_record_image_digest_t digest;
+  SHA_EVP256(reinterpret_cast<const unsigned char *>(
+                 encoded_record_image.data()),
+             encoded_record_image.size(), digest.bytes);
+
+  const uint64_t target_id = record_target_id_for_trx(trx);
+  auto &partition = record_store_partition_for_target(target_id);
+  std::lock_guard<std::mutex> guard(partition.mutex);
+  lock_warmcopy_record_shard_map_t *store =
+      mutable_record_store_for_target_if_exists_locked(target_id);
+  if (store == nullptr) return true;
+
+  std::vector<lock_warmcopy_record_shard_key_t> matching_keys;
+  const page_id_t page_id = block->get_page_id();
+  for (const auto &entry : *store) {
+    const lock_warmcopy_record_shard_key_t &key = entry.first;
+    const lock_warmcopy_record_shard_state_t &shard = entry.second;
+    if (key.table_id == index->table->id && key.index_id == index->id &&
+        key.space_id == page_id.space() && key.page_no == page_id.page_no() &&
+        record_heap_no_is_valid(key, heap_no) &&
+        record_bitmap_bit_is_set(shard, heap_no)) {
+      matching_keys.push_back(key);
+    }
+  }
+
+  for (const lock_warmcopy_record_shard_key_t &key : matching_keys) {
+    const uint64_t page_lsn = mach_read_from_8(block->frame + FIL_PAGE_LSN);
+    const uint32_t page_n_heap = page_dir_get_n_heap(block->frame);
+    record_bitmap_set_locked(target_id, key, heap_no, &digest, heap_offset,
+                             &encoded_record_image, page_lsn, page_n_heap);
+  }
+
+  return true;
 }
 
 lock_warmcopy_debug_stats_t lock_warmcopy_debug_stats_for_unit_test() {
@@ -1507,9 +1582,11 @@ bool seed_record_payload_entry_into_store(
     const std::string &payload, size_t *offset,
     lock_warmcopy_record_shard_map_t *store, uint32_t *lock_count) {
   /*
-    Seeding parses the same payload shape that resume imports later. Rejecting
-    malformed bitmaps, duplicate shard keys, or missing record images here keeps
-    the mirror store from accepting a payload that cannot be restored.
+    Seeding parses the same payload shape that resume imports later. Phase-1
+    warmcopy may omit record images when the payload carries a stable page LSN;
+    that compact form is usable only as a prebuilt artifact guarded by the final
+    fence. If later seal has to rebuild bytes from the store, the missing images
+    make that path fail closed and fall back to live export.
   */
   lock_warmcopy_record_shard_key_t key;
   uint64_t page_lsn = 0;
@@ -1533,7 +1610,6 @@ bool seed_record_payload_entry_into_store(
     return false;
   }
 
-  (void)page_lsn;
   if (key.n_bits == 0 || page_n_heap == 0 || bitmap_len == 0 ||
       bitmap_len != record_bitmap_len(key.n_bits)) {
     return false;
@@ -1562,12 +1638,15 @@ bool seed_record_payload_entry_into_store(
 
   const uint32_t set_bits = record_bitmap_set_bit_count(normalized_bitmap);
   if (set_bits == 0 || heap_offsets_len != set_bits * 4U) return false;
+  const bool compact_stable_page_payload = record_images.empty();
 
   lock_warmcopy_record_shard_state_t &shard =
       find_or_create_record_shard_in_store(store, key);
   shard.key = key;
   shard.normalized_bitmap = normalized_bitmap;
   shard.record_images.clear();
+  shard.page_lsn = page_lsn;
+  shard.page_n_heap = page_n_heap;
   shard.set_bit_count = set_bits;
   shard.shard_state_flags = 0;
   shard.missing_record_image_count = 0;
@@ -1589,10 +1668,17 @@ bool seed_record_payload_entry_into_store(
     if ((normalized_bitmap[byte_pos] & bit_mask) == 0) continue;
 
     uint32_t heap_offset = 0;
-    std::string encoded_record_image;
     if (!read_u32_le_from_payload(heap_offsets, &heap_offsets_offset,
-                                  &heap_offset) ||
-        !read_encoded_record_image_slot(record_images, &record_images_offset,
+                                  &heap_offset)) {
+      return false;
+    }
+
+    if (compact_stable_page_payload) {
+      continue;
+    }
+
+    std::string encoded_record_image;
+    if (!read_encoded_record_image_slot(record_images, &record_images_offset,
                                         &encoded_record_image)) {
       return false;
     }
@@ -1609,7 +1695,7 @@ bool seed_record_payload_entry_into_store(
 
   if (heap_offsets_offset != heap_offsets.size() ||
       record_images_offset != record_images.size() ||
-      shard.record_images.size() != set_bits) {
+      (!compact_stable_page_payload && shard.record_images.size() != set_bits)) {
     return false;
   }
 

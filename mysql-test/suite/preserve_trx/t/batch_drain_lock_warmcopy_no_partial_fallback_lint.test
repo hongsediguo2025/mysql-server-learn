@@ -53,6 +53,10 @@ my $recover = extract_function(
   $preserve,
   qr/static\s+bool\s+recover_preserved_snapshot\s*\(/,
   'recover_preserved_snapshot');
+my $recover_load = extract_function(
+  $preserve,
+  qr/Preserve_snapshot_status\s+preserved_trx_load_bundle_for_recover_or_prewarm\s*\(/,
+  'preserved_trx_load_bundle_for_recover_or_prewarm');
 my $lock_warmcopy = read_source('sql', 'preserve_trx_lock_warmcopy.cc');
 my $prepare_quiesced = extract_function(
   $lock_warmcopy,
@@ -154,9 +158,12 @@ die "externalized record-lock payload must be removed from inline record-lock TL
            /max_record_locks_external_blob_bytes/s;
 die "startup recovery must hydrate external record-lock blobs before importing lock semantics\n"
   unless $recover =~
-         /store->read\s*\(\s*token\s*,\s*true\s*,\s*Preserved_trx_carrier::Payload_read_mode::\s*WITH_SEMANTIC_EXTERNAL_BLOBS/s &&
+         /preserved_trx_load_bundle_for_recover_or_prewarm\s*\([\s\S]{0,240}Preserved_trx_recover_load_profile::\s*WITH_SEMANTIC_EXTERNAL_BLOBS/s &&
+         $recover_load =~
+         /Preserved_trx_carrier::Payload_read_mode::\s*WITH_SEMANTIC_EXTERNAL_BLOBS/s &&
+         $recover_load =~ /store->read\s*\(\s*token\s*,\s*true\s*,\s*read_mode\s*,\s*bundle\s*\)/s &&
          $preserve =~
-         /static bool preserved_trx_recover_or_adopt_bundle_shared[\s\S]*trx_preserve_import_record_locks\s*\(\s*trx\s*,\s*metadata\.record_locks_payload\s*\)/s;
+         /static bool preserved_trx_recover_or_adopt_bundle_shared[\s\S]*trx_preserve_import_record_locks\s*\(\s*trx\s*,\s*metadata\.record_locks_payload\s*,[\s\S]{0,260}&result->phase_metrics\.record_lock_import/s;
 die "warmcopy phase2 metrics must expose record prebuilt/materialized target counts\n"
   unless $preserve =~ /phase1_record_prebuilt_target_count/s &&
          $preserve =~ /phase2_record_prebuilt_target_count/s &&

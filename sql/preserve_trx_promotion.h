@@ -30,6 +30,26 @@
 
 #include "sql/preserve_trx_bundle.h"
 
+extern uint preserve_trx_promotion_gate_batch_tokens;
+extern uint preserve_trx_promotion_gate_workers;
+extern uint preserve_trx_promotion_gate_timeout_ms;
+extern uint preserve_trx_promotion_gate_record_lock_page_cap;
+
+uint64_t preserve_trx_promotion_gate_elapsed_us_status();
+uint64_t preserve_trx_promotion_gate_token_count_status();
+uint64_t preserve_trx_promotion_gate_adopted_count_status();
+uint64_t preserve_trx_promotion_gate_abandoned_count_status();
+uint64_t preserve_trx_promotion_gate_skipped_count_status();
+uint64_t preserve_trx_promotion_gate_max_worker_elapsed_us_status();
+uint64_t preserve_trx_promotion_gate_p50_worker_elapsed_us_status();
+uint64_t preserve_trx_promotion_gate_p95_worker_elapsed_us_status();
+uint64_t preserve_trx_promotion_gate_status_code_status();
+uint64_t preserve_trx_promotion_gate_record_lock_page_count_status();
+uint64_t preserve_trx_promotion_gate_record_lock_resident_pages_status();
+uint64_t preserve_trx_promotion_gate_record_lock_cold_page_gets_status();
+uint64_t preserve_trx_promotion_gate_ready_cache_miss_count_status();
+uint64_t preserve_trx_promotion_gate_over_budget_count_status();
+
 enum class Preserve_trx_promotion_adopt_status {
   OK,
   OK_WITH_ABANDONED_TOKENS,
@@ -41,6 +61,8 @@ enum class Preserve_trx_promotion_adopt_status {
   EPOCH_NOT_COMMITTED,
   APPLY_BARRIER_NOT_REACHED,
   READY_CACHE_NOT_READY,
+  TOO_MANY_PROMOTION_TOKENS,
+  TOO_MANY_RECORD_LOCK_PAGES,
   CORRUPT_ARTIFACT,
   UNSUPPORTED_ARTIFACT,
   CLAIMED_IMPORT_FAILED,
@@ -54,6 +76,7 @@ const char *preserve_trx_promotion_adopt_status_name(
 
 enum class Preserve_trx_promotion_ready_state;
 struct Preserve_trx_promotion_token_result;
+struct Preserve_trx_promotion_adopt_result;
 
 struct Preserve_trx_promotion_apply_state {
   bool apply_frozen{false};
@@ -69,10 +92,16 @@ using Preserve_trx_promotion_adopt_executor =
              Preserve_trx_promotion_token_result *token_result);
 
 /*
-  Unit tests use this hook to model the SQL-thread/apply barrier without
-  connecting Phase A to failover orchestration. Production code leaves it unset
-  until the real promotion coordinator owns that barrier.
+  The HA promotion coordinator installs this provider when it can prove the
+  physical apply state for a standby-pending epoch.  A missing provider is a
+  fail-closed condition: promotion may inspect the artifacts, but it must not
+  claim or import prepared transactions as if redo apply had reached the source
+  epoch.  Unit tests use the _for_unit_test wrapper below so test-only setup is
+  visible at call sites.
 */
+void preserved_trx_set_promotion_apply_state_provider(
+    Preserve_trx_promotion_apply_state_provider provider);
+
 void preserved_trx_set_promotion_apply_state_provider_for_unit_test(
     Preserve_trx_promotion_apply_state_provider provider);
 
@@ -96,12 +125,49 @@ void preserved_trx_promotion_ready_cache_put_bundle_for_unit_test(
     uint64_t token, Preserve_trx_promotion_ready_state state,
     uint64_t required_apply_lsn, const Preserved_trx_bundle &ready_bundle);
 
+void
+preserved_trx_promotion_ready_cache_put_bundle_with_record_lock_proof_for_unit_test(
+    const std::string &preserve_dir, const std::string &epoch_id,
+    uint64_t token, Preserve_trx_promotion_ready_state state,
+    uint64_t required_apply_lsn, const Preserved_trx_bundle &ready_bundle,
+    uint64_t record_lock_page_count, uint64_t record_lock_bitmap_pages,
+    uint64_t record_lock_bitmap_bits);
+
+void
+preserved_trx_promotion_ready_cache_put_bundle_with_record_lock_residency_for_unit_test(
+    const std::string &preserve_dir, const std::string &epoch_id,
+    uint64_t token, Preserve_trx_promotion_ready_state state,
+    uint64_t required_apply_lsn, const Preserved_trx_bundle &ready_bundle,
+    uint64_t record_lock_page_count,
+    uint64_t record_lock_prefetch_submitted_pages,
+    uint64_t record_lock_resident_pages, uint64_t record_lock_bitmap_pages,
+    uint64_t record_lock_bitmap_bits);
+
+bool preserved_trx_promotion_record_lock_pages_gate_ready_for_unit_test(
+    bool record_lock_pages_prewarmed, uint64_t record_lock_page_count,
+    uint64_t record_lock_prefetch_submitted_pages,
+    uint64_t record_lock_resident_pages);
+
+bool preserved_trx_promotion_record_lock_pages_wait_for_residency_for_unit_test(
+    bool record_lock_pages_prewarmed, uint64_t record_lock_page_count,
+    uint64_t record_lock_prefetch_submitted_pages,
+    const std::vector<uint64_t> &resident_page_samples,
+    uint64_t *final_resident_pages, uint64_t *sample_count);
+
 Preserve_trx_promotion_adopt_status
 preserved_trx_promotion_prewarm_standby_pending_token(
     const std::string &preserve_dir, const std::string &epoch_id,
     uint64_t token, uint64_t required_apply_lsn);
 
+Preserve_trx_promotion_adopt_status
+preserved_trx_promotion_prewarm_standby_pending_tokens(
+    const std::string &preserve_dir, const std::string &epoch_id,
+    const std::vector<uint64_t> &tokens, uint64_t required_apply_lsn,
+    uint worker_count, Preserve_trx_promotion_adopt_result *result);
+
 struct Preserve_trx_promotion_adopt_all_request {
+  Preserve_trx_promotion_adopt_all_request();
+
   std::string epoch_id;
   std::vector<uint64_t> tokens;
   uint64_t required_apply_lsn{0};
@@ -116,8 +182,10 @@ struct Preserve_trx_promotion_adopt_all_request {
   */
   bool execute_adopt{false};
   bool fail_on_first_error{true};
-  uint32_t worker_count{3};
-  uint64_t gate_timeout_ms{1000};
+  uint32_t gate_batch_tokens;
+  uint32_t worker_count;
+  uint64_t gate_timeout_ms;
+  uint64_t gate_record_lock_page_cap;
 };
 
 enum class Preserve_trx_promotion_cleanup_state {
@@ -150,7 +218,14 @@ struct Preserve_trx_promotion_adopt_result {
   uint64_t cleanup_failed_count{0};
   uint64_t elapsed_us{0};
   uint64_t max_worker_elapsed_us{0};
+  uint64_t p50_worker_elapsed_us{0};
+  uint64_t p95_worker_elapsed_us{0};
   uint64_t marker_us{0};
+  uint64_t record_lock_page_count{0};
+  uint64_t record_lock_resident_pages{0};
+  uint64_t record_lock_cold_page_gets{0};
+  uint64_t ready_cache_miss_count{0};
+  uint64_t over_budget_count{0};
   std::vector<uint64_t> seen_tokens;
   std::vector<Preserve_trx_promotion_token_result> token_results;
   std::string message;
@@ -174,6 +249,7 @@ struct Preserve_trx_promotion_ready_summary {
   std::vector<uint64_t> ready_tokens;
   std::vector<uint64_t> pending_tokens;
   std::vector<uint64_t> corrupt_tokens;
+  std::vector<Preserve_trx_promotion_token_result> token_results;
   uint64_t max_required_apply_lsn{0};
 };
 

@@ -246,6 +246,9 @@ That might lead to the deadlock with G3 never being noticed.
 // Forward declaration
 class ReadView;
 struct Preserve_lock_limits;
+struct trx_preserve_record_lock_page_plan_t;
+struct trx_preserve_record_lock_residency_t;
+struct trx_preserve_record_lock_import_metrics_t;
 
 extern bool innobase_deadlock_detect;
 
@@ -670,6 +673,17 @@ dberr_t lock_preserve_export_record_locks(trx_t *trx, std::string *payload);
 dberr_t lock_preserve_export_record_locks(trx_t *trx, std::string *payload,
                                           uint32_t max_lock_count);
 
+/** Export granted explicit record locks using stable page identity only.
+This is intended for phase-1 lock warmcopy seeding, where the prebuilt payload
+can be adopted if the final fence proves the page shape has not changed.
+Ordinary live export keeps record images for conservative import after drift.
+@param[in]  trx             transaction whose record locks are exported
+@param[out] payload         opaque serialized record-lock payload
+@param[in]  max_lock_count  maximum record bits to export
+@return DB_SUCCESS or error */
+dberr_t lock_preserve_export_record_locks_stable_page_only(
+    trx_t *trx, std::string *payload, uint32_t max_lock_count);
+
 /** Check whether a transaction currently owns predicate record locks.
 @param[in]  trx                  transaction to inspect
 @param[out] has_predicate_locks  true if a predicate lock exists
@@ -686,6 +700,34 @@ const char *lock_preserve_last_record_lock_export_error();
 @return DB_SUCCESS or error */
 dberr_t lock_preserve_import_record_locks(trx_t *trx,
                                           const std::string &payload);
+dberr_t lock_preserve_import_record_locks(
+    trx_t *trx, const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics);
+dberr_t lock_preserve_import_record_locks(
+    trx_t *trx, const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics,
+    bool (*deadline_expired)(void *), void *deadline_ctx);
+
+/** Issue best-effort asynchronous reads for pages referenced by a preserved
+record-lock payload.
+@param[in]     payload  opaque serialized record-lock payload
+@param[in,out] metrics  optional import metrics updated with issued prefetches
+@return DB_SUCCESS, or an error if the payload cannot be parsed or page size
+        metadata cannot be resolved */
+dberr_t lock_preserve_prefetch_record_lock_pages(
+    const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics);
+
+/** Read pages referenced by a preserved record-lock payload for a promotion
+gate. Unlike the startup prefetch helper, this path waits for each referenced
+page to become buffer-pool resident before the gate samples residency.
+@param[in]     payload  opaque serialized record-lock payload
+@param[in,out] metrics  optional import metrics updated with covered pages
+@return DB_SUCCESS, or an error if the payload cannot be parsed or page size
+        metadata cannot be resolved */
+dberr_t lock_preserve_prefetch_record_lock_pages_for_gate(
+    const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics);
 
 /** Validate an opaque preserved record-lock payload.
 @param[in] payload opaque serialized record-lock payload
@@ -699,6 +741,23 @@ bool lock_preserve_record_locks_payload_is_valid_for_import(
 @return true if the payload was parsed and counted successfully */
 bool lock_preserve_record_locks_payload_lock_count(const std::string &payload,
                                                    uint32_t *lock_count);
+
+/** Build a parse-only page plan from a preserved record-lock payload.
+@param[in]  payload opaque serialized record-lock payload
+@param[out] plan    distinct ordinary record pages and bitmap counters
+@return true if the payload was parsed successfully */
+bool lock_preserve_record_lock_payload_page_plan(
+    const std::string &payload, trx_preserve_record_lock_page_plan_t *plan);
+
+/** Sample record-lock page residency from a preserved record-lock payload.
+The first implementation is parse-only and reports non-empty pages as missing;
+later promotion prewarm work extends it with a nonblocking buffer-pool probe.
+@param[in]  payload    opaque serialized record-lock payload
+@param[out] residency  distinct ordinary record pages and residency counters
+@return true if the payload was parsed successfully */
+bool lock_preserve_record_lock_payload_residency(
+    const std::string &payload,
+    trx_preserve_record_lock_residency_t *residency);
 
 /** Split a mixed record/predicate payload into ordinary record-lock and
 predicate-lock payloads.

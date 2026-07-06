@@ -176,6 +176,120 @@ int show_preserve_trx_phase2_snapshot_write_us(THD *thd, SHOW_VAR *var,
 int show_preserve_trx_phase2_register_us(THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_phase2_slo_miss_count(THD *thd, SHOW_VAR *var,
                                             char *buf);
+int show_preserve_trx_resume_total_us(THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_elapsed_us(THD *thd, SHOW_VAR *var,
+                                                  char *buf);
+int show_preserve_trx_startup_recovery_error(THD *thd, SHOW_VAR *var,
+                                             char *buf);
+int show_preserve_trx_startup_recovery_snapshot_tokens(THD *thd,
+                                                       SHOW_VAR *var,
+                                                       char *buf);
+int show_preserve_trx_startup_recovery_local_snapshot_tokens(THD *thd,
+                                                             SHOW_VAR *var,
+                                                             char *buf);
+int show_preserve_trx_startup_recovery_binlog_cache_tokens(THD *thd,
+                                                           SHOW_VAR *var,
+                                                           char *buf);
+int show_preserve_trx_startup_recovery_tainted_tokens(THD *thd, SHOW_VAR *var,
+                                                      char *buf);
+int show_preserve_trx_startup_recovery_standby_pending_tokens(THD *thd,
+                                                              SHOW_VAR *var,
+                                                              char *buf);
+int show_preserve_trx_startup_recovery_promotion_intent_tokens(THD *thd,
+                                                               SHOW_VAR *var,
+                                                               char *buf);
+int show_preserve_trx_startup_recovery_orphan_rollback_count(THD *thd,
+                                                             SHOW_VAR *var,
+                                                             char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_load_us(THD *thd,
+                                                              SHOW_VAR *var,
+                                                              char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_validate_us(THD *thd,
+                                                                  SHOW_VAR *var,
+                                                                  char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_kernel_us(THD *thd,
+                                                                SHOW_VAR *var,
+                                                                char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_claim_us(THD *thd,
+                                                               SHOW_VAR *var,
+                                                               char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_read_view_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_table_locks_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_record_locks_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_record_lock_entries(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_record_lock_stable_page_hits(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_record_lock_image_resolves(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_pages(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_bits(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_count(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_record_lock_table_open_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_pages(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_bytes(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_residency_pages(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_resident_pages(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_io_pending_pages(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_missing_pages(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_predicate_locks_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_mdl_us(THD *thd,
+                                                             SHOW_VAR *var,
+                                                             char *buf);
+int show_preserve_trx_startup_recovery_phase_snapshot_register_us(THD *thd,
+                                                                  SHOW_VAR *var,
+                                                                  char *buf);
+int show_preserve_trx_promotion_gate_elapsed_us(THD *thd, SHOW_VAR *var,
+                                                char *buf);
+int show_preserve_trx_promotion_gate_token_count(THD *thd, SHOW_VAR *var,
+                                                 char *buf);
+int show_preserve_trx_promotion_gate_adopted_count(THD *thd, SHOW_VAR *var,
+                                                   char *buf);
+int show_preserve_trx_promotion_gate_abandoned_count(THD *thd, SHOW_VAR *var,
+                                                     char *buf);
+int show_preserve_trx_promotion_gate_skipped_count(THD *thd, SHOW_VAR *var,
+                                                   char *buf);
+int show_preserve_trx_promotion_gate_max_worker_elapsed_us(THD *thd,
+                                                           SHOW_VAR *var,
+                                                           char *buf);
+int show_preserve_trx_promotion_gate_p50_worker_elapsed_us(THD *thd,
+                                                           SHOW_VAR *var,
+                                                           char *buf);
+int show_preserve_trx_promotion_gate_p95_worker_elapsed_us(THD *thd,
+                                                           SHOW_VAR *var,
+                                                           char *buf);
+int show_preserve_trx_promotion_gate_status_code(THD *thd, SHOW_VAR *var,
+                                                 char *buf);
+int show_preserve_trx_promotion_gate_record_lock_page_count(THD *thd,
+                                                            SHOW_VAR *var,
+                                                            char *buf);
+int show_preserve_trx_promotion_gate_record_lock_resident_pages(THD *thd,
+                                                                SHOW_VAR *var,
+                                                                char *buf);
+int show_preserve_trx_promotion_gate_record_lock_cold_page_gets(THD *thd,
+                                                                SHOW_VAR *var,
+                                                                char *buf);
+int show_preserve_trx_promotion_gate_ready_cache_miss_count(THD *thd,
+                                                            SHOW_VAR *var,
+                                                            char *buf);
+int show_preserve_trx_promotion_gate_over_budget_count(THD *thd, SHOW_VAR *var,
+                                                       char *buf);
 int show_preserve_trx_lock_warmcopy_phase2_pause_us(THD *thd, SHOW_VAR *var,
                                                     char *buf);
 int show_preserve_trx_lock_warmcopy_spill_bytes(THD *thd, SHOW_VAR *var,

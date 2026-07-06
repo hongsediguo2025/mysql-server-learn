@@ -24,7 +24,9 @@ as published by the Free Software Foundation.
 #include <chrono>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -32,10 +34,12 @@ as published by the Free Software Foundation.
 #include "btr0btr.h"
 #include "btr0pcur.h"
 #include "buf0buf.h"
+#include "buf0rea.h"
 #include "current_thd.h"
 #include "debug_sync.h"
 #include "dict0dd.h"
 #include "dict0mem.h"
+#include "fil0fil.h"
 #include "ha_prototypes.h"
 #include "lock0lock.h"
 #include "lock0priv.h"
@@ -52,6 +56,14 @@ void lock_preserve_add_record_lock_for_import(ulint type_mode,
                                               ulint heap_no,
                                               dict_index_t *index,
                                               trx_t *trx);
+bool lock_preserve_add_record_bitmap_for_import(ulint type_mode,
+                                                const buf_block_t *block,
+                                                uint32_t n_bits,
+                                                const byte *bitmap,
+                                                size_t bitmap_len,
+                                                uint32_t first_set_heap_no,
+                                                dict_index_t *index,
+                                                trx_t *trx);
 dberr_t lock_preserve_create_table_lock_for_import(dict_table_t *table,
                                                    trx_t *trx,
                                                    lock_mode mode);
@@ -61,9 +73,12 @@ dberr_t lock_preserve_convert_impl_to_expl_for_materialize(
     bool allow_conversion);
 const lock_t *lock_preserve_record_lock_has_conflict(
     ulint precise_mode, const buf_block_t *block, ulint heap_no, trx_t *trx);
+bool lock_preserve_record_lock_object_has_conflict(
+    ulint precise_mode, const lock_t *lock, bool lock_is_on_supremum,
+    trx_t *trx);
 trx_t *lock_preserve_secondary_record_implicit_owner(const rec_t *rec,
-                                                    dict_index_t *index,
-                                                    const ulint *offsets);
+                                                     dict_index_t *index,
+                                                     const ulint *offsets);
 
 static thread_local const char *lock_preserve_record_export_error = nullptr;
 
@@ -177,6 +192,9 @@ struct Preserve_record_lock_entry {
   std::string heap_offsets;
   std::string record_images;
   std::string bitmap;
+  uint32_t set_bits{0};
+  uint32_t first_set_heap_no{UINT32_MAX};
+  uint32_t max_set_heap_no{UINT32_MAX};
 };
 
 static bool lock_preserve_entry_is_predicate(
@@ -184,11 +202,10 @@ static bool lock_preserve_entry_is_predicate(
   return lock_preserve_type_mode_is_predicate(entry.type_mode);
 }
 
-static uint32_t lock_preserve_bitmap_set_bit_count(
-    const Preserve_record_lock_entry &entry);
-
 static bool lock_preserve_bitmap_get_nth_bit(const std::string &bitmap,
                                              uint32_t heap_no);
+static bool lock_preserve_refresh_bitmap_stats(
+    Preserve_record_lock_entry *entry);
 
 static constexpr uint32_t kLockPreservePredicateMbrLength =
     sizeof(double) * 4;
@@ -352,7 +369,11 @@ static bool lock_preserve_read_record_lock(
   entry->bitmap.assign(payload.data() + *offset, bitmap_len);
   *offset += bitmap_len;
 
-  const uint32_t set_bits = lock_preserve_bitmap_set_bit_count(*entry);
+  if (!lock_preserve_refresh_bitmap_stats(entry)) {
+    return true;
+  }
+
+  const uint32_t set_bits = entry->set_bits;
   if (set_bits == 0) {
     return true;
   }
@@ -374,9 +395,15 @@ static bool lock_preserve_read_record_lock(
   }
 
   if (entry->heap_offsets.empty() || entry->heap_offsets.size() % 4 != 0 ||
-      entry->record_images.empty() ||
-      entry->heap_offsets.size() != static_cast<size_t>(set_bits) * 4 ||
-      !lock_preserve_record_images_payload_is_valid(entry->record_images,
+      entry->heap_offsets.size() != static_cast<size_t>(set_bits) * 4) {
+    return true;
+  }
+
+  if (entry->record_images.empty()) {
+    return false;
+  }
+
+  if (!lock_preserve_record_images_payload_is_valid(entry->record_images,
                                                     set_bits)) {
     return true;
   }
@@ -389,6 +416,42 @@ static bool lock_preserve_bitmap_get_nth_bit(const std::string &bitmap,
   return (static_cast<unsigned char>(bitmap[heap_no / 8]) >>
           (heap_no & 0x7)) &
          0x1;
+}
+
+static bool lock_preserve_refresh_bitmap_stats(
+    Preserve_record_lock_entry *entry) {
+  if (entry == nullptr || entry->n_bits == 0 || entry->bitmap.empty() ||
+      entry->bitmap.size() > UINT32_MAX / 8 ||
+      entry->n_bits != static_cast<uint32_t>(entry->bitmap.size() * 8)) {
+    return false;
+  }
+
+  entry->set_bits = 0;
+  entry->first_set_heap_no = UINT32_MAX;
+  entry->max_set_heap_no = UINT32_MAX;
+
+  for (uint32_t byte_no = 0;
+       byte_no < static_cast<uint32_t>(entry->bitmap.size()); ++byte_no) {
+    const unsigned char bits =
+        static_cast<unsigned char>(entry->bitmap[byte_no]);
+    if (bits == 0) continue;
+
+    for (uint32_t bit_no = 0; bit_no < 8; ++bit_no) {
+      if ((bits & (1U << bit_no)) == 0) continue;
+
+      const uint32_t heap_no = byte_no * 8U + bit_no;
+      if (heap_no >= entry->n_bits || entry->set_bits == UINT32_MAX) {
+        return false;
+      }
+      if (entry->first_set_heap_no == UINT32_MAX) {
+        entry->first_set_heap_no = heap_no;
+      }
+      entry->max_set_heap_no = heap_no;
+      ++entry->set_bits;
+    }
+  }
+
+  return entry->set_bits != 0;
 }
 
 static std::string lock_preserve_export_record_bitmap(const lock_t *lock) {
@@ -408,33 +471,13 @@ static std::string lock_preserve_export_record_bitmap(const lock_t *lock) {
 
 static bool lock_preserve_bitmap_has_set_bit(
     const Preserve_record_lock_entry &entry) {
-  for (uint32_t heap_no = 0; heap_no < entry.n_bits; ++heap_no) {
-    if (lock_preserve_bitmap_get_nth_bit(entry.bitmap, heap_no)) return true;
-  }
-  return false;
-}
-
-static uint32_t lock_preserve_bitmap_set_bit_count(
-    const Preserve_record_lock_entry &entry) {
-  uint32_t count = 0;
-  for (uint32_t heap_no = 0; heap_no < entry.n_bits; ++heap_no) {
-    if (lock_preserve_bitmap_get_nth_bit(entry.bitmap, heap_no)) ++count;
-  }
-  return count;
+  return entry.set_bits != 0;
 }
 
 static bool lock_preserve_bitmap_matches_page(
     const Preserve_record_lock_entry &entry, const page_t *page) {
   const uint16_t n_heap = page_dir_get_n_heap(page);
-
-  for (uint32_t heap_no = 0; heap_no < entry.n_bits; ++heap_no) {
-    if (lock_preserve_bitmap_get_nth_bit(entry.bitmap, heap_no) &&
-        heap_no >= n_heap) {
-      return false;
-    }
-  }
-
-  return true;
+  return entry.max_set_heap_no != UINT32_MAX && entry.max_set_heap_no < n_heap;
 }
 
 static bool lock_preserve_record_image_field_is_stable(
@@ -595,8 +638,43 @@ bool lock_warmcopy_capture_record_image_for_lock(
   }
 
   return lock_warmcopy_record_bitmap_set_with_image_for_lock(
-      lock, static_cast<uint32_t>(heap_no), static_cast<uint32_t>(heap_no),
-      encoded_record_image);
+      lock, block, static_cast<uint32_t>(heap_no),
+      static_cast<uint32_t>(heap_no), encoded_record_image);
+}
+
+bool lock_warmcopy_refresh_record_image_after_update(
+    trx_t *trx, const dict_index_t *index, const buf_block_t *block,
+    uint32_t heap_no) {
+  if (!lock_warmcopy_hooks_enabled()) return true;
+  /*
+    A record lock bit can remain unchanged while the owning transaction updates
+    the record contents after phase-1 warmcopy captured its image. Refreshing
+    the image after the page mutation keeps the mirror payload aligned with the
+    bytes that startup import will see after restart.
+  */
+  if (trx == nullptr || index == nullptr || block == nullptr) return false;
+
+  const rec_t *rec = page_find_rec_with_heap_no(block->frame, heap_no);
+  if (rec == nullptr) {
+    lock_warmcopy_record_hook_event();
+    return false;
+  }
+
+  std::string encoded_record_image;
+  if (page_rec_is_user_rec(rec)) {
+    if (!lock_preserve_append_record_image(index, rec,
+                                           &encoded_record_image)) {
+      lock_warmcopy_record_hook_event();
+      return false;
+    }
+  } else if (!lock_preserve_append_pseudo_record_image(
+                 heap_no, &encoded_record_image)) {
+    lock_warmcopy_record_hook_event();
+    return false;
+  }
+
+  return lock_warmcopy_record_store_refresh_record_image_for_trx(
+      trx, index, block, heap_no, heap_no, encoded_record_image);
 }
 
 static bool lock_preserve_build_record_identity(
@@ -667,10 +745,18 @@ static bool lock_preserve_build_record_identity(
   return true;
 }
 
-static uint32_t lock_preserve_rounded_record_n_bits(uint32_t min_bits) {
-  if (min_bits == 0) return 8;
-  if (min_bits > UINT32_MAX - 7) return UINT32_MAX & ~7U;
-  return (min_bits + 7U) & ~7U;
+static bool lock_preserve_build_stable_heap_identity(
+    const Preserve_record_lock_entry &entry, std::string *heap_offsets) {
+  if (heap_offsets == nullptr) return false;
+
+  heap_offsets->clear();
+  for (uint32_t heap_no = 0; heap_no < entry.n_bits; ++heap_no) {
+    if (lock_preserve_bitmap_get_nth_bit(entry.bitmap, heap_no)) {
+      lock_preserve_append_le32(heap_offsets, heap_no);
+    }
+  }
+
+  return !heap_offsets->empty();
 }
 
 static bool lock_preserve_build_current_record_image_map(
@@ -701,14 +787,82 @@ static bool lock_preserve_build_current_record_image_map(
   return true;
 }
 
+static bool lock_preserve_can_use_stable_page_heap_identity(
+    const Preserve_record_lock_entry &entry, const page_t *page,
+    uint32_t set_bits) {
+  if (lock_preserve_entry_is_predicate(entry)) return false;
+  if (!entry.record_images.empty()) return false;
+
+  /*
+    Compact phase-1 warmcopy payloads intentionally omit record images.  They
+    are valid only for the native record-lock identity that InnoDB actually
+    stores: a page plus heap-number bitmap.  The page LSN and n_heap captured in
+    the payload are diagnostic context, not durable identity; the target
+    transaction can keep DML'ing after phase-1 capture, changing both values
+    while the locked heap slots remain valid.  Recovery therefore checks only
+    that every locked heap bit still names an existing slot on the same page.
+
+    Payloads with record images always use the slower image-based resolver so
+    recovery still detects stale or corrupted record images.
+  */
+  if (entry.heap_offsets.size() != static_cast<size_t>(set_bits) * 4 ||
+      !lock_preserve_bitmap_matches_page(entry, page)) {
+    return false;
+  }
+
+  return true;
+}
+
+static bool lock_preserve_build_page_sized_record_bitmap(
+    const Preserve_record_lock_entry &entry, const page_t *page,
+    Preserve_record_lock_entry *resolved_entry) {
+  if (resolved_entry == nullptr) return false;
+
+  const size_t current_bitmap_bytes =
+      1 + ((page_dir_get_n_heap(page) + LOCK_PAGE_BITMAP_MARGIN) / 8);
+  if (current_bitmap_bytes == 0 || current_bitmap_bytes > UINT32_MAX / 8) {
+    lock_preserve_set_record_export_error(
+        "record_lock_identity_current_bitmap_too_large");
+    return false;
+  }
+
+  /*
+    A record lock_t keeps the bitmap size from the moment that lock_t was
+    created.  The page can later grow in the same transaction or by compatible
+    inserts, so startup import must allocate a lock_t sized for the current page
+    and copy the proven locked heap bits into it.  The identity proof above has
+    already checked every set bit still names an existing record on this page;
+    the zero-filled tail only represents records that were not locked by the
+    preserved transaction.
+  */
+  *resolved_entry = entry;
+  resolved_entry->n_bits = static_cast<uint32_t>(current_bitmap_bytes * 8);
+  resolved_entry->bitmap.assign(current_bitmap_bytes, '\0');
+  const size_t copy_bytes =
+      std::min(entry.bitmap.size(), resolved_entry->bitmap.size());
+  if (copy_bytes > 0) {
+    memcpy(&resolved_entry->bitmap[0], entry.bitmap.data(), copy_bytes);
+  }
+  return lock_preserve_refresh_bitmap_stats(resolved_entry);
+}
+
 static bool lock_preserve_resolve_record_identity(
     const Preserve_record_lock_entry &entry, const dict_index_t *index,
-    const page_t *page, Preserve_record_lock_entry *resolved_entry) {
+    const page_t *page, Preserve_record_lock_entry *resolved_entry,
+    trx_preserve_record_lock_import_metrics_t *metrics) {
   if (resolved_entry == nullptr || lock_preserve_entry_is_predicate(entry)) {
     return false;
   }
 
-  const uint32_t set_bits = lock_preserve_bitmap_set_bit_count(entry);
+  const uint32_t set_bits = entry.set_bits;
+  if (lock_preserve_can_use_stable_page_heap_identity(entry, page, set_bits)) {
+    if (metrics != nullptr) ++metrics->stable_page_hits;
+    return lock_preserve_build_page_sized_record_bitmap(entry, page,
+                                                        resolved_entry);
+  }
+
+  if (metrics != nullptr) ++metrics->image_resolves;
+
   std::vector<std::string> image_slots;
   if (!lock_preserve_record_image_slots(entry.record_images, set_bits,
                                         &image_slots)) {
@@ -784,10 +938,29 @@ static bool lock_preserve_resolve_record_identity(
     return false;
   }
 
+  const size_t current_bitmap_bytes =
+      1 + ((page_dir_get_n_heap(page) + LOCK_PAGE_BITMAP_MARGIN) / 8);
+  if (current_bitmap_bytes == 0 || current_bitmap_bytes > UINT32_MAX / 8) {
+    lock_preserve_set_record_export_error(
+        "record_lock_identity_current_bitmap_too_large");
+    return false;
+  }
+
   *resolved_entry = entry;
-  resolved_entry->n_bits = lock_preserve_rounded_record_n_bits(
-      std::max(entry.n_bits, max_heap_no + 1));
-  resolved_entry->bitmap.assign(resolved_entry->n_bits / 8U, '\0');
+  resolved_entry->n_bits = static_cast<uint32_t>(current_bitmap_bytes * 8);
+  if (max_heap_no >= resolved_entry->n_bits) {
+    lock_preserve_set_record_export_error(
+        "record_lock_identity_resolved_heap_out_of_range");
+    return false;
+  }
+  /*
+    Image-based identity can move locks to different heap numbers after page
+    changes.  The imported lock_t must still use the bitmap capacity that
+    InnoDB would allocate for the current page; otherwise the final adopt helper
+    rejects the proven lock because the payload-sized bitmap is not the native
+    lock_t bitmap size.
+  */
+  resolved_entry->bitmap.assign(current_bitmap_bytes, '\0');
   resolved_entry->heap_offsets.clear();
 
   for (uint32_t heap_no : resolved_heap_nos) {
@@ -797,7 +970,7 @@ static bool lock_preserve_resolve_record_identity(
     lock_preserve_append_le32(&resolved_entry->heap_offsets, heap_no);
   }
 
-  return true;
+  return lock_preserve_refresh_bitmap_stats(resolved_entry);
 }
 
 static bool lock_preserve_build_predicate_page_identity(
@@ -860,7 +1033,7 @@ static void lock_preserve_log_record_identity_mismatch(
              << " page_no=" << entry.page_no
              << " type_mode=" << entry.type_mode
              << " n_bits=" << entry.n_bits
-             << " set_bits=" << lock_preserve_bitmap_set_bit_count(entry)
+             << " set_bits=" << entry.set_bits
              << " page_lsn=" << entry.page_lsn
              << " current_page_lsn=" << mach_read_from_8(page + FIL_PAGE_LSN)
              << " page_n_heap=" << entry.page_n_heap
@@ -881,8 +1054,6 @@ static void lock_preserve_log_record_identity_mismatch(
 static bool lock_preserve_page_identity_matches(
     const Preserve_record_lock_entry &entry, const dict_index_t *index,
     const page_t *page) {
-  const uint64_t current_page_lsn = mach_read_from_8(page + FIL_PAGE_LSN);
-
   if (lock_preserve_entry_is_predicate(entry)) {
     /* Predicate locks are page-scoped pseudo-record locks. Their identity is
     the index page plus the serialized predicate MBR/op. New snapshots also
@@ -907,16 +1078,20 @@ static bool lock_preserve_page_identity_matches(
     for ordinary record-lock recovery.
   */
   if (entry.heap_offsets.size() !=
-      static_cast<size_t>(lock_preserve_bitmap_set_bit_count(entry)) * 4) {
+      static_cast<size_t>(entry.set_bits) * 4) {
     lock_preserve_set_record_export_error(
         "record_lock_identity_heap_payload_invalid");
     return false;
   }
+
+  const uint32_t set_bits = entry.set_bits;
+  if (entry.record_images.empty()) {
+    return lock_preserve_can_use_stable_page_heap_identity(entry, page,
+                                                           set_bits);
+  }
+
   std::string current_heap_offsets;
   std::string current_record_images;
-  if (current_page_lsn != entry.page_lsn && entry.record_images.empty()) {
-    return false;
-  }
 
   if (!lock_preserve_build_record_identity(entry, index, page,
                                            &current_heap_offsets,
@@ -975,6 +1150,107 @@ class Lock_preserve_table_handle {
   THD *m_thd{nullptr};
   MDL_ticket *m_mdl{nullptr};
   dict_table_t *m_table{nullptr};
+};
+
+struct Lock_preserve_index_cache_key {
+  table_id_t table_id;
+  space_index_t index_id;
+
+  bool operator==(const Lock_preserve_index_cache_key &other) const {
+    return table_id == other.table_id && index_id == other.index_id;
+  }
+};
+
+struct Lock_preserve_index_cache_key_hash {
+  size_t operator()(const Lock_preserve_index_cache_key &key) const {
+    return std::hash<uint64_t>{}(static_cast<uint64_t>(key.table_id)) ^
+           (std::hash<uint64_t>{}(static_cast<uint64_t>(key.index_id)) << 1);
+  }
+};
+
+class Lock_preserve_import_context {
+ public:
+  dict_table_t *get_table(table_id_t table_id,
+                          trx_preserve_record_lock_import_metrics_t *metrics,
+                          const char *open_error,
+                          const char *unavailable_error, dberr_t *err) {
+    ut_ad(err != nullptr);
+    *err = DB_SUCCESS;
+
+    auto found = m_tables.find(table_id);
+    if (found == m_tables.end()) {
+      const auto table_open_started_at = std::chrono::steady_clock::now();
+      std::unique_ptr<Lock_preserve_table_handle> handle(
+          new Lock_preserve_table_handle(table_id));
+      if (metrics != nullptr) {
+        metrics->table_open_us +=
+            static_cast<uint64_t>(std::chrono::duration_cast<
+                                  std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() -
+                                      table_open_started_at)
+                                      .count());
+      }
+      found = m_tables.emplace(table_id, std::move(handle)).first;
+    }
+
+    dict_table_t *table = found->second->get();
+    if (table == nullptr) {
+      lock_preserve_set_record_export_error(open_error);
+      *err = DB_TABLE_NOT_FOUND;
+      return nullptr;
+    }
+
+    if (table->ibd_file_missing || table->is_temporary()) {
+      lock_preserve_set_record_export_error(unavailable_error);
+      *err = DB_TABLE_NOT_FOUND;
+      return nullptr;
+    }
+
+    return table;
+  }
+
+  dict_index_t *get_index(const Preserve_record_lock_entry &entry,
+                          trx_preserve_record_lock_import_metrics_t *metrics,
+                          const char *table_open_error,
+                          const char *table_unavailable_error,
+                          const char *index_error, dberr_t *err) {
+    ut_ad(err != nullptr);
+    *err = DB_SUCCESS;
+
+    const Lock_preserve_index_cache_key key{entry.table_id, entry.index_id};
+    auto found = m_indexes.find(key);
+    if (found != m_indexes.end()) {
+      dict_index_t *index = found->second;
+      if (index == nullptr || index->space != entry.space_id) {
+        lock_preserve_set_record_export_error(index_error);
+        *err = DB_ERROR;
+        return nullptr;
+      }
+      return index;
+    }
+
+    dict_table_t *table =
+        get_table(entry.table_id, metrics, table_open_error,
+                  table_unavailable_error, err);
+    if (*err != DB_SUCCESS) return nullptr;
+
+    dict_index_t *index = lock_preserve_find_index(table, entry.index_id);
+    if (index == nullptr || index->space != entry.space_id) {
+      lock_preserve_set_record_export_error(index_error);
+      *err = DB_ERROR;
+      return nullptr;
+    }
+
+    m_indexes.emplace(key, index);
+    return index;
+  }
+
+ private:
+  std::unordered_map<table_id_t, std::unique_ptr<Lock_preserve_table_handle>>
+      m_tables;
+  std::unordered_map<Lock_preserve_index_cache_key, dict_index_t *,
+                     Lock_preserve_index_cache_key_hash>
+      m_indexes;
 };
 
 static bool lock_preserve_export_predicate_payload(
@@ -1041,7 +1317,7 @@ static bool lock_preserve_trx_has_matching_record_lock(
 }
 
 static dberr_t lock_preserve_capture_page_identity(
-    trx_t *trx, Preserve_record_lock_entry *entry) {
+    trx_t *trx, Preserve_record_lock_entry *entry, bool stable_page_only) {
   dict_table_t *table =
       dd_table_open_on_id(entry->table_id, nullptr, nullptr, false, true);
 
@@ -1128,6 +1404,21 @@ static dberr_t lock_preserve_capture_page_identity(
     return DB_SUCCESS;
   }
 
+  if (stable_page_only) {
+    if (!lock_preserve_build_stable_heap_identity(*entry,
+                                                  &entry->heap_offsets)) {
+      lock_preserve_set_record_export_error(
+          "record_lock_stable_page_identity_build_failed");
+      mtr_commit(&mtr);
+      dd_table_close(table, nullptr, nullptr, false);
+      return DB_ERROR;
+    }
+    entry->record_images.clear();
+    mtr_commit(&mtr);
+    dd_table_close(table, nullptr, nullptr, false);
+    return DB_SUCCESS;
+  }
+
   if (!lock_preserve_build_record_identity(
           *entry, index, block->frame, &entry->heap_offsets,
           &entry->record_images)) {
@@ -1183,8 +1474,9 @@ static uint32_t lock_preserve_count_live_record_bits(const lock_t *lock) {
   return count;
 }
 
-dberr_t lock_preserve_export_record_locks(trx_t *trx, std::string *payload,
-                                          uint32_t max_lock_count) {
+static dberr_t lock_preserve_export_record_locks_low(
+    trx_t *trx, std::string *payload, uint32_t max_lock_count,
+    bool stable_page_only) {
   lock_preserve_set_record_export_error(nullptr);
   if (trx == nullptr || payload == nullptr) {
     lock_preserve_set_record_export_error("record_lock_export_invalid_argument");
@@ -1252,6 +1544,13 @@ dberr_t lock_preserve_export_record_locks(trx_t *trx, std::string *payload,
       entry.type_mode = lock->type_mode;
       entry.n_bits = lock_rec_get_n_bits(lock);
       entry.bitmap = lock_preserve_export_record_bitmap(lock);
+      if (!lock_preserve_refresh_bitmap_stats(&entry)) {
+        lock_preserve_set_record_export_error(
+            "record_lock_export_bitmap_stats_failed");
+        trx_mutex_exit(trx);
+        payload->clear();
+        return DB_UNSUPPORTED;
+      }
       if (lock_preserve_entry_is_predicate(entry) &&
           !lock_preserve_export_predicate_payload(lock, &entry.record_images)) {
         lock_preserve_set_record_export_error(
@@ -1267,7 +1566,8 @@ dberr_t lock_preserve_export_record_locks(trx_t *trx, std::string *payload,
   }
 
   for (Preserve_record_lock_entry &entry : entries) {
-    const dberr_t err = lock_preserve_capture_page_identity(trx, &entry);
+    const dberr_t err =
+        lock_preserve_capture_page_identity(trx, &entry, stable_page_only);
     if (err != DB_SUCCESS) {
       if (lock_preserve_last_record_lock_export_error() == nullptr) {
         lock_preserve_set_record_export_error("record_lock_identity_drift");
@@ -1304,6 +1604,18 @@ dberr_t lock_preserve_export_record_locks(trx_t *trx, std::string *payload,
   return DB_SUCCESS;
 }
 
+dberr_t lock_preserve_export_record_locks(trx_t *trx, std::string *payload,
+                                          uint32_t max_lock_count) {
+  return lock_preserve_export_record_locks_low(trx, payload, max_lock_count,
+                                               false);
+}
+
+dberr_t lock_preserve_export_record_locks_stable_page_only(
+    trx_t *trx, std::string *payload, uint32_t max_lock_count) {
+  return lock_preserve_export_record_locks_low(trx, payload, max_lock_count,
+                                               true);
+}
+
 static bool lock_preserve_parse_predicate_payload(
     const Preserve_record_lock_entry &entry, uint16_t *op, rtr_mbr_t *mbr) {
   ut_ad(entry.type_mode & LOCK_PREDICATE);
@@ -1334,17 +1646,85 @@ static ulint lock_preserve_record_precise_mode(uint32_t type_mode) {
   return type_mode & ~(LOCK_TYPE_MASK | LOCK_WAIT);
 }
 
+static bool lock_preserve_page_has_record_locks(const buf_block_t *block) {
+  ut_ad(block != nullptr);
+  ut_ad(locksys::owns_page_shard(block->get_page_id()));
+
+  const page_id_t page_id = block->get_page_id();
+  hash_cell_t *cell = hash_get_nth_cell(
+      lock_sys->rec_hash, hash_calc_hash(lock_rec_fold(page_id),
+                                         lock_sys->rec_hash));
+  for (lock_t *lock = static_cast<lock_t *>(cell->node); lock != nullptr;
+       lock = static_cast<lock_t *>(lock->hash)) {
+    ut_ad(lock->is_record_lock());
+    if (lock->rec_lock.page_id == page_id) return true;
+  }
+
+  return false;
+}
+
+static bool lock_preserve_bitmap_intersects_lock(
+    const Preserve_record_lock_entry &entry, const lock_t *lock,
+    bool *lock_is_on_supremum) {
+  if (lock_is_on_supremum == nullptr || lock == nullptr ||
+      lock_get_type_low(lock) != LOCK_REC) {
+    return false;
+  }
+
+  *lock_is_on_supremum = false;
+  const uint32_t lock_n_bits = static_cast<uint32_t>(lock_rec_get_n_bits(lock));
+  const size_t bitmap_len =
+      std::min(entry.bitmap.size(), static_cast<size_t>(lock_n_bits / 8U));
+  const byte *lock_bitmap = reinterpret_cast<const byte *>(&lock[1]);
+  bool intersects = false;
+  bool has_non_supremum = false;
+
+  for (size_t i = 0; i < bitmap_len; ++i) {
+    unsigned char bits = static_cast<unsigned char>(entry.bitmap[i]) &
+                         static_cast<unsigned char>(lock_bitmap[i]);
+    if (bits == 0) continue;
+
+    intersects = true;
+    if (i == (PAGE_HEAP_NO_SUPREMUM / 8U)) {
+      bits = static_cast<unsigned char>(
+          bits & ~(1U << (PAGE_HEAP_NO_SUPREMUM & 0x7)));
+    }
+    if (bits != 0) {
+      has_non_supremum = true;
+      break;
+    }
+  }
+
+  *lock_is_on_supremum = intersects && !has_non_supremum;
+  return intersects;
+}
+
 static bool lock_preserve_record_entry_has_conflict(
     trx_t *trx, const Preserve_record_lock_entry &entry,
     const buf_block_t *block) {
   ut_ad(locksys::owns_page_shard(block->get_page_id()));
   ut_ad(!lock_preserve_entry_is_predicate(entry));
 
+  if (!lock_preserve_page_has_record_locks(block)) return false;
+
   const ulint precise_mode = lock_preserve_record_precise_mode(entry.type_mode);
-  for (uint32_t heap_no = 0; heap_no < entry.n_bits; ++heap_no) {
-    if (!lock_preserve_bitmap_get_nth_bit(entry.bitmap, heap_no)) continue;
-    if (lock_preserve_record_lock_has_conflict(precise_mode, block, heap_no,
-                                               trx) != nullptr) {
+  const page_id_t page_id = block->get_page_id();
+  hash_cell_t *cell = hash_get_nth_cell(
+      lock_sys->rec_hash, hash_calc_hash(lock_rec_fold(page_id),
+                                         lock_sys->rec_hash));
+  for (lock_t *lock = static_cast<lock_t *>(cell->node); lock != nullptr;
+       lock = static_cast<lock_t *>(lock->hash)) {
+    ut_ad(lock->is_record_lock());
+    if (lock->rec_lock.page_id != page_id) continue;
+
+    bool lock_is_on_supremum = false;
+    if (!lock_preserve_bitmap_intersects_lock(entry, lock,
+                                             &lock_is_on_supremum)) {
+      continue;
+    }
+
+    if (lock_preserve_record_lock_object_has_conflict(
+            precise_mode, lock, lock_is_on_supremum, trx)) {
       return true;
     }
   }
@@ -1381,7 +1761,7 @@ static dberr_t lock_preserve_import_predicate_lock(
   dict_index_t *index = lock_preserve_find_index(table, entry.index_id);
   if (index == nullptr || index->space != entry.space_id ||
       index->is_clustered() || !dict_index_is_spatial(index) ||
-      lock_preserve_bitmap_set_bit_count(entry) != 1 ||
+      entry.set_bits != 1 ||
       !lock_preserve_bitmap_get_nth_bit(entry.bitmap, PRDT_HEAPNO)) {
     return DB_ERROR;
   }
@@ -1447,29 +1827,23 @@ static dberr_t lock_preserve_import_predicate_lock(
 }
 
 static dberr_t lock_preserve_import_record_lock(
-    trx_t *trx, const Preserve_record_lock_entry &entry) {
+    trx_t *trx, const Preserve_record_lock_entry &entry,
+    trx_preserve_record_lock_import_metrics_t *metrics,
+    Lock_preserve_import_context *import_context) {
   if (lock_preserve_entry_is_predicate(entry)) {
     return lock_preserve_import_predicate_lock(trx, entry);
   }
+  if (metrics != nullptr) ++metrics->record_entries;
 
-  Lock_preserve_table_handle table_handle(entry.table_id);
-  dict_table_t *table = table_handle.get();
-
-  if (table == nullptr) {
-    lock_preserve_set_record_export_error("record_lock_import_table_open_failed");
-    return DB_TABLE_NOT_FOUND;
-  }
-
-  if (table->ibd_file_missing || table->is_temporary()) {
-    lock_preserve_set_record_export_error("record_lock_import_table_unavailable");
-    return DB_TABLE_NOT_FOUND;
-  }
-
-  dict_index_t *index = lock_preserve_find_index(table, entry.index_id);
-  if (index == nullptr || index->space != entry.space_id) {
-    lock_preserve_set_record_export_error("record_lock_import_index_open_failed");
-    return DB_ERROR;
-  }
+  ut_ad(import_context != nullptr);
+  dberr_t lookup_err = DB_SUCCESS;
+  dict_index_t *index = import_context->get_index(
+      entry, metrics, "record_lock_import_table_open_failed",
+      "record_lock_import_table_unavailable",
+      "record_lock_import_index_open_failed", &lookup_err);
+  if (lookup_err != DB_SUCCESS) return lookup_err;
+  ut_ad(index != nullptr);
+  dict_table_t *table = index->table;
 
   if (!lock_preserve_bitmap_has_set_bit(entry)) {
     lock_preserve_set_record_export_error("record_lock_import_empty_bitmap");
@@ -1491,8 +1865,18 @@ static dberr_t lock_preserve_import_record_lock(
   mtr_t mtr;
   mtr_start(&mtr);
   const page_id_t page_id(entry.space_id, entry.page_no);
+  const auto page_get_started_at = std::chrono::steady_clock::now();
   buf_block_t *block =
       buf_page_get(page_id, index->get_page_size(), RW_S_LATCH, &mtr);
+  if (metrics != nullptr) {
+    ++metrics->page_get_count;
+    metrics->page_get_us +=
+        static_cast<uint64_t>(std::chrono::duration_cast<
+                              std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() -
+                                  page_get_started_at)
+                                  .count());
+  }
 
   if (block == nullptr) {
     lock_preserve_set_record_export_error("record_lock_import_page_open_failed");
@@ -1509,7 +1893,7 @@ static dberr_t lock_preserve_import_record_lock(
 
   Preserve_record_lock_entry resolved_entry;
   if (!lock_preserve_resolve_record_identity(entry, index, block->frame,
-                                             &resolved_entry)) {
+                                             &resolved_entry, metrics)) {
     if (lock_preserve_last_record_lock_export_error() == nullptr) {
       lock_preserve_set_record_export_error(
           "record_lock_import_identity_drift");
@@ -1525,13 +1909,22 @@ static dberr_t lock_preserve_import_record_lock(
         lock_preserve_record_entry_has_conflict(trx, resolved_entry, block);
     if (!has_conflict) {
       trx_mutex_enter(trx);
-      for (uint32_t heap_no = 0; heap_no < resolved_entry.n_bits; ++heap_no) {
-        if (lock_preserve_bitmap_get_nth_bit(resolved_entry.bitmap, heap_no)) {
-          lock_preserve_add_record_lock_for_import(resolved_entry.type_mode,
-                                                   block, heap_no, index, trx);
-        }
-      }
+      const bool imported = lock_preserve_add_record_bitmap_for_import(
+          resolved_entry.type_mode, block, resolved_entry.n_bits,
+          reinterpret_cast<const byte *>(resolved_entry.bitmap.data()),
+          resolved_entry.bitmap.size(), resolved_entry.first_set_heap_no, index,
+          trx);
       trx_mutex_exit(trx);
+      if (!imported) {
+        lock_preserve_set_record_export_error(
+            "record_lock_import_bitmap_adopt_failed");
+        mtr_commit(&mtr);
+        return DB_ERROR;
+      }
+      if (metrics != nullptr) {
+        ++metrics->bitmap_pages;
+        metrics->bitmap_bits += resolved_entry.set_bits;
+      }
     }
   }
 
@@ -1573,6 +1966,21 @@ static dberr_t lock_preserve_parse_record_locks_payload(
   return offset == payload.size() ? DB_SUCCESS : DB_ERROR;
 }
 
+static void lock_preserve_sort_record_lock_entries_for_import(
+    std::vector<Preserve_record_lock_entry> *entries) {
+  ut_ad(entries != nullptr);
+  std::stable_sort(
+      entries->begin(), entries->end(),
+      [](const Preserve_record_lock_entry &lhs,
+         const Preserve_record_lock_entry &rhs) {
+        if (lhs.table_id != rhs.table_id) return lhs.table_id < rhs.table_id;
+        if (lhs.index_id != rhs.index_id) return lhs.index_id < rhs.index_id;
+        if (lhs.space_id != rhs.space_id) return lhs.space_id < rhs.space_id;
+        if (lhs.page_no != rhs.page_no) return lhs.page_no < rhs.page_no;
+        return lhs.type_mode < rhs.type_mode;
+      });
+}
+
 bool lock_preserve_record_locks_payload_is_valid_for_import(
     const std::string &payload) {
   std::vector<Preserve_record_lock_entry> entries;
@@ -1594,7 +2002,7 @@ bool lock_preserve_record_locks_payload_lock_count(
   }
 
   for (const Preserve_record_lock_entry &entry : entries) {
-    const uint32_t entry_count = lock_preserve_bitmap_set_bit_count(entry);
+    const uint32_t entry_count = entry.set_bits;
     if (entry_count > UINT32_MAX - *lock_count) {
       return false;
     }
@@ -1602,6 +2010,208 @@ bool lock_preserve_record_locks_payload_lock_count(
   }
 
   return true;
+}
+
+bool lock_preserve_record_lock_payload_page_plan(
+    const std::string &payload, trx_preserve_record_lock_page_plan_t *plan) {
+  if (plan == nullptr) {
+    return false;
+  }
+
+  *plan = trx_preserve_record_lock_page_plan_t{};
+
+  std::vector<Preserve_record_lock_entry> entries;
+  if (lock_preserve_parse_record_locks_payload(payload, &entries) !=
+      DB_SUCCESS) {
+    return false;
+  }
+
+  std::vector<std::pair<space_id_t, page_no_t>> pages;
+  pages.reserve(entries.size());
+  for (const Preserve_record_lock_entry &entry : entries) {
+    if (lock_preserve_entry_is_predicate(entry)) {
+      continue;
+    }
+    pages.emplace_back(entry.space_id, entry.page_no);
+    ++plan->bitmap_pages;
+    plan->bitmap_bits += entry.set_bits;
+  }
+
+  std::sort(pages.begin(), pages.end());
+  plan->page_count = static_cast<uint64_t>(
+      std::unique(pages.begin(), pages.end()) - pages.begin());
+  return true;
+}
+
+static void lock_preserve_record_lock_pages_residency(
+    const std::vector<Preserve_record_lock_entry> &entries,
+    trx_preserve_record_lock_residency_t *residency) {
+  if (residency == nullptr) {
+    return;
+  }
+
+  std::vector<std::pair<space_id_t, page_no_t>> pages;
+  pages.reserve(entries.size());
+  for (const Preserve_record_lock_entry &entry : entries) {
+    if (!lock_preserve_entry_is_predicate(entry)) {
+      pages.emplace_back(entry.space_id, entry.page_no);
+    }
+  }
+
+  std::sort(pages.begin(), pages.end());
+  pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+  residency->page_count = static_cast<uint64_t>(pages.size());
+  if (buf_pool_ptr == nullptr) {
+    residency->missing_pages = residency->page_count;
+    return;
+  }
+
+  for (const auto &page : pages) {
+    const page_id_t page_id(page.first, page.second);
+    buf_pool_t *buf_pool = buf_pool_get(page_id);
+    rw_lock_t *hash_lock = nullptr;
+    buf_page_t *bpage =
+        buf_page_hash_get_s_locked(buf_pool, page_id, &hash_lock);
+    if (bpage == nullptr) {
+      ++residency->missing_pages;
+      continue;
+    }
+
+    const enum buf_io_fix io_fix = buf_page_get_io_fix_unlocked(bpage);
+    if (io_fix != BUF_IO_NONE) {
+      ++residency->io_pending_pages;
+    } else {
+      const enum buf_page_state state = buf_page_get_state(bpage);
+      if (state == BUF_BLOCK_FILE_PAGE || state == BUF_BLOCK_ZIP_PAGE) {
+        ++residency->resident_pages;
+      } else {
+        ++residency->missing_pages;
+      }
+    }
+    rw_lock_s_unlock(hash_lock);
+  }
+}
+
+bool lock_preserve_record_lock_payload_residency(
+    const std::string &payload,
+    trx_preserve_record_lock_residency_t *residency) {
+  if (residency == nullptr) {
+    return false;
+  }
+
+  *residency = trx_preserve_record_lock_residency_t{};
+  if (payload.empty()) {
+    return true;
+  }
+
+  std::vector<Preserve_record_lock_entry> entries;
+  if (lock_preserve_parse_record_locks_payload(payload, &entries) !=
+      DB_SUCCESS) {
+    return false;
+  }
+
+  lock_preserve_record_lock_pages_residency(entries, residency);
+  return true;
+}
+
+static dberr_t lock_preserve_prefetch_record_lock_pages_low(
+    const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics, bool wait_for_resident) {
+  if (payload.empty()) {
+    return DB_SUCCESS;
+  }
+
+  if (buf_pool_ptr == nullptr) {
+    lock_preserve_set_record_export_error(
+        "record_lock_prefetch_buffer_pool_unavailable");
+    return DB_TABLE_NOT_FOUND;
+  }
+
+  std::vector<Preserve_record_lock_entry> entries;
+  const dberr_t parse_err =
+      lock_preserve_parse_record_locks_payload(payload, &entries);
+  if (parse_err != DB_SUCCESS) {
+    lock_preserve_set_record_export_error(
+        "record_lock_prefetch_payload_parse_failed");
+    return parse_err;
+  }
+
+  std::vector<const Preserve_record_lock_entry *> record_entries;
+  record_entries.reserve(entries.size());
+  for (const Preserve_record_lock_entry &entry : entries) {
+    if (!lock_preserve_entry_is_predicate(entry)) {
+      record_entries.push_back(&entry);
+    }
+  }
+
+  std::sort(record_entries.begin(), record_entries.end(),
+            [](const Preserve_record_lock_entry *lhs,
+               const Preserve_record_lock_entry *rhs) {
+              if (lhs->space_id != rhs->space_id) {
+                return lhs->space_id < rhs->space_id;
+              }
+              if (lhs->page_no != rhs->page_no) {
+                return lhs->page_no < rhs->page_no;
+              }
+              if (lhs->table_id != rhs->table_id) {
+                return lhs->table_id < rhs->table_id;
+              }
+              return lhs->index_id < rhs->index_id;
+            });
+
+  space_id_t last_space_id = SPACE_UNKNOWN;
+  page_no_t last_page_no = FIL_NULL;
+  bool have_last_page = false;
+  Lock_preserve_import_context prefetch_context;
+  for (const Preserve_record_lock_entry *entry : record_entries) {
+    if (have_last_page && entry->space_id == last_space_id &&
+        entry->page_no == last_page_no) {
+      continue;
+    }
+    have_last_page = true;
+    last_space_id = entry->space_id;
+    last_page_no = entry->page_no;
+
+    const page_id_t page_id(entry->space_id, entry->page_no);
+    bool found = false;
+    const page_size_t page_size = fil_space_get_page_size(entry->space_id, &found);
+    if (!found) {
+      lock_preserve_set_record_export_error(
+          "record_lock_prefetch_space_unavailable");
+      return DB_TABLE_NOT_FOUND;
+    }
+    if (wait_for_resident) {
+      /*
+        Promotion prewarm is outside the service gate and must prove that the
+        gate will not perform cold record-lock page reads.  Use the normal
+        synchronous read primitive here; the startup helper below keeps the
+        lighter best-effort background read behavior.
+      */
+      (void)buf_read_page(page_id, page_size);
+      if (metrics != nullptr) {
+        ++metrics->prefetch_pages;
+        metrics->prefetch_bytes += page_size.physical();
+      }
+    } else if (buf_read_page_background(page_id, page_size, false) &&
+               metrics != nullptr) {
+      ++metrics->prefetch_pages;
+      metrics->prefetch_bytes += page_size.physical();
+    }
+  }
+
+  return DB_SUCCESS;
+}
+
+dberr_t lock_preserve_prefetch_record_lock_pages(
+    const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics) {
+  return lock_preserve_prefetch_record_lock_pages_low(payload, metrics, false);
+}
+
+dberr_t lock_preserve_prefetch_record_lock_pages_for_gate(
+    const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics) {
+  return lock_preserve_prefetch_record_lock_pages_low(payload, metrics, true);
 }
 
 static void lock_preserve_serialize_record_locks_payload(
@@ -1681,8 +2291,10 @@ static bool lock_preserve_skip_record_lock_table_resurrect() {
   return skip;
 }
 
-dberr_t lock_preserve_import_record_locks(trx_t *trx,
-                                          const std::string &payload) {
+dberr_t lock_preserve_import_record_locks(
+    trx_t *trx, const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics,
+    bool (*deadline_expired)(void *), void *deadline_ctx) {
   lock_preserve_set_record_export_error(nullptr);
   if (payload.empty()) {
     return DB_SUCCESS;
@@ -1706,7 +2318,19 @@ dberr_t lock_preserve_import_record_locks(trx_t *trx,
     lock_preserve_set_record_export_error("record_lock_import_payload_parse_failed");
     return parse_err;
   }
+  lock_preserve_sort_record_lock_entries_for_import(&entries);
 
+  auto check_deadline = [&]() {
+    if (deadline_expired != nullptr && deadline_expired(deadline_ctx)) {
+      lock_preserve_set_record_export_error(
+          "record_lock_import_deadline_expired");
+      return true;
+    }
+    return false;
+  };
+
+  uint32_t imported_entries = 0;
+  Lock_preserve_import_context import_context;
   for (Preserve_record_lock_entry &entry : entries) {
     DBUG_EXECUTE_IF("preserve_trx_corrupt_import_record_lock_identity",
                     if (!entry.record_images.empty()) {
@@ -1719,18 +2343,42 @@ dberr_t lock_preserve_import_record_locks(trx_t *trx,
                     });
     DBUG_EXECUTE_IF("preserve_trx_corrupt_import_record_lock_page_n_heap",
                     entry.page_n_heap = UINT32_MAX;);
+    DBUG_EXECUTE_IF("preserve_trx_corrupt_import_record_lock_page_lsn",
+                    entry.page_lsn ^= 0x1;);
     DBUG_EXECUTE_IF("preserve_trx_corrupt_import_predicate_page_identity",
                     if (lock_preserve_entry_is_predicate(entry)) {
                       entry.heap_offsets.assign("corrupt-page-identity");
                     });
 
-    const dberr_t err = lock_preserve_import_record_lock(trx, entry);
+    const dberr_t err =
+        lock_preserve_import_record_lock(trx, entry, metrics, &import_context);
     if (err != DB_SUCCESS) {
       return err;
+    }
+    ++imported_entries;
+    if ((imported_entries % 64) == 0) {
+      DBUG_EXECUTE_IF("preserve_trx_slow_record_lock_import_loop", {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      });
+      if (check_deadline()) {
+        return DB_INTERRUPTED;
+      }
     }
   }
 
   return DB_SUCCESS;
+}
+
+dberr_t lock_preserve_import_record_locks(
+    trx_t *trx, const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics) {
+  return lock_preserve_import_record_locks(trx, payload, metrics, nullptr,
+                                           nullptr);
+}
+
+dberr_t lock_preserve_import_record_locks(trx_t *trx,
+                                          const std::string &payload) {
+  return lock_preserve_import_record_locks(trx, payload, nullptr);
 }
 
 constexpr uint32_t kPreserveTableLockEntryStaticLength =
@@ -1771,12 +2419,7 @@ dberr_t lock_preserve_export_table_locks(trx_t *trx, std::string *payload,
     locksys::Global_exclusive_latch_guard guard{};
     trx_mutex_enter(trx);
 
-    for (const lock_t *lock = UT_LIST_GET_FIRST(trx->lock.trx_locks);
-         lock != nullptr; lock = UT_LIST_GET_NEXT(trx_locks, lock)) {
-      if (lock_get_type_low(lock) != LOCK_TABLE) {
-        continue;
-      }
-
+    for (const lock_t *lock : trx->lock.table_locks) {
       if (lock->is_waiting()) {
         trx_mutex_exit(trx);
         payload->clear();

@@ -68,7 +68,7 @@ class Local_file_preserved_trx_carrier final
       const std::string &token,
       Preserve_snapshot_remove_options options = {}) override;
   Preserved_trx_carrier_status remove_stale_tmp_files(
-      const std::string &token) override;
+      const std::string &token, bool heavy_cleanup = true) override;
   Preserved_trx_carrier_status mark_tainted(
       const std::string &token, const std::string &reason) override;
   Preserved_trx_carrier_status remove_taint(const std::string &token) override;
@@ -103,6 +103,11 @@ class Local_file_preserved_trx_carrier final
       const std::string &blob_name,
       uint64_t warmcopy_epoch,
       const Preserved_trx_external_blob_descriptor &descriptor) override;
+  Preserved_trx_carrier_status read_warm_external_blob(
+      const std::string &warmcopy_id, const std::string &blob_name,
+      uint64_t warmcopy_epoch,
+      const Preserved_trx_external_blob_descriptor &descriptor,
+      uint64_t max_bytes, Preserved_trx_external_blob *blob) override;
   Preserved_trx_carrier_status remove_warm_external_blob(
       const std::string &warmcopy_id, const std::string &blob_name) override;
 

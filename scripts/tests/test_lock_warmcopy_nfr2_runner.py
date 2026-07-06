@@ -40,6 +40,19 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
         self.assertIn("preserve-trx-lock-warmcopy-enable=ON", rendered)
         self.assertIn("max-connections=17", rendered)
 
+    def test_render_my_cnf_supports_startup_recovery_thread_override(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            build = repo / "build-release"
+            work = build / "lock-warmcopy-nfr2"
+            paths = resolve_paths(repo, build, work)
+
+            rendered = render_my_cnf(
+                paths, ServerOptions(preserve_startup_recovery_threads=16)
+            )
+
+        self.assertIn("preserve-trx-startup-recovery-threads=16", rendered)
+
     def test_skip_log_bin_common_arg_renders_no_bin_config(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir) / "repo"
@@ -278,6 +291,22 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
         self.assertEqual("1800", command[resume_timeout_index + 1])
         self.assertIn(str(output), command)
 
+    def test_full_benchmark_command_supports_startup_recovery_thread_override(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            output = Path(tmpdir) / "warmcopy-report.json"
+            paths = resolve_paths(repo, Path("build-release"), None)
+
+            command = build_full_benchmark_command(
+                paths,
+                output,
+                warmcopy_only=True,
+                preserve_startup_recovery_threads=16,
+            )
+
+        startup_index = command.index("--preserve-startup-recovery-threads")
+        self.assertEqual("16", command[startup_index + 1])
+
     def test_scaled_benchmark_command_uses_configurable_lockset_gate(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir) / "repo"
@@ -294,6 +323,7 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
                 lockset_batch_size=10,
                 cycles=2,
                 drain_interval_s=0.25,
+                business_run_before_drain_s=7.5,
                 preserve_timeout_s=300,
                 preserve_parallel_preserve_threads=32,
             )
@@ -313,6 +343,7 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
             ("--lockset-batch-size", "10"),
             ("--cycles", "2"),
             ("--drain-interval", "0.25"),
+            ("--business-run-before-drain", "7.5"),
             ("--preserve-timeout", "300"),
             ("--preserve-parallel-preserve-threads", "32"),
         ):
@@ -336,6 +367,7 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
                 lockset_batch_size=10,
                 cycles=2,
                 drain_interval_s=0.25,
+                business_run_before_drain_s=0.0,
                 preserve_timeout_s=300,
                 warmcopy_only=True,
             )

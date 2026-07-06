@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 import queue
+import struct
 import tempfile
 import threading
 import time
@@ -22,18 +23,26 @@ from pathlib import Path
 from scripts.resumable_trx_business_e2e import (
     BusinessE2ERunner,
     BusinessWorker,
+    COM_PRESERVE_TRX_TRANSFER,
     ExpectedDatabaseState,
     HarnessConfig,
     MySQLRuntime,
     OperationKind,
+    DrainTargetCounterRejectionMetrics,
     Phase2PauseSample,
     ResumeCoordinator,
+    StartupRecoveryMetrics,
+    TransferFrameType,
     WARMCOPY_TAIL_BUDGET_BYTES,
     WarmcopyDrainMetrics,
     WorkloadPlan,
+    annotate_record_lock_import_report,
     canonicalize_normalized_binlog_table_events,
     comparable_binlog_table_events,
+    encode_promotion_gate_frame,
+    encode_promotion_prewarm_frame,
     evaluate_phase2_pause_gate,
+    format_drain_target_counter_rejection,
     normalize_mysqlbinlog_table_events,
     validate_phase2_pause_samples,
     _expect_count_sum_row,
@@ -57,6 +66,35 @@ class _FakeConnection:
 
     def close(self):
         self.closed = True
+
+
+class _RawCommandConnection(_FakeConnection):
+    def __init__(self):
+        super().__init__()
+        self.sent_commands = []
+        self.ok_packets = []
+
+    def _send_cmd(self, command, argument=None):
+        self.sent_commands.append((command, argument))
+        return b"\x00"
+
+    def _handle_ok(self, packet):
+        self.ok_packets.append(packet)
+        return {"status": "ok"}
+
+
+class _FailingRawCommandConnection(_RawCommandConnection):
+    def _send_cmd(self, command, argument=None):
+        raise RuntimeError("server rejected promotion frame")
+
+
+class _ConnectorCapture:
+    def __init__(self):
+        self.kwargs = None
+
+    def connect(self, **kwargs):
+        self.kwargs = kwargs
+        return _FakeConnection()
 
 
 class _SchemaSeedCursor:
@@ -122,6 +160,27 @@ class _SchemaSeedRuntime:
         return self.connection
 
 
+def _expected_transfer_control_frame(frame_type, sequence, epoch_id, token, lsn):
+    def string_payload(value):
+        payload = value.encode("utf-8")
+        return struct.pack("<I", len(payload)) + payload
+
+    return b"PTRXFRM1" + b"".join(
+        [
+            struct.pack("<H", 3),
+            struct.pack("<H", frame_type),
+            struct.pack("<Q", sequence),
+            string_payload(epoch_id),
+            struct.pack("<Q", token),
+            string_payload(""),
+            struct.pack("<Q", lsn),
+            string_payload(""),
+            string_payload(""),
+            string_payload(""),
+        ]
+    )
+
+
 def _fake_fetch_rows(sql):
     if sql == "SELECT @@global.preserve_trx_enable":
         return [(0,)]
@@ -160,6 +219,389 @@ class _FakeRuntime:
     def connect(self, database=False, autocommit=True):
         return _FakeConnection()
 
+    def send_preserve_transfer_frame(self, conn, encoded_frame):
+        packet = conn._send_cmd(COM_PRESERVE_TRX_TRANSFER, encoded_frame)
+        return conn._handle_ok(packet)
+
+
+class RecordLockImportReportClassificationTest(unittest.TestCase):
+    def test_lock_heavy_startup_report_requires_io_breakdown_fields(self):
+        report = {
+            "scenario": "business",
+            "startup_recovery_elapsed_samples_ms": [66000.0],
+            "startup_recovery_snapshot_record_locks_samples_ms": [62000.0],
+            "startup_recovery_snapshot_record_lock_page_get_count_samples": [14421],
+        }
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "startup_recovery_snapshot_record_lock_page_get_us_samples",
+        ):
+            annotate_record_lock_import_report(
+                report, require_lock_heavy_startup_fields=True
+            )
+
+    def test_small_physical_standby_gate_is_not_full_lock_heavy_candidate(self):
+        report = {
+            "scenario": "physical_standby_promotion_gate_scaled",
+            "phase2_record_lock_count_samples": [150000],
+            "server_promotion_gate_token_count": 3,
+            "server_promotion_gate_record_lock_page_count": 342,
+            "server_promotion_gate_record_lock_resident_pages": 342,
+            "server_promotion_gate_record_lock_cold_page_gets": 0,
+            "server_promotion_gate_ready_cache_miss_count": 0,
+            "server_promotion_gate_abandoned_count": 0,
+            "server_promotion_gate_elapsed_us": 9290,
+        }
+
+        annotate_record_lock_import_report(report)
+
+        self.assertEqual(report["report_class"], "small_promotion_gate_plumbing")
+        self.assertFalse(report["lock_heavy_closure_candidate"])
+
+    def test_warm_promotion_gate_lock_heavy_candidate_requires_resident_pages(self):
+        report = {
+            "scenario": "physical_standby_promotion_gate_scaled",
+            "phase2_record_lock_count_samples": [1000000],
+            "server_promotion_gate_token_count": 3,
+            "server_promotion_gate_record_lock_page_count": 5000,
+            "server_promotion_gate_record_lock_resident_pages": 5000,
+            "server_promotion_gate_record_lock_cold_page_gets": 0,
+            "server_promotion_gate_ready_cache_miss_count": 0,
+            "server_promotion_gate_abandoned_count": 0,
+            "server_promotion_gate_elapsed_us": 850000,
+        }
+
+        annotate_record_lock_import_report(report)
+
+        self.assertEqual(report["report_class"], "warm_promotion_gate_lock_heavy")
+        self.assertTrue(report["lock_heavy_closure_candidate"])
+
+    def test_debug_apply_gate_is_not_release_candidate(self):
+        report = {
+            "scenario": "physical_standby_promotion_gate_scaled",
+            "promotion_gate_debug_apply_reached": True,
+            "phase2_record_lock_count_samples": [1000000],
+            "server_promotion_gate_token_count": 3,
+            "server_promotion_gate_record_lock_page_count": 5000,
+            "server_promotion_gate_record_lock_resident_pages": 5000,
+            "server_promotion_gate_record_lock_cold_page_gets": 0,
+            "server_promotion_gate_ready_cache_miss_count": 0,
+            "server_promotion_gate_abandoned_count": 0,
+            "server_promotion_gate_elapsed_us": 850000,
+        }
+
+        annotate_record_lock_import_report(report)
+
+        self.assertEqual(report["report_class"], "warm_promotion_gate_lock_heavy")
+        self.assertFalse(report["lock_heavy_closure_candidate"])
+        self.assertEqual(report["promotion_gate_evidence_class"],
+                         "debug_apply_simulator")
+        self.assertFalse(report["release_gate_ready"])
+
+
+class _EndpointFakeRuntime(_FakeRuntime):
+    def __init__(self):
+        super().__init__()
+        self.endpoint_calls = []
+
+    def connect_endpoint(
+        self,
+        *,
+        user,
+        password,
+        host,
+        port,
+        unix_socket=None,
+        database=None,
+        autocommit=True,
+    ):
+        self.endpoint_calls.append(
+            {
+                "user": user,
+                "password": password,
+                "host": host,
+                "port": port,
+                "unix_socket": unix_socket,
+                "database": database,
+                "autocommit": autocommit,
+            }
+        )
+        return _FakeConnection()
+
+
+class TransferPromotionFrameTest(unittest.TestCase):
+    def test_runtime_uses_pure_python_connector_for_raw_transfer_commands(self):
+        capture = _ConnectorCapture()
+        runtime = MySQLRuntime.__new__(MySQLRuntime)
+        runtime.config = HarnessConfig(user="root", unix_socket="/tmp/mysql.sock")
+        runtime.mysql_connector = capture
+
+        conn = runtime.connect(database=False)
+
+        self.assertIsInstance(conn, _FakeConnection)
+        self.assertEqual(capture.kwargs["use_pure"], True)
+
+    def test_promotion_control_frames_match_cpp_wire_layout(self):
+        self.assertEqual(COM_PRESERVE_TRX_TRANSFER, 33)
+        prewarm = encode_promotion_prewarm_frame(
+            epoch_id="epoch_7", token=1234, required_apply_lsn=987, sequence=11
+        )
+        gate = encode_promotion_gate_frame(
+            epoch_id="epoch_7", required_apply_lsn=987, sequence=12
+        )
+
+        self.assertEqual(
+            prewarm,
+            _expected_transfer_control_frame(
+                frame_type=TransferFrameType.PROMOTION_PREWARM_TOKEN,
+                sequence=11,
+                epoch_id="epoch_7",
+                token=1234,
+                lsn=987,
+            ),
+        )
+        self.assertEqual(
+            gate,
+            _expected_transfer_control_frame(
+                frame_type=TransferFrameType.PROMOTION_GATE_EPOCH,
+                sequence=12,
+                epoch_id="epoch_7",
+                token=0,
+                lsn=987,
+            ),
+        )
+
+    def test_runtime_sends_promotion_control_frame_as_transfer_com_command(self):
+        runtime = MySQLRuntime.__new__(MySQLRuntime)
+        conn = _RawCommandConnection()
+        frame = encode_promotion_gate_frame(
+            epoch_id="epoch_7", required_apply_lsn=987, sequence=12
+        )
+
+        result = runtime.send_preserve_transfer_frame(conn, frame)
+
+        self.assertEqual(result, {"status": "ok"})
+        self.assertEqual(conn.sent_commands, [(COM_PRESERVE_TRX_TRANSFER, frame)])
+        self.assertEqual(conn.ok_packets, [b"\x00"])
+
+    def test_promotion_warm_gate_simulator_sends_prewarm_then_gate_report(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "promotion-gate.json"
+            runtime = _PromotionGateStatusRuntime()
+            source_conn = _RawCommandConnection()
+            runtime.connect = lambda database=False, autocommit=True: source_conn
+            runtime.wait_until_up = mock.Mock()
+
+            runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+            runner.config = HarnessConfig(
+                promotion_gate_epoch_id="epoch_7",
+                promotion_gate_tokens=[101, 102],
+                promotion_gate_required_apply_lsn=987,
+                promotion_gate_execute=True,
+                report_json=str(report_path),
+            )
+            runner.runtime = runtime
+
+            runner.run_promotion_warm_gate_simulator()
+
+            sent_payloads = [payload for _, payload in source_conn.sent_commands]
+            self.assertEqual(
+                sent_payloads,
+                [
+                    encode_promotion_prewarm_frame(
+                        epoch_id="epoch_7",
+                        token=101,
+                        required_apply_lsn=987,
+                        sequence=1,
+                    ),
+                    encode_promotion_prewarm_frame(
+                        epoch_id="epoch_7",
+                        token=102,
+                        required_apply_lsn=987,
+                        sequence=2,
+                    ),
+                    encode_promotion_gate_frame(
+                        epoch_id="epoch_7",
+                        required_apply_lsn=987,
+                        sequence=3,
+                    ),
+                ],
+            )
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertTrue(report["success"])
+            self.assertEqual(report["scenario"], "promotion_warm_gate_simulator")
+            self.assertEqual(report["promotion_gate_token_count"], 2)
+            self.assertEqual(report["promotion_gate_execute"], True)
+            self.assertIn("promotion_gate_elapsed_us", report)
+            self.assertEqual(report["server_promotion_gate_elapsed_us"], 4567)
+            self.assertEqual(report["server_promotion_gate_token_count"], 2)
+            self.assertEqual(report["server_promotion_gate_adopted_count"], 2)
+            self.assertEqual(report["server_promotion_gate_abandoned_count"], 0)
+            self.assertEqual(report["server_promotion_gate_p50_worker_elapsed_us"], 1000)
+            self.assertEqual(report["server_promotion_gate_p95_worker_elapsed_us"], 1234)
+            self.assertEqual(report["server_promotion_gate_record_lock_page_count"], 30)
+            self.assertEqual(report["server_promotion_gate_record_lock_resident_pages"], 30)
+            self.assertEqual(report["server_promotion_gate_record_lock_cold_page_gets"], 0)
+            self.assertEqual(report["server_promotion_gate_ready_cache_miss_count"], 0)
+            self.assertEqual(report["server_promotion_gate_over_budget_count"], 0)
+            self.assertEqual(report["server_promotion_gate_status_code"], 0)
+
+    def test_promotion_warm_gate_simulator_can_enable_debug_apply_reached(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "promotion-gate-debug-apply.json"
+            runtime = _PromotionGateStatusRuntime()
+            source_conn = _RawCommandConnection()
+            runtime.connect = lambda database=False, autocommit=True: source_conn
+            runtime.wait_until_up = mock.Mock()
+
+            runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+            runner.config = HarnessConfig(
+                promotion_gate_epoch_id="epoch_7",
+                promotion_gate_tokens=[101],
+                promotion_gate_required_apply_lsn=987,
+                promotion_gate_execute=True,
+                promotion_gate_debug_apply_reached=True,
+                report_json=str(report_path),
+            )
+            runner.runtime = runtime
+
+            runner.run_promotion_warm_gate_simulator()
+
+            self.assertIn(
+                (
+                    "SET SESSION debug='+d,preserve_trx_promotion_debug_apply_reached'",
+                    False,
+                ),
+                runtime.calls,
+            )
+            sent_payloads = [payload for _, payload in source_conn.sent_commands]
+            self.assertEqual(
+                sent_payloads,
+                [
+                    encode_promotion_prewarm_frame(
+                        epoch_id="epoch_7",
+                        token=101,
+                        required_apply_lsn=987,
+                        sequence=1,
+                    ),
+                    encode_promotion_gate_frame(
+                        epoch_id="epoch_7",
+                        required_apply_lsn=987,
+                        sequence=2,
+                    ),
+                ],
+            )
+
+    def test_receiver_drain_then_promotion_gate_uses_published_epoch_and_tokens(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "combined.json"
+            receiver_dir = Path(tmpdir) / "receiver-preserve"
+            transfer_root = receiver_dir / ".transfer" / "epoch_7"
+            transfer_root.mkdir(parents=True)
+            (receiver_dir / "101.standby_pending").write_text("", encoding="utf-8")
+            (receiver_dir / "102.standby_pending").write_text("", encoding="utf-8")
+            (transfer_root / "epoch.fact").write_text(
+                "\n".join(
+                    [
+                        "PTRXFER_EPOCH_FACT_V1",
+                        "epoch=epoch_7",
+                        "source=source_uuid",
+                        "target=target_uuid",
+                        "token_count=2",
+                        "token=101",
+                        "source_prepare_lsn=11",
+                        "source_epoch_commit_lsn=987",
+                        "manifest_digest=" + ("0" * 64),
+                        "object_count=0",
+                        "token=102",
+                        "source_prepare_lsn=12",
+                        "source_epoch_commit_lsn=987",
+                        "manifest_digest=" + ("0" * 64),
+                        "object_count=0",
+                        "digest=" + ("0" * 64),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            runtime = _PromotionGateStatusRuntime()
+            source_conn = _RawCommandConnection()
+            receiver_conn = _RawCommandConnection()
+            runtime.connect = lambda database=False, autocommit=True: source_conn
+            runtime.wait_until_up = mock.Mock()
+
+            runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+            runner.config = HarnessConfig(
+                scenario="standby_transfer_receiver_drain_metrics",
+                receiver_preserve_dir=str(receiver_dir),
+                receiver_unix_socket="/tmp/receiver.sock",
+                promotion_gate_execute=True,
+                report_json=str(report_path),
+            )
+            runner.runtime = runtime
+            runner.run_standby_transfer_receiver_drain_metrics = mock.Mock()
+            runner._receiver_admin_connection = mock.Mock(return_value=receiver_conn)
+
+            runner.run_receiver_drain_then_promotion_gate()
+
+            self.assertEqual(source_conn.sent_commands, [])
+            sent_payloads = [payload for _, payload in receiver_conn.sent_commands]
+            self.assertEqual(
+                sent_payloads,
+                [
+                    encode_promotion_prewarm_frame(
+                        epoch_id="epoch_7",
+                        token=101,
+                        required_apply_lsn=987,
+                        sequence=1,
+                    ),
+                    encode_promotion_prewarm_frame(
+                        epoch_id="epoch_7",
+                        token=102,
+                        required_apply_lsn=987,
+                        sequence=2,
+                    ),
+                    encode_promotion_gate_frame(
+                        epoch_id="epoch_7",
+                        required_apply_lsn=987,
+                        sequence=3,
+                    ),
+                ],
+            )
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertTrue(report["success"])
+            self.assertEqual(report["scenario"], "receiver_drain_then_promotion_gate")
+            self.assertEqual(report["receiver_standby_pending_tokens"], 2)
+            self.assertEqual(report["promotion_gate_token_count"], 2)
+            self.assertEqual(report["server_promotion_gate_record_lock_cold_page_gets"], 0)
+
+    def test_promotion_warm_gate_simulator_writes_failure_report(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "promotion-gate-failure.json"
+            runtime = _PromotionGateStatusRuntime()
+            raw_conn = _FailingRawCommandConnection()
+            runtime.connect = lambda database=False, autocommit=True: raw_conn
+            runtime.wait_until_up = mock.Mock()
+
+            runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+            runner.config = HarnessConfig(
+                promotion_gate_epoch_id="epoch_7",
+                promotion_gate_tokens=[101],
+                promotion_gate_required_apply_lsn=987,
+                promotion_gate_execute=True,
+                report_json=str(report_path),
+            )
+            runner.runtime = runtime
+
+            with self.assertRaisesRegex(RuntimeError, "server rejected"):
+                runner.run_promotion_warm_gate_simulator()
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "failed")
+            self.assertFalse(report["success"])
+            self.assertIn("server rejected promotion frame", report["error"])
+
 
 class _NoPreservedRuntime(_FakeRuntime):
     def execute(self, conn, sql, fetch=False):
@@ -170,6 +612,73 @@ class _NoPreservedRuntime(_FakeRuntime):
         if fetch:
             return _fake_fetch_rows(sql)
         return ()
+
+
+class _StartupRecoveryStatusRuntime(_FakeRuntime):
+    def execute(self, conn, sql, fetch=False):
+        self.sql.append(sql)
+        self.calls.append((sql, fetch))
+        if fetch and "performance_schema.global_status" in sql:
+            return [
+                ("Preserve_trx_startup_recovery_binlog_cache_tokens", "3"),
+                ("Preserve_trx_startup_recovery_elapsed_us", "987654"),
+                ("Preserve_trx_startup_recovery_error", "0"),
+                ("Preserve_trx_startup_recovery_local_snapshot_tokens", "5"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_claim_us", "1000"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_kernel_us", "12600000"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_load_us", "123000"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_mdl_us", "5000"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_predicate_locks_us", "4000"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_read_view_us", "2000"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_bits", "77"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_pages", "11"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_record_lock_entries", "13"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_record_lock_image_resolves", "2"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_us", "9900000"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_count", "14"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_record_lock_table_open_us", "880000"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_pages", "12"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_bytes", "196608"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_residency_pages", "12"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_resident_pages", "7"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_io_pending_pages", "3"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_missing_pages", "2"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_record_lock_stable_page_hits", "9"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_record_locks_us", "12000000"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_register_us", "6000"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_table_locks_us", "3000"),
+                ("Preserve_trx_startup_recovery_phase_snapshot_validate_us", "456000"),
+                ("Preserve_trx_startup_recovery_orphan_rollback_count", "1"),
+                ("Preserve_trx_startup_recovery_promotion_intent_tokens", "2"),
+                ("Preserve_trx_startup_recovery_snapshot_tokens", "7"),
+                ("Preserve_trx_startup_recovery_standby_pending_tokens", "4"),
+                ("Preserve_trx_startup_recovery_tainted_tokens", "6"),
+            ]
+        return super().execute(conn, sql, fetch)
+
+
+class _PromotionGateStatusRuntime(_FakeRuntime):
+    def execute(self, conn, sql, fetch=False):
+        self.sql.append(sql)
+        self.calls.append((sql, fetch))
+        if fetch and "performance_schema.global_status" in sql:
+            return [
+                ("Preserve_trx_promotion_gate_abandoned_count", "0"),
+                ("Preserve_trx_promotion_gate_adopted_count", "2"),
+                ("Preserve_trx_promotion_gate_elapsed_us", "4567"),
+                ("Preserve_trx_promotion_gate_max_worker_elapsed_us", "1234"),
+                ("Preserve_trx_promotion_gate_p50_worker_elapsed_us", "1000"),
+                ("Preserve_trx_promotion_gate_p95_worker_elapsed_us", "1234"),
+                ("Preserve_trx_promotion_gate_record_lock_page_count", "30"),
+                ("Preserve_trx_promotion_gate_record_lock_resident_pages", "30"),
+                ("Preserve_trx_promotion_gate_record_lock_cold_page_gets", "0"),
+                ("Preserve_trx_promotion_gate_ready_cache_miss_count", "0"),
+                ("Preserve_trx_promotion_gate_over_budget_count", "0"),
+                ("Preserve_trx_promotion_gate_skipped_count", "0"),
+                ("Preserve_trx_promotion_gate_status_code", "0"),
+                ("Preserve_trx_promotion_gate_token_count", "2"),
+            ]
+        return super().execute(conn, sql, fetch)
 
 
 class _FlappingShutdownRuntime:
@@ -2196,6 +2705,21 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertIs(results[1], resumed[1])
         self.assertIs(results[2], resumed[2])
 
+    def test_wait_for_resumed_connection_completes_current_drain_generation(self):
+        coordinator = ResumeCoordinator(sessions=1)
+        coordinator.request_drain_checkpoint()
+        resumed = object()
+
+        coordinator.publish_resumed_connection(1, resumed)
+
+        self.assertIs(
+            coordinator.wait_for_resumed_connection(1, timeout_s=0.1),
+            resumed,
+        )
+        self.assertIsNone(
+            coordinator.pause_for_drain_if_requested(1, timeout_s=0.1)
+        )
+
     def test_batch_publish_can_hold_next_transaction_until_next_drain(self):
         coordinator = ResumeCoordinator(sessions=1)
         generation = coordinator.request_drain_checkpoint()
@@ -2325,6 +2849,37 @@ class WorkloadPlanTest(unittest.TestCase):
 
         def start_workers():
             self.assertTrue(runner.coordinator._hold_transaction_starts)
+            raise StopAfterStart()
+
+        runner.start_workers = start_workers
+
+        with self.assertRaises(StopAfterStart):
+            runner.run()
+
+    def test_business_run_before_drain_does_not_hold_workers_before_first_drain(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            cycles=1,
+            drain_interval_s=0,
+            business_run_before_drain_s=5,
+            max_transactions_per_worker=1,
+        )
+        runner.plan = WorkloadPlan(runner.config)
+        runner.runtime = _FakeRuntime()
+        runner.coordinator = ResumeCoordinator(runner.config.sessions)
+        runner.expected_state = _NoopExpectedState()
+        runner.stop_event = threading.Event()
+        runner.workers = []
+        runner.phase2_pause_samples = []
+        runner.binlog_event_validation_enabled = lambda: False
+        runner.setup_schema = lambda: None
+        runner.configure_preserve_globals = lambda: None
+
+        class StopAfterStart(Exception):
+            pass
+
+        def start_workers():
+            self.assertFalse(runner.coordinator._hold_transaction_starts)
             raise StopAfterStart()
 
         runner.start_workers = start_workers
@@ -2777,6 +3332,28 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertTrue(runner.coordinator.wait_timeouts)
         self.assertLessEqual(max(runner.coordinator.wait_timeouts), 1.0)
         runner.restart_server.assert_not_called()
+
+    def test_business_run_before_drain_issues_drain_without_harness_pause(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            sessions=2,
+            strict_token_count=False,
+            business_run_before_drain_s=5,
+        )
+        runner.runtime = _DrainRuntime()
+        runner.coordinator = _NeverPausedCoordinator(runner.config.sessions)
+        runner.restart_server = lambda: None
+        runner.configure_preserve_globals = lambda: None
+        runner.read_preserved_tokens = lambda: []
+
+        runner.drain_restart_resume(cycle=1)
+
+        drain_calls = [
+            sql for sql, _ in runner.runtime.calls
+            if sql.startswith("DRAIN TRANSACTIONS PRESERVE")
+        ]
+        self.assertEqual(len(drain_calls), 1)
+        self.assertEqual(runner.coordinator.wait_timeouts, [])
 
     def test_inflight_drain_waits_for_observed_lock_waits_before_drain(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -3674,6 +4251,566 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertEqual(cfg.min_statements_before_drain_pause, 80)
         with self.assertRaisesRegex(ValueError, "at least cycles"):
             HarnessConfig(cycles=3, max_transactions_per_worker=1).validate()
+
+    def test_cli_business_run_before_drain_is_applied(self):
+        cfg = parse_args(
+            [
+                "--cycles",
+                "1",
+                "--business-run-before-drain",
+                "12.5",
+            ]
+        )
+
+        self.assertEqual(cfg.business_run_before_drain_s, 12.5)
+
+    def test_cli_standby_transfer_receiver_drain_metrics_args_are_applied(self):
+        cfg = parse_args(
+            [
+                "--scenario",
+                "standby_transfer_receiver_drain_metrics",
+                "--receiver-unix-socket",
+                "/tmp/receiver.sock",
+                "--receiver-preserve-dir",
+                "/tmp/receiver-data/preserve",
+                "--standby-transfer-user",
+                "transfer_user",
+                "--standby-transfer-password",
+                "transfer_secret",
+                "--standby-transfer-credential-name",
+                "transfer_credential",
+            ]
+        )
+
+        self.assertEqual(cfg.scenario, "standby_transfer_receiver_drain_metrics")
+        self.assertEqual(cfg.receiver_unix_socket, "/tmp/receiver.sock")
+        self.assertEqual(cfg.receiver_preserve_dir, "/tmp/receiver-data/preserve")
+        self.assertEqual(cfg.standby_transfer_user, "transfer_user")
+        self.assertEqual(cfg.standby_transfer_password, "transfer_secret")
+        self.assertEqual(cfg.standby_transfer_credential_name, "transfer_credential")
+
+    def test_standby_transfer_receiver_drain_metrics_requires_preserve_dir(self):
+        with self.assertRaisesRegex(ValueError, "receiver-preserve-dir"):
+            HarnessConfig(
+                scenario="standby_transfer_receiver_drain_metrics",
+                receiver_unix_socket="/tmp/receiver.sock",
+            ).validate()
+
+    def test_physical_standby_promotion_gate_scaled_requires_datadirs(self):
+        with self.assertRaisesRegex(ValueError, "source-datadir"):
+            HarnessConfig(
+                scenario="physical_standby_promotion_gate_scaled",
+                receiver_unix_socket="/tmp/receiver.sock",
+                receiver_preserve_dir="/tmp/rx/data/preserve",
+                receiver_datadir="/tmp/rx/data",
+            ).validate()
+        with self.assertRaisesRegex(ValueError, "receiver-datadir"):
+            HarnessConfig(
+                scenario="physical_standby_promotion_gate_scaled",
+                receiver_unix_socket="/tmp/receiver.sock",
+                receiver_preserve_dir="/tmp/rx/data/preserve",
+                source_datadir="/tmp/src/data",
+            ).validate()
+
+    def test_physical_standby_promotion_gate_scaled_requires_receiver_restart_command(self):
+        with self.assertRaisesRegex(ValueError, "receiver-restart-command"):
+            HarnessConfig(
+                scenario="physical_standby_promotion_gate_scaled",
+                receiver_unix_socket="/tmp/receiver.sock",
+                receiver_preserve_dir="/tmp/rx/data/preserve",
+                source_datadir="/tmp/src/data",
+                receiver_datadir="/tmp/rx/data",
+            ).validate()
+
+    def test_cli_physical_standby_promotion_gate_scaled_args_are_applied(self):
+        cfg = parse_args(
+            [
+                "--scenario",
+                "physical_standby_promotion_gate_scaled",
+                "--receiver-unix-socket",
+                "/tmp/receiver.sock",
+                "--receiver-preserve-dir",
+                "/tmp/rx/data/preserve",
+                "--source-datadir",
+                "/tmp/src/data",
+                "--receiver-datadir",
+                "/tmp/rx/data",
+                "--source-start-command",
+                "mysqld --defaults-file=/tmp/src.cnf",
+                "--receiver-start-command",
+                "mysqld --defaults-file=/tmp/rx.cnf --skip-log-bin",
+                "--receiver-restart-command",
+                "mysqld --defaults-file=/tmp/rx.cnf",
+            ]
+        )
+
+        self.assertEqual(cfg.scenario, "physical_standby_promotion_gate_scaled")
+        self.assertEqual(cfg.receiver_unix_socket, "/tmp/receiver.sock")
+        self.assertEqual(cfg.receiver_preserve_dir, "/tmp/rx/data/preserve")
+        self.assertEqual(cfg.source_datadir, "/tmp/src/data")
+        self.assertEqual(cfg.receiver_datadir, "/tmp/rx/data")
+        self.assertEqual(cfg.source_start_command, "mysqld --defaults-file=/tmp/src.cnf")
+        self.assertEqual(
+            cfg.receiver_start_command,
+            "mysqld --defaults-file=/tmp/rx.cnf --skip-log-bin",
+        )
+        self.assertEqual(cfg.receiver_restart_command, "mysqld --defaults-file=/tmp/rx.cnf")
+
+    def test_receiver_preserve_artifact_counts_include_standby_and_epoch_fact(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            preserve_dir = Path(tmpdir) / "preserve"
+            transfer_dir = preserve_dir / ".transfer" / "epoch_7"
+            transfer_dir.mkdir(parents=True)
+            (preserve_dir / "101.bin").write_text("snapshot", encoding="utf-8")
+            (preserve_dir / "101.standby_pending").write_text(
+                "standby_pending\n", encoding="utf-8"
+            )
+            (preserve_dir / "101.binlog_cache").write_text(
+                "blob", encoding="utf-8"
+            )
+            (transfer_dir / "epoch.fact").write_text("fact", encoding="utf-8")
+            (transfer_dir / "epoch.commit").write_text("commit", encoding="utf-8")
+
+            runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+            runner.config = HarnessConfig(
+                scenario="standby_transfer_receiver_drain_metrics",
+                receiver_unix_socket="/tmp/receiver.sock",
+                receiver_preserve_dir=str(preserve_dir),
+            ).validate()
+
+            self.assertEqual(
+                runner.receiver_preserve_artifact_counts(),
+                {
+                    "snapshot_tokens": 1,
+                    "standby_pending_tokens": 1,
+                    "external_blob_tokens": 1,
+                    "epoch_fact_count": 1,
+                    "epoch_commit_count": 1,
+                },
+            )
+
+    def test_standby_transfer_receiver_report_includes_phase2_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "standby-transfer.json"
+            runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+            runner.config = HarnessConfig(
+                scenario="standby_transfer_receiver_drain_metrics",
+                cycles=1,
+                sessions=2,
+                receiver_unix_socket="/tmp/receiver.sock",
+                receiver_preserve_dir=str(Path(tmpdir) / "preserve"),
+                report_json=str(report_path),
+            ).validate()
+            runner.warmcopy_drain_metrics = [
+                WarmcopyDrainMetrics(
+                    phase2_pause_ms=12.0,
+                    full_copy_to_count=2,
+                    phase2_total_ms=34.0,
+                    phase2_slo_guaranteed=0,
+                    phase2_slo_reason="non_record_family_live_compare",
+                    phase2_record_materialized_target_count=0,
+                    phase2_table_live_export_target_count=0,
+                    phase2_mdl_live_export_target_count=0,
+                    phase2_savepoint_live_export_target_count=0,
+                )
+            ]
+            runner.receiver_artifact_counts = {
+                "snapshot_tokens": 2,
+                "standby_pending_tokens": 2,
+                "external_blob_tokens": 2,
+                "epoch_fact_count": 1,
+                "epoch_commit_count": 1,
+            }
+
+            runner.write_standby_transfer_receiver_report(
+                status="success",
+                completed_stmt_total=88,
+            )
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertTrue(report["success"])
+            self.assertEqual(report["scenario"], "standby_transfer_receiver_drain_metrics")
+            self.assertEqual(report["receiver_standby_pending_tokens"], 2)
+            self.assertEqual(report["receiver_epoch_fact_count"], 1)
+            self.assertEqual(report["receiver_snapshot_tokens"], 2)
+            self.assertEqual(report["phase2_total_samples_ms"], [34.0])
+            self.assertEqual(report["warmcopy_provider_full_copy_count"], 2)
+            self.assertEqual(report["lock_warmcopy_live_fallback_count"], 0)
+            self.assertEqual(report["completed_stmt_total"], 88)
+
+    def test_receiver_promotion_gate_report_includes_drain_phase2_metrics(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "promotion-gate.json"
+            runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+            runner.config = HarnessConfig(
+                scenario="physical_standby_promotion_gate_scaled",
+                receiver_unix_socket="/tmp/receiver.sock",
+                receiver_preserve_dir=str(Path(tmpdir) / "preserve"),
+                source_datadir=str(Path(tmpdir) / "src"),
+                receiver_datadir=str(Path(tmpdir) / "rx"),
+                receiver_restart_command="mysqld --defaults-file=/tmp/rx.cnf",
+                report_json=str(report_path),
+            ).validate()
+            runner.receiver_preserve_artifact_counts = mock.Mock(
+                return_value={
+                    "snapshot_tokens": 3,
+                    "standby_pending_tokens": 3,
+                    "external_blob_tokens": 3,
+                    "epoch_fact_count": 3,
+                    "epoch_commit_count": 3,
+                }
+            )
+            runner.promotion_gate_elapsed_samples_us = [4000, 5000, 6000]
+            runner.promotion_gate_server_metrics = []
+            runner.warmcopy_drain_metrics = [
+                WarmcopyDrainMetrics(
+                    phase2_pause_ms=1.0,
+                    full_copy_to_count=0,
+                    phase2_total_ms=10.2,
+                    phase2_slo_guaranteed=0,
+                    phase2_slo_reason="temp_table_manifest_phase2_build",
+                    phase2_target_count=3,
+                    phase2_record_lock_count=150000,
+                    phase2_record_prebuilt_target_count=3,
+                    phase2_record_materialized_target_count=0,
+                    phase2_full_lock_scan_count=0,
+                    materialized_lock_payload_bytes_in_phase2=0,
+                    phase2_table_live_export_target_count=0,
+                    phase2_mdl_live_export_target_count=0,
+                    phase2_savepoint_live_export_target_count=0,
+                )
+            ]
+
+            runner.write_receiver_promotion_gate_report(
+                "11,12,13",
+                [11, 12, 13],
+                scenario_name="physical_standby_promotion_gate_scaled",
+            )
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["promotion_gate_elapsed_us"], 15000)
+            self.assertEqual(report["phase2_total_samples_ms"], [10.2])
+            self.assertEqual(report["lock_warmcopy_live_fallback_count"], 0)
+            self.assertFalse(report["phase2_slo_guaranteed"])
+            self.assertEqual(report["phase2_target_count_samples"], [3])
+            self.assertEqual(report["phase2_record_lock_count_samples"], [150000])
+            self.assertEqual(report["phase2_record_prebuilt_target_count_samples"], [3])
+            self.assertEqual(report["phase2_record_materialized_target_count_samples"], [0])
+            self.assertEqual(report["phase2_full_lock_scan_count_samples"], [0])
+            self.assertEqual(
+                report["materialized_lock_payload_bytes_in_phase2_samples"], [0]
+            )
+
+    def test_standby_transfer_receiver_scenario_uses_special_runner(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+        ).validate()
+        runner.run_standby_transfer_receiver_drain_metrics = mock.Mock()
+
+        runner.run()
+
+        runner.run_standby_transfer_receiver_drain_metrics.assert_called_once_with()
+
+    def test_physical_standby_promotion_gate_scaled_uses_special_runner(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="physical_standby_promotion_gate_scaled",
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/rx/data/preserve",
+            source_datadir="/tmp/src/data",
+            receiver_datadir="/tmp/rx/data",
+            receiver_restart_command="mysqld --defaults-file=/tmp/rx.cnf",
+        ).validate()
+        runner.run_physical_standby_promotion_gate_scaled = mock.Mock()
+
+        runner.run()
+
+        runner.run_physical_standby_promotion_gate_scaled.assert_called_once_with()
+
+    def test_physical_standby_copy_preserves_receiver_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "source"
+            receiver = root / "receiver"
+            source.mkdir()
+            receiver.mkdir()
+            (source / "ibdata1").write_text("source-pages", encoding="utf-8")
+            (source / "source-only.ibd").write_text("table-pages", encoding="utf-8")
+            (source / "auto.cnf").write_text(
+                "server-uuid=source-uuid\n", encoding="utf-8"
+            )
+            (receiver / "old.ibd").write_text("old-receiver-pages", encoding="utf-8")
+            (receiver / "auto.cnf").write_text(
+                "server-uuid=receiver-uuid\n", encoding="utf-8"
+            )
+            receiver_preserve = receiver / "preserve"
+            transfer_dir = receiver_preserve / ".transfer" / "epoch_7"
+            transfer_dir.mkdir(parents=True)
+            (receiver_preserve / "101.bin").write_text("snapshot", encoding="utf-8")
+            (receiver_preserve / "101.standby_pending").write_text(
+                "standby\n", encoding="utf-8"
+            )
+            (transfer_dir / "epoch.fact").write_text("fact", encoding="utf-8")
+
+            runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+            runner.config = HarnessConfig(
+                scenario="physical_standby_promotion_gate_scaled",
+                receiver_unix_socket="/tmp/receiver.sock",
+                receiver_preserve_dir=str(receiver_preserve),
+                source_datadir=str(source),
+                receiver_datadir=str(receiver),
+                receiver_restart_command="mysqld --defaults-file=/tmp/rx.cnf",
+            ).validate()
+
+            runner.materialize_physical_standby_datadir_for_promotion()
+
+            self.assertEqual(
+                (receiver / "ibdata1").read_text(encoding="utf-8"),
+                "source-pages",
+            )
+            self.assertEqual(
+                (receiver / "source-only.ibd").read_text(encoding="utf-8"),
+                "table-pages",
+            )
+            self.assertFalse((receiver / "old.ibd").exists())
+            self.assertEqual(
+                (receiver / "auto.cnf").read_text(encoding="utf-8"),
+                "server-uuid=receiver-uuid\n",
+            )
+            self.assertEqual(
+                (receiver / "preserve" / "101.bin").read_text(encoding="utf-8"),
+                "snapshot",
+            )
+            self.assertTrue((receiver / "preserve" / "101.standby_pending").exists())
+            self.assertEqual(
+                (receiver / "preserve" / ".transfer" / "epoch_7" / "epoch.fact")
+                .read_text(encoding="utf-8"),
+                "fact",
+            )
+
+    def test_physical_standby_copy_rejects_same_source_and_receiver(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            datadir = Path(tmpdir) / "data"
+            preserve = datadir / "preserve"
+            preserve.mkdir(parents=True)
+            runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+            runner.config = HarnessConfig(
+                scenario="physical_standby_promotion_gate_scaled",
+                receiver_unix_socket="/tmp/receiver.sock",
+                receiver_preserve_dir=str(preserve),
+                source_datadir=str(datadir),
+                receiver_datadir=str(datadir),
+                receiver_restart_command="mysqld --defaults-file=/tmp/rx.cnf",
+            ).validate()
+
+            with self.assertRaisesRegex(ValueError, "source and receiver datadir"):
+                runner.materialize_physical_standby_datadir_for_promotion()
+
+    def test_physical_standby_scaled_runner_runs_promotion_after_restart(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="physical_standby_promotion_gate_scaled",
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/rx/data/preserve",
+            source_datadir="/tmp/src/data",
+            receiver_datadir="/tmp/rx/data",
+            receiver_restart_command="mysqld --defaults-file=/tmp/rx.cnf",
+        ).validate()
+        calls = []
+        runner.run_standby_transfer_receiver_drain_metrics = (
+            lambda: calls.append("transfer_drain")
+        )
+        runner.shutdown_receiver_for_physical_standby_copy = (
+            lambda: calls.append("shutdown_receiver")
+        )
+        runner.materialize_physical_standby_datadir_for_promotion = (
+            lambda: calls.append("materialize")
+        )
+        runner.restart_receiver_server = lambda: calls.append("restart_receiver")
+        runner.read_all_receiver_epoch_facts = mock.Mock(
+            return_value=[("epoch_7", [101, 102], 987)]
+        )
+        runner._receiver_admin_connection = mock.Mock(name="receiver_conn_factory")
+        runner.run_promotion_warm_gate_simulator = mock.Mock(
+            side_effect=lambda **_: calls.append("promotion_gate")
+        )
+        runner.write_receiver_promotion_gate_report = mock.Mock(
+            side_effect=lambda *_, **__: calls.append("write_report")
+        )
+
+        runner.run_physical_standby_promotion_gate_scaled()
+
+        self.assertEqual(
+            calls,
+            [
+                "transfer_drain",
+                "shutdown_receiver",
+                "materialize",
+                "restart_receiver",
+                "promotion_gate",
+                "write_report",
+            ],
+        )
+        self.assertEqual(runner.config.promotion_gate_epoch_id, "epoch_7")
+        self.assertEqual(runner.config.promotion_gate_tokens, [101, 102])
+        self.assertEqual(runner.config.promotion_gate_required_apply_lsn, 987)
+        self.assertTrue(runner.config.promotion_gate_execute)
+        runner.run_promotion_warm_gate_simulator.assert_called_once_with(
+            connection_factory=runner._receiver_admin_connection,
+            wait_until_up=False,
+        )
+        runner.write_receiver_promotion_gate_report.assert_called_once_with(
+            "epoch_7",
+            [101, 102],
+            scenario_name="physical_standby_promotion_gate_scaled",
+        )
+
+    def test_physical_standby_scaled_runner_uses_all_receiver_epoch_facts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            preserve = Path(tmp) / "rx" / "data" / "preserve"
+            for token in (101, 102, 103):
+                transfer_dir = preserve / ".transfer" / str(token)
+                transfer_dir.mkdir(parents=True, exist_ok=True)
+                (transfer_dir / "epoch.fact").write_text(
+                    f"epoch={token}\n"
+                    f"token={token}\n"
+                    f"source_epoch_commit_lsn={token * 10}\n",
+                    encoding="utf-8",
+                )
+                (transfer_dir / "epoch.commit").write_text(
+                    "committed\n", encoding="utf-8"
+                )
+                (preserve / f"{token}.standby_pending").write_text(
+                    "pending\n", encoding="utf-8"
+                )
+
+            runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+            runner.config = HarnessConfig(
+                scenario="physical_standby_promotion_gate_scaled",
+                receiver_unix_socket="/tmp/receiver.sock",
+                receiver_preserve_dir=str(preserve),
+                source_datadir="/tmp/src/data",
+                receiver_datadir="/tmp/rx/data",
+                receiver_restart_command="mysqld --defaults-file=/tmp/rx.cnf",
+            ).validate()
+            calls = []
+            runner.run_standby_transfer_receiver_drain_metrics = (
+                lambda: calls.append("transfer_drain")
+            )
+            runner.shutdown_receiver_for_physical_standby_copy = (
+                lambda: calls.append("shutdown_receiver")
+            )
+            runner.materialize_physical_standby_datadir_for_promotion = (
+                lambda: calls.append("materialize")
+            )
+            runner.restart_receiver_server = lambda: calls.append("restart_receiver")
+            runner._receiver_admin_connection = mock.Mock(
+                name="receiver_conn_factory"
+            )
+            runner.run_promotion_warm_gate_simulator = mock.Mock(
+                side_effect=lambda **_: calls.append("promotion_gate")
+            )
+            runner.write_receiver_promotion_gate_report = mock.Mock(
+                side_effect=lambda *_, **__: calls.append("write_report")
+            )
+
+            runner.run_physical_standby_promotion_gate_scaled()
+
+            self.assertEqual(
+                runner.run_promotion_warm_gate_simulator.call_count,
+                3,
+            )
+            self.assertEqual(runner.config.promotion_gate_tokens, [103])
+            self.assertEqual(runner.config.promotion_gate_required_apply_lsn, 1030)
+            self.assertEqual(runner.config.promotion_gate_epoch_id, "103")
+            runner.write_receiver_promotion_gate_report.assert_called_once_with(
+                "101,102,103",
+                [101, 102, 103],
+                scenario_name="physical_standby_promotion_gate_scaled",
+            )
+
+    def test_physical_standby_scaled_runner_can_start_source_and_receiver(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="physical_standby_promotion_gate_scaled",
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/rx/data/preserve",
+            source_datadir="/tmp/src/data",
+            receiver_datadir="/tmp/rx/data",
+            source_start_command="mysqld --defaults-file=/tmp/src.cnf",
+            receiver_start_command="mysqld --defaults-file=/tmp/rx.cnf --skip-log-bin",
+            receiver_restart_command="mysqld --defaults-file=/tmp/rx.cnf --skip-log-bin",
+        ).validate()
+        calls = []
+        runner.start_source_server_if_configured = lambda: calls.append(
+            "start_source"
+        )
+        runner.start_receiver_server_if_configured = lambda: calls.append(
+            "start_receiver"
+        )
+        runner.run_standby_transfer_receiver_drain_metrics = (
+            lambda: calls.append("transfer_drain")
+        )
+        runner.shutdown_receiver_for_physical_standby_copy = (
+            lambda: calls.append("shutdown_receiver")
+        )
+        runner.materialize_physical_standby_datadir_for_promotion = (
+            lambda: calls.append("materialize")
+        )
+        runner.restart_receiver_server = lambda: calls.append("restart_receiver")
+        runner.read_all_receiver_epoch_facts = mock.Mock(
+            return_value=[("epoch_7", [101], 0)]
+        )
+        runner._receiver_admin_connection = mock.Mock(name="receiver_conn_factory")
+        runner.run_promotion_warm_gate_simulator = mock.Mock(
+            side_effect=lambda **_: calls.append("promotion_gate")
+        )
+        runner.write_receiver_promotion_gate_report = mock.Mock(
+            side_effect=lambda *_, **__: calls.append("write_report")
+        )
+
+        runner.run_physical_standby_promotion_gate_scaled()
+
+        self.assertEqual(
+            calls,
+            [
+                "start_source",
+                "start_receiver",
+                "transfer_drain",
+                "shutdown_receiver",
+                "materialize",
+                "restart_receiver",
+                "promotion_gate",
+                "write_report",
+            ],
+        )
+
+    def test_configure_standby_transfer_credentials_on_source_and_receiver(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+            standby_transfer_user="transfer_user",
+            standby_transfer_password="transfer_secret",
+            standby_transfer_credential_name="transfer_credential",
+        ).validate()
+        runner.runtime = _EndpointFakeRuntime()
+
+        runner.configure_standby_transfer_credentials()
+
+        sql_text = "\n".join(runner.runtime.sql)
+        self.assertIn("CREATE USER IF NOT EXISTS 'transfer_user'@'localhost'", sql_text)
+        self.assertIn("GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*", sql_text)
+        self.assertNotIn("CHANGE MASTER TO", sql_text)
+        self.assertNotIn("FOR CHANNEL 'transfer_credential'", sql_text)
+        self.assertEqual(len(runner.runtime.endpoint_calls), 1)
+        self.assertEqual(
+            runner.runtime.endpoint_calls[0]["unix_socket"], "/tmp/receiver.sock"
+        )
 
     def test_cli_bulk_lockset_flags_are_applied(self):
         cfg = parse_args(
@@ -4693,7 +5830,16 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
                 "PRESERVE: warm-copy drain metrics "
                 "phase2_pause_us=123000 phase2_total_us=2500000 "
                 "phase2_slo_guaranteed=0 "
-                "phase2_slo_reason=temp_table_manifest_phase2_build\n"
+                "phase2_slo_reason=temp_table_manifest_phase2_build "
+                "phase2_target_count=3 "
+                "phase2_record_lock_count=150000 "
+                "phase2_record_prebuilt_target_count=3 "
+                "phase2_record_materialized_target_count=1 "
+                "phase2_full_lock_scan_count=0 "
+                "materialized_lock_payload_bytes_in_phase2=0 "
+                "phase2_table_live_export_target_count=2 "
+                "phase2_mdl_live_export_target_count=3 "
+                "phase2_savepoint_live_export_target_count=4\n"
             )
             error_log.flush()
             runner.config = HarnessConfig(server_error_log=error_log.name)
@@ -4707,6 +5853,181 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertEqual(
             metrics.phase2_slo_reason, "temp_table_manifest_phase2_build"
         )
+        self.assertEqual(metrics.phase2_target_count, 3)
+        self.assertEqual(metrics.phase2_record_lock_count, 150000)
+        self.assertEqual(metrics.phase2_record_prebuilt_target_count, 3)
+        self.assertEqual(metrics.phase2_record_materialized_target_count, 1)
+        self.assertEqual(metrics.phase2_full_lock_scan_count, 0)
+        self.assertEqual(metrics.materialized_lock_payload_bytes_in_phase2, 0)
+        self.assertEqual(metrics.lock_warmcopy_live_fallback_count(), 10)
+
+    def test_drain_target_counter_rejection_parser_reads_latest_metric_after_offset(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as error_log:
+            error_log.write(
+                "PRESERVE: batch target counter rejected "
+                "stage=target_counter_rejected transaction_count=1 "
+                "target_count=1 nonidle_transaction_count=0 "
+                "has_unsupported_transaction=0\n"
+            )
+            error_log.flush()
+            offset = error_log.tell()
+            error_log.write("noise\n")
+            error_log.write(
+                "PRESERVE: batch target counter rejected "
+                "stage=target_counter_rejected transaction_count=2 "
+                "target_count=1 nonidle_transaction_count=1 "
+                "has_unsupported_transaction=0\n"
+            )
+            error_log.flush()
+            runner.config = HarnessConfig(server_error_log=error_log.name)
+
+            metrics = runner.read_latest_drain_target_counter_rejection_since(offset)
+
+        self.assertIsNotNone(metrics)
+        self.assertEqual(metrics.transaction_count, 2)
+        self.assertEqual(metrics.target_count, 1)
+        self.assertEqual(metrics.nonidle_transaction_count, 1)
+        self.assertEqual(metrics.has_unsupported_transaction, 0)
+
+    def test_drain_target_counter_rejection_formatter_includes_all_counts(self):
+        message = format_drain_target_counter_rejection(
+            DrainTargetCounterRejectionMetrics(
+                transaction_count=2,
+                target_count=1,
+                nonidle_transaction_count=1,
+                has_unsupported_transaction=0,
+            )
+        )
+
+        self.assertIn("transaction_count=2", message)
+        self.assertIn("target_count=1", message)
+        self.assertIn("nonidle_transaction_count=1", message)
+        self.assertIn("has_unsupported_transaction=0", message)
+
+    def test_startup_recovery_log_parser_reads_latest_metric_after_offset(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as error_log:
+            error_log.write(
+                "PRESERVE: preserved transaction recovery end elapsed_us=100 "
+                "error=0 outcome=completed snapshot_tokens=1 "
+                "local_snapshot_tokens=1 binlog_cache_tokens=1 "
+                "tainted_tokens=0 standby_pending_tokens=0 "
+                "promotion_intent_tokens=0 orphan_rollback_count=0\n"
+            )
+            error_log.flush()
+            offset = error_log.tell()
+            error_log.write("noise\n")
+            error_log.write(
+                "PRESERVE: preserved transaction recovery end elapsed_us=13206843 "
+                "error=0 outcome=completed snapshot_tokens=1000 "
+                "local_snapshot_tokens=1000 binlog_cache_tokens=1000 "
+                "tainted_tokens=0 standby_pending_tokens=0 "
+                "promotion_intent_tokens=0 orphan_rollback_count=0 "
+                "phase_snapshot_load_us=123000 "
+                "phase_snapshot_validate_us=456000 "
+                "phase_snapshot_kernel_us=12600000 "
+                "phase_snapshot_claim_us=1000 "
+                "phase_snapshot_read_view_us=2000 "
+                "phase_snapshot_table_locks_us=3000 "
+                "phase_snapshot_record_locks_us=12000000 "
+                "phase_snapshot_record_lock_entries=13 "
+                "phase_snapshot_record_lock_stable_page_hits=9 "
+                "phase_snapshot_record_lock_image_resolves=2 "
+                "phase_snapshot_record_lock_bitmap_pages=11 "
+                "phase_snapshot_record_lock_bitmap_bits=77 "
+                "phase_snapshot_record_lock_page_get_us=9900000 "
+                "phase_snapshot_record_lock_page_get_count=14 "
+                "phase_snapshot_record_lock_table_open_us=880000 "
+                "phase_snapshot_record_lock_prefetch_pages=12 "
+                "phase_snapshot_record_lock_prefetch_bytes=196608 "
+                "phase_snapshot_record_lock_prefetch_residency_pages=12 "
+                "phase_snapshot_record_lock_prefetch_resident_pages=7 "
+                "phase_snapshot_record_lock_prefetch_io_pending_pages=3 "
+                "phase_snapshot_record_lock_prefetch_missing_pages=2 "
+                "phase_snapshot_predicate_locks_us=4000 "
+                "phase_snapshot_mdl_us=5000 "
+                "phase_snapshot_register_us=6000\n"
+            )
+            error_log.flush()
+            runner.config = HarnessConfig(server_error_log=error_log.name)
+
+            metrics = runner.read_latest_startup_recovery_metrics_since(offset)
+
+        self.assertIsNotNone(metrics)
+        self.assertEqual(metrics.elapsed_ms, 13206.843)
+        self.assertEqual(metrics.error, 0)
+        self.assertEqual(metrics.outcome, "completed")
+        self.assertEqual(metrics.snapshot_tokens, 1000)
+        self.assertEqual(metrics.local_snapshot_tokens, 1000)
+        self.assertEqual(metrics.binlog_cache_tokens, 1000)
+        self.assertEqual(metrics.orphan_rollback_count, 0)
+        self.assertEqual(metrics.snapshot_load_ms, 123.0)
+        self.assertEqual(metrics.snapshot_validate_ms, 456.0)
+        self.assertEqual(metrics.snapshot_kernel_ms, 12600.0)
+        self.assertEqual(metrics.snapshot_claim_ms, 1.0)
+        self.assertEqual(metrics.snapshot_read_view_ms, 2.0)
+        self.assertEqual(metrics.snapshot_table_locks_ms, 3.0)
+        self.assertEqual(metrics.snapshot_record_locks_ms, 12000.0)
+        self.assertEqual(metrics.snapshot_record_lock_entries, 13)
+        self.assertEqual(metrics.snapshot_record_lock_stable_page_hits, 9)
+        self.assertEqual(metrics.snapshot_record_lock_image_resolves, 2)
+        self.assertEqual(metrics.snapshot_record_lock_bitmap_pages, 11)
+        self.assertEqual(metrics.snapshot_record_lock_bitmap_bits, 77)
+        self.assertEqual(metrics.snapshot_record_lock_page_get_us, 9900000)
+        self.assertEqual(metrics.snapshot_record_lock_page_get_count, 14)
+        self.assertEqual(metrics.snapshot_record_lock_table_open_us, 880000)
+        self.assertEqual(metrics.snapshot_record_lock_prefetch_pages, 12)
+        self.assertEqual(metrics.snapshot_record_lock_prefetch_bytes, 196608)
+        self.assertEqual(metrics.snapshot_record_lock_prefetch_residency_pages, 12)
+        self.assertEqual(metrics.snapshot_record_lock_prefetch_resident_pages, 7)
+        self.assertEqual(metrics.snapshot_record_lock_prefetch_io_pending_pages, 3)
+        self.assertEqual(metrics.snapshot_record_lock_prefetch_missing_pages, 2)
+        self.assertEqual(metrics.snapshot_predicate_locks_ms, 4.0)
+        self.assertEqual(metrics.snapshot_mdl_ms, 5.0)
+        self.assertEqual(metrics.snapshot_register_ms, 6.0)
+
+    def test_startup_recovery_status_reader_uses_global_status(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.runtime = _StartupRecoveryStatusRuntime()
+
+        metrics = runner.read_startup_recovery_metrics_from_status()
+
+        self.assertIsNotNone(metrics)
+        self.assertEqual(metrics.elapsed_ms, 987.654)
+        self.assertEqual(metrics.error, 0)
+        self.assertEqual(metrics.outcome, "completed")
+        self.assertEqual(metrics.snapshot_tokens, 7)
+        self.assertEqual(metrics.local_snapshot_tokens, 5)
+        self.assertEqual(metrics.binlog_cache_tokens, 3)
+        self.assertEqual(metrics.tainted_tokens, 6)
+        self.assertEqual(metrics.standby_pending_tokens, 4)
+        self.assertEqual(metrics.promotion_intent_tokens, 2)
+        self.assertEqual(metrics.orphan_rollback_count, 1)
+        self.assertEqual(metrics.snapshot_load_ms, 123.0)
+        self.assertEqual(metrics.snapshot_validate_ms, 456.0)
+        self.assertEqual(metrics.snapshot_kernel_ms, 12600.0)
+        self.assertEqual(metrics.snapshot_claim_ms, 1.0)
+        self.assertEqual(metrics.snapshot_read_view_ms, 2.0)
+        self.assertEqual(metrics.snapshot_table_locks_ms, 3.0)
+        self.assertEqual(metrics.snapshot_record_locks_ms, 12000.0)
+        self.assertEqual(metrics.snapshot_record_lock_entries, 13)
+        self.assertEqual(metrics.snapshot_record_lock_stable_page_hits, 9)
+        self.assertEqual(metrics.snapshot_record_lock_image_resolves, 2)
+        self.assertEqual(metrics.snapshot_record_lock_bitmap_pages, 11)
+        self.assertEqual(metrics.snapshot_record_lock_bitmap_bits, 77)
+        self.assertEqual(metrics.snapshot_record_lock_page_get_us, 9900000)
+        self.assertEqual(metrics.snapshot_record_lock_page_get_count, 14)
+        self.assertEqual(metrics.snapshot_record_lock_table_open_us, 880000)
+        self.assertEqual(metrics.snapshot_record_lock_prefetch_pages, 12)
+        self.assertEqual(metrics.snapshot_record_lock_prefetch_bytes, 196608)
+        self.assertEqual(metrics.snapshot_record_lock_prefetch_residency_pages, 12)
+        self.assertEqual(metrics.snapshot_record_lock_prefetch_resident_pages, 7)
+        self.assertEqual(metrics.snapshot_record_lock_prefetch_io_pending_pages, 3)
+        self.assertEqual(metrics.snapshot_record_lock_prefetch_missing_pages, 2)
+        self.assertEqual(metrics.snapshot_predicate_locks_ms, 4.0)
+        self.assertEqual(metrics.snapshot_mdl_ms, 5.0)
+        self.assertEqual(metrics.snapshot_register_ms, 6.0)
 
     def test_drain_restart_resume_uses_error_log_phase2_metric(self):
         with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as error_log:
@@ -5002,6 +6323,20 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
                     phase2_slo_reason="temp_table_manifest_phase2_build",
                 )
             ]
+            runner.startup_recovery_metrics = [
+                StartupRecoveryMetrics(
+                    elapsed_ms=13206.843,
+                    error=0,
+                    outcome="completed",
+                    snapshot_tokens=1000,
+                    local_snapshot_tokens=1000,
+                    binlog_cache_tokens=1000,
+                    tainted_tokens=0,
+                    standby_pending_tokens=0,
+                    promotion_intent_tokens=0,
+                    orphan_rollback_count=0,
+                )
+            ]
             runner.post_resume_temp_dml_executed = True
 
             runner.final_validation()
@@ -5017,6 +6352,9 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
                 report["phase2_slo_reasons"],
                 {"temp_table_manifest_phase2_build": 1},
             )
+            self.assertEqual(report["startup_recovery_elapsed_samples_ms"], [13206.843])
+            self.assertEqual(report["startup_recovery_token_samples"], [1000])
+            self.assertEqual(report["startup_recovery_outcomes"], {"completed": 1})
             self.assertTrue(report["post_resume_temp_dml_executed"])
             self.assertIsNone(report["temp_sidecar_bytes"])
             self.assertIsNone(report["temp_undo_pages"])

@@ -60,9 +60,57 @@ struct Preserve_modified_table_name {
   uint32_t required_write_acls{0};
 };
 
+struct trx_preserve_record_lock_import_metrics_t {
+  uint64_t record_entries{0};
+  uint64_t stable_page_hits{0};
+  uint64_t image_resolves{0};
+  uint64_t bitmap_pages{0};
+  uint64_t bitmap_bits{0};
+  uint64_t page_get_us{0};
+  uint64_t page_get_count{0};
+  uint64_t table_open_us{0};
+  uint64_t prefetch_pages{0};
+  uint64_t prefetch_bytes{0};
+  uint64_t prefetch_residency_pages{0};
+  uint64_t prefetch_resident_pages{0};
+  uint64_t prefetch_io_pending_pages{0};
+  uint64_t prefetch_missing_pages{0};
+
+  void add(const trx_preserve_record_lock_import_metrics_t &other) {
+    record_entries += other.record_entries;
+    stable_page_hits += other.stable_page_hits;
+    image_resolves += other.image_resolves;
+    bitmap_pages += other.bitmap_pages;
+    bitmap_bits += other.bitmap_bits;
+    page_get_us += other.page_get_us;
+    page_get_count += other.page_get_count;
+    table_open_us += other.table_open_us;
+    prefetch_pages += other.prefetch_pages;
+    prefetch_bytes += other.prefetch_bytes;
+    prefetch_residency_pages += other.prefetch_residency_pages;
+    prefetch_resident_pages += other.prefetch_resident_pages;
+    prefetch_io_pending_pages += other.prefetch_io_pending_pages;
+    prefetch_missing_pages += other.prefetch_missing_pages;
+  }
+};
+
+struct trx_preserve_record_lock_page_plan_t {
+  uint64_t page_count{0};
+  uint64_t bitmap_pages{0};
+  uint64_t bitmap_bits{0};
+};
+
+struct trx_preserve_record_lock_residency_t {
+  uint64_t page_count{0};
+  uint64_t resident_pages{0};
+  uint64_t io_pending_pages{0};
+  uint64_t missing_pages{0};
+};
+
 trx_t *trx_preserve_claim_prepared(const XID &xid);
 bool trx_preserve_probe_detached_prepared(const XID &xid);
 trx_t *trx_preserve_current_thd_trx(THD *thd);
+uint64_t trx_preserve_current_redo_lsn();
 dberr_t trx_preserve_claim_detached_prepared(trx_t *trx);
 dberr_t trx_preserve_rollback_by_token(const char *token);
 dberr_t trx_preserve_rollback_by_token_for_thd(const char *token, THD *thd);
@@ -81,6 +129,7 @@ trx_t *trx_preserve_create_temp_only_claimed(const XID &xid, uint64_t trx_id);
 uint64_t trx_preserve_trx_id(const trx_t *trx);
 void trx_preserve_release_claim_before_free(trx_t *trx);
 bool trx_preserve_current_thd_has_read_view(THD *thd);
+bool trx_preserve_current_thd_has_record_locks(THD *thd);
 bool trx_preserve_current_thd_has_no_redo_undo(THD *thd);
 bool trx_preserve_current_thd_no_redo_undo_state(THD *thd, bool *present,
                                                  uint64_t *top_undo_no);
@@ -109,6 +158,8 @@ dberr_t trx_preserve_export_record_locks(trx_t *trx, std::string *payload,
                                          uint32_t max_lock_count);
 dberr_t trx_preserve_export_record_locks(THD *thd, std::string *payload,
                                          uint32_t max_lock_count);
+dberr_t trx_preserve_export_record_locks_stable_page_only(
+    THD *thd, std::string *payload, uint32_t max_lock_count);
 bool trx_preserve_sample_lock_warmcopy_fence(
     THD *thd, lock_warmcopy_trx_lock_fence_t *fence);
 bool trx_preserve_sample_lock_warmcopy_fence(
@@ -121,10 +172,28 @@ bool trx_preserve_has_predicate_locks(THD *thd, bool *has_predicate_locks);
 const char *trx_preserve_last_record_lock_export_error();
 dberr_t trx_preserve_import_record_locks(trx_t *trx,
                                          const std::string &payload);
+dberr_t trx_preserve_import_record_locks(
+    trx_t *trx, const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics);
+dberr_t trx_preserve_import_record_locks(
+    trx_t *trx, const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics,
+    bool (*deadline_expired)(void *), void *deadline_ctx);
+dberr_t trx_preserve_prefetch_record_lock_pages(
+    const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics);
+dberr_t trx_preserve_prefetch_record_lock_pages_for_gate(
+    const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics);
 bool trx_preserve_record_locks_payload_is_valid_for_import(
     const std::string &payload);
 bool trx_preserve_record_locks_payload_lock_count(
     const std::string &payload, uint32_t *lock_count);
+bool trx_preserve_record_lock_payload_page_plan(
+    const std::string &payload, trx_preserve_record_lock_page_plan_t *plan);
+bool trx_preserve_record_lock_payload_residency(
+    const std::string &payload,
+    trx_preserve_record_lock_residency_t *residency);
 bool trx_preserve_split_record_and_predicate_locks(
     const std::string &payload, std::string *record_locks_payload,
     std::string *predicate_locks_payload);

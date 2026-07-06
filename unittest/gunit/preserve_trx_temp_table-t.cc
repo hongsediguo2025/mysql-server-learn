@@ -605,7 +605,7 @@ TEST(TempResumeMaterializerContractTest, ResumeMaterializerEntryPointsExist) {
 
   const std::string resume_body =
       extract_function_body_after_signature_for_temp_table_test(
-          resume_impl, "bool Sql_cmd_resume_preserved_transaction::execute(");
+          resume_impl, "static bool preserved_trx_resume_record_on_thd(");
   ASSERT_FALSE(resume_body.empty());
   const std::string normalized_resume_body =
       normalize_whitespace_for_temp_table_test(resume_body);
@@ -656,6 +656,9 @@ TEST(TempResumeMaterializerContractTest,
       {"Sql_cmd_resume_preserved_transaction::execute",
        extract_function_body_after_signature_for_temp_table_test(
            resume_impl, "bool Sql_cmd_resume_preserved_transaction::execute(")},
+      {"preserved_trx_resume_record_on_thd",
+       extract_function_body_after_signature_for_temp_table_test(
+           resume_impl, "static bool preserved_trx_resume_record_on_thd(")},
   };
   for (const auto &source : checked_sources) {
     ASSERT_FALSE(source.second.empty()) << source.first;
@@ -1780,7 +1783,7 @@ TEST(TempResumeMaterializerContractTest,
 
   const std::string resume_body =
       extract_function_body_after_signature_for_temp_table_test(
-          resume_impl, "bool Sql_cmd_resume_preserved_transaction::execute(");
+          resume_impl, "static bool preserved_trx_resume_record_on_thd(");
   ASSERT_FALSE(resume_body.empty());
   const std::string normalized_resume_body =
       normalize_whitespace_for_temp_table_test(resume_body);

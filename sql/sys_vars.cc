@@ -109,6 +109,7 @@
 #include "sql/psi_memory_key.h"
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_resource.h"
+#include "sql/preserve_trx_promotion.h"
 #include "sql/preserve_trx_transfer.h"
 #include "sql/query_options.h"
 #include "sql/rpl_group_replication.h"  // is_group_replication_running
@@ -1348,6 +1349,31 @@ static Sys_var_uint Sys_preserve_trx_parallel_preserve_threads(
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 1024), DEFAULT(0), BLOCK_SIZE(1),
     NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
+static Sys_var_uint Sys_preserve_trx_startup_recovery_threads(
+    "preserve_trx_startup_recovery_threads",
+    "Number of Preserve/Resume startup snapshot recovery worker threads. 0 "
+    "selects an automatic worker count for local preserved snapshots; 1 "
+    "forces the legacy serial startup recovery loop.",
+    GLOBAL_VAR(preserve_trx_startup_recovery_threads), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, 1024), DEFAULT(0), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_bool Sys_preserve_trx_recover_lock_page_prefetch(
+    "preserve_trx_recover_lock_page_prefetch",
+    "Issue best-effort asynchronous InnoDB page reads for preserved record-lock "
+    "payload pages before startup recovery imports the record locks.",
+    GLOBAL_VAR(preserve_trx_recover_lock_page_prefetch), CMD_LINE(OPT_ARG),
+    DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_recover_lock_page_prefetch_io_bytes_per_sec(
+    "preserve_trx_recover_lock_page_prefetch_io_bytes_per_sec",
+    "Target I/O byte budget per second for Preserve/Resume record-lock page "
+    "prefetch during startup recovery. The first implementation records the "
+    "configured budget for rollout control; prefetch remains best-effort.",
+    GLOBAL_VAR(preserve_trx_recover_lock_page_prefetch_io_bytes_per_sec),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT_MAX32), DEFAULT(134217728),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
 static Sys_var_uint Sys_preserve_trx_lock_warmcopy_conversion_wait_timeout_ms(
     "preserve_trx_lock_warmcopy_conversion_wait_timeout_ms",
     "Maximum milliseconds another session may wait when lock warm-copy has "
@@ -1493,9 +1519,9 @@ static Sys_var_uint Sys_preserve_trx_transfer_sender_workers(
 
 static Sys_var_uint Sys_preserve_trx_transfer_receiver_workers(
     "preserve_trx_transfer_receiver_workers",
-    "reserved count for a planned receiver worker pool in Preserve/Resume "
-    "standby direct-transfer. The current receiver validates and stages each "
-    "command frame on the dispatching session.",
+    "Maximum worker count for the Preserve/Resume standby direct-transfer "
+    "batch receiver payload path. classic single-frame dispatch still validates "
+    "and stages one command frame on the dispatching session.",
     GLOBAL_VAR(preserve_trx_transfer_receiver_workers),
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 1024), DEFAULT(3), BLOCK_SIZE(1),
     NO_MUTEX_GUARD, NOT_IN_BINLOG);
@@ -1522,6 +1548,41 @@ static Sys_var_uint Sys_preserve_trx_transfer_commit_timeout_ms(
     "direct-transfer epoch commit acknowledgment.",
     GLOBAL_VAR(preserve_trx_transfer_commit_timeout_ms),
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, UINT_MAX32), DEFAULT(30000),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_promotion_gate_batch_tokens(
+    "preserve_trx_promotion_gate_batch_tokens",
+    "Maximum standby-pending tokens a single Preserve/Resume promotion gate "
+    "batch may adopt. Requests above this limit fail closed instead of "
+    "silently spilling into an unbounded gate window.",
+    GLOBAL_VAR(preserve_trx_promotion_gate_batch_tokens),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 1024), DEFAULT(3), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_promotion_gate_workers(
+    "preserve_trx_promotion_gate_workers",
+    "Maximum worker count for Preserve/Resume standby promotion gate token "
+    "adoption. The current entry uses this as the default request budget; "
+    "future HA hooks may map it to a bounded worker pool.",
+    GLOBAL_VAR(preserve_trx_promotion_gate_workers), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, 1024), DEFAULT(3), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_promotion_gate_timeout_ms(
+    "preserve_trx_promotion_gate_timeout_ms",
+    "Default promotion gate deadline in milliseconds for Preserve/Resume "
+    "standby adopt operations.",
+    GLOBAL_VAR(preserve_trx_promotion_gate_timeout_ms),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, UINT_MAX32), DEFAULT(1000),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_promotion_gate_record_lock_page_cap(
+    "preserve_trx_promotion_gate_record_lock_page_cap",
+    "Maximum record-lock page count a single Preserve/Resume promotion gate "
+    "may adopt. Tokens above this cap fail closed so large lock imports remain "
+    "outside the bounded promotion gate.",
+    GLOBAL_VAR(preserve_trx_promotion_gate_record_lock_page_cap),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT_MAX32), DEFAULT(2000),
     BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
 static bool fix_binlog_cache_size(sys_var *, THD *thd, enum_var_type) {

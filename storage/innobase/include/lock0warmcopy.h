@@ -32,6 +32,8 @@
 #include "db0err.h"
 
 struct ib_lock_t;
+struct buf_block_t;
+struct dict_index_t;
 class THD;
 struct trx_lock_t;
 struct trx_t;
@@ -101,6 +103,8 @@ struct lock_warmcopy_record_shard_snapshot_t {
   */
   std::vector<unsigned char> normalized_bitmap;
   std::vector<lock_warmcopy_record_image_entry_t> record_images;
+  uint64_t page_lsn{0};
+  uint32_t page_n_heap{0};
   uint32_t set_bit_count{0};
   /*
     State flags and generations distinguish clean reuse from dirty rescan and
@@ -269,8 +273,15 @@ bool lock_warmcopy_record_bitmap_set_with_image_for_trx(
     uint32_t heap_no, const lock_warmcopy_record_image_digest_t &digest,
     uint32_t heap_offset, const std::string &encoded_record_image);
 bool lock_warmcopy_record_bitmap_set_with_image_for_lock(
-    const ib_lock_t *lock, uint32_t heap_no, uint32_t heap_offset,
+    const ib_lock_t *lock, const buf_block_t *block, uint32_t heap_no,
+    uint32_t heap_offset, const std::string &encoded_record_image);
+bool lock_warmcopy_record_store_refresh_record_image_for_trx(
+    const trx_t *trx, const dict_index_t *index, const buf_block_t *block,
+    uint32_t heap_no, uint32_t heap_offset,
     const std::string &encoded_record_image);
+bool lock_warmcopy_refresh_record_image_after_update(
+    trx_t *trx, const dict_index_t *index, const buf_block_t *block,
+    uint32_t heap_no);
 lock_warmcopy_debug_stats_t lock_warmcopy_debug_stats_for_unit_test();
 void lock_warmcopy_reset_for_unit_test();
 bool lock_warmcopy_record_store_export_record_payload(std::string *payload,

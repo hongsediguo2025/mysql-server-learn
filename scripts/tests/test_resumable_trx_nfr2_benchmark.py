@@ -53,6 +53,59 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
                 SimpleNamespace(phase2_pause_ms=25.0),
                 SimpleNamespace(phase2_pause_ms=50.0),
             ]
+            self.startup_recovery_metrics = [
+                SimpleNamespace(
+                    elapsed_ms=13206.843,
+                    snapshot_tokens=1000,
+                    local_snapshot_tokens=1000,
+                    binlog_cache_tokens=1000,
+                    error=0,
+                    outcome="completed",
+                    snapshot_load_ms=12.5,
+                    snapshot_validate_ms=2.25,
+                    snapshot_kernel_ms=13192.093,
+                    snapshot_claim_ms=1.0,
+                    snapshot_read_view_ms=2.0,
+                    snapshot_table_locks_ms=3.0,
+                    snapshot_record_locks_ms=13100.0,
+                    snapshot_record_lock_entries=1000,
+                    snapshot_record_lock_stable_page_hits=997,
+                    snapshot_record_lock_image_resolves=3,
+                    snapshot_record_lock_bitmap_pages=1000,
+                    snapshot_record_lock_bitmap_bits=100000000,
+                    snapshot_record_lock_page_get_us=9900000,
+                    snapshot_record_lock_page_get_count=1000,
+                    snapshot_record_lock_table_open_us=880000,
+                    snapshot_record_lock_prefetch_pages=1000,
+                    snapshot_record_lock_prefetch_bytes=16384000,
+                    snapshot_record_lock_prefetch_residency_pages=1000,
+                    snapshot_record_lock_prefetch_resident_pages=998,
+                    snapshot_record_lock_prefetch_io_pending_pages=1,
+                    snapshot_record_lock_prefetch_missing_pages=1,
+                    snapshot_predicate_locks_ms=4.0,
+                    snapshot_mdl_ms=5.0,
+                    snapshot_register_ms=6.0,
+                )
+            ]
+            self.promotion_gate_elapsed_samples_us = [4567]
+            self.promotion_gate_server_metrics = [
+                SimpleNamespace(
+                    elapsed_us=3456,
+                    token_count=3,
+                    adopted_count=2,
+                    abandoned_count=1,
+                    skipped_count=0,
+                    max_worker_elapsed_us=2345,
+                    p50_worker_elapsed_us=1234,
+                    p95_worker_elapsed_us=2345,
+                    record_lock_page_count=30,
+                    record_lock_resident_pages=30,
+                    record_lock_cold_page_gets=0,
+                    ready_cache_miss_count=0,
+                    over_budget_count=0,
+                    status_code=1,
+                )
+            ]
 
         def run(self):
             append_log = getattr(self.config, "append_log_during_run", "")
@@ -697,6 +750,137 @@ class ResumableTrxNfr2BenchmarkTest(unittest.TestCase):
         self.assertEqual(900, report["phase1_record_active_scan_target_count"])
         self.assertEqual(998, report["phase2_record_prebuilt_target_count"])
         self.assertEqual(2, report["phase2_record_materialized_target_count"])
+        self.assertEqual(
+            {
+                "sample_count": 1,
+                "p50_ms": 13206.843,
+                "p95_ms": 13206.843,
+                "p99_ms": 13206.843,
+                "max_ms": 13206.843,
+            },
+            report["startup_recovery_elapsed_summary_ms"],
+        )
+        self.assertEqual([1000], report["startup_recovery_token_samples"])
+        self.assertEqual({"completed": 1}, report["startup_recovery_outcomes"])
+        self.assertEqual([12.5], report["startup_recovery_snapshot_load_samples_ms"])
+        self.assertEqual(
+            [2.25], report["startup_recovery_snapshot_validate_samples_ms"]
+        )
+        self.assertEqual(
+            [13192.093], report["startup_recovery_snapshot_kernel_samples_ms"]
+        )
+        self.assertEqual(
+            [13100.0], report["startup_recovery_snapshot_record_locks_samples_ms"]
+        )
+        self.assertEqual(
+            [1000],
+            report["startup_recovery_snapshot_record_lock_entries_samples"],
+        )
+        self.assertEqual(
+            [997],
+            report[
+                "startup_recovery_snapshot_record_lock_stable_page_hits_samples"
+            ],
+        )
+        self.assertEqual(
+            [3],
+            report["startup_recovery_snapshot_record_lock_image_resolves_samples"],
+        )
+        self.assertEqual(
+            [1000],
+            report["startup_recovery_snapshot_record_lock_bitmap_pages_samples"],
+        )
+        self.assertEqual(
+            [100000000],
+            report["startup_recovery_snapshot_record_lock_bitmap_bits_samples"],
+        )
+        self.assertEqual(
+            [9900000],
+            report["startup_recovery_snapshot_record_lock_page_get_us_samples"],
+        )
+        self.assertEqual(
+            [1000],
+            report["startup_recovery_snapshot_record_lock_page_get_count_samples"],
+        )
+        self.assertEqual(
+            [880000],
+            report["startup_recovery_snapshot_record_lock_table_open_us_samples"],
+        )
+        self.assertEqual(
+            [1000],
+            report["startup_recovery_snapshot_record_lock_prefetch_pages_samples"],
+        )
+        self.assertEqual(
+            [16384000],
+            report["startup_recovery_snapshot_record_lock_prefetch_bytes_samples"],
+        )
+        self.assertEqual(
+            [1000],
+            report[
+                "startup_recovery_snapshot_record_lock_prefetch_residency_pages_samples"
+            ],
+        )
+        self.assertEqual(
+            [998],
+            report[
+                "startup_recovery_snapshot_record_lock_prefetch_resident_pages_samples"
+            ],
+        )
+        self.assertEqual(
+            [1],
+            report[
+                "startup_recovery_snapshot_record_lock_prefetch_io_pending_pages_samples"
+            ],
+        )
+        self.assertEqual(
+            [1],
+            report[
+                "startup_recovery_snapshot_record_lock_prefetch_missing_pages_samples"
+            ],
+        )
+        self.assertEqual(
+            {
+                "sample_count": 1,
+                "p50_ms": 13192.093,
+                "p95_ms": 13192.093,
+                "p99_ms": 13192.093,
+                "max_ms": 13192.093,
+            },
+            report["startup_recovery_snapshot_kernel_summary_ms"],
+        )
+        self.assertEqual(
+            {
+                "sample_count": 1,
+                "p50_ms": 13100.0,
+                "p95_ms": 13100.0,
+                "p99_ms": 13100.0,
+                "max_ms": 13100.0,
+            },
+            report["startup_recovery_snapshot_record_locks_summary_ms"],
+        )
+        self.assertEqual([4.567], report["promotion_gate_elapsed_samples_ms"])
+        self.assertEqual(
+            {
+                "sample_count": 1,
+                "p50_ms": 3.456,
+                "p95_ms": 3.456,
+                "p99_ms": 3.456,
+                "max_ms": 3.456,
+            },
+            report["server_promotion_gate_elapsed_summary_ms"],
+        )
+        self.assertEqual([3], report["server_promotion_gate_token_samples"])
+        self.assertEqual([2], report["server_promotion_gate_adopted_samples"])
+        self.assertEqual([1], report["server_promotion_gate_abandoned_samples"])
+        self.assertEqual([0], report["server_promotion_gate_skipped_samples"])
+        self.assertEqual([1.234], report["server_promotion_gate_p50_worker_samples_ms"])
+        self.assertEqual([2.345], report["server_promotion_gate_p95_worker_samples_ms"])
+        self.assertEqual([30], report["server_promotion_gate_record_lock_page_samples"])
+        self.assertEqual([30], report["server_promotion_gate_record_lock_resident_page_samples"])
+        self.assertEqual([0], report["server_promotion_gate_record_lock_cold_page_get_samples"])
+        self.assertEqual([0], report["server_promotion_gate_ready_cache_miss_samples"])
+        self.assertEqual([0], report["server_promotion_gate_over_budget_samples"])
+        self.assertEqual([1], report["server_promotion_gate_status_code_samples"])
 
     def test_required_phase2_pause_gate_returns_nonzero_on_failed_comparison(self):
         def fake_run_scenario(scenario):

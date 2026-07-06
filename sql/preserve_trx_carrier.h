@@ -64,6 +64,13 @@ struct Preserved_trx_carrier_listing {
   std::set<std::string> snapshot_tokens;
   std::set<std::string> external_blob_tokens;
   std::set<std::string> temp_sidecar_tokens;
+  /*
+    Tokens with visible temporary artifacts at listing time. Startup recovery
+    uses this to keep the common path (durable snapshot + final external
+    blobs, no stale tmp files) from rescanning sidecar directories once per
+    token.
+  */
+  std::set<std::string> stale_tmp_tokens;
   std::set<std::string> tainted_tokens;
   std::set<std::string> standby_pending_tokens;
   /*
@@ -249,7 +256,7 @@ class Preserved_trx_carrier {
       Preserve_snapshot_remove_options options = {}) = 0;
 
   virtual Preserved_trx_carrier_status remove_stale_tmp_files(
-      const std::string &token) = 0;
+      const std::string &token, bool heavy_cleanup = true) = 0;
 
   virtual Preserved_trx_carrier_status mark_tainted(
       const std::string &token, const std::string &reason) = 0;
@@ -353,6 +360,12 @@ class Preserved_trx_warm_external_blob_carrier {
       uint64_t warmcopy_epoch,
       const Preserved_trx_external_blob_descriptor &descriptor) = 0;
 
+  virtual Preserved_trx_carrier_status read_warm_external_blob(
+      const std::string &warmcopy_id, const std::string &blob_name,
+      uint64_t warmcopy_epoch,
+      const Preserved_trx_external_blob_descriptor &descriptor,
+      uint64_t max_bytes, Preserved_trx_external_blob *blob) = 0;
+
   /*
     Cleanup wildcard for one warmcopy id/blob family. It removes staged bodies
     and descriptors that match that scratch identity, regardless of epoch, and
@@ -445,7 +458,8 @@ class Preserved_trx_store {
   Preserve_snapshot_delete_status remove_with_status(
       const std::string &token, Preserve_snapshot_remove_options options = {});
 
-  Preserve_snapshot_status remove_stale_tmp_files(const std::string &token);
+  Preserve_snapshot_status remove_stale_tmp_files(const std::string &token,
+                                                  bool heavy_cleanup = true);
 
  private:
   Preserve_snapshot_status write_impl(

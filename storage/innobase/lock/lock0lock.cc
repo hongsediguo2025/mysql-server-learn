@@ -914,6 +914,12 @@ const lock_t *lock_preserve_record_lock_has_conflict(
   return lock_rec_other_has_conflicting(precise_mode, block, heap_no, trx);
 }
 
+bool lock_preserve_record_lock_object_has_conflict(
+    ulint precise_mode, const lock_t *lock, bool lock_is_on_supremum,
+    trx_t *trx) {
+  return lock_rec_has_to_wait(trx, precise_mode, lock, lock_is_on_supremum);
+}
+
 trx_t *lock_preserve_secondary_record_implicit_owner(const rec_t *rec,
                                                     dict_index_t *index,
                                                     const ulint *offsets) {
@@ -1515,6 +1521,60 @@ void lock_preserve_add_record_lock_for_import(ulint type_mode,
                                               dict_index_t *index,
                                               trx_t *trx) {
   lock_rec_add_to_queue(type_mode, block, heap_no, index, trx, true);
+}
+
+bool lock_preserve_add_record_bitmap_for_import(ulint type_mode,
+                                                const buf_block_t *block,
+                                                uint32_t n_bits,
+                                                const byte *bitmap,
+                                                size_t bitmap_len,
+                                                uint32_t first_set_heap_no,
+                                                dict_index_t *index,
+                                                trx_t *trx) {
+  if (block == nullptr || bitmap == nullptr || index == nullptr || trx == nullptr ||
+      n_bits == 0 || bitmap_len == 0 || bitmap_len > UINT32_MAX / 8 ||
+      n_bits != static_cast<uint32_t>(bitmap_len * 8) ||
+      first_set_heap_no >= n_bits) {
+    return false;
+  }
+
+  ut_ad(locksys::owns_page_shard(block->get_page_id()));
+  ut_ad(trx_mutex_own(trx));
+  ut_ad(!(type_mode & (LOCK_PREDICATE | LOCK_PRDT_PAGE)));
+
+  const ulint anchor_heap_no = first_set_heap_no;
+
+  if (anchor_heap_no == PAGE_HEAP_NO_SUPREMUM) {
+    if (type_mode & LOCK_REC_NOT_GAP) {
+      return false;
+    }
+    type_mode &= ~(LOCK_GAP | LOCK_REC_NOT_GAP);
+  }
+
+  const size_t lock_bitmap_bytes =
+      1 + ((page_dir_get_n_heap(block->frame) + LOCK_PAGE_BITMAP_MARGIN) / 8);
+  if (lock_bitmap_bytes > UINT32_MAX / 8 ||
+      static_cast<uint32_t>(lock_bitmap_bytes * 8) != n_bits) {
+    return false;
+  }
+
+  /*
+    Startup recovery has already validated conflicts and record identity for
+    the whole page-level bitmap. Importing the validated bitmap as one lock_t
+    preserves the same queue/hash shape as the runtime path without replaying
+    every set heap bit through lock_rec_add_to_queue().
+  */
+  RecLock rec_lock(index, block, anchor_heap_no, type_mode);
+  lock_t *lock = rec_lock.create(trx);
+  if (lock == nullptr) {
+    return false;
+  }
+  ut_ad(lock_rec_get_n_bits(lock) == n_bits);
+
+  memset(&lock[1], 0, lock_rec_get_n_bits(lock) / 8);
+  memcpy(&lock[1], bitmap, bitmap_len);
+
+  return true;
 }
 
 /** This is a fast routine for locking a record in the most common cases:

@@ -134,6 +134,11 @@ trx_t *trx_preserve_current_thd_trx(THD *thd) {
   return thd == nullptr ? nullptr : thd_to_trx(thd);
 }
 
+uint64_t trx_preserve_current_redo_lsn() {
+  if (log_sys == nullptr) return 0;
+  return static_cast<uint64_t>(log_get_lsn(*log_sys));
+}
+
 static void trx_preserve_append_le32(std::string *payload, uint32_t value) {
   for (size_t i = 0; i < 4; ++i) {
     payload->push_back(static_cast<char>((value >> (i * 8)) & 0xff));
@@ -940,6 +945,8 @@ void trx_preserve_release_claim_before_free(trx_t *trx) {
   }
 }
 
+static trx_t *trx_preserve_current_thd_get_trx_if_available(THD *thd);
+
 bool trx_preserve_current_thd_has_read_view(THD *thd) {
   if (thd == nullptr) {
     return false;
@@ -947,6 +954,18 @@ bool trx_preserve_current_thd_has_read_view(THD *thd) {
 
   trx_t *trx = thd_to_trx(thd);
   return trx_preserve_trx_has_read_view(trx);
+}
+
+bool trx_preserve_current_thd_has_record_locks(THD *thd) {
+  trx_t *trx = trx_preserve_current_thd_get_trx_if_available(thd);
+  if (trx == nullptr) return false;
+
+  /*
+    This is only a phase-1 warmcopy candidate hint. The authoritative seal path
+    samples the full lock fence and falls back if the prebuilt payload cannot be
+    proven current, so this helper must not be used as a correctness fence.
+  */
+  return trx->lock.n_rec_locks.load() != 0;
 }
 
 static trx_t *trx_preserve_current_thd_get_trx_if_available(THD *thd) {
@@ -1271,6 +1290,21 @@ dberr_t trx_preserve_export_record_locks(THD *thd, std::string *payload,
   return lock_preserve_export_record_locks(trx, payload, max_lock_count);
 }
 
+dberr_t trx_preserve_export_record_locks_stable_page_only(
+    THD *thd, std::string *payload, uint32_t max_lock_count) {
+  if (thd == nullptr || payload == nullptr) {
+    return DB_ERROR;
+  }
+
+  trx_t *trx = thd_to_trx(thd);
+  if (trx == nullptr) {
+    return DB_ERROR;
+  }
+
+  return lock_preserve_export_record_locks_stable_page_only(
+      trx, payload, max_lock_count);
+}
+
 bool trx_preserve_sample_lock_warmcopy_fence(
     trx_t *trx, lock_warmcopy_trx_lock_fence_t *fence) {
   if (trx == nullptr || fence == nullptr) return false;
@@ -1363,6 +1397,32 @@ dberr_t trx_preserve_import_record_locks(trx_t *trx,
   return lock_preserve_import_record_locks(trx, payload);
 }
 
+dberr_t trx_preserve_import_record_locks(
+    trx_t *trx, const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics) {
+  return lock_preserve_import_record_locks(trx, payload, metrics);
+}
+
+dberr_t trx_preserve_import_record_locks(
+    trx_t *trx, const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics,
+    bool (*deadline_expired)(void *), void *deadline_ctx) {
+  return lock_preserve_import_record_locks(trx, payload, metrics,
+                                           deadline_expired, deadline_ctx);
+}
+
+dberr_t trx_preserve_prefetch_record_lock_pages(
+    const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics) {
+  return lock_preserve_prefetch_record_lock_pages(payload, metrics);
+}
+
+dberr_t trx_preserve_prefetch_record_lock_pages_for_gate(
+    const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics) {
+  return lock_preserve_prefetch_record_lock_pages_for_gate(payload, metrics);
+}
+
 bool trx_preserve_record_locks_payload_is_valid_for_import(
     const std::string &payload) {
   return lock_preserve_record_locks_payload_is_valid_for_import(payload);
@@ -1371,6 +1431,17 @@ bool trx_preserve_record_locks_payload_is_valid_for_import(
 bool trx_preserve_record_locks_payload_lock_count(
     const std::string &payload, uint32_t *lock_count) {
   return lock_preserve_record_locks_payload_lock_count(payload, lock_count);
+}
+
+bool trx_preserve_record_lock_payload_page_plan(
+    const std::string &payload, trx_preserve_record_lock_page_plan_t *plan) {
+  return lock_preserve_record_lock_payload_page_plan(payload, plan);
+}
+
+bool trx_preserve_record_lock_payload_residency(
+    const std::string &payload,
+    trx_preserve_record_lock_residency_t *residency) {
+  return lock_preserve_record_lock_payload_residency(payload, residency);
 }
 
 bool trx_preserve_split_record_and_predicate_locks(

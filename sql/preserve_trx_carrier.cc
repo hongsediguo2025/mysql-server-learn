@@ -761,7 +761,8 @@ Preserve_snapshot_delete_status Preserved_trx_store::remove_with_status(
 }
 
 Preserve_snapshot_status Preserved_trx_store::remove_stale_tmp_files(
-    const std::string &token) {
+    const std::string &token, bool heavy_cleanup) {
   if (m_carrier == nullptr) return Preserve_snapshot_status::INVALID_ARGUMENT;
-  return map_carrier_status(m_carrier->remove_stale_tmp_files(token));
+  return map_carrier_status(
+      m_carrier->remove_stale_tmp_files(token, heavy_cleanup));
 }
