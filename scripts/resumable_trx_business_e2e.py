@@ -77,6 +77,30 @@ def _int_report_value(report: Dict[str, object], key: str) -> int:
     return 0
 
 
+def _summarize_us_samples(samples: Sequence[Optional[int]]) -> Dict[str, Optional[int]]:
+    values = sorted(int(sample) for sample in samples if sample is not None)
+    if not values:
+        return {
+            "sample_count": 0,
+            "p50_us": None,
+            "p95_us": None,
+            "p99_us": None,
+            "max_us": None,
+        }
+
+    def nearest_rank(percentile: int) -> int:
+        index = max(0, math.ceil(percentile / 100.0 * len(values)) - 1)
+        return values[min(index, len(values) - 1)]
+
+    return {
+        "sample_count": len(values),
+        "p50_us": nearest_rank(50),
+        "p95_us": nearest_rank(95),
+        "p99_us": nearest_rank(99),
+        "max_us": values[-1],
+    }
+
+
 def _validate_lock_heavy_startup_report_fields(report: Dict[str, object]) -> None:
     missing = [
         field
@@ -4504,6 +4528,16 @@ class BusinessE2ERunner:
         receiver_epoch_fact_bound = artifact_counts.get(
             "epoch_fact_count", 0
         ) > 0 and artifact_counts.get("epoch_commit_count", 0) > 0
+        source_phase2_total_us = [
+            int(round(metric.phase2_total_ms * 1000))
+            for metric in metrics
+            if metric.phase2_total_ms is not None
+        ]
+        receiver_ready_lag_samples = (
+            []
+            if receiver_ready_after_source_phase2_end_us is None
+            else [receiver_ready_after_source_phase2_end_us]
+        )
         report = {
             "generated_at_utc": datetime.datetime.utcnow()
             .replace(microsecond=0)
@@ -4565,6 +4599,9 @@ class BusinessE2ERunner:
                 metric.lock_warmcopy_live_fallback_count() or 0
                 for metric in metrics
             ),
+            "standby_tokens": artifact_counts.get("standby_pending_tokens", 0),
+            "source_phase2_total_us": source_phase2_total_us,
+            "source_phase2_end_us": source_phase2_end_us,
             "receiver_snapshot_tokens": artifact_counts.get("snapshot_tokens", 0),
             "receiver_standby_pending_tokens": artifact_counts.get(
                 "standby_pending_tokens", 0
@@ -4589,6 +4626,9 @@ class BusinessE2ERunner:
             ),
             "receiver_ready_after_source_phase2_end_us": (
                 receiver_ready_after_source_phase2_end_us
+            ),
+            "receiver_ready_after_source_phase2_summary_us": (
+                _summarize_us_samples(receiver_ready_lag_samples)
             ),
             "receiver_phase1_transfer_prewarm_overlap": receiver_phase1_overlap,
         }

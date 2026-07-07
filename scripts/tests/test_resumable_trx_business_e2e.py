@@ -4595,11 +4595,24 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertTrue(report["success"])
             self.assertEqual(report["scenario"], "standby_transfer_receiver_drain_metrics")
             self.assertEqual(report["receiver_standby_pending_tokens"], 2)
+            self.assertEqual(report["standby_tokens"], 2)
             self.assertEqual(report["receiver_epoch_fact_count"], 1)
             self.assertEqual(report["receiver_snapshot_tokens"], 2)
             self.assertTrue(report["receiver_epoch_fact_bound"])
             self.assertEqual(report["phase2_total_samples_ms"], [34.0])
+            self.assertEqual(report["source_phase2_total_us"], [34000])
+            self.assertEqual(report["source_phase2_end_us"], 1_000_000)
             self.assertEqual(report["receiver_ready_after_source_phase2_end_us"], 42000)
+            self.assertEqual(
+                report["receiver_ready_after_source_phase2_summary_us"],
+                {
+                    "sample_count": 1,
+                    "p50_us": 42000,
+                    "p95_us": 42000,
+                    "p99_us": 42000,
+                    "max_us": 42000,
+                },
+            )
             self.assertTrue(report["receiver_phase1_transfer_prewarm_overlap"])
             self.assertEqual(report["receiver_ready_tokens"], 3)
             self.assertEqual(report["receiver_not_ready_tokens"], 1)
