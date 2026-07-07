@@ -420,6 +420,7 @@ class HarnessConfig:
     two_phase: bool = False
     max_phase2_pause_ms: int = 5000
     max_phase2_total_ms: int = 0
+    max_receiver_ready_after_phase2_ms: int = 0
     warmcopy_disabled_baseline_slope_ms_per_mb: Optional[float] = None
     temp_table_workload: bool = False
     temp_table_target_mb: int = 0
@@ -442,6 +443,7 @@ class HarnessConfig:
     source_start_command: Optional[str] = None
     receiver_start_command: Optional[str] = None
     receiver_restart_command: Optional[str] = None
+    receiver_physical_copy_before_drain: bool = False
     standby_transfer_user: str = "preserve_transfer_receiver"
     standby_transfer_password: str = "preserve_transfer_secret"
     standby_transfer_credential_name: str = "preserve_transfer_credential"
@@ -469,6 +471,10 @@ class HarnessConfig:
             raise ValueError("table_count must be positive")
         if self.promotion_gate_required_apply_lsn < 0:
             raise ValueError("promotion gate required apply LSN must be non-negative")
+        if self.max_receiver_ready_after_phase2_ms < 0:
+            raise ValueError(
+                "max receiver ready after phase2 ms must be non-negative"
+            )
         if self.scenario == "standby_transfer_receiver_drain_metrics":
             if not self.receiver_preserve_dir:
                 raise ValueError(
@@ -482,6 +488,31 @@ class HarnessConfig:
                 )
             if not self.standby_transfer_credential_name:
                 raise ValueError("standby transfer credential name is required")
+            if self.receiver_physical_copy_before_drain:
+                if not self.source_datadir:
+                    raise ValueError(
+                        "standby_transfer_receiver_drain_metrics "
+                        "requires --source-datadir when "
+                        "--receiver-physical-copy-before-drain is used"
+                    )
+                if not self.receiver_datadir:
+                    raise ValueError(
+                        "standby_transfer_receiver_drain_metrics "
+                        "requires --receiver-datadir when "
+                        "--receiver-physical-copy-before-drain is used"
+                    )
+                if not self.restart_command:
+                    raise ValueError(
+                        "standby_transfer_receiver_drain_metrics "
+                        "requires --restart-command when "
+                        "--receiver-physical-copy-before-drain is used"
+                    )
+                if not self.receiver_restart_command:
+                    raise ValueError(
+                        "standby_transfer_receiver_drain_metrics "
+                        "requires --receiver-restart-command when "
+                        "--receiver-physical-copy-before-drain is used"
+                    )
         if self.scenario == "receiver_drain_then_promotion_gate":
             if not self.receiver_preserve_dir:
                 raise ValueError(
@@ -729,6 +760,7 @@ class WarmcopyDrainMetrics:
     phase2_pause_ms: float
     full_copy_to_count: Optional[int]
     phase2_total_ms: Optional[float] = None
+    phase2_end_monotonic_us: Optional[int] = None
     phase2_slo_guaranteed: Optional[int] = None
     phase2_slo_reason: Optional[str] = None
     phase2_target_count: Optional[int] = None
@@ -827,6 +859,26 @@ class PromotionGateMetrics:
     ready_cache_miss_count: int
     over_budget_count: int
     status_code: int
+
+
+@dataclasses.dataclass(frozen=True)
+class ReceiverPrewarmMetrics:
+    auto_prewarm_tokens: int
+    auto_prewarm_ready_tokens: int
+    auto_prewarm_not_ready_tokens: int
+    auto_prewarm_last_status: int
+    ready_monotonic_us: int
+    first_frame_monotonic_us: int
+    last_object_seal_monotonic_us: int
+    prewarm_start_monotonic_us: int
+    prewarm_end_monotonic_us: int
+    record_lock_page_count: int
+    record_lock_resident_pages: int
+    record_lock_cold_page_gets: int
+    seal_prewarm_tokens: int
+    seal_prewarm_success_tokens: int
+    seal_prewarm_not_ready_tokens: int
+    seal_prewarm_last_status: int
 
 
 class WorkloadPlan:
@@ -3496,6 +3548,7 @@ class BusinessE2ERunner:
         self.startup_recovery_metrics: List[StartupRecoveryMetrics] = []
         self.promotion_gate_elapsed_samples_us: List[int] = []
         self.promotion_gate_server_metrics: List[PromotionGateMetrics] = []
+        self.receiver_prewarm_metrics: Optional[ReceiverPrewarmMetrics] = None
         self.post_resume_temp_dml_executed = False
 
     def run(self) -> None:
@@ -3648,6 +3701,8 @@ class BusinessE2ERunner:
         receiver_conn.close()
         if self.config.setup_schema:
             self.setup_schema()
+        if self.config.receiver_physical_copy_before_drain:
+            self.materialize_receiver_physical_copy_before_drain()
         self.configure_standby_transfer_credentials()
         self.configure_preserve_globals()
         if (
@@ -3720,6 +3775,13 @@ class BusinessE2ERunner:
                     self.config.sessions if self.config.strict_token_count else 1
                 ),
                 timeout_s=self.config.resume_timeout_s,
+            )
+            self.wait_for_receiver_readiness(
+                expected_standby_pending=(
+                    self.config.sessions if self.config.strict_token_count else 1
+                ),
+                timeout_s=self.config.resume_timeout_s,
+                connection_factory=self._receiver_admin_connection,
             )
             completed_stmt_total = sum(
                 worker.statements_completed for worker in self.workers
@@ -3822,6 +3884,43 @@ class BusinessE2ERunner:
         finally:
             receiver_conn.close()
         self.wait_until_receiver_down(self.config.shutdown_timeout_s)
+
+    def shutdown_source_for_receiver_physical_copy(self) -> None:
+        source_conn = self.runtime.connect(database=False)
+        try:
+            self.runtime.execute(source_conn, "SHUTDOWN")
+        except BaseException as exc:
+            if not self.runtime.is_connection_error(exc):
+                raise
+        finally:
+            try:
+                source_conn.close()
+            except BaseException:
+                pass
+        self.runtime.wait_until_down(self.config.shutdown_timeout_s)
+
+    def restart_source_server(self) -> None:
+        if not self.config.restart_command:
+            raise RuntimeError(
+                "--restart-command is required after source shutdown"
+            )
+        LOG.info("starting source mysqld with restart command: %s",
+                 self.config.restart_command)
+        process = subprocess.Popen(self.config.restart_command, shell=True)
+        if not hasattr(self, "server_processes"):
+            self.server_processes = []
+        self.server_processes.append(process)
+        self.runtime.wait_until_up(self.config.startup_timeout_s)
+
+    def materialize_receiver_physical_copy_before_drain(self) -> None:
+        LOG.info(
+            "materializing receiver datadir from source before standby-transfer drain"
+        )
+        self.shutdown_source_for_receiver_physical_copy()
+        self.shutdown_receiver_for_physical_standby_copy()
+        self.materialize_physical_standby_datadir_for_promotion()
+        self.restart_receiver_server()
+        self.restart_source_server()
 
     def wait_until_receiver_down(self, timeout_s: float) -> None:
         deadline = time.monotonic() + timeout_s
@@ -4340,6 +4439,39 @@ class BusinessE2ERunner:
             time.sleep(min(0.2, remaining))
             last_counts = self.receiver_preserve_artifact_counts()
 
+    def wait_for_receiver_readiness(
+        self,
+        *,
+        expected_standby_pending: int,
+        timeout_s: float,
+        connection_factory: Optional[Callable[[], object]] = None,
+        poll_interval_s: float = 0.2,
+    ) -> None:
+        deadline = time.monotonic() + timeout_s
+        last_error: Optional[BaseException] = None
+        while True:
+            self.receiver_prewarm_metrics = (
+                self.read_receiver_prewarm_metrics_from_status(
+                    connection_factory=connection_factory
+                )
+            )
+            self.compute_receiver_ready_after_source_phase2_end_us()
+            try:
+                self.validate_standby_transfer_receiver_readiness(
+                    expected_standby_pending=expected_standby_pending
+                )
+                return
+            except AssertionError as exc:
+                last_error = exc
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if last_error is not None:
+                    raise last_error
+                raise TimeoutError("receiver readiness did not become available")
+            if poll_interval_s > 0:
+                time.sleep(min(poll_interval_s, remaining))
+
     def write_standby_transfer_receiver_report(
         self, status: str, completed_stmt_total: int, error: Optional[str] = None
     ) -> None:
@@ -4352,6 +4484,26 @@ class BusinessE2ERunner:
             getattr(self, "receiver_artifact_counts", {})
             or self.receiver_preserve_artifact_counts()
         )
+        receiver_ready_after_source_phase2_end_us = getattr(
+            self, "receiver_ready_after_source_phase2_end_us", None
+        )
+        receiver_prewarm_metrics = getattr(self, "receiver_prewarm_metrics", None)
+        source_phase2_end_us = self.latest_source_phase2_end_monotonic_us()
+        receiver_phase1_overlap = (
+            None
+            if receiver_prewarm_metrics is None or source_phase2_end_us is None
+            else (
+                receiver_prewarm_metrics.first_frame_monotonic_us > 0
+                and receiver_prewarm_metrics.prewarm_start_monotonic_us > 0
+                and receiver_prewarm_metrics.first_frame_monotonic_us
+                <= source_phase2_end_us
+                and receiver_prewarm_metrics.prewarm_start_monotonic_us
+                <= source_phase2_end_us
+            )
+        )
+        receiver_epoch_fact_bound = artifact_counts.get(
+            "epoch_fact_count", 0
+        ) > 0 and artifact_counts.get("epoch_commit_count", 0) > 0
         report = {
             "generated_at_utc": datetime.datetime.utcnow()
             .replace(microsecond=0)
@@ -4424,7 +4576,75 @@ class BusinessE2ERunner:
             "receiver_epoch_commit_count": artifact_counts.get(
                 "epoch_commit_count", 0
             ),
+            "receiver_epoch_fact_bound": receiver_epoch_fact_bound,
+            "receiver_ready_tokens": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.auto_prewarm_ready_tokens
+            ),
+            "receiver_not_ready_tokens": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.auto_prewarm_not_ready_tokens
+            ),
+            "receiver_ready_after_source_phase2_end_us": (
+                receiver_ready_after_source_phase2_end_us
+            ),
+            "receiver_phase1_transfer_prewarm_overlap": receiver_phase1_overlap,
         }
+        if receiver_prewarm_metrics is not None:
+            report.update(
+                {
+                    "receiver_auto_prewarm_tokens": (
+                        receiver_prewarm_metrics.auto_prewarm_tokens
+                    ),
+                    "receiver_auto_prewarm_ready_tokens": (
+                        receiver_prewarm_metrics.auto_prewarm_ready_tokens
+                    ),
+                    "receiver_auto_prewarm_not_ready_tokens": (
+                        receiver_prewarm_metrics.auto_prewarm_not_ready_tokens
+                    ),
+                    "receiver_auto_prewarm_last_status": (
+                        receiver_prewarm_metrics.auto_prewarm_last_status
+                    ),
+                    "receiver_ready_monotonic_us": (
+                        receiver_prewarm_metrics.ready_monotonic_us
+                    ),
+                    "receiver_first_frame_monotonic_us": (
+                        receiver_prewarm_metrics.first_frame_monotonic_us
+                    ),
+                    "receiver_last_object_seal_monotonic_us": (
+                        receiver_prewarm_metrics.last_object_seal_monotonic_us
+                    ),
+                    "receiver_prewarm_start_monotonic_us": (
+                        receiver_prewarm_metrics.prewarm_start_monotonic_us
+                    ),
+                    "receiver_prewarm_end_monotonic_us": (
+                        receiver_prewarm_metrics.prewarm_end_monotonic_us
+                    ),
+                    "receiver_record_lock_page_count": (
+                        receiver_prewarm_metrics.record_lock_page_count
+                    ),
+                    "receiver_record_lock_resident_pages": (
+                        receiver_prewarm_metrics.record_lock_resident_pages
+                    ),
+                    "receiver_record_cold_gets": (
+                        receiver_prewarm_metrics.record_lock_cold_page_gets
+                    ),
+                    "receiver_seal_prewarm_tokens": (
+                        receiver_prewarm_metrics.seal_prewarm_tokens
+                    ),
+                    "receiver_seal_prewarm_success_tokens": (
+                        receiver_prewarm_metrics.seal_prewarm_success_tokens
+                    ),
+                    "receiver_seal_prewarm_not_ready_tokens": (
+                        receiver_prewarm_metrics.seal_prewarm_not_ready_tokens
+                    ),
+                    "receiver_seal_prewarm_last_status": (
+                        receiver_prewarm_metrics.seal_prewarm_last_status
+                    ),
+                }
+            )
         if error:
             report["error"] = error
         report_path.write_text(
@@ -4432,6 +4652,104 @@ class BusinessE2ERunner:
             + "\n",
             encoding="utf-8",
         )
+
+    def validate_standby_transfer_receiver_readiness(
+        self, *, expected_standby_pending: int
+    ) -> None:
+        artifact_counts = dict(
+            getattr(self, "receiver_artifact_counts", {})
+            or self.receiver_preserve_artifact_counts()
+        )
+        standby_pending = artifact_counts.get("standby_pending_tokens", 0)
+        if standby_pending < expected_standby_pending:
+            raise AssertionError(
+                "receiver not ready: standby-pending token count "
+                f"{standby_pending} < expected {expected_standby_pending}"
+            )
+        if artifact_counts.get("epoch_fact_count", 0) < 1 or artifact_counts.get(
+            "epoch_commit_count", 0
+        ) < 1:
+            raise AssertionError(
+                "receiver not ready: epoch fact/commit marker is not bound"
+            )
+
+        receiver_prewarm_metrics = getattr(self, "receiver_prewarm_metrics", None)
+        if receiver_prewarm_metrics is None:
+            raise AssertionError("receiver not ready: prewarm status unavailable")
+        phase2_end_us = self.latest_source_phase2_end_monotonic_us()
+        if phase2_end_us is None:
+            raise AssertionError(
+                "receiver not ready: source phase2 end timestamp is unavailable"
+            )
+        if (
+            receiver_prewarm_metrics.first_frame_monotonic_us == 0
+            or receiver_prewarm_metrics.prewarm_start_monotonic_us == 0
+            or receiver_prewarm_metrics.first_frame_monotonic_us > phase2_end_us
+            or receiver_prewarm_metrics.prewarm_start_monotonic_us > phase2_end_us
+        ):
+            raise AssertionError(
+                "receiver not ready: phase1 transfer/prewarm did not overlap "
+                "source drain before phase2 completion "
+                f"first_frame_us={receiver_prewarm_metrics.first_frame_monotonic_us} "
+                f"prewarm_start_us={receiver_prewarm_metrics.prewarm_start_monotonic_us} "
+                f"phase2_end_us={phase2_end_us}"
+            )
+        if (
+            receiver_prewarm_metrics.seal_prewarm_success_tokens
+            < expected_standby_pending
+        ):
+            raise AssertionError(
+                "receiver not ready: seal-time prewarm did not cover every token "
+                f"success={receiver_prewarm_metrics.seal_prewarm_success_tokens} "
+                f"expected={expected_standby_pending}"
+            )
+        if receiver_prewarm_metrics.seal_prewarm_not_ready_tokens != 0:
+            raise AssertionError(
+                "receiver not ready: seal-time prewarm has not-ready tokens "
+                f"not_ready={receiver_prewarm_metrics.seal_prewarm_not_ready_tokens}"
+            )
+        if (
+            receiver_prewarm_metrics.auto_prewarm_ready_tokens
+            < expected_standby_pending
+            or receiver_prewarm_metrics.auto_prewarm_not_ready_tokens != 0
+        ):
+            raise AssertionError(
+                "receiver not ready: final epoch prewarm did not make every token "
+                "ready "
+                f"ready={receiver_prewarm_metrics.auto_prewarm_ready_tokens} "
+                f"not_ready={receiver_prewarm_metrics.auto_prewarm_not_ready_tokens} "
+                f"expected={expected_standby_pending}"
+            )
+        if (
+            receiver_prewarm_metrics.record_lock_resident_pages
+            < receiver_prewarm_metrics.record_lock_page_count
+        ):
+            raise AssertionError(
+                "receiver not ready: record-lock pages are not fully resident "
+                f"resident={receiver_prewarm_metrics.record_lock_resident_pages} "
+                f"page_count={receiver_prewarm_metrics.record_lock_page_count}"
+            )
+        if receiver_prewarm_metrics.record_lock_cold_page_gets != 0:
+            raise AssertionError(
+                "receiver not ready: record-lock ready cache would cold-read "
+                f"pages={receiver_prewarm_metrics.record_lock_cold_page_gets}"
+            )
+
+        ready_lag_us = getattr(
+            self, "receiver_ready_after_source_phase2_end_us", None
+        )
+        if ready_lag_us is None:
+            raise AssertionError(
+                "receiver not ready: source phase2 end to receiver ready lag is "
+                "unavailable"
+            )
+        max_lag_ms = self.config.max_receiver_ready_after_phase2_ms
+        if max_lag_ms > 0 and ready_lag_us > max_lag_ms * 1000:
+            raise AssertionError(
+                "receiver readiness lag exceeded threshold: "
+                f"receiver_ready_after_source_phase2_end_us={ready_lag_us} "
+                f"max_ms={max_lag_ms}"
+            )
 
     def preflight_disk_budgets(self) -> None:
         plan = getattr(self, "plan", None)
@@ -5316,6 +5634,37 @@ class BusinessE2ERunner:
             self.startup_recovery_metrics = []
         self.startup_recovery_metrics.append(observed_metrics)
 
+    def latest_source_phase2_end_monotonic_us(self) -> Optional[int]:
+        metrics = list(getattr(self, "warmcopy_drain_metrics", []))
+        return next(
+            (
+                metric.phase2_end_monotonic_us
+                for metric in reversed(metrics)
+                if metric.phase2_end_monotonic_us is not None
+            ),
+            None,
+        )
+
+    def compute_receiver_ready_after_source_phase2_end_us(
+        self, *, now_monotonic_us: Optional[Callable[[], int]] = None
+    ) -> Optional[int]:
+        if now_monotonic_us is None:
+            now_monotonic_us = lambda: int(time.monotonic() * 1_000_000)
+        phase2_end_us = self.latest_source_phase2_end_monotonic_us()
+        if phase2_end_us is None:
+            self.receiver_ready_after_source_phase2_end_us = None
+            return None
+        receiver_prewarm_metrics = getattr(self, "receiver_prewarm_metrics", None)
+        ready_us = (
+            receiver_prewarm_metrics.ready_monotonic_us
+            if receiver_prewarm_metrics is not None
+            and receiver_prewarm_metrics.ready_monotonic_us > 0
+            else now_monotonic_us()
+        )
+        ready_lag_us = max(0, ready_us - phase2_end_us)
+        self.receiver_ready_after_source_phase2_end_us = ready_lag_us
+        return ready_lag_us
+
     def _will_execute_temp_dml_after_resume(self, completed_stmt_no: int) -> bool:
         if (
             not self.config.temp_table_workload
@@ -5457,6 +5806,9 @@ class BusinessE2ERunner:
             metric_line,
         )
         total_match = re.search(r"\bphase2_total_us=(\d+)\b", metric_line)
+        phase2_end_match = re.search(
+            r"\bphase2_end_monotonic_us=(\d+)\b", metric_line
+        )
         slo_match = re.search(r"\bphase2_slo_guaranteed=(\d+)\b", metric_line)
         reason_match = re.search(r"\bphase2_slo_reason=([A-Za-z0-9_]+)\b",
                                  metric_line)
@@ -5503,6 +5855,11 @@ class BusinessE2ERunner:
             ),
             phase2_total_ms=(
                 int(total_match.group(1)) / 1000.0 if total_match is not None else None
+            ),
+            phase2_end_monotonic_us=(
+                int(phase2_end_match.group(1))
+                if phase2_end_match is not None
+                else None
             ),
             phase2_slo_guaranteed=(
                 int(slo_match.group(1)) if slo_match is not None else None
@@ -5898,6 +6255,114 @@ class BusinessE2ERunner:
                     "Preserve_trx_promotion_gate_over_budget_count"
                 ),
                 status_code=metric("Preserve_trx_promotion_gate_status_code"),
+            )
+        except ValueError:
+            return None
+
+    def read_receiver_prewarm_metrics_from_status(
+        self,
+        *,
+        connection_factory: Optional[Callable[[], object]] = None,
+    ) -> Optional[ReceiverPrewarmMetrics]:
+        fields = {
+            "Preserve_trx_transfer_receiver_auto_prewarm_last_status",
+            "Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens",
+            "Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens",
+            "Preserve_trx_transfer_receiver_auto_prewarm_tokens",
+            "Preserve_trx_transfer_receiver_first_frame_monotonic_us",
+            "Preserve_trx_transfer_receiver_last_object_seal_monotonic_us",
+            "Preserve_trx_transfer_receiver_prewarm_end_monotonic_us",
+            "Preserve_trx_transfer_receiver_prewarm_start_monotonic_us",
+            "Preserve_trx_transfer_receiver_ready_monotonic_us",
+            "Preserve_trx_promotion_prewarm_record_lock_cold_page_gets",
+            "Preserve_trx_promotion_prewarm_record_lock_page_count",
+            "Preserve_trx_promotion_prewarm_record_lock_resident_pages",
+            "Preserve_trx_transfer_receiver_seal_prewarm_last_status",
+            "Preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens",
+            "Preserve_trx_transfer_receiver_seal_prewarm_success_tokens",
+            "Preserve_trx_transfer_receiver_seal_prewarm_tokens",
+        }
+        quoted_fields = ", ".join(f"'{field}'" for field in sorted(fields))
+        sql = (
+            "SELECT VARIABLE_NAME, VARIABLE_VALUE "
+            "FROM performance_schema.global_status "
+            f"WHERE VARIABLE_NAME IN ({quoted_fields})"
+        )
+        conn = None
+        try:
+            if connection_factory is None:
+                connection_factory = lambda: self.runtime.connect(database=False)
+            conn = connection_factory()
+            rows = self.runtime.execute(conn, sql, fetch=True)
+        except BaseException as exc:
+            if self.runtime.is_connection_error(exc):
+                return None
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
+        values: Dict[str, str] = {}
+        for row in rows:
+            if len(row) != 2:
+                return None
+            name, value = row
+            values[str(name)] = str(value)
+        if any(field not in values for field in fields):
+            return None
+
+        def metric(field: str) -> int:
+            return int(values[field])
+
+        try:
+            return ReceiverPrewarmMetrics(
+                auto_prewarm_tokens=metric(
+                    "Preserve_trx_transfer_receiver_auto_prewarm_tokens"
+                ),
+                auto_prewarm_ready_tokens=metric(
+                    "Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens"
+                ),
+                auto_prewarm_not_ready_tokens=metric(
+                    "Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens"
+                ),
+                auto_prewarm_last_status=metric(
+                    "Preserve_trx_transfer_receiver_auto_prewarm_last_status"
+                ),
+                ready_monotonic_us=metric(
+                    "Preserve_trx_transfer_receiver_ready_monotonic_us"
+                ),
+                first_frame_monotonic_us=metric(
+                    "Preserve_trx_transfer_receiver_first_frame_monotonic_us"
+                ),
+                last_object_seal_monotonic_us=metric(
+                    "Preserve_trx_transfer_receiver_last_object_seal_monotonic_us"
+                ),
+                prewarm_start_monotonic_us=metric(
+                    "Preserve_trx_transfer_receiver_prewarm_start_monotonic_us"
+                ),
+                prewarm_end_monotonic_us=metric(
+                    "Preserve_trx_transfer_receiver_prewarm_end_monotonic_us"
+                ),
+                record_lock_page_count=metric(
+                    "Preserve_trx_promotion_prewarm_record_lock_page_count"
+                ),
+                record_lock_resident_pages=metric(
+                    "Preserve_trx_promotion_prewarm_record_lock_resident_pages"
+                ),
+                record_lock_cold_page_gets=metric(
+                    "Preserve_trx_promotion_prewarm_record_lock_cold_page_gets"
+                ),
+                seal_prewarm_tokens=metric(
+                    "Preserve_trx_transfer_receiver_seal_prewarm_tokens"
+                ),
+                seal_prewarm_success_tokens=metric(
+                    "Preserve_trx_transfer_receiver_seal_prewarm_success_tokens"
+                ),
+                seal_prewarm_not_ready_tokens=metric(
+                    "Preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens"
+                ),
+                seal_prewarm_last_status=metric(
+                    "Preserve_trx_transfer_receiver_seal_prewarm_last_status"
+                ),
             )
         except ValueError:
             return None
@@ -7444,6 +7909,7 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--two-phase", action="store_true", help="compatibility flag documenting that the warmcopy_two_phase_large_cache_equivalence scenario must use the two-phase warm-copy path")
     parser.add_argument("--max-phase2-pause-ms", type=int, default=5000, help="maximum allowed median warm-copy binlog-cache phase2 pause per large-cache bucket")
     parser.add_argument("--max-phase2-total-ms", type=int, default=0, help="optional maximum server-side phase2_total_ms per drain cycle; 0 disables this gate")
+    parser.add_argument("--max-receiver-ready-after-phase2-ms", type=int, default=None, help="optional maximum standby receiver ready lag after source phase2 end; 0 disables this gate; standby-transfer receiver evidence defaults to 100ms")
     parser.add_argument("--warmcopy-disabled-baseline-slope-ms-per-mb", type=float, help="optional warmcopy-disabled pause slope baseline; warm-copy slope may be at most 25%% of it")
     parser.add_argument("--temp-table-workload", action="store_true", help="mix InnoDB user temporary-table operations into each 100-statement transaction; restart command must keep preserve_trx_temp_table_enable available")
     parser.add_argument("--temp-table-target-mb", type=int, default=0, help="pre-fill each user temporary table to this many MiB before the drainable transaction starts")
@@ -7465,6 +7931,15 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--source-start-command", help="optional shell command used to start source mysqld before physical-standby transfer/drain")
     parser.add_argument("--receiver-start-command", help="optional shell command used to start receiver mysqld before physical-standby transfer/drain")
     parser.add_argument("--receiver-restart-command", help="shell command used to restart the receiver mysqld after physical-standby datadir materialization")
+    parser.add_argument(
+        "--receiver-physical-copy-before-drain",
+        action="store_true",
+        help=(
+            "for standby-transfer receiver metrics, stop source/receiver after "
+            "schema setup, copy the source datadir to the receiver, restart both "
+            "mysqld processes, then run business workload and DRAIN"
+        ),
+    )
     parser.add_argument("--standby-transfer-user", default="preserve_transfer_receiver", help="receiver account used by source-side standby transfer sessions")
     parser.add_argument("--standby-transfer-password", default="preserve_transfer_secret", help="shared secret stored in source/receiver credential stores for standby-transfer E2E")
     parser.add_argument("--standby-transfer-credential-name", default="preserve_transfer_credential", help="credential name used by source/receiver transfer codec and source client")
@@ -7503,6 +7978,12 @@ command is used after each DRAIN command shuts that server down.
     max_transactions_per_worker = args.max_transactions_per_worker
     if args.no_preserve_baseline and max_transactions_per_worker == 0:
         max_transactions_per_worker = max(1, args.cycles)
+    max_receiver_ready_after_phase2_ms = args.max_receiver_ready_after_phase2_ms
+    if (
+        max_receiver_ready_after_phase2_ms is None
+        and args.scenario == "standby_transfer_receiver_drain_metrics"
+    ):
+        max_receiver_ready_after_phase2_ms = 100
     return HarnessConfig(
         scenario=args.scenario,
         host=args.host,
@@ -7555,6 +8036,11 @@ command is used after each DRAIN command shuts that server down.
         two_phase=args.two_phase,
         max_phase2_pause_ms=args.max_phase2_pause_ms,
         max_phase2_total_ms=args.max_phase2_total_ms,
+        max_receiver_ready_after_phase2_ms=(
+            max_receiver_ready_after_phase2_ms
+            if max_receiver_ready_after_phase2_ms is not None
+            else 0
+        ),
         warmcopy_disabled_baseline_slope_ms_per_mb=args.warmcopy_disabled_baseline_slope_ms_per_mb,
         temp_table_workload=temp_table_workload,
         temp_table_target_mb=args.temp_table_target_mb,
@@ -7577,6 +8063,7 @@ command is used after each DRAIN command shuts that server down.
         source_start_command=args.source_start_command,
         receiver_start_command=args.receiver_start_command,
         receiver_restart_command=args.receiver_restart_command,
+        receiver_physical_copy_before_drain=args.receiver_physical_copy_before_drain,
         standby_transfer_user=args.standby_transfer_user,
         standby_transfer_password=args.standby_transfer_password,
         standby_transfer_credential_name=args.standby_transfer_credential_name,

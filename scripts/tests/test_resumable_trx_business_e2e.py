@@ -30,6 +30,7 @@ from scripts.resumable_trx_business_e2e import (
     OperationKind,
     DrainTargetCounterRejectionMetrics,
     Phase2PauseSample,
+    ReceiverPrewarmMetrics,
     ResumeCoordinator,
     StartupRecoveryMetrics,
     TransferFrameType,
@@ -677,6 +678,65 @@ class _PromotionGateStatusRuntime(_FakeRuntime):
                 ("Preserve_trx_promotion_gate_skipped_count", "0"),
                 ("Preserve_trx_promotion_gate_status_code", "0"),
                 ("Preserve_trx_promotion_gate_token_count", "2"),
+            ]
+        return super().execute(conn, sql, fetch)
+
+
+class _ReceiverPrewarmStatusRuntime(_FakeRuntime):
+    def execute(self, conn, sql, fetch=False):
+        self.sql.append(sql)
+        self.calls.append((sql, fetch))
+        if fetch and "performance_schema.global_status" in sql:
+            return [
+                ("Preserve_trx_transfer_receiver_auto_prewarm_tokens", "4"),
+                ("Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens", "3"),
+                (
+                    "Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens",
+                    "1",
+                ),
+                ("Preserve_trx_transfer_receiver_auto_prewarm_last_status", "2"),
+                (
+                    "Preserve_trx_transfer_receiver_ready_monotonic_us",
+                    "123456789",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_first_frame_monotonic_us",
+                    "123450000",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_last_object_seal_monotonic_us",
+                    "123455000",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_prewarm_start_monotonic_us",
+                    "123455100",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_prewarm_end_monotonic_us",
+                    "123456700",
+                ),
+                (
+                    "Preserve_trx_promotion_prewarm_record_lock_page_count",
+                    "17",
+                ),
+                (
+                    "Preserve_trx_promotion_prewarm_record_lock_resident_pages",
+                    "16",
+                ),
+                (
+                    "Preserve_trx_promotion_prewarm_record_lock_cold_page_gets",
+                    "1",
+                ),
+                ("Preserve_trx_transfer_receiver_seal_prewarm_tokens", "5"),
+                (
+                    "Preserve_trx_transfer_receiver_seal_prewarm_success_tokens",
+                    "4",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens",
+                    "1",
+                ),
+                ("Preserve_trx_transfer_receiver_seal_prewarm_last_status", "0"),
             ]
         return super().execute(conn, sql, fetch)
 
@@ -4279,6 +4339,8 @@ class WorkloadPlanTest(unittest.TestCase):
                 "transfer_secret",
                 "--standby-transfer-credential-name",
                 "transfer_credential",
+                "--max-receiver-ready-after-phase2-ms",
+                "100",
             ]
         )
 
@@ -4288,6 +4350,21 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertEqual(cfg.standby_transfer_user, "transfer_user")
         self.assertEqual(cfg.standby_transfer_password, "transfer_secret")
         self.assertEqual(cfg.standby_transfer_credential_name, "transfer_credential")
+        self.assertEqual(cfg.max_receiver_ready_after_phase2_ms, 100)
+
+    def test_standby_transfer_receiver_drain_metrics_defaults_to_100ms_ready_gate(self):
+        cfg = parse_args(
+            [
+                "--scenario",
+                "standby_transfer_receiver_drain_metrics",
+                "--receiver-unix-socket",
+                "/tmp/receiver.sock",
+                "--receiver-preserve-dir",
+                "/tmp/receiver-data/preserve",
+            ]
+        )
+
+        self.assertEqual(cfg.max_receiver_ready_after_phase2_ms, 100)
 
     def test_standby_transfer_receiver_drain_metrics_requires_preserve_dir(self):
         with self.assertRaisesRegex(ValueError, "receiver-preserve-dir"):
@@ -4320,6 +4397,48 @@ class WorkloadPlanTest(unittest.TestCase):
                 receiver_preserve_dir="/tmp/rx/data/preserve",
                 source_datadir="/tmp/src/data",
                 receiver_datadir="/tmp/rx/data",
+            ).validate()
+
+    def test_standby_transfer_receiver_physical_copy_requires_restart_inputs(self):
+        with self.assertRaisesRegex(ValueError, "source-datadir"):
+            HarnessConfig(
+                scenario="standby_transfer_receiver_drain_metrics",
+                receiver_unix_socket="/tmp/receiver.sock",
+                receiver_preserve_dir="/tmp/rx/data/preserve",
+                receiver_physical_copy_before_drain=True,
+                receiver_datadir="/tmp/rx/data",
+                restart_command="mysqld --defaults-file=/tmp/src.cnf",
+                receiver_restart_command="mysqld --defaults-file=/tmp/rx.cnf",
+            ).validate()
+        with self.assertRaisesRegex(ValueError, "receiver-datadir"):
+            HarnessConfig(
+                scenario="standby_transfer_receiver_drain_metrics",
+                receiver_unix_socket="/tmp/receiver.sock",
+                receiver_preserve_dir="/tmp/rx/data/preserve",
+                receiver_physical_copy_before_drain=True,
+                source_datadir="/tmp/src/data",
+                restart_command="mysqld --defaults-file=/tmp/src.cnf",
+                receiver_restart_command="mysqld --defaults-file=/tmp/rx.cnf",
+            ).validate()
+        with self.assertRaisesRegex(ValueError, "restart-command"):
+            HarnessConfig(
+                scenario="standby_transfer_receiver_drain_metrics",
+                receiver_unix_socket="/tmp/receiver.sock",
+                receiver_preserve_dir="/tmp/rx/data/preserve",
+                receiver_physical_copy_before_drain=True,
+                source_datadir="/tmp/src/data",
+                receiver_datadir="/tmp/rx/data",
+                receiver_restart_command="mysqld --defaults-file=/tmp/rx.cnf",
+            ).validate()
+        with self.assertRaisesRegex(ValueError, "receiver-restart-command"):
+            HarnessConfig(
+                scenario="standby_transfer_receiver_drain_metrics",
+                receiver_unix_socket="/tmp/receiver.sock",
+                receiver_preserve_dir="/tmp/rx/data/preserve",
+                receiver_physical_copy_before_drain=True,
+                source_datadir="/tmp/src/data",
+                receiver_datadir="/tmp/rx/data",
+                restart_command="mysqld --defaults-file=/tmp/src.cnf",
             ).validate()
 
     def test_cli_physical_standby_promotion_gate_scaled_args_are_applied(self):
@@ -4355,6 +4474,29 @@ class WorkloadPlanTest(unittest.TestCase):
             "mysqld --defaults-file=/tmp/rx.cnf --skip-log-bin",
         )
         self.assertEqual(cfg.receiver_restart_command, "mysqld --defaults-file=/tmp/rx.cnf")
+
+    def test_cli_standby_transfer_receiver_physical_copy_arg_is_applied(self):
+        cfg = parse_args(
+            [
+                "--scenario",
+                "standby_transfer_receiver_drain_metrics",
+                "--receiver-unix-socket",
+                "/tmp/receiver.sock",
+                "--receiver-preserve-dir",
+                "/tmp/rx/data/preserve",
+                "--source-datadir",
+                "/tmp/src/data",
+                "--receiver-datadir",
+                "/tmp/rx/data",
+                "--restart-command",
+                "mysqld --defaults-file=/tmp/src.cnf",
+                "--receiver-restart-command",
+                "mysqld --defaults-file=/tmp/rx.cnf",
+                "--receiver-physical-copy-before-drain",
+            ]
+        )
+
+        self.assertTrue(cfg.receiver_physical_copy_before_drain)
 
     def test_receiver_preserve_artifact_counts_include_standby_and_epoch_fact(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4406,6 +4548,7 @@ class WorkloadPlanTest(unittest.TestCase):
                     phase2_pause_ms=12.0,
                     full_copy_to_count=2,
                     phase2_total_ms=34.0,
+                    phase2_end_monotonic_us=1_000_000,
                     phase2_slo_guaranteed=0,
                     phase2_slo_reason="non_record_family_live_compare",
                     phase2_record_materialized_target_count=0,
@@ -4421,6 +4564,27 @@ class WorkloadPlanTest(unittest.TestCase):
                 "epoch_fact_count": 1,
                 "epoch_commit_count": 1,
             }
+            runner.compute_receiver_ready_after_source_phase2_end_us(
+                now_monotonic_us=lambda: 1_042_000
+            )
+            runner.receiver_prewarm_metrics = ReceiverPrewarmMetrics(
+                auto_prewarm_tokens=4,
+                auto_prewarm_ready_tokens=3,
+                auto_prewarm_not_ready_tokens=1,
+                auto_prewarm_last_status=2,
+                ready_monotonic_us=1_042_000,
+                first_frame_monotonic_us=950_000,
+                last_object_seal_monotonic_us=1_030_000,
+                prewarm_start_monotonic_us=980_000,
+                prewarm_end_monotonic_us=1_041_000,
+                record_lock_page_count=17,
+                record_lock_resident_pages=17,
+                record_lock_cold_page_gets=0,
+                seal_prewarm_tokens=5,
+                seal_prewarm_success_tokens=4,
+                seal_prewarm_not_ready_tokens=1,
+                seal_prewarm_last_status=0,
+            )
 
             runner.write_standby_transfer_receiver_report(
                 status="success",
@@ -4433,10 +4597,285 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertEqual(report["receiver_standby_pending_tokens"], 2)
             self.assertEqual(report["receiver_epoch_fact_count"], 1)
             self.assertEqual(report["receiver_snapshot_tokens"], 2)
+            self.assertTrue(report["receiver_epoch_fact_bound"])
             self.assertEqual(report["phase2_total_samples_ms"], [34.0])
+            self.assertEqual(report["receiver_ready_after_source_phase2_end_us"], 42000)
+            self.assertTrue(report["receiver_phase1_transfer_prewarm_overlap"])
+            self.assertEqual(report["receiver_ready_tokens"], 3)
+            self.assertEqual(report["receiver_not_ready_tokens"], 1)
+            self.assertEqual(report["receiver_auto_prewarm_tokens"], 4)
+            self.assertEqual(report["receiver_auto_prewarm_ready_tokens"], 3)
+            self.assertEqual(report["receiver_auto_prewarm_not_ready_tokens"], 1)
+            self.assertEqual(report["receiver_ready_monotonic_us"], 1_042_000)
+            self.assertEqual(report["receiver_first_frame_monotonic_us"], 950_000)
+            self.assertEqual(
+                report["receiver_last_object_seal_monotonic_us"], 1_030_000
+            )
+            self.assertEqual(
+                report["receiver_prewarm_start_monotonic_us"], 980_000
+            )
+            self.assertEqual(
+                report["receiver_prewarm_end_monotonic_us"], 1_041_000
+            )
+            self.assertEqual(report["receiver_record_lock_page_count"], 17)
+            self.assertEqual(report["receiver_record_lock_resident_pages"], 17)
+            self.assertEqual(report["receiver_record_cold_gets"], 0)
+            self.assertEqual(report["receiver_seal_prewarm_tokens"], 5)
+            self.assertEqual(report["receiver_seal_prewarm_success_tokens"], 4)
+            self.assertEqual(report["receiver_seal_prewarm_not_ready_tokens"], 1)
             self.assertEqual(report["warmcopy_provider_full_copy_count"], 2)
             self.assertEqual(report["lock_warmcopy_live_fallback_count"], 0)
             self.assertEqual(report["completed_stmt_total"], 88)
+
+    def test_standby_transfer_receiver_readiness_gate_rejects_not_ready_token(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+        ).validate()
+        runner.receiver_artifact_counts = {
+            "snapshot_tokens": 2,
+            "standby_pending_tokens": 2,
+            "external_blob_tokens": 2,
+            "epoch_fact_count": 1,
+            "epoch_commit_count": 1,
+        }
+        runner.receiver_prewarm_metrics = ReceiverPrewarmMetrics(
+            auto_prewarm_tokens=2,
+            auto_prewarm_ready_tokens=1,
+            auto_prewarm_not_ready_tokens=1,
+            auto_prewarm_last_status=2,
+            ready_monotonic_us=1_012_000,
+            first_frame_monotonic_us=1_000_000,
+            last_object_seal_monotonic_us=1_006_000,
+            prewarm_start_monotonic_us=1_006_100,
+            prewarm_end_monotonic_us=1_012_000,
+            record_lock_page_count=0,
+            record_lock_resident_pages=0,
+            record_lock_cold_page_gets=0,
+            seal_prewarm_tokens=2,
+            seal_prewarm_success_tokens=2,
+            seal_prewarm_not_ready_tokens=0,
+            seal_prewarm_last_status=0,
+        )
+        runner.receiver_ready_after_source_phase2_end_us = 12_000
+
+        with self.assertRaisesRegex(AssertionError, "receiver not ready"):
+            runner.validate_standby_transfer_receiver_readiness(
+                expected_standby_pending=2
+            )
+
+    def test_standby_transfer_receiver_readiness_gate_enforces_lag_limit(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+            max_receiver_ready_after_phase2_ms=10,
+        ).validate()
+        runner.warmcopy_drain_metrics = [
+            WarmcopyDrainMetrics(
+                phase2_pause_ms=1.0,
+                full_copy_to_count=0,
+                phase2_total_ms=2.0,
+                phase2_end_monotonic_us=1_000_000,
+            )
+        ]
+        runner.receiver_artifact_counts = {
+            "snapshot_tokens": 2,
+            "standby_pending_tokens": 2,
+            "external_blob_tokens": 2,
+            "epoch_fact_count": 1,
+            "epoch_commit_count": 1,
+        }
+        runner.receiver_prewarm_metrics = ReceiverPrewarmMetrics(
+            auto_prewarm_tokens=2,
+            auto_prewarm_ready_tokens=2,
+            auto_prewarm_not_ready_tokens=0,
+            auto_prewarm_last_status=0,
+            ready_monotonic_us=1_011_000,
+            first_frame_monotonic_us=999_000,
+            last_object_seal_monotonic_us=1_006_000,
+            prewarm_start_monotonic_us=999_500,
+            prewarm_end_monotonic_us=1_011_000,
+            record_lock_page_count=0,
+            record_lock_resident_pages=0,
+            record_lock_cold_page_gets=0,
+            seal_prewarm_tokens=2,
+            seal_prewarm_success_tokens=2,
+            seal_prewarm_not_ready_tokens=0,
+            seal_prewarm_last_status=0,
+        )
+        runner.receiver_ready_after_source_phase2_end_us = 11_000
+
+        with self.assertRaisesRegex(AssertionError, "receiver readiness lag"):
+            runner.validate_standby_transfer_receiver_readiness(
+                expected_standby_pending=2
+            )
+
+    def test_standby_transfer_receiver_readiness_gate_requires_phase1_overlap(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+            max_receiver_ready_after_phase2_ms=100,
+        ).validate()
+        runner.warmcopy_drain_metrics = [
+            WarmcopyDrainMetrics(
+                phase2_pause_ms=1.0,
+                full_copy_to_count=0,
+                phase2_total_ms=2.0,
+                phase2_end_monotonic_us=1_000_000,
+            )
+        ]
+        runner.receiver_artifact_counts = {
+            "snapshot_tokens": 2,
+            "standby_pending_tokens": 2,
+            "external_blob_tokens": 2,
+            "epoch_fact_count": 1,
+            "epoch_commit_count": 1,
+        }
+        runner.receiver_prewarm_metrics = ReceiverPrewarmMetrics(
+            auto_prewarm_tokens=2,
+            auto_prewarm_ready_tokens=2,
+            auto_prewarm_not_ready_tokens=0,
+            auto_prewarm_last_status=0,
+            ready_monotonic_us=1_020_000,
+            first_frame_monotonic_us=1_010_000,
+            last_object_seal_monotonic_us=1_015_000,
+            prewarm_start_monotonic_us=1_012_000,
+            prewarm_end_monotonic_us=1_020_000,
+            record_lock_page_count=0,
+            record_lock_resident_pages=0,
+            record_lock_cold_page_gets=0,
+            seal_prewarm_tokens=2,
+            seal_prewarm_success_tokens=2,
+            seal_prewarm_not_ready_tokens=0,
+            seal_prewarm_last_status=0,
+        )
+        runner.receiver_ready_after_source_phase2_end_us = 20_000
+
+        with self.assertRaisesRegex(AssertionError, "phase1 transfer/prewarm"):
+            runner.validate_standby_transfer_receiver_readiness(
+                expected_standby_pending=2
+            )
+
+    def test_standby_transfer_receiver_waits_for_prewarm_ready_metrics(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+            max_receiver_ready_after_phase2_ms=100,
+        ).validate()
+        runner.warmcopy_drain_metrics = [
+            WarmcopyDrainMetrics(
+                phase2_pause_ms=1.0,
+                full_copy_to_count=0,
+                phase2_total_ms=2.0,
+                phase2_end_monotonic_us=1_000_000,
+            )
+        ]
+        runner.receiver_artifact_counts = {
+            "snapshot_tokens": 2,
+            "standby_pending_tokens": 2,
+            "external_blob_tokens": 2,
+            "epoch_fact_count": 1,
+            "epoch_commit_count": 1,
+        }
+        not_ready = ReceiverPrewarmMetrics(
+            auto_prewarm_tokens=2,
+            auto_prewarm_ready_tokens=1,
+            auto_prewarm_not_ready_tokens=1,
+            auto_prewarm_last_status=2,
+            ready_monotonic_us=1_012_000,
+            first_frame_monotonic_us=950_000,
+            last_object_seal_monotonic_us=1_006_000,
+            prewarm_start_monotonic_us=960_000,
+            prewarm_end_monotonic_us=1_012_000,
+            record_lock_page_count=10,
+            record_lock_resident_pages=10,
+            record_lock_cold_page_gets=0,
+            seal_prewarm_tokens=2,
+            seal_prewarm_success_tokens=2,
+            seal_prewarm_not_ready_tokens=0,
+            seal_prewarm_last_status=0,
+        )
+        ready = ReceiverPrewarmMetrics(
+            auto_prewarm_tokens=2,
+            auto_prewarm_ready_tokens=2,
+            auto_prewarm_not_ready_tokens=0,
+            auto_prewarm_last_status=0,
+            ready_monotonic_us=1_030_000,
+            first_frame_monotonic_us=950_000,
+            last_object_seal_monotonic_us=1_006_000,
+            prewarm_start_monotonic_us=960_000,
+            prewarm_end_monotonic_us=1_030_000,
+            record_lock_page_count=10,
+            record_lock_resident_pages=10,
+            record_lock_cold_page_gets=0,
+            seal_prewarm_tokens=2,
+            seal_prewarm_success_tokens=2,
+            seal_prewarm_not_ready_tokens=0,
+            seal_prewarm_last_status=0,
+        )
+        metrics = iter([not_ready, ready])
+        runner.read_receiver_prewarm_metrics_from_status = mock.Mock(
+            side_effect=lambda connection_factory=None: next(metrics)
+        )
+
+        runner.wait_for_receiver_readiness(
+            expected_standby_pending=2,
+            timeout_s=1,
+            poll_interval_s=0,
+            connection_factory=lambda: None,
+        )
+
+        self.assertEqual(
+            runner.read_receiver_prewarm_metrics_from_status.call_count, 2
+        )
+        self.assertEqual(runner.receiver_prewarm_metrics, ready)
+        self.assertEqual(runner.receiver_ready_after_source_phase2_end_us, 30_000)
+
+    def test_receiver_ready_lag_uses_server_side_ready_timestamp(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.warmcopy_drain_metrics = [
+            WarmcopyDrainMetrics(
+                phase2_pause_ms=1.0,
+                full_copy_to_count=0,
+                phase2_end_monotonic_us=1_000_000,
+            )
+        ]
+        runner.receiver_prewarm_metrics = ReceiverPrewarmMetrics(
+            auto_prewarm_tokens=2,
+            auto_prewarm_ready_tokens=2,
+            auto_prewarm_not_ready_tokens=0,
+            auto_prewarm_last_status=0,
+            ready_monotonic_us=1_010_000,
+            first_frame_monotonic_us=1_000_000,
+            last_object_seal_monotonic_us=1_006_000,
+            prewarm_start_monotonic_us=1_006_100,
+            prewarm_end_monotonic_us=1_010_000,
+            record_lock_page_count=0,
+            record_lock_resident_pages=0,
+            record_lock_cold_page_gets=0,
+            seal_prewarm_tokens=2,
+            seal_prewarm_success_tokens=2,
+            seal_prewarm_not_ready_tokens=0,
+            seal_prewarm_last_status=0,
+        )
+
+        lag_us = runner.compute_receiver_ready_after_source_phase2_end_us(
+            now_monotonic_us=lambda: 1_100_000
+        )
+
+        self.assertEqual(lag_us, 10_000)
 
     def test_receiver_promotion_gate_report_includes_drain_phase2_metrics(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5829,6 +6268,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             error_log.write(
                 "PRESERVE: warm-copy drain metrics "
                 "phase2_pause_us=123000 phase2_total_us=2500000 "
+                "phase2_end_monotonic_us=987654321 "
                 "phase2_slo_guaranteed=0 "
                 "phase2_slo_reason=temp_table_manifest_phase2_build "
                 "phase2_target_count=3 "
@@ -5849,6 +6289,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertIsNotNone(metrics)
         self.assertEqual(metrics.phase2_pause_ms, 123.0)
         self.assertEqual(metrics.phase2_total_ms, 2500.0)
+        self.assertEqual(metrics.phase2_end_monotonic_us, 987654321)
         self.assertEqual(metrics.phase2_slo_guaranteed, 0)
         self.assertEqual(
             metrics.phase2_slo_reason, "temp_table_manifest_phase2_build"
@@ -6028,6 +6469,30 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertEqual(metrics.snapshot_predicate_locks_ms, 4.0)
         self.assertEqual(metrics.snapshot_mdl_ms, 5.0)
         self.assertEqual(metrics.snapshot_register_ms, 6.0)
+
+    def test_receiver_prewarm_status_reader_uses_global_status(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.runtime = _ReceiverPrewarmStatusRuntime()
+
+        metrics = runner.read_receiver_prewarm_metrics_from_status()
+
+        self.assertIsNotNone(metrics)
+        self.assertEqual(metrics.auto_prewarm_tokens, 4)
+        self.assertEqual(metrics.auto_prewarm_ready_tokens, 3)
+        self.assertEqual(metrics.auto_prewarm_not_ready_tokens, 1)
+        self.assertEqual(metrics.auto_prewarm_last_status, 2)
+        self.assertEqual(metrics.ready_monotonic_us, 123456789)
+        self.assertEqual(metrics.first_frame_monotonic_us, 123450000)
+        self.assertEqual(metrics.last_object_seal_monotonic_us, 123455000)
+        self.assertEqual(metrics.prewarm_start_monotonic_us, 123455100)
+        self.assertEqual(metrics.prewarm_end_monotonic_us, 123456700)
+        self.assertEqual(metrics.record_lock_page_count, 17)
+        self.assertEqual(metrics.record_lock_resident_pages, 16)
+        self.assertEqual(metrics.record_lock_cold_page_gets, 1)
+        self.assertEqual(metrics.seal_prewarm_tokens, 5)
+        self.assertEqual(metrics.seal_prewarm_success_tokens, 4)
+        self.assertEqual(metrics.seal_prewarm_not_ready_tokens, 1)
+        self.assertEqual(metrics.seal_prewarm_last_status, 0)
 
     def test_drain_restart_resume_uses_error_log_phase2_metric(self):
         with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as error_log:

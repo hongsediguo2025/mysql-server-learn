@@ -290,6 +290,43 @@ int show_preserve_trx_promotion_gate_ready_cache_miss_count(THD *thd,
                                                             char *buf);
 int show_preserve_trx_promotion_gate_over_budget_count(THD *thd, SHOW_VAR *var,
                                                        char *buf);
+int show_preserve_trx_promotion_prewarm_record_lock_page_count(THD *thd,
+                                                               SHOW_VAR *var,
+                                                               char *buf);
+int show_preserve_trx_promotion_prewarm_record_lock_resident_pages(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_promotion_prewarm_record_lock_cold_page_gets(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_auto_prewarm_tokens(THD *thd,
+                                                            SHOW_VAR *var,
+                                                            char *buf);
+int show_preserve_trx_transfer_receiver_auto_prewarm_ready_tokens(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_auto_prewarm_last_status(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_ready_monotonic_us(THD *thd,
+                                                           SHOW_VAR *var,
+                                                           char *buf);
+int show_preserve_trx_transfer_receiver_first_frame_monotonic_us(THD *thd,
+                                                                 SHOW_VAR *var,
+                                                                 char *buf);
+int show_preserve_trx_transfer_receiver_last_object_seal_monotonic_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_prewarm_start_monotonic_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_prewarm_end_monotonic_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_seal_prewarm_tokens(THD *thd,
+                                                            SHOW_VAR *var,
+                                                            char *buf);
+int show_preserve_trx_transfer_receiver_seal_prewarm_success_tokens(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_seal_prewarm_last_status(
+    THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_lock_warmcopy_phase2_pause_us(THD *thd, SHOW_VAR *var,
                                                     char *buf);
 int show_preserve_trx_lock_warmcopy_spill_bytes(THD *thd, SHOW_VAR *var,

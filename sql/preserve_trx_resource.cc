@@ -33,6 +33,7 @@
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_lock_warmcopy.h"
 #include "sql/preserve_trx_promotion.h"
+#include "sql/preserve_trx_transfer.h"
 
 ulonglong preserve_trx_memory_budget_bytes = 256ULL * 1024ULL * 1024ULL;
 ulonglong preserve_trx_memory_per_token_bytes = 64ULL * 1024ULL * 1024ULL;
@@ -406,6 +407,54 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_promotion_gate_over_budget_count,
     preserve_trx_promotion_gate_over_budget_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_prewarm_record_lock_page_count,
+    preserve_trx_promotion_prewarm_record_lock_page_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_prewarm_record_lock_resident_pages,
+    preserve_trx_promotion_prewarm_record_lock_resident_pages_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_prewarm_record_lock_cold_page_gets,
+    preserve_trx_promotion_prewarm_record_lock_cold_page_gets_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_auto_prewarm_tokens,
+    preserve_trx_transfer_receiver_auto_prewarm_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_auto_prewarm_ready_tokens,
+    preserve_trx_transfer_receiver_auto_prewarm_ready_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens,
+    preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_auto_prewarm_last_status,
+    preserve_trx_transfer_receiver_auto_prewarm_last_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_ready_monotonic_us,
+    preserve_trx_transfer_receiver_ready_monotonic_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_first_frame_monotonic_us,
+    preserve_trx_transfer_receiver_first_frame_monotonic_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_last_object_seal_monotonic_us,
+    preserve_trx_transfer_receiver_last_object_seal_monotonic_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_prewarm_start_monotonic_us,
+    preserve_trx_transfer_receiver_prewarm_start_monotonic_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_prewarm_end_monotonic_us,
+    preserve_trx_transfer_receiver_prewarm_end_monotonic_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_seal_prewarm_tokens,
+    preserve_trx_transfer_receiver_seal_prewarm_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_seal_prewarm_success_tokens,
+    preserve_trx_transfer_receiver_seal_prewarm_success_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens,
+    preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_seal_prewarm_last_status,
+    preserve_trx_transfer_receiver_seal_prewarm_last_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_lock_warmcopy_phase2_pause_us,
     preserve_trx_lock_warmcopy_phase2_pause_us_status())

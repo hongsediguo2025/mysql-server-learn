@@ -71,6 +71,20 @@ extern uint preserve_trx_transfer_chunk_bytes;
 extern ulonglong preserve_trx_transfer_max_inflight_bytes;
 extern uint preserve_trx_transfer_commit_timeout_ms;
 
+uint64_t preserve_trx_transfer_receiver_auto_prewarm_tokens_status();
+uint64_t preserve_trx_transfer_receiver_auto_prewarm_ready_tokens_status();
+uint64_t preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens_status();
+uint64_t preserve_trx_transfer_receiver_auto_prewarm_last_status();
+uint64_t preserve_trx_transfer_receiver_ready_monotonic_us_status();
+uint64_t preserve_trx_transfer_receiver_first_frame_monotonic_us_status();
+uint64_t preserve_trx_transfer_receiver_last_object_seal_monotonic_us_status();
+uint64_t preserve_trx_transfer_receiver_prewarm_start_monotonic_us_status();
+uint64_t preserve_trx_transfer_receiver_prewarm_end_monotonic_us_status();
+uint64_t preserve_trx_transfer_receiver_seal_prewarm_tokens_status();
+uint64_t preserve_trx_transfer_receiver_seal_prewarm_success_tokens_status();
+uint64_t preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens_status();
+uint64_t preserve_trx_transfer_receiver_seal_prewarm_last_status();
+
 Preserve_trx_transfer_artifact_decision
 preserve_trx_transfer_artifact_decision();
 
@@ -99,7 +113,9 @@ enum class Preserve_trx_transfer_frame_type : uint16_t {
   COMMIT_EPOCH = 4,
   ABORT = 5,
   PROMOTION_PREWARM_TOKEN = 6,
-  PROMOTION_GATE_EPOCH = 7
+  PROMOTION_GATE_EPOCH = 7,
+  DECLARE_TOKEN = 8,
+  DECLARE_OBJECT = 9
 };
 
 struct Preserve_trx_transfer_object_descriptor {
@@ -181,6 +197,7 @@ struct Preserve_trx_transfer_frame {
 };
 
 enum class Preserve_trx_transfer_receiver_state {
+  DECLARED,
   RECEIVING,
   SAVED_ONLINE,
   CORRUPT,
@@ -210,9 +227,17 @@ struct Preserve_trx_transfer_receiver_record {
 
 class Preserve_trx_transfer_receiver_registry {
  public:
+  Preserve_trx_transfer_status declare_token(
+      const std::string &epoch_id, uint64_t token,
+      const std::string &source_server_uuid,
+      const std::string &target_server_uuid);
+
   Preserve_trx_transfer_status begin_receive(
       const Preserve_trx_transfer_manifest &manifest,
       uint64_t inflight_bytes = 0);
+  Preserve_trx_transfer_status declare_object(
+      const std::string &epoch_id, uint64_t token,
+      const Preserve_trx_transfer_object_descriptor &descriptor);
 
   Preserve_trx_transfer_status mark_saved_online(const std::string &epoch_id,
                                                  uint64_t token);
@@ -225,9 +250,15 @@ class Preserve_trx_transfer_receiver_registry {
   Preserve_trx_transfer_status mark_object_sealed(
       const std::string &epoch_id, uint64_t token,
       const std::string &object_id);
+  Preserve_trx_transfer_status consume_frame_sequence(
+      const std::string &epoch_id, uint64_t sequence);
+  void rollback_frame_sequence(const std::string &epoch_id,
+                               uint64_t sequence);
   bool all_objects_sealed(const std::string &epoch_id,
                           uint64_t token) const;
   bool all_receiving_tokens_sealed(const std::string &epoch_id) const;
+  std::vector<Preserve_trx_transfer_receiver_record>
+  receiving_records_for_epoch(const std::string &epoch_id) const;
   std::vector<Preserve_trx_transfer_receiver_record>
   sealed_receiving_records_for_epoch(const std::string &epoch_id) const;
 
@@ -244,6 +275,7 @@ class Preserve_trx_transfer_receiver_registry {
 
   mutable std::mutex m_mutex;
   std::map<Token_key, Preserve_trx_transfer_receiver_record> m_records;
+  std::map<std::string, uint64_t> m_next_sequence_by_epoch;
 };
 
 Preserve_trx_transfer_status preserve_trx_transfer_encode_manifest(
@@ -306,6 +338,76 @@ class Preserve_trx_transfer_encoded_frame_sink {
       const std::string &encoded_frame) = 0;
 };
 
+class Preserve_trx_transfer_source_epoch_session {
+ public:
+  Preserve_trx_transfer_source_epoch_session(
+      const std::string &epoch_id, const std::string &source_server_uuid,
+      const std::string &target_server_uuid, uint32_t chunk_bytes,
+      Preserve_trx_transfer_encoded_frame_sink *sink);
+
+  Preserve_trx_transfer_status declare_token(uint64_t transfer_token);
+  Preserve_trx_transfer_status declare_object(
+      uint64_t transfer_token,
+      const Preserve_trx_transfer_object_descriptor &descriptor);
+  Preserve_trx_transfer_status begin_token_objects(
+      const Preserve_trx_transfer_manifest &manifest);
+  Preserve_trx_transfer_status write_object_chunk(
+      uint64_t transfer_token, const std::string &object_id,
+      uint64_t chunk_offset, const std::string &chunk_payload);
+  Preserve_trx_transfer_status seal_object(uint64_t transfer_token,
+                                           const std::string &object_id);
+  Preserve_trx_transfer_status finalize_token_manifest(
+      uint64_t transfer_token);
+  Preserve_trx_transfer_status send_token_objects(
+      const Preserve_trx_transfer_manifest &manifest,
+      const std::vector<Preserve_trx_transfer_object_payload> &objects);
+  Preserve_trx_transfer_status send_token_bundle(
+      const Preserved_trx_bundle &bundle, uint64_t transfer_token,
+      Preserve_trx_transfer_manifest *manifest = nullptr);
+  Preserve_trx_transfer_status abort_token(uint64_t transfer_token,
+                                           const std::string &reason);
+  Preserve_trx_transfer_status abort_epoch(const std::string &reason);
+  Preserve_trx_transfer_status commit_epoch();
+  std::string epoch_id() const { return m_epoch_id; }
+  std::string source_server_uuid() const { return m_source_server_uuid; }
+  std::string target_server_uuid() const { return m_target_server_uuid; }
+  uint32_t chunk_bytes() const { return m_chunk_bytes; }
+  uint64_t next_sequence() const {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    return m_next_sequence;
+  }
+
+ private:
+  bool token_declared(uint64_t transfer_token) const;
+  bool token_resolved(uint64_t transfer_token) const;
+  Preserve_trx_transfer_status send_token_objects_locked(
+      const Preserve_trx_transfer_manifest &manifest,
+      const std::vector<Preserve_trx_transfer_object_payload> &objects);
+  Preserve_trx_transfer_status abort_token_locked(uint64_t transfer_token,
+                                                  const std::string &reason,
+                                                  bool allow_finalized);
+
+  std::string m_epoch_id;
+  std::string m_source_server_uuid;
+  std::string m_target_server_uuid;
+  uint32_t m_chunk_bytes{0};
+  Preserve_trx_transfer_encoded_frame_sink *m_sink{nullptr};
+  uint64_t m_next_sequence{1};
+  mutable std::mutex m_mutex;
+  bool m_epoch_committed{false};
+  std::set<uint64_t> m_declared_tokens;
+  std::set<uint64_t> m_finalized_tokens;
+  std::set<uint64_t> m_aborted_tokens;
+  std::map<uint64_t, Preserve_trx_transfer_manifest> m_streaming_manifests;
+  std::map<uint64_t, std::map<std::string,
+                              Preserve_trx_transfer_object_descriptor>>
+      m_streaming_declared_objects;
+  std::map<uint64_t, std::map<std::string, uint64_t>>
+      m_streaming_object_written_bytes;
+  std::map<uint64_t, std::set<std::string>> m_streaming_sealed_objects;
+  std::vector<Preserve_trx_transfer_manifest> m_finalized_manifests;
+};
+
 struct Preserve_trx_transfer_client_endpoint {
   std::string target_server_uuid;
   std::string host;
@@ -355,6 +457,25 @@ Preserve_trx_transfer_status preserve_trx_transfer_send_bundle_frames(
     uint64_t transfer_token, uint32_t chunk_bytes,
     Preserve_trx_transfer_encoded_frame_sink *sink,
     Preserve_trx_transfer_manifest *manifest = nullptr);
+
+Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_begin_frames(
+    const std::vector<Preserve_trx_transfer_manifest> &manifests,
+    Preserve_trx_transfer_encoded_frame_sink *sink, uint64_t *next_sequence);
+
+Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_declare_token_frame(
+    const std::string &epoch_id, const std::string &source_server_uuid,
+    const std::string &target_server_uuid, uint64_t transfer_token,
+    Preserve_trx_transfer_encoded_frame_sink *sink, uint64_t *next_sequence);
+
+Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_object_frames(
+    const Preserve_trx_transfer_manifest &manifest,
+    const std::vector<Preserve_trx_transfer_object_payload> &objects,
+    uint32_t chunk_bytes, Preserve_trx_transfer_encoded_frame_sink *sink,
+    uint64_t *next_sequence);
+
+Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_commit_frame(
+    const std::string &epoch_id, uint64_t token,
+    Preserve_trx_transfer_encoded_frame_sink *sink, uint64_t *next_sequence);
 
 Preserve_trx_transfer_status preserve_trx_transfer_send_epoch_bundles(
     const std::string &epoch_id, const std::string &source_server_uuid,
@@ -429,6 +550,11 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
     Preserved_trx_store *store, Preserve_trx_transfer_receiver_registry *registry,
     uint64_t timeout_seconds,
     Preserve_snapshot_metadata *written_metadata = nullptr);
+
+Preserve_trx_transfer_status preserve_trx_transfer_replay_receiver_spool(
+    const std::string &root_dir, const std::string &epoch_id,
+    Preserved_trx_store *store, Preserve_trx_transfer_receiver_registry *registry,
+    uint64_t timeout_seconds);
 
 Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload(
     const std::string &root_dir, const std::string &encoded_frame,
@@ -522,6 +648,29 @@ class Preserve_trx_transfer_artifact_sink final
   std::string m_preserve_dir;
 };
 
+class Preserve_trx_transfer_session_artifact_sink final
+    : public Preserve_trx_artifact_sink {
+ public:
+  Preserve_trx_transfer_session_artifact_sink(
+      Preserve_trx_transfer_source_epoch_session *session,
+      uint64_t transfer_token, std::string preserve_dir = "")
+      : m_session(session),
+        m_transfer_token(transfer_token),
+        m_preserve_dir(std::move(preserve_dir)) {}
+
+  Preserve_snapshot_status publish_bundle(
+      Preserved_trx_bundle bundle, uint64_t timeout_seconds,
+      Preserve_snapshot_metadata *written_metadata,
+      bool *durable_snapshot_may_exist = nullptr,
+      Preserve_snapshot_delete_status *write_failure_delete_status = nullptr,
+      Preserved_trx_store_write_stats *write_stats = nullptr) override;
+
+ private:
+  Preserve_trx_transfer_source_epoch_session *m_session{nullptr};
+  uint64_t m_transfer_token{0};
+  std::string m_preserve_dir;
+};
+
 class Preserve_trx_standby_pending_artifact_sink final
     : public Preserve_trx_artifact_sink {
  public:
@@ -544,6 +693,8 @@ Preserve_snapshot_status preserve_trx_make_artifact_sink_for_decision(
     const std::string &epoch_id, const std::string &source_server_uuid,
     const std::string &target_server_uuid, uint64_t transfer_token,
     uint32_t chunk_bytes, Preserve_trx_transfer_encoded_frame_sink *frame_sink,
-    std::unique_ptr<Preserve_trx_artifact_sink> *sink);
+    std::unique_ptr<Preserve_trx_artifact_sink> *sink,
+    Preserve_trx_transfer_source_epoch_session *source_epoch_session = nullptr,
+    const std::string &preserve_dir = std::string());
 
 #endif /* SQL_PRESERVE_TRX_TRANSFER_INCLUDED */

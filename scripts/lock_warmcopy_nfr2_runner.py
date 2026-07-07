@@ -114,6 +114,7 @@ class ServerOptions:
     preserve_startup_recovery_threads: int = 0
     preserve_lock_warmcopy_max_memory_bytes: int = 1_073_741_824
     preserve_lock_warmcopy_max_journal_bytes: int = 4_294_967_296
+    extra_mysqld_options: Sequence[str] = dataclasses.field(default_factory=tuple)
 
 
 def resolve_paths(
@@ -185,13 +186,18 @@ def render_my_cnf(paths: Nfr2Paths, options: ServerOptions) -> str:
         "preserve-trx-lock-warmcopy-enable=ON",
         f"preserve-trx-lock-warmcopy-max-memory-bytes={options.preserve_lock_warmcopy_max_memory_bytes}",
         f"preserve-trx-lock-warmcopy-max-journal-bytes={options.preserve_lock_warmcopy_max_journal_bytes}",
-        "",
-        "[client]",
-        "user=root",
-        "password=",
-        f"socket={paths.socket}",
-        "",
     ]
+    lines.extend(options.extra_mysqld_options)
+    lines.extend(
+        [
+            "",
+            "[client]",
+            "user=root",
+            "password=",
+            f"socket={paths.socket}",
+            "",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -222,6 +228,7 @@ def server_options_from_args(args: argparse.Namespace) -> ServerOptions:
         preserve_startup_recovery_threads=getattr(
             args, "preserve_startup_recovery_threads", 0
         ),
+        extra_mysqld_options=tuple(getattr(args, "mysqld_option", []) or ()),
     )
 
 
@@ -586,6 +593,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         "--skip-log-bin",
         action="store_true",
         help="render and preserve a no-binlog my.cnf for no-bin E2E gates",
+    )
+    parser.add_argument(
+        "--mysqld-option",
+        action="append",
+        default=[],
+        help="append a raw mysqld option line to the generated [mysqld] section",
     )
 
 

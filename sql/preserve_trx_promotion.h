@@ -49,6 +49,9 @@ uint64_t preserve_trx_promotion_gate_record_lock_resident_pages_status();
 uint64_t preserve_trx_promotion_gate_record_lock_cold_page_gets_status();
 uint64_t preserve_trx_promotion_gate_ready_cache_miss_count_status();
 uint64_t preserve_trx_promotion_gate_over_budget_count_status();
+uint64_t preserve_trx_promotion_prewarm_record_lock_page_count_status();
+uint64_t preserve_trx_promotion_prewarm_record_lock_resident_pages_status();
+uint64_t preserve_trx_promotion_prewarm_record_lock_cold_page_gets_status();
 
 enum class Preserve_trx_promotion_adopt_status {
   OK,
@@ -160,6 +163,12 @@ preserved_trx_promotion_prewarm_standby_pending_token(
     uint64_t token, uint64_t required_apply_lsn);
 
 Preserve_trx_promotion_adopt_status
+preserved_trx_promotion_prewarm_staged_bundle_for_receiver(
+    const std::string &preserve_dir, const std::string &epoch_id,
+    uint64_t token, uint64_t required_apply_lsn,
+    const Preserved_trx_bundle &bundle);
+
+Preserve_trx_promotion_adopt_status
 preserved_trx_promotion_prewarm_standby_pending_tokens(
     const std::string &preserve_dir, const std::string &epoch_id,
     const std::vector<uint64_t> &tokens, uint64_t required_apply_lsn,
@@ -236,6 +245,7 @@ enum class Preserve_trx_promotion_ready_state {
   RECEIVED_DURABLE,
   HYDRATING,
   DRY_VALIDATED,
+  PREWARMED_PENDING_FINAL_FACT,
   APPLY_PENDING,
   APPLY_REACHED,
   READY,

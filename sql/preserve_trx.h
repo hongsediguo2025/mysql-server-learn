@@ -42,6 +42,7 @@ class THD;
 struct TABLE;
 struct LEX;
 struct Preserve_trx_lock_warmcopy_artifact;
+class Preserve_trx_transfer_source_epoch_session;
 
 extern bool preserve_trx_enable;
 extern bool preserve_trx_temp_table_enable;
@@ -570,7 +571,10 @@ bool preserve_trx_preserve_attached_transaction(
     const Preserve_trx_lock_warmcopy_artifact *lock_warmcopy_artifact = nullptr,
     bool debug_fail_ha_prepare_low = false,
     bool debug_fail_temp_only_prepare = false,
-    bool defer_snapshot_directory_fsync = false);
+    bool defer_snapshot_directory_fsync = false,
+    Preserve_trx_transfer_source_epoch_session *transfer_source_epoch_session =
+        nullptr,
+    const std::string &transfer_preserve_dir = std::string());
 
 /*
   SQL command for preserving the current transaction before shutdown.

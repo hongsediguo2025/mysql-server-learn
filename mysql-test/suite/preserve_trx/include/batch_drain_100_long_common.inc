@@ -98,6 +98,9 @@ DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS;
 
 --exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=200 --max-connections=400 $batch_long_restart_options" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --enable_reconnect
+# Debug big-test matrices can spend longer than the default 100s reconnect
+# window inside preserved transaction recovery.
+--let $wait_counter= 3000
 --source include/wait_until_connected_again.inc
 --disable_reconnect
 

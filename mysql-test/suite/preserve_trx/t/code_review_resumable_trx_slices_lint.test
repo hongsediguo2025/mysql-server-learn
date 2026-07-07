@@ -155,6 +155,66 @@ die "standby transfer commit marker publication must not truncate an existing te
 die "standby transfer epoch fact publication must not truncate an existing temp file\n"
   if $transfer =~
      /write_epoch_fact_file[\s\S]*my_create\s*\([^;]*O_WRONLY\s*\|\s*O_TRUNC[^;]*\)/s;
+die "standby streaming transfer must expose a session-backed artifact sink for phase1-declared tokens\n"
+  unless $transfer_header =~ /class\s+Preserve_trx_transfer_session_artifact_sink/s;
+die "standby streaming transfer source epoch session must finalize externally built manifest objects for phase1 builders\n"
+  unless $transfer_header =~ /send_token_objects\s*\(\s*const\s+Preserve_trx_transfer_manifest\s*&\s*manifest\s*,\s*const\s+std::vector<Preserve_trx_transfer_object_payload>\s*&\s*objects\s*\)/s &&
+         $transfer =~ /Preserve_trx_transfer_source_epoch_session::send_token_objects/s;
+die "standby streaming transfer source epoch session must expose chunk-level object streaming for phase1 builders\n"
+  unless $transfer_header =~ /begin_token_objects\s*\(\s*const\s+Preserve_trx_transfer_manifest\s*&\s*manifest\s*\)/s &&
+         $transfer_header =~ /write_object_chunk\s*\(\s*uint64_t\s+transfer_token\s*,\s*const\s+std::string\s*&\s*object_id\s*,\s*uint64_t\s+chunk_offset\s*,\s*const\s+std::string\s*&\s*chunk_payload\s*\)/s &&
+         $transfer_header =~ /seal_object\s*\(\s*uint64_t\s+transfer_token\s*,\s*const\s+std::string\s*&\s*object_id\s*\)/s &&
+         $transfer_header =~ /finalize_token_manifest\s*\(\s*uint64_t\s+transfer_token\s*\)/s &&
+         $transfer =~ /Preserve_trx_transfer_source_epoch_session::write_object_chunk/s;
+die "standby streaming transfer must declare large objects before the final token manifest so receiver prewarm can start early\n"
+  unless $transfer_header =~ /DECLARE_OBJECT/s &&
+         $transfer_header =~ /declare_object\s*\(\s*uint64_t\s+transfer_token\s*,\s*const\s+Preserve_trx_transfer_object_descriptor\s*&\s*descriptor\s*\)/s &&
+         $transfer =~ /Preserve_trx_transfer_source_epoch_session::declare_object/s &&
+         $transfer =~ /Preserve_trx_transfer_frame_type::DECLARE_OBJECT/s;
+my ($session_artifact_sink_publish) =
+  $transfer =~ /(Preserve_trx_transfer_session_artifact_sink::publish_bundle[\s\S]*?return Preserve_snapshot_status::OK;\n})/s
+  or die "could not isolate standby streaming transfer session artifact sink publish path\n";
+die "standby streaming transfer session artifact sink must use chunk-level session API, not send_token_bundle\n"
+  unless $session_artifact_sink_publish =~ /declare_object/s &&
+         $session_artifact_sink_publish =~ /begin_token_objects/s &&
+         $session_artifact_sink_publish =~ /write_object_chunk/s &&
+         $session_artifact_sink_publish =~ /seal_object/s &&
+         $session_artifact_sink_publish =~ /finalize_token_manifest/s &&
+         $session_artifact_sink_publish !~ /send_token_bundle/s;
+my ($receiver_payload_batch) =
+  $transfer =~ /(preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*?return\s+preserve_trx_transfer_apply_receiver_frame_batch_with_workers[\s\S]*?;\n})/s
+  or die "could not isolate standby receiver encoded payload batch path\n";
+die "standby receiver encoded payload batch path must use receiver worker_count after durable sequence admission\n"
+  unless $receiver_payload_batch !~ /\(void\)\s*worker_count\s*;/ &&
+         $receiver_payload_batch =~ /worker_count/s &&
+         $receiver_payload_batch =~ /pre_admit_receiver_batch_sequence/s &&
+         $receiver_payload_batch =~ /preserve_trx_transfer_apply_receiver_frame_batch_with_workers\(\s*frames,\s*worker_count/s;
+die "standby streaming transfer must not create a per-token configured frame sink when the kernel request already has a source epoch session\n"
+  unless $preserve =~
+     /request\.transfer_source_epoch_session\s*==\s*nullptr[\s\S]*preserve_trx_transfer_make_configured_frame_sink/s;
+die "standby streaming transfer kernel path must pass the source epoch session into artifact sink factory\n"
+  unless $preserve =~
+     /preserve_trx_make_artifact_sink_for_decision[\s\S]*request\.transfer_source_epoch_session[\s\S]*request\.transfer_preserve_dir/s;
+die "standby streaming transfer batch path must own one source epoch session for all target tokens\n"
+  unless $preserve =~ /batch_transfer_source_session/s;
+die "standby streaming transfer must force two-phase drain so the source epoch can open during phase1\n"
+  unless $preserve =~
+     /standby_transfer_streaming_enabled[\s\S]*two_phase_enabled\s*=[\s\S]*standby_transfer_streaming_enabled/s;
+die "standby streaming transfer source epoch must open after phase1 participants and before WARMCOPY_CLOSING\n"
+  unless $preserve =~
+     /open_phase1_participants\s*\(\s*\)[\s\S]*open_batch_transfer_source_epoch\s*\(\s*\)[\s\S]*transition_to\s*\(\s*Preserve_trx_manager_state::WARMCOPY_CLOSING/s;
+die "standby streaming transfer must predeclare phase1 target tokens before WARMCOPY_CLOSING\n"
+  unless $preserve =~
+     /declare_phase1_transfer_targets[\s\S]*transition_to\s*\(\s*Preserve_trx_manager_state::WARMCOPY_CLOSING/s;
+die "standby streaming transfer must abort phase1-declared tokens that are not in the final quiesced target set\n"
+  unless $preserve =~ /abort_phase1_transfer_targets_not_quiesced/s;
+die "standby streaming transfer batch path must declare every quiesced target token before target preserve publishes bundles\n"
+  unless $preserve =~
+     /for\s*\(\s*const\s+my_thread_id\s+target_thread_id\s*:\s*quiesced_target_thread_ids\s*\)[\s\S]*batch_transfer_source_session[\s\S]*declare_token/s;
+die "standby streaming transfer batch path must abort the source epoch when the batch fails before commit\n"
+  unless $preserve =~ /batch_transfer_source_session[\s\S]*abort_epoch/s;
+die "standby streaming transfer batch path must commit the source epoch only after all batch target snapshots are ready\n"
+  unless $preserve =~ /batch_transfer_source_session[\s\S]*commit_epoch/s;
 
 $lock_preserve =~ /static bool lock_preserve_page_identity_matches[\s\S]*?^}/m
   or die "could not isolate lock_preserve_page_identity_matches\n";
@@ -244,7 +304,9 @@ $promotion =~
 my $promotion_prewarm = $&;
 die "promotion prewarm must sample record-lock page residency before marking a record-lock token ready\n"
   unless $promotion =~
-         /preserved_trx_promotion_prewarm_standby_pending_token[\s\S]*wait_for_record_lock_pages_to_be_gate_ready/s &&
+         /preserved_trx_promotion_prewarm_standby_pending_token[\s\S]*prewarm_loaded_bundle_into_ready_cache/s &&
+         $promotion =~
+         /prewarm_loaded_bundle_into_ready_cache[\s\S]*wait_for_record_lock_pages_to_be_gate_ready/s &&
          $promotion =~
          /wait_for_record_lock_pages_to_be_gate_ready[\s\S]*record_lock_pages_are_gate_ready/s &&
          $promotion =~
@@ -254,7 +316,9 @@ die "promotion prewarm failure log must include record-lock residency counters\n
          /promotion prewarm token=[\s\S]*record_lock_page_count[\s\S]*record_lock_prefetch_submitted_pages[\s\S]*record_lock_resident_pages[\s\S]*record_lock_io_pending_pages[\s\S]*record_lock_missing_pages/s;
 die "promotion prewarm must use the gate record-lock page prefetch helper that waits for resident pages\n"
   unless $promotion =~
-         /preserved_trx_promotion_prewarm_standby_pending_token[\s\S]*trx_preserve_prefetch_record_lock_pages_for_gate/s;
+         /preserved_trx_promotion_prewarm_standby_pending_token[\s\S]*prewarm_loaded_bundle_into_ready_cache/s &&
+         $promotion =~
+         /prewarm_loaded_bundle_into_ready_cache[\s\S]*trx_preserve_prefetch_record_lock_pages_for_gate/s;
 die "startup recovery must globally prewarm record-lock pages before starting recovery workers\n"
   unless $preserve =~
          /prewarm_record_lock_pages_for_startup_recovery/s &&
@@ -1777,7 +1841,9 @@ die "startup recovery and promotion prewarm must share side-effect-free dry vali
          $preserve =~
          /recover_preserved_snapshot[\s\S]*preserved_trx_dry_validate_loaded_bundle/s &&
          $promotion =~
-         /preserved_trx_promotion_prewarm_standby_pending_token[\s\S]*preserved_trx_dry_validate_loaded_bundle/s;
+         /preserved_trx_promotion_prewarm_standby_pending_token[\s\S]*prewarm_loaded_bundle_into_ready_cache/s &&
+         $promotion =~
+         /prewarm_loaded_bundle_into_ready_cache[\s\S]*preserved_trx_dry_validate_loaded_bundle/s;
 
 my $resume_execute_audit = $resume_core;
 die "successful RESUME must emit an audit event\n"

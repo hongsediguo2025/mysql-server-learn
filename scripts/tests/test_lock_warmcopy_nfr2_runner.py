@@ -53,6 +53,29 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
 
         self.assertIn("preserve-trx-startup-recovery-threads=16", rendered)
 
+    def test_render_my_cnf_supports_extra_startup_options(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            build = repo / "build-release"
+            work = build / "lock-warmcopy-nfr2"
+            paths = resolve_paths(repo, build, work)
+
+            rendered = render_my_cnf(
+                paths,
+                ServerOptions(
+                    extra_mysqld_options=[
+                        "preserve-trx-transfer-enable=ON",
+                        "preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE",
+                    ]
+                ),
+            )
+
+        self.assertIn("preserve-trx-transfer-enable=ON", rendered)
+        self.assertIn(
+            "preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE",
+            rendered,
+        )
+
     def test_skip_log_bin_common_arg_renders_no_bin_config(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir) / "repo"

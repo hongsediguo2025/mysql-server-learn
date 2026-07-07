@@ -24,9 +24,12 @@
 #ifndef SQL_PRESERVE_TRX_KERNEL_INCLUDED
 #define SQL_PRESERVE_TRX_KERNEL_INCLUDED
 
+#include <string>
+
 #include "sql/preserve_trx.h"
 
 struct Preserve_trx_lock_warmcopy_artifact;
+class Preserve_trx_transfer_source_epoch_session;
 
 struct Preserve_trx_kernel_request {
   THD *target_thd{nullptr};
@@ -40,6 +43,9 @@ struct Preserve_trx_kernel_request {
   bool debug_fail_temp_only_prepare{false};
   const Preserve_trx_lock_warmcopy_artifact *lock_warmcopy_artifact{nullptr};
   bool defer_snapshot_directory_fsync{false};
+  Preserve_trx_transfer_source_epoch_session *transfer_source_epoch_session{
+      nullptr};
+  std::string transfer_preserve_dir;
 };
 
 struct Preserve_trx_kernel_result {

@@ -44,6 +44,7 @@
 #include "mysqld_error.h"
 #include "mysql/components/services/log_builtins.h"
 #include "sha2.h"
+#include "sql/mysqld.h"  // server_uuid
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_carrier.h"
 #include "sql/preserve_trx_transfer.h"
@@ -187,6 +188,20 @@ bool ready_cache_lookup(const std::string &preserve_dir,
   if (found == g_ready_cache.end()) return false;
   if (entry != nullptr) *entry = found->second;
   return true;
+}
+
+std::vector<std::pair<uint64_t, Promotion_ready_cache_entry>>
+ready_cache_entries_for_epoch(const std::string &preserve_dir,
+                              const std::string &epoch_id) {
+  std::vector<std::pair<uint64_t, Promotion_ready_cache_entry>> entries;
+  std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+  for (const auto &item : g_ready_cache) {
+    if (item.first.preserve_dir == preserve_dir &&
+        item.first.epoch_id == epoch_id) {
+      entries.emplace_back(item.first.token, item.second);
+    }
+  }
+  return entries;
 }
 
 std::string ready_cache_reason_or_status(
@@ -1148,6 +1163,44 @@ uint64_t preserve_trx_promotion_gate_over_budget_count_status() {
   return g_promotion_gate_over_budget_count.load();
 }
 
+uint64_t preserve_trx_promotion_prewarm_record_lock_page_count_status() {
+  uint64_t page_count = 0;
+  std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+  for (const auto &item : g_ready_cache) {
+    const Promotion_ready_cache_entry &entry = item.second;
+    if (ready_cache_entry_needs_record_lock_prewarm(entry)) {
+      page_count += entry.record_lock_page_count;
+    }
+  }
+  return page_count;
+}
+
+uint64_t preserve_trx_promotion_prewarm_record_lock_resident_pages_status() {
+  uint64_t resident_pages = 0;
+  std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+  for (const auto &item : g_ready_cache) {
+    const Promotion_ready_cache_entry &entry = item.second;
+    if (ready_cache_entry_needs_record_lock_prewarm(entry)) {
+      resident_pages += entry.record_lock_resident_pages;
+    }
+  }
+  return resident_pages;
+}
+
+uint64_t preserve_trx_promotion_prewarm_record_lock_cold_page_gets_status() {
+  uint64_t cold_page_gets = 0;
+  std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+  for (const auto &item : g_ready_cache) {
+    const Promotion_ready_cache_entry &entry = item.second;
+    if (ready_cache_entry_needs_record_lock_prewarm(entry) &&
+        entry.record_lock_page_count > entry.record_lock_resident_pages) {
+      cold_page_gets +=
+          entry.record_lock_page_count - entry.record_lock_resident_pages;
+    }
+  }
+  return cold_page_gets;
+}
+
 void preserved_trx_set_promotion_apply_state_provider(
     Preserve_trx_promotion_apply_state_provider provider) {
   g_apply_state_provider = provider;
@@ -1273,56 +1326,11 @@ bool preserved_trx_promotion_record_lock_pages_wait_for_residency_for_unit_test(
   return ready;
 }
 
-Preserve_trx_promotion_adopt_status
-preserved_trx_promotion_prewarm_standby_pending_token(
+Preserve_trx_promotion_adopt_status prewarm_loaded_bundle_into_ready_cache(
     const std::string &preserve_dir, const std::string &epoch_id,
-    uint64_t token, uint64_t required_apply_lsn) {
-  if (preserve_dir.empty() || epoch_id.empty() || token == 0) {
-    return Preserve_trx_promotion_adopt_status::INVALID_ARGUMENT;
-  }
-  if (!preserve_trx_is_enabled()) {
-    return Preserve_trx_promotion_adopt_status::NOT_ENABLED;
-  }
-
-  auto store = create_preserved_trx_default_store(preserve_dir);
-  Preserved_trx_carrier_listing listing;
-  const Preserve_snapshot_status list_status = store->list_tokens(&listing);
-  if (list_status != Preserve_snapshot_status::OK) {
-    return carrier_status_to_promotion_status(list_status);
-  }
-
+    uint64_t token, uint64_t required_apply_lsn,
+    const Preserved_trx_bundle &bundle, bool wait_for_final_epoch_fact) {
   const std::string token_string = std::to_string(token);
-  if (listing.standby_pending_tokens.count(token_string) == 0) {
-    return listing.snapshot_tokens.count(token_string) != 0
-               ? Preserve_trx_promotion_adopt_status::NOT_STANDBY_PENDING
-               : Preserve_trx_promotion_adopt_status::TOKEN_NOT_FOUND;
-  }
-
-  Preserved_trx_bundle bundle;
-  const Preserve_snapshot_status read_status =
-      preserved_trx_load_bundle_for_recover_or_prewarm(
-          preserve_dir, token_string,
-          Preserved_trx_recover_load_profile::WITH_SEMANTIC_EXTERNAL_BLOBS,
-          &bundle);
-  if (read_status != Preserve_snapshot_status::OK) {
-    if (read_status == Preserve_snapshot_status::NOT_FOUND ||
-        read_status == Preserve_snapshot_status::CORRUPT ||
-        read_status == Preserve_snapshot_status::UNSUPPORTED) {
-      std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
-      Promotion_ready_cache_entry entry;
-      entry.state = Preserve_trx_promotion_ready_state::CORRUPT;
-      entry.required_apply_lsn = required_apply_lsn;
-      entry.reason = std::string("bundle load failed: ") +
-                     preserve_snapshot_status_name(read_status);
-      g_ready_cache[Promotion_ready_cache_key{preserve_dir, epoch_id, token}] =
-          std::move(entry);
-    }
-    if (read_status == Preserve_snapshot_status::NOT_FOUND) {
-      return Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT;
-    }
-    return carrier_status_to_promotion_status(read_status);
-  }
-
   std::string dry_validate_reason;
   const Preserve_snapshot_status dry_validate_status =
       preserved_trx_dry_validate_loaded_bundle(preserve_dir, token_string,
@@ -1346,7 +1354,10 @@ preserved_trx_promotion_prewarm_standby_pending_token(
   }
 
   Promotion_ready_cache_entry entry;
-  entry.state = Preserve_trx_promotion_ready_state::READY;
+  entry.state = wait_for_final_epoch_fact
+                    ? Preserve_trx_promotion_ready_state::
+                          PREWARMED_PENDING_FINAL_FACT
+                    : Preserve_trx_promotion_ready_state::READY;
   entry.required_apply_lsn = required_apply_lsn;
   entry.has_ready_bundle = true;
   entry.ready_bundle = bundle;
@@ -1379,8 +1390,9 @@ preserved_trx_promotion_prewarm_standby_pending_token(
           entry.reason = "record-lock page prefetch not ready";
         }
         std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
-        g_ready_cache[Promotion_ready_cache_key{preserve_dir, epoch_id, token}] =
-            std::move(entry);
+        g_ready_cache
+            [Promotion_ready_cache_key{preserve_dir, epoch_id, token}] =
+                std::move(entry);
         return Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY;
       }
       entry.state = Preserve_trx_promotion_ready_state::CORRUPT;
@@ -1449,6 +1461,16 @@ preserved_trx_promotion_prewarm_standby_pending_token(
     const Preserve_trx_transfer_status fact_status =
         preserve_trx_transfer_read_epoch_fact(preserve_dir, epoch_id, &fact);
     if (fact_status == Preserve_trx_transfer_status::OK) {
+      if (fact.target_server_uuid != server_uuid) {
+        entry.state = Preserve_trx_promotion_ready_state::CORRUPT;
+        entry.has_ready_bundle = false;
+        entry.reason = "epoch fact target does not match local server_uuid";
+        std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+        g_ready_cache
+            [Promotion_ready_cache_key{preserve_dir, epoch_id, token}] =
+                std::move(entry);
+        return Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT;
+      }
       bool token_found = false;
       for (const Preserve_trx_transfer_epoch_fact_token &fact_token :
            fact.tokens) {
@@ -1467,6 +1489,7 @@ preserved_trx_promotion_prewarm_standby_pending_token(
                 std::move(entry);
         return Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT;
       }
+      entry.state = Preserve_trx_promotion_ready_state::READY;
       entry.has_epoch_fact = true;
       entry.epoch_fact_digest = fact.fact_digest;
     } else {
@@ -1486,6 +1509,75 @@ preserved_trx_promotion_prewarm_standby_pending_token(
         std::move(entry);
   }
   return Preserve_trx_promotion_adopt_status::OK;
+}
+
+Preserve_trx_promotion_adopt_status
+preserved_trx_promotion_prewarm_standby_pending_token(
+    const std::string &preserve_dir, const std::string &epoch_id,
+    uint64_t token, uint64_t required_apply_lsn) {
+  if (preserve_dir.empty() || epoch_id.empty() || token == 0) {
+    return Preserve_trx_promotion_adopt_status::INVALID_ARGUMENT;
+  }
+  if (!preserve_trx_is_enabled()) {
+    return Preserve_trx_promotion_adopt_status::NOT_ENABLED;
+  }
+
+  auto store = create_preserved_trx_default_store(preserve_dir);
+  Preserved_trx_carrier_listing listing;
+  const Preserve_snapshot_status list_status = store->list_tokens(&listing);
+  if (list_status != Preserve_snapshot_status::OK) {
+    return carrier_status_to_promotion_status(list_status);
+  }
+
+  const std::string token_string = std::to_string(token);
+  if (listing.standby_pending_tokens.count(token_string) == 0) {
+    return listing.snapshot_tokens.count(token_string) != 0
+               ? Preserve_trx_promotion_adopt_status::NOT_STANDBY_PENDING
+               : Preserve_trx_promotion_adopt_status::TOKEN_NOT_FOUND;
+  }
+
+  Preserved_trx_bundle bundle;
+  const Preserve_snapshot_status read_status =
+      preserved_trx_load_bundle_for_recover_or_prewarm(
+          preserve_dir, token_string,
+          Preserved_trx_recover_load_profile::WITH_SEMANTIC_EXTERNAL_BLOBS,
+          &bundle);
+  if (read_status != Preserve_snapshot_status::OK) {
+    if (read_status == Preserve_snapshot_status::NOT_FOUND ||
+        read_status == Preserve_snapshot_status::CORRUPT ||
+        read_status == Preserve_snapshot_status::UNSUPPORTED) {
+      std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+      Promotion_ready_cache_entry entry;
+      entry.state = Preserve_trx_promotion_ready_state::CORRUPT;
+      entry.required_apply_lsn = required_apply_lsn;
+      entry.reason = std::string("bundle load failed: ") +
+                     preserve_snapshot_status_name(read_status);
+      g_ready_cache[Promotion_ready_cache_key{preserve_dir, epoch_id, token}] =
+          std::move(entry);
+    }
+    if (read_status == Preserve_snapshot_status::NOT_FOUND) {
+      return Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT;
+    }
+    return carrier_status_to_promotion_status(read_status);
+  }
+
+  return prewarm_loaded_bundle_into_ready_cache(
+      preserve_dir, epoch_id, token, required_apply_lsn, bundle, false);
+}
+
+Preserve_trx_promotion_adopt_status
+preserved_trx_promotion_prewarm_staged_bundle_for_receiver(
+    const std::string &preserve_dir, const std::string &epoch_id,
+    uint64_t token, uint64_t required_apply_lsn,
+    const Preserved_trx_bundle &bundle) {
+  if (preserve_dir.empty() || epoch_id.empty() || token == 0) {
+    return Preserve_trx_promotion_adopt_status::INVALID_ARGUMENT;
+  }
+  if (!preserve_trx_is_enabled()) {
+    return Preserve_trx_promotion_adopt_status::NOT_ENABLED;
+  }
+  return prewarm_loaded_bundle_into_ready_cache(
+      preserve_dir, epoch_id, token, required_apply_lsn, bundle, true);
 }
 
 Preserve_trx_promotion_adopt_status
@@ -1615,6 +1707,7 @@ preserved_trx_promotion_ready_summary_for_epoch(
   if (list_status != Preserve_snapshot_status::OK) {
     return carrier_status_to_promotion_status(list_status);
   }
+  std::set<uint64_t> reported_tokens;
   for (const std::string &token_string : listing.standby_pending_tokens) {
     uint64_t token = 0;
     if (!parse_uint64_strict(token_string, &token) || token == 0) {
@@ -1624,6 +1717,7 @@ preserved_trx_promotion_ready_summary_for_epoch(
           "non-numeric standby-pending token");
       continue;
     }
+    reported_tokens.insert(token);
     Promotion_ready_cache_entry cache_entry;
     if (!ready_cache_lookup(preserve_dir, epoch_id, token, &cache_entry)) {
       summary->pending_tokens.push_back(token);
@@ -1656,6 +1750,25 @@ preserved_trx_promotion_ready_summary_for_epoch(
           cache_entry.reason.empty() ? "promotion-ready cache not ready"
                                      : cache_entry.reason);
     }
+  }
+  for (const auto &cache_item :
+       ready_cache_entries_for_epoch(preserve_dir, epoch_id)) {
+    const uint64_t token = cache_item.first;
+    const Promotion_ready_cache_entry &cache_entry = cache_item.second;
+    if (reported_tokens.count(token) != 0 ||
+        cache_entry.state != Preserve_trx_promotion_ready_state::
+                                 PREWARMED_PENDING_FINAL_FACT) {
+      continue;
+    }
+    summary->pending_tokens.push_back(token);
+    summary->max_required_apply_lsn =
+        std::max(summary->max_required_apply_lsn,
+                 cache_entry.required_apply_lsn);
+    append_ready_summary_token_result(
+        summary, token,
+        Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+        cache_entry.reason.empty() ? "prewarmed pending final epoch fact"
+                                   : cache_entry.reason);
   }
   std::sort(summary->ready_tokens.begin(), summary->ready_tokens.end());
   std::sort(summary->pending_tokens.begin(), summary->pending_tokens.end());

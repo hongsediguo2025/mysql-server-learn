@@ -229,13 +229,18 @@ class Transfer_receiver_config_guard {
       : m_preserve_enable(preserve_trx_enable),
         m_receiver_enable(preserve_trx_transfer_receiver_enable),
         m_allowed_source(preserve_trx_transfer_allowed_source_uuid),
-        m_target(preserve_trx_transfer_target_server_uuid) {}
+        m_target(preserve_trx_transfer_target_server_uuid),
+        m_server_uuid(server_uuid),
+        m_server_uuid_ptr(server_uuid_ptr) {}
 
   ~Transfer_receiver_config_guard() {
     preserve_trx_set_enable_value(m_preserve_enable);
     preserve_trx_transfer_receiver_enable = m_receiver_enable;
     preserve_trx_transfer_allowed_source_uuid = m_allowed_source;
     preserve_trx_transfer_target_server_uuid = m_target;
+    std::snprintf(server_uuid, UUID_LENGTH + 1, "%s",
+                  m_server_uuid.c_str());
+    server_uuid_ptr = m_server_uuid_ptr;
   }
 
   void allow(const char *source_uuid, const char *target_uuid) {
@@ -245,6 +250,10 @@ class Transfer_receiver_config_guard {
         const_cast<char *>(source_uuid);
     preserve_trx_transfer_target_server_uuid =
         const_cast<char *>(target_uuid);
+    std::snprintf(server_uuid, UUID_LENGTH + 1, "%s", target_uuid);
+    server_uuid_ptr =
+        std::strlen(target_uuid) == UUID_LENGTH ? server_uuid
+                                                : m_server_uuid.c_str();
   }
 
  private:
@@ -252,6 +261,8 @@ class Transfer_receiver_config_guard {
   bool m_receiver_enable;
   char *m_allowed_source;
   char *m_target;
+  std::string m_server_uuid;
+  const char *m_server_uuid_ptr{nullptr};
 };
 
 class Transfer_source_config_guard {
@@ -2070,6 +2081,27 @@ TEST(PreservedTrxTransfer, ManifestV2DecodesWithoutStrictApplyBarrierLsns) {
   EXPECT_EQ(0U, decoded.source_epoch_commit_lsn);
 }
 
+TEST(PreservedTrxTransfer, EpochFactRejectsZeroApplyBarrierLsns) {
+  Preserve_trx_transfer_epoch_fact fact;
+  fact.epoch_id = "epoch-zero-lsn";
+  fact.source_server_uuid = "source-uuid";
+  fact.target_server_uuid = "target-uuid";
+  Preserve_trx_transfer_epoch_fact_token token;
+  token.token = 12348;
+  token.source_prepare_lsn = 0;
+  token.source_epoch_commit_lsn = 140;
+  fact.tokens.push_back(token);
+
+  std::string encoded;
+  EXPECT_EQ(Preserve_trx_transfer_status::INVALID_ARGUMENT,
+            preserve_trx_transfer_encode_epoch_fact(fact, &encoded));
+
+  fact.tokens[0].source_prepare_lsn = 120;
+  fact.tokens[0].source_epoch_commit_lsn = 0;
+  EXPECT_EQ(Preserve_trx_transfer_status::INVALID_ARGUMENT,
+            preserve_trx_transfer_encode_epoch_fact(fact, &encoded));
+}
+
 TEST(PreservedTrxTransfer, ManifestRejectsBadVersionAndTruncation) {
   Preserve_trx_transfer_manifest manifest;
   manifest.protocol_version = kPreserveTrxTransferProtocolVersion + 1;
@@ -2668,6 +2700,11 @@ TEST(PreservedTrxTransfer, ReceiverPolicyRequiresEnableAllowedSourceAndTarget) {
 }
 
 TEST(PreservedTrxTransfer, ReceiverPolicyUsesConfiguredEndpointIdentity) {
+  const std::string saved_server_uuid = server_uuid;
+  const char *saved_server_uuid_ptr = server_uuid_ptr;
+  std::snprintf(server_uuid, UUID_LENGTH + 1, "%s", "target-uuid");
+  server_uuid_ptr = server_uuid;
+
   Preserve_trx_transfer_manifest manifest;
   manifest.epoch_id = "epoch-1";
   manifest.source_server_uuid = "source-uuid";
@@ -2693,6 +2730,9 @@ TEST(PreservedTrxTransfer, ReceiverPolicyUsesConfiguredEndpointIdentity) {
   preserve_trx_transfer_allowed_source_uuid = old_allowed_source;
   preserve_trx_transfer_target_server_uuid = old_target;
   preserve_trx_transfer_receiver_enable = old_receiver_enable;
+  std::snprintf(server_uuid, UUID_LENGTH + 1, "%s",
+                saved_server_uuid.c_str());
+  server_uuid_ptr = saved_server_uuid_ptr;
 }
 
 TEST(PreservedTrxTransfer, ProtocolCommandNameIsRegistered) {
@@ -3822,6 +3862,8 @@ TEST_F(PreserveSnapshotTest, PromotionRejectsEpochFactTokenSetMismatch) {
   fact.target_server_uuid = "target-uuid";
   Preserve_trx_transfer_epoch_fact_token wrong_token;
   wrong_token.token = 924;
+  wrong_token.source_prepare_lsn = 120;
+  wrong_token.source_epoch_commit_lsn = 140;
   fact.tokens.push_back(wrong_token);
   std::string encoded_fact;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
@@ -3876,6 +3918,8 @@ TEST_F(PreserveSnapshotTest, PromotionEmptyRequestUsesEpochFactTokenSet) {
   fact.target_server_uuid = "target-uuid";
   Preserve_trx_transfer_epoch_fact_token token;
   token.token = 931;
+  token.source_prepare_lsn = 120;
+  token.source_epoch_commit_lsn = 140;
   fact.tokens.push_back(token);
   std::string encoded_fact;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
@@ -4007,14 +4051,14 @@ TEST_F(PreserveSnapshotTest, PromotionRejectsReadyCacheFactDigestDrift) {
   std::vector<Preserve_trx_transfer_object_payload> objects;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             preserve_trx_transfer_build_portable_objects(
-                "epoch-fact-drift", "source-uuid", "target-uuid", bundle,
+                "epoch-fact-drift", "source-uuid", server_uuid, bundle,
                 transfer_token, &manifest, &objects));
   std::string manifest_payload;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             preserve_trx_transfer_encode_manifest(manifest, &manifest_payload));
 
   Transfer_receiver_config_guard receiver_config;
-  receiver_config.allow("source-uuid", "target-uuid");
+  receiver_config.allow("source-uuid", server_uuid);
   Preserve_trx_transfer_receiver_registry registry;
   Local_file_preserved_trx_carrier carrier(m_dir);
   Preserved_trx_store store(&carrier);
@@ -4575,6 +4619,32 @@ TEST_F(PreserveSnapshotTest, PromotionReadyRecordLockMetricsRequireResidency) {
   EXPECT_TRUE(
       preserved_trx_promotion_record_lock_pages_gate_ready_for_unit_test(
           true, 10, 10, 10));
+}
+
+TEST_F(PreserveSnapshotTest, PromotionPrewarmStatusSummarizesRecordLockPages) {
+  preserve_trx_set_enable_value(true);
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = "947";
+  meta.record_locks_payload = record_locks_payload();
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  preserved_trx_promotion_ready_cache_clear_for_unit_test();
+  preserved_trx_promotion_ready_cache_put_bundle_with_record_lock_residency_for_unit_test(
+      m_dir, "epoch-1", 947, Preserve_trx_promotion_ready_state::READY, 0,
+      bundle, 10, 10, 7, 1, 10);
+
+  EXPECT_EQ(10U, preserve_trx_promotion_prewarm_record_lock_page_count_status());
+  EXPECT_EQ(7U,
+            preserve_trx_promotion_prewarm_record_lock_resident_pages_status());
+  EXPECT_EQ(3U,
+            preserve_trx_promotion_prewarm_record_lock_cold_page_gets_status());
+
+  preserved_trx_promotion_ready_cache_clear_for_unit_test();
+  preserve_trx_set_enable_value(true);
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -8375,7 +8445,7 @@ TEST_F(PreserveSnapshotTest,
   std::vector<Preserve_trx_transfer_object_payload> objects;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             preserve_trx_transfer_build_portable_objects(
-                "epoch-1", "source-uuid", "target-uuid", bundle,
+                "epoch-1", "source-uuid", server_uuid, bundle,
                 transfer_token, &manifest, &objects));
   EXPECT_GT(manifest.source_prepare_lsn, 0U);
   EXPECT_GT(manifest.source_epoch_commit_lsn, 0U);
@@ -8384,11 +8454,20 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_encode_manifest(manifest, &manifest_payload));
 
   Transfer_receiver_config_guard receiver_config;
-  receiver_config.allow("source-uuid", "target-uuid");
+  receiver_config.allow("source-uuid", server_uuid);
 
   Preserve_trx_transfer_receiver_registry registry;
   Local_file_preserved_trx_carrier carrier(m_dir);
   Preserved_trx_store store(&carrier);
+
+  const uint64_t auto_prewarm_tokens_before =
+      preserve_trx_transfer_receiver_auto_prewarm_tokens_status();
+  const uint64_t auto_prewarm_ready_before =
+      preserve_trx_transfer_receiver_auto_prewarm_ready_tokens_status();
+  const uint64_t auto_prewarm_not_ready_before =
+      preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens_status();
+  const uint64_t receiver_ready_before =
+      preserve_trx_transfer_receiver_ready_monotonic_us_status();
 
   Preserve_trx_transfer_frame begin;
   begin.type = Preserve_trx_transfer_frame_type::BEGIN;
@@ -8462,6 +8541,26 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_TRUE(token_state.snapshot);
   EXPECT_TRUE(token_state.standby_pending);
 
+  Preserve_trx_promotion_ready_summary ready_summary;
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::OK,
+            preserved_trx_promotion_ready_summary_for_epoch(
+                m_dir, manifest.epoch_id, &ready_summary));
+  ASSERT_EQ(1U, ready_summary.ready_tokens.size());
+  EXPECT_EQ(manifest.token, ready_summary.ready_tokens[0]);
+  EXPECT_EQ(manifest.source_epoch_commit_lsn,
+            ready_summary.max_required_apply_lsn);
+  EXPECT_EQ(auto_prewarm_tokens_before + 1,
+            preserve_trx_transfer_receiver_auto_prewarm_tokens_status());
+  EXPECT_EQ(auto_prewarm_ready_before + 1,
+            preserve_trx_transfer_receiver_auto_prewarm_ready_tokens_status());
+  EXPECT_EQ(
+      auto_prewarm_not_ready_before,
+      preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens_status());
+  EXPECT_EQ(static_cast<uint64_t>(Preserve_trx_promotion_adopt_status::OK),
+            preserve_trx_transfer_receiver_auto_prewarm_last_status());
+  EXPECT_GT(preserve_trx_transfer_receiver_ready_monotonic_us_status(),
+            receiver_ready_before);
+
   /*
     Once COMMIT_EPOCH has published the target-local snapshot and marker, the
     token's transfer staging payloads are no longer the recovery source.
@@ -8472,6 +8571,544 @@ TEST_F(PreserveSnapshotTest,
                               "/snapshot.part")
                                  .c_str(),
                              &staged_snapshot_stat, MYF(0)));
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverRejectsFrameTargetThatIsNotLocalServerUuid) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 1020;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-target-mismatch", "source-uuid",
+                "bbbbbbbb-cccc-dddd-eeee-ffffffffffff", bundle,
+                transfer_token, &manifest, &objects));
+  std::string manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_manifest(manifest, &manifest_payload));
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid",
+                        "bbbbbbbb-cccc-dddd-eeee-ffffffffffff");
+  std::snprintf(server_uuid, UUID_LENGTH + 1, "%s",
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+  server_uuid_ptr = server_uuid;
+
+  Preserve_trx_transfer_receiver_registry registry;
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+
+  Preserve_trx_transfer_frame begin;
+  begin.type = Preserve_trx_transfer_frame_type::BEGIN;
+  begin.sequence = 1;
+  begin.epoch_id = manifest.epoch_id;
+  begin.token = manifest.token;
+  begin.manifest_payload = manifest_payload;
+  EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, begin, &store, &registry, 300, nullptr));
+  return;
+
+  uint64_t sequence = 2;
+  for (const Preserve_trx_transfer_object_payload &object : objects) {
+    Preserve_trx_transfer_frame chunk;
+    chunk.type = Preserve_trx_transfer_frame_type::OBJECT_CHUNK;
+    chunk.sequence = sequence++;
+    chunk.epoch_id = manifest.epoch_id;
+    chunk.token = manifest.token;
+    chunk.object_id = object.descriptor.object_id;
+    chunk.chunk_payload = object.payload;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_apply_receiver_frame(
+                  m_dir, chunk, &store, &registry, 300, nullptr));
+
+    Preserve_trx_transfer_frame seal;
+    seal.type = Preserve_trx_transfer_frame_type::SEAL_OBJECT;
+    seal.sequence = sequence++;
+    seal.epoch_id = manifest.epoch_id;
+    seal.token = manifest.token;
+    seal.object_id = object.descriptor.object_id;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_apply_receiver_frame(
+                  m_dir, seal, &store, &registry, 300, nullptr));
+  }
+
+  Preserve_trx_transfer_frame commit;
+  commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
+  commit.sequence = sequence++;
+  commit.epoch_id = manifest.epoch_id;
+  commit.token = manifest.token;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, commit, &store, &registry, 300, nullptr));
+  EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
+
+  Preserve_trx_promotion_ready_summary ready_summary;
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+            preserved_trx_promotion_ready_summary_for_epoch(
+                m_dir, manifest.epoch_id, &ready_summary));
+  EXPECT_TRUE(ready_summary.ready_tokens.empty());
+  ASSERT_EQ(1U, ready_summary.corrupt_tokens.size());
+  EXPECT_EQ(manifest.token, ready_summary.corrupt_tokens[0]);
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverSealPrewarmsStagedBundleBeforeEpochCommit) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 1022;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-seal-prewarm", "source-uuid", server_uuid, bundle,
+                transfer_token, &manifest, &objects));
+  std::string manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_manifest(manifest, &manifest_payload));
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", server_uuid);
+
+  Preserve_trx_transfer_receiver_registry registry;
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  const uint64_t seal_prewarm_tokens_before =
+      preserve_trx_transfer_receiver_seal_prewarm_tokens_status();
+  const uint64_t seal_prewarm_success_before =
+      preserve_trx_transfer_receiver_seal_prewarm_success_tokens_status();
+  const uint64_t seal_prewarm_not_ready_before =
+      preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens_status();
+
+  Preserve_trx_transfer_frame begin;
+  begin.type = Preserve_trx_transfer_frame_type::BEGIN;
+  begin.sequence = 1;
+  begin.epoch_id = manifest.epoch_id;
+  begin.token = manifest.token;
+  begin.manifest_payload = manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, begin, &store, &registry, 300, nullptr));
+
+  uint64_t sequence = 2;
+  for (const Preserve_trx_transfer_object_payload &object : objects) {
+    Preserve_trx_transfer_frame chunk;
+    chunk.type = Preserve_trx_transfer_frame_type::OBJECT_CHUNK;
+    chunk.sequence = sequence++;
+    chunk.epoch_id = manifest.epoch_id;
+    chunk.token = manifest.token;
+    chunk.object_id = object.descriptor.object_id;
+    chunk.chunk_payload = object.payload;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_apply_receiver_frame(
+                  m_dir, chunk, &store, &registry, 300, nullptr));
+
+    Preserve_trx_transfer_frame seal;
+    seal.type = Preserve_trx_transfer_frame_type::SEAL_OBJECT;
+    seal.sequence = sequence++;
+    seal.epoch_id = manifest.epoch_id;
+    seal.token = manifest.token;
+    seal.object_id = object.descriptor.object_id;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_apply_receiver_frame(
+                  m_dir, seal, &store, &registry, 300, nullptr));
+  }
+
+  Preserve_trx_promotion_ready_summary ready_summary;
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+            preserved_trx_promotion_ready_summary_for_epoch(
+                m_dir, manifest.epoch_id, &ready_summary));
+  EXPECT_TRUE(ready_summary.ready_tokens.empty());
+  ASSERT_EQ(1U, ready_summary.pending_tokens.size());
+  EXPECT_EQ(manifest.token, ready_summary.pending_tokens[0]);
+  EXPECT_EQ(seal_prewarm_tokens_before + 1,
+            preserve_trx_transfer_receiver_seal_prewarm_tokens_status());
+  EXPECT_EQ(seal_prewarm_success_before + 1,
+            preserve_trx_transfer_receiver_seal_prewarm_success_tokens_status());
+  EXPECT_EQ(seal_prewarm_not_ready_before,
+            preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens_status());
+  EXPECT_EQ(static_cast<uint64_t>(Preserve_trx_promotion_adopt_status::OK),
+            preserve_trx_transfer_receiver_seal_prewarm_last_status());
+
+  Preserve_trx_transfer_frame commit;
+  commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
+  commit.sequence = sequence++;
+  commit.epoch_id = manifest.epoch_id;
+  commit.token = manifest.token;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, commit, &store, &registry, 300, nullptr));
+
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::OK,
+            preserved_trx_promotion_ready_summary_for_epoch(
+                m_dir, manifest.epoch_id, &ready_summary));
+  ASSERT_EQ(1U, ready_summary.ready_tokens.size());
+  EXPECT_EQ(manifest.token, ready_summary.ready_tokens[0]);
+  EXPECT_TRUE(ready_summary.pending_tokens.empty());
+}
+
+TEST_F(PreserveSnapshotTest, TransferReceiverBeginWritesDurableFrameSpool) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 1021;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-spool", "source-uuid", server_uuid, bundle,
+                transfer_token, &manifest, &objects));
+  std::string manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_manifest(manifest, &manifest_payload));
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", server_uuid);
+
+  Preserve_trx_transfer_receiver_registry registry;
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+
+  Preserve_trx_transfer_frame begin;
+  begin.type = Preserve_trx_transfer_frame_type::BEGIN;
+  begin.sequence = 1;
+  begin.epoch_id = manifest.epoch_id;
+  begin.token = manifest.token;
+  begin.manifest_payload = manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, begin, &store, &registry, 300, nullptr));
+
+  MY_STAT stat_area;
+  EXPECT_NE(nullptr,
+            my_stat((m_dir + ".transfer/" + manifest.epoch_id +
+                     "/receiver.frames")
+                        .c_str(),
+                    &stat_area, MYF(0)));
+}
+
+TEST_F(PreserveSnapshotTest, TransferReceiverReplaysDurableFrameSpool) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 1022;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-spool-replay", "source-uuid", server_uuid, bundle,
+                transfer_token, &manifest, &objects));
+  std::string manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_manifest(manifest, &manifest_payload));
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", server_uuid);
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+
+  Preserve_trx_transfer_frame begin;
+  begin.type = Preserve_trx_transfer_frame_type::BEGIN;
+  begin.sequence = 1;
+  begin.epoch_id = manifest.epoch_id;
+  begin.token = manifest.token;
+  begin.manifest_payload = manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, begin, &store, &registry, 300, nullptr));
+
+  uint64_t sequence = 2;
+  for (const Preserve_trx_transfer_object_payload &object : objects) {
+    Preserve_trx_transfer_frame chunk;
+    chunk.type = Preserve_trx_transfer_frame_type::OBJECT_CHUNK;
+    chunk.sequence = sequence++;
+    chunk.epoch_id = manifest.epoch_id;
+    chunk.token = manifest.token;
+    chunk.object_id = object.descriptor.object_id;
+    chunk.chunk_payload = object.payload;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_apply_receiver_frame(
+                  m_dir, chunk, &store, &registry, 300, nullptr));
+
+    Preserve_trx_transfer_frame seal;
+    seal.type = Preserve_trx_transfer_frame_type::SEAL_OBJECT;
+    seal.sequence = sequence++;
+    seal.epoch_id = manifest.epoch_id;
+    seal.token = manifest.token;
+    seal.object_id = object.descriptor.object_id;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_apply_receiver_frame(
+                  m_dir, seal, &store, &registry, 300, nullptr));
+  }
+
+  Preserve_trx_transfer_receiver_registry replayed_registry;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_replay_receiver_spool(
+                m_dir, manifest.epoch_id, &store, &replayed_registry, 300));
+  Preserve_trx_transfer_receiver_record replayed_record;
+  ASSERT_TRUE(replayed_registry.lookup(manifest.epoch_id, manifest.token,
+                                       &replayed_record));
+  EXPECT_TRUE(replayed_registry.all_objects_sealed(manifest.epoch_id,
+                                                  manifest.token));
+
+  Preserve_trx_transfer_frame commit;
+  commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
+  commit.sequence = sequence++;
+  commit.epoch_id = manifest.epoch_id;
+  commit.token = manifest.token;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, commit, &store, &replayed_registry, 300, nullptr));
+  EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverReplaysCommittedSpoolIdempotentlyAndRebuildsReady) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 1024;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-spool-replay-committed", "source-uuid", server_uuid,
+                bundle, transfer_token, &manifest, &objects));
+  std::string manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_manifest(manifest, &manifest_payload));
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", server_uuid);
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+
+  Preserve_trx_transfer_frame begin;
+  begin.type = Preserve_trx_transfer_frame_type::BEGIN;
+  begin.sequence = 1;
+  begin.epoch_id = manifest.epoch_id;
+  begin.token = manifest.token;
+  begin.manifest_payload = manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, begin, &store, &registry, 300, nullptr));
+
+  uint64_t sequence = 2;
+  for (const Preserve_trx_transfer_object_payload &object : objects) {
+    Preserve_trx_transfer_frame chunk;
+    chunk.type = Preserve_trx_transfer_frame_type::OBJECT_CHUNK;
+    chunk.sequence = sequence++;
+    chunk.epoch_id = manifest.epoch_id;
+    chunk.token = manifest.token;
+    chunk.object_id = object.descriptor.object_id;
+    chunk.chunk_payload = object.payload;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_apply_receiver_frame(
+                  m_dir, chunk, &store, &registry, 300, nullptr));
+
+    Preserve_trx_transfer_frame seal;
+    seal.type = Preserve_trx_transfer_frame_type::SEAL_OBJECT;
+    seal.sequence = sequence++;
+    seal.epoch_id = manifest.epoch_id;
+    seal.token = manifest.token;
+    seal.object_id = object.descriptor.object_id;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_apply_receiver_frame(
+                  m_dir, seal, &store, &registry, 300, nullptr));
+  }
+
+  Preserve_trx_transfer_frame commit;
+  commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
+  commit.sequence = sequence++;
+  commit.epoch_id = manifest.epoch_id;
+  commit.token = manifest.token;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, commit, &store, &registry, 300, nullptr));
+  EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
+
+  Preserved_trx_carrier_token_state state;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(test_transfer_token_string(manifest.token),
+                                &state));
+  ASSERT_TRUE(state.snapshot);
+  ASSERT_TRUE(state.standby_pending);
+
+  preserved_trx_promotion_ready_cache_clear_for_unit_test();
+
+  Preserve_trx_transfer_receiver_registry replayed_registry;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_replay_receiver_spool(
+                m_dir, manifest.epoch_id, &store, &replayed_registry, 300));
+
+  Preserve_trx_promotion_ready_summary ready_summary;
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::OK,
+            preserved_trx_promotion_ready_summary_for_epoch(
+                m_dir, manifest.epoch_id, &ready_summary));
+  ASSERT_EQ(1U, ready_summary.ready_tokens.size());
+  EXPECT_EQ(manifest.token, ready_summary.ready_tokens[0]);
+  EXPECT_TRUE(ready_summary.pending_tokens.empty());
+  EXPECT_TRUE(ready_summary.corrupt_tokens.empty());
+}
+
+TEST_F(PreserveSnapshotTest, TransferReceiverReplayIgnoresTornTailFrame) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 1023;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-spool-torn-tail", "source-uuid", server_uuid, bundle,
+                transfer_token, &manifest, &objects));
+  std::string manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_manifest(manifest, &manifest_payload));
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", server_uuid);
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+
+  Preserve_trx_transfer_frame begin;
+  begin.type = Preserve_trx_transfer_frame_type::BEGIN;
+  begin.sequence = 1;
+  begin.epoch_id = manifest.epoch_id;
+  begin.token = manifest.token;
+  begin.manifest_payload = manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, begin, &store, &registry, 300, nullptr));
+
+  const std::string spool_path =
+      m_dir + ".transfer/" + manifest.epoch_id + "/receiver.frames";
+  File file = my_open(spool_path.c_str(), O_WRONLY | O_APPEND, MYF(0));
+  ASSERT_GE(file, 0);
+  const std::string torn_tail = "PTRXSPL1";
+  ASSERT_EQ(torn_tail.size(),
+            my_write(file, reinterpret_cast<const uchar *>(torn_tail.data()),
+                     torn_tail.size(), MYF(0)));
+  ASSERT_EQ(0, my_close(file, MYF(0)));
+
+  Preserve_trx_transfer_receiver_registry replayed_registry;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_replay_receiver_spool(
+                m_dir, manifest.epoch_id, &store, &replayed_registry, 300));
+  Preserve_trx_transfer_receiver_record replayed_record;
+  ASSERT_TRUE(replayed_registry.lookup(manifest.epoch_id, manifest.token,
+                                       &replayed_record));
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverRejectsFrameSequenceGapBeforeStagingChunk) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 1023;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-sequence-gap", "source-uuid", server_uuid, bundle,
+                transfer_token, &manifest, &objects));
+  ASSERT_FALSE(objects.empty());
+  std::string manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_manifest(manifest, &manifest_payload));
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", server_uuid);
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+
+  Preserve_trx_transfer_frame begin;
+  begin.type = Preserve_trx_transfer_frame_type::BEGIN;
+  begin.sequence = 1;
+  begin.epoch_id = manifest.epoch_id;
+  begin.token = manifest.token;
+  begin.manifest_payload = manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, begin, &store, &registry, 300, nullptr));
+
+  Preserve_trx_transfer_frame gap_chunk;
+  gap_chunk.type = Preserve_trx_transfer_frame_type::OBJECT_CHUNK;
+  gap_chunk.sequence = 3;
+  gap_chunk.epoch_id = manifest.epoch_id;
+  gap_chunk.token = manifest.token;
+  gap_chunk.object_id = objects.front().descriptor.object_id;
+  gap_chunk.chunk_payload = objects.front().payload;
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, gap_chunk, &store, &registry, 300, nullptr));
+
+  const std::string part_path =
+      m_dir + ".transfer/" + manifest.epoch_id + "/" +
+      test_transfer_token_string(manifest.token) + "/" +
+      objects.front().descriptor.object_id + ".part";
+  MY_STAT stat_area;
+  EXPECT_EQ(nullptr, my_stat(part_path.c_str(), &stat_area, MYF(0)));
+
+  Preserve_trx_transfer_frame expected_chunk = gap_chunk;
+  expected_chunk.sequence = 2;
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, expected_chunk, &store, &registry, 300, nullptr));
 }
 
 TEST_F(PreserveSnapshotTest, TransferReceiverFrameRequiresMainPreserveEnable) {
@@ -8621,6 +9258,7 @@ TEST_F(PreserveSnapshotTest,
   uint64_t second_bytes = 0;
   build_begin(103, &first_begin, &first_bytes);
   build_begin(104, &second_begin, &second_bytes);
+  second_begin.sequence = 2;
 
   const ulonglong old_budget = preserve_trx_transfer_max_inflight_bytes;
   preserve_trx_transfer_max_inflight_bytes = first_bytes + second_bytes - 1;
@@ -9751,7 +10389,7 @@ TEST_F(PreserveSnapshotTest,
        TransferReceiverRecordLockBlobPrewarmWaitsForPhysicalStandbyPages) {
   Transfer_codec_context_guard codec_guard;
   Transfer_receiver_config_guard receiver_config;
-  receiver_config.allow("source-uuid", "target-uuid");
+  receiver_config.allow("source-uuid", server_uuid);
   preserve_trx_set_enable_value(true);
 
   const uint64_t transfer_token = 940;
@@ -10155,7 +10793,7 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
-       TransferReceiverCommitEpochPublishesSealedTokenAndMergesLaterToken) {
+       TransferReceiverCommitEpochRejectsUnsealedReceivingToken) {
   Transfer_codec_context_guard codec_guard;
   auto build_bundle = [&](uint64_t transfer_token, Preserved_trx_bundle *bundle,
                           Preserve_trx_transfer_manifest *manifest,
@@ -10183,14 +10821,15 @@ TEST_F(PreserveSnapshotTest,
   std::vector<Preserve_trx_transfer_object_payload> second_objects;
   build_bundle(202, &second_bundle, &second_manifest, &second_objects);
 
-  auto begin_frame = [](const Preserve_trx_transfer_manifest &manifest) {
+  uint64_t sequence = 1;
+  auto begin_frame = [&](const Preserve_trx_transfer_manifest &manifest) {
     std::string manifest_payload;
     EXPECT_EQ(Preserve_trx_transfer_status::OK,
               preserve_trx_transfer_encode_manifest(manifest,
                                                     &manifest_payload));
     Preserve_trx_transfer_frame begin;
     begin.type = Preserve_trx_transfer_frame_type::BEGIN;
-    begin.sequence = 1;
+    begin.sequence = sequence++;
     begin.epoch_id = manifest.epoch_id;
     begin.token = manifest.token;
     begin.manifest_payload = manifest_payload;
@@ -10220,7 +10859,7 @@ TEST_F(PreserveSnapshotTest,
         for (const Preserve_trx_transfer_object_payload &object : objects) {
           Preserve_trx_transfer_frame chunk;
           chunk.type = Preserve_trx_transfer_frame_type::OBJECT_CHUNK;
-          chunk.sequence = 2;
+          chunk.sequence = sequence++;
           chunk.epoch_id = manifest.epoch_id;
           chunk.token = manifest.token;
           chunk.object_id = object.descriptor.object_id;
@@ -10231,7 +10870,7 @@ TEST_F(PreserveSnapshotTest,
 
           Preserve_trx_transfer_frame seal;
           seal.type = Preserve_trx_transfer_frame_type::SEAL_OBJECT;
-          seal.sequence = 3;
+          seal.sequence = sequence++;
           seal.epoch_id = manifest.epoch_id;
           seal.token = manifest.token;
           seal.object_id = object.descriptor.object_id;
@@ -10245,10 +10884,10 @@ TEST_F(PreserveSnapshotTest,
 
   Preserve_trx_transfer_frame commit;
   commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
-  commit.sequence = 4;
+  commit.sequence = sequence++;
   commit.epoch_id = first_manifest.epoch_id;
   commit.token = first_manifest.token;
-  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
             preserve_trx_transfer_apply_receiver_frame(
                 m_dir, commit, &store, &registry, 300, &written_metadata));
 
@@ -10256,13 +10895,13 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_EQ(Preserved_trx_carrier_status::OK,
             carrier.token_state(test_transfer_token_string(first_manifest.token),
                                 &state));
-  EXPECT_TRUE(state.snapshot);
-  EXPECT_TRUE(state.standby_pending);
+  EXPECT_FALSE(state.snapshot);
+  EXPECT_FALSE(state.standby_pending);
 
   Preserve_trx_transfer_receiver_record record;
   ASSERT_TRUE(
       registry.lookup(first_manifest.epoch_id, first_manifest.token, &record));
-  EXPECT_EQ(Preserve_trx_transfer_receiver_state::SAVED_ONLINE, record.state);
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::CORRUPT, record.state);
 
   Preserved_trx_carrier_token_state second_state;
   ASSERT_EQ(Preserved_trx_carrier_status::OK,
@@ -10275,37 +10914,10 @@ TEST_F(PreserveSnapshotTest,
   Preserve_trx_transfer_receiver_record second_record;
   ASSERT_TRUE(registry.lookup(second_manifest.epoch_id, second_manifest.token,
                               &second_record));
-  EXPECT_EQ(Preserve_trx_transfer_receiver_state::RECEIVING,
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::CORRUPT,
             second_record.state);
-
-  Preserve_trx_transfer_epoch_fact fact;
-  ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            preserve_trx_transfer_read_epoch_fact(m_dir, first_manifest.epoch_id,
-                                                  &fact));
-  ASSERT_EQ(1U, fact.tokens.size());
-  EXPECT_EQ(first_manifest.token, fact.tokens[0].token);
-  EXPECT_EQ(test_transfer_token_string(first_manifest.token),
-            written_metadata.token);
-
-  apply_objects(second_manifest, second_objects);
-  commit.token = second_manifest.token;
-  ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            preserve_trx_transfer_apply_receiver_frame(
-                m_dir, commit, &store, &registry, 300, nullptr));
-
-  ASSERT_EQ(Preserved_trx_carrier_status::OK,
-            carrier.token_state(
-                test_transfer_token_string(second_manifest.token),
-                &second_state));
-  EXPECT_TRUE(second_state.snapshot);
-  EXPECT_TRUE(second_state.standby_pending);
-
-  ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            preserve_trx_transfer_read_epoch_fact(m_dir, first_manifest.epoch_id,
-                                                  &fact));
-  ASSERT_EQ(2U, fact.tokens.size());
-  EXPECT_EQ(first_manifest.token, fact.tokens[0].token);
-  EXPECT_EQ(second_manifest.token, fact.tokens[1].token);
+  EXPECT_FALSE(preserve_trx_transfer_epoch_committed(m_dir, first_manifest));
+  EXPECT_TRUE(written_metadata.token.empty());
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -10337,14 +10949,15 @@ TEST_F(PreserveSnapshotTest,
   std::vector<Preserve_trx_transfer_object_payload> second_objects;
   build_bundle(204, &second_bundle, &second_manifest, &second_objects);
 
-  auto begin_frame = [](const Preserve_trx_transfer_manifest &manifest) {
+  uint64_t sequence = 1;
+  auto begin_frame = [&](const Preserve_trx_transfer_manifest &manifest) {
     std::string manifest_payload;
     EXPECT_EQ(Preserve_trx_transfer_status::OK,
               preserve_trx_transfer_encode_manifest(manifest,
                                                     &manifest_payload));
     Preserve_trx_transfer_frame begin;
     begin.type = Preserve_trx_transfer_frame_type::BEGIN;
-    begin.sequence = 1;
+    begin.sequence = sequence++;
     begin.epoch_id = manifest.epoch_id;
     begin.token = manifest.token;
     begin.manifest_payload = manifest_payload;
@@ -10358,7 +10971,7 @@ TEST_F(PreserveSnapshotTest,
         for (const Preserve_trx_transfer_object_payload &object : objects) {
           Preserve_trx_transfer_frame chunk;
           chunk.type = Preserve_trx_transfer_frame_type::OBJECT_CHUNK;
-          chunk.sequence = 2;
+          chunk.sequence = sequence++;
           chunk.epoch_id = manifest.epoch_id;
           chunk.token = manifest.token;
           chunk.object_id = object.descriptor.object_id;
@@ -10369,7 +10982,7 @@ TEST_F(PreserveSnapshotTest,
 
           Preserve_trx_transfer_frame seal;
           seal.type = Preserve_trx_transfer_frame_type::SEAL_OBJECT;
-          seal.sequence = 3;
+          seal.sequence = sequence++;
           seal.epoch_id = manifest.epoch_id;
           seal.token = manifest.token;
           seal.object_id = object.descriptor.object_id;
@@ -10402,7 +11015,7 @@ TEST_F(PreserveSnapshotTest,
 
   Preserve_trx_transfer_frame commit;
   commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
-  commit.sequence = 4;
+  commit.sequence = sequence++;
   commit.epoch_id = first_manifest.epoch_id;
   commit.token = first_manifest.token;
   EXPECT_NE(Preserve_trx_transfer_status::OK,
@@ -10481,7 +11094,7 @@ TEST_F(PreserveSnapshotTest,
        TransferReceiverPromotionGateControlFrameAdoptsReadyEpoch) {
   Transfer_codec_context_guard codec_guard;
   Transfer_receiver_config_guard receiver_config;
-  receiver_config.allow("source-uuid", "target-uuid");
+  receiver_config.allow("source-uuid", server_uuid);
   preserve_trx_set_enable_value(true);
 
   const uint64_t transfer_token = 951;
@@ -10497,7 +11110,7 @@ TEST_F(PreserveSnapshotTest,
   std::vector<Preserve_trx_transfer_object_payload> objects;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             preserve_trx_transfer_build_portable_objects(
-                "epoch-gate-control", "source-uuid", "target-uuid", bundle,
+                "epoch-gate-control", "source-uuid", server_uuid, bundle,
                 transfer_token, &manifest, &objects));
 
   std::string manifest_payload;
@@ -10770,6 +11383,42 @@ TEST_F(PreserveSnapshotTest, TransferSourceSendsBundleThroughFrameSink) {
 }
 
 TEST_F(PreserveSnapshotTest,
+       TransferSourceBundleFramesDeclareTokenBeforeManifestFrame) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 402;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Capturing_transfer_frame_sink sink;
+  Preserve_trx_transfer_manifest manifest;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_send_bundle_frames(
+                "epoch-single-source-declare", "source-uuid", "target-uuid",
+                bundle, transfer_token, 7, &sink, &manifest));
+  ASSERT_GE(sink.frames().size(), 2U);
+
+  Preserve_trx_transfer_frame first_frame;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(sink.frames().front(),
+                                               &first_frame));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::DECLARE_TOKEN, first_frame.type);
+  EXPECT_EQ(transfer_token, first_frame.token);
+  EXPECT_EQ("epoch-single-source-declare", first_frame.epoch_id);
+
+  Preserve_trx_transfer_frame second_frame;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(sink.frames()[1],
+                                               &second_frame));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::BEGIN, second_frame.type);
+  EXPECT_EQ(manifest.token, second_frame.token);
+}
+
+TEST_F(PreserveSnapshotTest,
        TransferReceiverPayloadBatchPublishesEpochWithWorkers) {
   Transfer_codec_context_guard codec_guard;
   auto build_bundle = [&](uint64_t transfer_token) {
@@ -10885,6 +11534,715 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(1U, commit_count);
 }
 
+TEST_F(PreserveSnapshotTest,
+       TransferSourceEpochBundlesDeclareTokensBeforeManifestFrames) {
+  Transfer_codec_context_guard codec_guard;
+  auto build_bundle = [&](uint64_t transfer_token) {
+    Preserve_snapshot_metadata meta = metadata();
+    meta.token = test_transfer_token_string(transfer_token);
+    Preserved_trx_bundle bundle;
+    Preserved_trx_bundle_build_input input;
+    input.metadata = meta;
+    EXPECT_EQ(Preserve_snapshot_status::OK,
+              build_preserved_trx_bundle(input, &bundle));
+    return bundle;
+  };
+
+  std::vector<Preserved_trx_bundle> bundles;
+  bundles.push_back(build_bundle(631));
+  bundles.push_back(build_bundle(632));
+  std::vector<uint64_t> transfer_tokens{631, 632};
+
+  Capturing_transfer_frame_sink sink;
+  std::vector<Preserve_trx_transfer_manifest> manifests;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_send_epoch_bundles(
+                "epoch-source-declare-first", "source-uuid", "target-uuid",
+                bundles, transfer_tokens, 7, &sink, &manifests));
+  ASSERT_GE(sink.frames().size(), 4U);
+
+  for (size_t i = 0; i < transfer_tokens.size(); ++i) {
+    Preserve_trx_transfer_frame frame;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_decode_frame(sink.frames()[i], &frame));
+    EXPECT_EQ(Preserve_trx_transfer_frame_type::DECLARE_TOKEN, frame.type);
+    EXPECT_EQ(transfer_tokens[i], frame.token);
+    EXPECT_EQ("epoch-source-declare-first", frame.epoch_id);
+  }
+
+  Preserve_trx_transfer_frame first_payload_frame;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(
+                sink.frames()[transfer_tokens.size()], &first_payload_frame));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::BEGIN,
+            first_payload_frame.type);
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferSourceStreamingLifecyclePredeclaresTokensBeforeObjects) {
+  Transfer_codec_context_guard codec_guard;
+  auto build_bundle = [&](uint64_t transfer_token, Preserved_trx_bundle *bundle,
+                          Preserve_trx_transfer_manifest *manifest,
+                          std::vector<Preserve_trx_transfer_object_payload>
+                              *objects) {
+    Preserve_snapshot_metadata meta = metadata();
+    meta.token = test_transfer_token_string(transfer_token);
+    Preserved_trx_bundle_build_input input;
+    input.metadata = meta;
+    ASSERT_EQ(Preserve_snapshot_status::OK,
+              build_preserved_trx_bundle(input, bundle));
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_build_portable_objects(
+                  "epoch-streaming-lifecycle", "source-uuid", "target-uuid",
+                  *bundle, transfer_token, manifest, objects));
+  };
+
+  Preserved_trx_bundle first_bundle;
+  Preserve_trx_transfer_manifest first_manifest;
+  std::vector<Preserve_trx_transfer_object_payload> first_objects;
+  build_bundle(701, &first_bundle, &first_manifest, &first_objects);
+
+  Preserved_trx_bundle second_bundle;
+  Preserve_trx_transfer_manifest second_manifest;
+  std::vector<Preserve_trx_transfer_object_payload> second_objects;
+  build_bundle(702, &second_bundle, &second_manifest, &second_objects);
+
+  Capturing_transfer_frame_sink sink;
+  uint64_t next_sequence = 1;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_send_epoch_begin_frames(
+                {first_manifest, second_manifest}, &sink, &next_sequence));
+  ASSERT_EQ(2U, sink.frames().size());
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  size_t consumed_frames = 0;
+  auto apply_new_frames = [&]() {
+    std::vector<std::string> frames(sink.frames().begin() + consumed_frames,
+                                    sink.frames().end());
+    consumed_frames = sink.frames().size();
+    return preserve_trx_transfer_handle_receiver_payload_batch(
+        m_dir, frames, &store, &registry, 300, 3);
+  };
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, apply_new_frames());
+
+  Preserve_trx_transfer_receiver_record first_record;
+  ASSERT_TRUE(
+      registry.lookup(first_manifest.epoch_id, first_manifest.token, &first_record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::RECEIVING,
+            first_record.state);
+  Preserve_trx_transfer_receiver_record second_record;
+  ASSERT_TRUE(registry.lookup(second_manifest.epoch_id, second_manifest.token,
+                              &second_record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::RECEIVING,
+            second_record.state);
+
+  Preserved_trx_carrier_token_state first_state;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(test_transfer_token_string(first_manifest.token),
+                                &first_state));
+  EXPECT_FALSE(first_state.snapshot);
+  EXPECT_FALSE(first_state.standby_pending);
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_send_epoch_object_frames(
+                first_manifest, first_objects, 7, &sink, &next_sequence));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_send_epoch_object_frames(
+                second_manifest, second_objects, 7, &sink, &next_sequence));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_send_epoch_commit_frame(
+                first_manifest.epoch_id, first_manifest.token, &sink,
+                &next_sequence));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, apply_new_frames());
+
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(test_transfer_token_string(first_manifest.token),
+                                &first_state));
+  EXPECT_TRUE(first_state.snapshot);
+  EXPECT_TRUE(first_state.standby_pending);
+  Preserved_trx_carrier_token_state second_state;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(
+                test_transfer_token_string(second_manifest.token),
+                &second_state));
+  EXPECT_TRUE(second_state.snapshot);
+  EXPECT_TRUE(second_state.standby_pending);
+  EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, first_manifest));
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferSourceEpochSessionSendsExternallyBuiltObjects) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 703;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-session-external-objects", "source-uuid",
+                "target-uuid", bundle, transfer_token, &manifest, &objects));
+  ASSERT_FALSE(objects.empty());
+
+  Capturing_transfer_frame_sink source_sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-session-external-objects", "source-uuid", "target-uuid", 7,
+      &source_sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_token(transfer_token));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.send_token_objects(manifest, objects));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
+
+  ASSERT_GE(source_sink.frames().size(), 4U);
+  Preserve_trx_transfer_frame first_frame;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(source_sink.frames()[0],
+                                               &first_frame));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::DECLARE_TOKEN, first_frame.type);
+
+  Preserve_trx_transfer_frame second_frame;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(source_sink.frames()[1],
+                                               &second_frame));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::BEGIN, second_frame.type);
+  EXPECT_EQ(transfer_token, second_frame.token);
+
+  bool saw_object_chunk = false;
+  bool saw_seal = false;
+  bool saw_commit = false;
+  for (const std::string &encoded_frame : source_sink.frames()) {
+    Preserve_trx_transfer_frame frame;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_decode_frame(encoded_frame, &frame));
+    if (frame.type == Preserve_trx_transfer_frame_type::OBJECT_CHUNK) {
+      saw_object_chunk = true;
+    } else if (frame.type == Preserve_trx_transfer_frame_type::SEAL_OBJECT) {
+      saw_seal = true;
+    } else if (frame.type == Preserve_trx_transfer_frame_type::COMMIT_EPOCH) {
+      saw_commit = true;
+    }
+  }
+  EXPECT_TRUE(saw_object_chunk);
+  EXPECT_TRUE(saw_seal);
+  EXPECT_TRUE(saw_commit);
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_handle_receiver_payload_batch(
+                m_dir, source_sink.frames(), &store, &registry, 300, 3));
+
+  Preserved_trx_carrier_token_state state;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(test_transfer_token_string(transfer_token),
+                                &state));
+  EXPECT_TRUE(state.snapshot);
+  EXPECT_TRUE(state.standby_pending);
+  EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferSourceEpochSessionStreamsObjectChunksBeforeFinalize) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 704;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-session-stream-object", "source-uuid", "target-uuid",
+                bundle, transfer_token, &manifest, &objects));
+  ASSERT_EQ(1U, objects.size());
+  ASSERT_GT(objects.front().payload.length(), 3U);
+
+  Capturing_transfer_frame_sink source_sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-session-stream-object", "source-uuid", "target-uuid", 7,
+      &source_sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_token(transfer_token));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.begin_token_objects(manifest));
+
+  const std::string object_id = objects.front().descriptor.object_id;
+  const std::string &payload = objects.front().payload;
+  const size_t split = payload.length() / 2;
+  ASSERT_GT(split, 0U);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.write_object_chunk(transfer_token, object_id, 0,
+                                       payload.substr(0, split)));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.write_object_chunk(transfer_token, object_id, split,
+                                       payload.substr(split)));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.seal_object(transfer_token, object_id));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.finalize_token_manifest(transfer_token));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
+
+  bool saw_begin = false;
+  uint64_t chunk_count = 0;
+  bool saw_seal = false;
+  bool saw_commit = false;
+  for (const std::string &encoded_frame : source_sink.frames()) {
+    Preserve_trx_transfer_frame frame;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_decode_frame(encoded_frame, &frame));
+    if (frame.type == Preserve_trx_transfer_frame_type::BEGIN) {
+      saw_begin = true;
+    } else if (frame.type == Preserve_trx_transfer_frame_type::OBJECT_CHUNK) {
+      ++chunk_count;
+    } else if (frame.type == Preserve_trx_transfer_frame_type::SEAL_OBJECT) {
+      saw_seal = true;
+    } else if (frame.type == Preserve_trx_transfer_frame_type::COMMIT_EPOCH) {
+      saw_commit = true;
+    }
+  }
+  EXPECT_TRUE(saw_begin);
+  EXPECT_EQ(2U, chunk_count);
+  EXPECT_TRUE(saw_seal);
+  EXPECT_TRUE(saw_commit);
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_handle_receiver_payload_batch(
+                m_dir, source_sink.frames(), &store, &registry, 300, 3));
+
+  Preserved_trx_carrier_token_state state;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(test_transfer_token_string(transfer_token),
+                                &state));
+  EXPECT_TRUE(state.snapshot);
+  EXPECT_TRUE(state.standby_pending);
+  EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferSourceEpochSessionStreamsDeclaredBlobBeforeFinalManifest) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 714;
+  Preserve_snapshot_metadata meta = logged_with_cache_metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  const std::string blob_payload = "phase1-streamed-external-blob";
+
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  Mysql_binlog_preserve_snapshot logged_binlog;
+  logged_binlog.cache_payload = blob_payload;
+  logged_binlog.gtid_next = "AUTOMATIC";
+  logged_binlog.event_counter = 3;
+  logged_binlog.with_rbr = true;
+  logged_binlog.with_start = true;
+  logged_binlog.with_content = true;
+  input.logged_binlog_snapshot = &logged_binlog;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-session-declare-object", "source-uuid", "target-uuid",
+                bundle, transfer_token, &manifest, &objects));
+  ASSERT_EQ(2U, objects.size());
+
+  const Preserve_trx_transfer_object_payload *blob_object = nullptr;
+  const Preserve_trx_transfer_object_payload *snapshot_object = nullptr;
+  for (const Preserve_trx_transfer_object_payload &object : objects) {
+    if (object.descriptor.kind ==
+        Preserve_trx_transfer_object_kind::EXTERNAL_BLOB) {
+      blob_object = &object;
+    } else if (object.descriptor.kind ==
+               Preserve_trx_transfer_object_kind::SNAPSHOT_BUNDLE) {
+      snapshot_object = &object;
+    }
+  }
+  ASSERT_NE(nullptr, blob_object);
+  ASSERT_NE(nullptr, snapshot_object);
+
+  Capturing_transfer_frame_sink source_sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-session-declare-object", "source-uuid", "target-uuid", 7,
+      &source_sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_token(transfer_token));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_object(transfer_token, blob_object->descriptor));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.write_object_chunk(transfer_token,
+                                       blob_object->descriptor.object_id, 0,
+                                       blob_object->payload));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.seal_object(transfer_token,
+                                blob_object->descriptor.object_id));
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.begin_token_objects(manifest));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.write_object_chunk(transfer_token,
+                                       snapshot_object->descriptor.object_id, 0,
+                                       snapshot_object->payload));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.seal_object(transfer_token,
+                                snapshot_object->descriptor.object_id));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.finalize_token_manifest(transfer_token));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
+
+  ASSERT_GE(source_sink.frames().size(), 6U);
+  Preserve_trx_transfer_frame declare_object_frame;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(source_sink.frames()[1],
+                                               &declare_object_frame));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::DECLARE_OBJECT,
+            declare_object_frame.type);
+  Preserve_trx_transfer_frame begin_frame;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(source_sink.frames()[4],
+                                               &begin_frame));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::BEGIN, begin_frame.type);
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_handle_receiver_payload_batch(
+                m_dir, source_sink.frames(), &store, &registry, 300, 3));
+
+  Preserved_trx_carrier_token_state state;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(test_transfer_token_string(transfer_token),
+                                &state));
+  EXPECT_TRUE(state.snapshot);
+  EXPECT_TRUE(state.standby_pending);
+  EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverTokenDeclareWaitsForManifestBeforeCommit) {
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+
+  Preserve_trx_transfer_frame declare;
+  declare.type = Preserve_trx_transfer_frame_type::DECLARE_TOKEN;
+  declare.sequence = 1;
+  declare.epoch_id = "epoch-declare-token";
+  declare.token = 901;
+  declare.reason = "source-uuid\ntarget-uuid";
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, declare, &store, &registry, 300, nullptr));
+
+  Preserve_trx_transfer_receiver_record record;
+  ASSERT_TRUE(registry.lookup("epoch-declare-token", 901, &record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::DECLARED, record.state);
+  EXPECT_EQ("source-uuid", record.source_server_uuid);
+  EXPECT_EQ("target-uuid", record.target_server_uuid);
+
+  Preserved_trx_carrier_token_state token_state;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(test_transfer_token_string(901),
+                                &token_state));
+  EXPECT_FALSE(token_state.snapshot);
+  EXPECT_FALSE(token_state.standby_pending);
+
+  Preserve_trx_transfer_frame commit;
+  commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
+  commit.sequence = 2;
+  commit.epoch_id = "epoch-declare-token";
+  commit.token = 901;
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, commit, &store, &registry, 300, nullptr));
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverRejectsConfiguredTargetThatIsNotLocalServerUuid) {
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+  std::snprintf(server_uuid, UUID_LENGTH + 1, "%s",
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+  server_uuid_ptr = server_uuid;
+
+  Preserve_trx_transfer_manifest manifest;
+  manifest.epoch_id = "epoch-local-target";
+  manifest.source_server_uuid = "source-uuid";
+  manifest.target_server_uuid = "target-uuid";
+  manifest.token = 902;
+  manifest.source_prepare_lsn = 120;
+  manifest.source_epoch_commit_lsn = 140;
+
+  EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED,
+            preserve_trx_transfer_validate_receiver_manifest_from_config(
+                manifest));
+}
+
+TEST_F(PreserveSnapshotTest, TransferSourceCanDeclareTokenBeforeManifest) {
+  Transfer_codec_context_guard codec_guard;
+
+  Capturing_transfer_frame_sink sink;
+  uint64_t next_sequence = 1;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_send_epoch_declare_token_frame(
+                "epoch-source-declare", "source-uuid", "target-uuid", 902,
+                &sink, &next_sequence));
+  ASSERT_EQ(1U, sink.frames().size());
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  size_t consumed_frames = 0;
+  auto apply_new_frames = [&]() {
+    std::vector<std::string> frames(sink.frames().begin() + consumed_frames,
+                                    sink.frames().end());
+    consumed_frames = sink.frames().size();
+    return preserve_trx_transfer_handle_receiver_payload_batch(
+        m_dir, frames, &store, &registry, 300, 3);
+  };
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, apply_new_frames());
+
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(902);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-source-declare", "source-uuid", "target-uuid", bundle,
+                902, &manifest, &objects));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_send_epoch_begin_frames(
+                {manifest}, &sink, &next_sequence));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_send_epoch_object_frames(
+                manifest, objects, 7, &sink, &next_sequence));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_send_epoch_commit_frame(
+                manifest.epoch_id, manifest.token, &sink, &next_sequence));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, apply_new_frames());
+
+  Preserved_trx_carrier_token_state token_state;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(test_transfer_token_string(902),
+                                &token_state));
+  EXPECT_TRUE(token_state.snapshot);
+  EXPECT_TRUE(token_state.standby_pending);
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferSourceEpochSessionAbortsRemovedTargetsBeforeCommit) {
+  Transfer_codec_context_guard codec_guard;
+
+  auto build_bundle = [&](uint64_t transfer_token) {
+    Preserve_snapshot_metadata meta = metadata();
+    meta.token = test_transfer_token_string(transfer_token);
+    Preserved_trx_bundle bundle;
+    Preserved_trx_bundle_build_input input;
+    input.metadata = meta;
+    EXPECT_EQ(Preserve_snapshot_status::OK,
+              build_preserved_trx_bundle(input, &bundle));
+    return bundle;
+  };
+
+  Capturing_transfer_frame_sink sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-source-session-abort", "source-uuid", "target-uuid", 7, &sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.declare_token(904));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.declare_token(905));
+
+  Preserve_trx_transfer_manifest manifest;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.send_token_bundle(build_bundle(904), 904, &manifest));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.abort_token(905, "source_phase1_target_removed"));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_handle_receiver_payload_batch(
+                m_dir, sink.frames(), &store, &registry, 300, 3));
+
+  Preserved_trx_carrier_token_state kept_state;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(test_transfer_token_string(904), &kept_state));
+  EXPECT_TRUE(kept_state.snapshot);
+  EXPECT_TRUE(kept_state.standby_pending);
+
+  Preserved_trx_carrier_token_state removed_state;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(test_transfer_token_string(905),
+                                &removed_state));
+  EXPECT_FALSE(removed_state.snapshot);
+  EXPECT_FALSE(removed_state.standby_pending);
+
+  Preserve_trx_transfer_receiver_record removed_record;
+  ASSERT_TRUE(registry.lookup(manifest.epoch_id, 905, &removed_record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::ABORTED,
+            removed_record.state);
+  EXPECT_EQ("source_phase1_target_removed", removed_record.last_error);
+  EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferSourceEpochSessionRejectsCommitWithUnresolvedDeclaredToken) {
+  Transfer_codec_context_guard codec_guard;
+
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(906);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Capturing_transfer_frame_sink sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-source-session-unresolved", "source-uuid", "target-uuid", 7,
+      &sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.declare_token(906));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.declare_token(907));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.send_token_bundle(bundle, 906, nullptr));
+
+  const size_t frame_count_before_commit = sink.frames().size();
+  EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED,
+            session.commit_epoch());
+  ASSERT_EQ(frame_count_before_commit, sink.frames().size());
+  for (const std::string &encoded_frame : sink.frames()) {
+    Preserve_trx_transfer_frame frame;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_decode_frame(encoded_frame, &frame));
+    EXPECT_NE(Preserve_trx_transfer_frame_type::COMMIT_EPOCH, frame.type);
+  }
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferSourceEpochSessionAbortEpochCleansFinalizedAndDeclaredTokens) {
+  Transfer_codec_context_guard codec_guard;
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+
+  auto build_bundle = [&](uint64_t transfer_token) {
+    Preserve_snapshot_metadata meta = metadata();
+    meta.token = test_transfer_token_string(transfer_token);
+    Preserved_trx_bundle bundle;
+    Preserved_trx_bundle_build_input input;
+    input.metadata = meta;
+    EXPECT_EQ(Preserve_snapshot_status::OK,
+              build_preserved_trx_bundle(input, &bundle));
+    return bundle;
+  };
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  Transfer_receiver_payload_test_sink frame_sink(m_dir, &store, &registry,
+                                                 nullptr);
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-session-abort", "source-uuid", "target-uuid", 11, &frame_sink);
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.declare_token(908));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.declare_token(909));
+  Preserved_trx_bundle first = build_bundle(908);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.send_token_bundle(first, 908));
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.abort_epoch("source_batch_failed"));
+  EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED, session.commit_epoch());
+
+  Preserve_trx_transfer_receiver_record first_record;
+  ASSERT_TRUE(registry.lookup("epoch-session-abort", 908, &first_record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::ABORTED, first_record.state);
+  EXPECT_EQ("source_batch_failed", first_record.last_error);
+
+  Preserve_trx_transfer_receiver_record second_record;
+  ASSERT_TRUE(registry.lookup("epoch-session-abort", 909, &second_record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::ABORTED, second_record.state);
+  EXPECT_EQ("source_batch_failed", second_record.last_error);
+}
+
+TEST_F(PreserveSnapshotTest, TransferReceiverAbortCanCancelDeclaredToken) {
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+
+  Preserve_trx_transfer_frame declare;
+  declare.type = Preserve_trx_transfer_frame_type::DECLARE_TOKEN;
+  declare.sequence = 1;
+  declare.epoch_id = "epoch-declare-abort";
+  declare.token = 903;
+  declare.reason = "source-uuid\ntarget-uuid";
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, declare, &store, &registry, 300, nullptr));
+
+  Preserve_trx_transfer_frame abort;
+  abort.type = Preserve_trx_transfer_frame_type::ABORT;
+  abort.sequence = 2;
+  abort.epoch_id = "epoch-declare-abort";
+  abort.token = 903;
+  abort.reason = "source_phase1_abort";
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, abort, &store, &registry, 300, nullptr));
+
+  Preserve_trx_transfer_receiver_record record;
+  ASSERT_TRUE(registry.lookup("epoch-declare-abort", 903, &record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::ABORTED, record.state);
+  EXPECT_EQ("source_phase1_abort", record.last_error);
+}
+
 TEST_F(PreserveSnapshotTest, TransferReceiverCommitEpochPublishesEverySealedToken) {
   Transfer_codec_context_guard codec_guard;
   auto build_bundle = [&](uint64_t transfer_token, Preserved_trx_bundle *bundle,
@@ -10913,14 +12271,15 @@ TEST_F(PreserveSnapshotTest, TransferReceiverCommitEpochPublishesEverySealedToke
   std::vector<Preserve_trx_transfer_object_payload> second_objects;
   build_bundle(302, &second_bundle, &second_manifest, &second_objects);
 
-  auto begin_frame = [](const Preserve_trx_transfer_manifest &manifest) {
+  uint64_t sequence = 1;
+  auto begin_frame = [&](const Preserve_trx_transfer_manifest &manifest) {
     std::string manifest_payload;
     EXPECT_EQ(Preserve_trx_transfer_status::OK,
               preserve_trx_transfer_encode_manifest(manifest,
                                                     &manifest_payload));
     Preserve_trx_transfer_frame begin;
     begin.type = Preserve_trx_transfer_frame_type::BEGIN;
-    begin.sequence = 1;
+    begin.sequence = sequence++;
     begin.epoch_id = manifest.epoch_id;
     begin.token = manifest.token;
     begin.manifest_payload = manifest_payload;
@@ -10935,7 +12294,7 @@ TEST_F(PreserveSnapshotTest, TransferReceiverCommitEpochPublishesEverySealedToke
         for (const Preserve_trx_transfer_object_payload &object : objects) {
           Preserve_trx_transfer_frame chunk;
           chunk.type = Preserve_trx_transfer_frame_type::OBJECT_CHUNK;
-          chunk.sequence = 2;
+          chunk.sequence = sequence++;
           chunk.epoch_id = manifest.epoch_id;
           chunk.token = manifest.token;
           chunk.object_id = object.descriptor.object_id;
@@ -10946,7 +12305,7 @@ TEST_F(PreserveSnapshotTest, TransferReceiverCommitEpochPublishesEverySealedToke
 
           Preserve_trx_transfer_frame seal;
           seal.type = Preserve_trx_transfer_frame_type::SEAL_OBJECT;
-          seal.sequence = 3;
+          seal.sequence = sequence++;
           seal.epoch_id = manifest.epoch_id;
           seal.token = manifest.token;
           seal.object_id = object.descriptor.object_id;
@@ -10977,7 +12336,7 @@ TEST_F(PreserveSnapshotTest, TransferReceiverCommitEpochPublishesEverySealedToke
 
   Preserve_trx_transfer_frame commit;
   commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
-  commit.sequence = 4;
+  commit.sequence = sequence++;
   commit.epoch_id = first_manifest.epoch_id;
   commit.token = first_manifest.token;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
@@ -11177,6 +12536,119 @@ TEST_F(PreserveSnapshotTest, TransferArtifactSinkPublishesThroughFrameSink) {
 }
 
 TEST_F(PreserveSnapshotTest,
+       TransferSessionArtifactSinkDefersEpochCommitToSourceSession) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 604;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  Preserve_snapshot_metadata receiver_metadata;
+  Transfer_receiver_payload_test_sink frame_sink(m_dir, &store, &registry,
+                                                 &receiver_metadata);
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-session-artifact", "source-uuid", "target-uuid", 11,
+      &frame_sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_token(transfer_token));
+
+  Preserve_trx_transfer_session_artifact_sink sink(&session, transfer_token,
+                                                   m_dir);
+
+  Preserve_snapshot_metadata written_metadata;
+  bool durable_snapshot_may_exist = false;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            sink.publish_bundle(std::move(bundle), 300, &written_metadata,
+                                &durable_snapshot_may_exist));
+  EXPECT_TRUE(durable_snapshot_may_exist);
+  EXPECT_EQ(meta.token, written_metadata.token);
+  EXPECT_EQ("", receiver_metadata.token);
+
+  Preserved_trx_carrier_token_state state;
+  if (carrier.token_state(meta.token, &state) ==
+      Preserved_trx_carrier_status::OK) {
+    EXPECT_FALSE(state.standby_pending);
+  }
+  EXPECT_FALSE(preserve_trx_transfer_epoch_committed(
+      m_dir, std::string("epoch-session-artifact")));
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(meta.token, &state));
+  EXPECT_TRUE(state.snapshot);
+  EXPECT_TRUE(state.standby_pending);
+  EXPECT_EQ(meta.token, receiver_metadata.token);
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferArtifactSinkDeclaresExternalBlobBeforeFinalManifest) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 603;
+  Mysql_binlog_preserve_snapshot snapshot;
+  snapshot.cache_payload = "artifact-sink-predeclared-binlog-cache";
+  snapshot.gtid_next = "AUTOMATIC";
+  snapshot.event_counter = 11;
+  snapshot.with_rbr = true;
+  snapshot.with_start = true;
+  snapshot.with_content = true;
+
+  Preserve_snapshot_metadata meta = logged_with_cache_metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  input.logged_binlog_snapshot = &snapshot;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Capturing_transfer_frame_sink frame_sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-artifact-predeclare", "source-uuid", "target-uuid", 9,
+      &frame_sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_token(transfer_token));
+  Preserve_trx_transfer_session_artifact_sink sink(&session, transfer_token,
+                                                   m_dir);
+
+  Preserve_snapshot_metadata written_metadata;
+  bool durable_snapshot_may_exist = false;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            sink.publish_bundle(std::move(bundle), 300, &written_metadata,
+                                &durable_snapshot_may_exist));
+  EXPECT_TRUE(durable_snapshot_may_exist);
+  EXPECT_EQ(meta.token, written_metadata.token);
+
+  size_t begin_index = frame_sink.frames().size();
+  size_t declare_object_index = frame_sink.frames().size();
+  for (size_t i = 0; i < frame_sink.frames().size(); ++i) {
+    Preserve_trx_transfer_frame frame;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_decode_frame(frame_sink.frames()[i],
+                                                 &frame));
+    if (frame.type == Preserve_trx_transfer_frame_type::DECLARE_OBJECT &&
+        frame.object_id == kPreservedTrxBlobBinlogCache) {
+      declare_object_index = std::min(declare_object_index, i);
+    }
+    if (frame.type == Preserve_trx_transfer_frame_type::BEGIN) {
+      begin_index = std::min(begin_index, i);
+    }
+  }
+  ASSERT_LT(declare_object_index, frame_sink.frames().size());
+  ASSERT_LT(begin_index, frame_sink.frames().size());
+  EXPECT_LT(declare_object_index, begin_index);
+}
+
+TEST_F(PreserveSnapshotTest,
        TransferArtifactSinkAssignsSnapshotDeadlineBeforeSending) {
   Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 602;
@@ -11362,6 +12834,52 @@ TEST_F(PreserveSnapshotTest, ArtifactSinkFactoryRejectsStandbyWithoutFrameSink) 
                 &store, "epoch-factory", "source-uuid", "target-uuid", 701,
                 17, nullptr, &sink));
   EXPECT_EQ(nullptr, sink.get());
+}
+
+TEST_F(PreserveSnapshotTest, ArtifactSinkFactoryUsesSourceEpochSession) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 702;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  Preserve_snapshot_metadata receiver_metadata;
+  Transfer_receiver_payload_test_sink frame_sink(m_dir, &store, &registry,
+                                                 &receiver_metadata);
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-factory-session", "source-uuid", "target-uuid", 17,
+      &frame_sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_token(transfer_token));
+
+  std::unique_ptr<Preserve_trx_artifact_sink> sink;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            preserve_trx_make_artifact_sink_for_decision(
+                Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE,
+                &store, "epoch-factory-session", "source-uuid", "target-uuid",
+                transfer_token, 17, nullptr, &sink, &session, m_dir));
+  ASSERT_NE(nullptr, sink.get());
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            sink->publish_bundle(std::move(bundle), 300, nullptr));
+  EXPECT_FALSE(preserve_trx_transfer_epoch_committed(
+      m_dir, std::string("epoch-factory-session")));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
+
+  Preserved_trx_carrier_token_state state;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(meta.token, &state));
+  EXPECT_TRUE(state.snapshot);
+  EXPECT_TRUE(state.standby_pending);
 }
 
 TEST_F(PreserveSnapshotTest, LocalFileTaintMarkerPreservesRootCause) {
