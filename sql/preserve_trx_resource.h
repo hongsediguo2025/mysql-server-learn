@@ -327,6 +327,25 @@ int show_preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_seal_prewarm_last_status(
     THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_phase2_bulk_bytes(THD *thd, SHOW_VAR *var,
+                                                 char *buf);
+int show_preserve_trx_transfer_phase2_receiver_prewarm_wait_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_phase2_final_metadata_fsync_count(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_phase2_final_metadata_ack_us(THD *thd,
+                                                            SHOW_VAR *var,
+                                                            char *buf);
+int show_preserve_trx_transfer_phase1_business_enqueue_block_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_ready_after_final_metadata_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_prewarm_backlog_at_phase2_end(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_record_lock_required_residency_bytes(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_record_lock_reserved_residency_bytes(
+    THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_lock_warmcopy_phase2_pause_us(THD *thd, SHOW_VAR *var,
                                                     char *buf);
 int show_preserve_trx_lock_warmcopy_spill_bytes(THD *thd, SHOW_VAR *var,

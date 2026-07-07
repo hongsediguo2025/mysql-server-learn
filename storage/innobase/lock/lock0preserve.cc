@@ -2180,6 +2180,21 @@ static dberr_t lock_preserve_prefetch_record_lock_pages_low(
           "record_lock_prefetch_space_unavailable");
       return DB_TABLE_NOT_FOUND;
     }
+    const page_no_t space_size = fil_space_get_size(entry->space_id);
+    if (space_size == 0 || entry->page_no >= space_size) {
+      /*
+        A standby receiver can prewarm a token before its physical copy has
+        grown to every source-side record-lock page.  Treat that as a not-ready
+        artifact instead of letting buf_read_page() assert on an out-of-bounds
+        page number.
+      */
+      lock_preserve_set_record_export_error(
+          "record_lock_prefetch_page_out_of_bounds");
+      if (metrics != nullptr) {
+        ++metrics->prefetch_missing_pages;
+      }
+      return DB_TABLE_NOT_FOUND;
+    }
     if (wait_for_resident) {
       /*
         Promotion prewarm is outside the service gate and must prove that the

@@ -824,6 +824,7 @@
 #include "sql/thd_raii.h"
 #include "sql/thr_malloc.h"
 #include "sql/transaction.h"
+#include "sql/preserve_trx_transfer.h"
 #include "sql/tztime.h"  // Time_zone
 #include "sql/xa.h"
 #include "sql_common.h"  // mysql_client_plugin_init
@@ -2393,6 +2394,7 @@ static void clean_up(bool print_message) {
   if (cleanup_done++) return; /* purecov: inspected */
 
   preserved_trx_stop_expired_reaper();
+  preserve_trx_transfer_shutdown_receiver_prewarm_workers();
 
   ha_pre_dd_shutdown();
   dd::shutdown();
@@ -9247,6 +9249,35 @@ SHOW_VAR status_vars[] = {
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_transfer_receiver_seal_prewarm_tokens",
      (char *)&show_preserve_trx_transfer_receiver_seal_prewarm_tokens,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_phase2_bulk_bytes",
+     (char *)&show_preserve_trx_transfer_phase2_bulk_bytes, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_phase2_receiver_prewarm_wait_us",
+     (char *)&show_preserve_trx_transfer_phase2_receiver_prewarm_wait_us,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_phase2_final_metadata_fsync_count",
+     (char *)&show_preserve_trx_transfer_phase2_final_metadata_fsync_count,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_phase2_final_metadata_ack_us",
+     (char *)&show_preserve_trx_transfer_phase2_final_metadata_ack_us, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_phase1_business_enqueue_block_us",
+     (char *)&show_preserve_trx_transfer_phase1_business_enqueue_block_us,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_receiver_ready_after_final_metadata_us",
+     (char *)&show_preserve_trx_transfer_receiver_ready_after_final_metadata_us,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_receiver_prewarm_backlog_at_phase2_end",
+     (char *)&show_preserve_trx_transfer_receiver_prewarm_backlog_at_phase2_end,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_receiver_record_lock_req_residency_bytes",
+     (char *)
+         &show_preserve_trx_transfer_receiver_record_lock_required_residency_bytes,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_receiver_record_lock_resv_residency_bytes",
+     (char *)
+         &show_preserve_trx_transfer_receiver_record_lock_reserved_residency_bytes,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_spill_bytes", (char *)&show_preserve_trx_spill_bytes,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},

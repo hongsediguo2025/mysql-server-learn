@@ -330,6 +330,8 @@ class Preserve_trx_lock_warmcopy_drain_participant final
   bool target_observation_for_thread(
       uint64_t thread_id,
       Preserve_trx_lock_warmcopy_target_observation *observation) const;
+  bool phase1_record_prebuilt_blob_for_thread(
+      uint64_t thread_id, PrebuiltRecordLocksBlob *blob) const;
   bool target_observation_for_thread_for_unit_test(
       uint64_t thread_id,
       Preserve_trx_lock_warmcopy_target_observation *observation) const;

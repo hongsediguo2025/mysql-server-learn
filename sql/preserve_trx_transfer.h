@@ -84,6 +84,20 @@ uint64_t preserve_trx_transfer_receiver_seal_prewarm_tokens_status();
 uint64_t preserve_trx_transfer_receiver_seal_prewarm_success_tokens_status();
 uint64_t preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens_status();
 uint64_t preserve_trx_transfer_receiver_seal_prewarm_last_status();
+void preserve_trx_transfer_reset_source_phase2_metrics();
+uint64_t preserve_trx_transfer_phase2_bulk_bytes_status();
+uint64_t preserve_trx_transfer_phase2_snapshot_bundle_bytes_status();
+uint64_t preserve_trx_transfer_phase2_snapshot_bundle_count_status();
+uint64_t preserve_trx_transfer_phase2_final_metadata_frame_count_status();
+uint64_t preserve_trx_transfer_phase2_final_metadata_encoded_bytes_status();
+uint64_t preserve_trx_transfer_phase2_receiver_prewarm_wait_us_status();
+uint64_t preserve_trx_transfer_phase2_final_metadata_fsync_count_status();
+uint64_t preserve_trx_transfer_phase2_final_metadata_ack_us_status();
+uint64_t preserve_trx_transfer_phase1_business_enqueue_block_us_status();
+uint64_t preserve_trx_transfer_receiver_ready_after_final_metadata_us_status();
+uint64_t preserve_trx_transfer_receiver_prewarm_backlog_at_phase2_end_status();
+uint64_t preserve_trx_transfer_receiver_record_lock_required_residency_bytes_status();
+uint64_t preserve_trx_transfer_receiver_record_lock_reserved_residency_bytes_status();
 
 Preserve_trx_transfer_artifact_decision
 preserve_trx_transfer_artifact_decision();
@@ -350,12 +364,16 @@ class Preserve_trx_transfer_source_epoch_session {
       uint64_t transfer_token,
       const Preserve_trx_transfer_object_descriptor &descriptor);
   Preserve_trx_transfer_status begin_token_objects(
-      const Preserve_trx_transfer_manifest &manifest);
+      const Preserve_trx_transfer_manifest &manifest,
+      bool queue_final_metadata = false);
   Preserve_trx_transfer_status write_object_chunk(
       uint64_t transfer_token, const std::string &object_id,
       uint64_t chunk_offset, const std::string &chunk_payload);
   Preserve_trx_transfer_status seal_object(uint64_t transfer_token,
                                            const std::string &object_id);
+  bool object_presealed_for_token(
+      uint64_t transfer_token,
+      const Preserve_trx_transfer_object_descriptor &descriptor) const;
   Preserve_trx_transfer_status finalize_token_manifest(
       uint64_t transfer_token);
   Preserve_trx_transfer_status send_token_objects(
@@ -382,7 +400,10 @@ class Preserve_trx_transfer_source_epoch_session {
   bool token_resolved(uint64_t transfer_token) const;
   Preserve_trx_transfer_status send_token_objects_locked(
       const Preserve_trx_transfer_manifest &manifest,
-      const std::vector<Preserve_trx_transfer_object_payload> &objects);
+      const std::vector<Preserve_trx_transfer_object_payload> &objects,
+      bool queue_final_metadata);
+  Preserve_trx_transfer_status emit_frame_locked(
+      Preserve_trx_transfer_frame frame, bool queue_final_metadata);
   Preserve_trx_transfer_status abort_token_locked(uint64_t transfer_token,
                                                   const std::string &reason,
                                                   bool allow_finalized);
@@ -405,8 +426,22 @@ class Preserve_trx_transfer_source_epoch_session {
   std::map<uint64_t, std::map<std::string, uint64_t>>
       m_streaming_object_written_bytes;
   std::map<uint64_t, std::set<std::string>> m_streaming_sealed_objects;
+  std::set<uint64_t> m_final_metadata_tokens;
+  std::vector<Preserve_trx_transfer_frame> m_pending_final_metadata_frames;
   std::vector<Preserve_trx_transfer_manifest> m_finalized_manifests;
 };
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_stream_prebuilt_record_locks_blob(
+    Preserve_trx_transfer_source_epoch_session *session,
+    uint64_t transfer_token, const std::string &preserve_dir,
+    const PrebuiltRecordLocksBlob &blob);
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_stream_prebuilt_binlog_cache_blob(
+    Preserve_trx_transfer_source_epoch_session *session,
+    uint64_t transfer_token, const std::string &preserve_dir,
+    const PrebuiltBinlogCacheBlob &blob);
 
 struct Preserve_trx_transfer_client_endpoint {
   std::string target_server_uuid;
@@ -562,10 +597,16 @@ Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload(
     uint64_t timeout_seconds,
     Preserve_snapshot_metadata *written_metadata = nullptr);
 
+using Preserve_trx_transfer_after_spool_callback =
+    Preserve_trx_transfer_status (*)(void *context);
+
 Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch(
     const std::string &root_dir, const std::vector<std::string> &encoded_frames,
     Preserved_trx_store *store, Preserve_trx_transfer_receiver_registry *registry,
-    uint64_t timeout_seconds, uint worker_count);
+    uint64_t timeout_seconds, uint worker_count,
+    Preserve_snapshot_metadata *written_metadata = nullptr,
+    Preserve_trx_transfer_after_spool_callback after_spool = nullptr,
+    void *after_spool_context = nullptr);
 
 using Preserve_trx_transfer_frame_apply_callback =
     Preserve_trx_transfer_status (*)(const Preserve_trx_transfer_frame &frame,
@@ -575,6 +616,8 @@ Preserve_trx_transfer_status
 preserve_trx_transfer_apply_receiver_frame_batch_with_workers(
     const std::vector<Preserve_trx_transfer_frame> &frames, uint worker_count,
     Preserve_trx_transfer_frame_apply_callback apply_frame, void *context);
+
+void preserve_trx_transfer_shutdown_receiver_prewarm_workers();
 
 void preserve_trx_transfer_dispatch_command(THD *thd);
 

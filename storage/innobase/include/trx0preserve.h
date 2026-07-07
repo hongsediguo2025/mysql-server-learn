@@ -121,7 +121,27 @@ dberr_t trx_preserve_rollback_prepared_without_snapshot(
 dberr_t trx_preserve_prepare_resumed_rollback_gtid(trx_t *trx);
 dberr_t trx_preserve_activate_resumed(trx_t *trx);
 dberr_t trx_preserve_reactivate_prepared_in_original_thd(THD *thd);
-dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(THD *thd);
+enum class trx_preserve_thd_transition_failure {
+  NONE,
+  NULL_THD,
+  INNODB_HANDLER_UNAVAILABLE,
+  NO_TRX,
+  NO_XID,
+  XID_NOT_PRESERVE_MAGIC,
+  NOT_PREPARED,
+  NOT_ACTIVE_OR_PREPARED,
+  NO_UPDATED_RSEG,
+  NOT_IN_MYSQL_TRX_LIST,
+  THD_MISMATCH,
+  CLAIMED,
+  UNDO_ACTIVATE_FAILED
+};
+
+const char *trx_preserve_thd_transition_failure_name(
+    trx_preserve_thd_transition_failure reason);
+
+dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(
+    THD *thd, trx_preserve_thd_transition_failure *reason = nullptr);
 dberr_t trx_preserve_activate_reattached_in_original_thd(trx_t *trx, THD *thd);
 bool trx_preserve_is_active_attached_to_thd(trx_t *trx, THD *thd);
 dberr_t trx_preserve_prepare_current_temp_only(THD *thd, const XID &xid);
@@ -256,7 +276,8 @@ struct Preserve_rseg_collection_debug_result {
 void trx_preserve_debug_current_thd_rseg_collection(
     THD *thd, Preserve_rseg_collection_debug_result *result);
 
-trx_t *trx_preserve_detach_current_thd(THD *thd);
+trx_t *trx_preserve_detach_current_thd(
+    THD *thd, trx_preserve_thd_transition_failure *reason = nullptr);
 dberr_t trx_preserve_attach_to_thd(trx_t *trx, THD *thd);
 dberr_t trx_preserve_reattach_preserved_to_original_thd(trx_t *trx, THD *thd);
 dberr_t trx_preserve_detach_resumed_from_thd(trx_t *trx, THD *thd);

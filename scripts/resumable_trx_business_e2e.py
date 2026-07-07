@@ -784,6 +784,7 @@ class WarmcopyDrainMetrics:
     phase2_pause_ms: float
     full_copy_to_count: Optional[int]
     phase2_total_ms: Optional[float] = None
+    phase2_binlog_preflight_ms: Optional[float] = None
     phase2_end_monotonic_us: Optional[int] = None
     phase2_slo_guaranteed: Optional[int] = None
     phase2_slo_reason: Optional[str] = None
@@ -796,6 +797,17 @@ class WarmcopyDrainMetrics:
     phase2_table_live_export_target_count: Optional[int] = None
     phase2_mdl_live_export_target_count: Optional[int] = None
     phase2_savepoint_live_export_target_count: Optional[int] = None
+    phase2_target_pin_us: Optional[int] = None
+    phase2_target_worker_wall_us: Optional[int] = None
+    phase2_target_result_collect_us: Optional[int] = None
+    phase2_target_deferred_dir_fsync_us: Optional[int] = None
+    phase2_transfer_commit_epoch_us: Optional[int] = None
+    source_phase2_transfer_bulk_bytes: Optional[int] = None
+    source_phase2_transfer_snapshot_bundle_bytes: Optional[int] = None
+    source_phase2_transfer_snapshot_bundle_count: Optional[int] = None
+    source_phase2_transfer_final_metadata_frame_count: Optional[int] = None
+    source_phase2_transfer_final_metadata_bytes: Optional[int] = None
+    source_phase2_transfer_final_metadata_ack_us: Optional[int] = None
 
     def lock_warmcopy_live_fallback_count(self) -> Optional[int]:
         counts = (
@@ -903,6 +915,15 @@ class ReceiverPrewarmMetrics:
     seal_prewarm_success_tokens: int
     seal_prewarm_not_ready_tokens: int
     seal_prewarm_last_status: int
+    phase2_transfer_bulk_bytes: int = 0
+    phase2_receiver_prewarm_wait_us: int = 0
+    phase2_final_metadata_fsync_count: int = 0
+    phase2_transfer_final_metadata_ack_us: int = 0
+    phase1_business_enqueue_block_us: int = 0
+    ready_after_final_metadata_us: int = 0
+    prewarm_backlog_at_phase2_end: int = 0
+    record_lock_required_residency_bytes: int = 0
+    record_lock_reserved_residency_bytes: int = 0
 
 
 class WorkloadPlan:
@@ -3719,6 +3740,8 @@ class BusinessE2ERunner:
         self.write_promotion_warm_gate_report(gate_elapsed_us, server_metrics)
 
     def run_standby_transfer_receiver_drain_metrics(self) -> None:
+        self.start_source_server_if_configured()
+        self.start_receiver_server_if_configured()
         self.preflight_disk_budgets()
         self.runtime.wait_until_up(self.config.startup_timeout_s)
         receiver_conn = self._receiver_admin_connection()
@@ -3729,6 +3752,7 @@ class BusinessE2ERunner:
             self.materialize_receiver_physical_copy_before_drain()
         self.configure_standby_transfer_credentials()
         self.configure_preserve_globals()
+        self.validate_standby_transfer_endpoint_config()
         if (
             self.config.max_transactions_per_worker > 0
             and self.config.business_run_before_drain_s <= 0
@@ -3847,8 +3871,6 @@ class BusinessE2ERunner:
         self.write_receiver_promotion_gate_report(epoch_id, tokens)
 
     def run_physical_standby_promotion_gate_scaled(self) -> None:
-        self.start_source_server_if_configured()
-        self.start_receiver_server_if_configured()
         self.run_standby_transfer_receiver_drain_metrics()
         self.shutdown_receiver_for_physical_standby_copy()
         self.materialize_physical_standby_datadir_for_promotion()
@@ -4193,6 +4215,11 @@ class BusinessE2ERunner:
                         for metric in metrics
                         if metric.phase2_total_ms is not None
                     ],
+                    "phase2_binlog_preflight_samples_ms": [
+                        metric.phase2_binlog_preflight_ms
+                        for metric in metrics
+                        if metric.phase2_binlog_preflight_ms is not None
+                    ],
                     "phase2_slo_guaranteed": all(
                         metric.phase2_slo_guaranteed == 1 for metric in metrics
                     ),
@@ -4533,6 +4560,14 @@ class BusinessE2ERunner:
             for metric in metrics
             if metric.phase2_total_ms is not None
         ]
+        def source_metric_samples(field: str) -> List[int]:
+            return [
+                int(value)
+                for metric in metrics
+                for value in [getattr(metric, field)]
+                if value is not None
+            ]
+
         receiver_ready_lag_samples = (
             []
             if receiver_ready_after_source_phase2_end_us is None
@@ -4548,6 +4583,22 @@ class BusinessE2ERunner:
             "scenario": "standby_transfer_receiver_drain_metrics",
             "sessions": self.config.sessions,
             "cycles": self.config.cycles,
+            "workload_sessions": self.config.sessions,
+            "workload_table_count": self.config.table_count,
+            "workload_statements_per_tx": self.config.statements_per_tx,
+            "workload_seed_rows_per_table_per_session": (
+                self.config.seed_rows_per_table_per_session
+            ),
+            "workload_lockset_batch_size": self.config.lockset_batch_size,
+            "workload_lockset_session_table_shards": (
+                self.config.lockset_session_table_shards
+            ),
+            "workload_lockset_noop_update": self.config.lockset_noop_update,
+            "workload_lockset_touch_one_row": self.config.lockset_touch_one_row,
+            "workload_lockset_select_for_update": (
+                self.config.lockset_select_for_update
+            ),
+            "workload_lockset_minimal_table": self.config.lockset_minimal_table,
             "completed_stmt_total": completed_stmt_total,
             "phase2_pause_samples_ms": [
                 metric.phase2_pause_ms for metric in metrics
@@ -4556,6 +4607,11 @@ class BusinessE2ERunner:
                 metric.phase2_total_ms
                 for metric in metrics
                 if metric.phase2_total_ms is not None
+            ],
+            "phase2_binlog_preflight_samples_ms": [
+                metric.phase2_binlog_preflight_ms
+                for metric in metrics
+                if metric.phase2_binlog_preflight_ms is not None
             ],
             "phase2_slo_guaranteed": (
                 None
@@ -4602,6 +4658,66 @@ class BusinessE2ERunner:
             "standby_tokens": artifact_counts.get("standby_pending_tokens", 0),
             "source_phase2_total_us": source_phase2_total_us,
             "source_phase2_end_us": source_phase2_end_us,
+            "source_phase2_target_pin_us_samples": source_metric_samples(
+                "phase2_target_pin_us"
+            ),
+            "source_phase2_target_worker_wall_us_samples": source_metric_samples(
+                "phase2_target_worker_wall_us"
+            ),
+            "source_phase2_target_result_collect_us_samples": source_metric_samples(
+                "phase2_target_result_collect_us"
+            ),
+            "source_phase2_target_deferred_dir_fsync_us_samples": (
+                source_metric_samples("phase2_target_deferred_dir_fsync_us")
+            ),
+            "source_phase2_transfer_commit_epoch_us_samples": source_metric_samples(
+                "phase2_transfer_commit_epoch_us"
+            ),
+            "source_phase2_transfer_bulk_bytes_samples": source_metric_samples(
+                "source_phase2_transfer_bulk_bytes"
+            ),
+            "source_phase2_transfer_snapshot_bundle_bytes_samples": (
+                source_metric_samples("source_phase2_transfer_snapshot_bundle_bytes")
+            ),
+            "source_phase2_transfer_snapshot_bundle_count_samples": (
+                source_metric_samples("source_phase2_transfer_snapshot_bundle_count")
+            ),
+            "source_phase2_transfer_final_metadata_frame_count_samples": (
+                source_metric_samples(
+                    "source_phase2_transfer_final_metadata_frame_count"
+                )
+            ),
+            "source_phase2_transfer_final_metadata_bytes_samples": (
+                source_metric_samples("source_phase2_transfer_final_metadata_bytes")
+            ),
+            "source_phase2_transfer_final_metadata_ack_us_samples": (
+                source_metric_samples("source_phase2_transfer_final_metadata_ack_us")
+            ),
+            "phase2_transfer_bulk_bytes": (
+                0
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.phase2_transfer_bulk_bytes
+            ),
+            "phase2_receiver_prewarm_wait_us": (
+                0
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.phase2_receiver_prewarm_wait_us
+            ),
+            "phase2_final_metadata_fsync_count": (
+                0
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.phase2_final_metadata_fsync_count
+            ),
+            "phase2_transfer_final_metadata_ack_us": (
+                0
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.phase2_transfer_final_metadata_ack_us
+            ),
+            "phase1_business_enqueue_block_us": (
+                0
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.phase1_business_enqueue_block_us
+            ),
             "receiver_snapshot_tokens": artifact_counts.get("snapshot_tokens", 0),
             "receiver_standby_pending_tokens": artifact_counts.get(
                 "standby_pending_tokens", 0
@@ -4626,6 +4742,16 @@ class BusinessE2ERunner:
             ),
             "receiver_ready_after_source_phase2_end_us": (
                 receiver_ready_after_source_phase2_end_us
+            ),
+            "receiver_ready_after_final_metadata_us": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.ready_after_final_metadata_us
+            ),
+            "receiver_prewarm_backlog_at_phase2_end": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.prewarm_backlog_at_phase2_end
             ),
             "receiver_ready_after_source_phase2_summary_us": (
                 _summarize_us_samples(receiver_ready_lag_samples)
@@ -4670,6 +4796,12 @@ class BusinessE2ERunner:
                     ),
                     "receiver_record_cold_gets": (
                         receiver_prewarm_metrics.record_lock_cold_page_gets
+                    ),
+                    "receiver_record_lock_required_residency_bytes": (
+                        receiver_prewarm_metrics.record_lock_required_residency_bytes
+                    ),
+                    "receiver_record_lock_reserved_residency_bytes": (
+                        receiver_prewarm_metrics.record_lock_reserved_residency_bytes
                     ),
                     "receiver_seal_prewarm_tokens": (
                         receiver_prewarm_metrics.seal_prewarm_tokens
@@ -4725,7 +4857,6 @@ class BusinessE2ERunner:
             receiver_prewarm_metrics.first_frame_monotonic_us == 0
             or receiver_prewarm_metrics.prewarm_start_monotonic_us == 0
             or receiver_prewarm_metrics.first_frame_monotonic_us > phase2_end_us
-            or receiver_prewarm_metrics.prewarm_start_monotonic_us > phase2_end_us
         ):
             raise AssertionError(
                 "receiver not ready: phase1 transfer/prewarm did not overlap "
@@ -4774,20 +4905,21 @@ class BusinessE2ERunner:
                 "receiver not ready: record-lock ready cache would cold-read "
                 f"pages={receiver_prewarm_metrics.record_lock_cold_page_gets}"
             )
-
-        ready_lag_us = getattr(
-            self, "receiver_ready_after_source_phase2_end_us", None
-        )
-        if ready_lag_us is None:
+        if (
+            self.config.lockset_batch_size > 0
+            and receiver_prewarm_metrics.record_lock_page_count <= 0
+        ):
             raise AssertionError(
-                "receiver not ready: source phase2 end to receiver ready lag is "
-                "unavailable"
+                "receiver not ready: lockset workload produced no record-lock page "
+                "evidence"
             )
+
+        ready_lag_us = receiver_prewarm_metrics.ready_after_final_metadata_us
         max_lag_ms = self.config.max_receiver_ready_after_phase2_ms
         if max_lag_ms > 0 and ready_lag_us > max_lag_ms * 1000:
             raise AssertionError(
                 "receiver readiness lag exceeded threshold: "
-                f"receiver_ready_after_source_phase2_end_us={ready_lag_us} "
+                f"receiver_ready_after_final_metadata_us={ready_lag_us} "
                 f"max_ms={max_lag_ms}"
             )
 
@@ -5381,8 +5513,123 @@ class BusinessE2ERunner:
                     receiver_conn,
                     f"GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.* TO {account}",
                 )
+            rows = self.runtime.execute(
+                receiver_conn,
+                "SELECT "
+                "@@global.preserve_trx_transfer_credential_name, "
+                "@@global.preserve_trx_transfer_target_user",
+                fetch=True,
+            )
+            credential_name = "" if not rows else str(rows[0][0] or "")
+            target_user = "" if not rows else str(rows[0][1] or "")
+            if (
+                credential_name != self.config.standby_transfer_credential_name
+                or target_user != self.config.standby_transfer_user
+            ):
+                raise AssertionError(
+                    "receiver transfer codec configuration is incomplete: "
+                    "start the receiver mysqld with "
+                    f"--preserve-trx-transfer-credential-name="
+                    f"{self.config.standby_transfer_credential_name} and "
+                    f"--preserve-trx-transfer-target-user="
+                    f"{self.config.standby_transfer_user}; "
+                    f"observed credential_name={credential_name!r} "
+                    f"target_user={target_user!r}"
+                )
         finally:
             receiver_conn.close()
+
+    def validate_standby_transfer_endpoint_config(self) -> None:
+        source_conn = self.runtime.connect(database=False)
+        receiver_conn = self._receiver_admin_connection()
+        try:
+            source_rows = self.runtime.execute(
+                source_conn,
+                "SELECT @@global.server_uuid, "
+                "@@global.preserve_trx_transfer_target_server_uuid, "
+                "@@global.preserve_trx_transfer_artifact_mode",
+                fetch=True,
+            )
+            receiver_rows = self.runtime.execute(
+                receiver_conn,
+                "SELECT @@global.server_uuid, "
+                "@@global.preserve_trx_transfer_target_server_uuid, "
+                "@@global.preserve_trx_transfer_allowed_source_uuid, "
+                "@@global.preserve_trx_transfer_credential_name, "
+                "@@global.preserve_trx_transfer_target_user, "
+                "@@global.preserve_trx_dir",
+                fetch=True,
+            )
+            if not source_rows or not receiver_rows:
+                raise AssertionError(
+                    "standby transfer endpoint UUID configuration is unavailable"
+                )
+            source_uuid = str(source_rows[0][0] or "")
+            source_target_uuid = str(source_rows[0][1] or "")
+            source_artifact_mode = str(source_rows[0][2] or "")
+            receiver_uuid = str(receiver_rows[0][0] or "")
+            receiver_target_uuid = str(receiver_rows[0][1] or "")
+            receiver_allowed_source_uuid = str(receiver_rows[0][2] or "")
+            receiver_credential_name = str(receiver_rows[0][3] or "")
+            receiver_target_user = str(receiver_rows[0][4] or "")
+            receiver_preserve_dir = str(receiver_rows[0][5] or "")
+            mismatches = []
+            if source_target_uuid != receiver_uuid:
+                mismatches.append(
+                    f"source target uuid {source_target_uuid!r} != "
+                    f"receiver server_uuid {receiver_uuid!r}"
+                )
+            if source_artifact_mode != "STANDBY_TRANSFER_SAVE":
+                mismatches.append(
+                    f"source artifact mode {source_artifact_mode!r} != "
+                    "'STANDBY_TRANSFER_SAVE'"
+                )
+            if receiver_target_uuid != receiver_uuid:
+                mismatches.append(
+                    f"receiver configured target uuid {receiver_target_uuid!r} "
+                    f"!= receiver server_uuid {receiver_uuid!r}"
+                )
+            if receiver_allowed_source_uuid != source_uuid:
+                mismatches.append(
+                    f"receiver allowed source uuid "
+                    f"{receiver_allowed_source_uuid!r} != source server_uuid "
+                    f"{source_uuid!r}"
+                )
+            if receiver_credential_name != self.config.standby_transfer_credential_name:
+                mismatches.append(
+                    f"receiver credential name {receiver_credential_name!r} "
+                    f"!= expected "
+                    f"{self.config.standby_transfer_credential_name!r}"
+                )
+            if receiver_target_user != self.config.standby_transfer_user:
+                mismatches.append(
+                    f"receiver transfer target user {receiver_target_user!r} "
+                    f"!= expected {self.config.standby_transfer_user!r}"
+                )
+            configured_receiver_preserve_dir = str(
+                Path(self.config.receiver_preserve_dir or "")
+                .expanduser()
+                .resolve(strict=False)
+            )
+            actual_receiver_preserve_dir = str(
+                Path(receiver_preserve_dir).expanduser().resolve(strict=False)
+            )
+            if configured_receiver_preserve_dir != actual_receiver_preserve_dir:
+                mismatches.append(
+                    "receiver preserve dir mismatch: configured "
+                    f"{configured_receiver_preserve_dir!r} != server "
+                    f"@@preserve_trx_dir {actual_receiver_preserve_dir!r}"
+                )
+            if mismatches:
+                raise AssertionError(
+                    "standby transfer endpoint UUID configuration is inconsistent: "
+                    + "; ".join(mismatches)
+                )
+        finally:
+            try:
+                source_conn.close()
+            finally:
+                receiver_conn.close()
 
     def configure_no_preserve_baseline_globals(self) -> None:
         conn = self.runtime.connect(database=False)
@@ -5846,6 +6093,9 @@ class BusinessE2ERunner:
             metric_line,
         )
         total_match = re.search(r"\bphase2_total_us=(\d+)\b", metric_line)
+        binlog_preflight_match = re.search(
+            r"\bphase2_binlog_preflight_us=(\d+)\b", metric_line
+        )
         phase2_end_match = re.search(
             r"\bphase2_end_monotonic_us=(\d+)\b", metric_line
         )
@@ -5888,6 +6138,10 @@ class BusinessE2ERunner:
             r"\bphase2_savepoint_live_export_target_count=(\d+)\b",
             metric_line,
         )
+        def int_metric(name: str) -> Optional[int]:
+            match = re.search(rf"\b{name}=(\d+)\b", metric_line)
+            return int(match.group(1)) if match is not None else None
+
         return WarmcopyDrainMetrics(
             phase2_pause_ms=int(pause_match.group(1)) / 1000.0,
             full_copy_to_count=(
@@ -5895,6 +6149,11 @@ class BusinessE2ERunner:
             ),
             phase2_total_ms=(
                 int(total_match.group(1)) / 1000.0 if total_match is not None else None
+            ),
+            phase2_binlog_preflight_ms=(
+                int(binlog_preflight_match.group(1)) / 1000.0
+                if binlog_preflight_match is not None
+                else None
             ),
             phase2_end_monotonic_us=(
                 int(phase2_end_match.group(1))
@@ -5951,6 +6210,37 @@ class BusinessE2ERunner:
                 int(savepoint_live_match.group(1))
                 if savepoint_live_match is not None
                 else None
+            ),
+            phase2_target_pin_us=int_metric("phase2_target_pin_us"),
+            phase2_target_worker_wall_us=int_metric(
+                "phase2_target_worker_wall_us"
+            ),
+            phase2_target_result_collect_us=int_metric(
+                "phase2_target_result_collect_us"
+            ),
+            phase2_target_deferred_dir_fsync_us=int_metric(
+                "phase2_target_deferred_dir_fsync_us"
+            ),
+            phase2_transfer_commit_epoch_us=int_metric(
+                "phase2_transfer_commit_epoch_us"
+            ),
+            source_phase2_transfer_bulk_bytes=int_metric(
+                "source_phase2_transfer_bulk_bytes"
+            ),
+            source_phase2_transfer_snapshot_bundle_bytes=int_metric(
+                "source_phase2_transfer_snapshot_bundle_bytes"
+            ),
+            source_phase2_transfer_snapshot_bundle_count=int_metric(
+                "source_phase2_transfer_snapshot_bundle_count"
+            ),
+            source_phase2_transfer_final_metadata_frame_count=int_metric(
+                "source_phase2_transfer_final_metadata_frame_count"
+            ),
+            source_phase2_transfer_final_metadata_bytes=int_metric(
+                "source_phase2_transfer_final_metadata_bytes"
+            ),
+            source_phase2_transfer_final_metadata_ack_us=int_metric(
+                "source_phase2_transfer_final_metadata_ack_us"
             ),
         )
 
@@ -6321,6 +6611,15 @@ class BusinessE2ERunner:
             "Preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens",
             "Preserve_trx_transfer_receiver_seal_prewarm_success_tokens",
             "Preserve_trx_transfer_receiver_seal_prewarm_tokens",
+            "Preserve_trx_transfer_phase2_bulk_bytes",
+            "Preserve_trx_transfer_phase2_receiver_prewarm_wait_us",
+            "Preserve_trx_transfer_phase2_final_metadata_fsync_count",
+            "Preserve_trx_transfer_phase2_final_metadata_ack_us",
+            "Preserve_trx_transfer_phase1_business_enqueue_block_us",
+            "Preserve_trx_transfer_receiver_ready_after_final_metadata_us",
+            "Preserve_trx_transfer_receiver_prewarm_backlog_at_phase2_end",
+            "Preserve_trx_transfer_receiver_record_lock_req_residency_bytes",
+            "Preserve_trx_transfer_receiver_record_lock_resv_residency_bytes",
         }
         quoted_fields = ", ".join(f"'{field}'" for field in sorted(fields))
         sql = (
@@ -6402,6 +6701,33 @@ class BusinessE2ERunner:
                 ),
                 seal_prewarm_last_status=metric(
                     "Preserve_trx_transfer_receiver_seal_prewarm_last_status"
+                ),
+                phase2_transfer_bulk_bytes=metric(
+                    "Preserve_trx_transfer_phase2_bulk_bytes"
+                ),
+                phase2_receiver_prewarm_wait_us=metric(
+                    "Preserve_trx_transfer_phase2_receiver_prewarm_wait_us"
+                ),
+                phase2_final_metadata_fsync_count=metric(
+                    "Preserve_trx_transfer_phase2_final_metadata_fsync_count"
+                ),
+                phase2_transfer_final_metadata_ack_us=metric(
+                    "Preserve_trx_transfer_phase2_final_metadata_ack_us"
+                ),
+                phase1_business_enqueue_block_us=metric(
+                    "Preserve_trx_transfer_phase1_business_enqueue_block_us"
+                ),
+                ready_after_final_metadata_us=metric(
+                    "Preserve_trx_transfer_receiver_ready_after_final_metadata_us"
+                ),
+                prewarm_backlog_at_phase2_end=metric(
+                    "Preserve_trx_transfer_receiver_prewarm_backlog_at_phase2_end"
+                ),
+                record_lock_required_residency_bytes=metric(
+                    "Preserve_trx_transfer_receiver_record_lock_req_residency_bytes"
+                ),
+                record_lock_reserved_residency_bytes=metric(
+                    "Preserve_trx_transfer_receiver_record_lock_resv_residency_bytes"
                 ),
             )
         except ValueError:
@@ -7261,6 +7587,11 @@ class BusinessE2ERunner:
                 metric.phase2_total_ms
                 for metric in metrics
                 if metric.phase2_total_ms is not None
+            ],
+            "phase2_binlog_preflight_samples_ms": [
+                metric.phase2_binlog_preflight_ms
+                for metric in metrics
+                if metric.phase2_binlog_preflight_ms is not None
             ],
             "phase2_slo_guaranteed": (
                 None

@@ -697,15 +697,61 @@ dberr_t trx_preserve_reactivate_prepared_in_original_thd(THD *thd) {
   return trx_preserve_activate_undo_state(trx);
 }
 
-dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(THD *thd) {
-  if (thd == nullptr) return DB_ERROR;
+const char *trx_preserve_thd_transition_failure_name(
+    trx_preserve_thd_transition_failure reason) {
+  switch (reason) {
+    case trx_preserve_thd_transition_failure::NONE:
+      return "none";
+    case trx_preserve_thd_transition_failure::NULL_THD:
+      return "null_thd";
+    case trx_preserve_thd_transition_failure::INNODB_HANDLER_UNAVAILABLE:
+      return "innodb_handler_unavailable";
+    case trx_preserve_thd_transition_failure::NO_TRX:
+      return "no_trx";
+    case trx_preserve_thd_transition_failure::NO_XID:
+      return "no_xid";
+    case trx_preserve_thd_transition_failure::XID_NOT_PRESERVE_MAGIC:
+      return "xid_not_preserve_magic";
+    case trx_preserve_thd_transition_failure::NOT_PREPARED:
+      return "not_prepared";
+    case trx_preserve_thd_transition_failure::NOT_ACTIVE_OR_PREPARED:
+      return "not_active_or_prepared";
+    case trx_preserve_thd_transition_failure::NO_UPDATED_RSEG:
+      return "no_updated_rseg";
+    case trx_preserve_thd_transition_failure::NOT_IN_MYSQL_TRX_LIST:
+      return "not_in_mysql_trx_list";
+    case trx_preserve_thd_transition_failure::THD_MISMATCH:
+      return "thd_mismatch";
+    case trx_preserve_thd_transition_failure::CLAIMED:
+      return "claimed";
+    case trx_preserve_thd_transition_failure::UNDO_ACTIVATE_FAILED:
+      return "undo_activate_failed";
+  }
+  return "unknown";
+}
+
+dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(
+    THD *thd, trx_preserve_thd_transition_failure *reason) {
+  if (reason != nullptr) {
+    *reason = trx_preserve_thd_transition_failure::NONE;
+  }
+  auto fail = [&](trx_preserve_thd_transition_failure why) {
+    if (reason != nullptr) *reason = why;
+    return DB_ERROR;
+  };
+
+  if (thd == nullptr) return fail(trx_preserve_thd_transition_failure::NULL_THD);
 
   trx_t *trx = thd_to_trx(thd);
-  if (trx == nullptr || trx->xid == nullptr ||
-      !xid_is_preserve_magic(*trx->xid) || trx->mysql_thd != thd ||
-      trx->preserve_trx_claimed) {
-    return DB_ERROR;
-  }
+  if (trx == nullptr) return fail(trx_preserve_thd_transition_failure::NO_TRX);
+  if (trx->xid == nullptr)
+    return fail(trx_preserve_thd_transition_failure::NO_XID);
+  if (!xid_is_preserve_magic(*trx->xid))
+    return fail(trx_preserve_thd_transition_failure::XID_NOT_PRESERVE_MAGIC);
+  if (trx->mysql_thd != thd)
+    return fail(trx_preserve_thd_transition_failure::THD_MISMATCH);
+  if (trx->preserve_trx_claimed)
+    return fail(trx_preserve_thd_transition_failure::CLAIMED);
 
   bool was_prepared = false;
   dberr_t err = DB_SUCCESS;
@@ -713,6 +759,11 @@ dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(THD *thd) {
   if (trx_state_eq(trx, TRX_STATE_PREPARED)) {
     if (trx->mysql_thd != thd || trx->preserve_trx_claimed) {
       err = DB_ERROR;
+      if (reason != nullptr) {
+        *reason = trx->mysql_thd != thd
+                      ? trx_preserve_thd_transition_failure::THD_MISMATCH
+                      : trx_preserve_thd_transition_failure::CLAIMED;
+      }
     } else {
       ut_a(trx_sys->n_prepared_trx > 0);
       --trx_sys->n_prepared_trx;
@@ -722,11 +773,26 @@ dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(THD *thd) {
   } else if (!trx_state_eq(trx, TRX_STATE_ACTIVE) || trx->mysql_thd != thd ||
              trx->preserve_trx_claimed) {
     err = DB_ERROR;
+    if (reason != nullptr) {
+      if (!trx_state_eq(trx, TRX_STATE_ACTIVE)) {
+        *reason =
+            trx_preserve_thd_transition_failure::NOT_ACTIVE_OR_PREPARED;
+      } else if (trx->mysql_thd != thd) {
+        *reason = trx_preserve_thd_transition_failure::THD_MISMATCH;
+      } else {
+        *reason = trx_preserve_thd_transition_failure::CLAIMED;
+      }
+    }
   }
   trx_sys_mutex_exit();
 
   if (err != DB_SUCCESS) return err;
-  return was_prepared ? trx_preserve_activate_undo_state(trx) : DB_SUCCESS;
+  if (!was_prepared) return DB_SUCCESS;
+  err = trx_preserve_activate_undo_state(trx);
+  if (err != DB_SUCCESS && reason != nullptr) {
+    *reason = trx_preserve_thd_transition_failure::UNDO_ACTIVATE_FAILED;
+  }
+  return err;
 }
 
 dberr_t trx_preserve_activate_reattached_in_original_thd(trx_t *trx,
@@ -1805,17 +1871,47 @@ void trx_preserve_debug_current_thd_rseg_collection(
   mysql_trx_list, thd_to_trx() and ha_info are cleared, and the original THD no
   longer has a transaction scope for this engine trx.
 */
-trx_t *trx_preserve_detach_current_thd(THD *thd) {
+trx_t *trx_preserve_detach_current_thd(
+    THD *thd, trx_preserve_thd_transition_failure *reason) {
+  if (reason != nullptr) {
+    *reason = trx_preserve_thd_transition_failure::NONE;
+  }
   if (thd == nullptr || innodb_hton == nullptr ||
       innodb_hton->replace_native_transaction_in_thd == nullptr) {
+    if (reason != nullptr) {
+      *reason = thd == nullptr
+                    ? trx_preserve_thd_transition_failure::NULL_THD
+                    : trx_preserve_thd_transition_failure::
+                          INNODB_HANDLER_UNAVAILABLE;
+    }
     return nullptr;
   }
 
   trx_t *trx = thd_to_trx(thd);
-  if (trx == nullptr || trx->xid == nullptr ||
-      !xid_is_preserve_magic(*trx->xid) ||
-      !trx_state_eq(trx, TRX_STATE_PREPARED) ||
-      !trx_is_rseg_updated(trx)) {
+  if (trx == nullptr) {
+    if (reason != nullptr) *reason = trx_preserve_thd_transition_failure::NO_TRX;
+    return nullptr;
+  }
+  if (trx->xid == nullptr) {
+    if (reason != nullptr) *reason = trx_preserve_thd_transition_failure::NO_XID;
+    return nullptr;
+  }
+  if (!xid_is_preserve_magic(*trx->xid)) {
+    if (reason != nullptr) {
+      *reason = trx_preserve_thd_transition_failure::XID_NOT_PRESERVE_MAGIC;
+    }
+    return nullptr;
+  }
+  if (!trx_state_eq(trx, TRX_STATE_PREPARED)) {
+    if (reason != nullptr) {
+      *reason = trx_preserve_thd_transition_failure::NOT_PREPARED;
+    }
+    return nullptr;
+  }
+  if (!trx_is_rseg_updated(trx)) {
+    if (reason != nullptr) {
+      *reason = trx_preserve_thd_transition_failure::NO_UPDATED_RSEG;
+    }
     return nullptr;
   }
 
@@ -1825,6 +1921,15 @@ trx_t *trx_preserve_detach_current_thd(THD *thd) {
       !trx->in_mysql_trx_list ||
 #endif /* UNIV_DEBUG */
       trx->mysql_thd != thd) {
+    if (reason != nullptr) {
+#ifdef UNIV_DEBUG
+      *reason = !trx->in_mysql_trx_list
+                    ? trx_preserve_thd_transition_failure::NOT_IN_MYSQL_TRX_LIST
+                    : trx_preserve_thd_transition_failure::THD_MISMATCH;
+#else
+      *reason = trx_preserve_thd_transition_failure::THD_MISMATCH;
+#endif /* UNIV_DEBUG */
+    }
     trx_sys_mutex_exit();
     return nullptr;
   }

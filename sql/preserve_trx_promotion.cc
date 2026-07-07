@@ -217,8 +217,44 @@ std::string ready_cache_reason_or_status(
 
 bool ready_cache_entry_needs_record_lock_prewarm(
     const Promotion_ready_cache_entry &entry) {
-  return entry.has_ready_bundle &&
-         !entry.ready_bundle.metadata.record_locks_payload.empty();
+  if (!entry.has_ready_bundle) return false;
+  if (!entry.ready_bundle.metadata.record_locks_payload.empty()) return true;
+  for (const Preserved_trx_external_blob &blob :
+       entry.ready_bundle.external_blobs) {
+    if (blob.name == kPreservedTrxBlobRecordLocks) return true;
+  }
+  return false;
+}
+
+bool select_record_lock_payload_for_prewarm(const Preserved_trx_bundle &bundle,
+                                            const std::string **payload,
+                                            std::string *reason) {
+  if (payload == nullptr) return false;
+  *payload = nullptr;
+  if (!bundle.metadata.record_locks_payload.empty()) {
+    *payload = &bundle.metadata.record_locks_payload;
+    return true;
+  }
+
+  const Preserved_trx_external_blob *record_blob = nullptr;
+  for (const Preserved_trx_external_blob &blob : bundle.external_blobs) {
+    if (blob.name != kPreservedTrxBlobRecordLocks) continue;
+    if (record_blob != nullptr) {
+      if (reason != nullptr) *reason = "duplicate record-lock external blob";
+      return false;
+    }
+    record_blob = &blob;
+  }
+  if (record_blob == nullptr) return true;
+
+  if (record_blob->payload.empty() ||
+      record_blob->descriptor.name != kPreservedTrxBlobRecordLocks ||
+      record_blob->descriptor.size != record_blob->payload.length()) {
+    if (reason != nullptr) *reason = "record-lock external blob is incomplete";
+    return false;
+  }
+  *payload = &record_blob->payload;
+  return true;
 }
 
 bool record_lock_pages_are_gate_ready(bool record_lock_pages_prewarmed,
@@ -1361,12 +1397,27 @@ Preserve_trx_promotion_adopt_status prewarm_loaded_bundle_into_ready_cache(
   entry.required_apply_lsn = required_apply_lsn;
   entry.has_ready_bundle = true;
   entry.ready_bundle = bundle;
-  if (bundle.metadata.record_locks_payload.empty()) {
+  const std::string *record_lock_payload = nullptr;
+  std::string record_lock_payload_reason;
+  if (!select_record_lock_payload_for_prewarm(bundle, &record_lock_payload,
+                                              &record_lock_payload_reason)) {
+    entry.state = Preserve_trx_promotion_ready_state::CORRUPT;
+    entry.has_ready_bundle = false;
+    entry.reason =
+        record_lock_payload_reason.empty()
+            ? "record-lock payload selection failed"
+            : record_lock_payload_reason;
+    std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+    g_ready_cache[Promotion_ready_cache_key{preserve_dir, epoch_id, token}] =
+        std::move(entry);
+    return Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT;
+  }
+  if (record_lock_payload == nullptr || record_lock_payload->empty()) {
     entry.record_lock_pages_prewarmed = true;
   } else {
     trx_preserve_record_lock_page_plan_t page_plan;
     if (!trx_preserve_record_lock_payload_page_plan(
-            bundle.metadata.record_locks_payload, &page_plan)) {
+            *record_lock_payload, &page_plan)) {
       entry.state = Preserve_trx_promotion_ready_state::CORRUPT;
       entry.has_ready_bundle = false;
       entry.reason = "record-lock page plan failed";
@@ -1377,8 +1428,8 @@ Preserve_trx_promotion_adopt_status prewarm_loaded_bundle_into_ready_cache(
     }
     trx_preserve_record_lock_import_metrics_t prefetch_metrics;
     const dberr_t prefetch_status =
-        trx_preserve_prefetch_record_lock_pages_for_gate(
-            bundle.metadata.record_locks_payload, &prefetch_metrics);
+        trx_preserve_prefetch_record_lock_pages_for_gate(*record_lock_payload,
+                                                         &prefetch_metrics);
     if (prefetch_status != DB_SUCCESS) {
       if (prefetch_status == DB_TABLE_NOT_FOUND) {
         entry.state = Preserve_trx_promotion_ready_state::APPLY_PENDING;
@@ -1422,7 +1473,7 @@ Preserve_trx_promotion_adopt_status prewarm_loaded_bundle_into_ready_cache(
             entry.record_lock_prefetch_submitted_pages, residency_deadline_us,
             [&](trx_preserve_record_lock_residency_t *sample) {
               if (trx_preserve_record_lock_payload_residency(
-                      bundle.metadata.record_locks_payload, sample)) {
+                      *record_lock_payload, sample)) {
                 return true;
               }
               residency_parse_failed = true;
@@ -1578,6 +1629,90 @@ preserved_trx_promotion_prewarm_staged_bundle_for_receiver(
   }
   return prewarm_loaded_bundle_into_ready_cache(
       preserve_dir, epoch_id, token, required_apply_lsn, bundle, true);
+}
+
+Preserve_trx_promotion_adopt_status
+preserved_trx_promotion_bind_prewarmed_epoch_for_receiver(
+    const std::string &preserve_dir, const std::string &epoch_id,
+    const std::vector<uint64_t> &tokens, uint64_t *ready_tokens) {
+  if (ready_tokens != nullptr) *ready_tokens = 0;
+  if (preserve_dir.empty() || epoch_id.empty() || tokens.empty()) {
+    return Preserve_trx_promotion_adopt_status::INVALID_ARGUMENT;
+  }
+  if (!preserve_trx_is_enabled()) {
+    return Preserve_trx_promotion_adopt_status::NOT_ENABLED;
+  }
+
+  Preserve_trx_transfer_epoch_fact fact;
+  const Preserve_trx_transfer_status fact_status =
+      preserve_trx_transfer_read_epoch_fact(preserve_dir, epoch_id, &fact);
+  if (fact_status != Preserve_trx_transfer_status::OK ||
+      fact.target_server_uuid != server_uuid) {
+    return Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT;
+  }
+
+  std::map<uint64_t, uint64_t> fact_lsn_by_token;
+  for (const Preserve_trx_transfer_epoch_fact_token &fact_token :
+       fact.tokens) {
+    fact_lsn_by_token.emplace(fact_token.token,
+                              fact_token.source_epoch_commit_lsn);
+  }
+
+  Preserve_trx_promotion_adopt_status first_failure =
+      Preserve_trx_promotion_adopt_status::OK;
+  uint64_t local_ready_tokens = 0;
+  std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+  for (uint64_t token : tokens) {
+    if (token == 0 || fact_lsn_by_token.count(token) == 0) {
+      first_failure = Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT;
+      continue;
+    }
+    const auto key = Promotion_ready_cache_key{preserve_dir, epoch_id, token};
+    auto entry_it = g_ready_cache.find(key);
+    if (entry_it == g_ready_cache.end()) {
+      if (first_failure == Preserve_trx_promotion_adopt_status::OK) {
+        first_failure =
+            Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY;
+      }
+      continue;
+    }
+    Promotion_ready_cache_entry &entry = entry_it->second;
+    if (entry.state == Preserve_trx_promotion_ready_state::READY) {
+      ++local_ready_tokens;
+      continue;
+    }
+    if (entry.state != Preserve_trx_promotion_ready_state::
+                           PREWARMED_PENDING_FINAL_FACT) {
+      if (first_failure == Preserve_trx_promotion_adopt_status::OK) {
+        first_failure =
+            entry.state == Preserve_trx_promotion_ready_state::CORRUPT
+                ? Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT
+                : Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY;
+      }
+      continue;
+    }
+    if (!record_lock_pages_are_gate_ready(
+            entry.record_lock_pages_prewarmed, entry.record_lock_page_count,
+            entry.record_lock_prefetch_submitted_pages,
+            entry.record_lock_resident_pages)) {
+      entry.state = Preserve_trx_promotion_ready_state::APPLY_PENDING;
+      entry.reason = "record-lock pages are not resident";
+      if (first_failure == Preserve_trx_promotion_adopt_status::OK) {
+        first_failure =
+            Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY;
+      }
+      continue;
+    }
+    entry.state = Preserve_trx_promotion_ready_state::READY;
+    entry.has_epoch_fact = true;
+    entry.epoch_fact_digest = fact.fact_digest;
+    entry.required_apply_lsn = fact_lsn_by_token[token];
+    ++local_ready_tokens;
+  }
+  if (ready_tokens != nullptr) *ready_tokens = local_ready_tokens;
+  return local_ready_tokens == tokens.size()
+             ? Preserve_trx_promotion_adopt_status::OK
+             : first_failure;
 }
 
 Preserve_trx_promotion_adopt_status

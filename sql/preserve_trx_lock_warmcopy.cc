@@ -2596,6 +2596,18 @@ Preserve_trx_lock_warmcopy_drain_participant::artifact_for_thread(
   return it == m_artifacts.end() ? nullptr : &it->second;
 }
 
+bool Preserve_trx_lock_warmcopy_drain_participant::
+    phase1_record_prebuilt_blob_for_thread(uint64_t thread_id,
+                                           PrebuiltRecordLocksBlob *blob) const {
+  if (blob == nullptr) return false;
+  const auto it = m_targets.find(thread_id);
+  if (it == m_targets.end() || !it->second.has_phase1_record_prebuilt_blob) {
+    return false;
+  }
+  *blob = it->second.phase1_record_prebuilt_blob;
+  return !blob->warmcopy_id.empty() && blob->size != 0;
+}
+
 bool Preserve_trx_lock_warmcopy_drain_participant::prepare_phase1_idle_target(
     THD *target) {
   return prepare_phase1_record_scan_target(target);

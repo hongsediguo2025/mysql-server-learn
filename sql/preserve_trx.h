@@ -374,6 +374,8 @@ struct Preserve_trx_preserve_result {
   bool cleanup_completed_after_detach_failure{false};
   bool cleanup_failed_after_reattach{false};
   bool left_preserved_after_cleanup_failure{false};
+  const char *detach_failure_reason{nullptr};
+  const char *reactivate_failure_reason{nullptr};
   /* True when binlog cache semantics were logged into the snapshot. */
   bool logged_binlog_cache{false};
 };

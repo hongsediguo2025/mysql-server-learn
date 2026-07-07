@@ -331,6 +331,70 @@ class _EndpointFakeRuntime(_FakeRuntime):
         return _FakeConnection()
 
 
+class _ReceiverTransferCodecConfigRuntime(_EndpointFakeRuntime):
+    def __init__(self, credential_name: str, target_user: str):
+        super().__init__()
+        self.credential_name = credential_name
+        self.target_user = target_user
+
+    def execute(self, conn, sql, fetch=False):
+        self.sql.append(sql)
+        self.calls.append((sql, fetch))
+        if fetch and "@@global.preserve_trx_transfer_credential_name" in sql:
+            return [(self.credential_name, self.target_user)]
+        if fetch:
+            return _fake_fetch_rows(sql)
+        return ()
+
+
+class _StandbyTransferEndpointConfigRuntime(_ReceiverTransferCodecConfigRuntime):
+    def __init__(
+        self,
+        *,
+        source_uuid: str,
+        source_target_uuid: str,
+        source_artifact_mode: str = "STANDBY_TRANSFER_SAVE",
+        receiver_uuid: str,
+        receiver_target_uuid: str,
+        receiver_allowed_source_uuid: str,
+        credential_name: str = "transfer_credential",
+        target_user: str = "transfer_user",
+        receiver_preserve_dir: str = "/tmp/receiver-data/preserve",
+    ):
+        super().__init__(credential_name=credential_name, target_user=target_user)
+        self.source_uuid = source_uuid
+        self.source_target_uuid = source_target_uuid
+        self.source_artifact_mode = source_artifact_mode
+        self.receiver_uuid = receiver_uuid
+        self.receiver_target_uuid = receiver_target_uuid
+        self.receiver_allowed_source_uuid = receiver_allowed_source_uuid
+        self.receiver_preserve_dir = receiver_preserve_dir
+
+    def execute(self, conn, sql, fetch=False):
+        self.sql.append(sql)
+        self.calls.append((sql, fetch))
+        if fetch and "@@global.server_uuid" in sql:
+            if "@@global.preserve_trx_transfer_allowed_source_uuid" in sql:
+                return [
+                    (
+                        self.receiver_uuid,
+                        self.receiver_target_uuid,
+                        self.receiver_allowed_source_uuid,
+                        self.credential_name,
+                        self.target_user,
+                        self.receiver_preserve_dir,
+                    )
+                ]
+            return [
+                (self.source_uuid, self.source_target_uuid, self.source_artifact_mode)
+            ]
+        if fetch and "@@global.preserve_trx_transfer_credential_name" in sql:
+            return [(self.credential_name, self.target_user)]
+        if fetch:
+            return _fake_fetch_rows(sql)
+        return ()
+
+
 class TransferPromotionFrameTest(unittest.TestCase):
     def test_runtime_uses_pure_python_connector_for_raw_transfer_commands(self):
         capture = _ConnectorCapture()
@@ -737,6 +801,27 @@ class _ReceiverPrewarmStatusRuntime(_FakeRuntime):
                     "1",
                 ),
                 ("Preserve_trx_transfer_receiver_seal_prewarm_last_status", "0"),
+                ("Preserve_trx_transfer_phase2_bulk_bytes", "12345"),
+                ("Preserve_trx_transfer_phase2_receiver_prewarm_wait_us", "6789"),
+                ("Preserve_trx_transfer_phase2_final_metadata_fsync_count", "2"),
+                ("Preserve_trx_transfer_phase2_final_metadata_ack_us", "3000"),
+                ("Preserve_trx_transfer_phase1_business_enqueue_block_us", "0"),
+                (
+                    "Preserve_trx_transfer_receiver_ready_after_final_metadata_us",
+                    "9000",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_prewarm_backlog_at_phase2_end",
+                    "0",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_record_lock_req_residency_bytes",
+                    "278528",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_record_lock_resv_residency_bytes",
+                    "278528",
+                ),
             ]
         return super().execute(conn, sql, fetch)
 
@@ -4498,6 +4583,34 @@ class WorkloadPlanTest(unittest.TestCase):
 
         self.assertTrue(cfg.receiver_physical_copy_before_drain)
 
+    def test_standby_transfer_receiver_metrics_starts_configured_servers_first(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/rx/data/preserve",
+            source_start_command="mysqld --defaults-file=/tmp/src.cnf",
+            receiver_start_command="mysqld --defaults-file=/tmp/rx.cnf",
+        ).validate()
+        calls = []
+        runner.start_source_server_if_configured = lambda: calls.append(
+            "start_source"
+        )
+        runner.start_receiver_server_if_configured = lambda: calls.append(
+            "start_receiver"
+        )
+
+        def stop_after_preflight():
+            calls.append("preflight")
+            raise RuntimeError("stop after preflight")
+
+        runner.preflight_disk_budgets = stop_after_preflight
+
+        with self.assertRaisesRegex(RuntimeError, "stop after preflight"):
+            runner.run_standby_transfer_receiver_drain_metrics()
+
+        self.assertEqual(calls, ["start_source", "start_receiver", "preflight"])
+
     def test_receiver_preserve_artifact_counts_include_standby_and_epoch_fact(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             preserve_dir = Path(tmpdir) / "preserve"
@@ -4539,6 +4652,13 @@ class WorkloadPlanTest(unittest.TestCase):
                 scenario="standby_transfer_receiver_drain_metrics",
                 cycles=1,
                 sessions=2,
+                statements_per_tx=100000,
+                seed_rows_per_table_per_session=100000,
+                lockset_batch_size=100000,
+                lockset_session_table_shards=True,
+                lockset_noop_update=True,
+                lockset_touch_one_row=True,
+                lockset_minimal_table=True,
                 receiver_unix_socket="/tmp/receiver.sock",
                 receiver_preserve_dir=str(Path(tmpdir) / "preserve"),
                 report_json=str(report_path),
@@ -4555,6 +4675,17 @@ class WorkloadPlanTest(unittest.TestCase):
                     phase2_table_live_export_target_count=0,
                     phase2_mdl_live_export_target_count=0,
                     phase2_savepoint_live_export_target_count=0,
+                    phase2_target_pin_us=111,
+                    phase2_target_worker_wall_us=222,
+                    phase2_target_result_collect_us=333,
+                    phase2_target_deferred_dir_fsync_us=444,
+                    phase2_transfer_commit_epoch_us=555,
+                    source_phase2_transfer_bulk_bytes=666,
+                    source_phase2_transfer_snapshot_bundle_bytes=777,
+                    source_phase2_transfer_snapshot_bundle_count=8,
+                    source_phase2_transfer_final_metadata_frame_count=9,
+                    source_phase2_transfer_final_metadata_bytes=1000,
+                    source_phase2_transfer_final_metadata_ack_us=1100,
                 )
             ]
             runner.receiver_artifact_counts = {
@@ -4584,6 +4715,15 @@ class WorkloadPlanTest(unittest.TestCase):
                 seal_prewarm_success_tokens=4,
                 seal_prewarm_not_ready_tokens=1,
                 seal_prewarm_last_status=0,
+                phase2_transfer_bulk_bytes=12345,
+                phase2_receiver_prewarm_wait_us=6789,
+                phase2_final_metadata_fsync_count=2,
+                phase2_transfer_final_metadata_ack_us=3000,
+                phase1_business_enqueue_block_us=0,
+                ready_after_final_metadata_us=9000,
+                prewarm_backlog_at_phase2_end=0,
+                record_lock_required_residency_bytes=278528,
+                record_lock_reserved_residency_bytes=278528,
             )
 
             runner.write_standby_transfer_receiver_report(
@@ -4594,6 +4734,14 @@ class WorkloadPlanTest(unittest.TestCase):
             report = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertTrue(report["success"])
             self.assertEqual(report["scenario"], "standby_transfer_receiver_drain_metrics")
+            self.assertEqual(report["workload_sessions"], 2)
+            self.assertEqual(report["workload_statements_per_tx"], 100000)
+            self.assertEqual(report["workload_lockset_batch_size"], 100000)
+            self.assertEqual(report["workload_seed_rows_per_table_per_session"], 100000)
+            self.assertTrue(report["workload_lockset_session_table_shards"])
+            self.assertTrue(report["workload_lockset_noop_update"])
+            self.assertTrue(report["workload_lockset_touch_one_row"])
+            self.assertTrue(report["workload_lockset_minimal_table"])
             self.assertEqual(report["receiver_standby_pending_tokens"], 2)
             self.assertEqual(report["standby_tokens"], 2)
             self.assertEqual(report["receiver_epoch_fact_count"], 1)
@@ -4602,7 +4750,44 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertEqual(report["phase2_total_samples_ms"], [34.0])
             self.assertEqual(report["source_phase2_total_us"], [34000])
             self.assertEqual(report["source_phase2_end_us"], 1_000_000)
+            self.assertEqual(report["phase2_transfer_bulk_bytes"], 12345)
+            self.assertEqual(report["phase2_receiver_prewarm_wait_us"], 6789)
+            self.assertEqual(report["phase2_final_metadata_fsync_count"], 2)
+            self.assertEqual(report["phase2_transfer_final_metadata_ack_us"], 3000)
+            self.assertEqual(report["source_phase2_target_pin_us_samples"], [111])
+            self.assertEqual(
+                report["source_phase2_target_worker_wall_us_samples"], [222]
+            )
+            self.assertEqual(
+                report["source_phase2_target_result_collect_us_samples"], [333]
+            )
+            self.assertEqual(
+                report["source_phase2_target_deferred_dir_fsync_us_samples"], [444]
+            )
+            self.assertEqual(report["source_phase2_transfer_commit_epoch_us_samples"], [555])
+            self.assertEqual(report["source_phase2_transfer_bulk_bytes_samples"], [666])
+            self.assertEqual(
+                report["source_phase2_transfer_snapshot_bundle_bytes_samples"],
+                [777],
+            )
+            self.assertEqual(
+                report["source_phase2_transfer_snapshot_bundle_count_samples"], [8]
+            )
+            self.assertEqual(
+                report["source_phase2_transfer_final_metadata_frame_count_samples"],
+                [9],
+            )
+            self.assertEqual(
+                report["source_phase2_transfer_final_metadata_bytes_samples"], [1000]
+            )
+            self.assertEqual(
+                report["source_phase2_transfer_final_metadata_ack_us_samples"],
+                [1100],
+            )
+            self.assertEqual(report["phase1_business_enqueue_block_us"], 0)
             self.assertEqual(report["receiver_ready_after_source_phase2_end_us"], 42000)
+            self.assertEqual(report["receiver_ready_after_final_metadata_us"], 9000)
+            self.assertEqual(report["receiver_prewarm_backlog_at_phase2_end"], 0)
             self.assertEqual(
                 report["receiver_ready_after_source_phase2_summary_us"],
                 {
@@ -4633,6 +4818,8 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertEqual(report["receiver_record_lock_page_count"], 17)
             self.assertEqual(report["receiver_record_lock_resident_pages"], 17)
             self.assertEqual(report["receiver_record_cold_gets"], 0)
+            self.assertEqual(report["receiver_record_lock_required_residency_bytes"], 278528)
+            self.assertEqual(report["receiver_record_lock_reserved_residency_bytes"], 278528)
             self.assertEqual(report["receiver_seal_prewarm_tokens"], 5)
             self.assertEqual(report["receiver_seal_prewarm_success_tokens"], 4)
             self.assertEqual(report["receiver_seal_prewarm_not_ready_tokens"], 1)
@@ -4680,7 +4867,7 @@ class WorkloadPlanTest(unittest.TestCase):
                 expected_standby_pending=2
             )
 
-    def test_standby_transfer_receiver_readiness_gate_enforces_lag_limit(self):
+    def test_standby_transfer_receiver_readiness_gate_enforces_final_metadata_lag_limit(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.config = HarnessConfig(
             scenario="standby_transfer_receiver_drain_metrics",
@@ -4721,15 +4908,228 @@ class WorkloadPlanTest(unittest.TestCase):
             seal_prewarm_success_tokens=2,
             seal_prewarm_not_ready_tokens=0,
             seal_prewarm_last_status=0,
+            ready_after_final_metadata_us=11_000,
         )
-        runner.receiver_ready_after_source_phase2_end_us = 11_000
+        runner.receiver_ready_after_source_phase2_end_us = 1_000
 
         with self.assertRaisesRegex(AssertionError, "receiver readiness lag"):
             runner.validate_standby_transfer_receiver_readiness(
                 expected_standby_pending=2
             )
 
-    def test_standby_transfer_receiver_readiness_gate_requires_phase1_overlap(self):
+    def test_standby_transfer_receiver_readiness_gate_uses_receiver_local_final_metadata_lag(
+        self,
+    ):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+            max_receiver_ready_after_phase2_ms=10,
+        ).validate()
+        runner.warmcopy_drain_metrics = [
+            WarmcopyDrainMetrics(
+                phase2_pause_ms=1.0,
+                full_copy_to_count=0,
+                phase2_total_ms=2.0,
+                phase2_end_monotonic_us=1_000_000,
+            )
+        ]
+        runner.receiver_artifact_counts = {
+            "snapshot_tokens": 2,
+            "standby_pending_tokens": 2,
+            "external_blob_tokens": 2,
+            "epoch_fact_count": 1,
+            "epoch_commit_count": 1,
+        }
+        runner.receiver_prewarm_metrics = ReceiverPrewarmMetrics(
+            auto_prewarm_tokens=2,
+            auto_prewarm_ready_tokens=2,
+            auto_prewarm_not_ready_tokens=0,
+            auto_prewarm_last_status=0,
+            ready_monotonic_us=1_011_000,
+            first_frame_monotonic_us=999_000,
+            last_object_seal_monotonic_us=1_006_000,
+            prewarm_start_monotonic_us=999_500,
+            prewarm_end_monotonic_us=1_011_000,
+            record_lock_page_count=0,
+            record_lock_resident_pages=0,
+            record_lock_cold_page_gets=0,
+            seal_prewarm_tokens=2,
+            seal_prewarm_success_tokens=2,
+            seal_prewarm_not_ready_tokens=0,
+            seal_prewarm_last_status=0,
+            ready_after_final_metadata_us=5_000,
+        )
+        runner.receiver_ready_after_source_phase2_end_us = 999_999_999
+
+        runner.validate_standby_transfer_receiver_readiness(
+            expected_standby_pending=2
+        )
+
+    def test_standby_transfer_receiver_readiness_gate_rejects_lockset_without_record_pages(
+        self,
+    ):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            statements_per_tx=100000,
+            seed_rows_per_table_per_session=100000,
+            lockset_batch_size=100000,
+            lockset_noop_update=True,
+            lockset_touch_one_row=True,
+            lockset_minimal_table=True,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+            max_receiver_ready_after_phase2_ms=100,
+        ).validate()
+        runner.warmcopy_drain_metrics = [
+            WarmcopyDrainMetrics(
+                phase2_pause_ms=1.0,
+                full_copy_to_count=0,
+                phase2_total_ms=2.0,
+                phase2_end_monotonic_us=1_000_000,
+            )
+        ]
+        runner.receiver_artifact_counts = {
+            "snapshot_tokens": 2,
+            "standby_pending_tokens": 2,
+            "external_blob_tokens": 2,
+            "epoch_fact_count": 1,
+            "epoch_commit_count": 1,
+        }
+        runner.receiver_prewarm_metrics = ReceiverPrewarmMetrics(
+            auto_prewarm_tokens=2,
+            auto_prewarm_ready_tokens=2,
+            auto_prewarm_not_ready_tokens=0,
+            auto_prewarm_last_status=0,
+            ready_monotonic_us=1_010_000,
+            first_frame_monotonic_us=950_000,
+            last_object_seal_monotonic_us=990_000,
+            prewarm_start_monotonic_us=960_000,
+            prewarm_end_monotonic_us=1_010_000,
+            record_lock_page_count=0,
+            record_lock_resident_pages=0,
+            record_lock_cold_page_gets=0,
+            seal_prewarm_tokens=2,
+            seal_prewarm_success_tokens=2,
+            seal_prewarm_not_ready_tokens=0,
+            seal_prewarm_last_status=0,
+            ready_after_final_metadata_us=5_000,
+        )
+        runner.receiver_ready_after_source_phase2_end_us = 10_000
+
+        with self.assertRaisesRegex(AssertionError, "record-lock page evidence"):
+            runner.validate_standby_transfer_receiver_readiness(
+                expected_standby_pending=2
+            )
+
+    def test_standby_transfer_receiver_readiness_gate_requires_overlap_before_source_phase2_end(
+        self,
+    ):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+            max_receiver_ready_after_phase2_ms=100,
+        ).validate()
+        runner.warmcopy_drain_metrics = [
+            WarmcopyDrainMetrics(
+                phase2_pause_ms=1.0,
+                full_copy_to_count=0,
+                phase2_total_ms=2.0,
+                phase2_end_monotonic_us=1_000_000,
+            )
+        ]
+        runner.receiver_artifact_counts = {
+            "snapshot_tokens": 2,
+            "standby_pending_tokens": 2,
+            "external_blob_tokens": 2,
+            "epoch_fact_count": 1,
+            "epoch_commit_count": 1,
+        }
+        runner.receiver_prewarm_metrics = ReceiverPrewarmMetrics(
+            auto_prewarm_tokens=2,
+            auto_prewarm_ready_tokens=2,
+            auto_prewarm_not_ready_tokens=0,
+            auto_prewarm_last_status=0,
+            ready_monotonic_us=1_010_000,
+            first_frame_monotonic_us=1_001_000,
+            last_object_seal_monotonic_us=1_006_000,
+            prewarm_start_monotonic_us=1_002_000,
+            prewarm_end_monotonic_us=1_010_000,
+            record_lock_page_count=0,
+            record_lock_resident_pages=0,
+            record_lock_cold_page_gets=0,
+            seal_prewarm_tokens=2,
+            seal_prewarm_success_tokens=2,
+            seal_prewarm_not_ready_tokens=0,
+            seal_prewarm_last_status=0,
+            ready_after_final_metadata_us=5_000,
+        )
+        runner.receiver_ready_after_source_phase2_end_us = 10_000
+
+        with self.assertRaisesRegex(AssertionError, "did not overlap"):
+            runner.validate_standby_transfer_receiver_readiness(
+                expected_standby_pending=2
+            )
+
+    def test_standby_transfer_receiver_readiness_allows_late_prewarm_when_ready_after_final_metadata(
+        self,
+    ):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+            max_receiver_ready_after_phase2_ms=100,
+        ).validate()
+        runner.warmcopy_drain_metrics = [
+            WarmcopyDrainMetrics(
+                phase2_pause_ms=1.0,
+                full_copy_to_count=0,
+                phase2_total_ms=2.0,
+                phase2_end_monotonic_us=1_000_000,
+            )
+        ]
+        runner.receiver_artifact_counts = {
+            "snapshot_tokens": 2,
+            "standby_pending_tokens": 2,
+            "external_blob_tokens": 2,
+            "epoch_fact_count": 1,
+            "epoch_commit_count": 1,
+        }
+        runner.receiver_prewarm_metrics = ReceiverPrewarmMetrics(
+            auto_prewarm_tokens=2,
+            auto_prewarm_ready_tokens=2,
+            auto_prewarm_not_ready_tokens=0,
+            auto_prewarm_last_status=0,
+            ready_monotonic_us=1_010_000,
+            first_frame_monotonic_us=999_000,
+            last_object_seal_monotonic_us=1_006_000,
+            prewarm_start_monotonic_us=1_000_600,
+            prewarm_end_monotonic_us=1_010_000,
+            record_lock_page_count=0,
+            record_lock_resident_pages=0,
+            record_lock_cold_page_gets=0,
+            seal_prewarm_tokens=2,
+            seal_prewarm_success_tokens=2,
+            seal_prewarm_not_ready_tokens=0,
+            seal_prewarm_last_status=0,
+            ready_after_final_metadata_us=42,
+        )
+        runner.receiver_ready_after_source_phase2_end_us = 10_000
+
+        runner.validate_standby_transfer_receiver_readiness(
+            expected_standby_pending=2
+        )
+
+    def test_standby_transfer_receiver_readiness_gate_requires_phase1_evidence(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.config = HarnessConfig(
             scenario="standby_transfer_receiver_drain_metrics",
@@ -4759,9 +5159,9 @@ class WorkloadPlanTest(unittest.TestCase):
             auto_prewarm_not_ready_tokens=0,
             auto_prewarm_last_status=0,
             ready_monotonic_us=1_020_000,
-            first_frame_monotonic_us=1_010_000,
+            first_frame_monotonic_us=0,
             last_object_seal_monotonic_us=1_015_000,
-            prewarm_start_monotonic_us=1_012_000,
+            prewarm_start_monotonic_us=0,
             prewarm_end_monotonic_us=1_020_000,
             record_lock_page_count=0,
             record_lock_resident_pages=0,
@@ -5184,7 +5584,7 @@ class WorkloadPlanTest(unittest.TestCase):
                 scenario_name="physical_standby_promotion_gate_scaled",
             )
 
-    def test_physical_standby_scaled_runner_can_start_source_and_receiver(self):
+    def test_physical_standby_scaled_runner_delegates_start_to_transfer_drain(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.config = HarnessConfig(
             scenario="physical_standby_promotion_gate_scaled",
@@ -5197,12 +5597,6 @@ class WorkloadPlanTest(unittest.TestCase):
             receiver_restart_command="mysqld --defaults-file=/tmp/rx.cnf --skip-log-bin",
         ).validate()
         calls = []
-        runner.start_source_server_if_configured = lambda: calls.append(
-            "start_source"
-        )
-        runner.start_receiver_server_if_configured = lambda: calls.append(
-            "start_receiver"
-        )
         runner.run_standby_transfer_receiver_drain_metrics = (
             lambda: calls.append("transfer_drain")
         )
@@ -5229,8 +5623,6 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                "start_source",
-                "start_receiver",
                 "transfer_drain",
                 "shutdown_receiver",
                 "materialize",
@@ -5250,7 +5642,10 @@ class WorkloadPlanTest(unittest.TestCase):
             standby_transfer_password="transfer_secret",
             standby_transfer_credential_name="transfer_credential",
         ).validate()
-        runner.runtime = _EndpointFakeRuntime()
+        runner.runtime = _ReceiverTransferCodecConfigRuntime(
+            credential_name="transfer_credential",
+            target_user="transfer_user",
+        )
 
         runner.configure_standby_transfer_credentials()
 
@@ -5263,6 +5658,123 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertEqual(
             runner.runtime.endpoint_calls[0]["unix_socket"], "/tmp/receiver.sock"
         )
+
+    def test_configure_standby_transfer_credentials_requires_receiver_codec_options(
+        self,
+    ):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+            standby_transfer_user="transfer_user",
+            standby_transfer_password="transfer_secret",
+            standby_transfer_credential_name="transfer_credential",
+        ).validate()
+        runner.runtime = _ReceiverTransferCodecConfigRuntime(
+            credential_name="",
+            target_user="",
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "receiver transfer codec configuration is incomplete",
+        ):
+            runner.configure_standby_transfer_credentials()
+
+    def test_standby_transfer_endpoint_config_accepts_matching_uuids(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+            standby_transfer_user="transfer_user",
+            standby_transfer_password="transfer_secret",
+            standby_transfer_credential_name="transfer_credential",
+        ).validate()
+        runner.runtime = _StandbyTransferEndpointConfigRuntime(
+            source_uuid="source-uuid",
+            source_target_uuid="receiver-uuid",
+            receiver_uuid="receiver-uuid",
+            receiver_target_uuid="receiver-uuid",
+            receiver_allowed_source_uuid="source-uuid",
+        )
+
+        runner.validate_standby_transfer_endpoint_config()
+
+    def test_standby_transfer_endpoint_config_rejects_target_uuid_mismatch(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+            standby_transfer_user="transfer_user",
+            standby_transfer_password="transfer_secret",
+            standby_transfer_credential_name="transfer_credential",
+        ).validate()
+        runner.runtime = _StandbyTransferEndpointConfigRuntime(
+            source_uuid="source-uuid",
+            source_target_uuid="configured-target-uuid",
+            receiver_uuid="actual-receiver-uuid",
+            receiver_target_uuid="configured-target-uuid",
+            receiver_allowed_source_uuid="source-uuid",
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "standby transfer endpoint UUID configuration is inconsistent",
+        ):
+            runner.validate_standby_transfer_endpoint_config()
+
+    def test_standby_transfer_endpoint_config_requires_standby_artifact_mode(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+            standby_transfer_user="transfer_user",
+            standby_transfer_password="transfer_secret",
+            standby_transfer_credential_name="transfer_credential",
+        ).validate()
+        runner.runtime = _StandbyTransferEndpointConfigRuntime(
+            source_uuid="source-uuid",
+            source_target_uuid="receiver-uuid",
+            source_artifact_mode="LOCAL_CARRIER",
+            receiver_uuid="receiver-uuid",
+            receiver_target_uuid="receiver-uuid",
+            receiver_allowed_source_uuid="source-uuid",
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "source artifact mode 'LOCAL_CARRIER' != 'STANDBY_TRANSFER_SAVE'",
+        ):
+            runner.validate_standby_transfer_endpoint_config()
+
+    def test_standby_transfer_endpoint_config_rejects_receiver_preserve_dir_mismatch(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/rx/data/#preserve_trx",
+            standby_transfer_user="transfer_user",
+            standby_transfer_password="transfer_secret",
+            standby_transfer_credential_name="transfer_credential",
+        ).validate()
+        runner.runtime = _StandbyTransferEndpointConfigRuntime(
+            source_uuid="source-uuid",
+            source_target_uuid="receiver-uuid",
+            receiver_uuid="receiver-uuid",
+            receiver_target_uuid="receiver-uuid",
+            receiver_allowed_source_uuid="source-uuid",
+            receiver_preserve_dir="/tmp/rx/data/preserve",
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "receiver preserve dir mismatch",
+        ):
+            runner.validate_standby_transfer_endpoint_config()
 
     def test_cli_bulk_lockset_flags_are_applied(self):
         cfg = parse_args(
@@ -6281,6 +6793,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             error_log.write(
                 "PRESERVE: warm-copy drain metrics "
                 "phase2_pause_us=123000 phase2_total_us=2500000 "
+                "phase2_binlog_preflight_us=1700000 "
                 "phase2_end_monotonic_us=987654321 "
                 "phase2_slo_guaranteed=0 "
                 "phase2_slo_reason=temp_table_manifest_phase2_build "
@@ -6292,7 +6805,18 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
                 "materialized_lock_payload_bytes_in_phase2=0 "
                 "phase2_table_live_export_target_count=2 "
                 "phase2_mdl_live_export_target_count=3 "
-                "phase2_savepoint_live_export_target_count=4\n"
+                "phase2_savepoint_live_export_target_count=4 "
+                "phase2_target_pin_us=111 "
+                "phase2_target_worker_wall_us=222 "
+                "phase2_target_result_collect_us=333 "
+                "phase2_target_deferred_dir_fsync_us=444 "
+                "phase2_transfer_commit_epoch_us=555 "
+                "source_phase2_transfer_bulk_bytes=666 "
+                "source_phase2_transfer_snapshot_bundle_bytes=777 "
+                "source_phase2_transfer_snapshot_bundle_count=8 "
+                "source_phase2_transfer_final_metadata_frame_count=9 "
+                "source_phase2_transfer_final_metadata_bytes=1000 "
+                "source_phase2_transfer_final_metadata_ack_us=1100\n"
             )
             error_log.flush()
             runner.config = HarnessConfig(server_error_log=error_log.name)
@@ -6302,6 +6826,7 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertIsNotNone(metrics)
         self.assertEqual(metrics.phase2_pause_ms, 123.0)
         self.assertEqual(metrics.phase2_total_ms, 2500.0)
+        self.assertEqual(metrics.phase2_binlog_preflight_ms, 1700.0)
         self.assertEqual(metrics.phase2_end_monotonic_us, 987654321)
         self.assertEqual(metrics.phase2_slo_guaranteed, 0)
         self.assertEqual(
@@ -6314,6 +6839,17 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertEqual(metrics.phase2_full_lock_scan_count, 0)
         self.assertEqual(metrics.materialized_lock_payload_bytes_in_phase2, 0)
         self.assertEqual(metrics.lock_warmcopy_live_fallback_count(), 10)
+        self.assertEqual(metrics.phase2_target_pin_us, 111)
+        self.assertEqual(metrics.phase2_target_worker_wall_us, 222)
+        self.assertEqual(metrics.phase2_target_result_collect_us, 333)
+        self.assertEqual(metrics.phase2_target_deferred_dir_fsync_us, 444)
+        self.assertEqual(metrics.phase2_transfer_commit_epoch_us, 555)
+        self.assertEqual(metrics.source_phase2_transfer_bulk_bytes, 666)
+        self.assertEqual(metrics.source_phase2_transfer_snapshot_bundle_bytes, 777)
+        self.assertEqual(metrics.source_phase2_transfer_snapshot_bundle_count, 8)
+        self.assertEqual(metrics.source_phase2_transfer_final_metadata_frame_count, 9)
+        self.assertEqual(metrics.source_phase2_transfer_final_metadata_bytes, 1000)
+        self.assertEqual(metrics.source_phase2_transfer_final_metadata_ack_us, 1100)
 
     def test_drain_target_counter_rejection_parser_reads_latest_metric_after_offset(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -6502,6 +7038,15 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertEqual(metrics.record_lock_page_count, 17)
         self.assertEqual(metrics.record_lock_resident_pages, 16)
         self.assertEqual(metrics.record_lock_cold_page_gets, 1)
+        self.assertEqual(metrics.phase2_transfer_bulk_bytes, 12345)
+        self.assertEqual(metrics.phase2_receiver_prewarm_wait_us, 6789)
+        self.assertEqual(metrics.phase2_final_metadata_fsync_count, 2)
+        self.assertEqual(metrics.phase2_transfer_final_metadata_ack_us, 3000)
+        self.assertEqual(metrics.phase1_business_enqueue_block_us, 0)
+        self.assertEqual(metrics.ready_after_final_metadata_us, 9000)
+        self.assertEqual(metrics.prewarm_backlog_at_phase2_end, 0)
+        self.assertEqual(metrics.record_lock_required_residency_bytes, 278528)
+        self.assertEqual(metrics.record_lock_reserved_residency_bytes, 278528)
         self.assertEqual(metrics.seal_prewarm_tokens, 5)
         self.assertEqual(metrics.seal_prewarm_success_tokens, 4)
         self.assertEqual(metrics.seal_prewarm_not_ready_tokens, 1)

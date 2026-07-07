@@ -15,10 +15,42 @@ transfer，receiver 端边收边 durable spool、install、prewarm，并在 sour
 receiver readiness lag ~= receiver_ready_us - source_phase2_end_us
 ```
 
+本设计采用两个彼此解耦的同步边界：
+
+- **source drain 同步边界**：source 只等待 receiver 把 required frame、object 和 final
+  metadata durable received。ACK 只表达“receiver crash 后仍能重放/继续处理”，不表达
+  “receiver 已完成 prewarm”。
+- **receiver readiness 边界**：receiver 本地必须边收边实时 prewarm，但 prewarm 是
+  receiver worker pipeline 的状态，不参与 source drain 的同步等待。它通过
+  `receiver_ready_after_source_phase2_end_us` 验收。
+
+因此本设计的性能目标分成两条硬线：
+
+```text
+source phase2_total_us                     ~= 1s 到 2s 级别
+receiver_ready_after_source_phase2_end_us  <= 100000us  # 默认 100ms
+receiver_ready_after_final_metadata_us     <= 100000us  # 跨机权威口径
+phase1_business_enqueue_block_us           == 0
+```
+
+第一条约束 source 端业务阻塞窗口，第二条约束 receiver 在 drain phase 2 完成后是否已经
+具备 future promotion-ready 状态。二者不能互相“借时间”：source phase 2 不允许为了等
+prewarm 而延长，receiver 也不能把未完成 prewarm 隐藏到未来 promotion gate 里现场补冷路径。
+
+跨机器验收时，`receiver_ready_after_final_metadata_us` 是同机时钟权威指标。它使用 receiver
+本地的 `receiver_final_metadata_durable_us` 和 `receiver_ready_us` 计算。只有 source/receiver
+同机、时钟已校准，或报告包含 RTT/clock-skew 上界时，`receiver_ready_after_source_phase2_end_us`
+才可作为强验收指标。
+
 为了达成这个目标，transfer 和 prewarm 必须前移：
 
 - source drain phase 1 一开始就打开 standby transfer epoch。
-- receiver 收到 frame 后先 durable spool，再并行 seal/install/prewarm。
+- source phase 1 后台 transfer pipeline 负责持续发送 bulk data；业务线程和 drain phase 1
+  不等待 receiver prewarm，不等待 receiver 完整处理。
+- 业务/DML 线程对 transfer queue 只能 try-only、零等待；失败只标记 dirty/lagged，不 sleep、
+  不 retry、不做大对象构造。
+- receiver 收到 frame 后先 durable spool，再 ACK source 后台 sender；seal/install/prewarm
+  在 receiver 本地 worker 中实时推进。
 - phase 2 只发送 tail/final descriptor、epoch fact、commit marker 等小对象。
 - phase 2 完成时，receiver 应已经具备 promotion-ready cache；最多只剩 final fact
   绑定、状态翻转和指标发布等毫秒级尾工作。
@@ -104,6 +136,32 @@ transfer frame、shared recover/adopt kernel 等基础件，但以下目标契�
 | durable frame spool | 当前有 object staging 文件和 in-memory receiver registry，但没有可 replay 的 durable frame spool | receiver crash 后必须能从 durable frame log 重建 receiving/sealed/prewarm 状态，否则不能声明 crash-safe streaming transfer |
 | frame sequencing | frame 结构已有 `sequence` 字段，但本文档原始幂等 key 未把 `sequence` 写入，并且未定义乱序/gap 处理 | streaming 协议必须定义 epoch/token 内 sequence 重组、gap detection 和 retransmit/fail-closed 语义 |
 | record-lock residency | ready cache 记录 page resident 状态，但还没有定义从 prewarm 到 gate 的 page retention/pin 策略 | 如果要求 `cold_gets=0`，必须有 pin/保留池/短窗口重验策略；否则 gate 只能把 residency miss 当 not-ready |
+| source phase 2 等待边界 | 当前 `publish_bundle()` 在 phase 2 per-target preserve 中 build portable objects、同步发送 chunks/seal，并且 receiver seal/commit 路径可同步 prewarm | phase 2 只能等待 receiver durable received final metadata；bulk object 发送、seal-time prewarm、commit-time prewarm 必须前移或异步 |
+| receiver prewarm ACK 语义 | 当前 `SEAL_OBJECT` 处理在返回前调用 prewarm，`COMMIT_EPOCH` 后也会同步调用 epoch prewarm | ACK 必须只表示 durable received / durable installed；prewarm 必须实时发生但不能成为 ACK 前置条件 |
+
+### 2.6 当前 22s phase2 的代码归因
+
+在 full-pressure receiver/prewarm 验证中，source 端曾出现 `phase2_total_us` 约 22 秒。
+该现象不能归因于 record lock warmcopy：该报告中的 record locks 已命中 prebuilt artifact，
+`phase2_full_lock_scan_count=0`、`materialized_lock_payload_bytes_in_phase2=0`、
+`phase2_record_materialized_target_count=0`，record seal 只在毫秒级。
+
+代码上的主要耦合点是：
+
+- `Preserve_batch_quiesced_idle_target` 在 phase 2 target preserve 中把
+  `batch_transfer_source_session` 传给 `preserve_trx_preserve_attached_transaction()`。
+- `preserve_trx_preserve_attached_transaction()` 的 snapshot write/store 子阶段调用
+  `artifact_sink->publish_bundle()`。
+- `Preserve_trx_transfer_session_artifact_sink::publish_bundle()` 会 build portable objects，
+  分 chunk 同步 `write_object_chunk()`，然后同步 `seal_object()`。
+- receiver `SEAL_OBJECT` 处理当前会在返回前调用
+  `preserved_trx_promotion_prewarm_staged_bundle_for_receiver()`。
+- source phase 2 末尾还会同步调用 `batch_transfer_source_session->commit_epoch()`，receiver
+  `COMMIT_EPOCH` 处理当前会调用 `prewarm_committed_epoch_tokens()`。
+
+因此当前长 phase2 的根因是 standby transfer / receiver prewarm 与 source phase 2 的同步
+耦合，而不是 record lock warmcopy 本身失效。后续实现必须把这些耦合从 source phase 2
+移出，否则无法稳定把 `phase2_total_us` 控制在 1s 到 2s 级别。
 
 ## 3. 目标状态
 
@@ -167,6 +225,36 @@ receiver_ready_after_source_phase2_end_us <= 100000  # 100ms 级默认目标
 
 如果某个 workload 需要更大的尾延迟阈值，应在 E2E/NFR profile 中显式写出，并报告
 P50/P95/P99/max；不能把真正升主耗时或 SQL resume 耗时混进这个指标。
+
+source 端 phase 2 另有独立目标：
+
+```text
+source_phase2_total_us ~= 1,000,000 到 2,000,000
+```
+
+`source_phase2_total_us` 是 E2E/NFR 报告字段名；server 内部日志中已有的
+`phase2_total_us` 表达同一 source drain phase 2 窗口。实现插桩时应保留 server 侧
+`phase2_total_us`，并在 E2E JSON 中映射为 `source_phase2_total_us`，避免同一指标产生两个
+不同语义。
+
+该目标只覆盖 source drain phase 2 的业务阻塞窗口。它允许等待 receiver 确认 final
+metadata durable received，但不允许等待 receiver prewarm 完成。如果 source phase 2 超过
+该目标，必须用分段指标定位是本地 quiesce/prepare/detach、final metadata publish、receiver
+durable ACK，还是误把 bulk transfer/prewarm 留在 phase 2。
+
+release 证据必须同时报告两组指标：
+
+| 指标 | 目标 | 失败含义 |
+|---|---|---|
+| `source_phase2_total_us` | 1s 到 2s 级别 | source 业务阻塞仍过长 |
+| `phase2_transfer_bulk_bytes` | 接近 0 | bulk data 没有前移到 phase 1 |
+| `phase2_transfer_final_bytes` | 小对象规模 | final metadata 正常 |
+| `phase2_receiver_prewarm_wait_us` | 0 | phase 2 仍同步等待 receiver prewarm |
+| `receiver_ready_after_source_phase2_end_us` | 默认 <=100ms | receiver 准备链路滞后 |
+| `receiver_record_cold_gets` | 0 | receiver ready cache 不完整或 page retention 不足 |
+
+其中 `phase2_receiver_prewarm_wait_us` 是强制诊断指标：如果它非 0，说明实现违反了
+“DRAIN 不等 prewarm”原则，即使总耗时偶然低于 2s，也不能认为边界正确。
 
 ### 4.2 下游背景指标
 
@@ -338,7 +426,58 @@ receiver 只有在 frame durable append 后才能 ACK。
 parse/auth -> durable spool append + fsync policy -> update in-memory registry -> ACK
 ```
 
-ACK 不代表 object 已 prewarm，只代表 receiver crash 后可以从 spool 恢复该 frame。
+ACK 不代表 object 已 prewarm，只代表 receiver crash 后可以从 spool 恢复该 frame。更精确地说，
+ACK 分为三类：
+
+| ACK 类型 | 允许 source 等待吗 | 含义 | 不包含的含义 |
+|---|---|---|---|
+| `FRAME_DURABLE_ACK` | phase 1 后台 sender 可等待或重试；业务线程和 drain phase 1 不等待 | frame 已 durable append，receiver 可 replay | 不表示 object 已 install，不表示 prewarm 完成 |
+| `OBJECT_DURABLE_ACK` | phase 1 后台 sender 可等待或重试；source phase 2 不应等待 bulk object ACK | object chunk 已全部 durable，seal digest 已验证，object 可安装或已安装 | 不表示 ready cache 完成 |
+| `FINAL_METADATA_DURABLE_ACK` | source phase 2 可以等待 | final descriptor、final digest、epoch fact、commit marker 等小对象已 durable received / durable published | 不表示 receiver prewarm 完成，不表示 future promotion gate 已执行 |
+
+source drain phase 2 只能等待 `FINAL_METADATA_DURABLE_ACK`，且该 ACK 的工作量必须与
+token 数和 final metadata 大小相关，不能与 record-lock bitmap page 数、binlog blob size、
+temp sidecar size 或 receiver prewarm 耗时线性相关。bulk object 的
+`FRAME_DURABLE_ACK`/`OBJECT_DURABLE_ACK` 属于 phase 1 后台 transfer pipeline；如果它们在
+phase 2 才发生，该 profile 不能声明 phase2 1s 到 2s 目标达成。
+
+`FINAL_METADATA_DURABLE_ACK` 必须使用 group fsync / segmented spool 摊销。1000 token profile
+不得逐 token fsync。推荐约束：
+
+```text
+phase2_final_metadata_fsync_count <= O(1) + ceil(tokens / final_metadata_tokens_per_segment)
+phase2_transfer_final_metadata_ack_us <= 300000
+final_metadata_tokens_per_segment >= 256
+```
+
+如果平台 fsync 延迟较高，必须增大 segment 或采用专用 group commit；不能把 receiver final
+metadata 写入退化成 1000 次独立 fsync。
+
+phase 2 的 tail 必须受 cap 约束。final descriptor、digest、epoch fact、commit marker、小
+fence 摘要计入 `phase2_transfer_final_bytes`；与业务写速率、lock count、blob size 或 temp
+sidecar size 线性相关的 tail chunk 都计入 `phase2_transfer_bulk_bytes`，不得在 phase 2 发送。
+推荐默认：
+
+```text
+phase2_tail_final_bytes_per_token <= 64 KiB
+phase2_tail_final_bytes_per_epoch <= 64 MiB
+```
+
+超过 cap 的 token 标记 `TRANSFER_LAGGED` 或 `TRANSFER_INCOMPLETE`，source phase2 不补发 bulk。
+
+receiver 实时 prewarm 的完成情况必须通过独立状态报告：
+
+```text
+receiver_prewarm_started_us
+receiver_prewarm_finished_us
+receiver_ready_after_source_phase2_end_us
+receiver_ready_after_final_metadata_us
+receiver_ready_tokens
+receiver_not_ready_tokens
+receiver_record_cold_gets
+```
+
+这些状态可以让控制面判断 receiver 是否 ready，但不能改变 source phase 2 的等待边界。
 
 ### 7.4 Frame 顺序和 torn-frame 检测
 
@@ -399,12 +538,62 @@ abort_epoch(reason)
 该 sink 不拥有 preserve 正确性判断；它只把已经由各 participant 产生的 artifact 事实
 实时传给 receiver。
 
+该 sink 也不能在业务线程或 drain phase 1 主流程里同步等待 receiver。推荐实现分成三层：
+
+1. **artifact producer**：binlog/lock/temp/session participant 产生稳定 chunk、descriptor 或
+   tail candidate。
+2. **local enqueue**：把 frame/chunk 放入 source 本地 bounded transfer queue。入队失败或
+   队列超过容量时，token 标记 transfer not-ready/fail-closed；不得等待、sleep 或 retry
+   receiver 路径。
+3. **background sender**：负责网络发送、durable ACK 重试、receiver backpressure、abort。
+
+phase 1 的主流程只能等待本地 enqueue 的确定结果，不能等待 receiver 完整处理。若后台 sender
+滞后，phase 2 到来时只能根据已 durable received 的 token/object 集合决定该 token 是否可作为
+standby-ready 候选；不能在 phase 2 现场补发 bulk data。
+
+推荐 backpressure 规则：
+
+- receiver 网络或 spool 慢：source sender 限速并记录 `transfer_backpressure_us`，业务继续。
+- source 本地 queue 满：新 chunk 不再接收，token 进入 `TRANSFER_LAGGED`，后续不计入
+  promotion-ready。
+- phase 2 final seal 到来时 bulk object 未 durable received：source phase 2 不补发 bulk；
+  receiver readiness 对该 token 记 `READY_CACHE_NOT_READY` 或 `TRANSFER_INCOMPLETE`。
+
+这样可以保证 phase 1 transfer 与业务 DML 重叠，同时不把 receiver 慢路径变成业务阻塞。
+
+业务/DML 线程上的 enqueue 必须是 try-only：
+
+```text
+phase1_business_enqueue_block_us == 0
+phase1_business_enqueue_try_fail_count
+phase1_dml_p95_drift_pct
+phase1_dml_p99_drift_pct
+```
+
+推荐 full-pressure profile 要求 phase 1 期间 DML P95 相对无 drain 基线漂移不超过 5%，P99
+不超过 10%。如果 source queue 满，业务线程不能等待，只能标记 dirty/lagged；该 token 后续
+不能计入 promotion-ready。
+
+同时，若 release profile 要求 `receiver_not_ready_tokens == 0`，必须给出容量证明：
+
+```text
+required_queue_bytes >= peak_artifact_produce_bytes_per_sec * max_sender_stall_sec
+required_sender_bytes_per_sec >= total_bulk_artifact_bytes / available_phase1_streaming_sec
+required_receiver_prewarm_bytes_per_sec >= total_prewarm_input_bytes / available_phase1_streaming_sec
+source_queue_full_count == 0
+phase2_transfer_incomplete_token_count == 0
+```
+
+否则 `queue full -> TRANSFER_LAGGED` 与 `receiver_not_ready_tokens == 0` 在 full-pressure 下会互相矛盾。
+
 ### 8.3 Binlog Warmcopy Streaming
 
 binlog cache 大对象可以在 phase 1 增长过程中分块传输：
 
 - phase 1 发送当前稳定 chunk。
-- phase 2 发送 tail chunk 和 final cache digest。
+- phase 2 只允许发送受 §7.3 per-token/per-epoch cap 约束的 small tail metadata 和
+  final cache digest；与 binlog cache 增长线性相关的 tail chunk 必须计入
+  `phase2_transfer_bulk_bytes`，不得在 phase 2 补发。
 - receiver 可以提前安装稳定 chunk，但只有 final digest 到达后才能 READY。
 
 ### 8.4 Lock Warmcopy Streaming
@@ -416,7 +605,9 @@ artifact，并提前完成 page prefetch。
 
 - phase 1 mirror/builder 输出稳定 page/bitmap segment。
 - receiver 对已 sealed segment 做 dry validation 和 page prefetch。
-- phase 2 只发送 tail delta、final fence digest、final descriptor。
+- phase 2 只发送受 §7.3 per-token/per-epoch cap 约束的 small tail delta、final fence
+  digest、final descriptor；与 lock count 或 bitmap segment 数线性相关的 delta 必须计入
+  `phase2_transfer_bulk_bytes`，不得在 phase 2 补发。
 - gate 内不允许 fallback 到 record image slow resolver 或 cold bitmap import。
 
 ### 8.5 Table / MDL / Savepoint
@@ -498,10 +689,37 @@ worker 调度规则：
 
 receiver 不应等 promotion 命令才 prewarm。触发点：
 
-- `SEAL_OBJECT` 完成后，enqueue token/object 到 prewarm queue。
+- `SEAL_OBJECT` durable seal / object install 完成后，enqueue token/object 到 prewarm queue。
 - token 的 minimal bundle metadata 可读后，执行 dry validation。
 - record-lock page plan 可读后，执行 page prefetch/residency check。
 - epoch fact 到达后，绑定 final digest 和 required LSN。
+
+这里的关键要求是：**prewarm 必须实时启动，但不能阻塞 receiver 对 source 的 durable ACK**。
+
+推荐状态流：
+
+```text
+OBJECT_CHUNK durable append
+  -> FRAME_DURABLE_ACK
+  -> object assembly worker
+  -> SEAL_OBJECT durable verify/install
+  -> OBJECT_DURABLE_ACK
+  -> enqueue prewarm job
+  -> PREWARMING
+  -> PREWARMED_PENDING_FINAL_FACT
+  -> final fact bind
+  -> READY
+```
+
+`OBJECT_DURABLE_ACK` 和 `PREWARMING` 可以紧邻发生，但二者不是同一个同步动作。receiver
+应该在 ACK 后立即调度 prewarm worker，以保证 phase 1 / phase 2 期间持续推进 ready cache；
+source drain 不得等该 worker 完成。若 prewarm 因资源预算、page residency、digest 或
+semantic validation 失败而未完成，receiver 记录 not-ready，source drain 不因此延长。
+
+这条规则解决两个相互冲突的目标：
+
+- receiver 必须实时预热，不能等未来 promotion gate 才开始 hydrate/prefetch。
+- source phase 2 必须只受 final metadata durable ACK 约束，不能把 prewarm 变成业务阻塞。
 
 ready cache entry 必须包含：
 
@@ -536,6 +754,25 @@ unsupported_reason
 
 默认 release 口径应优先采用 pin 或保留池。短窗口重验只能证明 fail-closed，不能证明
 持续 `cold_gets=0`。
+
+100ms readiness 尾延迟还要求 receiver prewarm 吞吐高于 sealed object 到达速率：
+
+```text
+receiver_prewarm_workers * worker_pages_per_sec >= peak_sealed_record_pages_per_sec
+receiver_prewarm_backlog_at_phase2_end == 0
+receiver_prewarm_last_batch_max_us <= 100000
+```
+
+record-lock residency 需要显式容量预算：
+
+```text
+required_residency_bytes = receiver_record_lock_pages_total * innodb_page_size
+receiver_record_lock_residency_budget_bytes >= required_residency_bytes
+```
+
+预算不足时，receiver 不能发布 READY，只能报 `READY_CACHE_NOT_READY`。因此 full-pressure
+profile 必须同时报告 page count、page size、required bytes、reserved bytes 和 buffer pool /
+prewarm pool 配置；只报告 `cold_gets=0` 不足以证明容量长期成立。
 
 ### 9.4 未来 Promotion Gate 的消费约束
 
@@ -623,11 +860,39 @@ PREWARMED_PENDING_FINAL_FACT
   -> mark READY
 ```
 
+source phase 2 的 transfer 等待清单严格限制为：
+
+- final descriptor durable received。
+- final bundle / object digest durable received。
+- final token seal durable received。
+- epoch fact durable received。
+- commit marker durable received。
+- small tail metadata durable received。
+
+source phase 2 禁止执行或等待：
+
+- build portable objects。
+- send snapshot bundle / external blob / record-lock segment / temp sidecar bulk chunks。
+- receiver `SEAL_OBJECT` 后同步 prewarm 完成。
+- receiver `COMMIT_EPOCH` 后同步 prewarm 完成。
+- receiver cold hydrate / cold record-lock import / record image resolve。
+- promotion gate claim/import/register。
+
+如果任何 bulk object 到 phase 2 才开始发送，或者 receiver 在 phase 2 ACK 前同步执行 prewarm，
+该 run 只能说明功能正确，不能作为 `phase2_total_us ~= 1s 到 2s` 的 release 证据。
+
 如果 phase 2 完成时 receiver 未 ready：
 
 - source drain 仍可功能正确完成。
 - receiver readiness report 必须显示 `READY_CACHE_NOT_READY` 或 `RECEIVER_PREWARM_LAG`。
 - 后续真实 promotion 不能在 gate 内补 cold prewarm。
+
+如果 phase 2 完成时 receiver 已经 durable received 所有 final metadata，但 prewarm 尚未完成：
+
+- source drain 仍应结束。
+- receiver readiness lag 继续计时，直到 ready 或 not-ready。
+- E2E/NFR 按 `receiver_ready_after_source_phase2_end_us` 判定 receiver 准备链路是否达标。
+- 该 lag 不能反向加到 source phase2，也不能隐藏到 future promotion gate。
 
 当前 source build 已有 LSN provider / current redo LSN 的非零填充基础；后续实现还必须在
 epoch fact decode、ready cache 构建和 gate 入口全部拒绝零 LSN，避免旧 artifact 或坏
@@ -645,6 +910,10 @@ fact 使 apply barrier 空转。
 8. corrupt token 不能影响同 epoch 其它 token 的 service-first promotion。
 9. receiver ready report 不得把 unsupported/corrupt/not-ready token 标成 ready。
 10. phase 2 SLO miss 不等于运行时失败；promotion-ready miss 是 receiver readiness 诊断结果。
+11. 任一 token 在任一时刻至多只有一个可恢复所有者：source local recovery owner 或 receiver
+    standby promotion owner，不能两者同时成立。该不变量依赖 `{epoch_id, token}` 跨机身份、
+    `target_server_uuid == receiver local server_uuid`、未 adopted standby token 不被 ordinary
+    local recovery/resume 消费，以及后续 HA/物理备机控制面提供单主 fencing。
 
 这些是不变量目标，不代表当前代码全部满足。当前已知落差包括：
 
@@ -680,10 +949,32 @@ fact 使 apply barrier 空转。
 - `standby_transfer_first_object_seal_us`
 - `standby_transfer_phase1_bytes`
 - `standby_transfer_phase2_tail_bytes`
+- `standby_transfer_phase2_bulk_bytes`
 - `standby_transfer_phase2_final_frames_us`
 - `standby_transfer_epoch_commit_us`
 - `phase2_total_us`
 - `phase2_final_transfer_us`
+- `phase2_transfer_bulk_bytes`
+- `phase2_transfer_final_bytes`
+- `phase2_transfer_final_metadata_ack_us`
+- `phase2_final_metadata_fsync_count`
+- `phase2_receiver_prewarm_wait_us`
+- `phase2_transfer_queue_backpressure_us`
+- `phase2_transfer_incomplete_token_count`
+- `phase2_transfer_lagged_token_count`
+- `phase2_tail_final_bytes_per_token`
+- `phase2_tail_final_bytes_per_epoch`
+- `phase1_business_enqueue_block_us`
+- `phase1_business_enqueue_try_fail_count`
+- `phase1_dml_p95_drift_pct`
+- `phase1_dml_p99_drift_pct`
+
+其中：
+
+- `phase2_transfer_bulk_bytes` 必须接近 0；它非 0 表示 bulk data 仍留在 phase 2。
+- `phase2_receiver_prewarm_wait_us` 必须为 0；它非 0 表示 source drain 同步等待了 receiver
+  prewarm，违反本设计。
+- `phase2_transfer_final_metadata_ack_us` 是 phase 2 允许等待的 receiver ACK 时间。
 
 ### 14.2 Receiver 指标
 
@@ -697,6 +988,8 @@ fact 使 apply barrier 空转。
 - `receiver_objects_corrupt_count`
 - `receiver_prewarm_started_us`
 - `receiver_prewarm_finished_us`
+- `receiver_prewarm_enqueued_count`
+- `receiver_prewarm_ack_blocking_count`
 - `receiver_ready_tokens`
 - `receiver_ready_miss`
 - `receiver_record_pages_total`
@@ -706,8 +999,17 @@ fact 使 apply barrier 空转。
 - `receiver_cleanup_not_found_residue`
 - `receiver_prewarm_lag_after_source_phase2_us`
 - `receiver_ready_after_source_phase2_end_us`
+- `receiver_ready_after_final_metadata_us`
 - `receiver_not_ready_tokens`
 - `receiver_ready_epoch_fact_bound_count`
+- `receiver_prewarm_backlog_at_phase2_end`
+- `receiver_prewarm_last_batch_max_us`
+- `receiver_prewarm_capacity_pages_per_sec`
+- `receiver_record_lock_residency_budget_bytes`
+- `receiver_record_lock_required_residency_bytes`
+
+其中 `receiver_prewarm_ack_blocking_count` 必须为 0；如果它非 0，说明 receiver 仍把 prewarm
+放在 source ACK 前置路径上。
 
 ### 14.3 下游 Promotion 参考指标
 
@@ -803,7 +1105,7 @@ receiver_prewarm_finished_us - source_phase2_end_us
 
 ## 16. 实现阶段
 
-### Phase 0: 指标和口径固定
+### T0: 指标和口径固定
 
 - 增加 source/receiver readiness 结构化指标。
 - E2E JSON 显式区分：
@@ -814,40 +1116,48 @@ receiver_prewarm_finished_us - source_phase2_end_us
   - cold startup recovery elapsed
 - 禁止用 cold startup 结果或 promotion simulator 结果替代 receiver readiness 结果。
 
-### Phase 1: Source Phase 1 Streaming Sink
+### T1: Source Phase 1 Streaming Sink
 
 - drain phase 1 打开 transfer epoch。
 - token/object 在 phase 1 可被 declare。
-- stable object chunk 可立即发送。
-- phase 2 仅发送 final tail/fact。
+- stable object chunk 进入 source 本地 bounded queue，由后台 sender 发送。
+- phase 1 主流程不等待 receiver prewarm，也不等待 receiver 完整处理；只检查本地 enqueue
+  是否成功。
+- phase 2 仅发送 final descriptor、final digest、epoch fact、commit marker 和 small tail
+  metadata。
+- phase 2 不补发 bulk snapshot/blob/record-lock/temp sidecar。
 - transfer token 持久身份使用 `{epoch_id, token}`；legacy flat token collision 必须 fail
   closed。
 
-### Phase 2: Receiver Durable Spool
+### T2: Receiver Durable Spool
 
 - frame append 先 durable 再 ACK。
 - frame 格式包含 sequence、length、header digest、payload digest。
 - 同 token/object 有序，不同 token 并行；同 token 的 sequence gap 关闭前不推进语义。
 - crash 后从 spool 重建 registry。
+- ACK 只证明 durable received / durable installed；不证明 prewarm 完成。
 
-### Phase 3: Receiver 自动 Prewarm
+### T3: Receiver 自动 Prewarm
 
-- `SEAL_OBJECT` 后自动 enqueue。
+- `SEAL_OBJECT` durable seal/install 后自动 enqueue prewarm job。
+- receiver 必须实时执行 prewarm worker；但 prewarm worker 完成不是 source ACK 的前置条件。
 - prewarm 使用现有 dry validate、record page prefetch、ready cache。
 - ready cache entry 等待 final epoch fact 绑定。
 - record-lock pages 使用 pin/保留池，或在 gate 前重验并 fail closed；不能把无 pin 的
   resident sample 当成稳定事实。
 
-### Phase 4: Final Fact Two-Phase Publish
+### T4: Final Fact Two-Phase Publish
 
 - source phase 2 产生 final token seal。
 - receiver 验证 token set、object digest、epoch fact。
+- receiver 对 source phase 2 返回的 ACK 只表示 final metadata durable received/published。
+- receiver 不得在 final ACK 前执行 cold hydrate、cold import 或等待 prewarm completion。
 - commit marker 只是 projection；epoch fact 是 readiness truth。
 - fact 中 `source_prepare_lsn` 和 `source_epoch_commit_lsn` 必须非零。
 - receiver 校验 `target_server_uuid == 本机 server_uuid`。
 - COMMIT_EPOCH 部分发布失败必须回滚/清理所有已发布 token，并记录 cleanup 失败。
 
-### Phase 5: Downstream Gate Consumption Guardrails
+### T5: Downstream Gate Consumption Guardrails
 
 - 保留 promotion simulator/source-shape guard，证明下游 gate 只能读 ready cache、小
   marker/fact 和 apply provider。
@@ -859,10 +1169,20 @@ receiver_prewarm_finished_us - source_phase2_end_us
 - post-claim marker failure 必须 rollback claimed trx，或写入比 `CLEANUP_TAINTED` 更精确的
   durable adopted-but-not-durable 状态；这是下游 promotion adopt 实现的正确性要求。
 
-### Phase 6: Release Evidence
+### T6: Release Evidence
 
 - 同 lock-heavy 模型跑 source/receiver/prewarm/readiness。
 - 产出 release JSON 和 mysqld log。
+- 证明 source phase 2 只等待 final metadata durable ACK，`phase2_receiver_prewarm_wait_us=0`。
+- 证明 `source_phase2_total_us` 达到 1s 到 2s 级别，或明确指出哪个 source-side 本地步骤
+  超限。
+- 证明业务/DML 线程没有被 transfer enqueue 阻塞：`phase1_business_enqueue_block_us=0`。
+- 证明 final metadata ACK 使用批量 fsync：`phase2_final_metadata_fsync_count` 在 profile
+  门槛内。
+- 证明 phase2 tail 未超过 cap：`phase2_transfer_bulk_bytes=0` 且
+  `phase2_tail_final_bytes_per_token/epoch` 在 profile 门槛内。
+- 证明 receiver prewarm 没有 backlog：`receiver_prewarm_backlog_at_phase2_end=0`。
+- 证明 receiver record-lock residency 容量足够：reserved bytes 覆盖 required bytes。
 - 证明 receiver prewarm 在 phase 2 结束前完成，或在 phase 2 后 profile 指定的毫秒级尾
   延迟内完成。
 - 可选 simulator 只用于证明“若未来 gate 消费 ready cache，则不会走 cold path”，不能

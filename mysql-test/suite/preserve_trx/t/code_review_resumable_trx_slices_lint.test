@@ -54,6 +54,8 @@ my $purge_path = File::Spec->catfile($source_root, 'storage', 'innobase',
                                      'trx', 'trx0purge.cc');
 my $trx_preserve_path = File::Spec->catfile($source_root, 'storage', 'innobase',
                                            'trx', 'trx0preserve.cc');
+my $trx_preserve_header_path = File::Spec->catfile(
+  $source_root, 'storage', 'innobase', 'include', 'trx0preserve.h');
 my $trx_temp_preserve_path = File::Spec->catfile(
   $source_root, 'storage', 'innobase', 'trx', 'trx0temp_preserve.cc');
 my $trx_undo_path = File::Spec->catfile($source_root, 'storage', 'innobase',
@@ -116,6 +118,7 @@ my $lock_warmcopy = read_source($lock_warmcopy_path);
 my $lock_warmcopy_header = read_source($lock_warmcopy_header_path);
 my $purge = read_source($purge_path);
 my $trx_preserve = read_source($trx_preserve_path);
+my $trx_preserve_header = read_source($trx_preserve_header_path);
 my $trx_temp_preserve = read_source($trx_temp_preserve_path);
 my $trx_undo = read_source($trx_undo_path);
 my $trx = read_source($trx_path);
@@ -161,7 +164,7 @@ die "standby streaming transfer source epoch session must finalize externally bu
   unless $transfer_header =~ /send_token_objects\s*\(\s*const\s+Preserve_trx_transfer_manifest\s*&\s*manifest\s*,\s*const\s+std::vector<Preserve_trx_transfer_object_payload>\s*&\s*objects\s*\)/s &&
          $transfer =~ /Preserve_trx_transfer_source_epoch_session::send_token_objects/s;
 die "standby streaming transfer source epoch session must expose chunk-level object streaming for phase1 builders\n"
-  unless $transfer_header =~ /begin_token_objects\s*\(\s*const\s+Preserve_trx_transfer_manifest\s*&\s*manifest\s*\)/s &&
+  unless $transfer_header =~ /begin_token_objects\s*\(\s*const\s+Preserve_trx_transfer_manifest\s*&\s*manifest\s*(?:,\s*bool\s+queue_final_metadata\s*=\s*false)?\s*\)/s &&
          $transfer_header =~ /write_object_chunk\s*\(\s*uint64_t\s+transfer_token\s*,\s*const\s+std::string\s*&\s*object_id\s*,\s*uint64_t\s+chunk_offset\s*,\s*const\s+std::string\s*&\s*chunk_payload\s*\)/s &&
          $transfer_header =~ /seal_object\s*\(\s*uint64_t\s+transfer_token\s*,\s*const\s+std::string\s*&\s*object_id\s*\)/s &&
          $transfer_header =~ /finalize_token_manifest\s*\(\s*uint64_t\s+transfer_token\s*\)/s &&
@@ -188,7 +191,16 @@ die "standby receiver encoded payload batch path must use receiver worker_count 
   unless $receiver_payload_batch !~ /\(void\)\s*worker_count\s*;/ &&
          $receiver_payload_batch =~ /worker_count/s &&
          $receiver_payload_batch =~ /pre_admit_receiver_batch_sequence/s &&
-         $receiver_payload_batch =~ /preserve_trx_transfer_apply_receiver_frame_batch_with_workers\(\s*frames,\s*worker_count/s;
+         $receiver_payload_batch =~ /preserve_trx_transfer_apply_receiver_frame_batch_with_workers\(\s*frames,\s*(?:worker_count|written_metadata\s*==\s*nullptr\s*\?\s*worker_count\s*:\s*1)/s;
+my ($receiver_apply_frame) =
+  $transfer =~ /(Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame[\s\S]*?^}\n\nPreserve_trx_transfer_status preserve_trx_transfer_replay_receiver_spool)/m
+  or die "could not isolate standby receiver frame apply path\n";
+die "standby receiver SEAL_OBJECT/COMMIT_EPOCH ACK path must enqueue prewarm instead of synchronously prewarming\n"
+  unless $receiver_apply_frame =~ /enqueue_receiver_staged_token_prewarm/s &&
+         $receiver_apply_frame =~ /enqueue_receiver_committed_epoch_prewarm/s;
+die "standby receiver frame apply path must not synchronously prewarm staged or committed tokens\n"
+  if $receiver_apply_frame =~ /preserved_trx_promotion_prewarm_staged_bundle_for_receiver/s ||
+     $receiver_apply_frame =~ /note_receiver_sync_prewarm_wait/s;
 die "standby streaming transfer must not create a per-token configured frame sink when the kernel request already has a source epoch session\n"
   unless $preserve =~
      /request\.transfer_source_epoch_session\s*==\s*nullptr[\s\S]*preserve_trx_transfer_make_configured_frame_sink/s;
@@ -206,6 +218,24 @@ die "standby streaming transfer source epoch must open after phase1 participants
 die "standby streaming transfer must predeclare phase1 target tokens before WARMCOPY_CLOSING\n"
   unless $preserve =~
      /declare_phase1_transfer_targets[\s\S]*transition_to\s*\(\s*Preserve_trx_manager_state::WARMCOPY_CLOSING/s;
+die "standby streaming transfer phase2 diagnostics must split target preserve wall time before optimization\n"
+  unless $preserve =~ /phase2_target_pin_us/s &&
+         $preserve =~ /phase2_target_worker_wall_us/s &&
+         $preserve =~ /phase2_target_result_collect_us/s &&
+         $preserve =~ /phase2_transfer_commit_epoch_us/s;
+die "standby streaming transfer phase2 diagnostics must expose source-side transfer bytes and ACK time\n"
+  unless $preserve =~ /source_phase2_transfer_snapshot_bundle_bytes/s &&
+         $preserve =~ /source_phase2_transfer_final_metadata_frame_count/s &&
+         $preserve =~ /source_phase2_transfer_final_metadata_ack_us/s &&
+         $transfer =~ /g_transfer_phase2_snapshot_bundle_bytes/s &&
+         $transfer =~ /g_transfer_phase2_final_metadata_frame_count/s &&
+         $transfer =~ /g_transfer_phase2_final_metadata_encoded_bytes/s;
+die "standby streaming transfer must stream phase1 record-lock blobs before WARMCOPY_CLOSING\n"
+  unless $preserve =~
+     /stream_phase1_transfer_record_lock_blobs[\s\S]*transition_to\s*\(\s*Preserve_trx_manager_state::WARMCOPY_CLOSING/s;
+die "standby streaming transfer must stream phase1 binlog-cache blobs before WARMCOPY_CLOSING\n"
+  unless $preserve =~
+     /stream_phase1_transfer_binlog_cache_blobs[\s\S]*transition_to\s*\(\s*Preserve_trx_manager_state::WARMCOPY_CLOSING/s;
 die "standby streaming transfer must abort phase1-declared tokens that are not in the final quiesced target set\n"
   unless $preserve =~ /abort_phase1_transfer_targets_not_quiesced/s;
 die "standby streaming transfer batch path must declare every quiesced target token before target preserve publishes bundles\n"
@@ -215,6 +245,15 @@ die "standby streaming transfer batch path must abort the source epoch when the 
   unless $preserve =~ /batch_transfer_source_session[\s\S]*abort_epoch/s;
 die "standby streaming transfer batch path must commit the source epoch only after all batch target snapshots are ready\n"
   unless $preserve =~ /batch_transfer_source_session[\s\S]*commit_epoch/s;
+die "standby streaming transfer phase2 publish must skip external objects already sealed during phase1\n"
+  unless $transfer =~
+     /Preserve_trx_transfer_session_artifact_sink::publish_bundle[\s\S]*object_presealed_for_token[\s\S]*predeclared_objects\.insert/s;
+die "batch drain phase2 metrics must aggregate binlog preflight time so binlog full-copy tails are visible\n"
+  unless $preserve =~
+     /phase2_metrics\.binlog_preflight_us\s*\+=\s*result\.binlog_preflight_us/s;
+die "batch drain warm-copy metrics log must print phase2_binlog_preflight_us\n"
+  unless $preserve =~
+     /" phase2_binlog_preflight_us="\s*\+[\s\S]*std::to_string\s*\(\s*phase2_metrics\.binlog_preflight_us\s*\)/s;
 
 $lock_preserve =~ /static bool lock_preserve_page_identity_matches[\s\S]*?^}/m
   or die "could not isolate lock_preserve_page_identity_matches\n";
@@ -319,6 +358,9 @@ die "promotion prewarm must use the gate record-lock page prefetch helper that w
          /preserved_trx_promotion_prewarm_standby_pending_token[\s\S]*prewarm_loaded_bundle_into_ready_cache/s &&
          $promotion =~
          /prewarm_loaded_bundle_into_ready_cache[\s\S]*trx_preserve_prefetch_record_lock_pages_for_gate/s;
+die "record-lock gate prefetch must reject pages outside the receiver tablespace bounds before buf_read_page\n"
+  unless $lock_preserve =~
+         /lock_preserve_prefetch_record_lock_pages_low[\s\S]*fil_space_get_size[\s\S]*record_lock_prefetch_page_out_of_bounds[\s\S]*buf_read_page/s;
 die "startup recovery must globally prewarm record-lock pages before starting recovery workers\n"
   unless $preserve =~
          /prewarm_record_lock_pages_for_startup_recovery/s &&
@@ -609,7 +651,7 @@ die "post-prepare batch cleanup must not fall through to single-session cleanup 
      /if\s*\(\s*batch_delivery\s*&&\s*!\s*reactivate_current_batch_prepared_failure_to_original_thd\s*\(\s*thd\s*\)\s*\)/s;
 die "post-prepare batch cleanup must handle batch reactivation failure before the single-session fallback\n"
   unless $prepared_batch_restore =~
-         /if\s*\(\s*batch_delivery\s*\)\s*\{[\s\S]*?if\s*\(\s*reactivate_current_batch_prepared_failure_to_original_thd\s*\(\s*thd\s*\)\s*\)[\s\S]*?cleanup_failed_after_reattach\s*=\s*true[\s\S]*?return\s+reject_unsupported_for_delivery\s*\(\s*\)/s;
+         /if\s*\(\s*batch_delivery\s*\)\s*\{[\s\S]*?if\s*\(\s*reactivate_current_batch_prepared_failure_to_original_thd\s*\(\s*thd\s*(?:,\s*&reactivate_failure)?\s*\)\s*\)[\s\S]*?cleanup_failed_after_reattach\s*=\s*true[\s\S]*?return\s+reject_unsupported_for_delivery\s*\(\s*\)/s;
 
 $preserve =~ /auto reject_after_binlog_export = \[\&\]\(const char \*reason\) \{[\s\S]*?^\s*\};/m
   or die "could not isolate reject_after_binlog_export\n";
@@ -1550,6 +1592,13 @@ die "lock warmcopy must not hold a global prepare guard across ha_prepare_low\n"
 die "lock warmcopy final fence must use per-trx conversion freeze before ha_prepare_low\n"
   unless $preserve =~
          /trx_t\s+\*lock_warmcopy_frozen_trx\s*=\s*nullptr[\s\S]*auto\s+thaw_lock_warmcopy_conversion[\s\S]*trx_preserve_lock_warmcopy_conversion_freeze\s*\(\s*thd[\s\S]*ha_prepare_low\s*\(\s*thd\s*,\s*true\s*\)[\s\S]*thaw_lock_warmcopy_conversion/s;
+die "batch preserve detach/reattach failures must expose InnoDB transition reasons\n"
+  unless $trx_preserve_header =~ /enum class trx_preserve_thd_transition_failure/s &&
+         $trx_preserve =~ /trx_preserve_thd_transition_failure_name/s &&
+         $preserve =~ /trx_preserve_detach_current_thd\s*\(\s*thd\s*,\s*&detach_failure/s &&
+         $preserve =~ /reactivate_current_batch_prepared_failure_to_original_thd\s*\(\s*thd\s*,\s*&reactivate_failure/s &&
+         $preserve =~ /detach_reason=/s &&
+         $preserve =~ /reactivate_reason=/s;
 die "lock warmcopy must expose a debug-only post-freeze conversion attempt injection before the final fence\n"
   unless $preserve =~
          /preserve_trx_lock_warmcopy_after_conversion_freeze[\s\S]{0,600}DBUG_EXECUTE_IF\s*\(\s*"preserve_trx_lock_warmcopy_simulate_conversion_after_freeze"[\s\S]{0,600}preserve_trx_lock_warmcopy_after_final_fence/s &&
