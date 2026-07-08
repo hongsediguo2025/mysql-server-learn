@@ -455,6 +455,27 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_seal_prewarm_last_status,
     preserve_trx_transfer_receiver_seal_prewarm_last_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_object_prewarm_proof_count,
+    preserve_trx_transfer_receiver_object_prewarm_proof_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_object_prewarm_miss_count,
+    preserve_trx_transfer_receiver_object_prewarm_miss_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_committed_epoch_fallback_count,
+    preserve_trx_transfer_receiver_committed_epoch_fallback_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_staged_token_publish_us,
+    preserve_trx_transfer_receiver_staged_token_publish_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_staged_token_ready_cache_us,
+    preserve_trx_transfer_receiver_staged_token_ready_cache_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_staged_token_total_us,
+    preserve_trx_transfer_receiver_staged_token_total_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_staged_token_max_us,
+    preserve_trx_transfer_receiver_staged_token_max_us_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_transfer_phase2_bulk_bytes,
                               preserve_trx_transfer_phase2_bulk_bytes_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
@@ -472,6 +493,12 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_ready_after_final_metadata_us,
     preserve_trx_transfer_receiver_ready_after_final_metadata_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_final_spool_ack_monotonic_us,
+    preserve_trx_transfer_receiver_final_spool_ack_monotonic_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_ready_after_final_spool_ack_us,
+    preserve_trx_transfer_receiver_ready_after_final_spool_ack_us_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_prewarm_backlog_at_phase2_end,
     preserve_trx_transfer_receiver_prewarm_backlog_at_phase2_end_status())

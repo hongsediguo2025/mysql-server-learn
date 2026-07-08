@@ -163,6 +163,9 @@ die "standby streaming transfer must expose a session-backed artifact sink for p
 die "standby streaming transfer source epoch session must finalize externally built manifest objects for phase1 builders\n"
   unless $transfer_header =~ /send_token_objects\s*\(\s*const\s+Preserve_trx_transfer_manifest\s*&\s*manifest\s*,\s*const\s+std::vector<Preserve_trx_transfer_object_payload>\s*&\s*objects\s*\)/s &&
          $transfer =~ /Preserve_trx_transfer_source_epoch_session::send_token_objects/s;
+die "standby streaming transfer source epoch session must batch phase2 final token metadata frames\n"
+  unless $transfer_header =~ /send_token_objects_batch\s*\(\s*const\s+Preserve_trx_transfer_manifest\s*&\s*manifest\s*,\s*const\s+std::vector<Preserve_trx_transfer_object_payload>\s*&\s*objects\s*,\s*const\s+std::set<std::string>\s*&\s*presealed_objects\s*\)/s &&
+         $transfer =~ /Preserve_trx_transfer_source_epoch_session::send_token_objects_batch/s;
 die "standby streaming transfer source epoch session must expose chunk-level object streaming for phase1 builders\n"
   unless $transfer_header =~ /begin_token_objects\s*\(\s*const\s+Preserve_trx_transfer_manifest\s*&\s*manifest\s*(?:,\s*bool\s+queue_final_metadata\s*=\s*false)?\s*\)/s &&
          $transfer_header =~ /write_object_chunk\s*\(\s*uint64_t\s+transfer_token\s*,\s*const\s+std::string\s*&\s*object_id\s*,\s*uint64_t\s+chunk_offset\s*,\s*const\s+std::string\s*&\s*chunk_payload\s*\)/s &&
@@ -177,12 +180,8 @@ die "standby streaming transfer must declare large objects before the final toke
 my ($session_artifact_sink_publish) =
   $transfer =~ /(Preserve_trx_transfer_session_artifact_sink::publish_bundle[\s\S]*?return Preserve_snapshot_status::OK;\n})/s
   or die "could not isolate standby streaming transfer session artifact sink publish path\n";
-die "standby streaming transfer session artifact sink must use chunk-level session API, not send_token_bundle\n"
-  unless $session_artifact_sink_publish =~ /declare_object/s &&
-         $session_artifact_sink_publish =~ /begin_token_objects/s &&
-         $session_artifact_sink_publish =~ /write_object_chunk/s &&
-         $session_artifact_sink_publish =~ /seal_object/s &&
-         $session_artifact_sink_publish =~ /finalize_token_manifest/s &&
+die "standby streaming transfer session artifact sink must batch final token metadata, not fall back to send_token_bundle\n"
+  unless $session_artifact_sink_publish =~ /send_token_objects_batch/s &&
          $session_artifact_sink_publish !~ /send_token_bundle/s;
 my ($receiver_payload_batch) =
   $transfer =~ /(preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*?return\s+preserve_trx_transfer_apply_receiver_frame_batch_with_workers[\s\S]*?;\n})/s
@@ -195,12 +194,21 @@ die "standby receiver encoded payload batch path must use receiver worker_count 
 my ($receiver_apply_frame) =
   $transfer =~ /(Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame[\s\S]*?^}\n\nPreserve_trx_transfer_status preserve_trx_transfer_replay_receiver_spool)/m
   or die "could not isolate standby receiver frame apply path\n";
-die "standby receiver SEAL_OBJECT/COMMIT_EPOCH ACK path must enqueue prewarm instead of synchronously prewarming\n"
-  unless $receiver_apply_frame =~ /enqueue_receiver_staged_token_prewarm/s &&
-         $receiver_apply_frame =~ /enqueue_receiver_committed_epoch_prewarm/s;
+die "standby receiver SEAL_OBJECT path must enqueue object/staged prewarm instead of synchronously prewarming\n"
+  unless $receiver_apply_frame =~ /enqueue_receiver_object_prewarm/s &&
+         $receiver_apply_frame =~ /enqueue_receiver_staged_token_prewarm/s;
+die "standby receiver COMMIT_EPOCH path must not launch committed-epoch cold prewarm\n"
+  if $receiver_apply_frame =~ /enqueue_receiver_committed_epoch_prewarm/s;
 die "standby receiver frame apply path must not synchronously prewarm staged or committed tokens\n"
   if $receiver_apply_frame =~ /preserved_trx_promotion_prewarm_staged_bundle_for_receiver/s ||
      $receiver_apply_frame =~ /note_receiver_sync_prewarm_wait/s;
+my ($receiver_staged_prewarm_job) =
+  $transfer =~ /(void run_receiver_staged_token_prewarm_job\([\s\S]*?^}\n\nstatic void run_receiver_object_prewarm_job)/m
+  or die "could not isolate standby receiver staged-token prewarm job\n";
+die "standby receiver staged-token publish must use the batch-safe projection helper\n"
+  unless $receiver_staged_prewarm_job =~ /publish_receiver_standby_bundle_projection/s;
+die "standby receiver staged-token publish must not serialize full token publish under a global mutex\n"
+  if $receiver_staged_prewarm_job =~ /g_receiver_standby_publish_mutex[\s\S]*preserve_trx_transfer_publish_standby_bundle/s;
 die "standby streaming transfer must not create a per-token configured frame sink when the kernel request already has a source epoch session\n"
   unless $preserve =~
      /request\.transfer_source_epoch_session\s*==\s*nullptr[\s\S]*preserve_trx_transfer_make_configured_frame_sink/s;
@@ -223,19 +231,35 @@ die "standby streaming transfer phase2 diagnostics must split target preserve wa
          $preserve =~ /phase2_target_worker_wall_us/s &&
          $preserve =~ /phase2_target_result_collect_us/s &&
          $preserve =~ /phase2_transfer_commit_epoch_us/s;
-die "standby streaming transfer phase2 diagnostics must expose source-side transfer bytes and ACK time\n"
-  unless $preserve =~ /source_phase2_transfer_snapshot_bundle_bytes/s &&
-         $preserve =~ /source_phase2_transfer_final_metadata_frame_count/s &&
-         $preserve =~ /source_phase2_transfer_final_metadata_ack_us/s &&
-         $transfer =~ /g_transfer_phase2_snapshot_bundle_bytes/s &&
-         $transfer =~ /g_transfer_phase2_final_metadata_frame_count/s &&
-         $transfer =~ /g_transfer_phase2_final_metadata_encoded_bytes/s;
-die "standby streaming transfer must stream phase1 record-lock blobs before WARMCOPY_CLOSING\n"
-  unless $preserve =~
-     /stream_phase1_transfer_record_lock_blobs[\s\S]*transition_to\s*\(\s*Preserve_trx_manager_state::WARMCOPY_CLOSING/s;
+	die "standby streaming transfer phase2 diagnostics must expose source-side transfer bytes and ACK time\n"
+	  unless $preserve =~ /source_phase2_transfer_snapshot_bundle_bytes/s &&
+	         $preserve =~ /source_phase2_transfer_final_metadata_frame_count/s &&
+	         $preserve =~ /source_phase2_transfer_final_metadata_ack_us/s &&
+	         $transfer =~ /g_transfer_phase2_snapshot_bundle_bytes/s &&
+	         $transfer =~ /g_transfer_phase2_final_metadata_frame_count/s &&
+	         $transfer =~ /g_transfer_phase2_final_metadata_encoded_bytes/s;
+	die "standby receiver prewarm diagnostics must expose object-proof and fallback counters\n"
+	  unless $transfer =~ /g_receiver_object_prewarm_proof_count/s &&
+	         $transfer =~ /g_receiver_object_prewarm_miss_count/s &&
+	         $transfer =~ /g_receiver_committed_epoch_fallback_count/s &&
+	         $mysqld =~ /Preserve_trx_transfer_receiver_object_prewarm_proof_count/s &&
+	         $mysqld =~ /Preserve_trx_transfer_receiver_object_prewarm_miss_count/s &&
+	         $mysqld =~ /Preserve_trx_transfer_receiver_committed_epoch_fallback_count/s;
+	die "standby streaming transfer must stream phase1 record-lock blobs before WARMCOPY_CLOSING\n"
+	  unless $preserve =~
+	     /stream_phase1_transfer_record_lock_blobs[\s\S]*transition_to\s*\(\s*Preserve_trx_manager_state::WARMCOPY_CLOSING/s;
 die "standby streaming transfer must stream phase1 binlog-cache blobs before WARMCOPY_CLOSING\n"
   unless $preserve =~
      /stream_phase1_transfer_binlog_cache_blobs[\s\S]*transition_to\s*\(\s*Preserve_trx_manager_state::WARMCOPY_CLOSING/s;
+die "standby streaming transfer must send phase1 prewarm manifests before WARMCOPY_CLOSING\n"
+  unless $preserve =~
+     /begin_phase1_transfer_prewarm_manifests[\s\S]*transition_to\s*\(\s*Preserve_trx_manager_state::WARMCOPY_CLOSING/s;
+my ($receiver_dispatch_command) =
+  $transfer =~ /(void preserve_trx_transfer_dispatch_command\(THD \*thd\)[\s\S]*?^}\n\nPreserve_snapshot_status Preserve_trx_local_carrier_artifact_sink::publish_bundle)/m
+  or die "could not isolate standby receiver COM dispatch path\n";
+die "standby receiver single COMMIT_EPOCH frame must use durable spool ACK instead of synchronous final publish\n"
+  unless $receiver_dispatch_command =~
+     /decoded_frame\.type\s*==\s*Preserve_trx_transfer_frame_type::COMMIT_EPOCH[\s\S]*preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*send_receiver_durable_spool_ack/s;
 die "standby streaming transfer must abort phase1-declared tokens that are not in the final quiesced target set\n"
   unless $preserve =~ /abort_phase1_transfer_targets_not_quiesced/s;
 die "standby streaming transfer batch path must declare every quiesced target token before target preserve publishes bundles\n"
@@ -247,7 +271,8 @@ die "standby streaming transfer batch path must commit the source epoch only aft
   unless $preserve =~ /batch_transfer_source_session[\s\S]*commit_epoch/s;
 die "standby streaming transfer phase2 publish must skip external objects already sealed during phase1\n"
   unless $transfer =~
-     /Preserve_trx_transfer_session_artifact_sink::publish_bundle[\s\S]*object_presealed_for_token[\s\S]*predeclared_objects\.insert/s;
+     /send_token_objects_batch[\s\S]*object_is_presealed[\s\S]*m_streaming_sealed_objects[\s\S]*m_streaming_object_written_bytes/s &&
+     $session_artifact_sink_publish =~ /send_token_objects_batch/s;
 die "batch drain phase2 metrics must aggregate binlog preflight time so binlog full-copy tails are visible\n"
   unless $preserve =~
      /phase2_metrics\.binlog_preflight_us\s*\+=\s*result\.binlog_preflight_us/s;
@@ -1989,10 +2014,11 @@ $transfer_apply_receiver_frame =~
   /case Preserve_trx_transfer_frame_type::COMMIT_EPOCH:[\s\S]*?case Preserve_trx_transfer_frame_type::BEGIN:/m
   or die "could not isolate standby transfer COMMIT_EPOCH receiver branch\n";
 my $transfer_commit_epoch_branch = $&;
-die "standby transfer COMMIT_EPOCH publish failures must log the publish substage\n"
+die "standby transfer COMMIT_EPOCH must not synchronously publish standby bundles\n"
+  if $transfer_commit_epoch_branch =~ /publish_standby_bundle_from_staging/s ||
+     $transfer_commit_epoch_branch =~ /commit epoch publish failed/s;
+die "standby transfer COMMIT_EPOCH final metadata failures must log the finalize substage\n"
   unless $transfer_commit_epoch_branch =~
-         /standby transfer receiver commit epoch publish failed[\s\S]*transfer_status_name\s*\(\s*status\s*\)/s &&
-         $transfer_commit_epoch_branch =~
          /standby transfer receiver commit epoch finalize failed[\s\S]*transfer_status_name\s*\(\s*status\s*\)/s;
 die "standby transfer production source client must resolve credential-name before opening a socket\n"
   unless $transfer =~

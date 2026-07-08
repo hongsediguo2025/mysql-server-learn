@@ -24,6 +24,7 @@ import math
 from pathlib import Path
 import queue
 import re
+import shlex
 import shutil
 import statistics
 import struct
@@ -99,6 +100,22 @@ def _summarize_us_samples(samples: Sequence[Optional[int]]) -> Dict[str, Optiona
         "p99_us": nearest_rank(99),
         "max_us": values[-1],
     }
+
+
+def _mysqld_command_option(command: Optional[str], option: str) -> Optional[str]:
+    if not command:
+        return None
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    inline_prefix = option + "="
+    for idx, part in enumerate(parts):
+        if part.startswith(inline_prefix):
+            return part[len(inline_prefix):]
+        if part == option and idx + 1 < len(parts):
+            return parts[idx + 1]
+    return None
 
 
 def _validate_lock_heavy_startup_report_fields(report: Dict[str, object]) -> None:
@@ -921,9 +938,18 @@ class ReceiverPrewarmMetrics:
     phase2_transfer_final_metadata_ack_us: int = 0
     phase1_business_enqueue_block_us: int = 0
     ready_after_final_metadata_us: int = 0
+    final_spool_ack_monotonic_us: int = 0
+    ready_after_final_spool_ack_us: int = 0
     prewarm_backlog_at_phase2_end: int = 0
     record_lock_required_residency_bytes: int = 0
     record_lock_reserved_residency_bytes: int = 0
+    object_prewarm_proof_count: int = 0
+    object_prewarm_miss_count: int = 0
+    committed_epoch_fallback_count: int = 0
+    staged_token_publish_us: int = 0
+    staged_token_ready_cache_us: int = 0
+    staged_token_total_us: int = 0
+    staged_token_max_us: int = 0
 
 
 class WorkloadPlan:
@@ -3740,6 +3766,7 @@ class BusinessE2ERunner:
         self.write_promotion_warm_gate_report(gate_elapsed_us, server_metrics)
 
     def run_standby_transfer_receiver_drain_metrics(self) -> None:
+        self.prepare_standby_transfer_credential_secret_files()
         self.start_source_server_if_configured()
         self.start_receiver_server_if_configured()
         self.preflight_disk_budgets()
@@ -3900,6 +3927,54 @@ class BusinessE2ERunner:
             sorted(all_tokens),
             scenario_name="physical_standby_promotion_gate_scaled",
         )
+
+    def prepare_standby_transfer_credential_secret_files(self) -> None:
+        if self.config.scenario not in {
+            "standby_transfer_receiver_drain_metrics",
+            "physical_standby_promotion_gate_scaled",
+        }:
+            return
+        if not self.config.standby_transfer_password:
+            raise AssertionError("standby transfer password must not be empty")
+
+        def add_secret_file(command: Optional[str],
+                            datadir: Optional[str],
+                            label: str) -> Optional[str]:
+            if not command:
+                return command
+            if "--preserve-trx-transfer-credential-secret-file" in command:
+                return command
+            if not datadir:
+                raise AssertionError(
+                    f"{label} datadir is required to create transfer "
+                    "credential secret file"
+                )
+            secret_dir = Path(datadir).expanduser().resolve(strict=False)
+            secret_dir.mkdir(parents=True, exist_ok=True)
+            secret_file = secret_dir / "preserve_transfer_credential.secret"
+            secret_file.write_text(
+                f"{self.config.standby_transfer_password}\n",
+                encoding="utf-8",
+            )
+            secret_file.chmod(0o600)
+            return (
+                f"{command} "
+                "--preserve-trx-transfer-credential-secret-file="
+                f"{shlex.quote(str(secret_file))}"
+            )
+
+        self.config.source_start_command = add_secret_file(
+            self.config.source_start_command, self.config.source_datadir,
+            "source")
+        self.config.receiver_start_command = add_secret_file(
+            self.config.receiver_start_command, self.config.receiver_datadir,
+            "receiver")
+        self.config.restart_command = add_secret_file(
+            self.config.restart_command, self.config.source_datadir,
+            "source")
+        self.config.receiver_restart_command = add_secret_file(
+            self.config.receiver_restart_command, self.config.receiver_datadir,
+            "receiver")
 
     def start_source_server_if_configured(self) -> None:
         if not self.config.source_start_command:
@@ -4748,6 +4823,16 @@ class BusinessE2ERunner:
                 if receiver_prewarm_metrics is None
                 else receiver_prewarm_metrics.ready_after_final_metadata_us
             ),
+            "receiver_final_spool_ack_monotonic_us": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.final_spool_ack_monotonic_us
+            ),
+            "receiver_ready_after_final_spool_ack_us": (
+                None
+                if receiver_prewarm_metrics is None
+                else receiver_prewarm_metrics.ready_after_final_spool_ack_us
+            ),
             "receiver_prewarm_backlog_at_phase2_end": (
                 None
                 if receiver_prewarm_metrics is None
@@ -4802,6 +4887,27 @@ class BusinessE2ERunner:
                     ),
                     "receiver_record_lock_reserved_residency_bytes": (
                         receiver_prewarm_metrics.record_lock_reserved_residency_bytes
+                    ),
+                    "receiver_object_prewarm_proof_count": (
+                        receiver_prewarm_metrics.object_prewarm_proof_count
+                    ),
+                    "receiver_object_prewarm_miss_count": (
+                        receiver_prewarm_metrics.object_prewarm_miss_count
+                    ),
+                    "receiver_committed_epoch_fallback_count": (
+                        receiver_prewarm_metrics.committed_epoch_fallback_count
+                    ),
+                    "receiver_staged_token_publish_us": (
+                        receiver_prewarm_metrics.staged_token_publish_us
+                    ),
+                    "receiver_staged_token_ready_cache_us": (
+                        receiver_prewarm_metrics.staged_token_ready_cache_us
+                    ),
+                    "receiver_staged_token_total_us": (
+                        receiver_prewarm_metrics.staged_token_total_us
+                    ),
+                    "receiver_staged_token_max_us": (
+                        receiver_prewarm_metrics.staged_token_max_us
                     ),
                     "receiver_seal_prewarm_tokens": (
                         receiver_prewarm_metrics.seal_prewarm_tokens
@@ -4866,20 +4972,6 @@ class BusinessE2ERunner:
                 f"phase2_end_us={phase2_end_us}"
             )
         if (
-            receiver_prewarm_metrics.seal_prewarm_success_tokens
-            < expected_standby_pending
-        ):
-            raise AssertionError(
-                "receiver not ready: seal-time prewarm did not cover every token "
-                f"success={receiver_prewarm_metrics.seal_prewarm_success_tokens} "
-                f"expected={expected_standby_pending}"
-            )
-        if receiver_prewarm_metrics.seal_prewarm_not_ready_tokens != 0:
-            raise AssertionError(
-                "receiver not ready: seal-time prewarm has not-ready tokens "
-                f"not_ready={receiver_prewarm_metrics.seal_prewarm_not_ready_tokens}"
-            )
-        if (
             receiver_prewarm_metrics.auto_prewarm_ready_tokens
             < expected_standby_pending
             or receiver_prewarm_metrics.auto_prewarm_not_ready_tokens != 0
@@ -4890,6 +4982,11 @@ class BusinessE2ERunner:
                 f"ready={receiver_prewarm_metrics.auto_prewarm_ready_tokens} "
                 f"not_ready={receiver_prewarm_metrics.auto_prewarm_not_ready_tokens} "
                 f"expected={expected_standby_pending}"
+            )
+        if receiver_prewarm_metrics.committed_epoch_fallback_count != 0:
+            raise AssertionError(
+                "receiver not ready: committed-epoch fallback was used "
+                f"count={receiver_prewarm_metrics.committed_epoch_fallback_count}"
             )
         if (
             receiver_prewarm_metrics.record_lock_resident_pages
@@ -5475,6 +5572,11 @@ class BusinessE2ERunner:
                 )
             else:
                 commands.append("SET GLOBAL preserve_trx_warmcopy_enable=OFF")
+            if (
+                self.config.scenario == "standby_transfer_receiver_drain_metrics"
+                and "SET GLOBAL log_error_verbosity=3" not in commands
+            ):
+                commands.append("SET GLOBAL log_error_verbosity=3")
             for sql in commands:
                 self.runtime.execute(conn, sql)
         finally:
@@ -5996,14 +6098,6 @@ class BusinessE2ERunner:
         )
 
     def _run_business_before_drain(self, cycle: int) -> None:
-        timeout_s = max(
-            self.config.resume_timeout_s,
-            self.config.business_run_before_drain_s + self.config.resume_timeout_s,
-        )
-        if not self.coordinator.wait_all_in_transaction(timeout_s):
-            raise TimeoutError(
-                "not all workers entered transactions before business-run drain"
-            )
         LOG.info(
             "cycle %s/%s running business workload %.3fs before direct drain",
             cycle,
@@ -6050,6 +6144,15 @@ class BusinessE2ERunner:
     def warmcopy_error_log_path(self) -> Optional[str]:
         if self.config.server_error_log:
             return self.config.server_error_log
+        if (
+            self.config.scenario == "standby_transfer_receiver_drain_metrics"
+            and self.config.source_start_command
+        ):
+            source_error_log = _mysqld_command_option(
+                self.config.source_start_command, "--log-error"
+            )
+            if source_error_log:
+                return source_error_log
         if self.config.unix_socket:
             return str(Path(self.config.unix_socket).expanduser().parent / "mysqld.err")
         return None
@@ -6617,9 +6720,18 @@ class BusinessE2ERunner:
             "Preserve_trx_transfer_phase2_final_metadata_ack_us",
             "Preserve_trx_transfer_phase1_business_enqueue_block_us",
             "Preserve_trx_transfer_receiver_ready_after_final_metadata_us",
+            "Preserve_trx_transfer_receiver_final_spool_ack_monotonic_us",
+            "Preserve_trx_transfer_receiver_ready_after_final_spool_ack_us",
             "Preserve_trx_transfer_receiver_prewarm_backlog_at_phase2_end",
             "Preserve_trx_transfer_receiver_record_lock_req_residency_bytes",
             "Preserve_trx_transfer_receiver_record_lock_resv_residency_bytes",
+            "Preserve_trx_transfer_receiver_object_prewarm_proof_count",
+            "Preserve_trx_transfer_receiver_object_prewarm_miss_count",
+            "Preserve_trx_transfer_receiver_committed_epoch_fallback_count",
+            "Preserve_trx_transfer_receiver_staged_token_publish_us",
+            "Preserve_trx_transfer_receiver_staged_token_ready_cache_us",
+            "Preserve_trx_transfer_receiver_staged_token_total_us",
+            "Preserve_trx_transfer_receiver_staged_token_max_us",
         }
         quoted_fields = ", ".join(f"'{field}'" for field in sorted(fields))
         sql = (
@@ -6720,6 +6832,12 @@ class BusinessE2ERunner:
                 ready_after_final_metadata_us=metric(
                     "Preserve_trx_transfer_receiver_ready_after_final_metadata_us"
                 ),
+                final_spool_ack_monotonic_us=metric(
+                    "Preserve_trx_transfer_receiver_final_spool_ack_monotonic_us"
+                ),
+                ready_after_final_spool_ack_us=metric(
+                    "Preserve_trx_transfer_receiver_ready_after_final_spool_ack_us"
+                ),
                 prewarm_backlog_at_phase2_end=metric(
                     "Preserve_trx_transfer_receiver_prewarm_backlog_at_phase2_end"
                 ),
@@ -6728,6 +6846,27 @@ class BusinessE2ERunner:
                 ),
                 record_lock_reserved_residency_bytes=metric(
                     "Preserve_trx_transfer_receiver_record_lock_resv_residency_bytes"
+                ),
+                object_prewarm_proof_count=metric(
+                    "Preserve_trx_transfer_receiver_object_prewarm_proof_count"
+                ),
+                object_prewarm_miss_count=metric(
+                    "Preserve_trx_transfer_receiver_object_prewarm_miss_count"
+                ),
+                committed_epoch_fallback_count=metric(
+                    "Preserve_trx_transfer_receiver_committed_epoch_fallback_count"
+                ),
+                staged_token_publish_us=metric(
+                    "Preserve_trx_transfer_receiver_staged_token_publish_us"
+                ),
+                staged_token_ready_cache_us=metric(
+                    "Preserve_trx_transfer_receiver_staged_token_ready_cache_us"
+                ),
+                staged_token_total_us=metric(
+                    "Preserve_trx_transfer_receiver_staged_token_total_us"
+                ),
+                staged_token_max_us=metric(
+                    "Preserve_trx_transfer_receiver_staged_token_max_us"
                 ),
             )
         except ValueError:

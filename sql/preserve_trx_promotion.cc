@@ -126,6 +126,15 @@ struct Promotion_ready_cache_entry {
   std::string reason;
 };
 
+struct Promotion_record_lock_proof {
+  bool available{false};
+  uint64_t page_count{0};
+  uint64_t resident_pages{0};
+  uint64_t cold_gets{0};
+  uint64_t bitmap_pages{0};
+  uint64_t bitmap_bits{0};
+};
+
 std::mutex g_ready_cache_mutex;
 std::map<Promotion_ready_cache_key, Promotion_ready_cache_entry> g_ready_cache;
 
@@ -1365,7 +1374,8 @@ bool preserved_trx_promotion_record_lock_pages_wait_for_residency_for_unit_test(
 Preserve_trx_promotion_adopt_status prewarm_loaded_bundle_into_ready_cache(
     const std::string &preserve_dir, const std::string &epoch_id,
     uint64_t token, uint64_t required_apply_lsn,
-    const Preserved_trx_bundle &bundle, bool wait_for_final_epoch_fact) {
+    const Preserved_trx_bundle &bundle, bool wait_for_final_epoch_fact,
+    const Promotion_record_lock_proof *record_lock_proof) {
   const std::string token_string = std::to_string(token);
   std::string dry_validate_reason;
   const Preserve_snapshot_status dry_validate_status =
@@ -1414,6 +1424,26 @@ Preserve_trx_promotion_adopt_status prewarm_loaded_bundle_into_ready_cache(
   }
   if (record_lock_payload == nullptr || record_lock_payload->empty()) {
     entry.record_lock_pages_prewarmed = true;
+  } else if (record_lock_proof != nullptr &&
+             record_lock_proof->available) {
+    entry.record_lock_pages_prewarmed = true;
+    entry.record_lock_page_count = record_lock_proof->page_count;
+    entry.record_lock_prefetch_submitted_pages = record_lock_proof->page_count;
+    entry.record_lock_resident_pages = record_lock_proof->resident_pages;
+    entry.record_lock_bitmap_pages = record_lock_proof->bitmap_pages;
+    entry.record_lock_bitmap_bits = record_lock_proof->bitmap_bits;
+    if (record_lock_proof->cold_gets != 0 ||
+        !record_lock_pages_are_gate_ready(
+            entry.record_lock_pages_prewarmed, entry.record_lock_page_count,
+            entry.record_lock_prefetch_submitted_pages,
+            entry.record_lock_resident_pages)) {
+      entry.state = Preserve_trx_promotion_ready_state::APPLY_PENDING;
+      entry.reason = "record-lock object proof is not resident";
+      std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+      g_ready_cache[Promotion_ready_cache_key{preserve_dir, epoch_id, token}] =
+          std::move(entry);
+      return Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY;
+    }
   } else {
     trx_preserve_record_lock_page_plan_t page_plan;
     if (!trx_preserve_record_lock_payload_page_plan(
@@ -1613,7 +1643,8 @@ preserved_trx_promotion_prewarm_standby_pending_token(
   }
 
   return prewarm_loaded_bundle_into_ready_cache(
-      preserve_dir, epoch_id, token, required_apply_lsn, bundle, false);
+      preserve_dir, epoch_id, token, required_apply_lsn, bundle, false,
+      nullptr);
 }
 
 Preserve_trx_promotion_adopt_status
@@ -1628,7 +1659,31 @@ preserved_trx_promotion_prewarm_staged_bundle_for_receiver(
     return Preserve_trx_promotion_adopt_status::NOT_ENABLED;
   }
   return prewarm_loaded_bundle_into_ready_cache(
-      preserve_dir, epoch_id, token, required_apply_lsn, bundle, true);
+      preserve_dir, epoch_id, token, required_apply_lsn, bundle, true, nullptr);
+}
+
+Preserve_trx_promotion_adopt_status
+preserved_trx_promotion_prewarm_staged_bundle_with_record_lock_proof_for_receiver(
+    const std::string &preserve_dir, const std::string &epoch_id,
+    uint64_t token, uint64_t required_apply_lsn,
+    const Preserved_trx_bundle &bundle, uint64_t record_lock_page_count,
+    uint64_t record_lock_resident_pages, uint64_t record_lock_cold_gets,
+    uint64_t record_lock_bitmap_pages, uint64_t record_lock_bitmap_bits) {
+  if (preserve_dir.empty() || epoch_id.empty() || token == 0) {
+    return Preserve_trx_promotion_adopt_status::INVALID_ARGUMENT;
+  }
+  if (!preserve_trx_is_enabled()) {
+    return Preserve_trx_promotion_adopt_status::NOT_ENABLED;
+  }
+  Promotion_record_lock_proof proof;
+  proof.available = true;
+  proof.page_count = record_lock_page_count;
+  proof.resident_pages = record_lock_resident_pages;
+  proof.cold_gets = record_lock_cold_gets;
+  proof.bitmap_pages = record_lock_bitmap_pages;
+  proof.bitmap_bits = record_lock_bitmap_bits;
+  return prewarm_loaded_bundle_into_ready_cache(
+      preserve_dir, epoch_id, token, required_apply_lsn, bundle, true, &proof);
 }
 
 Preserve_trx_promotion_adopt_status

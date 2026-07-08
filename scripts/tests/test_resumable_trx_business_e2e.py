@@ -811,6 +811,14 @@ class _ReceiverPrewarmStatusRuntime(_FakeRuntime):
                     "9000",
                 ),
                 (
+                    "Preserve_trx_transfer_receiver_final_spool_ack_monotonic_us",
+                    "1040000",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_ready_after_final_spool_ack_us",
+                    "7000",
+                ),
+                (
                     "Preserve_trx_transfer_receiver_prewarm_backlog_at_phase2_end",
                     "0",
                 ),
@@ -821,6 +829,34 @@ class _ReceiverPrewarmStatusRuntime(_FakeRuntime):
                 (
                     "Preserve_trx_transfer_receiver_record_lock_resv_residency_bytes",
                     "278528",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_object_prewarm_proof_count",
+                    "4",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_object_prewarm_miss_count",
+                    "1",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_committed_epoch_fallback_count",
+                    "2",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_staged_token_publish_us",
+                    "1200",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_staged_token_ready_cache_us",
+                    "2300",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_staged_token_total_us",
+                    "3500",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_staged_token_max_us",
+                    "900",
                 ),
             ]
         return super().execute(conn, sql, fetch)
@@ -1474,6 +1510,21 @@ class _NeverPausedCoordinator(ResumeCoordinator):
             "not_drainable": [1],
             "completed": [],
         }
+
+
+class _NeverInTransactionCoordinator:
+    def __init__(self):
+        self.errors = queue.Queue()
+        self.wait_timeouts = []
+        self.error_after_first_wait = None
+
+    def wait_all_in_transaction(self, timeout_s):
+        self.wait_timeouts.append(timeout_s)
+        if timeout_s > 1.0:
+            raise AssertionError("in-transaction wait must be chunked for worker fail-fast")
+        if self.error_after_first_wait is not None and len(self.wait_timeouts) == 1:
+            self.errors.put(self.error_after_first_wait)
+        return False
 
 
 class _RecordingDrainableCoordinator:
@@ -3500,6 +3551,34 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertEqual(len(drain_calls), 1)
         self.assertEqual(runner.coordinator.wait_timeouts, [])
 
+    def test_business_run_before_drain_checks_worker_errors_while_waiting_for_transactions(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            sessions=2,
+            business_run_before_drain_s=0.1,
+            resume_timeout_s=0.2,
+        )
+        runner.coordinator = _NeverInTransactionCoordinator()
+        runner.coordinator.errors.put(RuntimeError("worker failed before drain"))
+
+        with self.assertRaisesRegex(RuntimeError, "worker failed before drain"):
+            runner._run_business_before_drain(cycle=1)
+
+        self.assertEqual(runner.coordinator.wait_timeouts, [])
+
+    def test_business_run_before_drain_does_not_require_all_workers_in_transaction(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            sessions=2,
+            business_run_before_drain_s=0.001,
+            resume_timeout_s=10,
+        )
+        runner.coordinator = _NeverInTransactionCoordinator()
+
+        runner._run_business_before_drain(cycle=1)
+
+        self.assertEqual(runner.coordinator.wait_timeouts, [])
+
     def test_inflight_drain_waits_for_observed_lock_waits_before_drain(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.config = HarnessConfig(
@@ -4589,6 +4668,8 @@ class WorkloadPlanTest(unittest.TestCase):
             scenario="standby_transfer_receiver_drain_metrics",
             receiver_unix_socket="/tmp/receiver.sock",
             receiver_preserve_dir="/tmp/rx/data/preserve",
+            source_datadir="/tmp/src/data",
+            receiver_datadir="/tmp/rx/data",
             source_start_command="mysqld --defaults-file=/tmp/src.cnf",
             receiver_start_command="mysqld --defaults-file=/tmp/rx.cnf",
         ).validate()
@@ -4610,6 +4691,30 @@ class WorkloadPlanTest(unittest.TestCase):
             runner.run_standby_transfer_receiver_drain_metrics()
 
         self.assertEqual(calls, ["start_source", "start_receiver", "preflight"])
+
+    def test_standby_transfer_receiver_metrics_reads_source_error_log(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            unix_socket="/tmp/source.sock",
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/rx/data/preserve",
+            source_start_command=(
+                "mysqld --datadir=/tmp/src "
+                "--log-error=/tmp/standby-source.err "
+                "--socket=/tmp/source.sock"
+            ),
+            receiver_start_command=(
+                "mysqld --datadir=/tmp/rx "
+                "--log-error=/tmp/standby-receiver.err "
+                "--socket=/tmp/receiver.sock"
+            ),
+        ).validate()
+
+        self.assertEqual(
+            runner.warmcopy_error_log_path(),
+            "/tmp/standby-source.err",
+        )
 
     def test_receiver_preserve_artifact_counts_include_standby_and_epoch_fact(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4721,9 +4826,18 @@ class WorkloadPlanTest(unittest.TestCase):
                 phase2_transfer_final_metadata_ack_us=3000,
                 phase1_business_enqueue_block_us=0,
                 ready_after_final_metadata_us=9000,
+                final_spool_ack_monotonic_us=1_040_000,
+                ready_after_final_spool_ack_us=7000,
                 prewarm_backlog_at_phase2_end=0,
                 record_lock_required_residency_bytes=278528,
                 record_lock_reserved_residency_bytes=278528,
+                object_prewarm_proof_count=4,
+                object_prewarm_miss_count=1,
+                committed_epoch_fallback_count=2,
+                staged_token_publish_us=1200,
+                staged_token_ready_cache_us=2300,
+                staged_token_total_us=3500,
+                staged_token_max_us=900,
             )
 
             runner.write_standby_transfer_receiver_report(
@@ -4787,6 +4901,8 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertEqual(report["phase1_business_enqueue_block_us"], 0)
             self.assertEqual(report["receiver_ready_after_source_phase2_end_us"], 42000)
             self.assertEqual(report["receiver_ready_after_final_metadata_us"], 9000)
+            self.assertEqual(report["receiver_final_spool_ack_monotonic_us"], 1_040_000)
+            self.assertEqual(report["receiver_ready_after_final_spool_ack_us"], 7000)
             self.assertEqual(report["receiver_prewarm_backlog_at_phase2_end"], 0)
             self.assertEqual(
                 report["receiver_ready_after_source_phase2_summary_us"],
@@ -4820,6 +4936,13 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertEqual(report["receiver_record_cold_gets"], 0)
             self.assertEqual(report["receiver_record_lock_required_residency_bytes"], 278528)
             self.assertEqual(report["receiver_record_lock_reserved_residency_bytes"], 278528)
+            self.assertEqual(report["receiver_object_prewarm_proof_count"], 4)
+            self.assertEqual(report["receiver_object_prewarm_miss_count"], 1)
+            self.assertEqual(report["receiver_committed_epoch_fallback_count"], 2)
+            self.assertEqual(report["receiver_staged_token_publish_us"], 1200)
+            self.assertEqual(report["receiver_staged_token_ready_cache_us"], 2300)
+            self.assertEqual(report["receiver_staged_token_total_us"], 3500)
+            self.assertEqual(report["receiver_staged_token_max_us"], 900)
             self.assertEqual(report["receiver_seal_prewarm_tokens"], 5)
             self.assertEqual(report["receiver_seal_prewarm_success_tokens"], 4)
             self.assertEqual(report["receiver_seal_prewarm_not_ready_tokens"], 1)
@@ -4863,6 +4986,110 @@ class WorkloadPlanTest(unittest.TestCase):
         runner.receiver_ready_after_source_phase2_end_us = 12_000
 
         with self.assertRaisesRegex(AssertionError, "receiver not ready"):
+            runner.validate_standby_transfer_receiver_readiness(
+                expected_standby_pending=2
+            )
+
+    def test_standby_transfer_receiver_readiness_allows_transient_seal_not_ready(
+        self,
+    ):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+            max_receiver_ready_after_phase2_ms=500,
+        ).validate()
+        runner.warmcopy_drain_metrics = [
+            WarmcopyDrainMetrics(
+                phase2_pause_ms=1.0,
+                full_copy_to_count=0,
+                phase2_total_ms=2.0,
+                phase2_end_monotonic_us=1_000_000,
+            )
+        ]
+        runner.receiver_artifact_counts = {
+            "snapshot_tokens": 2,
+            "standby_pending_tokens": 2,
+            "external_blob_tokens": 2,
+            "epoch_fact_count": 1,
+            "epoch_commit_count": 1,
+        }
+        runner.receiver_prewarm_metrics = ReceiverPrewarmMetrics(
+            auto_prewarm_tokens=2,
+            auto_prewarm_ready_tokens=2,
+            auto_prewarm_not_ready_tokens=0,
+            auto_prewarm_last_status=0,
+            ready_monotonic_us=1_020_000,
+            first_frame_monotonic_us=900_000,
+            last_object_seal_monotonic_us=990_000,
+            prewarm_start_monotonic_us=910_000,
+            prewarm_end_monotonic_us=1_020_000,
+            record_lock_page_count=4,
+            record_lock_resident_pages=4,
+            record_lock_cold_page_gets=0,
+            seal_prewarm_tokens=5,
+            seal_prewarm_success_tokens=4,
+            seal_prewarm_not_ready_tokens=1,
+            seal_prewarm_last_status=0,
+            ready_after_final_metadata_us=200_000,
+        )
+        runner.receiver_ready_after_source_phase2_end_us = 220_000
+
+        runner.validate_standby_transfer_receiver_readiness(
+            expected_standby_pending=2
+        )
+
+    def test_standby_transfer_receiver_readiness_rejects_committed_epoch_fallback(
+        self,
+    ):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+            max_receiver_ready_after_phase2_ms=500,
+        ).validate()
+        runner.warmcopy_drain_metrics = [
+            WarmcopyDrainMetrics(
+                phase2_pause_ms=1.0,
+                full_copy_to_count=0,
+                phase2_total_ms=2.0,
+                phase2_end_monotonic_us=1_000_000,
+            )
+        ]
+        runner.receiver_artifact_counts = {
+            "snapshot_tokens": 2,
+            "standby_pending_tokens": 2,
+            "external_blob_tokens": 2,
+            "epoch_fact_count": 1,
+            "epoch_commit_count": 1,
+        }
+        runner.receiver_prewarm_metrics = ReceiverPrewarmMetrics(
+            auto_prewarm_tokens=2,
+            auto_prewarm_ready_tokens=2,
+            auto_prewarm_not_ready_tokens=0,
+            auto_prewarm_last_status=0,
+            ready_monotonic_us=1_020_000,
+            first_frame_monotonic_us=900_000,
+            last_object_seal_monotonic_us=990_000,
+            prewarm_start_monotonic_us=910_000,
+            prewarm_end_monotonic_us=1_020_000,
+            record_lock_page_count=4,
+            record_lock_resident_pages=4,
+            record_lock_cold_page_gets=0,
+            seal_prewarm_tokens=2,
+            seal_prewarm_success_tokens=2,
+            seal_prewarm_not_ready_tokens=0,
+            seal_prewarm_last_status=0,
+            committed_epoch_fallback_count=1,
+            ready_after_final_metadata_us=200_000,
+        )
+        runner.receiver_ready_after_source_phase2_end_us = 220_000
+
+        with self.assertRaisesRegex(AssertionError, "committed-epoch fallback"):
             runner.validate_standby_transfer_receiver_readiness(
                 expected_standby_pending=2
             )
@@ -5632,6 +5859,60 @@ class WorkloadPlanTest(unittest.TestCase):
             ],
         )
 
+    def test_standby_transfer_source_start_uses_secret_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_datadir = Path(tmpdir) / "src"
+            receiver_datadir = Path(tmpdir) / "rx"
+            source_datadir.mkdir()
+            receiver_datadir.mkdir()
+            runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+            runner.config = HarnessConfig(
+                scenario="standby_transfer_receiver_drain_metrics",
+                receiver_unix_socket="/tmp/receiver.sock",
+                receiver_preserve_dir="/tmp/rx/data/preserve",
+                source_datadir=str(source_datadir),
+                receiver_datadir=str(receiver_datadir),
+                source_start_command="mysqld --defaults-file=/tmp/src.cnf",
+                receiver_start_command="mysqld --defaults-file=/tmp/rx.cnf",
+                restart_command="mysqld --defaults-file=/tmp/src.cnf",
+                receiver_restart_command="mysqld --defaults-file=/tmp/rx.cnf",
+                standby_transfer_password="transfer_secret",
+                standby_transfer_credential_name="transfer_credential",
+            ).validate()
+
+            runner.prepare_standby_transfer_credential_secret_files()
+
+            self.assertIn(
+                "--preserve-trx-transfer-credential-secret-file=",
+                runner.config.source_start_command,
+            )
+            self.assertIn(
+                "--preserve-trx-transfer-credential-secret-file=",
+                runner.config.receiver_start_command,
+            )
+            self.assertIn(
+                "--preserve-trx-transfer-credential-secret-file=",
+                runner.config.restart_command,
+            )
+            self.assertIn(
+                "--preserve-trx-transfer-credential-secret-file=",
+                runner.config.receiver_restart_command,
+            )
+            secret_arg = runner.config.source_start_command.split(
+                "--preserve-trx-transfer-credential-secret-file=", 1
+            )[1].split()[0].strip("'\"")
+            receiver_secret_arg = runner.config.receiver_start_command.split(
+                "--preserve-trx-transfer-credential-secret-file=", 1
+            )[1].split()[0].strip("'\"")
+            self.assertEqual(
+                Path(secret_arg).read_text(encoding="utf-8"),
+                "transfer_secret\n",
+            )
+            self.assertEqual(
+                Path(receiver_secret_arg).read_text(encoding="utf-8"),
+                "transfer_secret\n",
+            )
+
     def test_configure_standby_transfer_credentials_on_source_and_receiver(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.config = HarnessConfig(
@@ -6303,6 +6584,19 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             runner.plan.max_large_payload_bytes_per_statement(),
         )
         self.assertEqual(configured_total, expected_total)
+
+    def test_standby_receiver_metrics_enable_info_log(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+        )
+        runner.runtime = _FakeRuntime()
+
+        runner.configure_preserve_globals()
+
+        self.assertIn("SET GLOBAL log_error_verbosity=3", runner.runtime.sql)
 
     def test_large_batch_configures_preserve_capacity_for_all_sessions(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -7047,6 +7341,13 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertEqual(metrics.prewarm_backlog_at_phase2_end, 0)
         self.assertEqual(metrics.record_lock_required_residency_bytes, 278528)
         self.assertEqual(metrics.record_lock_reserved_residency_bytes, 278528)
+        self.assertEqual(metrics.object_prewarm_proof_count, 4)
+        self.assertEqual(metrics.object_prewarm_miss_count, 1)
+        self.assertEqual(metrics.committed_epoch_fallback_count, 2)
+        self.assertEqual(metrics.staged_token_publish_us, 1200)
+        self.assertEqual(metrics.staged_token_ready_cache_us, 2300)
+        self.assertEqual(metrics.staged_token_total_us, 3500)
+        self.assertEqual(metrics.staged_token_max_us, 900)
         self.assertEqual(metrics.seal_prewarm_tokens, 5)
         self.assertEqual(metrics.seal_prewarm_success_tokens, 4)
         self.assertEqual(metrics.seal_prewarm_not_ready_tokens, 1)

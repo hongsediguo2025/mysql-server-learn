@@ -12385,6 +12385,28 @@ bool Preserve_trx_drain_service::execute(
     }
     return false;
   };
+  auto begin_phase1_transfer_prewarm_manifests = [&]() {
+    if (batch_transfer_source_session == nullptr ||
+        batch_transfer_phase1_declared_tokens.empty()) {
+      return false;
+    }
+    for (const my_thread_id target_thread_id :
+         batch_transfer_phase1_declared_tokens) {
+      const Preserve_trx_transfer_status begin_status =
+          batch_transfer_source_session->begin_token_prewarm_manifest(
+              static_cast<uint64_t>(target_thread_id));
+      if (begin_status == Preserve_trx_transfer_status::OK ||
+          begin_status == Preserve_trx_transfer_status::UNSUPPORTED) {
+        continue;
+      }
+      abort_batch_transfer_epoch(
+          "standby_transfer_phase1_prewarm_manifest_failed");
+      abort_drain_participants(
+          "standby_transfer_phase1_prewarm_manifest_failed");
+      return true;
+    }
+    return false;
+  };
   if (two_phase_enabled) {
     if (drain_orchestrator.open_phase1_participants() !=
         Preserve_trx_drain_status::OK) {
@@ -12458,6 +12480,9 @@ bool Preserve_trx_drain_service::execute(
           "standby_transfer_phase1_binlog_blob_stream_failed");
       abort_drain_participants(
           "standby_transfer_phase1_binlog_blob_stream_failed");
+      return preserve_trx_reject_unsupported();
+    }
+    if (begin_phase1_transfer_prewarm_manifests()) {
       return preserve_trx_reject_unsupported();
     }
     if (temp_table_participant != nullptr &&

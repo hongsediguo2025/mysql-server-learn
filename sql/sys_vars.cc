@@ -1489,6 +1489,15 @@ static Sys_var_charptr Sys_preserve_trx_transfer_credential_name(
     READ_ONLY GLOBAL_VAR(preserve_trx_transfer_credential_name),
     CMD_LINE(REQUIRED_ARG), IN_SYSTEM_CHARSET, DEFAULT(""));
 
+static Sys_var_charptr Sys_preserve_trx_transfer_credential_secret_file(
+    "preserve_trx_transfer_credential_secret_file",
+    "Path to a local file containing the Preserve/Resume standby "
+    "direct-transfer credential secret. The path is read by source background "
+    "sessions and receiver codec code when no in-memory credential store entry "
+    "is available.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_credential_secret_file),
+    CMD_LINE(REQUIRED_ARG), IN_FS_CHARSET, DEFAULT(""));
+
 static Sys_var_enum Sys_preserve_trx_transfer_artifact_mode(
     "preserve_trx_transfer_artifact_mode",
     "Artifact publication mode for Preserve/Resume. LOCAL_CARRIER preserves "
