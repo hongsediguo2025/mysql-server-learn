@@ -205,8 +205,8 @@ die "standby receiver frame apply path must not synchronously prewarm staged or 
 my ($receiver_staged_prewarm_job) =
   $transfer =~ /(Preserve_trx_promotion_adopt_status run_receiver_staged_token_prewarm_job\([\s\S]*?^}\n\nstatic (?:void|bool) run_receiver_object_prewarm_job)/m
   or die "could not isolate standby receiver staged-token prewarm job\n";
-die "standby receiver staged-token publish must use the batch-safe projection helper\n"
-  unless $receiver_staged_prewarm_job =~ /publish_receiver_standby_bundle_projection/s;
+die "online standby receiver staged-token READY must not publish local carrier projection\n"
+  if $receiver_staged_prewarm_job =~ /publish_receiver_standby_bundle_projection/s;
 die "standby receiver staged-token publish must not serialize full token publish under a global mutex\n"
   if $receiver_staged_prewarm_job =~ /g_receiver_standby_publish_mutex[\s\S]*preserve_trx_transfer_publish_standby_bundle/s;
 die "standby receiver projection must not use a single global mutex\n"
@@ -380,6 +380,9 @@ die "preserved record-lock import must expose an import-only page bitmap helper 
 die "record-lock startup prefetch must have an explicit preserve_trx_recover_lock_page_prefetch sysvar\n"
   unless $sys_vars =~ /preserve_trx_recover_lock_page_prefetch/s &&
          $preserve_header =~ /preserve_trx_recover_lock_page_prefetch/s;
+die "record-lock startup prefetch must not expose an unused IO-governor sysvar\n"
+  if $sys_vars =~ /preserve_trx_recover_lock_page_prefetch_io_bytes_per_sec/s ||
+     $preserve_header =~ /preserve_trx_recover_lock_page_prefetch_io_bytes_per_sec/s;
 die "record-lock startup prefetch must live in the preserve-owned lock prefetch helper\n"
   unless $lock_preserve =~
          /lock_preserve_prefetch_record_lock_pages[\s\S]*buf_read_page_background/s;
@@ -2064,9 +2067,27 @@ die "standby transfer production source client must resolve credential-name befo
 die "standby transfer production source client must send frames through COM_PRESERVE_TRX_TRANSFER\n"
   unless $transfer =~
          /default_transfer_client_send[\s\S]*simple_command[\s\S]*COM_PRESERVE_TRX_TRANSFER/s;
-die "standby transfer sender worker sysvar must stay reserved until a real source worker pool exists\n"
-  unless $sys_vars =~
-         /preserve_trx_transfer_sender_workers[\s\S]*reserved[\s\S]*planned source worker pool/s;
+die "standby transfer source publication must be selected only by artifact mode, not by a duplicate source enable sysvar\n"
+  if $sys_vars =~ /preserve_trx_transfer_enable/s ||
+     $transfer =~ /preserve_trx_transfer_enable/s ||
+     $transfer_header =~ /preserve_trx_transfer_enable/s;
+die "batch target preserve failure log must include the failed target thread id\n"
+  unless $preserve =~
+         /PRESERVE: batch target preserve failed[\s\S]*target_thread_id=/s;
+die "standby transfer must log final-target coverage before preserving targets\n"
+  unless $preserve =~
+         /PRESERVE: standby transfer final target coverage/s &&
+         $preserve =~ /missing_declared=/s &&
+         $preserve =~ /missing_binlog=/s &&
+         $preserve =~ /missing_record=/s;
+die "standby transfer must not expose reserved/no-op source sender sysvars\n"
+  if $sys_vars =~ /preserve_trx_transfer_sender_workers/s ||
+     $transfer =~ /preserve_trx_transfer_sender_workers/s ||
+     $transfer_header =~ /preserve_trx_transfer_sender_workers/s;
+die "standby transfer must not expose ineffective data session sysvars while frames are single-sequence\n"
+  if $sys_vars =~ /preserve_trx_transfer_data_sessions/s ||
+     $transfer =~ /preserve_trx_transfer_data_sessions/s ||
+     $transfer_header =~ /preserve_trx_transfer_data_sessions/s;
 die "standby transfer receiver worker sysvar must document the batch receiver worker path\n"
   unless $sys_vars =~
          /preserve_trx_transfer_receiver_workers[\s\S]*batch receiver[\s\S]*classic single-frame dispatch/s;
@@ -2130,6 +2151,9 @@ my $promotion_gate = $&;
 die "standby promotion Phase B gate must not hydrate snapshot payloads when ready-cache gating is required\n"
   if $promotion_gate =~
      /store->read\s*\(|Payload_read_mode|WITH_SEMANTIC_EXTERNAL_BLOBS/s;
+die "strict online promotion gate must not require standby-pending projection membership\n"
+  unless $promotion_gate =~ /strict_online_epoch_gate/s &&
+         $promotion_gate =~ /!strict_online_epoch_gate[\s\S]*standby_pending_tokens\.count/s;
 die "standby promotion simulator must only bypass apply-barrier readiness through a DBUG-only seam\n"
   unless $promotion_gate =~ /g_apply_state_provider\s*!=\s*nullptr/s &&
          $promotion_gate =~
@@ -2257,11 +2281,11 @@ die "standby promotion abandoned marker must carry cleanup states for async roll
          $promotion =~ /CLEANUP_NOT_FOUND/s &&
          $promotion =~ /CLEANUP_TAINTED/s &&
          $promotion =~ /CLAIMED_IMPORT_FAILED/s;
-die "standby transfer design doc must not claim production client transport and worker pools are complete in this milestone\n"
+die "standby transfer design doc must not claim production HA promotion is complete in this milestone\n"
   unless $standby_transfer_doc =~
-         /当前实现状态[\s\S]*source transport[\s\S]*fail-closed/s &&
+         /当前实现状态[\s\S]*source transport[\s\S]*fail-closed/s ||
          $standby_transfer_doc =~
-         /sender_workers[\s\S]*reserved[\s\S]*receiver_workers[\s\S]*reserved/s;
+         /真实物理备机升主[\s\S]*不在/s;
 EOF
 
 SELECT 'ok' AS code_review_resumable_trx_slices_lint;

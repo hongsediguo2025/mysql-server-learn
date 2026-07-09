@@ -150,7 +150,6 @@ uint preserve_trx_lock_warmcopy_conversion_wait_timeout_ms = 30000;
 uint preserve_trx_parallel_preserve_threads = 0;
 uint preserve_trx_startup_recovery_threads = 0;
 bool preserve_trx_recover_lock_page_prefetch = true;
-uint preserve_trx_recover_lock_page_prefetch_io_bytes_per_sec = 134217728;
 extern ulong srv_force_recovery;
 extern ulong srv_rollback_segments;
 extern bool recv_needed_recovery;
@@ -12912,6 +12911,89 @@ bool Preserve_trx_drain_service::execute(
     }
   }
 
+  auto missing_target_sample = [](const std::vector<my_thread_id> &sample)
+      -> std::string {
+    std::ostringstream out;
+    for (size_t i = 0; i < sample.size(); ++i) {
+      if (i != 0) out << ",";
+      out << static_cast<unsigned long long>(sample[i]);
+    }
+    return out.str();
+  };
+  auto append_missing_target_sample = [](std::vector<my_thread_id> *sample,
+                                         my_thread_id thread_id) {
+    if (sample != nullptr && sample->size() < 8) sample->push_back(thread_id);
+  };
+  auto log_batch_transfer_final_target_coverage = [&]() {
+    if (batch_transfer_source_session == nullptr) return;
+
+    Preserve_batch_quiesced_target_pin_collector pin_collector(
+        thd, generation, quiesced_target_thread_ids);
+    Global_THD_manager::get_instance()->do_for_all_thd_copy(&pin_collector);
+
+    std::map<my_thread_id, THD *> pinned_by_thread_id;
+    for (const Preserve_trx_pinned_thd &pinned : pin_collector.targets()) {
+      if (pinned.thd == nullptr) continue;
+      pinned_by_thread_id[pinned.thd->thread_id()] = pinned.thd;
+    }
+
+    size_t phase1_declared_count = 0;
+    size_t record_blob_count = 0;
+    size_t binlog_blob_count = 0;
+    std::vector<my_thread_id> missing_declared_sample;
+    std::vector<my_thread_id> missing_record_sample;
+    std::vector<my_thread_id> missing_binlog_sample;
+    for (const my_thread_id target_thread_id : quiesced_target_thread_ids) {
+      if (batch_transfer_phase1_declared_tokens.count(target_thread_id) != 0) {
+        ++phase1_declared_count;
+      } else {
+        append_missing_target_sample(&missing_declared_sample, target_thread_id);
+      }
+
+      PrebuiltRecordLocksBlob record_blob;
+      if (lock_warmcopy_participant == nullptr ||
+          lock_warmcopy_participant->phase1_record_prebuilt_blob_for_thread(
+              static_cast<uint64_t>(target_thread_id), &record_blob)) {
+        ++record_blob_count;
+      } else {
+        append_missing_target_sample(&missing_record_sample, target_thread_id);
+      }
+
+      const auto pinned_it = pinned_by_thread_id.find(target_thread_id);
+      if (batch_transfer_binlog_blob_provider == nullptr ||
+          (pinned_it != pinned_by_thread_id.end() &&
+           batch_transfer_binlog_blob_provider->has_blob_for_thd(
+               pinned_it->second))) {
+        ++binlog_blob_count;
+      } else {
+        append_missing_target_sample(&missing_binlog_sample, target_thread_id);
+      }
+    }
+
+    std::ostringstream message;
+    message << "PRESERVE: standby transfer final target coverage"
+            << " target_count=" << quiesced_target_thread_ids.size()
+            << " phase1_declared=" << phase1_declared_count
+            << " missing_declared="
+            << (quiesced_target_thread_ids.size() - phase1_declared_count)
+            << " record_blob=" << record_blob_count
+            << " missing_record="
+            << (quiesced_target_thread_ids.size() - record_blob_count)
+            << " binlog_blob=" << binlog_blob_count
+            << " missing_binlog="
+            << (quiesced_target_thread_ids.size() - binlog_blob_count)
+            << " pinned=" << pinned_by_thread_id.size()
+            << " pin_error=" << (pin_collector.error() ? 1 : 0)
+            << " missing_declared_sample="
+            << missing_target_sample(missing_declared_sample)
+            << " missing_record_sample="
+            << missing_target_sample(missing_record_sample)
+            << " missing_binlog_sample="
+            << missing_target_sample(missing_binlog_sample);
+    LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.str().c_str());
+  };
+  log_batch_transfer_final_target_coverage();
+
   std::vector<Preserve_trx_batch_item> preserved_batch_items;
   preserved_batch_items.reserve(quiesced_target_thread_ids.size());
   bool debug_fail_ha_prepare_low = false;
@@ -13150,6 +13232,9 @@ bool Preserve_trx_drain_service::execute(
     const std::string message =
         "PRESERVE: batch target preserve failed visited=" +
         std::to_string(failed_execution->visited_target ? 1 : 0) +
+        " target_thread_id=" +
+        std::to_string(
+            static_cast<unsigned long long>(failed_execution->target_thread_id)) +
         " error=" + std::to_string(failed_execution->error ? 1 : 0) +
         " stage=" + preserve_trx_preserve_stage_name(batch_result.stage) +
         " reason=" +

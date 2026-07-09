@@ -9265,6 +9265,14 @@ SHOW_VAR status_vars[] = {
     {"Preserve_trx_transfer_receiver_object_prewarm_max_us",
      (char *)&show_preserve_trx_transfer_receiver_object_prewarm_max_us,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_recv_obj_prewarm_first_start_us",
+     (char *)
+         &show_preserve_trx_transfer_receiver_object_prewarm_first_start_monotonic_us,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_recv_obj_prewarm_last_end_us",
+     (char *)
+         &show_preserve_trx_transfer_receiver_object_prewarm_last_end_monotonic_us,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_transfer_receiver_record_object_prewarm_count",
      (char *)&show_preserve_trx_transfer_receiver_record_object_prewarm_count,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
@@ -9273,6 +9281,22 @@ SHOW_VAR status_vars[] = {
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_transfer_receiver_record_object_prewarm_max_us",
      (char *)&show_preserve_trx_transfer_receiver_record_object_prewarm_max_us,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_recv_rec_obj_prewarm_first_start_us",
+     (char *)
+         &show_preserve_trx_transfer_receiver_record_object_prewarm_first_start_monotonic_us,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_recv_rec_obj_prewarm_last_end_us",
+     (char *)
+         &show_preserve_trx_transfer_receiver_record_object_prewarm_last_end_monotonic_us,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_recv_binlog_obj_prewarm_first_start_us",
+     (char *)
+         &show_preserve_trx_transfer_receiver_binlog_object_prewarm_first_start_monotonic_us,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_recv_binlog_obj_prewarm_last_end_us",
+     (char *)
+         &show_preserve_trx_transfer_receiver_binlog_object_prewarm_last_end_monotonic_us,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_transfer_receiver_committed_epoch_fallback_count",
      (char *)&show_preserve_trx_transfer_receiver_committed_epoch_fallback_count,

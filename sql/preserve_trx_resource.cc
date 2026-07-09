@@ -471,6 +471,12 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_object_prewarm_max_us,
     preserve_trx_transfer_receiver_object_prewarm_max_us_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_object_prewarm_first_start_monotonic_us,
+    preserve_trx_transfer_receiver_object_prewarm_first_start_monotonic_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_object_prewarm_last_end_monotonic_us,
+    preserve_trx_transfer_receiver_object_prewarm_last_end_monotonic_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_record_object_prewarm_count,
     preserve_trx_transfer_receiver_record_object_prewarm_count_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
@@ -479,6 +485,18 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_record_object_prewarm_max_us,
     preserve_trx_transfer_receiver_record_object_prewarm_max_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_record_object_prewarm_first_start_monotonic_us,
+    preserve_trx_transfer_receiver_record_object_prewarm_first_start_monotonic_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_record_object_prewarm_last_end_monotonic_us,
+    preserve_trx_transfer_receiver_record_object_prewarm_last_end_monotonic_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_binlog_object_prewarm_first_start_monotonic_us,
+    preserve_trx_transfer_receiver_binlog_object_prewarm_first_start_monotonic_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_binlog_object_prewarm_last_end_monotonic_us,
+    preserve_trx_transfer_receiver_binlog_object_prewarm_last_end_monotonic_us_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_committed_epoch_fallback_count,
     preserve_trx_transfer_receiver_committed_epoch_fallback_count_status())

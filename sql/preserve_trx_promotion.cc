@@ -53,15 +53,12 @@
 uint preserve_trx_promotion_gate_batch_tokens = 3;
 uint preserve_trx_promotion_gate_workers = 3;
 uint preserve_trx_promotion_gate_timeout_ms = 1000;
-uint preserve_trx_promotion_gate_record_lock_page_cap = 2000;
 
 Preserve_trx_promotion_adopt_all_request::
     Preserve_trx_promotion_adopt_all_request()
     : gate_batch_tokens(preserve_trx_promotion_gate_batch_tokens),
       worker_count(preserve_trx_promotion_gate_workers),
-      gate_timeout_ms(preserve_trx_promotion_gate_timeout_ms),
-      gate_record_lock_page_cap(
-          preserve_trx_promotion_gate_record_lock_page_cap) {}
+      gate_timeout_ms(preserve_trx_promotion_gate_timeout_ms) {}
 
 namespace {
 
@@ -1134,8 +1131,6 @@ const char *preserve_trx_promotion_adopt_status_name(
       return "READY_CACHE_NOT_READY";
     case Preserve_trx_promotion_adopt_status::TOO_MANY_PROMOTION_TOKENS:
       return "TOO_MANY_PROMOTION_TOKENS";
-    case Preserve_trx_promotion_adopt_status::TOO_MANY_RECORD_LOCK_PAGES:
-      return "TOO_MANY_RECORD_LOCK_PAGES";
     case Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT:
       return "CORRUPT_ARTIFACT";
     case Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT:
@@ -1946,20 +1941,31 @@ preserved_trx_promotion_ready_summary_for_epoch(
        ready_cache_entries_for_epoch(preserve_dir, epoch_id)) {
     const uint64_t token = cache_item.first;
     const Promotion_ready_cache_entry &cache_entry = cache_item.second;
-    if (reported_tokens.count(token) != 0 ||
-        cache_entry.state != Preserve_trx_promotion_ready_state::
-                                 PREWARMED_PENDING_FINAL_FACT) {
+    if (reported_tokens.count(token) != 0) {
       continue;
     }
-    summary->pending_tokens.push_back(token);
-    summary->max_required_apply_lsn =
-        std::max(summary->max_required_apply_lsn,
-                 cache_entry.required_apply_lsn);
-    append_ready_summary_token_result(
-        summary, token,
-        Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
-        cache_entry.reason.empty() ? "prewarmed pending final epoch fact"
-                                   : cache_entry.reason);
+    if (cache_entry.state == Preserve_trx_promotion_ready_state::READY) {
+      summary->ready_tokens.push_back(token);
+      summary->max_required_apply_lsn =
+          std::max(summary->max_required_apply_lsn,
+                   cache_entry.required_apply_lsn);
+    } else if (cache_entry.state == Preserve_trx_promotion_ready_state::CORRUPT) {
+      summary->corrupt_tokens.push_back(token);
+      append_ready_summary_token_result(
+          summary, token, Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT,
+          cache_entry.reason.empty() ? "promotion-ready cache is corrupt"
+                                     : cache_entry.reason);
+    } else {
+      summary->pending_tokens.push_back(token);
+      summary->max_required_apply_lsn =
+          std::max(summary->max_required_apply_lsn,
+                   cache_entry.required_apply_lsn);
+      append_ready_summary_token_result(
+          summary, token,
+          Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
+          cache_entry.reason.empty() ? "promotion-ready cache not ready"
+                                     : cache_entry.reason);
+    }
   }
   std::sort(summary->ready_tokens.begin(), summary->ready_tokens.end());
   std::sort(summary->pending_tokens.begin(), summary->pending_tokens.end());
@@ -2049,14 +2055,17 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
         return finish_gate_result(status);
       };
   Preserved_trx_carrier_listing listing;
-  const Preserve_snapshot_status list_status = store->list_tokens(&listing);
-  if (list_status != Preserve_snapshot_status::OK) {
-    return finish_gate_result(carrier_status_to_promotion_status(list_status));
-  }
+  bool listing_loaded = false;
+  auto load_listing = [&]() {
+    if (listing_loaded) return Preserve_snapshot_status::OK;
+    const Preserve_snapshot_status list_status = store->list_tokens(&listing);
+    if (list_status == Preserve_snapshot_status::OK) listing_loaded = true;
+    return list_status;
+  };
 
   std::set<uint64_t> requested_tokens;
+  bool requested_from_epoch_fact = false;
   if (request.tokens.empty()) {
-    bool requested_from_epoch_fact = false;
     if (request.require_epoch_committed &&
         preserve_trx_transfer_epoch_committed(preserve_dir, request.epoch_id)) {
       Preserve_trx_transfer_epoch_fact fact;
@@ -2072,6 +2081,10 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
       }
     }
     if (!requested_from_epoch_fact) {
+      const Preserve_snapshot_status list_status = load_listing();
+      if (list_status != Preserve_snapshot_status::OK) {
+        return finish_gate_result(carrier_status_to_promotion_status(list_status));
+      }
       for (const std::string &token_string : listing.standby_pending_tokens) {
         uint64_t token = 0;
         if (!parse_uint64_strict(token_string, &token) || token == 0) {
@@ -2103,9 +2116,18 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
         Preserve_trx_promotion_adopt_status::TOKEN_NOT_FOUND);
   }
 
+  const bool strict_online_epoch_gate =
+      request.require_epoch_committed && request.require_promotion_ready_cache;
   for (uint64_t token : requested_tokens) {
     const std::string token_string = std::to_string(token);
-    if (listing.standby_pending_tokens.count(token_string) == 0) {
+    if (!strict_online_epoch_gate) {
+      const Preserve_snapshot_status list_status = load_listing();
+      if (list_status != Preserve_snapshot_status::OK) {
+        return finish_gate_result(carrier_status_to_promotion_status(list_status));
+      }
+    }
+    if (!strict_online_epoch_gate &&
+        listing.standby_pending_tokens.count(token_string) == 0) {
       const Preserve_trx_promotion_adopt_status status =
           listing.snapshot_tokens.count(token_string) != 0
               ? Preserve_trx_promotion_adopt_status::NOT_STANDBY_PENDING
@@ -2281,18 +2303,6 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
               result, token,
               Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY,
               "record-lock pages are not resident",
-              Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING);
-          continue;
-        }
-        if (ready_cache_entry_needs_record_lock_prewarm(cache_entry) &&
-            cache_entry.record_lock_page_count >
-                request.gate_record_lock_page_cap) {
-          ++result->over_budget_count;
-          add_abandoned_token(
-              result, token,
-              Preserve_trx_promotion_adopt_status::
-                  TOO_MANY_RECORD_LOCK_PAGES,
-              "record-lock page count exceeds promotion gate budget",
               Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING);
           continue;
         }

@@ -54,7 +54,6 @@ enum class Preserve_trx_transfer_artifact_decision {
   UNSUPPORTED
 };
 
-extern bool preserve_trx_transfer_enable;
 extern bool preserve_trx_transfer_receiver_enable;
 extern char *preserve_trx_transfer_allowed_source_uuid;
 extern char *preserve_trx_transfer_target_server_uuid;
@@ -65,8 +64,6 @@ extern char *preserve_trx_transfer_target_user;
 extern char *preserve_trx_transfer_credential_name;
 extern char *preserve_trx_transfer_credential_secret_file;
 extern ulong preserve_trx_transfer_artifact_mode;
-extern uint preserve_trx_transfer_data_sessions;
-extern uint preserve_trx_transfer_sender_workers;
 extern uint preserve_trx_transfer_receiver_workers;
 extern uint preserve_trx_transfer_chunk_bytes;
 extern ulonglong preserve_trx_transfer_max_inflight_bytes;
@@ -90,9 +87,21 @@ uint64_t preserve_trx_transfer_receiver_object_prewarm_miss_count_status();
 uint64_t preserve_trx_transfer_receiver_object_prewarm_count_status();
 uint64_t preserve_trx_transfer_receiver_object_prewarm_us_status();
 uint64_t preserve_trx_transfer_receiver_object_prewarm_max_us_status();
+uint64_t
+preserve_trx_transfer_receiver_object_prewarm_first_start_monotonic_us_status();
+uint64_t
+preserve_trx_transfer_receiver_object_prewarm_last_end_monotonic_us_status();
 uint64_t preserve_trx_transfer_receiver_record_object_prewarm_count_status();
 uint64_t preserve_trx_transfer_receiver_record_object_prewarm_us_status();
 uint64_t preserve_trx_transfer_receiver_record_object_prewarm_max_us_status();
+uint64_t
+preserve_trx_transfer_receiver_record_object_prewarm_first_start_monotonic_us_status();
+uint64_t
+preserve_trx_transfer_receiver_record_object_prewarm_last_end_monotonic_us_status();
+uint64_t
+preserve_trx_transfer_receiver_binlog_object_prewarm_first_start_monotonic_us_status();
+uint64_t
+preserve_trx_transfer_receiver_binlog_object_prewarm_last_end_monotonic_us_status();
 uint64_t preserve_trx_transfer_receiver_committed_epoch_fallback_count_status();
 uint64_t preserve_trx_transfer_receiver_staged_token_publish_us_status();
 uint64_t preserve_trx_transfer_receiver_staged_token_ready_cache_us_status();

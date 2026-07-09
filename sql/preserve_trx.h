@@ -130,7 +130,6 @@ extern uint preserve_trx_lock_warmcopy_conversion_wait_timeout_ms;
 extern uint preserve_trx_parallel_preserve_threads;
 extern uint preserve_trx_startup_recovery_threads;
 extern bool preserve_trx_recover_lock_page_prefetch;
-extern uint preserve_trx_recover_lock_page_prefetch_io_bytes_per_sec;
 
 uint preserve_trx_auto_parallel_preserve_threads(uint hardware_threads);
 bool preserve_trx_is_enabled();

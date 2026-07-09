@@ -33,7 +33,6 @@
 extern uint preserve_trx_promotion_gate_batch_tokens;
 extern uint preserve_trx_promotion_gate_workers;
 extern uint preserve_trx_promotion_gate_timeout_ms;
-extern uint preserve_trx_promotion_gate_record_lock_page_cap;
 
 uint64_t preserve_trx_promotion_gate_elapsed_us_status();
 uint64_t preserve_trx_promotion_gate_token_count_status();
@@ -65,7 +64,6 @@ enum class Preserve_trx_promotion_adopt_status {
   APPLY_BARRIER_NOT_REACHED,
   READY_CACHE_NOT_READY,
   TOO_MANY_PROMOTION_TOKENS,
-  TOO_MANY_RECORD_LOCK_PAGES,
   CORRUPT_ARTIFACT,
   UNSUPPORTED_ARTIFACT,
   CLAIMED_IMPORT_FAILED,
@@ -207,7 +205,6 @@ struct Preserve_trx_promotion_adopt_all_request {
   uint32_t gate_batch_tokens;
   uint32_t worker_count;
   uint64_t gate_timeout_ms;
-  uint64_t gate_record_lock_page_cap;
 };
 
 enum class Preserve_trx_promotion_cleanup_state {

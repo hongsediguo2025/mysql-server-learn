@@ -337,11 +337,23 @@ int show_preserve_trx_transfer_receiver_object_prewarm_us(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_object_prewarm_max_us(
     THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_object_prewarm_first_start_monotonic_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_object_prewarm_last_end_monotonic_us(
+    THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_record_object_prewarm_count(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_record_object_prewarm_us(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_record_object_prewarm_max_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_record_object_prewarm_first_start_monotonic_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_record_object_prewarm_last_end_monotonic_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_binlog_object_prewarm_first_start_monotonic_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_binlog_object_prewarm_last_end_monotonic_us(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_committed_epoch_fallback_count(
     THD *thd, SHOW_VAR *var, char *buf);

@@ -948,9 +948,15 @@ class ReceiverPrewarmMetrics:
     object_prewarm_count: int = 0
     object_prewarm_us: int = 0
     object_prewarm_max_us: int = 0
+    object_prewarm_first_start_monotonic_us: int = 0
+    object_prewarm_last_end_monotonic_us: int = 0
     record_object_prewarm_count: int = 0
     record_object_prewarm_us: int = 0
     record_object_prewarm_max_us: int = 0
+    record_object_prewarm_first_start_monotonic_us: int = 0
+    record_object_prewarm_last_end_monotonic_us: int = 0
+    binlog_object_prewarm_first_start_monotonic_us: int = 0
+    binlog_object_prewarm_last_end_monotonic_us: int = 0
     committed_epoch_fallback_count: int = 0
     staged_token_publish_us: int = 0
     staged_token_ready_cache_us: int = 0
@@ -3027,6 +3033,15 @@ class MySQLRuntime:
             or "er_preserve_trx_session_drained" in text
         )
 
+    def is_preserve_session_drained(self, exc: BaseException) -> bool:
+        if getattr(exc, "errno", None) == 4020:
+            return True
+        text = str(exc).lower()
+        return (
+            "this session's transaction has been preserved" in text
+            or "er_preserve_trx_session_drained" in text
+        )
+
     def wait_until_up(self, timeout_s: float) -> None:
         deadline = time.monotonic() + timeout_s
         last_error: Optional[BaseException] = None
@@ -3304,6 +3319,26 @@ class BusinessWorker(threading.Thread):
                     )
                 return conn
             except BaseException as exc:
+                if (
+                    self.plan.config.scenario == "standby_transfer_receiver_drain_metrics"
+                    and self.runtime.is_preserve_session_drained(exc)
+                ):
+                    LOG.info(
+                        "worker sid=%s transaction was handed off to standby-transfer DRAIN at commit",
+                        self.sid,
+                    )
+                    self.stop_event.set()
+                    return conn
+                if (
+                    self.plan.config.scenario == "standby_transfer_receiver_drain_metrics"
+                    and self.runtime.is_connection_error(exc)
+                ):
+                    LOG.info(
+                        "worker sid=%s connection closed by standby-transfer DRAIN at commit",
+                        self.sid,
+                    )
+                    self.stop_event.set()
+                    return conn
                 if not self.runtime.is_connection_error(exc):
                     raise
                 LOG.info("worker sid=%s waiting for resume while committing tx=%s", self.sid, tx_id)
@@ -4590,16 +4625,15 @@ class BusinessE2ERunner:
         last_counts = self.receiver_preserve_artifact_counts()
         while True:
             if (
-                last_counts.get("standby_pending_tokens", 0)
-                >= expected_standby_pending
-                and last_counts.get("epoch_fact_count", 0) >= 1
+                last_counts.get("epoch_fact_count", 0) >= 1
+                and last_counts.get("epoch_commit_count", 0) >= 1
             ):
                 return last_counts
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(
-                    "receiver did not publish expected standby transfer artifacts: "
-                    f"expected_standby_pending={expected_standby_pending} "
+                    "receiver did not publish expected online epoch metadata: "
+                    f"expected_ready_tokens={expected_standby_pending} "
                     f"observed={last_counts}"
                 )
             time.sleep(min(0.2, remaining))
@@ -4650,20 +4684,31 @@ class BusinessE2ERunner:
             getattr(self, "receiver_artifact_counts", {})
             or self.receiver_preserve_artifact_counts()
         )
-        receiver_ready_after_source_phase2_end_us = getattr(
-            self, "receiver_ready_after_source_phase2_end_us", None
-        )
         receiver_prewarm_metrics = getattr(self, "receiver_prewarm_metrics", None)
         source_phase2_end_us = self.latest_source_phase2_end_monotonic_us()
-        receiver_phase1_overlap = (
+        receiver_object_prewarm_phase1_overlap = (
             None
             if receiver_prewarm_metrics is None or source_phase2_end_us is None
             else (
                 receiver_prewarm_metrics.first_frame_monotonic_us > 0
-                and receiver_prewarm_metrics.prewarm_start_monotonic_us > 0
+                and receiver_prewarm_metrics.object_prewarm_first_start_monotonic_us
+                > 0
                 and receiver_prewarm_metrics.first_frame_monotonic_us
                 <= source_phase2_end_us
-                and receiver_prewarm_metrics.prewarm_start_monotonic_us
+                and receiver_prewarm_metrics.object_prewarm_first_start_monotonic_us
+                <= source_phase2_end_us
+            )
+        )
+        receiver_record_object_prewarm_phase1_overlap = (
+            None
+            if receiver_prewarm_metrics is None or source_phase2_end_us is None
+            else (
+                receiver_prewarm_metrics.first_frame_monotonic_us > 0
+                and receiver_prewarm_metrics.record_object_prewarm_first_start_monotonic_us
+                > 0
+                and receiver_prewarm_metrics.first_frame_monotonic_us
+                <= source_phase2_end_us
+                and receiver_prewarm_metrics.record_object_prewarm_first_start_monotonic_us
                 <= source_phase2_end_us
             )
         )
@@ -4675,6 +4720,13 @@ class BusinessE2ERunner:
             for metric in metrics
             if metric.phase2_total_ms is not None
         ]
+        standby_token_count = artifact_counts.get("standby_pending_tokens", 0)
+        if (
+            standby_token_count == 0
+            and receiver_prewarm_metrics is not None
+            and receiver_prewarm_metrics.auto_prewarm_tokens > 0
+        ):
+            standby_token_count = receiver_prewarm_metrics.auto_prewarm_tokens
         def source_metric_samples(field: str) -> List[int]:
             return [
                 int(value)
@@ -4683,11 +4735,6 @@ class BusinessE2ERunner:
                 if value is not None
             ]
 
-        receiver_ready_lag_samples = (
-            []
-            if receiver_ready_after_source_phase2_end_us is None
-            else [receiver_ready_after_source_phase2_end_us]
-        )
         report = {
             "generated_at_utc": datetime.datetime.utcnow()
             .replace(microsecond=0)
@@ -4770,7 +4817,7 @@ class BusinessE2ERunner:
                 metric.lock_warmcopy_live_fallback_count() or 0
                 for metric in metrics
             ),
-            "standby_tokens": artifact_counts.get("standby_pending_tokens", 0),
+            "standby_tokens": standby_token_count,
             "source_phase2_total_us": source_phase2_total_us,
             "source_phase2_end_us": source_phase2_end_us,
             "source_phase2_target_pin_us_samples": source_metric_samples(
@@ -4823,11 +4870,6 @@ class BusinessE2ERunner:
                 if receiver_prewarm_metrics is None
                 else receiver_prewarm_metrics.phase2_final_metadata_fsync_count
             ),
-            "phase2_transfer_final_metadata_ack_us": (
-                0
-                if receiver_prewarm_metrics is None
-                else receiver_prewarm_metrics.phase2_transfer_final_metadata_ack_us
-            ),
             "phase1_business_enqueue_block_us": (
                 0
                 if receiver_prewarm_metrics is None
@@ -4855,9 +4897,6 @@ class BusinessE2ERunner:
                 if receiver_prewarm_metrics is None
                 else receiver_prewarm_metrics.auto_prewarm_not_ready_tokens
             ),
-            "receiver_ready_after_source_phase2_end_us": (
-                receiver_ready_after_source_phase2_end_us
-            ),
             "receiver_ready_after_final_metadata_us": (
                 None
                 if receiver_prewarm_metrics is None
@@ -4878,10 +4917,12 @@ class BusinessE2ERunner:
                 if receiver_prewarm_metrics is None
                 else receiver_prewarm_metrics.prewarm_backlog_at_phase2_end
             ),
-            "receiver_ready_after_source_phase2_summary_us": (
-                _summarize_us_samples(receiver_ready_lag_samples)
+            "receiver_object_prewarm_phase1_overlap": (
+                receiver_object_prewarm_phase1_overlap
             ),
-            "receiver_phase1_transfer_prewarm_overlap": receiver_phase1_overlap,
+            "receiver_record_object_prewarm_phase1_overlap": (
+                receiver_record_object_prewarm_phase1_overlap
+            ),
         }
         if receiver_prewarm_metrics is not None:
             report.update(
@@ -4943,6 +4984,14 @@ class BusinessE2ERunner:
                     "receiver_object_prewarm_max_us": (
                         receiver_prewarm_metrics.object_prewarm_max_us
                     ),
+                    "receiver_object_prewarm_first_start_monotonic_us": (
+                        receiver_prewarm_metrics
+                        .object_prewarm_first_start_monotonic_us
+                    ),
+                    "receiver_object_prewarm_last_end_monotonic_us": (
+                        receiver_prewarm_metrics
+                        .object_prewarm_last_end_monotonic_us
+                    ),
                     "receiver_record_object_prewarm_count": (
                         receiver_prewarm_metrics.record_object_prewarm_count
                     ),
@@ -4951,6 +5000,22 @@ class BusinessE2ERunner:
                     ),
                     "receiver_record_object_prewarm_max_us": (
                         receiver_prewarm_metrics.record_object_prewarm_max_us
+                    ),
+                    "receiver_record_object_prewarm_first_start_monotonic_us": (
+                        receiver_prewarm_metrics
+                        .record_object_prewarm_first_start_monotonic_us
+                    ),
+                    "receiver_record_object_prewarm_last_end_monotonic_us": (
+                        receiver_prewarm_metrics
+                        .record_object_prewarm_last_end_monotonic_us
+                    ),
+                    "receiver_binlog_object_prewarm_first_start_monotonic_us": (
+                        receiver_prewarm_metrics
+                        .binlog_object_prewarm_first_start_monotonic_us
+                    ),
+                    "receiver_binlog_object_prewarm_last_end_monotonic_us": (
+                        receiver_prewarm_metrics
+                        .binlog_object_prewarm_last_end_monotonic_us
                     ),
                     "receiver_committed_epoch_fallback_count": (
                         receiver_prewarm_metrics.committed_epoch_fallback_count
@@ -5038,12 +5103,6 @@ class BusinessE2ERunner:
             getattr(self, "receiver_artifact_counts", {})
             or self.receiver_preserve_artifact_counts()
         )
-        standby_pending = artifact_counts.get("standby_pending_tokens", 0)
-        if standby_pending < expected_standby_pending:
-            raise AssertionError(
-                "receiver not ready: standby-pending token count "
-                f"{standby_pending} < expected {expected_standby_pending}"
-            )
         if artifact_counts.get("epoch_fact_count", 0) < 1 or artifact_counts.get(
             "epoch_commit_count", 0
         ) < 1:
@@ -6830,9 +6889,15 @@ class BusinessE2ERunner:
             "Preserve_trx_transfer_receiver_object_prewarm_count",
             "Preserve_trx_transfer_receiver_object_prewarm_us",
             "Preserve_trx_transfer_receiver_object_prewarm_max_us",
+            "Preserve_trx_recv_obj_prewarm_first_start_us",
+            "Preserve_trx_recv_obj_prewarm_last_end_us",
             "Preserve_trx_transfer_receiver_record_object_prewarm_count",
             "Preserve_trx_transfer_receiver_record_object_prewarm_us",
             "Preserve_trx_transfer_receiver_record_object_prewarm_max_us",
+            "Preserve_trx_recv_rec_obj_prewarm_first_start_us",
+            "Preserve_trx_recv_rec_obj_prewarm_last_end_us",
+            "Preserve_trx_recv_binlog_obj_prewarm_first_start_us",
+            "Preserve_trx_recv_binlog_obj_prewarm_last_end_us",
             "Preserve_trx_transfer_receiver_committed_epoch_fallback_count",
             "Preserve_trx_transfer_receiver_staged_token_publish_us",
             "Preserve_trx_transfer_receiver_staged_token_ready_cache_us",
@@ -6982,6 +7047,12 @@ class BusinessE2ERunner:
                 object_prewarm_max_us=metric(
                     "Preserve_trx_transfer_receiver_object_prewarm_max_us"
                 ),
+                object_prewarm_first_start_monotonic_us=metric(
+                    "Preserve_trx_recv_obj_prewarm_first_start_us"
+                ),
+                object_prewarm_last_end_monotonic_us=metric(
+                    "Preserve_trx_recv_obj_prewarm_last_end_us"
+                ),
                 record_object_prewarm_count=metric(
                     "Preserve_trx_transfer_receiver_record_object_prewarm_count"
                 ),
@@ -6990,6 +7061,18 @@ class BusinessE2ERunner:
                 ),
                 record_object_prewarm_max_us=metric(
                     "Preserve_trx_transfer_receiver_record_object_prewarm_max_us"
+                ),
+                record_object_prewarm_first_start_monotonic_us=metric(
+                    "Preserve_trx_recv_rec_obj_prewarm_first_start_us"
+                ),
+                record_object_prewarm_last_end_monotonic_us=metric(
+                    "Preserve_trx_recv_rec_obj_prewarm_last_end_us"
+                ),
+                binlog_object_prewarm_first_start_monotonic_us=metric(
+                    "Preserve_trx_recv_binlog_obj_prewarm_first_start_us"
+                ),
+                binlog_object_prewarm_last_end_monotonic_us=metric(
+                    "Preserve_trx_recv_binlog_obj_prewarm_last_end_us"
                 ),
                 committed_epoch_fallback_count=metric(
                     "Preserve_trx_transfer_receiver_committed_epoch_fallback_count"

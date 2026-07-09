@@ -64,13 +64,11 @@ class LockWarmcopyNfr2RunnerTest(unittest.TestCase):
                 paths,
                 ServerOptions(
                     extra_mysqld_options=[
-                        "preserve-trx-transfer-enable=ON",
                         "preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE",
                     ]
                 ),
             )
 
-        self.assertIn("preserve-trx-transfer-enable=ON", rendered)
         self.assertIn(
             "preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE",
             rendered,

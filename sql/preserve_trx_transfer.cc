@@ -70,7 +70,6 @@
 #include "scope_guard.h"
 #include "storage/innobase/include/trx0preserve.h"
 
-bool preserve_trx_transfer_enable = false;
 bool preserve_trx_transfer_receiver_enable = false;
 char *preserve_trx_transfer_allowed_source_uuid = nullptr;
 char *preserve_trx_transfer_target_server_uuid = nullptr;
@@ -82,8 +81,6 @@ char *preserve_trx_transfer_credential_name = nullptr;
 char *preserve_trx_transfer_credential_secret_file = nullptr;
 ulong preserve_trx_transfer_artifact_mode =
     PRESERVE_TRX_TRANSFER_ARTIFACT_LOCAL_CARRIER;
-uint preserve_trx_transfer_data_sessions = 3;
-uint preserve_trx_transfer_sender_workers = 3;
 uint preserve_trx_transfer_receiver_workers = 3;
 uint preserve_trx_transfer_chunk_bytes = 1048576;
 ulonglong preserve_trx_transfer_max_inflight_bytes = 1073741824ULL;
@@ -107,9 +104,15 @@ static std::atomic<uint64_t> g_receiver_object_prewarm_miss_count{0};
 static std::atomic<uint64_t> g_receiver_object_prewarm_count{0};
 static std::atomic<uint64_t> g_receiver_object_prewarm_us{0};
 static std::atomic<uint64_t> g_receiver_object_prewarm_max_us{0};
+static std::atomic<uint64_t> g_receiver_object_prewarm_first_start_us{0};
+static std::atomic<uint64_t> g_receiver_object_prewarm_last_end_us{0};
 static std::atomic<uint64_t> g_receiver_record_object_prewarm_count{0};
 static std::atomic<uint64_t> g_receiver_record_object_prewarm_us{0};
 static std::atomic<uint64_t> g_receiver_record_object_prewarm_max_us{0};
+static std::atomic<uint64_t> g_receiver_record_object_prewarm_first_start_us{0};
+static std::atomic<uint64_t> g_receiver_record_object_prewarm_last_end_us{0};
+static std::atomic<uint64_t> g_receiver_binlog_object_prewarm_first_start_us{0};
+static std::atomic<uint64_t> g_receiver_binlog_object_prewarm_last_end_us{0};
 static std::atomic<uint64_t> g_receiver_committed_epoch_fallback_count{0};
 static std::atomic<uint64_t> g_receiver_staged_token_publish_us{0};
 static std::atomic<uint64_t> g_receiver_staged_token_ready_cache_us{0};
@@ -294,6 +297,16 @@ uint64_t preserve_trx_transfer_receiver_object_prewarm_max_us_status() {
   return g_receiver_object_prewarm_max_us.load();
 }
 
+uint64_t
+preserve_trx_transfer_receiver_object_prewarm_first_start_monotonic_us_status() {
+  return g_receiver_object_prewarm_first_start_us.load();
+}
+
+uint64_t
+preserve_trx_transfer_receiver_object_prewarm_last_end_monotonic_us_status() {
+  return g_receiver_object_prewarm_last_end_us.load();
+}
+
 uint64_t preserve_trx_transfer_receiver_record_object_prewarm_count_status() {
   return g_receiver_record_object_prewarm_count.load();
 }
@@ -304,6 +317,26 @@ uint64_t preserve_trx_transfer_receiver_record_object_prewarm_us_status() {
 
 uint64_t preserve_trx_transfer_receiver_record_object_prewarm_max_us_status() {
   return g_receiver_record_object_prewarm_max_us.load();
+}
+
+uint64_t
+preserve_trx_transfer_receiver_record_object_prewarm_first_start_monotonic_us_status() {
+  return g_receiver_record_object_prewarm_first_start_us.load();
+}
+
+uint64_t
+preserve_trx_transfer_receiver_record_object_prewarm_last_end_monotonic_us_status() {
+  return g_receiver_record_object_prewarm_last_end_us.load();
+}
+
+uint64_t
+preserve_trx_transfer_receiver_binlog_object_prewarm_first_start_monotonic_us_status() {
+  return g_receiver_binlog_object_prewarm_first_start_us.load();
+}
+
+uint64_t
+preserve_trx_transfer_receiver_binlog_object_prewarm_last_end_monotonic_us_status() {
+  return g_receiver_binlog_object_prewarm_last_end_us.load();
 }
 
 uint64_t preserve_trx_transfer_receiver_committed_epoch_fallback_count_status() {
@@ -494,8 +527,7 @@ preserve_trx_transfer_artifact_decision() {
   if (!preserve_trx_is_enabled()) {
     return Preserve_trx_transfer_artifact_decision::UNSUPPORTED;
   }
-  if (preserve_trx_transfer_enable &&
-      preserve_trx_transfer_artifact_mode ==
+  if (preserve_trx_transfer_artifact_mode ==
           PRESERVE_TRX_TRANSFER_ARTIFACT_STANDBY_TRANSFER_SAVE) {
     if (!preserve_trx_transfer_source_endpoint_ready()) {
       return Preserve_trx_transfer_artifact_decision::UNSUPPORTED;
@@ -881,9 +913,7 @@ class Preserve_trx_transfer_client_frame_sink final
       Preserve_trx_transfer_client_endpoint endpoint,
       const Preserve_trx_transfer_client_ops *ops)
       : m_endpoint(std::move(endpoint)), m_ops(ops) {
-    const uint session_count =
-        std::max<uint>(1, preserve_trx_transfer_data_sessions);
-    m_connections.resize(session_count, nullptr);
+    m_connections.resize(1, nullptr);
   }
 
   ~Preserve_trx_transfer_client_frame_sink() override {
@@ -2010,7 +2040,6 @@ Preserve_trx_transfer_status map_promotion_status_to_transfer(
     case Preserve_trx_promotion_adopt_status::APPLY_BARRIER_NOT_REACHED:
     case Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY:
     case Preserve_trx_promotion_adopt_status::TOO_MANY_PROMOTION_TOKENS:
-    case Preserve_trx_promotion_adopt_status::TOO_MANY_RECORD_LOCK_PAGES:
     case Preserve_trx_promotion_adopt_status::CLAIMED_IMPORT_FAILED:
     case Preserve_trx_promotion_adopt_status::TOKEN_ABANDONED:
     case Preserve_trx_promotion_adopt_status::CLEANUP_PENDING:
@@ -2141,6 +2170,15 @@ void update_receiver_max_us(std::atomic<uint64_t> *max_value,
   }
 }
 
+void update_receiver_first_us(std::atomic<uint64_t> *first_value,
+                              uint64_t started_us) {
+  if (first_value == nullptr || started_us == 0) return;
+  uint64_t current = first_value->load();
+  while ((current == 0 || started_us < current) &&
+         !first_value->compare_exchange_weak(current, started_us)) {
+  }
+}
+
 void note_receiver_staged_token_job_started() {
   const uint64_t active = g_receiver_staged_token_active.fetch_add(1) + 1;
   uint64_t current = g_receiver_staged_token_max_active.load();
@@ -2160,17 +2198,34 @@ void note_receiver_staged_token_job_finished() {
 
 void note_receiver_object_prewarm_elapsed(uint64_t started_us,
                                           uint64_t elapsed_us,
-                                          bool record_lock_object) {
+                                          bool record_lock_object,
+                                          bool binlog_object) {
+  const uint64_t finished_us = started_us + elapsed_us;
   uint64_t expected_start = 0;
   (void)g_receiver_object_prewarm_start_monotonic_us.compare_exchange_strong(
       expected_start, started_us);
+  update_receiver_first_us(&g_receiver_object_prewarm_first_start_us,
+                           started_us);
+  update_receiver_max_us(&g_receiver_object_prewarm_last_end_us, finished_us);
   g_receiver_object_prewarm_count.fetch_add(1);
   g_receiver_object_prewarm_us.fetch_add(elapsed_us);
   update_receiver_max_us(&g_receiver_object_prewarm_max_us, elapsed_us);
-  if (!record_lock_object) return;
-  g_receiver_record_object_prewarm_count.fetch_add(1);
-  g_receiver_record_object_prewarm_us.fetch_add(elapsed_us);
-  update_receiver_max_us(&g_receiver_record_object_prewarm_max_us, elapsed_us);
+  if (record_lock_object) {
+    update_receiver_first_us(&g_receiver_record_object_prewarm_first_start_us,
+                             started_us);
+    update_receiver_max_us(&g_receiver_record_object_prewarm_last_end_us,
+                           finished_us);
+    g_receiver_record_object_prewarm_count.fetch_add(1);
+    g_receiver_record_object_prewarm_us.fetch_add(elapsed_us);
+    update_receiver_max_us(&g_receiver_record_object_prewarm_max_us,
+                           elapsed_us);
+  }
+  if (binlog_object) {
+    update_receiver_first_us(&g_receiver_binlog_object_prewarm_first_start_us,
+                             started_us);
+    update_receiver_max_us(&g_receiver_binlog_object_prewarm_last_end_us,
+                           finished_us);
+  }
 }
 
 void note_receiver_projection_publish_us(uint64_t elapsed_us) {
@@ -5940,9 +5995,9 @@ Preserve_trx_transfer_status finalize_receiver_ready_token_staging(
   }
 
   /*
-    Record-lock object prewarm reads the transfer staging object. Projection is
-    durable before READY, but staging cannot be removed until the token has
-    actually populated the ready cache.
+    Record-lock object prewarm reads the transfer staging object. Online READY is
+    bound to the committed epoch fact and ready cache; staging cannot be removed
+    until the token has actually populated the ready cache.
   */
   (void)cleanup_transfer_token_staging(root_dir, manifest.epoch_id,
                                        manifest.token);
@@ -5976,19 +6031,6 @@ Preserve_trx_promotion_adopt_status run_receiver_staged_token_prewarm_job(
         Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
     return Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT;
   }
-
-  const uint64_t publish_started_us = transfer_monotonic_us();
-  const Preserve_trx_transfer_status publish_status =
-      publish_receiver_standby_bundle_projection(root_dir, manifest,
-                                                 staged_bundle,
-                                                 objects_already_sealed);
-  if (publish_status != Preserve_trx_transfer_status::OK) {
-    note_receiver_seal_prewarm_status(
-        Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT);
-    return Preserve_trx_promotion_adopt_status::CORRUPT_ARTIFACT;
-  }
-  g_receiver_staged_token_publish_us.fetch_add(transfer_monotonic_us() -
-                                               publish_started_us);
 
   const uint64_t ready_started_us = transfer_monotonic_us();
   note_receiver_prewarm_start();
@@ -6073,11 +6115,12 @@ static bool run_receiver_object_prewarm_job(
     if (have_inflight_key) finish_receiver_object_prewarm_job(inflight_key);
   });
   const bool record_lock_object = object_id == kPreservedTrxBlobRecordLocks;
+  const bool binlog_object = object_id == kPreservedTrxBlobBinlogCache;
   auto note_elapsed = [&]() {
     const uint64_t finished_us = transfer_monotonic_us();
     note_receiver_object_prewarm_elapsed(
         started_us, finished_us >= started_us ? finished_us - started_us : 0,
-        record_lock_object);
+        record_lock_object, binlog_object);
   };
 
   Receiver_object_prewarm_key key;
@@ -6897,11 +6940,9 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
       }
       if (status == Preserve_trx_transfer_status::OK) {
         /*
-          The final snapshot, standby-pending marker, and epoch commit marker
-          are now the durable sources of truth for every sealed token in this
-          epoch. Staging files are only transfer assembly scratch space, so
-          remove them without changing already-published token state if cleanup
-          itself fails.
+          Streaming receiver READY is an online handoff state. The ready cache is
+          bound to the committed epoch fact, so local standby-pending projection
+          is not part of the phase-2/READY critical path.
         */
         const std::vector<Preserve_trx_transfer_receiver_record> records =
             registry->sealed_receiving_records_for_epoch(frame.epoch_id);
