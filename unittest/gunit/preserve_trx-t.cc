@@ -2971,6 +2971,26 @@ TEST_F(PreservedTrxMdlSavepoint,
   EXPECT_EQ(expected_part_key, payload.substr(16, part_key_length));
 }
 
+TEST(PreservedTrxLockWarmcopy,
+     EmptyPhase1RecordPayloadDoesNotSeedRecordCandidate) {
+  lock_warmcopy_reset_for_unit_test();
+
+  Preserve_trx_lock_warmcopy_options options;
+  options.enabled = true;
+  Preserve_trx_lock_warmcopy_drain_participant participant(options);
+  ASSERT_TRUE(participant.open_phase1());
+
+  ASSERT_TRUE(participant.prepare_phase1_record_payload_for_thread_for_unit_test(
+      42, std::string()));
+
+  PrebuiltRecordLocksBlob blob;
+  EXPECT_FALSE(participant.phase1_record_prebuilt_blob_for_thread(42, &blob));
+  EXPECT_FALSE(participant.record_locks_seeded_in_phase1_for_unit_test(42));
+
+  participant.abort_phase();
+  lock_warmcopy_reset_for_unit_test();
+}
+
 class PreserveSnapshotTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -3560,6 +3580,42 @@ class PreserveSnapshotTest : public ::testing::Test {
   std::string m_saved_server_uuid;
   const char *m_saved_server_uuid_ptr{nullptr};
 };
+
+TEST_F(PreserveSnapshotTest,
+       LockWarmcopyMaterializesQuiescedRecordBlobForTransferCatchup) {
+  lock_warmcopy_reset_for_unit_test();
+
+  Preserve_trx_lock_warmcopy_options options;
+  options.enabled = true;
+  options.preserve_dir = m_dir;
+  Preserve_trx_lock_warmcopy_drain_participant participant(options);
+  ASSERT_TRUE(participant.open_phase1());
+
+  Preserve_trx_lock_warmcopy_artifact artifact;
+  artifact.valid = true;
+  artifact.reason = Preserve_trx_lock_warmcopy_reason::OK;
+  artifact.source = Preserve_trx_lock_warmcopy_artifact_source::WARM_COPY;
+  artifact.record_locks_payload =
+      record_locks_payload() + "quiesced-final-catchup-record";
+  artifact.record_lock_count = 1;
+  artifact.mdl_descriptors_payload = empty_mdl_descriptors_payload();
+  participant.set_artifact_for_thread_for_unit_test(7001, artifact);
+
+  PrebuiltRecordLocksBlob blob;
+  EXPECT_EQ(Preserve_trx_lock_warmcopy_record_blob_status::OK,
+            participant.ensure_quiesced_record_prebuilt_blob_for_thread(7001,
+                                                                        &blob));
+  EXPECT_EQ(kPreservedTrxBlobRecordLocks, blob.name);
+  EXPECT_EQ(artifact.record_locks_payload.size(), blob.size);
+
+  PrebuiltRecordLocksBlob lookup;
+  EXPECT_TRUE(
+      participant.phase1_record_prebuilt_blob_for_thread(7001, &lookup));
+  EXPECT_EQ(blob.warmcopy_id, lookup.warmcopy_id);
+
+  participant.abort_phase();
+  lock_warmcopy_reset_for_unit_test();
+}
 
 TEST_F(PreserveSnapshotTest, PromotionAdoptedEpochMarkerDoesNotDeleteStandby) {
   Local_file_preserved_trx_carrier carrier(m_dir);
@@ -14522,6 +14578,140 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(meta.token, written_metadata.token);
   EXPECT_EQ(bulk_bytes_before,
             preserve_trx_transfer_phase2_bulk_bytes_status());
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferSessionArtifactSinkReplacesStalePresealedRecordLocksBlob) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 616;
+  const std::string stale_record_payload =
+      record_locks_payload() + "stale-phase1-presealed-record-locks";
+  const std::string final_record_payload = record_locks_payload();
+
+  Local_file_preserved_trx_carrier warm_carrier(m_dir);
+  PrebuiltRecordLocksBlob stale_prebuilt_record;
+  create_warm_prebuilt_record_locks_blob(
+      &warm_carrier, "stale-record-warmcopy", stale_record_payload,
+      &stale_prebuilt_record);
+
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  meta.record_locks_payload = final_record_payload;
+  meta.mdl_descriptors_payload = empty_mdl_descriptors_payload();
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  input.externalize_record_locks_payload = true;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+  ASSERT_EQ(1U, bundle.external_blobs.size());
+  ASSERT_FALSE(bundle.external_blobs[0].prebuilt);
+  ASSERT_EQ(kPreservedTrxBlobRecordLocks, bundle.external_blobs[0].name);
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+
+  Local_file_preserved_trx_carrier receiver_carrier(m_dir);
+  Preserved_trx_store store(&receiver_carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  Preserve_snapshot_metadata receiver_metadata;
+  Transfer_receiver_payload_test_sink frame_sink(m_dir, &store, &registry,
+                                                 &receiver_metadata);
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-session-stale-presealed-record", "source-uuid", "target-uuid", 11,
+      &frame_sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_token(transfer_token));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_stream_prebuilt_record_locks_blob(
+                &session, transfer_token, m_dir, stale_prebuilt_record));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.begin_token_prewarm_manifest(transfer_token));
+
+  const uint64_t bulk_bytes_before =
+      preserve_trx_transfer_phase2_bulk_bytes_status();
+  Preserve_trx_transfer_session_artifact_sink sink(&session, transfer_token,
+                                                   m_dir);
+  Preserve_snapshot_metadata written_metadata;
+  bool durable_snapshot_may_exist = false;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            sink.publish_bundle(std::move(bundle), 300, &written_metadata,
+                                &durable_snapshot_may_exist));
+  EXPECT_TRUE(durable_snapshot_may_exist);
+  EXPECT_EQ(meta.token, written_metadata.token);
+  EXPECT_GT(preserve_trx_transfer_phase2_bulk_bytes_status(),
+            bulk_bytes_before);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
+
+  Preserved_trx_carrier_token_state state;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            receiver_carrier.token_state(meta.token, &state));
+  EXPECT_TRUE(state.external_blob);
+  EXPECT_FALSE(state.snapshot);
+  EXPECT_FALSE(state.standby_pending);
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferSourceAndReceiverReplaceDeclaredRecordLocksBlobForCatchup) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 617;
+  const std::string stale_record_payload =
+      record_locks_payload() + "stale-phase1-record-catchup";
+  const std::string final_record_payload =
+      record_locks_payload() + "final-quiesced-record-catchup";
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  Preserve_snapshot_metadata receiver_metadata;
+  Transfer_receiver_payload_test_sink frame_sink(m_dir, &store, &registry,
+                                                 &receiver_metadata);
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-session-record-catchup-replace", "source-uuid", "target-uuid", 11,
+      &frame_sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_token(transfer_token));
+
+  Local_file_preserved_trx_carrier warm_carrier(m_dir);
+  PrebuiltRecordLocksBlob stale_prebuilt_record;
+  create_warm_prebuilt_record_locks_blob(
+      &warm_carrier, "stale-record-catchup", stale_record_payload,
+      &stale_prebuilt_record);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_stream_prebuilt_record_locks_blob(
+                &session, transfer_token, m_dir, stale_prebuilt_record));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.begin_token_prewarm_manifest(transfer_token));
+
+  PrebuiltRecordLocksBlob final_prebuilt_record;
+  create_warm_prebuilt_record_locks_blob(
+      &warm_carrier, "final-record-catchup", final_record_payload,
+      &final_prebuilt_record);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_stream_prebuilt_record_locks_blob(
+                &session, transfer_token, m_dir, final_prebuilt_record));
+
+  Preserve_trx_transfer_object_descriptor final_descriptor;
+  final_descriptor.object_id = kPreservedTrxBlobRecordLocks;
+  final_descriptor.kind = Preserve_trx_transfer_object_kind::EXTERNAL_BLOB;
+  final_descriptor.total_size = final_prebuilt_record.size;
+  final_descriptor.digest = final_prebuilt_record.digest;
+  EXPECT_TRUE(session.object_presealed_for_token(transfer_token,
+                                                final_descriptor));
+
+  Preserve_trx_transfer_receiver_record record;
+  ASSERT_TRUE(registry.lookup("epoch-session-record-catchup-replace",
+                              transfer_token, &record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::RECEIVING, record.state);
+  ASSERT_EQ(1U, record.objects.size());
+  EXPECT_EQ(final_descriptor.object_id, record.objects[0].object_id);
+  EXPECT_EQ(final_descriptor.kind, record.objects[0].kind);
+  EXPECT_EQ(final_descriptor.total_size, record.objects[0].total_size);
+  EXPECT_EQ(final_descriptor.digest, record.objects[0].digest);
+  EXPECT_TRUE(registry.all_objects_sealed(record.epoch_id, record.token));
 }
 
 TEST_F(PreserveSnapshotTest,

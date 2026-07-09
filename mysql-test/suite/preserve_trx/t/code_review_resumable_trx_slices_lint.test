@@ -280,6 +280,11 @@ die "standby streaming transfer phase2 diagnostics must split target preserve wa
 die "standby streaming transfer must stream phase1 binlog-cache blobs before WARMCOPY_CLOSING\n"
   unless $preserve =~
      /stream_phase1_transfer_binlog_cache_blobs[\s\S]*transition_to\s*\(\s*Preserve_trx_manager_state::WARMCOPY_CLOSING/s;
+my ($phase1_binlog_streamer) =
+  $preserve =~ /(static bool stream_phase1_transfer_binlog_cache_blobs[\s\S]*?^}\n\n\/\*)/m
+  or die "could not isolate phase1 transfer binlog-cache streaming helper\n";
+die "standby phase1 binlog-cache streaming must be target-set driven, not idle-scan-only\n"
+  if $phase1_binlog_streamer =~ /Warmcopy_prepare_idle_participants/s;
 die "standby streaming transfer must send phase1 prewarm manifests before WARMCOPY_CLOSING\n"
   unless $preserve =~
      /begin_phase1_transfer_prewarm_manifests[\s\S]*transition_to\s*\(\s*Preserve_trx_manager_state::WARMCOPY_CLOSING/s;
@@ -291,11 +296,30 @@ die "standby receiver single COMMIT_EPOCH frame must use durable spool ACK inste
      /decoded_frame\.type\s*==\s*Preserve_trx_transfer_frame_type::COMMIT_EPOCH[\s\S]*preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*send_receiver_durable_spool_ack/s;
 die "standby streaming transfer must abort phase1-declared tokens that are not in the final quiesced target set\n"
   unless $preserve =~ /abort_phase1_transfer_targets_not_quiesced/s;
-die "standby streaming transfer batch path must declare every quiesced target token before target preserve publishes bundles\n"
+die "standby streaming transfer must re-sweep phase1 target declarations before object streaming\n"
   unless $preserve =~
-     /for\s*\(\s*const\s+my_thread_id\s+target_thread_id\s*:\s*quiesced_target_thread_ids\s*\)[\s\S]*batch_transfer_source_session[\s\S]*declare_token/s;
+     /declare_phase1_transfer_targets\s*\(\s*\)[\s\S]*stream_phase1_transfer_record_lock_blobs\s*\(\s*\)[\s\S]*stream_phase1_transfer_binlog_cache_blobs/s;
 die "standby streaming transfer batch path must abort the source epoch when the batch fails before commit\n"
   unless $preserve =~ /batch_transfer_source_session[\s\S]*abort_epoch/s;
+die "standby streaming transfer must fail closed when final quiesced targets lack phase1 transfer coverage\n"
+  unless $preserve =~ /standby_transfer_final_target_coverage_rejected/s;
+die "standby streaming transfer must do bounded record catch-up only after final targets are quiesced and before final coverage metadata\n"
+  unless $preserve =~
+     /prepare_quiesced_targets[\s\S]*stream_phase2_transfer_record_lock_catchup_blobs[\s\S]*validate_batch_transfer_final_target_coverage/s;
+die "standby streaming transfer record catch-up must stay before final target preserve publishes bundles\n"
+  unless $preserve =~
+     /stream_phase2_transfer_record_lock_catchup_blobs[\s\S]*Preserve_batch_target_execution/s;
+die "standby streaming transfer must do bounded binlog catch-up only after final targets are quiesced and before final coverage metadata\n"
+  unless $preserve =~
+     /prepare_quiesced_targets[\s\S]*stream_phase2_transfer_binlog_cache_catchup_blobs[\s\S]*validate_batch_transfer_final_target_coverage/s;
+die "standby streaming transfer binlog catch-up must stay before final target preserve publishes bundles\n"
+  unless $preserve =~
+     /stream_phase2_transfer_binlog_cache_catchup_blobs[\s\S]*Preserve_batch_target_execution/s;
+die "standby streaming transfer must not do generic unbounded bulk backfill in phase2\n"
+  if $preserve =~ /backfill_batch_transfer_binlog_blobs/s ||
+     $preserve =~ /transfer_binlog_phase2_backfill/s;
+die "standby streaming transfer must not late-declare final targets without streaming phase1 objects\n"
+  if $preserve =~ /standby_transfer_declare_failed/s;
 die "standby streaming transfer batch path must commit the source epoch only after all batch target snapshots are ready\n"
   unless $preserve =~ /batch_transfer_source_session[\s\S]*commit_epoch/s;
 die "standby streaming transfer phase2 publish must skip external objects already sealed during phase1\n"
@@ -2080,6 +2104,10 @@ die "standby transfer must log final-target coverage before preserving targets\n
          $preserve =~ /missing_declared=/s &&
          $preserve =~ /missing_binlog=/s &&
          $preserve =~ /missing_record=/s;
+die "standby final-target coverage must distinguish phase1 presealed binlog blobs from fallback warmcopy blobs\n"
+  unless $preserve =~ /phase1_blob_matches_current_thd/s;
+die "standby final-target coverage must not treat missing binlog provider as covered\n"
+  if $preserve =~ /batch_transfer_binlog_blob_provider\s*==\s*nullptr\s*\|\|/s;
 die "standby transfer must not expose reserved/no-op source sender sysvars\n"
   if $sys_vars =~ /preserve_trx_transfer_sender_workers/s ||
      $transfer =~ /preserve_trx_transfer_sender_workers/s ||

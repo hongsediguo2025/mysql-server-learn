@@ -1127,6 +1127,25 @@ Preserve_trx_transfer_status cleanup_transfer_token_staging(
   return Preserve_trx_transfer_status::OK;
 }
 
+Preserve_trx_transfer_status cleanup_transfer_object_staging(
+    const std::string &root_dir,
+    const Preserve_trx_transfer_manifest &manifest,
+    const Preserve_trx_transfer_object_descriptor &object) {
+  if (root_dir.empty() || !transfer_component_safe(manifest.epoch_id) ||
+      manifest.token == 0 || !transfer_component_safe(object.object_id)) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+
+  for (const std::string &path :
+       {transfer_object_path(root_dir, manifest, object),
+        transfer_object_range_path(root_dir, manifest, object)}) {
+    if (my_delete(path.c_str(), MYF(0)) != 0 && my_errno() != ENOENT) {
+      return Preserve_trx_transfer_status::IO_ERROR;
+    }
+  }
+  return Preserve_trx_transfer_status::OK;
+}
+
 const Preserve_trx_transfer_object_descriptor *find_object(
     const Preserve_trx_transfer_manifest &manifest,
     const std::string &object_id) {
@@ -3374,18 +3393,6 @@ Preserve_trx_transfer_receiver_registry::begin_receive(
             manifest.target_server_uuid) {
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
-    for (const Preserve_trx_transfer_object_descriptor &declared :
-         existing_record->second.objects) {
-      const auto found = std::find_if(
-          manifest.objects.begin(), manifest.objects.end(),
-          [&](const Preserve_trx_transfer_object_descriptor &candidate) {
-            return candidate.object_id == declared.object_id;
-          });
-      if (found == manifest.objects.end() ||
-          !transfer_object_descriptor_equal(*found, declared)) {
-        return Preserve_trx_transfer_status::CORRUPT;
-      }
-    }
   }
   uint64_t epoch_inflight_bytes = 0;
   for (const auto &entry : m_records) {
@@ -3409,7 +3416,18 @@ Preserve_trx_transfer_receiver_registry::begin_receive(
   if (existing_record == m_records.end()) {
     m_records.emplace(key, std::move(record));
   } else {
-    record.sealed_objects = existing_record->second.sealed_objects;
+    const Preserve_trx_transfer_manifest existing_manifest =
+        receiver_record_manifest(existing_record->second);
+    for (const Preserve_trx_transfer_object_descriptor &object :
+         manifest.objects) {
+      const Preserve_trx_transfer_object_descriptor *existing =
+          find_object(existing_manifest, object.object_id);
+      if (existing != nullptr &&
+          transfer_object_descriptor_equal(*existing, object) &&
+          existing_record->second.sealed_objects.count(object.object_id) != 0) {
+        record.sealed_objects.insert(object.object_id);
+      }
+    }
     existing_record->second = std::move(record);
   }
   return Preserve_trx_transfer_status::OK;
@@ -3438,9 +3456,12 @@ Preserve_trx_transfer_receiver_registry::declare_object(
         return candidate.object_id == descriptor.object_id;
       });
   if (existing != found->second.objects.end()) {
-    return transfer_object_descriptor_equal(*existing, descriptor)
-               ? Preserve_trx_transfer_status::OK
-               : Preserve_trx_transfer_status::CORRUPT;
+    if (transfer_object_descriptor_equal(*existing, descriptor)) {
+      return Preserve_trx_transfer_status::OK;
+    }
+    *existing = descriptor;
+    found->second.sealed_objects.erase(descriptor.object_id);
+    return Preserve_trx_transfer_status::OK;
   }
   found->second.objects.push_back(descriptor);
   return Preserve_trx_transfer_status::OK;
@@ -4227,8 +4248,10 @@ Preserve_trx_transfer_source_epoch_session::declare_object(
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
   auto &objects = m_streaming_declared_objects[transfer_token];
-  if (objects.count(descriptor.object_id) != 0) {
-    return Preserve_trx_transfer_status::UNSUPPORTED;
+  auto existing = objects.find(descriptor.object_id);
+  if (existing != objects.end() &&
+      transfer_object_descriptor_equal(existing->second, descriptor)) {
+    return Preserve_trx_transfer_status::OK;
   }
 
   std::string descriptor_payload;
@@ -4243,7 +4266,12 @@ Preserve_trx_transfer_source_epoch_session::declare_object(
   declare.manifest_payload = std::move(descriptor_payload);
   status = emit_frame_locked(std::move(declare), false);
   if (status != Preserve_trx_transfer_status::OK) return status;
-  objects.emplace(descriptor.object_id, descriptor);
+  if (existing != objects.end()) {
+    existing->second = descriptor;
+    m_streaming_sealed_objects[transfer_token].erase(descriptor.object_id);
+  } else {
+    objects.emplace(descriptor.object_id, descriptor);
+  }
   m_streaming_object_written_bytes[transfer_token][descriptor.object_id] = 0;
   return Preserve_trx_transfer_status::OK;
 }
@@ -4619,7 +4647,6 @@ Preserve_trx_transfer_source_epoch_session::send_token_objects_batch(
     const std::set<std::string> &presealed_objects,
     bool queue_final_metadata) {
   std::lock_guard<std::mutex> guard(m_mutex);
-  (void)presealed_objects;
   if (m_sink == nullptr || m_chunk_bytes == 0 || manifest.token == 0 ||
       manifest.epoch_id != m_epoch_id ||
       manifest.source_server_uuid != m_source_server_uuid ||
@@ -4639,6 +4666,7 @@ Preserve_trx_transfer_source_epoch_session::send_token_objects_batch(
   const auto declared_it = m_streaming_declared_objects.find(manifest.token);
   if (declared_it != m_streaming_declared_objects.end()) {
     for (const auto &entry : declared_it->second) {
+      if (presealed_objects.count(entry.first) == 0) continue;
       const Preserve_trx_transfer_object_descriptor *descriptor =
           find_object(manifest, entry.first);
       if (descriptor == nullptr ||
@@ -4661,6 +4689,7 @@ Preserve_trx_transfer_source_epoch_session::send_token_objects_batch(
 
   auto object_is_presealed =
       [&](const Preserve_trx_transfer_object_descriptor &descriptor) -> bool {
+    if (presealed_objects.count(descriptor.object_id) == 0) return false;
     const auto declared_token =
         m_streaming_declared_objects.find(manifest.token);
     if (declared_token == m_streaming_declared_objects.end()) return false;
@@ -6715,6 +6744,40 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
     if (descriptor.object_id != frame.object_id) {
       return Preserve_trx_transfer_status::CORRUPT;
     }
+    Preserve_trx_transfer_receiver_record existing_record;
+    if (registry->lookup(frame.epoch_id, frame.token, &existing_record) &&
+        (existing_record.state == Preserve_trx_transfer_receiver_state::DECLARED ||
+         existing_record.state == Preserve_trx_transfer_receiver_state::RECEIVING)) {
+      const Preserve_trx_transfer_manifest existing_manifest =
+          receiver_record_manifest(existing_record);
+      const Preserve_trx_transfer_object_descriptor *existing_object =
+          find_object(existing_manifest, descriptor.object_id);
+      if (existing_object != nullptr &&
+          !transfer_object_descriptor_equal(*existing_object, descriptor)) {
+        status = cleanup_transfer_object_staging(root_dir, existing_manifest,
+                                                 *existing_object);
+        if (status != Preserve_trx_transfer_status::OK) return status;
+        if (existing_object->kind ==
+                Preserve_trx_transfer_object_kind::EXTERNAL_BLOB &&
+            receiver_projection_blob_can_be_preinstalled(
+                existing_object->object_id)) {
+          Preserved_trx_external_blob old_blob;
+          old_blob.name = existing_object->object_id;
+          old_blob.descriptor.name = existing_object->object_id;
+          old_blob.descriptor.size = existing_object->total_size;
+          old_blob.descriptor.digest = existing_object->digest;
+          Local_file_preserved_trx_carrier carrier(
+              root_dir, receiver_standby_projection_write_options());
+          const Preserved_trx_carrier_status remove_status =
+              carrier.remove_external_blobs(
+                  transfer_token_component(existing_manifest.token),
+                  {old_blob});
+          if (remove_status != Preserved_trx_carrier_status::OK) {
+            return map_carrier_status_to_transfer(remove_status);
+          }
+        }
+      }
+    }
     return registry->declare_object(frame.epoch_id, frame.token, descriptor);
   }
 
@@ -6735,6 +6798,44 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
     if (status != Preserve_trx_transfer_status::OK) return status;
     if (inflight_bytes > preserve_trx_transfer_max_inflight_bytes) {
       return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
+    Preserve_trx_transfer_receiver_record existing_record;
+    if (registry->lookup(frame.epoch_id, frame.token, &existing_record) &&
+        (existing_record.state == Preserve_trx_transfer_receiver_state::DECLARED ||
+         existing_record.state == Preserve_trx_transfer_receiver_state::RECEIVING)) {
+      const Preserve_trx_transfer_manifest existing_manifest =
+          receiver_record_manifest(existing_record);
+      for (const Preserve_trx_transfer_object_descriptor &existing_object :
+           existing_manifest.objects) {
+        const Preserve_trx_transfer_object_descriptor *replacement =
+            find_object(manifest, existing_object.object_id);
+        if (replacement != nullptr &&
+            transfer_object_descriptor_equal(*replacement, existing_object)) {
+          continue;
+        }
+        status = cleanup_transfer_object_staging(root_dir, existing_manifest,
+                                                 existing_object);
+        if (status != Preserve_trx_transfer_status::OK) return status;
+        if (existing_object.kind ==
+                Preserve_trx_transfer_object_kind::EXTERNAL_BLOB &&
+            receiver_projection_blob_can_be_preinstalled(
+                existing_object.object_id)) {
+          Preserved_trx_external_blob old_blob;
+          old_blob.name = existing_object.object_id;
+          old_blob.descriptor.name = existing_object.object_id;
+          old_blob.descriptor.size = existing_object.total_size;
+          old_blob.descriptor.digest = existing_object.digest;
+          Local_file_preserved_trx_carrier carrier(
+              root_dir, receiver_standby_projection_write_options());
+          const Preserved_trx_carrier_status remove_status =
+              carrier.remove_external_blobs(
+                  transfer_token_component(existing_manifest.token),
+                  {old_blob});
+          if (remove_status != Preserved_trx_carrier_status::OK) {
+            return map_carrier_status_to_transfer(remove_status);
+          }
+        }
+      }
     }
     status = registry->begin_receive(manifest, inflight_bytes);
     if (status == Preserve_trx_transfer_status::OK) {

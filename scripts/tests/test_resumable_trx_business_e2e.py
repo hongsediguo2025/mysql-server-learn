@@ -4968,6 +4968,76 @@ class WorkloadPlanTest(unittest.TestCase):
                 },
             )
 
+    def test_standby_transfer_receiver_allows_bounded_final_catchup_metric(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/rx/data/preserve",
+            setup_schema=False,
+        ).validate()
+        runner.runtime = mock.Mock()
+        runner.runtime.wait_until_up = mock.Mock()
+        runner.runtime.wait_until_down = mock.Mock()
+        runner.coordinator = mock.Mock()
+        runner.coordinator.request_drain_checkpoint.return_value = 1
+        runner.stop_event = threading.Event()
+        runner.workers = []
+        runner.prepare_standby_transfer_credential_secret_files = mock.Mock()
+        runner.start_source_server_if_configured = mock.Mock()
+        runner.start_receiver_server_if_configured = mock.Mock()
+        runner.preflight_disk_budgets = mock.Mock()
+        runner._receiver_admin_connection = mock.Mock(return_value=_FakeConnection())
+        runner.materialize_receiver_physical_copy_before_drain = mock.Mock()
+        runner.configure_standby_transfer_credentials = mock.Mock()
+        runner.configure_preserve_globals = mock.Mock()
+        runner.validate_standby_transfer_endpoint_config = mock.Mock()
+        runner.start_workers = mock.Mock()
+        runner._wait_all_paused_for_drain_or_raise = mock.Mock()
+        runner.warmcopy_error_log_offset = mock.Mock(return_value=0)
+        runner._execute_drain_preserve = mock.Mock(return_value=True)
+        runner.read_latest_drain_target_counter_rejection_since = mock.Mock(
+            return_value=None
+        )
+        runner.read_latest_warmcopy_metrics_since = mock.Mock(
+            return_value=WarmcopyDrainMetrics(
+                phase2_pause_ms=0.1,
+                full_copy_to_count=0,
+                phase2_total_ms=0.068,
+                phase2_record_materialized_target_count=1,
+                phase2_table_live_export_target_count=1,
+                phase2_mdl_live_export_target_count=1,
+                phase2_savepoint_live_export_target_count=0,
+            )
+        )
+        runner.wait_for_receiver_artifacts = mock.Mock(
+            return_value={
+                "snapshot_tokens": 2,
+                "standby_pending_tokens": 2,
+                "external_blob_tokens": 2,
+                "epoch_fact_count": 1,
+                "epoch_commit_count": 1,
+            }
+        )
+        runner.wait_for_receiver_readiness = mock.Mock()
+        runner.write_standby_transfer_receiver_report = mock.Mock()
+        runner.join_workers = mock.Mock()
+
+        runner.run_standby_transfer_receiver_drain_metrics()
+
+        self.assertEqual(len(runner.warmcopy_drain_metrics), 1)
+        self.assertEqual(
+            runner.warmcopy_drain_metrics[0].lock_warmcopy_live_fallback_count(),
+            3,
+        )
+        runner.wait_for_receiver_artifacts.assert_called_once()
+        runner.wait_for_receiver_readiness.assert_called_once()
+        runner.write_standby_transfer_receiver_report.assert_called_with(
+            status="success",
+            completed_stmt_total=0,
+        )
+
     def test_receiver_artifact_wait_accepts_online_epoch_without_projection(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         observed = {

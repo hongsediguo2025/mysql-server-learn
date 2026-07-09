@@ -95,6 +95,12 @@ enum class Preserve_trx_lock_warmcopy_artifact_source {
   LIVE_EXPORT
 };
 
+enum class Preserve_trx_lock_warmcopy_record_blob_status {
+  OK,
+  NOT_REQUIRED,
+  INVALID
+};
+
 enum class Preserve_trx_lock_warmcopy_route_action {
   USE_WARM_COPY,
   FALLBACK_TO_LIVE_EXPORT,
@@ -330,8 +336,12 @@ class Preserve_trx_lock_warmcopy_drain_participant final
   bool target_observation_for_thread(
       uint64_t thread_id,
       Preserve_trx_lock_warmcopy_target_observation *observation) const;
+  Preserve_trx_lock_warmcopy_record_blob_status
+  ensure_quiesced_record_prebuilt_blob_for_thread(
+      uint64_t thread_id, PrebuiltRecordLocksBlob *blob);
   bool phase1_record_prebuilt_blob_for_thread(
       uint64_t thread_id, PrebuiltRecordLocksBlob *blob) const;
+  bool record_locks_seeded_in_phase1_for_unit_test(uint64_t thread_id) const;
   bool target_observation_for_thread_for_unit_test(
       uint64_t thread_id,
       Preserve_trx_lock_warmcopy_target_observation *observation) const;
