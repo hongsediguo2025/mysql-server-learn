@@ -285,8 +285,14 @@ class Preserved_trx_carrier {
   virtual Preserved_trx_carrier_status list_tokens(
       Preserved_trx_carrier_listing *listing) = 0;
 
+  virtual Preserved_trx_carrier_status new_token_state_for_write(
+      const std::string &token, Preserved_trx_carrier_token_state *state);
+
   virtual Preserved_trx_carrier_status token_state(
       const std::string &token, Preserved_trx_carrier_token_state *state);
+
+  virtual Preserved_trx_carrier_status standby_projection_exists(
+      const std::string &token, bool *exists);
 
   virtual Preserved_trx_carrier_status remove_warm_external_blob_artifact(
       const std::string &artifact_filename) = 0;
@@ -385,6 +391,7 @@ struct Preserved_trx_store_write_stats {
   uint64_t adopt_warm_blob_us{0};
   uint64_t write_new_blobs_us{0};
   uint64_t encode_us{0};
+  uint64_t write_standby_pending_marker_us{0};
   uint64_t write_snapshot_us{0};
 };
 
@@ -515,6 +522,8 @@ create_preserved_trx_default_warm_external_blob_carrier(const std::string &dir);
 
 Preserve_snapshot_status preserve_trx_fsync_default_store_directory(
     const std::string &dir);
+Preserve_snapshot_status preserve_trx_fsync_default_store_token_directory(
+    const std::string &dir, const std::string &token);
 
 enum class Preserved_trx_carrier_support_status {
   OK,

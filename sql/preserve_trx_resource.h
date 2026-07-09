@@ -331,6 +331,18 @@ int show_preserve_trx_transfer_receiver_object_prewarm_proof_count(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_object_prewarm_miss_count(
     THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_object_prewarm_count(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_object_prewarm_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_object_prewarm_max_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_record_object_prewarm_count(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_record_object_prewarm_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_record_object_prewarm_max_us(
+    THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_committed_epoch_fallback_count(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_staged_token_publish_us(
@@ -340,6 +352,34 @@ int show_preserve_trx_transfer_receiver_staged_token_ready_cache_us(
 int show_preserve_trx_transfer_receiver_staged_token_total_us(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_staged_token_max_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_staged_token_active(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_staged_token_max_active(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_projection_publish_count(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_projection_publish_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_projection_publish_max_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_projection_publish_p95_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_projection_lock_wait_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_projection_store_write_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_projection_marker_write_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_projection_snapshot_write_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_projection_external_blob_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_projection_encode_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_projection_token_state_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_epoch_ready_bind_attempts(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_phase2_bulk_bytes(THD *thd, SHOW_VAR *var,
                                                  char *buf);

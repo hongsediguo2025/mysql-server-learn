@@ -87,11 +87,31 @@ uint64_t preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens_status();
 uint64_t preserve_trx_transfer_receiver_seal_prewarm_last_status();
 uint64_t preserve_trx_transfer_receiver_object_prewarm_proof_count_status();
 uint64_t preserve_trx_transfer_receiver_object_prewarm_miss_count_status();
+uint64_t preserve_trx_transfer_receiver_object_prewarm_count_status();
+uint64_t preserve_trx_transfer_receiver_object_prewarm_us_status();
+uint64_t preserve_trx_transfer_receiver_object_prewarm_max_us_status();
+uint64_t preserve_trx_transfer_receiver_record_object_prewarm_count_status();
+uint64_t preserve_trx_transfer_receiver_record_object_prewarm_us_status();
+uint64_t preserve_trx_transfer_receiver_record_object_prewarm_max_us_status();
 uint64_t preserve_trx_transfer_receiver_committed_epoch_fallback_count_status();
 uint64_t preserve_trx_transfer_receiver_staged_token_publish_us_status();
 uint64_t preserve_trx_transfer_receiver_staged_token_ready_cache_us_status();
 uint64_t preserve_trx_transfer_receiver_staged_token_total_us_status();
 uint64_t preserve_trx_transfer_receiver_staged_token_max_us_status();
+uint64_t preserve_trx_transfer_receiver_staged_token_active_status();
+uint64_t preserve_trx_transfer_receiver_staged_token_max_active_status();
+uint64_t preserve_trx_transfer_receiver_projection_publish_count_status();
+uint64_t preserve_trx_transfer_receiver_projection_publish_us_status();
+uint64_t preserve_trx_transfer_receiver_projection_publish_max_us_status();
+uint64_t preserve_trx_transfer_receiver_projection_publish_p95_us_status();
+uint64_t preserve_trx_transfer_receiver_projection_lock_wait_us_status();
+uint64_t preserve_trx_transfer_receiver_projection_store_write_us_status();
+uint64_t preserve_trx_transfer_receiver_projection_marker_write_us_status();
+uint64_t preserve_trx_transfer_receiver_projection_snapshot_write_us_status();
+uint64_t preserve_trx_transfer_receiver_projection_external_blob_us_status();
+uint64_t preserve_trx_transfer_receiver_projection_encode_us_status();
+uint64_t preserve_trx_transfer_receiver_projection_token_state_us_status();
+uint64_t preserve_trx_transfer_receiver_epoch_ready_bind_attempts_status();
 void preserve_trx_transfer_reset_source_phase2_metrics();
 uint64_t preserve_trx_transfer_phase2_bulk_bytes_status();
 uint64_t preserve_trx_transfer_phase2_snapshot_bundle_bytes_status();
@@ -396,7 +416,8 @@ class Preserve_trx_transfer_source_epoch_session {
   Preserve_trx_transfer_status send_token_objects_batch(
       const Preserve_trx_transfer_manifest &manifest,
       const std::vector<Preserve_trx_transfer_object_payload> &objects,
-      const std::set<std::string> &presealed_objects);
+      const std::set<std::string> &presealed_objects,
+      bool queue_final_metadata = false);
   Preserve_trx_transfer_status send_token_bundle(
       const Preserved_trx_bundle &bundle, uint64_t transfer_token,
       Preserve_trx_transfer_manifest *manifest = nullptr);
@@ -507,6 +528,8 @@ void preserve_trx_transfer_set_frame_sink_factory_for_unit_test(
 
 void preserve_trx_transfer_set_receiver_staged_prewarm_delay_ms_for_unit_test(
     uint delay_ms);
+void preserve_trx_transfer_set_receiver_object_prewarm_delay_ms_for_unit_test(
+    uint delay_ms);
 void preserve_trx_transfer_put_receiver_object_prewarm_proof_for_unit_test(
     const std::string &root_dir,
     const Preserve_trx_transfer_manifest &manifest,
@@ -562,11 +585,13 @@ Preserve_trx_transfer_status preserve_trx_transfer_seal_staged_object(
 Preserve_trx_transfer_status preserve_trx_transfer_read_sealed_object_payload(
     const std::string &root_dir,
     const Preserve_trx_transfer_manifest &manifest,
-    const std::string &object_id, std::string *payload);
+    const std::string &object_id, std::string *payload,
+    bool objects_already_sealed = false);
 
 Preserve_trx_transfer_status preserve_trx_transfer_read_snapshot_bundle_payload(
     const std::string &root_dir,
-    const Preserve_trx_transfer_manifest &manifest, std::string *payload);
+    const Preserve_trx_transfer_manifest &manifest, std::string *payload,
+    bool objects_already_sealed = false);
 
 Preserve_trx_transfer_status preserve_trx_transfer_seal_manifest_objects(
     const std::string &root_dir,
@@ -576,7 +601,9 @@ Preserve_trx_transfer_status preserve_trx_transfer_publish_standby_bundle(
     const std::string &root_dir,
     const Preserve_trx_transfer_manifest &manifest, Preserved_trx_bundle bundle,
     Preserved_trx_store *store, uint64_t timeout_seconds,
-    Preserve_snapshot_metadata *written_metadata = nullptr);
+    Preserve_snapshot_metadata *written_metadata = nullptr,
+    Preserved_trx_store_write_stats *write_stats = nullptr,
+    bool objects_already_sealed = false);
 
 Preserve_trx_transfer_status
 preserve_trx_transfer_publish_standby_bundle_from_staging(
@@ -727,10 +754,12 @@ class Preserve_trx_transfer_session_artifact_sink final
  public:
   Preserve_trx_transfer_session_artifact_sink(
       Preserve_trx_transfer_source_epoch_session *session,
-      uint64_t transfer_token, std::string preserve_dir = "")
+      uint64_t transfer_token, std::string preserve_dir = "",
+      bool queue_final_metadata = false)
       : m_session(session),
         m_transfer_token(transfer_token),
-        m_preserve_dir(std::move(preserve_dir)) {}
+        m_preserve_dir(std::move(preserve_dir)),
+        m_queue_final_metadata(queue_final_metadata) {}
 
   Preserve_snapshot_status publish_bundle(
       Preserved_trx_bundle bundle, uint64_t timeout_seconds,
@@ -743,6 +772,7 @@ class Preserve_trx_transfer_session_artifact_sink final
   Preserve_trx_transfer_source_epoch_session *m_session{nullptr};
   uint64_t m_transfer_token{0};
   std::string m_preserve_dir;
+  bool m_queue_final_metadata{false};
 };
 
 class Preserve_trx_standby_pending_artifact_sink final

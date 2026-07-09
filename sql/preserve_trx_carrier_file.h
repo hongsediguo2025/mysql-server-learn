@@ -89,9 +89,14 @@ class Local_file_preserved_trx_carrier final
       const std::string &epoch_id, std::string *marker_payload) override;
   Preserved_trx_carrier_status list_tokens(
       Preserved_trx_carrier_listing *listing) override;
+  Preserved_trx_carrier_status new_token_state_for_write(
+      const std::string &token,
+      Preserved_trx_carrier_token_state *state) override;
   Preserved_trx_carrier_status token_state(
       const std::string &token,
       Preserved_trx_carrier_token_state *state) override;
+  Preserved_trx_carrier_status standby_projection_exists(
+      const std::string &token, bool *exists) override;
   Preserved_trx_carrier_status remove_warm_external_blob_artifact(
       const std::string &artifact_filename) override;
   Preserved_trx_carrier_status create_warm_external_blob_writer(
@@ -103,6 +108,11 @@ class Local_file_preserved_trx_carrier final
       const std::string &blob_name,
       uint64_t warmcopy_epoch,
       const Preserved_trx_external_blob_descriptor &descriptor) override;
+  Preserved_trx_carrier_status
+  install_staged_external_blob_for_standby_projection(
+      const std::string &token, const std::string &blob_name,
+      const std::string &staged_path,
+      const Preserved_trx_external_blob_descriptor &descriptor);
   Preserved_trx_carrier_status read_warm_external_blob(
       const std::string &warmcopy_id, const std::string &blob_name,
       uint64_t warmcopy_epoch,

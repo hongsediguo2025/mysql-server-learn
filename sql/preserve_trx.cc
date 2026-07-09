@@ -4874,6 +4874,115 @@ class Preserve_batch_clear_temp_table_unsupported_boundaries final
   }
 };
 
+class Phase1_transfer_binlog_blob_provider final
+    : public PreserveBinlogBlobProvider {
+ public:
+  explicit Phase1_transfer_binlog_blob_provider(
+      PreserveBinlogBlobProvider *fallback_provider)
+      : m_fallback_provider(fallback_provider) {}
+
+  void remember_phase1_blob(my_thread_id thread_id,
+                            const PrebuiltBinlogCacheBlob &blob) {
+    if (thread_id == 0 || blob.name != kPreservedTrxBlobBinlogCache ||
+        blob.size == 0) {
+      return;
+    }
+    std::lock_guard<std::mutex> guard(m_mutex);
+    m_phase1_blobs[thread_id] = blob;
+    if (!blob.warmcopy_id.empty()) m_phase1_warmcopy_ids.insert(blob.warmcopy_id);
+  }
+
+  bool has_blob_for_thd(const THD *thd) const override {
+    if (thd == nullptr) return false;
+    {
+      std::lock_guard<std::mutex> guard(m_mutex);
+      if (m_phase1_blobs.count(thd->thread_id()) != 0) return true;
+    }
+    return m_fallback_provider != nullptr &&
+           m_fallback_provider->has_blob_for_thd(thd);
+  }
+
+  Preserve_snapshot_status finalize_for_preserve(
+      THD *thd, const std::string &token,
+      PrebuiltBinlogCacheBlob *blob) override {
+    if (thd == nullptr || blob == nullptr) {
+      return Preserve_snapshot_status::INVALID_ARGUMENT;
+    }
+    PrebuiltBinlogCacheBlob phase1_blob;
+    bool has_phase1_blob = false;
+    {
+      std::lock_guard<std::mutex> guard(m_mutex);
+      auto it = m_phase1_blobs.find(thd->thread_id());
+      if (it != m_phase1_blobs.end()) {
+        phase1_blob = it->second;
+        has_phase1_blob = true;
+      }
+    }
+    if (has_phase1_blob) {
+      uint64_t current_length = 0;
+      bool current_has_blob = false;
+      Mysql_binlog_preserve_snapshot current_metadata;
+      const bool current_matches =
+          !mysql_binlog_preserve_warmcopy_cache_length(
+              thd, &current_length, &current_has_blob) &&
+          current_has_blob && current_length == phase1_blob.size &&
+          !mysql_binlog_preserve_export_metadata_only(thd, &current_metadata) &&
+          binlog_metadata_matches(current_metadata, phase1_blob.metadata);
+      if (current_matches) {
+        std::lock_guard<std::mutex> guard(m_mutex);
+        auto it = m_phase1_blobs.find(thd->thread_id());
+        if (it != m_phase1_blobs.end() &&
+            it->second.warmcopy_id == phase1_blob.warmcopy_id) {
+          *blob = it->second;
+          m_phase1_blobs.erase(it);
+          return Preserve_snapshot_status::OK;
+        }
+      }
+    }
+    return m_fallback_provider == nullptr
+               ? Preserve_snapshot_status::INVALID_ARGUMENT
+               : m_fallback_provider->finalize_for_preserve(thd, token, blob);
+  }
+
+  void discard_for_preserve(THD *thd, const std::string &token,
+                            const PrebuiltBinlogCacheBlob &blob) override {
+    {
+      std::lock_guard<std::mutex> guard(m_mutex);
+      if (m_phase1_warmcopy_ids.count(blob.warmcopy_id) != 0) return;
+    }
+    if (m_fallback_provider != nullptr) {
+      m_fallback_provider->discard_for_preserve(thd, token, blob);
+    }
+  }
+
+ private:
+  static bool binlog_metadata_matches(
+      const Mysql_binlog_preserve_snapshot &lhs,
+      const Mysql_binlog_preserve_snapshot &rhs) {
+    return lhs.gtid_next == rhs.gtid_next && lhs.owned_gtid == rhs.owned_gtid &&
+           lhs.event_counter == rhs.event_counter &&
+           lhs.immediate == rhs.immediate && lhs.with_xid == rhs.with_xid &&
+           lhs.with_sbr == rhs.with_sbr && lhs.with_rbr == rhs.with_rbr &&
+           lhs.with_start == rhs.with_start && lhs.with_end == rhs.with_end &&
+           lhs.with_content == rhs.with_content &&
+           lhs.has_prev_position == rhs.has_prev_position &&
+           lhs.prev_position == rhs.prev_position &&
+           lhs.has_cache_length == rhs.has_cache_length &&
+           lhs.cache_length == rhs.cache_length &&
+           lhs.has_compression_session_state ==
+               rhs.has_compression_session_state &&
+           lhs.binlog_trx_compression == rhs.binlog_trx_compression &&
+           lhs.binlog_trx_compression_type == rhs.binlog_trx_compression_type &&
+           lhs.binlog_trx_compression_level_zstd ==
+               rhs.binlog_trx_compression_level_zstd;
+  }
+
+  PreserveBinlogBlobProvider *m_fallback_provider{nullptr};
+  mutable std::mutex m_mutex;
+  std::map<my_thread_id, PrebuiltBinlogCacheBlob> m_phase1_blobs;
+  std::set<std::string> m_phase1_warmcopy_ids;
+};
+
 bool warmcopy_close_deadline_expired(ulonglong close_deadline_us);
 
 unsigned long warmcopy_close_timeout_ms_until_deadline(
@@ -5486,7 +5595,8 @@ static bool prepare_lock_warmcopy_active_record_targets(
 static bool stream_phase1_transfer_binlog_cache_blobs(
     THD *owner, ulonglong generation,
     const std::set<my_thread_id> &declared_tokens,
-    Preserve_trx_transfer_source_epoch_session *source_session) {
+    Preserve_trx_transfer_source_epoch_session *source_session,
+    Phase1_transfer_binlog_blob_provider *phase1_binlog_provider) {
   if (source_session == nullptr || declared_tokens.empty()) return false;
 
   std::unique_ptr<Preserved_trx_warm_external_blob_carrier> warm_carrier =
@@ -5533,6 +5643,10 @@ static bool stream_phase1_transfer_binlog_cache_blobs(
     if (stream_status != Preserve_trx_transfer_status::OK ||
         cleanup_status != Preserved_trx_carrier_status::OK) {
       return true;
+    }
+    if (phase1_binlog_provider != nullptr) {
+      phase1_binlog_provider->remember_phase1_blob(target_thread_id,
+                                                   prebuilt_binlog);
     }
   }
   return false;
@@ -12269,6 +12383,8 @@ bool Preserve_trx_drain_service::execute(
       batch_transfer_frame_sink;
   std::unique_ptr<Preserve_trx_transfer_source_epoch_session>
       batch_transfer_source_session;
+  std::unique_ptr<Phase1_transfer_binlog_blob_provider>
+      batch_transfer_binlog_blob_provider;
   std::set<my_thread_id> batch_transfer_phase1_declared_tokens;
   auto abort_batch_transfer_epoch = [&](const char *reason) {
     if (batch_transfer_source_session == nullptr) return;
@@ -12312,6 +12428,8 @@ bool Preserve_trx_drain_service::execute(
         new Preserve_trx_transfer_source_epoch_session(
             batch_transfer_epoch_id, source_server_uuid, target_server_uuid,
             preserve_trx_transfer_chunk_bytes, batch_transfer_frame_sink.get()));
+    batch_transfer_binlog_blob_provider.reset(
+        new Phase1_transfer_binlog_blob_provider(warmcopy_provider));
     return false;
   };
   auto declare_phase1_transfer_targets = [&]() {
@@ -12475,7 +12593,8 @@ bool Preserve_trx_drain_service::execute(
     }
     if (stream_phase1_transfer_binlog_cache_blobs(
             thd, generation, batch_transfer_phase1_declared_tokens,
-            batch_transfer_source_session.get())) {
+            batch_transfer_source_session.get(),
+            batch_transfer_binlog_blob_provider.get())) {
       abort_batch_transfer_epoch(
           "standby_transfer_phase1_binlog_blob_stream_failed");
       abort_drain_participants(
@@ -12872,10 +12991,15 @@ bool Preserve_trx_drain_service::execute(
                 ? nullptr
                 : lock_warmcopy_participant->artifact_for_thread(
                       target_thread_id);
+        PreserveBinlogBlobProvider *binlog_blob_provider =
+            batch_transfer_binlog_blob_provider != nullptr
+                ? batch_transfer_binlog_blob_provider.get()
+                : warmcopy_provider;
         Preserve_batch_quiesced_idle_target batch(
             owner_thd, options, timeout_seconds, generation, target_thread_id,
-            warmcopy_provider, lock_warmcopy_artifact, debug_fail_ha_prepare_low,
-            debug_fail_temp_only_prepare, defer_batch_snapshot_directory_fsync,
+            binlog_blob_provider, lock_warmcopy_artifact,
+            debug_fail_ha_prepare_low, debug_fail_temp_only_prepare,
+            defer_batch_snapshot_directory_fsync,
             batch_transfer_source_session.get(), preserve_trx_default_dir(),
             worker_thread_stack);
         if (target_thd != nullptr) batch.run(target_thd);

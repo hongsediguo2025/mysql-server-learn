@@ -462,6 +462,24 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_object_prewarm_miss_count,
     preserve_trx_transfer_receiver_object_prewarm_miss_count_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_object_prewarm_count,
+    preserve_trx_transfer_receiver_object_prewarm_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_object_prewarm_us,
+    preserve_trx_transfer_receiver_object_prewarm_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_object_prewarm_max_us,
+    preserve_trx_transfer_receiver_object_prewarm_max_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_record_object_prewarm_count,
+    preserve_trx_transfer_receiver_record_object_prewarm_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_record_object_prewarm_us,
+    preserve_trx_transfer_receiver_record_object_prewarm_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_record_object_prewarm_max_us,
+    preserve_trx_transfer_receiver_record_object_prewarm_max_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_committed_epoch_fallback_count,
     preserve_trx_transfer_receiver_committed_epoch_fallback_count_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
@@ -476,6 +494,48 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_staged_token_max_us,
     preserve_trx_transfer_receiver_staged_token_max_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_staged_token_active,
+    preserve_trx_transfer_receiver_staged_token_active_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_staged_token_max_active,
+    preserve_trx_transfer_receiver_staged_token_max_active_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_projection_publish_count,
+    preserve_trx_transfer_receiver_projection_publish_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_projection_publish_us,
+    preserve_trx_transfer_receiver_projection_publish_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_projection_publish_max_us,
+    preserve_trx_transfer_receiver_projection_publish_max_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_projection_publish_p95_us,
+    preserve_trx_transfer_receiver_projection_publish_p95_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_projection_lock_wait_us,
+    preserve_trx_transfer_receiver_projection_lock_wait_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_projection_store_write_us,
+    preserve_trx_transfer_receiver_projection_store_write_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_projection_marker_write_us,
+    preserve_trx_transfer_receiver_projection_marker_write_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_projection_snapshot_write_us,
+    preserve_trx_transfer_receiver_projection_snapshot_write_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_projection_external_blob_us,
+    preserve_trx_transfer_receiver_projection_external_blob_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_projection_encode_us,
+    preserve_trx_transfer_receiver_projection_encode_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_projection_token_state_us,
+    preserve_trx_transfer_receiver_projection_token_state_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_epoch_ready_bind_attempts,
+    preserve_trx_transfer_receiver_epoch_ready_bind_attempts_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_transfer_phase2_bulk_bytes,
                               preserve_trx_transfer_phase2_bulk_bytes_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(

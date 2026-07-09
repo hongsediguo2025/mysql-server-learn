@@ -303,6 +303,22 @@ Preserved_trx_carrier_status Preserved_trx_carrier::token_state(
   return Preserved_trx_carrier_status::OK;
 }
 
+Preserved_trx_carrier_status Preserved_trx_carrier::new_token_state_for_write(
+    const std::string &token, Preserved_trx_carrier_token_state *state) {
+  return token_state(token, state);
+}
+
+Preserved_trx_carrier_status Preserved_trx_carrier::standby_projection_exists(
+    const std::string &token, bool *exists) {
+  if (exists == nullptr) return Preserved_trx_carrier_status::CORRUPT;
+  *exists = false;
+  Preserved_trx_carrier_token_state state;
+  const Preserved_trx_carrier_status status = token_state(token, &state);
+  if (status != Preserved_trx_carrier_status::OK) return status;
+  *exists = state.snapshot && state.standby_pending;
+  return Preserved_trx_carrier_status::OK;
+}
+
 Preserved_trx_carrier_status
 Preserved_trx_carrier::read_promotion_abandoned_epoch(
     const std::string &epoch_id, std::string *marker_payload) {
@@ -376,7 +392,8 @@ Preserve_snapshot_status Preserved_trx_store::write_impl(
 
   Preserved_trx_carrier_token_state token_state;
   uint64_t store_step_started_us = my_micro_time();
-  carrier_status = m_carrier->token_state(bundle.metadata.token, &token_state);
+  carrier_status =
+      m_carrier->new_token_state_for_write(bundle.metadata.token, &token_state);
   add_store_write_elapsed(&Preserved_trx_store_write_stats::token_state_us,
                           store_step_started_us, write_stats);
   if (carrier_status != Preserved_trx_carrier_status::OK)
@@ -505,7 +522,11 @@ Preserve_snapshot_status Preserved_trx_store::write_impl(
       appears. Startup recovery and ordinary RESUME filter this marker, while a
       future promotion apply path can adopt the token explicitly.
     */
+    store_step_started_us = my_micro_time();
     carrier_status = m_carrier->mark_standby_pending(encoded_metadata.token);
+    add_store_write_elapsed(
+        &Preserved_trx_store_write_stats::write_standby_pending_marker_us,
+        store_step_started_us, write_stats);
     if (carrier_status != Preserved_trx_carrier_status::OK) {
       return cleanup_external_blobs_after_write_failure(
           m_carrier, encoded_metadata.token, written_external_blobs,

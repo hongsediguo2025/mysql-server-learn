@@ -1537,7 +1537,8 @@ Preserve_trx_promotion_adopt_status prewarm_loaded_bundle_into_ready_cache(
     When an epoch fact exists, bind the cache entry to its digest so the gate
     can reject stale prewarm results if the durable epoch fact is rewritten.
   */
-  if (promotion_epoch_fact_file_exists(preserve_dir, epoch_id)) {
+  if (!wait_for_final_epoch_fact &&
+      promotion_epoch_fact_file_exists(preserve_dir, epoch_id)) {
     Preserve_trx_transfer_epoch_fact fact;
     const Preserve_trx_transfer_status fact_status =
         preserve_trx_transfer_read_epoch_fact(preserve_dir, epoch_id, &fact);

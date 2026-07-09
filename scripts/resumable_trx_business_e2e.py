@@ -945,11 +945,31 @@ class ReceiverPrewarmMetrics:
     record_lock_reserved_residency_bytes: int = 0
     object_prewarm_proof_count: int = 0
     object_prewarm_miss_count: int = 0
+    object_prewarm_count: int = 0
+    object_prewarm_us: int = 0
+    object_prewarm_max_us: int = 0
+    record_object_prewarm_count: int = 0
+    record_object_prewarm_us: int = 0
+    record_object_prewarm_max_us: int = 0
     committed_epoch_fallback_count: int = 0
     staged_token_publish_us: int = 0
     staged_token_ready_cache_us: int = 0
     staged_token_total_us: int = 0
     staged_token_max_us: int = 0
+    staged_token_active: int = 0
+    staged_token_max_active: int = 0
+    projection_publish_count: int = 0
+    projection_publish_us: int = 0
+    projection_publish_max_us: int = 0
+    projection_publish_p95_us: int = 0
+    projection_lock_wait_us: int = 0
+    projection_store_write_us: int = 0
+    projection_marker_write_us: int = 0
+    projection_snapshot_write_us: int = 0
+    projection_external_blob_us: int = 0
+    projection_encode_us: int = 0
+    projection_token_state_us: int = 0
+    epoch_ready_bind_attempts: int = 0
 
 
 class WorkloadPlan:
@@ -4522,25 +4542,45 @@ class BusinessE2ERunner:
         if not preserve_dir.exists():
             return counts
 
-        for entry in preserve_dir.iterdir():
-            if not entry.is_file():
+        pending_dirs = [preserve_dir]
+        while pending_dirs:
+            current_dir = pending_dirs.pop()
+            try:
+                entries = list(current_dir.iterdir())
+            except FileNotFoundError:
                 continue
-            name = entry.name
-            if name.endswith(".standby_pending"):
-                counts["standby_pending_tokens"] += 1
-            elif name.endswith(".bin"):
-                counts["snapshot_tokens"] += 1
-            elif name.endswith(".binlog_cache") or ".blob." in name:
-                counts["external_blob_tokens"] += 1
+            for entry in entries:
+                if entry.name == ".transfer":
+                    continue
+                try:
+                    if entry.is_dir():
+                        pending_dirs.append(entry)
+                        continue
+                    if not entry.is_file():
+                        continue
+                except FileNotFoundError:
+                    continue
+                name = entry.name
+                if name.endswith(".standby_pending"):
+                    counts["standby_pending_tokens"] += 1
+                elif name.endswith(".bin"):
+                    counts["snapshot_tokens"] += 1
+                elif name.endswith(".binlog_cache") or ".blob." in name:
+                    counts["external_blob_tokens"] += 1
 
         transfer_root = preserve_dir / ".transfer"
         if transfer_root.exists():
-            counts["epoch_fact_count"] = sum(
-                1 for path in transfer_root.glob("*/epoch.fact") if path.is_file()
-            )
-            counts["epoch_commit_count"] = sum(
-                1 for path in transfer_root.glob("*/epoch.commit") if path.is_file()
-            )
+            try:
+                counts["epoch_fact_count"] = sum(
+                    1 for path in transfer_root.glob("*/epoch.fact") if path.is_file()
+                )
+                counts["epoch_commit_count"] = sum(
+                    1
+                    for path in transfer_root.glob("*/epoch.commit")
+                    if path.is_file()
+                )
+            except FileNotFoundError:
+                pass
         return counts
 
     def wait_for_receiver_artifacts(
@@ -4894,6 +4934,24 @@ class BusinessE2ERunner:
                     "receiver_object_prewarm_miss_count": (
                         receiver_prewarm_metrics.object_prewarm_miss_count
                     ),
+                    "receiver_object_prewarm_count": (
+                        receiver_prewarm_metrics.object_prewarm_count
+                    ),
+                    "receiver_object_prewarm_us": (
+                        receiver_prewarm_metrics.object_prewarm_us
+                    ),
+                    "receiver_object_prewarm_max_us": (
+                        receiver_prewarm_metrics.object_prewarm_max_us
+                    ),
+                    "receiver_record_object_prewarm_count": (
+                        receiver_prewarm_metrics.record_object_prewarm_count
+                    ),
+                    "receiver_record_object_prewarm_us": (
+                        receiver_prewarm_metrics.record_object_prewarm_us
+                    ),
+                    "receiver_record_object_prewarm_max_us": (
+                        receiver_prewarm_metrics.record_object_prewarm_max_us
+                    ),
                     "receiver_committed_epoch_fallback_count": (
                         receiver_prewarm_metrics.committed_epoch_fallback_count
                     ),
@@ -4908,6 +4966,48 @@ class BusinessE2ERunner:
                     ),
                     "receiver_staged_token_max_us": (
                         receiver_prewarm_metrics.staged_token_max_us
+                    ),
+                    "receiver_staged_token_active": (
+                        receiver_prewarm_metrics.staged_token_active
+                    ),
+                    "receiver_staged_token_max_active": (
+                        receiver_prewarm_metrics.staged_token_max_active
+                    ),
+                    "receiver_projection_publish_count": (
+                        receiver_prewarm_metrics.projection_publish_count
+                    ),
+                    "receiver_projection_publish_us": (
+                        receiver_prewarm_metrics.projection_publish_us
+                    ),
+                    "receiver_projection_publish_max_us": (
+                        receiver_prewarm_metrics.projection_publish_max_us
+                    ),
+                    "receiver_projection_publish_p95_us": (
+                        receiver_prewarm_metrics.projection_publish_p95_us
+                    ),
+                    "receiver_projection_lock_wait_us": (
+                        receiver_prewarm_metrics.projection_lock_wait_us
+                    ),
+                    "receiver_projection_store_write_us": (
+                        receiver_prewarm_metrics.projection_store_write_us
+                    ),
+                    "receiver_projection_marker_write_us": (
+                        receiver_prewarm_metrics.projection_marker_write_us
+                    ),
+                    "receiver_projection_snapshot_write_us": (
+                        receiver_prewarm_metrics.projection_snapshot_write_us
+                    ),
+                    "receiver_projection_external_blob_us": (
+                        receiver_prewarm_metrics.projection_external_blob_us
+                    ),
+                    "receiver_projection_encode_us": (
+                        receiver_prewarm_metrics.projection_encode_us
+                    ),
+                    "receiver_projection_token_state_us": (
+                        receiver_prewarm_metrics.projection_token_state_us
+                    ),
+                    "receiver_epoch_ready_bind_attempts": (
+                        receiver_prewarm_metrics.epoch_ready_bind_attempts
                     ),
                     "receiver_seal_prewarm_tokens": (
                         receiver_prewarm_metrics.seal_prewarm_tokens
@@ -6727,11 +6827,31 @@ class BusinessE2ERunner:
             "Preserve_trx_transfer_receiver_record_lock_resv_residency_bytes",
             "Preserve_trx_transfer_receiver_object_prewarm_proof_count",
             "Preserve_trx_transfer_receiver_object_prewarm_miss_count",
+            "Preserve_trx_transfer_receiver_object_prewarm_count",
+            "Preserve_trx_transfer_receiver_object_prewarm_us",
+            "Preserve_trx_transfer_receiver_object_prewarm_max_us",
+            "Preserve_trx_transfer_receiver_record_object_prewarm_count",
+            "Preserve_trx_transfer_receiver_record_object_prewarm_us",
+            "Preserve_trx_transfer_receiver_record_object_prewarm_max_us",
             "Preserve_trx_transfer_receiver_committed_epoch_fallback_count",
             "Preserve_trx_transfer_receiver_staged_token_publish_us",
             "Preserve_trx_transfer_receiver_staged_token_ready_cache_us",
             "Preserve_trx_transfer_receiver_staged_token_total_us",
             "Preserve_trx_transfer_receiver_staged_token_max_us",
+            "Preserve_trx_transfer_receiver_staged_token_active",
+            "Preserve_trx_transfer_receiver_staged_token_max_active",
+            "Preserve_trx_transfer_receiver_projection_publish_count",
+            "Preserve_trx_transfer_receiver_projection_publish_us",
+            "Preserve_trx_transfer_receiver_projection_publish_max_us",
+            "Preserve_trx_transfer_receiver_projection_publish_p95_us",
+            "Preserve_trx_transfer_receiver_projection_lock_wait_us",
+            "Preserve_trx_transfer_receiver_projection_store_write_us",
+            "Preserve_trx_transfer_receiver_projection_marker_write_us",
+            "Preserve_trx_transfer_receiver_projection_snapshot_write_us",
+            "Preserve_trx_transfer_receiver_projection_external_blob_us",
+            "Preserve_trx_transfer_receiver_projection_encode_us",
+            "Preserve_trx_transfer_receiver_projection_token_state_us",
+            "Preserve_trx_transfer_receiver_epoch_ready_bind_attempts",
         }
         quoted_fields = ", ".join(f"'{field}'" for field in sorted(fields))
         sql = (
@@ -6853,6 +6973,24 @@ class BusinessE2ERunner:
                 object_prewarm_miss_count=metric(
                     "Preserve_trx_transfer_receiver_object_prewarm_miss_count"
                 ),
+                object_prewarm_count=metric(
+                    "Preserve_trx_transfer_receiver_object_prewarm_count"
+                ),
+                object_prewarm_us=metric(
+                    "Preserve_trx_transfer_receiver_object_prewarm_us"
+                ),
+                object_prewarm_max_us=metric(
+                    "Preserve_trx_transfer_receiver_object_prewarm_max_us"
+                ),
+                record_object_prewarm_count=metric(
+                    "Preserve_trx_transfer_receiver_record_object_prewarm_count"
+                ),
+                record_object_prewarm_us=metric(
+                    "Preserve_trx_transfer_receiver_record_object_prewarm_us"
+                ),
+                record_object_prewarm_max_us=metric(
+                    "Preserve_trx_transfer_receiver_record_object_prewarm_max_us"
+                ),
                 committed_epoch_fallback_count=metric(
                     "Preserve_trx_transfer_receiver_committed_epoch_fallback_count"
                 ),
@@ -6867,6 +7005,48 @@ class BusinessE2ERunner:
                 ),
                 staged_token_max_us=metric(
                     "Preserve_trx_transfer_receiver_staged_token_max_us"
+                ),
+                staged_token_active=metric(
+                    "Preserve_trx_transfer_receiver_staged_token_active"
+                ),
+                staged_token_max_active=metric(
+                    "Preserve_trx_transfer_receiver_staged_token_max_active"
+                ),
+                projection_publish_count=metric(
+                    "Preserve_trx_transfer_receiver_projection_publish_count"
+                ),
+                projection_publish_us=metric(
+                    "Preserve_trx_transfer_receiver_projection_publish_us"
+                ),
+                projection_publish_max_us=metric(
+                    "Preserve_trx_transfer_receiver_projection_publish_max_us"
+                ),
+                projection_publish_p95_us=metric(
+                    "Preserve_trx_transfer_receiver_projection_publish_p95_us"
+                ),
+                projection_lock_wait_us=metric(
+                    "Preserve_trx_transfer_receiver_projection_lock_wait_us"
+                ),
+                projection_store_write_us=metric(
+                    "Preserve_trx_transfer_receiver_projection_store_write_us"
+                ),
+                projection_marker_write_us=metric(
+                    "Preserve_trx_transfer_receiver_projection_marker_write_us"
+                ),
+                projection_snapshot_write_us=metric(
+                    "Preserve_trx_transfer_receiver_projection_snapshot_write_us"
+                ),
+                projection_external_blob_us=metric(
+                    "Preserve_trx_transfer_receiver_projection_external_blob_us"
+                ),
+                projection_encode_us=metric(
+                    "Preserve_trx_transfer_receiver_projection_encode_us"
+                ),
+                projection_token_state_us=metric(
+                    "Preserve_trx_transfer_receiver_projection_token_state_us"
+                ),
+                epoch_ready_bind_attempts=metric(
+                    "Preserve_trx_transfer_receiver_epoch_ready_bind_attempts"
                 ),
             )
         except ValueError:

@@ -215,11 +215,28 @@ std::string snapshot_dir_for_new_write(
                                       : normalize_dir(dir);
 }
 
+std::string standby_pending_dir_for_new_write(
+    const std::string &dir, const std::string &token,
+    const Preserve_snapshot_write_options &options) {
+  return options.shard_snapshot_files ? generic_external_blob_shard_dir(dir, token)
+                                      : normalize_dir(dir);
+}
+
 std::string snapshot_path_for_existing_token(const std::string &dir,
                                              const std::string &token) {
   const std::string root_path = join_path(dir, token + ".bin");
   if (file_exists(root_path)) return root_path;
   return join_path(generic_external_blob_shard_dir(dir, token), token + ".bin");
+}
+
+bool standby_pending_marker_exists(const std::string &dir,
+                                   const std::string &token) {
+  for (const std::string &candidate_dir : snapshot_dirs_for_token(dir, token)) {
+    if (file_exists(join_path(candidate_dir, token + ".standby_pending"))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::string warm_external_blob_filename(const std::string &warmcopy_id,
@@ -1318,6 +1335,7 @@ Preserve_snapshot_delete_status remove_stale_tmp_files_for_token(
   delete_optional_tmp(join_path(dir, token + ".tainted.tmp"));
   for (const std::string &candidate_dir : snapshot_dirs_for_token(dir, token)) {
     delete_optional_tmp(join_path(candidate_dir, token + ".bin.tmp"));
+    delete_optional_tmp(join_path(candidate_dir, token + ".standby_pending.tmp"));
   }
 
   if (heavy_cleanup) {
@@ -1355,8 +1373,7 @@ Preserve_snapshot_delete_status delete_snapshot_files_with_status(
   const std::string dir = normalize_dir(dir_arg);
   const std::string binlog_cache_path = join_path(dir, token + ".binlog_cache");
   const std::string tainted_path = join_path(dir, token + ".tainted");
-  const std::string standby_pending_path =
-      join_path(dir, token + ".standby_pending");
+  std::set<std::string> sidecar_removed_dirs;
   bool error = false;
   bool removed_sidecar = false;
   /*
@@ -1375,6 +1392,9 @@ Preserve_snapshot_delete_status delete_snapshot_files_with_status(
       return;
     }
     removed_sidecar = true;
+    const size_t pos = path.find_last_of(FN_DIRSEP);
+    sidecar_removed_dirs.insert(pos == std::string::npos ? dir
+                                                         : path.substr(0, pos));
   };
   if (error) return Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE;
 
@@ -1416,7 +1436,10 @@ Preserve_snapshot_delete_status delete_snapshot_files_with_status(
 
   delete_optional_sidecar(binlog_cache_path);
   delete_optional_sidecar(tainted_path);
-  delete_optional_sidecar(standby_pending_path);
+  for (const std::string &candidate_dir : snapshot_dirs_for_token(dir, token)) {
+    delete_optional_sidecar(join_path(candidate_dir,
+                                      token + ".standby_pending"));
+  }
   bool removed_generic_sidecar = false;
   const Preserve_snapshot_delete_status generic_final_status =
       remove_generic_external_blobs_for_token_all_dirs(
@@ -1432,8 +1455,12 @@ Preserve_snapshot_delete_status delete_snapshot_files_with_status(
   if (committed_temp_status != Preserve_snapshot_delete_status::OK) error = true;
   removed_sidecar = removed_sidecar || removed_temp_sidecar;
 
-  if ((snapshot_file_removed || removed_sidecar) && fsync_directory(dir))
-    error = true;
+  if (snapshot_file_removed || removed_sidecar) {
+    sidecar_removed_dirs.insert(dir);
+    for (const std::string &removed_dir : sidecar_removed_dirs) {
+      if (fsync_directory(removed_dir)) error = true;
+    }
+  }
   if (!error) return Preserve_snapshot_delete_status::OK;
 
   return snapshot_file_removed
@@ -1839,16 +1866,23 @@ bool write_tainted_marker(const std::string &dir, const std::string &token,
                            {}) != Atomic_write_status::OK;
 }
 
-bool write_standby_pending_marker(const std::string &dir,
-                                  const std::string &token) {
+bool write_standby_pending_marker(
+    const std::string &dir, const std::string &token,
+    const Preserve_snapshot_write_options &options) {
   if (!token_is_filename_safe(token)) return true;
   DBUG_EXECUTE_IF("preserve_trx_fail_write_standby_pending_marker",
                   return true;);
   const std::string normalized_dir = normalize_dir(dir);
+  if (options.shard_snapshot_files &&
+      ensure_generic_external_blob_shard_dir(normalized_dir, token)) {
+    return true;
+  }
+  const std::string marker_dir =
+      standby_pending_dir_for_new_write(normalized_dir, token, options);
   const std::string marker = "standby_pending\n";
   const std::vector<unsigned char> bytes(marker.begin(), marker.end());
-  return atomic_write_file(normalized_dir, token + ".standby_pending", bytes,
-                           0600, {}) != Atomic_write_status::OK;
+  return atomic_write_file(marker_dir, token + ".standby_pending", bytes, 0600,
+                           options) != Atomic_write_status::OK;
 }
 
 }  // namespace
@@ -2171,7 +2205,7 @@ Local_file_preserved_trx_carrier::mark_standby_pending(
     It is stored beside the immutable snapshot so transfer cleanup can reason
     about the publish boundary without rewriting the snapshot body.
   */
-  return write_standby_pending_marker(m_dir, token)
+  return write_standby_pending_marker(m_dir, token, m_write_options)
              ? Preserved_trx_carrier_status::IO_ERROR
              : Preserved_trx_carrier_status::OK;
 }
@@ -2425,9 +2459,6 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::token_state(
   if (!token_is_filename_safe(token)) {
     return Preserved_trx_carrier_status::CORRUPT;
   }
-  if (m_write_options.fast_new_token_state) {
-    return Preserved_trx_carrier_status::OK;
-  }
 
   state->snapshot = false;
   for (const std::string &candidate_dir : snapshot_dirs_for_token(m_dir, token)) {
@@ -2445,8 +2476,7 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::token_state(
                             external_blob_filename(
                                 token, kPreservedTrxBlobRecordLocks)));
   state->tainted = file_exists(join_path(m_dir, token + ".tainted"));
-  state->standby_pending =
-      file_exists(join_path(m_dir, token + ".standby_pending"));
+  state->standby_pending = standby_pending_marker_exists(m_dir, token);
 
   for (const std::string &candidate_dir :
        generic_external_blob_dirs_for_token(m_dir, token)) {
@@ -2482,6 +2512,41 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::token_state(
     my_dirend(dir_info);
     if (state->temp_sidecar && state->external_blob) break;
   }
+  return Preserved_trx_carrier_status::OK;
+}
+
+Preserved_trx_carrier_status
+Local_file_preserved_trx_carrier::new_token_state_for_write(
+    const std::string &token, Preserved_trx_carrier_token_state *state) {
+  if (state == nullptr) return Preserved_trx_carrier_status::CORRUPT;
+  *state = {};
+  if (!token_is_filename_safe(token)) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  if (m_write_options.fast_new_token_state) {
+    return Preserved_trx_carrier_status::OK;
+  }
+  return token_state(token, state);
+}
+
+Preserved_trx_carrier_status
+Local_file_preserved_trx_carrier::standby_projection_exists(
+    const std::string &token, bool *exists) {
+  if (exists == nullptr) return Preserved_trx_carrier_status::CORRUPT;
+  *exists = false;
+  if (!token_is_filename_safe(token)) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+
+  bool snapshot = false;
+  for (const std::string &candidate_dir : snapshot_dirs_for_token(m_dir, token)) {
+    if (file_exists(join_path(candidate_dir, token + ".bin"))) {
+      snapshot = true;
+      break;
+    }
+  }
+  if (!snapshot) return Preserved_trx_carrier_status::OK;
+  *exists = standby_pending_marker_exists(m_dir, token);
   return Preserved_trx_carrier_status::OK;
 }
 
@@ -2602,6 +2667,16 @@ Local_file_preserved_trx_carrier::adopt_warm_external_blob(
   const std::string final_blob_path =
       external_blob_path_for_new_write(m_dir, token, blob_name,
                                        m_write_options);
+  if (m_write_options.fast_prebuilt_blob_adopt) {
+    MY_STAT final_stat;
+    if (file_exists(final_blob_path, &final_stat)) {
+      if (final_stat.st_size < 0 ||
+          static_cast<uint64_t>(final_stat.st_size) != descriptor.size) {
+        return Preserved_trx_carrier_status::CORRUPT;
+      }
+      return Preserved_trx_carrier_status::OK;
+    }
+  }
   if (!m_write_options.fast_prebuilt_blob_adopt) {
     bool existing_external_blob = file_exists(final_blob_path);
     if (generic_external_blob_uses_shard(blob_name)) {
@@ -2625,9 +2700,14 @@ Local_file_preserved_trx_carrier::adopt_warm_external_blob(
   }
 
   std::string warm_filename;
-  Preserved_trx_carrier_status find_status = find_warm_external_blob_filename(
-      m_dir, warmcopy_id, blob_name, warmcopy_epoch, &warm_filename);
-  if (find_status != Preserved_trx_carrier_status::OK) return find_status;
+  if (m_write_options.fast_prebuilt_blob_adopt) {
+    warm_filename = warm_external_blob_filename(warmcopy_id, blob_name,
+                                                warmcopy_epoch);
+  } else {
+    Preserved_trx_carrier_status find_status = find_warm_external_blob_filename(
+        m_dir, warmcopy_id, blob_name, warmcopy_epoch, &warm_filename);
+    if (find_status != Preserved_trx_carrier_status::OK) return find_status;
+  }
 
   MY_STAT stat_area;
   const std::string warm_path = join_path(m_dir, warm_filename);
@@ -2696,6 +2776,65 @@ Local_file_preserved_trx_carrier::adopt_warm_external_blob(
     treat it as an orphan artifact.
   */
   return Preserved_trx_carrier_status::OK;
+}
+
+Preserved_trx_carrier_status
+Local_file_preserved_trx_carrier::
+    install_staged_external_blob_for_standby_projection(
+        const std::string &token, const std::string &blob_name,
+        const std::string &staged_path,
+        const Preserved_trx_external_blob_descriptor &descriptor) {
+  if (!token_is_filename_safe(token) ||
+      !prebuilt_external_blob_name_is_supported(blob_name) ||
+      descriptor.name != blob_name) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  if (m_write_options.shard_generic_external_blobs &&
+      generic_external_blob_uses_shard(blob_name) &&
+      ensure_generic_external_blob_shard_dir(m_dir, token)) {
+    return Preserved_trx_carrier_status::IO_ERROR;
+  }
+
+  const std::string final_blob_path =
+      external_blob_path_for_new_write(m_dir, token, blob_name,
+                                       m_write_options);
+  MY_STAT stat_area;
+  if (file_exists(final_blob_path, &stat_area)) {
+    if (stat_area.st_size < 0 ||
+        static_cast<uint64_t>(stat_area.st_size) != descriptor.size) {
+      return Preserved_trx_carrier_status::CORRUPT;
+    }
+    return Preserved_trx_carrier_status::OK;
+  }
+  if (path_is_symlink(staged_path) || !file_exists(staged_path, &stat_area) ||
+      stat_area.st_size < 0 || !MY_S_ISREG(stat_area.st_mode) ||
+      static_cast<uint64_t>(stat_area.st_size) != descriptor.size) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+
+#ifdef _WIN32
+  if (CopyFile(staged_path.c_str(), final_blob_path.c_str(), TRUE)) {
+    return Preserved_trx_carrier_status::OK;
+  }
+  my_osmaperr(GetLastError());
+  if (my_errno() == EEXIST && file_exists(final_blob_path, &stat_area) &&
+      stat_area.st_size >= 0 &&
+      static_cast<uint64_t>(stat_area.st_size) == descriptor.size) {
+    return Preserved_trx_carrier_status::OK;
+  }
+  return Preserved_trx_carrier_status::IO_ERROR;
+#else
+  if (link(staged_path.c_str(), final_blob_path.c_str()) == 0) {
+    return Preserved_trx_carrier_status::OK;
+  }
+  set_my_errno(errno);
+  if (errno == EEXIST && file_exists(final_blob_path, &stat_area) &&
+      stat_area.st_size >= 0 &&
+      static_cast<uint64_t>(stat_area.st_size) == descriptor.size) {
+    return Preserved_trx_carrier_status::OK;
+  }
+  return Preserved_trx_carrier_status::IO_ERROR;
+#endif
 }
 
 Preserved_trx_carrier_status
@@ -2849,6 +2988,25 @@ Preserve_snapshot_status preserve_trx_fsync_default_store_directory(
                : Preserve_snapshot_status::OK;
 }
 
+Preserve_snapshot_status preserve_trx_fsync_default_store_token_directory(
+    const std::string &dir, const std::string &token) {
+  if (!token_is_filename_safe(token)) {
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
+  const std::string root = normalize_dir(dir);
+  const std::string shard_dir = generic_external_blob_shard_dir(root, token);
+
+  /*
+    Explicit sync point for callers that deliberately deferred directory fsync
+    while still needing a token-shard durability boundary. Receiver streaming
+    transfer does not use this in the per-token READY path; its ACK/READY path
+    is based on local projection publication, with crash handling delegated to
+    the transfer epoch/replay contract instead of direct per-token sync.
+  */
+  if (fsync_directory(shard_dir)) return Preserve_snapshot_status::IO_ERROR;
+  return Preserve_snapshot_status::OK;
+}
+
 std::unique_ptr<Preserved_trx_warm_external_blob_carrier>
 create_preserved_trx_default_warm_external_blob_carrier(
     const std::string &dir) {
@@ -2996,7 +3154,9 @@ bool preserved_trx_default_carrier_generated_token_exists(
   for (const std::string &candidate_dir :
        snapshot_dirs_for_token(normalized_dir, token)) {
     if (file_exists(join_path(candidate_dir, token + ".bin")) ||
-        file_exists(join_path(candidate_dir, token + ".bin.tmp"))) {
+        file_exists(join_path(candidate_dir, token + ".bin.tmp")) ||
+        file_exists(join_path(candidate_dir, token + ".standby_pending")) ||
+        file_exists(join_path(candidate_dir, token + ".standby_pending.tmp"))) {
       return true;
     }
   }

@@ -839,6 +839,30 @@ class _ReceiverPrewarmStatusRuntime(_FakeRuntime):
                     "1",
                 ),
                 (
+                    "Preserve_trx_transfer_receiver_object_prewarm_count",
+                    "8",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_object_prewarm_us",
+                    "9000",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_object_prewarm_max_us",
+                    "1200",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_record_object_prewarm_count",
+                    "6",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_record_object_prewarm_us",
+                    "7000",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_record_object_prewarm_max_us",
+                    "1000",
+                ),
+                (
                     "Preserve_trx_transfer_receiver_committed_epoch_fallback_count",
                     "2",
                 ),
@@ -857,6 +881,62 @@ class _ReceiverPrewarmStatusRuntime(_FakeRuntime):
                 (
                     "Preserve_trx_transfer_receiver_staged_token_max_us",
                     "900",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_staged_token_active",
+                    "0",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_staged_token_max_active",
+                    "7",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_projection_publish_count",
+                    "4",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_projection_publish_us",
+                    "4000",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_projection_publish_max_us",
+                    "1600",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_projection_publish_p95_us",
+                    "2000",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_projection_lock_wait_us",
+                    "700",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_projection_store_write_us",
+                    "3100",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_projection_marker_write_us",
+                    "500",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_projection_snapshot_write_us",
+                    "900",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_projection_external_blob_us",
+                    "300",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_projection_encode_us",
+                    "200",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_projection_token_state_us",
+                    "100",
+                ),
+                (
+                    "Preserve_trx_transfer_receiver_epoch_ready_bind_attempts",
+                    "1",
                 ),
             ]
         return super().execute(conn, sql, fetch)
@@ -4749,6 +4829,47 @@ class WorkloadPlanTest(unittest.TestCase):
                 },
             )
 
+    def test_receiver_preserve_artifact_counts_include_sharded_projection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            preserve_dir = Path(tmpdir) / "preserve"
+            shard_dir = preserve_dir / "blob_shards" / "9"
+            transfer_dir = preserve_dir / ".transfer" / "epoch_7"
+            shard_dir.mkdir(parents=True)
+            transfer_dir.mkdir(parents=True)
+            (shard_dir / "101.bin").write_text("snapshot", encoding="utf-8")
+            (shard_dir / "101.standby_pending").write_text(
+                "standby_pending\n", encoding="utf-8"
+            )
+            (shard_dir / "101.blob.record_locks").write_text(
+                "record locks", encoding="utf-8"
+            )
+            (preserve_dir / "101.binlog_cache").write_text(
+                "binlog", encoding="utf-8"
+            )
+            (transfer_dir / "epoch.fact").write_text("fact", encoding="utf-8")
+            (transfer_dir / "epoch.commit").write_text("commit", encoding="utf-8")
+            (transfer_dir / "ignored.bin").write_text(
+                "not a snapshot", encoding="utf-8"
+            )
+
+            runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+            runner.config = HarnessConfig(
+                scenario="standby_transfer_receiver_drain_metrics",
+                receiver_unix_socket="/tmp/receiver.sock",
+                receiver_preserve_dir=str(preserve_dir),
+            ).validate()
+
+            self.assertEqual(
+                runner.receiver_preserve_artifact_counts(),
+                {
+                    "snapshot_tokens": 1,
+                    "standby_pending_tokens": 1,
+                    "external_blob_tokens": 2,
+                    "epoch_fact_count": 1,
+                    "epoch_commit_count": 1,
+                },
+            )
+
     def test_standby_transfer_receiver_report_includes_phase2_and_artifacts(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             report_path = Path(tmpdir) / "standby-transfer.json"
@@ -4838,6 +4959,20 @@ class WorkloadPlanTest(unittest.TestCase):
                 staged_token_ready_cache_us=2300,
                 staged_token_total_us=3500,
                 staged_token_max_us=900,
+                staged_token_active=0,
+                staged_token_max_active=7,
+                projection_publish_count=4,
+                projection_publish_us=4000,
+                projection_publish_max_us=1600,
+                projection_publish_p95_us=2000,
+                projection_lock_wait_us=700,
+                projection_store_write_us=3100,
+                projection_marker_write_us=500,
+                projection_snapshot_write_us=900,
+                projection_external_blob_us=300,
+                projection_encode_us=200,
+                projection_token_state_us=100,
+                epoch_ready_bind_attempts=1,
             )
 
             runner.write_standby_transfer_receiver_report(
@@ -4943,6 +5078,20 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertEqual(report["receiver_staged_token_ready_cache_us"], 2300)
             self.assertEqual(report["receiver_staged_token_total_us"], 3500)
             self.assertEqual(report["receiver_staged_token_max_us"], 900)
+            self.assertEqual(report["receiver_staged_token_active"], 0)
+            self.assertEqual(report["receiver_staged_token_max_active"], 7)
+            self.assertEqual(report["receiver_projection_publish_count"], 4)
+            self.assertEqual(report["receiver_projection_publish_us"], 4000)
+            self.assertEqual(report["receiver_projection_publish_max_us"], 1600)
+            self.assertEqual(report["receiver_projection_publish_p95_us"], 2000)
+            self.assertEqual(report["receiver_projection_lock_wait_us"], 700)
+            self.assertEqual(report["receiver_projection_store_write_us"], 3100)
+            self.assertEqual(report["receiver_projection_marker_write_us"], 500)
+            self.assertEqual(report["receiver_projection_snapshot_write_us"], 900)
+            self.assertEqual(report["receiver_projection_external_blob_us"], 300)
+            self.assertEqual(report["receiver_projection_encode_us"], 200)
+            self.assertEqual(report["receiver_projection_token_state_us"], 100)
+            self.assertEqual(report["receiver_epoch_ready_bind_attempts"], 1)
             self.assertEqual(report["receiver_seal_prewarm_tokens"], 5)
             self.assertEqual(report["receiver_seal_prewarm_success_tokens"], 4)
             self.assertEqual(report["receiver_seal_prewarm_not_ready_tokens"], 1)
@@ -7343,11 +7492,31 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertEqual(metrics.record_lock_reserved_residency_bytes, 278528)
         self.assertEqual(metrics.object_prewarm_proof_count, 4)
         self.assertEqual(metrics.object_prewarm_miss_count, 1)
+        self.assertEqual(metrics.object_prewarm_count, 8)
+        self.assertEqual(metrics.object_prewarm_us, 9000)
+        self.assertEqual(metrics.object_prewarm_max_us, 1200)
+        self.assertEqual(metrics.record_object_prewarm_count, 6)
+        self.assertEqual(metrics.record_object_prewarm_us, 7000)
+        self.assertEqual(metrics.record_object_prewarm_max_us, 1000)
         self.assertEqual(metrics.committed_epoch_fallback_count, 2)
         self.assertEqual(metrics.staged_token_publish_us, 1200)
         self.assertEqual(metrics.staged_token_ready_cache_us, 2300)
         self.assertEqual(metrics.staged_token_total_us, 3500)
         self.assertEqual(metrics.staged_token_max_us, 900)
+        self.assertEqual(metrics.staged_token_active, 0)
+        self.assertEqual(metrics.staged_token_max_active, 7)
+        self.assertEqual(metrics.projection_publish_count, 4)
+        self.assertEqual(metrics.projection_publish_us, 4000)
+        self.assertEqual(metrics.projection_publish_max_us, 1600)
+        self.assertEqual(metrics.projection_publish_p95_us, 2000)
+        self.assertEqual(metrics.projection_lock_wait_us, 700)
+        self.assertEqual(metrics.projection_store_write_us, 3100)
+        self.assertEqual(metrics.projection_marker_write_us, 500)
+        self.assertEqual(metrics.projection_snapshot_write_us, 900)
+        self.assertEqual(metrics.projection_external_blob_us, 300)
+        self.assertEqual(metrics.projection_encode_us, 200)
+        self.assertEqual(metrics.projection_token_state_us, 100)
+        self.assertEqual(metrics.epoch_ready_bind_attempts, 1)
         self.assertEqual(metrics.seal_prewarm_tokens, 5)
         self.assertEqual(metrics.seal_prewarm_success_tokens, 4)
         self.assertEqual(metrics.seal_prewarm_not_ready_tokens, 1)
