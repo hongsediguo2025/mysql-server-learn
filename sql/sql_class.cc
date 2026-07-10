@@ -1024,6 +1024,8 @@ void THD::cleanup(void) {
 void THD::release_resources() {
   DBUG_ASSERT(m_release_resources_done == false);
 
+  preserved_trx_begin_external_thd_teardown(this);
+
   Global_THD_manager::get_instance()->release_thread_id(m_thread_id);
 
   /* Ensure that no one is using THD */
@@ -1089,6 +1091,7 @@ void THD::release_resources() {
   mysql_mutex_unlock(&LOCK_status);
 
   m_release_resources_done = true;
+  preserved_trx_end_external_thd_teardown(this);
 }
 
 THD::~THD() {

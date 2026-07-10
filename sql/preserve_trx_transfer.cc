@@ -7644,18 +7644,23 @@ Preserve_trx_transfer_session_artifact_sink::publish_bundle(
   bundle.metadata.expires_at_us =
       created_at_us + timeout_seconds * kMicrosecondsPerSecond;
 
-  std::set<std::string> presealed_prebuilt_objects;
+  std::set<std::string> presealed_external_objects;
   for (const Preserved_trx_external_blob &blob : bundle.external_blobs) {
-    if (!blob.prebuilt) continue;
     Preserve_trx_transfer_object_descriptor descriptor;
     descriptor.object_id = blob.name;
     descriptor.kind = Preserve_trx_transfer_object_kind::EXTERNAL_BLOB;
-    descriptor.total_size = blob.descriptor.size;
-    descriptor.digest = blob.descriptor.digest;
+    if (blob.prebuilt) {
+      descriptor.total_size = blob.descriptor.size;
+      descriptor.digest = blob.descriptor.digest;
+    } else {
+      descriptor.total_size = blob.payload.length();
+      descriptor.digest = sha256_digest(blob.payload);
+    }
     if (m_session->object_presealed_for_token(m_transfer_token, descriptor)) {
-      presealed_prebuilt_objects.insert(blob.name);
+      presealed_external_objects.insert(blob.name);
       continue;
     }
+    if (!blob.prebuilt) continue;
     (void)m_session->abort_token(
         m_transfer_token, "source_session_prebuilt_not_presealed");
     const std::string message =
@@ -7668,7 +7673,7 @@ Preserve_trx_transfer_session_artifact_sink::publish_bundle(
 
   const Preserve_trx_transfer_status materialize_status =
       materialize_prebuilt_external_blobs_for_transfer(
-          m_preserve_dir, &bundle, &presealed_prebuilt_objects);
+          m_preserve_dir, &bundle, &presealed_external_objects);
   if (materialize_status != Preserve_trx_transfer_status::OK) {
     (void)m_session->abort_token(
         m_transfer_token, "source_session_prebuilt_materialize_failed:" +
@@ -7690,11 +7695,11 @@ Preserve_trx_transfer_session_artifact_sink::publish_bundle(
       preserve_trx_transfer_build_portable_objects_impl(
           m_session->epoch_id(), m_session->source_server_uuid(),
           m_session->target_server_uuid(), bundle, m_transfer_token, &manifest,
-          &objects, &presealed_prebuilt_objects);
+          &objects, &presealed_external_objects);
   if (status == Preserve_trx_transfer_status::OK) {
     publish_step = "send_token_objects_batch";
     status = m_session->send_token_objects_batch(
-        manifest, objects, presealed_prebuilt_objects, m_queue_final_metadata);
+        manifest, objects, presealed_external_objects, m_queue_final_metadata);
   }
   if (status != Preserve_trx_transfer_status::OK) {
     (void)m_session->abort_token(

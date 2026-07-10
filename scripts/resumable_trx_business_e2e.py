@@ -5171,12 +5171,16 @@ class BusinessE2ERunner:
                 "evidence"
             )
 
-        ready_lag_us = receiver_prewarm_metrics.ready_after_final_metadata_us
+        ready_lag_us = receiver_prewarm_metrics.ready_after_final_spool_ack_us
+        ready_lag_label = "receiver_ready_after_final_spool_ack_us"
+        if ready_lag_us == 0:
+            ready_lag_us = receiver_prewarm_metrics.ready_after_final_metadata_us
+            ready_lag_label = "receiver_ready_after_final_metadata_us"
         max_lag_ms = self.config.max_receiver_ready_after_phase2_ms
         if max_lag_ms > 0 and ready_lag_us > max_lag_ms * 1000:
             raise AssertionError(
-                "receiver readiness lag exceeded threshold: "
-                f"receiver_ready_after_final_metadata_us={ready_lag_us} "
+                "receiver readiness lag exceeded threshold after final spool ACK: "
+                f"{ready_lag_label}={ready_lag_us} "
                 f"max_ms={max_lag_ms}"
             )
 

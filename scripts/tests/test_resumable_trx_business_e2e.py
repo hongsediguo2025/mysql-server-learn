@@ -5557,6 +5557,67 @@ class WorkloadPlanTest(unittest.TestCase):
                 expected_standby_pending=2
             )
 
+    def test_standby_transfer_receiver_readiness_gate_uses_final_spool_ack_lag(
+        self,
+    ):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            receiver_unix_socket="/tmp/receiver.sock",
+            receiver_preserve_dir="/tmp/receiver-data/preserve",
+            max_receiver_ready_after_phase2_ms=10,
+        ).validate()
+        runner.warmcopy_drain_metrics = [
+            WarmcopyDrainMetrics(
+                phase2_pause_ms=1.0,
+                full_copy_to_count=0,
+                phase2_total_ms=2.0,
+                phase2_end_monotonic_us=1_000_000,
+            )
+        ]
+        runner.receiver_artifact_counts = {
+            "snapshot_tokens": 2,
+            "standby_pending_tokens": 2,
+            "external_blob_tokens": 2,
+            "epoch_fact_count": 1,
+            "epoch_commit_count": 1,
+        }
+        runner.receiver_prewarm_metrics = ReceiverPrewarmMetrics(
+            auto_prewarm_tokens=2,
+            auto_prewarm_ready_tokens=2,
+            auto_prewarm_not_ready_tokens=0,
+            auto_prewarm_last_status=0,
+            ready_monotonic_us=1_011_000,
+            first_frame_monotonic_us=999_000,
+            last_object_seal_monotonic_us=1_006_000,
+            prewarm_start_monotonic_us=999_500,
+            prewarm_end_monotonic_us=1_011_000,
+            record_lock_page_count=0,
+            record_lock_resident_pages=0,
+            record_lock_cold_page_gets=0,
+            seal_prewarm_tokens=2,
+            seal_prewarm_success_tokens=2,
+            seal_prewarm_not_ready_tokens=0,
+            seal_prewarm_last_status=0,
+            ready_after_final_metadata_us=99_000_000,
+            ready_after_final_spool_ack_us=5_000,
+        )
+        runner.receiver_ready_after_source_phase2_end_us = 999_999_999
+
+        runner.validate_standby_transfer_receiver_readiness(
+            expected_standby_pending=2
+        )
+
+        runner.receiver_prewarm_metrics = replace(
+            runner.receiver_prewarm_metrics,
+            ready_after_final_spool_ack_us=11_000,
+        )
+        with self.assertRaisesRegex(AssertionError, "final spool ACK"):
+            runner.validate_standby_transfer_receiver_readiness(
+                expected_standby_pending=2
+            )
+
     def test_standby_transfer_receiver_readiness_gate_uses_receiver_local_final_metadata_lag(
         self,
     ):

@@ -562,6 +562,8 @@ bool preserved_trx_defer_shutdown_signal();
 void preserved_trx_note_statement_response(THD *thd);
 void preserved_trx_finalize_statement_response(THD *thd);
 void preserved_trx_release_resources(THD *thd);
+void preserved_trx_begin_external_thd_teardown(THD *thd);
+void preserved_trx_end_external_thd_teardown(THD *thd);
 void preserved_trx_wait_for_external_thd_use(THD *thd);
 bool preserved_trx_thd_has_external_use(THD *thd);
 bool preserve_trx_preserve_attached_transaction(

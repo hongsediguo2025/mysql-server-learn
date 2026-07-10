@@ -2215,6 +2215,17 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
         }
       }
     }
+    if (effective_required_apply_lsn == 0) {
+      for (uint64_t token : result->seen_tokens) {
+        add_abandoned_token(
+            result, token,
+            Preserve_trx_promotion_adopt_status::APPLY_BARRIER_NOT_REACHED,
+            "apply barrier requires a non-zero LSN",
+            Preserve_trx_promotion_cleanup_state::CLEANUP_PENDING);
+      }
+      return finish_with_optional_abandoned_marker(
+          Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS);
+    }
     Preserve_trx_promotion_apply_state apply_state;
     bool apply_state_available = false;
     if (g_apply_state_provider != nullptr) {

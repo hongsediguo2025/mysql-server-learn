@@ -3251,6 +3251,30 @@ class PreserveSnapshotTest : public ::testing::Test {
     return false;
   }
 
+  bool wait_for_epoch_ready_token(
+      const std::string &epoch_id, uint64_t token,
+      Preserve_trx_promotion_ready_summary *summary = nullptr,
+      uint attempts = 200) {
+    for (uint attempt = 0; attempt < attempts; ++attempt) {
+      Preserve_trx_promotion_ready_summary current;
+      const Preserve_trx_promotion_adopt_status status =
+          preserved_trx_promotion_ready_summary_for_epoch(m_dir, epoch_id,
+                                                          &current);
+      if (status == Preserve_trx_promotion_adopt_status::OK &&
+          std::find(current.ready_tokens.begin(), current.ready_tokens.end(),
+                    token) != current.ready_tokens.end()) {
+        if (summary != nullptr) *summary = current;
+        return true;
+      }
+      my_sleep(10000);
+    }
+    if (summary != nullptr) {
+      (void)preserved_trx_promotion_ready_summary_for_epoch(m_dir, epoch_id,
+                                                            summary);
+    }
+    return false;
+  }
+
   std::vector<unsigned char> read_snapshot_bytes() {
     const std::string snapshot = read_file(m_dir + "msp_snapshot_gunit.bin");
     return std::vector<unsigned char>(snapshot.begin(), snapshot.end());
@@ -5762,6 +5786,53 @@ TEST_F(PreserveSnapshotTest, PromotionReadyCacheRequiredLsnFeedsApplyBarrier) {
   EXPECT_EQ(Preserve_trx_promotion_adopt_status::APPLY_BARRIER_NOT_REACHED,
             result.token_results[0].status);
   preserved_trx_set_promotion_apply_state_provider_for_unit_test(nullptr);
+  preserve_trx_set_enable_value(true);
+}
+
+TEST_F(PreserveSnapshotTest, PromotionApplyBarrierRejectsZeroEffectiveLsn) {
+  preserve_trx_set_enable_value(true);
+  preserved_trx_promotion_ready_cache_clear_for_unit_test();
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = "946";
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_snapshot_metadata written_metadata;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            store.write_standby_pending(std::move(bundle), 300,
+                                        &written_metadata));
+
+  preserved_trx_promotion_ready_cache_put_for_unit_test(
+      m_dir, "epoch-1", 946, Preserve_trx_promotion_ready_state::READY, 0);
+  preserved_trx_set_promotion_apply_state_provider_for_unit_test(nullptr);
+  DBUG_SET("+d,preserve_trx_promotion_debug_apply_reached");
+  Preserve_trx_promotion_adopt_all_request request;
+  request.epoch_id = "epoch-1";
+  request.tokens.push_back(946);
+  request.required_apply_lsn = 0;
+  request.require_epoch_committed = false;
+  request.require_apply_barrier = true;
+  request.require_promotion_ready_cache = true;
+
+  Preserve_trx_promotion_adopt_result result;
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::OK_WITH_ABANDONED_TOKENS,
+            preserved_trx_adopt_standby_pending_all_for_promotion(
+                m_dir, request, &result));
+  EXPECT_EQ(0U, result.adopted_count);
+  EXPECT_EQ(0U, result.failed_count);
+  EXPECT_EQ(1U, result.abandoned_count);
+  ASSERT_EQ(1U, result.token_results.size());
+  EXPECT_EQ(Preserve_trx_promotion_adopt_status::APPLY_BARRIER_NOT_REACHED,
+            result.token_results[0].status);
+
+  DBUG_SET("-d,preserve_trx_promotion_debug_apply_reached");
+  preserved_trx_set_promotion_apply_state_provider_for_unit_test(nullptr);
+  preserved_trx_promotion_ready_cache_clear_for_unit_test();
   preserve_trx_set_enable_value(true);
 }
 
@@ -8863,7 +8934,7 @@ TEST_F(PreserveSnapshotTest,
                 m_dir, commit, &store, &registry, 300, &written_metadata));
   EXPECT_TRUE(written_metadata.token.empty());
   EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
-  ASSERT_TRUE(wait_for_standby_artifact(&carrier, meta.token));
+  ASSERT_TRUE(wait_for_epoch_ready_token(manifest.epoch_id, manifest.token));
 
   Preserve_trx_transfer_epoch_fact fact;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
@@ -8887,11 +8958,6 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_TRUE(record.state == Preserve_trx_transfer_receiver_state::RECEIVING ||
               record.state == Preserve_trx_transfer_receiver_state::SAVED_ONLINE);
 
-  Preserved_trx_carrier_token_state token_state;
-  ASSERT_TRUE(wait_for_standby_artifact(&carrier, meta.token, &token_state));
-  EXPECT_TRUE(token_state.snapshot);
-  EXPECT_TRUE(token_state.standby_pending);
-
   Preserve_trx_promotion_ready_summary ready_summary;
   ASSERT_TRUE(wait_for_epoch_ready(manifest.epoch_id, 1, &ready_summary));
   ASSERT_EQ(1U, ready_summary.ready_tokens.size());
@@ -8912,7 +8978,7 @@ TEST_F(PreserveSnapshotTest,
 
   /*
     COMMIT_EPOCH is only the final-metadata durable boundary. Staging scratch
-    cleanup may lag behind the durable snapshot/standby marker and ready cache.
+    cleanup may lag behind the online ready cache.
   */
 }
 
@@ -9939,13 +10005,10 @@ TEST_F(PreserveSnapshotTest,
                 m_dir, commit, &store, &registry, 300, nullptr));
   EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
 
-  Preserved_trx_carrier_token_state state;
-  ASSERT_TRUE(wait_for_standby_artifact(
-      &carrier, test_transfer_token_string(manifest.token), &state));
-  ASSERT_TRUE(state.snapshot);
-  ASSERT_TRUE(state.standby_pending);
+  ASSERT_TRUE(wait_for_epoch_ready_token(manifest.epoch_id, manifest.token));
 
   preserved_trx_promotion_ready_cache_clear_for_unit_test();
+  preserve_trx_transfer_shutdown_receiver_prewarm_workers();
 
   Preserve_trx_transfer_receiver_registry replayed_registry;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
@@ -10566,7 +10629,7 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             apply_encoded_frame(commit, &written_metadata));
   EXPECT_TRUE(written_metadata.token.empty());
-  ASSERT_TRUE(wait_for_standby_artifact(&carrier, meta.token));
+  ASSERT_TRUE(wait_for_epoch_ready_token(manifest.epoch_id, manifest.token));
 
   Preserve_trx_transfer_receiver_record record;
   ASSERT_TRUE(registry.lookup(manifest.epoch_id, manifest.token, &record));
@@ -10648,7 +10711,7 @@ TEST_F(PreserveSnapshotTest,
   }
   EXPECT_TRUE(written_metadata.token.empty());
   EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
-  ASSERT_TRUE(wait_for_standby_artifact(&carrier, meta.token));
+  ASSERT_TRUE(wait_for_epoch_ready_token(manifest.epoch_id, manifest.token));
 }
 
 TEST_F(PreserveSnapshotTest, TransferReceiverStagingSealsObjectDigest) {
@@ -11702,11 +11765,7 @@ TEST_F(PreserveSnapshotTest,
                   &written_metadata));
   }
 
-  Preserved_trx_carrier_token_state state;
-  ASSERT_TRUE(wait_for_standby_artifact(&carrier, meta.token, &state));
-  EXPECT_TRUE(state.snapshot);
-  EXPECT_TRUE(state.external_blob);
-  EXPECT_TRUE(state.standby_pending);
+  ASSERT_TRUE(wait_for_epoch_ready_token(manifest.epoch_id, manifest.token));
   EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
   EXPECT_TRUE(written_metadata.token.empty());
 }
@@ -12139,33 +12198,25 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_apply_receiver_frame(
                 m_dir, commit, &store, &registry, 300, nullptr));
   ASSERT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest.epoch_id));
-  ASSERT_TRUE(wait_for_standby_artifact(&carrier, meta.token));
-
-  preserved_trx_promotion_ready_cache_clear_for_unit_test();
-  Preserve_trx_transfer_frame prewarm;
-  prewarm.type = Preserve_trx_transfer_frame_type::PROMOTION_PREWARM_TOKEN;
-  prewarm.sequence = 5;
-  prewarm.epoch_id = manifest.epoch_id;
-  prewarm.token = transfer_token;
-  prewarm.chunk_offset = 50;
-  ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            preserve_trx_transfer_apply_receiver_frame(
-                m_dir, prewarm, &store, &registry, 300, nullptr));
+  ASSERT_TRUE(wait_for_epoch_ready_token(manifest.epoch_id, manifest.token));
 
   preserved_trx_set_promotion_apply_state_provider_for_unit_test(
       promotion_apply_provider_reached_for_test);
   preserved_trx_set_promotion_adopt_executor_for_unit_test(
       promotion_adopt_success_for_test);
+  DBUG_SET("+d,preserve_trx_promotion_debug_apply_reached");
 
   Preserve_trx_transfer_frame gate;
   gate.type = Preserve_trx_transfer_frame_type::PROMOTION_GATE_EPOCH;
-  gate.sequence = 6;
+  gate.sequence = 5;
   gate.epoch_id = manifest.epoch_id;
   gate.token = 0;
   gate.chunk_offset = 50;
-  EXPECT_EQ(Preserve_trx_transfer_status::OK,
-            preserve_trx_transfer_apply_receiver_frame(
-                m_dir, gate, &store, &registry, 300, nullptr));
+  const Preserve_trx_transfer_status gate_status =
+      preserve_trx_transfer_apply_receiver_frame(
+          m_dir, gate, &store, &registry, 300, nullptr);
+  DBUG_SET("-d,preserve_trx_promotion_debug_apply_reached");
+  EXPECT_EQ(Preserve_trx_transfer_status::OK, gate_status);
 
   const std::string adopted_payload =
       read_file(m_dir + manifest.epoch_id + ".promotion_adopted");
@@ -12375,10 +12426,7 @@ TEST_F(PreserveSnapshotTest, TransferSourceSendsBundleThroughFrameSink) {
   EXPECT_GT(sink.frame_count(), 0U);
   EXPECT_TRUE(written_metadata.token.empty());
 
-  Preserved_trx_carrier_token_state state;
-  ASSERT_TRUE(wait_for_standby_artifact(&carrier, meta.token, &state));
-  EXPECT_TRUE(state.snapshot);
-  EXPECT_TRUE(state.standby_pending);
+  ASSERT_TRUE(wait_for_epoch_ready_token(manifest.epoch_id, manifest.token));
   EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
 }
 
@@ -12458,11 +12506,8 @@ TEST_F(PreserveSnapshotTest,
                 m_dir, source_sink.frames(), &store, &registry, 300, 3));
 
   for (const uint64_t transfer_token : transfer_tokens) {
-    Preserved_trx_carrier_token_state state;
-    ASSERT_TRUE(wait_for_standby_artifact(
-        &carrier, test_transfer_token_string(transfer_token), &state));
-    EXPECT_TRUE(state.snapshot);
-    EXPECT_TRUE(state.standby_pending);
+    ASSERT_TRUE(wait_for_epoch_ready_token("epoch-receiver-batch",
+                                           transfer_token));
   }
   EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifests[0]));
 }
@@ -12660,17 +12705,10 @@ TEST_F(PreserveSnapshotTest,
                 &next_sequence));
   ASSERT_EQ(Preserve_trx_transfer_status::OK, apply_new_frames());
 
-  ASSERT_TRUE(wait_for_standby_artifact(
-      &carrier, test_transfer_token_string(first_manifest.token),
-      &first_state));
-  EXPECT_TRUE(first_state.snapshot);
-  EXPECT_TRUE(first_state.standby_pending);
-  Preserved_trx_carrier_token_state second_state;
-  ASSERT_TRUE(wait_for_standby_artifact(
-      &carrier, test_transfer_token_string(second_manifest.token),
-      &second_state));
-  EXPECT_TRUE(second_state.snapshot);
-  EXPECT_TRUE(second_state.standby_pending);
+  ASSERT_TRUE(wait_for_epoch_ready_token(first_manifest.epoch_id,
+                                         first_manifest.token));
+  ASSERT_TRUE(wait_for_epoch_ready_token(second_manifest.epoch_id,
+                                         second_manifest.token));
   EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, first_manifest));
 }
 
@@ -12746,11 +12784,7 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_handle_receiver_payload_batch(
                 m_dir, source_sink.frames(), &store, &registry, 300, 3));
 
-  Preserved_trx_carrier_token_state state;
-  ASSERT_TRUE(wait_for_standby_artifact(
-      &carrier, test_transfer_token_string(transfer_token), &state));
-  EXPECT_TRUE(state.snapshot);
-  EXPECT_TRUE(state.standby_pending);
+  ASSERT_TRUE(wait_for_epoch_ready_token(manifest.epoch_id, manifest.token));
   EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
 }
 
@@ -12832,11 +12866,7 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_handle_receiver_payload_batch(
                 m_dir, source_sink.frames(), &store, &registry, 300, 3));
 
-  Preserved_trx_carrier_token_state state;
-  ASSERT_TRUE(wait_for_standby_artifact(
-      &carrier, test_transfer_token_string(transfer_token), &state));
-  EXPECT_TRUE(state.snapshot);
-  EXPECT_TRUE(state.standby_pending);
+  ASSERT_TRUE(wait_for_epoch_ready_token(manifest.epoch_id, manifest.token));
   EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
 }
 
@@ -12935,11 +12965,7 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_handle_receiver_payload_batch(
                 m_dir, source_sink.frames(), &store, &registry, 300, 3));
 
-  Preserved_trx_carrier_token_state state;
-  ASSERT_TRUE(wait_for_standby_artifact(
-      &carrier, test_transfer_token_string(transfer_token), &state));
-  EXPECT_TRUE(state.snapshot);
-  EXPECT_TRUE(state.standby_pending);
+  ASSERT_TRUE(wait_for_epoch_ready_token(manifest.epoch_id, manifest.token));
   EXPECT_TRUE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
 }
 
@@ -13566,11 +13592,7 @@ TEST_F(PreserveSnapshotTest, TransferSourceCanDeclareTokenBeforeManifest) {
                 manifest.epoch_id, manifest.token, &sink, &next_sequence));
   ASSERT_EQ(Preserve_trx_transfer_status::OK, apply_new_frames());
 
-  Preserved_trx_carrier_token_state token_state;
-  ASSERT_TRUE(wait_for_standby_artifact(
-      &carrier, test_transfer_token_string(902), &token_state));
-  EXPECT_TRUE(token_state.snapshot);
-  EXPECT_TRUE(token_state.standby_pending);
+  ASSERT_TRUE(wait_for_epoch_ready_token(manifest.epoch_id, manifest.token));
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -13611,11 +13633,7 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_handle_receiver_payload_batch(
                 m_dir, sink.frames(), &store, &registry, 300, 3));
 
-  Preserved_trx_carrier_token_state kept_state;
-  ASSERT_TRUE(wait_for_standby_artifact(
-      &carrier, test_transfer_token_string(904), &kept_state));
-  EXPECT_TRUE(kept_state.snapshot);
-  EXPECT_TRUE(kept_state.standby_pending);
+  ASSERT_TRUE(wait_for_epoch_ready_token(manifest.epoch_id, 904));
 
   Preserved_trx_carrier_token_state removed_state;
   ASSERT_EQ(Preserved_trx_carrier_status::OK,
@@ -13674,17 +13692,10 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_handle_receiver_payload_batch(
                 m_dir, sink.frames(), &store, &registry, 300, 3));
 
-  Preserved_trx_carrier_token_state first_state;
-  ASSERT_TRUE(wait_for_standby_artifact(
-      &carrier, test_transfer_token_string(912), &first_state));
-  EXPECT_TRUE(first_state.snapshot);
-  EXPECT_TRUE(first_state.standby_pending);
-
-  Preserved_trx_carrier_token_state second_state;
-  ASSERT_TRUE(wait_for_standby_artifact(
-      &carrier, test_transfer_token_string(913), &second_state));
-  EXPECT_TRUE(second_state.snapshot);
-  EXPECT_TRUE(second_state.standby_pending);
+  ASSERT_TRUE(wait_for_epoch_ready_token("epoch-source-session-batch-final",
+                                         912));
+  ASSERT_TRUE(wait_for_epoch_ready_token("epoch-source-session-batch-final",
+                                         913));
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -13730,11 +13741,8 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_TRUE(probe.contains_commit_epoch);
   EXPECT_TRUE(probe.saw_unpublished_tokens);
 
-  Preserved_trx_carrier_token_state first_state;
-  ASSERT_TRUE(wait_for_standby_artifact(
-      &carrier, test_transfer_token_string(914), &first_state));
-  EXPECT_TRUE(first_state.snapshot);
-  EXPECT_TRUE(first_state.standby_pending);
+  ASSERT_TRUE(wait_for_epoch_ready_token("epoch-source-session-spool-signal",
+                                         914));
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -14366,10 +14374,7 @@ TEST_F(PreserveSnapshotTest, TransferArtifactSinkPublishesThroughFrameSink) {
   EXPECT_TRUE(receiver_metadata.token.empty());
   EXPECT_GT(frame_sink.frame_count(), 0U);
 
-  Preserved_trx_carrier_token_state state;
-  ASSERT_TRUE(wait_for_standby_artifact(&carrier, meta.token, &state));
-  EXPECT_TRUE(state.snapshot);
-  EXPECT_TRUE(state.standby_pending);
+  ASSERT_TRUE(wait_for_epoch_ready_token("epoch-artifact", transfer_token));
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -14429,9 +14434,8 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
   EXPECT_GT(preserve_trx_transfer_phase2_final_metadata_fsync_count_status(),
             final_metadata_fsyncs_before);
-  ASSERT_TRUE(wait_for_standby_artifact(&carrier, meta.token, &state));
-  EXPECT_TRUE(state.snapshot);
-  EXPECT_TRUE(state.standby_pending);
+  ASSERT_TRUE(wait_for_epoch_ready_token("epoch-session-artifact",
+                                         transfer_token));
   EXPECT_TRUE(receiver_metadata.token.empty());
 }
 
@@ -15058,10 +15062,8 @@ TEST_F(PreserveSnapshotTest,
               preserve_trx_transfer_handle_receiver_payload(
                   m_dir, encoded_frame, &store, &registry, 300, nullptr));
   }
-  Preserved_trx_carrier_token_state state;
-  ASSERT_TRUE(wait_for_standby_artifact(&carrier, meta.token, &state));
-  EXPECT_TRUE(state.snapshot);
-  EXPECT_TRUE(state.standby_pending);
+  ASSERT_TRUE(wait_for_epoch_ready_token("epoch-artifact-predeclare",
+                                         transfer_token));
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -15110,13 +15112,8 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_TRUE(receiver_metadata.token.empty());
   EXPECT_GT(frame_sink.frame_count(), 0U);
 
-  Preserved_trx_bundle received;
-  ASSERT_TRUE(wait_for_standby_artifact(&carrier, meta.token));
-  ASSERT_EQ(Preserve_snapshot_status::OK,
-            store.read(meta.token, true, &received));
-  EXPECT_GT(received.metadata.created_at_us, 0U);
-  EXPECT_GT(received.metadata.expires_at_us,
-            received.metadata.created_at_us);
+  ASSERT_TRUE(wait_for_epoch_ready_token("epoch-artifact-deadline",
+                                         transfer_token));
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -15151,15 +15148,7 @@ TEST_F(PreserveSnapshotTest,
       bundle.external_blobs.begin(), bundle.external_blobs.end(),
       [](const Preserved_trx_external_blob &blob) { return blob.prebuilt; }));
 
-  Transfer_receiver_config_guard receiver_config;
-  receiver_config.allow("source-uuid", "target-uuid");
-
-  Local_file_preserved_trx_carrier receiver_carrier(m_dir);
-  Preserved_trx_store store(&receiver_carrier);
-  Preserve_trx_transfer_receiver_registry registry;
-  Preserve_snapshot_metadata receiver_metadata;
-  Transfer_receiver_payload_test_sink frame_sink(m_dir, &store, &registry,
-                                                 &receiver_metadata);
+  Capturing_transfer_frame_sink frame_sink;
   Preserve_trx_transfer_artifact_sink sink(
       "epoch-artifact-prebuilt", "source-uuid", "target-uuid", transfer_token,
       11, &frame_sink, m_dir);
@@ -15168,14 +15157,18 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_EQ(Preserve_snapshot_status::OK,
             sink.publish_bundle(std::move(bundle), 300, &written_metadata));
 
-  Preserved_trx_bundle received;
-  ASSERT_TRUE(wait_for_standby_artifact(&receiver_carrier, meta.token));
-  ASSERT_EQ(Preserve_snapshot_status::OK,
-            store.read(meta.token, true, &received));
-  EXPECT_EQ(record_payload, received.metadata.record_locks_payload);
-  EXPECT_EQ(binlog_payload, received.metadata.binlog_cache_payload);
-  EXPECT_TRUE(receiver_metadata.token.empty());
-  EXPECT_GT(frame_sink.frame_count(), 0U);
+  std::map<std::string, std::string> object_payloads;
+  for (const std::string &encoded_frame : frame_sink.frames()) {
+    Preserve_trx_transfer_frame frame;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_decode_frame(encoded_frame, &frame));
+    if (frame.type == Preserve_trx_transfer_frame_type::OBJECT_CHUNK) {
+      object_payloads[frame.object_id].append(frame.chunk_payload);
+    }
+  }
+  EXPECT_EQ(record_payload, object_payloads[kPreservedTrxBlobRecordLocks]);
+  EXPECT_EQ(binlog_payload, object_payloads[kPreservedTrxBlobBinlogCache]);
+  EXPECT_GT(frame_sink.frames().size(), 0U);
 }
 
 TEST_F(PreserveSnapshotTest, LocalArtifactSinkPublishesOrdinarySnapshot) {
@@ -15299,10 +15292,8 @@ TEST_F(PreserveSnapshotTest, ArtifactSinkFactoryUsesSourceEpochSession) {
       m_dir, std::string("epoch-factory-session")));
   ASSERT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
 
-  Preserved_trx_carrier_token_state state;
-  ASSERT_TRUE(wait_for_standby_artifact(&carrier, meta.token, &state));
-  EXPECT_TRUE(state.snapshot);
-  EXPECT_TRUE(state.standby_pending);
+  ASSERT_TRUE(wait_for_epoch_ready_token("epoch-factory-session",
+                                         transfer_token));
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -15354,10 +15345,8 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_handle_receiver_payload_batch(
                 m_dir, frame_sink.frames(), &receiver_store, &registry, 300, 3));
 
-  Preserved_trx_carrier_token_state state;
-  ASSERT_TRUE(wait_for_standby_artifact(&carrier, meta.token, &state));
-  EXPECT_TRUE(state.snapshot);
-  EXPECT_TRUE(state.standby_pending);
+  ASSERT_TRUE(wait_for_epoch_ready_token("epoch-factory-session-queued",
+                                         transfer_token));
 }
 
 TEST_F(PreserveSnapshotTest,

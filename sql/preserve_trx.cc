@@ -42,6 +42,7 @@
 #include <sstream>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -707,6 +708,7 @@ bool g_preserved_trx_reaper_stop = false;
 std::mutex g_preserved_trx_thd_pin_mutex;
 std::condition_variable g_preserved_trx_thd_pin_cond;
 std::unordered_map<THD *, uint> g_preserved_trx_thd_pin_counts;
+std::unordered_set<THD *> g_preserved_trx_thd_teardown;
 
 static uint64_t preserve_trx_monotonic_us() {
   using clock = std::chrono::steady_clock;
@@ -861,13 +863,17 @@ class Preserve_trx_external_thd_pin {
  public:
   static std::unique_ptr<Preserve_trx_external_thd_pin> acquire_locked(
       THD *thd) {
-    if (thd == nullptr || thd->release_resources_done()) return nullptr;
     std::unique_ptr<Preserve_trx_external_thd_pin> pin(
         new Preserve_trx_external_thd_pin(thd));
     {
       std::lock_guard<std::mutex> lock(g_preserved_trx_thd_pin_mutex);
+      if (thd == nullptr || thd->release_resources_done() ||
+          g_preserved_trx_thd_teardown.count(thd) != 0) {
+        return nullptr;
+      }
       ++g_preserved_trx_thd_pin_counts[thd];
     }
+    DEBUG_SYNC(current_thd, "preserve_trx_external_thd_pin_acquired");
     return pin;
   }
 
@@ -9047,13 +9053,28 @@ void preserved_trx_release_resources(THD *thd) {
   preserved_trx_finalize_statement_response(thd);
 }
 
-void preserved_trx_wait_for_external_thd_use(THD *thd) {
+void preserved_trx_begin_external_thd_teardown(THD *thd) {
   if (thd == nullptr) return;
   std::unique_lock<std::mutex> lock(g_preserved_trx_thd_pin_mutex);
+  g_preserved_trx_thd_teardown.insert(thd);
   g_preserved_trx_thd_pin_cond.wait(lock, [thd] {
     return g_preserved_trx_thd_pin_counts.find(thd) ==
            g_preserved_trx_thd_pin_counts.end();
   });
+}
+
+void preserved_trx_end_external_thd_teardown(THD *thd) {
+  if (thd == nullptr) return;
+  {
+    std::lock_guard<std::mutex> lock(g_preserved_trx_thd_pin_mutex);
+    g_preserved_trx_thd_teardown.erase(thd);
+  }
+  g_preserved_trx_thd_pin_cond.notify_all();
+}
+
+void preserved_trx_wait_for_external_thd_use(THD *thd) {
+  preserved_trx_begin_external_thd_teardown(thd);
+  preserved_trx_end_external_thd_teardown(thd);
 }
 
 bool preserved_trx_thd_has_external_use(THD *thd) {
@@ -12997,13 +13018,12 @@ bool Preserve_trx_drain_service::execute(
 
     bool complete(size_t target_count) const {
       return !pin_error && phase1_declared_count == target_count &&
-             record_blob_count + record_fallback_count == target_count &&
-             binlog_blob_count == target_count;
+             record_blob_count == target_count && binlog_blob_count == target_count;
     }
 
     size_t missing_record_count(size_t target_count) const {
-      const size_t covered = record_blob_count + record_fallback_count;
-      return target_count >= covered ? target_count - covered : 0;
+      return target_count >= record_blob_count ? target_count - record_blob_count
+                                               : 0;
     }
 
     size_t missing_binlog_count(size_t target_count) const {

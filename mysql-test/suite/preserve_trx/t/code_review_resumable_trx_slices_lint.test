@@ -90,6 +90,7 @@ my $xa_path = File::Spec->catfile($source_root, 'sql', 'xa.cc');
 my $gunit_path = File::Spec->catfile($source_root, 'unittest', 'gunit',
                                      'preserve_trx-t.cc');
 my $sql_parse_path = File::Spec->catfile($source_root, 'sql', 'sql_parse.cc');
+my $sql_class_path = File::Spec->catfile($source_root, 'sql', 'sql_class.cc');
 my $sys_vars_path = File::Spec->catfile($source_root, 'sql', 'sys_vars.cc');
 my $transfer_path = File::Spec->catfile($source_root, 'sql',
                                         'preserve_trx_transfer.cc');
@@ -138,6 +139,7 @@ my $handler = read_source($handler_path);
 my $xa = read_source($xa_path);
 my $gunit = read_source($gunit_path);
 my $sql_parse = read_source($sql_parse_path);
+my $sql_class = read_source($sql_class_path);
 my $sys_vars = read_source($sys_vars_path);
 my $transfer = read_source($transfer_path);
 my $transfer_header = read_source($transfer_header_path);
@@ -183,6 +185,17 @@ my ($session_artifact_sink_publish) =
 die "standby streaming transfer session artifact sink must batch final token metadata, not fall back to send_token_bundle\n"
   unless $session_artifact_sink_publish =~ /send_token_objects_batch/s &&
          $session_artifact_sink_publish !~ /send_token_bundle/s;
+die "preserve external THD pins must block new pins once THD teardown starts\n"
+  unless $preserve =~ /g_preserved_trx_thd_teardown/s &&
+         $preserve =~ /g_preserved_trx_thd_teardown\.count\s*\(\s*thd\s*\)/s;
+my ($release_resources_body) =
+  $sql_class =~ /(void THD::release_resources\(\)[\s\S]*?^})/m
+  or die "could not isolate THD::release_resources\n";
+die "THD::release_resources must wait for preserve external THD pins before releasing thread id/resources\n"
+  unless $release_resources_body =~
+     /preserved_trx_begin_external_thd_teardown\s*\(\s*this\s*\)[\s\S]*release_thread_id/s &&
+         $release_resources_body =~
+     /m_release_resources_done\s*=\s*true[\s\S]*preserved_trx_end_external_thd_teardown\s*\(\s*this\s*\)/s;
 my ($receiver_payload_batch) =
   $transfer =~ /(preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*?return\s+preserve_trx_transfer_apply_receiver_frame_batch_with_workers[\s\S]*?;\n})/s
   or die "could not isolate standby receiver encoded payload batch path\n";
@@ -303,6 +316,9 @@ die "standby streaming transfer batch path must abort the source epoch when the 
   unless $preserve =~ /batch_transfer_source_session[\s\S]*abort_epoch/s;
 die "standby streaming transfer must fail closed when final quiesced targets lack phase1 transfer coverage\n"
   unless $preserve =~ /standby_transfer_final_target_coverage_rejected/s;
+die "standby streaming transfer final coverage must not double-count fallback-covered record targets\n"
+  if $preserve =~ /record_blob_count\s*\+\s*record_fallback_count\s*==\s*target_count/s ||
+     $preserve =~ /covered\s*=\s*record_blob_count\s*\+\s*record_fallback_count/s;
 die "standby streaming transfer must do bounded record catch-up only after final targets are quiesced and before final coverage metadata\n"
   unless $preserve =~
      /prepare_quiesced_targets[\s\S]*stream_phase2_transfer_record_lock_catchup_blobs[\s\S]*validate_batch_transfer_final_target_coverage/s;
