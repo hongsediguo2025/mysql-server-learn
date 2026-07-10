@@ -301,6 +301,28 @@ die "standby phase1 binlog-cache streaming must be target-set driven, not idle-s
 die "standby streaming transfer must send phase1 prewarm manifests before WARMCOPY_CLOSING\n"
   unless $preserve =~
      /begin_phase1_transfer_prewarm_manifests[\s\S]*transition_to\s*\(\s*Preserve_trx_manager_state::WARMCOPY_CLOSING/s;
+die "standby phase1 record-store preparation must stream each completed blob through the adaptive batch sender\n"
+  unless $preserve =~
+     /prepare_phase1_record_store_targets\s*\(\s*\[&\]\s*\(\s*uint64_t[\s\S]*batch_transfer_phase1_sender[\s\S]*enqueue/s;
+my ($phase1_record_streamer) =
+  $preserve =~ /(auto stream_phase1_transfer_record_lock_blobs[\s\S]*?^  };)/m
+  or die "could not isolate phase1 transfer record-lock streaming helper\n";
+die "existing phase1 prebuilt record blobs must use the adaptive batch sender when batching is enabled\n"
+  unless $phase1_record_streamer =~
+         /batch_transfer_phase1_sender[\s\S]*enqueue[\s\S]*flush/s;
+die "standby phase1 adaptive sender must flush before WARMCOPY_CLOSING\n"
+  unless $preserve =~
+     /batch_transfer_phase1_sender[\s\S]*flush\s*\(\s*\)[\s\S]*transition_to\s*\(\s*Preserve_trx_manager_state::WARMCOPY_CLOSING/s;
+die "standby phase1 sender must snapshot batch, chunk, and inflight limits into the source epoch\n"
+  unless $preserve =~ /Preserve_trx_transfer_source_epoch_options[\s\S]*chunk_bytes[\s\S]*max_inflight_bytes[\s\S]*phase1_batch_bytes/s;
+die "standby phase1 sender thread must initialize and release MySQL thread state\n"
+  unless $transfer =~ /Preserve_trx_transfer_phase1_batch_sender::Impl[\s\S]*my_thread_init\s*\(\s*\)[\s\S]*my_thread_end\s*\(\s*\)/s;
+die "receiver staged-token prewarm must preserve a retry requested while the token job is still inflight\n"
+  unless $transfer =~
+         /g_receiver_staged_token_prewarm_deferred[\s\S]*finish_receiver_staged_token_prewarm_job[\s\S]*g_receiver_prewarm_jobs\.push_back\s*\(\s*job\s*\)/s;
+die "standby phase1 control frames must use batch source-session APIs\n"
+  unless $preserve =~ /declare_tokens_batch/s &&
+         $preserve =~ /begin_token_prewarm_manifests_batch/s;
 my ($receiver_dispatch_command) =
   $transfer =~ /(void preserve_trx_transfer_dispatch_command\(THD \*thd\)[\s\S]*?^}\n\nPreserve_snapshot_status Preserve_trx_local_carrier_artifact_sink::publish_bundle)/m
   or die "could not isolate standby receiver COM dispatch path\n";

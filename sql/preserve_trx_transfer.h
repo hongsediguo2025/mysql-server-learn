@@ -26,6 +26,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -68,6 +69,8 @@ extern uint preserve_trx_transfer_receiver_workers;
 extern uint preserve_trx_transfer_chunk_bytes;
 extern ulonglong preserve_trx_transfer_max_inflight_bytes;
 extern uint preserve_trx_transfer_commit_timeout_ms;
+extern ulonglong preserve_trx_transfer_phase1_batch_bytes;
+extern uint preserve_trx_transfer_phase1_batch_linger_ms;
 
 uint64_t preserve_trx_transfer_receiver_auto_prewarm_tokens_status();
 uint64_t preserve_trx_transfer_receiver_auto_prewarm_ready_tokens_status();
@@ -131,6 +134,22 @@ uint64_t preserve_trx_transfer_phase2_receiver_prewarm_wait_us_status();
 uint64_t preserve_trx_transfer_phase2_final_metadata_fsync_count_status();
 uint64_t preserve_trx_transfer_phase2_final_metadata_ack_us_status();
 uint64_t preserve_trx_transfer_phase1_business_enqueue_block_us_status();
+void preserve_trx_transfer_reset_source_phase1_metrics();
+uint64_t preserve_trx_transfer_phase1_frame_count_status();
+uint64_t preserve_trx_transfer_phase1_network_send_count_status();
+uint64_t preserve_trx_transfer_phase1_batch_count_status();
+uint64_t preserve_trx_transfer_phase1_batch_bytes_p50_status();
+uint64_t preserve_trx_transfer_phase1_batch_bytes_p95_status();
+uint64_t preserve_trx_transfer_phase1_batch_bytes_max_status();
+uint64_t preserve_trx_transfer_phase1_batch_tokens_p50_status();
+uint64_t preserve_trx_transfer_phase1_batch_tokens_p95_status();
+uint64_t preserve_trx_transfer_phase1_batch_tokens_max_status();
+uint64_t preserve_trx_transfer_phase1_record_batch_tokens_avg_status();
+uint64_t preserve_trx_transfer_phase1_batch_linger_us_p95_status();
+uint64_t preserve_trx_transfer_phase1_batch_linger_us_max_status();
+uint64_t preserve_trx_transfer_phase1_oversize_token_count_status();
+uint64_t preserve_trx_transfer_phase1_record_first_batch_send_us_status();
+uint64_t preserve_trx_transfer_phase1_record_last_batch_send_us_status();
 uint64_t preserve_trx_transfer_receiver_ready_after_final_metadata_us_status();
 uint64_t
 preserve_trx_transfer_receiver_final_spool_ack_monotonic_us_status();
@@ -153,6 +172,49 @@ enum class Preserve_trx_transfer_status {
   CORRUPT,
   IO_ERROR,
   UNSUPPORTED
+};
+
+struct Preserve_trx_transfer_phase1_blob_request {
+  uint64_t transfer_token{0};
+  std::string object_id;
+  std::string warmcopy_id;
+  uint64_t warmcopy_epoch{0};
+  uint64_t size{0};
+  std::array<unsigned char, kPreservedTrxSha256Length> digest{};
+};
+
+struct Preserve_trx_transfer_phase1_batch_options {
+  uint64_t max_batch_bytes{0};
+  uint32_t linger_ms{0};
+  uint64_t max_inflight_bytes{0};
+};
+
+using Preserve_trx_transfer_phase1_batch_flush_callback =
+    Preserve_trx_transfer_status (*)(
+        const std::vector<Preserve_trx_transfer_phase1_blob_request> &batch,
+        void *context);
+
+class Preserve_trx_transfer_phase1_batch_sender {
+ public:
+  Preserve_trx_transfer_phase1_batch_sender(
+      const Preserve_trx_transfer_phase1_batch_options &options,
+      Preserve_trx_transfer_phase1_batch_flush_callback flush_callback,
+      void *flush_context);
+  ~Preserve_trx_transfer_phase1_batch_sender();
+
+  Preserve_trx_transfer_phase1_batch_sender(
+      const Preserve_trx_transfer_phase1_batch_sender &) = delete;
+  Preserve_trx_transfer_phase1_batch_sender &operator=(
+      const Preserve_trx_transfer_phase1_batch_sender &) = delete;
+
+  Preserve_trx_transfer_status enqueue(
+      const Preserve_trx_transfer_phase1_blob_request &request);
+  Preserve_trx_transfer_status flush();
+  void abort();
+
+ private:
+  class Impl;
+  std::unique_ptr<Impl> m_impl;
 };
 
 enum class Preserve_trx_transfer_object_kind : uint16_t {
@@ -393,14 +455,27 @@ class Preserve_trx_transfer_encoded_frame_sink {
       const std::string &encoded_frame) = 0;
 };
 
+struct Preserve_trx_transfer_source_epoch_options {
+  uint32_t chunk_bytes{0};
+  uint64_t max_inflight_bytes{0};
+  uint64_t phase1_batch_bytes{0};
+};
+
 class Preserve_trx_transfer_source_epoch_session {
  public:
   Preserve_trx_transfer_source_epoch_session(
       const std::string &epoch_id, const std::string &source_server_uuid,
       const std::string &target_server_uuid, uint32_t chunk_bytes,
       Preserve_trx_transfer_encoded_frame_sink *sink);
+  Preserve_trx_transfer_source_epoch_session(
+      const std::string &epoch_id, const std::string &source_server_uuid,
+      const std::string &target_server_uuid,
+      const Preserve_trx_transfer_source_epoch_options &options,
+      Preserve_trx_transfer_encoded_frame_sink *sink);
 
   Preserve_trx_transfer_status declare_token(uint64_t transfer_token);
+  Preserve_trx_transfer_status declare_tokens_batch(
+      const std::vector<uint64_t> &transfer_tokens);
   Preserve_trx_transfer_status declare_object(
       uint64_t transfer_token,
       const Preserve_trx_transfer_object_descriptor &descriptor);
@@ -409,6 +484,11 @@ class Preserve_trx_transfer_source_epoch_session {
       bool queue_final_metadata = false);
   Preserve_trx_transfer_status begin_token_prewarm_manifest(
       uint64_t transfer_token);
+  Preserve_trx_transfer_status begin_token_prewarm_manifests_batch(
+      const std::vector<uint64_t> &transfer_tokens);
+  Preserve_trx_transfer_status stream_prebuilt_blobs_batch(
+      const std::string &preserve_dir,
+      const std::vector<Preserve_trx_transfer_phase1_blob_request> &requests);
   Preserve_trx_transfer_status write_object_chunk(
       uint64_t transfer_token, const std::string &object_id,
       uint64_t chunk_offset, const std::string &chunk_payload);
@@ -438,6 +518,12 @@ class Preserve_trx_transfer_source_epoch_session {
   std::string source_server_uuid() const { return m_source_server_uuid; }
   std::string target_server_uuid() const { return m_target_server_uuid; }
   uint32_t chunk_bytes() const { return m_chunk_bytes; }
+  uint64_t max_inflight_bytes() const { return m_max_inflight_bytes; }
+  uint64_t phase1_batch_bytes() const { return m_phase1_batch_bytes; }
+  void set_phase1_metrics_enabled(bool enabled) {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    m_phase1_metrics_enabled = enabled;
+  }
   uint64_t next_sequence() const {
     std::lock_guard<std::mutex> guard(m_mutex);
     return m_next_sequence;
@@ -452,6 +538,8 @@ class Preserve_trx_transfer_source_epoch_session {
       bool queue_final_metadata);
   Preserve_trx_transfer_status emit_frame_locked(
       Preserve_trx_transfer_frame frame, bool queue_final_metadata);
+  Preserve_trx_transfer_status send_phase1_control_batches_locked(
+      const std::vector<std::string> &encoded_frames);
   Preserve_trx_transfer_status abort_token_locked(uint64_t transfer_token,
                                                   const std::string &reason,
                                                   bool allow_finalized);
@@ -460,10 +548,13 @@ class Preserve_trx_transfer_source_epoch_session {
   std::string m_source_server_uuid;
   std::string m_target_server_uuid;
   uint32_t m_chunk_bytes{0};
+  uint64_t m_max_inflight_bytes{0};
+  uint64_t m_phase1_batch_bytes{0};
   Preserve_trx_transfer_encoded_frame_sink *m_sink{nullptr};
   uint64_t m_next_sequence{1};
   mutable std::mutex m_mutex;
   bool m_epoch_committed{false};
+  bool m_phase1_metrics_enabled{false};
   std::set<uint64_t> m_declared_tokens;
   std::set<uint64_t> m_finalized_tokens;
   std::set<uint64_t> m_aborted_tokens;
@@ -491,6 +582,12 @@ preserve_trx_transfer_stream_prebuilt_binlog_cache_blob(
     Preserve_trx_transfer_source_epoch_session *session,
     uint64_t transfer_token, const std::string &preserve_dir,
     const PrebuiltBinlogCacheBlob &blob);
+
+Preserve_trx_transfer_status preserve_trx_transfer_stream_prebuilt_blobs_batch(
+    Preserve_trx_transfer_source_epoch_session *session,
+    const std::string &preserve_dir,
+    const std::vector<Preserve_trx_transfer_phase1_blob_request> &requests,
+    uint64_t max_batch_bytes);
 
 struct Preserve_trx_transfer_client_endpoint {
   std::string target_server_uuid;

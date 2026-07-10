@@ -443,6 +443,8 @@ class HarnessConfig:
     preserve_lock_warmcopy_seal_threads: int = 0
     preserve_parallel_preserve_threads: int = 0
     preserve_startup_recovery_threads: int = 0
+    transfer_phase1_batch_bytes: Optional[int] = None
+    transfer_phase1_batch_linger_ms: Optional[int] = None
     inflight_drain_probe: bool = False
     inflight_probe_min_waits: int = 1
     inflight_probe_timeout_s: int = 5
@@ -699,6 +701,16 @@ class HarnessConfig:
             raise ValueError("preserve_parallel_preserve_threads must be non-negative")
         if self.preserve_startup_recovery_threads < 0:
             raise ValueError("preserve_startup_recovery_threads must be non-negative")
+        if (
+            self.transfer_phase1_batch_bytes is not None
+            and not 0 <= self.transfer_phase1_batch_bytes <= 67_108_864
+        ):
+            raise ValueError("transfer phase1 batch bytes must be in 0..67108864")
+        if (
+            self.transfer_phase1_batch_linger_ms is not None
+            and not 0 <= self.transfer_phase1_batch_linger_ms <= 1000
+        ):
+            raise ValueError("transfer phase1 batch linger ms must be in 0..1000")
         if self.inflight_drain_probe and self.sessions < 2:
             raise ValueError("inflight_drain_probe requires at least 2 sessions")
         if self.inflight_probe_min_waits <= 0:
@@ -825,6 +837,21 @@ class WarmcopyDrainMetrics:
     source_phase2_transfer_final_metadata_frame_count: Optional[int] = None
     source_phase2_transfer_final_metadata_bytes: Optional[int] = None
     source_phase2_transfer_final_metadata_ack_us: Optional[int] = None
+    source_phase1_transfer_frame_count: Optional[int] = None
+    source_phase1_transfer_network_send_count: Optional[int] = None
+    source_phase1_transfer_batch_count: Optional[int] = None
+    source_phase1_transfer_batch_bytes_p50: Optional[int] = None
+    source_phase1_transfer_batch_bytes_p95: Optional[int] = None
+    source_phase1_transfer_batch_bytes_max: Optional[int] = None
+    source_phase1_transfer_batch_tokens_p50: Optional[int] = None
+    source_phase1_transfer_batch_tokens_p95: Optional[int] = None
+    source_phase1_transfer_batch_tokens_max: Optional[int] = None
+    source_phase1_record_batch_tokens_avg: Optional[int] = None
+    source_phase1_transfer_batch_linger_us_p95: Optional[int] = None
+    source_phase1_transfer_batch_linger_us_max: Optional[int] = None
+    source_phase1_transfer_oversize_token_count: Optional[int] = None
+    source_phase1_record_first_batch_send_us: Optional[int] = None
+    source_phase1_record_last_batch_send_us: Optional[int] = None
 
     def lock_warmcopy_live_fallback_count(self) -> Optional[int]:
         counts = (
@@ -4762,6 +4789,12 @@ class BusinessE2ERunner:
                 self.config.lockset_select_for_update
             ),
             "workload_lockset_minimal_table": self.config.lockset_minimal_table,
+            "source_phase1_transfer_batch_bytes_config": (
+                self.config.transfer_phase1_batch_bytes
+            ),
+            "source_phase1_transfer_batch_linger_ms_config": (
+                self.config.transfer_phase1_batch_linger_ms
+            ),
             "completed_stmt_total": completed_stmt_total,
             "phase2_pause_samples_ms": [
                 metric.phase2_pause_ms for metric in metrics
@@ -4855,6 +4888,81 @@ class BusinessE2ERunner:
             ),
             "source_phase2_transfer_final_metadata_ack_us_samples": (
                 source_metric_samples("source_phase2_transfer_final_metadata_ack_us")
+            ),
+            "source_phase1_transfer_frame_count": (
+                source_metric_samples("source_phase1_transfer_frame_count")[-1]
+                if source_metric_samples("source_phase1_transfer_frame_count")
+                else None
+            ),
+            "source_phase1_transfer_network_send_count": (
+                source_metric_samples("source_phase1_transfer_network_send_count")[-1]
+                if source_metric_samples("source_phase1_transfer_network_send_count")
+                else None
+            ),
+            "source_phase1_transfer_batch_count": (
+                source_metric_samples("source_phase1_transfer_batch_count")[-1]
+                if source_metric_samples("source_phase1_transfer_batch_count")
+                else None
+            ),
+            "source_phase1_transfer_batch_bytes_p50": (
+                source_metric_samples("source_phase1_transfer_batch_bytes_p50")[-1]
+                if source_metric_samples("source_phase1_transfer_batch_bytes_p50")
+                else None
+            ),
+            "source_phase1_transfer_batch_bytes_p95": (
+                source_metric_samples("source_phase1_transfer_batch_bytes_p95")[-1]
+                if source_metric_samples("source_phase1_transfer_batch_bytes_p95")
+                else None
+            ),
+            "source_phase1_transfer_batch_bytes_max": (
+                source_metric_samples("source_phase1_transfer_batch_bytes_max")[-1]
+                if source_metric_samples("source_phase1_transfer_batch_bytes_max")
+                else None
+            ),
+            "source_phase1_transfer_batch_tokens_p50": (
+                source_metric_samples("source_phase1_transfer_batch_tokens_p50")[-1]
+                if source_metric_samples("source_phase1_transfer_batch_tokens_p50")
+                else None
+            ),
+            "source_phase1_transfer_batch_tokens_p95": (
+                source_metric_samples("source_phase1_transfer_batch_tokens_p95")[-1]
+                if source_metric_samples("source_phase1_transfer_batch_tokens_p95")
+                else None
+            ),
+            "source_phase1_transfer_batch_tokens_max": (
+                source_metric_samples("source_phase1_transfer_batch_tokens_max")[-1]
+                if source_metric_samples("source_phase1_transfer_batch_tokens_max")
+                else None
+            ),
+            "source_phase1_record_batch_tokens_avg": (
+                source_metric_samples("source_phase1_record_batch_tokens_avg")[-1]
+                if source_metric_samples("source_phase1_record_batch_tokens_avg")
+                else None
+            ),
+            "source_phase1_transfer_batch_linger_us_p95": (
+                source_metric_samples("source_phase1_transfer_batch_linger_us_p95")[-1]
+                if source_metric_samples("source_phase1_transfer_batch_linger_us_p95")
+                else None
+            ),
+            "source_phase1_transfer_batch_linger_us_max": (
+                source_metric_samples("source_phase1_transfer_batch_linger_us_max")[-1]
+                if source_metric_samples("source_phase1_transfer_batch_linger_us_max")
+                else None
+            ),
+            "source_phase1_transfer_oversize_token_count": (
+                source_metric_samples("source_phase1_transfer_oversize_token_count")[-1]
+                if source_metric_samples("source_phase1_transfer_oversize_token_count")
+                else None
+            ),
+            "source_phase1_record_first_batch_send_us": (
+                source_metric_samples("source_phase1_record_first_batch_send_us")[-1]
+                if source_metric_samples("source_phase1_record_first_batch_send_us")
+                else None
+            ),
+            "source_phase1_record_last_batch_send_us": (
+                source_metric_samples("source_phase1_record_last_batch_send_us")[-1]
+                if source_metric_samples("source_phase1_record_last_batch_send_us")
+                else None
             ),
             "phase2_transfer_bulk_bytes": (
                 0
@@ -5691,6 +5799,16 @@ class BusinessE2ERunner:
                     "SET GLOBAL preserve_trx_lock_warmcopy_seal_threads="
                     f"{self.config.preserve_lock_warmcopy_seal_threads}"
                 )
+            if self.config.transfer_phase1_batch_bytes is not None:
+                commands.append(
+                    "SET GLOBAL preserve_trx_transfer_phase1_batch_bytes="
+                    f"{self.config.transfer_phase1_batch_bytes}"
+                )
+            if self.config.transfer_phase1_batch_linger_ms is not None:
+                commands.append(
+                    "SET GLOBAL preserve_trx_transfer_phase1_batch_linger_ms="
+                    f"{self.config.transfer_phase1_batch_linger_ms}"
+                )
             if self.config.temp_table_workload:
                 commands.append("SET GLOBAL preserve_trx_temp_table_enable=ON")
                 temp_sidecar_budget = plan.temp_table_sidecar_budget_bytes()
@@ -6508,6 +6626,51 @@ class BusinessE2ERunner:
             ),
             source_phase2_transfer_final_metadata_ack_us=int_metric(
                 "source_phase2_transfer_final_metadata_ack_us"
+            ),
+            source_phase1_transfer_frame_count=int_metric(
+                "source_phase1_transfer_frame_count"
+            ),
+            source_phase1_transfer_network_send_count=int_metric(
+                "source_phase1_transfer_network_send_count"
+            ),
+            source_phase1_transfer_batch_count=int_metric(
+                "source_phase1_transfer_batch_count"
+            ),
+            source_phase1_transfer_batch_bytes_p50=int_metric(
+                "source_phase1_transfer_batch_bytes_p50"
+            ),
+            source_phase1_transfer_batch_bytes_p95=int_metric(
+                "source_phase1_transfer_batch_bytes_p95"
+            ),
+            source_phase1_transfer_batch_bytes_max=int_metric(
+                "source_phase1_transfer_batch_bytes_max"
+            ),
+            source_phase1_transfer_batch_tokens_p50=int_metric(
+                "source_phase1_transfer_batch_tokens_p50"
+            ),
+            source_phase1_transfer_batch_tokens_p95=int_metric(
+                "source_phase1_transfer_batch_tokens_p95"
+            ),
+            source_phase1_transfer_batch_tokens_max=int_metric(
+                "source_phase1_transfer_batch_tokens_max"
+            ),
+            source_phase1_record_batch_tokens_avg=int_metric(
+                "source_phase1_record_batch_tokens_avg"
+            ),
+            source_phase1_transfer_batch_linger_us_p95=int_metric(
+                "source_phase1_transfer_batch_linger_us_p95"
+            ),
+            source_phase1_transfer_batch_linger_us_max=int_metric(
+                "source_phase1_transfer_batch_linger_us_max"
+            ),
+            source_phase1_transfer_oversize_token_count=int_metric(
+                "source_phase1_transfer_oversize_token_count"
+            ),
+            source_phase1_record_first_batch_send_us=int_metric(
+                "source_phase1_record_first_batch_send_us"
+            ),
+            source_phase1_record_last_batch_send_us=int_metric(
+                "source_phase1_record_last_batch_send_us"
             ),
         )
 
@@ -8667,6 +8830,8 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--preserve-lock-warmcopy-seal-threads", dest="preserve_lock_warmcopy_seal_threads", type=int, default=0, help="preserve_trx_lock_warmcopy_seal_threads for lock warmcopy seal tuning; 0 keeps server auto")
     parser.add_argument("--preserve-parallel-preserve-threads", dest="preserve_parallel_preserve_threads", type=int, default=0, help="preserve_trx_parallel_preserve_threads for lock warmcopy target-preserve tuning; 0 keeps server auto")
     parser.add_argument("--preserve-startup-recovery-threads", dest="preserve_startup_recovery_threads", type=int, default=0, help="preserve_trx_startup_recovery_threads configured at mysqld startup; 0 keeps server auto")
+    parser.add_argument("--transfer-phase1-batch-bytes", type=int, help="source preserve_trx_transfer_phase1_batch_bytes for the next transfer epoch")
+    parser.add_argument("--transfer-phase1-batch-linger-ms", type=int, help="source preserve_trx_transfer_phase1_batch_linger_ms for the next transfer epoch")
     parser.add_argument("--inflight-drain-probe", action="store_true", help="allow even-numbered workers to enter real UPDATE lock waits before each DRAIN")
     parser.add_argument("--inflight-probe-min-waits", dest="inflight_probe_min_waits", type=int, default=1, help="minimum simultaneous harness data_lock_waits required before issuing DRAIN in in-flight probe mode")
     parser.add_argument("--inflight-probe-timeout", dest="inflight_probe_timeout_s", type=int, default=5, help="innodb_lock_wait_timeout used by in-flight probe statements")
@@ -8796,6 +8961,8 @@ command is used after each DRAIN command shuts that server down.
         preserve_lock_warmcopy_seal_threads=args.preserve_lock_warmcopy_seal_threads,
         preserve_parallel_preserve_threads=args.preserve_parallel_preserve_threads,
         preserve_startup_recovery_threads=args.preserve_startup_recovery_threads,
+        transfer_phase1_batch_bytes=args.transfer_phase1_batch_bytes,
+        transfer_phase1_batch_linger_ms=args.transfer_phase1_batch_linger_ms,
         inflight_drain_probe=args.inflight_drain_probe,
         inflight_probe_min_waits=args.inflight_probe_min_waits,
         inflight_probe_timeout_s=args.inflight_probe_timeout_s,

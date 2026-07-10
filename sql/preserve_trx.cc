@@ -5667,7 +5667,8 @@ static bool stream_phase1_transfer_binlog_cache_blobs(
     THD *owner, ulonglong generation,
     const std::set<my_thread_id> &declared_tokens,
     Preserve_trx_transfer_source_epoch_session *source_session,
-    Phase1_transfer_binlog_blob_provider *phase1_binlog_provider) {
+    Phase1_transfer_binlog_blob_provider *phase1_binlog_provider,
+    Preserve_trx_transfer_phase1_batch_sender *phase1_batch_sender) {
   if (source_session == nullptr || declared_tokens.empty()) return false;
 
   std::unique_ptr<Preserved_trx_warm_external_blob_carrier> warm_carrier =
@@ -5680,6 +5681,8 @@ static bool stream_phase1_transfer_binlog_cache_blobs(
   Global_THD_manager::get_instance()->do_for_all_thd_copy(&targets);
   if (targets.error()) return true;
 
+  std::vector<std::pair<my_thread_id, PrebuiltBinlogCacheBlob>> built_blobs;
+  bool enqueue_failed = false;
   for (const Preserve_batch_phase1_declared_target_pin_collector::Target
            &target : targets.targets()) {
     if (target.thd == nullptr) continue;
@@ -5718,23 +5721,44 @@ static bool stream_phase1_transfer_binlog_cache_blobs(
     }
     if (!has_prebuilt_blob) continue;
 
-    const Preserve_trx_transfer_status stream_status =
-        preserve_trx_transfer_stream_prebuilt_binlog_cache_blob(
-            source_session, static_cast<uint64_t>(target_thread_id),
-            preserve_trx_default_dir(), prebuilt_binlog);
-    const Preserved_trx_carrier_status cleanup_status =
-        warm_carrier->remove_warm_external_blob(prebuilt_binlog.warmcopy_id,
-                                                prebuilt_binlog.name);
-    if (stream_status != Preserve_trx_transfer_status::OK ||
-        cleanup_status != Preserved_trx_carrier_status::OK) {
-      return true;
-    }
-    if (phase1_binlog_provider != nullptr) {
-      phase1_binlog_provider->remember_phase1_blob(target_thread_id,
-                                                   prebuilt_binlog);
+    Preserve_trx_transfer_phase1_blob_request request;
+    request.transfer_token = static_cast<uint64_t>(target_thread_id);
+    request.object_id = prebuilt_binlog.name;
+    request.warmcopy_id = prebuilt_binlog.warmcopy_id;
+    request.warmcopy_epoch = prebuilt_binlog.warmcopy_epoch;
+    request.size = prebuilt_binlog.size;
+    request.digest = prebuilt_binlog.digest;
+    const Preserve_trx_transfer_status enqueue_status =
+        phase1_batch_sender == nullptr
+            ? preserve_trx_transfer_stream_prebuilt_binlog_cache_blob(
+                  source_session, static_cast<uint64_t>(target_thread_id),
+                  preserve_trx_default_dir(), prebuilt_binlog)
+            : phase1_batch_sender->enqueue(request);
+    built_blobs.emplace_back(target_thread_id, prebuilt_binlog);
+    if (enqueue_status != Preserve_trx_transfer_status::OK) {
+      enqueue_failed = true;
+      break;
     }
   }
-  return false;
+  const Preserve_trx_transfer_status flush_status =
+      phase1_batch_sender == nullptr ? Preserve_trx_transfer_status::OK
+                                     : phase1_batch_sender->flush();
+  bool cleanup_failed = false;
+  for (const auto &entry : built_blobs) {
+    const Preserved_trx_carrier_status cleanup_status =
+        warm_carrier->remove_warm_external_blob(entry.second.warmcopy_id,
+                                                entry.second.name);
+    if (cleanup_status != Preserved_trx_carrier_status::OK) {
+      cleanup_failed = true;
+      continue;
+    }
+    if (!enqueue_failed && flush_status == Preserve_trx_transfer_status::OK &&
+        phase1_binlog_provider != nullptr) {
+      phase1_binlog_provider->remember_phase1_blob(entry.first, entry.second);
+    }
+  }
+  return enqueue_failed || flush_status != Preserve_trx_transfer_status::OK ||
+         cleanup_failed;
 }
 
 /*
@@ -12402,6 +12426,7 @@ bool Preserve_trx_drain_service::execute(
   const Preserve_trx_transfer_artifact_decision batch_artifact_decision =
       preserve_trx_transfer_artifact_decision_for_request(
           Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY);
+  preserve_trx_transfer_reset_source_phase1_metrics();
   const bool standby_transfer_streaming_enabled =
       batch_artifact_decision ==
       Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE;
@@ -12483,11 +12508,23 @@ bool Preserve_trx_drain_service::execute(
       batch_transfer_frame_sink;
   std::unique_ptr<Preserve_trx_transfer_source_epoch_session>
       batch_transfer_source_session;
+  Preserve_trx_transfer_phase1_batch_options batch_transfer_phase1_options;
+  struct Phase1_batch_flush_context {
+    Preserve_trx_transfer_source_epoch_session *session{nullptr};
+    std::string preserve_dir;
+    uint64_t max_batch_bytes{0};
+  } batch_transfer_phase1_flush_context;
+  std::unique_ptr<Preserve_trx_transfer_phase1_batch_sender>
+      batch_transfer_phase1_sender;
   std::unique_ptr<Phase1_transfer_binlog_blob_provider>
       batch_transfer_binlog_blob_provider;
   std::set<my_thread_id> batch_transfer_phase1_declared_tokens;
   auto abort_batch_transfer_epoch = [&](const char *reason) {
     if (batch_transfer_source_session == nullptr) return;
+    if (batch_transfer_phase1_sender != nullptr) {
+      batch_transfer_phase1_sender->abort();
+      batch_transfer_phase1_sender.reset();
+    }
     const Preserve_trx_transfer_status abort_status =
         batch_transfer_source_session->abort_epoch(reason == nullptr
                                                        ? "batch_abort"
@@ -12524,10 +12561,55 @@ bool Preserve_trx_drain_service::execute(
         preserve_trx_transfer_target_server_uuid == nullptr
             ? std::string()
             : std::string(preserve_trx_transfer_target_server_uuid);
+    batch_transfer_phase1_options.max_batch_bytes =
+        preserve_trx_transfer_phase1_batch_bytes;
+    batch_transfer_phase1_options.linger_ms =
+        preserve_trx_transfer_phase1_batch_linger_ms;
+    batch_transfer_phase1_options.max_inflight_bytes =
+        preserve_trx_transfer_max_inflight_bytes;
+    if (batch_transfer_phase1_options.max_batch_bytes >
+        batch_transfer_phase1_options.max_inflight_bytes) {
+      LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: standby transfer phase1 batch bytes exceeds max "
+             "inflight bytes");
+      batch_transfer_source_session.reset();
+      batch_transfer_frame_sink.reset();
+      abort_drain_participants("standby_transfer_phase1_batch_config_invalid");
+      return true;
+    }
+    Preserve_trx_transfer_source_epoch_options source_epoch_options;
+    source_epoch_options.chunk_bytes = preserve_trx_transfer_chunk_bytes;
+    source_epoch_options.max_inflight_bytes =
+        batch_transfer_phase1_options.max_inflight_bytes;
+    source_epoch_options.phase1_batch_bytes =
+        batch_transfer_phase1_options.max_batch_bytes;
     batch_transfer_source_session.reset(
         new Preserve_trx_transfer_source_epoch_session(
             batch_transfer_epoch_id, source_server_uuid, target_server_uuid,
-            preserve_trx_transfer_chunk_bytes, batch_transfer_frame_sink.get()));
+            source_epoch_options, batch_transfer_frame_sink.get()));
+    batch_transfer_source_session->set_phase1_metrics_enabled(true);
+    batch_transfer_phase1_flush_context.session =
+        batch_transfer_source_session.get();
+    batch_transfer_phase1_flush_context.preserve_dir =
+        preserve_trx_default_dir();
+    batch_transfer_phase1_flush_context.max_batch_bytes =
+        batch_transfer_phase1_options.max_batch_bytes;
+    batch_transfer_phase1_sender.reset(
+        new Preserve_trx_transfer_phase1_batch_sender(
+            batch_transfer_phase1_options,
+            [](const std::vector<Preserve_trx_transfer_phase1_blob_request>
+                   &batch,
+               void *context) {
+              auto *flush_context =
+                  static_cast<Phase1_batch_flush_context *>(context);
+              if (flush_context == nullptr || flush_context->session == nullptr) {
+                return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+              }
+              return preserve_trx_transfer_stream_prebuilt_blobs_batch(
+                  flush_context->session, flush_context->preserve_dir, batch,
+                  flush_context->max_batch_bytes);
+            },
+            &batch_transfer_phase1_flush_context));
     batch_transfer_binlog_blob_provider.reset(
         new Phase1_transfer_binlog_blob_provider(warmcopy_provider));
     return false;
@@ -12536,17 +12618,32 @@ bool Preserve_trx_drain_service::execute(
     if (batch_transfer_source_session == nullptr) return false;
     Preserve_batch_phase1_transfer_target_scanner scanner(thd);
     Global_THD_manager::get_instance()->do_for_all_thd_copy(&scanner);
+    std::vector<uint64_t> newly_declared_tokens;
     for (const my_thread_id target_thread_id : scanner.target_thread_ids()) {
       if (batch_transfer_phase1_declared_tokens.count(target_thread_id) != 0)
         continue;
-      const Preserve_trx_transfer_status declare_status =
-          batch_transfer_source_session->declare_token(
-              static_cast<uint64_t>(target_thread_id));
-      if (declare_status != Preserve_trx_transfer_status::OK) {
-        abort_batch_transfer_epoch("standby_transfer_phase1_declare_failed");
-        abort_drain_participants("standby_transfer_phase1_declare_failed");
-        return true;
+      newly_declared_tokens.push_back(static_cast<uint64_t>(target_thread_id));
+    }
+    if (newly_declared_tokens.empty()) return false;
+    Preserve_trx_transfer_status declare_status =
+        Preserve_trx_transfer_status::OK;
+    if (batch_transfer_phase1_options.max_batch_bytes == 0 ||
+        batch_transfer_phase1_options.linger_ms == 0) {
+      for (uint64_t token : newly_declared_tokens) {
+        declare_status = batch_transfer_source_session->declare_token(token);
+        if (declare_status != Preserve_trx_transfer_status::OK) break;
       }
+    } else {
+      declare_status = batch_transfer_source_session->declare_tokens_batch(
+          newly_declared_tokens);
+    }
+    if (declare_status != Preserve_trx_transfer_status::OK) {
+      abort_batch_transfer_epoch("standby_transfer_phase1_declare_failed");
+      abort_drain_participants("standby_transfer_phase1_declare_failed");
+      return true;
+    }
+    for (uint64_t token : newly_declared_tokens) {
+      const my_thread_id target_thread_id = static_cast<my_thread_id>(token);
       batch_transfer_phase1_declared_tokens.insert(target_thread_id);
     }
     return false;
@@ -12581,11 +12678,42 @@ bool Preserve_trx_drain_service::execute(
         batch_transfer_phase1_declared_tokens.empty()) {
       return false;
     }
+    const bool batch_record_blobs =
+        batch_transfer_phase1_sender != nullptr &&
+        batch_transfer_phase1_options.max_batch_bytes != 0 &&
+        batch_transfer_phase1_options.linger_ms != 0;
     for (const my_thread_id target_thread_id :
          batch_transfer_phase1_declared_tokens) {
       PrebuiltRecordLocksBlob record_blob;
       if (!lock_warmcopy_participant->phase1_record_prebuilt_blob_for_thread(
               static_cast<uint64_t>(target_thread_id), &record_blob)) {
+        continue;
+      }
+      if (batch_record_blobs) {
+        Preserve_trx_transfer_object_descriptor descriptor;
+        descriptor.object_id = record_blob.name;
+        descriptor.kind = Preserve_trx_transfer_object_kind::EXTERNAL_BLOB;
+        descriptor.total_size = record_blob.size;
+        descriptor.digest = record_blob.digest;
+        if (batch_transfer_source_session->object_presealed_for_token(
+                static_cast<uint64_t>(target_thread_id), descriptor)) {
+          continue;
+        }
+        Preserve_trx_transfer_phase1_blob_request request;
+        request.transfer_token = static_cast<uint64_t>(target_thread_id);
+        request.object_id = record_blob.name;
+        request.warmcopy_id = record_blob.warmcopy_id;
+        request.warmcopy_epoch = record_blob.warmcopy_epoch;
+        request.size = record_blob.size;
+        request.digest = record_blob.digest;
+        if (batch_transfer_phase1_sender->enqueue(request) !=
+            Preserve_trx_transfer_status::OK) {
+          abort_batch_transfer_epoch(
+              "standby_transfer_phase1_record_blob_stream_failed");
+          abort_drain_participants(
+              "standby_transfer_phase1_record_blob_stream_failed");
+          return true;
+        }
         continue;
       }
       const Preserve_trx_transfer_status stream_status =
@@ -12601,6 +12729,15 @@ bool Preserve_trx_drain_service::execute(
         return true;
       }
     }
+    if (batch_record_blobs &&
+        batch_transfer_phase1_sender->flush() !=
+            Preserve_trx_transfer_status::OK) {
+      abort_batch_transfer_epoch(
+          "standby_transfer_phase1_record_blob_stream_failed");
+      abort_drain_participants(
+          "standby_transfer_phase1_record_blob_stream_failed");
+      return true;
+    }
     return false;
   };
   auto begin_phase1_transfer_prewarm_manifests = [&]() {
@@ -12608,11 +12745,31 @@ bool Preserve_trx_drain_service::execute(
         batch_transfer_phase1_declared_tokens.empty()) {
       return false;
     }
+    std::vector<uint64_t> transfer_tokens;
+    transfer_tokens.reserve(batch_transfer_phase1_declared_tokens.size());
     for (const my_thread_id target_thread_id :
          batch_transfer_phase1_declared_tokens) {
+      transfer_tokens.push_back(static_cast<uint64_t>(target_thread_id));
+    }
+    if (batch_transfer_phase1_options.max_batch_bytes != 0 &&
+        batch_transfer_phase1_options.linger_ms != 0) {
+      const Preserve_trx_transfer_status begin_status =
+          batch_transfer_source_session->begin_token_prewarm_manifests_batch(
+              transfer_tokens);
+      if (begin_status == Preserve_trx_transfer_status::OK ||
+          begin_status == Preserve_trx_transfer_status::UNSUPPORTED) {
+        return false;
+      }
+      abort_batch_transfer_epoch(
+          "standby_transfer_phase1_prewarm_manifest_failed");
+      abort_drain_participants(
+          "standby_transfer_phase1_prewarm_manifest_failed");
+      return true;
+    }
+    for (uint64_t transfer_token : transfer_tokens) {
       const Preserve_trx_transfer_status begin_status =
           batch_transfer_source_session->begin_token_prewarm_manifest(
-              static_cast<uint64_t>(target_thread_id));
+              transfer_token);
       if (begin_status == Preserve_trx_transfer_status::OK ||
           begin_status == Preserve_trx_transfer_status::UNSUPPORTED) {
         continue;
@@ -12686,9 +12843,29 @@ bool Preserve_trx_drain_service::execute(
       return preserve_trx_reject_unsupported();
     }
     if (lock_warmcopy_participant != nullptr &&
-        !lock_warmcopy_participant->prepare_phase1_record_store_targets()) {
+        !lock_warmcopy_participant->prepare_phase1_record_store_targets(
+            [&](uint64_t target_thread_id,
+                const PrebuiltRecordLocksBlob &record_blob) {
+              if (batch_transfer_phase1_sender == nullptr) return true;
+              Preserve_trx_transfer_phase1_blob_request request;
+              request.transfer_token = target_thread_id;
+              request.object_id = record_blob.name;
+              request.warmcopy_id = record_blob.warmcopy_id;
+              request.warmcopy_epoch = record_blob.warmcopy_epoch;
+              request.size = record_blob.size;
+              request.digest = record_blob.digest;
+              return batch_transfer_phase1_sender->enqueue(request) ==
+                     Preserve_trx_transfer_status::OK;
+            })) {
       abort_batch_transfer_epoch("lock_warmcopy_phase1_store_prepare_rejected");
       abort_drain_participants("lock_warmcopy_phase1_store_prepare_rejected");
+      return preserve_trx_reject_unsupported();
+    }
+    if (batch_transfer_phase1_sender != nullptr &&
+        batch_transfer_phase1_sender->flush() !=
+            Preserve_trx_transfer_status::OK) {
+      abort_batch_transfer_epoch("standby_transfer_phase1_record_batch_failed");
+      abort_drain_participants("standby_transfer_phase1_record_batch_failed");
       return preserve_trx_reject_unsupported();
     }
     if (stream_phase1_transfer_record_lock_blobs()) {
@@ -12697,7 +12874,8 @@ bool Preserve_trx_drain_service::execute(
     if (stream_phase1_transfer_binlog_cache_blobs(
             thd, generation, batch_transfer_phase1_declared_tokens,
             batch_transfer_source_session.get(),
-            batch_transfer_binlog_blob_provider.get())) {
+            batch_transfer_binlog_blob_provider.get(),
+            batch_transfer_phase1_sender.get())) {
       abort_batch_transfer_epoch(
           "standby_transfer_phase1_binlog_blob_stream_failed");
       abort_drain_participants(
@@ -12706,6 +12884,18 @@ bool Preserve_trx_drain_service::execute(
     }
     if (begin_phase1_transfer_prewarm_manifests()) {
       return preserve_trx_reject_unsupported();
+    }
+    if (batch_transfer_phase1_sender != nullptr) {
+      if (batch_transfer_phase1_sender->flush() !=
+          Preserve_trx_transfer_status::OK) {
+        abort_batch_transfer_epoch("standby_transfer_phase1_batch_flush_failed");
+        abort_drain_participants("standby_transfer_phase1_batch_flush_failed");
+        return preserve_trx_reject_unsupported();
+      }
+      batch_transfer_phase1_sender.reset();
+    }
+    if (batch_transfer_source_session != nullptr) {
+      batch_transfer_source_session->set_phase1_metrics_enabled(false);
     }
     if (temp_table_participant != nullptr &&
         !temp_table_participant->prepare_late_phase1_idle_targets()) {
@@ -13972,7 +14162,50 @@ bool Preserve_trx_drain_service::execute(
             preserve_trx_transfer_phase2_final_metadata_encoded_bytes_status()) +
         " source_phase2_transfer_final_metadata_ack_us=" +
         std::to_string(
-            preserve_trx_transfer_phase2_final_metadata_ack_us_status());
+            preserve_trx_transfer_phase2_final_metadata_ack_us_status()) +
+        " source_phase1_transfer_frame_count=" +
+        std::to_string(preserve_trx_transfer_phase1_frame_count_status()) +
+        " source_phase1_transfer_network_send_count=" +
+        std::to_string(
+            preserve_trx_transfer_phase1_network_send_count_status()) +
+        " source_phase1_transfer_batch_count=" +
+        std::to_string(preserve_trx_transfer_phase1_batch_count_status()) +
+        " source_phase1_transfer_batch_bytes_p50=" +
+        std::to_string(
+            preserve_trx_transfer_phase1_batch_bytes_p50_status()) +
+        " source_phase1_transfer_batch_bytes_p95=" +
+        std::to_string(
+            preserve_trx_transfer_phase1_batch_bytes_p95_status()) +
+        " source_phase1_transfer_batch_bytes_max=" +
+        std::to_string(
+            preserve_trx_transfer_phase1_batch_bytes_max_status()) +
+        " source_phase1_transfer_batch_tokens_p50=" +
+        std::to_string(
+            preserve_trx_transfer_phase1_batch_tokens_p50_status()) +
+        " source_phase1_transfer_batch_tokens_p95=" +
+        std::to_string(
+            preserve_trx_transfer_phase1_batch_tokens_p95_status()) +
+        " source_phase1_transfer_batch_tokens_max=" +
+        std::to_string(
+            preserve_trx_transfer_phase1_batch_tokens_max_status()) +
+        " source_phase1_record_batch_tokens_avg=" +
+        std::to_string(
+            preserve_trx_transfer_phase1_record_batch_tokens_avg_status()) +
+        " source_phase1_transfer_batch_linger_us_p95=" +
+        std::to_string(
+            preserve_trx_transfer_phase1_batch_linger_us_p95_status()) +
+        " source_phase1_transfer_batch_linger_us_max=" +
+        std::to_string(
+            preserve_trx_transfer_phase1_batch_linger_us_max_status()) +
+        " source_phase1_transfer_oversize_token_count=" +
+        std::to_string(
+            preserve_trx_transfer_phase1_oversize_token_count_status()) +
+        " source_phase1_record_first_batch_send_us=" +
+        std::to_string(
+            preserve_trx_transfer_phase1_record_first_batch_send_us_status()) +
+        " source_phase1_record_last_batch_send_us=" +
+        std::to_string(
+            preserve_trx_transfer_phase1_record_last_batch_send_us_status());
     if (!phase2_slo_reason.empty()) {
       message += " phase2_slo_reason=" + phase2_slo_reason;
     }

@@ -619,6 +619,42 @@ TEST(PreserveTrxLockWarmcopyDrainParticipant,
 }
 
 TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     Phase1RecordStoreInvokesBlobReadyCallbackPerTarget) {
+  lock_warmcopy_reset_for_unit_test();
+  lock_warmcopy_record_shard_key_t key;
+  key.table_id = 100;
+  key.index_id = 200;
+  key.space_id = 7;
+  key.page_no = 11;
+  key.lock_type_mode = 3;
+  key.n_bits = 8;
+  lock_warmcopy_record_image_digest_t digest;
+  digest.bytes[0] = 0xa8;
+
+  Preserve_trx_lock_warmcopy_options options =
+      preserve_trx_lock_warmcopy_current_options();
+  options.preserve_dir =
+      unique_dir_for_test("preserve-lock-warmcopy-record-ready-callback");
+  Preserve_trx_lock_warmcopy_drain_participant participant(options);
+  ASSERT_TRUE(participant.open_phase1());
+  ASSERT_TRUE(
+      lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
+          42, key, 2, digest, 20, make_record_image('i')));
+
+  std::vector<uint64_t> callback_tokens;
+  ASSERT_TRUE(participant.prepare_phase1_record_store_targets(
+      [&](uint64_t token, const PrebuiltRecordLocksBlob &blob) {
+        callback_tokens.push_back(token);
+        return blob.size != 0 && !blob.warmcopy_id.empty();
+      }));
+  ASSERT_EQ(1U, callback_tokens.size());
+  EXPECT_EQ(42U, callback_tokens[0]);
+
+  participant.finalize_phase();
+  (void)rmdir(options.preserve_dir.c_str());
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
      Phase1PrebuiltRecordBlobIsNotUsedAfterStoreDelta) {
   lock_warmcopy_reset_for_unit_test();
   const std::string phase1_payload = make_record_payload(

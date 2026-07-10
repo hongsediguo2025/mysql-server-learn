@@ -12397,6 +12397,386 @@ class Transfer_receiver_payload_test_sink final
   size_t m_frame_count{0};
 };
 
+struct Phase1_transfer_batch_probe {
+  std::mutex mutex;
+  std::condition_variable condition;
+  std::vector<std::vector<Preserve_trx_transfer_phase1_blob_request>> batches;
+  Preserve_trx_transfer_status status{Preserve_trx_transfer_status::OK};
+};
+
+struct Blocking_phase1_transfer_batch_probe {
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool first_entered{false};
+  bool release_first{false};
+  size_t calls{0};
+};
+
+static Preserve_trx_transfer_status blocking_phase1_transfer_batch_flush(
+    const std::vector<Preserve_trx_transfer_phase1_blob_request> &, void *context) {
+  auto *probe = static_cast<Blocking_phase1_transfer_batch_probe *>(context);
+  if (probe == nullptr) return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  std::unique_lock<std::mutex> guard(probe->mutex);
+  ++probe->calls;
+  if (probe->calls == 1) {
+    probe->first_entered = true;
+    probe->condition.notify_all();
+    probe->condition.wait(guard, [&]() { return probe->release_first; });
+  }
+  return Preserve_trx_transfer_status::OK;
+}
+
+static Preserve_trx_transfer_status phase1_transfer_batch_probe_flush(
+    const std::vector<Preserve_trx_transfer_phase1_blob_request> &batch,
+    void *context) {
+  auto *probe = static_cast<Phase1_transfer_batch_probe *>(context);
+  if (probe == nullptr) return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  std::lock_guard<std::mutex> guard(probe->mutex);
+  probe->batches.push_back(batch);
+  probe->condition.notify_all();
+  return probe->status;
+}
+
+static Preserve_trx_transfer_phase1_blob_request phase1_batch_request(
+    uint64_t token, uint64_t size) {
+  Preserve_trx_transfer_phase1_blob_request request;
+  request.transfer_token = token;
+  request.object_id = kPreservedTrxBlobRecordLocks;
+  request.warmcopy_id = "phase1-batch-" + std::to_string(token);
+  request.warmcopy_epoch = 1;
+  request.size = size;
+  return request;
+}
+
+TEST_F(PreserveSnapshotTest, TransferPhase1BatchFlushesAtByteThreshold) {
+  Phase1_transfer_batch_probe probe;
+  Preserve_trx_transfer_phase1_batch_options options;
+  options.max_batch_bytes = 100;
+  options.linger_ms = 1000;
+  options.max_inflight_bytes = 1000;
+  Preserve_trx_transfer_phase1_batch_sender sender(
+      options, phase1_transfer_batch_probe_flush, &probe);
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            sender.enqueue(phase1_batch_request(1, 60)));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            sender.enqueue(phase1_batch_request(2, 60)));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, sender.flush());
+
+  ASSERT_EQ(1U, probe.batches.size());
+  ASSERT_EQ(2U, probe.batches[0].size());
+}
+
+TEST_F(PreserveSnapshotTest, TransferPhase1BatchFlushesAtLingerWithoutNewItem) {
+  Phase1_transfer_batch_probe probe;
+  Preserve_trx_transfer_phase1_batch_options options;
+  options.max_batch_bytes = 1024 * 1024;
+  options.linger_ms = 10;
+  options.max_inflight_bytes = 2 * 1024 * 1024;
+  Preserve_trx_transfer_phase1_batch_sender sender(
+      options, phase1_transfer_batch_probe_flush, &probe);
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            sender.enqueue(phase1_batch_request(3, 100)));
+  std::unique_lock<std::mutex> guard(probe.mutex);
+  ASSERT_TRUE(probe.condition.wait_for(guard, std::chrono::milliseconds(500),
+                                       [&]() { return !probe.batches.empty(); }));
+  ASSERT_EQ(1U, probe.batches.size());
+  ASSERT_EQ(1U, probe.batches[0].size());
+}
+
+TEST_F(PreserveSnapshotTest, TransferPhase1BatchFlushSendsTail) {
+  Phase1_transfer_batch_probe probe;
+  Preserve_trx_transfer_phase1_batch_options options;
+  options.max_batch_bytes = 1024;
+  options.linger_ms = 1000;
+  options.max_inflight_bytes = 4096;
+  Preserve_trx_transfer_phase1_batch_sender sender(
+      options, phase1_transfer_batch_probe_flush, &probe);
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            sender.enqueue(phase1_batch_request(4, 100)));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, sender.flush());
+  ASSERT_EQ(1U, probe.batches.size());
+  ASSERT_EQ(4U, probe.batches[0][0].transfer_token);
+}
+
+TEST_F(PreserveSnapshotTest, TransferPhase1BatchDisabledSendsImmediately) {
+  Phase1_transfer_batch_probe probe;
+  Preserve_trx_transfer_phase1_batch_options options;
+  options.max_batch_bytes = 0;
+  options.linger_ms = 20;
+  options.max_inflight_bytes = 4096;
+  Preserve_trx_transfer_phase1_batch_sender sender(
+      options, phase1_transfer_batch_probe_flush, &probe);
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            sender.enqueue(phase1_batch_request(5, 100)));
+  ASSERT_EQ(1U, probe.batches.size());
+  ASSERT_EQ(1U, probe.batches[0].size());
+}
+
+TEST_F(PreserveSnapshotTest, TransferPhase1ZeroLingerSendsImmediately) {
+  Phase1_transfer_batch_probe probe;
+  Preserve_trx_transfer_phase1_batch_options options;
+  options.max_batch_bytes = 1024;
+  options.linger_ms = 0;
+  options.max_inflight_bytes = 4096;
+  Preserve_trx_transfer_phase1_batch_sender sender(
+      options, phase1_transfer_batch_probe_flush, &probe);
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            sender.enqueue(phase1_batch_request(8, 100)));
+  ASSERT_EQ(1U, probe.batches.size());
+  ASSERT_EQ(8U, probe.batches[0][0].transfer_token);
+}
+
+TEST_F(PreserveSnapshotTest, TransferPhase1BatchStopsAfterSendFailure) {
+  Phase1_transfer_batch_probe probe;
+  probe.status = Preserve_trx_transfer_status::IO_ERROR;
+  Preserve_trx_transfer_phase1_batch_options options;
+  options.max_batch_bytes = 100;
+  options.linger_ms = 1000;
+  options.max_inflight_bytes = 1000;
+  Preserve_trx_transfer_phase1_batch_sender sender(
+      options, phase1_transfer_batch_probe_flush, &probe);
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            sender.enqueue(phase1_batch_request(6, 100)));
+  EXPECT_EQ(Preserve_trx_transfer_status::IO_ERROR, sender.flush());
+  EXPECT_EQ(Preserve_trx_transfer_status::IO_ERROR,
+            sender.enqueue(phase1_batch_request(7, 100)));
+  EXPECT_EQ(1U, probe.batches.size());
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferPhase1BackpressureIncludesInFlightBatchBytes) {
+  Blocking_phase1_transfer_batch_probe probe;
+  Preserve_trx_transfer_phase1_batch_options options;
+  options.max_batch_bytes = 100;
+  options.linger_ms = 1000;
+  options.max_inflight_bytes = 100;
+  Preserve_trx_transfer_phase1_batch_sender sender(
+      options, blocking_phase1_transfer_batch_flush, &probe);
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            sender.enqueue(phase1_batch_request(31, 100)));
+  {
+    std::unique_lock<std::mutex> guard(probe.mutex);
+    ASSERT_TRUE(probe.condition.wait_for(
+        guard, std::chrono::milliseconds(500),
+        [&]() { return probe.first_entered; }));
+  }
+
+  std::atomic<bool> second_enqueue_done{false};
+  std::thread producer([&]() {
+    EXPECT_EQ(Preserve_trx_transfer_status::OK,
+              sender.enqueue(phase1_batch_request(32, 100)));
+    second_enqueue_done.store(true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_FALSE(second_enqueue_done.load());
+  {
+    std::lock_guard<std::mutex> guard(probe.mutex);
+    probe.release_first = true;
+    probe.condition.notify_all();
+  }
+  producer.join();
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, sender.flush());
+  EXPECT_EQ(2U, probe.calls);
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferSourceEpochSessionBatchesPhase1ControlAndBlobFrames) {
+  preserve_trx_transfer_reset_source_phase1_metrics();
+  Transfer_codec_context_guard codec_guard;
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+
+  Local_file_preserved_trx_carrier warm_carrier(m_dir);
+  PrebuiltRecordLocksBlob first_blob;
+  PrebuiltRecordLocksBlob second_blob;
+  create_warm_prebuilt_record_locks_blob(
+      &warm_carrier, "phase1-batch-record-801", record_locks_payload(),
+      &first_blob);
+  create_warm_prebuilt_record_locks_blob(
+      &warm_carrier, "phase1-batch-record-802", record_locks_payload(),
+      &second_blob);
+
+  Capturing_transfer_frame_sink sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-phase1-network-batch", "source-uuid", "target-uuid", 1048576,
+      &sink);
+  session.set_phase1_metrics_enabled(true);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_tokens_batch({801, 802}));
+  ASSERT_EQ(1U, sink.frames().size());
+
+  std::vector<Preserve_trx_transfer_phase1_blob_request> requests;
+  for (const auto &entry :
+       std::vector<std::pair<uint64_t, PrebuiltRecordLocksBlob>>{
+           {801, first_blob}, {802, second_blob}}) {
+    Preserve_trx_transfer_phase1_blob_request request;
+    request.transfer_token = entry.first;
+    request.object_id = entry.second.name;
+    request.warmcopy_id = entry.second.warmcopy_id;
+    request.warmcopy_epoch = entry.second.warmcopy_epoch;
+    request.size = entry.second.size;
+    request.digest = entry.second.digest;
+    requests.push_back(request);
+  }
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_stream_prebuilt_blobs_batch(
+                &session, m_dir, requests, 4 * 1024 * 1024));
+  ASSERT_EQ(2U, sink.frames().size());
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.begin_token_prewarm_manifests_batch({801, 802}));
+  ASSERT_EQ(3U, sink.frames().size());
+  EXPECT_EQ(10U, preserve_trx_transfer_phase1_frame_count_status());
+  EXPECT_EQ(3U, preserve_trx_transfer_phase1_network_send_count_status());
+  EXPECT_EQ(3U, preserve_trx_transfer_phase1_batch_count_status());
+  EXPECT_GT(preserve_trx_transfer_phase1_batch_bytes_max_status(), 0U);
+  EXPECT_GE(preserve_trx_transfer_phase1_batch_tokens_max_status(), 2U);
+  EXPECT_EQ(2U,
+            preserve_trx_transfer_phase1_record_batch_tokens_avg_status());
+  EXPECT_GT(preserve_trx_transfer_phase1_record_first_batch_send_us_status(),
+            0U);
+  EXPECT_GE(preserve_trx_transfer_phase1_record_last_batch_send_us_status(),
+            preserve_trx_transfer_phase1_record_first_batch_send_us_status());
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_handle_receiver_payload_batch(
+                m_dir, sink.frames(), &store, &registry, 300, 2));
+  for (uint64_t token : {801ULL, 802ULL}) {
+    Preserve_trx_transfer_receiver_record record;
+    ASSERT_TRUE(registry.lookup("epoch-phase1-network-batch", token, &record));
+    EXPECT_EQ(Preserve_trx_transfer_receiver_state::RECEIVING, record.state);
+    EXPECT_TRUE(registry.all_objects_sealed(record.epoch_id, record.token));
+  }
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferSourceEpochSessionSnapshotsPhase1BatchLimits) {
+  Transfer_codec_context_guard codec_guard;
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+
+  Preserve_trx_transfer_source_epoch_options options;
+  options.chunk_bytes = 1048576;
+  options.max_inflight_bytes = 8 * 1024 * 1024;
+  options.phase1_batch_bytes = 4 * 1024 * 1024;
+  Capturing_transfer_frame_sink sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-phase1-snapshot", "source-uuid", "target-uuid", options,
+      &sink);
+
+  const ulonglong saved_max_inflight =
+      preserve_trx_transfer_max_inflight_bytes;
+  const ulonglong saved_batch_bytes =
+      preserve_trx_transfer_phase1_batch_bytes;
+  preserve_trx_transfer_max_inflight_bytes = 1;
+  preserve_trx_transfer_phase1_batch_bytes = 1;
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_tokens_batch({811, 812}));
+  EXPECT_EQ(8U * 1024U * 1024U, session.max_inflight_bytes());
+  EXPECT_EQ(4U * 1024U * 1024U, session.phase1_batch_bytes());
+  preserve_trx_transfer_max_inflight_bytes = saved_max_inflight;
+  preserve_trx_transfer_phase1_batch_bytes = saved_batch_bytes;
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferSourceEpochSessionSplitsControlFramesAtSnapshotBatchBytes) {
+  Transfer_codec_context_guard codec_guard;
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+
+  Preserve_trx_transfer_source_epoch_options options;
+  options.chunk_bytes = 1048576;
+  options.max_inflight_bytes = 8 * 1024 * 1024;
+  options.phase1_batch_bytes = 1;
+  Capturing_transfer_frame_sink sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-phase1-control-split", "source-uuid", "target-uuid", options,
+      &sink);
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_tokens_batch({821, 822}));
+  EXPECT_EQ(2U, sink.frames().size());
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferPhase1OversizeRecordUsesSingleTokenPathAndMetrics) {
+  preserve_trx_transfer_reset_source_phase1_metrics();
+  Transfer_codec_context_guard codec_guard;
+  Local_file_preserved_trx_carrier warm_carrier(m_dir);
+  PrebuiltRecordLocksBlob blob;
+  create_warm_prebuilt_record_locks_blob(
+      &warm_carrier, "phase1-oversize-record", record_locks_payload(), &blob);
+
+  Capturing_transfer_frame_sink sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-phase1-oversize", "source-uuid", "target-uuid", 1048576,
+      &sink);
+  session.set_phase1_metrics_enabled(true);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.declare_token(831));
+
+  Preserve_trx_transfer_phase1_blob_request request;
+  request.transfer_token = 831;
+  request.object_id = blob.name;
+  request.warmcopy_id = blob.warmcopy_id;
+  request.warmcopy_epoch = blob.warmcopy_epoch;
+  request.size = blob.size;
+  request.digest = blob.digest;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_stream_prebuilt_blobs_batch(
+                &session, m_dir, {request}, 1));
+  EXPECT_EQ(1U,
+            preserve_trx_transfer_phase1_oversize_token_count_status());
+  EXPECT_GT(preserve_trx_transfer_phase1_record_first_batch_send_us_status(),
+            0U);
+  EXPECT_GE(preserve_trx_transfer_phase1_record_last_batch_send_us_status(),
+            preserve_trx_transfer_phase1_record_first_batch_send_us_status());
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferPhase1BatchSendFailureDoesNotPublishPresealedState) {
+  Transfer_codec_context_guard codec_guard;
+  Local_file_preserved_trx_carrier warm_carrier(m_dir);
+  PrebuiltRecordLocksBlob blob;
+  create_warm_prebuilt_record_locks_blob(
+      &warm_carrier, "phase1-failed-record-batch", record_locks_payload(),
+      &blob);
+
+  Fail_once_transfer_frame_sink sink(2);
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-phase1-failed-batch", "source-uuid", "target-uuid", 1048576,
+      &sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_tokens_batch({841}));
+
+  Preserve_trx_transfer_phase1_blob_request request;
+  request.transfer_token = 841;
+  request.object_id = blob.name;
+  request.warmcopy_id = blob.warmcopy_id;
+  request.warmcopy_epoch = blob.warmcopy_epoch;
+  request.size = blob.size;
+  request.digest = blob.digest;
+  EXPECT_EQ(Preserve_trx_transfer_status::IO_ERROR,
+            preserve_trx_transfer_stream_prebuilt_blobs_batch(
+                &session, m_dir, {request}, 4 * 1024 * 1024));
+
+  Preserve_trx_transfer_object_descriptor descriptor;
+  descriptor.object_id = blob.name;
+  descriptor.kind = Preserve_trx_transfer_object_kind::EXTERNAL_BLOB;
+  descriptor.total_size = blob.size;
+  descriptor.digest = blob.digest;
+  EXPECT_FALSE(session.object_presealed_for_token(841, descriptor));
+}
+
 TEST_F(PreserveSnapshotTest, TransferSourceSendsBundleThroughFrameSink) {
   Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 401;
@@ -12970,7 +13350,7 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
-       TransferReceiverDeclaredObjectSealWaitsForManifestBeforeObjectPrewarm) {
+       TransferReceiverDeclaredObjectSealStartsObjectPrewarmBeforeManifest) {
   Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 715;
   Preserve_snapshot_metadata meta = logged_with_cache_metadata();
@@ -13042,7 +13422,14 @@ TEST_F(PreserveSnapshotTest,
                   m_dir, frame, &store, &registry, 300, nullptr));
   }
 
-  EXPECT_EQ(proof_count_before,
+  for (uint attempt = 0; attempt < 100; ++attempt) {
+    if (preserve_trx_transfer_receiver_object_prewarm_proof_count_status() >
+        proof_count_before) {
+      break;
+    }
+    my_sleep(10000);
+  }
+  EXPECT_EQ(proof_count_before + 1,
             preserve_trx_transfer_receiver_object_prewarm_proof_count_status());
 
   Preserve_trx_transfer_receiver_record record;

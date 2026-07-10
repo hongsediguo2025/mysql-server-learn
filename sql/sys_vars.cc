@@ -1512,6 +1512,24 @@ static Sys_var_uint Sys_preserve_trx_transfer_commit_timeout_ms(
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, UINT_MAX32), DEFAULT(30000),
     BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
+static Sys_var_ulonglong Sys_preserve_trx_transfer_phase1_batch_bytes(
+    "preserve_trx_transfer_phase1_batch_bytes",
+    "Target encoded-byte threshold for one Preserve/Resume phase-1 standby "
+    "transfer batch. Zero disables batching. Each transfer epoch snapshots "
+    "the value when the epoch is opened.",
+    GLOBAL_VAR(preserve_trx_transfer_phase1_batch_bytes),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 67108864ULL), DEFAULT(4194304ULL),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_transfer_phase1_batch_linger_ms(
+    "preserve_trx_transfer_phase1_batch_linger_ms",
+    "Maximum milliseconds the oldest queued phase-1 standby transfer object "
+    "may wait before its batch is sent. Zero sends immediately. Each transfer "
+    "epoch snapshots the value when the epoch is opened.",
+    GLOBAL_VAR(preserve_trx_transfer_phase1_batch_linger_ms),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 1000), DEFAULT(20), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
 static Sys_var_uint Sys_preserve_trx_promotion_gate_batch_tokens(
     "preserve_trx_promotion_gate_batch_tokens",
     "Maximum standby-pending tokens a single Preserve/Resume promotion gate "

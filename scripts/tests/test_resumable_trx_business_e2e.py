@@ -4683,6 +4683,10 @@ class WorkloadPlanTest(unittest.TestCase):
                 "transfer_credential",
                 "--max-receiver-ready-after-phase2-ms",
                 "100",
+                "--transfer-phase1-batch-bytes",
+                "8388608",
+                "--transfer-phase1-batch-linger-ms",
+                "50",
             ]
         )
 
@@ -4693,6 +4697,8 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertEqual(cfg.standby_transfer_password, "transfer_secret")
         self.assertEqual(cfg.standby_transfer_credential_name, "transfer_credential")
         self.assertEqual(cfg.max_receiver_ready_after_phase2_ms, 100)
+        self.assertEqual(cfg.transfer_phase1_batch_bytes, 8388608)
+        self.assertEqual(cfg.transfer_phase1_batch_linger_ms, 50)
 
     def test_standby_transfer_receiver_drain_metrics_defaults_to_100ms_ready_gate(self):
         cfg = parse_args(
@@ -5073,6 +5079,8 @@ class WorkloadPlanTest(unittest.TestCase):
                 lockset_minimal_table=True,
                 receiver_unix_socket="/tmp/receiver.sock",
                 receiver_preserve_dir=str(Path(tmpdir) / "preserve"),
+                transfer_phase1_batch_bytes=8388608,
+                transfer_phase1_batch_linger_ms=50,
                 report_json=str(report_path),
             ).validate()
             runner.warmcopy_drain_metrics = [
@@ -5098,6 +5106,21 @@ class WorkloadPlanTest(unittest.TestCase):
                     source_phase2_transfer_final_metadata_frame_count=9,
                     source_phase2_transfer_final_metadata_bytes=1000,
                     source_phase2_transfer_final_metadata_ack_us=1100,
+                    source_phase1_transfer_frame_count=100,
+                    source_phase1_transfer_network_send_count=20,
+                    source_phase1_transfer_batch_count=18,
+                    source_phase1_transfer_batch_bytes_p50=10000,
+                    source_phase1_transfer_batch_bytes_p95=20000,
+                    source_phase1_transfer_batch_bytes_max=30000,
+                    source_phase1_transfer_batch_tokens_p50=4,
+                    source_phase1_transfer_batch_tokens_p95=8,
+                    source_phase1_transfer_batch_tokens_max=10,
+                    source_phase1_record_batch_tokens_avg=7,
+                    source_phase1_transfer_batch_linger_us_p95=19000,
+                    source_phase1_transfer_batch_linger_us_max=20000,
+                    source_phase1_transfer_oversize_token_count=1,
+                    source_phase1_record_first_batch_send_us=900000,
+                    source_phase1_record_last_batch_send_us=990000,
                 )
             ]
             runner.receiver_artifact_counts = {
@@ -5183,6 +5206,12 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertTrue(report["workload_lockset_noop_update"])
             self.assertTrue(report["workload_lockset_touch_one_row"])
             self.assertTrue(report["workload_lockset_minimal_table"])
+            self.assertEqual(
+                report["source_phase1_transfer_batch_bytes_config"], 8388608
+            )
+            self.assertEqual(
+                report["source_phase1_transfer_batch_linger_ms_config"], 50
+            )
             self.assertEqual(report["receiver_standby_pending_tokens"], 2)
             self.assertEqual(report["standby_tokens"], 2)
             self.assertEqual(report["receiver_epoch_fact_count"], 1)
@@ -5225,6 +5254,23 @@ class WorkloadPlanTest(unittest.TestCase):
                 report["source_phase2_transfer_final_metadata_ack_us_samples"],
                 [1100],
             )
+            self.assertEqual(report["source_phase1_transfer_frame_count"], 100)
+            self.assertEqual(
+                report["source_phase1_transfer_network_send_count"], 20
+            )
+            self.assertEqual(report["source_phase1_transfer_batch_count"], 18)
+            self.assertEqual(report["source_phase1_transfer_batch_bytes_p50"], 10000)
+            self.assertEqual(report["source_phase1_transfer_batch_bytes_p95"], 20000)
+            self.assertEqual(report["source_phase1_transfer_batch_bytes_max"], 30000)
+            self.assertEqual(report["source_phase1_transfer_batch_tokens_p50"], 4)
+            self.assertEqual(report["source_phase1_transfer_batch_tokens_p95"], 8)
+            self.assertEqual(report["source_phase1_transfer_batch_tokens_max"], 10)
+            self.assertEqual(report["source_phase1_record_batch_tokens_avg"], 7)
+            self.assertEqual(report["source_phase1_transfer_batch_linger_us_p95"], 19000)
+            self.assertEqual(report["source_phase1_transfer_batch_linger_us_max"], 20000)
+            self.assertEqual(report["source_phase1_transfer_oversize_token_count"], 1)
+            self.assertEqual(report["source_phase1_record_first_batch_send_us"], 900000)
+            self.assertEqual(report["source_phase1_record_last_batch_send_us"], 990000)
             self.assertEqual(report["phase1_business_enqueue_block_us"], 0)
             self.assertEqual(report["receiver_ready_after_final_metadata_us"], 9000)
             self.assertEqual(report["receiver_final_spool_ack_monotonic_us"], 1_040_000)
@@ -7065,12 +7111,22 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             scenario="standby_transfer_receiver_drain_metrics",
             receiver_unix_socket="/tmp/receiver.sock",
             receiver_preserve_dir="/tmp/receiver-data/preserve",
+            transfer_phase1_batch_bytes=8388608,
+            transfer_phase1_batch_linger_ms=50,
         )
         runner.runtime = _FakeRuntime()
 
         runner.configure_preserve_globals()
 
         self.assertIn("SET GLOBAL log_error_verbosity=3", runner.runtime.sql)
+        self.assertIn(
+            "SET GLOBAL preserve_trx_transfer_phase1_batch_bytes=8388608",
+            runner.runtime.sql,
+        )
+        self.assertIn(
+            "SET GLOBAL preserve_trx_transfer_phase1_batch_linger_ms=50",
+            runner.runtime.sql,
+        )
 
     def test_large_batch_configures_preserve_capacity_for_all_sessions(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -7584,7 +7640,22 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
                 "source_phase2_transfer_snapshot_bundle_count=8 "
                 "source_phase2_transfer_final_metadata_frame_count=9 "
                 "source_phase2_transfer_final_metadata_bytes=1000 "
-                "source_phase2_transfer_final_metadata_ack_us=1100\n"
+                "source_phase2_transfer_final_metadata_ack_us=1100 "
+                "source_phase1_transfer_frame_count=100 "
+                "source_phase1_transfer_network_send_count=20 "
+                "source_phase1_transfer_batch_count=18 "
+                "source_phase1_transfer_batch_bytes_p50=10000 "
+                "source_phase1_transfer_batch_bytes_p95=20000 "
+                "source_phase1_transfer_batch_bytes_max=30000 "
+                "source_phase1_transfer_batch_tokens_p50=4 "
+                "source_phase1_transfer_batch_tokens_p95=8 "
+                "source_phase1_transfer_batch_tokens_max=10 "
+                "source_phase1_record_batch_tokens_avg=7 "
+                "source_phase1_transfer_batch_linger_us_p95=19000 "
+                "source_phase1_transfer_batch_linger_us_max=20000 "
+                "source_phase1_transfer_oversize_token_count=1 "
+                "source_phase1_record_first_batch_send_us=900000 "
+                "source_phase1_record_last_batch_send_us=990000\n"
             )
             error_log.flush()
             runner.config = HarnessConfig(server_error_log=error_log.name)
@@ -7618,6 +7689,21 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertEqual(metrics.source_phase2_transfer_final_metadata_frame_count, 9)
         self.assertEqual(metrics.source_phase2_transfer_final_metadata_bytes, 1000)
         self.assertEqual(metrics.source_phase2_transfer_final_metadata_ack_us, 1100)
+        self.assertEqual(metrics.source_phase1_transfer_frame_count, 100)
+        self.assertEqual(metrics.source_phase1_transfer_network_send_count, 20)
+        self.assertEqual(metrics.source_phase1_transfer_batch_count, 18)
+        self.assertEqual(metrics.source_phase1_transfer_batch_bytes_p50, 10000)
+        self.assertEqual(metrics.source_phase1_transfer_batch_bytes_p95, 20000)
+        self.assertEqual(metrics.source_phase1_transfer_batch_bytes_max, 30000)
+        self.assertEqual(metrics.source_phase1_transfer_batch_tokens_p50, 4)
+        self.assertEqual(metrics.source_phase1_transfer_batch_tokens_p95, 8)
+        self.assertEqual(metrics.source_phase1_transfer_batch_tokens_max, 10)
+        self.assertEqual(metrics.source_phase1_record_batch_tokens_avg, 7)
+        self.assertEqual(metrics.source_phase1_transfer_batch_linger_us_p95, 19000)
+        self.assertEqual(metrics.source_phase1_transfer_batch_linger_us_max, 20000)
+        self.assertEqual(metrics.source_phase1_transfer_oversize_token_count, 1)
+        self.assertEqual(metrics.source_phase1_record_first_batch_send_us, 900000)
+        self.assertEqual(metrics.source_phase1_record_last_batch_send_us, 990000)
 
     def test_drain_target_counter_rejection_parser_reads_latest_metric_after_offset(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)

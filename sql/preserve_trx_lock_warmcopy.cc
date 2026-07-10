@@ -2810,7 +2810,8 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
 }
 
 bool Preserve_trx_lock_warmcopy_drain_participant::
-    prepare_phase1_record_store_targets() {
+    prepare_phase1_record_store_targets(
+        const Phase1_record_blob_ready_callback &blob_ready) {
   if (!m_options.enabled ||
       m_observation.state != Preserve_trx_drain_participant_state::OPEN) {
     return true;
@@ -2832,6 +2833,12 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
     if (!seed_phase1_record_payload_for_thread(target_id,
                                                record_locks_payload)) {
       lock_warmcopy_record_store_clear_for_target(target_id);
+    } else if (blob_ready) {
+      PrebuiltRecordLocksBlob blob;
+      if (!phase1_record_prebuilt_blob_for_thread(target_id, &blob) ||
+          !blob_ready(target_id, blob)) {
+        return false;
+      }
     }
   }
   if (!target_ids.empty() && Global_THD_manager::get_instance() != nullptr) {

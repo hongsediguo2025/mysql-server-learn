@@ -404,6 +404,43 @@ int show_preserve_trx_transfer_phase2_final_metadata_ack_us(THD *thd,
                                                             char *buf);
 int show_preserve_trx_transfer_phase1_business_enqueue_block_us(
     THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_phase1_frame_count(THD *thd, SHOW_VAR *var,
+                                                  char *buf);
+int show_preserve_trx_transfer_phase1_network_send_count(THD *thd,
+                                                         SHOW_VAR *var,
+                                                         char *buf);
+int show_preserve_trx_transfer_phase1_batch_count(THD *thd, SHOW_VAR *var,
+                                                  char *buf);
+int show_preserve_trx_transfer_phase1_batch_bytes_p50(THD *thd, SHOW_VAR *var,
+                                                      char *buf);
+int show_preserve_trx_transfer_phase1_batch_bytes_p95(THD *thd, SHOW_VAR *var,
+                                                      char *buf);
+int show_preserve_trx_transfer_phase1_batch_bytes_max(THD *thd, SHOW_VAR *var,
+                                                      char *buf);
+int show_preserve_trx_transfer_phase1_batch_tokens_p50(THD *thd,
+                                                       SHOW_VAR *var,
+                                                       char *buf);
+int show_preserve_trx_transfer_phase1_batch_tokens_p95(THD *thd,
+                                                       SHOW_VAR *var,
+                                                       char *buf);
+int show_preserve_trx_transfer_phase1_batch_tokens_max(THD *thd,
+                                                       SHOW_VAR *var,
+                                                       char *buf);
+int show_preserve_trx_transfer_phase1_record_batch_tokens_avg(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_phase1_batch_linger_us_p95(THD *thd,
+                                                          SHOW_VAR *var,
+                                                          char *buf);
+int show_preserve_trx_transfer_phase1_batch_linger_us_max(THD *thd,
+                                                          SHOW_VAR *var,
+                                                          char *buf);
+int show_preserve_trx_transfer_phase1_oversize_token_count(THD *thd,
+                                                           SHOW_VAR *var,
+                                                           char *buf);
+int show_preserve_trx_transfer_phase1_record_first_batch_send_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_phase1_record_last_batch_send_us(
+    THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_ready_after_final_metadata_us(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_final_spool_ack_monotonic_us(

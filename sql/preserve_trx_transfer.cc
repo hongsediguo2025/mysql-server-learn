@@ -85,6 +85,8 @@ uint preserve_trx_transfer_receiver_workers = 3;
 uint preserve_trx_transfer_chunk_bytes = 1048576;
 ulonglong preserve_trx_transfer_max_inflight_bytes = 1073741824ULL;
 uint preserve_trx_transfer_commit_timeout_ms = 30000;
+ulonglong preserve_trx_transfer_phase1_batch_bytes = 4194304ULL;
+uint preserve_trx_transfer_phase1_batch_linger_ms = 20;
 
 static std::atomic<uint64_t> g_receiver_auto_prewarm_tokens{0};
 static std::atomic<uint64_t> g_receiver_auto_prewarm_ready_tokens{0};
@@ -140,6 +142,17 @@ static std::atomic<uint64_t> g_transfer_phase2_receiver_prewarm_wait_us{0};
 static std::atomic<uint64_t> g_transfer_phase2_final_metadata_fsync_count{0};
 static std::atomic<uint64_t> g_transfer_phase2_final_metadata_ack_us{0};
 static std::atomic<uint64_t> g_transfer_phase1_business_enqueue_block_us{0};
+static std::atomic<uint64_t> g_transfer_phase1_frame_count{0};
+static std::atomic<uint64_t> g_transfer_phase1_network_send_count{0};
+static std::atomic<uint64_t> g_transfer_phase1_batch_count{0};
+static std::atomic<uint64_t> g_transfer_phase1_oversize_token_count{0};
+static std::atomic<uint64_t> g_transfer_phase1_record_first_batch_send_us{0};
+static std::atomic<uint64_t> g_transfer_phase1_record_last_batch_send_us{0};
+static std::mutex g_transfer_phase1_batch_metrics_mutex;
+static std::vector<uint64_t> g_transfer_phase1_batch_bytes_samples;
+static std::vector<uint64_t> g_transfer_phase1_batch_tokens_samples;
+static std::vector<uint64_t> g_transfer_phase1_record_batch_tokens_samples;
+static std::vector<uint64_t> g_transfer_phase1_batch_linger_us_samples;
 static std::atomic<uint64_t> g_receiver_final_metadata_durable_us{0};
 static std::atomic<uint64_t> g_receiver_ready_after_final_metadata_us{0};
 static std::atomic<uint64_t> g_receiver_final_spool_ack_monotonic_us{0};
@@ -223,6 +236,351 @@ static uint64_t transfer_monotonic_us() {
       std::chrono::duration_cast<std::chrono::microseconds>(
           clock::now().time_since_epoch())
           .count());
+}
+
+static uint64_t phase1_sample_percentile(const std::vector<uint64_t> &values,
+                                         uint percentile) {
+  if (values.empty()) return 0;
+  std::vector<uint64_t> sorted(values);
+  std::sort(sorted.begin(), sorted.end());
+  const size_t index = std::min<size_t>(
+      sorted.size() - 1,
+      (sorted.size() * static_cast<size_t>(percentile) + 99) / 100 - 1);
+  return sorted[index];
+}
+
+static void note_source_phase1_network_send(uint64_t frame_count,
+                                            uint64_t encoded_bytes,
+                                            uint64_t token_count,
+                                            bool encoded_batch) {
+  g_transfer_phase1_frame_count.fetch_add(frame_count);
+  g_transfer_phase1_network_send_count.fetch_add(1);
+  if (!encoded_batch) return;
+  g_transfer_phase1_batch_count.fetch_add(1);
+  std::lock_guard<std::mutex> guard(g_transfer_phase1_batch_metrics_mutex);
+  g_transfer_phase1_batch_bytes_samples.push_back(encoded_bytes);
+  g_transfer_phase1_batch_tokens_samples.push_back(token_count);
+}
+
+static void note_source_phase1_batch_linger(uint64_t linger_us) {
+  std::lock_guard<std::mutex> guard(g_transfer_phase1_batch_metrics_mutex);
+  g_transfer_phase1_batch_linger_us_samples.push_back(linger_us);
+}
+
+static void note_source_phase1_record_batch_sent(uint64_t token_count) {
+  const uint64_t now_us = transfer_monotonic_us();
+  uint64_t expected = 0;
+  (void)g_transfer_phase1_record_first_batch_send_us.compare_exchange_strong(
+      expected, now_us);
+  g_transfer_phase1_record_last_batch_send_us.store(now_us);
+  std::lock_guard<std::mutex> guard(g_transfer_phase1_batch_metrics_mutex);
+  g_transfer_phase1_record_batch_tokens_samples.push_back(token_count);
+}
+
+void preserve_trx_transfer_reset_source_phase1_metrics() {
+  g_transfer_phase1_frame_count.store(0);
+  g_transfer_phase1_network_send_count.store(0);
+  g_transfer_phase1_batch_count.store(0);
+  g_transfer_phase1_oversize_token_count.store(0);
+  g_transfer_phase1_record_first_batch_send_us.store(0);
+  g_transfer_phase1_record_last_batch_send_us.store(0);
+  std::lock_guard<std::mutex> guard(g_transfer_phase1_batch_metrics_mutex);
+  g_transfer_phase1_batch_bytes_samples.clear();
+  g_transfer_phase1_batch_tokens_samples.clear();
+  g_transfer_phase1_record_batch_tokens_samples.clear();
+  g_transfer_phase1_batch_linger_us_samples.clear();
+}
+
+uint64_t preserve_trx_transfer_phase1_frame_count_status() {
+  return g_transfer_phase1_frame_count.load();
+}
+
+uint64_t preserve_trx_transfer_phase1_network_send_count_status() {
+  return g_transfer_phase1_network_send_count.load();
+}
+
+uint64_t preserve_trx_transfer_phase1_batch_count_status() {
+  return g_transfer_phase1_batch_count.load();
+}
+
+uint64_t preserve_trx_transfer_phase1_batch_bytes_p50_status() {
+  std::lock_guard<std::mutex> guard(g_transfer_phase1_batch_metrics_mutex);
+  return phase1_sample_percentile(g_transfer_phase1_batch_bytes_samples, 50);
+}
+
+uint64_t preserve_trx_transfer_phase1_batch_bytes_p95_status() {
+  std::lock_guard<std::mutex> guard(g_transfer_phase1_batch_metrics_mutex);
+  return phase1_sample_percentile(g_transfer_phase1_batch_bytes_samples, 95);
+}
+
+uint64_t preserve_trx_transfer_phase1_batch_bytes_max_status() {
+  std::lock_guard<std::mutex> guard(g_transfer_phase1_batch_metrics_mutex);
+  return g_transfer_phase1_batch_bytes_samples.empty()
+             ? 0
+             : *std::max_element(g_transfer_phase1_batch_bytes_samples.begin(),
+                                 g_transfer_phase1_batch_bytes_samples.end());
+}
+
+uint64_t preserve_trx_transfer_phase1_batch_tokens_p50_status() {
+  std::lock_guard<std::mutex> guard(g_transfer_phase1_batch_metrics_mutex);
+  return phase1_sample_percentile(g_transfer_phase1_batch_tokens_samples, 50);
+}
+
+uint64_t preserve_trx_transfer_phase1_batch_tokens_p95_status() {
+  std::lock_guard<std::mutex> guard(g_transfer_phase1_batch_metrics_mutex);
+  return phase1_sample_percentile(g_transfer_phase1_batch_tokens_samples, 95);
+}
+
+uint64_t preserve_trx_transfer_phase1_batch_tokens_max_status() {
+  std::lock_guard<std::mutex> guard(g_transfer_phase1_batch_metrics_mutex);
+  return g_transfer_phase1_batch_tokens_samples.empty()
+             ? 0
+             : *std::max_element(g_transfer_phase1_batch_tokens_samples.begin(),
+                                 g_transfer_phase1_batch_tokens_samples.end());
+}
+
+uint64_t preserve_trx_transfer_phase1_record_batch_tokens_avg_status() {
+  std::lock_guard<std::mutex> guard(g_transfer_phase1_batch_metrics_mutex);
+  if (g_transfer_phase1_record_batch_tokens_samples.empty()) return 0;
+  uint64_t sum = 0;
+  for (uint64_t value : g_transfer_phase1_record_batch_tokens_samples) {
+    sum += value;
+  }
+  return sum / g_transfer_phase1_record_batch_tokens_samples.size();
+}
+
+uint64_t preserve_trx_transfer_phase1_batch_linger_us_p95_status() {
+  std::lock_guard<std::mutex> guard(g_transfer_phase1_batch_metrics_mutex);
+  return phase1_sample_percentile(g_transfer_phase1_batch_linger_us_samples, 95);
+}
+
+uint64_t preserve_trx_transfer_phase1_batch_linger_us_max_status() {
+  std::lock_guard<std::mutex> guard(g_transfer_phase1_batch_metrics_mutex);
+  return g_transfer_phase1_batch_linger_us_samples.empty()
+             ? 0
+             : *std::max_element(g_transfer_phase1_batch_linger_us_samples.begin(),
+                                 g_transfer_phase1_batch_linger_us_samples.end());
+}
+
+uint64_t preserve_trx_transfer_phase1_oversize_token_count_status() {
+  return g_transfer_phase1_oversize_token_count.load();
+}
+
+uint64_t preserve_trx_transfer_phase1_record_first_batch_send_us_status() {
+  return g_transfer_phase1_record_first_batch_send_us.load();
+}
+
+uint64_t preserve_trx_transfer_phase1_record_last_batch_send_us_status() {
+  return g_transfer_phase1_record_last_batch_send_us.load();
+}
+
+class Preserve_trx_transfer_phase1_batch_sender::Impl {
+ public:
+  using clock = std::chrono::steady_clock;
+
+  struct Queued_request {
+    Preserve_trx_transfer_phase1_blob_request request;
+    clock::time_point enqueued_at;
+  };
+
+  Impl(const Preserve_trx_transfer_phase1_batch_options &options,
+       Preserve_trx_transfer_phase1_batch_flush_callback flush_callback,
+       void *flush_context)
+      : m_options(options),
+        m_flush_callback(flush_callback),
+        m_flush_context(flush_context) {
+    if (m_flush_callback == nullptr || m_options.max_inflight_bytes == 0) {
+      m_status = Preserve_trx_transfer_status::INVALID_ARGUMENT;
+      return;
+    }
+    if (m_options.max_batch_bytes > m_options.max_inflight_bytes) {
+      m_status = Preserve_trx_transfer_status::UNSUPPORTED;
+      return;
+    }
+    m_batching_enabled =
+        m_options.max_batch_bytes != 0 && m_options.linger_ms != 0;
+    if (m_batching_enabled) m_worker = std::thread([this]() { run(); });
+  }
+
+  ~Impl() {
+    if (!m_batching_enabled) return;
+    {
+      std::lock_guard<std::mutex> guard(m_mutex);
+      m_stop = true;
+      m_flush_requested = true;
+      m_condition.notify_all();
+    }
+    if (m_worker.joinable()) m_worker.join();
+  }
+
+  Preserve_trx_transfer_status enqueue(
+      const Preserve_trx_transfer_phase1_blob_request &request) {
+    if (request.transfer_token == 0 || request.object_id.empty() ||
+        request.warmcopy_id.empty() || request.warmcopy_epoch == 0 ||
+        request.size == 0) {
+      return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+    }
+    if (!m_batching_enabled) {
+      if (m_status != Preserve_trx_transfer_status::OK) return m_status;
+      const Preserve_trx_transfer_status status =
+          m_flush_callback(std::vector<Preserve_trx_transfer_phase1_blob_request>{
+                               request},
+                           m_flush_context);
+      if (status != Preserve_trx_transfer_status::OK) m_status = status;
+      return status;
+    }
+
+    std::unique_lock<std::mutex> guard(m_mutex);
+    if (m_status != Preserve_trx_transfer_status::OK) return m_status;
+    if (request.size > m_options.max_inflight_bytes) {
+      return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
+    m_condition.wait(guard, [&]() {
+      const uint64_t used_bytes = m_queued_bytes + m_in_flight_bytes;
+      return m_status != Preserve_trx_transfer_status::OK || m_stop ||
+             used_bytes <=
+                 m_options.max_inflight_bytes - request.size;
+    });
+    if (m_status != Preserve_trx_transfer_status::OK) return m_status;
+    if (m_stop) return Preserve_trx_transfer_status::UNSUPPORTED;
+
+    m_queue.push_back({request, clock::now()});
+    m_queued_bytes += request.size;
+    m_condition.notify_all();
+    return Preserve_trx_transfer_status::OK;
+  }
+
+  Preserve_trx_transfer_status flush() {
+    if (!m_batching_enabled) return m_status;
+    std::unique_lock<std::mutex> guard(m_mutex);
+    m_flush_requested = true;
+    m_condition.notify_all();
+    m_condition.wait(guard, [&]() {
+      return m_status != Preserve_trx_transfer_status::OK ||
+             (m_queue.empty() && !m_in_flight);
+    });
+    if (m_status == Preserve_trx_transfer_status::OK) {
+      m_flush_requested = false;
+    }
+    return m_status;
+  }
+
+  void abort() {
+    if (!m_batching_enabled) return;
+    std::lock_guard<std::mutex> guard(m_mutex);
+    m_stop = true;
+    m_queue.clear();
+    m_queued_bytes = 0;
+    m_condition.notify_all();
+  }
+
+ private:
+  void run() {
+    if (my_thread_init()) {
+      std::lock_guard<std::mutex> failed_guard(m_mutex);
+      m_status = Preserve_trx_transfer_status::UNSUPPORTED;
+      m_condition.notify_all();
+      return;
+    }
+    auto thread_end_guard = create_scope_guard([] { my_thread_end(); });
+    std::unique_lock<std::mutex> guard(m_mutex);
+    while (true) {
+      m_condition.wait(guard, [&]() {
+        return m_stop || m_status != Preserve_trx_transfer_status::OK ||
+               !m_queue.empty();
+      });
+      if ((m_stop || m_status != Preserve_trx_transfer_status::OK) &&
+          m_queue.empty()) {
+        return;
+      }
+      if (m_queue.empty()) continue;
+
+      const auto deadline =
+          m_queue.front().enqueued_at +
+          std::chrono::milliseconds(m_options.linger_ms);
+      if (!m_flush_requested &&
+          m_queued_bytes < m_options.max_batch_bytes &&
+          clock::now() < deadline) {
+        m_condition.wait_until(guard, deadline);
+        continue;
+      }
+
+      std::vector<Preserve_trx_transfer_phase1_blob_request> batch;
+      uint64_t batch_bytes = 0;
+      const uint64_t linger_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              clock::now() - m_queue.front().enqueued_at)
+              .count());
+      while (!m_queue.empty()) {
+        Queued_request queued = std::move(m_queue.front());
+        m_queue.pop_front();
+        m_queued_bytes -= queued.request.size;
+        batch_bytes += queued.request.size;
+        batch.push_back(std::move(queued.request));
+        if (batch_bytes >= m_options.max_batch_bytes) break;
+      }
+      m_in_flight = true;
+      m_in_flight_bytes = batch_bytes;
+      guard.unlock();
+      note_source_phase1_batch_linger(linger_us);
+      Preserve_trx_transfer_status status = Preserve_trx_transfer_status::OK;
+      try {
+        status = m_flush_callback(batch, m_flush_context);
+      } catch (...) {
+        status = Preserve_trx_transfer_status::UNSUPPORTED;
+      }
+      guard.lock();
+      m_in_flight = false;
+      m_in_flight_bytes = 0;
+      if (status != Preserve_trx_transfer_status::OK) {
+        m_status = status;
+        m_queue.clear();
+        m_queued_bytes = 0;
+      }
+      m_condition.notify_all();
+    }
+  }
+
+  Preserve_trx_transfer_phase1_batch_options m_options;
+  Preserve_trx_transfer_phase1_batch_flush_callback m_flush_callback{nullptr};
+  void *m_flush_context{nullptr};
+  bool m_batching_enabled{false};
+  bool m_stop{false};
+  bool m_flush_requested{false};
+  bool m_in_flight{false};
+  Preserve_trx_transfer_status m_status{Preserve_trx_transfer_status::OK};
+  std::mutex m_mutex;
+  std::condition_variable m_condition;
+  std::deque<Queued_request> m_queue;
+  uint64_t m_queued_bytes{0};
+  uint64_t m_in_flight_bytes{0};
+  std::thread m_worker;
+};
+
+Preserve_trx_transfer_phase1_batch_sender::
+    Preserve_trx_transfer_phase1_batch_sender(
+        const Preserve_trx_transfer_phase1_batch_options &options,
+        Preserve_trx_transfer_phase1_batch_flush_callback flush_callback,
+        void *flush_context)
+    : m_impl(new Impl(options, flush_callback, flush_context)) {}
+
+Preserve_trx_transfer_phase1_batch_sender::~
+    Preserve_trx_transfer_phase1_batch_sender() = default;
+
+Preserve_trx_transfer_status
+Preserve_trx_transfer_phase1_batch_sender::enqueue(
+    const Preserve_trx_transfer_phase1_blob_request &request) {
+  return m_impl == nullptr ? Preserve_trx_transfer_status::INVALID_ARGUMENT
+                           : m_impl->enqueue(request);
+}
+
+Preserve_trx_transfer_status Preserve_trx_transfer_phase1_batch_sender::flush() {
+  return m_impl == nullptr ? Preserve_trx_transfer_status::INVALID_ARGUMENT
+                           : m_impl->flush();
+}
+
+void Preserve_trx_transfer_phase1_batch_sender::abort() {
+  if (m_impl != nullptr) m_impl->abort();
 }
 
 uint64_t preserve_trx_transfer_receiver_auto_prewarm_tokens_status() {
@@ -3207,8 +3565,9 @@ bool transfer_frame_batch_magic_matches(const std::string &encoded) {
                      kTransferFrameBatchMagicLength) == 0;
 }
 
-Preserve_trx_transfer_status preserve_trx_transfer_encode_frame_batch(
-    const std::vector<std::string> &encoded_frames, std::string *encoded_batch) {
+static Preserve_trx_transfer_status encode_frame_batch_with_limit(
+    const std::vector<std::string> &encoded_frames, uint64_t max_bytes,
+    std::string *encoded_batch) {
   if (encoded_batch == nullptr || encoded_frames.empty() ||
       encoded_frames.size() > kMaxTransferManifestObjects) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
@@ -3230,8 +3589,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_frame_batch(
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
     total_bytes += encoded_frame.length();
-    if (preserve_trx_transfer_max_inflight_bytes != 0 &&
-        total_bytes > preserve_trx_transfer_max_inflight_bytes) {
+    if (max_bytes != 0 && total_bytes > max_bytes) {
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
     append_u64(&out, encoded_frame.length());
@@ -3239,6 +3597,12 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_frame_batch(
   }
   *encoded_batch = std::move(out);
   return Preserve_trx_transfer_status::OK;
+}
+
+Preserve_trx_transfer_status preserve_trx_transfer_encode_frame_batch(
+    const std::vector<std::string> &encoded_frames, std::string *encoded_batch) {
+  return encode_frame_batch_with_limit(
+      encoded_frames, preserve_trx_transfer_max_inflight_bytes, encoded_batch);
 }
 
 Preserve_trx_transfer_status preserve_trx_transfer_decode_frame_batch(
@@ -4180,6 +4544,22 @@ Preserve_trx_transfer_source_epoch_session::
       m_source_server_uuid(source_server_uuid),
       m_target_server_uuid(target_server_uuid),
       m_chunk_bytes(chunk_bytes),
+      m_max_inflight_bytes(preserve_trx_transfer_max_inflight_bytes),
+      m_phase1_batch_bytes(preserve_trx_transfer_phase1_batch_bytes),
+      m_sink(sink) {}
+
+Preserve_trx_transfer_source_epoch_session::
+    Preserve_trx_transfer_source_epoch_session(
+        const std::string &epoch_id, const std::string &source_server_uuid,
+        const std::string &target_server_uuid,
+        const Preserve_trx_transfer_source_epoch_options &options,
+        Preserve_trx_transfer_encoded_frame_sink *sink)
+    : m_epoch_id(epoch_id),
+      m_source_server_uuid(source_server_uuid),
+      m_target_server_uuid(target_server_uuid),
+      m_chunk_bytes(options.chunk_bytes),
+      m_max_inflight_bytes(options.max_inflight_bytes),
+      m_phase1_batch_bytes(options.phase1_batch_bytes),
       m_sink(sink) {}
 
 bool Preserve_trx_transfer_source_epoch_session::token_declared(
@@ -4202,7 +4582,63 @@ Preserve_trx_transfer_source_epoch_session::emit_frame_locked(
     m_pending_final_metadata_frames.push_back(std::move(frame));
     return Preserve_trx_transfer_status::OK;
   }
-  return send_encoded_transfer_frame(m_sink, frame);
+  std::string encoded_frame;
+  Preserve_trx_transfer_status status =
+      preserve_trx_transfer_encode_frame(frame, &encoded_frame);
+  if (status != Preserve_trx_transfer_status::OK) return status;
+  status = m_sink->send_encoded_frame(encoded_frame);
+  if (status == Preserve_trx_transfer_status::OK &&
+      m_phase1_metrics_enabled) {
+    note_source_phase1_network_send(1, encoded_frame.length(), 1, false);
+  }
+  return status;
+}
+
+Preserve_trx_transfer_status
+Preserve_trx_transfer_source_epoch_session::send_phase1_control_batches_locked(
+    const std::vector<std::string> &encoded_frames) {
+  if (m_sink == nullptr || encoded_frames.empty()) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  const uint64_t batch_overhead =
+      kTransferFrameBatchMagicLength + sizeof(uint16_t) + sizeof(uint32_t);
+  size_t first = 0;
+  while (first < encoded_frames.size()) {
+    size_t last = first;
+    uint64_t encoded_bytes = batch_overhead;
+    while (last < encoded_frames.size()) {
+      const uint64_t frame_bytes =
+          sizeof(uint64_t) + encoded_frames[last].length();
+      if (frame_bytes > std::numeric_limits<uint64_t>::max() - encoded_bytes) {
+        return Preserve_trx_transfer_status::UNSUPPORTED;
+      }
+      const uint64_t next_bytes = encoded_bytes + frame_bytes;
+      if (last != first &&
+          (m_phase1_batch_bytes == 0 || next_bytes > m_phase1_batch_bytes)) {
+        break;
+      }
+      encoded_bytes = next_bytes;
+      ++last;
+      if (m_phase1_batch_bytes == 0 ||
+          encoded_bytes >= m_phase1_batch_bytes) {
+        break;
+      }
+    }
+    std::vector<std::string> batch(encoded_frames.begin() + first,
+                                   encoded_frames.begin() + last);
+    std::string encoded_batch;
+    Preserve_trx_transfer_status status = encode_frame_batch_with_limit(
+        batch, m_max_inflight_bytes, &encoded_batch);
+    if (status != Preserve_trx_transfer_status::OK) return status;
+    status = m_sink->send_encoded_frame(encoded_batch);
+    if (status != Preserve_trx_transfer_status::OK) return status;
+    if (m_phase1_metrics_enabled) {
+      note_source_phase1_network_send(batch.size(), encoded_batch.length(),
+                                      batch.size(), true);
+    }
+    first = last;
+  }
+  return Preserve_trx_transfer_status::OK;
 }
 
 Preserve_trx_transfer_status
@@ -4230,6 +4666,49 @@ Preserve_trx_transfer_source_epoch_session::declare_token(
       emit_frame_locked(std::move(declare), false);
   if (status != Preserve_trx_transfer_status::OK) return status;
   m_declared_tokens.insert(transfer_token);
+  return Preserve_trx_transfer_status::OK;
+}
+
+Preserve_trx_transfer_status
+Preserve_trx_transfer_source_epoch_session::declare_tokens_batch(
+    const std::vector<uint64_t> &transfer_tokens) {
+  if (transfer_tokens.empty()) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  std::lock_guard<std::mutex> guard(m_mutex);
+  if (m_sink == nullptr || m_chunk_bytes == 0 ||
+      !transfer_component_safe(m_epoch_id) ||
+      !transfer_component_safe(m_source_server_uuid) ||
+      !transfer_component_safe(m_target_server_uuid) || m_epoch_committed) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+
+  std::set<uint64_t> unique_tokens;
+  std::vector<std::string> encoded_frames;
+  encoded_frames.reserve(transfer_tokens.size());
+  for (uint64_t transfer_token : transfer_tokens) {
+    if (transfer_token == 0 || !unique_tokens.insert(transfer_token).second ||
+        token_declared(transfer_token) || token_resolved(transfer_token)) {
+      return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
+    Preserve_trx_transfer_frame declare;
+    declare.type = Preserve_trx_transfer_frame_type::DECLARE_TOKEN;
+    declare.sequence = m_next_sequence++;
+    declare.epoch_id = m_epoch_id;
+    declare.token = transfer_token;
+    declare.reason =
+        encode_declare_token_reason(m_source_server_uuid, m_target_server_uuid);
+    std::string encoded_frame;
+    Preserve_trx_transfer_status status =
+        preserve_trx_transfer_encode_frame(declare, &encoded_frame);
+    if (status != Preserve_trx_transfer_status::OK) return status;
+    encoded_frames.push_back(std::move(encoded_frame));
+  }
+
+  Preserve_trx_transfer_status status =
+      send_phase1_control_batches_locked(encoded_frames);
+  if (status != Preserve_trx_transfer_status::OK) return status;
+  m_declared_tokens.insert(unique_tokens.begin(), unique_tokens.end());
   return Preserve_trx_transfer_status::OK;
 }
 
@@ -4390,6 +4869,74 @@ Preserve_trx_transfer_source_epoch_session::begin_token_prewarm_manifest(
   if (status != Preserve_trx_transfer_status::OK) return status;
 
   m_prewarm_manifest_tokens.insert(transfer_token);
+  return Preserve_trx_transfer_status::OK;
+}
+
+Preserve_trx_transfer_status
+Preserve_trx_transfer_source_epoch_session::begin_token_prewarm_manifests_batch(
+    const std::vector<uint64_t> &transfer_tokens) {
+  if (transfer_tokens.empty()) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  std::lock_guard<std::mutex> guard(m_mutex);
+  if (m_sink == nullptr || m_chunk_bytes == 0 || m_epoch_committed) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+
+  std::vector<std::string> encoded_frames;
+  std::vector<uint64_t> newly_started;
+  encoded_frames.reserve(transfer_tokens.size());
+  newly_started.reserve(transfer_tokens.size());
+  for (uint64_t transfer_token : transfer_tokens) {
+    if (transfer_token == 0 || !token_declared(transfer_token) ||
+        token_resolved(transfer_token) ||
+        m_streaming_manifests.count(transfer_token) != 0) {
+      return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
+    if (m_prewarm_manifest_tokens.count(transfer_token) != 0) continue;
+    const auto declared_it = m_streaming_declared_objects.find(transfer_token);
+    if (declared_it == m_streaming_declared_objects.end() ||
+        declared_it->second.empty()) {
+      return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
+
+    Preserve_trx_transfer_manifest manifest;
+    manifest.epoch_id = m_epoch_id;
+    manifest.source_server_uuid = m_source_server_uuid;
+    manifest.target_server_uuid = m_target_server_uuid;
+    manifest.token = transfer_token;
+    if (!load_source_transfer_lsn_fact(&manifest.source_prepare_lsn,
+                                       &manifest.source_epoch_commit_lsn)) {
+      return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
+    manifest.objects.reserve(declared_it->second.size());
+    for (const auto &entry : declared_it->second) {
+      manifest.objects.push_back(entry.second);
+    }
+    Preserve_trx_transfer_status status =
+        validate_manifest_components(manifest, false);
+    if (status != Preserve_trx_transfer_status::OK) return status;
+    std::string manifest_payload;
+    status = preserve_trx_transfer_encode_manifest(manifest, &manifest_payload);
+    if (status != Preserve_trx_transfer_status::OK) return status;
+    Preserve_trx_transfer_frame begin;
+    begin.type = Preserve_trx_transfer_frame_type::BEGIN;
+    begin.sequence = m_next_sequence++;
+    begin.epoch_id = manifest.epoch_id;
+    begin.token = manifest.token;
+    begin.manifest_payload = std::move(manifest_payload);
+    std::string encoded_frame;
+    status = preserve_trx_transfer_encode_frame(begin, &encoded_frame);
+    if (status != Preserve_trx_transfer_status::OK) return status;
+    encoded_frames.push_back(std::move(encoded_frame));
+    newly_started.push_back(transfer_token);
+  }
+  if (encoded_frames.empty()) return Preserve_trx_transfer_status::OK;
+
+  Preserve_trx_transfer_status status =
+      send_phase1_control_batches_locked(encoded_frames);
+  if (status != Preserve_trx_transfer_status::OK) return status;
+  m_prewarm_manifest_tokens.insert(newly_started.begin(), newly_started.end());
   return Preserve_trx_transfer_status::OK;
 }
 
@@ -4794,10 +5341,15 @@ Preserve_trx_transfer_source_epoch_session::send_token_objects_batch(
 
     std::string encoded_batch;
     status =
-        preserve_trx_transfer_encode_frame_batch(encoded_frames, &encoded_batch);
+        encode_frame_batch_with_limit(encoded_frames, m_max_inflight_bytes,
+                                      &encoded_batch);
     if (status != Preserve_trx_transfer_status::OK) return status;
     status = m_sink->send_encoded_frame(encoded_batch);
     if (status != Preserve_trx_transfer_status::OK) return status;
+    if (m_phase1_metrics_enabled) {
+      note_source_phase1_network_send(encoded_frames.size(),
+                                      encoded_batch.length(), 1, true);
+    }
   }
 
   if (snapshot_bundle_bytes != 0) {
@@ -4910,6 +5462,220 @@ Preserve_trx_transfer_status stream_prebuilt_external_blob_for_transfer(
     if (status != Preserve_trx_transfer_status::OK) return status;
   }
   return session->seal_object(transfer_token, descriptor.object_id);
+}
+
+Preserve_trx_transfer_status
+Preserve_trx_transfer_source_epoch_session::stream_prebuilt_blobs_batch(
+    const std::string &preserve_dir,
+    const std::vector<Preserve_trx_transfer_phase1_blob_request> &requests) {
+  if (requests.empty()) return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+
+  struct Materialized_request {
+    Preserve_trx_transfer_phase1_blob_request request;
+    Preserve_trx_transfer_object_descriptor descriptor;
+    std::string payload;
+  };
+  const std::string source_dir =
+      preserve_dir.empty() ? preserved_trx_dir_value() : preserve_dir;
+  std::unique_ptr<Preserved_trx_warm_external_blob_carrier> warm_carrier =
+      create_preserved_trx_default_warm_external_blob_carrier(source_dir);
+  if (warm_carrier == nullptr) return Preserve_trx_transfer_status::IO_ERROR;
+
+  std::vector<Materialized_request> materialized_requests;
+  materialized_requests.reserve(requests.size());
+  for (const Preserve_trx_transfer_phase1_blob_request &request : requests) {
+    if (request.transfer_token == 0 || request.object_id.empty() ||
+        request.warmcopy_id.empty() || request.warmcopy_epoch == 0 ||
+        request.size == 0) {
+      return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+    }
+    Preserved_trx_external_blob_descriptor warm_descriptor;
+    warm_descriptor.name = request.object_id;
+    warm_descriptor.size = request.size;
+    warm_descriptor.digest = request.digest;
+    Preserved_trx_external_blob materialized;
+    const Preserved_trx_carrier_status carrier_status =
+        warm_carrier->read_warm_external_blob(
+            request.warmcopy_id, request.object_id, request.warmcopy_epoch,
+            warm_descriptor, m_max_inflight_bytes,
+            &materialized);
+    if (carrier_status != Preserved_trx_carrier_status::OK) {
+      return map_carrier_status_to_transfer(carrier_status);
+    }
+    if (materialized.payload.length() != request.size ||
+        materialized.descriptor.name != request.object_id ||
+        materialized.descriptor.size != request.size ||
+        materialized.descriptor.digest != request.digest) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
+    Materialized_request prepared;
+    prepared.request = request;
+    prepared.descriptor.object_id = request.object_id;
+    prepared.descriptor.kind =
+        Preserve_trx_transfer_object_kind::EXTERNAL_BLOB;
+    prepared.descriptor.total_size = request.size;
+    prepared.descriptor.digest = request.digest;
+    prepared.payload = std::move(materialized.payload);
+    materialized_requests.push_back(std::move(prepared));
+  }
+
+  std::lock_guard<std::mutex> guard(m_mutex);
+  if (m_sink == nullptr || m_chunk_bytes == 0 || m_epoch_committed) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  std::vector<std::string> encoded_frames;
+  std::vector<size_t> sent_request_indexes;
+  for (size_t request_index = 0;
+       request_index < materialized_requests.size(); ++request_index) {
+    const Materialized_request &prepared =
+        materialized_requests[request_index];
+    const uint64_t transfer_token = prepared.request.transfer_token;
+    if (!token_declared(transfer_token) || token_resolved(transfer_token) ||
+        m_streaming_manifests.count(transfer_token) != 0) {
+      return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
+    bool already_presealed = false;
+    const auto declared_token =
+        m_streaming_declared_objects.find(transfer_token);
+    if (declared_token != m_streaming_declared_objects.end()) {
+      const auto declared_object =
+          declared_token->second.find(prepared.descriptor.object_id);
+      const auto sealed_token = m_streaming_sealed_objects.find(transfer_token);
+      const auto written_token =
+          m_streaming_object_written_bytes.find(transfer_token);
+      if (declared_object != declared_token->second.end() &&
+          transfer_object_descriptor_equal(declared_object->second,
+                                           prepared.descriptor) &&
+          sealed_token != m_streaming_sealed_objects.end() &&
+          sealed_token->second.count(prepared.descriptor.object_id) != 0 &&
+          written_token != m_streaming_object_written_bytes.end()) {
+        const auto written_object =
+            written_token->second.find(prepared.descriptor.object_id);
+        already_presealed =
+            written_object != written_token->second.end() &&
+            written_object->second == prepared.descriptor.total_size;
+      }
+    }
+    if (already_presealed) continue;
+
+    std::string descriptor_payload;
+    Preserve_trx_transfer_status status = encode_transfer_object_descriptor(
+        prepared.descriptor, &descriptor_payload);
+    if (status != Preserve_trx_transfer_status::OK) return status;
+    Preserve_trx_transfer_frame declare;
+    declare.type = Preserve_trx_transfer_frame_type::DECLARE_OBJECT;
+    declare.sequence = m_next_sequence++;
+    declare.epoch_id = m_epoch_id;
+    declare.token = transfer_token;
+    declare.object_id = prepared.descriptor.object_id;
+    declare.manifest_payload = std::move(descriptor_payload);
+    std::string encoded_declare;
+    status = preserve_trx_transfer_encode_frame(declare, &encoded_declare);
+    if (status != Preserve_trx_transfer_status::OK) return status;
+    encoded_frames.push_back(std::move(encoded_declare));
+
+    for (uint64_t offset = 0; offset < prepared.payload.length();
+         offset += m_chunk_bytes) {
+      const size_t length = std::min<uint64_t>(
+          m_chunk_bytes, prepared.payload.length() - offset);
+      Preserve_trx_transfer_frame chunk;
+      chunk.type = Preserve_trx_transfer_frame_type::OBJECT_CHUNK;
+      chunk.sequence = m_next_sequence++;
+      chunk.epoch_id = m_epoch_id;
+      chunk.token = transfer_token;
+      chunk.object_id = prepared.descriptor.object_id;
+      chunk.chunk_offset = offset;
+      chunk.chunk_payload = prepared.payload.substr(offset, length);
+      std::string encoded_chunk;
+      status = preserve_trx_transfer_encode_frame(chunk, &encoded_chunk);
+      if (status != Preserve_trx_transfer_status::OK) return status;
+      encoded_frames.push_back(std::move(encoded_chunk));
+    }
+
+    Preserve_trx_transfer_frame seal;
+    seal.type = Preserve_trx_transfer_frame_type::SEAL_OBJECT;
+    seal.sequence = m_next_sequence++;
+    seal.epoch_id = m_epoch_id;
+    seal.token = transfer_token;
+    seal.object_id = prepared.descriptor.object_id;
+    std::string encoded_seal;
+    status = preserve_trx_transfer_encode_frame(seal, &encoded_seal);
+    if (status != Preserve_trx_transfer_status::OK) return status;
+    encoded_frames.push_back(std::move(encoded_seal));
+    sent_request_indexes.push_back(request_index);
+  }
+  if (encoded_frames.empty()) return Preserve_trx_transfer_status::OK;
+
+  std::string encoded_batch;
+  Preserve_trx_transfer_status status =
+      encode_frame_batch_with_limit(encoded_frames, m_max_inflight_bytes,
+                                    &encoded_batch);
+  if (status != Preserve_trx_transfer_status::OK) return status;
+  status = m_sink->send_encoded_frame(encoded_batch);
+  if (status != Preserve_trx_transfer_status::OK) return status;
+  if (m_phase1_metrics_enabled) {
+    note_source_phase1_network_send(encoded_frames.size(),
+                                    encoded_batch.length(),
+                                    sent_request_indexes.size(), true);
+    for (size_t request_index : sent_request_indexes) {
+      if (materialized_requests[request_index].request.object_id ==
+          kPreservedTrxBlobRecordLocks) {
+        size_t record_tokens = 0;
+        for (size_t record_index : sent_request_indexes) {
+          if (materialized_requests[record_index].request.object_id ==
+              kPreservedTrxBlobRecordLocks) {
+            ++record_tokens;
+          }
+        }
+        note_source_phase1_record_batch_sent(record_tokens);
+        break;
+      }
+    }
+  }
+
+  for (size_t request_index : sent_request_indexes) {
+    const Materialized_request &prepared =
+        materialized_requests[request_index];
+    const uint64_t transfer_token = prepared.request.transfer_token;
+    m_streaming_declared_objects[transfer_token][prepared.descriptor.object_id] =
+        prepared.descriptor;
+    m_streaming_object_written_bytes[transfer_token]
+                                    [prepared.descriptor.object_id] =
+        prepared.descriptor.total_size;
+    m_streaming_sealed_objects[transfer_token].insert(
+        prepared.descriptor.object_id);
+  }
+  return Preserve_trx_transfer_status::OK;
+}
+
+Preserve_trx_transfer_status preserve_trx_transfer_stream_prebuilt_blobs_batch(
+    Preserve_trx_transfer_source_epoch_session *session,
+    const std::string &preserve_dir,
+    const std::vector<Preserve_trx_transfer_phase1_blob_request> &requests,
+    uint64_t max_batch_bytes) {
+  if (session == nullptr || requests.empty()) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  if (max_batch_bytes == 0 ||
+      (requests.size() == 1 && requests.front().size > max_batch_bytes)) {
+    if (max_batch_bytes != 0 && requests.size() == 1 &&
+        requests.front().size > max_batch_bytes) {
+      g_transfer_phase1_oversize_token_count.fetch_add(1);
+    }
+    for (const Preserve_trx_transfer_phase1_blob_request &request : requests) {
+      const Preserve_trx_transfer_status status =
+          stream_prebuilt_external_blob_for_transfer(
+              session, request.transfer_token, preserve_dir, request.object_id,
+              request.warmcopy_id, request.warmcopy_epoch, request.size,
+              request.digest);
+      if (status != Preserve_trx_transfer_status::OK) return status;
+      if (request.object_id == kPreservedTrxBlobRecordLocks) {
+        note_source_phase1_record_batch_sent(1);
+      }
+    }
+    return Preserve_trx_transfer_status::OK;
+  }
+  return session->stream_prebuilt_blobs_batch(preserve_dir, requests);
 }
 
 Preserve_trx_transfer_status
@@ -5083,7 +5849,8 @@ Preserve_trx_transfer_source_epoch_session::commit_epoch() {
 
     std::string encoded_batch;
     status =
-        preserve_trx_transfer_encode_frame_batch(encoded_frames, &encoded_batch);
+        encode_frame_batch_with_limit(encoded_frames, m_max_inflight_bytes,
+                                      &encoded_batch);
     if (status != Preserve_trx_transfer_status::OK) return status;
     g_transfer_phase2_final_metadata_frame_count.fetch_add(
         encoded_frames.size());
@@ -5933,6 +6700,8 @@ std::set<Receiver_staged_token_prewarm_key>
     g_receiver_staged_token_prewarm_inflight;
 std::set<Receiver_staged_token_prewarm_key>
     g_receiver_staged_token_prewarm_done;
+std::set<Receiver_staged_token_prewarm_key>
+    g_receiver_staged_token_prewarm_deferred;
 std::set<Receiver_object_prewarm_key> g_receiver_object_prewarm_inflight;
 bool g_receiver_prewarm_workers_started = false;
 bool g_receiver_prewarm_shutdown = false;
@@ -6000,9 +6769,21 @@ void finish_receiver_staged_token_prewarm_job(
     const Receiver_prewarm_job &job, bool terminal) {
   Receiver_staged_token_prewarm_key key =
       receiver_staged_token_prewarm_key(job.root_dir, job.manifest);
-  std::lock_guard<std::mutex> guard(g_receiver_prewarm_mutex);
-  g_receiver_staged_token_prewarm_inflight.erase(key);
-  if (terminal) g_receiver_staged_token_prewarm_done.insert(std::move(key));
+  bool notify_retry = false;
+  {
+    std::lock_guard<std::mutex> guard(g_receiver_prewarm_mutex);
+    g_receiver_staged_token_prewarm_inflight.erase(key);
+    const bool deferred =
+        g_receiver_staged_token_prewarm_deferred.erase(key) != 0;
+    if (terminal) {
+      g_receiver_staged_token_prewarm_done.insert(std::move(key));
+    } else if (deferred) {
+      g_receiver_staged_token_prewarm_inflight.insert(key);
+      g_receiver_prewarm_jobs.push_back(job);
+      notify_retry = true;
+    }
+  }
+  if (notify_retry) g_receiver_prewarm_cv.notify_one();
 }
 
 void finish_receiver_object_prewarm_job(
@@ -6455,8 +7236,11 @@ Preserve_trx_transfer_status enqueue_receiver_prewarm_job(
     if (job.kind == Receiver_prewarm_job_kind::STAGED_TOKEN) {
       Receiver_staged_token_prewarm_key key =
           receiver_staged_token_prewarm_key(job.root_dir, job.manifest);
-      if (g_receiver_staged_token_prewarm_done.count(key) != 0 ||
-          g_receiver_staged_token_prewarm_inflight.count(key) != 0) {
+      if (g_receiver_staged_token_prewarm_done.count(key) != 0) {
+        return Preserve_trx_transfer_status::OK;
+      }
+      if (g_receiver_staged_token_prewarm_inflight.count(key) != 0) {
+        g_receiver_staged_token_prewarm_deferred.insert(std::move(key));
         return Preserve_trx_transfer_status::OK;
       }
       g_receiver_staged_token_prewarm_inflight.insert(std::move(key));
@@ -6548,6 +7332,7 @@ void preserve_trx_transfer_shutdown_receiver_prewarm_workers() {
     g_receiver_prewarm_jobs.clear();
     g_receiver_staged_token_prewarm_inflight.clear();
     g_receiver_staged_token_prewarm_done.clear();
+    g_receiver_staged_token_prewarm_deferred.clear();
     g_receiver_object_prewarm_inflight.clear();
     g_receiver_prewarm_shutdown = false;
   }
@@ -6931,11 +7716,8 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
           if (registry->lookup(frame.epoch_id, frame.token, &sealed_record)) {
             const Preserve_trx_transfer_manifest sealed_manifest =
                 receiver_record_manifest(sealed_record);
-            if (sealed_record.state ==
-                Preserve_trx_transfer_receiver_state::RECEIVING) {
-              status = enqueue_receiver_object_prewarm(
-                  root_dir, sealed_manifest, frame.object_id, registry);
-            }
+            status = enqueue_receiver_object_prewarm(
+                root_dir, sealed_manifest, frame.object_id, registry);
             if (status == Preserve_trx_transfer_status::OK &&
                 transfer_manifest_has_snapshot_bundle(sealed_manifest) &&
                 registry->all_objects_sealed(frame.epoch_id, frame.token)) {

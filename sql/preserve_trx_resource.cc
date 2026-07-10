@@ -569,6 +569,51 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_phase1_business_enqueue_block_us,
     preserve_trx_transfer_phase1_business_enqueue_block_us_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_phase1_frame_count,
+    preserve_trx_transfer_phase1_frame_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_phase1_network_send_count,
+    preserve_trx_transfer_phase1_network_send_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_phase1_batch_count,
+    preserve_trx_transfer_phase1_batch_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_phase1_batch_bytes_p50,
+    preserve_trx_transfer_phase1_batch_bytes_p50_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_phase1_batch_bytes_p95,
+    preserve_trx_transfer_phase1_batch_bytes_p95_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_phase1_batch_bytes_max,
+    preserve_trx_transfer_phase1_batch_bytes_max_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_phase1_batch_tokens_p50,
+    preserve_trx_transfer_phase1_batch_tokens_p50_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_phase1_batch_tokens_p95,
+    preserve_trx_transfer_phase1_batch_tokens_p95_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_phase1_batch_tokens_max,
+    preserve_trx_transfer_phase1_batch_tokens_max_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_phase1_record_batch_tokens_avg,
+    preserve_trx_transfer_phase1_record_batch_tokens_avg_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_phase1_batch_linger_us_p95,
+    preserve_trx_transfer_phase1_batch_linger_us_p95_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_phase1_batch_linger_us_max,
+    preserve_trx_transfer_phase1_batch_linger_us_max_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_phase1_oversize_token_count,
+    preserve_trx_transfer_phase1_oversize_token_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_phase1_record_first_batch_send_us,
+    preserve_trx_transfer_phase1_record_first_batch_send_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_phase1_record_last_batch_send_us,
+    preserve_trx_transfer_phase1_record_last_batch_send_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_ready_after_final_metadata_us,
     preserve_trx_transfer_receiver_ready_after_final_metadata_us_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(

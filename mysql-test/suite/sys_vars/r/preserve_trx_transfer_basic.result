@@ -1,1 +1,15 @@
+@@GLOBAL.preserve_trx_transfer_phase1_batch_bytes
+4194304
+@@GLOBAL.preserve_trx_transfer_phase1_batch_linger_ms
+20
+phase1_batch_status_count
+15
+@@GLOBAL.preserve_trx_transfer_phase1_batch_bytes
+8388608
+@@GLOBAL.preserve_trx_transfer_phase1_batch_linger_ms
+50
+@@GLOBAL.preserve_trx_transfer_phase1_batch_bytes
+67108864
+@@GLOBAL.preserve_trx_transfer_phase1_batch_linger_ms
+1000
 ok

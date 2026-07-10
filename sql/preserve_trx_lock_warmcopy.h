@@ -25,6 +25,7 @@
 #define SQL_PRESERVE_TRX_LOCK_WARMCOPY_INCLUDED
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -323,7 +324,10 @@ class Preserve_trx_lock_warmcopy_drain_participant final
   bool prepare_phase1_idle_target(THD *target);
   bool prepare_phase1_record_scan_target(THD *target,
                                          bool active_scan = false);
-  bool prepare_phase1_record_store_targets();
+  using Phase1_record_blob_ready_callback =
+      std::function<bool(uint64_t, const PrebuiltRecordLocksBlob &)>;
+  bool prepare_phase1_record_store_targets(
+      const Phase1_record_blob_ready_callback &blob_ready = {});
   bool prepare_quiesced_targets(const std::vector<uint64_t> &thread_ids);
   bool prepare_quiesced_targets_for_unit_test(
       const std::vector<uint64_t> &thread_ids);
