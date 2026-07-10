@@ -81,7 +81,7 @@ char *preserve_trx_transfer_credential_name = nullptr;
 char *preserve_trx_transfer_credential_secret_file = nullptr;
 ulong preserve_trx_transfer_artifact_mode =
     PRESERVE_TRX_TRANSFER_ARTIFACT_LOCAL_CARRIER;
-uint preserve_trx_transfer_receiver_workers = 3;
+uint preserve_trx_transfer_receiver_workers = 8;
 uint preserve_trx_transfer_chunk_bytes = 1048576;
 ulonglong preserve_trx_transfer_max_inflight_bytes = 1073741824ULL;
 uint preserve_trx_transfer_commit_timeout_ms = 30000;

@@ -1485,7 +1485,7 @@ static Sys_var_uint Sys_preserve_trx_transfer_receiver_workers(
     "batch receiver payload path. classic single-frame dispatch still validates "
     "and stages one command frame on the dispatching session.",
     GLOBAL_VAR(preserve_trx_transfer_receiver_workers),
-    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 1024), DEFAULT(3), BLOCK_SIZE(1),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 1024), DEFAULT(8), BLOCK_SIZE(1),
     NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
 static Sys_var_uint Sys_preserve_trx_transfer_chunk_bytes(
