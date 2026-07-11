@@ -300,6 +300,7 @@ Preserve_trx_final_token_facts make_final_token_facts(uint64_t lsn) {
   facts.final_lock_generation_digest.assign(64, 'b');
   facts.page_layout_digest.assign(64, 'c');
   facts.dictionary_generation_digest.assign(64, 'd');
+  facts.prewarm_object_set_digest.assign(64, 'e');
   facts.target_boot_incarnation = "boot-1";
   facts.record_lock_unique_pages = 0;
   facts.record_lock_bitmap_entries = 0;
@@ -422,6 +423,68 @@ TEST(PreservedTrxPreparedRegistry,
   prepare = {};
   registry.purge_epoch(key.source_uuid, key.epoch_id);
   EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry, PrewarmResourcesWaitForFinalFacts) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &prepare));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_prewarmed(
+                &prepare, std::string(64, 'e'),
+                acquire_prepared_resources(key)));
+
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::
+                PREWARMED_PENDING_FINAL_FACT,
+            snapshot.state);
+  EXPECT_TRUE(snapshot.facts.canonical_digest.empty());
+  EXPECT_EQ(Preserve_trx_prepared_status::INVALID_STATE,
+            registry.mark_ready_for_gate(key, 1));
+
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.bind_final_facts(key, 1,
+                                      make_final_token_facts(100)));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::READY_FACTS_PENDING_LEASE,
+            snapshot.state);
+  EXPECT_EQ(std::string(64, 'e'),
+            snapshot.facts.prewarm_object_set_digest);
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry, StaleFinalFactsCannotBindNewGeneration) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(2);
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 2, &prepare));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_prewarmed(
+                &prepare, std::string(64, 'e'),
+                acquire_prepared_resources(key)));
+  auto stale_key = key;
+  stale_key.generation = 1;
+  EXPECT_EQ(Preserve_trx_prepared_status::STALE_GENERATION,
+            registry.bind_final_facts(stale_key, 1,
+                                      make_final_token_facts(100)));
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::
+                PREWARMED_PENDING_FINAL_FACT,
+            snapshot.state);
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
   preserve_trx_resource_manager_reset_for_unit_test();
 }
 

@@ -182,6 +182,7 @@ struct Preserve_trx_final_token_facts {
   std::string final_lock_generation_digest;
   std::string page_layout_digest;
   std::string dictionary_generation_digest;
+  std::string prewarm_object_set_digest;
   std::string target_boot_incarnation;
   uint64_t record_lock_unique_pages{0};
   uint64_t record_lock_bitmap_entries{0};
@@ -372,6 +373,13 @@ class Preserve_trx_prepared_token_registry {
   Preserve_trx_prepared_status publish_ready(
       Preserve_trx_prepare_lease *lease, Preserve_trx_final_token_facts facts,
       Preserve_trx_prepared_token_resources resources);
+  Preserve_trx_prepared_status publish_prewarmed(
+      Preserve_trx_prepare_lease *lease,
+      const std::string &prewarm_object_set_digest,
+      Preserve_trx_prepared_token_resources resources);
+  Preserve_trx_prepared_status bind_final_facts(
+      const Preserve_trx_prepared_token_key &key,
+      uint64_t expected_generation, Preserve_trx_final_token_facts facts);
   Preserve_trx_prepared_status mark_ready_for_gate(
       const Preserve_trx_prepared_token_key &key,
       uint64_t expected_generation);

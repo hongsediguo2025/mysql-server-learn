@@ -59,6 +59,7 @@ struct Preserve_trx_prepared_token_entry {
   Preserve_trx_prepared_token_key key;
   std::shared_ptr<const Preserve_trx_prepared_token_publication> publication;
   Preserve_trx_prepared_token_resources resources;
+  std::string prewarm_object_set_digest;
   bool preparing{false};
   bool retired_from_registry{false};
   uint64_t preparing_generation{0};
@@ -290,6 +291,7 @@ bool final_token_facts_are_valid(const Preserve_trx_final_token_facts &facts) {
          digest_is_sha256_hex(facts.final_lock_generation_digest) &&
          digest_is_sha256_hex(facts.page_layout_digest) &&
          digest_is_sha256_hex(facts.dictionary_generation_digest) &&
+         digest_is_sha256_hex(facts.prewarm_object_set_digest) &&
          !facts.target_boot_incarnation.empty() && facts.semantic_validated &&
          facts.lock_plan_ready && facts.binlog_handle_ready &&
          facts.resources_reserved && facts.epoch_prepare_deadline_us != 0 &&
@@ -518,6 +520,8 @@ bool preserved_trx_finalize_token_facts(
       !append_canonical_string(&canonical, facts->page_layout_digest) ||
       !append_canonical_string(&canonical,
                                facts->dictionary_generation_digest) ||
+      !append_canonical_string(&canonical,
+                               facts->prewarm_object_set_digest) ||
       !append_canonical_string(&canonical,
                                facts->target_boot_incarnation)) {
     return false;
@@ -919,33 +923,29 @@ Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::begin_prepare
 Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::publish_ready(
     Preserve_trx_prepare_lease *lease, Preserve_trx_final_token_facts facts,
     Preserve_trx_prepared_token_resources resources) {
-  const bool has_record_lock_facts =
-      facts.record_lock_unique_pages != 0 ||
-      facts.record_lock_bitmap_entries != 0 || facts.record_lock_bits != 0;
-  const lock_preserve_metadata_plan_t *record_lock_plan =
-      resources.m_impl == nullptr ? nullptr
-                                  : resources.m_impl->record_lock_plan.get();
+  if (lease == nullptr || !lease->active()) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  const Preserve_trx_prepared_token_key key = lease->m_key;
+  const uint64_t generation = key.generation;
+  const std::string prewarm_digest = facts.prewarm_object_set_digest;
+  const auto prewarm_status = publish_prewarmed(
+      lease, prewarm_digest, std::move(resources));
+  if (prewarm_status != Preserve_trx_prepared_status::OK &&
+      prewarm_status != Preserve_trx_prepared_status::IDEMPOTENT) {
+    return prewarm_status;
+  }
+  return bind_final_facts(key, generation, std::move(facts));
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::publish_prewarmed(
+    Preserve_trx_prepare_lease *lease,
+    const std::string &prewarm_object_set_digest,
+    Preserve_trx_prepared_token_resources resources) {
   if (lease == nullptr || !lease->active() || lease->m_entry == nullptr ||
-      !resources.acquired() || !preserved_trx_finalize_token_facts(&facts) ||
-      facts.target_boot_incarnation !=
-          lease->m_key.target_boot_incarnation ||
-      facts.lock_plan_capacity_bytes != resources.lock_plan_bytes() ||
-      facts.native_binlog_capacity_bytes != resources.native_binlog_bytes() ||
-      (has_record_lock_facts &&
-       (record_lock_plan == nullptr || !record_lock_plan->ready() ||
-        facts.record_lock_unique_pages > record_lock_plan->entry_count() ||
-        facts.record_lock_bitmap_entries != record_lock_plan->entry_count() ||
-        facts.record_lock_bits != record_lock_plan->bitmap_bits() ||
-        facts.lock_plan_capacity_bytes != record_lock_plan->capacity_bytes())) ||
-      (!has_record_lock_facts && record_lock_plan != nullptr) ||
-      (facts.binlog_cache_present &&
-       (!facts.binlog_handle_ready ||
-        !resources.has_native_binlog_handle() ||
-        !resources.m_impl->native_binlog_handle->matches(
-            prepared_binlog_identity(lease->m_key),
-            facts.binlog_handle_digest, facts.binlog_cache_length,
-            facts.binlog_cache_file_backed))) ||
-      (!facts.binlog_cache_present && resources.has_native_binlog_handle())) {
+      !resources.acquired() ||
+      !digest_is_sha256_hex(prewarm_object_set_digest)) {
     return Preserve_trx_prepared_status::INVALID_ARGUMENT;
   }
 
@@ -955,48 +955,121 @@ Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::publish_ready
     std::lock_guard<std::mutex> guard(lease->m_entry->mutex);
     if (!lease->m_entry->preparing ||
         lease->m_entry->preparing_generation != lease->m_key.generation) {
-      lease->m_active = false;
-      lease->m_entry.reset();
-      lease->m_registry.reset();
-      return Preserve_trx_prepared_status::STALE_GENERATION;
-    }
-    const auto current = std::atomic_load_explicit(
-        &lease->m_entry->publication, std::memory_order_acquire);
-    if (current != nullptr &&
-        current->key.generation > lease->m_key.generation) {
       status = Preserve_trx_prepared_status::STALE_GENERATION;
-    } else if (current != nullptr &&
-               current->key.generation == lease->m_key.generation) {
-      if (current->facts.canonical_digest == facts.canonical_digest) {
-        status = Preserve_trx_prepared_status::IDEMPOTENT;
-      } else {
-        lease->m_entry->state.store(Preserve_trx_prepared_token_state::CORRUPT,
-                                    std::memory_order_release);
-        retired_resources = std::move(lease->m_entry->resources);
-        status = Preserve_trx_prepared_status::DIGEST_CONFLICT;
-      }
     } else {
-      auto publication =
-          std::make_shared<const Preserve_trx_prepared_token_publication>(
-              Preserve_trx_prepared_token_publication{lease->m_key,
-                                                       std::move(facts)});
-      retired_resources = std::move(lease->m_entry->resources);
-      lease->m_entry->resources = std::move(resources);
-      lease->m_entry->key = lease->m_key;
-      std::atomic_store_explicit(&lease->m_entry->publication,
-                                 std::move(publication),
-                                 std::memory_order_release);
-      lease->m_entry->state.store(
-          Preserve_trx_prepared_token_state::READY_FACTS_PENDING_LEASE,
-          std::memory_order_release);
+      if (lease->m_entry->resources.acquired()) {
+        if (lease->m_entry->key.generation == lease->m_key.generation &&
+            lease->m_entry->prewarm_object_set_digest ==
+                prewarm_object_set_digest) {
+          status = Preserve_trx_prepared_status::IDEMPOTENT;
+        } else {
+          lease->m_entry->state.store(
+              Preserve_trx_prepared_token_state::CORRUPT,
+              std::memory_order_release);
+          retired_resources = std::move(lease->m_entry->resources);
+          status = Preserve_trx_prepared_status::DIGEST_CONFLICT;
+        }
+      } else {
+        lease->m_entry->resources = std::move(resources);
+        lease->m_entry->key = lease->m_key;
+        lease->m_entry->prewarm_object_set_digest = prewarm_object_set_digest;
+        lease->m_entry->state.store(
+            Preserve_trx_prepared_token_state::PREWARMED_PENDING_FINAL_FACT,
+            std::memory_order_release);
+      }
+      lease->m_entry->preparing = false;
+      lease->m_entry->preparing_generation = 0;
     }
-    lease->m_entry->preparing = false;
-    lease->m_entry->preparing_generation = 0;
   }
   lease->m_active = false;
   lease->m_entry.reset();
   lease->m_registry.reset();
   return status;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::bind_final_facts(
+    const Preserve_trx_prepared_token_key &key,
+    uint64_t expected_generation, Preserve_trx_final_token_facts facts) {
+  if (!prepared_token_key_is_valid(key) || expected_generation == 0 ||
+      expected_generation != key.generation ||
+      !preserved_trx_finalize_token_facts(&facts) ||
+      facts.target_boot_incarnation != key.target_boot_incarnation) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  auto entry = find_prepared_entry(m_state, key);
+  if (entry == nullptr) return Preserve_trx_prepared_status::NOT_FOUND;
+
+  Preserve_trx_prepared_token_resources retired_resources;
+  {
+    std::lock_guard<std::mutex> guard(entry->mutex);
+    if (entry->key.generation != expected_generation ||
+        entry->key.preserve_dir != key.preserve_dir ||
+        entry->key.target_boot_incarnation != key.target_boot_incarnation) {
+      return Preserve_trx_prepared_status::STALE_GENERATION;
+    }
+    const auto current = std::atomic_load_explicit(
+        &entry->publication, std::memory_order_acquire);
+    if (current != nullptr) {
+      if (current->key.generation == expected_generation &&
+          current->facts.canonical_digest == facts.canonical_digest) {
+        return Preserve_trx_prepared_status::IDEMPOTENT;
+      }
+      entry->state.store(Preserve_trx_prepared_token_state::CORRUPT,
+                         std::memory_order_release);
+      retired_resources = std::move(entry->resources);
+      return Preserve_trx_prepared_status::DIGEST_CONFLICT;
+    }
+    if (entry->state.load(std::memory_order_acquire) !=
+            Preserve_trx_prepared_token_state::
+                PREWARMED_PENDING_FINAL_FACT ||
+        !entry->resources.acquired() ||
+        entry->prewarm_object_set_digest !=
+            facts.prewarm_object_set_digest) {
+      return Preserve_trx_prepared_status::INVALID_STATE;
+    }
+
+    const bool has_record_lock_facts =
+        facts.record_lock_unique_pages != 0 ||
+        facts.record_lock_bitmap_entries != 0 || facts.record_lock_bits != 0;
+    const lock_preserve_metadata_plan_t *record_lock_plan =
+        entry->resources.m_impl == nullptr
+            ? nullptr
+            : entry->resources.m_impl->record_lock_plan.get();
+    if (facts.lock_plan_capacity_bytes !=
+            entry->resources.lock_plan_bytes() ||
+        facts.native_binlog_capacity_bytes !=
+            entry->resources.native_binlog_bytes() ||
+        (has_record_lock_facts &&
+         (record_lock_plan == nullptr || !record_lock_plan->ready() ||
+          facts.record_lock_unique_pages > record_lock_plan->entry_count() ||
+          facts.record_lock_bitmap_entries !=
+              record_lock_plan->entry_count() ||
+          facts.record_lock_bits != record_lock_plan->bitmap_bits() ||
+          facts.lock_plan_capacity_bytes !=
+              record_lock_plan->capacity_bytes())) ||
+        (!has_record_lock_facts && record_lock_plan != nullptr) ||
+        (facts.binlog_cache_present &&
+         (!facts.binlog_handle_ready ||
+          !entry->resources.has_native_binlog_handle() ||
+          !entry->resources.m_impl->native_binlog_handle->matches(
+              prepared_binlog_identity(key), facts.binlog_handle_digest,
+              facts.binlog_cache_length, facts.binlog_cache_file_backed))) ||
+        (!facts.binlog_cache_present &&
+         entry->resources.has_native_binlog_handle())) {
+      return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+    }
+
+    auto publication =
+        std::make_shared<const Preserve_trx_prepared_token_publication>(
+            Preserve_trx_prepared_token_publication{key, std::move(facts)});
+    std::atomic_store_explicit(&entry->publication, std::move(publication),
+                               std::memory_order_release);
+    entry->state.store(
+        Preserve_trx_prepared_token_state::READY_FACTS_PENDING_LEASE,
+        std::memory_order_release);
+  }
+  return Preserve_trx_prepared_status::OK;
 }
 
 Preserve_trx_prepared_status
