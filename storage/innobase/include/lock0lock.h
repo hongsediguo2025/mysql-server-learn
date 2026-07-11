@@ -751,6 +751,25 @@ struct lock_preserve_metadata_plan_validation_t {
   bool is_final_quiesced{false};
 };
 
+struct lock_preserve_record_lock_metadata_facts_t {
+  std::string final_lock_generation_digest;
+  std::string page_layout_digest;
+  std::string dictionary_generation_digest;
+  uint64_t unique_pages{0};
+  uint64_t bitmap_entries{0};
+  uint64_t bitmap_bits{0};
+  bool predicate_lock_present{false};
+  bool wait_lock_present{false};
+  bool record_image_present{false};
+};
+
+/** Derive canonical final-lock, page-layout, and dictionary identity facts from
+an exported record-lock payload without reading any InnoDB page. */
+lock_preserve_metadata_plan_status
+lock_preserve_build_record_lock_metadata_facts(
+    const std::string &payload,
+    lock_preserve_record_lock_metadata_facts_t *facts);
+
 struct lock_preserve_metadata_dict_lease_ops_t {
   void *context{nullptr};
   bool (*acquire)(void *context, table_id_t table_id,

@@ -299,6 +299,47 @@ TEST(LockWarmcopyMetadataPlan, AcceptsFinalStablePagePayloadWithoutPageIo) {
   EXPECT_GT(plan.capacity_bytes(), bitmap.size());
 }
 
+TEST(LockWarmcopyMetadataPlan,
+     FinalFactsSeparateLockBitsFromPageAndDictionaryIdentity) {
+  const std::string first_payload = make_metadata_record_lock_payload(
+      LOCK_REC | LOCK_X, 16, std::string(2, '\x02'));
+  lock_preserve_record_lock_metadata_facts_t first;
+  ASSERT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_facts(first_payload,
+                                                           &first));
+  EXPECT_EQ(1U, first.bitmap_entries);
+  EXPECT_EQ(2U, first.bitmap_bits);
+  EXPECT_EQ(1U, first.unique_pages);
+  EXPECT_EQ(64U, first.final_lock_generation_digest.size());
+  EXPECT_EQ(64U, first.page_layout_digest.size());
+  EXPECT_EQ(64U, first.dictionary_generation_digest.size());
+  EXPECT_FALSE(first.predicate_lock_present);
+  EXPECT_FALSE(first.wait_lock_present);
+  EXPECT_FALSE(first.record_image_present);
+
+  const std::string changed_bitmap = make_metadata_record_lock_payload(
+      LOCK_REC | LOCK_X, 16, std::string(2, '\x04'));
+  lock_preserve_record_lock_metadata_facts_t bitmap_facts;
+  ASSERT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_facts(changed_bitmap,
+                                                           &bitmap_facts));
+  EXPECT_NE(first.final_lock_generation_digest,
+            bitmap_facts.final_lock_generation_digest);
+  EXPECT_EQ(first.page_layout_digest, bitmap_facts.page_layout_digest);
+  EXPECT_EQ(first.dictionary_generation_digest,
+            bitmap_facts.dictionary_generation_digest);
+
+  const std::string changed_layout = make_metadata_record_lock_payload(
+      LOCK_REC | LOCK_X, 24, std::string(3, '\x02'));
+  lock_preserve_record_lock_metadata_facts_t layout_facts;
+  ASSERT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_facts(changed_layout,
+                                                           &layout_facts));
+  EXPECT_NE(first.page_layout_digest, layout_facts.page_layout_digest);
+  EXPECT_EQ(first.dictionary_generation_digest,
+            layout_facts.dictionary_generation_digest);
+}
+
 TEST(LockWarmcopyMetadataPlan, RejectsNonFinalAndColdIdentityPayloads) {
   constexpr uint32_t kRecordBitmapMargin = 64;
   const uint32_t page_n_heap = 16;

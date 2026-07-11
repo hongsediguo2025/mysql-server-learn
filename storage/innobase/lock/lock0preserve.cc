@@ -25,8 +25,10 @@ as published by the Free Software Foundation.
 #include <functional>
 #include <limits>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -2028,6 +2030,58 @@ bool lock_preserve_metadata_deadline_expired(uint64_t deadline_us) {
 }
 
 }  // namespace
+
+lock_preserve_metadata_plan_status
+lock_preserve_build_record_lock_metadata_facts(
+    const std::string &payload,
+    lock_preserve_record_lock_metadata_facts_t *facts) {
+  if (facts == nullptr || payload.empty()) {
+    return lock_preserve_metadata_plan_status::INVALID_ARGUMENT;
+  }
+  *facts = {};
+  std::vector<Preserve_record_lock_entry> entries;
+  if (lock_preserve_parse_record_locks_payload(payload, &entries, true) !=
+      DB_SUCCESS) {
+    return lock_preserve_metadata_plan_status::CORRUPT_METADATA;
+  }
+  lock_preserve_sort_record_lock_entries_for_import(&entries);
+
+  std::string page_identity("PTRX_PAGE_LAYOUT_V1");
+  std::string dictionary_identity("PTRX_DICTIONARY_GENERATION_V1");
+  std::set<std::tuple<table_id_t, space_index_t, space_id_t, page_no_t>> pages;
+  std::set<std::tuple<table_id_t, space_index_t, space_id_t>> indexes;
+  for (const Preserve_record_lock_entry &entry : entries) {
+    facts->predicate_lock_present |= lock_preserve_entry_is_predicate(entry);
+    facts->wait_lock_present |= (entry.type_mode & LOCK_WAIT) != 0;
+    facts->record_image_present |= !entry.record_images.empty();
+    ++facts->bitmap_entries;
+    facts->bitmap_bits += entry.set_bits;
+
+    const auto page = std::make_tuple(entry.table_id, entry.index_id,
+                                      entry.space_id, entry.page_no);
+    if (pages.insert(page).second) {
+      lock_preserve_append_le64(&page_identity, entry.table_id);
+      lock_preserve_append_le64(&page_identity, entry.index_id);
+      lock_preserve_append_le32(&page_identity, entry.space_id);
+      lock_preserve_append_le32(&page_identity, entry.page_no);
+      lock_preserve_append_le64(&page_identity, entry.page_lsn);
+      lock_preserve_append_le32(&page_identity, entry.page_n_heap);
+    }
+    const auto index =
+        std::make_tuple(entry.table_id, entry.index_id, entry.space_id);
+    if (indexes.insert(index).second) {
+      lock_preserve_append_le64(&dictionary_identity, entry.table_id);
+      lock_preserve_append_le64(&dictionary_identity, entry.index_id);
+      lock_preserve_append_le32(&dictionary_identity, entry.space_id);
+    }
+  }
+  facts->unique_pages = pages.size();
+  facts->final_lock_generation_digest = lock_preserve_sha256_hex(payload);
+  facts->page_layout_digest = lock_preserve_sha256_hex(page_identity);
+  facts->dictionary_generation_digest =
+      lock_preserve_sha256_hex(dictionary_identity);
+  return lock_preserve_metadata_plan_status::OK;
+}
 
 class lock_preserve_metadata_plan_t::Impl {
  public:
