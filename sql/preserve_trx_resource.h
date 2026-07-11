@@ -52,6 +52,10 @@ enum class Preserve_trx_memory_kind {
     manager kind.
   */
   BINLOG_WARMCOPY_BUFFER,
+  /* Immutable record-lock metadata plan prepared for a strict promotion. */
+  PROMOTION_LOCK_PLAN,
+  /* Native binlog cache manager/buffer prepared before connection attach. */
+  PROMOTION_BINLOG_NATIVE_CACHE,
   /* Snapshot encode/decode working memory. */
   SNAPSHOT_CODEC_BUFFER
 };
@@ -297,6 +301,64 @@ int show_preserve_trx_promotion_prewarm_record_lock_resident_pages(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_promotion_prewarm_record_lock_cold_page_gets(
     THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_promotion_resume_core_elapsed_us(THD *thd,
+                                                       SHOW_VAR *var,
+                                                       char *buf);
+int show_preserve_trx_promotion_resume_core_count(THD *thd, SHOW_VAR *var,
+                                                  char *buf);
+int show_preserve_trx_promotion_resume_core_p50_us(THD *thd, SHOW_VAR *var,
+                                                   char *buf);
+int show_preserve_trx_promotion_resume_core_p95_us(THD *thd, SHOW_VAR *var,
+                                                   char *buf);
+int show_preserve_trx_promotion_resume_core_p99_us(THD *thd, SHOW_VAR *var,
+                                                   char *buf);
+int show_preserve_trx_promotion_resume_core_max_us(THD *thd, SHOW_VAR *var,
+                                                   char *buf);
+int show_preserve_trx_promotion_resume_failure_count(THD *thd, SHOW_VAR *var,
+                                                     char *buf);
+int show_preserve_trx_promotion_fence_lease_wait_us(THD *thd, SHOW_VAR *var,
+                                                    char *buf);
+int show_preserve_trx_promotion_fence_digest_compare_us(THD *thd,
+                                                        SHOW_VAR *var,
+                                                        char *buf);
+int show_preserve_trx_promotion_lock_page_get_count(THD *thd, SHOW_VAR *var,
+                                                    char *buf);
+int show_preserve_trx_promotion_lock_page_get_us(THD *thd, SHOW_VAR *var,
+                                                 char *buf);
+int show_preserve_trx_promotion_lock_image_resolves(THD *thd, SHOW_VAR *var,
+                                                    char *buf);
+int show_preserve_trx_promotion_lock_apply_us(THD *thd, SHOW_VAR *var,
+                                              char *buf);
+int show_preserve_trx_promotion_lock_accounting_bits(THD *thd,
+                                                     SHOW_VAR *var,
+                                                     char *buf);
+int show_preserve_trx_receiver_lock_plan_capacity_bytes(THD *thd,
+                                                        SHOW_VAR *var,
+                                                        char *buf);
+int show_preserve_trx_receiver_lock_plan_epoch_peak_bytes(THD *thd,
+                                                          SHOW_VAR *var,
+                                                          char *buf);
+int show_preserve_trx_receiver_lock_plan_subpool_cap_bytes(THD *thd,
+                                                          SHOW_VAR *var,
+                                                          char *buf);
+int show_preserve_trx_resource_admission_open_failed_count(THD *thd,
+                                                           SHOW_VAR *var,
+                                                           char *buf);
+int show_preserve_trx_resume_binlog_payload_read_bytes(THD *thd,
+                                                       SHOW_VAR *var,
+                                                       char *buf);
+int show_preserve_trx_resume_binlog_payload_write_bytes(THD *thd,
+                                                        SHOW_VAR *var,
+                                                        char *buf);
+int show_preserve_trx_resume_binlog_rename_count(THD *thd, SHOW_VAR *var,
+                                                 char *buf);
+int show_preserve_trx_resume_physical_consistency_mode(THD *thd,
+                                                       SHOW_VAR *var,
+                                                       char *buf);
+int show_preserve_trx_resume_real_redo_apply(THD *thd, SHOW_VAR *var,
+                                             char *buf);
+int show_preserve_trx_resume_real_ha_promotion(THD *thd, SHOW_VAR *var,
+                                               char *buf);
 int show_preserve_trx_transfer_receiver_auto_prewarm_tokens(THD *thd,
                                                             SHOW_VAR *var,
                                                             char *buf);

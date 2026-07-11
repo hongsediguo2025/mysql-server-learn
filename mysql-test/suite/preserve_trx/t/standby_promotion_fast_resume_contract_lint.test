@@ -1,0 +1,67 @@
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+# Source-shape contract only. Runtime behavior is covered by GUnit and targeted
+# promotion/transfer MTR tests.
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_source {
+  my ($path) = @_;
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $source = do { local $/; <$fh> };
+  close($fh);
+  return $source;
+}
+
+my $prepared = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_promotion_prepared.cc'));
+my $prepared_h = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_promotion_prepared.h'));
+my $promotion = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_promotion.cc'));
+my $transfer = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_transfer.cc'));
+my $preserve = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx.cc'));
+my $sys_vars = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'sys_vars.cc'));
+my $mysqld = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'mysqld.cc'));
+
+die "strict production fence path must stay unreachable before P4\n"
+  if $promotion =~ /preserved_trx_acquire_production_physical_fence_lease/ ||
+     $transfer =~ /preserved_trx_acquire_production_physical_fence_lease/ ||
+     $preserve =~ /preserved_trx_acquire_production_physical_fence_lease/;
+
+die "test physical-fence provider must not be a production fallback\n"
+  unless $prepared =~ /g_production_provider_registered/ &&
+         $prepared =~ /g_test_provider_registered/ &&
+         $prepared =~ /MISSING_PROVIDER/;
+
+die "P0 strict contract module must not read InnoDB pages\n"
+  if $prepared =~ /buf_page_get|btr_cur_|row_search|record_image_resolve/;
+
+die "P0 strict contract module must not touch binlog cache internals\n"
+  if $prepared =~ /binlog_cache_mngr|register_binlog_handler|IO_CACHE|my_b_read/;
+
+die "strict physical-fence controls must not become public sysvars\n"
+  if $sys_vars =~ /preserve_trx_physical_consistency_mode|physical_fence_provider/;
+
+die "strict proof must require exact LSN equality and immutable digests\n"
+  unless $prepared =~ /target_frozen_lsn == proof\.source_fence_lsn/ &&
+         $prepared_h =~ /final_lock_generation_digest/ &&
+         $prepared_h =~ /page_layout_digest/ &&
+         $prepared_h =~ /dictionary_generation_digest/;
+
+die "fast-resume evidence must be exposed as server-owned status\n"
+  unless $mysqld =~ /Preserve_trx_promotion_resume_core_p95_us/ &&
+         $mysqld =~ /Preserve_trx_promotion_lock_page_get_count/ &&
+         $mysqld =~ /Preserve_trx_resume_binlog_payload_read_bytes/;
+EOF
+
+SELECT 'ok' AS standby_promotion_fast_resume_contract_lint;

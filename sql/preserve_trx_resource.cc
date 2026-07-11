@@ -33,6 +33,7 @@
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_lock_warmcopy.h"
 #include "sql/preserve_trx_promotion.h"
+#include "sql/preserve_trx_promotion_prepared.h"
 #include "sql/preserve_trx_transfer.h"
 
 ulonglong preserve_trx_memory_budget_bytes = 256ULL * 1024ULL * 1024ULL;
@@ -416,6 +417,74 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_promotion_prewarm_record_lock_cold_page_gets,
     preserve_trx_promotion_prewarm_record_lock_cold_page_gets_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_resume_core_elapsed_us,
+    preserve_trx_promotion_resume_core_elapsed_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_resume_core_count,
+    preserve_trx_promotion_resume_core_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_resume_core_p50_us,
+    preserve_trx_promotion_resume_core_p50_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_resume_core_p95_us,
+    preserve_trx_promotion_resume_core_p95_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_resume_core_p99_us,
+    preserve_trx_promotion_resume_core_p99_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_resume_core_max_us,
+    preserve_trx_promotion_resume_core_max_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_resume_failure_count,
+    preserve_trx_promotion_resume_failure_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_fence_lease_wait_us,
+    preserve_trx_promotion_fence_lease_wait_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_fence_digest_compare_us,
+    preserve_trx_promotion_fence_digest_compare_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_lock_page_get_count,
+    preserve_trx_promotion_lock_page_get_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_promotion_lock_page_get_us,
+                              preserve_trx_promotion_lock_page_get_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_lock_image_resolves,
+    preserve_trx_promotion_lock_image_resolves_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_promotion_lock_apply_us,
+                              preserve_trx_promotion_lock_apply_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_lock_accounting_bits,
+    preserve_trx_promotion_lock_accounting_bits_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_receiver_lock_plan_capacity_bytes,
+    preserve_trx_receiver_lock_plan_capacity_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_receiver_lock_plan_epoch_peak_bytes,
+    preserve_trx_receiver_lock_plan_epoch_peak_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_receiver_lock_plan_subpool_cap_bytes,
+    preserve_trx_receiver_lock_plan_subpool_cap_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_resource_admission_open_failed_count,
+    preserve_trx_resource_admission_open_failed_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_resume_binlog_payload_read_bytes,
+    preserve_trx_resume_binlog_payload_read_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_resume_binlog_payload_write_bytes,
+    preserve_trx_resume_binlog_payload_write_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_resume_binlog_rename_count,
+                              preserve_trx_resume_binlog_rename_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_resume_physical_consistency_mode,
+    preserve_trx_resume_physical_consistency_mode_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_resume_real_redo_apply,
+                              preserve_trx_resume_real_redo_apply_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_resume_real_ha_promotion,
+    preserve_trx_resume_real_ha_promotion_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_auto_prewarm_tokens,
     preserve_trx_transfer_receiver_auto_prewarm_tokens_status())

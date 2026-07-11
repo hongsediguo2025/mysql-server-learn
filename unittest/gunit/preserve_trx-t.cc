@@ -65,6 +65,7 @@
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_lock_warmcopy.h"
 #include "sql/preserve_trx_promotion.h"
+#include "sql/preserve_trx_promotion_prepared.h"
 #include "sql/preserve_trx_resource.h"
 #include "sql/preserve_trx_temp_table.h"
 #include "sql/preserve_trx_temp_table_carrier.h"
@@ -85,6 +86,196 @@ static_assert(
     "Preserve_trx_options::timeout_seconds must stay ulonglong");
 
 namespace preserve_trx_unittest {
+
+namespace {
+
+bool g_test_physical_fence_drift_on_acquire{false};
+bool g_test_physical_fence_drift_on_revalidate{false};
+
+Preserve_trx_physical_fence_proof make_test_physical_fence_proof(
+    Preserve_trx_physical_consistency_mode mode) {
+  Preserve_trx_physical_fence_proof proof;
+  proof.consistency_mode = mode;
+  proof.source_lineage_uuid = "source-lineage";
+  proof.target_server_uuid = "target-server";
+  proof.target_boot_incarnation = "target-boot";
+  proof.provider_generation = 7;
+  proof.source_fence_lsn = 1234;
+  proof.target_frozen_lsn = 1234;
+  proof.epoch_fact_digest.assign(64, 'a');
+  proof.final_lock_generation_digest.assign(64, 'b');
+  proof.page_layout_digest.assign(64, 'c');
+  proof.dictionary_generation_digest.assign(64, 'd');
+  proof.apply_frozen = true;
+  return proof;
+}
+
+bool test_physical_fence_acquire(
+    const Preserve_trx_physical_fence_proof &expected,
+    Preserve_trx_physical_fence_proof *actual, void **opaque_lease) {
+  if (actual == nullptr || opaque_lease == nullptr) return false;
+  *actual = expected;
+  if (g_test_physical_fence_drift_on_acquire) ++actual->target_frozen_lsn;
+  *opaque_lease = new Preserve_trx_physical_fence_proof(expected);
+  return true;
+}
+
+bool test_physical_fence_revalidate(
+    void *opaque_lease, uint64_t expected_provider_generation,
+    Preserve_trx_physical_fence_proof *actual) {
+  if (opaque_lease == nullptr || actual == nullptr) return false;
+  *actual = *static_cast<Preserve_trx_physical_fence_proof *>(opaque_lease);
+  if (g_test_physical_fence_drift_on_revalidate) {
+    ++actual->provider_generation;
+    return true;
+  }
+  return actual->provider_generation == expected_provider_generation;
+}
+
+void test_physical_fence_release(void *opaque_lease) {
+  delete static_cast<Preserve_trx_physical_fence_proof *>(opaque_lease);
+}
+
+}  // namespace
+
+TEST(PreservedTrxPhysicalFence, ProductionPathRejectsMissingProvider) {
+  preserved_trx_set_physical_fence_provider_for_unit_test(nullptr);
+  Preserve_trx_physical_fence_lease lease;
+  EXPECT_EQ(Preserve_trx_physical_fence_status::MISSING_PROVIDER,
+            preserved_trx_acquire_production_physical_fence_lease(
+                make_test_physical_fence_proof(
+                    Preserve_trx_physical_consistency_mode::
+                        PRODUCTION_REDO_APPLY_FENCE),
+                &lease));
+  EXPECT_FALSE(lease.acquired());
+}
+
+TEST(PreservedTrxPhysicalFence, ExactLsnAndCompleteDigestAreRequired) {
+  Preserve_trx_physical_fence_proof proof = make_test_physical_fence_proof(
+      Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY);
+  EXPECT_TRUE(preserved_trx_physical_fence_proof_is_valid(proof));
+  ++proof.target_frozen_lsn;
+  EXPECT_FALSE(preserved_trx_physical_fence_proof_is_valid(proof));
+  proof.target_frozen_lsn = proof.source_fence_lsn;
+  proof.page_layout_digest.clear();
+  EXPECT_FALSE(preserved_trx_physical_fence_proof_is_valid(proof));
+}
+
+TEST(PreservedTrxPhysicalFence, TestProviderCannotReachProductionSlot) {
+  Preserve_trx_physical_fence_provider_ops ops;
+  ops.consistency_mode =
+      Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY;
+  ops.acquire = test_physical_fence_acquire;
+  ops.revalidate = test_physical_fence_revalidate;
+  ops.release = test_physical_fence_release;
+  preserved_trx_set_physical_fence_provider_for_unit_test(&ops);
+
+  Preserve_trx_physical_fence_lease production_lease;
+  EXPECT_EQ(Preserve_trx_physical_fence_status::MISSING_PROVIDER,
+            preserved_trx_acquire_production_physical_fence_lease(
+                make_test_physical_fence_proof(
+                    Preserve_trx_physical_consistency_mode::
+                        PRODUCTION_REDO_APPLY_FENCE),
+                &production_lease));
+
+  Preserve_trx_physical_fence_lease test_lease;
+  EXPECT_EQ(Preserve_trx_physical_fence_status::OK,
+            preserved_trx_acquire_physical_fence_lease_for_unit_test(
+                make_test_physical_fence_proof(
+                    Preserve_trx_physical_consistency_mode::
+                        TEST_FROZEN_DATADIR_COPY),
+                &test_lease));
+  EXPECT_TRUE(test_lease.acquired());
+  EXPECT_EQ(Preserve_trx_physical_fence_status::OK, test_lease.revalidate());
+  preserved_trx_set_physical_fence_provider_for_unit_test(nullptr);
+}
+
+TEST(PreservedTrxPhysicalFence, ProviderDriftViolatesLeaseContract) {
+  Preserve_trx_physical_fence_provider_ops ops;
+  ops.consistency_mode =
+      Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY;
+  ops.acquire = test_physical_fence_acquire;
+  ops.revalidate = test_physical_fence_revalidate;
+  ops.release = test_physical_fence_release;
+  preserved_trx_set_physical_fence_provider_for_unit_test(&ops);
+
+  g_test_physical_fence_drift_on_acquire = true;
+  Preserve_trx_physical_fence_lease rejected_lease;
+  EXPECT_EQ(Preserve_trx_physical_fence_status::PROVIDER_CONTRACT_VIOLATION,
+            preserved_trx_acquire_physical_fence_lease_for_unit_test(
+                make_test_physical_fence_proof(
+                    Preserve_trx_physical_consistency_mode::
+                        TEST_FROZEN_DATADIR_COPY),
+                &rejected_lease));
+  EXPECT_FALSE(rejected_lease.acquired());
+  g_test_physical_fence_drift_on_acquire = false;
+
+  Preserve_trx_physical_fence_lease acquired_lease;
+  ASSERT_EQ(Preserve_trx_physical_fence_status::OK,
+            preserved_trx_acquire_physical_fence_lease_for_unit_test(
+                make_test_physical_fence_proof(
+                    Preserve_trx_physical_consistency_mode::
+                        TEST_FROZEN_DATADIR_COPY),
+                &acquired_lease));
+  g_test_physical_fence_drift_on_revalidate = true;
+  EXPECT_EQ(Preserve_trx_physical_fence_status::PROVIDER_CONTRACT_VIOLATION,
+            acquired_lease.revalidate());
+  g_test_physical_fence_drift_on_revalidate = false;
+  acquired_lease.release();
+  preserved_trx_set_physical_fence_provider_for_unit_test(nullptr);
+}
+
+TEST(PreservedTrxPromotionMetrics, ResumeCoreUsesServerSideFixedBuckets) {
+  preserved_trx_promotion_prepared_metrics_reset_for_unit_test();
+  preserved_trx_promotion_resume_core_note(10, true);
+  preserved_trx_promotion_resume_core_note(100, true);
+  preserved_trx_promotion_resume_core_note(1000, true);
+  preserved_trx_promotion_resume_core_note(10000, false);
+
+  EXPECT_EQ(3U, preserve_trx_promotion_resume_core_count_status());
+  EXPECT_EQ(10000U, preserve_trx_promotion_resume_core_elapsed_us_status());
+  EXPECT_EQ(100U, preserve_trx_promotion_resume_core_p50_us_status());
+  EXPECT_EQ(1000U, preserve_trx_promotion_resume_core_p95_us_status());
+  EXPECT_EQ(1000U, preserve_trx_promotion_resume_core_p99_us_status());
+  EXPECT_EQ(1000U, preserve_trx_promotion_resume_core_max_us_status());
+  EXPECT_EQ(1U, preserve_trx_promotion_resume_failure_count_status());
+}
+
+TEST(PreservedTrxPromotionMetrics, EvidenceModeIsExplicit) {
+  preserved_trx_promotion_prepared_metrics_reset_for_unit_test();
+  preserved_trx_promotion_prepared_set_evidence_for_unit_test(
+      Preserve_trx_physical_consistency_mode::TEST_SAME_INSTANCE_ATTACH_ONLY,
+      false, false);
+  EXPECT_EQ(static_cast<uint64_t>(Preserve_trx_physical_consistency_mode::
+                                      TEST_SAME_INSTANCE_ATTACH_ONLY),
+            preserve_trx_resume_physical_consistency_mode_status());
+  EXPECT_EQ(0U, preserve_trx_resume_real_redo_apply_status());
+  EXPECT_EQ(0U, preserve_trx_resume_real_ha_promotion_status());
+}
+
+TEST(PreservedTrxPromotionMetrics, RawFastPathCountersAreServerOwned) {
+  preserved_trx_promotion_prepared_metrics_reset_for_unit_test();
+  preserved_trx_promotion_prepared_note_fence_metrics(11, 12);
+  preserved_trx_promotion_prepared_note_lock_metrics(13, 14, 15, 16, 17);
+  preserved_trx_promotion_prepared_note_lock_plan_metrics(18, 19, 20);
+  preserved_trx_promotion_prepared_note_resource_open_failure();
+  preserved_trx_promotion_prepared_note_resume_binlog_io(21, 22, 23);
+
+  EXPECT_EQ(11U, preserve_trx_promotion_fence_lease_wait_us_status());
+  EXPECT_EQ(12U, preserve_trx_promotion_fence_digest_compare_us_status());
+  EXPECT_EQ(13U, preserve_trx_promotion_lock_page_get_count_status());
+  EXPECT_EQ(14U, preserve_trx_promotion_lock_page_get_us_status());
+  EXPECT_EQ(15U, preserve_trx_promotion_lock_image_resolves_status());
+  EXPECT_EQ(16U, preserve_trx_promotion_lock_apply_us_status());
+  EXPECT_EQ(17U, preserve_trx_promotion_lock_accounting_bits_status());
+  EXPECT_EQ(18U, preserve_trx_receiver_lock_plan_capacity_bytes_status());
+  EXPECT_EQ(19U, preserve_trx_receiver_lock_plan_epoch_peak_bytes_status());
+  EXPECT_EQ(20U, preserve_trx_receiver_lock_plan_subpool_cap_bytes_status());
+  EXPECT_EQ(1U, preserve_trx_resource_admission_open_failed_count_status());
+  EXPECT_EQ(21U, preserve_trx_resume_binlog_payload_read_bytes_status());
+  EXPECT_EQ(22U, preserve_trx_resume_binlog_payload_write_bytes_status());
+  EXPECT_EQ(23U, preserve_trx_resume_binlog_rename_count_status());
+}
 
 TEST(PreservedTrxRecordLockImportMetrics, AddAccumulatesIoBreakdown) {
   trx_preserve_record_lock_import_metrics_t total;

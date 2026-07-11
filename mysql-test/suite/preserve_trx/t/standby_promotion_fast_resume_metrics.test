@@ -1,0 +1,27 @@
+SELECT COUNT(*) AS registered_fast_resume_metrics
+  FROM performance_schema.global_status
+  WHERE VARIABLE_NAME IN (
+    'Preserve_trx_promotion_resume_core_elapsed_us',
+    'Preserve_trx_promotion_resume_core_count',
+    'Preserve_trx_promotion_resume_core_p50_us',
+    'Preserve_trx_promotion_resume_core_p95_us',
+    'Preserve_trx_promotion_resume_core_p99_us',
+    'Preserve_trx_promotion_resume_core_max_us',
+    'Preserve_trx_promotion_resume_failure_count',
+    'Preserve_trx_promotion_fence_lease_wait_us',
+    'Preserve_trx_promotion_fence_digest_compare_us',
+    'Preserve_trx_promotion_lock_page_get_count',
+    'Preserve_trx_promotion_lock_page_get_us',
+    'Preserve_trx_promotion_lock_image_resolves',
+    'Preserve_trx_promotion_lock_apply_us',
+    'Preserve_trx_promotion_lock_accounting_bits',
+    'Preserve_trx_receiver_lock_plan_capacity_bytes',
+    'Preserve_trx_receiver_lock_plan_epoch_peak_bytes',
+    'Preserve_trx_receiver_lock_plan_subpool_cap_bytes',
+    'Preserve_trx_resource_admission_open_failed_count',
+    'Preserve_trx_resume_binlog_payload_read_bytes',
+    'Preserve_trx_resume_binlog_payload_write_bytes',
+    'Preserve_trx_resume_binlog_rename_count',
+    'Preserve_trx_resume_physical_consistency_mode',
+    'Preserve_trx_resume_real_redo_apply',
+    'Preserve_trx_resume_real_ha_promotion');
