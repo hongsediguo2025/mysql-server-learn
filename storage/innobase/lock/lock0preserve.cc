@@ -2253,10 +2253,16 @@ lock_preserve_build_record_lock_metadata_plan(
         1ULL + ((static_cast<uint64_t>(record.page_n_heap) +
                  LOCK_PAGE_BITMAP_MARGIN) /
                 8ULL);
-    if (bitmap_bytes == 0 || bitmap_bytes > UINT32_MAX / 8 ||
-        record.bitmap.size() < bitmap_bytes) {
+    if (bitmap_bytes == 0 || bitmap_bytes > UINT32_MAX / 8) {
       return lock_preserve_metadata_plan_status::CORRUPT_METADATA;
     }
+    /*
+      A native lock bitmap keeps the size chosen when the lock was created.
+      The page can gain records before the final fence, so a valid source
+      bitmap may be shorter than a newly allocated bitmap for page_n_heap.
+      max_set_heap_no was checked above; zero-extension preserves every lock
+      bit while normalizing the plan to the final native allocation size.
+    */
     for (size_t i = static_cast<size_t>(bitmap_bytes);
          i < record.bitmap.size(); ++i) {
       if (record.bitmap[i] != '\0') {

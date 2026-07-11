@@ -300,6 +300,23 @@ TEST(LockWarmcopyMetadataPlan, AcceptsFinalStablePagePayloadWithoutPageIo) {
 }
 
 TEST(LockWarmcopyMetadataPlan,
+     ZeroExtendsNativeBitmapWhenFinalPageHeapHasGrown) {
+  constexpr uint32_t kPageNHeap = 41;
+  std::string bitmap(13, '\0');
+  bitmap[5] = static_cast<char>(0x01);  // heap 40
+  const std::string payload = make_metadata_record_lock_payload(
+      LOCK_REC | LOCK_X, kPageNHeap, bitmap);
+  lock_preserve_metadata_plan_t plan;
+  EXPECT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_plan(
+                payload, make_metadata_plan_validation(payload),
+                make_metadata_dict_lease_ops(), &plan));
+  EXPECT_TRUE(plan.ready());
+  EXPECT_EQ(1U, plan.entry_count());
+  EXPECT_EQ(1U, plan.bitmap_bits());
+}
+
+TEST(LockWarmcopyMetadataPlan,
      FinalFactsSeparateLockBitsFromPageAndDictionaryIdentity) {
   const std::string first_payload = make_metadata_record_lock_payload(
       LOCK_REC | LOCK_X, 16, std::string(2, '\x02'));
