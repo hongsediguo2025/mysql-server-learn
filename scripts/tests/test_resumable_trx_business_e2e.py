@@ -6087,6 +6087,18 @@ class WorkloadPlanTest(unittest.TestCase):
             )
 
             report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["evidence_mode"], "SIMULATOR")
+            self.assertEqual(
+                report["physical_consistency_mode"], "frozen_datadir_copy"
+            )
+            self.assertFalse(report["strict_physical_fence_gate_executed"])
+            self.assertFalse(report["protected_thd_attach_executed"])
+            self.assertFalse(report["real_redo_apply"])
+            self.assertFalse(report["real_ha_promotion"])
+            self.assertEqual(
+                report["ha_blocked"],
+                ["production_physical_fence_provider", "single_primary_role_transition"],
+            )
             self.assertEqual(report["promotion_gate_elapsed_us"], 15000)
             self.assertEqual(report["phase2_total_samples_ms"], [10.2])
             self.assertEqual(report["lock_warmcopy_live_fallback_count"], 0)
@@ -6099,6 +6111,23 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertEqual(
                 report["materialized_lock_payload_bytes_in_phase2_samples"], [0]
             )
+
+    def test_promotion_warm_gate_report_is_explicitly_simulator_only(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "warm-gate.json"
+            runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+            runner.config = HarnessConfig(report_json=str(report_path))
+            runner.write_promotion_warm_gate_report(1234, None)
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["evidence_mode"], "SIMULATOR")
+            self.assertEqual(
+                report["physical_consistency_mode"], "not_proven"
+            )
+            self.assertFalse(report["strict_physical_fence_gate_executed"])
+            self.assertFalse(report["protected_thd_attach_executed"])
+            self.assertFalse(report["real_redo_apply"])
+            self.assertFalse(report["real_ha_promotion"])
 
     def test_standby_transfer_receiver_scenario_uses_special_runner(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)

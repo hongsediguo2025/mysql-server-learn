@@ -4338,6 +4338,20 @@ class BusinessE2ERunner:
             "status": "success",
             "success": True,
             "scenario": scenario_name,
+            "evidence_mode": "SIMULATOR",
+            "physical_consistency_mode": (
+                "frozen_datadir_copy"
+                if scenario_name == "physical_standby_promotion_gate_scaled"
+                else "receiver_transfer_only"
+            ),
+            "strict_physical_fence_gate_executed": False,
+            "protected_thd_attach_executed": False,
+            "real_redo_apply": False,
+            "real_ha_promotion": False,
+            "ha_blocked": [
+                "production_physical_fence_provider",
+                "single_primary_role_transition",
+            ],
             "promotion_gate_epoch_id": epoch_id,
             "promotion_gate_token_count": len(tokens),
             "promotion_gate_tokens": list(tokens),
@@ -4529,6 +4543,16 @@ class BusinessE2ERunner:
             "status": "failed" if error else "success",
             "success": error is None,
             "scenario": "promotion_warm_gate_simulator",
+            "evidence_mode": "SIMULATOR",
+            "physical_consistency_mode": "not_proven",
+            "strict_physical_fence_gate_executed": False,
+            "protected_thd_attach_executed": False,
+            "real_redo_apply": False,
+            "real_ha_promotion": False,
+            "ha_blocked": [
+                "production_physical_fence_provider",
+                "single_primary_role_transition",
+            ],
             "promotion_gate_epoch_id": self.config.promotion_gate_epoch_id,
             "promotion_gate_token_count": len(self.config.promotion_gate_tokens),
             "promotion_gate_tokens": self.config.promotion_gate_tokens,
