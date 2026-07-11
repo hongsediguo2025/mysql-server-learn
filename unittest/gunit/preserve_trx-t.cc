@@ -301,9 +301,9 @@ Preserve_trx_final_token_facts make_final_token_facts(uint64_t lsn) {
   facts.page_layout_digest.assign(64, 'c');
   facts.dictionary_generation_digest.assign(64, 'd');
   facts.target_boot_incarnation = "boot-1";
-  facts.record_lock_unique_pages = 3;
-  facts.record_lock_bitmap_entries = 4;
-  facts.record_lock_bits = 5;
+  facts.record_lock_unique_pages = 0;
+  facts.record_lock_bitmap_entries = 0;
+  facts.record_lock_bits = 0;
   facts.lock_plan_capacity_bytes = 128;
   facts.native_binlog_capacity_bytes = 0;
   facts.epoch_prepare_deadline_us = 500000;
@@ -400,6 +400,29 @@ TEST(PreservedTrxPreparedRegistry, CanonicalFactsBindEveryFenceField) {
   facts.required_apply_lsn = 101;
   facts.canonical_digest.clear();
   EXPECT_FALSE(preserved_trx_finalize_token_facts(&facts));
+}
+
+TEST(PreservedTrxPreparedRegistry,
+     RecordLockFactsCannotPublishWithoutMetadataPlan) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &prepare));
+  auto facts = make_final_token_facts(100);
+  facts.record_lock_unique_pages = 1;
+  facts.record_lock_bitmap_entries = 1;
+  facts.record_lock_bits = 2;
+  facts.canonical_digest.clear();
+  ASSERT_TRUE(preserved_trx_finalize_token_facts(&facts));
+  const auto status = registry.publish_ready(
+      &prepare, std::move(facts), acquire_prepared_resources(key));
+  EXPECT_EQ(Preserve_trx_prepared_status::INVALID_ARGUMENT, status);
+  prepare = {};
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  preserve_trx_resource_manager_reset_for_unit_test();
 }
 
 TEST(PreservedTrxPreparedRegistry, SupersedingUnpublishedPrepareAbortsNotReady) {

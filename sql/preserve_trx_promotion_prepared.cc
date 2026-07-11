@@ -39,6 +39,7 @@ class Preserve_trx_prepared_token_resources::Impl {
  public:
   Preserve_memory_lease lock_plan_memory;
   Preserve_native_binlog_resource_lease native_binlog_resources;
+  std::unique_ptr<lock_preserve_metadata_plan_t> record_lock_plan;
   std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle>
       native_binlog_handle;
   uint64_t lock_plan_bytes{0};
@@ -573,8 +574,24 @@ uint64_t Preserve_trx_prepared_token_resources::native_binlog_bytes() const {
   return m_impl == nullptr ? 0 : m_impl->native_binlog_bytes;
 }
 
+bool Preserve_trx_prepared_token_resources::has_record_lock_plan() const {
+  return m_impl != nullptr && m_impl->record_lock_plan != nullptr;
+}
+
 bool Preserve_trx_prepared_token_resources::has_native_binlog_handle() const {
   return m_impl != nullptr && m_impl->native_binlog_handle != nullptr;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_resources::install_record_lock_plan(
+    std::unique_ptr<lock_preserve_metadata_plan_t> plan) {
+  if (m_impl == nullptr || !m_impl->acquired || plan == nullptr ||
+      m_impl->record_lock_plan != nullptr || !plan->ready() ||
+      plan->capacity_bytes() != m_impl->lock_plan_bytes) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  m_impl->record_lock_plan = std::move(plan);
+  return Preserve_trx_prepared_status::OK;
 }
 
 Mysql_binlog_preserve_cache_status
@@ -902,12 +919,25 @@ Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::begin_prepare
 Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::publish_ready(
     Preserve_trx_prepare_lease *lease, Preserve_trx_final_token_facts facts,
     Preserve_trx_prepared_token_resources resources) {
+  const bool has_record_lock_facts =
+      facts.record_lock_unique_pages != 0 ||
+      facts.record_lock_bitmap_entries != 0 || facts.record_lock_bits != 0;
+  const lock_preserve_metadata_plan_t *record_lock_plan =
+      resources.m_impl == nullptr ? nullptr
+                                  : resources.m_impl->record_lock_plan.get();
   if (lease == nullptr || !lease->active() || lease->m_entry == nullptr ||
       !resources.acquired() || !preserved_trx_finalize_token_facts(&facts) ||
       facts.target_boot_incarnation !=
           lease->m_key.target_boot_incarnation ||
       facts.lock_plan_capacity_bytes != resources.lock_plan_bytes() ||
       facts.native_binlog_capacity_bytes != resources.native_binlog_bytes() ||
+      (has_record_lock_facts &&
+       (record_lock_plan == nullptr || !record_lock_plan->ready() ||
+        facts.record_lock_unique_pages > record_lock_plan->entry_count() ||
+        facts.record_lock_bitmap_entries != record_lock_plan->entry_count() ||
+        facts.record_lock_bits != record_lock_plan->bitmap_bits() ||
+        facts.lock_plan_capacity_bytes != record_lock_plan->capacity_bytes())) ||
+      (!has_record_lock_facts && record_lock_plan != nullptr) ||
       (facts.binlog_cache_present &&
        (!facts.binlog_handle_ready ||
         !resources.has_native_binlog_handle() ||
@@ -1027,6 +1057,15 @@ Preserve_trx_prepared_token_registry::begin_gate_adopt(
   lease->m_entry = std::move(entry);
   lease->m_active = true;
   return Preserve_trx_prepared_status::OK;
+}
+
+const lock_preserve_metadata_plan_t *
+Preserve_trx_gate_adopt_lease::record_lock_plan() const {
+  if (!m_active || m_entry == nullptr) return nullptr;
+  std::lock_guard<std::mutex> guard(m_entry->mutex);
+  return m_entry->resources.m_impl == nullptr
+             ? nullptr
+             : m_entry->resources.m_impl->record_lock_plan.get();
 }
 
 Preserve_trx_prepared_status
@@ -1293,6 +1332,7 @@ Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::snapshot(
     snapshot->key = entry->key;
     snapshot->facts = {};
     snapshot->state = entry->state.load(std::memory_order_acquire);
+    snapshot->record_lock_plan_owned = false;
     snapshot->native_binlog_handle_owned = false;
     return Preserve_trx_prepared_status::OK;
   }
@@ -1302,6 +1342,7 @@ Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::snapshot(
   snapshot->key = publication->key;
   snapshot->facts = publication->facts;
   snapshot->state = entry->state.load(std::memory_order_acquire);
+  snapshot->record_lock_plan_owned = entry->resources.has_record_lock_plan();
   snapshot->native_binlog_handle_owned =
       entry->resources.has_native_binlog_handle();
   return Preserve_trx_prepared_status::OK;

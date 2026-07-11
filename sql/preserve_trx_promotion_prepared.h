@@ -15,6 +15,8 @@
 #include <memory>
 #include <string>
 
+#include "storage/innobase/include/lock0preserve_plan.h"
+
 class Mysql_binlog_preserve_payload_reader;
 class Mysql_binlog_preserve_prepared_cache_handle;
 class Preserve_trx_internal_operation_capability;
@@ -220,7 +222,10 @@ class Preserve_trx_prepared_token_resources {
   bool acquired() const;
   uint64_t lock_plan_bytes() const;
   uint64_t native_binlog_bytes() const;
+  bool has_record_lock_plan() const;
   bool has_native_binlog_handle() const;
+  Preserve_trx_prepared_status install_record_lock_plan(
+      std::unique_ptr<lock_preserve_metadata_plan_t> plan);
   Mysql_binlog_preserve_cache_status prepare_native_binlog_handle(
       const Preserve_trx_internal_operation_capability &capability,
       const Mysql_binlog_preserve_cache_facts &facts,
@@ -235,6 +240,7 @@ class Preserve_trx_prepared_token_resources {
       const Preserve_trx_prepared_token_key &, uint64_t, uint64_t, uint64_t,
       uint64_t, Preserve_trx_prepared_token_resources *);
   friend class Preserve_trx_prepared_token_registry;
+  friend class Preserve_trx_gate_adopt_lease;
   friend class Preserve_trx_attach_lease;
 };
 
@@ -289,6 +295,7 @@ class Preserve_trx_gate_adopt_lease {
       Preserve_trx_gate_adopt_lease &&other) noexcept;
   ~Preserve_trx_gate_adopt_lease();
   bool active() const { return m_active; }
+  const lock_preserve_metadata_plan_t *record_lock_plan() const;
 
  private:
   void fail_closed();
@@ -346,6 +353,7 @@ struct Preserve_trx_prepared_token_snapshot {
   Preserve_trx_final_token_facts facts;
   Preserve_trx_prepared_token_state state{
       Preserve_trx_prepared_token_state::NOT_FOUND};
+  bool record_lock_plan_owned{false};
   bool native_binlog_handle_owned{false};
 };
 
