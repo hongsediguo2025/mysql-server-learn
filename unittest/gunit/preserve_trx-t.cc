@@ -57,6 +57,7 @@
 #include "my_thread_local.h"
 #include "sha2.h"
 #include "sql/handler.h"
+#include "sql/binlog_preserve_prepared.h"
 #include "sql/mdl_context_backup.h"
 #include "sql/mysqld.h"
 #include "sql/preserve_trx_carrier.h"
@@ -84,6 +85,9 @@ static_assert(
     std::is_same<decltype(Preserve_trx_options::timeout_seconds), ulonglong>::
         value,
     "Preserve_trx_options::timeout_seconds must stay ulonglong");
+static_assert(
+    !std::is_move_assignable<Mysql_binlog_preserve_attach_journal>::value,
+    "an active native binlog attach journal must not be move-assigned");
 
 namespace preserve_trx_unittest {
 
@@ -301,7 +305,7 @@ Preserve_trx_final_token_facts make_final_token_facts(uint64_t lsn) {
   facts.record_lock_bitmap_entries = 4;
   facts.record_lock_bits = 5;
   facts.lock_plan_capacity_bytes = 128;
-  facts.native_binlog_capacity_bytes = 64;
+  facts.native_binlog_capacity_bytes = 0;
   facts.epoch_prepare_deadline_us = 500000;
   facts.client_resume_deadline_us = 1000000;
   facts.semantic_validated = true;
@@ -314,13 +318,42 @@ Preserve_trx_final_token_facts make_final_token_facts(uint64_t lsn) {
 
 Preserve_trx_prepared_token_resources acquire_prepared_resources(
     const Preserve_trx_prepared_token_key &key, uint64_t lock_bytes = 128,
-    uint64_t binlog_bytes = 64) {
+    uint64_t binlog_bytes = 0, uint64_t native_fd_count = 0,
+    uint64_t native_tmpdir_bytes = 0) {
   Preserve_trx_prepared_token_resources resources;
   EXPECT_EQ(Preserve_trx_prepared_status::OK,
             preserved_trx_acquire_prepared_token_resources(
-                key, lock_bytes, binlog_bytes, &resources));
+                key, lock_bytes, binlog_bytes, native_fd_count,
+                native_tmpdir_bytes, &resources));
   EXPECT_TRUE(resources.acquired());
   return resources;
+}
+
+struct Prepared_registry_interleave_context {
+  Preserve_trx_prepared_token_registry *registry{nullptr};
+  Preserve_trx_prepared_token_key key;
+  Preserve_trx_gate_adopt_lease *adopt_lease{nullptr};
+  Preserve_trx_prepared_status adopt_status{
+      Preserve_trx_prepared_status::INVALID_STATE};
+};
+
+void prepared_registry_interleave_probe(
+    Preserve_trx_prepared_registry_probe_point point, void *opaque) {
+  auto *context = static_cast<Prepared_registry_interleave_context *>(opaque);
+  ASSERT_NE(nullptr, context);
+  ASSERT_NE(nullptr, context->registry);
+  switch (point) {
+    case Preserve_trx_prepared_registry_probe_point::BEGIN_PREPARE_AFTER_LOOKUP:
+      context->registry->purge_epoch(context->key.source_uuid,
+                                     context->key.epoch_id);
+      break;
+    case Preserve_trx_prepared_registry_probe_point::
+        INVALIDATE_BEFORE_RETIRE:
+      ASSERT_NE(nullptr, context->adopt_lease);
+      context->adopt_status = context->registry->begin_gate_adopt(
+          context->key, context->key.generation, context->adopt_lease);
+      break;
+  }
 }
 
 TEST(PreservedTrxPreparedRegistry, StaleWorkerCannotOverwriteNewGeneration) {
@@ -435,7 +468,7 @@ TEST(PreservedTrxPreparedRegistry, SameDigestPublishIsIdempotent) {
   EXPECT_EQ(Preserve_trx_prepared_status::IDEMPOTENT,
             registry.publish_ready(&retry, facts,
                                    acquire_prepared_resources(key)));
-  EXPECT_EQ(192U, preserve_trx_memory_current_bytes_status());
+  EXPECT_EQ(128U, preserve_trx_memory_current_bytes_status());
   registry.purge_epoch(key.source_uuid, key.epoch_id);
   EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
   preserve_trx_resource_manager_reset_for_unit_test();
@@ -444,8 +477,10 @@ TEST(PreservedTrxPreparedRegistry, SameDigestPublishIsIdempotent) {
 TEST(PreservedTrxPreparedRegistry, ResourceSubpoolsEnforceSixtyThirtyTen) {
   preserve_trx_resource_manager_reset_for_unit_test();
   preserve_trx_resource_manager_set_limits_for_unit_test({1000, 1000});
+  preserve_trx_resource_manager_set_external_limits_for_unit_test(
+      {4096, 16, 16ULL * 1024ULL * 1024ULL * 1024ULL, true});
   auto key = make_prepared_token_key(1);
-  auto resources = acquire_prepared_resources(key, 600, 300);
+  auto resources = acquire_prepared_resources(key, 600, 300, 2, 0);
   EXPECT_EQ(600U, preserve_trx_resource_kind_current_bytes_for_unit_test(
                       Preserve_trx_memory_kind::PROMOTION_LOCK_PLAN));
   EXPECT_EQ(300U, preserve_trx_resource_kind_current_bytes_for_unit_test(
@@ -464,6 +499,7 @@ TEST(PreservedTrxPreparedRegistry, ResourceSubpoolsEnforceSixtyThirtyTen) {
   resources = {};
   EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
   preserve_trx_resource_manager_reset_for_unit_test();
+  preserve_trx_resource_manager_set_external_limits_for_unit_test({});
   preserve_trx_resource_manager_set_limits_for_unit_test(
       Preserve_trx_resource_limits{});
 }
@@ -597,6 +633,747 @@ TEST(PreservedTrxPreparedRegistry, PendingLeaseDeadlineReleasesOnlyUnclaimed) {
   EXPECT_EQ(Preserve_trx_prepared_token_state::NOT_READY, snapshot.state);
   EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
   registry.purge_epoch(key.source_uuid, key.epoch_id);
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+class ChunkedBinlogPayloadReader final
+    : public Mysql_binlog_preserve_payload_reader {
+ public:
+  ChunkedBinlogPayloadReader(std::string payload, size_t chunk_bytes)
+      : m_payload(std::move(payload)), m_chunk_bytes(chunk_bytes) {}
+
+  Mysql_binlog_preserve_payload_read_status read(
+      unsigned char *buffer, size_t capacity, size_t *bytes_read) override {
+    ++m_read_calls;
+    if (buffer == nullptr || bytes_read == nullptr || capacity == 0)
+      return Mysql_binlog_preserve_payload_read_status::ERROR;
+    if (m_offset == m_payload.size()) {
+      *bytes_read = 0;
+      return Mysql_binlog_preserve_payload_read_status::END;
+    }
+    const size_t bytes = std::min(
+        {capacity, m_chunk_bytes, m_payload.size() - m_offset});
+    std::memcpy(buffer, m_payload.data() + m_offset, bytes);
+    m_offset += bytes;
+    m_max_read_bytes = std::max(m_max_read_bytes, bytes);
+    *bytes_read = bytes;
+    return Mysql_binlog_preserve_payload_read_status::DATA;
+  }
+
+  size_t read_calls() const { return m_read_calls; }
+  size_t max_read_bytes() const { return m_max_read_bytes; }
+
+ private:
+  std::string m_payload;
+  size_t m_chunk_bytes{0};
+  size_t m_offset{0};
+  size_t m_read_calls{0};
+  size_t m_max_read_bytes{0};
+};
+
+class PreservedTrxNativeBinlogPrepared : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    m_server_initializer.SetUp();
+    m_saved_enable = preserve_trx_enable;
+    m_saved_opt_bin_log = opt_bin_log;
+    m_saved_binlog_cache_size = binlog_cache_size;
+    m_saved_max_binlog_cache_size = max_binlog_cache_size;
+    m_saved_binlog_stmt_cache_size = binlog_stmt_cache_size;
+    m_saved_max_binlog_stmt_cache_size = max_binlog_stmt_cache_size;
+    m_saved_sql_log_bin = thd()->variables.sql_log_bin;
+
+    preserve_trx_set_enable_value(true);
+    opt_bin_log = true;
+    binlog_cache_size = 32 * 1024;
+    max_binlog_cache_size = 4 * 1024 * 1024;
+    binlog_stmt_cache_size = 32 * 1024;
+    max_binlog_stmt_cache_size = 4 * 1024 * 1024;
+    m_binlog_hton.slot = 0;
+    m_binlog_hton.savepoint_offset = sizeof(my_off_t);
+    mysql_binlog_preserve_set_runtime_for_unit_test(&m_binlog_hton, true);
+    thd()->variables.option_bits |= OPTION_BIN_LOG;
+    thd()->variables.sql_log_bin = true;
+    preserve_trx_resource_manager_reset_for_unit_test();
+    preserve_trx_resource_manager_set_limits_for_unit_test(
+        {16 * 1024 * 1024, 16 * 1024 * 1024});
+    preserve_trx_resource_manager_set_external_limits_for_unit_test(
+        {4096, 16, 16ULL * 1024ULL * 1024ULL * 1024ULL, true});
+  }
+
+  void TearDown() override {
+    mysql_binlog_preserve_cleanup_attached_cache_for_unit_test(thd());
+    mysql_binlog_preserve_set_runtime_for_unit_test(nullptr, false);
+    preserve_trx_resource_manager_reset_for_unit_test();
+    preserve_trx_resource_manager_set_limits_for_unit_test(
+        Preserve_trx_resource_limits{});
+    preserve_trx_resource_manager_set_external_limits_for_unit_test({});
+    thd()->variables.sql_log_bin = m_saved_sql_log_bin;
+    max_binlog_stmt_cache_size = m_saved_max_binlog_stmt_cache_size;
+    binlog_stmt_cache_size = m_saved_binlog_stmt_cache_size;
+    max_binlog_cache_size = m_saved_max_binlog_cache_size;
+    binlog_cache_size = m_saved_binlog_cache_size;
+    opt_bin_log = m_saved_opt_bin_log;
+    preserve_trx_set_enable_value(m_saved_enable);
+    m_server_initializer.TearDown();
+  }
+
+  THD *thd() const { return m_server_initializer.thd(); }
+
+  Mysql_binlog_preserve_cache_facts make_facts(
+      const std::string &payload, const std::string &token = "token-1") const {
+    Mysql_binlog_preserve_cache_facts facts;
+    facts.identity.source_uuid = "source-uuid";
+    facts.identity.epoch_id = "epoch-1";
+    facts.identity.token = token;
+    facts.identity.target_boot_incarnation = "boot-1";
+    facts.identity.generation = 1;
+    facts.snapshot.event_counter = 7;
+    facts.snapshot.with_rbr = true;
+    facts.snapshot.with_content = true;
+    facts.snapshot.has_prev_position = true;
+    facts.snapshot.prev_position = 13;
+    facts.snapshot.has_cache_length = true;
+    facts.snapshot.cache_length = payload.size();
+    facts.cache_length = payload.size();
+    SHA256(pointer_cast<const unsigned char *>(payload.data()), payload.size(),
+           facts.payload_sha256.data());
+    facts.binlog_incarnation = 17;
+    facts.key_generation = 23;
+    facts.option_bin_log = true;
+    facts.session_sql_log_bin = true;
+    Mysql_binlog_preserve_cache_state cache_state;
+    cache_state.position = 13;
+    cache_state.event_counter = 3;
+    cache_state.with_rbr = true;
+    cache_state.with_content = true;
+    facts.cache_states.push_back(cache_state);
+    EXPECT_TRUE(mysql_binlog_preserve_finalize_cache_facts(&facts));
+    return facts;
+  }
+
+  Preserve_trx_internal_operation_capability prepare_capability(
+      const Mysql_binlog_preserve_cache_facts &facts) const {
+    return preserved_trx_make_binlog_capability_for_unit_test(
+        Preserve_trx_internal_operation::PREPARE_BINLOG_CACHE, facts.identity,
+        17, 23);
+  }
+
+  Preserve_trx_internal_operation_capability attach_capability(
+      const Mysql_binlog_preserve_cache_facts &facts) const {
+    return preserved_trx_make_binlog_capability_for_unit_test(
+        Preserve_trx_internal_operation::ATTACH_BINLOG_CACHE, facts.identity,
+        17, 23);
+  }
+
+  Preserve_native_binlog_resource_lease acquire_native_resources(
+      const std::string &resource_token,
+      const Mysql_binlog_preserve_cache_facts &facts) const {
+    auto lease = preserve_trx_acquire_native_binlog_resource_lease(
+        resource_token,
+        mysql_binlog_preserve_native_memory_bytes_required(facts),
+        mysql_binlog_preserve_native_fd_count_required(facts),
+        mysql_binlog_preserve_native_tmpdir_bytes_required(facts));
+    EXPECT_TRUE(lease.acquired());
+    return lease;
+  }
+
+ private:
+  my_testing::Server_initializer m_server_initializer;
+  handlerton m_binlog_hton{};
+  bool m_saved_enable{false};
+  bool m_saved_opt_bin_log{false};
+  ulong m_saved_binlog_cache_size{0};
+  ulonglong m_saved_max_binlog_cache_size{0};
+  ulong m_saved_binlog_stmt_cache_size{0};
+  ulonglong m_saved_max_binlog_stmt_cache_size{0};
+  bool m_saved_sql_log_bin{true};
+};
+
+TEST_F(PreservedTrxNativeBinlogPrepared,
+       RejectsDefaultCapabilityBeforeReadingPayload) {
+  const std::string payload(1024, 'a');
+  auto facts = make_facts(payload);
+  ChunkedBinlogPayloadReader reader(payload, 128);
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> handle;
+  auto resources =
+      acquire_native_resources("native-binlog-default-capability", facts);
+
+  EXPECT_EQ(Mysql_binlog_preserve_cache_status::CAPABILITY_REJECTED,
+            mysql_binlog_preserve_prepare_detached_cache(
+                Preserve_trx_internal_operation_capability{}, facts, &reader,
+                std::move(resources), &handle));
+  EXPECT_EQ(0U, reader.read_calls());
+  EXPECT_EQ(nullptr, handle);
+}
+
+TEST_F(PreservedTrxNativeBinlogPrepared,
+       FeatureOffRejectsBeforeReadingPayload) {
+  const std::string payload(1024, 'a');
+  auto facts = make_facts(payload);
+  ChunkedBinlogPayloadReader reader(payload, 128);
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> handle;
+  auto resources = acquire_native_resources("native-binlog-off", facts);
+  preserve_trx_set_enable_value(false);
+
+  EXPECT_EQ(Mysql_binlog_preserve_cache_status::FEATURE_DISABLED,
+            mysql_binlog_preserve_prepare_detached_cache(
+                prepare_capability(facts), facts, &reader, std::move(resources),
+                &handle));
+  EXPECT_EQ(0U, reader.read_calls());
+  EXPECT_EQ(nullptr, handle);
+}
+
+TEST_F(PreservedTrxNativeBinlogPrepared,
+       IncarnationMismatchRejectsBeforeReadingPayload) {
+  const std::string payload(1024, 'a');
+  auto facts = make_facts(payload);
+  ++facts.binlog_incarnation;
+  facts.canonical_digest.clear();
+  ASSERT_TRUE(mysql_binlog_preserve_finalize_cache_facts(&facts));
+  ChunkedBinlogPayloadReader reader(payload, 128);
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> handle;
+  auto resources = acquire_native_resources("native-binlog-stale", facts);
+
+  EXPECT_EQ(Mysql_binlog_preserve_cache_status::INCARNATION_MISMATCH,
+            mysql_binlog_preserve_prepare_detached_cache(
+                prepare_capability(make_facts(payload)), facts, &reader,
+                std::move(resources),
+                &handle));
+  EXPECT_EQ(0U, reader.read_calls());
+  EXPECT_EQ(nullptr, handle);
+}
+
+TEST_F(PreservedTrxNativeBinlogPrepared,
+       StreamsLargePayloadIntoNativeFileBackedCache) {
+  const std::string payload(128 * 1024, 'b');
+  auto facts = make_facts(payload);
+  ChunkedBinlogPayloadReader reader(payload, 4096);
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> handle;
+  auto resources = acquire_native_resources("native-binlog-large", facts);
+
+  ASSERT_EQ(Mysql_binlog_preserve_cache_status::OK,
+            mysql_binlog_preserve_prepare_detached_cache(
+                prepare_capability(facts), facts, &reader, std::move(resources),
+                &handle));
+  ASSERT_NE(nullptr, handle);
+  EXPECT_TRUE(handle->sealed());
+  EXPECT_EQ(payload.size(), handle->cache_length());
+  EXPECT_TRUE(handle->file_backed());
+  EXPECT_GT(reader.read_calls(), 1U);
+  EXPECT_LE(reader.max_read_bytes(), 4096U);
+}
+
+TEST_F(PreservedTrxNativeBinlogPrepared,
+       SmallPayloadRemainsInNativeMemoryBuffer) {
+  const std::string payload(8 * 1024, 's');
+  auto facts = make_facts(payload);
+  ChunkedBinlogPayloadReader reader(payload, 1024);
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> handle;
+  auto resources = acquire_native_resources("native-binlog-small", facts);
+
+  ASSERT_EQ(Mysql_binlog_preserve_cache_status::OK,
+            mysql_binlog_preserve_prepare_detached_cache(
+                prepare_capability(facts), facts, &reader, std::move(resources),
+                &handle));
+  ASSERT_NE(nullptr, handle);
+  EXPECT_FALSE(handle->file_backed());
+  EXPECT_EQ(payload.size(), handle->cache_length());
+}
+
+TEST_F(PreservedTrxNativeBinlogPrepared,
+       DigestMismatchPublishesNoHandle) {
+  const std::string payload(8 * 1024, 'x');
+  auto facts = make_facts(payload);
+  facts.payload_sha256[0] ^= 0xff;
+  facts.canonical_digest.clear();
+  ASSERT_TRUE(mysql_binlog_preserve_finalize_cache_facts(&facts));
+  ChunkedBinlogPayloadReader reader(payload, 1024);
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> handle;
+  auto resources = acquire_native_resources("native-binlog-digest", facts);
+
+  EXPECT_EQ(Mysql_binlog_preserve_cache_status::DIGEST_MISMATCH,
+            mysql_binlog_preserve_prepare_detached_cache(
+                prepare_capability(facts), facts, &reader, std::move(resources),
+                &handle));
+  EXPECT_EQ(nullptr, handle);
+}
+
+TEST_F(PreservedTrxNativeBinlogPrepared,
+       OversizedReaderChunkStopsBeforeWritingPastDeclaredLength) {
+  const std::string declared_payload(1024, 'y');
+  const std::string actual_payload(4096, 'y');
+  auto facts = make_facts(declared_payload);
+  ChunkedBinlogPayloadReader reader(actual_payload, actual_payload.size());
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> handle;
+  auto resources = acquire_native_resources("native-binlog-length", facts);
+
+  EXPECT_EQ(Mysql_binlog_preserve_cache_status::LENGTH_MISMATCH,
+            mysql_binlog_preserve_prepare_detached_cache(
+                prepare_capability(facts), facts, &reader, std::move(resources),
+                &handle));
+  EXPECT_EQ(1U, reader.read_calls());
+  EXPECT_EQ(nullptr, handle);
+}
+
+TEST_F(PreservedTrxNativeBinlogPrepared,
+       AttachAbortRestoresHandleAndCommitKeepsManagerAddress) {
+  const std::string payload(128 * 1024, 'c');
+  auto facts = make_facts(payload);
+  ChunkedBinlogPayloadReader reader(payload, 4096);
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> handle;
+  auto resources = acquire_native_resources("native-binlog-attach", facts);
+  ASSERT_EQ(Mysql_binlog_preserve_cache_status::OK,
+            mysql_binlog_preserve_prepare_detached_cache(
+                prepare_capability(facts), facts, &reader, std::move(resources),
+                &handle));
+  const void *const manager_identity = handle->native_manager_identity();
+
+  Mysql_binlog_preserve_attach_journal journal;
+  ASSERT_EQ(Mysql_binlog_preserve_cache_status::OK,
+            mysql_binlog_preserve_attach_detached_cache(
+                attach_capability(facts), thd(), &handle, &journal));
+  EXPECT_EQ(nullptr, handle);
+  EXPECT_TRUE(journal.active());
+  EXPECT_EQ(manager_identity,
+            mysql_binlog_preserve_attached_manager_identity_for_unit_test(
+                thd()));
+  ASSERT_EQ(Mysql_binlog_preserve_cache_status::OK,
+            mysql_binlog_preserve_abort_detached_cache_attach(&journal,
+                                                               &handle));
+  ASSERT_NE(nullptr, handle);
+  EXPECT_EQ(manager_identity, handle->native_manager_identity());
+  EXPECT_EQ(nullptr,
+            mysql_binlog_preserve_attached_manager_identity_for_unit_test(
+                thd()));
+
+  ASSERT_EQ(Mysql_binlog_preserve_cache_status::OK,
+            mysql_binlog_preserve_attach_detached_cache(
+                attach_capability(facts), thd(), &handle, &journal));
+  ASSERT_EQ(Mysql_binlog_preserve_cache_status::OK,
+            mysql_binlog_preserve_commit_detached_cache_attach(&journal));
+  EXPECT_FALSE(journal.active());
+  EXPECT_EQ(manager_identity,
+            mysql_binlog_preserve_attached_manager_identity_for_unit_test(
+                thd()));
+  EXPECT_TRUE(
+      mysql_binlog_preserve_attached_handlers_ready_for_unit_test(thd()));
+}
+
+TEST_F(PreservedTrxNativeBinlogPrepared,
+       AttachRejectsBackupOwnershipAndDisabledSessionBinlog) {
+  const std::string payload(8 * 1024, 'p');
+  auto facts = make_facts(payload);
+  ChunkedBinlogPayloadReader reader(payload, 1024);
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> handle;
+  auto resources = acquire_native_resources("native-binlog-pristine", facts);
+  ASSERT_EQ(Mysql_binlog_preserve_cache_status::OK,
+            mysql_binlog_preserve_prepare_detached_cache(
+                prepare_capability(facts), facts, &reader,
+                std::move(resources), &handle));
+
+  Mysql_binlog_preserve_attach_journal journal;
+  thd()->get_ha_data(0)->ha_ptr_backup = reinterpret_cast<void *>(1);
+  EXPECT_EQ(Mysql_binlog_preserve_cache_status::TARGET_NOT_PRISTINE,
+            mysql_binlog_preserve_attach_detached_cache(
+                attach_capability(facts), thd(), &handle, &journal));
+  EXPECT_NE(nullptr, handle);
+  EXPECT_FALSE(journal.active());
+  thd()->get_ha_data(0)->ha_ptr_backup = nullptr;
+
+  thd()->variables.sql_log_bin = false;
+  EXPECT_EQ(Mysql_binlog_preserve_cache_status::MODE_MISMATCH,
+            mysql_binlog_preserve_attach_detached_cache(
+                attach_capability(facts), thd(), &handle, &journal));
+  EXPECT_NE(nullptr, handle);
+  EXPECT_FALSE(journal.active());
+}
+
+TEST_F(PreservedTrxNativeBinlogPrepared,
+       ResourceAdmissionCoversNativeBuffersFdAndTmpdir) {
+  const std::string payload(128 * 1024, 'r');
+  auto facts = make_facts(payload);
+  const uint64_t required_memory =
+      mysql_binlog_preserve_native_memory_bytes_required(facts);
+  const uint64_t required_fds =
+      mysql_binlog_preserve_native_fd_count_required(facts);
+  const uint64_t required_tmpdir =
+      mysql_binlog_preserve_native_tmpdir_bytes_required(facts);
+  ASSERT_GT(required_memory, payload.size() / 2);
+  ASSERT_EQ(2U, required_fds);
+  ASSERT_EQ(payload.size(), required_tmpdir);
+
+  auto undersized = preserve_trx_acquire_native_binlog_resource_lease(
+      "native-binlog-undersized", required_memory - 1, required_fds,
+      required_tmpdir);
+  ASSERT_TRUE(undersized.acquired());
+  ChunkedBinlogPayloadReader reader(payload, 4096);
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> handle;
+  EXPECT_EQ(Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED,
+            mysql_binlog_preserve_prepare_detached_cache(
+                prepare_capability(facts), facts, &reader,
+                std::move(undersized), &handle));
+  EXPECT_EQ(0U, reader.read_calls());
+
+  preserve_trx_resource_manager_set_external_limits_for_unit_test(
+      {80, 20, 16ULL * 1024ULL * 1024ULL * 1024ULL, true});
+  auto fd_rejected = preserve_trx_acquire_native_binlog_resource_lease(
+      "native-binlog-fd-rejected", required_memory, required_fds,
+      required_tmpdir);
+  EXPECT_FALSE(fd_rejected.acquired());
+
+  preserve_trx_resource_manager_set_external_limits_for_unit_test(
+      {4096, 16, 2ULL * 1024ULL * 1024ULL * 1024ULL, true});
+  auto tmp_rejected = preserve_trx_acquire_native_binlog_resource_lease(
+      "native-binlog-tmp-rejected", required_memory, required_fds,
+      1536ULL * 1024ULL * 1024ULL);
+  EXPECT_FALSE(tmp_rejected.acquired());
+  EXPECT_EQ(0U, preserve_trx_native_binlog_reserved_fd_count_for_unit_test());
+  EXPECT_EQ(0U,
+            preserve_trx_native_binlog_reserved_tmpdir_bytes_for_unit_test());
+}
+
+TEST_F(PreservedTrxNativeBinlogPrepared,
+       ResourceAdmissionChargesCacheStateMapNodes) {
+  constexpr size_t kStateCount = 1024;
+  auto reserved_only = make_facts(std::string(1024, 'm'));
+  reserved_only.cache_states.clear();
+  reserved_only.cache_states.reserve(kStateCount);
+  auto populated = make_facts(std::string(1024, 'm'));
+  populated.cache_states.clear();
+  populated.cache_states.reserve(kStateCount);
+  Mysql_binlog_preserve_cache_state state;
+  state.event_counter = 1;
+  state.with_content = true;
+  for (size_t index = 0; index < kStateCount; ++index) {
+    state.position = index + 1;
+    populated.cache_states.push_back(state);
+  }
+
+  const uint64_t reserved_only_bytes =
+      mysql_binlog_preserve_native_memory_bytes_required(reserved_only);
+  const uint64_t populated_bytes =
+      mysql_binlog_preserve_native_memory_bytes_required(populated);
+  ASSERT_GT(reserved_only_bytes, 0U);
+  ASSERT_GT(populated_bytes, 0U);
+  EXPECT_GT(populated_bytes,
+            reserved_only_bytes +
+                kStateCount * sizeof(Mysql_binlog_preserve_cache_state));
+}
+
+TEST_F(PreservedTrxNativeBinlogPrepared,
+       StrictRegistryOwnsHandleUntilAttachLeaseConsumesIt) {
+  const std::string payload(128 * 1024, 'd');
+  auto cache_facts = make_facts(payload);
+  ChunkedBinlogPayloadReader reader(payload, 4096);
+  auto key = make_prepared_token_key(1);
+  const uint64_t native_memory_bytes =
+      mysql_binlog_preserve_native_memory_bytes_required(cache_facts);
+  auto resources = acquire_prepared_resources(
+      key, 128, native_memory_bytes,
+      mysql_binlog_preserve_native_fd_count_required(cache_facts),
+      mysql_binlog_preserve_native_tmpdir_bytes_required(cache_facts));
+  ASSERT_EQ(Mysql_binlog_preserve_cache_status::OK,
+            resources.prepare_native_binlog_handle(
+                prepare_capability(cache_facts), cache_facts, &reader));
+  ASSERT_TRUE(resources.has_native_binlog_handle());
+
+  auto final_facts = make_final_token_facts(100);
+  final_facts.native_binlog_capacity_bytes = native_memory_bytes;
+  final_facts.binlog_cache_length = payload.size();
+  final_facts.binlog_cache_memory_bytes = native_memory_bytes;
+  final_facts.binlog_cache_present = true;
+  final_facts.binlog_cache_file_backed = true;
+  final_facts.binlog_handle_digest = cache_facts.canonical_digest;
+  final_facts.canonical_digest.clear();
+
+  Preserve_trx_prepared_token_registry registry;
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &prepare));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&prepare, std::move(final_facts),
+                                   std::move(resources)));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.mark_ready_for_gate(key, 1));
+  Preserve_trx_gate_adopt_lease adopt;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_gate_adopt(key, 1, &adopt));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.commit_gate_adopt(&adopt));
+
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_TRUE(snapshot.native_binlog_handle_owned);
+
+  Preserve_trx_attach_lease attach;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_attach(key, 1, &attach));
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> handle;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            attach.take_native_binlog_handle(&handle));
+  ASSERT_NE(nullptr, handle);
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_FALSE(snapshot.native_binlog_handle_owned);
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            attach.restore_native_binlog_handle(&handle));
+  EXPECT_EQ(nullptr, handle);
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.abort_attach_after_full_unwind(&attach));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_TRUE(snapshot.native_binlog_handle_owned);
+
+  Preserve_trx_cleanup_lease cleanup;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_cleanup(
+                key, 1, Preserve_trx_prepared_token_state::ADOPTED_LOCKED,
+                &cleanup));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.commit_cleanup(&cleanup, true));
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+}
+
+TEST_F(PreservedTrxNativeBinlogPrepared,
+       FailedRegistryPreparationCannotPublishReleasedReservation) {
+  const std::string payload(8 * 1024, 'e');
+  auto cache_facts = make_facts(payload);
+  cache_facts.payload_sha256[0] ^= 0xff;
+  cache_facts.canonical_digest.clear();
+  ASSERT_TRUE(mysql_binlog_preserve_finalize_cache_facts(&cache_facts));
+  ChunkedBinlogPayloadReader reader(payload, 1024);
+  auto key = make_prepared_token_key(1);
+  const uint64_t native_memory_bytes =
+      mysql_binlog_preserve_native_memory_bytes_required(cache_facts);
+  auto resources = acquire_prepared_resources(
+      key, 128, native_memory_bytes,
+      mysql_binlog_preserve_native_fd_count_required(cache_facts),
+      mysql_binlog_preserve_native_tmpdir_bytes_required(cache_facts));
+
+  EXPECT_EQ(Mysql_binlog_preserve_cache_status::DIGEST_MISMATCH,
+            resources.prepare_native_binlog_handle(
+                prepare_capability(cache_facts), cache_facts, &reader));
+  EXPECT_FALSE(resources.acquired());
+  EXPECT_FALSE(resources.has_native_binlog_handle());
+}
+
+TEST_F(PreservedTrxNativeBinlogPrepared,
+       StrictRegistryRejectsCrossTokenHandleRestore) {
+  const std::string payload1(8 * 1024, '1');
+  auto facts1 = make_facts(payload1, "token-1");
+  ChunkedBinlogPayloadReader reader1(payload1, 1024);
+  auto key = make_prepared_token_key(1);
+  const uint64_t memory1 =
+      mysql_binlog_preserve_native_memory_bytes_required(facts1);
+  auto resources1 = acquire_prepared_resources(
+      key, 128, memory1,
+      mysql_binlog_preserve_native_fd_count_required(facts1),
+      mysql_binlog_preserve_native_tmpdir_bytes_required(facts1));
+  ASSERT_EQ(Mysql_binlog_preserve_cache_status::OK,
+            resources1.prepare_native_binlog_handle(
+                prepare_capability(facts1), facts1, &reader1));
+
+  auto final_facts = make_final_token_facts(100);
+  final_facts.native_binlog_capacity_bytes = memory1;
+  final_facts.binlog_cache_length = payload1.size();
+  final_facts.binlog_cache_memory_bytes = memory1;
+  final_facts.binlog_cache_present = true;
+  final_facts.binlog_handle_digest = facts1.canonical_digest;
+  final_facts.canonical_digest.clear();
+
+  Preserve_trx_prepared_token_registry registry;
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &prepare));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&prepare, std::move(final_facts),
+                                   std::move(resources1)));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.mark_ready_for_gate(key, 1));
+  Preserve_trx_gate_adopt_lease adopt;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_gate_adopt(key, 1, &adopt));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.commit_gate_adopt(&adopt));
+  Preserve_trx_attach_lease attach;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_attach(key, 1, &attach));
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> handle1;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            attach.take_native_binlog_handle(&handle1));
+
+  const std::string payload2(8 * 1024, '2');
+  auto facts2 = make_facts(payload2, "token-2");
+  ChunkedBinlogPayloadReader reader2(payload2, 1024);
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> handle2;
+  auto resources2 = acquire_native_resources("native-binlog-token-2", facts2);
+  ASSERT_EQ(Mysql_binlog_preserve_cache_status::OK,
+            mysql_binlog_preserve_prepare_detached_cache(
+                prepare_capability(facts2), facts2, &reader2,
+                std::move(resources2), &handle2));
+
+  EXPECT_EQ(Preserve_trx_prepared_status::DIGEST_CONFLICT,
+            attach.restore_native_binlog_handle(&handle2));
+  EXPECT_NE(nullptr, handle2);
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            attach.restore_native_binlog_handle(&handle1));
+  EXPECT_EQ(nullptr, handle1);
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.abort_attach_after_full_unwind(&attach));
+  Preserve_trx_cleanup_lease cleanup;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_cleanup(
+                key, 1, Preserve_trx_prepared_token_state::ADOPTED_LOCKED,
+                &cleanup));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.commit_cleanup(&cleanup, true));
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+}
+
+TEST(PreservedTrxPreparedRegistry,
+     PurgeAndInvalidateCannotDestroyClaimedTokenResources) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &prepare));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&prepare, make_final_token_facts(100),
+                                   acquire_prepared_resources(key)));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.mark_ready_for_gate(key, 1));
+  Preserve_trx_gate_adopt_lease adopt;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_gate_adopt(key, 1, &adopt));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.commit_gate_adopt(&adopt));
+
+  registry.invalidate_incarnation("different-boot");
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::ADOPTED_LOCKED,
+            snapshot.state);
+  EXPECT_GT(preserve_trx_memory_current_bytes_status(), 0U);
+
+  Preserve_trx_attach_lease attach;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_attach(key, 1, &attach));
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::ATTACHING, snapshot.state);
+  EXPECT_GT(preserve_trx_memory_current_bytes_status(), 0U);
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.abort_attach_after_full_unwind(&attach));
+
+  Preserve_trx_cleanup_lease cleanup;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_cleanup(
+                key, 1, Preserve_trx_prepared_token_state::ADOPTED_LOCKED,
+                &cleanup));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.commit_cleanup(&cleanup, true));
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+  EXPECT_EQ(Preserve_trx_prepared_status::NOT_FOUND,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry,
+     PurgeAndInvalidateCannotRemoveActivePrepareLease) {
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &prepare));
+
+  registry.invalidate_incarnation("different-boot");
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_TRUE(prepare.active());
+
+  prepare = {};
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+  EXPECT_EQ(Preserve_trx_prepared_status::NOT_FOUND,
+            registry.snapshot(key, &snapshot));
+}
+
+TEST(PreservedTrxPreparedRegistry,
+     PurgeAfterLookupCannotCreateOrphanPrepareLease) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease initial;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &initial));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&initial, make_final_token_facts(100),
+                                   acquire_prepared_resources(key)));
+
+  Prepared_registry_interleave_context context;
+  context.registry = &registry;
+  context.key = key;
+  preserved_trx_prepared_registry_set_probe_for_unit_test(
+      prepared_registry_interleave_probe, &context);
+  Preserve_trx_prepare_lease raced;
+  const auto status = registry.begin_prepare(key, 1, &raced);
+  preserved_trx_prepared_registry_set_probe_for_unit_test(nullptr, nullptr);
+
+  EXPECT_EQ(Preserve_trx_prepared_status::NOT_FOUND, status);
+  EXPECT_FALSE(raced.active());
+  Preserve_trx_prepared_token_snapshot snapshot;
+  EXPECT_EQ(Preserve_trx_prepared_status::NOT_FOUND,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry,
+     InvalidateCannotRetireGateClaimWonAfterStateCheck) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &prepare));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&prepare, make_final_token_facts(100),
+                                   acquire_prepared_resources(key)));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.mark_ready_for_gate(key, 1));
+
+  Preserve_trx_gate_adopt_lease adopt;
+  Prepared_registry_interleave_context context;
+  context.registry = &registry;
+  context.key = key;
+  context.adopt_lease = &adopt;
+  preserved_trx_prepared_registry_set_probe_for_unit_test(
+      prepared_registry_interleave_probe, &context);
+  registry.invalidate_incarnation("different-boot");
+  preserved_trx_prepared_registry_set_probe_for_unit_test(nullptr, nullptr);
+
+  ASSERT_EQ(Preserve_trx_prepared_status::OK, context.adopt_status);
+  ASSERT_TRUE(adopt.active());
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::ADOPTING, snapshot.state);
+  EXPECT_GT(preserve_trx_memory_current_bytes_status(), 0U);
+
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.abort_gate_adopt(
+                &adopt,
+                Preserve_trx_gate_abort_outcome::ABANDONED_ROLLED_BACK));
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
   preserve_trx_resource_manager_reset_for_unit_test();
 }
 

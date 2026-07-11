@@ -18,6 +18,7 @@
 
 #include <openssl/sha.h>
 
+#include "sql/binlog_preserve_prepared.h"
 #include "sql/preserve_trx_resource.h"
 
 class Preserve_trx_physical_fence_lease_factory {
@@ -37,7 +38,9 @@ class Preserve_trx_physical_fence_lease_factory {
 class Preserve_trx_prepared_token_resources::Impl {
  public:
   Preserve_memory_lease lock_plan_memory;
-  Preserve_memory_lease native_binlog_memory;
+  Preserve_native_binlog_resource_lease native_binlog_resources;
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle>
+      native_binlog_handle;
   uint64_t lock_plan_bytes{0};
   uint64_t native_binlog_bytes{0};
   bool acquired{false};
@@ -56,6 +59,7 @@ struct Preserve_trx_prepared_token_entry {
   std::shared_ptr<const Preserve_trx_prepared_token_publication> publication;
   Preserve_trx_prepared_token_resources resources;
   bool preparing{false};
+  bool retired_from_registry{false};
   uint64_t preparing_generation{0};
 };
 
@@ -133,6 +137,18 @@ std::atomic<uint64_t> g_resume_binlog_payload_read_bytes{0};
 std::atomic<uint64_t> g_resume_binlog_payload_write_bytes{0};
 std::atomic<uint64_t> g_resume_binlog_rename_count{0};
 
+#ifndef NDEBUG
+Preserve_trx_prepared_registry_probe g_prepared_registry_probe{nullptr};
+void *g_prepared_registry_probe_context{nullptr};
+
+void run_prepared_registry_probe(
+    Preserve_trx_prepared_registry_probe_point point) {
+  if (g_prepared_registry_probe != nullptr) {
+    g_prepared_registry_probe(point, g_prepared_registry_probe_context);
+  }
+}
+#endif
+
 bool provider_ops_are_complete(
     const Preserve_trx_physical_fence_provider_ops &ops) {
   return ops.acquire != nullptr && ops.revalidate != nullptr &&
@@ -202,6 +218,23 @@ bool prepared_state_accepts_generation(
   }
 }
 
+bool prepared_state_has_live_or_ambiguous_owner(
+    Preserve_trx_prepared_token_state state) {
+  switch (state) {
+    case Preserve_trx_prepared_token_state::ADOPTING:
+    case Preserve_trx_prepared_token_state::ADOPTED_LOCKED:
+    case Preserve_trx_prepared_token_state::ATTACHING:
+    case Preserve_trx_prepared_token_state::ACTIVATING:
+    case Preserve_trx_prepared_token_state::ACTIVE:
+    case Preserve_trx_prepared_token_state::CLEANUP_PENDING:
+    case Preserve_trx_prepared_token_state::CLEANUP_TAINTED:
+    case Preserve_trx_prepared_token_state::ATTACH_TAINTED:
+      return true;
+    default:
+      return false;
+  }
+}
+
 std::shared_ptr<Preserve_trx_prepared_token_entry> find_prepared_entry(
     const std::shared_ptr<Preserve_trx_prepared_registry_state> &registry,
     const Preserve_trx_prepared_token_key &key) {
@@ -259,13 +292,27 @@ bool final_token_facts_are_valid(const Preserve_trx_final_token_facts &facts) {
          !facts.target_boot_incarnation.empty() && facts.semantic_validated &&
          facts.lock_plan_ready && facts.binlog_handle_ready &&
          facts.resources_reserved && facts.epoch_prepare_deadline_us != 0 &&
-         facts.client_resume_deadline_us != 0;
+         facts.client_resume_deadline_us != 0 &&
+         ((!facts.binlog_cache_present && facts.binlog_handle_digest.empty()) ||
+          (facts.binlog_cache_present &&
+           digest_is_sha256_hex(facts.binlog_handle_digest)));
 }
 
 std::string prepared_resource_token(
     const Preserve_trx_prepared_token_key &key) {
   return key.source_uuid + "\x1f" + key.epoch_id + "\x1f" + key.token +
          "\x1f" + std::to_string(key.generation);
+}
+
+Mysql_binlog_preserve_token_identity prepared_binlog_identity(
+    const Preserve_trx_prepared_token_key &key) {
+  Mysql_binlog_preserve_token_identity identity;
+  identity.source_uuid = key.source_uuid;
+  identity.epoch_id = key.epoch_id;
+  identity.token = key.token;
+  identity.target_boot_incarnation = key.target_boot_incarnation;
+  identity.generation = key.generation;
+  return identity;
 }
 
 Preserve_trx_physical_fence_status acquire_with_provider(
@@ -490,6 +537,9 @@ bool preserved_trx_finalize_token_facts(
   append_canonical_bool(&canonical, facts->predicate_lock_present);
   append_canonical_bool(&canonical, facts->binlog_cache_present);
   append_canonical_bool(&canonical, facts->binlog_cache_file_backed);
+  if (!append_canonical_string(&canonical, facts->binlog_handle_digest)) {
+    return false;
+  }
   const std::string digest = sha256_hex_string(canonical);
   if (!facts->canonical_digest.empty() && facts->canonical_digest != digest) {
     return false;
@@ -523,13 +573,49 @@ uint64_t Preserve_trx_prepared_token_resources::native_binlog_bytes() const {
   return m_impl == nullptr ? 0 : m_impl->native_binlog_bytes;
 }
 
+bool Preserve_trx_prepared_token_resources::has_native_binlog_handle() const {
+  return m_impl != nullptr && m_impl->native_binlog_handle != nullptr;
+}
+
+Mysql_binlog_preserve_cache_status
+Preserve_trx_prepared_token_resources::prepare_native_binlog_handle(
+    const Preserve_trx_internal_operation_capability &capability,
+    const Mysql_binlog_preserve_cache_facts &facts,
+    Mysql_binlog_preserve_payload_reader *reader) {
+  if (m_impl == nullptr || !m_impl->acquired ||
+      m_impl->native_binlog_handle != nullptr ||
+      !m_impl->native_binlog_resources.acquired()) {
+    return Mysql_binlog_preserve_cache_status::INVALID_STATE;
+  }
+  const auto status = mysql_binlog_preserve_prepare_detached_cache(
+      capability, facts, reader, std::move(m_impl->native_binlog_resources),
+      &m_impl->native_binlog_handle);
+  if (status != Mysql_binlog_preserve_cache_status::OK)
+    m_impl->acquired = false;
+  return status;
+}
+
 Preserve_trx_prepared_status
 preserved_trx_acquire_prepared_token_resources(
     const Preserve_trx_prepared_token_key &key, uint64_t lock_plan_bytes,
     uint64_t native_binlog_bytes,
     Preserve_trx_prepared_token_resources *resources) {
+  if (native_binlog_bytes != 0)
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  return preserved_trx_acquire_prepared_token_resources(
+      key, lock_plan_bytes, 0, 0, 0, resources);
+}
+
+Preserve_trx_prepared_status
+preserved_trx_acquire_prepared_token_resources(
+    const Preserve_trx_prepared_token_key &key, uint64_t lock_plan_bytes,
+    uint64_t native_binlog_bytes, uint64_t native_binlog_fd_count,
+    uint64_t native_binlog_tmpdir_bytes,
+    Preserve_trx_prepared_token_resources *resources) {
   if (!prepared_token_key_is_valid(key) || resources == nullptr ||
-      resources->acquired()) {
+      resources->acquired() ||
+      ((native_binlog_bytes == 0) != (native_binlog_fd_count == 0)) ||
+      (native_binlog_bytes == 0 && native_binlog_tmpdir_bytes != 0)) {
     return Preserve_trx_prepared_status::INVALID_ARGUMENT;
   }
   Preserve_trx_prepared_token_resources acquired;
@@ -540,12 +626,14 @@ preserved_trx_acquire_prepared_token_resources(
   if (!acquired.m_impl->lock_plan_memory.acquired()) {
     return Preserve_trx_prepared_status::RESOURCE_EXHAUSTED;
   }
-  acquired.m_impl->native_binlog_memory = preserve_trx_acquire_memory_lease(
-      resource_token,
-      Preserve_trx_memory_kind::PROMOTION_BINLOG_NATIVE_CACHE,
-      native_binlog_bytes);
-  if (!acquired.m_impl->native_binlog_memory.acquired()) {
-    return Preserve_trx_prepared_status::RESOURCE_EXHAUSTED;
+  if (native_binlog_bytes != 0) {
+    acquired.m_impl->native_binlog_resources =
+        preserve_trx_acquire_native_binlog_resource_lease(
+            resource_token, native_binlog_bytes, native_binlog_fd_count,
+            native_binlog_tmpdir_bytes);
+    if (!acquired.m_impl->native_binlog_resources.acquired()) {
+      return Preserve_trx_prepared_status::RESOURCE_EXHAUSTED;
+    }
   }
   acquired.m_impl->lock_plan_bytes = lock_plan_bytes;
   acquired.m_impl->native_binlog_bytes = native_binlog_bytes;
@@ -655,6 +743,61 @@ Preserve_trx_attach_lease &Preserve_trx_attach_lease::operator=(
 
 Preserve_trx_attach_lease::~Preserve_trx_attach_lease() { fail_closed(); }
 
+Preserve_trx_prepared_status
+Preserve_trx_attach_lease::take_native_binlog_handle(
+    std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> *out) {
+  if (!m_active || m_entry == nullptr || m_activation_started || out == nullptr ||
+      *out != nullptr) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  std::lock_guard<std::mutex> guard(m_entry->mutex);
+  if (m_entry->state.load(std::memory_order_acquire) !=
+      Preserve_trx_prepared_token_state::ATTACHING) {
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  const auto publication = std::atomic_load_explicit(
+      &m_entry->publication, std::memory_order_acquire);
+  if (publication == nullptr || !publication->facts.binlog_cache_present ||
+      m_entry->resources.m_impl == nullptr ||
+      m_entry->resources.m_impl->native_binlog_handle == nullptr ||
+      !m_entry->resources.m_impl->native_binlog_handle->matches(
+          prepared_binlog_identity(publication->key),
+          publication->facts.binlog_handle_digest,
+          publication->facts.binlog_cache_length,
+          publication->facts.binlog_cache_file_backed)) {
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  *out = std::move(m_entry->resources.m_impl->native_binlog_handle);
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_attach_lease::restore_native_binlog_handle(
+    std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> *inout) {
+  if (!m_active || m_entry == nullptr || m_activation_started ||
+      inout == nullptr || *inout == nullptr) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  std::lock_guard<std::mutex> guard(m_entry->mutex);
+  if (m_entry->state.load(std::memory_order_acquire) !=
+          Preserve_trx_prepared_token_state::ATTACHING ||
+      m_entry->resources.m_impl == nullptr ||
+      m_entry->resources.m_impl->native_binlog_handle != nullptr) {
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  const auto publication = std::atomic_load_explicit(
+      &m_entry->publication, std::memory_order_acquire);
+  if (publication == nullptr ||
+      !(*inout)->matches(prepared_binlog_identity(publication->key),
+                         publication->facts.binlog_handle_digest,
+                         publication->facts.binlog_cache_length,
+                         publication->facts.binlog_cache_file_backed)) {
+    return Preserve_trx_prepared_status::DIGEST_CONFLICT;
+  }
+  m_entry->resources.m_impl->native_binlog_handle = std::move(*inout);
+  return Preserve_trx_prepared_status::OK;
+}
+
 void Preserve_trx_cleanup_lease::fail_closed() {
   if (!m_active || m_entry == nullptr) return;
   auto expected = Preserve_trx_prepared_token_state::CLEANUP_PENDING;
@@ -713,7 +856,15 @@ Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::begin_prepare
     }
   }
 
+#ifndef NDEBUG
+  run_prepared_registry_probe(
+      Preserve_trx_prepared_registry_probe_point::BEGIN_PREPARE_AFTER_LOOKUP);
+#endif
+
   std::lock_guard<std::mutex> entry_guard(entry->mutex);
+  if (entry->retired_from_registry) {
+    return Preserve_trx_prepared_status::NOT_FOUND;
+  }
   const auto state = entry->state.load(std::memory_order_acquire);
   if (!prepared_state_accepts_generation(state)) {
     return Preserve_trx_prepared_status::INVALID_STATE;
@@ -756,7 +907,15 @@ Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::publish_ready
       facts.target_boot_incarnation !=
           lease->m_key.target_boot_incarnation ||
       facts.lock_plan_capacity_bytes != resources.lock_plan_bytes() ||
-      facts.native_binlog_capacity_bytes != resources.native_binlog_bytes()) {
+      facts.native_binlog_capacity_bytes != resources.native_binlog_bytes() ||
+      (facts.binlog_cache_present &&
+       (!facts.binlog_handle_ready ||
+        !resources.has_native_binlog_handle() ||
+        !resources.m_impl->native_binlog_handle->matches(
+            prepared_binlog_identity(lease->m_key),
+            facts.binlog_handle_digest, facts.binlog_cache_length,
+            facts.binlog_cache_file_backed))) ||
+      (!facts.binlog_cache_present && resources.has_native_binlog_handle())) {
     return Preserve_trx_prepared_status::INVALID_ARGUMENT;
   }
 
@@ -960,6 +1119,16 @@ Preserve_trx_prepared_token_registry::begin_activation(
       lease->m_activation_started) {
     return Preserve_trx_prepared_status::INVALID_ARGUMENT;
   }
+  {
+    std::lock_guard<std::mutex> guard(lease->m_entry->mutex);
+    const auto publication = std::atomic_load_explicit(
+        &lease->m_entry->publication, std::memory_order_acquire);
+    if (publication == nullptr ||
+        (publication->facts.binlog_cache_present &&
+         lease->m_entry->resources.has_native_binlog_handle())) {
+      return Preserve_trx_prepared_status::INVALID_STATE;
+    }
+  }
   auto expected = Preserve_trx_prepared_token_state::ATTACHING;
   if (!lease->m_entry->state.compare_exchange_strong(
           expected, Preserve_trx_prepared_token_state::ACTIVATING,
@@ -976,6 +1145,16 @@ Preserve_trx_prepared_token_registry::commit_attach(
   if (lease == nullptr || !lease->active() || lease->m_entry == nullptr ||
       !lease->m_activation_started) {
     return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  {
+    std::lock_guard<std::mutex> guard(lease->m_entry->mutex);
+    const auto publication = std::atomic_load_explicit(
+        &lease->m_entry->publication, std::memory_order_acquire);
+    if (publication == nullptr ||
+        (publication->facts.binlog_cache_present &&
+         lease->m_entry->resources.has_native_binlog_handle())) {
+      return Preserve_trx_prepared_status::INVALID_STATE;
+    }
   }
   auto expected = Preserve_trx_prepared_token_state::ACTIVATING;
   if (!lease->m_entry->state.compare_exchange_strong(
@@ -995,6 +1174,16 @@ Preserve_trx_prepared_token_registry::abort_attach_after_full_unwind(
   if (lease == nullptr || !lease->active() || lease->m_entry == nullptr ||
       lease->m_activation_started) {
     return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  {
+    std::lock_guard<std::mutex> guard(lease->m_entry->mutex);
+    const auto publication = std::atomic_load_explicit(
+        &lease->m_entry->publication, std::memory_order_acquire);
+    if (publication == nullptr ||
+        (publication->facts.binlog_cache_present &&
+         !lease->m_entry->resources.has_native_binlog_handle())) {
+      return Preserve_trx_prepared_status::INVALID_STATE;
+    }
   }
   auto expected = Preserve_trx_prepared_token_state::ATTACHING;
   if (!lease->m_entry->state.compare_exchange_strong(
@@ -1104,6 +1293,7 @@ Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::snapshot(
     snapshot->key = entry->key;
     snapshot->facts = {};
     snapshot->state = entry->state.load(std::memory_order_acquire);
+    snapshot->native_binlog_handle_owned = false;
     return Preserve_trx_prepared_status::OK;
   }
   if (!prepared_token_keys_match(publication->key, key)) {
@@ -1112,12 +1302,15 @@ Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::snapshot(
   snapshot->key = publication->key;
   snapshot->facts = publication->facts;
   snapshot->state = entry->state.load(std::memory_order_acquire);
+  snapshot->native_binlog_handle_owned =
+      entry->resources.has_native_binlog_handle();
   return Preserve_trx_prepared_status::OK;
 }
 
 void Preserve_trx_prepared_token_registry::invalidate_incarnation(
     const std::string &current_boot_incarnation) {
   std::vector<std::shared_ptr<Preserve_trx_prepared_token_entry>> entries;
+  std::vector<Preserve_trx_prepared_token_resources> retired_resources;
   {
     std::lock_guard<std::mutex> guard(m_state->mutex);
     for (const auto &item : m_state->entries) entries.push_back(item.second);
@@ -1127,9 +1320,21 @@ void Preserve_trx_prepared_token_registry::invalidate_incarnation(
     if (entry->key.target_boot_incarnation == current_boot_incarnation) {
       continue;
     }
-    entry->state.store(Preserve_trx_prepared_token_state::STALE_GENERATION,
-                       std::memory_order_release);
-    entry->resources = {};
+    auto expected = entry->state.load(std::memory_order_acquire);
+    if (entry->preparing ||
+        prepared_state_has_live_or_ambiguous_owner(expected)) {
+      continue;
+    }
+#ifndef NDEBUG
+    run_prepared_registry_probe(
+        Preserve_trx_prepared_registry_probe_point::INVALIDATE_BEFORE_RETIRE);
+#endif
+    if (!entry->state.compare_exchange_strong(
+            expected, Preserve_trx_prepared_token_state::STALE_GENERATION,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+      continue;
+    }
+    retired_resources.push_back(std::move(entry->resources));
     entry->preparing = false;
     entry->preparing_generation = 0;
   }
@@ -1173,26 +1378,35 @@ size_t Preserve_trx_prepared_token_registry::expire_ready_facts_pending_lease(
 
 void Preserve_trx_prepared_token_registry::purge_epoch(
     const std::string &source_uuid, const std::string &epoch_id) {
-  std::vector<std::shared_ptr<Preserve_trx_prepared_token_entry>> removed;
+  std::vector<Preserve_trx_prepared_token_resources> retired_resources;
   {
     std::lock_guard<std::mutex> guard(m_state->mutex);
     for (auto it = m_state->entries.begin(); it != m_state->entries.end();) {
       if (it->first.source_uuid == source_uuid &&
           it->first.epoch_id == epoch_id) {
-        removed.push_back(it->second);
+        std::lock_guard<std::mutex> entry_guard(it->second->mutex);
+        auto expected = it->second->state.load(std::memory_order_acquire);
+        if (it->second->preparing ||
+            prepared_state_has_live_or_ambiguous_owner(expected)) {
+          ++it;
+          continue;
+        }
+        if (!it->second->state.compare_exchange_strong(
+                expected,
+                Preserve_trx_prepared_token_state::STALE_GENERATION,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+          ++it;
+          continue;
+        }
+        it->second->retired_from_registry = true;
+        retired_resources.push_back(std::move(it->second->resources));
+        it->second->preparing = false;
+        it->second->preparing_generation = 0;
         it = m_state->entries.erase(it);
       } else {
         ++it;
       }
     }
-  }
-  for (const auto &entry : removed) {
-    std::lock_guard<std::mutex> guard(entry->mutex);
-    entry->state.store(Preserve_trx_prepared_token_state::STALE_GENERATION,
-                       std::memory_order_release);
-    entry->resources = {};
-    entry->preparing = false;
-    entry->preparing_generation = 0;
   }
 }
 
@@ -1201,6 +1415,14 @@ preserved_trx_strict_prepared_token_registry() {
   static Preserve_trx_prepared_token_registry registry;
   return registry;
 }
+
+#ifndef NDEBUG
+void preserved_trx_prepared_registry_set_probe_for_unit_test(
+    Preserve_trx_prepared_registry_probe probe, void *context) {
+  g_prepared_registry_probe = probe;
+  g_prepared_registry_probe_context = context;
+}
+#endif
 
 void preserved_trx_promotion_prepared_metrics_reset_for_unit_test() {
   g_resume_core_elapsed_us.store(0, std::memory_order_relaxed);

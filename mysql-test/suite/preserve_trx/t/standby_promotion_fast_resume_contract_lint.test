@@ -36,6 +36,12 @@ my $lock_preserve = read_source(File::Spec->catfile(
   $source_root, 'storage', 'innobase', 'lock', 'lock0preserve.cc'));
 my $lock_native = read_source(File::Spec->catfile(
   $source_root, 'storage', 'innobase', 'lock', 'lock0lock.cc'));
+my $binlog = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'binlog.cc'));
+my $binlog_prepared_h = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'binlog_preserve_prepared.h'));
+my $prepared_gunit = read_source(File::Spec->catfile(
+  $source_root, 'unittest', 'gunit', 'preserve_trx-t.cc'));
 
 die "strict production fence path must stay unreachable before P4\n"
   if $promotion =~ /preserved_trx_acquire_production_physical_fence_lease/ ||
@@ -51,6 +57,11 @@ die "P2 metadata-only lock apply must remain unreachable before P4\n"
      $transfer =~ /lock_preserve_apply_record_lock_metadata_plan/ ||
      $preserve =~ /lock_preserve_apply_record_lock_metadata_plan/;
 
+die "P3 native binlog prepare/attach must remain unreachable before P4/P5\n"
+  if $promotion =~ /mysql_binlog_preserve_(?:prepare|attach)_detached_cache/ ||
+     $transfer =~ /mysql_binlog_preserve_(?:prepare|attach)_detached_cache/ ||
+     $preserve =~ /mysql_binlog_preserve_(?:prepare|attach)_detached_cache/;
+
 die "test physical-fence provider must not be a production fallback\n"
   unless $prepared =~ /g_production_provider_registered/ &&
          $prepared =~ /g_test_provider_registered/ &&
@@ -61,6 +72,50 @@ die "P0 strict contract module must not read InnoDB pages\n"
 
 die "P0 strict contract module must not touch binlog cache internals\n"
   if $prepared =~ /binlog_cache_mngr|register_binlog_handler|IO_CACHE|my_b_read/;
+
+my $binlog_prepare_start = index(
+  $binlog, 'mysql_binlog_preserve_prepare_detached_cache(');
+my $binlog_prepare_end = index(
+  $binlog, 'mysql_binlog_preserve_attach_detached_cache(',
+  $binlog_prepare_start);
+die "cannot locate P3 native binlog prepare block\n"
+  if $binlog_prepare_start < 0 || $binlog_prepare_end <= $binlog_prepare_start;
+my $binlog_prepare_impl = substr(
+  $binlog, $binlog_prepare_start,
+  $binlog_prepare_end - $binlog_prepare_start);
+my $binlog_manager_start = index($binlog, 'class binlog_cache_mngr {');
+my $binlog_manager_end = index(
+  $binlog, 'static binlog_cache_mngr *thd_get_cache_mngr',
+  $binlog_manager_start);
+die "cannot locate native binlog manager layout\n"
+  if $binlog_manager_start < 0 ||
+     $binlog_manager_end <= $binlog_manager_start;
+my $binlog_manager_impl = substr(
+  $binlog, $binlog_manager_start,
+  $binlog_manager_end - $binlog_manager_start);
+die "Preserve must not add per-THD ownership fields to native binlog manager\n"
+  if $binlog_manager_impl =~ /Preserve_(?:memory|native_binlog_resource)_lease/;
+die "P3 native binlog prepare must self-gate feature, capability and binlog mode\n"
+  unless $binlog_prepare_impl =~ /preserve_trx_is_enabled/ &&
+         $binlog_prepare_impl =~ /PREPARE_BINLOG_CACHE/ &&
+         $binlog_prepare_impl =~ /opt_bin_log/ &&
+         $binlog_prepare_impl =~ /preserve_binlog_runtime_is_open/;
+die "P3 native binlog prepare must stream into native cache without payload copy\n"
+  unless $binlog_prepare_impl =~ /reader->read/ &&
+         $binlog_prepare_impl =~ /get_trx_cache\(\)->write/ &&
+         $binlog_prepare_impl !~ /cache_payload\.data/;
+die "P3 handle must keep binlog manager opaque and fixed-address\n"
+  unless $binlog_prepared_h =~ /struct Impl/ &&
+         $binlog_prepare_impl =~
+           /my_malloc\([\s\S]*?sizeof\(binlog_cache_mngr\)/ &&
+         $binlog_prepare_impl =~
+           /new \(manager_memory\) binlog_cache_mngr/;
+die "P3 test capability/runtime hooks must have no production caller\n"
+  if $promotion =~ /make_binlog_capability_for_unit_test|set_runtime_for_unit_test/ ||
+     $transfer =~ /make_binlog_capability_for_unit_test|set_runtime_for_unit_test/ ||
+     $preserve =~ /make_binlog_capability_for_unit_test|set_runtime_for_unit_test/;
+die "P3 test capability must be exercised only by GUnit before P4\n"
+  unless $prepared_gunit =~ /make_binlog_capability_for_unit_test/;
 
 my $metadata_start = index(
   $lock_preserve, 'lock_preserve_build_record_lock_metadata_plan(');

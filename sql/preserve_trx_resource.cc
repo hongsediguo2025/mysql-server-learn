@@ -25,14 +25,20 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <utility>
+
+#ifndef _WIN32
+#include <sys/statvfs.h>
+#endif
 
 #include "my_sys.h"
 #include "mysqld_error.h"
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_lock_warmcopy.h"
+#include "sql/mysqld.h"
 #include "sql/preserve_trx_promotion.h"
 #include "sql/preserve_trx_promotion_prepared.h"
 #include "sql/preserve_trx_transfer.h"
@@ -72,11 +78,119 @@ struct Token_kind_key {
   }
 };
 
+bool preserve_trx_capture_external_resource_limits(
+    Preserve_trx_external_resource_limits *limits) {
+  if (limits == nullptr || open_files_limit == 0) return false;
+#ifdef _WIN32
+  return false;
+#else
+  struct statvfs filesystem{};
+  const char *const tmpdir = mysql_tmpdir;
+  if (tmpdir == nullptr || statvfs(tmpdir, &filesystem) != 0 ||
+      filesystem.f_frsize == 0 ||
+      filesystem.f_bavail >
+          std::numeric_limits<uint64_t>::max() / filesystem.f_frsize) {
+    return false;
+  }
+  limits->open_files_limit = open_files_limit;
+  limits->current_open_files =
+      static_cast<uint64_t>(my_file_opened) + my_stream_opened;
+  limits->tmpdir_free_bytes =
+      static_cast<uint64_t>(filesystem.f_bavail) * filesystem.f_frsize;
+  limits->snapshots_available = true;
+  return true;
+#endif
+}
+
 class Preserve_resource_manager {
  public:
   bool acquire(const std::string &token, Preserve_trx_memory_kind kind,
                uint64_t bytes) {
     std::lock_guard<std::mutex> guard(m_mutex);
+    return acquire_memory_locked(token, kind, bytes);
+  }
+
+  void release(const std::string &token, Preserve_trx_memory_kind kind,
+               uint64_t bytes) {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    release_memory_locked(token, kind, bytes);
+  }
+
+  bool acquire_native_binlog(const std::string &token, uint64_t memory_bytes,
+                             uint64_t fd_count, uint64_t tmpdir_bytes) {
+    Preserve_trx_external_resource_limits limits;
+#ifndef NDEBUG
+    {
+      std::lock_guard<std::mutex> guard(m_mutex);
+      if (m_external_limits_override) {
+        limits = m_external_limits;
+        return acquire_native_binlog_locked(token, memory_bytes, fd_count,
+                                            tmpdir_bytes, limits);
+      }
+    }
+#endif
+    if (!preserve_trx_capture_external_resource_limits(&limits)) return false;
+    std::lock_guard<std::mutex> guard(m_mutex);
+    return acquire_native_binlog_locked(token, memory_bytes, fd_count,
+                                        tmpdir_bytes, limits);
+  }
+
+  void release_native_binlog(const std::string &token, uint64_t memory_bytes,
+                             uint64_t fd_count, uint64_t tmpdir_bytes) {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    release_memory_locked(token,
+                          Preserve_trx_memory_kind::PROMOTION_BINLOG_NATIVE_CACHE,
+                          memory_bytes);
+    auto fd_it = m_native_fd_by_token.find(token);
+    const uint64_t released_fds =
+        fd_it == m_native_fd_by_token.end()
+            ? 0
+            : std::min(fd_count, fd_it->second);
+    m_reserved_native_fds -=
+        std::min(m_reserved_native_fds, released_fds);
+    if (fd_it != m_native_fd_by_token.end()) {
+      if (released_fds >= fd_it->second)
+        m_native_fd_by_token.erase(fd_it);
+      else
+        fd_it->second -= released_fds;
+    }
+    auto tmp_it = m_native_tmpdir_by_token.find(token);
+    const uint64_t released_tmpdir =
+        tmp_it == m_native_tmpdir_by_token.end()
+            ? 0
+            : std::min(tmpdir_bytes, tmp_it->second);
+    m_reserved_native_tmpdir_bytes -=
+        std::min(m_reserved_native_tmpdir_bytes, released_tmpdir);
+    if (tmp_it != m_native_tmpdir_by_token.end()) {
+      if (released_tmpdir >= tmp_it->second)
+        m_native_tmpdir_by_token.erase(tmp_it);
+      else
+        tmp_it->second -= released_tmpdir;
+    }
+  }
+
+#ifndef NDEBUG
+  void set_external_limits_for_unit_test(
+      const Preserve_trx_external_resource_limits &limits) {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    m_external_limits = limits;
+    m_external_limits_override = limits.snapshots_available;
+  }
+
+  uint64_t reserved_native_fds_for_unit_test() const {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    return m_reserved_native_fds;
+  }
+
+  uint64_t reserved_native_tmpdir_bytes_for_unit_test() const {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    return m_reserved_native_tmpdir_bytes;
+  }
+#endif
+
+ private:
+  bool acquire_memory_locked(const std::string &token,
+                             Preserve_trx_memory_kind kind, uint64_t bytes) {
     const size_t kind_index = preserve_memory_kind_index(kind);
     if (token.empty() || kind_index >= kPreserveMemoryKindCount) return false;
     /*
@@ -89,15 +203,12 @@ class Preserve_resource_manager {
     const uint64_t per_token_budget = preserve_trx_memory_per_token_bytes;
     if (bytes > global_budget || bytes > per_token_budget) return false;
     if (m_current_bytes > global_budget - bytes) return false;
-
     const uint64_t kind_cap = preserve_memory_kind_cap(kind, global_budget);
     if (bytes > kind_cap || m_by_kind[kind_index] > kind_cap - bytes) {
       return false;
     }
-
     const uint64_t token_bytes = m_by_token[token];
     if (token_bytes > per_token_budget - bytes) return false;
-
     m_current_bytes += bytes;
     m_peak_bytes = std::max(m_peak_bytes, m_current_bytes);
     m_by_token[token] = token_bytes + bytes;
@@ -106,16 +217,10 @@ class Preserve_resource_manager {
     return true;
   }
 
-  void release(const std::string &token, Preserve_trx_memory_kind kind,
-               uint64_t bytes) {
-    std::lock_guard<std::mutex> guard(m_mutex);
+  void release_memory_locked(const std::string &token,
+                             Preserve_trx_memory_kind kind, uint64_t bytes) {
     const size_t kind_index = preserve_memory_kind_index(kind);
     if (token.empty() || kind_index >= kPreserveMemoryKindCount) return;
-    /*
-      Release is tolerant of repeated or oversized cleanup requests. Only bytes
-      still owned by this token/kind are removed, so one cleanup cannot consume
-      another resource lease's accounting.
-    */
     Token_kind_key key{token, kind};
     auto kind_it = m_by_token_kind.find(key);
     const uint64_t released_bytes =
@@ -144,6 +249,48 @@ class Preserve_resource_manager {
     }
   }
 
+  bool acquire_native_binlog_locked(
+      const std::string &token, uint64_t memory_bytes, uint64_t fd_count,
+      uint64_t tmpdir_bytes,
+      const Preserve_trx_external_resource_limits &limits) {
+    if (token.empty() || memory_bytes == 0 || fd_count == 0 ||
+        !limits.snapshots_available || limits.open_files_limit == 0) {
+      return false;
+    }
+    const uint64_t fd_headroom =
+        std::max<uint64_t>(64, limits.open_files_limit / 10);
+    if (limits.current_open_files > limits.open_files_limit ||
+        m_reserved_native_fds >
+            limits.open_files_limit - limits.current_open_files ||
+        fd_count > limits.open_files_limit - limits.current_open_files -
+                       m_reserved_native_fds ||
+        fd_headroom > limits.open_files_limit - limits.current_open_files -
+                          m_reserved_native_fds - fd_count) {
+      return false;
+    }
+    const uint64_t tmpdir_headroom = std::max<uint64_t>(
+        1ULL * 1024ULL * 1024ULL * 1024ULL,
+        limits.tmpdir_free_bytes / 10);
+    if (m_reserved_native_tmpdir_bytes > limits.tmpdir_free_bytes ||
+        tmpdir_bytes >
+            limits.tmpdir_free_bytes - m_reserved_native_tmpdir_bytes ||
+        tmpdir_headroom > limits.tmpdir_free_bytes -
+                              m_reserved_native_tmpdir_bytes - tmpdir_bytes) {
+      return false;
+    }
+    if (!acquire_memory_locked(
+            token, Preserve_trx_memory_kind::PROMOTION_BINLOG_NATIVE_CACHE,
+            memory_bytes)) {
+      return false;
+    }
+    m_reserved_native_fds += fd_count;
+    m_reserved_native_tmpdir_bytes += tmpdir_bytes;
+    m_native_fd_by_token[token] += fd_count;
+    m_native_tmpdir_by_token[token] += tmpdir_bytes;
+    return true;
+  }
+
+ public:
   void note_spill_bytes(uint64_t bytes) {
     std::lock_guard<std::mutex> guard(m_mutex);
     m_spill_bytes += bytes;
@@ -189,6 +336,10 @@ class Preserve_resource_manager {
     m_by_token.clear();
     m_by_token_kind.clear();
     m_by_kind.fill(0);
+    m_reserved_native_fds = 0;
+    m_reserved_native_tmpdir_bytes = 0;
+    m_native_fd_by_token.clear();
+    m_native_tmpdir_by_token.clear();
   }
 
  private:
@@ -200,6 +351,14 @@ class Preserve_resource_manager {
   std::map<std::string, uint64_t> m_by_token;
   std::map<Token_kind_key, uint64_t> m_by_token_kind;
   std::array<uint64_t, kPreserveMemoryKindCount> m_by_kind{};
+  uint64_t m_reserved_native_fds{0};
+  uint64_t m_reserved_native_tmpdir_bytes{0};
+  std::map<std::string, uint64_t> m_native_fd_by_token;
+  std::map<std::string, uint64_t> m_native_tmpdir_by_token;
+#ifndef NDEBUG
+  Preserve_trx_external_resource_limits m_external_limits;
+  bool m_external_limits_override{false};
+#endif
 };
 
 Preserve_resource_manager g_preserve_resource_manager;
@@ -818,6 +977,73 @@ Preserve_memory_lease preserve_trx_acquire_memory_lease(
   return Preserve_memory_lease(token, kind, bytes, true);
 }
 
+Preserve_native_binlog_resource_lease::
+    Preserve_native_binlog_resource_lease(std::string token,
+                                          uint64_t memory_bytes,
+                                          uint64_t fd_count,
+                                          uint64_t tmpdir_bytes, bool acquired)
+    : m_token(std::move(token)),
+      m_memory_bytes(memory_bytes),
+      m_fd_count(fd_count),
+      m_tmpdir_bytes(tmpdir_bytes),
+      m_acquired(acquired) {}
+
+Preserve_native_binlog_resource_lease::
+    Preserve_native_binlog_resource_lease(
+        Preserve_native_binlog_resource_lease &&other) noexcept
+    : m_token(std::move(other.m_token)),
+      m_memory_bytes(other.m_memory_bytes),
+      m_fd_count(other.m_fd_count),
+      m_tmpdir_bytes(other.m_tmpdir_bytes),
+      m_acquired(other.m_acquired) {
+  other.m_memory_bytes = 0;
+  other.m_fd_count = 0;
+  other.m_tmpdir_bytes = 0;
+  other.m_acquired = false;
+}
+
+Preserve_native_binlog_resource_lease &
+Preserve_native_binlog_resource_lease::operator=(
+    Preserve_native_binlog_resource_lease &&other) noexcept {
+  if (this == &other) return *this;
+  release();
+  m_token = std::move(other.m_token);
+  m_memory_bytes = other.m_memory_bytes;
+  m_fd_count = other.m_fd_count;
+  m_tmpdir_bytes = other.m_tmpdir_bytes;
+  m_acquired = other.m_acquired;
+  other.m_memory_bytes = 0;
+  other.m_fd_count = 0;
+  other.m_tmpdir_bytes = 0;
+  other.m_acquired = false;
+  return *this;
+}
+
+Preserve_native_binlog_resource_lease::
+    ~Preserve_native_binlog_resource_lease() {
+  release();
+}
+
+void Preserve_native_binlog_resource_lease::release() {
+  if (!m_acquired) return;
+  g_preserve_resource_manager.release_native_binlog(
+      m_token, m_memory_bytes, m_fd_count, m_tmpdir_bytes);
+  m_memory_bytes = 0;
+  m_fd_count = 0;
+  m_tmpdir_bytes = 0;
+  m_acquired = false;
+}
+
+Preserve_native_binlog_resource_lease
+preserve_trx_acquire_native_binlog_resource_lease(
+    const std::string &token, uint64_t memory_bytes, uint64_t fd_count,
+    uint64_t tmpdir_bytes) {
+  const bool acquired = g_preserve_resource_manager.acquire_native_binlog(
+      token, memory_bytes, fd_count, tmpdir_bytes);
+  return Preserve_native_binlog_resource_lease(
+      token, memory_bytes, fd_count, tmpdir_bytes, acquired);
+}
+
 bool preserve_trx_resource_acquire_memory(const std::string &token,
                                           Preserve_trx_memory_kind kind,
                                           uint64_t bytes) {
@@ -875,3 +1101,20 @@ uint64_t preserve_trx_resource_kind_cap_bytes_for_unit_test(
     Preserve_trx_memory_kind kind) {
   return preserve_memory_kind_cap(kind, preserve_trx_memory_budget_bytes);
 }
+
+#ifndef NDEBUG
+void preserve_trx_resource_manager_set_external_limits_for_unit_test(
+    const Preserve_trx_external_resource_limits &limits) {
+  g_preserve_resource_manager.set_external_limits_for_unit_test(limits);
+}
+
+uint64_t preserve_trx_native_binlog_reserved_fd_count_for_unit_test() {
+  return g_preserve_resource_manager.reserved_native_fds_for_unit_test();
+}
+
+uint64_t
+preserve_trx_native_binlog_reserved_tmpdir_bytes_for_unit_test() {
+  return g_preserve_resource_manager
+      .reserved_native_tmpdir_bytes_for_unit_test();
+}
+#endif

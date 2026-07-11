@@ -66,6 +66,13 @@ struct Preserve_trx_resource_limits {
   uint64_t per_token_memory_budget_bytes{64ULL * 1024ULL * 1024ULL};
 };
 
+struct Preserve_trx_external_resource_limits {
+  uint64_t open_files_limit{0};
+  uint64_t current_open_files{0};
+  uint64_t tmpdir_free_bytes{0};
+  bool snapshots_available{false};
+};
+
 class Preserve_memory_lease {
  public:
   Preserve_memory_lease() = default;
@@ -100,6 +107,52 @@ class Preserve_memory_lease {
 Preserve_memory_lease preserve_trx_acquire_memory_lease(
     const std::string &token, Preserve_trx_memory_kind kind, uint64_t bytes);
 
+/*
+  Atomic Preserve-owned reservation for a detached native binlog cache. The
+  OS open and write operations remain authoritative; this lease prevents
+  Preserve workers from oversubscribing one another before those operations.
+*/
+class Preserve_native_binlog_resource_lease {
+ public:
+  Preserve_native_binlog_resource_lease() = default;
+  Preserve_native_binlog_resource_lease(
+      const Preserve_native_binlog_resource_lease &) = delete;
+  Preserve_native_binlog_resource_lease &operator=(
+      const Preserve_native_binlog_resource_lease &) = delete;
+  Preserve_native_binlog_resource_lease(
+      Preserve_native_binlog_resource_lease &&other) noexcept;
+  Preserve_native_binlog_resource_lease &operator=(
+      Preserve_native_binlog_resource_lease &&other) noexcept;
+  ~Preserve_native_binlog_resource_lease();
+
+  bool acquired() const { return m_acquired; }
+  uint64_t memory_bytes() const { return m_memory_bytes; }
+  uint64_t fd_count() const { return m_fd_count; }
+  uint64_t tmpdir_bytes() const { return m_tmpdir_bytes; }
+  void release();
+
+ private:
+  Preserve_native_binlog_resource_lease(std::string token,
+                                        uint64_t memory_bytes,
+                                        uint64_t fd_count,
+                                        uint64_t tmpdir_bytes, bool acquired);
+
+  std::string m_token;
+  uint64_t m_memory_bytes{0};
+  uint64_t m_fd_count{0};
+  uint64_t m_tmpdir_bytes{0};
+  bool m_acquired{false};
+
+  friend Preserve_native_binlog_resource_lease
+  preserve_trx_acquire_native_binlog_resource_lease(
+      const std::string &, uint64_t, uint64_t, uint64_t);
+};
+
+Preserve_native_binlog_resource_lease
+preserve_trx_acquire_native_binlog_resource_lease(
+    const std::string &token, uint64_t memory_bytes, uint64_t fd_count,
+    uint64_t tmpdir_bytes);
+
 /* Manual acquire/release helpers for callers that cannot hold an RAII object. */
 bool preserve_trx_resource_acquire_memory(const std::string &token,
                                           Preserve_trx_memory_kind kind,
@@ -124,6 +177,12 @@ ulonglong preserve_trx_spill_failures_status();
 void preserve_trx_resource_manager_reset_for_unit_test();
 void preserve_trx_resource_manager_set_limits_for_unit_test(
     const Preserve_trx_resource_limits &limits);
+#ifndef NDEBUG
+void preserve_trx_resource_manager_set_external_limits_for_unit_test(
+    const Preserve_trx_external_resource_limits &limits);
+uint64_t preserve_trx_native_binlog_reserved_fd_count_for_unit_test();
+uint64_t preserve_trx_native_binlog_reserved_tmpdir_bytes_for_unit_test();
+#endif
 uint64_t preserve_trx_resource_kind_current_bytes_for_unit_test(
     Preserve_trx_memory_kind kind);
 uint64_t preserve_trx_resource_kind_cap_bytes_for_unit_test(

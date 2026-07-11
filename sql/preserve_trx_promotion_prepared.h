@@ -15,6 +15,12 @@
 #include <memory>
 #include <string>
 
+class Mysql_binlog_preserve_payload_reader;
+class Mysql_binlog_preserve_prepared_cache_handle;
+class Preserve_trx_internal_operation_capability;
+struct Mysql_binlog_preserve_cache_facts;
+enum class Mysql_binlog_preserve_cache_status : uint8_t;
+
 enum class Preserve_trx_physical_consistency_mode : uint8_t {
   NONE = 0,
   TEST_SAME_INSTANCE_ATTACH_ONLY,
@@ -191,6 +197,7 @@ struct Preserve_trx_final_token_facts {
   bool predicate_lock_present{false};
   bool binlog_cache_present{false};
   bool binlog_cache_file_backed{false};
+  std::string binlog_handle_digest;
   std::string canonical_digest;
 };
 
@@ -213,6 +220,11 @@ class Preserve_trx_prepared_token_resources {
   bool acquired() const;
   uint64_t lock_plan_bytes() const;
   uint64_t native_binlog_bytes() const;
+  bool has_native_binlog_handle() const;
+  Mysql_binlog_preserve_cache_status prepare_native_binlog_handle(
+      const Preserve_trx_internal_operation_capability &capability,
+      const Mysql_binlog_preserve_cache_facts &facts,
+      Mysql_binlog_preserve_payload_reader *reader);
 
  private:
   class Impl;
@@ -220,15 +232,22 @@ class Preserve_trx_prepared_token_resources {
 
   friend Preserve_trx_prepared_status
   preserved_trx_acquire_prepared_token_resources(
-      const Preserve_trx_prepared_token_key &, uint64_t, uint64_t,
-      Preserve_trx_prepared_token_resources *);
+      const Preserve_trx_prepared_token_key &, uint64_t, uint64_t, uint64_t,
+      uint64_t, Preserve_trx_prepared_token_resources *);
   friend class Preserve_trx_prepared_token_registry;
+  friend class Preserve_trx_attach_lease;
 };
 
 Preserve_trx_prepared_status
 preserved_trx_acquire_prepared_token_resources(
     const Preserve_trx_prepared_token_key &key, uint64_t lock_plan_bytes,
     uint64_t native_binlog_bytes,
+    Preserve_trx_prepared_token_resources *resources);
+Preserve_trx_prepared_status
+preserved_trx_acquire_prepared_token_resources(
+    const Preserve_trx_prepared_token_key &key, uint64_t lock_plan_bytes,
+    uint64_t native_binlog_bytes, uint64_t native_binlog_fd_count,
+    uint64_t native_binlog_tmpdir_bytes,
     Preserve_trx_prepared_token_resources *resources);
 
 struct Preserve_trx_prepared_registry_state;
@@ -290,6 +309,10 @@ class Preserve_trx_attach_lease {
   ~Preserve_trx_attach_lease();
   bool active() const { return m_active; }
   bool activation_started() const { return m_activation_started; }
+  Preserve_trx_prepared_status take_native_binlog_handle(
+      std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> *out);
+  Preserve_trx_prepared_status restore_native_binlog_handle(
+      std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> *inout);
 
  private:
   void fail_closed();
@@ -323,6 +346,7 @@ struct Preserve_trx_prepared_token_snapshot {
   Preserve_trx_final_token_facts facts;
   Preserve_trx_prepared_token_state state{
       Preserve_trx_prepared_token_state::NOT_FOUND};
+  bool native_binlog_handle_owned{false};
 };
 
 class Preserve_trx_prepared_token_registry {
@@ -428,5 +452,16 @@ uint64_t preserve_trx_resource_admission_open_failed_count_status();
 uint64_t preserve_trx_resume_binlog_payload_read_bytes_status();
 uint64_t preserve_trx_resume_binlog_payload_write_bytes_status();
 uint64_t preserve_trx_resume_binlog_rename_count_status();
+
+#ifndef NDEBUG
+enum class Preserve_trx_prepared_registry_probe_point : uint8_t {
+  BEGIN_PREPARE_AFTER_LOOKUP = 0,
+  INVALIDATE_BEFORE_RETIRE
+};
+using Preserve_trx_prepared_registry_probe = void (*)(
+    Preserve_trx_prepared_registry_probe_point, void *);
+void preserved_trx_prepared_registry_set_probe_for_unit_test(
+    Preserve_trx_prepared_registry_probe probe, void *context);
+#endif
 
 #endif  // SQL_PRESERVE_TRX_PROMOTION_PREPARED_INCLUDED
