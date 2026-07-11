@@ -399,6 +399,21 @@ TEST(LockWarmcopyMetadataPlan,
                 payload, validation, make_metadata_dict_lease_ops(), &plan));
 }
 
+TEST(LockWarmcopyMetadataPlan,
+     DefaultDictionaryLeaseFailsClosedWithoutPageAccess) {
+  constexpr uint32_t kRecordBitmapMargin = 64;
+  constexpr uint32_t kPageNHeap = 16;
+  std::string bitmap(1 + ((kPageNHeap + kRecordBitmapMargin) / 8), '\0');
+  bitmap[0] = static_cast<char>(0x02);
+  const std::string payload = make_metadata_record_lock_payload(
+      LOCK_REC | LOCK_X, kPageNHeap, bitmap);
+  auto validation = make_metadata_plan_validation(payload);
+  lock_preserve_metadata_plan_t plan;
+  EXPECT_EQ(lock_preserve_metadata_plan_status::DICT_LEASE_FAILED,
+            lock_preserve_build_record_lock_metadata_plan_with_default_dict_lease(
+                payload, validation, &plan));
+}
+
 TEST(LockWarmcopyMetadataPlan, RejectsWaitPredicateAndDigestMismatch) {
   constexpr uint32_t kRecordBitmapMargin = 64;
   const uint32_t page_n_heap = 16;

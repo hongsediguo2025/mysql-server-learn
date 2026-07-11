@@ -40,6 +40,7 @@ as published by the Free Software Foundation.
 #include "current_thd.h"
 #include "debug_sync.h"
 #include "dict0dd.h"
+#include "dict0dict.h"
 #include "dict0mem.h"
 #include "fil0fil.h"
 #include "ha_prototypes.h"
@@ -2302,6 +2303,116 @@ lock_preserve_build_record_lock_metadata_plan(
   prepared->ready = true;
   plan->m_impl = std::move(prepared);
   return lock_preserve_metadata_plan_status::OK;
+}
+
+namespace {
+
+class Lock_preserve_metadata_table_handle {
+ public:
+  explicit Lock_preserve_metadata_table_handle(table_id_t table_id)
+      : m_table(dd_table_open_on_id(table_id, nullptr, nullptr, false, true)) {}
+
+  ~Lock_preserve_metadata_table_handle() {
+    if (m_table != nullptr) {
+      dd_table_close(m_table, nullptr, nullptr, false);
+    }
+  }
+
+  dict_table_t *get() const { return m_table; }
+
+  Lock_preserve_metadata_table_handle(
+      const Lock_preserve_metadata_table_handle &) = delete;
+  Lock_preserve_metadata_table_handle &operator=(
+      const Lock_preserve_metadata_table_handle &) = delete;
+
+ private:
+  dict_table_t *m_table{nullptr};
+};
+
+struct Lock_preserve_metadata_default_lease_context {
+  std::unordered_map<
+      table_id_t, std::shared_ptr<Lock_preserve_metadata_table_handle>>
+      tables;
+};
+
+struct Lock_preserve_metadata_default_lease {
+  std::shared_ptr<Lock_preserve_metadata_table_handle> table;
+  table_id_t table_id{0};
+  space_index_t index_id{0};
+  space_id_t space_id{0};
+};
+
+static dict_index_t *lock_preserve_metadata_default_lease_index(
+    const Lock_preserve_metadata_default_lease &lease) {
+  dict_table_t *table = lease.table == nullptr ? nullptr : lease.table->get();
+  if (table == nullptr || table->id != lease.table_id ||
+      table->ibd_file_missing || table->is_temporary()) {
+    return nullptr;
+  }
+  dict_index_t *index = lock_preserve_find_index(table, lease.index_id);
+  return index != nullptr && index->space == lease.space_id ? index : nullptr;
+}
+
+static bool lock_preserve_metadata_default_lease_acquire(
+    void *opaque_context, table_id_t table_id, space_index_t index_id,
+    space_id_t space_id, const std::string &, void **opaque_lease,
+    dict_index_t **index) {
+  if (opaque_context == nullptr || opaque_lease == nullptr || index == nullptr) {
+    return false;
+  }
+  *opaque_lease = nullptr;
+  *index = nullptr;
+  if (dict_sys == nullptr) return false;
+
+  auto *context = static_cast<Lock_preserve_metadata_default_lease_context *>(
+      opaque_context);
+  auto found = context->tables.find(table_id);
+  if (found == context->tables.end()) {
+    auto handle =
+        std::make_shared<Lock_preserve_metadata_table_handle>(table_id);
+    found = context->tables.emplace(table_id, std::move(handle)).first;
+  }
+
+  auto lease = std::make_unique<Lock_preserve_metadata_default_lease>();
+  lease->table = found->second;
+  lease->table_id = table_id;
+  lease->index_id = index_id;
+  lease->space_id = space_id;
+  *index = lock_preserve_metadata_default_lease_index(*lease);
+  if (*index == nullptr) return false;
+
+  *opaque_lease = lease.release();
+  return true;
+}
+
+static bool lock_preserve_metadata_default_lease_revalidate(
+    void *opaque_lease, const std::string &, dict_index_t **index) {
+  if (opaque_lease == nullptr || index == nullptr) return false;
+  auto *lease =
+      static_cast<Lock_preserve_metadata_default_lease *>(opaque_lease);
+  *index = lock_preserve_metadata_default_lease_index(*lease);
+  return *index != nullptr;
+}
+
+static void lock_preserve_metadata_default_lease_release(void *opaque_lease) {
+  delete static_cast<Lock_preserve_metadata_default_lease *>(opaque_lease);
+}
+
+}  // namespace
+
+lock_preserve_metadata_plan_status
+lock_preserve_build_record_lock_metadata_plan_with_default_dict_lease(
+    const std::string &payload,
+    const lock_preserve_metadata_plan_validation_t &validation,
+    lock_preserve_metadata_plan_t *plan) {
+  Lock_preserve_metadata_default_lease_context context;
+  lock_preserve_metadata_dict_lease_ops_t lease_ops;
+  lease_ops.context = &context;
+  lease_ops.acquire = lock_preserve_metadata_default_lease_acquire;
+  lease_ops.revalidate = lock_preserve_metadata_default_lease_revalidate;
+  lease_ops.release = lock_preserve_metadata_default_lease_release;
+  return lock_preserve_build_record_lock_metadata_plan(
+      payload, validation, lease_ops, plan);
 }
 
 lock_preserve_metadata_conflict_result

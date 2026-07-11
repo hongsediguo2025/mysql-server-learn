@@ -793,6 +793,15 @@ lock_preserve_build_record_lock_metadata_plan(
     const lock_preserve_metadata_dict_lease_ops_t &dict_lease_ops,
     lock_preserve_metadata_plan_t *plan);
 
+/** Build an immutable record-lock plan using the production dictionary lease.
+The lease pins dictionary objects across receiver prewarm and promotion gate,
+but does not read any InnoDB page. */
+lock_preserve_metadata_plan_status
+lock_preserve_build_record_lock_metadata_plan_with_default_dict_lease(
+    const std::string &payload,
+    const lock_preserve_metadata_plan_validation_t &validation,
+    lock_preserve_metadata_plan_t *plan);
+
 /** Issue best-effort asynchronous reads for pages referenced by a preserved
 record-lock payload.
 @param[in]     payload  opaque serialized record-lock payload
