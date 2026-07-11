@@ -24,6 +24,7 @@
 #include "sql/preserve_trx_resource.h"
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <mutex>
 #include <utility>
@@ -42,6 +43,25 @@ uint preserve_trx_spill_chunk_bytes = 4U * 1024U * 1024U;
 
 namespace {
 
+constexpr size_t kPreserveMemoryKindCount =
+    static_cast<size_t>(Preserve_trx_memory_kind::COUNT);
+
+size_t preserve_memory_kind_index(Preserve_trx_memory_kind kind) {
+  return static_cast<size_t>(kind);
+}
+
+uint64_t preserve_memory_kind_cap(Preserve_trx_memory_kind kind,
+                                  uint64_t global_budget) {
+  switch (kind) {
+    case Preserve_trx_memory_kind::PROMOTION_LOCK_PLAN:
+      return global_budget / 10 * 6 + global_budget % 10 * 6 / 10;
+    case Preserve_trx_memory_kind::PROMOTION_BINLOG_NATIVE_CACHE:
+      return global_budget / 10 * 3 + global_budget % 10 * 3 / 10;
+    default:
+      return global_budget;
+  }
+}
+
 struct Token_kind_key {
   std::string token;
   Preserve_trx_memory_kind kind{Preserve_trx_memory_kind::SNAPSHOT_CODEC_BUFFER};
@@ -57,7 +77,8 @@ class Preserve_resource_manager {
   bool acquire(const std::string &token, Preserve_trx_memory_kind kind,
                uint64_t bytes) {
     std::lock_guard<std::mutex> guard(m_mutex);
-    if (token.empty()) return false;
+    const size_t kind_index = preserve_memory_kind_index(kind);
+    if (token.empty() || kind_index >= kPreserveMemoryKindCount) return false;
     /*
       Resource accounting is scoped by preserved token and memory kind. It
       protects preserve/resume staging buffers from exhausting the process, but
@@ -69,6 +90,11 @@ class Preserve_resource_manager {
     if (bytes > global_budget || bytes > per_token_budget) return false;
     if (m_current_bytes > global_budget - bytes) return false;
 
+    const uint64_t kind_cap = preserve_memory_kind_cap(kind, global_budget);
+    if (bytes > kind_cap || m_by_kind[kind_index] > kind_cap - bytes) {
+      return false;
+    }
+
     const uint64_t token_bytes = m_by_token[token];
     if (token_bytes > per_token_budget - bytes) return false;
 
@@ -76,40 +102,44 @@ class Preserve_resource_manager {
     m_peak_bytes = std::max(m_peak_bytes, m_current_bytes);
     m_by_token[token] = token_bytes + bytes;
     m_by_token_kind[{token, kind}] += bytes;
+    m_by_kind[kind_index] += bytes;
     return true;
   }
 
   void release(const std::string &token, Preserve_trx_memory_kind kind,
                uint64_t bytes) {
     std::lock_guard<std::mutex> guard(m_mutex);
-    if (token.empty()) return;
+    const size_t kind_index = preserve_memory_kind_index(kind);
+    if (token.empty() || kind_index >= kPreserveMemoryKindCount) return;
     /*
-      Release is tolerant of oversized cleanup requests because failure paths
-      may have already released part of the staging buffer. Counters are clipped
-      at zero rather than turning cleanup into a second preserve failure.
+      Release is tolerant of repeated or oversized cleanup requests. Only bytes
+      still owned by this token/kind are removed, so one cleanup cannot consume
+      another resource lease's accounting.
     */
-    if (bytes > m_current_bytes) {
-      m_current_bytes = 0;
-    } else {
-      m_current_bytes -= bytes;
-    }
+    Token_kind_key key{token, kind};
+    auto kind_it = m_by_token_kind.find(key);
+    const uint64_t released_bytes =
+        kind_it == m_by_token_kind.end()
+            ? 0
+            : std::min(bytes, kind_it->second);
+    m_current_bytes -= std::min(m_current_bytes, released_bytes);
+    m_by_kind[kind_index] -=
+        std::min(m_by_kind[kind_index], released_bytes);
 
     auto token_it = m_by_token.find(token);
     if (token_it != m_by_token.end()) {
-      if (bytes >= token_it->second) {
+      if (released_bytes >= token_it->second) {
         m_by_token.erase(token_it);
       } else {
-        token_it->second -= bytes;
+        token_it->second -= released_bytes;
       }
     }
 
-    Token_kind_key key{token, kind};
-    auto kind_it = m_by_token_kind.find(key);
     if (kind_it != m_by_token_kind.end()) {
-      if (bytes >= kind_it->second) {
+      if (released_bytes >= kind_it->second) {
         m_by_token_kind.erase(kind_it);
       } else {
-        kind_it->second -= bytes;
+        kind_it->second -= released_bytes;
       }
     }
   }
@@ -144,6 +174,12 @@ class Preserve_resource_manager {
     return static_cast<ulonglong>(m_spill_failures);
   }
 
+  uint64_t kind_current_bytes(Preserve_trx_memory_kind kind) const {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    const size_t kind_index = preserve_memory_kind_index(kind);
+    return kind_index < kPreserveMemoryKindCount ? m_by_kind[kind_index] : 0;
+  }
+
   void reset_for_unit_test() {
     std::lock_guard<std::mutex> guard(m_mutex);
     m_current_bytes = 0;
@@ -152,6 +188,7 @@ class Preserve_resource_manager {
     m_spill_failures = 0;
     m_by_token.clear();
     m_by_token_kind.clear();
+    m_by_kind.fill(0);
   }
 
  private:
@@ -162,6 +199,7 @@ class Preserve_resource_manager {
   uint64_t m_spill_failures{0};
   std::map<std::string, uint64_t> m_by_token;
   std::map<Token_kind_key, uint64_t> m_by_token_kind;
+  std::array<uint64_t, kPreserveMemoryKindCount> m_by_kind{};
 };
 
 Preserve_resource_manager g_preserve_resource_manager;
@@ -826,4 +864,14 @@ void preserve_trx_resource_manager_set_limits_for_unit_test(
       static_cast<ulonglong>(limits.global_memory_budget_bytes);
   preserve_trx_memory_per_token_bytes =
       static_cast<ulonglong>(limits.per_token_memory_budget_bytes);
+}
+
+uint64_t preserve_trx_resource_kind_current_bytes_for_unit_test(
+    Preserve_trx_memory_kind kind) {
+  return g_preserve_resource_manager.kind_current_bytes(kind);
+}
+
+uint64_t preserve_trx_resource_kind_cap_bytes_for_unit_test(
+    Preserve_trx_memory_kind kind) {
+  return preserve_memory_kind_cap(kind, preserve_trx_memory_budget_bytes);
 }

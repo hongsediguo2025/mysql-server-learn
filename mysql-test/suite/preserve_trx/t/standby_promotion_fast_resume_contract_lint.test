@@ -38,6 +38,10 @@ die "strict production fence path must stay unreachable before P4\n"
      $transfer =~ /preserved_trx_acquire_production_physical_fence_lease/ ||
      $preserve =~ /preserved_trx_acquire_production_physical_fence_lease/;
 
+die "strict registry must remain unreachable from legacy promotion/transfer before P4\n"
+  if $promotion =~ /preserved_trx_strict_prepared_token_registry/ ||
+     $transfer =~ /preserved_trx_strict_prepared_token_registry/;
+
 die "test physical-fence provider must not be a production fallback\n"
   unless $prepared =~ /g_production_provider_registered/ &&
          $prepared =~ /g_test_provider_registered/ &&
@@ -57,6 +61,17 @@ die "strict proof must require exact LSN equality and immutable digests\n"
          $prepared_h =~ /final_lock_generation_digest/ &&
          $prepared_h =~ /page_layout_digest/ &&
          $prepared_h =~ /dictionary_generation_digest/;
+
+die "strict registry must publish immutable facts and own move-only resources\n"
+  unless $prepared_h =~ /Preserve_trx_prepared_token_registry/ &&
+         $prepared_h =~ /Preserve_trx_prepared_token_resources/ &&
+         $prepared =~ /atomic_store_explicit[\s\S]*memory_order_release/ &&
+         $prepared =~ /expire_ready_facts_pending_lease/;
+
+die "final facts digest must use versioned length-delimited big-endian encoding\n"
+  unless $prepared =~ /PTRX_FINAL_TOKEN_FACTS_V1/ &&
+         $prepared =~ /append_canonical_u32/ &&
+         $prepared =~ /for \(int shift = 56; shift >= 0; shift -= 8\)/;
 
 die "fast-resume evidence must be exposed as server-owned status\n"
   unless $mysqld =~ /Preserve_trx_promotion_resume_core_p95_us/ &&

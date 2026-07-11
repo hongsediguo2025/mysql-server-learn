@@ -11,8 +11,14 @@
 #include <atomic>
 #include <cctype>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <utility>
+#include <vector>
+
+#include <openssl/sha.h>
+
+#include "sql/preserve_trx_resource.h"
 
 class Preserve_trx_physical_fence_lease_factory {
  public:
@@ -26,6 +32,50 @@ class Preserve_trx_physical_fence_lease_factory {
     lease->m_proof = std::move(actual);
     lease->m_opaque_lease = opaque_lease;
   }
+};
+
+class Preserve_trx_prepared_token_resources::Impl {
+ public:
+  Preserve_memory_lease lock_plan_memory;
+  Preserve_memory_lease native_binlog_memory;
+  uint64_t lock_plan_bytes{0};
+  uint64_t native_binlog_bytes{0};
+  bool acquired{false};
+};
+
+struct Preserve_trx_prepared_token_publication {
+  Preserve_trx_prepared_token_key key;
+  Preserve_trx_final_token_facts facts;
+};
+
+struct Preserve_trx_prepared_token_entry {
+  std::mutex mutex;
+  std::atomic<Preserve_trx_prepared_token_state> state{
+      Preserve_trx_prepared_token_state::OBJECTS_RECEIVING};
+  Preserve_trx_prepared_token_key key;
+  std::shared_ptr<const Preserve_trx_prepared_token_publication> publication;
+  Preserve_trx_prepared_token_resources resources;
+  bool preparing{false};
+  uint64_t preparing_generation{0};
+};
+
+struct Preserve_trx_prepared_token_locator {
+  std::string source_uuid;
+  std::string epoch_id;
+  std::string token;
+
+  bool operator<(const Preserve_trx_prepared_token_locator &other) const {
+    if (source_uuid != other.source_uuid) return source_uuid < other.source_uuid;
+    if (epoch_id != other.epoch_id) return epoch_id < other.epoch_id;
+    return token < other.token;
+  }
+};
+
+struct Preserve_trx_prepared_registry_state {
+  std::mutex mutex;
+  std::map<Preserve_trx_prepared_token_locator,
+           std::shared_ptr<Preserve_trx_prepared_token_entry>>
+      entries;
 };
 
 namespace {
@@ -113,6 +163,109 @@ bool proofs_match(const Preserve_trx_physical_fence_proof &expected,
          expected.dictionary_generation_digest ==
              actual.dictionary_generation_digest &&
          actual.apply_frozen;
+}
+
+bool prepared_token_key_is_valid(const Preserve_trx_prepared_token_key &key) {
+  return !key.preserve_dir.empty() && !key.source_uuid.empty() &&
+         !key.epoch_id.empty() && !key.token.empty() &&
+         !key.target_boot_incarnation.empty() && key.generation != 0;
+}
+
+Preserve_trx_prepared_token_locator prepared_token_locator(
+    const Preserve_trx_prepared_token_key &key) {
+  return {key.source_uuid, key.epoch_id, key.token};
+}
+
+bool prepared_token_keys_match(const Preserve_trx_prepared_token_key &lhs,
+                               const Preserve_trx_prepared_token_key &rhs) {
+  return lhs.preserve_dir == rhs.preserve_dir &&
+         lhs.source_uuid == rhs.source_uuid && lhs.epoch_id == rhs.epoch_id &&
+         lhs.token == rhs.token &&
+         lhs.target_boot_incarnation == rhs.target_boot_incarnation &&
+         lhs.generation == rhs.generation;
+}
+
+bool prepared_state_accepts_generation(
+    Preserve_trx_prepared_token_state state) {
+  switch (state) {
+    case Preserve_trx_prepared_token_state::OBJECTS_RECEIVING:
+    case Preserve_trx_prepared_token_state::PREWARMING:
+    case Preserve_trx_prepared_token_state::PREWARMED_PENDING_FINAL_FACT:
+    case Preserve_trx_prepared_token_state::READY_FACTS_PENDING_LEASE:
+    case Preserve_trx_prepared_token_state::READY_FOR_GATE:
+    case Preserve_trx_prepared_token_state::NOT_READY:
+    case Preserve_trx_prepared_token_state::RESOURCE_EXHAUSTED:
+    case Preserve_trx_prepared_token_state::STALE_GENERATION:
+      return true;
+    default:
+      return false;
+  }
+}
+
+std::shared_ptr<Preserve_trx_prepared_token_entry> find_prepared_entry(
+    const std::shared_ptr<Preserve_trx_prepared_registry_state> &registry,
+    const Preserve_trx_prepared_token_key &key) {
+  if (registry == nullptr) return nullptr;
+  std::lock_guard<std::mutex> guard(registry->mutex);
+  const auto it = registry->entries.find(prepared_token_locator(key));
+  return it == registry->entries.end() ? nullptr : it->second;
+}
+
+void append_canonical_u32(std::string *encoded, uint32_t value) {
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    encoded->push_back(static_cast<char>((value >> shift) & 0xff));
+  }
+}
+
+void append_canonical_u64(std::string *encoded, uint64_t value) {
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    encoded->push_back(static_cast<char>((value >> shift) & 0xff));
+  }
+}
+
+bool append_canonical_string(std::string *encoded, const std::string &value) {
+  if (value.size() > std::numeric_limits<uint32_t>::max()) return false;
+  append_canonical_u32(encoded, static_cast<uint32_t>(value.size()));
+  encoded->append(value);
+  return true;
+}
+
+void append_canonical_bool(std::string *encoded, bool value) {
+  encoded->push_back(value ? '\x01' : '\x00');
+}
+
+std::string sha256_hex_string(const std::string &payload) {
+  std::array<unsigned char, SHA256_DIGEST_LENGTH> digest{};
+  SHA256(reinterpret_cast<const unsigned char *>(payload.data()),
+         payload.size(), digest.data());
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string encoded;
+  encoded.reserve(digest.size() * 2);
+  for (const unsigned char byte : digest) {
+    encoded.push_back(kHex[(byte >> 4) & 0x0f]);
+    encoded.push_back(kHex[byte & 0x0f]);
+  }
+  return encoded;
+}
+
+bool final_token_facts_are_valid(const Preserve_trx_final_token_facts &facts) {
+  return facts.required_apply_lsn != 0 &&
+         facts.physical_fence_lsn != 0 &&
+         facts.required_apply_lsn <= facts.physical_fence_lsn &&
+         digest_is_sha256_hex(facts.epoch_fact_digest) &&
+         digest_is_sha256_hex(facts.final_lock_generation_digest) &&
+         digest_is_sha256_hex(facts.page_layout_digest) &&
+         digest_is_sha256_hex(facts.dictionary_generation_digest) &&
+         !facts.target_boot_incarnation.empty() && facts.semantic_validated &&
+         facts.lock_plan_ready && facts.binlog_handle_ready &&
+         facts.resources_reserved && facts.epoch_prepare_deadline_us != 0 &&
+         facts.client_resume_deadline_us != 0;
+}
+
+std::string prepared_resource_token(
+    const Preserve_trx_prepared_token_key &key) {
+  return key.source_uuid + "\x1f" + key.epoch_id + "\x1f" + key.token +
+         "\x1f" + std::to_string(key.generation);
 }
 
 Preserve_trx_physical_fence_status acquire_with_provider(
@@ -299,6 +452,754 @@ bool preserved_trx_physical_fence_proof_is_valid(
          digest_is_sha256_hex(proof.page_layout_digest) &&
          digest_is_sha256_hex(proof.dictionary_generation_digest) &&
          proof.apply_frozen;
+}
+
+bool preserved_trx_finalize_token_facts(
+    Preserve_trx_final_token_facts *facts) {
+  if (facts == nullptr || !final_token_facts_are_valid(*facts)) return false;
+  std::string canonical;
+  canonical.reserve(512);
+  if (!append_canonical_string(&canonical, "PTRX_FINAL_TOKEN_FACTS_V1")) {
+    return false;
+  }
+  append_canonical_u64(&canonical, facts->required_apply_lsn);
+  append_canonical_u64(&canonical, facts->physical_fence_lsn);
+  if (!append_canonical_string(&canonical, facts->epoch_fact_digest) ||
+      !append_canonical_string(&canonical,
+                               facts->final_lock_generation_digest) ||
+      !append_canonical_string(&canonical, facts->page_layout_digest) ||
+      !append_canonical_string(&canonical,
+                               facts->dictionary_generation_digest) ||
+      !append_canonical_string(&canonical,
+                               facts->target_boot_incarnation)) {
+    return false;
+  }
+  append_canonical_u64(&canonical, facts->record_lock_unique_pages);
+  append_canonical_u64(&canonical, facts->record_lock_bitmap_entries);
+  append_canonical_u64(&canonical, facts->record_lock_bits);
+  append_canonical_u64(&canonical, facts->binlog_cache_length);
+  append_canonical_u64(&canonical, facts->binlog_cache_memory_bytes);
+  append_canonical_u64(&canonical, facts->lock_plan_capacity_bytes);
+  append_canonical_u64(&canonical, facts->native_binlog_capacity_bytes);
+  append_canonical_u64(&canonical, facts->epoch_prepare_deadline_us);
+  append_canonical_u64(&canonical, facts->client_resume_deadline_us);
+  append_canonical_bool(&canonical, facts->semantic_validated);
+  append_canonical_bool(&canonical, facts->lock_plan_ready);
+  append_canonical_bool(&canonical, facts->binlog_handle_ready);
+  append_canonical_bool(&canonical, facts->resources_reserved);
+  append_canonical_bool(&canonical, facts->predicate_lock_present);
+  append_canonical_bool(&canonical, facts->binlog_cache_present);
+  append_canonical_bool(&canonical, facts->binlog_cache_file_backed);
+  const std::string digest = sha256_hex_string(canonical);
+  if (!facts->canonical_digest.empty() && facts->canonical_digest != digest) {
+    return false;
+  }
+  facts->canonical_digest = digest;
+  return true;
+}
+
+Preserve_trx_prepared_token_resources::Preserve_trx_prepared_token_resources()
+    : m_impl(new Impl()) {}
+
+Preserve_trx_prepared_token_resources::Preserve_trx_prepared_token_resources(
+    Preserve_trx_prepared_token_resources &&other) noexcept = default;
+
+Preserve_trx_prepared_token_resources &
+Preserve_trx_prepared_token_resources::operator=(
+    Preserve_trx_prepared_token_resources &&other) noexcept = default;
+
+Preserve_trx_prepared_token_resources::~Preserve_trx_prepared_token_resources() =
+    default;
+
+bool Preserve_trx_prepared_token_resources::acquired() const {
+  return m_impl != nullptr && m_impl->acquired;
+}
+
+uint64_t Preserve_trx_prepared_token_resources::lock_plan_bytes() const {
+  return m_impl == nullptr ? 0 : m_impl->lock_plan_bytes;
+}
+
+uint64_t Preserve_trx_prepared_token_resources::native_binlog_bytes() const {
+  return m_impl == nullptr ? 0 : m_impl->native_binlog_bytes;
+}
+
+Preserve_trx_prepared_status
+preserved_trx_acquire_prepared_token_resources(
+    const Preserve_trx_prepared_token_key &key, uint64_t lock_plan_bytes,
+    uint64_t native_binlog_bytes,
+    Preserve_trx_prepared_token_resources *resources) {
+  if (!prepared_token_key_is_valid(key) || resources == nullptr ||
+      resources->acquired()) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  Preserve_trx_prepared_token_resources acquired;
+  const std::string resource_token = prepared_resource_token(key);
+  acquired.m_impl->lock_plan_memory = preserve_trx_acquire_memory_lease(
+      resource_token, Preserve_trx_memory_kind::PROMOTION_LOCK_PLAN,
+      lock_plan_bytes);
+  if (!acquired.m_impl->lock_plan_memory.acquired()) {
+    return Preserve_trx_prepared_status::RESOURCE_EXHAUSTED;
+  }
+  acquired.m_impl->native_binlog_memory = preserve_trx_acquire_memory_lease(
+      resource_token,
+      Preserve_trx_memory_kind::PROMOTION_BINLOG_NATIVE_CACHE,
+      native_binlog_bytes);
+  if (!acquired.m_impl->native_binlog_memory.acquired()) {
+    return Preserve_trx_prepared_status::RESOURCE_EXHAUSTED;
+  }
+  acquired.m_impl->lock_plan_bytes = lock_plan_bytes;
+  acquired.m_impl->native_binlog_bytes = native_binlog_bytes;
+  acquired.m_impl->acquired = true;
+  *resources = std::move(acquired);
+  return Preserve_trx_prepared_status::OK;
+}
+
+void Preserve_trx_prepare_lease::fail_closed() {
+  if (!m_active || m_entry == nullptr) return;
+  std::lock_guard<std::mutex> guard(m_entry->mutex);
+  if (m_entry->preparing &&
+      m_entry->preparing_generation == m_key.generation) {
+    m_entry->preparing = false;
+    m_entry->preparing_generation = 0;
+    if (m_new_entry &&
+        std::atomic_load_explicit(&m_entry->publication,
+                                  std::memory_order_acquire) == nullptr) {
+      m_entry->state.store(Preserve_trx_prepared_token_state::NOT_READY,
+                           std::memory_order_release);
+    }
+  }
+  m_active = false;
+  m_entry.reset();
+  m_registry.reset();
+}
+
+Preserve_trx_prepare_lease::Preserve_trx_prepare_lease(
+    Preserve_trx_prepare_lease &&other) noexcept {
+  *this = std::move(other);
+}
+
+Preserve_trx_prepare_lease &Preserve_trx_prepare_lease::operator=(
+    Preserve_trx_prepare_lease &&other) noexcept {
+  if (this == &other) return *this;
+  fail_closed();
+  m_registry = std::move(other.m_registry);
+  m_entry = std::move(other.m_entry);
+  m_key = std::move(other.m_key);
+  m_new_entry = other.m_new_entry;
+  m_active = other.m_active;
+  other.m_new_entry = false;
+  other.m_active = false;
+  return *this;
+}
+
+Preserve_trx_prepare_lease::~Preserve_trx_prepare_lease() { fail_closed(); }
+
+void Preserve_trx_gate_adopt_lease::fail_closed() {
+  if (!m_active || m_entry == nullptr) return;
+  auto expected = Preserve_trx_prepared_token_state::ADOPTING;
+  m_entry->state.compare_exchange_strong(
+      expected, Preserve_trx_prepared_token_state::CLEANUP_TAINTED,
+      std::memory_order_acq_rel, std::memory_order_acquire);
+  m_active = false;
+  m_entry.reset();
+}
+
+Preserve_trx_gate_adopt_lease::Preserve_trx_gate_adopt_lease(
+    Preserve_trx_gate_adopt_lease &&other) noexcept {
+  *this = std::move(other);
+}
+
+Preserve_trx_gate_adopt_lease &Preserve_trx_gate_adopt_lease::operator=(
+    Preserve_trx_gate_adopt_lease &&other) noexcept {
+  if (this == &other) return *this;
+  fail_closed();
+  m_entry = std::move(other.m_entry);
+  m_active = other.m_active;
+  other.m_active = false;
+  return *this;
+}
+
+Preserve_trx_gate_adopt_lease::~Preserve_trx_gate_adopt_lease() {
+  fail_closed();
+}
+
+void Preserve_trx_attach_lease::fail_closed() {
+  if (!m_active || m_entry == nullptr) return;
+  auto expected = m_activation_started
+                      ? Preserve_trx_prepared_token_state::ACTIVATING
+                      : Preserve_trx_prepared_token_state::ATTACHING;
+  m_entry->state.compare_exchange_strong(
+      expected, Preserve_trx_prepared_token_state::ATTACH_TAINTED,
+      std::memory_order_acq_rel, std::memory_order_acquire);
+  m_active = false;
+  m_activation_started = false;
+  m_entry.reset();
+}
+
+Preserve_trx_attach_lease::Preserve_trx_attach_lease(
+    Preserve_trx_attach_lease &&other) noexcept {
+  *this = std::move(other);
+}
+
+Preserve_trx_attach_lease &Preserve_trx_attach_lease::operator=(
+    Preserve_trx_attach_lease &&other) noexcept {
+  if (this == &other) return *this;
+  fail_closed();
+  m_entry = std::move(other.m_entry);
+  m_active = other.m_active;
+  m_activation_started = other.m_activation_started;
+  other.m_active = false;
+  other.m_activation_started = false;
+  return *this;
+}
+
+Preserve_trx_attach_lease::~Preserve_trx_attach_lease() { fail_closed(); }
+
+void Preserve_trx_cleanup_lease::fail_closed() {
+  if (!m_active || m_entry == nullptr) return;
+  auto expected = Preserve_trx_prepared_token_state::CLEANUP_PENDING;
+  m_entry->state.compare_exchange_strong(
+      expected, Preserve_trx_prepared_token_state::CLEANUP_TAINTED,
+      std::memory_order_acq_rel, std::memory_order_acquire);
+  m_active = false;
+  m_entry.reset();
+}
+
+Preserve_trx_cleanup_lease::Preserve_trx_cleanup_lease(
+    Preserve_trx_cleanup_lease &&other) noexcept {
+  *this = std::move(other);
+}
+
+Preserve_trx_cleanup_lease &Preserve_trx_cleanup_lease::operator=(
+    Preserve_trx_cleanup_lease &&other) noexcept {
+  if (this == &other) return *this;
+  fail_closed();
+  m_entry = std::move(other.m_entry);
+  m_active = other.m_active;
+  other.m_active = false;
+  return *this;
+}
+
+Preserve_trx_cleanup_lease::~Preserve_trx_cleanup_lease() { fail_closed(); }
+
+Preserve_trx_prepared_token_registry::Preserve_trx_prepared_token_registry()
+    : m_state(std::make_shared<Preserve_trx_prepared_registry_state>()) {}
+
+Preserve_trx_prepared_token_registry::~Preserve_trx_prepared_token_registry() =
+    default;
+
+Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::begin_prepare(
+    const Preserve_trx_prepared_token_key &key, uint64_t expected_generation,
+    Preserve_trx_prepare_lease *lease) {
+  if (!prepared_token_key_is_valid(key) || expected_generation == 0 ||
+      expected_generation != key.generation || lease == nullptr ||
+      lease->active()) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+
+  std::shared_ptr<Preserve_trx_prepared_token_entry> entry;
+  bool new_entry = false;
+  {
+    std::lock_guard<std::mutex> guard(m_state->mutex);
+    const auto locator = prepared_token_locator(key);
+    auto it = m_state->entries.find(locator);
+    if (it == m_state->entries.end()) {
+      entry = std::make_shared<Preserve_trx_prepared_token_entry>();
+      entry->key = key;
+      m_state->entries.emplace(locator, entry);
+      new_entry = true;
+    } else {
+      entry = it->second;
+    }
+  }
+
+  std::lock_guard<std::mutex> entry_guard(entry->mutex);
+  const auto state = entry->state.load(std::memory_order_acquire);
+  if (!prepared_state_accepts_generation(state)) {
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  const auto publication = std::atomic_load_explicit(
+      &entry->publication, std::memory_order_acquire);
+  const uint64_t current_generation =
+      publication == nullptr ? entry->key.generation
+                             : publication->key.generation;
+  if (expected_generation < current_generation) {
+    return Preserve_trx_prepared_status::STALE_GENERATION;
+  }
+  if (entry->key.target_boot_incarnation != key.target_boot_incarnation ||
+      entry->key.preserve_dir != key.preserve_dir) {
+    return Preserve_trx_prepared_status::STALE_GENERATION;
+  }
+  if (entry->preparing) {
+    if (expected_generation <= entry->preparing_generation) {
+      return expected_generation < entry->preparing_generation
+                 ? Preserve_trx_prepared_status::STALE_GENERATION
+                 : Preserve_trx_prepared_status::ALREADY_CLAIMED;
+    }
+  }
+  if (publication == nullptr) entry->key = key;
+  entry->preparing = true;
+  entry->preparing_generation = expected_generation;
+  lease->m_registry = m_state;
+  lease->m_entry = entry;
+  lease->m_key = key;
+  lease->m_new_entry = new_entry || publication == nullptr;
+  lease->m_active = true;
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::publish_ready(
+    Preserve_trx_prepare_lease *lease, Preserve_trx_final_token_facts facts,
+    Preserve_trx_prepared_token_resources resources) {
+  if (lease == nullptr || !lease->active() || lease->m_entry == nullptr ||
+      !resources.acquired() || !preserved_trx_finalize_token_facts(&facts) ||
+      facts.target_boot_incarnation !=
+          lease->m_key.target_boot_incarnation ||
+      facts.lock_plan_capacity_bytes != resources.lock_plan_bytes() ||
+      facts.native_binlog_capacity_bytes != resources.native_binlog_bytes()) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+
+  Preserve_trx_prepared_token_resources retired_resources;
+  Preserve_trx_prepared_status status = Preserve_trx_prepared_status::OK;
+  {
+    std::lock_guard<std::mutex> guard(lease->m_entry->mutex);
+    if (!lease->m_entry->preparing ||
+        lease->m_entry->preparing_generation != lease->m_key.generation) {
+      lease->m_active = false;
+      lease->m_entry.reset();
+      lease->m_registry.reset();
+      return Preserve_trx_prepared_status::STALE_GENERATION;
+    }
+    const auto current = std::atomic_load_explicit(
+        &lease->m_entry->publication, std::memory_order_acquire);
+    if (current != nullptr &&
+        current->key.generation > lease->m_key.generation) {
+      status = Preserve_trx_prepared_status::STALE_GENERATION;
+    } else if (current != nullptr &&
+               current->key.generation == lease->m_key.generation) {
+      if (current->facts.canonical_digest == facts.canonical_digest) {
+        status = Preserve_trx_prepared_status::IDEMPOTENT;
+      } else {
+        lease->m_entry->state.store(Preserve_trx_prepared_token_state::CORRUPT,
+                                    std::memory_order_release);
+        retired_resources = std::move(lease->m_entry->resources);
+        status = Preserve_trx_prepared_status::DIGEST_CONFLICT;
+      }
+    } else {
+      auto publication =
+          std::make_shared<const Preserve_trx_prepared_token_publication>(
+              Preserve_trx_prepared_token_publication{lease->m_key,
+                                                       std::move(facts)});
+      retired_resources = std::move(lease->m_entry->resources);
+      lease->m_entry->resources = std::move(resources);
+      lease->m_entry->key = lease->m_key;
+      std::atomic_store_explicit(&lease->m_entry->publication,
+                                 std::move(publication),
+                                 std::memory_order_release);
+      lease->m_entry->state.store(
+          Preserve_trx_prepared_token_state::READY_FACTS_PENDING_LEASE,
+          std::memory_order_release);
+    }
+    lease->m_entry->preparing = false;
+    lease->m_entry->preparing_generation = 0;
+  }
+  lease->m_active = false;
+  lease->m_entry.reset();
+  lease->m_registry.reset();
+  return status;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::mark_ready_for_gate(
+    const Preserve_trx_prepared_token_key &key,
+    uint64_t expected_generation) {
+  if (!prepared_token_key_is_valid(key) ||
+      expected_generation != key.generation) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  auto entry = find_prepared_entry(m_state, key);
+  if (entry == nullptr) return Preserve_trx_prepared_status::NOT_FOUND;
+  auto expected =
+      Preserve_trx_prepared_token_state::READY_FACTS_PENDING_LEASE;
+  if (entry->state.load(std::memory_order_acquire) != expected) {
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  const auto publication = std::atomic_load_explicit(
+      &entry->publication, std::memory_order_acquire);
+  if (publication == nullptr ||
+      !prepared_token_keys_match(publication->key, key)) {
+    return Preserve_trx_prepared_status::STALE_GENERATION;
+  }
+  if (!entry->state.compare_exchange_strong(
+          expected, Preserve_trx_prepared_token_state::READY_FOR_GATE,
+          std::memory_order_acq_rel, std::memory_order_acquire)) {
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::begin_gate_adopt(
+    const Preserve_trx_prepared_token_key &key, uint64_t expected_generation,
+    Preserve_trx_gate_adopt_lease *lease) {
+  if (!prepared_token_key_is_valid(key) ||
+      expected_generation != key.generation || lease == nullptr ||
+      lease->active()) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  auto entry = find_prepared_entry(m_state, key);
+  if (entry == nullptr) return Preserve_trx_prepared_status::NOT_FOUND;
+  auto expected = Preserve_trx_prepared_token_state::READY_FOR_GATE;
+  if (entry->state.load(std::memory_order_acquire) != expected) {
+    return Preserve_trx_prepared_status::ALREADY_CLAIMED;
+  }
+  const auto publication = std::atomic_load_explicit(
+      &entry->publication, std::memory_order_acquire);
+  if (publication == nullptr ||
+      !prepared_token_keys_match(publication->key, key)) {
+    return Preserve_trx_prepared_status::STALE_GENERATION;
+  }
+  if (!entry->state.compare_exchange_strong(
+          expected, Preserve_trx_prepared_token_state::ADOPTING,
+          std::memory_order_acq_rel, std::memory_order_acquire)) {
+    return Preserve_trx_prepared_status::ALREADY_CLAIMED;
+  }
+  lease->m_entry = std::move(entry);
+  lease->m_active = true;
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::commit_gate_adopt(
+    Preserve_trx_gate_adopt_lease *lease) {
+  if (lease == nullptr || !lease->active() || lease->m_entry == nullptr) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  auto expected = Preserve_trx_prepared_token_state::ADOPTING;
+  if (!lease->m_entry->state.compare_exchange_strong(
+          expected, Preserve_trx_prepared_token_state::ADOPTED_LOCKED,
+          std::memory_order_acq_rel, std::memory_order_acquire)) {
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  lease->m_active = false;
+  lease->m_entry.reset();
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::abort_gate_adopt(
+    Preserve_trx_gate_adopt_lease *lease,
+    Preserve_trx_gate_abort_outcome outcome) {
+  if (lease == nullptr || !lease->active() || lease->m_entry == nullptr) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  Preserve_trx_prepared_token_state terminal;
+  switch (outcome) {
+    case Preserve_trx_gate_abort_outcome::ABANDONED_ROLLED_BACK:
+      terminal = Preserve_trx_prepared_token_state::ABANDONED_ROLLED_BACK;
+      break;
+    case Preserve_trx_gate_abort_outcome::ABANDONED_NOT_FOUND_PROVEN:
+      terminal =
+          Preserve_trx_prepared_token_state::ABANDONED_NOT_FOUND_PROVEN;
+      break;
+    case Preserve_trx_gate_abort_outcome::CLEANUP_TAINTED:
+      terminal = Preserve_trx_prepared_token_state::CLEANUP_TAINTED;
+      break;
+  }
+  auto expected = Preserve_trx_prepared_token_state::ADOPTING;
+  if (!lease->m_entry->state.compare_exchange_strong(
+          expected, terminal, std::memory_order_acq_rel,
+          std::memory_order_acquire)) {
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  if (terminal != Preserve_trx_prepared_token_state::CLEANUP_TAINTED) {
+    std::lock_guard<std::mutex> guard(lease->m_entry->mutex);
+    lease->m_entry->resources = {};
+  }
+  lease->m_active = false;
+  lease->m_entry.reset();
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::begin_attach(
+    const Preserve_trx_prepared_token_key &key, uint64_t expected_generation,
+    Preserve_trx_attach_lease *lease) {
+  if (!prepared_token_key_is_valid(key) ||
+      expected_generation != key.generation || lease == nullptr ||
+      lease->active()) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  auto entry = find_prepared_entry(m_state, key);
+  if (entry == nullptr) return Preserve_trx_prepared_status::NOT_FOUND;
+  auto expected = Preserve_trx_prepared_token_state::ADOPTED_LOCKED;
+  if (entry->state.load(std::memory_order_acquire) != expected) {
+    return Preserve_trx_prepared_status::ALREADY_CLAIMED;
+  }
+  const auto publication = std::atomic_load_explicit(
+      &entry->publication, std::memory_order_acquire);
+  if (publication == nullptr ||
+      !prepared_token_keys_match(publication->key, key)) {
+    return Preserve_trx_prepared_status::STALE_GENERATION;
+  }
+  if (!entry->state.compare_exchange_strong(
+          expected, Preserve_trx_prepared_token_state::ATTACHING,
+          std::memory_order_acq_rel, std::memory_order_acquire)) {
+    return Preserve_trx_prepared_status::ALREADY_CLAIMED;
+  }
+  lease->m_entry = std::move(entry);
+  lease->m_active = true;
+  lease->m_activation_started = false;
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::begin_activation(
+    Preserve_trx_attach_lease *lease) {
+  if (lease == nullptr || !lease->active() || lease->m_entry == nullptr ||
+      lease->m_activation_started) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  auto expected = Preserve_trx_prepared_token_state::ATTACHING;
+  if (!lease->m_entry->state.compare_exchange_strong(
+          expected, Preserve_trx_prepared_token_state::ACTIVATING,
+          std::memory_order_acq_rel, std::memory_order_acquire)) {
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  lease->m_activation_started = true;
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::commit_attach(
+    Preserve_trx_attach_lease *lease) {
+  if (lease == nullptr || !lease->active() || lease->m_entry == nullptr ||
+      !lease->m_activation_started) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  auto expected = Preserve_trx_prepared_token_state::ACTIVATING;
+  if (!lease->m_entry->state.compare_exchange_strong(
+          expected, Preserve_trx_prepared_token_state::ACTIVE,
+          std::memory_order_acq_rel, std::memory_order_acquire)) {
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  lease->m_active = false;
+  lease->m_activation_started = false;
+  lease->m_entry.reset();
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::abort_attach_after_full_unwind(
+    Preserve_trx_attach_lease *lease) {
+  if (lease == nullptr || !lease->active() || lease->m_entry == nullptr ||
+      lease->m_activation_started) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  auto expected = Preserve_trx_prepared_token_state::ATTACHING;
+  if (!lease->m_entry->state.compare_exchange_strong(
+          expected, Preserve_trx_prepared_token_state::ADOPTED_LOCKED,
+          std::memory_order_acq_rel, std::memory_order_acquire)) {
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  lease->m_active = false;
+  lease->m_entry.reset();
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::taint_attach(
+    Preserve_trx_attach_lease *lease) {
+  if (lease == nullptr || !lease->active() || lease->m_entry == nullptr) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  auto expected = lease->m_activation_started
+                      ? Preserve_trx_prepared_token_state::ACTIVATING
+                      : Preserve_trx_prepared_token_state::ATTACHING;
+  if (!lease->m_entry->state.compare_exchange_strong(
+          expected, Preserve_trx_prepared_token_state::ATTACH_TAINTED,
+          std::memory_order_acq_rel, std::memory_order_acquire)) {
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  lease->m_active = false;
+  lease->m_activation_started = false;
+  lease->m_entry.reset();
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::begin_cleanup(
+    const Preserve_trx_prepared_token_key &key, uint64_t expected_generation,
+    Preserve_trx_prepared_token_state expected_state,
+    Preserve_trx_cleanup_lease *lease) {
+  if (!prepared_token_key_is_valid(key) ||
+      expected_generation != key.generation || lease == nullptr ||
+      lease->active() ||
+      (expected_state != Preserve_trx_prepared_token_state::ADOPTED_LOCKED &&
+       expected_state != Preserve_trx_prepared_token_state::ATTACH_TAINTED)) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  auto entry = find_prepared_entry(m_state, key);
+  if (entry == nullptr) return Preserve_trx_prepared_status::NOT_FOUND;
+  auto expected = expected_state;
+  if (entry->state.load(std::memory_order_acquire) != expected) {
+    return Preserve_trx_prepared_status::ALREADY_CLAIMED;
+  }
+  const auto publication = std::atomic_load_explicit(
+      &entry->publication, std::memory_order_acquire);
+  if (publication == nullptr ||
+      !prepared_token_keys_match(publication->key, key)) {
+    return Preserve_trx_prepared_status::STALE_GENERATION;
+  }
+  if (!entry->state.compare_exchange_strong(
+          expected, Preserve_trx_prepared_token_state::CLEANUP_PENDING,
+          std::memory_order_acq_rel, std::memory_order_acquire)) {
+    return Preserve_trx_prepared_status::ALREADY_CLAIMED;
+  }
+  lease->m_entry = std::move(entry);
+  lease->m_active = true;
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::commit_cleanup(
+    Preserve_trx_cleanup_lease *lease, bool rollback_proven) {
+  if (lease == nullptr || !lease->active() || lease->m_entry == nullptr) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  const auto terminal =
+      rollback_proven ? Preserve_trx_prepared_token_state::CLEANUP_ROLLED_BACK
+                      : Preserve_trx_prepared_token_state::CLEANUP_TAINTED;
+  auto expected = Preserve_trx_prepared_token_state::CLEANUP_PENDING;
+  if (!lease->m_entry->state.compare_exchange_strong(
+          expected, terminal, std::memory_order_acq_rel,
+          std::memory_order_acquire)) {
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  if (rollback_proven) {
+    std::lock_guard<std::mutex> guard(lease->m_entry->mutex);
+    lease->m_entry->resources = {};
+  }
+  lease->m_active = false;
+  lease->m_entry.reset();
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::snapshot(
+    const Preserve_trx_prepared_token_key &key,
+    Preserve_trx_prepared_token_snapshot *snapshot) const {
+  if (!prepared_token_key_is_valid(key) || snapshot == nullptr) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  auto entry = find_prepared_entry(m_state, key);
+  if (entry == nullptr) return Preserve_trx_prepared_status::NOT_FOUND;
+  std::lock_guard<std::mutex> guard(entry->mutex);
+  const auto publication = std::atomic_load_explicit(
+      &entry->publication, std::memory_order_acquire);
+  if (publication == nullptr) {
+    if (entry->key.generation != key.generation ||
+        entry->key.preserve_dir != key.preserve_dir ||
+        entry->key.target_boot_incarnation != key.target_boot_incarnation) {
+      return Preserve_trx_prepared_status::STALE_GENERATION;
+    }
+    snapshot->key = entry->key;
+    snapshot->facts = {};
+    snapshot->state = entry->state.load(std::memory_order_acquire);
+    return Preserve_trx_prepared_status::OK;
+  }
+  if (!prepared_token_keys_match(publication->key, key)) {
+    return Preserve_trx_prepared_status::STALE_GENERATION;
+  }
+  snapshot->key = publication->key;
+  snapshot->facts = publication->facts;
+  snapshot->state = entry->state.load(std::memory_order_acquire);
+  return Preserve_trx_prepared_status::OK;
+}
+
+void Preserve_trx_prepared_token_registry::invalidate_incarnation(
+    const std::string &current_boot_incarnation) {
+  std::vector<std::shared_ptr<Preserve_trx_prepared_token_entry>> entries;
+  {
+    std::lock_guard<std::mutex> guard(m_state->mutex);
+    for (const auto &item : m_state->entries) entries.push_back(item.second);
+  }
+  for (const auto &entry : entries) {
+    std::lock_guard<std::mutex> guard(entry->mutex);
+    if (entry->key.target_boot_incarnation == current_boot_incarnation) {
+      continue;
+    }
+    entry->state.store(Preserve_trx_prepared_token_state::STALE_GENERATION,
+                       std::memory_order_release);
+    entry->resources = {};
+    entry->preparing = false;
+    entry->preparing_generation = 0;
+  }
+}
+
+size_t Preserve_trx_prepared_token_registry::expire_ready_facts_pending_lease(
+    const std::string &source_uuid, const std::string &epoch_id,
+    uint64_t now_us) {
+  std::vector<std::shared_ptr<Preserve_trx_prepared_token_entry>> entries;
+  {
+    std::lock_guard<std::mutex> guard(m_state->mutex);
+    for (const auto &item : m_state->entries) {
+      if (item.first.source_uuid == source_uuid &&
+          item.first.epoch_id == epoch_id) {
+        entries.push_back(item.second);
+      }
+    }
+  }
+  size_t expired = 0;
+  for (const auto &entry : entries) {
+    auto expected =
+        Preserve_trx_prepared_token_state::READY_FACTS_PENDING_LEASE;
+    if (entry->state.load(std::memory_order_acquire) != expected) continue;
+    const auto publication = std::atomic_load_explicit(
+        &entry->publication, std::memory_order_acquire);
+    if (publication == nullptr ||
+        publication->facts.epoch_prepare_deadline_us > now_us) {
+      continue;
+    }
+    if (!entry->state.compare_exchange_strong(
+            expected, Preserve_trx_prepared_token_state::NOT_READY,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+      continue;
+    }
+    std::lock_guard<std::mutex> guard(entry->mutex);
+    entry->resources = {};
+    ++expired;
+  }
+  return expired;
+}
+
+void Preserve_trx_prepared_token_registry::purge_epoch(
+    const std::string &source_uuid, const std::string &epoch_id) {
+  std::vector<std::shared_ptr<Preserve_trx_prepared_token_entry>> removed;
+  {
+    std::lock_guard<std::mutex> guard(m_state->mutex);
+    for (auto it = m_state->entries.begin(); it != m_state->entries.end();) {
+      if (it->first.source_uuid == source_uuid &&
+          it->first.epoch_id == epoch_id) {
+        removed.push_back(it->second);
+        it = m_state->entries.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  for (const auto &entry : removed) {
+    std::lock_guard<std::mutex> guard(entry->mutex);
+    entry->state.store(Preserve_trx_prepared_token_state::STALE_GENERATION,
+                       std::memory_order_release);
+    entry->resources = {};
+    entry->preparing = false;
+    entry->preparing_generation = 0;
+  }
+}
+
+Preserve_trx_prepared_token_registry &
+preserved_trx_strict_prepared_token_registry() {
+  static Preserve_trx_prepared_token_registry registry;
+  return registry;
 }
 
 void preserved_trx_promotion_prepared_metrics_reset_for_unit_test() {

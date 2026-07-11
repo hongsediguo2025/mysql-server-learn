@@ -57,7 +57,8 @@ enum class Preserve_trx_memory_kind {
   /* Native binlog cache manager/buffer prepared before connection attach. */
   PROMOTION_BINLOG_NATIVE_CACHE,
   /* Snapshot encode/decode working memory. */
-  SNAPSHOT_CODEC_BUFFER
+  SNAPSHOT_CODEC_BUFFER,
+  COUNT
 };
 
 struct Preserve_trx_resource_limits {
@@ -123,6 +124,10 @@ ulonglong preserve_trx_spill_failures_status();
 void preserve_trx_resource_manager_reset_for_unit_test();
 void preserve_trx_resource_manager_set_limits_for_unit_test(
     const Preserve_trx_resource_limits &limits);
+uint64_t preserve_trx_resource_kind_current_bytes_for_unit_test(
+    Preserve_trx_memory_kind kind);
+uint64_t preserve_trx_resource_kind_cap_bytes_for_unit_test(
+    Preserve_trx_memory_kind kind);
 
 bool preserve_trx_sysvar_check_enable(sys_var *self, THD *thd, set_var *var);
 bool preserve_trx_sysvar_update_enable(sys_var *self, THD *thd,

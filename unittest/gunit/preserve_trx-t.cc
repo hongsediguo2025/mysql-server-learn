@@ -277,6 +277,329 @@ TEST(PreservedTrxPromotionMetrics, RawFastPathCountersAreServerOwned) {
   EXPECT_EQ(23U, preserve_trx_resume_binlog_rename_count_status());
 }
 
+Preserve_trx_prepared_token_key make_prepared_token_key(uint64_t generation) {
+  Preserve_trx_prepared_token_key key;
+  key.preserve_dir = "/tmp/preserve-registry";
+  key.source_uuid = "source-uuid";
+  key.epoch_id = "epoch-1";
+  key.token = "token-1";
+  key.target_boot_incarnation = "boot-1";
+  key.generation = generation;
+  return key;
+}
+
+Preserve_trx_final_token_facts make_final_token_facts(uint64_t lsn) {
+  Preserve_trx_final_token_facts facts;
+  facts.required_apply_lsn = lsn;
+  facts.physical_fence_lsn = lsn;
+  facts.epoch_fact_digest.assign(64, 'a');
+  facts.final_lock_generation_digest.assign(64, 'b');
+  facts.page_layout_digest.assign(64, 'c');
+  facts.dictionary_generation_digest.assign(64, 'd');
+  facts.target_boot_incarnation = "boot-1";
+  facts.record_lock_unique_pages = 3;
+  facts.record_lock_bitmap_entries = 4;
+  facts.record_lock_bits = 5;
+  facts.lock_plan_capacity_bytes = 128;
+  facts.native_binlog_capacity_bytes = 64;
+  facts.epoch_prepare_deadline_us = 500000;
+  facts.client_resume_deadline_us = 1000000;
+  facts.semantic_validated = true;
+  facts.lock_plan_ready = true;
+  facts.binlog_handle_ready = true;
+  facts.resources_reserved = true;
+  EXPECT_TRUE(preserved_trx_finalize_token_facts(&facts));
+  return facts;
+}
+
+Preserve_trx_prepared_token_resources acquire_prepared_resources(
+    const Preserve_trx_prepared_token_key &key, uint64_t lock_bytes = 128,
+    uint64_t binlog_bytes = 64) {
+  Preserve_trx_prepared_token_resources resources;
+  EXPECT_EQ(Preserve_trx_prepared_status::OK,
+            preserved_trx_acquire_prepared_token_resources(
+                key, lock_bytes, binlog_bytes, &resources));
+  EXPECT_TRUE(resources.acquired());
+  return resources;
+}
+
+TEST(PreservedTrxPreparedRegistry, StaleWorkerCannotOverwriteNewGeneration) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_resource_limits limits{4096, 4096};
+  preserve_trx_resource_manager_set_limits_for_unit_test(limits);
+  Preserve_trx_prepared_token_registry registry;
+
+  auto key1 = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease lease1;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key1, 1, &lease1));
+
+  auto key2 = make_prepared_token_key(2);
+  Preserve_trx_prepare_lease lease2;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key2, 2, &lease2));
+  EXPECT_EQ(Preserve_trx_prepared_status::STALE_GENERATION,
+            registry.publish_ready(&lease1, make_final_token_facts(100),
+                                   acquire_prepared_resources(key1)));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&lease2, make_final_token_facts(200),
+                                   acquire_prepared_resources(key2)));
+
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key2, &snapshot));
+  EXPECT_EQ(2U, snapshot.key.generation);
+  EXPECT_EQ(200U, snapshot.facts.required_apply_lsn);
+  registry.purge_epoch(key2.source_uuid, key2.epoch_id);
+  preserve_trx_resource_manager_reset_for_unit_test();
+  preserve_trx_resource_manager_set_limits_for_unit_test(
+      Preserve_trx_resource_limits{});
+}
+
+TEST(PreservedTrxPreparedRegistry, CanonicalFactsBindEveryFenceField) {
+  auto facts = make_final_token_facts(100);
+  const std::string digest = facts.canonical_digest;
+  EXPECT_EQ(64U, digest.size());
+  facts.required_apply_lsn = 99;
+  facts.canonical_digest.clear();
+  ASSERT_TRUE(preserved_trx_finalize_token_facts(&facts));
+  EXPECT_NE(digest, facts.canonical_digest);
+  facts.required_apply_lsn = 101;
+  facts.canonical_digest.clear();
+  EXPECT_FALSE(preserved_trx_finalize_token_facts(&facts));
+}
+
+TEST(PreservedTrxPreparedRegistry, SupersedingUnpublishedPrepareAbortsNotReady) {
+  Preserve_trx_prepared_token_registry registry;
+  auto key1 = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease first;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key1, 1, &first));
+  auto key2 = make_prepared_token_key(2);
+  {
+    Preserve_trx_prepare_lease superseding;
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.begin_prepare(key2, 2, &superseding));
+  }
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key2, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::NOT_READY, snapshot.state);
+  EXPECT_TRUE(first.active());
+  first = {};
+  Preserve_trx_prepare_lease retry;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key2, 2, &retry));
+  retry = {};
+  registry.purge_epoch(key2.source_uuid, key2.epoch_id);
+}
+
+TEST(PreservedTrxPreparedRegistry, DigestConflictIsTerminal) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease first;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &first));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&first, make_final_token_facts(100),
+                                   acquire_prepared_resources(key)));
+
+  Preserve_trx_prepare_lease conflicting;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &conflicting));
+  EXPECT_EQ(Preserve_trx_prepared_status::DIGEST_CONFLICT,
+            registry.publish_ready(&conflicting, make_final_token_facts(101),
+                                   acquire_prepared_resources(key)));
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::CORRUPT, snapshot.state);
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry, SameDigestPublishIsIdempotent) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  auto facts = make_final_token_facts(100);
+  Preserve_trx_prepare_lease first;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &first));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&first, facts,
+                                   acquire_prepared_resources(key)));
+  Preserve_trx_prepare_lease retry;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &retry));
+  EXPECT_EQ(Preserve_trx_prepared_status::IDEMPOTENT,
+            registry.publish_ready(&retry, facts,
+                                   acquire_prepared_resources(key)));
+  EXPECT_EQ(192U, preserve_trx_memory_current_bytes_status());
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry, ResourceSubpoolsEnforceSixtyThirtyTen) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  preserve_trx_resource_manager_set_limits_for_unit_test({1000, 1000});
+  auto key = make_prepared_token_key(1);
+  auto resources = acquire_prepared_resources(key, 600, 300);
+  EXPECT_EQ(600U, preserve_trx_resource_kind_current_bytes_for_unit_test(
+                      Preserve_trx_memory_kind::PROMOTION_LOCK_PLAN));
+  EXPECT_EQ(300U, preserve_trx_resource_kind_current_bytes_for_unit_test(
+                      Preserve_trx_memory_kind::PROMOTION_BINLOG_NATIVE_CACHE));
+  EXPECT_EQ(600U, preserve_trx_resource_kind_cap_bytes_for_unit_test(
+                      Preserve_trx_memory_kind::PROMOTION_LOCK_PLAN));
+  EXPECT_EQ(300U, preserve_trx_resource_kind_cap_bytes_for_unit_test(
+                      Preserve_trx_memory_kind::PROMOTION_BINLOG_NATIVE_CACHE));
+
+  Preserve_trx_prepared_token_resources rejected;
+  auto key2 = make_prepared_token_key(1);
+  key2.token = "token-2";
+  EXPECT_EQ(Preserve_trx_prepared_status::RESOURCE_EXHAUSTED,
+            preserved_trx_acquire_prepared_token_resources(key2, 1, 0,
+                                                           &rejected));
+  resources = {};
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  preserve_trx_resource_manager_reset_for_unit_test();
+  preserve_trx_resource_manager_set_limits_for_unit_test(
+      Preserve_trx_resource_limits{});
+}
+
+TEST(PreservedTrxPreparedRegistry, GateAndAttachLeasesEnforceStateMachine) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &prepare));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&prepare, make_final_token_facts(100),
+                                   acquire_prepared_resources(key)));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.mark_ready_for_gate(key, 1));
+
+  Preserve_trx_gate_adopt_lease adopt;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_gate_adopt(key, 1, &adopt));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.commit_gate_adopt(&adopt));
+
+  Preserve_trx_attach_lease attach;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_attach(key, 1, &attach));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.abort_attach_after_full_unwind(&attach));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_attach(key, 1, &attach));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_activation(&attach));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.commit_attach(&attach));
+
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::ACTIVE, snapshot.state);
+  Preserve_trx_prepare_lease rejected;
+  EXPECT_EQ(Preserve_trx_prepared_status::INVALID_STATE,
+            registry.begin_prepare(key, 1, &rejected));
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry, AttachAndCleanupUseOneStateClaim) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &prepare));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&prepare, make_final_token_facts(100),
+                                   acquire_prepared_resources(key)));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.mark_ready_for_gate(key, 1));
+  Preserve_trx_gate_adopt_lease adopt;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_gate_adopt(key, 1, &adopt));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.commit_gate_adopt(&adopt));
+
+  Preserve_trx_attach_lease attach;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_attach(key, 1, &attach));
+  Preserve_trx_cleanup_lease cleanup;
+  EXPECT_EQ(Preserve_trx_prepared_status::ALREADY_CLAIMED,
+            registry.begin_cleanup(
+                key, 1, Preserve_trx_prepared_token_state::ADOPTED_LOCKED,
+                &cleanup));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.abort_attach_after_full_unwind(&attach));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_cleanup(
+                key, 1, Preserve_trx_prepared_token_state::ADOPTED_LOCKED,
+                &cleanup));
+  EXPECT_EQ(Preserve_trx_prepared_status::ALREADY_CLAIMED,
+            registry.begin_attach(key, 1, &attach));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.commit_cleanup(&cleanup, true));
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry, UnresolvedGateLeaseFailsClosed) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &prepare));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&prepare, make_final_token_facts(100),
+                                   acquire_prepared_resources(key)));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.mark_ready_for_gate(key, 1));
+  {
+    Preserve_trx_gate_adopt_lease unresolved;
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.begin_gate_adopt(key, 1, &unresolved));
+  }
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::CLEANUP_TAINTED,
+            snapshot.state);
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry, PendingLeaseDeadlineReleasesOnlyUnclaimed) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &prepare));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&prepare, make_final_token_facts(100),
+                                   acquire_prepared_resources(key)));
+  EXPECT_EQ(0U, registry.expire_ready_facts_pending_lease(
+                    key.source_uuid, key.epoch_id, 499999));
+  EXPECT_EQ(1U, registry.expire_ready_facts_pending_lease(
+                    key.source_uuid, key.epoch_id, 500000));
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::NOT_READY, snapshot.state);
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
 TEST(PreservedTrxRecordLockImportMetrics, AddAccumulatesIoBreakdown) {
   trx_preserve_record_lock_import_metrics_t total;
   total.record_entries = 1;
