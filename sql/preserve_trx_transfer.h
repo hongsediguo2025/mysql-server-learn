@@ -40,6 +40,7 @@
 #include "sql/preserve_trx_carrier.h"
 
 class THD;
+struct Preserve_trx_prepared_token_key;
 enum class Preserve_trx_delivery_mode;
 
 static constexpr uint16_t kPreserveTrxTransferProtocolVersion = 3;
@@ -636,6 +637,13 @@ void preserve_trx_transfer_set_receiver_staged_prewarm_delay_ms_for_unit_test(
     uint delay_ms);
 void preserve_trx_transfer_set_receiver_object_prewarm_delay_ms_for_unit_test(
     uint delay_ms);
+#ifndef NDEBUG
+bool preserve_trx_transfer_strict_prepared_key_for_unit_test(
+    const std::string &root_dir,
+    const Preserve_trx_transfer_manifest &manifest,
+    const std::string &semantic_token,
+    Preserve_trx_prepared_token_key *key);
+#endif
 void preserve_trx_transfer_put_receiver_object_prewarm_proof_for_unit_test(
     const std::string &root_dir,
     const Preserve_trx_transfer_manifest &manifest,

@@ -11752,6 +11752,11 @@ TEST_F(PreserveSnapshotTest,
   Preserve_trx_transfer_receiver_registry registry;
   Local_file_preserved_trx_carrier carrier(m_dir);
   Preserved_trx_store store(&carrier);
+  Preserve_trx_prepared_token_key strict_key;
+  ASSERT_TRUE(preserve_trx_transfer_strict_prepared_key_for_unit_test(
+      m_dir, manifest, bundle.metadata.token, &strict_key));
+  auto &strict_registry = preserved_trx_strict_prepared_token_registry();
+  strict_registry.purge_epoch(strict_key.source_uuid, strict_key.epoch_id);
   const uint64_t seal_ready_before =
       preserve_trx_transfer_receiver_seal_prewarm_success_tokens_status();
   const uint64_t ready_before =
@@ -11800,6 +11805,11 @@ TEST_F(PreserveSnapshotTest,
   }
   ASSERT_GT(preserve_trx_transfer_receiver_seal_prewarm_success_tokens_status(),
             seal_ready_before);
+  Preserve_trx_prepared_token_snapshot strict_snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            strict_registry.snapshot(strict_key, &strict_snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::PREWARMED_PENDING_FINAL_FACT,
+            strict_snapshot.state);
 
   Preserve_trx_transfer_frame commit;
   commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
@@ -11810,12 +11820,20 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_apply_receiver_frame(
                 m_dir, commit, &store, &registry, 300, nullptr));
 
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            strict_registry.snapshot(strict_key, &strict_snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::READY_FOR_GATE,
+            strict_snapshot.state);
+  EXPECT_EQ(manifest.source_epoch_commit_lsn,
+            strict_snapshot.facts.required_apply_lsn);
+
   EXPECT_GT(preserve_trx_transfer_receiver_ready_monotonic_us_status(),
             ready_before);
   EXPECT_GT(preserve_trx_transfer_receiver_ready_after_final_metadata_us_status(),
             0U);
   EXPECT_LT(preserve_trx_transfer_receiver_ready_after_final_metadata_us_status(),
             100000U);
+  strict_registry.purge_epoch(strict_key.source_uuid, strict_key.epoch_id);
 }
 
 TEST_F(PreserveSnapshotTest,
