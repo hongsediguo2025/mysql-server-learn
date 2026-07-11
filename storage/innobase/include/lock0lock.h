@@ -33,6 +33,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #ifndef lock0lock_h
 #define lock0lock_h
 
+#include <memory>
 #include <string>
 
 #include "buf0types.h"
@@ -723,6 +724,137 @@ without exposing lock0priv.h outside the lock module. */
 bool lock_preserve_record_bitmap_accounting_for_unit_test(
     const byte *bitmap, size_t bitmap_len, uint64_t *count_after_publish,
     uint64_t *count_after_reset);
+
+enum class lock_preserve_metadata_plan_status : uint8_t {
+  OK = 0,
+  INVALID_ARGUMENT,
+  CORRUPT_METADATA,
+  UNSUPPORTED_MODE,
+  DIGEST_MISMATCH,
+  NOT_FINAL,
+  DICT_LEASE_FAILED,
+  STALE_GENERATION
+};
+
+enum class lock_preserve_metadata_conflict_result : uint8_t {
+  OK = 0,
+  CONFLICT,
+  UNSUPPORTED_MODE,
+  CORRUPT_METADATA,
+  DICT_LEASE_INVALID,
+  DEADLINE_EXCEEDED
+};
+
+struct lock_preserve_metadata_plan_validation_t {
+  uint64_t object_generation{0};
+  uint64_t expected_object_generation{0};
+  uint64_t physical_fence_lsn{0};
+  uint32_t artifact_protocol_version{0};
+  uint32_t source_server_version{0};
+  std::string object_digest;
+  std::string final_lock_generation_digest;
+  std::string page_layout_digest;
+  std::string dictionary_generation_digest;
+  bool implicit_locks_materialized{false};
+  bool is_final_quiesced{false};
+};
+
+struct lock_preserve_metadata_dict_lease_ops_t {
+  void *context{nullptr};
+  bool (*acquire)(void *context, table_id_t table_id,
+                  space_index_t index_id, space_id_t space_id,
+                  const std::string &dictionary_generation_digest,
+                  void **opaque_lease, dict_index_t **index){nullptr};
+  bool (*revalidate)(void *opaque_lease,
+                     const std::string &dictionary_generation_digest,
+                     dict_index_t **index){nullptr};
+  void (*release)(void *opaque_lease){nullptr};
+};
+
+class lock_preserve_metadata_plan_t {
+ public:
+  lock_preserve_metadata_plan_t();
+  lock_preserve_metadata_plan_t(const lock_preserve_metadata_plan_t &) =
+      delete;
+  lock_preserve_metadata_plan_t &operator=(
+      const lock_preserve_metadata_plan_t &) = delete;
+  lock_preserve_metadata_plan_t(
+      lock_preserve_metadata_plan_t &&other) noexcept;
+  lock_preserve_metadata_plan_t &operator=(
+      lock_preserve_metadata_plan_t &&other) noexcept;
+  ~lock_preserve_metadata_plan_t();
+
+  bool ready() const;
+  uint64_t entry_count() const;
+  uint64_t bitmap_bits() const;
+  uint64_t capacity_bytes() const;
+
+ private:
+  class Impl;
+  std::unique_ptr<Impl> m_impl;
+
+  friend lock_preserve_metadata_plan_status
+  lock_preserve_build_record_lock_metadata_plan(
+      const std::string &, const lock_preserve_metadata_plan_validation_t &,
+      const lock_preserve_metadata_dict_lease_ops_t &,
+      lock_preserve_metadata_plan_t *);
+  friend lock_preserve_metadata_conflict_result
+  lock_preserve_check_record_bitmap_conflicts_from_metadata(
+      trx_t *, const lock_preserve_metadata_plan_t &, uint64_t);
+  friend dberr_t lock_preserve_apply_record_lock_metadata_plan(
+      trx_t *, const lock_preserve_metadata_plan_t &, uint64_t,
+      class lock_preserve_import_journal_t *);
+};
+
+class lock_preserve_import_journal_t {
+ public:
+  lock_preserve_import_journal_t();
+  lock_preserve_import_journal_t(const lock_preserve_import_journal_t &) =
+      delete;
+  lock_preserve_import_journal_t &operator=(
+      const lock_preserve_import_journal_t &) = delete;
+  lock_preserve_import_journal_t(
+      lock_preserve_import_journal_t &&other) noexcept;
+  lock_preserve_import_journal_t &operator=(
+      lock_preserve_import_journal_t &&other) noexcept;
+  ~lock_preserve_import_journal_t();
+  size_t size() const;
+
+ private:
+  class Impl;
+  std::unique_ptr<Impl> m_impl;
+  friend dberr_t lock_preserve_apply_record_lock_metadata_plan(
+      trx_t *, const lock_preserve_metadata_plan_t &, uint64_t,
+      lock_preserve_import_journal_t *);
+  friend dberr_t lock_preserve_unwind_record_lock_metadata_import(
+      trx_t *, lock_preserve_import_journal_t *);
+};
+
+/** Build an immutable record-lock plan from final physical metadata. This
+function parses metadata and acquires dictionary leases, but never reads an
+InnoDB page. */
+lock_preserve_metadata_plan_status
+lock_preserve_build_record_lock_metadata_plan(
+    const std::string &payload,
+    const lock_preserve_metadata_plan_validation_t &validation,
+    const lock_preserve_metadata_dict_lease_ops_t &dict_lease_ops,
+    lock_preserve_metadata_plan_t *plan);
+
+/** Check the native lock queues addressed by a metadata plan without creating
+a waiting lock or reading the referenced pages. */
+lock_preserve_metadata_conflict_result
+lock_preserve_check_record_bitmap_conflicts_from_metadata(
+    trx_t *trx, const lock_preserve_metadata_plan_t &plan,
+    uint64_t operation_deadline_us);
+
+/** Install granted record-lock bitmaps under the caller's physical-layout
+lease. Partial success is recorded in journal and must be unwound on error. */
+dberr_t lock_preserve_apply_record_lock_metadata_plan(
+    trx_t *trx, const lock_preserve_metadata_plan_t &plan,
+    uint64_t operation_deadline_us, lock_preserve_import_journal_t *journal);
+
+dberr_t lock_preserve_unwind_record_lock_metadata_import(
+    trx_t *trx, lock_preserve_import_journal_t *journal);
 
 /** Issue best-effort asynchronous reads for pages referenced by a preserved
 record-lock payload.

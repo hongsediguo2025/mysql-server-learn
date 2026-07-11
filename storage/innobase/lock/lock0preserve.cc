@@ -45,8 +45,10 @@ as published by the Free Software Foundation.
 #include "lock0priv.h"
 #include "mach0data.h"
 #include "row0sel.h"
+#include "sha2.h"
 #include "trx0preserve.h"
 #include "trx0sys.h"
+#include "ut0ut.h"
 #include "ut0new.h"
 
 #include "my_dbug.h"
@@ -64,6 +66,11 @@ bool lock_preserve_add_record_bitmap_for_import(ulint type_mode,
                                                 uint32_t first_set_heap_no,
                                                 dict_index_t *index,
                                                 trx_t *trx);
+lock_t *lock_preserve_add_record_bitmap_from_metadata(
+    ulint type_mode, const page_id_t &page_id, uint32_t n_bits,
+    const byte *bitmap, size_t bitmap_len, uint32_t first_set_heap_no,
+    dict_index_t *index, trx_t *trx);
+void lock_preserve_remove_record_bitmap_from_metadata(lock_t *lock);
 dberr_t lock_preserve_create_table_lock_for_import(dict_table_t *table,
                                                    trx_t *trx,
                                                    lock_mode mode);
@@ -323,7 +330,8 @@ static bool lock_preserve_predicate_page_identity_payload_is_valid(
 
 static bool lock_preserve_read_record_lock(
     const std::string &payload, size_t *offset,
-    Preserve_record_lock_entry *entry) {
+    Preserve_record_lock_entry *entry,
+    bool allow_unsupported_for_classification) {
   uint64_t table_id = 0;
   uint64_t index_id = 0;
   uint32_t space_id = 0;
@@ -349,7 +357,10 @@ static bool lock_preserve_read_record_lock(
   if (entry->n_bits == 0 || bitmap_len == 0 ||
       entry->page_n_heap == 0 ||
       bitmap_len > UINT32_MAX / 8 || entry->n_bits != bitmap_len * 8 ||
-      !lock_preserve_type_mode_is_valid(entry->type_mode) ||
+      (!lock_preserve_type_mode_is_valid(entry->type_mode) &&
+       !(allow_unsupported_for_classification &&
+         ((entry->type_mode & LOCK_WAIT) != 0 ||
+          lock_preserve_type_mode_is_predicate(entry->type_mode)))) ||
       *offset > payload.size() ||
       payload.size() - *offset < heap_offsets_len ||
       payload.size() - *offset - heap_offsets_len < record_images_len ||
@@ -376,6 +387,12 @@ static bool lock_preserve_read_record_lock(
   const uint32_t set_bits = entry->set_bits;
   if (set_bits == 0) {
     return true;
+  }
+
+  if (allow_unsupported_for_classification &&
+      (lock_preserve_entry_is_predicate(*entry) ||
+       (entry->type_mode & LOCK_WAIT) != 0)) {
+    return false;
   }
 
   if (lock_preserve_entry_is_predicate(*entry)) {
@@ -1646,11 +1663,9 @@ static ulint lock_preserve_record_precise_mode(uint32_t type_mode) {
   return type_mode & ~(LOCK_TYPE_MASK | LOCK_WAIT);
 }
 
-static bool lock_preserve_page_has_record_locks(const buf_block_t *block) {
-  ut_ad(block != nullptr);
-  ut_ad(locksys::owns_page_shard(block->get_page_id()));
+static bool lock_preserve_page_has_record_locks(const page_id_t &page_id) {
+  ut_ad(locksys::owns_page_shard(page_id));
 
-  const page_id_t page_id = block->get_page_id();
   hash_cell_t *cell = hash_get_nth_cell(
       lock_sys->rec_hash, hash_calc_hash(lock_rec_fold(page_id),
                                          lock_sys->rec_hash));
@@ -1701,14 +1716,13 @@ static bool lock_preserve_bitmap_intersects_lock(
 
 static bool lock_preserve_record_entry_has_conflict(
     trx_t *trx, const Preserve_record_lock_entry &entry,
-    const buf_block_t *block) {
-  ut_ad(locksys::owns_page_shard(block->get_page_id()));
+    const page_id_t &page_id) {
+  ut_ad(locksys::owns_page_shard(page_id));
   ut_ad(!lock_preserve_entry_is_predicate(entry));
 
-  if (!lock_preserve_page_has_record_locks(block)) return false;
+  if (!lock_preserve_page_has_record_locks(page_id)) return false;
 
   const ulint precise_mode = lock_preserve_record_precise_mode(entry.type_mode);
-  const page_id_t page_id = block->get_page_id();
   hash_cell_t *cell = hash_get_nth_cell(
       lock_sys->rec_hash, hash_calc_hash(lock_rec_fold(page_id),
                                          lock_sys->rec_hash));
@@ -1906,7 +1920,8 @@ static dberr_t lock_preserve_import_record_lock(
   {
     locksys::Shard_latch_guard guard{block->get_page_id()};
     has_conflict =
-        lock_preserve_record_entry_has_conflict(trx, resolved_entry, block);
+        lock_preserve_record_entry_has_conflict(trx, resolved_entry,
+                                                block->get_page_id());
     if (!has_conflict) {
       trx_mutex_enter(trx);
       const bool imported = lock_preserve_add_record_bitmap_for_import(
@@ -1941,7 +1956,8 @@ static dberr_t lock_preserve_import_record_lock(
 
 static dberr_t lock_preserve_parse_record_locks_payload(
     const std::string &payload,
-    std::vector<Preserve_record_lock_entry> *entries) {
+    std::vector<Preserve_record_lock_entry> *entries,
+    bool allow_unsupported_for_classification = false) {
   ut_ad(entries != nullptr);
 
   entries->clear();
@@ -1957,7 +1973,8 @@ static dberr_t lock_preserve_parse_record_locks_payload(
 
   for (uint32_t i = 0; i < count; ++i) {
     Preserve_record_lock_entry entry;
-    if (lock_preserve_read_record_lock(payload, &offset, &entry)) {
+    if (lock_preserve_read_record_lock(payload, &offset, &entry,
+                                       allow_unsupported_for_classification)) {
       return DB_ERROR;
     }
     entries->push_back(std::move(entry));
@@ -1979,6 +1996,353 @@ static void lock_preserve_sort_record_lock_entries_for_import(
         if (lhs.page_no != rhs.page_no) return lhs.page_no < rhs.page_no;
         return lhs.type_mode < rhs.type_mode;
       });
+}
+
+namespace {
+
+std::string lock_preserve_sha256_hex(const std::string &payload) {
+  unsigned char digest[SHA256_DIGEST_LENGTH]{};
+  SHA_EVP256(reinterpret_cast<const unsigned char *>(payload.data()),
+             payload.size(), digest);
+
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string encoded(SHA256_DIGEST_LENGTH * 2, '0');
+  for (size_t i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+    encoded[i * 2] = kHex[digest[i] >> 4];
+    encoded[i * 2 + 1] = kHex[digest[i] & 0x0f];
+  }
+  return encoded;
+}
+
+bool lock_preserve_sha256_hex_is_valid(const std::string &digest) {
+  if (digest.size() != SHA256_DIGEST_LENGTH * 2) return false;
+  return std::all_of(digest.begin(), digest.end(), [](char value) {
+    return (value >= '0' && value <= '9') ||
+           (value >= 'a' && value <= 'f');
+  });
+}
+
+bool lock_preserve_metadata_deadline_expired(uint64_t deadline_us) {
+  return deadline_us != 0 &&
+         static_cast<uint64_t>(ut_time_monotonic_us()) >= deadline_us;
+}
+
+}  // namespace
+
+class lock_preserve_metadata_plan_t::Impl {
+ public:
+  struct Entry {
+    Preserve_record_lock_entry record;
+    dict_index_t *index{nullptr};
+    void *opaque_lease{nullptr};
+    bool (*revalidate)(void *, const std::string &, dict_index_t **){nullptr};
+    void (*release)(void *){nullptr};
+
+    Entry() = default;
+    Entry(const Entry &) = delete;
+    Entry &operator=(const Entry &) = delete;
+
+    Entry(Entry &&other) noexcept
+        : record(std::move(other.record)),
+          index(other.index),
+          opaque_lease(other.opaque_lease),
+          revalidate(other.revalidate),
+          release(other.release) {
+      other.index = nullptr;
+      other.opaque_lease = nullptr;
+      other.revalidate = nullptr;
+      other.release = nullptr;
+    }
+
+    Entry &operator=(Entry &&other) noexcept {
+      if (this == &other) return *this;
+      reset();
+      record = std::move(other.record);
+      index = other.index;
+      opaque_lease = other.opaque_lease;
+      revalidate = other.revalidate;
+      release = other.release;
+      other.index = nullptr;
+      other.opaque_lease = nullptr;
+      other.revalidate = nullptr;
+      other.release = nullptr;
+      return *this;
+    }
+
+    ~Entry() { reset(); }
+
+    void reset() {
+      if (opaque_lease != nullptr && release != nullptr) {
+        release(opaque_lease);
+      }
+      index = nullptr;
+      opaque_lease = nullptr;
+      revalidate = nullptr;
+      release = nullptr;
+    }
+  };
+
+  bool ready{false};
+  uint64_t bitmap_bits{0};
+  uint64_t capacity_bytes{0};
+  std::string dictionary_generation_digest;
+  std::vector<Entry> entries;
+};
+
+class lock_preserve_import_journal_t::Impl {
+ public:
+  std::vector<lock_t *> locks;
+};
+
+lock_preserve_metadata_plan_t::lock_preserve_metadata_plan_t()
+    : m_impl(std::make_unique<Impl>()) {}
+lock_preserve_metadata_plan_t::lock_preserve_metadata_plan_t(
+    lock_preserve_metadata_plan_t &&other) noexcept = default;
+lock_preserve_metadata_plan_t &lock_preserve_metadata_plan_t::operator=(
+    lock_preserve_metadata_plan_t &&other) noexcept = default;
+lock_preserve_metadata_plan_t::~lock_preserve_metadata_plan_t() = default;
+
+bool lock_preserve_metadata_plan_t::ready() const {
+  return m_impl != nullptr && m_impl->ready;
+}
+
+uint64_t lock_preserve_metadata_plan_t::entry_count() const {
+  return m_impl == nullptr ? 0 : static_cast<uint64_t>(m_impl->entries.size());
+}
+
+uint64_t lock_preserve_metadata_plan_t::bitmap_bits() const {
+  return m_impl == nullptr ? 0 : m_impl->bitmap_bits;
+}
+
+uint64_t lock_preserve_metadata_plan_t::capacity_bytes() const {
+  return m_impl == nullptr ? 0 : m_impl->capacity_bytes;
+}
+
+lock_preserve_import_journal_t::lock_preserve_import_journal_t()
+    : m_impl(std::make_unique<Impl>()) {}
+lock_preserve_import_journal_t::lock_preserve_import_journal_t(
+    lock_preserve_import_journal_t &&other) noexcept = default;
+lock_preserve_import_journal_t &lock_preserve_import_journal_t::operator=(
+    lock_preserve_import_journal_t &&other) noexcept = default;
+lock_preserve_import_journal_t::~lock_preserve_import_journal_t() = default;
+
+size_t lock_preserve_import_journal_t::size() const {
+  return m_impl == nullptr ? 0 : m_impl->locks.size();
+}
+
+lock_preserve_metadata_plan_status
+lock_preserve_build_record_lock_metadata_plan(
+    const std::string &payload,
+    const lock_preserve_metadata_plan_validation_t &validation,
+    const lock_preserve_metadata_dict_lease_ops_t &dict_lease_ops,
+    lock_preserve_metadata_plan_t *plan) {
+  if (plan == nullptr) {
+    return lock_preserve_metadata_plan_status::INVALID_ARGUMENT;
+  }
+  *plan = lock_preserve_metadata_plan_t{};
+
+  if (validation.object_generation == 0 ||
+      validation.expected_object_generation == 0 ||
+      validation.physical_fence_lsn == 0 ||
+      validation.artifact_protocol_version != 1 ||
+      validation.source_server_version == 0 ||
+      !lock_preserve_sha256_hex_is_valid(validation.object_digest) ||
+      !lock_preserve_sha256_hex_is_valid(
+          validation.final_lock_generation_digest) ||
+      !lock_preserve_sha256_hex_is_valid(validation.page_layout_digest) ||
+      !lock_preserve_sha256_hex_is_valid(
+          validation.dictionary_generation_digest) ||
+      dict_lease_ops.acquire == nullptr ||
+      dict_lease_ops.revalidate == nullptr ||
+      dict_lease_ops.release == nullptr) {
+    return lock_preserve_metadata_plan_status::INVALID_ARGUMENT;
+  }
+  if (validation.object_generation !=
+      validation.expected_object_generation) {
+    return lock_preserve_metadata_plan_status::STALE_GENERATION;
+  }
+  if (!validation.is_final_quiesced ||
+      !validation.implicit_locks_materialized) {
+    return lock_preserve_metadata_plan_status::NOT_FINAL;
+  }
+  if (lock_preserve_sha256_hex(payload) != validation.object_digest) {
+    return lock_preserve_metadata_plan_status::DIGEST_MISMATCH;
+  }
+
+  std::vector<Preserve_record_lock_entry> parsed_entries;
+  if (lock_preserve_parse_record_locks_payload(
+          payload, &parsed_entries, true) != DB_SUCCESS) {
+    return lock_preserve_metadata_plan_status::CORRUPT_METADATA;
+  }
+  lock_preserve_sort_record_lock_entries_for_import(&parsed_entries);
+
+  auto prepared =
+      std::make_unique<lock_preserve_metadata_plan_t::Impl>();
+  prepared->dictionary_generation_digest =
+      validation.dictionary_generation_digest;
+  prepared->entries.reserve(parsed_entries.size());
+
+  for (Preserve_record_lock_entry &record : parsed_entries) {
+    if (lock_preserve_entry_is_predicate(record) ||
+        (record.type_mode & LOCK_WAIT) != 0) {
+      return lock_preserve_metadata_plan_status::UNSUPPORTED_MODE;
+    }
+    if (!record.record_images.empty() || record.page_n_heap == 0 ||
+        record.max_set_heap_no == UINT32_MAX ||
+        record.max_set_heap_no >= record.page_n_heap) {
+      return lock_preserve_metadata_plan_status::CORRUPT_METADATA;
+    }
+
+    const uint64_t bitmap_bytes =
+        1ULL + ((static_cast<uint64_t>(record.page_n_heap) +
+                 LOCK_PAGE_BITMAP_MARGIN) /
+                8ULL);
+    if (bitmap_bytes == 0 || bitmap_bytes > UINT32_MAX / 8 ||
+        record.bitmap.size() < bitmap_bytes) {
+      return lock_preserve_metadata_plan_status::CORRUPT_METADATA;
+    }
+    for (size_t i = static_cast<size_t>(bitmap_bytes);
+         i < record.bitmap.size(); ++i) {
+      if (record.bitmap[i] != '\0') {
+        return lock_preserve_metadata_plan_status::CORRUPT_METADATA;
+      }
+    }
+    record.bitmap.resize(static_cast<size_t>(bitmap_bytes));
+    record.n_bits = static_cast<uint32_t>(bitmap_bytes * 8);
+    if (!lock_preserve_refresh_bitmap_stats(&record) ||
+        record.max_set_heap_no >= record.page_n_heap) {
+      return lock_preserve_metadata_plan_status::CORRUPT_METADATA;
+    }
+
+    lock_preserve_metadata_plan_t::Impl::Entry entry;
+    entry.record = std::move(record);
+    entry.record.heap_offsets.clear();
+    entry.record.record_images.clear();
+    entry.revalidate = dict_lease_ops.revalidate;
+    entry.release = dict_lease_ops.release;
+    if (!dict_lease_ops.acquire(
+            dict_lease_ops.context, entry.record.table_id,
+            entry.record.index_id, entry.record.space_id,
+            validation.dictionary_generation_digest, &entry.opaque_lease,
+            &entry.index) ||
+        entry.opaque_lease == nullptr || entry.index == nullptr) {
+      return lock_preserve_metadata_plan_status::DICT_LEASE_FAILED;
+    }
+
+    if (UINT64_MAX - prepared->bitmap_bits < entry.record.set_bits) {
+      return lock_preserve_metadata_plan_status::CORRUPT_METADATA;
+    }
+    prepared->bitmap_bits += entry.record.set_bits;
+    prepared->entries.push_back(std::move(entry));
+  }
+
+  prepared->capacity_bytes =
+      sizeof(lock_preserve_metadata_plan_t::Impl) +
+      prepared->entries.capacity() *
+          sizeof(lock_preserve_metadata_plan_t::Impl::Entry);
+  for (const lock_preserve_metadata_plan_t::Impl::Entry &entry :
+       prepared->entries) {
+    prepared->capacity_bytes += entry.record.bitmap.capacity();
+  }
+  prepared->ready = true;
+  plan->m_impl = std::move(prepared);
+  return lock_preserve_metadata_plan_status::OK;
+}
+
+lock_preserve_metadata_conflict_result
+lock_preserve_check_record_bitmap_conflicts_from_metadata(
+    trx_t *trx, const lock_preserve_metadata_plan_t &plan,
+    uint64_t operation_deadline_us) {
+  if (trx == nullptr || plan.m_impl == nullptr || !plan.m_impl->ready) {
+    return lock_preserve_metadata_conflict_result::CORRUPT_METADATA;
+  }
+
+  for (const lock_preserve_metadata_plan_t::Impl::Entry &entry :
+       plan.m_impl->entries) {
+    if (lock_preserve_metadata_deadline_expired(operation_deadline_us)) {
+      return lock_preserve_metadata_conflict_result::DEADLINE_EXCEEDED;
+    }
+    dict_index_t *index = nullptr;
+    if (entry.revalidate == nullptr || entry.opaque_lease == nullptr ||
+        !entry.revalidate(entry.opaque_lease,
+                          plan.m_impl->dictionary_generation_digest, &index) ||
+        index == nullptr || index != entry.index) {
+      return lock_preserve_metadata_conflict_result::DICT_LEASE_INVALID;
+    }
+
+    const page_id_t page_id(entry.record.space_id, entry.record.page_no);
+    locksys::Shard_latch_guard guard{page_id};
+    if (lock_preserve_record_entry_has_conflict(trx, entry.record, page_id)) {
+      return lock_preserve_metadata_conflict_result::CONFLICT;
+    }
+  }
+  return lock_preserve_metadata_conflict_result::OK;
+}
+
+dberr_t lock_preserve_apply_record_lock_metadata_plan(
+    trx_t *trx, const lock_preserve_metadata_plan_t &plan,
+    uint64_t operation_deadline_us, lock_preserve_import_journal_t *journal) {
+  if (trx == nullptr || plan.m_impl == nullptr || !plan.m_impl->ready ||
+      journal == nullptr || journal->m_impl == nullptr ||
+      !journal->m_impl->locks.empty()) {
+    return DB_ERROR;
+  }
+
+  journal->m_impl->locks.reserve(plan.m_impl->entries.size());
+  for (const lock_preserve_metadata_plan_t::Impl::Entry &entry :
+       plan.m_impl->entries) {
+    if (lock_preserve_metadata_deadline_expired(operation_deadline_us)) {
+      return DB_INTERRUPTED;
+    }
+    dict_index_t *index = nullptr;
+    if (entry.revalidate == nullptr || entry.opaque_lease == nullptr ||
+        !entry.revalidate(entry.opaque_lease,
+                          plan.m_impl->dictionary_generation_digest, &index) ||
+        index == nullptr || index != entry.index) {
+      return DB_ERROR;
+    }
+
+    const page_id_t page_id(entry.record.space_id, entry.record.page_no);
+    locksys::Shard_latch_guard guard{page_id};
+    if (lock_preserve_record_entry_has_conflict(trx, entry.record, page_id)) {
+      return DB_LOCK_WAIT;
+    }
+
+    trx_mutex_enter(trx);
+    lock_t *lock = lock_preserve_add_record_bitmap_from_metadata(
+        entry.record.type_mode, page_id, entry.record.n_bits,
+        reinterpret_cast<const byte *>(entry.record.bitmap.data()),
+        entry.record.bitmap.size(), entry.record.first_set_heap_no, index, trx);
+    trx_mutex_exit(trx);
+    if (lock == nullptr) return DB_ERROR;
+    journal->m_impl->locks.push_back(lock);
+  }
+  return DB_SUCCESS;
+}
+
+dberr_t lock_preserve_unwind_record_lock_metadata_import(
+    trx_t *trx, lock_preserve_import_journal_t *journal) {
+  if (trx == nullptr || journal == nullptr || journal->m_impl == nullptr) {
+    return DB_ERROR;
+  }
+  for (lock_t *lock : journal->m_impl->locks) {
+    if (lock == nullptr || lock->trx != trx ||
+        lock_get_type_low(lock) != LOCK_REC) {
+      return DB_ERROR;
+    }
+  }
+
+  for (auto it = journal->m_impl->locks.rbegin();
+       it != journal->m_impl->locks.rend(); ++it) {
+    lock_t *lock = *it;
+    locksys::Shard_latch_guard guard{lock->rec_lock.page_id};
+    trx_mutex_enter(trx);
+    lock_preserve_remove_record_bitmap_from_metadata(lock);
+    trx_mutex_exit(trx);
+    *it = nullptr;
+  }
+  journal->m_impl->locks.clear();
+  return DB_SUCCESS;
 }
 
 bool lock_preserve_record_locks_payload_is_valid_for_import(

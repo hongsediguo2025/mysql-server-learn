@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "sql/sql_class.h"
+#include "sha2.h"
 #include "storage/innobase/include/lock0lock.h"
 #include "storage/innobase/include/lock0warmcopy.h"
 #include "storage/innobase/include/trx0trx.h"
@@ -80,11 +81,115 @@ void append_digest(std::string *out,
               sizeof(digest.bytes));
 }
 
+std::string metadata_payload_sha256_hex(const std::string &payload) {
+  unsigned char digest[SHA256_DIGEST_LENGTH]{};
+  SHA_EVP256(reinterpret_cast<const unsigned char *>(payload.data()),
+             payload.size(), digest);
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string encoded(SHA256_DIGEST_LENGTH * 2, '0');
+  for (size_t i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+    encoded[i * 2] = kHex[digest[i] >> 4];
+    encoded[i * 2 + 1] = kHex[digest[i] & 0x0f];
+  }
+  return encoded;
+}
+
 std::string make_encoded_record_image(const std::string &raw_image) {
   std::string image;
   append_u32(&image, static_cast<uint32_t>(raw_image.size()));
   image.append(raw_image);
   return image;
+}
+
+std::string make_metadata_record_lock_payload(uint32_t type_mode,
+                                              uint32_t page_n_heap,
+                                              const std::string &bitmap,
+                                              const std::string &record_images =
+                                                  std::string()) {
+  std::string payload;
+  append_u32(&payload, 1);
+  append_u64(&payload, 101);
+  append_u64(&payload, 202);
+  append_u32(&payload, 303);
+  append_u32(&payload, 404);
+  append_u32(&payload, type_mode);
+  append_u32(&payload, static_cast<uint32_t>(bitmap.size() * 8));
+  append_u64(&payload, 505);
+  append_u32(&payload, page_n_heap);
+  uint32_t set_bits = 0;
+  for (const unsigned char bitmap_byte : bitmap) {
+    for (uint32_t bit = 0; bit < 8; ++bit) {
+      if (bitmap_byte & (1U << bit)) ++set_bits;
+    }
+  }
+  append_u32(&payload, set_bits * 4);
+  append_u32(&payload, static_cast<uint32_t>(record_images.size()));
+  append_u32(&payload, static_cast<uint32_t>(bitmap.size()));
+  for (uint32_t i = 0; i < set_bits; ++i) append_u32(&payload, i + 1);
+  payload.append(record_images);
+  payload.append(bitmap);
+  return payload;
+}
+
+bool metadata_dict_lease_acquire(
+    void *, table_id_t, space_index_t, space_id_t, const std::string &,
+    void **opaque_lease, dict_index_t **index) {
+  if (opaque_lease == nullptr || index == nullptr) return false;
+  *opaque_lease = new uint64_t(1);
+  *index = reinterpret_cast<dict_index_t *>(static_cast<uintptr_t>(1));
+  return true;
+}
+
+std::atomic<bool> metadata_dict_lease_valid{true};
+std::atomic<uint64_t> metadata_dict_lease_release_count{0};
+
+bool metadata_dict_lease_revalidate(void *opaque_lease, const std::string &,
+                                    dict_index_t **index) {
+  if (opaque_lease == nullptr || index == nullptr ||
+      !metadata_dict_lease_valid.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  *index = reinterpret_cast<dict_index_t *>(static_cast<uintptr_t>(1));
+  return true;
+}
+
+void metadata_dict_lease_release(void *opaque_lease) {
+  metadata_dict_lease_release_count.fetch_add(1, std::memory_order_relaxed);
+  delete static_cast<uint64_t *>(opaque_lease);
+}
+
+bool metadata_dict_lease_partial_acquire_failure(
+    void *, table_id_t, space_index_t, space_id_t, const std::string &,
+    void **opaque_lease, dict_index_t **index) {
+  if (opaque_lease == nullptr || index == nullptr) return false;
+  *opaque_lease = new uint64_t(1);
+  *index = nullptr;
+  return false;
+}
+
+lock_preserve_metadata_plan_validation_t make_metadata_plan_validation(
+    const std::string &payload) {
+  lock_preserve_metadata_plan_validation_t validation;
+  validation.object_generation = 7;
+  validation.expected_object_generation = 7;
+  validation.physical_fence_lsn = 505;
+  validation.artifact_protocol_version = 1;
+  validation.source_server_version = 80022;
+  validation.object_digest = metadata_payload_sha256_hex(payload);
+  validation.final_lock_generation_digest.assign(64, 'a');
+  validation.page_layout_digest.assign(64, 'b');
+  validation.dictionary_generation_digest.assign(64, 'c');
+  validation.implicit_locks_materialized = true;
+  validation.is_final_quiesced = true;
+  return validation;
+}
+
+lock_preserve_metadata_dict_lease_ops_t make_metadata_dict_lease_ops() {
+  lock_preserve_metadata_dict_lease_ops_t ops;
+  ops.acquire = metadata_dict_lease_acquire;
+  ops.revalidate = metadata_dict_lease_revalidate;
+  ops.release = metadata_dict_lease_release;
+  return ops;
 }
 
 std::string read_source_file(const char *path) {
@@ -172,6 +277,143 @@ TEST(LockWarmcopyRecordImport, MultiBitBitmapBalancesNativeAccounting) {
       imported_bitmap, kBitmapLen, &count_after_publish, &count_after_reset));
   EXPECT_EQ(3ULL, count_after_publish);
   EXPECT_EQ(0ULL, count_after_reset);
+}
+
+TEST(LockWarmcopyMetadataPlan, AcceptsFinalStablePagePayloadWithoutPageIo) {
+  constexpr uint32_t kRecordBitmapMargin = 64;
+  const uint32_t page_n_heap = 16;
+  const size_t bitmap_bytes =
+      1 + ((page_n_heap + kRecordBitmapMargin) / 8);
+  std::string bitmap(bitmap_bytes, '\0');
+  bitmap[0] = static_cast<char>(0x0a);
+  const std::string payload = make_metadata_record_lock_payload(
+      LOCK_REC | LOCK_X, page_n_heap, bitmap);
+  lock_preserve_metadata_plan_t plan;
+  EXPECT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_plan(
+                payload, make_metadata_plan_validation(payload),
+                make_metadata_dict_lease_ops(), &plan));
+  EXPECT_TRUE(plan.ready());
+  EXPECT_EQ(1U, plan.entry_count());
+  EXPECT_EQ(2U, plan.bitmap_bits());
+  EXPECT_GT(plan.capacity_bytes(), bitmap.size());
+}
+
+TEST(LockWarmcopyMetadataPlan, RejectsNonFinalAndColdIdentityPayloads) {
+  constexpr uint32_t kRecordBitmapMargin = 64;
+  const uint32_t page_n_heap = 16;
+  const size_t bitmap_bytes =
+      1 + ((page_n_heap + kRecordBitmapMargin) / 8);
+  std::string bitmap(bitmap_bytes, '\0');
+  bitmap[0] = static_cast<char>(0x02);
+  const std::string payload = make_metadata_record_lock_payload(
+      LOCK_REC | LOCK_X, page_n_heap, bitmap);
+  auto validation = make_metadata_plan_validation(payload);
+  validation.is_final_quiesced = false;
+  lock_preserve_metadata_plan_t plan;
+  EXPECT_EQ(lock_preserve_metadata_plan_status::NOT_FINAL,
+            lock_preserve_build_record_lock_metadata_plan(
+                payload, validation, make_metadata_dict_lease_ops(), &plan));
+
+  validation = make_metadata_plan_validation(payload);
+  validation.implicit_locks_materialized = false;
+  EXPECT_EQ(lock_preserve_metadata_plan_status::NOT_FINAL,
+            lock_preserve_build_record_lock_metadata_plan(
+                payload, validation, make_metadata_dict_lease_ops(), &plan));
+
+  validation = make_metadata_plan_validation(payload);
+  validation.expected_object_generation = validation.object_generation + 1;
+  EXPECT_EQ(lock_preserve_metadata_plan_status::STALE_GENERATION,
+            lock_preserve_build_record_lock_metadata_plan(
+                payload, validation, make_metadata_dict_lease_ops(), &plan));
+
+  const std::string image_payload = make_metadata_record_lock_payload(
+      LOCK_REC | LOCK_X, page_n_heap, bitmap,
+      make_encoded_record_image("cold-record-image"));
+  EXPECT_EQ(lock_preserve_metadata_plan_status::CORRUPT_METADATA,
+            lock_preserve_build_record_lock_metadata_plan(
+                image_payload, make_metadata_plan_validation(image_payload),
+                make_metadata_dict_lease_ops(), &plan));
+}
+
+TEST(LockWarmcopyMetadataPlan, RejectsWaitPredicateAndDigestMismatch) {
+  constexpr uint32_t kRecordBitmapMargin = 64;
+  const uint32_t page_n_heap = 16;
+  const size_t bitmap_bytes =
+      1 + ((page_n_heap + kRecordBitmapMargin) / 8);
+  std::string bitmap(bitmap_bytes, '\0');
+  bitmap[0] = static_cast<char>(0x02);
+  lock_preserve_metadata_plan_t plan;
+
+  std::string payload = make_metadata_record_lock_payload(
+      LOCK_REC | LOCK_X | LOCK_WAIT, page_n_heap, bitmap);
+  EXPECT_EQ(lock_preserve_metadata_plan_status::UNSUPPORTED_MODE,
+            lock_preserve_build_record_lock_metadata_plan(
+                payload, make_metadata_plan_validation(payload),
+                make_metadata_dict_lease_ops(), &plan));
+
+  payload = make_metadata_record_lock_payload(
+      LOCK_REC | LOCK_X | LOCK_PREDICATE, page_n_heap, bitmap);
+  EXPECT_EQ(lock_preserve_metadata_plan_status::UNSUPPORTED_MODE,
+            lock_preserve_build_record_lock_metadata_plan(
+                payload, make_metadata_plan_validation(payload),
+                make_metadata_dict_lease_ops(), &plan));
+
+  payload = make_metadata_record_lock_payload(LOCK_REC | LOCK_X, page_n_heap,
+                                              bitmap);
+  auto validation = make_metadata_plan_validation(payload);
+  validation.object_digest.assign(64, 'f');
+  EXPECT_EQ(lock_preserve_metadata_plan_status::DIGEST_MISMATCH,
+            lock_preserve_build_record_lock_metadata_plan(
+                payload, validation, make_metadata_dict_lease_ops(), &plan));
+}
+
+TEST(LockWarmcopyMetadataPlan, DeadlineAndDictLeaseFailBeforePageAccess) {
+  constexpr uint32_t kRecordBitmapMargin = 64;
+  const uint32_t page_n_heap = 16;
+  const size_t bitmap_bytes =
+      1 + ((page_n_heap + kRecordBitmapMargin) / 8);
+  std::string bitmap(bitmap_bytes, '\0');
+  bitmap[0] = static_cast<char>(0x02);
+  const std::string payload = make_metadata_record_lock_payload(
+      LOCK_REC | LOCK_X, page_n_heap, bitmap);
+  lock_preserve_metadata_plan_t plan;
+  ASSERT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_plan(
+                payload, make_metadata_plan_validation(payload),
+                make_metadata_dict_lease_ops(), &plan));
+
+  trx_t trx{};
+  EXPECT_EQ(lock_preserve_metadata_conflict_result::DEADLINE_EXCEEDED,
+            lock_preserve_check_record_bitmap_conflicts_from_metadata(
+                &trx, plan, 1));
+
+  metadata_dict_lease_valid.store(false, std::memory_order_relaxed);
+  EXPECT_EQ(lock_preserve_metadata_conflict_result::DICT_LEASE_INVALID,
+            lock_preserve_check_record_bitmap_conflicts_from_metadata(
+                &trx, plan, 0));
+  metadata_dict_lease_valid.store(true, std::memory_order_relaxed);
+}
+
+TEST(LockWarmcopyMetadataPlan, PartialDictLeaseAcquireIsReleased) {
+  constexpr uint32_t kRecordBitmapMargin = 64;
+  const uint32_t page_n_heap = 16;
+  const size_t bitmap_bytes =
+      1 + ((page_n_heap + kRecordBitmapMargin) / 8);
+  std::string bitmap(bitmap_bytes, '\0');
+  bitmap[0] = static_cast<char>(0x02);
+  const std::string payload = make_metadata_record_lock_payload(
+      LOCK_REC | LOCK_X, page_n_heap, bitmap);
+
+  auto ops = make_metadata_dict_lease_ops();
+  ops.acquire = metadata_dict_lease_partial_acquire_failure;
+  metadata_dict_lease_release_count.store(0, std::memory_order_relaxed);
+  lock_preserve_metadata_plan_t plan;
+  EXPECT_EQ(lock_preserve_metadata_plan_status::DICT_LEASE_FAILED,
+            lock_preserve_build_record_lock_metadata_plan(
+                payload, make_metadata_plan_validation(payload), ops, &plan));
+  EXPECT_EQ(1U, metadata_dict_lease_release_count.load(
+                    std::memory_order_relaxed));
 }
 
 TEST(LockWarmcopyRecordShard, SetResetMutationsUpdateGenerationAndBitmap) {

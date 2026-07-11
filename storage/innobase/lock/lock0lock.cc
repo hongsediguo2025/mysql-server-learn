@@ -1236,6 +1236,29 @@ lock_t *RecLock::create(trx_t *trx, const lock_prdt_t *prdt) {
   return (lock);
 }
 
+lock_t *RecLock::create_for_preserve_metadata(
+    trx_t *trx, dict_index_t *index, const page_id_t &page_id,
+    uint32_t anchor_heap_no, ulint mode, size_t bitmap_bytes) {
+  ut_ad(trx != nullptr);
+  ut_ad(index != nullptr);
+  ut_ad(bitmap_bytes > 0);
+  ut_ad(anchor_heap_no < bitmap_bytes * 8);
+  ut_ad((mode & (LOCK_WAIT | LOCK_PREDICATE | LOCK_PRDT_PAGE)) == 0);
+  ut_ad(locksys::owns_page_shard(page_id));
+  ut_ad(trx_mutex_own(trx));
+
+  if (anchor_heap_no == PAGE_HEAP_NO_SUPREMUM) {
+    ut_ad((mode & LOCK_REC_NOT_GAP) == 0);
+    mode &= ~(LOCK_GAP | LOCK_REC_NOT_GAP);
+  }
+
+  const RecID rec_id(page_id, anchor_heap_no);
+  RecLock rec_lock(index, rec_id, mode, bitmap_bytes);
+  lock_t *lock = lock_alloc(trx, index, mode, rec_id, bitmap_bytes);
+  rec_lock.lock_add(lock);
+  return lock;
+}
+
 /**
 Collect the transactions that will need to be rolled back asynchronously
 @param[in, out] hit_list    The list of transactions to be rolled back, to which
@@ -1542,6 +1565,8 @@ static bool lock_preserve_record_bitmap_set_bit_count(
   return true;
 }
 
+static void lock_rec_dequeue_from_page(lock_t *in_lock);
+
 bool lock_preserve_publish_record_bitmap_for_import(lock_t *lock,
                                                     const byte *bitmap,
                                                     size_t bitmap_len) {
@@ -1680,6 +1705,64 @@ bool lock_preserve_add_record_bitmap_for_import(ulint type_mode,
 
   return lock_preserve_publish_record_bitmap_for_import(lock, bitmap,
                                                         bitmap_len);
+}
+
+lock_t *lock_preserve_add_record_bitmap_from_metadata(
+    ulint type_mode, const page_id_t &page_id, uint32_t n_bits,
+    const byte *bitmap, size_t bitmap_len, uint32_t first_set_heap_no,
+    dict_index_t *index, trx_t *trx) {
+  if (bitmap == nullptr || index == nullptr || trx == nullptr || n_bits == 0 ||
+      bitmap_len == 0 || bitmap_len > UINT32_MAX / 8 ||
+      n_bits != static_cast<uint32_t>(bitmap_len * 8) ||
+      first_set_heap_no >= n_bits ||
+      (type_mode & (LOCK_WAIT | LOCK_PREDICATE | LOCK_PRDT_PAGE)) != 0) {
+    return nullptr;
+  }
+
+  ut_ad(locksys::owns_page_shard(page_id));
+  ut_ad(trx_mutex_own(trx));
+
+  uint32_t imported_set_bits = 0;
+  if ((bitmap[first_set_heap_no / 8] &
+       static_cast<byte>(1U << (first_set_heap_no % 8))) == 0 ||
+      !lock_preserve_record_bitmap_set_bit_count(bitmap, bitmap_len,
+                                                 &imported_set_bits)) {
+    return nullptr;
+  }
+  if (first_set_heap_no == PAGE_HEAP_NO_SUPREMUM &&
+      (type_mode & LOCK_REC_NOT_GAP) != 0) {
+    return nullptr;
+  }
+
+  lock_t *lock = RecLock::create_for_preserve_metadata(
+      trx, index, page_id, first_set_heap_no, type_mode, bitmap_len);
+  if (lock == nullptr) return nullptr;
+
+  if (!lock_preserve_publish_record_bitmap_for_import(lock, bitmap,
+                                                      bitmap_len)) {
+    for (ulint heap_no = lock_rec_find_set_bit(lock);
+         heap_no != ULINT_UNDEFINED;
+         heap_no = lock_rec_find_set_bit(lock)) {
+      lock_rec_reset_nth_bit(lock, heap_no);
+    }
+    lock_rec_dequeue_from_page(lock);
+    return nullptr;
+  }
+  return lock;
+}
+
+void lock_preserve_remove_record_bitmap_from_metadata(lock_t *lock) {
+  ut_ad(lock != nullptr);
+  ut_ad(lock_get_type_low(lock) == LOCK_REC);
+  ut_ad(locksys::owns_page_shard(lock->rec_lock.page_id));
+  ut_ad(trx_mutex_own(lock->trx));
+
+  for (ulint heap_no = lock_rec_find_set_bit(lock);
+       heap_no != ULINT_UNDEFINED;
+       heap_no = lock_rec_find_set_bit(lock)) {
+    lock_rec_reset_nth_bit(lock, heap_no);
+  }
+  lock_rec_dequeue_from_page(lock);
 }
 
 /** This is a fast routine for locking a record in the most common cases:

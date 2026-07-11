@@ -747,7 +747,27 @@ class RecLock {
   static lock_t *lock_alloc(trx_t *trx, dict_index_t *index, ulint mode,
                             const RecID &rec_id, ulint size);
 
+  /** Create a granted Preserve/Resume record lock from a validated physical
+  bitmap without opening the referenced page. The caller must own the page
+  lock shard and trx mutex. */
+  static lock_t *create_for_preserve_metadata(
+      trx_t *trx, dict_index_t *index, const page_id_t &page_id,
+      uint32_t anchor_heap_no, ulint mode, size_t bitmap_bytes);
+
  private:
+  RecLock(dict_index_t *index, const RecID &rec_id, ulint mode,
+          size_t bitmap_bytes)
+      : m_thr(),
+        m_trx(),
+        m_mode(mode),
+        m_size(bitmap_bytes),
+        m_index(index),
+        m_rec_id(rec_id) {
+    ut_ad(!is_predicate_lock(m_mode));
+    ut_ad((m_mode & LOCK_WAIT) == 0);
+    ut_ad(bitmap_bytes > 0);
+  }
+
   /*
   @return the record lock size in bytes */
   size_t lock_size() const { return (m_size); }

@@ -32,6 +32,10 @@ my $sys_vars = read_source(File::Spec->catfile(
   $source_root, 'sql', 'sys_vars.cc'));
 my $mysqld = read_source(File::Spec->catfile(
   $source_root, 'sql', 'mysqld.cc'));
+my $lock_preserve = read_source(File::Spec->catfile(
+  $source_root, 'storage', 'innobase', 'lock', 'lock0preserve.cc'));
+my $lock_native = read_source(File::Spec->catfile(
+  $source_root, 'storage', 'innobase', 'lock', 'lock0lock.cc'));
 
 die "strict production fence path must stay unreachable before P4\n"
   if $promotion =~ /preserved_trx_acquire_production_physical_fence_lease/ ||
@@ -41,6 +45,11 @@ die "strict production fence path must stay unreachable before P4\n"
 die "strict registry must remain unreachable from legacy promotion/transfer before P4\n"
   if $promotion =~ /preserved_trx_strict_prepared_token_registry/ ||
      $transfer =~ /preserved_trx_strict_prepared_token_registry/;
+
+die "P2 metadata-only lock apply must remain unreachable before P4\n"
+  if $promotion =~ /lock_preserve_apply_record_lock_metadata_plan/ ||
+     $transfer =~ /lock_preserve_apply_record_lock_metadata_plan/ ||
+     $preserve =~ /lock_preserve_apply_record_lock_metadata_plan/;
 
 die "test physical-fence provider must not be a production fallback\n"
   unless $prepared =~ /g_production_provider_registered/ &&
@@ -52,6 +61,28 @@ die "P0 strict contract module must not read InnoDB pages\n"
 
 die "P0 strict contract module must not touch binlog cache internals\n"
   if $prepared =~ /binlog_cache_mngr|register_binlog_handler|IO_CACHE|my_b_read/;
+
+my $metadata_start = index(
+  $lock_preserve, 'lock_preserve_build_record_lock_metadata_plan(');
+my $metadata_end = index(
+  $lock_preserve, 'bool lock_preserve_record_locks_payload_is_valid_for_import',
+  $metadata_start);
+die "cannot locate P2 metadata-only implementation block\n"
+  if $metadata_start < 0 || $metadata_end <= $metadata_start;
+my $metadata_impl = substr(
+  $lock_preserve, $metadata_start, $metadata_end - $metadata_start);
+die "P2 metadata-only lock plan must not read InnoDB pages or resolve images\n"
+  if $metadata_impl =~
+     /buf_page_get|buf_read_page|page_find_rec_with_heap_no|record_image_resolve/;
+die "P2 metadata-only plan must reuse the existing record-lock parser\n"
+  unless $metadata_impl =~
+         /lock_preserve_parse_record_locks_payload\([\s\S]*true\)/;
+die "P2 conflict scan must be keyed by page_id without buf_block\n"
+  unless $lock_preserve =~
+         /lock_preserve_record_entry_has_conflict\([\s\S]{0,180}const page_id_t &page_id\)/;
+die "native exact-bitmap helper must stay Preserve-specific and page-free\n"
+  unless $lock_native =~ /create_for_preserve_metadata/ &&
+         $lock_native =~ /lock_preserve_add_record_bitmap_from_metadata/;
 
 die "strict physical-fence controls must not become public sysvars\n"
   if $sys_vars =~ /preserve_trx_physical_consistency_mode|physical_fence_provider/;
