@@ -58,6 +58,7 @@
 #include "sql/debug_sync.h"
 #include "sql/mysqld.h"
 #include "sql/preserve_trx.h"
+#include "sql/preserve_trx_promotion_prepared.h"
 #include "sql/preserve_trx_xid.h"
 
 namespace {
@@ -624,6 +625,15 @@ bool intent_marker_tokens_from_payload(const std::vector<unsigned char> &bytes,
                                        std::set<std::string> *tokens) {
   if (tokens == nullptr) return false;
   const std::string encoded(bytes.begin(), bytes.end());
+  Preserve_trx_strict_promotion_intent_epoch strict_intent;
+  if (preserved_trx_decode_strict_promotion_intent_v2(encoded,
+                                                       &strict_intent)) {
+    for (const Preserve_trx_strict_promotion_intent_token &token :
+         strict_intent.tokens) {
+      tokens->insert(token.token);
+    }
+    return !tokens->empty();
+  }
   const size_t digest_pos = encoded.rfind("digest=");
   if (digest_pos == std::string::npos ||
       (digest_pos > 0 && encoded[digest_pos - 1] != '\n')) {

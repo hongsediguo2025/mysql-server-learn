@@ -43,6 +43,8 @@ struct TABLE;
 struct LEX;
 struct Preserve_trx_lock_warmcopy_artifact;
 class Preserve_trx_transfer_source_epoch_session;
+class Preserve_trx_gate_adopt_lease;
+class Preserve_trx_physical_fence_lease;
 
 extern bool preserve_trx_enable;
 extern bool preserve_trx_temp_table_enable;
@@ -549,6 +551,37 @@ struct Preserved_trx_promotion_ready_adopt_result {
   bool rolled_back{false};
   std::string reason;
 };
+
+enum class Preserved_trx_physical_adopt_status : uint8_t {
+  OK = 0,
+  INVALID_ARGUMENT,
+  PHYSICAL_FENCE_REVALIDATE_FAILED,
+  PHYSICAL_FENCE_PROVIDER_VIOLATION,
+  PREPARED_TRX_NOT_FOUND,
+  LOCK_CONFLICT,
+  SEMANTIC_IMPORT_FAILED,
+  ROLLED_BACK,
+  CLEANUP_TAINTED
+};
+
+struct Preserved_trx_physical_adopt_result {
+  Preserved_trx_physical_adopt_status status{
+      Preserved_trx_physical_adopt_status::INVALID_ARGUMENT};
+  bool claimed{false};
+  bool rolled_back{false};
+  bool provider_contract_violation{false};
+  uint64_t record_lock_apply_us{0};
+  uint64_t record_lock_entries{0};
+  uint64_t record_lock_bits{0};
+  std::string reason;
+};
+
+Preserved_trx_physical_adopt_status
+preserved_trx_adopt_prepared_for_physical_promotion(
+    const std::string &dir, Preserve_trx_gate_adopt_lease *adopt_lease,
+    Preserve_trx_physical_fence_lease *physical_lease,
+    uint64_t operation_deadline_us,
+    Preserved_trx_physical_adopt_result *result);
 
 bool preserved_trx_adopt_ready_bundle_for_promotion(
     const std::string &dir, Preserved_trx_bundle bundle,

@@ -43,21 +43,26 @@ my $binlog_prepared_h = read_source(File::Spec->catfile(
 my $prepared_gunit = read_source(File::Spec->catfile(
   $source_root, 'unittest', 'gunit', 'preserve_trx-t.cc'));
 
-die "strict production fence path must stay unreachable before P4\n"
-  if $promotion =~ /preserved_trx_acquire_production_physical_fence_lease/ ||
-     $transfer =~ /preserved_trx_acquire_production_physical_fence_lease/ ||
+die "strict production fence must be acquired only by promotion coordinator\n"
+  unless $promotion =~ /preserved_trx_acquire_production_physical_fence_lease/;
+die "transfer/shared kernel must not acquire the production physical fence\n"
+  if $transfer =~ /preserved_trx_acquire_production_physical_fence_lease/ ||
      $preserve =~ /preserved_trx_acquire_production_physical_fence_lease/;
 
-die "strict registry must remain unreachable from legacy promotion/transfer before P4\n"
-  if $promotion =~ /preserved_trx_strict_prepared_token_registry/ ||
-     $transfer =~ /preserved_trx_strict_prepared_token_registry/;
+die "strict promotion coordinator must consume the prepared-token registry\n"
+  unless $promotion =~ /preserved_trx_strict_prepared_token_registry/;
+die "transfer must not consume strict gate ownership\n"
+  if $transfer =~ /preserved_trx_strict_prepared_token_registry/;
 
-die "P2 metadata-only lock apply must remain unreachable before P4\n"
+my $metadata_apply_count = () =
+  $preserve =~ /lock_preserve_apply_record_lock_metadata_plan/g;
+die "metadata-only lock apply must have one shared-kernel caller\n"
+  unless $metadata_apply_count == 1;
+die "promotion/transfer wrappers must not install metadata locks directly\n"
   if $promotion =~ /lock_preserve_apply_record_lock_metadata_plan/ ||
-     $transfer =~ /lock_preserve_apply_record_lock_metadata_plan/ ||
-     $preserve =~ /lock_preserve_apply_record_lock_metadata_plan/;
+     $transfer =~ /lock_preserve_apply_record_lock_metadata_plan/;
 
-die "P3 native binlog prepare/attach must remain unreachable before P4/P5\n"
+die "P3 native binlog prepare/attach must remain unreachable before P5\n"
   if $promotion =~ /mysql_binlog_preserve_(?:prepare|attach)_detached_cache/ ||
      $transfer =~ /mysql_binlog_preserve_(?:prepare|attach)_detached_cache/ ||
      $preserve =~ /mysql_binlog_preserve_(?:prepare|attach)_detached_cache/;
@@ -66,6 +71,17 @@ die "test physical-fence provider must not be a production fallback\n"
   unless $prepared =~ /g_production_provider_registered/ &&
          $prepared =~ /g_test_provider_registered/ &&
          $prepared =~ /MISSING_PROVIDER/;
+
+die "strict gate must use the shared physical-fence kernel entry\n"
+  unless $promotion =~ /preserved_trx_adopt_prepared_for_physical_promotion/ &&
+         $preserve =~ /STANDBY_PROMOTION_PHYSICAL_FENCE/;
+die "promotion wrapper must not directly claim or import prepared trx state\n"
+  if $promotion =~ /trx_preserve_claim_prepared|trx_preserve_import_read_view|preserved_trx_add_record/;
+
+die "strict gate must write versioned epoch intent before and after adopt\n"
+  unless $promotion =~ /write_strict_promotion_intent[\s\S]*false/ &&
+         $promotion =~ /write_strict_promotion_intent[\s\S]*true/ &&
+         $prepared =~ /PTRX_STRICT_PROMOTION_INTENT_EPOCH_V2/;
 
 die "P0 strict contract module must not read InnoDB pages\n"
   if $prepared =~ /buf_page_get|btr_cur_|row_search|record_image_resolve/;

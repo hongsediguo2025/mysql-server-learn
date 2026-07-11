@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "sql/preserve_trx_bundle.h"
+#include "sql/preserve_trx_promotion_prepared.h"
 
 extern uint preserve_trx_promotion_gate_batch_tokens;
 extern uint preserve_trx_promotion_gate_workers;
@@ -283,6 +284,58 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
     const std::string &preserve_dir,
     const Preserve_trx_promotion_adopt_all_request &request,
     Preserve_trx_promotion_adopt_result *result);
+
+enum class Preserve_trx_physical_promotion_gate_status : uint8_t {
+  OK = 0,
+  NOT_ENABLED,
+  INVALID_ARGUMENT,
+  PHYSICAL_FENCE_NOT_AVAILABLE,
+  PHYSICAL_FENCE_MISMATCH,
+  REGISTRY_NOT_READY,
+  INTENT_IO_ERROR,
+  ADOPT_FAILED,
+  CLEANUP_TAINTED
+};
+
+struct Preserve_trx_physical_promotion_gate_request {
+  std::string epoch_id;
+  std::vector<Preserve_trx_prepared_token_key> tokens;
+  Preserve_trx_physical_fence_proof expected_fence;
+  uint64_t operation_deadline_us{0};
+  uint32_t worker_count{1};
+};
+
+struct Preserve_trx_physical_promotion_gate_result {
+  Preserve_trx_physical_promotion_gate_status status{
+      Preserve_trx_physical_promotion_gate_status::INVALID_ARGUMENT};
+  uint64_t adopted_count{0};
+  uint64_t rolled_back_count{0};
+  uint64_t tainted_count{0};
+  uint64_t elapsed_us{0};
+  std::string message;
+};
+
+enum class Preserved_trx_physical_adopt_status : uint8_t;
+struct Preserved_trx_physical_adopt_result;
+using Preserve_trx_strict_physical_adopt_executor =
+    Preserved_trx_physical_adopt_status (*)(
+        const std::string &, Preserve_trx_gate_adopt_lease *,
+        Preserve_trx_physical_fence_lease *, uint64_t,
+        Preserved_trx_physical_adopt_result *);
+
+void preserved_trx_set_strict_physical_adopt_executor_for_unit_test(
+    Preserve_trx_strict_physical_adopt_executor executor);
+
+Preserve_trx_physical_promotion_gate_status
+preserved_trx_adopt_prepared_epoch_for_physical_promotion(
+    const std::string &preserve_dir,
+    const Preserve_trx_physical_promotion_gate_request &request,
+    Preserve_trx_physical_promotion_gate_result *result);
+Preserve_trx_physical_promotion_gate_status
+preserved_trx_adopt_prepared_epoch_for_physical_promotion_for_unit_test(
+    const std::string &preserve_dir,
+    const Preserve_trx_physical_promotion_gate_request &request,
+    Preserve_trx_physical_promotion_gate_result *result);
 
 Preserve_trx_promotion_adopt_status
 preserved_trx_cleanup_abandoned_standby_promotion_epoch(

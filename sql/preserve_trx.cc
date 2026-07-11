@@ -88,6 +88,7 @@
 #include "sql/preserve_trx_drain.h"
 #include "sql/preserve_trx_kernel.h"
 #include "sql/preserve_trx_lock_warmcopy.h"
+#include "sql/preserve_trx_promotion_prepared.h"
 #include "sql/preserve_trx_temp_table.h"
 #include "sql/preserve_trx_transfer.h"
 #include "sql/preserve_trx_warmcopy.h"
@@ -9110,7 +9111,8 @@ bool preserved_trx_thd_has_external_use(THD *thd) {
 
 enum class Preserved_trx_recover_or_adopt_policy {
   LOCAL_STARTUP_RECOVERY,
-  STANDBY_PROMOTION_ADOPT
+  STANDBY_PROMOTION_ADOPT,
+  STANDBY_PROMOTION_PHYSICAL_FENCE
 };
 
 struct Preserved_trx_recover_or_adopt_phase_metrics {
@@ -9129,6 +9131,8 @@ struct Preserved_trx_recover_or_adopt_result {
   bool rolled_back{false};
   bool cleanup_error{false};
   bool prepared_missing{false};
+  bool provider_contract_violation{false};
+  bool record_lock_conflict{false};
   Preserved_trx_recover_or_adopt_phase_metrics phase_metrics;
   std::string reason;
 };
@@ -9138,6 +9142,8 @@ struct Preserved_trx_recover_or_adopt_options {
       Preserved_trx_recover_or_adopt_policy::LOCAL_STARTUP_RECOVERY};
   uint64_t deadline_us{0};
   bool record_lock_pages_prewarmed{false};
+  const lock_preserve_metadata_plan_t *record_lock_plan{nullptr};
+  Preserve_trx_physical_fence_lease *physical_fence_lease{nullptr};
 };
 
 static bool recover_or_adopt_deadline_expired(
@@ -9157,17 +9163,20 @@ using Preserved_trx_after_claim_hook = bool (*)(
     void *context, std::string *reason);
 
 static bool preserved_trx_recover_or_adopt_bundle_shared(
-    const std::string &dir, Preserved_trx_bundle bundle,
+    const std::string &dir, Preserved_trx_bundle *bundle,
     const Preserved_trx_recover_or_adopt_options &options,
     Preserved_trx_after_claim_hook after_claim_hook, void *after_claim_context,
     Preserved_trx_recover_or_adopt_result *result) {
-  if (result == nullptr) return false;
+  if (result == nullptr || bundle == nullptr) return false;
   *result = {};
-  Preserve_snapshot_metadata metadata = std::move(bundle.metadata);
+  Preserve_snapshot_metadata &metadata = bundle->metadata;
   const std::string token = metadata.token;
   const bool local_startup =
       options.policy ==
       Preserved_trx_recover_or_adopt_policy::LOCAL_STARTUP_RECOVERY;
+  const bool strict_physical =
+      options.policy == Preserved_trx_recover_or_adopt_policy::
+                            STANDBY_PROMOTION_PHYSICAL_FENCE;
 
   auto fail_before_claim = [&](const std::string &reason) {
     result->reason = reason;
@@ -9177,6 +9186,16 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
     return fail_before_claim(local_startup ? "invalid durable transaction "
                                              "snapshot"
                                            : "invalid promotion ready record");
+  }
+  if (strict_physical &&
+      (options.physical_fence_lease == nullptr ||
+       !options.physical_fence_lease->acquired() ||
+       !metadata.predicate_locks_payload.empty() ||
+       (!metadata.record_locks_payload.empty() &&
+        (options.record_lock_plan == nullptr ||
+         !options.record_lock_plan->ready())))) {
+    return fail_before_claim(
+        "invalid metadata-only physical promotion inputs");
   }
   if (!recoverable_binlog_state(metadata.binlog_state)) {
     return fail_before_claim("unsupported durable transaction binlog state");
@@ -9190,6 +9209,21 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
                                              "deadline expired"
                                            : "promotion gate deadline "
                                              "expired before claim");
+  }
+
+  auto revalidate_physical_fence = [&]() {
+    if (!strict_physical) return Preserve_trx_physical_fence_status::OK;
+    return options.physical_fence_lease->revalidate();
+  };
+  Preserve_trx_physical_fence_status fence_status =
+      revalidate_physical_fence();
+  if (fence_status != Preserve_trx_physical_fence_status::OK) {
+    result->provider_contract_violation =
+        fence_status == Preserve_trx_physical_fence_status::
+                            PROVIDER_CONTRACT_VIOLATION;
+    return fail_before_claim(result->provider_contract_violation
+                                 ? "physical-fence provider contract violated"
+                                 : "physical-fence revalidation failed");
   }
 
   XID xid;
@@ -9226,9 +9260,17 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
   }
   result->claimed = true;
 
+  lock_preserve_import_journal_t strict_lock_journal;
+
   auto rollback_after_claim = [&](const std::string &reason) {
     result->reason = reason;
     delete_detached_mdl_context(token);
+    if (strict_physical && strict_lock_journal.size() != 0 &&
+        lock_preserve_unwind_record_lock_metadata_import(
+            trx, &strict_lock_journal) != DB_SUCCESS) {
+      result->cleanup_error = true;
+      result->reason += "; metadata lock unwind failed";
+    }
     if (local_startup) {
       const bool cleanup_error = rollback_claimed_preserved_snapshot_or_log(
           dir, token, trx, reason, &metadata);
@@ -9243,6 +9285,29 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
     }
     return false;
   };
+
+  auto taint_after_claim = [&](const std::string &reason) {
+    result->reason = reason;
+    result->cleanup_error = true;
+    result->provider_contract_violation = true;
+    return false;
+  };
+
+  auto revalidate_after_claim = [&](const char *stage) {
+    fence_status = revalidate_physical_fence();
+    if (fence_status == Preserve_trx_physical_fence_status::OK) return true;
+    const std::string reason =
+        std::string("physical-fence revalidation failed ") + stage;
+    if (fence_status == Preserve_trx_physical_fence_status::
+                            PROVIDER_CONTRACT_VIOLATION) {
+      taint_after_claim(reason + "; provider contract violated");
+    } else {
+      rollback_after_claim(reason);
+    }
+    return false;
+  };
+
+  if (!revalidate_after_claim("after claim")) return false;
 
   if (recover_or_adopt_deadline_expired(options)) {
     return rollback_after_claim(local_startup ? "durable transaction recovery "
@@ -9337,31 +9402,62 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
       return rollback_semantics_failure("record locks");
     }
   }
-  semantic_err = trx_preserve_import_record_locks(
-      trx, metadata.record_locks_payload,
-      &result->phase_metrics.record_lock_import,
-      local_startup ? nullptr : recover_or_adopt_deadline_expired_callback,
-      local_startup ? nullptr
-                    : const_cast<Preserved_trx_recover_or_adopt_options *>(
-                          &options));
+  if (strict_physical) {
+    if (options.record_lock_plan != nullptr) {
+      const auto conflict =
+          lock_preserve_check_record_bitmap_conflicts_from_metadata(
+              trx, *options.record_lock_plan, options.deadline_us);
+      if (conflict != lock_preserve_metadata_conflict_result::OK) {
+        result->record_lock_conflict =
+            conflict == lock_preserve_metadata_conflict_result::CONFLICT;
+        add_kernel_elapsed_us(phase_started_us,
+                              &result->phase_metrics.record_locks_us);
+        return rollback_after_claim(
+            result->record_lock_conflict
+                ? "metadata-only record-lock conflict"
+                : "metadata-only record-lock preflight failed");
+      }
+      semantic_err = lock_preserve_apply_record_lock_metadata_plan(
+          trx, *options.record_lock_plan, options.deadline_us,
+          &strict_lock_journal);
+      result->phase_metrics.record_lock_import.record_entries +=
+          options.record_lock_plan->entry_count();
+      result->phase_metrics.record_lock_import.bitmap_bits +=
+          options.record_lock_plan->bitmap_bits();
+    } else {
+      semantic_err = metadata.record_locks_payload.empty() ? DB_SUCCESS
+                                                           : DB_ERROR;
+    }
+  } else {
+    semantic_err = trx_preserve_import_record_locks(
+        trx, metadata.record_locks_payload,
+        &result->phase_metrics.record_lock_import,
+        local_startup ? nullptr : recover_or_adopt_deadline_expired_callback,
+        local_startup ? nullptr
+                      : const_cast<Preserved_trx_recover_or_adopt_options *>(
+                            &options));
+  }
   add_kernel_elapsed_us(phase_started_us,
                         &result->phase_metrics.record_locks_us);
   if (semantic_err != DB_SUCCESS) {
     return rollback_semantics_failure("record locks");
   }
+  if (!revalidate_after_claim("after record-lock import")) return false;
   if (recover_or_adopt_deadline_expired(options)) {
     return rollback_after_claim(local_startup ? "durable transaction recovery "
                                                "deadline expired"
                                              : "promotion gate deadline "
                                                "expired during semantic import");
   }
-  phase_started_us = preserve_trx_monotonic_us();
-  semantic_err =
-      trx_preserve_import_record_locks(trx, metadata.predicate_locks_payload);
-  add_kernel_elapsed_us(phase_started_us,
-                        &result->phase_metrics.predicate_locks_us);
-  if (semantic_err != DB_SUCCESS) {
-    return rollback_semantics_failure("predicate locks");
+  if (!strict_physical) {
+    phase_started_us = preserve_trx_monotonic_us();
+    semantic_err = trx_preserve_import_record_locks(
+        trx, metadata.predicate_locks_payload);
+    add_kernel_elapsed_us(phase_started_us,
+                          &result->phase_metrics.predicate_locks_us);
+    if (semantic_err != DB_SUCCESS) {
+      return rollback_semantics_failure("predicate locks");
+    }
   }
   if (recover_or_adopt_deadline_expired(options)) {
     return rollback_after_claim(local_startup ? "durable transaction recovery "
@@ -9377,6 +9473,7 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
         local_startup ? "failed to restore durable transaction MDL context"
                       : "failed to restore promotion transaction MDL context");
   }
+  if (!revalidate_after_claim("before record registration")) return false;
   if (recover_or_adopt_deadline_expired(options)) {
     return rollback_after_claim(local_startup ? "durable transaction recovery "
                                                "deadline expired"
@@ -9389,7 +9486,7 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
           metadata, trx, local_startup,
           local_startup ? Preserved_trx_lifecycle_state::PRESERVED
                         : Preserved_trx_lifecycle_state::ADOPTED_FOR_PROMOTION,
-          std::move(bundle.blob_descriptors));
+          std::move(bundle->blob_descriptors));
   add_kernel_elapsed_us(phase_started_us, &result->phase_metrics.register_us);
   if (add_record_err) {
     return rollback_after_claim(
@@ -9596,7 +9693,7 @@ static bool recover_preserved_snapshot(const std::string &dir,
                                           : &phase_metrics->validate_us);
   subphase_started_us = preserve_trx_monotonic_us();
   const bool recovered = preserved_trx_recover_or_adopt_bundle_shared(
-      dir, std::move(bundle), recover_options, nullptr, nullptr,
+      dir, &bundle, recover_options, nullptr, nullptr,
       &kernel_result);
   add_elapsed_us(subphase_started_us,
                  phase_metrics == nullptr ? nullptr : &phase_metrics->kernel_us);
@@ -9689,11 +9786,98 @@ bool preserved_trx_adopt_ready_bundle_for_promotion(
       Preserved_trx_recover_or_adopt_policy::STANDBY_PROMOTION_ADOPT;
   adopt_options.deadline_us = deadline_us;
   const bool adopted = preserved_trx_recover_or_adopt_bundle_shared(
-      dir, std::move(bundle), adopt_options, nullptr, nullptr, &kernel_result);
+      dir, &bundle, adopt_options, nullptr, nullptr, &kernel_result);
   result->claimed = kernel_result.claimed;
   result->rolled_back = kernel_result.rolled_back;
   result->reason = kernel_result.reason;
   return adopted;
+}
+
+Preserved_trx_physical_adopt_status
+preserved_trx_adopt_prepared_for_physical_promotion(
+    const std::string &dir, Preserve_trx_gate_adopt_lease *adopt_lease,
+    Preserve_trx_physical_fence_lease *physical_lease,
+    uint64_t operation_deadline_us,
+    Preserved_trx_physical_adopt_result *result) {
+  if (result == nullptr) {
+    return Preserved_trx_physical_adopt_status::INVALID_ARGUMENT;
+  }
+  *result = {};
+  if (dir.empty() || adopt_lease == nullptr || !adopt_lease->active() ||
+      physical_lease == nullptr || !physical_lease->acquired() ||
+      operation_deadline_us == 0) {
+    result->reason = "strict promotion requires active registry and physical "
+                     "fence leases";
+    return result->status;
+  }
+
+  const lock_preserve_metadata_plan_t *record_lock_plan =
+      adopt_lease->record_lock_plan();
+  std::unique_ptr<Preserved_trx_bundle> bundle;
+  if (adopt_lease->take_semantic_bundle(&bundle) !=
+          Preserve_trx_prepared_status::OK ||
+      bundle == nullptr) {
+    result->reason = "strict promotion semantic bundle is unavailable";
+    return result->status;
+  }
+
+  Preserved_trx_recover_or_adopt_options options;
+  options.policy = Preserved_trx_recover_or_adopt_policy::
+      STANDBY_PROMOTION_PHYSICAL_FENCE;
+  options.deadline_us = operation_deadline_us;
+  options.record_lock_plan = record_lock_plan;
+  options.physical_fence_lease = physical_lease;
+  Preserved_trx_recover_or_adopt_result kernel_result;
+  const bool adopted = preserved_trx_recover_or_adopt_bundle_shared(
+      dir, bundle.get(), options, nullptr, nullptr, &kernel_result);
+
+  result->claimed = kernel_result.claimed;
+  result->rolled_back = kernel_result.rolled_back;
+  result->provider_contract_violation =
+      kernel_result.provider_contract_violation;
+  result->record_lock_apply_us =
+      kernel_result.phase_metrics.record_locks_us;
+  result->record_lock_entries =
+      kernel_result.phase_metrics.record_lock_import.record_entries;
+  result->record_lock_bits =
+      kernel_result.phase_metrics.record_lock_import.bitmap_bits;
+  result->reason = kernel_result.reason;
+
+  if ((!kernel_result.claimed || kernel_result.provider_contract_violation ||
+       kernel_result.cleanup_error) &&
+      bundle != nullptr &&
+      adopt_lease->restore_semantic_bundle(&bundle) !=
+          Preserve_trx_prepared_status::OK) {
+    result->status = Preserved_trx_physical_adopt_status::CLEANUP_TAINTED;
+    result->reason += "; failed to restore strict semantic bundle ownership";
+    return result->status;
+  }
+
+  preserved_trx_promotion_prepared_note_lock_metrics(
+      0, 0, 0, result->record_lock_apply_us, result->record_lock_bits);
+  if (adopted) {
+    result->status = Preserved_trx_physical_adopt_status::OK;
+  } else if (kernel_result.provider_contract_violation) {
+    result->status = Preserved_trx_physical_adopt_status::
+        PHYSICAL_FENCE_PROVIDER_VIOLATION;
+  } else if (kernel_result.prepared_missing) {
+    result->status =
+        Preserved_trx_physical_adopt_status::PREPARED_TRX_NOT_FOUND;
+  } else if (kernel_result.record_lock_conflict) {
+    result->status = Preserved_trx_physical_adopt_status::LOCK_CONFLICT;
+  } else if (kernel_result.cleanup_error) {
+    result->status = Preserved_trx_physical_adopt_status::CLEANUP_TAINTED;
+  } else if (kernel_result.rolled_back) {
+    result->status = Preserved_trx_physical_adopt_status::ROLLED_BACK;
+  } else if (kernel_result.reason.find("physical-fence revalidation failed") !=
+             std::string::npos) {
+    result->status = Preserved_trx_physical_adopt_status::
+        PHYSICAL_FENCE_REVALIDATE_FAILED;
+  } else {
+    result->status =
+        Preserved_trx_physical_adopt_status::SEMANTIC_IMPORT_FAILED;
+  }
+  return result->status;
 }
 
 bool preserved_trx_preflight_recoverability() {

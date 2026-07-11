@@ -331,6 +331,10 @@ class Preserve_trx_gate_adopt_lease {
   ~Preserve_trx_gate_adopt_lease();
   bool active() const { return m_active; }
   const lock_preserve_metadata_plan_t *record_lock_plan() const;
+  Preserve_trx_prepared_status take_semantic_bundle(
+      std::unique_ptr<Preserved_trx_bundle> *out);
+  Preserve_trx_prepared_status restore_semantic_bundle(
+      std::unique_ptr<Preserved_trx_bundle> *inout);
 
  private:
   void fail_closed();

@@ -504,6 +504,7 @@ Preserve_trx_physical_fence_lease::~Preserve_trx_physical_fence_lease() {
 
 Preserve_trx_physical_fence_status
 Preserve_trx_physical_fence_lease::revalidate() {
+  std::lock_guard<std::mutex> guard(g_provider_mutex);
   if (!acquired() || m_ops.revalidate == nullptr) {
     return Preserve_trx_physical_fence_status::INVALID_ARGUMENT;
   }
@@ -1348,9 +1349,11 @@ Preserve_trx_prepared_token_registry::mark_ready_for_gate(
   }
   auto entry = find_prepared_entry(m_state, key);
   if (entry == nullptr) return Preserve_trx_prepared_status::NOT_FOUND;
+  const auto current = entry->state.load(std::memory_order_acquire);
   auto expected =
       Preserve_trx_prepared_token_state::READY_FACTS_PENDING_LEASE;
-  if (entry->state.load(std::memory_order_acquire) != expected) {
+  if (current != expected &&
+      current != Preserve_trx_prepared_token_state::READY_FOR_GATE) {
     return Preserve_trx_prepared_status::INVALID_STATE;
   }
   const auto publication = std::atomic_load_explicit(
@@ -1358,6 +1361,9 @@ Preserve_trx_prepared_token_registry::mark_ready_for_gate(
   if (publication == nullptr ||
       !prepared_token_keys_match(publication->key, key)) {
     return Preserve_trx_prepared_status::STALE_GENERATION;
+  }
+  if (current == Preserve_trx_prepared_token_state::READY_FOR_GATE) {
+    return Preserve_trx_prepared_status::IDEMPOTENT;
   }
   if (!entry->state.compare_exchange_strong(
           expected, Preserve_trx_prepared_token_state::READY_FOR_GATE,
@@ -1405,6 +1411,38 @@ Preserve_trx_gate_adopt_lease::record_lock_plan() const {
   return m_entry->resources.m_impl == nullptr
              ? nullptr
              : m_entry->resources.m_impl->record_lock_plan.get();
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_gate_adopt_lease::take_semantic_bundle(
+    std::unique_ptr<Preserved_trx_bundle> *out) {
+  if (!m_active || m_entry == nullptr || out == nullptr) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  std::lock_guard<std::mutex> guard(m_entry->mutex);
+  if (m_entry->resources.m_impl == nullptr ||
+      m_entry->resources.m_impl->semantic_bundle == nullptr) {
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  if (*out != nullptr) return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  *out = std::move(m_entry->resources.m_impl->semantic_bundle);
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_gate_adopt_lease::restore_semantic_bundle(
+    std::unique_ptr<Preserved_trx_bundle> *inout) {
+  if (!m_active || m_entry == nullptr || inout == nullptr ||
+      *inout == nullptr) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  std::lock_guard<std::mutex> guard(m_entry->mutex);
+  if (m_entry->resources.m_impl == nullptr ||
+      m_entry->resources.m_impl->semantic_bundle != nullptr) {
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  m_entry->resources.m_impl->semantic_bundle = std::move(*inout);
+  return Preserve_trx_prepared_status::OK;
 }
 
 Preserve_trx_prepared_status
