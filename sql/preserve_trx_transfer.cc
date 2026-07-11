@@ -169,6 +169,9 @@ static std::map<std::pair<std::string, uint64_t>,
 struct Receiver_epoch_ready_state {
   std::set<uint64_t> fact_tokens;
   std::set<uint64_t> ready_tokens;
+  std::map<uint64_t, size_t> fact_token_indexes;
+  std::shared_ptr<const Preserve_trx_transfer_epoch_fact> fact;
+  size_t ready_fact_token_count{0};
   bool fact_loaded{false};
   bool binding{false};
   bool bound{false};
@@ -2853,7 +2856,8 @@ std::string strict_empty_set_digest(const char *domain) {
 
 void bind_strict_prepared_tokens_from_epoch_fact(
     const std::string &root_dir,
-    const Preserve_trx_transfer_epoch_fact &fact) {
+    const Preserve_trx_transfer_epoch_fact &fact,
+    const Preserve_trx_transfer_epoch_fact_token *single_token = nullptr) {
   auto &registry = preserved_trx_strict_prepared_token_registry();
   const uint64_t now_us = transfer_monotonic_us();
   const uint64_t prepare_window_us =
@@ -2861,7 +2865,8 @@ void bind_strict_prepared_tokens_from_epoch_fact(
   constexpr uint64_t kClientResumeWindowUs = 300ULL * 1000000ULL;
   const std::string epoch_fact_digest = digest_hex(fact.fact_digest);
 
-  for (const Preserve_trx_transfer_epoch_fact_token &token : fact.tokens) {
+  const auto bind_token =
+      [&](const Preserve_trx_transfer_epoch_fact_token &token) {
     const auto has_object = [&](const char *object_id) {
       return std::any_of(token.objects.begin(), token.objects.end(),
                          [&](const auto &object) {
@@ -2877,7 +2882,7 @@ void bind_strict_prepared_tokens_from_epoch_fact(
           g_receiver_strict_record_lock_facts_mutex);
       const auto found = g_receiver_strict_record_lock_facts.find(
           {root_dir, fact.epoch_id, token.token});
-      if (found == g_receiver_strict_record_lock_facts.end()) continue;
+      if (found == g_receiver_strict_record_lock_facts.end()) return;
       record_lock_facts = found->second;
     }
     Receiver_strict_binlog_facts binlog_facts;
@@ -2886,7 +2891,7 @@ void bind_strict_prepared_tokens_from_epoch_fact(
           g_receiver_strict_binlog_facts_mutex);
       const auto found = g_receiver_strict_binlog_facts.find(
           {root_dir, fact.epoch_id, token.token});
-      if (found == g_receiver_strict_binlog_facts.end()) continue;
+      if (found == g_receiver_strict_binlog_facts.end()) return;
       binlog_facts = found->second;
     }
 
@@ -2901,7 +2906,7 @@ void bind_strict_prepared_tokens_from_epoch_fact(
     Preserve_trx_prepared_token_key key;
     if (!strict_prepared_key_for_receiver(root_dir, manifest,
                                           std::to_string(token.token), &key)) {
-      continue;
+      return;
     }
     Preserve_trx_final_token_facts facts;
     facts.required_apply_lsn = token.source_epoch_commit_lsn;
@@ -2981,14 +2986,14 @@ void bind_strict_prepared_tokens_from_epoch_fact(
         existing.facts.binlog_cache_file_backed ==
             facts.binlog_cache_file_backed &&
         existing.facts.binlog_handle_digest == facts.binlog_handle_digest) {
-      continue;
+      return;
     }
 
     const auto bind_status =
         registry.bind_final_facts(key, key.generation, std::move(facts));
     if (bind_status != Preserve_trx_prepared_status::OK &&
         bind_status != Preserve_trx_prepared_status::IDEMPOTENT) {
-      continue;
+      return;
     }
     const auto ready_status =
         registry.mark_ready_for_gate(key, key.generation);
@@ -3008,18 +3013,75 @@ void bind_strict_prepared_tokens_from_epoch_fact(
       g_receiver_strict_binlog_facts.erase(
           {root_dir, fact.epoch_id, token.token});
     }
+  };
+  if (single_token != nullptr) {
+    bind_token(*single_token);
+    return;
   }
+  for (const Preserve_trx_transfer_epoch_fact_token &token : fact.tokens) {
+    bind_token(token);
+  }
+}
+
+void cache_receiver_epoch_fact(
+    const std::string &root_dir,
+    std::shared_ptr<const Preserve_trx_transfer_epoch_fact> fact) {
+  if (fact == nullptr) return;
+  std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+  Receiver_epoch_ready_state &state =
+      g_receiver_ready_epoch_state[{root_dir, fact->epoch_id}];
+  if (state.fact_loaded) return;
+  state.fact_tokens.clear();
+  state.fact_token_indexes.clear();
+  for (size_t index = 0; index < fact->tokens.size(); ++index) {
+    const uint64_t token = fact->tokens[index].token;
+    state.fact_tokens.insert(token);
+    state.fact_token_indexes.emplace(token, index);
+  }
+  state.ready_fact_token_count = 0;
+  for (uint64_t ready_token : state.ready_tokens) {
+    if (state.fact_tokens.count(ready_token) != 0) {
+      ++state.ready_fact_token_count;
+    }
+  }
+  state.fact = std::move(fact);
+  state.fact_loaded = true;
+}
+
+void bind_strict_prepared_token_from_cached_epoch_fact(
+    const std::string &root_dir, const std::string &epoch_id, uint64_t token) {
+  std::shared_ptr<const Preserve_trx_transfer_epoch_fact> fact;
+  size_t token_index = 0;
+  {
+    std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+    const auto state_it =
+        g_receiver_ready_epoch_state.find({root_dir, epoch_id});
+    if (state_it == g_receiver_ready_epoch_state.end() ||
+        !state_it->second.fact_loaded || state_it->second.fact == nullptr) {
+      return;
+    }
+    const auto token_it = state_it->second.fact_token_indexes.find(token);
+    if (token_it == state_it->second.fact_token_indexes.end()) return;
+    fact = state_it->second.fact;
+    token_index = token_it->second;
+  }
+  if (token_index >= fact->tokens.size()) return;
+  bind_strict_prepared_tokens_from_epoch_fact(
+      root_dir, *fact, &fact->tokens[token_index]);
 }
 
 void bind_strict_prepared_tokens_from_committed_epoch(
     const std::string &root_dir, const std::string &epoch_id) {
   if (!preserve_trx_transfer_epoch_committed(root_dir, epoch_id)) return;
-  Preserve_trx_transfer_epoch_fact fact;
-  if (preserve_trx_transfer_read_epoch_fact(root_dir, epoch_id, &fact) !=
+  Preserve_trx_transfer_epoch_fact loaded_fact;
+  if (preserve_trx_transfer_read_epoch_fact(root_dir, epoch_id, &loaded_fact) !=
       Preserve_trx_transfer_status::OK) {
     return;
   }
-  bind_strict_prepared_tokens_from_epoch_fact(root_dir, fact);
+  auto fact = std::make_shared<const Preserve_trx_transfer_epoch_fact>(
+      std::move(loaded_fact));
+  cache_receiver_epoch_fact(root_dir, fact);
+  bind_strict_prepared_tokens_from_epoch_fact(root_dir, *fact);
 }
 
 Preserve_trx_transfer_receiver_registry &default_receiver_registry() {
@@ -3204,7 +3266,10 @@ void note_receiver_epoch_token_ready(const std::string &root_dir,
   std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
   Receiver_epoch_ready_state &state =
       g_receiver_ready_epoch_state[{root_dir, epoch_id}];
-  state.ready_tokens.insert(token);
+  const bool inserted = state.ready_tokens.insert(token).second;
+  if (inserted && state.fact_loaded && state.fact_tokens.count(token) != 0) {
+    ++state.ready_fact_token_count;
+  }
 }
 
 bool publish_receiver_epoch_ready_from_seal_prewarm(
@@ -3220,36 +3285,51 @@ bool publish_receiver_epoch_ready_from_fact_if_possible(
   if (!preserve_trx_transfer_epoch_committed(root_dir, epoch_id)) {
     return false;
   }
-  Preserve_trx_transfer_epoch_fact fact;
-  if (preserve_trx_transfer_read_epoch_fact(root_dir, epoch_id, &fact) !=
-      Preserve_trx_transfer_status::OK) {
-    return false;
-  }
 
   std::vector<uint64_t> tokens;
-  tokens.reserve(fact.tokens.size());
+  std::shared_ptr<const Preserve_trx_transfer_epoch_fact> fact;
   {
     std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
     Receiver_epoch_ready_state &state =
         g_receiver_ready_epoch_state[{root_dir, epoch_id}];
     if (state.bound) return true;
     if (state.binding) return false;
-    state.fact_tokens.clear();
-    for (const Preserve_trx_transfer_epoch_fact_token &fact_token :
-         fact.tokens) {
-      state.fact_tokens.insert(fact_token.token);
+    if (state.fact_loaded) {
+      if (state.fact == nullptr ||
+          state.ready_fact_token_count != state.fact_tokens.size()) {
+        return false;
+      }
+      state.binding = true;
+      fact = state.fact;
+      tokens.assign(state.fact_tokens.begin(), state.fact_tokens.end());
     }
-    state.fact_loaded = true;
-    if (!std::includes(state.ready_tokens.begin(), state.ready_tokens.end(),
-                       state.fact_tokens.begin(), state.fact_tokens.end())) {
+  }
+
+  if (fact == nullptr) {
+    Preserve_trx_transfer_epoch_fact loaded_fact;
+    if (preserve_trx_transfer_read_epoch_fact(root_dir, epoch_id, &loaded_fact) !=
+        Preserve_trx_transfer_status::OK) {
       return false;
     }
+    auto loaded =
+        std::make_shared<const Preserve_trx_transfer_epoch_fact>(
+            std::move(loaded_fact));
+    cache_receiver_epoch_fact(root_dir, loaded);
+    std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+    Receiver_epoch_ready_state &state =
+        g_receiver_ready_epoch_state[{root_dir, epoch_id}];
+    if (state.bound) return true;
+    if (state.binding) return false;
+    if (state.fact == nullptr ||
+        state.ready_fact_token_count != state.fact_tokens.size()) {
+      return false;
+    }
+    fact = state.fact;
     state.binding = true;
     tokens.assign(state.fact_tokens.begin(), state.fact_tokens.end());
   }
 
   uint64_t ready_tokens = 0;
-  bind_strict_prepared_tokens_from_epoch_fact(root_dir, fact);
   g_receiver_epoch_ready_bind_attempts.fetch_add(1);
   const Preserve_trx_promotion_adopt_status bind_status =
       preserved_trx_promotion_bind_prewarmed_epoch_for_receiver(
@@ -7437,8 +7517,8 @@ Preserve_trx_promotion_adopt_status run_receiver_staged_token_prewarm_job(
   const bool strict_prepared =
       prepare_strict_bundle_for_receiver(root_dir, manifest, staged_bundle);
   if (strict_prepared) {
-    bind_strict_prepared_tokens_from_committed_epoch(root_dir,
-                                                     manifest.epoch_id);
+    bind_strict_prepared_token_from_cached_epoch_fact(
+        root_dir, manifest.epoch_id, manifest.token);
   }
   if (prewarm_status == Preserve_trx_promotion_adopt_status::OK) {
     note_receiver_epoch_token_ready(root_dir, manifest.epoch_id,

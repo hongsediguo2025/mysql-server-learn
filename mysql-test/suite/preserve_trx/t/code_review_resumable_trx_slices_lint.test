@@ -225,7 +225,7 @@ die "receiver strict metadata plan builder must not read or prefetch InnoDB page
 die "final manifest must move the exact record-lock plan into strict registry resources\n"
   unless $transfer =~
          /prepare_strict_bundle_for_receiver[\s\S]*take_receiver_record_lock_prepared[\s\S]*install_record_lock_plan[\s\S]*publish_prewarmed/s;
-die "COMMIT_EPOCH must bind strict prepared tokens from the durable epoch fact\n"
+die "COMMIT_EPOCH must cache the durable epoch fact and bind the prepared-token snapshot once\n"
   unless $receiver_apply_frame =~
          /commit_epoch_final_metadata[\s\S]*bind_strict_prepared_tokens_from_committed_epoch/s;
 die "receiver native binlog preparation must stream from the sealed staging file\n"
@@ -252,6 +252,18 @@ my ($receiver_staged_prewarm_job) =
   or die "could not isolate standby receiver staged-token prewarm job\n";
 die "online standby receiver staged-token READY must not publish local carrier projection\n"
   if $receiver_staged_prewarm_job =~ /publish_receiver_standby_bundle_projection/s;
+die "online standby receiver staged-token worker must not rescan and bind the full committed epoch\n"
+  if $receiver_staged_prewarm_job =~
+     /bind_strict_prepared_tokens_from_committed_epoch/s;
+die "online standby receiver staged-token worker must bind only its token from the cached epoch fact\n"
+  unless $receiver_staged_prewarm_job =~
+         /bind_strict_prepared_token_from_cached_epoch_fact/s;
+my ($receiver_epoch_ready_publish) =
+  $transfer =~ /(bool publish_receiver_epoch_ready_from_fact_if_possible\(\n    const std::string &root_dir, const std::string &epoch_id\) \{[\s\S]*?^}\n\nbool transfer_manifest_has_snapshot_bundle)/m
+  or die "could not isolate receiver epoch READY publisher\n";
+die "receiver epoch READY publisher must not repeat the strict full-epoch bind\n"
+  if $receiver_epoch_ready_publish =~
+     /bind_strict_prepared_tokens_from_epoch_fact/s;
 die "standby receiver staged-token publish must not serialize full token publish under a global mutex\n"
   if $receiver_staged_prewarm_job =~ /g_receiver_standby_publish_mutex[\s\S]*preserve_trx_transfer_publish_standby_bundle/s;
 die "standby receiver projection must not use a single global mutex\n"
