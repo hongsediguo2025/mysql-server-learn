@@ -1523,6 +1523,106 @@ void lock_preserve_add_record_lock_for_import(ulint type_mode,
   lock_rec_add_to_queue(type_mode, block, heap_no, index, trx, true);
 }
 
+static bool lock_preserve_record_bitmap_set_bit_count(
+    const byte *bitmap, size_t bitmap_len, uint32_t *set_bit_count) {
+  if (bitmap == nullptr || bitmap_len == 0 || set_bit_count == nullptr) {
+    return false;
+  }
+
+  uint64_t count = 0;
+  for (size_t byte_index = 0; byte_index < bitmap_len; ++byte_index) {
+    byte value = bitmap[byte_index];
+    while (value != 0) {
+      value = static_cast<byte>(value & static_cast<byte>(value - 1));
+      ++count;
+    }
+  }
+  if (count == 0 || count > UINT32_MAX) return false;
+  *set_bit_count = static_cast<uint32_t>(count);
+  return true;
+}
+
+bool lock_preserve_publish_record_bitmap_for_import(lock_t *lock,
+                                                    const byte *bitmap,
+                                                    size_t bitmap_len) {
+  if (lock == nullptr || lock->trx == nullptr ||
+      lock_get_type_low(lock) != LOCK_REC || bitmap == nullptr ||
+      bitmap_len == 0 || bitmap_len > UINT32_MAX / 8 ||
+      lock_rec_get_n_bits(lock) != bitmap_len * 8) {
+    return false;
+  }
+
+  uint32_t old_set_bits = 0;
+  uint32_t new_set_bits = 0;
+  if (!lock_preserve_record_bitmap_set_bit_count(
+          reinterpret_cast<const byte *>(&lock[1]), bitmap_len,
+          &old_set_bits) ||
+      !lock_preserve_record_bitmap_set_bit_count(bitmap, bitmap_len,
+                                                 &new_set_bits)) {
+    return false;
+  }
+
+  const uint64_t current_count =
+      lock->trx->lock.n_rec_locks.load(std::memory_order_relaxed);
+  if (current_count < old_set_bits) return false;
+
+  memcpy(&lock[1], bitmap, bitmap_len);
+  if (new_set_bits > old_set_bits) {
+    lock->trx->lock.n_rec_locks.fetch_add(new_set_bits - old_set_bits,
+                                          std::memory_order_relaxed);
+  } else if (old_set_bits > new_set_bits) {
+    lock->trx->lock.n_rec_locks.fetch_sub(old_set_bits - new_set_bits,
+                                          std::memory_order_relaxed);
+  }
+  return true;
+}
+
+bool lock_preserve_record_bitmap_accounting_for_unit_test(
+    const byte *bitmap, size_t bitmap_len, uint64_t *count_after_publish,
+    uint64_t *count_after_reset) {
+  if (bitmap == nullptr || bitmap_len == 0 || count_after_publish == nullptr ||
+      count_after_reset == nullptr || bitmap_len > UINT32_MAX / 8) {
+    return false;
+  }
+
+  uint32_t set_bit_count = 0;
+  if (!lock_preserve_record_bitmap_set_bit_count(bitmap, bitmap_len,
+                                                 &set_bit_count)) {
+    return false;
+  }
+  uint32_t anchor_heap_no = 0;
+  while (anchor_heap_no < bitmap_len * 8 &&
+         (bitmap[anchor_heap_no / 8] &
+          static_cast<byte>(1U << (anchor_heap_no % 8))) == 0) {
+    ++anchor_heap_no;
+  }
+
+  std::vector<byte> storage(sizeof(lock_t) + bitmap_len, 0);
+  auto *lock = reinterpret_cast<lock_t *>(storage.data());
+  trx_t trx{};
+  lock->trx = &trx;
+  lock->type_mode = LOCK_REC | LOCK_X;
+  lock->rec_lock.n_bits = static_cast<uint32_t>(bitmap_len * 8);
+  reinterpret_cast<byte *>(&lock[1])[anchor_heap_no / 8] =
+      static_cast<byte>(1U << (anchor_heap_no % 8));
+  trx.lock.n_rec_locks.store(1, std::memory_order_relaxed);
+
+  if (!lock_preserve_publish_record_bitmap_for_import(lock, bitmap,
+                                                      bitmap_len)) {
+    return false;
+  }
+  *count_after_publish =
+      trx.lock.n_rec_locks.load(std::memory_order_relaxed);
+
+  for (uint32_t heap_no = 0; heap_no < bitmap_len * 8; ++heap_no) {
+    if (lock_rec_get_nth_bit(lock, heap_no)) {
+      lock_rec_reset_nth_bit(lock, heap_no);
+    }
+  }
+  *count_after_reset = trx.lock.n_rec_locks.load(std::memory_order_relaxed);
+  return set_bit_count == *count_after_publish;
+}
+
 bool lock_preserve_add_record_bitmap_for_import(ulint type_mode,
                                                 const buf_block_t *block,
                                                 uint32_t n_bits,
@@ -1543,6 +1643,13 @@ bool lock_preserve_add_record_bitmap_for_import(ulint type_mode,
   ut_ad(!(type_mode & (LOCK_PREDICATE | LOCK_PRDT_PAGE)));
 
   const ulint anchor_heap_no = first_set_heap_no;
+  uint32_t imported_set_bits = 0;
+  if ((bitmap[first_set_heap_no / 8] &
+       static_cast<byte>(1U << (first_set_heap_no % 8))) == 0 ||
+      !lock_preserve_record_bitmap_set_bit_count(bitmap, bitmap_len,
+                                                 &imported_set_bits)) {
+    return false;
+  }
 
   if (anchor_heap_no == PAGE_HEAP_NO_SUPREMUM) {
     if (type_mode & LOCK_REC_NOT_GAP) {
@@ -1571,10 +1678,8 @@ bool lock_preserve_add_record_bitmap_for_import(ulint type_mode,
   }
   ut_ad(lock_rec_get_n_bits(lock) == n_bits);
 
-  memset(&lock[1], 0, lock_rec_get_n_bits(lock) / 8);
-  memcpy(&lock[1], bitmap, bitmap_len);
-
-  return true;
+  return lock_preserve_publish_record_bitmap_for_import(lock, bitmap,
+                                                        bitmap_len);
 }
 
 /** This is a fast routine for locking a record in the most common cases:

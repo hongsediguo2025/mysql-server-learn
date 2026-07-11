@@ -708,6 +708,22 @@ dberr_t lock_preserve_import_record_locks(
     trx_preserve_record_lock_import_metrics_t *metrics,
     bool (*deadline_expired)(void *), void *deadline_ctx);
 
+/** Replace the bitmap of a newly created Preserve import lock while keeping
+native per-bit transaction accounting balanced.
+@param[in,out] lock        newly created record lock
+@param[in]     bitmap      final imported bitmap
+@param[in]     bitmap_len bitmap bytes, matching lock->rec_lock.n_bits
+@return true if the bitmap is valid and was published */
+bool lock_preserve_publish_record_bitmap_for_import(lock_t *lock,
+                                                    const byte *bitmap,
+                                                    size_t bitmap_len);
+
+/** Exercise Preserve bitmap publication and native per-bit reset accounting
+without exposing lock0priv.h outside the lock module. */
+bool lock_preserve_record_bitmap_accounting_for_unit_test(
+    const byte *bitmap, size_t bitmap_len, uint64_t *count_after_publish,
+    uint64_t *count_after_reset);
+
 /** Issue best-effort asynchronous reads for pages referenced by a preserved
 record-lock payload.
 @param[in]     payload  opaque serialized record-lock payload

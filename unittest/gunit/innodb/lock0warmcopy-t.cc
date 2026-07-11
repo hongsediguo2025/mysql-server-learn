@@ -161,6 +161,19 @@ TEST(LockWarmcopyHooks, OpenEpochEnablesSlowPathUntilClosed) {
             lock_warmcopy_debug_stats_for_unit_test().observed_hook_events);
 }
 
+TEST(LockWarmcopyRecordImport, MultiBitBitmapBalancesNativeAccounting) {
+  lock_warmcopy_reset_for_unit_test();
+
+  constexpr size_t kBitmapLen = 2;
+  const byte imported_bitmap[kBitmapLen] = {0x0a, 0x02};  // heaps 1, 3, 9.
+  uint64_t count_after_publish = 0;
+  uint64_t count_after_reset = 0;
+  ASSERT_TRUE(lock_preserve_record_bitmap_accounting_for_unit_test(
+      imported_bitmap, kBitmapLen, &count_after_publish, &count_after_reset));
+  EXPECT_EQ(3ULL, count_after_publish);
+  EXPECT_EQ(0ULL, count_after_reset);
+}
+
 TEST(LockWarmcopyRecordShard, SetResetMutationsUpdateGenerationAndBitmap) {
   lock_warmcopy_reset_for_unit_test();
 
