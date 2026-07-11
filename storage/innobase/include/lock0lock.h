@@ -748,6 +748,7 @@ struct lock_preserve_metadata_plan_validation_t {
   std::string page_layout_digest;
   std::string dictionary_generation_digest;
   bool implicit_locks_materialized{false};
+  bool implicit_native_continuity_proven{false};
   bool is_final_quiesced{false};
 };
 

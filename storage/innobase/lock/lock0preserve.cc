@@ -2216,7 +2216,8 @@ lock_preserve_build_record_lock_metadata_plan(
     return lock_preserve_metadata_plan_status::STALE_GENERATION;
   }
   if (!validation.is_final_quiesced ||
-      !validation.implicit_locks_materialized) {
+      (!validation.implicit_locks_materialized &&
+       !validation.implicit_native_continuity_proven)) {
     return lock_preserve_metadata_plan_status::NOT_FINAL;
   }
   if (lock_preserve_sha256_hex(payload) != validation.object_digest) {

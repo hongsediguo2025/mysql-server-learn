@@ -112,6 +112,7 @@ Preserve_trx_physical_fence_proof make_test_physical_fence_proof(
   proof.page_layout_digest.assign(64, 'c');
   proof.dictionary_generation_digest.assign(64, 'd');
   proof.apply_frozen = true;
+  proof.implicit_native_continuity_proven = true;
   return proof;
 }
 
@@ -163,6 +164,10 @@ TEST(PreservedTrxPhysicalFence, ExactLsnAndCompleteDigestAreRequired) {
   EXPECT_FALSE(preserved_trx_physical_fence_proof_is_valid(proof));
   proof.target_frozen_lsn = proof.source_fence_lsn;
   proof.page_layout_digest.clear();
+  EXPECT_FALSE(preserved_trx_physical_fence_proof_is_valid(proof));
+  proof = make_test_physical_fence_proof(
+      Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY);
+  proof.implicit_native_continuity_proven = false;
   EXPECT_FALSE(preserved_trx_physical_fence_proof_is_valid(proof));
   proof = make_test_physical_fence_proof(
       Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY);

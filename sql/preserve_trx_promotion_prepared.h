@@ -46,6 +46,7 @@ struct Preserve_trx_physical_fence_proof {
   std::string page_layout_digest;
   std::string dictionary_generation_digest;
   bool apply_frozen{false};
+  bool implicit_native_continuity_proven{false};
 };
 
 enum class Preserve_trx_physical_fence_status : uint8_t {

@@ -377,6 +377,28 @@ TEST(LockWarmcopyMetadataPlan, RejectsNonFinalAndColdIdentityPayloads) {
                 make_metadata_dict_lease_ops(), &plan));
 }
 
+TEST(LockWarmcopyMetadataPlan,
+     AcceptsPhysicalFenceImplicitContinuityWithoutMaterialization) {
+  constexpr uint32_t kRecordBitmapMargin = 64;
+  constexpr uint32_t kPageNHeap = 16;
+  std::string bitmap(1 + ((kPageNHeap + kRecordBitmapMargin) / 8), '\0');
+  bitmap[0] = static_cast<char>(0x02);
+  const std::string payload = make_metadata_record_lock_payload(
+      LOCK_REC | LOCK_X, kPageNHeap, bitmap);
+  auto validation = make_metadata_plan_validation(payload);
+  validation.implicit_locks_materialized = false;
+  validation.implicit_native_continuity_proven = true;
+  lock_preserve_metadata_plan_t plan;
+  EXPECT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_plan(
+                payload, validation, make_metadata_dict_lease_ops(), &plan));
+
+  validation.implicit_native_continuity_proven = false;
+  EXPECT_EQ(lock_preserve_metadata_plan_status::NOT_FINAL,
+            lock_preserve_build_record_lock_metadata_plan(
+                payload, validation, make_metadata_dict_lease_ops(), &plan));
+}
+
 TEST(LockWarmcopyMetadataPlan, RejectsWaitPredicateAndDigestMismatch) {
   constexpr uint32_t kRecordBitmapMargin = 64;
   const uint32_t page_n_heap = 16;

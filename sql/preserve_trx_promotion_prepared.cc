@@ -206,7 +206,7 @@ bool proofs_match(const Preserve_trx_physical_fence_proof &expected,
          expected.page_layout_digest == actual.page_layout_digest &&
          expected.dictionary_generation_digest ==
              actual.dictionary_generation_digest &&
-         actual.apply_frozen;
+         actual.apply_frozen && actual.implicit_native_continuity_proven;
 }
 
 bool prepared_token_key_is_valid(const Preserve_trx_prepared_token_key &key) {
@@ -636,7 +636,7 @@ bool preserved_trx_physical_fence_proof_is_valid(
          digest_is_sha256_hex(proof.final_lock_generation_digest) &&
          digest_is_sha256_hex(proof.page_layout_digest) &&
          digest_is_sha256_hex(proof.dictionary_generation_digest) &&
-         proof.apply_frozen;
+         proof.apply_frozen && proof.implicit_native_continuity_proven;
 }
 
 bool preserved_trx_encode_strict_promotion_intent_v2(
@@ -689,6 +689,8 @@ bool preserved_trx_encode_strict_promotion_intent_v2(
     return false;
   }
   append_canonical_bool(&body, marker.physical_fence.apply_frozen);
+  append_canonical_bool(
+      &body, marker.physical_fence.implicit_native_continuity_proven);
   append_canonical_u64(&body, marker.generated_at_us);
   append_canonical_u32(&body, static_cast<uint32_t>(tokens.size()));
   for (const auto &token : tokens) {
@@ -727,6 +729,7 @@ bool preserved_trx_decode_strict_promotion_intent_v2(
   size_t offset = kMagicLength;
   uint8_t mode = 0;
   uint8_t apply_frozen = 0;
+  uint8_t implicit_native_continuity_proven = 0;
   uint32_t token_count = 0;
   if (!read_canonical_u8(body, &offset, &mode) ||
       !read_canonical_string(body, &offset, &parsed.epoch_id) ||
@@ -753,6 +756,8 @@ bool preserved_trx_decode_strict_promotion_intent_v2(
           body, &offset,
           &parsed.physical_fence.dictionary_generation_digest) ||
       !read_canonical_u8(body, &offset, &apply_frozen) ||
+      !read_canonical_u8(body, &offset,
+                         &implicit_native_continuity_proven) ||
       !read_canonical_u64(body, &offset, &parsed.generated_at_us) ||
       !read_canonical_u32(body, &offset, &token_count) || token_count == 0 ||
       token_count > kStrictPromotionIntentMaxTokens) {
@@ -760,8 +765,10 @@ bool preserved_trx_decode_strict_promotion_intent_v2(
   }
   parsed.physical_fence.consistency_mode =
       static_cast<Preserve_trx_physical_consistency_mode>(mode);
-  if (apply_frozen > 1) return false;
+  if (apply_frozen > 1 || implicit_native_continuity_proven > 1) return false;
   parsed.physical_fence.apply_frozen = apply_frozen != 0;
+  parsed.physical_fence.implicit_native_continuity_proven =
+      implicit_native_continuity_proven != 0;
   parsed.tokens.reserve(token_count);
   for (uint32_t i = 0; i < token_count; ++i) {
     Preserve_trx_strict_promotion_intent_token token;
