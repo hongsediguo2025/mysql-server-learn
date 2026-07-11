@@ -212,6 +212,22 @@ die "standby receiver SEAL_OBJECT path must enqueue object/staged prewarm instea
          $receiver_apply_frame =~ /enqueue_receiver_staged_token_prewarm/s;
 die "standby receiver COMMIT_EPOCH path must not launch committed-epoch cold prewarm\n"
   if $receiver_apply_frame =~ /enqueue_receiver_committed_epoch_prewarm/s;
+die "receiver record-lock metadata plan must be built before legacy page prefetch\n"
+  unless $transfer =~
+         /run_receiver_object_prewarm_job[\s\S]*build_receiver_record_lock_prepared[\s\S]*trx_preserve_prefetch_record_lock_pages_for_gate/s;
+$transfer =~
+  /bool\s+build_receiver_record_lock_prepared\s*\([\s\S]*?(?=\nbool\s+prepare_strict_semantic_bundle_for_receiver)/m
+  or die "could not isolate build_receiver_record_lock_prepared\n";
+my $receiver_record_lock_plan_builder = $&;
+die "receiver strict metadata plan builder must not read or prefetch InnoDB pages\n"
+  if $receiver_record_lock_plan_builder =~
+     /buf_page_get|buf_read_page|trx_preserve_prefetch_record_lock_pages/;
+die "final manifest must move the exact record-lock plan into strict registry resources\n"
+  unless $transfer =~
+         /prepare_strict_record_lock_bundle_for_receiver[\s\S]*take_receiver_record_lock_prepared[\s\S]*install_record_lock_plan[\s\S]*publish_prewarmed/s;
+die "COMMIT_EPOCH must bind strict prepared tokens from the durable epoch fact\n"
+  unless $receiver_apply_frame =~
+         /commit_epoch_final_metadata[\s\S]*bind_strict_prepared_tokens_from_committed_epoch/s;
 die "standby receiver frame apply path must not synchronously prewarm staged or committed tokens\n"
   if $receiver_apply_frame =~ /preserved_trx_promotion_prewarm_staged_bundle_for_receiver/s ||
      $receiver_apply_frame =~ /note_receiver_sync_prewarm_wait/s;

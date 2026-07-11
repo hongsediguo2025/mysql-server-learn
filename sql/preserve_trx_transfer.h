@@ -40,6 +40,8 @@
 #include "sql/preserve_trx_carrier.h"
 
 class THD;
+class lock_preserve_metadata_plan_t;
+struct lock_preserve_record_lock_metadata_facts_t;
 struct Preserve_trx_prepared_token_key;
 enum class Preserve_trx_delivery_mode;
 
@@ -643,6 +645,11 @@ bool preserve_trx_transfer_strict_prepared_key_for_unit_test(
     const Preserve_trx_transfer_manifest &manifest,
     const std::string &semantic_token,
     Preserve_trx_prepared_token_key *key);
+bool preserve_trx_transfer_put_receiver_record_lock_plan_for_unit_test(
+    const std::string &root_dir,
+    const Preserve_trx_transfer_manifest &manifest,
+    std::unique_ptr<lock_preserve_metadata_plan_t> plan,
+    const lock_preserve_record_lock_metadata_facts_t &facts);
 #endif
 void preserve_trx_transfer_put_receiver_object_prewarm_proof_for_unit_test(
     const std::string &root_dir,

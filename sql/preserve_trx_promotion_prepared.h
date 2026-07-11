@@ -498,6 +498,8 @@ class Preserve_trx_prepared_token_registry {
   size_t expire_ready_facts_pending_lease(const std::string &source_uuid,
                                           const std::string &epoch_id,
                                           uint64_t now_us);
+  Preserve_trx_prepared_status purge_token(
+      const Preserve_trx_prepared_token_key &key);
   void purge_epoch(const std::string &source_uuid,
                    const std::string &epoch_id);
 

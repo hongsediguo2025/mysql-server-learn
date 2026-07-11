@@ -2045,6 +2045,36 @@ size_t Preserve_trx_prepared_token_registry::expire_ready_facts_pending_lease(
   return expired;
 }
 
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::purge_token(
+    const Preserve_trx_prepared_token_key &key) {
+  Preserve_trx_prepared_token_resources retired_resources;
+  {
+    std::lock_guard<std::mutex> guard(m_state->mutex);
+    const auto found = m_state->entries.find(prepared_token_locator(key));
+    if (found == m_state->entries.end()) {
+      return Preserve_trx_prepared_status::NOT_FOUND;
+    }
+    std::lock_guard<std::mutex> entry_guard(found->second->mutex);
+    auto expected = found->second->state.load(std::memory_order_acquire);
+    if (found->second->preparing ||
+        prepared_state_has_live_or_ambiguous_owner(expected)) {
+      return Preserve_trx_prepared_status::INVALID_STATE;
+    }
+    if (!found->second->state.compare_exchange_strong(
+            expected, Preserve_trx_prepared_token_state::STALE_GENERATION,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+      return Preserve_trx_prepared_status::INVALID_STATE;
+    }
+    found->second->retired_from_registry = true;
+    retired_resources = std::move(found->second->resources);
+    found->second->preparing = false;
+    found->second->preparing_generation = 0;
+    m_state->entries.erase(found);
+  }
+  return Preserve_trx_prepared_status::OK;
+}
+
 void Preserve_trx_prepared_token_registry::purge_epoch(
     const std::string &source_uuid, const std::string &epoch_id) {
   std::vector<Preserve_trx_prepared_token_resources> retired_resources;
