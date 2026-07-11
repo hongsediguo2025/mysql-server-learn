@@ -174,7 +174,8 @@ bool physical_consistency_mode_is_valid(
     Preserve_trx_physical_consistency_mode mode) {
   switch (mode) {
     case Preserve_trx_physical_consistency_mode::TEST_SAME_INSTANCE_ATTACH_ONLY:
-    case Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY:
+    case Preserve_trx_physical_consistency_mode::
+        TEST_ONLY_PHYSICAL_FENCE_SIMULATOR:
     case Preserve_trx_physical_consistency_mode::PRODUCTION_REDO_APPLY_FENCE:
       return true;
     case Preserve_trx_physical_consistency_mode::NONE:

@@ -582,10 +582,11 @@ Transfer_receiver_registry
 - temp table image sidecar。
 - no-redo undo sidecar。
 
-本轮不要求 mysqld 重启时自动重建 receiver registry。如果后续需要重建，也必须发生在
-mysqld 已完成启动后的 transfer receiver 运行期逻辑中，不能挂到 startup 阶段的
-preserve/resume 流程。
-正常路径是在线升主直接使用运行中的 registry 和同目录文件。
+本产品路径不支持 receiver mysqld 重启后继续当前 transfer/promotion-ready epoch。
+Receiver 重启后，进程内 registry、prewarm plan 和 native handle 均失效；旧 epoch 必须
+fail closed，并由 source 在新的在线 epoch 中重新传输。不得从 spool、carrier 或其它
+持久工件自动 replay/rebuild promotion-ready registry，也不得把该逻辑挂到 startup
+阶段。正常路径是 receiver 全程在线，未来升主直接消费运行中的 registry。
 
 ## 7. 备机只读安全
 

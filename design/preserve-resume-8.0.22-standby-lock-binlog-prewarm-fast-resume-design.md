@@ -111,16 +111,20 @@ Promotion wrapper 仍不得直接 claim/import/register。第三 policy 只替�
 record-lock apply strategy，其余 read view、table lock、MDL、register 和 cleanup 顺序继续
 复用 shared kernel。
 
-本设计的验证证据严格分为三类，不能相互替代：
+本设计的验证证据严格分为四类，不能相互替代：
 
 ```text
-TEST_SAME_INSTANCE_ATTACH_ONLY  -> 只证明同一 InnoDB 实例中的 attach core
-TEST_FROZEN_DATADIR_COPY        -> 证明 QUIESCED 后静态物理副本中的 gate/attach 等价性
-PRODUCTION_REDO_APPLY_FENCE     -> 未来真实 HA/redo apply provider 才能签发
+TEST_SAME_INSTANCE_ATTACH_ONLY       -> 只证明同一 InnoDB 实例中的 attach core
+ONLINE_RECEIVER_READY_SIMULATOR      -> 只证明在线 receiver READY 编排与性能合同
+TEST_ONLY_PHYSICAL_FENCE_SIMULATOR   -> 只供 GUnit/shared-kernel 故障测试
+PRODUCTION_REDO_APPLY_FENCE          -> 未来真实 HA/redo apply provider 才能签发
 ```
 
-任意两个没有上述物理一致性证据的 mysqld 之间，不得执行 metadata-only lock import、事务
-attach 或继续 DML；只能返回 `PHYSICAL_CONSISTENCY_NOT_PROVEN`。
+`ONLINE_RECEIVER_READY_SIMULATOR` 不是 physical consistency mode，不得签发 lease，也不得执行
+真实跨实例 claim、metadata-only lock import、事务 attach、rollback 或继续 DML。内部
+`TEST_ONLY_PHYSICAL_FENCE_SIMULATOR` 可以在 GUnit 中驱动 shared kernel 和故障收敛，但不能进入
+runtime E2E 或 release 证据。任意两个没有 production physical-fence 证明的 mysqld 之间只能
+返回 `PHYSICAL_CONSISTENCY_NOT_PROVEN`。
 
 ## 2. 性能口径
 
@@ -163,8 +167,8 @@ promotion_resume_core_elapsed_us <= 100000
 `promotion_resume_core_*` 是 server status、PFS 和 E2E JSON 的唯一正式前缀；文档、测试和
 脚本不得再输出无 `promotion_` 前缀的 `resume_core_*` 别名，避免同一计时区间出现双名。
 
-当前仓库中的 `100ms` 结果只能作为同实例或冻结 datadir 副本上的 server-side attach-core
-证据，不是在线物理备机升主后的业务续作证据。报告必须同时标明 consistency mode、
+当前仓库中的 `100ms` 结果只能作为 same-instance server-side attach-core 证据，不是在线物理
+备机升主后的业务续作证据。报告必须同时标明 consistency mode、
 `real_redo_apply` 和 `real_ha_promotion`；只有未来 production provider 模式才能声明真实跨节点
 事务继续。
 
@@ -291,7 +295,8 @@ resume_worker_count
 - 不把无 redo apply 的双 mysqld simulator 当作真实跨节点事务续作证据。
 - 不为 detached/adopted trx 创建 placeholder THD；prepared/preserved trx 的锁和 undo 所有权
   继续由 `trx_t` 表达。
-- 不让 receiver mysqld 重启后继续使用进程退出前的 prepared handle。
+- 不支持 receiver mysqld 重启后继续当前 transfer/promotion-ready epoch；重启后旧 registry、plan、
+  native handle 全部失效，只允许 fail closed、清理垃圾或由 source 建立新 epoch 重传。
 - 不实现新的 InnoDB 持久化 no-commit quarantine；rollback 失败时以阻断 epoch 保证安全。
 - 不改变 `preserve_trx_enable=OFF` 时的原生 MySQL 8.0.22 行为。
 
@@ -503,7 +508,7 @@ struct Preserve_trx_physical_fence_proof {
 
 enum class Preserve_trx_physical_consistency_mode {
   TEST_SAME_INSTANCE_ATTACH_ONLY,
-  TEST_FROZEN_DATADIR_COPY,
+  TEST_ONLY_PHYSICAL_FENCE_SIMULATOR,
   PRODUCTION_REDO_APPLY_FENCE
 };
 
@@ -618,25 +623,27 @@ lock inheritance和rseg保护正确；如果这些测试暴露真实null-THD缺�
 
 当前仓库没有真实物理备机和生产 apply-state provider，因此只能证明：
 
-- source/receiver transfer、durable spool 和 physical-copy E2E 已存在，但不等于真实 redo
-  replication/apply 或 HA promotion；
+- source/receiver 在线 transfer、receiver 实时 prepare 和 READY_FOR_GATE 已存在，但不等于真实
+  redo replication/apply 或 HA promotion；
 - metadata-only plan 构建正确；
-- 在 QUIESCED 后冻结 datadir 副本测试中，page-free lock import 与当前 page-based import
-  产生等价 lock_sys 状态；
-- gate 不发生 page IO，per-connection resume 不再执行 lock import；
+- online receiver simulator 的 gate 编排不做 page IO、hydrate 或 payload rewrite；
+- same-instance attach core 不再执行 lock import；
 - 缺少 provider/fence 时 fail closed。
 
 其中测试模式的权限边界固定为：
 
 - `TEST_SAME_INSTANCE_ATTACH_ONLY` 只能消费同一 InnoDB 实例中已经安全 adopted 的事务，不能
   授权跨实例 metadata-only import；
-- `TEST_FROZEN_DATADIR_COPY` 必须在所有目标 QUIESCED、source 停止后复制完整 datadir，并将
-  receiver 已接收的 standby carrier/spool 作为 overlay 恢复；它只能证明静态物理副本等价；
+- `ONLINE_RECEIVER_READY_SIMULATOR` 不是本枚举成员，只能读取当前在线 receiver 进程内已发布的
+  strict registry snapshot，验证 READY 编排与时延；不得获得 physical lease；
+- `TEST_ONLY_PHYSICAL_FENCE_SIMULATOR` 只能由 GUnit 注册，允许测试 shared kernel，但不得作为
+  runtime E2E、release gate 或物理一致性证据；
 - `PRODUCTION_REDO_APPLY_FENCE` 只能由未来 production provider slot 生成，TEST_ONLY 插件、
   SQL、DBUG 和 simulator 均不能构造。
 
 当前 `--receiver-physical-copy-before-drain` 在业务负载之前复制 datadir，之后没有 redo apply，
-因此不能用于跨节点 attach/DML 证明。该模式只保留 transfer/prewarm 测试价值。
+因此不能用于跨节点 gate/attach/DML 证明。该模式只保留 transfer/prewarm 测试价值，不得发展为
+receiver restart 后重建 strict registry 的兼容路径。
 
 当前仓库不能声明真实物理升主合同已经完成。该边界必须写入 release 结论。
 
@@ -831,11 +838,11 @@ any in-memory prepared state -> STALE_GENERATION (boot incarnation changed)
 Intent、registry 和 preserved record 的转换顺序必须固定，不能产生“intent 已 adopted 但
 锁未安装”或“resource 已消费但 THD 未 attach”的窗口。
 
-本设计不支持 strict online promotion 在 receiver mysqld 重启后自动继续。启动时发现未终结的
-`ADOPTING/ATTACHING/ACTIVATING` intent，或发现 intent 的 boot incarnation 与当前进程不同，
-必须阻断该 epoch 和 service-open；普通 local startup recovery 不得消费这些 standby token。
-HA 只能丢弃并重建该 standby，或显式进入 destructive abandon/rollback 流程。不得仅凭 intent
-猜测 claim、lock import 或 activation 已完成，也不得自动重建 native handle 后继续 promotion。
+本设计不支持 strict online promotion 在 receiver mysqld 重启后自动继续。进程退出即使当前
+epoch 失效；启动时发现旧 standby spool、projection 或未终结 `ADOPTING/ATTACHING/ACTIVATING`
+intent，只能 fail closed 并清理/隔离，或由 source 建立新 epoch 重传。普通 local startup
+recovery 不得消费这些 standby token；不得从 durable spool 重建 strict registry、metadata plan、
+native binlog handle 后继续 promotion。
 
 Gate rollback 成功的 durable proof 固定为：native rollback 返回成功、prepared XID lookup
 不存在、active owner 不存在，并将 epoch intent 原子 rewrite 为 `ABANDONED_ROLLED_BACK`。只满足
@@ -916,7 +923,8 @@ projection。Final fact 超时的 token 进入 not-ready/abandoned cleanup，不
 registry reaper 通过 `begin_cleanup(ADOPTED_LOCKED)` 与 `begin_attach()` 做同一 CAS：成功取得
 cleanup lease 后进入 `CLEANUP_PENDING`，在物理一致的新主上 rollback 用户事务；成功进入
 `CLEANUP_ROLLED_BACK`，失败进入 `CLEANUP_TAINTED` 并持续告警。该清理不属于 P5 attach 失败
-回退；同实例/冻结副本测试可以验证状态机，任意异构 receiver 不得执行该 rollback。
+回退；只有 same-instance 测试可以验证用户事务 rollback 状态机，online receiver simulator 和
+任意异构 receiver 均不得执行该 rollback。
 
 Client-resume deadline 由未来 HA coordinator 在 gate request 中提供并冻结到 epoch/token facts；
 TEST_ONLY profile 使用测试配置常量。它不是用户动态 sysvar，也不能由目标连接延长。生产 provider
@@ -926,7 +934,8 @@ TEST_ONLY profile 使用测试配置常量。它不是用户动态 sysvar，也�
 binlog、MDL 和 THD ownership journal 仍能证明且 controlled rollback 可安全调用时，operator
 才能通过 `begin_tainted_cleanup()` CAS 进入 `CLEANUP_PENDING`；成功为
 `CLEANUP_ROLLED_BACK`，失败为 `CLEANUP_TAINTED`。Ownership 不可证明时固定为
-`INSTANCE_REBUILD_ONLY`，不提供进程内 rollback/kill 出口，只能阻断并重建实例。
+`INSTANCE_REBUILD_ONLY`，不提供进程内 rollback/kill 出口，只能阻断并重建实例。当前仓库只在
+same-instance 测试中执行用户事务 rollback；online receiver simulator 不执行 rollback。
 
 ## 7. Record-Lock Metadata Prewarm 设计
 
@@ -1892,7 +1901,7 @@ HA 丢弃并重建 standby/实例；destructive abandon 必须显式授权并留
 | Receiver | `preserve_trx_transfer_receiver_enable` |
 | Memory | `preserve_trx_memory_budget_bytes` / `_per_token_bytes` |
 | Gate batch/concurrency/deadline | 现有 `preserve_trx_promotion_gate_*` |
-| Strict metadata-only | 非 public sysvar；生产只允许 production physical lease provider + explicit internal policy；测试只允许隔离的 same-instance/frozen-copy policy |
+| Strict metadata-only | 非 public sysvar；生产只允许 production physical lease provider + explicit internal policy；测试只允许隔离的 same-instance attach 或 online receiver simulator policy |
 
 本轮不增加 `allow_page_fallback` 或 metadata-only 强制开启参数。缺 lease/provider 时 strict path
 不可达；这就是 kill switch。Gate 不能为了“可用性”现场退回 page-based cold import。
@@ -2121,17 +2130,18 @@ per-entry CAS，不要求为了本设计顺手重构 legacy ready cache；只有
 - GUnit：内核数据结构、state CAS、fault injection、mock lease；
 - MTR：单实例 SQL/权限/OFF/local-startup 行为和 source-shape guard；
 - `resumable_trx_business_e2e.py`：当前 pre-drain physical-copy 只覆盖 source + receiver
-  transfer/prewarm/gate，不具备负载后的物理一致性，不能执行跨节点 attach/DML 证明；
-- test-only protected-THD component：只在同实例或 QUIESCED 后冻结 datadir 副本模式中覆盖
-  attach core 行为和性能；
+  transfer/prewarm，不具备负载后的物理一致性，不能执行跨节点 gate/attach/DML 证明；
+- online receiver TEST_ONLY gate component：只读取当前进程内 strict registry，使用 no-op/test
+  executor 验证 gate 编排、deadline、worker 和 no-cold-path 指标；
+- test-only protected-THD component：只在同一 InnoDB 实例中覆盖 attach core 行为和性能；
 - 未来真实 HA 项目：production redo/apply/fence/provider 证明。
 
-当前 E2E runner 只执行到 promotion gate，没有实际为目标连接调用
+当前 E2E runner 只执行到 receiver READY/simulator gate，没有实际为目标连接调用
 `preserved_trx_resume_adopted_for_promotion_on_thd()`，因此现有报告不能证明 per-connection
 100ms。P0 必须增加一个不进入生产 mysqld 用户接口的 test-only plugin/component：它只能在
-显式 `TEST_SAME_INSTANCE_ATTACH_ONLY` 或 `TEST_FROZEN_DATADIR_COPY` 证据下，先建立目标连接并
-记录 connection id，再通过 `Preserved_trx_peer_thd_resolver` 获得 protected handle并调用内部
-attach API。组件不得创建 adopted record、伪造 production lease或绕过 registry/gate。
+显式 `TEST_SAME_INSTANCE_ATTACH_ONLY` 证据下，先建立目标连接并记录 connection id，再通过
+`Preserved_trx_peer_thd_resolver` 获得 protected handle并调用内部 attach API。组件不得创建
+adopted record、伪造 production lease或绕过 registry/gate。
 Release E2E 必须使用 release mysqld 加载该测试组件，不能用 mock attach 或 Python sleep 代替
 真实 server-side attach；但测试结果仍不得标记为真实 HA 续作。
 
@@ -2148,7 +2158,7 @@ production core: preserved_trx_resume_adopted_for_promotion_on_thd(...)
 不得创建 adopted record、直接 claim/import/register、写 production provider slot、伪造 LSN/digest、
 绕过 authorization/registry，或从用户可安装的 production package 默认加载。Release test build
 必须显式启用组件；普通 release packaging/link map 不包含该 entry。Same-instance 只证明 attach
-core，frozen-copy 证明静态副本 gate+attach，二者都不证明真实 redo apply/HA。
+core；online receiver simulator 只证明准备状态与 gate 编排；二者都不证明真实 redo apply/HA。
 Consistency mode 在组件加载时冻结，不由该 entry 的参数选择。
 
 Mock provider 必须返回完整 proof/lease、支持 acquire/revalidate失败、operation deadline和
@@ -2256,8 +2266,8 @@ provider contract violation taints and blocks instead of guessing rollback
 - primary/secondary index record locks、gap/next-key locks 恢复后阻塞语义正确；
 - gate 完成但连接尚未 resume 时，preserved locks 已阻塞新业务；
 - gate 未完成时 service-open barrier 不放行；
-- 同实例或QUIESCED后冻结datadir副本中，attach后继续UPDATE/INSERT/DELETE、savepoint rollback、
-  commit/rollback正确；任意异构receiver必须在attach前拒绝；
+- 同实例中 attach 后继续 UPDATE/INSERT/DELETE、savepoint rollback、commit/rollback 正确；任意
+  异构 receiver 必须在 attach 前拒绝；
 - GTID、compression、session state 和 binlog event 内容正确；
 - unsupported predicate/temp/artifact 明确 fail closed；
 - local startup 继续使用原 page-based import；
@@ -2274,8 +2284,7 @@ provider contract violation taints and blocks instead of guessing rollback
   handle；ACTIVE/rollback 后 pending kill 按原生语义生效，tainted 时保持阻断；
 - required apply LSN 为 0、provider 缺失、null/default executor 均 fail closed；
 - unsupported artifact 保留审计状态，直到 rollback 成功或阻断 epoch 后显式清理；
-- 未终结 `ADOPTING/ATTACHING/ACTIVATING` intent 在 receiver restart 后必须阻断
-  service/promotion，普通 startup 不得自动消费或 replay；
+- receiver restart 后旧 strict epoch 必须失效，普通 startup 不得自动消费、replay 或重建；
 - OFF path 不创建 prepared state；
 - source-shape guard 禁止 fast path 调 `buf_page_get`、blob hydrate 和 payload import。
 
@@ -2319,7 +2328,7 @@ receiver workers 和资源参数显式报告
 先 scaled，再连续至少三轮 full release。不同证据profile使用不同硬指标，不能把不可执行的
 gate/attach字段填0后混成一张“成功”报告。
 
-Pre-drain physical-copy transfer/prewarm profile：
+Online source/receiver transfer/prewarm profile：
 
 ```text
 receiver_ready_tokens == standby_tokens
@@ -2331,31 +2340,30 @@ resource_admission_unaccounted_bytes == 0
 
 该profile不得输出`promotion_gate_adopted_tokens`或`resume_active_tokens`成功断言。
 
-Frozen-copy gate profile：
+Online receiver strict-registry/gate simulator profile：
 
 ```text
-promotion_gate_expected_tokens == standby_tokens
-promotion_gate_adopted_tokens == promotion_gate_expected_tokens
-promotion_gate_abandoned_tokens == 0
-promotion_gate_skipped_tokens == 0
-promotion_gate_failed_tokens == 0
-promotion_cleanup_tainted_tokens == 0
+strict_registry_ready_for_gate_tokens == standby_tokens
+strict_registry_not_ready_tokens == 0
+strict_registry_lock_plan_tokens == standby_tokens
+strict_registry_native_binlog_handle_tokens == binlog_cache_tokens
 promotion_preserve_gate_elapsed_us <= 1000000
 promotion_lock_page_get_count == 0
 promotion_lock_page_get_us == 0
 promotion_lock_image_resolves == 0
-promotion_lock_accounting_bits == imported_set_bits
-promotion_lock_metadata_only_import_entries == expected_bitmap_entries
 receiver_lock_plan_epoch_peak_bytes <= receiver_lock_plan_subpool_cap_bytes
 promotion_fence_digest_compare_us reports fixed-size compare only
 lock_warmcopy_hot_hook_non_target_partition_locks == 0
 resource_admission_unaccounted_bytes == 0
+simulator_executor_claim_count == 0
+simulator_executor_import_count == 0
+simulator_executor_rollback_count == 0
 ```
 
-Same-instance/frozen-copy attach profile：
+Same-instance attach profile：
 
 ```text
-resume_expected_tokens == promotion_gate_adopted_tokens
+resume_expected_tokens == same_instance_adopted_tokens
 resume_active_tokens == resume_expected_tokens
 promotion_resume_core_p95_us <= 100000
 promotion_resume_core_max_us <= 100000
@@ -2370,33 +2378,22 @@ resume_binlog_rename_count == 0
 Batch wall time、CPU、lock_sys shard contention 另外报告，不得用单连接 `<=100ms` 掩盖
 1000-token 总耗时。
 
-由于当前没有真实物理备机，Release证据拆成三类独立profile：
+由于当前没有真实物理备机，Release证据拆成三类独立 profile：
 
-1. 现有pre-drain physical-copy profile只验证transfer/prewarm/gate准备链路，不执行strict adopt
-   或跨节点attach；
-2. same-instance profile只验证同一InnoDB实例上的protected-THD attach core；
-3. frozen-copy profile在所有目标QUIESCED、source停止后复制完整datadir，保留receiver UUID并恢复
-   receiver standby carrier/spool，再使用`TEST_FROZEN_DATADIR_COPY` lease验证静态物理副本上的
-   gate和attach。
+1. source/receiver online transfer/prewarm profile 验证真实 frame、object、final fact 和
+   `READY_FOR_GATE` 准备链路；receiver 全程不重启；
+2. online receiver simulator profile 在同一在线进程消费 strict registry snapshot，只用 TEST_ONLY
+   executor 验证 gate 编排、digest/deadline/worker 和 no-cold-path；不得 claim/import/rollback；
+3. same-instance profile 只验证同一 InnoDB 实例上的 protected-THD attach core。
 
-Frozen-copy harness 操作顺序固定为：
-
-1. 停止 receiver，保存 receiver `auto.cnf`、server UUID、carrier、frame spool 和 epoch fact；
-2. 确认 source 所有目标 QUIESCED 并停止 source，记录 fence LSN；
-3. 复制完整 source datadir 到 receiver staging；
-4. 删除副本中 source-local Preserve carrier/intent/token artifact，禁止它们进入 receiver local
-   startup recovery；
-5. overlay receiver carrier/spool/epoch fact，恢复 receiver `auto.cnf`/UUID；
-6. 启动前 listing 验证不存在 source-local snapshot token，standby token set 与 epoch fact 相等；
-7. 启动 receiver并只安装 `TEST_FROZEN_DATADIR_COPY` provider/component。
-
-Pre-drain和frozen-copy profile必须实际启动source/receiver两个mysqld或等价独立进程，不能用
-单进程复制map替代artifact transfer/native handle构建。三类profile都不构成真实redo apply或
-HA promotion证据。
+Online transfer/prewarm 与 simulator profile 必须实际启动 source/receiver 两个 mysqld 或等价独立
+进程，不能用单进程复制 map 替代 artifact transfer/native handle 构建。Receiver restart、冻结
+datadir copy、spool replay/rebuild 不属于 release profile。三类 profile 都不构成真实 redo apply
+或 HA promotion 证据。
 报告必须标注：
 
 ```text
-physical_consistency_mode=pre_drain_copy|same_instance|frozen_datadir_copy
+physical_consistency_mode=online_receiver_simulator|same_instance|not_proven
 simulated_physical_fence=true
 real_redo_apply=false
 production_ha_promotion=false
@@ -2405,10 +2402,10 @@ real_business_continuation_proven=false
 
 E2E 必须覆盖 final tail cap、gate service-open barrier 和 attach failure staging unwind。Sequential
 Python SQL、source-shape lint、小 smoke 或 cold startup 不能替代 release behavior 证据。
-Same-instance和frozen-copy attach profile必须创建`resume_expected_tokens`个真实目标THD，通过
-test-only protected-handle组件逐个调用生产内部attach core。仅这两个物理一致性模式可以在
-目标THD上继续DML/commit或rollback验证所有权与binlog内容；pre-drain copy profile不得执行。
-这些结果证明100ms attach core，不证明真实物理备机业务续作。
+Same-instance attach profile 必须创建 `resume_expected_tokens` 个真实目标 THD，通过 test-only
+protected-handle 组件逐个调用生产内部 attach core。只有该同实例 profile 可以在目标 THD 上继续
+DML/commit/rollback 验证 ownership 与 binlog 内容；online receiver simulator 不得执行。
+这些结果证明 100ms attach core，不证明真实物理备机业务续作。
 
 ## 17. 实施顺序
 
@@ -2419,8 +2416,8 @@ test-only protected-handle组件逐个调用生产内部attach core。仅这两�
 - 冻结 metadata-only helper 的原生等价 conflict predicate、validated dict/index lease 和
   no-wait-import 语义；
 - 定义 production physical lease interface、strict shared-kernel policy 和 service-open barrier；
-- 定义 same-instance、frozen-copy、production-redo-apply 三类 consistency evidence，测试入口不能
-  构造 production mode；
+- 定义 same-instance attach、online receiver simulator、production-redo-apply 三类 evidence，
+  测试入口不能构造 production mode；
 - 将 lease 冻结为 holder 持有期间不可撤销，operation deadline 与 lease lifetime 分离；
 - 冻结现有 ready enum 到 strict registry 的单一权威映射；
 - 增加 page-get、image-resolve、lock accounting、binlog payload IO、attach 分段指标；
@@ -2480,14 +2477,14 @@ test-only protected-handle组件逐个调用生产内部attach core。仅这两�
 - rollback-success terminal policy 与 tainted epoch-blocking policy；
 - lease 交接到模拟 HA role transition，service-open commit 后才释放；holder期间provider不可
   恢复apply或撤销lease；
-- release simulator gate `<=1s` 证据。
+- online receiver simulator gate `<=1s` 证据；TEST_ONLY executor 不 claim/import/rollback。
 
 ### P5：物理一致性分级 Protected THD Attach Core 与 100ms 证据
 
 - atomic attach lease 和 authorization policy；
 - session/binlog/MDL/GTID/temp/savepoint 顺序、`ACTIVATING` intent 和不可逆 activation；
-- 同实例只验证attach core；frozen-copy验证静态物理副本上的gate/attach；pre-drain copy不执行
-  跨节点attach；
+- 同实例只验证 attach core；online receiver simulator 不执行 attach；跨节点 attach 保持
+  `HA_BLOCKED`；
 - activation 前 attach 失败只撤销 staging；activation 后受控 rollback，失败进入 pinned
   `ATTACH_TAINTED`；`ADOPTED_LOCKED`过期清理由独立registry reaper处理；
 - targeted GUnit/MTR 全部通过；
@@ -2505,7 +2502,8 @@ test-only protected-handle组件逐个调用生产内部attach core。仅这两�
 | 标签 | 可覆盖的验收项 | 含义 |
 |---|---|---|
 | `IN_REPO` | 1、2、5-14、16、17、20、22-30、32-39 | 当前仓库 GUnit/MTR/source-shape/release harness 可直接证明 |
-| `SIMULATOR` | 3-5、13、15、18、19、29、31、33、34、38、39 | same-instance、frozen-copy 或 TEST_ONLY provider 可证明等价合同，不是真实 HA |
+| `SIMULATOR` | 4、18、29、33、34 | online receiver TEST_ONLY gate 可证明准备/编排合同，不是真实 HA，也不执行用户事务 adopt |
+| `TEST_SAME_INSTANCE` | 13、15、19、29、31、38、39 | 同一 InnoDB 实例可证明 protected-THD attach core 与所有权合同，不证明跨节点物理一致性 |
 | `HA_BLOCKED` | 3-5、15、18、19、21、31、33、34 | 必须由未来 redo apply/provider/single-primary role transition 重新签发生产证据 |
 
 Release JSON 对每项输出实际 evidence mode；`HA_BLOCKED` 项在当前仓库只能报告
@@ -2530,15 +2528,15 @@ Release JSON 对每项输出实际 evidence mode；`HA_BLOCKED` 项在当前仓�
 13. Attach 在 `ACTIVATING` 前可逆；进入 activation 后不可回退 token，失败时受控 rollback
     成功或保持 pinned `ATTACH_TAINTED`，不得先普通 kill；artifact 只在 `ACTIVE` durable 后清理。
 14. Resume 不读、写或 rename binlog payload。
-15. 同实例和frozen-copy模式下attach后DML、savepoint、commit、rollback、GTID、compression
-    语义正确；任意异构receiver必须拒绝attach。
+15. 同实例模式下 attach 后 DML、savepoint、commit、rollback、GTID、compression 语义正确；
+    任意异构 receiver 必须拒绝 attach。
 16. 普通 SQL 权限和可信 HA authorization 明确隔离。
 17. OFF/native MySQL 8.0.22 路径不变。
-18. Release simulator promotion gate `<=1000000us`，page IO 为 0，且 expected/adopted 数量
-    相等、abandoned/skipped/failed/tainted 均为 0。
-19. Same-instance/frozen-copy attach profile 的单连接 release P95 和 max 都 `<=100000us`，且
-    expected/ACTIVE 数量相等、deadline miss和failure count均为0；pre-drain copy profile不生成
-    该证据。
+18. Online receiver simulator gate `<=1000000us`，page IO 为 0，strict registry expected/ready
+    数量相等，且 TEST_ONLY executor 的 claim/import/rollback 计数均为 0。
+19. Same-instance attach profile 的单连接 release P95 和 max 都 `<=100000us`，且
+    expected/ACTIVE 数量相等、deadline miss 和 failure count 均为 0；online receiver profile
+    不生成该证据。
 20. Full-pressure batch wall、CPU、内存、FD、tmpdir 和 contention 真实报告。
 21. Release 报告明确没有真实物理备机/HA promotion 证据。
 22. Strict READY 只有 registry 一个权威，legacy projection 不可独立判 READY。
@@ -2547,8 +2545,8 @@ Release JSON 对每项输出实际 evidence mode；`HA_BLOCKED` 项在当前仓�
 25. OFF、从未开启 epoch、已关闭 epoch三种状态的前台锁吞吐均在 baseline 容差内。
 26. 四类 source-shape guard 和对应 runtime behavior tests 均通过。
 27. Ordinary supremum lock 使用整页 bitmap sizing，仅执行原生 mode normalization。
-28. Receiver restart 发现未终结 strict intent 时阻断 service/promotion，不自动 replay 或本地
-    recovery。
+28. Receiver restart 后旧 strict epoch 失效；不自动 replay/rebuild registry、plan 或 native
+    handle，也不被 local recovery 消费。
 29. Release E2E 通过 test-only protected-handle 组件调用真实内部 resume core，而不是只运行
     promotion gate。
 30. Gate intent为单个epoch-level durable record，不发生1000次per-token fsync；attach intent
@@ -2598,14 +2596,15 @@ READY/handle 失效。
 接入后只能调用本设计的 prepared-object 接口。HA 层不得重新解析 lock payload、读取
 InnoDB 页面、hydrate binlog sidecar 或维护第三套 resume 逻辑。
 
-在这些 production 合同全部接入前，本仓库只能报告 attach-core 和 frozen-copy 等价验证；
-不得把 simulator、pre-drain datadir copy 或TEST_ONLY provider标记为真实业务续作。
+在这些 production 合同全部接入前，本仓库只能报告 online receiver promotion-ready 准备、
+simulator gate 编排和 same-instance attach-core；不得把 simulator、pre-drain datadir copy 或
+TEST_ONLY provider 标记为真实业务续作。
 
 ## 20. 风险登记册
 
 | 风险 | 严重度 | Owner/边界 | 必须证据或处置 |
 |---|---|---|---|
-| Production provider 错误证明 page layout | Critical external | 未来 HA/redo apply provider | Provider conformance、frozen-copy 等价测试；仓库报告始终标注非 production proof |
+| Production provider 错误证明 page layout | Critical external | 未来 HA/redo apply provider | Provider conformance 由外部 HA 项目完成；仓库报告始终标注 HA_BLOCKED |
 | Metadata-only conflict/accounting 与原生不等价 | Critical in-repo | InnoDB lock helper | shared native predicate、multi-bit accounting RED/GUnit、split/merge/rollback 对称测试 |
 | Activation 部分写入后普通 THD teardown破坏 ownership | Critical in-repo | Attach core | 四个 activation fault point；受控 rollback 或 pinned taint，禁止先 kill |
 | Detached trx `mysql_thd=null` 的 purge/rseg/lock 缺口 | High in-repo | InnoDB trx/lock | conflict DML、purge/delete-mark inheritance、rseg runtime tests；不引入 placeholder THD |

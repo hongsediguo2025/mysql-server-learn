@@ -28,7 +28,7 @@ enum class Mysql_binlog_preserve_cache_status : uint8_t;
 enum class Preserve_trx_physical_consistency_mode : uint8_t {
   NONE = 0,
   TEST_SAME_INSTANCE_ATTACH_ONLY,
-  TEST_FROZEN_DATADIR_COPY,
+  TEST_ONLY_PHYSICAL_FENCE_SIMULATOR,
   PRODUCTION_REDO_APPLY_FENCE
 };
 

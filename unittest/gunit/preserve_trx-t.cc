@@ -160,7 +160,8 @@ TEST(PreservedTrxPhysicalFence, ProductionPathRejectsMissingProvider) {
 
 TEST(PreservedTrxPhysicalFence, ExactLsnAndCompleteDigestAreRequired) {
   Preserve_trx_physical_fence_proof proof = make_test_physical_fence_proof(
-      Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY);
+      Preserve_trx_physical_consistency_mode::
+          TEST_ONLY_PHYSICAL_FENCE_SIMULATOR);
   EXPECT_TRUE(preserved_trx_physical_fence_proof_is_valid(proof));
   ++proof.target_frozen_lsn;
   EXPECT_FALSE(preserved_trx_physical_fence_proof_is_valid(proof));
@@ -168,11 +169,13 @@ TEST(PreservedTrxPhysicalFence, ExactLsnAndCompleteDigestAreRequired) {
   proof.page_layout_digest.clear();
   EXPECT_FALSE(preserved_trx_physical_fence_proof_is_valid(proof));
   proof = make_test_physical_fence_proof(
-      Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY);
+      Preserve_trx_physical_consistency_mode::
+          TEST_ONLY_PHYSICAL_FENCE_SIMULATOR);
   proof.implicit_native_continuity_proven = false;
   EXPECT_FALSE(preserved_trx_physical_fence_proof_is_valid(proof));
   proof = make_test_physical_fence_proof(
-      Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY);
+      Preserve_trx_physical_consistency_mode::
+          TEST_ONLY_PHYSICAL_FENCE_SIMULATOR);
   proof.consistency_mode =
       static_cast<Preserve_trx_physical_consistency_mode>(255);
   EXPECT_FALSE(preserved_trx_physical_fence_proof_is_valid(proof));
@@ -206,7 +209,8 @@ TEST(PreservedTrxPhysicalFence,
 TEST(PreservedTrxPhysicalFence, TestProviderCannotReachProductionSlot) {
   Preserve_trx_physical_fence_provider_ops ops;
   ops.consistency_mode =
-      Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY;
+      Preserve_trx_physical_consistency_mode::
+          TEST_ONLY_PHYSICAL_FENCE_SIMULATOR;
   ops.acquire = test_physical_fence_acquire;
   ops.revalidate = test_physical_fence_revalidate;
   ops.release = test_physical_fence_release;
@@ -225,7 +229,7 @@ TEST(PreservedTrxPhysicalFence, TestProviderCannotReachProductionSlot) {
             preserved_trx_acquire_physical_fence_lease_for_unit_test(
                 make_test_physical_fence_proof(
                     Preserve_trx_physical_consistency_mode::
-                        TEST_FROZEN_DATADIR_COPY),
+                        TEST_ONLY_PHYSICAL_FENCE_SIMULATOR),
                 &test_lease));
   EXPECT_TRUE(test_lease.acquired());
   EXPECT_EQ(Preserve_trx_physical_fence_status::OK, test_lease.revalidate());
@@ -235,7 +239,8 @@ TEST(PreservedTrxPhysicalFence, TestProviderCannotReachProductionSlot) {
 TEST(PreservedTrxPhysicalFence, ProviderDriftViolatesLeaseContract) {
   Preserve_trx_physical_fence_provider_ops ops;
   ops.consistency_mode =
-      Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY;
+      Preserve_trx_physical_consistency_mode::
+          TEST_ONLY_PHYSICAL_FENCE_SIMULATOR;
   ops.acquire = test_physical_fence_acquire;
   ops.revalidate = test_physical_fence_revalidate;
   ops.release = test_physical_fence_release;
@@ -247,7 +252,7 @@ TEST(PreservedTrxPhysicalFence, ProviderDriftViolatesLeaseContract) {
             preserved_trx_acquire_physical_fence_lease_for_unit_test(
                 make_test_physical_fence_proof(
                     Preserve_trx_physical_consistency_mode::
-                        TEST_FROZEN_DATADIR_COPY),
+                        TEST_ONLY_PHYSICAL_FENCE_SIMULATOR),
                 &rejected_lease));
   EXPECT_FALSE(rejected_lease.acquired());
   g_test_physical_fence_drift_on_acquire = false;
@@ -257,7 +262,7 @@ TEST(PreservedTrxPhysicalFence, ProviderDriftViolatesLeaseContract) {
             preserved_trx_acquire_physical_fence_lease_for_unit_test(
                 make_test_physical_fence_proof(
                     Preserve_trx_physical_consistency_mode::
-                        TEST_FROZEN_DATADIR_COPY),
+                        TEST_ONLY_PHYSICAL_FENCE_SIMULATOR),
                 &acquired_lease));
   g_test_physical_fence_drift_on_revalidate = true;
   EXPECT_EQ(Preserve_trx_physical_fence_status::PROVIDER_CONTRACT_VIOLATION,
@@ -775,7 +780,8 @@ TEST(PreservedTrxPhysicalPromotion,
 
   Preserve_trx_physical_fence_provider_ops ops;
   ops.consistency_mode =
-      Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY;
+      Preserve_trx_physical_consistency_mode::
+          TEST_ONLY_PHYSICAL_FENCE_SIMULATOR;
   ops.acquire = test_physical_fence_acquire;
   ops.revalidate = test_physical_fence_revalidate;
   ops.release = test_physical_fence_release;
@@ -785,7 +791,7 @@ TEST(PreservedTrxPhysicalPromotion,
             preserved_trx_acquire_physical_fence_lease_for_unit_test(
                 make_test_physical_fence_proof(
                     Preserve_trx_physical_consistency_mode::
-                        TEST_FROZEN_DATADIR_COPY),
+                        TEST_ONLY_PHYSICAL_FENCE_SIMULATOR),
                 &physical_lease));
 
   g_test_physical_fence_drift_on_revalidate = true;
@@ -6665,7 +6671,8 @@ TEST_F(PreserveSnapshotTest, CarrierListsStrictPromotionIntentV2Tokens) {
   Preserve_trx_strict_promotion_intent_epoch marker;
   marker.epoch_id = "strict-listing";
   marker.physical_fence = make_test_physical_fence_proof(
-      Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY);
+      Preserve_trx_physical_consistency_mode::
+          TEST_ONLY_PHYSICAL_FENCE_SIMULATOR);
   marker.generated_at_us = 123;
   marker.tokens.push_back(
       {"strict-token", 1,
@@ -6720,7 +6727,8 @@ TEST_F(PreserveSnapshotTest,
   preserve_trx_set_enable_value(true);
   preserve_trx_resource_manager_reset_for_unit_test();
   auto proof = make_test_physical_fence_proof(
-      Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY);
+      Preserve_trx_physical_consistency_mode::
+          TEST_ONLY_PHYSICAL_FENCE_SIMULATOR);
   Preserve_trx_physical_fence_provider_ops ops;
   ops.consistency_mode = proof.consistency_mode;
   ops.acquire = test_physical_fence_acquire;
@@ -6807,7 +6815,8 @@ TEST_F(PreserveSnapshotTest,
   preserve_trx_set_enable_value(true);
   preserve_trx_resource_manager_reset_for_unit_test();
   auto proof = make_test_physical_fence_proof(
-      Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY);
+      Preserve_trx_physical_consistency_mode::
+          TEST_ONLY_PHYSICAL_FENCE_SIMULATOR);
   Preserve_trx_physical_fence_provider_ops ops;
   ops.consistency_mode = proof.consistency_mode;
   ops.acquire = test_physical_fence_acquire;
@@ -6884,7 +6893,8 @@ TEST_F(PreserveSnapshotTest,
   preserve_trx_set_enable_value(true);
   preserve_trx_resource_manager_reset_for_unit_test();
   auto proof = make_test_physical_fence_proof(
-      Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY);
+      Preserve_trx_physical_consistency_mode::
+          TEST_ONLY_PHYSICAL_FENCE_SIMULATOR);
   Preserve_trx_physical_fence_provider_ops ops;
   ops.consistency_mode = proof.consistency_mode;
   ops.acquire = test_physical_fence_acquire;
@@ -6952,7 +6962,8 @@ TEST_F(PreserveSnapshotTest, StrictPhysicalFenceUsesRequestedWorkers) {
   preserve_trx_set_enable_value(true);
   preserve_trx_resource_manager_reset_for_unit_test();
   auto proof = make_test_physical_fence_proof(
-      Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY);
+      Preserve_trx_physical_consistency_mode::
+          TEST_ONLY_PHYSICAL_FENCE_SIMULATOR);
   Preserve_trx_physical_fence_provider_ops ops;
   ops.consistency_mode = proof.consistency_mode;
   ops.acquire = test_physical_fence_acquire;

@@ -2488,7 +2488,8 @@ adopt_prepared_epoch_for_physical_promotion_impl(
   }
   const auto required_mode =
       use_test_provider
-          ? Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY
+          ? Preserve_trx_physical_consistency_mode::
+                TEST_ONLY_PHYSICAL_FENCE_SIMULATOR
           : Preserve_trx_physical_consistency_mode::
                 PRODUCTION_REDO_APPLY_FENCE;
   if (preserve_dir.empty() || request.epoch_id.empty() ||
