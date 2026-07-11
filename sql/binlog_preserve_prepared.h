@@ -72,6 +72,7 @@ class Preserve_trx_internal_operation_capability {
 #endif
   friend class Mysql_binlog_preserve_prepared_cache_handle;
   friend class Mysql_binlog_preserve_attach_journal;
+  friend class Preserve_trx_prepared_token_resources;
   friend Mysql_binlog_preserve_cache_status
   mysql_binlog_preserve_prepare_detached_cache(
       const Preserve_trx_internal_operation_capability &,

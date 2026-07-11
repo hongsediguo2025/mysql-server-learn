@@ -6492,6 +6492,57 @@ void preserve_trx_warmcopy_admit_current_thd_binlog_write_impl(THD *thd) {
 
 }  // namespace
 
+bool preserved_trx_build_native_binlog_cache_facts(
+    const Preserve_snapshot_metadata &metadata,
+    const Mysql_binlog_preserve_token_identity &identity,
+    const Preserved_trx_external_blob_descriptor &descriptor,
+    uint64_t binlog_incarnation, uint64_t key_generation,
+    Mysql_binlog_preserve_cache_facts *facts) {
+  if (facts == nullptr ||
+      metadata.binlog_state !=
+          Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE ||
+      !metadata.global_log_bin || !metadata.option_bin_log ||
+      !metadata.session_sql_log_bin ||
+      descriptor.name != kPreservedTrxBlobBinlogCache ||
+      descriptor.size == 0 || descriptor.size != metadata.binlog_cache_size ||
+      binlog_incarnation == 0 || key_generation == 0) {
+    return false;
+  }
+
+  uint32_t mdl_descriptor_count = 0;
+  if (!mdl_descriptors_payload_is_valid(metadata.mdl_descriptors_payload,
+                                        &mdl_descriptor_count)) {
+    return false;
+  }
+  std::vector<Preserve_sql_savepoint_entry> savepoints;
+  if (parse_sql_savepoint_entries(metadata.sql_savepoints_payload,
+                                  mdl_descriptor_count, &savepoints) ||
+      savepoints.size() != metadata.savepoint_count) {
+    return false;
+  }
+
+  Mysql_binlog_preserve_cache_facts built;
+  built.identity = identity;
+  built.snapshot = metadata_to_binlog_cache_snapshot(metadata);
+  built.snapshot.cache_payload.clear();
+  built.snapshot.has_cache_length = true;
+  built.snapshot.cache_length = descriptor.size;
+  for (const Preserve_sql_savepoint_entry &savepoint : savepoints) {
+    if (savepoint.has_binlog_handler()) {
+      built.cache_states.push_back(savepoint.binlog_cache_state);
+    }
+  }
+  built.payload_sha256 = descriptor.digest;
+  built.cache_length = descriptor.size;
+  built.binlog_incarnation = binlog_incarnation;
+  built.key_generation = key_generation;
+  built.option_bin_log = metadata.option_bin_log;
+  built.session_sql_log_bin = metadata.session_sql_log_bin;
+  if (!mysql_binlog_preserve_finalize_cache_facts(&built)) return false;
+  *facts = std::move(built);
+  return true;
+}
+
 class Preserved_trx_peer_thd_handle::Impl {
  public:
   THD *thd{nullptr};

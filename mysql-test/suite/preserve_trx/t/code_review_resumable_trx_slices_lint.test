@@ -216,7 +216,7 @@ die "receiver record-lock metadata plan must be built before legacy page prefetc
   unless $transfer =~
          /run_receiver_object_prewarm_job[\s\S]*build_receiver_record_lock_prepared[\s\S]*trx_preserve_prefetch_record_lock_pages_for_gate/s;
 $transfer =~
-  /bool\s+build_receiver_record_lock_prepared\s*\([\s\S]*?(?=\nbool\s+prepare_strict_semantic_bundle_for_receiver)/m
+  /bool\s+build_receiver_record_lock_prepared\s*\([\s\S]*?(?=\nclass\s+Receiver_binlog_staging_payload_reader)/m
   or die "could not isolate build_receiver_record_lock_prepared\n";
 my $receiver_record_lock_plan_builder = $&;
 die "receiver strict metadata plan builder must not read or prefetch InnoDB pages\n"
@@ -224,10 +224,26 @@ die "receiver strict metadata plan builder must not read or prefetch InnoDB page
      /buf_page_get|buf_read_page|trx_preserve_prefetch_record_lock_pages/;
 die "final manifest must move the exact record-lock plan into strict registry resources\n"
   unless $transfer =~
-         /prepare_strict_record_lock_bundle_for_receiver[\s\S]*take_receiver_record_lock_prepared[\s\S]*install_record_lock_plan[\s\S]*publish_prewarmed/s;
+         /prepare_strict_bundle_for_receiver[\s\S]*take_receiver_record_lock_prepared[\s\S]*install_record_lock_plan[\s\S]*publish_prewarmed/s;
 die "COMMIT_EPOCH must bind strict prepared tokens from the durable epoch fact\n"
   unless $receiver_apply_frame =~
          /commit_epoch_final_metadata[\s\S]*bind_strict_prepared_tokens_from_committed_epoch/s;
+die "receiver native binlog preparation must stream from the sealed staging file\n"
+  unless $transfer =~
+         /Receiver_binlog_staging_payload_reader[\s\S]*prepare_native_binlog_handle_for_receiver/s;
+die "receiver native binlog path must not use the test-only capability factory\n"
+  if $transfer =~ /preserved_trx_make_binlog_capability_for_unit_test/s;
+$transfer =~
+  /bool\s+prepare_strict_bundle_for_receiver\s*\([\s\S]*?(?=\nstd::string\s+strict_empty_set_digest)/m
+  or die "could not isolate prepare_strict_bundle_for_receiver\n";
+my $strict_receiver_prepare = $&;
+die "strict receiver resources must support lock plan and native binlog handle together\n"
+  unless $strict_receiver_prepare =~ /install_record_lock_plan/s &&
+         $strict_receiver_prepare =~ /prepare_native_binlog_handle_for_receiver/s &&
+         $strict_receiver_prepare =~ /install_semantic_bundle/s;
+die "strict metadata-only receiver preparation must not depend on legacy page-residency prewarm success\n"
+  if $transfer =~
+     /prewarm_status\s*==\s*Preserve_trx_promotion_adopt_status::OK[\s\S]{0,300}prepare_strict_bundle_for_receiver/s;
 die "standby receiver frame apply path must not synchronously prewarm staged or committed tokens\n"
   if $receiver_apply_frame =~ /preserved_trx_promotion_prewarm_staged_bundle_for_receiver/s ||
      $receiver_apply_frame =~ /note_receiver_sync_prewarm_wait/s;

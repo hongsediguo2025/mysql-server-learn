@@ -47,6 +47,8 @@ class Preserve_trx_transfer_source_epoch_session;
 class Preserve_trx_gate_adopt_lease;
 class Preserve_trx_physical_fence_lease;
 struct Preserve_trx_prepared_token_key;
+struct Mysql_binlog_preserve_cache_facts;
+struct Mysql_binlog_preserve_token_identity;
 
 extern bool preserve_trx_enable;
 extern bool preserve_trx_temp_table_enable;
@@ -66,6 +68,13 @@ extern uint preserve_trx_max_lock_count;
 extern uint preserve_trx_max_modified_tables;
 extern uint preserve_trx_max_scan_pages;
 extern uint preserve_trx_materialize_timeout_ms;
+
+bool preserved_trx_build_native_binlog_cache_facts(
+    const Preserve_snapshot_metadata &metadata,
+    const Mysql_binlog_preserve_token_identity &identity,
+    const Preserved_trx_external_blob_descriptor &descriptor,
+    uint64_t binlog_incarnation, uint64_t key_generation,
+    Mysql_binlog_preserve_cache_facts *facts);
 enum Preserve_trx_drain_mode {
   PRESERVE_TRX_DRAIN_MODE_SOFT = 0,
   PRESERVE_TRX_DRAIN_MODE_HARD = 1

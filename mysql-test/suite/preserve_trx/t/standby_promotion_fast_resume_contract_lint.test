@@ -56,8 +56,12 @@ die "transfer/shared kernel must not acquire the production physical fence\n"
 
 die "strict promotion coordinator must consume the prepared-token registry\n"
   unless $promotion =~ /preserved_trx_strict_prepared_token_registry/;
-die "transfer must not consume strict gate ownership\n"
-  if $transfer =~ /preserved_trx_strict_prepared_token_registry/;
+die "receiver transfer must publish strict prepared resources before promotion\n"
+  unless $transfer =~ /preserved_trx_strict_prepared_token_registry/ &&
+         $transfer =~ /publish_prewarmed/ &&
+         $transfer =~ /bind_final_facts/;
+die "transfer must not consume strict gate, attach or cleanup ownership\n"
+  if $transfer =~ /begin_gate_adopt|commit_gate_adopt|begin_attach|begin_cleanup/;
 
 my $metadata_apply_count = () =
   $preserve =~ /lock_preserve_apply_record_lock_metadata_plan/g;

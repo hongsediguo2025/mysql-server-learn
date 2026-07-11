@@ -293,6 +293,10 @@ class Preserve_trx_prepared_token_resources {
       const Preserve_trx_internal_operation_capability &capability,
       const Mysql_binlog_preserve_cache_facts &facts,
       Mysql_binlog_preserve_payload_reader *reader);
+  Mysql_binlog_preserve_cache_status
+  prepare_native_binlog_handle_for_receiver(
+      const Mysql_binlog_preserve_cache_facts &facts,
+      Mysql_binlog_preserve_payload_reader *reader);
 
  private:
   class Impl;

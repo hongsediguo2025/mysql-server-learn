@@ -62,6 +62,7 @@
 #include "sql/mysqld.h"
 #include "sql/log.h"
 #include "sql/current_thd.h"
+#include "sql/binlog_preserve_prepared.h"
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_carrier_file.h"
 #include "sql/preserve_trx_promotion.h"
@@ -210,11 +211,20 @@ struct Receiver_strict_record_lock_facts {
   lock_preserve_record_lock_metadata_facts_t facts;
   uint64_t plan_capacity_bytes{0};
 };
+struct Receiver_strict_binlog_facts {
+  std::string handle_digest;
+  uint64_t cache_length{0};
+  uint64_t memory_bytes{0};
+  bool file_backed{false};
+};
 using Receiver_strict_token_key =
     std::tuple<std::string, std::string, uint64_t>;
 static std::mutex g_receiver_strict_record_lock_facts_mutex;
 static std::map<Receiver_strict_token_key, Receiver_strict_record_lock_facts>
     g_receiver_strict_record_lock_facts;
+static std::mutex g_receiver_strict_binlog_facts_mutex;
+static std::map<Receiver_strict_token_key, Receiver_strict_binlog_facts>
+    g_receiver_strict_binlog_facts;
 
 static void erase_receiver_strict_record_lock_state(
     const std::string &root_dir, const std::string &epoch_id, uint64_t token) {
@@ -233,6 +243,9 @@ static void erase_receiver_strict_record_lock_state(
   std::lock_guard<std::mutex> guard(
       g_receiver_strict_record_lock_facts_mutex);
   g_receiver_strict_record_lock_facts.erase({root_dir, epoch_id, token});
+  std::lock_guard<std::mutex> binlog_guard(
+      g_receiver_strict_binlog_facts_mutex);
+  g_receiver_strict_binlog_facts.erase({root_dir, epoch_id, token});
 }
 
 bool receiver_record_lock_proof_gate_ready(
@@ -2663,65 +2676,59 @@ bool build_receiver_record_lock_prepared(
                                            facts);
 }
 
-bool prepare_strict_semantic_bundle_for_receiver(
+class Receiver_binlog_staging_payload_reader final
+    : public Mysql_binlog_preserve_payload_reader {
+ public:
+  Receiver_binlog_staging_payload_reader(const std::string &path,
+                                          uint64_t length)
+      : m_remaining(length), m_file(my_open(path.c_str(), O_RDONLY, MYF(0))) {}
+  ~Receiver_binlog_staging_payload_reader() override {
+    if (m_file >= 0) (void)my_close(m_file, MYF(0));
+  }
+
+  bool opened() const { return m_file >= 0; }
+
+  Mysql_binlog_preserve_payload_read_status read(
+      unsigned char *buffer, size_t capacity, size_t *bytes_read) override {
+    if (buffer == nullptr || bytes_read == nullptr || capacity == 0 ||
+        m_file < 0) {
+      return Mysql_binlog_preserve_payload_read_status::ERROR;
+    }
+    *bytes_read = 0;
+    if (m_remaining == 0)
+      return Mysql_binlog_preserve_payload_read_status::END;
+    const size_t request = static_cast<size_t>(
+        std::min<uint64_t>(m_remaining, static_cast<uint64_t>(capacity)));
+    const size_t read_bytes = my_read(m_file, buffer, request, MYF(0));
+    if (read_bytes == MY_FILE_ERROR || read_bytes == 0 ||
+        read_bytes > request) {
+      return Mysql_binlog_preserve_payload_read_status::ERROR;
+    }
+    m_remaining -= read_bytes;
+    *bytes_read = read_bytes;
+    return Mysql_binlog_preserve_payload_read_status::DATA;
+  }
+
+ private:
+  uint64_t m_remaining{0};
+  File m_file{-1};
+};
+
+bool prepare_strict_bundle_for_receiver(
     const std::string &root_dir,
     const Preserve_trx_transfer_manifest &manifest,
     const Preserved_trx_bundle &bundle) {
-  if (find_object(manifest, kPreservedTrxBlobRecordLocks) != nullptr ||
+  const bool has_record_locks =
+      find_object(manifest, kPreservedTrxBlobRecordLocks) != nullptr;
+  const auto *binlog_object =
+      find_object(manifest, kPreservedTrxBlobBinlogCache);
+  const bool has_binlog_cache =
       bundle.metadata.binlog_state ==
-          Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE) {
-    return false;
-  }
-
-  Preserve_trx_prepared_token_key key;
-  if (!strict_prepared_key_for_receiver(root_dir, manifest,
-                                        bundle.metadata.token, &key)) {
-    return false;
-  }
-  std::string encoded_manifest;
-  if (preserve_trx_transfer_encode_manifest(manifest, &encoded_manifest) !=
-      Preserve_trx_transfer_status::OK) {
-    return false;
-  }
-  const std::string object_set_digest =
-      digest_hex(sha256_digest(encoded_manifest));
-
-  auto &registry = preserved_trx_strict_prepared_token_registry();
-  Preserve_trx_prepare_lease prepare;
-  if (registry.begin_prepare(key, key.generation, &prepare) !=
-      Preserve_trx_prepared_status::OK) {
-    return false;
-  }
-  Preserve_trx_prepared_token_resources resources;
-  if (preserved_trx_acquire_prepared_token_resources(key, 0, 0, &resources) !=
-          Preserve_trx_prepared_status::OK ||
-      resources.install_semantic_bundle(
-          std::make_unique<Preserved_trx_bundle>(bundle)) !=
-          Preserve_trx_prepared_status::OK) {
-    return false;
-  }
-  const auto status = registry.publish_prewarmed(
-      &prepare, object_set_digest, std::move(resources));
-  return status == Preserve_trx_prepared_status::OK ||
-         status == Preserve_trx_prepared_status::IDEMPOTENT;
-}
-
-bool prepare_strict_record_lock_bundle_for_receiver(
-    const std::string &root_dir,
-    const Preserve_trx_transfer_manifest &manifest,
-    const Preserved_trx_bundle &bundle) {
-  if (find_object(manifest, kPreservedTrxBlobRecordLocks) == nullptr ||
-      bundle.metadata.binlog_state ==
-          Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE) {
-    return false;
-  }
+      Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE;
+  if (has_binlog_cache != (binlog_object != nullptr)) return false;
 
   Receiver_record_lock_prepared prepared;
-  if (!take_receiver_record_lock_prepared(root_dir, manifest, &prepared) ||
-      prepared.plan == nullptr || !prepared.plan->ready()) {
-    return false;
-  }
-  const uint64_t plan_capacity_bytes = prepared.plan->capacity_bytes();
+  uint64_t plan_capacity_bytes = 0;
 
   Preserve_trx_prepared_token_key key;
   if (!strict_prepared_key_for_receiver(root_dir, manifest,
@@ -2736,6 +2743,56 @@ bool prepare_strict_record_lock_bundle_for_receiver(
   const std::string object_set_digest =
       digest_hex(sha256_digest(encoded_manifest));
 
+  Mysql_binlog_preserve_cache_facts binlog_facts;
+  std::unique_ptr<Receiver_binlog_staging_payload_reader> binlog_reader;
+  uint64_t native_binlog_bytes = 0;
+  uint64_t native_binlog_fd_count = 0;
+  uint64_t native_binlog_tmpdir_bytes = 0;
+  if (has_binlog_cache) {
+    Preserved_trx_external_blob_descriptor descriptor;
+    descriptor.name = binlog_object->object_id;
+    descriptor.size = binlog_object->total_size;
+    descriptor.digest = binlog_object->digest;
+    Mysql_binlog_preserve_token_identity identity;
+    identity.source_uuid = key.source_uuid;
+    identity.epoch_id = key.epoch_id;
+    identity.token = key.token;
+    identity.target_boot_incarnation = key.target_boot_incarnation;
+    identity.generation = key.generation;
+    const uint64_t binlog_incarnation =
+        std::max<uint64_t>(1, static_cast<uint64_t>(server_start_time));
+    if (!preserved_trx_build_native_binlog_cache_facts(
+            bundle.metadata, identity, descriptor, binlog_incarnation,
+            key.generation, &binlog_facts)) {
+      return false;
+    }
+    native_binlog_bytes =
+        mysql_binlog_preserve_native_memory_bytes_required(binlog_facts);
+    native_binlog_fd_count =
+        mysql_binlog_preserve_native_fd_count_required(binlog_facts);
+    native_binlog_tmpdir_bytes =
+        mysql_binlog_preserve_native_tmpdir_bytes_required(binlog_facts);
+    if (native_binlog_bytes == 0) return false;
+    binlog_reader = std::make_unique<Receiver_binlog_staging_payload_reader>(
+        transfer_object_path(root_dir, manifest, *binlog_object),
+        binlog_object->total_size);
+    if (!binlog_reader->opened()) return false;
+  }
+
+  if (has_record_locks &&
+      (!take_receiver_record_lock_prepared(root_dir, manifest, &prepared) ||
+       prepared.plan == nullptr || !prepared.plan->ready())) {
+    return false;
+  }
+  plan_capacity_bytes =
+      prepared.plan == nullptr ? 0 : prepared.plan->capacity_bytes();
+  auto restore_unconsumed_plan = create_scope_guard([&] {
+    if (prepared.plan != nullptr) {
+      (void)put_receiver_record_lock_prepared(
+          root_dir, manifest, std::move(prepared.plan), prepared.facts);
+    }
+  });
+
   auto &registry = preserved_trx_strict_prepared_token_registry();
   Preserve_trx_prepare_lease prepare;
   if (registry.begin_prepare(key, key.generation, &prepare) !=
@@ -2743,14 +2800,22 @@ bool prepare_strict_record_lock_bundle_for_receiver(
     return false;
   }
   Preserve_trx_prepared_token_resources resources;
+  auto semantic_bundle = std::make_unique<Preserved_trx_bundle>(bundle);
+  semantic_bundle->metadata.binlog_cache_payload.clear();
+  semantic_bundle->external_blobs.clear();
   if (preserved_trx_acquire_prepared_token_resources(
-          key, plan_capacity_bytes, 0, &resources) !=
+          key, plan_capacity_bytes, native_binlog_bytes,
+          native_binlog_fd_count, native_binlog_tmpdir_bytes, &resources) !=
           Preserve_trx_prepared_status::OK ||
-      resources.install_record_lock_plan(std::move(prepared.plan)) !=
+      (binlog_reader != nullptr &&
+       resources.prepare_native_binlog_handle_for_receiver(
+           binlog_facts, binlog_reader.get()) !=
+           Mysql_binlog_preserve_cache_status::OK) ||
+      resources.install_semantic_bundle(std::move(semantic_bundle)) !=
           Preserve_trx_prepared_status::OK ||
-      resources.install_semantic_bundle(
-          std::make_unique<Preserved_trx_bundle>(bundle)) !=
-          Preserve_trx_prepared_status::OK) {
+      (prepared.plan != nullptr &&
+       resources.install_record_lock_plan(std::move(prepared.plan)) !=
+           Preserve_trx_prepared_status::OK)) {
     return false;
   }
   const auto status = registry.publish_prewarmed(
@@ -2760,12 +2825,25 @@ bool prepare_strict_record_lock_bundle_for_receiver(
     return false;
   }
 
-  Receiver_strict_record_lock_facts pending;
-  pending.facts = prepared.facts;
-  pending.plan_capacity_bytes = plan_capacity_bytes;
-  std::lock_guard<std::mutex> guard(g_receiver_strict_record_lock_facts_mutex);
-  g_receiver_strict_record_lock_facts[{root_dir, manifest.epoch_id,
-                                       manifest.token}] = std::move(pending);
+  if (has_record_locks) {
+    Receiver_strict_record_lock_facts pending;
+    pending.facts = prepared.facts;
+    pending.plan_capacity_bytes = plan_capacity_bytes;
+    std::lock_guard<std::mutex> guard(
+        g_receiver_strict_record_lock_facts_mutex);
+    g_receiver_strict_record_lock_facts[{root_dir, manifest.epoch_id,
+                                         manifest.token}] = std::move(pending);
+  }
+  if (has_binlog_cache) {
+    Receiver_strict_binlog_facts pending;
+    pending.handle_digest = binlog_facts.canonical_digest;
+    pending.cache_length = binlog_facts.cache_length;
+    pending.memory_bytes = native_binlog_bytes;
+    pending.file_backed = native_binlog_tmpdir_bytes != 0;
+    std::lock_guard<std::mutex> guard(g_receiver_strict_binlog_facts_mutex);
+    g_receiver_strict_binlog_facts[{root_dir, manifest.epoch_id,
+                                    manifest.token}] = std::move(pending);
+  }
   return true;
 }
 
@@ -2791,9 +2869,7 @@ void bind_strict_prepared_tokens_from_epoch_fact(
                          });
     };
     const bool has_record_locks = has_object(kPreservedTrxBlobRecordLocks);
-    if (has_object(kPreservedTrxBlobBinlogCache)) {
-      continue;
-    }
+    const bool has_binlog_cache = has_object(kPreservedTrxBlobBinlogCache);
 
     Receiver_strict_record_lock_facts record_lock_facts;
     if (has_record_locks) {
@@ -2803,6 +2879,15 @@ void bind_strict_prepared_tokens_from_epoch_fact(
           {root_dir, fact.epoch_id, token.token});
       if (found == g_receiver_strict_record_lock_facts.end()) continue;
       record_lock_facts = found->second;
+    }
+    Receiver_strict_binlog_facts binlog_facts;
+    if (has_binlog_cache) {
+      std::lock_guard<std::mutex> guard(
+          g_receiver_strict_binlog_facts_mutex);
+      const auto found = g_receiver_strict_binlog_facts.find(
+          {root_dir, fact.epoch_id, token.token});
+      if (found == g_receiver_strict_binlog_facts.end()) continue;
+      binlog_facts = found->second;
     }
 
     Preserve_trx_transfer_manifest manifest;
@@ -2848,6 +2933,14 @@ void bind_strict_prepared_tokens_from_epoch_fact(
       facts.predicate_lock_present =
           record_lock_facts.facts.predicate_lock_present;
     }
+    if (has_binlog_cache) {
+      facts.native_binlog_capacity_bytes = binlog_facts.memory_bytes;
+      facts.binlog_cache_length = binlog_facts.cache_length;
+      facts.binlog_cache_memory_bytes = binlog_facts.memory_bytes;
+      facts.binlog_cache_present = true;
+      facts.binlog_cache_file_backed = binlog_facts.file_backed;
+      facts.binlog_handle_digest = binlog_facts.handle_digest;
+    }
     facts.semantic_validated = true;
     facts.lock_plan_ready = true;
     facts.binlog_handle_ready = true;
@@ -2878,7 +2971,16 @@ void bind_strict_prepared_tokens_from_epoch_fact(
             facts.record_lock_bitmap_entries &&
         existing.facts.record_lock_bits == facts.record_lock_bits &&
         existing.facts.lock_plan_capacity_bytes ==
-            facts.lock_plan_capacity_bytes) {
+            facts.lock_plan_capacity_bytes &&
+        existing.facts.native_binlog_capacity_bytes ==
+            facts.native_binlog_capacity_bytes &&
+        existing.facts.binlog_cache_length == facts.binlog_cache_length &&
+        existing.facts.binlog_cache_memory_bytes ==
+            facts.binlog_cache_memory_bytes &&
+        existing.facts.binlog_cache_present == facts.binlog_cache_present &&
+        existing.facts.binlog_cache_file_backed ==
+            facts.binlog_cache_file_backed &&
+        existing.facts.binlog_handle_digest == facts.binlog_handle_digest) {
       continue;
     }
 
@@ -2896,6 +2998,14 @@ void bind_strict_prepared_tokens_from_epoch_fact(
       std::lock_guard<std::mutex> guard(
           g_receiver_strict_record_lock_facts_mutex);
       g_receiver_strict_record_lock_facts.erase(
+          {root_dir, fact.epoch_id, token.token});
+    }
+    if (has_binlog_cache &&
+        (ready_status == Preserve_trx_prepared_status::OK ||
+         ready_status == Preserve_trx_prepared_status::IDEMPOTENT)) {
+      std::lock_guard<std::mutex> guard(
+          g_receiver_strict_binlog_facts_mutex);
+      g_receiver_strict_binlog_facts.erase(
           {root_dir, fact.epoch_id, token.token});
     }
   }
@@ -7324,14 +7434,8 @@ Preserve_trx_promotion_adopt_status run_receiver_staged_token_prewarm_job(
   note_receiver_seal_prewarm_status(prewarm_status);
   note_receiver_seal_prewarm_token_status(manifest.epoch_id, manifest.token,
                                           prewarm_status);
-  bool strict_prepared = false;
-  if (has_record_lock_object) {
-    strict_prepared = prepare_strict_record_lock_bundle_for_receiver(
-        root_dir, manifest, staged_bundle);
-  } else if (prewarm_status == Preserve_trx_promotion_adopt_status::OK) {
-    strict_prepared = prepare_strict_semantic_bundle_for_receiver(
-        root_dir, manifest, staged_bundle);
-  }
+  const bool strict_prepared =
+      prepare_strict_bundle_for_receiver(root_dir, manifest, staged_bundle);
   if (strict_prepared) {
     bind_strict_prepared_tokens_from_committed_epoch(root_dir,
                                                      manifest.epoch_id);
@@ -7821,6 +7925,10 @@ void preserve_trx_transfer_shutdown_receiver_prewarm_workers() {
     std::lock_guard<std::mutex> guard(
         g_receiver_strict_record_lock_facts_mutex);
     g_receiver_strict_record_lock_facts.clear();
+  }
+  {
+    std::lock_guard<std::mutex> guard(g_receiver_strict_binlog_facts_mutex);
+    g_receiver_strict_binlog_facts.clear();
   }
 }
 

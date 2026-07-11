@@ -1005,6 +1005,29 @@ Preserve_trx_prepared_token_resources::prepare_native_binlog_handle(
   return status;
 }
 
+Mysql_binlog_preserve_cache_status
+Preserve_trx_prepared_token_resources::prepare_native_binlog_handle_for_receiver(
+    const Mysql_binlog_preserve_cache_facts &facts,
+    Mysql_binlog_preserve_payload_reader *reader) {
+  if (m_impl == nullptr || !m_impl->acquired || reader == nullptr ||
+      m_impl->key.source_uuid != facts.identity.source_uuid ||
+      m_impl->key.epoch_id != facts.identity.epoch_id ||
+      m_impl->key.token != facts.identity.token ||
+      m_impl->key.target_boot_incarnation !=
+          facts.identity.target_boot_incarnation ||
+      m_impl->key.generation != facts.identity.generation ||
+      facts.binlog_incarnation == 0 || facts.key_generation == 0) {
+    return Mysql_binlog_preserve_cache_status::CAPABILITY_REJECTED;
+  }
+  Preserve_trx_internal_operation_capability capability;
+  capability.m_operation =
+      Preserve_trx_internal_operation::PREPARE_BINLOG_CACHE;
+  capability.m_identity = facts.identity;
+  capability.m_binlog_incarnation = facts.binlog_incarnation;
+  capability.m_key_generation = facts.key_generation;
+  return prepare_native_binlog_handle(capability, facts, reader);
+}
+
 Preserve_trx_prepared_status
 preserved_trx_acquire_prepared_token_resources(
     const Preserve_trx_prepared_token_key &key, uint64_t lock_plan_bytes,
