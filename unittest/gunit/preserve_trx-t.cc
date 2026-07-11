@@ -163,6 +163,11 @@ TEST(PreservedTrxPhysicalFence, ExactLsnAndCompleteDigestAreRequired) {
   proof.target_frozen_lsn = proof.source_fence_lsn;
   proof.page_layout_digest.clear();
   EXPECT_FALSE(preserved_trx_physical_fence_proof_is_valid(proof));
+  proof = make_test_physical_fence_proof(
+      Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY);
+  proof.consistency_mode =
+      static_cast<Preserve_trx_physical_consistency_mode>(255);
+  EXPECT_FALSE(preserved_trx_physical_fence_proof_is_valid(proof));
 }
 
 TEST(PreservedTrxPhysicalFence, TestProviderCannotReachProductionSlot) {
@@ -3295,6 +3300,68 @@ TEST(PreservedTrxPromotion, IntentEpochMarkerRejectsInvalidStatePairs) {
                            "tainted state must carry tainted cleanup"});
   EXPECT_FALSE(preserved_trx_encode_promotion_intent_epoch_marker(marker,
                                                                   &encoded));
+}
+
+TEST(PreservedTrxPromotion, StrictIntentV2RoundTripsFenceAndGeneration) {
+  Preserve_trx_strict_promotion_intent_epoch marker;
+  marker.epoch_id = "strict-epoch";
+  marker.physical_fence = make_test_physical_fence_proof(
+      Preserve_trx_physical_consistency_mode::PRODUCTION_REDO_APPLY_FENCE);
+  marker.generated_at_us = 7788;
+  marker.tokens.push_back(
+      {"token-2", 2,
+       Preserve_trx_strict_promotion_intent_state::ADOPTED_LOCKED});
+  marker.tokens.push_back(
+      {"token-1", 1,
+       Preserve_trx_strict_promotion_intent_state::ADOPTING});
+
+  std::string encoded;
+  ASSERT_TRUE(preserved_trx_encode_strict_promotion_intent_v2(marker,
+                                                              &encoded));
+  Preserve_trx_strict_promotion_intent_epoch decoded;
+  ASSERT_TRUE(preserved_trx_decode_strict_promotion_intent_v2(encoded,
+                                                              &decoded));
+  EXPECT_EQ(marker.epoch_id, decoded.epoch_id);
+  EXPECT_EQ(marker.physical_fence.source_lineage_uuid,
+            decoded.physical_fence.source_lineage_uuid);
+  EXPECT_EQ(marker.physical_fence.target_server_uuid,
+            decoded.physical_fence.target_server_uuid);
+  EXPECT_EQ(marker.physical_fence.target_boot_incarnation,
+            decoded.physical_fence.target_boot_incarnation);
+  EXPECT_EQ(marker.physical_fence.provider_generation,
+            decoded.physical_fence.provider_generation);
+  EXPECT_EQ(marker.physical_fence.source_fence_lsn,
+            decoded.physical_fence.source_fence_lsn);
+  EXPECT_EQ(marker.generated_at_us, decoded.generated_at_us);
+  ASSERT_EQ(2U, decoded.tokens.size());
+  EXPECT_EQ("token-1", decoded.tokens[0].token);
+  EXPECT_EQ(1U, decoded.tokens[0].generation);
+  EXPECT_EQ(Preserve_trx_strict_promotion_intent_state::ADOPTING,
+            decoded.tokens[0].state);
+  EXPECT_EQ("token-2", decoded.tokens[1].token);
+  EXPECT_EQ(Preserve_trx_strict_promotion_intent_state::ADOPTED_LOCKED,
+            decoded.tokens[1].state);
+
+  encoded[20] ^= 1;
+  EXPECT_FALSE(preserved_trx_decode_strict_promotion_intent_v2(encoded,
+                                                               &decoded));
+}
+
+TEST(PreservedTrxPromotion, StrictIntentV2CannotBeDecodedAsLegacyV1) {
+  Preserve_trx_strict_promotion_intent_epoch marker;
+  marker.epoch_id = "strict-epoch";
+  marker.physical_fence = make_test_physical_fence_proof(
+      Preserve_trx_physical_consistency_mode::PRODUCTION_REDO_APPLY_FENCE);
+  marker.generated_at_us = 1;
+  marker.tokens.push_back(
+      {"token-1", 1,
+       Preserve_trx_strict_promotion_intent_state::CLEANUP_TAINTED});
+  std::string encoded;
+  ASSERT_TRUE(preserved_trx_encode_strict_promotion_intent_v2(marker,
+                                                              &encoded));
+  Preserve_trx_promotion_intent_epoch_marker legacy;
+  EXPECT_FALSE(
+      preserved_trx_decode_promotion_intent_epoch_marker(encoded, &legacy));
 }
 
 TEST(PreservedTrxPromotion, RejectsInvalidTokenZero) {

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "storage/innobase/include/lock0preserve_plan.h"
 
@@ -121,6 +122,35 @@ preserved_trx_acquire_physical_fence_lease_for_unit_test(
 
 bool preserved_trx_physical_fence_proof_is_valid(
     const Preserve_trx_physical_fence_proof &proof);
+
+enum class Preserve_trx_strict_promotion_intent_state : uint8_t {
+  ADOPTING = 0,
+  ADOPTED_LOCKED,
+  ABANDONED_ROLLED_BACK,
+  ABANDONED_NOT_FOUND_PROVEN,
+  CLEANUP_TAINTED
+};
+
+struct Preserve_trx_strict_promotion_intent_token {
+  std::string token;
+  uint64_t generation{0};
+  Preserve_trx_strict_promotion_intent_state state{
+      Preserve_trx_strict_promotion_intent_state::ADOPTING};
+};
+
+struct Preserve_trx_strict_promotion_intent_epoch {
+  std::string epoch_id;
+  Preserve_trx_physical_fence_proof physical_fence;
+  uint64_t generated_at_us{0};
+  std::vector<Preserve_trx_strict_promotion_intent_token> tokens;
+};
+
+bool preserved_trx_encode_strict_promotion_intent_v2(
+    const Preserve_trx_strict_promotion_intent_epoch &marker,
+    std::string *encoded);
+bool preserved_trx_decode_strict_promotion_intent_v2(
+    const std::string &encoded,
+    Preserve_trx_strict_promotion_intent_epoch *marker);
 
 enum class Preserve_trx_prepared_token_state : uint8_t {
   NOT_FOUND = 0,

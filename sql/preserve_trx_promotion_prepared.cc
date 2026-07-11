@@ -86,6 +86,14 @@ struct Preserve_trx_prepared_registry_state {
 
 namespace {
 
+constexpr char kStrictPromotionIntentV2Magic[] =
+    "PTRX_STRICT_PROMOTION_INTENT_EPOCH_V2";
+constexpr size_t kStrictPromotionIntentDigestHexLength =
+    SHA256_DIGEST_LENGTH * 2;
+constexpr size_t kStrictPromotionIntentMaxBytes = 64U * 1024U * 1024U;
+constexpr uint32_t kStrictPromotionIntentMaxTokens = 1000000;
+constexpr uint32_t kStrictPromotionIntentMaxStringBytes = 4096;
+
 constexpr std::array<uint64_t, 20> kResumeCoreHistogramUpperBoundsUs{{
     10,
     25,
@@ -155,6 +163,19 @@ bool provider_ops_are_complete(
     const Preserve_trx_physical_fence_provider_ops &ops) {
   return ops.acquire != nullptr && ops.revalidate != nullptr &&
          ops.release != nullptr;
+}
+
+bool physical_consistency_mode_is_valid(
+    Preserve_trx_physical_consistency_mode mode) {
+  switch (mode) {
+    case Preserve_trx_physical_consistency_mode::TEST_SAME_INSTANCE_ATTACH_ONLY:
+    case Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY:
+    case Preserve_trx_physical_consistency_mode::PRODUCTION_REDO_APPLY_FENCE:
+      return true;
+    case Preserve_trx_physical_consistency_mode::NONE:
+      return false;
+  }
+  return false;
 }
 
 bool digest_is_sha256_hex(const std::string &digest) {
@@ -267,6 +288,82 @@ bool append_canonical_string(std::string *encoded, const std::string &value) {
 
 void append_canonical_bool(std::string *encoded, bool value) {
   encoded->push_back(value ? '\x01' : '\x00');
+}
+
+bool read_canonical_u8(const std::string &encoded, size_t *offset,
+                       uint8_t *value) {
+  if (offset == nullptr || value == nullptr || *offset >= encoded.size()) {
+    return false;
+  }
+  *value = static_cast<uint8_t>(encoded[*offset]);
+  ++*offset;
+  return true;
+}
+
+bool read_canonical_u32(const std::string &encoded, size_t *offset,
+                        uint32_t *value) {
+  if (offset == nullptr || value == nullptr ||
+      encoded.size() - std::min(*offset, encoded.size()) < sizeof(uint32_t)) {
+    return false;
+  }
+  uint32_t decoded = 0;
+  for (size_t i = 0; i < sizeof(uint32_t); ++i) {
+    decoded = (decoded << 8) |
+              static_cast<unsigned char>(encoded[*offset + i]);
+  }
+  *offset += sizeof(uint32_t);
+  *value = decoded;
+  return true;
+}
+
+bool read_canonical_u64(const std::string &encoded, size_t *offset,
+                        uint64_t *value) {
+  if (offset == nullptr || value == nullptr ||
+      encoded.size() - std::min(*offset, encoded.size()) < sizeof(uint64_t)) {
+    return false;
+  }
+  uint64_t decoded = 0;
+  for (size_t i = 0; i < sizeof(uint64_t); ++i) {
+    decoded = (decoded << 8) |
+              static_cast<unsigned char>(encoded[*offset + i]);
+  }
+  *offset += sizeof(uint64_t);
+  *value = decoded;
+  return true;
+}
+
+bool read_canonical_string(const std::string &encoded, size_t *offset,
+                           std::string *value) {
+  uint32_t length = 0;
+  if (value == nullptr || !read_canonical_u32(encoded, offset, &length) ||
+      length == 0 || length > kStrictPromotionIntentMaxStringBytes ||
+      encoded.size() - std::min(*offset, encoded.size()) < length) {
+    return false;
+  }
+  value->assign(encoded.data() + *offset, length);
+  *offset += length;
+  return true;
+}
+
+bool strict_intent_state_is_valid(
+    Preserve_trx_strict_promotion_intent_state state) {
+  switch (state) {
+    case Preserve_trx_strict_promotion_intent_state::ADOPTING:
+    case Preserve_trx_strict_promotion_intent_state::ADOPTED_LOCKED:
+    case Preserve_trx_strict_promotion_intent_state::ABANDONED_ROLLED_BACK:
+    case Preserve_trx_strict_promotion_intent_state::
+        ABANDONED_NOT_FOUND_PROVEN:
+    case Preserve_trx_strict_promotion_intent_state::CLEANUP_TAINTED:
+      return true;
+  }
+  return false;
+}
+
+bool strict_intent_token_is_valid(
+    const Preserve_trx_strict_promotion_intent_token &token) {
+  return !token.token.empty() &&
+         token.token.size() <= kStrictPromotionIntentMaxStringBytes &&
+         token.generation != 0 && strict_intent_state_is_valid(token.state);
 }
 
 std::string sha256_hex_string(const std::string &payload) {
@@ -491,7 +588,7 @@ preserved_trx_acquire_physical_fence_lease_for_unit_test(
 
 bool preserved_trx_physical_fence_proof_is_valid(
     const Preserve_trx_physical_fence_proof &proof) {
-  return proof.consistency_mode != Preserve_trx_physical_consistency_mode::NONE &&
+  return physical_consistency_mode_is_valid(proof.consistency_mode) &&
          !proof.source_lineage_uuid.empty() &&
          !proof.target_server_uuid.empty() &&
          !proof.target_boot_incarnation.empty() &&
@@ -502,6 +599,155 @@ bool preserved_trx_physical_fence_proof_is_valid(
          digest_is_sha256_hex(proof.page_layout_digest) &&
          digest_is_sha256_hex(proof.dictionary_generation_digest) &&
          proof.apply_frozen;
+}
+
+bool preserved_trx_encode_strict_promotion_intent_v2(
+    const Preserve_trx_strict_promotion_intent_epoch &marker,
+    std::string *encoded) {
+  if (encoded == nullptr || marker.epoch_id.empty() ||
+      marker.epoch_id.size() > kStrictPromotionIntentMaxStringBytes ||
+      marker.generated_at_us == 0 || marker.tokens.empty() ||
+      marker.tokens.size() > kStrictPromotionIntentMaxTokens ||
+      !preserved_trx_physical_fence_proof_is_valid(marker.physical_fence)) {
+    return false;
+  }
+  std::vector<Preserve_trx_strict_promotion_intent_token> tokens =
+      marker.tokens;
+  std::sort(tokens.begin(), tokens.end(),
+            [](const Preserve_trx_strict_promotion_intent_token &left,
+               const Preserve_trx_strict_promotion_intent_token &right) {
+              return left.token < right.token;
+            });
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    if (!strict_intent_token_is_valid(tokens[i]) ||
+        (i != 0 && tokens[i - 1].token == tokens[i].token)) {
+      return false;
+    }
+  }
+
+  std::string body(kStrictPromotionIntentV2Magic,
+                   sizeof(kStrictPromotionIntentV2Magic) - 1);
+  body.push_back(static_cast<char>(marker.physical_fence.consistency_mode));
+  if (!append_canonical_string(&body, marker.epoch_id) ||
+      !append_canonical_string(&body,
+                               marker.physical_fence.source_lineage_uuid) ||
+      !append_canonical_string(&body,
+                               marker.physical_fence.target_server_uuid) ||
+      !append_canonical_string(
+          &body, marker.physical_fence.target_boot_incarnation)) {
+    return false;
+  }
+  append_canonical_u64(&body, marker.physical_fence.provider_generation);
+  append_canonical_u64(&body, marker.physical_fence.source_fence_lsn);
+  append_canonical_u64(&body, marker.physical_fence.target_frozen_lsn);
+  if (!append_canonical_string(&body,
+                               marker.physical_fence.epoch_fact_digest) ||
+      !append_canonical_string(
+          &body, marker.physical_fence.final_lock_generation_digest) ||
+      !append_canonical_string(&body,
+                               marker.physical_fence.page_layout_digest) ||
+      !append_canonical_string(
+          &body, marker.physical_fence.dictionary_generation_digest)) {
+    return false;
+  }
+  append_canonical_bool(&body, marker.physical_fence.apply_frozen);
+  append_canonical_u64(&body, marker.generated_at_us);
+  append_canonical_u32(&body, static_cast<uint32_t>(tokens.size()));
+  for (const auto &token : tokens) {
+    if (!append_canonical_string(&body, token.token)) return false;
+    append_canonical_u64(&body, token.generation);
+    body.push_back(static_cast<char>(token.state));
+  }
+  if (body.size() >
+      kStrictPromotionIntentMaxBytes - kStrictPromotionIntentDigestHexLength) {
+    return false;
+  }
+  *encoded = body;
+  encoded->append(sha256_hex_string(body));
+  return true;
+}
+
+bool preserved_trx_decode_strict_promotion_intent_v2(
+    const std::string &encoded,
+    Preserve_trx_strict_promotion_intent_epoch *marker) {
+  constexpr size_t kMagicLength = sizeof(kStrictPromotionIntentV2Magic) - 1;
+  if (marker == nullptr ||
+      encoded.size() <= kMagicLength + kStrictPromotionIntentDigestHexLength ||
+      encoded.size() > kStrictPromotionIntentMaxBytes) {
+    return false;
+  }
+  const size_t body_length =
+      encoded.size() - kStrictPromotionIntentDigestHexLength;
+  const std::string body = encoded.substr(0, body_length);
+  if (body.compare(0, kMagicLength, kStrictPromotionIntentV2Magic) != 0 ||
+      encoded.compare(body_length, kStrictPromotionIntentDigestHexLength,
+                      sha256_hex_string(body)) != 0) {
+    return false;
+  }
+
+  Preserve_trx_strict_promotion_intent_epoch parsed;
+  size_t offset = kMagicLength;
+  uint8_t mode = 0;
+  uint8_t apply_frozen = 0;
+  uint32_t token_count = 0;
+  if (!read_canonical_u8(body, &offset, &mode) ||
+      !read_canonical_string(body, &offset, &parsed.epoch_id) ||
+      !read_canonical_string(
+          body, &offset, &parsed.physical_fence.source_lineage_uuid) ||
+      !read_canonical_string(
+          body, &offset, &parsed.physical_fence.target_server_uuid) ||
+      !read_canonical_string(
+          body, &offset, &parsed.physical_fence.target_boot_incarnation) ||
+      !read_canonical_u64(
+          body, &offset, &parsed.physical_fence.provider_generation) ||
+      !read_canonical_u64(body, &offset,
+                          &parsed.physical_fence.source_fence_lsn) ||
+      !read_canonical_u64(body, &offset,
+                          &parsed.physical_fence.target_frozen_lsn) ||
+      !read_canonical_string(body, &offset,
+                             &parsed.physical_fence.epoch_fact_digest) ||
+      !read_canonical_string(
+          body, &offset,
+          &parsed.physical_fence.final_lock_generation_digest) ||
+      !read_canonical_string(body, &offset,
+                             &parsed.physical_fence.page_layout_digest) ||
+      !read_canonical_string(
+          body, &offset,
+          &parsed.physical_fence.dictionary_generation_digest) ||
+      !read_canonical_u8(body, &offset, &apply_frozen) ||
+      !read_canonical_u64(body, &offset, &parsed.generated_at_us) ||
+      !read_canonical_u32(body, &offset, &token_count) || token_count == 0 ||
+      token_count > kStrictPromotionIntentMaxTokens) {
+    return false;
+  }
+  parsed.physical_fence.consistency_mode =
+      static_cast<Preserve_trx_physical_consistency_mode>(mode);
+  if (apply_frozen > 1) return false;
+  parsed.physical_fence.apply_frozen = apply_frozen != 0;
+  parsed.tokens.reserve(token_count);
+  for (uint32_t i = 0; i < token_count; ++i) {
+    Preserve_trx_strict_promotion_intent_token token;
+    uint8_t state = 0;
+    if (!read_canonical_string(body, &offset, &token.token) ||
+        !read_canonical_u64(body, &offset, &token.generation) ||
+        !read_canonical_u8(body, &offset, &state)) {
+      return false;
+    }
+    token.state =
+        static_cast<Preserve_trx_strict_promotion_intent_state>(state);
+    if (!strict_intent_token_is_valid(token) ||
+        (!parsed.tokens.empty() &&
+         parsed.tokens.back().token >= token.token)) {
+      return false;
+    }
+    parsed.tokens.push_back(std::move(token));
+  }
+  if (offset != body.size() || parsed.generated_at_us == 0 ||
+      !preserved_trx_physical_fence_proof_is_valid(parsed.physical_fence)) {
+    return false;
+  }
+  *marker = std::move(parsed);
+  return true;
 }
 
 bool preserved_trx_finalize_token_facts(
