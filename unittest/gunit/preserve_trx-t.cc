@@ -332,6 +332,10 @@ Preserve_trx_prepared_token_resources acquire_prepared_resources(
                 key, lock_bytes, binlog_bytes, native_fd_count,
                 native_tmpdir_bytes, &resources));
   EXPECT_TRUE(resources.acquired());
+  auto bundle = std::make_unique<Preserved_trx_bundle>();
+  bundle->metadata.token = key.token;
+  EXPECT_EQ(Preserve_trx_prepared_status::OK,
+            resources.install_semantic_bundle(std::move(bundle)));
   return resources;
 }
 
@@ -462,6 +466,26 @@ TEST(PreservedTrxPreparedRegistry, PrewarmResourcesWaitForFinalFacts) {
             snapshot.state);
   EXPECT_EQ(std::string(64, 'e'),
             snapshot.facts.prewarm_object_set_digest);
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry, PrewarmRejectsMissingSemanticBundle) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepared_token_resources resources;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            preserved_trx_acquire_prepared_token_resources(
+                key, 128, 0, &resources));
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &prepare));
+  EXPECT_EQ(Preserve_trx_prepared_status::INVALID_ARGUMENT,
+            registry.publish_prewarmed(&prepare, std::string(64, 'e'),
+                                       std::move(resources)));
+  prepare = {};
   registry.purge_epoch(key.source_uuid, key.epoch_id);
   EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
   preserve_trx_resource_manager_reset_for_unit_test();

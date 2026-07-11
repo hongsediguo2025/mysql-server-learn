@@ -19,6 +19,7 @@
 #include <openssl/sha.h>
 
 #include "sql/binlog_preserve_prepared.h"
+#include "sql/preserve_trx_bundle.h"
 #include "sql/preserve_trx_resource.h"
 
 class Preserve_trx_physical_fence_lease_factory {
@@ -40,8 +41,10 @@ class Preserve_trx_prepared_token_resources::Impl {
   Preserve_memory_lease lock_plan_memory;
   Preserve_native_binlog_resource_lease native_binlog_resources;
   std::unique_ptr<lock_preserve_metadata_plan_t> record_lock_plan;
+  std::unique_ptr<Preserved_trx_bundle> semantic_bundle;
   std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle>
       native_binlog_handle;
+  Preserve_trx_prepared_token_key key;
   uint64_t lock_plan_bytes{0};
   uint64_t native_binlog_bytes{0};
   bool acquired{false};
@@ -828,6 +831,10 @@ bool Preserve_trx_prepared_token_resources::has_record_lock_plan() const {
   return m_impl != nullptr && m_impl->record_lock_plan != nullptr;
 }
 
+bool Preserve_trx_prepared_token_resources::has_semantic_bundle() const {
+  return m_impl != nullptr && m_impl->semantic_bundle != nullptr;
+}
+
 bool Preserve_trx_prepared_token_resources::has_native_binlog_handle() const {
   return m_impl != nullptr && m_impl->native_binlog_handle != nullptr;
 }
@@ -841,6 +848,18 @@ Preserve_trx_prepared_token_resources::install_record_lock_plan(
     return Preserve_trx_prepared_status::INVALID_ARGUMENT;
   }
   m_impl->record_lock_plan = std::move(plan);
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_resources::install_semantic_bundle(
+    std::unique_ptr<Preserved_trx_bundle> bundle) {
+  if (m_impl == nullptr || !m_impl->acquired || bundle == nullptr ||
+      m_impl->semantic_bundle != nullptr ||
+      bundle->metadata.token != m_impl->key.token) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  m_impl->semantic_bundle = std::move(bundle);
   return Preserve_trx_prepared_status::OK;
 }
 
@@ -904,6 +923,7 @@ preserved_trx_acquire_prepared_token_resources(
   }
   acquired.m_impl->lock_plan_bytes = lock_plan_bytes;
   acquired.m_impl->native_binlog_bytes = native_binlog_bytes;
+  acquired.m_impl->key = key;
   acquired.m_impl->acquired = true;
   *resources = std::move(acquired);
   return Preserve_trx_prepared_status::OK;
@@ -1190,7 +1210,7 @@ Preserve_trx_prepared_token_registry::publish_prewarmed(
     const std::string &prewarm_object_set_digest,
     Preserve_trx_prepared_token_resources resources) {
   if (lease == nullptr || !lease->active() || lease->m_entry == nullptr ||
-      !resources.acquired() ||
+      !resources.acquired() || !resources.has_semantic_bundle() ||
       !digest_is_sha256_hex(prewarm_object_set_digest)) {
     return Preserve_trx_prepared_status::INVALID_ARGUMENT;
   }
@@ -1652,6 +1672,7 @@ Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::snapshot(
     snapshot->facts = {};
     snapshot->state = entry->state.load(std::memory_order_acquire);
     snapshot->record_lock_plan_owned = false;
+    snapshot->semantic_bundle_owned = false;
     snapshot->native_binlog_handle_owned = false;
     return Preserve_trx_prepared_status::OK;
   }
@@ -1662,6 +1683,7 @@ Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::snapshot(
   snapshot->facts = publication->facts;
   snapshot->state = entry->state.load(std::memory_order_acquire);
   snapshot->record_lock_plan_owned = entry->resources.has_record_lock_plan();
+  snapshot->semantic_bundle_owned = entry->resources.has_semantic_bundle();
   snapshot->native_binlog_handle_owned =
       entry->resources.has_native_binlog_handle();
   return Preserve_trx_prepared_status::OK;

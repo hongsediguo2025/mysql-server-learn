@@ -20,6 +20,7 @@
 
 class Mysql_binlog_preserve_payload_reader;
 class Mysql_binlog_preserve_prepared_cache_handle;
+struct Preserved_trx_bundle;
 class Preserve_trx_internal_operation_capability;
 struct Mysql_binlog_preserve_cache_facts;
 enum class Mysql_binlog_preserve_cache_status : uint8_t;
@@ -254,9 +255,12 @@ class Preserve_trx_prepared_token_resources {
   uint64_t lock_plan_bytes() const;
   uint64_t native_binlog_bytes() const;
   bool has_record_lock_plan() const;
+  bool has_semantic_bundle() const;
   bool has_native_binlog_handle() const;
   Preserve_trx_prepared_status install_record_lock_plan(
       std::unique_ptr<lock_preserve_metadata_plan_t> plan);
+  Preserve_trx_prepared_status install_semantic_bundle(
+      std::unique_ptr<Preserved_trx_bundle> bundle);
   Mysql_binlog_preserve_cache_status prepare_native_binlog_handle(
       const Preserve_trx_internal_operation_capability &capability,
       const Mysql_binlog_preserve_cache_facts &facts,
@@ -385,6 +389,7 @@ struct Preserve_trx_prepared_token_snapshot {
   Preserve_trx_prepared_token_state state{
       Preserve_trx_prepared_token_state::NOT_FOUND};
   bool record_lock_plan_owned{false};
+  bool semantic_bundle_owned{false};
   bool native_binlog_handle_owned{false};
 };
 
