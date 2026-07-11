@@ -297,6 +297,8 @@ TEST(LockWarmcopyRecordShard, CanonicalBytesAreDeterministicAndLittleEndian) {
   append_u32(&expected, key.page_no);
   append_u32(&expected, key.lock_type_mode);
   append_u32(&expected, key.n_bits);
+  append_u64(&expected, 0);  // page_lsn
+  append_u32(&expected, 0);  // page_n_heap
   append_u32(&expected, 2);  // bitmap_len
   expected.push_back(static_cast<char>(0x02));
   expected.push_back(static_cast<char>(0x02));
