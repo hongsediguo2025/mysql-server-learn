@@ -64,6 +64,7 @@
 #include "sql/auth/sql_security_ctx.h"
 #include "sql/auto_thd.h"
 #include "sql/binlog.h"
+#include "sql/binlog_preserve_prepared.h"
 #include "sql/dd/cache/dictionary_client.h"
 #include "sql/dd/dd_schema.h"
 #include "sql/dd/string_type.h"
@@ -710,6 +711,8 @@ std::mutex g_preserved_trx_thd_pin_mutex;
 std::condition_variable g_preserved_trx_thd_pin_cond;
 std::unordered_map<THD *, uint> g_preserved_trx_thd_pin_counts;
 std::unordered_set<THD *> g_preserved_trx_thd_teardown;
+std::unordered_map<THD *, uint> g_preserved_trx_thd_kill_deferral_counts;
+std::unordered_map<THD *, int> g_preserved_trx_thd_deferred_kills;
 
 static uint64_t preserve_trx_monotonic_us() {
   using clock = std::chrono::steady_clock;
@@ -6488,6 +6491,124 @@ void preserve_trx_warmcopy_admit_current_thd_binlog_write_impl(THD *thd) {
 }
 
 }  // namespace
+
+class Preserved_trx_peer_thd_handle::Impl {
+ public:
+  THD *thd{nullptr};
+  std::unique_ptr<Preserve_trx_external_thd_pin> lifetime_pin;
+};
+
+Preserved_trx_peer_thd_handle::Preserved_trx_peer_thd_handle() = default;
+Preserved_trx_peer_thd_handle::Preserved_trx_peer_thd_handle(
+    Preserved_trx_peer_thd_handle &&) noexcept = default;
+Preserved_trx_peer_thd_handle &Preserved_trx_peer_thd_handle::operator=(
+    Preserved_trx_peer_thd_handle &&other) noexcept {
+  if (this == &other) return *this;
+  release();
+  m_impl = std::move(other.m_impl);
+  return *this;
+}
+Preserved_trx_peer_thd_handle::~Preserved_trx_peer_thd_handle() { release(); }
+
+THD *Preserved_trx_peer_thd_handle::get() const {
+  return m_impl == nullptr ? nullptr : m_impl->thd;
+}
+
+bool Preserved_trx_peer_thd_handle::valid() const { return get() != nullptr; }
+
+bool Preserved_trx_peer_thd_handle::acquire_locked_for_internal_use(THD *thd) {
+  if (thd == nullptr || m_impl != nullptr) return false;
+  auto lifetime_pin = Preserve_trx_external_thd_pin::acquire_locked(thd);
+  if (lifetime_pin == nullptr) return false;
+  {
+    std::lock_guard<std::mutex> guard(g_preserved_trx_thd_pin_mutex);
+    if (g_preserved_trx_thd_kill_deferral_counts.count(thd) != 0) {
+      return false;
+    }
+    g_preserved_trx_thd_kill_deferral_counts[thd] = 1;
+  }
+  thd->preserve_trx_batch_state = Preserve_trx_batch_thd_state::ATTACHING;
+  auto impl = std::make_unique<Impl>();
+  impl->thd = thd;
+  impl->lifetime_pin = std::move(lifetime_pin);
+  m_impl = std::move(impl);
+  return true;
+}
+
+void Preserved_trx_peer_thd_handle::release() {
+  if (m_impl == nullptr || m_impl->thd == nullptr) {
+    m_impl.reset();
+    return;
+  }
+  THD *const thd = m_impl->thd;
+  int deferred_kill = static_cast<int>(THD::NOT_KILLED);
+  bool has_deferred_kill = false;
+  mysql_mutex_lock(&thd->LOCK_thd_data);
+  if (thd->preserve_trx_batch_state ==
+      Preserve_trx_batch_thd_state::ATTACHING) {
+    thd->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
+  }
+  {
+    std::lock_guard<std::mutex> guard(g_preserved_trx_thd_pin_mutex);
+    auto count_it = g_preserved_trx_thd_kill_deferral_counts.find(thd);
+    if (count_it != g_preserved_trx_thd_kill_deferral_counts.end()) {
+      assert(count_it->second == 1);
+      g_preserved_trx_thd_kill_deferral_counts.erase(count_it);
+    }
+    auto kill_it = g_preserved_trx_thd_deferred_kills.find(thd);
+    if (kill_it != g_preserved_trx_thd_deferred_kills.end()) {
+      deferred_kill = kill_it->second;
+      has_deferred_kill = true;
+      g_preserved_trx_thd_deferred_kills.erase(kill_it);
+    }
+  }
+  if (has_deferred_kill) {
+    thd->awake(static_cast<THD::killed_state>(deferred_kill));
+  }
+  mysql_mutex_unlock(&thd->LOCK_thd_data);
+  m_impl->lifetime_pin.reset();
+  m_impl.reset();
+}
+
+bool preserved_trx_resolve_peer_thd(
+    uint64_t source_connection_id, Preserved_trx_operation_deadline deadline,
+    Preserved_trx_peer_thd_handle *target_handle) {
+  if (!preserve_trx_is_enabled() || source_connection_id == 0 ||
+      target_handle == nullptr || target_handle->valid() ||
+      (deadline.deadline_us != 0 &&
+       preserve_trx_monotonic_us() >= deadline.deadline_us)) {
+    return false;
+  }
+  Find_thd_with_id finder(static_cast<my_thread_id>(source_connection_id));
+  THD *target = Global_THD_manager::get_instance()->find_thd(&finder);
+  if (target == nullptr) return false;
+  const bool eligible =
+      target != current_thd && !target->release_resources_done() &&
+      target->killed == THD::NOT_KILLED && target->m_server_idle &&
+      target->preserve_trx_batch_state == Preserve_trx_batch_thd_state::NONE &&
+      !target->in_active_multi_stmt_transaction();
+  const bool acquired =
+      eligible && target_handle->acquire_locked_for_internal_use(target);
+  mysql_mutex_unlock(&target->LOCK_thd_data);
+  return acquired;
+}
+
+bool preserved_trx_defer_external_thd_kill(THD *thd, int killed_state) {
+  if (!preserve_trx_is_enabled() || thd == nullptr) return false;
+  std::lock_guard<std::mutex> guard(g_preserved_trx_thd_pin_mutex);
+  if (g_preserved_trx_thd_kill_deferral_counts.count(thd) == 0) return false;
+  auto rank = [](int state) {
+    if (state == static_cast<int>(THD::KILL_CONNECTION)) return 3;
+    if (state == static_cast<int>(THD::KILL_TIMEOUT)) return 2;
+    return 1;
+  };
+  auto it = g_preserved_trx_thd_deferred_kills.find(thd);
+  if (it == g_preserved_trx_thd_deferred_kills.end() ||
+      rank(killed_state) > rank(it->second)) {
+    g_preserved_trx_thd_deferred_kills[thd] = killed_state;
+  }
+  return true;
+}
 
 bool preserve_trx_magic_xid_has_snapshot(const XID &xid) {
   return preserve_trx_magic_xid_has_snapshot_impl(xid);
@@ -14950,18 +15071,448 @@ bool Sql_cmd_resume_preserved_transaction::execute(THD *thd) {
   return preserved_trx_resume_record_on_thd(thd, m_token, options);
 }
 
-bool preserved_trx_resume_adopted_for_promotion_on_thd(
-    Preserved_trx_peer_thd_handle *target_handle, const std::string &token) {
-  if (target_handle == nullptr || !target_handle->valid()) {
-    my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
-    return true;
+namespace {
+
+class Preserve_peer_thd_execution_context {
+ public:
+  explicit Preserve_peer_thd_execution_context(THD *target)
+      : m_owner(current_thd),
+        m_target(target),
+        m_old_real_id(target == nullptr ? my_thread_t{} : target->real_id),
+        m_old_thread_stack(target == nullptr ? nullptr : target->thread_stack) {
+    if (m_owner == nullptr || m_target == nullptr || m_owner == m_target) return;
+    m_owner->restore_globals();
+    m_target->thread_stack = m_owner->thread_stack;
+    m_target->store_globals();
+    m_active = true;
   }
 
-  const LEX_CSTRING resume_token{token.c_str(), token.length()};
-  const Preserved_trx_resume_options options{
-      Preserved_trx_resume_policy::PROMOTION_RESUME_ON_THD, true};
-  return preserved_trx_resume_record_on_thd(target_handle->get(), resume_token,
-                                            options);
+  Preserve_peer_thd_execution_context(
+      const Preserve_peer_thd_execution_context &) = delete;
+  Preserve_peer_thd_execution_context &operator=(
+      const Preserve_peer_thd_execution_context &) = delete;
+
+  ~Preserve_peer_thd_execution_context() {
+    if (!m_active) return;
+    m_target->restore_globals();
+    m_target->real_id = m_old_real_id;
+    m_target->thread_stack = m_old_thread_stack;
+    m_owner->store_globals();
+  }
+
+  bool active() const { return m_active; }
+
+ private:
+  THD *m_owner{nullptr};
+  THD *m_target{nullptr};
+  my_thread_t m_old_real_id{};
+  const char *m_old_thread_stack{nullptr};
+  bool m_active{false};
+};
+
+struct Preserve_strict_attach_intent_write_context {
+  Preserve_trx_strict_attach_intent_state state{
+      Preserve_trx_strict_attach_intent_state::ATTACHING};
+  uint64_t target_connection_id{0};
+};
+
+bool write_strict_attach_intent(
+    const Preserve_trx_prepared_token_key &key, void *context) {
+  auto *write_context =
+      static_cast<Preserve_strict_attach_intent_write_context *>(context);
+  if (write_context == nullptr || write_context->target_connection_id == 0) {
+    return false;
+  }
+  DBUG_EXECUTE_IF("preserve_trx_fail_write_strict_attach_intent",
+                  return false;);
+  Preserve_trx_strict_attach_intent intent;
+  intent.key = key;
+  intent.state = write_context->state;
+  intent.target_connection_id = write_context->target_connection_id;
+  intent.generated_at_us = my_micro_time();
+  std::string encoded;
+  const std::string journal_id =
+      preserved_trx_strict_attach_intent_journal_id(key);
+  if (journal_id.empty() ||
+      !preserved_trx_encode_strict_attach_intent_v1(intent, &encoded)) {
+    return false;
+  }
+  auto store = create_preserved_trx_default_store(key.preserve_dir);
+  return store->write_promotion_intent_epoch(journal_id, encoded) ==
+         Preserve_snapshot_status::OK;
+}
+
+void remove_strict_attach_intent(
+    const Preserve_trx_prepared_token_key &key) {
+  const std::string journal_id =
+      preserved_trx_strict_attach_intent_journal_id(key);
+  if (journal_id.empty()) return;
+  auto store = create_preserved_trx_default_store(key.preserve_dir);
+  (void)store->remove_promotion_intent_epoch(journal_id);
+}
+
+}  // namespace
+
+Preserved_trx_promotion_resume_status
+preserved_trx_resume_adopted_for_promotion_on_thd(
+    Preserved_trx_peer_thd_handle *target_handle,
+    const Preserve_trx_prepared_token_key &key,
+    Preserved_trx_operation_deadline deadline,
+    Preserved_trx_promotion_resume_result *result) {
+  const uint64_t started_us = preserve_trx_monotonic_us();
+  auto finish = [&](Preserved_trx_promotion_resume_status status,
+                    const std::string &reason) {
+    const uint64_t elapsed_us = preserve_trx_monotonic_us() - started_us;
+    if (result != nullptr) {
+      result->status = status;
+      result->reason = reason;
+      result->elapsed_us = elapsed_us;
+    }
+    preserved_trx_promotion_resume_core_note(
+        elapsed_us, status == Preserved_trx_promotion_resume_status::OK);
+    return status;
+  };
+  if (result == nullptr || target_handle == nullptr ||
+      !target_handle->valid() || key.preserve_dir.empty() ||
+      key.source_uuid.empty() || key.epoch_id.empty() || key.token.empty() ||
+      key.target_boot_incarnation.empty() || key.generation == 0 ||
+      deadline.deadline_us == 0) {
+    return finish(Preserved_trx_promotion_resume_status::INVALID_ARGUMENT,
+                  "invalid strict promotion resume request");
+  }
+  *result = {};
+  if (!preserve_trx_is_enabled()) {
+    return finish(Preserved_trx_promotion_resume_status::FEATURE_DISABLED,
+                  "preserve transaction support is disabled");
+  }
+  if (preserve_trx_monotonic_us() >= deadline.deadline_us) {
+    return finish(Preserved_trx_promotion_resume_status::DEADLINE_EXPIRED,
+                  "strict promotion resume deadline expired");
+  }
+  Preserve_trx_prepared_token_snapshot snapshot;
+  auto &registry = preserved_trx_strict_prepared_token_registry();
+  if (registry.snapshot(key, &snapshot) != Preserve_trx_prepared_status::OK ||
+      snapshot.state != Preserve_trx_prepared_token_state::ADOPTED_LOCKED) {
+    return finish(
+        Preserved_trx_promotion_resume_status::REGISTRY_NOT_ADOPTED,
+        "strict prepared token is not ADOPTED_LOCKED");
+  }
+  THD *const target = target_handle->get();
+  mysql_mutex_lock(&target->LOCK_thd_data);
+  const bool target_pristine =
+      target->preserve_trx_batch_state ==
+          Preserve_trx_batch_thd_state::ATTACHING &&
+      target->m_server_idle && target->killed == THD::NOT_KILLED &&
+      !target->release_resources_done();
+  mysql_mutex_unlock(&target->LOCK_thd_data);
+  if (!target_pristine || target->in_active_multi_stmt_transaction()) {
+    return finish(Preserved_trx_promotion_resume_status::TARGET_NOT_PRISTINE,
+                  "protected target THD is not pristine");
+  }
+
+  Preserved_trx_record preview;
+  if (!preserved_trx_find_record(key.token, &preview) ||
+      preview.state !=
+          Preserved_trx_lifecycle_state::ADOPTED_FOR_PROMOTION ||
+      preview.resumable || preview.trx == nullptr ||
+      preview.metadata.token != key.token) {
+    return finish(
+        Preserved_trx_promotion_resume_status::PROMOTION_RECORD_NOT_FOUND,
+        "promotion-owned transaction record is unavailable");
+  }
+  if (preserve_trx_is_unsupported_common_context(target) ||
+      !trx_preserve_thd_can_accept_preserved_trx(target) ||
+      !recoverable_binlog_state(preview.metadata.binlog_state) ||
+      !binlog_state_matches_current_mode(preview.metadata)) {
+    return finish(Preserved_trx_promotion_resume_status::TARGET_NOT_PRISTINE,
+                  "protected target THD cannot accept promoted transaction");
+  }
+  const bool metadata_has_binlog_cache =
+      preview.metadata.binlog_state ==
+      Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE;
+  if (metadata_has_binlog_cache != snapshot.facts.binlog_cache_present) {
+    return finish(Preserved_trx_promotion_resume_status::STAGING_FAILED,
+                  "native binlog facts do not match promoted metadata");
+  }
+
+  Preserve_strict_attach_intent_write_context intent_context;
+  intent_context.state = Preserve_trx_strict_attach_intent_state::ATTACHING;
+  intent_context.target_connection_id = target->thread_id();
+  if (!write_strict_attach_intent(key, &intent_context)) {
+    return finish(
+        Preserved_trx_promotion_resume_status::ATTACH_INTENT_IO_ERROR,
+        "failed to write strict ATTACHING intent");
+  }
+
+  Preserve_trx_attach_lease attach_lease;
+  if (registry.begin_attach(key, key.generation, &attach_lease) !=
+      Preserve_trx_prepared_status::OK) {
+    intent_context.state =
+        Preserve_trx_strict_attach_intent_state::ATTACH_ROLLED_BACK;
+    if (write_strict_attach_intent(key, &intent_context)) {
+      remove_strict_attach_intent(key);
+    }
+    return finish(Preserved_trx_promotion_resume_status::REGISTRY_NOT_ADOPTED,
+                  "strict prepared token attach ownership changed");
+  }
+
+  Preserved_trx_record record;
+  if (!preserved_trx_take_promotion_adopted_record(key.token, &record)) {
+    intent_context.state =
+        Preserve_trx_strict_attach_intent_state::ATTACH_ROLLED_BACK;
+    const bool terminal_written =
+        write_strict_attach_intent(key, &intent_context);
+    if (terminal_written &&
+        registry.abort_attach_after_full_unwind(&attach_lease) ==
+            Preserve_trx_prepared_status::OK) {
+      remove_strict_attach_intent(key);
+      return finish(
+          Preserved_trx_promotion_resume_status::PROMOTION_RECORD_NOT_FOUND,
+          "promotion-owned record was concurrently consumed");
+    }
+    if (attach_lease.active()) (void)registry.taint_attach(&attach_lease);
+    return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED,
+                  "failed to close attach ownership after missing record");
+  }
+
+  Preserve_peer_thd_execution_context execution_context(target);
+  if (!execution_context.active()) {
+    (void)restore_record_after_resume_failure(record,
+                                              "peer THD context switch failed");
+    intent_context.state =
+        Preserve_trx_strict_attach_intent_state::ATTACH_ROLLED_BACK;
+    const bool terminal_written =
+        write_strict_attach_intent(key, &intent_context);
+    if (terminal_written &&
+        registry.abort_attach_after_full_unwind(&attach_lease) ==
+            Preserve_trx_prepared_status::OK) {
+      remove_strict_attach_intent(key);
+      return finish(Preserved_trx_promotion_resume_status::STAGING_FAILED,
+                    "peer THD context switch failed");
+    }
+    if (attach_lease.active()) (void)registry.taint_attach(&attach_lease);
+    return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED,
+                  "peer THD context switch ownership is tainted");
+  }
+
+  Resume_thd_state_guard thd_state_guard(target);
+  bool binlog_attached = false;
+  bool mdl_cloned = false;
+  bool gtid_restored = false;
+  bool temp_materialized = false;
+  bool trx_attached = false;
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> binlog_handle;
+  Mysql_binlog_preserve_attach_journal binlog_journal;
+
+  auto pre_boundary_failure = [&](const std::string &reason) {
+    bool unwind_ok = true;
+    if (trx_attached) {
+      if (trx_preserve_detach_resumed_from_thd(record.trx, target) !=
+              DB_SUCCESS &&
+          trx_preserve_detach_resumed_from_thd_for_cleanup(record.trx,
+                                                            target) !=
+              DB_SUCCESS) {
+        unwind_ok = false;
+      }
+      trx_attached = false;
+    }
+    if (temp_materialized &&
+        preserve_trx_temp_table_rollback_materialized_for_resume(
+            target, record.metadata) != Preserve_snapshot_status::OK) {
+      unwind_ok = false;
+    }
+    temp_materialized = false;
+    rollback_restored_logged_cache_gtid_next(target, &gtid_restored);
+    if (mdl_cloned) target->mdl_context.release_transactional_locks();
+    mdl_cloned = false;
+    if (binlog_attached) {
+      if (mysql_binlog_preserve_abort_detached_cache_attach(
+              &binlog_journal, &binlog_handle) !=
+          Mysql_binlog_preserve_cache_status::OK) {
+        unwind_ok = false;
+      }
+      binlog_attached = false;
+    }
+    if (binlog_handle != nullptr &&
+        attach_lease.restore_native_binlog_handle(&binlog_handle) !=
+            Preserve_trx_prepared_status::OK) {
+      unwind_ok = false;
+    }
+    reset_thd_after_preserve_detach(target);
+    if (restore_record_after_resume_failure(record, reason)) unwind_ok = false;
+    intent_context.state = unwind_ok
+                               ? Preserve_trx_strict_attach_intent_state::
+                                     ATTACH_ROLLED_BACK
+                               : Preserve_trx_strict_attach_intent_state::
+                                     ATTACH_TAINTED;
+    if (!write_strict_attach_intent(key, &intent_context)) unwind_ok = false;
+    if (unwind_ok &&
+        registry.abort_attach_after_full_unwind(&attach_lease) ==
+            Preserve_trx_prepared_status::OK) {
+      remove_strict_attach_intent(key);
+      return finish(Preserved_trx_promotion_resume_status::STAGING_FAILED,
+                    reason);
+    }
+    if (attach_lease.active()) (void)registry.taint_attach(&attach_lease);
+    return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED,
+                  reason + "; attach unwind is tainted");
+  };
+
+  if (record.metadata.tx_isolation > ISO_SERIALIZABLE ||
+      set_tx_isolation(target,
+                       static_cast<enum_tx_isolation>(
+                           record.metadata.tx_isolation),
+                       true) ||
+      restore_preserved_session_variables(target, record.metadata)) {
+    return pre_boundary_failure("session state restore failed");
+  }
+  target->variables.sql_log_bin = record.metadata.session_sql_log_bin;
+  if (record.metadata.option_bin_log)
+    target->variables.option_bits |= OPTION_BIN_LOG;
+  else
+    target->variables.option_bits &= ~OPTION_BIN_LOG;
+  target->variables.option_bits |= OPTION_BEGIN;
+  target->server_status |= SERVER_STATUS_IN_TRANS;
+  restore_preserved_transaction_access_mode(target, record.metadata);
+  restore_last_insert_id_state(target, record.metadata);
+  restore_forced_insert_id_state(target, record.metadata);
+  if (import_user_vars_payload(target, record.metadata.user_vars_payload)) {
+    return pre_boundary_failure("user variable restore failed");
+  }
+
+  if (snapshot.facts.binlog_cache_present) {
+    Preserve_trx_internal_operation_capability capability;
+    if (attach_lease.make_native_binlog_attach_capability(&capability) !=
+            Preserve_trx_prepared_status::OK ||
+        attach_lease.take_native_binlog_handle(&binlog_handle) !=
+            Preserve_trx_prepared_status::OK ||
+        mysql_binlog_preserve_attach_detached_cache(
+            capability, target, &binlog_handle, &binlog_journal) !=
+            Mysql_binlog_preserve_cache_status::OK) {
+      return pre_boundary_failure("native binlog cache attach failed");
+    }
+    binlog_attached = true;
+  }
+
+  if (restore_detached_mdl_context(target, key.token)) {
+    return pre_boundary_failure("detached MDL clone failed");
+  }
+  mdl_cloned = true;
+  if (preserve_snapshot_allows_gtid_restore(record.metadata)) {
+    if (restore_logged_cache_gtid_next(target, record.metadata) ||
+        trx_preserve_prepare_resumed_rollback_gtid(record.trx) != DB_SUCCESS) {
+      return pre_boundary_failure("GTID ownership restore failed");
+    }
+    gtid_restored = true;
+  }
+
+  std::string temp_reason;
+  if (preserve_trx_temp_table_materialize_for_resume(
+          target, record.trx, key.preserve_dir, key.token, record.metadata,
+          &temp_reason) != Preserve_snapshot_status::OK) {
+    return pre_boundary_failure(temp_reason.empty()
+                                    ? "temporary table materialization failed"
+                                    : temp_reason);
+  }
+  temp_materialized = !record.metadata.temp_table_manifest_payload.empty();
+  if (trx_preserve_attach_to_thd(record.trx, target) != DB_SUCCESS) {
+    return pre_boundary_failure("InnoDB transaction attach failed");
+  }
+  trx_attached = true;
+  if (restore_savepoints_to_thd(target, record.trx, record.metadata)) {
+    return pre_boundary_failure("savepoint restore failed");
+  }
+  if (preserve_trx_monotonic_us() >= deadline.deadline_us) {
+    return pre_boundary_failure("deadline expired before activation");
+  }
+
+  intent_context.state = Preserve_trx_strict_attach_intent_state::ACTIVATING;
+  if (registry.begin_activation(&attach_lease, write_strict_attach_intent,
+                                &intent_context) !=
+      Preserve_trx_prepared_status::OK) {
+    return pre_boundary_failure("durable ACTIVATING intent failed");
+  }
+  result->activation_boundary_committed = true;
+  auto post_boundary_failure = [&](const std::string &reason,
+                                   bool ownership_tainted) {
+    if (!ownership_tainted && !trans_rollback(target)) {
+      intent_context.state =
+          Preserve_trx_strict_attach_intent_state::ATTACH_ROLLED_BACK;
+      if (registry.rollback_attach_after_activation(
+              &attach_lease, write_strict_attach_intent, &intent_context) ==
+          Preserve_trx_prepared_status::OK) {
+        result->rolled_back = true;
+        delete_detached_mdl_context(key.token);
+        (void)delete_preserved_snapshot_files_and_sidecars_or_log(
+            key.preserve_dir, key.token, &record.metadata);
+        return finish(Preserved_trx_promotion_resume_status::
+                          ACTIVATION_FAILED_ROLLED_BACK,
+                      reason);
+      }
+    }
+    intent_context.state =
+        Preserve_trx_strict_attach_intent_state::ATTACH_TAINTED;
+    (void)write_strict_attach_intent(key, &intent_context);
+    if (attach_lease.active()) (void)registry.taint_attach(&attach_lease);
+    thd_state_guard.dismiss();
+    return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED,
+                  reason + "; ownership retained for operator cleanup");
+  };
+
+  if (binlog_attached) {
+    const auto binlog_commit_status =
+        mysql_binlog_preserve_commit_detached_cache_attach(&binlog_journal);
+    if (binlog_commit_status != Mysql_binlog_preserve_cache_status::OK) {
+      bool ownership_tainted =
+          binlog_commit_status ==
+          Mysql_binlog_preserve_cache_status::OWNERSHIP_TAINTED;
+      if (!ownership_tainted) {
+        const auto abort_status =
+            mysql_binlog_preserve_abort_detached_cache_attach(
+                &binlog_journal, &binlog_handle);
+        if (abort_status == Mysql_binlog_preserve_cache_status::OK) {
+          binlog_attached = false;
+          binlog_handle.reset();
+        } else {
+          ownership_tainted = true;
+        }
+      }
+      return post_boundary_failure(
+          "native binlog ownership commit failed", ownership_tainted);
+    }
+  }
+  binlog_attached = false;
+  if (trx_preserve_activate_resumed(record.trx) != DB_SUCCESS) {
+    return post_boundary_failure("InnoDB undo activation failed", false);
+  }
+  intent_context.state = Preserve_trx_strict_attach_intent_state::ACTIVE;
+  if (registry.commit_attach(&attach_lease, write_strict_attach_intent,
+                             &intent_context) !=
+      Preserve_trx_prepared_status::OK) {
+    return post_boundary_failure("durable ACTIVE intent failed", false);
+  }
+
+  delete_detached_mdl_context(key.token);
+  Preserve_snapshot_remove_options remove_options;
+  if (temp_materialized) {
+    remove_options.preserve_committed_temp_sidecar_source_space_ids =
+        preserve_trx_temp_table_sidecar_source_space_ids(record.metadata);
+  }
+  const Preserve_snapshot_delete_status delete_status =
+      delete_snapshot_files_with_status(key.preserve_dir, key.token,
+                                        remove_options);
+  if (delete_status == Preserve_snapshot_delete_status::OK) {
+    remove_strict_attach_intent(key);
+  } else {
+    const std::string message =
+        redacted_preserved_trx_log_subject(key.token) +
+        " strict attach artifact cleanup remains pending";
+    LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
+  }
+  preserved_trx_promotion_prepared_note_resume_binlog_io(0, 0, 0);
+  thd_state_guard.dismiss();
+  audit_preserved_trx_event(target, key.token, "promotion-resume", "success");
+  return finish(Preserved_trx_promotion_resume_status::OK, "ok");
 }
 
 bool Sql_cmd_show_preserved_transactions::execute(THD *thd) {

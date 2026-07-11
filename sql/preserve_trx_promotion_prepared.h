@@ -153,6 +153,17 @@ bool preserved_trx_decode_strict_promotion_intent_v2(
     const std::string &encoded,
     Preserve_trx_strict_promotion_intent_epoch *marker);
 
+enum class Preserve_trx_strict_attach_intent_state : uint8_t {
+  ATTACHING = 0,
+  ACTIVATING,
+  ACTIVE,
+  ATTACH_ROLLED_BACK,
+  ATTACH_TAINTED,
+  CLEANUP_PENDING,
+  CLEANUP_ROLLED_BACK,
+  CLEANUP_TAINTED
+};
+
 enum class Preserve_trx_prepared_token_state : uint8_t {
   NOT_FOUND = 0,
   OBJECTS_RECEIVING,
@@ -188,7 +199,8 @@ enum class Preserve_trx_prepared_status : uint8_t {
   ALREADY_CLAIMED,
   STALE_GENERATION,
   DIGEST_CONFLICT,
-  RESOURCE_EXHAUSTED
+  RESOURCE_EXHAUSTED,
+  INTENT_IO_ERROR
 };
 
 enum class Preserve_trx_gate_abort_outcome : uint8_t {
@@ -205,6 +217,21 @@ struct Preserve_trx_prepared_token_key {
   std::string target_boot_incarnation;
   uint64_t generation{0};
 };
+
+struct Preserve_trx_strict_attach_intent {
+  Preserve_trx_prepared_token_key key;
+  Preserve_trx_strict_attach_intent_state state{
+      Preserve_trx_strict_attach_intent_state::ATTACHING};
+  uint64_t target_connection_id{0};
+  uint64_t generated_at_us{0};
+};
+
+bool preserved_trx_encode_strict_attach_intent_v1(
+    const Preserve_trx_strict_attach_intent &intent, std::string *encoded);
+bool preserved_trx_decode_strict_attach_intent_v1(
+    const std::string &encoded, Preserve_trx_strict_attach_intent *intent);
+std::string preserved_trx_strict_attach_intent_journal_id(
+    const Preserve_trx_prepared_token_key &key);
 
 struct Preserve_trx_final_token_facts {
   uint64_t required_apply_lsn{0};
@@ -293,6 +320,8 @@ preserved_trx_acquire_prepared_token_resources(
 
 struct Preserve_trx_prepared_registry_state;
 struct Preserve_trx_prepared_token_entry;
+using Preserve_trx_activation_intent_writer = bool (*)(
+    const Preserve_trx_prepared_token_key &, void *context);
 
 class Preserve_trx_prepare_lease {
  public:
@@ -357,6 +386,8 @@ class Preserve_trx_attach_lease {
   bool activation_started() const { return m_activation_started; }
   Preserve_trx_prepared_status take_native_binlog_handle(
       std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> *out);
+  Preserve_trx_prepared_status make_native_binlog_attach_capability(
+      Preserve_trx_internal_operation_capability *out) const;
   Preserve_trx_prepared_status restore_native_binlog_handle(
       std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> *inout);
 
@@ -434,8 +465,17 @@ class Preserve_trx_prepared_token_registry {
       const Preserve_trx_prepared_token_key &key,
       uint64_t expected_generation, Preserve_trx_attach_lease *lease);
   Preserve_trx_prepared_status begin_activation(
-      Preserve_trx_attach_lease *lease);
-  Preserve_trx_prepared_status commit_attach(Preserve_trx_attach_lease *lease);
+      Preserve_trx_attach_lease *lease,
+      Preserve_trx_activation_intent_writer intent_writer,
+      void *intent_context);
+  Preserve_trx_prepared_status commit_attach(
+      Preserve_trx_attach_lease *lease,
+      Preserve_trx_activation_intent_writer intent_writer,
+      void *intent_context);
+  Preserve_trx_prepared_status rollback_attach_after_activation(
+      Preserve_trx_attach_lease *lease,
+      Preserve_trx_activation_intent_writer intent_writer,
+      void *intent_context);
   Preserve_trx_prepared_status abort_attach_after_full_unwind(
       Preserve_trx_attach_lease *lease);
   Preserve_trx_prepared_status taint_attach(
@@ -449,6 +489,9 @@ class Preserve_trx_prepared_token_registry {
       Preserve_trx_cleanup_lease *lease, bool rollback_proven);
   Preserve_trx_prepared_status snapshot(
       const Preserve_trx_prepared_token_key &key,
+      Preserve_trx_prepared_token_snapshot *snapshot) const;
+  Preserve_trx_prepared_status find_unique_adopted(
+      const std::string &epoch_id, const std::string &token,
       Preserve_trx_prepared_token_snapshot *snapshot) const;
   void invalidate_incarnation(const std::string &current_boot_incarnation);
   size_t expire_ready_facts_pending_lease(const std::string &source_uuid,

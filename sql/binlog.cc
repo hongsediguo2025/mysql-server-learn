@@ -1612,6 +1612,21 @@ bool Mysql_binlog_preserve_prepared_cache_handle::matches(
          m_impl->file_backed == file_backed_arg;
 }
 
+bool Mysql_binlog_preserve_prepared_cache_handle::make_attach_capability(
+    Preserve_trx_internal_operation_capability *out) const {
+  if (out == nullptr || m_impl == nullptr || !m_impl->sealed ||
+      m_impl->facts.binlog_incarnation == 0 ||
+      m_impl->facts.key_generation == 0) {
+    return false;
+  }
+  *out = {};
+  out->m_operation = Preserve_trx_internal_operation::ATTACH_BINLOG_CACHE;
+  out->m_identity = m_impl->facts.identity;
+  out->m_binlog_incarnation = m_impl->facts.binlog_incarnation;
+  out->m_key_generation = m_impl->facts.key_generation;
+  return true;
+}
+
 Mysql_binlog_preserve_attach_journal::Mysql_binlog_preserve_attach_journal() =
     default;
 Mysql_binlog_preserve_attach_journal::Mysql_binlog_preserve_attach_journal(
@@ -1841,6 +1856,10 @@ Mysql_binlog_preserve_cache_status mysql_binlog_preserve_attach_detached_cache(
       &binlog_stmt_cache_use, &binlog_stmt_cache_disk_use, &binlog_cache_use,
       &binlog_cache_disk_use);
   set_preserve_binlog_cache_manager(thd, journal_impl->manager);
+  trans_register_ha(thd, true, binlog_hton, nullptr);
+  trans_register_ha(thd, false, binlog_hton, nullptr);
+  ha_data->ha_info[Transaction_ctx::SESSION].set_trx_read_write();
+  ha_data->ha_info[Transaction_ctx::STMT].set_trx_read_write();
   journal_impl->active = true;
   journal->m_impl = std::move(journal_impl);
   return Mysql_binlog_preserve_cache_status::OK;
@@ -1860,6 +1879,11 @@ mysql_binlog_preserve_abort_detached_cache_attach(
   if (binlog_hton == nullptr || thd_get_cache_mngr(impl.thd) != impl.manager)
     return Mysql_binlog_preserve_cache_status::OWNERSHIP_TAINTED;
 
+  Ha_data *const ha_data = impl.thd->get_ha_data(binlog_hton->slot);
+  ha_data->ha_info[Transaction_ctx::SESSION].reset();
+  ha_data->ha_info[Transaction_ctx::STMT].reset();
+  impl.thd->get_transaction()->reset_scope(Transaction_ctx::SESSION);
+  impl.thd->get_transaction()->reset_scope(Transaction_ctx::STMT);
   set_preserve_binlog_cache_manager(impl.thd, nullptr);
   impl.manager->preserve_rebind_status_counters(
       &impl.handle_shell->m_impl->detached_stmt_cache_use,
@@ -1892,16 +1916,13 @@ mysql_binlog_preserve_commit_detached_cache_attach(
   auto &impl = *journal->m_impl;
   if (binlog_hton == nullptr || thd_get_cache_mngr(impl.thd) != impl.manager)
     return Mysql_binlog_preserve_cache_status::OWNERSHIP_TAINTED;
+  DBUG_EXECUTE_IF("preserve_trx_fail_native_binlog_resource_registration",
+                  return Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED;);
   if (!preserve_binlog_register_attached_resources(
           impl.manager, &impl.handle_shell->m_impl->resource_lease)) {
-    return Mysql_binlog_preserve_cache_status::OWNERSHIP_TAINTED;
+    return Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED;
   }
 
-  trans_register_ha(impl.thd, true, binlog_hton, nullptr);
-  trans_register_ha(impl.thd, false, binlog_hton, nullptr);
-  Ha_data *const ha_data = impl.thd->get_ha_data(binlog_hton->slot);
-  ha_data->ha_info[Transaction_ctx::SESSION].set_trx_read_write();
-  ha_data->ha_info[Transaction_ctx::STMT].set_trx_read_write();
   impl.active = false;
   impl.manager = nullptr;
   impl.handle_shell.reset();

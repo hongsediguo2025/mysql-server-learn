@@ -91,6 +91,8 @@ namespace {
 
 constexpr char kStrictPromotionIntentV2Magic[] =
     "PTRX_STRICT_PROMOTION_INTENT_EPOCH_V2";
+constexpr char kStrictAttachIntentV1Magic[] =
+    "PTRX_STRICT_PROMOTION_ATTACH_INTENT_V1";
 constexpr size_t kStrictPromotionIntentDigestHexLength =
     SHA256_DIGEST_LENGTH * 2;
 constexpr size_t kStrictPromotionIntentMaxBytes = 64U * 1024U * 1024U;
@@ -367,6 +369,38 @@ bool strict_intent_token_is_valid(
   return !token.token.empty() &&
          token.token.size() <= kStrictPromotionIntentMaxStringBytes &&
          token.generation != 0 && strict_intent_state_is_valid(token.state);
+}
+
+bool strict_attach_intent_state_is_valid(
+    Preserve_trx_strict_attach_intent_state state) {
+  switch (state) {
+    case Preserve_trx_strict_attach_intent_state::ATTACHING:
+    case Preserve_trx_strict_attach_intent_state::ACTIVATING:
+    case Preserve_trx_strict_attach_intent_state::ACTIVE:
+    case Preserve_trx_strict_attach_intent_state::ATTACH_ROLLED_BACK:
+    case Preserve_trx_strict_attach_intent_state::ATTACH_TAINTED:
+    case Preserve_trx_strict_attach_intent_state::CLEANUP_PENDING:
+    case Preserve_trx_strict_attach_intent_state::CLEANUP_ROLLED_BACK:
+    case Preserve_trx_strict_attach_intent_state::CLEANUP_TAINTED:
+      return true;
+  }
+  return false;
+}
+
+bool strict_attach_intent_is_valid(
+    const Preserve_trx_strict_attach_intent &intent) {
+  const auto string_is_valid = [](const std::string &value) {
+    return !value.empty() &&
+           value.size() <= kStrictPromotionIntentMaxStringBytes;
+  };
+  return prepared_token_key_is_valid(intent.key) &&
+         string_is_valid(intent.key.preserve_dir) &&
+         string_is_valid(intent.key.source_uuid) &&
+         string_is_valid(intent.key.epoch_id) &&
+         string_is_valid(intent.key.token) &&
+         string_is_valid(intent.key.target_boot_incarnation) &&
+         strict_attach_intent_state_is_valid(intent.state) &&
+         intent.target_connection_id != 0 && intent.generated_at_us != 0;
 }
 
 std::string sha256_hex_string(const std::string &payload) {
@@ -754,6 +788,88 @@ bool preserved_trx_decode_strict_promotion_intent_v2(
   return true;
 }
 
+bool preserved_trx_encode_strict_attach_intent_v1(
+    const Preserve_trx_strict_attach_intent &intent, std::string *encoded) {
+  if (encoded == nullptr || !strict_attach_intent_is_valid(intent)) {
+    return false;
+  }
+  std::string body(kStrictAttachIntentV1Magic,
+                   sizeof(kStrictAttachIntentV1Magic) - 1);
+  if (!append_canonical_string(&body, intent.key.preserve_dir) ||
+      !append_canonical_string(&body, intent.key.source_uuid) ||
+      !append_canonical_string(&body, intent.key.epoch_id) ||
+      !append_canonical_string(&body, intent.key.token) ||
+      !append_canonical_string(&body,
+                               intent.key.target_boot_incarnation)) {
+    return false;
+  }
+  append_canonical_u64(&body, intent.key.generation);
+  body.push_back(static_cast<char>(intent.state));
+  append_canonical_u64(&body, intent.target_connection_id);
+  append_canonical_u64(&body, intent.generated_at_us);
+  if (body.size() >
+      kStrictPromotionIntentMaxBytes - kStrictPromotionIntentDigestHexLength) {
+    return false;
+  }
+  *encoded = body;
+  encoded->append(sha256_hex_string(body));
+  return true;
+}
+
+bool preserved_trx_decode_strict_attach_intent_v1(
+    const std::string &encoded, Preserve_trx_strict_attach_intent *intent) {
+  constexpr size_t kMagicLength = sizeof(kStrictAttachIntentV1Magic) - 1;
+  if (intent == nullptr ||
+      encoded.size() <= kMagicLength + kStrictPromotionIntentDigestHexLength ||
+      encoded.size() > kStrictPromotionIntentMaxBytes) {
+    return false;
+  }
+  const size_t body_length =
+      encoded.size() - kStrictPromotionIntentDigestHexLength;
+  const std::string body = encoded.substr(0, body_length);
+  if (body.compare(0, kMagicLength, kStrictAttachIntentV1Magic) != 0 ||
+      encoded.compare(body_length, kStrictPromotionIntentDigestHexLength,
+                      sha256_hex_string(body)) != 0) {
+    return false;
+  }
+
+  Preserve_trx_strict_attach_intent parsed;
+  size_t offset = kMagicLength;
+  uint8_t state = 0;
+  if (!read_canonical_string(body, &offset, &parsed.key.preserve_dir) ||
+      !read_canonical_string(body, &offset, &parsed.key.source_uuid) ||
+      !read_canonical_string(body, &offset, &parsed.key.epoch_id) ||
+      !read_canonical_string(body, &offset, &parsed.key.token) ||
+      !read_canonical_string(body, &offset,
+                             &parsed.key.target_boot_incarnation) ||
+      !read_canonical_u64(body, &offset, &parsed.key.generation) ||
+      !read_canonical_u8(body, &offset, &state) ||
+      !read_canonical_u64(body, &offset, &parsed.target_connection_id) ||
+      !read_canonical_u64(body, &offset, &parsed.generated_at_us) ||
+      offset != body.size()) {
+    return false;
+  }
+  parsed.state = static_cast<Preserve_trx_strict_attach_intent_state>(state);
+  if (!strict_attach_intent_is_valid(parsed)) return false;
+  *intent = std::move(parsed);
+  return true;
+}
+
+std::string preserved_trx_strict_attach_intent_journal_id(
+    const Preserve_trx_prepared_token_key &key) {
+  if (!prepared_token_key_is_valid(key)) return {};
+  std::string identity;
+  if (!append_canonical_string(&identity, key.preserve_dir) ||
+      !append_canonical_string(&identity, key.source_uuid) ||
+      !append_canonical_string(&identity, key.epoch_id) ||
+      !append_canonical_string(&identity, key.token) ||
+      !append_canonical_string(&identity, key.target_boot_incarnation)) {
+    return {};
+  }
+  append_canonical_u64(&identity, key.generation);
+  return "attach-" + sha256_hex_string(identity);
+}
+
 bool preserved_trx_finalize_token_facts(
     Preserve_trx_final_token_facts *facts) {
   if (facts == nullptr || !final_token_facts_are_valid(*facts)) return false;
@@ -1056,6 +1172,25 @@ Preserve_trx_attach_lease::take_native_binlog_handle(
     return Preserve_trx_prepared_status::INVALID_STATE;
   }
   *out = std::move(m_entry->resources.m_impl->native_binlog_handle);
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_attach_lease::make_native_binlog_attach_capability(
+    Preserve_trx_internal_operation_capability *out) const {
+  if (!m_active || m_entry == nullptr || m_activation_started ||
+      out == nullptr) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  std::lock_guard<std::mutex> guard(m_entry->mutex);
+  if (m_entry->state.load(std::memory_order_acquire) !=
+          Preserve_trx_prepared_token_state::ATTACHING ||
+      m_entry->resources.m_impl == nullptr ||
+      m_entry->resources.m_impl->native_binlog_handle == nullptr ||
+      !m_entry->resources.m_impl->native_binlog_handle->make_attach_capability(
+          out)) {
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
   return Preserve_trx_prepared_status::OK;
 }
 
@@ -1530,11 +1665,14 @@ Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::begin_attach(
 
 Preserve_trx_prepared_status
 Preserve_trx_prepared_token_registry::begin_activation(
-    Preserve_trx_attach_lease *lease) {
+    Preserve_trx_attach_lease *lease,
+    Preserve_trx_activation_intent_writer intent_writer,
+    void *intent_context) {
   if (lease == nullptr || !lease->active() || lease->m_entry == nullptr ||
-      lease->m_activation_started) {
+      lease->m_activation_started || intent_writer == nullptr) {
     return Preserve_trx_prepared_status::INVALID_ARGUMENT;
   }
+  Preserve_trx_prepared_token_key key;
   {
     std::lock_guard<std::mutex> guard(lease->m_entry->mutex);
     const auto publication = std::atomic_load_explicit(
@@ -1544,11 +1682,22 @@ Preserve_trx_prepared_token_registry::begin_activation(
          lease->m_entry->resources.has_native_binlog_handle())) {
       return Preserve_trx_prepared_status::INVALID_STATE;
     }
+    key = publication->key;
+  }
+  if (!intent_writer(key, intent_context)) {
+    return Preserve_trx_prepared_status::INTENT_IO_ERROR;
   }
   auto expected = Preserve_trx_prepared_token_state::ATTACHING;
   if (!lease->m_entry->state.compare_exchange_strong(
           expected, Preserve_trx_prepared_token_state::ACTIVATING,
           std::memory_order_acq_rel, std::memory_order_acquire)) {
+    lease->m_activation_started = true;
+    auto current = lease->m_entry->state.load(std::memory_order_acquire);
+    if (current == Preserve_trx_prepared_token_state::ATTACHING) {
+      (void)lease->m_entry->state.compare_exchange_strong(
+          current, Preserve_trx_prepared_token_state::ATTACH_TAINTED,
+          std::memory_order_acq_rel, std::memory_order_acquire);
+    }
     return Preserve_trx_prepared_status::INVALID_STATE;
   }
   lease->m_activation_started = true;
@@ -1557,11 +1706,14 @@ Preserve_trx_prepared_token_registry::begin_activation(
 
 Preserve_trx_prepared_status
 Preserve_trx_prepared_token_registry::commit_attach(
-    Preserve_trx_attach_lease *lease) {
+    Preserve_trx_attach_lease *lease,
+    Preserve_trx_activation_intent_writer intent_writer,
+    void *intent_context) {
   if (lease == nullptr || !lease->active() || lease->m_entry == nullptr ||
-      !lease->m_activation_started) {
+      !lease->m_activation_started || intent_writer == nullptr) {
     return Preserve_trx_prepared_status::INVALID_ARGUMENT;
   }
+  Preserve_trx_prepared_token_key key;
   {
     std::lock_guard<std::mutex> guard(lease->m_entry->mutex);
     const auto publication = std::atomic_load_explicit(
@@ -1571,10 +1723,59 @@ Preserve_trx_prepared_token_registry::commit_attach(
          lease->m_entry->resources.has_native_binlog_handle())) {
       return Preserve_trx_prepared_status::INVALID_STATE;
     }
+    key = publication->key;
+  }
+  if (!intent_writer(key, intent_context)) {
+    return Preserve_trx_prepared_status::INTENT_IO_ERROR;
   }
   auto expected = Preserve_trx_prepared_token_state::ACTIVATING;
   if (!lease->m_entry->state.compare_exchange_strong(
           expected, Preserve_trx_prepared_token_state::ACTIVE,
+          std::memory_order_acq_rel, std::memory_order_acquire)) {
+    auto current = lease->m_entry->state.load(std::memory_order_acquire);
+    if (current == Preserve_trx_prepared_token_state::ACTIVATING) {
+      (void)lease->m_entry->state.compare_exchange_strong(
+          current, Preserve_trx_prepared_token_state::ATTACH_TAINTED,
+          std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+    lease->m_active = false;
+    lease->m_activation_started = false;
+    lease->m_entry.reset();
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  lease->m_active = false;
+  lease->m_activation_started = false;
+  lease->m_entry.reset();
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::rollback_attach_after_activation(
+    Preserve_trx_attach_lease *lease,
+    Preserve_trx_activation_intent_writer intent_writer,
+    void *intent_context) {
+  if (lease == nullptr || !lease->active() || lease->m_entry == nullptr ||
+      !lease->m_activation_started || intent_writer == nullptr) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  Preserve_trx_prepared_token_key key;
+  {
+    std::lock_guard<std::mutex> guard(lease->m_entry->mutex);
+    const auto publication = std::atomic_load_explicit(
+        &lease->m_entry->publication, std::memory_order_acquire);
+    if (publication == nullptr ||
+        (publication->facts.binlog_cache_present &&
+         lease->m_entry->resources.has_native_binlog_handle())) {
+      return Preserve_trx_prepared_status::INVALID_STATE;
+    }
+    key = publication->key;
+  }
+  if (!intent_writer(key, intent_context)) {
+    return Preserve_trx_prepared_status::INTENT_IO_ERROR;
+  }
+  auto expected = Preserve_trx_prepared_token_state::ACTIVATING;
+  if (!lease->m_entry->state.compare_exchange_strong(
+          expected, Preserve_trx_prepared_token_state::ATTACH_ROLLED_BACK,
           std::memory_order_acq_rel, std::memory_order_acquire)) {
     return Preserve_trx_prepared_status::INVALID_STATE;
   }
@@ -1725,6 +1926,47 @@ Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::snapshot(
   snapshot->native_binlog_handle_owned =
       entry->resources.has_native_binlog_handle();
   return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::find_unique_adopted(
+    const std::string &epoch_id, const std::string &token,
+    Preserve_trx_prepared_token_snapshot *snapshot) const {
+  if (epoch_id.empty() || token.empty() || snapshot == nullptr) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  std::vector<std::shared_ptr<Preserve_trx_prepared_token_entry>> candidates;
+  {
+    std::lock_guard<std::mutex> guard(m_state->mutex);
+    for (const auto &item : m_state->entries) {
+      if (item.first.epoch_id == epoch_id && item.first.token == token) {
+        candidates.push_back(item.second);
+      }
+    }
+  }
+  bool found = false;
+  for (const auto &entry : candidates) {
+    std::lock_guard<std::mutex> guard(entry->mutex);
+    if (entry->state.load(std::memory_order_acquire) !=
+        Preserve_trx_prepared_token_state::ADOPTED_LOCKED) {
+      continue;
+    }
+    const auto publication = std::atomic_load_explicit(
+        &entry->publication, std::memory_order_acquire);
+    if (publication == nullptr) continue;
+    if (found) return Preserve_trx_prepared_status::DIGEST_CONFLICT;
+    snapshot->key = publication->key;
+    snapshot->facts = publication->facts;
+    snapshot->state = Preserve_trx_prepared_token_state::ADOPTED_LOCKED;
+    snapshot->record_lock_plan_owned = entry->resources.has_record_lock_plan();
+    snapshot->semantic_bundle_owned = entry->resources.has_semantic_bundle();
+    snapshot->native_binlog_handle_owned =
+        entry->resources.has_native_binlog_handle();
+    found = true;
+  }
+  return found ? Preserve_trx_prepared_status::OK
+               : candidates.empty() ? Preserve_trx_prepared_status::NOT_FOUND
+                                    : Preserve_trx_prepared_status::INVALID_STATE;
 }
 
 void Preserve_trx_prepared_token_registry::invalidate_incarnation(

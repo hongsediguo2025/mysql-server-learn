@@ -634,6 +634,12 @@ bool intent_marker_tokens_from_payload(const std::vector<unsigned char> &bytes,
     }
     return !tokens->empty();
   }
+  Preserve_trx_strict_attach_intent attach_intent;
+  if (preserved_trx_decode_strict_attach_intent_v1(encoded,
+                                                    &attach_intent)) {
+    tokens->insert(attach_intent.key.token);
+    return true;
+  }
   const size_t digest_pos = encoded.rfind("digest=");
   if (digest_pos == std::string::npos ||
       (digest_pos > 0 && encoded[digest_pos - 1] != '\n')) {
@@ -2304,6 +2310,20 @@ Local_file_preserved_trx_carrier::read_promotion_intent_epoch(
   marker_payload->assign(reinterpret_cast<const char *>(bytes.data()),
                          bytes.size());
   return Preserved_trx_carrier_status::OK;
+}
+
+Preserved_trx_carrier_status
+Local_file_preserved_trx_carrier::remove_promotion_intent_epoch(
+    const std::string &epoch_id) {
+  if (!promotion_epoch_component_is_filename_safe(epoch_id)) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  const std::string path = join_path(m_dir, epoch_id + ".promotion_intent");
+  if (my_delete(path.c_str(), MYF(0)) && my_errno() != ENOENT) {
+    return Preserved_trx_carrier_status::IO_ERROR;
+  }
+  return fsync_directory(m_dir) ? Preserved_trx_carrier_status::IO_ERROR
+                                : Preserved_trx_carrier_status::OK;
 }
 
 Preserved_trx_carrier_status Local_file_preserved_trx_carrier::list_tokens(

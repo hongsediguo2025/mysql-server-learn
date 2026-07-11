@@ -335,6 +335,13 @@ Preserved_trx_carrier::read_promotion_intent_epoch(
   return Preserved_trx_carrier_status::NOT_FOUND;
 }
 
+Preserved_trx_carrier_status
+Preserved_trx_carrier::remove_promotion_intent_epoch(
+    const std::string &epoch_id) {
+  (void)epoch_id;
+  return Preserved_trx_carrier_status::NOT_FOUND;
+}
+
 Preserve_snapshot_status Preserved_trx_store::write(
     Preserved_trx_bundle bundle, uint64_t timeout_seconds,
     Preserve_snapshot_metadata *written_metadata,
@@ -765,6 +772,13 @@ Preserve_snapshot_status Preserved_trx_store::read_promotion_intent_epoch(
   }
   return map_carrier_status(
       m_carrier->read_promotion_intent_epoch(epoch_id, marker_payload));
+}
+
+Preserve_snapshot_status Preserved_trx_store::remove_promotion_intent_epoch(
+    const std::string &epoch_id) {
+  if (m_carrier == nullptr) return Preserve_snapshot_status::INVALID_ARGUMENT;
+  return map_carrier_status(
+      m_carrier->remove_promotion_intent_epoch(epoch_id));
 }
 
 Preserve_snapshot_status Preserved_trx_store::remove_warm_external_blob_artifact(

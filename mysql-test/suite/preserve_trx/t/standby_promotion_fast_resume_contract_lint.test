@@ -42,6 +42,11 @@ my $binlog_prepared_h = read_source(File::Spec->catfile(
   $source_root, 'sql', 'binlog_preserve_prepared.h'));
 my $prepared_gunit = read_source(File::Spec->catfile(
   $source_root, 'unittest', 'gunit', 'preserve_trx-t.cc'));
+my $sql_class = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'sql_class.cc'));
+my $test_attach_plugin = read_source(File::Spec->catfile(
+  $source_root, 'plugin', 'test_preserve_trx_promotion',
+  'test_preserve_trx_promotion.cc'));
 
 die "strict production fence must be acquired only by promotion coordinator\n"
   unless $promotion =~ /preserved_trx_acquire_production_physical_fence_lease/;
@@ -62,10 +67,15 @@ die "promotion/transfer wrappers must not install metadata locks directly\n"
   if $promotion =~ /lock_preserve_apply_record_lock_metadata_plan/ ||
      $transfer =~ /lock_preserve_apply_record_lock_metadata_plan/;
 
-die "P3 native binlog prepare/attach must remain unreachable before P5\n"
-  if $promotion =~ /mysql_binlog_preserve_(?:prepare|attach)_detached_cache/ ||
-     $transfer =~ /mysql_binlog_preserve_(?:prepare|attach)_detached_cache/ ||
-     $preserve =~ /mysql_binlog_preserve_(?:prepare|attach)_detached_cache/;
+my $native_attach_call_count = () =
+  $preserve =~ /mysql_binlog_preserve_attach_detached_cache\s*\(/g;
+die "P5 native binlog attach must have one strict production-core caller\n"
+  unless $native_attach_call_count == 1 &&
+         $preserve =~
+         /preserved_trx_resume_adopted_for_promotion_on_thd[\s\S]*mysql_binlog_preserve_attach_detached_cache/s;
+die "promotion/transfer wrappers must not attach native binlog caches\n"
+  if $promotion =~ /mysql_binlog_preserve_attach_detached_cache/ ||
+     $transfer =~ /mysql_binlog_preserve_attach_detached_cache/;
 
 die "test physical-fence provider must not be a production fallback\n"
   unless $prepared =~ /g_production_provider_registered/ &&
@@ -132,6 +142,29 @@ die "P3 test capability/runtime hooks must have no production caller\n"
      $preserve =~ /make_binlog_capability_for_unit_test|set_runtime_for_unit_test/;
 die "P3 test capability must be exercised only by GUnit before P4\n"
   unless $prepared_gunit =~ /make_binlog_capability_for_unit_test/;
+
+die "P5 strict attach core must consume prepared handles without payload hydrate/import\n"
+  unless $preserve =~
+           /preserved_trx_resume_adopted_for_promotion_on_thd[\s\S]*take_native_binlog_handle[\s\S]*mysql_binlog_preserve_attach_detached_cache/s &&
+         $preserve !~
+           /preserved_trx_resume_adopted_for_promotion_on_thd[\s\S]{0,12000}(?:hydrate_logged_binlog_cache_payload_if_needed|mysql_binlog_preserve_import)/s;
+die "P5 protected THD handle must own lifetime pin, command gate and kill deferral\n"
+  unless $preserve =~ /Preserved_trx_peer_thd_handle::Impl[\s\S]*Preserve_trx_external_thd_pin/s &&
+         $preserve =~ /preserve_trx_batch_state\s*=\s*Preserve_trx_batch_thd_state::ATTACHING/s &&
+         $preserve =~ /preserved_trx_defer_external_thd_kill[\s\S]*!preserve_trx_is_enabled/s &&
+         $sql_class =~ /THD::awake[\s\S]*preserved_trx_defer_external_thd_kill/s;
+die "P5 attach activation must be bracketed by versioned durable token intent\n"
+  unless $prepared =~ /PTRX_STRICT_PROMOTION_ATTACH_INTENT_V1/s &&
+         $prepared =~ /begin_activation[\s\S]*intent_writer/s &&
+         $prepared =~ /commit_attach[\s\S]*intent_writer/s &&
+         $preserve =~ /ATTACHING[\s\S]*ACTIVATING[\s\S]*ACTIVE/s;
+die "TEST_ONLY promotion plugin must only resolve an adopted token and call the production core\n"
+  unless $test_attach_plugin =~ /find_unique_adopted/s &&
+         $test_attach_plugin =~ /preserved_trx_resolve_peer_thd/s &&
+         $test_attach_plugin =~ /preserved_trx_resume_adopted_for_promotion_on_thd/s;
+die "TEST_ONLY promotion plugin must not fake a fence, gate, registry publication or adopted record\n"
+  if $test_attach_plugin =~
+     /set_physical_fence_provider|acquire_physical_fence|adopt_prepared_epoch|publish_ready|commit_gate_adopt|preserved_trx_add_record/s;
 
 my $metadata_start = index(
   $lock_preserve, 'lock_preserve_build_record_lock_metadata_plan(');

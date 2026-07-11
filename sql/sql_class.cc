@@ -1168,6 +1168,11 @@ void THD::awake(THD::killed_state state_to_set) {
   THD_CHECK_SENTRY(this);
   mysql_mutex_assert_owner(&LOCK_thd_data);
 
+  if (preserved_trx_defer_external_thd_kill(
+          this, static_cast<int>(state_to_set))) {
+    return;
+  }
+
   /* Shutdown clone vio always, to wake up clone waiting for remote. */
   shutdown_clone_vio();
 

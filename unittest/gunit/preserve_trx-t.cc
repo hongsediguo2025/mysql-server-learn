@@ -60,6 +60,7 @@
 #include "sql/binlog_preserve_prepared.h"
 #include "sql/mdl_context_backup.h"
 #include "sql/mysqld.h"
+#include "sql/mysqld_thd_manager.h"
 #include "sql/preserve_trx_carrier.h"
 #include "sql/preserve_trx_carrier_file.h"
 #include "sql/preserve_trx_bundle.h"
@@ -347,6 +348,9 @@ Preserve_trx_prepared_token_resources acquire_prepared_resources(
             resources.install_semantic_bundle(std::move(bundle)));
   return resources;
 }
+
+bool activation_intent_writer_for_test(
+    const Preserve_trx_prepared_token_key &, void *context);
 
 struct Prepared_registry_interleave_context {
   Preserve_trx_prepared_token_registry *registry{nullptr};
@@ -653,6 +657,12 @@ TEST(PreservedTrxPreparedRegistry, GateAndAttachLeasesEnforceStateMachine) {
             adopt.take_semantic_bundle(&adopted_bundle));
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.commit_gate_adopt(&adopt));
+  Preserve_trx_prepared_token_snapshot adopted_snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.find_unique_adopted(key.epoch_id, key.token,
+                                         &adopted_snapshot));
+  EXPECT_EQ(key.source_uuid, adopted_snapshot.key.source_uuid);
+  EXPECT_EQ(key.generation, adopted_snapshot.key.generation);
 
   Preserve_trx_attach_lease attach;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
@@ -661,10 +671,30 @@ TEST(PreservedTrxPreparedRegistry, GateAndAttachLeasesEnforceStateMachine) {
             registry.abort_attach_after_full_unwind(&attach));
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.begin_attach(key, 1, &attach));
+  bool durable_activation_intent = false;
+  ASSERT_EQ(Preserve_trx_prepared_status::INTENT_IO_ERROR,
+            registry.begin_activation(&attach,
+                                      activation_intent_writer_for_test,
+                                      &durable_activation_intent));
+  EXPECT_TRUE(attach.active());
+  EXPECT_FALSE(attach.activation_started());
+  durable_activation_intent = true;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
-            registry.begin_activation(&attach));
+            registry.begin_activation(&attach,
+                                      activation_intent_writer_for_test,
+                                      &durable_activation_intent));
+  durable_activation_intent = false;
+  ASSERT_EQ(Preserve_trx_prepared_status::INTENT_IO_ERROR,
+            registry.commit_attach(&attach,
+                                   activation_intent_writer_for_test,
+                                   &durable_activation_intent));
+  EXPECT_TRUE(attach.active());
+  EXPECT_TRUE(attach.activation_started());
+  durable_activation_intent = true;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
-            registry.commit_attach(&attach));
+            registry.commit_attach(&attach,
+                                   activation_intent_writer_for_test,
+                                   &durable_activation_intent));
 
   Preserve_trx_prepared_token_snapshot snapshot;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
@@ -789,6 +819,12 @@ Preserved_trx_physical_adopt_status strict_adopt_parallel_probe_for_test(
   return status;
 }
 
+bool activation_intent_writer_for_test(
+    const Preserve_trx_prepared_token_key &, void *context) {
+  auto *allow = static_cast<bool *>(context);
+  return allow != nullptr && *allow;
+}
+
 TEST(PreservedTrxPreparedRegistry, AttachAndCleanupUseOneStateClaim) {
   preserve_trx_resource_manager_reset_for_unit_test();
   Preserve_trx_prepared_token_registry registry;
@@ -830,6 +866,51 @@ TEST(PreservedTrxPreparedRegistry, AttachAndCleanupUseOneStateClaim) {
   EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
   registry.purge_epoch(key.source_uuid, key.epoch_id);
   preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry,
+     ActivatedAttachRollbackRequiresDurableTerminalIntent) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(88);
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, key.generation, &prepare));
+  auto resources = acquire_prepared_resources(key);
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&prepare, make_final_token_facts(88),
+                                   std::move(resources)));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.mark_ready_for_gate(key, key.generation));
+  Preserve_trx_gate_adopt_lease gate;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_gate_adopt(key, key.generation, &gate));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.commit_gate_adopt(&gate));
+  Preserve_trx_attach_lease attach;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_attach(key, key.generation, &attach));
+  bool durable_intent = true;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_activation(&attach,
+                                      activation_intent_writer_for_test,
+                                      &durable_intent));
+  durable_intent = false;
+  EXPECT_EQ(Preserve_trx_prepared_status::INTENT_IO_ERROR,
+            registry.rollback_attach_after_activation(
+                &attach, activation_intent_writer_for_test,
+                &durable_intent));
+  EXPECT_TRUE(attach.active());
+  durable_intent = true;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.rollback_attach_after_activation(
+                &attach, activation_intent_writer_for_test,
+                &durable_intent));
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::ATTACH_ROLLED_BACK,
+            snapshot.state);
 }
 
 TEST(PreservedTrxPreparedRegistry, UnresolvedGateLeaseFailsClosed) {
@@ -1183,6 +1264,8 @@ TEST_F(PreservedTrxNativeBinlogPrepared,
   EXPECT_EQ(manager_identity,
             mysql_binlog_preserve_attached_manager_identity_for_unit_test(
                 thd()));
+  EXPECT_TRUE(
+      mysql_binlog_preserve_attached_handlers_ready_for_unit_test(thd()));
   ASSERT_EQ(Mysql_binlog_preserve_cache_status::OK,
             mysql_binlog_preserve_abort_detached_cache_attach(&journal,
                                                                &handle));
@@ -1191,6 +1274,8 @@ TEST_F(PreservedTrxNativeBinlogPrepared,
   EXPECT_EQ(nullptr,
             mysql_binlog_preserve_attached_manager_identity_for_unit_test(
                 thd()));
+  EXPECT_FALSE(
+      mysql_binlog_preserve_attached_handlers_ready_for_unit_test(thd()));
 
   ASSERT_EQ(Mysql_binlog_preserve_cache_status::OK,
             mysql_binlog_preserve_attach_detached_cache(
@@ -1202,6 +1287,45 @@ TEST_F(PreservedTrxNativeBinlogPrepared,
             mysql_binlog_preserve_attached_manager_identity_for_unit_test(
                 thd()));
   EXPECT_TRUE(
+      mysql_binlog_preserve_attached_handlers_ready_for_unit_test(thd()));
+}
+
+TEST_F(PreservedTrxNativeBinlogPrepared,
+       CommitResourceFailureLeavesAttachJournalReversible) {
+  const std::string payload(128 * 1024, 'j');
+  auto facts = make_facts(payload);
+  ChunkedBinlogPayloadReader reader(payload, 4096);
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> handle;
+  auto resources = acquire_native_resources("native-binlog-commit-failure",
+                                            facts);
+  ASSERT_EQ(Mysql_binlog_preserve_cache_status::OK,
+            mysql_binlog_preserve_prepare_detached_cache(
+                prepare_capability(facts), facts, &reader,
+                std::move(resources), &handle));
+  const void *const manager_identity = handle->native_manager_identity();
+
+  Mysql_binlog_preserve_attach_journal journal;
+  ASSERT_EQ(Mysql_binlog_preserve_cache_status::OK,
+            mysql_binlog_preserve_attach_detached_cache(
+                attach_capability(facts), thd(), &handle, &journal));
+  DBUG_SET("+d,preserve_trx_fail_native_binlog_resource_registration");
+  EXPECT_EQ(Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED,
+            mysql_binlog_preserve_commit_detached_cache_attach(&journal));
+  DBUG_SET("-d,preserve_trx_fail_native_binlog_resource_registration");
+  ASSERT_TRUE(journal.active());
+  EXPECT_EQ(manager_identity,
+            mysql_binlog_preserve_attached_manager_identity_for_unit_test(
+                thd()));
+
+  ASSERT_EQ(Mysql_binlog_preserve_cache_status::OK,
+            mysql_binlog_preserve_abort_detached_cache_attach(&journal,
+                                                               &handle));
+  ASSERT_NE(nullptr, handle);
+  EXPECT_EQ(manager_identity, handle->native_manager_identity());
+  EXPECT_EQ(nullptr,
+            mysql_binlog_preserve_attached_manager_identity_for_unit_test(
+                thd()));
+  EXPECT_FALSE(
       mysql_binlog_preserve_attached_handlers_ready_for_unit_test(thd()));
 }
 
@@ -1355,6 +1479,10 @@ TEST_F(PreservedTrxNativeBinlogPrepared,
   Preserve_trx_attach_lease attach;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.begin_attach(key, 1, &attach));
+  Preserve_trx_internal_operation_capability attach_capability;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            attach.make_native_binlog_attach_capability(
+                &attach_capability));
   std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> handle;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             attach.take_native_binlog_handle(&handle));
@@ -2832,6 +2960,107 @@ TEST_F(PreservedTrxCommandRead,
 }
 
 TEST_F(PreservedTrxCommandRead,
+       ProtectedPeerHandlePinsCommandGateAndDefersKill) {
+  THD *target = thd();
+  preserve_trx_set_enable_value(true);
+  target->m_server_idle = true;
+  target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
+  target->killed = THD::NOT_KILLED;
+  ASSERT_NE(0U, target->thread_id());
+  Global_THD_manager *const thd_manager =
+      Global_THD_manager::get_instance();
+  thd_manager->set_unit_test();
+  thd_manager->add_thd(target);
+  struct Remove_thd_guard {
+    Global_THD_manager *manager;
+    THD *target;
+    ~Remove_thd_guard() { manager->remove_thd(target); }
+  } remove_thd_guard{thd_manager, target};
+  Find_thd_with_id finder(target->thread_id());
+  THD *const found = thd_manager->find_thd(&finder);
+  ASSERT_EQ(target, found);
+  mysql_mutex_unlock(&found->LOCK_thd_data);
+  EXPECT_FALSE(target->release_resources_done());
+  EXPECT_FALSE(target->in_active_multi_stmt_transaction());
+
+  Preserved_trx_peer_thd_handle handle;
+  THD *const saved_current_thd = current_thd;
+  current_thd = nullptr;
+  const bool resolved = preserved_trx_resolve_peer_thd(
+      target->thread_id(), Preserved_trx_operation_deadline{}, &handle);
+  current_thd = saved_current_thd;
+  ASSERT_TRUE(resolved);
+  ASSERT_TRUE(handle.valid());
+  EXPECT_EQ(target, handle.get());
+  EXPECT_TRUE(preserved_trx_thd_has_external_use(target));
+  mysql_mutex_lock(&target->LOCK_thd_data);
+  EXPECT_EQ(Preserve_trx_batch_thd_state::ATTACHING,
+            target->preserve_trx_batch_state);
+  mysql_mutex_unlock(&target->LOCK_thd_data);
+
+  mysql_mutex_lock(&target->LOCK_thd_data);
+  target->awake(THD::KILL_CONNECTION);
+  mysql_mutex_unlock(&target->LOCK_thd_data);
+  EXPECT_EQ(THD::NOT_KILLED, target->killed);
+
+  handle.release();
+  EXPECT_FALSE(preserved_trx_thd_has_external_use(target));
+  mysql_mutex_lock(&target->LOCK_thd_data);
+  EXPECT_EQ(Preserve_trx_batch_thd_state::NONE,
+            target->preserve_trx_batch_state);
+  mysql_mutex_unlock(&target->LOCK_thd_data);
+  EXPECT_EQ(THD::KILL_CONNECTION, target->killed);
+  target->killed = THD::NOT_KILLED;
+  target->m_server_idle = false;
+}
+
+TEST_F(PreservedTrxCommandRead,
+       StrictPromotionResumeRejectsMissingRegistryBeforeTargetMutation) {
+  THD *target = thd();
+  preserve_trx_set_enable_value(true);
+  target->m_server_idle = true;
+  target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
+  target->killed = THD::NOT_KILLED;
+  Global_THD_manager *const thd_manager =
+      Global_THD_manager::get_instance();
+  thd_manager->set_unit_test();
+  thd_manager->add_thd(target);
+  struct Remove_thd_guard {
+    Global_THD_manager *manager;
+    THD *target;
+    ~Remove_thd_guard() { manager->remove_thd(target); }
+  } remove_thd_guard{thd_manager, target};
+
+  Preserved_trx_peer_thd_handle handle;
+  THD *const saved_current_thd = current_thd;
+  current_thd = nullptr;
+  const bool resolved = preserved_trx_resolve_peer_thd(
+      target->thread_id(), Preserved_trx_operation_deadline{}, &handle);
+  current_thd = saved_current_thd;
+  ASSERT_TRUE(resolved);
+
+  Preserve_trx_prepared_token_key key = make_prepared_token_key(73);
+  key.preserve_dir = "/tmp/preserve-missing-registry/";
+  const auto now = std::chrono::steady_clock::now().time_since_epoch();
+  Preserved_trx_operation_deadline deadline;
+  deadline.deadline_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(now).count() +
+      1000000;
+  Preserved_trx_promotion_resume_result result;
+  EXPECT_EQ(Preserved_trx_promotion_resume_status::REGISTRY_NOT_ADOPTED,
+            preserved_trx_resume_adopted_for_promotion_on_thd(
+                &handle, key, deadline, &result));
+  EXPECT_TRUE(handle.valid());
+  EXPECT_EQ(THD::NOT_KILLED, target->killed);
+  mysql_mutex_lock(&target->LOCK_thd_data);
+  EXPECT_EQ(Preserve_trx_batch_thd_state::ATTACHING,
+            target->preserve_trx_batch_state);
+  mysql_mutex_unlock(&target->LOCK_thd_data);
+  handle.release();
+  target->m_server_idle = false;
+}
+
+TEST_F(PreservedTrxCommandRead,
        DrainCleanupFailedWithoutRecordsAllowsNewTransactions) {
   THD *target = thd();
   preserve_trx_set_enable_value(true);
@@ -3516,6 +3745,48 @@ TEST(PreservedTrxPromotion, StrictIntentV2CannotBeDecodedAsLegacyV1) {
   Preserve_trx_promotion_intent_epoch_marker legacy;
   EXPECT_FALSE(
       preserved_trx_decode_promotion_intent_epoch_marker(encoded, &legacy));
+}
+
+TEST(PreservedTrxPromotion, StrictAttachIntentV1RoundTripsAndRejectsTamper) {
+  Preserve_trx_strict_attach_intent intent;
+  intent.key.preserve_dir = "/tmp/preserve";
+  intent.key.source_uuid = "source-uuid";
+  intent.key.epoch_id = "epoch-7";
+  intent.key.token = "token-9";
+  intent.key.target_boot_incarnation = "boot-3";
+  intent.key.generation = 11;
+  intent.state = Preserve_trx_strict_attach_intent_state::ACTIVATING;
+  intent.target_connection_id = 1234;
+  intent.generated_at_us = 5678;
+
+  std::string encoded;
+  ASSERT_TRUE(
+      preserved_trx_encode_strict_attach_intent_v1(intent, &encoded));
+  Preserve_trx_strict_attach_intent decoded;
+  ASSERT_TRUE(
+      preserved_trx_decode_strict_attach_intent_v1(encoded, &decoded));
+  EXPECT_EQ(intent.key.preserve_dir, decoded.key.preserve_dir);
+  EXPECT_EQ(intent.key.source_uuid, decoded.key.source_uuid);
+  EXPECT_EQ(intent.key.epoch_id, decoded.key.epoch_id);
+  EXPECT_EQ(intent.key.token, decoded.key.token);
+  EXPECT_EQ(intent.key.target_boot_incarnation,
+            decoded.key.target_boot_incarnation);
+  EXPECT_EQ(intent.key.generation, decoded.key.generation);
+  EXPECT_EQ(intent.state, decoded.state);
+  EXPECT_EQ(intent.target_connection_id, decoded.target_connection_id);
+  EXPECT_EQ(intent.generated_at_us, decoded.generated_at_us);
+  const std::string journal_id =
+      preserved_trx_strict_attach_intent_journal_id(intent.key);
+  EXPECT_EQ(71U, journal_id.size());
+  EXPECT_EQ(0U, journal_id.find("attach-"));
+  EXPECT_EQ(std::string::npos, journal_id.find('.'));
+
+  encoded[encoded.size() / 2] ^= 1;
+  EXPECT_FALSE(
+      preserved_trx_decode_strict_attach_intent_v1(encoded, &decoded));
+  intent.state = static_cast<Preserve_trx_strict_attach_intent_state>(255);
+  EXPECT_FALSE(
+      preserved_trx_encode_strict_attach_intent_v1(intent, &encoded));
 }
 
 TEST(PreservedTrxPromotion, RejectsInvalidTokenZero) {
@@ -6233,6 +6504,38 @@ TEST_F(PreserveSnapshotTest, CarrierListsStrictPromotionIntentV2Tokens) {
   ASSERT_EQ(Preserved_trx_carrier_status::OK,
             carrier.list_tokens(&listing));
   EXPECT_EQ(1U, listing.promotion_intent_tokens.count("strict-token"));
+}
+
+TEST_F(PreserveSnapshotTest,
+       StrictAttachIntentProtectsTokenUntilTerminalRemoval) {
+  Preserve_trx_strict_attach_intent intent;
+  intent.key.preserve_dir = m_dir;
+  intent.key.source_uuid = "source-uuid";
+  intent.key.epoch_id = "epoch-attach";
+  intent.key.token = "token-attach";
+  intent.key.target_boot_incarnation = "boot-1";
+  intent.key.generation = 1;
+  intent.state = Preserve_trx_strict_attach_intent_state::ATTACHING;
+  intent.target_connection_id = 17;
+  intent.generated_at_us = 99;
+  std::string encoded;
+  ASSERT_TRUE(
+      preserved_trx_encode_strict_attach_intent_v1(intent, &encoded));
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  const std::string journal_id = "attach-epoch-token";
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.write_promotion_intent_epoch(journal_id, encoded));
+  Preserved_trx_carrier_listing listing;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.list_tokens(&listing));
+  EXPECT_EQ(1U, listing.promotion_intent_tokens.count("token-attach"));
+
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.remove_promotion_intent_epoch(journal_id));
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.list_tokens(&listing));
+  EXPECT_EQ(0U, listing.promotion_intent_tokens.count("token-attach"));
 }
 
 TEST_F(PreserveSnapshotTest,

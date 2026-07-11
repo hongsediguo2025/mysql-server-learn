@@ -160,6 +160,8 @@ class Mysql_binlog_preserve_prepared_cache_handle final {
   bool matches(const Mysql_binlog_preserve_token_identity &identity,
                const std::string &facts_digest, uint64_t cache_length,
                bool file_backed) const;
+  bool make_attach_capability(
+      Preserve_trx_internal_operation_capability *out) const;
 
  private:
   struct Impl;

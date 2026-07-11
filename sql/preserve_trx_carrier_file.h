@@ -87,6 +87,9 @@ class Local_file_preserved_trx_carrier final
       const std::string &epoch_id, std::string *marker_payload) override;
   Preserved_trx_carrier_status read_promotion_intent_epoch(
       const std::string &epoch_id, std::string *marker_payload) override;
+
+  Preserved_trx_carrier_status remove_promotion_intent_epoch(
+      const std::string &epoch_id) override;
   Preserved_trx_carrier_status list_tokens(
       Preserved_trx_carrier_listing *listing) override;
   Preserved_trx_carrier_status new_token_state_for_write(

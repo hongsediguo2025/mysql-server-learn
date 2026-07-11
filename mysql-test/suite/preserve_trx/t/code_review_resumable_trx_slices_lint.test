@@ -518,7 +518,7 @@ $lock_preserve =~ /static bool lock_preserve_record_entry_has_conflict[\s\S]*?^}
 my $preserve_record_conflict = $&;
 die "record-lock import conflict check must skip per-bit scan when the page has no existing record locks\n"
   unless $preserve_record_conflict =~
-         /if\s*\(\s*!\s*lock_preserve_page_has_record_locks\s*\(\s*block\s*\)\s*\)\s*\{?\s*return\s+false\s*;/s;
+         /if\s*\(\s*!\s*lock_preserve_page_has_record_locks\s*\(\s*(?:block|page_id)\s*\)\s*\)\s*\{?\s*return\s+false\s*;/s;
 die "record-lock import conflict check must compare imported and existing page bitmaps in bulk\n"
   if $preserve_record_conflict =~
      /for\s*\([^)]*heap_no[\s\S]*lock_preserve_bitmap_get_nth_bit[\s\S]*lock_preserve_record_lock_has_conflict/s;
