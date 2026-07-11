@@ -178,6 +178,31 @@ TEST(PreservedTrxPhysicalFence, ExactLsnAndCompleteDigestAreRequired) {
   EXPECT_FALSE(preserved_trx_physical_fence_proof_is_valid(proof));
 }
 
+TEST(PreservedTrxPhysicalFence,
+     EpochDigestCommitmentIsOrderIndependentAndRejectsDuplicateToken) {
+  const Preserve_trx_epoch_physical_digest_input first{
+      "token-1", 1, std::string(64, '1'), std::string(64, '2'),
+      std::string(64, '3')};
+  const Preserve_trx_epoch_physical_digest_input second{
+      "token-2", 2, std::string(64, '4'), std::string(64, '5'),
+      std::string(64, '6')};
+  std::string lock_forward;
+  std::string page_forward;
+  std::string dictionary_forward;
+  ASSERT_TRUE(preserved_trx_compute_epoch_physical_digest_commitments(
+      {first, second}, &lock_forward, &page_forward, &dictionary_forward));
+  std::string lock_reverse;
+  std::string page_reverse;
+  std::string dictionary_reverse;
+  ASSERT_TRUE(preserved_trx_compute_epoch_physical_digest_commitments(
+      {second, first}, &lock_reverse, &page_reverse, &dictionary_reverse));
+  EXPECT_EQ(lock_forward, lock_reverse);
+  EXPECT_EQ(page_forward, page_reverse);
+  EXPECT_EQ(dictionary_forward, dictionary_reverse);
+  EXPECT_FALSE(preserved_trx_compute_epoch_physical_digest_commitments(
+      {first, first}, &lock_reverse, &page_reverse, &dictionary_reverse));
+}
+
 TEST(PreservedTrxPhysicalFence, TestProviderCannotReachProductionSlot) {
   Preserve_trx_physical_fence_provider_ops ops;
   ops.consistency_mode =
@@ -6694,7 +6719,7 @@ TEST_F(PreserveSnapshotTest,
        StrictPhysicalFenceWritesOneEpochIntentAndAdoptsReadyRegistryToken) {
   preserve_trx_set_enable_value(true);
   preserve_trx_resource_manager_reset_for_unit_test();
-  const auto proof = make_test_physical_fence_proof(
+  auto proof = make_test_physical_fence_proof(
       Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY);
   Preserve_trx_physical_fence_provider_ops ops;
   ops.consistency_mode = proof.consistency_mode;
@@ -6707,7 +6732,6 @@ TEST_F(PreserveSnapshotTest,
 
   Preserve_trx_physical_promotion_gate_request request;
   request.epoch_id = "strict-ready-epoch";
-  request.expected_fence = proof;
   request.operation_deadline_us = my_micro_time() + 1000000;
   auto key = make_prepared_token_key(1);
   key.preserve_dir = m_dir;
@@ -6726,6 +6750,12 @@ TEST_F(PreserveSnapshotTest,
   facts.target_boot_incarnation = proof.target_boot_incarnation;
   facts.canonical_digest.clear();
   ASSERT_TRUE(preserved_trx_finalize_token_facts(&facts));
+  ASSERT_TRUE(preserved_trx_compute_epoch_physical_digest_commitments(
+      {{key.token, key.generation, facts.final_lock_generation_digest,
+        facts.page_layout_digest, facts.dictionary_generation_digest}},
+      &proof.final_lock_generation_digest, &proof.page_layout_digest,
+      &proof.dictionary_generation_digest));
+  request.expected_fence = proof;
 
   auto &registry = preserved_trx_strict_prepared_token_registry();
   registry.purge_epoch(key.source_uuid, key.epoch_id);
@@ -6773,10 +6803,87 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
+       StrictPhysicalFenceAcceptsDistinctTokenDigestsWithEpochCommitment) {
+  preserve_trx_set_enable_value(true);
+  preserve_trx_resource_manager_reset_for_unit_test();
+  auto proof = make_test_physical_fence_proof(
+      Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY);
+  Preserve_trx_physical_fence_provider_ops ops;
+  ops.consistency_mode = proof.consistency_mode;
+  ops.acquire = test_physical_fence_acquire;
+  ops.revalidate = test_physical_fence_revalidate;
+  ops.release = test_physical_fence_release;
+  preserved_trx_set_physical_fence_provider_for_unit_test(&ops);
+  preserved_trx_set_strict_physical_adopt_executor_for_unit_test(
+      strict_adopt_success_for_test);
+
+  Preserve_trx_physical_promotion_gate_request request;
+  request.epoch_id = "strict-distinct-digest-epoch";
+  request.operation_deadline_us = my_micro_time() + 1000000;
+  request.worker_count = 2;
+  auto &registry = preserved_trx_strict_prepared_token_registry();
+  registry.purge_epoch(proof.source_lineage_uuid, request.epoch_id);
+  std::vector<Preserve_trx_epoch_physical_digest_input> digest_inputs;
+  for (uint64_t i = 1; i <= 2; ++i) {
+    auto key = make_prepared_token_key(i);
+    key.preserve_dir = m_dir;
+    key.source_uuid = proof.source_lineage_uuid;
+    key.epoch_id = request.epoch_id;
+    key.token = "strict-distinct-" + std::to_string(i);
+    key.target_boot_incarnation = proof.target_boot_incarnation;
+    request.tokens.push_back(key);
+
+    auto facts = make_final_token_facts(proof.source_fence_lsn);
+    facts.epoch_fact_digest = proof.epoch_fact_digest;
+    facts.final_lock_generation_digest.assign(64, i == 1 ? '1' : '4');
+    facts.page_layout_digest.assign(64, i == 1 ? '2' : '5');
+    facts.dictionary_generation_digest.assign(64, i == 1 ? '3' : '6');
+    facts.target_boot_incarnation = proof.target_boot_incarnation;
+    facts.canonical_digest.clear();
+    ASSERT_TRUE(preserved_trx_finalize_token_facts(&facts));
+    digest_inputs.push_back(
+        {key.token, key.generation, facts.final_lock_generation_digest,
+         facts.page_layout_digest, facts.dictionary_generation_digest});
+    Preserve_trx_prepare_lease prepare;
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.begin_prepare(key, key.generation, &prepare));
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.publish_ready(&prepare, facts,
+                                     acquire_prepared_resources(key)));
+  }
+  ASSERT_TRUE(preserved_trx_compute_epoch_physical_digest_commitments(
+      digest_inputs, &proof.final_lock_generation_digest,
+      &proof.page_layout_digest, &proof.dictionary_generation_digest));
+  request.expected_fence = proof;
+
+  Preserve_trx_physical_promotion_gate_result result;
+  EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::OK,
+            preserved_trx_adopt_prepared_epoch_for_physical_promotion_for_unit_test(
+                m_dir, request, &result))
+      << result.message;
+  EXPECT_EQ(2U, result.adopted_count);
+  EXPECT_EQ(0U, result.tainted_count);
+
+  for (const auto &key : request.tokens) {
+    Preserve_trx_cleanup_lease cleanup;
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.begin_cleanup(
+                  key, key.generation,
+                  Preserve_trx_prepared_token_state::ADOPTED_LOCKED,
+                  &cleanup));
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.commit_cleanup(&cleanup, true));
+  }
+  registry.purge_epoch(proof.source_lineage_uuid, request.epoch_id);
+  preserved_trx_set_strict_physical_adopt_executor_for_unit_test(nullptr);
+  preserved_trx_set_physical_fence_provider_for_unit_test(nullptr);
+}
+
+TEST_F(PreserveSnapshotTest,
        StrictPhysicalFenceFinalIntentFailureTaintsAdoptedToken) {
   preserve_trx_set_enable_value(true);
   preserve_trx_resource_manager_reset_for_unit_test();
-  const auto proof = make_test_physical_fence_proof(
+  auto proof = make_test_physical_fence_proof(
       Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY);
   Preserve_trx_physical_fence_provider_ops ops;
   ops.consistency_mode = proof.consistency_mode;
@@ -6789,7 +6896,6 @@ TEST_F(PreserveSnapshotTest,
 
   Preserve_trx_physical_promotion_gate_request request;
   request.epoch_id = "strict-final-intent-failure";
-  request.expected_fence = proof;
   request.operation_deadline_us = my_micro_time() + 1000000;
   auto key = make_prepared_token_key(1);
   key.preserve_dir = m_dir;
@@ -6808,6 +6914,12 @@ TEST_F(PreserveSnapshotTest,
   facts.target_boot_incarnation = proof.target_boot_incarnation;
   facts.canonical_digest.clear();
   ASSERT_TRUE(preserved_trx_finalize_token_facts(&facts));
+  ASSERT_TRUE(preserved_trx_compute_epoch_physical_digest_commitments(
+      {{key.token, key.generation, facts.final_lock_generation_digest,
+        facts.page_layout_digest, facts.dictionary_generation_digest}},
+      &proof.final_lock_generation_digest, &proof.page_layout_digest,
+      &proof.dictionary_generation_digest));
+  request.expected_fence = proof;
 
   auto &registry = preserved_trx_strict_prepared_token_registry();
   registry.purge_epoch(key.source_uuid, key.epoch_id);
@@ -6839,7 +6951,7 @@ TEST_F(PreserveSnapshotTest,
 TEST_F(PreserveSnapshotTest, StrictPhysicalFenceUsesRequestedWorkers) {
   preserve_trx_set_enable_value(true);
   preserve_trx_resource_manager_reset_for_unit_test();
-  const auto proof = make_test_physical_fence_proof(
+  auto proof = make_test_physical_fence_proof(
       Preserve_trx_physical_consistency_mode::TEST_FROZEN_DATADIR_COPY);
   Preserve_trx_physical_fence_provider_ops ops;
   ops.consistency_mode = proof.consistency_mode;
@@ -6854,11 +6966,11 @@ TEST_F(PreserveSnapshotTest, StrictPhysicalFenceUsesRequestedWorkers) {
 
   Preserve_trx_physical_promotion_gate_request request;
   request.epoch_id = "strict-parallel-epoch";
-  request.expected_fence = proof;
   request.operation_deadline_us = my_micro_time() + 1000000;
   request.worker_count = 3;
   auto &registry = preserved_trx_strict_prepared_token_registry();
   registry.purge_epoch(proof.source_lineage_uuid, request.epoch_id);
+  std::vector<Preserve_trx_epoch_physical_digest_input> digest_inputs;
   for (uint64_t i = 1; i <= 3; ++i) {
     auto key = make_prepared_token_key(i);
     key.preserve_dir = m_dir;
@@ -6878,6 +6990,9 @@ TEST_F(PreserveSnapshotTest, StrictPhysicalFenceUsesRequestedWorkers) {
     facts.target_boot_incarnation = proof.target_boot_incarnation;
     facts.canonical_digest.clear();
     ASSERT_TRUE(preserved_trx_finalize_token_facts(&facts));
+    digest_inputs.push_back(
+        {key.token, key.generation, facts.final_lock_generation_digest,
+         facts.page_layout_digest, facts.dictionary_generation_digest});
     Preserve_trx_prepare_lease prepare;
     ASSERT_EQ(Preserve_trx_prepared_status::OK,
               registry.begin_prepare(key, key.generation, &prepare));
@@ -6885,6 +7000,10 @@ TEST_F(PreserveSnapshotTest, StrictPhysicalFenceUsesRequestedWorkers) {
               registry.publish_ready(&prepare, facts,
                                      acquire_prepared_resources(key)));
   }
+  ASSERT_TRUE(preserved_trx_compute_epoch_physical_digest_commitments(
+      digest_inputs, &proof.final_lock_generation_digest,
+      &proof.page_layout_digest, &proof.dictionary_generation_digest));
+  request.expected_fence = proof;
 
   Preserve_trx_physical_promotion_gate_result result;
   EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::OK,

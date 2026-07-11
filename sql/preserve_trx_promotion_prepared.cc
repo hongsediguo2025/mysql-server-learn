@@ -508,6 +508,63 @@ uint64_t resume_core_percentile(uint64_t numerator, uint64_t denominator) {
 
 }  // namespace
 
+bool preserved_trx_compute_epoch_physical_digest_commitments(
+    const std::vector<Preserve_trx_epoch_physical_digest_input> &inputs,
+    std::string *final_lock_generation_digest,
+    std::string *page_layout_digest,
+    std::string *dictionary_generation_digest) {
+  if (inputs.empty() || inputs.size() > kStrictPromotionIntentMaxTokens ||
+      final_lock_generation_digest == nullptr ||
+      page_layout_digest == nullptr ||
+      dictionary_generation_digest == nullptr) {
+    return false;
+  }
+  std::vector<Preserve_trx_epoch_physical_digest_input> sorted = inputs;
+  std::sort(sorted.begin(), sorted.end(),
+            [](const auto &left, const auto &right) {
+              return left.token != right.token
+                         ? left.token < right.token
+                         : left.generation < right.generation;
+            });
+
+  std::string lock_commitment("PTRX_FINAL_LOCK_EPOCH_V1");
+  std::string page_commitment("PTRX_PAGE_LAYOUT_EPOCH_V1");
+  std::string dictionary_commitment("PTRX_DICTIONARY_EPOCH_V1");
+  append_canonical_u32(&lock_commitment,
+                       static_cast<uint32_t>(sorted.size()));
+  append_canonical_u32(&page_commitment,
+                       static_cast<uint32_t>(sorted.size()));
+  append_canonical_u32(&dictionary_commitment,
+                       static_cast<uint32_t>(sorted.size()));
+  for (size_t i = 0; i < sorted.size(); ++i) {
+    const auto &input = sorted[i];
+    if (input.token.empty() || input.generation == 0 ||
+        !digest_is_sha256_hex(input.final_lock_generation_digest) ||
+        !digest_is_sha256_hex(input.page_layout_digest) ||
+        !digest_is_sha256_hex(input.dictionary_generation_digest) ||
+        (i != 0 && input.token == sorted[i - 1].token)) {
+      return false;
+    }
+    for (std::string *commitment : {&lock_commitment, &page_commitment,
+                                    &dictionary_commitment}) {
+      if (!append_canonical_string(commitment, input.token)) return false;
+      append_canonical_u64(commitment, input.generation);
+    }
+    if (!append_canonical_string(&lock_commitment,
+                                 input.final_lock_generation_digest) ||
+        !append_canonical_string(&page_commitment,
+                                 input.page_layout_digest) ||
+        !append_canonical_string(&dictionary_commitment,
+                                 input.dictionary_generation_digest)) {
+      return false;
+    }
+  }
+  *final_lock_generation_digest = sha256_hex_string(lock_commitment);
+  *page_layout_digest = sha256_hex_string(page_commitment);
+  *dictionary_generation_digest = sha256_hex_string(dictionary_commitment);
+  return true;
+}
+
 Preserve_trx_physical_fence_lease::Preserve_trx_physical_fence_lease(
     Preserve_trx_physical_fence_lease &&other) noexcept
     : m_ops(other.m_ops),

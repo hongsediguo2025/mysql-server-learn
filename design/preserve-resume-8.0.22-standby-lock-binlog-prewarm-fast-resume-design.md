@@ -551,6 +551,14 @@ generation identity；既有 HMAC/credential 只证明 transport authenticity。
 token set、上述 digest、LSN 和 UUID。Prewarm 完成 canonicalization 和 digest 构建；gate 只能
 比较固定长度 digest，禁止在 gate 内重新遍历所有 page entry。
 
+上述三个 physical digest 在 lease proof 中是 **epoch 级 commitment**，不是要求每个 token
+具有相同 digest。Receiver 对每个 token 保留独立的 lock/page/dictionary digest，再按
+`{token,generation}` 稳定排序，以 domain-separated SHA-256 分别聚合为 epoch
+`final_lock_generation_digest`、`page_layout_digest` 和
+`dictionary_generation_digest`。Gate 可以在既有 token preflight 循环中聚合这些固定长度
+token facts，但不得重新解析 lock payload 或遍历 page entry。重复 token、空 digest、顺序不稳定
+或聚合结果与 lease proof 不一致均 fail closed。
+
 缺 production provider、provider 返回 false、debug executor 为空或默认 executor 回落，都不
 得让 metadata-only policy 可达。Debug simulator 只能由显式 test policy 安装，不能复用
 production provider slot。

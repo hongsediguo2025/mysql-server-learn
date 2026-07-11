@@ -2442,11 +2442,6 @@ bool strict_prepared_snapshot_matches_fence(
          facts.required_apply_lsn <= proof.target_frozen_lsn &&
          facts.physical_fence_lsn == proof.source_fence_lsn &&
          facts.epoch_fact_digest == proof.epoch_fact_digest &&
-         facts.final_lock_generation_digest ==
-             proof.final_lock_generation_digest &&
-         facts.page_layout_digest == proof.page_layout_digest &&
-         facts.dictionary_generation_digest ==
-             proof.dictionary_generation_digest &&
          facts.target_boot_incarnation == proof.target_boot_incarnation &&
          !facts.canonical_digest.empty();
 }
@@ -2550,6 +2545,30 @@ adopt_prepared_epoch_for_physical_promotion_impl(
           "strict prepared-token facts are not promotion ready");
     }
     snapshots.push_back(std::move(snapshot));
+  }
+  std::vector<Preserve_trx_epoch_physical_digest_input> digest_inputs;
+  digest_inputs.reserve(snapshots.size());
+  for (size_t i = 0; i < snapshots.size(); ++i) {
+    digest_inputs.push_back(
+        {request.tokens[i].token, request.tokens[i].generation,
+         snapshots[i].facts.final_lock_generation_digest,
+         snapshots[i].facts.page_layout_digest,
+         snapshots[i].facts.dictionary_generation_digest});
+  }
+  std::string final_lock_generation_digest;
+  std::string page_layout_digest;
+  std::string dictionary_generation_digest;
+  if (!preserved_trx_compute_epoch_physical_digest_commitments(
+          digest_inputs, &final_lock_generation_digest, &page_layout_digest,
+          &dictionary_generation_digest) ||
+      final_lock_generation_digest !=
+          request.expected_fence.final_lock_generation_digest ||
+      page_layout_digest != request.expected_fence.page_layout_digest ||
+      dictionary_generation_digest !=
+          request.expected_fence.dictionary_generation_digest) {
+    return finish(
+        Preserve_trx_physical_promotion_gate_status::PHYSICAL_FENCE_MISMATCH,
+        "strict prepared-token epoch digest commitment mismatch");
   }
   if (physical_lease.revalidate() !=
       Preserve_trx_physical_fence_status::OK) {

@@ -49,6 +49,20 @@ struct Preserve_trx_physical_fence_proof {
   bool implicit_native_continuity_proven{false};
 };
 
+struct Preserve_trx_epoch_physical_digest_input {
+  std::string token;
+  uint64_t generation{0};
+  std::string final_lock_generation_digest;
+  std::string page_layout_digest;
+  std::string dictionary_generation_digest;
+};
+
+bool preserved_trx_compute_epoch_physical_digest_commitments(
+    const std::vector<Preserve_trx_epoch_physical_digest_input> &inputs,
+    std::string *final_lock_generation_digest,
+    std::string *page_layout_digest,
+    std::string *dictionary_generation_digest);
+
 enum class Preserve_trx_physical_fence_status : uint8_t {
   OK = 0,
   INVALID_ARGUMENT,
