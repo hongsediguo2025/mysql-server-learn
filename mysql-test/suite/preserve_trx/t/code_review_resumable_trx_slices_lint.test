@@ -2199,6 +2199,16 @@ die "standby transfer production source client must resolve credential-name befo
   unless $transfer =~
          /default_transfer_client_connect[\s\S]*resolve_transfer_credential[\s\S]*mysql_real_connect/s &&
          $gunit =~ /ConfiguredFrameSinkDefaultClientUsesCredentialStore/s;
+die "standby transfer TCP client must use the server CA and verify peer identity\n"
+  unless $transfer =~
+         /default_transfer_client_connect[\s\S]*MYSQL_OPT_PROTOCOL[\s\S]*Ssl_mysql_main_status::get_ssl_ca_and_capath[\s\S]*MYSQL_OPT_SSL_CA[\s\S]*MYSQL_OPT_SSL_CAPATH[\s\S]*SSL_MODE_VERIFY_IDENTITY[\s\S]*mysql_real_connect[\s\S]*mysql_get_ssl_cipher/s &&
+         $transfer =~ /has_tcp_target\s*!=\s*has_socket_target/s;
+die "standby transfer credential file must be opened and validated without following links\n"
+  unless $transfer =~
+         /read_transfer_credential_secret_file[\s\S]*O_CLOEXEC[\s\S]*O_NOFOLLOW[\s\S]*O_NONBLOCK[\s\S]*my_fstat[\s\S]*transfer_credential_file_metadata_is_secure/s;
+die "standby transfer credential buffers must be cleansed after use\n"
+  unless $transfer =~ /Transfer_resolved_credential[\s\S]*OPENSSL_cleanse/s &&
+         $transfer =~ /read_transfer_credential_secret_file[\s\S]*OPENSSL_cleanse/s;
 die "standby transfer production source client must send frames through COM_PRESERVE_TRX_TRANSFER\n"
   unless $transfer =~
          /default_transfer_client_send[\s\S]*simple_command[\s\S]*COM_PRESERVE_TRX_TRANSFER/s;

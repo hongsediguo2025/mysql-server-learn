@@ -172,6 +172,22 @@ static int show_char_status(SHOW_VAR *var, char *buff,
 
 /* Status functions for mysql_main TLS context */
 
+bool Ssl_mysql_main_status::get_ssl_ca_and_capath(std::string *ssl_ca,
+                                                  std::string *ssl_capath) {
+  if (ssl_ca == nullptr || ssl_capath == nullptr) return false;
+  ssl_ca->clear();
+  ssl_capath->clear();
+  if (mysql_main == nullptr) return false;
+
+  Lock_and_access_ssl_acceptor_context main(mysql_main);
+  if (!main.have_ssl()) return false;
+  *ssl_ca = main.show_property(
+      Ssl_acceptor_context_property_type::current_tls_ca);
+  *ssl_capath = main.show_property(
+      Ssl_acceptor_context_property_type::current_tls_capath);
+  return true;
+}
+
 int Ssl_mysql_main_status::show_ssl_ctx_sess_accept(THD *, SHOW_VAR *var,
                                                     char *buff) {
   return show_long_status(var, buff,

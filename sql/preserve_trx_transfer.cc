@@ -47,6 +47,7 @@
 #include <vector>
 
 #include <openssl/evp.h>
+#include <openssl/crypto.h>
 #include <openssl/sha.h>
 
 #include "my_dir.h"
@@ -70,6 +71,7 @@
 #include "sql/protocol_classic.h"
 #include "sql/rpl_channel_credentials.h"
 #include "sql/sql_class.h"
+#include "sql/ssl_acceptor_context_status.h"
 #include "scope_guard.h"
 #include "storage/innobase/include/trx0preserve.h"
 
@@ -914,9 +916,10 @@ static bool preserve_trx_transfer_string_is_set(const char *value) {
 }
 
 static bool preserve_trx_transfer_source_endpoint_ready() {
-  const bool has_tcp_target =
-      preserve_trx_transfer_string_is_set(preserve_trx_transfer_target_host) &&
-      preserve_trx_transfer_target_port != 0;
+  const bool has_tcp_host =
+      preserve_trx_transfer_string_is_set(preserve_trx_transfer_target_host);
+  const bool has_tcp_port = preserve_trx_transfer_target_port != 0;
+  const bool has_tcp_target = has_tcp_host && has_tcp_port;
   const bool has_socket_target =
       preserve_trx_transfer_string_is_set(preserve_trx_transfer_target_socket);
 
@@ -926,7 +929,8 @@ static bool preserve_trx_transfer_source_endpoint_ready() {
              preserve_trx_transfer_target_user) &&
          preserve_trx_transfer_string_is_set(
              preserve_trx_transfer_credential_name) &&
-         (has_tcp_target || has_socket_target);
+         has_tcp_host == has_tcp_port &&
+         (has_tcp_target != has_socket_target);
 }
 
 Preserve_trx_transfer_artifact_decision
@@ -986,26 +990,69 @@ constexpr size_t kReceiverFrameSpoolRecordMagicLength =
 constexpr uint32_t kMaxTransferManifestStringBytes = 1024 * 1024;
 constexpr uint32_t kMaxTransferManifestObjects = 1024 * 1024;
 
+void cleanse_transfer_secret(std::string *value) {
+  if (value == nullptr) return;
+  if (!value->empty()) OPENSSL_cleanse(&(*value)[0], value->size());
+  value->clear();
+}
+
 struct Transfer_resolved_credential {
   std::string user;
   std::string password;
   std::string auth_plugin;
+
+  ~Transfer_resolved_credential() { cleanse_transfer_secret(&password); }
 };
+
+bool transfer_tls_identity_config_is_valid(bool unix_socket,
+                                           const std::string &ssl_ca,
+                                           const std::string &ssl_capath) {
+  return unix_socket || !ssl_ca.empty() || !ssl_capath.empty();
+}
+
+bool transfer_credential_file_metadata_is_secure(uint64_t mode,
+                                                 uint64_t owner_uid,
+                                                 uint64_t effective_uid) {
+  return MY_S_ISREG(mode) && owner_uid == effective_uid &&
+         (mode & (S_IRWXG | S_IRWXO)) == 0;
+}
 
 bool read_transfer_credential_secret_file(const char *path,
                                           std::string *secret) {
   if (path == nullptr || path[0] == '\0' || secret == nullptr) return false;
 
+  cleanse_transfer_secret(secret);
+
   constexpr size_t kMaxCredentialSecretBytes = 4096;
-  File file = my_open(path, O_RDONLY, MYF(0));
+  File file =
+      my_open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, MYF(0));
   if (file < 0) return false;
 
-  std::vector<unsigned char> buffer(kMaxCredentialSecretBytes + 1);
+  auto close_file = create_scope_guard([&] {
+    if (file >= 0) (void)my_close(file, MYF(0));
+  });
+
+  MY_STAT opened_stat;
+  if (my_fstat(file, &opened_stat) != 0 || opened_stat.st_size <= 0 ||
+      static_cast<uint64_t>(opened_stat.st_size) >
+          kMaxCredentialSecretBytes ||
+      !transfer_credential_file_metadata_is_secure(
+          static_cast<uint64_t>(opened_stat.st_mode),
+          static_cast<uint64_t>(opened_stat.st_uid),
+          static_cast<uint64_t>(geteuid()))) {
+    return false;
+  }
+
+  const size_t expected_bytes = static_cast<size_t>(opened_stat.st_size);
+  std::vector<unsigned char> buffer(expected_bytes);
+  auto cleanse_buffer = create_scope_guard([&] {
+    if (!buffer.empty()) OPENSSL_cleanse(buffer.data(), buffer.size());
+  });
   const size_t bytes =
-      my_read(file, buffer.data(), buffer.size(), MYF(0));
+      my_read(file, buffer.data(), buffer.size(), MYF(MY_FULL_IO));
   const int close_error = my_close(file, MYF(0));
-  if (bytes == MY_FILE_ERROR || close_error != 0 ||
-      bytes > kMaxCredentialSecretBytes) {
+  file = -1;
+  if (bytes == MY_FILE_ERROR || bytes != expected_bytes || close_error != 0) {
     return false;
   }
 
@@ -1015,7 +1062,8 @@ bool read_transfer_credential_secret_file(const char *path,
     value.pop_back();
   }
   if (value.empty()) return false;
-  *secret = std::move(value);
+  secret->assign(value.data(), value.size());
+  cleanse_transfer_secret(&value);
   return true;
 }
 
@@ -1027,6 +1075,8 @@ bool resolve_transfer_credential(const std::string &credential_name,
   String_set user;
   String_set pass;
   String_set auth;
+  auto cleanse_store_password =
+      create_scope_guard([&] { cleanse_transfer_secret(&pass.second); });
   if (Rpl_channel_credentials::get_instance().get_credentials(
           credential_name.c_str(), user, pass, auth) == 0) {
     if (!pass.first || pass.second.empty()) return false;
@@ -1055,7 +1105,8 @@ bool resolve_transfer_credential(const std::string &credential_name,
   }
 
   credential->user = configured_user;
-  credential->password = std::move(secret);
+  credential->password.assign(secret.data(), secret.size());
+  cleanse_transfer_secret(&secret);
   return true;
 }
 
@@ -1116,6 +1167,41 @@ Preserve_trx_transfer_status default_transfer_client_connect(
                          : endpoint.host.c_str();
   const char *socket =
       endpoint.socket.empty() ? nullptr : endpoint.socket.c_str();
+  const bool tcp_configured = !endpoint.host.empty() || endpoint.port != 0;
+  const bool unix_socket = socket != nullptr;
+  if (tcp_configured == unix_socket ||
+      (tcp_configured && (endpoint.host.empty() || endpoint.port == 0))) {
+    mysql_close(mysql);
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+  uint protocol =
+      unix_socket ? MYSQL_PROTOCOL_SOCKET : MYSQL_PROTOCOL_TCP;
+  if (mysql_options(mysql, MYSQL_OPT_PROTOCOL, &protocol) != 0) {
+    mysql_close(mysql);
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+  std::string ssl_ca;
+  std::string ssl_capath;
+  enum mysql_ssl_mode ssl_mode = SSL_MODE_DISABLED;
+  if (!unix_socket) {
+    if (!Ssl_mysql_main_status::get_ssl_ca_and_capath(&ssl_ca, &ssl_capath) ||
+        !transfer_tls_identity_config_is_valid(false, ssl_ca, ssl_capath)) {
+      mysql_close(mysql);
+      return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
+    if ((!ssl_ca.empty() &&
+         mysql_options(mysql, MYSQL_OPT_SSL_CA, ssl_ca.c_str()) != 0) ||
+        (!ssl_capath.empty() &&
+         mysql_options(mysql, MYSQL_OPT_SSL_CAPATH, ssl_capath.c_str()) != 0)) {
+      mysql_close(mysql);
+      return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
+    ssl_mode = SSL_MODE_VERIFY_IDENTITY;
+  }
+  if (mysql_options(mysql, MYSQL_OPT_SSL_MODE, &ssl_mode) != 0) {
+    mysql_close(mysql);
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
   Transfer_client_current_thd_guard current_thd_guard;
   if (mysql_real_connect(mysql, host, credential.user.c_str(),
                          credential.password.c_str(), nullptr, endpoint.port,
@@ -1126,6 +1212,13 @@ Preserve_trx_transfer_status default_transfer_client_connect(
     LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
     mysql_close(mysql);
     return Preserve_trx_transfer_status::IO_ERROR;
+  }
+  if (!unix_socket) {
+    const char *cipher = mysql_get_ssl_cipher(mysql);
+    if (cipher == nullptr || cipher[0] == '\0') {
+      mysql_close(mysql);
+      return Preserve_trx_transfer_status::IO_ERROR;
+    }
   }
 
   Transfer_client_connection *client = new (std::nothrow) Transfer_client_connection;
@@ -1212,6 +1305,7 @@ std::array<unsigned char, kPreservedTrxSha256Length> digest_context_material(
   std::array<unsigned char, kPreservedTrxSha256Length> digest{};
   SHA256(reinterpret_cast<const unsigned char *>(material.data()),
          material.length(), digest.data());
+  cleanse_transfer_secret(&material);
   return digest;
 }
 
@@ -3460,6 +3554,23 @@ Preserve_trx_transfer_status send_encoded_transfer_frame(
 }
 
 }  // namespace
+
+bool preserve_trx_transfer_tls_identity_config_is_valid_for_unit_test(
+    bool unix_socket, const std::string &ssl_ca, const std::string &ssl_capath) {
+  return transfer_tls_identity_config_is_valid(unix_socket, ssl_ca,
+                                               ssl_capath);
+}
+
+bool preserve_trx_transfer_credential_file_metadata_is_secure_for_unit_test(
+    uint64_t mode, uint64_t owner_uid, uint64_t effective_uid) {
+  return transfer_credential_file_metadata_is_secure(mode, owner_uid,
+                                                     effective_uid);
+}
+
+bool preserve_trx_transfer_read_credential_secret_file_for_unit_test(
+    const char *path, std::string *secret) {
+  return read_transfer_credential_secret_file(path, secret);
+}
 
 #ifndef NDEBUG
 bool preserve_trx_transfer_strict_prepared_key_for_unit_test(

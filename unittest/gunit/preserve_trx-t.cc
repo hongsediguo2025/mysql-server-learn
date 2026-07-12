@@ -4496,6 +4496,13 @@ TEST(PreservedTrxTransfer,
   guard.socket("target-uuid", "", "transfer_user", "transfer_credential");
   EXPECT_EQ(Preserve_trx_transfer_artifact_decision::UNSUPPORTED,
             preserve_trx_transfer_artifact_decision());
+
+  guard.tcp("target-uuid", "127.0.0.1", 3307, "transfer_user",
+            "transfer_credential");
+  preserve_trx_transfer_target_socket =
+      const_cast<char *>("/tmp/mysql-standby.sock");
+  EXPECT_EQ(Preserve_trx_transfer_artifact_decision::UNSUPPORTED,
+            preserve_trx_transfer_artifact_decision());
 }
 
 class Discarding_transfer_frame_sink final
@@ -4750,6 +4757,23 @@ TEST(PreservedTrxTransfer, ConfiguredFrameSinkDefaultClientUsesCredentialStore) 
             sink->send_encoded_frame("encoded-frame"));
 }
 
+TEST(PreservedTrxTransfer, ConfiguredFrameSinkDefaultTcpClientRequiresServerCa) {
+  Transfer_source_config_guard config;
+  config.tcp("target-uuid", "127.0.0.1", 3307, "transfer_user",
+             "transfer_credential");
+  Transfer_credentials_guard credentials;
+  credentials.store("transfer_credential", "transfer_user",
+                    "shared-transfer-secret");
+
+  std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> sink;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_make_configured_frame_sink(&sink));
+  ASSERT_NE(nullptr, sink.get());
+
+  EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED,
+            sink->send_encoded_frame("encoded-frame"));
+}
+
 TEST(PreservedTrxTransfer, ConfiguredFrameSinkRejectsMissingCredentialSecret) {
   Transfer_source_config_guard config;
   config.socket("target-uuid", "/tmp/mysql-preserve-transfer-missing.sock",
@@ -4792,6 +4816,70 @@ TEST(PreservedTrxTransfer, ConfiguredFrameSinkUsesCredentialSecretFile) {
             sink->send_encoded_frame("encoded-frame"));
   my_delete(secret_path, MYF(0));
   preserve_trx_transfer_credential_secret_file = nullptr;
+}
+
+TEST(PreservedTrxTransfer, TcpIdentityRequiresCaButUnixSocketDoesNot) {
+  EXPECT_FALSE(preserve_trx_transfer_tls_identity_config_is_valid_for_unit_test(
+      false, "", ""));
+  EXPECT_TRUE(preserve_trx_transfer_tls_identity_config_is_valid_for_unit_test(
+      false, "/tmp/ca.pem", ""));
+  EXPECT_TRUE(preserve_trx_transfer_tls_identity_config_is_valid_for_unit_test(
+      false, "", "/tmp/ca"));
+  EXPECT_TRUE(preserve_trx_transfer_tls_identity_config_is_valid_for_unit_test(
+      true, "", ""));
+}
+
+TEST(PreservedTrxTransfer, CredentialSecretFileMetadataIsOwnerOnlyRegular) {
+  const uint64_t regular_file = static_cast<uint64_t>(S_IFREG);
+  EXPECT_TRUE(
+      preserve_trx_transfer_credential_file_metadata_is_secure_for_unit_test(
+          regular_file | 0600, 501, 501));
+  EXPECT_FALSE(
+      preserve_trx_transfer_credential_file_metadata_is_secure_for_unit_test(
+          regular_file | 0644, 501, 501));
+  EXPECT_FALSE(
+      preserve_trx_transfer_credential_file_metadata_is_secure_for_unit_test(
+          regular_file | 0600, 502, 501));
+  EXPECT_FALSE(
+      preserve_trx_transfer_credential_file_metadata_is_secure_for_unit_test(
+          static_cast<uint64_t>(S_IFDIR) | 0700, 501, 501));
+}
+
+TEST(PreservedTrxTransfer, CredentialSecretFileRejectsSymlinkAndDirectory) {
+  char secret_path[FN_REFLEN];
+  File secret_file = create_temp_file(secret_path, nullptr,
+                                      "preserve-transfer-secure", 0600,
+                                      KEEP_FILE, MYF(0));
+  ASSERT_GE(secret_file, 0);
+  const char secret[] = "shared-transfer-secret\n";
+  ASSERT_EQ(strlen(secret),
+            my_write(secret_file, pointer_cast<const uchar *>(secret),
+                     strlen(secret), MYF(0)));
+  ASSERT_EQ(0, my_close(secret_file, MYF(0)));
+
+  std::string read_secret;
+  EXPECT_TRUE(preserve_trx_transfer_read_credential_secret_file_for_unit_test(
+      secret_path, &read_secret));
+  EXPECT_EQ("shared-transfer-secret", read_secret);
+
+  const std::string symlink_path = std::string(secret_path) + ".link";
+  ASSERT_EQ(0, symlink(secret_path, symlink_path.c_str()));
+  EXPECT_FALSE(preserve_trx_transfer_read_credential_secret_file_for_unit_test(
+      symlink_path.c_str(), &read_secret));
+  EXPECT_FALSE(preserve_trx_transfer_read_credential_secret_file_for_unit_test(
+      mysql_tmpdir, &read_secret));
+
+  const std::string fifo_path = std::string(secret_path) + ".fifo";
+  ASSERT_EQ(0, mkfifo(fifo_path.c_str(), 0600));
+  EXPECT_FALSE(preserve_trx_transfer_read_credential_secret_file_for_unit_test(
+      fifo_path.c_str(), &read_secret));
+
+  ASSERT_EQ(0, chmod(secret_path, 0644));
+  EXPECT_FALSE(preserve_trx_transfer_read_credential_secret_file_for_unit_test(
+      secret_path, &read_secret));
+  my_delete(symlink_path.c_str(), MYF(0));
+  my_delete(fifo_path.c_str(), MYF(0));
+  my_delete(secret_path, MYF(0));
 }
 
 TEST(PreservedTrxTransfer, ReceiverPolicyRequiresEnableAllowedSourceAndTarget) {

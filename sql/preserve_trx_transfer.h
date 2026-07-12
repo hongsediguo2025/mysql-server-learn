@@ -75,6 +75,13 @@ extern uint preserve_trx_transfer_commit_timeout_ms;
 extern ulonglong preserve_trx_transfer_phase1_batch_bytes;
 extern uint preserve_trx_transfer_phase1_batch_linger_ms;
 
+bool preserve_trx_transfer_tls_identity_config_is_valid_for_unit_test(
+    bool unix_socket, const std::string &ssl_ca, const std::string &ssl_capath);
+bool preserve_trx_transfer_credential_file_metadata_is_secure_for_unit_test(
+    uint64_t mode, uint64_t owner_uid, uint64_t effective_uid);
+bool preserve_trx_transfer_read_credential_secret_file_for_unit_test(
+    const char *path, std::string *secret);
+
 uint64_t preserve_trx_transfer_receiver_auto_prewarm_tokens_status();
 uint64_t preserve_trx_transfer_receiver_auto_prewarm_ready_tokens_status();
 uint64_t preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens_status();
