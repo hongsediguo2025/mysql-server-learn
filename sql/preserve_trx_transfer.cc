@@ -10434,6 +10434,10 @@ Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch
       break;
     }
   }
+  if (after_spool != nullptr) {
+    status = after_spool(after_spool_context, contains_commit_epoch);
+    if (status != Preserve_trx_transfer_status::OK) return status;
+  }
   Receiver_payload_batch_apply_context context;
   context.root_dir = &root_dir;
   context.store = store;
@@ -10445,10 +10449,6 @@ Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch
   status = preserve_trx_transfer_apply_receiver_frame_batch_with_workers(
       frames, written_metadata == nullptr ? worker_count : 1,
       apply_receiver_payload_batch_frame, &context);
-  if (status != Preserve_trx_transfer_status::OK) return status;
-  if (after_spool != nullptr) {
-    status = after_spool(after_spool_context, contains_commit_epoch);
-  }
   return status;
 }
 
@@ -10572,7 +10572,7 @@ static Preserve_trx_transfer_status send_receiver_durable_spool_ack(
   status = preserve_trx_transfer_encode_frame_ack(ack, &encoded_ack);
   if (status != Preserve_trx_transfer_status::OK) return status;
 
-  /* The semantic apply succeeded; publish the single authenticated response. */
+  /* The authenticated durable spool is complete; semantic apply continues. */
   my_ok(ack_context->thd, 0, 0, encoded_ack.c_str());
   ack_context->thd->send_statement_status();
   ack_context->thd->get_stmt_da()->reset_diagnostics_area();

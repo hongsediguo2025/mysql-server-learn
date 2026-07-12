@@ -199,10 +199,10 @@ die "THD::release_resources must wait for preserve external THD pins before rele
 my ($receiver_payload_batch) =
   $transfer =~ /(Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch\([\s\S]*?^})/m
   or die "could not isolate standby receiver encoded payload batch path\n";
-die "standby receiver encoded payload batch path must apply admitted frames before acknowledging them\n"
+die "standby receiver encoded payload batch path must acknowledge durable spool before semantic apply\n"
   unless $receiver_payload_batch !~ /\(void\)\s*worker_count\s*;/ &&
          $receiver_payload_batch =~ /worker_count/s &&
-         $receiver_payload_batch =~ /pre_admit_receiver_batch_sequence[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers[\s\S]*after_spool/s &&
+         $receiver_payload_batch =~ /pre_admit_receiver_batch_sequence[\s\S]*after_spool[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s &&
          $receiver_payload_batch =~ /preserve_trx_transfer_apply_receiver_frame_batch_with_workers\(\s*frames,\s*(?:worker_count|written_metadata\s*==\s*nullptr\s*\?\s*worker_count\s*:\s*1)/s;
 my ($receiver_apply_frame) =
   $transfer =~ /(Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame[\s\S]*?^}\n\nPreserve_trx_transfer_status preserve_trx_transfer_replay_receiver_spool)/m
@@ -2272,7 +2272,7 @@ die "standby transfer batch decoder must validate count against remaining bytes 
          /preserve_trx_transfer_decode_manifest[\s\S]*kMinEncodedObjectBytes[\s\S]*acquire_transfer_decode_memory_lease[\s\S]*reserve\s*\(\s*object_count\s*\)/s;
 die "standby transfer online handler must retain aggregate decoded payload accounting through apply and ACK\n"
   unless $receiver_payload_batch =~
-         /payload_lease[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers[\s\S]*after_spool/s;
+         /payload_lease[\s\S]*after_spool[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
 die "standby transfer unconfirmed short-write rollback must taint sequence admission\n"
   unless $transfer =~
          /rollback_confirmed[\s\S]*Preserve_trx_transfer_status::CORRUPT/s &&

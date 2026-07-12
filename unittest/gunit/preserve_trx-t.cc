@@ -16136,9 +16136,12 @@ transfer_receiver_promotion_barrier_probe_apply(
 
 struct Transfer_receiver_after_spool_probe {
   Preserved_trx_carrier *carrier{nullptr};
+  std::string root_dir;
+  std::string epoch_id;
   bool called{false};
   bool contains_commit_epoch{false};
   bool saw_unpublished_tokens{false};
+  bool semantic_apply_not_started{false};
 };
 
 static Preserve_trx_transfer_status transfer_receiver_after_spool_probe(
@@ -16155,6 +16158,9 @@ static Preserve_trx_transfer_status transfer_receiver_after_spool_probe(
   probe->called = true;
   probe->contains_commit_epoch = contains_commit_epoch;
   probe->saw_unpublished_tokens = listing.standby_pending_tokens.empty();
+  probe->semantic_apply_not_started =
+      !preserve_trx_transfer_epoch_committed(probe->root_dir,
+                                             probe->epoch_id);
   return Preserve_trx_transfer_status::OK;
 }
 
@@ -18642,7 +18648,7 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
-       TransferReceiverBatchSignalsAfterApplyBeforeProjection) {
+       TransferReceiverBatchSignalsAfterSpoolBeforeSemanticApply) {
   Transfer_codec_context_guard codec_guard;
   Transfer_receiver_config_guard receiver_config;
   receiver_config.allow("source-uuid", "target-uuid");
@@ -18675,6 +18681,8 @@ TEST_F(PreserveSnapshotTest,
   Preserve_trx_transfer_receiver_registry registry;
   Transfer_receiver_after_spool_probe probe;
   probe.carrier = &carrier;
+  probe.root_dir = m_dir;
+  probe.epoch_id = "epoch-source-session-spool-signal";
 
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             preserve_trx_transfer_handle_receiver_payload_batch(
@@ -18683,6 +18691,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_TRUE(probe.called);
   EXPECT_TRUE(probe.contains_commit_epoch);
   EXPECT_TRUE(probe.saw_unpublished_tokens);
+  EXPECT_TRUE(probe.semantic_apply_not_started);
 
   ASSERT_TRUE(wait_for_epoch_ready_token("epoch-source-session-spool-signal",
                                          914));
