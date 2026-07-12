@@ -16553,6 +16553,48 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
+       TransferPhase1ManifestBatchSkipsDeclaredTokenWithoutObjects) {
+  Transfer_codec_context_guard codec_guard;
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  Transfer_receiver_payload_test_sink sink(m_dir, &store, &registry, nullptr);
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-phase1-partial-manifest", "source-uuid", "target-uuid",
+      1048576, &sink);
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_tokens_batch({811, 812}));
+
+  Local_file_preserved_trx_carrier warm_carrier(m_dir);
+  PrebuiltRecordLocksBlob record_blob;
+  create_warm_prebuilt_record_locks_blob(
+      &warm_carrier, "phase1-partial-record-811", record_locks_payload(),
+      &record_blob);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_stream_prebuilt_record_locks_blob(
+                &session, 811, m_dir, record_blob));
+
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            session.begin_token_prewarm_manifests_batch({811, 812}));
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            session.abort_token(812, "source_phase1_target_removed"));
+
+  Preserve_trx_transfer_receiver_record receiving;
+  ASSERT_TRUE(
+      registry.lookup("epoch-phase1-partial-manifest", 811, &receiving));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::RECEIVING,
+            receiving.state);
+  Preserve_trx_transfer_receiver_record aborted;
+  ASSERT_TRUE(registry.lookup("epoch-phase1-partial-manifest", 812, &aborted));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::ABORTED, aborted.state);
+  preserve_trx_transfer_shutdown_receiver_prewarm_workers();
+}
+
+TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSessionSnapshotsPhase1BatchLimits) {
   Transfer_codec_context_guard codec_guard;
   Transfer_receiver_config_guard receiver_config;

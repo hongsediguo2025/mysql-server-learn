@@ -6663,6 +6663,7 @@ Preserve_trx_transfer_source_epoch_session::begin_token_prewarm_manifests_batch(
   encoded_frames.reserve(transfer_tokens.size());
   newly_started.reserve(transfer_tokens.size());
   const uint64_t first_sequence = m_next_sequence;
+  uint64_t next_sequence = first_sequence;
   for (uint64_t transfer_token : transfer_tokens) {
     if (transfer_token == 0 || !token_declared(transfer_token) ||
         token_resolved(transfer_token) ||
@@ -6673,7 +6674,7 @@ Preserve_trx_transfer_source_epoch_session::begin_token_prewarm_manifests_batch(
     const auto declared_it = m_streaming_declared_objects.find(transfer_token);
     if (declared_it == m_streaming_declared_objects.end() ||
         declared_it->second.empty()) {
-      return Preserve_trx_transfer_status::UNSUPPORTED;
+      continue;
     }
 
     Preserve_trx_transfer_manifest manifest;
@@ -6697,7 +6698,7 @@ Preserve_trx_transfer_source_epoch_session::begin_token_prewarm_manifests_batch(
     if (status != Preserve_trx_transfer_status::OK) return status;
     Preserve_trx_transfer_frame begin;
     begin.type = Preserve_trx_transfer_frame_type::BEGIN;
-    begin.sequence = m_next_sequence++;
+    begin.sequence = next_sequence++;
     begin.epoch_id = manifest.epoch_id;
     begin.token = manifest.token;
     begin.manifest_payload = std::move(manifest_payload);
