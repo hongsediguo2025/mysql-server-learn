@@ -12735,7 +12735,7 @@ TEST_F(PreserveSnapshotTest,
   const uint64_t transfer_token = 1026;
   Preserve_snapshot_metadata meta = metadata();
   meta.token = test_transfer_token_string(transfer_token);
-  meta.record_locks_payload = record_locks_payload();
+  meta.record_locks_payload = metadata_only_record_locks_payload();
 
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
@@ -12777,14 +12777,53 @@ TEST_F(PreserveSnapshotTest,
                                           object.descriptor.object_id));
   }
 
+  const auto record_object = std::find_if(
+      objects.begin(), objects.end(), [](const auto &object) {
+        return object.descriptor.object_id == kPreservedTrxBlobRecordLocks;
+      });
+  ASSERT_NE(objects.end(), record_object);
+  lock_preserve_record_lock_metadata_facts_t lock_facts;
+  ASSERT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_facts(
+                record_object->payload, &lock_facts));
+  lock_preserve_metadata_plan_validation_t validation;
+  validation.object_generation = manifest.source_epoch_commit_lsn;
+  validation.expected_object_generation = manifest.source_epoch_commit_lsn;
+  validation.physical_fence_lsn = manifest.source_epoch_commit_lsn;
+  validation.artifact_protocol_version = 1;
+  validation.source_server_version = 80022;
+  validation.object_digest = lock_facts.final_lock_generation_digest;
+  validation.final_lock_generation_digest =
+      lock_facts.final_lock_generation_digest;
+  validation.page_layout_digest = lock_facts.page_layout_digest;
+  validation.dictionary_generation_digest =
+      lock_facts.dictionary_generation_digest;
+  validation.implicit_native_continuity_proven = true;
+  validation.is_final_quiesced = true;
+  auto lock_plan = std::make_unique<lock_preserve_metadata_plan_t>();
+  ASSERT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_plan(
+                record_object->payload, validation,
+                transfer_metadata_dict_lease_ops(), lock_plan.get()));
+  ASSERT_TRUE(
+      preserve_trx_transfer_put_receiver_record_lock_plan_for_unit_test(
+          m_dir, manifest, std::move(lock_plan), lock_facts));
+  Preserve_trx_prepared_token_key strict_key;
+  ASSERT_TRUE(preserve_trx_transfer_strict_prepared_key_for_unit_test(
+      m_dir, manifest, bundle.metadata.token, &strict_key));
+  auto &strict_registry = preserved_trx_strict_prepared_token_registry();
+  strict_registry.purge_epoch(strict_key.source_uuid, strict_key.epoch_id);
+
   const uint64_t prewarm_tokens_before =
       preserve_trx_transfer_receiver_seal_prewarm_tokens_status();
   const uint64_t not_ready_before =
       preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens_status();
+  const uint64_t success_before =
+      preserve_trx_transfer_receiver_seal_prewarm_success_tokens_status();
   const uint64_t page_count_before =
       preserve_trx_promotion_prewarm_record_lock_page_count_status();
 
-  preserve_trx_transfer_set_receiver_object_prewarm_delay_ms_for_unit_test(2000);
+  preserve_trx_transfer_set_receiver_object_prewarm_delay_ms_for_unit_test(500);
 
   std::string manifest_payload;
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
@@ -12812,11 +12851,35 @@ TEST_F(PreserveSnapshotTest,
             not_ready_before);
   EXPECT_EQ(page_count_before,
             preserve_trx_promotion_prewarm_record_lock_page_count_status());
+  Preserve_trx_prepared_token_snapshot strict_snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            strict_registry.snapshot(strict_key, &strict_snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::PREWARMED_PENDING_FINAL_FACT,
+            strict_snapshot.state);
+
+  preserve_trx_transfer_put_receiver_object_prewarm_proof_for_unit_test(
+      m_dir, manifest, record_object->descriptor.object_id, 1, 1, 0, 1, 1);
+  begin.sequence = 2;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, begin, &store, &registry, 300, nullptr));
+
+  for (uint attempt = 0; attempt < 300; ++attempt) {
+    if (preserve_trx_transfer_receiver_seal_prewarm_success_tokens_status() >
+        success_before) {
+      break;
+    }
+    my_sleep(10000);
+  }
+  EXPECT_GT(preserve_trx_transfer_receiver_seal_prewarm_success_tokens_status(),
+            success_before);
 
   Preserve_trx_promotion_ready_summary ready_summary;
   (void)preserved_trx_promotion_ready_summary_for_epoch(
       m_dir, manifest.epoch_id, &ready_summary);
   EXPECT_TRUE(ready_summary.ready_tokens.empty());
+  preserve_trx_transfer_shutdown_receiver_prewarm_workers();
+  strict_registry.purge_epoch(strict_key.source_uuid, strict_key.epoch_id);
 }
 
 TEST_F(PreserveSnapshotTest,

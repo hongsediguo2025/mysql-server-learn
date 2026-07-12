@@ -3045,6 +3045,17 @@ bool prepare_strict_bundle_for_receiver(
   const std::string object_set_digest =
       digest_hex(sha256_digest(encoded_manifest));
 
+  Preserve_trx_prepared_token_snapshot existing;
+  if (preserved_trx_strict_prepared_token_registry().snapshot(key, &existing) ==
+          Preserve_trx_prepared_status::OK &&
+      (existing.state == Preserve_trx_prepared_token_state::
+                             PREWARMED_PENDING_FINAL_FACT ||
+       existing.state ==
+           Preserve_trx_prepared_token_state::READY_FACTS_PENDING_LEASE ||
+       existing.state == Preserve_trx_prepared_token_state::READY_FOR_GATE)) {
+    return true;
+  }
+
   Mysql_binlog_preserve_cache_facts binlog_facts;
   std::unique_ptr<Receiver_binlog_staging_payload_reader> binlog_reader;
   uint64_t native_binlog_bytes = 0;
