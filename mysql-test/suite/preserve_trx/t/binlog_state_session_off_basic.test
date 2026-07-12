@@ -7,6 +7,7 @@ DROP TABLE IF EXISTS t_session_off;
 
 SET GLOBAL preserve_trx_enable=ON;
 
+SET SESSION binlog_format=ROW;
 SET SESSION sql_log_bin=0;
 
 CREATE TABLE t_session_off(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
@@ -28,6 +29,7 @@ PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
 --source suite/preserve_trx/include/get_preserved_token.inc
 
 SELECT @@global.log_bin AS log_bin_after_restart;
+SET SESSION binlog_format=ROW;
 
 --replace_column 1 TOKEN
 SELECT TOKEN, BINLOG_STATE, WROTE_TO_CACHE, BINLOG_CACHE_SIZE,

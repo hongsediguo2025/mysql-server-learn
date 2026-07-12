@@ -10,6 +10,7 @@ SET GLOBAL preserve_trx_enable=ON;
 --let MYSQLD_DATADIR= `SELECT @@datadir`
 
 --disable_query_log
+CALL mtr.add_suppression("Found 1 prepared XA transactions");
 CALL mtr.add_suppression("Skip updating information_schema metadata in InnoDB read-only mode");
 CALL mtr.add_suppression("Skip re-populating collations and character sets tables in InnoDB read-only mode");
 CALL mtr.add_suppression("PRESERVE: failed to mark preserved transaction snapshot tainted while innodb_force_recovery is enabled");
