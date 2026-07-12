@@ -306,6 +306,7 @@ struct Preserve_trx_transfer_epoch_fact {
   std::string epoch_id;
   std::string source_server_uuid;
   std::string target_server_uuid;
+  uint64_t source_fence_lsn{0};
   std::vector<Preserve_trx_transfer_epoch_fact_token> tokens;
   std::array<unsigned char, kPreservedTrxSha256Length> fact_digest{};
 };
@@ -785,6 +786,11 @@ bool preserve_trx_transfer_put_receiver_record_lock_plan_for_unit_test(
     const Preserve_trx_transfer_manifest &manifest,
     std::unique_ptr<lock_preserve_metadata_plan_t> plan,
     const lock_preserve_record_lock_metadata_facts_t &facts);
+bool preserve_trx_transfer_receiver_residency_wait_for_unit_test(
+    uint64_t page_count, const std::vector<uint64_t> &resident_page_samples,
+    const std::vector<uint64_t> &monotonic_time_samples,
+    size_t cancel_after_samples, uint64_t timeout_us,
+    size_t *sample_count);
 #endif
 void preserve_trx_transfer_put_receiver_object_prewarm_proof_for_unit_test(
     const std::string &root_dir,

@@ -2126,8 +2126,8 @@ class lock_preserve_metadata_plan_t::Impl {
  public:
   struct Entry {
     Preserve_record_lock_entry record;
-    dict_index_t *index{nullptr};
     void *opaque_lease{nullptr};
+    uint64_t lease_retained_bytes{0};
     bool (*revalidate)(void *, const std::string &, dict_index_t **){nullptr};
     void (*release)(void *){nullptr};
 
@@ -2137,12 +2137,12 @@ class lock_preserve_metadata_plan_t::Impl {
 
     Entry(Entry &&other) noexcept
         : record(std::move(other.record)),
-          index(other.index),
           opaque_lease(other.opaque_lease),
+          lease_retained_bytes(other.lease_retained_bytes),
           revalidate(other.revalidate),
           release(other.release) {
-      other.index = nullptr;
       other.opaque_lease = nullptr;
+      other.lease_retained_bytes = 0;
       other.revalidate = nullptr;
       other.release = nullptr;
     }
@@ -2151,12 +2151,12 @@ class lock_preserve_metadata_plan_t::Impl {
       if (this == &other) return *this;
       reset();
       record = std::move(other.record);
-      index = other.index;
       opaque_lease = other.opaque_lease;
+      lease_retained_bytes = other.lease_retained_bytes;
       revalidate = other.revalidate;
       release = other.release;
-      other.index = nullptr;
       other.opaque_lease = nullptr;
+      other.lease_retained_bytes = 0;
       other.revalidate = nullptr;
       other.release = nullptr;
       return *this;
@@ -2168,8 +2168,8 @@ class lock_preserve_metadata_plan_t::Impl {
       if (opaque_lease != nullptr && release != nullptr) {
         release(opaque_lease);
       }
-      index = nullptr;
       opaque_lease = nullptr;
+      lease_retained_bytes = 0;
       revalidate = nullptr;
       release = nullptr;
     }
@@ -2210,6 +2210,23 @@ uint64_t lock_preserve_metadata_plan_t::bitmap_bits() const {
 uint64_t lock_preserve_metadata_plan_t::capacity_bytes() const {
   return m_impl == nullptr ? 0 : m_impl->capacity_bytes;
 }
+
+#ifndef NDEBUG
+bool lock_preserve_metadata_plan_t::revalidates_stable_ids_for_unit_test()
+    const {
+  if (m_impl == nullptr || !m_impl->ready) return false;
+  for (const Impl::Entry &entry : m_impl->entries) {
+    dict_index_t *index = nullptr;
+    if (entry.revalidate == nullptr || entry.opaque_lease == nullptr ||
+        !entry.revalidate(entry.opaque_lease,
+                          m_impl->dictionary_generation_digest, &index) ||
+        index == nullptr) {
+      return false;
+    }
+  }
+  return true;
+}
+#endif
 
 lock_preserve_import_journal_t::lock_preserve_import_journal_t()
     : m_impl(std::make_unique<Impl>()) {}
@@ -2320,12 +2337,14 @@ lock_preserve_build_record_lock_metadata_plan(
     entry.record.record_images.clear();
     entry.revalidate = dict_lease_ops.revalidate;
     entry.release = dict_lease_ops.release;
+    dict_index_t *acquired_index = nullptr;
     if (!dict_lease_ops.acquire(
             dict_lease_ops.context, entry.record.table_id,
             entry.record.index_id, entry.record.space_id,
             validation.dictionary_generation_digest, &entry.opaque_lease,
-            &entry.index) ||
-        entry.opaque_lease == nullptr || entry.index == nullptr) {
+            &acquired_index, &entry.lease_retained_bytes) ||
+        entry.opaque_lease == nullptr || acquired_index == nullptr ||
+        entry.lease_retained_bytes == 0) {
       return lock_preserve_metadata_plan_status::DICT_LEASE_FAILED;
     }
 
@@ -2336,14 +2355,37 @@ lock_preserve_build_record_lock_metadata_plan(
     prepared->entries.push_back(std::move(entry));
   }
 
-  prepared->capacity_bytes =
-      sizeof(lock_preserve_metadata_plan_t::Impl) +
-      prepared->entries.capacity() *
-          sizeof(lock_preserve_metadata_plan_t::Impl::Entry);
+  uint64_t capacity_bytes = 0;
+  const auto add_capacity = [&capacity_bytes](uint64_t bytes) {
+    if (UINT64_MAX - capacity_bytes < bytes) return false;
+    capacity_bytes += bytes;
+    return true;
+  };
+  const auto add_scaled_capacity = [&add_capacity](size_t count,
+                                                   size_t element_size) {
+    if (element_size != 0 && count > UINT64_MAX / element_size) return false;
+    return add_capacity(static_cast<uint64_t>(count) * element_size);
+  };
+  if (!add_capacity(sizeof(lock_preserve_metadata_plan_t::Impl)) ||
+      !add_scaled_capacity(
+          prepared->entries.capacity(),
+          sizeof(lock_preserve_metadata_plan_t::Impl::Entry)) ||
+      !add_capacity(prepared->dictionary_generation_digest.capacity()) ||
+      !add_capacity(sizeof(std::vector<lock_t *>)) ||
+      !add_scaled_capacity(prepared->entries.capacity(), sizeof(lock_t *))) {
+    return lock_preserve_metadata_plan_status::CORRUPT_METADATA;
+  }
   for (const lock_preserve_metadata_plan_t::Impl::Entry &entry :
        prepared->entries) {
-    prepared->capacity_bytes += entry.record.bitmap.capacity();
+    if (!add_capacity(entry.record.bitmap.capacity()) ||
+        !add_scaled_capacity(entry.record.heap_offsets.capacity(),
+                             sizeof(uint32_t)) ||
+        !add_capacity(entry.record.record_images.capacity()) ||
+        !add_capacity(entry.lease_retained_bytes)) {
+      return lock_preserve_metadata_plan_status::CORRUPT_METADATA;
+    }
   }
+  prepared->capacity_bytes = capacity_bytes;
   prepared->ready = true;
   plan->m_impl = std::move(prepared);
   return lock_preserve_metadata_plan_status::OK;
@@ -2394,18 +2436,23 @@ static dict_index_t *lock_preserve_metadata_default_lease_index(
     return nullptr;
   }
   dict_index_t *index = lock_preserve_find_index(table, lease.index_id);
-  return index != nullptr && index->space == lease.space_id ? index : nullptr;
+  return index != nullptr && index->space == lease.space_id &&
+                 !index->to_be_dropped && !index->is_corrupted()
+             ? index
+             : nullptr;
 }
 
 static bool lock_preserve_metadata_default_lease_acquire(
     void *opaque_context, table_id_t table_id, space_index_t index_id,
     space_id_t space_id, const std::string &, void **opaque_lease,
-    dict_index_t **index) {
-  if (opaque_context == nullptr || opaque_lease == nullptr || index == nullptr) {
+    dict_index_t **index, uint64_t *retained_bytes) {
+  if (opaque_context == nullptr || opaque_lease == nullptr || index == nullptr ||
+      retained_bytes == nullptr) {
     return false;
   }
   *opaque_lease = nullptr;
   *index = nullptr;
+  *retained_bytes = 0;
   if (dict_sys == nullptr) return false;
 
   auto *context = static_cast<Lock_preserve_metadata_default_lease_context *>(
@@ -2422,10 +2469,13 @@ static bool lock_preserve_metadata_default_lease_acquire(
   lease->table_id = table_id;
   lease->index_id = index_id;
   lease->space_id = space_id;
+  mutex_enter(&dict_sys->mutex);
   *index = lock_preserve_metadata_default_lease_index(*lease);
+  mutex_exit(&dict_sys->mutex);
   if (*index == nullptr) return false;
 
   *opaque_lease = lease.release();
+  *retained_bytes = sizeof(Lock_preserve_metadata_default_lease);
   return true;
 }
 
@@ -2434,7 +2484,9 @@ static bool lock_preserve_metadata_default_lease_revalidate(
   if (opaque_lease == nullptr || index == nullptr) return false;
   auto *lease =
       static_cast<Lock_preserve_metadata_default_lease *>(opaque_lease);
+  mutex_enter(&dict_sys->mutex);
   *index = lock_preserve_metadata_default_lease_index(*lease);
+  mutex_exit(&dict_sys->mutex);
   return *index != nullptr;
 }
 
@@ -2476,7 +2528,7 @@ lock_preserve_check_record_bitmap_conflicts_from_metadata(
     if (entry.revalidate == nullptr || entry.opaque_lease == nullptr ||
         !entry.revalidate(entry.opaque_lease,
                           plan.m_impl->dictionary_generation_digest, &index) ||
-        index == nullptr || index != entry.index) {
+        index == nullptr) {
       return lock_preserve_metadata_conflict_result::DICT_LEASE_INVALID;
     }
 
@@ -2508,7 +2560,7 @@ dberr_t lock_preserve_apply_record_lock_metadata_plan(
     if (entry.revalidate == nullptr || entry.opaque_lease == nullptr ||
         !entry.revalidate(entry.opaque_lease,
                           plan.m_impl->dictionary_generation_digest, &index) ||
-        index == nullptr || index != entry.index) {
+        index == nullptr) {
       return DB_ERROR;
     }
 

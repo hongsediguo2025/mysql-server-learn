@@ -131,16 +131,24 @@ std::string make_metadata_record_lock_payload(uint32_t type_mode,
   return payload;
 }
 
+struct Metadata_dict_test_lease {
+  uint64_t identity{1};
+  std::array<unsigned char, 4096 - sizeof(uint64_t)> retained{};
+};
+
 bool metadata_dict_lease_acquire(
     void *, table_id_t, space_index_t, space_id_t, const std::string &,
-    void **opaque_lease, dict_index_t **index) {
-  if (opaque_lease == nullptr || index == nullptr) return false;
-  *opaque_lease = new uint64_t(1);
+    void **opaque_lease, dict_index_t **index, uint64_t *retained_bytes) {
+  if (opaque_lease == nullptr || index == nullptr || retained_bytes == nullptr)
+    return false;
+  *opaque_lease = new Metadata_dict_test_lease();
   *index = reinterpret_cast<dict_index_t *>(static_cast<uintptr_t>(1));
+  *retained_bytes = sizeof(Metadata_dict_test_lease);
   return true;
 }
 
 std::atomic<bool> metadata_dict_lease_valid{true};
+std::atomic<bool> metadata_dict_lease_rebound{false};
 std::atomic<uint64_t> metadata_dict_lease_release_count{0};
 
 bool metadata_dict_lease_revalidate(void *opaque_lease, const std::string &,
@@ -149,21 +157,24 @@ bool metadata_dict_lease_revalidate(void *opaque_lease, const std::string &,
       !metadata_dict_lease_valid.load(std::memory_order_relaxed)) {
     return false;
   }
-  *index = reinterpret_cast<dict_index_t *>(static_cast<uintptr_t>(1));
+  *index = reinterpret_cast<dict_index_t *>(static_cast<uintptr_t>(
+      metadata_dict_lease_rebound.load(std::memory_order_relaxed) ? 2 : 1));
   return true;
 }
 
 void metadata_dict_lease_release(void *opaque_lease) {
   metadata_dict_lease_release_count.fetch_add(1, std::memory_order_relaxed);
-  delete static_cast<uint64_t *>(opaque_lease);
+  delete static_cast<Metadata_dict_test_lease *>(opaque_lease);
 }
 
 bool metadata_dict_lease_partial_acquire_failure(
     void *, table_id_t, space_index_t, space_id_t, const std::string &,
-    void **opaque_lease, dict_index_t **index) {
-  if (opaque_lease == nullptr || index == nullptr) return false;
-  *opaque_lease = new uint64_t(1);
+    void **opaque_lease, dict_index_t **index, uint64_t *retained_bytes) {
+  if (opaque_lease == nullptr || index == nullptr || retained_bytes == nullptr)
+    return false;
+  *opaque_lease = new Metadata_dict_test_lease();
   *index = nullptr;
+  *retained_bytes = sizeof(Metadata_dict_test_lease);
   return false;
 }
 
@@ -490,6 +501,26 @@ TEST(LockWarmcopyMetadataPlan, DeadlineAndDictLeaseFailBeforePageAccess) {
   metadata_dict_lease_valid.store(true, std::memory_order_relaxed);
 }
 
+TEST(LockWarmcopyMetadataPlan, RevalidationUsesStableIdsNotRetainedIndex) {
+  constexpr uint32_t kRecordBitmapMargin = 64;
+  const uint32_t page_n_heap = 16;
+  const size_t bitmap_bytes =
+      1 + ((page_n_heap + kRecordBitmapMargin) / 8);
+  std::string bitmap(bitmap_bytes, '\0');
+  bitmap[0] = static_cast<char>(0x02);
+  const std::string payload = make_metadata_record_lock_payload(
+      LOCK_REC | LOCK_X, page_n_heap, bitmap);
+  lock_preserve_metadata_plan_t plan;
+  ASSERT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_plan(
+                payload, make_metadata_plan_validation(payload),
+                make_metadata_dict_lease_ops(), &plan));
+
+  metadata_dict_lease_rebound.store(true, std::memory_order_relaxed);
+  EXPECT_TRUE(plan.revalidates_stable_ids_for_unit_test());
+  metadata_dict_lease_rebound.store(false, std::memory_order_relaxed);
+}
+
 TEST(LockWarmcopyMetadataPlan, PartialDictLeaseAcquireIsReleased) {
   constexpr uint32_t kRecordBitmapMargin = 64;
   const uint32_t page_n_heap = 16;
@@ -509,6 +540,39 @@ TEST(LockWarmcopyMetadataPlan, PartialDictLeaseAcquireIsReleased) {
                 payload, make_metadata_plan_validation(payload), ops, &plan));
   EXPECT_EQ(1U, metadata_dict_lease_release_count.load(
                     std::memory_order_relaxed));
+}
+
+TEST(LockWarmcopyMetadataPlan, CapacityIncludesRetainedHeapOffsets) {
+  constexpr uint32_t kPageNHeap = 4096;
+  std::string bitmap(kPageNHeap / 8, static_cast<char>(0xff));
+  const std::string payload = make_metadata_record_lock_payload(
+      LOCK_REC | LOCK_X, kPageNHeap, bitmap);
+
+  lock_preserve_metadata_plan_t plan;
+  ASSERT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_plan(
+                payload, make_metadata_plan_validation(payload),
+                make_metadata_dict_lease_ops(), &plan));
+
+  const uint64_t retained_heap_offsets =
+      static_cast<uint64_t>(kPageNHeap) * sizeof(uint32_t);
+  EXPECT_GE(plan.capacity_bytes(), retained_heap_offsets + bitmap.size());
+}
+
+TEST(LockWarmcopyMetadataPlan, CapacityIncludesRetainedDictionaryLease) {
+  constexpr uint32_t kPageNHeap = 16;
+  std::string bitmap(1 + ((kPageNHeap + 64) / 8), '\0');
+  bitmap[0] = static_cast<char>(0x02);
+  const std::string payload = make_metadata_record_lock_payload(
+      LOCK_REC | LOCK_X, kPageNHeap, bitmap);
+
+  lock_preserve_metadata_plan_t plan;
+  ASSERT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_plan(
+                payload, make_metadata_plan_validation(payload),
+                make_metadata_dict_lease_ops(), &plan));
+
+  EXPECT_GE(plan.capacity_bytes(), sizeof(Metadata_dict_test_lease));
 }
 
 TEST(LockWarmcopyRecordShard, SetResetMutationsUpdateGenerationAndBitmap) {

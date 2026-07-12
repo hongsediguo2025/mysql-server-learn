@@ -2634,10 +2634,12 @@ std::string metadata_only_record_locks_payload() {
 
 bool transfer_metadata_dict_lease_acquire(
     void *, uint64_t, uint64_t, uint32_t, const std::string &,
-    void **opaque_lease, dict_index_t **index) {
-  if (opaque_lease == nullptr || index == nullptr) return false;
+    void **opaque_lease, dict_index_t **index, uint64_t *retained_bytes) {
+  if (opaque_lease == nullptr || index == nullptr || retained_bytes == nullptr)
+    return false;
   *opaque_lease = new uint64_t(1);
   *index = reinterpret_cast<dict_index_t *>(static_cast<uintptr_t>(1));
+  *retained_bytes = sizeof(uint64_t);
   return true;
 }
 
@@ -4525,6 +4527,7 @@ TEST(PreservedTrxTransfer, EpochFactRejectsZeroApplyBarrierLsns) {
   fact.epoch_id = "epoch-zero-lsn";
   fact.source_server_uuid = "source-uuid";
   fact.target_server_uuid = "target-uuid";
+  fact.source_fence_lsn = 140;
   Preserve_trx_transfer_epoch_fact_token token;
   token.token = 12348;
   token.source_prepare_lsn = 0;
@@ -4537,6 +4540,38 @@ TEST(PreservedTrxTransfer, EpochFactRejectsZeroApplyBarrierLsns) {
 
   fact.tokens[0].source_prepare_lsn = 120;
   fact.tokens[0].source_epoch_commit_lsn = 0;
+  EXPECT_EQ(Preserve_trx_transfer_status::INVALID_ARGUMENT,
+            preserve_trx_transfer_encode_epoch_fact(fact, &encoded));
+}
+
+TEST(PreservedTrxTransfer, EpochFactRoundTripsOneCommonPhysicalFence) {
+  Preserve_trx_transfer_epoch_fact fact;
+  fact.epoch_id = "epoch-common-fence";
+  fact.source_server_uuid = "source-uuid";
+  fact.target_server_uuid = "target-uuid";
+  fact.source_fence_lsn = 140;
+  Preserve_trx_transfer_epoch_fact_token first;
+  first.token = 1;
+  first.source_prepare_lsn = 120;
+  first.source_epoch_commit_lsn = 125;
+  Preserve_trx_transfer_epoch_fact_token second;
+  second.token = 2;
+  second.source_prepare_lsn = 140;
+  second.source_epoch_commit_lsn = 140;
+  fact.tokens = {first, second};
+
+  std::string encoded;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_epoch_fact(fact, &encoded));
+  Preserve_trx_transfer_epoch_fact decoded;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_epoch_fact(encoded, &decoded));
+  EXPECT_EQ(140U, decoded.source_fence_lsn);
+  ASSERT_EQ(2U, decoded.tokens.size());
+  EXPECT_EQ(120U, decoded.tokens[0].source_prepare_lsn);
+  EXPECT_EQ(140U, decoded.tokens[1].source_prepare_lsn);
+
+  fact.source_fence_lsn = 139;
   EXPECT_EQ(Preserve_trx_transfer_status::INVALID_ARGUMENT,
             preserve_trx_transfer_encode_epoch_fact(fact, &encoded));
 }
@@ -5058,6 +5093,55 @@ class Transfer_codec_context_guard {
     preserve_trx_transfer_set_source_lsn_provider_for_unit_test(nullptr);
     preserve_trx_transfer_set_codec_context_provider_for_unit_test(nullptr);
   }
+};
+
+class Transfer_native_binlog_runtime_guard {
+ public:
+  Transfer_native_binlog_runtime_guard()
+      : m_saved_enable(preserve_trx_enable),
+        m_saved_opt_bin_log(opt_bin_log),
+        m_saved_binlog_cache_size(binlog_cache_size),
+        m_saved_max_binlog_cache_size(max_binlog_cache_size),
+        m_saved_binlog_stmt_cache_size(binlog_stmt_cache_size),
+        m_saved_max_binlog_stmt_cache_size(max_binlog_stmt_cache_size) {
+    m_hton.slot = 0;
+    m_hton.savepoint_offset = sizeof(my_off_t);
+    preserve_trx_set_enable_value(true);
+    opt_bin_log = true;
+    binlog_cache_size = 32 * 1024;
+    max_binlog_cache_size = 4 * 1024 * 1024;
+    binlog_stmt_cache_size = 32 * 1024;
+    max_binlog_stmt_cache_size = 4 * 1024 * 1024;
+    mysql_binlog_preserve_set_runtime_for_unit_test(&m_hton, true);
+    preserve_trx_resource_manager_reset_for_unit_test();
+    preserve_trx_resource_manager_set_limits_for_unit_test(
+        {16 * 1024 * 1024, 16 * 1024 * 1024});
+    preserve_trx_resource_manager_set_external_limits_for_unit_test(
+        {4096, 16, 16ULL * 1024ULL * 1024ULL * 1024ULL, true});
+  }
+
+  ~Transfer_native_binlog_runtime_guard() {
+    preserve_trx_transfer_shutdown_receiver_prewarm_workers();
+    preserve_trx_resource_manager_reset_for_unit_test();
+    preserve_trx_resource_manager_set_limits_for_unit_test({});
+    preserve_trx_resource_manager_set_external_limits_for_unit_test({});
+    mysql_binlog_preserve_set_runtime_for_unit_test(nullptr, false);
+    max_binlog_stmt_cache_size = m_saved_max_binlog_stmt_cache_size;
+    binlog_stmt_cache_size = m_saved_binlog_stmt_cache_size;
+    max_binlog_cache_size = m_saved_max_binlog_cache_size;
+    binlog_cache_size = m_saved_binlog_cache_size;
+    opt_bin_log = m_saved_opt_bin_log;
+    preserve_trx_set_enable_value(m_saved_enable);
+  }
+
+ private:
+  bool m_saved_enable;
+  bool m_saved_opt_bin_log;
+  ulong m_saved_binlog_cache_size;
+  ulonglong m_saved_max_binlog_cache_size;
+  ulong m_saved_binlog_stmt_cache_size;
+  ulonglong m_saved_max_binlog_stmt_cache_size;
+  handlerton m_hton{};
 };
 
 TEST(PreservedTrxTransfer, ConfiguredFrameSinkDefaultsToUnsupported) {
@@ -6661,6 +6745,7 @@ TEST_F(PreserveSnapshotTest, PromotionRejectsEpochFactTokenSetMismatch) {
   fact.epoch_id = "epoch-token-mismatch";
   fact.source_server_uuid = "source-uuid";
   fact.target_server_uuid = "target-uuid";
+  fact.source_fence_lsn = 140;
   Preserve_trx_transfer_epoch_fact_token wrong_token;
   wrong_token.token = 924;
   wrong_token.source_prepare_lsn = 120;
@@ -6717,6 +6802,7 @@ TEST_F(PreserveSnapshotTest, PromotionEmptyRequestUsesEpochFactTokenSet) {
   fact.epoch_id = "epoch-token-subset";
   fact.source_server_uuid = "source-uuid";
   fact.target_server_uuid = "target-uuid";
+  fact.source_fence_lsn = 140;
   Preserve_trx_transfer_epoch_fact_token token;
   token.token = 931;
   token.source_prepare_lsn = 120;
@@ -6772,6 +6858,7 @@ TEST_F(PreserveSnapshotTest,
   fact.epoch_id = epoch_id;
   fact.source_server_uuid = "source-uuid";
   fact.target_server_uuid = server_uuid;
+  fact.source_fence_lsn = 140;
   Preserve_trx_transfer_epoch_fact_token token;
   token.token = transfer_token;
   token.source_prepare_lsn = 120;
@@ -7949,6 +8036,23 @@ TEST_F(PreserveSnapshotTest,
           true, 3, 3, {0, 1, 2}, &final_resident_pages, &sample_count));
   EXPECT_EQ(2U, final_resident_pages);
   EXPECT_EQ(3U, sample_count);
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverResidencyWaitUsesMonotonicTimeAndCancellation) {
+  size_t sample_count = 0;
+  EXPECT_FALSE(preserve_trx_transfer_receiver_residency_wait_for_unit_test(
+      3, {0, 1, 2}, {1000, 900, 1100}, 2, 1000, &sample_count));
+  EXPECT_EQ(2U, sample_count);
+
+  sample_count = 0;
+  EXPECT_FALSE(preserve_trx_transfer_receiver_residency_wait_for_unit_test(
+      3, {0, 1, 2},
+      {std::numeric_limits<uint64_t>::max() - 10,
+       std::numeric_limits<uint64_t>::max() - 5,
+       std::numeric_limits<uint64_t>::max()},
+      std::numeric_limits<size_t>::max(), 100, &sample_count));
+  EXPECT_LE(sample_count, 3U);
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -15377,6 +15481,7 @@ TEST_F(PreserveSnapshotTest, TransferCommitEpochRejectsCorruptMarker) {
 TEST_F(PreserveSnapshotTest,
        TransferSourceEncodedFrameSequenceFeedsReceiverPayloadHandler) {
   Transfer_codec_context_guard codec_guard;
+  Transfer_native_binlog_runtime_guard binlog_runtime;
   Mysql_binlog_preserve_snapshot snapshot;
   snapshot.cache_payload = "portable-encoded-frame-binlog-cache";
   snapshot.gtid_next = "AUTOMATIC";
@@ -17560,6 +17665,7 @@ TEST_F(PreserveSnapshotTest,
 TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSessionStreamsDeclaredBlobBeforeFinalManifest) {
   Transfer_codec_context_guard codec_guard;
+  Transfer_native_binlog_runtime_guard binlog_runtime;
   const uint64_t transfer_token = 714;
   Preserve_snapshot_metadata meta = logged_with_cache_metadata();
   meta.token = test_transfer_token_string(transfer_token);
@@ -18385,6 +18491,15 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             preserve_trx_transfer_handle_receiver_payload_batch(
                 m_dir, sink.frames(), &store, &registry, 300, 3));
+
+  Preserve_trx_transfer_epoch_fact fact;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_read_epoch_fact(
+                m_dir, "epoch-source-session-batch-final", &fact));
+  EXPECT_EQ(140U, fact.source_fence_lsn);
+  ASSERT_EQ(2U, fact.tokens.size());
+  EXPECT_LE(fact.tokens[0].source_epoch_commit_lsn, fact.source_fence_lsn);
+  EXPECT_LE(fact.tokens[1].source_epoch_commit_lsn, fact.source_fence_lsn);
 
   ASSERT_TRUE(wait_for_epoch_ready_token("epoch-source-session-batch-final",
                                          912));
@@ -19701,6 +19816,7 @@ TEST_F(PreserveSnapshotTest,
 TEST_F(PreserveSnapshotTest,
        TransferArtifactSinkBatchesFinalManifestAfterPredeclaredExternalBlob) {
   Transfer_codec_context_guard codec_guard;
+  Transfer_native_binlog_runtime_guard binlog_runtime;
   const uint64_t transfer_token = 603;
   Mysql_binlog_preserve_snapshot snapshot;
   snapshot.cache_payload = "artifact-sink-predeclared-binlog-cache";
@@ -19924,8 +20040,84 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
+       TransferReceiverStrictPrepareFailureDoesNotPublishGenericReady) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 610;
+  Mysql_binlog_preserve_snapshot snapshot;
+  snapshot.cache_payload.assign(64 * 1024, 'f');
+  snapshot.gtid_next = "AUTOMATIC";
+  snapshot.event_counter = 3;
+  snapshot.with_rbr = true;
+  snapshot.with_start = true;
+  snapshot.with_content = true;
+  Preserve_snapshot_metadata meta = logged_with_cache_metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  input.logged_binlog_snapshot = &snapshot;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-strict-prepare-failure", "source-uuid", server_uuid,
+                bundle, transfer_token, &manifest, &objects));
+  Preserve_trx_prepared_token_key strict_key;
+  ASSERT_TRUE(preserve_trx_transfer_strict_prepared_key_for_unit_test(
+      m_dir, manifest, bundle.metadata.token, &strict_key));
+  auto &strict_registry = preserved_trx_strict_prepared_token_registry();
+  strict_registry.purge_epoch(strict_key.source_uuid, strict_key.epoch_id);
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", server_uuid);
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  Capturing_transfer_frame_sink sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      manifest.epoch_id, manifest.source_server_uuid,
+      manifest.target_server_uuid, 17, &sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_token(transfer_token));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.send_token_objects(manifest, objects));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
+
+  for (const std::string &frame : sink.frames()) {
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_handle_receiver_payload(
+                  m_dir, frame, &store, &registry, 300, nullptr));
+  }
+  for (uint attempt = 0; attempt < 100; ++attempt) {
+    Preserve_trx_prepared_token_snapshot strict_snapshot;
+    if (strict_registry.snapshot(strict_key, &strict_snapshot) ==
+            Preserve_trx_prepared_status::OK &&
+        strict_snapshot.state == Preserve_trx_prepared_token_state::NOT_READY) {
+      break;
+    }
+    my_sleep(10000);
+  }
+
+  Preserve_trx_promotion_ready_summary ready_summary;
+  (void)preserved_trx_promotion_ready_summary_for_epoch(
+      m_dir, manifest.epoch_id, &ready_summary);
+  EXPECT_TRUE(ready_summary.ready_tokens.empty());
+  Preserve_trx_transfer_receiver_record receiver_record;
+  ASSERT_TRUE(registry.lookup(manifest.epoch_id, manifest.token,
+                              &receiver_record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::RECEIVING,
+            receiver_record.state);
+  strict_registry.purge_epoch(strict_key.source_uuid, strict_key.epoch_id);
+  preserve_trx_transfer_shutdown_receiver_prewarm_workers();
+}
+
+TEST_F(PreserveSnapshotTest,
        TransferArtifactSinkAssignsSnapshotDeadlineBeforeSending) {
   Transfer_codec_context_guard codec_guard;
+  Transfer_native_binlog_runtime_guard binlog_runtime;
   const uint64_t transfer_token = 602;
   Mysql_binlog_preserve_snapshot snapshot;
   snapshot.cache_payload = "transfer-artifact-binlog-cache";

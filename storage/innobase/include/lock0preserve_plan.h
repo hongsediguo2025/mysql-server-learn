@@ -64,7 +64,8 @@ struct lock_preserve_metadata_dict_lease_ops_t {
   bool (*acquire)(void *context, uint64_t table_id, uint64_t index_id,
                   uint32_t space_id,
                   const std::string &dictionary_generation_digest,
-                  void **opaque_lease, dict_index_t **index){nullptr};
+                  void **opaque_lease, dict_index_t **index,
+                  uint64_t *retained_bytes){nullptr};
   bool (*revalidate)(void *opaque_lease,
                      const std::string &dictionary_generation_digest,
                      dict_index_t **index){nullptr};
@@ -97,6 +98,9 @@ class lock_preserve_metadata_plan_t {
   uint64_t entry_count() const;
   uint64_t bitmap_bits() const;
   uint64_t capacity_bytes() const;
+#ifndef NDEBUG
+  bool revalidates_stable_ids_for_unit_test() const;
+#endif
 
  private:
   class Impl;
