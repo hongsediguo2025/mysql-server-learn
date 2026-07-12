@@ -1349,6 +1349,7 @@ Preserve_snapshot_delete_status remove_stale_tmp_files_for_token(
 
   delete_optional_tmp(join_path(dir, token + ".binlog_cache.tmp"));
   delete_optional_tmp(join_path(dir, token + ".tainted.tmp"));
+  delete_optional_tmp(join_path(dir, token + ".consume_state.tmp"));
   for (const std::string &candidate_dir : snapshot_dirs_for_token(dir, token)) {
     delete_optional_tmp(join_path(candidate_dir, token + ".bin.tmp"));
     delete_optional_tmp(join_path(candidate_dir, token + ".standby_pending.tmp"));
@@ -1389,6 +1390,8 @@ Preserve_snapshot_delete_status delete_snapshot_files_with_status(
   const std::string dir = normalize_dir(dir_arg);
   const std::string binlog_cache_path = join_path(dir, token + ".binlog_cache");
   const std::string tainted_path = join_path(dir, token + ".tainted");
+  const std::string consume_state_path =
+      join_path(dir, token + ".consume_state");
   std::set<std::string> sidecar_removed_dirs;
   bool error = false;
   bool removed_sidecar = false;
@@ -1476,6 +1479,11 @@ Preserve_snapshot_delete_status delete_snapshot_files_with_status(
     for (const std::string &removed_dir : sidecar_removed_dirs) {
       if (fsync_directory(removed_dir)) error = true;
     }
+  }
+  if (!error) {
+    const bool marker_existed = file_exists(consume_state_path);
+    delete_optional_sidecar(consume_state_path);
+    if (!error && marker_existed && fsync_directory(dir)) error = true;
   }
   if (!error) return Preserve_snapshot_delete_status::OK;
 
@@ -1882,6 +1890,43 @@ bool write_tainted_marker(const std::string &dir, const std::string &token,
                            {}) != Atomic_write_status::OK;
 }
 
+const char *consume_state_name(Preserve_snapshot_consume_state state) {
+  switch (state) {
+    case Preserve_snapshot_consume_state::CONSUME_PENDING:
+      return "CONSUME_PENDING";
+    case Preserve_snapshot_consume_state::ROLLED_BACK:
+      return "ROLLED_BACK";
+    case Preserve_snapshot_consume_state::ACTIVE_CONSUMED:
+      return "ACTIVE_CONSUMED";
+    case Preserve_snapshot_consume_state::CLEANUP_TAINTED:
+      return "CLEANUP_TAINTED";
+  }
+  return nullptr;
+}
+
+bool write_consume_state_marker(const std::string &dir,
+                                const std::string &token,
+                                Preserve_snapshot_consume_state state,
+                                const std::string &reason) {
+  const char *state_name = consume_state_name(state);
+  if (!token_is_filename_safe(token) || state_name == nullptr ||
+      reason.length() > 1024 || reason.find('\0') != std::string::npos ||
+      reason.find('\n') != std::string::npos ||
+      reason.find('\r') != std::string::npos) {
+    return true;
+  }
+  DBUG_EXECUTE_IF("preserve_trx_fail_write_consume_state_marker", return true;);
+  std::string marker("PRESERVE_CONSUME_STATE_V1\n");
+  marker.append(state_name);
+  marker.push_back('\n');
+  marker.append(reason);
+  marker.push_back('\n');
+  const std::string normalized_dir = normalize_dir(dir);
+  std::vector<unsigned char> bytes(marker.begin(), marker.end());
+  return atomic_write_file(normalized_dir, token + ".consume_state", bytes,
+                           0600, {}) != Atomic_write_status::OK;
+}
+
 bool write_standby_pending_marker(
     const std::string &dir, const std::string &token,
     const Preserve_snapshot_write_options &options) {
@@ -2227,6 +2272,31 @@ Local_file_preserved_trx_carrier::mark_standby_pending(
 }
 
 Preserved_trx_carrier_status
+Local_file_preserved_trx_carrier::write_consume_state(
+    const std::string &token, Preserve_snapshot_consume_state state,
+    const std::string &reason) {
+  return write_consume_state_marker(m_dir, token, state, reason)
+             ? Preserved_trx_carrier_status::IO_ERROR
+             : Preserved_trx_carrier_status::OK;
+}
+
+Preserved_trx_carrier_status
+Local_file_preserved_trx_carrier::remove_consume_state(
+    const std::string &token) {
+  if (!token_is_filename_safe(token)) {
+    return Preserved_trx_carrier_status::CORRUPT;
+  }
+  DBUG_EXECUTE_IF("preserve_trx_fail_remove_consume_state_marker",
+                  return Preserved_trx_carrier_status::IO_ERROR;);
+  if (my_delete(join_path(m_dir, token + ".consume_state").c_str(), MYF(0)) &&
+      my_errno() != ENOENT) {
+    return Preserved_trx_carrier_status::IO_ERROR;
+  }
+  return fsync_directory(m_dir) ? Preserved_trx_carrier_status::IO_ERROR
+                                : Preserved_trx_carrier_status::OK;
+}
+
+Preserved_trx_carrier_status
 Local_file_preserved_trx_carrier::write_promotion_adopted_epoch(
     const std::string &epoch_id, const std::string &marker_payload) {
   if (!promotion_epoch_component_is_filename_safe(epoch_id) ||
@@ -2334,6 +2404,7 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::list_tokens(
   listing->temp_sidecar_tokens.clear();
   listing->stale_tmp_tokens.clear();
   listing->tainted_tokens.clear();
+  listing->consume_state_tokens.clear();
   listing->standby_pending_tokens.clear();
   listing->promotion_adopted_tokens.clear();
   listing->promotion_intent_tokens.clear();
@@ -2393,6 +2464,14 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::list_tokens(
       }
       if (filename_to_token(file->name, ".tainted", &token)) {
         listing->tainted_tokens.insert(token);
+        continue;
+      }
+      if (filename_to_token(file->name, ".consume_state.tmp", &token)) {
+        listing->stale_tmp_tokens.insert(token);
+        continue;
+      }
+      if (filename_to_token(file->name, ".consume_state", &token)) {
+        listing->consume_state_tokens.insert(token);
         continue;
       }
       if (filename_to_token(file->name, ".standby_pending", &token)) {
@@ -2506,6 +2585,8 @@ Preserved_trx_carrier_status Local_file_preserved_trx_carrier::token_state(
                             external_blob_filename(
                                 token, kPreservedTrxBlobRecordLocks)));
   state->tainted = file_exists(join_path(m_dir, token + ".tainted"));
+  state->consume_state =
+      file_exists(join_path(m_dir, token + ".consume_state"));
   state->standby_pending = standby_pending_marker_exists(m_dir, token);
 
   for (const std::string &candidate_dir :
@@ -3177,7 +3258,9 @@ bool preserved_trx_default_carrier_generated_token_exists(
   if (file_exists(join_path(normalized_dir, token + ".binlog_cache")) ||
       file_exists(join_path(normalized_dir, token + ".binlog_cache.tmp")) ||
       file_exists(join_path(normalized_dir, token + ".tainted")) ||
-      file_exists(join_path(normalized_dir, token + ".tainted.tmp"))) {
+      file_exists(join_path(normalized_dir, token + ".tainted.tmp")) ||
+      file_exists(join_path(normalized_dir, token + ".consume_state")) ||
+      file_exists(join_path(normalized_dir, token + ".consume_state.tmp"))) {
     return true;
   }
 

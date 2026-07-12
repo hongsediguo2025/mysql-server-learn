@@ -46,6 +46,13 @@ enum class Preserve_snapshot_delete_status {
   ERROR_AFTER_SNAPSHOT_DELETE
 };
 
+enum class Preserve_snapshot_consume_state : uint8_t {
+  CONSUME_PENDING = 1,
+  ROLLED_BACK = 2,
+  ACTIVE_CONSUMED = 3,
+  CLEANUP_TAINTED = 4
+};
+
 struct Preserve_snapshot_remove_options {
   /*
     Source-space ids for temp-table sidecars that must survive this token remove
@@ -72,6 +79,7 @@ struct Preserved_trx_carrier_listing {
   */
   std::set<std::string> stale_tmp_tokens;
   std::set<std::string> tainted_tokens;
+  std::set<std::string> consume_state_tokens;
   std::set<std::string> standby_pending_tokens;
   /*
     Tokens listed in an epoch.promotion_adopted marker have crossed the
@@ -98,6 +106,7 @@ struct Preserved_trx_carrier_token_state {
   bool external_blob{false};
   bool temp_sidecar{false};
   bool tainted{false};
+  bool consume_state{false};
   bool standby_pending{false};
 };
 
@@ -263,6 +272,13 @@ class Preserved_trx_carrier {
 
   virtual Preserved_trx_carrier_status remove_taint(
       const std::string &token) = 0;
+
+  virtual Preserved_trx_carrier_status write_consume_state(
+      const std::string &token, Preserve_snapshot_consume_state state,
+      const std::string &reason);
+
+  virtual Preserved_trx_carrier_status remove_consume_state(
+      const std::string &token);
 
   virtual Preserved_trx_carrier_status mark_standby_pending(
       const std::string &token) = 0;
@@ -446,6 +462,12 @@ class Preserved_trx_store {
                                         const std::string &reason = "tainted");
 
   Preserve_snapshot_status remove_taint(const std::string &token);
+
+  Preserve_snapshot_status mark_consume_state(
+      const std::string &token, Preserve_snapshot_consume_state state,
+      const std::string &reason);
+
+  Preserve_snapshot_status remove_consume_state(const std::string &token);
 
   Preserve_snapshot_status write_promotion_adopted_epoch(
       const std::string &epoch_id, const std::string &marker_payload);

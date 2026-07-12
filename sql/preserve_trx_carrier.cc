@@ -236,6 +236,9 @@ std::set<std::string> preserved_trx_local_import_snapshot_tokens(
           listing.snapshot_tokens, listing);
   tokens.insert(listing.promotion_adopted_tokens.begin(),
                 listing.promotion_adopted_tokens.end());
+  for (const std::string &token : listing.consume_state_tokens) {
+    tokens.erase(token);
+  }
   return tokens;
 }
 
@@ -270,6 +273,7 @@ Preserved_trx_carrier_listing preserved_trx_local_crash_abandon_listing(
   local.external_blob_tokens = filter_tokens(listing.external_blob_tokens);
   local.temp_sidecar_tokens = filter_tokens(listing.temp_sidecar_tokens);
   local.tainted_tokens = filter_tokens(listing.tainted_tokens);
+  local.consume_state_tokens = filter_tokens(listing.consume_state_tokens);
   local.standby_pending_tokens = listing.standby_pending_tokens;
   local.promotion_adopted_tokens = listing.promotion_adopted_tokens;
   local.promotion_intent_tokens = listing.promotion_intent_tokens;
@@ -299,6 +303,7 @@ Preserved_trx_carrier_status Preserved_trx_carrier::token_state(
   state->external_blob = listing.external_blob_tokens.count(token) != 0;
   state->temp_sidecar = listing.temp_sidecar_tokens.count(token) != 0;
   state->tainted = listing.tainted_tokens.count(token) != 0;
+  state->consume_state = listing.consume_state_tokens.count(token) != 0;
   state->standby_pending = listing.standby_pending_tokens.count(token) != 0;
   return Preserved_trx_carrier_status::OK;
 }
@@ -325,6 +330,17 @@ Preserved_trx_carrier::read_promotion_abandoned_epoch(
   (void)epoch_id;
   if (marker_payload != nullptr) marker_payload->clear();
   return Preserved_trx_carrier_status::NOT_FOUND;
+}
+
+Preserved_trx_carrier_status Preserved_trx_carrier::write_consume_state(
+    const std::string &, Preserve_snapshot_consume_state,
+    const std::string &) {
+  return Preserved_trx_carrier_status::CORRUPT;
+}
+
+Preserved_trx_carrier_status Preserved_trx_carrier::remove_consume_state(
+    const std::string &) {
+  return Preserved_trx_carrier_status::CORRUPT;
 }
 
 Preserved_trx_carrier_status
@@ -407,7 +423,8 @@ Preserve_snapshot_status Preserved_trx_store::write_impl(
     return map_carrier_status(carrier_status);
   if (token_state.snapshot || token_state.external_blob ||
       (token_state.temp_sidecar && !bundle.owns_current_temp_sidecars) ||
-      token_state.tainted || token_state.standby_pending) {
+      token_state.tainted || token_state.consume_state ||
+      token_state.standby_pending) {
     return map_carrier_status(Preserved_trx_carrier_status::ALREADY_EXISTS);
   }
 
@@ -733,6 +750,20 @@ Preserve_snapshot_status Preserved_trx_store::remove_taint(
     const std::string &token) {
   if (m_carrier == nullptr) return Preserve_snapshot_status::INVALID_ARGUMENT;
   return map_carrier_status(m_carrier->remove_taint(token));
+}
+
+Preserve_snapshot_status Preserved_trx_store::mark_consume_state(
+    const std::string &token, Preserve_snapshot_consume_state state,
+    const std::string &reason) {
+  if (m_carrier == nullptr) return Preserve_snapshot_status::INVALID_ARGUMENT;
+  return map_carrier_status(
+      m_carrier->write_consume_state(token, state, reason));
+}
+
+Preserve_snapshot_status Preserved_trx_store::remove_consume_state(
+    const std::string &token) {
+  if (m_carrier == nullptr) return Preserve_snapshot_status::INVALID_ARGUMENT;
+  return map_carrier_status(m_carrier->remove_consume_state(token));
 }
 
 Preserve_snapshot_status Preserved_trx_store::write_promotion_adopted_epoch(

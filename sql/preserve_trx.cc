@@ -274,6 +274,7 @@ bool preserved_trx_listing_has_crash_abandon_artifacts(
          !listing.external_blob_tokens.empty() ||
          !listing.temp_sidecar_tokens.empty() ||
          !listing.tainted_tokens.empty() ||
+         !listing.consume_state_tokens.empty() ||
          !listing.warm_external_blob_artifacts.empty();
 }
 
@@ -293,6 +294,8 @@ static std::string preserved_trx_listing_artifact_summary(
          ", temp_sidecars=" +
          std::to_string(listing.temp_sidecar_tokens.size()) +
          ", tainted=" + std::to_string(listing.tainted_tokens.size()) +
+         ", consume_state=" +
+         std::to_string(listing.consume_state_tokens.size()) +
          ", standby_pending=" +
          std::to_string(listing.standby_pending_tokens.size()) +
          ", promotion_adopted=" +
@@ -8826,6 +8829,17 @@ static void rollback_pending_token_delivery_record(const std::string &token) {
   Preserved_trx_record record;
   if (!preserved_trx_take_record(token, &record)) return;
 
+  auto store = create_preserved_trx_default_store(preserve_trx_default_dir());
+  if (store->mark_consume_state(
+          token, Preserve_snapshot_consume_state::CONSUME_PENDING,
+          "token delivery rollback pending") != Preserve_snapshot_status::OK) {
+    const char marker_error[] =
+        "failed to publish token delivery rollback consume state";
+    (void)preserved_trx_add_record_with_error(record, marker_error);
+    log_redacted_token_delivery_cleanup_failure(token, marker_error);
+    return;
+  }
+
   dberr_t rollback_status = DB_SUCCESS;
   DBUG_EXECUTE_IF("preserve_trx_fail_token_delivery_rollback",
                   rollback_status = DB_ERROR;);
@@ -8847,6 +8861,12 @@ static void rollback_pending_token_delivery_record(const std::string &token) {
 
   audit_preserved_trx_event(current_thd, token, "rollback", "failure",
                             "token delivery failed");
+  if (store->mark_consume_state(
+          token, Preserve_snapshot_consume_state::ROLLED_BACK,
+          "token delivery rollback completed") != Preserve_snapshot_status::OK) {
+    log_redacted_token_delivery_cleanup_failure(
+        token, "failed to publish rolled-back consume state");
+  }
   delete_detached_mdl_context(token);
   if (delete_preserved_snapshot_files_and_sidecars_or_log(
           preserve_trx_default_dir(), token, &record.metadata))
@@ -9379,6 +9399,15 @@ struct Preserved_trx_recover_or_adopt_options {
   Preserve_trx_physical_fence_lease *physical_fence_lease{nullptr};
 };
 
+bool preserved_trx_snapshot_allows_synthetic_temp_claim(
+    const Preserve_snapshot_metadata &metadata) {
+  return !metadata.temp_table_manifest_payload.empty() &&
+         metadata.engine_shape == Preserve_snapshot_engine_shape::TEMP_ONLY &&
+         !metadata.has_persistent_engine_state &&
+         metadata.has_temp_engine_state &&
+         !metadata.has_logged_persistent_work;
+}
+
 static bool recover_or_adopt_deadline_expired(
     const Preserved_trx_recover_or_adopt_options &options) {
   return options.deadline_us != 0 &&
@@ -9476,7 +9505,8 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
 
   uint64_t phase_started_us = preserve_trx_monotonic_us();
   trx_t *trx = trx_preserve_claim_prepared(xid);
-  if (trx == nullptr && !metadata.temp_table_manifest_payload.empty()) {
+  if (trx == nullptr &&
+      preserved_trx_snapshot_allows_synthetic_temp_claim(metadata)) {
     const uint64_t temp_owner_trx_id =
         preserve_trx_temp_table_owner_trx_id(metadata);
     if (temp_owner_trx_id != 0) {
@@ -10725,6 +10755,9 @@ bool preserved_trx_recover_all() {
   std::set<std::string> tainted_tokens =
       preserved_trx_filter_standby_pending_tokens_for_local_recovery(
           listing.tainted_tokens, listing);
+  std::set<std::string> consume_state_tokens =
+      preserved_trx_filter_standby_pending_tokens_for_local_recovery(
+          listing.consume_state_tokens, listing);
   std::set<std::string> warm_external_blob_artifacts =
       listing.warm_external_blob_artifacts;
   local_snapshot_token_count = snapshot_tokens.size();
@@ -10785,6 +10818,14 @@ bool preserved_trx_recover_all() {
         error = true;
       }
     }
+    for (const std::string &token : listing.consume_state_tokens) {
+      if (listing.snapshot_tokens.find(token) != listing.snapshot_tokens.end())
+        continue;
+      if (store->remove_consume_state(token) !=
+          Preserve_snapshot_status::OK) {
+        error = true;
+      }
+    }
 
     return finish_recovery(error, "off_abandon_completed");
   }
@@ -10842,6 +10883,26 @@ bool preserved_trx_recover_all() {
            "PRESERVE: rolled back prepared transaction without snapshot "
            "during recovery");
   }
+
+  phase_started_us = preserve_trx_monotonic_us();
+  for (const std::string &token : consume_state_tokens) {
+    if (listing.snapshot_tokens.count(token) == 0) continue;
+    Preserved_trx_bundle cleanup_bundle;
+    Preserve_snapshot_metadata *cleanup_metadata = nullptr;
+    if (store->read(token, true,
+                    Preserved_trx_carrier::Payload_read_mode::METADATA_ONLY,
+                    &cleanup_bundle) == Preserve_snapshot_status::OK) {
+      cleanup_metadata = &cleanup_bundle.metadata;
+    }
+    if (rollback_preserved_snapshot_or_log(
+            dir, token, "durable consume-state cleanup", cleanup_metadata,
+            cleanup_metadata == nullptr
+                ? Temp_sidecar_cleanup_mode::RAW_UNLINK
+                : Temp_sidecar_cleanup_mode::METADATA_AWARE)) {
+      return finish_recovery(true, "consume_state_cleanup_failed");
+    }
+  }
+  phase_metrics.tainted_cleanup_us += elapsed_since_us(phase_started_us);
 
   Preserved_trx_recovery_attempt_ledger recovery_attempt_ledger;
   phase_started_us = preserve_trx_monotonic_us();
@@ -11004,6 +11065,12 @@ bool preserved_trx_recover_all() {
   for (const std::string &token : tainted_tokens) {
     if (snapshot_tokens.find(token) != snapshot_tokens.end()) continue;
     if (store->remove_taint(token) != Preserve_snapshot_status::OK) {
+      error = true;
+    }
+  }
+  for (const std::string &token : consume_state_tokens) {
+    if (listing.snapshot_tokens.count(token) != 0) continue;
+    if (store->remove_consume_state(token) != Preserve_snapshot_status::OK) {
       error = true;
     }
   }
@@ -12396,6 +12463,29 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     result->snapshot_write_temp_manifest_built =
         !metadata.temp_table_manifest_payload.empty();
   }
+
+  bool has_persistent_engine_update = false;
+  bool has_temp_engine_update = false;
+  if (!trx_preserve_engine_state_facts(trx, &has_persistent_engine_update,
+                                       &has_temp_engine_update)) {
+    set_failure_reason("engine_state_fact_capture_failed");
+    discard_prebuilt_binlog_blob_if_needed();
+    return reject_after_snapshot_failure(false);
+  }
+  metadata.has_temp_engine_state =
+      has_temp_engine_update ||
+      !metadata.temp_table_manifest_payload.empty();
+  metadata.has_logged_persistent_work =
+      has_logged_binlog_cache && binlog_snapshot.with_content;
+  metadata.has_persistent_engine_state =
+      has_persistent_engine_update || metadata.has_logged_persistent_work ||
+      !metadata.has_temp_engine_state;
+  metadata.engine_shape =
+      metadata.has_temp_engine_state
+          ? (metadata.has_persistent_engine_state
+                 ? Preserve_snapshot_engine_shape::MIXED
+                 : Preserve_snapshot_engine_shape::TEMP_ONLY)
+          : Preserve_snapshot_engine_shape::PERSISTENT_ONLY;
 
   Preserved_trx_bundle_build_input bundle_input;
   bundle_input.metadata = metadata;
@@ -15141,14 +15231,64 @@ static bool preserved_trx_resume_record_on_thd(
     return preserve_trx_reject_unsupported();
   }
 
+  auto consume_store =
+      create_preserved_trx_default_store(preserve_trx_default_dir());
+  if (consume_store->mark_consume_state(
+          token, Preserve_snapshot_consume_state::CONSUME_PENDING,
+          "resume activation pending") != Preserve_snapshot_status::OK) {
+    if (!detach_resumed_after_failure("consume-state publish failure")) {
+      reset_thd_after_preserve_detach(thd);
+      (void)restore_preserved_record_after_failure(
+          "consume-state publish failure");
+    }
+    return preserve_trx_reject_unsupported();
+  }
+
   if (trx_preserve_activate_resumed(record.trx) != DB_SUCCESS) {
     LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
            "Preserved transaction resume failed to activate prepared undo state");
     if (!detach_resumed_after_failure("undo activation failure")) {
-      reset_thd_after_preserve_detach(thd);
-      (void)restore_preserved_record_after_failure("undo activation failure");
+      if (consume_store->remove_consume_state(token) ==
+          Preserve_snapshot_status::OK) {
+        reset_thd_after_preserve_detach(thd);
+        (void)restore_preserved_record_after_failure("undo activation failure");
+      } else {
+        if (temp_tables_materialized) {
+          (void)preserve_trx_temp_table_rollback_materialized_for_resume(
+              thd, record.metadata);
+          temp_tables_materialized = false;
+        }
+        rollback_restored_logged_cache_gtid_next(thd, &gtid_restored);
+        if (binlog_imported) {
+          discard_binlog_preserve_cache_and_reset_scopes(thd);
+          binlog_imported = false;
+        }
+        reset_thd_after_preserve_detach(thd);
+        const dberr_t rollback_status =
+            trx_preserve_rollback_claimed(record.trx);
+        delete_detached_mdl_context(token);
+        (void)consume_store->mark_consume_state(
+            token, Preserve_snapshot_consume_state::CLEANUP_TAINTED,
+            rollback_status == DB_SUCCESS
+                ? "activation failed and consume marker cleanup failed"
+                : "activation and rollback cleanup failed");
+        if (rollback_status != DB_SUCCESS) {
+          preserved_trx_add_failed_observable_record(
+              record.metadata,
+              "activation failed with consume marker cleanup failure");
+        }
+      }
     }
     return preserve_trx_reject_unsupported();
+  }
+
+  if (consume_store->mark_consume_state(
+          token, Preserve_snapshot_consume_state::ACTIVE_CONSUMED,
+          "resume activation completed") != Preserve_snapshot_status::OK) {
+    const std::string marker_message =
+        redacted_preserved_trx_log_subject(token) +
+        " failed to publish active-consumed state; pending state retained";
+    LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG, marker_message.c_str());
   }
 
   delete_detached_mdl_context(token);

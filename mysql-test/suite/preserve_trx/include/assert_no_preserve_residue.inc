@@ -51,6 +51,7 @@ while (defined(my $name = readdir($dh))) {
   next unless -f $path;
 
   my $is_tainted = $name =~ /\.tainted$/;
+  my $is_consume_state = $name =~ /\.consume_state(?:\.tmp)?$/;
   my $is_temp =
       $name =~ /\.tempts\.\d+\.(?:image|undo|warm|undo\.warm)(?:\.tmp)?$/;
   my $is_warm =
@@ -65,6 +66,7 @@ while (defined(my $name = readdir($dh))) {
   next if $is_warm && $allow_warm;
 
   push @bad, $name if $is_snapshot || $is_blob || $is_tainted ||
+                      $is_consume_state ||
                       $is_temp || $is_warm;
 }
 closedir($dh);

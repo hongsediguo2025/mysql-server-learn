@@ -10,7 +10,7 @@ SET GLOBAL preserve_trx_enable=ON;
 
 --disable_query_log
 CALL mtr.add_suppression("Preserved transaction .* snapshot cleanup failed after resume; transaction remains attached");
-CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: preserved transaction snapshot tainted");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: durable consume-state cleanup");
 --enable_query_log
 
 CREATE TABLE t_resume_delete_failure(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
@@ -30,6 +30,7 @@ PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
 
 --source suite/preserve_trx/include/get_preserved_token.inc
 --let $PRESERVED_TAINTED_FILE= `SELECT CONCAT(@@global.preserve_trx_dir, '$preserved_token', '.tainted')`
+--let $CONSUME_FILE= `SELECT CONCAT(@@global.preserve_trx_dir, '$preserved_token', '.consume_state')`
 
 SET SESSION debug="+d,preserve_trx_fail_delete_snapshot_files";
 
@@ -47,6 +48,7 @@ SELECT COUNT(*) AS remaining_preserved
   FROM performance_schema.preserved_transactions;
 --file_exists $PRESERVED_SNAPSHOT_FILE
 --file_exists $PRESERVED_TAINTED_FILE
+--file_exists $CONSUME_FILE
 
 --let _TAINTED_FILE= $PRESERVED_TAINTED_FILE
 --perl
@@ -75,8 +77,8 @@ my $path = $ENV{'_ERROR_LOG'} or die "missing error log path";
 open(my $fh, '<', $path) or die "cannot open error log $path: $!";
 my $content = do { local $/; <$fh> };
 close($fh);
-die "expected resume cleanup taint reason in recovery log"
-  unless $content =~ /recovery forced rollback: .*resume_cleanup_failure/;
+die "expected durable consume-state cleanup reason in recovery log"
+  unless $content =~ /recovery forced rollback: durable consume-state cleanup/;
 EOF
 --let _ERROR_LOG=
 

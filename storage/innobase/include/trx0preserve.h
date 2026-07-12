@@ -146,6 +146,9 @@ dberr_t trx_preserve_activate_reattached_in_original_thd(trx_t *trx, THD *thd);
 bool trx_preserve_is_active_attached_to_thd(trx_t *trx, THD *thd);
 dberr_t trx_preserve_prepare_current_temp_only(THD *thd, const XID &xid);
 trx_t *trx_preserve_create_temp_only_claimed(const XID &xid, uint64_t trx_id);
+bool trx_preserve_engine_state_facts(const trx_t *trx,
+                                     bool *has_persistent_state,
+                                     bool *has_temp_state);
 uint64_t trx_preserve_trx_id(const trx_t *trx);
 void trx_preserve_release_claim_before_free(trx_t *trx);
 bool trx_preserve_current_thd_has_read_view(THD *thd);

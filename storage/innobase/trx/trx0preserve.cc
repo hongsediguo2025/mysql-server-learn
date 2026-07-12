@@ -1001,6 +1001,18 @@ trx_t *trx_preserve_create_temp_only_claimed(const XID &xid, uint64_t trx_id) {
   return trx;
 }
 
+bool trx_preserve_engine_state_facts(const trx_t *trx,
+                                     bool *has_persistent_state,
+                                     bool *has_temp_state) {
+  if (trx == nullptr || has_persistent_state == nullptr ||
+      has_temp_state == nullptr) {
+    return false;
+  }
+  *has_persistent_state = trx_is_redo_rseg_updated(trx);
+  *has_temp_state = trx_is_temp_rseg_updated(trx);
+  return true;
+}
+
 uint64_t trx_preserve_trx_id(const trx_t *trx) {
   return trx != nullptr ? trx->id : 0;
 }

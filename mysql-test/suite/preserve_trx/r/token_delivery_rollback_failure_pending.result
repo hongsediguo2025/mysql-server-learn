@@ -41,8 +41,10 @@ ERROR HY000: Access denied for preserved transaction
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 # restart: --preserve-trx-enable=ON
-RESUME PRESERVED TRANSACTION 'TOKEN';
-ROLLBACK;
+SELECT COUNT(*) AS preserved_count_after_restart
+FROM performance_schema.preserved_transactions;
+preserved_count_after_restart
+0
 SELECT * FROM t_preserve_token_rollback_failure WHERE a=1;
 a	b
 1	10

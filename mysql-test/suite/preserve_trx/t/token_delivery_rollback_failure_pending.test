@@ -9,6 +9,7 @@ DROP TABLE IF EXISTS t_preserve_token_rollback_failure;
 --disable_query_log
 CALL mtr.add_suppression("Preserved transaction .* token delivery cleanup failed.*");
 CALL mtr.add_suppression("RESUME PRESERVED TRANSACTION .*token is pending and cannot be resumed");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: durable consume-state cleanup");
 --enable_query_log
 
 SET GLOBAL preserve_trx_enable=ON;
@@ -81,10 +82,9 @@ SELECT COUNT(*) AS preserved_count_with_last_error_at
 --let $do_not_echo_parameters=
 --let $restart_parameters=
 
---source suite/preserve_trx/include/get_preserved_token.inc
---replace_result $preserved_token TOKEN
---eval RESUME PRESERVED TRANSACTION '$preserved_token'
-ROLLBACK;
+SELECT COUNT(*) AS preserved_count_after_restart
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
 SELECT * FROM t_preserve_token_rollback_failure WHERE a=1;
 
 DROP TABLE t_preserve_token_rollback_failure;

@@ -72,6 +72,11 @@ class Local_file_preserved_trx_carrier final
   Preserved_trx_carrier_status mark_tainted(
       const std::string &token, const std::string &reason) override;
   Preserved_trx_carrier_status remove_taint(const std::string &token) override;
+  Preserved_trx_carrier_status write_consume_state(
+      const std::string &token, Preserve_snapshot_consume_state state,
+      const std::string &reason) override;
+  Preserved_trx_carrier_status remove_consume_state(
+      const std::string &token) override;
   Preserved_trx_carrier_status mark_standby_pending(
       const std::string &token) override;
   Preserved_trx_carrier_status write_promotion_adopted_epoch(

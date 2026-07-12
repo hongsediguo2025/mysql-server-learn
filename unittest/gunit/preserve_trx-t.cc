@@ -19939,6 +19939,75 @@ TEST(PreserveSnapshotCodecBounds, CheckedTlvLengthRejectsU32AndTotalOverflow) {
       UINT64_MAX - 5, 0, &encoded_size));
 }
 
+TEST(PreservedTrxRecovery,
+     TempOnlySyntheticClaimRequiresAuthenticatedEngineShape) {
+  Preserve_snapshot_metadata metadata;
+  metadata.temp_table_manifest_payload = "manifest";
+  metadata.engine_shape = Preserve_snapshot_engine_shape::TEMP_ONLY;
+  metadata.has_persistent_engine_state = false;
+  metadata.has_temp_engine_state = true;
+  metadata.has_logged_persistent_work = false;
+  EXPECT_TRUE(
+      preserved_trx_snapshot_allows_synthetic_temp_claim(metadata));
+
+  metadata.engine_shape = Preserve_snapshot_engine_shape::MIXED;
+  metadata.has_persistent_engine_state = true;
+  EXPECT_FALSE(
+      preserved_trx_snapshot_allows_synthetic_temp_claim(metadata));
+
+  metadata.engine_shape = Preserve_snapshot_engine_shape::TEMP_ONLY;
+  metadata.has_persistent_engine_state = false;
+  metadata.has_logged_persistent_work = true;
+  EXPECT_FALSE(
+      preserved_trx_snapshot_allows_synthetic_temp_claim(metadata));
+}
+
+TEST_F(PreserveSnapshotTest,
+       ConsumeStateMarkerExcludesSnapshotFromLocalRecovery) {
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  Preserved_trx_bundle bundle;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  ASSERT_EQ(Preserve_snapshot_status::OK, store.write(bundle, 300, nullptr));
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            store.mark_consume_state(
+                input.metadata.token,
+                Preserve_snapshot_consume_state::CONSUME_PENDING,
+                "resume activation pending"));
+
+  Preserved_trx_carrier_listing listing;
+  ASSERT_EQ(Preserve_snapshot_status::OK, store.list_tokens(&listing));
+  EXPECT_EQ(1U, listing.consume_state_tokens.count(input.metadata.token));
+  EXPECT_EQ(0U,
+            preserved_trx_local_recoverable_snapshot_tokens(listing).count(
+                input.metadata.token));
+
+  Preserved_trx_carrier_token_state token_state;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(input.metadata.token, &token_state));
+  EXPECT_TRUE(token_state.consume_state);
+
+  DBUG_SET("+d,preserve_trx_fail_delete_snapshot_files");
+  EXPECT_EQ(Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE,
+            carrier.remove_with_status(input.metadata.token));
+  DBUG_SET("-d,preserve_trx_fail_delete_snapshot_files");
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(input.metadata.token, &token_state));
+  EXPECT_TRUE(token_state.snapshot);
+  EXPECT_TRUE(token_state.consume_state);
+
+  EXPECT_EQ(Preserve_snapshot_delete_status::OK,
+            carrier.remove_with_status(input.metadata.token));
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier.token_state(input.metadata.token, &token_state));
+  EXPECT_FALSE(token_state.snapshot);
+  EXPECT_FALSE(token_state.consume_state);
+}
+
 TEST_F(PreserveSnapshotTest,
        BundleCodecAcceptsCurrentNoCacheWithoutMetadataTlv) {
   Preserved_trx_bundle bundle;

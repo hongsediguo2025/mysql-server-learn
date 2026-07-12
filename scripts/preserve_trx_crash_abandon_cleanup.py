@@ -26,6 +26,8 @@ TOKEN_PATTERNS = [
     ("binlog_cache", re.compile(rf"^{TOKEN_RE}\.binlog_cache$")),
     ("tainted_tmp", re.compile(rf"^{TOKEN_RE}\.tainted\.tmp$")),
     ("tainted", re.compile(rf"^{TOKEN_RE}\.tainted$")),
+    ("consume_state_tmp", re.compile(rf"^{TOKEN_RE}\.consume_state\.tmp$")),
+    ("consume_state", re.compile(rf"^{TOKEN_RE}\.consume_state$")),
     ("generic_blob_tmp",
      re.compile(rf"^{TOKEN_RE}\.blob\.{BLOB_NAME_RE}\.tmp$")),
     ("generic_blob", re.compile(rf"^{TOKEN_RE}\.blob\.{BLOB_NAME_RE}$")),

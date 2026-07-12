@@ -15,6 +15,11 @@ class PreserveTrxCrashAbandonCleanupTest(unittest.TestCase):
                          classify_preserve_artifact("tok_1.bin.tmp"))
         self.assertEqual("binlog_cache",
                          classify_preserve_artifact("tok_1.binlog_cache"))
+        self.assertEqual("consume_state",
+                         classify_preserve_artifact("tok_1.consume_state"))
+        self.assertEqual("consume_state_tmp",
+                         classify_preserve_artifact(
+                             "tok_1.consume_state.tmp"))
         self.assertEqual("generic_blob",
                          classify_preserve_artifact("tok_1.blob.record_locks"))
         self.assertEqual("generic_blob_tmp",
@@ -51,6 +56,7 @@ class PreserveTrxCrashAbandonCleanupTest(unittest.TestCase):
             shard.mkdir(parents=True)
             (root / "tok_1.bin").write_text("snapshot")
             (root / "tok_1.tainted").write_text("tainted")
+            (root / "tok_1.consume_state").write_text("active")
             (shard / "tok_1.blob.record_locks").write_text("locks")
             (root / "warm_1.record_locks.warm.7").write_text("warm")
             (root / "ibdata1").write_text("native")
@@ -60,6 +66,7 @@ class PreserveTrxCrashAbandonCleanupTest(unittest.TestCase):
             self.assertEqual([], result.errors)
             self.assertFalse((root / "tok_1.bin").exists())
             self.assertFalse((root / "tok_1.tainted").exists())
+            self.assertFalse((root / "tok_1.consume_state").exists())
             self.assertFalse((shard / "tok_1.blob.record_locks").exists())
             self.assertFalse((root / "warm_1.record_locks.warm.7").exists())
             self.assertTrue((root / "ibdata1").exists())
