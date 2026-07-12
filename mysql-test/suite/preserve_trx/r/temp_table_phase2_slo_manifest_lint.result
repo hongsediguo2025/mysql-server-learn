@@ -1,7 +1,8 @@
 # Lint-only source-shape guard for temp-table phase-2 SLO reporting.
-# If temp-table image/undo manifest construction still runs inside the
-# phase-2 snapshot-write window, strict phase-2 SLO must be reported as
-# not guaranteed. Functional preserve may still succeed.
+# Temp-table manifest timing and actual manifest construction are
+# separate facts. Only targets that built a manifest in phase 2 make
+# strict phase-2 SLO not guaranteed. Functional preserve may still
+# succeed.
 SELECT 'ok' AS temp_table_phase2_slo_manifest_lint;
 temp_table_phase2_slo_manifest_lint
 ok

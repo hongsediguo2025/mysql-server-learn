@@ -1,7 +1,8 @@
 --echo # Lint-only source-shape guard for temp-table phase-2 SLO reporting.
---echo # If temp-table image/undo manifest construction still runs inside the
---echo # phase-2 snapshot-write window, strict phase-2 SLO must be reported as
---echo # not guaranteed. Functional preserve may still succeed.
+--echo # Temp-table manifest timing and actual manifest construction are
+--echo # separate facts. Only targets that built a manifest in phase 2 make
+--echo # strict phase-2 SLO not guaranteed. Functional preserve may still
+--echo # succeed.
 
 --perl
 use strict;
@@ -21,9 +22,20 @@ close($fh);
 die "drain metrics must report temp-table manifest phase-2 build time\n"
   unless $preserve =~ /phase2_snapshot_write_temp_manifest_us/s;
 
-die "phase-2 temp-table manifest build must make strict SLO not guaranteed\n"
+die "temp-table manifest construction must be tracked independently of timing\n"
   unless $preserve =~
-    /if\s*\(\s*phase2_metrics\.snapshot_write_temp_manifest_us\s*!=\s*0\s*\)\s*\{[\s\S]{0,800}phase2_slo_guaranteed\s*=\s*0[\s\S]{0,800}temp_table_manifest_phase2_build/s;
+    /snapshot_write_temp_manifest_built\s*=\s*!metadata\.temp_table_manifest_payload\.empty\(\)/s;
+
+die "phase-2 metrics must count targets that actually built temp manifests\n"
+  unless $preserve =~ /temp_manifest_build_target_count/s;
+
+die "elapsed temp-manifest time must not decide strict SLO eligibility\n"
+  if $preserve =~
+    /if\s*\(\s*phase2_metrics\.snapshot_write_temp_manifest_us\s*!=\s*0\s*\)/s;
+
+die "actual phase-2 temp-table manifest builds must make strict SLO not guaranteed\n"
+  unless $preserve =~
+    /if\s*\(\s*phase2_metrics\.temp_manifest_build_target_count\s*!=\s*0\s*\)\s*\{[\s\S]{0,800}phase2_slo_guaranteed\s*=\s*0[\s\S]{0,800}temp_table_manifest_phase2_build/s;
 
 die "temp-table phase-2 SLO reason must not be hidden behind savepoint fallback\n"
   unless $preserve =~

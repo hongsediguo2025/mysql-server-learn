@@ -400,6 +400,7 @@ struct Preserve_trx_phase2_metrics {
   uint64_t snapshot_write_us{0};
   uint64_t snapshot_write_prebuilt_binlog_us{0};
   uint64_t snapshot_write_temp_manifest_us{0};
+  uint64_t temp_manifest_build_target_count{0};
   uint64_t snapshot_write_bundle_build_us{0};
   uint64_t snapshot_write_store_us{0};
   uint64_t snapshot_write_store_token_state_us{0};
@@ -12317,6 +12318,10 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     discard_prebuilt_binlog_blob_if_needed();
     return reject_after_snapshot_failure(false);
   }
+  if (result != nullptr) {
+    result->snapshot_write_temp_manifest_built =
+        !metadata.temp_table_manifest_payload.empty();
+  }
 
   Preserved_trx_bundle_build_input bundle_input;
   bundle_input.metadata = metadata;
@@ -14001,6 +14006,8 @@ bool Preserve_trx_drain_service::execute(
         result.snapshot_write_prebuilt_binlog_us;
     phase2_metrics.snapshot_write_temp_manifest_us +=
         result.snapshot_write_temp_manifest_us;
+    phase2_metrics.temp_manifest_build_target_count +=
+        result.snapshot_write_temp_manifest_built ? 1 : 0;
     phase2_metrics.snapshot_write_bundle_build_us +=
         result.snapshot_write_bundle_build_us;
     phase2_metrics.snapshot_write_store_us += result.snapshot_write_store_us;
@@ -14371,7 +14378,7 @@ bool Preserve_trx_drain_service::execute(
             phase2_metrics.savepoint_live_export_target_count;
       }
     }
-    if (phase2_metrics.snapshot_write_temp_manifest_us != 0) {
+    if (phase2_metrics.temp_manifest_build_target_count != 0) {
       phase2_slo_guaranteed = 0;
       if (phase2_slo_reason.empty() ||
           phase2_slo_reason == "non_record_lock_family_live_export" ||
@@ -14379,11 +14386,10 @@ bool Preserve_trx_drain_service::execute(
           phase2_slo_reason == "record_payload_materialized_in_phase2") {
         phase2_slo_reason = "temp_table_manifest_phase2_build";
       }
-      const uint64_t temp_manifest_slo_target_count =
-          std::max<uint64_t>(uint64_t{1}, phase2_metrics.target_count);
       if (phase2_slo_not_guaranteed_count <
-          temp_manifest_slo_target_count) {
-        phase2_slo_not_guaranteed_count = temp_manifest_slo_target_count;
+          phase2_metrics.temp_manifest_build_target_count) {
+        phase2_slo_not_guaranteed_count =
+            phase2_metrics.temp_manifest_build_target_count;
       }
     }
     std::string message =
@@ -14451,6 +14457,8 @@ bool Preserve_trx_drain_service::execute(
         std::to_string(phase2_metrics.snapshot_write_prebuilt_binlog_us) +
         " phase2_snapshot_write_temp_manifest_us=" +
         std::to_string(phase2_metrics.snapshot_write_temp_manifest_us) +
+        " phase2_temp_manifest_build_target_count=" +
+        std::to_string(phase2_metrics.temp_manifest_build_target_count) +
         " phase2_snapshot_write_bundle_build_us=" +
         std::to_string(phase2_metrics.snapshot_write_bundle_build_us) +
         " phase2_snapshot_write_store_us=" +

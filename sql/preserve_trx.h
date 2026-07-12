@@ -394,6 +394,7 @@ struct Preserve_trx_preserve_result {
   uint64_t snapshot_write_us{0};
   uint64_t snapshot_write_prebuilt_binlog_us{0};
   uint64_t snapshot_write_temp_manifest_us{0};
+  bool snapshot_write_temp_manifest_built{false};
   uint64_t snapshot_write_bundle_build_us{0};
   uint64_t snapshot_write_store_us{0};
   uint64_t snapshot_write_store_token_state_us{0};
