@@ -47,6 +47,7 @@ as published by the Free Software Foundation.
 #include "lock0lock.h"
 #include "lock0priv.h"
 #include "mach0data.h"
+#include "os0file.h"
 #include "row0sel.h"
 #include "sha2.h"
 #include "trx0preserve.h"
@@ -2788,6 +2789,8 @@ static dberr_t lock_preserve_prefetch_record_lock_pages_low(
   space_id_t last_space_id = SPACE_UNKNOWN;
   page_no_t last_page_no = FIL_NULL;
   bool have_last_page = false;
+  bool submitted_background_reads = false;
+  dberr_t result = DB_SUCCESS;
   Lock_preserve_import_context prefetch_context;
   for (const Preserve_record_lock_entry *entry : record_entries) {
     if (have_last_page && entry->space_id == last_space_id &&
@@ -2804,7 +2807,8 @@ static dberr_t lock_preserve_prefetch_record_lock_pages_low(
     if (!found) {
       lock_preserve_set_record_export_error(
           "record_lock_prefetch_space_unavailable");
-      return DB_TABLE_NOT_FOUND;
+      result = DB_TABLE_NOT_FOUND;
+      break;
     }
     const page_no_t space_size = fil_space_get_size(entry->space_id);
     if (space_size == 0 || entry->page_no >= space_size) {
@@ -2819,7 +2823,8 @@ static dberr_t lock_preserve_prefetch_record_lock_pages_low(
       if (metrics != nullptr) {
         ++metrics->prefetch_missing_pages;
       }
-      return DB_TABLE_NOT_FOUND;
+      result = DB_TABLE_NOT_FOUND;
+      break;
     }
     if (wait_for_resident) {
       /*
@@ -2833,14 +2838,20 @@ static dberr_t lock_preserve_prefetch_record_lock_pages_low(
         ++metrics->prefetch_pages;
         metrics->prefetch_bytes += page_size.physical();
       }
-    } else if (buf_read_page_background(page_id, page_size, false) &&
-               metrics != nullptr) {
-      ++metrics->prefetch_pages;
-      metrics->prefetch_bytes += page_size.physical();
+    } else if (buf_read_page_background(page_id, page_size, false)) {
+      submitted_background_reads = true;
+      if (metrics != nullptr) {
+        ++metrics->prefetch_pages;
+        metrics->prefetch_bytes += page_size.physical();
+      }
     }
   }
 
-  return DB_SUCCESS;
+  if (submitted_background_reads) {
+    os_aio_simulated_wake_handler_threads();
+  }
+
+  return result;
 }
 
 dberr_t lock_preserve_prefetch_record_lock_pages(

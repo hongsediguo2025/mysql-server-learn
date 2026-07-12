@@ -504,6 +504,9 @@ die "record-lock startup prefetch must not expose an unused IO-governor sysvar\n
 die "record-lock startup prefetch must live in the preserve-owned lock prefetch helper\n"
   unless $lock_preserve =~
          /lock_preserve_prefetch_record_lock_pages[\s\S]*buf_read_page_background/s;
+die "record-lock startup prefetch must wake simulated AIO after submitting background reads\n"
+  unless $lock_preserve =~
+         /lock_preserve_prefetch_record_lock_pages_low[\s\S]*buf_read_page_background[\s\S]*os_aio_simulated_wake_handler_threads/s;
 die "record-lock startup prefetch helper must be gated by preserve_trx_recover_lock_page_prefetch\n"
   unless $preserve =~
          /preserve_trx_recover_lock_page_prefetch[\s\S]*trx_preserve_prefetch_record_lock_pages/s;
