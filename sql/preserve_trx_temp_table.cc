@@ -962,8 +962,8 @@ Preserve_snapshot_status temp_table_metadata_preflight(THD *thd) {
     physical sidecar can be proven before the snapshot is built. Unsupported
     engines, missing dictionary bindings or oversized sidecars fail closed.
   */
-  Temp_table_warmcopy_participant *participant =
-      preserve_trx_temp_table_get_participant(thd);
+  std::shared_ptr<Temp_table_warmcopy_participant> participant =
+      preserve_trx_temp_table_pin_participant(thd);
 
   auto reject = [&](const char *reason) {
     if (participant != nullptr) participant->mark_degraded(reason);
@@ -991,7 +991,8 @@ Preserve_snapshot_status temp_table_metadata_preflight(THD *thd) {
       return map_temp_dberr(err);
     }
     const Preserve_snapshot_status image_budget_status =
-        temp_table_physical_image_budget_preflight(source_metadata, participant);
+        temp_table_physical_image_budget_preflight(source_metadata,
+                                                   participant.get());
     if (image_budget_status != Preserve_snapshot_status::OK) {
       return image_budget_status;
     }
@@ -1117,46 +1118,76 @@ bool preserve_trx_temp_table_append_ownership_claims_from_descriptor(
 }
 
 Temp_table_warmcopy_participant::Temp_table_warmcopy_participant(
-    size_t max_tail_bytes)
-    : m_max_tail_bytes(max_tail_bytes) {}
+    size_t max_tail_bytes, size_t max_marker_count)
+    : m_max_tail_bytes(max_tail_bytes),
+      m_max_marker_count(max_marker_count) {}
+
+Temp_table_warmcopy_participant::~Temp_table_warmcopy_participant() {
+  for (const std::unique_ptr<Prebuilt_sidecar> &sidecar :
+       m_prebuilt_sidecars) {
+    if (sidecar == nullptr) continue;
+    if (sidecar->image_writer != nullptr) {
+      const Preserved_trx_carrier_status status = sidecar->image_writer->abort();
+      if (status != Preserved_trx_carrier_status::OK) {
+        preserve_trx_resource_note_spill_failure();
+      }
+    }
+    trx_preserve_temp_space_image_reset_dirty_page_stream(
+        &sidecar->descriptor);
+    if (!sidecar->preserve_dir.empty()) {
+      Local_file_preserved_temp_table_image_carrier carrier(
+          normalize_dir(sidecar->preserve_dir));
+      (void)carrier.remove_warm_sidecars(sidecar->warmcopy_id,
+                                         sidecar->source_space_id);
+    }
+  }
+}
 
 void Temp_table_warmcopy_participant::begin_baseline_copy() {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   if (m_state != Temp_table_participant_state::DEGRADED)
     m_state = Temp_table_participant_state::COPYING_BASELINE;
 }
 
 void Temp_table_warmcopy_participant::begin_journal_apply() {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   if (m_state != Temp_table_participant_state::DEGRADED)
     m_state = Temp_table_participant_state::APPLYING_JOURNAL;
 }
 
 void Temp_table_warmcopy_participant::mark_ready() {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   if (m_state != Temp_table_participant_state::DEGRADED)
     m_state = Temp_table_participant_state::READY;
 }
 
 void Temp_table_warmcopy_participant::mark_degraded(std::string reason) {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   m_state = Temp_table_participant_state::DEGRADED;
   m_degraded_reason = std::move(reason);
 }
 
 void Temp_table_warmcopy_participant::mark_untracked_change_before_history() {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   m_untracked_change_before_history = true;
 }
 
 bool Temp_table_warmcopy_participant::arm_dirty_page_capture() {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   if (m_state == Temp_table_participant_state::DEGRADED) return false;
   m_dirty_page_capture_armed = true;
   return true;
 }
 
 bool Temp_table_warmcopy_participant::arm_metadata_mutation_capture() {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   if (m_state == Temp_table_participant_state::DEGRADED) return false;
   m_metadata_mutation_capture_armed = true;
   return true;
 }
 
 bool Temp_table_warmcopy_participant::begin_capture_epoch() {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   if (m_state == Temp_table_participant_state::DEGRADED) return false;
   if (!m_dirty_page_capture_armed || !m_metadata_mutation_capture_armed)
     return false;
@@ -1168,6 +1199,7 @@ bool Temp_table_warmcopy_participant::begin_capture_epoch() {
 }
 
 bool Temp_table_warmcopy_participant::start_history() {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   if (m_state == Temp_table_participant_state::DEGRADED) return false;
   if (m_untracked_change_before_history) {
     mark_degraded("late temp-table history start");
@@ -1178,15 +1210,26 @@ bool Temp_table_warmcopy_participant::start_history() {
 }
 
 uint64_t Temp_table_warmcopy_participant::next_sequence() {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   return m_next_sequence++;
 }
 
 bool Temp_table_warmcopy_participant::append_journal(
     Temp_table_journal_record record) {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   if (m_state == Temp_table_participant_state::DEGRADED) return false;
   if (!m_history_started && !start_history()) return false;
 
-  if (record.payload.size() > m_max_tail_bytes - m_tail_bytes) {
+  if (m_journal.size() >= m_max_marker_count) {
+    mark_degraded("temp-table journal marker count exceeded");
+    return false;
+  }
+  constexpr size_t kFixedRecordCharge = sizeof(Temp_table_journal_record);
+  if (record.payload.size() >
+          std::numeric_limits<size_t>::max() - kFixedRecordCharge ||
+      m_tail_bytes > m_max_tail_bytes ||
+      kFixedRecordCharge + record.payload.size() >
+          m_max_tail_bytes - m_tail_bytes) {
     mark_degraded("temp-table journal tail budget exceeded");
     return false;
   }
@@ -1207,13 +1250,15 @@ bool Temp_table_warmcopy_participant::append_journal(
     }
     record.row_seq = table_state->next_row_sequence++;
   }
-  m_tail_bytes += record.payload.size();
+  m_tail_bytes += kFixedRecordCharge + record.payload.size();
   m_journal.push_back(std::move(record));
+  m_mutation_generation.fetch_add(1, std::memory_order_release);
   m_current_statement_touched = true;
   return true;
 }
 
 bool Temp_table_warmcopy_participant::has_row_history() const {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   return std::any_of(m_journal.begin(), m_journal.end(),
                      [](const Temp_table_journal_record &record) {
                        switch (record.kind) {
@@ -1236,6 +1281,7 @@ bool Temp_table_warmcopy_participant::has_row_history() const {
 }
 
 bool Temp_table_warmcopy_participant::has_temp_dml_history() const {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   return std::any_of(m_journal.begin(), m_journal.end(),
                      [](const Temp_table_journal_record &record) {
                        switch (record.kind) {
@@ -1258,6 +1304,7 @@ bool Temp_table_warmcopy_participant::has_temp_dml_history() const {
 }
 
 bool Temp_table_warmcopy_participant::has_temp_ddl_history() const {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   return std::any_of(m_journal.begin(), m_journal.end(),
                      [](const Temp_table_journal_record &record) {
                        switch (record.kind) {
@@ -1280,6 +1327,7 @@ bool Temp_table_warmcopy_participant::has_temp_ddl_history() const {
 }
 
 bool Temp_table_warmcopy_participant::has_unsupported_history() const {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   if (m_untracked_change_before_history) return true;
 
   return std::any_of(m_journal.begin(), m_journal.end(),
@@ -1305,6 +1353,7 @@ bool Temp_table_warmcopy_participant::has_unsupported_history() const {
 
 bool Temp_table_warmcopy_participant::register_table(
     uint32_t table_ordinal, std::string table_name) {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   if (table_ordinal == 0 || table_name.empty() ||
       find_table(table_ordinal) != nullptr) {
     return false;
@@ -1321,6 +1370,7 @@ bool Temp_table_warmcopy_participant::register_table(
 
 uint32_t Temp_table_warmcopy_participant::ordinal_for_table_key(
     const std::string &schema_name, const std::string &table_name) {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   const uint32_t existing = lookup_table_ordinal(schema_name, table_name);
   if (existing != 0) return existing;
 
@@ -1335,6 +1385,7 @@ uint32_t Temp_table_warmcopy_participant::ordinal_for_table_key(
 
 uint32_t Temp_table_warmcopy_participant::lookup_table_ordinal(
     const std::string &schema_name, const std::string &table_name) const {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   for (const Table_state &table : m_tables) {
     if (table.schema_name == schema_name && table.table_name == table_name)
       return table.table_ordinal;
@@ -1344,17 +1395,20 @@ uint32_t Temp_table_warmcopy_participant::lookup_table_ordinal(
 
 bool Temp_table_warmcopy_participant::has_table(
     uint32_t table_ordinal) const {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   return find_table(table_ordinal) != nullptr;
 }
 
 uint32_t Temp_table_warmcopy_participant::table_generation(
     uint32_t table_ordinal) const {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   const Table_state *table_state = find_table(table_ordinal);
   return table_state == nullptr ? 0 : table_state->generation;
 }
 
 bool Temp_table_warmcopy_participant::note_drop_table(
     uint32_t table_ordinal) {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   if (!has_table(table_ordinal)) {
     mark_degraded("untracked temp-table drop");
     return false;
@@ -1372,6 +1426,7 @@ bool Temp_table_warmcopy_participant::note_drop_table(
 
 bool Temp_table_warmcopy_participant::note_truncate_table(
     uint32_t table_ordinal) {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   Table_state *table_state = find_table(table_ordinal);
   if (table_state == nullptr) {
     mark_degraded("untracked temp-table truncate");
@@ -1405,6 +1460,7 @@ Temp_table_warmcopy_participant::find_table(uint32_t table_ordinal) const {
 bool Temp_table_warmcopy_participant::append_table_event(
     uint32_t table_ordinal, Temp_table_journal_record::Kind kind,
     std::string payload) {
+  std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
   Temp_table_journal_record record;
   record.table_ordinal = table_ordinal;
   record.kind = kind;
@@ -1451,14 +1507,25 @@ Temp_table_warmcopy_participant *preserve_trx_temp_table_get_participant(
 
   mysql_mutex_lock(&thd->LOCK_thd_data);
   Temp_table_warmcopy_participant *participant =
+      thd->preserve_trx_temp_table_participant.get();
+  mysql_mutex_unlock(&thd->LOCK_thd_data);
+  return participant;
+}
+
+std::shared_ptr<Temp_table_warmcopy_participant>
+preserve_trx_temp_table_pin_participant(THD *thd) {
+  if (thd == nullptr) return {};
+
+  mysql_mutex_lock(&thd->LOCK_thd_data);
+  std::shared_ptr<Temp_table_warmcopy_participant> participant =
       thd->preserve_trx_temp_table_participant;
   mysql_mutex_unlock(&thd->LOCK_thd_data);
   return participant;
 }
 
 std::string preserve_trx_temp_table_degraded_reason(THD *thd) {
-  Temp_table_warmcopy_participant *participant =
-      preserve_trx_temp_table_get_participant(thd);
+  std::shared_ptr<Temp_table_warmcopy_participant> participant =
+      preserve_trx_temp_table_pin_participant(thd);
   if (participant == nullptr) return std::string();
   return participant->degraded_reason();
 }
@@ -1467,8 +1534,8 @@ bool preserve_trx_temp_table_has_row_history(THD *thd) {
   if (thd == nullptr) return false;
   if (preserve_trx_temp_table_has_untracked_change(thd)) return true;
 
-  Temp_table_warmcopy_participant *participant =
-      preserve_trx_temp_table_get_participant(thd);
+  std::shared_ptr<Temp_table_warmcopy_participant> participant =
+      preserve_trx_temp_table_pin_participant(thd);
   return participant != nullptr && participant->has_row_history();
 }
 
@@ -1499,8 +1566,8 @@ Preserve_snapshot_status preserve_trx_temp_table_preflight_preserve(THD *thd) {
     records DDL/savepoint/statement-rollback boundaries that remain fail-closed.
     No SQL row payload is replayed during resume.
   */
-  Temp_table_warmcopy_participant *participant =
-      preserve_trx_temp_table_get_participant(thd);
+  std::shared_ptr<Temp_table_warmcopy_participant> participant =
+      preserve_trx_temp_table_pin_participant(thd);
   const bool untracked_change = preserve_trx_temp_table_has_untracked_change(thd);
   const bool batch_unsupported_boundary =
       preserve_trx_temp_table_has_batch_unsupported_boundary(thd);
@@ -1616,6 +1683,31 @@ void preserve_trx_temp_table_mark_transaction_start(THD *thd) {
   thd->preserve_trx_temp_table_no_redo_baseline_top = top_undo_no;
 }
 
+bool preserve_trx_temp_table_reseed_after_resume(THD *thd) {
+  if (thd == nullptr || !preserve_trx_temp_table_row_hooks_enabled()) {
+    return false;
+  }
+
+  bool present = false;
+  uint64_t top_undo_no = 0;
+  if (!trx_preserve_current_thd_no_redo_undo_state(thd, &present,
+                                                   &top_undo_no)) {
+    return false;
+  }
+
+  preserve_trx_temp_table_clear_participant(thd);
+  thd->preserve_trx_temp_table_untracked_change.store(
+      false, std::memory_order_release);
+  thd->preserve_trx_temp_table_batch_unsupported_boundary.store(
+      false, std::memory_order_release);
+  thd->preserve_trx_temp_table_batch_capture_epoch.store(
+      false, std::memory_order_release);
+  thd->preserve_trx_temp_table_no_redo_baseline_valid = true;
+  thd->preserve_trx_temp_table_no_redo_baseline_present = present;
+  thd->preserve_trx_temp_table_no_redo_baseline_top = top_undo_no;
+  return true;
+}
+
 Temp_table_warmcopy_participant *preserve_trx_temp_table_ensure_participant(
     THD *thd) {
   if (!preserve_trx_is_enabled() || !preserve_trx_temp_table_enable ||
@@ -1636,8 +1728,12 @@ Temp_table_warmcopy_participant *preserve_trx_temp_table_ensure_participant(
   mysql_mutex_lock(&thd->LOCK_thd_data);
   if (thd->preserve_trx_temp_table_participant == nullptr) {
     if (!fail_participant_alloc) {
-      thd->preserve_trx_temp_table_participant =
-          new (std::nothrow) Temp_table_warmcopy_participant();
+      try {
+        thd->preserve_trx_temp_table_participant =
+            std::make_shared<Temp_table_warmcopy_participant>();
+      } catch (const std::bad_alloc &) {
+        thd->preserve_trx_temp_table_participant.reset();
+      }
     }
     if (thd->preserve_trx_temp_table_participant != nullptr &&
         has_existing_savepoints) {
@@ -1646,7 +1742,7 @@ Temp_table_warmcopy_participant *preserve_trx_temp_table_ensure_participant(
     }
   }
   Temp_table_warmcopy_participant *participant =
-      thd->preserve_trx_temp_table_participant;
+      thd->preserve_trx_temp_table_participant.get();
   if (participant != nullptr) {
     thd->preserve_trx_temp_table_has_participant.store(
         true, std::memory_order_release);
@@ -1660,44 +1756,13 @@ void preserve_trx_temp_table_clear_participant(THD *thd) {
   if (thd == nullptr) return;
 
   mysql_mutex_lock(&thd->LOCK_thd_data);
-  Temp_table_warmcopy_participant *participant =
-      thd->preserve_trx_temp_table_participant;
-  thd->preserve_trx_temp_table_participant = nullptr;
+  std::shared_ptr<Temp_table_warmcopy_participant> participant =
+      std::move(thd->preserve_trx_temp_table_participant);
+  thd->preserve_trx_temp_table_participant.reset();
   thd->preserve_trx_temp_table_participant_id = 0;
   thd->preserve_trx_temp_table_has_participant.store(
       false, std::memory_order_release);
   mysql_mutex_unlock(&thd->LOCK_thd_data);
-
-  /*
-    A target may hit an unsupported temp-table DDL boundary after phase 1 has
-    written warm sidecars but before DRAIN reaches the normal participant abort
-    path. Clear the files while the participant still remembers their warmcopy
-    ids; otherwise a later state reset would orphan tempwarm artifacts.
-  */
-  if (participant != nullptr && !participant->prebuilt_sidecars().empty()) {
-    for (const std::unique_ptr<Temp_table_warmcopy_participant::Prebuilt_sidecar>
-             &sidecar :
-         participant->prebuilt_sidecars()) {
-      if (sidecar == nullptr) continue;
-      if (sidecar->image_writer != nullptr) {
-        const Preserved_trx_carrier_status abort_status =
-            sidecar->image_writer->abort();
-        if (abort_status != Preserved_trx_carrier_status::OK) {
-          preserve_trx_resource_note_spill_failure();
-        }
-      }
-      trx_preserve_temp_space_image_reset_dirty_page_stream(
-          &sidecar->descriptor);
-      if (!sidecar->preserve_dir.empty()) {
-        Local_file_preserved_temp_table_image_carrier carrier(
-            normalize_dir(sidecar->preserve_dir));
-        (void)carrier.remove_warm_sidecars(sidecar->warmcopy_id,
-                                           sidecar->source_space_id);
-      }
-    }
-    participant->clear_prebuilt_sidecars();
-  }
-  delete participant;
 }
 
 bool preserve_trx_temp_table_transaction_state_needs_clear(const THD *thd) {
@@ -2057,8 +2122,9 @@ bool preserve_trx_temp_table_begin_capture_epoch(THD *thd) {
   if (thd == nullptr) return false;
   if (thd->temporary_tables == nullptr) return true;
 
-  Temp_table_warmcopy_participant *participant =
-      preserve_trx_temp_table_ensure_participant(thd);
+  (void)preserve_trx_temp_table_ensure_participant(thd);
+  std::shared_ptr<Temp_table_warmcopy_participant> participant =
+      preserve_trx_temp_table_pin_participant(thd);
   if (participant == nullptr) return false;
   return participant->arm_dirty_page_capture() &&
          participant->arm_metadata_mutation_capture() &&
@@ -2314,16 +2380,155 @@ bool preserve_trx_temp_table_build_baseline_image(
   return true;
 }
 
+namespace {
+
+struct Temp_table_phase1_prebuild_capture {
+  trx_preserve_temp_table_exported_metadata metadata;
+  std::unique_ptr<Temp_table_warmcopy_participant::Prebuilt_sidecar> sidecar;
+  std::string undo_payload;
+};
+
+bool prepare_temp_table_phase1_prebuild_captures(
+    THD *thd, trx_t *trx, const std::string &normalized_dir,
+    const std::string &warmcopy_id,
+    const std::shared_ptr<Temp_table_warmcopy_participant> &participant,
+    std::vector<Temp_table_phase1_prebuild_capture> *captures,
+    bool *target_still_idle, std::string *failure_reason) {
+  if (captures == nullptr || target_still_idle == nullptr ||
+      participant == nullptr) {
+    return false;
+  }
+
+  *target_still_idle = false;
+  std::set<uint32_t> visited_source_space_ids;
+  mysql_mutex_lock(&thd->LOCK_thd_data);
+  if (!thd->m_server_idle ||
+      thd->preserve_trx_temp_table_participant.get() != participant.get() ||
+      trx_preserve_current_thd_trx(thd) != trx) {
+    mysql_mutex_unlock(&thd->LOCK_thd_data);
+    return true;
+  }
+  *target_still_idle = true;
+
+  for (TABLE *table = thd->temporary_tables; table != nullptr;
+       table = table->next) {
+    if (!temp_table_candidate(table)) {
+      assign_reason(failure_reason, "unsupported temporary table type");
+      mysql_mutex_unlock(&thd->LOCK_thd_data);
+      return false;
+    }
+    if (table_schema_from_table(table).empty() ||
+        table_name_from_table(table).empty()) {
+      assign_reason(failure_reason, "temp-table metadata unavailable");
+      mysql_mutex_unlock(&thd->LOCK_thd_data);
+      return false;
+    }
+
+    Temp_table_phase1_prebuild_capture capture;
+    if (trx_preserve_temp_table_export_source_metadata(table,
+                                                       &capture.metadata) !=
+        DB_SUCCESS) {
+      assign_reason(failure_reason,
+                    "temp-table source metadata unavailable");
+      mysql_mutex_unlock(&thd->LOCK_thd_data);
+      return false;
+    }
+    if (capture.metadata.source_space_id == 0 ||
+        !visited_source_space_ids.insert(capture.metadata.source_space_id)
+             .second ||
+        participant->find_prebuilt_sidecar(
+            capture.metadata.source_space_id) != nullptr) {
+      continue;
+    }
+
+    capture.sidecar =
+        std::make_unique<Temp_table_warmcopy_participant::Prebuilt_sidecar>();
+    if (capture.sidecar == nullptr) {
+      assign_reason(failure_reason,
+                    "temp-table phase1 sidecar allocation failed");
+      mysql_mutex_unlock(&thd->LOCK_thd_data);
+      return false;
+    }
+    capture.sidecar->source_space_id = capture.metadata.source_space_id;
+    capture.sidecar->warmcopy_id = warmcopy_id;
+    capture.sidecar->preserve_dir = normalized_dir;
+    capture.sidecar->descriptor.source_space_id =
+        capture.metadata.source_space_id;
+    capture.sidecar->descriptor.page_size = capture.metadata.page_size;
+    capture.sidecar->descriptor.space_flags = capture.metadata.space_flags;
+
+    participant->begin_baseline_copy();
+    dberr_t err = trx_preserve_temp_space_image_arm_dirty_page_stream(
+        &capture.sidecar->descriptor, participant.get(), 64ULL * 1024 * 1024,
+        warmcopy_id.c_str());
+    if (err == DB_SUCCESS) {
+      err = trx_preserve_temp_space_image_register_dirty_page_stream(
+          &capture.sidecar->descriptor);
+    }
+    if (err == DB_SUCCESS) {
+      err = trx_preserve_temp_space_image_flush_dirty_pages_for_copy(
+          &capture.sidecar->descriptor);
+    }
+    if (err == DB_SUCCESS) {
+      err = trx_preserve_temp_space_image_begin_initial_copy(
+          &capture.sidecar->descriptor, participant.get());
+    }
+    if (err != DB_SUCCESS) {
+      assign_reason(failure_reason,
+                    "temp-table phase1 dirty stream open failed");
+      trx_preserve_temp_space_image_reset_dirty_page_stream(
+          &capture.sidecar->descriptor);
+      mysql_mutex_unlock(&thd->LOCK_thd_data);
+      return false;
+    }
+
+    if (participant->has_temp_dml_history()) {
+      err = trx == nullptr
+                ? DB_ERROR
+                : trx_preserve_temp_space_image_capture_no_redo_undo_from_trx(
+                      &capture.sidecar->descriptor, trx);
+      if (err == DB_SUCCESS) {
+        err = trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(
+            &capture.sidecar->descriptor);
+      }
+      if (err == DB_SUCCESS) {
+        err = trx_preserve_temp_space_image_build_no_redo_undo_sidecar_payload(
+            capture.sidecar->descriptor, &capture.undo_payload);
+      }
+      if (err != DB_SUCCESS) {
+        assign_reason(
+            failure_reason,
+            "temp-table phase1 no-redo undo sidecar capture failed");
+        trx_preserve_temp_space_image_reset_dirty_page_stream(
+            &capture.sidecar->descriptor);
+        mysql_mutex_unlock(&thd->LOCK_thd_data);
+        return false;
+      }
+      capture.sidecar->undo = undo_descriptor_from_image_descriptor(
+          warmcopy_id, capture.sidecar->descriptor, capture.undo_payload);
+      capture.sidecar->has_undo = true;
+    }
+    capture.sidecar->journal_record_count =
+        participant->journal_record_count();
+    capture.sidecar->mutation_generation = participant->mutation_generation();
+    captures->push_back(std::move(capture));
+  }
+  mysql_mutex_unlock(&thd->LOCK_thd_data);
+  return true;
+}
+
+}  // namespace
+
 bool preserve_trx_temp_table_prebuild_phase1_sidecars(
     THD *thd, trx_t *trx, const std::string &dir,
     const std::string &warmcopy_id) {
   if (!preserve_trx_temp_table_enable) return true;
   if (thd == nullptr) return false;
-  if (thd->temporary_tables == nullptr) return true;
   if (!token_is_filename_safe(warmcopy_id)) return false;
 
-  Temp_table_warmcopy_participant *participant =
-      preserve_trx_temp_table_ensure_participant(thd);
+  (void)preserve_trx_temp_table_ensure_participant(thd);
+  std::shared_ptr<Temp_table_warmcopy_participant> participant =
+      preserve_trx_temp_table_pin_participant(thd);
   if (participant == nullptr) return false;
   if (preserve_trx_temp_table_has_untracked_change(thd) ||
       preserve_trx_temp_table_has_batch_unsupported_boundary(thd) ||
@@ -2336,7 +2541,7 @@ bool preserve_trx_temp_table_prebuild_phase1_sidecars(
   const std::string normalized_dir = normalize_dir(dir);
   Local_file_preserved_temp_table_image_carrier carrier(normalized_dir);
   std::vector<uint32_t> staged_image_source_space_ids;
-  std::set<uint32_t> visited_source_space_ids;
+  std::vector<Temp_table_phase1_prebuild_capture> captures;
 
   auto cleanup_warm_sidecars = [&]() {
     for (const std::unique_ptr<
@@ -2359,60 +2564,49 @@ bool preserve_trx_temp_table_prebuild_phase1_sidecars(
     for (uint32_t source_space_id : staged_image_source_space_ids) {
       (void)carrier.remove_warm_image(warmcopy_id, source_space_id);
     }
+    for (Temp_table_phase1_prebuild_capture &capture : captures) {
+      if (capture.sidecar == nullptr) continue;
+      if (capture.sidecar->image_writer != nullptr) {
+        const Preserved_trx_carrier_status abort_status =
+            capture.sidecar->image_writer->abort();
+        if (abort_status != Preserved_trx_carrier_status::OK) {
+          preserve_trx_resource_note_spill_failure();
+        }
+      }
+      trx_preserve_temp_space_image_reset_dirty_page_stream(
+          &capture.sidecar->descriptor);
+    }
   };
 
-  for (TABLE *table = thd->temporary_tables; table != nullptr;
-       table = table->next) {
-    if (!temp_table_candidate(table)) {
-      participant->mark_degraded("unsupported temporary table type");
-      cleanup_warm_sidecars();
-      return false;
-    }
+  bool target_still_idle = false;
+  std::string capture_failure_reason;
+  if (!prepare_temp_table_phase1_prebuild_captures(
+          thd, trx, normalized_dir, warmcopy_id, participant, &captures,
+          &target_still_idle, &capture_failure_reason)) {
+    participant->mark_degraded(capture_failure_reason);
+    cleanup_warm_sidecars();
+    return false;
+  }
+  if (!target_still_idle) return true;
 
-    const std::string schema_name = table_schema_from_table(table);
-    const std::string table_name = table_name_from_table(table);
-    if (schema_name.empty() || table_name.empty()) {
-      participant->mark_degraded("temp-table metadata unavailable");
-      cleanup_warm_sidecars();
-      return false;
-    }
+  const auto participant_still_current = [&]() {
+    mysql_mutex_lock(&thd->LOCK_thd_data);
+    const bool current =
+        thd->preserve_trx_temp_table_participant.get() == participant.get() &&
+        trx_preserve_current_thd_trx(thd) == trx;
+    mysql_mutex_unlock(&thd->LOCK_thd_data);
+    return current;
+  };
 
-    trx_preserve_temp_table_exported_metadata source_metadata;
-    if (trx_preserve_temp_table_export_source_metadata(table, &source_metadata) !=
-        DB_SUCCESS) {
-      participant->mark_degraded("temp-table source metadata unavailable");
-      cleanup_warm_sidecars();
-      return false;
-    }
-    if (source_metadata.source_space_id == 0 ||
-        visited_source_space_ids.find(source_metadata.source_space_id) !=
-            visited_source_space_ids.end()) {
-      continue;
-    }
-    visited_source_space_ids.insert(source_metadata.source_space_id);
-    if (participant->find_prebuilt_sidecar(source_metadata.source_space_id) !=
-        nullptr) {
-      continue;
-    }
-
-    participant->begin_baseline_copy();
-
-    auto sidecar =
-        std::make_unique<Temp_table_warmcopy_participant::Prebuilt_sidecar>();
-    if (sidecar == nullptr) {
-      participant->mark_degraded("temp-table phase1 sidecar allocation failed");
-      cleanup_warm_sidecars();
-      return false;
-    }
-    sidecar->source_space_id = source_metadata.source_space_id;
-    sidecar->warmcopy_id = warmcopy_id;
-    sidecar->preserve_dir = normalized_dir;
-    sidecar->descriptor.source_space_id = source_metadata.source_space_id;
-    sidecar->descriptor.page_size = source_metadata.page_size;
-    sidecar->descriptor.space_flags = source_metadata.space_flags;
+  for (Temp_table_phase1_prebuild_capture &capture : captures) {
+    trx_preserve_temp_table_exported_metadata &source_metadata =
+        capture.metadata;
+    std::unique_ptr<Temp_table_warmcopy_participant::Prebuilt_sidecar> &sidecar =
+        capture.sidecar;
 
     const auto fail_prebuild = [&](const char *reason) {
-      participant->mark_degraded(reason);
+      const bool current = participant_still_current();
+      if (current) participant->mark_degraded(reason);
       if (sidecar->image_writer != nullptr) {
         const Preserved_trx_carrier_status abort_status =
             sidecar->image_writer->abort();
@@ -2423,27 +2617,8 @@ bool preserve_trx_temp_table_prebuild_phase1_sidecars(
       trx_preserve_temp_space_image_reset_dirty_page_stream(
           &sidecar->descriptor);
       cleanup_warm_sidecars();
-      return false;
+      return !current;
     };
-
-    dberr_t err = trx_preserve_temp_space_image_arm_dirty_page_stream(
-        &sidecar->descriptor, participant, 64ULL * 1024 * 1024,
-        warmcopy_id.c_str());
-    if (err == DB_SUCCESS) {
-      err = trx_preserve_temp_space_image_register_dirty_page_stream(
-          &sidecar->descriptor);
-    }
-    if (err == DB_SUCCESS) {
-      err = trx_preserve_temp_space_image_flush_dirty_pages_for_copy(
-          &sidecar->descriptor);
-    }
-    if (err == DB_SUCCESS) {
-      err = trx_preserve_temp_space_image_begin_initial_copy(
-          &sidecar->descriptor, participant);
-    }
-    if (err != DB_SUCCESS) {
-      return fail_prebuild("temp-table phase1 dirty stream open failed");
-    }
 
     const uint64_t stream_buffer_bytes =
         std::max<uint64_t>(source_metadata.page_size,
@@ -2469,6 +2644,7 @@ bool preserve_trx_temp_table_prebuild_phase1_sidecars(
     writer_context.writer = sidecar->image_writer.get();
     writer_context.page_size = source_metadata.page_size;
 
+    dberr_t err = DB_SUCCESS;
     err = trx_preserve_temp_space_image_copy_initial_file_pages_to_writer(
         &sidecar->descriptor, source_metadata.source_path.c_str(),
         &writer_context, temp_table_image_stream_write_page);
@@ -2485,38 +2661,17 @@ bool preserve_trx_temp_table_prebuild_phase1_sidecars(
       return fail_prebuild("temp-table phase1 baseline stream failed");
     }
 
-    std::string undo_payload;
-    if (participant->has_temp_dml_history()) {
-      err = trx == nullptr
-                ? DB_ERROR
-                : trx_preserve_temp_space_image_capture_no_redo_undo_from_trx(
-                      &sidecar->descriptor, trx);
-      if (err == DB_SUCCESS) {
-        err = trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(
-            &sidecar->descriptor);
-      }
-      if (err == DB_SUCCESS) {
-        err = trx_preserve_temp_space_image_build_no_redo_undo_sidecar_payload(
-            sidecar->descriptor, &undo_payload);
-      }
-      if (err != DB_SUCCESS) {
-        return fail_prebuild(
-            "temp-table phase1 no-redo undo sidecar capture failed");
-      }
+    if (sidecar->has_undo) {
       const Preserved_trx_carrier_status undo_status =
           carrier.write_warm_undo(
               warmcopy_id, source_metadata.source_space_id,
-              reinterpret_cast<const unsigned char *>(undo_payload.data()),
-              undo_payload.length());
+              reinterpret_cast<const unsigned char *>(
+                  capture.undo_payload.data()),
+              capture.undo_payload.length());
       if (undo_status != Preserved_trx_carrier_status::OK) {
         preserve_trx_resource_note_spill_failure();
         return fail_prebuild("temp-table phase1 warm undo writer failed");
       }
-      sidecar->undo =
-          undo_descriptor_from_image_descriptor(warmcopy_id,
-                                                sidecar->descriptor,
-                                                undo_payload);
-      sidecar->has_undo = true;
     }
 
     Temp_table_image_stream_writer_context final_writer_context;
@@ -2551,7 +2706,10 @@ bool preserve_trx_temp_table_prebuild_phase1_sidecars(
     preserve_trx_resource_note_spill_bytes(writer_result.size);
     sidecar->image_writer.reset();
     sidecar->tail_sealed = true;
-    sidecar->journal_record_count = participant->journal().size();
+    if (!participant_still_current()) {
+      cleanup_warm_sidecars();
+      return true;
+    }
     if (!participant->remember_prebuilt_sidecar(std::move(sidecar))) {
       participant->mark_degraded("temp-table phase1 sidecar duplicate");
       cleanup_warm_sidecars();
@@ -2571,8 +2729,8 @@ bool preserve_trx_temp_table_adopt_phase1_sidecar(
     return false;
   }
 
-  Temp_table_warmcopy_participant *participant =
-      preserve_trx_temp_table_get_participant(thd);
+  std::shared_ptr<Temp_table_warmcopy_participant> participant =
+      preserve_trx_temp_table_pin_participant(thd);
   if (participant == nullptr ||
       preserve_trx_temp_table_has_untracked_change(thd) ||
       preserve_trx_temp_table_has_batch_unsupported_boundary(thd) ||
@@ -2583,7 +2741,10 @@ bool preserve_trx_temp_table_adopt_phase1_sidecar(
 
   const Temp_table_warmcopy_participant::Prebuilt_sidecar *sidecar =
       participant->find_prebuilt_sidecar(source_space_id);
-  if (sidecar == nullptr) return false;
+  if (sidecar == nullptr ||
+      sidecar->mutation_generation != participant->mutation_generation()) {
+    return false;
+  }
 
   if (descriptor != nullptr) *descriptor = sidecar->descriptor;
   if (undo != nullptr) {
@@ -2608,8 +2769,8 @@ bool preserve_trx_temp_table_seal_phase1_tail_sidecar(
     return false;
   }
 
-  Temp_table_warmcopy_participant *participant =
-      preserve_trx_temp_table_get_participant(thd);
+  std::shared_ptr<Temp_table_warmcopy_participant> participant =
+      preserve_trx_temp_table_pin_participant(thd);
   if (participant == nullptr ||
       preserve_trx_temp_table_has_untracked_change(thd) ||
       preserve_trx_temp_table_has_batch_unsupported_boundary(thd) ||
@@ -2637,8 +2798,9 @@ bool preserve_trx_temp_table_seal_phase1_tail_sidecar(
                                         sidecar->source_space_id);
   };
 
-  if (sidecar->tail_sealed &&
-      sidecar->journal_record_count != participant->journal().size()) {
+  if (sidecar->mutation_generation != participant->mutation_generation() ||
+      (sidecar->tail_sealed && sidecar->journal_record_count !=
+                                   participant->journal_record_count())) {
     abandon_prebuilt();
     return false;
   }
@@ -2649,7 +2811,7 @@ bool preserve_trx_temp_table_seal_phase1_tail_sidecar(
     std::string undo_payload;
     const bool undo_sidecar_current =
         sidecar->has_undo &&
-        sidecar->journal_record_count == participant->journal().size();
+        sidecar->journal_record_count == participant->journal_record_count();
     if (participant->has_temp_dml_history() && !undo_sidecar_current) {
       if (sidecar->has_undo) {
         const Preserved_trx_carrier_status remove_status =
@@ -2748,8 +2910,8 @@ bool preserve_trx_temp_table_seal_phase1_tail_sidecar(
 
 void preserve_trx_temp_table_discard_phase1_sidecars(THD *thd,
                                                      const std::string &dir) {
-  Temp_table_warmcopy_participant *participant =
-      preserve_trx_temp_table_get_participant(thd);
+  std::shared_ptr<Temp_table_warmcopy_participant> participant =
+      preserve_trx_temp_table_pin_participant(thd);
   if (participant == nullptr || participant->prebuilt_sidecars().empty())
     return;
 
@@ -3088,6 +3250,44 @@ preserve_trx_temp_table_preclaim_decision(
   return decision;
 }
 
+Preserve_snapshot_status preserve_trx_temp_table_check_target_namespace(
+    THD *thd, const Preserve_snapshot_metadata &metadata,
+    std::string *failure_reason) {
+  if (metadata.temp_table_manifest_payload.empty()) {
+    assign_reason(failure_reason, "");
+    return Preserve_snapshot_status::OK;
+  }
+  if (thd == nullptr) {
+    assign_reason(failure_reason, "invalid target session");
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
+
+  Preserved_temp_table_manifest manifest;
+  if (!preserve_trx_decode_temp_table_manifest(
+          metadata.temp_table_manifest_payload, &manifest)) {
+    assign_reason(failure_reason, "corrupt temporary table manifest");
+    return Preserve_snapshot_status::CORRUPT;
+  }
+
+  for (TABLE *table = thd->temporary_tables; table != nullptr;
+       table = table->next) {
+    const std::string schema_name = table_schema_from_table(table);
+    const std::string table_name = table_name_from_table(table);
+    for (const Preserved_temp_table_manifest_entry &entry : manifest.tables) {
+      if (schema_name == entry.schema_name && table_name == entry.table_name) {
+        const std::string reason =
+            "target session already owns temporary table " +
+            entry.schema_name + "." + entry.table_name;
+        assign_reason(failure_reason, reason.c_str());
+        return Preserve_snapshot_status::UNSUPPORTED;
+      }
+    }
+  }
+
+  assign_reason(failure_reason, "");
+  return Preserve_snapshot_status::OK;
+}
+
 Preserve_trx_temp_table_materialize_plan
 preserve_trx_temp_table_materialize_plan(
     const Preserve_snapshot_metadata &metadata) {
@@ -3340,7 +3540,10 @@ Preserve_snapshot_status preserve_trx_temp_table_deserialize_dd_table(
 */
 Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume(
     THD *thd, trx_t *trx, const std::string &dir, const std::string &token,
-    const Preserve_snapshot_metadata &metadata, std::string *failure_reason) {
+    const Preserve_snapshot_metadata &metadata, std::string *failure_reason,
+    Preserve_trx_temp_table_cleanup_result *cleanup_result) {
+  Preserve_trx_temp_table_cleanup_result cleanup;
+  if (cleanup_result != nullptr) *cleanup_result = cleanup;
   auto fail_without_cleanup = [failure_reason](
                                   Preserve_snapshot_status status,
                                   const char *reason) {
@@ -3390,11 +3593,14 @@ Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume(
   Preserve_trx_temp_table_staged_tables staged;
 
   auto cleanup_for_retry = [&]() {
+    cleanup.attempted = true;
     preserve_trx_temp_table_close_staged_tables(thd, &staged);
     for (auto &descriptor : descriptors) {
       if (descriptor.second != nullptr) {
-        (void)trx_preserve_temp_space_image_unregister_dict_tables_for_resume(
-            thd, *descriptor.second);
+        if (trx_preserve_temp_space_image_unregister_dict_tables_for_resume(
+                thd, *descriptor.second) != DB_SUCCESS) {
+          cleanup.dict_tables_unregistered = false;
+        }
         const dberr_t release_err =
             trx_preserve_temp_space_image_release_preserved_fil_space_for_retry(
                 descriptor.second.get());
@@ -3402,19 +3608,35 @@ Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume(
           const auto retry_image =
               retry_image_payloads.find(descriptor.first);
           if (retry_image != retry_image_payloads.end()) {
-            (void)carrier.restore_sealed_image_for_retry(
-                token, retry_image->second.first, retry_image->second.second);
+            if (carrier.restore_sealed_image_for_retry(
+                    token, retry_image->second.first,
+                    retry_image->second.second) !=
+                Preserved_trx_carrier_status::OK) {
+              cleanup.sidecars_restored = false;
+            }
           }
+        } else {
+          cleanup.native_ownership_released = false;
+          cleanup.sidecars_restored = false;
         }
       }
     }
-    (void)trx_preserve_temp_space_image_register_page_reservations_from_claims(
-        trx_ownership_claims_from_manifest_claims(
-            plan.manifest.ownership_claims));
+    cleanup.page_reservations_restored =
+        trx_preserve_temp_space_image_register_page_reservations_from_claims(
+            trx_ownership_claims_from_manifest_claims(
+                plan.manifest.ownership_claims));
+    if (cleanup_result != nullptr) *cleanup_result = cleanup;
   };
   auto fail_after_cleanup = [&](Preserve_snapshot_status status,
                                 const char *reason) {
     cleanup_for_retry();
+    const bool cleanup_complete = cleanup_result == nullptr
+                                      ? cleanup.complete()
+                                      : cleanup_result->complete();
+    if (!cleanup_complete) {
+      assign_reason(failure_reason, "temporary table cleanup incomplete");
+      return status;
+    }
     assign_reason(failure_reason, reason == nullptr ? "" : reason);
     return status;
   };
@@ -3604,7 +3826,11 @@ Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume(
 
 Preserve_snapshot_status
 preserve_trx_temp_table_rollback_materialized_for_resume(
-    THD *thd, const Preserve_snapshot_metadata &metadata) {
+    THD *thd, const Preserve_snapshot_metadata &metadata,
+    Preserve_trx_temp_table_cleanup_result *cleanup_result) {
+  Preserve_trx_temp_table_cleanup_result cleanup;
+  cleanup.attempted = !metadata.temp_table_manifest_payload.empty();
+  if (cleanup_result != nullptr) *cleanup_result = cleanup;
   if (metadata.temp_table_manifest_payload.empty()) {
     return Preserve_snapshot_status::OK;
   }
@@ -3646,6 +3872,7 @@ preserve_trx_temp_table_rollback_materialized_for_resume(
                 thd, dict_name.c_str()));
         if (unregister_status != Preserve_snapshot_status::OK) {
           status = unregister_status;
+          cleanup.dict_tables_unregistered = false;
         }
       }
     }
@@ -3664,8 +3891,10 @@ preserve_trx_temp_table_rollback_materialized_for_resume(
             &descriptor));
     if (release_status != Preserve_snapshot_status::OK) {
       status = release_status;
+      cleanup.native_ownership_released = false;
     }
   }
+  if (cleanup_result != nullptr) *cleanup_result = cleanup;
   return status;
 }
 

@@ -26,8 +26,10 @@
 
 #include <stddef.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -135,18 +137,34 @@ class Temp_table_warmcopy_participant {
     bool has_undo{false};
     Preserved_temp_table_undo_descriptor undo;
     size_t journal_record_count{0};
+    uint64_t mutation_generation{0};
     bool tail_sealed{false};
   };
 
   explicit Temp_table_warmcopy_participant(
-      size_t max_tail_bytes = kDefaultMaxTailBytes);
+      size_t max_tail_bytes = kDefaultMaxTailBytes,
+      size_t max_marker_count = kDefaultMaxJournalRecords);
+  ~Temp_table_warmcopy_participant();
 
-  Temp_table_participant_state state() const { return m_state; }
-  bool ready() const { return m_state == Temp_table_participant_state::READY; }
+  Temp_table_participant_state state() const {
+    std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
+    return m_state;
+  }
+  bool ready() const { return state() == Temp_table_participant_state::READY; }
   bool can_close_phase1() const { return ready(); }
-  const std::string &degraded_reason() const { return m_degraded_reason; }
+  std::string degraded_reason() const {
+    std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
+    return m_degraded_reason;
+  }
   const std::vector<Temp_table_journal_record> &journal() const {
     return m_journal;
+  }
+  size_t journal_record_count() const {
+    std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
+    return m_journal.size();
+  }
+  uint64_t mutation_generation() const {
+    return m_mutation_generation.load(std::memory_order_acquire);
   }
   /* True when any DDL-like or row-changing temp-table tail history exists. */
   bool has_row_history() const;
@@ -165,15 +183,21 @@ class Temp_table_warmcopy_participant {
   bool arm_dirty_page_capture();
   bool arm_metadata_mutation_capture();
   bool begin_capture_epoch();
-  bool dirty_page_capture_armed() const { return m_dirty_page_capture_armed; }
+  bool dirty_page_capture_armed() const {
+    std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
+    return m_dirty_page_capture_armed;
+  }
   bool metadata_mutation_capture_armed() const {
+    std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
     return m_metadata_mutation_capture_armed;
   }
   bool capture_epoch_ready_for_copy() const {
+    std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
     return m_capture_epoch_started && m_dirty_page_capture_armed &&
            m_metadata_mutation_capture_armed;
   }
   uint64_t capture_epoch_start_sequence() const {
+    std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
     return m_capture_epoch_start_sequence;
   }
   bool start_history();
@@ -202,11 +226,16 @@ class Temp_table_warmcopy_participant {
   }
   void clear_prebuilt_sidecars() { m_prebuilt_sidecars.clear(); }
   bool current_statement_touched() const {
+    std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
     return m_current_statement_touched;
   }
-  void clear_current_statement_touch() { m_current_statement_touched = false; }
+  void clear_current_statement_touch() {
+    std::lock_guard<std::recursive_mutex> guard(m_state_mutex);
+    m_current_statement_touched = false;
+  }
 
   static constexpr size_t kDefaultMaxTailBytes = 1024 * 1024;
+  static constexpr size_t kDefaultMaxJournalRecords = 16 * 1024;
 
  private:
   struct Table_state {
@@ -251,15 +280,20 @@ class Temp_table_warmcopy_participant {
   /* Tail budget bounds the amount of logical history inspected for support. */
   size_t m_max_tail_bytes{kDefaultMaxTailBytes};
   size_t m_tail_bytes{0};
+  size_t m_max_marker_count{kDefaultMaxJournalRecords};
   /* Latest reason that made this participant unusable for warmcopy preserve. */
   std::string m_degraded_reason;
   std::vector<Table_state> m_tables;
   std::vector<Temp_table_journal_record> m_journal;
   std::vector<std::unique_ptr<Prebuilt_sidecar>> m_prebuilt_sidecars;
+  std::atomic<uint64_t> m_mutation_generation{0};
+  mutable std::recursive_mutex m_state_mutex;
 };
 
 Temp_table_warmcopy_participant *preserve_trx_temp_table_get_participant(
     THD *thd);
+std::shared_ptr<Temp_table_warmcopy_participant>
+preserve_trx_temp_table_pin_participant(THD *thd);
 std::string preserve_trx_temp_table_degraded_reason(THD *thd);
 /* Session-level form of has_row_history(); includes DDL-like or row history. */
 bool preserve_trx_temp_table_has_row_history(THD *thd);
@@ -273,6 +307,7 @@ bool preserve_trx_temp_table_has_batch_unsupported_boundary(THD *thd);
 void preserve_trx_temp_table_clear_batch_unsupported_boundary(THD *thd);
 void preserve_trx_temp_table_note_untracked_change(THD *thd);
 void preserve_trx_temp_table_mark_transaction_start(THD *thd);
+bool preserve_trx_temp_table_reseed_after_resume(THD *thd);
 Temp_table_warmcopy_participant *preserve_trx_temp_table_ensure_participant(
     THD *thd);
 void preserve_trx_temp_table_clear_participant(THD *thd);
@@ -417,6 +452,23 @@ struct Preserve_trx_temp_table_materialize_plan {
   Preserved_temp_table_manifest manifest;
 };
 
+struct Preserve_trx_temp_table_cleanup_result {
+  bool attempted{false};
+  bool sql_tables_closed{true};
+  bool dict_tables_unregistered{true};
+  /* The InnoDB retry release covers no-redo undo, FSEG and FIL ownership. */
+  bool native_ownership_released{true};
+  bool sidecars_restored{true};
+  bool page_reservations_restored{true};
+
+  bool complete() const {
+    return !attempted ||
+           (sql_tables_closed && dict_tables_unregistered &&
+            native_ownership_released && sidecars_restored &&
+            page_reservations_restored);
+  }
+};
+
 struct Preserve_trx_temp_table_deserialized_dd {
   std::unique_ptr<dd::Table> table;
   std::string schema_name;
@@ -446,6 +498,10 @@ Preserve_trx_temp_table_preclaim_decision
 preserve_trx_temp_table_preclaim_decision(
     const Preserve_snapshot_metadata &metadata);
 
+Preserve_snapshot_status preserve_trx_temp_table_check_target_namespace(
+    THD *thd, const Preserve_snapshot_metadata &metadata,
+    std::string *failure_reason = nullptr);
+
 Preserve_trx_temp_table_materialize_plan
 preserve_trx_temp_table_materialize_plan(
     const Preserve_snapshot_metadata &metadata);
@@ -465,11 +521,13 @@ uint64_t preserve_trx_temp_table_owner_trx_id(
 Preserve_snapshot_status preserve_trx_temp_table_materialize_for_resume(
     THD *thd, trx_t *trx, const std::string &dir, const std::string &token,
     const Preserve_snapshot_metadata &metadata,
-    std::string *failure_reason = nullptr);
+    std::string *failure_reason = nullptr,
+    Preserve_trx_temp_table_cleanup_result *cleanup_result = nullptr);
 
 Preserve_snapshot_status
 preserve_trx_temp_table_rollback_materialized_for_resume(
-    THD *thd, const Preserve_snapshot_metadata &metadata);
+    THD *thd, const Preserve_snapshot_metadata &metadata,
+    Preserve_trx_temp_table_cleanup_result *cleanup_result = nullptr);
 
 TABLE *preserve_trx_temp_table_open_uncached_for_resume(
     THD *thd, const std::string &path,

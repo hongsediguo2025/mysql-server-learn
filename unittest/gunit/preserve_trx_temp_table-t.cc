@@ -1806,6 +1806,71 @@ TEST(TempResumeMaterializerContractTest,
   EXPECT_LT(rollback_call, restore_record_call);
 }
 
+TEST(TempResumeMaterializerContractTest,
+     CleanupFailureTaintsTokenInsteadOfRestoringRetryability) {
+  const std::string resume_impl =
+      read_source_file_for_temp_table_test("sql/preserve_trx.cc");
+  const std::string sql_header = read_source_file_for_temp_table_test(
+      "sql/preserve_trx_temp_table.h");
+  const std::string sql_impl = read_source_file_for_temp_table_test(
+      "sql/preserve_trx_temp_table.cc");
+
+  ASSERT_FALSE(resume_impl.empty());
+  ASSERT_FALSE(sql_header.empty());
+  ASSERT_FALSE(sql_impl.empty());
+
+  EXPECT_NE(std::string::npos,
+            sql_header.find("Preserve_trx_temp_table_cleanup_result"));
+  EXPECT_NE(std::string::npos,
+            sql_header.find("page_reservations_restored"));
+  EXPECT_NE(std::string::npos, sql_impl.find("cleanup_result->complete()"));
+
+  const std::string resume_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          resume_impl, "static bool preserved_trx_resume_record_on_thd(");
+  ASSERT_FALSE(resume_body.empty());
+  EXPECT_NE(std::string::npos,
+            resume_body.find("Preserve_trx_temp_table_cleanup_result"));
+  EXPECT_NE(
+      std::string::npos,
+      resume_body.find("Preserve_snapshot_consume_state::CLEANUP_TAINTED"));
+  EXPECT_NE(std::string::npos,
+            resume_body.find("temporary table cleanup incomplete"));
+}
+
+TEST(TempResumeMaterializerContractTest,
+     SuccessfulAttachReseedsTempBaselineBeforeActivation) {
+  const std::string header = read_source_file_for_temp_table_test(
+      "sql/preserve_trx_temp_table.h");
+  const std::string temp_impl = read_source_file_for_temp_table_test(
+      "sql/preserve_trx_temp_table.cc");
+  const std::string resume_impl =
+      read_source_file_for_temp_table_test("sql/preserve_trx.cc");
+
+  EXPECT_NE(std::string::npos,
+            header.find("preserve_trx_temp_table_reseed_after_resume"));
+  const std::string reseed_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_impl, "bool preserve_trx_temp_table_reseed_after_resume(");
+  ASSERT_FALSE(reseed_body.empty());
+  EXPECT_NE(std::string::npos,
+            reseed_body.find("preserve_trx_temp_table_untracked_change"));
+  EXPECT_NE(std::string::npos,
+            reseed_body.find("preserve_trx_temp_table_no_redo_baseline_valid"));
+
+  const std::string resume_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          resume_impl, "static bool preserved_trx_resume_record_on_thd(");
+  ASSERT_FALSE(resume_body.empty());
+  const size_t reseed_call =
+      resume_body.find("preserve_trx_temp_table_reseed_after_resume(thd)");
+  const size_t activate_call =
+      resume_body.find("trx_preserve_activate_resumed(record.trx)");
+  ASSERT_NE(std::string::npos, reseed_call);
+  ASSERT_NE(std::string::npos, activate_call);
+  EXPECT_LT(reseed_call, activate_call);
+}
+
 TEST(TempLivePreserveManifestContractTest,
      PreserveBuildsTempManifestBeforeSnapshotBundle) {
   const std::string sql_header = read_source_file_for_temp_table_test(
@@ -2169,8 +2234,8 @@ TEST(TempLivePreserveManifestContractTest,
       normalize_whitespace_for_temp_table_test(tail_body);
   EXPECT_NE(std::string::npos,
             normalized_tail_body.find(
-                "if (sidecar->tail_sealed && sidecar->journal_record_count != "
-                "participant->journal().size())"))
+                "sidecar->mutation_generation != "
+                "participant->mutation_generation()"))
       << "a phase-1 sealed image becomes stale if the target performs more "
          "temp-table work before phase 2; in that case phase 2 must discard it "
          "and use the correctness fallback";
@@ -2186,22 +2251,29 @@ TEST(TempLivePreserveManifestContractTest,
       extract_function_body_after_signature_for_temp_table_test(
           sql_impl, "bool preserve_trx_temp_table_prebuild_phase1_sidecars(");
   ASSERT_FALSE(prebuild_body.empty());
+  const std::string capture_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          sql_impl,
+          "bool prepare_temp_table_phase1_prebuild_captures(");
+  ASSERT_FALSE(capture_body.empty());
 
   EXPECT_EQ(std::string::npos, prebuild_body.find("(void)trx;"))
       << "phase 1 prebuild receives trx so it can move stable no-redo undo "
          "capture out of the phase-2 blocked window";
 
-  const size_t undo_capture = prebuild_body.find(
+  const size_t undo_capture = capture_body.find(
       "trx_preserve_temp_space_image_capture_no_redo_undo_from_trx(");
-  const size_t undo_seal = prebuild_body.find(
+  const size_t undo_seal = capture_body.find(
       "trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(");
-  const size_t undo_payload = prebuild_body.find(
+  const size_t undo_payload = capture_body.find(
       "trx_preserve_temp_space_image_build_no_redo_undo_sidecar_payload(");
   const size_t write_warm_undo = prebuild_body.find("carrier.write_warm_undo(");
-  const size_t mark_has_undo = prebuild_body.find("sidecar->has_undo = true");
-  const size_t journal_count =
-      prebuild_body.find("sidecar->journal_record_count = "
-                         "participant->journal().size()");
+  const size_t mark_has_undo =
+      capture_body.find("capture.sidecar->has_undo = true");
+  const size_t journal_count = capture_body.find(
+      "capture.sidecar->journal_record_count =");
+  const size_t mutation_generation = capture_body.find(
+      "capture.sidecar->mutation_generation =");
   const size_t remember_sidecar =
       prebuild_body.find("participant->remember_prebuilt_sidecar(");
   ASSERT_NE(std::string::npos, undo_capture);
@@ -2210,12 +2282,21 @@ TEST(TempLivePreserveManifestContractTest,
   ASSERT_NE(std::string::npos, write_warm_undo);
   ASSERT_NE(std::string::npos, mark_has_undo);
   ASSERT_NE(std::string::npos, journal_count);
+  ASSERT_NE(std::string::npos, mutation_generation);
   ASSERT_NE(std::string::npos, remember_sidecar);
-  EXPECT_LT(undo_capture, write_warm_undo);
-  EXPECT_LT(write_warm_undo, journal_count);
-  EXPECT_LT(journal_count, remember_sidecar)
-      << "the journal count must describe the exact history covered by both "
-         "the phase-1 image stream and the phase-1 undo sidecar";
+  EXPECT_LT(undo_capture, undo_seal);
+  EXPECT_LT(undo_seal, undo_payload);
+  EXPECT_LT(journal_count, mutation_generation);
+  EXPECT_LT(write_warm_undo, remember_sidecar);
+  EXPECT_NE(std::string::npos,
+            capture_body.find("mysql_mutex_lock(&thd->LOCK_thd_data)"));
+  EXPECT_NE(std::string::npos,
+            capture_body.find("for (TABLE *table = thd->temporary_tables"));
+  EXPECT_EQ(std::string::npos,
+            capture_body.find(
+                "trx_preserve_temp_space_image_copy_initial_file_pages_to_writer("))
+      << "TABLE metadata and stream registration may hold LOCK_thd_data, but "
+         "bulk file copy must run after the target command gate is released";
 
   const std::string tail_body =
       extract_function_body_after_signature_for_temp_table_test(
@@ -2226,7 +2307,7 @@ TEST(TempLivePreserveManifestContractTest,
   EXPECT_NE(std::string::npos,
             normalized_tail_body.find("sidecar->has_undo && "
                                       "sidecar->journal_record_count == "
-                                      "participant->journal().size()"))
+                                      "participant->journal_record_count()"))
       << "phase 2 must not rebuild a no-redo undo sidecar that phase 1 already "
          "captured after the last temp-DML journal record";
   const size_t reuse_marker = tail_body.find("undo_sidecar_current");
@@ -8728,6 +8809,53 @@ TEST(TempTableParticipantTest, StartsHistoryAtTransactionTempTouch) {
       std::memory_order_acquire));
 }
 
+TEST(TempTableParticipantTest, PinnedParticipantSurvivesThdStateClear) {
+  PreserveTrxEnableGuard preserve_guard(true);
+  PreserveTrxTempTableEnableGuard enable_guard(true);
+  THD thd(false);
+  mark_active_transaction(&thd);
+
+  Temp_table_warmcopy_participant *participant =
+      preserve_trx_temp_table_ensure_participant(&thd);
+  ASSERT_NE(nullptr, participant);
+  std::shared_ptr<Temp_table_warmcopy_participant> pin =
+      preserve_trx_temp_table_pin_participant(&thd);
+  ASSERT_NE(nullptr, pin);
+  ASSERT_EQ(participant, pin.get());
+
+  preserve_trx_temp_table_clear_participant(&thd);
+  EXPECT_EQ(nullptr, preserve_trx_temp_table_get_participant(&thd));
+
+  Temp_table_journal_record marker;
+  marker.kind = Temp_table_journal_record::Kind::SAVEPOINT_MARK;
+  EXPECT_TRUE(pin->append_journal(marker));
+  EXPECT_EQ(1U, pin->journal().size());
+}
+
+TEST(TempTableParticipantTest, PreservePreflightPinsParticipantLifetime) {
+  const std::string temp_impl = read_source_file_for_temp_table_test(
+      "sql/preserve_trx_temp_table.cc");
+  const std::string preflight_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          temp_impl,
+          "Preserve_snapshot_status preserve_trx_temp_table_preflight_preserve(");
+  ASSERT_FALSE(preflight_body.empty());
+  EXPECT_NE(std::string::npos,
+            preflight_body.find("preserve_trx_temp_table_pin_participant(thd)"));
+  EXPECT_EQ(std::string::npos,
+            preflight_body.find("preserve_trx_temp_table_get_participant(thd)"));
+}
+
+TEST(TempTableParticipantTest, MutationGenerationTracksJournalChanges) {
+  Temp_table_warmcopy_participant participant;
+  const uint64_t before = participant.mutation_generation();
+  Temp_table_journal_record marker;
+  marker.kind = Temp_table_journal_record::Kind::SAVEPOINT_MARK;
+
+  ASSERT_TRUE(participant.append_journal(marker));
+  EXPECT_GT(participant.mutation_generation(), before);
+}
+
 TEST(TempTableParticipantTest,
      ObjectLifecycleJournalEventsAreUnsupportedRowHistory) {
   Temp_table_warmcopy_participant create_participant;
@@ -8802,7 +8930,8 @@ TEST(TempTableParticipantTest, LateHistoryStartIsUnsupported) {
 }
 
 TEST(TempTableParticipantTest, JournalFailureMarksDegraded) {
-  Temp_table_warmcopy_participant participant(/*max_tail_bytes=*/4);
+  Temp_table_warmcopy_participant participant(
+      /*max_tail_bytes=*/sizeof(Temp_table_journal_record) + 4);
   Temp_table_journal_record record;
   record.table_ordinal = 1;
   record.kind = Temp_table_journal_record::Kind::INSERT_ROW;
@@ -8811,6 +8940,22 @@ TEST(TempTableParticipantTest, JournalFailureMarksDegraded) {
   EXPECT_FALSE(participant.append_journal(record));
   EXPECT_EQ(Temp_table_participant_state::DEGRADED, participant.state());
   EXPECT_EQ("temp-table journal tail budget exceeded",
+            participant.degraded_reason());
+}
+
+TEST(TempTableParticipantTest, ZeroPayloadMarkersConsumeFixedBudgetAndCountCap) {
+  Temp_table_warmcopy_participant participant(
+      /*max_tail_bytes=*/2 * sizeof(Temp_table_journal_record),
+      /*max_marker_count=*/2);
+  Temp_table_journal_record marker;
+  marker.kind = Temp_table_journal_record::Kind::SAVEPOINT_MARK;
+
+  EXPECT_TRUE(participant.append_journal(marker));
+  EXPECT_TRUE(participant.append_journal(marker));
+  EXPECT_FALSE(participant.append_journal(marker));
+  EXPECT_EQ(2U, participant.journal().size());
+  EXPECT_EQ(Temp_table_participant_state::DEGRADED, participant.state());
+  EXPECT_EQ("temp-table journal marker count exceeded",
             participant.degraded_reason());
 }
 
@@ -8868,7 +9013,8 @@ TEST(TempTableParticipantTest, UnknownTruncateMarksParticipantDegraded) {
 }
 
 TEST(TempTableParticipantTest, TailBudgetOverflowBlocksClosing) {
-  Temp_table_warmcopy_participant participant(/*max_tail_bytes=*/8);
+  Temp_table_warmcopy_participant participant(
+      /*max_tail_bytes=*/2 * sizeof(Temp_table_journal_record) + 8);
   ASSERT_TRUE(participant.register_table(1, "tmp_tail"));
   Temp_table_journal_record first;
   first.table_ordinal = 1;
@@ -9566,6 +9712,9 @@ class TempPhysicalTlvTest : public PreserveTrxTempTableCarrierTest {
     metadata.option_bin_log = false;
     metadata.global_log_bin = false;
     metadata.mdl_descriptors_payload = std::string(4, '\0');
+    metadata.engine_shape = Preserve_snapshot_engine_shape::TEMP_ONLY;
+    metadata.has_persistent_engine_state = false;
+    metadata.has_temp_engine_state = true;
     return metadata;
   }
 
@@ -10942,6 +11091,38 @@ TEST_F(TempPhysicalTlvTest,
   EXPECT_FALSE(with_manifest.may_mutate_base_transaction);
 }
 
+TEST_F(TempPhysicalTlvTest, TargetTemporaryTableNameCollisionIsRejected) {
+  Preserve_snapshot_metadata snapshot = metadata();
+  Preserved_temp_table_manifest manifest;
+  Preserved_temp_table_manifest_entry entry;
+  entry.table_ordinal = 9;
+  entry.schema_name = "test";
+  entry.table_name = "tmp_gunit";
+  entry.engine_name = "InnoDB";
+  entry.serialized_dd_table = serialized_temp_dd_table_for_test(
+      entry.schema_name, entry.table_name, entry.engine_name);
+  entry.image = descriptor(9, "namespace-image",
+                           "temp_tlv_token.tempts.9.image");
+  attach_dict_binding(&entry);
+  manifest.tables.push_back(entry);
+  ASSERT_TRUE(preserve_trx_encode_temp_table_manifest(
+      manifest, &snapshot.temp_table_manifest_payload));
+
+  THD thd(false);
+  TABLE table;
+  TABLE_SHARE share;
+  init_fake_table(&table, &share, TRANSACTIONAL_TMP_TABLE);
+  thd.temporary_tables = &table;
+
+  std::string reason;
+  EXPECT_EQ(Preserve_snapshot_status::UNSUPPORTED,
+            preserve_trx_temp_table_check_target_namespace(
+                &thd, snapshot, &reason));
+  EXPECT_EQ("target session already owns temporary table test.tmp_gunit",
+            reason);
+  thd.temporary_tables = nullptr;
+}
+
 TEST_F(TempPhysicalTlvTest,
        ResumeFeatureOnWithNonNativeNoRedoUndoSidecarCannotClaim) {
   PreserveTrxTempTableEnableGuard enable_guard(true);
@@ -11239,6 +11420,10 @@ TEST_F(TempPhysicalTlvTest, FeatureOffNewPreserveDoesNotEmitTlv80OrSidecars) {
 
   Preserved_trx_bundle_build_input input;
   input.metadata = metadata();
+  input.metadata.engine_shape =
+      Preserve_snapshot_engine_shape::PERSISTENT_ONLY;
+  input.metadata.has_persistent_engine_state = true;
+  input.metadata.has_temp_engine_state = false;
   Preserved_trx_bundle bundle;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));

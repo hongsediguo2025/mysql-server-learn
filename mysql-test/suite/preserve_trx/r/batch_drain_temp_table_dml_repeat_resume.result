@@ -1,0 +1,39 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
+CREATE TABLE t_temp_repeat_resume_base(
+id INT PRIMARY KEY,
+v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_temp_repeat_resume_base VALUES(1, 10);
+CREATE TEMPORARY TABLE tmp_temp_repeat_resume(
+id INT PRIMARY KEY,
+v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO tmp_temp_repeat_resume VALUES(1, 100);
+START TRANSACTION;
+UPDATE tmp_temp_repeat_resume SET v = 101 WHERE id = 1;
+UPDATE t_temp_repeat_resume_base SET v = 11 WHERE id = 1;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+SELECT * FROM tmp_temp_repeat_resume ORDER BY id;
+id	v
+1	101
+UPDATE tmp_temp_repeat_resume SET v = 102 WHERE id = 1;
+INSERT INTO tmp_temp_repeat_resume VALUES(2, 200);
+UPDATE t_temp_repeat_resume_base SET v = 12 WHERE id = 1;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+SELECT * FROM tmp_temp_repeat_resume ORDER BY id;
+id	v
+1	102
+2	200
+COMMIT;
+SELECT * FROM t_temp_repeat_resume_base ORDER BY id;
+id	v
+1	12
+DROP TEMPORARY TABLE tmp_temp_repeat_resume;
+DROP TABLE t_temp_repeat_resume_base;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_enable=ON;

@@ -1353,8 +1353,8 @@ class THD : public MDL_context_owner,
     is generated. Protected by LOCK_thd_data where it is read together with
     per-session preserve/drain state.
   */
-  Temp_table_warmcopy_participant *preserve_trx_temp_table_participant{
-      nullptr};
+  std::shared_ptr<Temp_table_warmcopy_participant>
+      preserve_trx_temp_table_participant;
   /**
     Hot-path predicate for temporary-table hooks. The pointer above is protected
     by LOCK_thd_data; this flag lets row/metadata hooks avoid taking that mutex

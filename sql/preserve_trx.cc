@@ -16362,6 +16362,18 @@ static bool preserved_trx_resume_record_on_thd(
         "materialized");
     return preserve_trx_reject_unsupported();
   }
+  std::string temp_namespace_reason;
+  const Preserve_snapshot_status temp_namespace_status =
+      preserve_trx_temp_table_check_target_namespace(
+          thd, record.metadata, &temp_namespace_reason);
+  if (temp_namespace_status != Preserve_snapshot_status::OK) {
+    (void)preserved_trx_update_record_last_error(
+        record.metadata.token,
+        temp_namespace_reason.empty()
+            ? "target temporary table namespace conflicts with preserved token"
+            : temp_namespace_reason);
+    return preserve_trx_reject_unsupported();
+  }
   std::string temp_bootstrap_reason;
   const Preserve_snapshot_status temp_bootstrap_status =
       reserve_temp_sidecars_for_resume_retry(preserve_trx_default_dir(), token,
@@ -16539,11 +16551,35 @@ static bool preserved_trx_resume_record_on_thd(
   bool mdl_transferred = false;
   bool gtid_restored = false;
   bool temp_tables_materialized = false;
-  auto restore_preserved_record_after_failure =
+  auto taint_record_after_temp_cleanup_failure =
       [&](const std::string &reason) {
+        const std::string cleanup_reason =
+            reason + "; temporary table cleanup incomplete";
+        auto store =
+            create_preserved_trx_default_store(preserve_trx_default_dir());
+        if (store->mark_consume_state(
+                token, Preserve_snapshot_consume_state::CLEANUP_TAINTED,
+                cleanup_reason) != Preserve_snapshot_status::OK) {
+          log_preserved_trx_cleanup_failure(
+              token, "failed to publish temporary table cleanup taint");
+        }
+        record.resumable = false;
+        record.state = Preserved_trx_lifecycle_state::FAILED;
+        record.observable_only = false;
+        return preserved_trx_add_record_with_error(record, cleanup_reason);
+      };
+  auto restore_preserved_record_after_failure =
+      [&](const std::string &reason,
+          bool temp_cleanup_incomplete = false) {
         if (temp_tables_materialized) {
-          (void)preserve_trx_temp_table_rollback_materialized_for_resume(
-              thd, record.metadata);
+          Preserve_trx_temp_table_cleanup_result cleanup_result;
+          const Preserve_snapshot_status rollback_status =
+              preserve_trx_temp_table_rollback_materialized_for_resume(
+                  thd, record.metadata, &cleanup_result);
+          temp_cleanup_incomplete =
+              temp_cleanup_incomplete ||
+              rollback_status != Preserve_snapshot_status::OK ||
+              !cleanup_result.complete();
           temp_tables_materialized = false;
         }
         const bool must_reset_thd_transaction_state = gtid_restored;
@@ -16556,6 +16592,9 @@ static bool preserved_trx_resume_record_on_thd(
           reset_thd_after_preserve_detach(thd);
         else if (mdl_transferred)
           thd->mdl_context.release_transactional_locks();
+        if (temp_cleanup_incomplete) {
+          return taint_record_after_temp_cleanup_failure(reason);
+        }
         return restore_record_after_resume_failure(record, reason);
       };
 
@@ -16620,16 +16659,18 @@ static bool preserved_trx_resume_record_on_thd(
   }
 
   std::string temp_materialize_reason;
+  Preserve_trx_temp_table_cleanup_result temp_materialize_cleanup;
   const Preserve_snapshot_status temp_materialize_status =
       preserve_trx_temp_table_materialize_for_resume(
           thd, record.trx, preserve_trx_default_dir(), token, record.metadata,
-          &temp_materialize_reason);
+          &temp_materialize_reason, &temp_materialize_cleanup);
   if (temp_materialize_status != Preserve_snapshot_status::OK) {
     (void)restore_preserved_record_after_failure(
         temp_materialize_reason.empty()
             ? "temporary table materialization failure"
             : "temporary table materialization failure: " +
-                  temp_materialize_reason);
+                  temp_materialize_reason,
+        !temp_materialize_cleanup.complete());
     return preserve_trx_reject_unsupported();
   }
   temp_tables_materialized = !record.metadata.temp_table_manifest_payload.empty();
@@ -16642,19 +16683,17 @@ static bool preserved_trx_resume_record_on_thd(
 
   if (restore_savepoints_to_thd(thd, record.trx, record.metadata)) {
     if (!detach_resumed_after_failure("savepoint restore failure")) {
-      rollback_restored_logged_cache_gtid_next(thd, &gtid_restored);
-      if (binlog_imported) {
-        discard_binlog_preserve_cache_and_reset_scopes(thd);
-        binlog_imported = false;
-      }
-      reset_thd_after_preserve_detach(thd);
-      if (temp_tables_materialized) {
-        (void)preserve_trx_temp_table_rollback_materialized_for_resume(
-            thd, record.metadata);
-        temp_tables_materialized = false;
-      }
-      (void)restore_record_after_resume_failure(record,
-                                                "savepoint restore failure");
+      (void)restore_preserved_record_after_failure(
+          "savepoint restore failure");
+    }
+    return preserve_trx_reject_unsupported();
+  }
+
+  if (temp_tables_materialized &&
+      !preserve_trx_temp_table_reseed_after_resume(thd)) {
+    if (!detach_resumed_after_failure("temporary table baseline reseed failure")) {
+      (void)restore_preserved_record_after_failure(
+          "temporary table baseline reseed failure");
     }
     return preserve_trx_reject_unsupported();
   }
@@ -16681,9 +16720,15 @@ static bool preserved_trx_resume_record_on_thd(
         reset_thd_after_preserve_detach(thd);
         (void)restore_preserved_record_after_failure("undo activation failure");
       } else {
+        bool temp_cleanup_incomplete = false;
         if (temp_tables_materialized) {
-          (void)preserve_trx_temp_table_rollback_materialized_for_resume(
-              thd, record.metadata);
+          Preserve_trx_temp_table_cleanup_result cleanup_result;
+          const Preserve_snapshot_status cleanup_status =
+              preserve_trx_temp_table_rollback_materialized_for_resume(
+                  thd, record.metadata, &cleanup_result);
+          temp_cleanup_incomplete =
+              cleanup_status != Preserve_snapshot_status::OK ||
+              !cleanup_result.complete();
           temp_tables_materialized = false;
         }
         rollback_restored_logged_cache_gtid_next(thd, &gtid_restored);
@@ -16697,13 +16742,15 @@ static bool preserved_trx_resume_record_on_thd(
         delete_detached_mdl_context(token);
         (void)consume_store->mark_consume_state(
             token, Preserve_snapshot_consume_state::CLEANUP_TAINTED,
-            rollback_status == DB_SUCCESS
+            rollback_status == DB_SUCCESS && !temp_cleanup_incomplete
                 ? "activation failed and consume marker cleanup failed"
-                : "activation and rollback cleanup failed");
-        if (rollback_status != DB_SUCCESS) {
+                : "activation, rollback, or temp cleanup failed");
+        if (rollback_status != DB_SUCCESS || temp_cleanup_incomplete) {
           preserved_trx_add_failed_observable_record(
               record.metadata,
-              "activation failed with consume marker cleanup failure");
+              temp_cleanup_incomplete
+                  ? "activation failed with temporary table cleanup failure"
+                  : "activation failed with consume marker cleanup failure");
         }
       }
     }
