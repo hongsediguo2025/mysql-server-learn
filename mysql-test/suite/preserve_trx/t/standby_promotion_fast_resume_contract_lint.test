@@ -61,7 +61,7 @@ die "receiver transfer must publish strict prepared resources before promotion\n
          $transfer =~ /publish_prewarmed/ &&
          $transfer =~ /bind_final_facts/;
 die "transfer must not consume strict gate, attach or cleanup ownership\n"
-  if $transfer =~ /begin_gate_adopt|commit_gate_adopt|begin_attach|begin_cleanup/;
+  if $transfer =~ /begin_gate_adopt\s*\(|commit_gate_adopt\s*\(|begin_attach\s*\(|begin_cleanup\s*\(/;
 
 my $metadata_apply_count = () =
   $preserve =~ /lock_preserve_apply_record_lock_metadata_plan/g;

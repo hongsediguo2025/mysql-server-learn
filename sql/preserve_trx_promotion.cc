@@ -48,6 +48,7 @@
 #include "sql/preserve_trx.h"
 #include "sql/preserve_trx_carrier.h"
 #include "sql/preserve_trx_transfer.h"
+#include "scope_guard.h"
 #include "storage/innobase/include/trx0preserve.h"
 
 uint preserve_trx_promotion_gate_batch_tokens = 3;
@@ -1785,6 +1786,8 @@ preserved_trx_promotion_prewarm_standby_pending_tokens(
   result->token_results.resize(tokens.size());
 
   std::atomic<size_t> next_token{0};
+  std::atomic<bool> workers_released{false};
+  std::atomic<bool> worker_abort{false};
   std::atomic<uint64_t> max_worker_elapsed_us{0};
   const size_t actual_workers =
       std::min<size_t>(std::max<uint>(1, worker_count), tokens.size());
@@ -1797,7 +1800,11 @@ preserved_trx_promotion_prewarm_standby_pending_tokens(
   };
 
   auto run_worker = [&]() {
+    while (!workers_released.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
     for (;;) {
+      if (worker_abort.load(std::memory_order_acquire)) break;
       const size_t token_index = next_token.fetch_add(1);
       if (token_index >= tokens.size()) break;
 
@@ -1805,26 +1812,56 @@ preserved_trx_promotion_prewarm_standby_pending_tokens(
       Preserve_trx_promotion_token_result token_result;
       token_result.token = token;
       const uint64_t token_started_us = my_micro_time();
-      token_result.status =
-          preserved_trx_promotion_prewarm_standby_pending_token(
-              preserve_dir, epoch_id, token, required_apply_lsn);
-      token_result.reason =
-          token_result.status == Preserve_trx_promotion_adopt_status::OK
-              ? "prewarmed"
-              : ready_cache_reason_or_status(preserve_dir, epoch_id, token,
-                                             token_result.status);
+      try {
+        token_result.status =
+            preserved_trx_promotion_prewarm_standby_pending_token(
+                preserve_dir, epoch_id, token, required_apply_lsn);
+        token_result.reason =
+            token_result.status == Preserve_trx_promotion_adopt_status::OK
+                ? "prewarmed"
+                : ready_cache_reason_or_status(preserve_dir, epoch_id, token,
+                                               token_result.status);
+      } catch (...) {
+        token_result.status =
+            Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT;
+        token_result.reason = "promotion prewarm worker failed";
+        worker_abort.store(true, std::memory_order_release);
+      }
       result->token_results[token_index] = std::move(token_result);
       update_max_worker_elapsed(my_micro_time() - token_started_us);
     }
   };
 
   std::vector<std::thread> workers;
-  workers.reserve(actual_workers);
-  for (size_t i = 0; i < actual_workers; ++i) {
-    workers.emplace_back(run_worker);
+  auto join_workers = create_scope_guard([&] {
+    for (std::thread &worker : workers) {
+      if (worker.joinable()) worker.join();
+    }
+  });
+  bool worker_creation_failed = false;
+  try {
+    workers.reserve(actual_workers);
+    for (size_t i = 0; i < actual_workers; ++i) {
+      workers.emplace_back(run_worker);
+    }
+  } catch (...) {
+    worker_creation_failed = true;
+    worker_abort.store(true, std::memory_order_release);
   }
-  for (std::thread &worker : workers) {
-    worker.join();
+  workers_released.store(true, std::memory_order_release);
+  join_workers.rollback();
+  if (worker_abort.load(std::memory_order_acquire)) {
+    for (size_t i = 0; i < result->token_results.size(); ++i) {
+      Preserve_trx_promotion_token_result &token_result =
+          result->token_results[i];
+      if (token_result.token != 0) continue;
+      token_result.token = tokens[i];
+      token_result.status =
+          Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT;
+      token_result.reason = worker_creation_failed
+                                ? "promotion prewarm worker creation failed"
+                                : "promotion prewarm worker aborted";
+    }
   }
 
   Preserve_trx_promotion_adopt_status first_failure =
@@ -2351,35 +2388,71 @@ preserved_trx_adopt_standby_pending_all_for_promotion(
     }
     if (!adopt_tasks.empty()) {
       std::atomic<size_t> next_task{0};
+      std::atomic<bool> workers_released{false};
+      std::atomic<bool> worker_abort{false};
       const uint32_t worker_count = std::min<uint32_t>(
           request.worker_count, static_cast<uint32_t>(adopt_tasks.size()));
       auto run_worker = [&]() {
+        while (!workers_released.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
         for (;;) {
+          if (worker_abort.load(std::memory_order_acquire)) break;
           const size_t index = next_task.fetch_add(1);
           if (index >= adopt_tasks.size()) break;
           Adopt_task &task = adopt_tasks[index];
           const uint64_t worker_started_us = my_micro_time();
-          if (g_adopt_executor == nullptr) {
-            task.adopted = promotion_adopt_ready_bundle_default(
-                preserve_dir, task.ready_bundle, gate_deadline_us,
-                &task.token_result);
-          } else {
-            task.adopted = g_adopt_executor(preserve_dir, task.ready_bundle,
-                                            &task.token_result);
+          try {
+            if (g_adopt_executor == nullptr) {
+              task.adopted = promotion_adopt_ready_bundle_default(
+                  preserve_dir, task.ready_bundle, gate_deadline_us,
+                  &task.token_result);
+            } else {
+              task.adopted = g_adopt_executor(preserve_dir, task.ready_bundle,
+                                              &task.token_result);
+            }
+          } catch (...) {
+            task.token_result.token = task.token;
+            task.token_result.status =
+                Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT;
+            task.token_result.reason = "promotion adopt worker failed";
+            worker_abort.store(true, std::memory_order_release);
           }
           task.elapsed_us = my_micro_time() - worker_started_us;
         }
       };
       if (worker_count <= 1) {
+        workers_released.store(true, std::memory_order_release);
         run_worker();
       } else {
         std::vector<std::thread> workers;
-        workers.reserve(worker_count);
-        for (uint32_t i = 0; i < worker_count; ++i) {
-          workers.emplace_back(run_worker);
+        auto join_workers = create_scope_guard([&] {
+          for (std::thread &worker : workers) {
+            if (worker.joinable()) worker.join();
+          }
+        });
+        bool worker_creation_failed = false;
+        try {
+          workers.reserve(worker_count);
+          for (uint32_t i = 0; i < worker_count; ++i) {
+            workers.emplace_back(run_worker);
+          }
+        } catch (...) {
+          worker_creation_failed = true;
+          worker_abort.store(true, std::memory_order_release);
         }
-        for (std::thread &worker : workers) {
-          worker.join();
+        workers_released.store(true, std::memory_order_release);
+        join_workers.rollback();
+        if (worker_abort.load(std::memory_order_acquire)) {
+          for (Adopt_task &task : adopt_tasks) {
+            if (task.adopted || task.token_result.token != 0) continue;
+            task.token_result.token = task.token;
+            task.token_result.status =
+                Preserve_trx_promotion_adopt_status::UNSUPPORTED_ARTIFACT;
+            task.token_result.reason =
+                worker_creation_failed ? "promotion adopt worker creation failed"
+                                       : "promotion adopt worker aborted";
+          }
         }
       }
       std::vector<uint64_t> worker_elapsed_samples;
@@ -2620,8 +2693,14 @@ adopt_prepared_epoch_for_physical_promotion_impl(
   };
   std::vector<Strict_adopt_task> tasks(request.tokens.size());
   std::atomic<size_t> next_task{0};
+  std::atomic<bool> workers_released{false};
+  std::atomic<bool> worker_abort{false};
   auto run_worker = [&]() {
+    while (!workers_released.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
     for (;;) {
+      if (worker_abort.load(std::memory_order_acquire)) break;
       const size_t i = next_task.fetch_add(1);
       if (i >= request.tokens.size()) break;
       const Preserve_trx_prepared_token_key &key = request.tokens[i];
@@ -2654,6 +2733,7 @@ adopt_prepared_epoch_for_physical_promotion_impl(
               Preserve_trx_gate_abort_outcome::CLEANUP_TAINTED);
         }
       } catch (...) {
+        worker_abort.store(true, std::memory_order_release);
         if (adopt_lease.active()) {
           (void)registry.abort_gate_adopt(
               &adopt_lease,
@@ -2665,14 +2745,25 @@ adopt_prepared_epoch_for_physical_promotion_impl(
   const uint32_t worker_count = std::min<uint32_t>(
       request.worker_count, static_cast<uint32_t>(tasks.size()));
   if (worker_count <= 1) {
+    workers_released.store(true, std::memory_order_release);
     run_worker();
   } else {
     std::vector<std::thread> workers;
-    workers.reserve(worker_count);
-    for (uint32_t i = 0; i < worker_count; ++i) {
-      workers.emplace_back(run_worker);
+    auto join_workers = create_scope_guard([&] {
+      for (std::thread &worker : workers) {
+        if (worker.joinable()) worker.join();
+      }
+    });
+    try {
+      workers.reserve(worker_count);
+      for (uint32_t i = 0; i < worker_count; ++i) {
+        workers.emplace_back(run_worker);
+      }
+    } catch (...) {
+      worker_abort.store(true, std::memory_order_release);
     }
-    for (std::thread &worker : workers) worker.join();
+    workers_released.store(true, std::memory_order_release);
+    join_workers.rollback();
   }
   for (size_t i = 0; i < tasks.size(); ++i) {
     intent.tokens[i].state = tasks[i].state;

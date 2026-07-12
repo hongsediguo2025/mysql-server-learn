@@ -365,7 +365,7 @@ struct Preserve_trx_transfer_receiver_record {
       Preserve_trx_transfer_receiver_state::RECEIVING};
   std::vector<Preserve_trx_transfer_object_descriptor> objects;
   std::set<std::string> sealed_objects;
-  uint64_t inflight_bytes{0};
+  uint64_t reserved_bytes{0};
   std::string last_error;
 };
 
@@ -378,7 +378,7 @@ class Preserve_trx_transfer_receiver_registry {
 
   Preserve_trx_transfer_status begin_receive(
       const Preserve_trx_transfer_manifest &manifest,
-      uint64_t inflight_bytes = 0);
+      uint64_t manifest_payload_bytes = 0);
   Preserve_trx_transfer_status declare_object(
       const std::string &epoch_id, uint64_t token,
       const Preserve_trx_transfer_object_descriptor &descriptor);
@@ -715,6 +715,16 @@ void preserve_trx_transfer_set_receiver_staged_prewarm_delay_ms_for_unit_test(
     uint delay_ms);
 void preserve_trx_transfer_set_receiver_object_prewarm_delay_ms_for_unit_test(
     uint delay_ms);
+void preserve_trx_transfer_set_temporary_worker_create_failure_for_unit_test(
+    int fail_at_worker_index);
+Preserve_trx_transfer_status
+preserve_trx_transfer_start_receiver_workers_for_unit_test(
+    uint worker_count, int fail_create_at_worker_index,
+    int fail_init_at_worker_index);
+bool preserve_trx_transfer_receiver_workers_started_for_unit_test();
+void preserve_trx_transfer_set_receiver_worker_init_pause_for_unit_test(
+    bool pause);
+bool preserve_trx_transfer_receiver_workers_starting_for_unit_test();
 #ifndef NDEBUG
 bool preserve_trx_transfer_strict_prepared_key_for_unit_test(
     const std::string &root_dir,

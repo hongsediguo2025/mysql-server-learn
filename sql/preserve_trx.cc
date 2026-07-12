@@ -98,6 +98,7 @@
 #include "sql/sql_class.h"
 #include "sql/sql_error.h"
 #include "sql/sql_lex.h"
+#include "scope_guard.h"
 #include "sql/sql_list.h"
 #include "sql/sql_audit.h"
 #include "sql/sql_backup_lock.h"
@@ -710,7 +711,13 @@ std::mutex g_preserved_trx_reaper_mutex;
 std::condition_variable g_preserved_trx_reaper_cond;
 std::thread g_preserved_trx_reaper_thread;
 bool g_preserved_trx_reaper_started = false;
+bool g_preserved_trx_reaper_starting = false;
+bool g_preserved_trx_reaper_stopping = false;
 bool g_preserved_trx_reaper_stop = false;
+bool g_preserved_trx_reaper_init_reported = false;
+bool g_preserved_trx_reaper_init_failed = false;
+bool g_preserved_trx_reaper_pause_init_report_for_unit_test = false;
+std::atomic<bool> g_preserved_trx_reaper_fail_init_for_unit_test{false};
 std::mutex g_preserved_trx_thd_pin_mutex;
 std::condition_variable g_preserved_trx_thd_pin_cond;
 std::unordered_map<THD *, uint> g_preserved_trx_thd_pin_counts;
@@ -8656,7 +8663,21 @@ static void preserved_trx_expired_reaper_scan_once() {
 }
 
 static void preserved_trx_expired_reaper_thread() {
-  my_thread_init();
+  const bool init_failed =
+      g_preserved_trx_reaper_fail_init_for_unit_test.load() ||
+      my_thread_init();
+
+  {
+    std::unique_lock<std::mutex> lock(g_preserved_trx_reaper_mutex);
+    g_preserved_trx_reaper_cond.wait(lock, [] {
+      return !g_preserved_trx_reaper_pause_init_report_for_unit_test;
+    });
+    g_preserved_trx_reaper_init_reported = true;
+    g_preserved_trx_reaper_init_failed = init_failed;
+  }
+  g_preserved_trx_reaper_cond.notify_all();
+  if (init_failed) return;
+  auto thread_end_guard = create_scope_guard([] { my_thread_end(); });
 
   std::unique_lock<std::mutex> lock(g_preserved_trx_reaper_mutex);
   while (!g_preserved_trx_reaper_stop) {
@@ -8666,19 +8687,45 @@ static void preserved_trx_expired_reaper_thread() {
     preserved_trx_expired_reaper_scan_once();
     lock.lock();
   }
-
-  lock.unlock();
-  my_thread_end();
 }
 
-void preserved_trx_start_expired_reaper() {
-  DBUG_EXECUTE_IF("preserve_trx_expired_reaper_skip", return;);
-  std::lock_guard<std::mutex> lock(g_preserved_trx_reaper_mutex);
-  if (g_preserved_trx_reaper_started) return;
+bool preserved_trx_start_expired_reaper() {
+  DBUG_EXECUTE_IF("preserve_trx_expired_reaper_skip", return true;);
+  std::unique_lock<std::mutex> lock(g_preserved_trx_reaper_mutex);
+  g_preserved_trx_reaper_cond.wait(lock, [] {
+    return !g_preserved_trx_reaper_starting &&
+           !g_preserved_trx_reaper_stopping;
+  });
+  if (g_preserved_trx_reaper_started) return true;
+  g_preserved_trx_reaper_starting = true;
   g_preserved_trx_reaper_stop = false;
-  g_preserved_trx_reaper_thread =
-      std::thread(preserved_trx_expired_reaper_thread);
+  g_preserved_trx_reaper_init_reported = false;
+  g_preserved_trx_reaper_init_failed = false;
+  try {
+    g_preserved_trx_reaper_thread =
+        std::thread(preserved_trx_expired_reaper_thread);
+  } catch (...) {
+    g_preserved_trx_reaper_starting = false;
+    g_preserved_trx_reaper_cond.notify_all();
+    return false;
+  }
+  g_preserved_trx_reaper_cond.wait(
+      lock, [] { return g_preserved_trx_reaper_init_reported; });
+  if (g_preserved_trx_reaper_init_failed) {
+    std::thread failed_reaper = std::move(g_preserved_trx_reaper_thread);
+    lock.unlock();
+    if (failed_reaper.joinable()) failed_reaper.join();
+    lock.lock();
+    g_preserved_trx_reaper_init_reported = false;
+    g_preserved_trx_reaper_init_failed = false;
+    g_preserved_trx_reaper_starting = false;
+    g_preserved_trx_reaper_cond.notify_all();
+    return false;
+  }
   g_preserved_trx_reaper_started = true;
+  g_preserved_trx_reaper_starting = false;
+  g_preserved_trx_reaper_cond.notify_all();
+  return true;
 }
 
 void preserved_trx_start_expired_reaper_if_ready() {
@@ -8687,20 +8734,59 @@ void preserved_trx_start_expired_reaper_if_ready() {
     std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
     if (!g_preserved_trx_recovery_done) return;
   }
-  preserved_trx_start_expired_reaper();
+  if (!preserved_trx_start_expired_reaper()) {
+    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+           "PRESERVE: failed to initialize expired-token reaper");
+  }
 }
 
 void preserved_trx_stop_expired_reaper() {
   std::thread reaper;
   {
-    std::lock_guard<std::mutex> lock(g_preserved_trx_reaper_mutex);
+    std::unique_lock<std::mutex> lock(g_preserved_trx_reaper_mutex);
+    g_preserved_trx_reaper_cond.wait(lock, [] {
+      return !g_preserved_trx_reaper_starting &&
+             !g_preserved_trx_reaper_stopping;
+    });
     if (!g_preserved_trx_reaper_started) return;
+    g_preserved_trx_reaper_stopping = true;
     g_preserved_trx_reaper_stop = true;
     reaper = std::move(g_preserved_trx_reaper_thread);
     g_preserved_trx_reaper_started = false;
   }
   g_preserved_trx_reaper_cond.notify_all();
   if (reaper.joinable()) reaper.join();
+  {
+    std::lock_guard<std::mutex> lock(g_preserved_trx_reaper_mutex);
+    g_preserved_trx_reaper_stop = false;
+    g_preserved_trx_reaper_stopping = false;
+  }
+  g_preserved_trx_reaper_cond.notify_all();
+}
+
+bool preserved_trx_start_expired_reaper_for_unit_test(bool fail_thread_init) {
+  g_preserved_trx_reaper_fail_init_for_unit_test.store(fail_thread_init);
+  const bool started = preserved_trx_start_expired_reaper();
+  g_preserved_trx_reaper_fail_init_for_unit_test.store(false);
+  return started;
+}
+
+bool preserved_trx_expired_reaper_started_for_unit_test() {
+  std::lock_guard<std::mutex> lock(g_preserved_trx_reaper_mutex);
+  return g_preserved_trx_reaper_started;
+}
+
+void preserved_trx_set_expired_reaper_init_pause_for_unit_test(bool pause) {
+  {
+    std::lock_guard<std::mutex> lock(g_preserved_trx_reaper_mutex);
+    g_preserved_trx_reaper_pause_init_report_for_unit_test = pause;
+  }
+  g_preserved_trx_reaper_cond.notify_all();
+}
+
+bool preserved_trx_expired_reaper_starting_for_unit_test() {
+  std::lock_guard<std::mutex> lock(g_preserved_trx_reaper_mutex);
+  return g_preserved_trx_reaper_starting;
 }
 
 class Preserve_detached_mdl_owner final : public MDL_context_owner {
@@ -11018,36 +11104,66 @@ bool preserved_trx_recover_all() {
       std::atomic<size_t> next_startup_recovery_index{0};
       std::atomic<bool> worker_init_failed{false};
       std::atomic<bool> worker_exception_failed{false};
+      std::atomic<size_t> worker_init_reports{0};
+      std::atomic<bool> workers_released{false};
+      std::atomic<bool> worker_abort{false};
       std::vector<std::thread> startup_recovery_workers;
-      startup_recovery_workers.reserve(startup_recovery_worker_count);
-      for (uint worker_index = 0; worker_index < startup_recovery_worker_count;
-           ++worker_index) {
-        startup_recovery_workers.emplace_back([&]() {
-          if (my_thread_init()) {
-            worker_init_failed.store(true, std::memory_order_relaxed);
-            return;
-          }
-          try {
-            std::unique_ptr<Auto_THD> startup_recovery_thd;
-            if (current_thd == nullptr) {
-              startup_recovery_thd = std::make_unique<Auto_THD>();
+      auto join_startup_workers = create_scope_guard([&] {
+        for (std::thread &worker : startup_recovery_workers) {
+          if (worker.joinable()) worker.join();
+        }
+      });
+      try {
+        startup_recovery_workers.reserve(startup_recovery_worker_count);
+        for (uint worker_index = 0;
+             worker_index < startup_recovery_worker_count; ++worker_index) {
+          startup_recovery_workers.emplace_back([&]() {
+            if (my_thread_init()) {
+              worker_init_failed.store(true, std::memory_order_relaxed);
+              worker_abort.store(true, std::memory_order_release);
+              worker_init_reports.fetch_add(1, std::memory_order_release);
+              return;
             }
-            for (;;) {
-              const size_t task_index =
-                  next_startup_recovery_index.fetch_add(
-                      1, std::memory_order_relaxed);
-              if (task_index >= startup_recovery_tasks.size()) break;
-              recover_startup_task(&startup_recovery_tasks[task_index]);
+            auto thread_end_guard = create_scope_guard([] { my_thread_end(); });
+            worker_init_reports.fetch_add(1, std::memory_order_release);
+            while (!workers_released.load(std::memory_order_acquire)) {
+              std::this_thread::yield();
             }
-          } catch (...) {
-            worker_exception_failed.store(true, std::memory_order_relaxed);
-          }
-          my_thread_end();
-        });
+            if (worker_abort.load(std::memory_order_acquire)) return;
+            try {
+              std::unique_ptr<Auto_THD> startup_recovery_thd;
+              if (current_thd == nullptr) {
+                startup_recovery_thd = std::make_unique<Auto_THD>();
+              }
+              for (;;) {
+                if (worker_abort.load(std::memory_order_acquire)) break;
+                const size_t task_index =
+                    next_startup_recovery_index.fetch_add(
+                        1, std::memory_order_relaxed);
+                if (task_index >= startup_recovery_tasks.size()) break;
+                recover_startup_task(&startup_recovery_tasks[task_index]);
+              }
+            } catch (...) {
+              worker_exception_failed.store(true, std::memory_order_relaxed);
+              worker_abort.store(true, std::memory_order_release);
+            }
+          });
+        }
+      } catch (...) {
+        worker_exception_failed.store(true, std::memory_order_relaxed);
+        worker_abort.store(true, std::memory_order_release);
       }
-      for (std::thread &worker : startup_recovery_workers) {
-        worker.join();
+      if (!worker_abort.load(std::memory_order_acquire)) {
+        while (worker_init_reports.load(std::memory_order_acquire) <
+               startup_recovery_workers.size()) {
+          std::this_thread::yield();
+        }
+        if (worker_init_failed.load(std::memory_order_relaxed)) {
+          worker_abort.store(true, std::memory_order_release);
+        }
       }
+      workers_released.store(true, std::memory_order_release);
+      join_startup_workers.rollback();
       if (worker_init_failed.load(std::memory_order_relaxed) ||
           worker_exception_failed.load(std::memory_order_relaxed)) {
         error = true;
@@ -14289,47 +14405,77 @@ bool Preserve_trx_drain_service::execute(
       std::atomic<size_t> next_target_index{0};
       std::atomic<bool> worker_init_failed{false};
       std::atomic<bool> worker_exception_failed{false};
+      std::atomic<size_t> worker_init_reports{0};
+      std::atomic<bool> workers_released{false};
+      std::atomic<bool> worker_abort{false};
       std::vector<std::thread> workers;
-      workers.reserve(preserve_worker_count);
+      auto join_workers = create_scope_guard([&] {
+        for (std::thread &worker : workers) {
+          if (worker.joinable()) worker.join();
+        }
+      });
       target_step_started_us = preserve_trx_monotonic_us();
-      for (uint worker_index = 0; worker_index < preserve_worker_count;
-           ++worker_index) {
-        workers.emplace_back([&]() {
-          if (my_thread_init()) {
-            worker_init_failed.store(true, std::memory_order_relaxed);
-            return;
-          }
-          try {
-            char worker_thread_stack_anchor = 0;
-            for (;;) {
-              const size_t target_index =
-                  next_target_index.fetch_add(1, std::memory_order_relaxed);
-              if (target_index >= quiesced_target_thread_ids.size()) break;
-              const my_thread_id target_thread_id =
-                  quiesced_target_thread_ids[target_index];
-              auto target_it = pinned_by_thread_id.find(target_thread_id);
-              preserve_one_target(
-                  target_thread_id,
-                  target_it == pinned_by_thread_id.end() ? nullptr
-                                                         : target_it->second,
-                  nullptr, &worker_thread_stack_anchor,
-                  &target_results[target_index]);
+      try {
+        workers.reserve(preserve_worker_count);
+        for (uint worker_index = 0; worker_index < preserve_worker_count;
+             ++worker_index) {
+          workers.emplace_back([&]() {
+            if (my_thread_init()) {
+              worker_init_failed.store(true, std::memory_order_relaxed);
+              worker_abort.store(true, std::memory_order_release);
+              worker_init_reports.fetch_add(1, std::memory_order_release);
+              return;
             }
-          } catch (...) {
-            worker_exception_failed.store(true, std::memory_order_relaxed);
-          }
-          my_thread_end();
-        });
+            auto thread_end_guard = create_scope_guard([] { my_thread_end(); });
+            worker_init_reports.fetch_add(1, std::memory_order_release);
+            while (!workers_released.load(std::memory_order_acquire)) {
+              std::this_thread::yield();
+            }
+            if (worker_abort.load(std::memory_order_acquire)) return;
+            try {
+              char worker_thread_stack_anchor = 0;
+              for (;;) {
+                if (worker_abort.load(std::memory_order_acquire)) break;
+                const size_t target_index =
+                    next_target_index.fetch_add(1, std::memory_order_relaxed);
+                if (target_index >= quiesced_target_thread_ids.size()) break;
+                const my_thread_id target_thread_id =
+                    quiesced_target_thread_ids[target_index];
+                auto target_it = pinned_by_thread_id.find(target_thread_id);
+                preserve_one_target(
+                    target_thread_id,
+                    target_it == pinned_by_thread_id.end() ? nullptr
+                                                           : target_it->second,
+                    nullptr, &worker_thread_stack_anchor,
+                    &target_results[target_index]);
+              }
+            } catch (...) {
+              worker_exception_failed.store(true, std::memory_order_relaxed);
+              worker_abort.store(true, std::memory_order_release);
+            }
+          });
+        }
+      } catch (...) {
+        worker_exception_failed.store(true, std::memory_order_relaxed);
+        worker_abort.store(true, std::memory_order_release);
       }
-      for (std::thread &worker : workers) {
-        worker.join();
+      if (!worker_abort.load(std::memory_order_acquire)) {
+        while (worker_init_reports.load(std::memory_order_acquire) <
+               workers.size()) {
+          std::this_thread::yield();
+        }
+        if (worker_init_failed.load(std::memory_order_relaxed)) {
+          worker_abort.store(true, std::memory_order_release);
+        }
       }
+      workers_released.store(true, std::memory_order_release);
+      join_workers.rollback();
       phase2_metrics.target_worker_wall_us +=
           elapsed_since(target_step_started_us);
       if (worker_init_failed.load(std::memory_order_relaxed) ||
           worker_exception_failed.load(std::memory_order_relaxed)) {
         for (Preserve_batch_target_execution &execution : target_results) {
-          if (!execution.visited_target) execution.pin_error = true;
+          execution.pin_error = true;
         }
       }
     }

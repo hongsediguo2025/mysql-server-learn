@@ -3417,6 +3417,94 @@ TEST(PreservedTrxExpiredReaper, EmptyClaimDoesNotPublishManagerState) {
   EXPECT_EQ(Preserve_trx_manager_state::IDLE, preserved_trx_manager_state());
 }
 
+TEST(PreservedTrxExpiredReaper, InitFailureIsRetryable) {
+  preserved_trx_stop_expired_reaper();
+  EXPECT_FALSE(preserved_trx_start_expired_reaper_for_unit_test(true));
+  EXPECT_FALSE(preserved_trx_expired_reaper_started_for_unit_test());
+  EXPECT_TRUE(preserved_trx_start_expired_reaper_for_unit_test(false));
+  EXPECT_TRUE(preserved_trx_expired_reaper_started_for_unit_test());
+  preserved_trx_stop_expired_reaper();
+}
+
+TEST(PreservedTrxExpiredReaper, ConcurrentStartsShareOneInitialization) {
+  preserved_trx_stop_expired_reaper();
+  preserved_trx_set_expired_reaper_init_pause_for_unit_test(true);
+
+  std::atomic<bool> first_done{false};
+  std::atomic<bool> second_done{false};
+  bool first_started = false;
+  bool second_started = false;
+  std::thread first([&] {
+    first_started = preserved_trx_start_expired_reaper();
+    first_done.store(true);
+  });
+  for (uint i = 0;
+       i < 1000 && !preserved_trx_expired_reaper_starting_for_unit_test();
+       ++i) {
+    std::this_thread::yield();
+  }
+  if (!preserved_trx_expired_reaper_starting_for_unit_test()) {
+    preserved_trx_set_expired_reaper_init_pause_for_unit_test(false);
+    first.join();
+    preserved_trx_stop_expired_reaper();
+    FAIL() << "reaper did not enter STARTING";
+  }
+
+  std::thread second([&] {
+    second_started = preserved_trx_start_expired_reaper();
+    second_done.store(true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_FALSE(first_done.load());
+  EXPECT_FALSE(second_done.load());
+
+  preserved_trx_set_expired_reaper_init_pause_for_unit_test(false);
+  first.join();
+  second.join();
+  EXPECT_TRUE(first_started);
+  EXPECT_TRUE(second_started);
+  EXPECT_TRUE(preserved_trx_expired_reaper_started_for_unit_test());
+  preserved_trx_stop_expired_reaper();
+}
+
+TEST(PreservedTrxExpiredReaper, StopWaitsForInitialization) {
+  preserved_trx_stop_expired_reaper();
+  preserved_trx_set_expired_reaper_init_pause_for_unit_test(true);
+
+  std::atomic<bool> start_done{false};
+  std::atomic<bool> stop_done{false};
+  bool started = false;
+  std::thread starter([&] {
+    started = preserved_trx_start_expired_reaper();
+    start_done.store(true);
+  });
+  for (uint i = 0;
+       i < 1000 && !preserved_trx_expired_reaper_starting_for_unit_test();
+       ++i) {
+    std::this_thread::yield();
+  }
+  if (!preserved_trx_expired_reaper_starting_for_unit_test()) {
+    preserved_trx_set_expired_reaper_init_pause_for_unit_test(false);
+    starter.join();
+    preserved_trx_stop_expired_reaper();
+    FAIL() << "reaper did not enter STARTING";
+  }
+
+  std::thread stopper([&] {
+    preserved_trx_stop_expired_reaper();
+    stop_done.store(true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_FALSE(start_done.load());
+  EXPECT_FALSE(stop_done.load());
+
+  preserved_trx_set_expired_reaper_init_pause_for_unit_test(false);
+  starter.join();
+  stopper.join();
+  EXPECT_TRUE(started);
+  EXPECT_FALSE(preserved_trx_expired_reaper_started_for_unit_test());
+}
+
 TEST(PreservedTrxExpiredReaper, DeadlineUsesMonotonicAnchor) {
   ASSERT_TRUE(preserved_trx_add_deadline_record_for_unit_test(
       "unit-monotonic-deadline-token", 1000, 2000, 1000, 5000));
@@ -13156,6 +13244,168 @@ TEST_F(PreserveSnapshotTest,
       registry.lookup(second_begin.epoch_id, second_begin.token, &record));
 }
 
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverReplacementBeginDoesNotDoubleChargeBudget) {
+  Preserve_trx_transfer_manifest manifest;
+  manifest.epoch_id = "epoch-budget-replacement";
+  manifest.source_server_uuid = "source-uuid";
+  manifest.target_server_uuid = "target-uuid";
+  manifest.token = 105;
+
+  const ulonglong old_budget = preserve_trx_transfer_max_inflight_bytes;
+  auto restore_budget = create_scope_guard([&] {
+    preserve_trx_transfer_max_inflight_bytes = old_budget;
+  });
+  preserve_trx_transfer_max_inflight_bytes = 100;
+
+  Preserve_trx_transfer_receiver_registry registry;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_receive(manifest, 60));
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_receive(manifest, 60));
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverRejectedReplacementKeepsOldStaging) {
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+  const ulonglong old_budget = preserve_trx_transfer_max_inflight_bytes;
+  auto restore_budget = create_scope_guard([&] {
+    preserve_trx_transfer_max_inflight_bytes = old_budget;
+  });
+  preserve_trx_transfer_max_inflight_bytes = 1024 * 1024;
+
+  Preserve_trx_transfer_manifest manifest;
+  manifest.epoch_id = "epoch-rejected-replacement";
+  manifest.source_server_uuid = "source-uuid";
+  manifest.target_server_uuid = "target-uuid";
+  manifest.token = 110;
+  Preserve_trx_transfer_object_descriptor object;
+  object.object_id = "snapshot";
+  object.kind = Preserve_trx_transfer_object_kind::SNAPSHOT_BUNDLE;
+  object.total_size = 4;
+  object.digest.fill(1);
+  manifest.objects.push_back(object);
+
+  std::string manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_manifest(manifest,
+                                                  &manifest_payload));
+  Preserve_trx_transfer_receiver_registry registry;
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_frame begin;
+  begin.type = Preserve_trx_transfer_frame_type::BEGIN;
+  begin.sequence = 1;
+  begin.epoch_id = manifest.epoch_id;
+  begin.token = manifest.token;
+  begin.manifest_payload = manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, begin, &store, &registry, 300, nullptr));
+
+  Preserve_trx_transfer_frame chunk;
+  chunk.type = Preserve_trx_transfer_frame_type::OBJECT_CHUNK;
+  chunk.sequence = 2;
+  chunk.epoch_id = manifest.epoch_id;
+  chunk.token = manifest.token;
+  chunk.object_id = object.object_id;
+  chunk.chunk_payload = "old!";
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, chunk, &store, &registry, 300, nullptr));
+  const std::string object_path =
+      m_dir + ".transfer/" + manifest.epoch_id + "/" +
+      test_transfer_token_string(manifest.token) + "/snapshot.part";
+  MY_STAT stat_area;
+  ASSERT_NE(nullptr, my_stat(object_path.c_str(), &stat_area, MYF(0)));
+
+  manifest.objects[0].digest.fill(2);
+  std::string replacement_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_manifest(manifest,
+                                                  &replacement_payload));
+  preserve_trx_transfer_max_inflight_bytes =
+      replacement_payload.length() + manifest.objects[0].total_size;
+  Preserve_trx_transfer_frame replacement = begin;
+  replacement.sequence = 3;
+  replacement.manifest_payload = replacement_payload;
+  EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, replacement, &store, &registry, 300, nullptr));
+  EXPECT_NE(nullptr, my_stat(object_path.c_str(), &stat_area, MYF(0)));
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverDeclareObjectReservesEpochBudget) {
+  const ulonglong old_budget = preserve_trx_transfer_max_inflight_bytes;
+  auto restore_budget = create_scope_guard([&] {
+    preserve_trx_transfer_max_inflight_bytes = old_budget;
+  });
+  preserve_trx_transfer_max_inflight_bytes = 1024;
+
+  Preserve_trx_transfer_receiver_registry registry;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.declare_token("epoch-declare-budget", 106, "source-uuid",
+                                   "target-uuid"));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.declare_token("epoch-declare-budget", 107, "source-uuid",
+                                   "target-uuid"));
+
+  Preserve_trx_transfer_object_descriptor first;
+  first.object_id = "snapshot";
+  first.kind = Preserve_trx_transfer_object_kind::SNAPSHOT_BUNDLE;
+  first.total_size = 512;
+  first.digest.fill(1);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.declare_object("epoch-declare-budget", 106, first));
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            registry.declare_object("epoch-declare-budget", 106, first));
+
+  Preserve_trx_transfer_object_descriptor second = first;
+  second.digest.fill(2);
+  EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED,
+            registry.declare_object("epoch-declare-budget", 107, second));
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverObjectReplacementReleasesOldReservation) {
+  const ulonglong old_budget = preserve_trx_transfer_max_inflight_bytes;
+  auto restore_budget = create_scope_guard([&] {
+    preserve_trx_transfer_max_inflight_bytes = old_budget;
+  });
+  preserve_trx_transfer_max_inflight_bytes = 1200;
+
+  Preserve_trx_transfer_receiver_registry registry;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.declare_token("epoch-object-replacement", 108,
+                                   "source-uuid", "target-uuid"));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.declare_token("epoch-object-replacement", 109,
+                                   "source-uuid", "target-uuid"));
+
+  Preserve_trx_transfer_object_descriptor descriptor;
+  descriptor.object_id = "snapshot";
+  descriptor.kind = Preserve_trx_transfer_object_kind::SNAPSHOT_BUNDLE;
+  descriptor.total_size = 800;
+  descriptor.digest.fill(1);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.declare_object("epoch-object-replacement", 108,
+                                    descriptor));
+
+  descriptor.total_size = 1;
+  descriptor.digest.fill(2);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.declare_object("epoch-object-replacement", 108,
+                                    descriptor));
+
+  descriptor.total_size = 650;
+  descriptor.digest.fill(3);
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            registry.declare_object("epoch-object-replacement", 109,
+                                    descriptor));
+}
+
 TEST_F(PreserveSnapshotTest, TransferReceiverBeginRejectsEmptyRootDir) {
   Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 105;
@@ -15187,6 +15437,114 @@ TEST_F(PreserveSnapshotTest,
     last_sequence_for_610 = entry.second;
   }
   EXPECT_EQ(2U, last_sequence_for_610);
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverTemporaryWorkerCreationFailureReturnsError) {
+  std::vector<Preserve_trx_transfer_frame> frames;
+  for (uint64_t token = 620; token < 623; ++token) {
+    Preserve_trx_transfer_frame frame;
+    frame.type = Preserve_trx_transfer_frame_type::OBJECT_CHUNK;
+    frame.epoch_id = "epoch-batch-worker-create-failure";
+    frame.token = token;
+    frame.sequence = 1;
+    frames.push_back(frame);
+  }
+
+  Transfer_receiver_batch_probe probe;
+  preserve_trx_transfer_set_temporary_worker_create_failure_for_unit_test(1);
+  EXPECT_EQ(Preserve_trx_transfer_status::RESOURCE_EXHAUSTED,
+            preserve_trx_transfer_apply_receiver_frame_batch_with_workers(
+                frames, 3, transfer_receiver_batch_probe_apply, &probe));
+  preserve_trx_transfer_set_temporary_worker_create_failure_for_unit_test(-1);
+  EXPECT_TRUE(probe.applied_order.empty());
+
+  Transfer_receiver_batch_probe retry_probe;
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame_batch_with_workers(
+                frames, 3, transfer_receiver_batch_probe_apply,
+                &retry_probe));
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverPoolPartialThreadCreationFailureIsRetryable) {
+  preserve_trx_transfer_shutdown_receiver_prewarm_workers();
+  EXPECT_EQ(Preserve_trx_transfer_status::RESOURCE_EXHAUSTED,
+            preserve_trx_transfer_start_receiver_workers_for_unit_test(3, 1,
+                                                                       -1));
+  EXPECT_FALSE(preserve_trx_transfer_receiver_workers_started_for_unit_test());
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_start_receiver_workers_for_unit_test(3, -1,
+                                                                       -1));
+  EXPECT_TRUE(preserve_trx_transfer_receiver_workers_started_for_unit_test());
+  preserve_trx_transfer_shutdown_receiver_prewarm_workers();
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverPoolPartialInitFailureIsRetryable) {
+  preserve_trx_transfer_shutdown_receiver_prewarm_workers();
+  EXPECT_EQ(Preserve_trx_transfer_status::RESOURCE_EXHAUSTED,
+            preserve_trx_transfer_start_receiver_workers_for_unit_test(3, -1,
+                                                                       1));
+  EXPECT_FALSE(preserve_trx_transfer_receiver_workers_started_for_unit_test());
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_start_receiver_workers_for_unit_test(3, -1,
+                                                                       -1));
+  preserve_trx_transfer_shutdown_receiver_prewarm_workers();
+}
+
+TEST_F(PreserveSnapshotTest, TransferReceiverPoolAllInitFailureIsRetryable) {
+  preserve_trx_transfer_shutdown_receiver_prewarm_workers();
+  EXPECT_EQ(Preserve_trx_transfer_status::RESOURCE_EXHAUSTED,
+            preserve_trx_transfer_start_receiver_workers_for_unit_test(3, -1,
+                                                                       -2));
+  EXPECT_FALSE(preserve_trx_transfer_receiver_workers_started_for_unit_test());
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_start_receiver_workers_for_unit_test(3, -1,
+                                                                       -1));
+  preserve_trx_transfer_shutdown_receiver_prewarm_workers();
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverPoolShutdownWaitsForInitialization) {
+  preserve_trx_transfer_shutdown_receiver_prewarm_workers();
+  preserve_trx_transfer_set_receiver_worker_init_pause_for_unit_test(true);
+
+  std::atomic<bool> start_done{false};
+  std::atomic<bool> shutdown_done{false};
+  Preserve_trx_transfer_status start_status =
+      Preserve_trx_transfer_status::UNSUPPORTED;
+  std::thread starter([&] {
+    start_status = preserve_trx_transfer_start_receiver_workers_for_unit_test(
+        3, -1, -1);
+    start_done.store(true);
+  });
+  for (uint i = 0;
+       i < 1000 &&
+       !preserve_trx_transfer_receiver_workers_starting_for_unit_test();
+       ++i) {
+    std::this_thread::yield();
+  }
+  if (!preserve_trx_transfer_receiver_workers_starting_for_unit_test()) {
+    preserve_trx_transfer_set_receiver_worker_init_pause_for_unit_test(false);
+    starter.join();
+    preserve_trx_transfer_shutdown_receiver_prewarm_workers();
+    FAIL() << "receiver worker pool did not enter STARTING";
+  }
+
+  std::thread shutdown([&] {
+    preserve_trx_transfer_shutdown_receiver_prewarm_workers();
+    shutdown_done.store(true);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_FALSE(start_done.load());
+  EXPECT_FALSE(shutdown_done.load());
+
+  preserve_trx_transfer_set_receiver_worker_init_pause_for_unit_test(false);
+  starter.join();
+  shutdown.join();
+  EXPECT_EQ(Preserve_trx_transfer_status::OK, start_status);
+  EXPECT_FALSE(preserve_trx_transfer_receiver_workers_started_for_unit_test());
 }
 
 TEST_F(PreserveSnapshotTest,

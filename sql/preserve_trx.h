@@ -633,9 +633,13 @@ bool preserved_trx_adopt_ready_bundle_for_promotion(
     const std::string &dir, Preserved_trx_bundle bundle,
     Preserved_trx_promotion_ready_adopt_result *result,
     uint64_t deadline_us = 0);
-void preserved_trx_start_expired_reaper();
+bool preserved_trx_start_expired_reaper();
 void preserved_trx_start_expired_reaper_if_ready();
 void preserved_trx_stop_expired_reaper();
+bool preserved_trx_start_expired_reaper_for_unit_test(bool fail_thread_init);
+bool preserved_trx_expired_reaper_started_for_unit_test();
+void preserved_trx_set_expired_reaper_init_pause_for_unit_test(bool pause);
+bool preserved_trx_expired_reaper_starting_for_unit_test();
 bool preserved_trx_shutdown_requested();
 bool preserved_trx_defer_shutdown_signal();
 void preserved_trx_note_statement_response(THD *thd);

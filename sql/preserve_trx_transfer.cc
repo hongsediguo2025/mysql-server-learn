@@ -39,6 +39,7 @@
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <system_error>
 #include <sys/stat.h>
 #include <thread>
 #include <tuple>
@@ -1786,6 +1787,42 @@ Preserve_trx_transfer_status transfer_manifest_inflight_bytes(
     total += object.total_size;
   }
   *inflight_bytes = total;
+  return Preserve_trx_transfer_status::OK;
+}
+
+constexpr uint64_t kReceiverObjectReservationOverhead = 256;
+
+Preserve_trx_transfer_status receiver_object_reserved_bytes(
+    const Preserve_trx_transfer_object_descriptor &object,
+    uint64_t *reserved_bytes) {
+  if (reserved_bytes == nullptr)
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  if (object.total_size > std::numeric_limits<uint64_t>::max() -
+                              kReceiverObjectReservationOverhead) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+  *reserved_bytes = object.total_size + kReceiverObjectReservationOverhead;
+  return Preserve_trx_transfer_status::OK;
+}
+
+Preserve_trx_transfer_status receiver_manifest_reserved_bytes(
+    const Preserve_trx_transfer_manifest &manifest,
+    uint64_t manifest_payload_bytes, uint64_t *reserved_bytes) {
+  if (reserved_bytes == nullptr)
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  uint64_t total = manifest_payload_bytes;
+  for (const Preserve_trx_transfer_object_descriptor &object :
+       manifest.objects) {
+    uint64_t object_bytes = 0;
+    const Preserve_trx_transfer_status status =
+        receiver_object_reserved_bytes(object, &object_bytes);
+    if (status != Preserve_trx_transfer_status::OK) return status;
+    if (object_bytes > std::numeric_limits<uint64_t>::max() - total) {
+      return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
+    total += object_bytes;
+  }
+  *reserved_bytes = total;
   return Preserve_trx_transfer_status::OK;
 }
 
@@ -4873,11 +4910,20 @@ Preserve_trx_transfer_receiver_registry::declare_token(
 
 Preserve_trx_transfer_status
 Preserve_trx_transfer_receiver_registry::begin_receive(
-    const Preserve_trx_transfer_manifest &manifest, uint64_t inflight_bytes) {
+    const Preserve_trx_transfer_manifest &manifest,
+    uint64_t manifest_payload_bytes) {
   const Preserve_trx_transfer_status validation_status =
       validate_manifest_components(manifest, false);
   if (validation_status != Preserve_trx_transfer_status::OK)
     return validation_status;
+
+  uint64_t reserved_bytes = 0;
+  const Preserve_trx_transfer_status reservation_status =
+      receiver_manifest_reserved_bytes(manifest, manifest_payload_bytes,
+                                       &reserved_bytes);
+  if (reservation_status != Preserve_trx_transfer_status::OK) {
+    return reservation_status;
+  }
 
   Preserve_trx_transfer_receiver_record record;
   record.epoch_id = manifest.epoch_id;
@@ -4888,7 +4934,7 @@ Preserve_trx_transfer_receiver_registry::begin_receive(
   record.source_epoch_commit_lsn = manifest.source_epoch_commit_lsn;
   record.state = Preserve_trx_transfer_receiver_state::RECEIVING;
   record.objects = manifest.objects;
-  record.inflight_bytes = inflight_bytes;
+  record.reserved_bytes = reserved_bytes;
 
   std::lock_guard<std::mutex> guard(m_mutex);
   const Token_key key(manifest.epoch_id, manifest.token);
@@ -4905,22 +4951,24 @@ Preserve_trx_transfer_receiver_registry::begin_receive(
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
   }
-  uint64_t epoch_inflight_bytes = 0;
+  uint64_t epoch_reserved_bytes = 0;
   for (const auto &entry : m_records) {
+    if (entry.first == key) continue;
     const Preserve_trx_transfer_receiver_record &existing = entry.second;
     if (existing.epoch_id != manifest.epoch_id ||
-        existing.state != Preserve_trx_transfer_receiver_state::RECEIVING) {
+        (existing.state != Preserve_trx_transfer_receiver_state::DECLARED &&
+         existing.state != Preserve_trx_transfer_receiver_state::RECEIVING)) {
       continue;
     }
-    if (existing.inflight_bytes >
-        std::numeric_limits<uint64_t>::max() - epoch_inflight_bytes) {
+    if (existing.reserved_bytes >
+        std::numeric_limits<uint64_t>::max() - epoch_reserved_bytes) {
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
-    epoch_inflight_bytes += existing.inflight_bytes;
+    epoch_reserved_bytes += existing.reserved_bytes;
   }
-  if (inflight_bytes >
-          std::numeric_limits<uint64_t>::max() - epoch_inflight_bytes ||
-      epoch_inflight_bytes + inflight_bytes >
+  if (reserved_bytes >
+          std::numeric_limits<uint64_t>::max() - epoch_reserved_bytes ||
+      epoch_reserved_bytes + reserved_bytes >
           preserve_trx_transfer_max_inflight_bytes) {
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
@@ -4961,6 +5009,13 @@ Preserve_trx_transfer_receiver_registry::declare_object(
       found->second.state != Preserve_trx_transfer_receiver_state::RECEIVING) {
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
+
+  uint64_t new_object_bytes = 0;
+  const Preserve_trx_transfer_status reservation_status =
+      receiver_object_reserved_bytes(descriptor, &new_object_bytes);
+  if (reservation_status != Preserve_trx_transfer_status::OK) {
+    return reservation_status;
+  }
   const auto existing = std::find_if(
       found->second.objects.begin(), found->second.objects.end(),
       [&](const Preserve_trx_transfer_object_descriptor &candidate) {
@@ -4970,11 +5025,84 @@ Preserve_trx_transfer_receiver_registry::declare_object(
     if (transfer_object_descriptor_equal(*existing, descriptor)) {
       return Preserve_trx_transfer_status::OK;
     }
-    *existing = descriptor;
+    uint64_t old_object_bytes = 0;
+    const Preserve_trx_transfer_status old_reservation_status =
+        receiver_object_reserved_bytes(*existing, &old_object_bytes);
+    if (old_reservation_status != Preserve_trx_transfer_status::OK ||
+        found->second.reserved_bytes < old_object_bytes) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
+    const uint64_t base_reserved_bytes =
+        found->second.reserved_bytes - old_object_bytes;
+    if (new_object_bytes > std::numeric_limits<uint64_t>::max() -
+                               base_reserved_bytes) {
+      return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
+    uint64_t other_reserved_bytes = 0;
+    for (const auto &entry : m_records) {
+      if (entry.first == key || entry.second.epoch_id != epoch_id ||
+          (entry.second.state !=
+               Preserve_trx_transfer_receiver_state::DECLARED &&
+           entry.second.state !=
+               Preserve_trx_transfer_receiver_state::RECEIVING)) {
+        continue;
+      }
+      if (entry.second.reserved_bytes >
+          std::numeric_limits<uint64_t>::max() - other_reserved_bytes) {
+        return Preserve_trx_transfer_status::UNSUPPORTED;
+      }
+      other_reserved_bytes += entry.second.reserved_bytes;
+    }
+    const uint64_t replacement_reserved_bytes =
+        base_reserved_bytes + new_object_bytes;
+    if (replacement_reserved_bytes >
+            std::numeric_limits<uint64_t>::max() - other_reserved_bytes ||
+        other_reserved_bytes + replacement_reserved_bytes >
+            preserve_trx_transfer_max_inflight_bytes) {
+      return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
+    try {
+      *existing = descriptor;
+    } catch (...) {
+      return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
+    }
+    found->second.reserved_bytes = replacement_reserved_bytes;
     found->second.sealed_objects.erase(descriptor.object_id);
     return Preserve_trx_transfer_status::OK;
   }
-  found->second.objects.push_back(descriptor);
+
+  if (new_object_bytes > std::numeric_limits<uint64_t>::max() -
+                             found->second.reserved_bytes) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+  const uint64_t record_reserved_bytes =
+      found->second.reserved_bytes + new_object_bytes;
+  uint64_t epoch_reserved_bytes = 0;
+  for (const auto &entry : m_records) {
+    if (entry.first == key || entry.second.epoch_id != epoch_id ||
+        (entry.second.state != Preserve_trx_transfer_receiver_state::DECLARED &&
+         entry.second.state !=
+             Preserve_trx_transfer_receiver_state::RECEIVING)) {
+      continue;
+    }
+    if (entry.second.reserved_bytes >
+        std::numeric_limits<uint64_t>::max() - epoch_reserved_bytes) {
+      return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
+    epoch_reserved_bytes += entry.second.reserved_bytes;
+  }
+  if (record_reserved_bytes >
+          std::numeric_limits<uint64_t>::max() - epoch_reserved_bytes ||
+      epoch_reserved_bytes + record_reserved_bytes >
+          preserve_trx_transfer_max_inflight_bytes) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+  try {
+    found->second.objects.push_back(descriptor);
+  } catch (...) {
+    return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
+  }
+  found->second.reserved_bytes = record_reserved_bytes;
   return Preserve_trx_transfer_status::OK;
 }
 
@@ -5228,6 +5356,7 @@ Preserve_trx_transfer_receiver_registry::mark_terminal_locked(
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
   found->second.state = state;
+  found->second.reserved_bytes = 0;
   found->second.last_error = reason;
   return Preserve_trx_transfer_status::OK;
 }
@@ -7942,7 +8071,16 @@ std::set<Receiver_staged_token_prewarm_key>
     g_receiver_staged_token_prewarm_deferred;
 std::set<Receiver_object_prewarm_key> g_receiver_object_prewarm_inflight;
 bool g_receiver_prewarm_workers_started = false;
+bool g_receiver_prewarm_workers_starting = false;
+bool g_receiver_prewarm_workers_stopping = false;
 bool g_receiver_prewarm_shutdown = false;
+size_t g_receiver_prewarm_worker_init_reports = 0;
+size_t g_receiver_prewarm_worker_init_failures = 0;
+std::atomic<uint> g_receiver_prewarm_worker_init_index{0};
+std::atomic<int> g_receiver_prewarm_fail_create_at_for_unit_test{-1};
+std::atomic<int> g_receiver_prewarm_fail_init_at_for_unit_test{-1};
+bool g_receiver_prewarm_pause_init_report_for_unit_test = false;
+std::atomic<int> g_temporary_worker_fail_create_at_for_unit_test{-1};
 Preserve_trx_transfer_status enqueue_receiver_staged_token_prewarm(
     const std::string &root_dir,
     const Preserve_trx_transfer_manifest &manifest,
@@ -8367,7 +8505,24 @@ static void run_receiver_committed_epoch_prewarm_job(
 }
 
 void receiver_prewarm_worker_main() {
-  if (my_thread_init()) return;
+  const uint init_index =
+      g_receiver_prewarm_worker_init_index.fetch_add(1);
+  const int fail_init_at =
+      g_receiver_prewarm_fail_init_at_for_unit_test.load();
+  const bool init_failed =
+      fail_init_at == -2 || fail_init_at == static_cast<int>(init_index) ||
+      my_thread_init();
+  {
+    std::unique_lock<std::mutex> guard(g_receiver_prewarm_mutex);
+    g_receiver_prewarm_cv.wait(guard, [] {
+      return !g_receiver_prewarm_pause_init_report_for_unit_test;
+    });
+    ++g_receiver_prewarm_worker_init_reports;
+    if (init_failed) ++g_receiver_prewarm_worker_init_failures;
+  }
+  g_receiver_prewarm_cv.notify_all();
+  if (init_failed) return;
+  auto thread_end_guard = create_scope_guard([] { my_thread_end(); });
   for (;;) {
     Receiver_prewarm_job job;
     {
@@ -8376,7 +8531,6 @@ void receiver_prewarm_worker_main() {
         if (g_receiver_prewarm_shutdown &&
             g_receiver_staged_token_prewarm_jobs.empty() &&
             g_receiver_prewarm_jobs.empty()) {
-          my_thread_end();
           return;
         }
 
@@ -8395,7 +8549,6 @@ void receiver_prewarm_worker_main() {
           break;
         }
         if (g_receiver_prewarm_shutdown) {
-          my_thread_end();
           return;
         }
         g_receiver_prewarm_cv.wait(guard);
@@ -8443,30 +8596,117 @@ void receiver_prewarm_worker_main() {
                    Preserve_trx_promotion_adopt_status::READY_CACHE_NOT_READY);
     }
   }
-  my_thread_end();
 }
 
-Preserve_trx_transfer_status ensure_receiver_prewarm_workers_locked() {
-  if (g_receiver_prewarm_workers_started) return Preserve_trx_transfer_status::OK;
-  if (g_receiver_prewarm_shutdown) return Preserve_trx_transfer_status::UNSUPPORTED;
-  const uint worker_count = std::max<uint>(1, preserve_trx_transfer_receiver_workers);
-  try {
-    g_receiver_prewarm_workers.reserve(worker_count);
-    for (uint worker_index = 0; worker_index < worker_count; ++worker_index) {
-      g_receiver_prewarm_workers.emplace_back(receiver_prewarm_worker_main);
-    }
-  } catch (...) {
-    g_receiver_prewarm_shutdown = true;
-    g_receiver_prewarm_cv.notify_all();
-    for (std::thread &worker : g_receiver_prewarm_workers) {
-      if (worker.joinable()) worker.join();
-    }
-    g_receiver_prewarm_workers.clear();
-    g_receiver_prewarm_shutdown = false;
+Preserve_trx_transfer_status ensure_receiver_prewarm_workers_locked(
+    std::unique_lock<std::mutex> *lock, uint worker_count) {
+  if (lock == nullptr || !lock->owns_lock()) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  if (g_receiver_prewarm_shutdown) {
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
+  while (g_receiver_prewarm_workers_starting ||
+         g_receiver_prewarm_workers_stopping) {
+    g_receiver_prewarm_cv.wait(*lock);
+    if (g_receiver_prewarm_shutdown) {
+      return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
+  }
+  if (g_receiver_prewarm_workers_started) return Preserve_trx_transfer_status::OK;
+  worker_count = std::max<uint>(1, worker_count);
+  g_receiver_prewarm_workers_starting = true;
+  g_receiver_prewarm_worker_init_reports = 0;
+  g_receiver_prewarm_worker_init_failures = 0;
+  g_receiver_prewarm_worker_init_index.store(0);
+
+  std::vector<std::thread> workers;
+  auto join_workers = create_scope_guard([&] {
+    for (std::thread &worker : workers) {
+      if (worker.joinable()) worker.join();
+    }
+  });
+  bool create_failed = false;
+  try {
+    workers.reserve(worker_count);
+    for (uint worker_index = 0; worker_index < worker_count; ++worker_index) {
+      if (g_receiver_prewarm_fail_create_at_for_unit_test.load() ==
+          static_cast<int>(worker_index)) {
+        throw std::system_error(
+            std::make_error_code(std::errc::resource_unavailable_try_again));
+      }
+      workers.emplace_back(receiver_prewarm_worker_main);
+    }
+  } catch (...) {
+    create_failed = true;
+  }
+
+  if (!create_failed) {
+    g_receiver_prewarm_cv.wait(*lock, [&] {
+      return g_receiver_prewarm_worker_init_reports == workers.size();
+    });
+  }
+
+  if (create_failed || g_receiver_prewarm_worker_init_failures != 0) {
+    g_receiver_prewarm_shutdown = true;
+    lock->unlock();
+    g_receiver_prewarm_cv.notify_all();
+    join_workers.rollback();
+    lock->lock();
+    g_receiver_prewarm_shutdown = false;
+    g_receiver_prewarm_workers_starting = false;
+    g_receiver_prewarm_worker_init_reports = 0;
+    g_receiver_prewarm_worker_init_failures = 0;
+    g_receiver_prewarm_cv.notify_all();
+    return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
+  }
+
+  g_receiver_prewarm_workers.swap(workers);
+  join_workers.commit();
   g_receiver_prewarm_workers_started = true;
+  g_receiver_prewarm_workers_starting = false;
+  g_receiver_prewarm_cv.notify_all();
   return Preserve_trx_transfer_status::OK;
+}
+
+void preserve_trx_transfer_set_temporary_worker_create_failure_for_unit_test(
+    int fail_at_worker_index) {
+  g_temporary_worker_fail_create_at_for_unit_test.store(fail_at_worker_index);
+}
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_start_receiver_workers_for_unit_test(
+    uint worker_count, int fail_create_at_worker_index,
+    int fail_init_at_worker_index) {
+  g_receiver_prewarm_fail_create_at_for_unit_test.store(
+      fail_create_at_worker_index);
+  g_receiver_prewarm_fail_init_at_for_unit_test.store(
+      fail_init_at_worker_index);
+  std::unique_lock<std::mutex> lock(g_receiver_prewarm_mutex);
+  const Preserve_trx_transfer_status status =
+      ensure_receiver_prewarm_workers_locked(&lock, worker_count);
+  g_receiver_prewarm_fail_create_at_for_unit_test.store(-1);
+  g_receiver_prewarm_fail_init_at_for_unit_test.store(-1);
+  return status;
+}
+
+bool preserve_trx_transfer_receiver_workers_started_for_unit_test() {
+  std::lock_guard<std::mutex> guard(g_receiver_prewarm_mutex);
+  return g_receiver_prewarm_workers_started;
+}
+
+void preserve_trx_transfer_set_receiver_worker_init_pause_for_unit_test(
+    bool pause) {
+  {
+    std::lock_guard<std::mutex> guard(g_receiver_prewarm_mutex);
+    g_receiver_prewarm_pause_init_report_for_unit_test = pause;
+  }
+  g_receiver_prewarm_cv.notify_all();
+}
+
+bool preserve_trx_transfer_receiver_workers_starting_for_unit_test() {
+  std::lock_guard<std::mutex> guard(g_receiver_prewarm_mutex);
+  return g_receiver_prewarm_workers_starting;
 }
 
 Preserve_trx_transfer_status enqueue_receiver_prewarm_job(
@@ -8481,9 +8721,10 @@ Preserve_trx_transfer_status enqueue_receiver_prewarm_job(
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
   {
-    std::lock_guard<std::mutex> guard(g_receiver_prewarm_mutex);
+    std::unique_lock<std::mutex> guard(g_receiver_prewarm_mutex);
     const Preserve_trx_transfer_status start_status =
-        ensure_receiver_prewarm_workers_locked();
+        ensure_receiver_prewarm_workers_locked(
+            &guard, preserve_trx_transfer_receiver_workers);
     if (start_status != Preserve_trx_transfer_status::OK) return start_status;
     if (job.kind == Receiver_prewarm_job_kind::STAGED_TOKEN) {
       Receiver_staged_token_prewarm_key key =
@@ -8568,8 +8809,13 @@ Preserve_trx_transfer_status enqueue_receiver_committed_epoch_prewarm(
 void preserve_trx_transfer_shutdown_receiver_prewarm_workers() {
   std::vector<std::thread> workers;
   {
-    std::lock_guard<std::mutex> guard(g_receiver_prewarm_mutex);
+    std::unique_lock<std::mutex> guard(g_receiver_prewarm_mutex);
+    g_receiver_prewarm_cv.wait(guard, [] {
+      return !g_receiver_prewarm_workers_starting &&
+             !g_receiver_prewarm_workers_stopping;
+    });
     if (!g_receiver_prewarm_workers_started) return;
+    g_receiver_prewarm_workers_stopping = true;
     g_receiver_prewarm_shutdown = true;
     workers.swap(g_receiver_prewarm_workers);
     g_receiver_prewarm_workers_started = false;
@@ -8587,7 +8833,9 @@ void preserve_trx_transfer_shutdown_receiver_prewarm_workers() {
     g_receiver_staged_token_prewarm_deferred.clear();
     g_receiver_object_prewarm_inflight.clear();
     g_receiver_prewarm_shutdown = false;
+    g_receiver_prewarm_workers_stopping = false;
   }
+  g_receiver_prewarm_cv.notify_all();
   {
     std::lock_guard<std::mutex> guard(g_receiver_seal_prewarm_state_mutex);
     g_receiver_seal_prewarm_state.clear();
@@ -8797,22 +9045,39 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
     if (descriptor.object_id != frame.object_id) {
       return Preserve_trx_transfer_status::CORRUPT;
     }
+    Preserve_trx_transfer_manifest existing_manifest;
+    Preserve_trx_transfer_object_descriptor replaced_object;
+    bool cleanup_replaced_object = false;
     Preserve_trx_transfer_receiver_record existing_record;
     if (registry->lookup(frame.epoch_id, frame.token, &existing_record) &&
         (existing_record.state == Preserve_trx_transfer_receiver_state::DECLARED ||
          existing_record.state == Preserve_trx_transfer_receiver_state::RECEIVING)) {
-      const Preserve_trx_transfer_manifest existing_manifest =
-          receiver_record_manifest(existing_record);
-      const Preserve_trx_transfer_object_descriptor *existing_object =
-          find_object(existing_manifest, descriptor.object_id);
-      if (existing_object != nullptr &&
-          !transfer_object_descriptor_equal(*existing_object, descriptor)) {
-        status = cleanup_transfer_object_staging(root_dir, existing_manifest,
-                                                 *existing_object);
-        if (status != Preserve_trx_transfer_status::OK) return status;
+      try {
+        existing_manifest = receiver_record_manifest(existing_record);
+        const Preserve_trx_transfer_object_descriptor *existing_object =
+            find_object(existing_manifest, descriptor.object_id);
+        if (existing_object != nullptr &&
+            !transfer_object_descriptor_equal(*existing_object, descriptor)) {
+          replaced_object = *existing_object;
+          cleanup_replaced_object = true;
+        }
+      } catch (...) {
+        return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
       }
     }
-    return registry->declare_object(frame.epoch_id, frame.token, descriptor);
+    status = registry->declare_object(frame.epoch_id, frame.token, descriptor);
+    if (status != Preserve_trx_transfer_status::OK ||
+        !cleanup_replaced_object) {
+      return status;
+    }
+    status = cleanup_transfer_object_staging(root_dir, existing_manifest,
+                                             replaced_object);
+    if (status == Preserve_trx_transfer_status::OK) return status;
+    const Preserve_trx_transfer_status mark_status = registry->mark_corrupt(
+        frame.epoch_id, frame.token,
+        "replacement_object_cleanup_failed:" + transfer_status_name(status));
+    return mark_status == Preserve_trx_transfer_status::OK ? status
+                                                           : mark_status;
   }
 
   if (frame.type == Preserve_trx_transfer_frame_type::BEGIN) {
@@ -8833,27 +9098,48 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
     if (inflight_bytes > preserve_trx_transfer_max_inflight_bytes) {
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
+    Preserve_trx_transfer_manifest existing_manifest;
+    std::vector<Preserve_trx_transfer_object_descriptor> objects_to_cleanup;
     Preserve_trx_transfer_receiver_record existing_record;
     if (registry->lookup(frame.epoch_id, frame.token, &existing_record) &&
         (existing_record.state == Preserve_trx_transfer_receiver_state::DECLARED ||
          existing_record.state == Preserve_trx_transfer_receiver_state::RECEIVING)) {
-      const Preserve_trx_transfer_manifest existing_manifest =
-          receiver_record_manifest(existing_record);
-      for (const Preserve_trx_transfer_object_descriptor &existing_object :
-           existing_manifest.objects) {
-        const Preserve_trx_transfer_object_descriptor *replacement =
-            find_object(manifest, existing_object.object_id);
-        if (replacement != nullptr &&
-            transfer_object_descriptor_equal(*replacement, existing_object)) {
-          continue;
+      try {
+        existing_manifest = receiver_record_manifest(existing_record);
+        objects_to_cleanup.reserve(existing_manifest.objects.size());
+        for (const Preserve_trx_transfer_object_descriptor &existing_object :
+             existing_manifest.objects) {
+          const Preserve_trx_transfer_object_descriptor *replacement =
+              find_object(manifest, existing_object.object_id);
+          if (replacement != nullptr &&
+              transfer_object_descriptor_equal(*replacement,
+                                               existing_object)) {
+            continue;
+          }
+          objects_to_cleanup.push_back(existing_object);
         }
-        status = cleanup_transfer_object_staging(root_dir, existing_manifest,
-                                                 existing_object);
-        if (status != Preserve_trx_transfer_status::OK) return status;
+      } catch (...) {
+        return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
       }
     }
-    status = registry->begin_receive(manifest, inflight_bytes);
+    status = registry->begin_receive(manifest, frame.manifest_payload.length());
     if (status == Preserve_trx_transfer_status::OK) {
+      for (const Preserve_trx_transfer_object_descriptor &existing_object :
+           objects_to_cleanup) {
+        const Preserve_trx_transfer_status cleanup_status =
+            cleanup_transfer_object_staging(root_dir, existing_manifest,
+                                            existing_object);
+        if (cleanup_status != Preserve_trx_transfer_status::OK) {
+          const Preserve_trx_transfer_status mark_status =
+              registry->mark_corrupt(
+                  frame.epoch_id, frame.token,
+                  "replacement_begin_cleanup_failed:" +
+                      transfer_status_name(cleanup_status));
+          return mark_status == Preserve_trx_transfer_status::OK
+                     ? cleanup_status
+                     : mark_status;
+        }
+      }
       Preserve_trx_transfer_receiver_record record_after_begin;
       if (registry->lookup(frame.epoch_id, frame.token, &record_after_begin)) {
         const Preserve_trx_transfer_manifest begin_manifest =
@@ -9307,6 +9593,8 @@ Preserve_trx_transfer_status apply_receiver_frame_segment_with_workers(
   const size_t actual_workers =
       std::min<size_t>(std::max<uint>(1, worker_count), token_order.size());
   std::atomic<size_t> next_token{0};
+  std::atomic<bool> workers_released{false};
+  std::atomic<bool> worker_abort{false};
   std::mutex status_mutex;
   Preserve_trx_transfer_status first_status =
       Preserve_trx_transfer_status::OK;
@@ -9320,7 +9608,11 @@ Preserve_trx_transfer_status apply_receiver_frame_segment_with_workers(
   };
 
   auto worker = [&]() {
+    while (!workers_released.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
     for (;;) {
+      if (worker_abort.load(std::memory_order_acquire)) break;
       const size_t token_index = next_token.fetch_add(1);
       if (token_index >= token_order.size()) break;
 
@@ -9346,13 +9638,27 @@ Preserve_trx_transfer_status apply_receiver_frame_segment_with_workers(
   };
 
   std::vector<std::thread> workers;
-  workers.reserve(actual_workers);
-  for (size_t i = 0; i < actual_workers; ++i) {
-    workers.emplace_back(worker);
+  auto join_workers = create_scope_guard([&] {
+    for (std::thread &thread : workers) {
+      if (thread.joinable()) thread.join();
+    }
+  });
+  try {
+    workers.reserve(actual_workers);
+    for (size_t i = 0; i < actual_workers; ++i) {
+      if (g_temporary_worker_fail_create_at_for_unit_test.load() ==
+          static_cast<int>(i)) {
+        throw std::system_error(
+            std::make_error_code(std::errc::resource_unavailable_try_again));
+      }
+      workers.emplace_back(worker);
+    }
+  } catch (...) {
+    worker_abort.store(true, std::memory_order_release);
+    remember_failure(Preserve_trx_transfer_status::RESOURCE_EXHAUSTED);
   }
-  for (std::thread &thread : workers) {
-    thread.join();
-  }
+  workers_released.store(true, std::memory_order_release);
+  join_workers.rollback();
   return first_status;
 }
 

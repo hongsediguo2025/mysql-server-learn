@@ -48,6 +48,7 @@
 #include "sql/preserve_trx.h"
 #include "sql/sql_class.h"
 #include "my_dbug.h"
+#include "scope_guard.h"
 #include "sha2.h"
 #include "storage/innobase/include/lock0warmcopy.h"
 #include "storage/innobase/include/trx0preserve.h"
@@ -2004,21 +2005,47 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
     }
   } else {
     std::atomic<size_t> next_target_index{0};
+    std::atomic<bool> workers_released{false};
+    std::atomic<bool> worker_abort{false};
+    std::atomic<bool> worker_failed{false};
     std::vector<std::thread> workers;
-    workers.reserve(seal_worker_count);
-    for (uint32_t worker_index = 0; worker_index < seal_worker_count;
-         ++worker_index) {
-      workers.emplace_back([&]() {
-        for (;;) {
-          const size_t target_index =
-              next_target_index.fetch_add(1, std::memory_order_relaxed);
-          if (target_index >= m_target_thread_ids.size()) break;
-          seal_record_for_index(target_index);
-        }
-      });
+    auto join_workers = create_scope_guard([&] {
+      for (std::thread &worker : workers) {
+        if (worker.joinable()) worker.join();
+      }
+    });
+    bool worker_creation_failed = false;
+    try {
+      workers.reserve(seal_worker_count);
+      for (uint32_t worker_index = 0; worker_index < seal_worker_count;
+           ++worker_index) {
+        workers.emplace_back([&]() {
+          while (!workers_released.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+          }
+          for (;;) {
+            if (worker_abort.load(std::memory_order_acquire)) break;
+            const size_t target_index =
+                next_target_index.fetch_add(1, std::memory_order_relaxed);
+            if (target_index >= m_target_thread_ids.size()) break;
+            try {
+              seal_record_for_index(target_index);
+            } catch (...) {
+              worker_failed.store(true, std::memory_order_relaxed);
+              worker_abort.store(true, std::memory_order_release);
+              break;
+            }
+          }
+        });
+      }
+    } catch (...) {
+      worker_creation_failed = true;
+      worker_abort.store(true, std::memory_order_release);
     }
-    for (std::thread &worker : workers) {
-      worker.join();
+    workers_released.store(true, std::memory_order_release);
+    join_workers.rollback();
+    if (worker_creation_failed || worker_failed.load(std::memory_order_relaxed)) {
+      return false;
     }
   }
   const ulonglong lock_seal_finished_us = my_micro_time();
