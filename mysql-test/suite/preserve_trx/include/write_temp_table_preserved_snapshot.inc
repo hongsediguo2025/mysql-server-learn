@@ -217,11 +217,29 @@ my $session_state =
   chr(0) .
   chr(0);
 my $no_cache_metadata = le16(1) . le16(0) . le16(0);
+my $semantic_contract =
+  le16(1) .                       # semantic contract version
+  chr(2) .                        # TEMP_ONLY
+  chr(2) .                        # has temp engine state
+  chr(2) .                        # ROW binlog format
+  chr(7) .                        # FK, unique and autocommit enabled
+  le16(0) .
+  le64(1) .                       # auto_increment_increment
+  le64(1);                        # auto_increment_offset
+my $savepoint_topology =
+  le16(1) .                       # topology version
+  le16(0) .                       # participant count
+  le32(0);                        # savepoint count
+my $tx_access_mode = chr(0) . chr(0);
+my $autoinc_state = chr(0) . chr(0) . le64(0);
 my $payload =
   tlv(0x10, 'no-cache') .
   tlv(0x11, le32(0)) .
   tlv(0x50, $session_state) .
-  tlv(0x62, chr(0)) .
+  tlv(0x53, $tx_access_mode) .
+  tlv(0x54, $semantic_contract) .
+  tlv(0x42, $savepoint_topology) .
+  tlv(0x62, $autoinc_state) .
   tlv(0x51, le32(0)) .
   tlv(0x61, $no_cache_metadata) .
   tlv(0x80, $manifest);
@@ -229,7 +247,7 @@ my $payload =
 my $header_len = 552;
 my $snapshot = "\0" x ($header_len + length($payload));
 substr($snapshot, 0, 8) = 'MSP_PRES';
-substr($snapshot, 8, 2) = le16(8);
+substr($snapshot, 8, 2) = le16(9);
 substr($snapshot, 10, 2) = le16($header_len);
 substr($snapshot, 12, 4) = le32($mysql_version_id);
 substr($snapshot, 16, 4) = le32(0);
@@ -262,4 +280,39 @@ open(my $sh, '>:raw', File::Spec->catfile($preserve_dir, "$token.bin"))
   or die "cannot write snapshot: $!";
 print {$sh} $snapshot;
 close($sh);
+
+my $identity =
+  "PTRX_SNAPSHOT_IDENTITY_V1\n" .
+  length($token) . ":$token\n" .
+  length('root') . ":root\n" .
+  length('localhost') . ":localhost\n" .
+  "$created_at\n" .
+  ($created_at + 300 * 1000000) . "\n" .
+  "2\n0\n1\n0\n";
+my $identity_digest = unpack('H*', hmac_sha256($identity, $key));
+my $generation = substr(unpack('H*', sha256("test-generation:$token")), 0, 32);
+my $ledger_path = File::Spec->catfile($preserve_dir, '.xid_provenance');
+my %provenance;
+if (-e $ledger_path) {
+  open(my $lh, '<:raw', $ledger_path) or die "cannot read $ledger_path: $!";
+  while (my $line = <$lh>) {
+    chomp($line);
+    next if $line eq 'PTRX_XID_PROVENANCE_LEDGER_V1' ||
+            $line =~ /^hmac / || $line eq '';
+    $line =~ /^(\S+) B ([0-9a-f]{32}) ([0-9a-f]{64})$/
+      or die "invalid existing provenance record: $line";
+    $provenance{$1} = [$2, $3];
+  }
+  close($lh);
+}
+$provenance{$token} = [$generation, $identity_digest];
+my $ledger_body = "PTRX_XID_PROVENANCE_LEDGER_V1\n";
+for my $ledger_token (sort keys %provenance) {
+  $ledger_body .= "$ledger_token B $provenance{$ledger_token}[0] " .
+                  "$provenance{$ledger_token}[1]\n";
+}
+my $ledger_hmac = unpack('H*', hmac_sha256($ledger_body, $key));
+open(my $lh, '>:raw', $ledger_path) or die "cannot write $ledger_path: $!";
+print {$lh} $ledger_body, "hmac $ledger_hmac\n";
+close($lh);
 EOF
