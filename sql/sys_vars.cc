@@ -1493,7 +1493,7 @@ static Sys_var_uint Sys_preserve_trx_transfer_chunk_bytes(
     "Target chunk size in bytes for Preserve/Resume standby direct-transfer "
     "object payloads.",
     GLOBAL_VAR(preserve_trx_transfer_chunk_bytes), CMD_LINE(REQUIRED_ARG),
-    VALID_RANGE(1, UINT_MAX32), DEFAULT(1048576), BLOCK_SIZE(1),
+    VALID_RANGE(1, 1048576), DEFAULT(1048576), BLOCK_SIZE(1),
     NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
 static Sys_var_ulonglong Sys_preserve_trx_transfer_max_inflight_bytes(

@@ -181,7 +181,15 @@ enum class Preserve_trx_transfer_status {
   INVALID_ARGUMENT,
   CORRUPT,
   IO_ERROR,
-  UNSUPPORTED
+  UNSUPPORTED,
+  RESOURCE_EXHAUSTED,
+  ACK_UNCERTAIN
+};
+
+enum class Preserve_trx_transfer_sequence_admission {
+  NEW_FRAME,
+  RETRY_PENDING,
+  ALREADY_APPLIED
 };
 
 struct Preserve_trx_transfer_phase1_blob_request {
@@ -323,6 +331,15 @@ struct Preserve_trx_transfer_frame {
   std::string reason;
 };
 
+struct Preserve_trx_transfer_frame_ack {
+  std::string source_incarnation_id;
+  std::string epoch_id;
+  uint64_t sequence{0};
+  std::array<unsigned char, kPreservedTrxSha256Length> frame_digest{};
+  Preserve_trx_transfer_status status{Preserve_trx_transfer_status::OK};
+  std::array<unsigned char, kPreservedTrxSha256Length> hmac{};
+};
+
 enum class Preserve_trx_transfer_receiver_state {
   DECLARED,
   RECEIVING,
@@ -379,6 +396,16 @@ class Preserve_trx_transfer_receiver_registry {
       const std::string &object_id);
   Preserve_trx_transfer_status consume_frame_sequence(
       const std::string &epoch_id, uint64_t sequence);
+  Preserve_trx_transfer_status admit_frame_sequence(
+      const std::string &epoch_id, uint64_t sequence,
+      const std::array<unsigned char, kPreservedTrxSha256Length> &digest,
+      Preserve_trx_transfer_sequence_admission *admission);
+  void mark_frame_sequence_applied(const std::string &epoch_id,
+                                   uint64_t sequence);
+  void mark_frame_sequence_corrupt(const std::string &epoch_id,
+                                   uint64_t sequence);
+  bool frame_sequence_applied(const std::string &epoch_id,
+                              uint64_t sequence) const;
   void rollback_frame_sequence(const std::string &epoch_id,
                                uint64_t sequence);
   bool all_objects_sealed(const std::string &epoch_id,
@@ -403,6 +430,13 @@ class Preserve_trx_transfer_receiver_registry {
   mutable std::mutex m_mutex;
   std::map<Token_key, Preserve_trx_transfer_receiver_record> m_records;
   std::map<std::string, uint64_t> m_next_sequence_by_epoch;
+  struct Frame_sequence_record {
+    std::array<unsigned char, kPreservedTrxSha256Length> digest{};
+    bool applied{false};
+    bool corrupt{false};
+  };
+  std::map<std::pair<std::string, uint64_t>, Frame_sequence_record>
+      m_frame_sequences;
 };
 
 Preserve_trx_transfer_status preserve_trx_transfer_encode_manifest(
@@ -422,6 +456,30 @@ Preserve_trx_transfer_status preserve_trx_transfer_encode_frame(
 
 Preserve_trx_transfer_status preserve_trx_transfer_decode_frame(
     const std::string &encoded, Preserve_trx_transfer_frame *frame);
+
+Preserve_trx_transfer_status preserve_trx_transfer_encode_frame_batch(
+    const std::vector<std::string> &encoded_frames,
+    std::string *encoded_batch);
+
+Preserve_trx_transfer_status preserve_trx_transfer_decode_frame_batch(
+    const std::string &encoded_batch,
+    std::vector<std::string> *encoded_frames);
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_validate_online_payload_identity(
+    const std::string &encoded_payload, std::string *source_incarnation_id,
+    std::string *epoch_id, uint64_t *last_sequence);
+
+Preserve_trx_transfer_status preserve_trx_transfer_build_frame_ack(
+    const std::string &source_incarnation_id,
+    const std::string &encoded_payload, Preserve_trx_transfer_status status,
+    Preserve_trx_transfer_frame_ack *ack);
+Preserve_trx_transfer_status preserve_trx_transfer_encode_frame_ack(
+    const Preserve_trx_transfer_frame_ack &ack, std::string *encoded);
+Preserve_trx_transfer_status preserve_trx_transfer_verify_frame_ack(
+    const std::string &encoded_ack,
+    const std::string &expected_source_incarnation_id,
+    const std::string &encoded_payload, Preserve_trx_transfer_frame_ack *ack);
 
 Preserve_trx_transfer_status preserve_trx_transfer_validate_receiver_manifest(
     const Preserve_trx_transfer_manifest &manifest,
@@ -549,7 +607,8 @@ class Preserve_trx_transfer_source_epoch_session {
   Preserve_trx_transfer_status emit_frame_locked(
       Preserve_trx_transfer_frame frame, bool queue_final_metadata);
   Preserve_trx_transfer_status send_phase1_control_batches_locked(
-      const std::vector<std::string> &encoded_frames);
+      const std::vector<std::string> &encoded_frames,
+      size_t *acknowledged_frame_count);
   Preserve_trx_transfer_status abort_token_locked(uint64_t transfer_token,
                                                   const std::string &reason,
                                                   bool allow_finalized);
@@ -619,6 +678,16 @@ struct Preserve_trx_transfer_client_ops {
 
 void preserve_trx_transfer_set_client_ops_for_unit_test(
     const Preserve_trx_transfer_client_ops *ops);
+std::string preserve_trx_transfer_qualify_epoch_id(
+    const std::string &epoch_id);
+std::string preserve_trx_transfer_source_incarnation_id_for_unit_test();
+std::string preserve_trx_transfer_qualify_epoch_id_for_unit_test(
+    const std::string &epoch_id);
+void preserve_trx_transfer_set_spool_short_write_for_unit_test(bool enabled);
+void preserve_trx_transfer_set_spool_rollback_failure_for_unit_test(
+    bool enabled);
+bool preserve_trx_transfer_frame_batch_count_fits_payload(
+    uint32_t count, size_t remaining_bytes);
 
 using Preserve_trx_transfer_codec_context_provider =
     bool (*)(Preserved_trx_codec_context *context);

@@ -13094,8 +13094,13 @@ bool Preserve_trx_drain_service::execute(
     }
 
     const std::string batch_transfer_epoch_id =
-        "batch-" + std::to_string(generation) + "-" +
-        std::to_string(preserve_trx_monotonic_us());
+        preserve_trx_transfer_qualify_epoch_id(
+            "batch-" + std::to_string(generation) + "-" +
+            std::to_string(preserve_trx_monotonic_us()));
+    if (batch_transfer_epoch_id.empty()) {
+      abort_drain_participants("standby_transfer_source_incarnation_failed");
+      return true;
+    }
     const std::string source_server_uuid(server_uuid);
     const std::string target_server_uuid =
         preserve_trx_transfer_target_server_uuid == nullptr

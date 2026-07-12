@@ -197,12 +197,12 @@ die "THD::release_resources must wait for preserve external THD pins before rele
          $release_resources_body =~
      /m_release_resources_done\s*=\s*true[\s\S]*preserved_trx_end_external_thd_teardown\s*\(\s*this\s*\)/s;
 my ($receiver_payload_batch) =
-  $transfer =~ /(preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*?return\s+preserve_trx_transfer_apply_receiver_frame_batch_with_workers[\s\S]*?;\n})/s
+  $transfer =~ /(Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch\([\s\S]*?^})/m
   or die "could not isolate standby receiver encoded payload batch path\n";
-die "standby receiver encoded payload batch path must use receiver worker_count after durable sequence admission\n"
+die "standby receiver encoded payload batch path must apply admitted frames before acknowledging them\n"
   unless $receiver_payload_batch !~ /\(void\)\s*worker_count\s*;/ &&
          $receiver_payload_batch =~ /worker_count/s &&
-         $receiver_payload_batch =~ /pre_admit_receiver_batch_sequence/s &&
+         $receiver_payload_batch =~ /pre_admit_receiver_batch_sequence[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers[\s\S]*after_spool/s &&
          $receiver_payload_batch =~ /preserve_trx_transfer_apply_receiver_frame_batch_with_workers\(\s*frames,\s*(?:worker_count|written_metadata\s*==\s*nullptr\s*\?\s*worker_count\s*:\s*1)/s;
 my ($receiver_apply_frame) =
   $transfer =~ /(Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame[\s\S]*?^}\n\nPreserve_trx_transfer_status preserve_trx_transfer_replay_receiver_spool)/m
@@ -370,9 +370,9 @@ die "standby phase1 control frames must use batch source-session APIs\n"
 my ($receiver_dispatch_command) =
   $transfer =~ /(void preserve_trx_transfer_dispatch_command\(THD \*thd\)[\s\S]*?^}\n\nPreserve_snapshot_status Preserve_trx_local_carrier_artifact_sink::publish_bundle)/m
   or die "could not isolate standby receiver COM dispatch path\n";
-die "standby receiver single COMMIT_EPOCH frame must use durable spool ACK instead of synchronous final publish\n"
+die "standby receiver single sequence frame must use the authenticated spool/apply ACK path\n"
   unless $receiver_dispatch_command =~
-     /decoded_frame\.type\s*==\s*Preserve_trx_transfer_frame_type::COMMIT_EPOCH[\s\S]*preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*send_receiver_durable_spool_ack/s;
+     /receiver_frame_should_spool\s*\(\s*decoded_frame\.type\s*\)[\s\S]*preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*send_receiver_durable_spool_ack/s;
 die "standby streaming transfer must abort phase1-declared tokens that are not in the final quiesced target set\n"
   unless $preserve =~ /abort_phase1_transfer_targets_not_quiesced/s;
 die "standby streaming transfer must re-sweep phase1 target declarations before object streaming\n"
@@ -2212,6 +2212,41 @@ die "standby transfer credential buffers must be cleansed after use\n"
 die "standby transfer production source client must send frames through COM_PRESERVE_TRX_TRANSFER\n"
   unless $transfer =~
          /default_transfer_client_send[\s\S]*simple_command[\s\S]*COM_PRESERVE_TRX_TRANSFER/s;
+die "standby transfer production source epochs must include a per-start incarnation\n"
+  unless $preserve =~ /preserve_trx_transfer_qualify_epoch_id/s &&
+         $transfer =~ /my_rand_buffer[\s\S]*transfer_source_incarnation_id/s;
+die "standby transfer default client must verify the authenticated receiver ACK\n"
+  unless $transfer =~
+         /default_transfer_client_send[\s\S]*preserve_trx_transfer_verify_frame_ack/s &&
+         $transfer =~ /HMAC\s*\([\s\S]*EVP_sha256/s;
+die "standby transfer source must pin an unconfirmed payload until its exact ACK arrives\n"
+  unless $transfer =~
+         /m_uncertain_payload[\s\S]*m_uncertain_payload\s*!=\s*encoded_frame[\s\S]*ACK_UNCERTAIN/s;
+die "standby transfer receiver must validate source incarnation and batch order before creating store side effects\n"
+  unless $receiver_dispatch_command =~
+         /preserve_trx_transfer_validate_online_payload_identity[\s\S]*create_preserved_trx_default_store/s;
+die "standby transfer receiver retries must bind sequence admission to frame digest\n"
+  unless $transfer =~
+         /admit_frame_sequence[\s\S]*Frame_sequence_record[\s\S]*digest/s &&
+         $transfer =~ /ALREADY_APPLIED[\s\S]*RETRY_PENDING/s;
+die "standby transfer batch decoder must validate count against remaining bytes before reserve\n"
+  unless $transfer =~
+         /preserve_trx_transfer_decode_frame_batch[\s\S]*count_fits_payload[\s\S]*acquire_transfer_decode_memory_lease[\s\S]*reserve\s*\(\s*count\s*\)/s &&
+         $transfer =~
+         /preserve_trx_transfer_decode_manifest[\s\S]*kMinEncodedObjectBytes[\s\S]*acquire_transfer_decode_memory_lease[\s\S]*reserve\s*\(\s*object_count\s*\)/s;
+die "standby transfer online handler must retain aggregate decoded payload accounting through apply and ACK\n"
+  unless $receiver_payload_batch =~
+         /payload_lease[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers[\s\S]*after_spool/s;
+die "standby transfer unconfirmed short-write rollback must taint sequence admission\n"
+  unless $transfer =~
+         /rollback_confirmed[\s\S]*Preserve_trx_transfer_status::CORRUPT/s &&
+         $transfer =~ /mark_frame_sequence_corrupt/s;
+die "standby transfer online SEAL must keep external objects epoch-scoped instead of flat-token preinstall\n"
+  if $transfer =~
+     /case\s+Preserve_trx_transfer_frame_type::SEAL_OBJECT:[\s\S]*?install_receiver_sealed_external_object[\s\S]*?break\s*;/s;
+die "standby transfer chunk sysvar must not exceed the 1MiB frame codec boundary\n"
+  unless $sys_vars =~
+         /Sys_preserve_trx_transfer_chunk_bytes[\s\S]*VALID_RANGE\s*\(\s*1\s*,\s*1048576\s*\)/s;
 die "standby transfer source publication must be selected only by artifact mode, not by a duplicate source enable sysvar\n"
   if $sys_vars =~ /preserve_trx_transfer_enable/s ||
      $transfer =~ /preserve_trx_transfer_enable/s ||
@@ -2269,7 +2304,8 @@ die "standby promotion Phase C must use transfer manifest protocol version 3\n"
          /kPreserveTrxTransferProtocolVersion\s*=\s*3\s*;/s &&
          $transfer_header =~ /source_prepare_lsn/s &&
          $transfer_header =~ /source_epoch_commit_lsn/s &&
-         $transfer =~ /parsed\.protocol_version\s*!=\s*2/s;
+         $transfer =~
+         /parsed\.protocol_version\s*!=\s*kPreserveTrxTransferProtocolVersion/s;
 die "standby promotion Phase A must expose a single promotion adopt entry point\n"
   unless $promotion =~
          /preserved_trx_adopt_standby_pending_all_for_promotion/s;
