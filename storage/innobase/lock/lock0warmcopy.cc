@@ -57,6 +57,8 @@ extern uint preserve_trx_lock_warmcopy_conversion_wait_timeout_ms;
 namespace {
 std::atomic<uint64_t> lock_warmcopy_observed_hook_events{0};
 std::atomic<uint64_t> lock_warmcopy_conversion_freeze_waits{0};
+std::atomic<uint64_t> lock_warmcopy_max_journal_bytes{
+    std::numeric_limits<uint64_t>::max()};
 constexpr uint64_t k_lock_warmcopy_default_target_id = 0;
 
 template <typename IsFrozen, typename ShouldAbort>
@@ -150,6 +152,7 @@ struct lock_warmcopy_record_store_partition_t {
     otherwise parseable.
   */
   std::map<uint64_t, uint64_t> expected_delta_sequence_by_target;
+  std::map<uint64_t, uint64_t> journal_bytes_by_target;
   /*
     Target-level invalidation diagnostic. Once present, SQL must route the target
     through live export or reject it; the string is best-effort reporting detail,
@@ -491,6 +494,34 @@ uint64_t record_journal_delta_bytes(
       encoded_record_image == nullptr ? 0 : encoded_record_image->size());
 }
 
+bool record_target_is_invalid_locked(uint64_t target_id);
+void mark_record_target_invalid_locked(uint64_t target_id,
+                                       uint64_t journal_cursor,
+                                       const char *reason);
+
+bool record_target_admit_journal_delta_locked(uint64_t target_id,
+                                              uint64_t bytes) {
+  auto &partition = record_store_partition_for_target(target_id);
+  if (record_target_is_invalid_locked(target_id)) return false;
+
+  const uint64_t limit =
+      lock_warmcopy_max_journal_bytes.load(std::memory_order_acquire);
+  const auto found = partition.journal_bytes_by_target.find(target_id);
+  const uint64_t used =
+      found == partition.journal_bytes_by_target.end() ? 0 : found->second;
+  if (bytes > limit || used > limit - bytes) {
+    mark_record_target_invalid_locked(target_id, 0,
+                                      "record_journal_budget_exceeded");
+    return false;
+  }
+  if (found == partition.journal_bytes_by_target.end()) {
+    partition.journal_bytes_by_target.emplace(target_id, bytes);
+  } else {
+    found->second = used + bytes;
+  }
+  return true;
+}
+
 void add_record_shard_journal_bytes_locked(
     lock_warmcopy_record_shard_state_t *shard, uint64_t bytes) {
   shard->journal_bytes = saturating_add_u64(shard->journal_bytes, bytes);
@@ -625,6 +656,11 @@ bool record_bitmap_set_locked(
     then reject a target on any sequence gap or fence change instead of trying
     to reconstruct missing lock mutations.
   */
+  const uint64_t journal_delta =
+      record_journal_delta_bytes(encoded_record_image);
+  if (!record_target_admit_journal_delta_locked(target_id, journal_delta)) {
+    return false;
+  }
   const uint64_t journal_cursor =
       next_record_journal_sequence_for_target_locked(target_id);
   lock_warmcopy_record_shard_state_t &shard =
@@ -660,8 +696,7 @@ bool record_bitmap_set_locked(
   shard.shard_state_flags &= ~LOCK_WARMCOPY_RECORD_SHARD_TOMBSTONE;
   refresh_missing_record_image_flag(&shard);
   ++shard.mutation_generation;
-  add_record_shard_journal_bytes_locked(
-      &shard, record_journal_delta_bytes(encoded_record_image));
+  add_record_shard_journal_bytes_locked(&shard, journal_delta);
   shard.journal_cursor = journal_cursor;
   shard.last_applied_journal_seq = journal_cursor;
   normalize_record_bitmap(&shard.normalized_bitmap, shard.key.n_bits);
@@ -673,6 +708,10 @@ bool record_bitmap_set_locked(
 bool record_bitmap_reset_locked(uint64_t target_id,
                                 const lock_warmcopy_record_shard_key_t &key,
                                 uint32_t heap_no) {
+  const uint64_t journal_delta = record_journal_delta_bytes(nullptr);
+  if (!record_target_admit_journal_delta_locked(target_id, journal_delta)) {
+    return false;
+  }
   const uint64_t journal_cursor =
       next_record_journal_sequence_for_target_locked(target_id);
   lock_warmcopy_record_shard_state_t &shard =
@@ -695,8 +734,7 @@ bool record_bitmap_reset_locked(uint64_t target_id,
   shard.shard_state_flags |= LOCK_WARMCOPY_RECORD_SHARD_DIRTY;
   refresh_missing_record_image_flag(&shard);
   ++shard.mutation_generation;
-  add_record_shard_journal_bytes_locked(
-      &shard, record_journal_delta_bytes(nullptr));
+  add_record_shard_journal_bytes_locked(&shard, journal_delta);
   shard.journal_cursor = journal_cursor;
   shard.last_applied_journal_seq = journal_cursor;
   normalize_record_bitmap(&shard.normalized_bitmap, shard.key.n_bits);
@@ -708,6 +746,11 @@ bool record_bitmap_reset_locked(uint64_t target_id,
 bool record_lock_discard_locked(uint64_t target_id,
                                 const lock_warmcopy_record_shard_key_t &key) {
   if (record_bitmap_len(key.n_bits) == 0) return false;
+
+  const uint64_t journal_delta = record_journal_delta_bytes(nullptr);
+  if (!record_target_admit_journal_delta_locked(target_id, journal_delta)) {
+    return false;
+  }
 
   const uint64_t journal_cursor =
       next_record_journal_sequence_for_target_locked(target_id);
@@ -723,8 +766,7 @@ bool record_lock_discard_locked(uint64_t target_id,
                             LOCK_WARMCOPY_RECORD_SHARD_TOMBSTONE;
   shard.last_diagnostic_reason = "record_lock_discard";
   ++shard.mutation_generation;
-  add_record_shard_journal_bytes_locked(&shard,
-                                        record_journal_delta_bytes(nullptr));
+  add_record_shard_journal_bytes_locked(&shard, journal_delta);
   shard.journal_cursor = journal_cursor;
   shard.last_applied_journal_seq = journal_cursor;
   update_record_shard_rolling_fingerprint_locked(&shard, 9, 0, nullptr, 0);
@@ -748,6 +790,13 @@ bool apply_record_journal_delta_locked(
   if (journal_sequence > expected_sequence) {
     mark_record_target_invalid_locked(target_id, journal_sequence,
                                       "journal_seq_gap");
+    expected_sequence = journal_sequence + 1;
+    return false;
+  }
+
+  const uint64_t journal_delta =
+      record_journal_delta_bytes(encoded_record_image);
+  if (!record_target_admit_journal_delta_locked(target_id, journal_delta)) {
     expected_sequence = journal_sequence + 1;
     return false;
   }
@@ -821,8 +870,7 @@ bool apply_record_journal_delta_locked(
   }
 
   ++shard.mutation_generation;
-  add_record_shard_journal_bytes_locked(
-      &shard, record_journal_delta_bytes(encoded_record_image));
+  add_record_shard_journal_bytes_locked(&shard, journal_delta);
   shard.journal_cursor = journal_sequence;
   shard.last_applied_journal_seq = journal_sequence;
   normalize_record_bitmap(&shard.normalized_bitmap, shard.key.n_bits);
@@ -1093,12 +1141,14 @@ struct lock_warmcopy_prepare_guard_t {
   locksys::Global_exclusive_latch_guard guard;
 };
 
-void lock_warmcopy_open_epoch(uint64_t epoch) {
+void lock_warmcopy_open_epoch(uint64_t epoch, uint64_t max_journal_bytes) {
   /*
     Epoch zero means hooks are disabled. A non-zero epoch admits lightweight
     record-hook bookkeeping; target selection and final seal still decide
     whether any observed state is usable.
   */
+  lock_warmcopy_max_journal_bytes.store(max_journal_bytes,
+                                        std::memory_order_release);
   lock_warmcopy_epoch.store(epoch == 0 ? 1 : epoch, std::memory_order_release);
 }
 
@@ -1316,6 +1366,8 @@ lock_warmcopy_debug_stats_t lock_warmcopy_debug_stats_for_unit_test() {
 
 void lock_warmcopy_reset_for_unit_test() {
   lock_warmcopy_close_epoch();
+  lock_warmcopy_max_journal_bytes.store(
+      std::numeric_limits<uint64_t>::max(), std::memory_order_release);
   lock_warmcopy_observed_hook_events.store(0, std::memory_order_relaxed);
   lock_warmcopy_conversion_freeze_waits.store(0, std::memory_order_relaxed);
   lock_warmcopy_record_store_reset_for_unit_test();
@@ -1566,6 +1618,7 @@ void lock_warmcopy_record_store_clear_for_target(uint64_t target_id) {
   partition.store_by_target.erase(target_id);
   partition.journal_sequence_by_target.erase(target_id);
   partition.expected_delta_sequence_by_target.erase(target_id);
+  partition.journal_bytes_by_target.erase(target_id);
   partition.target_invalid_reason_by_target.erase(target_id);
 }
 
@@ -2059,8 +2112,17 @@ void lock_warmcopy_record_store_reset_for_unit_test() {
     partition.store_by_target.clear();
     partition.journal_sequence_by_target.clear();
     partition.expected_delta_sequence_by_target.clear();
+    partition.journal_bytes_by_target.clear();
     partition.target_invalid_reason_by_target.clear();
   }
+}
+
+uint64_t lock_warmcopy_record_store_journal_bytes_for_target_for_unit_test(
+    uint64_t target_id) {
+  auto &partition = record_store_partition_for_target(target_id);
+  std::lock_guard<std::mutex> guard(partition.mutex);
+  const auto found = partition.journal_bytes_by_target.find(target_id);
+  return found == partition.journal_bytes_by_target.end() ? 0 : found->second;
 }
 
 void lock_warmcopy_trx_conversion_freeze_for_unit_test(

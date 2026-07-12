@@ -363,7 +363,22 @@ enum class Preserve_trx_preserve_stage {
   COMPLETE
 };
 
+struct Preserve_trx_source_rollback_image {
+  std::string preserve_dir;
+  Mysql_binlog_preserve_snapshot binlog_snapshot;
+  PrebuiltBinlogCacheBlob prebuilt_binlog_blob;
+  bool has_prebuilt_binlog_blob{false};
+};
+
 struct Preserve_trx_preserve_result {
+  Preserve_trx_preserve_result() = default;
+  Preserve_trx_preserve_result(const Preserve_trx_preserve_result &) = delete;
+  Preserve_trx_preserve_result &operator=(
+      const Preserve_trx_preserve_result &) = delete;
+  Preserve_trx_preserve_result(Preserve_trx_preserve_result &&) noexcept =
+      default;
+  Preserve_trx_preserve_result &operator=(
+      Preserve_trx_preserve_result &&) noexcept = default;
   /*
     Result and ownership boundary for one target. token is allocated before
     engine prepare so later stages can name the snapshot, but it is not
@@ -422,6 +437,7 @@ struct Preserve_trx_preserve_result {
   const char *reactivate_failure_reason{nullptr};
   /* True when binlog cache semantics were logged into the snapshot. */
   bool logged_binlog_cache{false};
+  std::unique_ptr<Preserve_trx_source_rollback_image> source_rollback_image;
 };
 
 /*
@@ -513,6 +529,11 @@ bool preserved_trx_binlog_format_is_supported(ulong binlog_format);
 bool preserved_trx_startup_record_lock_pages_prewarmed_for_unit_test(
     uint64_t record_lock_page_count, uint64_t prefetch_submitted_pages,
     uint64_t resident_pages);
+bool preserved_trx_hydrate_source_rollback_image_for_unit_test(
+    const std::string &token, Preserve_snapshot_metadata *metadata,
+    const Preserve_trx_source_rollback_image &source_rollback_image);
+bool preserved_trx_binlog_payload_memory_peak_for_unit_test(
+    uint64_t payload_bytes, uint64_t *peak_bytes);
 void preserved_trx_add_failed_observable_record_for_unit_test(
     const std::string &token, uint64_t anchor_monotonic_us);
 size_t preserved_trx_gc_failed_observable_records_for_unit_test(

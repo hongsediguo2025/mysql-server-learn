@@ -46,11 +46,7 @@ enum class Preserve_trx_memory_kind {
   TEMP_DIRTY_PAGE_QUEUE,
   /* Buffer used while reading temp-table sidecars during resume. */
   TEMP_SIDECAR_READ_BUFFER,
-  /*
-    Reserved for a future binlog warmcopy heap lease. Current binlog warmcopy
-    capacity accounting is the warm external blob byte budget, not this resource
-    manager kind.
-  */
+  /* Bounded binlog cache export/read working memory. */
   BINLOG_WARMCOPY_BUFFER,
   /* Immutable record-lock metadata plan prepared for a strict promotion. */
   PROMOTION_LOCK_PLAN,

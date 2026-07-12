@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -464,6 +465,42 @@ TEST_F(BinlogWarmcopyMirrorTest, LeaseCanDetachAfterStorageDestruction) {
   lease->clear_if_owner(&mirror);
   EXPECT_FALSE(lease->active());
   EXPECT_EQ(1, mirror.source_cache_closed);
+}
+
+TEST_F(BinlogWarmcopyMirrorTest,
+       ConcurrentLeasePublicationAndObservationRemainConsistent) {
+  m_storage.clear_warmcopy_mirror(&m_mirror);
+  std::atomic<bool> start{false};
+  std::atomic<bool> observer_ready{false};
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> observations{0};
+
+  std::thread observer([&]() {
+    while (!start.load(std::memory_order_acquire)) {
+    }
+    do {
+      (void)m_storage.warmcopy_mirror_active();
+      observations.fetch_add(1, std::memory_order_relaxed);
+      observer_ready.store(true, std::memory_order_release);
+    } while (!stop.load(std::memory_order_acquire));
+  });
+
+  start.store(true, std::memory_order_release);
+  while (!observer_ready.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  for (uint i = 0; i < 1000; ++i) {
+    my_off_t length = -1;
+    uint64_t generation = 0;
+    EXPECT_FALSE(m_storage.install_warmcopy_mirror_if_absent(
+        &m_mirror, &length, &generation));
+    m_storage.clear_warmcopy_mirror(&m_mirror);
+  }
+  stop.store(true, std::memory_order_release);
+  observer.join();
+
+  EXPECT_GT(observations.load(std::memory_order_relaxed), 0U);
+  EXPECT_FALSE(m_storage.warmcopy_mirror_active());
 }
 
 TEST_F(BinlogWarmcopyMirrorTest, RangeCopyRejectsStaleGenerationAfterTruncate) {

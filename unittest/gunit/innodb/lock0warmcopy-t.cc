@@ -618,6 +618,40 @@ TEST(LockWarmcopyRecordShard,
   EXPECT_FALSE(payload.empty());
 }
 
+TEST(LockWarmcopyRecordShard,
+     Phase1JournalBudgetStopsGrowthBeforeSecondImageAllocation) {
+  lock_warmcopy_reset_for_unit_test();
+
+  constexpr uint64_t kTargetId = 901;
+  constexpr uint64_t kJournalLimit = 160;
+  const lock_warmcopy_record_shard_key_t key = make_record_shard_key(8);
+  const lock_warmcopy_record_image_digest_t digest = make_digest(0x31);
+  const std::string image = make_encoded_record_image("budgeted-image");
+
+  lock_warmcopy_open_epoch(13, kJournalLimit);
+  ASSERT_TRUE(lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
+      kTargetId, key, 1, digest, 1, image));
+  const uint64_t admitted =
+      lock_warmcopy_record_store_journal_bytes_for_target_for_unit_test(
+          kTargetId);
+  EXPECT_GT(admitted, 0U);
+  EXPECT_LE(admitted, kJournalLimit);
+
+  EXPECT_FALSE(
+      lock_warmcopy_record_bitmap_set_with_image_for_target_for_unit_test(
+          kTargetId, key, 2, digest, 2, image));
+  EXPECT_EQ(admitted,
+            lock_warmcopy_record_store_journal_bytes_for_target_for_unit_test(
+                kTargetId));
+
+  lock_warmcopy_record_shard_snapshot_t snapshot;
+  ASSERT_TRUE(lock_warmcopy_record_shard_snapshot_for_target_for_unit_test(
+      kTargetId, key, &snapshot));
+  EXPECT_EQ(1U, snapshot.set_bit_count);
+  EXPECT_NE(0U,
+            snapshot.shard_state_flags & LOCK_WARMCOPY_RECORD_SHARD_INVALID);
+}
+
 TEST(LockWarmcopyRecordShard, CanonicalBytesAreDeterministicAndLittleEndian) {
   lock_warmcopy_reset_for_unit_test();
 

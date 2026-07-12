@@ -1787,7 +1787,7 @@ bool Preserve_trx_lock_warmcopy_drain_participant::open_phase1() {
     cannot contaminate each other's target state.
   */
   m_epoch = lock_warmcopy_sql_epoch.fetch_add(1, std::memory_order_relaxed) + 1;
-  lock_warmcopy_open_epoch(m_epoch);
+  lock_warmcopy_open_epoch(m_epoch, m_options.max_journal_bytes);
   m_observation.state = Preserve_trx_drain_participant_state::OPEN;
   m_observation.owns_artifact = false;
   m_observation.bytes_used = 0;

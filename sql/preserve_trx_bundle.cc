@@ -74,6 +74,68 @@ bool preserve_trx_snapshot_payload_size_matches(uint64_t encoded_payload_size,
          snapshot_size - header_length;
 }
 
+Preserve_snapshot_status preserve_trx_snapshot_codec_peak_bytes(
+    const Preserve_snapshot_metadata &metadata,
+    const Mysql_binlog_preserve_snapshot *logged_binlog_snapshot,
+    uint64_t *peak_bytes) {
+  if (peak_bytes == nullptr) return Preserve_snapshot_status::INVALID_ARGUMENT;
+
+  uint64_t logical_bytes = 64ULL * 1024ULL;
+  auto add_bytes = [&logical_bytes](uint64_t bytes) {
+    if (bytes > UINT64_MAX - logical_bytes) return false;
+    logical_bytes += bytes;
+    return true;
+  };
+  auto add_string = [&add_bytes](const std::string &value) {
+    return add_bytes(value.size());
+  };
+
+  if (!add_string(metadata.token) || !add_string(metadata.owner_user) ||
+      !add_string(metadata.owner_host) || !add_string(metadata.schema_name) ||
+      !add_string(metadata.binlog_cache_payload) ||
+      !add_string(metadata.binlog_gtid_next) ||
+      !add_string(metadata.binlog_owned_gtid) ||
+      !add_string(metadata.time_zone_name) ||
+      !add_string(metadata.read_view_payload) ||
+      !add_string(metadata.record_locks_payload) ||
+      !add_string(metadata.predicate_locks_payload) ||
+      !add_string(metadata.table_locks_payload) ||
+      !add_string(metadata.mdl_descriptors_payload) ||
+      !add_string(metadata.user_vars_payload) ||
+      !add_string(metadata.sql_savepoints_payload) ||
+      !add_string(metadata.innodb_savepoints_payload) ||
+      !add_string(metadata.temp_table_manifest_payload)) {
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
+  for (const Preserve_snapshot_modified_table_name &table :
+       metadata.modified_table_names) {
+    if (!add_bytes(sizeof(table)) || !add_string(table.schema_name) ||
+        !add_string(table.table_name)) {
+      return Preserve_snapshot_status::INVALID_ARGUMENT;
+    }
+  }
+  if (!add_bytes(metadata.session_participant_order.size()) ||
+      metadata.savepoint_suffix_ordinals.size() >
+          UINT64_MAX / sizeof(uint16_t) ||
+      !add_bytes(metadata.savepoint_suffix_ordinals.size() *
+                 sizeof(uint16_t))) {
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
+  if (logged_binlog_snapshot != nullptr &&
+      (!add_string(logged_binlog_snapshot->cache_payload) ||
+       !add_string(logged_binlog_snapshot->gtid_next) ||
+       !add_string(logged_binlog_snapshot->owned_gtid))) {
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
+
+  constexpr uint64_t kSimultaneousCodecCopies = 6;
+  if (logical_bytes > UINT64_MAX / kSimultaneousCodecCopies) {
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
+  *peak_bytes = logical_bytes * kSimultaneousCodecCopies;
+  return Preserve_snapshot_status::OK;
+}
+
 namespace {
 
 constexpr char kSnapshotMagic[] = "MSP_PRES";

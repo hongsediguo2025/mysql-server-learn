@@ -26,6 +26,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -245,7 +246,9 @@ inline bool lock_warmcopy_hooks_enabled() {
   return lock_warmcopy_epoch.load(std::memory_order_acquire) != 0;
 }
 
-void lock_warmcopy_open_epoch(uint64_t epoch);
+void lock_warmcopy_open_epoch(
+    uint64_t epoch,
+    uint64_t max_journal_bytes = std::numeric_limits<uint64_t>::max());
 void lock_warmcopy_close_epoch();
 void lock_warmcopy_record_hook_event();
 /*
@@ -375,6 +378,8 @@ bool lock_warmcopy_record_store_export_record_payload_for_unit_test(
 bool lock_warmcopy_record_store_export_record_payload_for_target_for_unit_test(
     uint64_t target_id, std::string *payload);
 void lock_warmcopy_record_store_reset_for_unit_test();
+uint64_t lock_warmcopy_record_store_journal_bytes_for_target_for_unit_test(
+    uint64_t target_id);
 void lock_warmcopy_trx_conversion_freeze_for_unit_test(
     trx_lock_t *trx_lock, uint64_t wait_epoch);
 void lock_warmcopy_trx_conversion_thaw_for_unit_test(trx_lock_t *trx_lock);

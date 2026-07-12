@@ -3087,6 +3087,49 @@ TEST(PreservedTrxResourceBudget, LeaseTracksCurrentPeakAndPerTokenLimits) {
       Preserve_trx_resource_limits{});
 }
 
+TEST(PreservedTrxResourceBudget,
+     SnapshotCodecPeakAccountsForSimultaneousPayloadCopies) {
+  Preserve_snapshot_metadata metadata;
+  metadata.token = "codec-peak-token";
+  metadata.user_vars_payload.assign(1024 * 1024, 'u');
+
+  uint64_t peak_bytes = 0;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            preserve_trx_snapshot_codec_peak_bytes(metadata, nullptr,
+                                                   &peak_bytes));
+  EXPECT_GE(peak_bytes, 6ULL * metadata.user_vars_payload.size());
+
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_resource_limits limits;
+  limits.global_memory_budget_bytes = peak_bytes - 1;
+  limits.per_token_memory_budget_bytes = peak_bytes - 1;
+  preserve_trx_resource_manager_set_limits_for_unit_test(limits);
+  auto rejected = preserve_trx_acquire_memory_lease(
+      metadata.token, Preserve_trx_memory_kind::SNAPSHOT_CODEC_BUFFER,
+      peak_bytes);
+  EXPECT_FALSE(rejected.acquired());
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  preserve_trx_resource_manager_reset_for_unit_test();
+  preserve_trx_resource_manager_set_limits_for_unit_test(
+      Preserve_trx_resource_limits{});
+}
+
+TEST(PreservedTrxResourceBudget,
+     BinlogPayloadPeakRejectsLargeWholeReadBeforeAllocation) {
+  uint64_t peak_bytes = 0;
+  ASSERT_TRUE(preserved_trx_binlog_payload_memory_peak_for_unit_test(
+      512ULL * 1024ULL * 1024ULL, &peak_bytes));
+  EXPECT_EQ(1536ULL * 1024ULL * 1024ULL, peak_bytes);
+
+  preserve_trx_resource_manager_reset_for_unit_test();
+  auto rejected = preserve_trx_acquire_memory_lease(
+      "large-binlog-token", Preserve_trx_memory_kind::BINLOG_WARMCOPY_BUFFER,
+      peak_bytes);
+  EXPECT_FALSE(rejected.acquired());
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
 TEST(PreservedTrxRollback, OwnedRollbackRequiresThd) {
   EXPECT_EQ(DB_ERROR, trx_preserve_rollback_by_token_for_thd(
                           "msp_missing_token", nullptr));
@@ -10499,6 +10542,57 @@ TEST_F(PreserveSnapshotTest,
           Preserve_snapshot_io_step::RENAME_TEMP_FILE,
           Preserve_snapshot_io_step::FSYNC_DIRECTORY}),
       steps);
+}
+
+TEST_F(PreserveSnapshotTest,
+       SourceRollbackImageHydratesRetainedWarmBinlogArtifact) {
+  const std::string payload = "remote-only-source-rollback-binlog";
+  const std::string warmcopy_id = "rollback_warmcopy_1";
+  constexpr uint64_t kWarmcopyEpoch = 77;
+  auto carrier =
+      create_preserved_trx_default_warm_external_blob_carrier(m_dir);
+  ASSERT_NE(nullptr, carrier);
+  std::unique_ptr<Preserved_trx_external_blob_writer> writer;
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            carrier->create_warm_external_blob_writer(
+                warmcopy_id, kPreservedTrxBlobBinlogCache, kWarmcopyEpoch,
+                &writer));
+  ASSERT_NE(nullptr, writer);
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            writer->write_at(0, pointer_cast<const unsigned char *>(
+                                    payload.data()),
+                             payload.size()));
+  ASSERT_EQ(Preserved_trx_carrier_status::OK, writer->close());
+
+  Preserved_trx_external_blob_descriptor descriptor;
+  descriptor.name = kPreservedTrxBlobBinlogCache;
+  descriptor.size = payload.size();
+  SHA_EVP256(pointer_cast<const unsigned char *>(payload.data()),
+             payload.size(), descriptor.digest.data());
+  ASSERT_EQ(Preserved_trx_carrier_status::OK,
+            writer->seal_descriptor(descriptor));
+
+  Preserve_trx_source_rollback_image image;
+  image.preserve_dir = m_dir;
+  image.binlog_snapshot.event_counter = 1;
+  image.binlog_snapshot.has_cache_length = true;
+  image.binlog_snapshot.cache_length = payload.size();
+  image.prebuilt_binlog_blob.warmcopy_id = warmcopy_id;
+  image.prebuilt_binlog_blob.warmcopy_epoch = kWarmcopyEpoch;
+  image.prebuilt_binlog_blob.name = descriptor.name;
+  image.prebuilt_binlog_blob.size = descriptor.size;
+  image.prebuilt_binlog_blob.digest = descriptor.digest;
+  image.has_prebuilt_binlog_blob = true;
+
+  Preserve_snapshot_metadata restored = logged_with_cache_metadata();
+  restored.binlog_cache_size = payload.size();
+  ASSERT_FALSE(preserved_trx_hydrate_source_rollback_image_for_unit_test(
+      restored.token, &restored, image));
+  EXPECT_EQ(payload, restored.binlog_cache_payload);
+
+  EXPECT_EQ(Preserved_trx_carrier_status::OK,
+            carrier->remove_warm_external_blob(warmcopy_id,
+                                               kPreservedTrxBlobBinlogCache));
 }
 
 TEST_F(PreserveSnapshotTest, LocalFileStoreWriteCanDeferDirectoryFsync) {

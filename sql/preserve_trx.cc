@@ -38,6 +38,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <set>
 #include <sstream>
 #include <thread>
@@ -677,6 +678,7 @@ struct Preserve_trx_batch_item {
   my_thread_id original_thread_id{0};
   std::string token;
   bool logged_binlog_cache{false};
+  std::unique_ptr<Preserve_trx_source_rollback_image> source_rollback_image;
 };
 
 struct Pending_token_delivery {
@@ -2173,12 +2175,93 @@ bool preserved_trx_blob_descriptors_equal(
   return true;
 }
 
+bool binlog_payload_memory_peak(uint64_t payload_bytes, uint64_t *peak_bytes) {
+  constexpr uint64_t kSimultaneousPayloadCopies = 3;
+  if (peak_bytes == nullptr || payload_bytes == 0 ||
+      payload_bytes > UINT64_MAX / kSimultaneousPayloadCopies) {
+    return false;
+  }
+  *peak_bytes = payload_bytes * kSimultaneousPayloadCopies;
+  return true;
+}
+
 bool hydrate_logged_binlog_cache_payload_if_needed(Preserved_trx_record *record,
-                                                   const std::string &token) {
+                                                   const std::string &token,
+                                                   const Preserve_trx_source_rollback_image
+                                                       *source_rollback_image =
+                                                           nullptr,
+                                                   Preserve_memory_lease
+                                                       *payload_lease = nullptr) {
   if (record == nullptr ||
       record->metadata.binlog_state !=
           Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE ||
       !record->metadata.binlog_cache_payload.empty()) {
+    return false;
+  }
+
+  uint64_t payload_bytes = 0;
+  if (source_rollback_image != nullptr) {
+    payload_bytes =
+        !source_rollback_image->binlog_snapshot.cache_payload.empty()
+            ? source_rollback_image->binlog_snapshot.cache_payload.size()
+            : source_rollback_image->prebuilt_binlog_blob.size;
+  } else {
+    const auto descriptor = std::find_if(
+        record->blob_descriptors.begin(), record->blob_descriptors.end(),
+        [](const Preserved_trx_external_blob_descriptor &candidate) {
+          return candidate.name == kPreservedTrxBlobBinlogCache;
+        });
+    if (descriptor != record->blob_descriptors.end()) {
+      payload_bytes = descriptor->size;
+    }
+  }
+  uint64_t payload_peak_bytes = 0;
+  if (payload_lease == nullptr ||
+      !binlog_payload_memory_peak(payload_bytes, &payload_peak_bytes)) {
+    return true;
+  }
+  Preserve_memory_lease acquired = preserve_trx_acquire_memory_lease(
+      token, Preserve_trx_memory_kind::BINLOG_WARMCOPY_BUFFER,
+      payload_peak_bytes);
+  if (!acquired.acquired()) return true;
+  *payload_lease = std::move(acquired);
+
+  if (source_rollback_image != nullptr) {
+    const Mysql_binlog_preserve_snapshot &source_snapshot =
+        source_rollback_image->binlog_snapshot;
+    std::string payload;
+    if (!source_snapshot.cache_payload.empty()) {
+      payload = source_snapshot.cache_payload;
+    } else if (source_rollback_image->has_prebuilt_binlog_blob) {
+      const PrebuiltBinlogCacheBlob &prebuilt =
+          source_rollback_image->prebuilt_binlog_blob;
+      Preserved_trx_external_blob_descriptor descriptor;
+      descriptor.name = prebuilt.name;
+      descriptor.size = prebuilt.size;
+      descriptor.digest = prebuilt.digest;
+      const std::string &rollback_dir = source_rollback_image->preserve_dir;
+      auto carrier = create_preserved_trx_default_warm_external_blob_carrier(
+          rollback_dir.empty() ? preserve_trx_default_dir() : rollback_dir);
+      Preserved_trx_external_blob blob;
+      if (carrier == nullptr ||
+          carrier->read_warm_external_blob(
+              prebuilt.warmcopy_id, prebuilt.name, prebuilt.warmcopy_epoch,
+              descriptor, preserve_trx_max_binlog_cache_bytes, &blob) !=
+              Preserved_trx_carrier_status::OK) {
+        return true;
+      }
+      payload = std::move(blob.payload);
+    } else {
+      return true;
+    }
+    if (payload.empty() || payload.size() != record->metadata.binlog_cache_size ||
+        (source_snapshot.has_cache_length &&
+         source_snapshot.cache_length != payload.size()) ||
+        source_snapshot.event_counter !=
+            record->metadata.binlog_cache_event_counter) {
+      return true;
+    }
+    record->metadata.binlog_cache_payload = std::move(payload);
     return false;
   }
 
@@ -2206,6 +2289,21 @@ bool hydrate_logged_binlog_cache_payload_if_needed(Preserved_trx_record *record,
 
   record->metadata.binlog_cache_payload =
       std::move(bundle.metadata.binlog_cache_payload);
+  return false;
+}
+
+bool hydrate_source_rollback_image_for_unit_test_impl(
+    const std::string &token, Preserve_snapshot_metadata *metadata,
+    const Preserve_trx_source_rollback_image &source_rollback_image) {
+  if (metadata == nullptr) return true;
+  Preserved_trx_record record;
+  record.metadata = *metadata;
+  Preserve_memory_lease payload_lease;
+  if (hydrate_logged_binlog_cache_payload_if_needed(
+          &record, token, &source_rollback_image, &payload_lease)) {
+    return true;
+  }
+  *metadata = std::move(record.metadata);
   return false;
 }
 
@@ -5009,6 +5107,8 @@ class Phase1_transfer_binlog_blob_provider final
       PreserveBinlogBlobProvider *fallback_provider)
       : m_fallback_provider(fallback_provider) {}
 
+  ~Phase1_transfer_binlog_blob_provider() override { cleanup_phase1_blobs(); }
+
   void remember_phase1_blob(my_thread_id thread_id,
                             const PrebuiltBinlogCacheBlob &blob) {
     if (thread_id == 0 || blob.name != kPreservedTrxBlobBinlogCache ||
@@ -5100,6 +5200,28 @@ class Phase1_transfer_binlog_blob_provider final
     }
     if (m_fallback_provider != nullptr) {
       m_fallback_provider->discard_for_preserve(thd, token, blob);
+    }
+  }
+
+  void cleanup_phase1_blobs() {
+    std::set<std::string> warmcopy_ids;
+    {
+      std::lock_guard<std::mutex> guard(m_mutex);
+      warmcopy_ids.swap(m_phase1_warmcopy_ids);
+      m_phase1_blobs.clear();
+    }
+    if (warmcopy_ids.empty()) return;
+    auto carrier = create_preserved_trx_default_warm_external_blob_carrier(
+        preserve_trx_default_dir());
+    if (carrier == nullptr) return;
+    for (const std::string &warmcopy_id : warmcopy_ids) {
+      if (carrier->remove_warm_external_blob(
+              warmcopy_id, kPreservedTrxBlobBinlogCache) !=
+          Preserved_trx_carrier_status::OK) {
+        LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+               "PRESERVE: failed to remove retained source rollback binlog "
+               "artifact");
+      }
     }
   }
 
@@ -5822,16 +5944,15 @@ static bool stream_phase1_transfer_binlog_cache_blobs(
                                      : phase1_batch_sender->flush();
   bool cleanup_failed = false;
   for (const auto &entry : built_blobs) {
-    const Preserved_trx_carrier_status cleanup_status =
-        warm_carrier->remove_warm_external_blob(entry.second.warmcopy_id,
-                                                entry.second.name);
-    if (cleanup_status != Preserved_trx_carrier_status::OK) {
-      cleanup_failed = true;
-      continue;
-    }
     if (!enqueue_failed && flush_status == Preserve_trx_transfer_status::OK &&
         phase1_binlog_provider != nullptr) {
       phase1_binlog_provider->remember_phase1_blob(entry.first, entry.second);
+      continue;
+    }
+    if (warm_carrier->remove_warm_external_blob(entry.second.warmcopy_id,
+                                                entry.second.name) !=
+        Preserved_trx_carrier_status::OK) {
+      cleanup_failed = true;
     }
   }
   return enqueue_failed || flush_status != Preserve_trx_transfer_status::OK ||
@@ -5949,7 +6070,7 @@ class Preserve_batch_quiesced_idle_target final {
 
   bool visited_target() const { return m_visited_target; }
   bool error() const { return m_error; }
-  const Preserve_trx_preserve_result &result() const { return m_result; }
+  Preserve_trx_preserve_result take_result() { return std::move(m_result); }
 
  private:
   void clear_target_after_error(THD *candidate) const {
@@ -6564,6 +6685,18 @@ void preserve_trx_warmcopy_admit_current_thd_binlog_write_impl(THD *thd) {
 }
 
 }  // namespace
+
+bool preserved_trx_hydrate_source_rollback_image_for_unit_test(
+    const std::string &token, Preserve_snapshot_metadata *metadata,
+    const Preserve_trx_source_rollback_image &source_rollback_image) {
+  return hydrate_source_rollback_image_for_unit_test_impl(
+      token, metadata, source_rollback_image);
+}
+
+bool preserved_trx_binlog_payload_memory_peak_for_unit_test(
+    uint64_t payload_bytes, uint64_t *peak_bytes) {
+  return binlog_payload_memory_peak(payload_bytes, peak_bytes);
+}
 
 bool preserved_trx_build_native_binlog_cache_facts(
     const Preserve_snapshot_metadata &metadata,
@@ -9059,7 +9192,10 @@ static bool restore_batch_record_to_original_thd(
 
   if (record.metadata.binlog_state ==
       Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE) {
-    if (hydrate_logged_binlog_cache_payload_if_needed(&record, item.token))
+    Preserve_memory_lease binlog_payload_lease;
+    if (hydrate_logged_binlog_cache_payload_if_needed(
+            &record, item.token, item.source_rollback_image.get(),
+            &binlog_payload_lease))
       return restore_record_after_failure(
           "batch cleanup binlog cache read failure");
     Mysql_binlog_preserve_snapshot binlog_snapshot =
@@ -11306,6 +11442,8 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     set_failure_reason("null_target_thd");
     return preserve_trx_reject_unsupported();
   }
+  const std::string preserve_resource_lease_key =
+      "preserve-thd-" + std::to_string(thd->thread_id());
 
   const bool batch_delivery =
       delivery_mode == Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY;
@@ -11341,6 +11479,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       Preserve_snapshot_binlog_state::GLOBAL_OFF_NO_CACHE;
   Mysql_binlog_preserve_snapshot binlog_snapshot;
   PrebuiltBinlogCacheBlob prebuilt_binlog_blob;
+  Preserve_memory_lease single_phase_binlog_payload_lease;
   bool has_logged_binlog_cache = false;
   bool use_prebuilt_binlog_cache = false;
   if (determine_no_cache_binlog_state(thd, &binlog_state)) {
@@ -11361,6 +11500,20 @@ bool preserve_trx_kernel_preserve_attached_transaction(
            binlog_cache_length >
                preserve_trx_single_phase_max_binlog_cache_bytes)) {
         return reject_unsupported_for_delivery("binlog_cache_too_large");
+      }
+      uint64_t binlog_payload_peak_bytes = 0;
+      if (!has_binlog_cache ||
+          !binlog_payload_memory_peak(binlog_cache_length,
+                                      &binlog_payload_peak_bytes)) {
+        return reject_unsupported_for_delivery("binlog_cache_size_invalid");
+      }
+      single_phase_binlog_payload_lease = preserve_trx_acquire_memory_lease(
+          preserve_resource_lease_key,
+          Preserve_trx_memory_kind::BINLOG_WARMCOPY_BUFFER,
+          binlog_payload_peak_bytes);
+      if (!single_phase_binlog_payload_lease.acquired()) {
+        return reject_unsupported_for_delivery(
+            "binlog_cache_resource_exhausted");
       }
       preserve_trx_warmcopy_note_provider_full_copy_to();
       if (mysql_binlog_preserve_export(thd, &binlog_snapshot))
@@ -12435,6 +12588,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   }
 
   std::vector<Preserved_trx_external_blob_descriptor> blob_descriptors;
+  std::unique_ptr<Preserve_trx_source_rollback_image> source_rollback_image;
 
   auto reject_after_snapshot_failure =
       [&](bool snapshot_files_may_exist,
@@ -12461,11 +12615,33 @@ bool preserve_trx_kernel_preserve_attached_transaction(
           token,
           "failed to fsync preserved transaction directory after unlink");
     }
+    Mysql_binlog_preserve_snapshot rollback_binlog_snapshot = binlog_snapshot;
+    Preserve_memory_lease rollback_binlog_payload_lease;
+    if (has_logged_binlog_cache && source_rollback_image != nullptr) {
+      Preserve_snapshot_metadata rollback_metadata;
+      rollback_metadata.token = token;
+      rollback_metadata.binlog_state =
+          Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE;
+      rollback_metadata.binlog_cache_size =
+          source_rollback_image->prebuilt_binlog_blob.size;
+      rollback_metadata.binlog_cache_event_counter =
+          source_rollback_image->binlog_snapshot.event_counter;
+      Preserved_trx_record rollback_record;
+      rollback_record.metadata = std::move(rollback_metadata);
+      if (hydrate_logged_binlog_cache_payload_if_needed(
+              &rollback_record, token, source_rollback_image.get(),
+              &rollback_binlog_payload_lease)) {
+        set_failure_reason("source_rollback_binlog_hydrate_failed");
+      } else {
+        rollback_binlog_snapshot.cache_payload =
+            std::move(rollback_record.metadata.binlog_cache_payload);
+      }
+    }
     if (batch_delivery &&
         !reattach_current_batch_preserve_failure_to_original_thd(
             thd, trx, token, true, effective_snapshot_files_may_exist,
             &cleanup_failed, &left_preserved, &metadata, has_logged_binlog_cache,
-            &binlog_snapshot, &blob_descriptors)) {
+            &rollback_binlog_snapshot, &blob_descriptors)) {
       if (left_preserved) {
         reset_thd_after_preserve_detach(thd);
         cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
@@ -12574,6 +12750,24 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     prebuilt_binlog_blob_finalized = true;
   }
 
+  if (batch_delivery && has_logged_binlog_cache &&
+      artifact_decision ==
+          Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE &&
+      use_prebuilt_binlog_cache && prebuilt_binlog_blob_finalized) {
+    source_rollback_image.reset(
+        new (std::nothrow) Preserve_trx_source_rollback_image());
+    if (source_rollback_image == nullptr) {
+      discard_prebuilt_binlog_blob_if_needed();
+      return reject_after_snapshot_failure(false);
+    }
+    source_rollback_image->binlog_snapshot = binlog_snapshot;
+    source_rollback_image->preserve_dir = preserve_trx_default_dir();
+    if (use_prebuilt_binlog_cache && prebuilt_binlog_blob_finalized) {
+      source_rollback_image->prebuilt_binlog_blob = prebuilt_binlog_blob;
+      source_rollback_image->has_prebuilt_binlog_blob = true;
+    }
+  }
+
   substep_started_us = preserve_trx_monotonic_us();
   const Preserve_snapshot_status temp_manifest_status =
       preserve_trx_temp_table_build_preserve_manifest(
@@ -12622,6 +12816,29 @@ bool preserve_trx_kernel_preserve_attached_transaction(
                  : Preserve_snapshot_engine_shape::TEMP_ONLY)
           : Preserve_snapshot_engine_shape::PERSISTENT_ONLY;
 
+  uint64_t snapshot_codec_peak_bytes = 0;
+  const Mysql_binlog_preserve_snapshot *codec_binlog_snapshot =
+      has_logged_binlog_cache && !use_prebuilt_binlog_cache
+          ? &binlog_snapshot
+          : nullptr;
+  if (preserve_trx_snapshot_codec_peak_bytes(
+          metadata, codec_binlog_snapshot, &snapshot_codec_peak_bytes) !=
+      Preserve_snapshot_status::OK) {
+    set_failure_reason("snapshot_codec_size_overflow");
+    discard_prebuilt_binlog_blob_if_needed();
+    return reject_after_snapshot_failure(false);
+  }
+  Preserve_memory_lease snapshot_codec_lease =
+      preserve_trx_acquire_memory_lease(
+          preserve_resource_lease_key,
+          Preserve_trx_memory_kind::SNAPSHOT_CODEC_BUFFER,
+          snapshot_codec_peak_bytes);
+  if (!snapshot_codec_lease.acquired()) {
+    set_failure_reason("snapshot_codec_resource_exhausted");
+    discard_prebuilt_binlog_blob_if_needed();
+    return reject_after_snapshot_failure(false);
+  }
+
   Preserved_trx_bundle_build_input bundle_input;
   bundle_input.metadata = metadata;
   if (has_logged_binlog_cache) {
@@ -12663,8 +12880,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   blob_descriptors = bundle.blob_descriptors;
 
   Preserve_snapshot_write_options snapshot_write_options;
-  snapshot_write_options.defer_file_fsync =
-      request.defer_snapshot_directory_fsync;
+  snapshot_write_options.defer_file_fsync = false;
   snapshot_write_options.defer_directory_fsync =
       request.defer_snapshot_directory_fsync;
   snapshot_write_options.fast_new_token_state =
@@ -12816,6 +13032,8 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   snapshotting_state.remove();
 
   if (batch_delivery) {
+    if (result != nullptr)
+      result->source_rollback_image = std::move(source_rollback_image);
     reset_thd_after_preserve_detach(thd);
     cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
     audit_preserved_trx_event(thd, token, "preserve", "success");
@@ -14198,11 +14416,13 @@ bool Preserve_trx_drain_service::execute(
               batch_transfer_source_session.get(),
               static_cast<uint64_t>(target_thread_id),
               preserve_trx_default_dir(), prebuilt_binlog);
-      const Preserved_trx_carrier_status cleanup_status =
-          warm_carrier->remove_warm_external_blob(prebuilt_binlog.warmcopy_id,
-                                                  prebuilt_binlog.name);
-      if (stream_status != Preserve_trx_transfer_status::OK ||
-          cleanup_status != Preserved_trx_carrier_status::OK) {
+      Preserved_trx_carrier_status cleanup_status =
+          Preserved_trx_carrier_status::OK;
+      if (stream_status != Preserve_trx_transfer_status::OK) {
+        cleanup_status = warm_carrier->remove_warm_external_blob(
+            prebuilt_binlog.warmcopy_id, prebuilt_binlog.name);
+      }
+      if (stream_status != Preserve_trx_transfer_status::OK) {
         const std::string message =
             "PRESERVE: standby transfer phase2 binlog catchup stream failed "
             "status=" +
@@ -14360,7 +14580,7 @@ bool Preserve_trx_drain_service::execute(
         if (target_thd != nullptr) batch.run(target_thd);
         execution->visited_target = batch.visited_target();
         execution->error = batch.error();
-        execution->result = batch.result();
+        execution->result = batch.take_result();
       };
 
   uint preserve_worker_count =
@@ -14491,7 +14711,7 @@ bool Preserve_trx_drain_service::execute(
 
   const Preserve_batch_target_execution *failed_execution = nullptr;
   const ulonglong result_collect_started_us = preserve_trx_monotonic_us();
-  for (const Preserve_batch_target_execution &execution : target_results) {
+  for (Preserve_batch_target_execution &execution : target_results) {
     apply_target_metrics(execution.result);
 
     if (execution.pin_error || !execution.visited_target || execution.error ||
@@ -14500,9 +14720,13 @@ bool Preserve_trx_drain_service::execute(
       continue;
     }
 
-    preserved_batch_items.push_back(
-        {execution.target_thread_id, execution.result.token,
-         execution.result.logged_binlog_cache});
+    Preserve_trx_batch_item batch_item;
+    batch_item.original_thread_id = execution.target_thread_id;
+    batch_item.token = execution.result.token;
+    batch_item.logged_binlog_cache = execution.result.logged_binlog_cache;
+    batch_item.source_rollback_image =
+        std::move(execution.result.source_rollback_image);
+    preserved_batch_items.push_back(std::move(batch_item));
     preserved_token_count = preserved_batch_items.size();
     DEBUG_SYNC(thd, "preserve_trx_batch_after_one_target_preserved");
     if (debug_fail_after_one_target) {
@@ -15264,11 +15488,13 @@ static bool preserved_trx_resume_record_on_thd(
   }
 
   bool binlog_imported = false;
+  Preserve_memory_lease binlog_payload_lease;
   if (record.metadata.binlog_state ==
       Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE) {
     DBUG_EXECUTE_IF("preserve_trx_resume_clear_binlog_cache_payload",
                     record.metadata.binlog_cache_payload.clear(););
-    if (hydrate_logged_binlog_cache_payload_if_needed(&record, token)) {
+    if (hydrate_logged_binlog_cache_payload_if_needed(
+            &record, token, nullptr, &binlog_payload_lease)) {
       (void)restore_record_after_resume_failure(
           record, "binlog cache read failure");
       return preserve_trx_reject_unsupported();

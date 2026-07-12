@@ -1021,24 +1021,24 @@ $binlog_ostream =~ /bool Binlog_cache_storage::write[\s\S]*?^}/m
   or die "could not isolate Binlog_cache_storage::write\n";
 my $binlog_cache_write = $&;
 die "binlog cache write must avoid the warmcopy mutex when no mirror is installed\n"
-  unless $binlog_cache_write =~ /m_warmcopy_lease->active\s*\(\s*\)/s &&
-         index($binlog_cache_write, 'm_warmcopy_lease->active') <
+  unless $binlog_cache_write =~ /lease->active\s*\(\s*\)/s &&
+         index($binlog_cache_write, 'lease->active') <
          index($binlog_cache_write, 'std::lock_guard');
 
 $binlog_ostream =~ /bool Binlog_cache_storage::truncate[\s\S]*?^}/m
   or die "could not isolate Binlog_cache_storage::truncate\n";
 my $binlog_cache_truncate = $&;
 die "binlog cache truncate must avoid the warmcopy mutex when no mirror is installed\n"
-  unless $binlog_cache_truncate =~ /m_warmcopy_lease->active\s*\(\s*\)/s &&
-         index($binlog_cache_truncate, 'm_warmcopy_lease->active') <
+  unless $binlog_cache_truncate =~ /lease->active\s*\(\s*\)/s &&
+         index($binlog_cache_truncate, 'lease->active') <
          index($binlog_cache_truncate, 'std::lock_guard');
 
 $binlog_ostream =~ /bool Binlog_cache_storage::reset[\s\S]*?^}/m
   or die "could not isolate Binlog_cache_storage::reset\n";
 my $binlog_cache_reset = $&;
 die "binlog cache reset must avoid the warmcopy mutex when no mirror is installed\n"
-  unless $binlog_cache_reset =~ /m_warmcopy_lease->active\s*\(\s*\)/s &&
-         index($binlog_cache_reset, 'm_warmcopy_lease->active') <
+  unless $binlog_cache_reset =~ /lease->active\s*\(\s*\)/s &&
+         index($binlog_cache_reset, 'lease->active') <
          index($binlog_cache_reset, 'std::lock_guard');
 
 die "temp dirty-page hook must test active source-space before per-space admission-close checks\n"
@@ -2489,6 +2489,36 @@ die "standby promotion must report token-level abandoned outcomes without failin
   unless $promotion =~ /OK_WITH_ABANDONED_TOKENS/s &&
          $promotion =~ /abandoned_count/s &&
          $promotion =~ /promotion-ready cache not built/s;
+die "batch snapshot publication may defer directory fsync but must retain the per-file data barrier\n"
+  unless $preserve =~
+         /snapshot_write_options\.defer_file_fsync\s*=\s*false\s*;[\s\S]{0,240}snapshot_write_options\.defer_directory_fsync\s*=\s*request\.defer_snapshot_directory_fsync\s*;/s;
+die "binlog warmcopy lease publication and lock-free reads must use atomic shared_ptr operations\n"
+  unless $binlog_ostream =~ /atomic_load_explicit\s*\(\s*&m_warmcopy_lease/s &&
+         $binlog_ostream =~ /atomic_store_explicit\s*\(\s*&m_warmcopy_lease/s;
+die "lock warmcopy must pass the journal budget into phase1 admission\n"
+  unless $sql_lock_warmcopy =~
+         /lock_warmcopy_open_epoch\s*\(\s*m_epoch\s*,\s*m_options\.max_journal_bytes\s*\)/s;
+die "record mirror mutation must reserve journal bytes before allocating a shard\n"
+  unless $lock_warmcopy =~
+         /record_bitmap_set_locked[\s\S]*record_target_admit_journal_delta_locked[\s\S]*find_or_create_record_shard/s;
+die "remote-only batch rollback must retain and consume a source rollback image\n"
+  unless $preserve_header =~ /Preserve_trx_source_rollback_image/s &&
+         $preserve =~ /Preserve_trx_batch_item[\s\S]*source_rollback_image/s &&
+         $preserve =~
+         /hydrate_logged_binlog_cache_payload_if_needed\s*\(\s*&record\s*,\s*item\.token\s*,\s*item\.source_rollback_image\.get\s*\(\s*\)\s*,\s*&binlog_payload_lease\s*\)/s;
+die "snapshot build and publication must hold a checked codec memory lease\n"
+  unless $preserve =~ /preserve_trx_snapshot_codec_peak_bytes/s &&
+         $preserve =~ /Preserve_trx_memory_kind::SNAPSHOT_CODEC_BUFFER/s &&
+         $preserve =~ /snapshot_codec_lease\.acquired\s*\(\s*\)/s;
+die "single-phase logged binlog preserve must reserve its whole-read peak before copying the cache\n"
+  unless $preserve =~
+         /binlog_payload_memory_peak\s*\(\s*binlog_cache_length[\s\S]{0,520}single_phase_binlog_payload_lease\s*=\s*preserve_trx_acquire_memory_lease[\s\S]{0,520}mysql_binlog_preserve_export\s*\(/s;
+die "resume must acquire a bounded binlog payload lease before reading an external cache body\n"
+  unless $preserve =~ /binlog_payload_memory_peak/s &&
+         $preserve =~ /Preserve_trx_memory_kind::BINLOG_WARMCOPY_BUFFER/s;
+die "phase1 transfer binlog artifacts must survive until epoch success or rollback\n"
+  unless $preserve =~
+         /~Phase1_transfer_binlog_blob_provider[\s\S]*cleanup_phase1_blobs/s;
 die "standby promotion abandoned marker must be an epoch-level side artifact\n"
   unless $promotion =~ /PTRX_PROMOTION_ABANDONED_EPOCH_V1/s &&
          $promotion =~ /write_promotion_abandoned_epoch/s &&

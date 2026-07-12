@@ -23,6 +23,7 @@
 
 #include "sql/binlog_ostream.h"
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <vector>
 #include "my_aes.h"
@@ -345,7 +346,9 @@ bool Binlog_cache_storage::open(my_off_t cache_size, my_off_t max_cache_size) {
 
 void Binlog_cache_storage::close() {
   std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
-  if (m_warmcopy_lease != nullptr) m_warmcopy_lease->close_source_cache();
+  const auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                                std::memory_order_acquire);
+  if (lease != nullptr) lease->close_source_cache();
   m_pipeline_head = nullptr;
   m_file.close();
 }
@@ -355,13 +358,18 @@ Binlog_cache_storage::~Binlog_cache_storage() { close(); }
 void Binlog_cache_storage::set_warmcopy_mirror(
     Binlog_cache_warmcopy_mirror *mirror) {
   std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
-  if (m_warmcopy_lease == nullptr)
-    m_warmcopy_lease = std::make_shared<Binlog_cache_warmcopy_lease>();
+  auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                         std::memory_order_acquire);
+  if (lease == nullptr) {
+    lease = std::make_shared<Binlog_cache_warmcopy_lease>();
+    std::atomic_store_explicit(&m_warmcopy_lease, lease,
+                               std::memory_order_release);
+  }
   if (mirror == nullptr) {
-    m_warmcopy_lease->close_source_cache();
+    lease->close_source_cache();
     return;
   }
-  (void)m_warmcopy_lease->install_if_absent(mirror);
+  (void)lease->install_if_absent(mirror);
 }
 
 bool Binlog_cache_storage::install_warmcopy_mirror_if_absent(
@@ -369,23 +377,32 @@ bool Binlog_cache_storage::install_warmcopy_mirror_if_absent(
     uint64_t *truncate_generation,
     std::shared_ptr<Binlog_cache_warmcopy_lease> *lease) {
   std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
-  if (m_warmcopy_lease == nullptr)
-    m_warmcopy_lease = std::make_shared<Binlog_cache_warmcopy_lease>();
+  auto current_lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                                 std::memory_order_acquire);
+  if (current_lease == nullptr) {
+    current_lease = std::make_shared<Binlog_cache_warmcopy_lease>();
+    std::atomic_store_explicit(&m_warmcopy_lease, current_lease,
+                               std::memory_order_release);
+  }
   if (length != nullptr) *length = m_file.length();
   if (truncate_generation != nullptr)
     *truncate_generation = m_truncate_generation;
-  if (m_warmcopy_lease->install_if_absent(mirror)) return true;
-  if (lease != nullptr) *lease = m_warmcopy_lease;
+  if (current_lease->install_if_absent(mirror)) return true;
+  if (lease != nullptr) *lease = current_lease;
   return false;
 }
 
 void Binlog_cache_storage::clear_warmcopy_mirror(
     Binlog_cache_warmcopy_mirror *mirror) {
-  if (m_warmcopy_lease != nullptr) m_warmcopy_lease->clear_if_owner(mirror);
+  const auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                                std::memory_order_acquire);
+  if (lease != nullptr) lease->clear_if_owner(mirror);
 }
 
 bool Binlog_cache_storage::warmcopy_mirror_active() const {
-  return m_warmcopy_lease != nullptr && m_warmcopy_lease->active();
+  const auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                                std::memory_order_acquire);
+  return lease != nullptr && lease->active();
 }
 
 uint64_t Binlog_cache_storage::truncate_generation() const {
@@ -395,63 +412,77 @@ uint64_t Binlog_cache_storage::truncate_generation() const {
 
 bool Binlog_cache_storage::write(const unsigned char *buffer,
                                  my_off_t length) {
-  if (m_warmcopy_lease == nullptr || !m_warmcopy_lease->active()) {
+  auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                         std::memory_order_acquire);
+  if (lease == nullptr || !lease->active()) {
     if (m_pipeline_head == nullptr) return true;
     return m_pipeline_head->write(buffer, length);
   }
 
   std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
+  lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                    std::memory_order_acquire);
   if (m_pipeline_head == nullptr) {
-    m_warmcopy_lease->note_source_write_failed();
+    if (lease != nullptr) lease->note_source_write_failed();
     return true;
   }
 
   const my_off_t offset = m_file.length();
   const bool source_error = m_pipeline_head->write(buffer, length);
   if (source_error) {
-    m_warmcopy_lease->note_source_write_failed();
+    if (lease != nullptr) lease->note_source_write_failed();
     return true;
   }
 
-  if (m_warmcopy_lease->write_at(static_cast<uint64_t>(offset), buffer,
-                                 static_cast<size_t>(length)) ==
+  if (lease != nullptr && lease->active() &&
+      lease->write_at(static_cast<uint64_t>(offset), buffer,
+                      static_cast<size_t>(length)) ==
           Binlog_warmcopy_mirror_status::ERROR) {
-    m_warmcopy_lease->mark_degraded("mirror write failed");
+    lease->mark_degraded("mirror write failed");
   }
   return false;
 }
 
 bool Binlog_cache_storage::truncate(my_off_t offset) {
-  if (m_warmcopy_lease == nullptr || !m_warmcopy_lease->active()) {
+  auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                         std::memory_order_acquire);
+  if (lease == nullptr || !lease->active()) {
     if (m_pipeline_head == nullptr) return true;
     return m_pipeline_head->truncate(offset);
   }
 
   std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
+  lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                    std::memory_order_acquire);
   if (m_pipeline_head == nullptr) return true;
 
   const bool source_error = m_pipeline_head->truncate(offset);
   if (source_error) return true;
 
   ++m_truncate_generation;
-  if (m_warmcopy_lease->truncate(static_cast<uint64_t>(offset)) ==
+  if (lease != nullptr && lease->active() &&
+      lease->truncate(static_cast<uint64_t>(offset)) ==
           Binlog_warmcopy_mirror_status::ERROR) {
-    m_warmcopy_lease->mark_degraded("mirror truncate failed");
+    lease->mark_degraded("mirror truncate failed");
   }
   return false;
 }
 
 bool Binlog_cache_storage::reset() {
-  if (m_warmcopy_lease == nullptr || !m_warmcopy_lease->active()) {
+  auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                         std::memory_order_acquire);
+  if (lease == nullptr || !lease->active()) {
     return m_file.reset();
   }
 
   std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
+  lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                    std::memory_order_acquire);
   const bool source_error = m_file.reset();
   if (source_error) return true;
 
   ++m_truncate_generation;
-  m_warmcopy_lease->note_non_lifecycle_reset();
+  if (lease != nullptr && lease->active()) lease->note_non_lifecycle_reset();
   return false;
 }
 

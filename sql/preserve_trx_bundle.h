@@ -490,6 +490,12 @@ Preserve_snapshot_status build_preserved_trx_bundle(
     const Preserved_trx_bundle_build_input &input,
     Preserved_trx_bundle *bundle);
 
+/* Conservative simultaneous heap peak for build plus encode. */
+Preserve_snapshot_status preserve_trx_snapshot_codec_peak_bytes(
+    const Preserve_snapshot_metadata &metadata,
+    const Mysql_binlog_preserve_snapshot *logged_binlog_snapshot,
+    uint64_t *peak_bytes);
+
 Preserve_snapshot_status encode_preserved_trx_bundle(
     const Preserved_trx_codec_context &context,
     const Preserved_trx_bundle &bundle,
