@@ -2370,6 +2370,17 @@ Preserve_snapshot_metadata make_no_cache_metadata(
       static_cast<uint8_t>(thd->variables.transaction_isolation);
   metadata.tx_read_only = thd->tx_read_only;
   metadata.session_tx_read_only = thd->variables.transaction_read_only;
+  metadata.binlog_format = static_cast<Preserve_snapshot_binlog_format>(
+      thd->variables.binlog_format);
+  metadata.foreign_key_checks =
+      (thd->variables.option_bits & OPTION_NO_FOREIGN_KEY_CHECKS) == 0;
+  metadata.unique_checks =
+      (thd->variables.option_bits & OPTION_RELAXED_UNIQUE_CHECKS) == 0;
+  metadata.autocommit =
+      (thd->variables.option_bits & OPTION_NOT_AUTOCOMMIT) == 0;
+  metadata.auto_increment_increment =
+      thd->variables.auto_increment_increment;
+  metadata.auto_increment_offset = thd->variables.auto_increment_offset;
   metadata.has_extended_session_state = true;
   metadata.sql_mode = thd->variables.sql_mode;
   if (thd->variables.time_zone != nullptr &&
@@ -3490,14 +3501,40 @@ bool savepoint_handler_state(SAVEPOINT *savepoint, uint16_t *handler_flags,
 bool export_sql_savepoints(THD *thd, Preserve_snapshot_binlog_state binlog_state,
                            std::string *payload,
                            uint32_t *savepoint_count,
-                           uint32_t *innodb_savepoint_count) {
+                           uint32_t *innodb_savepoint_count,
+                           std::vector<Preserve_savepoint_participant>
+                               *session_participant_order,
+                           std::vector<uint16_t> *savepoint_suffix_ordinals) {
   if (thd == nullptr || payload == nullptr || savepoint_count == nullptr ||
-      innodb_savepoint_count == nullptr)
+      innodb_savepoint_count == nullptr ||
+      session_participant_order == nullptr ||
+      savepoint_suffix_ordinals == nullptr)
     return true;
 
   payload->clear();
   *savepoint_count = 0;
   *innodb_savepoint_count = 0;
+  session_participant_order->clear();
+  savepoint_suffix_ordinals->clear();
+
+  std::vector<Ha_trx_info *> participant_nodes;
+  std::set<uint8_t> participants;
+  for (Ha_trx_info *ha_info =
+           thd->get_transaction()->ha_trx_info(Transaction_ctx::SESSION);
+       ha_info != nullptr; ha_info = ha_info->next()) {
+    Preserve_savepoint_participant participant;
+    if (ha_legacy_type(ha_info->ht()) == DB_TYPE_INNODB) {
+      participant = Preserve_savepoint_participant::INNODB;
+    } else if (ha_legacy_type(ha_info->ht()) == DB_TYPE_BINLOG) {
+      participant = Preserve_savepoint_participant::BINLOG;
+    } else {
+      return true;
+    }
+    const uint8_t raw = static_cast<uint8_t>(participant);
+    if (!participants.insert(raw).second) return true;
+    participant_nodes.push_back(ha_info);
+    session_participant_order->push_back(participant);
+  }
 
   std::vector<SAVEPOINT *> savepoints;
   for (SAVEPOINT *savepoint = thd->get_transaction()->m_savepoints;
@@ -3524,6 +3561,29 @@ bool export_sql_savepoints(THD *thd, Preserve_snapshot_binlog_state binlog_state
     }
     if ((handler_flags & kSavepointHandlerInnodb) != 0)
       ++*innodb_savepoint_count;
+
+    uint16_t suffix_ordinal =
+        static_cast<uint16_t>(participant_nodes.size());
+    if (savepoint->ha_list != nullptr) {
+      const auto participant_it =
+          std::find(participant_nodes.begin(), participant_nodes.end(),
+                    savepoint->ha_list);
+      if (participant_it == participant_nodes.end()) return true;
+      suffix_ordinal = static_cast<uint16_t>(
+          std::distance(participant_nodes.begin(), participant_it));
+    }
+    uint16_t expected_handler_flags = 0;
+    for (size_t participant_index = suffix_ordinal;
+         participant_index < session_participant_order->size();
+         ++participant_index) {
+      expected_handler_flags |=
+          (*session_participant_order)[participant_index] ==
+                  Preserve_savepoint_participant::INNODB
+              ? kSavepointHandlerInnodb
+              : kSavepointHandlerBinlog;
+    }
+    if (expected_handler_flags != handler_flags) return true;
+    savepoint_suffix_ordinals->push_back(suffix_ordinal);
 
     uint32_t mdl_stmt_ordinal = 0;
     uint32_t mdl_trans_ordinal = 0;
@@ -11320,10 +11380,14 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   std::string sql_savepoints_payload;
   uint32_t savepoint_count = 0;
   uint32_t sql_innodb_savepoint_count = 0;
+  std::vector<Preserve_savepoint_participant> session_participant_order;
+  std::vector<uint16_t> savepoint_suffix_ordinals;
   substep_started_us = preserve_trx_monotonic_us();
   if (export_sql_savepoints(thd, binlog_state, &sql_savepoints_payload,
                             &savepoint_count,
-                            &sql_innodb_savepoint_count)) {
+                            &sql_innodb_savepoint_count,
+                            &session_participant_order,
+                            &savepoint_suffix_ordinals)) {
     return reject_after_binlog_export("sql_savepoint_export_failed");
   }
   add_result_elapsed_us(&Preserve_trx_preserve_result::
@@ -11828,10 +11892,15 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     std::string current_sql_savepoints_payload;
     uint32_t current_savepoint_count = 0;
     uint32_t current_sql_innodb_savepoint_count = 0;
+    std::vector<Preserve_savepoint_participant>
+        current_session_participant_order;
+    std::vector<uint16_t> current_savepoint_suffix_ordinals;
     if (export_sql_savepoints(thd, binlog_state,
                               &current_sql_savepoints_payload,
                               &current_savepoint_count,
-                              &current_sql_innodb_savepoint_count)) {
+                              &current_sql_innodb_savepoint_count,
+                              &current_session_participant_order,
+                              &current_savepoint_suffix_ordinals)) {
       thaw_lock_warmcopy_conversion();
       set_failure_reason("savepoint_final_fence_export_failed");
       return restore_unprepared_batch_prepare_failure_or_rollback();
@@ -11841,7 +11910,9 @@ bool preserve_trx_kernel_preserve_attached_transaction(
         { current_sql_savepoints_payload.push_back('\1'); });
     if (current_savepoint_count != savepoint_count ||
         current_sql_innodb_savepoint_count != sql_innodb_savepoint_count ||
-        current_sql_savepoints_payload != sql_savepoints_payload) {
+        current_sql_savepoints_payload != sql_savepoints_payload ||
+        current_session_participant_order != session_participant_order ||
+        current_savepoint_suffix_ordinals != savepoint_suffix_ordinals) {
       /*
         Savepoint changes can alter rollback-to-savepoint lock ownership. Until
         savepoint warmcopy has its own generation hook, a changed final payload
@@ -12152,6 +12223,9 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   metadata.savepoint_count = savepoint_count;
   metadata.sql_savepoints_payload = std::move(sql_savepoints_payload);
   metadata.innodb_savepoints_payload = std::move(innodb_savepoints_payload);
+  metadata.session_participant_order = std::move(session_participant_order);
+  metadata.savepoint_suffix_ordinals =
+      std::move(savepoint_suffix_ordinals);
 
   if (create_detached_mdl_context(thd, token)) {
     thaw_lock_warmcopy_conversion();

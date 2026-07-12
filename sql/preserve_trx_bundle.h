@@ -86,6 +86,23 @@ enum class Preserve_snapshot_binlog_state : uint8_t {
   LOGGED_WITH_CACHE = 4
 };
 
+enum class Preserve_snapshot_engine_shape : uint8_t {
+  PERSISTENT_ONLY = 1,
+  TEMP_ONLY = 2,
+  MIXED = 3
+};
+
+enum class Preserve_snapshot_binlog_format : uint8_t {
+  STATEMENT = 0,
+  MIXED = 1,
+  ROW = 2
+};
+
+enum class Preserve_savepoint_participant : uint8_t {
+  INNODB = 1,
+  BINLOG = 2
+};
+
 enum class Preserve_snapshot_status {
   OK,
   NOT_FOUND,
@@ -129,6 +146,11 @@ struct Preserve_snapshot_metadata {
     only after claim, so early reject/rollback may not persist a new count.
   */
   uint32_t recovered_count{0};
+  Preserve_snapshot_engine_shape engine_shape{
+      Preserve_snapshot_engine_shape::PERSISTENT_ONLY};
+  bool has_persistent_engine_state{true};
+  bool has_temp_engine_state{false};
+  bool has_logged_persistent_work{false};
   /*
     Binlog state is split into environment flags and cache-content flags.
     Resume must restore both the bytes and the write semantics that produced
@@ -189,6 +211,8 @@ struct Preserve_snapshot_metadata {
   std::string binlog_owned_gtid;
   bool has_binlog_gtid_mode{false};
   uint8_t binlog_gtid_mode{0};
+  Preserve_snapshot_binlog_format binlog_format{
+      Preserve_snapshot_binlog_format::ROW};
   /*
     Transaction access mode and isolation are captured separately for the active
     transaction and session defaults. Resume must restore both so COMMIT/ROLLBACK
@@ -198,6 +222,11 @@ struct Preserve_snapshot_metadata {
   uint8_t session_tx_isolation{2};
   bool tx_read_only{false};
   bool session_tx_read_only{false};
+  bool foreign_key_checks{true};
+  bool unique_checks{true};
+  bool autocommit{true};
+  uint64_t auto_increment_increment{1};
+  uint64_t auto_increment_offset{1};
   /*
     Extended session state contains statement-visible execution context. It is
     optional for legacy snapshots, but new snapshots set the flag when the fields
@@ -239,6 +268,8 @@ struct Preserve_snapshot_metadata {
   uint32_t savepoint_count{0};
   std::string sql_savepoints_payload;
   std::string innodb_savepoints_payload;
+  std::vector<Preserve_savepoint_participant> session_participant_order;
+  std::vector<uint16_t> savepoint_suffix_ordinals;
   /*
     Temp-table manifest names physical sidecars and DD/dict bindings. Its
     presence changes resume ordering because sidecars may need to be materialized
@@ -469,5 +500,10 @@ Preserve_snapshot_status decode_preserved_trx_snapshot_bytes(
     const Preserved_trx_codec_context &context,
     const std::vector<unsigned char> &snapshot_bytes, bool validate_identity,
     Preserved_trx_decoded_snapshot *decoded);
+
+/** Checked size calculation used before encoding a TLV length as u32. */
+bool preserve_trx_snapshot_checked_tlv_size(uint64_t current_size,
+                                            uint64_t value_size,
+                                            uint64_t *encoded_size);
 
 #endif  // SQL_PRESERVE_TRX_BUNDLE_INCLUDED

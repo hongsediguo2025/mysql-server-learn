@@ -1990,9 +1990,11 @@ static void test_mach_write_to_4(unsigned char *ptr, uint32_t value) {
 constexpr uint16_t kTestPredicateLocksTlv = 0x32;
 constexpr uint16_t kTestSqlSavepointsTlv = 0x40;
 constexpr uint16_t kTestInnodbSavepointsTlv = 0x41;
+constexpr uint16_t kTestSavepointTopologyTlv = 0x42;
 constexpr uint16_t kTestMdlDescriptorsTlv = 0x51;
 constexpr uint16_t kTestUserVariablesTlv = 0x52;
 constexpr uint16_t kTestTxAccessModeTlv = 0x53;
+constexpr uint16_t kTestSemanticContractTlv = 0x54;
 constexpr uint16_t kTestBinlogNoCacheMetadataTlv = 0x61;
 constexpr uint16_t kTestAutoincStateTlv = 0x62;
 constexpr uint16_t kTestBinlogCachePayloadTlv = 0x70;
@@ -2186,6 +2188,46 @@ std::string autoinc_state_payload(bool autoinc_lock_owned,
   payload.push_back(static_cast<char>(autoinc_lock_owned ? 1 : 0));
   payload.push_back(static_cast<char>(has_forced_insert_id ? 1 : 0));
   append_le64(&payload, forced_insert_id);
+  return payload;
+}
+
+std::string semantic_contract_payload(
+    const Preserve_snapshot_metadata &metadata) {
+  std::string payload;
+  append_le16(&payload, 1);
+  payload.push_back(static_cast<char>(metadata.engine_shape));
+  uint8_t state_flags = 0;
+  if (metadata.has_persistent_engine_state) state_flags |= 1U << 0;
+  if (metadata.has_temp_engine_state) state_flags |= 1U << 1;
+  if (metadata.has_logged_persistent_work) state_flags |= 1U << 2;
+  payload.push_back(static_cast<char>(state_flags));
+  payload.push_back(static_cast<char>(metadata.binlog_format));
+  uint8_t policy_flags = 0;
+  if (metadata.foreign_key_checks) policy_flags |= 1U << 0;
+  if (metadata.unique_checks) policy_flags |= 1U << 1;
+  if (metadata.autocommit) policy_flags |= 1U << 2;
+  payload.push_back(static_cast<char>(policy_flags));
+  append_le16(&payload, 0);
+  append_le64(&payload, metadata.auto_increment_increment);
+  append_le64(&payload, metadata.auto_increment_offset);
+  return payload;
+}
+
+std::string savepoint_topology_payload(
+    const Preserve_snapshot_metadata &metadata) {
+  std::string payload;
+  append_le16(&payload, 1);
+  append_le16(
+      &payload,
+      static_cast<uint16_t>(metadata.session_participant_order.size()));
+  append_le32(&payload, metadata.savepoint_count);
+  for (Preserve_savepoint_participant participant :
+       metadata.session_participant_order) {
+    payload.push_back(static_cast<char>(participant));
+  }
+  for (uint16_t suffix : metadata.savepoint_suffix_ordinals) {
+    append_le16(&payload, suffix);
+  }
   return payload;
 }
 
@@ -5590,6 +5632,24 @@ class PreserveSnapshotTest : public ::testing::Test {
                                  metadata.has_forced_insert_id,
                                  metadata.forced_insert_id)});
     }
+    const auto semantic_contract_tlv = std::find_if(
+        bundle.tlvs.begin(), bundle.tlvs.end(),
+        [](const Preserve_snapshot_tlv &tlv) {
+          return tlv.tag == kTestSemanticContractTlv;
+        });
+    if (semantic_contract_tlv == bundle.tlvs.end()) {
+      bundle.tlvs.push_back(
+          {kTestSemanticContractTlv, semantic_contract_payload(metadata)});
+    }
+    const auto savepoint_topology_tlv = std::find_if(
+        bundle.tlvs.begin(), bundle.tlvs.end(),
+        [](const Preserve_snapshot_tlv &tlv) {
+          return tlv.tag == kTestSavepointTopologyTlv;
+        });
+    if (savepoint_topology_tlv == bundle.tlvs.end()) {
+      bundle.tlvs.push_back(
+          {kTestSavepointTopologyTlv, savepoint_topology_payload(metadata)});
+    }
 
     uint64_t payload_size = 0;
     for (const Preserve_snapshot_tlv &tlv : bundle.tlvs) {
@@ -8748,6 +8808,9 @@ TEST_F(PreserveSnapshotTest, InMemoryStoreReadRestoresFullMetadataPayloads) {
   input.metadata.sql_savepoints_payload = sql_savepoint_payload(1, 0);
   input.metadata.innodb_savepoints_payload = innodb_savepoint_payload(4, 0);
   input.metadata.savepoint_count = 1;
+  input.metadata.session_participant_order = {
+      Preserve_savepoint_participant::INNODB};
+  input.metadata.savepoint_suffix_ordinals = {0};
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -8975,6 +9038,9 @@ TEST_F(PreserveSnapshotTest, InMemoryStoreReadAcceptsLoggedBinlogOnlySavepoint) 
   input.metadata.savepoint_count = 1;
   input.metadata.sql_savepoints_payload = sql_savepoint_payload(2, 8);
   input.metadata.innodb_savepoints_payload.clear();
+  input.metadata.session_participant_order = {
+      Preserve_savepoint_participant::BINLOG};
+  input.metadata.savepoint_suffix_ordinals = {0};
   input.logged_binlog_snapshot = &snapshot;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
@@ -18854,13 +18920,15 @@ TEST_F(PreserveSnapshotTest, BundleBuilderNoCacheProducesTlvsWithoutBlob) {
   EXPECT_EQ(input.metadata.token, bundle.metadata.token);
   EXPECT_EQ(input.metadata.mod_tables_count, bundle.metadata.mod_tables_count);
   EXPECT_TRUE(bundle.external_blobs.empty());
-  ASSERT_GE(bundle.tlvs.size(), 7U);
+  ASSERT_GE(bundle.tlvs.size(), 9U);
   EXPECT_EQ(0x10, bundle.tlvs[0].tag);
   EXPECT_EQ(0x11, bundle.tlvs[1].tag);
   EXPECT_EQ(0x50, bundle.tlvs[2].tag);
   EXPECT_EQ(kTestTxAccessModeTlv, bundle.tlvs[3].tag);
-  EXPECT_EQ(kTestAutoincStateTlv, bundle.tlvs[4].tag);
-  EXPECT_EQ(kTestMdlDescriptorsTlv, bundle.tlvs[5].tag);
+  EXPECT_EQ(kTestSemanticContractTlv, bundle.tlvs[4].tag);
+  EXPECT_EQ(kTestSavepointTopologyTlv, bundle.tlvs[5].tag);
+  EXPECT_EQ(kTestAutoincStateTlv, bundle.tlvs[6].tag);
+  EXPECT_EQ(kTestMdlDescriptorsTlv, bundle.tlvs[7].tag);
   EXPECT_NE(bundle.tlvs.end(),
             std::find_if(bundle.tlvs.begin(), bundle.tlvs.end(),
                          [](const Preserve_snapshot_tlv &tlv) {
@@ -19693,9 +19761,182 @@ TEST_F(PreserveSnapshotTest,
   rewrite_encoded_authentication(&encoded.snapshot_bytes, codec_context());
 
   Preserved_trx_decoded_snapshot decoded;
+  EXPECT_EQ(Preserve_snapshot_status::UNSUPPORTED,
+            decode_preserved_trx_snapshot_bytes(
+                codec_context(), encoded.snapshot_bytes, true, &decoded));
+}
+
+TEST_F(PreserveSnapshotTest, BundleCodecRejectsV8AfterV9Cutover) {
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserved_trx_encoded_bundle encoded;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            encode_preserved_trx_bundle(codec_context(), bundle, &encoded,
+                                        nullptr));
+  overwrite_encoded_format_version(&encoded.snapshot_bytes, 8);
+
+  Preserved_trx_decoded_snapshot decoded;
+  EXPECT_EQ(Preserve_snapshot_status::UNSUPPORTED,
+            decode_preserved_trx_snapshot_bytes(
+                codec_context(), encoded.snapshot_bytes, true, &decoded));
+}
+
+TEST_F(PreserveSnapshotTest, BundleCodecV9RequiresSemanticContractTlv) {
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserved_trx_encoded_bundle encoded;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            encode_preserved_trx_bundle(codec_context(), bundle, &encoded,
+                                        nullptr));
+  remove_encoded_tlv(&encoded.snapshot_bytes, kTestSemanticContractTlv);
+
+  Preserved_trx_decoded_snapshot decoded;
   EXPECT_EQ(Preserve_snapshot_status::CORRUPT,
             decode_preserved_trx_snapshot_bytes(
                 codec_context(), encoded.snapshot_bytes, true, &decoded));
+}
+
+TEST_F(PreserveSnapshotTest, BundleCodecV9SemanticContractRoundTrips) {
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  input.metadata.engine_shape = Preserve_snapshot_engine_shape::MIXED;
+  input.metadata.has_persistent_engine_state = true;
+  input.metadata.has_temp_engine_state = true;
+  input.metadata.has_logged_persistent_work = false;
+  input.metadata.binlog_format = Preserve_snapshot_binlog_format::ROW;
+  input.metadata.foreign_key_checks = false;
+  input.metadata.unique_checks = false;
+  input.metadata.autocommit = false;
+  input.metadata.auto_increment_increment = 17;
+  input.metadata.auto_increment_offset = 3;
+
+  Preserved_trx_bundle bundle;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+  Preserved_trx_encoded_bundle encoded;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            encode_preserved_trx_bundle(codec_context(), bundle, &encoded,
+                                        nullptr));
+
+  Preserved_trx_decoded_snapshot decoded;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            decode_preserved_trx_snapshot_bytes(
+                codec_context(), encoded.snapshot_bytes, true, &decoded));
+  const Preserve_snapshot_metadata &out = decoded.header_metadata;
+  EXPECT_EQ(Preserve_snapshot_engine_shape::MIXED, out.engine_shape);
+  EXPECT_TRUE(out.has_persistent_engine_state);
+  EXPECT_TRUE(out.has_temp_engine_state);
+  EXPECT_FALSE(out.has_logged_persistent_work);
+  EXPECT_EQ(Preserve_snapshot_binlog_format::ROW, out.binlog_format);
+  EXPECT_FALSE(out.foreign_key_checks);
+  EXPECT_FALSE(out.unique_checks);
+  EXPECT_FALSE(out.autocommit);
+  EXPECT_EQ(17U, out.auto_increment_increment);
+  EXPECT_EQ(3U, out.auto_increment_offset);
+}
+
+TEST_F(PreserveSnapshotTest,
+       BundleCodecV9RejectsContradictoryTempOnlyContract) {
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  input.metadata.engine_shape = Preserve_snapshot_engine_shape::TEMP_ONLY;
+  input.metadata.has_persistent_engine_state = true;
+  input.metadata.has_temp_engine_state = true;
+
+  Preserved_trx_bundle bundle;
+  EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
+            build_preserved_trx_bundle(input, &bundle));
+}
+
+TEST_F(PreserveSnapshotTest, BundleCodecV9RequiresSavepointTopologyTlv) {
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  Preserved_trx_bundle bundle;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+  Preserved_trx_encoded_bundle encoded;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            encode_preserved_trx_bundle(codec_context(), bundle, &encoded,
+                                        nullptr));
+  remove_encoded_tlv(&encoded.snapshot_bytes, kTestSavepointTopologyTlv);
+
+  Preserved_trx_decoded_snapshot decoded;
+  EXPECT_EQ(Preserve_snapshot_status::CORRUPT,
+            decode_preserved_trx_snapshot_bytes(
+                codec_context(), encoded.snapshot_bytes, true, &decoded));
+}
+
+TEST_F(PreserveSnapshotTest, BundleCodecV9SavepointTopologyRoundTrips) {
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  input.metadata.savepoint_count = 1;
+  input.metadata.sql_savepoints_payload = sql_savepoint_payload(1);
+  input.metadata.innodb_savepoints_payload = innodb_savepoint_payload(1, 0);
+  input.metadata.session_participant_order = {
+      Preserve_savepoint_participant::INNODB};
+  input.metadata.savepoint_suffix_ordinals = {0};
+
+  Preserved_trx_bundle bundle;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+  Preserved_trx_encoded_bundle encoded;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            encode_preserved_trx_bundle(codec_context(), bundle, &encoded,
+                                        nullptr));
+  Preserved_trx_decoded_snapshot decoded;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            decode_preserved_trx_snapshot_bytes(
+                codec_context(), encoded.snapshot_bytes, true, &decoded));
+  EXPECT_EQ(input.metadata.session_participant_order,
+            decoded.header_metadata.session_participant_order);
+  EXPECT_EQ(input.metadata.savepoint_suffix_ordinals,
+            decoded.header_metadata.savepoint_suffix_ordinals);
+}
+
+TEST_F(PreserveSnapshotTest, BundleCodecV9RejectsInvalidSavepointTopology) {
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  input.metadata.session_participant_order = {
+      static_cast<Preserve_savepoint_participant>(99)};
+  Preserved_trx_bundle bundle;
+  EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
+            build_preserved_trx_bundle(input, &bundle));
+
+  input.metadata = metadata();
+  input.metadata.session_participant_order = {
+      Preserve_savepoint_participant::INNODB,
+      Preserve_savepoint_participant::INNODB};
+  EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
+            build_preserved_trx_bundle(input, &bundle));
+
+  input.metadata = metadata();
+  input.metadata.savepoint_count = 1;
+  input.metadata.sql_savepoints_payload = sql_savepoint_payload(1);
+  input.metadata.innodb_savepoints_payload = innodb_savepoint_payload(1, 0);
+  input.metadata.session_participant_order = {
+      Preserve_savepoint_participant::INNODB};
+  input.metadata.savepoint_suffix_ordinals = {2};
+  EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
+            build_preserved_trx_bundle(input, &bundle));
+}
+
+TEST(PreserveSnapshotCodecBounds, CheckedTlvLengthRejectsU32AndTotalOverflow) {
+  uint64_t encoded_size = 0;
+  EXPECT_TRUE(preserve_trx_snapshot_checked_tlv_size(
+      0, UINT32_MAX, &encoded_size));
+  EXPECT_EQ(static_cast<uint64_t>(UINT32_MAX) + 6, encoded_size);
+  EXPECT_FALSE(preserve_trx_snapshot_checked_tlv_size(
+      0, static_cast<uint64_t>(UINT32_MAX) + 1, &encoded_size));
+  EXPECT_FALSE(preserve_trx_snapshot_checked_tlv_size(
+      UINT64_MAX - 5, 0, &encoded_size));
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -19812,12 +20053,12 @@ TEST_F(PreserveSnapshotTest,
   overwrite_encoded_format_version(&encoded.snapshot_bytes, 1);
 
   Preserved_trx_decoded_snapshot decoded;
-  EXPECT_EQ(Preserve_snapshot_status::CORRUPT,
+  EXPECT_EQ(Preserve_snapshot_status::UNSUPPORTED,
             decode_preserved_trx_snapshot_bytes(
                 codec_context(), encoded.snapshot_bytes, true, &decoded));
 }
 
-TEST_F(PreserveSnapshotTest, CrossVersionSnapshotCorpusRejectsAllPreV8Headers) {
+TEST_F(PreserveSnapshotTest, CrossVersionSnapshotCorpusRejectsAllPreV9Headers) {
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = metadata();
@@ -19829,12 +20070,12 @@ TEST_F(PreserveSnapshotTest, CrossVersionSnapshotCorpusRejectsAllPreV8Headers) {
             encode_preserved_trx_bundle(codec_context(), bundle, &encoded,
                                         nullptr));
 
-  for (uint16_t version = 1; version < 8; ++version) {
+  for (uint16_t version = 1; version < 9; ++version) {
     std::vector<unsigned char> snapshot = encoded.snapshot_bytes;
     overwrite_encoded_format_version(&snapshot, version);
 
     Preserved_trx_decoded_snapshot decoded;
-    EXPECT_EQ(Preserve_snapshot_status::CORRUPT,
+    EXPECT_EQ(Preserve_snapshot_status::UNSUPPORTED,
               decode_preserved_trx_snapshot_bytes(codec_context(), snapshot,
                                                   true, &decoded))
         << "version=" << version;
@@ -19857,7 +20098,7 @@ TEST_F(PreserveSnapshotTest,
   overwrite_encoded_expires_at(&encoded.snapshot_bytes, 0);
 
   Preserved_trx_decoded_snapshot decoded;
-  EXPECT_EQ(Preserve_snapshot_status::CORRUPT,
+  EXPECT_EQ(Preserve_snapshot_status::UNSUPPORTED,
             decode_preserved_trx_snapshot_bytes(
                 codec_context(), encoded.snapshot_bytes, true, &decoded));
 }
@@ -19899,7 +20140,7 @@ TEST_F(PreserveSnapshotTest,
   overwrite_encoded_format_version(&encoded.snapshot_bytes, 4);
 
   Preserved_trx_decoded_snapshot decoded;
-  EXPECT_EQ(Preserve_snapshot_status::CORRUPT,
+  EXPECT_EQ(Preserve_snapshot_status::UNSUPPORTED,
             decode_preserved_trx_snapshot_bytes(
                 codec_context(), encoded.snapshot_bytes, true, &decoded));
 }
@@ -19921,7 +20162,7 @@ TEST_F(PreserveSnapshotTest,
   overwrite_encoded_format_version(&encoded.snapshot_bytes, 5);
 
   Preserved_trx_decoded_snapshot decoded;
-  EXPECT_EQ(Preserve_snapshot_status::CORRUPT,
+  EXPECT_EQ(Preserve_snapshot_status::UNSUPPORTED,
             decode_preserved_trx_snapshot_bytes(
                 codec_context(), encoded.snapshot_bytes, true, &decoded));
 }
@@ -19966,7 +20207,7 @@ TEST_F(PreserveSnapshotTest,
   overwrite_encoded_format_version(&encoded.snapshot_bytes, 7);
 
   Preserved_trx_decoded_snapshot decoded;
-  EXPECT_EQ(Preserve_snapshot_status::CORRUPT,
+  EXPECT_EQ(Preserve_snapshot_status::UNSUPPORTED,
             decode_preserved_trx_snapshot_bytes(
                 codec_context(), encoded.snapshot_bytes, true, &decoded));
 }
@@ -20503,7 +20744,7 @@ TEST_F(PreserveSnapshotTest, LegacyAutoincWithoutTableLocksIsRejected) {
   write_snapshot_bytes(snapshot);
 
   Preserve_snapshot_metadata out;
-  EXPECT_EQ(Preserve_snapshot_status::CORRUPT,
+  EXPECT_EQ(Preserve_snapshot_status::UNSUPPORTED,
             test_read_snapshot(m_dir, "msp_snapshot_gunit", &out));
 }
 
@@ -20670,7 +20911,7 @@ TEST_F(PreserveSnapshotTest, LegacyFormatWithoutRecordLocksIsRejected) {
   rewrite_snapshot_authentication(&snapshot);
   write_snapshot_bytes(snapshot);
 
-  EXPECT_EQ(Preserve_snapshot_status::CORRUPT,
+  EXPECT_EQ(Preserve_snapshot_status::UNSUPPORTED,
             test_read_snapshot(m_dir, "msp_snapshot_gunit", &out));
 }
 
@@ -20690,7 +20931,7 @@ TEST_F(PreserveSnapshotTest, RecordLocksInLegacyFormatIsRejected) {
   write_snapshot_bytes(snapshot);
 
   Preserve_snapshot_metadata out;
-  EXPECT_EQ(Preserve_snapshot_status::CORRUPT,
+  EXPECT_EQ(Preserve_snapshot_status::UNSUPPORTED,
             test_read_snapshot(m_dir, "msp_snapshot_gunit", &out));
 }
 
@@ -20796,7 +21037,7 @@ TEST_F(PreserveSnapshotTest, TableLocksInLegacyFormatIsRejected) {
   write_snapshot_bytes(snapshot);
 
   Preserve_snapshot_metadata out;
-  EXPECT_EQ(Preserve_snapshot_status::CORRUPT,
+  EXPECT_EQ(Preserve_snapshot_status::UNSUPPORTED,
             test_read_snapshot(m_dir, "msp_snapshot_gunit", &out));
 }
 
@@ -20864,7 +21105,7 @@ TEST_F(PreserveSnapshotTest, LegacyV3ZeroDeadlineIsRejected) {
   rewrite_snapshot_tlv_tag(kTestPredicateLocksTlv, kTestRecordLocksTlv);
 
   Preserve_snapshot_metadata out;
-  EXPECT_EQ(Preserve_snapshot_status::CORRUPT,
+  EXPECT_EQ(Preserve_snapshot_status::UNSUPPORTED,
             test_read_snapshot(m_dir, "msp_snapshot_gunit", &out));
 }
 
@@ -21438,6 +21679,10 @@ TEST_F(PreserveSnapshotTest, LoggedCacheSqlSavepointBinlogPositionRoundTrips) {
   metadata.savepoint_count = 1;
   metadata.sql_savepoints_payload = sql_savepoint_payload(3, 8);
   metadata.innodb_savepoints_payload = innodb_savepoint_payload(1, 8);
+  metadata.session_participant_order = {
+      Preserve_savepoint_participant::BINLOG,
+      Preserve_savepoint_participant::INNODB};
+  metadata.savepoint_suffix_ordinals = {0};
   std::vector<Preserve_snapshot_tlv> tlvs = logged_with_cache_tlvs();
   tlvs.push_back({kTestSqlSavepointsTlv, metadata.sql_savepoints_payload});
   tlvs.push_back({kTestInnodbSavepointsTlv, metadata.innodb_savepoints_payload});
