@@ -7324,10 +7324,15 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
             large_binlog_cache_buckets_mb=[1, 16, 64],
             artifact_dir=".",
         )
-        plan = WorkloadPlan(cfg)
-        self.assertGreaterEqual(plan.warmcopy_close_timeout_ms(), 290000)
-        self.assertGreater(plan.drain_hard_timeout_ms(),
-                           plan.warmcopy_close_timeout_ms())
+        fake_usage = type("Usage", (), {"free": 40 * 1024 * 1024 * 1024})()
+        with mock.patch(
+            "scripts.resumable_trx_business_e2e.shutil.disk_usage",
+            return_value=fake_usage,
+        ):
+            plan = WorkloadPlan(cfg)
+            self.assertGreaterEqual(plan.warmcopy_close_timeout_ms(), 290000)
+            self.assertGreater(plan.drain_hard_timeout_ms(),
+                               plan.warmcopy_close_timeout_ms())
 
     def test_warmcopy_required_without_large_cache_keeps_prefix_headroom(self):
         cfg = HarnessConfig(
