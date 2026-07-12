@@ -9,6 +9,8 @@ DROP TABLE IF EXISTS t_key_rotation_batch;
 --disable_query_log
 CALL mtr.add_suppression("Preserved transaction .* recovery deferred cleanup: corrupt durable transaction snapshot");
 CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot");
+CALL mtr.add_suppression("PRESERVE: failed to authenticate XID provenance before storage engine recovery");
+CALL mtr.add_suppression("Aborting");
 --enable_query_log
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`
@@ -83,16 +85,16 @@ write_bound_preserve_key($key, 'B' x 32);
 print "batch key replaced before restart\n";
 EOF
 
---echo # restart: --preserve-trx-enable=ON --skip-log-bin --preserve-trx-recovery-max-count=10
---exec echo "restart: --preserve-trx-enable=ON --skip-log-bin --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---enable_reconnect
---source include/wait_until_connected_again.inc
---disable_reconnect
+--let $_server_id= 1
+--let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--let $restart_parameters= --preserve-trx-enable=ON --skip-log-bin --preserve-trx-recovery-max-count=10
+--source include/start_mysqld_expecting_crash.inc
 
 --let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
---let $grep_pattern= Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot
+--let $grep_pattern= PRESERVE: failed to authenticate XID provenance before storage engine recovery
 --let $wait_timeout= 30
 --source include/wait_for_pattern_in_file.inc
+--source suite/preserve_trx/include/wait_for_expected_crash.inc
 
 --perl
 use strict;
@@ -110,8 +112,21 @@ chmod(0600, $key) or die "cannot chmod restored key: $!";
 print "batch_old_key_restored_after_failclosed\n1\n";
 EOF
 
+--exec echo "restart: --preserve-trx-enable=ON --skip-log-bin --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
 SELECT COUNT(*) AS preserved_count_after_key_failclosed
   FROM performance_schema.preserved_transactions;
+--let $preserved_token_1= `SELECT TOKEN FROM performance_schema.preserved_transactions ORDER BY TOKEN LIMIT 1`
+--let $preserved_token_2= `SELECT TOKEN FROM performance_schema.preserved_transactions ORDER BY TOKEN LIMIT 1 OFFSET 1`
+--replace_result $preserved_token_1 TOKEN_1
+--eval RESUME PRESERVED TRANSACTION '$preserved_token_1'
+ROLLBACK;
+--replace_result $preserved_token_2 TOKEN_2
+--eval RESUME PRESERVED TRANSACTION '$preserved_token_2'
+ROLLBACK;
 
 SELECT COUNT(*) AS committed_rows_after_key_failclosed
   FROM t_key_rotation_batch;

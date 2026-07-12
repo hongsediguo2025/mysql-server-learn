@@ -12,6 +12,8 @@ DROP TABLE IF EXISTS t_key_rotation_hmac;
 CALL mtr.add_suppression("Preserved transaction .* recovery deferred cleanup: corrupt durable transaction snapshot");
 CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot");
 CALL mtr.add_suppression("RESUME PRESERVED TRANSACTION .* failed: token not found");
+CALL mtr.add_suppression("PRESERVE: failed to authenticate XID provenance before storage engine recovery");
+CALL mtr.add_suppression("Aborting");
 --enable_query_log
 
 CREATE USER preserve_key_reader@localhost;
@@ -96,16 +98,16 @@ write_bound_preserve_key($key, 'R' x 32);
 print "key replaced before restart\n";
 EOF
 
---echo # restart: --preserve-trx-enable=ON --skip-log-bin
---exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---enable_reconnect
---source include/wait_until_connected_again.inc
---disable_reconnect
+--let $_server_id= 1
+--let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--let $restart_parameters= --preserve-trx-enable=ON --skip-log-bin
+--source include/start_mysqld_expecting_crash.inc
 
 --let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
---let $grep_pattern= Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot
+--let $grep_pattern= PRESERVE: failed to authenticate XID provenance before storage engine recovery
 --let $wait_timeout= 30
 --source include/wait_for_pattern_in_file.inc
+--source suite/preserve_trx/include/wait_for_expected_crash.inc
 
 --perl
 use strict;
@@ -122,8 +124,18 @@ chmod(0600, $key) or die "cannot chmod restored key: $!";
 print "old_key_restored_after_failclosed\n1\n";
 EOF
 
+--exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
 SELECT COUNT(*) AS preserved_after_key_restore
   FROM performance_schema.preserved_transactions;
+--source $MYSQLTEST_VARDIR/tmp/key_rotation_old_token.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/key_rotation_old_token.inc
+--replace_result $old_key_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$old_key_token'
+ROLLBACK;
 SELECT * FROM t_key_rotation_hmac ORDER BY a;
 --source suite/preserve_trx/include/assert_no_preserve_residue.inc
 

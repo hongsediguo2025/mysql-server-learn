@@ -14,9 +14,6 @@ SELECT STATE, LAST_ERROR IS NOT NULL AS has_last_error
 FROM performance_schema.preserved_transactions;
 STATE	has_last_error
 FAILED	1
-# restart
-RESUME PRESERVED TRANSACTION 'TOKEN';
-ROLLBACK;
 SELECT * FROM t_single_snapshot_cleanup_observable ORDER BY id;
 id	v
 1	10

@@ -9,6 +9,7 @@ DROP TABLE IF EXISTS t_snapshot_header_corrupt_matrix;
 --disable_query_log
 CALL mtr.add_suppression("Preserved transaction .* recovery deferred cleanup: corrupt durable transaction snapshot");
 CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: unsupported durable transaction snapshot");
 --enable_query_log
 
 --let MYSQLD_DATADIR= `SELECT @@datadir`

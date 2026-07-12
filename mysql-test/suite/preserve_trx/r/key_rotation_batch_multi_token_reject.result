@@ -7,14 +7,19 @@ START TRANSACTION;
 INSERT INTO t_key_rotation_batch VALUES(2,20);
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 batch key replaced before restart
-# restart: --preserve-trx-enable=ON --skip-log-bin --preserve-trx-recovery-max-count=10
-include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot]
+# restart_abort: --preserve-trx-enable=ON --skip-log-bin --preserve-trx-recovery-max-count=10
+include/wait_for_pattern_in_file.inc [PRESERVE: failed to authenticate XID provenance before storage engine recovery]
+include/wait_for_expected_crash.inc [safe_process]
 batch_old_key_restored_after_failclosed
 1
 SELECT COUNT(*) AS preserved_count_after_key_failclosed
 FROM performance_schema.preserved_transactions;
 preserved_count_after_key_failclosed
-0
+2
+RESUME PRESERVED TRANSACTION 'TOKEN_1';
+ROLLBACK;
+RESUME PRESERVED TRANSACTION 'TOKEN_2';
+ROLLBACK;
 SELECT COUNT(*) AS committed_rows_after_key_failclosed
 FROM t_key_rotation_batch;
 committed_rows_after_key_failclosed
