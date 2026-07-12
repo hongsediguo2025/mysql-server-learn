@@ -43,6 +43,8 @@ SET DEBUG_SYNC = 'now SIGNAL continue_owner';
 --disconnect preserve_owner
 
 --connection default
+--let $wait_condition= SELECT COUNT(*) = 1 FROM performance_schema.preserved_transactions WHERE STATE = 'FAILED' AND LAST_ERROR IS NOT NULL AND LAST_ERROR_AT IS NOT NULL
+--source include/wait_condition.inc
 SELECT * FROM t_preserve_token_rollback_failure WHERE a=1;
 SELECT COUNT(*) AS preserved_count
   FROM performance_schema.preserved_transactions;
