@@ -3730,7 +3730,7 @@ static void innobase_post_recover() {
 
   if (srv_read_only_mode) {
     purge_sys->state = PURGE_STATE_DISABLED;
-    preserved_trx_mark_recovery_complete();
+    (void)preserved_trx_mark_innodb_read_only_recovery_state();
     return;
   }
 

@@ -117,7 +117,8 @@ dberr_t trx_preserve_rollback_by_token_for_thd(const char *token, THD *thd);
 dberr_t trx_preserve_rollback_claimed(trx_t *trx);
 bool trx_preserve_token_has_any_owner(const char *token);
 dberr_t trx_preserve_rollback_prepared_without_snapshot(
-    const std::vector<std::string> &snapshot_tokens, uint32_t *rolled_back);
+    const std::vector<std::string> &snapshot_tokens, uint32_t *rolled_back,
+    std::vector<std::string> *rolled_back_tokens = nullptr);
 dberr_t trx_preserve_prepare_resumed_rollback_gtid(trx_t *trx);
 dberr_t trx_preserve_activate_resumed(trx_t *trx);
 dberr_t trx_preserve_reactivate_prepared_in_original_thd(THD *thd);
@@ -134,7 +135,8 @@ enum class trx_preserve_thd_transition_failure {
   NOT_IN_MYSQL_TRX_LIST,
   THD_MISMATCH,
   CLAIMED,
-  UNDO_ACTIVATE_FAILED
+  UNDO_ACTIVATE_FAILED,
+  RECORD_LOCK_RESTORE_FAILED
 };
 
 const char *trx_preserve_thd_transition_failure_name(
@@ -142,6 +144,9 @@ const char *trx_preserve_thd_transition_failure_name(
 
 dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(
     THD *thd, trx_preserve_thd_transition_failure *reason = nullptr);
+dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(
+    THD *thd, const std::string &pre_prepare_record_locks_payload,
+    trx_preserve_thd_transition_failure *reason = nullptr);
 dberr_t trx_preserve_activate_reattached_in_original_thd(trx_t *trx, THD *thd);
 bool trx_preserve_is_active_attached_to_thd(trx_t *trx, THD *thd);
 dberr_t trx_preserve_prepare_current_temp_only(THD *thd, const XID &xid);

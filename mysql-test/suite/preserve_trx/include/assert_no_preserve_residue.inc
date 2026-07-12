@@ -60,6 +60,8 @@ while (defined(my $name = readdir($dh))) {
       $name =~ /\.(?:bin|bin\.tmp|binlog_cache|binlog_cache\.tmp)$/;
   my $is_blob =
       $name =~ /\.blob\.[A-Za-z0-9_-]+(?:\.tmp)?$/;
+  my $is_xid_provenance = $name eq '.xid_provenance' ||
+                          $name eq '.xid_provenance.tmp';
 
   next if $is_tainted && $allow_tainted;
   next if $is_temp && $allow_temp;
@@ -67,7 +69,7 @@ while (defined(my $name = readdir($dh))) {
 
   push @bad, $name if $is_snapshot || $is_blob || $is_tainted ||
                       $is_consume_state ||
-                      $is_temp || $is_warm;
+                      $is_temp || $is_warm || $is_xid_provenance;
 }
 closedir($dh);
 

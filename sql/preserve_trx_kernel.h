@@ -46,6 +46,9 @@ struct Preserve_trx_kernel_request {
   Preserve_trx_transfer_source_epoch_session *transfer_source_epoch_session{
       nullptr};
   std::string transfer_preserve_dir;
+  std::string preselected_token;
+  bool xid_provenance_intent_prepared{false};
+  bool defer_xid_provenance_bind{false};
 };
 
 struct Preserve_trx_kernel_result {

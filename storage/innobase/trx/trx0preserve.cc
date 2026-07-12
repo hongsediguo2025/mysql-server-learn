@@ -552,8 +552,10 @@ static bool trx_preserve_xid_token_in(
 }
 
 dberr_t trx_preserve_rollback_prepared_without_snapshot(
-    const std::vector<std::string> &snapshot_tokens, uint32_t *rolled_back) {
+    const std::vector<std::string> &snapshot_tokens, uint32_t *rolled_back,
+    std::vector<std::string> *rolled_back_tokens) {
   if (rolled_back != nullptr) *rolled_back = 0;
+  if (rolled_back_tokens != nullptr) rolled_back_tokens->clear();
   if (trx_sys == nullptr) return DB_SUCCESS;
 
   for (;;) {
@@ -570,6 +572,7 @@ dberr_t trx_preserve_rollback_prepared_without_snapshot(
           trx_state_eq(candidate, TRX_STATE_PREPARED) &&
           candidate->xid != nullptr &&
           xid_is_preserve_magic(*candidate->xid) &&
+          trx_preserve_xid_should_be_protected(*candidate->xid) &&
           !trx_preserve_xid_token_in(*candidate->xid, snapshot_tokens)) {
         candidate->preserve_trx_claimed = true;
         trx = candidate;
@@ -580,10 +583,19 @@ dberr_t trx_preserve_rollback_prepared_without_snapshot(
 
     if (trx == nullptr) return DB_SUCCESS;
 
+    std::string token;
+    if (rolled_back_tokens != nullptr && trx->xid != nullptr) {
+      const char *token_data =
+          trx->xid->get_data() + PRESERVE_TRX_XID_GTRID_LENGTH;
+      token.assign(token_data,
+                   static_cast<size_t>(trx->xid->get_bqual_length()));
+    }
     const dberr_t err = trx_preserve_rollback_claimed(trx);
     if (err != DB_SUCCESS) return err;
 
     if (rolled_back != nullptr) ++*rolled_back;
+    if (rolled_back_tokens != nullptr)
+      rolled_back_tokens->push_back(std::move(token));
   }
 }
 
@@ -726,12 +738,21 @@ const char *trx_preserve_thd_transition_failure_name(
       return "claimed";
     case trx_preserve_thd_transition_failure::UNDO_ACTIVATE_FAILED:
       return "undo_activate_failed";
+    case trx_preserve_thd_transition_failure::RECORD_LOCK_RESTORE_FAILED:
+      return "record_lock_restore_failed";
   }
   return "unknown";
 }
 
 dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(
     THD *thd, trx_preserve_thd_transition_failure *reason) {
+  return trx_preserve_reactivate_prepare_failure_in_original_thd(
+      thd, std::string(), reason);
+}
+
+dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(
+    THD *thd, const std::string &pre_prepare_record_locks_payload,
+    trx_preserve_thd_transition_failure *reason) {
   if (reason != nullptr) {
     *reason = trx_preserve_thd_transition_failure::NONE;
   }
@@ -791,6 +812,14 @@ dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(
   err = trx_preserve_activate_undo_state(trx);
   if (err != DB_SUCCESS && reason != nullptr) {
     *reason = trx_preserve_thd_transition_failure::UNDO_ACTIVATE_FAILED;
+  }
+  if (err != DB_SUCCESS) return err;
+
+  trx->skip_lock_inheritance = false;
+  err = lock_preserve_restore_record_locks_after_prepare_failure(
+      trx, pre_prepare_record_locks_payload);
+  if (err != DB_SUCCESS && reason != nullptr) {
+    *reason = trx_preserve_thd_transition_failure::RECORD_LOCK_RESTORE_FAILED;
   }
   return err;
 }

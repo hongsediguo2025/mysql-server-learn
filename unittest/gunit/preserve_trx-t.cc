@@ -3260,13 +3260,13 @@ class PreserveMagicXidPolicy : public ::testing::Test {
   ulong m_saved_policy{PRESERVE_TRX_OFF_ARTIFACT_POLICY_FAIL_IF_PRESENT};
 };
 
-TEST_F(PreserveMagicXidPolicy, EnabledFeatureProtectsMagicXid) {
+TEST_F(PreserveMagicXidPolicy, EnabledFeatureDoesNotProtectUnauthenticatedMagicXid) {
   preserve_trx_set_enable_value(true);
   preserve_trx_off_artifact_policy = PRESERVE_TRX_OFF_ARTIFACT_POLICY_IGNORE;
 
   const XID xid = preserve_magic_xid_for_test("policy_enabled");
-  EXPECT_TRUE(preserve_trx_magic_xid_should_be_protected(xid));
-  EXPECT_TRUE(trx_preserve_xid_should_be_protected(xid));
+  EXPECT_FALSE(preserve_trx_magic_xid_should_be_protected(xid));
+  EXPECT_FALSE(trx_preserve_xid_should_be_protected(xid));
 }
 
 TEST_F(PreserveMagicXidPolicy, IgnoreDoesNotProtectMagicXid) {
@@ -3278,7 +3278,7 @@ TEST_F(PreserveMagicXidPolicy, IgnoreDoesNotProtectMagicXid) {
   EXPECT_FALSE(trx_preserve_xid_should_be_protected(xid));
 }
 
-TEST_F(PreserveMagicXidPolicy, OffPoliciesRequireBackedArtifact) {
+TEST_F(PreserveMagicXidPolicy, OffPoliciesDoNotProtectUnauthenticatedMagicXid) {
   preserve_trx_set_enable_value(false);
   const XID xid = preserve_magic_xid_for_test("policy_missing_token");
 
@@ -3289,6 +3289,40 @@ TEST_F(PreserveMagicXidPolicy, OffPoliciesRequireBackedArtifact) {
   EXPECT_FALSE(preserve_trx_magic_xid_should_be_protected(xid));
   preserve_trx_off_artifact_policy = PRESERVE_TRX_OFF_ARTIFACT_POLICY_ABANDON;
   EXPECT_FALSE(preserve_trx_magic_xid_should_be_protected(xid));
+}
+
+TEST(PreserveTransactionParticipants, ReadOnlyUnsupportedEngineIsRejected) {
+  EXPECT_TRUE(preserve_trx_participant_type_is_supported_for_unit_test(
+      DB_TYPE_INNODB, Preserve_snapshot_binlog_state::SESSION_OFF_NO_CACHE));
+  EXPECT_TRUE(preserve_trx_participant_type_is_supported_for_unit_test(
+      DB_TYPE_BINLOG, Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE));
+  EXPECT_FALSE(preserve_trx_participant_type_is_supported_for_unit_test(
+      DB_TYPE_BINLOG,
+      Preserve_snapshot_binlog_state::SESSION_OFF_NO_CACHE));
+  EXPECT_FALSE(preserve_trx_participant_type_is_supported_for_unit_test(
+      DB_TYPE_MYISAM, Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE));
+}
+
+TEST(PreservePendingTokenDelivery, AtomicCountTracksUniqueThds) {
+  THD *first = reinterpret_cast<THD *>(static_cast<uintptr_t>(0x1000));
+  THD *second = reinterpret_cast<THD *>(static_cast<uintptr_t>(0x2000));
+  const size_t baseline =
+      preserved_trx_pending_token_delivery_count_for_unit_test();
+
+  preserved_trx_register_pending_token_delivery_for_unit_test(first, "one");
+  EXPECT_EQ(baseline + 1,
+            preserved_trx_pending_token_delivery_count_for_unit_test());
+  preserved_trx_register_pending_token_delivery_for_unit_test(first, "new");
+  EXPECT_EQ(baseline + 1,
+            preserved_trx_pending_token_delivery_count_for_unit_test());
+  preserved_trx_register_pending_token_delivery_for_unit_test(second, "two");
+  EXPECT_EQ(baseline + 2,
+            preserved_trx_pending_token_delivery_count_for_unit_test());
+
+  preserved_trx_erase_pending_token_delivery_for_unit_test(first);
+  preserved_trx_erase_pending_token_delivery_for_unit_test(second);
+  EXPECT_EQ(baseline,
+            preserved_trx_pending_token_delivery_count_for_unit_test());
 }
 
 TEST_F(PreservedTrxCommandRead,

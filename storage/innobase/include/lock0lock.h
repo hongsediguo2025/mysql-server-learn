@@ -702,6 +702,8 @@ const char *lock_preserve_last_record_lock_export_error();
 @return DB_SUCCESS or error */
 dberr_t lock_preserve_import_record_locks(trx_t *trx,
                                           const std::string &payload);
+dberr_t lock_preserve_restore_record_locks_after_prepare_failure(
+    trx_t *trx, const std::string &payload);
 dberr_t lock_preserve_import_record_locks(
     trx_t *trx, const std::string &payload,
     trx_preserve_record_lock_import_metrics_t *metrics);

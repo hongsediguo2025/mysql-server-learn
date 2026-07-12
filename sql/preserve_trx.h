@@ -437,6 +437,7 @@ struct Preserve_trx_preserve_result {
   const char *reactivate_failure_reason{nullptr};
   /* True when binlog cache semantics were logged into the snapshot. */
   bool logged_binlog_cache{false};
+  std::string snapshot_identity_digest;
   std::unique_ptr<Preserve_trx_source_rollback_image> source_rollback_image;
 };
 
@@ -502,6 +503,12 @@ void preserved_trx_set_manager_state_publication_probe_for_unit_test(
 void preserved_trx_set_manager_state_for_unit_test(
     Preserve_trx_manager_state state, my_thread_id owner_thread_id);
 void preserved_trx_set_recovery_complete_for_unit_test(bool complete);
+size_t preserved_trx_pending_token_delivery_count_for_unit_test();
+void preserved_trx_register_pending_token_delivery_for_unit_test(
+    THD *thd, const char *token);
+void preserved_trx_erase_pending_token_delivery_for_unit_test(THD *thd);
+bool preserve_trx_participant_type_is_supported_for_unit_test(
+    int legacy_type, Preserve_snapshot_binlog_state binlog_state);
 bool preserved_trx_probe_manager_state_guard_for_unit_test(
     Preserve_trx_manager_state to, my_thread_id owner_thread_id);
 void preserved_trx_add_record_for_unit_test(const std::string &token,
@@ -612,6 +619,7 @@ bool preserved_trx_recover_all();
 bool preserved_trx_recovery_complete();
 bool preserved_trx_local_record_exists(const std::string &token);
 void preserved_trx_mark_recovery_complete();
+bool preserved_trx_mark_innodb_read_only_recovery_state();
 
 struct Preserved_trx_promotion_ready_adopt_result {
   bool claimed{false};
@@ -681,7 +689,10 @@ bool preserve_trx_preserve_attached_transaction(
     bool defer_snapshot_directory_fsync = false,
     Preserve_trx_transfer_source_epoch_session *transfer_source_epoch_session =
         nullptr,
-    const std::string &transfer_preserve_dir = std::string());
+    const std::string &transfer_preserve_dir = std::string(),
+    const std::string &preselected_token = std::string(),
+    bool xid_provenance_intent_prepared = false,
+    bool defer_xid_provenance_bind = false);
 
 /*
   SQL command for preserving the current transaction before shutdown.

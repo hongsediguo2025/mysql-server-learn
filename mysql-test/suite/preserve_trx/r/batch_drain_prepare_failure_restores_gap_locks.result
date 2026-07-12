@@ -1,0 +1,31 @@
+DROP TABLE IF EXISTS t_prepare_failure_gap;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
+CREATE TABLE t_prepare_failure_gap(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_prepare_failure_gap VALUES(10, 10), (30, 30);
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE t_prepare_failure_gap SET v=11 WHERE id=10;
+SELECT * FROM t_prepare_failure_gap WHERE id BETWEEN 10 AND 30 FOR UPDATE;
+id	v
+10	11
+30	30
+SET DEBUG='+d,ib_force_release_gap_lock_prepare';
+SET DEBUG='+d,preserve_trx_fail_after_undo_prepared';
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET DEBUG='-d,preserve_trx_fail_after_undo_prepared';
+SET DEBUG='-d,ib_force_release_gap_lock_prepare';
+SET innodb_lock_wait_timeout=1;
+INSERT INTO t_prepare_failure_gap VALUES(20, 20);
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+ROLLBACK;
+INSERT INTO t_prepare_failure_gap VALUES(20, 20);
+COMMIT;
+SELECT * FROM t_prepare_failure_gap ORDER BY id;
+id	v
+10	10
+20	20
+30	30
+DROP TABLE t_prepare_failure_gap;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;

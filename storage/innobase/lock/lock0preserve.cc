@@ -1846,7 +1846,8 @@ static dberr_t lock_preserve_import_predicate_lock(
 static dberr_t lock_preserve_import_record_lock(
     trx_t *trx, const Preserve_record_lock_entry &entry,
     trx_preserve_record_lock_import_metrics_t *metrics,
-    Lock_preserve_import_context *import_context) {
+    Lock_preserve_import_context *import_context,
+    bool merge_existing_for_same_trx = false) {
   if (lock_preserve_entry_is_predicate(entry)) {
     return lock_preserve_import_predicate_lock(trx, entry);
   }
@@ -1926,11 +1927,48 @@ static dberr_t lock_preserve_import_record_lock(
         lock_preserve_record_entry_has_conflict(trx, resolved_entry,
                                                 block->get_page_id());
     if (!has_conflict) {
+      Preserve_record_lock_entry import_entry = resolved_entry;
+      if (merge_existing_for_same_trx) {
+        for (lock_t *existing = lock_rec_get_first_on_page_addr(
+                 lock_sys->rec_hash, block->get_page_id());
+             existing != nullptr;
+             existing = lock_rec_get_next_on_page(existing)) {
+          if (existing->trx != trx ||
+              (existing->type_mode & ~LOCK_WAIT) !=
+                  (resolved_entry.type_mode & ~LOCK_WAIT)) {
+            continue;
+          }
+          const ulint existing_bits = lock_rec_get_n_bits(existing);
+          for (uint32_t heap_no = 0; heap_no < import_entry.n_bits; ++heap_no) {
+            if (heap_no < existing_bits &&
+                lock_rec_get_nth_bit(existing, heap_no)) {
+              import_entry.bitmap[heap_no / 8] &=
+                  static_cast<char>(~(1U << (heap_no % 8)));
+            }
+          }
+        }
+        import_entry.first_set_heap_no = UINT32_MAX;
+        import_entry.set_bits = 0;
+        for (uint32_t heap_no = 0; heap_no < import_entry.n_bits; ++heap_no) {
+          if ((static_cast<unsigned char>(
+                   import_entry.bitmap[heap_no / 8]) &
+               static_cast<unsigned char>(1U << (heap_no % 8))) == 0) {
+            continue;
+          }
+          if (import_entry.first_set_heap_no == UINT32_MAX)
+            import_entry.first_set_heap_no = heap_no;
+          ++import_entry.set_bits;
+        }
+        if (import_entry.set_bits == 0) {
+          mtr_commit(&mtr);
+          return DB_SUCCESS;
+        }
+      }
       trx_mutex_enter(trx);
       const bool imported = lock_preserve_add_record_bitmap_for_import(
-          resolved_entry.type_mode, block, resolved_entry.n_bits,
-          reinterpret_cast<const byte *>(resolved_entry.bitmap.data()),
-          resolved_entry.bitmap.size(), resolved_entry.first_set_heap_no, index,
+          import_entry.type_mode, block, import_entry.n_bits,
+          reinterpret_cast<const byte *>(import_entry.bitmap.data()),
+          import_entry.bitmap.size(), import_entry.first_set_heap_no, index,
           trx);
       trx_mutex_exit(trx);
       if (!imported) {
@@ -1941,7 +1979,7 @@ static dberr_t lock_preserve_import_record_lock(
       }
       if (metrics != nullptr) {
         ++metrics->bitmap_pages;
-        metrics->bitmap_bits += resolved_entry.set_bits;
+        metrics->bitmap_bits += import_entry.set_bits;
       }
     }
   }
@@ -2930,6 +2968,26 @@ dberr_t lock_preserve_import_record_locks(
 dberr_t lock_preserve_import_record_locks(trx_t *trx,
                                           const std::string &payload) {
   return lock_preserve_import_record_locks(trx, payload, nullptr);
+}
+
+dberr_t lock_preserve_restore_record_locks_after_prepare_failure(
+    trx_t *trx, const std::string &payload) {
+  if (payload.empty()) return DB_SUCCESS;
+  if (trx == nullptr) return DB_ERROR;
+
+  std::vector<Preserve_record_lock_entry> entries;
+  const dberr_t parse_err =
+      lock_preserve_parse_record_locks_payload(payload, &entries);
+  if (parse_err != DB_SUCCESS) return parse_err;
+  lock_preserve_sort_record_lock_entries_for_import(&entries);
+
+  Lock_preserve_import_context import_context;
+  for (Preserve_record_lock_entry &entry : entries) {
+    const dberr_t err = lock_preserve_import_record_lock(
+        trx, entry, nullptr, &import_context, true);
+    if (err != DB_SUCCESS) return err;
+  }
+  return DB_SUCCESS;
 }
 
 constexpr uint32_t kPreserveTableLockEntryStaticLength =

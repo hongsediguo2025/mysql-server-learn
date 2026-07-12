@@ -41,11 +41,15 @@
 #include <new>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include <openssl/crypto.h>
+#include <openssl/hmac.h>
 
 #include "mem_root_deque.h"
 #include "m_string.h"
@@ -159,7 +163,6 @@ bool preserve_trx_recover_lock_page_prefetch = true;
 extern ulong srv_force_recovery;
 extern ulong srv_rollback_segments;
 extern bool recv_needed_recovery;
-
 static std::atomic<bool> g_preserve_trx_enable_cached{true};
 static std::atomic<bool> g_preserve_trx_enable_cache_initialized{false};
 
@@ -264,6 +267,7 @@ constexpr size_t kUserVariableEntryFixedLength = 12;
 
 std::string normalize_dir(std::string dir);
 std::string preserve_trx_default_dir();
+static bool preserve_trx_xid_provenance_ledger_presence(bool *exists);
 
 bool preserved_trx_startup_needed_crash_recovery() {
   DBUG_EXECUTE_IF("preserve_trx_force_crash_recovery_abandon_guard",
@@ -330,12 +334,23 @@ static bool preserve_trx_off_artifact_preflight(const char *phase) {
     return true;
   }
 
-  if (!preserved_trx_listing_has_any_artifact(listing)) return false;
+  bool xid_provenance_present = false;
+  if (preserve_trx_xid_provenance_ledger_presence(
+          &xid_provenance_present)) {
+    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+           "PRESERVE: failed to inspect XID provenance during OFF artifact "
+           "preflight");
+    return true;
+  }
+  if (!preserved_trx_listing_has_any_artifact(listing) &&
+      !xid_provenance_present)
+    return false;
 
   std::string message =
       "PRESERVE: preserve_trx_enable=OFF found historical Preserve/Resume "
       "artifacts under '" +
       dir + "' (" + preserved_trx_listing_artifact_summary(listing) +
+      ", xid_provenance=" + std::to_string(xid_provenance_present ? 1 : 0) +
       "). Start with preserve_trx_enable=ON to recover them, use "
       "preserve_trx_off_artifact_policy=ABANDON for explicit rollback/"
       "cleanup, or use IGNORE only after external HA tooling has removed or "
@@ -484,6 +499,10 @@ constexpr char kPreservedTrxRecoveryAttemptLedgerFilename[] =
     ".recovery_attempt_ledger";
 constexpr char kPreservedTrxRecoveryAttemptLedgerMagic[] =
     "PTRX_RECOVERY_ATTEMPT_LEDGER_V1";
+constexpr char kPreservedTrxXidProvenanceLedgerFilename[] =
+    ".xid_provenance";
+constexpr char kPreservedTrxXidProvenanceLedgerMagic[] =
+    "PTRX_XID_PROVENANCE_LEDGER_V1";
 
 void preserve_trx_warmcopy_reset_status() {
   g_warmcopy_prefix_bytes.store(0);
@@ -709,6 +728,7 @@ struct Preserve_user_var_snapshot_entry {
 std::mutex g_preserved_trx_mutex;
 std::condition_variable g_preserved_trx_recovery_cond;
 bool g_preserved_trx_recovery_done = false;
+bool g_preserved_trx_recovery_deferred = false;
 std::vector<Preserved_trx_record> g_preserved_trx_records;
 std::mutex g_preserved_trx_reaper_mutex;
 std::condition_variable g_preserved_trx_reaper_cond;
@@ -931,6 +951,7 @@ struct Preserve_trx_pinned_thd {
 };
 std::mutex g_token_delivery_mutex;
 std::unordered_map<THD *, Pending_token_delivery> g_pending_token_delivery;
+std::atomic<size_t> g_pending_token_delivery_count{0};
 std::atomic<bool> g_deferred_shutdown_signal_requested{false};
 
 std::string lex_cstring_to_string(LEX_CSTRING value) {
@@ -1437,16 +1458,26 @@ bool preserved_trx_mark_resumable(const std::string &token) {
 void preserved_trx_register_pending_token_delivery(THD *thd,
                                                    const std::string &token) {
   std::lock_guard<std::mutex> lock(g_token_delivery_mutex);
-  g_pending_token_delivery[thd] = {token, false, false, false};
+  const auto inserted = g_pending_token_delivery.emplace(
+      thd, Pending_token_delivery{token, false, false, false});
+  if (inserted.second) {
+    g_pending_token_delivery_count.fetch_add(1, std::memory_order_release);
+  } else {
+    inserted.first->second = {token, false, false, false};
+  }
 }
 
 bool preserved_trx_has_pending_token_delivery(THD *thd) {
+  if (g_pending_token_delivery_count.load(std::memory_order_acquire) == 0)
+    return false;
   std::lock_guard<std::mutex> lock(g_token_delivery_mutex);
   return g_pending_token_delivery.find(thd) != g_pending_token_delivery.end();
 }
 
 void note_pending_token_delivery_statement_response(THD *thd) {
   if (thd == nullptr) return;
+  if (g_pending_token_delivery_count.load(std::memory_order_acquire) == 0)
+    return;
 
   std::lock_guard<std::mutex> lock(g_token_delivery_mutex);
   auto it = g_pending_token_delivery.find(thd);
@@ -1479,16 +1510,30 @@ bool preserved_trx_begin_pending_token_delivery_finalization(THD *thd,
 
 void preserved_trx_erase_pending_token_delivery(THD *thd) {
   std::lock_guard<std::mutex> lock(g_token_delivery_mutex);
-  g_pending_token_delivery.erase(thd);
+  if (g_pending_token_delivery.erase(thd) != 0) {
+    const size_t previous =
+        g_pending_token_delivery_count.fetch_sub(1, std::memory_order_acq_rel);
+    assert(previous != 0);
+  }
 }
 
 void mark_preserved_trx_recovery_complete() {
   {
     std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
+    g_preserved_trx_recovery_deferred = false;
     g_preserved_trx_recovery_done = true;
   }
   g_preserved_trx_recovery_cond.notify_all();
   preserved_trx_start_expired_reaper_if_ready();
+}
+
+void mark_preserved_trx_recovery_deferred() {
+  {
+    std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
+    g_preserved_trx_recovery_deferred = true;
+    g_preserved_trx_recovery_done = true;
+  }
+  g_preserved_trx_recovery_cond.notify_all();
 }
 
 void preserved_trx_wait_recovery_complete() {
@@ -1641,6 +1686,403 @@ static bool preserved_trx_write_recovery_attempt_ledger(
   return error;
 }
 
+enum class Preserve_trx_xid_provenance_state : uint8_t {
+  PREPARED_INTENT = 1,
+  SNAPSHOT_BOUND = 2
+};
+
+struct Preserve_trx_xid_provenance_record {
+  Preserve_trx_xid_provenance_state state{
+      Preserve_trx_xid_provenance_state::PREPARED_INTENT};
+  std::string generation;
+  std::string snapshot_identity_digest;
+};
+
+using Preserve_trx_xid_provenance_map =
+    std::map<std::string, Preserve_trx_xid_provenance_record, std::less<>>;
+
+std::mutex g_preserve_trx_xid_provenance_write_mutex;
+std::shared_ptr<const Preserve_trx_xid_provenance_map>
+    g_preserve_trx_xid_provenance =
+        std::make_shared<const Preserve_trx_xid_provenance_map>();
+
+bool preserve_trx_xid_codec_context(
+    Preserved_trx_codec_context_purpose purpose,
+    Preserved_trx_codec_context *context);
+
+static std::string preserve_trx_hex(const unsigned char *bytes, size_t length) {
+  static constexpr char kHexDigits[] = "0123456789abcdef";
+  std::string encoded(length * 2, '0');
+  for (size_t index = 0; index < length; ++index) {
+    encoded[index * 2] = kHexDigits[bytes[index] >> 4];
+    encoded[index * 2 + 1] = kHexDigits[bytes[index] & 0x0f];
+  }
+  return encoded;
+}
+
+static bool preserve_trx_lower_hex(const std::string &value,
+                                   size_t expected_length) {
+  return value.length() == expected_length &&
+         std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+           return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+         });
+}
+
+static bool preserve_trx_hmac_hex(const std::string &payload,
+                                  std::string *digest) {
+  if (digest == nullptr) return true;
+  Preserved_trx_codec_context context;
+  if (preserve_trx_xid_codec_context(
+          Preserved_trx_codec_context_purpose::READ_EXISTING, &context)) {
+    return true;
+  }
+  unsigned char bytes[EVP_MAX_MD_SIZE]{};
+  unsigned int length = 0;
+  if (HMAC(EVP_sha256(), context.hmac_key.data(), context.hmac_key.size(),
+           reinterpret_cast<const unsigned char *>(payload.data()),
+           payload.size(), bytes, &length) == nullptr || length != 32) {
+    return true;
+  }
+  *digest = preserve_trx_hex(bytes, length);
+  return false;
+}
+
+static std::string preserve_trx_xid_provenance_ledger_path(
+    const std::string &dir) {
+  return normalize_dir(dir) + kPreservedTrxXidProvenanceLedgerFilename;
+}
+
+static bool preserve_trx_xid_provenance_ledger_presence(bool *exists) {
+  if (exists == nullptr) return true;
+  *exists = false;
+  const std::string path =
+      preserve_trx_xid_provenance_ledger_path(preserve_trx_default_dir());
+  if (my_access(path.c_str(), F_OK) == 0) {
+    *exists = true;
+    return false;
+  }
+  return my_errno() != ENOENT;
+}
+
+static bool preserve_trx_encode_xid_provenance_ledger(
+    const Preserve_trx_xid_provenance_map &records, std::string *encoded) {
+  if (encoded == nullptr || records.size() > 100000) return true;
+  std::ostringstream body;
+  body << kPreservedTrxXidProvenanceLedgerMagic << '\n';
+  for (const auto &entry : records) {
+    if (!token_is_filename_safe(entry.first) ||
+        !preserve_trx_lower_hex(entry.second.generation, 32) ||
+        (entry.second.state ==
+             Preserve_trx_xid_provenance_state::SNAPSHOT_BOUND &&
+         !preserve_trx_lower_hex(entry.second.snapshot_identity_digest, 64)) ||
+        (entry.second.state ==
+             Preserve_trx_xid_provenance_state::PREPARED_INTENT &&
+         !entry.second.snapshot_identity_digest.empty())) {
+      return true;
+    }
+    body << entry.first << ' '
+         << (entry.second.state ==
+                     Preserve_trx_xid_provenance_state::SNAPSHOT_BOUND
+                 ? 'B'
+                 : 'P')
+         << ' ' << entry.second.generation << ' '
+         << (entry.second.snapshot_identity_digest.empty()
+                 ? "-"
+                 : entry.second.snapshot_identity_digest)
+         << '\n';
+  }
+  std::string digest;
+  if (preserve_trx_hmac_hex(body.str(), &digest)) return true;
+  *encoded = body.str() + "hmac " + digest + "\n";
+  return false;
+}
+
+static bool preserve_trx_decode_xid_provenance_ledger(
+    const std::string &encoded, Preserve_trx_xid_provenance_map *records) {
+  if (records == nullptr || encoded.empty() || encoded.size() > 16 * 1024 * 1024)
+    return true;
+  const size_t hmac_offset = encoded.rfind("hmac ");
+  if (hmac_offset == std::string::npos || hmac_offset == 0 ||
+      encoded.back() != '\n') {
+    return true;
+  }
+  const std::string body = encoded.substr(0, hmac_offset);
+  const std::string supplied_digest =
+      encoded.substr(hmac_offset + 5, encoded.size() - hmac_offset - 6);
+  if (!preserve_trx_lower_hex(supplied_digest, 64)) return true;
+  std::string expected_digest;
+  if (preserve_trx_hmac_hex(body, &expected_digest) ||
+      CRYPTO_memcmp(supplied_digest.data(), expected_digest.data(),
+                    expected_digest.size()) != 0) {
+    return true;
+  }
+
+  std::istringstream input(body);
+  std::string line;
+  if (!std::getline(input, line) ||
+      line != kPreservedTrxXidProvenanceLedgerMagic) {
+    return true;
+  }
+  Preserve_trx_xid_provenance_map parsed;
+  while (std::getline(input, line)) {
+    if (line.empty()) continue;
+    std::istringstream fields(line);
+    std::string token;
+    std::string state;
+    std::string generation;
+    std::string snapshot_digest;
+    std::string trailing;
+    if (!(fields >> token >> state >> generation >> snapshot_digest) ||
+        (fields >> trailing) || !token_is_filename_safe(token) ||
+        !preserve_trx_lower_hex(generation, 32) ||
+        (state != "P" && state != "B") ||
+        (state == "P" && snapshot_digest != "-") ||
+        (state == "B" && !preserve_trx_lower_hex(snapshot_digest, 64))) {
+      return true;
+    }
+    Preserve_trx_xid_provenance_record record;
+    record.state = state == "B"
+                       ? Preserve_trx_xid_provenance_state::SNAPSHOT_BOUND
+                       : Preserve_trx_xid_provenance_state::PREPARED_INTENT;
+    record.generation = std::move(generation);
+    if (state == "B") record.snapshot_identity_digest = std::move(snapshot_digest);
+    if (!parsed.emplace(std::move(token), std::move(record)).second ||
+        parsed.size() > 100000) {
+      return true;
+    }
+  }
+  *records = std::move(parsed);
+  return false;
+}
+
+static bool preserve_trx_read_xid_provenance_ledger(
+    const std::string &dir, Preserve_trx_xid_provenance_map *records) {
+  if (records == nullptr) return true;
+  records->clear();
+  const std::string path = preserve_trx_xid_provenance_ledger_path(dir);
+  File file = my_open(path.c_str(), O_RDONLY | O_NOFOLLOW, MYF(0));
+  if (file < 0) return my_errno() == ENOENT ? false : true;
+  const my_off_t size = my_seek(file, 0, MY_SEEK_END, MYF(0));
+  bool error = size == MY_FILEPOS_ERROR || size <= 0 ||
+               size > static_cast<my_off_t>(16 * 1024 * 1024) ||
+               my_seek(file, 0, MY_SEEK_SET, MYF(0)) == MY_FILEPOS_ERROR;
+  std::string encoded;
+  if (!error) {
+    encoded.resize(static_cast<size_t>(size));
+    error = my_read(file, reinterpret_cast<unsigned char *>(&encoded[0]),
+                    encoded.size(), MYF(0)) != encoded.size();
+  }
+  if (my_close(file, MYF(0))) error = true;
+  return error || preserve_trx_decode_xid_provenance_ledger(encoded, records);
+}
+
+static bool preserve_trx_write_xid_provenance_ledger(
+    const std::string &dir, const Preserve_trx_xid_provenance_map &records) {
+  DBUG_EXECUTE_IF("preserve_trx_fail_xid_provenance_write", return true;);
+  const std::string path = preserve_trx_xid_provenance_ledger_path(dir);
+  if (records.empty()) {
+    if (my_delete(path.c_str(), MYF(0)) && my_errno() != ENOENT) return true;
+    return preserve_trx_fsync_default_store_directory(dir) !=
+           Preserve_snapshot_status::OK;
+  }
+  std::string encoded;
+  if (preserve_trx_encode_xid_provenance_ledger(records, &encoded)) return true;
+  const std::string tmp_path = path + ".tmp";
+  (void)my_delete(tmp_path.c_str(), MYF(0));
+  File file = my_create(tmp_path.c_str(), 0600,
+                        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, MYF(0));
+  if (file < 0) return true;
+  bool error = !preserved_trx_write_all(file, encoded);
+  if (!error && my_sync(file, MYF(0))) error = true;
+  if (my_close(file, MYF(0))) error = true;
+  if (!error && my_rename(tmp_path.c_str(), path.c_str(), MYF(0))) error = true;
+  if (!error &&
+      preserve_trx_fsync_default_store_directory(dir) !=
+          Preserve_snapshot_status::OK) {
+    error = true;
+  }
+  if (error) (void)my_delete(tmp_path.c_str(), MYF(0));
+  return error;
+}
+
+static bool preserve_trx_prepare_xid_provenance_publication(
+    const Preserve_trx_xid_provenance_map &records,
+    std::shared_ptr<const Preserve_trx_xid_provenance_map> *published) {
+  if (published == nullptr) return true;
+  try {
+    *published =
+        std::make_shared<const Preserve_trx_xid_provenance_map>(records);
+  } catch (const std::bad_alloc &) {
+    published->reset();
+    return true;
+  }
+  return false;
+}
+
+static void preserve_trx_publish_xid_provenance_map(
+    std::shared_ptr<const Preserve_trx_xid_provenance_map> published) {
+  std::atomic_store_explicit(&g_preserve_trx_xid_provenance,
+                             std::move(published), std::memory_order_release);
+}
+
+static std::shared_ptr<const Preserve_trx_xid_provenance_map>
+preserve_trx_xid_provenance_snapshot() {
+  return std::atomic_load_explicit(&g_preserve_trx_xid_provenance,
+                                   std::memory_order_acquire);
+}
+
+static bool preserve_trx_xid_provenance_contains(std::string_view token) {
+  const auto records = preserve_trx_xid_provenance_snapshot();
+  return records != nullptr && records->find(token) != records->end();
+}
+
+static bool preserve_trx_xid_provenance_has_state(
+    std::string_view token, Preserve_trx_xid_provenance_state state) {
+  const auto records = preserve_trx_xid_provenance_snapshot();
+  if (records == nullptr) return false;
+  const auto found = records->find(token);
+  return found != records->end() && found->second.state == state;
+}
+
+static bool preserve_trx_xid_provenance_begin_many(
+    const std::vector<std::string> &tokens) {
+  if (tokens.empty()) return false;
+  std::lock_guard<std::mutex> lock(g_preserve_trx_xid_provenance_write_mutex);
+  Preserve_trx_xid_provenance_map records =
+      *preserve_trx_xid_provenance_snapshot();
+  if (tokens.size() > 100000 || records.size() > 100000 - tokens.size())
+    return true;
+  std::set<std::string> unique_tokens;
+  for (const std::string &token : tokens) {
+    if (!token_is_filename_safe(token) || !unique_tokens.insert(token).second ||
+        records.find(token) != records.end()) {
+      return true;
+    }
+    std::array<unsigned char, 16> generation{};
+    if (my_rand_buffer(generation.data(), generation.size())) return true;
+    Preserve_trx_xid_provenance_record record;
+    record.generation = preserve_trx_hex(generation.data(), generation.size());
+    records.emplace(token, std::move(record));
+  }
+  std::shared_ptr<const Preserve_trx_xid_provenance_map> published;
+  if (preserve_trx_prepare_xid_provenance_publication(records, &published))
+    return true;
+  if (preserve_trx_write_xid_provenance_ledger(preserve_trx_default_dir(),
+                                               records)) {
+    return true;
+  }
+  preserve_trx_publish_xid_provenance_map(std::move(published));
+  return false;
+}
+
+static bool preserve_trx_xid_provenance_begin(const std::string &token) {
+  return preserve_trx_xid_provenance_begin_many({token});
+}
+
+using Preserve_trx_xid_provenance_binding =
+    std::pair<std::string, std::string>;
+
+static bool preserve_trx_xid_provenance_bind_many(
+    const std::vector<Preserve_trx_xid_provenance_binding> &bindings) {
+  DBUG_EXECUTE_IF("preserve_trx_fail_xid_provenance_bind", return true;);
+  if (bindings.empty()) return false;
+  std::lock_guard<std::mutex> lock(g_preserve_trx_xid_provenance_write_mutex);
+  Preserve_trx_xid_provenance_map records =
+      *preserve_trx_xid_provenance_snapshot();
+  std::set<std::string> unique_tokens;
+  for (const Preserve_trx_xid_provenance_binding &binding : bindings) {
+    if (!token_is_filename_safe(binding.first) ||
+        !preserve_trx_lower_hex(binding.second, 64) ||
+        !unique_tokens.insert(binding.first).second) {
+      return true;
+    }
+    auto found = records.find(binding.first);
+    if (found == records.end() ||
+        found->second.state !=
+            Preserve_trx_xid_provenance_state::PREPARED_INTENT) {
+      return true;
+    }
+    found->second.state = Preserve_trx_xid_provenance_state::SNAPSHOT_BOUND;
+    found->second.snapshot_identity_digest = binding.second;
+  }
+  std::shared_ptr<const Preserve_trx_xid_provenance_map> published;
+  if (preserve_trx_prepare_xid_provenance_publication(records, &published))
+    return true;
+  if (preserve_trx_write_xid_provenance_ledger(preserve_trx_default_dir(),
+                                               records)) {
+    return true;
+  }
+  preserve_trx_publish_xid_provenance_map(std::move(published));
+  return false;
+}
+
+static bool preserve_trx_xid_provenance_bind(
+    const std::string &token, const std::string &snapshot_identity_digest) {
+  return preserve_trx_xid_provenance_bind_many(
+      {{token, snapshot_identity_digest}});
+}
+
+static bool preserve_trx_xid_provenance_remove_many(
+    const std::vector<std::string> &tokens) {
+  if (tokens.empty()) return false;
+  std::lock_guard<std::mutex> lock(g_preserve_trx_xid_provenance_write_mutex);
+  Preserve_trx_xid_provenance_map records =
+      *preserve_trx_xid_provenance_snapshot();
+  bool changed = false;
+  for (const std::string &token : tokens) {
+    changed = records.erase(token) != 0 || changed;
+  }
+  if (!changed) return false;
+  std::shared_ptr<const Preserve_trx_xid_provenance_map> published;
+  if (preserve_trx_prepare_xid_provenance_publication(records, &published))
+    return true;
+  if (preserve_trx_write_xid_provenance_ledger(preserve_trx_default_dir(),
+                                               records)) {
+    return true;
+  }
+  preserve_trx_publish_xid_provenance_map(std::move(published));
+  return false;
+}
+
+static bool preserve_trx_xid_provenance_remove(const std::string &token) {
+  return preserve_trx_xid_provenance_remove_many({token});
+}
+
+static bool preserve_trx_xid_provenance_preload(
+    Preserve_trx_xid_provenance_map *records) {
+  if (records == nullptr) return true;
+  std::lock_guard<std::mutex> lock(g_preserve_trx_xid_provenance_write_mutex);
+  Preserve_trx_xid_provenance_map loaded;
+  if (preserve_trx_read_xid_provenance_ledger(preserve_trx_default_dir(),
+                                              &loaded)) {
+    return true;
+  }
+  std::shared_ptr<const Preserve_trx_xid_provenance_map> published;
+  if (preserve_trx_prepare_xid_provenance_publication(loaded, &published))
+    return true;
+  *records = loaded;
+  preserve_trx_publish_xid_provenance_map(std::move(published));
+  return false;
+}
+
+static bool preserve_trx_snapshot_identity_digest(
+    const Preserve_snapshot_metadata &metadata, std::string *digest) {
+  std::ostringstream canonical;
+  canonical << "PTRX_SNAPSHOT_IDENTITY_V1\n"
+            << metadata.token.length() << ':' << metadata.token << '\n'
+            << metadata.owner_user.length() << ':' << metadata.owner_user
+            << '\n'
+            << metadata.owner_host.length() << ':' << metadata.owner_host
+            << '\n'
+            << metadata.created_at_us << '\n'
+            << metadata.expires_at_us << '\n'
+            << static_cast<unsigned>(metadata.engine_shape) << '\n'
+            << metadata.has_persistent_engine_state << '\n'
+            << metadata.has_temp_engine_state << '\n'
+            << metadata.has_logged_persistent_work << '\n';
+  return preserve_trx_hmac_hex(canonical.str(), digest);
+}
+
 static bool preserved_trx_publish_recovery_attempt_ledger(
     const std::string &dir, const std::set<std::string> &snapshot_tokens,
     Preserved_trx_recovery_attempt_ledger *ledger) {
@@ -1708,6 +2150,31 @@ bool preserved_trx_file_exists_for_token(const std::string &token) {
       preserve_trx_default_dir(), token);
 }
 
+std::mutex g_preserve_trx_xid_codec_context_mutex;
+bool g_preserve_trx_xid_codec_context_valid = false;
+Preserved_trx_codec_context g_preserve_trx_xid_codec_context;
+
+bool preserve_trx_xid_codec_context(
+    Preserved_trx_codec_context_purpose purpose,
+    Preserved_trx_codec_context *context) {
+  if (context == nullptr) return true;
+  std::lock_guard<std::mutex> lock(g_preserve_trx_xid_codec_context_mutex);
+  if (g_preserve_trx_xid_codec_context_valid) {
+    *context = g_preserve_trx_xid_codec_context;
+    return false;
+  }
+
+  auto store = create_preserved_trx_default_store(preserve_trx_default_dir());
+  Preserved_trx_codec_context loaded;
+  if (store->codec_context(&loaded, purpose) != Preserve_snapshot_status::OK) {
+    return true;
+  }
+  g_preserve_trx_xid_codec_context = loaded;
+  g_preserve_trx_xid_codec_context_valid = true;
+  *context = loaded;
+  return false;
+}
+
 bool preserve_trx_magic_xid_has_snapshot_impl(const XID &xid) {
   if (!xid_is_preserve_magic(xid)) return false;
 
@@ -1715,9 +2182,22 @@ bool preserve_trx_magic_xid_has_snapshot_impl(const XID &xid) {
       xid.get_data() + static_cast<size_t>(PRESERVE_TRX_XID_GTRID_LENGTH);
   const size_t token_length = static_cast<size_t>(xid.get_bqual_length());
   const std::string token_string(token, token_length);
-  if (!token_is_filename_safe(token_string)) return false;
 
-  return preserved_trx_file_exists_for_token(token_string);
+  auto store = create_preserved_trx_default_store(preserve_trx_default_dir());
+  Preserved_trx_bundle bundle;
+  return store->read(token_string, true,
+                     Preserved_trx_carrier::Payload_read_mode::METADATA_ONLY,
+                     &bundle) == Preserve_snapshot_status::OK &&
+         bundle.metadata.token == token_string;
+}
+
+static bool preserve_trx_token_collides(const std::string &token) {
+  {
+    std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
+    if (preserved_trx_record_exists_locked(token)) return true;
+  }
+  return preserve_trx_xid_provenance_contains(token) ||
+         preserved_trx_file_exists_for_token(token);
 }
 
 bool generate_preserve_trx_token(std::string *token) {
@@ -1737,11 +2217,7 @@ bool generate_preserve_trx_token(std::string *token) {
       candidate[i * 2 + 1] = kHexDigits[random_bytes[i] & 0x0f];
     }
 
-    {
-      std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
-      if (preserved_trx_record_exists_locked(candidate)) continue;
-    }
-    if (preserved_trx_file_exists_for_token(candidate)) continue;
+    if (preserve_trx_token_collides(candidate)) continue;
 
     *token = std::move(candidate);
     return false;
@@ -1759,9 +2235,33 @@ struct Preserve_trx_token_selection {
 
 static bool preserve_trx_select_token_for_request(
     THD *target_thd, Preserve_trx_transfer_artifact_decision artifact_decision,
+    const std::string &preselected_token,
     Preserve_trx_token_selection *selection) {
   if (selection == nullptr) return true;
   *selection = Preserve_trx_token_selection{};
+
+  if (!preselected_token.empty()) {
+    if (!token_is_filename_safe(preselected_token) ||
+        !preserve_trx_xid_provenance_has_state(
+            preselected_token,
+            Preserve_trx_xid_provenance_state::PREPARED_INTENT)) {
+      selection->failure_reason = "batch_preselected_token_not_reserved";
+      return true;
+    }
+    if (artifact_decision ==
+        Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE) {
+      if (target_thd == nullptr || target_thd->thread_id() == 0 ||
+          preselected_token != std::to_string(target_thd->thread_id())) {
+        selection->failure_reason = "batch_preselected_transfer_token_mismatch";
+        return true;
+      }
+      selection->transfer_token =
+          static_cast<uint64_t>(target_thd->thread_id());
+      selection->is_transfer_token = true;
+    }
+    selection->preserve_token_string = preselected_token;
+    return false;
+  }
 
   if (artifact_decision !=
       Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE) {
@@ -1790,14 +2290,7 @@ static bool preserve_trx_select_token_for_request(
     return true;
   }
 
-  {
-    std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
-    if (preserved_trx_record_exists_locked(token_string)) {
-      selection->failure_reason = "standby_transfer_token_collision";
-      return true;
-    }
-  }
-  if (preserved_trx_file_exists_for_token(token_string)) {
+  if (preserve_trx_token_collides(token_string)) {
     selection->failure_reason = "standby_transfer_token_collision";
     return true;
   }
@@ -1805,6 +2298,33 @@ static bool preserve_trx_select_token_for_request(
   selection->preserve_token_string = token_string;
   selection->transfer_token = transfer_token;
   selection->is_transfer_token = true;
+  return false;
+}
+
+static bool preserve_trx_select_batch_tokens(
+    const std::vector<my_thread_id> &target_thread_ids,
+    Preserve_trx_transfer_artifact_decision artifact_decision,
+    std::map<my_thread_id, std::string> *tokens_by_thread_id,
+    std::vector<std::string> *tokens) {
+  if (tokens_by_thread_id == nullptr || tokens == nullptr) return true;
+  tokens_by_thread_id->clear();
+  tokens->clear();
+  tokens->reserve(target_thread_ids.size());
+  for (const my_thread_id target_thread_id : target_thread_ids) {
+    std::string token;
+    if (artifact_decision ==
+        Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE) {
+      if (target_thread_id == 0) return true;
+      token = std::to_string(target_thread_id);
+      if (!token_is_filename_safe(token) || preserve_trx_token_collides(token))
+        return true;
+    } else if (generate_preserve_trx_token(&token)) {
+      return true;
+    }
+    if (!tokens_by_thread_id->emplace(target_thread_id, token).second)
+      return true;
+    tokens->push_back(std::move(token));
+  }
   return false;
 }
 
@@ -3843,25 +4363,92 @@ Ha_trx_info *find_binlog_ha_info(THD *thd) {
   return nullptr;
 }
 
-Ha_trx_info *savepoint_ha_list_for_entry(
-    THD *thd, const Preserve_sql_savepoint_entry &entry,
-    Ha_trx_info *innodb_info, Ha_trx_info *binlog_info) {
-  if (entry.has_innodb_handler() && innodb_info == nullptr) return nullptr;
-  if (entry.has_binlog_handler() && binlog_info == nullptr) return nullptr;
-  if (entry.has_innodb_handler() && entry.has_binlog_handler()) {
-    Ha_trx_info *ha_list =
-        thd->get_transaction()->ha_trx_info(Transaction_ctx::SESSION);
-    for (Ha_trx_info *ha_info = ha_list; ha_info != nullptr;
-         ha_info = ha_info->next()) {
-      const auto legacy_type = ha_legacy_type(ha_info->ht());
-      if (legacy_type != DB_TYPE_INNODB && legacy_type != DB_TYPE_BINLOG)
-        return nullptr;
+bool restore_session_participant_topology(
+    THD *thd, const Preserve_snapshot_metadata &metadata) {
+  if (thd == nullptr) return true;
+
+  struct Participant_state {
+    Preserve_savepoint_participant participant;
+    Ha_trx_info *ha_info;
+    handlerton *hton;
+    bool read_write;
+  };
+  std::vector<Participant_state> current;
+  std::set<uint8_t> seen;
+  for (Ha_trx_info *ha_info =
+           thd->get_transaction()->ha_trx_info(Transaction_ctx::SESSION);
+       ha_info != nullptr; ha_info = ha_info->next()) {
+    Preserve_savepoint_participant participant;
+    const legacy_db_type legacy_type = ha_legacy_type(ha_info->ht());
+    if (legacy_type == DB_TYPE_INNODB) {
+      participant = Preserve_savepoint_participant::INNODB;
+    } else if (legacy_type == DB_TYPE_BINLOG) {
+      participant = Preserve_savepoint_participant::BINLOG;
+    } else {
+      return true;
     }
-    return ha_list;
+    if (!seen.insert(static_cast<uint8_t>(participant)).second) return true;
+    current.push_back(
+        {participant, ha_info, ha_info->ht(), ha_info->is_trx_read_write()});
   }
-  if (entry.has_binlog_handler()) return binlog_info;
-  if (entry.has_innodb_handler()) return innodb_info;
-  return nullptr;
+  if (current.size() != metadata.session_participant_order.size()) return true;
+
+  std::vector<Participant_state *> ordered;
+  ordered.reserve(metadata.session_participant_order.size());
+  for (Preserve_savepoint_participant participant :
+       metadata.session_participant_order) {
+    const auto it = std::find_if(
+        current.begin(), current.end(), [&](const Participant_state &state) {
+          return state.participant == participant;
+        });
+    if (it == current.end()) return true;
+    ordered.push_back(&*it);
+  }
+
+  Transaction_ctx *trn_ctx = thd->get_transaction();
+  for (Participant_state &state : current) state.ha_info->reset();
+  trn_ctx->reset_scope(Transaction_ctx::SESSION);
+
+  int read_write_count = 0;
+  for (auto it = ordered.rbegin(); it != ordered.rend(); ++it) {
+    trans_register_ha(thd, true, (*it)->hton, nullptr);
+    Ha_trx_info *restored =
+        thd->get_ha_data((*it)->hton->slot)
+            ->ha_info + Transaction_ctx::SESSION;
+    if ((*it)->read_write) {
+      restored->set_trx_read_write();
+      ++read_write_count;
+    }
+  }
+  trn_ctx->set_rw_ha_count(Transaction_ctx::SESSION, read_write_count);
+  return false;
+}
+
+Ha_trx_info *savepoint_ha_list_for_suffix(
+    THD *thd, const Preserve_snapshot_metadata &metadata,
+    const Preserve_sql_savepoint_entry &entry, uint16_t suffix_ordinal) {
+  if (thd == nullptr ||
+      suffix_ordinal > metadata.session_participant_order.size()) {
+    return nullptr;
+  }
+  uint16_t expected_flags = kSavepointHandlerNone;
+  for (size_t index = suffix_ordinal;
+       index < metadata.session_participant_order.size(); ++index) {
+    expected_flags |=
+        metadata.session_participant_order[index] ==
+                Preserve_savepoint_participant::INNODB
+            ? kSavepointHandlerInnodb
+            : kSavepointHandlerBinlog;
+  }
+  if (expected_flags != entry.handler_flags) return nullptr;
+
+  Ha_trx_info *suffix =
+      thd->get_transaction()->ha_trx_info(Transaction_ctx::SESSION);
+  for (uint16_t index = 0; index < suffix_ordinal; ++index) {
+    if (suffix == nullptr) return nullptr;
+    suffix = suffix->next();
+  }
+  return suffix;
 }
 
 std::string innodb_savepoint_internal_name(SAVEPOINT *savepoint,
@@ -3877,6 +4464,7 @@ std::string innodb_savepoint_internal_name(SAVEPOINT *savepoint,
 
 bool restore_savepoints_to_thd(THD *thd, trx_t *trx,
                                const Preserve_snapshot_metadata &metadata) {
+  if (restore_session_participant_topology(thd, metadata)) return true;
   if (metadata.savepoint_count == 0) {
     return trx_preserve_import_savepoints(
                trx, metadata.innodb_savepoints_payload,
@@ -3892,7 +4480,8 @@ bool restore_savepoints_to_thd(THD *thd, trx_t *trx,
   std::vector<Preserve_sql_savepoint_entry> entries;
   if (parse_sql_savepoint_entries(metadata.sql_savepoints_payload,
                                   mdl_descriptor_count, &entries) ||
-      entries.size() != metadata.savepoint_count) {
+      entries.size() != metadata.savepoint_count ||
+      metadata.savepoint_suffix_ordinals.size() != entries.size()) {
     return true;
   }
 
@@ -3919,7 +4508,8 @@ bool restore_savepoints_to_thd(THD *thd, trx_t *trx,
   Transaction_ctx *trn_ctx = thd->get_transaction();
   trn_ctx->m_savepoints = nullptr;
   SAVEPOINT *restored_savepoints = nullptr;
-  for (const Preserve_sql_savepoint_entry &entry : entries) {
+  for (size_t entry_index = 0; entry_index < entries.size(); ++entry_index) {
+    const Preserve_sql_savepoint_entry &entry = entries[entry_index];
     SAVEPOINT *savepoint = static_cast<SAVEPOINT *>(
         trn_ctx->allocate_memory(savepoint_alloc_size));
     if (savepoint == nullptr) return true;
@@ -3927,8 +4517,9 @@ bool restore_savepoints_to_thd(THD *thd, trx_t *trx,
     savepoint->name = trn_ctx->strmake(entry.name.data(), entry.name.length());
     if (savepoint->name == nullptr) return true;
     savepoint->length = entry.name.length();
-    savepoint->ha_list =
-        savepoint_ha_list_for_entry(thd, entry, innodb_info, binlog_info);
+    savepoint->ha_list = savepoint_ha_list_for_suffix(
+        thd, metadata, entry,
+        metadata.savepoint_suffix_ordinals[entry_index]);
     if ((entry.handler_flags != kSavepointHandlerNone) &&
         savepoint->ha_list == nullptr) {
       return true;
@@ -4158,19 +4749,32 @@ void audit_preserved_trx_control_event(THD *thd, const char *action,
       key_value_count);
 }
 
-bool preserve_trx_has_only_supported_rw_engines(
+bool preserve_trx_participant_type_is_supported(
+    legacy_db_type legacy_type, Preserve_snapshot_binlog_state binlog_state) {
+  if (legacy_type == DB_TYPE_INNODB) return true;
+  return legacy_type == DB_TYPE_BINLOG &&
+         (binlog_state == Preserve_snapshot_binlog_state::LOGGED_EMPTY ||
+          binlog_state == Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE);
+}
+
+bool preserve_trx_has_only_supported_transaction_engines(
     THD *thd, Preserve_snapshot_binlog_state binlog_state) {
-  for (Ha_trx_info *ha_info =
-           thd->get_transaction()->ha_trx_info(Transaction_ctx::SESSION);
-       ha_info != nullptr; ha_info = ha_info->next()) {
-    if (!ha_info->is_trx_read_write()) continue;
-    const legacy_db_type legacy_type = ha_legacy_type(ha_info->ht());
-    if (legacy_type == DB_TYPE_INNODB) continue;
-    if (legacy_type == DB_TYPE_BINLOG &&
-        (binlog_state == Preserve_snapshot_binlog_state::LOGGED_EMPTY ||
-         binlog_state == Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE))
-      continue;
-    return false;
+  if (thd == nullptr) return false;
+  for (Transaction_ctx::enum_trx_scope scope :
+       {Transaction_ctx::SESSION, Transaction_ctx::STMT}) {
+    for (Ha_trx_info *ha_info =
+             thd->get_transaction()->ha_trx_info(scope);
+         ha_info != nullptr; ha_info = ha_info->next()) {
+      /*
+        Read-only participants still own callback state and can affect prepare,
+        rollback-to-savepoint, or cleanup. Never omit them merely because the
+        TRX_READ_WRITE bit is clear.
+      */
+      if (!preserve_trx_participant_type_is_supported(
+              ha_legacy_type(ha_info->ht()), binlog_state)) {
+        return false;
+      }
+    }
   }
   return true;
 }
@@ -4287,7 +4891,8 @@ bool preserve_trx_has_unsupported_transaction_contents(
           Transaction_ctx::STMT)) {
     return true;
   }
-  if (!preserve_trx_has_only_supported_rw_engines(thd, binlog_state)) {
+  if (!preserve_trx_has_only_supported_transaction_engines(thd,
+                                                            binlog_state)) {
     return true;
   }
 
@@ -6056,6 +6661,8 @@ class Preserve_batch_quiesced_idle_target final {
                                               nullptr,
                                       std::string transfer_preserve_dir =
                                           std::string(),
+                                      std::string preselected_token =
+                                          std::string(),
                                       const char *worker_thread_stack = nullptr)
       : m_owner(owner),
         m_options(options),
@@ -6069,6 +6676,7 @@ class Preserve_batch_quiesced_idle_target final {
         m_defer_snapshot_directory_fsync(defer_snapshot_directory_fsync),
         m_transfer_source_epoch_session(transfer_source_epoch_session),
         m_transfer_preserve_dir(std::move(transfer_preserve_dir)),
+        m_preselected_token(std::move(preselected_token)),
         m_worker_thread_stack(worker_thread_stack) {}
 
   void run(THD *candidate) {
@@ -6102,7 +6710,8 @@ class Preserve_batch_quiesced_idle_target final {
             m_binlog_blob_provider, m_lock_warmcopy_artifact,
             m_debug_fail_ha_prepare_low, m_debug_fail_temp_only_prepare,
             m_defer_snapshot_directory_fsync,
-            m_transfer_source_epoch_session, m_transfer_preserve_dir);
+            m_transfer_source_epoch_session, m_transfer_preserve_dir,
+            m_preselected_token, true, true);
       }
     }
     if (early_target_error) {
@@ -6169,6 +6778,7 @@ class Preserve_batch_quiesced_idle_target final {
   Preserve_trx_transfer_source_epoch_session *m_transfer_source_epoch_session{
       nullptr};
   std::string m_transfer_preserve_dir;
+  std::string m_preselected_token;
   const char *m_worker_thread_stack{nullptr};
   bool m_visited_target{false};
   bool m_error{false};
@@ -6941,16 +7551,16 @@ bool preserve_trx_magic_xid_has_snapshot(const XID &xid) {
 
 bool preserve_trx_magic_xid_should_be_protected(const XID &xid) {
   if (!xid_is_preserve_magic(xid)) return false;
-  if (preserve_trx_is_enabled()) return true;
-  if (preserve_trx_off_artifact_policy_ignore()) return false;
+  if (!preserve_trx_is_enabled() && preserve_trx_off_artifact_policy_ignore())
+    return false;
 
-  /*
-    FAIL_IF_PRESENT rejects preserved artifacts before the server starts
-    serving. RECOVER and ABANDON are explicit artifact-handling modes. In all
-    three modes a live magic XID backed by a token file must stay out of normal
-    XA/InnoDB commit and rollback paths.
-  */
-  return preserve_trx_magic_xid_has_snapshot_impl(xid);
+  const char *token =
+      xid.get_data() + static_cast<size_t>(PRESERVE_TRX_XID_GTRID_LENGTH);
+  const auto provenance = preserve_trx_xid_provenance_snapshot();
+  return provenance != nullptr &&
+         provenance->find(std::string_view(
+             token, static_cast<size_t>(xid.get_bqual_length()))) !=
+             provenance->end();
 }
 
 bool preserve_trx_temp_table_session_needs_eligibility_check(const THD *thd) {
@@ -7268,7 +7878,50 @@ void preserved_trx_mark_recovery_complete() {
 
 bool preserved_trx_recovery_complete() {
   std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
-  return g_preserved_trx_recovery_done;
+  return g_preserved_trx_recovery_done && !g_preserved_trx_recovery_deferred;
+}
+
+bool preserved_trx_mark_innodb_read_only_recovery_state() {
+  if (!preserve_trx_is_enabled()) {
+    mark_preserved_trx_recovery_complete();
+    return false;
+  }
+
+  Preserved_trx_carrier_listing listing;
+  auto store = create_preserved_trx_default_store(preserve_trx_default_dir());
+  const Preserve_snapshot_status status = store->list_tokens(&listing);
+  bool xid_provenance_present = false;
+  const bool xid_provenance_presence_error =
+      preserve_trx_xid_provenance_ledger_presence(&xid_provenance_present);
+  const bool has_artifacts =
+      status != Preserve_snapshot_status::OK || xid_provenance_presence_error ||
+      xid_provenance_present ||
+      !listing.snapshot_tokens.empty() ||
+      !listing.external_blob_tokens.empty() ||
+      !listing.temp_sidecar_tokens.empty() ||
+      !listing.stale_tmp_tokens.empty() || !listing.tainted_tokens.empty() ||
+      !listing.consume_state_tokens.empty() ||
+      !listing.standby_pending_tokens.empty() ||
+      !listing.promotion_adopted_tokens.empty() ||
+      !listing.promotion_intent_tokens.empty() ||
+      !listing.warm_external_blob_artifacts.empty();
+  if (!has_artifacts) {
+    mark_preserved_trx_recovery_complete();
+    return false;
+  }
+
+  g_startup_recovery_error.store(1);
+  g_startup_recovery_snapshot_tokens.store(listing.snapshot_tokens.size());
+  g_startup_recovery_local_snapshot_tokens.store(
+      preserved_trx_local_recoverable_snapshot_tokens(listing).size());
+  g_startup_recovery_binlog_cache_tokens.store(
+      listing.external_blob_tokens.size());
+  LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+         "PRESERVE: startup recovery deferred because innodb_read_only is "
+         "enabled and preserved artifacts are present; files were retained "
+         "without import, rollback, or cleanup");
+  mark_preserved_trx_recovery_deferred();
+  return true;
 }
 
 bool preserved_trx_local_record_exists(const std::string &token) {
@@ -7334,8 +7987,29 @@ void preserved_trx_set_recovery_complete_for_unit_test(bool complete) {
   {
     std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
     g_preserved_trx_recovery_done = complete;
+    g_preserved_trx_recovery_deferred = false;
   }
   g_preserved_trx_recovery_cond.notify_all();
+}
+
+size_t preserved_trx_pending_token_delivery_count_for_unit_test() {
+  return g_pending_token_delivery_count.load(std::memory_order_acquire);
+}
+
+void preserved_trx_register_pending_token_delivery_for_unit_test(
+    THD *thd, const char *token) {
+  preserved_trx_register_pending_token_delivery(
+      thd, token == nullptr ? std::string() : std::string(token));
+}
+
+void preserved_trx_erase_pending_token_delivery_for_unit_test(THD *thd) {
+  preserved_trx_erase_pending_token_delivery(thd);
+}
+
+bool preserve_trx_participant_type_is_supported_for_unit_test(
+    int legacy_type, Preserve_snapshot_binlog_state binlog_state) {
+  return preserve_trx_participant_type_is_supported(
+      static_cast<legacy_db_type>(legacy_type), binlog_state);
 }
 
 void preserved_trx_add_record_for_unit_test(const std::string &token,
@@ -7505,6 +8179,8 @@ void preserved_trx_note_statement_response(THD *thd) {
 
 bool preserved_trx_defer_shutdown_signal() {
   if (!preserved_trx_shutdown_requested()) return false;
+  if (g_pending_token_delivery_count.load(std::memory_order_acquire) == 0)
+    return false;
 
   std::lock_guard<std::mutex> lock(g_token_delivery_mutex);
   if (g_pending_token_delivery.empty()) return false;
@@ -8051,12 +8727,6 @@ static Preserve_snapshot_delete_status delete_snapshot_files_with_status(
   return store->remove_with_status(token, options);
 }
 
-static bool delete_snapshot_files(const std::string &dir_arg,
-                                  const std::string &token) {
-  return delete_snapshot_files_with_status(dir_arg, token) !=
-         Preserve_snapshot_delete_status::OK;
-}
-
 static void log_preserved_trx_rejected_binlog_mode(
     const std::string &token, const Preserve_snapshot_metadata &metadata) {
   std::string required_mode;
@@ -8481,10 +9151,11 @@ static bool delete_preserved_snapshot_files_and_sidecars_or_log(
         token, "failed to delete snapshot files");
   }
 
-  if (metadata == nullptr) return false;
-  release_temp_sidecar_space_id_reservations(*metadata);
-  if (metadata->temp_table_manifest_payload.empty()) return false;
-  if (temp_sidecar_cleanup_mode == Temp_sidecar_cleanup_mode::RAW_UNLINK) {
+  if (metadata != nullptr) {
+    release_temp_sidecar_space_id_reservations(*metadata);
+  }
+  if (metadata != nullptr && !metadata->temp_table_manifest_payload.empty() &&
+      temp_sidecar_cleanup_mode == Temp_sidecar_cleanup_mode::RAW_UNLINK) {
     /*
       Recovery reaches RAW_UNLINK only after the sidecar has already been
       classified as corrupt/unsupported, or the token has been tainted. Do not
@@ -8493,10 +9164,20 @@ static bool delete_preserved_snapshot_files_and_sidecars_or_log(
       require sidecar bytes.
     */
     preserve_trx_temp_table_release_ownership_reservations(*metadata);
-    return false;
+  } else if (metadata != nullptr &&
+             !metadata->temp_table_manifest_payload.empty() &&
+             delete_preserved_temp_table_sidecars_or_log(dir, token,
+                                                         *metadata)) {
+    return true;
   }
 
-  return delete_preserved_temp_table_sidecars_or_log(dir, token, *metadata);
+  if (normalize_dir(dir) == normalize_dir(preserve_trx_default_dir()) &&
+      preserve_trx_xid_provenance_contains(token) &&
+      preserve_trx_xid_provenance_remove(token)) {
+    return log_preserved_trx_cleanup_failure(
+        token, "failed to remove internal XID provenance");
+  }
+  return false;
 }
 
 static bool delete_orphan_temp_table_sidecars_or_log(
@@ -9330,7 +10011,7 @@ static bool restore_batch_record_to_original_thd(
     thd_state_guard.dismiss();
     return true;
   }
-  const bool cleanup_failed_after_unlink =
+  bool cleanup_failed_after_unlink =
       delete_status ==
       Preserve_snapshot_delete_status::ERROR_AFTER_SNAPSHOT_DELETE;
 
@@ -9352,6 +10033,20 @@ static bool restore_batch_record_to_original_thd(
     log_preserved_trx_cleanup_failure(
         item.token,
         "failed to fsync preserved transaction directory after unlink");
+  }
+
+  if (!temp_sidecar_cleanup_failed &&
+      delete_status !=
+          Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE &&
+      preserve_trx_xid_provenance_contains(item.token)) {
+    if (preserve_trx_xid_provenance_remove(item.token)) {
+      log_preserved_trx_cleanup_failure(
+          item.token, "failed to remove internal XID provenance");
+      cleanup_failed_after_unlink = true;
+    } else {
+      /* The provenance update includes a directory barrier for the unlink. */
+      cleanup_failed_after_unlink = false;
+    }
   }
 
   preserve_trx_set_batch_state(thd, 0, Preserve_trx_batch_thd_state::NONE);
@@ -9459,9 +10154,12 @@ static bool reattach_current_batch_preserve_failure_to_original_thd(
       stale. A pre-unlink failure leaves the token tainted; a post-unlink fsync
       failure is logged but the active transaction remains with the session.
     */
-    if (!snapshot_files_may_exist) return Preserve_snapshot_delete_status::OK;
-    const Preserve_snapshot_delete_status delete_status =
-        delete_snapshot_files_with_status(preserve_trx_default_dir(), token);
+    Preserve_snapshot_delete_status delete_status =
+        Preserve_snapshot_delete_status::OK;
+    if (snapshot_files_may_exist) {
+      delete_status =
+          delete_snapshot_files_with_status(preserve_trx_default_dir(), token);
+    }
     if (delete_status ==
         Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE) {
       if (cleanup_failed != nullptr) *cleanup_failed = true;
@@ -9472,14 +10170,31 @@ static bool reattach_current_batch_preserve_failure_to_original_thd(
         Preserve_snapshot_delete_status::ERROR_AFTER_SNAPSHOT_DELETE) {
       if (cleanup_failed != nullptr) *cleanup_failed = true;
     }
-    if (delete_status !=
-        Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE &&
+    bool temp_cleanup_failed = false;
+    if (snapshot_files_may_exist &&
+        delete_status !=
+            Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE &&
         metadata != nullptr) {
       release_temp_sidecar_space_id_reservations(*metadata);
       if (!metadata->temp_table_manifest_payload.empty() &&
           delete_preserved_temp_table_sidecars_or_log(
               preserve_trx_default_dir(), token, *metadata)) {
+        temp_cleanup_failed = true;
         if (cleanup_failed != nullptr) *cleanup_failed = true;
+      }
+    }
+    if (!temp_cleanup_failed &&
+        delete_status !=
+            Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE &&
+        preserve_trx_xid_provenance_contains(token)) {
+      if (preserve_trx_xid_provenance_remove(token)) {
+        if (cleanup_failed != nullptr) *cleanup_failed = true;
+        log_preserved_trx_cleanup_failure(
+            token, "failed to remove internal XID provenance");
+      } else if (delete_status ==
+                 Preserve_snapshot_delete_status::ERROR_AFTER_SNAPSHOT_DELETE) {
+        /* The provenance update supplied the missing directory barrier. */
+        delete_status = Preserve_snapshot_delete_status::OK;
       }
     }
     return delete_status;
@@ -9569,13 +10284,14 @@ static bool reattach_current_batch_preserve_failure_to_original_thd(
 }
 
 static bool reactivate_current_batch_prepared_failure_to_original_thd(
-    THD *thd, trx_preserve_thd_transition_failure *reactivate_failure =
-                  nullptr) {
+    THD *thd, const std::string &pre_prepare_record_locks_payload,
+    trx_preserve_thd_transition_failure *reactivate_failure = nullptr) {
   if (reactivate_failure != nullptr) {
     *reactivate_failure = trx_preserve_thd_transition_failure::NONE;
   }
   if (trx_preserve_reactivate_prepare_failure_in_original_thd(
-          thd, reactivate_failure) != DB_SUCCESS)
+          thd, pre_prepare_record_locks_payload, reactivate_failure) !=
+      DB_SUCCESS)
     return true;
 
   reset_preserve_xid_to_active_transaction_xid(thd);
@@ -10457,12 +11173,21 @@ preserved_trx_adopt_prepared_for_physical_promotion(
 
 bool preserved_trx_preflight_recoverability() {
   if (!preserve_trx_is_enabled()) {
-    if (!preserve_trx_off_artifact_policy_recover()) {
+    if (!preserve_trx_off_artifact_policy_recover() &&
+        !preserve_trx_off_artifact_policy_abandon()) {
       return preserve_trx_off_artifact_preflight(
           "preserved transaction preflight");
     }
   }
   if (srv_force_recovery > 0) return false;
+
+  Preserve_trx_xid_provenance_map provenance_records;
+  if (preserve_trx_xid_provenance_preload(&provenance_records)) {
+    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+           "PRESERVE: failed to authenticate XID provenance before storage "
+           "engine recovery");
+    return true;
+  }
 
   /*
     Startup preflight avoids entering crash recovery with snapshots that this
@@ -10502,6 +11227,27 @@ bool preserved_trx_preflight_recoverability() {
     }
 
     const Preserve_snapshot_metadata &metadata = bundle.metadata;
+    std::string snapshot_identity_digest;
+    if (preserve_trx_snapshot_identity_digest(metadata,
+                                              &snapshot_identity_digest)) {
+      return log_preserved_trx_recovery_failure(
+          token, "failed to calculate authenticated snapshot identity");
+    }
+    auto provenance = provenance_records.find(token);
+    if (provenance == provenance_records.end()) {
+      return log_preserved_trx_recovery_failure(
+          token, "authenticated snapshot has no internal XID provenance");
+    }
+    if (provenance->second.state !=
+        Preserve_trx_xid_provenance_state::SNAPSHOT_BOUND) {
+      return log_preserved_trx_recovery_failure(
+          token, "snapshot publication did not complete XID provenance bind");
+    }
+    if (provenance->second.snapshot_identity_digest !=
+        snapshot_identity_digest) {
+      return log_preserved_trx_recovery_failure(
+          token, "XID provenance snapshot identity mismatch");
+    }
     if (!recoverable_binlog_state(metadata.binlog_state)) {
       return log_preserved_trx_recovery_failure(
           token, "unsupported durable transaction binlog state");
@@ -11096,8 +11842,10 @@ bool preserved_trx_recover_all() {
       }
     }
 
+    std::vector<std::string> rolled_back_orphan_tokens;
     if (trx_preserve_rollback_prepared_without_snapshot(
-            std::vector<std::string>(), &orphan_rollback_count) != DB_SUCCESS) {
+            std::vector<std::string>(), &orphan_rollback_count,
+            &rolled_back_orphan_tokens) != DB_SUCCESS) {
       LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
              "PRESERVE: failed to rollback preserved prepared transaction "
              "during preserve_trx_enable=OFF abandon");
@@ -11135,6 +11883,23 @@ bool preserved_trx_recover_all() {
         continue;
       if (store->remove_consume_state(token) !=
           Preserve_snapshot_status::OK) {
+        error = true;
+      }
+    }
+
+    if (!error) {
+      std::vector<std::string> remaining_provenance_tokens;
+      const auto remaining_provenance =
+          preserve_trx_xid_provenance_snapshot();
+      if (remaining_provenance != nullptr) {
+        remaining_provenance_tokens.reserve(remaining_provenance->size());
+        for (const auto &entry : *remaining_provenance)
+          remaining_provenance_tokens.push_back(entry.first);
+      }
+      if (preserve_trx_xid_provenance_remove_many(
+              remaining_provenance_tokens)) {
+        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+               "PRESERVE: failed to remove XID provenance after OFF abandon");
         error = true;
       }
     }
@@ -11179,10 +11944,12 @@ bool preserved_trx_recover_all() {
       preserved_trx_orphan_rollback_retained_tokens(listing);
   std::vector<std::string> retained_snapshot_tokens(
       retained_token_set.begin(), retained_token_set.end());
+  std::vector<std::string> rolled_back_orphan_tokens;
   phase_started_us = preserve_trx_monotonic_us();
   const dberr_t orphan_rollback_status =
       trx_preserve_rollback_prepared_without_snapshot(retained_snapshot_tokens,
-                                                      &orphan_rollback_count);
+                                                      &orphan_rollback_count,
+                                                      &rolled_back_orphan_tokens);
   phase_metrics.orphan_rollback_us += elapsed_since_us(phase_started_us);
   if (orphan_rollback_status != DB_SUCCESS) {
     LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
@@ -11194,6 +11961,22 @@ bool preserved_trx_recover_all() {
     LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
            "PRESERVE: rolled back prepared transaction without snapshot "
            "during recovery");
+  }
+  std::vector<std::string> orphan_provenance_tokens;
+  const auto provenance_after_recovery =
+      preserve_trx_xid_provenance_snapshot();
+  if (provenance_after_recovery != nullptr) {
+    orphan_provenance_tokens.reserve(provenance_after_recovery->size());
+    for (const auto &entry : *provenance_after_recovery) {
+      if (retained_token_set.count(entry.first) == 0)
+        orphan_provenance_tokens.push_back(entry.first);
+    }
+  }
+  if (preserve_trx_xid_provenance_remove_many(orphan_provenance_tokens)) {
+    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+           "PRESERVE: failed to remove terminal or stale XID provenance "
+           "during recovery");
+    return finish_recovery(true, "orphan_provenance_cleanup_failed");
   }
 
   phase_started_us = preserve_trx_monotonic_us();
@@ -12043,6 +12826,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
 
   Preserve_trx_token_selection token_selection;
   if (preserve_trx_select_token_for_request(thd, artifact_decision,
+                                            request.preselected_token,
                                             &token_selection)) {
     return reject_after_binlog_export(
         token_selection.failure_reason == nullptr
@@ -12055,6 +12839,23 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   XID xid;
   if (preserve_trx_token_to_xid(token, &xid))
     return reject_after_binlog_export("token_to_xid_failed");
+
+  bool xid_provenance_started = request.xid_provenance_intent_prepared;
+  auto remove_xid_provenance_after_terminal = [&]() {
+    if (!xid_provenance_started) return false;
+    if (request.xid_provenance_intent_prepared) {
+      xid_provenance_started = false;
+      return false;
+    }
+    if (preserve_trx_xid_provenance_remove(token)) {
+      log_preserved_trx_cleanup_failure(
+          token, "failed to remove internal XID provenance");
+      if (result != nullptr) result->cleanup_failed_after_reattach = true;
+      return true;
+    }
+    xid_provenance_started = false;
+    return false;
+  };
 
   /*
     From this point on, preserve failure handling depends on whether the
@@ -12109,6 +12910,9 @@ bool preserve_trx_kernel_preserve_attached_transaction(
                 thd, binlog_snapshot)) {
           cleanup_failed = true;
         }
+        if (!cleanup_failed && remove_xid_provenance_after_terminal()) {
+          cleanup_failed = true;
+        }
         if (cleanup_failed) {
           LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                  "PRESERVE: failed to restore single-session transaction "
@@ -12125,7 +12929,12 @@ bool preserve_trx_kernel_preserve_attached_transaction(
 
   auto restore_batch_prepare_failure_or_rollback = [&]() {
     if (batch_delivery) {
-      if (reactivate_current_batch_prepared_failure_to_original_thd(thd)) {
+      const std::string &reactivation_record_locks =
+          use_lock_warmcopy_artifact && lock_warmcopy_artifact != nullptr
+              ? lock_warmcopy_artifact->record_locks_payload
+              : record_locks_preflight_payload;
+      if (reactivate_current_batch_prepared_failure_to_original_thd(
+              thd, reactivation_record_locks)) {
         if (result != nullptr) {
           result->cleanup_failed_after_reattach = true;
         }
@@ -12140,6 +12949,10 @@ bool preserve_trx_kernel_preserve_attached_transaction(
           }
           return reject_unsupported_for_delivery();
         }
+      }
+      if (remove_xid_provenance_after_terminal()) {
+        if (result != nullptr) result->cleanup_failed_after_reattach = true;
+        return reject_unsupported_for_delivery();
       }
       if (result != nullptr) {
         result->reattached_to_original_thd = true;
@@ -12164,6 +12977,10 @@ bool preserve_trx_kernel_preserve_attached_transaction(
           }
           return reject_unsupported_for_delivery();
         }
+      }
+      if (remove_xid_provenance_after_terminal()) {
+        if (result != nullptr) result->cleanup_failed_after_reattach = true;
+        return reject_unsupported_for_delivery();
       }
       if (result != nullptr) {
         result->reattached_to_original_thd = true;
@@ -12354,6 +13171,23 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       return restore_unprepared_batch_prepare_failure_or_rollback();
     }
   }
+  if (request.xid_provenance_intent_prepared) {
+    if (!preserve_trx_xid_provenance_has_state(
+            token, Preserve_trx_xid_provenance_state::PREPARED_INTENT)) {
+      thaw_lock_warmcopy_conversion();
+      set_failure_reason("xid_provenance_batch_intent_missing");
+      return restore_unprepared_batch_prepare_failure_or_rollback();
+    }
+  } else {
+    if (preserve_trx_xid_provenance_begin(token)) {
+      thaw_lock_warmcopy_conversion();
+      set_failure_reason("xid_provenance_intent_write_failed");
+      return restore_unprepared_batch_prepare_failure_or_rollback();
+    }
+    xid_provenance_started = true;
+  }
+  DBUG_EXECUTE_IF("preserve_trx_crash_after_xid_provenance_before_prepare",
+                  DBUG_SUICIDE(););
   if (ha_prepare_low(thd, true)) {
     thaw_lock_warmcopy_conversion();
     return restore_batch_prepare_failure_or_rollback();
@@ -12376,8 +13210,12 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     if (batch_delivery) {
       trx_preserve_thd_transition_failure reactivate_failure =
           trx_preserve_thd_transition_failure::NONE;
+      const std::string &reactivation_record_locks =
+          use_lock_warmcopy_artifact && lock_warmcopy_artifact != nullptr
+              ? lock_warmcopy_artifact->record_locks_payload
+              : record_locks_preflight_payload;
       if (reactivate_current_batch_prepared_failure_to_original_thd(
-              thd, &reactivate_failure)) {
+              thd, reactivation_record_locks, &reactivate_failure)) {
         if (result != nullptr) {
           result->cleanup_failed_after_reattach = true;
           result->reactivate_failure_reason =
@@ -12394,6 +13232,10 @@ bool preserve_trx_kernel_preserve_attached_transaction(
           }
           return reject_unsupported_for_delivery();
         }
+      }
+      if (remove_xid_provenance_after_terminal()) {
+        if (result != nullptr) result->cleanup_failed_after_reattach = true;
+        return reject_unsupported_for_delivery();
       }
       if (result != nullptr) {
         result->reattached_to_original_thd = true;
@@ -12457,16 +13299,25 @@ bool preserve_trx_kernel_preserve_attached_transaction(
                     inject_rollback_failure = true;);
     const dberr_t rollback_status =
         inject_rollback_failure ? DB_ERROR : trx_preserve_rollback_claimed(trx);
+    const bool provenance_cleanup_failed =
+        rollback_status == DB_SUCCESS &&
+        remove_xid_provenance_after_terminal();
     reset_thd_after_preserve_detach(thd);
     cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
     if (result != nullptr && batch_delivery) {
       result->cleanup_completed_after_detach_failure =
-          rollback_status == DB_SUCCESS;
-      result->cleanup_failed_after_reattach = rollback_status != DB_SUCCESS;
+          rollback_status == DB_SUCCESS && !provenance_cleanup_failed;
+      result->cleanup_failed_after_reattach =
+          rollback_status != DB_SUCCESS || provenance_cleanup_failed;
     }
     if (!batch_delivery && rollback_status != DB_SUCCESS) {
       mark_single_detached_cleanup_failure(
           "single preserve detached rollback failure");
+      return true;
+    }
+    if (provenance_cleanup_failed && !batch_delivery) {
+      mark_single_detached_cleanup_failure(
+          "single preserve XID provenance cleanup failure");
       return true;
     }
     return reject_unsupported_for_delivery();
@@ -12499,17 +13350,22 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       return reject_unsupported_for_delivery();
     const dberr_t rollback_status =
         trx_preserve_rollback_by_token(token.c_str());
+    const bool provenance_cleanup_failed =
+        rollback_status == DB_SUCCESS &&
+        remove_xid_provenance_after_terminal();
     reset_thd_after_preserve_detach(thd);
     cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
-    if (!batch_delivery && rollback_status != DB_SUCCESS) {
+    if (!batch_delivery &&
+        (rollback_status != DB_SUCCESS || provenance_cleanup_failed)) {
       mark_single_detached_cleanup_failure(
           "single preserve detached claim rollback failure");
       return true;
     }
     if (result != nullptr && batch_delivery) {
       result->cleanup_completed_after_detach_failure =
-          rollback_status == DB_SUCCESS;
-      result->cleanup_failed_after_reattach = rollback_status != DB_SUCCESS;
+          rollback_status == DB_SUCCESS && !provenance_cleanup_failed;
+      result->cleanup_failed_after_reattach =
+          rollback_status != DB_SUCCESS || provenance_cleanup_failed;
     }
     return reject_unsupported_for_delivery();
   }
@@ -12786,6 +13642,10 @@ bool preserve_trx_kernel_preserve_attached_transaction(
         if (result != nullptr && batch_delivery)
           result->cleanup_failed_after_reattach = true;
       }
+    } else if (rollback_status == DB_SUCCESS &&
+               remove_xid_provenance_after_terminal()) {
+      if (result != nullptr && batch_delivery)
+        result->cleanup_failed_after_reattach = true;
     }
     reset_thd_after_preserve_detach(thd);
     cleanup_original_binlog_cache_after_detach(thd, has_logged_binlog_cache);
@@ -13032,6 +13892,21 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     return reject_after_snapshot_failure(durable_snapshot_may_exist,
                                          write_failure_delete_status);
   }
+  DBUG_EXECUTE_IF("preserve_trx_crash_after_snapshot_before_xid_provenance_bind",
+                  DBUG_SUICIDE(););
+  std::string snapshot_identity_digest;
+  if (preserve_trx_snapshot_identity_digest(metadata,
+                                            &snapshot_identity_digest)) {
+    set_failure_reason("xid_provenance_snapshot_bind_failed");
+    return reject_after_snapshot_failure(true);
+  }
+  if (result != nullptr)
+    result->snapshot_identity_digest = snapshot_identity_digest;
+  if (!request.defer_xid_provenance_bind &&
+      preserve_trx_xid_provenance_bind(token, snapshot_identity_digest)) {
+    set_failure_reason("xid_provenance_snapshot_bind_failed");
+    return reject_after_snapshot_failure(true);
+  }
 
   if (use_lock_warmcopy_artifact) {
     DEBUG_SYNC(thd,
@@ -13133,7 +14008,10 @@ bool preserve_trx_preserve_attached_transaction(
     bool debug_fail_temp_only_prepare_override,
     bool defer_snapshot_directory_fsync,
     Preserve_trx_transfer_source_epoch_session *transfer_source_epoch_session,
-    const std::string &transfer_preserve_dir) {
+    const std::string &transfer_preserve_dir,
+    const std::string &preselected_token,
+    bool xid_provenance_intent_prepared,
+    bool defer_xid_provenance_bind) {
   const bool batch_delivery =
       delivery_mode == Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY;
   if (target_thd == nullptr) {
@@ -13178,7 +14056,9 @@ bool preserve_trx_preserve_attached_transaction(
                                       lock_warmcopy_artifact,
                                       defer_snapshot_directory_fsync,
                                       transfer_source_epoch_session,
-                                      transfer_preserve_dir};
+                                      transfer_preserve_dir, preselected_token,
+                                      xid_provenance_intent_prepared,
+                                      defer_xid_provenance_bind};
   const bool error = preserve_trx_kernel_preserve_attached_transaction(request);
   if (error || batch_delivery) return error;
 
@@ -14561,6 +15441,26 @@ bool Preserve_trx_drain_service::execute(
     return preserve_trx_reject_unsupported();
   }
 
+  std::map<my_thread_id, std::string> batch_provenance_tokens_by_thread_id;
+  std::vector<std::string> batch_provenance_tokens;
+  if (preserve_trx_select_batch_tokens(
+          quiesced_target_thread_ids, batch_artifact_decision,
+          &batch_provenance_tokens_by_thread_id, &batch_provenance_tokens) ||
+      preserve_trx_xid_provenance_begin_many(batch_provenance_tokens)) {
+    Preserve_batch_clear_generation clear(generation);
+    Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
+    abort_batch_transfer_epoch("xid_provenance_batch_intent_write_failed");
+    abort_drain_participants("xid_provenance_batch_intent_write_failed");
+    return preserve_trx_reject_unsupported();
+  }
+  auto batch_provenance_cleanup = create_scope_guard([&] {
+    if (preserve_trx_xid_provenance_remove_many(batch_provenance_tokens)) {
+      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: failed to remove batch XID provenance after drain "
+             "failure");
+    }
+  });
+
   std::vector<Preserve_trx_batch_item> preserved_batch_items;
   preserved_batch_items.reserve(quiesced_target_thread_ids.size());
   bool debug_fail_ha_prepare_low = false;
@@ -14646,13 +15546,19 @@ bool Preserve_trx_drain_service::execute(
             batch_transfer_binlog_blob_provider != nullptr
                 ? batch_transfer_binlog_blob_provider.get()
                 : warmcopy_provider;
+        const auto token_it =
+            batch_provenance_tokens_by_thread_id.find(target_thread_id);
+        if (token_it == batch_provenance_tokens_by_thread_id.end()) {
+          execution->pin_error = true;
+          return;
+        }
         Preserve_batch_quiesced_idle_target batch(
             owner_thd, options, timeout_seconds, generation, target_thread_id,
             binlog_blob_provider, lock_warmcopy_artifact,
             debug_fail_ha_prepare_low, debug_fail_temp_only_prepare,
             defer_batch_snapshot_directory_fsync,
             batch_transfer_source_session.get(), preserve_trx_default_dir(),
-            worker_thread_stack);
+            token_it->second, worker_thread_stack);
         if (target_thd != nullptr) batch.run(target_thd);
         execution->visited_target = batch.visited_target();
         execution->error = batch.error();
@@ -14810,6 +15716,7 @@ bool Preserve_trx_drain_service::execute(
           quiesced_target_thread_ids.size() > 1) {
         if (restore_preserved_batch_items_to_original_thds(
                 generation, preserved_batch_items)) {
+          batch_provenance_cleanup.commit();
           abort_batch_transfer_epoch("debug_after_one_target_cleanup_failed");
           LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                  "Preserved transaction batch cleanup failed after debug "
@@ -14874,6 +15781,7 @@ bool Preserve_trx_drain_service::execute(
     const bool cleanup_error =
         batch_result.cleanup_failed_after_reattach || prior_cleanup_error;
     if (cleanup_error) {
+      batch_provenance_cleanup.commit();
       abort_batch_transfer_epoch("target_cleanup_failed");
       if (!batch_result.token.empty()) {
         if (batch_result.left_preserved_after_cleanup_failure) {
@@ -14895,6 +15803,30 @@ bool Preserve_trx_drain_service::execute(
     abort_drain_participants("target_preserve_failed");
     return preserve_trx_reject_unsupported();
   }
+  std::vector<Preserve_trx_xid_provenance_binding>
+      batch_provenance_bindings;
+  batch_provenance_bindings.reserve(target_results.size());
+  for (const Preserve_batch_target_execution &execution : target_results) {
+    batch_provenance_bindings.emplace_back(
+        execution.result.token, execution.result.snapshot_identity_digest);
+  }
+  if (preserve_trx_xid_provenance_bind_many(batch_provenance_bindings)) {
+    const bool cleanup_error = restore_preserved_batch_items_to_original_thds(
+        generation, preserved_batch_items);
+    abort_batch_transfer_epoch("xid_provenance_batch_bind_failed");
+    if (cleanup_error) {
+      batch_provenance_cleanup.commit();
+      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+             "Preserved transaction batch cleanup failed after XID provenance "
+             "bind error");
+      return finish_cleanup_failure_without_shutdown(
+          "xid_provenance_batch_bind_cleanup_failed");
+    }
+    batch_provenance_cleanup.rollback();
+    abort_drain_participants("xid_provenance_batch_bind_failed");
+    return preserve_trx_reject_unsupported();
+  }
+  batch_provenance_cleanup.commit();
   if (defer_batch_snapshot_directory_fsync && !preserved_batch_items.empty()) {
     const ulonglong fsync_started_us = preserve_trx_monotonic_us();
     const Preserve_snapshot_status fsync_status =
@@ -15356,7 +16288,9 @@ static bool preserved_trx_resume_record_on_thd(
                           &bundle)
             : Preserve_snapshot_status::NOT_FOUND;
     if (status == Preserve_snapshot_status::CORRUPT) {
-      (void)delete_snapshot_files(preserve_trx_default_dir(), token);
+      (void)delete_preserved_snapshot_files_and_sidecars_or_log(
+          preserve_trx_default_dir(), token, nullptr,
+          Temp_sidecar_cleanup_mode::RAW_UNLINK);
       my_error(ER_PRESERVE_TRX_CORRUPT_SNAPSHOT, MYF(0));
     } else if (status == Preserve_snapshot_status::NOT_FOUND) {
       log_redacted_resume_failure(token, "token not found");
@@ -15796,9 +16730,23 @@ static bool preserved_trx_resume_record_on_thd(
     remove_options.preserve_committed_temp_sidecar_source_space_ids =
         preserve_trx_temp_table_sidecar_source_space_ids(record.metadata);
   }
-  const Preserve_snapshot_delete_status delete_status =
+  Preserve_snapshot_delete_status delete_status =
       delete_snapshot_files_with_status(preserve_trx_default_dir(), token,
                                         remove_options);
+  if (delete_status !=
+          Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE &&
+      preserve_trx_xid_provenance_contains(token)) {
+    if (preserve_trx_xid_provenance_remove(token)) {
+      log_preserved_trx_cleanup_failure(
+          token, "failed to remove internal XID provenance after resume");
+      delete_status =
+          Preserve_snapshot_delete_status::ERROR_AFTER_SNAPSHOT_DELETE;
+    } else if (delete_status ==
+               Preserve_snapshot_delete_status::ERROR_AFTER_SNAPSHOT_DELETE) {
+      /* The provenance update supplied the missing directory barrier. */
+      delete_status = Preserve_snapshot_delete_status::OK;
+    }
+  }
   if (delete_status != Preserve_snapshot_delete_status::OK) {
     if (delete_status ==
         Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE) {
@@ -16267,9 +17215,22 @@ preserved_trx_resume_adopted_for_promotion_on_thd(
     remove_options.preserve_committed_temp_sidecar_source_space_ids =
         preserve_trx_temp_table_sidecar_source_space_ids(record.metadata);
   }
-  const Preserve_snapshot_delete_status delete_status =
+  Preserve_snapshot_delete_status delete_status =
       delete_snapshot_files_with_status(key.preserve_dir, key.token,
                                         remove_options);
+  if (delete_status !=
+          Preserve_snapshot_delete_status::ERROR_BEFORE_SNAPSHOT_DELETE &&
+      normalize_dir(key.preserve_dir) ==
+          normalize_dir(preserve_trx_default_dir()) &&
+      preserve_trx_xid_provenance_contains(key.token)) {
+    if (preserve_trx_xid_provenance_remove(key.token)) {
+      delete_status =
+          Preserve_snapshot_delete_status::ERROR_AFTER_SNAPSHOT_DELETE;
+    } else if (delete_status ==
+               Preserve_snapshot_delete_status::ERROR_AFTER_SNAPSHOT_DELETE) {
+      delete_status = Preserve_snapshot_delete_status::OK;
+    }
+  }
   if (delete_status == Preserve_snapshot_delete_status::OK) {
     remove_strict_attach_intent(key);
   } else {

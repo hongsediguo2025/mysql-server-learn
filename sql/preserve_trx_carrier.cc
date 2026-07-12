@@ -601,6 +601,14 @@ Preserve_snapshot_status Preserved_trx_store::read(const std::string &token,
               bundle);
 }
 
+Preserve_snapshot_status Preserved_trx_store::codec_context(
+    Preserved_trx_codec_context *context,
+    Preserved_trx_codec_context_purpose purpose) {
+  if (m_carrier == nullptr || context == nullptr)
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  return map_carrier_status(m_carrier->codec_context(context, purpose));
+}
+
 Preserve_snapshot_status Preserved_trx_store::read(
     const std::string &token, bool validate_identity,
     Preserved_trx_carrier::Payload_read_mode payload_read_mode,

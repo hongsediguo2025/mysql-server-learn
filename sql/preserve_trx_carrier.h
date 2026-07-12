@@ -446,6 +446,10 @@ class Preserved_trx_store {
       Preserve_snapshot_delete_status *write_failure_delete_status = nullptr,
       Preserved_trx_store_write_stats *write_stats = nullptr);
 
+  Preserve_snapshot_status codec_context(
+      Preserved_trx_codec_context *context,
+      Preserved_trx_codec_context_purpose purpose);
+
   Preserve_snapshot_status read(const std::string &token, bool validate_identity,
                                 Preserved_trx_bundle *bundle);
   Preserve_snapshot_status read(const std::string &token, bool validate_identity,

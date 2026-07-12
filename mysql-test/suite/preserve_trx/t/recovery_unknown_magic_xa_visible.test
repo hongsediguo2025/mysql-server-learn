@@ -1,0 +1,37 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_unknown_magic_xa;
+--enable_warnings
+CALL mtr.add_suppression("Found 1 prepared XA transactions");
+
+--let $restart_parameters= restart: --preserve-trx-enable=OFF --preserve-trx-off-artifact-policy=IGNORE
+--let $do_not_echo_parameters= 1
+--source include/restart_mysqld.inc
+--let $do_not_echo_parameters=
+--let $restart_parameters=
+
+CREATE TABLE t_unknown_magic_xa(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_unknown_magic_xa VALUES(1, 10);
+
+# An external XA client can choose the Preserve format id and gtrid. Without
+# authenticated provenance this must not be mistaken for an internal token.
+--connect(xa_client,localhost,root,,test)
+XA START X'4d53505f50524553', X'65787465726e616c5f6d61676963', 1836281843;
+UPDATE t_unknown_magic_xa SET v=20 WHERE id=1;
+XA END X'4d53505f50524553', X'65787465726e616c5f6d61676963', 1836281843;
+XA PREPARE X'4d53505f50524553', X'65787465726e616c5f6d61676963', 1836281843;
+--connection default
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-off-artifact-policy=FAIL_IF_PRESENT
+--let $do_not_echo_parameters= 1
+--source include/restart_mysqld.inc
+--let $do_not_echo_parameters=
+--let $restart_parameters=
+
+XA RECOVER CONVERT XID;
+XA ROLLBACK X'4d53505f50524553', X'65787465726e616c5f6d61676963', 1836281843;
+SELECT * FROM t_unknown_magic_xa ORDER BY id;
+
+DROP TABLE t_unknown_magic_xa;
