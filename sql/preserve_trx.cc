@@ -2044,6 +2044,45 @@ static bool preserve_trx_xid_provenance_remove_many(
   return false;
 }
 
+static bool preserve_trx_xid_provenance_reconcile_failed_batch(
+    const std::vector<std::string> &batch_tokens,
+    const std::vector<Preserve_trx_xid_provenance_binding>
+        &surviving_snapshots) {
+  std::lock_guard<std::mutex> lock(g_preserve_trx_xid_provenance_write_mutex);
+  const auto current = preserve_trx_xid_provenance_snapshot();
+  Preserve_trx_xid_provenance_map records = *current;
+  const std::set<std::string> batch_token_set(batch_tokens.begin(),
+                                               batch_tokens.end());
+
+  for (const std::string &token : batch_tokens) records.erase(token);
+  for (const Preserve_trx_xid_provenance_binding &binding :
+       surviving_snapshots) {
+    if (binding.first.empty() || binding.second.empty() ||
+        batch_token_set.count(binding.first) == 0) {
+      return true;
+    }
+    const auto existing = current->find(binding.first);
+    if (existing == current->end() ||
+        existing->second.state !=
+            Preserve_trx_xid_provenance_state::PREPARED_INTENT) {
+      return true;
+    }
+    Preserve_trx_xid_provenance_record record = existing->second;
+    record.state = Preserve_trx_xid_provenance_state::SNAPSHOT_BOUND;
+    record.snapshot_identity_digest = binding.second;
+    records[binding.first] = std::move(record);
+  }
+
+  std::shared_ptr<const Preserve_trx_xid_provenance_map> published;
+  if (preserve_trx_prepare_xid_provenance_publication(records, &published))
+    return true;
+  if (preserve_trx_write_xid_provenance_ledger(preserve_trx_default_dir(),
+                                               records))
+    return true;
+  preserve_trx_publish_xid_provenance_map(std::move(published));
+  return false;
+}
+
 static bool preserve_trx_xid_provenance_remove(const std::string &token) {
   return preserve_trx_xid_provenance_remove_many({token});
 }
@@ -13888,6 +13927,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
         store_write_stats.write_snapshot_us;
   }
   if (status != Preserve_snapshot_status::OK) {
+    if (durable_snapshot_may_exist && result != nullptr &&
+        result->snapshot_identity_digest.empty()) {
+      (void)preserve_trx_snapshot_identity_digest(
+          metadata, &result->snapshot_identity_digest);
+    }
     discard_prebuilt_binlog_blob_if_needed();
     return reject_after_snapshot_failure(durable_snapshot_may_exist,
                                          write_failure_delete_status);
@@ -15490,6 +15534,25 @@ bool Preserve_trx_drain_service::execute(
           : quiesced_target_thread_ids.size();
   std::vector<Preserve_batch_target_execution> target_results(
       target_execution_count);
+  auto reconcile_failed_batch_provenance = [&]() {
+    auto store = create_preserved_trx_default_store(preserve_trx_default_dir());
+    Preserved_trx_carrier_listing listing;
+    if (store->list_tokens(&listing) != Preserve_snapshot_status::OK)
+      return true;
+    std::vector<Preserve_trx_xid_provenance_binding> surviving_snapshots;
+    surviving_snapshots.reserve(target_results.size());
+    for (const Preserve_batch_target_execution &execution : target_results) {
+      if (execution.result.token.empty() ||
+          execution.result.snapshot_identity_digest.empty() ||
+          listing.snapshot_tokens.count(execution.result.token) == 0) {
+        continue;
+      }
+      surviving_snapshots.emplace_back(
+          execution.result.token, execution.result.snapshot_identity_digest);
+    }
+    return preserve_trx_xid_provenance_reconcile_failed_batch(
+        batch_provenance_tokens, surviving_snapshots);
+  };
   auto apply_target_metrics = [&](const Preserve_trx_preserve_result &result) {
     phase2_metrics.binlog_preflight_us += result.binlog_preflight_us;
     phase2_metrics.lock_preflight_us += result.lock_preflight_us;
@@ -15717,6 +15780,11 @@ bool Preserve_trx_drain_service::execute(
         if (restore_preserved_batch_items_to_original_thds(
                 generation, preserved_batch_items)) {
           batch_provenance_cleanup.commit();
+          if (reconcile_failed_batch_provenance()) {
+            LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                   "PRESERVE: failed to reconcile XID provenance after "
+                   "debug-injected batch cleanup failure");
+          }
           abort_batch_transfer_epoch("debug_after_one_target_cleanup_failed");
           LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                  "Preserved transaction batch cleanup failed after debug "
@@ -15782,6 +15850,11 @@ bool Preserve_trx_drain_service::execute(
         batch_result.cleanup_failed_after_reattach || prior_cleanup_error;
     if (cleanup_error) {
       batch_provenance_cleanup.commit();
+      if (reconcile_failed_batch_provenance()) {
+        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+               "PRESERVE: failed to reconcile XID provenance after target "
+               "cleanup failure");
+      }
       abort_batch_transfer_epoch("target_cleanup_failed");
       if (!batch_result.token.empty()) {
         if (batch_result.left_preserved_after_cleanup_failure) {
@@ -15816,6 +15889,11 @@ bool Preserve_trx_drain_service::execute(
     abort_batch_transfer_epoch("xid_provenance_batch_bind_failed");
     if (cleanup_error) {
       batch_provenance_cleanup.commit();
+      if (reconcile_failed_batch_provenance()) {
+        LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+               "PRESERVE: failed to reconcile XID provenance after bind "
+               "cleanup failure");
+      }
       LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
              "Preserved transaction batch cleanup failed after XID provenance "
              "bind error");
