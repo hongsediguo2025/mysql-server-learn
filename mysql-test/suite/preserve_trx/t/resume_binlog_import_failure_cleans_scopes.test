@@ -33,7 +33,9 @@ SET SESSION debug=
 --error ER_PRESERVE_TRX_UNSUPPORTED
 --eval RESUME PRESERVED TRANSACTION '$preserved_token'
 SET SESSION debug=
-  "-d,preserve_trx_fail_binlog_import_after_handler_registration,+d,preserve_trx_assert_binlog_import_scopes_clean";
+  "-d,preserve_trx_fail_binlog_import_after_handler_registration";
+SET SESSION debug=
+  "+d,preserve_trx_assert_binlog_import_scopes_clean";
 
 --replace_result $preserved_token TOKEN
 --eval RESUME PRESERVED TRANSACTION '$preserved_token'

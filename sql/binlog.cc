@@ -4117,6 +4117,13 @@ bool mysql_binlog_preserve_import(
   binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
   if (cache_mngr == nullptr || !cache_mngr->is_binlog_empty()) return true;
 
+  /*
+    A previous failed RESUME command can leave an empty command-level binlog
+    savepoint after its statement rollback. The imported cache replaces that
+    empty statement state, so normalize it before registering the preserved
+    transaction participants.
+  */
+  cache_mngr->trx_cache.set_prev_position(MY_OFF_T_UNDEF);
   DBUG_EXECUTE_IF("preserve_trx_assert_binlog_import_scopes_clean",
                   assert(binlog_preserve_import_scopes_are_clean(thd)););
   register_binlog_handler(thd, true);
