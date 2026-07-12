@@ -337,6 +337,11 @@ Preserve_trx_prepared_token_key make_prepared_token_key(uint64_t generation) {
 
 Preserve_trx_final_token_facts make_final_token_facts(uint64_t lsn) {
   Preserve_trx_final_token_facts facts;
+  static const uint64_t epoch_deadline_us =
+      preserved_trx_promotion_prepared_monotonic_us_for_unit_test() +
+      3600ULL * 1000000ULL;
+  static const uint64_t resume_deadline_us =
+      epoch_deadline_us + 3600ULL * 1000000ULL;
   facts.required_apply_lsn = lsn;
   facts.physical_fence_lsn = lsn;
   facts.epoch_fact_digest.assign(64, 'a');
@@ -350,8 +355,8 @@ Preserve_trx_final_token_facts make_final_token_facts(uint64_t lsn) {
   facts.record_lock_bits = 0;
   facts.lock_plan_capacity_bytes = 128;
   facts.native_binlog_capacity_bytes = 0;
-  facts.epoch_prepare_deadline_us = 500000;
-  facts.client_resume_deadline_us = 1000000;
+  facts.epoch_prepare_deadline_us = epoch_deadline_us;
+  facts.client_resume_deadline_us = resume_deadline_us;
   facts.semantic_validated = true;
   facts.lock_plan_ready = true;
   facts.binlog_handle_ready = true;
@@ -984,19 +989,197 @@ TEST(PreservedTrxPreparedRegistry, PendingLeaseDeadlineReleasesOnlyUnclaimed) {
   Preserve_trx_prepare_lease prepare;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.begin_prepare(key, 1, &prepare));
+  const Preserve_trx_final_token_facts facts = make_final_token_facts(100);
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
-            registry.publish_ready(&prepare, make_final_token_facts(100),
+            registry.publish_ready(&prepare, facts,
                                    acquire_prepared_resources(key)));
   EXPECT_EQ(0U, registry.expire_ready_facts_pending_lease(
-                    key.source_uuid, key.epoch_id, 499999));
+                    key.source_uuid, key.epoch_id,
+                    facts.epoch_prepare_deadline_us - 1));
   EXPECT_EQ(1U, registry.expire_ready_facts_pending_lease(
-                    key.source_uuid, key.epoch_id, 500000));
+                    key.source_uuid, key.epoch_id,
+                    facts.epoch_prepare_deadline_us));
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::NOT_READY, snapshot.state);
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  (void)registry.expire_once(facts.epoch_prepare_deadline_us);
+  EXPECT_EQ(Preserve_trx_prepared_status::NOT_FOUND,
+            registry.snapshot(key, &snapshot));
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry, ReadyForGateDeadlineReleasesResources) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, key.generation, &prepare));
+  const Preserve_trx_final_token_facts facts = make_final_token_facts(100);
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&prepare, facts,
+                                   acquire_prepared_resources(key)));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.mark_ready_for_gate(key, key.generation));
+
+  const auto expired = registry.expire_once(facts.epoch_prepare_deadline_us);
+  EXPECT_EQ(1U, expired.ready_expired);
+  EXPECT_EQ(0U, expired.adopted_tainted);
+  EXPECT_EQ(0U, expired.active_artifacts_cleaned);
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::NOT_READY, snapshot.state);
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  (void)registry.expire_once(facts.epoch_prepare_deadline_us);
+  EXPECT_EQ(Preserve_trx_prepared_status::NOT_FOUND,
+            registry.snapshot(key, &snapshot));
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry,
+     AdoptedLockedDeadlineTaintsWithoutSpeculativeRollback) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, key.generation, &prepare));
+  const Preserve_trx_final_token_facts facts = make_final_token_facts(100);
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&prepare, facts,
+                                   acquire_prepared_resources(key)));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.mark_ready_for_gate(key, key.generation));
+  Preserve_trx_gate_adopt_lease adopt;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_gate_adopt(key, key.generation, &adopt));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.commit_gate_adopt(&adopt));
+
+  const auto expired = registry.expire_once(facts.client_resume_deadline_us);
+  EXPECT_EQ(0U, expired.ready_expired);
+  EXPECT_EQ(1U, expired.adopted_tainted);
+  EXPECT_EQ(0U, expired.active_artifacts_cleaned);
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::CLEANUP_TAINTED,
+            snapshot.state);
+  EXPECT_GT(preserve_trx_memory_current_bytes_status(), 0U);
+}
+
+TEST(PreservedTrxPreparedRegistry,
+     GateAdoptRejectsDeadlineBeforePeriodicReaperScan) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease prepare;
+  auto facts = make_final_token_facts(100);
+  facts.epoch_prepare_deadline_us = 1;
+  facts.canonical_digest.clear();
+  ASSERT_TRUE(preserved_trx_finalize_token_facts(&facts));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, key.generation, &prepare));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&prepare, facts,
+                                   acquire_prepared_resources(key)));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.mark_ready_for_gate(key, key.generation));
+
+  Preserve_trx_gate_adopt_lease adopt;
+  EXPECT_EQ(Preserve_trx_prepared_status::INVALID_STATE,
+            registry.begin_gate_adopt(key, key.generation, &adopt));
   Preserve_trx_prepared_token_snapshot snapshot;
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             registry.snapshot(key, &snapshot));
   EXPECT_EQ(Preserve_trx_prepared_token_state::NOT_READY, snapshot.state);
   EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
   registry.purge_epoch(key.source_uuid, key.epoch_id);
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry,
+     AttachRejectsDeadlineBeforePeriodicReaperScan) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease prepare;
+  auto facts = make_final_token_facts(100);
+  facts.client_resume_deadline_us = 1;
+  facts.canonical_digest.clear();
+  ASSERT_TRUE(preserved_trx_finalize_token_facts(&facts));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, key.generation, &prepare));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&prepare, facts,
+                                   acquire_prepared_resources(key)));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.mark_ready_for_gate(key, key.generation));
+  Preserve_trx_gate_adopt_lease adopt;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_gate_adopt(key, key.generation, &adopt));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.commit_gate_adopt(&adopt));
+
+  Preserve_trx_attach_lease attach;
+  EXPECT_EQ(Preserve_trx_prepared_status::INVALID_STATE,
+            registry.begin_attach(key, key.generation, &attach));
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::CLEANUP_TAINTED,
+            snapshot.state);
+  EXPECT_GT(preserve_trx_memory_current_bytes_status(), 0U);
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry, ActiveExpiryOnlyCleansPreserveArtifacts) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, key.generation, &prepare));
+  const Preserve_trx_final_token_facts facts = make_final_token_facts(100);
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&prepare, facts,
+                                   acquire_prepared_resources(key)));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.mark_ready_for_gate(key, key.generation));
+  Preserve_trx_gate_adopt_lease adopt;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_gate_adopt(key, key.generation, &adopt));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.commit_gate_adopt(&adopt));
+  Preserve_trx_attach_lease attach;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_attach(key, key.generation, &attach));
+  bool durable_intent = true;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_activation(&attach,
+                                      activation_intent_writer_for_test,
+                                      &durable_intent));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.commit_attach(&attach,
+                                   activation_intent_writer_for_test,
+                                   &durable_intent));
+
+  const auto expired = registry.expire_once(facts.client_resume_deadline_us);
+  EXPECT_EQ(0U, expired.ready_expired);
+  EXPECT_EQ(0U, expired.adopted_tainted);
+  EXPECT_EQ(1U, expired.active_artifacts_cleaned);
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::ACTIVE_ARTIFACTS_CLEANED,
+            snapshot.state);
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  (void)registry.expire_once(facts.client_resume_deadline_us);
+  EXPECT_EQ(Preserve_trx_prepared_status::NOT_FOUND,
+            registry.snapshot(key, &snapshot));
   preserve_trx_resource_manager_reset_for_unit_test();
 }
 
@@ -12470,9 +12653,31 @@ TEST_F(PreserveSnapshotTest,
   commit.sequence = sequence++;
   commit.epoch_id = manifest.epoch_id;
   commit.token = manifest.token;
+  auto reset_bind_fault = create_scope_guard([] {
+    preserve_trx_transfer_set_epoch_bind_bad_alloc_for_unit_test(false);
+  });
+  preserve_trx_transfer_set_epoch_bind_bad_alloc_for_unit_test(true);
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             preserve_trx_transfer_apply_receiver_frame(
                 m_dir, commit, &store, &registry, 300, nullptr));
+  Preserve_trx_transfer_receiver_record receiver_record;
+  ASSERT_TRUE(
+      registry.lookup(manifest.epoch_id, manifest.token, &receiver_record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::RECEIVING,
+            receiver_record.state);
+  EXPECT_FALSE(preserve_trx_transfer_epoch_binding_for_unit_test(
+      m_dir, manifest.epoch_id));
+  preserve_trx_transfer_set_epoch_bind_bad_alloc_for_unit_test(false);
+  preserve_trx_transfer_receiver_reaper_scan_for_unit_test(transfer_token,
+                                                           &registry);
+  EXPECT_FALSE(preserve_trx_transfer_epoch_binding_for_unit_test(
+      m_dir, manifest.epoch_id));
+  EXPECT_TRUE(preserve_trx_transfer_epoch_bound_for_unit_test(
+      m_dir, manifest.epoch_id));
+  ASSERT_TRUE(
+      registry.lookup(manifest.epoch_id, manifest.token, &receiver_record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::SAVED_ONLINE,
+            receiver_record.state);
 
   ASSERT_EQ(Preserve_trx_prepared_status::OK,
             strict_registry.snapshot(strict_key, &strict_snapshot));
@@ -12781,6 +12986,230 @@ TEST_F(PreserveSnapshotTest, TransferReceiverBeginWritesDurableFrameSpool) {
                      "/receiver.frames")
                         .c_str(),
                     &stat_area, MYF(0)));
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverStagingCleanupDebtRetriesBeforeSavedOnline) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 1033;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-cleanup-debt", "source-uuid", server_uuid, bundle,
+                transfer_token, &manifest, &objects));
+  Preserve_trx_transfer_receiver_registry registry;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_receive(manifest));
+  ASSERT_FALSE(objects.empty());
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_stage_object_chunk(
+                m_dir, manifest, objects.front().descriptor.object_id, 0,
+                objects.front().payload));
+
+  auto reset_cleanup_fault = create_scope_guard([] {
+    preserve_trx_transfer_set_staging_cleanup_failures_for_unit_test(0);
+  });
+  preserve_trx_transfer_set_staging_cleanup_failures_for_unit_test(2);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_finalize_receiver_staging_for_unit_test(
+                m_dir, manifest, &registry, 100));
+  Preserve_trx_transfer_receiver_record record;
+  ASSERT_TRUE(registry.lookup(manifest.epoch_id, manifest.token, &record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::CLEANUP_PENDING,
+            record.state);
+  EXPECT_EQ(1U, registry.cleanup_debt_count_for_unit_test());
+
+  const ulonglong saved_max_inflight =
+      preserve_trx_transfer_max_inflight_bytes;
+  auto restore_max_inflight = create_scope_guard([&] {
+    preserve_trx_transfer_max_inflight_bytes = saved_max_inflight;
+  });
+  preserve_trx_transfer_max_inflight_bytes = 1;
+  Preserve_trx_transfer_manifest next_manifest = manifest;
+  next_manifest.epoch_id = "epoch-cleanup-debt-next";
+  next_manifest.token = transfer_token + 1;
+  EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED,
+            registry.begin_receive(next_manifest));
+  preserve_trx_transfer_max_inflight_bytes = saved_max_inflight;
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_finalize_receiver_staging_for_unit_test(
+                m_dir, manifest, &registry, 500000));
+
+  EXPECT_EQ(0U, registry.retry_cleanup_debt_once(1000000));
+  EXPECT_EQ(1U, registry.retry_cleanup_debt_once(1000100));
+  ASSERT_TRUE(registry.lookup(manifest.epoch_id, manifest.token, &record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::SAVED_ONLINE, record.state);
+  EXPECT_EQ(0U, registry.cleanup_debt_count_for_unit_test());
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverStagingCleanupDebtLimitRemainsVisibleTaint) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 1035;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-cleanup-taint", "source-uuid", server_uuid, bundle,
+                transfer_token, &manifest, &objects));
+  Preserve_trx_transfer_receiver_registry registry;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.begin_receive(manifest));
+
+  auto reset_cleanup_fault = create_scope_guard([] {
+    preserve_trx_transfer_set_staging_cleanup_failures_for_unit_test(0);
+  });
+  preserve_trx_transfer_set_staging_cleanup_failures_for_unit_test(5);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_finalize_receiver_staging_for_unit_test(
+                m_dir, manifest, &registry, 100));
+  EXPECT_EQ(0U, registry.retry_cleanup_debt_once(1000100));
+  EXPECT_EQ(0U, registry.retry_cleanup_debt_once(3000100));
+  EXPECT_EQ(0U, registry.retry_cleanup_debt_once(7000100));
+  EXPECT_EQ(0U, registry.retry_cleanup_debt_once(15000100));
+
+  Preserve_trx_transfer_receiver_record record;
+  ASSERT_TRUE(registry.lookup(manifest.epoch_id, manifest.token, &record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::CLEANUP_TAINTED,
+            record.state);
+  EXPECT_EQ(1U, registry.cleanup_debt_count_for_unit_test());
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverAbortCleanupDebtRetriesToAborted) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 1036;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-abort-cleanup-debt", "source-uuid", server_uuid,
+                bundle, transfer_token, &manifest, &objects));
+  std::string manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_manifest(manifest, &manifest_payload));
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", server_uuid);
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+
+  Preserve_trx_transfer_frame begin;
+  begin.type = Preserve_trx_transfer_frame_type::BEGIN;
+  begin.sequence = 1;
+  begin.epoch_id = manifest.epoch_id;
+  begin.token = manifest.token;
+  begin.manifest_payload = manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, begin, &store, &registry, 300, nullptr));
+
+  auto reset_cleanup_fault = create_scope_guard([] {
+    preserve_trx_transfer_set_staging_cleanup_failures_for_unit_test(0);
+  });
+  preserve_trx_transfer_set_staging_cleanup_failures_for_unit_test(1);
+  Preserve_trx_transfer_frame abort;
+  abort.type = Preserve_trx_transfer_frame_type::ABORT;
+  abort.sequence = 2;
+  abort.epoch_id = manifest.epoch_id;
+  abort.token = manifest.token;
+  abort.reason = "source_abort";
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, abort, &store, &registry, 300, nullptr));
+
+  Preserve_trx_transfer_receiver_record record;
+  ASSERT_TRUE(registry.lookup(manifest.epoch_id, manifest.token, &record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::CLEANUP_PENDING,
+            record.state);
+  EXPECT_EQ(1U, registry.cleanup_debt_count_for_unit_test());
+  EXPECT_EQ(1U, registry.retry_cleanup_debt_once(
+                    std::numeric_limits<uint64_t>::max()));
+  ASSERT_TRUE(registry.lookup(manifest.epoch_id, manifest.token, &record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::ABORTED, record.state);
+  EXPECT_EQ(0U, registry.cleanup_debt_count_for_unit_test());
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverFinalAckBoundsSpoolAndSequenceHistory) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 1034;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-ack-retire", "source-uuid", server_uuid, bundle,
+                transfer_token, &manifest, &objects));
+  std::string manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_manifest(manifest, &manifest_payload));
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", server_uuid);
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  Preserve_trx_transfer_frame begin;
+  begin.type = Preserve_trx_transfer_frame_type::BEGIN;
+  begin.sequence = 1;
+  begin.epoch_id = manifest.epoch_id;
+  begin.token = manifest.token;
+  begin.manifest_payload = manifest_payload;
+  std::string encoded_begin;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_frame(begin, &encoded_begin));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_handle_receiver_payload_batch(
+                m_dir, {encoded_begin}, &store, &registry, 300, 1, nullptr));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.mark_saved_online(manifest.epoch_id, manifest.token));
+  ASSERT_TRUE(registry.frame_sequence_applied(manifest.epoch_id, 1));
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_acknowledge_epoch_for_unit_test(
+                m_dir, manifest.epoch_id, &registry, 100, 1000));
+  MY_STAT stat_area;
+  EXPECT_EQ(nullptr,
+            my_stat((m_dir + ".transfer/" + manifest.epoch_id +
+                     "/receiver.frames")
+                        .c_str(),
+                    &stat_area, MYF(0)));
+  EXPECT_TRUE(registry.frame_sequence_applied(manifest.epoch_id, 1));
+  EXPECT_EQ(0U, registry.retire_acknowledged_epochs_once(1099));
+  EXPECT_EQ(1U, registry.retire_acknowledged_epochs_once(1100));
+  EXPECT_FALSE(registry.frame_sequence_applied(manifest.epoch_id, 1));
+  EXPECT_EQ(0U, registry.size());
 }
 
 TEST_F(PreserveSnapshotTest, TransferReceiverReplaysDurableFrameSpool) {

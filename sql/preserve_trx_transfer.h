@@ -343,6 +343,8 @@ struct Preserve_trx_transfer_frame_ack {
 enum class Preserve_trx_transfer_receiver_state {
   DECLARED,
   RECEIVING,
+  CLEANUP_PENDING,
+  CLEANUP_TAINTED,
   SAVED_ONLINE,
   CORRUPT,
   ABORTED
@@ -385,6 +387,16 @@ class Preserve_trx_transfer_receiver_registry {
 
   Preserve_trx_transfer_status mark_saved_online(const std::string &epoch_id,
                                                  uint64_t token);
+  Preserve_trx_transfer_status mark_cleanup_pending(
+      const std::string &root_dir, const std::string &epoch_id, uint64_t token,
+      uint64_t now_us, Preserve_trx_transfer_receiver_state target_state,
+      const std::string &reason);
+  size_t retry_cleanup_debt_once(uint64_t now_us);
+  size_t cleanup_debt_count_for_unit_test() const;
+  Preserve_trx_transfer_status acknowledge_epoch(
+      const std::string &root_dir, const std::string &epoch_id,
+      uint64_t now_us, uint64_t grace_us);
+  size_t retire_acknowledged_epochs_once(uint64_t now_us);
   Preserve_trx_transfer_status mark_corrupt(const std::string &epoch_id,
                                             uint64_t token,
                                             const std::string &reason);
@@ -423,6 +435,8 @@ class Preserve_trx_transfer_receiver_registry {
  private:
   using Token_key = std::pair<std::string, uint64_t>;
 
+  uint64_t cleanup_debt_reserved_bytes_locked(bool *overflow) const;
+
   Preserve_trx_transfer_status mark_terminal_locked(
       const Token_key &key, Preserve_trx_transfer_receiver_state state,
       const std::string &reason);
@@ -437,6 +451,21 @@ class Preserve_trx_transfer_receiver_registry {
   };
   std::map<std::pair<std::string, uint64_t>, Frame_sequence_record>
       m_frame_sequences;
+  struct Cleanup_debt {
+    std::string root_dir;
+    Preserve_trx_transfer_receiver_state target_state{
+        Preserve_trx_transfer_receiver_state::SAVED_ONLINE};
+    uint64_t reserved_bytes{0};
+    uint64_t next_retry_us{0};
+    uint attempts{0};
+  };
+  std::map<Token_key, Cleanup_debt> m_cleanup_debts;
+  struct Acknowledged_epoch {
+    std::string root_dir;
+    uint64_t retire_after_us{0};
+    bool spool_deleted{false};
+  };
+  std::map<std::string, Acknowledged_epoch> m_acknowledged_epochs;
 };
 
 Preserve_trx_transfer_status preserve_trx_transfer_encode_manifest(
@@ -686,6 +715,21 @@ std::string preserve_trx_transfer_qualify_epoch_id_for_unit_test(
 void preserve_trx_transfer_set_spool_short_write_for_unit_test(bool enabled);
 void preserve_trx_transfer_set_spool_rollback_failure_for_unit_test(
     bool enabled);
+void preserve_trx_transfer_set_staging_cleanup_failures_for_unit_test(
+    uint failures);
+Preserve_trx_transfer_status
+preserve_trx_transfer_finalize_receiver_staging_for_unit_test(
+    const std::string &root_dir,
+    const Preserve_trx_transfer_manifest &manifest,
+    Preserve_trx_transfer_receiver_registry *registry, uint64_t now_us);
+Preserve_trx_transfer_status
+preserve_trx_transfer_acknowledge_epoch_for_unit_test(
+    const std::string &root_dir, const std::string &epoch_id,
+    Preserve_trx_transfer_receiver_registry *registry, uint64_t now_us,
+    uint64_t grace_us);
+void preserve_trx_transfer_receiver_reaper_scan_once(uint64_t now_us);
+void preserve_trx_transfer_receiver_reaper_scan_for_unit_test(
+    uint64_t now_us, Preserve_trx_transfer_receiver_registry *registry);
 bool preserve_trx_transfer_frame_batch_count_fits_payload(
     uint32_t count, size_t remaining_bytes);
 
@@ -717,6 +761,11 @@ void preserve_trx_transfer_set_receiver_object_prewarm_delay_ms_for_unit_test(
     uint delay_ms);
 void preserve_trx_transfer_set_temporary_worker_create_failure_for_unit_test(
     int fail_at_worker_index);
+void preserve_trx_transfer_set_epoch_bind_bad_alloc_for_unit_test(bool enabled);
+bool preserve_trx_transfer_epoch_binding_for_unit_test(
+    const std::string &root_dir, const std::string &epoch_id);
+bool preserve_trx_transfer_epoch_bound_for_unit_test(
+    const std::string &root_dir, const std::string &epoch_id);
 Preserve_trx_transfer_status
 preserve_trx_transfer_start_receiver_workers_for_unit_test(
     uint worker_count, int fail_create_at_worker_index,

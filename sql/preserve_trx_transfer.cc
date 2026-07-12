@@ -99,6 +99,7 @@ uint preserve_trx_transfer_phase1_batch_linger_ms = 20;
 
 static std::atomic<bool> g_transfer_spool_short_write_for_unit_test{false};
 static std::atomic<bool> g_transfer_spool_rollback_failure_for_unit_test{false};
+static std::atomic<uint> g_transfer_staging_cleanup_failures_for_unit_test{0};
 
 static std::atomic<uint64_t> g_receiver_auto_prewarm_tokens{0};
 static std::atomic<uint64_t> g_receiver_auto_prewarm_ready_tokens{0};
@@ -184,10 +185,41 @@ struct Receiver_epoch_ready_state {
   bool fact_loaded{false};
   bool binding{false};
   bool bound{false};
+  uint64_t binding_generation{0};
 };
 static std::mutex g_receiver_ready_epoch_mutex;
 static std::map<std::pair<std::string, std::string>, Receiver_epoch_ready_state>
     g_receiver_ready_epoch_state;
+static std::atomic<bool> g_receiver_epoch_bind_bad_alloc_for_unit_test{false};
+
+class Receiver_epoch_binding_guard {
+ public:
+  Receiver_epoch_binding_guard(std::string root_dir, std::string epoch_id)
+      : m_key(std::move(root_dir), std::move(epoch_id)) {}
+  Receiver_epoch_binding_guard(const Receiver_epoch_binding_guard &) = delete;
+  Receiver_epoch_binding_guard &operator=(
+      const Receiver_epoch_binding_guard &) = delete;
+  ~Receiver_epoch_binding_guard() {
+    if (!m_armed) return;
+    std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+    const auto found = g_receiver_ready_epoch_state.find(m_key);
+    if (found != g_receiver_ready_epoch_state.end() &&
+        found->second.binding_generation == m_generation) {
+      found->second.binding = false;
+    }
+  }
+
+  void arm(uint64_t generation) {
+    m_generation = generation;
+    m_armed = true;
+  }
+  void commit() { m_armed = false; }
+
+ private:
+  std::pair<std::string, std::string> m_key;
+  uint64_t m_generation{0};
+  bool m_armed{false};
+};
 struct Receiver_object_prewarm_key {
   std::string root_dir;
   std::string epoch_id;
@@ -1684,6 +1716,14 @@ Preserve_trx_transfer_status cleanup_transfer_token_staging(
       !transfer_component_safe(token_component)) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
+
+  uint remaining =
+      g_transfer_staging_cleanup_failures_for_unit_test.load();
+  while (remaining != 0 &&
+         !g_transfer_staging_cleanup_failures_for_unit_test
+              .compare_exchange_weak(remaining, remaining - 1)) {
+  }
+  if (remaining != 0) return Preserve_trx_transfer_status::IO_ERROR;
 
   const std::string epoch_dir =
       join_path(join_path(root_dir, ".transfer"), epoch_id);
@@ -3530,12 +3570,13 @@ bool publish_receiver_epoch_ready_from_seal_prewarm(
       root_dir, manifests.front().epoch_id);
 }
 
-bool publish_receiver_epoch_ready_from_fact_if_possible(
+bool publish_receiver_epoch_ready_from_fact_if_possible_impl(
     const std::string &root_dir, const std::string &epoch_id) {
   if (!preserve_trx_transfer_epoch_committed(root_dir, epoch_id)) {
     return false;
   }
 
+  Receiver_epoch_binding_guard binding_guard(root_dir, epoch_id);
   std::vector<uint64_t> tokens;
   std::shared_ptr<const Preserve_trx_transfer_epoch_fact> fact;
   {
@@ -3550,6 +3591,10 @@ bool publish_receiver_epoch_ready_from_fact_if_possible(
         return false;
       }
       state.binding = true;
+      binding_guard.arm(++state.binding_generation);
+      if (g_receiver_epoch_bind_bad_alloc_for_unit_test.load()) {
+        throw std::bad_alloc();
+      }
       fact = state.fact;
       tokens.assign(state.fact_tokens.begin(), state.fact_tokens.end());
     }
@@ -3576,6 +3621,10 @@ bool publish_receiver_epoch_ready_from_fact_if_possible(
     }
     fact = state.fact;
     state.binding = true;
+    binding_guard.arm(++state.binding_generation);
+    if (g_receiver_epoch_bind_bad_alloc_for_unit_test.load()) {
+      throw std::bad_alloc();
+    }
     tokens.assign(state.fact_tokens.begin(), state.fact_tokens.end());
   }
 
@@ -3586,10 +3635,6 @@ bool publish_receiver_epoch_ready_from_fact_if_possible(
           root_dir, epoch_id, tokens, &ready_tokens);
   if (bind_status != Preserve_trx_promotion_adopt_status::OK ||
       ready_tokens != tokens.size()) {
-    std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
-    Receiver_epoch_ready_state &state =
-        g_receiver_ready_epoch_state[{root_dir, epoch_id}];
-    state.binding = false;
     return false;
   }
 
@@ -3601,6 +3646,7 @@ bool publish_receiver_epoch_ready_from_fact_if_possible(
     if (state.bound) return true;
     state.bound = true;
   }
+  binding_guard.commit();
   const uint64_t total_tokens = tokens.size();
   g_receiver_auto_prewarm_tokens.fetch_add(total_tokens);
   g_receiver_auto_prewarm_ready_tokens.fetch_add(total_tokens);
@@ -3611,6 +3657,51 @@ bool publish_receiver_epoch_ready_from_fact_if_possible(
   refresh_receiver_ready_after_final_metadata();
   refresh_receiver_ready_after_final_spool_ack();
   return true;
+}
+
+bool publish_receiver_epoch_ready_from_fact_if_possible(
+    const std::string &root_dir, const std::string &epoch_id) {
+  try {
+    return publish_receiver_epoch_ready_from_fact_if_possible_impl(root_dir,
+                                                                   epoch_id);
+  } catch (...) {
+    return false;
+  }
+}
+
+bool receiver_epoch_ready_is_bound(const std::string &root_dir,
+                                   const std::string &epoch_id) {
+  std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+  const auto found = g_receiver_ready_epoch_state.find({root_dir, epoch_id});
+  return found != g_receiver_ready_epoch_state.end() && found->second.bound;
+}
+
+void retry_unbound_receiver_epochs_once() {
+  std::vector<std::pair<std::string, std::string>> epochs;
+  {
+    std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+    for (const auto &item : g_receiver_ready_epoch_state) {
+      const Receiver_epoch_ready_state &state = item.second;
+      if (!state.bound && !state.binding && state.fact_loaded &&
+          state.fact != nullptr &&
+          state.ready_fact_token_count == state.fact_tokens.size()) {
+        epochs.push_back(item.first);
+      }
+    }
+  }
+  for (const auto &epoch : epochs) {
+    (void)publish_receiver_epoch_ready_from_fact_if_possible(epoch.first,
+                                                             epoch.second);
+  }
+}
+
+std::vector<std::pair<std::string, std::string>> bound_receiver_epochs() {
+  std::vector<std::pair<std::string, std::string>> epochs;
+  std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+  for (const auto &item : g_receiver_ready_epoch_state) {
+    if (item.second.bound) epochs.push_back(item.first);
+  }
+  return epochs;
 }
 
 bool transfer_manifest_has_snapshot_bundle(
@@ -3743,6 +3834,11 @@ void preserve_trx_transfer_set_spool_short_write_for_unit_test(bool enabled) {
 void preserve_trx_transfer_set_spool_rollback_failure_for_unit_test(
     bool enabled) {
   g_transfer_spool_rollback_failure_for_unit_test.store(enabled);
+}
+
+void preserve_trx_transfer_set_staging_cleanup_failures_for_unit_test(
+    uint failures) {
+  g_transfer_staging_cleanup_failures_for_unit_test.store(failures);
 }
 
 bool preserve_trx_transfer_tls_identity_config_is_valid_for_unit_test(
@@ -4908,6 +5004,21 @@ Preserve_trx_transfer_receiver_registry::declare_token(
   return Preserve_trx_transfer_status::OK;
 }
 
+uint64_t Preserve_trx_transfer_receiver_registry::
+    cleanup_debt_reserved_bytes_locked(bool *overflow) const {
+  uint64_t bytes = 0;
+  if (overflow != nullptr) *overflow = false;
+  for (const auto &item : m_cleanup_debts) {
+    if (item.second.reserved_bytes >
+        std::numeric_limits<uint64_t>::max() - bytes) {
+      if (overflow != nullptr) *overflow = true;
+      return 0;
+    }
+    bytes += item.second.reserved_bytes;
+  }
+  return bytes;
+}
+
 Preserve_trx_transfer_status
 Preserve_trx_transfer_receiver_registry::begin_receive(
     const Preserve_trx_transfer_manifest &manifest,
@@ -4951,7 +5062,12 @@ Preserve_trx_transfer_receiver_registry::begin_receive(
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
   }
-  uint64_t epoch_reserved_bytes = 0;
+  bool cleanup_debt_overflow = false;
+  uint64_t epoch_reserved_bytes =
+      cleanup_debt_reserved_bytes_locked(&cleanup_debt_overflow);
+  if (cleanup_debt_overflow) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
   for (const auto &entry : m_records) {
     if (entry.first == key) continue;
     const Preserve_trx_transfer_receiver_record &existing = entry.second;
@@ -5038,7 +5154,12 @@ Preserve_trx_transfer_receiver_registry::declare_object(
                                base_reserved_bytes) {
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
-    uint64_t other_reserved_bytes = 0;
+    bool cleanup_debt_overflow = false;
+    uint64_t other_reserved_bytes =
+        cleanup_debt_reserved_bytes_locked(&cleanup_debt_overflow);
+    if (cleanup_debt_overflow) {
+      return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
     for (const auto &entry : m_records) {
       if (entry.first == key || entry.second.epoch_id != epoch_id ||
           (entry.second.state !=
@@ -5077,7 +5198,12 @@ Preserve_trx_transfer_receiver_registry::declare_object(
   }
   const uint64_t record_reserved_bytes =
       found->second.reserved_bytes + new_object_bytes;
-  uint64_t epoch_reserved_bytes = 0;
+  bool cleanup_debt_overflow = false;
+  uint64_t epoch_reserved_bytes =
+      cleanup_debt_reserved_bytes_locked(&cleanup_debt_overflow);
+  if (cleanup_debt_overflow) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
   for (const auto &entry : m_records) {
     if (entry.first == key || entry.second.epoch_id != epoch_id ||
         (entry.second.state != Preserve_trx_transfer_receiver_state::DECLARED &&
@@ -5110,9 +5236,229 @@ Preserve_trx_transfer_status
 Preserve_trx_transfer_receiver_registry::mark_saved_online(
     const std::string &epoch_id, uint64_t token) {
   std::lock_guard<std::mutex> guard(m_mutex);
-  return mark_terminal_locked(Token_key(epoch_id, token),
-                              Preserve_trx_transfer_receiver_state::SAVED_ONLINE,
-                              "");
+  const Token_key key(epoch_id, token);
+  auto found = m_records.find(key);
+  if (found == m_records.end()) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  if (found->second.state ==
+      Preserve_trx_transfer_receiver_state::SAVED_ONLINE) {
+    return Preserve_trx_transfer_status::OK;
+  }
+  if (found->second.state != Preserve_trx_transfer_receiver_state::DECLARED &&
+      found->second.state != Preserve_trx_transfer_receiver_state::RECEIVING &&
+      found->second.state !=
+          Preserve_trx_transfer_receiver_state::CLEANUP_PENDING) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+  found->second.state = Preserve_trx_transfer_receiver_state::SAVED_ONLINE;
+  found->second.reserved_bytes = 0;
+  found->second.last_error.clear();
+  m_cleanup_debts.erase(key);
+  return Preserve_trx_transfer_status::OK;
+}
+
+Preserve_trx_transfer_status
+Preserve_trx_transfer_receiver_registry::mark_cleanup_pending(
+    const std::string &root_dir, const std::string &epoch_id, uint64_t token,
+    uint64_t now_us, Preserve_trx_transfer_receiver_state target_state,
+    const std::string &reason) {
+  static constexpr uint64_t kCleanupRetryBaseUs = 1000000;
+  if (root_dir.empty() ||
+      (target_state != Preserve_trx_transfer_receiver_state::SAVED_ONLINE &&
+       target_state != Preserve_trx_transfer_receiver_state::CORRUPT &&
+       target_state != Preserve_trx_transfer_receiver_state::ABORTED)) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  std::lock_guard<std::mutex> guard(m_mutex);
+  const Token_key key(epoch_id, token);
+  auto found = m_records.find(key);
+  if (found == m_records.end()) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  if (found->second.state != Preserve_trx_transfer_receiver_state::DECLARED &&
+      found->second.state != Preserve_trx_transfer_receiver_state::RECEIVING &&
+      found->second.state !=
+          Preserve_trx_transfer_receiver_state::CLEANUP_PENDING) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+  Cleanup_debt &debt = m_cleanup_debts[key];
+  if (debt.attempts == 0) {
+    debt.root_dir = root_dir;
+    debt.target_state = target_state;
+    debt.reserved_bytes = found->second.reserved_bytes;
+    debt.attempts = 1;
+    debt.next_retry_us =
+        now_us > std::numeric_limits<uint64_t>::max() - kCleanupRetryBaseUs
+            ? std::numeric_limits<uint64_t>::max()
+            : now_us + kCleanupRetryBaseUs;
+  } else if (debt.root_dir != root_dir || debt.target_state != target_state) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+  found->second.state = Preserve_trx_transfer_receiver_state::CLEANUP_PENDING;
+  found->second.reserved_bytes = 0;
+  found->second.last_error = reason;
+  return Preserve_trx_transfer_status::OK;
+}
+
+size_t Preserve_trx_transfer_receiver_registry::retry_cleanup_debt_once(
+    uint64_t now_us) {
+  static constexpr uint kCleanupRetryLimit = 5;
+  static constexpr uint64_t kCleanupRetryBaseUs = 1000000;
+  std::vector<std::pair<Token_key, Cleanup_debt>> due;
+  {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    for (const auto &item : m_cleanup_debts) {
+      if (item.second.next_retry_us <= now_us) due.push_back(item);
+    }
+  }
+
+  size_t completed = 0;
+  for (const auto &item : due) {
+    const Preserve_trx_transfer_status cleanup_status =
+        cleanup_transfer_token_staging(item.second.root_dir, item.first.first,
+                                       item.first.second);
+    std::lock_guard<std::mutex> guard(m_mutex);
+    auto debt = m_cleanup_debts.find(item.first);
+    auto record = m_records.find(item.first);
+    if (debt == m_cleanup_debts.end() || record == m_records.end() ||
+        record->second.state !=
+            Preserve_trx_transfer_receiver_state::CLEANUP_PENDING) {
+      continue;
+    }
+    if (cleanup_status == Preserve_trx_transfer_status::OK) {
+      record->second.state = debt->second.target_state;
+      record->second.reserved_bytes = 0;
+      record->second.last_error.clear();
+      m_cleanup_debts.erase(debt);
+      ++completed;
+      continue;
+    }
+
+    ++debt->second.attempts;
+    record->second.last_error =
+        "staging_cleanup_retry_failed:" + transfer_status_name(cleanup_status);
+    if (debt->second.attempts >= kCleanupRetryLimit) {
+      record->second.state =
+          Preserve_trx_transfer_receiver_state::CLEANUP_TAINTED;
+      debt->second.next_retry_us = std::numeric_limits<uint64_t>::max();
+      continue;
+    }
+    const uint shift = std::min<uint>(debt->second.attempts - 1, 6);
+    const uint64_t delay = kCleanupRetryBaseUs << shift;
+    debt->second.next_retry_us =
+        now_us > std::numeric_limits<uint64_t>::max() - delay
+            ? std::numeric_limits<uint64_t>::max()
+            : now_us + delay;
+  }
+  return completed;
+}
+
+size_t
+Preserve_trx_transfer_receiver_registry::cleanup_debt_count_for_unit_test()
+    const {
+  std::lock_guard<std::mutex> guard(m_mutex);
+  return m_cleanup_debts.size();
+}
+
+Preserve_trx_transfer_status
+Preserve_trx_transfer_receiver_registry::acknowledge_epoch(
+    const std::string &root_dir, const std::string &epoch_id, uint64_t now_us,
+    uint64_t grace_us) {
+  if (root_dir.empty() || !transfer_component_safe(epoch_id)) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  const uint64_t retire_after_us =
+      now_us > std::numeric_limits<uint64_t>::max() - grace_us
+          ? std::numeric_limits<uint64_t>::max()
+          : now_us + grace_us;
+  {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    try {
+      Acknowledged_epoch &ack = m_acknowledged_epochs[epoch_id];
+      ack.root_dir = root_dir;
+      ack.retire_after_us = retire_after_us;
+      ack.spool_deleted = false;
+    } catch (...) {
+      return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
+    }
+  }
+  const std::string spool_path =
+      transfer_receiver_frame_spool_path(root_dir, epoch_id);
+  const bool spool_deleted =
+      my_delete(spool_path.c_str(), MYF(0)) == 0 || my_errno() == ENOENT;
+  {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    const auto ack = m_acknowledged_epochs.find(epoch_id);
+    if (ack != m_acknowledged_epochs.end()) {
+      ack->second.spool_deleted = spool_deleted;
+    }
+  }
+  return spool_deleted ? Preserve_trx_transfer_status::OK
+                       : Preserve_trx_transfer_status::IO_ERROR;
+}
+
+size_t
+Preserve_trx_transfer_receiver_registry::retire_acknowledged_epochs_once(
+    uint64_t now_us) {
+  std::vector<std::pair<std::string, Acknowledged_epoch>> acknowledged;
+  {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    for (const auto &item : m_acknowledged_epochs) {
+      acknowledged.push_back(item);
+    }
+  }
+
+  size_t retired = 0;
+  for (auto &item : acknowledged) {
+    if (!item.second.spool_deleted) {
+      const std::string spool_path = transfer_receiver_frame_spool_path(
+          item.second.root_dir, item.first);
+      item.second.spool_deleted =
+          my_delete(spool_path.c_str(), MYF(0)) == 0 || my_errno() == ENOENT;
+    }
+    std::lock_guard<std::mutex> guard(m_mutex);
+    auto ack = m_acknowledged_epochs.find(item.first);
+    if (ack == m_acknowledged_epochs.end()) continue;
+    ack->second.spool_deleted = item.second.spool_deleted;
+    if (!ack->second.spool_deleted || ack->second.retire_after_us > now_us) {
+      continue;
+    }
+    bool terminal = true;
+    for (const auto &record : m_records) {
+      if (record.first.first != item.first) continue;
+      if (record.second.state !=
+              Preserve_trx_transfer_receiver_state::SAVED_ONLINE &&
+          record.second.state != Preserve_trx_transfer_receiver_state::CORRUPT &&
+          record.second.state != Preserve_trx_transfer_receiver_state::ABORTED) {
+        terminal = false;
+        break;
+      }
+    }
+    if (!terminal) continue;
+    bool has_debt = false;
+    for (const auto &debt : m_cleanup_debts) {
+      if (debt.first.first == item.first) {
+        has_debt = true;
+        break;
+      }
+    }
+    if (has_debt) continue;
+    for (auto record = m_records.begin(); record != m_records.end();) {
+      record = record->first.first == item.first ? m_records.erase(record)
+                                                 : std::next(record);
+    }
+    for (auto frame = m_frame_sequences.begin();
+         frame != m_frame_sequences.end();) {
+      frame = frame->first.first == item.first
+                  ? m_frame_sequences.erase(frame)
+                  : std::next(frame);
+    }
+    m_next_sequence_by_epoch.erase(item.first);
+    m_acknowledged_epochs.erase(ack);
+    ++retired;
+  }
+  return retired;
 }
 
 Preserve_trx_transfer_status
@@ -8179,16 +8525,24 @@ Preserve_trx_transfer_status finalize_receiver_ready_token_staging(
   if (!receiver_seal_prewarm_token_ok(manifest.epoch_id, manifest.token)) {
     return Preserve_trx_transfer_status::OK;
   }
+  if (!receiver_epoch_ready_is_bound(root_dir, manifest.epoch_id)) {
+    return Preserve_trx_transfer_status::OK;
+  }
 
   /*
     Record-lock object prewarm reads the transfer staging object. Online READY is
     bound to the committed epoch fact and ready cache; staging cannot be removed
     until the token has actually populated the ready cache.
   */
-  (void)cleanup_transfer_token_staging(root_dir, manifest.epoch_id,
-                                       manifest.token);
-  Preserve_trx_transfer_status status =
-      registry->mark_saved_online(manifest.epoch_id, manifest.token);
+  Preserve_trx_transfer_status status = cleanup_transfer_token_staging(
+      root_dir, manifest.epoch_id, manifest.token);
+  if (status != Preserve_trx_transfer_status::OK) {
+    return registry->mark_cleanup_pending(
+        root_dir, manifest.epoch_id, manifest.token, transfer_monotonic_us(),
+        Preserve_trx_transfer_receiver_state::SAVED_ONLINE,
+        "staging_cleanup_failed:" + transfer_status_name(status));
+  }
+  status = registry->mark_saved_online(manifest.epoch_id, manifest.token);
   if (status != Preserve_trx_transfer_status::UNSUPPORTED) return status;
 
   Preserve_trx_transfer_receiver_record record;
@@ -8197,6 +8551,58 @@ Preserve_trx_transfer_status finalize_receiver_ready_token_staging(
     return Preserve_trx_transfer_status::OK;
   }
   return status;
+}
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_finalize_receiver_staging_for_unit_test(
+    const std::string &root_dir,
+    const Preserve_trx_transfer_manifest &manifest,
+    Preserve_trx_transfer_receiver_registry *registry, uint64_t now_us) {
+  if (registry == nullptr) return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  const Preserve_trx_transfer_status cleanup_status =
+      cleanup_transfer_token_staging(root_dir, manifest.epoch_id,
+                                     manifest.token);
+  if (cleanup_status == Preserve_trx_transfer_status::OK) {
+    return registry->mark_saved_online(manifest.epoch_id, manifest.token);
+  }
+  return registry->mark_cleanup_pending(
+      root_dir, manifest.epoch_id, manifest.token, now_us,
+      Preserve_trx_transfer_receiver_state::SAVED_ONLINE,
+      "staging_cleanup_failed:" + transfer_status_name(cleanup_status));
+}
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_acknowledge_epoch_for_unit_test(
+    const std::string &root_dir, const std::string &epoch_id,
+    Preserve_trx_transfer_receiver_registry *registry, uint64_t now_us,
+    uint64_t grace_us) {
+  if (registry == nullptr) return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  return registry->acknowledge_epoch(root_dir, epoch_id, now_us, grace_us);
+}
+
+void receiver_reaper_scan_once(
+    uint64_t now_us, Preserve_trx_transfer_receiver_registry *registry) {
+  if (registry == nullptr) return;
+  retry_unbound_receiver_epochs_once();
+  for (const auto &epoch : bound_receiver_epochs()) {
+    const auto records =
+        registry->sealed_receiving_records_for_epoch(epoch.second);
+    for (const auto &record : records) {
+      (void)finalize_receiver_ready_token_staging(
+          epoch.first, receiver_record_manifest(record), registry);
+    }
+  }
+  (void)registry->retry_cleanup_debt_once(now_us);
+  (void)registry->retire_acknowledged_epochs_once(now_us);
+}
+
+void preserve_trx_transfer_receiver_reaper_scan_once(uint64_t now_us) {
+  receiver_reaper_scan_once(now_us, &default_receiver_registry());
+}
+
+void preserve_trx_transfer_receiver_reaper_scan_for_unit_test(
+    uint64_t now_us, Preserve_trx_transfer_receiver_registry *registry) {
+  receiver_reaper_scan_once(now_us, registry);
 }
 
 Preserve_trx_promotion_adopt_status run_receiver_staged_token_prewarm_job(
@@ -8674,6 +9080,26 @@ void preserve_trx_transfer_set_temporary_worker_create_failure_for_unit_test(
   g_temporary_worker_fail_create_at_for_unit_test.store(fail_at_worker_index);
 }
 
+void preserve_trx_transfer_set_epoch_bind_bad_alloc_for_unit_test(
+    bool enabled) {
+  g_receiver_epoch_bind_bad_alloc_for_unit_test.store(enabled);
+}
+
+bool preserve_trx_transfer_epoch_binding_for_unit_test(
+    const std::string &root_dir, const std::string &epoch_id) {
+  std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+  const auto found = g_receiver_ready_epoch_state.find({root_dir, epoch_id});
+  return found != g_receiver_ready_epoch_state.end() &&
+         found->second.binding;
+}
+
+bool preserve_trx_transfer_epoch_bound_for_unit_test(
+    const std::string &root_dir, const std::string &epoch_id) {
+  std::lock_guard<std::mutex> guard(g_receiver_ready_epoch_mutex);
+  const auto found = g_receiver_ready_epoch_state.find({root_dir, epoch_id});
+  return found != g_receiver_ready_epoch_state.end() && found->second.bound;
+}
+
 Preserve_trx_transfer_status
 preserve_trx_transfer_start_receiver_workers_for_unit_test(
     uint worker_count, int fail_create_at_worker_index,
@@ -8869,6 +9295,12 @@ Preserve_trx_transfer_status mark_epoch_records_corrupt(
     const std::string &reason) {
   Preserve_trx_transfer_status first_status = Preserve_trx_transfer_status::OK;
   for (const Preserve_trx_transfer_receiver_record &record : records) {
+    Preserve_trx_transfer_receiver_record current;
+    if (registry->lookup(record.epoch_id, record.token, &current) &&
+        current.state ==
+            Preserve_trx_transfer_receiver_state::CLEANUP_PENDING) {
+      continue;
+    }
     const Preserve_trx_transfer_status status =
         registry->mark_corrupt(record.epoch_id, record.token, reason);
     if (status != Preserve_trx_transfer_status::OK &&
@@ -8879,16 +9311,34 @@ Preserve_trx_transfer_status mark_epoch_records_corrupt(
   return first_status;
 }
 
-void cleanup_epoch_transfer_staging(
+Preserve_trx_transfer_status cleanup_epoch_transfer_staging(
     const std::string &root_dir,
-    const std::vector<Preserve_trx_transfer_receiver_record> &records) {
+    const std::vector<Preserve_trx_transfer_receiver_record> &records,
+    Preserve_trx_transfer_receiver_registry *registry) {
+  Preserve_trx_transfer_status first_status = Preserve_trx_transfer_status::OK;
   for (const Preserve_trx_transfer_receiver_record &record : records) {
     erase_receiver_strict_record_lock_state(root_dir, record.epoch_id,
                                             record.token);
     purge_strict_prepared_token_for_receiver(root_dir, record);
-    (void)cleanup_transfer_token_staging(root_dir, record.epoch_id,
-                                         record.token);
+    const Preserve_trx_transfer_status cleanup_status =
+        cleanup_transfer_token_staging(root_dir, record.epoch_id, record.token);
+    if (cleanup_status == Preserve_trx_transfer_status::OK) continue;
+    const Preserve_trx_transfer_status debt_status =
+        registry == nullptr
+            ? Preserve_trx_transfer_status::INVALID_ARGUMENT
+            : registry->mark_cleanup_pending(
+                  root_dir, record.epoch_id, record.token,
+                  transfer_monotonic_us(),
+                  Preserve_trx_transfer_receiver_state::CORRUPT,
+                  "epoch_staging_cleanup_failed:" +
+                      transfer_status_name(cleanup_status));
+    if (first_status == Preserve_trx_transfer_status::OK) {
+      first_status = debt_status == Preserve_trx_transfer_status::OK
+                         ? cleanup_status
+                         : debt_status;
+    }
   }
+  return first_status;
 }
 
 Preserve_trx_transfer_status preserve_trx_transfer_commit_epoch(
@@ -9176,11 +9626,10 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
     status =
         cleanup_transfer_token_staging(root_dir, frame.epoch_id, frame.token);
     if (status != Preserve_trx_transfer_status::OK) {
-      const Preserve_trx_transfer_status mark_status = registry->mark_corrupt(
-          frame.epoch_id, frame.token,
+      return registry->mark_cleanup_pending(
+          root_dir, frame.epoch_id, frame.token, transfer_monotonic_us(),
+          Preserve_trx_transfer_receiver_state::ABORTED,
           "abort_cleanup_failed:" + transfer_status_name(status));
-      return mark_status == Preserve_trx_transfer_status::OK ? status
-                                                             : mark_status;
     }
     return registry->mark_aborted(frame.epoch_id, frame.token, frame.reason);
   }
@@ -9189,7 +9638,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
       !registry->all_receiving_tokens_sealed(frame.epoch_id)) {
     const std::vector<Preserve_trx_transfer_receiver_record> records =
         registry->receiving_records_for_epoch(frame.epoch_id);
-    cleanup_epoch_transfer_staging(root_dir, records);
+    (void)cleanup_epoch_transfer_staging(root_dir, records, registry);
     const Preserve_trx_transfer_status mark_status =
         mark_epoch_records_corrupt(registry, records,
                                    "commit_epoch_unsealed_receiving_token");
@@ -9248,7 +9697,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
       if (!registry->all_receiving_tokens_sealed(frame.epoch_id)) {
         const std::vector<Preserve_trx_transfer_receiver_record> records =
             registry->receiving_records_for_epoch(frame.epoch_id);
-        cleanup_epoch_transfer_staging(root_dir, records);
+        (void)cleanup_epoch_transfer_staging(root_dir, records, registry);
         const Preserve_trx_transfer_status mark_status =
             mark_epoch_records_corrupt(
                 registry, records,
@@ -9295,7 +9744,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
               (void)store->remove_with_status(
                   transfer_token_component(published_token));
             }
-            cleanup_epoch_transfer_staging(root_dir, records);
+            (void)cleanup_epoch_transfer_staging(root_dir, records, registry);
             const Preserve_trx_transfer_status mark_status =
                 mark_epoch_records_corrupt(
                     registry, records,
@@ -9380,6 +9829,12 @@ Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame(
     if (cleanup_failed) {
       reason.append("; cleanup:");
       reason.append(transfer_status_name(cleanup_status));
+      const Preserve_trx_transfer_status debt_status =
+          registry->mark_cleanup_pending(
+              root_dir, frame.epoch_id, frame.token, transfer_monotonic_us(),
+              Preserve_trx_transfer_receiver_state::CORRUPT, reason);
+      return debt_status == Preserve_trx_transfer_status::OK ? status
+                                                             : debt_status;
     }
     const Preserve_trx_transfer_status mark_status = registry->mark_corrupt(
         frame.epoch_id, frame.token, reason);
@@ -9809,6 +10264,7 @@ preserve_trx_transfer_apply_receiver_frame_batch_with_workers(
 struct Receiver_durable_ack_context {
   THD *thd{nullptr};
   const std::string *encoded_payload{nullptr};
+  std::string root_dir;
   bool ack_sent{false};
 };
 
@@ -9890,8 +10346,21 @@ static Preserve_trx_transfer_status send_receiver_durable_spool_ack(
   ack_context->thd->get_stmt_da()->disable_status();
   ack_context->ack_sent = true;
   if (contains_commit_epoch) {
-    g_receiver_final_spool_ack_monotonic_us.store(transfer_monotonic_us());
+    const uint64_t ack_us = transfer_monotonic_us();
+    g_receiver_final_spool_ack_monotonic_us.store(ack_us);
     refresh_receiver_ready_after_final_spool_ack();
+    static constexpr uint64_t kReceiverRetryHistoryGraceUs = 60000000;
+    const Preserve_trx_transfer_status cleanup_status =
+        default_receiver_registry().acknowledge_epoch(
+            ack_context->root_dir, epoch_id, ack_us,
+            kReceiverRetryHistoryGraceUs);
+    if (cleanup_status != Preserve_trx_transfer_status::OK) {
+      const std::string message =
+          "PRESERVE: receiver acknowledged epoch but frame spool cleanup "
+          "requires retry epoch=" +
+          epoch_id + " status=" + transfer_status_name(cleanup_status);
+      LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
+    }
   }
   return Preserve_trx_transfer_status::OK;
 }
@@ -9959,6 +10428,7 @@ void preserve_trx_transfer_dispatch_command(THD *thd) {
   Receiver_durable_ack_context ack_context;
   ack_context.thd = thd;
   ack_context.encoded_payload = &encoded_frame;
+  ack_context.root_dir = preserve_dir;
   Preserve_trx_transfer_status status = Preserve_trx_transfer_status::OK;
   if (transfer_frame_batch_magic_matches(encoded_frame)) {
     status = preserve_trx_transfer_handle_receiver_payload_batch(

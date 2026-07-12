@@ -299,6 +299,7 @@ class Preserve_trx_prepared_token_resources {
   bool has_record_lock_plan() const;
   bool has_semantic_bundle() const;
   bool has_native_binlog_handle() const;
+  void reset() noexcept;
   Preserve_trx_prepared_status install_record_lock_plan(
       std::unique_ptr<lock_preserve_metadata_plan_t> plan);
   Preserve_trx_prepared_status install_semantic_bundle(
@@ -447,6 +448,12 @@ struct Preserve_trx_prepared_token_snapshot {
   bool native_binlog_handle_owned{false};
 };
 
+struct Preserve_trx_prepared_expire_result {
+  size_t ready_expired{0};
+  size_t adopted_tainted{0};
+  size_t active_artifacts_cleaned{0};
+};
+
 class Preserve_trx_prepared_token_registry {
  public:
   Preserve_trx_prepared_token_registry();
@@ -516,6 +523,7 @@ class Preserve_trx_prepared_token_registry {
   size_t expire_ready_facts_pending_lease(const std::string &source_uuid,
                                           const std::string &epoch_id,
                                           uint64_t now_us);
+  Preserve_trx_prepared_expire_result expire_once(uint64_t now_us);
   Preserve_trx_prepared_status purge_token(
       const Preserve_trx_prepared_token_key &key);
   void purge_epoch(const std::string &source_uuid,
@@ -529,6 +537,7 @@ Preserve_trx_prepared_token_registry &
 preserved_trx_strict_prepared_token_registry();
 
 void preserved_trx_promotion_prepared_metrics_reset_for_unit_test();
+uint64_t preserved_trx_promotion_prepared_monotonic_us_for_unit_test();
 void preserved_trx_promotion_resume_core_note(uint64_t elapsed_us,
                                                bool success);
 void preserved_trx_promotion_prepared_set_evidence_for_unit_test(

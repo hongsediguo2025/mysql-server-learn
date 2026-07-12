@@ -8653,6 +8653,14 @@ static void preserved_trx_expired_reaper_scan_once() {
   DBUG_EXECUTE_IF("preserve_trx_expired_reaper_skip", return;);
 
   (void)preserved_trx_gc_failed_observable_records();
+  try {
+    const uint64_t now_us = preserve_trx_monotonic_us();
+    (void)preserved_trx_strict_prepared_token_registry().expire_once(now_us);
+    preserve_trx_transfer_receiver_reaper_scan_once(now_us);
+  } catch (...) {
+    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+           "PRESERVE: strict receiver resource reaper pass failed");
+  }
 
   constexpr uint kMaxExpiredRecordsPerPass = 16;
   for (uint i = 0; i < kMaxExpiredRecordsPerPass; ++i) {
