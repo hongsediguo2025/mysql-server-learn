@@ -1,0 +1,23 @@
+DROP TABLE IF EXISTS t_resume_binlog_import_cleanup;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_resume_binlog_import_cleanup(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO t_resume_binlog_import_cleanup VALUES(1,10);
+START TRANSACTION;
+UPDATE t_resume_binlog_import_cleanup SET v=11 WHERE id=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug=
+"+d,preserve_trx_fail_binlog_import_after_handler_registration";
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug=
+"-d,preserve_trx_fail_binlog_import_after_handler_registration,+d,preserve_trx_assert_binlog_import_scopes_clean";
+RESUME PRESERVED TRANSACTION 'TOKEN';
+SET SESSION debug="-d,preserve_trx_assert_binlog_import_scopes_clean";
+COMMIT;
+SELECT * FROM t_resume_binlog_import_cleanup;
+id	v
+1	11
+DROP TABLE t_resume_binlog_import_cleanup;

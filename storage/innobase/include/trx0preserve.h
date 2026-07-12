@@ -286,5 +286,7 @@ dberr_t trx_preserve_reattach_preserved_to_original_thd(trx_t *trx, THD *thd);
 dberr_t trx_preserve_detach_resumed_from_thd(trx_t *trx, THD *thd);
 dberr_t trx_preserve_detach_resumed_from_thd_for_cleanup(trx_t *trx, THD *thd);
 void trx_preserve_reset_thd_statement_registration(THD *thd);
+void trx_preserve_restore_dml_policy(trx_t *trx, bool foreign_key_checks,
+                                     bool unique_checks);
 
 #endif /* trx0preserve_h */

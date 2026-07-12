@@ -2163,3 +2163,10 @@ void trx_preserve_reset_thd_statement_registration(THD *thd) {
   thd->get_ha_data(innodb_hton->slot)->ha_info[Transaction_ctx::STMT].reset();
   thd->get_transaction()->reset_scope(Transaction_ctx::STMT);
 }
+
+void trx_preserve_restore_dml_policy(trx_t *trx, bool foreign_key_checks,
+                                     bool unique_checks) {
+  if (trx == nullptr) return;
+  trx->check_foreigns = foreign_key_checks;
+  trx->check_unique_secondary = unique_checks;
+}

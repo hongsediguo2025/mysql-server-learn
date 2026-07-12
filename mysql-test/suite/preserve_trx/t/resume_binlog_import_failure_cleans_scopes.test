@@ -1,0 +1,44 @@
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_resume_binlog_import_cleanup;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_resume_binlog_import_cleanup(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_resume_binlog_import_cleanup VALUES(1,10);
+
+START TRANSACTION;
+UPDATE t_resume_binlog_import_cleanup SET v=11 WHERE id=1;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --log-bin=preserve-trx-binlog-import-cleanup-bin --server-id=1 --binlog-format=ROW" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+SET SESSION debug=
+  "+d,preserve_trx_fail_binlog_import_after_handler_registration";
+--replace_result $preserved_token TOKEN
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+SET SESSION debug=
+  "-d,preserve_trx_fail_binlog_import_after_handler_registration,+d,preserve_trx_assert_binlog_import_scopes_clean";
+
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+SET SESSION debug="-d,preserve_trx_assert_binlog_import_scopes_clean";
+COMMIT;
+
+SELECT * FROM t_resume_binlog_import_cleanup;
+DROP TABLE t_resume_binlog_import_cleanup;

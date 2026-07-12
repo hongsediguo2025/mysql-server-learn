@@ -277,13 +277,8 @@ static bool check_session_admin(sys_var *self MY_ATTRIBUTE((unused)), THD *thd,
                                 set_var *setv) {
   DBUG_ASSERT(self->scope() !=
               sys_var::GLOBAL);  // don't abuse check_session_admin()
-  Security_context *sctx = thd->security_context();
   if ((setv->type == OPT_SESSION || setv->type == OPT_DEFAULT) &&
-      !sctx->has_global_grant(STRING_WITH_LEN("SESSION_VARIABLES_ADMIN"))
-           .first &&
-      !sctx->has_global_grant(STRING_WITH_LEN("SYSTEM_VARIABLES_ADMIN"))
-           .first &&
-      !sctx->check_access(SUPER_ACL)) {
+      !has_session_variable_admin_privilege(thd)) {
     my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0),
              "SUPER, SYSTEM_VARIABLES_ADMIN or SESSION_VARIABLES_ADMIN");
     return true;
@@ -298,6 +293,19 @@ static bool check_session_admin(sys_var *self MY_ATTRIBUTE((unused)), THD *thd,
   not a mistakenly forgotten 'static' keyword.
 */
 #define export /* not static */
+
+export bool has_session_variable_admin_privilege(THD *thd) {
+  if (thd == nullptr) return false;
+  Security_context *sctx = thd->security_context();
+  return sctx != nullptr &&
+         (sctx->has_global_grant(
+                   STRING_WITH_LEN("SESSION_VARIABLES_ADMIN"))
+              .first ||
+          sctx->has_global_grant(
+                  STRING_WITH_LEN("SYSTEM_VARIABLES_ADMIN"))
+              .first ||
+          sctx->check_access(SUPER_ACL));
+}
 
 #ifdef WITH_LOCK_ORDER
 
@@ -5521,15 +5529,11 @@ static Sys_var_debug_sync Sys_debug_sync("debug_sync", "Debug Sync Facility",
                                          ON_CHECK(check_session_admin));
 #endif /* defined(ENABLED_DEBUG_SYNC) */
 
-static bool fix_autocommit(sys_var *self, THD *thd, enum_var_type type) {
-  if (self->is_global_persist(type)) {
-    if (global_system_variables.option_bits & OPTION_AUTOCOMMIT)
-      global_system_variables.option_bits &= ~OPTION_NOT_AUTOCOMMIT;
-    else
-      global_system_variables.option_bits |= OPTION_NOT_AUTOCOMMIT;
-    return false;
-  }
-
+export bool set_session_autocommit_internal(THD *thd, bool enabled) {
+  if (enabled)
+    thd->variables.option_bits |= OPTION_AUTOCOMMIT;
+  else
+    thd->variables.option_bits &= ~OPTION_AUTOCOMMIT;
   if (thd->variables.option_bits & OPTION_AUTOCOMMIT &&
       thd->variables.option_bits &
           OPTION_NOT_AUTOCOMMIT) {  // activating autocommit
@@ -5567,6 +5571,19 @@ static bool fix_autocommit(sys_var *self, THD *thd, enum_var_type type) {
   }
 
   return false;  // autocommit value wasn't changed
+}
+
+static bool fix_autocommit(sys_var *self, THD *thd, enum_var_type type) {
+  if (self->is_global_persist(type)) {
+    if (global_system_variables.option_bits & OPTION_AUTOCOMMIT)
+      global_system_variables.option_bits &= ~OPTION_NOT_AUTOCOMMIT;
+    else
+      global_system_variables.option_bits |= OPTION_NOT_AUTOCOMMIT;
+    return false;
+  }
+
+  return set_session_autocommit_internal(
+      thd, (thd->variables.option_bits & OPTION_AUTOCOMMIT) != 0);
 }
 static Sys_var_bit Sys_autocommit("autocommit", "autocommit",
                                   SESSION_VAR(option_bits), NO_CMD_LINE,

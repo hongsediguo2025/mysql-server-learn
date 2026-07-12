@@ -2516,6 +2516,25 @@ die "single-phase logged binlog preserve must reserve its whole-read peak before
 die "resume must acquire a bounded binlog payload lease before reading an external cache body\n"
   unless $preserve =~ /binlog_payload_memory_peak/s &&
          $preserve =~ /Preserve_trx_memory_kind::BINLOG_WARMCOPY_BUFFER/s;
+die "binlog import failure after handler registration must reset both handler scopes and cache state\n"
+  unless $binlog =~
+         /mysql_binlog_preserve_import[\s\S]*register_binlog_handler[\s\S]*discard_binlog_preserve_import_and_reset_scopes/s;
+die "resume must restore autocommit through the native behavior-preserving helper before transaction attach\n"
+  unless $preserve =~
+         /restore_preserved_dml_policy[\s\S]*set_session_autocommit_internal/s &&
+         $resume_core =~
+         /restore_preserved_dml_policy[\s\S]*trx_preserve_attach_to_thd[\s\S]*mark_preserved_transaction_attached/s;
+die "resume must restore DML policy into both THD state and the detached InnoDB transaction before attach\n"
+  unless $resume_core =~
+         /restore_preserved_dml_policy[\s\S]*trx_preserve_attach_to_thd/s;
+die "cross-owner sql_log_bin OFF restore must require native session-variable administration privilege\n"
+  unless $resume_core =~
+         /!owns_token[\s\S]*!record\.metadata\.session_sql_log_bin[\s\S]*has_session_variable_admin_privilege/s;
+die "resume must rebuild explicit transaction tracker state after attach\n"
+  unless $preserve =~
+         /mark_preserved_transaction_attached[\s\S]*restore_preserved_transaction_tracker/s &&
+         $resume_core =~
+         /trx_preserve_attach_to_thd[\s\S]*mark_preserved_transaction_attached/s;
 die "phase1 transfer binlog artifacts must survive until epoch success or rollback\n"
   unless $preserve =~
          /~Phase1_transfer_binlog_blob_provider[\s\S]*cleanup_phase1_blobs/s;

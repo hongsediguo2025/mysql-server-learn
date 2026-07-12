@@ -4058,6 +4058,29 @@ bool mysql_binlog_warmcopy_source_truncate_generation(
   return false;
 }
 
+static void discard_binlog_preserve_import_and_reset_scopes(THD *thd) {
+  if (thd == nullptr) return;
+  mysql_binlog_preserve_discard(thd);
+  thd->get_transaction()->reset_scope(Transaction_ctx::SESSION);
+  thd->get_transaction()->reset_scope(Transaction_ctx::STMT);
+  thd->clear_binlog_table_maps();
+}
+
+#ifndef DBUG_OFF
+static bool binlog_preserve_import_scopes_are_clean(THD *thd) {
+  if (thd == nullptr || binlog_hton == nullptr ||
+      binlog_hton->slot == HA_SLOT_UNDEF) {
+    return true;
+  }
+  Ha_data *const ha_data = thd->get_ha_data(binlog_hton->slot);
+  return !ha_data->ha_info[Transaction_ctx::SESSION].is_started() &&
+         !ha_data->ha_info[Transaction_ctx::STMT].is_started() &&
+         thd->get_transaction()->ha_trx_info(Transaction_ctx::SESSION) ==
+             nullptr &&
+         thd->get_transaction()->ha_trx_info(Transaction_ctx::STMT) == nullptr;
+}
+#endif
+
 bool mysql_binlog_preserve_import(
     THD *thd, const Mysql_binlog_preserve_snapshot &snapshot) {
   DBUG_TRACE;
@@ -4094,12 +4117,17 @@ bool mysql_binlog_preserve_import(
   binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
   if (cache_mngr == nullptr || !cache_mngr->is_binlog_empty()) return true;
 
+  DBUG_EXECUTE_IF("preserve_trx_assert_binlog_import_scopes_clean",
+                  assert(binlog_preserve_import_scopes_are_clean(thd)););
   register_binlog_handler(thd, true);
+  DBUG_EXECUTE_IF(
+      "preserve_trx_fail_binlog_import_after_handler_registration",
+      discard_binlog_preserve_import_and_reset_scopes(thd); return true;);
   Binlog_cache_storage *const trx_cache = cache_mngr->get_trx_cache();
   if (trx_cache->write(pointer_cast<const unsigned char *>(
                            snapshot.cache_payload.data()),
                        static_cast<my_off_t>(snapshot.cache_payload.size()))) {
-    cache_mngr->reset();
+    discard_binlog_preserve_import_and_reset_scopes(thd);
     return true;
   }
   cache_mngr->trx_cache.preserve_import_state(snapshot);

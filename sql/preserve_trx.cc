@@ -84,6 +84,7 @@
 #include "sql/rpl_gtid.h"
 #include "sql/rpl_mi.h"
 #include "sql/rpl_msr.h"
+#include "sql/session_tracker.h"
 #include "sql/set_var.h"
 #include "sql/handler.h"
 #include "sql/preserve_trx_carrier.h"
@@ -2565,6 +2566,57 @@ void restore_preserved_transaction_access_mode(
     thd->server_status &= ~SERVER_STATUS_IN_TRANS_READONLY;
 }
 
+bool restore_preserved_dml_policy(
+    THD *thd, trx_t *trx, const Preserve_snapshot_metadata &metadata) {
+  if (thd == nullptr || trx == nullptr ||
+      set_session_autocommit_internal(thd, metadata.autocommit)) {
+    return true;
+  }
+
+  if (metadata.foreign_key_checks)
+    thd->variables.option_bits &= ~OPTION_NO_FOREIGN_KEY_CHECKS;
+  else
+    thd->variables.option_bits |= OPTION_NO_FOREIGN_KEY_CHECKS;
+  if (metadata.unique_checks)
+    thd->variables.option_bits &= ~OPTION_RELAXED_UNIQUE_CHECKS;
+  else
+    thd->variables.option_bits |= OPTION_RELAXED_UNIQUE_CHECKS;
+  thd->variables.auto_increment_increment =
+      metadata.auto_increment_increment;
+  thd->variables.auto_increment_offset = metadata.auto_increment_offset;
+
+  trx_preserve_restore_dml_policy(trx, metadata.foreign_key_checks,
+                                  metadata.unique_checks);
+  return false;
+}
+
+void restore_preserved_transaction_tracker(
+    THD *thd, const Preserve_snapshot_metadata &metadata) {
+  TX_TRACKER_GET(tracker);
+  if (tracker == nullptr) return;
+  tracker->set_read_flags(
+      thd, metadata.tx_read_only ? TX_READ_ONLY : TX_READ_WRITE);
+  tracker->add_trx_state(thd, TX_EXPLICIT);
+}
+
+void mark_preserved_transaction_attached(
+    THD *thd, const Preserve_snapshot_metadata &metadata) {
+  thd->variables.option_bits |= OPTION_BEGIN;
+  thd->server_status |= SERVER_STATUS_IN_TRANS;
+  if (metadata.tx_read_only)
+    thd->server_status |= SERVER_STATUS_IN_TRANS_READONLY;
+  else
+    thd->server_status &= ~SERVER_STATUS_IN_TRANS_READONLY;
+  restore_preserved_transaction_tracker(thd, metadata);
+}
+
+bool preserved_trx_resume_binlog_format_is_supported(
+    THD *thd, const Preserve_snapshot_metadata &metadata) {
+  return thd != nullptr &&
+         metadata.binlog_format == Preserve_snapshot_binlog_format::ROW &&
+         thd->variables.binlog_format == BINLOG_FORMAT_ROW;
+}
+
 void reset_preserve_statement_transaction_scope(THD *thd) {
   if (thd == nullptr) return;
 
@@ -3373,6 +3425,8 @@ class Resume_thd_state_guard {
             thd->variables.binlog_trx_compression_level_zstd),
         m_tx_read_only(thd->tx_read_only),
         m_session_tx_read_only(thd->variables.transaction_read_only),
+        m_auto_increment_increment(thd->variables.auto_increment_increment),
+        m_auto_increment_offset(thd->variables.auto_increment_offset),
         m_sql_mode(thd->variables.sql_mode),
         m_time_zone(thd->variables.time_zone),
         m_character_set_client(thd->variables.character_set_client),
@@ -3406,7 +3460,17 @@ class Resume_thd_state_guard {
 
  private:
   void restore() {
-    m_thd->variables.option_bits = m_option_bits;
+    const bool saved_autocommit =
+        (m_option_bits & OPTION_AUTOCOMMIT) != 0;
+    if (set_session_autocommit_internal(m_thd, saved_autocommit)) {
+      LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: failed to restore autocommit after RESUME failure");
+    }
+    const auto autocommit_mask = OPTION_AUTOCOMMIT | OPTION_NOT_AUTOCOMMIT;
+    const auto restored_autocommit_bits =
+        m_thd->variables.option_bits & autocommit_mask;
+    m_thd->variables.option_bits =
+        (m_option_bits & ~autocommit_mask) | restored_autocommit_bits;
     m_thd->variables.sql_log_bin = m_sql_log_bin;
     m_thd->server_status = m_server_status;
     trans_reset_one_shot_chistics(m_thd);
@@ -3419,6 +3483,8 @@ class Resume_thd_state_guard {
         m_binlog_trx_compression_level_zstd;
     m_thd->tx_read_only = m_tx_read_only;
     m_thd->variables.transaction_read_only = m_session_tx_read_only;
+    m_thd->variables.auto_increment_increment = m_auto_increment_increment;
+    m_thd->variables.auto_increment_offset = m_auto_increment_offset;
     m_thd->variables.sql_mode = m_sql_mode;
     m_thd->variables.time_zone = m_time_zone;
     m_thd->variables.character_set_client = m_character_set_client;
@@ -3458,6 +3524,8 @@ class Resume_thd_state_guard {
       m_binlog_trx_compression_level_zstd;
   bool m_tx_read_only;
   bool m_session_tx_read_only;
+  decltype(THD::variables.auto_increment_increment) m_auto_increment_increment;
+  decltype(THD::variables.auto_increment_offset) m_auto_increment_offset;
   sql_mode_t m_sql_mode;
   Time_zone *m_time_zone;
   const CHARSET_INFO *m_character_set_client;
@@ -9169,14 +9237,21 @@ static bool restore_batch_record_to_original_thd(
     return restore_record_after_failure(
         "batch cleanup session state restore failure");
   }
+  if (!preserved_trx_resume_binlog_format_is_supported(thd,
+                                                        record.metadata)) {
+    return restore_record_after_failure(
+        "batch cleanup binlog format restore failure");
+  }
+  if (restore_preserved_dml_policy(thd, record.trx, record.metadata)) {
+    return restore_record_after_failure(
+        "batch cleanup DML policy restore failure");
+  }
 
   thd->variables.sql_log_bin = record.metadata.session_sql_log_bin;
   if (record.metadata.option_bin_log)
     thd->variables.option_bits |= OPTION_BIN_LOG;
   else
     thd->variables.option_bits &= ~OPTION_BIN_LOG;
-  thd->variables.option_bits |= OPTION_BEGIN;
-  thd->server_status |= SERVER_STATUS_IN_TRANS;
   restore_preserved_transaction_access_mode(thd, record.metadata);
   restore_last_insert_id_state(thd, record.metadata);
   restore_forced_insert_id_state(thd, record.metadata);
@@ -9226,6 +9301,7 @@ static bool restore_batch_record_to_original_thd(
     return restore_record_after_failure("batch cleanup reattach failure");
   }
   attached = true;
+  mark_preserved_transaction_attached(thd, record.metadata);
 
   if (restore_savepoints_to_thd(thd, record.trx, record.metadata)) {
     return restore_record_after_failure("batch cleanup savepoint restore failure");
@@ -15301,6 +15377,13 @@ static bool preserved_trx_resume_record_on_thd(
     my_error(ER_PRESERVE_TRX_ACCESS_DENIED, MYF(0));
     return true;
   }
+  if (check_sql_privilege && !owns_token &&
+      !record.metadata.session_sql_log_bin &&
+      !has_session_variable_admin_privilege(thd)) {
+    my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0),
+             "SUPER, SYSTEM_VARIABLES_ADMIN or SESSION_VARIABLES_ADMIN");
+    return true;
+  }
 
   if (preserved_trx_record_resume_deadline_expired(record)) {
     if (!preserved_trx_take_record(token, &record)) {
@@ -15393,6 +15476,13 @@ static bool preserved_trx_resume_record_on_thd(
     return true;
   }
 
+  if (!preserved_trx_resume_binlog_format_is_supported(thd,
+                                                        record.metadata)) {
+    (void)preserved_trx_update_record_last_error(
+        record.metadata.token, "binlog format is not ROW");
+    return preserve_trx_reject_unsupported();
+  }
+
   if (!trx_preserve_thd_can_accept_preserved_trx(thd)) {
     (void)preserved_trx_update_record_last_error(
         record.metadata.token,
@@ -15470,14 +15560,17 @@ static bool preserved_trx_resume_record_on_thd(
         record, "session state restore failure");
     return preserve_trx_reject_unsupported();
   }
+  if (restore_preserved_dml_policy(thd, record.trx, record.metadata)) {
+    (void)restore_record_after_resume_failure(record,
+                                              "DML policy restore failure");
+    return preserve_trx_reject_unsupported();
+  }
 
   thd->variables.sql_log_bin = record.metadata.session_sql_log_bin;
   if (record.metadata.option_bin_log)
     thd->variables.option_bits |= OPTION_BIN_LOG;
   else
     thd->variables.option_bits &= ~OPTION_BIN_LOG;
-  thd->variables.option_bits |= OPTION_BEGIN;
-  thd->server_status |= SERVER_STATUS_IN_TRANS;
   restore_preserved_transaction_access_mode(thd, record.metadata);
   restore_last_insert_id_state(thd, record.metadata);
   restore_forced_insert_id_state(thd, record.metadata);
@@ -15611,6 +15704,7 @@ static bool preserved_trx_resume_record_on_thd(
     (void)restore_preserved_record_after_failure("attach failure");
     return preserve_trx_reject_unsupported();
   }
+  mark_preserved_transaction_attached(thd, record.metadata);
 
   if (restore_savepoints_to_thd(thd, record.trx, record.metadata)) {
     if (!detach_resumed_after_failure("savepoint restore failure")) {
@@ -15896,7 +15990,9 @@ preserved_trx_resume_adopted_for_promotion_on_thd(
   if (preserve_trx_is_unsupported_common_context(target) ||
       !trx_preserve_thd_can_accept_preserved_trx(target) ||
       !recoverable_binlog_state(preview.metadata.binlog_state) ||
-      !binlog_state_matches_current_mode(preview.metadata)) {
+      !binlog_state_matches_current_mode(preview.metadata) ||
+      !preserved_trx_resume_binlog_format_is_supported(target,
+                                                        preview.metadata)) {
     return finish(Preserved_trx_promotion_resume_status::TARGET_NOT_PRISTINE,
                   "protected target THD cannot accept promoted transaction");
   }
@@ -16036,7 +16132,8 @@ preserved_trx_resume_adopted_for_promotion_on_thd(
                        static_cast<enum_tx_isolation>(
                            record.metadata.tx_isolation),
                        true) ||
-      restore_preserved_session_variables(target, record.metadata)) {
+      restore_preserved_session_variables(target, record.metadata) ||
+      restore_preserved_dml_policy(target, record.trx, record.metadata)) {
     return pre_boundary_failure("session state restore failed");
   }
   target->variables.sql_log_bin = record.metadata.session_sql_log_bin;
@@ -16044,8 +16141,6 @@ preserved_trx_resume_adopted_for_promotion_on_thd(
     target->variables.option_bits |= OPTION_BIN_LOG;
   else
     target->variables.option_bits &= ~OPTION_BIN_LOG;
-  target->variables.option_bits |= OPTION_BEGIN;
-  target->server_status |= SERVER_STATUS_IN_TRANS;
   restore_preserved_transaction_access_mode(target, record.metadata);
   restore_last_insert_id_state(target, record.metadata);
   restore_forced_insert_id_state(target, record.metadata);
@@ -16092,6 +16187,7 @@ preserved_trx_resume_adopted_for_promotion_on_thd(
     return pre_boundary_failure("InnoDB transaction attach failed");
   }
   trx_attached = true;
+  mark_preserved_transaction_attached(target, record.metadata);
   if (restore_savepoints_to_thd(target, record.trx, record.metadata)) {
     return pre_boundary_failure("savepoint restore failed");
   }
