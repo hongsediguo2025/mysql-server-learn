@@ -290,19 +290,18 @@ TEST(PreservedTrxPromotionMetrics, ResumeCoreUsesServerSideFixedBuckets) {
 
 TEST(PreservedTrxPromotionMetrics, EvidenceModeIsExplicit) {
   preserved_trx_promotion_prepared_metrics_reset_for_unit_test();
-  preserved_trx_promotion_prepared_set_evidence_for_unit_test(
+  preserved_trx_promotion_prepared_note_evidence(
       Preserve_trx_physical_consistency_mode::TEST_SAME_INSTANCE_ATTACH_ONLY,
-      false, false);
+      false);
   EXPECT_EQ(static_cast<uint64_t>(Preserve_trx_physical_consistency_mode::
                                       TEST_SAME_INSTANCE_ATTACH_ONLY),
             preserve_trx_resume_physical_consistency_mode_status());
   EXPECT_EQ(0U, preserve_trx_resume_real_redo_apply_status());
-  EXPECT_EQ(0U, preserve_trx_resume_real_ha_promotion_status());
 }
 
 TEST(PreservedTrxPromotionMetrics, RawFastPathCountersAreServerOwned) {
   preserved_trx_promotion_prepared_metrics_reset_for_unit_test();
-  preserved_trx_promotion_prepared_note_fence_metrics(11, 12);
+  preserved_trx_promotion_prepared_note_fence_metrics(11, 12, 13);
   preserved_trx_promotion_prepared_note_lock_metrics(13, 14, 15, 16, 17);
   preserved_trx_promotion_prepared_note_lock_plan_metrics(18, 19, 20);
   preserved_trx_promotion_prepared_note_resource_open_failure();
@@ -310,6 +309,7 @@ TEST(PreservedTrxPromotionMetrics, RawFastPathCountersAreServerOwned) {
 
   EXPECT_EQ(11U, preserve_trx_promotion_fence_lease_wait_us_status());
   EXPECT_EQ(12U, preserve_trx_promotion_fence_digest_compare_us_status());
+  EXPECT_EQ(13U, preserve_trx_promotion_fence_revalidate_us_status());
   EXPECT_EQ(13U, preserve_trx_promotion_lock_page_get_count_status());
   EXPECT_EQ(14U, preserve_trx_promotion_lock_page_get_us_status());
   EXPECT_EQ(15U, preserve_trx_promotion_lock_image_resolves_status());
@@ -322,6 +322,7 @@ TEST(PreservedTrxPromotionMetrics, RawFastPathCountersAreServerOwned) {
   EXPECT_EQ(21U, preserve_trx_resume_binlog_payload_read_bytes_status());
   EXPECT_EQ(22U, preserve_trx_resume_binlog_payload_write_bytes_status());
   EXPECT_EQ(23U, preserve_trx_resume_binlog_rename_count_status());
+  EXPECT_EQ(1U, preserve_trx_resume_binlog_attach_count_status());
 }
 
 Preserve_trx_prepared_token_key make_prepared_token_key(uint64_t generation) {
@@ -1442,6 +1443,27 @@ TEST_F(PreservedTrxNativeBinlogPrepared,
             wrong_resources.prepare_native_binlog_handle_for_receiver(
                 facts, &wrong_reader));
   EXPECT_EQ(0U, wrong_reader.read_calls());
+}
+
+TEST_F(PreservedTrxNativeBinlogPrepared,
+       StrictResourceOpenFailureUpdatesProductionMetric) {
+  const std::string payload(128 * 1024, 'o');
+  auto facts = make_facts(payload);
+  ChunkedBinlogPayloadReader reader(payload, 4096);
+  auto key = make_prepared_token_key(1);
+  auto resources = acquire_prepared_resources(
+      key, 128, mysql_binlog_preserve_native_memory_bytes_required(facts),
+      mysql_binlog_preserve_native_fd_count_required(facts),
+      mysql_binlog_preserve_native_tmpdir_bytes_required(facts));
+  preserved_trx_promotion_prepared_metrics_reset_for_unit_test();
+
+  DBUG_SET("+d,preserve_trx_fail_native_binlog_prepare_open");
+  EXPECT_EQ(Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED,
+            resources.prepare_native_binlog_handle_for_receiver(facts,
+                                                                 &reader));
+  DBUG_SET("-d,preserve_trx_fail_native_binlog_prepare_open");
+  EXPECT_EQ(1U, preserve_trx_resource_admission_open_failed_count_status());
+  EXPECT_EQ(0U, reader.read_calls());
 }
 
 TEST_F(PreservedTrxNativeBinlogPrepared,
@@ -7386,6 +7408,7 @@ TEST_F(PreserveSnapshotTest,
        StrictPhysicalFenceWritesOneEpochIntentAndAdoptsReadyRegistryToken) {
   preserve_trx_set_enable_value(true);
   preserve_trx_resource_manager_reset_for_unit_test();
+  preserved_trx_promotion_prepared_metrics_reset_for_unit_test();
   auto proof = make_test_physical_fence_proof(
       Preserve_trx_physical_consistency_mode::
           TEST_ONLY_PHYSICAL_FENCE_SIMULATOR);
@@ -7442,6 +7465,9 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(1U, result.adopted_count);
   EXPECT_EQ(0U, result.rolled_back_count);
   EXPECT_EQ(0U, result.tainted_count);
+  EXPECT_EQ(static_cast<uint64_t>(Preserve_trx_physical_consistency_mode::
+                                      TEST_ONLY_PHYSICAL_FENCE_SIMULATOR),
+            preserve_trx_resume_physical_consistency_mode_status());
 
   const std::string encoded =
       read_file(m_dir + request.epoch_id + ".promotion_intent");
@@ -19883,6 +19909,7 @@ TEST_F(PreserveSnapshotTest,
 TEST_F(PreserveSnapshotTest,
        TransferReceiverPreparesNativeBinlogHandleBeforeStrictReady) {
   Transfer_codec_context_guard codec_guard;
+  preserved_trx_promotion_prepared_metrics_reset_for_unit_test();
   const bool saved_enable = preserve_trx_enable;
   const bool saved_opt_bin_log = opt_bin_log;
   const ulong saved_binlog_cache_size = binlog_cache_size;
@@ -20036,6 +20063,9 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(snapshot.cache_payload.size(),
             strict_snapshot.facts.binlog_cache_length);
   EXPECT_TRUE(strict_snapshot.facts.binlog_cache_file_backed);
+  EXPECT_GT(preserve_trx_receiver_lock_plan_capacity_bytes_status(), 0U);
+  EXPECT_GT(preserve_trx_receiver_lock_plan_epoch_peak_bytes_status(), 0U);
+  EXPECT_GT(preserve_trx_receiver_lock_plan_subpool_cap_bytes_status(), 0U);
   strict_registry.purge_epoch(strict_key.source_uuid, strict_key.epoch_id);
 }
 

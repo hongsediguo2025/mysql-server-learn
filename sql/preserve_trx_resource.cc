@@ -642,6 +642,9 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_promotion_fence_digest_compare_us,
     preserve_trx_promotion_fence_digest_compare_us_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_fence_revalidate_us,
+    preserve_trx_promotion_fence_revalidate_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_promotion_lock_page_get_count,
     preserve_trx_promotion_lock_page_get_count_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_promotion_lock_page_get_us,
@@ -674,14 +677,13 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
     preserve_trx_resume_binlog_payload_write_bytes_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_resume_binlog_rename_count,
                               preserve_trx_resume_binlog_rename_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_resume_binlog_attach_count,
+                              preserve_trx_resume_binlog_attach_count_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_resume_physical_consistency_mode,
     preserve_trx_resume_physical_consistency_mode_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_resume_real_redo_apply,
                               preserve_trx_resume_real_redo_apply_status())
-DEFINE_PRESERVE_TRX_SHOW_FUNC(
-    show_preserve_trx_resume_real_ha_promotion,
-    preserve_trx_resume_real_ha_promotion_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_auto_prewarm_tokens,
     preserve_trx_transfer_receiver_auto_prewarm_tokens_status())
@@ -766,9 +768,6 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_committed_epoch_fallback_count,
     preserve_trx_transfer_receiver_committed_epoch_fallback_count_status())
-DEFINE_PRESERVE_TRX_SHOW_FUNC(
-    show_preserve_trx_transfer_receiver_staged_token_publish_us,
-    preserve_trx_transfer_receiver_staged_token_publish_us_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_staged_token_ready_cache_us,
     preserve_trx_transfer_receiver_staged_token_ready_cache_us_status())
@@ -1092,14 +1091,24 @@ void preserve_trx_resource_manager_set_limits_for_unit_test(
       static_cast<ulonglong>(limits.per_token_memory_budget_bytes);
 }
 
-uint64_t preserve_trx_resource_kind_current_bytes_for_unit_test(
+uint64_t preserve_trx_resource_kind_current_bytes(
     Preserve_trx_memory_kind kind) {
   return g_preserve_resource_manager.kind_current_bytes(kind);
 }
 
-uint64_t preserve_trx_resource_kind_cap_bytes_for_unit_test(
+uint64_t preserve_trx_resource_kind_current_bytes_for_unit_test(
+    Preserve_trx_memory_kind kind) {
+  return preserve_trx_resource_kind_current_bytes(kind);
+}
+
+uint64_t preserve_trx_resource_kind_cap_bytes(
     Preserve_trx_memory_kind kind) {
   return preserve_memory_kind_cap(kind, preserve_trx_memory_budget_bytes);
+}
+
+uint64_t preserve_trx_resource_kind_cap_bytes_for_unit_test(
+    Preserve_trx_memory_kind kind) {
+  return preserve_trx_resource_kind_cap_bytes(kind);
 }
 
 #ifndef NDEBUG

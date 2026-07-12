@@ -2589,11 +2589,14 @@ adopt_prepared_epoch_for_physical_promotion_impl(
   }
 
   Preserve_trx_physical_fence_lease physical_lease;
+  const uint64_t fence_acquire_started_us = my_micro_time();
   const auto fence_status = use_test_provider
                                 ? preserved_trx_acquire_physical_fence_lease_for_unit_test(
                                       request.expected_fence, &physical_lease)
                                 : preserved_trx_acquire_production_physical_fence_lease(
                                       request.expected_fence, &physical_lease);
+  const uint64_t fence_acquire_us =
+      my_micro_time() - fence_acquire_started_us;
   if (fence_status == Preserve_trx_physical_fence_status::MISSING_PROVIDER) {
     return finish(
         Preserve_trx_physical_promotion_gate_status::
@@ -2605,7 +2608,10 @@ adopt_prepared_epoch_for_physical_promotion_impl(
         Preserve_trx_physical_promotion_gate_status::PHYSICAL_FENCE_MISMATCH,
         "production physical-fence acquisition failed");
   }
+  preserved_trx_promotion_prepared_note_evidence(
+      required_mode, !use_test_provider);
 
+  const uint64_t digest_compare_started_us = my_micro_time();
   auto &registry = preserved_trx_strict_prepared_token_registry();
   std::vector<Preserve_trx_prepared_token_snapshot> snapshots;
   snapshots.reserve(request.tokens.size());
@@ -2640,12 +2646,21 @@ adopt_prepared_epoch_for_physical_promotion_impl(
       page_layout_digest != request.expected_fence.page_layout_digest ||
       dictionary_generation_digest !=
           request.expected_fence.dictionary_generation_digest) {
+    preserved_trx_promotion_prepared_note_fence_metrics(
+        fence_acquire_us, my_micro_time() - digest_compare_started_us, 0);
     return finish(
         Preserve_trx_physical_promotion_gate_status::PHYSICAL_FENCE_MISMATCH,
         "strict prepared-token epoch digest commitment mismatch");
   }
-  if (physical_lease.revalidate() !=
-      Preserve_trx_physical_fence_status::OK) {
+  const uint64_t digest_compare_us =
+      my_micro_time() - digest_compare_started_us;
+  const uint64_t fence_revalidate_started_us = my_micro_time();
+  const auto fence_revalidate_status = physical_lease.revalidate();
+  const uint64_t fence_revalidate_us =
+      my_micro_time() - fence_revalidate_started_us;
+  preserved_trx_promotion_prepared_note_fence_metrics(
+      fence_acquire_us, digest_compare_us, fence_revalidate_us);
+  if (fence_revalidate_status != Preserve_trx_physical_fence_status::OK) {
     return finish(
         Preserve_trx_physical_promotion_gate_status::PHYSICAL_FENCE_MISMATCH,
         "physical-fence revalidation failed before intent");

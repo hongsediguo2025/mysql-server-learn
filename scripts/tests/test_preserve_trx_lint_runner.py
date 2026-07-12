@@ -35,7 +35,14 @@ class PreserveTrxLintRunnerTest(unittest.TestCase):
         return tmp
 
     def test_registers_current_legacy_lint_rules(self):
-        self.assertEqual(26, len(LEGACY_LINT_RULE_IDS))
+        repo_root = Path(__file__).resolve().parents[2]
+        discovered = {
+            path.stem
+            for path in (repo_root / "mysql-test/suite/preserve_trx/t").glob(
+                "*_lint.test"
+            )
+        }
+        self.assertEqual(discovered, set(LEGACY_LINT_RULE_IDS))
         self.assertIn("batch_drain_lock_warmcopy_hook_coverage_lint",
                       LEGACY_LINT_RULE_IDS)
         self.assertIn("temp_table_ddl_boundary_lint", LEGACY_LINT_RULE_IDS)
@@ -54,6 +61,8 @@ class PreserveTrxLintRunnerTest(unittest.TestCase):
         self.assertIn("preserve_crash_abandon_contract_lint",
                       LEGACY_LINT_RULE_IDS)
         self.assertIn("preserve_review_fix_contract_lint",
+                      LEGACY_LINT_RULE_IDS)
+        self.assertIn("standby_promotion_fast_resume_contract_lint",
                       LEGACY_LINT_RULE_IDS)
         self.assertIn("preserve_sql_command_flags_lint",
                       SOURCE_LINT_RULE_IDS)

@@ -10,6 +10,7 @@ WHERE VARIABLE_NAME IN (
 'Preserve_trx_promotion_resume_failure_count',
 'Preserve_trx_promotion_fence_lease_wait_us',
 'Preserve_trx_promotion_fence_digest_compare_us',
+'Preserve_trx_promotion_fence_revalidate_us',
 'Preserve_trx_promotion_lock_page_get_count',
 'Preserve_trx_promotion_lock_page_get_us',
 'Preserve_trx_promotion_lock_image_resolves',
@@ -22,8 +23,12 @@ WHERE VARIABLE_NAME IN (
 'Preserve_trx_resume_binlog_payload_read_bytes',
 'Preserve_trx_resume_binlog_payload_write_bytes',
 'Preserve_trx_resume_binlog_rename_count',
+'Preserve_trx_resume_binlog_attach_count',
 'Preserve_trx_resume_physical_consistency_mode',
-'Preserve_trx_resume_real_redo_apply',
-'Preserve_trx_resume_real_ha_promotion');
+'Preserve_trx_resume_real_redo_apply');
 registered_fast_resume_metrics
-24
+25
+INSTALL PLUGIN test_preserve_trx_promotion
+SONAME 'libtest_preserve_trx_promotion.so';
+production_resume_failure_delta=1
+UNINSTALL PLUGIN test_preserve_trx_promotion;

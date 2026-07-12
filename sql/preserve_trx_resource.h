@@ -179,8 +179,11 @@ void preserve_trx_resource_manager_set_external_limits_for_unit_test(
 uint64_t preserve_trx_native_binlog_reserved_fd_count_for_unit_test();
 uint64_t preserve_trx_native_binlog_reserved_tmpdir_bytes_for_unit_test();
 #endif
+uint64_t preserve_trx_resource_kind_current_bytes(
+    Preserve_trx_memory_kind kind);
 uint64_t preserve_trx_resource_kind_current_bytes_for_unit_test(
     Preserve_trx_memory_kind kind);
+uint64_t preserve_trx_resource_kind_cap_bytes(Preserve_trx_memory_kind kind);
 uint64_t preserve_trx_resource_kind_cap_bytes_for_unit_test(
     Preserve_trx_memory_kind kind);
 
@@ -379,8 +382,10 @@ int show_preserve_trx_promotion_resume_failure_count(THD *thd, SHOW_VAR *var,
 int show_preserve_trx_promotion_fence_lease_wait_us(THD *thd, SHOW_VAR *var,
                                                     char *buf);
 int show_preserve_trx_promotion_fence_digest_compare_us(THD *thd,
-                                                        SHOW_VAR *var,
-                                                        char *buf);
+                                                         SHOW_VAR *var,
+                                                         char *buf);
+int show_preserve_trx_promotion_fence_revalidate_us(THD *thd, SHOW_VAR *var,
+                                                     char *buf);
 int show_preserve_trx_promotion_lock_page_get_count(THD *thd, SHOW_VAR *var,
                                                     char *buf);
 int show_preserve_trx_promotion_lock_page_get_us(THD *thd, SHOW_VAR *var,
@@ -411,14 +416,14 @@ int show_preserve_trx_resume_binlog_payload_write_bytes(THD *thd,
                                                         SHOW_VAR *var,
                                                         char *buf);
 int show_preserve_trx_resume_binlog_rename_count(THD *thd, SHOW_VAR *var,
-                                                 char *buf);
+                                                  char *buf);
+int show_preserve_trx_resume_binlog_attach_count(THD *thd, SHOW_VAR *var,
+                                                  char *buf);
 int show_preserve_trx_resume_physical_consistency_mode(THD *thd,
-                                                       SHOW_VAR *var,
-                                                       char *buf);
+                                                        SHOW_VAR *var,
+                                                        char *buf);
 int show_preserve_trx_resume_real_redo_apply(THD *thd, SHOW_VAR *var,
-                                             char *buf);
-int show_preserve_trx_resume_real_ha_promotion(THD *thd, SHOW_VAR *var,
-                                               char *buf);
+                                              char *buf);
 int show_preserve_trx_transfer_receiver_auto_prewarm_tokens(THD *thd,
                                                             SHOW_VAR *var,
                                                             char *buf);
@@ -478,8 +483,6 @@ int show_preserve_trx_transfer_receiver_binlog_object_prewarm_first_start_monoto
 int show_preserve_trx_transfer_receiver_binlog_object_prewarm_last_end_monotonic_us(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_committed_epoch_fallback_count(
-    THD *thd, SHOW_VAR *var, char *buf);
-int show_preserve_trx_transfer_receiver_staged_token_publish_us(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_staged_token_ready_cache_us(
     THD *thd, SHOW_VAR *var, char *buf);

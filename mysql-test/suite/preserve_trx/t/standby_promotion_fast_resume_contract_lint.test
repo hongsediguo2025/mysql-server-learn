@@ -216,6 +216,19 @@ die "fast-resume evidence must be exposed as server-owned status\n"
   unless $mysqld =~ /Preserve_trx_promotion_resume_core_p95_us/ &&
          $mysqld =~ /Preserve_trx_promotion_lock_page_get_count/ &&
          $mysqld =~ /Preserve_trx_resume_binlog_payload_read_bytes/;
+die "removed staged-token publish metric must not be exposed\n"
+  if $mysqld =~ /receiver_staged_token_publish_us/ ||
+     $transfer =~ /receiver_staged_token_publish_us/;
+die "real HA promotion must remain HA_BLOCKED instead of a numeric metric\n"
+  if $mysqld =~ /Preserve_trx_resume_real_ha_promotion/;
+die "strict gate must write fence evidence and timing metrics\n"
+  unless $promotion =~ /preserved_trx_promotion_prepared_note_evidence/ &&
+         $promotion =~ /preserved_trx_promotion_prepared_note_fence_metrics/;
+die "receiver strict prepare must write lock-plan admission metrics\n"
+  unless $transfer =~ /preserved_trx_promotion_prepared_note_lock_plan_metrics/;
+die "native binlog resource failures and attach IO must have production writers\n"
+  unless $prepared =~ /preserved_trx_promotion_prepared_note_resource_open_failure/ &&
+         $preserve =~ /preserved_trx_promotion_prepared_note_resume_binlog_io/;
 EOF
 
 SELECT 'ok' AS standby_promotion_fast_resume_contract_lint;

@@ -17286,7 +17286,9 @@ preserved_trx_resume_adopted_for_promotion_on_thd(
         " strict attach artifact cleanup remains pending";
     LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
   }
-  preserved_trx_promotion_prepared_note_resume_binlog_io(0, 0, 0);
+  if (metadata_has_binlog_cache) {
+    preserved_trx_promotion_prepared_note_resume_binlog_io(0, 0, 0);
+  }
   thd_state_guard.dismiss();
   audit_preserved_trx_event(target, key.token, "promotion-resume", "success");
   return finish(Preserved_trx_promotion_resume_status::OK, "ok");

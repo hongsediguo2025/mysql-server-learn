@@ -73,10 +73,16 @@ long long resume_udf(UDF_INIT *, UDF_ARGS *args, unsigned char *is_null,
 
   Preserve_trx_prepared_token_snapshot snapshot;
   auto &registry = preserved_trx_strict_prepared_token_registry();
-  if (registry.find_unique_adopted(epoch_id, token, &snapshot) !=
-      Preserve_trx_prepared_status::OK) {
-    return static_cast<long long>(
-        Preserved_trx_promotion_resume_status::REGISTRY_NOT_ADOPTED);
+  const bool adopted_token_found =
+      registry.find_unique_adopted(epoch_id, token, &snapshot) ==
+      Preserve_trx_prepared_status::OK;
+  if (!adopted_token_found) {
+    snapshot.key.preserve_dir = ".";
+    snapshot.key.source_uuid = "test-only-missing-source";
+    snapshot.key.epoch_id = epoch_id;
+    snapshot.key.token = token;
+    snapshot.key.target_boot_incarnation = "test-only-missing-boot";
+    snapshot.key.generation = 1;
   }
 
   auto handle = std::make_unique<Preserved_trx_peer_thd_handle>();
@@ -85,7 +91,9 @@ long long resume_udf(UDF_INIT *, UDF_ARGS *args, unsigned char *is_null,
   if (!preserved_trx_resolve_peer_thd(
           static_cast<uint64_t>(connection_id), deadline, handle.get())) {
     return static_cast<long long>(
-        Preserved_trx_promotion_resume_status::TARGET_NOT_PRISTINE);
+        adopted_token_found
+            ? Preserved_trx_promotion_resume_status::TARGET_NOT_PRISTINE
+            : Preserved_trx_promotion_resume_status::REGISTRY_NOT_ADOPTED);
   }
 
   Preserved_trx_promotion_resume_result result;

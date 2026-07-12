@@ -573,10 +573,11 @@ class TransferPromotionFrameTest(unittest.TestCase):
             (transfer_root / "epoch.fact").write_text(
                 "\n".join(
                     [
-                        "PTRXFER_EPOCH_FACT_V1",
+                        "PTRXFER_EPOCH_FACT_V2",
                         "epoch=epoch_7",
                         "source=source_uuid",
                         "target=target_uuid",
+                        "source_fence_lsn=987",
                         "token_count=2",
                         "token=101",
                         "source_prepare_lsn=11",
@@ -795,6 +796,10 @@ class _ReceiverPrewarmStatusRuntime(_FakeRuntime):
                     "Preserve_trx_promotion_prewarm_record_lock_cold_page_gets",
                     "1",
                 ),
+                ("Preserve_trx_receiver_lock_plan_capacity_bytes", "1234"),
+                ("Preserve_trx_receiver_lock_plan_epoch_peak_bytes", "5678"),
+                ("Preserve_trx_receiver_lock_plan_subpool_cap_bytes", "9999"),
+                ("Preserve_trx_resource_admission_open_failed_count", "2"),
                 ("Preserve_trx_transfer_receiver_seal_prewarm_tokens", "5"),
                 (
                     "Preserve_trx_transfer_receiver_seal_prewarm_success_tokens",
@@ -893,10 +898,6 @@ class _ReceiverPrewarmStatusRuntime(_FakeRuntime):
                 (
                     "Preserve_trx_transfer_receiver_committed_epoch_fallback_count",
                     "2",
-                ),
-                (
-                    "Preserve_trx_transfer_receiver_staged_token_publish_us",
-                    "1200",
                 ),
                 (
                     "Preserve_trx_transfer_receiver_staged_token_ready_cache_us",
@@ -5146,6 +5147,10 @@ class WorkloadPlanTest(unittest.TestCase):
                 record_lock_page_count=17,
                 record_lock_resident_pages=17,
                 record_lock_cold_page_gets=0,
+                lock_plan_capacity_bytes=1234,
+                lock_plan_epoch_peak_bytes=5678,
+                lock_plan_subpool_cap_bytes=9999,
+                resource_admission_open_failed_count=2,
                 seal_prewarm_tokens=5,
                 seal_prewarm_success_tokens=4,
                 seal_prewarm_not_ready_tokens=1,
@@ -5170,7 +5175,6 @@ class WorkloadPlanTest(unittest.TestCase):
                 binlog_object_prewarm_first_start_monotonic_us=971_000,
                 binlog_object_prewarm_last_end_monotonic_us=1_037_000,
                 committed_epoch_fallback_count=2,
-                staged_token_publish_us=1200,
                 staged_token_ready_cache_us=2300,
                 staged_token_total_us=3500,
                 staged_token_max_us=900,
@@ -5326,12 +5330,18 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertEqual(report["receiver_record_lock_page_count"], 17)
             self.assertEqual(report["receiver_record_lock_resident_pages"], 17)
             self.assertEqual(report["receiver_record_cold_gets"], 0)
+            self.assertEqual(report["receiver_lock_plan_capacity_bytes"], 1234)
+            self.assertEqual(report["receiver_lock_plan_epoch_peak_bytes"], 5678)
+            self.assertEqual(report["receiver_lock_plan_subpool_cap_bytes"], 9999)
+            self.assertEqual(
+                report["receiver_resource_admission_open_failed_count"], 2
+            )
             self.assertEqual(report["receiver_record_lock_required_residency_bytes"], 278528)
             self.assertEqual(report["receiver_record_lock_reserved_residency_bytes"], 278528)
             self.assertEqual(report["receiver_object_prewarm_proof_count"], 4)
             self.assertEqual(report["receiver_object_prewarm_miss_count"], 1)
             self.assertEqual(report["receiver_committed_epoch_fallback_count"], 2)
-            self.assertEqual(report["receiver_staged_token_publish_us"], 1200)
+            self.assertNotIn("receiver_staged_token_publish_us", report)
             self.assertEqual(report["receiver_staged_token_ready_cache_us"], 2300)
             self.assertEqual(report["receiver_staged_token_total_us"], 3500)
             self.assertEqual(report["receiver_staged_token_max_us"], 900)
@@ -6091,14 +6101,22 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertEqual(
                 report["physical_consistency_mode"], "frozen_datadir_copy"
             )
-            self.assertFalse(report["strict_physical_fence_gate_executed"])
-            self.assertFalse(report["protected_thd_attach_executed"])
-            self.assertFalse(report["real_redo_apply"])
-            self.assertFalse(report["real_ha_promotion"])
             self.assertEqual(
-                report["ha_blocked"],
-                ["production_physical_fence_provider", "single_primary_role_transition"],
+                report["physical_ha_evidence"],
+                {
+                    "evidence_mode": "HA_BLOCKED",
+                    "status": "not_executed",
+                    "blocked_on": [
+                        "production_physical_fence_provider",
+                        "single_primary_role_transition",
+                    ],
+                },
             )
+            self.assertNotIn("strict_physical_fence_gate_executed", report)
+            self.assertNotIn("protected_thd_attach_executed", report)
+            self.assertNotIn("real_redo_apply", report)
+            self.assertNotIn("real_ha_promotion", report)
+            self.assertNotIn("ha_blocked", report)
             self.assertEqual(report["promotion_gate_elapsed_us"], 15000)
             self.assertEqual(report["phase2_total_samples_ms"], [10.2])
             self.assertEqual(report["lock_warmcopy_live_fallback_count"], 0)
@@ -6124,10 +6142,16 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertEqual(
                 report["physical_consistency_mode"], "not_proven"
             )
-            self.assertFalse(report["strict_physical_fence_gate_executed"])
-            self.assertFalse(report["protected_thd_attach_executed"])
-            self.assertFalse(report["real_redo_apply"])
-            self.assertFalse(report["real_ha_promotion"])
+            self.assertEqual(
+                report["physical_ha_evidence"]["evidence_mode"], "HA_BLOCKED"
+            )
+            self.assertEqual(
+                report["physical_ha_evidence"]["status"], "not_executed"
+            )
+            self.assertNotIn("strict_physical_fence_gate_executed", report)
+            self.assertNotIn("protected_thd_attach_executed", report)
+            self.assertNotIn("real_redo_apply", report)
+            self.assertNotIn("real_ha_promotion", report)
 
     def test_standby_transfer_receiver_scenario_uses_special_runner(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -7921,6 +7945,10 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertEqual(metrics.record_lock_page_count, 17)
         self.assertEqual(metrics.record_lock_resident_pages, 16)
         self.assertEqual(metrics.record_lock_cold_page_gets, 1)
+        self.assertEqual(metrics.lock_plan_capacity_bytes, 1234)
+        self.assertEqual(metrics.lock_plan_epoch_peak_bytes, 5678)
+        self.assertEqual(metrics.lock_plan_subpool_cap_bytes, 9999)
+        self.assertEqual(metrics.resource_admission_open_failed_count, 2)
         self.assertEqual(metrics.phase2_transfer_bulk_bytes, 12345)
         self.assertEqual(metrics.phase2_receiver_prewarm_wait_us, 6789)
         self.assertEqual(metrics.phase2_final_metadata_fsync_count, 2)
@@ -7949,7 +7977,6 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         )
         self.assertEqual(metrics.binlog_object_prewarm_last_end_monotonic_us, 123455800)
         self.assertEqual(metrics.committed_epoch_fallback_count, 2)
-        self.assertEqual(metrics.staged_token_publish_us, 1200)
         self.assertEqual(metrics.staged_token_ready_cache_us, 2300)
         self.assertEqual(metrics.staged_token_total_us, 3500)
         self.assertEqual(metrics.staged_token_max_us, 900)

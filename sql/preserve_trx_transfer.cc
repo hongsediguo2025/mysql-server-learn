@@ -129,7 +129,6 @@ static std::atomic<uint64_t> g_receiver_record_object_prewarm_last_end_us{0};
 static std::atomic<uint64_t> g_receiver_binlog_object_prewarm_first_start_us{0};
 static std::atomic<uint64_t> g_receiver_binlog_object_prewarm_last_end_us{0};
 static std::atomic<uint64_t> g_receiver_committed_epoch_fallback_count{0};
-static std::atomic<uint64_t> g_receiver_staged_token_publish_us{0};
 static std::atomic<uint64_t> g_receiver_staged_token_ready_cache_us{0};
 static std::atomic<uint64_t> g_receiver_staged_token_total_us{0};
 static std::atomic<uint64_t> g_receiver_staged_token_max_us{0};
@@ -793,10 +792,6 @@ preserve_trx_transfer_receiver_binlog_object_prewarm_last_end_monotonic_us_statu
 
 uint64_t preserve_trx_transfer_receiver_committed_epoch_fallback_count_status() {
   return g_receiver_committed_epoch_fallback_count.load();
-}
-
-uint64_t preserve_trx_transfer_receiver_staged_token_publish_us_status() {
-  return g_receiver_staged_token_publish_us.load();
 }
 
 uint64_t preserve_trx_transfer_receiver_staged_token_ready_cache_us_status() {
@@ -3116,6 +3111,14 @@ bool prepare_strict_bundle_for_receiver(
   if (status != Preserve_trx_prepared_status::OK &&
       status != Preserve_trx_prepared_status::IDEMPOTENT) {
     return false;
+  }
+  if (has_record_locks) {
+    preserved_trx_promotion_prepared_note_lock_plan_metrics(
+        plan_capacity_bytes,
+        preserve_trx_resource_kind_current_bytes(
+            Preserve_trx_memory_kind::PROMOTION_LOCK_PLAN),
+        preserve_trx_resource_kind_cap_bytes(
+            Preserve_trx_memory_kind::PROMOTION_LOCK_PLAN));
   }
 
   if (has_record_locks) {

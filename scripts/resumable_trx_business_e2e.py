@@ -959,6 +959,10 @@ class ReceiverPrewarmMetrics:
     seal_prewarm_success_tokens: int
     seal_prewarm_not_ready_tokens: int
     seal_prewarm_last_status: int
+    lock_plan_capacity_bytes: int = 0
+    lock_plan_epoch_peak_bytes: int = 0
+    lock_plan_subpool_cap_bytes: int = 0
+    resource_admission_open_failed_count: int = 0
     phase2_transfer_bulk_bytes: int = 0
     phase2_receiver_prewarm_wait_us: int = 0
     phase2_final_metadata_fsync_count: int = 0
@@ -985,7 +989,6 @@ class ReceiverPrewarmMetrics:
     binlog_object_prewarm_first_start_monotonic_us: int = 0
     binlog_object_prewarm_last_end_monotonic_us: int = 0
     committed_epoch_fallback_count: int = 0
-    staged_token_publish_us: int = 0
     staged_token_ready_cache_us: int = 0
     staged_token_total_us: int = 0
     staged_token_max_us: int = 0
@@ -4344,14 +4347,14 @@ class BusinessE2ERunner:
                 if scenario_name == "physical_standby_promotion_gate_scaled"
                 else "receiver_transfer_only"
             ),
-            "strict_physical_fence_gate_executed": False,
-            "protected_thd_attach_executed": False,
-            "real_redo_apply": False,
-            "real_ha_promotion": False,
-            "ha_blocked": [
-                "production_physical_fence_provider",
-                "single_primary_role_transition",
-            ],
+            "physical_ha_evidence": {
+                "evidence_mode": "HA_BLOCKED",
+                "status": "not_executed",
+                "blocked_on": [
+                    "production_physical_fence_provider",
+                    "single_primary_role_transition",
+                ],
+            },
             "promotion_gate_epoch_id": epoch_id,
             "promotion_gate_token_count": len(tokens),
             "promotion_gate_tokens": list(tokens),
@@ -4545,14 +4548,14 @@ class BusinessE2ERunner:
             "scenario": "promotion_warm_gate_simulator",
             "evidence_mode": "SIMULATOR",
             "physical_consistency_mode": "not_proven",
-            "strict_physical_fence_gate_executed": False,
-            "protected_thd_attach_executed": False,
-            "real_redo_apply": False,
-            "real_ha_promotion": False,
-            "ha_blocked": [
-                "production_physical_fence_provider",
-                "single_primary_role_transition",
-            ],
+            "physical_ha_evidence": {
+                "evidence_mode": "HA_BLOCKED",
+                "status": "not_executed",
+                "blocked_on": [
+                    "production_physical_fence_provider",
+                    "single_primary_role_transition",
+                ],
+            },
             "promotion_gate_epoch_id": self.config.promotion_gate_epoch_id,
             "promotion_gate_token_count": len(self.config.promotion_gate_tokens),
             "promotion_gate_tokens": self.config.promotion_gate_tokens,
@@ -5096,6 +5099,19 @@ class BusinessE2ERunner:
                     "receiver_record_cold_gets": (
                         receiver_prewarm_metrics.record_lock_cold_page_gets
                     ),
+                    "receiver_lock_plan_capacity_bytes": (
+                        receiver_prewarm_metrics.lock_plan_capacity_bytes
+                    ),
+                    "receiver_lock_plan_epoch_peak_bytes": (
+                        receiver_prewarm_metrics.lock_plan_epoch_peak_bytes
+                    ),
+                    "receiver_lock_plan_subpool_cap_bytes": (
+                        receiver_prewarm_metrics.lock_plan_subpool_cap_bytes
+                    ),
+                    "receiver_resource_admission_open_failed_count": (
+                        receiver_prewarm_metrics
+                        .resource_admission_open_failed_count
+                    ),
                     "receiver_record_lock_required_residency_bytes": (
                         receiver_prewarm_metrics.record_lock_required_residency_bytes
                     ),
@@ -5152,9 +5168,6 @@ class BusinessE2ERunner:
                     ),
                     "receiver_committed_epoch_fallback_count": (
                         receiver_prewarm_metrics.committed_epoch_fallback_count
-                    ),
-                    "receiver_staged_token_publish_us": (
-                        receiver_prewarm_metrics.staged_token_publish_us
                     ),
                     "receiver_staged_token_ready_cache_us": (
                         receiver_prewarm_metrics.staged_token_ready_cache_us
@@ -7061,6 +7074,10 @@ class BusinessE2ERunner:
             "Preserve_trx_promotion_prewarm_record_lock_cold_page_gets",
             "Preserve_trx_promotion_prewarm_record_lock_page_count",
             "Preserve_trx_promotion_prewarm_record_lock_resident_pages",
+            "Preserve_trx_receiver_lock_plan_capacity_bytes",
+            "Preserve_trx_receiver_lock_plan_epoch_peak_bytes",
+            "Preserve_trx_receiver_lock_plan_subpool_cap_bytes",
+            "Preserve_trx_resource_admission_open_failed_count",
             "Preserve_trx_transfer_receiver_seal_prewarm_last_status",
             "Preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens",
             "Preserve_trx_transfer_receiver_seal_prewarm_success_tokens",
@@ -7091,7 +7108,6 @@ class BusinessE2ERunner:
             "Preserve_trx_recv_binlog_obj_prewarm_first_start_us",
             "Preserve_trx_recv_binlog_obj_prewarm_last_end_us",
             "Preserve_trx_transfer_receiver_committed_epoch_fallback_count",
-            "Preserve_trx_transfer_receiver_staged_token_publish_us",
             "Preserve_trx_transfer_receiver_staged_token_ready_cache_us",
             "Preserve_trx_transfer_receiver_staged_token_total_us",
             "Preserve_trx_transfer_receiver_staged_token_max_us",
@@ -7178,6 +7194,18 @@ class BusinessE2ERunner:
                 ),
                 record_lock_cold_page_gets=metric(
                     "Preserve_trx_promotion_prewarm_record_lock_cold_page_gets"
+                ),
+                lock_plan_capacity_bytes=metric(
+                    "Preserve_trx_receiver_lock_plan_capacity_bytes"
+                ),
+                lock_plan_epoch_peak_bytes=metric(
+                    "Preserve_trx_receiver_lock_plan_epoch_peak_bytes"
+                ),
+                lock_plan_subpool_cap_bytes=metric(
+                    "Preserve_trx_receiver_lock_plan_subpool_cap_bytes"
+                ),
+                resource_admission_open_failed_count=metric(
+                    "Preserve_trx_resource_admission_open_failed_count"
                 ),
                 seal_prewarm_tokens=metric(
                     "Preserve_trx_transfer_receiver_seal_prewarm_tokens"
@@ -7268,9 +7296,6 @@ class BusinessE2ERunner:
                 ),
                 committed_epoch_fallback_count=metric(
                     "Preserve_trx_transfer_receiver_committed_epoch_fallback_count"
-                ),
-                staged_token_publish_us=metric(
-                    "Preserve_trx_transfer_receiver_staged_token_publish_us"
                 ),
                 staged_token_ready_cache_us=metric(
                     "Preserve_trx_transfer_receiver_staged_token_ready_cache_us"

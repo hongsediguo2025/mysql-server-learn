@@ -145,9 +145,9 @@ std::atomic<uint64_t> g_resume_core_max_us{0};
 std::atomic<uint64_t> g_resume_failure_count{0};
 std::atomic<uint64_t> g_resume_physical_consistency_mode{0};
 std::atomic<uint64_t> g_resume_real_redo_apply{0};
-std::atomic<uint64_t> g_resume_real_ha_promotion{0};
 std::atomic<uint64_t> g_promotion_fence_lease_wait_us{0};
 std::atomic<uint64_t> g_promotion_fence_digest_compare_us{0};
+std::atomic<uint64_t> g_promotion_fence_revalidate_us{0};
 std::atomic<uint64_t> g_promotion_lock_page_get_count{0};
 std::atomic<uint64_t> g_promotion_lock_page_get_us{0};
 std::atomic<uint64_t> g_promotion_lock_image_resolves{0};
@@ -160,6 +160,7 @@ std::atomic<uint64_t> g_resource_admission_open_failed_count{0};
 std::atomic<uint64_t> g_resume_binlog_payload_read_bytes{0};
 std::atomic<uint64_t> g_resume_binlog_payload_write_bytes{0};
 std::atomic<uint64_t> g_resume_binlog_rename_count{0};
+std::atomic<uint64_t> g_resume_binlog_attach_count{0};
 
 #ifndef NDEBUG
 Preserve_trx_prepared_registry_probe g_prepared_registry_probe{nullptr};
@@ -1070,9 +1071,19 @@ Preserve_trx_prepared_token_resources::prepare_native_binlog_handle(
       !m_impl->native_binlog_resources.acquired()) {
     return Mysql_binlog_preserve_cache_status::INVALID_STATE;
   }
-  const auto status = mysql_binlog_preserve_prepare_detached_cache(
-      capability, facts, reader, std::move(m_impl->native_binlog_resources),
-      &m_impl->native_binlog_handle);
+  bool inject_open_failure = false;
+  DBUG_EXECUTE_IF("preserve_trx_fail_native_binlog_prepare_open",
+                  inject_open_failure = true;);
+  const auto status =
+      inject_open_failure
+          ? Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED
+          : mysql_binlog_preserve_prepare_detached_cache(
+                capability, facts, reader,
+                std::move(m_impl->native_binlog_resources),
+                &m_impl->native_binlog_handle);
+  if (status == Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED) {
+    preserved_trx_promotion_prepared_note_resource_open_failure();
+  }
   if (status != Mysql_binlog_preserve_cache_status::OK)
     m_impl->acquired = false;
   return status;
@@ -2323,9 +2334,9 @@ void preserved_trx_promotion_prepared_metrics_reset_for_unit_test() {
   g_resume_failure_count.store(0, std::memory_order_relaxed);
   g_resume_physical_consistency_mode.store(0, std::memory_order_relaxed);
   g_resume_real_redo_apply.store(0, std::memory_order_relaxed);
-  g_resume_real_ha_promotion.store(0, std::memory_order_relaxed);
   g_promotion_fence_lease_wait_us.store(0, std::memory_order_relaxed);
   g_promotion_fence_digest_compare_us.store(0, std::memory_order_relaxed);
+  g_promotion_fence_revalidate_us.store(0, std::memory_order_relaxed);
   g_promotion_lock_page_get_count.store(0, std::memory_order_relaxed);
   g_promotion_lock_page_get_us.store(0, std::memory_order_relaxed);
   g_promotion_lock_image_resolves.store(0, std::memory_order_relaxed);
@@ -2338,6 +2349,7 @@ void preserved_trx_promotion_prepared_metrics_reset_for_unit_test() {
   g_resume_binlog_payload_read_bytes.store(0, std::memory_order_relaxed);
   g_resume_binlog_payload_write_bytes.store(0, std::memory_order_relaxed);
   g_resume_binlog_rename_count.store(0, std::memory_order_relaxed);
+  g_resume_binlog_attach_count.store(0, std::memory_order_relaxed);
 }
 
 void preserved_trx_promotion_resume_core_note(uint64_t elapsed_us,
@@ -2358,23 +2370,23 @@ void preserved_trx_promotion_resume_core_note(uint64_t elapsed_us,
                                                   std::memory_order_relaxed);
 }
 
-void preserved_trx_promotion_prepared_set_evidence_for_unit_test(
-    Preserve_trx_physical_consistency_mode mode, bool real_redo_apply,
-    bool real_ha_promotion) {
+void preserved_trx_promotion_prepared_note_evidence(
+    Preserve_trx_physical_consistency_mode mode, bool real_redo_apply) {
   g_resume_physical_consistency_mode.store(static_cast<uint64_t>(mode),
                                             std::memory_order_relaxed);
   g_resume_real_redo_apply.store(real_redo_apply ? 1 : 0,
                                  std::memory_order_relaxed);
-  g_resume_real_ha_promotion.store(real_ha_promotion ? 1 : 0,
-                                   std::memory_order_relaxed);
 }
 
 void preserved_trx_promotion_prepared_note_fence_metrics(
-    uint64_t lease_wait_us, uint64_t digest_compare_us) {
+    uint64_t lease_wait_us, uint64_t digest_compare_us,
+    uint64_t revalidate_us) {
   g_promotion_fence_lease_wait_us.store(lease_wait_us,
                                         std::memory_order_relaxed);
   g_promotion_fence_digest_compare_us.store(digest_compare_us,
                                              std::memory_order_relaxed);
+  g_promotion_fence_revalidate_us.store(revalidate_us,
+                                        std::memory_order_relaxed);
 }
 
 void preserved_trx_promotion_prepared_note_lock_metrics(
@@ -2395,8 +2407,7 @@ void preserved_trx_promotion_prepared_note_lock_plan_metrics(
     uint64_t subpool_cap_bytes) {
   g_receiver_lock_plan_capacity_bytes.store(capacity_bytes,
                                              std::memory_order_relaxed);
-  g_receiver_lock_plan_epoch_peak_bytes.store(epoch_peak_bytes,
-                                               std::memory_order_relaxed);
+  update_max(&g_receiver_lock_plan_epoch_peak_bytes, epoch_peak_bytes);
   g_receiver_lock_plan_subpool_cap_bytes.store(subpool_cap_bytes,
                                                 std::memory_order_relaxed);
 }
@@ -2415,6 +2426,7 @@ void preserved_trx_promotion_prepared_note_resume_binlog_io(
                                                  std::memory_order_relaxed);
   g_resume_binlog_rename_count.fetch_add(rename_count,
                                           std::memory_order_relaxed);
+  g_resume_binlog_attach_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 uint64_t preserve_trx_promotion_resume_core_elapsed_us_status() {
@@ -2453,16 +2465,16 @@ uint64_t preserve_trx_resume_real_redo_apply_status() {
   return g_resume_real_redo_apply.load(std::memory_order_relaxed);
 }
 
-uint64_t preserve_trx_resume_real_ha_promotion_status() {
-  return g_resume_real_ha_promotion.load(std::memory_order_relaxed);
-}
-
 uint64_t preserve_trx_promotion_fence_lease_wait_us_status() {
   return g_promotion_fence_lease_wait_us.load(std::memory_order_relaxed);
 }
 
 uint64_t preserve_trx_promotion_fence_digest_compare_us_status() {
   return g_promotion_fence_digest_compare_us.load(std::memory_order_relaxed);
+}
+
+uint64_t preserve_trx_promotion_fence_revalidate_us_status() {
+  return g_promotion_fence_revalidate_us.load(std::memory_order_relaxed);
 }
 
 uint64_t preserve_trx_promotion_lock_page_get_count_status() {
@@ -2511,4 +2523,8 @@ uint64_t preserve_trx_resume_binlog_payload_write_bytes_status() {
 
 uint64_t preserve_trx_resume_binlog_rename_count_status() {
   return g_resume_binlog_rename_count.load(std::memory_order_relaxed);
+}
+
+uint64_t preserve_trx_resume_binlog_attach_count_status() {
+  return g_resume_binlog_attach_count.load(std::memory_order_relaxed);
 }

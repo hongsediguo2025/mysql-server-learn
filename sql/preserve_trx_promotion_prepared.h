@@ -540,11 +540,11 @@ void preserved_trx_promotion_prepared_metrics_reset_for_unit_test();
 uint64_t preserved_trx_promotion_prepared_monotonic_us_for_unit_test();
 void preserved_trx_promotion_resume_core_note(uint64_t elapsed_us,
                                                bool success);
-void preserved_trx_promotion_prepared_set_evidence_for_unit_test(
-    Preserve_trx_physical_consistency_mode mode, bool real_redo_apply,
-    bool real_ha_promotion);
+void preserved_trx_promotion_prepared_note_evidence(
+    Preserve_trx_physical_consistency_mode mode, bool real_redo_apply);
 void preserved_trx_promotion_prepared_note_fence_metrics(
-    uint64_t lease_wait_us, uint64_t digest_compare_us);
+    uint64_t lease_wait_us, uint64_t digest_compare_us,
+    uint64_t revalidate_us);
 void preserved_trx_promotion_prepared_note_lock_metrics(
     uint64_t page_get_count, uint64_t page_get_us, uint64_t image_resolves,
     uint64_t apply_us, uint64_t accounting_bits);
@@ -565,9 +565,9 @@ uint64_t preserve_trx_promotion_resume_core_max_us_status();
 uint64_t preserve_trx_promotion_resume_failure_count_status();
 uint64_t preserve_trx_resume_physical_consistency_mode_status();
 uint64_t preserve_trx_resume_real_redo_apply_status();
-uint64_t preserve_trx_resume_real_ha_promotion_status();
 uint64_t preserve_trx_promotion_fence_lease_wait_us_status();
 uint64_t preserve_trx_promotion_fence_digest_compare_us_status();
+uint64_t preserve_trx_promotion_fence_revalidate_us_status();
 uint64_t preserve_trx_promotion_lock_page_get_count_status();
 uint64_t preserve_trx_promotion_lock_page_get_us_status();
 uint64_t preserve_trx_promotion_lock_image_resolves_status();
@@ -580,6 +580,7 @@ uint64_t preserve_trx_resource_admission_open_failed_count_status();
 uint64_t preserve_trx_resume_binlog_payload_read_bytes_status();
 uint64_t preserve_trx_resume_binlog_payload_write_bytes_status();
 uint64_t preserve_trx_resume_binlog_rename_count_status();
+uint64_t preserve_trx_resume_binlog_attach_count_status();
 
 #ifndef NDEBUG
 enum class Preserve_trx_prepared_registry_probe_point : uint8_t {
