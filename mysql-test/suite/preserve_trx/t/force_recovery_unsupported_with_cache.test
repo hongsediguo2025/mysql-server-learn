@@ -6,6 +6,7 @@ DROP TABLE IF EXISTS t_force_recovery_cache;
 --enable_warnings
 
 --disable_query_log
+CALL mtr.add_suppression("Found 1 prepared XA transactions");
 CALL mtr.add_suppression("Skip updating information_schema metadata in InnoDB read-only mode");
 CALL mtr.add_suppression("Skip re-populating collations and character sets tables in InnoDB read-only mode");
 CALL mtr.add_suppression("PRESERVE: preserved transaction recovery is not supported while innodb_force_recovery is enabled; snapshot and binlog-cache files are retained and marked tainted");

@@ -10,6 +10,8 @@ DROP TABLE IF EXISTS t_key_rotation_binlog_digest;
 --disable_query_log
 CALL mtr.add_suppression("Preserved transaction .* recovery deferred cleanup: corrupt durable transaction snapshot");
 CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot");
+CALL mtr.add_suppression("PRESERVE: failed to authenticate XID provenance before storage engine recovery");
+CALL mtr.add_suppression("Aborting");
 --enable_query_log
 
 SET GLOBAL preserve_trx_enable=ON;
@@ -121,16 +123,16 @@ write_bound_preserve_key($key, 'R' x 32);
 print "key_and_binlog_cache_sidecar_corrupted\n1\n";
 EOF
 
---echo # restart: --preserve-trx-enable=ON
---exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
---enable_reconnect
---source include/wait_until_connected_again.inc
---disable_reconnect
+--let $_server_id= 1
+--let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--let $restart_parameters= --preserve-trx-enable=ON
+--source include/start_mysqld_expecting_crash.inc
 
 --let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
---let $grep_pattern= Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot
+--let $grep_pattern= PRESERVE: failed to authenticate XID provenance before storage engine recovery
 --let $wait_timeout= 30
 --source include/wait_for_pattern_in_file.inc
+--source suite/preserve_trx/include/wait_for_expected_crash.inc
 
 --perl
 use strict;
@@ -147,6 +149,16 @@ rename($key_backup, $key) or die "cannot restore original key: $!";
 chmod(0600, $key) or die "cannot chmod restored key: $!";
 print "old_key_restored_after_failclosed\n1\n";
 EOF
+
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $grep_pattern= Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot
+--let $wait_timeout= 30
+--source include/wait_for_pattern_in_file.inc
 
 SELECT COUNT(*) AS preserved_count_after_restored_key_corrupt_sidecar
   FROM performance_schema.preserved_transactions;
