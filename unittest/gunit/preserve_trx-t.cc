@@ -18049,6 +18049,10 @@ TEST_F(PreserveSnapshotTest,
 TEST_F(PreserveSnapshotTest,
        TransferReceiverSkipsDuplicateReadyRecordLockObjectPrewarm) {
   Transfer_codec_context_guard codec_guard;
+  preserve_trx_transfer_set_receiver_object_prewarm_delay_ms_for_unit_test(50);
+  auto restore_object_delay = create_scope_guard([] {
+    preserve_trx_transfer_set_receiver_object_prewarm_delay_ms_for_unit_test(0);
+  });
   const uint64_t transfer_token = 719;
   const std::string record_payload = record_locks_payload();
 
@@ -18098,17 +18102,6 @@ TEST_F(PreserveSnapshotTest,
   const uint64_t record_object_prewarm_before =
       preserve_trx_transfer_receiver_record_object_prewarm_count_status();
   ASSERT_EQ(Preserve_trx_transfer_status::OK, apply_new_frames());
-  for (uint attempt = 0; attempt < 100; ++attempt) {
-    if (preserve_trx_transfer_receiver_record_object_prewarm_count_status() >
-        record_object_prewarm_before) {
-      break;
-    }
-    my_sleep(10000);
-  }
-  const uint64_t after_phase1 =
-      preserve_trx_transfer_receiver_record_object_prewarm_count_status();
-  ASSERT_EQ(record_object_prewarm_before + 1, after_phase1);
-
   Preserve_trx_transfer_receiver_record phase1_record;
   ASSERT_TRUE(registry.lookup("epoch-phase1-prewarm-dedup", transfer_token,
                               &phase1_record));
@@ -18123,6 +18116,16 @@ TEST_F(PreserveSnapshotTest,
   phase1_manifest.objects = phase1_record.objects;
   preserve_trx_transfer_put_receiver_object_prewarm_proof_for_unit_test(
       m_dir, phase1_manifest, kPreservedTrxBlobRecordLocks, 1, 1, 0, 1, 1);
+  for (uint attempt = 0; attempt < 100; ++attempt) {
+    if (preserve_trx_transfer_receiver_record_object_prewarm_count_status() >=
+        record_object_prewarm_before + 1) {
+      break;
+    }
+    my_sleep(10000);
+  }
+  const uint64_t after_phase1 =
+      preserve_trx_transfer_receiver_record_object_prewarm_count_status();
+  ASSERT_EQ(record_object_prewarm_before + 1, after_phase1);
 
   Preserve_trx_transfer_session_artifact_sink artifact_sink(
       &session, transfer_token, m_dir);
@@ -18141,7 +18144,7 @@ TEST_F(PreserveSnapshotTest,
     }
     my_sleep(10000);
   }
-  EXPECT_EQ(after_phase1,
+  EXPECT_EQ(after_phase1 + 1,
             preserve_trx_transfer_receiver_record_object_prewarm_count_status());
 }
 
@@ -18193,15 +18196,15 @@ TEST_F(PreserveSnapshotTest,
   }
 
   for (uint attempt = 0; attempt < 100; ++attempt) {
-    if (preserve_trx_transfer_receiver_object_prewarm_miss_count_status() >
-        miss_count_before) {
+    if (preserve_trx_transfer_receiver_object_prewarm_miss_count_status() >=
+        miss_count_before + 2) {
       break;
     }
     my_sleep(10000);
   }
   EXPECT_EQ(proof_count_before,
             preserve_trx_transfer_receiver_object_prewarm_proof_count_status());
-  EXPECT_EQ(miss_count_before + 1,
+  EXPECT_EQ(miss_count_before + 2,
             preserve_trx_transfer_receiver_object_prewarm_miss_count_status());
 }
 

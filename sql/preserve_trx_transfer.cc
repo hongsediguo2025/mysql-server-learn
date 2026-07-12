@@ -75,6 +75,7 @@
 #include "sql/protocol_classic.h"
 #include "sql/rpl_channel_credentials.h"
 #include "sql/sql_class.h"
+#include "sql/sql_thd_internal_api.h"
 #include "sql/ssl_acceptor_context_status.h"
 #include "scope_guard.h"
 #include "storage/innobase/include/trx0preserve.h"
@@ -2921,6 +2922,19 @@ bool take_receiver_record_lock_prepared(
   *prepared = std::move(found->second);
   g_receiver_record_lock_prepared.erase(found);
   return true;
+}
+
+bool receiver_record_lock_prepared_exists(
+    const std::string &root_dir,
+    const Preserve_trx_transfer_manifest &manifest) {
+  Receiver_object_prewarm_key key;
+  if (!receiver_record_lock_prepared_key(root_dir, manifest, &key)) {
+    return false;
+  }
+  std::lock_guard<std::mutex> guard(g_receiver_record_lock_prepared_mutex);
+  const auto found = g_receiver_record_lock_prepared.find(key);
+  return found != g_receiver_record_lock_prepared.end() &&
+         found->second.plan != nullptr && found->second.plan->ready();
 }
 
 bool build_receiver_record_lock_prepared(
@@ -8474,6 +8488,10 @@ std::set<Receiver_staged_token_prewarm_key>
 std::set<Receiver_staged_token_prewarm_key>
     g_receiver_staged_token_prewarm_deferred;
 std::set<Receiver_object_prewarm_key> g_receiver_object_prewarm_inflight;
+std::map<Receiver_object_prewarm_key, Preserve_trx_transfer_manifest>
+    g_receiver_record_plan_deferred;
+std::map<Receiver_object_prewarm_key, uint64_t>
+    g_receiver_record_plan_attempted_generation;
 bool g_receiver_prewarm_workers_started = false;
 bool g_receiver_prewarm_workers_starting = false;
 bool g_receiver_prewarm_workers_stopping = false;
@@ -8566,10 +8584,18 @@ void finish_receiver_staged_token_prewarm_job(
   if (notify_retry) g_receiver_prewarm_cv.notify_one();
 }
 
-void finish_receiver_object_prewarm_job(
-    const Receiver_object_prewarm_key &key) {
+bool finish_receiver_object_prewarm_job(
+    const Receiver_object_prewarm_key &key,
+    Preserve_trx_transfer_manifest *deferred_manifest) {
   std::lock_guard<std::mutex> guard(g_receiver_prewarm_mutex);
   g_receiver_object_prewarm_inflight.erase(key);
+  const auto deferred = g_receiver_record_plan_deferred.find(key);
+  if (deferred == g_receiver_record_plan_deferred.end()) return false;
+  if (deferred_manifest != nullptr) {
+    *deferred_manifest = std::move(deferred->second);
+  }
+  g_receiver_record_plan_deferred.erase(deferred);
+  return deferred_manifest != nullptr;
 }
 
 Preserve_trx_transfer_status finalize_receiver_ready_token_staging(
@@ -8824,7 +8850,13 @@ static bool run_receiver_object_prewarm_job(
       receiver_object_prewarm_key(root_dir, effective_manifest, object_id,
                                   &inflight_key);
   auto finish_inflight = create_scope_guard([&] {
-    if (have_inflight_key) finish_receiver_object_prewarm_job(inflight_key);
+    if (!have_inflight_key) return;
+    Preserve_trx_transfer_manifest deferred_manifest;
+    if (finish_receiver_object_prewarm_job(inflight_key,
+                                           &deferred_manifest)) {
+      (void)enqueue_receiver_object_prewarm(
+          root_dir, deferred_manifest, object_id, registry);
+    }
   });
   const bool record_lock_object = object_id == kPreservedTrxBlobRecordLocks;
   const bool binlog_object = object_id == kPreservedTrxBlobBinlogCache;
@@ -8842,6 +8874,23 @@ static bool run_receiver_object_prewarm_job(
   key.object_id = object_id;
   key.digest = object->digest;
 
+  const auto enqueue_staged_if_complete = [&] {
+    if (registry == nullptr) return;
+    Preserve_trx_transfer_receiver_record sealed_record;
+    if (!registry->lookup(effective_manifest.epoch_id,
+                          effective_manifest.token, &sealed_record)) {
+      return;
+    }
+    const Preserve_trx_transfer_manifest sealed_manifest =
+        receiver_record_manifest(sealed_record);
+    if (transfer_manifest_has_snapshot_bundle(sealed_manifest) &&
+        registry->all_objects_sealed(sealed_manifest.epoch_id,
+                                     sealed_manifest.token)) {
+      (void)enqueue_receiver_staged_token_prewarm(root_dir, sealed_manifest,
+                                                  registry);
+    }
+  };
+
   Receiver_object_prewarm_proof proof;
   if (record_lock_object) {
     std::string payload;
@@ -8858,8 +8907,16 @@ static bool run_receiver_object_prewarm_job(
       resident in this worker. The plan is not publishable until a final
       manifest claims the same object digest.
     */
-    (void)build_receiver_record_lock_prepared(root_dir, effective_manifest,
-                                              payload);
+    const bool strict_plan_ready =
+        effective_manifest.source_epoch_commit_lsn != 0 &&
+        build_receiver_record_lock_prepared(root_dir, effective_manifest,
+                                            payload);
+    if (receiver_object_prewarm_proof_state(key) ==
+        Receiver_object_prewarm_proof_state::READY) {
+      note_elapsed();
+      if (strict_plan_ready) enqueue_staged_if_complete();
+      return false;
+    }
 
     trx_preserve_record_lock_page_plan_t page_plan;
     if (!trx_preserve_record_lock_payload_page_plan(payload, &page_plan)) {
@@ -8947,21 +9004,7 @@ static bool run_receiver_object_prewarm_job(
     }
   }
   note_elapsed();
-
-  if (registry == nullptr) return retry_after_finish;
-
-  Preserve_trx_transfer_receiver_record sealed_record;
-  if (!registry->lookup(effective_manifest.epoch_id, effective_manifest.token,
-                        &sealed_record)) {
-    return retry_after_finish;
-  }
-  const Preserve_trx_transfer_manifest sealed_manifest =
-      receiver_record_manifest(sealed_record);
-  if (transfer_manifest_has_snapshot_bundle(sealed_manifest) &&
-      registry->all_objects_sealed(manifest.epoch_id, manifest.token)) {
-    (void)enqueue_receiver_staged_token_prewarm(root_dir, sealed_manifest,
-                                                registry);
-  }
+  enqueue_staged_if_complete();
   return retry_after_finish;
 }
 
@@ -9054,9 +9097,14 @@ void receiver_prewarm_worker_main() {
       g_receiver_prewarm_worker_init_index.fetch_add(1);
   const int fail_init_at =
       g_receiver_prewarm_fail_init_at_for_unit_test.load();
-  const bool init_failed =
+  bool init_failed =
       fail_init_at == -2 || fail_init_at == static_cast<int>(init_index) ||
       my_thread_init();
+  THD *worker_thd = nullptr;
+  if (!init_failed) {
+    worker_thd = create_thd(false, true, true, 0);
+    init_failed = worker_thd == nullptr;
+  }
   {
     std::unique_lock<std::mutex> guard(g_receiver_prewarm_mutex);
     g_receiver_prewarm_cv.wait(guard, [] {
@@ -9066,8 +9114,12 @@ void receiver_prewarm_worker_main() {
     if (init_failed) ++g_receiver_prewarm_worker_init_failures;
   }
   g_receiver_prewarm_cv.notify_all();
-  if (init_failed) return;
+  if (init_failed) {
+    if (worker_thd != nullptr) destroy_thd(worker_thd);
+    return;
+  }
   auto thread_end_guard = create_scope_guard([] { my_thread_end(); });
+  auto thd_guard = create_scope_guard([&] { destroy_thd(worker_thd); });
   for (;;) {
     Receiver_prewarm_job job;
     {
@@ -9285,6 +9337,10 @@ Preserve_trx_transfer_status enqueue_receiver_prewarm_job(
   if (job.kind == Receiver_prewarm_job_kind::OBJECT && !has_object_key) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
+  const bool record_plan_missing =
+      has_object_key && job.object_id == kPreservedTrxBlobRecordLocks &&
+      job.manifest.source_epoch_commit_lsn != 0 &&
+      !receiver_record_lock_prepared_exists(job.root_dir, job.manifest);
   {
     std::unique_lock<std::mutex> guard(g_receiver_prewarm_mutex);
     const Preserve_trx_transfer_status start_status =
@@ -9307,15 +9363,33 @@ Preserve_trx_transfer_status enqueue_receiver_prewarm_job(
       return Preserve_trx_transfer_status::OK;
     }
     if (has_object_key) {
+      const auto attempted =
+          g_receiver_record_plan_attempted_generation.find(object_key);
+      const bool needs_record_plan =
+          record_plan_missing &&
+          (attempted == g_receiver_record_plan_attempted_generation.end() ||
+           attempted->second < job.manifest.source_epoch_commit_lsn);
       if (g_receiver_object_prewarm_inflight.count(object_key) != 0) {
+        if (needs_record_plan) {
+          auto &deferred = g_receiver_record_plan_deferred[object_key];
+          if (deferred.source_epoch_commit_lsn <=
+              job.manifest.source_epoch_commit_lsn) {
+            deferred = job.manifest;
+          }
+        }
         return Preserve_trx_transfer_status::OK;
       }
       const Receiver_object_prewarm_proof_state proof_state =
           receiver_object_prewarm_proof_state(object_key);
-      if (proof_state == Receiver_object_prewarm_proof_state::READY ||
+      if ((proof_state == Receiver_object_prewarm_proof_state::READY &&
+           !needs_record_plan) ||
           (proof_state == Receiver_object_prewarm_proof_state::STALE &&
            !job.retry_stale_record_lock_proof)) {
         return Preserve_trx_transfer_status::OK;
+      }
+      if (needs_record_plan) {
+        g_receiver_record_plan_attempted_generation[object_key] =
+            job.manifest.source_epoch_commit_lsn;
       }
       g_receiver_object_prewarm_inflight.insert(object_key);
     }
@@ -9397,6 +9471,8 @@ void preserve_trx_transfer_shutdown_receiver_prewarm_workers() {
     g_receiver_staged_token_prewarm_done.clear();
     g_receiver_staged_token_prewarm_deferred.clear();
     g_receiver_object_prewarm_inflight.clear();
+    g_receiver_record_plan_deferred.clear();
+    g_receiver_record_plan_attempted_generation.clear();
     g_receiver_prewarm_shutdown = false;
     g_receiver_prewarm_workers_stopping = false;
   }
