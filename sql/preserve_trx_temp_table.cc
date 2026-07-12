@@ -2526,6 +2526,20 @@ bool preserve_trx_temp_table_prebuild_phase1_sidecars(
   if (thd == nullptr) return false;
   if (!token_is_filename_safe(warmcopy_id)) return false;
 
+  /*
+    Ordinary transactions do not need a temp-table participant. Creating one
+    here after a SQL savepoint already exists would incorrectly classify that
+    unrelated savepoint as incomplete temp-table history.
+  */
+  if (thd->temporary_tables == nullptr &&
+      !thd->preserve_trx_temp_table_has_participant.load(
+          std::memory_order_acquire) &&
+      !preserve_trx_temp_table_has_untracked_change(thd) &&
+      !preserve_trx_temp_table_has_batch_unsupported_boundary(thd) &&
+      !preserve_trx_temp_table_no_redo_undo_added_since_baseline(thd)) {
+    return true;
+  }
+
   (void)preserve_trx_temp_table_ensure_participant(thd);
   std::shared_ptr<Temp_table_warmcopy_participant> participant =
       preserve_trx_temp_table_pin_participant(thd);

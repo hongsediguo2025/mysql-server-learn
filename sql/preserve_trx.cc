@@ -16551,6 +16551,7 @@ static bool preserved_trx_resume_record_on_thd(
   bool mdl_transferred = false;
   bool gtid_restored = false;
   bool temp_tables_materialized = false;
+  bool thd_detached_after_attach = false;
   auto taint_record_after_temp_cleanup_failure =
       [&](const std::string &reason) {
         const std::string cleanup_reason =
@@ -16582,16 +16583,19 @@ static bool preserved_trx_resume_record_on_thd(
               !cleanup_result.complete();
           temp_tables_materialized = false;
         }
-        const bool must_reset_thd_transaction_state = gtid_restored;
+        const bool must_reset_thd_transaction_state =
+            gtid_restored || thd_detached_after_attach;
         rollback_restored_logged_cache_gtid_next(thd, &gtid_restored);
         if (binlog_imported) {
           discard_binlog_preserve_cache_and_reset_scopes(thd);
           binlog_imported = false;
         }
-        if (must_reset_thd_transaction_state)
+        if (must_reset_thd_transaction_state) {
           reset_thd_after_preserve_detach(thd);
-        else if (mdl_transferred)
+          thd_detached_after_attach = false;
+        } else if (mdl_transferred) {
           thd->mdl_context.release_transactional_locks();
+        }
         if (temp_cleanup_incomplete) {
           return taint_record_after_temp_cleanup_failure(reason);
         }
@@ -16599,16 +16603,20 @@ static bool preserved_trx_resume_record_on_thd(
       };
 
   auto detach_resumed_after_failure = [&](const char *reason) {
-    if (trx_preserve_detach_resumed_from_thd(record.trx, thd) == DB_SUCCESS)
+    if (trx_preserve_detach_resumed_from_thd(record.trx, thd) == DB_SUCCESS) {
+      thd_detached_after_attach = true;
       return false;
+    }
 
     const std::string retry_message =
         "Preserved transaction resume failed to detach transaction after " +
         std::string(reason) + "; retrying cleanup detach";
     LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG, retry_message.c_str());
     if (trx_preserve_detach_resumed_from_thd_for_cleanup(record.trx, thd) ==
-        DB_SUCCESS)
+        DB_SUCCESS) {
+      thd_detached_after_attach = true;
       return false;
+    }
 
     const std::string kill_message =
         "Preserved transaction resume failed to detach transaction after " +
@@ -16704,7 +16712,6 @@ static bool preserved_trx_resume_record_on_thd(
           token, Preserve_snapshot_consume_state::CONSUME_PENDING,
           "resume activation pending") != Preserve_snapshot_status::OK) {
     if (!detach_resumed_after_failure("consume-state publish failure")) {
-      reset_thd_after_preserve_detach(thd);
       (void)restore_preserved_record_after_failure(
           "consume-state publish failure");
     }
@@ -16717,7 +16724,6 @@ static bool preserved_trx_resume_record_on_thd(
     if (!detach_resumed_after_failure("undo activation failure")) {
       if (consume_store->remove_consume_state(token) ==
           Preserve_snapshot_status::OK) {
-        reset_thd_after_preserve_detach(thd);
         (void)restore_preserved_record_after_failure("undo activation failure");
       } else {
         bool temp_cleanup_incomplete = false;
@@ -16737,6 +16743,7 @@ static bool preserved_trx_resume_record_on_thd(
           binlog_imported = false;
         }
         reset_thd_after_preserve_detach(thd);
+        thd_detached_after_attach = false;
         const dberr_t rollback_status =
             trx_preserve_rollback_claimed(record.trx);
         delete_detached_mdl_context(token);
