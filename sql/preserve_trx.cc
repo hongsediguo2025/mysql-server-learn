@@ -4866,6 +4866,8 @@ class Preserve_batch_quiesced_target_counter final : public Do_THD_Impl {
               Preserve_trx_batch_thd_state::QUIESCED ||
           !candidate->m_server_idle ||
           !preserve_trx_has_explicit_active_transaction(candidate) ||
+          !preserved_trx_binlog_format_is_supported(
+              candidate->variables.binlog_format) ||
           preserve_trx_is_unsupported_common_context(candidate);
       if (unsupported) {
         m_has_unsupported_transaction = true;
@@ -9408,6 +9410,10 @@ bool preserved_trx_snapshot_allows_synthetic_temp_claim(
          !metadata.has_logged_persistent_work;
 }
 
+bool preserved_trx_binlog_format_is_supported(ulong binlog_format) {
+  return binlog_format == BINLOG_FORMAT_ROW;
+}
+
 static bool recover_or_adopt_deadline_expired(
     const Preserved_trx_recover_or_adopt_options &options) {
   return options.deadline_us != 0 &&
@@ -11201,6 +11207,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
             : "standby_transfer_requires_batch_drain");
   }
 
+  if (!preserved_trx_binlog_format_is_supported(
+          thd->variables.binlog_format)) {
+    return reject_unsupported_for_delivery("binlog_format_not_row");
+  }
+
   set_stage(Preserve_trx_preserve_stage::BINLOG_PREFLIGHT);
   Preserve_snapshot_binlog_state binlog_state =
       Preserve_snapshot_binlog_state::GLOBAL_OFF_NO_CACHE;
@@ -12708,6 +12719,10 @@ bool preserve_trx_preserve_attached_transaction(
   const bool batch_delivery =
       delivery_mode == Preserve_trx_delivery_mode::BATCH_MANAGER_DELIVERY;
   if (target_thd == nullptr) {
+    return preserve_trx_reject_unsupported();
+  }
+  if (!preserved_trx_binlog_format_is_supported(
+          target_thd->variables.binlog_format)) {
     return preserve_trx_reject_unsupported();
   }
   std::unique_ptr<Preserve_trx_manager_state_guard> draining;

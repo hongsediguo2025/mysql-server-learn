@@ -1,0 +1,34 @@
+DROP TABLE IF EXISTS t_non_row_preserve_preflight;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_drain_mode=HARD;
+CREATE TABLE t_non_row_preserve_preflight(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO t_non_row_preserve_preflight VALUES(1,10),(2,20);
+START TRANSACTION;
+UPDATE t_non_row_preserve_preflight SET v=21 WHERE id=2;
+SET SESSION binlog_format=STATEMENT;
+START TRANSACTION;
+UPDATE t_non_row_preserve_preflight SET v=11 WHERE id=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+ROLLBACK;
+SELECT COUNT(*) AS blocker_thread_count FROM performance_schema.threads WHERE PROCESSLIST_ID = BLOCKER_ID;
+blocker_thread_count
+1
+UPDATE t_non_row_preserve_preflight SET v=22 WHERE id=2;
+ROLLBACK;
+SET SESSION binlog_format=STATEMENT;
+START TRANSACTION;
+UPDATE t_non_row_preserve_preflight SET v=21 WHERE id=2;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+UPDATE t_non_row_preserve_preflight SET v=22 WHERE id=2;
+ROLLBACK;
+SELECT * FROM t_non_row_preserve_preflight ORDER BY id;
+id	v
+1	10
+2	20
+DROP TABLE t_non_row_preserve_preflight;
+SET GLOBAL preserve_trx_drain_mode=SOFT;

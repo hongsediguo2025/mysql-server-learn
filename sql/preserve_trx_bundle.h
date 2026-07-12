@@ -505,5 +505,7 @@ Preserve_snapshot_status decode_preserved_trx_snapshot_bytes(
 bool preserve_trx_snapshot_checked_tlv_size(uint64_t current_size,
                                             uint64_t value_size,
                                             uint64_t *encoded_size);
+bool preserve_trx_snapshot_payload_size_matches(uint64_t encoded_payload_size,
+                                                size_t snapshot_size);
 
 #endif  // SQL_PRESERVE_TRX_BUNDLE_INCLUDED

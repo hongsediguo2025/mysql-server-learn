@@ -4314,6 +4314,9 @@ TEST(PreservedTrxTransfer,
   manifest_payload.tables.push_back(entry);
   ASSERT_TRUE(preserve_trx_encode_temp_table_manifest(
       manifest_payload, &meta.temp_table_manifest_payload));
+  meta.engine_shape = Preserve_snapshot_engine_shape::MIXED;
+  meta.has_persistent_engine_state = true;
+  meta.has_temp_engine_state = true;
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
   input.metadata = meta;
@@ -5126,7 +5129,7 @@ class PreserveSnapshotTest : public ::testing::Test {
   std::vector<Preserve_snapshot_tlv> core_required_tlvs() {
     return {{0x10, "no-cache"},
             {0x11, modified_tables_payload(0)},
-            {0x50, ""},
+            {0x50, session_state_payload(ISO_REPEATABLE_READ, 0, 0, 0, 0, 0)},
             {0x51, empty_mdl_descriptors_payload()}};
   }
 
@@ -5631,6 +5634,17 @@ class PreserveSnapshotTest : public ::testing::Test {
                                  metadata.autoinc_lock_owned,
                                  metadata.has_forced_insert_id,
                                  metadata.forced_insert_id)});
+    }
+    const auto tx_access_tlv = std::find_if(
+        bundle.tlvs.begin(), bundle.tlvs.end(),
+        [](const Preserve_snapshot_tlv &tlv) {
+          return tlv.tag == kTestTxAccessModeTlv;
+        });
+    if (tx_access_tlv == bundle.tlvs.end()) {
+      bundle.tlvs.push_back(
+          {kTestTxAccessModeTlv,
+           tx_access_mode_payload(metadata.tx_read_only,
+                                  metadata.session_tx_read_only)});
     }
     const auto semantic_contract_tlv = std::find_if(
         bundle.tlvs.begin(), bundle.tlvs.end(),
@@ -10815,6 +10829,9 @@ TEST_F(PreserveSnapshotTest,
   input.metadata = metadata();
   ASSERT_TRUE(preserve_trx_encode_temp_table_manifest(
       manifest, &input.metadata.temp_table_manifest_payload));
+  input.metadata.engine_shape = Preserve_snapshot_engine_shape::MIXED;
+  input.metadata.has_persistent_engine_state = true;
+  input.metadata.has_temp_engine_state = true;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             build_preserved_trx_bundle(input, &bundle));
 
@@ -19807,9 +19824,10 @@ TEST_F(PreserveSnapshotTest, BundleCodecV9RequiresSemanticContractTlv) {
 TEST_F(PreserveSnapshotTest, BundleCodecV9SemanticContractRoundTrips) {
   Preserved_trx_bundle_build_input input;
   input.metadata = metadata();
-  input.metadata.engine_shape = Preserve_snapshot_engine_shape::MIXED;
+  input.metadata.engine_shape =
+      Preserve_snapshot_engine_shape::PERSISTENT_ONLY;
   input.metadata.has_persistent_engine_state = true;
-  input.metadata.has_temp_engine_state = true;
+  input.metadata.has_temp_engine_state = false;
   input.metadata.has_logged_persistent_work = false;
   input.metadata.binlog_format = Preserve_snapshot_binlog_format::ROW;
   input.metadata.foreign_key_checks = false;
@@ -19831,9 +19849,10 @@ TEST_F(PreserveSnapshotTest, BundleCodecV9SemanticContractRoundTrips) {
             decode_preserved_trx_snapshot_bytes(
                 codec_context(), encoded.snapshot_bytes, true, &decoded));
   const Preserve_snapshot_metadata &out = decoded.header_metadata;
-  EXPECT_EQ(Preserve_snapshot_engine_shape::MIXED, out.engine_shape);
+  EXPECT_EQ(Preserve_snapshot_engine_shape::PERSISTENT_ONLY,
+            out.engine_shape);
   EXPECT_TRUE(out.has_persistent_engine_state);
-  EXPECT_TRUE(out.has_temp_engine_state);
+  EXPECT_FALSE(out.has_temp_engine_state);
   EXPECT_FALSE(out.has_logged_persistent_work);
   EXPECT_EQ(Preserve_snapshot_binlog_format::ROW, out.binlog_format);
   EXPECT_FALSE(out.foreign_key_checks);
@@ -19841,6 +19860,30 @@ TEST_F(PreserveSnapshotTest, BundleCodecV9SemanticContractRoundTrips) {
   EXPECT_FALSE(out.autocommit);
   EXPECT_EQ(17U, out.auto_increment_increment);
   EXPECT_EQ(3U, out.auto_increment_offset);
+}
+
+TEST_F(PreserveSnapshotTest,
+       BundleCodecV9RejectsMixedContractWithoutTempManifest) {
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  input.metadata.engine_shape = Preserve_snapshot_engine_shape::MIXED;
+  input.metadata.has_persistent_engine_state = true;
+  input.metadata.has_temp_engine_state = true;
+
+  Preserved_trx_bundle bundle;
+  EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
+            build_preserved_trx_bundle(input, &bundle));
+}
+
+TEST_F(PreserveSnapshotTest,
+       BundleCodecV9RejectsLoggedFactWithoutLoggedPayload) {
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  input.metadata.has_logged_persistent_work = true;
+
+  Preserved_trx_bundle bundle;
+  EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
+            build_preserved_trx_bundle(input, &bundle));
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -19926,6 +19969,25 @@ TEST_F(PreserveSnapshotTest, BundleCodecV9RejectsInvalidSavepointTopology) {
   input.metadata.savepoint_suffix_ordinals = {2};
   EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
             build_preserved_trx_bundle(input, &bundle));
+
+  input.metadata = metadata();
+  input.metadata.savepoint_count = 2;
+  std::string first = sql_savepoint_payload(3);
+  std::string second = sql_savepoint_payload(2);
+  second.back() = '2';
+  input.metadata.sql_savepoints_payload.clear();
+  append_le32(&input.metadata.sql_savepoints_payload, 2);
+  input.metadata.sql_savepoints_payload.append(first.data() + 4,
+                                                first.length() - 4);
+  input.metadata.sql_savepoints_payload.append(second.data() + 4,
+                                                second.length() - 4);
+  input.metadata.innodb_savepoints_payload = innodb_savepoint_payload(1, 0);
+  input.metadata.session_participant_order = {
+      Preserve_savepoint_participant::INNODB,
+      Preserve_savepoint_participant::BINLOG};
+  input.metadata.savepoint_suffix_ordinals = {0, 1};
+  EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
+            build_preserved_trx_bundle(input, &bundle));
 }
 
 TEST(PreserveSnapshotCodecBounds, CheckedTlvLengthRejectsU32AndTotalOverflow) {
@@ -19937,6 +19999,17 @@ TEST(PreserveSnapshotCodecBounds, CheckedTlvLengthRejectsU32AndTotalOverflow) {
       0, static_cast<uint64_t>(UINT32_MAX) + 1, &encoded_size));
   EXPECT_FALSE(preserve_trx_snapshot_checked_tlv_size(
       UINT64_MAX - 5, 0, &encoded_size));
+  EXPECT_TRUE(preserve_trx_snapshot_payload_size_matches(
+      7, preserve_trx_bundle_snapshot_header_length() + 7));
+  EXPECT_FALSE(preserve_trx_snapshot_payload_size_matches(
+      UINT64_MAX, preserve_trx_bundle_snapshot_header_length()));
+}
+
+TEST(PreservedTrxEligibility, RejectsNonRowBinlogFormatsBeforePreserve) {
+  EXPECT_TRUE(preserved_trx_binlog_format_is_supported(BINLOG_FORMAT_ROW));
+  EXPECT_FALSE(
+      preserved_trx_binlog_format_is_supported(BINLOG_FORMAT_STMT));
+  EXPECT_FALSE(preserved_trx_binlog_format_is_supported(BINLOG_FORMAT_MIXED));
 }
 
 TEST(PreservedTrxRecovery,
@@ -20678,15 +20751,22 @@ TEST_F(PreserveSnapshotTest, TransactionAccessModeRoundTrips) {
 }
 
 TEST_F(PreserveSnapshotTest,
-       LegacySnapshotDefaultsTransactionAccessModeToReadWrite) {
-  Preserve_snapshot_metadata out;
+       CurrentSnapshotRequiresTransactionAccessModeTlv) {
+  Preserved_trx_bundle_build_input input;
+  input.metadata = metadata();
+  Preserved_trx_bundle bundle;
   ASSERT_EQ(Preserve_snapshot_status::OK,
-            test_write_snapshot(m_dir, metadata(), required_tlvs()));
+            build_preserved_trx_bundle(input, &bundle));
+  Preserved_trx_encoded_bundle encoded;
   ASSERT_EQ(Preserve_snapshot_status::OK,
-            test_read_snapshot(m_dir, "msp_snapshot_gunit", &out));
+            encode_preserved_trx_bundle(codec_context(), bundle, &encoded,
+                                        nullptr));
+  remove_encoded_tlv(&encoded.snapshot_bytes, kTestTxAccessModeTlv);
 
-  EXPECT_FALSE(out.tx_read_only);
-  EXPECT_FALSE(out.session_tx_read_only);
+  Preserved_trx_decoded_snapshot decoded;
+  EXPECT_EQ(Preserve_snapshot_status::CORRUPT,
+            decode_preserved_trx_snapshot_bytes(
+                codec_context(), encoded.snapshot_bytes, true, &decoded));
 }
 
 TEST_F(PreserveSnapshotTest, InvalidTransactionAccessModeTlvRejectsSnapshot) {
@@ -20706,22 +20786,12 @@ TEST_F(PreserveSnapshotTest,
             test_write_snapshot(m_dir, metadata(), tlvs));
 }
 
-TEST_F(PreserveSnapshotTest, LegacySessionStateRoundTripsIsolationOnly) {
+TEST_F(PreserveSnapshotTest, CurrentSnapshotRejectsLegacySessionState) {
   std::vector<Preserve_snapshot_tlv> tlvs = required_tlvs();
   tlvs[2].value = std::string(1, static_cast<char>(ISO_SERIALIZABLE));
 
-  Preserve_snapshot_metadata out;
-  ASSERT_EQ(Preserve_snapshot_status::OK,
+  EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
             test_write_snapshot(m_dir, metadata(), tlvs));
-  EXPECT_EQ(Preserve_snapshot_status::OK,
-            test_read_snapshot(m_dir, "msp_snapshot_gunit", &out));
-
-  EXPECT_EQ(ISO_SERIALIZABLE, out.tx_isolation);
-  EXPECT_EQ(0U, out.first_successful_insert_id_in_prev_stmt);
-  EXPECT_EQ(0U, out.first_successful_insert_id_in_prev_stmt_for_binlog);
-  EXPECT_EQ(0U, out.first_successful_insert_id_in_cur_stmt);
-  EXPECT_FALSE(out.arg_of_last_insert_id_function);
-  EXPECT_FALSE(out.stmt_depends_on_first_successful_insert_id_in_prev_stmt);
 }
 
 TEST_F(PreserveSnapshotTest, AutoincLockStateRoundTrips) {
@@ -20744,7 +20814,7 @@ TEST_F(PreserveSnapshotTest, AutoincLockStateRoundTrips) {
   EXPECT_EQ(0U, out.forced_insert_id);
 }
 
-TEST_F(PreserveSnapshotTest, LegacyOneByteAutoincLockStateRoundTrips) {
+TEST_F(PreserveSnapshotTest, CurrentSnapshotRejectsLegacyAutoincState) {
   Preserve_snapshot_metadata input = metadata();
   input.autoinc_lock_owned = true;
   input.table_locks_payload = table_locks_payload_ix_and_autoinc();
@@ -20753,15 +20823,8 @@ TEST_F(PreserveSnapshotTest, LegacyOneByteAutoincLockStateRoundTrips) {
   tlvs.push_back({0x62, std::string(1, '\1')});
   tlvs.push_back({kTestTableLocksTlv, input.table_locks_payload});
 
-  Preserve_snapshot_metadata out;
-  ASSERT_EQ(Preserve_snapshot_status::OK,
+  EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
             test_write_snapshot(m_dir, input, tlvs));
-  EXPECT_EQ(Preserve_snapshot_status::OK,
-            test_read_snapshot(m_dir, "msp_snapshot_gunit", &out));
-
-  EXPECT_TRUE(out.autoinc_lock_owned);
-  EXPECT_FALSE(out.has_forced_insert_id);
-  EXPECT_EQ(0U, out.forced_insert_id);
 }
 
 TEST_F(PreserveSnapshotTest, AutoincForcedInsertIdRoundTrips) {
@@ -20832,19 +20895,18 @@ TEST_F(PreserveSnapshotTest, SnapshotWriteAddsDefaultAutoincStateTlv) {
   EXPECT_EQ(0, snapshot[tlv_offset + 7]);
 }
 
-TEST_F(PreserveSnapshotTest, LegacySnapshotWithoutAutoincStateReadsFalse) {
+TEST_F(PreserveSnapshotTest, CurrentSnapshotRequiresAutoincState) {
   Preserve_snapshot_metadata out;
   ASSERT_EQ(Preserve_snapshot_status::OK,
             test_write_snapshot(m_dir, metadata(), required_tlvs()));
 
   remove_snapshot_tlv(kTestAutoincStateTlv);
 
-  EXPECT_EQ(Preserve_snapshot_status::OK,
+  EXPECT_EQ(Preserve_snapshot_status::CORRUPT,
             test_read_snapshot(m_dir, "msp_snapshot_gunit", &out));
-  EXPECT_FALSE(out.autoinc_lock_owned);
 }
 
-TEST_F(PreserveSnapshotTest, ExtendedAutoincStateRoundTripsLockFlag) {
+TEST_F(PreserveSnapshotTest, CurrentSnapshotRejectsExtendedAutoincState) {
   Preserve_snapshot_metadata input = metadata();
   input.autoinc_lock_owned = true;
   input.table_locks_payload = table_locks_payload_ix_and_autoinc();
@@ -20855,13 +20917,8 @@ TEST_F(PreserveSnapshotTest, ExtendedAutoincStateRoundTripsLockFlag) {
   tlvs.push_back({0x62, payload});
   tlvs.push_back({kTestTableLocksTlv, input.table_locks_payload});
 
-  Preserve_snapshot_metadata out;
-  ASSERT_EQ(Preserve_snapshot_status::OK,
+  EXPECT_EQ(Preserve_snapshot_status::INVALID_ARGUMENT,
             test_write_snapshot(m_dir, input, tlvs));
-  EXPECT_EQ(Preserve_snapshot_status::OK,
-            test_read_snapshot(m_dir, "msp_snapshot_gunit", &out));
-
-  EXPECT_TRUE(out.autoinc_lock_owned);
 }
 
 TEST_F(PreserveSnapshotTest, RecordLocksPayloadRoundTrips) {

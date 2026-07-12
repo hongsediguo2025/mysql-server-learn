@@ -63,6 +63,17 @@ bool preserve_trx_snapshot_checked_tlv_size(uint64_t current_size,
   return true;
 }
 
+bool preserve_trx_snapshot_payload_size_matches(uint64_t encoded_payload_size,
+                                                size_t snapshot_size) {
+  const size_t header_length = preserve_trx_bundle_snapshot_header_length();
+  if (snapshot_size < header_length ||
+      encoded_payload_size > std::numeric_limits<size_t>::max()) {
+    return false;
+  }
+  return static_cast<size_t>(encoded_payload_size) ==
+         snapshot_size - header_length;
+}
+
 namespace {
 
 constexpr char kSnapshotMagic[] = "MSP_PRES";
@@ -200,7 +211,8 @@ constexpr size_t kUserVariablesHeaderLength = 6;
 constexpr size_t kUserVariableEntryFixedLength = 12;
 constexpr uint16_t kRequiredTlvs[] = {
     kTlvInnodbCore, kTlvModifiedTables, kTlvSessionState,
-    kTlvMdlDescriptors, kTlvSemanticContract, kTlvSavepointTopology};
+    kTlvMdlDescriptors, kTlvTxAccessMode, kTlvSemanticContract,
+    kTlvSavepointTopology, kTlvAutoincState};
 
 void append_le16(std::string *payload, uint16_t value) {
   payload->push_back(static_cast<char>(value & 0xff));
@@ -380,6 +392,19 @@ bool semantic_contract_is_valid(const Preserve_snapshot_metadata &metadata) {
   return metadata.binlog_format == Preserve_snapshot_binlog_format::ROW &&
          metadata.auto_increment_increment != 0 &&
          metadata.auto_increment_offset != 0;
+}
+
+bool semantic_payload_facts_are_valid(
+    const Preserve_snapshot_metadata &metadata) {
+  const bool has_temp_payload =
+      !metadata.temp_table_manifest_payload.empty();
+  const bool has_logged_payload =
+      metadata.binlog_state ==
+          Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE &&
+      metadata.binlog_cache_with_content;
+  return semantic_contract_is_valid(metadata) &&
+         metadata.has_temp_engine_state == has_temp_payload &&
+         metadata.has_logged_persistent_work == has_logged_payload;
 }
 
 std::string semantic_contract_tlv_value(
@@ -1034,13 +1059,7 @@ bool parse_session_state_tlv(const std::string &value,
   metadata->arg_of_last_insert_id_function = false;
   metadata->stmt_depends_on_first_successful_insert_id_in_prev_stmt = false;
 
-  if (value.empty()) return false;
-  if (value.length() == kSessionStateLegacyLength) {
-    metadata->tx_isolation =
-        static_cast<uint8_t>(static_cast<unsigned char>(
-            value[kSessionStateTxIsolationOffset]));
-    return metadata->tx_isolation > kIsoSerializable;
-  }
+  if (value.empty() || value.length() == kSessionStateLegacyLength) return true;
   if (value.length() != kSessionStateLength &&
       value.length() < kSessionStateExtendedHeaderLength) {
     return true;
@@ -1100,21 +1119,17 @@ bool parse_session_state_tlv(const std::string &value,
 
 bool parse_autoinc_state_tlv(const std::string &value,
                              Preserve_snapshot_metadata *metadata) {
-  if (metadata == nullptr || value.empty()) return true;
+  if (metadata == nullptr || value.length() != 10) return true;
   const unsigned char flag = static_cast<unsigned char>(value[0]);
   if (flag > 1) return true;
   metadata->autoinc_lock_owned = flag != 0;
   metadata->has_forced_insert_id = false;
   metadata->forced_insert_id = 0;
 
-  if (value.length() > 1 && value.length() < 10) return true;
-
-  if (value.length() >= 10) {
-    const unsigned char has_forced = static_cast<unsigned char>(value[1]);
-    if (has_forced > 1) return true;
-    metadata->has_forced_insert_id = has_forced != 0;
-    metadata->forced_insert_id = read_le64(value, 2);
-  }
+  const unsigned char has_forced = static_cast<unsigned char>(value[1]);
+  if (has_forced > 1) return true;
+  metadata->has_forced_insert_id = has_forced != 0;
+  metadata->forced_insert_id = read_le64(value, 2);
   return false;
 }
 
@@ -1237,7 +1252,10 @@ bool savepoint_topology_is_valid(
   }
   for (size_t i = 0; i < metadata.savepoint_suffix_ordinals.size(); ++i) {
     const uint16_t suffix = metadata.savepoint_suffix_ordinals[i];
-    if (suffix > metadata.session_participant_order.size()) return false;
+    if (suffix > metadata.session_participant_order.size() ||
+        (i != 0 && suffix > metadata.savepoint_suffix_ordinals[i - 1])) {
+      return false;
+    }
     uint16_t expected_flags = 0;
     for (size_t participant_index = suffix;
          participant_index < metadata.session_participant_order.size();
@@ -2219,7 +2237,7 @@ bool apply_bundle_semantics(std::vector<Preserve_snapshot_tlv> *tlvs,
     metadata->temp_table_manifest_payload = temp_table_manifest->value;
   }
 
-  return false;
+  return !semantic_payload_facts_are_valid(*metadata);
 }
 
 bool decode_external_blob_descriptor(
@@ -2472,10 +2490,6 @@ Preserve_snapshot_status build_preserved_trx_bundle(
     built.tlvs = no_cache_tlvs(built.metadata);
   }
 
-  if (!semantic_contract_is_valid(built.metadata)) {
-    return Preserve_snapshot_status::INVALID_ARGUMENT;
-  }
-
   const Preserve_snapshot_status prebuilt_record_locks_status =
       attach_prebuilt_record_locks_blob_if_requested(input, &built);
   if (prebuilt_record_locks_status != Preserve_snapshot_status::OK)
@@ -2490,6 +2504,10 @@ Preserve_snapshot_status build_preserved_trx_bundle(
     return Preserve_snapshot_status::INVALID_ARGUMENT;
   built.owns_current_temp_sidecars =
       !built.metadata.temp_table_manifest_payload.empty();
+
+  if (!semantic_payload_facts_are_valid(built.metadata)) {
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
 
   if (!metadata_payloads_are_valid(built.metadata, false)) {
     return Preserve_snapshot_status::INVALID_ARGUMENT;
@@ -2699,11 +2717,13 @@ Preserve_snapshot_status decode_preserved_trx_snapshot_bytes(
     return Preserve_snapshot_status::CORRUPT;
   }
 
-  const size_t payload_size =
-      static_cast<size_t>(read_le64(snapshot_bytes, kPayloadSizeOffset));
-  if (payload_size != snapshot_bytes.size() - kSnapshotHeaderLength) {
+  const uint64_t encoded_payload_size =
+      read_le64(snapshot_bytes, kPayloadSizeOffset);
+  if (!preserve_trx_snapshot_payload_size_matches(encoded_payload_size,
+                                                   snapshot_bytes.size())) {
     return Preserve_snapshot_status::CORRUPT;
   }
+  const size_t payload_size = static_cast<size_t>(encoded_payload_size);
 
   std::vector<unsigned char> crc_bytes = snapshot_bytes;
   const uint32_t stored_crc = read_le32(crc_bytes, kCrcOffset);

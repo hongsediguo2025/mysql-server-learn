@@ -509,6 +509,7 @@ bool preserved_trx_recovery_deadline_expired_for_unit_test(
     uint64_t anchor_monotonic_us, uint64_t now_monotonic_us);
 bool preserved_trx_snapshot_allows_synthetic_temp_claim(
     const Preserve_snapshot_metadata &metadata);
+bool preserved_trx_binlog_format_is_supported(ulong binlog_format);
 bool preserved_trx_startup_record_lock_pages_prewarmed_for_unit_test(
     uint64_t record_lock_page_count, uint64_t prefetch_submitted_pages,
     uint64_t resident_pages);
