@@ -10395,7 +10395,7 @@ void preserved_trx_release_resources(THD *thd) {
 }
 
 void preserved_trx_begin_external_thd_teardown(THD *thd) {
-  if (thd == nullptr) return;
+  if (!preserve_trx_is_enabled() || thd == nullptr) return;
   std::unique_lock<std::mutex> lock(g_preserved_trx_thd_pin_mutex);
   g_preserved_trx_thd_teardown.insert(thd);
   g_preserved_trx_thd_pin_cond.wait(lock, [thd] {
@@ -10405,7 +10405,7 @@ void preserved_trx_begin_external_thd_teardown(THD *thd) {
 }
 
 void preserved_trx_end_external_thd_teardown(THD *thd) {
-  if (thd == nullptr) return;
+  if (!preserve_trx_is_enabled() || thd == nullptr) return;
   {
     std::lock_guard<std::mutex> lock(g_preserved_trx_thd_pin_mutex);
     g_preserved_trx_thd_teardown.erase(thd);

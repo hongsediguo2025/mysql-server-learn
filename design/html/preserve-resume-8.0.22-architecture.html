@@ -1,0 +1,1569 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>MySQL 8.0.22 Preserve / Resume 事务架构</title>
+  <style>
+    :root {
+      --ink: #17202a;
+      --muted: #5d6873;
+      --line: #d7dde2;
+      --line-strong: #aeb8c1;
+      --paper: #ffffff;
+      --canvas: #f4f6f7;
+      --soft: #eef2f3;
+      --teal: #087f76;
+      --teal-soft: #e5f4f2;
+      --green: #3b7a57;
+      --green-soft: #eaf3ed;
+      --amber: #a56200;
+      --amber-soft: #fff3d8;
+      --red: #a23a35;
+      --red-soft: #fbeceb;
+      --blue: #35658a;
+      --blue-soft: #eaf1f6;
+      --code: #20262c;
+      --shadow: 0 1px 2px rgba(23, 32, 42, .06), 0 8px 24px rgba(23, 32, 42, .05);
+      --radius: 6px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--canvas);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", Arial, sans-serif;
+      font-size: 16px;
+      line-height: 1.72;
+      letter-spacing: 0;
+    }
+    a { color: var(--teal); text-underline-offset: 3px; }
+    a:hover { color: #05675f; }
+    code, .mono {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: .92em;
+    }
+    code {
+      padding: .12em .34em;
+      color: #24343d;
+      background: #edf1f3;
+      border: 1px solid #dfe5e8;
+      border-radius: 4px;
+      overflow-wrap: anywhere;
+    }
+    pre {
+      margin: 18px 0;
+      padding: 16px 18px;
+      overflow: auto;
+      color: #e7ecef;
+      background: var(--code);
+      border-radius: var(--radius);
+      font-size: 13px;
+      line-height: 1.62;
+    }
+    pre code { padding: 0; color: inherit; background: none; border: 0; }
+    .skip-link {
+      position: fixed;
+      left: 16px;
+      top: -60px;
+      z-index: 100;
+      padding: 8px 12px;
+      color: #fff;
+      background: var(--teal);
+      border-radius: 4px;
+    }
+    .skip-link:focus { top: 12px; }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(248px, 288px) minmax(0, 1fr);
+      max-width: 1540px;
+      min-height: 100vh;
+      margin: 0 auto;
+      background: var(--paper);
+      box-shadow: 0 0 0 1px rgba(23, 32, 42, .04);
+    }
+    .sidebar {
+      position: sticky;
+      top: 0;
+      align-self: start;
+      height: 100vh;
+      overflow-y: auto;
+      padding: 26px 22px 28px;
+      background: #f8f9fa;
+      border-right: 1px solid var(--line);
+    }
+    .brand {
+      margin-bottom: 24px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand strong {
+      display: block;
+      margin-bottom: 5px;
+      font-size: 17px;
+      line-height: 1.35;
+    }
+    .brand span { color: var(--muted); font-size: 12px; }
+    .toc-title {
+      margin: 0 0 9px;
+      color: #78828b;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .toc { margin: 0; padding: 0; list-style: none; }
+    .toc a {
+      display: block;
+      margin: 1px 0;
+      padding: 6px 9px;
+      color: #43505b;
+      border-left: 2px solid transparent;
+      text-decoration: none;
+      font-size: 13px;
+      line-height: 1.42;
+    }
+    .toc a:hover { color: var(--ink); background: var(--soft); }
+    .toc a.active {
+      color: var(--teal);
+      background: var(--teal-soft);
+      border-left-color: var(--teal);
+      font-weight: 650;
+    }
+    .content { min-width: 0; padding: 0 5.2vw 88px; }
+    .hero {
+      position: relative;
+      margin: 0 -5.2vw 0;
+      padding: 58px 5.2vw 46px;
+      color: #fff;
+      background: #17343b;
+      overflow: hidden;
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      right: -70px;
+      bottom: -140px;
+      width: 420px;
+      height: 270px;
+      border: 1px solid rgba(255, 255, 255, .13);
+      transform: rotate(-10deg);
+    }
+    .eyebrow {
+      margin: 0 0 10px;
+      color: #9ed8d1;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+    h1 {
+      max-width: 880px;
+      margin: 0;
+      font-size: clamp(34px, 4.4vw, 58px);
+      line-height: 1.13;
+      letter-spacing: 0;
+    }
+    .hero .lead {
+      max-width: 910px;
+      margin: 22px 0 0;
+      color: #dce9eb;
+      font-size: 18px;
+      line-height: 1.72;
+    }
+    .hero-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px 22px;
+      margin-top: 26px;
+      color: #b8cdd0;
+      font-size: 12px;
+    }
+    main section { scroll-margin-top: 28px; }
+    .intro-strip {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1px;
+      margin: 0 -5.2vw 28px;
+      background: var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+    .intro-strip > div { padding: 18px 24px; background: #fbfcfc; }
+    .intro-strip b { display: block; margin-bottom: 4px; font-size: 13px; }
+    .intro-strip span { color: var(--muted); font-size: 12px; }
+    h2 {
+      margin: 64px 0 18px;
+      padding-top: 4px;
+      font-size: 28px;
+      line-height: 1.3;
+      letter-spacing: 0;
+    }
+    h2::before {
+      content: "";
+      display: block;
+      width: 44px;
+      height: 4px;
+      margin-bottom: 13px;
+      background: var(--teal);
+    }
+    h3 {
+      margin: 36px 0 12px;
+      font-size: 20px;
+      line-height: 1.4;
+      letter-spacing: 0;
+    }
+    h4 { margin: 25px 0 8px; font-size: 16px; }
+    p { max-width: 980px; margin: 12px 0; }
+    .section-lead { max-width: 1020px; color: #3e4c56; font-size: 17px; }
+    .note, .boundary, .principle {
+      max-width: 1040px;
+      margin: 20px 0;
+      padding: 15px 18px;
+      border-left: 4px solid var(--teal);
+      background: var(--teal-soft);
+    }
+    .boundary { border-left-color: var(--amber); background: var(--amber-soft); }
+    .principle { border-left-color: var(--blue); background: var(--blue-soft); }
+    .note strong, .boundary strong, .principle strong { display: block; margin-bottom: 4px; }
+    .grid-2, .grid-3, .grid-4 {
+      display: grid;
+      gap: 14px;
+      margin: 18px 0;
+    }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .panel {
+      min-width: 0;
+      padding: 17px 18px;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: 0 1px 0 rgba(23, 32, 42, .02);
+    }
+    .panel h3, .panel h4 { margin-top: 0; }
+    .panel p { margin: 6px 0 0; color: var(--muted); font-size: 14px; }
+    .panel .tag { margin-bottom: 10px; }
+    .tag {
+      display: inline-block;
+      padding: 2px 7px;
+      color: #33515a;
+      background: var(--soft);
+      border: 1px solid #dce3e6;
+      border-radius: 3px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .tag.teal { color: #066b63; background: var(--teal-soft); border-color: #bfe1dc; }
+    .tag.green { color: #326648; background: var(--green-soft); border-color: #c8ddcf; }
+    .tag.amber { color: #8a5500; background: var(--amber-soft); border-color: #ead09d; }
+    .tag.blue { color: #2d5e82; background: var(--blue-soft); border-color: #cadbe8; }
+    .diagram {
+      max-width: 1120px;
+      margin: 22px 0 28px;
+      padding: 18px;
+      overflow-x: auto;
+      background: #fbfcfc;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+    }
+    .diagram figcaption {
+      margin: 0 0 14px;
+      color: #44515b;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .diagram svg { display: block; min-width: 820px; width: 100%; height: auto; }
+    .diagram .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 18px;
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .legend i {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      margin-right: 5px;
+      border-radius: 2px;
+      vertical-align: -1px;
+    }
+    .flow-row {
+      display: flex;
+      align-items: stretch;
+      min-width: 930px;
+      gap: 9px;
+    }
+    .flow-step {
+      position: relative;
+      flex: 1 1 0;
+      min-width: 0;
+      padding: 13px 12px;
+      background: #fff;
+      border: 1px solid var(--line-strong);
+      border-radius: 5px;
+      text-align: center;
+      font-size: 12px;
+      line-height: 1.42;
+    }
+    .flow-step:not(:last-child)::after {
+      content: "";
+      position: absolute;
+      right: -9px;
+      top: 50%;
+      z-index: 2;
+      width: 9px;
+      height: 1px;
+      background: #7b8992;
+    }
+    .flow-step b { display: block; margin-bottom: 4px; color: var(--ink); font-size: 12px; }
+    .flow-step small { color: var(--muted); font-size: 10px; }
+    .flow-step.phase1 { border-top: 4px solid var(--green); }
+    .flow-step.phase2 { border-top: 4px solid var(--amber); }
+    .flow-step.durable { border-top: 4px solid var(--teal); }
+    .flow-step.external { border-top: 4px solid var(--blue); }
+    .table-wrap { max-width: 1120px; margin: 18px 0 28px; overflow-x: auto; }
+    table { width: 100%; min-width: 720px; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 11px 12px; border: 1px solid var(--line); vertical-align: top; text-align: left; }
+    th { color: #33414b; background: #eef2f3; font-weight: 700; }
+    tbody tr:nth-child(even) td { background: #fafbfb; }
+    td code { white-space: normal; }
+    ul, ol { max-width: 980px; padding-left: 22px; }
+    li { margin: 6px 0; }
+    .numbered {
+      max-width: 1040px;
+      margin: 18px 0;
+      padding: 0;
+      list-style: none;
+      counter-reset: item;
+    }
+    .numbered li {
+      position: relative;
+      min-height: 42px;
+      margin: 12px 0;
+      padding-left: 52px;
+      counter-increment: item;
+    }
+    .numbered li::before {
+      content: counter(item);
+      position: absolute;
+      left: 0;
+      top: 0;
+      display: grid;
+      place-items: center;
+      width: 34px;
+      height: 34px;
+      color: #fff;
+      background: var(--teal);
+      border-radius: 50%;
+      font-weight: 700;
+      line-height: 1;
+    }
+    .source-ref {
+      max-width: 1120px;
+      margin: 13px 0 24px;
+      padding: 10px 12px;
+      color: #56636d;
+      background: #f5f7f8;
+      border: 1px dashed #cbd3d9;
+      font-size: 12px;
+    }
+    .source-ref b { color: #36434d; }
+    .state-lane {
+      min-width: 960px;
+      display: grid;
+      grid-template-columns: repeat(10, minmax(86px, 1fr));
+      align-items: center;
+      gap: 6px;
+    }
+    .state-lane > div {
+      position: relative;
+      padding: 10px 7px;
+      border: 1px solid var(--line-strong);
+      border-radius: 4px;
+      background: #fff;
+      text-align: center;
+      font-size: 10px;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+    .state-lane > div:not(:last-child)::after {
+      content: "›";
+      position: absolute;
+      right: -8px;
+      top: 50%;
+      z-index: 2;
+      color: #7e8b94;
+      background: #fbfcfc;
+      transform: translateY(-52%);
+      font-size: 18px;
+      font-weight: 400;
+    }
+    .state-lane .ready { color: #075f58; background: var(--teal-soft); border-color: #86c9c1; }
+    .state-lane .active { color: #2f6747; background: var(--green-soft); border-color: #9fc4ad; }
+    .state-lane .gate { color: #835000; background: var(--amber-soft); border-color: #dfc079; }
+    .state-side {
+      min-width: 960px;
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .state-side > div { padding: 8px 10px; color: #7f332f; background: var(--red-soft); border-left: 3px solid var(--red); font-size: 11px; }
+    .callout-line {
+      display: grid;
+      grid-template-columns: 180px 1fr;
+      gap: 14px;
+      max-width: 1040px;
+      margin: 12px 0;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--line);
+    }
+    .callout-line > b { color: #34424c; }
+    .callout-line > span { color: var(--muted); }
+    .footer {
+      margin: 68px 0 0;
+      padding-top: 24px;
+      color: var(--muted);
+      border-top: 1px solid var(--line);
+      font-size: 12px;
+    }
+    .nav-toggle { display: none; }
+
+    @media (max-width: 1120px) {
+      .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 860px) {
+      .layout { display: block; }
+      .sidebar {
+        position: fixed;
+        left: 0;
+        top: 0;
+        z-index: 40;
+        width: min(320px, 86vw);
+        transform: translateX(-105%);
+        transition: transform .2s ease;
+        box-shadow: 12px 0 32px rgba(23, 32, 42, .18);
+      }
+      body.nav-open .sidebar { transform: translateX(0); }
+      .nav-toggle {
+        position: fixed;
+        right: 14px;
+        top: 14px;
+        z-index: 50;
+        display: grid;
+        place-items: center;
+        width: 42px;
+        height: 42px;
+        padding: 0;
+        color: #fff;
+        background: #17343b;
+        border: 1px solid rgba(255,255,255,.35);
+        border-radius: 5px;
+        cursor: pointer;
+      }
+      .nav-toggle span, .nav-toggle::before, .nav-toggle::after {
+        content: "";
+        display: block;
+        width: 18px;
+        height: 2px;
+        background: currentColor;
+      }
+      .nav-toggle span { margin: 4px 0; }
+      .content { padding: 0 22px 60px; }
+      .hero { margin: 0 -22px; padding: 48px 22px 38px; }
+      .hero .lead { font-size: 16px; }
+      .intro-strip { grid-template-columns: 1fr; margin: 0 -22px 20px; }
+      .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
+      h2 { margin-top: 52px; font-size: 25px; }
+      .callout-line { grid-template-columns: 1fr; gap: 2px; }
+    }
+    @media (max-width: 520px) {
+      body { font-size: 15px; }
+      h1 { font-size: 34px; }
+      .content { padding-left: 16px; padding-right: 16px; }
+      .hero, .intro-strip { margin-left: -16px; margin-right: -16px; }
+      .hero { padding-left: 16px; padding-right: 58px; }
+      .diagram { margin-left: -4px; margin-right: -4px; padding: 12px; }
+    }
+    @media print {
+      body { background: #fff; font-size: 11pt; }
+      .layout { display: block; max-width: none; box-shadow: none; }
+      .sidebar, .nav-toggle { display: none !important; }
+      .content { padding: 0; }
+      .hero { margin: 0; padding: 28px; color: #000; background: #fff; border-bottom: 2px solid #333; }
+      .hero .lead, .hero-meta, .eyebrow { color: #333; }
+      .hero::after { display: none; }
+      .intro-strip { margin: 0; }
+      h2 { break-after: avoid; }
+      .diagram, table, .panel { break-inside: avoid; box-shadow: none; }
+      .diagram { overflow: visible; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到正文</a>
+  <button class="nav-toggle" type="button" aria-label="打开章节导航" title="章节导航"><span></span></button>
+
+  <div class="layout">
+    <aside class="sidebar" aria-label="章节导航">
+      <div class="brand">
+        <strong>Preserve / Resume</strong>
+        <span>MySQL 8.0.22 架构与接手指南</span>
+      </div>
+      <div class="toc-title">阅读顺序</div>
+      <nav>
+        <ol class="toc">
+          <li><a href="#positioning">1. 文档定位</a></li>
+          <li><a href="#concepts">2. 核心概念</a></li>
+          <li><a href="#topology">3. 生产部署拓扑</a></li>
+          <li><a href="#lifecycle">4. 全链路总览</a></li>
+          <li><a href="#source-drain">5. 源端批量 Drain</a></li>
+          <li><a href="#kernel">6. Preserve 内核</a></li>
+          <li><a href="#artifacts">7. Bundle 与工件</a></li>
+          <li><a href="#transfer">8. 在线传输协议</a></li>
+          <li><a href="#prewarm">9. 接收端预热</a></li>
+          <li><a href="#promotion">10. 物理晋升门</a></li>
+          <li><a href="#attach">11. 目标会话接管</a></li>
+          <li><a href="#local-recovery">12. 本地启动恢复</a></li>
+          <li><a href="#object-model">13. 对象恢复原理</a></li>
+          <li><a href="#consistency">14. 一致性与所有权</a></li>
+          <li><a href="#operations">15. 命令、配置与观测</a></li>
+          <li><a href="#code-map">16. 代码地图</a></li>
+        </ol>
+      </nav>
+    </aside>
+
+    <main class="content" id="main">
+      <header class="hero">
+        <h1>Preserve / Resume 事务架构</h1>
+        <p class="lead">
+          这个特性把一个尚未提交的事务从原连接中拆出，保留为可验证、可转移、可重新接管的事务对象。
+          生产形态不是简单的“重启后恢复”，而是源端批量收口、事务语义在线传输、备端提前预热，
+          等物理副本达到一致性栅栏后再完成晋升与快速接管；其中物理复制、角色切换和严格晋升入口由仓库外的 HA 编排补齐。
+        </p>
+        <div class="hero-meta">
+          <span>范围：SQL 层、Preserve 内核、InnoDB、Binlog、临时表、Transfer、Promotion</span>
+        </div>
+      </header>
+
+      <div class="intro-strip" aria-label="文档摘要">
+        <div><b>先看生产链路</b><span>第 3 至 11 节按真实运行时序展开。</span></div>
+        <div><b>再看对象原理</b><span>第 13 至 14 节解释事务为什么能继续执行。</span></div>
+        <div><b>最后落到代码</b><span>第 15 至 16 节给出入口、观测面与阅读顺序。</span></div>
+      </div>
+
+      <section id="positioning">
+        <h2>1. 文档定位</h2>
+        <p class="section-lead">
+          Preserve / Resume 解决的是“事务连续性”，不是 SQL 重放。系统保留下来的不是一串待重放语句，
+          而是一个已经在 InnoDB prepare 边界上稳定下来的事务，加上一份足以恢复 SQL 层语义的快照。
+          恢复完成后，客户端面对的仍是原事务：它可以继续读写，最终选择 <code>COMMIT</code> 或 <code>ROLLBACK</code>。
+        </p>
+        <div class="principle">
+          <strong>一句话架构</strong>
+          InnoDB prepared transaction 是持久化锚点；authenticated bundle 是恢复契约；transfer epoch 是跨机发布单元；
+          prewarm registry 与 physical fence 把大部分恢复工作移到晋升前；protected THD attach 是事务重新回到客户端连接的最后一步。
+        </div>
+        <p>
+          文档按当前工作树描述实现。设计目录中若有“跨机传输尚未实现”“promotion 仍是后续工作”等旧结论，
+          不能再作为现状判断；这些材料仍可用于理解早期约束，但状态机、调用入口和工件格式要回到源码核对。
+        </p>
+      </section>
+
+      <section id="concepts">
+        <h2>2. 核心概念</h2>
+        <p class="section-lead">
+          先把几类经常混在一起的对象分开。后面的流程看似很长，本质上一直在回答三件事：
+          事务本体由谁持有，恢复语义保存在哪里，什么时候允许它重新变成 ACTIVE。
+        </p>
+
+        <div class="grid-3">
+          <article class="panel">
+            <span class="tag teal">事务本体</span>
+            <h3>Prepared transaction</h3>
+            <p>InnoDB 事务完成 prepare 后脱离原 THD，以 Preserve 专用 XID 留在引擎中。它保留 undo、修改和锁语义，是后续恢复的持久化锚点。</p>
+          </article>
+          <article class="panel">
+            <span class="tag blue">恢复契约</span>
+            <h3>Snapshot bundle</h3>
+            <p>保存 owner、session、read view、锁、MDL、savepoint、binlog cache、临时表 manifest 等语义。它不是展示元数据，而是 resume 的输入合同。</p>
+          </article>
+          <article class="panel">
+            <span class="tag green">对象标识</span>
+            <h3>Token</h3>
+            <p>关联 XID、snapshot、外部 blob、接收端状态和最终 resume 请求。本地单事务使用随机十六进制 token；standby batch 路径使用目标 thread id 的十进制文本作稳定关联键。</p>
+          </article>
+          <article class="panel">
+            <span class="tag amber">发布单元</span>
+            <h3>Transfer epoch</h3>
+            <p>一批 token 的在线传输事务。对象可以提前到达，但只有 epoch fact 与 <code>COMMIT_EPOCH</code> 完成后，接收端才把这批对象视为同一一致性事实。</p>
+          </article>
+          <article class="panel">
+            <span class="tag teal">晋升前准备</span>
+            <h3>Prewarm</h3>
+            <p>接收端提前做解码、语义校验、record-lock plan 构建、原生 binlog cache handle 准备和资源预留，避免晋升门内发生大文件读写。</p>
+          </article>
+          <article class="panel">
+            <span class="tag blue">物理证明</span>
+            <h3>Physical fence</h3>
+            <p>外部 HA/redo apply 组件提供的租约式证明：目标物理副本已达到指定 LSN、apply 已冻结，且页布局、字典代际和锁代际摘要与 epoch 事实一致。</p>
+          </article>
+        </div>
+
+        <figure class="diagram">
+          <figcaption>图 1 · 各类对象的所有权关系</figcaption>
+          <svg viewBox="0 0 1080 390" role="img" aria-label="Token 关联 prepared transaction、bundle、transfer epoch、prewarm registry 和 target THD">
+            <defs>
+              <marker id="arrow-concepts" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                <path d="M0,0 L8,4 L0,8 Z" fill="#70808a"/>
+              </marker>
+            </defs>
+            <rect x="25" y="38" width="250" height="88" rx="5" fill="#eaf3ed" stroke="#3b7a57"/>
+            <text x="150" y="70" text-anchor="middle" font-size="16" font-weight="700" fill="#244d37">InnoDB prepared trx</text>
+            <text x="150" y="96" text-anchor="middle" font-size="12" fill="#52635a">magic XID · undo · engine state</text>
+
+            <rect x="25" y="262" width="250" height="88" rx="5" fill="#eaf1f6" stroke="#35658a"/>
+            <text x="150" y="294" text-anchor="middle" font-size="16" font-weight="700" fill="#294f6b">Snapshot bundle</text>
+            <text x="150" y="320" text-anchor="middle" font-size="12" fill="#53636f">metadata · TLV · external blob</text>
+
+            <rect x="408" y="142" width="260" height="104" rx="5" fill="#e5f4f2" stroke="#087f76" stroke-width="2"/>
+            <text x="538" y="181" text-anchor="middle" font-size="19" font-weight="700" fill="#075f58">Token</text>
+            <text x="538" y="210" text-anchor="middle" font-size="12" fill="#42645f">跨层身份键与所有权定位键</text>
+
+            <rect x="805" y="32" width="245" height="82" rx="5" fill="#fff3d8" stroke="#a56200"/>
+            <text x="928" y="64" text-anchor="middle" font-size="16" font-weight="700" fill="#774900">Transfer epoch</text>
+            <text x="928" y="88" text-anchor="middle" font-size="12" fill="#705f45">对象集合 + final facts</text>
+
+            <rect x="805" y="154" width="245" height="82" rx="5" fill="#eef2f3" stroke="#7b8992"/>
+            <text x="928" y="186" text-anchor="middle" font-size="16" font-weight="700" fill="#3e4b54">Prepared registry</text>
+            <text x="928" y="210" text-anchor="middle" font-size="12" fill="#5b6871">状态 + lease + prepared resources</text>
+
+            <rect x="805" y="276" width="245" height="82" rx="5" fill="#eaf3ed" stroke="#3b7a57"/>
+            <text x="928" y="308" text-anchor="middle" font-size="16" font-weight="700" fill="#244d37">Protected target THD</text>
+            <text x="928" y="332" text-anchor="middle" font-size="12" fill="#52635a">attach · activate · client resumes</text>
+
+            <path d="M275 82 C350 82, 345 165, 408 180" fill="none" stroke="#70808a" stroke-width="2" marker-end="url(#arrow-concepts)"/>
+            <path d="M275 306 C350 306, 345 226, 408 210" fill="none" stroke="#70808a" stroke-width="2" marker-end="url(#arrow-concepts)"/>
+            <path d="M668 178 C730 145, 744 86, 805 76" fill="none" stroke="#70808a" stroke-width="2" marker-end="url(#arrow-concepts)"/>
+            <path d="M668 194 L805 194" fill="none" stroke="#70808a" stroke-width="2" marker-end="url(#arrow-concepts)"/>
+            <path d="M668 216 C730 245, 744 307, 805 316" fill="none" stroke="#70808a" stroke-width="2" marker-end="url(#arrow-concepts)"/>
+            <text x="329" y="104" font-size="11" fill="#5d6873">XID 绑定</text>
+            <text x="326" y="290" font-size="11" fill="#5d6873">文件命名与摘要</text>
+          </svg>
+        </figure>
+      </section>
+
+      <section id="topology">
+        <h2>3. 生产部署拓扑</h2>
+        <p class="section-lead">
+          生产链路有两条并行的数据通道，不能把它们当成一条。物理复制通道负责让持久表页、redo 和 prepared transaction
+          到达备端；Preserve Transfer 通道负责传递 SQL 层与非普通物理复制对象的恢复语义。晋升时，physical fence 把两条通道重新对齐。
+        </p>
+
+        <figure class="diagram">
+          <figcaption>图 2 · 真实上线形态：物理数据面与事务语义面并行</figcaption>
+          <svg viewBox="0 0 1100 560" role="img" aria-label="源 mysqld、物理复制、Preserve Transfer、目标 mysqld 和 HA coordinator 的生产拓扑">
+            <defs>
+              <marker id="arrow-topology" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#667984"/></marker>
+              <marker id="arrow-topology-teal" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#087f76"/></marker>
+              <marker id="arrow-topology-blue" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#35658a"/></marker>
+            </defs>
+            <rect x="28" y="46" width="300" height="430" rx="6" fill="#f8faf9" stroke="#8fb49b" stroke-width="2"/>
+            <text x="178" y="82" text-anchor="middle" font-size="20" font-weight="700" fill="#244d37">源端 mysqld</text>
+            <rect x="55" y="112" width="246" height="66" rx="4" fill="#fff" stroke="#aeb8c1"/>
+            <text x="178" y="139" text-anchor="middle" font-size="14" font-weight="700">业务 THD / active trx</text>
+            <text x="178" y="160" text-anchor="middle" font-size="11" fill="#5d6873">SQL · InnoDB · binlog · temp table</text>
+            <rect x="55" y="206" width="246" height="76" rx="4" fill="#eaf3ed" stroke="#3b7a57"/>
+            <text x="178" y="235" text-anchor="middle" font-size="14" font-weight="700" fill="#2f6747">Batch drain + preserve kernel</text>
+            <text x="178" y="258" text-anchor="middle" font-size="11" fill="#52635a">prepare · detach · bundle · epoch</text>
+            <rect x="55" y="314" width="246" height="66" rx="4" fill="#e5f4f2" stroke="#087f76"/>
+            <text x="178" y="341" text-anchor="middle" font-size="14" font-weight="700" fill="#075f58">Transfer sender</text>
+            <text x="178" y="362" text-anchor="middle" font-size="11" fill="#42645f">frame / HMAC ACK / retry</text>
+            <rect x="55" y="409" width="246" height="42" rx="4" fill="#eef2f3" stroke="#aeb8c1"/>
+            <text x="178" y="435" text-anchor="middle" font-size="12" fill="#43505b">源物理数据与 redo</text>
+
+            <rect x="772" y="46" width="300" height="430" rx="6" fill="#f7f9fb" stroke="#8ba9bf" stroke-width="2"/>
+            <text x="922" y="82" text-anchor="middle" font-size="20" font-weight="700" fill="#294f6b">目标 / 备端 mysqld</text>
+            <rect x="799" y="112" width="246" height="66" rx="4" fill="#fff" stroke="#aeb8c1"/>
+            <text x="922" y="139" text-anchor="middle" font-size="14" font-weight="700">Receiver authenticated spool</text>
+            <text x="922" y="160" text-anchor="middle" font-size="11" fill="#5d6873">identity · sequence · digest · append</text>
+            <rect x="799" y="206" width="246" height="76" rx="4" fill="#e5f4f2" stroke="#087f76"/>
+            <text x="922" y="235" text-anchor="middle" font-size="14" font-weight="700" fill="#075f58">Async prewarm + registry</text>
+            <text x="922" y="258" text-anchor="middle" font-size="11" fill="#42645f">lock plan · binlog handle · leases</text>
+            <rect x="799" y="314" width="246" height="66" rx="4" fill="#fff3d8" stroke="#a56200"/>
+            <text x="922" y="341" text-anchor="middle" font-size="14" font-weight="700" fill="#774900">Promotion gate</text>
+            <text x="922" y="362" text-anchor="middle" font-size="11" fill="#705f45">physical fence · adopt prepared trx</text>
+            <rect x="799" y="409" width="246" height="42" rx="4" fill="#eaf3ed" stroke="#3b7a57"/>
+            <text x="922" y="435" text-anchor="middle" font-size="12" fill="#2f6747">Protected THD attach / ACTIVE</text>
+
+            <path d="M328 430 C470 430, 625 430, 772 430" fill="none" stroke="#35658a" stroke-width="5" marker-end="url(#arrow-topology-blue)"/>
+            <text x="550" y="418" text-anchor="middle" font-size="12" font-weight="700" fill="#2d5e82">物理复制 / redo apply 数据面</text>
+
+            <path d="M328 347 C470 347, 625 146, 772 146" fill="none" stroke="#087f76" stroke-width="4" marker-end="url(#arrow-topology-teal)"/>
+            <path d="M772 166 C625 166, 480 364, 328 364" fill="none" stroke="#087f76" stroke-width="2" stroke-dasharray="7 5" marker-end="url(#arrow-topology-teal)"/>
+            <text x="550" y="247" text-anchor="middle" font-size="12" font-weight="700" fill="#066b63">Preserve Transfer 语义面</text>
+            <text x="550" y="266" text-anchor="middle" font-size="11" fill="#42645f">phase1 objects · final bundle · epoch fact / authenticated ACK</text>
+
+            <rect x="416" y="36" width="268" height="86" rx="5" fill="#eaf1f6" stroke="#35658a"/>
+            <text x="550" y="68" text-anchor="middle" font-size="16" font-weight="700" fill="#294f6b">外部 HA 协调器</text>
+            <text x="550" y="92" text-anchor="middle" font-size="11" fill="#53636f">冻结 apply · 提供 fence lease · 调用 gate / attach</text>
+            <path d="M684 79 C735 79, 744 320, 799 342" fill="none" stroke="#35658a" stroke-width="2" marker-end="url(#arrow-topology)"/>
+          </svg>
+          <div class="legend">
+            <span><i style="background:#35658a"></i>物理数据复制</span>
+            <span><i style="background:#087f76"></i>Preserve 语义与工件传输</span>
+            <span><i style="background:#a56200"></i>晋升时的短临界区</span>
+          </div>
+        </figure>
+
+        <div class="boundary">
+          <strong>HA 集成边界</strong>
+          当前仓库提供 transfer receiver、prepared registry、physical fence provider 接口、promotion gate 和 protected THD attach core。
+          物理复制拓扑、apply 冻结时机、fence provider 的生产注册，以及何时调用 strict gate/attach，由外部 HA 编排组件负责；
+          仓库内没有注册 production fence provider 或调用 strict physical gate 的生产入口。
+          仓库内的 <code>plugin/test_preserve_trx_promotion</code> 展示 attach 调用方式，但它是测试插件，不是生产 HA 控制器。
+        </div>
+      </section>
+
+      <section id="lifecycle">
+        <h2>4. 全链路总览</h2>
+        <p class="section-lead">
+          生产路径要把“长时间准备”和“晋升时必须串行完成的动作”分开。源端业务仍在运行时尽量复制大对象；
+          备端在线时尽量完成解码和资源准备；真正的 promotion gate 只做事实核对、prepared trx 认领和对象挂接。
+        </p>
+        <figure class="diagram">
+          <figcaption>图 3 · 从业务事务到目标连接继续执行</figcaption>
+          <div class="flow-row" aria-label="Preserve Resume 全链路步骤">
+            <div class="flow-step phase1"><b>1. Phase 1</b>业务继续运行<br><small>warmcopy / declare</small></div>
+            <div class="flow-step phase2"><b>2. Close admission</b>关闭新事务/锁入口<br><small>quiesce targets</small></div>
+            <div class="flow-step phase2"><b>3. Preserve</b>prepare + detach<br><small>bundle / final objects</small></div>
+            <div class="flow-step durable"><b>4. Commit epoch</b>发布最终事实<br><small>source fence LSN</small></div>
+            <div class="flow-step phase1"><b>5. Receiver</b>认证并追加 spool<br><small>verify / idempotency</small></div>
+            <div class="flow-step phase1"><b>6. Prewarm</b>准备锁与 binlog<br><small>reserve resources</small></div>
+            <div class="flow-step external"><b>7. Physical fence</b>物理副本冻结<br><small>HA proof lease</small></div>
+            <div class="flow-step phase2"><b>8. Gate adopt</b>认领 prepared trx<br><small>ADOPTED_LOCKED</small></div>
+            <div class="flow-step durable"><b>9. THD attach</b>恢复会话语义<br><small>ATTACHING → ACTIVE</small></div>
+          </div>
+        </figure>
+
+        <div class="grid-2">
+          <article class="panel">
+            <h3>冷路径做什么</h3>
+            <p>大文件传输、摘要计算、snapshot 解码、record-lock plan 构建、binlog cache 文件打开与容量预留，尽量在源端 phase 1 或接收端 prewarm 阶段完成。</p>
+          </article>
+          <article class="panel">
+            <h3>晋升门里只留下什么</h3>
+            <p>验证 physical fence 与 final facts，取得独占 lease，按 token 认领物理 prepared trx，挂接已经准备好的锁/缓存对象，持久记录所有权变化。</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="source-drain">
+        <h2>5. 源端批量 Drain</h2>
+        <p class="section-lead">
+          <code>DRAIN TRANSACTIONS PRESERVE</code> 是生产路径的总控入口。它不只是遍历连接逐个执行 preserve，
+          而是一个带 admission gate、参与者协议、目标集合复核和失败清理的两阶段编排器。
+        </p>
+
+        <h3>5.1 管理器状态与阻塞边界</h3>
+        <figure class="diagram">
+          <figcaption>图 4 · Batch drain 的主状态迁移</figcaption>
+          <div class="flow-row">
+            <div class="flow-step durable"><b>IDLE</b>无 owner</div>
+            <div class="flow-step phase1"><b>WARMCOPY_DRAINING</b>开放 phase 1<br><small>普通业务命令仍允许</small></div>
+            <div class="flow-step phase2"><b>WARMCOPY_CLOSING</b>先发布 gate<br><small>阻止新事务/锁创建</small></div>
+            <div class="flow-step phase2"><b>BATCH_DRAINING</b>目标静默、seal、preserve</div>
+            <div class="flow-step durable"><b>SHUTDOWN_REQUESTED</b>token/epoch 交接完成</div>
+          </div>
+        </figure>
+        <p>
+          <code>WARMCOPY_DRAINING</code> 期间，warmcopy 参与者可以追踪仍在变化的 binlog cache、record locks 和临时表，普通业务命令继续执行。
+          Table/predicate/AUTO_INC lock 主要在 phase 2 导出并做 canonical/ownership 核对，不应理解为都具备同样的原生 delta hook。
+          进入 <code>WARMCOPY_CLOSING</code> 时先对 SQL 与协议命令发布阻塞边界，再等待已经放行的语句结束；这样不会出现“扫描完目标后又冒出新事务”的窗口。
+          每个目标 THD 还有自己的 batch 状态，最终变成 <code>PRESERVED_DRAINED</code> 后不再接受业务命令。
+        </p>
+
+        <h3>5.2 两阶段参与者协议</h3>
+        <ol class="numbered">
+          <li><b>建立 generation 与目标候选集。</b> 记录这一轮 drain 的 owner、代际和目标 thread id；standby transfer 同时打开 source epoch 并声明 token。</li>
+          <li><b>打开 phase 1 参与者。</b> Binlog warmcopy、record-lock warmcopy、temporary-table phase1 在业务继续运行时复制基线并记录增量。</li>
+          <li><b>关闭 admission。</b> 先将全局状态推进到 <code>WARMCOPY_CLOSING</code>，然后停止新的 mirror/admission，等待在途危险语句退出。</li>
+          <li><b>固定目标集合。</b> 重新枚举并 pin 目标 THD，检查连接、事务形态、容量和 participant 状态，防止 phase 1 声明集与 phase 2 实际集漂移。</li>
+          <li><b>Seal 与 preflight。</b> 各参与者冻结最终代际，核对 canonical digest、尾部大小、MDL/锁/临时表约束；此时尚未进入每个事务的 engine prepare。</li>
+          <li><b>并行 preserve。</b> worker 在受控 THD 上调用同一个 preserve kernel；standby 模式使用预选 token，把 final bundle 和对象写入 source epoch sink。</li>
+          <li><b>提交 epoch 并交接 shutdown。</b> 所有 token 成功后发布 epoch fact 与 <code>COMMIT_EPOCH</code>。在此之前失败会走 participant abort、事务 reattach/rollback 和工件清理。</li>
+        </ol>
+
+        <h3>5.3 为什么要 warmcopy</h3>
+        <p>
+          单阶段方案会在全局阻塞窗口内读取完整 binlog cache、扫描大量 record lock、复制临时表空间。事务越大，停顿越长。
+          warmcopy 把绝大多数字节和索引构建搬到 phase 1，只在 close 后处理最后一小段增量并做不可变性核对。
+          它不是降低校验标准：phase 2 仍要用 freeze generation、canonical digest 和最终 fence 证明 phase 1 产物与被 preserve 的事务完全对应。
+        </p>
+        <div class="source-ref"><b>主要源码：</b> <code>sql/preserve_trx.cc</code> 的 <code>Preserve_trx_drain_service::execute()</code>、manager/admission gate、batch target pin；<code>sql/preserve_trx_drain.*</code>；<code>sql/preserve_trx_warmcopy.*</code>；<code>sql/preserve_trx_lock_warmcopy.*</code>；<code>sql/preserve_trx_temp_table.*</code>。</div>
+      </section>
+
+      <section id="kernel">
+        <h2>6. Preserve 内核</h2>
+        <p class="section-lead">
+          单事务命令和 batch drain 最终都进入 <code>preserve_trx_kernel_preserve_attached_transaction()</code>。
+          统一内核的意义是：两种入口必须保存同一套事务语义，也必须遵循同一条 durable ownership 边界。
+        </p>
+
+        <figure class="diagram">
+          <figcaption>图 5 · 共享 preserve kernel 的阶段与 durable boundary</figcaption>
+          <div class="flow-row">
+            <div class="flow-step phase1"><b>VALIDATION</b>SQL / session / engine</div>
+            <div class="flow-step phase1"><b>BINLOG_PREFLIGHT</b>格式与 cache 形态</div>
+            <div class="flow-step phase1"><b>LOCK_PREFLIGHT</b>read view / MDL / locks</div>
+            <div class="flow-step phase2"><b>UNDO_PREPARE</b>进入引擎 prepare 边界</div>
+            <div class="flow-step phase2"><b>DETACH</b>原 THD 交出事务</div>
+            <div class="flow-step durable"><b>SNAPSHOT_WRITE</b>认证快照与 blobs</div>
+            <div class="flow-step durable"><b>RECORD_REGISTER</b>token 可观察</div>
+            <div class="flow-step durable"><b>COMPLETE</b>kernel 所有权稳定</div>
+          </div>
+        </figure>
+
+        <div class="note">
+          <strong>Snapshot 发布与 token 可用不是一个提交点</strong>
+          单事务路径在 kernel 完成后进入 <code>TOKEN_DELIVERY</code>；只有 SQL OK 确实送达客户端，
+          <code>preserved_trx_finalize_statement_response()</code> 才把 record 标记为 resumable 并请求 shutdown。
+          响应交付失败时，pending token 不能直接当作可恢复凭据。Batch 路径则由 manager 统一持有并交付 token/epoch 结果。
+        </div>
+
+        <h3>6.1 durable boundary 前后，失败含义不同</h3>
+        <div class="grid-2">
+          <article class="panel">
+            <span class="tag green">prepare 之前</span>
+            <h3>拒绝即可</h3>
+            <p>事务仍由原 THD 持有。任何不支持的语义、容量超限、warmcopy 不一致都应尽量在这里发现，命令报错后业务事务仍可继续处理。</p>
+          </article>
+          <article class="panel">
+            <span class="tag amber">prepare / detach 之后</span>
+            <h3>必须显式处置所有权</h3>
+            <p>事务已经跨过引擎持久边界，不能只返回错误。实现需要 reattach、rollback，或留下可观察且可恢复的 token；snapshot/sidecar 的清理结果也要进入状态判断。</p>
+          </article>
+        </div>
+
+        <h3>6.2 实际保存的事务语义</h3>
+        <p>
+          内核先把活动 InnoDB 事务映射为 Preserve 专用 XID 并 prepare，再从原 THD detach；此时引擎状态仍是 <code>PREPARED</code>。
+          <code>claim</code> 发生在本地恢复或 promotion adopt 阶段，才把事务推进为进程内独占的 <code>PRESERVED</code>；它和 SQL 层 snapshot 是否已发布是两件事。
+          之后构造 bundle：事务隔离级别与读视图、表和记录锁、predicate lock、AUTO_INCREMENT 锁、MDL、修改表权限掩码、SQL/InnoDB savepoint 拓扑、
+          binlog 四态与 cache、GTID、session 状态、可选 user variables，以及临时表 manifest。只有这些对象形成一致整体，恢复后的事务才与原连接语义相同。
+        </p>
+        <p>
+          当前实现要求 <code>ROW</code> binlog format。原因不是“方便序列化”，而是事务恢复后仍可能继续产生 binlog，
+          系统必须能把原 cache 的字节和写入语义安全地交给新 THD；statement/mixed 模式会把更多隐含会话执行上下文带入合同。
+        </p>
+
+        <h3>6.3 Local record lifecycle</h3>
+        <p>
+          SQL 层每个本地 record 还有一套与 manager、InnoDB state、strict registry 都不同的生命周期：
+          <code>DRAINING</code> / <code>SNAPSHOTTING</code> 表示发布中，<code>PRESERVED</code> 是普通稳定态，
+          <code>ADOPTED_FOR_PROMOTION</code> 只能交给受保护的 promotion attach，<code>RESUMING</code> / <code>ROLLING_BACK</code>
+          表示 record 已被删除式领取；过期与失败状态留给 reaper 和可观察清理。
+          <code>resumable</code> 是独立 claim gate，不应仅根据 lifecycle 名称推断 token 已可被 SQL RESUME 使用。
+        </p>
+        <div class="source-ref"><b>主要源码：</b> <code>sql/preserve_trx.cc</code> 的 <code>preserve_trx_kernel_preserve_attached_transaction()</code> 与 <code>Preserve_trx_preserve_stage</code>；<code>storage/innobase/trx/trx0preserve.cc</code>。</div>
+      </section>
+
+      <section id="artifacts">
+        <h2>7. Bundle 与工件</h2>
+        <p class="section-lead">
+          Bundle 是逻辑恢复契约，carrier 是文件放置与原子发布机制。二者分开后，单机本地保存、warmcopy 预建对象和跨机 transfer 可以复用同一套语义编码，而不必共享同一种落盘路径。
+        </p>
+
+        <figure class="diagram">
+          <figcaption>图 6 · 本地 snapshot envelope 与外部对象</figcaption>
+          <svg viewBox="0 0 1080 500" role="img" aria-label="Snapshot v9 头部、TLV、外部 blob 与临时表 sidecar 结构">
+            <rect x="28" y="42" width="1024" height="94" rx="5" fill="#17343b"/>
+            <text x="52" y="74" font-size="16" font-weight="700" fill="#fff">&lt;token&gt;.bin · format v9 · magic MSP_PRES</text>
+            <text x="52" y="103" font-size="12" fill="#dce9eb">552-byte fixed header · server UUID · datadir fingerprint · owner / time / flags · HMAC · CRC</text>
+
+            <rect x="28" y="154" width="1024" height="132" rx="5" fill="#f8fafb" stroke="#aeb8c1"/>
+            <text x="52" y="184" font-size="15" font-weight="700" fill="#34424c">Authenticated TLV payload</text>
+            <g font-size="11" fill="#34424c">
+              <rect x="52" y="205" width="148" height="48" rx="3" fill="#eaf3ed" stroke="#9fc4ad"/><text x="126" y="225" text-anchor="middle">0x10–0x12</text><text x="126" y="242" text-anchor="middle">InnoDB / tables</text>
+              <rect x="216" y="205" width="148" height="48" rx="3" fill="#eaf1f6" stroke="#a9c3d5"/><text x="290" y="225" text-anchor="middle">0x20</text><text x="290" y="242" text-anchor="middle">Read view</text>
+              <rect x="380" y="205" width="148" height="48" rx="3" fill="#fff3d8" stroke="#dfc079"/><text x="454" y="225" text-anchor="middle">0x30–0x32</text><text x="454" y="242" text-anchor="middle">Lock families</text>
+              <rect x="544" y="205" width="148" height="48" rx="3" fill="#eef2f3" stroke="#b7c1c8"/><text x="618" y="225" text-anchor="middle">0x40–0x42</text><text x="618" y="242" text-anchor="middle">Savepoints</text>
+              <rect x="708" y="205" width="148" height="48" rx="3" fill="#e5f4f2" stroke="#86c9c1"/><text x="782" y="225" text-anchor="middle">0x50–0x54</text><text x="782" y="242" text-anchor="middle">Session / MDL</text>
+              <rect x="872" y="205" width="148" height="48" rx="3" fill="#eaf1f6" stroke="#a9c3d5"/><text x="946" y="225" text-anchor="middle">0x60–0x81</text><text x="946" y="242" text-anchor="middle">Binlog / temp / blobs</text>
+            </g>
+
+            <text x="28" y="332" font-size="15" font-weight="700" fill="#34424c">大对象与物理 sidecars</text>
+            <rect x="28" y="354" width="300" height="94" rx="5" fill="#e5f4f2" stroke="#087f76"/>
+            <text x="178" y="385" text-anchor="middle" font-size="14" font-weight="700" fill="#075f58">&lt;token&gt;.binlog_cache</text>
+            <text x="178" y="410" text-anchor="middle" font-size="11" fill="#42645f">可由 warmcopy 预建并原子 adopt</text>
+            <text x="178" y="428" text-anchor="middle" font-size="11" fill="#42645f">descriptor 进入 authenticated TLV</text>
+
+            <rect x="390" y="354" width="300" height="94" rx="5" fill="#fff3d8" stroke="#a56200"/>
+            <text x="540" y="385" text-anchor="middle" font-size="14" font-weight="700" fill="#774900">record_locks external blob</text>
+            <text x="540" y="410" text-anchor="middle" font-size="11" fill="#705f45">稳定页标识 · bitmap · generation</text>
+            <text x="540" y="428" text-anchor="middle" font-size="11" fill="#705f45">可直接传输并构建 prepared plan</text>
+
+            <rect x="752" y="354" width="300" height="94" rx="5" fill="#eaf1f6" stroke="#35658a"/>
+            <text x="902" y="385" text-anchor="middle" font-size="14" font-weight="700" fill="#294f6b">&lt;token&gt;.tempts.&lt;space&gt;.*</text>
+            <text x="902" y="410" text-anchor="middle" font-size="11" fill="#53636f">临时表镜像、no-redo undo、manifest</text>
+            <text x="902" y="428" text-anchor="middle" font-size="11" fill="#53636f">独立 ownership 与完整性证明</text>
+          </svg>
+        </figure>
+
+        <h3>7.1 本地 snapshot 不是跨机格式</h3>
+        <p>
+          本地 v9 snapshot 使用 HMAC 与 CRC，并绑定创建它的 server UUID 和 datadir fingerprint。这个绑定防止把另一实例的本地文件误当作可恢复对象。
+          因此跨机路径没有直接复制本地 <code>.bin</code> 文件，而是通过 portable transfer manifest 描述对象、端点身份、LSN 和摘要，
+          在接收端做语义验证与目标侧发布。
+        </p>
+
+        <h3>7.2 prebuilt 的含义</h3>
+        <p>
+          Bundle builder 同时支持 live payload 和 prebuilt blob，但同一对象族不能混用两种表示。
+          <code>prebuilt=true</code> 表示 warmcopy 已把对象主体持久化，carrier 只需要验证 descriptor 后通过 rename/adopt 发布；
+          它不代表跳过最终语义校验。record lock 和 binlog cache 可以各自独立选择 prebuilt 路径。
+        </p>
+        <div class="source-ref"><b>主要源码：</b> <code>sql/preserve_trx_bundle.*</code>；<code>sql/preserve_trx_carrier.*</code>；<code>sql/preserve_trx_carrier_file.cc</code>；<code>sql/preserve_trx_temp_table_carrier.*</code>。</div>
+      </section>
+
+      <section id="transfer">
+        <h2>8. 在线传输协议</h2>
+        <p class="section-lead">
+          Transfer 不是通用文件复制协议。它把一个 drain generation 里的 token、对象和最终物理事实组织为可重试、可验证、可原子提交的 epoch。
+          网络 ACK 在接收端完成身份/序列校验并追加 receiver spool 后返回；epoch 的 crash-durable 提交点则由同步落盘的 fact 与 commit marker 提供。
+        </p>
+
+        <figure class="diagram">
+          <figcaption>图 7 · Frame、认证 ACK 与异步语义应用</figcaption>
+          <svg viewBox="0 0 1080 650" role="img" aria-label="源端 sender、接收端 dispatcher、receiver spool、semantic apply 和 prewarm worker 时序">
+            <defs><marker id="arrow-transfer" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#667984"/></marker></defs>
+            <g font-size="13" font-weight="700" fill="#34424c">
+              <text x="120" y="34" text-anchor="middle">Source epoch session</text>
+              <text x="390" y="34" text-anchor="middle">Receiver dispatcher</text>
+              <text x="660" y="34" text-anchor="middle">Receiver spool</text>
+              <text x="930" y="34" text-anchor="middle">Apply / prewarm workers</text>
+            </g>
+            <g stroke="#c3cbd1" stroke-width="1" stroke-dasharray="4 5">
+              <line x1="120" y1="48" x2="120" y2="620"/><line x1="390" y1="48" x2="390" y2="620"/><line x1="660" y1="48" x2="660" y2="620"/><line x1="930" y1="48" x2="930" y2="620"/>
+            </g>
+            <g font-size="11" fill="#44515b">
+              <path d="M120 88 L390 88" stroke="#087f76" stroke-width="2" marker-end="url(#arrow-transfer)"/><text x="255" y="78" text-anchor="middle">DECLARE_TOKEN / DECLARE_OBJECT</text>
+              <path d="M390 112 L660 112" stroke="#667984" stroke-width="2" marker-end="url(#arrow-transfer)"/><text x="525" y="102" text-anchor="middle">identity + sequence admission</text>
+              <path d="M660 142 L390 142" stroke="#667984" stroke-width="2" marker-end="url(#arrow-transfer)"/><text x="525" y="132" text-anchor="middle">append + close completed</text>
+              <path d="M390 170 L120 170" stroke="#087f76" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow-transfer)"/><text x="255" y="160" text-anchor="middle">HMAC ACK(sequence, frame digest)</text>
+
+              <path d="M120 225 L390 225" stroke="#087f76" stroke-width="2" marker-end="url(#arrow-transfer)"/><text x="255" y="215" text-anchor="middle">OBJECT_CHUNK × N</text>
+              <path d="M390 249 L660 249" stroke="#667984" stroke-width="2" marker-end="url(#arrow-transfer)"/><text x="525" y="239" text-anchor="middle">append frame + stage ranges</text>
+              <path d="M660 279 L390 279" stroke="#667984" stroke-width="2" marker-end="url(#arrow-transfer)"/>
+              <path d="M390 307 L120 307" stroke="#087f76" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow-transfer)"/><text x="255" y="297" text-anchor="middle">authenticated ACK / retry-safe</text>
+              <path d="M660 326 L930 326" stroke="#35658a" stroke-width="2" marker-end="url(#arrow-transfer)"/><text x="795" y="316" text-anchor="middle">async object apply / prewarm</text>
+
+              <path d="M120 385 L390 385" stroke="#087f76" stroke-width="2" marker-end="url(#arrow-transfer)"/><text x="255" y="375" text-anchor="middle">SEAL_OBJECT / final manifest</text>
+              <path d="M390 411 L660 411" stroke="#667984" stroke-width="2" marker-end="url(#arrow-transfer)"/><text x="525" y="401" text-anchor="middle">size + SHA-256 + manifest check</text>
+              <path d="M660 441 L930 441" stroke="#35658a" stroke-width="2" marker-end="url(#arrow-transfer)"/><text x="795" y="431" text-anchor="middle">bind object proof</text>
+
+              <path d="M120 500 L390 500" stroke="#a56200" stroke-width="3" marker-end="url(#arrow-transfer)"/><text x="255" y="488" text-anchor="middle" font-weight="700">COMMIT_EPOCH + epoch fact</text>
+              <path d="M390 526 L660 526" stroke="#a56200" stroke-width="2" marker-end="url(#arrow-transfer)"/><text x="525" y="516" text-anchor="middle">durable commit marker</text>
+              <path d="M660 556 L930 556" stroke="#a56200" stroke-width="2" marker-end="url(#arrow-transfer)"/><text x="795" y="546" text-anchor="middle">bind final facts / committed-epoch job</text>
+              <path d="M390 590 L120 590" stroke="#087f76" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow-transfer)"/><text x="255" y="580" text-anchor="middle">commit ACK</text>
+            </g>
+          </svg>
+        </figure>
+
+        <h3>8.1 协议对象</h3>
+        <p>
+          Standby 远端交付只由 batch manager 选择：<code>CLIENT_TOKEN_DELIVERY</code> 的单连接
+          <code>PREPARE SHUTDOWN PRESERVE TRANSACTION</code> 不能进入 <code>STANDBY_TRANSFER_SAVE</code>。
+          源 mysqld 通过 libmysql 连接接收端；一个 epoch 使用一条严格有序连接，因为 sequence 是 epoch 级单调序列。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>对象</th><th>关键字段</th><th>作用</th></tr></thead>
+            <tbody>
+              <tr><td><code>Transfer manifest</code></td><td>epoch、source/target UUID、token、sequence、prepare/commit LSN、object descriptors</td><td>描述单个 token 的可移植对象集合，不重新解释 bundle 内部语义。</td></tr>
+              <tr><td><code>Object descriptor</code></td><td>object id、kind、flags、total size、SHA-256</td><td>对象身份与完整性合同；kind 枚举包括 snapshot bundle、external blob、temp-table sidecar。当前 portable sender 对非空 temp-table manifest 返回 <code>UNSUPPORTED</code>。</td></tr>
+              <tr><td><code>Epoch fact</code></td><td>source fence LSN、每 token 最终 manifest/object/LSN 事实、fact digest</td><td>把提前到达的 phase1 对象与最终 preserve 结果绑定为一个提交单元。</td></tr>
+              <tr><td><code>Frame ACK</code></td><td>source incarnation、epoch、sequence、frame digest、status、HMAC</td><td>确认对应 frame 已通过认证并追加到 receiver spool；相同 sequence 的重试可判定为 pending 或 already applied。它本身不是 crash-durability 证明。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>8.2 ACK、spool 与 epoch 提交点</h3>
+        <p>
+          当前路径先校验 source/target 身份、协议版本、序列与摘要，把 frame 追加到
+          <code>&lt;preserve_dir&gt;/.transfer/&lt;epoch&gt;/receiver.frames</code> 并关闭文件，再返回带 HMAC 的 ACK。
+          这里的 append 没有执行文件或目录同步，因此 ACK 表示已认证、已写入接收 spool，不能解释为断电后必然可重放。
+          后续语义应用和 prewarm 可以异步进行；它们失败不会伪造网络接收成功，但会阻止 token 进入 <code>READY_FOR_GATE</code>。
+        </p>
+        <p>
+          <code>epoch.fact</code> 与 <code>epoch.commit</code> 使用临时文件、文件同步、rename 和目录同步，才构成 epoch 的持久提交事实。
+          普通启动路径目前不会自动调用 <code>preserve_trx_transfer_replay_receiver_spool()</code> 重建 strict registry；
+          receiver spool、commit fact 和进程内 prepared resources 是三个不同层次的状态。
+        </p>
+        <p>
+          接收端的 transfer registry 与本地 <code>g_preserved_trx_records</code> 分离。<code>SAVED_ONLINE</code> 是 receiver-private 的终态之一，
+          不表示当前 mysqld 可以用普通 <code>RESUME PRESERVED TRANSACTION</code> 接管该 token。
+        </p>
+        <div class="source-ref"><b>主要源码：</b> <code>sql/preserve_trx_transfer.*</code> 的 frame/manifest/epoch fact、<code>Preserve_trx_transfer_source_epoch_session</code>、receiver registry、classic command dispatcher 与 prewarm worker。</div>
+      </section>
+
+      <section id="prewarm">
+        <h2>9. 接收端预热</h2>
+        <p class="section-lead">
+          接收端预热不是“把文件读进 page cache”这么简单。它把 token 从已接收的字节集合推进为可被 promotion gate 原子认领的 prepared resource set，
+          同时保留足够的 final facts，让 gate 不需要重新扫描冷工件。
+        </p>
+
+        <figure class="diagram">
+          <figcaption>图 8 · 对象到达、预热和最终事实绑定</figcaption>
+          <svg viewBox="0 0 1080 430" role="img" aria-label="接收端对象预热流水线">
+            <defs><marker id="arrow-prewarm" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#667984"/></marker></defs>
+            <g font-size="13" text-anchor="middle">
+              <rect x="28" y="65" width="190" height="90" rx="5" fill="#eef2f3" stroke="#89969f"/>
+              <text x="123" y="98" font-weight="700">Phase1 objects</text><text x="123" y="123" font-size="11" fill="#5d6873">record locks / binlog / temp</text>
+              <rect x="265" y="65" width="190" height="90" rx="5" fill="#eaf1f6" stroke="#35658a"/>
+              <text x="360" y="98" font-weight="700" fill="#294f6b">Object proof</text><text x="360" y="123" font-size="11" fill="#53636f">digest · size · generation</text>
+              <rect x="502" y="65" width="240" height="90" rx="5" fill="#e5f4f2" stroke="#087f76"/>
+              <text x="622" y="96" font-weight="700" fill="#075f58">Prepared resources</text><text x="622" y="120" font-size="11" fill="#42645f">lock plan · native binlog handle</text><text x="622" y="138" font-size="11" fill="#42645f">semantic bundle · reservations</text>
+              <rect x="789" y="65" width="262" height="90" rx="5" fill="#fff3d8" stroke="#a56200"/>
+              <text x="920" y="98" font-weight="700" fill="#774900">PREWARMED_PENDING_FINAL_FACT</text><text x="920" y="123" font-size="11" fill="#705f45">对象已准备，等待最终 epoch 事实</text>
+              <path d="M218 110 L265 110" stroke="#667984" stroke-width="2" marker-end="url(#arrow-prewarm)"/><path d="M455 110 L502 110" stroke="#667984" stroke-width="2" marker-end="url(#arrow-prewarm)"/><path d="M742 110 L789 110" stroke="#667984" stroke-width="2" marker-end="url(#arrow-prewarm)"/>
+
+              <rect x="188" y="250" width="250" height="92" rx="5" fill="#fff3d8" stroke="#a56200"/>
+              <text x="313" y="283" font-weight="700" fill="#774900">Epoch fact / final manifest</text><text x="313" y="308" font-size="11" fill="#705f45">LSN + physical digests + object set</text>
+              <rect x="510" y="250" width="250" height="92" rx="5" fill="#eef2f3" stroke="#89969f"/>
+              <text x="635" y="283" font-weight="700">Bind final facts + leases</text><text x="635" y="308" font-size="11" fill="#5d6873">boot incarnation / capacity / deadlines</text>
+              <rect x="832" y="250" width="219" height="92" rx="5" fill="#e5f4f2" stroke="#087f76" stroke-width="2"/>
+              <text x="942" y="286" font-weight="700" fill="#075f58">READY_FOR_GATE</text><text x="942" y="311" font-size="11" fill="#42645f">promotion 可取得 adopt lease</text>
+              <path d="M438 296 L510 296" stroke="#667984" stroke-width="2" marker-end="url(#arrow-prewarm)"/><path d="M760 296 L832 296" stroke="#667984" stroke-width="2" marker-end="url(#arrow-prewarm)"/>
+              <path d="M920 155 C920 204, 760 212, 704 250" fill="none" stroke="#667984" stroke-width="2" marker-end="url(#arrow-prewarm)"/>
+            </g>
+          </svg>
+        </figure>
+
+        <h3>9.1 prepared resource set</h3>
+        <ul>
+          <li><b>Semantic bundle：</b>完成认证解码和语义校验，但不长期保留不需要的超大 payload 副本。</li>
+          <li><b>Record-lock metadata plan：</b>把外部锁对象解析成按页组织、可直接 import 的计划，并保留页布局与锁代际摘要。</li>
+          <li><b>Native binlog cache handle：</b>从 staging payload 准备可被目标 THD 直接接管的文件/handle，避免 resume 时重新水化和重写完整 cache。</li>
+          <li><b>Resource reservations：</b>按 epoch/token 预留 lock plan、binlog、内存和文件资源；没有资源 lease 的“ready”不会进入 gate。</li>
+        </ul>
+
+        <h3>9.2 严格 registry 状态机</h3>
+        <figure class="diagram">
+          <figcaption>图 9 · 正常主线与终止状态</figcaption>
+          <div class="state-lane">
+            <div>OBJECTS_<br>RECEIVING</div><div>PREWARMING</div><div>PREWARMED_<br>PENDING_<br>FINAL_FACT</div><div>READY_FACTS_<br>PENDING_LEASE</div><div class="ready">READY_<br>FOR_GATE</div><div class="gate">ADOPTING</div><div class="gate">ADOPTED_<br>LOCKED</div><div>ATTACHING</div><div>ACTIVATING</div><div class="active">ACTIVE</div>
+          </div>
+          <div class="state-side">
+            <div>NOT_READY / CORRUPT / RESOURCE_EXHAUSTED / STALE_GENERATION</div>
+            <div>ABANDONED_ROLLED_BACK / ABANDONED_NOT_FOUND_PROVEN</div>
+            <div>CLEANUP_PENDING / CLEANUP_ROLLED_BACK / CLEANUP_TAINTED</div>
+            <div>ATTACH_ROLLED_BACK / ATTACH_TAINTED / ACTIVE_ARTIFACTS_CLEANED</div>
+          </div>
+        </figure>
+        <p>
+          Registry key 不只包含 token，还包含 <code>preserve_dir</code>、source UUID、epoch id、target boot incarnation 和 generation。
+          这样可以拒绝旧进程、旧 epoch 或同名 token 的资源复用。prepare lease、gate adopt lease、attach lease 和 cleanup lease 让同一时刻只有一个所有者推进状态。
+        </p>
+        <div class="source-ref"><b>主要源码：</b> <code>sql/preserve_trx_promotion_prepared.*</code> 的 strict registry、final facts、resource leases；<code>sql/preserve_trx_transfer.cc</code> 的 receiver object/staged-token/committed-epoch prewarm jobs。</div>
+      </section>
+
+      <section id="promotion">
+        <h2>10. 物理晋升门</h2>
+        <p class="section-lead">
+          Promotion gate 的目标不是“在备端重新恢复一次所有工件”，而是在一个有物理一致性证明的短窗口内，
+          把已经预热好的 token 从 standby-pending 所有权转成 promotion-owned detached transaction。
+        </p>
+
+        <div class="boundary">
+          <strong>先区分两套 promotion 入口</strong>
+          协议帧 <code>PROMOTION_PREWARM_TOKEN</code> / <code>PROMOTION_GATE_EPOCH</code> 调用的是 legacy ready-cache + apply-barrier 路径，
+          最终进入 <code>preserved_trx_adopt_standby_pending_all_for_promotion()</code>。
+          本节流程图描述的是严格物理路径：<code>preserved_trx_adopt_prepared_epoch_for_physical_promotion()</code>
+          使用 strict registry 与 production physical-fence lease。两者共享部分工件与预热结果，但不是同一个 gate；当前仓库内没有 strict 路径的生产调用者。
+        </div>
+
+        <figure class="diagram">
+          <figcaption>图 10 · Physical fence、gate lease 与 prepared trx adopt</figcaption>
+          <svg viewBox="0 0 1080 620" role="img" aria-label="HA coordinator、fence provider、promotion gate、prepared registry 和 InnoDB adopt 时序">
+            <defs><marker id="arrow-promotion" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#667984"/></marker></defs>
+            <g font-size="13" font-weight="700" fill="#34424c">
+              <text x="100" y="34" text-anchor="middle">HA coordinator</text><text x="310" y="34" text-anchor="middle">Fence provider</text><text x="535" y="34" text-anchor="middle">Promotion gate</text><text x="770" y="34" text-anchor="middle">Prepared registry</text><text x="990" y="34" text-anchor="middle">InnoDB / restore kernel</text>
+            </g>
+            <g stroke="#c3cbd1" stroke-width="1" stroke-dasharray="4 5"><line x1="100" y1="48" x2="100" y2="590"/><line x1="310" y1="48" x2="310" y2="590"/><line x1="535" y1="48" x2="535" y2="590"/><line x1="770" y1="48" x2="770" y2="590"/><line x1="990" y1="48" x2="990" y2="590"/></g>
+            <g font-size="11" fill="#44515b">
+              <path d="M100 86 L310 86" stroke="#35658a" stroke-width="2" marker-end="url(#arrow-promotion)"/><text x="205" y="76" text-anchor="middle">freeze physical apply</text>
+              <path d="M310 118 L100 118" stroke="#35658a" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow-promotion)"/><text x="205" y="108" text-anchor="middle">proof: frozen LSN + digests</text>
+              <path d="M100 164 L535 164" stroke="#a56200" stroke-width="3" marker-end="url(#arrow-promotion)"/><text x="318" y="152" text-anchor="middle" font-weight="700">adopt_prepared_epoch(request, expected fence)</text>
+              <path d="M535 198 L310 198" stroke="#35658a" stroke-width="2" marker-end="url(#arrow-promotion)"/><text x="422" y="188" text-anchor="middle">acquire production fence lease</text>
+              <path d="M310 230 L535 230" stroke="#35658a" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow-promotion)"/><text x="422" y="220" text-anchor="middle">actual proof / provider generation</text>
+              <path d="M535 274 L770 274" stroke="#a56200" stroke-width="2" marker-end="url(#arrow-promotion)"/><text x="652" y="264" text-anchor="middle">begin gate adopt lease</text>
+              <path d="M770 306 L535 306" stroke="#a56200" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow-promotion)"/><text x="652" y="296" text-anchor="middle">READY_FOR_GATE + prepared resources</text>
+              <path d="M535 352 L990 352" stroke="#087f76" stroke-width="3" marker-end="url(#arrow-promotion)"/><text x="762" y="340" text-anchor="middle" font-weight="700">claim XID + import prepared objects</text>
+              <path d="M990 386 L535 386" stroke="#087f76" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow-promotion)"/><text x="762" y="376" text-anchor="middle">promotion-owned detached record</text>
+              <path d="M535 424 L310 424" stroke="#35658a" stroke-width="2" marker-end="url(#arrow-promotion)"/><text x="422" y="414" text-anchor="middle">revalidate fence lease</text>
+              <path d="M535 468 L770 468" stroke="#a56200" stroke-width="2" marker-end="url(#arrow-promotion)"/><text x="652" y="458" text-anchor="middle">commit adopt</text>
+              <path d="M770 500 L535 500" stroke="#a56200" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow-promotion)"/><text x="652" y="490" text-anchor="middle">ADOPTED_LOCKED</text>
+              <path d="M535 546 L100 546" stroke="#3b7a57" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow-promotion)"/><text x="318" y="536" text-anchor="middle">gate result / per-token status</text>
+            </g>
+          </svg>
+        </figure>
+
+        <h3>10.1 physical fence 证明什么</h3>
+        <p>
+          证明至少绑定 source lineage、target server/boot incarnation、provider generation、source fence LSN、target frozen LSN、epoch fact digest，
+          以及 final lock generation、page layout 和 dictionary generation 摘要。provider 通过 <code>acquire / revalidate / release</code> 租约维持证明有效期；
+          gate 在关键边界重新验证，避免 apply 在导入锁或认领事务时继续推进。
+        </p>
+
+        <h3>10.2 adopt 做什么</h3>
+        <p>
+          Gate 为整个 epoch 写 strict promotion intent，逐 token 取得 adopt lease，再调用共享 recover/adopt kernel：
+          按 Preserve XID claim prepared transaction，恢复 isolation/read view、table/record locks 和 detached MDL，注册 promotion-owned record，
+          最后把 registry 推进到 <code>ADOPTED_LOCKED</code>。此时事务还没有进入客户端 THD，也没有 ACTIVE。
+        </p>
+        <div class="source-ref"><b>主要源码：</b> <code>sql/preserve_trx_promotion.*</code> 的 <code>preserved_trx_adopt_prepared_epoch_for_physical_promotion()</code>；<code>sql/preserve_trx_promotion_prepared.*</code> 的 production physical fence provider；<code>sql/preserve_trx.cc</code> 的 shared recover/adopt kernel。</div>
+      </section>
+
+      <section id="attach">
+        <h2>11. 目标会话接管</h2>
+        <p class="section-lead">
+          Gate 完成后，事务仍是 promotion-owned detached 状态。真正的 resume 发生在一个受保护、状态干净的目标 THD 上：
+          先恢复 SQL 层语义和资源句柄，再跨过 InnoDB activation boundary。这个顺序决定了失败能否回滚到安全状态。
+        </p>
+
+        <figure class="diagram">
+          <figcaption>图 11 · Protected THD attach 的提交顺序</figcaption>
+          <div class="flow-row">
+            <div class="flow-step phase1"><b>Validate THD</b>pristine + protected handle</div>
+            <div class="flow-step phase2"><b>ATTACHING intent</b>取得 attach lease 与 record</div>
+            <div class="flow-step phase1"><b>Restore session</b>schema / vars / modes</div>
+            <div class="flow-step phase1"><b>Attach resources</b>MDL / GTID / binlog handle / temp</div>
+            <div class="flow-step phase2"><b>Attach InnoDB</b>trx + savepoints</div>
+            <div class="flow-step phase2"><b>ACTIVATING intent</b>持久标记激活边界</div>
+            <div class="flow-step durable"><b>Activate</b>undo / trx ownership</div>
+            <div class="flow-step durable"><b>ACTIVE</b>清理 snapshot / sidecars</div>
+          </div>
+        </figure>
+
+        <h3>11.1 为什么要 protected handle</h3>
+        <p>
+          attach 过程会替换目标 THD 的事务、MDL、GTID、binlog cache、session vars 和临时表命名空间。
+          API 接受 <code>Preserved_trx_peer_thd_handle</code> 而不是裸 <code>THD*</code>，要求调用方先建立受保护的生命周期与线程上下文，
+          防止连接在接管中途被普通协议路径并发使用或销毁。
+        </p>
+
+        <h3>11.2 activation boundary</h3>
+        <p>
+          在 <code>ACTIVATING</code> 之前，失败可以把已经挂到目标 THD 的对象逐项拆回 promotion-owned record，并保持 prepared transaction 不激活。
+          一旦 binlog ownership、undo 和 InnoDB trx 激活完成，系统就必须按 ACTIVE 所有权处理，不能再把它伪装成“从未 attach”。
+          strict attach intent 记录 <code>ATTACHING → ACTIVATING → ACTIVE</code>，让进程异常后仍能判断所有权停在哪一侧。
+        </p>
+
+        <h3>11.3 最终可见语义</h3>
+        <p>
+          成功后，新连接继承原事务需要的 schema、隔离级别、SQL mode、时区、autocommit 相关状态、GTID/binlog cache、MDL、read view、锁、savepoints 和临时表。
+          如果 preserve 时显式选择 <code>WITH USER VARS</code>，目标 THD 的 user variables 也按快照恢复；否则不恢复。
+          未选择 INCLUDE 时 bundle 不写 user-vars payload，resume 也不会顺手清空目标 THD 已有的 user variables。
+          客户端随后可以继续执行 DML、<code>COMMIT</code> 或 <code>ROLLBACK</code>。
+        </p>
+        <div class="source-ref"><b>主要源码：</b> <code>sql/preserve_trx.cc</code> 的 <code>preserved_trx_resume_adopted_for_promotion_on_thd()</code>；<code>sql/preserve_trx_promotion_prepared.*</code> 的 attach intent/lease；<code>plugin/test_preserve_trx_promotion</code> 的测试调用示例。</div>
+      </section>
+
+      <section id="local-recovery">
+        <h2>12. 本地启动恢复</h2>
+        <p class="section-lead">
+          本地 shutdown/restart 是另一条使用同一 bundle 和恢复内核的路径。它与 standby promotion 最大的区别不是“是否重启”，
+          而是工件身份和物理一致性证明：本地 snapshot 已绑定本实例 datadir；standby-pending 必须等外部 physical fence 后由 promotion gate adopt。
+        </p>
+
+        <figure class="diagram">
+          <figcaption>图 12 · Local recovery 与 standby promotion 的分叉</figcaption>
+          <svg viewBox="0 0 1080 470" role="img" aria-label="本地 snapshot 和 standby pending artifact 走不同恢复分支">
+            <defs><marker id="arrow-recovery" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#667984"/></marker></defs>
+            <rect x="410" y="30" width="260" height="72" rx="5" fill="#eef2f3" stroke="#7b8992"/>
+            <text x="540" y="60" text-anchor="middle" font-size="15" font-weight="700">mysqld startup / promotion event</text>
+            <text x="540" y="82" text-anchor="middle" font-size="11" fill="#5d6873">列举 preserve_dir 与 receiver state</text>
+
+            <rect x="60" y="170" width="350" height="88" rx="5" fill="#eaf3ed" stroke="#3b7a57"/>
+            <text x="235" y="201" text-anchor="middle" font-size="15" font-weight="700" fill="#2f6747">本地 authenticated snapshot</text>
+            <text x="235" y="225" text-anchor="middle" font-size="11" fill="#52635a">server UUID / datadir fingerprint 匹配</text>
+            <text x="235" y="243" text-anchor="middle" font-size="11" fill="#52635a">ordinary startup recovery 可读取</text>
+
+            <rect x="670" y="170" width="350" height="88" rx="5" fill="#fff3d8" stroke="#a56200"/>
+            <text x="845" y="201" text-anchor="middle" font-size="15" font-weight="700" fill="#774900">Standby-pending epoch</text>
+            <text x="845" y="225" text-anchor="middle" font-size="11" fill="#705f45">receiver registry / commit fact / prepared resources</text>
+            <text x="845" y="243" text-anchor="middle" font-size="11" fill="#705f45">ordinary local recovery 明确跳过</text>
+
+            <rect x="60" y="338" width="350" height="88" rx="5" fill="#e5f4f2" stroke="#087f76"/>
+            <text x="235" y="370" text-anchor="middle" font-size="15" font-weight="700" fill="#075f58">preserved_trx_recover_all()</text>
+            <text x="235" y="394" text-anchor="middle" font-size="11" fill="#42645f">claim XID · import semantics · register PRESERVED</text>
+
+            <rect x="670" y="338" width="350" height="88" rx="5" fill="#eaf1f6" stroke="#35658a"/>
+            <text x="845" y="370" text-anchor="middle" font-size="15" font-weight="700" fill="#294f6b">physical fence + promotion gate</text>
+            <text x="845" y="394" text-anchor="middle" font-size="11" fill="#53636f">strict adopt · ADOPTED_LOCKED · protected attach</text>
+
+            <path d="M470 102 C420 130, 340 140, 280 170" fill="none" stroke="#667984" stroke-width="2" marker-end="url(#arrow-recovery)"/>
+            <path d="M610 102 C660 130, 740 140, 800 170" fill="none" stroke="#667984" stroke-width="2" marker-end="url(#arrow-recovery)"/>
+            <path d="M235 258 L235 338" stroke="#087f76" stroke-width="2" marker-end="url(#arrow-recovery)"/>
+            <path d="M845 258 L845 338" stroke="#35658a" stroke-width="2" marker-end="url(#arrow-recovery)"/>
+          </svg>
+        </figure>
+
+        <p>
+          <code>preserved_trx_recover_all()</code> 扫描 carrier 工件，验证 snapshot，按 token/XID claim prepared trx，恢复 read view、锁、MDL 等语义并注册为 <code>PRESERVED</code>。
+          启动恢复可并行处理 token，也可预取 record-lock 涉及的页。没有对应 snapshot 的 Preserve prepared XID 会按 orphan 规则处理，超时 token 由 reaper 取得 manager 所有权后回滚。
+        </p>
+        <p>
+          这条路径会过滤 standby-pending 工件，防止目标 mysqld 在没有 physical fence 的情况下把跨机 token 当作本地事务恢复。
+          两条路径在 bundle 语义和 recover/adopt kernel 上复用，在工件准入和所有权状态机上严格分离。
+        </p>
+        <div class="source-ref"><b>主要源码：</b> <code>sql/preserve_trx.cc</code> 的 <code>preserved_trx_recover_all()</code>、shared recover/adopt kernel、record reaper；<code>sql/preserve_trx_carrier_file.cc</code> 的 artifact listing 与 token state。</div>
+      </section>
+
+      <section id="object-model">
+        <h2>13. 对象恢复原理</h2>
+        <p class="section-lead">
+          “事务能继续执行”依赖多个对象族同时恢复。下面按对象说明保存内容、恢复动作和最关键的不变量。
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>对象族</th><th>Preserve / prewarm</th><th>Adopt / attach</th><th>关键不变量</th></tr></thead>
+            <tbody>
+              <tr><td>InnoDB trx / undo</td><td>prepare、分配 Preserve XID、保护 rollback segment、detach 原 THD</td><td>按 XID claim，挂接新 THD，最后 activate undo/trx</td><td>同一 prepared trx 只能有一个 owner；prepare 后失败必须显式 reattach/rollback/留存。</td></tr>
+              <tr><td>Read view</td><td>导出 creator/low/up limits 与 active trx ids</td><td>在物理数据一致后导入到 claimed trx</td><td>恢复后的可见性边界与原事务一致，不能用“新建一个 read view”代替。</td></tr>
+              <tr><td>Record / gap / next-key locks</td><td>物化隐式锁，导出页身份、heap bitmap、mode/type、generation；phase1 可 warmcopy</td><td>prewarm 构建 metadata plan，gate 在 fence 下恢复锁对象</td><td>页布局、字典代际、锁代际与 physical proof 一致；锁 accounting 不能重复或遗漏。</td></tr>
+              <tr><td>Table / predicate / AUTO_INC locks</td><td>独立 payload 与拥有标记，和 record locks 一起做 canonical 核对</td><td>在事务激活前恢复对应 InnoDB lock family</td><td>表锁 payload 与派生的 autoinc ownership 必须一致。</td></tr>
+              <tr><td>MDL</td><td>导出 namespace/db/name/type/duration，原 THD 释放后由 detached context 持有</td><td>先恢复到 detached owner，再转给目标 THD</td><td>对象名、权限与字典身份重新校验；不能在事务激活后才补锁。</td></tr>
+              <tr><td>Savepoints</td><td>同时保存 SQL savepoint 顺序、InnoDB savepoint、binlog participant suffix</td><td>按 participant topology 重建并挂回 THD/trx</td><td>不能只恢复 savepoint 名称；rollback-to-savepoint 的引擎和 binlog 边界都要一致。</td></tr>
+              <tr><td>Binlog / GTID</td><td>保存全局/会话 logging 状态、四态语义、cache bytes/descriptor、GTID ownership</td><td>attach 预建 native handle，恢复 GTID 与 cache ownership</td><td>“未记录”“记录但空 cache”“记录且有 cache”语义不同；只看文件大小会丢信息。</td></tr>
+              <tr><td>Session / user vars</td><td>保存 schema、isolation、sql mode、timezone、checks、autoinc 参数等；user vars 仅显式 INCLUDE</td><td>先备份目标 THD，再原子替换；失败时恢复原状态</td><td>resume 不能污染调用连接；user vars 的默认行为是排除。</td></tr>
+              <tr><td>Temporary tables</td><td>phase1 复制物理基线、buffer-pool overlay、dirty pages 与 no-redo undo；生成 manifest</td><td>采用 sidecars、重建 fil/dict 对象与 ownership，连接 no-redo undo 后恢复 DML</td><td>SQL journal 只证明变更历史和不支持边界，不承担行级重放。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>13.1 InnoDB 事务、undo 与 read view</h3>
+        <p>
+          Preserve 用专用 magic XID 把普通事务转成可在 crash recovery 后识别的 prepared transaction。prepare 期间保护对应 undo/rseg，
+          防止 purge 或启动清理把它当作普通残留事务处理。detach 只改变会话所有权，不提交也不回滚事务。
+          Resume 时 claim 同一个 XID，再导入原 read view，保证快照读仍处在原可见性边界。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>时点</th><th>InnoDB state</th><th><code>mysql_thd</code></th><th><code>preserve_trx_claimed</code></th><th>所有权解释</th></tr></thead>
+            <tbody>
+              <tr><td>原生 prepare 完成</td><td><code>PREPARED</code></td><td>原 THD</td><td><code>false</code></td><td>事务仍在原会话的 preserve 流程中。</td></tr>
+              <tr><td>源端 detach 完成</td><td><code>PREPARED</code></td><td><code>nullptr</code></td><td><code>false</code></td><td>事务已脱离会话，靠 magic XID 与 SQL 层工件定位。</td></tr>
+              <tr><td>本地 recovery / strict adopt claim</td><td><code>PRESERVED</code></td><td><code>nullptr</code></td><td><code>true</code></td><td>当前 mysqld 独占认领，可导入对象但尚未 ACTIVE。</td></tr>
+              <tr><td>Attach 与 activate 完成</td><td><code>ACTIVE</code></td><td>目标 THD</td><td><code>false</code></td><td>普通事务路径重新成为唯一 owner。</td></tr>
+              <tr><td>激活前 attach 失败并 detach</td><td><code>PRESERVED</code></td><td><code>nullptr</code></td><td><code>true</code></td><td>所有权退回 preserved record，可重试或清理。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>13.2 锁与 MDL</h3>
+        <p>
+          记录锁导出不是简单枚举 lock_t 指针。它需要把隐式记录锁物化为可持久表示，保存 space/page/index 身份、heap bitmap、锁模式和 gap/next-key 语义。
+          lock warmcopy 在 phase1 跟踪 mutation，seal 时冻结 generation 并做 canonical 对比；接收端预热将 blob 转成按页的 import plan。
+          MDL 属于 SQL 层，原 THD 退出后由 detached MDL context 暂持，直到新 THD 接管。
+        </p>
+
+        <h3>13.3 Binlog cache 与 GTID</h3>
+        <p>
+          Bundle 明确区分四种 binlog 状态：全局关闭且无 cache、会话关闭且无 cache、开启但未写 cache、已写且必须恢复 cache。
+          warmcopy 可以提前持久化大 cache；接收端将 staging payload 准备成 native handle。attach 时把 handle 与 GTID ownership 交给目标 THD，
+          避免在快速恢复路径重新读取、写出整份 cache。
+        </p>
+
+        <h3>13.4 用户临时表</h3>
+        <p>
+          InnoDB 用户临时表既不进入普通 redo，也不靠重启恢复，因此是 Preserve 的独立物理对象。
+          phase1 participant 复制表空间基线，合并 buffer pool 中较新的页，持续输出 dirty-page stream，并保存 no-redo undo sidecar、DD/dict 绑定和 page ownership 证明。
+          seal 后生成 manifest；resume 采用这些物理 sidecar，重建 adopted fil space 与内存 dict 对象（不写入持久 DD，也不加入普通 temp pool），
+          并把 no-redo undo slot/FSEG 重新接回事务。
+        </p>
+        <p>
+          SQL journal 记录 DDL/DML 边界、顺序和不支持操作，用于判断 baseline + dirty pages 是否仍可信；它不是行重放日志。
+          这点直接决定了实现能保留索引、页内状态、未提交修改和后续 DML 所需的 undo 关系。
+          no-redo sidecar 也不是整套替换共享 rollback segment：rseg header/allocator 页主要作为一致性证明，事务专属 undo header/log 页按保留 slot 与 FSEG 接管。
+        </p>
+        <div class="boundary">
+          <strong>本地临时表恢复与跨机 portable transfer 要分开理解</strong>
+          当前本地 carrier/resume 已实现临时表 image、no-redo undo 与 native ownership 接管；transfer 协议也保留了
+          <code>TEMP_TABLE_SIDECAR</code> 对象类型。但当前 portable sender 在 bundle 含非空
+          <code>temp_table_manifest_payload</code> 时直接返回 <code>UNSUPPORTED</code>，因此不能把本地临时表能力等同为当前跨机 sidecar 交付能力。
+        </div>
+
+        <div class="source-ref"><b>InnoDB 主要源码：</b> <code>storage/innobase/trx/trx0preserve.*</code>、<code>trx0temp_preserve.*</code>；<code>storage/innobase/lock/lock0preserve.*</code>、<code>lock0warmcopy.*</code>。<b>SQL 主要源码：</b> <code>sql/preserve_trx_temp_table.*</code>、<code>preserve_trx_lock_warmcopy.*</code>、<code>sql/binlog.cc</code> 的薄接入点。</div>
+      </section>
+
+      <section id="consistency">
+        <h2>14. 一致性与所有权</h2>
+        <p class="section-lead">
+          代码里大量 marker、lease、generation 和 digest 并非重复防御。它们分别约束“事实是否匹配”和“当前由谁处置”，
+          两类问题缺一不可。
+        </p>
+
+        <div class="grid-2">
+          <article class="panel">
+            <h3>Generation / incarnation</h3>
+            <p>Drain generation、warmcopy generation、source incarnation、target boot incarnation、provider generation 防止新进程误用旧内存状态或旧文件。</p>
+          </article>
+          <article class="panel">
+            <h3>Digest commitments</h3>
+            <p>Frame/object/fact digest 证明网络对象；canonical/lock/page-layout/dictionary digest 证明语义对象与物理副本；HMAC 证明端点信任。</p>
+          </article>
+          <article class="panel">
+            <h3>Intent journals</h3>
+            <p>Promotion intent 与 attach intent 在不可逆边界前写入，进程崩溃后可以判断事务停在 ADOPTING、ADOPTED_LOCKED、ATTACHING、ACTIVATING 还是 ACTIVE。</p>
+          </article>
+          <article class="panel">
+            <h3>Leases</h3>
+            <p>Physical fence lease 约束物理世界不再变化；prepare/adopt/attach/cleanup lease 约束同一个 token 只有一个软件所有者。</p>
+          </article>
+          <article class="panel">
+            <h3>XID provenance</h3>
+            <p><code>.xid_provenance</code> 在引擎 prepare 前记录 <code>PREPARED_INTENT</code>，snapshot 发布后推进到 <code>SNAPSHOT_BOUND</code>，用于区分“存在 magic XID”与“已有可绑定恢复工件”。</p>
+          </article>
+        </div>
+
+        <div class="callout-line"><b>源端原 THD</b><span>在 detach 之前拥有 active transaction；detach 后不能继续执行该事务。</span></div>
+        <div class="callout-line"><b>本地 preserved record</b><span>持有 prepared transaction 与 bundle 的本地恢复所有权，可被 owner 或特权账号 resume。</span></div>
+        <div class="callout-line"><b>Receiver registry</b><span>持有 standby-pending 工件，不等价于本地可恢复事务。</span></div>
+        <div class="callout-line"><b>Prepared registry lease</b><span>持有预热资源，并在 gate/attach/cleanup 之间传递独占权。</span></div>
+        <div class="callout-line"><b>Promotion-owned record</b><span>Gate 已认领 InnoDB prepared trx，但尚未挂入客户端 THD。</span></div>
+        <div class="callout-line"><b>目标 THD</b><span>跨过 activation boundary 后成为唯一 active owner，普通事务提交/回滚路径重新接管。</span></div>
+
+        <h3>14.1 Fail closed 的含义</h3>
+        <p>
+          对 Preserve / Resume 来说，“尽量恢复”会制造比报错更严重的语义分叉。任何身份、代际、摘要、资源或物理 fence 不匹配都不能降级为猜测性接管。
+          失败处理的目标是明确落到某个所有权状态：原 THD 继续持有、prepared trx 被回滚、token 保持可观察，或工件进入 cleanup/tainted 状态；
+          不能出现事务已被 detach 但系统说不清由谁负责的中间地带。
+        </p>
+
+        <h3>14.2 对原生 MySQL 路径的隔离</h3>
+        <p>
+          Parser、协议分发、THD、binlog、InnoDB lock/trx/undo/temp/FSP 等共享路径只放薄 hook，并由 <code>preserve_trx_enable</code>、子特性 sysvar、
+          active policy/epoch 或内部 admission 状态保护。特性关闭时，普通 MySQL 8.0.22 行为应保持不变；真正的状态机和大对象逻辑集中在专用模块中。
+        </p>
+      </section>
+
+      <section id="operations">
+        <h2>15. 命令、配置与观测</h2>
+
+        <h3>15.1 SQL 表面</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>命令</th><th>用途</th><th>关键语义</th></tr></thead>
+            <tbody>
+              <tr><td><code>PREPARE SHUTDOWN PRESERVE TRANSACTION ...</code></td><td>保存当前连接上的单个事务，并进入 shutdown 交接。</td><td>使用共享 preserve kernel；token 由客户端接收。</td></tr>
+              <tr><td><code>DRAIN TRANSACTIONS PRESERVE ...</code></td><td>批量收口所有目标业务事务；生产 standby transfer 的总控入口。</td><td>两阶段 warmcopy、admission close、并行 preserve、epoch commit。</td></tr>
+              <tr><td><code>RESUME PRESERVED TRANSACTION '&lt;token&gt;'</code></td><td>普通本地 preserved token 的会话接管。</td><td>校验 owner/特权与对象权限；standby-pending 不走这条入口。</td></tr>
+              <tr><td><code>SHOW PRESERVED TRANSACTIONS</code></td><td>查看当前账号可见的本地 preserved transactions。</td><td>底层使用同一份可见性过滤与 PFS 行数据。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h4><code>WITH USER VARS</code> 到底表示什么</h4>
+        <p>
+          <code>DRAIN TRANSACTIONS PRESERVE WITH USER VARS</code> 表示：对本批次中每一个被 preserve 的目标会话，序列化该会话的 user variables，
+          以后 resume 到新 THD 时用快照恢复。它不是保存 drain 管理连接自己的变量，也不是允许命令里引用 user variable。
+          代码只有在 <code>user_vars_mode == INCLUDE</code> 时调用 user-vars export；默认省略和显式排除都不会保存。
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>写法</th><th>解析结果</th><th>恢复行为</th></tr></thead>
+            <tbody>
+              <tr><td><code>DRAIN TRANSACTIONS PRESERVE WITH USER VARS</code></td><td><code>INCLUDE</code></td><td>保存并恢复每个目标会话的 user variables。</td></tr>
+              <tr><td><code>DRAIN TRANSACTIONS PRESERVE WITH NO USER VARS</code></td><td><code>EXCLUDE</code></td><td>不保存 user variables；resume 不清空目标 THD 原有变量。</td></tr>
+              <tr><td><code>DRAIN TRANSACTIONS PRESERVE NO USER VARS</code></td><td><code>EXCLUDE</code></td><td>Batch drain 额外接受的无 <code>WITH</code> 等价写法；恢复行为相同。</td></tr>
+              <tr><td><code>DRAIN TRANSACTIONS PRESERVE</code></td><td><code>DEFAULT</code></td><td>当前实现不导出 user variables，也不在 resume 时清空目标 THD 变量。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre><code>DRAIN TRANSACTIONS PRESERVE
+  WITH TIMEOUT 300
+  WITH USER VARS;</code></pre>
+
+        <h3>15.2 配置分组</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>分组</th><th>代表性 sysvar</th><th>控制内容</th></tr></thead>
+            <tbody>
+              <tr><td>总开关与目录</td><td><code>preserve_trx_enable</code>、<code>preserve_trx_dir</code>、<code>preserve_trx_off_artifact_policy</code></td><td>特性启停、工件根目录、关闭时工件处置策略。</td></tr>
+              <tr><td>Token 与容量</td><td><code>preserve_trx_max_total</code>、<code>max_pending_per_user</code>、<code>max_snapshot_bytes</code>、<code>memory_budget_bytes</code></td><td>全局/账号配额、snapshot/blob/内存上限与 spill 粒度。</td></tr>
+              <tr><td>Drain 与并行</td><td><code>preserve_trx_drain_mode</code>、<code>drain_grace_ms</code>、<code>batch_max_transactions</code>、<code>parallel_preserve_threads</code></td><td>软/硬 drain、目标数、关闭窗口与 worker 数。</td></tr>
+              <tr><td>Warmcopy</td><td><code>preserve_trx_warmcopy_enable</code>、<code>lock_warmcopy_enable</code>、<code>lock_warmcopy_max_memory_bytes</code>、<code>lock_warmcopy_seal_threads</code></td><td>binlog/record-lock phase1、尾部预算、journal 与 seal 并发。</td></tr>
+              <tr><td>临时表</td><td><code>preserve_trx_temp_table_enable</code>、<code>max_temp_sidecar_bytes</code></td><td>用户临时表物理 preserve 与 sidecar 容量。</td></tr>
+              <tr><td>Transfer endpoint</td><td><code>preserve_trx_transfer_receiver_enable</code>、<code>allowed_source_uuid</code>、<code>target_server_uuid</code>、<code>target_host/port/socket/user</code></td><td>接收端启用、端点身份、发送目标与连接方式。</td></tr>
+              <tr><td>Transfer 安全/流控</td><td><code>credential_name</code>、<code>credential_secret_file</code>、<code>chunk_bytes</code>、<code>max_inflight_bytes</code>、<code>commit_timeout_ms</code></td><td>凭据、frame 大小、在途字节与 ACK/commit 超时。</td></tr>
+              <tr><td>Receiver / promotion</td><td><code>transfer_receiver_workers</code>、<code>promotion_gate_batch_tokens</code>、<code>promotion_gate_workers</code>、<code>promotion_gate_timeout_ms</code></td><td>异步 apply/prewarm 并发与晋升门批量执行预算。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          <code>preserve_trx_transfer_receiver_enable</code> 和 transfer artifact mode 属于 startup-only 选项。接管新环境时应从实际部署配置读取默认值和容量，
+          不要只凭 sysvar 名称推断生产策略。
+        </p>
+
+        <h3>15.3 权限与可见性</h3>
+        <ul>
+          <li>Batch drain 属于 shutdown 级管理动作，走 <code>SHUTDOWN</code> 权限检查。</li>
+          <li>Transfer classic command 只有在总开关和 receiver startup option 都开启时才可用，并要求动态权限 <code>PRESERVE_TRX_TRANSFER_ADMIN</code>。</li>
+          <li>普通 resume 默认要求 token owner；动态权限 <code>RESUME_ANY_PRESERVED_TRANSACTION</code> 可跨账号接管，但仍会重新检查涉及 schema/table/routine/trigger/MDL 对象的权限。</li>
+          <li>PFS/SHOW 默认只显示本账号 token；<code>PROCESS</code> 或 resume-any 权限可查看更多行。没有 <code>PROCESS</code> 时 token 在结果中会被脱敏。</li>
+          <li>Transfer credential 优先使用命名 credential，后备 secret file；文件读取使用 no-follow，要求普通文件、owner 为当前 euid，且 group/other 无权限。</li>
+          <li>TCP 连接强制 <code>SSL_MODE_VERIFY_IDENTITY</code> 并确认实际 cipher；Unix socket 不启用 TLS。端点 UUID 与 ACK HMAC 共同参与信任边界。</li>
+        </ul>
+
+        <h3>15.4 观测面</h3>
+        <p>
+          <code>performance_schema.preserved_transactions</code> 是本地 preserved record 的主表，包含 token/owner/state、创建与过期时间、恢复次数、schema/isolation、
+          修改表/锁/read view/savepoint、binlog/GTID、AUTO_INC 和临时表 sidecar 状态。它不等价于 receiver strict registry 的完整视图。
+          <code>SHOW PRESERVED TRANSACTIONS</code> 与该表都读取当前进程内 registry，不会临时扫描 carrier 目录寻找所有文件。
+        </p>
+        <div class="grid-3">
+          <article class="panel"><h3>源端 phase 2</h3><p>total、target wait、participant prepare/close/preflight、lock seal、prepare/detach/snapshot/register、SLO miss。</p></article>
+          <article class="panel"><h3>Transfer / receiver</h3><p>phase1 batch bytes/linger、frame/ACK、spool/apply、object prewarm、resource admission、epoch readiness。</p></article>
+          <article class="panel"><h3>Promotion / resume</h3><p>gate elapsed/token results、fence wait/revalidate、record-lock page get、lock apply、resume core p50/p95/p99/max、binlog attach I/O。</p></article>
+        </div>
+        <p>
+          排障时先按 epoch/token 对齐四类事实：源端 drain 日志、receiver frame/commit 状态、prepared registry 状态、promotion/attach intent。
+          单看“文件存在”或“PFS 有行”不足以判断事务当前可接管。
+        </p>
+      </section>
+
+      <section id="code-map">
+        <h2>16. 代码地图</h2>
+        <p class="section-lead">
+          推荐按运行路径读代码，不要先从 InnoDB hook 逐个反推。先掌握 orchestration 和所有权状态，再进入对象 codec 与共享路径接入点。
+        </p>
+
+        <figure class="diagram">
+          <figcaption>图 13 · 模块依赖与阅读方向</figcaption>
+          <svg viewBox="0 0 1080 610" role="img" aria-label="Preserve Resume 模块依赖图">
+            <defs><marker id="arrow-code" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#667984"/></marker></defs>
+            <rect x="32" y="32" width="1016" height="84" rx="5" fill="#eef2f3" stroke="#aeb8c1"/>
+            <text x="540" y="62" text-anchor="middle" font-size="16" font-weight="700">SQL / protocol surface</text>
+            <text x="540" y="88" text-anchor="middle" font-size="12" fill="#5d6873">sql_yacc.yy · sql_parse.cc · preserve_trx_execute_command · SHOW / PFS</text>
+
+            <rect x="32" y="150" width="320" height="118" rx="5" fill="#eaf3ed" stroke="#3b7a57"/>
+            <text x="192" y="181" text-anchor="middle" font-size="15" font-weight="700" fill="#2f6747">Core orchestration</text>
+            <text x="192" y="207" text-anchor="middle" font-size="11" fill="#52635a">preserve_trx.cc / drain</text>
+            <text x="192" y="227" text-anchor="middle" font-size="11" fill="#52635a">manager · batch · preserve kernel</text>
+            <text x="192" y="247" text-anchor="middle" font-size="11" fill="#52635a">local recovery · THD attach</text>
+
+            <rect x="380" y="150" width="320" height="118" rx="5" fill="#e5f4f2" stroke="#087f76"/>
+            <text x="540" y="181" text-anchor="middle" font-size="15" font-weight="700" fill="#075f58">Artifact layer</text>
+            <text x="540" y="207" text-anchor="middle" font-size="11" fill="#42645f">bundle · carrier · carrier_file</text>
+            <text x="540" y="227" text-anchor="middle" font-size="11" fill="#42645f">warmcopy · lock_warmcopy</text>
+            <text x="540" y="247" text-anchor="middle" font-size="11" fill="#42645f">temp_table · temp_table_carrier</text>
+
+            <rect x="728" y="150" width="320" height="118" rx="5" fill="#fff3d8" stroke="#a56200"/>
+            <text x="888" y="181" text-anchor="middle" font-size="15" font-weight="700" fill="#774900">Standby / promotion</text>
+            <text x="888" y="207" text-anchor="middle" font-size="11" fill="#705f45">transfer · receiver prewarm</text>
+            <text x="888" y="227" text-anchor="middle" font-size="11" fill="#705f45">promotion · promotion_prepared</text>
+            <text x="888" y="247" text-anchor="middle" font-size="11" fill="#705f45">physical fence · strict registry</text>
+
+            <rect x="32" y="324" width="492" height="120" rx="5" fill="#eaf1f6" stroke="#35658a"/>
+            <text x="278" y="356" text-anchor="middle" font-size="15" font-weight="700" fill="#294f6b">InnoDB preserve engines</text>
+            <text x="278" y="382" text-anchor="middle" font-size="11" fill="#53636f">trx0preserve · lock0preserve · lock0warmcopy</text>
+            <text x="278" y="404" text-anchor="middle" font-size="11" fill="#53636f">trx0temp_preserve · read view / undo / rseg / fil / dict</text>
+            <text x="278" y="426" text-anchor="middle" font-size="11" fill="#53636f">prepared XID · import/export · activation</text>
+
+            <rect x="556" y="324" width="492" height="120" rx="5" fill="#f4f6f7" stroke="#89969f"/>
+            <text x="802" y="356" text-anchor="middle" font-size="15" font-weight="700">Native-path thin hooks</text>
+            <text x="802" y="382" text-anchor="middle" font-size="11" fill="#5d6873">THD / parser / protocol / binlog / transaction / XA</text>
+            <text x="802" y="404" text-anchor="middle" font-size="11" fill="#5d6873">InnoDB lock / trx / undo / purge / FSP / temp / read</text>
+            <text x="802" y="426" text-anchor="middle" font-size="11" fill="#5d6873">preserve_trx_enable + subfeature / policy / epoch gates</text>
+
+            <rect x="32" y="506" width="1016" height="70" rx="5" fill="#fff" stroke="#aeb8c1"/>
+            <text x="540" y="535" text-anchor="middle" font-size="15" font-weight="700">Tests and contracts</text>
+            <text x="540" y="559" text-anchor="middle" font-size="11" fill="#5d6873">mysql-test/suite/preserve_trx · unittest/gunit/preserve_trx*-t.cc · test promotion plugin</text>
+
+            <path d="M540 116 L540 150" stroke="#667984" stroke-width="2" marker-end="url(#arrow-code)"/>
+            <path d="M410 116 C330 130, 240 133, 192 150" fill="none" stroke="#667984" stroke-width="2" marker-end="url(#arrow-code)"/>
+            <path d="M670 116 C750 130, 840 133, 888 150" fill="none" stroke="#667984" stroke-width="2" marker-end="url(#arrow-code)"/>
+            <path d="M192 268 L245 324" stroke="#667984" stroke-width="2" marker-end="url(#arrow-code)"/>
+            <path d="M540 268 L350 324" stroke="#667984" stroke-width="2" marker-end="url(#arrow-code)"/>
+            <path d="M888 268 L470 324" stroke="#667984" stroke-width="2" marker-end="url(#arrow-code)"/>
+            <path d="M888 268 L850 324" stroke="#667984" stroke-width="2" marker-end="url(#arrow-code)"/>
+            <path d="M278 444 L380 506" stroke="#667984" stroke-width="2" marker-end="url(#arrow-code)"/>
+            <path d="M802 444 L700 506" stroke="#667984" stroke-width="2" marker-end="url(#arrow-code)"/>
+          </svg>
+        </figure>
+
+        <h3>16.1 推荐阅读顺序</h3>
+        <ol class="numbered">
+          <li><b>先读公开状态与入口。</b> 从 <code>sql/preserve_trx.h</code> 的 manager state、preserve stage、promotion attach API 开始，再看 grammar 和 command dispatch。</li>
+          <li><b>顺着生产总控走一遍。</b> 在 <code>sql/preserve_trx.cc</code> 找 batch drain、warmcopy participant、<code>preserve_trx_kernel_preserve_attached_transaction()</code>，建立源端时序。</li>
+          <li><b>理解 bundle/carrier。</b> 阅读 <code>preserve_trx_bundle.*</code> 的 metadata/TLV/codec，再读 carrier 的原子写、adopt 和清理规则。</li>
+          <li><b>进入 transfer/receiver。</b> 从 <code>preserve_trx_transfer.h</code> 的 manifest/frame/receiver state 入手，再追 source epoch session、dispatcher、spool 与 prewarm queue。</li>
+          <li><b>读 strict promotion。</b> 先读 <code>preserve_trx_promotion_prepared.h</code> 的 state/key/final facts/lease，再看 promotion gate 与 physical fence 的实现。</li>
+          <li><b>回到 attach 与共享恢复内核。</b> 对照 local startup recovery 和 standby adopt，确认哪些对象复用同一 kernel、哪些准入条件必须分开。</li>
+          <li><b>最后下沉 InnoDB。</b> 依次看 trx、record/table locks、warmcopy、temp preserve，再用 shared-path hooks 验证调用如何被 gated。</li>
+          <li><b>用测试锁定语义。</b> MTR 看 SQL 行为和 crash/restart；GUnit 看 codec、状态机、lease、gate；lint test 只作为源码形状合同，不能代替运行时证据。</li>
+        </ol>
+
+        <h3>16.2 模块索引</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>模块</th><th>职责</th><th>接手时重点找的符号</th></tr></thead>
+            <tbody>
+              <tr><td><code>sql/preserve_trx.cc/.h</code></td><td>manager、single/batch preserve、shared recover/adopt、local resume、promotion attach</td><td><code>Preserve_trx_drain_service::execute</code>、<code>preserve_trx_kernel_preserve_attached_transaction</code>、<code>preserved_trx_recover_all</code></td></tr>
+              <tr><td><code>sql/preserve_trx_bundle.*</code></td><td>语义模型、TLV、v9 codec、external blob descriptors</td><td><code>Preserve_snapshot_metadata</code>、<code>build_preserved_trx_bundle</code>、encode/decode</td></tr>
+              <tr><td><code>sql/preserve_trx_carrier*.cc</code></td><td>本地文件布局、原子发布、预建 blob adopt、token state、清理</td><td><code>Preserve_trx_artifact_sink</code>、file carrier store/read/delete/list</td></tr>
+              <tr><td><code>sql/preserve_trx_transfer.*</code></td><td>portable manifest、frame/ACK、source epoch、receiver、spool、prewarm workers</td><td><code>Preserve_trx_transfer_source_epoch_session</code>、<code>preserve_trx_transfer_dispatch_command</code></td></tr>
+              <tr><td><code>sql/preserve_trx_promotion.*</code></td><td>epoch gate、apply/fence 检查、prepared token adopt、结果与指标</td><td><code>preserved_trx_adopt_prepared_epoch_for_physical_promotion</code></td></tr>
+              <tr><td><code>sql/preserve_trx_promotion_prepared.*</code></td><td>physical fence provider、strict registry、final facts、intent、resource leases</td><td><code>Preserve_trx_prepared_token_state</code>、<code>Preserve_trx_final_token_facts</code></td></tr>
+              <tr><td><code>sql/preserve_trx_warmcopy.*</code></td><td>Binlog cache phase1 copy 与 tail seal</td><td>warmcopy provider/artifact、prefix/digest/durable metrics</td></tr>
+              <tr><td><code>sql/preserve_trx_lock_warmcopy.*</code></td><td>Record-lock warmcopy participant，以及 table/predicate/AUTO_INC 的最终 freeze/seal/canonical 验证</td><td><code>Preserve_trx_lock_warmcopy_drain_participant</code></td></tr>
+              <tr><td><code>sql/preserve_trx_temp_table*.cc</code></td><td>临时表 phase1、manifest、sidecar carrier、resume materialization</td><td><code>Temp_table_warmcopy_participant</code>、ownership reservation/adopt</td></tr>
+              <tr><td><code>storage/innobase/trx/trx0preserve.*</code></td><td>prepared XID、detach/claim/attach/activate、read view、savepoint</td><td><code>trx_preserve_*</code> API</td></tr>
+              <tr><td><code>storage/innobase/lock/lock0preserve.*</code></td><td>锁导出/导入、隐式锁物化、metadata plan、页/generation 证明</td><td><code>trx_preserve_*locks*</code>、record-lock plan</td></tr>
+              <tr><td><code>storage/innobase/lock/lock0warmcopy.*</code></td><td>record-lock phase1 store、mutation、freeze 与 seal</td><td>warmcopy epoch/store/final artifact</td></tr>
+              <tr><td><code>storage/innobase/trx/trx0temp_preserve.*</code></td><td>临时表空间、no-redo undo、dict/fil/page ownership adopt</td><td><code>trx_preserve_temp_*</code> API</td></tr>
+              <tr><td><code>storage/perfschema/table_preserved_transactions.*</code></td><td>本地 preserved transaction 观测表</td><td>table definition、row visibility、snapshot population</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+      </section>
+    </main>
+  </div>
+
+  <script>
+    (() => {
+      const body = document.body;
+      const toggle = document.querySelector('.nav-toggle');
+      const links = [...document.querySelectorAll('.toc a')];
+      const sections = links.map((link) => document.querySelector(link.getAttribute('href'))).filter(Boolean);
+
+      toggle.addEventListener('click', () => {
+        const open = body.classList.toggle('nav-open');
+        toggle.setAttribute('aria-label', open ? '关闭章节导航' : '打开章节导航');
+      });
+      links.forEach((link) => link.addEventListener('click', () => body.classList.remove('nav-open')));
+
+      const observer = new IntersectionObserver((entries) => {
+        const visible = entries.filter((entry) => entry.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)[0];
+        if (!visible) return;
+        links.forEach((link) => link.classList.toggle('active', link.getAttribute('href') === `#${visible.target.id}`));
+      }, { rootMargin: '-12% 0px -78% 0px', threshold: 0 });
+      sections.forEach((section) => observer.observe(section));
+    })();
+  </script>
+</body>
+</html>

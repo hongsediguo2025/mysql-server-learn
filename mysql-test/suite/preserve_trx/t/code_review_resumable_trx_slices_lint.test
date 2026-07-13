@@ -188,6 +188,17 @@ die "standby streaming transfer session artifact sink must batch final token met
 die "preserve external THD pins must block new pins once THD teardown starts\n"
   unless $preserve =~ /g_preserved_trx_thd_teardown/s &&
          $preserve =~ /g_preserved_trx_thd_teardown\.count\s*\(\s*thd\s*\)/s;
+my ($begin_external_thd_teardown_body) =
+  $preserve =~ /(void preserved_trx_begin_external_thd_teardown\(THD \*thd\)[\s\S]*?^})/m
+  or die "could not isolate preserve external THD teardown begin helper\n";
+my ($end_external_thd_teardown_body) =
+  $preserve =~ /(void preserved_trx_end_external_thd_teardown\(THD \*thd\)[\s\S]*?^})/m
+  or die "could not isolate preserve external THD teardown end helper\n";
+die "preserve external THD teardown helpers must be no-op while preserve is disabled\n"
+  unless $begin_external_thd_teardown_body =~
+             /!preserve_trx_is_enabled\(\)[\s\S]*g_preserved_trx_thd_pin_mutex/s &&
+         $end_external_thd_teardown_body =~
+             /!preserve_trx_is_enabled\(\)[\s\S]*g_preserved_trx_thd_pin_mutex/s;
 my ($release_resources_body) =
   $sql_class =~ /(void THD::release_resources\(\)[\s\S]*?^})/m
   or die "could not isolate THD::release_resources\n";

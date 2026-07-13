@@ -2334,8 +2334,8 @@ lock_preserve_build_record_lock_metadata_plan(
 
     lock_preserve_metadata_plan_t::Impl::Entry entry;
     entry.record = std::move(record);
-    entry.record.heap_offsets.clear();
-    entry.record.record_images.clear();
+    std::string{}.swap(entry.record.heap_offsets);
+    std::string{}.swap(entry.record.record_images);
     entry.revalidate = dict_lease_ops.revalidate;
     entry.release = dict_lease_ops.release;
     dict_index_t *acquired_index = nullptr;
@@ -2379,8 +2379,7 @@ lock_preserve_build_record_lock_metadata_plan(
   for (const lock_preserve_metadata_plan_t::Impl::Entry &entry :
        prepared->entries) {
     if (!add_capacity(entry.record.bitmap.capacity()) ||
-        !add_scaled_capacity(entry.record.heap_offsets.capacity(),
-                             sizeof(uint32_t)) ||
+        !add_capacity(entry.record.heap_offsets.capacity()) ||
         !add_capacity(entry.record.record_images.capacity()) ||
         !add_capacity(entry.lease_retained_bytes)) {
       return lock_preserve_metadata_plan_status::CORRUPT_METADATA;

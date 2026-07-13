@@ -8121,6 +8121,30 @@ TEST_F(TempStartupReservationRegistryTest,
       trx_preserve_temp_space_image_no_redo_undo_slot_reservation_slow_lookups_for_test());
 }
 
+TEST_F(TempStartupReservationRegistryTest,
+       NoRedoUndoSlotReservationRepeatedCyclesDoNotLeakActiveCount) {
+  constexpr uint32_t kCycles = 12;
+
+  for (uint32_t cycle = 0; cycle < kCycles; ++cycle) {
+    ASSERT_TRUE(trx_preserve_temp_space_image_reserve_no_redo_undo_slot(
+        5 + cycle, 77, 3, 4, 1));
+    ASSERT_EQ(
+        1U,
+        trx_preserve_temp_space_image_active_no_redo_undo_slot_reservations_for_test());
+
+    trx_preserve_temp_space_image_release_no_redo_undo_slot(77, 3, 4, 1);
+    EXPECT_EQ(
+        0U,
+        trx_preserve_temp_space_image_active_no_redo_undo_slot_reservations_for_test());
+    EXPECT_FALSE(trx_preserve_temp_space_image_no_redo_undo_slot_reserved(
+        77, 3, 4, 1));
+  }
+
+  EXPECT_EQ(
+      0U,
+      trx_preserve_temp_space_image_no_redo_undo_slot_reservation_slow_lookups_for_test());
+}
+
 TEST(TempStartupReservationRegistrySourceTest,
      ReservationPublishesActiveCountBeforeMapEntry) {
   const std::string impl = read_source_file_for_temp_table_test(

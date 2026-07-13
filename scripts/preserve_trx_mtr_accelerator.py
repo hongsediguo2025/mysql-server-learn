@@ -42,7 +42,7 @@ KNOWN_TIMING_SECONDS: Dict[str, float] = {
     "batch_drain_100_long_basic_dml_matrix": 72.2,
     "batch_drain_100_long_json_generated_matrix": 65.3,
     "batch_drain_100_long_session_state_matrix": 52.5,
-    "temp_table_resume_dml_no_undo_slot_leak": 48.1,
+    "temp_table_resume_dml_repeated_cycles": 48.1,
     "preserve_expired_token_reaper_rollback_failure_retry": 41.7,
     "snapshot_header_field_corruption_matrix": 40.1,
     "preserve_expired_token_reaper_cleanup_failure_taints": 37.3,

@@ -542,7 +542,7 @@ TEST(LockWarmcopyMetadataPlan, PartialDictLeaseAcquireIsReleased) {
                     std::memory_order_relaxed));
 }
 
-TEST(LockWarmcopyMetadataPlan, CapacityIncludesRetainedHeapOffsets) {
+TEST(LockWarmcopyMetadataPlan, ReleasesParseOnlyHeapOffsets) {
   constexpr uint32_t kPageNHeap = 4096;
   std::string bitmap(kPageNHeap / 8, static_cast<char>(0xff));
   const std::string payload = make_metadata_record_lock_payload(
@@ -556,7 +556,7 @@ TEST(LockWarmcopyMetadataPlan, CapacityIncludesRetainedHeapOffsets) {
 
   const uint64_t retained_heap_offsets =
       static_cast<uint64_t>(kPageNHeap) * sizeof(uint32_t);
-  EXPECT_GE(plan.capacity_bytes(), retained_heap_offsets + bitmap.size());
+  EXPECT_LT(plan.capacity_bytes(), retained_heap_offsets);
 }
 
 TEST(LockWarmcopyMetadataPlan, CapacityIncludesRetainedDictionaryLease) {
