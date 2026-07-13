@@ -822,17 +822,11 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_transfer_phase2_bulk_bytes,
                               preserve_trx_transfer_phase2_bulk_bytes_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
-    show_preserve_trx_transfer_phase2_receiver_prewarm_wait_us,
-    preserve_trx_transfer_phase2_receiver_prewarm_wait_us_status())
-DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_phase2_final_metadata_fsync_count,
     preserve_trx_transfer_phase2_final_metadata_fsync_count_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_phase2_final_metadata_ack_us,
     preserve_trx_transfer_phase2_final_metadata_ack_us_status())
-DEFINE_PRESERVE_TRX_SHOW_FUNC(
-    show_preserve_trx_transfer_phase1_business_enqueue_block_us,
-    preserve_trx_transfer_phase1_business_enqueue_block_us_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_phase1_frame_count,
     preserve_trx_transfer_phase1_frame_count_status())

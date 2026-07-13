@@ -811,10 +811,8 @@ class _ReceiverPrewarmStatusRuntime(_FakeRuntime):
                 ),
                 ("Preserve_trx_transfer_receiver_seal_prewarm_last_status", "0"),
                 ("Preserve_trx_transfer_phase2_bulk_bytes", "12345"),
-                ("Preserve_trx_transfer_phase2_receiver_prewarm_wait_us", "6789"),
                 ("Preserve_trx_transfer_phase2_final_metadata_fsync_count", "2"),
                 ("Preserve_trx_transfer_phase2_final_metadata_ack_us", "3000"),
-                ("Preserve_trx_transfer_phase1_business_enqueue_block_us", "0"),
                 (
                     "Preserve_trx_transfer_receiver_ready_after_final_metadata_us",
                     "9000",
@@ -5156,10 +5154,8 @@ class WorkloadPlanTest(unittest.TestCase):
                 seal_prewarm_not_ready_tokens=1,
                 seal_prewarm_last_status=0,
                 phase2_transfer_bulk_bytes=12345,
-                phase2_receiver_prewarm_wait_us=6789,
                 phase2_final_metadata_fsync_count=2,
                 phase2_transfer_final_metadata_ack_us=3000,
-                phase1_business_enqueue_block_us=0,
                 ready_after_final_metadata_us=9000,
                 final_spool_ack_monotonic_us=1_040_000,
                 ready_after_final_spool_ack_us=7000,
@@ -5225,7 +5221,7 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertEqual(report["source_phase2_total_us"], [34000])
             self.assertEqual(report["source_phase2_end_us"], 1_000_000)
             self.assertEqual(report["phase2_transfer_bulk_bytes"], 12345)
-            self.assertEqual(report["phase2_receiver_prewarm_wait_us"], 6789)
+            self.assertNotIn("phase2_receiver_prewarm_wait_us", report)
             self.assertEqual(report["phase2_final_metadata_fsync_count"], 2)
             self.assertNotIn("phase2_transfer_final_metadata_ack_us", report)
             self.assertEqual(report["source_phase2_target_pin_us_samples"], [111])
@@ -5275,7 +5271,7 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertEqual(report["source_phase1_transfer_oversize_token_count"], 1)
             self.assertEqual(report["source_phase1_record_first_batch_send_us"], 900000)
             self.assertEqual(report["source_phase1_record_last_batch_send_us"], 990000)
-            self.assertEqual(report["phase1_business_enqueue_block_us"], 0)
+            self.assertNotIn("phase1_business_enqueue_block_us", report)
             self.assertEqual(report["receiver_ready_after_final_metadata_us"], 9000)
             self.assertEqual(report["receiver_final_spool_ack_monotonic_us"], 1_040_000)
             self.assertEqual(report["receiver_ready_after_final_spool_ack_us"], 7000)
@@ -7955,10 +7951,8 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertEqual(metrics.lock_plan_subpool_cap_bytes, 9999)
         self.assertEqual(metrics.resource_admission_open_failed_count, 2)
         self.assertEqual(metrics.phase2_transfer_bulk_bytes, 12345)
-        self.assertEqual(metrics.phase2_receiver_prewarm_wait_us, 6789)
         self.assertEqual(metrics.phase2_final_metadata_fsync_count, 2)
         self.assertEqual(metrics.phase2_transfer_final_metadata_ack_us, 3000)
-        self.assertEqual(metrics.phase1_business_enqueue_block_us, 0)
         self.assertEqual(metrics.ready_after_final_metadata_us, 9000)
         self.assertEqual(metrics.prewarm_backlog_at_phase2_end, 0)
         self.assertEqual(metrics.record_lock_required_residency_bytes, 278528)

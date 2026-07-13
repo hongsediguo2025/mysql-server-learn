@@ -520,15 +520,11 @@ int show_preserve_trx_transfer_receiver_epoch_ready_bind_attempts(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_phase2_bulk_bytes(THD *thd, SHOW_VAR *var,
                                                  char *buf);
-int show_preserve_trx_transfer_phase2_receiver_prewarm_wait_us(
-    THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_phase2_final_metadata_fsync_count(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_phase2_final_metadata_ack_us(THD *thd,
                                                             SHOW_VAR *var,
                                                             char *buf);
-int show_preserve_trx_transfer_phase1_business_enqueue_block_us(
-    THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_phase1_frame_count(THD *thd, SHOW_VAR *var,
                                                   char *buf);
 int show_preserve_trx_transfer_phase1_network_send_count(THD *thd,

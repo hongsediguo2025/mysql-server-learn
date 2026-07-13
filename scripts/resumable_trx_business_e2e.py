@@ -964,10 +964,8 @@ class ReceiverPrewarmMetrics:
     lock_plan_subpool_cap_bytes: int = 0
     resource_admission_open_failed_count: int = 0
     phase2_transfer_bulk_bytes: int = 0
-    phase2_receiver_prewarm_wait_us: int = 0
     phase2_final_metadata_fsync_count: int = 0
     phase2_transfer_final_metadata_ack_us: int = 0
-    phase1_business_enqueue_block_us: int = 0
     ready_after_final_metadata_us: int = 0
     final_spool_ack_monotonic_us: int = 0
     ready_after_final_spool_ack_us: int = 0
@@ -4996,20 +4994,10 @@ class BusinessE2ERunner:
                 if receiver_prewarm_metrics is None
                 else receiver_prewarm_metrics.phase2_transfer_bulk_bytes
             ),
-            "phase2_receiver_prewarm_wait_us": (
-                0
-                if receiver_prewarm_metrics is None
-                else receiver_prewarm_metrics.phase2_receiver_prewarm_wait_us
-            ),
             "phase2_final_metadata_fsync_count": (
                 0
                 if receiver_prewarm_metrics is None
                 else receiver_prewarm_metrics.phase2_final_metadata_fsync_count
-            ),
-            "phase1_business_enqueue_block_us": (
-                0
-                if receiver_prewarm_metrics is None
-                else receiver_prewarm_metrics.phase1_business_enqueue_block_us
             ),
             "receiver_snapshot_tokens": artifact_counts.get("snapshot_tokens", 0),
             "receiver_standby_pending_tokens": artifact_counts.get(
@@ -7083,10 +7071,8 @@ class BusinessE2ERunner:
             "Preserve_trx_transfer_receiver_seal_prewarm_success_tokens",
             "Preserve_trx_transfer_receiver_seal_prewarm_tokens",
             "Preserve_trx_transfer_phase2_bulk_bytes",
-            "Preserve_trx_transfer_phase2_receiver_prewarm_wait_us",
             "Preserve_trx_transfer_phase2_final_metadata_fsync_count",
             "Preserve_trx_transfer_phase2_final_metadata_ack_us",
-            "Preserve_trx_transfer_phase1_business_enqueue_block_us",
             "Preserve_trx_transfer_receiver_ready_after_final_metadata_us",
             "Preserve_trx_transfer_receiver_final_spool_ack_monotonic_us",
             "Preserve_trx_transfer_receiver_ready_after_final_spool_ack_us",
@@ -7222,17 +7208,11 @@ class BusinessE2ERunner:
                 phase2_transfer_bulk_bytes=metric(
                     "Preserve_trx_transfer_phase2_bulk_bytes"
                 ),
-                phase2_receiver_prewarm_wait_us=metric(
-                    "Preserve_trx_transfer_phase2_receiver_prewarm_wait_us"
-                ),
                 phase2_final_metadata_fsync_count=metric(
                     "Preserve_trx_transfer_phase2_final_metadata_fsync_count"
                 ),
                 phase2_transfer_final_metadata_ack_us=metric(
                     "Preserve_trx_transfer_phase2_final_metadata_ack_us"
-                ),
-                phase1_business_enqueue_block_us=metric(
-                    "Preserve_trx_transfer_phase1_business_enqueue_block_us"
                 ),
                 ready_after_final_metadata_us=metric(
                     "Preserve_trx_transfer_receiver_ready_after_final_metadata_us"

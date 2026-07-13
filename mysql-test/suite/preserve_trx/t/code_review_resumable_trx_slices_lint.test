@@ -199,7 +199,7 @@ die "THD::release_resources must wait for preserve external THD pins before rele
 my ($receiver_payload_batch) =
   $transfer =~ /(Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch\([\s\S]*?^})/m
   or die "could not isolate standby receiver encoded payload batch path\n";
-die "standby receiver encoded payload batch path must acknowledge durable spool before semantic apply\n"
+die "standby receiver encoded payload batch path must acknowledge written spool bytes before semantic apply\n"
   unless $receiver_payload_batch !~ /\(void\)\s*worker_count\s*;/ &&
          $receiver_payload_batch =~ /worker_count/s &&
          $receiver_payload_batch =~ /pre_admit_receiver_batch_sequence[\s\S]*after_spool[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s &&
@@ -384,7 +384,7 @@ my ($receiver_dispatch_command) =
   or die "could not isolate standby receiver COM dispatch path\n";
 die "standby receiver single sequence frame must use the authenticated spool/apply ACK path\n"
   unless $receiver_dispatch_command =~
-     /receiver_frame_should_spool\s*\(\s*decoded_frame\.type\s*\)[\s\S]*preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*send_receiver_durable_spool_ack/s;
+     /receiver_frame_should_spool\s*\(\s*decoded_frame\.type\s*\)[\s\S]*preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*send_receiver_spool_write_ack/s;
 die "standby streaming transfer must abort phase1-declared tokens that are not in the final quiesced target set\n"
   unless $preserve =~ /abort_phase1_transfer_targets_not_quiesced/s;
 die "standby streaming transfer must re-sweep phase1 target declarations before object streaming\n"

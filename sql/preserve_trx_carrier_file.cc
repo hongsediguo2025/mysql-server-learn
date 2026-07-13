@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cctype>
 #include <cstring>
@@ -1232,19 +1233,25 @@ Preserve_key_status read_key(
 }
 
 bool create_key(const std::string &dir) {
+  static std::atomic<uint64_t> key_tmp_counter{0};
   std::array<unsigned char, kPreservedTrxKeyLength> key;
   if (my_rand_buffer(key.data(), key.size())) return true;
 
   const std::string key_path = join_path(dir, ".key");
-  const std::string tmp_path = key_path + ".tmp";
-  if (path_is_symlink(tmp_path)) return true;
+  const std::string legacy_tmp_path = key_path + ".tmp";
+  if (path_is_symlink(legacy_tmp_path)) return true;
   MY_STAT tmp_stat;
-  if (my_stat(tmp_path.c_str(), &tmp_stat, MYF(0)) != nullptr) {
+  if (my_stat(legacy_tmp_path.c_str(), &tmp_stat, MYF(0)) != nullptr) {
     if (!MY_S_ISREG(tmp_stat.st_mode)) return true;
-    if (my_delete(tmp_path.c_str(), MYF(0))) return true;
+    if (my_delete(legacy_tmp_path.c_str(), MYF(0))) return true;
   } else if (my_errno() != ENOENT) {
     return true;
   }
+
+  const std::string tmp_path =
+      legacy_tmp_path + "." + std::to_string(current_pid) + "." +
+      std::to_string(
+          key_tmp_counter.fetch_add(1, std::memory_order_relaxed));
   File file = my_create(tmp_path.c_str(), 0600,
                         O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, MYF(0));
   if (file < 0) return true;
@@ -1259,12 +1266,21 @@ bool create_key(const std::string &dir) {
   if (!error) error = !write_all(file, payload.data(), payload.size());
   if (!error && my_sync(file, MYF(0))) error = true;
   if (my_close(file, MYF(0))) error = true;
-  if (!error && my_rename(tmp_path.c_str(), key_path.c_str(), MYF(0))) {
-    error = true;
+  Atomic_write_status install_status = Atomic_write_status::IO_ERROR;
+  if (!error) {
+    install_status = install_temp_file(tmp_path, key_path, true, nullptr);
+    error = install_status == Atomic_write_status::IO_ERROR;
   }
-  if (!error && fsync_directory(dir)) error = true;
-  if (error) (void)my_delete(tmp_path.c_str(), MYF(0));
-  return error;
+  if (error) {
+    (void)my_delete(tmp_path.c_str(), MYF(0));
+    return true;
+  }
+  if (install_status == Atomic_write_status::ALREADY_EXISTS) {
+    (void)my_delete(tmp_path.c_str(), MYF(0));
+    std::array<unsigned char, kPreservedTrxKeyLength> installed_key;
+    if (read_key(dir, &installed_key) != Preserve_key_status::OK) return true;
+  }
+  return fsync_directory(dir);
 }
 
 bool ensure_key(const std::string &dir) {
@@ -1950,6 +1966,10 @@ bool write_standby_pending_marker(
 
 bool preserve_trx_errno_is_transient_io_for_unit_test(int err) {
   return preserve_trx_errno_is_transient_io(err);
+}
+
+bool preserve_trx_create_key_for_unit_test(const std::string &dir) {
+  return create_key(dir);
 }
 
 Local_file_preserved_trx_carrier::Local_file_preserved_trx_carrier(

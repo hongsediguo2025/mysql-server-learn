@@ -135,5 +135,6 @@ class Local_file_preserved_trx_carrier final
 };
 
 bool preserve_trx_errno_is_transient_io_for_unit_test(int err);
+bool preserve_trx_create_key_for_unit_test(const std::string &dir);
 
 #endif  // SQL_PRESERVE_TRX_CARRIER_FILE_INCLUDED

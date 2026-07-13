@@ -151,10 +151,8 @@ static std::atomic<uint64_t> g_transfer_phase2_snapshot_bundle_bytes{0};
 static std::atomic<uint64_t> g_transfer_phase2_snapshot_bundle_count{0};
 static std::atomic<uint64_t> g_transfer_phase2_final_metadata_frame_count{0};
 static std::atomic<uint64_t> g_transfer_phase2_final_metadata_encoded_bytes{0};
-static std::atomic<uint64_t> g_transfer_phase2_receiver_prewarm_wait_us{0};
 static std::atomic<uint64_t> g_transfer_phase2_final_metadata_fsync_count{0};
 static std::atomic<uint64_t> g_transfer_phase2_final_metadata_ack_us{0};
-static std::atomic<uint64_t> g_transfer_phase1_business_enqueue_block_us{0};
 static std::atomic<uint64_t> g_transfer_phase1_frame_count{0};
 static std::atomic<uint64_t> g_transfer_phase1_network_send_count{0};
 static std::atomic<uint64_t> g_transfer_phase1_batch_count{0};
@@ -901,20 +899,12 @@ uint64_t preserve_trx_transfer_phase2_final_metadata_encoded_bytes_status() {
   return g_transfer_phase2_final_metadata_encoded_bytes.load();
 }
 
-uint64_t preserve_trx_transfer_phase2_receiver_prewarm_wait_us_status() {
-  return g_transfer_phase2_receiver_prewarm_wait_us.load();
-}
-
 uint64_t preserve_trx_transfer_phase2_final_metadata_fsync_count_status() {
   return g_transfer_phase2_final_metadata_fsync_count.load();
 }
 
 uint64_t preserve_trx_transfer_phase2_final_metadata_ack_us_status() {
   return g_transfer_phase2_final_metadata_ack_us.load();
-}
-
-uint64_t preserve_trx_transfer_phase1_business_enqueue_block_us_status() {
-  return g_transfer_phase1_business_enqueue_block_us.load();
 }
 
 uint64_t preserve_trx_transfer_receiver_ready_after_final_metadata_us_status() {
@@ -5341,9 +5331,7 @@ Preserve_trx_transfer_receiver_registry::mark_saved_online(
     return Preserve_trx_transfer_status::OK;
   }
   if (found->second.state != Preserve_trx_transfer_receiver_state::DECLARED &&
-      found->second.state != Preserve_trx_transfer_receiver_state::RECEIVING &&
-      found->second.state !=
-          Preserve_trx_transfer_receiver_state::CLEANUP_PENDING) {
+      found->second.state != Preserve_trx_transfer_receiver_state::RECEIVING) {
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
   found->second.state = Preserve_trx_transfer_receiver_state::SAVED_ONLINE;
@@ -10575,7 +10563,7 @@ preserve_trx_transfer_apply_receiver_frame_batch_with_workers(
   return flush_segment();
 }
 
-struct Receiver_durable_ack_context {
+struct Receiver_spool_write_ack_context {
   THD *thd{nullptr};
   const std::string *encoded_payload{nullptr};
   std::string root_dir;
@@ -10621,9 +10609,9 @@ preserve_trx_transfer_validate_online_payload_identity(
   return Preserve_trx_transfer_status::OK;
 }
 
-static Preserve_trx_transfer_status send_receiver_durable_spool_ack(
+static Preserve_trx_transfer_status send_receiver_spool_write_ack(
     void *context, bool contains_commit_epoch) {
-  auto *ack_context = static_cast<Receiver_durable_ack_context *>(context);
+  auto *ack_context = static_cast<Receiver_spool_write_ack_context *>(context);
   if (ack_context == nullptr || ack_context->thd == nullptr) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
@@ -10653,7 +10641,7 @@ static Preserve_trx_transfer_status send_receiver_durable_spool_ack(
   status = preserve_trx_transfer_encode_frame_ack(ack, &encoded_ack);
   if (status != Preserve_trx_transfer_status::OK) return status;
 
-  /* The authenticated durable spool is complete; semantic apply continues. */
+  /* Authenticated frame bytes were written; semantic apply continues. */
   my_ok(ack_context->thd, 0, 0, encoded_ack.c_str());
   ack_context->thd->send_statement_status();
   ack_context->thd->get_stmt_da()->reset_diagnostics_area();
@@ -10739,7 +10727,7 @@ void preserve_trx_transfer_dispatch_command(THD *thd) {
 
   const std::string preserve_dir = transfer_default_preserve_dir();
   auto store = create_preserved_trx_default_store(preserve_dir);
-  Receiver_durable_ack_context ack_context;
+  Receiver_spool_write_ack_context ack_context;
   ack_context.thd = thd;
   ack_context.encoded_payload = &encoded_frame;
   ack_context.root_dir = preserve_dir;
@@ -10749,7 +10737,7 @@ void preserve_trx_transfer_dispatch_command(THD *thd) {
         preserve_dir, std::vector<std::string>{encoded_frame}, &store.store(),
         &default_receiver_registry(), transfer_commit_timeout_seconds(),
         preserve_trx_transfer_receiver_workers, nullptr,
-        send_receiver_durable_spool_ack, &ack_context);
+        send_receiver_spool_write_ack, &ack_context);
   } else {
     Preserve_trx_transfer_frame decoded_frame;
     const Preserve_trx_transfer_status decode_status =
@@ -10760,7 +10748,7 @@ void preserve_trx_transfer_dispatch_command(THD *thd) {
           preserve_dir, std::vector<std::string>{encoded_frame}, &store.store(),
           &default_receiver_registry(), transfer_commit_timeout_seconds(),
           preserve_trx_transfer_receiver_workers, nullptr,
-          send_receiver_durable_spool_ack, &ack_context);
+          send_receiver_spool_write_ack, &ack_context);
     } else {
       status = decode_status;
       if (status == Preserve_trx_transfer_status::OK) {

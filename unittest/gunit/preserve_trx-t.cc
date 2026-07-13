@@ -5543,6 +5543,35 @@ TEST(PreservedTrxTransfer, ReceiverRegistryRecordsCorruptAndAbortReasons) {
   EXPECT_EQ("client disconnect", record.last_error);
 }
 
+TEST(PreservedTrxTransfer,
+     ReceiverRegistryDoesNotOverwritePendingFailureWithSavedOnline) {
+  Preserve_trx_transfer_manifest manifest;
+  manifest.epoch_id = "epoch-cleanup";
+  manifest.source_server_uuid = "source-uuid";
+  manifest.target_server_uuid = "target-uuid";
+  manifest.token = 303;
+
+  Preserve_trx_transfer_receiver_registry registry;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, registry.begin_receive(manifest));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.mark_cleanup_pending(
+                "/tmp/preserve-trx-cleanup", manifest.epoch_id,
+                manifest.token, 100,
+                Preserve_trx_transfer_receiver_state::CORRUPT,
+                "semantic apply failed after spool ACK"));
+  ASSERT_EQ(1U, registry.cleanup_debt_count_for_unit_test());
+
+  EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED,
+            registry.mark_saved_online(manifest.epoch_id, manifest.token));
+
+  Preserve_trx_transfer_receiver_record record;
+  ASSERT_TRUE(registry.lookup(manifest.epoch_id, manifest.token, &record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::CLEANUP_PENDING,
+            record.state);
+  EXPECT_EQ("semantic apply failed after spool ACK", record.last_error);
+  EXPECT_EQ(1U, registry.cleanup_debt_count_for_unit_test());
+}
+
 TEST(PreservedTrxMdlBackup, StandardXaMissingBackupNoops) {
   ASSERT_FALSE(MDL_context_backup_manager::init());
 
@@ -12298,7 +12327,7 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
-       TransferReceiverSealEnqueuesPrewarmWithoutBlockingAck) {
+       TransferReceiverSealEnqueuesPrewarmAndCommitBindsReady) {
   Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 1022;
   Preserve_snapshot_metadata meta = metadata();
@@ -12325,9 +12354,6 @@ TEST_F(PreserveSnapshotTest,
   Preserve_trx_transfer_receiver_registry registry;
   Local_file_preserved_trx_carrier carrier(m_dir);
   Preserved_trx_store store(&carrier);
-  const uint64_t receiver_prewarm_wait_before =
-      preserve_trx_transfer_phase2_receiver_prewarm_wait_us_status();
-
   Preserve_trx_transfer_frame begin;
   begin.type = Preserve_trx_transfer_frame_type::BEGIN;
   begin.sequence = 1;
@@ -12365,9 +12391,6 @@ TEST_F(PreserveSnapshotTest,
   Preserve_trx_promotion_ready_summary ready_summary;
   (void)preserved_trx_promotion_ready_summary_for_epoch(
       m_dir, manifest.epoch_id, &ready_summary);
-  EXPECT_EQ(receiver_prewarm_wait_before,
-            preserve_trx_transfer_phase2_receiver_prewarm_wait_us_status());
-
   Preserve_trx_transfer_frame commit;
   commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
   commit.sequence = sequence++;
@@ -12386,8 +12409,6 @@ TEST_F(PreserveSnapshotTest,
     }
     my_sleep(10000);
   }
-  EXPECT_EQ(receiver_prewarm_wait_before,
-            preserve_trx_transfer_phase2_receiver_prewarm_wait_us_status());
   EXPECT_EQ(Preserve_trx_promotion_adopt_status::OK,
             preserved_trx_promotion_ready_summary_for_epoch(
                 m_dir, manifest.epoch_id, &ready_summary));
@@ -24081,6 +24102,15 @@ TEST_F(PreserveSnapshotTest, LocalFileStoreWritesBoundKeyFile) {
             key_payload.substr(0, strlen(kTestBoundKeyMagic)));
   EXPECT_NE(std::string::npos,
             key_payload.find("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+}
+
+TEST_F(PreserveSnapshotTest, ConcurrentKeyCreatorAdoptsInstalledWinner) {
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            test_write_snapshot(m_dir, metadata(), required_tlvs()));
+  const std::string winner_key = read_file(m_dir + ".key");
+
+  EXPECT_FALSE(preserve_trx_create_key_for_unit_test(m_dir));
+  EXPECT_EQ(winner_key, read_file(m_dir + ".key"));
 }
 
 TEST(PreserveSnapshotCarrierFile, FdExhaustionIsNotTransientIo) {
