@@ -55,6 +55,7 @@
 #include "my_sys.h"
 #include "my_systime.h"
 #include "my_thread_local.h"
+#include "mysql_version.h"
 #include "sha2.h"
 #include "sql/handler.h"
 #include "sql/binlog_preserve_prepared.h"
@@ -2222,6 +2223,18 @@ std::array<unsigned char, kPreservedTrxSha256Length> test_sha256(
   SHA256(reinterpret_cast<const unsigned char *>(payload.data()),
          payload.length(), digest.data());
   return digest;
+}
+
+std::string test_sha256_hex(const std::string &payload) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  const auto digest = test_sha256(payload);
+  std::string encoded;
+  encoded.reserve(digest.size() * 2);
+  for (const unsigned char byte : digest) {
+    encoded.push_back(kHex[byte >> 4]);
+    encoded.push_back(kHex[byte & 0x0f]);
+  }
+  return encoded;
 }
 
 std::string test_transfer_token_string(uint64_t token) {
@@ -16591,12 +16604,43 @@ TEST_F(PreserveSnapshotTest,
                 &session, m_dir, requests, 4 * 1024 * 1024));
   ASSERT_EQ(2U, sink.frames().size());
 
+  std::vector<std::string> encoded_phase1_frames;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame_batch(sink.frames()[1],
+                                                     &encoded_phase1_frames));
+  std::vector<Preserve_trx_transfer_frame> phase1_frames;
+  phase1_frames.reserve(encoded_phase1_frames.size());
+  for (const std::string &encoded_frame : encoded_phase1_frames) {
+    Preserve_trx_transfer_frame frame;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_decode_frame(encoded_frame, &frame));
+    phase1_frames.push_back(std::move(frame));
+  }
+  for (uint64_t token : {801ULL, 802ULL}) {
+    size_t begin_index = phase1_frames.size();
+    size_t seal_index = phase1_frames.size();
+    for (size_t index = 0; index < phase1_frames.size(); ++index) {
+      const auto &frame = phase1_frames[index];
+      if (frame.token != token) continue;
+      if (frame.type == Preserve_trx_transfer_frame_type::BEGIN) {
+        begin_index = std::min(begin_index, index);
+      }
+      if (frame.type == Preserve_trx_transfer_frame_type::SEAL_OBJECT &&
+          frame.object_id == kPreservedTrxBlobRecordLocks) {
+        seal_index = std::min(seal_index, index);
+      }
+    }
+    ASSERT_LT(begin_index, phase1_frames.size());
+    ASSERT_LT(seal_index, phase1_frames.size());
+    EXPECT_LT(begin_index, seal_index);
+  }
+
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             session.begin_token_prewarm_manifests_batch({801, 802}));
-  ASSERT_EQ(3U, sink.frames().size());
+  ASSERT_EQ(2U, sink.frames().size());
   EXPECT_EQ(10U, preserve_trx_transfer_phase1_frame_count_status());
-  EXPECT_EQ(3U, preserve_trx_transfer_phase1_network_send_count_status());
-  EXPECT_EQ(3U, preserve_trx_transfer_phase1_batch_count_status());
+  EXPECT_EQ(2U, preserve_trx_transfer_phase1_network_send_count_status());
+  EXPECT_EQ(2U, preserve_trx_transfer_phase1_batch_count_status());
   EXPECT_GT(preserve_trx_transfer_phase1_batch_bytes_max_status(), 0U);
   EXPECT_GE(preserve_trx_transfer_phase1_batch_tokens_max_status(), 2U);
   EXPECT_EQ(2U,
@@ -18010,6 +18054,25 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             session.begin_token_prewarm_manifest(transfer_token));
 
+  size_t begin_index = source_sink.frames().size();
+  size_t seal_index = source_sink.frames().size();
+  for (size_t index = 0; index < source_sink.frames().size(); ++index) {
+    Preserve_trx_transfer_frame frame;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_decode_frame(source_sink.frames()[index],
+                                                 &frame));
+    if (frame.type == Preserve_trx_transfer_frame_type::BEGIN) {
+      begin_index = std::min(begin_index, index);
+    }
+    if (frame.type == Preserve_trx_transfer_frame_type::SEAL_OBJECT &&
+        frame.object_id == kPreservedTrxBlobRecordLocks) {
+      seal_index = std::min(seal_index, index);
+    }
+  }
+  ASSERT_LT(begin_index, source_sink.frames().size());
+  ASSERT_LT(seal_index, source_sink.frames().size());
+  EXPECT_LT(begin_index, seal_index);
+
   Transfer_receiver_config_guard receiver_config;
   receiver_config.allow("source-uuid", "target-uuid");
   Local_file_preserved_trx_carrier carrier(m_dir);
@@ -18158,14 +18221,14 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
-       TransferReceiverSkipsDuplicateReadyRecordLockObjectPrewarm) {
+       TransferReceiverReusesPhase1RecordLockPreparationForFinalManifest) {
   Transfer_codec_context_guard codec_guard;
   preserve_trx_transfer_set_receiver_object_prewarm_delay_ms_for_unit_test(50);
   auto restore_object_delay = create_scope_guard([] {
     preserve_trx_transfer_set_receiver_object_prewarm_delay_ms_for_unit_test(0);
   });
   const uint64_t transfer_token = 719;
-  const std::string record_payload = record_locks_payload();
+  const std::string record_payload = metadata_only_record_locks_payload();
 
   Local_file_preserved_trx_carrier warm_carrier(m_dir);
   PrebuiltRecordLocksBlob prebuilt_record;
@@ -18238,6 +18301,37 @@ TEST_F(PreserveSnapshotTest,
       preserve_trx_transfer_receiver_record_object_prewarm_count_status();
   ASSERT_EQ(record_object_prewarm_before + 1, after_phase1);
 
+  lock_preserve_record_lock_metadata_facts_t facts;
+  ASSERT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_facts(record_payload,
+                                                           &facts));
+  lock_preserve_metadata_plan_validation_t validation;
+  validation.object_generation = phase1_manifest.source_epoch_commit_lsn;
+  validation.expected_object_generation =
+      phase1_manifest.source_epoch_commit_lsn;
+  validation.physical_fence_lsn = phase1_manifest.source_epoch_commit_lsn;
+  validation.artifact_protocol_version = 1;
+  validation.source_server_version = MYSQL_VERSION_ID;
+  validation.object_digest = test_sha256_hex(record_payload);
+  validation.final_lock_generation_digest =
+      facts.final_lock_generation_digest;
+  validation.page_layout_digest = facts.page_layout_digest;
+  validation.dictionary_generation_digest =
+      facts.dictionary_generation_digest;
+  validation.implicit_native_continuity_proven = true;
+  validation.is_final_quiesced = true;
+  lock_preserve_metadata_dict_lease_ops_t lease_ops;
+  lease_ops.acquire = transfer_metadata_dict_lease_acquire;
+  lease_ops.revalidate = transfer_metadata_dict_lease_revalidate;
+  lease_ops.release = transfer_metadata_dict_lease_release;
+  auto prepared_plan = std::make_unique<lock_preserve_metadata_plan_t>();
+  ASSERT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_plan(
+                record_payload, validation, lease_ops, prepared_plan.get()));
+  ASSERT_TRUE(prepared_plan->ready());
+  ASSERT_TRUE(preserve_trx_transfer_put_receiver_record_lock_plan_for_unit_test(
+      m_dir, phase1_manifest, std::move(prepared_plan), facts));
+
   Preserve_trx_transfer_session_artifact_sink artifact_sink(
       &session, transfer_token, m_dir);
   Preserve_snapshot_metadata written_metadata;
@@ -18255,7 +18349,7 @@ TEST_F(PreserveSnapshotTest,
     }
     my_sleep(10000);
   }
-  EXPECT_EQ(after_phase1 + 1,
+  EXPECT_EQ(after_phase1,
             preserve_trx_transfer_receiver_record_object_prewarm_count_status());
 }
 
@@ -18308,14 +18402,14 @@ TEST_F(PreserveSnapshotTest,
 
   for (uint attempt = 0; attempt < 100; ++attempt) {
     if (preserve_trx_transfer_receiver_object_prewarm_miss_count_status() >=
-        miss_count_before + 2) {
+        miss_count_before + 1) {
       break;
     }
     my_sleep(10000);
   }
   EXPECT_EQ(proof_count_before,
             preserve_trx_transfer_receiver_object_prewarm_proof_count_status());
-  EXPECT_EQ(miss_count_before + 2,
+  EXPECT_EQ(miss_count_before + 1,
             preserve_trx_transfer_receiver_object_prewarm_miss_count_status());
 }
 

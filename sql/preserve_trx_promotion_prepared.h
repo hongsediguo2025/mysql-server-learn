@@ -20,6 +20,7 @@
 
 class Mysql_binlog_preserve_payload_reader;
 class Mysql_binlog_preserve_prepared_cache_handle;
+class Preserve_memory_lease;
 struct Preserved_trx_bundle;
 class Preserve_trx_internal_operation_capability;
 struct Mysql_binlog_preserve_cache_facts;
@@ -302,6 +303,9 @@ class Preserve_trx_prepared_token_resources {
   void reset() noexcept;
   Preserve_trx_prepared_status install_record_lock_plan(
       std::unique_ptr<lock_preserve_metadata_plan_t> plan);
+  Preserve_trx_prepared_status install_record_lock_plan_with_memory_lease(
+      std::unique_ptr<lock_preserve_metadata_plan_t> plan,
+      Preserve_memory_lease &&memory_lease);
   Preserve_trx_prepared_status install_semantic_bundle(
       std::unique_ptr<Preserved_trx_bundle> bundle);
   Mysql_binlog_preserve_cache_status prepare_native_binlog_handle(

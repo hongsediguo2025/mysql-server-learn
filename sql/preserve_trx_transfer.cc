@@ -244,6 +244,7 @@ struct Receiver_object_prewarm_proof {
 struct Receiver_record_lock_prepared {
   std::unique_ptr<lock_preserve_metadata_plan_t> plan;
   lock_preserve_record_lock_metadata_facts_t facts;
+  Preserve_memory_lease memory_lease;
 };
 static std::mutex g_receiver_object_prewarm_proof_mutex;
 static std::map<Receiver_object_prewarm_key, Receiver_object_prewarm_proof>
@@ -2886,7 +2887,8 @@ bool put_receiver_record_lock_prepared(
     const std::string &root_dir,
     const Preserve_trx_transfer_manifest &manifest,
     std::unique_ptr<lock_preserve_metadata_plan_t> plan,
-    const lock_preserve_record_lock_metadata_facts_t &facts) {
+    const lock_preserve_record_lock_metadata_facts_t &facts,
+    Preserve_memory_lease memory_lease = Preserve_memory_lease{}) {
   Receiver_object_prewarm_key key;
   if (!receiver_record_lock_prepared_key(root_dir, manifest, &key) ||
       plan == nullptr || !plan->ready() || facts.unique_pages == 0 ||
@@ -2897,9 +2899,20 @@ bool put_receiver_record_lock_prepared(
       facts.bitmap_bits != plan->bitmap_bits()) {
     return false;
   }
+  if (!memory_lease.acquired()) {
+    const std::string resource_token =
+        "receiver-lock-plan:" + root_dir + ":" + manifest.epoch_id + ":" +
+        std::to_string(manifest.token) + ":" + digest_hex(key.digest);
+    memory_lease = preserve_trx_acquire_memory_lease(
+        resource_token, Preserve_trx_memory_kind::PROMOTION_LOCK_PLAN,
+        plan->capacity_bytes());
+    if (!memory_lease.acquired()) return false;
+  }
+  if (memory_lease.bytes() != plan->capacity_bytes()) return false;
   Receiver_record_lock_prepared prepared;
   prepared.plan = std::move(plan);
   prepared.facts = facts;
+  prepared.memory_lease = std::move(memory_lease);
   std::lock_guard<std::mutex> guard(g_receiver_record_lock_prepared_mutex);
   auto found = g_receiver_record_lock_prepared.find(key);
   if (found != g_receiver_record_lock_prepared.end()) return true;
@@ -3102,7 +3115,8 @@ bool prepare_strict_bundle_for_receiver(
   auto restore_unconsumed_plan = create_scope_guard([&] {
     if (prepared.plan != nullptr) {
       (void)put_receiver_record_lock_prepared(
-          root_dir, manifest, std::move(prepared.plan), prepared.facts);
+          root_dir, manifest, std::move(prepared.plan), prepared.facts,
+          std::move(prepared.memory_lease));
     }
   });
 
@@ -3116,19 +3130,34 @@ bool prepare_strict_bundle_for_receiver(
   auto semantic_bundle = std::make_unique<Preserved_trx_bundle>(bundle);
   semantic_bundle->metadata.binlog_cache_payload.clear();
   semantic_bundle->external_blobs.clear();
+  const uint64_t lock_plan_bytes_to_acquire =
+      prepared.memory_lease.acquired() ? 0 : plan_capacity_bytes;
   if (preserved_trx_acquire_prepared_token_resources(
-          key, plan_capacity_bytes, native_binlog_bytes,
+          key, lock_plan_bytes_to_acquire, native_binlog_bytes,
           native_binlog_fd_count, native_binlog_tmpdir_bytes, &resources) !=
-          Preserve_trx_prepared_status::OK ||
-      (binlog_reader != nullptr &&
-       resources.prepare_native_binlog_handle_for_receiver(
-           binlog_facts, binlog_reader.get()) !=
-           Mysql_binlog_preserve_cache_status::OK) ||
-      resources.install_semantic_bundle(std::move(semantic_bundle)) !=
-          Preserve_trx_prepared_status::OK ||
-      (prepared.plan != nullptr &&
-       resources.install_record_lock_plan(std::move(prepared.plan)) !=
-           Preserve_trx_prepared_status::OK)) {
+      Preserve_trx_prepared_status::OK) {
+    return false;
+  }
+  if (binlog_reader != nullptr &&
+      resources.prepare_native_binlog_handle_for_receiver(
+          binlog_facts, binlog_reader.get()) !=
+          Mysql_binlog_preserve_cache_status::OK) {
+    return false;
+  }
+  if (resources.install_semantic_bundle(std::move(semantic_bundle)) !=
+      Preserve_trx_prepared_status::OK) {
+    return false;
+  }
+  if (prepared.plan != nullptr) {
+    const Preserve_trx_prepared_status install_status =
+        prepared.memory_lease.acquired()
+            ? resources.install_record_lock_plan_with_memory_lease(
+                  std::move(prepared.plan),
+                  std::move(prepared.memory_lease))
+            : resources.install_record_lock_plan(std::move(prepared.plan));
+    if (install_status != Preserve_trx_prepared_status::OK) return false;
+  }
+  if (!resources.acquired()) {
     return false;
   }
   const auto status = registry.publish_prewarmed(
@@ -7248,6 +7277,14 @@ Preserve_trx_transfer_status stream_prebuilt_external_blob_for_transfer(
   Preserve_trx_transfer_status status =
       session->declare_object(transfer_token, descriptor);
   if (status != Preserve_trx_transfer_status::OK) return status;
+  if (expected_name == kPreservedTrxBlobRecordLocks) {
+    const Preserve_trx_transfer_status begin_status =
+        session->begin_token_prewarm_manifest(transfer_token);
+    if (begin_status != Preserve_trx_transfer_status::OK &&
+        begin_status != Preserve_trx_transfer_status::UNSUPPORTED) {
+      return begin_status;
+    }
+  }
   for (uint64_t offset = 0; offset < materialized.payload.length();
        offset += session->chunk_bytes()) {
     const size_t length = std::min<uint64_t>(
@@ -7321,6 +7358,7 @@ Preserve_trx_transfer_source_epoch_session::stream_prebuilt_blobs_batch(
   }
   std::vector<std::string> encoded_frames;
   std::vector<size_t> sent_request_indexes;
+  std::set<uint64_t> prewarm_started_tokens;
   const uint64_t first_sequence = m_next_sequence;
   auto sequence_guard = create_scope_guard(
       [&] { m_next_sequence = first_sequence; });
@@ -7372,6 +7410,46 @@ Preserve_trx_transfer_source_epoch_session::stream_prebuilt_blobs_batch(
     status = preserve_trx_transfer_encode_frame(declare, &encoded_declare);
     if (status != Preserve_trx_transfer_status::OK) return status;
     encoded_frames.push_back(std::move(encoded_declare));
+
+    if (prepared.descriptor.object_id == kPreservedTrxBlobRecordLocks &&
+        m_prewarm_manifest_tokens.count(transfer_token) == 0 &&
+        prewarm_started_tokens.insert(transfer_token).second) {
+      Preserve_trx_transfer_manifest prewarm_manifest;
+      prewarm_manifest.epoch_id = m_epoch_id;
+      prewarm_manifest.source_server_uuid = m_source_server_uuid;
+      prewarm_manifest.target_server_uuid = m_target_server_uuid;
+      prewarm_manifest.token = transfer_token;
+      if (load_source_transfer_lsn_fact(
+              &prewarm_manifest.source_prepare_lsn,
+              &prewarm_manifest.source_epoch_commit_lsn)) {
+        const auto existing =
+            m_streaming_declared_objects.find(transfer_token);
+        if (existing != m_streaming_declared_objects.end()) {
+          for (const auto &entry : existing->second) {
+            prewarm_manifest.objects.push_back(entry.second);
+          }
+        }
+        prewarm_manifest.objects.push_back(prepared.descriptor);
+        status = validate_manifest_components(prewarm_manifest, false);
+        if (status != Preserve_trx_transfer_status::OK) return status;
+        std::string prewarm_payload;
+        status = preserve_trx_transfer_encode_manifest(prewarm_manifest,
+                                                       &prewarm_payload);
+        if (status != Preserve_trx_transfer_status::OK) return status;
+        Preserve_trx_transfer_frame begin;
+        begin.type = Preserve_trx_transfer_frame_type::BEGIN;
+        begin.sequence = m_next_sequence++;
+        begin.epoch_id = m_epoch_id;
+        begin.token = transfer_token;
+        begin.manifest_payload = std::move(prewarm_payload);
+        std::string encoded_begin;
+        status = preserve_trx_transfer_encode_frame(begin, &encoded_begin);
+        if (status != Preserve_trx_transfer_status::OK) return status;
+        encoded_frames.push_back(std::move(encoded_begin));
+      } else {
+        prewarm_started_tokens.erase(transfer_token);
+      }
+    }
 
     for (uint64_t offset = 0; offset < prepared.payload.length();
          offset += m_chunk_bytes) {
@@ -7435,6 +7513,9 @@ Preserve_trx_transfer_source_epoch_session::stream_prebuilt_blobs_batch(
       }
     }
   }
+
+  m_prewarm_manifest_tokens.insert(prewarm_started_tokens.begin(),
+                                   prewarm_started_tokens.end());
 
   for (size_t request_index : sent_request_indexes) {
     const Materialized_request &prepared =

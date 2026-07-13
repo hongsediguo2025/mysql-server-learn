@@ -1050,6 +1050,24 @@ Preserve_trx_prepared_token_resources::install_record_lock_plan(
 }
 
 Preserve_trx_prepared_status
+Preserve_trx_prepared_token_resources::
+    install_record_lock_plan_with_memory_lease(
+        std::unique_ptr<lock_preserve_metadata_plan_t> plan,
+        Preserve_memory_lease &&memory_lease) {
+  if (m_impl == nullptr || !m_impl->acquired || plan == nullptr ||
+      m_impl->record_lock_plan != nullptr || !plan->ready() ||
+      !memory_lease.acquired() ||
+      memory_lease.bytes() != plan->capacity_bytes() ||
+      m_impl->lock_plan_bytes != 0) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  m_impl->lock_plan_memory = std::move(memory_lease);
+  m_impl->lock_plan_bytes = plan->capacity_bytes();
+  m_impl->record_lock_plan = std::move(plan);
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
 Preserve_trx_prepared_token_resources::install_semantic_bundle(
     std::unique_ptr<Preserved_trx_bundle> bundle) {
   if (m_impl == nullptr || !m_impl->acquired || bundle == nullptr ||
