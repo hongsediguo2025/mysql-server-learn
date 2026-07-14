@@ -9534,7 +9534,6 @@ void preserve_trx_transfer_shutdown_receiver_prewarm_workers() {
       return !g_receiver_prewarm_workers_starting &&
              !g_receiver_prewarm_workers_stopping;
     });
-    if (!g_receiver_prewarm_workers_started) return;
     g_receiver_prewarm_workers_stopping = true;
     g_receiver_prewarm_shutdown = true;
     workers.swap(g_receiver_prewarm_workers);
@@ -9583,6 +9582,8 @@ void preserve_trx_transfer_shutdown_receiver_prewarm_workers() {
     std::lock_guard<std::mutex> guard(g_receiver_strict_binlog_facts_mutex);
     g_receiver_strict_binlog_facts.clear();
   }
+  (void)preserved_trx_strict_prepared_token_registry()
+      .discard_all_for_process_shutdown();
 }
 
 Preserve_trx_transfer_status mark_epoch_records_corrupt(

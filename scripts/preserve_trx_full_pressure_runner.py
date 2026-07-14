@@ -1063,6 +1063,32 @@ def stop_owned_servers(paths: FullPressurePaths, timeout_s: float = 30.0) -> Dic
     }
 
 
+_SERVER_FATAL_PATTERNS = (
+    re.compile(r"Assertion failure:.*", re.IGNORECASE),
+    re.compile(r"mysqld got signal [0-9]+.*", re.IGNORECASE),
+    re.compile(r"Segmentation fault.*", re.IGNORECASE),
+)
+
+
+def detect_server_shutdown_failures(paths: FullPressurePaths) -> List[str]:
+    failures: List[str] = []
+    for label, error_log in (
+        ("source", paths.source_error_log),
+        ("receiver", paths.receiver_error_log),
+    ):
+        if not error_log.is_file():
+            continue
+        contents = error_log.read_text(encoding="utf-8", errors="replace")
+        matches = [
+            match.group(0)
+            for pattern in _SERVER_FATAL_PATTERNS
+            if (match := pattern.search(contents)) is not None
+        ]
+        if matches:
+            failures.append(f"{label} mysqld shutdown failed: " + "; ".join(matches))
+    return failures
+
+
 class RunnerLock:
     def __init__(self, history_root: Path) -> None:
         self.path = history_root / ".runner.lock"
@@ -1276,6 +1302,7 @@ class FullPressureRunner:
                 result["server_cleanup"] = stop_owned_servers(self.paths)
             except BaseException as exc:
                 cleanup_errors.append(f"server cleanup: {exc}")
+            cleanup_errors.extend(detect_server_shutdown_failures(self.paths))
             remaining_run_processes = matching_run_processes(self.paths)
             result["remaining_run_processes"] = [
                 {"pid": pid, "command": command}

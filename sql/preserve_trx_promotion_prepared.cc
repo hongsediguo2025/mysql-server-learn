@@ -2328,6 +2328,34 @@ void Preserve_trx_prepared_token_registry::purge_epoch(
   }
 }
 
+size_t
+Preserve_trx_prepared_token_registry::discard_all_for_process_shutdown() {
+  std::vector<Preserve_trx_prepared_token_resources> retired_resources;
+  size_t discarded = 0;
+  {
+    std::lock_guard<std::mutex> guard(m_state->mutex);
+    discarded = m_state->entries.size();
+    retired_resources.reserve(discarded);
+    for (auto &item : m_state->entries) {
+      auto &entry = item.second;
+      std::lock_guard<std::mutex> entry_guard(entry->mutex);
+      entry->retired_from_registry = true;
+      entry->preparing = false;
+      entry->preparing_generation = 0;
+      entry->state.store(Preserve_trx_prepared_token_state::STALE_GENERATION,
+                         std::memory_order_release);
+      std::atomic_store_explicit(
+          &entry->publication,
+          std::shared_ptr<const Preserve_trx_prepared_token_publication>{},
+          std::memory_order_release);
+      entry->prewarm_object_set_digest.clear();
+      retired_resources.push_back(std::move(entry->resources));
+    }
+    m_state->entries.clear();
+  }
+  return discarded;
+}
+
 Preserve_trx_prepared_token_registry &
 preserved_trx_strict_prepared_token_registry() {
   static Preserve_trx_prepared_token_registry registry;

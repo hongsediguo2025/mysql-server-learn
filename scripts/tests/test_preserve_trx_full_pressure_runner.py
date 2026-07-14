@@ -14,6 +14,7 @@ from scripts.preserve_trx_full_pressure_runner import (
     build_mysqld_commands,
     build_release_command,
     create_owned_work_dir,
+    detect_server_shutdown_failures,
     redact_command,
     remove_owned_work_dir,
     run_with_finalization,
@@ -147,6 +148,56 @@ class FullPressureProfileTest(unittest.TestCase):
 
 
 class FullPressureEnvironmentTest(unittest.TestCase):
+    def test_shutdown_log_scan_rejects_mysqld_assertion(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = FullPressurePaths.resolve(
+                repo_root=root / "repo",
+                build_dir=Path("build-release"),
+                work_root=root / "work",
+                history_root=root / "history",
+                run_id="run-assertion",
+            )
+            paths.source_error_log.parent.mkdir(parents=True, exist_ok=True)
+            paths.receiver_error_log.parent.mkdir(parents=True, exist_ok=True)
+            paths.source_error_log.write_text(
+                "Shutdown complete\n", encoding="utf-8"
+            )
+            paths.receiver_error_log.write_text(
+                "Assertion failure: dict0dict.cc:1885:table->get_ref_count() == 0\n"
+                "mysqld got signal 6 ;\n",
+                encoding="utf-8",
+            )
+
+            failures = detect_server_shutdown_failures(paths)
+
+        self.assertEqual(1, len(failures))
+        self.assertIn("receiver", failures[0])
+        self.assertIn("dict0dict.cc:1885", failures[0])
+
+    def test_shutdown_log_scan_accepts_clean_shutdown(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = FullPressurePaths.resolve(
+                repo_root=root / "repo",
+                build_dir=Path("build-release"),
+                work_root=root / "work",
+                history_root=root / "history",
+                run_id="run-clean",
+            )
+            paths.source_error_log.parent.mkdir(parents=True, exist_ok=True)
+            paths.receiver_error_log.parent.mkdir(parents=True, exist_ok=True)
+            paths.source_error_log.write_text(
+                "Shutdown complete\n", encoding="utf-8"
+            )
+            paths.receiver_error_log.write_text(
+                "Shutdown complete\n", encoding="utf-8"
+            )
+
+            failures = detect_server_shutdown_failures(paths)
+
+        self.assertEqual([], failures)
+
     def test_preflight_rejects_occupied_port(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

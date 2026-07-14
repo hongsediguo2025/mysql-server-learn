@@ -532,6 +532,8 @@ class Preserve_trx_prepared_token_registry {
       const Preserve_trx_prepared_token_key &key);
   void purge_epoch(const std::string &source_uuid,
                    const std::string &epoch_id);
+  /* Process shutdown only: discard receiver-owned prepared resources. */
+  size_t discard_all_for_process_shutdown();
 
  private:
   std::shared_ptr<Preserve_trx_prepared_registry_state> m_state;

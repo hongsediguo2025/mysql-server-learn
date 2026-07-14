@@ -2690,12 +2690,83 @@ void transfer_metadata_dict_lease_release(void *opaque_lease) {
   delete static_cast<uint64_t *>(opaque_lease);
 }
 
+std::atomic<uint64_t> shutdown_metadata_dict_lease_release_count{0};
+
+void shutdown_metadata_dict_lease_release(void *opaque_lease) {
+  shutdown_metadata_dict_lease_release_count.fetch_add(
+      1, std::memory_order_relaxed);
+  delete static_cast<uint64_t *>(opaque_lease);
+}
+
 lock_preserve_metadata_dict_lease_ops_t transfer_metadata_dict_lease_ops() {
   lock_preserve_metadata_dict_lease_ops_t ops;
   ops.acquire = transfer_metadata_dict_lease_acquire;
   ops.revalidate = transfer_metadata_dict_lease_revalidate;
   ops.release = transfer_metadata_dict_lease_release;
   return ops;
+}
+
+TEST(PreservedTrxPreparedRegistry,
+     ReceiverWorkerShutdownReleasesPreparedMetadataPlan) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  shutdown_metadata_dict_lease_release_count.store(0,
+                                                    std::memory_order_relaxed);
+
+  const auto key = make_prepared_token_key(1);
+  const std::string payload = metadata_only_record_locks_payload();
+  lock_preserve_record_lock_metadata_facts_t facts;
+  ASSERT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_facts(payload, &facts));
+
+  lock_preserve_metadata_plan_validation_t validation;
+  validation.object_generation = 5;
+  validation.expected_object_generation = 5;
+  validation.physical_fence_lsn = 5;
+  validation.artifact_protocol_version = 1;
+  validation.source_server_version = MYSQL_VERSION_ID;
+  validation.object_digest = test_sha256_hex(payload);
+  validation.final_lock_generation_digest =
+      facts.final_lock_generation_digest;
+  validation.page_layout_digest = facts.page_layout_digest;
+  validation.dictionary_generation_digest =
+      facts.dictionary_generation_digest;
+  validation.implicit_native_continuity_proven = true;
+  validation.is_final_quiesced = true;
+
+  auto lease_ops = transfer_metadata_dict_lease_ops();
+  lease_ops.release = shutdown_metadata_dict_lease_release;
+  auto plan = std::make_unique<lock_preserve_metadata_plan_t>();
+  ASSERT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_plan(
+                payload, validation, lease_ops, plan.get()));
+  ASSERT_TRUE(plan->ready());
+  const uint64_t plan_bytes = plan->capacity_bytes();
+
+  auto resources = acquire_prepared_resources(key, plan_bytes);
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            resources.install_record_lock_plan(std::move(plan)));
+  auto &registry = preserved_trx_strict_prepared_token_registry();
+  ASSERT_EQ(0U, registry.discard_all_for_process_shutdown());
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, key.generation, &prepare));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_prewarmed(&prepare, std::string(64, 'e'),
+                                       std::move(resources)));
+  EXPECT_GT(preserve_trx_memory_current_bytes_status(), 0U);
+  EXPECT_EQ(0U, shutdown_metadata_dict_lease_release_count.load(
+                    std::memory_order_relaxed));
+
+  preserve_trx_transfer_shutdown_receiver_prewarm_workers();
+
+  EXPECT_EQ(1U, shutdown_metadata_dict_lease_release_count.load(
+                    std::memory_order_relaxed));
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  Preserve_trx_prepared_token_snapshot snapshot;
+  EXPECT_EQ(Preserve_trx_prepared_status::NOT_FOUND,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(0U, registry.discard_all_for_process_shutdown());
+  preserve_trx_resource_manager_reset_for_unit_test();
 }
 
 std::string record_locks_payload_two_bits_one_entry() {
