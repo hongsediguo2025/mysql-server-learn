@@ -1,0 +1,20 @@
+DROP TABLE IF EXISTS t_snapshot_size_limit;
+SET GLOBAL preserve_trx_enable=ON;
+SET @saved_preserve_trx_max_snapshot_bytes=@@GLOBAL.preserve_trx_max_snapshot_bytes;
+SET GLOBAL preserve_trx_max_snapshot_bytes=1;
+CREATE TABLE t_snapshot_size_limit(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_snapshot_size_limit VALUES(1,10);
+START TRANSACTION;
+UPDATE t_snapshot_size_limit SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+SELECT * FROM t_snapshot_size_limit ORDER BY a;
+a	b
+1	10
+DROP TABLE t_snapshot_size_limit;
+SET GLOBAL preserve_trx_max_snapshot_bytes=@saved_preserve_trx_max_snapshot_bytes;
+SET GLOBAL preserve_trx_enable=ON;

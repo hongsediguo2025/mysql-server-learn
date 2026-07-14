@@ -1,0 +1,18 @@
+CREATE TABLE t_pr_off_iodku (id INT PRIMARY KEY, v INT UNIQUE) ENGINE=InnoDB;
+INSERT INTO t_pr_off_iodku VALUES (1, 10), (2, 20);
+START TRANSACTION;
+INSERT INTO t_pr_off_iodku VALUES (3, 30)
+ON DUPLICATE KEY UPDATE v = 30;
+SAVEPOINT s1;
+INSERT INTO t_pr_off_iodku VALUES (1, 99)
+ON DUPLICATE KEY UPDATE v = 20;
+ERROR 23000: Duplicate entry '20' for key 't_pr_off_iodku.v'
+ROLLBACK TO SAVEPOINT s1;
+UPDATE t_pr_off_iodku SET v = 31 WHERE id = 3;
+COMMIT;
+SELECT * FROM t_pr_off_iodku ORDER BY id;
+id	v
+1	10
+2	20
+3	31
+DROP TABLE t_pr_off_iodku;

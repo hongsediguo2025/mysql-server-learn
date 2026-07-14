@@ -1,0 +1,53 @@
+DROP TABLE IF EXISTS t_lock_warmcopy_implicit_gap;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+CREATE TABLE t_lock_warmcopy_implicit_gap(
+id INT PRIMARY KEY,
+uk INT UNIQUE,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_implicit_gap VALUES(10,10,10),(30,30,30);
+START TRANSACTION;
+INSERT INTO t_lock_warmcopy_implicit_gap VALUES(20,20,20);
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+include/assert_grep.inc [lock warmcopy succeeds for implicit gap strict mode]
+SELECT COUNT(*) AS preserved_count_after_implicit_gap
+FROM performance_schema.preserved_transactions;
+preserved_count_after_implicit_gap
+1
+SELECT COUNT(*) AS visible_before_gap_resume
+FROM t_lock_warmcopy_implicit_gap
+WHERE id=20 OR uk=20;
+visible_before_gap_resume
+0
+SET innodb_lock_wait_timeout=1;
+INSERT INTO t_lock_warmcopy_implicit_gap VALUES(15,15,15);
+INSERT INTO t_lock_warmcopy_implicit_gap VALUES(25,25,25);
+COMMIT;
+SELECT id, uk, v
+FROM t_lock_warmcopy_implicit_gap
+ORDER BY id;
+id	uk	v
+10	10	10
+15	15	15
+25	25	25
+30	30	30
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+SELECT COUNT(*) AS preserved_count_after_implicit_gap_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_implicit_gap_resume
+0
+SELECT id, uk, v
+FROM t_lock_warmcopy_implicit_gap
+ORDER BY id;
+id	uk	v
+10	10	10
+15	15	15
+20	20	20
+25	25	25
+30	30	30
+DROP TABLE t_lock_warmcopy_implicit_gap;

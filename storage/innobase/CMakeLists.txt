@@ -141,6 +141,8 @@ SET(INNOBASE_SOURCES
   lock/lock0prdt.cc
   lock/lock0latches.cc
   lock/lock0lock.cc
+  lock/lock0preserve.cc
+  lock/lock0warmcopy.cc
   lock/lock0wait.cc
   log/log0buf.cc
   log/log0chkp.cc
@@ -198,6 +200,8 @@ SET(INNOBASE_SOURCES
   sync/sync0debug.cc
   sync/sync0sync.cc
   trx/trx0i_s.cc
+  trx/trx0preserve.cc
+  trx/trx0temp_preserve.cc
   trx/trx0purge.cc
   trx/trx0rec.cc
   trx/trx0roll.cc

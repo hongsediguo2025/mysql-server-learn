@@ -4409,6 +4409,82 @@ bool MDL_ticket::has_pending_conflicting_lock() const {
 
 const MDL_key *MDL_ticket::get_key() const { return &m_lock->key; }
 
+bool MDL_context::visit_tickets(enum_mdl_duration duration,
+                                Ticket_visitor visitor, void *arg) const {
+  if (visitor == nullptr) return true;
+
+  MDL_ticket_store::List_iterator it = m_ticket_store.list_iterator(duration);
+  for (MDL_ticket *ticket = it++; ticket != nullptr; ticket = it++) {
+    if (visitor(ticket, arg)) return true;
+  }
+  return false;
+}
+
+bool MDL_context::export_savepoint_ordinals(
+    const MDL_savepoint &mdl_savepoint, uint32 *stmt_ordinal,
+    uint32 *trans_ordinal) const {
+  auto ticket_ordinal = [this](enum_mdl_duration duration, MDL_ticket *sentinel,
+                               uint32 *ordinal) {
+    if (ordinal == nullptr) return true;
+    if (sentinel == nullptr) {
+      *ordinal = 0;
+      return false;
+    }
+
+    uint32 current_ordinal = 0;
+    MDL_ticket_store::List_iterator it = m_ticket_store.list_iterator(duration);
+    for (MDL_ticket *ticket = it++; ticket != nullptr; ticket = it++) {
+      ++current_ordinal;
+      if (ticket == sentinel) {
+        *ordinal = current_ordinal;
+        return false;
+      }
+    }
+    return true;
+  };
+
+  return ticket_ordinal(MDL_STATEMENT, mdl_savepoint.m_stmt_ticket,
+                        stmt_ordinal) ||
+         ticket_ordinal(MDL_TRANSACTION, mdl_savepoint.m_trans_ticket,
+                        trans_ordinal);
+}
+
+bool MDL_context::savepoint_from_ordinals(uint32 stmt_ordinal,
+                                          uint32 trans_ordinal,
+                                          MDL_savepoint *mdl_savepoint) const {
+  if (mdl_savepoint == nullptr) return true;
+
+  auto ticket_from_ordinal = [this](enum_mdl_duration duration, uint32 ordinal,
+                                    MDL_ticket **sentinel) {
+    if (sentinel == nullptr) return true;
+    if (ordinal == 0) {
+      *sentinel = nullptr;
+      return false;
+    }
+
+    uint32 current_ordinal = 0;
+    MDL_ticket_store::List_iterator it = m_ticket_store.list_iterator(duration);
+    for (MDL_ticket *ticket = it++; ticket != nullptr; ticket = it++) {
+      ++current_ordinal;
+      if (current_ordinal == ordinal) {
+        *sentinel = ticket;
+        return false;
+      }
+    }
+    return true;
+  };
+
+  MDL_ticket *stmt_ticket = nullptr;
+  MDL_ticket *trans_ticket = nullptr;
+  if (ticket_from_ordinal(MDL_STATEMENT, stmt_ordinal, &stmt_ticket) ||
+      ticket_from_ordinal(MDL_TRANSACTION, trans_ordinal, &trans_ticket)) {
+    return true;
+  }
+
+  *mdl_savepoint = MDL_savepoint(stmt_ticket, trans_ticket);
+  return false;
+}
+
 /**
   Releases metadata locks that were acquired after a specific savepoint.
 

@@ -257,6 +257,11 @@ SET(SERVER_TESTS
   opt_range
   opt_ref
   opt_trace
+  preserve_trx_drain
+  preserve_trx
+  preserve_trx_temp_table
+  preserve_trx_lock_warmcopy
+  preserve_trx_warmcopy
   protocol_classic
   regexp_engine
   regexp_facade

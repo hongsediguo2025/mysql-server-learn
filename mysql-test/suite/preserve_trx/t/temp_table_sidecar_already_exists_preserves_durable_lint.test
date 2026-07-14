@@ -1,0 +1,65 @@
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+# Lint-only: the behavioral coverage lives in the gunit
+# AdoptCollisionPreservesDurableImageUndoAndCleansOnlyWarmSidecars.
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+my $gunit_path = File::Spec->catfile($source_root, 'unittest', 'gunit',
+                                     'preserve_trx_temp_table-t.cc');
+open(my $fh, '<', $gunit_path) or die "cannot open $gunit_path: $!";
+my $gunit = do { local $/; <$fh> };
+close($fh);
+
+$gunit =~ /TEST_F\s*\(\s*TempPhysicalImageCarrierTest\s*,\s*AdoptCollisionPreservesDurableImageUndoAndCleansOnlyWarmSidecars\s*\)[\s\S]*?^}/m
+  or die "could not isolate temp sidecar adopt-collision gunit\n";
+my $already_exists = $&;
+die "ALREADY_EXISTS temp sidecar test must cover both image and undo sidecars\n"
+  unless $already_exists =~ /seal_warm_image/s &&
+         $already_exists =~ /seal_warm_undo/s &&
+         $already_exists =~ /Preserved_trx_carrier_status::ALREADY_EXISTS/s;
+die "ALREADY_EXISTS temp sidecar test must prove durable sealed sidecars remain unchanged\n"
+  unless $already_exists =~ /sealed_physical_image_path/s &&
+         $already_exists =~ /sealed_physical_undo_path/s &&
+         $already_exists =~ /EXPECT_EQ\s*\(\s*image_payload\s*,\s*read_file/s &&
+         $already_exists =~ /EXPECT_EQ\s*\(\s*undo_payload\s*,\s*read_file/s;
+die "ALREADY_EXISTS temp sidecar test must prove orphan cleanup removes only rejected warm sidecars\n"
+  unless $already_exists =~ /preserve_trx_temp_table_remove_orphan_sidecars/s &&
+         $already_exists =~ /EXPECT_FALSE\s*\(\s*exists\s*\(\s*warm_physical_image_path/s &&
+         $already_exists =~ /EXPECT_FALSE\s*\(\s*exists\s*\(\s*warm_physical_undo_path/s;
+
+my $carrier_path = File::Spec->catfile($source_root, 'sql',
+                                       'preserve_trx_temp_table_carrier.cc');
+open(my $carrier_fh, '<', $carrier_path)
+  or die "cannot open $carrier_path: $!";
+my $carrier = do { local $/; <$carrier_fh> };
+close($carrier_fh);
+my $install_start =
+  index($carrier, 'Preserved_trx_carrier_status install_temp_file');
+my $install_end =
+  index($carrier, 'Preserved_trx_carrier_status atomic_write_file',
+        $install_start);
+die "could not isolate temp-table install_temp_file\n"
+  if $install_start < 0 || $install_end < 0 ||
+     $install_end <= $install_start;
+my $install_temp_file =
+  substr($carrier, $install_start, $install_end - $install_start);
+my $link_start =
+  index($install_temp_file,
+        'if (link(tmp_path.c_str(), final_path.c_str()) == 0)');
+my $link_end = index($install_temp_file, 'set_my_errno(errno);', $link_start);
+die "could not isolate temp-table install_temp_file link branch\n"
+  if $link_start < 0 || $link_end < 0 || $link_end <= $link_start;
+my $link_branch = substr($install_temp_file, $link_start,
+                         $link_end - $link_start);
+die "temp sidecar install must treat link-success tmp cleanup failure as stale tmp cleanup, not an untracked final-file failure\n"
+  unless $link_branch =~
+         /my_delete\s*\(tmp_path\.c_str\(\)[\s\S]*return\s+Preserved_trx_carrier_status::OK/s &&
+         $link_branch !~ /Preserved_trx_carrier_status::IO_ERROR/s;
+EOF
+
+SELECT 'lint-only' AS temp_table_sidecar_already_exists_preserves_durable_lint;

@@ -1,0 +1,33 @@
+DROP TABLE IF EXISTS t_timeout_resume_rollback_failure;
+SET GLOBAL preserve_trx_enable=ON;
+SET SESSION preserve_trx_min_timeout=1;
+SET SESSION preserve_trx_default_timeout=1;
+SET SESSION preserve_trx_max_timeout=86400;
+CREATE TABLE t_timeout_resume_rollback_failure(a INT PRIMARY KEY, b INT)
+ENGINE=InnoDB;
+INSERT INTO t_timeout_resume_rollback_failure VALUES(1,10);
+START TRANSACTION;
+UPDATE t_timeout_resume_rollback_failure SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+SET SESSION debug="+d,preserve_trx_fail_resume_timeout_rollback";
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug="-d,preserve_trx_fail_resume_timeout_rollback";
+SELECT STATE,
+LAST_ERROR = 'recovery timeout expired; resume timeout rollback failure'
+         AS last_error_preserved,
+LAST_ERROR_AT IS NOT NULL AS last_error_at_set
+FROM performance_schema.preserved_transactions;
+STATE	last_error_preserved	last_error_at_set
+FAILED	1	1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*) AS preserved_count_after_retry_cleanup
+FROM performance_schema.preserved_transactions;
+preserved_count_after_retry_cleanup
+0
+SELECT * FROM t_timeout_resume_rollback_failure ORDER BY a;
+a	b
+1	10
+DROP TABLE t_timeout_resume_rollback_failure;
+SET GLOBAL preserve_trx_enable=ON;

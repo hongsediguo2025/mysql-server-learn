@@ -56,6 +56,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "ibuf0ibuf.h"
 #include "log0log.h"
 #include "srv0srv.h"
+#include "trx0temp_preserve.h"
 #endif /* !UNIV_HOTBACKUP */
 #include "dict0mem.h"
 #include "fsp0sysspace.h"
@@ -398,6 +399,18 @@ page_no_t xdes_find_bit(xdes_t *descr, /*!< in: descriptor */
   return (FIL_NULL);
 }
 
+static bool fsp_temp_preserve_page_reserved(space_id_t space_id,
+                                            page_no_t page_no) {
+  return fsp_is_system_temporary(space_id) &&
+         trx_preserve_temp_space_image_page_reserved(
+             static_cast<uint32_t>(space_id), static_cast<uint32_t>(page_no));
+}
+
+static bool fsp_temp_preserve_page_reservation_active(space_id_t space_id) {
+  return fsp_is_system_temporary(space_id) &&
+         trx_preserve_temp_space_image_has_page_reservations();
+}
+
 /** Returns the number of used pages in a descriptor.
  @return number of pages used */
 UNIV_INLINE
@@ -669,6 +682,111 @@ page_no_t xdes_get_offset(const xdes_t *descr) /*!< in: extent descriptor */
           static_cast<page_no_t>(
               ((page_offset(descr) - XDES_ARR_OFFSET) / XDES_SIZE) *
               FSP_EXTENT_SIZE));
+}
+
+static bool fsp_extent_has_temp_preserve_page_reservation(space_id_t space_id,
+                                                          const xdes_t *descr) {
+  if (!fsp_temp_preserve_page_reservation_active(space_id)) return false;
+
+  const page_no_t extent_start = xdes_get_offset(descr);
+  for (page_no_t bit = 0; bit < FSP_EXTENT_SIZE; ++bit) {
+    if (fsp_temp_preserve_page_reserved(space_id, extent_start + bit)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/*
+  Find a free fragment page while honoring preserved temp-page reservations.
+  When no reservation is active this is the original xdes_find_bit() lookup.
+  The reservation-aware scan is used only for the system temporary tablespace,
+  where a preserved token may still own no-redo undo pages that look free in
+  the freshly restarted allocator.
+*/
+static page_no_t xdes_find_free_bit_for_temp_preserve(
+    space_id_t space_id, xdes_t *descr, page_no_t hint, bool scan_down,
+    mtr_t *mtr) {
+  ut_ad(descr && mtr);
+  ut_ad(hint < FSP_EXTENT_SIZE);
+
+  if (!fsp_temp_preserve_page_reservation_active(space_id)) {
+    return (xdes_find_bit(descr, XDES_FREE_BIT, TRUE, hint, mtr));
+  }
+
+  const page_no_t extent_start = xdes_get_offset(descr);
+
+  for (page_no_t step = 0; step < FSP_EXTENT_SIZE; ++step) {
+    const page_no_t bit =
+        scan_down ? (hint + FSP_EXTENT_SIZE - step) % FSP_EXTENT_SIZE
+                  : (hint + step) % FSP_EXTENT_SIZE;
+
+    if (xdes_mtr_get_bit(descr, XDES_FREE_BIT, bit, mtr) &&
+        !fsp_temp_preserve_page_reserved(space_id, extent_start + bit)) {
+      return (bit);
+    }
+  }
+
+  return (FIL_NULL);
+}
+
+/*
+  Locate a FREE_FRAG extent with at least one non-reserved page.  A preserved
+  token can reserve sparse pages in otherwise reusable extents; this helper lets
+  ordinary temporary-table allocation skip those holes instead of consuming a
+  page that resume still has to claim.
+*/
+static xdes_t *fsp_find_free_frag_for_temp_preserve(
+    space_id_t space_id, const page_size_t &page_size, fsp_header_t *header,
+    page_no_t hint, page_no_t *free, mtr_t *mtr) {
+  ut_ad(fsp_is_system_temporary(space_id));
+  ut_ad(header && free && mtr);
+
+  *free = FIL_NULL;
+
+  xdes_t *descr = xdes_get_descriptor_with_space_hdr(
+      header, space_id, hint, mtr);
+
+  if (descr && xdes_get_state(descr, mtr) == XDES_FREE_FRAG) {
+    *free = xdes_find_free_bit_for_temp_preserve(
+        space_id, descr, hint % FSP_EXTENT_SIZE, false, mtr);
+
+    if (*free != FIL_NULL) {
+      return (descr);
+    }
+  }
+
+  fil_addr_t node = flst_get_first(header + FSP_FREE_FRAG, mtr);
+
+  while (!fil_addr_is_null(node)) {
+    descr = xdes_lst_get_descriptor(space_id, page_size, node, mtr);
+    *free = xdes_find_free_bit_for_temp_preserve(space_id, descr, 0, false,
+                                                 mtr);
+
+    if (*free != FIL_NULL) {
+      return (descr);
+    }
+
+    node = flst_get_next_addr(descr + XDES_FLST_NODE, mtr);
+  }
+
+  return (nullptr);
+}
+
+static xdes_t *fsp_find_free_extent_for_temp_preserve(
+    space_id_t space_id, const page_size_t &page_size, fsp_header_t *header,
+    mtr_t *mtr) {
+  fil_addr_t node = flst_get_first(header + FSP_FREE, mtr);
+
+  while (!fil_addr_is_null(node)) {
+    xdes_t *descr = xdes_lst_get_descriptor(space_id, page_size, node, mtr);
+    if (!fsp_extent_has_temp_preserve_page_reservation(space_id, descr)) {
+      return descr;
+    }
+    node = flst_get_next_addr(descr + XDES_FLST_NODE, mtr);
+  }
+
+  return nullptr;
 }
 #endif /* !UNIV_HOTBACKUP */
 
@@ -1554,23 +1672,38 @@ static xdes_t *fsp_alloc_free_extent(space_id_t space_id,
     fil_block_check_type(desc_block, FIL_PAGE_TYPE_XDES, mtr);
   }
 
-  if (descr && (xdes_get_state(descr, mtr) == XDES_FREE)) {
+  if (descr && (xdes_get_state(descr, mtr) == XDES_FREE) &&
+      !fsp_extent_has_temp_preserve_page_reservation(space_id, descr)) {
     /* Ok, we can take this extent */
   } else {
     /* Take the first extent in the free list */
-    first = flst_get_first(header + FSP_FREE, mtr);
+    if (fsp_temp_preserve_page_reservation_active(space_id)) {
+      descr = fsp_find_free_extent_for_temp_preserve(space_id, page_size, header,
+                                                     mtr);
+    } else {
+      first = flst_get_first(header + FSP_FREE, mtr);
+      descr = fil_addr_is_null(first)
+                  ? nullptr
+                  : xdes_lst_get_descriptor(space_id, page_size, first, mtr);
+    }
 
-    if (fil_addr_is_null(first)) {
+    if (descr == nullptr) {
       fsp_fill_free_list(false, space, header, mtr);
 
-      first = flst_get_first(header + FSP_FREE, mtr);
+      if (fsp_temp_preserve_page_reservation_active(space_id)) {
+        descr = fsp_find_free_extent_for_temp_preserve(space_id, page_size,
+                                                       header, mtr);
+      } else {
+        first = flst_get_first(header + FSP_FREE, mtr);
+        descr = fil_addr_is_null(first)
+                    ? nullptr
+                    : xdes_lst_get_descriptor(space_id, page_size, first, mtr);
+      }
     }
 
-    if (fil_addr_is_null(first)) {
+    if (descr == nullptr) {
       return (nullptr); /* No free extents left */
     }
-
-    descr = xdes_lst_get_descriptor(space_id, page_size, first, mtr);
   }
 
   flst_remove(header + FSP_FREE, descr + XDES_FLST_NODE, mtr);
@@ -1670,50 +1803,83 @@ static MY_ATTRIBUTE((warn_unused_result)) buf_block_t *fsp_alloc_free_page(
   ut_d(fsp_space_modify_check(space, mtr));
   header = fsp_get_space_header(space, page_size, mtr);
 
-  /* Get the hinted descriptor */
-  descr = xdes_get_descriptor_with_space_hdr(header, space, hint, mtr);
+  if (fsp_temp_preserve_page_reservation_active(space)) {
+    /*
+      Preserve reservations are rare and scoped to restart/resume windows.  Keep
+      the normal allocation path byte-for-byte local below; only when a
+      reservation is active do we scan FREE_FRAG while skipping reserved pages.
+    */
+    descr = fsp_find_free_frag_for_temp_preserve(space, page_size, header, hint,
+                                                 &free, mtr);
 
-  if (descr && (xdes_get_state(descr, mtr) == XDES_FREE_FRAG)) {
-    /* Ok, we can take this extent */
-  } else {
-    /* Else take the first extent in free_frag list */
-    first = flst_get_first(header + FSP_FREE_FRAG, mtr);
-
-    if (fil_addr_is_null(first)) {
-      /* There are no partially full fragments: allocate
-      a free extent and add it to the FREE_FRAG list. NOTE
-      that the allocation may have as a side-effect that an
-      extent containing a descriptor page is added to the
-      FREE_FRAG list. But we will allocate our page from the
-      the free extent anyway. */
-
+    while (descr == nullptr) {
       descr = fsp_alloc_free_extent(space, page_size, hint, mtr);
 
       if (descr == nullptr) {
-        /* No free space left */
-
         return (nullptr);
       }
 
       xdes_set_state(descr, XDES_FREE_FRAG, mtr);
       flst_add_last(header + FSP_FREE_FRAG, descr + XDES_FLST_NODE, mtr);
+
+      const page_no_t descr_start = xdes_get_offset(descr);
+      const page_no_t free_hint =
+          descr_start <= hint && hint < descr_start + FSP_EXTENT_SIZE
+              ? hint % FSP_EXTENT_SIZE
+              : 0;
+      free = xdes_find_free_bit_for_temp_preserve(space, descr, free_hint,
+                                                  false, mtr);
+
+      if (free == FIL_NULL) {
+        descr = nullptr;
+      }
+    }
+  } else {
+    /* Get the hinted descriptor */
+    descr = xdes_get_descriptor_with_space_hdr(header, space, hint, mtr);
+
+    if (descr && (xdes_get_state(descr, mtr) == XDES_FREE_FRAG)) {
+      /* Ok, we can take this extent */
     } else {
-      descr = xdes_lst_get_descriptor(space, page_size, first, mtr);
+      /* Else take the first extent in free_frag list */
+      first = flst_get_first(header + FSP_FREE_FRAG, mtr);
+
+      if (fil_addr_is_null(first)) {
+        /* There are no partially full fragments: allocate
+        a free extent and add it to the FREE_FRAG list. NOTE
+        that the allocation may have as a side-effect that an
+        extent containing a descriptor page is added to the
+        FREE_FRAG list. But we will allocate our page from the
+        the free extent anyway. */
+
+        descr = fsp_alloc_free_extent(space, page_size, hint, mtr);
+
+        if (descr == nullptr) {
+          /* No free space left */
+
+          return (nullptr);
+        }
+
+        xdes_set_state(descr, XDES_FREE_FRAG, mtr);
+        flst_add_last(header + FSP_FREE_FRAG, descr + XDES_FLST_NODE, mtr);
+      } else {
+        descr = xdes_lst_get_descriptor(space, page_size, first, mtr);
+      }
+
+      /* Reset the hint */
+      hint = 0;
     }
 
-    /* Reset the hint */
-    hint = 0;
-  }
+    /* Now we have in descr an extent with at least one free page. Look
+    for a free page in the extent. */
+    free = xdes_find_free_bit_for_temp_preserve(
+        space, descr, hint % FSP_EXTENT_SIZE, false, mtr);
+    if (free == FIL_NULL) {
+      ut_print_buf(stderr, ((byte *)descr) - 500, 1000);
+      putc('\n', stderr);
 
-  /* Now we have in descr an extent with at least one free page. Look
-  for a free page in the extent. */
-
-  free = xdes_find_bit(descr, XDES_FREE_BIT, TRUE, hint % FSP_EXTENT_SIZE, mtr);
-  if (free == FIL_NULL) {
-    ut_print_buf(stderr, ((byte *)descr) - 500, 1000);
-    putc('\n', stderr);
-
-    ut_error;
+      ut_error;
+    }
   }
 
   page_no = xdes_get_offset(descr) + free;
@@ -2365,6 +2531,205 @@ funct_exit:
   return block;
 }
 
+#ifndef UNIV_HOTBACKUP
+/** Make a reserved preserved temporary-table page visible to the FSP extent
+descriptor layer before exact-page adoption tries to claim it. A restarted
+system temporary tablespace can be physically extendable while its FSP free
+limit still stops below a preserved no-redo undo page. Native adoption must
+advance the ordinary FSP metadata first; otherwise xdes_get_descriptor() would
+correctly report that the page has no initialized descriptor yet.
+@param[in,out]	space	Tablespace
+@param[in,out]	header	Tablespace header
+@param[in]	page_no	Exact reserved page to claim
+@param[in,out]	mtr	Mini-transaction
+@return true if the page is covered by initialized FSP metadata */
+static bool fsp_prepare_reserved_temp_page_for_claim(fil_space_t *space,
+                                                     fsp_header_t *header,
+                                                     page_no_t page_no,
+                                                     mtr_t *mtr) {
+  ut_ad(space != nullptr);
+  ut_ad(header != nullptr);
+  ut_ad(mtr != nullptr);
+  ut_ad(fsp_is_system_temporary(space->id));
+  ut_d(fsp_space_modify_check(space->id, mtr));
+
+  for (;;) {
+    const page_no_t size = mach_read_from_4(header + FSP_SIZE);
+    const page_no_t limit = mach_read_from_4(header + FSP_FREE_LIMIT);
+
+    ut_ad(size == space->size_in_header);
+    ut_ad(limit == space->free_limit ||
+          (space->free_limit == 0 && space->purpose == FIL_TYPE_TEMPORARY));
+
+    if (page_no < size && page_no < limit) {
+      return true;
+    }
+
+    const page_no_t old_size = space->size_in_header;
+    const page_no_t old_limit = space->free_limit;
+    fsp_fill_free_list(false, space, header, mtr);
+
+    if (old_size == space->size_in_header && old_limit == space->free_limit) {
+      return false;
+    }
+  }
+}
+
+/** Claim one exact page that was reserved for preserved temporary-table resume.
+The caller must already have created or located the file segment inode. The
+reservation is released only after XDES, FSEG fragment metadata, and the buffer
+page have all accepted the exact page. If any native ownership step fails, the
+reservation remains as the retry/cleanup guard that keeps ordinary temporary
+allocation away from the preserved page. */
+static buf_block_t *fseg_claim_reserved_page_for_temp_preserve(
+    fil_space_t *space, const page_size_t &page_size, fseg_inode_t *inode,
+    page_no_t page_no, rw_lock_type_t rw_latch, mtr_t *mtr) {
+  ut_ad(space != nullptr);
+  ut_ad(inode != nullptr);
+  ut_ad(mtr != nullptr);
+  ut_ad(fsp_is_system_temporary(space->id));
+  ut_ad(mach_read_from_4(inode + FSEG_MAGIC_N) == FSEG_MAGIC_N_VALUE);
+
+  if (!trx_preserve_temp_space_image_page_reserved(
+          static_cast<uint32_t>(space->id), static_cast<uint32_t>(page_no))) {
+    return nullptr;
+  }
+
+  mtr_x_lock_space(space, mtr);
+
+  fsp_header_t *header = fsp_get_space_header(space->id, page_size, mtr);
+  if (!fsp_prepare_reserved_temp_page_for_claim(space, header, page_no, mtr)) {
+    return nullptr;
+  }
+
+  xdes_t *descr = xdes_get_descriptor(space->id, page_no, page_size, mtr);
+  if (descr == nullptr) return nullptr;
+  if (!xdes_mtr_get_bit(descr, XDES_FREE_BIT, page_no % FSP_EXTENT_SIZE, mtr)) {
+    return nullptr;
+  }
+
+  const xdes_state_t state = xdes_get_state(descr, mtr);
+  if (state != XDES_FREE && state != XDES_FREE_FRAG) {
+    return nullptr;
+  }
+
+  const ulint frag_slot = fseg_find_free_frag_page_slot(inode, mtr);
+  if (frag_slot == ULINT_UNDEFINED) return nullptr;
+
+  /*
+    The ordinary segment allocator treats its page argument as a hint, not a
+    contract. Native no-redo undo adoption is stricter: the undo header and log
+    page numbers are already serialized in the sidecar, so the rebuilt FSEG
+    must own those exact pages before the rseg slot is published.
+  */
+  if (state == XDES_FREE) {
+    flst_remove(header + FSP_FREE, descr + XDES_FLST_NODE, mtr);
+    ut_a(space->free_len > 0);
+    --space->free_len;
+    xdes_set_state(descr, XDES_FREE_FRAG, mtr);
+    flst_add_last(header + FSP_FREE_FRAG, descr + XDES_FLST_NODE, mtr);
+  }
+
+  fsp_alloc_from_free_frag(header, descr, page_no % FSP_EXTENT_SIZE, mtr);
+  fseg_set_nth_frag_page_no(inode, frag_slot, page_no, mtr);
+
+  buf_block_t *block =
+      fsp_page_create(page_id_t(space->id, page_no), page_size, rw_latch, mtr,
+                      mtr);
+  if (block != nullptr) {
+    trx_preserve_temp_space_image_release_page_reservation(
+        static_cast<uint32_t>(space->id), static_cast<uint32_t>(page_no));
+  }
+  return block;
+}
+
+buf_block_t *fseg_create_at_reserved_page_for_temp_preserve(
+    space_id_t space_id, page_no_t page_no, ulint byte_offset, mtr_t *mtr) {
+  if (!fsp_is_system_temporary(space_id) || page_no == FIL_NULL ||
+      byte_offset + FSEG_HEADER_SIZE > UNIV_PAGE_SIZE - FIL_PAGE_DATA_END ||
+      mtr == nullptr) {
+    return nullptr;
+  }
+
+  fil_space_t *space = fil_space_get(space_id);
+  if (space == nullptr) return nullptr;
+
+  mtr_x_lock_space(space, mtr);
+
+  const page_size_t page_size(space->flags);
+  ulint n_reserved = 0;
+  if (!fsp_reserve_free_extents(&n_reserved, space_id, 2, FSP_NORMAL, mtr)) {
+    return nullptr;
+  }
+
+  fsp_header_t *space_header = fsp_get_space_header(space_id, page_size, mtr);
+  fseg_inode_t *inode = fsp_alloc_seg_inode(space_header, mtr);
+  if (inode == nullptr) {
+    fil_space_release_free_extents(space_id, n_reserved);
+    return nullptr;
+  }
+
+  const ib_id_t seg_id = mach_read_from_8(space_header + FSP_SEG_ID);
+  mlog_write_ull(space_header + FSP_SEG_ID, seg_id + 1, mtr);
+  mlog_write_ull(inode + FSEG_ID, seg_id, mtr);
+  {
+    File_segment_inode fseg_inode(space_id, page_size, inode, mtr);
+    fseg_inode.write_not_full_n_used(0);
+  }
+  flst_init(inode + FSEG_FREE, mtr);
+  flst_init(inode + FSEG_NOT_FULL, mtr);
+  flst_init(inode + FSEG_FULL, mtr);
+  mlog_write_ulint(inode + FSEG_MAGIC_N, FSEG_MAGIC_N_VALUE, MLOG_4BYTES, mtr);
+  for (ulint i = 0; i < FSEG_FRAG_ARR_N_SLOTS; ++i) {
+    fseg_set_nth_frag_page_no(inode, i, FIL_NULL, mtr);
+  }
+
+  buf_block_t *block = fseg_claim_reserved_page_for_temp_preserve(
+      space, page_size, inode, page_no, RW_X_LATCH, mtr);
+  if (block == nullptr) {
+    fsp_free_seg_inode(space_id, page_size, inode, mtr);
+    fil_space_release_free_extents(space_id, n_reserved);
+    return nullptr;
+  }
+
+  byte *frame = buf_block_get_frame(block);
+  fseg_header_t *header = frame + byte_offset;
+  mlog_write_ulint(frame + FIL_PAGE_TYPE, FIL_PAGE_TYPE_SYS, MLOG_2BYTES, mtr);
+  mlog_write_ulint(header + FSEG_HDR_OFFSET, page_offset(inode), MLOG_2BYTES,
+                   mtr);
+  mlog_write_ulint(header + FSEG_HDR_PAGE_NO, page_get_page_no(page_align(inode)),
+                   MLOG_4BYTES, mtr);
+  mlog_write_ulint(header + FSEG_HDR_SPACE, space_id, MLOG_4BYTES, mtr);
+
+  fil_space_release_free_extents(space_id, n_reserved);
+  return block;
+}
+
+buf_block_t *fseg_alloc_reserved_page_for_temp_preserve(
+    fseg_header_t *seg_header, page_no_t page_no, mtr_t *mtr) {
+  if (seg_header == nullptr || page_no == FIL_NULL || mtr == nullptr) {
+    return nullptr;
+  }
+
+  const space_id_t space_id = page_get_space_id(page_align(seg_header));
+  if (!fsp_is_system_temporary(space_id)) return nullptr;
+
+  fil_space_t *space = fil_space_get(space_id);
+  if (space == nullptr) return nullptr;
+
+  mtr_x_lock_space(space, mtr);
+
+  const page_size_t page_size(space->flags);
+  buf_block_t *inode_block = nullptr;
+  fseg_inode_t *inode =
+      fseg_inode_get(seg_header, space_id, page_size, mtr, &inode_block);
+  fil_block_check_type(inode_block, FIL_PAGE_INODE, mtr);
+
+  return fseg_claim_reserved_page_for_temp_preserve(space, page_size, inode,
+                                                    page_no, RW_X_LATCH, mtr);
+}
+#endif /* !UNIV_HOTBACKUP */
+
 /** Creates a new segment.
  @return the block where the segment header is placed, x-latched, NULL
  if could not create segment because of lack of space */
@@ -2503,6 +2868,9 @@ static void fseg_fill_free_list(fseg_inode_t *inode, space_id_t space,
     }
 
     descr = fsp_alloc_free_extent(space, page_size, hint, mtr);
+    if (descr == nullptr) {
+      return;
+    }
 
     seg_id = mach_read_from_8(inode + FSEG_ID);
     ut_ad(mach_read_from_4(inode + FSEG_MAGIC_N) == FSEG_MAGIC_N_VALUE);
@@ -2584,7 +2952,7 @@ static xdes_t *fsp_get_last_free_frag_extent(fsp_header_t *header,
 static xdes_t *fsp_alloc_xdes_free_frag(space_id_t space, fseg_inode_t *inode,
                                         const page_size_t &page_size,
                                         mtr_t *mtr) {
-  xdes_t *descr;
+  xdes_t *descr = nullptr;
   ib_id_t seg_id;
   ulint n_used;
 
@@ -2593,14 +2961,42 @@ static xdes_t *fsp_alloc_xdes_free_frag(space_id_t space, fseg_inode_t *inode,
 
   fsp_header_t *header = fsp_get_space_header(space, page_size, mtr);
 
-  /* If available, take an extent from the free_frag list. */
-  if (!(descr = fsp_get_last_free_frag_extent(header, page_size, mtr))) {
+  if (fsp_temp_preserve_page_reservation_active(space)) {
+    /*
+      A preserved temporary table may still own individual pages in an
+      extent that otherwise looks reusable after restart.  When the
+      reservation registry is active, lease only an extent whose full range is
+      free of preserved-page claims; the normal last-extent shortcut remains
+      unchanged for ordinary startup and non-preserve workloads.
+    */
+    fil_addr_t node = flst_get_last(header + FSP_FREE_FRAG, mtr);
+
+    while (!fil_addr_is_null(node)) {
+      xdes_t *candidate = xdes_lst_get_descriptor(space, page_size, node, mtr);
+      const fil_addr_t prev =
+          flst_get_prev_addr(candidate + XDES_FLST_NODE, mtr);
+
+      if (xdes_is_leasable(candidate, page_size, mtr) &&
+          !fsp_extent_has_temp_preserve_page_reservation(space, candidate)) {
+        descr = candidate;
+        break;
+      }
+
+      node = prev;
+    }
+  } else {
+    /* If available, take an extent from the free_frag list. */
+    descr = fsp_get_last_free_frag_extent(header, page_size, mtr);
+
+    if (descr != nullptr && !xdes_is_leasable(descr, page_size, mtr)) {
+      return (nullptr);
+    }
+  }
+
+  if (descr == nullptr) {
     return (nullptr);
   }
 
-  if (!xdes_is_leasable(descr, page_size, mtr)) {
-    return (nullptr);
-  }
   ut_ad(xdes_get_n_used(descr, mtr) == XDES_FRAG_N_USED);
 
   /* Remove from the FSP_FREE_FRAG list */
@@ -2622,6 +3018,41 @@ static xdes_t *fsp_alloc_xdes_free_frag(space_id_t space, fseg_inode_t *inode,
       static_cast<uint32_t>(n_used + XDES_FRAG_N_USED));
 
   return (descr);
+}
+
+static xdes_t *fseg_find_free_page_in_list_for_temp_preserve(
+    space_id_t space, const page_size_t &page_size, flst_base_node_t *base,
+    page_no_t hint, bool scan_down, page_no_t *free_bit, mtr_t *mtr) {
+  ut_ad(fsp_temp_preserve_page_reservation_active(space));
+  ut_ad(base != nullptr);
+  ut_ad(free_bit != nullptr);
+  ut_ad(mtr != nullptr);
+
+  *free_bit = FIL_NULL;
+
+  fil_addr_t node = flst_get_first(base, mtr);
+
+  while (!fil_addr_is_null(node)) {
+    xdes_t *descr = xdes_lst_get_descriptor(space, page_size, node, mtr);
+    page_no_t start = scan_down ? FSP_EXTENT_SIZE - 1 : 0;
+    const page_no_t extent_start = xdes_get_offset(descr);
+
+    if (hint != FIL_NULL && hint >= extent_start &&
+        hint < extent_start + FSP_EXTENT_SIZE) {
+      start = hint % FSP_EXTENT_SIZE;
+    }
+
+    *free_bit = xdes_find_free_bit_for_temp_preserve(space, descr, start,
+                                                     scan_down, mtr);
+
+    if (*free_bit != FIL_NULL) {
+      return (descr);
+    }
+
+    node = flst_get_next_addr(descr + XDES_FLST_NODE, mtr);
+  }
+
+  return (nullptr);
 }
 
 /** Allocates a free extent for the segment: looks first in the free list of
@@ -2650,10 +3081,24 @@ static xdes_t *fseg_alloc_free_extent(fseg_inode_t *inode, space_id_t space,
   if (flst_get_len(inode + FSEG_FREE) > 0) {
     /* Segment free list is not empty, allocate from it */
 
-    first = flst_get_first(inode + FSEG_FREE, mtr);
+    if (fsp_temp_preserve_page_reservation_active(space)) {
+      page_no_t free_bit;
 
-    descr = xdes_lst_get_descriptor(space, page_size, first, mtr);
-  } else {
+      descr = fseg_find_free_page_in_list_for_temp_preserve(
+          space, page_size, inode + FSEG_FREE, FIL_NULL, false, &free_bit, mtr);
+
+      if (descr != nullptr) {
+        return (descr);
+      }
+    } else {
+      first = flst_get_first(inode + FSEG_FREE, mtr);
+
+      descr = xdes_lst_get_descriptor(space, page_size, first, mtr);
+      return (descr);
+    }
+  }
+
+  {
     /* Segment free list was empty. */
 
     /* Check if we can allocate an extent from free frag
@@ -2762,7 +3207,8 @@ static buf_block_t *fseg_alloc_free_page_low(fil_space_t *space,
   /*-------------------------------------------------------------*/
   if (xdes_in_segment(descr, seg_id, mtr) &&
       (xdes_mtr_get_bit(descr, XDES_FREE_BIT, hint % FSP_EXTENT_SIZE, mtr) ==
-       TRUE)) {
+       TRUE) &&
+      !fsp_temp_preserve_page_reserved(space_id, hint)) {
   take_hinted_page:
     /* 1. We can take the hinted page
     =================================*/
@@ -2781,8 +3227,9 @@ static buf_block_t *fseg_alloc_free_page_low(fil_space_t *space,
     the hinted page
     ===============*/
     ret_descr = fsp_alloc_free_extent(space_id, page_size, hint, mtr);
-
-    ut_a(ret_descr == descr);
+    if (ret_descr == nullptr) {
+      return (nullptr);
+    }
 
     xdes_set_segment_id(ret_descr, seg_id, XDES_FSEG, mtr);
     flst_add_last(seg_inode + FSEG_FREE, ret_descr + XDES_FLST_NODE, mtr);
@@ -2790,7 +3237,25 @@ static buf_block_t *fseg_alloc_free_page_low(fil_space_t *space,
     /* Try to fill the segment free list */
     fseg_fill_free_list(seg_inode, space_id, page_size, hint + FSP_EXTENT_SIZE,
                         mtr);
-    goto take_hinted_page;
+    if (!fsp_temp_preserve_page_reservation_active(space_id)) {
+      goto take_hinted_page;
+    }
+
+    /*
+      Reservation-aware free-extent lookup may skip the hinted FREE extent
+      when it contains a page still owned by a preserved token.  Allocate from
+      the extent that was actually returned, using the original hint only when
+      it still falls inside that extent.
+    */
+    const page_no_t ret_extent_start = xdes_get_offset(ret_descr);
+    const page_no_t ret_hint =
+        hint >= ret_extent_start && hint < ret_extent_start + FSP_EXTENT_SIZE
+            ? hint % FSP_EXTENT_SIZE
+            : 0;
+    const page_no_t free_bit = xdes_find_free_bit_for_temp_preserve(
+        space_id, ret_descr, ret_hint, false, mtr);
+    ret_page = free_bit == FIL_NULL ? FIL_NULL
+                                    : ret_extent_start + free_bit;
     /*-----------------------------------------------------------*/
   } else if ((direction != FSP_NO_DIR) &&
              ((reserved - used) < reserved / FSEG_FILLFACTOR) &&
@@ -2804,11 +3269,18 @@ static buf_block_t *fseg_alloc_free_page_low(fil_space_t *space,
     highest page in it, depending on the direction
     ==============================================*/
     ret_page = xdes_get_offset(ret_descr);
-
-    if (direction == FSP_DOWN) {
-      ret_page += FSP_EXTENT_SIZE - 1;
-    } else if (xdes_get_state(ret_descr, mtr) == XDES_FSEG_FRAG) {
-      ret_page += xdes_find_bit(ret_descr, XDES_FREE_BIT, TRUE, 0, mtr);
+    if (!fsp_temp_preserve_page_reservation_active(space_id)) {
+      if (direction == FSP_DOWN) {
+        ret_page += FSP_EXTENT_SIZE - 1;
+      } else if (xdes_get_state(ret_descr, mtr) == XDES_FSEG_FRAG) {
+        ret_page += xdes_find_bit(ret_descr, XDES_FREE_BIT, TRUE, 0, mtr);
+      }
+    } else {
+      const page_no_t free_bit = xdes_find_free_bit_for_temp_preserve(
+          space_id, ret_descr, direction == FSP_DOWN ? FSP_EXTENT_SIZE - 1 : 0,
+          direction == FSP_DOWN, mtr);
+      ret_page = free_bit == FIL_NULL ? FIL_NULL
+                                      : xdes_get_offset(ret_descr) + free_bit;
     }
 
     ut_ad(!has_done_reservation || ret_page != FIL_NULL);
@@ -2822,9 +3294,26 @@ static buf_block_t *fseg_alloc_free_page_low(fil_space_t *space,
     segment)
     ========*/
     ret_descr = descr;
-    ret_page = xdes_get_offset(ret_descr) +
-               xdes_find_bit(ret_descr, XDES_FREE_BIT, TRUE,
-                             hint % FSP_EXTENT_SIZE, mtr);
+    page_no_t free_bit =
+        fsp_temp_preserve_page_reservation_active(space_id)
+            ? xdes_find_free_bit_for_temp_preserve(
+                  space_id, ret_descr, hint % FSP_EXTENT_SIZE, false, mtr)
+            : xdes_find_bit(ret_descr, XDES_FREE_BIT, TRUE,
+                            hint % FSP_EXTENT_SIZE, mtr);
+    if (free_bit == FIL_NULL &&
+        fsp_temp_preserve_page_reservation_active(space_id)) {
+      ret_descr = fseg_find_free_page_in_list_for_temp_preserve(
+          space_id, page_size, seg_inode + FSEG_NOT_FULL, hint, false,
+          &free_bit, mtr);
+
+      if (ret_descr == nullptr) {
+        ret_descr = fseg_find_free_page_in_list_for_temp_preserve(
+            space_id, page_size, seg_inode + FSEG_FREE, hint, false, &free_bit,
+            mtr);
+      }
+    }
+    ret_page = free_bit == FIL_NULL ? FIL_NULL
+                                    : xdes_get_offset(ret_descr) + free_bit;
     ut_ad(!has_done_reservation || ret_page != FIL_NULL);
     /*-----------------------------------------------------------*/
   } else if (used < reserved) {
@@ -2832,18 +3321,33 @@ static buf_block_t *fseg_alloc_free_page_low(fil_space_t *space,
     ==============================================*/
     fil_addr_t first;
 
-    if (flst_get_len(seg_inode + FSEG_NOT_FULL) > 0) {
+    page_no_t free_bit = FIL_NULL;
+
+    if (fsp_temp_preserve_page_reservation_active(space_id)) {
+      ret_descr = fseg_find_free_page_in_list_for_temp_preserve(
+          space_id, page_size, seg_inode + FSEG_NOT_FULL, 0, false, &free_bit,
+          mtr);
+
+      if (ret_descr == nullptr) {
+        ret_descr = fseg_find_free_page_in_list_for_temp_preserve(
+            space_id, page_size, seg_inode + FSEG_FREE, 0, false, &free_bit,
+            mtr);
+      }
+    } else if (flst_get_len(seg_inode + FSEG_NOT_FULL) > 0) {
       first = flst_get_first(seg_inode + FSEG_NOT_FULL, mtr);
+      ret_descr = xdes_lst_get_descriptor(space_id, page_size, first, mtr);
+      free_bit = xdes_find_bit(ret_descr, XDES_FREE_BIT, TRUE, 0, mtr);
     } else if (flst_get_len(seg_inode + FSEG_FREE) > 0) {
       first = flst_get_first(seg_inode + FSEG_FREE, mtr);
+      ret_descr = xdes_lst_get_descriptor(space_id, page_size, first, mtr);
+      free_bit = xdes_find_bit(ret_descr, XDES_FREE_BIT, TRUE, 0, mtr);
     } else {
       ut_ad(!has_done_reservation);
       return (nullptr);
     }
 
-    ret_descr = xdes_lst_get_descriptor(space_id, page_size, first, mtr);
-    ret_page = xdes_get_offset(ret_descr) +
-               xdes_find_bit(ret_descr, XDES_FREE_BIT, TRUE, 0, mtr);
+    ret_page = free_bit == FIL_NULL ? FIL_NULL
+                                    : xdes_get_offset(ret_descr) + free_bit;
     ut_ad(!has_done_reservation || ret_page != FIL_NULL);
     /*-----------------------------------------------------------*/
   } else if (used < FSEG_FRAG_LIMIT) {
@@ -2876,12 +3380,10 @@ static buf_block_t *fseg_alloc_free_page_low(fil_space_t *space,
       ret_page = FIL_NULL;
       ut_ad(!has_done_reservation);
     } else {
-      const xdes_state_t state = xdes_get_state(ret_descr, mtr);
-      ret_page = xdes_get_offset(ret_descr);
-
-      if (state == XDES_FSEG_FRAG) {
-        ret_page += xdes_find_bit(ret_descr, XDES_FREE_BIT, TRUE, 0, mtr);
-      }
+      const page_no_t free_bit = xdes_find_free_bit_for_temp_preserve(
+          space_id, ret_descr, 0, false, mtr);
+      ret_page = free_bit == FIL_NULL ? FIL_NULL
+                                      : xdes_get_offset(ret_descr) + free_bit;
 
       ut_ad(!has_done_reservation || ret_page != FIL_NULL);
     }

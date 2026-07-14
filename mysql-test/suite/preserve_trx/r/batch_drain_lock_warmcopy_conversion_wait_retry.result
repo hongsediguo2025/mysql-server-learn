@@ -1,0 +1,7 @@
+# Lint-only source-shape guard for ordinary implicit-to-explicit
+# conversion wait/retry. Runtime command-barrier behavior is covered by
+# batch_drain_lock_warmcopy_conversion_nowait_skiplocked; the low-level
+# wait success and timeout cases are covered by lock0warmcopy GUnit.
+SELECT 'ok' AS batch_drain_lock_warmcopy_conversion_wait_retry;
+batch_drain_lock_warmcopy_conversion_wait_retry
+ok

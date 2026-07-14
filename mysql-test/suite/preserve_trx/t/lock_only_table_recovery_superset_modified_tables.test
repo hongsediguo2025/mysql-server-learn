@@ -1,0 +1,62 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_lock_only_modified;
+DROP TABLE IF EXISTS t_lock_only_locked;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_lock_only_modified(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+CREATE TABLE t_lock_only_locked(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_lock_only_modified VALUES(1,10),(2,20);
+INSERT INTO t_lock_only_locked VALUES(1,100),(2,200);
+
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE t_lock_only_modified SET v=11 WHERE id=1;
+SELECT * FROM t_lock_only_locked WHERE id=1 FOR UPDATE;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+SELECT LOCKS_COUNT >= 2 AS restored_modified_and_lock_only_table_locks
+  FROM performance_schema.preserved_transactions;
+
+--connect(lock_only_competing_writer, localhost, root,,test)
+SET SESSION innodb_lock_wait_timeout=1;
+--error ER_LOCK_WAIT_TIMEOUT
+UPDATE t_lock_only_locked SET v=101 WHERE id=1;
+
+--connection default
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+COMMIT;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+--connection lock_only_competing_writer
+UPDATE t_lock_only_locked SET v=101 WHERE id=1;
+--disconnect lock_only_competing_writer
+
+--connection default
+SELECT * FROM t_lock_only_modified ORDER BY id;
+SELECT * FROM t_lock_only_locked ORDER BY id;
+
+DROP TABLE t_lock_only_modified;
+DROP TABLE t_lock_only_locked;
+SET GLOBAL preserve_trx_enable=ON;

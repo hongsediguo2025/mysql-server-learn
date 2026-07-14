@@ -1,0 +1,24 @@
+--source include/force_restart.inc
+
+--let $restart_parameters= restart: --preserve-trx-enable=OFF
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
+SELECT @@global.preserve_trx_enable;
+
+--error ER_PRESERVE_TRX_DISABLED
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+
+--error ER_PRESERVE_TRX_DISABLED
+RESUME PRESERVED TRANSACTION 'msp_test_token';
+
+SHOW PRESERVED TRANSACTIONS;
+--source suite/preserve_trx/include/assert_preserved_row_key_columns.inc
+
+SELECT COUNT(*) AS rows_seen
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=

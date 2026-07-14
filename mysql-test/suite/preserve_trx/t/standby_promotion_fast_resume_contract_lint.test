@@ -1,0 +1,234 @@
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+# Source-shape contract only. Runtime behavior is covered by GUnit and targeted
+# promotion/transfer MTR tests.
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_source {
+  my ($path) = @_;
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $source = do { local $/; <$fh> };
+  close($fh);
+  return $source;
+}
+
+my $prepared = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_promotion_prepared.cc'));
+my $prepared_h = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_promotion_prepared.h'));
+my $promotion = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_promotion.cc'));
+my $transfer = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx_transfer.cc'));
+my $preserve = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx.cc'));
+my $sys_vars = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'sys_vars.cc'));
+my $mysqld = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'mysqld.cc'));
+my $lock_preserve = read_source(File::Spec->catfile(
+  $source_root, 'storage', 'innobase', 'lock', 'lock0preserve.cc'));
+my $lock_native = read_source(File::Spec->catfile(
+  $source_root, 'storage', 'innobase', 'lock', 'lock0lock.cc'));
+my $binlog = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'binlog.cc'));
+my $binlog_prepared_h = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'binlog_preserve_prepared.h'));
+my $prepared_gunit = read_source(File::Spec->catfile(
+  $source_root, 'unittest', 'gunit', 'preserve_trx-t.cc'));
+my $sql_class = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'sql_class.cc'));
+my $test_attach_plugin = read_source(File::Spec->catfile(
+  $source_root, 'plugin', 'test_preserve_trx_promotion',
+  'test_preserve_trx_promotion.cc'));
+
+die "strict production fence must be acquired only by promotion coordinator\n"
+  unless $promotion =~ /preserved_trx_acquire_production_physical_fence_lease/;
+die "transfer/shared kernel must not acquire the production physical fence\n"
+  if $transfer =~ /preserved_trx_acquire_production_physical_fence_lease/ ||
+     $preserve =~ /preserved_trx_acquire_production_physical_fence_lease/;
+
+die "strict promotion coordinator must consume the prepared-token registry\n"
+  unless $promotion =~ /preserved_trx_strict_prepared_token_registry/;
+die "receiver transfer must publish strict prepared resources before promotion\n"
+  unless $transfer =~ /preserved_trx_strict_prepared_token_registry/ &&
+         $transfer =~ /publish_prewarmed/ &&
+         $transfer =~ /bind_final_facts/;
+die "transfer must not consume strict gate, attach or cleanup ownership\n"
+  if $transfer =~ /begin_gate_adopt\s*\(|commit_gate_adopt\s*\(|begin_attach\s*\(|begin_cleanup\s*\(/;
+
+my $metadata_apply_count = () =
+  $preserve =~ /lock_preserve_apply_record_lock_metadata_plan/g;
+die "metadata-only lock apply must have one shared-kernel caller\n"
+  unless $metadata_apply_count == 1;
+die "promotion/transfer wrappers must not install metadata locks directly\n"
+  if $promotion =~ /lock_preserve_apply_record_lock_metadata_plan/ ||
+     $transfer =~ /lock_preserve_apply_record_lock_metadata_plan/;
+
+my $native_attach_call_count = () =
+  $preserve =~ /mysql_binlog_preserve_attach_detached_cache\s*\(/g;
+die "P5 native binlog attach must have one strict production-core caller\n"
+  unless $native_attach_call_count == 1 &&
+         $preserve =~
+         /preserved_trx_resume_adopted_for_promotion_on_thd[\s\S]*mysql_binlog_preserve_attach_detached_cache/s;
+die "promotion/transfer wrappers must not attach native binlog caches\n"
+  if $promotion =~ /mysql_binlog_preserve_attach_detached_cache/ ||
+     $transfer =~ /mysql_binlog_preserve_attach_detached_cache/;
+
+die "test physical-fence provider must not be a production fallback\n"
+  unless $prepared =~ /g_production_provider_registered/ &&
+         $prepared =~ /g_test_provider_registered/ &&
+         $prepared =~ /MISSING_PROVIDER/;
+
+die "strict gate must use the shared physical-fence kernel entry\n"
+  unless $promotion =~ /preserved_trx_adopt_prepared_for_physical_promotion/ &&
+         $preserve =~ /STANDBY_PROMOTION_PHYSICAL_FENCE/;
+die "promotion wrapper must not directly claim or import prepared trx state\n"
+  if $promotion =~ /trx_preserve_claim_prepared|trx_preserve_import_read_view|preserved_trx_add_record/;
+
+die "strict gate must write versioned epoch intent before and after adopt\n"
+  unless $promotion =~ /write_strict_promotion_intent[\s\S]*false/ &&
+         $promotion =~ /write_strict_promotion_intent[\s\S]*true/ &&
+         $prepared =~ /PTRX_STRICT_PROMOTION_INTENT_EPOCH_V2/;
+
+die "P0 strict contract module must not read InnoDB pages\n"
+  if $prepared =~ /buf_page_get|btr_cur_|row_search|record_image_resolve/;
+
+die "P0 strict contract module must not touch binlog cache internals\n"
+  if $prepared =~ /binlog_cache_mngr|register_binlog_handler|IO_CACHE|my_b_read/;
+
+my $binlog_prepare_start = index(
+  $binlog, 'mysql_binlog_preserve_prepare_detached_cache(');
+my $binlog_prepare_end = index(
+  $binlog, 'mysql_binlog_preserve_attach_detached_cache(',
+  $binlog_prepare_start);
+die "cannot locate P3 native binlog prepare block\n"
+  if $binlog_prepare_start < 0 || $binlog_prepare_end <= $binlog_prepare_start;
+my $binlog_prepare_impl = substr(
+  $binlog, $binlog_prepare_start,
+  $binlog_prepare_end - $binlog_prepare_start);
+my $binlog_manager_start = index($binlog, 'class binlog_cache_mngr {');
+my $binlog_manager_end = index(
+  $binlog, 'static binlog_cache_mngr *thd_get_cache_mngr',
+  $binlog_manager_start);
+die "cannot locate native binlog manager layout\n"
+  if $binlog_manager_start < 0 ||
+     $binlog_manager_end <= $binlog_manager_start;
+my $binlog_manager_impl = substr(
+  $binlog, $binlog_manager_start,
+  $binlog_manager_end - $binlog_manager_start);
+die "Preserve must not add per-THD ownership fields to native binlog manager\n"
+  if $binlog_manager_impl =~ /Preserve_(?:memory|native_binlog_resource)_lease/;
+die "P3 native binlog prepare must self-gate feature, capability and binlog mode\n"
+  unless $binlog_prepare_impl =~ /preserve_trx_is_enabled/ &&
+         $binlog_prepare_impl =~ /PREPARE_BINLOG_CACHE/ &&
+         $binlog_prepare_impl =~ /opt_bin_log/ &&
+         $binlog_prepare_impl =~ /preserve_binlog_runtime_is_open/;
+die "P3 native binlog prepare must stream into native cache without payload copy\n"
+  unless $binlog_prepare_impl =~ /reader->read/ &&
+         $binlog_prepare_impl =~ /get_trx_cache\(\)->write/ &&
+         $binlog_prepare_impl !~ /cache_payload\.data/;
+die "P3 handle must keep binlog manager opaque and fixed-address\n"
+  unless $binlog_prepared_h =~ /struct Impl/ &&
+         $binlog_prepare_impl =~
+           /my_malloc\([\s\S]*?sizeof\(binlog_cache_mngr\)/ &&
+         $binlog_prepare_impl =~
+           /new \(manager_memory\) binlog_cache_mngr/;
+die "P3 test capability/runtime hooks must have no production caller\n"
+  if $promotion =~ /make_binlog_capability_for_unit_test|set_runtime_for_unit_test/ ||
+     $transfer =~ /make_binlog_capability_for_unit_test|set_runtime_for_unit_test/ ||
+     $preserve =~ /make_binlog_capability_for_unit_test|set_runtime_for_unit_test/;
+die "P3 test capability must be exercised only by GUnit before P4\n"
+  unless $prepared_gunit =~ /make_binlog_capability_for_unit_test/;
+
+die "P5 strict attach core must consume prepared handles without payload hydrate/import\n"
+  unless $preserve =~
+           /preserved_trx_resume_adopted_for_promotion_on_thd[\s\S]*take_native_binlog_handle[\s\S]*mysql_binlog_preserve_attach_detached_cache/s &&
+         $preserve !~
+           /preserved_trx_resume_adopted_for_promotion_on_thd[\s\S]{0,12000}(?:hydrate_logged_binlog_cache_payload_if_needed|mysql_binlog_preserve_import)/s;
+die "P5 protected THD handle must own lifetime pin, command gate and kill deferral\n"
+  unless $preserve =~ /Preserved_trx_peer_thd_handle::Impl[\s\S]*Preserve_trx_external_thd_pin/s &&
+         $preserve =~ /preserve_trx_batch_state\s*=\s*Preserve_trx_batch_thd_state::ATTACHING/s &&
+         $preserve =~ /preserved_trx_defer_external_thd_kill[\s\S]*!preserve_trx_is_enabled/s &&
+         $sql_class =~ /THD::awake[\s\S]*preserved_trx_defer_external_thd_kill/s;
+die "P5 attach activation must be bracketed by versioned durable token intent\n"
+  unless $prepared =~ /PTRX_STRICT_PROMOTION_ATTACH_INTENT_V1/s &&
+         $prepared =~ /begin_activation[\s\S]*intent_writer/s &&
+         $prepared =~ /commit_attach[\s\S]*intent_writer/s &&
+         $preserve =~ /ATTACHING[\s\S]*ACTIVATING[\s\S]*ACTIVE/s;
+die "TEST_ONLY promotion plugin must only resolve an adopted token and call the production core\n"
+  unless $test_attach_plugin =~ /find_unique_adopted/s &&
+         $test_attach_plugin =~ /preserved_trx_resolve_peer_thd/s &&
+         $test_attach_plugin =~ /preserved_trx_resume_adopted_for_promotion_on_thd/s;
+die "TEST_ONLY promotion plugin must not fake a fence, gate, registry publication or adopted record\n"
+  if $test_attach_plugin =~
+     /set_physical_fence_provider|acquire_physical_fence|adopt_prepared_epoch|publish_ready|commit_gate_adopt|preserved_trx_add_record/s;
+
+my $metadata_start = index(
+  $lock_preserve, 'lock_preserve_build_record_lock_metadata_plan(');
+my $metadata_end = index(
+  $lock_preserve, 'bool lock_preserve_record_locks_payload_is_valid_for_import',
+  $metadata_start);
+die "cannot locate P2 metadata-only implementation block\n"
+  if $metadata_start < 0 || $metadata_end <= $metadata_start;
+my $metadata_impl = substr(
+  $lock_preserve, $metadata_start, $metadata_end - $metadata_start);
+die "P2 metadata-only lock plan must not read InnoDB pages or resolve images\n"
+  if $metadata_impl =~
+     /buf_page_get|buf_read_page|page_find_rec_with_heap_no|record_image_resolve/;
+die "P2 metadata-only plan must reuse the existing record-lock parser\n"
+  unless $metadata_impl =~
+         /lock_preserve_parse_record_locks_payload\([\s\S]*true\)/;
+die "P2 conflict scan must be keyed by page_id without buf_block\n"
+  unless $lock_preserve =~
+         /lock_preserve_record_entry_has_conflict\([\s\S]{0,180}const page_id_t &page_id\)/;
+die "native exact-bitmap helper must stay Preserve-specific and page-free\n"
+  unless $lock_native =~ /create_for_preserve_metadata/ &&
+         $lock_native =~ /lock_preserve_add_record_bitmap_from_metadata/;
+
+die "strict physical-fence controls must not become public sysvars\n"
+  if $sys_vars =~ /preserve_trx_physical_consistency_mode|physical_fence_provider/;
+
+die "strict proof must require exact LSN equality and immutable digests\n"
+  unless $prepared =~ /target_frozen_lsn == proof\.source_fence_lsn/ &&
+         $prepared_h =~ /final_lock_generation_digest/ &&
+         $prepared_h =~ /page_layout_digest/ &&
+         $prepared_h =~ /dictionary_generation_digest/;
+
+die "strict registry must publish immutable facts and own move-only resources\n"
+  unless $prepared_h =~ /Preserve_trx_prepared_token_registry/ &&
+         $prepared_h =~ /Preserve_trx_prepared_token_resources/ &&
+         $prepared =~ /atomic_store_explicit[\s\S]*memory_order_release/ &&
+         $prepared =~ /expire_ready_facts_pending_lease/;
+
+die "final facts digest must use versioned length-delimited big-endian encoding\n"
+  unless $prepared =~ /PTRX_FINAL_TOKEN_FACTS_V1/ &&
+         $prepared =~ /append_canonical_u32/ &&
+         $prepared =~ /for \(int shift = 56; shift >= 0; shift -= 8\)/;
+
+die "fast-resume evidence must be exposed as server-owned status\n"
+  unless $mysqld =~ /Preserve_trx_promotion_resume_core_p95_us/ &&
+         $mysqld =~ /Preserve_trx_promotion_lock_page_get_count/ &&
+         $mysqld =~ /Preserve_trx_resume_binlog_payload_read_bytes/;
+die "removed staged-token publish metric must not be exposed\n"
+  if $mysqld =~ /receiver_staged_token_publish_us/ ||
+     $transfer =~ /receiver_staged_token_publish_us/;
+die "real HA promotion must remain HA_BLOCKED instead of a numeric metric\n"
+  if $mysqld =~ /Preserve_trx_resume_real_ha_promotion/;
+die "strict gate must write fence evidence and timing metrics\n"
+  unless $promotion =~ /preserved_trx_promotion_prepared_note_evidence/ &&
+         $promotion =~ /preserved_trx_promotion_prepared_note_fence_metrics/;
+die "receiver strict prepare must write lock-plan admission metrics\n"
+  unless $transfer =~ /preserved_trx_promotion_prepared_note_lock_plan_metrics/;
+die "native binlog resource failures and attach IO must have production writers\n"
+  unless $prepared =~ /preserved_trx_promotion_prepared_note_resource_open_failure/ &&
+         $preserve =~ /preserved_trx_promotion_prepared_note_resume_binlog_io/;
+EOF
+
+SELECT 'ok' AS standby_promotion_fast_resume_contract_lint;

@@ -1,0 +1,65 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+--source include/have_debug.inc
+
+# Verify that a LOCK_AUTO_INC table lock acquired under the traditional
+# AUTO-INC lock mode survives shutdown and continues to serialise concurrent
+# INSERT activity after recovery (but before RESUME).
+
+--disable_warnings
+DROP TABLE IF EXISTS t_autoinc_table_lock;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+# This test runs with --innodb-autoinc-lock-mode=0 from the .opt file.
+# Traditional mode gives the transaction an explicit LOCK_AUTO_INC object
+# during INSERT that must survive preserve/recover.
+
+CREATE TABLE t_autoinc_table_lock(
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+START TRANSACTION;
+SET SESSION debug="+d,preserve_trx_keep_autoinc_lock_at_statement_end";
+INSERT INTO t_autoinc_table_lock(v) VALUES(10);
+# AUTO_INCREMENT lock should be held at this point (legacy lock mode).
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --innodb-autoinc-lock-mode=0" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+# AUTOINC_LOCK_OWNED must surface in P_S consistently with the 0x31 payload.
+--replace_column 1 TOKEN
+SELECT TOKEN, AUTOINC_LOCK_OWNED
+  FROM performance_schema.preserved_transactions;
+
+# Another session attempting an INSERT must wait on the preserved AUTOINC
+# lock; with innodb_lock_wait_timeout=1 we observe the contention.
+--connect(autoinc_other, localhost, root,,test)
+connection autoinc_other;
+SET innodb_lock_wait_timeout=1;
+--error ER_LOCK_WAIT_TIMEOUT
+INSERT INTO t_autoinc_table_lock(v) VALUES(99);
+
+connection default;
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+COMMIT;
+
+connection autoinc_other;
+INSERT INTO t_autoinc_table_lock(v) VALUES(20);
+disconnect autoinc_other;
+
+connection default;
+SELECT * FROM t_autoinc_table_lock ORDER BY id;
+
+DROP TABLE t_autoinc_table_lock;
+SET GLOBAL preserve_trx_enable=ON;

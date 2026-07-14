@@ -31,6 +31,7 @@ SET(TESTS
   #example
   fil_path
   ha_innodb
+  lock0warmcopy
   log0log
   mem0mem
   os0thread-create
@@ -39,6 +40,7 @@ SET(TESTS
   ut0mem
   ut0new
   srv0conc
+  trx0preserve
 )
 
 SET(ALL_INNODB_TESTS)

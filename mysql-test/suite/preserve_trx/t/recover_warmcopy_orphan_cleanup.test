@@ -1,0 +1,19 @@
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+--exec mkdir -p "$MYSQLD_DATADIR/preserve"
+--exec printf stale > "$MYSQLD_DATADIR/preserve/warmcopy_orphan.binlog_cache.warm.7"
+--exec printf descriptor > "$MYSQLD_DATADIR/preserve/warmcopy_orphan.binlog_cache.warm.7.desc"
+--exec printf temp > "$MYSQLD_DATADIR/preserve/warmcopy_orphan.binlog_cache.warm.7.tmp"
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--exec test ! -e "$MYSQLD_DATADIR/preserve/warmcopy_orphan.binlog_cache.warm.7"
+--exec test ! -e "$MYSQLD_DATADIR/preserve/warmcopy_orphan.binlog_cache.warm.7.desc"
+--exec test ! -e "$MYSQLD_DATADIR/preserve/warmcopy_orphan.binlog_cache.warm.7.tmp"
+SET GLOBAL preserve_trx_enable=ON;

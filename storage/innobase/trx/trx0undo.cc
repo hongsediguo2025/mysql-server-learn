@@ -49,9 +49,11 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "srv0mon.h"
 #include "srv0srv.h"
 #include "srv0start.h"
+#include "trx0temp_preserve.h"
 #include "trx0purge.h"
 #include "trx0rec.h"
 #include "trx0rseg.h"
+#include "trx0sys.h"
 #include "trx0trx.h"
 
 /* How should the old versions in the history list be managed?
@@ -232,9 +234,9 @@ static trx_undo_rec_t *trx_undo_get_next_rec_from_next_page(
     }
   }
 
-  next_page_no = flst_get_next_addr(
-                     undo_page + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_NODE, mtr)
-                     .page;
+  const flst_node_t *page_node =
+      undo_page + TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_NODE;
+  next_page_no = flst_get_next_addr(page_node, mtr).page;
   if (next_page_no == FIL_NULL) {
     return (nullptr);
   }
@@ -269,7 +271,6 @@ trx_undo_rec_t *trx_undo_get_next_rec(
   }
 
   space = page_get_space_id(page_align(rec));
-
   bool found;
   const page_size_t &page_size = fil_space_get_page_size(space, &found);
 
@@ -380,6 +381,61 @@ static void trx_undo_page_init(
 }
 
 #ifndef UNIV_HOTBACKUP
+/*
+  Preserve/resume reserves no-redo undo slots that belong to a durable token.
+  The live temporary rseg header may show those slots as free after restart, so
+  normal undo allocation and cached-undo reuse must consult the reservation map
+  before taking a slot. When no reservation is active the lookup returns through
+  its active-count fast path and the original allocation behavior is unchanged.
+*/
+static bool trx_undo_temp_preserve_slot_reserved(const trx_rseg_t *rseg,
+                                                 ulint slot_no) {
+  return rseg != nullptr && slot_no < TRX_RSEG_N_SLOTS &&
+         fsp_is_system_temporary(rseg->space_id) &&
+         trx_preserve_temp_space_image_no_redo_undo_slot_reserved(
+             static_cast<uint32_t>(rseg->space_id),
+             static_cast<uint32_t>(rseg->page_no), static_cast<uint32_t>(rseg->id),
+             static_cast<uint32_t>(slot_no));
+}
+
+static ulint trx_undo_find_free_non_reserved_slot(
+    trx_rseg_t *rseg, trx_rsegf_t *rseg_hdr, ulint slot_no, mtr_t *mtr) {
+  if (!trx_undo_temp_preserve_slot_reserved(rseg, slot_no)) return slot_no;
+
+  /*
+    trx_rsegf_undo_find_free() returns one candidate. If that slot is reserved
+    for a preserved transaction, continue through the same rseg header looking
+    for another free slot instead of failing the ordinary transaction.
+  */
+  ulint max_slots = TRX_RSEG_N_SLOTS;
+#ifdef UNIV_DEBUG
+  if (trx_rseg_n_slots_debug) {
+    max_slots = ut_min(static_cast<ulint>(trx_rseg_n_slots_debug), max_slots);
+  }
+#endif
+
+  for (ulint candidate = slot_no + 1; candidate < max_slots; ++candidate) {
+    if (trx_rsegf_get_nth_undo(rseg_hdr, candidate, mtr) == FIL_NULL &&
+        !trx_undo_temp_preserve_slot_reserved(rseg, candidate)) {
+      return candidate;
+    }
+  }
+  return ULINT_UNDEFINED;
+}
+
+static void trx_undo_temp_preserve_release_slot_if_reserved(
+    const trx_rseg_t *rseg, ulint slot_no) {
+  if (rseg == nullptr || slot_no >= TRX_RSEG_N_SLOTS ||
+      !fsp_is_system_temporary(rseg->space_id)) {
+    return;
+  }
+
+  trx_preserve_temp_space_image_release_no_redo_undo_slot(
+      static_cast<uint32_t>(rseg->space_id),
+      static_cast<uint32_t>(rseg->page_no),
+      static_cast<uint32_t>(rseg->id), static_cast<uint32_t>(slot_no));
+}
+
 /** Creates a new undo log segment in file.
  @return DB_SUCCESS if page creation OK possible error codes are:
  DB_TOO_MANY_CONCURRENT_TRXS DB_OUT_OF_FILE_SPACE */
@@ -415,6 +471,12 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t trx_undo_seg_create(
   {
     slot_no = trx_rsegf_undo_find_free(rseg_hdr, mtr);
   }
+  /*
+    A reserved slot is logically owned by the preserved token even though the
+    restarted no-redo rseg header may not yet point to a live trx_undo_t. Skip
+    it until RESUME either adopts the slot or releases the reservation.
+  */
+  slot_no = trx_undo_find_free_non_reserved_slot(rseg, rseg_hdr, slot_no, mtr);
   if (slot_no == ULINT_UNDEFINED) {
     ib::error(ER_IB_MSG_1212)
         << "Cannot find a free slot for an undo log."
@@ -1434,6 +1496,7 @@ static trx_undo_t *trx_undo_mem_create(trx_rseg_t *rseg, ulint id, ulint type,
 
   undo->dict_operation = FALSE;
   undo->flag = 0;
+  undo->preserve_no_redo_undo_disable_cache = false;
   undo->gtid_allocated = false;
 
   undo->rseg = rseg;
@@ -1471,10 +1534,21 @@ static void trx_undo_mem_init_for_reuse(
 
   undo->dict_operation = FALSE;
   undo->flag = 0;
+  undo->preserve_no_redo_undo_disable_cache = false;
   undo->gtid_allocated = false;
 
   undo->hdr_offset = offset;
   undo->empty = TRUE;
+}
+
+bool trx_undo_preserve_magic_no_redo_should_skip_history(
+    const trx_undo_t *) {
+  return false;
+}
+
+bool trx_undo_preserve_magic_no_redo_should_skip_cache(
+    const trx_undo_t *undo) {
+  return undo != nullptr && undo->preserve_no_redo_undo_disable_cache;
 }
 
 /** Frees an undo log memory copy. */
@@ -1483,6 +1557,53 @@ void trx_undo_mem_free(trx_undo_t *undo) /*!< in: the undo object to be freed */
   ut_a(undo->id < TRX_RSEG_N_SLOTS);
 
   ut_free(undo);
+}
+
+void trx_undo_discard_cached_for_header_page(trx_rseg_t *rseg,
+                                             page_no_t hdr_page_no) {
+  if (rseg == nullptr || hdr_page_no == FIL_NULL) return;
+
+  ut_ad(mutex_own(&(rseg->mutex)));
+
+  for (trx_undo_t *undo = UT_LIST_GET_FIRST(rseg->insert_undo_cached);
+       undo != nullptr;) {
+    trx_undo_t *next = UT_LIST_GET_NEXT(undo_list, undo);
+    if (undo->hdr_page_no == hdr_page_no) {
+      UT_LIST_REMOVE(rseg->insert_undo_cached, undo);
+      MONITOR_DEC(MONITOR_NUM_UNDO_SLOT_CACHED);
+      trx_undo_mem_free(undo);
+    }
+    undo = next;
+  }
+
+  for (trx_undo_t *undo = UT_LIST_GET_FIRST(rseg->update_undo_cached);
+       undo != nullptr;) {
+    trx_undo_t *next = UT_LIST_GET_NEXT(undo_list, undo);
+    if (undo->hdr_page_no == hdr_page_no) {
+      UT_LIST_REMOVE(rseg->update_undo_cached, undo);
+      MONITOR_DEC(MONITOR_NUM_UNDO_SLOT_CACHED);
+      trx_undo_mem_free(undo);
+    }
+    undo = next;
+  }
+}
+
+void trx_undo_discard_cached_for_rseg(trx_rseg_t *rseg) {
+  if (rseg == nullptr) return;
+
+  ut_ad(mutex_own(&(rseg->mutex)));
+
+  while (trx_undo_t *undo = UT_LIST_GET_FIRST(rseg->insert_undo_cached)) {
+    UT_LIST_REMOVE(rseg->insert_undo_cached, undo);
+    MONITOR_DEC(MONITOR_NUM_UNDO_SLOT_CACHED);
+    trx_undo_mem_free(undo);
+  }
+
+  while (trx_undo_t *undo = UT_LIST_GET_FIRST(rseg->update_undo_cached)) {
+    UT_LIST_REMOVE(rseg->update_undo_cached, undo);
+    MONITOR_DEC(MONITOR_NUM_UNDO_SLOT_CACHED);
+    trx_undo_mem_free(undo);
+  }
 }
 
 /** Create a new undo log in the given rollback segment.
@@ -1567,8 +1688,21 @@ static trx_undo_t *trx_undo_reuse_cached(trx_t *trx, trx_rseg_t *rseg,
 
   ut_ad(mutex_own(&(rseg->mutex)));
 
+  if (fsp_is_system_temporary(rseg->space_id) &&
+      trx_preserve_temp_space_image_should_disable_undo_cache(rseg->space_id)) {
+    return (nullptr);
+  }
+
   if (type == TRX_UNDO_INSERT) {
-    undo = UT_LIST_GET_FIRST(rseg->insert_undo_cached);
+    /*
+      Cached no-redo undo pages can carry a slot that is reserved for a
+      preserved token. Walk past such cached objects; taking them would let a
+      new transaction overwrite undo pages that resume still needs.
+    */
+    for (undo = UT_LIST_GET_FIRST(rseg->insert_undo_cached); undo != nullptr;
+         undo = UT_LIST_GET_NEXT(undo_list, undo)) {
+      if (!trx_undo_temp_preserve_slot_reserved(rseg, undo->id)) break;
+    }
     if (undo == nullptr) {
       return (nullptr);
     }
@@ -1579,7 +1713,15 @@ static trx_undo_t *trx_undo_reuse_cached(trx_t *trx, trx_rseg_t *rseg,
   } else {
     ut_ad(type == TRX_UNDO_UPDATE);
 
-    undo = UT_LIST_GET_FIRST(rseg->update_undo_cached);
+    /*
+      Update undo uses the same slot namespace as insert undo. Keep the
+      reservation check symmetrical so a preserved update undo graph cannot be
+      hidden by cached reuse before resume.
+    */
+    for (undo = UT_LIST_GET_FIRST(rseg->update_undo_cached); undo != nullptr;
+         undo = UT_LIST_GET_NEXT(undo_list, undo)) {
+      if (!trx_undo_temp_preserve_slot_reserved(rseg, undo->id)) break;
+    }
     if (undo == nullptr) {
       return (nullptr);
     }
@@ -1770,7 +1912,8 @@ page_t *trx_undo_set_state_at_finish(
   seg_hdr = undo_page + TRX_UNDO_SEG_HDR;
   page_hdr = undo_page + TRX_UNDO_PAGE_HDR;
 
-  if (undo->size == 1 && mach_read_from_2(page_hdr + TRX_UNDO_PAGE_FREE) <
+  if (!trx_undo_preserve_magic_no_redo_should_skip_cache(undo) &&
+      undo->size == 1 && mach_read_from_2(page_hdr + TRX_UNDO_PAGE_FREE) <
                              TRX_UNDO_PAGE_REUSE_LIMIT) {
     state = TRX_UNDO_CACHED;
 
@@ -1856,14 +1999,40 @@ void trx_undo_update_cleanup(trx_t *trx, trx_undo_ptr_t *undo_ptr,
 
   ut_ad(mutex_own(&(rseg->mutex)));
 
+  if (trx_undo_preserve_magic_no_redo_should_skip_history(undo)) {
+    UT_LIST_REMOVE(rseg->update_undo_list, undo);
+    undo_ptr->update_undo = nullptr;
+    trx_undo_temp_preserve_release_slot_if_reserved(rseg, undo->id);
+    trx_undo_mem_free(undo);
+    return;
+  }
+
+  const bool skip_cache =
+      trx_undo_preserve_magic_no_redo_should_skip_cache(undo);
+
+  /*
+    Native-owned preserved no-redo undo must be released through the normal
+    history-list machinery so the adopted file segment is not left as an active
+    rollback segment. The record payload was restored from a temp-table sidecar,
+    however, and can contain page/list shapes that are valid for rollback and
+    post-resume DML but unsafe for background purge to re-parse record by record.
+    Temporary tables are session-private, so commit only needs the segment to
+    become reclaimable; it does not need delete-mark purge visibility for other
+    transactions.
+  */
+  if (undo->preserve_no_redo_undo_disable_cache) {
+    undo->del_marks = false;
+  }
+
   trx_purge_add_update_undo_to_history(
       trx, undo_ptr, undo_page, update_rseg_history_len, n_added_logs, mtr);
+  trx_undo_temp_preserve_release_slot_if_reserved(rseg, undo->id);
 
   UT_LIST_REMOVE(rseg->update_undo_list, undo);
 
   undo_ptr->update_undo = nullptr;
 
-  if (undo->state == TRX_UNDO_CACHED) {
+  if (!skip_cache && undo->state == TRX_UNDO_CACHED) {
     UT_LIST_ADD_FIRST(rseg->update_undo_cached, undo);
 
     MONITOR_INC(MONITOR_NUM_UNDO_SLOT_CACHED);
@@ -1895,8 +2064,15 @@ void trx_undo_insert_cleanup(trx_undo_ptr_t *undo_ptr, bool noredo) {
   UT_LIST_REMOVE(rseg->insert_undo_list, undo);
   undo_ptr->insert_undo = nullptr;
 
-  if (undo->state == TRX_UNDO_CACHED) {
+  const bool skip_cache =
+      trx_undo_preserve_magic_no_redo_should_skip_cache(undo);
+
+  if (trx_undo_preserve_magic_no_redo_should_skip_history(undo)) {
+    trx_undo_temp_preserve_release_slot_if_reserved(rseg, undo->id);
+    trx_undo_mem_free(undo);
+  } else if (!skip_cache && undo->state == TRX_UNDO_CACHED) {
     UT_LIST_ADD_FIRST(rseg->insert_undo_cached, undo);
+    trx_undo_temp_preserve_release_slot_if_reserved(rseg, undo->id);
 
     MONITOR_INC(MONITOR_NUM_UNDO_SLOT_CACHED);
   } else {
@@ -1907,6 +2083,7 @@ void trx_undo_insert_cleanup(trx_undo_ptr_t *undo_ptr, bool noredo) {
     rseg->unlatch();
 
     trx_undo_seg_free(undo, noredo);
+    trx_undo_temp_preserve_release_slot_if_reserved(rseg, undo->id);
 
     rseg->latch();
 
@@ -1946,6 +2123,14 @@ void trx_undo_free_trx_with_prepared_or_active_logs(trx_t *trx,
 
     UT_LIST_REMOVE(trx->rsegs.m_noredo.rseg->update_undo_list,
                    trx->rsegs.m_noredo.update_undo);
+    if (trx_undo_preserve_magic_no_redo_should_skip_history(
+            trx->rsegs.m_noredo.update_undo)) {
+      trx_preserve_temp_space_image_release_no_redo_undo_slot(
+          static_cast<uint32_t>(trx->rsegs.m_noredo.rseg->space_id),
+          static_cast<uint32_t>(trx->rsegs.m_noredo.rseg->page_no),
+          static_cast<uint32_t>(trx->rsegs.m_noredo.rseg->id),
+          static_cast<uint32_t>(trx->rsegs.m_noredo.update_undo->id));
+    }
     trx_undo_mem_free(trx->rsegs.m_noredo.update_undo);
 
     trx->rsegs.m_noredo.update_undo = nullptr;
@@ -1955,6 +2140,14 @@ void trx_undo_free_trx_with_prepared_or_active_logs(trx_t *trx,
 
     UT_LIST_REMOVE(trx->rsegs.m_noredo.rseg->insert_undo_list,
                    trx->rsegs.m_noredo.insert_undo);
+    if (trx_undo_preserve_magic_no_redo_should_skip_history(
+            trx->rsegs.m_noredo.insert_undo)) {
+      trx_preserve_temp_space_image_release_no_redo_undo_slot(
+          static_cast<uint32_t>(trx->rsegs.m_noredo.rseg->space_id),
+          static_cast<uint32_t>(trx->rsegs.m_noredo.rseg->page_no),
+          static_cast<uint32_t>(trx->rsegs.m_noredo.rseg->id),
+          static_cast<uint32_t>(trx->rsegs.m_noredo.insert_undo->id));
+    }
     trx_undo_mem_free(trx->rsegs.m_noredo.insert_undo);
 
     trx->rsegs.m_noredo.insert_undo = nullptr;

@@ -33,10 +33,14 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #ifndef lock0lock_h
 #define lock0lock_h
 
+#include <memory>
+#include <string>
+
 #include "buf0types.h"
 #include "dict0types.h"
 #include "hash0hash.h"
 #include "lock0types.h"
+#include "lock0preserve_plan.h"
 #include "mtr0types.h"
 #include "que0types.h"
 #include "rem0types.h"
@@ -243,6 +247,10 @@ That might lead to the deadlock with G3 never being noticed.
 
 // Forward declaration
 class ReadView;
+struct Preserve_lock_limits;
+struct trx_preserve_record_lock_page_plan_t;
+struct trx_preserve_record_lock_residency_t;
+struct trx_preserve_record_lock_import_metrics_t;
 
 extern bool innobase_deadlock_detect;
 
@@ -591,6 +599,50 @@ dberr_t lock_table(ulint flags, /*!< in: if BTR_NO_LOCKING_FLAG bit is set,
 @param[in,out] trx Transaction */
 void lock_table_ix_resurrect(dict_table_t *table, trx_t *trx);
 
+/** Export granted explicit table locks (IS/IX/S/X/AUTO_INC) for a preserved
+transaction.
+@param[in]  trx             transaction whose table locks are exported
+@param[out] payload         opaque serialized table-lock payload
+@param[in]  max_lock_count  shared lock-count budget that must not be exceeded
+                            when combined with already exported record locks
+@param[in]  already_used    number of lock-budget units already consumed by
+                            previously exported record locks
+@return DB_SUCCESS or error */
+dberr_t lock_preserve_export_table_locks(trx_t *trx, std::string *payload,
+                                         uint32_t max_lock_count,
+                                         uint32_t already_used);
+
+/** Validate an opaque preserved table-lock payload with the same parser used
+for import.
+@param[in] payload opaque serialized table-lock payload
+@return true if the payload is syntactically and semantically importable */
+bool lock_preserve_table_locks_payload_is_valid_for_import(
+    const std::string &payload);
+
+/** Count explicit table locks encoded in a preserved table-lock payload.
+Uses the import parser so corrupt payloads fail closed.
+@param[in]  payload    opaque serialized table-lock payload
+@param[out] lock_count number of table-lock entries in the payload
+@return true if the payload was parsed and counted successfully */
+bool lock_preserve_table_locks_payload_lock_count(const std::string &payload,
+                                                  uint32_t *lock_count);
+
+/** Returns whether a preserved table-lock payload encodes an explicit
+AUTO_INCREMENT table lock. Used by snapshot validation to keep the derived
+`autoinc_lock_owned` flag and the 0x31 TLV in sync.
+@param[in] payload opaque serialized table-lock payload
+@return true if at least one AUTO_INCREMENT table lock is present */
+bool lock_preserve_table_locks_payload_has_autoinc(const std::string &payload);
+
+/** Import granted explicit table locks for a preserved/resumed transaction.
+The payload is parsed with the same parser used by validation, and each table is
+reopened by InnoDB table id before recreating the lock on trx.
+@param[in,out] trx transaction receiving imported table locks
+@param[in] payload opaque serialized table-lock payload
+@return DB_SUCCESS or error */
+dberr_t lock_preserve_import_table_locks(trx_t *trx,
+                                         const std::string &payload);
+
 /** Sets a lock on a table based on the given mode.
 @param[in]	table	table to lock
 @param[in,out]	trx	transaction
@@ -608,6 +660,135 @@ void lock_rec_unlock(
     const buf_block_t *block, /*!< in: buffer block containing rec */
     const rec_t *rec,         /*!< in: record */
     lock_mode lock_mode);     /*!< in: LOCK_S or LOCK_X */
+
+/** Export granted explicit record locks for a preserved transaction.
+@param[in]  trx      transaction whose record locks are exported
+@param[out] payload  opaque serialized record-lock payload
+@return DB_SUCCESS or error */
+dberr_t lock_preserve_export_record_locks(trx_t *trx, std::string *payload);
+
+/** Export granted explicit record locks for a preserved transaction.
+@param[in]  trx             transaction whose record locks are exported
+@param[out] payload         opaque serialized record-lock payload
+@param[in]  max_lock_count  maximum record bits to export
+@return DB_SUCCESS or error */
+dberr_t lock_preserve_export_record_locks(trx_t *trx, std::string *payload,
+                                          uint32_t max_lock_count);
+
+/** Export granted explicit record locks using stable page identity only.
+This is intended for phase-1 lock warmcopy seeding, where the prebuilt payload
+can be adopted if the final fence proves the page shape has not changed.
+Ordinary live export keeps record images for conservative import after drift.
+@param[in]  trx             transaction whose record locks are exported
+@param[out] payload         opaque serialized record-lock payload
+@param[in]  max_lock_count  maximum record bits to export
+@return DB_SUCCESS or error */
+dberr_t lock_preserve_export_record_locks_stable_page_only(
+    trx_t *trx, std::string *payload, uint32_t max_lock_count);
+
+/** Check whether a transaction currently owns predicate record locks.
+@param[in]  trx                  transaction to inspect
+@param[out] has_predicate_locks  true if a predicate lock exists
+@return true if inspection succeeded */
+bool lock_preserve_trx_has_predicate_locks(trx_t *trx,
+                                           bool *has_predicate_locks);
+
+/** Last precise record-lock export failure reason, for diagnostics. */
+const char *lock_preserve_last_record_lock_export_error();
+
+/** Import granted explicit record locks for a preserved transaction.
+@param[in,out] trx      transaction receiving restored record locks
+@param[in]     payload  opaque serialized record-lock payload
+@return DB_SUCCESS or error */
+dberr_t lock_preserve_import_record_locks(trx_t *trx,
+                                          const std::string &payload);
+dberr_t lock_preserve_restore_record_locks_after_prepare_failure(
+    trx_t *trx, const std::string &payload);
+dberr_t lock_preserve_import_record_locks(
+    trx_t *trx, const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics);
+dberr_t lock_preserve_import_record_locks(
+    trx_t *trx, const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics,
+    bool (*deadline_expired)(void *), void *deadline_ctx);
+
+/** Replace the bitmap of a newly created Preserve import lock while keeping
+native per-bit transaction accounting balanced.
+@param[in,out] lock        newly created record lock
+@param[in]     bitmap      final imported bitmap
+@param[in]     bitmap_len bitmap bytes, matching lock->rec_lock.n_bits
+@return true if the bitmap is valid and was published */
+bool lock_preserve_publish_record_bitmap_for_import(lock_t *lock,
+                                                    const byte *bitmap,
+                                                    size_t bitmap_len);
+
+/** Exercise Preserve bitmap publication and native per-bit reset accounting
+without exposing lock0priv.h outside the lock module. */
+bool lock_preserve_record_bitmap_accounting_for_unit_test(
+    const byte *bitmap, size_t bitmap_len, uint64_t *count_after_publish,
+    uint64_t *count_after_reset);
+
+/** Issue best-effort asynchronous reads for pages referenced by a preserved
+record-lock payload.
+@param[in]     payload  opaque serialized record-lock payload
+@param[in,out] metrics  optional import metrics updated with issued prefetches
+@return DB_SUCCESS, or an error if the payload cannot be parsed or page size
+        metadata cannot be resolved */
+dberr_t lock_preserve_prefetch_record_lock_pages(
+    const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics);
+
+/** Read pages referenced by a preserved record-lock payload for a promotion
+gate. Unlike the startup prefetch helper, this path waits for each referenced
+page to become buffer-pool resident before the gate samples residency.
+@param[in]     payload  opaque serialized record-lock payload
+@param[in,out] metrics  optional import metrics updated with covered pages
+@return DB_SUCCESS, or an error if the payload cannot be parsed or page size
+        metadata cannot be resolved */
+dberr_t lock_preserve_prefetch_record_lock_pages_for_gate(
+    const std::string &payload,
+    trx_preserve_record_lock_import_metrics_t *metrics);
+
+/** Validate an opaque preserved record-lock payload.
+@param[in] payload opaque serialized record-lock payload
+@return true if the payload is syntactically importable */
+bool lock_preserve_record_locks_payload_is_valid_for_import(
+    const std::string &payload);
+
+/** Count record bits encoded in a preserved record-lock payload.
+@param[in]  payload     opaque serialized record-lock payload
+@param[out] lock_count  number of record bits in the payload
+@return true if the payload was parsed and counted successfully */
+bool lock_preserve_record_locks_payload_lock_count(const std::string &payload,
+                                                   uint32_t *lock_count);
+
+/** Build a parse-only page plan from a preserved record-lock payload.
+@param[in]  payload opaque serialized record-lock payload
+@param[out] plan    distinct ordinary record pages and bitmap counters
+@return true if the payload was parsed successfully */
+bool lock_preserve_record_lock_payload_page_plan(
+    const std::string &payload, trx_preserve_record_lock_page_plan_t *plan);
+
+/** Sample record-lock page residency from a preserved record-lock payload.
+The first implementation is parse-only and reports non-empty pages as missing;
+later promotion prewarm work extends it with a nonblocking buffer-pool probe.
+@param[in]  payload    opaque serialized record-lock payload
+@param[out] residency  distinct ordinary record pages and residency counters
+@return true if the payload was parsed successfully */
+bool lock_preserve_record_lock_payload_residency(
+    const std::string &payload,
+    trx_preserve_record_lock_residency_t *residency);
+
+/** Split a mixed record/predicate payload into ordinary record-lock and
+predicate-lock payloads.
+@param[in]  payload                  mixed record-lock payload
+@param[out] record_locks_payload     ordinary record-lock subset
+@param[out] predicate_locks_payload  predicate-lock subset
+@return true if payload was parsed and split successfully */
+bool lock_preserve_split_record_and_predicate_locks(
+    const std::string &payload, std::string *record_locks_payload,
+    std::string *predicate_locks_payload);
+
 /** Releases a transaction's locks, and releases possible other transactions
  waiting because of these locks. Change the state of the transaction to
  TRX_STATE_COMMITTED_IN_MEMORY. */
@@ -993,11 +1174,22 @@ to explicit for partial rollback cases
 @param[in]	index		index of record
 @param[in]	offsets		rec_get_offsets(rec, index)
 @param[in,out]	trx		active transaction
-@param[in]	heap_no		rec heap number to lock */
-void lock_rec_convert_active_impl_to_expl(const buf_block_t *block,
-                                          const rec_t *rec, dict_index_t *index,
-                                          const ulint *offsets, trx_t *trx,
-                                          ulint heap_no);
+@param[in]	heap_no		rec heap number to lock
+@return DB_SUCCESS or lock wait/deadlock status if conversion cannot proceed */
+dberr_t lock_rec_convert_active_impl_to_expl(const buf_block_t *block,
+                                             const rec_t *rec,
+                                             dict_index_t *index,
+                                             const ulint *offsets, trx_t *trx,
+                                             ulint heap_no);
+
+/** Converts implicit record locks for a transaction's modified clustered
+records to explicit record locks so they can be exported for preserve.
+@param[in,out] trx transaction whose implicit locks should be materialized
+@param[in] limits bounded scan/lock limits
+@param[out] materialized_any set to true if any implicit lock was converted
+@return DB_SUCCESS or error code */
+dberr_t lock_preserve_materialize_implicit_locks(
+    trx_t *trx, const Preserve_lock_limits &limits, bool *materialized_any);
 
 /** Removes a record lock request, waiting or granted, from the queue. */
 void lock_rec_discard(lock_t *in_lock); /*!< in: record lock object: all

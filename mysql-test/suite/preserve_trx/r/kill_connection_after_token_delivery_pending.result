@@ -1,0 +1,27 @@
+DROP TABLE IF EXISTS t_preserve_kill_after_pending;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_preserve_kill_after_pending(a INT PRIMARY KEY, b INT)
+ENGINE=InnoDB;
+INSERT INTO t_preserve_kill_after_pending VALUES(1,10);
+SET DEBUG_SYNC =
+'preserve_trx_after_token_delivery_pending SIGNAL after_token_pending WAIT_FOR continue_after_token_pending';
+SET DEBUG_SYNC =
+'preserve_trx_release_resources_before_finalize SIGNAL release_finalize_pending WAIT_FOR continue_release_finalize';
+START TRANSACTION;
+UPDATE t_preserve_kill_after_pending SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET DEBUG_SYNC = 'now WAIT_FOR after_token_pending TIMEOUT 10';
+KILL CONNECTION CONN_ID;
+SET DEBUG_SYNC = 'now SIGNAL continue_after_token_pending';
+SET DEBUG_SYNC = 'now WAIT_FOR release_finalize_pending TIMEOUT 10';
+SET DEBUG_SYNC = 'now SIGNAL continue_release_finalize';
+ERROR HY000: Lost connection to MySQL server during query
+SELECT * FROM t_preserve_kill_after_pending WHERE a=1;
+a	b
+1	10
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+DROP TABLE t_preserve_kill_after_pending;
+SET GLOBAL preserve_trx_enable=ON;

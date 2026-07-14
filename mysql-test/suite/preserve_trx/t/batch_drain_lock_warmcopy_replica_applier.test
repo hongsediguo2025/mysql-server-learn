@@ -1,0 +1,99 @@
+--echo # Lint-only source-shape guard for replica/applier fail-closed
+--echo # handling. MTR cannot cheaply create a true applier THD here; this test
+--echo # verifies that lock-warmcopy batch target discovery and attach-time
+--echo # preserve both use the common context predicate that rejects real
+--echo # replica/applier/group-replication states.
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_source {
+  my (@parts) = @_;
+  my $path = File::Spec->catfile($source_root, @parts);
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $src = do { local $/; <$fh> };
+  close($fh);
+  return $src;
+}
+
+sub extract_function {
+  my ($src, $signature_re, $label) = @_;
+  $src =~ /$signature_re/s or die "could not find $label signature\n";
+  my $sig_pos = $-[0];
+  my $brace_pos = index($src, '{', $sig_pos);
+  die "could not find $label body start\n" if $brace_pos < 0;
+
+  my $depth = 0;
+  for (my $i = $brace_pos; $i < length($src); ++$i) {
+    my $ch = substr($src, $i, 1);
+    ++$depth if $ch eq '{';
+    --$depth if $ch eq '}';
+    if ($depth == 0 && $ch eq '}') {
+      return substr($src, $sig_pos, $i - $sig_pos + 1);
+    }
+  }
+  die "could not parse $label body\n";
+}
+
+sub extract_class {
+  my ($src, $class_name) = @_;
+  $src =~ /class\s+\Q$class_name\E[\s\S]*?^};/m
+    or die "could not isolate $class_name\n";
+  return $&;
+}
+
+my $preserve = read_source('sql', 'preserve_trx.cc');
+my $existing_mtr = read_source('mysql-test', 'suite', 'preserve_trx', 't',
+                               'replication_context_preserve_drain_failclosed.test');
+
+my $channel_check = extract_function(
+  $preserve,
+  qr/static\s+bool\s+preserve_trx_has_configured_replica_channel\s*\(/,
+  'preserve_trx_has_configured_replica_channel');
+die "configured replica channel check must hold channel_map rdlock while scanning\n"
+  unless $channel_check =~ /channel_map\.rdlock\s*\(\s*\)/s &&
+         $channel_check =~ /channel_map\.begin\s*\(\s*\)[\s\S]*channel_map\.end\s*\(\s*\)/s &&
+         $channel_check =~ /Master_info::is_configured\s*\(/s &&
+         $channel_check =~ /channel_map\.unlock\s*\(\s*\)/s;
+
+my $common = extract_function(
+  $preserve,
+  qr/bool\s+preserve_trx_is_unsupported_common_context\s*\(/,
+  'preserve_trx_is_unsupported_common_context');
+die "common unsupported context must retain debug injection for replication context\n"
+  unless $common =~ /preserve_trx_simulate_replication_context/s &&
+         $common =~ /preserve_trx_simulate_group_replication_context/s;
+die "common unsupported context must reject real replica/applier/group replication states\n"
+  unless $common =~ /thd->slave_thread/s &&
+         $common =~ /thd->rli_slave\s*!=\s*nullptr/s &&
+         $common =~ /thd->is_binlog_applier\s*\(\s*\)/s &&
+         $common =~ /is_group_replication_running\s*\(\s*\)/s &&
+         $common =~ /preserve_trx_has_configured_replica_channel\s*\(\s*\)/s;
+
+my $candidate_discovery = extract_class($preserve,
+                                        'Warmcopy_prepare_idle_participants');
+die "batch candidate discovery must reject unsupported common contexts before pinning\n"
+  unless $candidate_discovery =~ /candidate_ready[\s\S]*!\s*preserve_trx_is_unsupported_common_context\s*\(\s*candidate\s*\)[\s\S]*Preserve_trx_external_thd_pin::acquire_locked\s*\(\s*candidate\s*\)/s;
+
+my $attached_target = extract_class($preserve,
+                                    'Preserve_batch_quiesced_idle_target');
+die "attached batch preserve must recheck unsupported common context after context switch\n"
+  unless $attached_target =~ /Preserve_thd_context_switch\s+switch_thd[\s\S]*preserve_trx_is_unsupported_common_context\s*\(\s*candidate\s*\)[\s\S]*early_target_error\s*=\s*true[\s\S]*preserve_trx_preserve_attached_transaction/s;
+
+die "existing runtime MTR must still exercise command-level replication debug fail-closed paths\n"
+  unless $existing_mtr =~ /preserve_trx_simulate_replication_context/s &&
+         $existing_mtr =~ /preserve_trx_simulate_group_replication_context/s &&
+         $existing_mtr =~ /PREPARE SHUTDOWN PRESERVE TRANSACTION/s &&
+         $existing_mtr =~ /DRAIN TRANSACTIONS PRESERVE/s &&
+         $existing_mtr =~ /ER_PRESERVE_TRX_UNSUPPORTED/s;
+
+EOF
+
+SELECT 'ok' AS batch_drain_lock_warmcopy_replica_applier;

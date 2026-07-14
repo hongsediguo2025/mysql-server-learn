@@ -1,0 +1,41 @@
+include/group_replication.inc [rpl_server_count=2]
+Warnings:
+Note	####	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	####	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+[connection server1]
+#
+# Preserve/resume remains single-instance only while Group Replication
+# is running. The real GR topology must reject preserve commands and
+# still apply ordinary group writes.
+#
+[connection server1]
+include/start_and_bootstrap_group_replication.inc
+include/gr_wait_primary_member_uuid.inc
+[connection server2]
+include/start_group_replication.inc
+include/gr_wait_primary_member_uuid.inc
+include/gr_find_a_primary.inc
+[connection server1]
+DROP TABLE IF EXISTS t_gr_preserve_apply;
+CREATE TABLE t_gr_preserve_apply(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_gr_preserve_apply VALUES(1, 10), (2, 20);
+include/rpl_sync.inc
+START TRANSACTION;
+UPDATE t_gr_preserve_apply SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+ROLLBACK;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+RESUME PRESERVED TRANSACTION 'invalid-token';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+INSERT INTO t_gr_preserve_apply VALUES(3, 30);
+include/rpl_sync.inc
+include/diff_tables.inc [server1:t_gr_preserve_apply, server2:t_gr_preserve_apply]
+DROP TABLE t_gr_preserve_apply;
+include/rpl_sync.inc
+include/group_replication_end.inc

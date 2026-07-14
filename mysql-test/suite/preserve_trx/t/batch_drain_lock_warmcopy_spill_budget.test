@@ -1,0 +1,72 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_lock_warmcopy_spill_budget;
+--enable_warnings
+
+--let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
+--let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_fallback= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_fallback_to_live_export`
+--let $old_preserve_trx_lock_warmcopy_max_memory_bytes= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_max_memory_bytes`
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_max_memory_bytes=1;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+
+CREATE TABLE t_lock_warmcopy_spill_budget(
+  id INT PRIMARY KEY,
+  v INT,
+  pad VARBINARY(128)
+) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_spill_budget VALUES
+  (1,10,REPEAT('a',64)),
+  (2,20,REPEAT('b',64));
+
+--connect(lock_wc_spill_budget_app, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_lock_warmcopy_spill_budget SET v=21, pad=REPEAT('c',64)
+  WHERE id=2;
+
+--connection default
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count_after_spill
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--connect(lock_wc_spill_budget_resume, localhost, root,,test)
+--connection lock_wc_spill_budget_resume
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+COMMIT;
+--disconnect lock_wc_spill_budget_resume
+
+--connection default
+SELECT COUNT(*) AS preserved_count_after_spill_resume
+  FROM performance_schema.preserved_transactions;
+SELECT id, v, pad=REPEAT('c',64) AS pad_ok
+  FROM t_lock_warmcopy_spill_budget
+  ORDER BY id;
+
+DROP TABLE t_lock_warmcopy_spill_budget;
+--disable_query_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_lock_warmcopy_max_memory_bytes=$old_preserve_trx_lock_warmcopy_max_memory_bytes
+--eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback
+--eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
+--eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
+--eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--enable_query_log

@@ -1,0 +1,3 @@
+SELECT 'ok' AS batch_drain_100_long_semantic_lint;
+batch_drain_100_long_semantic_lint
+ok

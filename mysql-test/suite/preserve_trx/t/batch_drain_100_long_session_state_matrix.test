@@ -1,0 +1,549 @@
+--source include/big_test.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $setup_file = File::Spec->catfile($vardir, 'tmp',
+                                     'batch_long_state_setup.inc');
+my $apps_file = File::Spec->catfile($vardir, 'tmp',
+                                    'batch_long_state_apps.inc');
+my $post_apps_file = File::Spec->catfile($vardir, 'tmp',
+                                         'batch_long_state_post_apps.inc');
+my $cleanup_file = File::Spec->catfile($vardir, 'tmp',
+                                       'batch_long_state_cleanup.inc');
+my $verify_file = File::Spec->catfile($vardir, 'tmp',
+                                      'batch_long_state_verify.inc');
+
+open(my $setup, '>', $setup_file)
+  or die "cannot open $setup_file for write: $!";
+open(my $apps, '>', $apps_file)
+  or die "cannot open $apps_file for write: $!";
+open(my $post_apps, '>', $post_apps_file)
+  or die "cannot open $post_apps_file for write: $!";
+open(my $cleanup, '>', $cleanup_file)
+  or die "cannot open $cleanup_file for write: $!";
+open(my $verify, '>', $verify_file)
+  or die "cannot open $verify_file for write: $!";
+
+print $cleanup <<'SQL';
+DROP PROCEDURE IF EXISTS p_batch_long_finalize;
+DROP TABLE IF EXISTS t_batch_long_tokens;
+DROP TABLE IF EXISTS t_state_auto;
+DROP TABLE IF EXISTS t_state_base;
+DROP TABLE IF EXISTS t_batch_long_audit;
+DROP TABLE IF EXISTS t_batch_long_control;
+SQL
+
+print $setup <<'SQL';
+CREATE TABLE t_batch_long_control(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  started_at DATETIME(6) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE t_batch_long_audit(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  lifecycle_age_us BIGINT UNSIGNED NOT NULL,
+  max_stmt_us BIGINT UNSIGNED NOT NULL,
+  sql_count INT UNSIGNED NOT NULL,
+  resumed_ok TINYINT NOT NULL,
+  detail VARCHAR(255) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE t_batch_long_tokens(
+  token_id INT PRIMARY KEY AUTO_INCREMENT,
+  token VARCHAR(255) NOT NULL UNIQUE
+) ENGINE=InnoDB;
+CREATE TABLE t_state_base(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  v INT NOT NULL,
+  decval DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+  txt VARCHAR(128),
+  dt DATETIME(6) NULL,
+  ts TIMESTAMP NULL DEFAULT NULL,
+  last_id_seen BIGINT UNSIGNED DEFAULT NULL,
+  marker VARCHAR(64),
+  heartbeat INT NOT NULL DEFAULT 0,
+  KEY idx_state_case(case_id),
+  KEY idx_state_marker(marker)
+) ENGINE=InnoDB;
+CREATE TABLE t_state_auto(
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  sid INT NOT NULL,
+  marker VARCHAR(64),
+  KEY idx_state_auto_sid(sid)
+) ENGINE=InnoDB;
+SQL
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  print $setup "INSERT INTO t_batch_long_control " .
+               "VALUES($sid, $case_id, TIMESTAMP'2000-01-01 00:00:00.000000');\n";
+  print $setup "INSERT INTO t_state_base " .
+               "VALUES($sid, $case_id, 0, 0.00, 'seed', NULL, NULL, NULL, 'seed', 0);\n";
+}
+
+print $setup <<'SQL';
+DELIMITER |;
+CREATE PROCEDURE p_batch_long_finalize()
+BEGIN
+  DECLARE post_ok TINYINT DEFAULT 0;
+  DECLARE detail_value VARCHAR(255) DEFAULT NULL;
+  DECLARE failure_message VARCHAR(255) DEFAULT NULL;
+
+  IF @batch_long_sid IS NULL OR @batch_long_case_id IS NULL THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'missing restored batch long user vars';
+  END IF;
+  IF COALESCE(@batch_state_pre_ok, 0) <> 1 THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'pre-drain session-state check was not restored';
+  END IF;
+
+  IF @batch_long_case_id = 1 THEN
+    UPDATE t_state_base
+       SET v = @state_int + 1, marker = 'user-var-int'
+     WHERE sid = @batch_long_sid;
+    SELECT v = @batch_long_sid * 10 + 2
+      INTO post_ok FROM t_state_base WHERE sid = @batch_long_sid;
+    SET detail_value = 'user-var-integer';
+  ELSEIF @batch_long_case_id = 2 THEN
+    UPDATE t_state_base
+       SET txt = @state_string, marker = 'user-var-string'
+     WHERE sid = @batch_long_sid;
+    SELECT txt = CONCAT('state-', @batch_long_sid)
+      INTO post_ok FROM t_state_base WHERE sid = @batch_long_sid;
+    SET detail_value = 'user-var-string';
+  ELSEIF @batch_long_case_id = 3 THEN
+    UPDATE t_state_base
+       SET decval = @state_decimal + 0.10, marker = 'user-var-decimal'
+     WHERE sid = @batch_long_sid;
+    SELECT decval = CAST(@batch_long_sid AS DECIMAL(12,2)) + 0.35
+      INTO post_ok FROM t_state_base WHERE sid = @batch_long_sid;
+    SET detail_value = 'user-var-decimal';
+  ELSEIF @batch_long_case_id = 4 THEN
+    SELECT LAST_INSERT_ID() = @state_expected_lid INTO post_ok;
+    UPDATE t_state_base
+       SET last_id_seen = LAST_INSERT_ID(), marker = 'last-insert-id'
+     WHERE sid = @batch_long_sid;
+    SET detail_value = 'last-insert-id';
+  ELSEIF @batch_long_case_id = 5 THEN
+    SELECT LAST_INSERT_ID() = @state_expected_lid INTO post_ok;
+    UPDATE t_state_base
+       SET last_id_seen = LAST_INSERT_ID(), marker = 'explicit-last-insert-id'
+     WHERE sid = @batch_long_sid;
+    SET detail_value = 'explicit-last-insert-id';
+  ELSEIF @batch_long_case_id = 6 THEN
+    SELECT FIND_IN_SET('ANSI_QUOTES', @batch_long_resume_sql_mode) > 0
+           AND txt = 'ansi-resumed'
+      INTO post_ok FROM t_state_base WHERE sid = @batch_long_sid;
+    SET detail_value = 'sql-mode-ansi-quotes';
+  ELSEIF @batch_long_case_id = 7 THEN
+    SELECT FIND_IN_SET('NO_BACKSLASH_ESCAPES',
+                       @batch_long_resume_sql_mode) > 0
+           AND txt = CONCAT('slash', CHAR(92), 'path')
+      INTO post_ok FROM t_state_base WHERE sid = @batch_long_sid;
+    SET detail_value = 'sql-mode-no-backslash';
+  ELSEIF @batch_long_case_id = 8 THEN
+    UPDATE t_state_base
+       SET v = CAST('8' AS SIGNED), marker = 'strict-mode'
+     WHERE sid = @batch_long_sid;
+    SELECT FIND_IN_SET('STRICT_TRANS_TABLES',
+                       @batch_long_resume_sql_mode) > 0
+           AND COALESCE(@state_strict_pre_finalize_ok, 0) = 1
+           AND v = 8
+      INTO post_ok FROM t_state_base WHERE sid = @batch_long_sid;
+    SET detail_value = 'sql-mode-strict';
+  ELSEIF @batch_long_case_id = 9 THEN
+    UPDATE t_state_base
+       SET dt = TIMESTAMP'2026-05-17 01:02:03.000000',
+           marker = 'time-zone-utc'
+     WHERE sid = @batch_long_sid;
+    SELECT @@time_zone = '+00:00'
+           AND ts = TIMESTAMP'2026-05-17 01:02:03'
+      INTO post_ok FROM t_state_base WHERE sid = @batch_long_sid;
+    SET detail_value = 'time-zone-utc';
+  ELSEIF @batch_long_case_id = 10 THEN
+    UPDATE t_state_base
+       SET dt = TIMESTAMP'2026-05-17 09:02:03.000000',
+           marker = 'time-zone-plus8'
+     WHERE sid = @batch_long_sid;
+    SELECT @@time_zone = '+08:00'
+           AND ts = TIMESTAMP'2026-05-17 09:02:03'
+      INTO post_ok FROM t_state_base WHERE sid = @batch_long_sid;
+    SET detail_value = 'time-zone-plus8';
+  ELSEIF @batch_long_case_id = 11 THEN
+    UPDATE t_state_base
+       SET txt = CONCAT(@state_utf8_text, '-ok'), marker = 'charset'
+     WHERE sid = @batch_long_sid;
+    SELECT @@character_set_connection = 'utf8mb4'
+           AND txt = 'utf8mb4-ok'
+      INTO post_ok FROM t_state_base WHERE sid = @batch_long_sid;
+    SET detail_value = 'charset-connection';
+  ELSEIF @batch_long_case_id = 12 THEN
+    UPDATE t_state_base
+       SET txt = IF('A' = 'a', 'collation-ci', 'collation-cs'),
+           marker = 'collation'
+     WHERE sid = @batch_long_sid;
+    SELECT @@collation_connection = 'utf8mb4_0900_ai_ci'
+           AND txt = 'collation-ci'
+      INTO post_ok FROM t_state_base WHERE sid = @batch_long_sid;
+    SET detail_value = 'collation-connection';
+  ELSEIF @batch_long_case_id = 13 THEN
+    UPDATE t_state_base
+       SET marker = 'isolation-rr'
+     WHERE sid = @batch_long_sid;
+    SELECT @@transaction_isolation = 'REPEATABLE-READ'
+      INTO post_ok;
+    SET detail_value = 'isolation-rr';
+  ELSEIF @batch_long_case_id = 14 THEN
+    UPDATE t_state_base
+       SET marker = 'isolation-rc'
+     WHERE sid = @batch_long_sid;
+    SELECT @@transaction_isolation = 'READ-COMMITTED'
+      INTO post_ok;
+    SET detail_value = 'isolation-rc';
+  ELSEIF @batch_long_case_id = 15 THEN
+    UPDATE t_state_base
+       SET marker = 'sql-log-bin-off'
+     WHERE sid = @batch_long_sid;
+    SELECT @@session.sql_log_bin = 0
+      INTO post_ok;
+    SET detail_value = 'sql-log-bin-off';
+  ELSEIF @batch_long_case_id = 16 THEN
+    UPDATE t_state_base
+       SET v = @state_multi_int + @state_multi_dec,
+           txt = @state_multi_string,
+           marker = 'multiple-user-vars'
+     WHERE sid = @batch_long_sid;
+    SELECT v = @batch_long_sid + 17
+           AND txt = CONCAT('multi-', @batch_long_sid)
+      INTO post_ok FROM t_state_base WHERE sid = @batch_long_sid;
+    SET detail_value = 'multiple-user-vars';
+  ELSEIF @batch_long_case_id = 17 THEN
+    UPDATE t_state_base
+       SET txt = IF(@state_null IS NULL, 'null-restored', 'null-missing'),
+           marker = 'null-user-var'
+     WHERE sid = @batch_long_sid;
+    SELECT txt = 'null-restored'
+      INTO post_ok FROM t_state_base WHERE sid = @batch_long_sid;
+    SET detail_value = 'null-user-var';
+  ELSEIF @batch_long_case_id = 18 THEN
+    UPDATE t_state_base
+       SET txt = @state_overwrite,
+           marker = 'overwritten-user-var'
+     WHERE sid = @batch_long_sid;
+    SELECT txt = CONCAT('final-', @batch_long_sid)
+      INTO post_ok FROM t_state_base WHERE sid = @batch_long_sid;
+    SET detail_value = 'overwritten-user-var';
+  ELSEIF @batch_long_case_id = 19 THEN
+    SET @state_resume_set = @state_resume_set + 1;
+    UPDATE t_state_base
+       SET v = @state_resume_set, marker = 'resume-set-user-var'
+     WHERE sid = @batch_long_sid;
+    SELECT v = @batch_long_sid + 1901
+      INTO post_ok FROM t_state_base WHERE sid = @batch_long_sid;
+    SET detail_value = 'resume-set-user-var';
+  ELSEIF @batch_long_case_id = 20 THEN
+    ROLLBACK TO SAVEPOINT s_state;
+    UPDATE t_state_base
+       SET v = @state_savepoint_value + 1,
+           marker = 'state-savepoint'
+     WHERE sid = @batch_long_sid;
+    SELECT v = @batch_long_sid * 2 + 1
+      INTO post_ok FROM t_state_base WHERE sid = @batch_long_sid;
+    SET detail_value = 'state-savepoint-light';
+  END IF;
+
+  IF COALESCE(post_ok, 0) <> 1 THEN
+    SET failure_message = CONCAT(
+      'post-resume session-state check failed sid=',
+      COALESCE(CAST(@batch_long_sid AS CHAR), 'NULL'),
+      ' case=',
+      COALESCE(CAST(@batch_long_case_id AS CHAR), 'NULL'),
+      ' detail=',
+      COALESCE(detail_value, 'NULL'),
+      ' post_ok=',
+      COALESCE(CAST(post_ok AS CHAR), 'NULL'));
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = failure_message;
+  END IF;
+  SET @batch_long_end_action = 'COMMIT';
+  INSERT INTO t_batch_long_audit VALUES(
+    @batch_long_sid,
+    @batch_long_case_id,
+    TIMESTAMPDIFF(MICROSECOND, @batch_long_started_at, UTC_TIMESTAMP(6)),
+    @batch_long_max_stmt_us,
+    @batch_long_sql_count,
+    1,
+    detail_value);
+END|
+DELIMITER ;|
+SQL
+
+print $verify <<'SQL';
+SELECT COUNT(DISTINCT detail) AS session_state_cases_ok
+  FROM t_batch_long_audit WHERE resumed_ok = 1;
+SELECT detail, COUNT(*) = 5 AS ok
+  FROM t_batch_long_audit GROUP BY detail ORDER BY detail;
+SELECT COUNT(*) = 10 AS last_insert_id_preserve_point_ok
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id IN (4, 5)
+   AND b.last_id_seen IS NOT NULL
+   AND b.marker IN ('last-insert-id', 'explicit-last-insert-id');
+SELECT COUNT(*) = 100 AS user_vars_restored_ok
+  FROM t_batch_long_audit
+ WHERE resumed_ok = 1;
+--disable_query_log
+SET @batch_state_old_time_zone = @@time_zone;
+SET time_zone = '+00:00';
+--enable_query_log
+SELECT 1 AS case_id,
+       COUNT(*) = 5 AS ok
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 1 AND b.v = b.sid * 10 + 2
+UNION ALL SELECT 2, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 2 AND b.txt = CONCAT('state-', b.sid)
+UNION ALL SELECT 3, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 3 AND b.decval = CAST(b.sid AS DECIMAL(12,2)) + 0.35
+UNION ALL SELECT 4, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 4 AND b.marker = 'last-insert-id'
+   AND b.last_id_seen IS NOT NULL
+UNION ALL SELECT 5, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 5 AND b.marker = 'explicit-last-insert-id'
+   AND b.last_id_seen = b.sid * 10000 + 5
+UNION ALL SELECT 6, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 6 AND b.txt = 'ansi-resumed'
+UNION ALL SELECT 7, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 7 AND b.txt = CONCAT('slash', CHAR(92), 'path')
+UNION ALL SELECT 8, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 8 AND b.v = 8
+UNION ALL SELECT 9, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 9 AND b.marker = 'time-zone-utc'
+   AND b.ts = TIMESTAMP'2026-05-17 01:02:03'
+UNION ALL SELECT 10, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 10 AND b.marker = 'time-zone-plus8'
+   AND b.ts = TIMESTAMP'2026-05-17 01:02:03'
+UNION ALL SELECT 11, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 11 AND b.txt = 'utf8mb4-ok'
+UNION ALL SELECT 12, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 12 AND b.txt = 'collation-ci'
+UNION ALL SELECT 13, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 13 AND b.marker = 'isolation-rr'
+UNION ALL SELECT 14, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 14 AND b.marker = 'isolation-rc'
+UNION ALL SELECT 15, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 15 AND b.marker = 'sql-log-bin-off'
+UNION ALL SELECT 16, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 16 AND b.v = b.sid + 17
+   AND b.txt = CONCAT('multi-', b.sid)
+UNION ALL SELECT 17, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 17 AND b.txt = 'null-restored'
+UNION ALL SELECT 18, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 18 AND b.txt = CONCAT('final-', b.sid)
+UNION ALL SELECT 19, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 19 AND b.v = b.sid + 1901
+UNION ALL SELECT 20, COUNT(*) = 5
+  FROM t_state_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 20 AND b.v = b.sid * 2 + 1
+ORDER BY case_id;
+--disable_query_log
+SET time_zone = @batch_state_old_time_zone;
+--enable_query_log
+SQL
+
+sub emit_measured {
+  my ($fh, $sql) = @_;
+  print $fh "SET \@batch_long_stmt_start = NOW(6);\n";
+  print $fh "$sql;\n";
+  print $fh "SET \@batch_long_stmt_us = " .
+            "TIMESTAMPDIFF(MICROSECOND, \@batch_long_stmt_start, NOW(6));\n";
+  print $fh "SET \@batch_long_max_stmt_us = " .
+            "GREATEST(\@batch_long_max_stmt_us, \@batch_long_stmt_us);\n";
+  print $fh "SET \@batch_long_sql_count = \@batch_long_sql_count + 1;\n";
+}
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  my $app_name = sprintf("batch_long_app_%03d", $sid);
+  print $apps "--connect($app_name,localhost,root,,test)\n";
+  print $apps "--connection $app_name\n";
+  print $apps "UPDATE t_batch_long_control SET started_at = NOW(6) WHERE sid = $sid;\n";
+  print $apps "SET \@batch_long_sid = $sid;\n";
+  print $apps "SET \@batch_long_case_id = $case_id;\n";
+  print $apps "SET \@batch_long_started_at = UTC_TIMESTAMP(6);\n";
+  print $apps "SET \@batch_long_max_stmt_us = 0;\n";
+  print $apps "SET \@batch_long_sql_count = 0;\n";
+  print $apps "SET \@batch_long_end_action = 'COMMIT';\n";
+  print $apps "SET \@batch_long_pre_finalize_sql = NULL;\n";
+  print $apps "SET \@batch_state_pre_ok = 0;\n";
+  print $apps "SET \@state_expected_lid = 0;\n";
+  if ($case_id == 6) {
+    print $apps "SET SESSION sql_mode = 'ANSI_QUOTES';\n";
+  } elsif ($case_id == 7) {
+    print $apps "SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES';\n";
+  } elsif ($case_id == 8) {
+    print $apps "SET SESSION sql_mode = 'STRICT_TRANS_TABLES';\n";
+  } elsif ($case_id == 9) {
+    print $apps "SET SESSION time_zone = '+00:00';\n";
+  } elsif ($case_id == 10) {
+    print $apps "SET SESSION time_zone = '+08:00';\n";
+  } elsif ($case_id == 11) {
+    print $apps "SET NAMES utf8mb4;\n";
+  } elsif ($case_id == 12) {
+    print $apps "SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;\n";
+  } elsif ($case_id == 13) {
+    print $apps "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;\n";
+  } elsif ($case_id == 14) {
+    print $apps "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;\n";
+  } elsif ($case_id == 15) {
+    print $apps "SET SESSION sql_log_bin = 0;\n";
+  }
+  print $apps "START TRANSACTION;\n";
+  emit_measured($apps, "UPDATE t_state_base SET heartbeat = heartbeat + 1 WHERE sid = $sid");
+  if ($case_id == 1) {
+    emit_measured($apps, "SET \@state_int = $sid * 10 + 1");
+    emit_measured($apps, "UPDATE t_state_base SET v = \@state_int WHERE sid = $sid");
+    emit_measured($apps, "SELECT v = " . ($sid * 10 + 1) . " INTO \@batch_state_pre_ok FROM t_state_base WHERE sid = $sid");
+  } elsif ($case_id == 2) {
+    emit_measured($apps, "SET \@state_string = CONCAT('state-', $sid)");
+    emit_measured($apps, "UPDATE t_state_base SET txt = \@state_string WHERE sid = $sid");
+    emit_measured($apps, "SELECT txt = CONCAT('state-', $sid) INTO \@batch_state_pre_ok FROM t_state_base WHERE sid = $sid");
+  } elsif ($case_id == 3) {
+    emit_measured($apps, "SET \@state_decimal = CAST($sid AS DECIMAL(12,2)) + 0.25");
+    emit_measured($apps, "UPDATE t_state_base SET decval = \@state_decimal WHERE sid = $sid");
+    emit_measured($apps, "SELECT decval = CAST($sid AS DECIMAL(12,2)) + 0.25 INTO \@batch_state_pre_ok FROM t_state_base WHERE sid = $sid");
+  } elsif ($case_id == 4) {
+    emit_measured($apps, "INSERT INTO t_state_auto(sid, marker) VALUES($sid, 'last-insert-id')");
+    emit_measured($apps, "SET \@state_expected_lid = LAST_INSERT_ID()");
+    emit_measured($apps, "SELECT LAST_INSERT_ID() = \@state_expected_lid INTO \@batch_state_pre_ok");
+  } elsif ($case_id == 5) {
+    emit_measured($apps, "SELECT LAST_INSERT_ID($sid * 10000 + 5) INTO \@state_lid_expr");
+    emit_measured($apps, "SET \@state_expected_lid = $sid * 10000 + 5");
+    emit_measured($apps, "SELECT LAST_INSERT_ID() = \@state_expected_lid INTO \@batch_state_pre_ok");
+  } elsif ($case_id == 6) {
+    emit_measured($apps, "SET \@state_ansi_sql = 'UPDATE t_state_base SET \"txt\" = ''ansi-resumed'' WHERE sid = \@batch_long_sid'");
+    emit_measured($apps, "SET \@batch_long_pre_finalize_sql = \@state_ansi_sql");
+    emit_measured($apps, "UPDATE t_state_base SET txt = 'ansi-pre' WHERE sid = $sid");
+    emit_measured($apps, "SELECT FIND_IN_SET('ANSI_QUOTES', \@\@sql_mode) > 0 INTO \@batch_state_pre_ok");
+  } elsif ($case_id == 7) {
+    emit_measured($apps, "SET \@state_no_backslash_sql = CONCAT('UPDATE t_state_base SET txt = ''slash', CHAR(92), 'path'' WHERE sid = \@batch_long_sid')");
+    emit_measured($apps, "SET \@batch_long_pre_finalize_sql = \@state_no_backslash_sql");
+    emit_measured($apps, "UPDATE t_state_base SET txt = 'no-backslash-pre' WHERE sid = $sid");
+    emit_measured($apps, "SELECT FIND_IN_SET('NO_BACKSLASH_ESCAPES', \@\@sql_mode) > 0 INTO \@batch_state_pre_ok");
+  } elsif ($case_id == 8) {
+    emit_measured($apps, "SET \@batch_long_pre_finalize_sql = 'SET \@state_strict_pre_finalize_ok = FIND_IN_SET(''STRICT_TRANS_TABLES'', \@\@sql_mode) > 0'");
+    emit_measured($apps, "UPDATE t_state_base SET v = CAST('8' AS SIGNED), marker = 'strict-pre' WHERE sid = $sid");
+    emit_measured($apps, "SELECT FIND_IN_SET('STRICT_TRANS_TABLES', \@\@sql_mode) > 0 INTO \@batch_state_pre_ok");
+  } elsif ($case_id == 9) {
+    emit_measured($apps, "UPDATE t_state_base SET dt = TIMESTAMP'2026-05-17 01:02:03.000000', ts = TIMESTAMP'2026-05-17 01:02:03', marker = 'tz-pre' WHERE sid = $sid");
+    emit_measured($apps, "SELECT \@\@time_zone = '+00:00' INTO \@batch_state_pre_ok");
+  } elsif ($case_id == 10) {
+    emit_measured($apps, "UPDATE t_state_base SET dt = TIMESTAMP'2026-05-17 09:02:03.000000', ts = TIMESTAMP'2026-05-17 09:02:03', marker = 'tz-pre' WHERE sid = $sid");
+    emit_measured($apps, "SELECT \@\@time_zone = '+08:00' INTO \@batch_state_pre_ok");
+  } elsif ($case_id == 11) {
+    emit_measured($apps, "SET \@state_utf8_text = 'utf8mb4'");
+    emit_measured($apps, "UPDATE t_state_base SET txt = \@state_utf8_text WHERE sid = $sid");
+    emit_measured($apps, "SELECT \@\@character_set_connection = 'utf8mb4' INTO \@batch_state_pre_ok");
+  } elsif ($case_id == 12) {
+    emit_measured($apps, "UPDATE t_state_base SET txt = IF('A' = 'a', 'collation-ci-pre', 'collation-cs-pre') WHERE sid = $sid");
+    emit_measured($apps, "SELECT \@\@collation_connection = 'utf8mb4_0900_ai_ci' AND txt = 'collation-ci-pre' INTO \@batch_state_pre_ok FROM t_state_base WHERE sid = $sid");
+  } elsif ($case_id == 13) {
+    emit_measured($apps, "UPDATE t_state_base SET marker = 'isolation-rr-pre' WHERE sid = $sid");
+    emit_measured($apps, "SELECT \@\@transaction_isolation = 'REPEATABLE-READ' INTO \@batch_state_pre_ok");
+  } elsif ($case_id == 14) {
+    emit_measured($apps, "UPDATE t_state_base SET marker = 'isolation-rc-pre' WHERE sid = $sid");
+    emit_measured($apps, "SELECT \@\@transaction_isolation = 'READ-COMMITTED' INTO \@batch_state_pre_ok");
+  } elsif ($case_id == 15) {
+    emit_measured($apps, "UPDATE t_state_base SET marker = 'sql-log-bin-pre' WHERE sid = $sid");
+    emit_measured($apps, "SELECT \@\@session.sql_log_bin = 0 INTO \@batch_state_pre_ok");
+  } elsif ($case_id == 16) {
+    emit_measured($apps, "SET \@state_multi_int = $sid");
+    emit_measured($apps, "SET \@state_multi_dec = CAST(17 AS DECIMAL(12,0))");
+    emit_measured($apps, "SET \@state_multi_string = CONCAT('multi-', $sid)");
+    emit_measured($apps, "UPDATE t_state_base SET v = \@state_multi_int + \@state_multi_dec, txt = \@state_multi_string WHERE sid = $sid");
+    emit_measured($apps, "SELECT txt = CONCAT('multi-', $sid) INTO \@batch_state_pre_ok FROM t_state_base WHERE sid = $sid");
+  } elsif ($case_id == 17) {
+    emit_measured($apps, "SET \@state_null = NULL");
+    emit_measured($apps, "UPDATE t_state_base SET txt = IF(\@state_null IS NULL, 'null-pre', 'null-missing') WHERE sid = $sid");
+    emit_measured($apps, "SELECT txt = 'null-pre' INTO \@batch_state_pre_ok FROM t_state_base WHERE sid = $sid");
+  } elsif ($case_id == 18) {
+    emit_measured($apps, "SET \@state_overwrite = 'initial'");
+    emit_measured($apps, "SET \@state_overwrite = CONCAT('final-', $sid)");
+    emit_measured($apps, "UPDATE t_state_base SET txt = \@state_overwrite WHERE sid = $sid");
+    emit_measured($apps, "SELECT txt = CONCAT('final-', $sid) INTO \@batch_state_pre_ok FROM t_state_base WHERE sid = $sid");
+  } elsif ($case_id == 19) {
+    emit_measured($apps, "SET \@state_resume_set = $sid + 1900");
+    emit_measured($apps, "UPDATE t_state_base SET v = \@state_resume_set WHERE sid = $sid");
+    emit_measured($apps, "SELECT v = " . ($sid + 1900) . " INTO \@batch_state_pre_ok FROM t_state_base WHERE sid = $sid");
+  } elsif ($case_id == 20) {
+    emit_measured($apps, "SET \@state_savepoint_value = $sid * 2");
+    emit_measured($apps, "UPDATE t_state_base SET v = \@state_savepoint_value, marker = 'state-savepoint-pre' WHERE sid = $sid");
+    emit_measured($apps, "SAVEPOINT s_state");
+    emit_measured($apps, "UPDATE t_state_base SET v = v + 100, marker = 'state-savepoint-after' WHERE sid = $sid");
+    emit_measured($apps, "SELECT marker = 'state-savepoint-after' INTO \@batch_state_pre_ok FROM t_state_base WHERE sid = $sid");
+  }
+}
+print $apps "--connection default\n";
+
+for my $round (1 .. 80) {
+  for my $sid (1 .. 100) {
+    my $name = sprintf("batch_long_app_%03d", $sid);
+    print $post_apps "--connection $name\n";
+    emit_measured($post_apps, "UPDATE t_state_base SET heartbeat = heartbeat + 1 WHERE sid = $sid");
+  }
+}
+print $post_apps "--connection default\n";
+
+close($setup);
+close($apps);
+close($post_apps);
+close($cleanup);
+close($verify);
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+SET GLOBAL preserve_trx_recovery_max_count=200;
+--let $old_preserve_trx_drain_grace_ms= `SELECT @@GLOBAL.preserve_trx_drain_grace_ms`
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+
+--let $batch_long_prefix= batch_long_state
+--let $batch_long_setup_file= $MYSQLTEST_VARDIR/tmp/batch_long_state_setup.inc
+--let $batch_long_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_state_apps.inc
+--let $batch_long_post_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_state_post_apps.inc
+--let $batch_long_cleanup_file= $MYSQLTEST_VARDIR/tmp/batch_long_state_cleanup.inc
+--let $batch_long_resume_file= $MYSQLTEST_VARDIR/tmp/batch_long_state_resume.inc
+--let $batch_long_verify_file= $MYSQLTEST_VARDIR/tmp/batch_long_state_verify.inc
+--source suite/preserve_trx/include/batch_drain_100_long_common.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+--disable_query_log
+--disable_result_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_drain_grace_ms=$old_preserve_trx_drain_grace_ms
+--enable_result_log
+--enable_query_log

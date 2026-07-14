@@ -1,0 +1,1976 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Preserve/Resume 8.0.22 用户手册</title>
+  <style>
+    :root {
+      --ink: #17212b;
+      --muted: #596675;
+      --line: #d9e0e7;
+      --soft: #f5f7f9;
+      --soft-2: #eef4f5;
+      --accent: #0b6670;
+      --accent-dark: #084b53;
+      --green: #28633d;
+      --amber: #8a5a00;
+      --amber-bg: #fff7e6;
+      --red: #933344;
+      --red-bg: #fff4f5;
+      --blue-bg: #eef6fb;
+      --code: #edf1f4;
+      --sidebar: 284px;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 24px; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      font-size: 15px;
+      line-height: 1.72;
+      letter-spacing: 0;
+    }
+    a { color: var(--accent); }
+    a:hover { color: var(--accent-dark); }
+    code, pre {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      letter-spacing: 0;
+    }
+    code {
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: var(--code);
+      overflow-wrap: anywhere;
+    }
+    pre {
+      margin: 14px 0;
+      padding: 16px 18px;
+      overflow: auto;
+      border: 1px solid #283645;
+      border-radius: 6px;
+      color: #f7fafc;
+      background: #17212b;
+      font-size: 13px;
+      line-height: 1.62;
+    }
+    pre code { padding: 0; color: inherit; background: transparent; overflow-wrap: normal; }
+    h1, h2, h3, h4 { color: #101820; line-height: 1.3; letter-spacing: 0; }
+    h1 { margin: 0; font-size: 34px; }
+    h2 {
+      margin: 52px 0 16px;
+      padding-top: 20px;
+      border-top: 1px solid var(--line);
+      font-size: 25px;
+    }
+    h3 { margin: 30px 0 10px; font-size: 19px; }
+    h4 { margin: 22px 0 8px; font-size: 16px; }
+    p { margin: 9px 0; }
+    ul, ol { margin: 9px 0 12px 24px; padding: 0; }
+    li { margin: 4px 0; }
+    strong { color: #111820; }
+    .layout { min-height: 100vh; }
+    .sidebar {
+      position: fixed;
+      z-index: 20;
+      inset: 0 auto 0 0;
+      width: var(--sidebar);
+      padding: 22px 18px 30px;
+      overflow-y: auto;
+      border-right: 1px solid var(--line);
+      background: #f8fafb;
+    }
+    .brand {
+      display: block;
+      margin: 0 4px 15px;
+      color: #111820;
+      font-size: 15px;
+      font-weight: 750;
+      text-decoration: none;
+    }
+    .toc-label {
+      margin: 18px 5px 7px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .toc { margin: 0; padding: 0; list-style: none; }
+    .toc li { margin: 1px 0; }
+    .toc a {
+      display: block;
+      padding: 6px 8px;
+      border-left: 2px solid transparent;
+      border-radius: 0 4px 4px 0;
+      color: #485563;
+      font-size: 13px;
+      line-height: 1.35;
+      text-decoration: none;
+    }
+    .toc a:hover { color: var(--accent-dark); background: #eef3f5; }
+    .toc a.active {
+      border-left-color: var(--accent);
+      color: var(--accent-dark);
+      background: #e7f0f1;
+      font-weight: 700;
+    }
+    .content {
+      width: min(1260px, calc(100% - var(--sidebar)));
+      margin-left: var(--sidebar);
+      padding: 38px 48px 80px;
+    }
+    .hero {
+      padding: 4px 0 26px;
+      border-bottom: 3px solid var(--accent);
+    }
+    .subtitle {
+      max-width: 900px;
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 17px;
+    }
+    .meta-line {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 20px;
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 22px 0;
+    }
+    .summary-item {
+      min-height: 86px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+    }
+    .summary-item b { display: block; margin-bottom: 3px; font-size: 18px; }
+    .summary-item span { color: var(--muted); font-size: 13px; }
+    .callout {
+      margin: 16px 0;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--accent);
+      border-radius: 4px;
+      background: var(--soft);
+    }
+    .callout.warn { border-left-color: #c17a00; background: var(--amber-bg); }
+    .callout.danger { border-left-color: var(--red); background: var(--red-bg); }
+    .callout.success { border-left-color: var(--green); background: #f1f8f3; }
+    .callout-title { display: block; margin-bottom: 3px; font-weight: 750; }
+    .tag {
+      display: inline-block;
+      margin: 2px 4px 2px 0;
+      padding: 2px 7px;
+      border: 1px solid #c9d6dc;
+      border-radius: 4px;
+      color: #34535c;
+      background: #f2f7f8;
+      font-size: 12px;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+    .table-wrap {
+      width: 100%;
+      margin: 14px 0 22px;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+    }
+    table {
+      width: 100%;
+      min-width: 760px;
+      border-collapse: collapse;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+    th, td {
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--line);
+      border-right: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+    th:last-child, td:last-child { border-right: 0; }
+    tr:last-child td { border-bottom: 0; }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      color: #26333e;
+      background: #edf2f5;
+      font-weight: 750;
+    }
+    tbody tr:nth-child(even) { background: #fafbfc; }
+    tbody tr:hover { background: #f1f7f8; }
+    td code { white-space: nowrap; }
+    .diagram {
+      margin: 18px 0 26px;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fbfcfd;
+    }
+    .diagram svg { display: block; min-width: 960px; width: 100%; height: auto; }
+    .flow-box { fill: #fff; stroke: #48616e; stroke-width: 1.3; }
+    .flow-green { fill: #f1f8f3; stroke: #39734d; stroke-width: 1.3; }
+    .flow-amber { fill: #fff8e8; stroke: #9a6a20; stroke-width: 1.3; }
+    .flow-red { fill: #fff4f5; stroke: #9e4050; stroke-width: 1.3; }
+    .flow-blue { fill: #eef6fb; stroke: #35708f; stroke-width: 1.3; }
+    .flow-line { fill: none; stroke: #4e5e69; stroke-width: 1.6; marker-end: url(#flow-arrow); }
+    .flow-dash { stroke-dasharray: 6 5; }
+    .flow-title { fill: #17212b; font-size: 15px; font-weight: 750; }
+    .flow-text { fill: #26343e; font-size: 13px; }
+    .flow-small { fill: #5c6873; font-size: 11px; }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      margin: 12px 0 8px;
+    }
+    .filter-input {
+      width: min(520px, 100%);
+      min-height: 38px;
+      padding: 8px 10px;
+      border: 1px solid #bfcbd3;
+      border-radius: 4px;
+      color: var(--ink);
+      background: #fff;
+      font: inherit;
+    }
+    .filter-input:focus { outline: 2px solid #9fc9ce; border-color: var(--accent); }
+    .filter-count { color: var(--muted); font-size: 13px; }
+    .top-rank {
+      width: 54px;
+      color: var(--accent-dark);
+      font-size: 16px;
+      font-weight: 800;
+      text-align: center;
+    }
+    #parameter-table { min-width: 1080px; }
+    .parameter-explanation { min-width: 500px; }
+    .parameter-meaning { margin: 0 0 8px; }
+    .parameter-guidance {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .parameter-guidance > div {
+      padding: 8px 10px;
+      border-left: 3px solid #b8c9cf;
+      background: #f4f7f8;
+    }
+    .parameter-guidance strong {
+      display: block;
+      margin-bottom: 2px;
+      color: #28434a;
+      font-size: 12px;
+    }
+    .parameter-guidance span { color: #44515e; }
+    .parameter-chain {
+      display: grid;
+      grid-template-columns: 190px minmax(0, 1fr);
+      gap: 6px 16px;
+      margin: 12px 0 18px;
+      padding: 0;
+      list-style: none;
+    }
+    .parameter-chain li { display: contents; }
+    .parameter-chain b,
+    .parameter-chain span {
+      padding: 8px 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .parameter-chain span { color: #44515e; }
+    .metric-group td {
+      color: #1f4c55;
+      background: #e9f1f2 !important;
+      font-weight: 750;
+    }
+    .muted { color: var(--muted); }
+    .nowrap { white-space: nowrap; }
+    .checklist { columns: 2; column-gap: 34px; }
+    .checklist li { break-inside: avoid; }
+    .foot {
+      margin-top: 54px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .menu-button {
+      display: none;
+      position: fixed;
+      z-index: 30;
+      top: 10px;
+      left: 10px;
+      width: 40px;
+      height: 40px;
+      border: 1px solid #bdc8cf;
+      border-radius: 4px;
+      color: #17343a;
+      background: #fff;
+      font-size: 22px;
+      line-height: 1;
+      cursor: pointer;
+    }
+    .scrim { display: none; }
+    @media (max-width: 980px) {
+      .menu-button { display: inline-grid; place-items: center; }
+      .sidebar {
+        transform: translateX(-100%);
+        transition: transform .18s ease;
+        box-shadow: 8px 0 24px rgba(20, 34, 45, .15);
+      }
+      body.nav-open .sidebar { transform: translateX(0); }
+      body.nav-open .scrim {
+        display: block;
+        position: fixed;
+        z-index: 15;
+        inset: 0;
+        background: rgba(10, 20, 28, .28);
+      }
+      .content { width: 100%; margin-left: 0; padding: 68px 24px 64px; }
+      .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 620px) {
+      body { font-size: 14px; }
+      .content { padding: 64px 16px 52px; }
+      h1 { font-size: 27px; }
+      h2 { margin-top: 42px; font-size: 22px; }
+      h3 { font-size: 18px; }
+      .subtitle { font-size: 15px; }
+      .summary-grid { grid-template-columns: 1fr; }
+      .summary-item { min-height: 0; }
+      .checklist { columns: 1; }
+      .parameter-guidance { grid-template-columns: 1fr; }
+      .parameter-chain { grid-template-columns: 1fr; gap: 0; }
+      .parameter-chain b { border-bottom: 0; padding-bottom: 0; }
+      .parameter-chain span { padding-top: 2px; }
+      table { min-width: 700px; }
+    }
+    @media print {
+      .sidebar, .menu-button, .scrim, .toolbar { display: none !important; }
+      .content { width: 100%; max-width: none; margin: 0; padding: 0; }
+      .diagram, .table-wrap, pre { break-inside: avoid; }
+      h2, h3 { break-after: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <svg width="0" height="0" aria-hidden="true" focusable="false" style="position:absolute">
+    <defs>
+      <marker id="flow-arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+        <path d="M0,0 L8,3 L0,6 Z" fill="#4e5e69"/>
+      </marker>
+    </defs>
+  </svg>
+  <button class="menu-button" id="menu-button" type="button" aria-label="打开目录" title="打开目录">☰</button>
+  <div class="scrim" id="scrim"></div>
+  <div class="layout">
+    <aside class="sidebar" id="sidebar" aria-label="文档目录">
+      <a class="brand" href="#top">Preserve/Resume 用户手册</a>
+      <div class="toc-label">使用与原理</div>
+      <ul class="toc">
+        <li><a href="#positioning">1. 特性定位</a></li>
+        <li><a href="#concepts">2. 核心概念</a></li>
+        <li><a href="#quickstart">3. 本地模式快速使用</a></li>
+        <li><a href="#sql">4. SQL 与接口</a></li>
+        <li><a href="#local-flow">5. 本地保存与恢复原理</a></li>
+        <li><a href="#batch">6. Batch drain 与 warmcopy</a></li>
+        <li><a href="#recovery">7. 启动恢复、超时与关闭策略</a></li>
+        <li><a href="#production">8. 生产形态：备机传输与晋升</a></li>
+        <li><a href="#security">9. 权限与安全</a></li>
+      </ul>
+      <div class="toc-label">配置与运维</div>
+      <ul class="toc">
+        <li><a href="#parameters">10. 参数全集</a></li>
+        <li><a href="#scenarios">11. 使用场景</a></li>
+        <li><a href="#observability">12. 可观察性全集</a></li>
+        <li><a href="#limitations">13. 限制与注意事项</a></li>
+        <li><a href="#troubleshooting">14. 错误与排障</a></li>
+        <li><a href="#checklists">15. 运维检查清单</a></li>
+        <li><a href="#appendix">附录：状态码与源码锚点</a></li>
+      </ul>
+    </aside>
+
+    <main class="content" id="top">
+      <header class="hero">
+        <h1>Preserve/Resume 8.0.22 用户手册</h1>
+        <p class="subtitle">面向 DBA、HA 平台、运维和值班支持，说明未提交事务跨受控停机的保存、恢复、备机传输、物理晋升接入，以及完整的配置和观测方法。</p>
+        <div class="meta-line">
+          <span><strong>事实源：</strong>语法、系统变量、P_S、SHOW STATUS 与当前实现源码</span>
+        </div>
+      </header>
+
+      <div class="summary-grid" aria-label="手册覆盖范围">
+        <div class="summary-item"><b>4 条 SQL</b><span>preserve、batch drain、resume、show</span></div>
+        <div class="summary-item"><b>64 个参数</b><span>含本地、warmcopy、传输和晋升</span></div>
+        <div class="summary-item"><b>29 个 P_S 字段</b><span>与 SHOW PRESERVED 输出一致</span></div>
+        <div class="summary-item"><b>183 个状态量</b><span>逐项说明口径、单位与重置边界</span></div>
+      </div>
+
+      <div class="callout warn">
+        <span class="callout-title">使用前先确认边界</span>
+        Preserve/Resume 面向<strong>受控停机</strong>。它保存的是未提交事务语义，不是提交结果，也不是任意 mysqld 崩溃后的事务续跑机制。生产备机形态还要求物理复制面与 Preserve 语义面共同满足晋升栅栏。
+      </div>
+
+      <section id="positioning">
+        <h2>1. 特性定位</h2>
+        <p>Preserve/Resume 把一个受支持的显式事务从当前连接中安全分离，保存为可验证的 durable snapshot 和外部对象；服务重启后，再把同一事务附着到新的连接。恢复成功后事务仍处于未提交状态，客户端可以继续执行受支持的 SQL，最后自行 <code>COMMIT</code> 或 <code>ROLLBACK</code>。</p>
+        <p>它解决的是维护停机、版本切换或物理备机晋升期间，长事务不希望全部回滚重做的问题。它不改变 MySQL 的提交语义，不把普通事务暴露成 XA 操作，也不保证所有会话状态都能跨进程恢复。</p>
+
+        <h3>1.1 保存了什么</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>类别</th><th>保存内容</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td>事务内核状态</td><td>InnoDB prepared transaction、内部 XID、undo/锁相关身份</td><td>由 prepare、detach、startup recovery/attach 共同保持。</td></tr>
+              <tr><td>并发语义</td><td>record/table locks、可物化隐式锁、read view、transaction-duration MDL</td><td>恢复时重新验证并导入；不支持的锁族 fail closed。</td></tr>
+              <tr><td>SQL 事务语义</td><td>隔离级别、当前 schema、SQL/InnoDB savepoint、modified tables</td><td>resume 前复检对象权限与目标 session 状态。</td></tr>
+              <tr><td>binlog/GTID</td><td>binlog 状态、transaction cache sidecar、<code>sql_log_bin</code>、<code>gtid_next</code></td><td>只支持 ROW；恢复环境必须与保存时兼容。</td></tr>
+              <tr><td>可选会话数据</td><td>用户变量 payload</td><td>只有显式 <code>WITH USER VARS</code> 才保存。</td></tr>
+              <tr><td>受约束临时表</td><td>InnoDB 用户临时表 image、no-redo undo sidecar、manifest</td><td>仅支持实现已验证的形态；跨机 portable transfer 当前不接受非空 temp manifest。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>1.2 没有保存什么</h3>
+        <p>普通连接身份、网络连接、客户端协议状态、open cursor、HANDLER、用户级锁、global read lock、backup lock、<code>LOCK TABLES</code> 等不会被转换为可恢复状态。这些上下文要么在入口直接拒绝，要么要求业务在停机前自行收敛。</p>
+      </section>
+
+      <section id="concepts">
+        <h2>2. 核心概念</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>概念</th><th>准确含义</th><th>常见误解</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Preserve</strong></td><td>把显式活跃事务 prepare、detach，并发布经过校验的 snapshot/sidecar。</td><td>不是提交，也不是只把 SQL 文本保存下来。</td></tr>
+              <tr><td><strong>Resume</strong></td><td>把 preserved transaction 恢复并附着到当前新 session。</td><td>不是重放历史 SQL；成功后仍需 COMMIT/ROLLBACK。</td></tr>
+              <tr><td><strong>Token</strong></td><td>本地模式通常是 32 位小写十六进制随机串；传输模式可能是源端连接 ID 的十进制字符串。</td><td>token 不是跨集群全局唯一身份；跨机还要结合 source UUID、epoch、generation/incarnation。</td></tr>
+              <tr><td><strong>Snapshot bundle</strong></td><td>认证后的事务元数据，加 binlog cache、record-lock、临时表等外部对象。</td><td>单看一个 <code>.bin</code> 文件不能证明事务完整可恢复。</td></tr>
+              <tr><td><strong>Carrier</strong></td><td>snapshot/对象被持久化和交付的载体。可选本地目录或 standby transfer。</td><td>carrier 不是事务一致性的全部证明。</td></tr>
+              <tr><td><strong>Drain</strong></td><td>停机控制面：阻止新风险工作、收敛目标 session、批量 preserve，再请求 shutdown。</td><td>单事务 preserve 也会做实例级收敛，不是完全局部操作。</td></tr>
+              <tr><td><strong>Warmcopy</strong></td><td>在 phase 1 提前复制 binlog/锁对象，phase 2 只封口、复检和写最终元数据。</td><td>不是跳过正确性检查；fallback 可能显著拉长 phase 2。</td></tr>
+              <tr><td><strong>Standby pending</strong></td><td>接收端已持久化且等待外部 HA 在物理晋升时认领的传输产物。</td><td>不等于普通本地 token，也不会自动出现在 P_S 表中。</td></tr>
+              <tr><td><strong>Promotion adopt</strong></td><td>物理栅栏满足后，严格 gate 将 prepared token 转为晋升方拥有的状态。</td><td><code>ADOPTED_FOR_PROMOTION</code> 不能再由普通 SQL RESUME 消费。</td></tr>
+              <tr><td><strong>Fail closed</strong></td><td>任何无法证明完整性、权限或一致性的路径都拒绝发布/消费 token。</td><td>失败不表示可以删文件重试；越过 durable point 后要按状态处理。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>2.1 Token 与记录身份</h3>
+        <p>本地 token 用于 SQL resume；跨机传输的严格身份还包括 source server UUID、epoch、generation/incarnation 和对象摘要。运维系统不得把 token 字符串单独当作跨实例主键。</p>
+        <div class="callout">
+          <span class="callout-title">当前 SQL 响应行为</span>
+          当前实现中，<code>PREPARE SHUTDOWN PRESERVE TRANSACTION</code> 成功时返回普通 OK，OK 包不携带 token；batch drain 也不返回 token 列表。受控重启后，应由具备 <code>PROCESS</code> 权限的管理连接通过 <code>SHOW PRESERVED TRANSACTIONS</code> 或 P_S 取得完整 token。生产传输模式则由外部 HA 控制面保存严格身份元组。
+        </div>
+      </section>
+
+      <section id="quickstart">
+        <h2>3. 本地模式快速使用</h2>
+        <h3>3.1 前置条件</h3>
+        <pre><code>SHOW VARIABLES WHERE Variable_name IN
+  ('preserve_trx_enable', 'preserve_trx_transfer_artifact_mode',
+   'binlog_format', 'read_only', 'super_read_only');
+
+-- 预期：preserve_trx_enable=ON
+-- 本地模式：preserve_trx_transfer_artifact_mode=LOCAL_CARRIER
+-- binlog_format=ROW</code></pre>
+
+        <h3>3.2 保存单个事务</h3>
+        <pre><code>START TRANSACTION;
+UPDATE orders SET status = 'processing' WHERE id = 1001;
+SET @maintenance_id = 'mw-20260713';
+
+PREPARE SHUTDOWN PRESERVE TRANSACTION
+  WITH TIMEOUT 3600
+  WITH USER VARS;</code></pre>
+        <p>命令成功后服务端请求 shutdown，原连接断开。不要期待 OK 包中出现 token。</p>
+
+        <h3>3.3 重启后查询并恢复</h3>
+        <pre><code>-- 使用具备 PROCESS 权限的管理账号
+SHOW PRESERVED TRANSACTIONS;
+
+SELECT TOKEN, USER, HOST, STATE, EXPIRES_AT, BINLOG_STATE,
+       BINLOG_CACHE_SIZE, TEMP_TABLE_STATE, LAST_ERROR
+  FROM performance_schema.preserved_transactions;
+
+-- 使用 token owner，或具备跨账号恢复权限的受控账号
+RESUME PRESERVED TRANSACTION '0123456789abcdef0123456789abcdef';
+
+-- 校验业务状态后，由客户端决定
+COMMIT;
+-- 或 ROLLBACK;</code></pre>
+
+        <h3>3.4 批量停机</h3>
+        <pre><code>SET GLOBAL preserve_trx_drain_mode = 'SOFT';
+SET GLOBAL preserve_trx_batch_max_transactions = 256;
+
+DRAIN TRANSACTIONS PRESERVE
+  WITH TIMEOUT 1800
+  WITH NO USER VARS;</code></pre>
+        <p>即使没有目标事务，batch 命令也可以成功并继续请求 shutdown。恢复前先查询实际 token 数量，不要按 drain 前连接数推断。</p>
+      </section>
+
+      <section id="sql">
+        <h2>4. SQL 语句与接口</h2>
+        <h3>4.1 语法总览</h3>
+        <pre><code>PREPARE SHUTDOWN PRESERVE TRANSACTION
+  [WITH TIMEOUT seconds]
+  [WITH USER VARS | WITH NO USER VARS];
+
+DRAIN TRANSACTIONS PRESERVE
+  [WITH TIMEOUT seconds]
+  [WITH USER VARS | WITH NO USER VARS | NO USER VARS];
+
+RESUME PRESERVED TRANSACTION 'token';
+
+SHOW PRESERVED TRANSACTIONS;</code></pre>
+        <p><code>WITH TIMEOUT</code> 和用户变量子句可以交换顺序，但同类子句重复会在语法合并阶段拒绝。只有 batch 兼容不带 <code>WITH</code> 的 <code>NO USER VARS</code>。</p>
+
+        <h3>4.2 PREPARE SHUTDOWN PRESERVE TRANSACTION</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>项目</th><th>行为</th></tr></thead>
+            <tbody>
+              <tr><td>目标</td><td>当前连接上的显式活跃事务。</td></tr>
+              <tr><td>权限</td><td>静态 <code>SHUTDOWN</code>。</td></tr>
+              <tr><td>超时</td><td>没有子句时取当前 session 的 <code>preserve_trx_default_timeout</code>；显式值还受 min/max 约束。</td></tr>
+              <tr><td>成功响应</td><td>普通 OK，不含 token；OK 成功交付后记录才转为 resumable，随后请求 shutdown。</td></tr>
+              <tr><td>实例影响</td><td>为了建立可控停机边界，会收敛其他活跃事务；不要把它当作只影响当前连接的轻量命令。</td></tr>
+              <tr><td>失败边界</td><td>durable point 前尽量保留原事务；越过 prepare/detach 后失败则 reattach、rollback 或记录可观察故障。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>4.3 DRAIN TRANSACTIONS PRESERVE</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>项目</th><th>行为</th></tr></thead>
+            <tbody>
+              <tr><td>控制连接</td><td>不能处于显式活跃事务中；需要 <code>SHUTDOWN</code>。</td></tr>
+              <tr><td>目标选择</td><td>收集可保存的业务 session；目标必须可静默到达 idle/quiesced 状态并通过支持性检查。</td></tr>
+              <tr><td>SOFT</td><td>先阻止新风险语句并等待 grace；到期后升级 HARD。</td></tr>
+              <tr><td>HARD</td><td>立即 kill 其他活跃用户事务，等待其退出；被 kill 的事务不会生成 token。</td></tr>
+              <tr><td>返回值</td><td>普通 OK，不返回 token 列表；成功后请求 shutdown。</td></tr>
+              <tr><td>清理失败</td><td>若 batch rollback/cleanup 不能完整撤销，返回专用错误并要求先检查 P_S 和目标 session，不能盲目重试。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn"><strong>目标 session 的体验：</strong>drain 期间命中阻断条件的业务语句会收到 <code>ER_PRESERVE_TRX_SESSION_DRAINED</code>。该错误只说明 session 被 drain，不携带 token。</div>
+
+        <h3>4.4 USER VARS 的准确语义</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>写法</th><th>保存行为</th><th>resume 对目标 session 的影响</th></tr></thead>
+            <tbody>
+              <tr><td>不写任何 USER VARS 子句</td><td>DEFAULT；不生成用户变量 payload。</td><td>不导入，也不清空目标 session 现有用户变量。</td></tr>
+              <tr><td><code>WITH NO USER VARS</code></td><td>显式 EXCLUDE；不生成 payload。</td><td>与 DEFAULT 相同，不覆盖目标 session。</td></tr>
+              <tr><td>batch 的 <code>NO USER VARS</code></td><td>语法兼容写法，语义仍是 EXCLUDE。</td><td>与 <code>WITH NO USER VARS</code> 完全相同。</td></tr>
+              <tr><td><code>WITH USER VARS</code></td><td>为每个目标业务 session 导出其变量集合；不是导出 drain 控制连接的变量。</td><td>导入 token 中的集合。即使保存时集合为空，也会记录“空集合 payload”，resume 时会清空目标 session 的现有用户变量。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>支持的值族包括字符串、实数、整数和 decimal。非法 charset/collation、无法编码的值或损坏 payload 会 fail closed。</p>
+
+        <h3>4.5 RESUME PRESERVED TRANSACTION</h3>
+        <p>resume 会先验证 token、owner、动态权限、对象权限、binlog/GTID 模式、只读状态和目标 session，再依次恢复 session 状态、MDL、binlog cache、临时表、InnoDB transaction、read view、锁和 savepoint。只有整个激活过程成功后才消费 snapshot。</p>
+        <div class="callout danger">
+          <span class="callout-title">不要把 RESUME 当作幂等查询</span>
+          它会认领并移动 token 状态。失败后先看 <code>STATE</code>、<code>LAST_ERROR</code> 和错误日志，确认 token 仍为 <code>PRESERVED</code> 再决定是否重试。
+        </div>
+
+        <h3>4.6 SHOW PRESERVED TRANSACTIONS</h3>
+        <p>SHOW 与 <code>performance_schema.preserved_transactions</code> 使用同一份 registry snapshot、同一套 owner 可见性和 token 脱敏规则，输出同样的 29 列。查询会等待本次 startup recovery 完成；总开关关闭时返回空集合。</p>
+      </section>
+
+      <section id="local-flow">
+        <h2>5. 本地保存与恢复原理</h2>
+        <div class="diagram" aria-label="本地 Preserve Resume 生命周期">
+          <svg viewBox="0 0 1180 430" role="img">
+            <text x="28" y="30" class="flow-title">本地模式：从业务事务到新连接</text>
+            <rect x="40" y="78" width="160" height="70" rx="5" class="flow-box"/>
+            <text x="67" y="107" class="flow-title">显式活跃事务</text><text x="67" y="130" class="flow-small">业务 SQL / 锁 / read view</text>
+            <rect x="245" y="78" width="185" height="70" rx="5" class="flow-blue"/>
+            <text x="274" y="107" class="flow-title">入口与语义预检</text><text x="274" y="130" class="flow-small">权限、上下文、binlog、对象</text>
+            <rect x="475" y="78" width="180" height="70" rx="5" class="flow-amber"/>
+            <text x="506" y="107" class="flow-title">prepare + detach</text><text x="506" y="130" class="flow-small">跨过 durable point</text>
+            <rect x="700" y="78" width="185" height="70" rx="5" class="flow-green"/>
+            <text x="725" y="107" class="flow-title">发布 snapshot bundle</text><text x="725" y="130" class="flow-small">registry=PRESERVED</text>
+            <rect x="930" y="78" width="175" height="70" rx="5" class="flow-box"/>
+            <text x="979" y="107" class="flow-title">受控关机</text><text x="958" y="130" class="flow-small">prepared trx 留在 InnoDB</text>
+            <path d="M200 113 L245 113" class="flow-line"/><path d="M430 113 L475 113" class="flow-line"/><path d="M655 113 L700 113" class="flow-line"/><path d="M885 113 L930 113" class="flow-line"/>
+
+            <rect x="930" y="255" width="175" height="70" rx="5" class="flow-blue"/>
+            <text x="965" y="284" class="flow-title">启动恢复扫描</text><text x="956" y="307" class="flow-small">XID、文件、摘要、尝试次数</text>
+            <rect x="700" y="255" width="185" height="70" rx="5" class="flow-green"/>
+            <text x="748" y="284" class="flow-title">恢复 registry</text><text x="730" y="307" class="flow-small">PRESERVED / 错误状态</text>
+            <rect x="475" y="255" width="180" height="70" rx="5" class="flow-blue"/>
+            <text x="513" y="284" class="flow-title">SQL RESUME</text><text x="501" y="307" class="flow-small">重新鉴权并认领 token</text>
+            <rect x="245" y="255" width="185" height="70" rx="5" class="flow-green"/>
+            <text x="275" y="284" class="flow-title">附着到新 session</text><text x="275" y="307" class="flow-small">恢复锁、MDL、binlog 等</text>
+            <rect x="40" y="255" width="160" height="70" rx="5" class="flow-box"/>
+            <text x="67" y="284" class="flow-title">继续或结束事务</text><text x="68" y="307" class="flow-small">SQL / COMMIT / ROLLBACK</text>
+            <path d="M1018 148 L1018 255" class="flow-line"/><path d="M930 290 L885 290" class="flow-line"/><path d="M700 290 L655 290" class="flow-line"/><path d="M475 290 L430 290" class="flow-line"/><path d="M245 290 L200 290" class="flow-line"/>
+            <path d="M566 148 C566 195 770 194 790 255" class="flow-line flow-dash"/>
+            <text x="580" y="208" class="flow-small">失败：reattach / rollback / taint / 可观察错误</text>
+          </svg>
+        </div>
+
+        <h3>5.1 Preserve 的关键阶段</h3>
+        <ol>
+          <li>检查总开关、classic protocol、<code>SHUTDOWN</code>、显式事务和不支持上下文。</li>
+          <li>完成 binlog preflight，确认 ROW、GTID 状态和 cache 分类。</li>
+          <li>检查只允许 InnoDB 和有效 binlog participant，拒绝非事务表修改。</li>
+          <li>导出/物化 read view、record/table locks、MDL、savepoint、modified tables、可选用户变量和临时表信息。</li>
+          <li>生成 token 与内部 XID，持久化 XID provenance。</li>
+          <li>调用引擎/binlog prepare，detach THD 上的事务；这是最关键的 durable 边界。</li>
+          <li>写认证 snapshot 和外部对象，注册 durable record。</li>
+          <li>确认成功响应交付后把 token 标记为可恢复，并进入 shutdown。</li>
+        </ol>
+
+        <h3>5.2 Resume 的关键阶段</h3>
+        <ol>
+          <li>等待 startup recovery，按 token 找到可消费记录。</li>
+          <li>校验 owner、跨账号权限、<code>sql_log_bin</code> 特权、对象 ACL、只读和 binlog 模式。</li>
+          <li>把状态从 <code>PRESERVED</code> 原子认领到 <code>RESUMING</code>。</li>
+          <li>读取并验证 snapshot、sidecar、摘要、XID 和资源预算。</li>
+          <li>恢复 schema/session state、用户变量、GTID/binlog cache、MDL、临时表和 InnoDB transaction。</li>
+          <li>恢复 read view、锁和 savepoint，验证 attached transaction 可继续运行。</li>
+          <li>激活成功后清理 snapshot；失败则按阶段回退状态、rollback 或标记错误。</li>
+        </ol>
+
+        <h3>5.3 为什么不是 SQL 重放</h3>
+        <p>恢复依赖的是 prepared transaction 和持久化语义对象，而不是重新执行历史语句。这样才能保留事务的 undo、锁、read view 和 binlog cache 边界，也意味着 snapshot 损坏、物理页不一致或 XID 不匹配时必须拒绝恢复。</p>
+      </section>
+
+      <section id="batch">
+        <h2>6. Batch drain 与 warmcopy</h2>
+        <p>Batch drain 是真实停机流程的主要入口。它把实例级收敛、多个目标事务的 phase 1 预处理、phase 2 封口和 shutdown 组织在一个控制流程里。</p>
+        <div class="diagram" aria-label="Batch 两阶段流程">
+          <svg viewBox="0 0 1180 430" role="img">
+            <text x="28" y="30" class="flow-title">DRAIN TRANSACTIONS PRESERVE：两阶段收敛</text>
+            <rect x="40" y="75" width="180" height="72" rx="5" class="flow-box"/>
+            <text x="72" y="105" class="flow-title">打开 drain epoch</text><text x="68" y="129" class="flow-small">冻结配置快照，选择目标</text>
+            <rect x="265" y="75" width="195" height="72" rx="5" class="flow-blue"/>
+            <text x="299" y="105" class="flow-title">Phase 1 warmcopy</text><text x="291" y="129" class="flow-small">binlog prefix / lock mirror</text>
+            <rect x="505" y="75" width="190" height="72" rx="5" class="flow-box"/>
+            <text x="544" y="105" class="flow-title">SOFT 收敛</text><text x="527" y="129" class="flow-small">阻断新风险语句，等待 idle</text>
+            <rect x="740" y="75" width="180" height="72" rx="5" class="flow-amber"/>
+            <text x="772" y="105" class="flow-title">Phase 2 封口</text><text x="767" y="129" class="flow-small">close、seal、final fence</text>
+            <rect x="965" y="75" width="170" height="72" rx="5" class="flow-green"/>
+            <text x="1003" y="105" class="flow-title">批量发布</text><text x="991" y="129" class="flow-small">snapshot / token / shutdown</text>
+            <path d="M220 111 L265 111" class="flow-line"/><path d="M460 111 L505 111" class="flow-line"/><path d="M695 111 L740 111" class="flow-line"/><path d="M920 111 L965 111" class="flow-line"/>
+
+            <rect x="505" y="245" width="190" height="72" rx="5" class="flow-red"/>
+            <text x="539" y="275" class="flow-title">升级 HARD</text><text x="528" y="299" class="flow-small">kill 活跃用户事务并等待</text>
+            <path d="M600 147 L600 245" class="flow-line flow-dash"/>
+            <rect x="740" y="245" width="395" height="72" rx="5" class="flow-red"/>
+            <text x="777" y="275" class="flow-title">目标不支持、预算不足、seal 无效或 cleanup 失败</text>
+            <text x="805" y="299" class="flow-small">fallback 到 live export 或 fail closed；先观测，不能盲目重试</text>
+            <path d="M695 281 L740 281" class="flow-line"/>
+          </svg>
+        </div>
+
+        <h3>6.1 SOFT 与 HARD</h3>
+        <p><code>SOFT</code> 先等待业务语句自然收敛，在 <code>preserve_trx_drain_grace_ms</code> 到期后升级 <code>HARD</code>。<code>HARD</code> 会 kill 其他活跃用户事务，并最多等待 <code>preserve_trx_drain_hard_timeout_ms</code>。它提高停机可控性，但应用必须能承受被 kill 事务的回滚与重试。</p>
+
+        <h3>6.2 Binlog warmcopy</h3>
+        <p>phase 1 复制 transaction binlog cache 的稳定 prefix，并持续接收 mirror；phase 2 关闭 admission、等待 mirror 收敛、验证 truncate generation、复制受限 tail、封存摘要。它减少停机阻塞窗口，但不改变 <code>preserve_trx_max_binlog_cache_bytes</code> 和最终完整性检查。</p>
+
+        <h3>6.3 Lock warmcopy</h3>
+        <p>锁 warmcopy 与 binlog warmcopy 是两个独立开关。它在 phase 1 建立锁对象/journal，phase 2 只处理 dirty shards、MDL 描述符和 final fence。artifact 无效时，<code>preserve_trx_lock_warmcopy_fallback_to_live_export=ON</code> 可以整 target 回退 live export；OFF 则严格拒绝。</p>
+
+        <h3>6.4 资源预算不是同一个数字</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>预算</th><th>约束对象</th><th>不能据此推断</th></tr></thead>
+            <tbody>
+              <tr><td>snapshot/binlog/temp sidecar size</td><td>单 token 持久化对象大小</td><td>不等于堆内存占用。</td></tr>
+              <tr><td>memory budget/per-token lease</td><td>Preserve 通用 heap lease</td><td>不覆盖 mysqld 全部内存，也不等于外部 blob 字节。</td></tr>
+              <tr><td>warmcopy max total</td><td>单 drain epoch 的 binlog warm artifact 总量</td><td>不会预分配同等内存。</td></tr>
+              <tr><td>lock warmcopy memory/journal</td><td>锁 artifact 内存保留和 journal</td><td>不是所有锁系统内存的总上限。</td></tr>
+              <tr><td>transfer max inflight</td><td>接收端一个 epoch 尚未 seal 的字节</td><td>不等于已提交 spool 总磁盘量。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="recovery">
+        <h2>7. 启动恢复、超时与关闭策略</h2>
+        <h3>7.1 启动恢复</h3>
+        <p>启动时先读取 XID provenance 和本地 artifact，清理 staging/taint 状态，更新恢复尝试 ledger，再并行恢复 snapshot 对应的 prepared transaction、MDL、read view 和锁。恢复完成后才向 SHOW/P_S 发布 registry snapshot。</p>
+        <p>普通启动恢复只处理本地 carrier；standby transfer spool 不会被普通目录扫描自动变成 SQL token，也不会自动完成 promotion adopt。</p>
+
+        <h3>7.2 超时、宽限与回收</h3>
+        <ul>
+          <li>token 的 <code>EXPIRES_AT</code> 使用墙上时间，由 preserve timeout 决定。</li>
+          <li>首次启动恢复遇到已经过期的 token，可应用 <code>preserve_trx_recovery_grace_seconds</code> 宽限。</li>
+          <li>同一 token 的启动恢复次数达到 <code>preserve_trx_recovery_max_count</code> 后，不再无限尝试，进入 rollback/清理。</li>
+          <li>运行期 reaper 对过期 token 认领 <code>EXPIRED_ROLLBACK</code> 并回滚；清理失败进入 <code>EXPIRED_CLEANUP_FAILED</code>。</li>
+        </ul>
+
+        <h3>7.3 崩溃恢复边界</h3>
+        <div class="callout danger">
+          本地 preserve artifact 与实际 InnoDB crash recovery 同时存在时，启动会拒绝继续。该特性要求受控、干净的 shutdown，不能把任意崩溃后的 redo recovery 与 preserved transaction 拼接起来。
+        </div>
+
+        <h3>7.4 总开关关闭时的历史工件策略</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>策略</th><th>启动行为</th><th>运维含义</th></tr></thead>
+            <tbody>
+              <tr><td><code>FAIL_IF_PRESENT</code></td><td>发现任何历史 Preserve artifact/XID provenance 就拒绝启动。</td><td>默认且最严格，防止 OFF 路径无意绕过历史事务。</td></tr>
+              <tr><td><code>IGNORE</code></td><td>不做特性恢复，保留文件给外部工具处理。</td><td>OFF+IGNORE 下不保留 Preserve magic XID 保护；必须有明确的外部处置责任人。</td></tr>
+              <tr><td><code>RECOVER</code></td><td>复用启动扫描处理本地 artifact，但 SQL preserve/drain/resume/transfer/promotion 仍关闭。</td><td>不是“关闭总开关但仍可 SQL resume”。</td></tr>
+              <tr><td><code>ABANDON</code></td><td>尝试可审计地 rollback/清理本地历史 snapshot、prepared trx 和 orphan。</td><td>涉及 transfer/promotion marker 时仍需外部 HA 确认所有权。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="production">
+        <h2>8. 生产形态：备机传输与物理晋升</h2>
+        <p>真实上线形态不是把本地 <code>preserve/</code> 目录简单复制到另一台机器。它同时依赖两条数据面：物理复制保证 InnoDB 数据页/redo 到达备机，Preserve 传输保证事务 snapshot、binlog/锁对象、摘要和 epoch 事实到达备机。晋升时必须用物理栅栏证明两条数据面在同一个一致性边界汇合。</p>
+
+        <div class="diagram" aria-label="生产备机传输与晋升流程">
+          <svg viewBox="0 0 1240 520" role="img">
+            <text x="28" y="30" class="flow-title">生产架构：双数据面 + 外部 HA 晋升栅栏</text>
+            <rect x="45" y="75" width="220" height="330" rx="5" class="flow-box"/>
+            <text x="110" y="105" class="flow-title">源库 mysqld</text>
+            <rect x="72" y="135" width="166" height="62" rx="4" class="flow-blue"/>
+            <text x="101" y="162" class="flow-text">业务事务 + drain</text><text x="91" y="183" class="flow-small">打开 transfer epoch</text>
+            <rect x="72" y="235" width="166" height="62" rx="4" class="flow-green"/>
+            <text x="96" y="262" class="flow-text">Phase 1 对象流</text><text x="87" y="283" class="flow-small">binlog / record-lock</text>
+            <rect x="72" y="335" width="166" height="48" rx="4" class="flow-amber"/>
+            <text x="91" y="365" class="flow-text">Phase 2 commit</text>
+
+            <rect x="500" y="75" width="235" height="330" rx="5" class="flow-box"/>
+            <text x="557" y="105" class="flow-title">物理备机 mysqld</text>
+            <rect x="530" y="135" width="175" height="62" rx="4" class="flow-blue"/>
+            <text x="561" y="162" class="flow-text">物理复制 / redo</text><text x="548" y="183" class="flow-small">页与日志一致性数据面</text>
+            <rect x="530" y="235" width="175" height="62" rx="4" class="flow-green"/>
+            <text x="557" y="262" class="flow-text">receiver spool</text><text x="544" y="283" class="flow-small">frames / ranges / epoch fact</text>
+            <rect x="530" y="335" width="175" height="48" rx="4" class="flow-amber"/>
+            <text x="546" y="365" class="flow-text">standby pending + prewarm</text>
+
+            <rect x="935" y="75" width="255" height="330" rx="5" class="flow-box"/>
+            <text x="1006" y="105" class="flow-title">外部 HA 控制面</text>
+            <rect x="965" y="135" width="195" height="62" rx="4" class="flow-blue"/>
+            <text x="992" y="162" class="flow-text">冻结物理 apply</text><text x="984" y="183" class="flow-small">取得 production fence proof</text>
+            <rect x="965" y="235" width="195" height="62" rx="4" class="flow-amber"/>
+            <text x="990" y="262" class="flow-text">strict promotion gate</text><text x="991" y="283" class="flow-small">epoch / digest / generation</text>
+            <rect x="965" y="335" width="195" height="48" rx="4" class="flow-green"/>
+            <text x="989" y="365" class="flow-text">绑定目标 THD 并恢复</text>
+
+            <path d="M265 166 C350 166 410 166 530 166" class="flow-line"/>
+            <text x="333" y="151" class="flow-small">物理复制面</text>
+            <path d="M238 266 C340 266 405 266 530 266" class="flow-line"/>
+            <text x="330" y="251" class="flow-small">Preserve 语义面</text>
+            <path d="M705 166 C810 166 850 166 965 166" class="flow-line flow-dash"/>
+            <path d="M705 359 C820 359 850 278 965 266" class="flow-line"/>
+            <path d="M1062 297 L1062 335" class="flow-line"/>
+            <rect x="365" y="445" width="520" height="52" rx="5" class="flow-red"/>
+            <text x="403" y="475" class="flow-text">任一数据面、epoch commit、物理 fence 或对象摘要不成立：拒绝晋升恢复</text>
+          </svg>
+        </div>
+
+        <h3>8.1 源端流程</h3>
+        <ol>
+          <li>以 <code>preserve_trx_transfer_artifact_mode=STANDBY_TRANSFER_SAVE</code> 启动，并配置唯一的 TCP 或 Unix socket 目标、目标 UUID、账号和凭据。</li>
+          <li>batch drain 打开 transfer epoch，固定本 epoch 的 batching 参数。</li>
+          <li>phase 1 按对象分帧发送 binlog/record-lock 数据；接收端按 range 幂等落盘并可以提前 prewarm。</li>
+          <li>phase 2 封存事务最终元数据、对象摘要和 epoch 事实，等待接收端 commit ACK。</li>
+          <li>只有远端 commit 得到确认，源端才按该 carrier 语义完成 token 发布与 shutdown。</li>
+        </ol>
+
+        <h3>8.2 接收端流程</h3>
+        <ol>
+          <li>接收端必须以 <code>preserve_trx_transfer_receiver_enable=ON</code> 启动，并固定 allowed source UUID、target UUID 和凭据。</li>
+          <li>内部 classic command <code>COM_PRESERVE_TRX_TRANSFER</code> 校验动态权限、HMAC、source/target 身份和帧结构。</li>
+          <li>对象写入 <code>.part</code>/<code>.ranges</code>；这只是 staging，不代表 epoch committed。</li>
+          <li>最终元数据与摘要通过后写 <code>epoch.fact</code>、<code>epoch.commit</code>，再发布 <code>.standby_pending</code> projection。</li>
+          <li>receiver 对对象和 prepared resource 做预热，状态通过 transfer receiver 指标、日志和磁盘 marker 观察。</li>
+        </ol>
+
+        <h3>8.3 晋升与严格 gate</h3>
+        <p>仓库提供 production physical fence provider 注册点、strict adopt core、peer THD 解析和 promotion resume attach 接口；完整 HA 编排由外部系统负责。严格路径会校验 epoch commit、物理 apply fence、token generation/incarnation、对象摘要、intent lease 和目标 THD 身份。</p>
+        <pre><code>preserved_trx_register_production_physical_fence_provider(...)
+preserved_trx_adopt_prepared_epoch_for_physical_promotion(...)
+preserved_trx_resolve_peer_thd(...)
+preserved_trx_resume_adopted_for_promotion_on_thd(...)</code></pre>
+        <p>严格 gate request 的 <code>operation_deadline_us=0</code> 时使用当前 <code>preserve_trx_promotion_gate_timeout_ms</code> 计算截止时间；<code>worker_count</code> 只能为 1..8。系统变量 <code>preserve_trx_promotion_gate_workers</code> 的 1..1024 范围属于旧 gate/default request budget，不能提高 strict physical gate 的硬上限。</p>
+        <div class="callout warn">
+          仓库内没有完整的生产 fence provider 和 HA 调用编排；<code>plugin/test_preserve_trx_promotion</code> 是测试接入示例，不是生产 HA 实现。旧的 ready-cache/apply-barrier gate 与严格 physical gate 是两条不同路径，不能用前者的成功代替生产物理一致性证明。
+        </div>
+
+        <h3>8.4 传输安全</h3>
+        <ul>
+          <li>TCP 必须配置 CA/capath，使用 <code>SSL_MODE_VERIFY_IDENTITY</code>，连接后还会确认实际 cipher 非空。</li>
+          <li>Unix socket 路径不使用 TLS；目标必须在 TCP 与 socket 中二选一，不能同时配置或都不配置。</li>
+          <li>凭据优先按 credential name 从复制通道凭据存储解析；也可使用受约束的 secret file。</li>
+          <li>secret file 以 no-follow 打开，必须是当前 euid 所有的普通文件，group/other 不得有权限。</li>
+          <li>HMAC/fingerprint 由 secret 与 target UUID 派生；ACK 也必须通过 HMAC 验证。</li>
+          <li>接收端同时校验 allowed source UUID 和 target server UUID。</li>
+        </ul>
+
+        <h3>8.5 当前跨机限制</h3>
+        <p>portable transfer 当前拒绝带非空临时表 manifest 的 token。本地模式可以支持受约束的用户临时表恢复，但不能据此推断临时表 sidecar 已支持跨主机迁移。</p>
+      </section>
+
+      <section id="security">
+        <h2>9. 权限、可见性与安全边界</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>操作</th><th>最低要求</th><th>额外检查</th></tr></thead>
+            <tbody>
+              <tr><td>单事务 preserve</td><td>静态 <code>SHUTDOWN</code></td><td>当前连接必须有显式事务，且上下文、引擎和对象形态受支持。</td></tr>
+              <tr><td>batch drain</td><td>静态 <code>SHUTDOWN</code></td><td>控制连接不能有显式事务；每个目标独立检查。</td></tr>
+              <tr><td>resume 自己的 token</td><td><code>(priv_user, priv_host)</code> 与 owner 精确匹配</td><td>仍复检 schema/table/routine/trigger/tablespace/modified table 权限。</td></tr>
+              <tr><td>跨账号 resume</td><td>动态 <code>RESUME_ANY_PRESERVED_TRANSACTION</code></td><td>对 modified table 要求完整写权限；不绕过对象 ACL。</td></tr>
+              <tr><td>跨账号恢复 <code>sql_log_bin=OFF</code> token</td><td>上述动态权限，另需 SUPER 或 SYSTEM_VARIABLES_ADMIN/SESSION_VARIABLES_ADMIN</td><td>防止借恢复绕过 binlog 管理权限。</td></tr>
+              <tr><td>查看记录范围</td><td>owner 看自己；<code>PROCESS</code> 或 resume-any 看全部</td><td>真正的 token 值只有 <code>PROCESS</code> 可见。</td></tr>
+              <tr><td>查看完整 token</td><td><code>PROCESS</code></td><td>没有 PROCESS 时，即使是 owner 或有 resume-any，仍只看到 <code>****</code> 加最后四位。</td></tr>
+              <tr><td>内部 transfer command</td><td>动态 <code>PRESERVE_TRX_TRANSFER_ADMIN</code></td><td>还要求总开关和 receiver startup option；否则按 unknown command 隐藏。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>token 在错误日志和审计事件中只记录脱敏值。不要把 token 输出到普通业务日志；完整 token 应由受控管理面读取和保管。</p>
+      </section>
+
+      <section id="parameters">
+        <h2>10. 参数详解</h2>
+        <p>当前实现共有 64 个 <code>preserve_trx_*</code> 系统变量。参数不是越大越好：容量类参数决定准入边界，超时类参数决定失败窗口，warmcopy/并行类参数主要改变停机阶段的工作分布，transfer/promotion 参数则属于跨机身份和一致性协议。除明确标为 session、只读或启动期的项目外，其余为 global 动态变量；动态修改只影响后续操作，不会重写已经持久化的 artifact。</p>
+
+        <h3>10.1 上线必审 Top 15</h3>
+        <p>这里的 Top 15 按“配置错误后的生产影响”排序，不是使用频率榜，也不是建议优先调大的参数。上线评审必须为每一项写下取值依据、容量证据、失败处置和回退方式。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Top</th><th>参数</th><th>为什么必须先审</th><th>上线决策与验收证据</th></tr></thead>
+            <tbody>
+              <tr><td class="top-rank">1</td><td><code>preserve_trx_enable</code></td><td>决定整个实例是否进入 Preserve/Resume 能力域，也是所有 SQL、transfer 和 promotion 路径的总门。</td><td>确认构建支持 snapshot、所有节点启动配置一致，并演练 ON/OFF 两种启动路径；不能把运行期 SET 当成切换开关。</td></tr>
+              <tr><td class="top-rank">2</td><td><code>preserve_trx_off_artifact_policy</code></td><td>总开关关闭但磁盘上仍有历史事务时，它决定实例拒绝启动、忽略、恢复还是放弃。</td><td>生产默认应保持 <code>FAIL_IF_PRESENT</code>，其他策略必须有工件所有权、prepared transaction 和外部 HA 的书面处置流程。</td></tr>
+              <tr><td class="top-rank">3</td><td><code>preserve_trx_dir</code></td><td>snapshot、binlog/temp sidecar、warm artifact、transfer spool 和 marker 共用这一持久化根目录。</td><td>验收容量、inode、权限、磁盘故障告警和备份排除策略；容量模型必须覆盖峰值 batch，而不是只看单 token。</td></tr>
+              <tr><td class="top-rank">4</td><td><code>preserve_trx_transfer_artifact_mode</code></td><td>决定保存结果留在本地 carrier，还是发布到备机；选错模式会直接改变恢复入口和 HA 责任边界。</td><td>本地维护使用 <code>LOCAL_CARRIER</code>；生产备机链路才使用 <code>STANDBY_TRANSFER_SAVE</code>，并完成 receiver、凭据、TLS/HMAC 和 promotion gate 联调。</td></tr>
+              <tr><td class="top-rank">5</td><td><code>preserve_trx_drain_mode</code></td><td>决定停机收敛是先等待业务退出，还是立即 kill 其他活跃用户事务。</td><td>常规维护优先 <code>SOFT</code>；只有业务明确接受强制终止且客户端具备重试/回滚策略时才使用 <code>HARD</code>。</td></tr>
+              <tr><td class="top-rank">6</td><td><code>preserve_trx_drain_grace_ms</code></td><td>决定 SOFT 阶段给非目标事务和新风险语句留下多长收敛时间。</td><td>依据业务长事务分位数和停机窗口设置；演练期间记录升级 HARD 的比例，不能仅按平均事务时长估算。</td></tr>
+              <tr><td class="top-rank">7</td><td><code>preserve_trx_drain_hard_timeout_ms</code></td><td>决定 HARD 阶段等待活跃事务真正退出的最后期限，超时将使 drain 失败。</td><td>必须覆盖 kill 后的引擎清理和线程退出尾延迟，并为超时保留停止重试、保存现场的操作窗口。</td></tr>
+              <tr><td class="top-rank">8</td><td><code>preserve_trx_max_total</code></td><td>是实例本地 registry 的总 token 上限，直接限制一次维护可留下多少未决事务。</td><td>按峰值 eligible 事务数、恢复并发和磁盘容量共同确定；与 per-user、batch 上限取共同约束。</td></tr>
+              <tr><td class="top-rank">9</td><td><code>preserve_trx_batch_max_transactions</code></td><td>限制单次 DRAIN 接受的目标数；设置过低会拒绝预期批次，设置过高会扩大 phase 2 和启动恢复压力。</td><td>用真实锁规模、binlog cache 和 temp sidecar 分布做压力演练，不能只按连接数设置。</td></tr>
+              <tr><td class="top-rank">10</td><td><code>preserve_trx_default_timeout</code></td><td>客户端省略 <code>WITH TIMEOUT</code> 时决定 token 可恢复窗口，过短会在维护期间过期，过长会长期占用锁和 prepared transaction。</td><td>至少覆盖停机、启动恢复、HA 决策和人工接管时间，并与 min/max timeout、reaper 和告警阈值对齐。</td></tr>
+              <tr><td class="top-rank">11</td><td><code>preserve_trx_max_snapshot_bytes</code></td><td>是单 token snapshot metadata 的硬上限；复杂锁、MDL、read view 和 session 状态会增加该对象。</td><td>采集真实业务 snapshot 大小分位数并保留余量；达到上限属于准入失败，不能依赖 spill 绕过。</td></tr>
+              <tr><td class="top-rank">12</td><td><code>preserve_trx_max_binlog_cache_bytes</code></td><td>限制单事务 binlog cache sidecar，直接影响大事务是否可保存以及目录容量。</td><td>与业务最大事务、<code>binlog_cache_size</code> 实际增长、single-phase 阈值和 warmcopy epoch 总量一起评估。</td></tr>
+              <tr><td class="top-rank">13</td><td><code>preserve_trx_memory_budget_bytes</code></td><td>是所有活跃 Preserve 操作共享的通用 heap 租约总预算；过小会触发 spill/拒绝，过大会与 mysqld 其他内存竞争。</td><td>按并发 token 数、单 token 上限和压测峰值设定，同时监控 current/peak 与 spill 指标。</td></tr>
+              <tr><td class="top-rank">14</td><td><code>preserve_trx_warmcopy_enable</code></td><td>决定是否在 phase 1 前移 binlog cache 复制工作，是 batch 停机窗口的主要性能开关之一。</td><td>上线前同时验证 warmcopy 成功、degraded/fallback 和关闭路径；开启不等于 phase 2 一定满足时延目标。</td></tr>
+              <tr><td class="top-rank">15</td><td><code>preserve_trx_lock_warmcopy_enable</code></td><td>决定是否在 drain 前移锁元数据导出；锁多事务的 phase 2 时延与失败面主要受它和 fallback 策略影响。</td><td>使用 lock-heavy 业务压测，核对 artifact valid/fallback/strict reject、journal 和 dirty shard 指标后再定。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn">
+          <span class="callout-title">备机上线还有一组不可省略的身份与一致性参数</span>
+          Top 15 是全场景优先级，不是备机配置清单。使用 <code>STANDBY_TRANSFER_SAVE</code> 时，还必须逐项审查 <code>preserve_trx_transfer_receiver_enable</code>、source/target UUID、host/port 或 socket、账号与 credential、inflight/commit timeout，以及三个 <code>preserve_trx_promotion_gate_*</code> 参数。缺少生产 physical fence provider 时，参数配齐也不能完成安全晋升。
+        </div>
+
+        <h3>10.2 参数联动与调参顺序</h3>
+        <p>先确定语义和失败边界，再做容量与性能调优。推荐按下面的链路评审，避免只改一个“看起来相关”的变量。</p>
+        <ul class="parameter-chain">
+          <li><b>总开关与历史工件</b><span><code>enable</code> → <code>off_artifact_policy</code> → 本地 artifact/XID provenance 处置；先演练启动行为，再允许生产留下 token。</span></li>
+          <li><b>Token 准入</b><span>有效批次上限同时受 <code>max_total</code>、每个 owner 的 <code>max_pending_per_user</code> 和 <code>batch_max_transactions</code> 约束。</span></li>
+          <li><b>可恢复时间窗</b><span><code>default/min/max_timeout</code> 决定创建时的 EXPIRES_AT；<code>recovery_grace_seconds</code> 和 <code>recovery_max_count</code> 只处理启动恢复边界，不能替代合理 timeout。</span></li>
+          <li><b>停机总窗口</b><span>SOFT 场景至少包含 grace、HARD 收敛、phase 2 preserve 和 shutdown；任何单个 timeout 都不是完整维护窗口。</span></li>
+          <li><b>单 token 与总资源</b><span>snapshot/binlog/temp 是持久化对象上限，memory total/per-token 是 heap lease，warmcopy total 和 transfer inflight 又是不同预算，不能互相换算。</span></li>
+          <li><b>Binlog warmcopy</b><span><code>warmcopy_enable</code> 打开 phase 1；chunk、pending range/bytes、tail budget、close timeout 和 epoch total 共同决定能否在 phase 2 前收敛。</span></li>
+          <li><b>Lock warmcopy</b><span>enable、memory/journal、dirty shards、MDL descriptors、seal threads 与 fallback 策略共同决定“直接使用、整 target 回退或严格拒绝”。</span></li>
+          <li><b>备机与晋升</b><span>artifact mode → receiver startup identity → endpoint/credential → inflight/commit → epoch/prewarm → promotion strict gate；任一步失败都不能跳过物理一致性证明。</span></li>
+        </ul>
+        <div class="callout">
+          <span class="callout-title">上线调参方法</span>
+          先记录默认值下的 P_S、SHOW STATUS、错误日志和磁盘峰值；再按单一假设调整一个参数组，覆盖成功、资源耗尽、超时、fallback 和重启恢复用例。动态参数的修改只用于后续操作，已有 token 仍按其持久化事实和创建时边界处理。
+        </div>
+
+        <h3 id="all-parameters">10.3 全部 64 个参数逐项解读</h3>
+        <p>“上线前确认”说明取值依据和验收动作；“风险与联动”说明该参数不能独立解读的原因。表中默认值和范围来自当前 <code>sql/sys_vars.cc</code>。</p>
+        <pre><code>SHOW VARIABLES LIKE 'preserve_trx_%';</code></pre>
+        <div class="toolbar">
+          <input class="filter-input" id="parameter-filter" type="search" placeholder="筛选参数名、分组、上线确认或风险" aria-label="筛选参数">
+          <span class="filter-count" id="parameter-count"></span>
+        </div>
+        <div class="table-wrap">
+          <table id="parameter-table">
+            <thead><tr><th>分组</th><th>参数</th><th>默认值</th><th>作用域 / 变更方式</th><th>详细解读</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="scenarios">
+        <h2>11. 用户使用场景</h2>
+        <h3>11.1 维护窗口保留一个长事务</h3>
+        <p>适用于明确知道目标事务、能够接受实例收敛和关机的场景。设置足够的 timeout；若业务依赖 session 用户变量，必须显式写 <code>WITH USER VARS</code>。重启后先以 PROCESS 账号找 token，再用 owner 恢复。</p>
+
+        <h3>11.2 批量保存多个空闲事务</h3>
+        <p>使用 batch drain。先统计 eligible 事务数、锁规模、binlog cache 和目录空间，确认不超过 max total、per-user 和 batch 上限。SOFT 适合常规维护，HARD 只用于业务已接受强制收敛的停机窗口。</p>
+
+        <h3>11.3 大 binlog cache 事务</h3>
+        <p>同时评估单 token binlog sidecar 上限、single-phase 上限、warmcopy epoch 总量、tail budget、preserve 目录空间和 phase 1 带宽。扩大 warmcopy 总量主要增加磁盘与 I/O 容量，不代表等量堆内存。</p>
+
+        <h3>11.4 锁很多或修改表很多的事务</h3>
+        <p>检查 lock count、modified tables、scan pages 和 materialize timeout。lock warmcopy 能把大部分工作前移，但 unsupported family、final fence mismatch 或资源耗尽仍会 fallback/reject。只调大线程数不能绕过这些语义限制。</p>
+
+        <h3>11.5 带用户临时表的本地事务</h3>
+        <p>只使用受支持的 InnoDB 用户临时表形态，并验证 temp image、undo 和 manifest 都为 READY。native-adopted 路径允许继续受支持的 temp DML；旧 manifest 或无法证明 undo/ownership 的形态会 fail closed。上线前必须用与业务相同的 DDL、savepoint 和 statement rollback 模式验证。</p>
+
+        <h3>11.6 物理备机快速晋升</h3>
+        <p>使用 standby transfer，而不是拷贝本地目录。外部 HA 必须保存 epoch 严格身份、冻结/证明物理 apply、调用 strict adopt，再把 token 定向附着到受保护目标 THD。生产验收要同时检查 transfer commit、prewarm readiness、physical consistency mode 和真实 redo apply 标志。</p>
+      </section>
+
+      <section id="observability">
+        <h2>12. 可观察性全集</h2>
+        <p>Preserve/Resume 的状态分散在四个证据面。排障时不能只看其中一个：SQL/P_S 反映本地 registry，SHOW STATUS 反映过程与性能，日志/审计说明决策原因，磁盘 marker 说明持久化阶段和 HA 所有权。</p>
+        <p>当前唯一的专用关系视图是 <code>performance_schema.preserved_transactions</code>；没有对应的 INFORMATION_SCHEMA 或 sys schema 视图。<code>SHOW PRESERVED TRANSACTIONS</code> 是同一 registry snapshot 的语句封装。</p>
+
+        <div class="diagram" aria-label="可观察性四个证据面">
+          <svg viewBox="0 0 1160 390" role="img">
+            <text x="28" y="30" class="flow-title">同一事件需要交叉验证的四个证据面</text>
+            <rect x="55" y="80" width="220" height="95" rx="5" class="flow-blue"/>
+            <text x="92" y="111" class="flow-title">SQL / P_S registry</text>
+            <text x="76" y="137" class="flow-small">29 列、生命周期、owner、LAST_ERROR</text>
+            <text x="87" y="157" class="flow-small">只覆盖本地 registry</text>
+            <rect x="330" y="80" width="220" height="95" rx="5" class="flow-green"/>
+            <text x="369" y="111" class="flow-title">SHOW STATUS</text>
+            <text x="353" y="137" class="flow-small">183 状态量 + 4 个 Com 计数</text>
+            <text x="355" y="157" class="flow-small">当前、最近一次、累计口径并存</text>
+            <rect x="605" y="80" width="220" height="95" rx="5" class="flow-amber"/>
+            <text x="655" y="111" class="flow-title">错误日志 / 审计</text>
+            <text x="632" y="137" class="flow-small">阶段、reason、SLO、transfer ACK</text>
+            <text x="653" y="157" class="flow-small">token 始终脱敏</text>
+            <rect x="880" y="80" width="220" height="95" rx="5" class="flow-red"/>
+            <text x="924" y="111" class="flow-title">磁盘 / HA marker</text>
+            <text x="905" y="137" class="flow-small">snapshot、spool、epoch、intent</text>
+            <text x="907" y="157" class="flow-small">存在不等于可恢复，禁止手改</text>
+            <rect x="355" y="250" width="450" height="70" rx="5" class="flow-box"/>
+            <text x="421" y="280" class="flow-title">运维结论：registry 状态 + 指标口径 + 原因日志 + 持久化阶段</text>
+            <text x="445" y="303" class="flow-small">跨机晋升还必须加入外部 HA 的 physical fence / epoch 状态</text>
+            <path d="M165 175 C165 230 370 228 430 250" class="flow-line"/>
+            <path d="M440 175 L500 250" class="flow-line"/>
+            <path d="M715 175 L660 250" class="flow-line"/>
+            <path d="M990 175 C990 230 790 228 735 250" class="flow-line"/>
+          </svg>
+        </div>
+
+        <h3>12.1 SHOW 与 performance_schema.preserved_transactions</h3>
+        <p>两种接口都从本地 registry 取得同一快照，查询前等待 startup recovery，且总开关 OFF 时返回 0 行。P_S 表是只读 perpetual table，不支持写入，查询还需要常规的 P_S 表访问权限；两种接口都不是目录扫描器，也不展示 transfer receiver 的严格 epoch/token registry。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>字段</th><th>类型 / 可空</th><th>含义</th><th>判读注意</th></tr></thead>
+            <tbody>
+              <tr><td><code>TOKEN</code></td><td><code>VARCHAR(128) NOT NULL</code></td><td>用于 SQL resume 的 token。</td><td>只有 PROCESS 看到完整值；否则为 <code>****</code> + 末四位。</td></tr>
+              <tr><td><code>USER</code></td><td><code>VARCHAR(32) NOT NULL</code></td><td>保存时的权限用户名。</td><td>来自 priv_user，不一定等于客户端展示用户名。</td></tr>
+              <tr><td><code>HOST</code></td><td><code>VARCHAR(255) NOT NULL</code></td><td>保存时的权限 host。</td><td>owner 匹配使用 priv_user/priv_host 精确组合。</td></tr>
+              <tr><td><code>STATE</code></td><td><code>VARCHAR(32) NOT NULL</code></td><td>本地生命周期状态。</td><td>见 12.2；部分失败记录会被后续 GC。</td></tr>
+              <tr><td><code>CREATED_AT</code></td><td><code>TIMESTAMP(6) NULL</code></td><td>token 创建墙上时间。</td><td>用于审计和计算年龄，不是 monotonic 时间。</td></tr>
+              <tr><td><code>EXPIRES_AT</code></td><td><code>TIMESTAMP(6) NULL</code></td><td>token 过期墙上时间。</td><td>首次启动恢复可能对已过期 token 应用 recovery grace。</td></tr>
+              <tr><td><code>RECOVERED_COUNT</code></td><td><code>BIGINT UNSIGNED NOT NULL</code></td><td>该 token 已经历的启动恢复次数。</td><td>达到 recovery max 后会 rollback，不会无限重试。</td></tr>
+              <tr><td><code>AGE_SECONDS</code></td><td><code>BIGINT UNSIGNED NOT NULL</code></td><td>查询时 token 年龄，单位秒。</td><td>是动态年龄，不是持久化时长样本。</td></tr>
+              <tr><td><code>SCHEMA_NAME</code></td><td><code>VARCHAR(64) NULL</code></td><td>保存时 session 的默认 schema。</td><td>NULL 表示没有选定默认 schema。</td></tr>
+              <tr><td><code>ISOLATION</code></td><td><code>VARCHAR(32) NOT NULL</code></td><td>保存的事务隔离级别。</td><td>resume 会恢复相关 transaction/session 语义。</td></tr>
+              <tr><td><code>MOD_TABLES_COUNT</code></td><td><code>BIGINT UNSIGNED NOT NULL</code></td><td>modified InnoDB table 数。</td><td>跨账号 resume 对这些表要求完整写权限。</td></tr>
+              <tr><td><code>LOCKS_COUNT</code></td><td><code>BIGINT UNSIGNED NULL</code></td><td>可恢复锁 payload 中可计数的锁摘要。</td><td>payload 不可用或非法时为 NULL，不能把 NULL 当 0。</td></tr>
+              <tr><td><code>HAS_READ_VIEW</code></td><td><code>ENUM('YES','NO') NOT NULL</code></td><td>事务是否保存了 MVCC read view。</td><td>用于判断是否存在快照读语义。</td></tr>
+              <tr><td><code>RV_LOW_LIMIT_NO</code></td><td><code>BIGINT UNSIGNED NOT NULL</code></td><td>保存 read view 的 low_limit_no。</td><td>HAS_READ_VIEW=NO 时不要单独解释该数值。</td></tr>
+              <tr><td><code>SAVEPOINT_COUNT</code></td><td><code>BIGINT UNSIGNED NOT NULL</code></td><td>保存的 SQL/InnoDB savepoint 数。</td><td>不支持的 savepoint/temp rollback 组合会在 preserve 前拒绝。</td></tr>
+              <tr><td><code>BINLOG_STATE</code></td><td><code>VARCHAR(32) NOT NULL</code></td><td>四类 binlog 状态之一。</td><td>值与判读见 12.3。</td></tr>
+              <tr><td><code>WROTE_TO_CACHE</code></td><td><code>ENUM('YES','NO') NOT NULL</code></td><td>事务是否曾写 transaction binlog cache。</td><td>与最终 cache 是否为空、是否有 sidecar 配合看。</td></tr>
+              <tr><td><code>BINLOG_CACHE_SIZE</code></td><td><code>BIGINT UNSIGNED NOT NULL</code></td><td>保存的 transaction cache 字节。</td><td>不是 statement cache；受单 token 上限约束。</td></tr>
+              <tr><td><code>BINLOG_WARMCOPY_STATE</code></td><td><code>VARCHAR(32) NOT NULL</code></td><td><code>NONE</code>/<code>READY</code>/<code>NOT_USED</code>。</td><td>READY 表示使用预建 warmcopy，不代表 resume 已完成。</td></tr>
+              <tr><td><code>SESSION_SQL_LOG_BIN</code></td><td><code>ENUM('ON','OFF') NOT NULL</code></td><td>保存时 session 的 <code>sql_log_bin</code>。</td><td>跨账号恢复 OFF token 有额外管理权限要求。</td></tr>
+              <tr><td><code>GLOBAL_LOG_BIN</code></td><td><code>ENUM('ON','OFF') NOT NULL</code></td><td>保存时全局 binlog 开关。</td><td>与 session 值及 BINLOG_STATE 联合判读。</td></tr>
+              <tr><td><code>GTID_NEXT</code></td><td><code>VARCHAR(1024) NULL</code></td><td>保存的 GTID_NEXT 表示。</td><td>no-cache 与 logged 路径有各自 GTID 前置条件。</td></tr>
+              <tr><td><code>AUTOINC_LOCK_OWNED</code></td><td><code>ENUM('YES','NO') NOT NULL</code></td><td>事务是否持有 AUTO_INC lock。</td><td>用于恢复锁语义和诊断。</td></tr>
+              <tr><td><code>TEMP_TABLE_STATE</code></td><td><code>VARCHAR(32) NOT NULL</code></td><td><code>NONE</code>/<code>READY</code>/<code>INCOMPLETE</code>/<code>CORRUPT</code>。</td><td>INCOMPLETE/CORRUPT 不能正常消费。</td></tr>
+              <tr><td><code>TEMP_IMAGE_BYTES</code></td><td><code>BIGINT UNSIGNED NOT NULL</code></td><td>临时表 physical image sidecar 总字节。</td><td>只反映本地 temp manifest 汇总。</td></tr>
+              <tr><td><code>TEMP_UNDO_BYTES</code></td><td><code>BIGINT UNSIGNED NOT NULL</code></td><td>临时表 no-redo undo sidecar 总字节。</td><td>0 需结合 TEMP_TABLE_STATE 判断，不能自动视为缺失。</td></tr>
+              <tr><td><code>TEMP_SIDECARS_COMPLETE</code></td><td><code>ENUM('YES','NO') NOT NULL</code></td><td>temp manifest 要求的 sidecar 是否齐全。</td><td>仍需结合 TEMP_TABLE_STATE 和错误日志。</td></tr>
+              <tr><td><code>LAST_ERROR</code></td><td><code>VARCHAR(1024) NULL</code></td><td>本地 registry 记录的最近错误文本。</td><td>receiver/strict gate 错误不一定写入这里。</td></tr>
+              <tr><td><code>LAST_ERROR_AT</code></td><td><code>TIMESTAMP(6) NULL</code></td><td>LAST_ERROR 的墙上时间。</td><td>NULL 表示 registry 没有记录错误时间，不证明其他观测面无错误。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>12.2 生命周期状态</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>STATE</th><th>含义</th><th>运维动作</th></tr></thead>
+            <tbody>
+              <tr><td><code>DRAINING</code></td><td>batch durable record 已建立，但 drain manager 仍拥有 shutdown 流程。</td><td>观察 batch 状态，不要从业务 session 并发 resume。</td></tr>
+              <tr><td><code>SNAPSHOTTING</code></td><td>正在生成/发布 snapshot 的瞬态。</td><td>长时间不动时查 phase2 指标和日志。</td></tr>
+              <tr><td><code>PRESERVED</code></td><td>正常可由 SQL resume 消费。</td><td>检查 owner、到期时间和错误后恢复。</td></tr>
+              <tr><td><code>ADOPTED_FOR_PROMOTION</code></td><td>已被物理晋升控制面认领。</td><td>只能走 promotion attach 接口，普通 SQL RESUME 会拒绝。</td></tr>
+              <tr><td><code>RESUMING</code></td><td>正在被某个 resume 调用认领。</td><td>避免并发重试；结合日志判断是否回退。</td></tr>
+              <tr><td><code>ROLLING_BACK</code></td><td>显式或清理路径正在回滚。</td><td>等待完成并查看 cleanup 日志。</td></tr>
+              <tr><td><code>EXPIRED_ROLLBACK</code></td><td>reaper 已认领过期 token 并回滚。</td><td>不可再恢复。</td></tr>
+              <tr><td><code>EXPIRED_CLEANUP_FAILED</code></td><td>过期回滚后的 artifact 清理失败。</td><td>保留现场，检查文件权限/磁盘和 LAST_ERROR。</td></tr>
+              <tr><td><code>FAILED</code></td><td>保存或恢复失败后保留的诊断记录。</td><td>按 LAST_ERROR 和错误日志处置；记录可能稍后被 GC。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>可观察失败记录会在保留期后被垃圾回收，因此“表里已经没有 FAILED”不能证明历史上从未失败。</p>
+
+        <h3>12.3 Binlog 与临时表状态</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>字段</th><th>值</th><th>含义</th></tr></thead>
+            <tbody>
+              <tr><td>BINLOG_STATE</td><td><code>GLOBAL_OFF_NO_CACHE</code></td><td>全局 binlog 关闭，且没有 transaction cache。</td></tr>
+              <tr><td>BINLOG_STATE</td><td><code>SESSION_OFF_NO_CACHE</code></td><td>session <code>sql_log_bin=OFF</code>，且没有 transaction cache。</td></tr>
+              <tr><td>BINLOG_STATE</td><td><code>LOGGED_EMPTY</code></td><td>处于 logged 模式，但最终 transaction cache 为空。</td></tr>
+              <tr><td>BINLOG_STATE</td><td><code>LOGGED_WITH_CACHE</code></td><td>有需要持久化并在 resume attach 的 transaction cache。</td></tr>
+              <tr><td>BINLOG_WARMCOPY_STATE</td><td><code>NONE</code></td><td>没有 logged cache payload。</td></tr>
+              <tr><td>BINLOG_WARMCOPY_STATE</td><td><code>READY</code></td><td>使用了 phase 1 预建的 warmcopy sidecar。</td></tr>
+              <tr><td>BINLOG_WARMCOPY_STATE</td><td><code>NOT_USED</code></td><td>有 cache，但通过 single-phase 等非 warmcopy 路径生成。</td></tr>
+              <tr><td>TEMP_TABLE_STATE</td><td><code>NONE</code></td><td>没有用户临时表 sidecar。</td></tr>
+              <tr><td>TEMP_TABLE_STATE</td><td><code>READY</code></td><td>manifest、image 和 undo sidecar 完整。</td></tr>
+              <tr><td>TEMP_TABLE_STATE</td><td><code>INCOMPLETE</code></td><td>所需 sidecar 不完整。</td></tr>
+              <tr><td>TEMP_TABLE_STATE</td><td><code>CORRUPT</code></td><td>manifest 或 sidecar 校验失败。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>12.4 命令计数</h3>
+        <pre><code>SHOW GLOBAL STATUS WHERE Variable_name IN (
+  'Com_prepare_shutdown_preserve',
+  'Com_drain_transactions_preserve',
+  'Com_resume_preserved_transaction',
+  'Com_show_preserved_transactions'
+);</code></pre>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>计数器</th><th>对应操作</th><th>注意</th></tr></thead>
+            <tbody>
+              <tr><td><code>Com_prepare_shutdown_preserve</code></td><td><code>PREPARE SHUTDOWN PRESERVE TRANSACTION</code></td><td>统计命令进入 SQL 执行的次数，不只统计成功。</td></tr>
+              <tr><td><code>Com_drain_transactions_preserve</code></td><td><code>DRAIN TRANSACTIONS PRESERVE</code></td><td>一次 batch 只加一次，不按目标 token 数增加。</td></tr>
+              <tr><td><code>Com_resume_preserved_transaction</code></td><td><code>RESUME PRESERVED TRANSACTION</code></td><td>失败、权限拒绝等尝试也不能靠该值区分。</td></tr>
+              <tr><td><code>Com_show_preserved_transactions</code></td><td><code>SHOW PRESERVED TRANSACTIONS</code></td><td>P_S 的 SELECT 不会计入这个 SHOW 命令计数。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>底层条目按 <code>SHOW_SCOPE_ALL</code> 注册，因此可以查询 session 或 global 口径；上面的 <code>SHOW GLOBAL STATUS</code> 取实例聚合。四个计数都不代表成功次数，也不能代替 token 状态或错误日志。</p>
+
+        <h3>12.5 Preserve_trx_* 全部状态量</h3>
+        <p>以下 183 个变量来自当前 <code>sql/mysqld.cc</code> 注册表，全部以 <code>SHOW_SCOPE_GLOBAL</code> 注册。表中的“口径”是正确解读的关键：同一前缀下可能同时存在 gauge、最近一次值、当前 epoch 值和进程累计值。</p>
+        <pre><code>SHOW GLOBAL STATUS LIKE 'Preserve_trx_%';</code></pre>
+        <div class="toolbar">
+          <input class="filter-input" id="metric-filter" type="search" placeholder="筛选状态变量、分组、口径或说明" aria-label="筛选状态变量">
+          <span class="filter-count" id="metric-count"></span>
+        </div>
+        <div class="table-wrap">
+          <table id="metric-table">
+            <thead><tr><th>分组</th><th>状态变量</th><th>口径</th><th>含义</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <h3>12.6 指标判读规则</h3>
+        <ul>
+          <li><strong>微秒：</strong><code>*_us</code> 一般为耗时或 steady-clock 时间点。带 <code>monotonic</code> 的值不是 Unix 时间，不能跨进程/重启直接比较。</li>
+          <li><strong>最近一次：</strong>phase2、SQL resume、startup recovery、promotion gate 中的部分变量会被下一次操作覆盖，采集系统需要按事件保存快照。</li>
+          <li><strong>累计：</strong>lock warmcopy、binlog attach I/O、receiver 多数计数从 mysqld 启动起累计；用速率或前后差值分析。</li>
+          <li><strong>当前值：</strong>memory current、staged token active 和 ready-cache 聚合是 gauge；不要对 gauge 做累加。</li>
+          <li><strong>直方图：</strong>p50/p95/p99/max 是进程内聚合或当前 attempt 聚合，具体以表中口径为准。</li>
+          <li><strong>状态码：</strong>两个 <code>*_prewarm_last_status</code> 使用 0..16 的 promotion adopt status；传输 API/日志中的 transfer status 使用另一套 0..6 枚举；strict physical gate 又是独立返回协议。</li>
+        </ul>
+
+        <h3>12.7 推荐查询</h3>
+        <pre><code>-- 当前可由本地 SQL 看到的 token
+SELECT TOKEN, USER, HOST, STATE, EXPIRES_AT, RECOVERED_COUNT,
+       BINLOG_STATE, BINLOG_CACHE_SIZE, BINLOG_WARMCOPY_STATE,
+       TEMP_TABLE_STATE, LAST_ERROR, LAST_ERROR_AT
+  FROM performance_schema.preserved_transactions
+ ORDER BY CREATED_AT;
+
+-- 最近一次 batch phase 2
+SHOW GLOBAL STATUS LIKE 'Preserve_trx_phase2_%';
+
+-- 本次启动恢复
+SHOW GLOBAL STATUS LIKE 'Preserve_trx_startup_recovery_%';
+
+-- receiver / transfer
+SHOW GLOBAL STATUS LIKE 'Preserve_trx_transfer_%';
+SHOW GLOBAL STATUS LIKE 'Preserve_trx_recv_%';
+
+-- 晋升一致性与核心恢复
+SHOW GLOBAL STATUS LIKE 'Preserve_trx_promotion_%';
+SHOW GLOBAL STATUS LIKE 'Preserve_trx_resume_physical_%';</code></pre>
+
+        <h3>12.8 错误日志</h3>
+        <p>实现中的 Preserve 日志主要使用 <code>PRESERVE:</code> 前缀。应关注：</p>
+        <ul>
+          <li>startup recovery begin/end、token 分类、orphan rollback 和各阶段耗时；</li>
+          <li>batch phase 2 指标与 <code>phase2_slo_reason</code>；</li>
+          <li>binlog/lock warmcopy fallback、resource limit、seal/fence mismatch；</li>
+          <li>transfer connect/send、manifest/object build、spool、ACK、prewarm 和 commit；</li>
+          <li>promotion prewarm、physical fence、attach intent、cleanup/taint；</li>
+          <li><code>RESUME PRESERVED TRANSACTION '****xxxx' failed: reason</code>。</li>
+        </ul>
+        <p>日志中的 token 只保留末四位；跨节点关联应优先使用 source UUID、epoch、generation/incarnation 和时间窗口。</p>
+
+        <h3>12.9 审计事件</h3>
+        <p>服务端通过 <code>MYSQL_AUDIT_MESSAGE_INTERNAL</code> 发出 category=<code>mysqld</code>、component=<code>preserve_trx</code> 的内部消息。主要事件：</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>事件</th><th>字段/动作</th><th>说明</th></tr></thead>
+            <tbody>
+              <tr><td><code>preserved_transaction</code></td><td>action=preserve/recover/promotion-adopt/resume/promotion-resume/rollback；result=success/timeout/failure/expired</td><td>带脱敏 token、结果和可选 reason。</td></tr>
+              <tr><td><code>preserved_transaction_control</code></td><td>action=drain、result、target_count、token_count</td><td>描述 batch 控制操作。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>这些事件只有在部署了能够消费 internal message 的审计插件/组件时才会形成可查询或可检索记录；“代码发出事件”不等于默认已有审计表。</p>
+
+        <h3>12.10 磁盘工件与 marker</h3>
+        <p><code>preserve_trx_dir</code> 默认为 <code>&lt;datadir&gt;/preserve/</code>。下面的文件名用于诊断持久化阶段，不是运维 API。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>文件/目录</th><th>含义</th><th>判读边界</th></tr></thead>
+            <tbody>
+              <tr><td><code>&lt;token&gt;.bin</code></td><td>认证 snapshot metadata。</td><td>单独存在不证明外部对象或 prepared trx 完整。</td></tr>
+              <tr><td><code>&lt;token&gt;.binlog_cache</code></td><td>transaction binlog cache sidecar。</td><td>只有 LOGGED_WITH_CACHE 需要。</td></tr>
+              <tr><td><code>&lt;token&gt;.blob.&lt;name&gt;</code></td><td>通用 external blob，例如 record locks；可能位于 <code>blob_shards/</code>。</td><td>要与 snapshot 摘要匹配。</td></tr>
+              <tr><td><code>&lt;token&gt;.tempts.&lt;space&gt;.image/.undo</code></td><td>用户临时表 image 和 no-redo undo sidecar。</td><td>必须与 temp manifest 和 ownership 一致。</td></tr>
+              <tr><td><code>&lt;warmcopy_id&gt;.&lt;blob&gt;.warm.&lt;epoch&gt;</code>、<code>.desc</code></td><td>warmcopy artifact 与 descriptor。</td><td>staging/未封存文件不能被当作最终对象。</td></tr>
+              <tr><td><code>*.tmp</code></td><td>原子发布前 staging。</td><td>启动时可能清理；存在说明上次流程未完成。</td></tr>
+              <tr><td><code>&lt;token&gt;.tainted</code></td><td>事务/工件进入不可安全自动消费的 taint 状态。</td><td>不要手工移除 marker 后强行 resume。</td></tr>
+              <tr><td><code>&lt;token&gt;.consume_state</code></td><td>消费状态记录。</td><td>用于避免重复或不完整消费。</td></tr>
+              <tr><td><code>&lt;token&gt;.standby_pending</code></td><td>receiver 发布的 standby projection。</td><td>不是普通本地 SQL registry 行。</td></tr>
+              <tr><td><code>&lt;epoch&gt;.promotion_adopted/.promotion_abandoned</code></td><td>晋升采用/放弃的终态摘要。</td><td>与 intent 和外部 HA 状态联合判断。</td></tr>
+              <tr><td><code>&lt;id&gt;.promotion_intent</code></td><td>严格 attach/adopt 所有权 journal；attach id 可为 <code>attach-&lt;sha256&gt;</code>。</td><td>存在时说明操作可能处于租约/恢复窗口。</td></tr>
+              <tr><td><code>.recovery_attempt_ledger</code></td><td>启动恢复尝试次数。</td><td>与 P_S RECOVERED_COUNT 配合。</td></tr>
+              <tr><td><code>.xid_provenance</code></td><td>Preserve 内部 XID 来源和保护信息。</td><td>OFF 策略和 orphan 处理的重要依据。</td></tr>
+              <tr><td><code>.transfer/&lt;epoch&gt;/receiver.frames</code></td><td>接收帧日志。</td><td>不能代替 epoch commit。</td></tr>
+              <tr><td><code>.transfer/&lt;epoch&gt;/epoch.fact</code></td><td>持久化 epoch 事实。</td><td>仍需 commit marker。</td></tr>
+              <tr><td><code>.transfer/&lt;epoch&gt;/epoch.commit</code></td><td>接收端 epoch commit marker。</td><td>表明语义面提交，不等于物理晋升 fence 已满足。</td></tr>
+              <tr><td><code>.transfer/&lt;epoch&gt;/&lt;token&gt;/&lt;object&gt;.part/.ranges</code></td><td>对象 staging 和已接收 range。</td><td>只代表可续传/幂等落盘进度。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout danger">
+          <span class="callout-title">禁止把文件系统当控制接口</span>
+          不要通过手工删除、改名或复制 marker 来“修复” token。文件存在仅说明某个持久化阶段发生过；是否可恢复必须结合 registry、epoch commit、prepared transaction、摘要、promotion intent 和外部 HA 状态判断。
+        </div>
+
+        <h3>12.11 当前观测空白</h3>
+        <ul>
+          <li>没有专用 SQL/P_S 视图展示 receiver spool、epoch commit、strict prepared-token registry、promotion/attach intent 或当前 drain manager/epoch ownership。</li>
+          <li>普通 P_S 表看不到 standby-pending token，也不会扫描 <code>.transfer/</code>。</li>
+          <li>当前没有 Preserve/Resume 专用的 Performance Schema stage/wait 或 PROCESSLIST 状态列；通用 thread/processlist 只能辅助看仍存活的连接，不能代替 durable token/epoch 状态。</li>
+          <li>四个内部 getter 当前未注册到 SHOW STATUS：<code>preserve_trx_transfer_phase2_snapshot_bundle_bytes_status()</code>、<code>preserve_trx_transfer_phase2_snapshot_bundle_count_status()</code>、<code>preserve_trx_transfer_phase2_final_metadata_frame_count_status()</code>、<code>preserve_trx_transfer_phase2_final_metadata_encoded_bytes_status()</code>。</li>
+          <li><code>LAST_ERROR</code> 只覆盖本地 registry 能记录的错误；receiver/strict gate 错误可能只在日志、status 和 marker 中出现。</li>
+          <li>生产 HA 必须自行持久化 source UUID、epoch、token generation/incarnation、physical fence proof 和调用结果，仓库不提供统一的运维视图。</li>
+        </ul>
+      </section>
+
+      <section id="limitations">
+        <h2>13. 限制与注意事项</h2>
+        <h3>13.1 通用不支持上下文</h3>
+        <ul>
+          <li>非 classic protocol；initialize/bootstrap/upgrade thread；<code>innodb_force_recovery &gt; 0</code>。</li>
+          <li>复制 SQL/applier thread、Group Replication 运行中，或实例存在已配置 replica channel。</li>
+          <li>XA 状态不是 <code>XA_NOTR</code>；DD update statement；子语句或 stored routine runtime。</li>
+          <li>global read lock、instance backup lock、<code>LOCK TABLES</code>、user-level locks。</li>
+          <li>open HANDLER table、open server-side cursor。</li>
+          <li>不受支持的用户临时表 session 状态。</li>
+        </ul>
+
+        <h3>13.2 事务内容限制</h3>
+        <ul>
+          <li>修改非事务表会拒绝；read-write handlerton 只允许 InnoDB 和有效 binlog participant。</li>
+          <li><code>binlog_format</code> 必须为 <code>ROW</code>。</li>
+          <li>锁数、modified table、scan page、snapshot、binlog/temp sidecar 和时间预算都可能导致 fail closed。</li>
+          <li>恢复环境不能是 read_only/super_read_only，不能已有多语句事务，且 binlog/GTID 模式必须兼容。</li>
+          <li>普通 SQL RESUME 不能消费 <code>ADOPTED_FOR_PROMOTION</code>。</li>
+        </ul>
+
+        <h3>13.3 操作注意事项</h3>
+        <ul>
+          <li>单事务 preserve 也会做实例级 drain；在生产执行前先通知业务并停止新流量。</li>
+          <li>batch 可在零目标时成功并关机；成功不等于有 token。</li>
+          <li>没有 PROCESS 时拿不到完整 token；提前确认恢复账号与管理面。</li>
+          <li>默认/NO USER VARS 不会清空恢复 session 的既有变量；WITH USER VARS 的空集合会清空。</li>
+          <li>fallback 保证兼容性，不保证 phase 2 性能目标。</li>
+          <li>调大容量前同时检查 datadir 空间、inode、I/O、启动恢复时间和接收端 inflight。</li>
+          <li>物理备机路径必须有外部 fence provider 和 HA 编排；测试插件不能直接上线。</li>
+        </ul>
+      </section>
+
+      <section id="troubleshooting">
+        <h2>14. 错误与排障</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>错误/症状</th><th>含义</th><th>优先检查</th><th>建议动作</th></tr></thead>
+            <tbody>
+              <tr><td><code>ER_PRESERVE_TRX_DISABLED</code></td><td>总开关关闭。</td><td>启动参数和 OFF artifact policy。</td><td>先确认历史 artifact 处置策略，再以正确启动配置重启。</td></tr>
+              <tr><td><code>ER_PRESERVE_TRX_INVALID_STATE</code></td><td>当前 session/事务或 token 状态不允许该操作。</td><td>显式事务、目标 session、P_S STATE。</td><td>不要并发 resume；按状态恢复或清理。</td></tr>
+              <tr><td><code>ER_PRESERVE_TRX_UNSUPPORTED</code></td><td>上下文、对象、引擎或 sidecar 形态不支持。</td><td>复制/XA/锁/临时表/binlog/DDL 边界。</td><td>消除不支持状态；调大容量不能解决 unsupported family。</td></tr>
+              <tr><td><code>ER_PRESERVE_TRX_DRAIN_TIMEOUT</code></td><td>HARD drain 未在截止时间内收敛。</td><td>活跃事务、kill 是否生效、hard timeout。</td><td>查 processlist 和日志，修复阻塞源后重新规划停机。</td></tr>
+              <tr><td><code>ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED</code></td><td>失败后的 batch cleanup 不完整。</td><td>P_S、目标 session、taint/consume marker。</td><td>保留现场，先确认所有权和状态；禁止立即重复 drain。</td></tr>
+              <tr><td><code>ER_PRESERVE_TRX_NOT_FOUND</code></td><td>token 不存在、已消费、已过期清理或不在本地 registry。</td><td>token 是否脱敏、owner、transfer/standby 路径。</td><td>用 PROCESS 查询完整 token；跨机走 HA registry。</td></tr>
+              <tr><td><code>ER_PRESERVE_TRX_ACCESS_DENIED</code></td><td>owner、动态权限或对象 ACL 不满足。</td><td>priv_user/host、resume-any、表/库/例程权限。</td><td>只授予所需权限，不通过 SUPER 粗暴绕过对象检查。</td></tr>
+              <tr><td><code>ER_PRESERVE_TRX_BINLOG_MODE_MISMATCH</code></td><td>当前 binlog/GTID 环境与 snapshot 不兼容。</td><td>ROW、global/session log_bin、GTID_NEXT。</td><td>恢复到兼容环境，勿修改 snapshot。</td></tr>
+              <tr><td><code>ER_PRESERVE_TRX_CORRUPT_SNAPSHOT</code></td><td>snapshot/sidecar/摘要/XID 校验失败。</td><td>磁盘、文件权限、日志、taint、transfer ACK。</td><td>停止重试并保留文件，按恢复/回滚 runbook 处理。</td></tr>
+              <tr><td><code>ER_PRESERVE_TRX_SESSION_DRAINED</code></td><td>业务 session 在 drain 期间被阻止继续风险语句。</td><td>当前 drain epoch 和目标 session。</td><td>客户端停止继续发 SQL，等待停机或按业务重连策略处理。</td></tr>
+              <tr><td>重启后 P_S 无记录</td><td>可能未做本地恢复，或 token 属于 transfer standby。</td><td>总开关、OFF policy、startup logs、<code>.transfer/</code>。</td><td>区分本地 carrier 与 transfer；不要靠目录文件猜状态。</td></tr>
+              <tr><td>晋升 gate 失败</td><td>ready cache、epoch、物理 fence、摘要或 lease 不满足。</td><td>status code、physical mode、real redo apply、intent marker。</td><td>按状态码修复前置条件，不能跳过 strict gate。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>14.1 排障顺序</h3>
+        <ol>
+          <li>记录原始 SQL 错误和时间，不要先重试。</li>
+          <li>查询 P_S/SHOW，保存 29 列快照；没有 PROCESS 时由管理账号补查完整 token。</li>
+          <li>采集对应前缀的 SHOW STATUS，并标记 mysqld 启动时间，避免混淆累计与最近一次值。</li>
+          <li>按 token 末四位、epoch、source UUID 和时间窗口检索错误日志/审计。</li>
+          <li>只读检查 marker 与文件权限/大小；不要改名、删除或复制。</li>
+          <li>跨机问题补充外部 HA 的 physical fence、epoch 和 strict gate 调用记录。</li>
+          <li>确认 token 所有权和当前状态后，再决定 resume、rollback、abandon 或重做停机。</li>
+        </ol>
+      </section>
+
+      <section id="checklists">
+        <h2>15. 运维检查清单</h2>
+        <h3>15.1 停机前</h3>
+        <ul class="checklist">
+          <li>确认总开关、carrier mode、ROW binlog。</li>
+          <li>确认恢复账号具备 PROCESS，业务 owner 可用。</li>
+          <li>统计 eligible/active 事务及 owner 分布。</li>
+          <li>估算锁、modified tables、binlog/temp sidecar。</li>
+          <li>检查 preserve 目录空间、inode 和 I/O。</li>
+          <li>确认 timeout、recovery grace 和业务窗口。</li>
+          <li>决定 USER VARS 策略并记录。</li>
+          <li>决定 SOFT/HARD 及应用重试策略。</li>
+          <li>传输模式确认 endpoint、TLS/secret、UUID。</li>
+          <li>保存基线 status 与 mysqld 启动时间。</li>
+        </ul>
+
+        <h3>15.2 命令成功后与关机前后</h3>
+        <ul class="checklist">
+          <li>确认控制命令收到 OK，而非假定收到 token。</li>
+          <li>确认 mysqld 按预期 shutdown。</li>
+          <li>保存 phase2、warmcopy、transfer 指标快照。</li>
+          <li>查日志中 token count、SLO reason、ACK。</li>
+          <li>传输模式确认 epoch commit 与 receiver readiness。</li>
+          <li>不得手工搬运本地 artifact 代替 transfer。</li>
+        </ul>
+
+        <h3>15.3 重启或晋升后</h3>
+        <ul class="checklist">
+          <li>确认 startup recovery 完成且 error=0。</li>
+          <li>用 PROCESS 查询完整 token 与状态。</li>
+          <li>核对 token 数、owner、到期时间和 LAST_ERROR。</li>
+          <li>先恢复一个低风险 token 验证链路。</li>
+          <li>resume 后验证业务数据与 session 状态。</li>
+          <li>明确 COMMIT/ROLLBACK 责任方，避免悬挂。</li>
+          <li>晋升模式确认 physical mode=3 且 real redo apply=1。</li>
+          <li>归档 status、日志、审计和 HA 调用结果。</li>
+        </ul>
+      </section>
+
+      <section id="appendix">
+        <h2>附录：状态码与源码锚点</h2>
+        <h3>A.1 Transfer API/协议状态</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>数值</th><th>状态</th><th>含义</th></tr></thead>
+            <tbody>
+              <tr><td>0</td><td>OK</td><td>成功。</td></tr>
+              <tr><td>1</td><td>INVALID_ARGUMENT</td><td>参数或帧不合法。</td></tr>
+              <tr><td>2</td><td>CORRUPT</td><td>内容或摘要损坏。</td></tr>
+              <tr><td>3</td><td>IO_ERROR</td><td>文件/网络 I/O 失败。</td></tr>
+              <tr><td>4</td><td>UNSUPPORTED</td><td>协议、对象或形态不支持。</td></tr>
+              <tr><td>5</td><td>RESOURCE_EXHAUSTED</td><td>inflight、内存、磁盘等资源耗尽。</td></tr>
+              <tr><td>6</td><td>ACK_UNCERTAIN</td><td>远端持久化结果可能成立，但 ACK 无法确认。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted">这套 0..6 枚举用于 source/receiver 传输调用与日志，不是两个 <code>*_prewarm_last_status</code> SHOW STATUS 变量的取值；后者使用 A.2 的 promotion adopt status。</p>
+
+        <h3>A.2 Promotion adopt / prewarm last status code</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>数值</th><th>状态</th><th>简要含义</th></tr></thead>
+            <tbody>
+              <tr><td>0</td><td>OK</td><td>采用成功。</td></tr>
+              <tr><td>1</td><td>OK_WITH_ABANDONED_TOKENS</td><td>成功，但有 token 被放弃。</td></tr>
+              <tr><td>2</td><td>NOT_ENABLED</td><td>功能未开启。</td></tr>
+              <tr><td>3</td><td>INVALID_ARGUMENT</td><td>请求参数非法。</td></tr>
+              <tr><td>4</td><td>IO_ERROR</td><td>持久化 I/O 失败。</td></tr>
+              <tr><td>5</td><td>TOKEN_NOT_FOUND</td><td>找不到 token。</td></tr>
+              <tr><td>6</td><td>NOT_STANDBY_PENDING</td><td>不是 standby pending。</td></tr>
+              <tr><td>7</td><td>EPOCH_NOT_COMMITTED</td><td>epoch 未提交。</td></tr>
+              <tr><td>8</td><td>APPLY_BARRIER_NOT_REACHED</td><td>物理 apply barrier 未到。</td></tr>
+              <tr><td>9</td><td>READY_CACHE_NOT_READY</td><td>ready cache 未就绪。</td></tr>
+              <tr><td>10</td><td>TOO_MANY_PROMOTION_TOKENS</td><td>超过 gate token 上限。</td></tr>
+              <tr><td>11</td><td>CORRUPT_ARTIFACT</td><td>artifact 损坏。</td></tr>
+              <tr><td>12</td><td>UNSUPPORTED_ARTIFACT</td><td>artifact 形态不支持。</td></tr>
+              <tr><td>13</td><td>CLAIMED_IMPORT_FAILED</td><td>认领后导入失败。</td></tr>
+              <tr><td>14</td><td>TOKEN_ABANDONED</td><td>token 已放弃。</td></tr>
+              <tr><td>15</td><td>CLEANUP_PENDING</td><td>清理尚未完成。</td></tr>
+              <tr><td>16</td><td>CLEANUP_TAINTED</td><td>清理进入 taint。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted">这套数值来自 <code>Preserve_trx_promotion_adopt_status</code> 的枚举顺序，供旧 ready-cache gate 和 receiver prewarm 状态使用；它不是 strict physical gate 的完整返回协议。</p>
+
+        <h3>A.3 Strict physical promotion gate status</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>数值</th><th>状态</th><th>控制面含义</th></tr></thead>
+            <tbody>
+              <tr><td>0</td><td>OK</td><td>严格 gate 完成，结果中给出 adopted/rolled_back/tainted 数量。</td></tr>
+              <tr><td>1</td><td>NOT_ENABLED</td><td>Preserve/Resume 总开关未启用。</td></tr>
+              <tr><td>2</td><td>INVALID_ARGUMENT</td><td>epoch、token tuple、deadline、worker 或 expected fence 非法。</td></tr>
+              <tr><td>3</td><td>PHYSICAL_FENCE_NOT_AVAILABLE</td><td>没有可用的 production physical fence provider/proof。</td></tr>
+              <tr><td>4</td><td>PHYSICAL_FENCE_MISMATCH</td><td>provider 返回的物理边界与 expected fence 不一致。</td></tr>
+              <tr><td>5</td><td>REGISTRY_NOT_READY</td><td>strict prepared-token registry 尚未达到可 gate 状态。</td></tr>
+              <tr><td>6</td><td>INTENT_IO_ERROR</td><td>promotion intent 的持久化或更新失败。</td></tr>
+              <tr><td>7</td><td>ADOPT_FAILED</td><td>至少一个 token 在严格 adopt 中失败；结合 result.message、日志和 intent/registry 状态定位。</td></tr>
+              <tr><td>8</td><td>CLEANUP_TAINTED</td><td>失败处置无法证明清理完整，必须按 taint 流程人工接管。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted">这是 <code>preserved_trx_adopt_prepared_epoch_for_physical_promotion()</code> 的直接返回枚举，不会写入 <code>Preserve_trx_promotion_gate_status_code</code>。</p>
+
+        <h3>A.4 Per-token physical adopt status</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>数值</th><th>状态</th><th>逐 token 含义</th></tr></thead>
+            <tbody>
+              <tr><td>0</td><td>OK</td><td>prepared transaction 与持久化语义成功采用。</td></tr>
+              <tr><td>1</td><td>INVALID_ARGUMENT</td><td>lease、目录、deadline 或 token facts 非法。</td></tr>
+              <tr><td>2</td><td>PHYSICAL_FENCE_REVALIDATE_FAILED</td><td>采用前最终物理栅栏复检失败。</td></tr>
+              <tr><td>3</td><td>PHYSICAL_FENCE_PROVIDER_VIOLATION</td><td>provider 违反不可变性/一致性契约。</td></tr>
+              <tr><td>4</td><td>PREPARED_TRX_NOT_FOUND</td><td>目标 prepared transaction 不存在。</td></tr>
+              <tr><td>5</td><td>LOCK_CONFLICT</td><td>锁语义无法安全导入或与当前内核状态冲突。</td></tr>
+              <tr><td>6</td><td>SEMANTIC_IMPORT_FAILED</td><td>read view、锁、binlog 等语义导入失败。</td></tr>
+              <tr><td>7</td><td>ROLLED_BACK</td><td>失败后已经安全回滚。</td></tr>
+              <tr><td>8</td><td>CLEANUP_TAINTED</td><td>回滚/清理不能证明完成，token 进入 taint。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>A.5 Physical consistency mode</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>数值</th><th>模式</th><th>使用边界</th></tr></thead>
+            <tbody>
+              <tr><td>0</td><td>NONE</td><td>没有物理一致性证明。</td></tr>
+              <tr><td>1</td><td>TEST_SAME_INSTANCE_ATTACH_ONLY</td><td>仅同实例测试 attach。</td></tr>
+              <tr><td>2</td><td>TEST_ONLY_PHYSICAL_FENCE_SIMULATOR</td><td>测试模拟器，不可作为生产证明。</td></tr>
+              <tr><td>3</td><td>PRODUCTION_REDO_APPLY_FENCE</td><td>生产 redo apply fence。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>生产期望：<code>Preserve_trx_resume_physical_consistency_mode=3</code> 且 <code>Preserve_trx_resume_real_redo_apply=1</code>。</p>
+
+        <h3>A.6 源码锚点</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>主题</th><th>当前源码入口</th></tr></thead>
+            <tbody>
+              <tr><td>SQL 语法</td><td><code>sql/sql_yacc.yy</code></td></tr>
+              <tr><td>SQL 执行、主 preserve/resume、registry、审计</td><td><code>sql/preserve_trx.cc</code>、<code>sql/preserve_trx.h</code></td></tr>
+              <tr><td>Batch drain</td><td><code>sql/preserve_trx_drain.cc</code></td></tr>
+              <tr><td>Transfer receiver/source</td><td><code>sql/preserve_trx_transfer.cc/.h</code></td></tr>
+              <tr><td>Promotion/strict gate</td><td><code>sql/preserve_trx_promotion.cc/.h</code></td></tr>
+              <tr><td>系统变量</td><td><code>sql/sys_vars.cc</code></td></tr>
+              <tr><td>SHOW STATUS 注册</td><td><code>sql/mysqld.cc</code></td></tr>
+              <tr><td>P_S 表</td><td><code>storage/perfschema/table_preserved_transactions.cc/.h</code></td></tr>
+              <tr><td>权限注册</td><td><code>sql/auth/dynamic_privileges_impl.cc</code></td></tr>
+              <tr><td>错误消息</td><td><code>share/messages_to_clients.txt</code></td></tr>
+              <tr><td>行为测试</td><td><code>mysql-test/suite/preserve_trx/</code>、<code>unittest/gunit/preserve_trx*-t.cc</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <footer class="foot">
+        本手册以当前工作树中的实现为准。参数、状态变量和生产接入接口在后续提交中变化时，应同步更新本文件并重新执行源码清单校验。
+      </footer>
+    </main>
+  </div>
+
+  <script>
+    "use strict";
+
+    const parameters = [
+      ["基础与启动", "preserve_trx_enable", "ON", "GLOBAL；启动期决定，运行时只允许 SET 为当前值", "总开关。OFF 时拒绝新 preserve、drain、resume、transfer 和 promotion；历史工件由 off_artifact_policy 决定。"],
+      ["基础与启动", "preserve_trx_dir", "<datadir>/preserve/", "GLOBAL 只读；由 datadir 派生", "本地 snapshot、sidecar、warm artifact、marker 和 transfer spool 的根目录。"],
+      ["基础与启动", "preserve_trx_off_artifact_policy", "FAIL_IF_PRESENT", "GLOBAL 只读；启动参数", "总开关 OFF 且存在历史工件时的策略：FAIL_IF_PRESENT、IGNORE、RECOVER、ABANDON。"],
+      ["基础与启动", "preserve_trx_temp_table_enable", "ON", "GLOBAL 动态", "启用受约束的 InnoDB 用户临时表本地 preserve/resume；不支持的 DDL、metadata、savepoint/statement rollback 边界仍 fail closed。"],
+
+      ["Token 与超时", "preserve_trx_max_total", "256", "GLOBAL 动态；1..UINT_MAX", "实例本地 registry 最多保留的事务数。"],
+      ["Token 与超时", "preserve_trx_max_pending_per_user", "256", "GLOBAL 动态；1..UINT_MAX", "同一权限账号最多 pending 的 preserved transaction 数。"],
+      ["Token 与超时", "preserve_trx_batch_max_transactions", "256", "GLOBAL 动态；1..UINT_MAX", "单次 DRAIN 最多接收的目标事务数；要与 max_total、per-user 一起配置。"],
+      ["Token 与超时", "preserve_trx_default_timeout", "300 s", "SESSION；1..UINT_MAX", "省略 WITH TIMEOUT 时使用的墙上时间 timeout。"],
+      ["Token 与超时", "preserve_trx_min_timeout", "60 s", "SESSION；1..UINT_MAX", "客户端显式 WITH TIMEOUT 的下限。"],
+      ["Token 与超时", "preserve_trx_max_timeout", "86400 s", "SESSION；1..UINT_MAX", "客户端显式 WITH TIMEOUT 的上限。"],
+      ["Token 与超时", "preserve_trx_recovery_max_count", "3", "GLOBAL 动态；1..UINT_MAX", "同一 token 最多经历的启动恢复次数，达到后进入 rollback/清理。"],
+      ["Token 与超时", "preserve_trx_recovery_grace_seconds", "120 s", "GLOBAL 动态；30..1800", "首次启动恢复遇到已过期 token 时允许的宽限窗口。"],
+
+      ["持久化与内存", "preserve_trx_max_snapshot_bytes", "16 MiB", "GLOBAL 动态；1..ULLONG_MAX", "单 token snapshot metadata 文件上限，不含 external blob。"],
+      ["持久化与内存", "preserve_trx_max_binlog_cache_bytes", "1 GiB", "GLOBAL 动态；1..ULLONG_MAX", "单 token transaction binlog cache sidecar 上限。"],
+      ["持久化与内存", "preserve_trx_max_temp_sidecar_bytes", "1 GiB", "GLOBAL 动态；1..ULLONG_MAX", "单个临时表 image 或 undo sidecar 文件上限。"],
+      ["持久化与内存", "preserve_trx_memory_budget_bytes", "256 MiB", "GLOBAL 动态；4 KiB..ULLONG_MAX", "所有活跃 Preserve 操作可租用的通用 heap 总预算；耗尽后调用方应 spill 或 fail closed。"],
+      ["持久化与内存", "preserve_trx_memory_per_token_bytes", "64 MiB", "GLOBAL 动态；4 KiB..ULLONG_MAX", "单 token 通用 heap lease 上限。"],
+      ["持久化与内存", "preserve_trx_spill_chunk_bytes", "4 MiB", "GLOBAL 动态；4 KiB..64 MiB", "大对象流式写 spill backend 时的 scratch chunk 大小。"],
+
+      ["锁与事务形态", "preserve_trx_single_phase_max_binlog_cache_bytes", "ULLONG_MAX", "GLOBAL 动态；0..ULLONG_MAX", "没有 warmcopy provider 时允许单阶段复制的 logged cache 上限；0 表示单阶段不接受任何非空 cache。"],
+      ["锁与事务形态", "preserve_trx_max_lock_count", "2000", "GLOBAL 动态；0..UINT_MAX", "单事务可物化/导出的锁数量预算；0 会拒绝需要锁导出的事务。"],
+      ["锁与事务形态", "preserve_trx_max_modified_tables", "64", "GLOBAL 动态；0..UINT_MAX", "单事务为隐式锁扫描的 modified InnoDB table 上限。"],
+      ["锁与事务形态", "preserve_trx_max_scan_pages", "20000", "GLOBAL 动态；0..UINT_MAX", "隐式锁物化最多扫描的 clustered-index page 数。"],
+      ["锁与事务形态", "preserve_trx_materialize_timeout_ms", "5000 ms", "GLOBAL 动态；0..UINT_MAX", "隐式锁物化墙上时间上限；0 等价于不提供可用处理窗口。"],
+
+      ["Drain", "preserve_trx_drain_mode", "SOFT", "GLOBAL 动态；SOFT/HARD", "SOFT 先阻断新风险语句并等待 grace，再升级 HARD；HARD 立即 kill 其他活跃用户事务。"],
+      ["Drain", "preserve_trx_drain_grace_ms", "30000 ms", "GLOBAL 动态；0..UINT_MAX", "SOFT drain 升级 HARD 前的最长等待时间。"],
+      ["Drain", "preserve_trx_drain_hard_timeout_ms", "30000 ms", "GLOBAL 动态；1..UINT_MAX", "HARD drain 等待活跃事务退出的最长时间。"],
+
+      ["Binlog warmcopy", "preserve_trx_warmcopy_enable", "ON", "GLOBAL 动态", "启用 batch phase 1 transaction binlog cache warmcopy；与 lock warmcopy 开关独立。"],
+      ["Binlog warmcopy", "preserve_trx_warmcopy_close_timeout_ms", "30000 ms", "GLOBAL 动态；0..UINT_MAX", "关闭 warmcopy admission 并等待 mirror 收敛的最长时间。"],
+      ["Binlog warmcopy", "preserve_trx_warmcopy_min_open_ms", "1000 ms", "GLOBAL 动态；0..UINT_MAX", "drain epoch 在关闭 warmcopy admission 前至少保持 open 的时间。"],
+      ["Binlog warmcopy", "preserve_trx_warmcopy_chunk_bytes", "1 MiB", "GLOBAL 动态；1..UINT_MAX", "phase 1 prefix copy 的目标 chunk 大小。"],
+      ["Binlog warmcopy", "preserve_trx_warmcopy_tail_budget_bytes", "1 MiB", "GLOBAL 动态；0..UINT_MAX", "descriptor high-water mark 之后允许在 phase 2 补拷的 cache tail 上限。"],
+      ["Binlog warmcopy", "preserve_trx_warmcopy_max_total_bytes", "10 GiB", "GLOBAL 动态；1..ULLONG_MAX", "单 drain epoch 所有 binlog warm artifact 的总 admission 上限；不是堆内存预分配。"],
+      ["Binlog warmcopy", "preserve_trx_warmcopy_pending_range_limit", "1024", "GLOBAL 动态；0..UINT_MAX", "每个 participant 可保留的乱序 mirror range 数上限；达到后 participant degraded。"],
+      ["Binlog warmcopy", "preserve_trx_warmcopy_pending_bytes_limit", "64 MiB", "GLOBAL 动态；0..ULLONG_MAX", "每个 participant 可保留的乱序 mirror payload 字节上限。"],
+
+      ["Lock warmcopy", "preserve_trx_lock_warmcopy_enable", "ON", "GLOBAL 动态", "启用锁元数据 warmcopy；不受 binlog warmcopy 开关隐式控制。"],
+      ["Lock warmcopy", "preserve_trx_lock_warmcopy_fallback_to_live_export", "ON", "GLOBAL 动态", "warm artifact 无效时允许整 target 回退现有 live export；OFF 时严格拒绝。"],
+      ["Lock warmcopy", "preserve_trx_lock_warmcopy_max_memory_bytes", "256 MiB", "GLOBAL 动态；1..ULLONG_MAX", "一个 drain epoch 中锁 artifact payload 的内存保留预算；不是进程总堆上限。"],
+      ["Lock warmcopy", "preserve_trx_lock_warmcopy_max_journal_bytes", "1 GiB", "GLOBAL 动态；1..ULLONG_MAX", "一个 drain epoch 中锁 warmcopy journal 的字节上限。"],
+      ["Lock warmcopy", "preserve_trx_lock_warmcopy_max_dirty_shards", "100000", "GLOBAL 动态；0..UINT_MAX", "phase 2 可重新验证的 dirty record shard 数上限。"],
+      ["Lock warmcopy", "preserve_trx_lock_warmcopy_max_mdl_descriptors", "100000", "GLOBAL 动态；0..UINT_MAX", "单 target 可保留的 transaction-duration MDL descriptor 上限。"],
+      ["Lock warmcopy", "preserve_trx_lock_warmcopy_seal_threads", "0 (auto)", "GLOBAL 动态；0..1024", "phase 2 record seal worker 数；0 由目标数量自动决定。"],
+      ["Lock warmcopy", "preserve_trx_lock_warmcopy_conversion_wait_timeout_ms", "30000 ms", "GLOBAL 动态；0..UINT_MAX", "其他 session 命中目标事务 implicit-to-explicit conversion freeze 时最多等待的时间。"],
+
+      ["并行与恢复", "preserve_trx_parallel_preserve_threads", "0 (auto)", "GLOBAL 动态；0..1024", "batch phase 2 target preserve worker 数；1 强制 legacy 串行循环。"],
+      ["并行与恢复", "preserve_trx_startup_recovery_threads", "0 (auto)", "GLOBAL 动态；0..1024", "本地 snapshot 启动恢复 worker 数；1 强制 legacy 串行恢复。"],
+      ["并行与恢复", "preserve_trx_recover_lock_page_prefetch", "ON", "GLOBAL 动态", "导入 record-lock payload 前，best-effort 异步预读相关 InnoDB page。"],
+
+      ["Transfer 启动身份", "preserve_trx_transfer_receiver_enable", "OFF", "GLOBAL；启动期决定，运行时不可切换", "允许本实例接收 standby direct-transfer；该路径独立于普通本地启动恢复。"],
+      ["Transfer 启动身份", "preserve_trx_transfer_allowed_source_uuid", "空", "GLOBAL 只读；启动参数", "receiver 接受的唯一 source server UUID；空值会拒绝 receiver manifest。"],
+      ["Transfer 启动身份", "preserve_trx_transfer_target_server_uuid", "空", "GLOBAL 只读；启动参数", "传输协议预期的 target UUID；用于身份和 HMAC/fingerprint 绑定。"],
+      ["Transfer 启动身份", "preserve_trx_transfer_target_host", "空", "GLOBAL 只读；启动参数", "源端后台连接使用的 TCP host；与 target_socket 二选一。"],
+      ["Transfer 启动身份", "preserve_trx_transfer_target_port", "0", "GLOBAL 只读；启动参数；0..65535", "源端后台连接使用的 TCP port；0 表示未配置 TCP port。"],
+      ["Transfer 启动身份", "preserve_trx_transfer_target_socket", "空", "GLOBAL 只读；启动参数", "源端后台连接使用的 Unix socket；与 host/port 二选一。"],
+      ["Transfer 启动身份", "preserve_trx_transfer_target_user", "空", "GLOBAL 只读；启动参数", "源端连接 receiver 使用的账号名。"],
+      ["Transfer 启动身份", "preserve_trx_transfer_credential_name", "空", "GLOBAL 只读；启动参数", "凭据引用名，不保存明文密码；优先从复制通道凭据存储解析。"],
+      ["Transfer 启动身份", "preserve_trx_transfer_credential_secret_file", "空", "GLOBAL 只读；启动参数", "找不到内存凭据时读取的本地 secret 文件；所有者和权限受严格检查。"],
+      ["Transfer 启动身份", "preserve_trx_transfer_artifact_mode", "LOCAL_CARRIER", "GLOBAL；启动期决定", "LOCAL_CARRIER 写本地 carrier；STANDBY_TRANSFER_SAVE 经配置 endpoint 发布。"],
+
+      ["Transfer 运行参数", "preserve_trx_transfer_receiver_workers", "8", "GLOBAL 动态；1..1024", "receiver batch payload 路径最大 worker 数；classic 单帧仍在 dispatch session 校验/落盘。"],
+      ["Transfer 运行参数", "preserve_trx_transfer_chunk_bytes", "1 MiB", "GLOBAL 动态；1..1 MiB", "standby transfer 对象 payload 的目标分块大小。"],
+      ["Transfer 运行参数", "preserve_trx_transfer_max_inflight_bytes", "1 GiB", "GLOBAL 动态；1..ULLONG_MAX", "一个 receiver epoch 未 seal 字节上限，超过后 backpressure 或 fail closed。"],
+      ["Transfer 运行参数", "preserve_trx_transfer_commit_timeout_ms", "30000 ms", "GLOBAL 动态；1..UINT_MAX", "源端等待远端 epoch commit ACK 的最长时间。"],
+      ["Transfer 运行参数", "preserve_trx_transfer_phase1_batch_bytes", "4 MiB", "GLOBAL 动态；0..64 MiB；epoch 打开时快照", "phase 1 单批目标编码字节；0 关闭 batching。"],
+      ["Transfer 运行参数", "preserve_trx_transfer_phase1_batch_linger_ms", "20 ms", "GLOBAL 动态；0..1000；epoch 打开时快照", "最老待发送 phase 1 对象可等待 batching 的时间；0 立即发送。"],
+
+      ["Promotion gate", "preserve_trx_promotion_gate_batch_tokens", "3", "GLOBAL 动态；1..1024", "单次旧 promotion gate 可采用的 standby-pending token 上限，超出即 fail closed。"],
+      ["Promotion gate", "preserve_trx_promotion_gate_workers", "3", "GLOBAL 动态；1..1024", "旧 promotion adoption 的默认 worker/request budget；不是完整常驻 worker pool，也不能突破 strict physical gate request 的 worker_count 1..8 硬上限。"],
+      ["Promotion gate", "preserve_trx_promotion_gate_timeout_ms", "1000 ms", "GLOBAL 动态；1..UINT_MAX", "standby adopt 的默认 gate deadline。"]
+    ];
+
+    const parameterGuidanceRows = [
+      ["preserve_trx_enable", "确认当前构建具备有效 snapshot support，并在主库、备机和演练环境使用一致的启动配置；上线前分别验证 ON 启动和 OFF 启动。", "它是启动期总门，运行时只能 SET 为当前值。OFF 不等于清理历史事务，磁盘上已有工件时还要服从 off_artifact_policy。"],
+      ["preserve_trx_dir", "按峰值 token 数估算 snapshot、binlog/temp sidecar、warm artifact、transfer spool、staging 和 marker 的总空间与 inode，并配置目录权限和磁盘告警。", "目录由 datadir 派生且只读，多类工件共享同一空间。不要手工复制、改名或删除其中的文件来改变事务状态。"],
+      ["preserve_trx_off_artifact_policy", "为 FAIL_IF_PRESENT、IGNORE、RECOVER、ABANDON 四种启动结果分别写清责任人和操作步骤；没有明确外部处置流程时保持默认值。", "IGNORE 会把历史工件留给外部工具，RECOVER 也不会重新开放 SQL resume，ABANDON 涉及 rollback/清理；transfer/promotion marker 还要由 HA 确认所有权。"],
+      ["preserve_trx_temp_table_enable", "只有业务确实需要保留 InnoDB 用户临时表时才开启，并用真实 DDL、savepoint、statement rollback 和重复 resume 场景验证 image/undo 完整性。", "该开关不能扩大受支持的临时表语义；portable standby transfer 仍拒绝非空 temp manifest，关闭后也不能把已有 sidecar 当普通表文件处理。"],
+
+      ["preserve_trx_max_total", "以维护时最大 eligible 事务数、预期恢复并发和目录容量为依据，并给异常重试或人工接管留下余量。", "实际准入还受 batch_max_transactions 和每个 owner 的 max_pending_per_user 约束；调低不会主动驱逐已经注册的 token。"],
+      ["preserve_trx_max_pending_per_user", "按权限账号而不是连接池实例估算峰值；多租户或共享账号要特别检查单一 priv_user/priv_host 聚集的 token 数。", "这是每个 owner 的限制，不是实例总量。提高它仍不能突破 max_total 和 batch 上限，过大则可能让一个账号占满 registry。"],
+      ["preserve_trx_batch_max_transactions", "使用真实 batch 的锁数、binlog cache、temp sidecar 和 phase 2 时延分布确定，而不是直接按 max_connections 设置。", "它只限制一次 DRAIN 的目标数；过大同时放大内存、磁盘、warmcopy、phase 2 和下次 startup recovery 压力，零目标成功语义不受它影响。"],
+      ["preserve_trx_default_timeout", "覆盖停机、重启、startup recovery、HA 决策和人工接管的最长合理时间；连接池应显式初始化 session 值。", "只在 SQL 未写 WITH TIMEOUT 时使用。值过短会被 reaper 回滚，值过长会延长锁和 prepared transaction 的占用；必须落在 min/max 范围内。"],
+      ["preserve_trx_min_timeout", "根据最短可完成维护流程设置，防止客户端创建几乎立即过期的 token；核对所有调用方显式 timeout。", "它约束显式 WITH TIMEOUT，不会改写已有 token，也不能代替 default_timeout。调整时必须与 max_timeout 保持有效区间。"],
+      ["preserve_trx_max_timeout", "按组织允许事务持锁和保留 prepared 状态的最长时间设置，并配套逾期告警和人工 rollback 流程。", "过大会放大长期锁阻塞、目录占用和恢复成本；它只限制新建 token 的显式 timeout，不延长已有 token。"],
+      ["preserve_trx_recovery_max_count", "根据可接受的自动启动重试次数设置，并确保达到阈值后的 rollback/cleanup 有日志告警和人工检查。", "这是同一 token 的启动恢复次数上限，不是 SQL resume 重试次数。调低可能使反复启动的节点更早放弃历史事务。"],
+      ["preserve_trx_recovery_grace_seconds", "至少覆盖首次启动扫描和恢复发布需要的时间，但不要用它掩盖 default_timeout 过短。", "只对首次 startup recovery 看到的已过期 token提供宽限；运行期 reaper 和后续恢复次数不能把它当通用续期机制。"],
+
+      ["preserve_trx_max_snapshot_bytes", "从真实业务采集 snapshot metadata 大小分位数，覆盖 MDL、read view、savepoint、锁描述和 session 元数据后保留增长余量。", "它不包含 external blob、binlog cache 或 temp sidecar。超过上限会 fail closed，通用 spill 和扩大 memory budget 都不能绕过该硬限制。"],
+      ["preserve_trx_max_binlog_cache_bytes", "以最大可接受业务事务的 transaction cache 实测值为依据，并把单 token 上限乘以并发目标数校验磁盘容量。", "它约束 sidecar，不是内存预分配。还要同时检查 single_phase 上限、warmcopy_max_total、tail budget 和当前 ROW/GTID 环境。"],
+      ["preserve_trx_max_temp_sidecar_bytes", "对每种受支持临时表分别测量 image 与 no-redo undo 的峰值，并为重复 DML 和 rollback 增长留余量。", "这是单个 image 或 undo sidecar 上限，不代表一个 token 的全部 temp 空间。调大不能让不受支持的 temp DDL 或跨机迁移变为可用。"],
+      ["preserve_trx_memory_budget_bytes", "用并发 preserve 压测记录 Preserve_trx_memory_current_bytes、peak 和 spill，给 mysqld buffer pool、连接和其他组件保留独立内存余量。", "这是通用 Preserve heap lease 总预算，不覆盖所有 artifact 或 InnoDB 内存。过小会 spill/fail，过大可能与实例其他内存竞争。"],
+      ["preserve_trx_memory_per_token_bytes", "按单个最大事务在 snapshot、导出和编码阶段的实际 heap 峰值设置，并确保总预算能容纳计划中的并发 token。", "单 token 上限和总预算同时生效；把它设得高于总预算不会获得额外可用内存，也不会提高 snapshot/sidecar 文件硬上限。"],
+      ["preserve_trx_spill_chunk_bytes", "在目标存储上压测吞吐、临时内存和系统调用开销；通常先保留默认值，只在明确观察到 chunk 瓶颈时调整。", "大 chunk 增加单次 scratch lease 和尾部浪费，小 chunk 增加 I/O/摘要调用次数；它不改变可接受对象的逻辑大小上限。"],
+
+      ["preserve_trx_single_phase_max_binlog_cache_bytes", "评估 warmcopy provider 不可用或单事务 preserve 时，允许在停机关键路径完整复制多大的 transaction cache。", "值越大，兼容路径越宽但 phase 2/单事务暂停越长；0 会拒绝任何非空 cache，ULLONG_MAX 可能把超大复制留到关键路径。"],
+      ["preserve_trx_max_lock_count", "从 lock-heavy 事务采集最终可导出锁数分布，并结合 resume 锁导入耗时设置。", "0 会拒绝需要锁导出的事务。提高它还会增加 snapshot/blob、warmcopy journal、startup recovery 和 promotion apply 成本。"],
+      ["preserve_trx_max_modified_tables", "按单事务实际修改的 InnoDB 表数设置，特别覆盖分库分表批处理和触发器带来的扩展集合。", "它限制隐式锁扫描和跨账号 ACL 复检的范围；增大后还要同步评估 max_scan_pages、materialize timeout 和恢复期开表成本。"],
+      ["preserve_trx_max_scan_pages", "使用最坏事务的 clustered-index 扫描页数和 materialize 指标定值，避免仅按锁条目数推算。", "限制的是隐式锁物化扫描，不是 buffer pool 大小。提高会增加 I/O 和停机时间，仍可能被 timeout 或 lock count 拒绝。"],
+      ["preserve_trx_materialize_timeout_ms", "用冷/热 buffer pool 两种场景测量隐式锁物化尾延迟，取能覆盖目标事务但不突破维护窗口的值。", "0 不提供可用处理窗口。调大只能放宽时间预算，不能解决 unsupported lock family、scan page 或 lock count 超限。"],
+
+      ["preserve_trx_drain_mode", "常规维护用 SOFT 验证业务自然收敛；只有业务明确接受强制终止并演练客户端恢复时才选择 HARD。", "SOFT 到期会升级 HARD。该参数影响所有非目标用户事务，不能把它理解为只暂停发起 preserve 的连接。"],
+      ["preserve_trx_drain_grace_ms", "按长事务 p95/p99、连接池停止发新请求的传播时间和业务优雅退出时间设置。", "过短会频繁升级 HARD，过长会拖延维护；它只属于 SOFT 阶段，之后仍受 hard timeout 和 phase 2 耗时影响。"],
+      ["preserve_trx_drain_hard_timeout_ms", "覆盖 kill 发出后事务回滚、引擎清理和线程退出的尾延迟，并在维护窗口中预留失败处置时间。", "超时会令 drain 失败，不会证明所有目标都已安全保存。盲目调大可能让控制连接长时间卡在不可预测的阻塞上。"],
+
+      ["preserve_trx_warmcopy_enable", "用带 transaction cache 的真实 batch 同时验证开启、关闭、degraded 和 fallback 路径，比较 phase 2 与总 I/O。", "只控制 binlog cache warmcopy，不控制 lock warmcopy。开启后还受 close timeout、tail、pending 和 epoch total 等预算约束。"],
+      ["preserve_trx_warmcopy_close_timeout_ms", "测量关闭 admission 后 mirror 收敛的 p99，覆盖并发写入和慢存储场景。", "太短会让 participant degraded/fallback，太长会延长 phase 2；它不能修复摘要不一致或 provider contract 错误。"],
+      ["preserve_trx_warmcopy_min_open_ms", "确保 phase 1 有足够时间复制有意义的 prefix；根据业务写入速率和 drain 触发节奏压测。", "过小会把大量 tail 留给 phase 2，过大会推迟关闭 admission。它与 close timeout 处理的是不同阶段。"],
+      ["preserve_trx_warmcopy_chunk_bytes", "根据文件系统顺序写、摘要吞吐和 scratch 内存压测选择；没有证据时保持默认。", "大 chunk 增加单次工作量和内存，小 chunk 增加调度与 I/O 次数；最终还受 pending bytes 和 epoch total 限制。"],
+      ["preserve_trx_warmcopy_tail_budget_bytes", "采集 descriptor high-water mark 后仍增长的 transaction cache 尾部，覆盖突发写入的高分位。", "太小会迫使 phase 2 拒绝或回退，太大则把更多复制重新带回关键暂停窗口；不能替代 min_open 和 close 收敛。"],
+      ["preserve_trx_warmcopy_max_total_bytes", "按单 drain epoch 所有目标 cache 的总和而不是最大单事务设置，并确保 preserve 目录有 staging 和失败重试空间。", "这是磁盘 artifact admission 上限，不会预分配同等 heap；单 token 仍受 max_binlog_cache_bytes 限制。"],
+      ["preserve_trx_warmcopy_pending_range_limit", "从乱序 mirror 的实际 range 数峰值定值，重点测试高并发小写入和重试。", "达到上限会使 participant degraded。提高 range 数会增加元数据和合并成本，不能解决 pending payload 字节超限。"],
+      ["preserve_trx_warmcopy_pending_bytes_limit", "测量每个 participant 未连续落盘 payload 的峰值，并与通用内存和目标 cache 大小一起评估。", "它是每 participant 限制，不是 epoch total；调大可能增加内存/暂存压力，range_limit 仍会独立触发 degraded。"],
+
+      ["preserve_trx_lock_warmcopy_enable", "用真实 record/table/MDL 锁组合和冷页场景测试 artifact seal、canonical compare 与 resume 导入。", "它独立于 binlog warmcopy。关闭会把锁导出留在 live/phase 2 路径，开启也不保证所有锁族都受支持。"],
+      ["preserve_trx_lock_warmcopy_fallback_to_live_export", "上线初期通常开启以保留兼容路径，同时对每次 fallback 告警；只有业务明确要求严格性能/一致路径时才考虑关闭。", "ON 会牺牲 phase 2 时延目标换取兼容性，OFF 会把 artifact 无效直接变成 target 拒绝；两种模式都要压测。"],
+      ["preserve_trx_lock_warmcopy_max_memory_bytes", "根据一个 epoch 内锁 artifact payload 的峰值设置，并与 preserve_trx_memory_budget_bytes 分开监控。", "它是锁 warmcopy 专用保留预算，不是锁系统或进程总内存；不足时可能 spill、invalid 或 fallback。"],
+      ["preserve_trx_lock_warmcopy_max_journal_bytes", "以 phase 1 打开到 seal 之间的锁变化率和最坏 open 时长估算 journal，覆盖热点锁竞争。", "过小会触发 resource limit，过大增加磁盘/内存和 phase 2 重放成本；不能用它替代 dirty shard 限制。"],
+      ["preserve_trx_lock_warmcopy_max_dirty_shards", "采集 phase 2 实际重验的 dirty shard 数，按热点事务高分位设置。", "0 基本不允许需要 dirty shard 重验的 target。提高会拉长 final seal/fence 时间，仍受 journal 和 timeout 约束。"],
+      ["preserve_trx_lock_warmcopy_max_mdl_descriptors", "按单 target 的 transaction-duration MDL 实测数量设置，覆盖分区表、触发器和批量访问对象。", "过低会令 artifact invalid，过高增加 snapshot/compare/恢复开销；它不放宽不受支持的 MDL 类型。"],
+      ["preserve_trx_lock_warmcopy_seal_threads", "先使用 auto，再根据 target 数、CPU 余量和 seal p95 调整；比较 1、auto 和计划值。", "线程过多会争抢 CPU、I/O 和锁，未必缩短最慢 target；该值只影响 record seal，不等于整个 phase 2 worker 数。"],
+      ["preserve_trx_lock_warmcopy_conversion_wait_timeout_ms", "用高锁竞争业务测量其他 session 等待 implicit-to-explicit conversion freeze 的尾延迟。", "过短会增加其他 session 的超时/重试，过长会扩大业务抖动；它不是 drain hard timeout，也不决定 artifact seal deadline。"],
+
+      ["preserve_trx_parallel_preserve_threads", "先用 auto 或 1 建立基线，再按 target 数、CPU、磁盘并发和最慢 token 时延调整。", "提高线程数会同时放大 snapshot I/O、内存 lease 和锁竞争；1 是串行兼容路径，0 才是自动选择。"],
+      ["preserve_trx_startup_recovery_threads", "在真实 artifact 数量、冷 buffer pool 和存储介质上测量启动恢复总时长及各阶段指标。", "过高会在启动期制造随机 I/O、开表和锁导入竞争；它不改变 token recovery count、grace 或失败处置规则。"],
+      ["preserve_trx_recover_lock_page_prefetch", "分别在冷启动和热缓存场景比较同步 page get、prefetch residency、missing pages 与启动总耗时。", "预读是 best effort；开启可能增加启动 I/O 和 buffer pool 压力，关闭则可能把冷页读取留给串行锁导入。"],
+
+      ["preserve_trx_transfer_receiver_enable", "只在承担 standby receiver 的实例启动时开启，并与 allowed source UUID、target UUID、receiver 账号和网络边界一起验收。", "这是启动期身份，运行时不能切换。开启不代表普通 startup recovery 会消费 transfer spool，也不自动完成 promotion。"],
+      ["preserve_trx_transfer_allowed_source_uuid", "写入唯一允许的源 server UUID，并在主备重建、换主和克隆流程中明确更新时点。", "空值会拒绝 receiver manifest；错误或过宽的身份管理会导致合法传输失败或削弱来源约束，不能用主机名代替 UUID。"],
+      ["preserve_trx_transfer_target_server_uuid", "配置协议预期的目标 server UUID，核对它与实际 receiver、凭据派生和 HA inventory 一致。", "空值或与实际目标不一致会使身份/HMAC/fingerprint 校验失败；备机重建后不能沿用旧身份而不重新评审。"],
+      ["preserve_trx_transfer_target_host", "TCP 模式填写可通过证书身份校验的稳定主机名，并验证 DNS、路由、CA 和故障切换行为。", "host/port 与 Unix socket 必须二选一；使用 IP 时证书 SAN 也必须匹配，不能通过降低 TLS 校验绕过。"],
+      ["preserve_trx_transfer_target_port", "TCP 模式配置 receiver 实际监听端口并验证防火墙、连接超时和故障注入。", "0 表示未配置 TCP 端口；必须与 target_host、socket 二选一规则和 VERIFY_IDENTITY TLS 配置一致。"],
+      ["preserve_trx_transfer_target_socket", "同主机受控部署可配置 Unix socket，并验证路径所有权、访问权限和 mysqld 重启后的稳定性。", "socket 模式不使用 TLS，因此依赖本机文件权限；不能同时再配置 TCP host/port，也不能把 socket 暴露给非受信账号。"],
+      ["preserve_trx_transfer_target_user", "使用专用最小权限账号，授予内部 transfer 所需动态权限，并验证账号 host 匹配和轮换流程。", "该账号不是业务 token owner；扩大其通用数据库权限不能修复 receiver identity、HMAC 或 artifact 校验失败。"],
+      ["preserve_trx_transfer_credential_name", "优先使用受控 credential name，从复制通道凭据存储解析；演练密码轮换、节点重启和凭据缺失。", "它是引用名而非明文 secret。找不到时才可能使用 secret file，两个来源的生命周期和 HA 发布顺序必须一致。"],
+      ["preserve_trx_transfer_credential_secret_file", "仅在凭据存储不可用时配置，确认文件为当前 euid 所有的普通文件，no-follow 打开且 group/other 无权限。", "路径配置正确不代表权限检查会通过；不要把文件纳入普通日志、宽权限配置管理或跨主机共享目录。"],
+      ["preserve_trx_transfer_artifact_mode", "明确本次维护是本地重启恢复还是把语义工件发布到物理备机；两种模式分别做端到端演练。", "STANDBY_TRANSFER_SAVE 依赖完整 endpoint、credential、receiver epoch commit 和外部 promotion；LOCAL_CARRIER 工件不能靠目录复制替代跨机协议。"],
+
+      ["preserve_trx_transfer_receiver_workers", "在 receiver 的 CPU、磁盘和 batch payload 下测量吞吐与 commit 延迟，先保留默认值再按瓶颈调整。", "它只控制 receiver batch payload 路径；classic 单帧仍在 dispatch session 校验/落盘，线程过多会放大 inflight 和 I/O 竞争。"],
+      ["preserve_trx_transfer_chunk_bytes", "根据网络 MTU/TLS、文件系统写入和摘要开销压测；协议上限为 1 MiB，默认值已取上限。", "减小会增加 frame、ACK/调度和元数据开销；它不提高 max_inflight，也不改变对象摘要和最终 commit 原子性。"],
+      ["preserve_trx_transfer_max_inflight_bytes", "按一个 epoch 未 seal 对象的峰值、receiver 内存/磁盘能力和网络带宽时延积设置。", "超过后会 backpressure 或 fail closed；它不是已提交 spool 的总磁盘上限，也不能替代 preserve_trx_dir 容量告警。"],
+      ["preserve_trx_transfer_commit_timeout_ms", "覆盖最后对象落盘、epoch fact/commit 持久化和 ACK 往返的 p99，并注入网络断连和 receiver 重启。", "超时可能产生 ACK_UNCERTAIN：远端结果可能已经成立，不能直接重发新 epoch；必须按同一严格身份查询/续传。"],
+      ["preserve_trx_transfer_phase1_batch_bytes", "根据 token 大小分布和网络 send 次数选择，观察 batch bytes/tokens p50/p95/max；0 仅用于明确关闭 batching 的对照或兼容场景。", "值在 epoch 打开时快照，运行中修改不会改变当前 epoch。过大增加首批延迟和内存，过小增加 frame/send 调用。"],
+      ["preserve_trx_transfer_phase1_batch_linger_ms", "用低流量与突发流量分别测量 batch 填充率和首批发送延迟；对快速停机目标通常保持较小值。", "0 表示立即发送，较大会提高聚合率但延迟最老对象；同样在 epoch 打开时快照，并受 batch bytes/inflight 共同限制。"],
+
+      ["preserve_trx_promotion_gate_batch_tokens", "按一次晋升必须采用的 standby-pending token 数设置，并确保 ready-cache、prepared registry 和 deadline 能承载该批次。", "这是旧 ready-cache gate 的单次 token 上限；超过会 fail closed。它不是 strict physical gate request 的 token 安全证明。"],
+      ["preserve_trx_promotion_gate_workers", "用旧 gate/adoption 路径的 token 数、CPU 和最慢 worker 指标调优；默认值通常足够建立基线。", "1..1024 是旧 gate/default request budget，不代表常驻线程池，也不能突破 strict physical gate request 的 worker_count 1..8 硬上限。"],
+      ["preserve_trx_promotion_gate_timeout_ms", "以生产晋升 SLO 为上界，在冷页、锁多和 provider 延迟场景验证 strict gate 能在截止时间内完成或可靠失败。", "strict request 的 operation_deadline_us=0 会用它计算 deadline；调大不能弥补缺失 production fence、epoch mismatch、摘要不一致或 registry 未就绪。"]
+    ];
+
+    const parameterGuidance = new Map(parameterGuidanceRows.map(function (row) {
+      return [row[0], [row[1], row[2]]];
+    }));
+    if (parameterGuidance.size !== parameters.length ||
+        parameters.some(function (row) { return !parameterGuidance.has(row[1]); })) {
+      throw new Error("parameter guidance must cover every preserve_trx variable");
+    }
+
+    const metricGroups = [
+      {
+        name: "Lock warmcopy",
+        basis: "进程启动后累计",
+        items: [
+          ["Preserve_trx_lock_warmcopy_artifact_bytes", "", "生成并计入锁 warmcopy artifact 的 payload 字节总量。"],
+          ["Preserve_trx_lock_warmcopy_attempts", "", "进入锁 warmcopy 的 target 尝试次数。"],
+          ["Preserve_trx_lock_warmcopy_canonical_mismatch", "", "warm artifact 与 live export canonical comparator 不等价的次数。"],
+          ["Preserve_trx_lock_warmcopy_conversion_freeze_waits", "", "其他 session 因目标事务 conversion freeze 等待/重试的次数。"],
+          ["Preserve_trx_lock_warmcopy_dirty_shards", "", "phase 2 seal 处理的 dirty record shard 累计数。"],
+          ["Preserve_trx_lock_warmcopy_final_fence_mismatch", "", "final fence 复检不一致的次数。"],
+          ["Preserve_trx_lock_warmcopy_journal_bytes", "", "锁变更 journal 累计字节。"],
+          ["Preserve_trx_lock_warmcopy_live_fallback", "", "artifact 无效后整 target 回退 live export 的次数。"],
+          ["Preserve_trx_lock_warmcopy_phase2_pause_us", "", "锁 warmcopy phase 2 暂停窗口累计微秒。"],
+          ["Preserve_trx_lock_warmcopy_resource_limit", "", "因内存、journal、dirty shard、MDL 等预算变为 invalid/reject 的次数。"],
+          ["Preserve_trx_lock_warmcopy_sealed_invalid", "", "seal/validation 后 artifact 无效的次数。"],
+          ["Preserve_trx_lock_warmcopy_sealed_valid", "", "seal 后 artifact 可直接使用的次数。"],
+          ["Preserve_trx_lock_warmcopy_spill_bytes", "", "锁 warmcopy 写入 spill backend 的累计字节。"],
+          ["Preserve_trx_lock_warmcopy_spill_failures", "", "锁 warmcopy spill 失败次数。"],
+          ["Preserve_trx_lock_warmcopy_strict_reject", "", "无法或不允许 fallback 时严格拒绝 target 的次数。"],
+          ["Preserve_trx_lock_warmcopy_unsupported_family", "", "因不支持的锁族导致 artifact 无效/拒绝的次数。"]
+        ]
+      },
+      {
+        name: "通用内存",
+        basis: "当前值 / 进程峰值",
+        items: [
+          ["Preserve_trx_memory_current_bytes", "当前 gauge", "当前所有 Preserve 通用 heap lease 字节。"],
+          ["Preserve_trx_memory_peak_bytes", "进程峰值", "本次 mysqld 启动以来通用 heap lease 峰值。"]
+        ]
+      },
+      {
+        name: "Batch phase 2",
+        basis: "最近一次两阶段 batch drain",
+        items: [
+          ["Preserve_trx_phase2_detach_claim_us", "", "最近一次 phase 2 认领并 detach 目标事务的耗时。"],
+          ["Preserve_trx_phase2_lock_preflight_us", "", "锁 artifact/preflight 检查耗时。"],
+          ["Preserve_trx_phase2_lock_seal_us", "", "锁 warmcopy seal 耗时。"],
+          ["Preserve_trx_phase2_participant_close_us", "", "关闭 warmcopy participant 并等待收敛的耗时。"],
+          ["Preserve_trx_phase2_participant_preflight_us", "", "participant 最终状态预检耗时。"],
+          ["Preserve_trx_phase2_participant_prepare_us", "", "participant prepare/finalize 耗时。"],
+          ["Preserve_trx_phase2_prepare_us", "", "存储引擎/binlog prepare 阶段耗时。"],
+          ["Preserve_trx_phase2_register_us", "", "把 durable token 注册到 manager/registry 的耗时。"],
+          ["Preserve_trx_phase2_slo_miss_count", "进程累计", "phase 2 超过实现定义性能目标的累计次数；不是最近一次布尔值。"],
+          ["Preserve_trx_phase2_snapshot_write_us", "", "最终 snapshot metadata 写入和发布耗时。"],
+          ["Preserve_trx_phase2_target_preserve_us", "", "所有 target preserve 工作耗时。"],
+          ["Preserve_trx_phase2_target_wait_us", "", "等待 target 达到可 preserve 状态的耗时。"],
+          ["Preserve_trx_phase2_total_us", "", "最近一次 batch phase 2 总耗时。"]
+        ]
+      },
+      {
+        name: "SQL Resume",
+        basis: "最近一次 SQL resume",
+        items: [
+          ["Preserve_trx_resume_total_us", "", "最近一次 RESUME PRESERVED TRANSACTION 尝试的总耗时，包括失败尝试。"]
+        ]
+      },
+      {
+        name: "启动恢复",
+        basis: "本次 mysqld 启动的 startup recovery",
+        items: [
+          ["Preserve_trx_startup_recovery_binlog_cache_tokens", "", "本次启动恢复中带 binlog cache payload 的 token 数。"],
+          ["Preserve_trx_startup_recovery_elapsed_us", "", "Preserve startup recovery 总耗时。"],
+          ["Preserve_trx_startup_recovery_error", "", "本次启动恢复是否记录错误；非 0 需要结合错误日志。"],
+          ["Preserve_trx_startup_recovery_local_snapshot_tokens", "", "本次启动识别的本地 snapshot token 数。"],
+          ["Preserve_trx_startup_recovery_orphan_rollback_count", "", "本次启动对 orphan prepared transaction 执行 rollback 的数量。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_claim_us", "", "所有 snapshot 的 claim 阶段聚合耗时。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_kernel_us", "", "所有 snapshot 内核恢复阶段聚合耗时。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_load_us", "", "读取/解码 snapshot 与 sidecar 的聚合耗时。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_mdl_us", "", "恢复 MDL 的聚合耗时。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_predicate_locks_us", "", "恢复 predicate lock 的聚合耗时。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_read_view_us", "", "恢复 read view 的聚合耗时。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_record_locks_us", "", "恢复 record lock 的聚合耗时。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_record_lock_entries", "", "处理的 record-lock entry 总数。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_record_lock_stable_page_hits", "", "record-lock 恢复命中稳定页映射的次数。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_record_lock_image_resolves", "", "通过持久化 lock image 完成解析的次数。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_pages", "", "record-lock bitmap 涉及的 page 数。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_bits", "", "record-lock bitmap 中处理的 bit 数。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_us", "", "record-lock 恢复同步取页的聚合耗时。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_count", "", "record-lock 恢复同步取页次数。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_record_lock_table_open_us", "", "为 record-lock 恢复打开 table/index 的聚合耗时。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_pages", "", "发起预读的 page 数。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_bytes", "", "预读请求对应的字节数。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_residency_pages", "", "纳入预读 residency 检查的 page 数。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_resident_pages", "", "预读前/检查时已 resident 的 page 数。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_io_pending_pages", "", "预读检查时已有 I/O pending 的 page 数。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_missing_pages", "", "预读后仍未 resident 的 page 数。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_register_us", "", "把恢复结果注册到本地 registry 的聚合耗时。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_table_locks_us", "", "恢复 table lock 的聚合耗时。"],
+          ["Preserve_trx_startup_recovery_phase_snapshot_validate_us", "", "snapshot/XID/摘要/兼容性验证的聚合耗时。"],
+          ["Preserve_trx_startup_recovery_promotion_intent_tokens", "", "启动扫描发现的 promotion intent 相关 token 数。"],
+          ["Preserve_trx_startup_recovery_snapshot_tokens", "", "本次启动实际进入 snapshot recovery 的 token 总数。"],
+          ["Preserve_trx_startup_recovery_standby_pending_tokens", "", "启动扫描识别的 standby-pending token 数；不会因此自动成为普通 SQL token。"],
+          ["Preserve_trx_startup_recovery_tainted_tokens", "", "本次启动识别为 tainted 的 token 数。"]
+        ]
+      },
+      {
+        name: "旧 Promotion ready-cache gate",
+        basis: "最近一次 gate 快照",
+        items: [
+          ["Preserve_trx_promotion_gate_abandoned_count", "", "最近一次 gate 放弃的 token 数。"],
+          ["Preserve_trx_promotion_gate_adopted_count", "", "最近一次 gate 成功采用的 token 数。"],
+          ["Preserve_trx_promotion_gate_elapsed_us", "", "最近一次 gate 总耗时。"],
+          ["Preserve_trx_promotion_gate_max_worker_elapsed_us", "", "最近一次 gate 最慢 worker 耗时。"],
+          ["Preserve_trx_promotion_gate_p50_worker_elapsed_us", "", "最近一次 gate worker 耗时 p50。"],
+          ["Preserve_trx_promotion_gate_p95_worker_elapsed_us", "", "最近一次 gate worker 耗时 p95。"],
+          ["Preserve_trx_promotion_gate_record_lock_cold_page_gets", "", "最近一次 gate 为 record locks 发生的冷页同步 get 数。"],
+          ["Preserve_trx_promotion_gate_record_lock_page_count", "", "最近一次 gate 处理的 record-lock page 数。"],
+          ["Preserve_trx_promotion_gate_record_lock_resident_pages", "", "最近一次 gate 中已 resident 的 record-lock page 数。"],
+          ["Preserve_trx_promotion_gate_ready_cache_miss_count", "", "最近一次 gate 的 ready-cache miss 数。"],
+          ["Preserve_trx_promotion_gate_over_budget_count", "", "最近一次 gate 超过预算的 token/操作数。"],
+          ["Preserve_trx_promotion_gate_skipped_count", "", "最近一次 gate 跳过的 token 数。"],
+          ["Preserve_trx_promotion_gate_status_code", "", "最近一次旧 gate 状态码；0..16 映射见附录，不等同 strict physical gate。"],
+          ["Preserve_trx_promotion_gate_token_count", "", "最近一次 gate 输入 token 数。"]
+        ]
+      },
+      {
+        name: "Promotion prewarm",
+        basis: "当前 ready-cache 聚合",
+        items: [
+          ["Preserve_trx_promotion_prewarm_record_lock_cold_page_gets", "", "当前 prewarm/ready-cache 汇总中的冷页同步 get 数。"],
+          ["Preserve_trx_promotion_prewarm_record_lock_page_count", "", "当前 promotion prewarm 涉及的 record-lock page 数。"],
+          ["Preserve_trx_promotion_prewarm_record_lock_resident_pages", "", "当前已 resident 的 promotion record-lock page 数。"]
+        ]
+      },
+      {
+        name: "Promotion resume core",
+        basis: "最近一次 + 进程累计直方图",
+        items: [
+          ["Preserve_trx_promotion_resume_core_elapsed_us", "最近一次", "最近一次 promotion resume core 的耗时。"],
+          ["Preserve_trx_promotion_resume_core_count", "进程累计", "promotion resume core 调用次数。"],
+          ["Preserve_trx_promotion_resume_core_p50_us", "进程累计分布", "进程内 promotion resume core 耗时 p50。"],
+          ["Preserve_trx_promotion_resume_core_p95_us", "进程累计分布", "进程内 promotion resume core 耗时 p95。"],
+          ["Preserve_trx_promotion_resume_core_p99_us", "进程累计分布", "进程内 promotion resume core 耗时 p99。"],
+          ["Preserve_trx_promotion_resume_core_max_us", "进程累计最大值", "进程内 promotion resume core 最大耗时。"],
+          ["Preserve_trx_promotion_resume_failure_count", "进程累计", "promotion resume 失败次数。"]
+        ]
+      },
+      {
+        name: "Promotion physical fence",
+        basis: "最近一次 fence/adopt 操作",
+        items: [
+          ["Preserve_trx_promotion_fence_lease_wait_us", "", "等待/取得 promotion intent lease 的耗时。"],
+          ["Preserve_trx_promotion_fence_digest_compare_us", "", "比较物理/语义对象摘要的耗时。"],
+          ["Preserve_trx_promotion_fence_revalidate_us", "", "认领前最终 fence 重验证耗时。"]
+        ]
+      },
+      {
+        name: "Promotion lock apply",
+        basis: "最近一次 promotion lock 操作",
+        items: [
+          ["Preserve_trx_promotion_lock_page_get_count", "", "promotion lock apply 的同步取页次数。"],
+          ["Preserve_trx_promotion_lock_page_get_us", "", "promotion lock apply 同步取页耗时。"],
+          ["Preserve_trx_promotion_lock_image_resolves", "", "通过预热 lock image 直接解析的数量。"],
+          ["Preserve_trx_promotion_lock_apply_us", "", "应用 record lock 语义的耗时。"],
+          ["Preserve_trx_promotion_lock_accounting_bits", "", "promotion lock accounting 处理的 bitmap bit 数。"]
+        ]
+      },
+      {
+        name: "Receiver lock-plan 内存",
+        basis: "当前容量 / 当前 epoch 峰值",
+        items: [
+          ["Preserve_trx_receiver_lock_plan_capacity_bytes", "当前容量", "receiver lock-plan 可用总容量。"],
+          ["Preserve_trx_receiver_lock_plan_epoch_peak_bytes", "进程最大值", "每次上报 epoch peak 时取 max；因此是本次 mysqld 启动以来所有已观测 epoch 的最大 lock-plan 占用，不会在新 epoch 自动清零。"],
+          ["Preserve_trx_receiver_lock_plan_subpool_cap_bytes", "当前容量", "lock-plan 子池容量上限。"]
+        ]
+      },
+      {
+        name: "资源准入",
+        basis: "进程启动后累计",
+        items: [
+          ["Preserve_trx_resource_admission_open_failed_count", "", "打开 Preserve 资源准入/epoch 失败的次数。"]
+        ]
+      },
+      {
+        name: "Resume binlog attach",
+        basis: "进程启动后累计",
+        items: [
+          ["Preserve_trx_resume_binlog_payload_read_bytes", "", "resume 读取 binlog cache payload 的累计字节。"],
+          ["Preserve_trx_resume_binlog_payload_write_bytes", "", "resume 为 attach/重建写入 binlog payload 的累计字节。"],
+          ["Preserve_trx_resume_binlog_rename_count", "", "binlog sidecar 通过 rename/adopt 的累计次数。"],
+          ["Preserve_trx_resume_binlog_attach_count", "", "binlog transaction cache 成功 attach 的累计次数。"]
+        ]
+      },
+      {
+        name: "Resume 物理一致性",
+        basis: "最近一次 promotion resume",
+        items: [
+          ["Preserve_trx_resume_physical_consistency_mode", "", "最近一次恢复使用的物理一致性模式：0 NONE、1 同实例测试、2 模拟器、3 生产 redo apply fence。"],
+          ["Preserve_trx_resume_real_redo_apply", "", "最近一次是否使用真实 redo apply 证明；生产期望为 1。"]
+        ]
+      },
+      {
+        name: "Transfer receiver 与 prewarm",
+        basis: "进程累计；last/timestamp/gauge 例外",
+        items: [
+          ["Preserve_trx_transfer_receiver_auto_prewarm_last_status", "最近一次状态码", "最近一次 receiver 自动 prewarm 的 promotion adopt status；0..16 映射见 A.2。"],
+          ["Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens", "进程累计", "自动 prewarm 后仍未 ready 的 token 数。"],
+          ["Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens", "进程累计", "自动 prewarm 后 ready 的 token 数。"],
+          ["Preserve_trx_transfer_receiver_auto_prewarm_tokens", "进程累计", "进入自动 prewarm 的 token 总数。"],
+          ["Preserve_trx_transfer_receiver_ready_monotonic_us", "最近一次 monotonic 时间点", "receiver 最近一次达到 ready 的进程内 steady-clock 微秒值；不是墙上时间。"],
+          ["Preserve_trx_transfer_receiver_first_frame_monotonic_us", "进程首个 monotonic 时间点", "本次 mysqld 启动后第一帧 durable 的 steady-clock 时间点；首次写入后不再覆盖。"],
+          ["Preserve_trx_transfer_receiver_last_object_seal_monotonic_us", "最近一次 monotonic 时间点", "当前/最近 epoch 最后对象 seal 的 steady-clock 时间点。"],
+          ["Preserve_trx_transfer_receiver_prewarm_start_monotonic_us", "进程首个 monotonic 时间点", "本次 mysqld 启动后第一次 receiver prewarm 开始的 steady-clock 时间点；首次写入后不再覆盖。"],
+          ["Preserve_trx_transfer_receiver_prewarm_end_monotonic_us", "进程最新 monotonic 时间点", "最近一次 receiver prewarm 结束的 steady-clock 时间点。"],
+          ["Preserve_trx_transfer_receiver_seal_prewarm_last_status", "最近一次状态码", "对象 seal 触发 prewarm 的最近 promotion adopt status；0..16 映射见 A.2。"],
+          ["Preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens", "进程累计", "seal prewarm 后未 ready 的 token 数。"],
+          ["Preserve_trx_transfer_receiver_seal_prewarm_success_tokens", "进程累计", "seal prewarm 成功 token 数。"],
+          ["Preserve_trx_transfer_receiver_seal_prewarm_tokens", "进程累计", "触发 seal prewarm 的 token 数。"],
+          ["Preserve_trx_transfer_receiver_object_prewarm_proof_count", "进程累计", "对象 prewarm 生成/验证 readiness proof 的次数。"],
+          ["Preserve_trx_transfer_receiver_object_prewarm_miss_count", "进程累计", "对象 prewarm 未命中 ready resource 的次数。"],
+          ["Preserve_trx_transfer_receiver_object_prewarm_count", "进程累计", "对象 prewarm 调用次数。"],
+          ["Preserve_trx_transfer_receiver_object_prewarm_us", "进程累计耗时", "所有对象 prewarm 的累计耗时。"],
+          ["Preserve_trx_transfer_receiver_object_prewarm_max_us", "进程最大值", "单个对象 prewarm 的最大耗时。"],
+          ["Preserve_trx_recv_obj_prewarm_first_start_us", "进程首个 monotonic 时间点", "本次 mysqld 启动后对象 prewarm 最早开始的 steady-clock 时间点。"],
+          ["Preserve_trx_recv_obj_prewarm_last_end_us", "进程最新 monotonic 时间点", "本次 mysqld 启动后对象 prewarm 最晚结束的 steady-clock 时间点。"],
+          ["Preserve_trx_transfer_receiver_record_object_prewarm_count", "进程累计", "record-lock 对象 prewarm 次数。"],
+          ["Preserve_trx_transfer_receiver_record_object_prewarm_us", "进程累计耗时", "record-lock 对象 prewarm 累计耗时。"],
+          ["Preserve_trx_transfer_receiver_record_object_prewarm_max_us", "进程最大值", "单个 record-lock 对象 prewarm 最大耗时。"],
+          ["Preserve_trx_recv_rec_obj_prewarm_first_start_us", "进程首个 monotonic 时间点", "本次 mysqld 启动后 record-lock 对象 prewarm 最早开始的 steady-clock 时间点。"],
+          ["Preserve_trx_recv_rec_obj_prewarm_last_end_us", "进程最新 monotonic 时间点", "本次 mysqld 启动后 record-lock 对象 prewarm 最晚结束的 steady-clock 时间点。"],
+          ["Preserve_trx_recv_binlog_obj_prewarm_first_start_us", "进程首个 monotonic 时间点", "本次 mysqld 启动后 binlog 对象 prewarm 最早开始的 steady-clock 时间点。"],
+          ["Preserve_trx_recv_binlog_obj_prewarm_last_end_us", "进程最新 monotonic 时间点", "本次 mysqld 启动后 binlog 对象 prewarm 最晚结束的 steady-clock 时间点。"],
+          ["Preserve_trx_transfer_receiver_committed_epoch_fallback_count", "进程累计", "committed epoch 未走期望快速路径而触发 fallback 的次数。"],
+          ["Preserve_trx_transfer_receiver_staged_token_ready_cache_us", "进程累计耗时", "staged token 建立 ready-cache 的累计耗时。"],
+          ["Preserve_trx_transfer_receiver_staged_token_total_us", "进程累计耗时", "staged token 从处理开始到完成的累计耗时。"],
+          ["Preserve_trx_transfer_receiver_staged_token_max_us", "进程最大值", "单个 staged token 的最大处理耗时。"],
+          ["Preserve_trx_transfer_receiver_staged_token_active", "当前 gauge", "当前并发处理的 staged token 数。"],
+          ["Preserve_trx_transfer_receiver_staged_token_max_active", "进程峰值", "本次启动以来 staged token 最大并发数。"],
+          ["Preserve_trx_transfer_receiver_projection_publish_count", "进程累计", "发布 standby projection 的次数。"],
+          ["Preserve_trx_transfer_receiver_projection_publish_us", "进程累计耗时", "projection publish 累计耗时。"],
+          ["Preserve_trx_transfer_receiver_projection_publish_max_us", "进程最大值", "单次 projection publish 最大耗时。"],
+          ["Preserve_trx_transfer_receiver_projection_publish_p95_us", "进程累计分布", "projection publish 耗时 p95。"],
+          ["Preserve_trx_transfer_receiver_projection_lock_wait_us", "进程累计耗时", "projection publish 等待内部锁的累计耗时。"],
+          ["Preserve_trx_transfer_receiver_projection_store_write_us", "进程累计耗时", "projection store 持久化写入累计耗时。"],
+          ["Preserve_trx_transfer_receiver_projection_marker_write_us", "进程累计耗时", "standby/promotion marker 写入累计耗时。"],
+          ["Preserve_trx_transfer_receiver_projection_snapshot_write_us", "进程累计耗时", "projection snapshot metadata 写入累计耗时。"],
+          ["Preserve_trx_transfer_receiver_projection_external_blob_us", "进程累计耗时", "projection external blob 发布累计耗时。"],
+          ["Preserve_trx_transfer_receiver_projection_encode_us", "进程累计耗时", "projection 编码累计耗时。"],
+          ["Preserve_trx_transfer_receiver_projection_token_state_us", "进程累计耗时", "projection token state 变更累计耗时。"],
+          ["Preserve_trx_transfer_receiver_epoch_ready_bind_attempts", "进程累计", "把 committed epoch 绑定到 ready state/registry 的尝试次数。"]
+        ]
+      },
+      {
+        name: "Transfer source phase 2",
+        basis: "最近一次 phase 2；fsync count 例外",
+        items: [
+          ["Preserve_trx_transfer_phase2_bulk_bytes", "最近一次 phase 2", "本次 phase 2 bulk 传输字节；下一次 phase 2 开始时重置。"],
+          ["Preserve_trx_transfer_phase2_final_metadata_fsync_count", "进程启动后累计", "最终元数据执行 durable fsync 的累计次数；不会随 source phase 2 reset 清零。"],
+          ["Preserve_trx_transfer_phase2_final_metadata_ack_us", "最近一次 phase 2", "发送最终元数据到收到确认 ACK 的耗时。"]
+        ]
+      },
+      {
+        name: "Transfer source phase 1",
+        basis: "当前/最近 transfer epoch；打开 epoch 时重置",
+        items: [
+          ["Preserve_trx_transfer_phase1_frame_count", "", "本 epoch phase 1 编码/发送的 frame 数。"],
+          ["Preserve_trx_transfer_phase1_network_send_count", "", "本 epoch 实际网络 send 调用/批次次数。"],
+          ["Preserve_trx_transfer_phase1_batch_count", "", "本 epoch 形成的 phase 1 batch 数。"],
+          ["Preserve_trx_transfer_phase1_batch_bytes_p50", "", "本 epoch batch 编码字节 p50。"],
+          ["Preserve_trx_transfer_phase1_batch_bytes_p95", "", "本 epoch batch 编码字节 p95。"],
+          ["Preserve_trx_transfer_phase1_batch_bytes_max", "", "本 epoch最大 batch 编码字节。"],
+          ["Preserve_trx_transfer_phase1_batch_tokens_p50", "", "本 epoch 每 batch token 数 p50。"],
+          ["Preserve_trx_transfer_phase1_batch_tokens_p95", "", "本 epoch 每 batch token 数 p95。"],
+          ["Preserve_trx_transfer_phase1_batch_tokens_max", "", "本 epoch 每 batch 最大 token 数。"],
+          ["Preserve_trx_transfer_phase1_record_batch_tokens_avg", "", "本 epoch record-lock 对象 batch 的平均 token 数。"],
+          ["Preserve_trx_transfer_phase1_batch_linger_us_p95", "", "本 epoch batch 等待 linger 的耗时 p95。"],
+          ["Preserve_trx_transfer_phase1_batch_linger_us_max", "", "本 epoch batch 最大 linger 耗时。"],
+          ["Preserve_trx_transfer_phase1_oversize_token_count", "", "单 token 超过目标 batch bytes、需要独立发送的数量。"],
+          ["Preserve_trx_transfer_phase1_record_first_batch_send_us", "当前 epoch monotonic 时间点", "本 epoch record 对象第一批发送的 steady-clock 时间点。"],
+          ["Preserve_trx_transfer_phase1_record_last_batch_send_us", "当前 epoch monotonic 时间点", "本 epoch record 对象最后一批发送的 steady-clock 时间点。"]
+        ]
+      },
+      {
+        name: "Transfer receiver 终态时序",
+        basis: "最近一次 / 当前值",
+        items: [
+          ["Preserve_trx_transfer_receiver_ready_after_final_metadata_us", "最近一次耗时", "receiver 在最终元数据到达后达到 ready 的延迟。"],
+          ["Preserve_trx_transfer_receiver_final_spool_ack_monotonic_us", "最近一次 monotonic 时间点", "最终 spool ACK 的进程内 steady-clock 时间点。"],
+          ["Preserve_trx_transfer_receiver_ready_after_final_spool_ack_us", "最近一次耗时", "最终 spool ACK 后到 receiver ready 的延迟。"],
+          ["Preserve_trx_transfer_receiver_prewarm_backlog_at_phase2_end", "最近一次 gauge", "phase 2 结束时仍待 prewarm 的对象/token 数。"],
+          ["Preserve_trx_transfer_receiver_record_lock_req_residency_bytes", "当前 ready-cache gauge", "当前 ready-cache 中需预热的 record-lock page 数乘 16 KiB 得到的 required residency。"],
+          ["Preserve_trx_transfer_receiver_record_lock_resv_residency_bytes", "当前 ready-cache gauge", "当前 ready-cache 中已 resident 的 record-lock page 数乘 16 KiB 得到的 reserved residency。"]
+        ]
+      },
+      {
+        name: "通用 Spill",
+        basis: "进程启动后累计",
+        items: [
+          ["Preserve_trx_spill_bytes", "", "通用 Preserve spill backend 写入累计字节。"],
+          ["Preserve_trx_spill_failures", "", "通用 Preserve spill 失败次数。"]
+        ]
+      },
+      {
+        name: "Binlog warmcopy",
+        basis: "当前/最近一次 batch warmcopy；phase 1 open 时清零",
+        items: [
+          ["Preserve_trx_warmcopy_digest_bytes", "", "本次 warmcopy 参与摘要计算的字节。"],
+          ["Preserve_trx_warmcopy_durable_bytes", "", "本次 warmcopy 推进到 durable watermark 的字节。"],
+          ["Preserve_trx_warmcopy_phase2_pause_us", "", "本次 binlog warmcopy phase 2 finalize 暂停窗口微秒。"],
+          ["Preserve_trx_warmcopy_prefix_bytes", "", "本次 phase 1 已复制的 binlog cache prefix 字节。"],
+          ["Preserve_trx_warmcopy_provider_full_copy_to_count", "", "本次 drain 中没有可用 provider、转走 full-copy 路径的次数。"]
+        ]
+      }
+    ];
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function renderParameters(query) {
+      const body = document.querySelector("#parameter-table tbody");
+      const needle = (query || "").trim().toLowerCase();
+      const filtered = parameters.filter(function (row) {
+        const guidance = parameterGuidance.get(row[1]) || [];
+        return row.concat(guidance).join(" ").toLowerCase().includes(needle);
+      });
+      body.innerHTML = filtered.map(function (row) {
+        const guidance = parameterGuidance.get(row[1]);
+        return "<tr><td>" + escapeHtml(row[0]) + "</td><td><code>" +
+          escapeHtml(row[1]) + "</code></td><td class=\"nowrap\">" +
+          escapeHtml(row[2]) + "</td><td>" + escapeHtml(row[3]) +
+          "</td><td class=\"parameter-explanation\"><p class=\"parameter-meaning\">" +
+          escapeHtml(row[4]) + "</p><div class=\"parameter-guidance\"><div><strong>" +
+          "上线前确认</strong><span>" + escapeHtml(guidance[0]) +
+          "</span></div><div><strong>风险与联动</strong><span>" +
+          escapeHtml(guidance[1]) + "</span></div></div></td></tr>";
+      }).join("");
+      document.getElementById("parameter-count").textContent =
+        "显示 " + filtered.length + " / " + parameters.length;
+    }
+
+    function flatMetrics() {
+      const rows = [];
+      metricGroups.forEach(function (group) {
+        group.items.forEach(function (item) {
+          rows.push([group.name, item[0], item[1] || group.basis, item[2]]);
+        });
+      });
+      return rows;
+    }
+
+    function renderMetrics(query) {
+      const body = document.querySelector("#metric-table tbody");
+      const all = flatMetrics();
+      const needle = (query || "").trim().toLowerCase();
+      const filtered = all.filter(function (row) {
+        return row.join(" ").toLowerCase().includes(needle);
+      });
+      body.innerHTML = filtered.map(function (row) {
+        return "<tr><td>" + escapeHtml(row[0]) + "</td><td><code>" +
+          escapeHtml(row[1]) + "</code></td><td>" + escapeHtml(row[2]) +
+          "</td><td>" + escapeHtml(row[3]) + "</td></tr>";
+      }).join("");
+      document.getElementById("metric-count").textContent =
+        "显示 " + filtered.length + " / " + all.length;
+    }
+
+    const parameterFilter = document.getElementById("parameter-filter");
+    const metricFilter = document.getElementById("metric-filter");
+    parameterFilter.addEventListener("input", function () { renderParameters(parameterFilter.value); });
+    metricFilter.addEventListener("input", function () { renderMetrics(metricFilter.value); });
+    renderParameters("");
+    renderMetrics("");
+
+    const menuButton = document.getElementById("menu-button");
+    const scrim = document.getElementById("scrim");
+    function closeNav() { document.body.classList.remove("nav-open"); }
+    menuButton.addEventListener("click", function () {
+      document.body.classList.toggle("nav-open");
+    });
+    scrim.addEventListener("click", closeNav);
+    document.querySelectorAll(".toc a").forEach(function (link) {
+      link.addEventListener("click", closeNav);
+    });
+
+    const tocLinks = Array.from(document.querySelectorAll(".toc a"));
+    const sections = tocLinks.map(function (link) {
+      return document.querySelector(link.getAttribute("href"));
+    }).filter(Boolean);
+    const observer = new IntersectionObserver(function (entries) {
+      const visible = entries.filter(function (entry) { return entry.isIntersecting; })
+        .sort(function (a, b) { return a.boundingClientRect.top - b.boundingClientRect.top; });
+      if (!visible.length) return;
+      const id = "#" + visible[0].target.id;
+      tocLinks.forEach(function (link) {
+        link.classList.toggle("active", link.getAttribute("href") === id);
+      });
+    }, { rootMargin: "-12% 0px -75% 0px", threshold: [0, 1] });
+    sections.forEach(function (section) { observer.observe(section); });
+  </script>
+</body>
+</html>

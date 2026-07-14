@@ -1,0 +1,50 @@
+CALL mtr.add_suppression("Preserved transaction batch cleanup failed after debug injected target error");
+DROP TABLE IF EXISTS t_batch_cleanup_failure;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_batch_cleanup_failure(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+START TRANSACTION;
+INSERT INTO t_batch_cleanup_failure VALUES(1,10);
+START TRANSACTION;
+INSERT INTO t_batch_cleanup_failure VALUES(2,20);
+SET SESSION debug="+d,preserve_trx_batch_fail_after_one_target,preserve_trx_fail_reattach_original_thd";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: DRAIN TRANSACTIONS PRESERVE batch cleanup failed; inspect preserved_transactions and target sessions before retry
+SET SESSION debug="-d,preserve_trx_batch_fail_after_one_target,preserve_trx_fail_reattach_original_thd";
+SELECT 1 AS server_alive_after_cleanup_failure;
+server_alive_after_cleanup_failure
+1
+SELECT COUNT(*) AS preserved_cleanup_records
+FROM performance_schema.preserved_transactions
+WHERE STATE = 'PRESERVED'
+   AND LAST_ERROR IS NOT NULL
+AND LAST_ERROR_AT IS NOT NULL;
+preserved_cleanup_records
+1
+SELECT TOKEN, STATE, LAST_ERROR IS NOT NULL AS has_last_error
+FROM performance_schema.preserved_transactions
+ORDER BY TOKEN;
+TOKEN	STATE	has_last_error
+TOKEN	PRESERVED	1
+BEGIN;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT 1;
+ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ROLLBACK;
+SHOW VARIABLES LIKE 'pid_file';
+Variable_name	Value
+pid_file	PID_FILE
+SELECT COUNT(*) AS preserved_count_after_restart
+FROM performance_schema.preserved_transactions;
+preserved_count_after_restart
+1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ROLLBACK;
+SELECT COUNT(*) AS preserved_count_after_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_resume
+0
+DROP TABLE t_batch_cleanup_failure;
+SET GLOBAL preserve_trx_enable=ON;

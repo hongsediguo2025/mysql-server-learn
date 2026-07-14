@@ -1,0 +1,60 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_lock_warmcopy_table_drift;
+--enable_warnings
+
+--let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
+--let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_fallback= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_fallback_to_live_export`
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=ON;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+
+CREATE TABLE t_lock_warmcopy_table_drift(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_table_drift VALUES(1,10);
+
+--connect(lock_wc_table_drift_app, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_lock_warmcopy_table_drift SET v=11 WHERE id=1;
+
+--connection default
+SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_table_post_prepare_drift";
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET SESSION debug="-d,preserve_trx_lock_warmcopy_simulate_table_post_prepare_drift";
+
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_text= table post-prepare drift rejects partial-family fallback
+--let $assert_select= PRESERVE_LOCK_WARMCOPY.*action=strict_reject.*reason=table_lock_warmcopy_post_prepare_drift
+--let $assert_count_condition= >= 1
+--source include/assert_grep.inc
+
+SELECT COUNT(*) AS preserved_count_after_table_drift_reject
+  FROM performance_schema.preserved_transactions;
+
+--connection lock_wc_table_drift_app
+ROLLBACK;
+
+--connection default
+SELECT id, v FROM t_lock_warmcopy_table_drift ORDER BY id;
+
+DROP TABLE t_lock_warmcopy_table_drift;
+
+--disable_query_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback
+--eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
+--eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
+--eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--enable_query_log

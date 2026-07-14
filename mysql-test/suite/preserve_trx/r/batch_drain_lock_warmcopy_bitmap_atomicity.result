@@ -1,0 +1,7 @@
+# Lint-only source-shape guard. Runtime bitmap behavior is covered by
+# batch_drain_lock_warmcopy_record_bitmap and low-level GUnit tests; this
+# file keeps the mandatory mutation-generation/fingerprint contract in
+# the MTR suite without adding invasive core hooks.
+SELECT 'ok' AS batch_drain_lock_warmcopy_bitmap_atomicity;
+batch_drain_lock_warmcopy_bitmap_atomicity
+ok

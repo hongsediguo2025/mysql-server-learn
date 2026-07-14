@@ -1,0 +1,1 @@
+--log-bin=preserve-trx-temp-drop-bin --server-id=1

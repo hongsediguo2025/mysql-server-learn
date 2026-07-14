@@ -43,6 +43,7 @@
 #include "sql/log.h"
 #include "sql/mdl.h"
 #include "sql/mysqld.h"  // opt_readonly
+#include "sql/preserve_trx_temp_table.h"
 #include "sql/query_options.h"
 #include "sql/rpl_context.h"
 #include "sql/rpl_gtid.h"
@@ -184,6 +185,13 @@ bool trans_begin(THD *thd, uint flags) {
   thd->server_status |= SERVER_STATUS_IN_TRANS;
   if (thd->tx_read_only) thd->server_status |= SERVER_STATUS_IN_TRANS_READONLY;
   DBUG_PRINT("info", ("setting SERVER_STATUS_IN_TRANS"));
+  /*
+    Temporary-table preserve compares no-redo undo at preserve time against the
+    transaction-start baseline. Explicit transactions may not touch InnoDB until
+    a later statement, so the baseline must be recorded when BEGIN becomes
+    visible rather than when the first temp-table row hook fires.
+  */
+  preserve_trx_temp_table_mark_transaction_start(thd);
 
   if (tst) tst->add_trx_state(thd, TX_EXPLICIT);
 
@@ -742,6 +750,8 @@ bool trans_savepoint(THD *thd, LEX_STRING name) {
         name.str);
   }
 
+  (void)preserve_trx_temp_table_note_savepoint(thd, name.str, name.length);
+
   return false;
 }
 
@@ -813,6 +823,11 @@ bool trans_rollback_to_savepoint(THD *thd, LEX_STRING name) {
         ->rollback_to_savepoint(name.str);
   }
 
+  if (!res) {
+    (void)preserve_trx_temp_table_note_rollback_to_savepoint(thd, name.str,
+                                                             name.length);
+  }
+
   return res;
 }
 
@@ -850,6 +865,11 @@ bool trans_release_savepoint(THD *thd, LEX_STRING name) {
   if (thd->is_current_stmt_binlog_row_enabled_with_write_set_extraction()) {
     thd->get_transaction()->get_transaction_write_set_ctx()->del_savepoint(
         name.str);
+  }
+
+  if (!res) {
+    (void)preserve_trx_temp_table_note_release_savepoint(thd, name.str,
+                                                        name.length);
   }
 
   return res;

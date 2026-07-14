@@ -1,0 +1,82 @@
+--disable_warnings
+DROP USER IF EXISTS preserve_resume_denied@localhost;
+DROP USER IF EXISTS preserve_resume_any@localhost;
+DROP USER IF EXISTS preserve_u@localhost;
+DROP TABLE IF EXISTS t_priv;
+--enable_warnings
+--disable_query_log
+CALL mtr.add_suppression("RESUME PRESERVED TRANSACTION .* failed: token not found");
+--enable_query_log
+
+SET GLOBAL preserve_trx_enable=ON;
+
+SELECT @@global.preserve_trx_drain_mode AS default_drain_mode;
+SELECT @@global.preserve_trx_drain_grace_ms AS default_drain_grace_ms;
+SET GLOBAL preserve_trx_drain_mode=HARD;
+SELECT @@global.preserve_trx_drain_mode AS hard_drain_mode;
+SET GLOBAL preserve_trx_drain_mode=SOFT;
+SET GLOBAL preserve_trx_drain_grace_ms=1;
+SELECT @@global.preserve_trx_drain_grace_ms AS updated_drain_grace_ms;
+SET GLOBAL preserve_trx_drain_grace_ms=30000;
+
+--error ER_PRESERVE_TRX_INVALID_STATE
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+
+START TRANSACTION;
+CREATE TEMPORARY TABLE tmp_preserve_reject(a INT) ENGINE=InnoDB;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+ROLLBACK;
+DROP TEMPORARY TABLE IF EXISTS tmp_preserve_reject;
+
+CREATE TABLE t_priv(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+
+SET autocommit=0;
+INSERT INTO t_priv VALUES(10,10);
+--error ER_PRESERVE_TRX_INVALID_STATE
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+ROLLBACK;
+SET autocommit=1;
+
+START TRANSACTION;
+INSERT INTO t_priv VALUES(11,11);
+SET @saved_preserve_trx_max_scan_pages=@@GLOBAL.preserve_trx_max_scan_pages;
+SET GLOBAL preserve_trx_max_scan_pages=0;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+ROLLBACK;
+SET GLOBAL preserve_trx_max_scan_pages=@saved_preserve_trx_max_scan_pages;
+
+CREATE USER preserve_u@localhost;
+GRANT SELECT, INSERT, UPDATE ON test.t_priv TO preserve_u@localhost;
+
+--connect(preserve_u_con, localhost, preserve_u,,test)
+START TRANSACTION;
+INSERT INTO t_priv VALUES(1,1);
+--error ER_SPECIFIC_ACCESS_DENIED_ERROR
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+ROLLBACK;
+--disconnect preserve_u_con
+--connection default
+
+CREATE USER preserve_resume_denied@localhost;
+--connect(preserve_resume_denied_con, localhost, preserve_resume_denied,,test)
+--error ER_PRESERVE_TRX_ACCESS_DENIED
+RESUME PRESERVED TRANSACTION 'msp_missing_token';
+--disconnect preserve_resume_denied_con
+--connection default
+
+CREATE USER preserve_resume_any@localhost;
+GRANT RESUME_ANY_PRESERVED_TRANSACTION ON *.* TO preserve_resume_any@localhost;
+SHOW GRANTS FOR preserve_resume_any@localhost;
+--connect(preserve_resume_any_con, localhost, preserve_resume_any,,test)
+--error ER_PRESERVE_TRX_NOT_FOUND
+RESUME PRESERVED TRANSACTION 'msp_missing_token';
+--disconnect preserve_resume_any_con
+--connection default
+DROP USER preserve_resume_any@localhost;
+
+DROP USER preserve_resume_denied@localhost;
+DROP USER preserve_u@localhost;
+DROP TABLE t_priv;
+SET GLOBAL preserve_trx_enable=ON;

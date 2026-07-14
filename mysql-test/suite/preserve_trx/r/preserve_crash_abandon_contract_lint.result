@@ -1,0 +1,3 @@
+SELECT 'ok' AS preserve_crash_abandon_contract_lint;
+preserve_crash_abandon_contract_lint
+ok

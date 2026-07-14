@@ -1,0 +1,18 @@
+# Tests for PERFORMANCE_SCHEMA
+#
+# Verify invalid DDL operations on preserved_transactions.
+
+--error ER_DBACCESS_DENIED_ERROR
+ALTER TABLE performance_schema.preserved_transactions
+  ADD COLUMN foo INTEGER;
+
+--error ER_TABLEACCESS_DENIED_ERROR
+TRUNCATE TABLE performance_schema.preserved_transactions;
+
+--error ER_DBACCESS_DENIED_ERROR
+ALTER TABLE performance_schema.preserved_transactions
+  ADD INDEX test_index(TOKEN);
+
+--error ER_DBACCESS_DENIED_ERROR
+CREATE UNIQUE INDEX test_index ON
+  performance_schema.preserved_transactions(TOKEN);

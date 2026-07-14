@@ -169,12 +169,16 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "os0thread.h"
 #include "sql/item.h"
 #include "sql/json_dom.h"
+#include "sql/preserve_trx.h"
+#include "sql/preserve_trx_xid.h"
 #include "sql_base.h"
 #include "srv0tmp.h"
+#include "trx0preserve.h"
 #include "trx0rec.h"
 #include "trx0roll.h"
 #include "trx0rseg.h"
 #include "trx0sys.h"
+#include "trx0temp_preserve.h"
 #include "trx0trx.h"
 #include "trx0xa.h"
 #include "ut0mem.h"
@@ -3724,8 +3728,20 @@ static void innobase_post_recover() {
     }
   }
 
-  if (srv_read_only_mode || srv_force_recovery >= SRV_FORCE_NO_BACKGROUND) {
+  if (srv_read_only_mode) {
     purge_sys->state = PURGE_STATE_DISABLED;
+    (void)preserved_trx_mark_innodb_read_only_recovery_state();
+    return;
+  }
+
+  if (srv_force_recovery >= SRV_FORCE_NO_BACKGROUND) {
+    purge_sys->state = PURGE_STATE_DISABLED;
+    if (!opt_initialize && preserved_trx_recover_all()) {
+      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: recovery failed before InnoDB background threads "
+             "could start");
+      ib::fatal(ER_IB_MSG_POST_RECOVER_DDL_LOG_RECOVER);
+    }
     return;
   }
 
@@ -3733,6 +3749,22 @@ static void innobase_post_recover() {
   if (dd_tablespace_update_cache(thd.thd)) {
     ut_ad(0);
   }
+
+  if (!opt_initialize && preserved_trx_recover_all()) {
+    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+           "PRESERVE: recovery failed before InnoDB background threads could "
+           "start");
+    ib::fatal(ER_IB_MSG_POST_RECOVER_DDL_LOG_RECOVER);
+  }
+
+  DBUG_EXECUTE_IF(
+      "preserve_trx_assert_recovered_before_purge",
+      LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: recovery completed before purge thread start"););
+  DBUG_EXECUTE_IF("preserve_trx_assert_recovered_before_recovery_rollback",
+                  LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+                         "PRESERVE: preserved transactions recovered before "
+                         "recovery rollback can observe them"););
 
   srv_start_threads_after_ddl_recovery();
 }
@@ -6795,8 +6827,14 @@ int ha_innobase::open(const char *name, int, uint open_flags,
       }
     }
   } else {
-    ib_table->acquire();
-    ut_ad(ib_table->is_intrinsic());
+    if (trx_preserve_temp_space_image_is_reserved_generated_table(ib_table)) {
+      mutex_enter(&dict_sys->mutex);
+      ib_table->acquire_with_lock();
+      mutex_exit(&dict_sys->mutex);
+    } else {
+      ib_table->acquire();
+      ut_ad(ib_table->is_intrinsic());
+    }
   }
 
   if (ib_table != nullptr) {
@@ -13553,8 +13591,23 @@ int innobase_basic_ddl::delete_impl(THD *thd, const char *name,
       index->last_ins_cur->release();
       index->last_sel_cur->release();
     }
-  } else if (srv_read_only_mode ||
-             srv_force_recovery >= SRV_FORCE_NO_UNDO_LOG_SCAN) {
+  }
+
+  if (handler != nullptr && handler->is_temporary() &&
+      trx_preserve_temp_space_image_fil_space_adopted_by_space_id(
+          handler->space)) {
+    error = trx_preserve_temp_space_image_drop_bound_table_by_space_id(
+        handler->space, handler);
+    if (error != DB_SUCCESS && error != DB_TABLESPACE_NOT_FOUND) {
+      return (convert_error_code_to_mysql(error, 0, nullptr));
+    }
+    priv->unregister_table_handler(norm_name);
+    return 0;
+  }
+
+  if (handler == nullptr &&
+      (srv_read_only_mode ||
+       srv_force_recovery >= SRV_FORCE_NO_UNDO_LOG_SCAN)) {
     return (HA_ERR_TABLE_READONLY);
   }
 
@@ -19245,6 +19298,10 @@ static xa_status_code innobase_commit_by_xid(
 {
   DBUG_ASSERT(hton == innodb_hton_ptr);
 
+  if (xid != nullptr && trx_preserve_xid_should_be_protected(*xid)) {
+    return (XAER_NOTA);
+  }
+
   trx_t *trx = trx_get_trx_by_xid(xid);
 
   if (trx != nullptr) {
@@ -19272,6 +19329,10 @@ static xa_status_code innobase_rollback_by_xid(
                       identification */
 {
   DBUG_ASSERT(hton == innodb_hton_ptr);
+
+  if (xid != nullptr && trx_preserve_xid_should_be_protected(*xid)) {
+    return (XAER_NOTA);
+  }
 
   trx_t *trx = trx_get_trx_by_xid(xid);
 

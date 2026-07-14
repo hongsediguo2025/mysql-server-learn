@@ -1,0 +1,45 @@
+DROP TABLE IF EXISTS t_preserve_sigterm_finalize;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_preserve_sigterm_finalize(a INT PRIMARY KEY, b INT)
+ENGINE=InnoDB;
+INSERT INTO t_preserve_sigterm_finalize VALUES(1,10);
+SET DEBUG_SYNC =
+'preserve_trx_finalize_token_delivery SIGNAL token_finalize_pending WAIT_FOR continue_token_finalize';
+START TRANSACTION;
+UPDATE t_preserve_sigterm_finalize SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET DEBUG_SYNC = 'now WAIT_FOR token_finalize_pending TIMEOUT 10';
+SELECT 1 AS server_alive_after_deferred_sigterm;
+server_alive_after_deferred_sigterm
+1
+SET DEBUG_SYNC = 'now SIGNAL continue_token_finalize';
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ROLLBACK;
+SELECT * FROM t_preserve_sigterm_finalize ORDER BY a;
+a	b
+1	10
+DROP TABLE t_preserve_sigterm_finalize;
+DROP TABLE IF EXISTS t_preserve_sigterm_rollback;
+CREATE TABLE t_preserve_sigterm_rollback(a INT PRIMARY KEY, b INT)
+ENGINE=InnoDB;
+INSERT INTO t_preserve_sigterm_rollback VALUES(1,10);
+SET DEBUG_SYNC =
+'preserve_trx_after_token_delivery_pending SIGNAL sigterm_rollback_pending WAIT_FOR continue_sigterm_rollback_pending';
+START TRANSACTION;
+UPDATE t_preserve_sigterm_rollback SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET DEBUG_SYNC = 'now WAIT_FOR sigterm_rollback_pending TIMEOUT 10';
+SELECT 1 AS server_alive_after_deferred_sigterm_rollback;
+server_alive_after_deferred_sigterm_rollback
+1
+KILL CONNECTION CONN_ID;
+ERROR HY000: Lost connection to MySQL server during query
+SELECT COUNT(*) AS preserved_count_after_deferred_sigterm_rollback
+FROM performance_schema.preserved_transactions;
+preserved_count_after_deferred_sigterm_rollback
+0
+SELECT * FROM t_preserve_sigterm_rollback ORDER BY a;
+a	b
+1	10
+DROP TABLE t_preserve_sigterm_rollback;
+SET GLOBAL preserve_trx_enable=ON;

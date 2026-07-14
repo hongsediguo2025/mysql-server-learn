@@ -1,0 +1,63 @@
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_preserve_kill_after_undo_binlog;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_preserve_kill_after_undo_binlog(a INT PRIMARY KEY, b INT)
+  ENGINE=InnoDB;
+INSERT INTO t_preserve_kill_after_undo_binlog VALUES(1,10);
+RESET MASTER;
+
+--connect(preserve_kill_after_undo_binlog,localhost,root,,test)
+--connection preserve_kill_after_undo_binlog
+--let $preserve_conn_id= `SELECT CONNECTION_ID()`
+SET DEBUG_SYNC =
+  'preserve_trx_after_undo_prepared_before_kill_check SIGNAL after_undo_prepared WAIT_FOR continue_after_undo_prepared';
+START TRANSACTION;
+UPDATE t_preserve_kill_after_undo_binlog SET b=11 WHERE a=1;
+--send PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300
+
+--connection default
+# Let preserve progress through the active-session drain before the control
+# connection waits for the post-prepare kill window.
+--sleep 2
+SET DEBUG_SYNC = 'now WAIT_FOR after_undo_prepared TIMEOUT 10';
+--replace_result $preserve_conn_id CONN_ID
+--eval KILL CONNECTION $preserve_conn_id
+SET DEBUG_SYNC = 'now SIGNAL continue_after_undo_prepared';
+
+--connection preserve_kill_after_undo_binlog
+--error 2013
+--reap
+--disconnect preserve_kill_after_undo_binlog
+
+--connection default
+SELECT * FROM t_preserve_kill_after_undo_binlog WHERE a=1;
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+START TRANSACTION;
+UPDATE t_preserve_kill_after_undo_binlog SET b=12 WHERE a=1;
+COMMIT;
+SELECT * FROM t_preserve_kill_after_undo_binlog WHERE a=1;
+
+--let $binlog_file= query_get_value(SHOW MASTER STATUS, File, 1)
+--exec $MYSQL_BINLOG --force-if-open --base64-output=decode-rows -v -v $MYSQLTEST_VARDIR/mysqld.1/data/$binlog_file > $MYSQLTEST_VARDIR/tmp/kill_after_undo_binlog_cleanup.mysqlbinlog
+--let $assert_text= New transaction remains in binlog after post-prepare kill cleanup
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/kill_after_undo_binlog_cleanup.mysqlbinlog
+--let $assert_select= @2=12
+--let $assert_count_condition= >= 1
+--source include/assert_grep.inc
+--let $assert_text= Killed post-prepare preserve transaction is discarded from binlog cache
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/kill_after_undo_binlog_cleanup.mysqlbinlog
+--let $assert_select= @2=11
+--let $assert_count_condition= == 0
+--source include/assert_grep.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/kill_after_undo_binlog_cleanup.mysqlbinlog
+
+DROP TABLE t_preserve_kill_after_undo_binlog;
+SET GLOBAL preserve_trx_enable=ON;

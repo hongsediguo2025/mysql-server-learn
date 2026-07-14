@@ -1,0 +1,20 @@
+SET GLOBAL preserve_trx_enable=ON;
+# restart: --preserve-trx-enable=ON
+preserve path is directory symlink
+Pattern "preserve_trx_enable=ON requires valid snapshot support" found
+# restart: --preserve-trx-enable=ON
+key malformed
+Pattern "preserve_trx_enable=ON requires valid snapshot support" found
+# restart: --preserve-trx-enable=ON
+preserve path is file
+Pattern "preserve_trx_enable=ON requires valid snapshot support" found
+# restart: --preserve-trx-enable=ON
+preserve key inaccessible
+Pattern "preserve_trx_enable=ON requires valid snapshot support" found
+# restart: --preserve-trx-enable=ON
+preserve path is dangling symlink
+Pattern "preserve_trx_enable=ON requires valid snapshot support" found
+# restart: --preserve-trx-enable=ON
+preserve key is dangling symlink
+Pattern "preserve_trx_enable=ON requires valid snapshot support" found
+# restart: --preserve-trx-enable=ON

@@ -1,0 +1,68 @@
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_snapshot_header_corrupt_matrix;
+--enable_warnings
+
+--disable_query_log
+CALL mtr.add_suppression("Preserved transaction .* recovery deferred cleanup: corrupt durable transaction snapshot");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: unsupported durable transaction snapshot");
+--enable_query_log
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_snapshot_header_corrupt_matrix(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_snapshot_header_corrupt_matrix VALUES(1,10);
+
+--let $snapshot_corrupt_label= magic
+--let $corrupt_offset= 0
+--source suite/preserve_trx/include/snapshot_header_corrupt_failclosed_once.inc
+
+--let $snapshot_corrupt_label= format version
+--let $corrupt_offset= 8
+--source suite/preserve_trx/include/snapshot_header_corrupt_failclosed_once.inc
+
+--let $snapshot_corrupt_label= header size
+--let $corrupt_offset= 10
+--source suite/preserve_trx/include/snapshot_header_corrupt_failclosed_once.inc
+
+--let $snapshot_corrupt_label= mysql version id
+--let $corrupt_offset= 12
+--source suite/preserve_trx/include/snapshot_header_corrupt_failclosed_once.inc
+
+--let $snapshot_corrupt_label= payload size
+--let $corrupt_offset= 48
+--source suite/preserve_trx/include/snapshot_header_corrupt_failclosed_once.inc
+
+--let $snapshot_corrupt_label= server uuid
+--let $corrupt_offset= 64
+--source suite/preserve_trx/include/snapshot_header_corrupt_failclosed_once.inc
+
+--let $snapshot_corrupt_label= datadir fingerprint
+--let $corrupt_offset= 100
+--source suite/preserve_trx/include/snapshot_header_corrupt_failclosed_once.inc
+
+--let $snapshot_corrupt_label= hmac
+--let $corrupt_offset= 516
+--source suite/preserve_trx/include/snapshot_header_corrupt_failclosed_once.inc
+
+--let $snapshot_corrupt_label= crc
+--let $corrupt_offset= 548
+--source suite/preserve_trx/include/snapshot_header_corrupt_failclosed_once.inc
+
+--let $snapshot_corrupt_label= first tlv byte
+--let $corrupt_offset= 552
+--source suite/preserve_trx/include/snapshot_header_corrupt_failclosed_once.inc
+
+SELECT * FROM t_snapshot_header_corrupt_matrix ORDER BY id;
+
+DROP TABLE t_snapshot_header_corrupt_matrix;
+SET GLOBAL preserve_trx_enable=ON;

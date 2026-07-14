@@ -1,0 +1,15 @@
+DROP TABLE IF EXISTS t_preserve_open_cursor;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_preserve_open_cursor(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_preserve_open_cursor VALUES(1,10),(2,20),(3,30);
+include/wait_for_pattern_in_file.inc [preserve_error_code=4013]
+preserve_error_code=4013
+preserve_error_message=Resumable transactions across shutdown do not support this operation
+preserve_rejects_open_server_cursor_done
+SELECT * FROM t_preserve_open_cursor ORDER BY id;
+id	v
+1	10
+2	20
+3	30
+DROP TABLE t_preserve_open_cursor;
+SET GLOBAL preserve_trx_enable=ON;

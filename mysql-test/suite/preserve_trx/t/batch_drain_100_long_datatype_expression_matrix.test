@@ -1,0 +1,595 @@
+--source include/big_test.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $setup_file = File::Spec->catfile($vardir, 'tmp',
+                                     'batch_long_type_setup.inc');
+my $apps_file = File::Spec->catfile($vardir, 'tmp',
+                                    'batch_long_type_apps.inc');
+my $post_apps_file = File::Spec->catfile($vardir, 'tmp',
+                                         'batch_long_type_post_apps.inc');
+my $cleanup_file = File::Spec->catfile($vardir, 'tmp',
+                                       'batch_long_type_cleanup.inc');
+my $verify_file = File::Spec->catfile($vardir, 'tmp',
+                                      'batch_long_type_verify.inc');
+
+open(my $setup, '>', $setup_file)
+  or die "cannot open $setup_file for write: $!";
+open(my $apps, '>', $apps_file)
+  or die "cannot open $apps_file for write: $!";
+open(my $post_apps, '>', $post_apps_file)
+  or die "cannot open $post_apps_file for write: $!";
+open(my $cleanup, '>', $cleanup_file)
+  or die "cannot open $cleanup_file for write: $!";
+open(my $verify, '>', $verify_file)
+  or die "cannot open $verify_file for write: $!";
+
+print $cleanup <<'SQL';
+DROP PROCEDURE IF EXISTS p_batch_long_finalize;
+DROP TABLE IF EXISTS t_batch_long_tokens;
+DROP TABLE IF EXISTS t_type_side;
+DROP TABLE IF EXISTS t_type_lookup;
+DROP TABLE IF EXISTS t_type_base;
+DROP TABLE IF EXISTS t_batch_long_audit;
+DROP TABLE IF EXISTS t_batch_long_control;
+SQL
+
+print $setup <<'SQL';
+CREATE TABLE t_batch_long_control(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  started_at DATETIME(6) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE t_batch_long_audit(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  lifecycle_age_us BIGINT UNSIGNED NOT NULL,
+  max_stmt_us BIGINT UNSIGNED NOT NULL,
+  sql_count INT UNSIGNED NOT NULL,
+  resumed_ok TINYINT NOT NULL,
+  detail VARCHAR(255) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE t_batch_long_tokens(
+  token_id INT PRIMARY KEY AUTO_INCREMENT,
+  token VARCHAR(255) NOT NULL UNIQUE
+) ENGINE=InnoDB;
+CREATE TABLE t_type_base(
+  sid INT NOT NULL,
+  k INT NOT NULL,
+  i BIGINT,
+  d DECIMAL(20,6),
+  vc VARCHAR(128),
+  txt TEXT,
+  b VARBINARY(64),
+  day_col DATE,
+  ts_col TIMESTAMP NULL DEFAULT NULL,
+  nullable_col INT NULL,
+  PRIMARY KEY(sid, k),
+  KEY idx_sid_vc(sid, vc),
+  KEY idx_sid_day(sid, day_col)
+) ENGINE=InnoDB;
+CREATE TABLE t_type_lookup(
+  sid INT NOT NULL,
+  lk INT NOT NULL,
+  dec_factor DECIMAL(10,6) NOT NULL,
+  vc_suffix VARCHAR(32) NOT NULL,
+  day_shift INT NOT NULL,
+  i_delta INT NOT NULL,
+  PRIMARY KEY(sid, lk)
+) ENGINE=InnoDB;
+CREATE TABLE t_type_side(
+  sid INT NOT NULL,
+  case_id INT NOT NULL,
+  calc BIGINT NOT NULL,
+  note VARCHAR(128) NOT NULL,
+  PRIMARY KEY(sid, case_id)
+) ENGINE=InnoDB;
+SQL
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  print $setup "INSERT INTO t_batch_long_control " .
+               "VALUES($sid, $case_id, TIMESTAMP'2000-01-01 00:00:00.000000');\n";
+  for my $k (0 .. 20) {
+    my $i = $sid * 1000 + $k;
+    my $d = sprintf("%d.%06d", $sid, $k);
+    my $day = sprintf("DATE_ADD(DATE '2026-05-17', INTERVAL %d DAY)", $k);
+    my $hex = sprintf("%016X", $sid * 100 + $k);
+    print $setup "INSERT INTO t_type_base VALUES(" .
+                 "$sid, $k, $i, $d, " .
+                 "CONCAT('seed-', $sid, '-$k'), " .
+                 "CONCAT('tiny-', $sid, '-$k'), " .
+                 "UNHEX('$hex'), $day, NULL, $k);\n";
+  }
+  my $day_shift = $sid % 7;
+  print $setup "INSERT INTO t_type_lookup VALUES(" .
+               "$sid, 1, 1.500000, CONCAT('-lk-', $sid), " .
+               "$day_shift, " . ($sid + 33) . ");\n";
+}
+
+print $setup <<'SQL';
+DELIMITER |;
+CREATE PROCEDURE p_batch_long_finalize()
+BEGIN
+  DECLARE post_ok TINYINT DEFAULT 0;
+  DECLARE detail_value VARCHAR(255) DEFAULT NULL;
+  DECLARE failure_message VARCHAR(255) DEFAULT NULL;
+
+  IF @batch_long_sid IS NULL OR @batch_long_case_id IS NULL THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'missing restored batch long user vars';
+  END IF;
+  IF COALESCE(@type_pre_ok, 0) <> 1 THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'pre-drain datatype check was not restored';
+  END IF;
+
+  IF @batch_long_case_id = 1 THEN
+    UPDATE t_type_base
+       SET i = i + 7
+     WHERE sid = @batch_long_sid AND k = 1;
+    SELECT i = 900000000000000000 + @batch_long_sid + 17
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 1;
+    SET detail_value = 'bigint-arithmetic';
+  ELSEIF @batch_long_case_id = 2 THEN
+    UPDATE t_type_base
+       SET d = d + 0.000001
+     WHERE sid = @batch_long_sid AND k = 2;
+    SELECT d = CAST(@batch_long_sid AS DECIMAL(20,6)) * 1.500000 + 1.250001
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 2;
+    SET detail_value = 'decimal-arithmetic';
+  ELSEIF @batch_long_case_id = 3 THEN
+    UPDATE t_type_base
+       SET vc = CONCAT(vc, '-post')
+     WHERE sid = @batch_long_sid AND k = 3;
+    SELECT vc = CONCAT('seed-', @batch_long_sid, '-3-pre-', @batch_long_sid,
+                       '-post')
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 3;
+    SET detail_value = 'varchar-concat';
+  ELSEIF @batch_long_case_id = 4 THEN
+    UPDATE t_type_base
+       SET txt = CONCAT(txt, '-post')
+     WHERE sid = @batch_long_sid AND k = 4;
+    SELECT txt = CONCAT('text-small-', @batch_long_sid, '-xxxxxxxxxxxxxxxxxxxx',
+                        '-post')
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 4;
+    SET detail_value = 'small-text-update';
+  ELSEIF @batch_long_case_id = 5 THEN
+    UPDATE t_type_base
+       SET b = UNHEX(CONCAT(HEX(b), '01'))
+     WHERE sid = @batch_long_sid AND k = 5;
+    SELECT HEX(b) = CONCAT('CAFE', LPAD(HEX(@batch_long_sid), 4, '0'),
+                           'BEEF01')
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 5;
+    SET detail_value = 'varbinary-hex';
+  ELSEIF @batch_long_case_id = 6 THEN
+    UPDATE t_type_base
+       SET day_col = DATE_ADD(day_col, INTERVAL 1 DAY)
+     WHERE sid = @batch_long_sid AND k = 6;
+    SELECT day_col = DATE '2026-05-30'
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 6;
+    SET detail_value = 'date-arithmetic';
+  ELSEIF @batch_long_case_id = 7 THEN
+    UPDATE t_type_base
+       SET ts_col = ts_col + INTERVAL 1 HOUR
+     WHERE sid = @batch_long_sid AND k = 7;
+    SELECT @@time_zone = '+00:00'
+           AND ts_col = TIMESTAMP'2026-05-17 13:00:00'
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 7;
+    SET detail_value = 'timestamp-time-zone';
+  ELSEIF @batch_long_case_id = 8 THEN
+    UPDATE t_type_base
+       SET vc = 'null-set'
+     WHERE sid = @batch_long_sid AND k = 8;
+    SELECT nullable_col IS NULL AND vc = 'null-set'
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 8;
+    SET detail_value = 'null-set';
+  ELSEIF @batch_long_case_id = 9 THEN
+    UPDATE t_type_base
+       SET nullable_col = COALESCE(nullable_col, 9)
+     WHERE sid = @batch_long_sid AND k = 9;
+    SELECT i = @batch_long_sid + 900 AND nullable_col = 9
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 9;
+    SET detail_value = 'null-coalesce';
+  ELSEIF @batch_long_case_id = 10 THEN
+    UPDATE t_type_base
+       SET i = i + 10,
+           vc = CONCAT(vc, '-post')
+     WHERE sid = @batch_long_sid AND k = 10;
+    SELECT i = CASE WHEN MOD(@batch_long_sid DIV 20, 2) = 0
+                    THEN 110 ELSE 210 END
+           AND vc = 'case-when-post'
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 10;
+    SET detail_value = 'case-when';
+  ELSEIF @batch_long_case_id = 11 THEN
+    UPDATE t_type_base
+       SET i = i + 1
+     WHERE sid = @batch_long_sid AND k = 11;
+    SELECT i = @batch_long_sid + 1101
+           AND d = CAST(CONCAT(@batch_long_sid, '.125000') AS DECIMAL(20,6))
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 11;
+    SET detail_value = 'cast-expression';
+  ELSEIF @batch_long_case_id = 12 THEN
+    UPDATE t_type_base
+       SET vc = CONCAT(vc, '-post')
+     WHERE sid = @batch_long_sid AND k = 12;
+    SELECT @@collation_connection = 'utf8mb4_0900_ai_ci'
+           AND vc = 'collation-ci-post'
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 12;
+    SET detail_value = 'collation-compare';
+  ELSEIF @batch_long_case_id = 13 THEN
+    UPDATE t_type_base
+       SET vc = CONCAT(vc, '-post')
+     WHERE sid = @batch_long_sid AND k = 13;
+    SELECT vc = CONCAT('like-hit-', @batch_long_sid, '-post')
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 13;
+    SET detail_value = 'like-predicate';
+  ELSEIF @batch_long_case_id = 14 THEN
+    UPDATE t_type_base
+       SET day_col = DATE_ADD(day_col, INTERVAL 1 DAY),
+           vc = 'between-date-post'
+     WHERE sid = @batch_long_sid AND k = 14;
+    SELECT day_col = DATE_ADD(DATE '2026-05-31',
+                              INTERVAL (MOD(@batch_long_sid, 7) + 1) DAY)
+           AND vc = 'between-date-post'
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 14;
+    SET detail_value = 'between-date';
+  ELSEIF @batch_long_case_id = 15 THEN
+    UPDATE t_type_base
+       SET vc = CONCAT(vc, '-post')
+     WHERE sid = @batch_long_sid AND k = 15;
+    SELECT vc = 'in-list-post'
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 15;
+    SET detail_value = 'in-list';
+  ELSEIF @batch_long_case_id = 16 THEN
+    UPDATE t_type_base
+       SET d = d + 0.000001
+     WHERE sid = @batch_long_sid AND k = 16;
+    SELECT i = @batch_long_sid * 1000 + 1600
+           AND d = 16.160001
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 16;
+    SET detail_value = 'least-greatest';
+  ELSEIF @batch_long_case_id = 17 THEN
+    UPDATE t_type_base
+       SET d = d + 0.001000
+     WHERE sid = @batch_long_sid AND k = 17;
+    SELECT d = ROUND(CAST(@batch_long_sid AS DECIMAL(20,6)) / 7, 3) + 0.001000
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 17;
+    SET detail_value = 'round-decimal';
+  ELSEIF @batch_long_case_id = 18 THEN
+    UPDATE t_type_base
+       SET nullable_col = IFNULL(nullable_col, 18)
+     WHERE sid = @batch_long_sid AND k = 18;
+    SELECT i = @batch_long_sid + 1800 AND nullable_col = 18
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 18;
+    SET detail_value = 'ifnull-nullable';
+  ELSEIF @batch_long_case_id = 19 THEN
+    UPDATE t_type_base
+       SET vc = 'expr-post'
+     WHERE sid = @batch_long_sid AND k = 19;
+    SELECT s.note = @type_expr_result AND b.vc = 'expr-post'
+      INTO post_ok
+      FROM t_type_base b JOIN t_type_side s
+        ON s.sid = b.sid AND s.case_id = 19
+     WHERE b.sid = @batch_long_sid AND b.k = 19;
+    SET detail_value = 'select-expression';
+  ELSEIF @batch_long_case_id = 20 THEN
+    UPDATE t_type_base
+       SET i = i + 1,
+           d = d + 0.000001,
+           vc = CONCAT(vc, '-post'),
+           txt = CONCAT(txt, '-post'),
+           nullable_col = IFNULL(nullable_col, 0) + 1
+     WHERE sid = @batch_long_sid AND k = 20;
+    SELECT i = @batch_long_sid * 10000 + 21
+           AND d = @batch_long_sid + 20.200001
+           AND vc = CONCAT('mixed-', @batch_long_sid, '-post')
+           AND txt = CONCAT('mixed-text-', @batch_long_sid, '-post')
+           AND HEX(b) = CONCAT('D00D', LPAD(HEX(@batch_long_sid), 4, '0'))
+           AND day_col = DATE '2026-06-20'
+           AND nullable_col = 21
+      INTO post_ok FROM t_type_base
+     WHERE sid = @batch_long_sid AND k = 20;
+    SET detail_value = 'mixed-type-update';
+  END IF;
+
+  IF COALESCE(post_ok, 0) <> 1 THEN
+    SET failure_message = CONCAT(
+      'post-resume datatype check failed sid=',
+      COALESCE(CAST(@batch_long_sid AS CHAR), 'NULL'),
+      ' case=',
+      COALESCE(CAST(@batch_long_case_id AS CHAR), 'NULL'),
+      ' detail=',
+      COALESCE(detail_value, 'NULL'),
+      ' post_ok=',
+      COALESCE(CAST(post_ok AS CHAR), 'NULL'));
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = failure_message;
+  END IF;
+
+  SET @batch_long_end_action = 'COMMIT';
+  INSERT INTO t_batch_long_audit VALUES(
+    @batch_long_sid,
+    @batch_long_case_id,
+    TIMESTAMPDIFF(MICROSECOND, @batch_long_started_at, UTC_TIMESTAMP(6)),
+    @batch_long_max_stmt_us,
+    @batch_long_sql_count,
+    1,
+    detail_value);
+END|
+DELIMITER ;|
+SQL
+
+print $verify <<'SQL';
+SELECT COUNT(DISTINCT detail) AS datatype_cases_ok
+  FROM t_batch_long_audit WHERE resumed_ok = 1;
+SELECT detail, COUNT(*) = 5 AS ok
+  FROM t_batch_long_audit GROUP BY detail ORDER BY detail;
+SELECT COUNT(*) = 0 AS small_text_binary_guard_ok
+  FROM t_type_base
+ WHERE CHAR_LENGTH(txt) > 128 OR OCTET_LENGTH(b) > 16;
+--disable_query_log
+SET @batch_type_old_time_zone = @@time_zone;
+SET time_zone = '+00:00';
+--enable_query_log
+SELECT 1 AS case_id,
+       COUNT(*) = 5 AS ok
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 1 AND b.k = 1
+   AND b.i = 900000000000000000 + b.sid + 17
+UNION ALL SELECT 2, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 2 AND b.k = 2
+   AND b.d = CAST(b.sid AS DECIMAL(20,6)) * 1.500000 + 1.250001
+UNION ALL SELECT 3, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 3 AND b.k = 3
+   AND b.vc = CONCAT('seed-', b.sid, '-3-pre-', b.sid, '-post')
+UNION ALL SELECT 4, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 4 AND b.k = 4
+   AND b.txt = CONCAT('text-small-', b.sid, '-xxxxxxxxxxxxxxxxxxxx-post')
+UNION ALL SELECT 5, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 5 AND b.k = 5
+   AND HEX(b.b) = CONCAT('CAFE', LPAD(HEX(b.sid), 4, '0'), 'BEEF01')
+UNION ALL SELECT 6, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 6 AND b.k = 6
+   AND b.day_col = DATE '2026-05-30'
+UNION ALL SELECT 7, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 7 AND b.k = 7
+   AND b.ts_col = TIMESTAMP'2026-05-17 13:00:00'
+UNION ALL SELECT 8, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 8 AND b.k = 8
+   AND b.nullable_col IS NULL AND b.vc = 'null-set'
+UNION ALL SELECT 9, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 9 AND b.k = 9
+   AND b.i = b.sid + 900 AND b.nullable_col = 9
+UNION ALL SELECT 10, COUNT(*) = 5
+ FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 10 AND b.k = 10
+   AND b.i = CASE WHEN MOD(b.sid DIV 20, 2) = 0 THEN 110 ELSE 210 END
+   AND b.vc = 'case-when-post'
+UNION ALL SELECT 11, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 11 AND b.k = 11
+   AND b.i = b.sid + 1101
+   AND b.d = CAST(CONCAT(b.sid, '.125000') AS DECIMAL(20,6))
+UNION ALL SELECT 12, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 12 AND b.k = 12
+   AND b.vc = 'collation-ci-post'
+UNION ALL SELECT 13, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 13 AND b.k = 13
+   AND b.vc = CONCAT('like-hit-', b.sid, '-post')
+UNION ALL SELECT 14, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 14 AND b.k = 14
+   AND b.day_col = DATE_ADD(DATE '2026-05-31',
+                            INTERVAL (MOD(b.sid, 7) + 1) DAY)
+   AND b.vc = 'between-date-post'
+UNION ALL SELECT 15, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 15 AND b.k = 15
+   AND b.vc = 'in-list-post'
+UNION ALL SELECT 16, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 16 AND b.k = 16
+   AND b.i = b.sid * 1000 + 1600
+   AND b.d = 16.160001
+UNION ALL SELECT 17, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 17 AND b.k = 17
+   AND b.d = ROUND(CAST(b.sid AS DECIMAL(20,6)) / 7, 3) + 0.001000
+UNION ALL SELECT 18, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 18 AND b.k = 18
+   AND b.i = b.sid + 1800 AND b.nullable_col = 18
+UNION ALL SELECT 19, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+  JOIN t_type_side s ON s.sid = b.sid AND s.case_id = 19
+ WHERE c.case_id = 19 AND b.k = 19
+   AND b.vc = 'expr-post'
+   AND s.note = CONCAT('seed-', b.sid, '-19:', b.sid * 2000 + 38)
+UNION ALL SELECT 20, COUNT(*) = 5
+  FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 20 AND b.k = 20
+   AND b.i = b.sid * 10000 + 21
+   AND b.d = b.sid + 20.200001
+   AND b.vc = CONCAT('mixed-', b.sid, '-post')
+   AND b.txt = CONCAT('mixed-text-', b.sid, '-post')
+   AND HEX(b.b) = CONCAT('D00D', LPAD(HEX(b.sid), 4, '0'))
+   AND b.day_col = DATE '2026-06-20'
+   AND b.nullable_col = 21
+ORDER BY case_id;
+--disable_query_log
+SET time_zone = @batch_type_old_time_zone;
+--enable_query_log
+SQL
+
+sub emit_measured {
+  my ($fh, $sql) = @_;
+  print $fh "SET \@batch_long_stmt_start = NOW(6);\n";
+  print $fh "$sql;\n";
+  print $fh "SET \@batch_long_stmt_us = " .
+            "TIMESTAMPDIFF(MICROSECOND, \@batch_long_stmt_start, NOW(6));\n";
+  print $fh "SET \@batch_long_max_stmt_us = " .
+            "GREATEST(\@batch_long_max_stmt_us, \@batch_long_stmt_us);\n";
+  print $fh "SET \@batch_long_sql_count = \@batch_long_sql_count + 1;\n";
+}
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  my $name = sprintf("batch_long_app_%03d", $sid);
+  print $apps "--connect($name,localhost,root,,test)\n";
+  print $apps "--connection $name\n";
+  print $apps "UPDATE t_batch_long_control SET started_at = NOW(6) WHERE sid = $sid;\n";
+  print $apps "SET \@batch_long_sid = $sid;\n";
+  print $apps "SET \@batch_long_case_id = $case_id;\n";
+  print $apps "SET \@batch_long_started_at = UTC_TIMESTAMP(6);\n";
+  print $apps "SET \@batch_long_max_stmt_us = 0;\n";
+  print $apps "SET \@batch_long_sql_count = 0;\n";
+  print $apps "SET \@batch_long_end_action = 'COMMIT';\n";
+  print $apps "SET \@type_pre_ok = 0;\n";
+  print $apps "SET \@type_expr_result = NULL;\n";
+  if ($case_id == 7) {
+    print $apps "SET SESSION time_zone = '+00:00';\n";
+  } elsif ($case_id == 12) {
+    print $apps "SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;\n";
+  }
+  print $apps "START TRANSACTION;\n";
+  emit_measured($apps, "UPDATE t_type_base SET i = i + 1 WHERE sid = $sid AND k = 0");
+
+  if ($case_id == 1) {
+    emit_measured($apps, "UPDATE t_type_base SET i = 900000000000000000 + $sid + 10 WHERE sid = $sid AND k = 1");
+    emit_measured($apps, "SELECT i = 900000000000000000 + $sid + 10 INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 1");
+  } elsif ($case_id == 2) {
+    emit_measured($apps, "UPDATE t_type_base b JOIN t_type_lookup l USING(sid) SET b.d = CAST($sid AS DECIMAL(20,6)) * l.dec_factor + 1.250000 WHERE b.sid = $sid AND b.k = 2 AND l.lk = 1");
+    emit_measured($apps, "SELECT d = CAST($sid AS DECIMAL(20,6)) * 1.500000 + 1.250000 INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 2");
+  } elsif ($case_id == 3) {
+    emit_measured($apps, "UPDATE t_type_base SET vc = CONCAT(vc, '-pre-', $sid) WHERE sid = $sid AND k = 3");
+    emit_measured($apps, "SELECT vc = CONCAT('seed-', $sid, '-3-pre-', $sid) INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 3");
+  } elsif ($case_id == 4) {
+    emit_measured($apps, "UPDATE t_type_base SET txt = CONCAT('text-small-', $sid, '-', REPEAT('x', 20)) WHERE sid = $sid AND k = 4");
+    emit_measured($apps, "SELECT txt = CONCAT('text-small-', $sid, '-xxxxxxxxxxxxxxxxxxxx') INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 4");
+  } elsif ($case_id == 5) {
+    emit_measured($apps, "UPDATE t_type_base SET b = UNHEX(CONCAT('CAFE', LPAD(HEX($sid), 4, '0'), 'BEEF')) WHERE sid = $sid AND k = 5");
+    emit_measured($apps, "SELECT HEX(b) = CONCAT('CAFE', LPAD(HEX($sid), 4, '0'), 'BEEF') INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 5");
+  } elsif ($case_id == 6) {
+    emit_measured($apps, "UPDATE t_type_base SET day_col = DATE_ADD(day_col, INTERVAL 6 DAY) WHERE sid = $sid AND k = 6");
+    emit_measured($apps, "SELECT day_col = DATE '2026-05-29' INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 6");
+  } elsif ($case_id == 7) {
+    emit_measured($apps, "UPDATE t_type_base SET ts_col = TIMESTAMP'2026-05-17 12:00:00' WHERE sid = $sid AND k = 7");
+    emit_measured($apps, "SELECT \@\@time_zone = '+00:00' AND ts_col = TIMESTAMP'2026-05-17 12:00:00' INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 7");
+  } elsif ($case_id == 8) {
+    emit_measured($apps, "UPDATE t_type_base SET nullable_col = NULL WHERE sid = $sid AND k = 8");
+    emit_measured($apps, "SELECT nullable_col IS NULL INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 8");
+  } elsif ($case_id == 9) {
+    emit_measured($apps, "UPDATE t_type_base SET nullable_col = NULL, i = COALESCE(nullable_col, $sid + 900) WHERE sid = $sid AND k = 9");
+    emit_measured($apps, "SELECT i = $sid + 900 AND nullable_col IS NULL INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 9");
+  } elsif ($case_id == 10) {
+    my $case_value = (int($sid / 20) % 2) == 0 ? 100 : 200;
+    emit_measured($apps, "UPDATE t_type_base SET i = CASE WHEN MOD(sid DIV 20, 2) = 0 THEN 100 ELSE 200 END, vc = 'case-when' WHERE sid = $sid AND k = 10");
+    emit_measured($apps, "SELECT i = $case_value AND vc = 'case-when' INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 10");
+  } elsif ($case_id == 11) {
+    emit_measured($apps, "UPDATE t_type_base SET i = CAST(CONCAT($sid) AS SIGNED) + 1100, d = CAST(CONCAT($sid, '.125000') AS DECIMAL(20,6)) WHERE sid = $sid AND k = 11");
+    emit_measured($apps, "SELECT i = $sid + 1100 AND d = CAST(CONCAT($sid, '.125000') AS DECIMAL(20,6)) INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 11");
+  } elsif ($case_id == 12) {
+    emit_measured($apps, "UPDATE t_type_base SET vc = IF('A' = 'a', 'collation-ci', 'collation-cs') WHERE sid = $sid AND k = 12");
+    emit_measured($apps, "SELECT \@\@collation_connection = 'utf8mb4_0900_ai_ci' AND vc = 'collation-ci' INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 12");
+  } elsif ($case_id == 13) {
+    emit_measured($apps, "UPDATE t_type_base SET vc = CONCAT('like-hit-', $sid) WHERE sid = $sid AND k = 13 AND vc LIKE CONCAT('seed-', $sid, '-%')");
+    emit_measured($apps, "SELECT vc = CONCAT('like-hit-', $sid) INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 13");
+  } elsif ($case_id == 14) {
+    emit_measured($apps, "UPDATE t_type_base b JOIN t_type_lookup l USING(sid) SET b.day_col = DATE_ADD(b.day_col, INTERVAL l.day_shift DAY), b.vc = 'between-date' WHERE b.sid = $sid AND b.k = 14 AND l.lk = 1 AND b.day_col BETWEEN DATE '2026-05-17' AND DATE '2026-06-30'");
+    emit_measured($apps, "SELECT vc = 'between-date' INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 14");
+  } elsif ($case_id == 15) {
+    emit_measured($apps, "UPDATE t_type_base SET vc = 'in-list' WHERE sid = $sid AND k IN (15, 115)");
+    emit_measured($apps, "SELECT vc = 'in-list' INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 15");
+  } elsif ($case_id == 16) {
+    emit_measured($apps, "UPDATE t_type_base SET i = GREATEST(i, $sid * 1000 + 1600), d = LEAST(GREATEST(d, 16.160000), 16.160000) WHERE sid = $sid AND k = 16");
+    emit_measured($apps, "SELECT i = $sid * 1000 + 1600 AND d = 16.160000 INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 16");
+  } elsif ($case_id == 17) {
+    emit_measured($apps, "UPDATE t_type_base SET d = ROUND(CAST($sid AS DECIMAL(20,6)) / 7, 3) WHERE sid = $sid AND k = 17");
+    emit_measured($apps, "SELECT d = ROUND(CAST($sid AS DECIMAL(20,6)) / 7, 3) INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 17");
+  } elsif ($case_id == 18) {
+    emit_measured($apps, "UPDATE t_type_base SET nullable_col = NULL, i = IFNULL(nullable_col, $sid + 1800) WHERE sid = $sid AND k = 18");
+    emit_measured($apps, "SELECT i = $sid + 1800 AND nullable_col IS NULL INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 18");
+  } elsif ($case_id == 19) {
+    emit_measured($apps, "SELECT CONCAT(vc, ':', CAST(i + $sid * 1000 + 19 AS CHAR)) INTO \@type_expr_result FROM t_type_base WHERE sid = $sid AND k = 19");
+    emit_measured($apps, "INSERT INTO t_type_side VALUES($sid, 19, $sid * 2000 + 38, \@type_expr_result)");
+    emit_measured($apps, "SELECT note = \@type_expr_result INTO \@type_pre_ok FROM t_type_side WHERE sid = $sid AND case_id = 19");
+  } elsif ($case_id == 20) {
+    emit_measured($apps, "UPDATE t_type_base SET i = $sid * 10000 + 20, d = $sid + 20.200000, vc = CONCAT('mixed-', $sid), txt = CONCAT('mixed-text-', $sid), b = UNHEX(CONCAT('D00D', LPAD(HEX($sid), 4, '0'))), day_col = DATE '2026-06-20', nullable_col = 20 WHERE sid = $sid AND k = 20");
+    emit_measured($apps, "SELECT i = $sid * 10000 + 20 AND vc = CONCAT('mixed-', $sid) INTO \@type_pre_ok FROM t_type_base WHERE sid = $sid AND k = 20");
+  }
+}
+print $apps "--connection default\n";
+
+for my $round (1 .. 80) {
+  for my $sid (1 .. 100) {
+    my $name = sprintf("batch_long_app_%03d", $sid);
+    print $post_apps "--connection $name\n";
+    emit_measured($post_apps, "UPDATE t_type_base SET i = i + 1 WHERE sid = $sid AND k = 0");
+  }
+}
+print $post_apps "--connection default\n";
+
+close($setup);
+close($apps);
+close($post_apps);
+close($cleanup);
+close($verify);
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+SET GLOBAL preserve_trx_recovery_max_count=200;
+--let $old_preserve_trx_drain_grace_ms= `SELECT @@GLOBAL.preserve_trx_drain_grace_ms`
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+
+--let $batch_long_prefix= batch_long_type
+--let $batch_long_setup_file= $MYSQLTEST_VARDIR/tmp/batch_long_type_setup.inc
+--let $batch_long_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_type_apps.inc
+--let $batch_long_post_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_type_post_apps.inc
+--let $batch_long_cleanup_file= $MYSQLTEST_VARDIR/tmp/batch_long_type_cleanup.inc
+--let $batch_long_resume_file= $MYSQLTEST_VARDIR/tmp/batch_long_type_resume.inc
+--let $batch_long_verify_file= $MYSQLTEST_VARDIR/tmp/batch_long_type_verify.inc
+--source suite/preserve_trx/include/batch_drain_100_long_common.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+--disable_query_log
+--disable_result_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_drain_grace_ms=$old_preserve_trx_drain_grace_ms
+--enable_result_log
+--enable_query_log

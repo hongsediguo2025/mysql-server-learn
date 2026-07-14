@@ -1,0 +1,83 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
+
+CREATE TABLE t_two_temp_spaces_commit_base(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+
+--connect(two_temp_commit_app,localhost,root,,test)
+CREATE TEMPORARY TABLE tmp_two_temp_commit_a(
+  id INT PRIMARY KEY,
+  v INT NOT NULL,
+  KEY(v)
+) ENGINE=InnoDB;
+CREATE TEMPORARY TABLE tmp_two_temp_commit_b(
+  id INT PRIMARY KEY,
+  v INT NOT NULL,
+  KEY(v)
+) ENGINE=InnoDB;
+INSERT INTO tmp_two_temp_commit_a VALUES(1, 10), (2, 20);
+INSERT INTO tmp_two_temp_commit_b VALUES(1, 100), (2, 200);
+
+START TRANSACTION;
+UPDATE tmp_two_temp_commit_a SET v = v + 1 WHERE id = 1;
+INSERT INTO tmp_two_temp_commit_a VALUES(3, 30);
+DELETE FROM tmp_two_temp_commit_a WHERE id = 2;
+UPDATE tmp_two_temp_commit_b SET v = v + 10 WHERE id = 1;
+INSERT INTO tmp_two_temp_commit_b VALUES(3, 300);
+DELETE FROM tmp_two_temp_commit_b WHERE id = 2;
+INSERT INTO t_two_temp_spaces_commit_base VALUES(1, 7);
+UPDATE t_two_temp_spaces_commit_base SET v = v + 1 WHERE id = 1;
+
+--connection default
+--let $wait_condition= SELECT COUNT(*) = 1 FROM performance_schema.threads WHERE PROCESSLIST_USER = 'root' AND PROCESSLIST_DB = 'test' AND PROCESSLIST_COMMAND = 'Sleep'
+--source include/wait_condition.inc
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON --preserve-trx-lock-warmcopy-enable=OFF --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+
+SELECT 'a_before_continue' AS phase, COUNT(*) AS rows_seen, SUM(v) AS sum_seen
+  FROM tmp_two_temp_commit_a;
+SELECT 'b_before_continue' AS phase, COUNT(*) AS rows_seen, SUM(v) AS sum_seen
+  FROM tmp_two_temp_commit_b;
+
+INSERT INTO tmp_two_temp_commit_a VALUES(4, 40);
+UPDATE tmp_two_temp_commit_a SET v = v + 100 WHERE id = 1;
+INSERT INTO tmp_two_temp_commit_b VALUES(4, 400);
+UPDATE tmp_two_temp_commit_b SET v = v + 1000 WHERE id = 1;
+COMMIT;
+
+SELECT 'a_after_commit' AS phase, COUNT(*) AS rows_seen, SUM(v) AS sum_seen
+  FROM tmp_two_temp_commit_a;
+SELECT 'b_after_commit' AS phase, COUNT(*) AS rows_seen, SUM(v) AS sum_seen
+  FROM tmp_two_temp_commit_b;
+SELECT COUNT(*) AS base_rows, SUM(v) AS base_sum
+  FROM t_two_temp_spaces_commit_base;
+SELECT COUNT(*) AS preserved_count_after_resume
+  FROM performance_schema.preserved_transactions;
+
+DROP TEMPORARY TABLE tmp_two_temp_commit_a;
+DROP TEMPORARY TABLE tmp_two_temp_commit_b;
+DROP TABLE t_two_temp_spaces_commit_base;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;

@@ -38,24 +38,32 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <algorithm>
 #include <set>
 #include <unordered_map>
-#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "btr0btr.h"
+#include "btr0pcur.h"
+#include "buf0buf.h"
 #include "current_thd.h"
 #include "debug_sync.h" /* CONDITIONAL_SYNC_POINT */
 #include "dict0boot.h"
+#include "dict0dd.h"
 #include "dict0mem.h"
+#include "fil0types.h"
 #include "ha_prototypes.h"
 #include "lock0lock.h"
 #include "lock0priv.h"
+#include "mach0data.h"
+#include "os0thread.h"
 #include "pars0pars.h"
 #include "row0mysql.h"
 #include "row0sel.h"
 #include "srv0mon.h"
 #include "trx0purge.h"
+#include "trx0preserve.h"
 #include "trx0sys.h"
 #include "usr0sess.h"
+#include "ut0bitset.h"
 #include "ut0new.h"
 #include "ut0vec.h"
 
@@ -75,6 +83,9 @@ static const ulint REC_LOCK_SIZE = sizeof(ib_lock_t) + 256;
 
 /** Total number of cached table locks */
 static const ulint TABLE_LOCK_CACHE = 8;
+
+bool lock_warmcopy_capture_record_image_for_lock(
+    const lock_t *lock, const buf_block_t *block, ulint heap_no);
 
 /** Size in bytes, of the table lock instance */
 static const ulint TABLE_LOCK_SIZE = sizeof(ib_lock_t);
@@ -654,6 +665,14 @@ byte lock_rec_reset_nth_bit(lock_t *lock, ulint i) {
   if (bit != 0) {
     ut_ad(lock->trx->lock.n_rec_locks.load() > 0);
     lock->trx->lock.n_rec_locks.fetch_sub(1, std::memory_order_relaxed);
+    if (lock_warmcopy_hooks_enabled()) {
+      /*
+        Preserve hook only mirrors the bitmap mutation; lock ownership above
+        remains the native InnoDB state.
+      */
+      (void)lock_warmcopy_record_bitmap_reset_for_lock(lock,
+                                                       static_cast<uint32_t>(i));
+    }
   }
 
   return (bit);
@@ -888,6 +907,23 @@ static trx_t *lock_sec_rec_some_has_impl(const rec_t *rec, dict_index_t *index,
   }
 
   return (trx);
+}
+
+const lock_t *lock_preserve_record_lock_has_conflict(
+    ulint precise_mode, const buf_block_t *block, ulint heap_no, trx_t *trx) {
+  return lock_rec_other_has_conflicting(precise_mode, block, heap_no, trx);
+}
+
+bool lock_preserve_record_lock_object_has_conflict(
+    ulint precise_mode, const lock_t *lock, bool lock_is_on_supremum,
+    trx_t *trx) {
+  return lock_rec_has_to_wait(trx, precise_mode, lock, lock_is_on_supremum);
+}
+
+trx_t *lock_preserve_secondary_record_implicit_owner(const rec_t *rec,
+                                                    dict_index_t *index,
+                                                    const ulint *offsets) {
+  return lock_sec_rec_some_has_impl(rec, index, offsets);
 }
 
 #ifdef UNIV_DEBUG
@@ -1200,6 +1236,29 @@ lock_t *RecLock::create(trx_t *trx, const lock_prdt_t *prdt) {
   return (lock);
 }
 
+lock_t *RecLock::create_for_preserve_metadata(
+    trx_t *trx, dict_index_t *index, const page_id_t &page_id,
+    uint32_t anchor_heap_no, ulint mode, size_t bitmap_bytes) {
+  ut_ad(trx != nullptr);
+  ut_ad(index != nullptr);
+  ut_ad(bitmap_bytes > 0);
+  ut_ad(anchor_heap_no < bitmap_bytes * 8);
+  ut_ad((mode & (LOCK_WAIT | LOCK_PREDICATE | LOCK_PRDT_PAGE)) == 0);
+  ut_ad(locksys::owns_page_shard(page_id));
+  ut_ad(trx_mutex_own(trx));
+
+  if (anchor_heap_no == PAGE_HEAP_NO_SUPREMUM) {
+    ut_ad((mode & LOCK_REC_NOT_GAP) == 0);
+    mode &= ~(LOCK_GAP | LOCK_REC_NOT_GAP);
+  }
+
+  const RecID rec_id(page_id, anchor_heap_no);
+  RecLock rec_lock(index, rec_id, mode, bitmap_bytes);
+  lock_t *lock = lock_alloc(trx, index, mode, rec_id, bitmap_bytes);
+  rec_lock.lock_add(lock);
+  return lock;
+}
+
 /**
 Collect the transactions that will need to be rolled back asynchronously
 @param[in, out] hit_list    The list of transactions to be rolled back, to which
@@ -1452,6 +1511,10 @@ static void lock_rec_add_to_queue(ulint type_mode, const buf_block_t *block,
               (ULINT_UNDEFINED == lock_rec_find_set_bit(lock)));
 
         lock_rec_set_nth_bit(lock, heap_no);
+        if (lock_warmcopy_hooks_enabled()) {
+          (void)lock_warmcopy_capture_record_image_for_lock(lock, block,
+                                                            heap_no);
+        }
         if (found_waiter_before_lock) {
           lock_rec_move_granted_to_front(lock, RecID{lock, heap_no});
         }
@@ -1465,10 +1528,241 @@ static void lock_rec_add_to_queue(ulint type_mode, const buf_block_t *block,
   if (!we_own_trx_mutex) {
     trx_mutex_enter(trx);
   }
-  rec_lock.create(trx);
+  lock_t *created_lock = rec_lock.create(trx);
+  if (lock_warmcopy_hooks_enabled()) {
+    (void)lock_warmcopy_capture_record_image_for_lock(created_lock, block,
+                                                      heap_no);
+  }
   if (!we_own_trx_mutex) {
     trx_mutex_exit(trx);
   }
+}
+
+void lock_preserve_add_record_lock_for_import(ulint type_mode,
+                                              const buf_block_t *block,
+                                              ulint heap_no,
+                                              dict_index_t *index,
+                                              trx_t *trx) {
+  lock_rec_add_to_queue(type_mode, block, heap_no, index, trx, true);
+}
+
+static bool lock_preserve_record_bitmap_set_bit_count(
+    const byte *bitmap, size_t bitmap_len, uint32_t *set_bit_count) {
+  if (bitmap == nullptr || bitmap_len == 0 || set_bit_count == nullptr) {
+    return false;
+  }
+
+  uint64_t count = 0;
+  for (size_t byte_index = 0; byte_index < bitmap_len; ++byte_index) {
+    byte value = bitmap[byte_index];
+    while (value != 0) {
+      value = static_cast<byte>(value & static_cast<byte>(value - 1));
+      ++count;
+    }
+  }
+  if (count == 0 || count > UINT32_MAX) return false;
+  *set_bit_count = static_cast<uint32_t>(count);
+  return true;
+}
+
+static void lock_rec_dequeue_from_page(lock_t *in_lock);
+
+bool lock_preserve_publish_record_bitmap_for_import(lock_t *lock,
+                                                    const byte *bitmap,
+                                                    size_t bitmap_len) {
+  if (lock == nullptr || lock->trx == nullptr ||
+      lock_get_type_low(lock) != LOCK_REC || bitmap == nullptr ||
+      bitmap_len == 0 || bitmap_len > UINT32_MAX / 8 ||
+      lock_rec_get_n_bits(lock) != bitmap_len * 8) {
+    return false;
+  }
+
+  uint32_t old_set_bits = 0;
+  uint32_t new_set_bits = 0;
+  if (!lock_preserve_record_bitmap_set_bit_count(
+          reinterpret_cast<const byte *>(&lock[1]), bitmap_len,
+          &old_set_bits) ||
+      !lock_preserve_record_bitmap_set_bit_count(bitmap, bitmap_len,
+                                                 &new_set_bits)) {
+    return false;
+  }
+
+  const uint64_t current_count =
+      lock->trx->lock.n_rec_locks.load(std::memory_order_relaxed);
+  if (current_count < old_set_bits) return false;
+
+  memcpy(&lock[1], bitmap, bitmap_len);
+  if (new_set_bits > old_set_bits) {
+    lock->trx->lock.n_rec_locks.fetch_add(new_set_bits - old_set_bits,
+                                          std::memory_order_relaxed);
+  } else if (old_set_bits > new_set_bits) {
+    lock->trx->lock.n_rec_locks.fetch_sub(old_set_bits - new_set_bits,
+                                          std::memory_order_relaxed);
+  }
+  return true;
+}
+
+bool lock_preserve_record_bitmap_accounting_for_unit_test(
+    const byte *bitmap, size_t bitmap_len, uint64_t *count_after_publish,
+    uint64_t *count_after_reset) {
+  if (bitmap == nullptr || bitmap_len == 0 || count_after_publish == nullptr ||
+      count_after_reset == nullptr || bitmap_len > UINT32_MAX / 8) {
+    return false;
+  }
+
+  uint32_t set_bit_count = 0;
+  if (!lock_preserve_record_bitmap_set_bit_count(bitmap, bitmap_len,
+                                                 &set_bit_count)) {
+    return false;
+  }
+  uint32_t anchor_heap_no = 0;
+  while (anchor_heap_no < bitmap_len * 8 &&
+         (bitmap[anchor_heap_no / 8] &
+          static_cast<byte>(1U << (anchor_heap_no % 8))) == 0) {
+    ++anchor_heap_no;
+  }
+
+  std::vector<byte> storage(sizeof(lock_t) + bitmap_len, 0);
+  auto *lock = reinterpret_cast<lock_t *>(storage.data());
+  trx_t trx{};
+  lock->trx = &trx;
+  lock->type_mode = LOCK_REC | LOCK_X;
+  lock->rec_lock.n_bits = static_cast<uint32_t>(bitmap_len * 8);
+  reinterpret_cast<byte *>(&lock[1])[anchor_heap_no / 8] =
+      static_cast<byte>(1U << (anchor_heap_no % 8));
+  trx.lock.n_rec_locks.store(1, std::memory_order_relaxed);
+
+  if (!lock_preserve_publish_record_bitmap_for_import(lock, bitmap,
+                                                      bitmap_len)) {
+    return false;
+  }
+  *count_after_publish =
+      trx.lock.n_rec_locks.load(std::memory_order_relaxed);
+
+  for (uint32_t heap_no = 0; heap_no < bitmap_len * 8; ++heap_no) {
+    if (lock_rec_get_nth_bit(lock, heap_no)) {
+      lock_rec_reset_nth_bit(lock, heap_no);
+    }
+  }
+  *count_after_reset = trx.lock.n_rec_locks.load(std::memory_order_relaxed);
+  return set_bit_count == *count_after_publish;
+}
+
+bool lock_preserve_add_record_bitmap_for_import(ulint type_mode,
+                                                const buf_block_t *block,
+                                                uint32_t n_bits,
+                                                const byte *bitmap,
+                                                size_t bitmap_len,
+                                                uint32_t first_set_heap_no,
+                                                dict_index_t *index,
+                                                trx_t *trx) {
+  if (block == nullptr || bitmap == nullptr || index == nullptr || trx == nullptr ||
+      n_bits == 0 || bitmap_len == 0 || bitmap_len > UINT32_MAX / 8 ||
+      n_bits != static_cast<uint32_t>(bitmap_len * 8) ||
+      first_set_heap_no >= n_bits) {
+    return false;
+  }
+
+  ut_ad(locksys::owns_page_shard(block->get_page_id()));
+  ut_ad(trx_mutex_own(trx));
+  ut_ad(!(type_mode & (LOCK_PREDICATE | LOCK_PRDT_PAGE)));
+
+  const ulint anchor_heap_no = first_set_heap_no;
+  uint32_t imported_set_bits = 0;
+  if ((bitmap[first_set_heap_no / 8] &
+       static_cast<byte>(1U << (first_set_heap_no % 8))) == 0 ||
+      !lock_preserve_record_bitmap_set_bit_count(bitmap, bitmap_len,
+                                                 &imported_set_bits)) {
+    return false;
+  }
+
+  if (anchor_heap_no == PAGE_HEAP_NO_SUPREMUM) {
+    if (type_mode & LOCK_REC_NOT_GAP) {
+      return false;
+    }
+    type_mode &= ~(LOCK_GAP | LOCK_REC_NOT_GAP);
+  }
+
+  const size_t lock_bitmap_bytes =
+      1 + ((page_dir_get_n_heap(block->frame) + LOCK_PAGE_BITMAP_MARGIN) / 8);
+  if (lock_bitmap_bytes > UINT32_MAX / 8 ||
+      static_cast<uint32_t>(lock_bitmap_bytes * 8) != n_bits) {
+    return false;
+  }
+
+  /*
+    Startup recovery has already validated conflicts and record identity for
+    the whole page-level bitmap. Importing the validated bitmap as one lock_t
+    preserves the same queue/hash shape as the runtime path without replaying
+    every set heap bit through lock_rec_add_to_queue().
+  */
+  RecLock rec_lock(index, block, anchor_heap_no, type_mode);
+  lock_t *lock = rec_lock.create(trx);
+  if (lock == nullptr) {
+    return false;
+  }
+  ut_ad(lock_rec_get_n_bits(lock) == n_bits);
+
+  return lock_preserve_publish_record_bitmap_for_import(lock, bitmap,
+                                                        bitmap_len);
+}
+
+lock_t *lock_preserve_add_record_bitmap_from_metadata(
+    ulint type_mode, const page_id_t &page_id, uint32_t n_bits,
+    const byte *bitmap, size_t bitmap_len, uint32_t first_set_heap_no,
+    dict_index_t *index, trx_t *trx) {
+  if (bitmap == nullptr || index == nullptr || trx == nullptr || n_bits == 0 ||
+      bitmap_len == 0 || bitmap_len > UINT32_MAX / 8 ||
+      n_bits != static_cast<uint32_t>(bitmap_len * 8) ||
+      first_set_heap_no >= n_bits ||
+      (type_mode & (LOCK_WAIT | LOCK_PREDICATE | LOCK_PRDT_PAGE)) != 0) {
+    return nullptr;
+  }
+
+  ut_ad(locksys::owns_page_shard(page_id));
+  ut_ad(trx_mutex_own(trx));
+
+  uint32_t imported_set_bits = 0;
+  if ((bitmap[first_set_heap_no / 8] &
+       static_cast<byte>(1U << (first_set_heap_no % 8))) == 0 ||
+      !lock_preserve_record_bitmap_set_bit_count(bitmap, bitmap_len,
+                                                 &imported_set_bits)) {
+    return nullptr;
+  }
+  if (first_set_heap_no == PAGE_HEAP_NO_SUPREMUM &&
+      (type_mode & LOCK_REC_NOT_GAP) != 0) {
+    return nullptr;
+  }
+
+  lock_t *lock = RecLock::create_for_preserve_metadata(
+      trx, index, page_id, first_set_heap_no, type_mode, bitmap_len);
+  if (lock == nullptr) return nullptr;
+
+  if (!lock_preserve_publish_record_bitmap_for_import(lock, bitmap,
+                                                      bitmap_len)) {
+    for (ulint heap_no = lock_rec_find_set_bit(lock);
+         heap_no != ULINT_UNDEFINED;
+         heap_no = lock_rec_find_set_bit(lock)) {
+      lock_rec_reset_nth_bit(lock, heap_no);
+    }
+    lock_rec_dequeue_from_page(lock);
+    return nullptr;
+  }
+  return lock;
+}
+
+void lock_preserve_remove_record_bitmap_from_metadata(lock_t *lock) {
+  ut_ad(lock != nullptr);
+  ut_ad(lock_get_type_low(lock) == LOCK_REC);
+  ut_ad(locksys::owns_page_shard(lock->rec_lock.page_id));
+  ut_ad(trx_mutex_own(lock->trx));
+
+  for (ulint heap_no = lock_rec_find_set_bit(lock);
+       heap_no != ULINT_UNDEFINED;
+       heap_no = lock_rec_find_set_bit(lock)) {
+    lock_rec_reset_nth_bit(lock, heap_no);
+  }
+  lock_rec_dequeue_from_page(lock);
 }
 
 /** This is a fast routine for locking a record in the most common cases:
@@ -1522,7 +1816,11 @@ lock_rec_req_status lock_rec_lock_fast(
       RecLock rec_lock(index, block, heap_no, mode);
 
       trx_mutex_enter(trx);
-      rec_lock.create(trx);
+      lock_t *created_lock = rec_lock.create(trx);
+      if (lock_warmcopy_hooks_enabled()) {
+        (void)lock_warmcopy_capture_record_image_for_lock(created_lock, block,
+                                                          heap_no);
+      }
       trx_mutex_exit(trx);
 
       status = LOCK_REC_SUCCESS_CREATED;
@@ -1540,6 +1838,10 @@ lock_rec_req_status lock_rec_lock_fast(
       set */
       if (!lock_rec_get_nth_bit(lock, heap_no)) {
         lock_rec_set_nth_bit(lock, heap_no);
+        if (lock_warmcopy_hooks_enabled()) {
+          (void)lock_warmcopy_capture_record_image_for_lock(lock, block,
+                                                            heap_no);
+        }
         status = LOCK_REC_SUCCESS_CREATED;
       }
     }
@@ -2245,6 +2547,9 @@ void lock_rec_discard(lock_t *in_lock) {
 
   ut_ad(in_lock->index->table->n_rec_locks.load() > 0);
   in_lock->index->table->n_rec_locks.fetch_sub(1, std::memory_order_relaxed);
+  if (lock_warmcopy_hooks_enabled()) {
+    (void)lock_warmcopy_record_mark_discard_for_lock(in_lock);
+  }
 
   /* We want the state of lock queue and trx_locks list to be synchronized
   atomically from the point of view of people using trx->mutex, so we perform
@@ -3211,6 +3516,12 @@ void lock_rec_restore_from_page_infimum(const buf_block_t *block,
   lock_rec_move(block, donator, heap_no, PAGE_HEAP_NO_INFIMUM);
 }
 
+/* === Preserved transaction: table locks (TLV 0x31) ======================= */
+
+/* Preserve/resume payload import/export implementation lives in
+   lock0preserve.cc.  Keep this file limited to native lock mutations and thin
+   warmcopy/preserve integration points. */
+
 /*========================= TABLE LOCKS ==============================*/
 
 /** Functor for accessing the embedded node within a table lock. */
@@ -3219,6 +3530,9 @@ struct TableLockGetNode {
     return (elem.tab_lock.locks);
   }
 };
+
+UNIV_INLINE const lock_t *lock_table_other_has_incompatible(
+    const trx_t *trx, ulint wait, const dict_table_t *table, lock_mode mode);
 
 /** Creates a table lock object and adds it as the last in the lock queue
  of the table. Does NOT check for deadlocks or lock compatibility.
@@ -3286,6 +3600,32 @@ lock_t *lock_table_create(dict_table_t *table, /*!< in/out: database table
   MONITOR_INC(MONITOR_NUM_TABLELOCK);
 
   return (lock);
+}
+
+
+dberr_t lock_preserve_create_table_lock_for_import(dict_table_t *table,
+                                                   trx_t *trx,
+                                                   lock_mode mode) {
+  if (mode != LOCK_AUTO_INC && lock_table_has(trx, table, mode)) {
+    return DB_SUCCESS;
+  }
+
+  locksys::Shard_latch_guard table_latch_guard{*table};
+
+  /*
+    Bootstrap isolation normally means no other transaction can hold an
+    incompatible table lock. If a valid snapshot still describes an impossible
+    lock graph, fail this token closed instead of aborting the server.
+  */
+  if (lock_table_other_has_incompatible(trx, LOCK_WAIT, table, mode)) {
+    return DB_LOCK_WAIT;
+  }
+
+  trx_mutex_enter(trx);
+  lock_table_create(table, mode, trx);
+  trx_mutex_exit(trx);
+
+  return DB_SUCCESS;
 }
 
 /** Pops autoinc lock requests from the transaction's autoinc_locks. We
@@ -5374,60 +5714,105 @@ dberr_t lock_rec_insert_check_and_lock(
  only has an implicit lock on the record. The transaction instance must have a
  reference count > 0 so that it can't be committed and freed before this
  function has completed. */
-static void lock_rec_convert_impl_to_expl_for_trx(
+static dberr_t lock_rec_convert_impl_to_expl_for_trx(
     const buf_block_t *block, /*!< in: buffer block of rec */
     const rec_t *rec,         /*!< in: user record on page */
     dict_index_t *index,      /*!< in: index of record */
     const ulint *offsets,     /*!< in: rec_get_offsets(rec, index) */
     trx_t *trx,               /*!< in/out: active transaction */
-    ulint heap_no)            /*!< in: rec heap number to lock */
+    ulint heap_no,            /*!< in: rec heap number to lock */
+    bool *converted = nullptr,
+    bool allow_conversion = true,
+    select_mode sel_mode = SELECT_ORDINARY)
 {
   ut_ad(trx_is_referenced(trx));
+  dberr_t err = DB_SUCCESS;
+  if (converted != nullptr) {
+    *converted = false;
+  }
 
   DEBUG_SYNC_C("before_lock_rec_convert_impl_to_expl_for_trx");
-  {
-    locksys::Shard_latch_guard guard{block->get_page_id()};
-    /* This trx->mutex acquisition here is not really needed.
-    Its purpose is to prevent a state transition between calls to trx_state_eq()
-    and lock_rec_add_to_queue().
-    But one can prove, that even if the state did change, it is not
-    a big problem, because we still keep reference count from dropping
-    to zero, so the trx object is still in use, and we hold the shard latched,
-    so trx can not release its explicit lock (if it has any) so we will
-    notice the explicit lock in lock_rec_has_expl.
-    On the other hand if trx does not have explicit lock, then we would create
-    one on its behalf, which is wasteful, but does not cause a problem, as once
-    the reference count drops to zero the trx will notice and remove this new
-    explicit lock. Also, even if some other trx had observed that trx is already
-    removed from rw trxs list and thus ignored the implicit lock and decided to
-    add its own lock, it will still have to wait for shard latch before adding
-    her lock. However it does not cost us much to simply take the trx->mutex
-    and avoid this whole shaky reasoning. */
-    trx_mutex_enter(trx);
 
-    ut_ad(!index->is_clustered() ||
-          trx->id ==
-              lock_clust_rec_some_has_impl(
-                  rec, index,
-                  offsets ? offsets : Rec_offsets().compute(rec, index)));
+  for (;;) {
+    bool wait_for_thaw = false;
 
-    ut_ad(!trx_state_eq(trx, TRX_STATE_NOT_STARTED));
+    {
+      locksys::Shard_latch_guard guard{block->get_page_id()};
+      /* This trx->mutex acquisition here is not really needed.
+      Its purpose is to prevent a state transition between calls to trx_state_eq()
+      and lock_rec_add_to_queue().
+      But one can prove, that even if the state did change, it is not
+      a big problem, because we still keep reference count from dropping
+      to zero, so the trx object is still in use, and we hold the shard latched,
+      so trx can not release its explicit lock (if it has any) so we will
+      notice the explicit lock in lock_rec_has_expl.
+      On the other hand if trx does not have explicit lock, then we would create
+      one on its behalf, which is wasteful, but does not cause a problem, as once
+      the reference count drops to zero the trx will notice and remove this new
+      explicit lock. Also, even if some other trx had observed that trx is already
+      removed from rw trxs list and thus ignored the implicit lock and decided to
+      add its own lock, it will still have to wait for shard latch before adding
+      her lock. However it does not cost us much to simply take the trx->mutex
+      and avoid this whole shaky reasoning. */
+      trx_mutex_enter(trx);
 
-    if (!trx_state_eq(trx, TRX_STATE_COMMITTED_IN_MEMORY) &&
-        !lock_rec_has_expl(LOCK_X | LOCK_REC_NOT_GAP, block, heap_no, trx)) {
-      ulint type_mode;
+      ut_ad(!index->is_clustered() ||
+            trx->id ==
+                lock_clust_rec_some_has_impl(
+                    rec, index,
+                    offsets ? offsets : Rec_offsets().compute(rec, index)));
 
-      type_mode = (LOCK_REC | LOCK_X | LOCK_REC_NOT_GAP);
+      ut_ad(!trx_state_eq(trx, TRX_STATE_NOT_STARTED));
 
-      lock_rec_add_to_queue(type_mode, block, heap_no, index, trx, true);
+      const bool needs_conversion =
+          !trx_state_eq(trx, TRX_STATE_COMMITTED_IN_MEMORY) &&
+          !lock_rec_has_expl(LOCK_X | LOCK_REC_NOT_GAP, block, heap_no, trx);
+      if (needs_conversion &&
+          lock_warmcopy_trx_conversion_is_frozen(&trx->lock)) {
+        DEBUG_SYNC_C("lock_warmcopy_impl_to_expl_after_freeze_check");
+        lock_warmcopy_trx_conversion_note_attempt(&trx->lock);
+        lock_warmcopy_trx_conversion_note_handled(&trx->lock);
+        DEBUG_SYNC_C("lock_warmcopy_impl_to_expl_before_return_frozen");
+        err = lock_warmcopy_frozen_conversion_result(sel_mode);
+        wait_for_thaw = err == DB_SUCCESS;
+      } else if (needs_conversion && !allow_conversion) {
+        err = DB_UNSUPPORTED;
+      } else if (needs_conversion) {
+        ulint type_mode;
+
+        type_mode = (LOCK_REC | LOCK_X | LOCK_REC_NOT_GAP);
+
+        lock_rec_add_to_queue(type_mode, block, heap_no, index, trx, true);
+        if (converted != nullptr) {
+          *converted = true;
+        }
+      }
+
+      trx_mutex_exit(trx);
     }
 
-    trx_mutex_exit(trx);
+    if (!wait_for_thaw) {
+      break;
+    }
+
+    err = lock_warmcopy_wait_for_conversion_thaw(trx, current_thd);
+    if (err != DB_SUCCESS) {
+      break;
+    }
   }
 
   trx_release_reference(trx);
 
   DEBUG_SYNC_C("after_lock_rec_convert_impl_to_expl_for_trx");
+  return err;
+}
+
+dberr_t lock_preserve_convert_impl_to_expl_for_materialize(
+    const buf_block_t *block, const rec_t *rec, dict_index_t *index,
+    const ulint *offsets, trx_t *trx, ulint heap_no, bool *converted,
+    bool allow_conversion) {
+  return lock_rec_convert_impl_to_expl_for_trx(
+      block, rec, index, offsets, trx, heap_no, converted, allow_conversion);
 }
 
 /** If a transaction has an implicit x-lock on a record, but no explicit x-lock
@@ -5435,10 +5820,14 @@ set on the record, sets one for it.
 @param[in]	block		buffer block of rec
 @param[in]	rec		user record on page
 @param[in]	index		index of record
-@param[in]	offsets		rec_get_offsets(rec, index) */
-static void lock_rec_convert_impl_to_expl(const buf_block_t *block,
-                                          const rec_t *rec, dict_index_t *index,
-                                          const ulint *offsets) {
+@param[in]	offsets		rec_get_offsets(rec, index)
+@return DB_SUCCESS or lock wait/deadlock status if conversion cannot proceed */
+static dberr_t lock_rec_convert_impl_to_expl(const buf_block_t *block,
+                                             const rec_t *rec,
+                                             dict_index_t *index,
+                                             const ulint *offsets,
+                                             select_mode sel_mode =
+                                                 SELECT_ORDINARY) {
   trx_t *trx;
 
   ut_ad(!locksys::owns_exclusive_global_latch());
@@ -5474,18 +5863,23 @@ static void lock_rec_convert_impl_to_expl(const buf_block_t *block,
     explicit x-lock set on the record, set one for it.
     trx cannot be committed until the ref count is zero. */
 
-    lock_rec_convert_impl_to_expl_for_trx(block, rec, index, offsets, trx,
-                                          heap_no);
+    return lock_rec_convert_impl_to_expl_for_trx(
+        block, rec, index, offsets, trx, heap_no, nullptr, true, sel_mode);
   }
+
+  return DB_SUCCESS;
 }
 
-void lock_rec_convert_active_impl_to_expl(const buf_block_t *block,
-                                          const rec_t *rec, dict_index_t *index,
-                                          const ulint *offsets, trx_t *trx,
-                                          ulint heap_no) {
+/* Preserve implicit-lock materialization lives in lock0preserve.cc. */
+
+dberr_t lock_rec_convert_active_impl_to_expl(const buf_block_t *block,
+                                             const rec_t *rec,
+                                             dict_index_t *index,
+                                             const ulint *offsets, trx_t *trx,
+                                             ulint heap_no) {
   trx_reference(trx, true);
-  lock_rec_convert_impl_to_expl_for_trx(block, rec, index, offsets, trx,
-                                        heap_no);
+  return lock_rec_convert_impl_to_expl_for_trx(block, rec, index, offsets, trx,
+                                               heap_no);
 }
 
 /** Checks if locks of other transactions prevent an immediate modify (update,
@@ -5523,7 +5917,12 @@ dberr_t lock_clust_rec_modify_check_and_lock(
   /* If a transaction has no explicit x-lock set on the record, set one
   for it */
 
-  lock_rec_convert_impl_to_expl(block, rec, index, offsets);
+  const dberr_t conversion_err =
+      lock_rec_convert_impl_to_expl(block, rec, index, offsets,
+                                    SELECT_ORDINARY);
+  if (conversion_err != DB_SUCCESS) {
+    return (conversion_err);
+  }
 
   {
     locksys::Shard_latch_guard guard{block->get_page_id()};
@@ -5632,7 +6031,11 @@ dberr_t lock_sec_rec_read_check_and_lock(
   if ((page_get_max_trx_id(block->frame) >= trx_rw_min_trx_id() ||
        recv_recovery_is_on()) &&
       !page_rec_is_supremum(rec)) {
-    lock_rec_convert_impl_to_expl(block, rec, index, offsets);
+    const dberr_t conversion_err =
+        lock_rec_convert_impl_to_expl(block, rec, index, offsets, sel_mode);
+    if (conversion_err != DB_SUCCESS) {
+      return (conversion_err);
+    }
   }
   {
     locksys::Shard_latch_guard guard{block->get_page_id()};
@@ -5681,7 +6084,11 @@ dberr_t lock_clust_rec_read_check_and_lock(
   heap_no = page_rec_get_heap_no(rec);
 
   if (heap_no != PAGE_HEAP_NO_SUPREMUM) {
-    lock_rec_convert_impl_to_expl(block, rec, index, offsets);
+    const dberr_t conversion_err =
+        lock_rec_convert_impl_to_expl(block, rec, index, offsets, sel_mode);
+    if (conversion_err != DB_SUCCESS) {
+      return (conversion_err);
+    }
   }
 
   DEBUG_SYNC_C("after_lock_clust_rec_read_check_and_lock_impl_to_expl");
@@ -6069,6 +6476,7 @@ void lock_unlock_table_autoinc(trx_t *trx) /*!< in/out: transaction */
 {
   ut_ad(!locksys::owns_exclusive_global_latch());
   ut_ad(!trx_mutex_own(trx));
+  DBUG_EXECUTE_IF("preserve_trx_keep_autoinc_lock_at_statement_end", return;);
 
   /* This can be invoked on NOT_STARTED, ACTIVE, PREPARED,
   but not COMMITTED transactions. */
@@ -6178,6 +6586,14 @@ void lock_trx_release_locks(trx_t *trx) /*!< in/out: transaction */
   trx_mutex_enter(trx);
   trx->lock.table_locks.clear();
   trx->lock.n_rec_locks.store(0);
+  /*
+    Conversion freeze is preserve-only bookkeeping and must not survive
+    transaction lock-state reinitialization.
+  */
+  trx->lock.lock_warmcopy_conversion_frozen = false;
+  trx->lock.lock_warmcopy_conversion_freeze_wait_epoch = 0;
+  trx->lock.lock_warmcopy_conversion_attempt_after_freeze = false;
+  trx->lock.lock_warmcopy_conversion_unhandled_after_freeze = false;
 
   ut_a(UT_LIST_GET_LEN(trx->lock.trx_locks) == 0);
   ut_a(ib_vector_is_empty(trx->lock.autoinc_locks));

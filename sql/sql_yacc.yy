@@ -121,6 +121,7 @@ Note: YYTHD is passed as an argument to yyparse(), and subsequently to yylex().
 #include "sql/parser_yystype.h"
 #include "sql/partition_element.h"
 #include "sql/partition_info.h"
+#include "sql/preserve_trx.h"
 #include "sql/protocol.h"
 #include "sql/query_options.h"
 #include "sql/resourcegroups/platform/thread_attrs_api.h"
@@ -1325,6 +1326,9 @@ void warn_about_deprecated_binary(THD *thd)
                                                             table expressions. */
 %token<lexer.keyword> REPLICA_SYM 1159
 %token<lexer.keyword> REPLICAS_SYM 1160
+%token<lexer.keyword> PRESERVED_SYM 1161              /* MYSQL */
+%token<lexer.keyword> TRANSACTIONS_SYM 1162           /* MYSQL */
+%token<lexer.keyword> DRAIN_SYM 1163                  /* MYSQL */
 
 
 /*
@@ -1463,6 +1467,11 @@ void warn_about_deprecated_binary(THD *thd)
 
 %type <ulonglong_number>
         ulonglong_num real_ulonglong_num size_number
+        preserve_trx_timeout_num
+
+%type <preserve_trx_options>
+        opt_preserve_trx_with_clauses preserve_trx_with_clause
+        opt_drain_preserve_trx_clauses drain_preserve_trx_clause
 
 %type <lock_type>
         replace_lock_option opt_low_priority insert_lock_option load_data_lock
@@ -2170,7 +2179,8 @@ opt_end_of_input:
         ;
 
 simple_statement_or_begin:
-          simple_statement      { *parse_tree= $1; }
+          resume_preserved_trx_stmt { *parse_tree= nullptr; }
+        | simple_statement      { *parse_tree= $1; }
         | begin_stmt
         ;
 
@@ -2239,7 +2249,9 @@ simple_statement:
         | lock                          { $$= nullptr; }
         | optimize_table_stmt
         | keycache_stmt
+        | drain_transactions_preserve_stmt { $$= nullptr; }
         | preload_stmt
+        | prepare_shutdown_preserve_stmt { $$= nullptr; }
         | prepare                       { $$= nullptr; }
         | purge                         { $$= nullptr; }
         | release                       { $$= nullptr; }
@@ -2283,6 +2295,104 @@ deallocate:
 deallocate_or_drop:
           DEALLOCATE_SYM
         | DROP
+        ;
+
+prepare_shutdown_preserve_stmt:
+          PREPARE_SYM SHUTDOWN PRESERVE_SYM TRANSACTION_SYM
+          opt_preserve_trx_with_clauses
+          {
+            Lex->sql_command= SQLCOM_PREPARE_SHUTDOWN_PRESERVE;
+            Lex->preserve_trx_has_timeout= $5.has_timeout;
+            Lex->preserve_trx_timeout_seconds= $5.timeout_seconds;
+            Lex->preserve_trx_user_vars_mode=
+              static_cast<uint>($5.user_vars_mode);
+          }
+        ;
+
+drain_transactions_preserve_stmt:
+          DRAIN_SYM TRANSACTIONS_SYM PRESERVE_SYM
+          opt_drain_preserve_trx_clauses
+          {
+            Lex->sql_command= SQLCOM_DRAIN_TRANSACTIONS_PRESERVE;
+            Lex->preserve_trx_has_timeout= $4.has_timeout;
+            Lex->preserve_trx_timeout_seconds= $4.timeout_seconds;
+            Lex->preserve_trx_user_vars_mode=
+              static_cast<uint>($4.user_vars_mode);
+          }
+        ;
+
+opt_preserve_trx_with_clauses:
+          /* empty */ { $$.init(); }
+        | opt_preserve_trx_with_clauses preserve_trx_with_clause
+          {
+            $$= $1;
+            if ($$.merge($2))
+            {
+              YYTHD->syntax_error_at(@2);
+              MYSQL_YYABORT;
+            }
+          }
+        ;
+
+opt_drain_preserve_trx_clauses:
+          /* empty */ { $$.init(); }
+        | opt_drain_preserve_trx_clauses drain_preserve_trx_clause
+          {
+            $$= $1;
+            if ($$.merge($2))
+            {
+              YYTHD->syntax_error_at(@2);
+              MYSQL_YYABORT;
+            }
+          }
+        ;
+
+preserve_trx_with_clause:
+          WITH ident preserve_trx_timeout_num
+          {
+            if (!is_identifier($2, "TIMEOUT"))
+            {
+              YYTHD->syntax_error_at(@2);
+              MYSQL_YYABORT;
+            }
+            $$.init();
+            $$.has_timeout= true;
+            $$.timeout_seconds= $3;
+          }
+        | WITH USER ident
+          {
+            if (!is_identifier($3, "VARS"))
+            {
+              YYTHD->syntax_error_at(@3);
+              MYSQL_YYABORT;
+            }
+            $$.init();
+            $$.user_vars_mode= Preserve_trx_parser_user_vars_mode::INCLUDE;
+          }
+        | WITH NO_SYM USER ident
+          {
+            if (!is_identifier($4, "VARS"))
+            {
+              YYTHD->syntax_error_at(@4);
+              MYSQL_YYABORT;
+            }
+            $$.init();
+            $$.user_vars_mode= Preserve_trx_parser_user_vars_mode::EXCLUDE;
+          }
+        ;
+
+drain_preserve_trx_clause:
+          preserve_trx_with_clause
+        | NO_SYM USER ident
+          {
+            if (!is_identifier($3, "VARS"))
+            {
+              YYTHD->syntax_error_at(@3);
+              MYSQL_YYABORT;
+            }
+            $$.init();
+            $$.user_vars_mode= Preserve_trx_parser_user_vars_mode::EXCLUDE;
+          }
         ;
 
 prepare:
@@ -12146,6 +12256,12 @@ real_ulonglong_num:
         | dec_num_error { MYSQL_YYABORT; }
         ;
 
+preserve_trx_timeout_num:
+          NUM           { int error; $$= (ulonglong) my_strtoll10($1.str, nullptr, &error); }
+        | LONG_NUM      { int error; $$= (ulonglong) my_strtoll10($1.str, nullptr, &error); }
+        | ULONGLONG_NUM { int error; $$= (ulonglong) my_strtoll10($1.str, nullptr, &error); }
+        ;
+
 dec_num_error:
           dec_num
           { YYTHD->syntax_error(ER_ONLY_INTEGERS_ALLOWED); }
@@ -13210,6 +13326,13 @@ show_param:
           {
             auto *p= NEW_PTN PT_show_privileges(@$);
             MAKE_CMD(p);
+          }
+        | PRESERVED_SYM TRANSACTIONS_SYM
+          {
+            Lex->sql_command= SQLCOM_SHOW_PRESERVED_TRX;
+            Lex->m_sql_cmd= NEW_PTN Sql_cmd_show_preserved_transactions();
+            if (Lex->m_sql_cmd == nullptr)
+              MYSQL_YYABORT;
           }
         | GRANTS
           {
@@ -14517,6 +14640,7 @@ ident_keywords_ambiguous_2_labels:
         | CONTAINS_SYM
         | DEALLOCATE_SYM
         | DO_SYM
+        | DRAIN_SYM
         | END
         | FLUSH_SYM
         | FOLLOWS_SYM
@@ -14820,6 +14944,7 @@ ident_keywords_unambiguous:
         | PORT_SYM
         | PRECEDING_SYM
         | PRESERVE_SYM
+        | PRESERVED_SYM
         | PREV_SYM
         | PRIVILEGES
         | PRIVILEGE_CHECKS_USER_SYM
@@ -14934,6 +15059,7 @@ ident_keywords_unambiguous:
         | TIME_SYM %prec KEYWORD_USED_AS_IDENT
         | TLS_SYM
         | TRANSACTION_SYM
+        | TRANSACTIONS_SYM
         | TRIGGERS_SYM
         | TYPES_SYM
         | TYPE_SYM
@@ -15455,6 +15581,18 @@ shutdown_stmt:
           {
             Lex->sql_command= SQLCOM_SHUTDOWN;
             $$= NEW_PTN PT_shutdown();
+          }
+        ;
+
+resume_preserved_trx_stmt:
+          RESUME_SYM PRESERVED_SYM TRANSACTION_SYM text_string
+          {
+            Lex->sql_command= SQLCOM_RESUME_PRESERVED_TRX;
+            Lex->m_sql_cmd=
+              NEW_PTN Sql_cmd_resume_preserved_transaction($4->ptr(),
+                                                           $4->length());
+            if (Lex->m_sql_cmd == nullptr)
+              MYSQL_YYABORT;
           }
         ;
 

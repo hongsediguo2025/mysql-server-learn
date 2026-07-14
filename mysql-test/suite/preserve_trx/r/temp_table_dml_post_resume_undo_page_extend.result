@@ -1,0 +1,26 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_max_temp_sidecar_bytes=1073741824;
+CREATE TEMPORARY TABLE tmp_preserve_undo_extend(
+id INT PRIMARY KEY,
+v INT NOT NULL,
+payload LONGBLOB NOT NULL,
+KEY(v)
+) ENGINE=InnoDB;
+START TRANSACTION;
+UPDATE tmp_preserve_undo_extend
+SET v = v + 1000, payload = REPEAT('b', 8192)
+WHERE id BETWEEN 1 AND 10;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+SELECT COUNT(*) AS row_count,
+SUM(v) AS v_sum,
+SUM(LENGTH(payload)) AS payload_bytes
+FROM tmp_preserve_undo_extend;
+row_count	v_sum	payload_bytes
+200	410100	1638400
+DROP TEMPORARY TABLE tmp_preserve_undo_extend;
+SET GLOBAL preserve_trx_max_temp_sidecar_bytes=1073741824;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_enable=ON;

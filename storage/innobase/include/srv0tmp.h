@@ -40,6 +40,34 @@ enum tbsp_purpose {
   TBSP_SLAVE      /*!< Tablespace is used by the slave node
                   in a replication setup */
 };
+
+/** Reserve a session temporary tablespace id for a preserved temp image.
+The normal session temporary tablespace allocator must not reuse reserved ids.
+@param[in] space_id session temporary tablespace id to reserve
+@return true if reservation was accepted */
+bool reserve_preserved_space_id(space_id_t space_id);
+
+/** Reserve a session temporary tablespace id or keep an existing preserved
+reservation for the caller.
+@param[in] space_id session temporary tablespace id to reserve
+@param[out] created true if this call created the reservation
+@return true if the id is now reserved */
+bool reserve_or_keep_preserved_space_id(space_id_t space_id, bool *created);
+
+/** Release a preserved session temporary tablespace id reservation.
+@param[in] space_id session temporary tablespace id to release
+@return true if an existing reservation was removed */
+bool release_preserved_space_id(space_id_t space_id);
+
+/** Check whether a session temporary tablespace id is currently reserved.
+@param[in] space_id session temporary tablespace id to check
+@return true if the id is reserved */
+bool is_preserved_space_id_reserved(space_id_t space_id);
+
+/** Return the number of active preserved session temporary tablespace id
+reservations. Test-only helper for the allocator fast path. */
+uint32_t preserved_space_id_reservation_active_count_for_test();
+
 /** Create the session temporary tablespaces on startup
 @param[in] create_new_db	true if bootstrapping
 @return DB_SUCCESS on success, else DB_ERROR on failure */
@@ -101,6 +129,9 @@ class Tablespace {
   std::string path() const;
 
  private:
+  /** Allocate the next unreserved session temporary tablespace id. */
+  static space_id_t next_space_id();
+
   /** The id used for name on disk temp_1.ibt, temp_2.ibt, etc
   @return the offset based on s_min_temp_space_id. The minimum offset is 1 */
   uint32_t file_id() const;
@@ -114,6 +145,13 @@ class Tablespace {
   /** Next available space_id for tablespace. These are
   hardcoded space_ids at higher range */
   static space_id_t m_last_used_space_id;
+
+  friend bool reserve_preserved_space_id(space_id_t space_id);
+
+  friend bool reserve_or_keep_preserved_space_id(space_id_t space_id,
+                                                bool *created);
+
+  friend void reset_temp_space_id_allocator_for_test();
 
   /** True only after .ibt file is created */
   bool m_inited;

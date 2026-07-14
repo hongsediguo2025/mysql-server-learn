@@ -1,0 +1,3 @@
+SELECT 'lint-only' AS batch_drain_warmcopy_recovery_abandoned_cleanup_lint;
+batch_drain_warmcopy_recovery_abandoned_cleanup_lint
+lint-only

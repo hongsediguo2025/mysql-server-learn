@@ -1,0 +1,26 @@
+DROP TABLE IF EXISTS t_resume_user_vars_decimal;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_resume_user_vars_decimal(id INT PRIMARY KEY, v INT)
+ENGINE=InnoDB;
+SET @preserve_decimal_var = CAST(123.45 AS DECIMAL(10,2));
+SET @preserve_int_var = CAST(42 AS SIGNED);
+SET @preserve_real_var = 3.5e0;
+SET @preserve_null_decimal_var = CAST(NULL AS DECIMAL(10,2));
+SET @preserve_string_var = 'restored-value';
+START TRANSACTION;
+INSERT INTO t_resume_user_vars_decimal VALUES(1,10);
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300 WITH USER VARS;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+SELECT @preserve_decimal_var AS decimal_var,
+@preserve_int_var AS int_var,
+@preserve_real_var AS real_var,
+@preserve_null_decimal_var IS NULL AS null_decimal_var,
+@preserve_string_var AS string_var;
+decimal_var	int_var	real_var	null_decimal_var	string_var
+123.45	42	3.5	1	restored-value
+COMMIT;
+SELECT * FROM t_resume_user_vars_decimal ORDER BY id;
+id	v
+1	10
+DROP TABLE t_resume_user_vars_decimal;
+SET GLOBAL preserve_trx_enable=ON;

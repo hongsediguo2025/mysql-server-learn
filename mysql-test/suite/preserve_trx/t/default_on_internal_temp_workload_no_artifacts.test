@@ -1,0 +1,82 @@
+--source include/not_windows.inc
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+
+--disable_warnings
+DROP TABLE IF EXISTS t_preserve_default_on_internal_tmp;
+--enable_warnings
+
+CREATE TABLE t_preserve_default_on_internal_tmp(
+  id INT PRIMARY KEY,
+  grp INT NOT NULL,
+  pad VARCHAR(200) NOT NULL,
+  KEY(grp)
+) ENGINE=InnoDB;
+
+INSERT INTO t_preserve_default_on_internal_tmp
+WITH RECURSIVE n(i) AS (
+  SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 256
+)
+SELECT i, i % 17, RPAD(CONCAT('payload-', i), 180, 'x') FROM n;
+
+SET SESSION tmp_table_size=16384;
+SET SESSION max_heap_table_size=16384;
+
+SELECT COUNT(*) AS grouped_rows
+FROM (
+  SELECT grp, COUNT(*) AS c, SUM(LENGTH(pad)) AS bytes
+  FROM t_preserve_default_on_internal_tmp
+  GROUP BY grp
+  HAVING c > 0
+  ORDER BY bytes DESC
+) AS grouped;
+
+SELECT COUNT(*) AS derived_rows
+FROM (
+  SELECT a.grp, a.id, b.bytes
+  FROM t_preserve_default_on_internal_tmp AS a
+  JOIN (
+    SELECT grp, SUM(LENGTH(pad)) AS bytes
+    FROM t_preserve_default_on_internal_tmp
+    GROUP BY grp
+  ) AS b ON b.grp = a.grp
+  ORDER BY b.bytes DESC, a.id DESC
+  LIMIT 128
+) AS derived;
+
+WITH cte AS (
+  SELECT grp, COUNT(*) AS c
+  FROM t_preserve_default_on_internal_tmp
+  GROUP BY grp
+)
+SELECT SUM(c) AS cte_rows FROM cte;
+
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+my @artifacts;
+if (-d $dir) {
+  opendir(my $dh, $dir) or die "cannot open preserve dir: $!";
+  while (defined(my $entry = readdir($dh))) {
+    next if $entry eq '.' || $entry eq '..' || $entry eq '.key';
+    push @artifacts, $entry;
+  }
+  closedir($dh);
+}
+die "unexpected preserve artifacts: " . join(',', sort @artifacts) . "\n"
+  if @artifacts;
+print "preserve_artifacts 0\n";
+EOF
+
+DROP TABLE t_preserve_default_on_internal_tmp;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

@@ -1,0 +1,46 @@
+--echo # Lint-only source-shape guard. Runtime behavior is covered by
+--echo # batch_drain_packet_before_dispatch and batch_drain_waits_inflight_statements.
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_source {
+  my ($path) = @_;
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $src = do { local $/; <$fh> };
+  close($fh);
+  return $src;
+}
+
+my $preserve = read_source(File::Spec->catfile($source_root, 'sql',
+                                               'preserve_trx.cc'));
+my $command_read_mtr = read_source(File::Spec->catfile(
+  $source_root, 'mysql-test', 'suite', 'preserve_trx', 't',
+  'batch_drain_command_read_state_lint.test'));
+my $packet_mtr = read_source(File::Spec->catfile(
+  $source_root, 'mysql-test', 'suite', 'preserve_trx', 't',
+  'batch_drain_packet_before_dispatch.test'));
+my $waits_mtr = read_source(File::Spec->catfile(
+  $source_root, 'mysql-test', 'suite', 'preserve_trx', 't',
+  'batch_drain_waits_inflight_statements.test'));
+
+die "command-read boundary must publish pending quiesce only after unknown-query depth is reset at idle boundary\n"
+  unless $preserve =~ /preserved_trx_begin_command_read[\s\S]*preserve_trx_inflight_unknown_query_depth\s*=\s*0/s &&
+         $preserve =~ /preserve_trx_publish_pending_quiesce_at_idle_boundary/s;
+die "command-read static MTR must guard unknown-query quiesce helper usage\n"
+  unless $command_read_mtr =~ /preserved_trx_begin_command_read/s &&
+         $command_read_mtr =~ /preserve_trx_publish_pending_quiesce_at_idle_boundary/s;
+die "packet-before-dispatch and inflight-statement MTRs must cover non-idle drain boundaries\n"
+  unless $packet_mtr =~ /DRAIN TRANSACTIONS PRESERVE/s &&
+         $packet_mtr =~ /SELECT COUNT\(\*\) AS preserved_count/s &&
+         $packet_mtr =~ /SELECT \* FROM t_batch_packet_before_dispatch/s &&
+         $waits_mtr =~ /DRAIN TRANSACTIONS PRESERVE/s;
+EOF
+
+SELECT 'ok' AS batch_drain_unknown_query_quiesce_boundary_lint;

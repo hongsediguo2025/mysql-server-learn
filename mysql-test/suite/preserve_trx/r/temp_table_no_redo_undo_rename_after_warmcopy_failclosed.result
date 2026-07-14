@@ -1,0 +1,36 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+CREATE TEMPORARY TABLE tmp_preserve_rename(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+START TRANSACTION;
+INSERT INTO tmp_preserve_rename VALUES(1, 10);
+SET DEBUG_SYNC =
+'preserve_trx_warmcopy_open SIGNAL temp_rename_warmcopy_open WAIT_FOR temp_rename_continue_warmcopy';
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET DEBUG_SYNC = 'now WAIT_FOR temp_rename_warmcopy_open TIMEOUT 10';
+ALTER TABLE tmp_preserve_rename RENAME TO tmp_preserve_renamed;
+START TRANSACTION;
+INSERT INTO tmp_preserve_renamed VALUES(2, 20);
+SET DEBUG_SYNC = 'now SIGNAL temp_rename_continue_warmcopy';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+SELECT * FROM tmp_preserve_rename;
+ERROR 42S02: Table 'test.tmp_preserve_rename' doesn't exist
+SELECT * FROM tmp_preserve_renamed ORDER BY id;
+id	v
+1	10
+2	20
+COMMIT;
+DROP TEMPORARY TABLE tmp_preserve_renamed;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET DEBUG_SYNC = 'RESET';

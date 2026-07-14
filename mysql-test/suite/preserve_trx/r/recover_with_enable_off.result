@@ -1,0 +1,32 @@
+DROP TABLE IF EXISTS t_recover_enable_off;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_recover_enable_off(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_recover_enable_off VALUES(1,10);
+START TRANSACTION;
+SELECT * FROM t_recover_enable_off WHERE a=1 FOR UPDATE;
+a	b
+1	10
+UPDATE t_recover_enable_off SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SELECT @@global.preserve_trx_enable AS enable_after_restart;
+enable_after_restart
+0
+SELECT COUNT(*) AS recovered_while_disabled
+FROM performance_schema.preserved_transactions;
+recovered_while_disabled
+0
+# restart: --preserve-trx-enable=ON --skip-log-bin
+SELECT @@global.preserve_trx_enable AS enable_after_enabled_restart;
+enable_after_enabled_restart
+1
+SELECT COUNT(*) AS recovered_after_enabled_restart
+FROM performance_schema.preserved_transactions;
+recovered_after_enabled_restart
+1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+SELECT * FROM t_recover_enable_off ORDER BY a;
+a	b
+1	11
+DROP TABLE t_recover_enable_off;
+SET GLOBAL preserve_trx_enable=ON;

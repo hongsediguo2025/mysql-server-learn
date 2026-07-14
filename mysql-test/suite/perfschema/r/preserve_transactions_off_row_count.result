@@ -1,0 +1,5 @@
+# restart: --preserve-trx-enable=OFF
+SELECT COUNT(*) FROM performance_schema.preserved_transactions;
+COUNT(*)
+0
+# restart: --preserve-trx-enable=ON

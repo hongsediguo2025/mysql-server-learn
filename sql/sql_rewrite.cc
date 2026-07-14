@@ -107,6 +107,17 @@
 #endif
 
 namespace {
+class Rewriter_resume_preserved_transaction final : public I_rewriter {
+ public:
+  Rewriter_resume_preserved_transaction(THD *thd, Consumer_type type)
+      : I_rewriter(thd, type) {}
+
+  bool rewrite(String &rlb) const override {
+    return mysql_rewrite_resume_preserved_transaction_raw(
+        m_thd, m_thd->query().str, m_thd->query().length, &rlb);
+  }
+};
+
 /**
   Append a comma to given string if item wasn't the first to be added.
 
@@ -291,6 +302,9 @@ bool rewrite_query(THD *thd, Consumer_type type, Rewrite_params *params,
       rw.reset(new Rewriter_clone(thd, type));
       break;
     }
+    case SQLCOM_RESUME_PRESERVED_TRX:
+      rw.reset(new Rewriter_resume_preserved_transaction(thd, type));
+      break;
     default: /* unhandled query types are legal. */
       break;
   }
@@ -340,7 +354,8 @@ void mysql_rewrite_query(THD *thd, Consumer_type type /*= Consumer_type::LOG */,
   // We should not come through here twice for the same query.
   DBUG_ASSERT(thd->rewritten_query().length() == 0);
 
-  if (thd->lex->contains_plaintext_password) {
+  if (thd->lex->contains_plaintext_password ||
+      thd->lex->sql_command == SQLCOM_RESUME_PRESERVED_TRX) {
     rewrite_query(thd, type, params, rlb);
     if (rlb.length() > 0) thd->swap_rewritten_query(rlb);
     // The previous rewritten query is in rlb now, which now goes out of scope.

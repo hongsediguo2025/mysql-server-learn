@@ -1,0 +1,20 @@
+DROP TABLE IF EXISTS t_mdl_restore;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_mdl_restore(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_mdl_restore VALUES(1,10);
+START TRANSACTION;
+UPDATE t_mdl_restore SET v=11 WHERE id=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET lock_wait_timeout=1;
+ALTER TABLE t_mdl_restore ADD COLUMN ddl_marker INT;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ALTER TABLE t_mdl_restore ADD COLUMN ddl_marker INT;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+COMMIT;
+ALTER TABLE t_mdl_restore ADD COLUMN ddl_marker INT;
+SELECT * FROM t_mdl_restore ORDER BY id;
+id	v	ddl_marker
+1	11	NULL
+DROP TABLE t_mdl_restore;
+SET GLOBAL preserve_trx_enable=ON;

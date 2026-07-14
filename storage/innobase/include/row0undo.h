@@ -46,8 +46,9 @@ this program; if not, write to the Free Software Foundation, Inc.,
 /** Converts an implict lock on the record to explict in case of partial
  rollback.
 @param[in]	cursor		cursor to record
-@param[in]	node		undo node */
-void row_convert_impl_to_expl_if_needed(btr_cur_t *cursor, undo_node_t *node);
+@param[in]	node		undo node
+@return DB_SUCCESS or lock wait/deadlock status if conversion cannot proceed */
+dberr_t row_convert_impl_to_expl_if_needed(btr_cur_t *cursor, undo_node_t *node);
 
 /** Creates a row undo node to a query graph.
 @param[in]	trx		 transaction

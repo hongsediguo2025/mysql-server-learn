@@ -531,6 +531,12 @@ extern sys_var *Sys_gtid_next_ptr;
 extern sys_var *Sys_gtid_next_list_ptr;
 extern sys_var *Sys_gtid_purged_ptr;
 
+/** Apply the native session autocommit transition and its side effects. */
+bool set_session_autocommit_internal(THD *thd, bool enabled);
+
+/** Whether THD may administer protected session variables. */
+bool has_session_variable_admin_privilege(THD *thd);
+
 extern ulonglong system_variable_hash_version;
 
 const CHARSET_INFO *get_old_charset_by_name(const char *old_name);

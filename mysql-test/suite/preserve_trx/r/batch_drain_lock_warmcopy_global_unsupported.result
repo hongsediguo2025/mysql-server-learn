@@ -1,0 +1,12 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=ON;
+FLUSH TABLES WITH READ LOCK;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+UNLOCK TABLES;
+SELECT COUNT(*) AS preserved_count_after_global_read_lock_reject
+FROM performance_schema.preserved_transactions;
+preserved_count_after_global_read_lock_reject
+0

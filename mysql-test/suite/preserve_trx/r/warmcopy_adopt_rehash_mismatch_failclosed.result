@@ -1,0 +1,25 @@
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot");
+DROP TABLE IF EXISTS t_warmcopy_adopt_rehash;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+CREATE TABLE t_warmcopy_adopt_rehash(id INT PRIMARY KEY, v INT)
+ENGINE=InnoDB;
+INSERT INTO t_warmcopy_adopt_rehash VALUES(1,10);
+START TRANSACTION;
+UPDATE t_warmcopy_adopt_rehash SET v=11 WHERE id=1;
+SET SESSION debug="+d,preserve_trx_corrupt_warmcopy_blob_after_descriptor";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+include/assert_grep.inc [corrupt warmcopy adopt is rejected during recovery]
+SELECT COUNT(*) AS preserved_count_after_corrupt_warmcopy_adopt
+FROM performance_schema.preserved_transactions;
+preserved_count_after_corrupt_warmcopy_adopt
+0
+SELECT * FROM t_warmcopy_adopt_rehash ORDER BY id;
+id	v
+1	10
+DROP TABLE t_warmcopy_adopt_rehash;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET DEBUG_SYNC = 'RESET';

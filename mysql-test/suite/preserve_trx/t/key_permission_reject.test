@@ -1,0 +1,48 @@
+--source include/not_windows.inc
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+SET GLOBAL preserve_trx_enable=ON;
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+my $key = File::Spec->catfile($dir, '.key');
+die "preserve dir missing: $dir" unless -d $dir;
+die "preserve key missing: $key" unless -f $key;
+chmod(0644, $key) or die "cannot loosen preserve key mode: $!";
+print "preserve key mode is too open\n";
+EOF
+
+--let $error_log= $MYSQLTEST_VARDIR/log/preserve_trx_key_permission.err
+--perl
+use strict;
+use warnings;
+my $path = $ENV{'error_log'} || '';
+unlink $path if $path ne '';
+EOF
+
+--error 1
+--exec $MYSQLD_CMD --validate-config --preserve-trx-enable=ON --log-error=$error_log > $error_log 2>&1
+
+--let SEARCH_FILE= $error_log
+--let SEARCH_PATTERN= preserve_trx_enable=ON requires valid snapshot support
+--source include/search_pattern.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $key = File::Spec->catfile($ENV{'MYSQLD_DATADIR'}, 'preserve', '.key');
+chmod(0600, $key) or die "cannot restore preserve key mode: $!";
+EOF
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
+--remove_file $error_log

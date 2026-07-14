@@ -1,0 +1,6 @@
+# Lint-only source-shape guard for unsupported temporary-table DDL.
+# DDL-like changes during a preserve target transaction or capture epoch
+# must be marked explicitly and rejected fail-closed.
+SELECT 'ok' AS temp_table_ddl_boundary_lint;
+temp_table_ddl_boundary_lint
+ok

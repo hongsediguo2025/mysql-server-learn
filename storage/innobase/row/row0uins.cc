@@ -116,7 +116,10 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
     mem_heap_free(heap);
   }
 
-  row_convert_impl_to_expl_if_needed(btr_cur, node);
+  err = row_convert_impl_to_expl_if_needed(btr_cur, node);
+  if (err != DB_SUCCESS) {
+    goto func_exit;
+  }
   if (btr_cur_optimistic_delete(btr_cur, 0, &mtr)) {
     err = DB_SUCCESS;
     goto func_exit;
@@ -238,7 +241,10 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
     modified it yet and we don't have implicit lock on it.
     We must convert to explicit if and only if we have
     implicit lock on the record.*/
-    row_convert_impl_to_expl_if_needed(btr_cur, node);
+    err = row_convert_impl_to_expl_if_needed(btr_cur, node);
+    if (err != DB_SUCCESS) {
+      goto func_exit;
+    }
   }
 
   if (modify_leaf) {

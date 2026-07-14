@@ -1,0 +1,37 @@
+DROP SCHEMA IF EXISTS xtest;
+SET GLOBAL preserve_trx_enable=ON;
+RUN CREATE SCHEMA xtest;
+
+1 rows affected
+RUN CREATE TABLE xtest.t_mysqlx_reject(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+
+0 rows affected
+RUN INSERT INTO xtest.t_mysqlx_reject VALUES(1,10);
+
+1 rows affected
+RUN START TRANSACTION;
+
+0 rows affected
+RUN UPDATE xtest.t_mysqlx_reject SET b=11 WHERE a=1;
+
+1 rows affected
+Rows matched: 1  Changed: 1  Warnings: 0
+RUN PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+Got expected error: Command not supported by pluggable protocols (code 3130)
+RUN SELECT COUNT(*) AS preserved_count FROM performance_schema.preserved_transactions;
+preserved_count
+0
+0 rows affected
+RUN ROLLBACK;
+
+0 rows affected
+RUN SELECT * FROM xtest.t_mysqlx_reject ORDER BY a;
+a	b
+1	10
+0 rows affected
+Mysqlx.Ok {
+  msg: "bye!"
+}
+ok
+DROP SCHEMA xtest;
+SET GLOBAL preserve_trx_enable=ON;

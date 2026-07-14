@@ -1,0 +1,89 @@
+--source include/not_log_bin.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_timeout_bounds;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+SET @saved_preserve_trx_min_timeout=@@SESSION.preserve_trx_min_timeout;
+SET @saved_preserve_trx_default_timeout=@@SESSION.preserve_trx_default_timeout;
+SET @saved_preserve_trx_max_timeout=@@SESSION.preserve_trx_max_timeout;
+SET @saved_global_preserve_trx_min_timeout=@@GLOBAL.preserve_trx_min_timeout;
+SET @saved_global_preserve_trx_default_timeout=@@GLOBAL.preserve_trx_default_timeout;
+SET @saved_global_preserve_trx_max_timeout=@@GLOBAL.preserve_trx_max_timeout;
+
+SET SESSION preserve_trx_min_timeout=10;
+SET SESSION preserve_trx_default_timeout=15;
+SET SESSION preserve_trx_max_timeout=20;
+
+SELECT @@session.preserve_trx_min_timeout AS min_timeout,
+       @@session.preserve_trx_default_timeout AS default_timeout,
+       @@session.preserve_trx_max_timeout AS max_timeout;
+
+SET GLOBAL preserve_trx_min_timeout=11;
+SET GLOBAL preserve_trx_default_timeout=12;
+SET GLOBAL preserve_trx_max_timeout=13;
+--connect(timeout_bounds_inherited,localhost,root,,test)
+SELECT @@session.preserve_trx_min_timeout AS inherited_min_timeout,
+       @@session.preserve_trx_default_timeout AS inherited_default_timeout,
+       @@session.preserve_trx_max_timeout AS inherited_max_timeout;
+--disconnect timeout_bounds_inherited
+--connection default
+
+CREATE TABLE t_timeout_bounds(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+
+--error ER_PRESERVE_TRX_INVALID_STATE
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+
+START TRANSACTION;
+INSERT INTO t_timeout_bounds VALUES(1,1);
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 9;
+ROLLBACK;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 9;
+
+START TRANSACTION;
+INSERT INTO t_timeout_bounds VALUES(2,2);
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 21;
+ROLLBACK;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 21;
+
+SET SESSION preserve_trx_default_timeout=25;
+--error ER_PRESERVE_TRX_INVALID_STATE
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+START TRANSACTION;
+INSERT INTO t_timeout_bounds VALUES(3,3);
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+ROLLBACK;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+
+SET SESSION preserve_trx_default_timeout=15;
+SET SESSION preserve_trx_min_timeout=30;
+SET SESSION preserve_trx_max_timeout=20;
+START TRANSACTION;
+INSERT INTO t_timeout_bounds VALUES(4,4);
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+ROLLBACK;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE;
+
+DROP TABLE t_timeout_bounds;
+
+SET SESSION preserve_trx_min_timeout=@saved_preserve_trx_min_timeout;
+SET SESSION preserve_trx_default_timeout=@saved_preserve_trx_default_timeout;
+SET SESSION preserve_trx_max_timeout=@saved_preserve_trx_max_timeout;
+SET GLOBAL preserve_trx_min_timeout=@saved_global_preserve_trx_min_timeout;
+SET GLOBAL preserve_trx_default_timeout=@saved_global_preserve_trx_default_timeout;
+SET GLOBAL preserve_trx_max_timeout=@saved_global_preserve_trx_max_timeout;
+SET GLOBAL preserve_trx_enable=ON;

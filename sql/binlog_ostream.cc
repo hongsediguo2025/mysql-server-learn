@@ -1,15 +1,16 @@
-/* Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2018, 2025, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License, version 2.0,
    as published by the Free Software Foundation.
 
-   This program is also distributed with certain software (including
+   This program is designed to work with certain software (including
    but not limited to OpenSSL) that is licensed under separate terms,
    as designated in a particular file or component or in included license
    documentation.  The authors of MySQL hereby grant you an additional
    permission to link the program and your derivative works with the
-   separately licensed software that they have included with MySQL.
+   separately licensed software that they have either included with
+   the program or referenced in the documentation.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -22,6 +23,9 @@
 
 #include "sql/binlog_ostream.h"
 #include <algorithm>
+#include <atomic>
+#include <limits>
+#include <vector>
 #include "my_aes.h"
 #include "my_inttypes.h"
 #include "my_rnd.h"
@@ -33,11 +37,11 @@
 #include "sql/rpl_log_encryption.h"
 #include "sql/sql_class.h"
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 bool binlog_cache_is_reset = false;
 #endif
 
-IO_CACHE_binlog_cache_storage::IO_CACHE_binlog_cache_storage() {}
+IO_CACHE_binlog_cache_storage::IO_CACHE_binlog_cache_storage() = default;
 IO_CACHE_binlog_cache_storage::~IO_CACHE_binlog_cache_storage() { close(); }
 
 bool IO_CACHE_binlog_cache_storage::open(const char *dir, const char *prefix,
@@ -63,7 +67,7 @@ bool IO_CACHE_binlog_cache_storage::write(const unsigned char *buffer,
     Enable/disable binlog cache temporary file encryption according to the
     setting of global binlog_encryption if both binlog cache temporary
     file encryption and the setting of global binlog_encryption are not
-    consistent on the first writting of binlog cache after changing the
+    consistent on the first writing of binlog cache after changing the
     setting of global binlog_encryption.
   */
   if (unlikely((m_io_cache.m_encryptor == nullptr ||
@@ -91,7 +95,7 @@ bool IO_CACHE_binlog_cache_storage::write(const unsigned char *buffer,
 
 bool IO_CACHE_binlog_cache_storage::truncate(my_off_t offset) {
   /*
-     It is not really necessary to flush the data will be trucnated into
+     It is not really necessary to flush the data will be truncated into
      temporary file before truncating . And it may cause write failure. So set
      clear_cache to true if all data in cache will be truncated.
      It avoids flush data to the internal temporary file.
@@ -114,7 +118,7 @@ bool IO_CACHE_binlog_cache_storage::reset() {
     DBUG_EXECUTE_IF("show_io_cache_size", {
       my_off_t file_size =
           my_seek(m_io_cache.file, 0L, MY_SEEK_END, MYF(MY_WME + MY_FAE));
-      DBUG_ASSERT(file_size == 0);
+      assert(file_size == 0);
     });
   }
 
@@ -155,14 +159,14 @@ bool IO_CACHE_binlog_cache_storage::begin(unsigned char **buffer,
   DBUG_EXECUTE_IF("ensure_binlog_cache_temporary_file_is_encrypted", {
     /*
       Assert that the temporary file of binlog cache is encrypted before
-      writting the content of binlog cache into binlog file.
+      writing the content of binlog cache into binlog file.
     */
-    DBUG_ASSERT(binlog_cache_temporary_file_is_encrypted);
+    assert(binlog_cache_temporary_file_is_encrypted);
   };);
 
   DBUG_EXECUTE_IF("ensure_binlog_cache_temp_file_encryption_is_disabled", {
-    DBUG_ASSERT(m_io_cache.m_encryptor == nullptr &&
-                m_io_cache.m_decryptor == nullptr);
+    assert(m_io_cache.m_encryptor == nullptr &&
+           m_io_cache.m_decryptor == nullptr);
   };);
 
   if (reinit_io_cache(&m_io_cache, READ_CACHE, 0, false, false)) {
@@ -190,6 +194,88 @@ bool IO_CACHE_binlog_cache_storage::next(unsigned char **buffer,
   m_io_cache.read_pos = m_io_cache.read_end;
 
   return m_io_cache.error;
+}
+
+bool IO_CACHE_binlog_cache_storage::copy_range_to(my_off_t offset,
+                                                  size_t range_length,
+                                                  Basic_ostream *ostream) {
+  if (ostream == nullptr) return true;
+  if (range_length == 0) return false;
+  if (range_length >
+      static_cast<size_t>(std::numeric_limits<my_off_t>::max() - offset)) {
+    return true;
+  }
+
+  const my_off_t end_offset = offset + static_cast<my_off_t>(range_length);
+  if (end_offset > length()) return true;
+  if (m_io_cache.type != WRITE_CACHE || m_io_cache.write_buffer == nullptr ||
+      m_io_cache.write_pos == nullptr) {
+    return true;
+  }
+
+  const my_off_t write_buffer_start = m_io_cache.pos_in_file;
+  const my_off_t write_buffer_used =
+      static_cast<my_off_t>(m_io_cache.write_pos - m_io_cache.write_buffer);
+  const my_off_t write_buffer_end = write_buffer_start + write_buffer_used;
+  std::vector<unsigned char> disk_buffer(8192);
+  my_off_t position = offset;
+  size_t remaining = range_length;
+
+  const auto read_disk = [&](my_off_t read_offset, size_t bytes) {
+    if (m_io_cache.file < 0) return true;
+    const my_off_t saved_file_pos = mysql_file_tell(m_io_cache.file, MYF(0));
+    if (saved_file_pos == MY_FILEPOS_ERROR) return true;
+
+    bool error = false;
+    if (mysql_encryption_file_seek(&m_io_cache, read_offset, MY_SEEK_SET,
+                                   MYF(0)) == MY_FILEPOS_ERROR) {
+      error = true;
+    } else {
+      const size_t read_length = mysql_encryption_file_read(
+          &m_io_cache, disk_buffer.data(), bytes, MYF(0));
+      error = read_length != bytes;
+      if (!error &&
+          ostream->write(disk_buffer.data(), static_cast<my_off_t>(bytes))) {
+        error = true;
+      }
+    }
+
+    if (mysql_encryption_file_seek(&m_io_cache, saved_file_pos, MY_SEEK_SET,
+                                   MYF(0)) == MY_FILEPOS_ERROR) {
+      error = true;
+    }
+    return error;
+  };
+
+  while (remaining > 0) {
+    if (position < write_buffer_start) {
+      const my_off_t disk_end = std::min(write_buffer_start, end_offset);
+      const size_t bytes_to_copy = std::min(
+          remaining,
+          std::min(disk_buffer.size(), static_cast<size_t>(disk_end - position)));
+      if (read_disk(position, bytes_to_copy)) return true;
+      position += bytes_to_copy;
+      remaining -= bytes_to_copy;
+      continue;
+    }
+
+    if (position >= write_buffer_start && position < write_buffer_end) {
+      const size_t in_buffer_start =
+          static_cast<size_t>(position - write_buffer_start);
+      const size_t bytes_to_copy = std::min(
+          remaining, static_cast<size_t>(write_buffer_end - position));
+      if (ostream->write(m_io_cache.write_buffer + in_buffer_start,
+                         static_cast<my_off_t>(bytes_to_copy))) {
+        return true;
+      }
+      position += bytes_to_copy;
+      remaining -= bytes_to_copy;
+      continue;
+    }
+
+    return true;
+  }
+  return false;
 }
 
 my_off_t IO_CACHE_binlog_cache_storage::length() const {
@@ -231,8 +317,8 @@ void IO_CACHE_binlog_cache_storage::disable_encryption() {
 }
 
 bool IO_CACHE_binlog_cache_storage::setup_ciphers_password() {
-  DBUG_ASSERT(m_io_cache.m_encryptor != nullptr &&
-              m_io_cache.m_decryptor != nullptr);
+  assert(m_io_cache.m_encryptor != nullptr &&
+         m_io_cache.m_decryptor != nullptr);
 
   unsigned char password[Aes_ctr_encryptor::PASSWORD_LENGTH];
   Key_string password_str;
@@ -259,11 +345,170 @@ bool Binlog_cache_storage::open(my_off_t cache_size, my_off_t max_cache_size) {
 }
 
 void Binlog_cache_storage::close() {
+  std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
+  const auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                                std::memory_order_acquire);
+  if (lease != nullptr) lease->close_source_cache();
   m_pipeline_head = nullptr;
   m_file.close();
 }
 
 Binlog_cache_storage::~Binlog_cache_storage() { close(); }
+
+void Binlog_cache_storage::set_warmcopy_mirror(
+    Binlog_cache_warmcopy_mirror *mirror) {
+  std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
+  auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                         std::memory_order_acquire);
+  if (lease == nullptr) {
+    lease = std::make_shared<Binlog_cache_warmcopy_lease>();
+    std::atomic_store_explicit(&m_warmcopy_lease, lease,
+                               std::memory_order_release);
+  }
+  if (mirror == nullptr) {
+    lease->close_source_cache();
+    return;
+  }
+  (void)lease->install_if_absent(mirror);
+}
+
+bool Binlog_cache_storage::install_warmcopy_mirror_if_absent(
+    Binlog_cache_warmcopy_mirror *mirror, my_off_t *length,
+    uint64_t *truncate_generation,
+    std::shared_ptr<Binlog_cache_warmcopy_lease> *lease) {
+  std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
+  auto current_lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                                 std::memory_order_acquire);
+  if (current_lease == nullptr) {
+    current_lease = std::make_shared<Binlog_cache_warmcopy_lease>();
+    std::atomic_store_explicit(&m_warmcopy_lease, current_lease,
+                               std::memory_order_release);
+  }
+  if (length != nullptr) *length = m_file.length();
+  if (truncate_generation != nullptr)
+    *truncate_generation = m_truncate_generation;
+  if (current_lease->install_if_absent(mirror)) return true;
+  if (lease != nullptr) *lease = current_lease;
+  return false;
+}
+
+void Binlog_cache_storage::clear_warmcopy_mirror(
+    Binlog_cache_warmcopy_mirror *mirror) {
+  const auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                                std::memory_order_acquire);
+  if (lease != nullptr) lease->clear_if_owner(mirror);
+}
+
+bool Binlog_cache_storage::warmcopy_mirror_active() const {
+  const auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                                std::memory_order_acquire);
+  return lease != nullptr && lease->active();
+}
+
+uint64_t Binlog_cache_storage::truncate_generation() const {
+  std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
+  return m_truncate_generation;
+}
+
+bool Binlog_cache_storage::write(const unsigned char *buffer,
+                                 my_off_t length) {
+  auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                         std::memory_order_acquire);
+  if (lease == nullptr || !lease->active()) {
+    if (m_pipeline_head == nullptr) return true;
+    return m_pipeline_head->write(buffer, length);
+  }
+
+  std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
+  lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                    std::memory_order_acquire);
+  if (m_pipeline_head == nullptr) {
+    if (lease != nullptr) lease->note_source_write_failed();
+    return true;
+  }
+
+  const my_off_t offset = m_file.length();
+  const bool source_error = m_pipeline_head->write(buffer, length);
+  if (source_error) {
+    if (lease != nullptr) lease->note_source_write_failed();
+    return true;
+  }
+
+  if (lease != nullptr && lease->active() &&
+      lease->write_at(static_cast<uint64_t>(offset), buffer,
+                      static_cast<size_t>(length)) ==
+          Binlog_warmcopy_mirror_status::ERROR) {
+    lease->mark_degraded("mirror write failed");
+  }
+  return false;
+}
+
+bool Binlog_cache_storage::truncate(my_off_t offset) {
+  auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                         std::memory_order_acquire);
+  if (lease == nullptr || !lease->active()) {
+    if (m_pipeline_head == nullptr) return true;
+    return m_pipeline_head->truncate(offset);
+  }
+
+  std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
+  lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                    std::memory_order_acquire);
+  if (m_pipeline_head == nullptr) return true;
+
+  const bool source_error = m_pipeline_head->truncate(offset);
+  if (source_error) return true;
+
+  ++m_truncate_generation;
+  if (lease != nullptr && lease->active() &&
+      lease->truncate(static_cast<uint64_t>(offset)) ==
+          Binlog_warmcopy_mirror_status::ERROR) {
+    lease->mark_degraded("mirror truncate failed");
+  }
+  return false;
+}
+
+bool Binlog_cache_storage::reset() {
+  auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                         std::memory_order_acquire);
+  if (lease == nullptr || !lease->active()) {
+    return m_file.reset();
+  }
+
+  std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
+  lease = std::atomic_load_explicit(&m_warmcopy_lease,
+                                    std::memory_order_acquire);
+  const bool source_error = m_file.reset();
+  if (source_error) return true;
+
+  ++m_truncate_generation;
+  if (lease != nullptr && lease->active()) lease->note_non_lifecycle_reset();
+  return false;
+}
+
+bool Binlog_cache_storage::copy_range_to(
+    my_off_t offset, size_t length, Basic_ostream *ostream,
+    uint64_t expected_truncate_generation, bool *stale_generation) {
+  if (stale_generation != nullptr) *stale_generation = false;
+  if (ostream == nullptr) return true;
+  if (length > static_cast<size_t>(std::numeric_limits<my_off_t>::max() -
+                                   offset)) {
+    return true;
+  }
+  std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
+  if (expected_truncate_generation != m_truncate_generation) {
+    if (stale_generation != nullptr) *stale_generation = true;
+    return true;
+  }
+
+  if (m_file.copy_range_to(offset, length, ostream)) return true;
+
+  if (expected_truncate_generation != m_truncate_generation) {
+    if (stale_generation != nullptr) *stale_generation = true;
+    return true;
+  }
+  return false;
+}
 
 Binlog_encryption_ostream::~Binlog_encryption_ostream() { close(); }
 
@@ -278,7 +523,7 @@ Binlog_encryption_ostream::~Binlog_encryption_ostream() { close(); }
 
 bool Binlog_encryption_ostream::open(
     std::unique_ptr<Truncatable_ostream> down_ostream) {
-  DBUG_ASSERT(down_ostream != nullptr);
+  assert(down_ostream != nullptr);
   m_header = Rpl_encryption_header::get_new_default_header();
   const Key_string password_str = m_header->generate_new_file_password();
   if (password_str.empty()) return true;
@@ -296,7 +541,7 @@ bool Binlog_encryption_ostream::open(
 bool Binlog_encryption_ostream::open(
     std::unique_ptr<Truncatable_ostream> down_ostream,
     std::unique_ptr<Rpl_encryption_header> header) {
-  DBUG_ASSERT(down_ostream != nullptr);
+  assert(down_ostream != nullptr);
 
   m_down_ostream = std::move(down_ostream);
   m_header = std::move(header);
@@ -314,8 +559,8 @@ bool Binlog_encryption_ostream::open(
 
 std::pair<bool, std::string> Binlog_encryption_ostream::reencrypt() {
   DBUG_TRACE;
-  DBUG_ASSERT(m_header != nullptr);
-  DBUG_ASSERT(m_down_ostream != nullptr);
+  assert(m_header != nullptr);
+  assert(m_down_ostream != nullptr);
   std::string error_message;
 
   /* Get the file password */

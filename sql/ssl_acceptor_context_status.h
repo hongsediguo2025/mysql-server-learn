@@ -23,9 +23,13 @@
 #ifndef SSL_ACCEPTOR_CONTEXT_STATUS
 #define SSL_ACCEPTOR_CONTEXT_STATUS
 
+#include <string>
+
 /* Functions to show mysql_main interface's TLS properties */
 class Ssl_mysql_main_status {
  public:
+  static bool get_ssl_ca_and_capath(std::string *ssl_ca,
+                                    std::string *ssl_capath);
   static int show_ssl_ctx_sess_accept(THD *, SHOW_VAR *var, char *buff);
   static int show_ssl_ctx_sess_accept_good(THD *, SHOW_VAR *var, char *buff);
   static int show_ssl_ctx_sess_connect_good(THD *, SHOW_VAR *var, char *buff);

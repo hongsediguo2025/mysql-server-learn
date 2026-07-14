@@ -1,0 +1,47 @@
+--source include/not_group_replication_plugin.inc
+--source include/master-slave.inc
+
+--echo #
+--echo # Preserve/resume remains single-instance only.  A client connected to
+--echo # a configured replica must fail closed, while ordinary replicated DML
+--echo # continues to apply from the source.
+--echo #
+
+--connection master
+--disable_warnings
+DROP TABLE IF EXISTS t_preserve_rpl_apply;
+--enable_warnings
+CREATE TABLE t_preserve_rpl_apply(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_preserve_rpl_apply VALUES(1, 10), (2, 20);
+--source include/sync_slave_sql_with_master.inc
+
+--connection slave
+SET GLOBAL preserve_trx_enable=ON;
+
+START TRANSACTION;
+UPDATE t_preserve_rpl_apply SET b=11 WHERE a=1;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ROLLBACK;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+
+--error ER_PRESERVE_TRX_UNSUPPORTED
+RESUME PRESERVED TRANSACTION 'invalid-token';
+
+SELECT * FROM t_preserve_rpl_apply ORDER BY a;
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+--connection master
+INSERT INTO t_preserve_rpl_apply VALUES(3, 30);
+--source include/sync_slave_sql_with_master.inc
+
+--connection slave
+SELECT * FROM t_preserve_rpl_apply ORDER BY a;
+
+--connection master
+DROP TABLE t_preserve_rpl_apply;
+--source include/sync_slave_sql_with_master.inc
+--source include/rpl_end.inc

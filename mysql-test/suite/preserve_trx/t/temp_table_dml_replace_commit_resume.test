@@ -1,0 +1,46 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+
+CREATE TEMPORARY TABLE tmp_preserve_replace_insert(
+  id INT PRIMARY KEY,
+  v INT NOT NULL,
+  KEY(v)
+) ENGINE=InnoDB;
+
+CREATE TABLE t_preserve_replace_insert(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO tmp_preserve_replace_insert VALUES(1, 10);
+START TRANSACTION;
+UPDATE tmp_preserve_replace_insert SET v = 11 WHERE id = 1;
+REPLACE INTO tmp_preserve_replace_insert VALUES(1, 12);
+REPLACE INTO t_preserve_replace_insert VALUES(1, 100);
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+
+REPLACE INTO t_preserve_replace_insert VALUES(2, 200);
+COMMIT;
+SELECT * FROM tmp_preserve_replace_insert ORDER BY id;
+SELECT * FROM t_preserve_replace_insert ORDER BY id;
+
+DROP TABLE t_preserve_replace_insert;
+DROP TEMPORARY TABLE tmp_preserve_replace_insert;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

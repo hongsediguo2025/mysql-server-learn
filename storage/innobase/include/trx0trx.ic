@@ -44,6 +44,7 @@ bool trx_state_eq(const trx_t *trx,  /*!< in: transaction */
 #ifdef UNIV_DEBUG
   switch (trx->state) {
     case TRX_STATE_PREPARED:
+    case TRX_STATE_PRESERVED:
 
       ut_ad(!trx_is_autocommit_non_locking(trx));
       return (trx->state == state);

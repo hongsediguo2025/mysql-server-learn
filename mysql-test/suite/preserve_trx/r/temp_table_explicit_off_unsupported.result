@@ -1,0 +1,34 @@
+SELECT @@global.preserve_trx_temp_table_enable AS temp_table_gate_default;
+temp_table_gate_default
+1
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=OFF;
+CREATE TABLE t_base(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+CREATE TEMPORARY TABLE tmp_t(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+START TRANSACTION;
+INSERT INTO t_base VALUES(1, 1);
+INSERT INTO tmp_t VALUES(1, 10);
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+ROLLBACK;
+DROP TEMPORARY TABLE tmp_t;
+INSERT INTO t_base VALUES(1, 1);
+CREATE TEMPORARY TABLE tmp_t_dropped(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+START TRANSACTION;
+UPDATE t_base SET v=2 WHERE id=1;
+SELECT ROW_COUNT() AS updated_base_rows;
+updated_base_rows
+1
+INSERT INTO tmp_t_dropped VALUES(2, 20);
+DROP TEMPORARY TABLE tmp_t_dropped;
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+ROLLBACK;
+Warnings:
+Warning	1752	Some temporary tables were dropped, but these operations could not be rolled back.
+SELECT id, v FROM t_base;
+id	v
+1	1
+DROP TABLE t_base;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

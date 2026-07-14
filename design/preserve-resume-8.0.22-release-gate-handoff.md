@@ -1,0 +1,686 @@
+# Preserve/Resume 8.0.22 Release Gate Handoff
+
+## Scope
+
+This handoff tracks the remaining release gate for the
+`codex/preserve-resume-8.0.22-port` branch after the preserve/resume feature
+port, hardening, and local verification work.
+
+Evidence baseline when this handoff was prepared:
+
+```text
+worktree: /Users/a1234/project/mysql-server-8022-preserve-port
+branch: codex/preserve-resume-8.0.22-port
+evidence baseline HEAD before this doc-only handoff: 2d35914e6f8
+```
+
+## Draft PR Entry
+
+A draft PR now exists for release-owner review and release-farm handoff:
+
+```text
+url: https://github.com/hongsediguo2025/mysql-server-learn/pull/1
+state: open draft
+base: codex/mysql-8.0.22-port-base
+base SHA: ee4455a33b10f1b1886044322e4893f587b319ed
+head: codex/preserve-resume-8.0.22-port
+head SHA at PR creation: 6f0ce733a1bdd5327a14375d41b87c9bc02dabab
+mergeable at creation: true
+size at creation: 84 commits, 1092 changed files
+```
+
+The base branch is intentionally `codex/mysql-8.0.22-port-base`, not `trunk`;
+the port branch is based on `mysql-8.0.22`.
+
+A release-owner action comment was added to the PR after the 49/49 local
+all-suite failure baseline-coverage classification:
+
+```text
+comment id: 4733460926
+purpose: request release-farm run or explicit release-owner waiver while keeping
+  the PR draft until the final full-MySQL gate closes
+```
+
+## Completed Local Gates
+
+The detailed evidence is recorded in
+`design/preserve-resume-8.0.22-review-checklist.md`.  The local gates already
+closed for this port include:
+
+- debug and release full builds for the 8.0.22 port worktree;
+- debug and release preserve/resume GUnit:
+  `preserve_trx-t`, `preserve_trx_drain-t`, `preserve_trx_temp_table-t`,
+  `preserve_trx_warmcopy-t`, and `trx0preserve-t`;
+- debug and release accelerated `preserve_trx` MTR with normal binlog,
+  `--skip-log-bin`, and `--big-test`;
+- source lint through `scripts/preserve_trx_lint_runner.py`;
+- Python unit, live E2E, reduced semantic matrix, and longrun/320-session
+  preserve/resume evidence recorded in the checklist;
+- targeted all-suite follow-up for port-owned result or plugin issues recorded
+  in the checklist.
+
+The most recent port-owned all-suite failure fixed in this branch was
+`rpl_gtid.rpl_multi_source_mtr_includes`.  It now keeps the default-channel and
+`ch1` include calls but no longer asserts nondeterministic relay-log event
+contents.  Release repeat evidence:
+
+```text
+command:
+  cd build-release/mysql-test &&
+  perl mysql-test-run.pl --suite=rpl_gtid rpl_multi_source_mtr_includes \
+    --force --parallel=1 --timer --repeat=50 \
+    --vardir=/tmp/m8022-rpl-include-start-repeat50b --port-base=30000
+
+status:
+  /tmp/m8022-rpl-include-start-repeat50b.status = 0
+```
+
+## Release-Owner Threat-Model Decisions
+
+The following preserve/resume semantics are intentional release-contract
+decisions rather than hidden implementation bugs.  They require explicit
+release-owner acceptance before the draft PR is marked ready:
+
+1. `PROCESS` sees full preserved-transaction tokens in
+   `performance_schema.preserved_transactions`.
+   - Current rationale: `PROCESS` is treated as a DBA/management trust boundary,
+     similar to visibility into other sessions' statement text.
+   - Risk: the token is a bearer credential for `RESUME PRESERVED TRANSACTION`.
+   - Future option if this trust boundary is rejected: add a dedicated
+     `PRESERVE_TRX_ADMIN` privilege and redact tokens from generic `PROCESS`.
+   - Sign-off status: pending release-owner decision.
+
+2. Snapshot and sidecar files are authenticated but not encrypted at rest.
+   - Current contract: CRC/HMAC, bound key, no-symlink regular-file checks,
+     `0600` files, and preserve directory permissions provide integrity and
+     filesystem-bound confidentiality.
+   - Risk: backups, shared storage, or host-level readers with datadir access can
+     inspect snapshot payloads.
+   - Future option if this threat model is rejected: add encryption-at-rest for
+     snapshot and sidecar payloads.
+   - Sign-off status: pending release-owner decision.
+
+3. RESUME object privilege recheck is conservative for column-level grants.
+   - Current hardening: lock-only MDL table checks now use only global/db/table
+     ACLs and reject column-only grants.  Modified-table checks already used
+     table-level grants only.
+   - Risk accepted by the implementation: a user with only column-level access
+     may be unable to resume a preserved transaction even if their original SQL
+     was column-limited.
+   - Chosen behavior: fail closed and keep the token available for an authorized
+     user rather than attempting to reconstruct original column access.
+   - Sign-off status: pending release-owner decision.
+
+## Remaining Gate
+
+The final full MySQL gate is still open:
+
+```text
+[ ] Full MySQL MTR or CI/release farm gate passed.
+```
+
+This should only be closed by one of:
+
+1. a plugin-complete full MySQL MTR pass for this branch;
+2. a CI/release-farm all-suite result accepted by the release owner; or
+3. an explicit waiver accepted by the release owner that lists every remaining
+   all-suite failure and proves each is baseline/environmental rather than a
+   preserve/resume regression.
+
+Local raw all-suite attempts are useful for triage, but they are not currently
+green release evidence on this macOS host.
+
+Remote CI availability check on 2026-06-18:
+
+```text
+branch:
+  mxx/codex/preserve-resume-8.0.22-port was checked at =
+  c8a629878528f047f51369c6a4dc2dc41340cbec
+
+GitHub PR:
+  https://github.com/hongsediguo2025/mysql-server-learn/pull/1
+  state=open draft
+  mergeable=true
+  checked head=c8a629878528f047f51369c6a4dc2dc41340cbec
+  release-owner action comment id=4733460926
+
+GitHub combined status for c8a629878528:
+  statuses=[]
+
+repository workflows:
+  no tracked .github/workflows files in this checkout
+```
+
+This documentation-only handoff refresh may advance the PR head; use the PR head
+ref as authoritative for the exact latest commit. The absence of automatic
+GitHub status/check context was observed for the checked head and still requires
+external release-farm or release-owner action.
+
+So this branch currently has no automatic GitHub status/check context that can
+close the release gate. The final gate still requires an explicit release-farm
+run, release-owner CI, or accepted waiver.
+
+## Current Plugin-Available Local All-Suite Refresh
+
+A newer local release all-suite attempt was run after the missing local plugin
+artifacts were built and available in `build-release/plugin_output_directory`.
+This makes the local evidence stronger than the earlier plugin-missing attempt,
+but it still does not close the final gate because the remaining failures are not
+all baseline-waived.
+
+```text
+run dir:
+  /tmp/m8022allrel-final-20260618005336
+
+command:
+  cd build-release/mysql-test &&
+  perl mysql-test-run.pl --suite=all --force --parallel=8 --max-test-fail=50 \
+    --timer --vardir=/tmp/m8022allrel-final-20260618005336/var
+
+status:
+  /tmp/m8022allrel-final-20260618005336/full.status = 1
+
+summary:
+  servers restarted: 1465
+  servers reinitialized: 50
+  failed: 49/4313 tests
+  successful: 98.86%
+  skipped: 3098 tests, 509 by the test itself
+  termination: Too many tests(50) failed.
+```
+
+The run exercised plugin-dependent areas that were previously unavailable on
+this host. For example, clone and group-replication tests such as
+`clone.remote_basic_replace`, `clone.remote_dml_replace`,
+`group_replication.gr_message_service`, and
+`group_replication.gr_clone_integration_basics` passed before the run reached
+the failure threshold.
+
+The final failing test list contains no `preserve_trx.*` tests. Preserve/Resume
+tests observed during the run passed, including warmcopy, token visibility,
+GTID/binlog-cache, lock/read-view, temp-table fail-closed, timeout/recovery, and
+batch-drain cases. This is useful integration evidence, but it is not a green
+full-MySQL gate.
+
+Failing tests from this local run:
+
+```text
+main.subquery_sj_all_bka_nobnl
+main.select_icp_mrr_bka
+main.range_icp_mrr
+auth_sec.cert_verify_openssl
+main.join_cache_bnl
+main.join_outer_bka
+main.myisam_mrr
+main.innodb_mrr
+main.subquery_nomat_nosj_bka
+main.sp
+engines/rr_trx.rr_c_stats
+main.select_all_bka
+auth_sec.admin_channel_tls
+main.subquery_none_bka_nobnl
+main.subquery_all_bka
+main.subquery_nomat_nosj_bka_nobnl
+main.grant_user_lock
+main.join_cache_nojb
+main.partition_column
+main.subquery_all
+main.join_cache_bka
+main.innodb_mrr_all
+perfschema.error_log
+main.myisam_mrr_all
+auth_sec.cert_verify
+main.subquery_nomat_nosj
+main.range_all
+main.range_mrr
+main.subquery_sj_all_bka
+main.select_all
+main.myisam_mrr_icp
+main.partition_list
+main.innodb_mrr_icp
+main.subquery_sj_all
+main.select_icp_mrr
+main.mysql_not_windows
+main.execution_constants
+main.subquery_all_bka_nobnl
+main.select_all_bka_nobnl
+main.subquery_none
+main.window_std_var
+engines/rr_trx.rr_c_count_not_zero
+json.array_index
+main.join_cache_bka_nobnl
+main.select_icp_mrr_bka_nobnl
+main.window_std_var_optimized
+main.join_outer_bka_nobnl
+engines/rr_trx.init_innodb
+main.subquery_none_bka
+```
+
+The final full-MySQL gate remains open until those failures are either absent in
+a release-farm all-suite pass or explicitly classified/waived by the release
+owner against an acceptable baseline.
+
+Local baseline coverage for this final failing list:
+
+```text
+current all-suite failing tests: 49
+covered by previous baseline reproduction:
+  /tmp/m8022-baseline-49fail-repro2/run.log -> 45 tests
+covered by previous baseline rr_trx reproduction:
+  /tmp/m8022-baseline-rrtrxfail-repro/run.log -> 3 tests
+new outlier:
+  main.grant_user_lock
+
+targeted port reproduction:
+  /tmp/m8022-port-grant-user-lock-targeted/status = 1
+
+targeted baseline reproduction:
+  /tmp/m8022-baseline-grant-user-lock-targeted/status = 1
+```
+
+`main.grant_user_lock` fails with the same error on the port and the
+`mysql-8.0.22` baseline plus local compiler shim:
+
+```text
+connect anonymous_user_con, localhost, '', pass
+ERROR 1045 (28000): Access denied for user 'root'@'localhost'
+```
+
+So the 49 failures from `/tmp/m8022allrel-final-20260618005336` are all covered
+by baseline reproduction or targeted baseline reproduction. This still is not a
+green full all-suite result; it is a waiver-ready classification package for the
+release owner.
+
+## Current Local Baseline-Parity Blockers
+
+The latest local broad all-suite attempt after `447fba51540` was stopped after
+collecting enough evidence because it had already failed and was consuming
+`/tmp` space.  Its relevant remaining blockers were reproduced on both the port
+and a clean `mysql-8.0.22` baseline plus the minimal local compiler shim needed
+by the current libc++ toolchain.
+
+### `main.range_all`
+
+Port result:
+
+```text
+/tmp/m8022-port-range-all.status = 1
+```
+
+Baseline result:
+
+```text
+/tmp/m8022-baseline-range-all.status = 1
+```
+
+Observed failure:
+
+```text
+expected row: 1014 N 14 1014 N 14
+actual row:   1001 A 1  1001 A 1
+```
+
+The same result difference appears on both port and baseline+shim, so it is not
+classified as a preserve/resume regression.
+
+### `main.subquery_all`
+
+Port result:
+
+```text
+/tmp/m8022-port-subquery-all.status = 1
+```
+
+Baseline result:
+
+```text
+/tmp/m8022-baseline-subquery-all.status = 1
+```
+
+Observed failure:
+
+```text
+mysqld got signal 10
+stack contains repeated:
+  mi_open_share
+  ha_myisam::open
+  handler::clone
+  DsMrr_impl::dsmrr_init
+  QUICK_RANGE_SELECT::reset
+  IndexRangeScanIterator::Init
+  TemptableAggregateIterator::Init
+  SELECT_LEX_UNIT::ExecuteIteratorQuery
+  Item_subselect::exec
+  get_mm_leaf / get_mm_tree / test_quick_select
+```
+
+The same crash stack appears on both port and baseline+shim, so it is not
+classified as a preserve/resume regression.
+
+## Required Release-Farm/Owner Action
+
+To close the final checklist item, the next owner should run a plugin-complete
+full all-suite gate in the release-farm environment, or explicitly waive the
+known local baseline-parity failures above together with any additional
+failures reported by that environment.
+
+Recommended release-farm command shape:
+
+```text
+cd build-release/mysql-test
+perl mysql-test-run.pl --suite=all --force --parallel=<farm-default> \
+  --timer --vardir=<farm-vardir>
+```
+
+The release-farm report should record:
+
+- exact branch and commit SHA;
+- build profile and plugin/component availability;
+- full MTR command line;
+- total executed/skipped/failed tests;
+- final failing test list, if any;
+- for each failure: port-only, baseline-reproduced, environment/plugin, or
+  accepted release waiver.
+
+## Non-Closure Rule
+
+Do not mark the final release checklist item complete solely because the
+feature-specific preserve/resume gates are green.  Those gates prove the feature
+surface; the remaining all-suite gate proves integration with the full MySQL
+8.0.22 test universe.
+
+## Lock Warmcopy Addendum, 2026-06-20
+
+This addendum tracks the lock warmcopy branch evidence in the current 8.0.22
+preserve-port worktree:
+
+```text
+worktree: /Users/a1234/project/mysql-server-8022-preserve-port
+branch: codex/preserve-trx-lock-warmcopy
+rule: no additional invasive changes to original MySQL 8.0.22 code
+```
+
+The lock warmcopy implementation remains an optimization over the current live
+lock export path. The current local evidence supports feature-specific review,
+but it does not close the full large-lockset release gate because this machine
+still lacks enough free disk for the configured full NFR workload.
+
+Fresh feature-specific gates:
+
+```text
+debug GUnit:
+  build-debug/runtime_output_directory/preserve_trx_lock_warmcopy-t
+  status: passed 40 tests
+
+  build-debug/runtime_output_directory/lock0warmcopy-t
+  status: passed 30 tests
+
+release GUnit:
+  build-release/runtime_output_directory/preserve_trx_lock_warmcopy-t
+  status: passed 40 tests
+
+  build-release/runtime_output_directory/lock0warmcopy-t
+  status: passed 30 tests
+
+debug MTR:
+  lock_warmcopy_test_count=41
+  status: all 42 executed MTR entries passed, including shutdown_report
+  server restarts: 30
+  elapsed executing testcases: 134.478 seconds
+```
+
+Fresh release hot-path gate:
+
+```text
+log:
+  build-release/lock-warmcopy-reports/lock0warmcopy-release-fresh.log
+report:
+  build-release/lock-warmcopy-reports/lock0warmcopy-hotpath-benchmark-fresh-report.json
+
+baseline:
+  BM_InnoDBLockWarmcopyRecordHotPathBaseline = 2.0 ns/iter
+disabled:
+  BM_InnoDBLockWarmcopyDisabledRecordHotPath = 2.0 ns/iter
+  disabled_regression_pct = 0.0
+  threshold = 2.0
+enabled:
+  BM_InnoDBLockWarmcopyEnabledRecordHotPath = 19.0 ns/iter
+status:
+  pass
+```
+
+Fresh release smoke:
+
+```text
+command shape:
+  python3 scripts/lock_warmcopy_nfr2_runner.py smoke --build-dir build-release
+    --clean --sessions 4 --tables 4 --statements-per-tx 20 --cycles 1
+    --drain-interval 0.1 --preserve-timeout 120 --lock-warmcopy-mode <on|off>
+    --stop-after
+
+lock_warmcopy_mode=on:
+  status: pass
+  workers: 4
+  cycles: 1
+  resumed preserved transactions: 4
+  completed_tx_min: 17
+  completed_stmt_total: 1360
+
+lock_warmcopy_mode=off:
+  status: pass
+  workers: 4
+  cycles: 1
+  resumed preserved transactions: 4
+  completed_tx_min: 10
+  completed_stmt_total: 840
+```
+
+Fresh scaled release NFR:
+
+```text
+command:
+  python3 scripts/lock_warmcopy_nfr2_runner.py run-scaled
+    --build-dir build-release --clean --sessions 4 --tables 4
+    --statements-per-tx 1000 --seed-rows-per-table-per-session 1000
+    --lockset-batch-size 100 --cycles 2 --drain-interval 0.1
+    --preserve-timeout 180
+    --output build-release/lock-warmcopy-nfr2/reports/large-lockset-bulk-4x1000-b100-c2-latest.json
+    --stop-after
+
+report:
+  build-release/lock-warmcopy-nfr2/reports/large-lockset-bulk-4x1000-b100-c2-latest.json
+
+live export:
+  p95: 49.241458 ms
+  p99: 49.241458 ms
+  max: 49.241458 ms
+  samples: 2
+
+lock warmcopy:
+  p95: 11.5245 ms
+  p99: 11.5245 ms
+  max: 11.5245 ms
+  samples: 2
+
+comparison:
+  warmcopy_p95_below_live_baseline: true
+  status: pass
+```
+
+Fresh larger scaled release NFR:
+
+```text
+command:
+  python3 scripts/lock_warmcopy_nfr2_runner.py run-scaled
+    --build-dir build-release --clean --sessions 16 --tables 16
+    --statements-per-tx 2000 --seed-rows-per-table-per-session 2000
+    --lockset-batch-size 100 --cycles 2 --drain-interval 0.1
+    --preserve-timeout 300
+    --output build-release/lock-warmcopy-nfr2/reports/large-lockset-bulk-16x2000-b100-c2-latest.json
+    --stop-after
+
+report:
+  build-release/lock-warmcopy-nfr2/reports/large-lockset-bulk-16x2000-b100-c2-latest.json
+
+live export:
+  p95: 472.180625 ms
+  p99: 472.180625 ms
+  max: 472.180625 ms
+  samples: 2
+
+lock warmcopy:
+  p95: 105.753333 ms
+  p99: 105.753333 ms
+  max: 105.753333 ms
+  samples: 2
+
+comparison:
+  warmcopy_p95_below_live_baseline: true
+  status: pass
+```
+
+Full large-lockset NFR status:
+
+```text
+command:
+  python3 scripts/lock_warmcopy_nfr2_runner.py run-full
+    --build-dir build-release --stop-after
+
+result:
+  fail-fast before starting mysqld
+  required_bytes: 51539607552
+  available_bytes: 22357970944
+  reusable_work_dir_bytes: 0
+  work_dir: build-release/lock-warmcopy-nfr2
+```
+
+This remains a local capacity blocker for the full large-lockset release gate,
+not a lock warmcopy runtime failure. The feature must not be called fully
+release-complete until the full NFR gate passes in an environment with enough
+disk, or a release owner explicitly accepts an equivalent release-farm result
+or waiver.
+
+Post-run process check:
+
+```text
+python3 scripts/lock_warmcopy_nfr2_runner.py status --build-dir build-release
+  socket not reachable after --stop-after
+
+ps scan:
+  no residual lock-warmcopy-nfr2, resumable_trx_nfr2_benchmark.py,
+  resumable_trx_business_e2e.py, or NFR mysqld process
+```
+
+## Lock Warmcopy Correctness Fix Addendum, 2026-06-21
+
+This addendum tracks the follow-up fixes on the same branch after the deeper
+record payload, store lifetime, spill ownership, and rollback/conversion review:
+
+```text
+worktree: /Users/a1234/project/mysql-server-8022-preserve-port
+branch: codex/preserve-trx-lock-warmcopy
+starting HEAD for this fix round: 9a53ce15f2ed06b638aadaaa4efa493e14ffec8d
+rule: keep MySQL 8.0.22 native hot-path changes narrow and auditable
+```
+
+Correctness changes in this round:
+
+- phase 2 now builds the artifact `record_locks_payload` from the sealed
+  InnoDB record warmcopy store result; quiesced live export is retained for
+  canonical equivalence and fallback, not as the default artifact source;
+- record warmcopy store state is cleared when targets are prepared, finalized,
+  or aborted, preventing thread-id reuse or consecutive drain contamination;
+- lock warmcopy spill files now live under an instance-private root derived from
+  datadir/server UUID/port, with an owner marker; orphan cleanup only scans the
+  current instance root and does not delete foreign owner artifacts;
+- partial rollback implicit-to-explicit conversion no longer propagates transient
+  warmcopy conversion freeze timeout/interruption as a rollback fatal path;
+- sysvar text and documentation now state that
+  `preserve_trx_lock_warmcopy_max_memory_bytes` is an artifact payload memory
+  budget, not a process heap cap, and that `preserve_trx_lock_warmcopy_seal_threads`
+  is currently reserved/serial.
+
+Fresh local evidence for this fix round:
+
+```text
+debug GUnit:
+  build-debug/runtime_output_directory/preserve_trx_lock_warmcopy-t
+  status: passed 45 tests
+
+  build-debug/runtime_output_directory/lock0warmcopy-t
+  status: passed 33 tests
+
+targeted debug MTR:
+  build-debug/mysql-test/mysql-test-run.pl --suite=preserve_trx
+    batch_drain_lock_warmcopy_conversion_wait_retry --debug-server --parallel=1
+  status: passed
+
+  build-debug/mysql-test/mysql-test-run.pl --suite=preserve_trx
+    <all lock_warmcopy/preserve_trx_lock_warmcopy named tests>
+    --debug-server --parallel=4
+  status: passed 44 tests
+
+full preserve_trx debug MTR, log-bin default:
+  build-debug/mysql-test/mysql-test-run.pl --suite=preserve_trx
+    --debug-server --parallel=4
+  status: passed 274 executed tests, 138 skipped
+  evidence: /tmp/preserve_trx_logbin_full.log
+
+full preserve_trx debug MTR, no-bin:
+  build-debug/mysql-test/mysql-test-run.pl --suite=preserve_trx
+    --debug-server --parallel=4 --mysqld=--skip-log-bin
+  status: passed 295 executed tests, 117 skipped
+  evidence: /tmp/preserve_trx_nobin_full.log
+
+release build and lock warmcopy GUnit:
+  cmake --build build-release --target lock0warmcopy-t preserve_trx_lock_warmcopy-t mysqld -j4
+  status: passed; warnings observed are existing macOS/MySQL 8.0.22 warnings
+
+  build-release/runtime_output_directory/lock0warmcopy-t
+  status: passed 33 tests
+  evidence: build-release/lock-warmcopy-reports/lock0warmcopy-release-current.log
+
+  build-release/runtime_output_directory/preserve_trx_lock_warmcopy-t
+  status: passed 45 tests
+  evidence: build-release/lock-warmcopy-reports/preserve_trx_lock_warmcopy-release-current.log
+
+release hot-path gate:
+  scripts/resumable_trx_nfr2_benchmark.py --scenario none
+    --hotpath-benchmark-log build-release/lock-warmcopy-reports/lock0warmcopy-release-current.log
+    --require-hotpath-benchmark-gates
+  status: passed; baseline=2ns/iter, disabled=2ns/iter, disabled regression=0.0%, enabled=21ns/iter
+  evidence: build-release/lock-warmcopy-reports/hotpath-gate-current.json
+
+scaled release NFR:
+  scripts/lock_warmcopy_nfr2_runner.py run-scaled --build-dir build-release
+    --work-dir /tmp/lwc-nfr2-current --clean --stop-after
+    --sessions 16 --tables 8 --statements-per-tx 1000
+    --seed-rows-per-table-per-session 1000 --lockset-batch-size 1000
+    --cycles 1 --drain-interval 0.1 --preserve-timeout 600
+  status: passed; live phase2 p95=1322.212916ms, lock warmcopy phase2 p95=30.955750ms,
+    warmcopy_success=16, sealed_valid=16
+  evidence: build-release/lock-warmcopy-reports/nfr2-scaled-current.json
+
+full 1000-session large-lockset NFR:
+  status: not run on this host; runner requires 48GiB available and this volume
+    had about 46GiB free at the check time
+
+invasive-surface and helper tests:
+  python3 scripts/lock_warmcopy_invasive_surface.py --fail-on-expanded-high-risk
+  status: passed; `storage/innobase/row/row0undo.cc` is classified as a
+    high-risk but approved warmcopy-related undo conversion point, with the
+    disabled-warmcopy legacy-semantics requirement still called out
+
+  python3 -m unittest scripts.tests.test_lock_warmcopy_invasive_surface \
+    scripts.tests.test_lock_warmcopy_nfr2_runner \
+    scripts.tests.test_resumable_trx_nfr2_benchmark
+  status: passed 41 tests using stdlib unittest; system Python did not have
+    pytest installed
+```
+
+This addendum closes the local debug preserve/resume regression gate for this
+fix round and adds release-build, hot-path, and scaled NFR evidence. It does not
+close the full release gate by itself: the branch still needs the full
+1000-session large-lock workload on a host with enough disk space, plus the
+broader release-farm/full-MySQL gate before the default-ON lock warmcopy posture
+can be called production-ready.

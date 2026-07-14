@@ -1,0 +1,288 @@
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--disable_result_log
+--disable_warnings
+DROP DATABASE IF EXISTS preserve_batch_autoinc;
+DROP DATABASE IF EXISTS preserve_batch_lock;
+DROP DATABASE IF EXISTS preserve_batch_logged_cache;
+DROP DATABASE IF EXISTS preserve_batch_logged_empty;
+DROP DATABASE IF EXISTS preserve_batch_ignored;
+DROP DATABASE IF EXISTS preserve_batch_rv;
+DROP DATABASE IF EXISTS preserve_batch_savepoint;
+DROP DATABASE IF EXISTS preserve_batch_session_off;
+DROP DATABASE IF EXISTS preserve_batch_user_vars;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE DATABASE preserve_batch_autoinc;
+CREATE DATABASE preserve_batch_lock;
+CREATE DATABASE preserve_batch_logged_cache;
+CREATE DATABASE preserve_batch_logged_empty;
+CREATE DATABASE preserve_batch_ignored;
+CREATE DATABASE preserve_batch_rv;
+CREATE DATABASE preserve_batch_savepoint;
+CREATE DATABASE preserve_batch_session_off;
+CREATE DATABASE preserve_batch_user_vars;
+
+CREATE TABLE preserve_batch_autoinc.t(
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+CREATE TABLE preserve_batch_lock.t(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO preserve_batch_lock.t VALUES(10,10),(20,20),(30,30);
+
+CREATE TABLE preserve_batch_logged_cache.t(id INT PRIMARY KEY, v INT)
+  ENGINE=InnoDB;
+INSERT INTO preserve_batch_logged_cache.t VALUES(1,10);
+
+CREATE TABLE preserve_batch_logged_empty.t(id INT PRIMARY KEY, v INT)
+  ENGINE=InnoDB;
+INSERT INTO preserve_batch_logged_empty.t VALUES(1,10);
+
+CREATE TABLE preserve_batch_ignored.seed(id INT PRIMARY KEY, v INT)
+  ENGINE=InnoDB;
+INSERT INTO preserve_batch_ignored.seed VALUES(1,10);
+
+CREATE TABLE preserve_batch_rv.t(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO preserve_batch_rv.t VALUES(1,10),(2,200),(3,300);
+
+CREATE TABLE preserve_batch_savepoint.t(id INT PRIMARY KEY, v INT)
+  ENGINE=InnoDB;
+INSERT INTO preserve_batch_savepoint.t VALUES(1,10),(2,20),(3,30);
+
+CREATE TABLE preserve_batch_session_off.t(id INT PRIMARY KEY, v INT)
+  ENGINE=InnoDB;
+INSERT INTO preserve_batch_session_off.t VALUES(1,10);
+
+CREATE TABLE preserve_batch_user_vars.t(id INT PRIMARY KEY, v INT)
+  ENGINE=InnoDB;
+
+--connect(batch_rv,localhost,root,,preserve_batch_rv)
+--connection batch_rv
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+SELECT * FROM t WHERE id=1;
+
+--connect(batch_rv_writer,localhost,root,,test)
+--connection batch_rv_writer
+UPDATE preserve_batch_rv.t SET v=20 WHERE id=1;
+UPDATE preserve_batch_rv.t SET v=330 WHERE id=3;
+--disconnect batch_rv_writer
+--source include/wait_until_disconnected.inc
+
+--connection batch_rv
+UPDATE t SET v=201 WHERE id=2;
+
+--connect(batch_lock,localhost,root,,preserve_batch_lock)
+--connection batch_lock
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE t SET v=11 WHERE id=10;
+SELECT * FROM t WHERE id > 10 AND id <= 20 FOR UPDATE;
+
+--connect(batch_savepoint,localhost,root,,preserve_batch_savepoint)
+--connection batch_savepoint
+START TRANSACTION;
+UPDATE t SET v=11 WHERE id=1;
+SAVEPOINT s1;
+UPDATE t SET v=22 WHERE id=2;
+SAVEPOINT s2;
+UPDATE t SET v=33 WHERE id=3;
+
+--connect(batch_autoinc,localhost,root,,preserve_batch_autoinc)
+--connection batch_autoinc
+START TRANSACTION;
+INSERT INTO t(v) VALUES(10);
+
+--connect(batch_user_vars,localhost,root,,preserve_batch_user_vars)
+--connection batch_user_vars
+SET @batch_user_var = 'restored-value';
+START TRANSACTION;
+INSERT INTO t VALUES(1,10);
+
+--connect(batch_logged_empty,localhost,root,,preserve_batch_logged_empty)
+--connection batch_logged_empty
+START TRANSACTION;
+UPDATE preserve_batch_ignored.seed SET v=11 WHERE id=1;
+
+--connect(batch_session_off,localhost,root,,preserve_batch_session_off)
+--connection batch_session_off
+SET SESSION sql_log_bin=0;
+START TRANSACTION;
+UPDATE t SET v=11 WHERE id=1;
+
+--connect(batch_logged_cache,localhost,root,,preserve_batch_logged_cache)
+--connection batch_logged_cache
+START TRANSACTION;
+UPDATE t SET v=11 WHERE id=1;
+
+--connection default
+--enable_result_log
+--enable_query_log
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=20" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+SELECT SCHEMA_NAME, BINLOG_STATE, HAS_READ_VIEW, SAVEPOINT_COUNT,
+       AUTOINC_LOCK_OWNED, WROTE_TO_CACHE,
+       BINLOG_CACHE_SIZE > 0 AS CACHE_SIZE_POSITIVE,
+       SESSION_SQL_LOG_BIN, GLOBAL_LOG_BIN
+  FROM performance_schema.preserved_transactions
+  ORDER BY SCHEMA_NAME;
+
+--let $rv_token= `SELECT TOKEN FROM performance_schema.preserved_transactions WHERE SCHEMA_NAME='preserve_batch_rv'`
+--let $lock_token= `SELECT TOKEN FROM performance_schema.preserved_transactions WHERE SCHEMA_NAME='preserve_batch_lock'`
+--let $savepoint_token= `SELECT TOKEN FROM performance_schema.preserved_transactions WHERE SCHEMA_NAME='preserve_batch_savepoint'`
+--let $autoinc_token= `SELECT TOKEN FROM performance_schema.preserved_transactions WHERE SCHEMA_NAME='preserve_batch_autoinc'`
+--let $user_vars_token= `SELECT TOKEN FROM performance_schema.preserved_transactions WHERE SCHEMA_NAME='preserve_batch_user_vars'`
+--let $logged_empty_token= `SELECT TOKEN FROM performance_schema.preserved_transactions WHERE SCHEMA_NAME='preserve_batch_logged_empty'`
+--let $session_off_token= `SELECT TOKEN FROM performance_schema.preserved_transactions WHERE SCHEMA_NAME='preserve_batch_session_off'`
+--let $logged_cache_token= `SELECT TOKEN FROM performance_schema.preserved_transactions WHERE SCHEMA_NAME='preserve_batch_logged_cache'`
+
+--connect(batch_lock_writer,localhost,root,,test)
+--connection batch_lock_writer
+SET SESSION innodb_lock_wait_timeout=1;
+--error ER_LOCK_WAIT_TIMEOUT
+UPDATE preserve_batch_lock.t SET v=21 WHERE id=20;
+--error ER_LOCK_WAIT_TIMEOUT
+INSERT INTO preserve_batch_lock.t VALUES(15,15);
+--disconnect batch_lock_writer
+--source include/wait_until_disconnected.inc
+
+--connect(batch_resume_rv,localhost,root,,test)
+--connection batch_resume_rv
+--disable_query_log
+--eval RESUME PRESERVED TRANSACTION '$rv_token'
+--enable_query_log
+SELECT * FROM preserve_batch_rv.t ORDER BY id;
+COMMIT;
+
+--connect(batch_resume_lock,localhost,root,,test)
+--connection batch_resume_lock
+--disable_query_log
+--eval RESUME PRESERVED TRANSACTION '$lock_token'
+--enable_query_log
+ROLLBACK;
+UPDATE preserve_batch_lock.t SET v=21 WHERE id=20;
+INSERT INTO preserve_batch_lock.t VALUES(15,15);
+
+--connect(batch_resume_savepoint,localhost,root,,test)
+--connection batch_resume_savepoint
+--disable_query_log
+--eval RESUME PRESERVED TRANSACTION '$savepoint_token'
+--enable_query_log
+ROLLBACK TO SAVEPOINT s1;
+RELEASE SAVEPOINT s1;
+COMMIT;
+
+--connect(batch_resume_autoinc,localhost,root,,test)
+--connection batch_resume_autoinc
+--disable_query_log
+--eval RESUME PRESERVED TRANSACTION '$autoinc_token'
+--enable_query_log
+SELECT LAST_INSERT_ID() AS resumed_last_insert_id;
+INSERT INTO preserve_batch_autoinc.t(v) VALUES(20);
+SELECT LAST_INSERT_ID() AS second_insert_id;
+COMMIT;
+
+--connect(batch_resume_user_vars,localhost,root,,test)
+--connection batch_resume_user_vars
+--disable_query_log
+--eval RESUME PRESERVED TRANSACTION '$user_vars_token'
+--enable_query_log
+SELECT @batch_user_var AS restored_user_var;
+COMMIT;
+
+--connect(batch_resume_logged_empty,localhost,root,,test)
+--connection batch_resume_logged_empty
+--disable_query_log
+--eval RESUME PRESERVED TRANSACTION '$logged_empty_token'
+--enable_query_log
+SELECT @@session.sql_log_bin AS logged_empty_sql_log_bin;
+UPDATE preserve_batch_logged_empty.t SET v=11 WHERE id=1;
+COMMIT;
+
+--connect(batch_resume_session_off,localhost,root,,test)
+--connection batch_resume_session_off
+--disable_query_log
+--eval RESUME PRESERVED TRANSACTION '$session_off_token'
+--enable_query_log
+SELECT @@session.sql_log_bin AS session_off_sql_log_bin;
+UPDATE preserve_batch_session_off.t SET v=12 WHERE id=1;
+COMMIT;
+
+--connect(batch_resume_logged_cache,localhost,root,,test)
+--connection batch_resume_logged_cache
+--disable_query_log
+--eval RESUME PRESERVED TRANSACTION '$logged_cache_token'
+--enable_query_log
+SELECT @@session.sql_log_bin AS logged_cache_sql_log_bin;
+COMMIT;
+
+--connection default
+SELECT COUNT(*) AS remaining_preserved
+  FROM performance_schema.preserved_transactions;
+SELECT * FROM preserve_batch_rv.t ORDER BY id;
+SELECT * FROM preserve_batch_lock.t ORDER BY id;
+SELECT * FROM preserve_batch_savepoint.t ORDER BY id;
+SELECT * FROM preserve_batch_autoinc.t ORDER BY id;
+SELECT * FROM preserve_batch_user_vars.t ORDER BY id;
+SELECT * FROM preserve_batch_logged_empty.t ORDER BY id;
+SELECT * FROM preserve_batch_session_off.t ORDER BY id;
+SELECT * FROM preserve_batch_logged_cache.t ORDER BY id;
+
+--let $binlog_file= query_get_value(SHOW MASTER STATUS, File, 1)
+--exec $MYSQL_BINLOG --force-if-open --base64-output=decode-rows -v -v $MYSQLTEST_VARDIR/mysqld.1/data/$binlog_file > $MYSQLTEST_VARDIR/tmp/batch_semantics_matrix.mysqlbinlog
+--let $assert_match=
+--let $assert_count=
+--let $assert_count_condition=
+--let $assert_text= Batch LOGGED_EMPTY future DML is written to the binlog
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/batch_semantics_matrix.mysqlbinlog
+--let $assert_select= ### UPDATE `preserve_batch_logged_empty`.`t`
+--let $assert_count_condition= >= 1
+--source include/assert_grep.inc
+--let $assert_match=
+--let $assert_count=
+--let $assert_count_condition=
+--let $assert_text= Batch LOGGED_WITH_CACHE preserved DML is written to the binlog
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/batch_semantics_matrix.mysqlbinlog
+--let $assert_select= ### UPDATE `preserve_batch_logged_cache`.`t`
+--let $assert_count_condition= >= 1
+--source include/assert_grep.inc
+--let $assert_match=
+--let $assert_count=
+--let $assert_count_condition=
+--let $assert_text= Batch SESSION_OFF_NO_CACHE DML stays out of the binlog
+--let $assert_file= $MYSQLTEST_VARDIR/tmp/batch_semantics_matrix.mysqlbinlog
+--let $assert_select= ### UPDATE `preserve_batch_session_off`.`t`
+--let $assert_count= 0
+--source include/assert_grep.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/batch_semantics_matrix.mysqlbinlog
+
+--disable_query_log
+DROP DATABASE preserve_batch_autoinc;
+DROP DATABASE preserve_batch_lock;
+DROP DATABASE preserve_batch_logged_cache;
+DROP DATABASE preserve_batch_logged_empty;
+DROP DATABASE preserve_batch_ignored;
+DROP DATABASE preserve_batch_rv;
+DROP DATABASE preserve_batch_savepoint;
+DROP DATABASE preserve_batch_session_off;
+DROP DATABASE preserve_batch_user_vars;
+SET GLOBAL preserve_trx_enable=ON;
+--enable_query_log

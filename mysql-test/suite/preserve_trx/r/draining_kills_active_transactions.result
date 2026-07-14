@@ -1,0 +1,37 @@
+DROP TABLE IF EXISTS t_preserve_drain;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_drain_mode=HARD;
+CREATE TABLE t_preserve_drain(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_preserve_drain VALUES(1,10),(2,20),(3,30);
+START TRANSACTION;
+UPDATE t_preserve_drain SET b=21 WHERE a=2;
+SET DEBUG_SYNC =
+'preserve_trx_after_lock_materialization SIGNAL drain_snapshot_ready WAIT_FOR continue_drain_preserve';
+START TRANSACTION;
+UPDATE t_preserve_drain SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET DEBUG_SYNC = 'now WAIT_FOR drain_snapshot_ready TIMEOUT 10';
+SELECT COUNT(*) AS blocker_thread_count FROM performance_schema.threads WHERE PROCESSLIST_ID = BLOCKER_ID;
+blocker_thread_count
+0
+UPDATE t_preserve_drain SET b=31 WHERE a=3;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+KILL QUERY PRESERVE_ID;
+SET DEBUG_SYNC = 'now SIGNAL continue_drain_preserve';
+ERROR 70100: Query execution was interrupted
+SET DEBUG_SYNC = 'RESET';
+SELECT * FROM t_preserve_drain WHERE a=1;
+a	b
+1	11
+ROLLBACK;
+SELECT * FROM t_preserve_drain ORDER BY a;
+a	b
+1	10
+2	20
+3	30
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+DROP TABLE t_preserve_drain;
+SET GLOBAL preserve_trx_enable=ON;

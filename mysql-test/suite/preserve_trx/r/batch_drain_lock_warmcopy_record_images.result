@@ -1,0 +1,60 @@
+DROP TABLE IF EXISTS t_lock_warmcopy_record_images;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+CREATE TABLE t_lock_warmcopy_record_images(
+id INT PRIMARY KEY,
+grp INT NOT NULL,
+v INT NOT NULL,
+pad VARBINARY(96),
+note VARCHAR(80),
+KEY k_grp_v(grp, v)
+) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_record_images VALUES
+(1,10,100,REPEAT('a',48),'share-image-alpha'),
+(2,10,200,REPEAT('b',64),'x-image-beta'),
+(3,20,300,REPEAT('c',32),'free-image-gamma');
+START TRANSACTION;
+SELECT id, grp, v, note
+FROM t_lock_warmcopy_record_images
+WHERE id=1
+FOR SHARE;
+id	grp	v	note
+1	10	100	share-image-alpha
+UPDATE t_lock_warmcopy_record_images
+SET v=201, pad=REPEAT('x',64), note='x-image-beta-updated'
+  WHERE id=2;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+include/assert_grep.inc [lock warmcopy succeeds for record images]
+SELECT COUNT(*) AS preserved_count_after_record_images_warmcopy
+FROM performance_schema.preserved_transactions;
+preserved_count_after_record_images_warmcopy
+1
+SET innodb_lock_wait_timeout=1;
+UPDATE t_lock_warmcopy_record_images
+SET note='share-row-should-block'
+  WHERE id=1;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+UPDATE t_lock_warmcopy_record_images
+SET note='x-row-should-block'
+  WHERE id=2;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+UPDATE t_lock_warmcopy_record_images
+SET v=301, note='free-row-updated'
+  WHERE id=3;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+SELECT COUNT(*) AS preserved_count_after_record_images_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_record_images_resume
+0
+SELECT id, v, pad=REPEAT('x',64) AS pad_x, note
+FROM t_lock_warmcopy_record_images
+ORDER BY id;
+id	v	pad_x	note
+1	100	0	share-image-alpha
+2	201	1	x-image-beta-updated
+3	301	0	free-row-updated
+DROP TABLE t_lock_warmcopy_record_images;

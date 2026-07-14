@@ -1,0 +1,25 @@
+# restart: --preserve-trx-enable=OFF
+DROP USER IF EXISTS preserve_pfs_denied@localhost;
+CREATE USER preserve_pfs_denied@localhost;
+SELECT COUNT(*) FROM performance_schema.preserved_transactions;
+ERROR 42000: SELECT command denied to user 'preserve_pfs_denied'@'localhost' for table 'preserved_transactions'
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 60;
+ERROR HY000: Resumable transactions across shutdown are disabled
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 1.5;
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near '1.5' at line 1
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH USER VARS;
+ERROR HY000: Resumable transactions across shutdown are disabled
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH NO USER VARS;
+ERROR HY000: Resumable transactions across shutdown are disabled
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 1 WITH TIMEOUT 2;
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'WITH TIMEOUT 2' at line 1
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300 NO USER VARS;
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'NO USER VARS' at line 1
+PREPARE SHUTDOWN PRESERVE TRANSACTION NO USER VARS;
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'NO USER VARS' at line 1
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH USER VARS WITH NO USER VARS;
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'WITH NO USER VARS' at line 1
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH NO USER VARS WITH USER VARS;
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'WITH USER VARS' at line 1
+DROP USER preserve_pfs_denied@localhost;
+# restart: --preserve-trx-enable=ON

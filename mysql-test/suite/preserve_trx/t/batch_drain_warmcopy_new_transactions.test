@@ -1,0 +1,101 @@
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_warmcopy_new;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=1;
+
+CREATE TABLE t_warmcopy_new(
+  id INT PRIMARY KEY,
+  v INT,
+  tag VARCHAR(32),
+  payload VARBINARY(2048)
+) ENGINE=InnoDB;
+INSERT INTO t_warmcopy_new
+  VALUES(1,10,'old',REPEAT('a',32)),(2,20,'new',REPEAT('b',32));
+
+--connect(warmcopy_new_old, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_warmcopy_new SET v=11 WHERE id=1;
+
+--connect(warmcopy_new_owner, localhost, root,,test)
+--connection warmcopy_new_owner
+SET DEBUG_SYNC =
+  'preserve_trx_warmcopy_open SIGNAL warmcopy_new_open WAIT_FOR warmcopy_new_continue';
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_new_open TIMEOUT 10';
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+
+--connect(warmcopy_new_control_drain, localhost, root,,test)
+--connection warmcopy_new_control_drain
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+--disconnect warmcopy_new_control_drain
+
+--connect(warmcopy_new_control_preserve, localhost, root,,test)
+--connection warmcopy_new_control_preserve
+START TRANSACTION;
+INSERT INTO t_warmcopy_new VALUES(3,30,'control',REPEAT('d',32));
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ROLLBACK;
+--disconnect warmcopy_new_control_preserve
+
+--connect(warmcopy_new_late, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_warmcopy_new SET v=21, payload=REPEAT('c',2048) WHERE id=2;
+--connection default
+SET DEBUG_SYNC = 'now SIGNAL warmcopy_new_continue';
+
+--connection warmcopy_new_owner
+--reap
+--disconnect warmcopy_new_owner
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+CREATE TEMPORARY TABLE warmcopy_new_tokens AS
+SELECT ROW_NUMBER() OVER (ORDER BY TOKEN) AS rn, TOKEN
+  FROM performance_schema.preserved_transactions;
+--let $token1= `SELECT TOKEN FROM warmcopy_new_tokens WHERE rn=1`
+--let $token2= `SELECT TOKEN FROM warmcopy_new_tokens WHERE rn=2`
+
+--connect(warmcopy_new_resume1, localhost, root,,test)
+--connection warmcopy_new_resume1
+--replace_result $token1 TOKEN
+--eval RESUME PRESERVED TRANSACTION '$token1'
+COMMIT;
+
+--connect(warmcopy_new_resume2, localhost, root,,test)
+--connection warmcopy_new_resume2
+--replace_result $token2 TOKEN
+--eval RESUME PRESERVED TRANSACTION '$token2'
+COMMIT;
+
+--connection default
+SELECT id, v, OCTET_LENGTH(payload) AS payload_len,
+       payload=IF(id=2, REPEAT('c',2048), REPEAT('a',32)) AS payload_ok
+  FROM t_warmcopy_new ORDER BY id;
+
+DROP TABLE t_warmcopy_new;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=18446744073709551615;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET DEBUG_SYNC = 'RESET';

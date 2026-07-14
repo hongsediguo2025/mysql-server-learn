@@ -1,0 +1,204 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_preserve_open_cursor;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_preserve_open_cursor(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_preserve_open_cursor VALUES(1,10),(2,20),(3,30);
+
+--let $raw_cursor_client= $MYSQLTEST_VARDIR/tmp/preserve_open_cursor_client.pl
+--let $raw_cursor_output= $MYSQLTEST_VARDIR/tmp/preserve_open_cursor.out
+
+--write_file $raw_cursor_client
+use strict;
+use warnings;
+use IO::Socket::UNIX;
+
+$| = 1;
+
+my ($socket_path) = @ARGV;
+
+use constant CLIENT_LONG_PASSWORD => 0x00000001;
+use constant CLIENT_LONG_FLAG => 0x00000004;
+use constant CLIENT_CONNECT_WITH_DB => 0x00000008;
+use constant CLIENT_PROTOCOL_41 => 0x00000200;
+use constant CLIENT_TRANSACTIONS => 0x00002000;
+use constant CLIENT_SECURE_CONNECTION => 0x00008000;
+use constant CLIENT_MULTI_RESULTS => 0x00020000;
+use constant CLIENT_PLUGIN_AUTH => 0x00080000;
+use constant CLIENT_CONNECT_ATTRS => 0x00100000;
+
+sub read_exact {
+  my ($sock, $len) = @_;
+  my $buf = '';
+  while (length($buf) < $len) {
+    my $read = sysread($sock, my $chunk, $len - length($buf));
+    die "socket closed\n" unless defined($read) && $read > 0;
+    $buf .= $chunk;
+  }
+  return $buf;
+}
+
+sub read_packet {
+  my ($sock) = @_;
+  my $header = read_exact($sock, 4);
+  my @h = unpack('C4', $header);
+  my $len = $h[0] | ($h[1] << 8) | ($h[2] << 16);
+  return read_exact($sock, $len);
+}
+
+sub write_packet {
+  my ($sock, $seq, $payload) = @_;
+  my $len = length($payload);
+  print {$sock} pack('C4', $len & 0xff, ($len >> 8) & 0xff,
+                     ($len >> 16) & 0xff, $seq) . $payload;
+}
+
+sub error_packet {
+  my ($packet) = @_;
+  return unless length($packet) > 0 && ord(substr($packet, 0, 1)) == 0xff;
+  my $code = unpack('v', substr($packet, 1, 2));
+  my $msg_start = substr($packet, 3, 1) eq '#' ? 9 : 3;
+  my $message = substr($packet, $msg_start);
+  $message =~ s/\r?\n/ /g;
+  return ($code, $message);
+}
+
+sub expect_ok {
+  my ($packet, $label) = @_;
+  if (my ($code, $message) = error_packet($packet)) {
+    die "$label failed: $code $message\n";
+  }
+  die "$label failed: unexpected packet\n"
+      unless length($packet) > 0 && ord(substr($packet, 0, 1)) == 0x00;
+}
+
+sub command {
+  my ($sock, $cmd, $body) = @_;
+  write_packet($sock, 0, chr($cmd) . $body);
+  return read_packet($sock);
+}
+
+sub query_ok {
+  my ($sock, $query) = @_;
+  expect_ok(command($sock, 0x03, $query), $query);
+}
+
+sub read_result_metadata {
+  my ($sock, $packet, $label) = @_;
+  if (my ($code, $message) = error_packet($packet)) {
+    die "$label failed: $code $message\n";
+  }
+  die "$label failed: empty packet\n" unless length($packet) > 0;
+  my $column_count = ord(substr($packet, 0, 1));
+  die "$label failed: unexpected column count marker\n"
+      if $column_count == 0 || $column_count >= 0xfb;
+  read_packet($sock) for 1..$column_count;
+  read_packet($sock);
+}
+
+my $sock = IO::Socket::UNIX->new(Type => SOCK_STREAM(), Peer => $socket_path)
+  or die "connect failed: $!\n";
+
+my $handshake = read_packet($sock);
+my $pos = 0;
+$pos += 1;
+my $nul = index($handshake, "\0", $pos);
+$pos = $nul + 1;
+$pos += 4 + 8 + 1;
+my $cap_lower = unpack('v', substr($handshake, $pos, 2));
+$pos += 2 + 1 + 2;
+my $cap_upper = unpack('v', substr($handshake, $pos, 2));
+my $server_cap = $cap_lower | ($cap_upper << 16);
+$pos += 2;
+my $auth_len = ord(substr($handshake, $pos, 1));
+$pos += 1 + 10;
+my $auth_part2_len = $auth_len > 8 ? $auth_len - 8 : 13;
+$pos += $auth_part2_len;
+my $plugin = 'mysql_native_password';
+if ($server_cap & CLIENT_PLUGIN_AUTH) {
+  my $plugin_end = index($handshake, "\0", $pos);
+  $plugin = substr($handshake, $pos, $plugin_end - $pos)
+    if $plugin_end > $pos;
+}
+
+my $flags = CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG | CLIENT_CONNECT_WITH_DB |
+            CLIENT_PROTOCOL_41 | CLIENT_TRANSACTIONS |
+            CLIENT_SECURE_CONNECTION | CLIENT_MULTI_RESULTS |
+            CLIENT_PLUGIN_AUTH | CLIENT_CONNECT_ATTRS;
+$flags &= $server_cap;
+
+my $response = pack('VVC', $flags, 16 * 1024 * 1024, 33) . ("\0" x 23) .
+               "root\0" . pack('C', 0) . "test\0";
+$response .= "$plugin\0" if $flags & CLIENT_PLUGIN_AUTH;
+$response .= "\0" if $flags & CLIENT_CONNECT_ATTRS;
+write_packet($sock, 1, $response);
+
+my $auth = read_packet($sock);
+if (length($auth) > 0 && ord(substr($auth, 0, 1)) == 0x01) {
+  die "full authentication requested\n"
+    unless length($auth) > 1 && ord(substr($auth, 1, 1)) == 0x03;
+  $auth = read_packet($sock);
+} elsif (length($auth) > 0 && ord(substr($auth, 0, 1)) == 0xfe) {
+  write_packet($sock, 3, '');
+  $auth = read_packet($sock);
+}
+expect_ok($auth, 'auth');
+
+query_ok($sock, 'START TRANSACTION');
+query_ok($sock, 'UPDATE t_preserve_open_cursor SET v=11 WHERE id=1');
+
+my $prepare = command(
+  $sock, 0x16, 'SELECT id, v FROM t_preserve_open_cursor ORDER BY id');
+if (my ($code, $message) = error_packet($prepare)) {
+  die "COM_STMT_PREPARE failed: $code $message\n";
+}
+die "COM_STMT_PREPARE returned non-OK\n"
+  unless length($prepare) >= 12 && ord(substr($prepare, 0, 1)) == 0x00;
+my $stmt_id = unpack('V', substr($prepare, 1, 4));
+my $column_count = unpack('v', substr($prepare, 5, 2));
+my $param_count = unpack('v', substr($prepare, 7, 2));
+read_packet($sock) for 1..$param_count;
+read_packet($sock) if $param_count > 0;
+read_packet($sock) for 1..$column_count;
+read_packet($sock) if $column_count > 0;
+
+my $cursor_type_read_only = 1;
+my $execute_payload = pack('VCV', $stmt_id, $cursor_type_read_only, 1);
+my $execute = command($sock, 0x17, $execute_payload);
+read_result_metadata($sock, $execute, 'COM_STMT_EXECUTE cursor');
+
+my $preserve = command($sock, 0x03,
+                       'PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300');
+if (my ($code, $message) = error_packet($preserve)) {
+  print "preserve_error_code=$code\n";
+  print "preserve_error_message=$message\n";
+  write_packet($sock, 0, chr(0x19) . pack('V', $stmt_id));
+  query_ok($sock, 'ROLLBACK');
+  print "preserve_rejects_open_server_cursor_done\n";
+  exit 0;
+}
+
+print "preserve_unexpected_success\n";
+exit 1;
+EOF
+
+--exec perl $raw_cursor_client $MASTER_MYSOCK > $raw_cursor_output 2>&1
+
+--let $grep_file= $raw_cursor_output
+--let $grep_pattern= preserve_error_code=4013
+--let $wait_timeout= 10
+--source include/wait_for_pattern_in_file.inc
+--cat_file $raw_cursor_output
+
+SELECT * FROM t_preserve_open_cursor ORDER BY id;
+
+DROP TABLE t_preserve_open_cursor;
+SET GLOBAL preserve_trx_enable=ON;
+
+--remove_file $raw_cursor_client
+--remove_file $raw_cursor_output

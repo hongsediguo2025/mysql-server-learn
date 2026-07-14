@@ -1,0 +1,48 @@
+DROP TABLE IF EXISTS t_lock_warmcopy_implicit_secondary;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+CREATE TABLE t_lock_warmcopy_implicit_secondary(
+id INT PRIMARY KEY,
+uk INT UNIQUE,
+v INT,
+pad VARBINARY(64)
+) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_implicit_secondary VALUES
+(1,10,10,REPEAT('a',32)),
+(3,30,30,REPEAT('c',32));
+START TRANSACTION;
+INSERT INTO t_lock_warmcopy_implicit_secondary
+VALUES(2,20,20,REPEAT('b',32));
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+include/assert_grep.inc [lock warmcopy succeeds for implicit secondary strict mode]
+SELECT COUNT(*) AS preserved_count_after_implicit_secondary
+FROM performance_schema.preserved_transactions;
+preserved_count_after_implicit_secondary
+1
+SELECT COUNT(*) AS visible_before_secondary_resume
+FROM t_lock_warmcopy_implicit_secondary FORCE INDEX(uk)
+WHERE uk=20;
+visible_before_secondary_resume
+0
+SET innodb_lock_wait_timeout=1;
+INSERT INTO t_lock_warmcopy_implicit_secondary
+VALUES(4,20,40,REPEAT('d',32));
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+SELECT COUNT(*) AS preserved_count_after_implicit_secondary_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_implicit_secondary_resume
+0
+INSERT INTO t_lock_warmcopy_implicit_secondary
+VALUES(5,20,50,REPEAT('e',32));
+ERROR 23000: Duplicate entry '20' for key 't_lock_warmcopy_implicit_secondary.uk'
+SELECT id, uk, v, pad=REPEAT('b',32) AS pad_ok
+FROM t_lock_warmcopy_implicit_secondary FORCE INDEX(uk)
+WHERE uk=20;
+id	uk	v	pad_ok
+2	20	20	1
+DROP TABLE t_lock_warmcopy_implicit_secondary;

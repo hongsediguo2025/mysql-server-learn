@@ -1,0 +1,30 @@
+DROP TABLE IF EXISTS t_preserve_enable_off_drain;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_preserve_enable_off_drain(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO t_preserve_enable_off_drain VALUES(1,10),(2,20);
+START TRANSACTION;
+UPDATE t_preserve_enable_off_drain SET v=11 WHERE id=1;
+SET DEBUG_SYNC =
+'preserve_trx_batch_after_one_target_preserved SIGNAL enable_off_draining WAIT_FOR continue_enable_off_draining';
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SELECT COUNT(*) AS draining_rows
+FROM performance_schema.preserved_transactions
+WHERE STATE = 'DRAINING';
+draining_rows
+1
+SET GLOBAL preserve_trx_enable=OFF;
+ERROR HY000: Incorrect arguments to preserve_trx_enable is a startup-only option
+SELECT @@global.preserve_trx_enable AS preserve_enable_still_on;
+preserve_enable_still_on
+1
+SELECT 1;
+ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+SET DEBUG_SYNC = 'now SIGNAL continue_enable_off_draining';
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ROLLBACK;
+DROP TABLE t_preserve_enable_off_drain;
+SET GLOBAL preserve_trx_enable=ON;
+SET DEBUG_SYNC = 'RESET';

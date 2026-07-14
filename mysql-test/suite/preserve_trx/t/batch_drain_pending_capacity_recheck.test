@@ -1,0 +1,54 @@
+--source include/not_log_bin.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_batch_pending_capacity;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+--let $old_batch_max= `SELECT @@GLOBAL.preserve_trx_batch_max_transactions`
+
+CREATE TABLE t_batch_pending_capacity(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+
+# Keep this test scoped to the quiesced-target capacity recheck. Command
+# boundary/inflight races have dedicated coverage in
+# batch_drain_packet_before_dispatch, batch_drain_waits_inflight_statements and
+# batch_drain_all_pending_no_tokens.
+--connect(batch_pending_capacity_a,localhost,root,,test)
+--connection batch_pending_capacity_a
+START TRANSACTION;
+INSERT INTO t_batch_pending_capacity VALUES(1,10);
+
+--connect(batch_pending_capacity_b,localhost,root,,test)
+--connection batch_pending_capacity_b
+START TRANSACTION;
+INSERT INTO t_batch_pending_capacity VALUES(2,20);
+
+--connection default
+SET GLOBAL preserve_trx_batch_max_transactions=1;
+
+--connect(batch_pending_capacity_owner,localhost,root,,test)
+--connection batch_pending_capacity_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+--disconnect batch_pending_capacity_owner
+
+--connection batch_pending_capacity_a
+COMMIT;
+--disconnect batch_pending_capacity_a
+
+--connection batch_pending_capacity_b
+ROLLBACK;
+--disconnect batch_pending_capacity_b
+
+--connection default
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+SELECT * FROM t_batch_pending_capacity ORDER BY id;
+
+DROP TABLE t_batch_pending_capacity;
+SET GLOBAL preserve_trx_enable=ON;
+--disable_query_log
+--disable_result_log
+--eval SET GLOBAL preserve_trx_batch_max_transactions=$old_batch_max
+--enable_result_log
+--enable_query_log

@@ -67,6 +67,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "ibuf0ibuf.h"
 #include "lob0lob.h"
 #include "lock0lock.h"
+#include "lock0warmcopy.h"
 #include "mtr0log.h"
 #include "row0upd.h"
 #endif /* !UNIV_HOTBACKUP */
@@ -3431,6 +3432,11 @@ dberr_t btr_cur_update_in_place(ulint flags, btr_cur_t *cursor, ulint *offsets,
 
   assert_block_ahi_valid(block);
   row_upd_rec_in_place(rec, index, offsets, update, page_zip);
+  if (thr != nullptr && lock_warmcopy_hooks_enabled()) {
+    (void)lock_warmcopy_refresh_record_image_after_update(
+        thr_get_trx(thr), index, block,
+        static_cast<uint32_t>(page_rec_get_heap_no(rec)));
+  }
 
   if (is_hashed) {
     rw_lock_x_unlock(btr_get_search_latch(index));

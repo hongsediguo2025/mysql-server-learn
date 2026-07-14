@@ -1,0 +1,85 @@
+--source include/not_log_bin.inc
+--source include/have_debug.inc
+--source include/count_sessions.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_xid_provenance_write_failure;
+--enable_warnings
+
+--let $MYSQLD_DATADIR= `SELECT @@datadir`
+
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_xid_provenance_write_failure(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_xid_provenance_write_failure VALUES(1, 10), (2, 20);
+
+--connect(target,localhost,root,,test)
+START TRANSACTION;
+UPDATE t_xid_provenance_write_failure SET v=20 WHERE id=1;
+
+--connect(target_two,localhost,root,,test)
+START TRANSACTION;
+UPDATE t_xid_provenance_write_failure SET v=30 WHERE id=2;
+
+--connection default
+SET SESSION debug='+d,preserve_trx_fail_xid_provenance_write';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET SESSION debug='-d,preserve_trx_fail_xid_provenance_write';
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--exec sh -c 'test ! -e "$MYSQLD_DATADIR/preserve/.xid_provenance"'
+
+--connection target
+SELECT v AS value_in_original_transaction
+  FROM t_xid_provenance_write_failure WHERE id=1;
+COMMIT;
+--disconnect target
+
+--connection target_two
+SELECT v AS value_in_second_original_transaction
+  FROM t_xid_provenance_write_failure WHERE id=2;
+COMMIT;
+--disconnect target_two
+
+--connection default
+SELECT * FROM t_xid_provenance_write_failure ORDER BY id;
+
+# A bind failure happens after snapshot publication. The batch must still
+# restore the original transaction and remove both snapshot and provenance.
+--connect(bind_target,localhost,root,,test)
+START TRANSACTION;
+UPDATE t_xid_provenance_write_failure SET v=30 WHERE id=1;
+
+--connect(bind_target_two,localhost,root,,test)
+START TRANSACTION;
+UPDATE t_xid_provenance_write_failure SET v=40 WHERE id=2;
+
+--connection default
+SET SESSION debug='+d,preserve_trx_fail_xid_provenance_bind';
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET SESSION debug='-d,preserve_trx_fail_xid_provenance_bind';
+SELECT COUNT(*) AS preserved_count_after_bind_failure
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+--connection bind_target
+SELECT v AS value_after_bind_failure
+  FROM t_xid_provenance_write_failure WHERE id=1;
+COMMIT;
+--disconnect bind_target
+
+--connection bind_target_two
+SELECT v AS second_value_after_bind_failure
+  FROM t_xid_provenance_write_failure WHERE id=2;
+COMMIT;
+--disconnect bind_target_two
+
+--connection default
+SELECT * FROM t_xid_provenance_write_failure ORDER BY id;
+DROP TABLE t_xid_provenance_write_failure;
+--source include/wait_until_count_sessions.inc

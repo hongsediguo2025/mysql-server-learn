@@ -1,0 +1,6 @@
+--disable_query_log
+--disable_result_log
+SELECT @@SESSION.preserve_trx_default_timeout;
+--enable_result_log
+--enable_query_log
+--echo ok

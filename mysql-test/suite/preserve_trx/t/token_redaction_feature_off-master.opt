@@ -1,0 +1,2 @@
+--preserve-trx-enable=OFF
+--skip-log-bin

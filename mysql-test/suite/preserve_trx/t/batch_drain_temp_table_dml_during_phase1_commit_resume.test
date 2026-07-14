@@ -1,0 +1,70 @@
+--source include/have_debug_sync.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+
+--connect(temp_phase1_app, localhost, root,,test)
+--connection temp_phase1_app
+CREATE TEMPORARY TABLE tmp_phase1_temp_dml(
+  id INT PRIMARY KEY,
+  v INT NOT NULL,
+  KEY(v)
+) ENGINE=InnoDB;
+
+START TRANSACTION;
+INSERT INTO tmp_phase1_temp_dml VALUES(1, 10), (2, 20);
+
+--connect(temp_phase1_owner, localhost, root,,test)
+--connection temp_phase1_owner
+SET DEBUG_SYNC =
+  'preserve_trx_warmcopy_after_phase1_open SIGNAL temp_phase1_open WAIT_FOR temp_phase1_continue';
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR temp_phase1_open TIMEOUT 10';
+
+--connection temp_phase1_app
+UPDATE tmp_phase1_temp_dml SET v = 21 WHERE id = 2;
+DELETE FROM tmp_phase1_temp_dml WHERE id = 1;
+INSERT INTO tmp_phase1_temp_dml VALUES(3, 30);
+
+--connection default
+SET DEBUG_SYNC = 'now SIGNAL temp_phase1_continue';
+
+--connection temp_phase1_owner
+--reap
+--disconnect temp_phase1_owner
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON --preserve-trx-warmcopy-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--connect(temp_phase1_resume, localhost, root,,test)
+--connection temp_phase1_resume
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+SELECT * FROM tmp_phase1_temp_dml ORDER BY id;
+COMMIT;
+SELECT COUNT(*) AS rows_after_commit, SUM(v) AS sum_after_commit
+  FROM tmp_phase1_temp_dml;
+DROP TEMPORARY TABLE tmp_phase1_temp_dml;
+--disconnect temp_phase1_resume
+
+--connection default
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+SET DEBUG_SYNC = 'RESET';
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_enable=ON;

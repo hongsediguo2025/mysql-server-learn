@@ -1,0 +1,70 @@
+SELECT @@global.preserve_trx_enable AS preserve_enabled;
+preserve_enabled
+0
+SET @feature_off_token='msp_feature_off_redaction_abcd';
+SET @feature_off_redacted=CONCAT('****', RIGHT(@feature_off_token, 4));
+UPDATE performance_schema.setup_consumers
+SET ENABLED='YES'
+ WHERE NAME IN ('events_statements_current', 'events_statements_history');
+SET GLOBAL log_output='TABLE';
+SET GLOBAL general_log=OFF;
+SET GLOBAL slow_query_log=OFF;
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+SET GLOBAL general_log=ON;
+SET GLOBAL slow_query_log=ON;
+SET GLOBAL log_raw=ON;
+SET GLOBAL long_query_time=0;
+SET SESSION long_query_time=0;
+SET GLOBAL log_slow_admin_statements=ON;
+ERROR HY000: Resumable transactions across shutdown are disabled
+SELECT COUNT(*) AS raw_token_in_general_log
+FROM mysql.general_log
+WHERE argument LIKE 'RESUME PRESERVED TRANSACTION%'
+   AND argument LIKE CONCAT('%', @feature_off_token, '%');
+raw_token_in_general_log
+0
+SELECT COUNT(*) > 0 AS redacted_token_in_general_log
+FROM mysql.general_log
+WHERE argument LIKE '%RESUME PRESERVED TRANSACTION%'
+   AND argument LIKE CONCAT('%', @feature_off_redacted, '%');
+redacted_token_in_general_log
+1
+SELECT COUNT(*) AS raw_token_in_slow_log
+FROM mysql.slow_log
+WHERE sql_text LIKE 'RESUME PRESERVED TRANSACTION%'
+   AND sql_text LIKE CONCAT('%', @feature_off_token, '%');
+raw_token_in_slow_log
+0
+SELECT COUNT(*) > 0 AS redacted_token_in_slow_log
+FROM mysql.slow_log
+WHERE sql_text LIKE '%RESUME PRESERVED TRANSACTION%'
+   AND sql_text LIKE CONCAT('%', @feature_off_redacted, '%');
+redacted_token_in_slow_log
+1
+SELECT COUNT(*) AS raw_token_in_pfs_history
+FROM performance_schema.events_statements_history
+WHERE SQL_TEXT LIKE 'RESUME PRESERVED TRANSACTION%'
+   AND SQL_TEXT LIKE CONCAT('%', @feature_off_token, '%');
+raw_token_in_pfs_history
+0
+SELECT COUNT(*) > 0 AS redacted_token_in_pfs_history
+FROM performance_schema.events_statements_history
+WHERE SQL_TEXT LIKE 'RESUME PRESERVED TRANSACTION%'
+   AND SQL_TEXT LIKE CONCAT('%', @feature_off_redacted, '%');
+redacted_token_in_pfs_history
+1
+Occurrences of 'msp_feature_off_redaction_abcd' in the input file: 0
+Occurrences of 'RESUME PRESERVED TRANSACTION '\*\*\*\*abcd' in the input file: 0
+SET GLOBAL general_log=OFF;
+SET GLOBAL slow_query_log=OFF;
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+SET GLOBAL log_raw=0;
+SET GLOBAL long_query_time=10.000000;
+SET GLOBAL log_slow_admin_statements=0;
+SET GLOBAL log_output='FILE';
+SET GLOBAL general_log=1;
+SET GLOBAL slow_query_log=1;
+UPDATE performance_schema.setup_consumers SET ENABLED='YES' WHERE NAME='events_statements_history';
+UPDATE performance_schema.setup_consumers SET ENABLED='YES' WHERE NAME='events_statements_current';

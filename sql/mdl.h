@@ -1447,16 +1447,24 @@ class MDL_context {
 
   bool has_locks_waited_for() const;
 
-#ifndef DBUG_OFF
-  bool has_locks(enum_mdl_duration duration) {
+  bool has_locks(enum_mdl_duration duration) const {
     return !m_ticket_store.is_empty(duration);
   }
-#endif
+
+  typedef bool (*Ticket_visitor)(const MDL_ticket *ticket, void *arg);
+  bool visit_tickets(enum_mdl_duration duration, Ticket_visitor visitor,
+                     void *arg) const;
 
   MDL_savepoint mdl_savepoint() {
     return MDL_savepoint(m_ticket_store.front(MDL_STATEMENT),
                          m_ticket_store.front(MDL_TRANSACTION));
   }
+
+  bool export_savepoint_ordinals(const MDL_savepoint &mdl_savepoint,
+                                 uint32 *stmt_ordinal,
+                                 uint32 *trans_ordinal) const;
+  bool savepoint_from_ordinals(uint32 stmt_ordinal, uint32 trans_ordinal,
+                               MDL_savepoint *mdl_savepoint) const;
 
   void set_explicit_duration_for_all_locks();
   void set_transaction_duration_for_all_locks();

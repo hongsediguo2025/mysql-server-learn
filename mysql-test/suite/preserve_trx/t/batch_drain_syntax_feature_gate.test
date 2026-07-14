@@ -1,0 +1,19 @@
+--source include/force_restart.inc
+
+--let $restart_parameters= restart: --preserve-trx-enable=OFF
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
+SELECT @@global.preserve_trx_enable;
+
+CREATE TABLE drain(id INT PRIMARY KEY, drain_col INT) ENGINE=InnoDB;
+DROP TABLE drain;
+
+--error ER_PRESERVE_TRX_DISABLED
+DRAIN TRANSACTIONS PRESERVE;
+--error ER_PRESERVE_TRX_DISABLED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 NO USER VARS;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=

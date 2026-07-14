@@ -1,0 +1,589 @@
+--source include/big_test.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $setup_file = File::Spec->catfile($vardir, 'tmp',
+                                     'batch_long_savepoint_setup.inc');
+my $apps_file = File::Spec->catfile($vardir, 'tmp',
+                                    'batch_long_savepoint_apps.inc');
+my $post_apps_file = File::Spec->catfile($vardir, 'tmp',
+                                         'batch_long_savepoint_post_apps.inc');
+my $cleanup_file = File::Spec->catfile($vardir, 'tmp',
+                                       'batch_long_savepoint_cleanup.inc');
+my $verify_file = File::Spec->catfile($vardir, 'tmp',
+                                      'batch_long_savepoint_verify.inc');
+
+open(my $setup, '>', $setup_file)
+  or die "cannot open $setup_file for write: $!";
+open(my $apps, '>', $apps_file)
+  or die "cannot open $apps_file for write: $!";
+open(my $post_apps, '>', $post_apps_file)
+  or die "cannot open $post_apps_file for write: $!";
+open(my $cleanup, '>', $cleanup_file)
+  or die "cannot open $cleanup_file for write: $!";
+open(my $verify, '>', $verify_file)
+  or die "cannot open $verify_file for write: $!";
+
+print $cleanup <<'SQL';
+DROP PROCEDURE IF EXISTS p_batch_long_finalize;
+DROP TABLE IF EXISTS t_batch_long_tokens;
+DROP TABLE IF EXISTS t_sp_auto;
+DROP TABLE IF EXISTS t_sp_base;
+DROP TABLE IF EXISTS t_batch_long_audit;
+DROP TABLE IF EXISTS t_batch_long_control;
+SQL
+
+print $setup <<'SQL';
+CREATE TABLE t_batch_long_control(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  started_at DATETIME(6) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE t_batch_long_audit(
+  sid INT PRIMARY KEY,
+  case_id INT NOT NULL,
+  lifecycle_age_us BIGINT UNSIGNED NOT NULL,
+  max_stmt_us BIGINT UNSIGNED NOT NULL,
+  sql_count INT UNSIGNED NOT NULL,
+  resumed_ok TINYINT NOT NULL,
+  detail VARCHAR(255) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE t_batch_long_tokens(
+  token_id INT PRIMARY KEY AUTO_INCREMENT,
+  token VARCHAR(255) NOT NULL UNIQUE
+) ENGINE=InnoDB;
+CREATE TABLE t_sp_base(
+  sid INT NOT NULL,
+  k INT NOT NULL,
+  v INT NOT NULL,
+  marker VARCHAR(32),
+  heartbeat INT NOT NULL DEFAULT 0,
+  PRIMARY KEY(sid, k),
+  KEY idx_sp_marker(sid, marker),
+  KEY idx_sp_v(sid, v)
+) ENGINE=InnoDB;
+CREATE TABLE t_sp_auto(
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  sid INT NOT NULL,
+  k INT NOT NULL,
+  marker VARCHAR(32),
+  KEY idx_sp_auto_sid_k(sid, k)
+) ENGINE=InnoDB;
+SQL
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  print $setup "INSERT INTO t_batch_long_control " .
+               "VALUES($sid, $case_id, TIMESTAMP'2000-01-01 00:00:00.000000');\n";
+  for my $k (0 .. 30) {
+    print $setup "INSERT INTO t_sp_base " .
+                 "VALUES($sid, $k, " . ($sid * 100 + $k) .
+                 ", 'seed', 0);\n";
+  }
+}
+
+print $setup <<'SQL';
+DELIMITER |;
+CREATE PROCEDURE p_batch_long_finalize()
+BEGIN
+  DECLARE post_ok TINYINT DEFAULT 0;
+  DECLARE missing_savepoint TINYINT DEFAULT 0;
+  DECLARE detail_value VARCHAR(255) DEFAULT NULL;
+
+  IF @batch_long_sid IS NULL OR @batch_long_case_id IS NULL THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'missing restored batch long user vars';
+  END IF;
+  IF COALESCE(@batch_sp_pre_ok, 0) <> 1 THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'pre-drain savepoint check was not restored';
+  END IF;
+
+  IF @batch_long_case_id = 1 THEN
+    ROLLBACK TO SAVEPOINT s1;
+    SELECT marker = 'before-s1'
+      INTO post_ok FROM t_sp_base
+     WHERE sid = @batch_long_sid AND k = 1;
+    SET detail_value = 'single-savepoint-rollback';
+  ELSEIF @batch_long_case_id = 2 THEN
+    ROLLBACK TO SAVEPOINT s2;
+    SELECT marker = 'between-s1-s2'
+      INTO post_ok FROM t_sp_base
+     WHERE sid = @batch_long_sid AND k = 2;
+    SET detail_value = 'two-savepoints-s2';
+  ELSEIF @batch_long_case_id = 3 THEN
+    UPDATE t_sp_base SET marker = 'after-resume'
+     WHERE sid = @batch_long_sid AND k = 3;
+    ROLLBACK TO SAVEPOINT s1;
+    SELECT marker = 'before-s1'
+      INTO post_ok FROM t_sp_base
+     WHERE sid = @batch_long_sid AND k = 3;
+    SET detail_value = 'rollback-to-older';
+  ELSEIF @batch_long_case_id = 4 THEN
+    SET missing_savepoint = 0;
+    BEGIN
+      DECLARE CONTINUE HANDLER FOR SQLSTATE '42000'
+        SET missing_savepoint = 1;
+      ROLLBACK TO SAVEPOINT s2;
+    END;
+    IF missing_savepoint <> 1 THEN
+      SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'released savepoint s2 remained visible';
+    END IF;
+    ROLLBACK TO SAVEPOINT s1;
+    SELECT marker = 'before-s1'
+      INTO post_ok FROM t_sp_base
+     WHERE sid = @batch_long_sid AND k = 4;
+    SET detail_value = 'release-latest';
+  ELSEIF @batch_long_case_id = 5 THEN
+    ROLLBACK TO SAVEPOINT s1;
+    SELECT marker = 'after-first-s1'
+      INTO post_ok FROM t_sp_base
+     WHERE sid = @batch_long_sid AND k = 5;
+    SET detail_value = 'same-name-overwrite';
+  ELSEIF @batch_long_case_id = 6 THEN
+    ROLLBACK TO SAVEPOINT s1;
+    SELECT marker = 'inserted-before-s1'
+      INTO post_ok FROM t_sp_base
+     WHERE sid = @batch_long_sid AND k = 61;
+    SET detail_value = 'insert-boundary';
+  ELSEIF @batch_long_case_id = 7 THEN
+    ROLLBACK TO SAVEPOINT s1;
+    SELECT marker = 'updated-before-s1' AND v = 7000
+      INTO post_ok FROM t_sp_base
+     WHERE sid = @batch_long_sid AND k = 7;
+    SET detail_value = 'update-boundary';
+  ELSEIF @batch_long_case_id = 8 THEN
+    ROLLBACK TO SAVEPOINT s1;
+    SELECT COUNT(*) = 0
+      INTO post_ok FROM t_sp_base
+     WHERE sid = @batch_long_sid AND k = 8;
+    SET detail_value = 'delete-boundary';
+  ELSEIF @batch_long_case_id = 9 THEN
+    ROLLBACK TO SAVEPOINT s2;
+    UPDATE t_sp_base SET marker = 'after-first-rollback'
+     WHERE sid = @batch_long_sid AND k = 9;
+    ROLLBACK TO SAVEPOINT s2;
+    SELECT marker = 'after-s1'
+      INTO post_ok FROM t_sp_base
+     WHERE sid = @batch_long_sid AND k = 9;
+    SET detail_value = 'multiple-rollback';
+  ELSEIF @batch_long_case_id = 10 THEN
+    ROLLBACK TO SAVEPOINT s1;
+    UPDATE t_sp_base SET marker = 'after-rollback-new'
+     WHERE sid = @batch_long_sid AND k = 10;
+    SELECT marker = 'after-rollback-new'
+      INTO post_ok FROM t_sp_base
+     WHERE sid = @batch_long_sid AND k = 10;
+    SET detail_value = 'rollback-new-dml';
+  ELSEIF @batch_long_case_id = 11 THEN
+    ROLLBACK TO SAVEPOINT s2;
+    SELECT marker = 'after-s1'
+      INTO post_ok FROM t_sp_base
+     WHERE sid = @batch_long_sid AND k = 11;
+    SET detail_value = 'release-new-savepoint';
+  ELSEIF @batch_long_case_id = 12 THEN
+    ROLLBACK TO SAVEPOINT s1;
+    SELECT EXISTS(SELECT 1 FROM t_sp_base FORCE INDEX(idx_sp_marker)
+                   WHERE sid = @batch_long_sid
+                     AND marker = 'sec-before'
+                     AND k = 12)
+           AND NOT EXISTS(SELECT 1 FROM t_sp_base FORCE INDEX(idx_sp_marker)
+                           WHERE sid = @batch_long_sid
+                             AND marker = 'sec-after')
+      INTO post_ok;
+    SET detail_value = 'secondary-update';
+  ELSEIF @batch_long_case_id = 13 THEN
+    ROLLBACK TO SAVEPOINT s1;
+    SELECT marker = 'own-before'
+      INTO post_ok FROM t_sp_base
+     WHERE sid = @batch_long_sid AND k = 13;
+    SET detail_value = 'own-read-after-rollback';
+  ELSEIF @batch_long_case_id = 14 THEN
+    ROLLBACK TO SAVEPOINT s1;
+    SELECT marker = 'auto-before'
+      INTO post_ok FROM t_sp_auto
+     WHERE id = @batch_sp_auto_id
+       AND sid = @batch_long_sid
+       AND k = 14;
+    SET detail_value = 'autoinc-savepoint';
+  ELSEIF @batch_long_case_id = 15 THEN
+    ROLLBACK TO SAVEPOINT s1;
+    UPDATE t_sp_base
+       SET v = @batch_sp_delta * 2, marker = 'var-resumed'
+     WHERE sid = @batch_long_sid AND k = 15;
+    SELECT marker = 'var-resumed' AND v = @batch_sp_delta * 2
+      INTO post_ok FROM t_sp_base
+     WHERE sid = @batch_long_sid AND k = 15;
+    SET detail_value = 'user-var-expression';
+  ELSEIF @batch_long_case_id = 16 THEN
+    ROLLBACK TO SAVEPOINT s3;
+    RELEASE SAVEPOINT s3;
+    UPDATE t_sp_base SET marker = 'deep-final'
+     WHERE sid = @batch_long_sid AND k = 16;
+    SELECT marker = 'deep-final'
+      INTO post_ok FROM t_sp_base
+     WHERE sid = @batch_long_sid AND k = 16;
+    SET detail_value = 'deep-stack';
+  ELSEIF @batch_long_case_id = 17 THEN
+    ROLLBACK TO SAVEPOINT s_pre;
+    SELECT marker = 'pre-drain'
+      INTO post_ok FROM t_sp_base
+     WHERE sid = @batch_long_sid AND k = 17;
+    SET detail_value = 'rollback-pre-drain';
+  ELSEIF @batch_long_case_id = 18 THEN
+    RELEASE SAVEPOINT s_pre;
+    SET missing_savepoint = 0;
+    BEGIN
+      DECLARE CONTINUE HANDLER FOR SQLSTATE '42000'
+        SET missing_savepoint = 1;
+      ROLLBACK TO SAVEPOINT s_pre;
+    END;
+    IF missing_savepoint <> 1 THEN
+      SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'released savepoint s_pre remained visible';
+    END IF;
+    UPDATE t_sp_base SET marker = 'released-final'
+     WHERE sid = @batch_long_sid AND k = 18;
+    SELECT marker = 'released-final'
+      INTO post_ok FROM t_sp_base
+     WHERE sid = @batch_long_sid AND k = 18;
+    SET detail_value = 'release-pre-drain';
+  ELSEIF @batch_long_case_id = 19 THEN
+    SAVEPOINT s2;
+    UPDATE t_sp_base SET marker = 'new-after'
+     WHERE sid = @batch_long_sid AND k = 19;
+    ROLLBACK TO SAVEPOINT s2;
+    ROLLBACK TO SAVEPOINT s1;
+    SELECT marker = 'old-base'
+      INTO post_ok FROM t_sp_base
+     WHERE sid = @batch_long_sid AND k = 19;
+    SET detail_value = 'new-savepoint-after-resume';
+  ELSEIF @batch_long_case_id = 20 THEN
+    ROLLBACK TO SAVEPOINT s2;
+    RELEASE SAVEPOINT s2;
+    UPDATE t_sp_base SET marker = 'final'
+     WHERE sid = @batch_long_sid AND k = 20;
+    SELECT ((SELECT marker FROM t_sp_base
+              WHERE sid = @batch_long_sid AND k = 20) = 'final')
+           AND EXISTS(SELECT 1 FROM t_sp_base
+                       WHERE sid = @batch_long_sid
+                         AND k = 200
+                         AND marker = 'inserted-before-s2')
+           AND EXISTS(SELECT 1 FROM t_sp_base
+                       WHERE sid = @batch_long_sid
+                         AND k = 21
+                         AND marker = 'seed')
+      INTO post_ok;
+    SET detail_value = 'final-commit-invariant';
+  END IF;
+
+  IF COALESCE(post_ok, 0) <> 1 THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'post-resume savepoint check failed';
+  END IF;
+  SET @batch_long_end_action = 'COMMIT';
+  INSERT INTO t_batch_long_audit VALUES(
+    @batch_long_sid,
+    @batch_long_case_id,
+    TIMESTAMPDIFF(MICROSECOND, @batch_long_started_at, NOW(6)),
+    @batch_long_max_stmt_us,
+    @batch_long_sql_count,
+    1,
+    detail_value);
+END|
+DELIMITER ;|
+SQL
+
+print $verify <<'SQL';
+SELECT COUNT(DISTINCT detail) AS savepoint_cases_ok
+  FROM t_batch_long_audit WHERE resumed_ok = 1;
+SELECT detail, COUNT(*) = 5 AS ok
+  FROM t_batch_long_audit GROUP BY detail ORDER BY detail;
+SELECT COUNT(*) = 5 AS rollback_to_pre_drain_savepoint_ok
+  FROM t_batch_long_audit
+ WHERE detail = 'rollback-pre-drain' AND resumed_ok = 1;
+SELECT COUNT(*) = 5 AS release_pre_drain_savepoint_ok
+  FROM t_batch_long_audit
+ WHERE detail = 'release-pre-drain' AND resumed_ok = 1;
+SELECT 1 AS case_id,
+       COUNT(*) = 5 AS ok
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 1 AND b.k = 1 AND b.marker = 'before-s1'
+UNION ALL SELECT 2, COUNT(*) = 5
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 2 AND b.k = 2 AND b.marker = 'between-s1-s2'
+UNION ALL SELECT 3, COUNT(*) = 5
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 3 AND b.k = 3 AND b.marker = 'before-s1'
+UNION ALL SELECT 4, COUNT(*) = 5
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 4 AND b.k = 4 AND b.marker = 'before-s1'
+UNION ALL SELECT 5, COUNT(*) = 5
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 5 AND b.k = 5 AND b.marker = 'after-first-s1'
+UNION ALL SELECT 6, COUNT(*) = 5
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 6 AND b.k = 61 AND b.marker = 'inserted-before-s1'
+UNION ALL SELECT 7, COUNT(*) = 5
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 7 AND b.k = 7 AND b.marker = 'updated-before-s1'
+   AND b.v = 7000
+UNION ALL SELECT 8, COUNT(*) = 0
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 8 AND b.k = 8
+UNION ALL SELECT 9, COUNT(*) = 5
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 9 AND b.k = 9 AND b.marker = 'after-s1'
+UNION ALL SELECT 10, COUNT(*) = 5
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 10 AND b.k = 10 AND b.marker = 'after-rollback-new'
+UNION ALL SELECT 11, COUNT(*) = 5
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 11 AND b.k = 11 AND b.marker = 'after-s1'
+UNION ALL SELECT 12, COUNT(*) = 5
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 12 AND b.k = 12 AND b.marker = 'sec-before'
+UNION ALL SELECT 13, COUNT(*) = 5
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 13 AND b.k = 13 AND b.marker = 'own-before'
+UNION ALL SELECT 14, COUNT(*) = 5
+  FROM t_sp_auto a JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 14 AND a.k = 14 AND a.marker = 'auto-before'
+UNION ALL SELECT 15, COUNT(*) = 5
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 15 AND b.k = 15 AND b.marker = 'var-resumed'
+UNION ALL SELECT 16, COUNT(*) = 5
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 16 AND b.k = 16 AND b.marker = 'deep-final'
+UNION ALL SELECT 17, COUNT(*) = 5
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 17 AND b.k = 17 AND b.marker = 'pre-drain'
+UNION ALL SELECT 18, COUNT(*) = 5
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 18 AND b.k = 18 AND b.marker = 'released-final'
+UNION ALL SELECT 19, COUNT(*) = 5
+  FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+ WHERE c.case_id = 19 AND b.k = 19 AND b.marker = 'old-base'
+UNION ALL SELECT 20,
+       (SELECT COUNT(*) = 5
+          FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+         WHERE c.case_id = 20 AND b.k = 20 AND b.marker = 'final')
+       AND
+       (SELECT COUNT(*) = 5
+          FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+         WHERE c.case_id = 20 AND b.k = 200
+           AND b.marker = 'inserted-before-s2')
+       AND
+       (SELECT COUNT(*) = 5
+          FROM t_sp_base b JOIN t_batch_long_control c USING(sid)
+         WHERE c.case_id = 20 AND b.k = 21 AND b.marker = 'seed')
+ORDER BY case_id;
+SQL
+
+sub emit_measured {
+  my ($fh, $sql) = @_;
+  print $fh "SET \@batch_long_stmt_start = NOW(6);\n";
+  print $fh "$sql;\n";
+  print $fh "SET \@batch_long_stmt_us = " .
+            "TIMESTAMPDIFF(MICROSECOND, \@batch_long_stmt_start, NOW(6));\n";
+  print $fh "SET \@batch_long_max_stmt_us = " .
+            "GREATEST(\@batch_long_max_stmt_us, \@batch_long_stmt_us);\n";
+  print $fh "SET \@batch_long_sql_count = \@batch_long_sql_count + 1;\n";
+}
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  my $app_name = sprintf("batch_long_app_%03d", $sid);
+  print $apps "--connect($app_name,localhost,root,,test)\n";
+  print $apps "--connection $app_name\n";
+  print $apps "UPDATE t_batch_long_control SET started_at = NOW(6) WHERE sid = $sid;\n";
+  print $apps "SET \@batch_long_sid = $sid;\n";
+  print $apps "SET \@batch_long_case_id = $case_id;\n";
+  print $apps "SET \@batch_long_started_at = " .
+              "(SELECT started_at FROM t_batch_long_control WHERE sid = $sid);\n";
+  print $apps "SET \@batch_long_max_stmt_us = 0;\n";
+  print $apps "SET \@batch_long_sql_count = 0;\n";
+  print $apps "SET \@batch_long_end_action = 'COMMIT';\n";
+  print $apps "SET \@batch_sp_pre_ok = 0;\n";
+  print $apps "SET \@batch_sp_auto_id = 0;\n";
+  print $apps "SET \@batch_sp_delta = 0;\n";
+  print $apps "START TRANSACTION;\n";
+  emit_measured($apps, "UPDATE t_sp_base SET heartbeat = heartbeat + 1 WHERE sid = $sid AND k = 0");
+  if ($case_id == 1) {
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'before-s1' WHERE sid = $sid AND k = 1");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'after-s1' WHERE sid = $sid AND k = 1");
+    emit_measured($apps, "SELECT marker = 'after-s1' INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 1");
+  } elsif ($case_id == 2) {
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'before-s1' WHERE sid = $sid AND k = 2");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'between-s1-s2' WHERE sid = $sid AND k = 2");
+    emit_measured($apps, "SAVEPOINT s2");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'after-s2' WHERE sid = $sid AND k = 2");
+    emit_measured($apps, "SELECT marker = 'after-s2' INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 2");
+  } elsif ($case_id == 3) {
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'before-s1' WHERE sid = $sid AND k = 3");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'after-s1' WHERE sid = $sid AND k = 3");
+    emit_measured($apps, "SAVEPOINT s2");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'case3-after' WHERE sid = $sid AND k = 4");
+    emit_measured($apps, "ROLLBACK TO SAVEPOINT s1");
+    emit_measured($apps, "SELECT marker = 'before-s1' INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 3");
+  } elsif ($case_id == 4) {
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'before-s1' WHERE sid = $sid AND k = 4");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'after-s1' WHERE sid = $sid AND k = 4");
+    emit_measured($apps, "SAVEPOINT s2");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'after-s2' WHERE sid = $sid AND k = 4");
+    emit_measured($apps, "RELEASE SAVEPOINT s2");
+    emit_measured($apps, "SELECT marker = 'after-s2' INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 4");
+  } elsif ($case_id == 5) {
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'before-first-s1' WHERE sid = $sid AND k = 5");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'after-first-s1' WHERE sid = $sid AND k = 5");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'after-second-s1' WHERE sid = $sid AND k = 5");
+    emit_measured($apps, "SELECT marker = 'after-second-s1' INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 5");
+  } elsif ($case_id == 6) {
+    emit_measured($apps, "INSERT INTO t_sp_base VALUES($sid, 61, 6100, 'inserted-before-s1', 0)");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'after-s1' WHERE sid = $sid AND k = 61");
+    emit_measured($apps, "SELECT marker = 'after-s1' INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 61");
+  } elsif ($case_id == 7) {
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'updated-before-s1', v = 7000 WHERE sid = $sid AND k = 7");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'after-s1', v = 7001 WHERE sid = $sid AND k = 7");
+    emit_measured($apps, "SELECT marker = 'after-s1' AND v = 7001 INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 7");
+  } elsif ($case_id == 8) {
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'before-delete' WHERE sid = $sid AND k = 8");
+    emit_measured($apps, "DELETE FROM t_sp_base WHERE sid = $sid AND k = 8");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "INSERT INTO t_sp_base VALUES($sid, 8, 8000, 'after-s1', 0)");
+    emit_measured($apps, "SELECT marker = 'after-s1' INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 8");
+  } elsif ($case_id == 9) {
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'base' WHERE sid = $sid AND k = 9");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'after-s1' WHERE sid = $sid AND k = 9");
+    emit_measured($apps, "SAVEPOINT s2");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'after-s2' WHERE sid = $sid AND k = 9");
+    emit_measured($apps, "SELECT marker = 'after-s2' INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 9");
+  } elsif ($case_id == 10) {
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'base' WHERE sid = $sid AND k = 10");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'after-s1' WHERE sid = $sid AND k = 10");
+    emit_measured($apps, "SELECT marker = 'after-s1' INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 10");
+  } elsif ($case_id == 11) {
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'base' WHERE sid = $sid AND k = 11");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'after-s1' WHERE sid = $sid AND k = 11");
+    emit_measured($apps, "RELEASE SAVEPOINT s1");
+    emit_measured($apps, "SAVEPOINT s2");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'after-s2' WHERE sid = $sid AND k = 11");
+    emit_measured($apps, "SELECT marker = 'after-s2' INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 11");
+  } elsif ($case_id == 12) {
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'sec-before', v = 1200 WHERE sid = $sid AND k = 12");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'sec-after', v = 1201 WHERE sid = $sid AND k = 12");
+    emit_measured($apps, "SELECT marker = 'sec-after' INTO \@batch_sp_pre_ok FROM t_sp_base FORCE INDEX(idx_sp_marker) WHERE sid = $sid AND marker = 'sec-after' AND k = 12");
+  } elsif ($case_id == 13) {
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'own-before' WHERE sid = $sid AND k = 13");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'own-after' WHERE sid = $sid AND k = 13");
+    emit_measured($apps, "SELECT marker = 'own-after' INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 13");
+  } elsif ($case_id == 14) {
+    emit_measured($apps, "INSERT INTO t_sp_auto(sid, k, marker) VALUES($sid, 14, 'auto-before')");
+    emit_measured($apps, "SET \@batch_sp_auto_id = LAST_INSERT_ID()");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "UPDATE t_sp_auto SET marker = 'auto-after' WHERE id = \@batch_sp_auto_id");
+    emit_measured($apps, "SELECT marker = 'auto-after' INTO \@batch_sp_pre_ok FROM t_sp_auto WHERE id = \@batch_sp_auto_id");
+  } elsif ($case_id == 15) {
+    emit_measured($apps, "SET \@batch_sp_delta = $sid + 15");
+    emit_measured($apps, "UPDATE t_sp_base SET v = \@batch_sp_delta, marker = 'var-before' WHERE sid = $sid AND k = 15");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "UPDATE t_sp_base SET v = \@batch_sp_delta + 1, marker = 'var-after' WHERE sid = $sid AND k = 15");
+    emit_measured($apps, "SELECT marker = 'var-after' AND v = \@batch_sp_delta + 1 INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 15");
+  } elsif ($case_id == 16) {
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 's0' WHERE sid = $sid AND k = 16");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 's1' WHERE sid = $sid AND k = 16");
+    emit_measured($apps, "SAVEPOINT s2");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 's2' WHERE sid = $sid AND k = 16");
+    emit_measured($apps, "SAVEPOINT s3");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 's3' WHERE sid = $sid AND k = 16");
+    emit_measured($apps, "SAVEPOINT s4");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 's4' WHERE sid = $sid AND k = 16");
+    emit_measured($apps, "SAVEPOINT s5");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 's5' WHERE sid = $sid AND k = 16");
+    emit_measured($apps, "SELECT marker = 's5' INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 16");
+  } elsif ($case_id == 17) {
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'pre-drain' WHERE sid = $sid AND k = 17");
+    emit_measured($apps, "SAVEPOINT s_pre");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'pre-drain-after' WHERE sid = $sid AND k = 17");
+    emit_measured($apps, "SELECT marker = 'pre-drain-after' INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 17");
+  } elsif ($case_id == 18) {
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'pre-release' WHERE sid = $sid AND k = 18");
+    emit_measured($apps, "SAVEPOINT s_pre");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'pre-release-after' WHERE sid = $sid AND k = 18");
+    emit_measured($apps, "SELECT marker = 'pre-release-after' INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 18");
+  } elsif ($case_id == 19) {
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'old-base' WHERE sid = $sid AND k = 19");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'old-after' WHERE sid = $sid AND k = 19");
+    emit_measured($apps, "SELECT marker = 'old-after' INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 19");
+  } elsif ($case_id == 20) {
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'base' WHERE sid = $sid AND k = 20");
+    emit_measured($apps, "SAVEPOINT s1");
+    emit_measured($apps, "INSERT INTO t_sp_base VALUES($sid, 200, 20000, 'inserted-before-s2', 0)");
+    emit_measured($apps, "SAVEPOINT s2");
+    emit_measured($apps, "UPDATE t_sp_base SET marker = 'after-s2' WHERE sid = $sid AND k = 20");
+    emit_measured($apps, "DELETE FROM t_sp_base WHERE sid = $sid AND k = 21");
+    emit_measured($apps, "SELECT marker = 'after-s2' INTO \@batch_sp_pre_ok FROM t_sp_base WHERE sid = $sid AND k = 20");
+  }
+}
+print $apps "--connection default\n";
+
+for my $round (1 .. 80) {
+  for my $sid (1 .. 100) {
+    my $name = sprintf("batch_long_app_%03d", $sid);
+    print $post_apps "--connection $name\n";
+    emit_measured($post_apps, "SELECT COUNT(*) >= 1 INTO \@batch_sp_heartbeat_ok FROM t_sp_base WHERE sid = $sid AND k = 0");
+  }
+}
+print $post_apps "--connection default\n";
+
+close($setup);
+close($apps);
+close($post_apps);
+close($cleanup);
+close($verify);
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+SET GLOBAL preserve_trx_recovery_max_count=200;
+--let $old_preserve_trx_drain_grace_ms= `SELECT @@GLOBAL.preserve_trx_drain_grace_ms`
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+
+--let $batch_long_prefix= batch_long_savepoint
+--let $batch_long_setup_file= $MYSQLTEST_VARDIR/tmp/batch_long_savepoint_setup.inc
+--let $batch_long_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_savepoint_apps.inc
+--let $batch_long_post_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_savepoint_post_apps.inc
+--let $batch_long_cleanup_file= $MYSQLTEST_VARDIR/tmp/batch_long_savepoint_cleanup.inc
+--let $batch_long_resume_file= $MYSQLTEST_VARDIR/tmp/batch_long_savepoint_resume.inc
+--let $batch_long_verify_file= $MYSQLTEST_VARDIR/tmp/batch_long_savepoint_verify.inc
+--source suite/preserve_trx/include/batch_drain_100_long_common.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+--disable_query_log
+--disable_result_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_drain_grace_ms=$old_preserve_trx_drain_grace_ms
+--enable_result_log
+--enable_query_log

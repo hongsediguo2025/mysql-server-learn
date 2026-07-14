@@ -1,0 +1,34 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_recovery_max_count=200;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS;
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+100
+INSERT INTO t_batch_temp_tokens(token)
+SELECT TOKEN
+FROM performance_schema.preserved_transactions
+ORDER BY TOKEN;
+SELECT COUNT(*) AS mapped_token_count
+FROM t_batch_temp_tokens;
+mapped_token_count
+100
+SELECT COUNT(*) AS preserved_count_after_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_resume
+0
+SELECT COUNT(*) AS base_rows, SUM(v) AS base_sum
+FROM t_batch_temp_base;
+base_rows	base_sum
+100	50600
+SELECT COUNT(*) AS checked_sessions,
+SUM(temp_rows) AS checked_temp_rows,
+SUM(temp_sum) AS checked_temp_sum
+FROM t_batch_temp_check;
+checked_sessions	checked_temp_rows	checked_temp_sum
+100	200	1011300
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;

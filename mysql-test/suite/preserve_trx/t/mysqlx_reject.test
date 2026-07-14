@@ -1,0 +1,39 @@
+--source include/not_log_bin.inc
+--source include/xplugin_preamble.inc
+--let $create_user_disable_binlog=1
+--source include/xplugin_create_user.inc
+
+--disable_warnings
+DROP SCHEMA IF EXISTS xtest;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+--write_file $MYSQL_TMP_DIR/preserve_trx_mysqlx_reject.xpl
+-->stmtsql CREATE SCHEMA xtest;
+-->recvresult
+-->stmtsql CREATE TABLE xtest.t_mysqlx_reject(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+-->recvresult
+-->stmtsql INSERT INTO xtest.t_mysqlx_reject VALUES(1,10);
+-->recvresult
+-->stmtsql START TRANSACTION;
+-->recvresult
+-->stmtsql UPDATE xtest.t_mysqlx_reject SET b=11 WHERE a=1;
+-->recvresult
+-->stmtsql PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+-->expecterror ER_PLUGGABLE_PROTOCOL_COMMAND_NOT_SUPPORTED
+-->recvresult
+-->stmtsql SELECT COUNT(*) AS preserved_count FROM performance_schema.preserved_transactions;
+-->recvresult
+-->stmtsql ROLLBACK;
+-->recvresult
+-->stmtsql SELECT * FROM xtest.t_mysqlx_reject ORDER BY a;
+-->recvresult
+EOF
+
+--exec $MYSQLXTEST -u x_root --password='' --file=$MYSQL_TMP_DIR/preserve_trx_mysqlx_reject.xpl 2>&1
+
+--remove_file $MYSQL_TMP_DIR/preserve_trx_mysqlx_reject.xpl
+DROP SCHEMA xtest;
+--source include/xplugin_drop_user.inc
+SET GLOBAL preserve_trx_enable=ON;

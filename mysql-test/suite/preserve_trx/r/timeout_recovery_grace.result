@@ -1,0 +1,30 @@
+DROP TABLE IF EXISTS t_recovery_grace;
+SET GLOBAL preserve_trx_enable=ON;
+SET SESSION preserve_trx_min_timeout=1;
+CREATE TABLE t_recovery_grace(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_recovery_grace VALUES(1,10);
+START TRANSACTION;
+SELECT * FROM t_recovery_grace WHERE a=1 FOR UPDATE;
+a	b
+1	10
+UPDATE t_recovery_grace SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 1;
+SELECT @@global.preserve_trx_recovery_grace_seconds AS recovery_grace_seconds;
+recovery_grace_seconds
+30
+SELECT TOKEN, RECOVERED_COUNT AS recovered_count_during_grace
+FROM performance_schema.preserved_transactions;
+TOKEN	recovered_count_during_grace
+TOKEN	1
+# restart: --preserve-trx-enable=ON --preserve-trx-recovery-grace-seconds=30
+include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: recovery timeout expired]
+SELECT TOKEN, STATE, LAST_ERROR
+FROM performance_schema.preserved_transactions;
+TOKEN	STATE	LAST_ERROR
+TOKEN	FAILED	recovery timeout expired
+SELECT * FROM t_recovery_grace ORDER BY a;
+a	b
+1	10
+DROP TABLE t_recovery_grace;
+SET GLOBAL preserve_trx_enable=ON;
+# restart: --preserve-trx-enable=ON --skip-log-bin

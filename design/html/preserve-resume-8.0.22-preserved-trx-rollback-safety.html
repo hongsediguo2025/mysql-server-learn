@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Preserve/Resume 8.0.22：已 Preserve 未提交事务为何不会被恢复回滚</title>
+  <style>
+    :root {
+      --ink:#17202a;
+      --muted:#5f6b7a;
+      --line:#d7dde6;
+      --panel:#f7f9fc;
+      --code:#eef3f8;
+      --accent:#0f6b7a;
+      --ok:#eaf7ef;
+      --warn:#fff7e8;
+      --danger:#fff7f8;
+      --deep:#111827;
+    }
+    body {
+      margin:0;
+      color:var(--ink);
+      background:#fff;
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+      line-height:1.66;
+    }
+    main {
+      max-width:1160px;
+      margin:0 auto;
+      padding:32px 36px 64px;
+    }
+    h1,h2,h3,h4 {
+      color:#111827;
+      line-height:1.25;
+    }
+    h1 {
+      margin:0 0 8px;
+      font-size:32px;
+    }
+    h2 {
+      margin-top:34px;
+      padding-top:16px;
+      border-top:1px solid var(--line);
+    }
+    h3 { margin-top:24px; }
+    h4 { margin-top:18px; }
+    p { margin:10px 0; }
+    a { color:var(--accent); text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    code {
+      font-family:"SFMono-Regular",Consolas,monospace;
+      background:var(--code);
+      padding:1px 5px;
+      border-radius:4px;
+      font-size:.92em;
+    }
+    pre {
+      margin:12px 0;
+      padding:14px 16px;
+      overflow:auto;
+      border-radius:8px;
+      background:var(--deep);
+      color:#f8fafc;
+    }
+    pre code {
+      background:transparent;
+      padding:0;
+      color:inherit;
+      font-size:.9em;
+    }
+    table {
+      width:100%;
+      border-collapse:collapse;
+      margin:14px 0;
+      font-size:14px;
+    }
+    th,td {
+      border:1px solid var(--line);
+      padding:8px 10px;
+      vertical-align:top;
+    }
+    th {
+      background:#eef3f8;
+      text-align:left;
+    }
+    ul,ol { margin:8px 0 8px 22px; }
+    li { margin:3px 0; }
+    .meta,.note,.ok,.warn,.danger {
+      border:1px solid var(--line);
+      border-radius:8px;
+      padding:14px 16px;
+      margin:16px 0;
+      background:var(--panel);
+    }
+    .ok { background:var(--ok); border-color:#a9d8b8; }
+    .warn { background:var(--warn); border-color:#e6c27c; }
+    .danger { background:var(--danger); border-color:#e6b8c0; }
+    .toc {
+      columns:2;
+      column-gap:28px;
+    }
+    .toc li { break-inside:avoid; }
+    .pill {
+      display:inline-block;
+      padding:2px 8px;
+      border-radius:999px;
+      background:#e6f4f6;
+      color:var(--accent);
+      font-weight:600;
+      font-size:12px;
+    }
+    .diagram {
+      margin:18px 0 26px;
+      border:1px solid var(--line);
+      border-radius:8px;
+      overflow-x:auto;
+      background:#fff;
+    }
+    .diagram svg {
+      display:block;
+      min-width:980px;
+      width:100%;
+      height:auto;
+    }
+    .box { fill:#f8fbff; stroke:#406078; stroke-width:1.3; }
+    .box2 { fill:#f6fbf7; stroke:#3f7a52; stroke-width:1.3; }
+    .box3 { fill:#fffaf0; stroke:#9a6a20; stroke-width:1.3; }
+    .box4 { fill:#fff6f7; stroke:#a73a4b; stroke-width:1.3; }
+    .arrow { stroke:#445566; stroke-width:1.6; fill:none; marker-end:url(#arrow); }
+    .dash { stroke-dasharray:5 4; }
+    .label { font-size:13px; fill:#17202a; }
+    .small { font-size:12px; fill:#4b5563; }
+    .title { font-size:15px; font-weight:700; fill:#111827; }
+    .muted { color:var(--muted); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Preserve/Resume 8.0.22：已 Preserve 未提交事务为何不会被恢复回滚</h1>
+  <div class="meta">
+    <p><strong>目标：</strong>解释当前 preserve/resume 特性如何确保“已经成功 preserve 的未提交事务”在 mysqld 重启恢复阶段不会被普通 crash recovery rollback 掉。</p>
+    <p><strong>结论：</strong>保障不是单靠 <code>preserved_trx_recover_all()</code> 调用得早，而是由 <strong>prepared 状态边界</strong>、<strong>preserve magic XID 隔离</strong>、<strong>rollback 线程状态过滤</strong>、<strong>ordinary XA recovery 排除</strong> 和 <strong>preserved_trx_recover_all() 的 token 配对/claim</strong> 共同完成。</p>
+    <p><strong>源码基准：</strong><code>codex/user-temp-table-phase1-drain-resume</code>，核查 HEAD <code>1b6f680d9890</code>；路径为 <code>/Users/a1234/project/mysql-server-8022-preserve-port</code>。</p>
+  </div>
+
+  <div class="ok">
+    <strong>一句话判断：</strong>普通 recovered active transaction 可以被 InnoDB recovery rollback 线程回滚；已经 preserve 成功的事务在重启后应处于 <code>TRX_STATE_PREPARED</code>，且携带 preserve magic XID，因此不会进入普通 rollback 线程和普通 XA recovery 的处理集合。随后 <code>preserved_trx_recover_all()</code> 根据 durable token 把它 claim 成 <code>TRX_STATE_PRESERVED</code> 并恢复锁、read view、MDL 等语义。
+  </div>
+
+  <h2>目录</h2>
+  <ol class="toc">
+    <li><a href="#scope">1. 问题边界</a></li>
+    <li><a href="#timeline">2. 启动恢复时序</a></li>
+    <li><a href="#prepare-boundary">3. 第一层保护：prepared 状态边界</a></li>
+    <li><a href="#rollback-filter">4. 第二层保护：recovery rollback 跳过 PREPARED/PRESERVED</a></li>
+    <li><a href="#xa-isolation">5. 第三层保护：preserve magic XID 不走普通 XA recovery</a></li>
+    <li><a href="#recover-all">6. 第四层保护：preserved_trx_recover_all() 配对并 claim</a></li>
+    <li><a href="#orphans">7. 孤儿 preserve prepared 为什么会被主动回滚</a></li>
+    <li><a href="#force-recovery">8. force recovery 和 read only 情况</a></li>
+    <li><a href="#invariants">9. 关键不变量</a></li>
+    <li><a href="#checklist">10. 实现/评审检查清单</a></li>
+    <li><a href="#sources">11. 源码索引</a></li>
+  </ol>
+
+  <h2 id="scope">1. 问题边界</h2>
+  <p>本文讨论的是<strong>已经 preserve 成功</strong>的未提交事务。这里的“成功”至少意味着：</p>
+  <ul>
+    <li>事务已经跨过 preserve 的 prepare 边界，InnoDB 中对应事务可在 crash recovery 后以 prepared 形态恢复。</li>
+    <li>事务的 durable artifact 已发布到 preserve store，包括 snapshot metadata、必要的语义 payload、外部 blob/sidecar 描述等。</li>
+    <li>token 与 InnoDB prepared transaction 的 preserve magic XID 可以互相映射。</li>
+  </ul>
+
+  <p>本文不讨论两类对象：</p>
+  <ul>
+    <li><strong>普通未提交事务：</strong>它们在 crash recovery 后是 active recovered transaction，可以被 recovery rollback 线程回滚。</li>
+    <li><strong>保存失败或半成品 artifact：</strong>这类对象应由 preserve 失败处理、crash recovery 清理或 taint/rollback 逻辑处理，不应被当作可 resume 的 token。</li>
+  </ul>
+
+  <div class="warn">
+    <strong>容易误解的点：</strong><code>srv_start_threads()</code> 在 <code>innobase_post_recover()</code> 前已经可能启动 <code>trx_recovery_rollback_thread</code>。所以不能把正确性解释成“rollback 线程完全没启动”。真正的正确性来自于 rollback 线程不会处理 <code>TRX_STATE_PREPARED</code>/<code>TRX_STATE_PRESERVED</code>，以及 preserve magic XID 不进入普通 XA recovery。
+  </div>
+
+  <h2 id="timeline">2. 启动恢复时序</h2>
+  <p>当前启动路径大致如下：</p>
+
+  <div class="diagram" aria-label="startup recovery timeline">
+    <svg viewBox="0 0 1080 420" role="img">
+      <defs>
+        <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+          <path d="M0,0 L8,3 L0,6 Z" fill="#445566"/>
+        </marker>
+      </defs>
+      <text x="28" y="34" class="title">mysqld 启动恢复关键路径</text>
+
+      <rect x="40" y="76" width="170" height="68" class="box"/>
+      <text x="62" y="104" class="label">InnoDB srv_start()</text>
+      <text x="62" y="126" class="small">redo/undo crash recovery</text>
+
+      <rect x="260" y="76" width="190" height="68" class="box2"/>
+      <text x="282" y="104" class="label">resurrect undo</text>
+      <text x="282" y="126" class="small">prepared undo -> PREPARED</text>
+
+      <rect x="500" y="76" width="210" height="68" class="box3"/>
+      <text x="522" y="104" class="label">srv_start_threads()</text>
+      <text x="522" y="126" class="small">可能启动 recovery rollback</text>
+
+      <rect x="760" y="76" width="210" height="68" class="box"/>
+      <text x="782" y="104" class="label">ha_recover()</text>
+      <text x="782" y="126" class="small">普通 XA recovery 扫描</text>
+
+      <rect x="40" y="224" width="190" height="68" class="box"/>
+      <text x="62" y="252" class="label">ha_post_recover()</text>
+      <text x="62" y="274" class="small">调用 engine post_recover</text>
+
+      <rect x="280" y="224" width="210" height="68" class="box2"/>
+      <text x="302" y="252" class="label">innobase_post_recover()</text>
+      <text x="302" y="274" class="small">DDL log recover</text>
+
+      <rect x="540" y="224" width="250" height="68" class="box2"/>
+      <text x="562" y="252" class="label">preserved_trx_recover_all()</text>
+      <text x="562" y="274" class="small">token -> claim PREPARED -> PRESERVED</text>
+
+      <rect x="840" y="224" width="190" height="68" class="box3"/>
+      <text x="862" y="252" class="label">network/accept loop</text>
+      <text x="862" y="274" class="small">对用户提供服务</text>
+
+      <path d="M210 110 L260 110" class="arrow"/>
+      <path d="M450 110 L500 110" class="arrow"/>
+      <path d="M710 110 L760 110" class="arrow"/>
+      <path d="M865 144 L865 184 L135 184 L135 224" class="arrow"/>
+      <path d="M230 258 L280 258" class="arrow"/>
+      <path d="M490 258 L540 258" class="arrow"/>
+      <path d="M790 258 L840 258" class="arrow"/>
+
+      <path d="M605 144 C605 174 605 194 605 224" class="arrow dash"/>
+      <text x="622" y="184" class="small">rollback 线程可以已启动，</text>
+      <text x="622" y="204" class="small">但跳过 PREPARED/PRESERVED</text>
+    </svg>
+  </div>
+
+  <p>对应源码锚点：</p>
+  <ul>
+    <li><code>innobase_init_files()</code> 里启动 InnoDB：<code>err = srv_start(create)</code>，见 <code>storage/innobase/handler/ha_innodb.cc:5033</code>。</li>
+    <li>字典恢复之后调用 <code>srv_start_threads(...)</code>，见 <code>storage/innobase/handler/ha_innodb.cc:3673</code>。</li>
+    <li><code>srv_start_threads()</code> 在需要时创建 <code>trx_recovery_rollback_thread</code>，见 <code>storage/innobase/srv/srv0start.cc:2979</code>。</li>
+    <li><code>init_server_components()</code> 里先 <code>ha_recover()</code>，再 <code>ha_post_recover()</code>，见 <code>sql/mysqld.cc:6300</code>。</li>
+    <li>InnoDB 注册的 <code>post_recover</code> hook 是 <code>innobase_post_recover()</code>，见 <code>storage/innobase/handler/ha_innodb.cc:4753</code>。</li>
+    <li><code>innobase_post_recover()</code> 中 DDL recovery 后调用 <code>preserved_trx_recover_all()</code>，见 <code>storage/innobase/handler/ha_innodb.cc:3753</code>。</li>
+  </ul>
+
+  <h2 id="prepare-boundary">3. 第一层保护：prepared 状态边界</h2>
+  <p>Preserve 的核心不是把普通 active transaction 留给 crash recovery，而是把它推到可恢复的 prepared 边界，并使用 preserve 专用 XID。重启时，InnoDB resurrect undo 的逻辑会把 prepared undo 恢复成 <code>TRX_STATE_PREPARED</code>。</p>
+
+  <pre><code>if (undo-&gt;state == TRX_UNDO_PREPARED) {
+  const bool preserve_magic_xid =
+      trx_preserve_xid_is_magic_active(*trx-&gt;xid);
+
+  if (srv_force_recovery == 0 || preserve_magic_xid) {
+    trx-&gt;state = TRX_STATE_PREPARED;
+    ++trx_sys-&gt;n_prepared_trx;
+  }
+}</code></pre>
+
+  <p>源码位置：<code>storage/innobase/trx/trx0trx.cc:814-833</code>。</p>
+
+  <p>这层保护的含义是：</p>
+  <ul>
+    <li>已 preserve 事务在 InnoDB crash recovery 后不是普通 <code>TRX_STATE_ACTIVE</code>。</li>
+    <li>普通 recovery rollback 线程主要处理需要 undo 的 active recovered transaction。</li>
+    <li>prepared transaction 的 commit/abort 决策必须由更高层明确给出；不能由 background rollback 线程擅自决定。</li>
+  </ul>
+
+  <h2 id="rollback-filter">4. 第二层保护：recovery rollback 跳过 PREPARED/PRESERVED</h2>
+  <p><code>srv_start_threads()</code> 中如果发现需要 rollback 的 recovered transactions，会创建 <code>trx_recovery_rollback_thread</code>：</p>
+
+  <pre><code>if (!bootstrap &amp;&amp; srv_force_recovery &lt; SRV_FORCE_NO_TRX_UNDO &amp;&amp;
+    trx_sys_need_rollback()) {
+  /* Rollback all recovered transactions that are
+  not in committed nor in XA PREPARE state. */
+  srv_threads.m_trx_recovery_rollback = os_thread_create(
+      trx_recovery_rollback_thread_key, trx_recovery_rollback_thread);
+
+  srv_threads.m_trx_recovery_rollback.start();
+}</code></pre>
+
+  <p>源码位置：<code>storage/innobase/srv/srv0start.cc:2979-2986</code>。</p>
+
+  <p>关键在 rollback 扫描逻辑。<code>trx_rollback_or_clean_resurrected()</code> 遇到 <code>TRX_STATE_PREPARED</code> 或 <code>TRX_STATE_PRESERVED</code> 时返回 <code>FALSE</code>，不做 rollback：</p>
+
+  <pre><code>case TRX_STATE_PREPARED:
+case TRX_STATE_PRESERVED:
+  return (FALSE);</code></pre>
+
+  <p>源码位置：<code>storage/innobase/trx/trx0roll.cc:671-673</code>。</p>
+
+  <p>同一文件还有直接说明：</p>
+
+  <pre><code>/* Note: For XA recovered transactions, we rely on MySQL to
+do rollback. They will be in TRX_STATE_PREPARED state. */</code></pre>
+
+  <p>源码位置：<code>storage/innobase/trx/trx0roll.cc:703-705</code>。</p>
+
+  <div class="ok">
+    <strong>因此：</strong>即使 recovery rollback 线程已经启动，只要 preserve 目标事务已经以 <code>TRX_STATE_PREPARED</code> resurrect，它就不会被该线程回滚。后续 <code>preserved_trx_recover_all()</code> claim 成 <code>TRX_STATE_PRESERVED</code> 后也同样被跳过。
+  </div>
+
+  <h2 id="xa-isolation">5. 第三层保护：preserve magic XID 不走普通 XA recovery</h2>
+  <p>如果只靠 prepared 状态，还要担心另一个问题：普通 XA recovery 会不会把这个 prepared transaction 当作普通 XA 事务接管，然后后续被普通 XA rollback/commit 处理？当前代码通过 preserve magic XID 做了隔离。</p>
+
+  <h3>5.1 普通 XA recover 上报时排除 preserve magic XID</h3>
+  <pre><code>if (trx_state_eq(trx, TRX_STATE_PREPARED) &amp;&amp;
+    !trx_preserve_xid_is_magic_active(*trx-&gt;xid)) {
+  if (get_info_about_prepared_transaction(&amp;txn_list[count], trx, mem_root))
+    break;
+  ...
+}</code></pre>
+
+  <p>源码位置：<code>storage/innobase/trx/trx0trx.cc:3034-3036</code>。</p>
+
+  <p>这表示 preserve magic XID 的 prepared transaction 不会被普通 XA recover 列表返回给 SQL 层。</p>
+
+  <h3>5.2 普通 trx_get_trx_by_xid() 也拒绝 preserve magic XID</h3>
+  <pre><code>trx_t *trx_get_trx_by_xid(const XID *xid) {
+  if (xid == nullptr || trx_preserve_xid_is_magic_active(*xid)) {
+    return (nullptr);
+  }
+  ...
+}</code></pre>
+
+  <p>源码位置：<code>storage/innobase/trx/trx0trx.cc:3102-3106</code>。</p>
+
+  <p>这意味着普通 XA 路径不能用 XID 抢走 preserve transaction。preserve transaction 必须走 preserve 专用 claim 入口。</p>
+
+  <h3>5.3 preserve token 与 XID 的映射</h3>
+  <p>preserve token 会被编码进 XID 的 bqual 部分：</p>
+
+  <pre><code>xid-&gt;set(PRESERVE_TRX_XID_FORMAT_ID, PRESERVE_TRX_XID_GTRID,
+         PRESERVE_TRX_XID_GTRID_LENGTH, token,
+         static_cast&lt;long&gt;(token_length));</code></pre>
+
+  <p>源码位置：<code>storage/innobase/trx/trx0preserve.cc:55-70</code>。</p>
+
+  <p>这个映射关系让 <code>preserved_trx_recover_all()</code> 能从 durable token 找回对应的 InnoDB prepared transaction，同时又不会和普通 XA XID 混用。</p>
+
+  <h2 id="recover-all">6. 第四层保护：preserved_trx_recover_all() 配对并 claim</h2>
+  <p><code>preserved_trx_recover_all()</code> 是启动阶段恢复 preserve artifact 的统一入口。它做的不是“防止普通 rollback 线程回滚”这一件事，而是在普通 recovery 已经完成后，把 durable token 与 InnoDB prepared transaction 做一致性配对，并恢复事务语义。</p>
+
+  <h3>6.1 扫描 durable token</h3>
+  <pre><code>const std::string dir = normalize_dir(preserve_trx_default_dir());
+auto store = create_preserved_trx_default_store(dir);
+...
+Preserved_trx_carrier_listing listing;
+if (store-&gt;list_tokens(&amp;listing) != Preserve_snapshot_status::OK) {
+  ...
+}</code></pre>
+
+  <p>源码位置：<code>sql/preserve_trx.cc:8599-8619</code>。</p>
+
+  <h3>6.2 读取 snapshot，构造 XID，claim prepared transaction</h3>
+  <pre><code>XID xid;
+if (preserve_trx_token_to_xid(token, &amp;xid)) {
+  return log_preserved_trx_recovery_failure(
+      token, "failed to map durable transaction token to XID");
+}
+
+trx_t *trx = trx_preserve_claim_prepared(xid);</code></pre>
+
+  <p>源码位置：<code>sql/preserve_trx.cc:8162-8182</code>。</p>
+
+  <p><code>trx_preserve_claim_prepared()</code> 的要求非常窄：必须是 preserve magic XID、无 live owner THD、未被 claim、状态为 <code>TRX_STATE_PREPARED</code>，然后标记为 <code>TRX_STATE_PRESERVED</code>。</p>
+
+  <pre><code>if (trx-&gt;mysql_thd == nullptr &amp;&amp; !trx-&gt;preserve_trx_claimed &amp;&amp;
+    trx_state_eq(trx, TRX_STATE_PREPARED) &amp;&amp; xid.eq(trx-&gt;xid) &amp;&amp;
+    trx_preserve_mark_preserved(trx) == DB_SUCCESS) {
+  trx-&gt;preserve_trx_claimed = true;
+  claimed = trx;
+  break;
+}</code></pre>
+
+  <p>源码位置：<code>storage/innobase/trx/trx0preserve.cc:258-276</code>。</p>
+
+  <h3>6.3 claim 后恢复语义对象</h3>
+  <p>claim 成功后，恢复逻辑会导入事务隔离级别、read view、表锁、行锁、predicate locks、detached MDL context，并注册为可 resume 的 preserved record：</p>
+
+  <pre><code>trx_preserve_set_isolation(trx, metadata.tx_isolation);
+trx_preserve_import_read_view(trx, metadata.read_view_payload);
+trx_preserve_import_table_locks(trx, metadata.table_locks_payload);
+trx_preserve_import_record_locks(trx, metadata.record_locks_payload);
+create_detached_mdl_context(metadata);
+
+preserved_trx_add_record(metadata, trx, true,
+                         Preserved_trx_lifecycle_state::PRESERVED,
+                         std::move(bundle.blob_descriptors));</code></pre>
+
+  <p>源码位置：<code>sql/preserve_trx.cc:8233-8279</code>。</p>
+
+  <div class="note">
+    <strong>这里的设计含义：</strong>已 preserve 事务不是只依赖 InnoDB prepared undo 存活。prepared undo 只保证未提交变更没有被普通 recovery rollback；真正能被用户继续 resume，还需要 durable snapshot 中的 SQL 层和锁语义被恢复到内存结构。
+  </div>
+
+  <h2 id="orphans">7. 孤儿 preserve prepared 为什么会被主动回滚</h2>
+  <p>正确性还包括另一面：如果 InnoDB 里存在 preserve magic XID prepared transaction，但没有对应 durable snapshot token，不能把它默默保留下来。否则它既不能安全 resume，也可能永久占用锁和 undo。</p>
+
+  <p><code>preserved_trx_recover_all()</code> 会先根据 durable listing 计算 <code>snapshot_tokens</code>，然后调用：</p>
+
+  <pre><code>std::vector&lt;std::string&gt; retained_snapshot_tokens(snapshot_tokens.begin(),
+                                                  snapshot_tokens.end());
+uint32_t orphan_rollback_count = 0;
+if (trx_preserve_rollback_prepared_without_snapshot(
+        retained_snapshot_tokens, &amp;orphan_rollback_count) != DB_SUCCESS) {
+  ...
+}</code></pre>
+
+  <p>源码位置：<code>sql/preserve_trx.cc:8673-8681</code>。</p>
+
+  <p>底层判断逻辑是：候选事务必须是 detached、未 claim、<code>TRX_STATE_PREPARED</code>、preserve magic XID，并且 XID 中的 token 不在 durable snapshot token 集合里。只有这种“没有 snapshot 的 preserve prepared”才会被主动回滚。</p>
+
+  <pre><code>if (candidate-&gt;mysql_thd == nullptr &amp;&amp;
+    !candidate-&gt;preserve_trx_claimed &amp;&amp;
+    trx_state_eq(candidate, TRX_STATE_PREPARED) &amp;&amp;
+    candidate-&gt;xid != nullptr &amp;&amp;
+    xid_is_preserve_magic(*candidate-&gt;xid) &amp;&amp;
+    !trx_preserve_xid_token_in(*candidate-&gt;xid, snapshot_tokens)) {
+  candidate-&gt;preserve_trx_claimed = true;
+  trx = candidate;
+  break;
+}</code></pre>
+
+  <p>源码位置：<code>storage/innobase/trx/trx0preserve.cc:442-476</code>。</p>
+
+  <div class="ok">
+    <strong>这不是破坏 preserve 语义，而是 fail closed：</strong>有 durable snapshot 的 preserve transaction 被恢复；没有 durable snapshot 的 preserve prepared transaction 被视为孤儿并回滚，避免留下无法 resume 的半状态。
+  </div>
+
+  <h2 id="force-recovery">8. force recovery 和 read only 情况</h2>
+  <h3>8.1 innodb_force_recovery</h3>
+  <p>当 <code>srv_force_recovery &gt; 0</code> 时，<code>preserved_trx_recover_all()</code> 不会正常导入 snapshot，而是把发现的 preserved token 标记为 tainted 并保留文件，避免在不完整恢复能力下做危险 resume。</p>
+
+  <pre><code>if (srv_force_recovery &gt; 0) {
+  ...
+  LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+         "PRESERVE: preserved transaction recovery is not supported while "
+         "innodb_force_recovery is enabled; snapshot and binlog-cache "
+         "files are retained and marked tainted");
+  preserved_trx_mark_recovery_complete();
+  return false;
+}</code></pre>
+
+  <p>源码位置：<code>sql/preserve_trx.cc:8645-8670</code>。</p>
+
+  <h3>8.2 srv_read_only_mode</h3>
+  <p><code>innobase_post_recover()</code> 在 <code>srv_read_only_mode</code> 下不会调用 <code>preserved_trx_recover_all()</code>，只标记 recovery complete 后返回：</p>
+
+  <pre><code>if (srv_read_only_mode) {
+  purge_sys-&gt;state = PURGE_STATE_DISABLED;
+  preserved_trx_mark_recovery_complete();
+  return;
+}</code></pre>
+
+  <p>源码位置：<code>storage/innobase/handler/ha_innodb.cc:3731-3734</code>。</p>
+
+  <p>这对物理备机只读运行场景很关键：只读备机运行时不会通过当前本地 startup preserve recovery 路径导入本地 token。后续如果设计“物理备机在线升主时 adopt/fast resume”，应该是显式 promotion/adopt 入口，而不是让 read-only startup recovery 自动处理。</p>
+
+  <h2 id="invariants">9. 关键不变量</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>不变量</th>
+        <th>为什么重要</th>
+        <th>源码依据</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>成功 preserve 的 InnoDB 事务必须能以 <code>TRX_STATE_PREPARED</code> 恢复</td>
+        <td>只有 prepared 才不会被普通 recovery rollback 当作 active recovered trx 回滚</td>
+        <td><code>trx0trx.cc:814-833</code></td>
+      </tr>
+      <tr>
+        <td>recovery rollback 跳过 <code>TRX_STATE_PREPARED</code>/<code>TRX_STATE_PRESERVED</code></td>
+        <td>即使 rollback 线程已经启动，也不会处理 preserve 目标事务</td>
+        <td><code>trx0roll.cc:671-673</code></td>
+      </tr>
+      <tr>
+        <td>preserve magic XID 不上报给普通 XA recovery</td>
+        <td>避免普通 XA cache 或普通 XA rollback/commit 接管 preserve 事务</td>
+        <td><code>trx0trx.cc:3034-3036</code></td>
+      </tr>
+      <tr>
+        <td>普通 <code>trx_get_trx_by_xid()</code> 拒绝 preserve magic XID</td>
+        <td>确保只有 preserve 专用 claim 路径能拿到该事务</td>
+        <td><code>trx0trx.cc:3102-3106</code></td>
+      </tr>
+      <tr>
+        <td>token 必须能映射成 preserve magic XID</td>
+        <td><code>preserved_trx_recover_all()</code> 依赖 token 找回对应 prepared trx</td>
+        <td><code>trx0preserve.cc:55-70</code></td>
+      </tr>
+      <tr>
+        <td>没有 durable snapshot 的 preserve prepared 会被主动回滚</td>
+        <td>避免不可 resume 的孤儿 prepared trx 长期占用资源</td>
+        <td><code>preserve_trx.cc:8673-8681</code>, <code>trx0preserve.cc:442-476</code></td>
+      </tr>
+      <tr>
+        <td>claim 后才能恢复 read view、锁、MDL 等语义</td>
+        <td>prepared undo 存活不等于事务可 resume；SQL 层语义必须重建</td>
+        <td><code>preserve_trx.cc:8233-8279</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="checklist">10. 实现/评审检查清单</h2>
+  <p>后续改 preserve/resume、standby transfer 或 promotion adopt 逻辑时，必须保护下面这些边界：</p>
+  <ul>
+    <li>不要让 preserve magic XID 进入普通 XA recovery 列表。</li>
+    <li>不要让普通 <code>trx_get_trx_by_xid()</code> 能拿到 preserve magic XID。</li>
+    <li>不要让 recovery rollback 路径回滚 <code>TRX_STATE_PREPARED</code> 或 <code>TRX_STATE_PRESERVED</code>。</li>
+    <li>不要把只有 InnoDB prepared trx、没有 durable snapshot 的对象暴露为可 resume token。</li>
+    <li>不要在 claim 前删除 durable snapshot；claim 后的任何语义恢复失败都必须 rollback claimed preserve transaction 或 taint/fail closed。</li>
+    <li>不要把物理备机接收保存路径塞进 <code>preserved_trx_recover_all()</code>；该入口是本地 startup recovery 路径。</li>
+    <li>如果新增 promotion-side adopt，应显式复用 token-to-XID、store read、bundle decode、claim/import 这些底层能力，但保持入口独立，避免影响现有本地 preserve/resume 行为。</li>
+  </ul>
+
+  <h2 id="sources">11. 源码索引</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>路径</th>
+        <th>关键位置</th>
+        <th>说明</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>storage/innobase/handler/ha_innodb.cc</code></td>
+        <td><code>3673</code>, <code>3731-3758</code>, <code>4753</code>, <code>5033</code></td>
+        <td>InnoDB 启动、post_recover 注册和 <code>preserved_trx_recover_all()</code> 调用点</td>
+      </tr>
+      <tr>
+        <td><code>storage/innobase/srv/srv0start.cc</code></td>
+        <td><code>2979-2986</code>, <code>3021-3056</code></td>
+        <td>recovery rollback 线程启动、post-DDL purge 启动</td>
+      </tr>
+      <tr>
+        <td><code>storage/innobase/trx/trx0trx.cc</code></td>
+        <td><code>814-833</code>, <code>3034-3036</code>, <code>3102-3106</code></td>
+        <td>prepared undo resurrect、普通 XA recovery 排除 preserve magic XID</td>
+      </tr>
+      <tr>
+        <td><code>storage/innobase/trx/trx0roll.cc</code></td>
+        <td><code>671-673</code>, <code>703-705</code>, <code>764-782</code></td>
+        <td>recovery rollback 线程和状态过滤</td>
+      </tr>
+      <tr>
+        <td><code>storage/innobase/trx/trx0preserve.cc</code></td>
+        <td><code>55-70</code>, <code>258-276</code>, <code>424-476</code></td>
+        <td>token-to-XID、claim prepared、orphan preserve prepared rollback</td>
+      </tr>
+      <tr>
+        <td><code>sql/preserve_trx.cc</code></td>
+        <td><code>8069-8280</code>, <code>8587-8734</code></td>
+        <td>snapshot 恢复、claim/import/register、recover_all 主入口</td>
+      </tr>
+      <tr>
+        <td><code>sql/mysqld.cc</code></td>
+        <td><code>6300-6308</code>, <code>7238-7239</code>, <code>7524-7525</code></td>
+        <td>server recovery hook 时序和对外接收连接时序</td>
+      </tr>
+      <tr>
+        <td><code>sql/handler.cc</code></td>
+        <td><code>8590-8601</code></td>
+        <td><code>ha_post_recover()</code> 调用 storage engine post_recover hook</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="meta">
+    <p><strong>最终结论：</strong>已 preserve 未提交事务不会被普通 crash recovery rollback 掉，核心原因是它不再是普通 active recovered transaction，而是带 preserve magic XID 的 prepared transaction；普通 recovery rollback 跳过 prepared/preserved 状态，普通 XA recovery 又排除 preserve magic XID。<code>preserved_trx_recover_all()</code> 随后用 durable token 找回该 prepared trx，claim 成 preserved，并恢复事务语义。没有 durable token 匹配的 preserve prepared 则会被主动回滚，这是 fail closed 的清理行为。</p>
+  </div>
+</main>
+</body>
+</html>

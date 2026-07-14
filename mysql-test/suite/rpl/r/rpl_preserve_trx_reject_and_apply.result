@@ -1,0 +1,42 @@
+include/master-slave.inc
+Warnings:
+Note	####	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	####	Storing MySQL user name or password information in the master info repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START SLAVE; see the 'START SLAVE Syntax' in the MySQL Manual for more information.
+[connection master]
+#
+# Preserve/resume remains single-instance only.  A client connected to
+# a configured replica must fail closed, while ordinary replicated DML
+# continues to apply from the source.
+#
+DROP TABLE IF EXISTS t_preserve_rpl_apply;
+CREATE TABLE t_preserve_rpl_apply(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_preserve_rpl_apply VALUES(1, 10), (2, 20);
+include/sync_slave_sql_with_master.inc
+SET GLOBAL preserve_trx_enable=ON;
+START TRANSACTION;
+UPDATE t_preserve_rpl_apply SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+ROLLBACK;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+RESUME PRESERVED TRANSACTION 'invalid-token';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT * FROM t_preserve_rpl_apply ORDER BY a;
+a	b
+1	10
+2	20
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+INSERT INTO t_preserve_rpl_apply VALUES(3, 30);
+include/sync_slave_sql_with_master.inc
+SELECT * FROM t_preserve_rpl_apply ORDER BY a;
+a	b
+1	10
+2	20
+3	30
+DROP TABLE t_preserve_rpl_apply;
+include/sync_slave_sql_with_master.inc
+include/rpl_end.inc

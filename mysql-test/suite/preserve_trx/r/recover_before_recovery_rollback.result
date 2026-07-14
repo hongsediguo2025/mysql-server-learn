@@ -1,0 +1,22 @@
+DROP TABLE IF EXISTS t_recover_before_rollback;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_recover_before_rollback(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_recover_before_rollback VALUES(1,10);
+START TRANSACTION;
+SELECT * FROM t_recover_before_rollback WHERE a=1 FOR UPDATE;
+a	b
+1	10
+UPDATE t_recover_before_rollback SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+Pattern "PRESERVE: preserved transactions recovered before recovery rollback can observe them" found
+RESUME PRESERVED TRANSACTION 'TOKEN';
+SELECT COUNT(*) AS remaining_preserved
+FROM performance_schema.preserved_transactions;
+remaining_preserved
+0
+COMMIT;
+SELECT * FROM t_recover_before_rollback ORDER BY a;
+a	b
+1	11
+DROP TABLE t_recover_before_rollback;
+SET GLOBAL preserve_trx_enable=ON;

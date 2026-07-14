@@ -1,0 +1,9 @@
+# restart: --preserve-trx-enable=OFF --preserve-trx-off-artifact-policy=IGNORE
+SELECT @@global.preserve_trx_enable;
+@@global.preserve_trx_enable
+0
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+# restart: --preserve-trx-enable=ON

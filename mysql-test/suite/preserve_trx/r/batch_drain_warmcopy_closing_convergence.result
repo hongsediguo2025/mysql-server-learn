@@ -1,0 +1,42 @@
+DROP TABLE IF EXISTS t_warmcopy_close;
+DROP PROCEDURE IF EXISTS p_warmcopy_close;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=5000;
+CREATE TABLE t_warmcopy_close(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_warmcopy_close VALUES(1,10),(2,20);
+PREPARE warmcopy_close_stmt FROM
+'UPDATE t_warmcopy_close SET v=v+1 WHERE id=?';
+START TRANSACTION;
+UPDATE t_warmcopy_close SET v=11 WHERE id=1;
+SET DEBUG_SYNC =
+'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL warmcopy_close_closing WAIT_FOR warmcopy_close_continue';
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_close_closing TIMEOUT 10';
+BEGIN;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+UPDATE t_warmcopy_close SET v=v+1 WHERE id=2;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET @warmcopy_close_id=2;
+EXECUTE warmcopy_close_stmt USING @warmcopy_close_id;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT * FROM t_warmcopy_close WHERE id=2 FOR UPDATE;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET DEBUG_SYNC = 'now SIGNAL warmcopy_close_continue';
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+SELECT * FROM t_warmcopy_close ORDER BY id;
+id	v
+1	11
+2	20
+DROP TABLE t_warmcopy_close;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=30000;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET DEBUG_SYNC = 'RESET';

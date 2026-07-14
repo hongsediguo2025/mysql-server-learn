@@ -1,0 +1,99 @@
+--echo # Lint-only source-shape guard for legal zero-count MDL descriptor
+--echo # payloads. Ordinary SQL DML transactions normally hold transaction
+--echo # duration MDL; this named plan item guards the participant and exporter
+--echo # contract directly.
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_source {
+  my (@parts) = @_;
+  my $path = File::Spec->catfile($source_root, @parts);
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $src = do { local $/; <$fh> };
+  close($fh);
+  return $src;
+}
+
+sub extract_function {
+  my ($src, $signature_re, $label) = @_;
+  $src =~ /$signature_re/s or die "could not find $label signature\n";
+  my $sig_pos = $-[0];
+  my $brace_pos = index($src, '{', $sig_pos);
+  die "could not find $label body start\n" if $brace_pos < 0;
+
+  my $depth = 0;
+  for (my $i = $brace_pos; $i < length($src); ++$i) {
+    my $ch = substr($src, $i, 1);
+    ++$depth if $ch eq '{';
+    --$depth if $ch eq '}';
+    if ($depth == 0 && $ch eq '}') {
+      return substr($src, $sig_pos, $i - $sig_pos + 1);
+    }
+  }
+  die "could not parse $label body\n";
+}
+
+my $participant = read_source('sql', 'preserve_trx_lock_warmcopy.cc');
+my $mdl = read_source('sql', 'mdl.cc');
+my $gunit = read_source('unittest', 'gunit',
+                        'preserve_trx_lock_warmcopy-t.cc');
+
+my $visit_tickets = extract_function(
+  $mdl,
+  qr/bool\s+MDL_context::visit_tickets\s*\(/,
+  'MDL_context::visit_tickets');
+die "MDL native code must only expose ticket iteration, not payload export\n"
+  unless $visit_tickets =~ /m_ticket_store\.list_iterator\s*\(\s*duration\s*\)/s &&
+         $visit_tickets =~ /visitor\s*\(\s*ticket,\s*arg\s*\)/s;
+
+my $export = extract_function(
+  $participant,
+  qr/bool\s+preserve_trx_lock_warmcopy_export_mdl_descriptors\s*\(/,
+  'preserve_trx_lock_warmcopy_export_mdl_descriptors');
+die "MDL export must reject statement/explicit duration locks\n"
+  unless $export =~ /has_locks\s*\(\s*MDL_STATEMENT\s*\)/s &&
+         $export =~ /has_locks\s*\(\s*MDL_EXPLICIT\s*\)/s;
+die "MDL export must start with a legal little-endian zero-count payload\n"
+  unless $export =~ /Mdl_descriptor_export_context\s+context[\s\S]*append_le32\s*\(\s*&context\.bytes,\s*0\s*\)/s;
+die "MDL export must only walk transaction-duration tickets\n"
+  unless $export =~ /visit_tickets\s*\(\s*MDL_TRANSACTION/s;
+die "MDL export must rewrite the leading count after walking the list\n"
+  unless $export =~ /for\s*\(\s*size_t\s+i\s*=\s*0;\s*i\s*<\s*4;\s*\+\+i\s*\)[\s\S]*context\.bytes\s*\[\s*i\s*\][\s\S]*context\.count\s*>>/s &&
+         $export =~ /\*lock_count\s*=\s*context\.count/s;
+
+my $unit_prepare = extract_function(
+  $participant,
+  qr/bool\s+Preserve_trx_lock_warmcopy_drain_participant::\s*prepare_quiesced_targets_for_unit_test\s*\(/,
+  'prepare_quiesced_targets_for_unit_test');
+die "unit-target helper must synthesize a legal zero-count MDL payload when no candidate is available\n"
+  unless $unit_prepare =~ /!\s*target\.second\.mdl_candidate_valid[\s\S]*target\.second\.mdl_descriptors_payload\.clear\s*\(\s*\)[\s\S]*append_le32\s*\(\s*&target\.second\.mdl_descriptors_payload,\s*0\s*\)[\s\S]*target\.second\.mdl_descriptor_count\s*=\s*0/s;
+
+die "GUnit must prove valid artifacts can carry zero MDL descriptors\n"
+  unless $gunit =~ /Phase2PreflightCreatesValidEmptyLockArtifactForEmptyTarget/s &&
+         $gunit =~ /EXPECT_FALSE\s*\(\s*artifact->mdl_descriptors_payload\.empty\s*\(\s*\)\s*\)/s &&
+         $gunit =~ /EXPECT_EQ\s*\(\s*0U,\s*artifact->mdl_descriptor_count\s*\)/s;
+die "GUnit canonical comparator must accept the exact four-byte zero-count payload\n"
+  unless $gunit =~ /MdlPayloadComparatorAcceptsZeroCountPayload/s &&
+         $gunit =~ /const\s+std::string\s+zero_count_payload\s*\(\s*4,\s*'\\0'\s*\)/s &&
+         $gunit =~ /preserve_trx_lock_warmcopy_compare_mdl_payloads_canonical\s*\(\s*zero_count_payload,\s*zero_count_payload\s*\)/s &&
+         $gunit =~ /EXPECT_TRUE\s*\(\s*result\.equivalent\s*\)/s;
+die "GUnit must prove multi-target zero MDL observations remain sealed valid\n"
+  unless $gunit =~ /for\s*\(\s*const\s+uint64_t\s+thread_id\s*:\s*\{\s*42ULL,\s*43ULL\s*\}/s &&
+         $gunit =~ /EXPECT_EQ\s*\(\s*Preserve_trx_lock_warmcopy_target_state::SEALED_VALID/s &&
+         $gunit =~ /EXPECT_EQ\s*\(\s*0U,\s*target\.mdl_descriptor_count\s*\)/s;
+die "GUnit must prove descriptor limit overflow remains invalid when count is nonzero\n"
+  unless $gunit =~ /Phase2PreflightRejectsMdlDescriptorLimitOverflow/s &&
+         $gunit =~ /set_mdl_descriptors_for_thread_for_unit_test\s*\(\s*42,\s*std::string\s*\(\s*"non-empty-mdl-payload"\s*\),\s*1\s*\)/s &&
+         $gunit =~ /Preserve_trx_lock_warmcopy_reason::RESOURCE_LIMIT_EXCEEDED/s;
+
+EOF
+
+SELECT 'ok' AS batch_drain_lock_warmcopy_mdl_zero_count;

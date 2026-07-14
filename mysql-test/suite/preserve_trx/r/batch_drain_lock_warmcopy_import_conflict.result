@@ -1,0 +1,42 @@
+DROP TABLE IF EXISTS t_lock_warmcopy_import_conflict;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+CREATE TABLE t_lock_warmcopy_import_conflict(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_import_conflict VALUES(1,10),(2,20),(3,30);
+START TRANSACTION;
+UPDATE t_lock_warmcopy_import_conflict SET v=21 WHERE id=2;
+SELECT * FROM t_lock_warmcopy_import_conflict WHERE id=1 FOR SHARE;
+id	v
+1	10
+START TRANSACTION;
+UPDATE t_lock_warmcopy_import_conflict SET v=31 WHERE id=3;
+SELECT * FROM t_lock_warmcopy_import_conflict WHERE id=1 FOR SHARE;
+id	v
+1	10
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+include/wait_for_pattern_in_file.inc [Preserved transaction .* recovery forced rollback: failed to restore durable transaction semantics]
+SELECT COUNT(*) AS preserved_count_after_lock_warmcopy_import_conflict
+FROM performance_schema.preserved_transactions;
+preserved_count_after_lock_warmcopy_import_conflict
+1
+CREATE TEMPORARY TABLE t_lock_warmcopy_import_conflict_tokens AS
+SELECT TOKEN FROM performance_schema.preserved_transactions ORDER BY TOKEN;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+SELECT COUNT(*) AS preserved_count_after_lock_warmcopy_import_conflict_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_lock_warmcopy_import_conflict_resume
+0
+SELECT COUNT(*) AS row_count,
+SUM((id = 2 AND v = 21) OR (id = 3 AND v = 31)) AS committed_updates,
+SUM((id = 2 AND v = 20) OR (id = 3 AND v = 30)) AS rolled_back_updates
+FROM t_lock_warmcopy_import_conflict;
+row_count	committed_updates	rolled_back_updates
+3	1	1
+DROP TABLE t_lock_warmcopy_import_conflict;

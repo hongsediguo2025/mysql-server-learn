@@ -1,0 +1,59 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_sidecar_state_forbid;
+--enable_warnings
+
+--disable_query_log
+CALL mtr.add_suppression("RESUME PRESERVED TRANSACTION .* failed: corrupt durable transaction snapshot");
+CALL mtr.add_suppression("Preserved transaction .* resume forced rollback: corrupt durable transaction snapshot");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: corrupt durable transaction snapshot");
+--enable_query_log
+
+SET GLOBAL preserve_trx_enable=ON;
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+CREATE TABLE t_sidecar_state_forbid(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_sidecar_state_forbid VALUES(1,10);
+
+START TRANSACTION;
+UPDATE t_sidecar_state_forbid SET v=11 WHERE id=1;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+opendir(my $dh, $dir) or die "cannot open preserve dir: $dir: $!";
+my @bins = grep { /\.bin$/ } readdir($dh);
+closedir($dh);
+die "expected exactly one preserved snapshot, found " . scalar(@bins) . "\n"
+  unless scalar(@bins) == 1;
+my $token = $bins[0];
+$token =~ s/\.bin$//;
+open(my $fh, '>', File::Spec->catfile($dir, "$token.binlog_cache"))
+  or die "cannot create forbidden sidecar: $!";
+print {$fh} "unexpected";
+close($fh) or die "cannot close forbidden sidecar: $!";
+EOF
+--exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count_after_recovery
+  FROM performance_schema.preserved_transactions;
+
+SELECT * FROM t_sidecar_state_forbid ORDER BY id;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+DROP TABLE t_sidecar_state_forbid;
+SET GLOBAL preserve_trx_enable=ON;

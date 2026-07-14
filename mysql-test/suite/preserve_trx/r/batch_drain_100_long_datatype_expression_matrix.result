@@ -1,0 +1,210 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_recovery_max_count=200;
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+SELECT COUNT(*) AS session_count
+FROM t_batch_long_control;
+session_count
+100
+SELECT MIN(TIMESTAMPDIFF(MICROSECOND, started_at, NOW(6))) >= 5000000
+AS all_sessions_older_than_five_seconds
+FROM t_batch_long_control;
+all_sessions_older_than_five_seconds
+1
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS;
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+100
+SELECT COUNT(*) AS preserved_state_count
+FROM performance_schema.preserved_transactions
+WHERE STATE = 'PRESERVED';
+preserved_state_count
+100
+SELECT COUNT(*) AS mapped_token_count
+FROM t_batch_long_tokens;
+mapped_token_count
+100
+SELECT COUNT(*) AS preserved_count_after_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_resume
+0
+SELECT COUNT(*) AS resume_success_count
+FROM t_batch_long_audit
+WHERE resumed_ok = 1;
+resume_success_count
+100
+SELECT COUNT(DISTINCT sid) AS resumed_distinct_sessions
+FROM t_batch_long_audit;
+resumed_distinct_sessions
+100
+SELECT MIN(lifecycle_age_us) >= 5000000 AS all_resumed_lifecycles_were_long
+FROM t_batch_long_audit;
+all_resumed_lifecycles_were_long
+1
+SELECT MIN(sql_count) >= 8 AS every_session_ran_enough_sql
+FROM t_batch_long_audit;
+every_session_ran_enough_sql
+1
+SELECT MAX(max_stmt_us) < 1000000 AS every_statement_under_one_second
+FROM t_batch_long_audit;
+every_statement_under_one_second
+1
+SELECT COUNT(*) AS audit_rows
+FROM t_batch_long_audit;
+audit_rows
+100
+SELECT COUNT(*) AS audit_control_case_mismatch_count
+FROM t_batch_long_audit a
+JOIN t_batch_long_control c USING(sid)
+WHERE a.case_id <> c.case_id;
+audit_control_case_mismatch_count
+0
+SELECT COUNT(DISTINCT detail) AS datatype_cases_ok
+FROM t_batch_long_audit WHERE resumed_ok = 1;
+datatype_cases_ok
+20
+SELECT detail, COUNT(*) = 5 AS ok
+FROM t_batch_long_audit GROUP BY detail ORDER BY detail;
+detail	ok
+between-date	1
+bigint-arithmetic	1
+case-when	1
+cast-expression	1
+collation-compare	1
+date-arithmetic	1
+decimal-arithmetic	1
+ifnull-nullable	1
+in-list	1
+least-greatest	1
+like-predicate	1
+mixed-type-update	1
+null-coalesce	1
+null-set	1
+round-decimal	1
+select-expression	1
+small-text-update	1
+timestamp-time-zone	1
+varbinary-hex	1
+varchar-concat	1
+SELECT COUNT(*) = 0 AS small_text_binary_guard_ok
+FROM t_type_base
+WHERE CHAR_LENGTH(txt) > 128 OR OCTET_LENGTH(b) > 16;
+small_text_binary_guard_ok
+1
+SELECT 1 AS case_id,
+COUNT(*) = 5 AS ok
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 1 AND b.k = 1
+AND b.i = 900000000000000000 + b.sid + 17
+UNION ALL SELECT 2, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 2 AND b.k = 2
+AND b.d = CAST(b.sid AS DECIMAL(20,6)) * 1.500000 + 1.250001
+UNION ALL SELECT 3, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 3 AND b.k = 3
+AND b.vc = CONCAT('seed-', b.sid, '-3-pre-', b.sid, '-post')
+UNION ALL SELECT 4, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 4 AND b.k = 4
+AND b.txt = CONCAT('text-small-', b.sid, '-xxxxxxxxxxxxxxxxxxxx-post')
+UNION ALL SELECT 5, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 5 AND b.k = 5
+AND HEX(b.b) = CONCAT('CAFE', LPAD(HEX(b.sid), 4, '0'), 'BEEF01')
+UNION ALL SELECT 6, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 6 AND b.k = 6
+AND b.day_col = DATE '2026-05-30'
+UNION ALL SELECT 7, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 7 AND b.k = 7
+AND b.ts_col = TIMESTAMP'2026-05-17 13:00:00'
+UNION ALL SELECT 8, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 8 AND b.k = 8
+AND b.nullable_col IS NULL AND b.vc = 'null-set'
+UNION ALL SELECT 9, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 9 AND b.k = 9
+AND b.i = b.sid + 900 AND b.nullable_col = 9
+UNION ALL SELECT 10, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 10 AND b.k = 10
+AND b.i = CASE WHEN MOD(b.sid DIV 20, 2) = 0 THEN 110 ELSE 210 END
+AND b.vc = 'case-when-post'
+UNION ALL SELECT 11, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 11 AND b.k = 11
+AND b.i = b.sid + 1101
+AND b.d = CAST(CONCAT(b.sid, '.125000') AS DECIMAL(20,6))
+UNION ALL SELECT 12, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 12 AND b.k = 12
+AND b.vc = 'collation-ci-post'
+UNION ALL SELECT 13, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 13 AND b.k = 13
+AND b.vc = CONCAT('like-hit-', b.sid, '-post')
+UNION ALL SELECT 14, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 14 AND b.k = 14
+AND b.day_col = DATE_ADD(DATE '2026-05-31',
+INTERVAL (MOD(b.sid, 7) + 1) DAY)
+AND b.vc = 'between-date-post'
+UNION ALL SELECT 15, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 15 AND b.k = 15
+AND b.vc = 'in-list-post'
+UNION ALL SELECT 16, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 16 AND b.k = 16
+AND b.i = b.sid * 1000 + 1600
+AND b.d = 16.160001
+UNION ALL SELECT 17, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 17 AND b.k = 17
+AND b.d = ROUND(CAST(b.sid AS DECIMAL(20,6)) / 7, 3) + 0.001000
+UNION ALL SELECT 18, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 18 AND b.k = 18
+AND b.i = b.sid + 1800 AND b.nullable_col = 18
+UNION ALL SELECT 19, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+JOIN t_type_side s ON s.sid = b.sid AND s.case_id = 19
+WHERE c.case_id = 19 AND b.k = 19
+AND b.vc = 'expr-post'
+   AND s.note = CONCAT('seed-', b.sid, '-19:', b.sid * 2000 + 38)
+UNION ALL SELECT 20, COUNT(*) = 5
+FROM t_type_base b JOIN t_batch_long_control c USING(sid)
+WHERE c.case_id = 20 AND b.k = 20
+AND b.i = b.sid * 10000 + 21
+AND b.d = b.sid + 20.200001
+AND b.vc = CONCAT('mixed-', b.sid, '-post')
+AND b.txt = CONCAT('mixed-text-', b.sid, '-post')
+AND HEX(b.b) = CONCAT('D00D', LPAD(HEX(b.sid), 4, '0'))
+AND b.day_col = DATE '2026-06-20'
+   AND b.nullable_col = 21
+ORDER BY case_id;
+case_id	ok
+1	1
+2	1
+3	1
+4	1
+5	1
+6	1
+7	1
+8	1
+9	1
+10	1
+11	1
+12	1
+13	1
+14	1
+15	1
+16	1
+17	1
+18	1
+19	1
+20	1
+SET GLOBAL preserve_trx_enable=ON;

@@ -1,0 +1,59 @@
+--source include/have_debug_sync.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_preserve_drain_soft;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_drain_mode=SOFT;
+SET GLOBAL preserve_trx_drain_grace_ms=1;
+
+CREATE TABLE t_preserve_drain_soft(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_preserve_drain_soft VALUES(1,10),(2,20);
+
+--connect(drain_soft_blocker,localhost,root,,test)
+--connection drain_soft_blocker
+--let $blocker_conn_id= `SELECT CONNECTION_ID()`
+START TRANSACTION;
+UPDATE t_preserve_drain_soft SET b=21 WHERE a=2;
+
+--connect(drain_soft_preserve,localhost,root,,test)
+--connection drain_soft_preserve
+--let $preserve_conn_id= `SELECT CONNECTION_ID()`
+SET DEBUG_SYNC =
+  'preserve_trx_drain_before_hard SIGNAL soft_grace_expired WAIT_FOR continue_soft_drain';
+START TRANSACTION;
+UPDATE t_preserve_drain_soft SET b=11 WHERE a=1;
+--send PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR soft_grace_expired TIMEOUT 10';
+--replace_result $blocker_conn_id BLOCKER_ID
+--eval SELECT COUNT(*) AS blocker_thread_count_before_hard FROM performance_schema.threads WHERE PROCESSLIST_ID = $blocker_conn_id
+--replace_result $preserve_conn_id PRESERVE_ID
+--eval KILL QUERY $preserve_conn_id
+SET DEBUG_SYNC = 'now SIGNAL continue_soft_drain';
+
+--connection drain_soft_preserve
+--error ER_QUERY_INTERRUPTED
+--reap
+SET DEBUG_SYNC = 'RESET';
+ROLLBACK;
+--disconnect drain_soft_preserve
+
+--connection drain_soft_blocker
+SELECT * FROM t_preserve_drain_soft WHERE a=2;
+ROLLBACK;
+--disconnect drain_soft_blocker
+
+--connection default
+SELECT * FROM t_preserve_drain_soft ORDER BY a;
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+DROP TABLE t_preserve_drain_soft;
+SET GLOBAL preserve_trx_drain_grace_ms=30000;
+SET GLOBAL preserve_trx_drain_mode=SOFT;
+SET GLOBAL preserve_trx_enable=ON;

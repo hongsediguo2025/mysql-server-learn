@@ -84,6 +84,7 @@ using std::min;
 */
 extern void thd_increment_bytes_sent(size_t length);
 extern void thd_increment_bytes_received(size_t length);
+extern void thd_wait_if_preserve_trx_batch_session_quiesced();
 
 /* Additional instrumentation hooks for the server */
 #include "mysql_com_server.h"
@@ -1349,6 +1350,9 @@ static bool net_read_raw_loop(NET *net, size_t count) {
 
   /* On failure, propagate the error code. */
   if (count) {
+#ifdef MYSQL_SERVER
+    thd_wait_if_preserve_trx_batch_session_quiesced();
+#endif
     /* Socket should be closed. */
     net->error = 2;
 

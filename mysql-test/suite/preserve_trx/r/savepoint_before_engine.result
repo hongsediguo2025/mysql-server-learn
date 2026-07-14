@@ -1,0 +1,16 @@
+DROP TABLE IF EXISTS t_savepoint_before_engine;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_savepoint_before_engine(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_savepoint_before_engine VALUES(1,10);
+START TRANSACTION;
+SAVEPOINT before_engine;
+UPDATE t_savepoint_before_engine SET v=11 WHERE id=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ROLLBACK TO SAVEPOINT before_engine;
+COMMIT;
+SELECT * FROM t_savepoint_before_engine ORDER BY id;
+id	v
+1	10
+DROP TABLE t_savepoint_before_engine;
+SET GLOBAL preserve_trx_enable=ON;

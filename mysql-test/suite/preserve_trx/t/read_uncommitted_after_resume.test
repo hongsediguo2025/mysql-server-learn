@@ -1,0 +1,59 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_read_uncommitted_after_resume;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_read_uncommitted_after_resume(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_read_uncommitted_after_resume VALUES(1,10),(2,20);
+
+SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+START TRANSACTION;
+UPDATE t_read_uncommitted_after_resume SET v=21 WHERE id=2;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+SELECT ISOLATION, HAS_READ_VIEW, RV_LOW_LIMIT_NO
+  FROM performance_schema.preserved_transactions;
+
+--connect(ru_dirty_writer, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_read_uncommitted_after_resume SET v=99 WHERE id=1;
+
+--connection default
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+
+SELECT v AS dirty_value_seen
+  FROM t_read_uncommitted_after_resume
+ WHERE id=1;
+SELECT v AS own_write_seen
+  FROM t_read_uncommitted_after_resume
+ WHERE id=2;
+
+ROLLBACK;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+
+--connection ru_dirty_writer
+ROLLBACK;
+--disconnect ru_dirty_writer
+
+--connection default
+SELECT * FROM t_read_uncommitted_after_resume ORDER BY id;
+
+DROP TABLE t_read_uncommitted_after_resume;
+SET GLOBAL preserve_trx_enable=ON;

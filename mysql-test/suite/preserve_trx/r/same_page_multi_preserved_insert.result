@@ -1,0 +1,43 @@
+DROP TABLE IF EXISTS t_same_page_multi_preserved;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_same_page_multi_preserved(
+id INT PRIMARY KEY,
+v INT,
+resumed_by INT DEFAULT NULL
+) ENGINE=InnoDB;
+START TRANSACTION;
+INSERT INTO t_same_page_multi_preserved VALUES(10,10,NULL);
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 86400;
+SELECT COUNT(*) AS preserved_count_after_first_generation
+FROM performance_schema.preserved_transactions;
+preserved_count_after_first_generation
+1
+START TRANSACTION;
+INSERT INTO t_same_page_multi_preserved VALUES(20,20,NULL);
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 86400;
+SELECT COUNT(*) AS preserved_count_after_second_generation
+FROM performance_schema.preserved_transactions;
+preserved_count_after_second_generation
+2
+RESUME PRESERVED TRANSACTION 'TOKEN_1';
+UPDATE t_same_page_multi_preserved
+SET v = v + 1000, resumed_by = 1
+WHERE id = 10;
+COMMIT;
+RESUME PRESERVED TRANSACTION 'TOKEN_2';
+UPDATE t_same_page_multi_preserved
+SET v = v + 1000, resumed_by = 2
+WHERE id = 20;
+COMMIT;
+SELECT COUNT(*) AS preserved_count_after_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_resume
+0
+SELECT COUNT(*) AS row_count,
+SUM(resumed_by IS NOT NULL) AS resumed_rows,
+SUM(v >= 1000) AS bumped_rows
+FROM t_same_page_multi_preserved;
+row_count	resumed_rows	bumped_rows
+2	2	2
+DROP TABLE t_same_page_multi_preserved;
+SET GLOBAL preserve_trx_enable=ON;

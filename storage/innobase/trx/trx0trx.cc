@@ -52,7 +52,9 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "srv0mon.h"
 #include "srv0srv.h"
 #include "srv0start.h"
+#include "sql/preserve_trx_xid.h"
 #include "trx0purge.h"
+#include "trx0preserve.h"
 #include "trx0rec.h"
 #include "trx0roll.h"
 #include "trx0rseg.h"
@@ -152,6 +154,7 @@ static void trx_init(trx_t *trx) {
   trx->skip_lock_inheritance = false;
 
   trx->is_recovered = false;
+  trx->preserve_trx_claimed = false;
 
   trx->op_info = "";
 
@@ -162,6 +165,11 @@ static void trx_init(trx_t *trx) {
   trx->check_unique_secondary = true;
 
   trx->lock.n_rec_locks.store(0);
+  trx->lock.lock_warmcopy_conversion_frozen = false;
+  trx->lock.lock_warmcopy_freeze_generation = 0;
+  trx->lock.lock_warmcopy_conversion_freeze_wait_epoch = 0;
+  trx->lock.lock_warmcopy_conversion_attempt_after_freeze = false;
+  trx->lock.lock_warmcopy_conversion_unhandled_after_freeze = false;
 
   trx->lock.blocking_trx.store(nullptr);
 
@@ -598,9 +606,18 @@ void trx_free_prepared_or_active_recovered(trx_t *trx) {
     ut_a(trx->is_recovered);
     expected_undo_state = TRX_UNDO_ACTIVE;
   } else {
-    ut_a(trx_state_eq(trx, TRX_STATE_PREPARED));
+    ut_a(trx_state_eq(trx, TRX_STATE_PREPARED) ||
+         trx_state_eq(trx, TRX_STATE_PRESERVED));
     expected_undo_state = TRX_UNDO_PREPARED;
   }
+  /*
+    A disconnected PREPARED/PRESERVED transaction can legitimately retain
+    will_lock while locks are released. trx_free() requires the field to be
+    clear, so reset it at the last point before returning the object to the
+    pool.
+  */
+  ut_ad(!trx->will_lock || trx_state_eq(trx, TRX_STATE_PREPARED) ||
+        trx_state_eq(trx, TRX_STATE_PRESERVED));
 
   assert_trx_in_rw_list(trx);
 
@@ -611,6 +628,8 @@ void trx_free_prepared_or_active_recovered(trx_t *trx) {
   ut_a(!trx->read_only);
 
   trx->state = TRX_STATE_NOT_STARTED;
+  trx->will_lock = 0;
+  trx_preserve_release_claim_before_free(trx);
 
   /* Undo trx_resurrect_table_locks(). */
   lock_trx_lock_list_init(&trx->lock.trx_locks);
@@ -800,7 +819,16 @@ static trx_t *trx_resurrect_insert(
       ib::info(ER_IB_MSG_1204) << "Transaction " << trx_get_id_for_print(trx)
                                << " was in the XA prepared state.";
 
-      if (srv_force_recovery == 0) {
+      const bool preserve_magic_xid =
+          trx_preserve_xid_should_be_protected(*trx->xid);
+
+      if (srv_force_recovery == 0 || preserve_magic_xid) {
+        if (srv_force_recovery > 0) {
+          ib::info(ER_IB_MSG_1205)
+              << "Since innodb_force_recovery > 0, preserved XA transaction "
+                 "will remain prepared for SQL-layer taint handling.";
+        }
+
         trx->state = TRX_STATE_PREPARED;
         ++trx_sys->n_prepared_trx;
       } else {
@@ -1489,13 +1517,20 @@ static bool trx_write_serialisation_history(
     trx_undo_ptr_t *redo_rseg_undo_ptr =
         trx->rsegs.m_redo.update_undo != nullptr ? &trx->rsegs.m_redo : nullptr;
 
+    const bool temp_update_undo_skips_history =
+        trx_undo_preserve_magic_no_redo_should_skip_history(
+            trx->rsegs.m_noredo.update_undo);
     trx_undo_ptr_t *temp_rseg_undo_ptr =
-        trx->rsegs.m_noredo.update_undo != nullptr ? &trx->rsegs.m_noredo
-                                                   : nullptr;
+        trx->rsegs.m_noredo.update_undo != nullptr &&
+                !temp_update_undo_skips_history
+            ? &trx->rsegs.m_noredo
+            : nullptr;
 
     /* Will set trx->no and will add rseg to purge queue. */
-    serialised = trx_serialisation_number_get(trx, redo_rseg_undo_ptr,
-                                              temp_rseg_undo_ptr);
+    if (redo_rseg_undo_ptr != nullptr || temp_rseg_undo_ptr != nullptr) {
+      serialised = trx_serialisation_number_get(trx, redo_rseg_undo_ptr,
+                                                temp_rseg_undo_ptr);
+    }
 
     /* It is not necessary to obtain trx->undo_mutex here because
     only a single OS thread is allowed to do the transaction commit
@@ -1510,7 +1545,7 @@ static bool trx_write_serialisation_history(
       non-redo update_undo too. This is to avoid immediate
       invocation of purge as we need to club these 2 segments
       with same trx-no as single unit. */
-      bool update_rseg_len = !(trx->rsegs.m_noredo.update_undo != nullptr);
+      bool update_rseg_len = temp_rseg_undo_ptr == nullptr;
 
       /* Set flag if GTID information need to persist. */
       auto undo_ptr = &trx->rsegs.m_redo;
@@ -1753,10 +1788,12 @@ static void trx_erase_lists(trx_t *trx, bool serialised, Gtid_desc &gtid_desc) {
 static void trx_release_impl_and_expl_locks(trx_t *trx, bool serialized) {
   check_trx_state(trx);
   ut_ad(trx_state_eq(trx, TRX_STATE_ACTIVE) ||
-        trx_state_eq(trx, TRX_STATE_PREPARED));
+        trx_state_eq(trx, TRX_STATE_PREPARED) ||
+        trx_state_eq(trx, TRX_STATE_PRESERVED));
 
   bool trx_sys_latch_is_needed =
-      (trx->id > 0) || trx_state_eq(trx, TRX_STATE_PREPARED);
+      (trx->id > 0) || trx_state_eq(trx, TRX_STATE_PREPARED) ||
+      trx_state_eq(trx, TRX_STATE_PRESERVED);
 
   /* Check and get GTID to be persisted. Do it outside trx_sys mutex. */
   Gtid_desc gtid_desc;
@@ -1797,7 +1834,10 @@ static void trx_release_impl_and_expl_locks(trx_t *trx, bool serialized) {
       lock_rec_convert_impl_to_expl_for_trx() when deciding for the final time
       if we really want to create explicit lock on behalf of implicit lock
       holder. */
+  const trx_state_t old_state = trx->state;
   trx->state = TRX_STATE_COMMITTED_IN_MEMORY;
+  trx_preserve_note_rseg_owner_state_change(
+      trx, old_state, TRX_STATE_COMMITTED_IN_MEMORY);
   trx_mutex_exit(trx);
 
   if (trx_sys_latch_is_needed) {
@@ -2183,6 +2223,7 @@ void trx_commit_or_rollback_prepare(trx_t *trx) /*!< in/out: transaction */
 
     case TRX_STATE_ACTIVE:
     case TRX_STATE_PREPARED:
+    case TRX_STATE_PRESERVED:
 
       /* If the trx is in a lock wait state, moves the waiting
       query thread to the suspended state */
@@ -2313,6 +2354,7 @@ dberr_t trx_commit_for_mysql(trx_t *trx) /*!< in/out: transaction */
       MONITOR_DEC(MONITOR_TRX_ACTIVE);
       trx->op_info = "";
       return (DB_SUCCESS);
+    case TRX_STATE_PRESERVED:
     case TRX_STATE_COMMITTED_IN_MEMORY:
       break;
   }
@@ -2348,6 +2390,7 @@ void trx_mark_sql_stat_end(trx_t *trx) /*!< in: trx handle */
 
   switch (trx->state) {
     case TRX_STATE_PREPARED:
+    case TRX_STATE_PRESERVED:
     case TRX_STATE_COMMITTED_IN_MEMORY:
       break;
     case TRX_STATE_NOT_STARTED:
@@ -2407,6 +2450,10 @@ void trx_print_low(FILE *f,
       goto state_ok;
     case TRX_STATE_PREPARED:
       fprintf(f, ", ACTIVE (PREPARED) %lu sec",
+              (ulong)difftime(time(nullptr), trx->start_time));
+      goto state_ok;
+    case TRX_STATE_PRESERVED:
+      fprintf(f, ", ACTIVE (PRESERVED) %lu sec",
               (ulong)difftime(time(nullptr), trx->start_time));
       goto state_ok;
     case TRX_STATE_COMMITTED_IN_MEMORY:
@@ -2535,6 +2582,7 @@ ibool trx_assert_started(const trx_t *trx) /*!< in: transaction */
 
   switch (trx->state) {
     case TRX_STATE_PREPARED:
+    case TRX_STATE_PRESERVED:
       return (TRUE);
 
     case TRX_STATE_ACTIVE:
@@ -2814,7 +2862,10 @@ static void trx_prepare(trx_t *trx) /*!< in/out: transaction */
   /*--------------------------------------*/
   ut_a(trx->state == TRX_STATE_ACTIVE);
   trx_sys_mutex_enter();
+  const trx_state_t old_state = trx->state;
   trx->state = TRX_STATE_PREPARED;
+  trx_preserve_note_rseg_owner_state_change(trx, old_state,
+                                            TRX_STATE_PREPARED);
   trx_sys->n_prepared_trx++;
   /* Add GTID to be persisted to disk table, if needed. */
   if (gtid_desc.m_is_set) {
@@ -2986,7 +3037,8 @@ int trx_recover_for_mysql(
     from or to NOT_STARTED while we are holding the
     trx_sys->mutex. It may change to PREPARED, but not if
     trx->is_recovered. */
-    if (trx_state_eq(trx, TRX_STATE_PREPARED)) {
+    if (trx_state_eq(trx, TRX_STATE_PREPARED) &&
+        !trx_preserve_xid_should_be_protected(*trx->xid)) {
       if (get_info_about_prepared_transaction(&txn_list[count], trx, mem_root))
         break;
 
@@ -3056,7 +3108,7 @@ static MY_ATTRIBUTE((warn_unused_result)) trx_t *trx_get_trx_by_xid_low(
 trx_t *trx_get_trx_by_xid(const XID *xid) {
   trx_t *trx;
 
-  if (xid == nullptr) {
+  if (xid == nullptr || trx_preserve_xid_should_be_protected(*xid)) {
     return (nullptr);
   }
 
@@ -3095,6 +3147,7 @@ void trx_start_if_not_started_xa_low(trx_t *trx, bool read_write) {
       }
       return;
     case TRX_STATE_PREPARED:
+    case TRX_STATE_PRESERVED:
     case TRX_STATE_COMMITTED_IN_MEMORY:
       break;
   }
@@ -3121,6 +3174,7 @@ void trx_start_if_not_started_low(trx_t *trx, bool read_write) {
       return;
 
     case TRX_STATE_PREPARED:
+    case TRX_STATE_PRESERVED:
     case TRX_STATE_COMMITTED_IN_MEMORY:
       break;
   }

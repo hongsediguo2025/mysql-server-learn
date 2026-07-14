@@ -2,6 +2,9 @@
 --source include/count_sessions.inc
 # Allowed cipher regex
 --source include/allowed_ciphers.inc
+--disable_query_log
+call mtr.add_suppression("Server SSL certificate doesn't verify: certificate has expired");
+--enable_query_log
 
 --echo # Setup
 

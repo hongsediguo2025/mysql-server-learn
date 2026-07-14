@@ -1,0 +1,335 @@
+--source include/big_test.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $vardir = $ENV{'MYSQLTEST_VARDIR'} or die "MYSQLTEST_VARDIR is not set";
+my $setup_file = File::Spec->catfile($vardir, 'tmp',
+                                     'batch_long_join_setup.inc');
+my $apps_file = File::Spec->catfile($vardir, 'tmp',
+                                    'batch_long_join_apps.inc');
+my $post_apps_file = File::Spec->catfile($vardir, 'tmp',
+                                         'batch_long_join_post_apps.inc');
+my $cleanup_file = File::Spec->catfile($vardir, 'tmp',
+                                       'batch_long_join_cleanup.inc');
+my $verify_file = File::Spec->catfile($vardir, 'tmp',
+                                      'batch_long_join_verify.inc');
+
+open(my $setup, '>', $setup_file)
+  or die "cannot open $setup_file for write: $!";
+open(my $apps, '>', $apps_file)
+  or die "cannot open $apps_file for write: $!";
+open(my $post_apps, '>', $post_apps_file)
+  or die "cannot open $post_apps_file for write: $!";
+open(my $cleanup, '>', $cleanup_file)
+  or die "cannot open $cleanup_file for write: $!";
+open(my $verify, '>', $verify_file)
+  or die "cannot open $verify_file for write: $!";
+
+print $cleanup "DROP PROCEDURE IF EXISTS p_batch_long_finalize;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_long_tokens;\n";
+print $cleanup "DROP TABLE IF EXISTS t_js_log;\n";
+print $cleanup "DROP TABLE IF EXISTS t_js_child;\n";
+print $cleanup "DROP TABLE IF EXISTS t_js_parent;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_long_audit;\n";
+print $cleanup "DROP TABLE IF EXISTS t_batch_long_control;\n";
+
+print $setup "CREATE TABLE t_batch_long_control(" .
+             "sid INT PRIMARY KEY, " .
+             "case_id INT NOT NULL, " .
+             "started_at DATETIME(6) NOT NULL" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_batch_long_audit(" .
+             "sid INT PRIMARY KEY, " .
+             "case_id INT NOT NULL, " .
+             "lifecycle_age_us BIGINT UNSIGNED NOT NULL, " .
+             "max_stmt_us BIGINT UNSIGNED NOT NULL, " .
+             "sql_count INT UNSIGNED NOT NULL, " .
+             "resumed_ok TINYINT NOT NULL, " .
+             "detail VARCHAR(255) NOT NULL" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_batch_long_tokens(" .
+             "token_id INT PRIMARY KEY AUTO_INCREMENT, " .
+             "token VARCHAR(255) NOT NULL UNIQUE" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_js_parent(" .
+             "sid INT NOT NULL, " .
+             "pid INT NOT NULL, " .
+             "v INT NOT NULL, " .
+             "grp INT NOT NULL, " .
+             "touch INT NOT NULL DEFAULT 0, " .
+             "note VARCHAR(64), " .
+             "PRIMARY KEY(sid, pid), " .
+             "KEY idx_parent_grp(sid, grp), " .
+             "KEY idx_parent_v(sid, v)" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_js_child(" .
+             "sid INT NOT NULL, " .
+             "cid INT NOT NULL, " .
+             "pid INT NOT NULL, " .
+             "score INT NOT NULL, " .
+             "status VARCHAR(32), " .
+             "note VARCHAR(64), " .
+             "PRIMARY KEY(sid, cid), " .
+             "KEY idx_child_pid(sid, pid), " .
+             "KEY idx_child_score(sid, score), " .
+             "KEY idx_child_status(sid, status)" .
+             ") ENGINE=InnoDB;\n";
+print $setup "CREATE TABLE t_js_log(" .
+             "sid INT NOT NULL, " .
+             "case_id INT NOT NULL, " .
+             "event_name VARCHAR(64) NOT NULL, " .
+             "val INT NOT NULL, " .
+             "PRIMARY KEY(sid, case_id, event_name)" .
+             ") ENGINE=InnoDB;\n";
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  print $setup "INSERT INTO t_batch_long_control " .
+               "VALUES($sid, $case_id, TIMESTAMP'2000-01-01 00:00:00.000000');\n";
+  for my $pid (0 .. 8) {
+    my $v = $sid * 100 + $pid;
+    my $grp = $pid % 3;
+    print $setup "INSERT INTO t_js_parent " .
+                 "VALUES($sid, $pid, $v, $grp, 0, 'parent-$pid');\n";
+  }
+  for my $cid (1 .. 10) {
+    my $pid = (($cid - 1) % 5) + 1;
+    my $score = $sid * 10 + $cid;
+    print $setup "INSERT INTO t_js_child " .
+                 "VALUES($sid, $cid, $pid, $score, 'open', 'child-$cid');\n";
+  }
+}
+
+print $setup "DELIMITER |;\n";
+print $setup "CREATE PROCEDURE p_batch_long_finalize()\n";
+print $setup "BEGIN\n";
+print $setup "  DECLARE post_ok TINYINT DEFAULT 0;\n";
+print $setup "  DECLARE detail_value VARCHAR(255) DEFAULT NULL;\n";
+print $setup "  IF \@batch_long_sid IS NULL OR \@batch_long_case_id IS NULL THEN\n";
+print $setup "    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'missing restored batch long user vars';\n";
+print $setup "  END IF;\n";
+print $setup "  IF COALESCE(\@batch_js_pre_ok, 0) <> 1 THEN\n";
+print $setup "    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'pre-drain join/subquery check was not restored';\n";
+print $setup "  END IF;\n";
+print $setup "  IF \@batch_long_case_id = 1 THEN\n";
+print $setup "    SELECT v = \@batch_long_sid * 110 + 2 INTO post_ok FROM t_js_parent WHERE sid = \@batch_long_sid AND pid = 1;\n";
+print $setup "    SET detail_value = 'update-join-parent';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 2 THEN\n";
+print $setup "    SELECT status = 'join-child' INTO post_ok FROM t_js_child WHERE sid = \@batch_long_sid AND cid = 2;\n";
+print $setup "    SET detail_value = 'update-join-child';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 3 THEN\n";
+print $setup "    SELECT COUNT(*) = 0 INTO post_ok FROM t_js_child WHERE sid = \@batch_long_sid AND cid = 3;\n";
+print $setup "    SET detail_value = 'delete-join-child';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 4 THEN\n";
+print $setup "    SELECT EXISTS(SELECT 1 FROM t_js_child WHERE sid = \@batch_long_sid AND cid = 40 AND pid = 4) INTO post_ok;\n";
+print $setup "    SET detail_value = 'insert-select-join';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 5 THEN\n";
+print $setup "    SELECT note = 'exists-match' INTO post_ok FROM t_js_parent WHERE sid = \@batch_long_sid AND pid = 5;\n";
+print $setup "    SET detail_value = 'exists-update';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 6 THEN\n";
+print $setup "    SELECT status = 'in-subquery' INTO post_ok FROM t_js_child WHERE sid = \@batch_long_sid AND cid = 6;\n";
+print $setup "    SET detail_value = 'in-subquery-update';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 7 THEN\n";
+print $setup "    SELECT EXISTS(SELECT 1 FROM t_js_parent WHERE sid = \@batch_long_sid AND pid = 70 AND note = 'anti-insert') INTO post_ok;\n";
+print $setup "    SET detail_value = 'not-exists-anti-insert';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 8 THEN\n";
+print $setup "    SELECT note = 'left-anti' INTO post_ok FROM t_js_parent WHERE sid = \@batch_long_sid AND pid = 8;\n";
+print $setup "    SET detail_value = 'left-join-anti-update';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 9 THEN\n";
+print $setup "    SELECT v = \@batch_long_sid * 20 + 9 INTO post_ok FROM t_js_parent WHERE sid = \@batch_long_sid AND pid = 2;\n";
+print $setup "    SET detail_value = 'derived-aggregate-update';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 10 THEN\n";
+print $setup "    SELECT status = 'cte-update' INTO post_ok FROM t_js_child WHERE sid = \@batch_long_sid AND cid = 4;\n";
+print $setup "    SET detail_value = 'cte-update-source';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 11 THEN\n";
+print $setup "    SELECT EXISTS(SELECT 1 FROM t_js_log WHERE sid = \@batch_long_sid AND case_id = 11 AND event_name = 'recursive-cte' AND val = 15) INTO post_ok;\n";
+print $setup "    SET detail_value = 'recursive-cte-select';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 12 THEN\n";
+print $setup "    SELECT note = 'self-join' INTO post_ok FROM t_js_parent WHERE sid = \@batch_long_sid AND pid = 1;\n";
+print $setup "    SET detail_value = 'self-join-update';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 13 THEN\n";
+print $setup "    SELECT COUNT(*) = 0 INTO post_ok FROM t_js_child WHERE sid = \@batch_long_sid AND cid = 9;\n";
+print $setup "    SET detail_value = 'self-join-delete';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 14 THEN\n";
+print $setup "    SELECT ((SELECT v FROM t_js_parent WHERE sid = \@batch_long_sid AND pid = 3) = \@batch_long_sid * 100 + 16) AND ((SELECT score FROM t_js_child WHERE sid = \@batch_long_sid AND cid = 8) = \@batch_long_sid * 10 + 21) INTO post_ok;\n";
+print $setup "    SET detail_value = 'multi-table-update';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 15 THEN\n";
+print $setup "    SELECT note = 'correlated' INTO post_ok FROM t_js_parent WHERE sid = \@batch_long_sid AND pid = 4;\n";
+print $setup "    SET detail_value = 'correlated-subquery';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 16 THEN\n";
+print $setup "    SELECT status = 'in-derived' INTO post_ok FROM t_js_child WHERE sid = \@batch_long_sid AND cid = 1;\n";
+print $setup "    SET detail_value = 'in-derived-update';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 17 THEN\n";
+print $setup "    SELECT COUNT(*) = 0 INTO post_ok FROM t_js_child WHERE sid = \@batch_long_sid AND cid = 170;\n";
+print $setup "    SET detail_value = 'left-anti-delete';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 18 THEN\n";
+print $setup "    UPDATE t_js_child c JOIN t_js_parent p ON p.sid = c.sid AND p.pid = c.pid SET c.status = 'resume-join' WHERE c.sid = \@batch_long_sid AND c.cid = 5;\n";
+print $setup "    SELECT status = 'resume-join' INTO post_ok FROM t_js_child WHERE sid = \@batch_long_sid AND cid = 5;\n";
+print $setup "    SET detail_value = 'resume-after-complex-sql';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 19 THEN\n";
+print $setup "    SELECT EXISTS(SELECT 1 FROM t_js_log WHERE sid = \@batch_long_sid AND case_id = 19 AND event_name = 'cte-aggregate' AND val = \@batch_long_sid * 20 + 7) INTO post_ok;\n";
+print $setup "    SET detail_value = 'cte-aggregate-log';\n";
+print $setup "  ELSEIF \@batch_long_case_id = 20 THEN\n";
+print $setup "    SELECT EXISTS(SELECT 1 FROM t_js_child WHERE sid = \@batch_long_sid AND cid = 200 AND status = 'mixed') AND NOT EXISTS(SELECT 1 FROM t_js_child WHERE sid = \@batch_long_sid AND cid = 10) INTO post_ok;\n";
+print $setup "    SET detail_value = 'mixed-join-subquery';\n";
+print $setup "  END IF;\n";
+print $setup "  IF COALESCE(post_ok, 0) <> 1 THEN\n";
+print $setup "    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'post-resume join/subquery check failed';\n";
+print $setup "  END IF;\n";
+print $setup "  SET \@batch_long_end_action = 'COMMIT';\n";
+print $setup "  INSERT INTO t_batch_long_audit VALUES(\n";
+print $setup "    \@batch_long_sid,\n";
+print $setup "    \@batch_long_case_id,\n";
+print $setup "    TIMESTAMPDIFF(MICROSECOND, \@batch_long_started_at, NOW(6)),\n";
+print $setup "    \@batch_long_max_stmt_us,\n";
+print $setup "    \@batch_long_sql_count,\n";
+print $setup "    1,\n";
+print $setup "    detail_value);\n";
+print $setup "END|\n";
+print $setup "DELIMITER ;|\n";
+
+print $verify "SELECT COUNT(DISTINCT detail) AS complex_sql_cases_ok\n";
+print $verify "  FROM t_batch_long_audit WHERE resumed_ok = 1;\n";
+print $verify "SELECT detail, COUNT(*) = 5 AS ok\n";
+print $verify "  FROM t_batch_long_audit GROUP BY detail ORDER BY detail;\n";
+print $verify "SELECT COUNT(*) = 0 AS parent_child_invariants_ok\n";
+print $verify "  FROM t_js_child c LEFT JOIN t_js_parent p\n";
+print $verify "    ON p.sid = c.sid AND p.pid = c.pid\n";
+print $verify " WHERE c.pid BETWEEN 0 AND 8 AND p.pid IS NULL;\n";
+
+sub emit_measured {
+  my ($fh, $sql) = @_;
+  print $fh "SET \@batch_long_stmt_start = NOW(6);\n";
+  print $fh "$sql;\n";
+  print $fh "SET \@batch_long_stmt_us = " .
+            "TIMESTAMPDIFF(MICROSECOND, \@batch_long_stmt_start, NOW(6));\n";
+  print $fh "SET \@batch_long_max_stmt_us = " .
+            "GREATEST(\@batch_long_max_stmt_us, \@batch_long_stmt_us);\n";
+  print $fh "SET \@batch_long_sql_count = \@batch_long_sql_count + 1;\n";
+}
+
+for my $sid (1 .. 100) {
+  my $case_id = (($sid - 1) % 20) + 1;
+  my $app_name = sprintf("batch_long_app_%03d", $sid);
+  print $apps "--connect($app_name,localhost,root,,test)\n";
+  print $apps "--connection $app_name\n";
+  print $apps "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;\n";
+  print $apps "UPDATE t_batch_long_control SET started_at = NOW(6) WHERE sid = $sid;\n";
+  print $apps "SET \@batch_long_sid = $sid;\n";
+  print $apps "SET \@batch_long_case_id = $case_id;\n";
+  print $apps "SET \@batch_long_started_at = " .
+              "(SELECT started_at FROM t_batch_long_control WHERE sid = $sid);\n";
+  print $apps "SET \@batch_long_max_stmt_us = 0;\n";
+  print $apps "SET \@batch_long_sql_count = 0;\n";
+  print $apps "SET \@batch_long_end_action = 'COMMIT';\n";
+  print $apps "SET \@batch_js_pre_ok = 0;\n";
+  print $apps "START TRANSACTION;\n";
+  emit_measured($apps, "UPDATE t_js_parent SET touch = touch + 1 WHERE sid = $sid AND pid = 0");
+  if ($case_id == 1) {
+    emit_measured($apps, "UPDATE t_js_parent p JOIN t_js_child c ON c.sid = p.sid AND c.pid = p.pid SET p.v = p.v + c.score WHERE p.sid = $sid AND p.pid = 1 AND c.cid = 1");
+    emit_measured($apps, "SELECT v = " . ($sid * 110 + 2) . " INTO \@batch_js_pre_ok FROM t_js_parent WHERE sid = $sid AND pid = 1");
+  } elsif ($case_id == 2) {
+    emit_measured($apps, "UPDATE t_js_child c JOIN t_js_parent p ON p.sid = c.sid AND p.pid = c.pid SET c.status = 'join-child' WHERE c.sid = $sid AND c.cid = 2 AND p.pid = 2");
+    emit_measured($apps, "SELECT status = 'join-child' INTO \@batch_js_pre_ok FROM t_js_child WHERE sid = $sid AND cid = 2");
+  } elsif ($case_id == 3) {
+    emit_measured($apps, "DELETE c FROM t_js_child c JOIN t_js_parent p ON p.sid = c.sid AND p.pid = c.pid WHERE c.sid = $sid AND c.cid = 3 AND p.grp = 0");
+    emit_measured($apps, "SELECT COUNT(*) = 0 INTO \@batch_js_pre_ok FROM t_js_child WHERE sid = $sid AND cid = 3");
+  } elsif ($case_id == 4) {
+    emit_measured($apps, "INSERT INTO t_js_child SELECT p.sid, 40, p.pid, p.v + 40, 'insert-select', 'from-join' FROM t_js_parent p JOIN t_js_child c ON c.sid = p.sid AND c.pid = p.pid WHERE p.sid = $sid AND p.pid = 4 AND c.cid = 4");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@batch_js_pre_ok FROM t_js_child WHERE sid = $sid AND cid = 40 AND pid = 4");
+  } elsif ($case_id == 5) {
+    emit_measured($apps, "UPDATE t_js_parent p SET note = 'exists-match' WHERE p.sid = $sid AND p.pid = 5 AND EXISTS (SELECT 1 FROM t_js_child c WHERE c.sid = p.sid AND c.pid = p.pid)");
+    emit_measured($apps, "SELECT note = 'exists-match' INTO \@batch_js_pre_ok FROM t_js_parent WHERE sid = $sid AND pid = 5");
+  } elsif ($case_id == 6) {
+    emit_measured($apps, "UPDATE t_js_child SET status = 'in-subquery' WHERE sid = $sid AND cid = 6 AND pid IN (SELECT pid FROM t_js_parent WHERE sid = $sid AND grp = 1)");
+    emit_measured($apps, "SELECT status = 'in-subquery' INTO \@batch_js_pre_ok FROM t_js_child WHERE sid = $sid AND cid = 6");
+  } elsif ($case_id == 7) {
+    emit_measured($apps, "INSERT INTO t_js_parent SELECT $sid, 70, 7000, 1, 0, 'anti-insert' FROM DUAL WHERE NOT EXISTS (SELECT 1 FROM t_js_child WHERE sid = $sid AND pid = 70)");
+    emit_measured($apps, "SELECT COUNT(*) = 1 INTO \@batch_js_pre_ok FROM t_js_parent WHERE sid = $sid AND pid = 70");
+  } elsif ($case_id == 8) {
+    emit_measured($apps, "UPDATE t_js_parent p LEFT JOIN t_js_child c ON c.sid = p.sid AND c.pid = p.pid SET p.note = 'left-anti' WHERE p.sid = $sid AND p.pid = 8 AND c.cid IS NULL");
+    emit_measured($apps, "SELECT note = 'left-anti' INTO \@batch_js_pre_ok FROM t_js_parent WHERE sid = $sid AND pid = 8");
+  } elsif ($case_id == 9) {
+    emit_measured($apps, "UPDATE t_js_parent p JOIN (SELECT sid, pid, SUM(score) AS total_score FROM t_js_child WHERE sid = $sid AND pid = 2 GROUP BY sid, pid) d ON d.sid = p.sid AND d.pid = p.pid SET p.v = d.total_score WHERE p.sid = $sid AND p.pid = 2");
+    emit_measured($apps, "SELECT v = " . ($sid * 20 + 9) . " INTO \@batch_js_pre_ok FROM t_js_parent WHERE sid = $sid AND pid = 2");
+  } elsif ($case_id == 10) {
+    emit_measured($apps, "WITH cte AS (SELECT sid, cid FROM t_js_child WHERE sid = $sid AND cid = 4) UPDATE t_js_child c JOIN cte ON cte.sid = c.sid AND cte.cid = c.cid SET c.status = 'cte-update'");
+    emit_measured($apps, "SELECT status = 'cte-update' INTO \@batch_js_pre_ok FROM t_js_child WHERE sid = $sid AND cid = 4");
+  } elsif ($case_id == 11) {
+    emit_measured($apps, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5) SELECT SUM(i) = 15 INTO \@batch_js_pre_ok FROM n");
+    emit_measured($apps, "INSERT INTO t_js_log VALUES($sid, 11, 'recursive-cte', 15)");
+  } elsif ($case_id == 12) {
+    emit_measured($apps, "UPDATE t_js_parent p1 JOIN t_js_parent p2 ON p2.sid = p1.sid AND p2.pid = 2 SET p1.note = 'self-join' WHERE p1.sid = $sid AND p1.pid = 1");
+    emit_measured($apps, "SELECT note = 'self-join' INTO \@batch_js_pre_ok FROM t_js_parent WHERE sid = $sid AND pid = 1");
+  } elsif ($case_id == 13) {
+    emit_measured($apps, "DELETE c1 FROM t_js_child c1 JOIN t_js_child c2 ON c2.sid = c1.sid AND c2.cid = 10 WHERE c1.sid = $sid AND c1.cid = 9");
+    emit_measured($apps, "SELECT COUNT(*) = 0 INTO \@batch_js_pre_ok FROM t_js_child WHERE sid = $sid AND cid = 9");
+  } elsif ($case_id == 14) {
+    emit_measured($apps, "UPDATE t_js_parent p JOIN t_js_child c ON c.sid = p.sid AND c.pid = p.pid SET p.v = p.v + 13, c.score = c.score + 13 WHERE p.sid = $sid AND p.pid = 3 AND c.cid = 8");
+    emit_measured($apps, "SELECT ((SELECT v FROM t_js_parent WHERE sid = $sid AND pid = 3) = " . ($sid * 100 + 16) . ") AND ((SELECT score FROM t_js_child WHERE sid = $sid AND cid = 8) = " . ($sid * 10 + 21) . ") INTO \@batch_js_pre_ok");
+  } elsif ($case_id == 15) {
+    emit_measured($apps, "UPDATE t_js_parent p SET note = 'correlated' WHERE p.sid = $sid AND p.pid = 4 AND p.v < (SELECT MAX(score) + " . ($sid * 100) . " FROM t_js_child c WHERE c.sid = p.sid)");
+    emit_measured($apps, "SELECT note = 'correlated' INTO \@batch_js_pre_ok FROM t_js_parent WHERE sid = $sid AND pid = 4");
+  } elsif ($case_id == 16) {
+    emit_measured($apps, "UPDATE t_js_child SET status = 'in-derived' WHERE sid = $sid AND cid IN (SELECT cid FROM (SELECT cid FROM t_js_child WHERE sid = $sid AND cid IN (1, 2)) d) AND cid = 1");
+    emit_measured($apps, "SELECT status = 'in-derived' INTO \@batch_js_pre_ok FROM t_js_child WHERE sid = $sid AND cid = 1");
+  } elsif ($case_id == 17) {
+    emit_measured($apps, "INSERT INTO t_js_child VALUES($sid, 170, 170, 170, 'orphan', 'anti-delete')");
+    emit_measured($apps, "DELETE c FROM t_js_child c LEFT JOIN t_js_parent p ON p.sid = c.sid AND p.pid = c.pid WHERE c.sid = $sid AND c.cid = 170 AND p.pid IS NULL");
+    emit_measured($apps, "SELECT COUNT(*) = 0 INTO \@batch_js_pre_ok FROM t_js_child WHERE sid = $sid AND cid = 170");
+  } elsif ($case_id == 18) {
+    emit_measured($apps, "SELECT EXISTS(SELECT 1 FROM t_js_parent p JOIN t_js_child c ON c.sid = p.sid AND c.pid = p.pid WHERE p.sid = $sid AND c.cid = 5) INTO \@batch_js_pre_ok");
+  } elsif ($case_id == 19) {
+    emit_measured($apps, "INSERT INTO t_js_log WITH cte AS (SELECT sid, pid, SUM(score) AS total_score FROM t_js_child WHERE sid = $sid AND pid = 1 GROUP BY sid, pid) SELECT sid, 19, 'cte-aggregate', total_score FROM cte");
+    emit_measured($apps, "SELECT val = " . ($sid * 20 + 7) . " INTO \@batch_js_pre_ok FROM t_js_log WHERE sid = $sid AND case_id = 19 AND event_name = 'cte-aggregate'");
+  } elsif ($case_id == 20) {
+    emit_measured($apps, "DELETE c FROM t_js_child c JOIN t_js_parent p ON p.sid = c.sid AND p.pid = c.pid WHERE c.sid = $sid AND c.cid = 10");
+    emit_measured($apps, "INSERT INTO t_js_child SELECT $sid, 200, p.pid, p.v, 'mixed', 'mixed-case' FROM t_js_parent p WHERE p.sid = $sid AND p.pid = 2 AND EXISTS (SELECT 1 FROM t_js_child c WHERE c.sid = p.sid AND c.pid = p.pid)");
+    emit_measured($apps, "SELECT EXISTS(SELECT 1 FROM t_js_child WHERE sid = $sid AND cid = 200) AND NOT EXISTS(SELECT 1 FROM t_js_child WHERE sid = $sid AND cid = 10) INTO \@batch_js_pre_ok");
+  }
+}
+print $apps "--connection default\n";
+
+for my $round (1 .. 80) {
+  for my $sid (1 .. 100) {
+    my $name = sprintf("batch_long_app_%03d", $sid);
+    print $post_apps "--connection $name\n";
+    emit_measured($post_apps, "SELECT COUNT(*) >= 1 INTO \@batch_js_heartbeat_ok FROM t_js_parent WHERE sid = $sid AND pid = 0");
+  }
+}
+print $post_apps "--connection default\n";
+
+close($setup);
+close($apps);
+close($post_apps);
+close($cleanup);
+close($verify);
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+SET GLOBAL preserve_trx_recovery_max_count=200;
+--let $old_preserve_trx_drain_grace_ms= `SELECT @@GLOBAL.preserve_trx_drain_grace_ms`
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+
+--let $batch_long_prefix= batch_long_join
+--let $batch_long_setup_file= $MYSQLTEST_VARDIR/tmp/batch_long_join_setup.inc
+--let $batch_long_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_join_apps.inc
+--let $batch_long_post_apps_file= $MYSQLTEST_VARDIR/tmp/batch_long_join_post_apps.inc
+--let $batch_long_cleanup_file= $MYSQLTEST_VARDIR/tmp/batch_long_join_cleanup.inc
+--let $batch_long_resume_file= $MYSQLTEST_VARDIR/tmp/batch_long_join_resume.inc
+--let $batch_long_verify_file= $MYSQLTEST_VARDIR/tmp/batch_long_join_verify.inc
+--source suite/preserve_trx/include/batch_drain_100_long_common.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+--disable_query_log
+--disable_result_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_drain_grace_ms=$old_preserve_trx_drain_grace_ms
+--enable_result_log
+--enable_query_log

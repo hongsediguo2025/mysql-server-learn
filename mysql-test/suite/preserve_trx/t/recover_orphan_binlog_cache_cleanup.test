@@ -1,0 +1,34 @@
+--source include/force_restart.inc
+
+SET GLOBAL preserve_trx_enable=ON;
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+--perl
+use strict;
+use warnings;
+use File::Path qw(make_path);
+use File::Spec;
+
+my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+make_path($dir);
+open(my $fh, '>', File::Spec->catfile($dir, 'orphan_cache_token.binlog_cache'))
+  or die "cannot create orphan binlog cache";
+print {$fh} "orphan binlog cache payload\n";
+close($fh) or die "cannot close orphan binlog cache";
+EOF
+
+--file_exists $MYSQLD_DATADIR/preserve/orphan_cache_token.binlog_cache
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--let $do_not_echo_parameters= 1
+--source include/restart_mysqld.inc
+--let $do_not_echo_parameters=
+--let $restart_parameters=
+
+--error 1
+--file_exists $MYSQLD_DATADIR/preserve/orphan_cache_token.binlog_cache
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+SET GLOBAL preserve_trx_enable=ON;

@@ -1,0 +1,78 @@
+--source include/have_debug.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+--disable_warnings
+DROP TABLE IF EXISTS t_multi_sidecar_crash_before_bin;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+
+--disable_query_log
+CALL mtr.add_suppression("Attempting backtrace");
+CALL mtr.add_suppression("You can use the following information to find out");
+CALL mtr.add_suppression("PRESERVE: rolled back prepared transaction without snapshot during recovery");
+--enable_query_log
+
+CREATE TABLE t_multi_sidecar_crash_before_bin(
+  id INT PRIMARY KEY,
+  v INT,
+  payload VARBINARY(512)
+) ENGINE=InnoDB;
+INSERT INTO t_multi_sidecar_crash_before_bin VALUES(1, 10, 'seed');
+RESET MASTER;
+
+CREATE TEMPORARY TABLE tmp_multi_sidecar_crash(
+  id INT PRIMARY KEY,
+  v INT,
+  KEY(v)
+) ENGINE=InnoDB;
+
+SET SESSION debug="+d,preserve_trx_crash_before_snapshot_rename";
+START TRANSACTION;
+UPDATE t_multi_sidecar_crash_before_bin
+  SET v = 11, payload = REPEAT('a', 512)
+  WHERE id = 1;
+INSERT INTO tmp_multi_sidecar_crash VALUES(1, 100), (2, 200);
+UPDATE tmp_multi_sidecar_crash SET v = v + 1 WHERE id = 1;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--error 2013
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+
+--source suite/preserve_trx/include/ha_crash_abandon_preserve_artifacts.inc
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_snapshot_file.inc
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
+my $preserve_dir = File::Spec->catdir($datadir, 'preserve');
+opendir(my $dh, $preserve_dir) or die "cannot open preserve dir: $!";
+my @leftovers = grep {
+  /\.(?:bin|binlog_cache|tainted)(?:\.tmp)?$/ ||
+  /\.blob\.[A-Za-z0-9_-]+(?:\.tmp)?$/ ||
+  /\.tempts\.\d+\.(?:image|undo|warm|undo\.warm)(?:\.tmp)?$/
+} readdir($dh);
+closedir($dh);
+die "orphan preserve artifacts remain after crash before .bin: @leftovers"
+  if @leftovers;
+EOF
+
+SELECT id, v, payload FROM t_multi_sidecar_crash_before_bin ORDER BY id;
+DROP TABLE t_multi_sidecar_crash_before_bin;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

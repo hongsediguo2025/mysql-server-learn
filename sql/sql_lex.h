@@ -4016,6 +4016,11 @@ struct LEX : public Query_tables_list {
   // Maximum execution time for a statement.
   ulong max_execution_time;
 
+  // Parsed options for PREPARE SHUTDOWN PRESERVE / DRAIN ... PRESERVE.
+  bool preserve_trx_has_timeout;
+  ulonglong preserve_trx_timeout_seconds;
+  uint preserve_trx_user_vars_mode;
+
   /*
     To flag the current statement as dependent for binary logging
     on explicit_defaults_for_timestamp

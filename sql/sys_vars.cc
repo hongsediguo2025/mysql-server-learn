@@ -107,6 +107,10 @@
 #include "sql/options_mysqld.h"
 #include "sql/protocol_classic.h"
 #include "sql/psi_memory_key.h"
+#include "sql/preserve_trx.h"
+#include "sql/preserve_trx_resource.h"
+#include "sql/preserve_trx_promotion.h"
+#include "sql/preserve_trx_transfer.h"
 #include "sql/query_options.h"
 #include "sql/rpl_group_replication.h"  // is_group_replication_running
 #include "sql/rpl_info_factory.h"       // Rpl_info_factory
@@ -273,13 +277,8 @@ static bool check_session_admin(sys_var *self MY_ATTRIBUTE((unused)), THD *thd,
                                 set_var *setv) {
   DBUG_ASSERT(self->scope() !=
               sys_var::GLOBAL);  // don't abuse check_session_admin()
-  Security_context *sctx = thd->security_context();
   if ((setv->type == OPT_SESSION || setv->type == OPT_DEFAULT) &&
-      !sctx->has_global_grant(STRING_WITH_LEN("SESSION_VARIABLES_ADMIN"))
-           .first &&
-      !sctx->has_global_grant(STRING_WITH_LEN("SYSTEM_VARIABLES_ADMIN"))
-           .first &&
-      !sctx->check_access(SUPER_ACL)) {
+      !has_session_variable_admin_privilege(thd)) {
     my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0),
              "SUPER, SYSTEM_VARIABLES_ADMIN or SESSION_VARIABLES_ADMIN");
     return true;
@@ -294,6 +293,19 @@ static bool check_session_admin(sys_var *self MY_ATTRIBUTE((unused)), THD *thd,
   not a mistakenly forgotten 'static' keyword.
 */
 #define export /* not static */
+
+export bool has_session_variable_admin_privilege(THD *thd) {
+  if (thd == nullptr) return false;
+  Security_context *sctx = thd->security_context();
+  return sctx != nullptr &&
+         (sctx->has_global_grant(
+                   STRING_WITH_LEN("SESSION_VARIABLES_ADMIN"))
+              .first ||
+          sctx->has_global_grant(
+                  STRING_WITH_LEN("SYSTEM_VARIABLES_ADMIN"))
+              .first ||
+          sctx->check_access(SUPER_ACL));
+}
 
 #ifdef WITH_LOCK_ORDER
 
@@ -1017,6 +1029,541 @@ static Sys_var_bool Sys_partial_revokes(
     ON_CHECK(check_partial_revokes), ON_UPDATE(partial_revokes_update), nullptr,
     sys_var::PARSE_EARLY);
 
+class Sys_var_preserve_trx_dir final : public Sys_var_charptr_func {
+ public:
+  Sys_var_preserve_trx_dir()
+      : Sys_var_charptr_func(
+            "preserve_trx_dir",
+            "Directory used for preserved transaction snapshot files.",
+            GLOBAL) {
+    is_os_charset = true;
+  }
+
+  const uchar *global_value_ptr(THD *, LEX_STRING *) override {
+    return pointer_cast<const uchar *>(preserved_trx_dir_value());
+  }
+};
+
+static Sys_var_preserve_trx_dir Sys_preserve_trx_dir;
+
+static Sys_var_bool Sys_preserve_trx_temp_table_enable(
+    "preserve_trx_temp_table_enable",
+    "Enable constrained user InnoDB temporary table preserve/resume support. "
+    "Tracked Temp-DML is preserved through physical image and no-redo undo "
+    "sidecars; DDL, unsupported metadata, savepoint and statement-rollback "
+    "boundaries remain fail-closed before durable token creation.",
+    GLOBAL_VAR(preserve_trx_temp_table_enable), CMD_LINE(OPT_ARG),
+    DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_max_total(
+    "preserve_trx_max_total",
+    "Maximum total number of preserved transactions allowed on the instance.",
+    GLOBAL_VAR(preserve_trx_max_total), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(256), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_max_pending_per_user(
+    "preserve_trx_max_pending_per_user",
+    "Maximum number of preserved transactions pending for one account.",
+    GLOBAL_VAR(preserve_trx_max_pending_per_user), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(256), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_batch_max_transactions(
+    "preserve_trx_batch_max_transactions",
+    "Maximum number of transactions that one DRAIN TRANSACTIONS PRESERVE "
+    "command may preserve.",
+    GLOBAL_VAR(preserve_trx_batch_max_transactions), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(256), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_default_timeout(
+    "preserve_trx_default_timeout",
+    "Default wall-clock timeout in seconds for PREPARE SHUTDOWN PRESERVE "
+    "TRANSACTION and DRAIN TRANSACTIONS PRESERVE when WITH TIMEOUT is omitted.",
+    SESSION_VAR(preserve_trx_default_timeout), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(300), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_min_timeout(
+    "preserve_trx_min_timeout",
+    "Minimum client-specified wall-clock timeout in seconds for preserved "
+    "transactions.",
+    SESSION_VAR(preserve_trx_min_timeout), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(60), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_max_timeout(
+    "preserve_trx_max_timeout",
+    "Maximum client-specified wall-clock timeout in seconds for preserved "
+    "transactions.",
+    SESSION_VAR(preserve_trx_max_timeout), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(86400), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_recovery_max_count(
+    "preserve_trx_recovery_max_count",
+    "Maximum number of startup recovery passes for the same preserved "
+    "transaction before it is rolled back.",
+    GLOBAL_VAR(preserve_trx_recovery_max_count), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(3), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_recovery_grace_seconds(
+    "preserve_trx_recovery_grace_seconds",
+    "Startup recovery grace window in seconds for the first recovery of a "
+    "preserved transaction whose original timeout already expired.",
+    GLOBAL_VAR(preserve_trx_recovery_grace_seconds), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(30, 1800), DEFAULT(120), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_max_snapshot_bytes(
+    "preserve_trx_max_snapshot_bytes",
+    "Maximum size in bytes of a preserved transaction snapshot metadata file.",
+    GLOBAL_VAR(preserve_trx_max_snapshot_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, ULLONG_MAX), DEFAULT(16777216), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_max_binlog_cache_bytes(
+    "preserve_trx_max_binlog_cache_bytes",
+    "Maximum size in bytes of a preserved transaction binlog cache sidecar "
+    "file.",
+    GLOBAL_VAR(preserve_trx_max_binlog_cache_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, ULLONG_MAX), DEFAULT(1073741824), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_max_temp_sidecar_bytes(
+    "preserve_trx_max_temp_sidecar_bytes",
+    "Maximum size in bytes of a preserved temporary table image or undo "
+    "sidecar file.",
+    GLOBAL_VAR(preserve_trx_max_temp_sidecar_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, ULLONG_MAX), DEFAULT(1073741824), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_memory_budget_bytes(
+    "preserve_trx_memory_budget_bytes",
+    "Maximum Preserve/Resume heap bytes that may be leased across all active "
+    "preserve operations before callers must spill or fail closed.",
+    GLOBAL_VAR(preserve_trx_memory_budget_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(4096, ULLONG_MAX), DEFAULT(268435456), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_memory_per_token_bytes(
+    "preserve_trx_memory_per_token_bytes",
+    "Maximum Preserve/Resume heap bytes that may be leased by one preserved "
+    "transaction token before callers must spill or fail closed.",
+    GLOBAL_VAR(preserve_trx_memory_per_token_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(4096, ULLONG_MAX), DEFAULT(67108864), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_spill_chunk_bytes(
+    "preserve_trx_spill_chunk_bytes",
+    "Scratch chunk size used when Preserve/Resume streams large artifacts to "
+    "the spill backend.",
+    GLOBAL_VAR(preserve_trx_spill_chunk_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(4096, 67108864), DEFAULT(4194304), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_single_phase_max_binlog_cache_bytes(
+    "preserve_trx_single_phase_max_binlog_cache_bytes",
+    "Maximum logged binlog cache bytes that preserve may copy without a "
+    "warm-copy phase. Larger single-phase preserves fail before undo prepare "
+    "or detach.",
+    GLOBAL_VAR(preserve_trx_single_phase_max_binlog_cache_bytes),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, ULLONG_MAX), DEFAULT(ULLONG_MAX),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_max_lock_count(
+    "preserve_trx_max_lock_count",
+    "Maximum number of record locks that preserve may materialize or export "
+    "before rejecting the transaction.",
+    GLOBAL_VAR(preserve_trx_max_lock_count), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, UINT_MAX32), DEFAULT(2000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_max_modified_tables(
+    "preserve_trx_max_modified_tables",
+    "Maximum number of modified InnoDB tables that preserve may scan for "
+    "implicit locks before rejecting the transaction.",
+    GLOBAL_VAR(preserve_trx_max_modified_tables), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, UINT_MAX32), DEFAULT(64), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_max_scan_pages(
+    "preserve_trx_max_scan_pages",
+    "Maximum number of clustered index pages that preserve may scan while "
+    "materializing implicit locks before rejecting the transaction.",
+    GLOBAL_VAR(preserve_trx_max_scan_pages), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, UINT_MAX32), DEFAULT(20000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_materialize_timeout_ms(
+    "preserve_trx_materialize_timeout_ms",
+    "Maximum wall-clock time in milliseconds that preserve may spend "
+    "materializing implicit locks before rejecting the transaction.",
+    GLOBAL_VAR(preserve_trx_materialize_timeout_ms), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, UINT_MAX32), DEFAULT(5000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static const char *preserve_trx_drain_mode_names[] = {"SOFT", "HARD", nullptr};
+static Sys_var_enum Sys_preserve_trx_drain_mode(
+    "preserve_trx_drain_mode",
+    "Shutdown drain mode for preserved transactions. SOFT blocks new risky "
+    "statements and waits for existing active transactions until "
+    "preserve_trx_drain_grace_ms before escalating to HARD. HARD immediately "
+    "kills other active user transactions.",
+    GLOBAL_VAR(preserve_trx_drain_mode), CMD_LINE(REQUIRED_ARG),
+    preserve_trx_drain_mode_names, DEFAULT(PRESERVE_TRX_DRAIN_MODE_SOFT),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_drain_grace_ms(
+    "preserve_trx_drain_grace_ms",
+    "Maximum wall-clock time in milliseconds that SOFT preserved transaction "
+    "shutdown drain waits before escalating to HARD.",
+    GLOBAL_VAR(preserve_trx_drain_grace_ms), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, UINT_MAX32), DEFAULT(30000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_drain_hard_timeout_ms(
+    "preserve_trx_drain_hard_timeout_ms",
+    "Maximum wall-clock time in milliseconds that HARD preserved transaction "
+    "shutdown drain waits for active transactions before failing.",
+    GLOBAL_VAR(preserve_trx_drain_hard_timeout_ms), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(30000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_bool Sys_preserve_trx_warmcopy_enable(
+    "preserve_trx_warmcopy_enable",
+    "Enable the warm-copy phase for DRAIN TRANSACTIONS PRESERVE binlog caches.",
+    GLOBAL_VAR(preserve_trx_warmcopy_enable), CMD_LINE(OPT_ARG),
+    DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_warmcopy_close_timeout_ms(
+    "preserve_trx_warmcopy_close_timeout_ms",
+    "Maximum wall-clock time in milliseconds to wait for warm-copy closing "
+    "convergence.",
+    GLOBAL_VAR(preserve_trx_warmcopy_close_timeout_ms), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, UINT_MAX32), DEFAULT(30000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_warmcopy_min_open_ms(
+    "preserve_trx_warmcopy_min_open_ms",
+    "Minimum wall-clock time in milliseconds that a warm-copy drain remains "
+    "open before closing admission.",
+    GLOBAL_VAR(preserve_trx_warmcopy_min_open_ms), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, UINT_MAX32), DEFAULT(1000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_warmcopy_chunk_bytes(
+    "preserve_trx_warmcopy_chunk_bytes",
+    "Target byte chunk size for warm-copy binlog cache prefix copy.",
+    GLOBAL_VAR(preserve_trx_warmcopy_chunk_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, UINT_MAX32), DEFAULT(1048576), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_warmcopy_tail_budget_bytes(
+    "preserve_trx_warmcopy_tail_budget_bytes",
+    "Maximum binlog cache tail bytes allowed after the warm-copy descriptor "
+    "high-water mark before preserve phase rejects the drain.",
+    GLOBAL_VAR(preserve_trx_warmcopy_tail_budget_bytes),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT_MAX32), DEFAULT(1048576),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_warmcopy_max_total_bytes(
+    "preserve_trx_warmcopy_max_total_bytes",
+    "Maximum total bytes of warm-copy binlog cache artifacts per drain epoch.",
+    GLOBAL_VAR(preserve_trx_warmcopy_max_total_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, ULLONG_MAX), DEFAULT(10737418240ULL), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_warmcopy_pending_range_limit(
+    "preserve_trx_warmcopy_pending_range_limit",
+    "Maximum number of out-of-order warm-copy mirror ranges retained per "
+    "participant before the participant is degraded.",
+    GLOBAL_VAR(preserve_trx_warmcopy_pending_range_limit),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT_MAX32), DEFAULT(1024),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_warmcopy_pending_bytes_limit(
+    "preserve_trx_warmcopy_pending_bytes_limit",
+    "Maximum bytes of out-of-order warm-copy mirror payload retained per "
+    "participant before the participant is degraded.",
+    GLOBAL_VAR(preserve_trx_warmcopy_pending_bytes_limit),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, ULLONG_MAX), DEFAULT(67108864ULL),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_bool Sys_preserve_trx_lock_warmcopy_enable(
+    "preserve_trx_lock_warmcopy_enable",
+    "Enable Preserve/Resume lock metadata warm-copy. This option is "
+    "independent from preserve_trx_warmcopy_enable, which controls binlog "
+    "cache warm-copy.",
+    GLOBAL_VAR(preserve_trx_lock_warmcopy_enable), CMD_LINE(OPT_ARG),
+    DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_bool Sys_preserve_trx_lock_warmcopy_fallback_to_live_export(
+    "preserve_trx_lock_warmcopy_fallback_to_live_export",
+    "Allow Preserve/Resume to discard an invalid lock warm-copy artifact and "
+    "fall back to the existing live lock export path for the whole target.",
+    GLOBAL_VAR(preserve_trx_lock_warmcopy_fallback_to_live_export),
+    CMD_LINE(OPT_ARG), DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_lock_warmcopy_max_memory_bytes(
+    "preserve_trx_lock_warmcopy_max_memory_bytes",
+    "Maximum Preserve/Resume lock warm-copy artifact payload bytes retained "
+    "in memory in one drain epoch before spill or fail-closed handling is "
+    "required. This is not a total process heap limit.",
+    GLOBAL_VAR(preserve_trx_lock_warmcopy_max_memory_bytes),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, ULLONG_MAX), DEFAULT(268435456ULL),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_lock_warmcopy_max_journal_bytes(
+    "preserve_trx_lock_warmcopy_max_journal_bytes",
+    "Maximum journal bytes for Preserve/Resume lock warm-copy state in one "
+    "drain epoch before spill or fail-closed handling is required.",
+    GLOBAL_VAR(preserve_trx_lock_warmcopy_max_journal_bytes),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, ULLONG_MAX), DEFAULT(1073741824ULL),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_lock_warmcopy_max_dirty_shards(
+    "preserve_trx_lock_warmcopy_max_dirty_shards",
+    "Maximum dirty record shards that Preserve/Resume lock warm-copy may "
+    "revalidate in phase 2 before the target artifact becomes invalid.",
+    GLOBAL_VAR(preserve_trx_lock_warmcopy_max_dirty_shards),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT_MAX32), DEFAULT(100000),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_lock_warmcopy_max_mdl_descriptors(
+    "preserve_trx_lock_warmcopy_max_mdl_descriptors",
+    "Maximum transaction-duration MDL descriptors that Preserve/Resume lock "
+    "warm-copy may retain for one target before the artifact becomes invalid.",
+    GLOBAL_VAR(preserve_trx_lock_warmcopy_max_mdl_descriptors),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT_MAX32), DEFAULT(100000),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_lock_warmcopy_seal_threads(
+    "preserve_trx_lock_warmcopy_seal_threads",
+    "Number of lock warm-copy phase-2 record seal worker threads. 0 selects "
+    "an automatic worker count bounded by the number of targets.",
+    GLOBAL_VAR(preserve_trx_lock_warmcopy_seal_threads),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 1024), DEFAULT(0), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_parallel_preserve_threads(
+    "preserve_trx_parallel_preserve_threads",
+    "Number of DRAIN TRANSACTIONS PRESERVE phase-2 target preserve worker "
+    "threads. 0 selects an automatic worker count for lock warm-copy batch "
+    "drains; 1 forces the legacy serial target preserve loop.",
+    GLOBAL_VAR(preserve_trx_parallel_preserve_threads),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 1024), DEFAULT(0), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_startup_recovery_threads(
+    "preserve_trx_startup_recovery_threads",
+    "Number of Preserve/Resume startup snapshot recovery worker threads. 0 "
+    "selects an automatic worker count for local preserved snapshots; 1 "
+    "forces the legacy serial startup recovery loop.",
+    GLOBAL_VAR(preserve_trx_startup_recovery_threads), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(0, 1024), DEFAULT(0), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_bool Sys_preserve_trx_recover_lock_page_prefetch(
+    "preserve_trx_recover_lock_page_prefetch",
+    "Issue best-effort asynchronous InnoDB page reads for preserved record-lock "
+    "payload pages before startup recovery imports the record locks.",
+    GLOBAL_VAR(preserve_trx_recover_lock_page_prefetch), CMD_LINE(OPT_ARG),
+    DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_lock_warmcopy_conversion_wait_timeout_ms(
+    "preserve_trx_lock_warmcopy_conversion_wait_timeout_ms",
+    "Maximum milliseconds another session may wait when lock warm-copy has "
+    "temporarily frozen implicit-to-explicit record lock conversion for a "
+    "target transaction.",
+    GLOBAL_VAR(preserve_trx_lock_warmcopy_conversion_wait_timeout_ms),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, UINT_MAX32), DEFAULT(30000),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static const char *preserve_trx_transfer_artifact_mode_names[] = {
+    "LOCAL_CARRIER", "STANDBY_TRANSFER_SAVE", nullptr};
+
+static bool check_preserve_trx_transfer_receiver_enable(sys_var *, THD *,
+                                                        set_var *var) {
+  const bool requested_enabled = var->save_result.ulonglong_value != 0;
+  if (requested_enabled != preserve_trx_transfer_receiver_enable) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0),
+             "preserve_trx_transfer_receiver_enable is a startup-only option");
+    return true;
+  }
+  return false;
+}
+
+static bool check_preserve_trx_transfer_artifact_mode(sys_var *, THD *,
+                                                      set_var *var) {
+  const ulong requested_mode =
+      static_cast<ulong>(var->save_result.ulonglong_value);
+  if (requested_mode != preserve_trx_transfer_artifact_mode) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0),
+             "preserve_trx_transfer_artifact_mode is a startup-only option");
+    return true;
+  }
+  return false;
+}
+
+static Sys_var_bool Sys_preserve_trx_transfer_receiver_enable(
+    "preserve_trx_transfer_receiver_enable",
+    "Allow this server to accept Preserve/Resume standby direct-transfer "
+    "receiver traffic. The receiver path is independent from ordinary local "
+    "startup recovery and resume.",
+    GLOBAL_VAR(preserve_trx_transfer_receiver_enable), CMD_LINE(OPT_ARG),
+    DEFAULT(false), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+    ON_CHECK(check_preserve_trx_transfer_receiver_enable));
+
+static Sys_var_charptr Sys_preserve_trx_transfer_allowed_source_uuid(
+    "preserve_trx_transfer_allowed_source_uuid",
+    "Source server UUID accepted by the Preserve/Resume standby "
+    "direct-transfer receiver. An empty value rejects receiver manifests.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_allowed_source_uuid),
+    CMD_LINE(REQUIRED_ARG), IN_SYSTEM_CHARSET, DEFAULT(""));
+
+static Sys_var_charptr Sys_preserve_trx_transfer_target_server_uuid(
+    "preserve_trx_transfer_target_server_uuid",
+    "Target server UUID expected by the Preserve/Resume standby "
+    "direct-transfer receiver. An empty value rejects receiver manifests.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_target_server_uuid),
+    CMD_LINE(REQUIRED_ARG), IN_SYSTEM_CHARSET, DEFAULT(""));
+
+static Sys_var_charptr Sys_preserve_trx_transfer_target_host(
+    "preserve_trx_transfer_target_host",
+    "Host name or address used by Preserve/Resume standby direct-transfer "
+    "source background sessions. Empty means no TCP target is configured.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_target_host),
+    CMD_LINE(REQUIRED_ARG), IN_FS_CHARSET, DEFAULT(""));
+
+static Sys_var_uint Sys_preserve_trx_transfer_target_port(
+    "preserve_trx_transfer_target_port",
+    "TCP port used by Preserve/Resume standby direct-transfer source "
+    "background sessions. 0 means no TCP target port is configured.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_target_port),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 65535), DEFAULT(0), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_charptr Sys_preserve_trx_transfer_target_socket(
+    "preserve_trx_transfer_target_socket",
+    "Unix socket used by Preserve/Resume standby direct-transfer source "
+    "background sessions. Empty means no socket target is configured.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_target_socket),
+    CMD_LINE(REQUIRED_ARG), IN_FS_CHARSET, DEFAULT(""));
+
+static Sys_var_charptr Sys_preserve_trx_transfer_target_user(
+    "preserve_trx_transfer_target_user",
+    "Account name used by Preserve/Resume standby direct-transfer source "
+    "background sessions. The password material is referenced separately.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_target_user),
+    CMD_LINE(REQUIRED_ARG), IN_SYSTEM_CHARSET, DEFAULT(""));
+
+static Sys_var_charptr Sys_preserve_trx_transfer_credential_name(
+    "preserve_trx_transfer_credential_name",
+    "Credential reference used by Preserve/Resume standby direct-transfer "
+    "source background sessions. The variable stores a credential name, not a "
+    "plain-text password.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_credential_name),
+    CMD_LINE(REQUIRED_ARG), IN_SYSTEM_CHARSET, DEFAULT(""));
+
+static Sys_var_charptr Sys_preserve_trx_transfer_credential_secret_file(
+    "preserve_trx_transfer_credential_secret_file",
+    "Path to a local file containing the Preserve/Resume standby "
+    "direct-transfer credential secret. The path is read by source background "
+    "sessions and receiver codec code when no in-memory credential store entry "
+    "is available.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_transfer_credential_secret_file),
+    CMD_LINE(REQUIRED_ARG), IN_FS_CHARSET, DEFAULT(""));
+
+static Sys_var_enum Sys_preserve_trx_transfer_artifact_mode(
+    "preserve_trx_transfer_artifact_mode",
+    "Artifact publication mode for Preserve/Resume. LOCAL_CARRIER preserves "
+    "the current local carrier path; STANDBY_TRANSFER_SAVE publishes through "
+    "the configured standby transfer endpoint.",
+    GLOBAL_VAR(preserve_trx_transfer_artifact_mode), CMD_LINE(REQUIRED_ARG),
+    preserve_trx_transfer_artifact_mode_names,
+    DEFAULT(PRESERVE_TRX_TRANSFER_ARTIFACT_LOCAL_CARRIER), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG, ON_CHECK(check_preserve_trx_transfer_artifact_mode));
+
+static Sys_var_uint Sys_preserve_trx_transfer_receiver_workers(
+    "preserve_trx_transfer_receiver_workers",
+    "Maximum worker count for the Preserve/Resume standby direct-transfer "
+    "batch receiver payload path. classic single-frame dispatch still validates "
+    "and stages one command frame on the dispatching session.",
+    GLOBAL_VAR(preserve_trx_transfer_receiver_workers),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 1024), DEFAULT(8), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_transfer_chunk_bytes(
+    "preserve_trx_transfer_chunk_bytes",
+    "Target chunk size in bytes for Preserve/Resume standby direct-transfer "
+    "object payloads.",
+    GLOBAL_VAR(preserve_trx_transfer_chunk_bytes), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, 1048576), DEFAULT(1048576), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_transfer_max_inflight_bytes(
+    "preserve_trx_transfer_max_inflight_bytes",
+    "Maximum unsealed bytes allowed in one Preserve/Resume standby "
+    "direct-transfer epoch before backpressure or fail-closed handling.",
+    GLOBAL_VAR(preserve_trx_transfer_max_inflight_bytes),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, ULLONG_MAX),
+    DEFAULT(1073741824ULL), BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_transfer_commit_timeout_ms(
+    "preserve_trx_transfer_commit_timeout_ms",
+    "Maximum milliseconds the source waits for a Preserve/Resume standby "
+    "direct-transfer epoch commit acknowledgment.",
+    GLOBAL_VAR(preserve_trx_transfer_commit_timeout_ms),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, UINT_MAX32), DEFAULT(30000),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_ulonglong Sys_preserve_trx_transfer_phase1_batch_bytes(
+    "preserve_trx_transfer_phase1_batch_bytes",
+    "Target encoded-byte threshold for one Preserve/Resume phase-1 standby "
+    "transfer batch. Zero disables batching. Each transfer epoch snapshots "
+    "the value when the epoch is opened.",
+    GLOBAL_VAR(preserve_trx_transfer_phase1_batch_bytes),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 67108864ULL), DEFAULT(4194304ULL),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_transfer_phase1_batch_linger_ms(
+    "preserve_trx_transfer_phase1_batch_linger_ms",
+    "Maximum milliseconds the oldest queued phase-1 standby transfer object "
+    "may wait before its batch is sent. Zero sends immediately. Each transfer "
+    "epoch snapshots the value when the epoch is opened.",
+    GLOBAL_VAR(preserve_trx_transfer_phase1_batch_linger_ms),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 1000), DEFAULT(20), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_promotion_gate_batch_tokens(
+    "preserve_trx_promotion_gate_batch_tokens",
+    "Maximum standby-pending tokens a single Preserve/Resume promotion gate "
+    "batch may adopt. Requests above this limit fail closed instead of "
+    "silently spilling into an unbounded gate window.",
+    GLOBAL_VAR(preserve_trx_promotion_gate_batch_tokens),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, 1024), DEFAULT(3), BLOCK_SIZE(1),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_promotion_gate_workers(
+    "preserve_trx_promotion_gate_workers",
+    "Maximum worker count for Preserve/Resume standby promotion gate token "
+    "adoption. The current entry uses this as the default request budget; "
+    "future HA hooks may map it to a bounded worker pool.",
+    GLOBAL_VAR(preserve_trx_promotion_gate_workers), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, 1024), DEFAULT(3), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_promotion_gate_timeout_ms(
+    "preserve_trx_promotion_gate_timeout_ms",
+    "Default promotion gate deadline in milliseconds for Preserve/Resume "
+    "standby adopt operations.",
+    GLOBAL_VAR(preserve_trx_promotion_gate_timeout_ms),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, UINT_MAX32), DEFAULT(1000),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
 static bool fix_binlog_cache_size(sys_var *, THD *thd, enum_var_type) {
   check_binlog_cache_size(thd);
   return false;
@@ -1286,6 +1833,33 @@ static bool prevent_global_rbr_exec_mode_idempotent(sys_var *self, THD *,
 static Sys_var_test_flag Sys_core_file("core_file",
                                        "write a core-file on crashes",
                                        TEST_CORE_ON_SIGNAL);
+
+static Sys_var_bool Sys_preserve_trx_enable(
+    "preserve_trx_enable",
+    "Enable resumable transactions across shutdown. When enabled, supported "
+    "transactions can be preserved, drained, recovered, and resumed across a "
+    "server restart; unsupported cases fail closed before a durable token is "
+    "published.",
+    GLOBAL_VAR(preserve_trx_enable), CMD_LINE(OPT_ARG), DEFAULT(true),
+    NO_MUTEX_GUARD, NOT_IN_BINLOG,
+    ON_CHECK(preserve_trx_sysvar_check_enable),
+    ON_UPDATE(preserve_trx_sysvar_update_enable));
+
+static const char *preserve_trx_off_artifact_policy_names[] = {
+    "FAIL_IF_PRESENT", "IGNORE", "RECOVER", "ABANDON", nullptr};
+
+static Sys_var_enum Sys_preserve_trx_off_artifact_policy(
+    "preserve_trx_off_artifact_policy",
+    "Startup-only policy used when preserve_trx_enable is OFF and historical "
+    "Preserve/Resume artifacts exist in the datadir. FAIL_IF_PRESENT rejects "
+    "startup if artifacts are present; IGNORE keeps the strict native OFF "
+    "path and leaves cleanup to external tooling; RECOVER handles local "
+    "preserve artifacts without allowing new preserve work; ABANDON attempts "
+    "auditable rollback/cleanup of historical artifacts.",
+    READ_ONLY GLOBAL_VAR(preserve_trx_off_artifact_policy),
+    CMD_LINE(REQUIRED_ARG), preserve_trx_off_artifact_policy_names,
+    DEFAULT(PRESERVE_TRX_OFF_ARTIFACT_POLICY_FAIL_IF_PRESENT), NO_MUTEX_GUARD,
+    NOT_IN_BINLOG);
 
 static Sys_var_enum Sys_binlog_format(
     "binlog_format",
@@ -4955,15 +5529,11 @@ static Sys_var_debug_sync Sys_debug_sync("debug_sync", "Debug Sync Facility",
                                          ON_CHECK(check_session_admin));
 #endif /* defined(ENABLED_DEBUG_SYNC) */
 
-static bool fix_autocommit(sys_var *self, THD *thd, enum_var_type type) {
-  if (self->is_global_persist(type)) {
-    if (global_system_variables.option_bits & OPTION_AUTOCOMMIT)
-      global_system_variables.option_bits &= ~OPTION_NOT_AUTOCOMMIT;
-    else
-      global_system_variables.option_bits |= OPTION_NOT_AUTOCOMMIT;
-    return false;
-  }
-
+export bool set_session_autocommit_internal(THD *thd, bool enabled) {
+  if (enabled)
+    thd->variables.option_bits |= OPTION_AUTOCOMMIT;
+  else
+    thd->variables.option_bits &= ~OPTION_AUTOCOMMIT;
   if (thd->variables.option_bits & OPTION_AUTOCOMMIT &&
       thd->variables.option_bits &
           OPTION_NOT_AUTOCOMMIT) {  // activating autocommit
@@ -5001,6 +5571,19 @@ static bool fix_autocommit(sys_var *self, THD *thd, enum_var_type type) {
   }
 
   return false;  // autocommit value wasn't changed
+}
+
+static bool fix_autocommit(sys_var *self, THD *thd, enum_var_type type) {
+  if (self->is_global_persist(type)) {
+    if (global_system_variables.option_bits & OPTION_AUTOCOMMIT)
+      global_system_variables.option_bits &= ~OPTION_NOT_AUTOCOMMIT;
+    else
+      global_system_variables.option_bits |= OPTION_NOT_AUTOCOMMIT;
+    return false;
+  }
+
+  return set_session_autocommit_internal(
+      thd, (thd->variables.option_bits & OPTION_AUTOCOMMIT) != 0);
 }
 static Sys_var_bit Sys_autocommit("autocommit", "autocommit",
                                   SESSION_VAR(option_bits), NO_CMD_LINE,

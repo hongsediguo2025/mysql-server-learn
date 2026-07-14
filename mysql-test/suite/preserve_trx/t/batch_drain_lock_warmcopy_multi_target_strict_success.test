@@ -1,0 +1,95 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_lock_warmcopy_multi_strict_tokens;
+DROP TABLE IF EXISTS t_lock_warmcopy_multi_strict;
+--enable_warnings
+
+--let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
+--let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_fallback= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_fallback_to_live_export`
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+--let $old_preserve_trx_parallel_preserve_threads= `SELECT @@GLOBAL.preserve_trx_parallel_preserve_threads`
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+SET GLOBAL preserve_trx_parallel_preserve_threads=2;
+
+CREATE TABLE t_lock_warmcopy_multi_strict(
+  id INT PRIMARY KEY,
+  v INT,
+  pad VARBINARY(64)
+) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_multi_strict VALUES
+  (1,10,REPEAT('a',32)),
+  (2,20,REPEAT('b',32));
+
+--connect(lock_wc_multi_a, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_lock_warmcopy_multi_strict SET v=11, pad=REPEAT('x',32)
+  WHERE id=1;
+
+--connect(lock_wc_multi_b, localhost, root,,test)
+START TRANSACTION;
+UPDATE t_lock_warmcopy_multi_strict SET v=22, pad=REPEAT('y',32)
+  WHERE id=2;
+
+--connection default
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+let SEARCH_FILE=$MYSQLTEST_VARDIR/log/mysqld.1.err;
+let SEARCH_PATTERN= phase2_preserve_worker_count=2;
+--source include/search_pattern.inc
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+CREATE TABLE t_lock_warmcopy_multi_strict_tokens AS
+SELECT ROW_NUMBER() OVER (ORDER BY TOKEN) AS rn, TOKEN
+  FROM performance_schema.preserved_transactions;
+--let $token1= `SELECT TOKEN FROM t_lock_warmcopy_multi_strict_tokens WHERE rn=1`
+--let $token2= `SELECT TOKEN FROM t_lock_warmcopy_multi_strict_tokens WHERE rn=2`
+
+--connect(lock_wc_multi_resume_1, localhost, root,,test)
+--connection lock_wc_multi_resume_1
+--replace_result $token1 TOKEN1
+--eval RESUME PRESERVED TRANSACTION '$token1'
+COMMIT;
+--disconnect lock_wc_multi_resume_1
+
+--connect(lock_wc_multi_resume_2, localhost, root,,test)
+--connection lock_wc_multi_resume_2
+--replace_result $token2 TOKEN2
+--eval RESUME PRESERVED TRANSACTION '$token2'
+COMMIT;
+--disconnect lock_wc_multi_resume_2
+
+--connection default
+SELECT COUNT(*) AS preserved_count_after_resume
+  FROM performance_schema.preserved_transactions;
+SELECT id, v, pad IN (REPEAT('x',32), REPEAT('y',32)) AS pad_ok
+  FROM t_lock_warmcopy_multi_strict
+  ORDER BY id;
+
+DROP TABLE t_lock_warmcopy_multi_strict_tokens;
+DROP TABLE t_lock_warmcopy_multi_strict;
+--disable_query_log
+--eval SET GLOBAL preserve_trx_parallel_preserve_threads=$old_preserve_trx_parallel_preserve_threads
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback
+--eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
+--eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
+--eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--enable_query_log

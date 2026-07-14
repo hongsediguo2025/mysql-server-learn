@@ -1,0 +1,24 @@
+--disable_warnings
+DROP TABLE IF EXISTS xa_keep;
+--enable_warnings
+
+CREATE TABLE xa_keep(a INT PRIMARY KEY) ENGINE=InnoDB;
+
+XA START 'normal_xa';
+INSERT INTO xa_keep VALUES(1);
+XA END 'normal_xa';
+XA PREPARE 'normal_xa';
+XA RECOVER;
+XA ROLLBACK 'normal_xa';
+
+SELECT COUNT(*) AS rows_after_rollback FROM xa_keep;
+
+XA START X'4d53505f50524553', X'746f6b656e', 1836281843;
+INSERT INTO xa_keep VALUES(2);
+XA END X'4d53505f50524553', X'746f6b656e', 1836281843;
+XA PREPARE X'4d53505f50524553', X'746f6b656e', 1836281843;
+XA ROLLBACK X'4d53505f50524553', X'746f6b656e', 1836281843;
+
+SELECT COUNT(*) AS magic_rows_after_rollback FROM xa_keep;
+
+DROP TABLE xa_keep;

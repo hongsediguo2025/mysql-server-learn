@@ -1,0 +1,29 @@
+DROP TABLE IF EXISTS t_lock_export_record_failclosed;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_lock_export_record_failclosed(
+id INT PRIMARY KEY,
+v INT
+) ENGINE=InnoDB;
+INSERT INTO t_lock_export_record_failclosed VALUES(1,10),(2,20);
+START TRANSACTION;
+UPDATE t_lock_export_record_failclosed SET v=11 WHERE id=1;
+SET SESSION debug="+d,preserve_trx_fail_export_record_locks";
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug="-d,preserve_trx_fail_export_record_locks";
+SELECT v AS value_visible_in_failed_preserve_trx
+FROM t_lock_export_record_failclosed
+WHERE id=1;
+value_visible_in_failed_preserve_trx
+11
+COMMIT;
+SELECT * FROM t_lock_export_record_failclosed ORDER BY id;
+id	v
+1	11
+2	20
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+0
+DROP TABLE t_lock_export_record_failclosed;
+SET GLOBAL preserve_trx_enable=ON;

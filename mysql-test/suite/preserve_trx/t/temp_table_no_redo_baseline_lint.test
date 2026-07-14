@@ -1,0 +1,49 @@
+--echo # Lint-only source-shape guard for no-redo temp undo baseline capture.
+--echo # Explicit and implicit multi-statement transaction starts must mark the
+--echo # baseline before temp DML can be compared against preserve-time state.
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+my $transaction_path = File::Spec->catfile($source_root, 'sql',
+                                           'transaction.cc');
+my $handler_path = File::Spec->catfile($source_root, 'sql', 'handler.cc');
+
+open(my $fh, '<', $transaction_path) or die "cannot open $transaction_path: $!";
+my $transaction = do { local $/; <$fh> };
+close($fh);
+open($fh, '<', $handler_path) or die "cannot open $handler_path: $!";
+my $handler = do { local $/; <$fh> };
+close($fh);
+
+die "transaction.cc must include preserve_trx_temp_table.h\n"
+  unless $transaction =~ /#include\s+"sql\/preserve_trx_temp_table\.h"/s;
+
+$transaction =~ /(bool\s+trans_begin\s*\([^)]*\)\s*\{[\s\S]*?^})/m
+  or die "could not isolate trans_begin\n";
+my $trans_begin = $1;
+die "trans_begin must mark the temp-table no-redo baseline after OPTION_BEGIN\n"
+  unless $trans_begin =~
+         /variables\.option_bits\s*\|=\s*OPTION_BEGIN[\s\S]*preserve_trx_temp_table_mark_transaction_start\s*\(\s*thd\s*\)/s;
+
+die "implicit all=true transaction registration must mark temp-table no-redo baseline\n"
+  unless $handler =~
+         /void\s+trans_register_ha\s*\([^)]*\)[\s\S]*const\s+bool\s+first_session_ha\s*=[\s\S]*trn_ctx->set_ha_trx_info\s*\(\s*trx_scope\s*,\s*ha_info\s*\)\s*;[\s\S]*if\s*\(\s*first_session_ha\s*\)\s*preserve_trx_temp_table_mark_transaction_start\s*\(\s*thd\s*\)/s;
+
+die "SAVEPOINT must mark temp-table savepoint history\n"
+  unless $transaction =~
+         /bool\s+trans_savepoint\s*\([^)]*\)[\s\S]*preserve_trx_temp_table_note_savepoint\s*\(\s*thd\s*,\s*name\.str\s*,\s*name\.length\s*\)/s;
+die "ROLLBACK TO SAVEPOINT must mark temp-table rollback history\n"
+  unless $transaction =~
+         /bool\s+trans_rollback_to_savepoint\s*\([^)]*\)[\s\S]*preserve_trx_temp_table_note_rollback_to_savepoint\s*\(\s*thd\s*,\s*name\.str\s*,\s*name\.length\s*\)/s;
+die "RELEASE SAVEPOINT must mark temp-table release history\n"
+  unless $transaction =~
+         /bool\s+trans_release_savepoint\s*\([^)]*\)[\s\S]*preserve_trx_temp_table_note_release_savepoint\s*\(\s*thd\s*,\s*name\.str\s*,\s*name\.length\s*\)/s;
+EOF
+
+SELECT 'ok' AS temp_table_no_redo_baseline_lint;

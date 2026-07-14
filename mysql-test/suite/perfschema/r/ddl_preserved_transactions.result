@@ -1,0 +1,11 @@
+ALTER TABLE performance_schema.preserved_transactions
+ADD COLUMN foo INTEGER;
+ERROR 42000: Access denied for user 'root'@'localhost' to database 'performance_schema'
+TRUNCATE TABLE performance_schema.preserved_transactions;
+ERROR 42000: DROP command denied to user 'root'@'localhost' for table 'preserved_transactions'
+ALTER TABLE performance_schema.preserved_transactions
+ADD INDEX test_index(TOKEN);
+ERROR 42000: Access denied for user 'root'@'localhost' to database 'performance_schema'
+CREATE UNIQUE INDEX test_index ON
+performance_schema.preserved_transactions(TOKEN);
+ERROR 42000: Access denied for user 'root'@'localhost' to database 'performance_schema'

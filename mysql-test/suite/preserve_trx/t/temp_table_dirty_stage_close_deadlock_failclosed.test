@@ -1,0 +1,64 @@
+--source include/have_debug_sync.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_temp_dirty_close_base;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_temp_dirty_close_base(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_temp_dirty_close_base VALUES(1, 10);
+
+CREATE TEMPORARY TABLE tmp_temp_dirty_close_owner(
+  id INT PRIMARY KEY,
+  payload VARCHAR(128)
+) ENGINE=InnoDB;
+INSERT INTO tmp_temp_dirty_close_owner VALUES(1, 'owner-before-preserve');
+
+--connect(temp_dirty_close_worker, localhost, root,,test)
+CREATE TEMPORARY TABLE tmp_temp_dirty_close_worker(
+  id INT PRIMARY KEY,
+  payload VARCHAR(128)
+) ENGINE=InnoDB;
+INSERT INTO tmp_temp_dirty_close_worker VALUES(1, 'worker-before-close');
+
+--connection default
+START TRANSACTION;
+UPDATE t_temp_dirty_close_base SET v = 11 WHERE id = 1;
+SET DEBUG_SYNC =
+  'preserve_temp_stage_admission_close_entered SIGNAL temp_dirty_close_entered WAIT_FOR temp_dirty_close_continue';
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--send PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300
+
+--connection temp_dirty_close_worker
+--sleep 2
+SET DEBUG_SYNC = 'now WAIT_FOR temp_dirty_close_entered TIMEOUT 10';
+--send INSERT INTO tmp_temp_dirty_close_worker VALUES (2, 'worker-during-close-a'), (3, 'worker-during-close-b'), (4, 'worker-during-close-c'), (5, 'worker-during-close-d')
+--error ER_PRESERVE_TRX_UNSUPPORTED
+--reap
+SELECT COUNT(*) AS worker_temp_rows FROM tmp_temp_dirty_close_worker;
+SET DEBUG_SYNC = 'now SIGNAL temp_dirty_close_continue';
+
+--connection default
+--reap
+--source include/wait_until_disconnected.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+SELECT * FROM tmp_temp_dirty_close_owner ORDER BY id;
+COMMIT;
+SELECT * FROM t_temp_dirty_close_base ORDER BY id;
+
+DROP TEMPORARY TABLE tmp_temp_dirty_close_owner;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+DROP TABLE t_temp_dirty_close_base;
+SET GLOBAL preserve_trx_enable=ON;
+SET DEBUG_SYNC = 'RESET';

@@ -1,0 +1,70 @@
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_mixed_stale_snapshot;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+--disable_query_log
+CALL mtr.add_suppression("Preserved transaction .* token delivery cleanup failed.*");
+CALL mtr.add_suppression("Preserved transaction .* recovery cleanup failed: failed to delete snapshot files");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: durable consume-state cleanup");
+--enable_query_log
+
+CREATE TABLE t_mixed_stale_snapshot(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+INSERT INTO t_mixed_stale_snapshot VALUES(1, 10);
+
+--connect(mixed_owner,localhost,root,,test)
+--connection mixed_owner
+--let $mixed_conn_id= `SELECT CONNECTION_ID()`
+CREATE TEMPORARY TABLE tmp_mixed_stale_snapshot(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO tmp_mixed_stale_snapshot VALUES(1, 100);
+SET SESSION debug="+d,preserve_trx_fail_delete_snapshot_files";
+SET DEBUG_SYNC =
+  'preserve_trx_before_token_delivery SIGNAL mixed_token_ready WAIT_FOR mixed_continue';
+START TRANSACTION;
+UPDATE t_mixed_stale_snapshot SET v=11 WHERE id=1;
+UPDATE tmp_mixed_stale_snapshot SET v=101 WHERE id=1;
+--send PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300
+
+--connection default
+--sleep 2
+SET DEBUG_SYNC = 'now WAIT_FOR mixed_token_ready TIMEOUT 10';
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $mixed_conn_id CONN_ID
+--eval KILL CONNECTION $mixed_conn_id
+SET DEBUG_SYNC = 'now SIGNAL mixed_continue';
+
+--connection mixed_owner
+--error 2013
+--reap
+--disconnect mixed_owner
+
+--connection default
+--file_exists $PRESERVED_SNAPSHOT_FILE
+--exec test -f "$MYSQLD_DATADIR/preserve/$preserved_token.consume_state"
+SELECT COUNT(*) AS preserved_count_before_restart
+  FROM performance_schema.preserved_transactions;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=ON
+--let $do_not_echo_parameters= 1
+--source include/restart_mysqld.inc
+--let $do_not_echo_parameters=
+--let $restart_parameters=
+
+SELECT COUNT(*) AS preserved_count_after_restart
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/assert_no_preserve_residue.inc
+SELECT * FROM t_mixed_stale_snapshot ORDER BY id;
+
+DROP TABLE t_mixed_stale_snapshot;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Preserve/Resume 8.0.22 全面详细设计</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18202a;
+      --muted: #5f6b7a;
+      --line: #d7dde6;
+      --panel: #f7f9fc;
+      --accent: #0f6b7a;
+      --accent2: #7a4f10;
+      --danger: #9b2335;
+      --ok: #26643b;
+      --code: #eef3f8;
+    }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      color: var(--ink);
+      background: white;
+      line-height: 1.65;
+    }
+    main { max-width: 1180px; margin: 0 auto; padding: 32px 36px 64px; }
+    h1, h2, h3 { line-height: 1.25; color: #111827; }
+    h1 { font-size: 32px; margin: 0 0 8px; }
+    h2 { margin-top: 34px; padding-top: 16px; border-top: 1px solid var(--line); }
+    h3 { margin-top: 24px; }
+    p { margin: 10px 0; }
+    code {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      background: var(--code);
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-size: 0.92em;
+    }
+    pre {
+      background: #111827;
+      color: #f8fafc;
+      border-radius: 8px;
+      padding: 14px 16px;
+      overflow: auto;
+      line-height: 1.45;
+    }
+    table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 14px; }
+    th, td { border: 1px solid var(--line); padding: 8px 10px; vertical-align: top; }
+    th { background: #eef3f8; text-align: left; }
+    .meta, .note, .warning, .review {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin: 16px 0;
+    }
+    .warning { border-color: #e6b8c0; background: #fff7f8; }
+    .note strong, .warning strong { color: #111827; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .card { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; background: #fff; }
+    .diagram { margin: 18px 0 26px; border: 1px solid var(--line); border-radius: 8px; background: #fff; overflow-x: auto; }
+    .diagram svg { display: block; min-width: 900px; width: 100%; height: auto; }
+    .box { fill: #f8fbff; stroke: #406078; stroke-width: 1.3; rx: 8; }
+    .box2 { fill: #f6fbf7; stroke: #3f7a52; stroke-width: 1.3; rx: 8; }
+    .box3 { fill: #fffaf0; stroke: #9a6a20; stroke-width: 1.3; rx: 8; }
+    .box4 { fill: #fff6f7; stroke: #a73a4b; stroke-width: 1.3; rx: 8; }
+    .arrow { stroke: #445566; stroke-width: 1.6; fill: none; marker-end: url(#arrow); }
+    .dash { stroke-dasharray: 5 4; }
+    .label { font-size: 13px; fill: #17202a; }
+    .small { font-size: 12px; fill: #4b5563; }
+    .title { font-size: 15px; font-weight: 700; fill: #111827; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #e6f4f6; color: var(--accent); font-weight: 600; font-size: 12px; }
+    ul { padding-left: 22px; }
+    .toc a { color: var(--accent); text-decoration: none; }
+    .toc li { margin: 3px 0; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Preserve/Resume 8.0.22 全面详细设计</h1>
+  <div class="meta">
+    <p><strong>读者对象：</strong>内核开发、DBA 工具开发、测试与发布负责人。</p>
+    <p><strong>适用版本：</strong>当前 worktree 的 MySQL 8.0.22 preserve-port 分支，当前代码事实与后续目标设计在文中明确区分。</p>
+    <p><strong>文档边界：</strong>本文描述 Preserve/Resume 当前实现、设计约束和 phase 2 约 1 秒目标路线；不修改源码，也不声称复制集群自动接入已经完成。</p>
+  </div>
+
+  <div class="meta">
+    <p><strong>文档套件导航：</strong>
+      <a href="preserve-resume-8.0.22-detailed-design.html">全面详细设计</a> ·
+      <a href="preserve-resume-8.0.22-user-manual.html">用户手册</a> ·
+      <a href="preserve-resume-8.0.22-engineer-handoff.html">新同事交接</a> ·
+      <a href="preserve-resume-8.0.22-replica-drain-resume-design.html">物理复制集群接入方案</a> ·
+      <a href="preserve-resume-8.0.22-code-analysis.html">代码详解</a>
+    </p>
+  </div>
+
+  <h2>覆盖清单</h2>
+  <table>
+    <thead><tr><th>计划要求</th><th>本文覆盖位置</th><th>事实源</th></tr></thead>
+    <tbody>
+      <tr><td>单事务 preserve、batch drain preserve、resume、startup recovery、expired-token reaper</td><td>第 3 至第 6 节状态机、sequence 和流程图</td><td><code>sql/preserve_trx.cc</code>、<code>sql/preserve_trx_drain.cc</code></td></tr>
+      <tr><td>fail-closed、durable point、snapshot publish、token delivery、cleanup/taint/rollback</td><td>第 3、4、9 节</td><td><code>sql/preserve_trx.cc</code>、<code>sql/preserve_trx_carrier*</code></td></tr>
+      <tr><td>binlog warmcopy、lock warmcopy、temp table sidecar、external blob、resource budget</td><td>第 7、8 节</td><td><code>sql/binlog_warmcopy.*</code>、<code>sql/preserve_trx_lock_warmcopy.*</code>、<code>storage/innobase/trx/trx0temp_preserve.cc</code></td></tr>
+      <tr><td>命令、参数、内核对象与代码锚点</td><td>第 1、2、8 节；用户操作细节由用户手册展开</td><td><code>sql/sql_yacc.yy</code>、<code>sql/sys_vars.cc</code>、InnoDB/MDL/P_S 相关源码</td></tr>
+      <tr><td>图表不少于计划要求</td><td>本文 9 张内联 SVG；四篇合计 25 张</td><td>本文绘图均为自包含 SVG/CSS</td></tr>
+    </tbody>
+  </table>
+
+  <h2>目录</h2>
+  <ol class="toc">
+    <li><a href="#sources">事实源与术语</a></li>
+    <li><a href="#architecture">总体架构</a></li>
+    <li><a href="#state">状态机与生命周期</a></li>
+    <li><a href="#preserve">单事务 Preserve</a></li>
+    <li><a href="#drain">Batch Drain Preserve</a></li>
+    <li><a href="#resume">Resume 与 Startup Recovery</a></li>
+    <li><a href="#artifacts">Snapshot、Sidecar 与资源预算</a></li>
+    <li><a href="#locks">锁、MDL、Read View、Savepoint 与临时表</a></li>
+    <li><a href="#limits">约束、失败处理与当前限制</a></li>
+    <li><a href="#review">文档 Review 记录</a></li>
+  </ol>
+
+  <h2 id="sources">1. 事实源与术语</h2>
+  <p>本文以当前仓库源码和现有设计文档为事实源。核心入口包括 <code>sql/sql_yacc.yy</code>、<code>sql/sql_parse.cc</code>、<code>sql/preserve_trx.cc</code>、<code>sql/preserve_trx_drain.cc</code>、<code>sql/preserve_trx_bundle.*</code>、<code>sql/preserve_trx_carrier*</code>、<code>sql/binlog_warmcopy.*</code>、<code>sql/preserve_trx_lock_warmcopy.*</code>、<code>storage/innobase/lock/lock0preserve.cc</code>、<code>storage/innobase/lock/lock0warmcopy.cc</code>、<code>storage/innobase/trx/trx0preserve.cc</code>、<code>storage/innobase/trx/trx0temp_preserve.cc</code>、<code>storage/innobase/read/read0read.cc</code>、<code>sql/mdl.*</code>、<code>sql/handler.cc</code>、<code>sql/xa.cc</code>、<code>storage/perfschema/table_preserved_transactions.*</code>。</p>
+  <table>
+    <thead><tr><th>术语</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>preserve</td><td>把一个未提交显式事务转换为 durable token 和 snapshot，使它可以跨重启恢复。</td></tr>
+      <tr><td>resume</td><td>用 token 在新连接中重新绑定 preserved transaction，并继续提交、回滚或执行后续 SQL；带用户临时表 no-redo undo sidecar 且已经 native-adopted 的事务，恢复后也可以继续执行受支持的用户临时表 DML。旧 manifest 或 restored-only 路径仍只能读、COMMIT 或 ROLLBACK。</td></tr>
+      <tr><td>drain</td><td>停机前收敛实例中的目标事务，批量执行 preserve。</td></tr>
+      <tr><td>snapshot</td><td>durable metadata 文件，记录 token、账号、binlog、锁、read view、savepoint、临时表 manifest 等恢复所需语义。</td></tr>
+      <tr><td>sidecar</td><td>大对象外置文件，例如 binlog cache、用户临时表 image、no-redo undo、warm external blob。</td></tr>
+      <tr><td>warmcopy</td><td>在 drain 第一阶段提前复制或镜像大对象，让第二阶段只处理 bounded tail 和一致性校验。</td></tr>
+      <tr><td>durable point</td><td>事务已经 prepare/detach 或 snapshot 可能存在后，失败处理必须避免丢失所有权。</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="architecture">2. 总体架构</h2>
+  <p>Preserve/Resume 是 SQL 层、binlog、InnoDB、P_S、文件 carrier 和资源预算共同组成的内核能力。它不只是 XA 包装：XA prepare 只能保存存储引擎事务状态，而 Preserve/Resume 还必须恢复 SQL session 语义、binlog cache、MDL、锁、read view、savepoint、临时表与权限边界。</p>
+
+  <div class="diagram" aria-label="总体架构图">
+    <svg viewBox="0 0 1040 430" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">Preserve/Resume 总体架构</text>
+      <rect x="30" y="60" width="180" height="72" class="box"/><text x="55" y="92" class="label">SQL Surface</text><text x="55" y="114" class="small">PREPARE / DR&#65;IN / RESUME / SHOW</text>
+      <rect x="260" y="60" width="190" height="72" class="box2"/><text x="290" y="92" class="label">Manager + Drain</text><text x="290" y="114" class="small">gate、quiesce、batch targets</text>
+      <rect x="500" y="60" width="190" height="72" class="box3"/><text x="530" y="92" class="label">Preserve Kernel</text><text x="530" y="114" class="small">preflight、prepare、detach、register</text>
+      <rect x="740" y="60" width="230" height="72" class="box"/><text x="775" y="92" class="label">Bundle + Carrier</text><text x="775" y="114" class="small">snapshot、sidecar、HMAC、cleanup</text>
+      <path d="M210 96 L260 96" class="arrow"/><path d="M450 96 L500 96" class="arrow"/><path d="M690 96 L740 96" class="arrow"/>
+
+      <rect x="90" y="205" width="170" height="76" class="box2"/><text x="118" y="238" class="label">Binlog Warmcopy</text><text x="118" y="260" class="small">cache mirror / GTID state</text>
+      <rect x="320" y="205" width="170" height="76" class="box2"/><text x="354" y="238" class="label">Lock Warmcopy</text><text x="354" y="260" class="small">record/table/MDL artifacts</text>
+      <rect x="550" y="205" width="170" height="76" class="box2"/><text x="592" y="238" class="label">InnoDB Trx</text><text x="582" y="260" class="small">trx_t、read view、savepoint</text>
+      <rect x="780" y="205" width="170" height="76" class="box2"/><text x="808" y="238" class="label">Temp Table</text><text x="810" y="260" class="small">DD、fil space、sidecar</text>
+      <path d="M595 132 C540 168 470 186 405 205" class="arrow"/><path d="M595 132 C620 165 630 180 635 205" class="arrow"/><path d="M595 132 C760 156 820 174 865 205" class="arrow"/><path d="M595 132 C385 160 245 185 175 205" class="arrow"/>
+
+      <rect x="310" y="335" width="190" height="56" class="box4"/><text x="342" y="368" class="label">P_S / SHOW / Status</text>
+      <rect x="550" y="335" width="200" height="56" class="box4"/><text x="585" y="368" class="label">Recovery / Reaper</text>
+      <path d="M855 132 C770 210 700 285 650 335" class="arrow"/><path d="M855 132 C720 250 570 315 500 350" class="arrow"/>
+    </svg>
+  </div>
+
+  <h3>2.1 分层职责</h3>
+  <div class="grid">
+    <div class="card"><strong>SQL Surface</strong><p>语法、命令分发、权限、drain gate、协议边界和 token delivery。</p></div>
+    <div class="card"><strong>Preserve Kernel</strong><p>单事务 preserve 的核心状态转换，负责 preflight、prepare、detach、snapshot write 和错误收敛。</p></div>
+    <div class="card"><strong>Bundle/Carrier</strong><p>定义 snapshot 格式、HMAC/CRC、外部 blob 描述符、文件写入、删除、taint 和 listing。</p></div>
+    <div class="card"><strong>InnoDB Adapter</strong><p>导出/导入 read view、savepoint、record/table/predicate locks、临时表物理 sidecar。</p></div>
+    <div class="card"><strong>Warmcopy</strong><p>在 batch drain phase 1 提前复制 binlog cache 或镜像锁信息，减少 phase 2 阻塞窗口。</p></div>
+    <div class="card"><strong>Observability</strong><p>P_S 表、SHOW、status counters、错误原因和 release/NFR 报告。</p></div>
+  </div>
+
+  <h2 id="state">3. 状态机与生命周期</h2>
+  <p>Preserve/Resume 的核心状态机围绕 token、InnoDB trx、snapshot 文件和内存 record 展开。状态转换必须 fail closed：不能把一个语义不完整的 token 标成可恢复，也不能在 durable point 后丢掉 prepared transaction 的所有权。</p>
+
+  <div class="diagram" aria-label="token状态机">
+    <svg viewBox="0 0 1000 310" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">Token 与事务状态机</text>
+      <rect x="40" y="80" width="130" height="58" class="box"/><text x="75" y="114" class="label">ACTIVE</text>
+      <rect x="230" y="80" width="130" height="58" class="box3"/><text x="258" y="114" class="label">PREPARED</text>
+      <rect x="420" y="80" width="130" height="58" class="box3"/><text x="452" y="114" class="label">DETACHED</text>
+      <rect x="610" y="80" width="130" height="58" class="box2"/><text x="642" y="114" class="label">PUBLISHED</text>
+      <rect x="800" y="80" width="130" height="58" class="box2"/><text x="832" y="114" class="label">RESUMED</text>
+      <path d="M170 109 L230 109" class="arrow"/><path d="M360 109 L420 109" class="arrow"/><path d="M550 109 L610 109" class="arrow"/><path d="M740 109 L800 109" class="arrow"/>
+      <text x="178" y="96" class="small">ha_prepare_low</text><text x="365" y="96" class="small">detach THD</text><text x="552" y="96" class="small">snapshot + record</text><text x="742" y="96" class="small">resume</text>
+      <rect x="230" y="210" width="160" height="50" class="box4"/><text x="265" y="240" class="label">ROLLBACK</text>
+      <rect x="610" y="210" width="160" height="50" class="box4"/><text x="655" y="240" class="label">Tainted</text>
+      <path d="M285 138 C270 165 275 188 310 210" class="arrow dash"/><path d="M675 138 C650 166 650 188 690 210" class="arrow dash"/>
+      <text x="400" y="238" class="small">失败路径保留可观察记录或回滚</text>
+    </svg>
+  </div>
+
+  <h2 id="preserve">4. 单事务 Preserve</h2>
+  <p>单事务 preserve 作用于当前连接上的显式事务。它在命令成功响应后触发 shutdown，token 在重启后可用于 resume。关键原则是：prepare 前失败应尽量保持原事务仍在 session；prepare/detach 后失败必须通过 reattach、rollback、taint 或 observable record 收敛。</p>
+  <p>用户入口命令包括 <code>PREPARE SHUTDOWN PRESERVE TRANSACTION</code>、<code>DR&#65;IN TRANSACTIONS PRESERVE</code>、<code>RESUME PRESERVED TRANSACTION</code> 和 <code>SHOW PRESERVED TRANSACTIONS</code>；语法与操作细节在用户手册中完整列出。</p>
+
+  <div class="diagram" aria-label="单事务preserve序列图">
+    <svg viewBox="0 0 1100 520" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">单事务 Preserve Sequence</text>
+      <text x="70" y="70" class="label">Client/THD</text><text x="270" y="70" class="label">Preserve Kernel</text><text x="515" y="70" class="label">Binlog/InnoDB/MDL</text><text x="795" y="70" class="label">Carrier</text>
+      <line x1="110" y1="85" x2="110" y2="470" stroke="#ccd3dd"/><line x1="335" y1="85" x2="335" y2="470" stroke="#ccd3dd"/><line x1="590" y1="85" x2="590" y2="470" stroke="#ccd3dd"/><line x1="850" y1="85" x2="850" y2="470" stroke="#ccd3dd"/>
+      <path d="M110 110 L335 110" class="arrow"/><text x="135" y="102" class="small">PREPARE SHUTDOWN PRESERVE</text>
+      <path d="M335 145 L590 145" class="arrow"/><text x="360" y="137" class="small">preflight: binlog、locks、read view、MDL、temp</text>
+      <path d="M590 180 L335 180" class="arrow"/><text x="375" y="172" class="small">semantic payloads / sidecar descriptors</text>
+      <path d="M335 215 L590 215" class="arrow"/><text x="375" y="207" class="small">ha_prepare_low(true)</text>
+      <path d="M335 250 L590 250" class="arrow"/><text x="375" y="242" class="small">detach trx from THD</text>
+      <path d="M335 285 L850 285" class="arrow"/><text x="375" y="277" class="small">write snapshot + external blobs</text>
+      <path d="M850 320 L335 320" class="arrow"/><text x="625" y="312" class="small">durable token published</text>
+      <path d="M335 355 L110 355" class="arrow"/><text x="145" y="347" class="small">OK + token</text>
+      <path d="M335 390 L590 390" class="arrow dash"/><text x="375" y="382" class="small">finalize delivery, trigger shutdown</text>
+      <rect x="245" y="430" width="410" height="48" class="box4"/><text x="270" y="460" class="label">prepare/detach 后失败：reattach、rollback、taint 或保留 observable record</text>
+    </svg>
+  </div>
+
+  <h3>4.1 Preserve 前置检查</h3>
+  <ul>
+    <li>全局开关 <code>preserve_trx_enable</code> 必须为 ON。</li>
+    <li>执行用户需要 <code>SHUTDOWN</code> 权限。</li>
+    <li>当前连接必须处于显式活跃事务，不能是复制线程、升级路径、force recovery、标准 XA 活跃状态或不支持的协议上下文。</li>
+    <li>事务不能包含非事务表修改，也不能包含 InnoDB/binlog 之外的 read-write handlerton 参与者。</li>
+    <li>对象权限、MDL、read view、savepoint、锁、binlog cache、临时表均必须能导出并通过预算限制。</li>
+  </ul>
+
+  <h3>4.2 Durable Point 与失败收敛</h3>
+  <p>在 <code>ha_prepare_low(thd, true)</code> 前，失败一般可以返回错误并保留原连接事务。进入 prepare/detach/snapshot write 后，失败处理不能简单返回：因为 prepared transaction、snapshot 文件或 sidecar 可能已经存在。当前实现通过 cleanup lambda、taint marker、observable record 和 rollback-by-token 保留可审计路径。</p>
+
+  <h2 id="drain">5. Batch Drain Preserve</h2>
+  <p>Batch drain 用于停机前批量保存目标事务。它比单事务 preserve 多出全局 gate、target 分类、SOFT/HARD drain、warmcopy phase 1 和 participant cleanup。</p>
+
+  <div class="diagram" aria-label="batch drain流程图">
+    <svg viewBox="0 0 1120 420" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">Batch Drain Phase 1 / Phase 2</text>
+      <rect x="40" y="85" width="145" height="62" class="box"/><text x="70" y="120" class="label">入口检查</text>
+      <rect x="230" y="85" width="150" height="62" class="box2"/><text x="253" y="112" class="label">Phase 1 Open</text><text x="253" y="134" class="small">warmcopy admission</text>
+      <rect x="425" y="85" width="160" height="62" class="box2"/><text x="452" y="112" class="label">SOFT/HARD Drain</text><text x="452" y="134" class="small">等待或 kill 活跃事务</text>
+      <rect x="630" y="85" width="150" height="62" class="box3"/><text x="655" y="112" class="label">Phase 1 Close</text><text x="655" y="134" class="small">tail 收敛</text>
+      <rect x="825" y="85" width="160" height="62" class="box3"/><text x="855" y="112" class="label">Phase 2 Preserve</text><text x="855" y="134" class="small">prepare/detach/snapshot</text>
+      <path d="M185 116 L230 116" class="arrow"/><path d="M380 116 L425 116" class="arrow"/><path d="M585 116 L630 116" class="arrow"/><path d="M780 116 L825 116" class="arrow"/>
+      <rect x="230" y="220" width="355" height="88" class="box2"/><text x="255" y="250" class="label">业务仍可执行的窗口</text><text x="255" y="274" class="small">binlog cache prefix copy、lock/temp candidate 采集、pending target 分类</text>
+      <rect x="630" y="220" width="355" height="88" class="box4"/><text x="655" y="250" class="label">业务阻塞窗口</text><text x="655" y="274" class="small">关闭 lock-capable command gate、bounded tail、final fence、snapshot/register</text>
+      <path d="M405 147 L405 220" class="arrow dash"/><path d="M705 147 L705 220" class="arrow dash"/>
+    </svg>
+  </div>
+
+  <h3>5.1 Phase 2 约 1 秒目标</h3>
+  <p>当前 full warmcopy-only NFR 证据显示大锁数场景仍可能达到分钟级阻塞，原因是大 payload 生产、编码、写入和 per-target preserve 仍集中在 phase 2。目标架构必须把 O(lock count) 的扫描、排序、编码、checksum、外部 artifact 写入移到 phase 1，并在 phase 2 只做 bounded tail、final fence 和 descriptor adopt。超过 1 秒是性能 SLO miss，不能改变功能正确性。</p>
+
+  <h2 id="resume">6. Resume 与 Startup Recovery</h2>
+  <p>Resume 从 durable snapshot 中恢复语义，并把 claimed transaction 重新绑定到当前 THD。Startup recovery 只在 mysqld 启动且 <code>preserve_trx_enable=ON</code> 时扫描 preserve 目录，导入有效 token，回滚过期或不可恢复 token，清理 staging/orphan 文件；实例以 <code>--preserve-trx-enable=OFF</code> 启动时不会扫描，运行中再 <code>SET GLOBAL preserve_trx_enable=ON</code> 也不会补扫既有 snapshot。</p>
+
+  <div class="diagram" aria-label="resume sequence">
+    <svg viewBox="0 0 1080 430" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">Resume Sequence</text>
+      <rect x="50" y="80" width="170" height="62" class="box"/><text x="76" y="116" class="label">RESUME token</text>
+      <rect x="270" y="80" width="170" height="62" class="box2"/><text x="300" y="106" class="label">读取 snapshot</text><text x="300" y="128" class="small">HMAC / CRC / version</text>
+      <rect x="490" y="80" width="170" height="62" class="box2"/><text x="520" y="106" class="label">权限与环境</text><text x="520" y="128" class="small">owner、read_only、binlog</text>
+      <rect x="710" y="80" width="170" height="62" class="box3"/><text x="742" y="106" class="label">导入语义</text><text x="742" y="128" class="small">trx、locks、MDL、temp</text>
+      <rect x="490" y="250" width="170" height="62" class="box2"/><text x="522" y="286" class="label">绑定 THD</text>
+      <rect x="710" y="250" width="170" height="62" class="box2"/><text x="745" y="286" class="label">ACTIVE</text>
+      <path d="M220 111 L270 111" class="arrow"/><path d="M440 111 L490 111" class="arrow"/><path d="M660 111 L710 111" class="arrow"/><path d="M795 142 C795 205 645 210 575 250" class="arrow"/>
+      <path d="M660 281 L710 281" class="arrow"/>
+      <rect x="50" y="250" width="300" height="62" class="box4"/><text x="78" y="278" class="label">失败：token 保留、taint 或 rollback</text><text x="78" y="300" class="small">取决于失败点和 cleanup 是否成功</text>
+      <path d="M490 142 C360 180 265 210 200 250" class="arrow dash"/>
+    </svg>
+  </div>
+
+  <div class="diagram" aria-label="startup recovery流程">
+    <svg viewBox="0 0 1050 360" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">Startup Recovery Flow</text>
+      <rect x="45" y="90" width="150" height="58" class="box"/><text x="64" y="113" class="label">启动开关检查</text><text x="62" y="135" class="small">preserve_trx_enable=ON</text>
+      <rect x="245" y="90" width="160" height="58" class="box2"/><text x="270" y="113" class="label">解析 snapshot</text><text x="270" y="135" class="small">版本、HMAC、CRC</text>
+      <rect x="455" y="90" width="160" height="58" class="box2"/><text x="484" y="113" class="label">校验 timeout</text><text x="484" y="135" class="small">grace / recover count</text>
+      <rect x="665" y="90" width="160" height="58" class="box3"/><text x="694" y="113" class="label">claim prepared</text><text x="694" y="135" class="small">token / XID</text>
+      <rect x="455" y="235" width="160" height="58" class="box4"/><text x="494" y="269" class="label">rollback</text>
+      <rect x="665" y="235" width="160" height="58" class="box2"/><text x="690" y="269" class="label">注册内存记录</text>
+      <path d="M195 119 L245 119" class="arrow"/><path d="M405 119 L455 119" class="arrow"/><path d="M615 119 L665 119" class="arrow"/><path d="M745 148 L745 235" class="arrow"/><path d="M535 148 L535 235" class="arrow dash"/>
+      <text x="840" y="124" class="small">有效 token</text><text x="622" y="214" class="small">过期、超限、不可解析</text>
+    </svg>
+  </div>
+
+  <h2 id="artifacts">7. Snapshot、Sidecar 与资源预算</h2>
+  <p>Snapshot metadata 是恢复语义的索引；大对象不应无界塞入内存或主 snapshot。当前实现已有 binlog cache sidecar、temp table sidecar、warm external blob、lock warmcopy spill。phase 2 1s 目标要求 lock artifact 进一步 descriptor 化，避免 phase 2 materialize 大 payload。</p>
+
+  <div class="diagram" aria-label="snapshot layout">
+    <svg viewBox="0 0 1080 380" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">Snapshot Bundle 与 Sidecar Layout</text>
+      <rect x="50" y="75" width="260" height="240" class="box"/>
+      <text x="78" y="108" class="label">Snapshot Metadata</text>
+      <text x="78" y="138" class="small">header / version / recovered count</text>
+      <text x="78" y="162" class="small">token / owner / timeout / binlog state</text>
+      <text x="78" y="186" class="small">read view / savepoint / MDL descriptors</text>
+      <text x="78" y="210" class="small">record/table lock payload or descriptor</text>
+      <text x="78" y="234" class="small">temp manifest / external blob descriptors</text>
+      <text x="78" y="258" class="small">CRC / HMAC</text>
+      <rect x="420" y="75" width="190" height="70" class="box2"/><text x="450" y="108" class="label">Binlog Sidecar</text><text x="450" y="130" class="small">cache payload + digest</text>
+      <rect x="420" y="175" width="190" height="70" class="box2"/><text x="448" y="208" class="label">Temp Sidecar</text><text x="448" y="230" class="small">image / no-redo undo</text>
+      <rect x="420" y="275" width="190" height="70" class="box2"/><text x="448" y="308" class="label">Warm Blob</text><text x="448" y="330" class="small">phase 1 external copy</text>
+      <rect x="730" y="125" width="230" height="90" class="box3"/><text x="760" y="160" class="label">目标：External Lock Artifact</text><text x="760" y="184" class="small">record/table/MDL segments</text><text x="760" y="206" class="small">descriptor only in snapshot</text>
+      <path d="M310 135 L420 110" class="arrow"/><path d="M310 205 L420 210" class="arrow"/><path d="M310 255 L420 310" class="arrow"/><path d="M310 210 C520 120 650 130 730 165" class="arrow dash"/>
+    </svg>
+  </div>
+
+  <h3>7.1 资源预算分层</h3>
+  <table>
+    <thead><tr><th>资源面</th><th>代表参数</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>token 数量</td><td><code>preserve_trx_max_total</code>、<code>preserve_trx_max_pending_per_user</code>、<code>preserve_trx_batch_max_transactions</code></td><td>限制实例、账号、单次 batch 保存数量。</td></tr>
+      <tr><td>snapshot 大小</td><td><code>preserve_trx_max_snapshot_bytes</code></td><td>限制 metadata 文件大小。锁、MDL、savepoint、temp manifest 过大会在这里失败。</td></tr>
+      <tr><td>binlog cache</td><td><code>preserve_trx_max_binlog_cache_bytes</code>、<code>preserve_trx_warmcopy_max_total_bytes</code></td><td>前者是单事务 sidecar 上限，后者是单个 drain epoch warm external blob 总预算。</td></tr>
+      <tr><td>通用内存</td><td><code>preserve_trx_memory_budget_bytes</code>、<code>preserve_trx_memory_per_token_bytes</code></td><td>控制 Preserve/Resume heap lease，不等于所有 MySQL 内存。</td></tr>
+      <tr><td>锁导出</td><td><code>preserve_trx_max_lock_count</code>、<code>preserve_trx_max_scan_pages</code>、<code>preserve_trx_materialize_timeout_ms</code></td><td>限制显式锁、implicit lock materialization 和扫描成本。</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="locks">8. 锁、MDL、Read View、Savepoint 与临时表</h2>
+  <p>这些对象共同决定事务恢复后的可见性、冲突行为和提交语义。任何一个对象不能导出或不能验证，都必须 fail closed 或按 per-target all-or-live fallback 回退。</p>
+  <p>本文中的锁对象包括 record locks、table locks、predicate locks、AUTO_INC locks、implicit locks、MDL tickets、read view、savepoint 和 temporary table 相关恢复对象。</p>
+
+  <div class="diagram" aria-label="锁warmcopy fallback流程">
+    <svg viewBox="0 0 1100 430" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">Lock Warmcopy All-or-Live Fallback</text>
+      <rect x="50" y="80" width="170" height="62" class="box2"/><text x="78" y="116" class="label">Phase 1 artifact</text>
+      <rect x="280" y="80" width="170" height="62" class="box2"/><text x="318" y="106" class="label">Seal / Fence</text><text x="318" y="128" class="small">record/table/MDL</text>
+      <rect x="510" y="80" width="170" height="62" class="box3"/><text x="545" y="116" class="label">Artifact valid?</text>
+      <rect x="760" y="45" width="210" height="62" class="box2"/><text x="790" y="80" class="label">Use warmcopy payloads</text>
+      <rect x="760" y="145" width="210" height="62" class="box4"/><text x="785" y="172" class="label">Discard all warmcopy</text><text x="785" y="194" class="small">live export or reject</text>
+      <path d="M220 111 L280 111" class="arrow"/><path d="M450 111 L510 111" class="arrow"/><path d="M680 102 L760 76" class="arrow"/><path d="M680 122 L760 176" class="arrow"/>
+      <text x="698" y="82" class="small">yes</text><text x="698" y="168" class="small">no</text>
+      <rect x="360" y="270" width="420" height="70" class="box4"/><text x="395" y="298" class="label">禁止混用：record warmcopy + table live + stale MDL</text><text x="395" y="320" class="small">任一 required family invalid 时，整 target 回退 live export 或 reject</text>
+    </svg>
+  </div>
+
+  <table>
+    <thead><tr><th>对象</th><th>当前处理逻辑</th><th>限制</th></tr></thead>
+    <tbody>
+      <tr><td>record locks</td><td>导出显式 record/predicate payload；lock warmcopy 目标中 record payload 可来自 sealed store。</td><td>R-tree/spatial predicate 不做 warmcopy 优化；implicit lock materialization 受扫描和数量预算限制。</td></tr>
+      <tr><td>table / AUTO_INC locks</td><td>导出 table lock payload，并与 record lock 共用锁数量预算。</td><td>后续 1s fast path 要求 table family 也进入 phase 1 mirror。</td></tr>
+      <tr><td>MDL</td><td>导出 transaction-duration MDL descriptors，resume 前做权限复检。</td><td>不支持 session/global 状态 preserve；LOCK TABLES、GET_LOCK、global read lock、backup lock 不纳入当前 v1。</td></tr>
+      <tr><td>read view</td><td>导出/导入 InnoDB MVCC read view。</td><td>需要确保 purge/read view 状态可恢复，失败则拒绝或保留 token。</td></tr>
+      <tr><td>savepoint</td><td>保存 SQL savepoint 与 InnoDB savepoint payload。</td><td>ROLLBACK TO SAVEPOINT 会影响锁和 MDL ordinal，warmcopy 目标需要 fence。</td></tr>
+      <tr><td>用户临时表</td><td>支持受约束的 InnoDB 用户临时表 image、DD/dict binding、fil space adoption、no-redo undo sidecar reconnect 和 native-owned undo adoption。</td><td>native-adopted 路径允许恢复后继续受支持的临时表 DML；旧 manifest/restored-only、缺失/损坏 sidecar、DDL/metadata/savepoint/statement rollback 边界仍必须拒绝。</td></tr>
+    </tbody>
+  </table>
+
+  <div class="diagram" aria-label="临时表preserve流程">
+    <svg viewBox="0 0 1050 340" role="img">
+      <defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#445566"/></marker></defs>
+      <text x="24" y="30" class="title">用户临时表 Preserve/Resume 数据流</text>
+      <rect x="45" y="85" width="170" height="64" class="box"/><text x="74" y="112" class="label">SQL Temp Table</text><text x="74" y="134" class="small">DD metadata / row hooks</text>
+      <rect x="270" y="85" width="170" height="64" class="box2"/><text x="298" y="112" class="label">InnoDB Image</text><text x="298" y="134" class="small">baseline + dirty pages</text>
+      <rect x="495" y="85" width="170" height="64" class="box2"/><text x="526" y="112" class="label">Sidecar</text><text x="526" y="134" class="small">image / undo / digest</text>
+      <rect x="720" y="85" width="190" height="64" class="box3"/><text x="752" y="112" class="label">Resume Materialize</text><text x="752" y="134" class="small">fil space + dict binding</text>
+      <path d="M215 117 L270 117" class="arrow"/><path d="M440 117 L495 117" class="arrow"/><path d="M665 117 L720 117" class="arrow"/>
+      <rect x="270" y="220" width="420" height="56" class="box4"/><text x="305" y="253" class="label">no-redo undo sidecar 可恢复；缺失/损坏或边界不支持时 fail closed</text>
+    </svg>
+  </div>
+
+  <h2 id="limits">9. 约束、失败处理与当前限制</h2>
+  <ul>
+    <li><strong>总开关：</strong><code>preserve_trx_enable=OFF</code> 时 preserve/drain/resume 拒绝；文档不应暗示关闭后仍执行特性流程。</li>
+    <li><strong>安全原则：</strong>无法完整导出或验证事务语义时 fail closed。</li>
+    <li><strong>权限原则：</strong>resume 重新检查 token 所属权和对象权限；跨账号 resume 需要 <code>RESUME_ANY_PRESERVED_TRANSACTION</code>。</li>
+    <li><strong>binlog 原则：</strong>binlog open、session <code>sql_log_bin</code>、GTID state 必须与 snapshot 兼容。</li>
+    <li><strong>锁原则：</strong>不混用不同时间点的 required lock family payload。</li>
+    <li><strong>临时表原则：</strong>仅支持当前实现可证明完整捕获的用户 InnoDB 临时表形态。</li>
+    <li><strong>复制集群：</strong>当前代码没有完成跨机器 artifact 传输和备机自动 resume 编排；这是后续接入方案，不是当前功能。</li>
+  </ul>
+
+  <h2 id="review">10. 文档 Review 记录</h2>
+  <div class="review">
+    <p><span class="pill">Source correctness</span> 本文命令、参数和对象章节已按当前源码锚点组织；phase 2 约 1 秒内容明确标注为目标架构，不写成当前已完成能力。</p>
+    <p><span class="pill">Completeness</span> 覆盖单事务 preserve、batch drain、resume、startup recovery、expired-token cleanup、binlog warmcopy、lock warmcopy、临时表、MDL、read view、savepoint、snapshot/carrier、P_S。</p>
+    <p><span class="pill">Reader usability</span> 面向内核读者给出状态机、sequence 和对象职责；操作步骤细节由用户手册承接。</p>
+    <p><span class="pill">Diagram consistency</span> 9 张 SVG 图均使用正文中的阶段和对象名，未引入外部依赖。</p>
+    <p><strong>剩余限制：</strong>本文不替代 release gate 证据；full MySQL MTR 或 release-farm 结论仍以发布交接文档记录为准。</p>
+  </div>
+</main>
+</body>
+</html>

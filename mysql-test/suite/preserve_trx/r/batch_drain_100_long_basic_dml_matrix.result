@@ -1,0 +1,104 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_recovery_max_count=200;
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+SELECT COUNT(*) AS session_count
+FROM t_batch_long_control;
+session_count
+100
+SELECT MIN(TIMESTAMPDIFF(MICROSECOND, started_at, NOW(6))) >= 5000000
+AS all_sessions_older_than_five_seconds
+FROM t_batch_long_control;
+all_sessions_older_than_five_seconds
+1
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS;
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+100
+SELECT COUNT(*) AS preserved_state_count
+FROM performance_schema.preserved_transactions
+WHERE STATE = 'PRESERVED';
+preserved_state_count
+100
+SELECT COUNT(*) AS mapped_token_count
+FROM t_batch_long_tokens;
+mapped_token_count
+100
+SELECT COUNT(*) AS preserved_count_after_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_resume
+0
+SELECT COUNT(*) AS resume_success_count
+FROM t_batch_long_audit
+WHERE resumed_ok = 1;
+resume_success_count
+100
+SELECT COUNT(DISTINCT sid) AS resumed_distinct_sessions
+FROM t_batch_long_audit;
+resumed_distinct_sessions
+100
+SELECT MIN(lifecycle_age_us) >= 5000000 AS all_resumed_lifecycles_were_long
+FROM t_batch_long_audit;
+all_resumed_lifecycles_were_long
+1
+SELECT MIN(sql_count) >= 8 AS every_session_ran_enough_sql
+FROM t_batch_long_audit;
+every_session_ran_enough_sql
+1
+SELECT MAX(max_stmt_us) < 1000000 AS every_statement_under_one_second
+FROM t_batch_long_audit;
+every_statement_under_one_second
+1
+SELECT COUNT(*) AS audit_rows
+FROM t_batch_long_audit;
+audit_rows
+100
+SELECT COUNT(*) AS audit_control_case_mismatch_count
+FROM t_batch_long_audit a
+JOIN t_batch_long_control c USING(sid)
+WHERE a.case_id <> c.case_id;
+audit_control_case_mismatch_count
+0
+SELECT 1 AS case_id, (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 1 AND b.k = 101 AND b.v = 102) AS ok
+UNION ALL SELECT 2 AS case_id, (SELECT COUNT(*) = 10 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 2 AND b.k IN (201, 202)) AS ok
+UNION ALL SELECT 3 AS case_id, (SELECT COUNT(*) = 10 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 3 AND b.note = 'secondary' AND b.v BETWEEN 30000 AND 39999) AS ok
+UNION ALL SELECT 4 AS case_id, (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 4 AND b.k = 4 AND b.note = 'reinserted') AS ok
+UNION ALL SELECT 5 AS case_id, (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 5 AND b.k = 5 AND b.note = 'seed') AS ok
+UNION ALL SELECT 6 AS case_id, (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 6 AND b.k = 6 AND b.note = 'odku' AND b.v >= 60000) AS ok
+UNION ALL SELECT 7 AS case_id, (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 7 AND b.k = 7 AND b.note = 'replace') AS ok
+UNION ALL SELECT 8 AS case_id, (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 8 AND b.k = 808) AS ok
+UNION ALL SELECT 9 AS case_id, (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 9 AND b.k IN (90, 91) AND b.note = 'limit') AS ok
+UNION ALL SELECT 10 AS case_id, (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 10 AND b.k = 10 AND b.v > b.sid * 200) AS ok
+UNION ALL SELECT 11 AS case_id, (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 11 AND b.k = 11 AND b.note IS NULL) AS ok
+UNION ALL SELECT 12 AS case_id, (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 12 AND b.k = 12 AND LOWER(b.note) = 'case12') AS ok
+UNION ALL SELECT 13 AS case_id, (SELECT COUNT(*) = 5 FROM t_dml_aux a JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 13 AND a.amount = 13.25 AND a.d = DATE '2026-05-18') AS ok
+UNION ALL SELECT 14 AS case_id, (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 14 AND b.k = 140 AND b.v = 140 AND b.note = 'own-write') AS ok
+UNION ALL SELECT 15 AS case_id, (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 15 AND b.k = 150) AS ok
+UNION ALL SELECT 16 AS case_id, (SELECT COUNT(*) = 15 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 16 AND b.k BETWEEN 160 AND 162 AND b.note = 'seed') AS ok
+UNION ALL SELECT 17 AS case_id, (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 17 AND b.k = 17 AND b.note = 'composite') AS ok
+UNION ALL SELECT 18 AS case_id, (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 18 AND b.k = 18 AND b.note = 'seed') AS ok
+UNION ALL SELECT 19 AS case_id, (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 19 AND b.k = 19 AND b.v >= b.sid * 100 + 22) AS ok
+UNION ALL SELECT 20 AS case_id, (SELECT (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 20 AND b.k = 200 AND b.note = 'mixed') AND (SELECT COUNT(*) = 5 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 20 AND b.k = 20 AND b.v >= b.sid * 100 + 2020) AND (SELECT COUNT(*) = 0 FROM t_dml_base b JOIN t_batch_long_control c USING(sid) WHERE c.case_id = 20 AND b.k = 21)) AS ok
+ORDER BY case_id;
+case_id	ok
+1	1
+2	1
+3	1
+4	1
+5	1
+6	1
+7	1
+8	1
+9	1
+10	1
+11	1
+12	1
+13	1
+14	1
+15	1
+16	1
+17	1
+18	1
+19	1
+20	1
+SET GLOBAL preserve_trx_enable=ON;

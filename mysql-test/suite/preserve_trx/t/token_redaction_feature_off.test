@@ -1,0 +1,89 @@
+--let $old_log_output= `SELECT @@global.log_output`
+--let $old_general_log= `SELECT @@global.general_log`
+--let $old_log_raw= `SELECT @@global.log_raw`
+--let $old_slow_query_log= `SELECT @@global.slow_query_log`
+--let $old_long_query_time= `SELECT @@global.long_query_time`
+--let $old_log_slow_admin_statements= `SELECT @@global.log_slow_admin_statements`
+
+SELECT @@global.preserve_trx_enable AS preserve_enabled;
+
+SET @feature_off_token='msp_feature_off_redaction_abcd';
+SET @feature_off_redacted=CONCAT('****', RIGHT(@feature_off_token, 4));
+
+--let $old_events_statements_history= `SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME='events_statements_history'`
+--let $old_events_statements_current= `SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME='events_statements_current'`
+UPDATE performance_schema.setup_consumers
+   SET ENABLED='YES'
+ WHERE NAME IN ('events_statements_current', 'events_statements_history');
+
+SET GLOBAL log_output='TABLE';
+SET GLOBAL general_log=OFF;
+SET GLOBAL slow_query_log=OFF;
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+SET GLOBAL general_log=ON;
+SET GLOBAL slow_query_log=ON;
+SET GLOBAL log_raw=ON;
+SET GLOBAL long_query_time=0;
+SET SESSION long_query_time=0;
+SET GLOBAL log_slow_admin_statements=ON;
+
+--disable_query_log
+CALL mtr.add_suppression("Resumable transactions across shutdown are disabled");
+CALL mtr.add_suppression("RESUME PRESERVED TRANSACTION .* failed");
+--enable_query_log
+
+--disable_query_log
+--error ER_PRESERVE_TRX_DISABLED
+RESUME PRESERVED TRANSACTION 'msp_feature_off_redaction_abcd';
+--enable_query_log
+
+SELECT COUNT(*) AS raw_token_in_general_log
+  FROM mysql.general_log
+ WHERE argument LIKE 'RESUME PRESERVED TRANSACTION%'
+   AND argument LIKE CONCAT('%', @feature_off_token, '%');
+SELECT COUNT(*) > 0 AS redacted_token_in_general_log
+  FROM mysql.general_log
+ WHERE argument LIKE '%RESUME PRESERVED TRANSACTION%'
+   AND argument LIKE CONCAT('%', @feature_off_redacted, '%');
+
+SELECT COUNT(*) AS raw_token_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text LIKE 'RESUME PRESERVED TRANSACTION%'
+   AND sql_text LIKE CONCAT('%', @feature_off_token, '%');
+SELECT COUNT(*) > 0 AS redacted_token_in_slow_log
+  FROM mysql.slow_log
+ WHERE sql_text LIKE '%RESUME PRESERVED TRANSACTION%'
+   AND sql_text LIKE CONCAT('%', @feature_off_redacted, '%');
+
+SELECT COUNT(*) AS raw_token_in_pfs_history
+  FROM performance_schema.events_statements_history
+ WHERE SQL_TEXT LIKE 'RESUME PRESERVED TRANSACTION%'
+   AND SQL_TEXT LIKE CONCAT('%', @feature_off_token, '%');
+SELECT COUNT(*) > 0 AS redacted_token_in_pfs_history
+  FROM performance_schema.events_statements_history
+ WHERE SQL_TEXT LIKE 'RESUME PRESERVED TRANSACTION%'
+   AND SQL_TEXT LIKE CONCAT('%', @feature_off_redacted, '%');
+
+--let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $grep_pattern= msp_feature_off_redaction_abcd
+--let $grep_output= count
+--source include/grep_pattern.inc
+
+--let $grep_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $grep_pattern= RESUME PRESERVED TRANSACTION '\\*\\*\\*\\*abcd
+--let $grep_output= count
+--source include/grep_pattern.inc
+
+SET GLOBAL general_log=OFF;
+SET GLOBAL slow_query_log=OFF;
+TRUNCATE TABLE mysql.general_log;
+TRUNCATE TABLE mysql.slow_log;
+--eval SET GLOBAL log_raw=$old_log_raw
+--eval SET GLOBAL long_query_time=$old_long_query_time
+--eval SET GLOBAL log_slow_admin_statements=$old_log_slow_admin_statements
+--eval SET GLOBAL log_output='$old_log_output'
+--eval SET GLOBAL general_log=$old_general_log
+--eval SET GLOBAL slow_query_log=$old_slow_query_log
+--eval UPDATE performance_schema.setup_consumers SET ENABLED='$old_events_statements_history' WHERE NAME='events_statements_history'
+--eval UPDATE performance_schema.setup_consumers SET ENABLED='$old_events_statements_current' WHERE NAME='events_statements_current'

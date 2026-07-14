@@ -118,6 +118,7 @@ class Parser_state;
 class PROFILING;
 class Query_tables_list;
 class Relay_log_info;
+class Temp_table_warmcopy_participant;
 class THD;
 class partition_info;
 class Protocol;
@@ -135,6 +136,27 @@ struct TABLE_LIST;
 struct timeval;
 struct User_level_lock;
 struct YYLTYPE;
+
+/*
+  Per-THD state while a batch drain owns or observes the session.
+
+  NONE means the THD is not participating in the current drain generation. An
+  idle target can be marked QUIESCED by the drain owner during enumeration; a
+  target with a command already in flight is marked PENDING_QUIESCE until it
+  reaches a command boundary and can report QUIESCED or DRAINED_NO_TRANSACTION.
+  ATTACHING is the short window where preserve borrows the target THD. The
+  PRESERVED_DRAINED state keeps the target blocked after successful token
+  registration, and also after unresolved detach/cleanup failures where
+  ownership must remain visible instead of letting the session run again.
+*/
+enum class Preserve_trx_batch_thd_state {
+  NONE,
+  PENDING_QUIESCE,
+  QUIESCED,
+  ATTACHING,
+  DRAINED_NO_TRANSACTION,
+  PRESERVED_DRAINED
+};
 
 namespace dd {
 namespace cache {
@@ -384,6 +406,8 @@ class Prepared_statement_map {
 
   /** Erase all prepared statements (calls Prepared_statement destructor). */
   void erase(Prepared_statement *statement);
+
+  bool has_open_server_side_cursor() const;
 
   void claim_memory_ownership(bool claim);
 
@@ -1301,6 +1325,88 @@ class THD : public MDL_context_owner,
   uint dbug_sentry;  // watch out for memory corruption
 #endif
   bool is_killable;
+  /**
+    Preserve/drain command-boundary state, protected by LOCK_thd_data.
+
+    risky_statement_depth marks a parsed statement known to create transaction
+    state or locks. unknown_query_depth is used both for COM_QUERY text before
+    parse classification and for the packet marker between get_command() and
+    dispatch. batch_generation ties this THD to one drain attempt so stale
+    quiesce/drained state is not reused by a later batch.
+  */
+  uint preserve_trx_inflight_risky_statement_depth{0};
+  uint preserve_trx_inflight_unknown_query_depth{0};
+  ulonglong preserve_trx_batch_generation{0};
+  Preserve_trx_batch_thd_state preserve_trx_batch_state{
+      Preserve_trx_batch_thd_state::NONE};
+  /**
+    Warmcopy participant id assigned by the preserve/drain coordinator while
+    this THD is admitted to an open warmcopy epoch. The id lets mirror callbacks
+    prove they belong to the current drain generation. Protected by
+    LOCK_thd_data.
+  */
+  uint preserve_trx_warmcopy_participant_id{0};
+  /**
+    Optional user temporary-table preserve participant. It owns SQL-side
+    temp-table history and coordinates with the InnoDB image/rebind runtime;
+    temp row-history/no-redo undo cases still fail closed before a durable token
+    is generated. Protected by LOCK_thd_data where it is read together with
+    per-session preserve/drain state.
+  */
+  std::shared_ptr<Temp_table_warmcopy_participant>
+      preserve_trx_temp_table_participant;
+  /**
+    Hot-path predicate for temporary-table hooks. The pointer above is protected
+    by LOCK_thd_data; this flag lets row/metadata hooks avoid taking that mutex
+    for sessions that have never created a participant.
+  */
+  std::atomic<bool> preserve_trx_temp_table_has_participant{false};
+  /**
+    True while this THD is an admitted target of a batch drain phase-1 capture
+    epoch. It is set by the drain owner when the target list is selected and
+    cleared with the batch generation, so temporary-table DDL/DML hooks can
+    reject unsupported boundaries for target sessions without treating every
+    session as a target just because the global manager is draining.
+  */
+  std::atomic<bool> preserve_trx_temp_table_batch_capture_epoch{false};
+  /**
+    Sticky fail-closed marker for temp-table activity that could not be ordered
+    in the participant journal. Preserve preflight rejects such sessions before
+    publishing a token.
+  */
+  std::atomic<bool> preserve_trx_temp_table_untracked_change{false};
+  /**
+    Sticky marker for unsupported temporary-table DDL/savepoint/rollback
+    boundaries observed while a batch drain capture epoch is open. It is not
+    tied to the SQL transaction lifetime because commands such as TRUNCATE
+    TEMPORARY TABLE can end the old transaction before the drain owner samples
+    the target state. The batch cleanup path clears this flag together with the
+    batch generation.
+  */
+  std::atomic<bool> preserve_trx_temp_table_batch_unsupported_boundary{false};
+  /**
+    true after the transaction-start sampler has decided whether a no-redo undo
+    baseline exists. Preserve uses the baseline to detect temp-table undo tail
+    changes that current resume support cannot reconnect safely; false means
+    callers must not interpret the present/top fields yet.
+  */
+  bool preserve_trx_temp_table_no_redo_baseline_valid{false};
+  /**
+    true when the sampled session actually had a no-redo undo stream to compare
+    against; false with valid=true means "sampled and absent".
+  */
+  bool preserve_trx_temp_table_no_redo_baseline_present{false};
+  /**
+    Top value sampled from the active no-redo undo stream when present=true.
+    The value is meaningful only while valid is true.
+  */
+  uint64_t preserve_trx_temp_table_no_redo_baseline_top{0};
+  /**
+    Participant identity cleared with the THD preserve state. The current
+    temp-table hooks use the has_participant fast path above rather than this
+    field as an admission key.
+  */
+  uint preserve_trx_temp_table_participant_id{0};
   /**
     Mutex protecting access to current_mutex and current_cond.
   */

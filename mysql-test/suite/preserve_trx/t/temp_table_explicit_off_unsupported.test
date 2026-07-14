@@ -1,0 +1,32 @@
+SELECT @@global.preserve_trx_temp_table_enable AS temp_table_gate_default;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=OFF;
+
+CREATE TABLE t_base(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+CREATE TEMPORARY TABLE tmp_t(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+
+START TRANSACTION;
+INSERT INTO t_base VALUES(1, 1);
+INSERT INTO tmp_t VALUES(1, 10);
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+ROLLBACK;
+
+DROP TEMPORARY TABLE tmp_t;
+INSERT INTO t_base VALUES(1, 1);
+
+CREATE TEMPORARY TABLE tmp_t_dropped(id INT PRIMARY KEY, v INT) ENGINE=InnoDB;
+
+START TRANSACTION;
+UPDATE t_base SET v=2 WHERE id=1;
+SELECT ROW_COUNT() AS updated_base_rows;
+INSERT INTO tmp_t_dropped VALUES(2, 20);
+DROP TEMPORARY TABLE tmp_t_dropped;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+PREPARE SHUTDOWN PRESERVE TRANSACTION;
+ROLLBACK;
+SELECT id, v FROM t_base;
+
+DROP TABLE t_base;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

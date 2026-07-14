@@ -1,0 +1,65 @@
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+# Lint-only source-shape guard. Runtime duplicate-MDL behavior is covered by
+# the targeted gunit and XA MTR coverage.
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_source {
+  my ($path) = @_;
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $src = do { local $/; <$fh> };
+  close($fh);
+  return $src;
+}
+
+my $mdl_header_path = File::Spec->catfile($source_root, 'sql',
+                                          'mdl_context_backup.h');
+my $mdl_path = File::Spec->catfile($source_root, 'sql',
+                                   'mdl_context_backup.cc');
+my $gunit_path = File::Spec->catfile($source_root, 'unittest', 'gunit',
+                                     'preserve_trx-t.cc');
+my $mdl_header = read_source($mdl_header_path);
+my $mdl = read_source($mdl_path);
+my $gunit = read_source($gunit_path);
+
+die "session MDL backup must expose explicit StandardXA and PreserveStrict policies\n"
+  unless $mdl_header =~ /enum\s+class\s+MDL_context_backup_policy[\s\S]*?STANDARD_XA[\s\S]*?PRESERVE_STRICT/s;
+
+$mdl =~ /bool MDL_context_backup_manager::create_backup\(const MDL_context \*context[\s\S]*?^}/m
+  or die "could not isolate session MDL create_backup overload\n";
+my $session_backup = $&;
+die "duplicate session MDL backup must fail closed only for preserve strict policy\n"
+  unless $session_backup =~
+         /if\s*\(\s*check_key_exist\s*\(\s*key_obj\s*\)\s*\)\s*return\s+policy\s*==\s*MDL_context_backup_policy::PRESERVE_STRICT\s*;/s;
+die "session MDL backup must check the final emplace result under LOCK_mdl_context_backup\n"
+  unless $session_backup =~
+         /auto\s+(?:insert_result|emplace_result)\s*=\s*m_backup_map\.emplace\s*\(\s*key_obj\s*,\s*std::move\s*\(\s*element\s*\)\s*\)/s &&
+         $session_backup =~
+         /(?:insert_result|emplace_result)\.second/s &&
+         $session_backup =~
+         /return\s+policy\s*==\s*MDL_context_backup_policy::PRESERVE_STRICT\s*;/s;
+
+$mdl =~ /bool MDL_context_backup_manager::create_backup\(MDL_request_list \*mdl_requests[\s\S]*?^}/m
+  or die "could not isolate recovery MDL create_backup overload\n";
+my $request_list_backup = $&;
+die "recovery MDL request-list duplicate behavior must stay explicitly idempotent, not share the session fail-closed branch accidentally\n"
+  unless $request_list_backup =~
+         /ha_recover\(\) can be called twice/s &&
+         $request_list_backup =~
+         /if\s*\(\s*check_key_exist\s*\(\s*key_obj\s*\)\s*\)\s*return\s+false\s*;/s;
+
+die "gunit must exercise preserve-strict duplicate session MDL backup fail-closed behavior\n"
+  unless $gunit =~ /TEST\s*\(\s*PreservedTrxMdlBackup\s*,\s*DuplicateSessionBackupFailsClosed\s*\)[\s\S]*?EXPECT_TRUE\s*\(\s*MDL_context_backup_manager::instance\(\)\.create_backup/s;
+
+die "gunit must exercise standard XA missing backup native no-op behavior\n"
+  unless $gunit =~ /TEST\s*\(\s*PreservedTrxMdlBackup\s*,\s*StandardXaMissingBackupNoops\s*\)/s;
+EOF
+
+SELECT 'ok' AS mdl_duplicate_backup_failclosed_standard_xa_lint;

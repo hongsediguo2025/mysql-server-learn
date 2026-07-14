@@ -1,0 +1,91 @@
+--source include/have_debug.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_lock_warmcopy_predicate_fallback;
+--enable_warnings
+
+--let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
+--let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_fallback= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_fallback_to_live_export`
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=ON;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+
+CREATE TABLE t_lock_warmcopy_predicate_fallback(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+
+--connect(lock_wc_predicate_fallback_app, localhost, root,,test)
+SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_predicate_locks";
+START TRANSACTION;
+INSERT INTO t_lock_warmcopy_predicate_fallback VALUES(1,10);
+UPDATE t_lock_warmcopy_predicate_fallback SET v=11 WHERE id=1;
+
+--connection default
+SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_predicate_locks";
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-lock-warmcopy-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
+--let $assert_text= lock warmcopy predicate fallback is logged
+--let $assert_select= PRESERVE_LOCK_WARMCOPY.*action=live_fallback.*reason=unsupported_family
+--let $assert_count_condition= >= 1
+--source include/assert_grep.inc
+SELECT COUNT(*) AS preserved_count_after_predicate_fallback
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--connect(lock_wc_predicate_fallback_resume, localhost, root,,test)
+--connection lock_wc_predicate_fallback_resume
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+COMMIT;
+--disconnect lock_wc_predicate_fallback_resume
+
+--connection default
+SELECT COUNT(*) AS preserved_count_after_predicate_resume
+  FROM performance_schema.preserved_transactions;
+SELECT id, v FROM t_lock_warmcopy_predicate_fallback ORDER BY id;
+
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+--connect(lock_wc_predicate_strict_app, localhost, root,,test)
+SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_predicate_locks";
+START TRANSACTION;
+INSERT INTO t_lock_warmcopy_predicate_fallback VALUES(2,20);
+UPDATE t_lock_warmcopy_predicate_fallback SET v=21 WHERE id=2;
+
+--connection default
+SET SESSION debug="+d,preserve_trx_lock_warmcopy_simulate_predicate_locks";
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET SESSION debug="-d,preserve_trx_lock_warmcopy_simulate_predicate_locks";
+SELECT COUNT(*) AS preserved_count_after_predicate_strict_reject
+  FROM performance_schema.preserved_transactions;
+
+--connection lock_wc_predicate_strict_app
+COMMIT;
+--disconnect lock_wc_predicate_strict_app
+
+--connection default
+SELECT id, v FROM t_lock_warmcopy_predicate_fallback ORDER BY id;
+
+DROP TABLE t_lock_warmcopy_predicate_fallback;
+--disable_query_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback
+--eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
+--eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
+--eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--enable_query_log

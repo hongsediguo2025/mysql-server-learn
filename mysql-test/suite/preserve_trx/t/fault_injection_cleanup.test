@@ -1,0 +1,41 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_preserve_fault_cleanup;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_preserve_fault_cleanup(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_preserve_fault_cleanup VALUES(1,10);
+
+--let $MYSQLD_DATADIR= `SELECT @@datadir`
+
+--let $fault_name= preserve_trx_fail_after_lock_materialization
+--source suite/preserve_trx/include/preserve_fault_cleanup_case.inc
+
+--let $fault_name= preserve_trx_fail_after_undo_prepared
+--source suite/preserve_trx/include/preserve_fault_cleanup_case.inc
+
+--let $fault_name= preserve_trx_fail_before_snapshot_fsync
+--source suite/preserve_trx/include/preserve_fault_cleanup_case.inc
+
+--let $fault_name= preserve_trx_simulate_short_write
+--source suite/preserve_trx/include/preserve_fault_cleanup_case.inc
+
+--let $fault_name= preserve_trx_simulate_enospc_write
+--source suite/preserve_trx/include/preserve_fault_cleanup_case.inc
+
+--let $fault_name= preserve_trx_fail_after_snapshot_rename
+--source suite/preserve_trx/include/preserve_fault_cleanup_case.inc
+
+--let $fault_name= preserve_trx_fail_snapshot_directory_fsync
+--source suite/preserve_trx/include/preserve_fault_cleanup_case.inc
+
+--let $fault_name= preserve_trx_fail_after_binlog_mode_validation
+--source suite/preserve_trx/include/preserve_fault_cleanup_case.inc
+
+DROP TABLE t_preserve_fault_cleanup;
+SET GLOBAL preserve_trx_enable=ON;

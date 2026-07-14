@@ -1,0 +1,5 @@
+# Lint-only guard: only documented disconnect/SIGTERM race helpers
+# may use --error 0,... in preserve_trx tests.
+SELECT 'ok' AS wide_error_masks_lint;
+wide_error_masks_lint
+ok

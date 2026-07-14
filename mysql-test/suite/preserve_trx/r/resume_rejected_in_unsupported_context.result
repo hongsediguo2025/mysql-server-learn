@@ -1,0 +1,37 @@
+DROP TABLE IF EXISTS t_resume_unsupported_context;
+SET GLOBAL preserve_trx_enable=ON;
+SELECT GET_LOCK('resume_unsupported_missing_token_lock', 0)
+AS got_missing_token_lock;
+got_missing_token_lock
+1
+RESUME PRESERVED TRANSACTION 'msp_resume_missing_context_token';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT RELEASE_LOCK('resume_unsupported_missing_token_lock')
+AS released_missing_token_lock;
+released_missing_token_lock
+1
+CREATE TABLE t_resume_unsupported_context(id INT PRIMARY KEY, v INT)
+ENGINE=InnoDB;
+INSERT INTO t_resume_unsupported_context VALUES(1,10);
+START TRANSACTION;
+UPDATE t_resume_unsupported_context SET v=20 WHERE id=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+HANDLER t_resume_unsupported_context OPEN;
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+HANDLER t_resume_unsupported_context CLOSE;
+SELECT GET_LOCK('resume_unsupported_context_lock', 0) AS got_lock;
+got_lock
+1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT RELEASE_LOCK('resume_unsupported_context_lock') AS released_lock;
+released_lock
+1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ROLLBACK;
+SELECT * FROM t_resume_unsupported_context ORDER BY id;
+id	v
+1	10
+DROP TABLE t_resume_unsupported_context;
+SET GLOBAL preserve_trx_enable=ON;

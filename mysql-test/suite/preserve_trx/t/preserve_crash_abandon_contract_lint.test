@@ -1,0 +1,43 @@
+--perl
+use strict;
+use warnings;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $src = "$mysql_test_dir/..";
+my $preserve = "$src/sql/preserve_trx.cc";
+
+open(my $fh, '<', $preserve) or die "open $preserve failed: $!\n";
+local $/;
+my $body = <$fh>;
+close($fh);
+
+my ($preamble) =
+  $body =~ /(bool preserved_temp_images_bootstrap_preamble\(\)[\s\S]*?^})/m;
+die "could not isolate preserved_temp_images_bootstrap_preamble\n"
+  unless defined $preamble;
+
+my ($recover) = $body =~ /(bool preserved_trx_recover_all\(\)[\s\S]*?^})/m;
+die "could not isolate preserved_trx_recover_all\n" unless defined $recover;
+
+my ($helper) =
+  $body =~ /(bool preserved_trx_crash_recovery_artifacts_forbidden[\s\S]*?^})/m;
+die "could not isolate preserved_trx_crash_recovery_artifacts_forbidden\n"
+  unless defined $helper;
+
+die "temp sidecar bootstrap must refuse crash-recovery artifacts\n"
+  unless $preamble =~ /preserved_trx_crash_recovery_artifacts_forbidden/s;
+die "temp sidecar bootstrap must keep crash-abandon checks before the temp subfeature gate\n"
+  unless index($preamble, 'preserved_trx_crash_recovery_artifacts_forbidden') <
+         index($preamble, 'if (!preserve_trx_temp_table_enable) continue;');
+die "temp sidecar bootstrap must skip no-redo/page adoption when preserve_trx_temp_table_enable is OFF\n"
+  unless $preamble =~ /if\s*\(\s*!preserve_trx_temp_table_enable\s*\)\s*continue\s*;/s;
+
+die "preserved trx recovery must refuse crash-recovery artifacts\n"
+  unless $recover =~ /preserved_trx_crash_recovery_artifacts_forbidden/s;
+
+die "crash-abandon helper must tell HA to clean artifacts before mysqld start\n"
+  unless $helper =~ /PRESERVE: crash recovery requires external cleanup/s;
+EOF
+
+SELECT 'ok' AS preserve_crash_abandon_contract_lint;

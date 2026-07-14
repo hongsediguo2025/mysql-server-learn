@@ -73,6 +73,82 @@ ADD_CUSTOM_TARGET(GenFixPrivs
   DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/mysql_fix_privilege_tables_sql.h
 )
 
+FIND_PROGRAM(PRESERVE_TRX_PYTHON_EXECUTABLE NAMES python3 python)
+IF(PRESERVE_TRX_PYTHON_EXECUTABLE)
+  ADD_TEST(
+    NAME resumable_trx_longrun_unit
+    COMMAND ${PRESERVE_TRX_PYTHON_EXECUTABLE} -m unittest
+            scripts.tests.test_resumable_trx_longrun_e2e
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  )
+  SET_TESTS_PROPERTIES(resumable_trx_longrun_unit PROPERTIES
+    LABELS "preserve_trx;longrun;python")
+  ADD_TEST(
+    NAME resumable_trx_crash_fuzz_unit
+    COMMAND ${PRESERVE_TRX_PYTHON_EXECUTABLE} -m unittest
+            scripts.tests.test_resumable_trx_crash_fuzz
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  )
+  SET_TESTS_PROPERTIES(resumable_trx_crash_fuzz_unit PROPERTIES
+    LABELS "preserve_trx;crash_fuzz;python")
+  SET(PRESERVE_TRX_CRASH_FUZZ_DRYRUN_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/preserve-crash-fuzz-dryrun-ctest")
+  ADD_TEST(
+    NAME resumable_trx_crash_fuzz_dryrun
+    COMMAND ${PRESERVE_TRX_PYTHON_EXECUTABLE}
+            scripts/resumable_trx_crash_fuzz.py
+            --artifact-dir ${PRESERVE_TRX_CRASH_FUZZ_DRYRUN_DIR}
+            --seed 1
+            --iterations 2
+            --dry-run
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  )
+  SET_TESTS_PROPERTIES(resumable_trx_crash_fuzz_dryrun PROPERTIES
+    LABELS "preserve_trx;crash_fuzz;python;smoke")
+  SET(PRESERVE_TRX_LONGRUN_SMOKE_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/preserve-longrun-smoke-ctest")
+  ADD_TEST(
+    NAME resumable_trx_longrun_smoke
+    COMMAND ${PRESERVE_TRX_PYTHON_EXECUTABLE}
+            scripts/resumable_trx_longrun_e2e.py
+            --profile smoke
+            --cycles 1
+            --cycle-interval-s 1
+            --mode dry-run
+            --artifact-dir ${PRESERVE_TRX_LONGRUN_SMOKE_DIR}
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  )
+  SET_TESTS_PROPERTIES(resumable_trx_longrun_smoke PROPERTIES
+    LABELS "preserve_trx;longrun;python;smoke")
+  ADD_TEST(
+    NAME resumable_trx_longrun_smoke_audit
+    COMMAND ${PRESERVE_TRX_PYTHON_EXECUTABLE}
+            scripts/resumable_trx_longrun_audit.py
+            --artifact-dir ${PRESERVE_TRX_LONGRUN_SMOKE_DIR}
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  )
+  SET_TESTS_PROPERTIES(resumable_trx_longrun_smoke_audit PROPERTIES
+    DEPENDS resumable_trx_longrun_smoke
+    LABELS "preserve_trx;longrun;python;smoke")
+  SET(PRESERVE_TRX_LONGRUN_LIVE_SMOKE_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/preserve-longrun-live-smoke-ctest")
+  ADD_TEST(
+    NAME resumable_trx_longrun_live_smoke
+    COMMAND ${PRESERVE_TRX_PYTHON_EXECUTABLE}
+            scripts/resumable_trx_longrun_e2e.py
+            --profile smoke
+            --cycles 1
+            --cycle-interval-s 1
+            --mode live-smoke
+            --skip-if-live-smoke-unconfigured
+            --artifact-dir ${PRESERVE_TRX_LONGRUN_LIVE_SMOKE_DIR}
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  )
+  SET_TESTS_PROPERTIES(resumable_trx_longrun_live_smoke PROPERTIES
+    LABELS "preserve_trx;longrun;python;live_smoke"
+    SKIP_RETURN_CODE 77)
+ENDIF()
+
 ADD_CUSTOM_COMMAND(
   OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/sql_commands_sys_schema.h
   COMMAND comp_sql

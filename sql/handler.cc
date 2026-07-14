@@ -94,6 +94,7 @@
 #include "sql/opt_costconstantcache.h"  // reload_optimizer_cost_constants
 #include "sql/opt_costmodel.h"
 #include "sql/opt_hints.h"
+#include "sql/preserve_trx_temp_table.h"
 #include "sql/protocol.h"
 #include "sql/psi_memory_key.h"
 #include "sql/query_options.h"
@@ -1272,6 +1273,8 @@ void trans_register_ha(THD *thd, bool all, handlerton *ht_arg,
   Transaction_ctx *trn_ctx = thd->get_transaction();
   Transaction_ctx::enum_trx_scope trx_scope =
       all ? Transaction_ctx::SESSION : Transaction_ctx::STMT;
+  const bool first_session_ha =
+      all && trn_ctx->ha_trx_info(Transaction_ctx::SESSION) == nullptr;
 
   DBUG_TRACE;
   DBUG_PRINT("enter", ("%s", all ? "all" : "stmt"));
@@ -1302,6 +1305,12 @@ void trans_register_ha(THD *thd, bool all, handlerton *ht_arg,
 
   trn_ctx->register_ha(trx_scope, ha_info, ht_arg);
   trn_ctx->set_ha_trx_info(trx_scope, ha_info);
+  /*
+    Autocommit=0 and implicit multi-statement transactions do not pass through
+    trans_begin(). Capture their no-redo undo baseline exactly once, on the
+    first session-scope engine participant.
+  */
+  if (first_session_ha) preserve_trx_temp_table_mark_transaction_start(thd);
 
   if (ht_arg->prepare == nullptr) trn_ctx->set_no_2pc(trx_scope, true);
 
@@ -1981,6 +1990,14 @@ err:
     if (!error) (void)RUN_HOOK(transaction, after_commit, (thd, all));
     trn_ctx->m_flags.run_hooks = false;
   }
+  if (!error) {
+    if (all) {
+      if (preserve_trx_temp_table_transaction_state_needs_clear(thd))
+        preserve_trx_temp_table_clear_transaction_state(thd);
+    } else {
+      preserve_trx_temp_table_note_statement_commit(thd);
+    }
+  }
   return error;
 }
 
@@ -2130,6 +2147,13 @@ int ha_rollback_trans(THD *thd, bool all) {
       trn_ctx->cannot_safely_rollback(Transaction_ctx::SESSION) &&
       !thd->slave_thread && thd->killed != THD::KILL_CONNECTION)
     trn_ctx->push_unsafe_rollback_warnings(thd);
+
+  if (all) {
+    if (preserve_trx_temp_table_transaction_state_needs_clear(thd))
+      preserve_trx_temp_table_clear_transaction_state(thd);
+  } else {
+    preserve_trx_temp_table_note_statement_rollback(thd);
+  }
 
   return error;
 }
@@ -7825,6 +7849,15 @@ int handler::ha_write_row(uchar *buf) {
   if (unlikely((error = binlog_log_row(table, nullptr, buf, log_func))))
     return error; /* purecov: inspected */
 
+  /*
+    Temporary-table preserve hooks are gated by preserve_trx_enable and only
+    mark temp DML after the native row operation and binlog hook have succeeded.
+    Physical page capture and no-redo undo sidecars are the recovery source, so
+    the hot row path must not copy row bytes or build SQL replay payloads.
+  */
+  if (preserve_trx_temp_table_row_hooks_enabled() &&
+      preserve_trx_temp_table_row_capture_candidate(ha_thd(), table))
+    (void)preserve_trx_temp_table_note_row_write(ha_thd(), table, nullptr, 0);
   DEBUG_SYNC_C("ha_write_row_end");
   return 0;
 }
@@ -7854,6 +7887,14 @@ int handler::ha_update_row(const uchar *old_data, uchar *new_data) {
   if (unlikely(error)) return error;
   if (unlikely((error = binlog_log_row(table, old_data, new_data, log_func))))
     return error;
+  /*
+    Mark temp DML only. Reconstructing row images here would add allocation and
+    row-buffer copying to every eligible temporary-table UPDATE; the preserve
+    path must instead rely on page after-images plus no-redo undo sidecars.
+  */
+  if (preserve_trx_temp_table_row_hooks_enabled() &&
+      preserve_trx_temp_table_row_capture_candidate(ha_thd(), table))
+    (void)preserve_trx_temp_table_note_row_update(ha_thd(), table, nullptr, 0);
   return 0;
 }
 
@@ -7866,7 +7907,6 @@ int handler::ha_delete_row(const uchar *buf) {
   */
   DBUG_ASSERT(buf == table->record[0] || buf == table->record[1]);
   DBUG_EXECUTE_IF("inject_error_ha_delete_row", return HA_ERR_INTERNAL_ERROR;);
-
   DBUG_EXECUTE_IF(
       "handler_crashed_table_on_usage",
       my_error(HA_ERR_CRASHED, MYF(ME_ERRORLOG), table_share->table_name.str);
@@ -7880,6 +7920,9 @@ int handler::ha_delete_row(const uchar *buf) {
   if (unlikely(error)) return error;
   if (unlikely((error = binlog_log_row(table, buf, nullptr, log_func))))
     return error;
+  if (preserve_trx_temp_table_row_hooks_enabled() &&
+      preserve_trx_temp_table_row_capture_candidate(ha_thd(), table))
+    (void)preserve_trx_temp_table_note_row_delete(ha_thd(), table, nullptr, 0);
   return 0;
 }
 

@@ -1,0 +1,90 @@
+--source include/have_debug_sync.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_lock_warmcopy_record_image_refresh;
+--enable_warnings
+
+--let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
+--let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_fallback= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_fallback_to_live_export`
+--let $old_preserve_trx_recovery_max_count= `SELECT @@GLOBAL.preserve_trx_recovery_max_count`
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+
+CREATE TABLE t_lock_warmcopy_record_image_refresh(
+  id INT PRIMARY KEY,
+  v INT,
+  pad VARBINARY(64)
+) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_record_image_refresh
+  VALUES(1,10,REPEAT('a',32));
+
+--connect(lock_wc_image_app,localhost,root,,test)
+--connection lock_wc_image_app
+START TRANSACTION;
+UPDATE t_lock_warmcopy_record_image_refresh
+  SET v=11, pad=REPEAT('b',32)
+  WHERE id=1;
+
+--connect(lock_wc_image_owner,localhost,root,,test)
+--connection lock_wc_image_owner
+SET DEBUG_SYNC =
+  'preserve_trx_lock_warmcopy_after_active_record_scan SIGNAL lock_wc_image_scanned WAIT_FOR continue_lock_wc_image_drain';
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_image_scanned TIMEOUT 10';
+
+--connection lock_wc_image_app
+UPDATE t_lock_warmcopy_record_image_refresh
+  SET v=12, pad=REPEAT('c',32)
+  WHERE id=1;
+
+--connection default
+SET DEBUG_SYNC = 'now SIGNAL continue_lock_wc_image_drain';
+
+--connection lock_wc_image_owner
+--reap
+--disconnect lock_wc_image_owner
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--connect(lock_wc_image_resume,localhost,root,,test)
+--connection lock_wc_image_resume
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+COMMIT;
+--disconnect lock_wc_image_resume
+
+--connection default
+SELECT COUNT(*) AS preserved_count_after_resume
+  FROM performance_schema.preserved_transactions;
+SELECT id, v, pad=REPEAT('c',32) AS pad_ok
+  FROM t_lock_warmcopy_record_image_refresh;
+
+DROP TABLE t_lock_warmcopy_record_image_refresh;
+--disable_query_log
+--eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
+--eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback
+--eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
+--eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
+--eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--enable_query_log

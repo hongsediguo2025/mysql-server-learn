@@ -1,0 +1,36 @@
+DROP TABLE IF EXISTS t_session_off;
+SET GLOBAL preserve_trx_enable=ON;
+SET SESSION binlog_format=ROW;
+SET SESSION sql_log_bin=0;
+CREATE TABLE t_session_off(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_session_off VALUES(1,10);
+START TRANSACTION;
+SELECT * FROM t_session_off WHERE a=1 FOR UPDATE;
+a	b
+1	10
+UPDATE t_session_off SET b=11 WHERE a=1;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SELECT @@global.log_bin AS log_bin_after_restart;
+log_bin_after_restart
+1
+SET SESSION binlog_format=ROW;
+SELECT TOKEN, BINLOG_STATE, WROTE_TO_CACHE, BINLOG_CACHE_SIZE,
+SESSION_SQL_LOG_BIN, GLOBAL_LOG_BIN
+FROM performance_schema.preserved_transactions;
+TOKEN	BINLOG_STATE	WROTE_TO_CACHE	BINLOG_CACHE_SIZE	SESSION_SQL_LOG_BIN	GLOBAL_LOG_BIN
+TOKEN	SESSION_OFF_NO_CACHE	NO	0	OFF	ON
+RESUME PRESERVED TRANSACTION 'TOKEN';
+SELECT @@session.sql_log_bin AS session_sql_log_bin_after_resume;
+session_sql_log_bin_after_resume
+0
+SELECT * FROM t_session_off WHERE a=1;
+a	b
+1	11
+UPDATE t_session_off SET b=12 WHERE a=1;
+COMMIT;
+SELECT * FROM t_session_off WHERE a=1;
+a	b
+1	12
+include/assert_grep.inc [DML stays out of the binlog after SESSION_OFF_NO_CACHE resume]
+DROP TABLE t_session_off;
+SET GLOBAL preserve_trx_enable=ON;

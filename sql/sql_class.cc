@@ -79,6 +79,8 @@
 #include "sql/parse_location.h"
 #include "sql/protocol.h"
 #include "sql/protocol_classic.h"
+#include "sql/preserve_trx.h"
+#include "sql/preserve_trx_temp_table.h"
 #include "sql/psi_memory_key.h"
 #include "sql/query_result.h"
 #include "sql/rpl_rli.h"    // Relay_log_info
@@ -91,6 +93,7 @@
 #include "sql/sql_base.h"         // close_temporary_tables
 #include "sql/sql_callback.h"     // MYSQL_CALLBACK
 #include "sql/sql_cmd.h"
+#include "sql/sql_cursor.h"
 #include "sql/sql_handler.h"  // mysql_ha_cleanup
 #include "sql/sql_lex.h"
 #include "sql/sql_parse.h"    // is_update_query
@@ -934,7 +937,8 @@ void THD::cleanup(void) {
       connection is gone. Log the error and continue.
     */
     if (MDL_context_backup_manager::instance().create_backup(
-            &mdl_context, xs->get_xid()->key(), xs->get_xid()->key_length())) {
+            &mdl_context, xs->get_xid()->key(), xs->get_xid()->key_length(),
+            MDL_context_backup_manager::MDL_context_backup_policy::STANDARD_XA)) {
       LogErr(ERROR_LEVEL, ER_XA_CANT_CREATE_MDL_BACKUP);
     }
     transaction_cache_detach(trn_ctx);
@@ -961,6 +965,8 @@ void THD::cleanup(void) {
     global_read_lock.unlock_global_read_lock(this);
 
   mysql_ull_cleanup(this);
+  if (preserve_trx_temp_table_transaction_state_needs_clear(this))
+    preserve_trx_temp_table_clear_transaction_state(this);
   /*
     All locking service locks must be released on disconnect.
   */
@@ -1018,6 +1024,8 @@ void THD::cleanup(void) {
 void THD::release_resources() {
   DBUG_ASSERT(m_release_resources_done == false);
 
+  preserved_trx_begin_external_thd_teardown(this);
+
   Global_THD_manager::get_instance()->release_thread_id(m_thread_id);
 
   /* Ensure that no one is using THD */
@@ -1038,6 +1046,7 @@ void THD::release_resources() {
   mysql_mutex_unlock(&LOCK_thd_query);
 
   stmt_map.reset(); /* close all prepared statements */
+  preserved_trx_release_resources(this);
   if (!cleanup_done) cleanup();
 
   mdl_context.destroy();
@@ -1082,6 +1091,7 @@ void THD::release_resources() {
   mysql_mutex_unlock(&LOCK_status);
 
   m_release_resources_done = true;
+  preserved_trx_end_external_thd_teardown(this);
 }
 
 THD::~THD() {
@@ -1090,6 +1100,8 @@ THD::~THD() {
   DBUG_PRINT("info", ("THD dtor, this %p", this));
 
   if (!m_release_resources_done) release_resources();
+  if (preserve_trx_temp_table_transaction_state_needs_clear(this))
+    preserve_trx_temp_table_clear_transaction_state(this);
 
   clear_next_event_pos();
 
@@ -1155,6 +1167,11 @@ void THD::awake(THD::killed_state state_to_set) {
   DBUG_PRINT("enter", ("this: %p current_thd: %p", this, current_thd));
   THD_CHECK_SENTRY(this);
   mysql_mutex_assert_owner(&LOCK_thd_data);
+
+  if (preserved_trx_defer_external_thd_kill(
+          this, static_cast<int>(state_to_set))) {
+    return;
+  }
 
   /* Shutdown clone vio always, to wake up clone waiting for remote. */
   shutdown_clone_vio();
@@ -1753,6 +1770,15 @@ void Prepared_statement_map::erase(Prepared_statement *statement) {
   DBUG_ASSERT(prepared_stmt_count > 0);
   prepared_stmt_count--;
   mysql_mutex_unlock(&LOCK_prepared_stmt_count);
+}
+
+bool Prepared_statement_map::has_open_server_side_cursor() const {
+  for (const auto &key_and_value : st_hash) {
+    const Prepared_statement *stmt = key_and_value.second.get();
+    if (stmt != nullptr && stmt->cursor != nullptr && stmt->cursor->is_open())
+      return true;
+  }
+  return false;
 }
 
 void Prepared_statement_map::claim_memory_ownership(bool claim) {

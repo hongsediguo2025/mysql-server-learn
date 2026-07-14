@@ -1,0 +1,105 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_batch_global_off;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_batch_global_off(
+  id INT PRIMARY KEY,
+  v INT,
+  resumed_by INT DEFAULT NULL
+) ENGINE=InnoDB;
+
+--connect(batch_global_off_a,localhost,root,,test)
+--connection batch_global_off_a
+SET @batch_user_var = 'must-not-restore';
+START TRANSACTION;
+INSERT INTO t_batch_global_off VALUES(1,10,NULL);
+
+--connect(batch_global_off_b,localhost,root,,test)
+--connection batch_global_off_b
+START TRANSACTION;
+INSERT INTO t_batch_global_off VALUES(2,20,NULL);
+
+--connection default
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 NO USER VARS;
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10 --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+SELECT BINLOG_STATE, WROTE_TO_CACHE, BINLOG_CACHE_SIZE,
+       SESSION_SQL_LOG_BIN, GLOBAL_LOG_BIN
+  FROM performance_schema.preserved_transactions
+  ORDER BY TOKEN;
+
+CREATE TEMPORARY TABLE t_batch_global_off_tokens AS
+SELECT ROW_NUMBER() OVER (ORDER BY TOKEN) AS rn, TOKEN
+  FROM performance_schema.preserved_transactions;
+
+--let $token1= `SELECT TOKEN FROM t_batch_global_off_tokens WHERE rn = 1`
+--let $token2= `SELECT TOKEN FROM t_batch_global_off_tokens WHERE rn = 2`
+--let $cache_file1= `SELECT CONCAT(@@global.preserve_trx_dir, '$token1', '.binlog_cache')`
+--let $cache_file2= `SELECT CONCAT(@@global.preserve_trx_dir, '$token2', '.binlog_cache')`
+
+--error 1
+--file_exists $cache_file1
+--error 1
+--file_exists $cache_file2
+
+--connect(batch_global_off_resume1,localhost,root,,test)
+--connection batch_global_off_resume1
+--disable_query_log
+--eval RESUME PRESERVED TRANSACTION '$token1'
+--enable_query_log
+SELECT @batch_user_var AS user_var_after_resume;
+SET @resume_id = NULL;
+SELECT id INTO @resume_id
+  FROM t_batch_global_off
+  WHERE resumed_by IS NULL
+  LIMIT 1;
+UPDATE t_batch_global_off
+  SET v = v + 100, resumed_by = 1
+  WHERE id = @resume_id;
+COMMIT;
+
+--connect(batch_global_off_resume2,localhost,root,,test)
+--connection batch_global_off_resume2
+--disable_query_log
+--eval RESUME PRESERVED TRANSACTION '$token2'
+--enable_query_log
+SELECT @batch_user_var AS user_var_after_resume;
+SET @resume_id = NULL;
+SELECT id INTO @resume_id
+  FROM t_batch_global_off
+  WHERE resumed_by IS NULL
+  LIMIT 1;
+UPDATE t_batch_global_off
+  SET v = v + 100, resumed_by = 2
+  WHERE id = @resume_id;
+COMMIT;
+
+--disconnect batch_global_off_resume1
+--disconnect batch_global_off_resume2
+--connection default
+
+SELECT COUNT(*) AS preserved_count_after_resume
+  FROM performance_schema.preserved_transactions;
+
+SELECT COUNT(*) AS row_count,
+       COUNT(DISTINCT id) AS distinct_ids,
+       SUM(resumed_by IS NOT NULL) AS resumed_rows,
+       SUM(v >= 100) AS bumped_rows
+  FROM t_batch_global_off;
+
+DROP TABLE t_batch_global_off;
+SET GLOBAL preserve_trx_enable=ON;

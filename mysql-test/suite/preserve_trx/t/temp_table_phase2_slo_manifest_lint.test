@@ -1,0 +1,49 @@
+--echo # Lint-only source-shape guard for temp-table phase-2 SLO reporting.
+--echo # Temp-table manifest timing and actual manifest construction are
+--echo # separate facts. Only targets that built a manifest in phase 2 make
+--echo # strict phase-2 SLO not guaranteed. Functional preserve may still
+--echo # succeed.
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+my $preserve_path = File::Spec->catfile($source_root, 'sql', 'preserve_trx.cc');
+
+open(my $fh, '<', $preserve_path) or die "cannot open $preserve_path: $!";
+my $preserve = do { local $/; <$fh> };
+close($fh);
+
+die "drain metrics must report temp-table manifest phase-2 build time\n"
+  unless $preserve =~ /phase2_snapshot_write_temp_manifest_us/s;
+
+die "temp-table manifest construction must be tracked independently of timing\n"
+  unless $preserve =~
+    /snapshot_write_temp_manifest_built\s*=\s*!metadata\.temp_table_manifest_payload\.empty\(\)/s;
+
+die "phase-2 metrics must count targets that actually built temp manifests\n"
+  unless $preserve =~ /temp_manifest_build_target_count/s;
+
+die "elapsed temp-manifest time must not decide strict SLO eligibility\n"
+  if $preserve =~
+    /if\s*\(\s*phase2_metrics\.snapshot_write_temp_manifest_us\s*!=\s*0\s*\)/s;
+
+die "actual phase-2 temp-table manifest builds must make strict SLO not guaranteed\n"
+  unless $preserve =~
+    /if\s*\(\s*phase2_metrics\.temp_manifest_build_target_count\s*!=\s*0\s*\)\s*\{[\s\S]{0,800}phase2_slo_guaranteed\s*=\s*0[\s\S]{0,800}temp_table_manifest_phase2_build/s;
+
+die "temp-table phase-2 SLO reason must not be hidden behind savepoint fallback\n"
+  unless $preserve =~
+    /phase2_slo_reason\s*=\s*"temp_table_manifest_phase2_build"/s;
+
+die "temp-table phase-2 SLO reason must not be hidden behind record payload materialization\n"
+  unless $preserve =~
+    /phase2_slo_reason\s*==\s*"record_payload_materialized_in_phase2"[\s\S]{0,320}phase2_slo_reason\s*=\s*"temp_table_manifest_phase2_build"/s;
+EOF
+
+SELECT 'ok' AS temp_table_phase2_slo_manifest_lint;

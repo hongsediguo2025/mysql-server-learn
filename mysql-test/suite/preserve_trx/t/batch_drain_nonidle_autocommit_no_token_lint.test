@@ -1,0 +1,24 @@
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+my $mtr_path = File::Spec->catfile($source_root, 'mysql-test', 'suite',
+                                   'preserve_trx', 't',
+                                   'batch_drain_all_pending_no_tokens.test');
+open(my $fh, '<', $mtr_path) or die "cannot open $mtr_path: $!";
+my $mtr = do { local $/; <$fh> };
+close($fh);
+
+die "non-idle autocommit no-token coverage must block statements before dispatch and drain them to DRAINED_NO_TRANSACTION\n"
+  unless $mtr =~ /before_execute_sql_command/s &&
+         $mtr =~ /DRAIN TRANSACTIONS PRESERVE/s &&
+         $mtr =~ /SELECT COUNT\(\*\) AS preserved_count/s &&
+         $mtr =~ /SELECT \* FROM t_batch_all_pending_no_tokens ORDER BY id/s;
+EOF
+
+SELECT 'ok' AS batch_drain_nonidle_autocommit_no_token_lint;

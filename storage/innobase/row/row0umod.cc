@@ -133,7 +133,10 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t row_undo_mod_clust_low(
 
   /* Update would release the implicit lock. Must convert to
   explicit lock before applying update undo.*/
-  row_convert_impl_to_expl_if_needed(btr_cur, node);
+  err = row_convert_impl_to_expl_if_needed(btr_cur, node);
+  if (err != DB_SUCCESS) {
+    return err;
+  }
 
   if (mode != BTR_MODIFY_TREE) {
     ut_ad((mode & ~BTR_ALREADY_S_LATCHED) == BTR_MODIFY_LEAF);
@@ -476,7 +479,11 @@ static MY_ATTRIBUTE((warn_unused_result)) dberr_t
   rec_deleted = rec_get_deleted_flag(btr_pcur_get_rec(&pcur),
                                      dict_table_is_comp(index->table));
   if (rec_deleted == 0) {
-    row_convert_impl_to_expl_if_needed(btr_cur, node);
+    err = row_convert_impl_to_expl_if_needed(btr_cur, node);
+    if (err != DB_SUCCESS) {
+      btr_pcur_commit_specify_mtr(&(node->pcur), &mtr_vers);
+      goto func_exit;
+    }
   }
 
   old_has = row_vers_old_has_index_entry(FALSE, btr_pcur_get_rec(&(node->pcur)),

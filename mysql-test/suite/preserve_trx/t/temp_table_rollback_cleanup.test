@@ -1,0 +1,54 @@
+--source include/not_windows.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+--disable_query_log
+CALL mtr.add_suppression("Preserved transaction .* rejected because snapshot binlog_state=GLOBAL_OFF_NO_CACHE requires log_bin=OFF");
+CALL mtr.add_suppression("Preserved transaction .* recovery forced rollback: binlog mode mismatch");
+--enable_query_log
+
+SET GLOBAL preserve_trx_enable=ON;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SHUTDOWN;
+--source include/wait_until_disconnected.inc
+
+--let TEMP_SNAPSHOT_TOKEN= temp_rollback_cleanup
+--let TEMP_SNAPSHOT_SPACE_ID= 4243767293
+--let TEMP_SNAPSHOT_CORRUPT_IMAGE= 0
+--let TEMP_SNAPSHOT_INCLUDE_UNDO= 1
+--let TEMP_SNAPSHOT_CORRUPT_UNDO= 0
+--let TEMP_SNAPSHOT_BINLOG_STATE= 1
+--let TEMP_SNAPSHOT_SESSION_SQL_LOG_BIN= 0
+--let TEMP_SNAPSHOT_OPTION_BIN_LOG= 0
+--let TEMP_SNAPSHOT_GLOBAL_LOG_BIN= 0
+--source suite/preserve_trx/include/write_temp_table_preserved_snapshot.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-temp-table-enable=OFF" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+my $datadir = $ENV{'MYSQLD_DATADIR'} or die "MYSQLD_DATADIR is not set";
+my $preserve_dir = File::Spec->catdir($datadir, 'preserve');
+for my $name (
+  'temp_rollback_cleanup.bin',
+  'temp_rollback_cleanup.tempts.4243767293.image',
+  'temp_rollback_cleanup.tempts.4243767293.undo') {
+  my $path = File::Spec->catfile($preserve_dir, $name);
+  die "unexpected preserved temp artifact remains after rollback: $path"
+    if -e $path;
+}
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=ON;

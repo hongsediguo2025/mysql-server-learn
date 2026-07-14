@@ -1,0 +1,46 @@
+DROP TABLE IF EXISTS t_lock_warmcopy_implicit_insert;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=OFF;
+SET GLOBAL preserve_trx_recovery_max_count=10;
+CREATE TABLE t_lock_warmcopy_implicit_insert(
+id INT PRIMARY KEY,
+uk INT UNIQUE,
+v INT,
+pad VARBINARY(64)
+) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_implicit_insert VALUES
+(1,10,10,REPEAT('a',32)),
+(3,30,30,REPEAT('c',32));
+START TRANSACTION;
+INSERT INTO t_lock_warmcopy_implicit_insert
+VALUES(2,20,20,REPEAT('b',32));
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+include/assert_grep.inc [lock warmcopy succeeds for implicit insert strict mode]
+SELECT COUNT(*) AS preserved_count_after_implicit_insert
+FROM performance_schema.preserved_transactions;
+preserved_count_after_implicit_insert
+1
+SELECT COUNT(*) AS visible_before_resume
+FROM t_lock_warmcopy_implicit_insert
+WHERE id=2 OR uk=20;
+visible_before_resume
+0
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+SELECT COUNT(*) AS preserved_count_after_implicit_insert_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_implicit_insert_resume
+0
+SELECT id, uk, v, pad=REPEAT('b',32) AS pad_ok
+FROM t_lock_warmcopy_implicit_insert
+WHERE id=2;
+id	uk	v	pad_ok
+2	20	20	1
+SELECT id, uk, v
+FROM t_lock_warmcopy_implicit_insert FORCE INDEX(uk)
+WHERE uk=20;
+id	uk	v
+2	20	20
+DROP TABLE t_lock_warmcopy_implicit_insert;

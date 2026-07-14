@@ -1,0 +1,31 @@
+--source include/not_windows.inc
+
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+SELECT @@global.preserve_trx_dir = CONCAT(@@global.datadir, 'preserve/') AS default_dir;
+
+SET GLOBAL preserve_trx_enable=ON;
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $dir = File::Spec->catdir($ENV{'MYSQLD_DATADIR'}, 'preserve');
+my $key = File::Spec->catfile($dir, '.key');
+
+die "preserve dir missing: $dir" unless -d $dir;
+print "preserve dir exists\n";
+
+my @stat = stat($key) or die "preserve key missing: $key";
+printf ".key mode %04o\n", $stat[2] & 0777;
+print ".key size $stat[7]\n";
+
+opendir(my $dh, $dir) or die "cannot open preserve dir: $!";
+my @tmp = grep { /\.tmp$/ } readdir($dh);
+closedir($dh);
+die "leftover temp files: @tmp" if @tmp;
+print "no preserve temp files\n";
+EOF
+
+SET GLOBAL preserve_trx_enable=ON;

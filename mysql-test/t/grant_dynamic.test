@@ -415,6 +415,9 @@ FLUSH PRIVILEGES;
 --error 1406
 INSERT INTO mysql.global_grants VALUES('u1', '%',
 'length_33_abcdefghijklmnopqrstuvw', 'Y');
+# Dynamic privileges have empty SHOW PRIVILEGES comments; normalizing the
+# comment column avoids adding new result lines with trailing whitespace.
+--replace_column 3 <comment>
 --sorted_result
 SHOW PRIVILEGES;
 TRUNCATE TABLE mysql.global_grants;

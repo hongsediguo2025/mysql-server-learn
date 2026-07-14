@@ -1,0 +1,23 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_temp_table_enable=OFF;
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*) AS preserved_count_after_dynamic_enable_reject
+FROM performance_schema.preserved_transactions;
+preserved_count_after_dynamic_enable_reject
+0
+SELECT COUNT(*) AS audit_rows,
+SUM(temp_count) AS temp_count_sum,
+SUM(temp_sum) AS temp_sum
+FROM t_batch_temp_dynamic_audit;
+audit_rows	temp_count_sum	temp_sum
+100	100	505100
+SELECT COUNT(*) AS base_rows,
+SUM(v = sid * 10 + 1) AS base_values_matched,
+SUM(v) AS base_sum
+FROM t_batch_temp_dynamic_base;
+base_rows	base_values_matched	base_sum
+100	100	50600
+SET GLOBAL preserve_trx_temp_table_enable=ON;
+SET GLOBAL preserve_trx_enable=ON;

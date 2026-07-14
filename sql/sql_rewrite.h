@@ -99,6 +99,21 @@ class Grant_params : public Rewrite_params {
 */
 void mysql_rewrite_query(THD *thd, Consumer_type type = Consumer_type::TEXTLOG,
                          Rewrite_params *params = nullptr);
+
+/**
+  Redact RESUME PRESERVED TRANSACTION text before raw general-log emission.
+
+  @param thd             Thread executing the query.
+  @param query           Original query text.
+  @param query_length    Length of original query text.
+  @param rewritten_query Buffer to receive the redacted query.
+
+  @retval true           Query was recognized and rewritten.
+  @retval false          Query did not require this raw rewrite.
+*/
+bool mysql_rewrite_resume_preserved_transaction_raw(
+    THD *thd, const char *query, size_t query_length, String *rewritten_query);
+
 /**
   Provides the default interface to rewrite the ACL query.
   If do_ps_instrument, it sets the thd->rewritten_query with

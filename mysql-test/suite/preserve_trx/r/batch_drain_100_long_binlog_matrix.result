@@ -1,0 +1,133 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_recovery_max_count=200;
+SET GLOBAL preserve_trx_drain_grace_ms=60000;
+SELECT COUNT(*) AS session_count
+FROM t_batch_long_control;
+session_count
+100
+SELECT MIN(TIMESTAMPDIFF(MICROSECOND, started_at, NOW(6))) >= 5000000
+AS all_sessions_older_than_five_seconds
+FROM t_batch_long_control;
+all_sessions_older_than_five_seconds
+1
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 86400 WITH USER VARS;
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+100
+SELECT COUNT(*) AS preserved_state_count
+FROM performance_schema.preserved_transactions
+WHERE STATE = 'PRESERVED';
+preserved_state_count
+100
+SELECT COUNT(*) AS mapped_token_count
+FROM t_batch_long_tokens;
+mapped_token_count
+100
+SELECT BINLOG_STATE,
+COUNT(*) AS state_count,
+SUM(WROTE_TO_CACHE = 'YES') AS wrote_to_cache_count,
+SUM(SESSION_SQL_LOG_BIN = 'OFF') AS session_off_count
+FROM performance_schema.preserved_transactions
+GROUP BY BINLOG_STATE
+ORDER BY BINLOG_STATE;
+BINLOG_STATE	state_count	wrote_to_cache_count	session_off_count
+LOGGED_EMPTY	20	0	0
+LOGGED_WITH_CACHE	60	60	0
+SESSION_OFF_NO_CACHE	20	0	20
+SELECT COUNT(*) AS preserved_count_after_resume
+FROM performance_schema.preserved_transactions;
+preserved_count_after_resume
+0
+SELECT COUNT(*) AS resume_success_count
+FROM t_batch_long_audit
+WHERE resumed_ok = 1;
+resume_success_count
+100
+SELECT COUNT(DISTINCT sid) AS resumed_distinct_sessions
+FROM t_batch_long_audit;
+resumed_distinct_sessions
+100
+SELECT MIN(lifecycle_age_us) >= 5000000 AS all_resumed_lifecycles_were_long
+FROM t_batch_long_audit;
+all_resumed_lifecycles_were_long
+1
+SELECT MIN(sql_count) >= 8 AS every_session_ran_enough_sql
+FROM t_batch_long_audit;
+every_session_ran_enough_sql
+1
+SELECT MAX(max_stmt_us) < 1000000 AS every_statement_under_one_second
+FROM t_batch_long_audit;
+every_statement_under_one_second
+1
+SELECT COUNT(*) AS audit_rows
+FROM t_batch_long_audit;
+audit_rows
+100
+SELECT COUNT(*) AS audit_control_case_mismatch_count
+FROM t_batch_long_audit a
+JOIN t_batch_long_control c USING(sid)
+WHERE a.case_id <> c.case_id;
+audit_control_case_mismatch_count
+0
+SELECT detail, COUNT(*) AS row_count
+FROM t_batch_long_audit
+GROUP BY detail
+ORDER BY detail;
+detail	row_count
+explicit-gtid	20
+logged-empty	20
+logged-with-cache	40
+session-off-no-cache	20
+SELECT detail, resumed_sql_log_bin, COUNT(*) AS row_count
+FROM t_binlog_resume_state
+GROUP BY detail, resumed_sql_log_bin
+ORDER BY detail, resumed_sql_log_bin;
+detail	resumed_sql_log_bin	row_count
+explicit-gtid	1	20
+logged-empty	1	20
+logged-with-cache	1	40
+session-off-no-cache	0	20
+SELECT COUNT(*) = 20 AS explicit_gtid_next_restored
+FROM t_binlog_resume_state
+WHERE detail = 'explicit-gtid'
+   AND resumed_gtid_next LIKE CONCAT(@@GLOBAL.SERVER_UUID, ':%');
+explicit_gtid_next_restored
+1
+SELECT COALESCE(SUM(GTID_SUBSET(resumed_gtid_next,
+@@GLOBAL.GTID_EXECUTED)), 0) = 20
+AS explicit_gtids_committed
+FROM t_binlog_resume_state
+WHERE detail = 'explicit-gtid';
+explicit_gtids_committed
+1
+SELECT COUNT(*) = 40 AS logged_cache_rows
+FROM t_binlog_logged_cache
+WHERE case_id BETWEEN 1 AND 8
+AND marker = 'logged-cache-post';
+logged_cache_rows
+1
+SELECT COUNT(*) = 20 AS logged_empty_rows
+FROM t_binlog_logged_empty
+WHERE case_id BETWEEN 9 AND 12
+AND marker = 'logged-empty-post';
+logged_empty_rows
+1
+SELECT COUNT(*) = 20 AS session_off_rows
+FROM t_binlog_session_off
+WHERE case_id BETWEEN 13 AND 16
+AND marker = 'session-off-post';
+session_off_rows
+1
+SELECT COUNT(*) = 20 AS explicit_gtid_rows
+FROM t_binlog_gtid
+WHERE case_id BETWEEN 17 AND 20
+AND marker = 'explicit-gtid-post';
+explicit_gtid_rows
+1
+include/assert_grep.inc [100-session LOGGED_WITH_CACHE events are written to the binlog]
+include/assert_grep.inc [100-session LOGGED_EMPTY future DML is written to the binlog]
+include/assert_grep.inc [100-session explicit GTID DML is written to the binlog]
+include/assert_grep.inc [100-session SESSION_OFF_NO_CACHE DML stays out of the binlog]
+include/assert_grep.inc [100-session ignored LOGGED_EMPTY pre-drain DML stays out of the binlog]
+SET GLOBAL preserve_trx_enable=ON;

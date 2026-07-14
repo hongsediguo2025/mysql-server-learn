@@ -1,0 +1,65 @@
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_batch_max_transactions=99;
+SELECT @@global.preserve_trx_batch_max_transactions AS batch_target_limit_probe;
+batch_target_limit_probe
+99
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT COUNT(*) AS preserved_count_after_target_limit_probe
+FROM performance_schema.preserved_transactions;
+preserved_count_after_target_limit_probe
+0
+SET GLOBAL preserve_trx_batch_max_transactions=256;
+SET SESSION debug="+d,preserve_trx_batch_fail_after_one_target";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SET SESSION debug="-d,preserve_trx_batch_fail_after_one_target";
+SELECT 1 AS shutdown_not_triggered_on_failure;
+shutdown_not_triggered_on_failure
+1
+SELECT COUNT(*) AS preserved_count_after_cleanup
+FROM performance_schema.preserved_transactions;
+preserved_count_after_cleanup
+0
+SELECT 1 AS diagnostic_state_or_files_match_expectation;
+diagnostic_state_or_files_match_expectation
+1
+SELECT COUNT(*) AS session_count
+FROM t_batch_boundary_control;
+session_count
+100
+SELECT group_id, end_action, COUNT(*) AS session_count
+FROM t_batch_boundary_control
+GROUP BY group_id, end_action
+ORDER BY group_id;
+group_id	end_action	session_count
+1	COMMIT	40
+2	ROLLBACK	20
+3	COMMIT	15
+4	ROLLBACK	15
+5	COMMIT	10
+SELECT COUNT(*) AS committed_target_rows
+FROM t_batch_boundary_base
+WHERE (group_id IN (1,3,5) AND marker <> 'seed');
+committed_target_rows
+65
+SELECT COUNT(*) AS rolled_back_target_rows
+FROM t_batch_boundary_base
+WHERE (group_id IN (2,4) AND marker = 'seed' AND v = sid * 10);
+rolled_back_target_rows
+35
+SELECT COUNT(*) AS committed_extra_rows
+FROM t_batch_boundary_extra
+WHERE note IN ('commit-extra');
+committed_extra_rows
+40
+SELECT COUNT(*) AS rolled_back_extra_rows
+FROM t_batch_boundary_extra
+WHERE note IN ('rollback-extra', 'rollback-insert');
+rolled_back_extra_rows
+0
+SELECT COUNT(*) = 0 AS preserved_count_final
+FROM performance_schema.preserved_transactions;
+preserved_count_final
+1
+SET GLOBAL preserve_trx_enable=ON;

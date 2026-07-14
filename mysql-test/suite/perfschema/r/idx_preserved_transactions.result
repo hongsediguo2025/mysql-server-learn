@@ -1,0 +1,19 @@
+EXPLAIN SELECT TOKEN
+FROM performance_schema.preserved_transactions
+WHERE TOKEN = 'not-present';
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	preserved_transactions	NULL	ALL	NULL	NULL	NULL	NULL	0	0.00	Using where
+Warnings:
+Note	1003	/* select#1 */ select `performance_schema`.`preserved_transactions`.`TOKEN` AS `TOKEN` from `performance_schema`.`preserved_transactions` where (`performance_schema`.`preserved_transactions`.`TOKEN` = 'not-present')
+EXPLAIN SELECT TOKEN
+FROM performance_schema.preserved_transactions
+WHERE STATE = 'PRESERVED';
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	preserved_transactions	NULL	ALL	NULL	NULL	NULL	NULL	0	0.00	Using where
+Warnings:
+Note	1003	/* select#1 */ select `performance_schema`.`preserved_transactions`.`TOKEN` AS `TOKEN` from `performance_schema`.`preserved_transactions` where (`performance_schema`.`preserved_transactions`.`STATE` = 'PRESERVED')
+SELECT COUNT(*) AS matching_rows
+FROM performance_schema.preserved_transactions
+WHERE TOKEN = 'not-present';
+matching_rows
+0

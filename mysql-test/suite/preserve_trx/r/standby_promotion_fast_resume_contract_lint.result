@@ -1,0 +1,3 @@
+SELECT 'ok' AS standby_promotion_fast_resume_contract_lint;
+standby_promotion_fast_resume_contract_lint
+ok

@@ -1,0 +1,45 @@
+--source include/have_debug.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_recover_record_lock_offset_change;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+--let MYSQLD_DATADIR= `SELECT @@datadir`
+
+CREATE TABLE t_recover_record_lock_offset_change(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+INSERT INTO t_recover_record_lock_offset_change VALUES(1,10),(2,20);
+
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE t_recover_record_lock_offset_change SET b=21 WHERE a=2;
+SELECT * FROM t_recover_record_lock_offset_change WHERE a=1 FOR SHARE;
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+--source include/wait_until_disconnected.inc
+--source suite/preserve_trx/include/assert_one_snapshot_file.inc
+
+--let $_server_id= 1
+--let $_expect_file_name= $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--let $restart_parameters= restart: --preserve-trx-enable=ON --debug=d,preserve_trx_corrupt_import_record_lock_offsets
+--source include/start_mysqld.inc
+
+SELECT COUNT(*) AS preserved_count_after_offset_change
+FROM performance_schema.preserved_transactions;
+
+--source suite/preserve_trx/include/get_preserved_token.inc
+
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+UPDATE t_recover_record_lock_offset_change SET b=b+100 WHERE a=2;
+COMMIT;
+
+SELECT * FROM t_recover_record_lock_offset_change ORDER BY a;
+SELECT COUNT(*) AS remaining_preserved
+FROM performance_schema.preserved_transactions;
+
+DROP TABLE t_recover_record_lock_offset_change;
+SET GLOBAL preserve_trx_enable=ON;

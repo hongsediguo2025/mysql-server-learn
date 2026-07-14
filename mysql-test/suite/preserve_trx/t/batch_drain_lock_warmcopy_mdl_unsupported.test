@@ -1,0 +1,39 @@
+--source include/not_log_bin.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_lock_warmcopy_mdl_unsupported;
+--enable_warnings
+
+--let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
+--let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_enable`
+--let $old_preserve_trx_lock_warmcopy_fallback= `SELECT @@GLOBAL.preserve_trx_lock_warmcopy_fallback_to_live_export`
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=ON;
+
+CREATE TABLE t_lock_warmcopy_mdl_unsupported(
+  id INT PRIMARY KEY,
+  v INT
+) ENGINE=InnoDB;
+INSERT INTO t_lock_warmcopy_mdl_unsupported VALUES(1,10);
+
+LOCK TABLES t_lock_warmcopy_mdl_unsupported WRITE;
+UPDATE t_lock_warmcopy_mdl_unsupported SET v=11 WHERE id=1;
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SELECT COUNT(*) AS preserved_count_after_explicit_mdl_reject
+  FROM performance_schema.preserved_transactions;
+UNLOCK TABLES;
+
+SELECT id, v FROM t_lock_warmcopy_mdl_unsupported ORDER BY id;
+DROP TABLE t_lock_warmcopy_mdl_unsupported;
+
+--disable_query_log
+--eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback
+--eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable
+--eval SET GLOBAL preserve_trx_warmcopy_enable=$old_preserve_trx_warmcopy_enable
+--eval SET GLOBAL preserve_trx_enable=$old_preserve_trx_enable
+--enable_query_log

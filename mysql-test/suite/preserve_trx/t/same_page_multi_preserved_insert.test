@@ -1,0 +1,81 @@
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_same_page_multi_preserved;
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+
+CREATE TABLE t_same_page_multi_preserved(
+  id INT PRIMARY KEY,
+  v INT,
+  resumed_by INT DEFAULT NULL
+) ENGINE=InnoDB;
+
+START TRANSACTION;
+INSERT INTO t_same_page_multi_preserved VALUES(10,10,NULL);
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 86400;
+--source include/wait_until_disconnected.inc
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count_after_first_generation
+  FROM performance_schema.preserved_transactions;
+--let $preserved_token_1= `SELECT TOKEN FROM performance_schema.preserved_transactions ORDER BY TOKEN LIMIT 1`
+
+START TRANSACTION;
+INSERT INTO t_same_page_multi_preserved VALUES(20,20,NULL);
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 86400;
+--source include/wait_until_disconnected.inc
+--exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+SELECT COUNT(*) AS preserved_count_after_second_generation
+  FROM performance_schema.preserved_transactions;
+--let $preserved_count_after_second_generation= `SELECT COUNT(*) FROM performance_schema.preserved_transactions`
+if ($preserved_count_after_second_generation != 2)
+{
+  --die Expected both same-page preserved transactions to be recoverable
+}
+
+--let $preserved_token_2= `SELECT TOKEN FROM performance_schema.preserved_transactions WHERE TOKEN <> '$preserved_token_1' ORDER BY TOKEN LIMIT 1`
+
+--connect(resume_1,localhost,root,,test)
+--replace_result $preserved_token_1 TOKEN_1
+--eval RESUME PRESERVED TRANSACTION '$preserved_token_1'
+UPDATE t_same_page_multi_preserved
+   SET v = v + 1000, resumed_by = 1
+ WHERE id = 10;
+COMMIT;
+
+--connect(resume_2,localhost,root,,test)
+--replace_result $preserved_token_2 TOKEN_2
+--eval RESUME PRESERVED TRANSACTION '$preserved_token_2'
+UPDATE t_same_page_multi_preserved
+   SET v = v + 1000, resumed_by = 2
+ WHERE id = 20;
+COMMIT;
+
+--disconnect resume_1
+--disconnect resume_2
+--connection default
+
+SELECT COUNT(*) AS preserved_count_after_resume
+  FROM performance_schema.preserved_transactions;
+
+SELECT COUNT(*) AS row_count,
+       SUM(resumed_by IS NOT NULL) AS resumed_rows,
+       SUM(v >= 1000) AS bumped_rows
+  FROM t_same_page_multi_preserved;
+
+DROP TABLE t_same_page_multi_preserved;
+SET GLOBAL preserve_trx_enable=ON;

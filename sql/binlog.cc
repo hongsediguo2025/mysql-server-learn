@@ -40,17 +40,25 @@
 #include "sql/check_stack.h"
 #include "sql/clone_handler.h"
 #include "sql_string.h"
+#include "scope_guard.h"
 #include "template_utils.h"
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
 #endif
 #include <algorithm>
+#include <atomic>
+#include <limits>
 #include <list>
 #include <map>
+#include <memory>
 #include <new>
 #include <queue>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <openssl/sha.h>
 
 #include "dur_prop.h"
 #include "libbinlogevents/include/compression/base.h"
@@ -82,6 +90,7 @@
 #include "sql/binlog/global.h"
 #include "sql/binlog/tools/iterators.h"
 #include "sql/binlog_ostream.h"
+#include "sql/binlog_preserve_prepared.h"
 #include "sql/binlog_reader.h"
 #include "sql/create_field.h"
 #include "sql/current_thd.h"
@@ -99,6 +108,8 @@
 #include "sql/protocol.h"
 #include "sql/psi_memory_key.h"
 #include "sql/query_options.h"
+#include "sql/preserve_trx.h"
+#include "sql/preserve_trx_bundle.h"
 #include "sql/rpl_filter.h"
 #include "sql/rpl_gtid.h"
 #include "sql/rpl_handler.h"  // RUN_HOOK
@@ -160,6 +171,11 @@ static bool unsafe_warning_suppression_is_activated = false;
 static int limit_unsafe_warning_count = 0;
 
 static handlerton *binlog_hton;
+#ifndef NDEBUG
+static handlerton *preserve_test_saved_binlog_hton;
+static bool preserve_test_binlog_runtime_active;
+static bool preserve_test_binlog_open;
+#endif
 bool opt_binlog_order_commits = true;
 
 const char *log_bin_index = nullptr;
@@ -575,12 +591,74 @@ class binlog_cache_data {
     return m_cache.open(cache_size, max_cache_size);
   }
 
+  void preserve_rebind_status_counters(ulong *cache_use,
+                                       ulong *cache_disk_use) {
+    ptr_binlog_cache_use = cache_use;
+    ptr_binlog_cache_disk_use = cache_disk_use;
+  }
+
   Binlog_cache_storage *get_cache() { return &m_cache; }
   int finalize(THD *thd, Log_event *end_event);
   int finalize(THD *thd, Log_event *end_event, XID_STATE *xs);
   int flush(THD *thd, my_off_t *bytes, bool *wrote_xid);
   int write_event(Log_event *event);
   size_t get_event_counter() { return event_counter; }
+  void preserve_export_state(Mysql_binlog_preserve_snapshot *snapshot) const {
+    snapshot->event_counter = event_counter;
+    snapshot->immediate = flags.immediate;
+    snapshot->with_xid = flags.with_xid;
+    snapshot->with_sbr = flags.with_sbr;
+    snapshot->with_rbr = flags.with_rbr;
+    snapshot->with_start = flags.with_start;
+    snapshot->with_end = flags.with_end;
+    snapshot->with_content = flags.with_content;
+  }
+  void preserve_import_state(const Mysql_binlog_preserve_snapshot &snapshot) {
+    flags.immediate = snapshot.immediate;
+    flags.with_xid = snapshot.with_xid;
+    flags.with_sbr = snapshot.with_sbr;
+    flags.with_rbr = snapshot.with_rbr;
+    flags.with_start = snapshot.with_start;
+    flags.with_end = snapshot.with_end;
+    flags.with_content = snapshot.with_content;
+    event_counter = snapshot.event_counter;
+  }
+  void preserve_import_reactivated_transaction_state(
+      const Mysql_binlog_preserve_snapshot &snapshot) {
+    preserve_import_state(snapshot);
+    flags.with_xid = false;
+    flags.with_end = false;
+    flags.finalized = false;
+  }
+  bool preserve_export_cache_state(my_off_t position,
+                                   Mysql_binlog_preserve_cache_state *state)
+      const {
+    if (state == nullptr || position == MY_OFF_T_UNDEF) return true;
+    *state = Mysql_binlog_preserve_cache_state{};
+    state->position = static_cast<uint64_t>(position);
+    if (position == 0) return false;
+    const auto it = cache_state_map.find(position);
+    if (it == cache_state_map.end()) return true;
+    state->event_counter = it->second.event_counter;
+    state->with_sbr = it->second.with_sbr;
+    state->with_rbr = it->second.with_rbr;
+    state->with_start = it->second.with_start;
+    state->with_end = it->second.with_end;
+    state->with_content = it->second.with_content;
+    return false;
+  }
+  void preserve_import_cache_state(
+      const Mysql_binlog_preserve_cache_state &state) {
+    if (state.position == 0 || state.position == UINT64_MAX) return;
+    cache_state cache_state;
+    cache_state.with_sbr = state.with_sbr;
+    cache_state.with_rbr = state.with_rbr;
+    cache_state.with_start = state.with_start;
+    cache_state.with_end = state.with_end;
+    cache_state.with_content = state.with_content;
+    cache_state.event_counter = state.event_counter;
+    cache_state_map[static_cast<my_off_t>(state.position)] = cache_state;
+  }
   size_t get_compressed_size() { return m_compressed_size; }
   size_t get_decompressed_size() { return m_decompressed_size; }
   binary_log::transaction::compression::type get_compression_type() {
@@ -796,12 +874,16 @@ class binlog_cache_data {
     pending event. It corresponds to rollback statement or rollback to
     a savepoint. It doesn't change transaction state.
    */
-  void truncate(my_off_t pos) {
+  bool truncate_checked(my_off_t pos) {
     DBUG_PRINT("info", ("truncating to position %lu", (ulong)pos));
     remove_pending_event();
 
-    // TODO: check the return value.
-    (void)m_cache.truncate(pos);
+    return m_cache.truncate(pos);
+  }
+
+  void truncate(my_off_t pos) {
+    /* Legacy callers intentionally retain the historical ignore-error behavior. */
+    (void)truncate_checked(pos);
   }
 
   /**
@@ -987,6 +1069,30 @@ class binlog_trx_cache_data : public binlog_cache_data {
     return;
   }
 
+  void preserve_import_prev_position(
+      const Mysql_binlog_preserve_snapshot &snapshot) {
+    before_stmt_pos = snapshot.has_prev_position
+                          ? static_cast<my_off_t>(snapshot.prev_position)
+                          : MY_OFF_T_UNDEF;
+    if (before_stmt_pos != MY_OFF_T_UNDEF)
+      cache_state_checkpoint(before_stmt_pos);
+  }
+
+  bool preserve_truncate_to_reactivated_transaction_state(
+      const Mysql_binlog_preserve_snapshot &snapshot) {
+    if (!snapshot.has_cache_length) return true;
+    if (snapshot.cache_length >
+        static_cast<uint64_t>(std::numeric_limits<my_off_t>::max()))
+      return true;
+    const my_off_t cache_length = static_cast<my_off_t>(snapshot.cache_length);
+    if (get_byte_position() < cache_length) return true;
+
+    if (binlog_cache_data::truncate_checked(cache_length)) return true;
+    binlog_cache_data::preserve_import_reactivated_transaction_state(snapshot);
+    preserve_import_prev_position(snapshot);
+    return false;
+  }
+
   void restore_prev_position() {
     DBUG_TRACE;
     DBUG_PRINT("enter", ("before_stmt_pos: %llu", (ulonglong)before_stmt_pos));
@@ -1059,6 +1165,17 @@ class binlog_cache_mngr {
 
   Binlog_cache_storage *get_stmt_cache() { return stmt_cache.get_cache(); }
   Binlog_cache_storage *get_trx_cache() { return trx_cache.get_cache(); }
+  void preserve_rebind_status_counters(
+      ulong *ptr_binlog_stmt_cache_use_arg,
+      ulong *ptr_binlog_stmt_cache_disk_use_arg,
+      ulong *ptr_binlog_cache_use_arg,
+      ulong *ptr_binlog_cache_disk_use_arg) {
+    stmt_cache.preserve_rebind_status_counters(
+        ptr_binlog_stmt_cache_use_arg,
+        ptr_binlog_stmt_cache_disk_use_arg);
+    trx_cache.preserve_rebind_status_counters(ptr_binlog_cache_use_arg,
+                                              ptr_binlog_cache_disk_use_arg);
+  }
   /**
     Convenience method to check if both caches are empty.
    */
@@ -1141,6 +1258,732 @@ static binlog_cache_mngr *thd_get_cache_mngr(const THD *thd) {
   DBUG_ASSERT(opt_bin_log);
   return (binlog_cache_mngr *)thd_get_ha_data(thd, binlog_hton);
 }
+
+namespace {
+
+constexpr size_t kPreserveBinlogPrepareBufferBytes = 64 * 1024;
+constexpr uint64_t kPreserveBinlogNativeDynamicOverheadBytes = 4096;
+constexpr uint64_t kPreserveBinlogCacheStateMapNodeAdmissionBytes =
+    sizeof(Mysql_binlog_preserve_cache_state) + 4 * sizeof(void *) +
+    2 * sizeof(uint64_t);
+constexpr uint64_t kPreserveBinlogNativeFdCount = 2;
+
+std::mutex g_preserve_attached_binlog_resource_mutex;
+std::unordered_map<
+    binlog_cache_mngr *,
+    std::unique_ptr<Preserve_native_binlog_resource_lease>>
+    g_preserve_attached_binlog_resources;
+std::atomic<uint64_t> g_preserve_attached_binlog_resource_count{0};
+
+bool preserve_binlog_identity_is_valid(
+    const Mysql_binlog_preserve_token_identity &identity) {
+  return !identity.source_uuid.empty() && !identity.epoch_id.empty() &&
+         !identity.token.empty() &&
+         !identity.target_boot_incarnation.empty() && identity.generation != 0;
+}
+
+bool preserve_binlog_identities_match(
+    const Mysql_binlog_preserve_token_identity &lhs,
+    const Mysql_binlog_preserve_token_identity &rhs) {
+  return lhs.source_uuid == rhs.source_uuid && lhs.epoch_id == rhs.epoch_id &&
+         lhs.token == rhs.token &&
+         lhs.target_boot_incarnation == rhs.target_boot_incarnation &&
+         lhs.generation == rhs.generation;
+}
+
+void preserve_binlog_append_u32(std::string *encoded, uint32_t value) {
+  for (int shift = 24; shift >= 0; shift -= 8)
+    encoded->push_back(static_cast<char>((value >> shift) & 0xff));
+}
+
+void preserve_binlog_append_u64(std::string *encoded, uint64_t value) {
+  for (int shift = 56; shift >= 0; shift -= 8)
+    encoded->push_back(static_cast<char>((value >> shift) & 0xff));
+}
+
+bool preserve_binlog_append_string(std::string *encoded,
+                                   const std::string &value) {
+  if (value.size() > std::numeric_limits<uint32_t>::max()) return false;
+  preserve_binlog_append_u32(encoded, static_cast<uint32_t>(value.size()));
+  encoded->append(value);
+  return true;
+}
+
+void preserve_binlog_append_bool(std::string *encoded, bool value) {
+  encoded->push_back(value ? '\x01' : '\x00');
+}
+
+std::string preserve_binlog_sha256_hex(const std::string &payload) {
+  std::array<unsigned char, SHA256_DIGEST_LENGTH> digest{};
+  SHA256(pointer_cast<const unsigned char *>(payload.data()), payload.size(),
+         digest.data());
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string result;
+  result.reserve(digest.size() * 2);
+  for (const unsigned char byte : digest) {
+    result.push_back(kHex[(byte >> 4) & 0x0f]);
+    result.push_back(kHex[byte & 0x0f]);
+  }
+  return result;
+}
+
+bool preserve_binlog_encode_cache_facts(
+    const Mysql_binlog_preserve_cache_facts &facts, std::string *encoded) {
+  if (encoded == nullptr ||
+      !preserve_binlog_identity_is_valid(facts.identity)) {
+    return false;
+  }
+  encoded->clear();
+  if (!preserve_binlog_append_string(encoded, facts.identity.source_uuid) ||
+      !preserve_binlog_append_string(encoded, facts.identity.epoch_id) ||
+      !preserve_binlog_append_string(encoded, facts.identity.token) ||
+      !preserve_binlog_append_string(
+          encoded, facts.identity.target_boot_incarnation) ||
+      !preserve_binlog_append_string(encoded, facts.snapshot.gtid_next) ||
+      !preserve_binlog_append_string(encoded, facts.snapshot.owned_gtid)) {
+    return false;
+  }
+  preserve_binlog_append_u64(encoded, facts.identity.generation);
+  preserve_binlog_append_u64(encoded, facts.snapshot.event_counter);
+  preserve_binlog_append_bool(encoded, facts.snapshot.immediate);
+  preserve_binlog_append_bool(encoded, facts.snapshot.with_xid);
+  preserve_binlog_append_bool(encoded, facts.snapshot.with_sbr);
+  preserve_binlog_append_bool(encoded, facts.snapshot.with_rbr);
+  preserve_binlog_append_bool(encoded, facts.snapshot.with_start);
+  preserve_binlog_append_bool(encoded, facts.snapshot.with_end);
+  preserve_binlog_append_bool(encoded, facts.snapshot.with_content);
+  preserve_binlog_append_bool(encoded, facts.snapshot.has_prev_position);
+  preserve_binlog_append_u64(encoded, facts.snapshot.prev_position);
+  preserve_binlog_append_bool(encoded, facts.snapshot.has_cache_length);
+  preserve_binlog_append_u64(encoded, facts.snapshot.cache_length);
+  preserve_binlog_append_bool(encoded,
+                              facts.snapshot.has_compression_session_state);
+  preserve_binlog_append_bool(encoded,
+                              facts.snapshot.binlog_trx_compression);
+  preserve_binlog_append_u32(encoded,
+                             facts.snapshot.binlog_trx_compression_type);
+  preserve_binlog_append_u32(
+      encoded, facts.snapshot.binlog_trx_compression_level_zstd);
+  preserve_binlog_append_u32(encoded,
+                             static_cast<uint32_t>(facts.cache_states.size()));
+  for (const auto &state : facts.cache_states) {
+    preserve_binlog_append_u64(encoded, state.position);
+    preserve_binlog_append_u64(encoded, state.event_counter);
+    preserve_binlog_append_bool(encoded, state.with_sbr);
+    preserve_binlog_append_bool(encoded, state.with_rbr);
+    preserve_binlog_append_bool(encoded, state.with_start);
+    preserve_binlog_append_bool(encoded, state.with_end);
+    preserve_binlog_append_bool(encoded, state.with_content);
+  }
+  encoded->append(pointer_cast<const char *>(facts.payload_sha256.data()),
+                  facts.payload_sha256.size());
+  preserve_binlog_append_u64(encoded, facts.cache_length);
+  preserve_binlog_append_u64(encoded, facts.binlog_incarnation);
+  preserve_binlog_append_u64(encoded, facts.key_generation);
+  preserve_binlog_append_bool(encoded, facts.option_bin_log);
+  preserve_binlog_append_bool(encoded, facts.session_sql_log_bin);
+  return true;
+}
+
+bool preserve_binlog_runtime_is_open() {
+#ifndef NDEBUG
+  if (preserve_test_binlog_runtime_active) return preserve_test_binlog_open;
+#endif
+  return mysql_bin_log.is_open();
+}
+
+void preserve_binlog_release_attached_resources(binlog_cache_mngr *manager) {
+  if (manager == nullptr ||
+      g_preserve_attached_binlog_resource_count.load(
+          std::memory_order_acquire) == 0) {
+    return;
+  }
+  std::unique_ptr<Preserve_native_binlog_resource_lease> resources;
+  {
+    std::lock_guard<std::mutex> guard(
+        g_preserve_attached_binlog_resource_mutex);
+    const auto it = g_preserve_attached_binlog_resources.find(manager);
+    if (it == g_preserve_attached_binlog_resources.end()) return;
+    resources = std::move(it->second);
+    g_preserve_attached_binlog_resources.erase(it);
+    g_preserve_attached_binlog_resource_count.fetch_sub(
+        1, std::memory_order_release);
+  }
+}
+
+void destroy_preserve_binlog_cache_manager(binlog_cache_mngr *manager) {
+  if (manager == nullptr) return;
+  manager->reset();
+  manager->~binlog_cache_mngr();
+  preserve_binlog_release_attached_resources(manager);
+  my_free(manager);
+}
+
+void set_preserve_binlog_cache_manager(THD *thd,
+                                       binlog_cache_mngr *manager) {
+#ifndef NDEBUG
+  if (preserve_test_binlog_runtime_active) {
+    thd->get_ha_data(binlog_hton->slot)->ha_ptr = manager;
+    return;
+  }
+#endif
+  thd_set_ha_data(thd, binlog_hton, manager);
+}
+
+bool preserve_binlog_cache_facts_are_well_formed(
+    const Mysql_binlog_preserve_cache_facts &facts) {
+  if (facts.cache_length == 0 ||
+      facts.cache_length >
+          static_cast<uint64_t>(std::numeric_limits<my_off_t>::max()) ||
+      facts.cache_length > max_binlog_cache_size ||
+      !facts.snapshot.cache_payload.empty() ||
+      !facts.snapshot.has_cache_length ||
+      facts.snapshot.cache_length != facts.cache_length ||
+      !preserve_binlog_identity_is_valid(facts.identity) ||
+      facts.binlog_incarnation == 0 ||
+      facts.key_generation == 0) {
+    return false;
+  }
+  for (const auto &state : facts.cache_states) {
+    if (state.position == 0 || state.position == UINT64_MAX ||
+        state.position > facts.cache_length) {
+      return false;
+    }
+  }
+  Mysql_binlog_preserve_cache_facts finalized = facts;
+  return mysql_binlog_preserve_finalize_cache_facts(&finalized) &&
+         !facts.canonical_digest.empty() &&
+         finalized.canonical_digest == facts.canonical_digest;
+}
+
+bool preserve_binlog_register_attached_resources(
+    binlog_cache_mngr *manager,
+    Preserve_native_binlog_resource_lease *resources) {
+  if (manager == nullptr || resources == nullptr || !resources->acquired())
+    return false;
+  std::lock_guard<std::mutex> guard(g_preserve_attached_binlog_resource_mutex);
+  if (g_preserve_attached_binlog_resources.find(manager) !=
+      g_preserve_attached_binlog_resources.end()) {
+    return false;
+  }
+  auto owned = std::make_unique<Preserve_native_binlog_resource_lease>(
+      std::move(*resources));
+  const auto result =
+      g_preserve_attached_binlog_resources.emplace(manager, std::move(owned));
+  if (result.second)
+    g_preserve_attached_binlog_resource_count.fetch_add(
+        1, std::memory_order_release);
+  return result.second;
+}
+
+}  // namespace
+
+bool mysql_binlog_preserve_finalize_cache_facts(
+    Mysql_binlog_preserve_cache_facts *facts) {
+  if (facts == nullptr || !facts->snapshot.cache_payload.empty() ||
+      facts->cache_states.size() > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  std::string encoded;
+  if (!preserve_binlog_encode_cache_facts(*facts, &encoded)) return false;
+  const std::string digest = preserve_binlog_sha256_hex(encoded);
+  if (!facts->canonical_digest.empty() &&
+      facts->canonical_digest != digest) {
+    return false;
+  }
+  facts->canonical_digest = digest;
+  return true;
+}
+
+struct Mysql_binlog_preserve_prepared_cache_handle::Impl {
+  ~Impl() { destroy_preserve_binlog_cache_manager(manager); }
+
+  binlog_cache_mngr *manager{nullptr};
+  Mysql_binlog_preserve_cache_facts facts;
+  Preserve_native_binlog_resource_lease resource_lease;
+  ulong detached_stmt_cache_use{0};
+  ulong detached_stmt_cache_disk_use{0};
+  ulong detached_trx_cache_use{0};
+  ulong detached_trx_cache_disk_use{0};
+  uint64_t cache_length{0};
+  bool file_backed{false};
+  bool sealed{false};
+};
+
+uint64_t mysql_binlog_preserve_native_memory_bytes_required(
+    const Mysql_binlog_preserve_cache_facts &facts) {
+  uint64_t result = sizeof(binlog_cache_mngr) +
+                    kPreserveBinlogNativeDynamicOverheadBytes;
+  if (facts.cache_states.capacity() >
+      std::numeric_limits<uint64_t>::max() /
+          sizeof(Mysql_binlog_preserve_cache_state) ||
+      facts.cache_states.size() >
+          std::numeric_limits<uint64_t>::max() /
+              kPreserveBinlogCacheStateMapNodeAdmissionBytes) {
+    return 0;
+  }
+  const std::array<uint64_t, 12> dynamic_bytes{
+      static_cast<uint64_t>(binlog_cache_size),
+      static_cast<uint64_t>(binlog_stmt_cache_size),
+      static_cast<uint64_t>(facts.cache_states.capacity()) *
+          sizeof(Mysql_binlog_preserve_cache_state),
+      static_cast<uint64_t>(facts.cache_states.size()) *
+          kPreserveBinlogCacheStateMapNodeAdmissionBytes,
+      static_cast<uint64_t>(facts.identity.source_uuid.capacity()),
+      static_cast<uint64_t>(facts.identity.epoch_id.capacity()),
+      static_cast<uint64_t>(facts.identity.token.capacity()),
+      static_cast<uint64_t>(
+          facts.identity.target_boot_incarnation.capacity()),
+      static_cast<uint64_t>(facts.snapshot.gtid_next.capacity()),
+      static_cast<uint64_t>(facts.snapshot.owned_gtid.capacity()),
+      static_cast<uint64_t>(facts.snapshot.cache_payload.capacity()),
+      static_cast<uint64_t>(facts.canonical_digest.capacity())};
+  for (const uint64_t bytes : dynamic_bytes) {
+    if (result > std::numeric_limits<uint64_t>::max() - bytes) return 0;
+    result += bytes;
+  }
+  return result;
+}
+
+uint64_t mysql_binlog_preserve_native_fd_count_required(
+    const Mysql_binlog_preserve_cache_facts &) {
+  return kPreserveBinlogNativeFdCount;
+}
+
+uint64_t mysql_binlog_preserve_native_tmpdir_bytes_required(
+    const Mysql_binlog_preserve_cache_facts &facts) {
+  return facts.cache_length > static_cast<uint64_t>(binlog_cache_size)
+             ? facts.cache_length
+             : 0;
+}
+
+struct Mysql_binlog_preserve_attach_journal::Impl {
+  THD *thd{nullptr};
+  binlog_cache_mngr *manager{nullptr};
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> handle_shell;
+  bool saved_binlog_trx_compression{false};
+  ulong saved_binlog_trx_compression_type{0};
+  uint saved_binlog_trx_compression_level_zstd{0};
+  bool active{false};
+};
+
+Mysql_binlog_preserve_prepared_cache_handle::
+    Mysql_binlog_preserve_prepared_cache_handle() = default;
+Mysql_binlog_preserve_prepared_cache_handle::
+    Mysql_binlog_preserve_prepared_cache_handle(
+        Mysql_binlog_preserve_prepared_cache_handle &&) noexcept = default;
+Mysql_binlog_preserve_prepared_cache_handle &
+Mysql_binlog_preserve_prepared_cache_handle::operator=(
+    Mysql_binlog_preserve_prepared_cache_handle &&) noexcept = default;
+Mysql_binlog_preserve_prepared_cache_handle::
+    ~Mysql_binlog_preserve_prepared_cache_handle() = default;
+
+bool Mysql_binlog_preserve_prepared_cache_handle::sealed() const {
+  return m_impl != nullptr && m_impl->sealed;
+}
+
+uint64_t Mysql_binlog_preserve_prepared_cache_handle::cache_length() const {
+  return m_impl == nullptr ? 0 : m_impl->cache_length;
+}
+
+bool Mysql_binlog_preserve_prepared_cache_handle::file_backed() const {
+  return m_impl != nullptr && m_impl->file_backed;
+}
+
+const void *
+Mysql_binlog_preserve_prepared_cache_handle::native_manager_identity() const {
+  return m_impl == nullptr ? nullptr : m_impl->manager;
+}
+
+const std::string &
+Mysql_binlog_preserve_prepared_cache_handle::facts_digest() const {
+  static const std::string empty;
+  return m_impl == nullptr ? empty : m_impl->facts.canonical_digest;
+}
+
+bool Mysql_binlog_preserve_prepared_cache_handle::matches(
+    const Mysql_binlog_preserve_token_identity &identity,
+    const std::string &facts_digest_arg, uint64_t cache_length_arg,
+    bool file_backed_arg) const {
+  return m_impl != nullptr && m_impl->sealed &&
+         preserve_binlog_identities_match(m_impl->facts.identity, identity) &&
+         m_impl->facts.canonical_digest == facts_digest_arg &&
+         m_impl->cache_length == cache_length_arg &&
+         m_impl->file_backed == file_backed_arg;
+}
+
+bool Mysql_binlog_preserve_prepared_cache_handle::make_attach_capability(
+    Preserve_trx_internal_operation_capability *out) const {
+  if (out == nullptr || m_impl == nullptr || !m_impl->sealed ||
+      m_impl->facts.binlog_incarnation == 0 ||
+      m_impl->facts.key_generation == 0) {
+    return false;
+  }
+  *out = {};
+  out->m_operation = Preserve_trx_internal_operation::ATTACH_BINLOG_CACHE;
+  out->m_identity = m_impl->facts.identity;
+  out->m_binlog_incarnation = m_impl->facts.binlog_incarnation;
+  out->m_key_generation = m_impl->facts.key_generation;
+  return true;
+}
+
+Mysql_binlog_preserve_attach_journal::Mysql_binlog_preserve_attach_journal() =
+    default;
+Mysql_binlog_preserve_attach_journal::Mysql_binlog_preserve_attach_journal(
+    Mysql_binlog_preserve_attach_journal &&) noexcept = default;
+
+Mysql_binlog_preserve_attach_journal::~Mysql_binlog_preserve_attach_journal() {
+  if (!active()) return;
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> handle;
+  const auto status =
+      mysql_binlog_preserve_abort_detached_cache_attach(this, &handle);
+  DBUG_ASSERT(status == Mysql_binlog_preserve_cache_status::OK);
+  if (status != Mysql_binlog_preserve_cache_status::OK) {
+    LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+           "PRESERVE: native binlog attach journal lost reversible ownership; "
+           "instance cleanup is required");
+    (void)m_impl.release();
+  }
+}
+
+bool Mysql_binlog_preserve_attach_journal::active() const {
+  return m_impl != nullptr && m_impl->active;
+}
+
+#ifndef NDEBUG
+Preserve_trx_internal_operation_capability
+preserved_trx_make_binlog_capability_for_unit_test(
+    Preserve_trx_internal_operation operation,
+    const Mysql_binlog_preserve_token_identity &identity,
+    uint64_t binlog_incarnation,
+    uint64_t key_generation) {
+  Preserve_trx_internal_operation_capability capability;
+  if (operation == Preserve_trx_internal_operation::NONE ||
+      !preserve_binlog_identity_is_valid(identity) || binlog_incarnation == 0 ||
+      key_generation == 0) {
+    return capability;
+  }
+  capability.m_operation = operation;
+  capability.m_identity = identity;
+  capability.m_binlog_incarnation = binlog_incarnation;
+  capability.m_key_generation = key_generation;
+  return capability;
+}
+#endif
+
+Mysql_binlog_preserve_cache_status
+mysql_binlog_preserve_prepare_detached_cache(
+    const Preserve_trx_internal_operation_capability &capability,
+    const Mysql_binlog_preserve_cache_facts &facts,
+    Mysql_binlog_preserve_payload_reader *reader,
+    Preserve_native_binlog_resource_lease resource_lease,
+    std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> *out) {
+  DBUG_TRACE;
+  if (reader == nullptr || out == nullptr || *out != nullptr) {
+    return Mysql_binlog_preserve_cache_status::INVALID_ARGUMENT;
+  }
+  if (!preserve_trx_is_enabled())
+    return Mysql_binlog_preserve_cache_status::FEATURE_DISABLED;
+  if (!preserve_binlog_cache_facts_are_well_formed(facts))
+    return Mysql_binlog_preserve_cache_status::INVALID_ARGUMENT;
+  if (capability.m_operation !=
+          Preserve_trx_internal_operation::PREPARE_BINLOG_CACHE ||
+      !preserve_binlog_identity_is_valid(capability.m_identity) ||
+      capability.m_binlog_incarnation == 0 ||
+      capability.m_key_generation == 0) {
+    return Mysql_binlog_preserve_cache_status::CAPABILITY_REJECTED;
+  }
+  if (!capability.permits(
+          Preserve_trx_internal_operation::PREPARE_BINLOG_CACHE,
+          facts.identity, facts.binlog_incarnation,
+          facts.key_generation)) {
+    return Mysql_binlog_preserve_cache_status::INCARNATION_MISMATCH;
+  }
+  if (!opt_bin_log || !preserve_binlog_runtime_is_open())
+    return Mysql_binlog_preserve_cache_status::BINLOG_DISABLED;
+  if (!facts.option_bin_log || !facts.session_sql_log_bin)
+    return Mysql_binlog_preserve_cache_status::MODE_MISMATCH;
+  const uint64_t required_memory =
+      mysql_binlog_preserve_native_memory_bytes_required(facts);
+  const uint64_t required_fds =
+      mysql_binlog_preserve_native_fd_count_required(facts);
+  const uint64_t required_tmpdir =
+      mysql_binlog_preserve_native_tmpdir_bytes_required(facts);
+  if (required_memory == 0 || !resource_lease.acquired() ||
+      resource_lease.memory_bytes() < required_memory ||
+      resource_lease.fd_count() < required_fds ||
+      resource_lease.tmpdir_bytes() < required_tmpdir) {
+    return Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED;
+  }
+
+  auto handle =
+      std::make_unique<Mysql_binlog_preserve_prepared_cache_handle>();
+  auto impl =
+      std::make_unique<Mysql_binlog_preserve_prepared_cache_handle::Impl>();
+  impl->facts = facts;
+  impl->resource_lease = std::move(resource_lease);
+
+  auto *const manager_memory = static_cast<binlog_cache_mngr *>(my_malloc(
+      key_memory_binlog_cache_mngr, sizeof(binlog_cache_mngr),
+      MYF(MY_ZEROFILL)));
+  if (manager_memory == nullptr)
+    return Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED;
+  impl->manager = new (manager_memory) binlog_cache_mngr(
+      &impl->detached_stmt_cache_use, &impl->detached_stmt_cache_disk_use,
+      &impl->detached_trx_cache_use, &impl->detached_trx_cache_disk_use);
+  if (impl->manager->init()) {
+    impl->manager->~binlog_cache_mngr();
+    my_free(impl->manager);
+    impl->manager = nullptr;
+    return Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED;
+  }
+
+  SHA256_CTX digest_context;
+  if (SHA256_Init(&digest_context) != 1)
+    return Mysql_binlog_preserve_cache_status::WRITE_ERROR;
+  std::array<unsigned char, kPreserveBinlogPrepareBufferBytes> buffer{};
+  uint64_t total_bytes = 0;
+  for (;;) {
+    size_t bytes_read = 0;
+    const auto read_status =
+        reader->read(buffer.data(), buffer.size(), &bytes_read);
+    if (read_status == Mysql_binlog_preserve_payload_read_status::ERROR)
+      return Mysql_binlog_preserve_cache_status::READ_ERROR;
+    if (read_status == Mysql_binlog_preserve_payload_read_status::END) {
+      if (bytes_read != 0)
+        return Mysql_binlog_preserve_cache_status::READ_ERROR;
+      break;
+    }
+    if (bytes_read == 0 || bytes_read > buffer.size() ||
+        bytes_read > facts.cache_length ||
+        total_bytes > facts.cache_length - bytes_read) {
+      return Mysql_binlog_preserve_cache_status::LENGTH_MISMATCH;
+    }
+    if (SHA256_Update(&digest_context, buffer.data(), bytes_read) != 1)
+      return Mysql_binlog_preserve_cache_status::WRITE_ERROR;
+    if (impl->manager->get_trx_cache()->write(
+            buffer.data(), static_cast<my_off_t>(bytes_read))) {
+      return Mysql_binlog_preserve_cache_status::WRITE_ERROR;
+    }
+    total_bytes += bytes_read;
+  }
+  if (total_bytes != facts.cache_length)
+    return Mysql_binlog_preserve_cache_status::LENGTH_MISMATCH;
+  std::array<unsigned char, kPreservedTrxSha256Length> digest{};
+  if (SHA256_Final(digest.data(), &digest_context) != 1)
+    return Mysql_binlog_preserve_cache_status::WRITE_ERROR;
+  if (digest != facts.payload_sha256)
+    return Mysql_binlog_preserve_cache_status::DIGEST_MISMATCH;
+
+  impl->manager->trx_cache.preserve_import_state(facts.snapshot);
+  impl->manager->trx_cache.preserve_import_prev_position(facts.snapshot);
+  for (const auto &state : facts.cache_states)
+    impl->manager->trx_cache.preserve_import_cache_state(state);
+  if (static_cast<uint64_t>(impl->manager->get_trx_cache()->length()) !=
+      facts.cache_length) {
+    return Mysql_binlog_preserve_cache_status::LENGTH_MISMATCH;
+  }
+  impl->cache_length = total_bytes;
+  impl->file_backed = impl->manager->get_trx_cache()->disk_writes() != 0;
+  impl->sealed = true;
+  handle->m_impl = std::move(impl);
+  *out = std::move(handle);
+  return Mysql_binlog_preserve_cache_status::OK;
+}
+
+Mysql_binlog_preserve_cache_status mysql_binlog_preserve_attach_detached_cache(
+    const Preserve_trx_internal_operation_capability &capability, THD *thd,
+    std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> *inout,
+    Mysql_binlog_preserve_attach_journal *journal) {
+  DBUG_TRACE;
+  if (thd == nullptr || inout == nullptr || *inout == nullptr ||
+      (*inout)->m_impl == nullptr || journal == nullptr || journal->active()) {
+    return Mysql_binlog_preserve_cache_status::INVALID_ARGUMENT;
+  }
+  if (!preserve_trx_is_enabled())
+    return Mysql_binlog_preserve_cache_status::FEATURE_DISABLED;
+  const auto &facts = (*inout)->m_impl->facts;
+  if (!capability.permits(
+          Preserve_trx_internal_operation::ATTACH_BINLOG_CACHE,
+          facts.identity, facts.binlog_incarnation,
+          facts.key_generation)) {
+    return Mysql_binlog_preserve_cache_status::CAPABILITY_REJECTED;
+  }
+  if (!opt_bin_log || !preserve_binlog_runtime_is_open() ||
+      binlog_hton == nullptr || binlog_hton->slot == HA_SLOT_UNDEF) {
+    return Mysql_binlog_preserve_cache_status::BINLOG_DISABLED;
+  }
+  if (!facts.option_bin_log || !facts.session_sql_log_bin ||
+      !(thd->variables.option_bits & OPTION_BIN_LOG) ||
+      !thd->variables.sql_log_bin) {
+    return Mysql_binlog_preserve_cache_status::MODE_MISMATCH;
+  }
+  if (!(*inout)->m_impl->sealed || (*inout)->m_impl->manager == nullptr)
+    return Mysql_binlog_preserve_cache_status::INVALID_STATE;
+
+  Ha_data *const ha_data = thd->get_ha_data(binlog_hton->slot);
+  if (thd_get_cache_mngr(thd) != nullptr ||
+      ha_data->ha_ptr_backup != nullptr ||
+      ha_data->ha_info[Transaction_ctx::SESSION].is_started() ||
+      ha_data->ha_info[Transaction_ctx::STMT].is_started() ||
+      !thd->get_transaction()->is_empty(Transaction_ctx::SESSION) ||
+      !thd->get_transaction()->is_empty(Transaction_ctx::STMT)) {
+    return Mysql_binlog_preserve_cache_status::TARGET_NOT_PRISTINE;
+  }
+
+  auto journal_impl =
+      std::make_unique<Mysql_binlog_preserve_attach_journal::Impl>();
+  journal_impl->thd = thd;
+  journal_impl->saved_binlog_trx_compression =
+      thd->variables.binlog_trx_compression;
+  journal_impl->saved_binlog_trx_compression_type =
+      thd->variables.binlog_trx_compression_type;
+  journal_impl->saved_binlog_trx_compression_level_zstd =
+      thd->variables.binlog_trx_compression_level_zstd;
+  if (facts.snapshot.has_compression_session_state) {
+    thd->variables.binlog_trx_compression =
+        facts.snapshot.binlog_trx_compression;
+    thd->variables.binlog_trx_compression_type =
+        facts.snapshot.binlog_trx_compression_type;
+    thd->variables.binlog_trx_compression_level_zstd =
+        facts.snapshot.binlog_trx_compression_level_zstd;
+  }
+
+  journal_impl->handle_shell = std::move(*inout);
+  journal_impl->manager = journal_impl->handle_shell->m_impl->manager;
+  journal_impl->handle_shell->m_impl->manager = nullptr;
+  journal_impl->manager->preserve_rebind_status_counters(
+      &binlog_stmt_cache_use, &binlog_stmt_cache_disk_use, &binlog_cache_use,
+      &binlog_cache_disk_use);
+  set_preserve_binlog_cache_manager(thd, journal_impl->manager);
+  trans_register_ha(thd, true, binlog_hton, nullptr);
+  trans_register_ha(thd, false, binlog_hton, nullptr);
+  ha_data->ha_info[Transaction_ctx::SESSION].set_trx_read_write();
+  ha_data->ha_info[Transaction_ctx::STMT].set_trx_read_write();
+  journal_impl->active = true;
+  journal->m_impl = std::move(journal_impl);
+  return Mysql_binlog_preserve_cache_status::OK;
+}
+
+Mysql_binlog_preserve_cache_status
+mysql_binlog_preserve_abort_detached_cache_attach(
+    Mysql_binlog_preserve_attach_journal *journal,
+    std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> *out) {
+  DBUG_TRACE;
+  if (journal == nullptr || !journal->active() || out == nullptr ||
+      *out != nullptr || journal->m_impl->handle_shell == nullptr ||
+      journal->m_impl->handle_shell->m_impl == nullptr) {
+    return Mysql_binlog_preserve_cache_status::INVALID_ARGUMENT;
+  }
+  auto &impl = *journal->m_impl;
+  if (binlog_hton == nullptr || thd_get_cache_mngr(impl.thd) != impl.manager)
+    return Mysql_binlog_preserve_cache_status::OWNERSHIP_TAINTED;
+
+  Ha_data *const ha_data = impl.thd->get_ha_data(binlog_hton->slot);
+  ha_data->ha_info[Transaction_ctx::SESSION].reset();
+  ha_data->ha_info[Transaction_ctx::STMT].reset();
+  impl.thd->get_transaction()->reset_scope(Transaction_ctx::SESSION);
+  impl.thd->get_transaction()->reset_scope(Transaction_ctx::STMT);
+  set_preserve_binlog_cache_manager(impl.thd, nullptr);
+  impl.manager->preserve_rebind_status_counters(
+      &impl.handle_shell->m_impl->detached_stmt_cache_use,
+      &impl.handle_shell->m_impl->detached_stmt_cache_disk_use,
+      &impl.handle_shell->m_impl->detached_trx_cache_use,
+      &impl.handle_shell->m_impl->detached_trx_cache_disk_use);
+  impl.handle_shell->m_impl->manager = impl.manager;
+  impl.manager = nullptr;
+  impl.thd->variables.binlog_trx_compression =
+      impl.saved_binlog_trx_compression;
+  impl.thd->variables.binlog_trx_compression_type =
+      impl.saved_binlog_trx_compression_type;
+  impl.thd->variables.binlog_trx_compression_level_zstd =
+      impl.saved_binlog_trx_compression_level_zstd;
+  impl.active = false;
+  *out = std::move(impl.handle_shell);
+  journal->m_impl.reset();
+  return Mysql_binlog_preserve_cache_status::OK;
+}
+
+Mysql_binlog_preserve_cache_status
+mysql_binlog_preserve_commit_detached_cache_attach(
+    Mysql_binlog_preserve_attach_journal *journal) {
+  DBUG_TRACE;
+  if (journal == nullptr || !journal->active() ||
+      journal->m_impl->handle_shell == nullptr ||
+      journal->m_impl->handle_shell->m_impl == nullptr) {
+    return Mysql_binlog_preserve_cache_status::INVALID_ARGUMENT;
+  }
+  auto &impl = *journal->m_impl;
+  if (binlog_hton == nullptr || thd_get_cache_mngr(impl.thd) != impl.manager)
+    return Mysql_binlog_preserve_cache_status::OWNERSHIP_TAINTED;
+  DBUG_EXECUTE_IF("preserve_trx_fail_native_binlog_resource_registration",
+                  return Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED;);
+  if (!preserve_binlog_register_attached_resources(
+          impl.manager, &impl.handle_shell->m_impl->resource_lease)) {
+    return Mysql_binlog_preserve_cache_status::RESOURCE_EXHAUSTED;
+  }
+
+  impl.active = false;
+  impl.manager = nullptr;
+  impl.handle_shell.reset();
+  journal->m_impl.reset();
+  return Mysql_binlog_preserve_cache_status::OK;
+}
+
+#ifndef NDEBUG
+void mysql_binlog_preserve_set_runtime_for_unit_test(handlerton *hton,
+                                                     bool binlog_open) {
+  if (hton != nullptr) {
+    DBUG_ASSERT(!preserve_test_binlog_runtime_active);
+    preserve_test_saved_binlog_hton = binlog_hton;
+    binlog_hton = hton;
+    preserve_test_binlog_runtime_active = true;
+    preserve_test_binlog_open = binlog_open;
+    return;
+  }
+  if (preserve_test_binlog_runtime_active)
+    binlog_hton = preserve_test_saved_binlog_hton;
+  preserve_test_saved_binlog_hton = nullptr;
+  preserve_test_binlog_runtime_active = false;
+  preserve_test_binlog_open = false;
+}
+
+const void *mysql_binlog_preserve_attached_manager_identity_for_unit_test(
+    THD *thd) {
+  if (thd == nullptr || binlog_hton == nullptr || !opt_bin_log) return nullptr;
+  return thd_get_cache_mngr(thd);
+}
+
+bool mysql_binlog_preserve_attached_handlers_ready_for_unit_test(THD *thd) {
+  if (thd == nullptr || binlog_hton == nullptr || !opt_bin_log) return false;
+  Ha_data *const ha_data = thd->get_ha_data(binlog_hton->slot);
+  const auto *const session_info =
+      &ha_data->ha_info[Transaction_ctx::SESSION];
+  const auto *const stmt_info = &ha_data->ha_info[Transaction_ctx::STMT];
+  return thd_get_cache_mngr(thd) != nullptr && session_info->is_started() &&
+         session_info->is_trx_read_write() && stmt_info->is_started() &&
+         stmt_info->is_trx_read_write() &&
+         thd->get_transaction()->ha_trx_info(Transaction_ctx::SESSION) ==
+             session_info &&
+         thd->get_transaction()->ha_trx_info(Transaction_ctx::STMT) ==
+             stmt_info;
+}
+
+void mysql_binlog_preserve_cleanup_attached_cache_for_unit_test(THD *thd) {
+  if (thd == nullptr || binlog_hton == nullptr || !opt_bin_log) return;
+  binlog_cache_mngr *const manager = thd_get_cache_mngr(thd);
+  if (manager == nullptr) return;
+  Ha_data *const ha_data = thd->get_ha_data(binlog_hton->slot);
+  ha_data->ha_info[Transaction_ctx::SESSION].reset();
+  ha_data->ha_info[Transaction_ctx::STMT].reset();
+  thd->get_transaction()->reset_scope(Transaction_ctx::SESSION);
+  thd->get_transaction()->reset_scope(Transaction_ctx::STMT);
+  thd->server_status &=
+      ~(SERVER_STATUS_IN_TRANS | SERVER_STATUS_IN_TRANS_READONLY);
+  set_preserve_binlog_cache_manager(thd, nullptr);
+  destroy_preserve_binlog_cache_manager(manager);
+}
+#endif
 
 /**
   Checks if the BINLOG_CACHE_SIZE's value is greater than MAX_BINLOG_CACHE_SIZE.
@@ -1375,6 +2218,7 @@ static int binlog_close_connection(handlerton *, THD *thd) {
                        (ulonglong) nullptr));
   thd_set_ha_data(thd, binlog_hton, nullptr);
   cache_mngr->~binlog_cache_mngr();
+  preserve_binlog_release_attached_resources(cache_mngr);
   my_free(cache_mngr);
   return 0;
 }
@@ -1383,6 +2227,8 @@ int binlog_cache_data::write_event(Log_event *ev) {
   DBUG_TRACE;
 
   if (ev != nullptr) {
+    preserve_trx_warmcopy_admit_current_thd_binlog_write(ev->thd);
+
     DBUG_EXECUTE_IF("simulate_disk_full_at_flush_pending",
                     { DBUG_SET("+d,simulate_file_write_error"); });
 
@@ -3016,6 +3862,417 @@ bool is_empty_transaction_in_binlog_cache(const THD *thd) {
   }
 
   return false;
+}
+
+bool mysql_binlog_preserve_no_cache_boundary_is_clean(const THD *thd) {
+  DBUG_TRACE;
+
+  if (thd == nullptr) return false;
+  if (!opt_bin_log || !mysql_bin_log.is_open()) return true;
+
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr) return true;
+
+  return (cache_mngr->is_binlog_empty() || cache_mngr->has_empty_transaction()) &&
+         !cache_mngr->stmt_cache.has_incident() &&
+         !cache_mngr->trx_cache.has_incident() &&
+         !cache_mngr->stmt_cache.is_finalized() &&
+         !cache_mngr->trx_cache.is_finalized() &&
+         !cache_mngr->trx_cache.cannot_rollback() &&
+         cache_mngr->trx_cache.get_prev_position() == MY_OFF_T_UNDEF;
+}
+
+class Preserve_binlog_string_ostream final : public Basic_ostream {
+ public:
+  explicit Preserve_binlog_string_ostream(std::string *out) : m_out(out) {}
+
+  bool write(const unsigned char *buffer, my_off_t length) override {
+    if (m_out == nullptr || length < 0) return true;
+    m_out->append(pointer_cast<const char *>(buffer),
+                  static_cast<size_t>(length));
+    return false;
+  }
+
+ private:
+  std::string *m_out;
+};
+
+static bool mysql_binlog_preserve_export_common(
+    THD *thd, Mysql_binlog_preserve_snapshot *snapshot, bool include_payload) {
+  DBUG_TRACE;
+
+  if (thd == nullptr || snapshot == nullptr) return true;
+  if (!opt_bin_log || !mysql_bin_log.is_open()) return true;
+  if (!(thd->variables.option_bits & OPTION_BIN_LOG)) return true;
+  if (thd->variables.gtid_next.type == ANONYMOUS_GTID) return true;
+  if (thd->variables.gtid_next.type == ASSIGNED_GTID &&
+      thd->owned_gtid_is_empty())
+    return true;
+  if (thd->binlog_flush_pending_rows_event(true)) return true;
+
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr) return true;
+  if (cache_mngr->trx_cache.pending() != nullptr) return true;
+  if (!cache_mngr->stmt_cache.is_binlog_empty()) return true;
+  if (cache_mngr->trx_cache.is_binlog_empty()) return true;
+  if (cache_mngr->trx_cache.get_prev_position() != MY_OFF_T_UNDEF) return true;
+  if (cache_mngr->stmt_cache.has_incident() ||
+      cache_mngr->trx_cache.has_incident() ||
+      cache_mngr->stmt_cache.is_finalized() ||
+      cache_mngr->trx_cache.is_finalized() ||
+      cache_mngr->trx_cache.cannot_rollback()) {
+    return true;
+  }
+
+  Mysql_binlog_preserve_snapshot exported;
+  exported.has_prev_position =
+      cache_mngr->trx_cache.get_prev_position() != MY_OFF_T_UNDEF;
+  if (exported.has_prev_position) {
+    exported.prev_position =
+        static_cast<uint64_t>(cache_mngr->trx_cache.get_prev_position());
+  }
+  char gtid_next_buf[Gtid_specification::MAX_TEXT_LENGTH + 1];
+  thd->variables.gtid_next.to_string(global_sid_map, gtid_next_buf, true);
+  exported.gtid_next.assign(gtid_next_buf);
+  if (thd->owned_gtid.sidno > 0) {
+    char owned_gtid_buf[Gtid::MAX_TEXT_LENGTH + 1];
+    thd->owned_gtid.to_string(global_sid_map, owned_gtid_buf, true);
+    exported.owned_gtid.assign(owned_gtid_buf);
+  } else if (thd->owned_gtid.sidno == THD::OWNED_SIDNO_ANONYMOUS) {
+    return true;
+  }
+  exported.has_compression_session_state = true;
+  exported.binlog_trx_compression = thd->variables.binlog_trx_compression;
+  exported.binlog_trx_compression_type =
+      static_cast<uint32_t>(thd->variables.binlog_trx_compression_type);
+  exported.binlog_trx_compression_level_zstd =
+      thd->variables.binlog_trx_compression_level_zstd;
+  cache_mngr->trx_cache.preserve_export_state(&exported);
+  exported.has_cache_length = true;
+  exported.cache_length =
+      static_cast<uint64_t>(cache_mngr->trx_cache.get_byte_position());
+
+  if (include_payload) {
+    Preserve_binlog_string_ostream ostream(&exported.cache_payload);
+    if (cache_mngr->trx_cache.get_cache()->copy_to(&ostream)) return true;
+    if (exported.cache_payload.empty()) return true;
+  }
+
+  *snapshot = std::move(exported);
+  return false;
+}
+
+bool mysql_binlog_preserve_export(THD *thd,
+                                  Mysql_binlog_preserve_snapshot *snapshot) {
+  return mysql_binlog_preserve_export_common(thd, snapshot, true);
+}
+
+bool mysql_binlog_preserve_export_metadata_only(
+    THD *thd, Mysql_binlog_preserve_snapshot *snapshot) {
+  DBUG_EXECUTE_IF("preserve_trx_fail_warmcopy_export_metadata",
+                  return true;);
+  return mysql_binlog_preserve_export_common(thd, snapshot, false);
+}
+
+
+bool mysql_binlog_warmcopy_source_eligible(THD *thd, bool require_nonempty,
+                                           uint64_t *cache_length,
+                                           bool *has_blob, bool *eligible) {
+  if (cache_length != nullptr) *cache_length = 0;
+  if (has_blob != nullptr) *has_blob = false;
+  if (eligible != nullptr) *eligible = false;
+  if (thd == nullptr) return true;
+  if (!opt_bin_log || !mysql_bin_log.is_open()) return false;
+  if (!(thd->variables.option_bits & OPTION_BIN_LOG)) return false;
+
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr || cache_mngr->trx_cache.pending() != nullptr ||
+      !cache_mngr->stmt_cache.is_binlog_empty() ||
+      cache_mngr->trx_cache.get_prev_position() != MY_OFF_T_UNDEF ||
+      cache_mngr->stmt_cache.has_incident() ||
+      cache_mngr->trx_cache.has_incident() ||
+      cache_mngr->stmt_cache.is_finalized() ||
+      cache_mngr->trx_cache.is_finalized() ||
+      cache_mngr->trx_cache.cannot_rollback()) {
+    return false;
+  }
+
+  const my_off_t length = cache_mngr->trx_cache.get_cache()->length();
+  if (eligible != nullptr) *eligible = true;
+  if (length <= 0) {
+    if (require_nonempty && eligible != nullptr) *eligible = false;
+    return false;
+  }
+  if (cache_length != nullptr) *cache_length = static_cast<uint64_t>(length);
+  if (has_blob != nullptr) *has_blob = true;
+  return false;
+}
+
+bool mysql_binlog_warmcopy_source_install_mirror(
+    THD *thd, Binlog_cache_warmcopy_mirror *mirror, uint64_t *prefix_end,
+    uint64_t *truncate_generation,
+    std::shared_ptr<Binlog_cache_warmcopy_lease> *lease, bool *installed) {
+  if (prefix_end != nullptr) *prefix_end = 0;
+  if (truncate_generation != nullptr) *truncate_generation = 0;
+  if (installed != nullptr) *installed = false;
+  if (thd == nullptr || mirror == nullptr) return true;
+
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr) return true;
+
+  my_off_t source_length = 0;
+  const bool already_has_mirror =
+      cache_mngr->trx_cache.get_cache()->install_warmcopy_mirror_if_absent(
+          mirror, &source_length, truncate_generation, lease);
+  if (already_has_mirror) return false;
+  if (source_length < 0) return true;
+  if (prefix_end != nullptr) *prefix_end = static_cast<uint64_t>(source_length);
+  if (installed != nullptr) *installed = true;
+  return false;
+}
+
+bool mysql_binlog_warmcopy_source_copy_range(
+    THD *thd, uint64_t offset, size_t length, Basic_ostream *ostream,
+    uint64_t expected_truncate_generation, bool *stale_generation) {
+  if (thd == nullptr || ostream == nullptr ||
+      offset > static_cast<uint64_t>(std::numeric_limits<my_off_t>::max())) {
+    return true;
+  }
+
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr) return true;
+  return cache_mngr->trx_cache.get_cache()->copy_range_to(
+      static_cast<my_off_t>(offset), length, ostream,
+      expected_truncate_generation, stale_generation);
+}
+
+bool mysql_binlog_warmcopy_source_truncate_generation(
+    THD *thd, uint64_t *truncate_generation) {
+  if (truncate_generation != nullptr) *truncate_generation = 0;
+  if (thd == nullptr || truncate_generation == nullptr) return true;
+
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr) return true;
+  *truncate_generation =
+      cache_mngr->trx_cache.get_cache()->truncate_generation();
+  return false;
+}
+
+static void discard_binlog_preserve_import_and_reset_scopes(THD *thd) {
+  if (thd == nullptr) return;
+  mysql_binlog_preserve_discard(thd);
+  thd->get_transaction()->reset_scope(Transaction_ctx::SESSION);
+  thd->get_transaction()->reset_scope(Transaction_ctx::STMT);
+  thd->clear_binlog_table_maps();
+}
+
+#ifndef DBUG_OFF
+static bool binlog_preserve_import_scopes_are_clean(THD *thd) {
+  if (thd == nullptr || binlog_hton == nullptr ||
+      binlog_hton->slot == HA_SLOT_UNDEF) {
+    return true;
+  }
+  Ha_data *const ha_data = thd->get_ha_data(binlog_hton->slot);
+  return !ha_data->ha_info[Transaction_ctx::SESSION].is_started() &&
+         !ha_data->ha_info[Transaction_ctx::STMT].is_started() &&
+         thd->get_transaction()->ha_trx_info(Transaction_ctx::SESSION) ==
+             nullptr &&
+         thd->get_transaction()->ha_trx_info(Transaction_ctx::STMT) == nullptr;
+}
+#endif
+
+bool mysql_binlog_preserve_import(
+    THD *thd, const Mysql_binlog_preserve_snapshot &snapshot) {
+  DBUG_TRACE;
+
+  if (thd == nullptr || snapshot.cache_payload.empty()) return true;
+  if (!opt_bin_log || !mysql_bin_log.is_open()) return true;
+  if (!(thd->variables.option_bits & OPTION_BIN_LOG)) return true;
+  const auto saved_binlog_trx_compression =
+      thd->variables.binlog_trx_compression;
+  const auto saved_binlog_trx_compression_type =
+      thd->variables.binlog_trx_compression_type;
+  const auto saved_binlog_trx_compression_level_zstd =
+      thd->variables.binlog_trx_compression_level_zstd;
+  bool keep_imported_compression_state =
+      !snapshot.has_compression_session_state;
+  auto restore_compression_state_on_failure = create_scope_guard([&]() {
+    if (!keep_imported_compression_state) {
+      thd->variables.binlog_trx_compression = saved_binlog_trx_compression;
+      thd->variables.binlog_trx_compression_type =
+          saved_binlog_trx_compression_type;
+      thd->variables.binlog_trx_compression_level_zstd =
+          saved_binlog_trx_compression_level_zstd;
+    }
+  });
+  if (snapshot.has_compression_session_state) {
+    thd->variables.binlog_trx_compression = snapshot.binlog_trx_compression;
+    thd->variables.binlog_trx_compression_type =
+        snapshot.binlog_trx_compression_type;
+    thd->variables.binlog_trx_compression_level_zstd =
+        snapshot.binlog_trx_compression_level_zstd;
+  }
+  if (thd->binlog_setup_trx_data()) return true;
+
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr || !cache_mngr->is_binlog_empty()) return true;
+
+  /*
+    A previous failed RESUME command can leave an empty command-level binlog
+    savepoint after its statement rollback. The imported cache replaces that
+    empty statement state, so normalize it before registering the preserved
+    transaction participants.
+  */
+  cache_mngr->trx_cache.set_prev_position(MY_OFF_T_UNDEF);
+  DBUG_EXECUTE_IF("preserve_trx_assert_binlog_import_scopes_clean",
+                  assert(binlog_preserve_import_scopes_are_clean(thd)););
+  register_binlog_handler(thd, true);
+  DBUG_EXECUTE_IF(
+      "preserve_trx_fail_binlog_import_after_handler_registration",
+      discard_binlog_preserve_import_and_reset_scopes(thd); return true;);
+  Binlog_cache_storage *const trx_cache = cache_mngr->get_trx_cache();
+  if (trx_cache->write(pointer_cast<const unsigned char *>(
+                           snapshot.cache_payload.data()),
+                       static_cast<my_off_t>(snapshot.cache_payload.size()))) {
+    discard_binlog_preserve_import_and_reset_scopes(thd);
+    return true;
+  }
+  cache_mngr->trx_cache.preserve_import_state(snapshot);
+  cache_mngr->trx_cache.preserve_import_prev_position(snapshot);
+  keep_imported_compression_state = true;
+  return false;
+}
+
+bool mysql_binlog_preserve_reactivate_after_prepare_failure(
+    THD *thd, const Mysql_binlog_preserve_snapshot &snapshot) {
+  DBUG_TRACE;
+
+  if (thd == nullptr ||
+      (snapshot.cache_payload.empty() && !snapshot.has_cache_length)) {
+    return true;
+  }
+  if (!opt_bin_log || !mysql_bin_log.is_open()) return true;
+  if (!(thd->variables.option_bits & OPTION_BIN_LOG)) return true;
+  if (binlog_hton == nullptr || binlog_hton->slot == HA_SLOT_UNDEF)
+    return true;
+  const auto saved_binlog_trx_compression =
+      thd->variables.binlog_trx_compression;
+  const auto saved_binlog_trx_compression_type =
+      thd->variables.binlog_trx_compression_type;
+  const auto saved_binlog_trx_compression_level_zstd =
+      thd->variables.binlog_trx_compression_level_zstd;
+  bool keep_imported_compression_state =
+      !snapshot.has_compression_session_state;
+  auto restore_compression_state_on_failure = create_scope_guard([&]() {
+    if (!keep_imported_compression_state) {
+      thd->variables.binlog_trx_compression = saved_binlog_trx_compression;
+      thd->variables.binlog_trx_compression_type =
+          saved_binlog_trx_compression_type;
+      thd->variables.binlog_trx_compression_level_zstd =
+          saved_binlog_trx_compression_level_zstd;
+    }
+  });
+  if (snapshot.has_compression_session_state) {
+    thd->variables.binlog_trx_compression = snapshot.binlog_trx_compression;
+    thd->variables.binlog_trx_compression_type =
+        snapshot.binlog_trx_compression_type;
+    thd->variables.binlog_trx_compression_level_zstd =
+        snapshot.binlog_trx_compression_level_zstd;
+  }
+  if (thd->binlog_setup_trx_data()) return true;
+
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr) return true;
+
+  register_binlog_handler(thd, true);
+  if (!snapshot.cache_payload.empty()) {
+    cache_mngr->trx_cache.reset();
+    Binlog_cache_storage *const trx_cache = cache_mngr->get_trx_cache();
+    if (trx_cache->write(pointer_cast<const unsigned char *>(
+                             snapshot.cache_payload.data()),
+                         static_cast<my_off_t>(snapshot.cache_payload.size()))) {
+      cache_mngr->trx_cache.reset();
+      return true;
+    }
+    cache_mngr->trx_cache.preserve_import_reactivated_transaction_state(
+        snapshot);
+    cache_mngr->trx_cache.preserve_import_prev_position(snapshot);
+  } else {
+    if (cache_mngr->trx_cache.preserve_truncate_to_reactivated_transaction_state(
+            snapshot)) {
+      return true;
+    }
+  }
+  thd->clear_binlog_table_maps();
+
+  Ha_data *const ha_data = thd->get_ha_data(binlog_hton->slot);
+  Ha_trx_info *const session_info =
+      &ha_data->ha_info[Transaction_ctx::SESSION];
+  if (!session_info->is_started())
+    trans_register_ha(thd, true, binlog_hton, nullptr);
+  session_info->set_trx_read_write();
+  ha_data->ha_info[Transaction_ctx::STMT].reset();
+  thd->get_transaction()->reset_scope(Transaction_ctx::STMT);
+  cache_mngr->trx_cache.set_prev_position(MY_OFF_T_UNDEF);
+  keep_imported_compression_state = true;
+  return false;
+}
+
+bool mysql_binlog_preserve_reactivate_after_detach_failure(
+    THD *thd, const Mysql_binlog_preserve_snapshot &snapshot) {
+  DBUG_TRACE;
+
+  if (thd == nullptr) return true;
+  if (binlog_hton != nullptr && binlog_hton->slot != HA_SLOT_UNDEF) {
+    Ha_data *const ha_data = thd->get_ha_data(binlog_hton->slot);
+    ha_data->ha_info[Transaction_ctx::SESSION].reset();
+    ha_data->ha_info[Transaction_ctx::STMT].reset();
+  }
+  thd->get_transaction()->reset_scope(Transaction_ctx::SESSION);
+  thd->get_transaction()->reset_scope(Transaction_ctx::STMT);
+  return mysql_binlog_preserve_reactivate_after_prepare_failure(thd, snapshot);
+}
+
+bool mysql_binlog_preserve_get_cache_state(
+    THD *thd, uint64_t position, Mysql_binlog_preserve_cache_state *state) {
+  DBUG_TRACE;
+
+  if (thd == nullptr || state == nullptr || position == UINT64_MAX)
+    return true;
+  if (!opt_bin_log || !mysql_bin_log.is_open()) return true;
+  if (!(thd->variables.option_bits & OPTION_BIN_LOG)) return true;
+
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr) return true;
+  return cache_mngr->trx_cache.preserve_export_cache_state(
+      static_cast<my_off_t>(position), state);
+}
+
+bool mysql_binlog_preserve_import_cache_state(
+    THD *thd, const Mysql_binlog_preserve_cache_state &state) {
+  DBUG_TRACE;
+
+  if (thd == nullptr || state.position == UINT64_MAX) return true;
+  if (!opt_bin_log || !mysql_bin_log.is_open()) return true;
+  if (!(thd->variables.option_bits & OPTION_BIN_LOG)) return true;
+
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr == nullptr) return true;
+  cache_mngr->trx_cache.preserve_import_cache_state(state);
+  return false;
+}
+
+void mysql_binlog_preserve_discard(THD *thd) {
+  DBUG_TRACE;
+
+  if (thd == nullptr || !opt_bin_log || !mysql_bin_log.is_open()) return;
+  binlog_cache_mngr *const cache_mngr = thd_get_cache_mngr(thd);
+  if (cache_mngr != nullptr) cache_mngr->reset();
+  if (binlog_hton != nullptr && binlog_hton->slot != HA_SLOT_UNDEF) {
+    Ha_data *const ha_data = thd->get_ha_data(binlog_hton->slot);
+    ha_data->ha_info[Transaction_ctx::SESSION].reset();
+    ha_data->ha_info[Transaction_ctx::STMT].reset();
+  }
 }
 
 /**
@@ -11232,6 +12489,7 @@ void binlog_prepare_row_images(const THD *thd, TABLE *table) {
 
 int THD::binlog_flush_pending_rows_event(bool stmt_end, bool is_transactional) {
   DBUG_TRACE;
+  DBUG_EXECUTE_IF("preserve_trx_fail_flush_pending_rows_event", { return 1; });
   /*
     We shall flush the pending event even if we are not in row-based
     mode: it might be the case that we left row-based mode before

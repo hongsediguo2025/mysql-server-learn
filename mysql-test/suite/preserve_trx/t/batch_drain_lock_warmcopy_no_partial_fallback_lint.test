@@ -1,0 +1,196 @@
+--echo # Lint-only source-shape guard for lock warmcopy correctness gates.
+--echo # Runtime table-drift behavior is covered by
+--echo # batch_drain_lock_warmcopy_table_post_prepare_drift.
+
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_source {
+  my (@parts) = @_;
+  my $path = File::Spec->catfile($source_root, @parts);
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $src = do { local $/; <$fh> };
+  close($fh);
+  return $src;
+}
+
+sub extract_function {
+  my ($src, $signature_re, $label) = @_;
+  $src =~ /$signature_re/s or die "could not find $label signature\n";
+  my $sig_pos = $-[0];
+  my $brace_pos = index($src, '{', $sig_pos);
+  die "could not find $label body start\n" if $brace_pos < 0;
+
+  my $depth = 0;
+  for (my $i = $brace_pos; $i < length($src); ++$i) {
+    my $ch = substr($src, $i, 1);
+    ++$depth if $ch eq '{';
+    --$depth if $ch eq '}';
+    if ($depth == 0 && $ch eq '}') {
+      return substr($src, $sig_pos, $i - $sig_pos + 1);
+    }
+  }
+  die "could not parse $label body\n";
+}
+
+my $preserve = read_source('sql', 'preserve_trx.cc');
+my $sys_vars = read_source('sql', 'sys_vars.cc');
+my $bundle_src = read_source('sql', 'preserve_trx_bundle.cc');
+my $innodb_warmcopy = read_source(
+  'storage', 'innobase', 'lock', 'lock0warmcopy.cc');
+my $kernel = extract_function(
+  $preserve,
+  qr/bool\s+preserve_trx_kernel_preserve_attached_transaction\s*\(/,
+  'preserve_trx_kernel_preserve_attached_transaction');
+my $recover = extract_function(
+  $preserve,
+  qr/static\s+bool\s+recover_preserved_snapshot\s*\(/,
+  'recover_preserved_snapshot');
+my $recover_load = extract_function(
+  $preserve,
+  qr/Preserve_snapshot_status\s+preserved_trx_load_bundle_for_recover_or_prewarm\s*\(/,
+  'preserved_trx_load_bundle_for_recover_or_prewarm');
+my $lock_warmcopy = read_source('sql', 'preserve_trx_lock_warmcopy.cc');
+my $prepare_quiesced = extract_function(
+  $lock_warmcopy,
+  qr/bool\s+Preserve_trx_lock_warmcopy_drain_participant::prepare_quiesced_targets\s*\(/,
+  'Preserve_trx_lock_warmcopy_drain_participant::prepare_quiesced_targets');
+my $phase2_preflight = extract_function(
+  $lock_warmcopy,
+  qr/bool\s+Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight\s*\(/,
+  'Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight');
+my $build_phase1_record_blob = extract_function(
+  $lock_warmcopy,
+  qr/bool\s+Preserve_trx_lock_warmcopy_drain_participant::\s*build_phase1_record_blob_for_target\s*\(/,
+  'Preserve_trx_lock_warmcopy_drain_participant::build_phase1_record_blob_for_target');
+my $metadata_seal = extract_function(
+  $innodb_warmcopy,
+  qr/bool\s+lock_warmcopy_record_store_seal_metadata_for_target\s*\(/,
+  'lock_warmcopy_record_store_seal_metadata_for_target');
+
+my $freeze_pos = index($kernel, 'trx_preserve_lock_warmcopy_conversion_freeze');
+my $verify_pos = index($kernel,
+  'preserve_trx_lock_warmcopy_verify_record_final_fence');
+my $prepare_pos = index($kernel, 'ha_prepare_low(thd, true)');
+die "lock warmcopy freeze/final-fence/prepare path is incomplete\n"
+  if $freeze_pos < 0 || $verify_pos < 0 || $prepare_pos < 0;
+die "lock warmcopy artifact final fence compare must happen after conversion freeze\n"
+  if $verify_pos < $freeze_pos;
+die "lock warmcopy artifact final fence compare must happen before ha_prepare_low\n"
+  if $verify_pos > $prepare_pos;
+
+die "lock warmcopy table post-prepare drift must not preserve by swapping only the table payload\n"
+  if $kernel =~
+     /Preserve_trx_lock_warmcopy_reason::TABLE_POST_PREPARE_DRIFT[\s\S]{0,500}metadata\.table_locks_payload\s*=\s*std::move\s*\(\s*prepared_table_locks_payload\s*\)/s;
+die "lock warmcopy table post-prepare drift must be a post-prepare reject, not a live fallback route\n"
+  if $kernel =~
+     /Preserve_trx_lock_warmcopy_reason::TABLE_POST_PREPARE_DRIFT[\s\S]{0,500}preserve_trx_lock_warmcopy_note_route_fallback/s;
+
+die "lock warmcopy quiesced prepare must not unconditionally clear phase1 record seeds\n"
+  if $prepare_quiesced =~
+     /for\s*\(\s*const\s+uint64_t\s+old_thread_id\s*:\s*m_target_thread_ids\s*\)\s*\{\s*lock_warmcopy_record_store_clear_for_target\s*\(\s*old_thread_id\s*\)\s*;\s*\}/s;
+die "lock warmcopy quiesced prepare must carry phase1 record seeded targets into the sampler\n"
+  unless $prepare_quiesced =~ /phase1_record_seeded_targets/s &&
+         $prepare_quiesced =~
+           /Lock_warmcopy_target_fence_sampler[\s\S]{0,300}phase1_record_seeded_targets/s;
+die "lock warmcopy target sampler must skip record live export for phase1 seeded targets\n"
+  unless $lock_warmcopy =~
+         /m_skip_record_export_thread_ids\.count\s*\(\s*thread_id\s*\)\s*==\s*0/s;
+
+die "lock warmcopy record payload must be externalized when building the preserve bundle\n"
+  unless $kernel =~
+         /bundle_input\.externalize_record_locks_payload\s*=\s*use_lock_warmcopy_artifact[\s\S]{0,160}bundle_input\.prebuilt_record_locks_blob\s*==\s*nullptr[\s\S]{0,160}!metadata\.record_locks_payload\.empty\s*\(\s*\)/s;
+die "lock warmcopy prebuilt record blob must be passed into the preserve bundle\n"
+  unless $kernel =~
+         /lock_warmcopy_artifact->has_prebuilt_record_locks_blob[\s\S]{0,180}bundle_input\.prebuilt_record_locks_blob\s*=[\s\S]{0,120}&lock_warmcopy_artifact->prebuilt_record_locks_blob/s;
+die "lock warmcopy record external payload must use the lock-warmcopy artifact budget\n"
+  unless $kernel =~
+         /bundle_input\.options\.max_record_locks_external_blob_bytes\s*=\s*preserve_trx_lock_warmcopy_max_journal_bytes/s;
+die "lock warmcopy phase2 prebuilt record artifacts must use metadata-only seal\n"
+  unless $phase2_preflight =~ /has_phase1_record_prebuilt_blob/s &&
+         $phase2_preflight =~ /lock_warmcopy_record_store_seal_metadata_for_target/s &&
+         $phase2_preflight =~ /lock_warmcopy_record_store_seal_for_target/s;
+die "lock warmcopy phase2 record seal must use a bounded worker pool when seal_threads allows it\n"
+  unless $phase2_preflight =~ /effective_lock_warmcopy_seal_thread_count/s &&
+         $phase2_preflight =~ /std::atomic\s*<\s*size_t\s*>\s+next_target_index/s &&
+         $phase2_preflight =~ /std::vector\s*<\s*std::thread\s*>\s+workers/s &&
+         $phase2_preflight =~ /record_seal_results\s*\[\s*target_index\s*\]/s;
+die "lock warmcopy seal_threads sysvar must describe the active worker pool, not a reserved serial setting\n"
+  if $sys_vars =~ /implementation seals targets serially|keep this at 0/s;
+die "lock warmcopy phase1 prebuilt record blob must be bound to a store fence\n"
+  unless $build_phase1_record_blob =~
+           /lock_warmcopy_record_store_fence_for_target\s*\(\s*thread_id\s*,\s*&prebuilt_fence\s*\)/s &&
+         $build_phase1_record_blob =~
+           /target->phase1_record_prebuilt_fence\s*=\s*prebuilt_fence/s &&
+         $build_phase1_record_blob =~
+           /target->phase1_record_prebuilt_fence_valid\s*=\s*true/s;
+die "lock warmcopy phase2 must reject stale phase1 prebuilt record blobs\n"
+  unless $phase2_preflight =~
+           /target->phase1_record_prebuilt_fence_valid/s &&
+         $phase2_preflight =~
+           /lock_warmcopy_record_store_fence_equal\s*\(\s*target->phase1_record_prebuilt_fence\s*,\s*target->phase1_record_fence\s*\)/s &&
+         $phase2_preflight =~
+           /use_prebuilt_record_blob[\s\S]{0,260}lock_warmcopy_record_store_seal_metadata_for_target/s;
+die "metadata-only record seal must not materialize record payload\n"
+  unless $metadata_seal =~
+         /result->record_lock_count\s*=\s*expected_record_lock_count/s &&
+         $metadata_seal !~ /export_record_payload_from_store_locked/s &&
+         $metadata_seal !~ /record_locks_payload/s &&
+         $metadata_seal !~ /materialized_payload_bytes/s;
+die "record warmcopy store must be target-partitioned, not guarded by one global mutex\n"
+  unless $innodb_warmcopy =~
+           /k_lock_warmcopy_record_store_partition_count/s &&
+         $innodb_warmcopy =~
+           /std::array\s*<\s*lock_warmcopy_record_store_partition_t/s &&
+         $innodb_warmcopy !~ /lock_warmcopy_record_store_mutex/s;
+die "externalized record-lock payload must be removed from inline record-lock TLV\n"
+  unless $bundle_src =~
+         /return\s+tlv\.tag\s*==\s*kTlvRecordLocks/s &&
+         $bundle_src =~ /kPreservedTrxBlobRecordLocks/s &&
+         $bundle_src =~
+           /max_record_locks_external_blob_bytes/s;
+die "startup recovery must hydrate external record-lock blobs before importing lock semantics\n"
+  unless $recover =~
+         /preserved_trx_load_bundle_for_recover_or_prewarm\s*\([\s\S]{0,240}Preserved_trx_recover_load_profile::\s*WITH_SEMANTIC_EXTERNAL_BLOBS/s &&
+         $recover_load =~
+         /Preserved_trx_carrier::Payload_read_mode::\s*WITH_SEMANTIC_EXTERNAL_BLOBS/s &&
+         $recover_load =~ /store->read\s*\(\s*token\s*,\s*true\s*,\s*read_mode\s*,\s*bundle\s*\)/s &&
+         $preserve =~
+         /static bool preserved_trx_recover_or_adopt_bundle_shared[\s\S]*trx_preserve_import_record_locks\s*\(\s*trx\s*,\s*metadata\.record_locks_payload\s*,[\s\S]{0,260}&result->phase_metrics\.record_lock_import/s;
+die "warmcopy phase2 metrics must expose record prebuilt/materialized target counts\n"
+  unless $preserve =~ /phase1_record_prebuilt_target_count/s &&
+         $preserve =~ /phase2_record_prebuilt_target_count/s &&
+         $preserve =~ /phase2_record_materialized_target_count/s;
+die "warmcopy phase2 metrics must expose lock seal time and seal worker count\n"
+  unless $preserve =~ /phase2_lock_seal_us/s &&
+         $preserve =~ /phase2_seal_worker_count/s &&
+         $preserve =~ /preserve_trx_phase2_lock_seal_us_status/s;
+die "lock warmcopy must perform a late idle phase1 sweep before WARMCOPY_CLOSING\n"
+  unless $preserve =~ /prepare_lock_warmcopy_idle_targets/s &&
+         $preserve =~ /lock_warmcopy_late_phase1_prepare_rejected/s &&
+         index($preserve, 'lock_warmcopy_late_phase1_prepare_rejected') <
+         index($preserve, 'draining.transition_to(Preserve_trx_manager_state::WARMCOPY_CLOSING)');
+die "lock warmcopy must scan active record targets before WARMCOPY_CLOSING\n"
+  unless $preserve =~ /prepare_lock_warmcopy_active_record_targets/s &&
+         $preserve =~ /lock_warmcopy_late_phase1_active_record_scan_rejected/s &&
+         index($preserve, 'lock_warmcopy_late_phase1_active_record_scan_rejected') <
+         index($preserve, 'draining.transition_to(Preserve_trx_manager_state::WARMCOPY_CLOSING)');
+die "lock warmcopy active phase1 record scan must be observable in metrics\n"
+  unless $preserve =~ /preserve_trx_lock_warmcopy_after_active_record_scan/s &&
+         $preserve =~ /phase1_record_active_scan_target_count/s;
+die "lock warmcopy must prepare hook-built record stores before WARMCOPY_CLOSING\n"
+  unless $preserve =~ /prepare_phase1_record_store_targets/s &&
+         $preserve =~ /lock_warmcopy_phase1_store_prepare_rejected/s &&
+         index($preserve, 'prepare_phase1_record_store_targets') <
+         index($preserve, 'draining.transition_to(Preserve_trx_manager_state::WARMCOPY_CLOSING)');
+
+EOF
+
+SELECT 'ok' AS batch_drain_lock_warmcopy_no_partial_fallback_lint;

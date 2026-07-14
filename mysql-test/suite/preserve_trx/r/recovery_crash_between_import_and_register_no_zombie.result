@@ -1,0 +1,30 @@
+DROP TABLE IF EXISTS t_recover_import_register_crash;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_recover_import_register_crash(
+a INT PRIMARY KEY,
+b INT
+) ENGINE=InnoDB;
+INSERT INTO t_recover_import_register_crash VALUES(1,10),(2,20);
+START TRANSACTION;
+SELECT * FROM t_recover_import_register_crash WHERE a=1 FOR UPDATE;
+a	b
+1	10
+UPDATE t_recover_import_register_crash SET b=21 WHERE a=2;
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+# restart_abort: --preserve-trx-enable=ON --debug=d,preserve_trx_crash_after_recover_import_before_register
+include/wait_for_pattern_in_file.inc [Preserved transaction recovery reached post-import pre-register crash point]
+include/wait_for_expected_crash.inc [safe_process]
+SELECT COUNT(*) AS recovered_count
+FROM performance_schema.preserved_transactions;
+recovered_count
+0
+SELECT COUNT(*) AS remaining_preserved
+FROM performance_schema.preserved_transactions;
+remaining_preserved
+0
+SELECT * FROM t_recover_import_register_crash ORDER BY a;
+a	b
+1	10
+2	20
+DROP TABLE t_recover_import_register_crash;
+SET GLOBAL preserve_trx_enable=ON;

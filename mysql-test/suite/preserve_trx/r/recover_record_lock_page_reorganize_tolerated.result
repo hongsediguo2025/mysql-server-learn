@@ -1,0 +1,40 @@
+DROP TABLE IF EXISTS t_recover_record_lock_page_reorg;
+SET GLOBAL preserve_trx_enable=ON;
+CREATE TABLE t_recover_record_lock_page_reorg(
+id INT PRIMARY KEY,
+v INT,
+pad VARCHAR(200)
+) ENGINE=InnoDB;
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+START TRANSACTION;
+UPDATE t_recover_record_lock_page_reorg SET v=30001 WHERE id=30;
+SELECT id, v, CHAR_LENGTH(pad) AS pad_len
+FROM t_recover_record_lock_page_reorg WHERE id=30;
+id	v	pad_len
+30	30001	180
+PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+SET SESSION debug='+d,do_page_reorganize';
+INSERT INTO t_recover_record_lock_page_reorg VALUES(1000,1000,'trigger');
+SET SESSION debug='-d,do_page_reorganize';
+# restart: --preserve-trx-enable=ON
+SELECT COUNT(*) AS preserved_count_after_page_reorganize
+FROM performance_schema.preserved_transactions;
+preserved_count_after_page_reorganize
+1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+COMMIT;
+SELECT id, v, CHAR_LENGTH(pad) AS pad_len
+FROM t_recover_record_lock_page_reorg
+WHERE id IN (1,20,30,1000)
+ORDER BY id;
+id	v	pad_len
+1	10	10
+20	200	10
+30	30001	180
+1000	1000	7
+SELECT COUNT(*) AS remaining_preserved
+FROM performance_schema.preserved_transactions;
+remaining_preserved
+0
+DROP TABLE t_recover_record_lock_page_reorg;
+SET GLOBAL preserve_trx_enable=ON;
