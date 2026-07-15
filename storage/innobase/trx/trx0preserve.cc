@@ -33,6 +33,9 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <limits>
+#include <map>
+#include <mutex>
 
 #include "log0log.h"
 #include "lock0lock.h"
@@ -40,9 +43,11 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "my_dbug.h"
 #include "read0read.h"
 #include "sess0sess.h"
+#include "srv0srv.h"
 #include "sql/handler.h"
 #include "sql/mysqld.h"
 #include "sql/preserve_trx.h"
+#include "sql/preserve_trx_promotion_prepared.h"
 #include "sql/sql_class.h"
 #include "sql/transaction_info.h"
 #include "storage/innobase/handler/ha_innodb.h"
@@ -137,6 +142,63 @@ trx_t *trx_preserve_current_thd_trx(THD *thd) {
 uint64_t trx_preserve_current_redo_lsn() {
   if (log_sys == nullptr) return 0;
   return static_cast<uint64_t>(log_get_lsn(*log_sys));
+}
+
+bool trx_preserve_validate_trx_id_store_fact(uint64_t store_value,
+                                             uint64_t redo_commit_lsn,
+                                             uint64_t safe_next_floor,
+                                             uint64_t source_fence_lsn) {
+  constexpr uint64_t margin = TRX_SYS_TRX_ID_WRITE_MARGIN;
+  if (store_value == 0 || redo_commit_lsn == 0 || source_fence_lsn == 0 ||
+      redo_commit_lsn > source_fence_lsn ||
+      store_value > std::numeric_limits<uint64_t>::max() - (margin - 1)) {
+    return false;
+  }
+  const uint64_t aligned_store =
+      ((store_value + margin - 1) / margin) * margin;
+  return aligned_store <=
+             std::numeric_limits<uint64_t>::max() - 2 * margin &&
+         safe_next_floor == aligned_store + 2 * margin;
+}
+
+dberr_t trx_preserve_capture_durable_trx_id_store_fact(
+    trx_preserve_trx_id_store_fact_t *fact) {
+  if (fact == nullptr || trx_sys == nullptr || log_sys == nullptr ||
+      srv_read_only_mode || !mtr_t::s_logging.is_enabled()) {
+    return DB_UNSUPPORTED;
+  }
+
+  trx_preserve_trx_id_store_fact_t captured;
+  trx_sys_mutex_enter();
+  captured.store_value = static_cast<uint64_t>(trx_sys->max_trx_id);
+  mtr_t mtr;
+  mtr.start();
+  trx_sysf_t *sys_header = trx_sysf_get(&mtr);
+  mlog_write_ull(sys_header + TRX_SYS_TRX_ID_STORE,
+                 captured.store_value, &mtr);
+  mtr.commit();
+  captured.redo_commit_lsn = static_cast<uint64_t>(mtr.commit_lsn());
+  trx_sys_mutex_exit();
+
+  constexpr uint64_t margin = TRX_SYS_TRX_ID_WRITE_MARGIN;
+  if (captured.store_value >
+      std::numeric_limits<uint64_t>::max() - (margin - 1)) {
+    return DB_ERROR;
+  }
+  const uint64_t aligned_store =
+      ((captured.store_value + margin - 1) / margin) * margin;
+  if (aligned_store > std::numeric_limits<uint64_t>::max() - 2 * margin)
+    return DB_ERROR;
+  captured.safe_next_floor = aligned_store + 2 * margin;
+  if (!trx_preserve_validate_trx_id_store_fact(
+          captured.store_value, captured.redo_commit_lsn,
+          captured.safe_next_floor, captured.redo_commit_lsn)) {
+    return DB_ERROR;
+  }
+
+  log_write_up_to(*log_sys, captured.redo_commit_lsn, true);
+  *fact = captured;
+  return DB_SUCCESS;
 }
 
 static void trx_preserve_append_le32(std::string *payload, uint32_t value) {
@@ -321,6 +383,7 @@ trx_t *trx_preserve_claim_prepared(const XID &xid) {
   if (!xid_is_preserve_magic(xid)) {
     return nullptr;
   }
+  DBUG_EXECUTE_IF("preserve_trx_fail_xid_lookup_claim", return nullptr;);
 
   trx_t *claimed = nullptr;
 
@@ -367,12 +430,15 @@ bool trx_preserve_probe_detached_prepared(const XID &xid) {
   return found;
 }
 
-dberr_t trx_preserve_claim_detached_prepared(trx_t *trx) {
+static dberr_t trx_preserve_claim_detached_prepared_low(
+    trx_t *trx, const XID *expected_xid) {
   dberr_t err;
 
   trx_sys_mutex_enter();
   if (trx == nullptr || trx->mysql_thd != nullptr ||
-      trx->preserve_trx_claimed || !trx_state_eq(trx, TRX_STATE_PREPARED)) {
+      trx->preserve_trx_claimed || !trx_state_eq(trx, TRX_STATE_PREPARED) ||
+      trx->xid == nullptr ||
+      (expected_xid != nullptr && !expected_xid->eq(trx->xid))) {
     err = DB_ERROR;
   } else if (trx_preserve_mark_preserved(trx) != DB_SUCCESS) {
     err = DB_ERROR;
@@ -383,6 +449,16 @@ dberr_t trx_preserve_claim_detached_prepared(trx_t *trx) {
   trx_sys_mutex_exit();
 
   return err;
+}
+
+dberr_t trx_preserve_claim_detached_prepared(trx_t *trx) {
+  return trx_preserve_claim_detached_prepared_low(trx, nullptr);
+}
+
+dberr_t trx_preserve_claim_detached_prepared_exact(
+    trx_t *trx, const XID &expected_xid) {
+  if (!xid_is_preserve_magic(expected_xid)) return DB_ERROR;
+  return trx_preserve_claim_detached_prepared_low(trx, &expected_xid);
 }
 
 dberr_t trx_preserve_rollback_by_token(const char *token) {
@@ -1187,6 +1263,642 @@ dberr_t trx_preserve_export_modified_table_names(
   trx_t *trx = thd_to_trx(thd);
   return trx_preserve_export_modified_table_names(trx, tables,
                                                  max_modified_tables);
+}
+
+dberr_t trx_preserve_export_resurrection_facts(
+    trx_t *trx, uint32_t max_modified_tables,
+    trx_preserve_resurrection_facts *facts) {
+  if (trx == nullptr || facts == nullptr || trx->xid == nullptr ||
+      trx->state != TRX_STATE_PREPARED || trx->preserve_prepare_lsn == 0 ||
+      trx->id == 0 || trx->rsegs.m_redo.rseg == nullptr ||
+      (trx->rsegs.m_redo.insert_undo == nullptr &&
+       trx->rsegs.m_redo.update_undo == nullptr) ||
+      trx->rsegs.m_noredo.insert_undo != nullptr ||
+      trx->rsegs.m_noredo.update_undo != nullptr ||
+      trx->mod_tables.size() > max_modified_tables) {
+    return DB_UNSUPPORTED;
+  }
+
+  trx_preserve_resurrection_facts exported;
+  exported.trx_id = trx->id;
+  exported.prepare_lsn = trx->preserve_prepare_lsn;
+  exported.xid = *trx->xid;
+
+  const auto add_anchor = [&](const trx_undo_t *undo,
+                              trx_preserve_resurrection_undo_kind kind) {
+    if (undo == nullptr) return;
+    exported.undo_anchors.push_back(
+        {kind, static_cast<uint32_t>(undo->space),
+         static_cast<uint32_t>(undo->id),
+         static_cast<uint32_t>(undo->hdr_page_no),
+         static_cast<uint32_t>(undo->hdr_offset),
+         static_cast<uint32_t>(undo->top_page_no),
+         static_cast<uint32_t>(undo->top_offset),
+         static_cast<uint64_t>(undo->top_undo_no), undo->empty != 0});
+  };
+  add_anchor(trx->rsegs.m_redo.insert_undo,
+             trx_preserve_resurrection_undo_kind::INSERT);
+  add_anchor(trx->rsegs.m_redo.update_undo,
+             trx_preserve_resurrection_undo_kind::UPDATE);
+  if (exported.undo_anchors.empty()) return DB_UNSUPPORTED;
+
+  exported.modified_table_ids.reserve(trx->mod_tables.size());
+  for (const dict_table_t *table : trx->mod_tables) {
+    if (table == nullptr || table->id == 0) return DB_ERROR;
+    exported.modified_table_ids.push_back(static_cast<uint64_t>(table->id));
+  }
+  std::sort(exported.modified_table_ids.begin(),
+            exported.modified_table_ids.end());
+  if (std::adjacent_find(exported.modified_table_ids.begin(),
+                         exported.modified_table_ids.end()) !=
+      exported.modified_table_ids.end()) {
+    return DB_ERROR;
+  }
+
+  *facts = std::move(exported);
+  return DB_SUCCESS;
+}
+
+namespace {
+
+std::mutex trx_preserve_startup_resurrection_mutex;
+std::map<uint64_t, trx_preserve_resurrection_facts>
+    trx_preserve_startup_resurrection_candidates;
+/* Valid only between trx_sys startup resurrection and completion of
+preserved_trx_recover_all(), before recovered PREPARED transactions can be
+freed by normal server work. */
+std::map<std::string, trx_t *> trx_preserve_startup_resurrection_verified;
+std::atomic_bool trx_preserve_startup_resurrection_metrics_enabled{false};
+std::atomic<uint64_t> trx_preserve_startup_resurrection_candidates_count{0};
+std::atomic<uint64_t> trx_preserve_startup_resurrection_index_hits{0};
+std::atomic<uint64_t> trx_preserve_startup_resurrection_fallbacks{0};
+std::atomic<uint64_t> trx_preserve_startup_resurrection_anchor_checks{0};
+std::atomic<uint64_t> trx_preserve_startup_resurrection_undo_body_pages{0};
+std::atomic<uint64_t> trx_preserve_startup_resurrection_undo_body_records{0};
+
+bool trx_preserve_resurrection_anchor_equal(
+    const trx_preserve_resurrection_undo_anchor &left,
+    const trx_preserve_resurrection_undo_anchor &right) {
+  return left.kind == right.kind &&
+         left.rseg_space_id == right.rseg_space_id &&
+         left.undo_slot == right.undo_slot &&
+         left.hdr_page_no == right.hdr_page_no &&
+         left.hdr_offset == right.hdr_offset &&
+         left.top_page_no == right.top_page_no &&
+         left.top_offset == right.top_offset &&
+         left.top_undo_no == right.top_undo_no && left.empty == right.empty;
+}
+
+bool trx_preserve_resurrection_xid_token(const XID &xid,
+                                         std::string *token) {
+  if (token == nullptr || !xid_is_preserve_magic(xid)) return false;
+  token->assign(
+      xid.get_data() + static_cast<size_t>(PRESERVE_TRX_XID_GTRID_LENGTH),
+      static_cast<size_t>(xid.get_bqual_length()));
+  return !token->empty();
+}
+
+bool trx_preserve_resurrection_facts_valid(
+    const trx_preserve_resurrection_facts &facts) {
+  if (facts.trx_id == 0 || facts.prepare_lsn == 0 ||
+      facts.xid.get_format_id() == -1 || facts.xid.get_gtrid_length() <= 0 ||
+      facts.xid.get_gtrid_length() > 64 || facts.xid.get_bqual_length() < 0 ||
+      facts.xid.get_bqual_length() > 64 || facts.undo_anchors.empty() ||
+      facts.undo_anchors.size() > 2) {
+    return false;
+  }
+  bool has_insert = false;
+  bool has_update = false;
+  for (const trx_preserve_resurrection_undo_anchor &anchor :
+       facts.undo_anchors) {
+    if (anchor.hdr_page_no == 0 || anchor.top_page_no == 0) return false;
+    if (anchor.kind == trx_preserve_resurrection_undo_kind::INSERT) {
+      if (has_insert) return false;
+      has_insert = true;
+    } else if (anchor.kind == trx_preserve_resurrection_undo_kind::UPDATE) {
+      if (has_update) return false;
+      has_update = true;
+    } else {
+      return false;
+    }
+  }
+  uint64_t previous = 0;
+  for (uint64_t table_id : facts.modified_table_ids) {
+    if (table_id == 0 || table_id <= previous) return false;
+    previous = table_id;
+  }
+  return true;
+}
+
+void trx_preserve_add_startup_anchor(
+    const trx_undo_t *undo, trx_preserve_resurrection_undo_kind kind,
+    std::vector<trx_preserve_resurrection_undo_anchor> *anchors) {
+  if (undo == nullptr || anchors == nullptr) return;
+  anchors->push_back(
+      {kind, static_cast<uint32_t>(undo->space),
+       static_cast<uint32_t>(undo->id),
+       static_cast<uint32_t>(undo->hdr_page_no),
+       static_cast<uint32_t>(undo->hdr_offset),
+       static_cast<uint32_t>(undo->top_page_no),
+       static_cast<uint32_t>(undo->top_offset),
+       static_cast<uint64_t>(undo->top_undo_no), undo->empty != 0});
+}
+
+}  // namespace
+
+void trx_preserve_startup_resurrection_reset() {
+  std::lock_guard<std::mutex> guard(trx_preserve_startup_resurrection_mutex);
+  trx_preserve_startup_resurrection_candidates.clear();
+  trx_preserve_startup_resurrection_verified.clear();
+  trx_preserve_startup_resurrection_candidates_count.store(
+      0, std::memory_order_release);
+  trx_preserve_startup_resurrection_index_hits.store(0,
+                                                      std::memory_order_release);
+  trx_preserve_startup_resurrection_fallbacks.store(0,
+                                                     std::memory_order_release);
+  trx_preserve_startup_resurrection_anchor_checks.store(
+      0, std::memory_order_release);
+  trx_preserve_startup_resurrection_undo_body_pages.store(
+      0, std::memory_order_release);
+  trx_preserve_startup_resurrection_undo_body_records.store(
+      0, std::memory_order_release);
+  trx_preserve_startup_resurrection_metrics_enabled.store(
+      true, std::memory_order_release);
+}
+
+dberr_t trx_preserve_startup_register_resurrection_candidate(
+    const trx_preserve_resurrection_facts &facts) {
+  if (!trx_preserve_resurrection_facts_valid(facts)) return DB_ERROR;
+  std::lock_guard<std::mutex> guard(trx_preserve_startup_resurrection_mutex);
+  if (!trx_preserve_startup_resurrection_candidates.emplace(facts.trx_id,
+                                                             facts)
+           .second) {
+    return DB_ERROR;
+  }
+  trx_preserve_startup_resurrection_candidates_count.fetch_add(
+      1, std::memory_order_relaxed);
+  return DB_SUCCESS;
+}
+
+bool trx_preserve_startup_resurrection_is_candidate(uint64_t trx_id) {
+  if (trx_id == 0) return false;
+  std::lock_guard<std::mutex> guard(trx_preserve_startup_resurrection_mutex);
+  return trx_preserve_startup_resurrection_candidates.find(trx_id) !=
+         trx_preserve_startup_resurrection_candidates.end();
+}
+
+trx_preserve_startup_resurrection_result
+trx_preserve_startup_validate_resurrection_candidate(
+    const trx_preserve_resurrection_facts &actual,
+    std::vector<uint64_t> *modified_table_ids, trx_t *verified_trx) {
+  if (modified_table_ids == nullptr) {
+    return trx_preserve_startup_resurrection_result::FALLBACK;
+  }
+  modified_table_ids->clear();
+
+  trx_preserve_resurrection_facts expected;
+  {
+    std::lock_guard<std::mutex> guard(trx_preserve_startup_resurrection_mutex);
+    auto candidate =
+        trx_preserve_startup_resurrection_candidates.find(actual.trx_id);
+    if (candidate == trx_preserve_startup_resurrection_candidates.end()) {
+      return trx_preserve_startup_resurrection_result::NOT_CANDIDATE;
+    }
+    expected = std::move(candidate->second);
+    trx_preserve_startup_resurrection_candidates.erase(candidate);
+  }
+
+  bool anchors_match =
+      expected.undo_anchors.size() == actual.undo_anchors.size();
+  for (const trx_preserve_resurrection_undo_anchor &expected_anchor :
+       expected.undo_anchors) {
+    trx_preserve_startup_resurrection_anchor_checks.fetch_add(
+        1, std::memory_order_relaxed);
+    auto actual_anchor = std::find_if(
+        actual.undo_anchors.begin(), actual.undo_anchors.end(),
+        [&](const trx_preserve_resurrection_undo_anchor &anchor) {
+          return anchor.kind == expected_anchor.kind;
+        });
+    if (actual_anchor == actual.undo_anchors.end() ||
+        !trx_preserve_resurrection_anchor_equal(expected_anchor,
+                                                *actual_anchor)) {
+      anchors_match = false;
+    }
+  }
+  const bool matches =
+      trx_preserve_resurrection_facts_valid(actual) &&
+      actual.prepare_lsn == expected.prepare_lsn &&
+      actual.xid.eq(&expected.xid) && anchors_match;
+  if (!matches) {
+    trx_preserve_startup_resurrection_fallbacks.fetch_add(
+        1, std::memory_order_relaxed);
+    return trx_preserve_startup_resurrection_result::FALLBACK;
+  }
+  if (verified_trx != nullptr) {
+    std::string token;
+    std::lock_guard<std::mutex> guard(trx_preserve_startup_resurrection_mutex);
+    if (!trx_preserve_resurrection_xid_token(expected.xid, &token) ||
+        !trx_preserve_startup_resurrection_verified
+             .emplace(std::move(token), verified_trx)
+             .second) {
+      trx_preserve_startup_resurrection_fallbacks.fetch_add(
+          1, std::memory_order_relaxed);
+      return trx_preserve_startup_resurrection_result::FALLBACK;
+    }
+  }
+  *modified_table_ids = expected.modified_table_ids;
+  trx_preserve_startup_resurrection_index_hits.fetch_add(
+      1, std::memory_order_relaxed);
+  return trx_preserve_startup_resurrection_result::INDEXED;
+}
+
+trx_preserve_startup_resurrection_result
+trx_preserve_startup_apply_resurrection_candidate(
+    trx_t *trx, std::vector<uint64_t> *modified_table_ids) {
+  if (trx == nullptr || trx->xid == nullptr || modified_table_ids == nullptr) {
+    return trx_preserve_startup_resurrection_result::FALLBACK;
+  }
+  uint64_t prepare_lsn = 0;
+  {
+    std::lock_guard<std::mutex> guard(trx_preserve_startup_resurrection_mutex);
+    auto candidate =
+        trx_preserve_startup_resurrection_candidates.find(trx->id);
+    if (candidate == trx_preserve_startup_resurrection_candidates.end()) {
+      return trx_preserve_startup_resurrection_result::NOT_CANDIDATE;
+    }
+    prepare_lsn = candidate->second.prepare_lsn;
+  }
+
+  trx_preserve_resurrection_facts actual;
+  actual.trx_id = trx->id;
+  actual.prepare_lsn = prepare_lsn;
+  actual.xid = *trx->xid;
+  trx_preserve_add_startup_anchor(
+      trx->rsegs.m_redo.insert_undo,
+      trx_preserve_resurrection_undo_kind::INSERT, &actual.undo_anchors);
+  trx_preserve_add_startup_anchor(
+      trx->rsegs.m_redo.update_undo,
+      trx_preserve_resurrection_undo_kind::UPDATE, &actual.undo_anchors);
+  const trx_preserve_startup_resurrection_result result =
+      trx_preserve_startup_validate_resurrection_candidate(
+          actual, modified_table_ids, trx);
+  if (result == trx_preserve_startup_resurrection_result::INDEXED) {
+    trx->preserve_prepare_lsn = prepare_lsn;
+  }
+  return result;
+}
+
+trx_t *trx_preserve_startup_resurrection_find_verified(const XID &xid) {
+  std::string token;
+  if (!trx_preserve_resurrection_xid_token(xid, &token)) return nullptr;
+  std::lock_guard<std::mutex> guard(trx_preserve_startup_resurrection_mutex);
+  const auto found = trx_preserve_startup_resurrection_verified.find(token);
+  return found == trx_preserve_startup_resurrection_verified.end()
+             ? nullptr
+             : found->second;
+}
+
+void trx_preserve_startup_resurrection_clear_verified() {
+  std::lock_guard<std::mutex> guard(trx_preserve_startup_resurrection_mutex);
+  trx_preserve_startup_resurrection_verified.clear();
+}
+
+namespace {
+
+bool trx_preserve_targeted_publication_candidate_valid(
+    const Preserve_trx_targeted_publication_capability &capability,
+    const Preserve_trx_prepared_token_key &key,
+    const trx_preserve_targeted_publication_candidate &candidate) {
+  std::string token;
+  return capability.valid_for(key) &&
+         trx_preserve_resurrection_xid_token(candidate.xid, &token) &&
+         token == key.token && candidate.trx_id != 0 &&
+         candidate.trx_id < TRX_ID_MAX && candidate.prepare_lsn != 0 &&
+         candidate.prepare_lsn <= capability.source_fence_lsn() &&
+         candidate.safe_next_trx_id_floor > candidate.trx_id &&
+         candidate.safe_next_trx_id_floor <= TRX_ID_MAX;
+}
+
+bool trx_preserve_targeted_publication_existing_matches(
+    const trx_t *trx,
+    const trx_preserve_targeted_publication_candidate &candidate) {
+  return trx != nullptr && trx->xid != nullptr &&
+         trx->id == candidate.trx_id && candidate.xid.eq(trx->xid) &&
+         trx_state_eq(trx, TRX_STATE_PREPARED) &&
+         trx->mysql_thd == nullptr && !trx->preserve_trx_claimed &&
+         trx->is_recovered &&
+         trx->preserve_prepare_lsn == candidate.prepare_lsn &&
+         trx->rsegs.m_redo.rseg != nullptr &&
+         trx->rsegs.m_redo.insert_undo == nullptr &&
+         trx->rsegs.m_redo.update_undo == nullptr &&
+         trx->rsegs.m_noredo.insert_undo == nullptr &&
+         trx->rsegs.m_noredo.update_undo == nullptr;
+}
+
+trx_t *trx_preserve_targeted_publication_find_conflict_locked(
+    const trx_preserve_targeted_publication_candidate &candidate,
+    bool *conflict) {
+  ut_ad(trx_sys_mutex_own());
+  ut_ad(conflict != nullptr);
+  *conflict = false;
+  for (trx_t *trx = UT_LIST_GET_FIRST(trx_sys->rw_trx_list); trx != nullptr;
+       trx = UT_LIST_GET_NEXT(trx_list, trx)) {
+    const bool id_matches = trx->id == candidate.trx_id;
+    const bool xid_matches = trx->xid != nullptr && candidate.xid.eq(trx->xid);
+    if (!id_matches && !xid_matches) continue;
+    if (id_matches && xid_matches &&
+        trx_preserve_targeted_publication_existing_matches(trx, candidate)) {
+      return trx;
+    }
+    *conflict = true;
+    return nullptr;
+  }
+  return nullptr;
+}
+
+void trx_preserve_targeted_publication_discard_unpublished(trx_t *trx) {
+  if (trx == nullptr) return;
+  if (trx->rsegs.m_redo.rseg != nullptr) {
+    ut_ad(trx->rsegs.m_redo.rseg->trx_ref_count > 0);
+    --trx->rsegs.m_redo.rseg->trx_ref_count;
+    trx->rsegs.m_redo.rseg = nullptr;
+  }
+  trx->xid->reset();
+  trx->preserve_prepare_lsn = 0;
+  trx->is_recovered = false;
+  trx_free_resurrected(trx);
+}
+
+bool trx_preserve_targeted_publication_journal_matches(
+    const Preserve_trx_prepared_token_key &key,
+    const trx_preserve_targeted_publication_journal &journal) {
+  std::string token;
+  return journal.active && journal.trx != nullptr && journal.trx_id != 0 &&
+         journal.generation == key.generation &&
+         journal.origin != trx_preserve_targeted_publication_origin::NONE &&
+         trx_preserve_resurrection_xid_token(journal.xid, &token) &&
+         token == key.token;
+}
+
+}  // namespace
+
+trx_preserve_targeted_publication_status
+trx_preserve_publish_simulated_prepared(
+    const Preserve_trx_targeted_publication_capability &capability,
+    const Preserve_trx_prepared_token_key &key,
+    const trx_preserve_targeted_publication_candidate &candidate,
+    trx_preserve_targeted_publication_journal *journal) {
+  if (!capability.valid_for(key)) {
+    return trx_preserve_targeted_publication_status::CAPABILITY_REJECTED;
+  }
+  if (journal == nullptr || journal->active ||
+      !trx_preserve_targeted_publication_candidate_valid(capability, key,
+                                                         candidate)) {
+    return trx_preserve_targeted_publication_status::INVALID_ARGUMENT;
+  }
+  if (!trx_preserve_feature_enabled() || trx_sys == nullptr) {
+    return trx_preserve_targeted_publication_status::INVALID_STATE;
+  }
+
+  trx_t *published = trx_allocate_for_background();
+  if (published == nullptr) {
+    return trx_preserve_targeted_publication_status::RESOURCE_EXHAUSTED;
+  }
+  *published->xid = candidate.xid;
+  published->id = static_cast<trx_id_t>(candidate.trx_id);
+  published->no = published->id;
+  published->read_only = false;
+  published->auto_commit = false;
+  published->is_recovered = true;
+  published->preserve_prepare_lsn =
+      static_cast<lsn_t>(candidate.prepare_lsn);
+  published->start_time = ut_time();
+  trx_assign_rseg_durable(published);
+  if (published->rsegs.m_redo.rseg == nullptr) {
+    trx_preserve_targeted_publication_discard_unpublished(published);
+    return trx_preserve_targeted_publication_status::RESOURCE_EXHAUSTED;
+  }
+
+  bool conflict = false;
+  trx_t *existing = nullptr;
+  trx_sys_mutex_enter();
+  if (!capability.valid_for(key)) {
+    trx_sys_mutex_exit();
+    trx_preserve_targeted_publication_discard_unpublished(published);
+    return trx_preserve_targeted_publication_status::CAPABILITY_REJECTED;
+  }
+  existing = trx_preserve_targeted_publication_find_conflict_locked(
+      candidate, &conflict);
+  if (existing == nullptr && !conflict) {
+    trx_preserve_store_private_state(published, TRX_STATE_PREPARED);
+    auto id_pos = std::lower_bound(trx_sys->rw_trx_ids.begin(),
+                                   trx_sys->rw_trx_ids.end(), published->id);
+    ut_a(id_pos == trx_sys->rw_trx_ids.end() || *id_pos != published->id);
+    trx_sys->rw_trx_ids.insert(id_pos, published->id);
+    trx_preserve_add_to_rw_trx_list_ordered(published);
+    const auto inserted =
+        trx_sys->rw_trx_set.insert(TrxTrack(published->id, published));
+    ut_a(inserted.second);
+    if (trx_sys->max_trx_id < candidate.safe_next_trx_id_floor) {
+      trx_sys->max_trx_id =
+          static_cast<trx_id_t>(candidate.safe_next_trx_id_floor);
+    }
+    trx_sys->min_active_id.store(trx_sys->rw_trx_ids.front());
+    ++trx_sys->n_prepared_trx;
+  }
+  trx_sys_mutex_exit();
+
+  if (conflict) {
+    trx_preserve_targeted_publication_discard_unpublished(published);
+    return trx_preserve_targeted_publication_status::CONFLICT;
+  }
+  if (existing != nullptr) {
+    trx_preserve_targeted_publication_discard_unpublished(published);
+    published = existing;
+  }
+
+  journal->trx = published;
+  journal->xid = candidate.xid;
+  journal->trx_id = candidate.trx_id;
+  journal->generation = key.generation;
+  journal->origin =
+      existing == nullptr
+          ? trx_preserve_targeted_publication_origin::NEWLY_PUBLISHED
+          : trx_preserve_targeted_publication_origin::IDEMPOTENT_EXISTING_MATCH;
+  journal->active = true;
+  journal->claimed = false;
+  return trx_preserve_targeted_publication_status::OK;
+}
+
+trx_preserve_targeted_publication_status
+trx_preserve_unclaim_simulated_prepared(
+    const Preserve_trx_targeted_publication_capability &capability,
+    const Preserve_trx_prepared_token_key &key,
+    trx_preserve_targeted_publication_journal *journal) {
+  if (!capability.valid_for(key)) {
+    return trx_preserve_targeted_publication_status::CAPABILITY_REJECTED;
+  }
+  if (journal == nullptr ||
+      !trx_preserve_targeted_publication_journal_matches(key, *journal)) {
+    return trx_preserve_targeted_publication_status::INVALID_ARGUMENT;
+  }
+  if (trx_sys == nullptr) {
+    return trx_preserve_targeted_publication_status::INVALID_STATE;
+  }
+
+  trx_t *trx = journal->trx;
+  trx_sys_mutex_enter();
+  const auto tracked = trx_sys->rw_trx_set.find(TrxTrack(journal->trx_id));
+  const bool exact = capability.valid_for(key) &&
+                     tracked != trx_sys->rw_trx_set.end() &&
+                     tracked->m_trx == trx && trx->xid != nullptr &&
+                     journal->xid.eq(trx->xid) &&
+                     trx->id == journal->trx_id && trx->mysql_thd == nullptr;
+  if (!exact) {
+    trx_sys_mutex_exit();
+    return trx_preserve_targeted_publication_status::CONFLICT;
+  }
+  if (trx_state_eq(trx, TRX_STATE_PREPARED) &&
+      !trx->preserve_trx_claimed && !journal->claimed) {
+    trx_sys_mutex_exit();
+    return trx_preserve_targeted_publication_status::OK;
+  }
+  if (!trx_state_eq(trx, TRX_STATE_PRESERVED) ||
+      !trx->preserve_trx_claimed || !journal->claimed) {
+    trx_sys_mutex_exit();
+    return trx_preserve_targeted_publication_status::INVALID_STATE;
+  }
+  trx_preserve_store_state_trx_sys_locked(trx, TRX_STATE_PREPARED);
+  ++trx_sys->n_prepared_trx;
+  trx->preserve_trx_claimed = false;
+  journal->claimed = false;
+  trx_sys_mutex_exit();
+  return trx_preserve_targeted_publication_status::OK;
+}
+
+trx_preserve_targeted_publication_status
+trx_preserve_unpublish_simulated_prepared(
+    const Preserve_trx_targeted_publication_capability &capability,
+    const Preserve_trx_prepared_token_key &key,
+    trx_preserve_targeted_publication_journal *journal) {
+  if (!capability.valid_for(key)) {
+    return trx_preserve_targeted_publication_status::CAPABILITY_REJECTED;
+  }
+  if (journal == nullptr ||
+      !trx_preserve_targeted_publication_journal_matches(key, *journal)) {
+    return trx_preserve_targeted_publication_status::INVALID_ARGUMENT;
+  }
+  if (journal->origin ==
+      trx_preserve_targeted_publication_origin::IDEMPOTENT_EXISTING_MATCH) {
+    return trx_preserve_targeted_publication_status::EXISTING_MUST_REMAIN;
+  }
+  if (journal->origin !=
+          trx_preserve_targeted_publication_origin::NEWLY_PUBLISHED ||
+      journal->claimed || trx_sys == nullptr) {
+    return trx_preserve_targeted_publication_status::INVALID_STATE;
+  }
+
+  trx_t *trx = journal->trx;
+  trx_sys_mutex_enter();
+  const auto tracked = trx_sys->rw_trx_set.find(TrxTrack(journal->trx_id));
+  const auto id_pos = std::lower_bound(trx_sys->rw_trx_ids.begin(),
+                                       trx_sys->rw_trx_ids.end(),
+                                       journal->trx_id);
+  const bool exact = capability.valid_for(key) &&
+                     tracked != trx_sys->rw_trx_set.end() &&
+                     tracked->m_trx == trx &&
+                     id_pos != trx_sys->rw_trx_ids.end() &&
+                     *id_pos == journal->trx_id &&
+                     trx_preserve_rw_trx_list_contains(trx) &&
+                     trx->xid != nullptr && journal->xid.eq(trx->xid) &&
+                     trx->id == journal->trx_id && trx->mysql_thd == nullptr &&
+                     trx_state_eq(trx, TRX_STATE_PREPARED) &&
+                     !trx->preserve_trx_claimed && trx->read_view == nullptr &&
+                     trx->rsegs.m_redo.rseg != nullptr &&
+                     trx->rsegs.m_redo.insert_undo == nullptr &&
+                     trx->rsegs.m_redo.update_undo == nullptr &&
+                     trx->rsegs.m_noredo.rseg == nullptr &&
+                     trx->rsegs.m_noredo.insert_undo == nullptr &&
+                     trx->rsegs.m_noredo.update_undo == nullptr;
+  if (!exact) {
+    trx_sys_mutex_exit();
+    return trx_preserve_targeted_publication_status::CONFLICT;
+  }
+
+  trx_sys->rw_trx_ids.erase(id_pos);
+  UT_LIST_REMOVE(trx_sys->rw_trx_list, trx);
+  ut_d(trx->in_rw_trx_list = false);
+  trx_sys->rw_trx_set.erase(tracked);
+  ut_a(trx_sys->n_prepared_trx > 0);
+  --trx_sys->n_prepared_trx;
+  const trx_state_t old_state = trx->state;
+  trx->state = TRX_STATE_COMMITTED_IN_MEMORY;
+  trx_preserve_note_rseg_owner_state_change(
+      trx, old_state, TRX_STATE_COMMITTED_IN_MEMORY);
+  const trx_id_t min_id = trx_sys->rw_trx_ids.empty()
+                              ? trx_sys->max_trx_id
+                              : trx_sys->rw_trx_ids.front();
+  trx_sys->min_active_id.store(min_id);
+  trx_sys_mutex_exit();
+
+  lock_trx_release_locks(trx);
+  ut_ad(trx->rsegs.m_redo.rseg->trx_ref_count > 0);
+  --trx->rsegs.m_redo.rseg->trx_ref_count;
+  trx->rsegs.m_redo.rseg = nullptr;
+  trx->xid->reset();
+  trx->state = TRX_STATE_NOT_STARTED;
+  trx->will_lock = 0;
+  trx->preserve_trx_claimed = false;
+  trx->preserve_prepare_lsn = 0;
+  trx_free_resurrected(trx);
+
+  journal->trx = nullptr;
+  journal->active = false;
+  journal->claimed = false;
+  return trx_preserve_targeted_publication_status::OK;
+}
+
+void trx_preserve_startup_note_undo_body_scan(uint64_t pages,
+                                             uint64_t records) {
+  if (!trx_preserve_startup_resurrection_metrics_enabled.load(
+          std::memory_order_acquire)) {
+    return;
+  }
+  trx_preserve_startup_resurrection_undo_body_pages.fetch_add(
+      pages, std::memory_order_relaxed);
+  trx_preserve_startup_resurrection_undo_body_records.fetch_add(
+      records, std::memory_order_relaxed);
+}
+
+trx_preserve_startup_resurrection_metrics
+trx_preserve_startup_resurrection_metrics_snapshot() {
+  trx_preserve_startup_resurrection_metrics metrics;
+  metrics.candidates = trx_preserve_startup_resurrection_candidates_count.load(
+      std::memory_order_acquire);
+  metrics.index_hits = trx_preserve_startup_resurrection_index_hits.load(
+      std::memory_order_acquire);
+  metrics.fallbacks = trx_preserve_startup_resurrection_fallbacks.load(
+      std::memory_order_acquire);
+  metrics.undo_anchor_checks =
+      trx_preserve_startup_resurrection_anchor_checks.load(
+          std::memory_order_acquire);
+  metrics.undo_body_pages =
+      trx_preserve_startup_resurrection_undo_body_pages.load(
+          std::memory_order_acquire);
+  metrics.undo_body_records =
+      trx_preserve_startup_resurrection_undo_body_records.load(
+          std::memory_order_acquire);
+  return metrics;
+}
+
+void trx_preserve_startup_resurrection_finish() {
+  std::lock_guard<std::mutex> guard(trx_preserve_startup_resurrection_mutex);
+  trx_preserve_startup_resurrection_fallbacks.fetch_add(
+      trx_preserve_startup_resurrection_candidates.size(),
+      std::memory_order_relaxed);
+  trx_preserve_startup_resurrection_candidates.clear();
+  trx_preserve_startup_resurrection_metrics_enabled.store(
+      false, std::memory_order_release);
 }
 
 /*

@@ -1,16 +1,10 @@
 --source include/not_log_bin.inc
 --source include/force_restart.inc
 
-# Regression test for the secondary-index branch of
-# lock_preserve_materialize_implicit_locks(): an UPDATE that mutates a
-# secondary-index column leaves an implicit X-lock on the secondary index;
-# the preserve flow must materialize it into an explicit record lock so that
-# another session attempting to update the same secondary-index key continues
-# to block correctly after restart.
-#
-# Before the fix the materialize path rejected any table with a secondary
-# index, so PRESERVE on this transaction would have returned
-# ER_PRESERVE_TRX_UNSUPPORTED.
+# An UPDATE that mutates a secondary-index column leaves native implicit lock
+# ownership in the record/Undo state. Preserve must not scan the index and
+# convert that ownership to an explicit lock: startup rebuilds the same trx_id
+# in rw_trx_set, so InnoDB can resolve the implicit owner on demand.
 
 --disable_warnings
 DROP TABLE IF EXISTS t_implicit_sec;
@@ -26,12 +20,18 @@ CREATE TABLE t_implicit_sec(
 ) ENGINE=InnoDB;
 INSERT INTO t_implicit_sec VALUES(1,100,10),(2,200,20),(3,300,30);
 
+--connect(native_implicit_app, localhost, root,,test)
 START TRANSACTION;
 # Updates the cluster row and the k_idx secondary-index entry for id=2.
 UPDATE t_implicit_sec SET k=250, v=21 WHERE id=2;
 
+# This injection would reject preserve if the legacy full-index implicit-lock
+# materializer were reached. Native continuity must bypass it.
+SET SESSION debug="+d,preserve_trx_fail_materialize_implicit_locks";
+
+--connection default
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 --source include/wait_until_disconnected.inc
 
 --exec echo "restart: --preserve-trx-enable=ON" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
@@ -39,7 +39,7 @@ PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
 --source include/wait_until_connected_again.inc
 --disable_reconnect
 
-SELECT COUNT(*) > 0 AS recovered_secondary_record_locks
+SELECT COUNT(*) AS recovered_explicit_secondary_record_locks
   FROM performance_schema.data_locks
   WHERE OBJECT_SCHEMA='test'
     AND OBJECT_NAME='t_implicit_sec'
@@ -47,8 +47,8 @@ SELECT COUNT(*) > 0 AS recovered_secondary_record_locks
     AND LOCK_TYPE='RECORD'
     AND LOCK_STATUS='GRANTED';
 
-# The secondary-index implicit X-lock for id=2 (rows with k=250) must have
-# been materialized at preserve time so it survives the restart.
+# The secondary-index implicit X-lock for id=2 must still block through the
+# record trx_id + recovered rw_trx_set/Undo chain, without a serialized lock_t.
 --connect(sec_writer, localhost, root,,test)
 connection sec_writer;
 SET innodb_lock_wait_timeout=1;

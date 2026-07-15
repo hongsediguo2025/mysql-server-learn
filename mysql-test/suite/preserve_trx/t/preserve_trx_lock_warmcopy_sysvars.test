@@ -86,6 +86,15 @@ SELECT VARIABLE_NAME, VARIABLE_VALUE REGEXP '^[0-9]+$' AS numeric_status
     'Preserve_trx_promotion_gate_skipped_count',
     'Preserve_trx_promotion_gate_status_code',
     'Preserve_trx_promotion_gate_token_count',
+    'Preserve_trx_promotion_gate_worker_active_count',
+    'Preserve_trx_promotion_gate_worker_count',
+    'Preserve_trx_promotion_gate_worker_idle_count',
+    'Preserve_trx_promotion_prepared_adopted_tokens',
+    'Preserve_trx_promotion_prepared_adopting_tokens',
+    'Preserve_trx_promotion_prepared_prewarm_pending_tokens',
+    'Preserve_trx_promotion_prepared_ready_tokens',
+    'Preserve_trx_promotion_prepared_registered_tokens',
+    'Preserve_trx_promotion_prepared_tainted_tokens',
     'Preserve_trx_resume_total_us',
     'Preserve_trx_startup_recovery_binlog_cache_tokens',
     'Preserve_trx_startup_recovery_elapsed_us',
@@ -95,8 +104,26 @@ SELECT VARIABLE_NAME, VARIABLE_VALUE REGEXP '^[0-9]+$' AS numeric_status
     'Preserve_trx_startup_recovery_promotion_intent_tokens',
     'Preserve_trx_startup_recovery_snapshot_tokens',
     'Preserve_trx_startup_recovery_standby_pending_tokens',
-    'Preserve_trx_startup_recovery_tainted_tokens')
+    'Preserve_trx_startup_recovery_tainted_tokens',
+    'Preserve_trx_transfer_last_throttle_reason',
+    'Preserve_trx_transfer_receiver_failed_tokens',
+    'Preserve_trx_transfer_receiver_inflight_bytes',
+    'Preserve_trx_transfer_receiver_inflight_tokens',
+    'Preserve_trx_transfer_receiver_last_failed_token',
+    'Preserve_trx_transfer_receiver_queued_bytes',
+    'Preserve_trx_transfer_receiver_saved_online_tokens',
+    'Preserve_trx_transfer_receiver_strict_ibuf_merges',
+    'Preserve_trx_transfer_receiver_strict_record_index_page_reads',
+    'Preserve_trx_transfer_receiver_strict_target_local_redo_bytes',
+    'Preserve_trx_transfer_receiver_worker_active',
+    'Preserve_trx_transfer_receiver_worker_idle',
+    'Preserve_trx_transfer_throttled_milliseconds')
   ORDER BY VARIABLE_NAME;
+
+SELECT VARIABLE_NAME, VARIABLE_VALUE IS NOT NULL AS readable_status
+  FROM performance_schema.global_status
+  WHERE VARIABLE_NAME =
+    'Preserve_trx_transfer_receiver_last_failed_reason';
 
 SET GLOBAL preserve_trx_warmcopy_enable=ON;
 SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;

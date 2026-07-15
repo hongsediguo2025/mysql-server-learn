@@ -190,6 +190,8 @@ struct lock_warmcopy_trx_lock_fence_t {
   uint64_t trx_locks_version{0};
   /* Native record-lock count sampled under trx->mutex. */
   uint64_t n_rec_locks{0};
+  /* Bulk coordinate mutations invisible to trx_locks_version. */
+  uint64_t coordinate_generation{0};
   /* Freeze generation active while prepare must reject late conversions. */
   uint64_t freeze_generation{0};
   /*
@@ -223,6 +225,12 @@ enum class lock_warmcopy_hook_action_t {
   INVALID_TARGET,
   READ_ONLY,
   UNREACHABLE
+};
+
+enum class lock_warmcopy_record_bulk_mutation_t : uint8_t {
+  REORGANIZE = 0,
+  MOVE,
+  INHERIT
 };
 
 /*
@@ -270,6 +278,8 @@ bool lock_warmcopy_record_bitmap_set_for_lock(const ib_lock_t *lock,
                                               uint32_t heap_no);
 bool lock_warmcopy_record_bitmap_reset_for_lock(const ib_lock_t *lock,
                                                 uint32_t heap_no);
+bool lock_warmcopy_record_note_bulk_mutation_for_lock(
+    const ib_lock_t *lock, lock_warmcopy_record_bulk_mutation_t mutation);
 bool lock_warmcopy_record_mark_discard_for_lock(const ib_lock_t *lock);
 bool lock_warmcopy_record_bitmap_set_with_image_for_trx(
     const trx_t *trx, const lock_warmcopy_record_shard_key_t &key,

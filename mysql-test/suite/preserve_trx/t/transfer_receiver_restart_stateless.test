@@ -1,0 +1,39 @@
+--source include/force_restart.inc
+
+--let $PRESERVE_TRX_DIR= `SELECT @@global.preserve_trx_dir`
+--let $TRANSFER_EPOCH_DIR= $PRESERVE_TRX_DIR/.transfer/restart-epoch/9001
+--let $TRANSFER_SPOOL= $TRANSFER_EPOCH_DIR/receiver.frames
+--let $STANDBY_MARKER= $PRESERVE_TRX_DIR/9001.standby_pending
+--let $SNAPSHOT_FILE= $PRESERVE_TRX_DIR/9001.bin
+--let $RECORD_LOCK_BLOB= $PRESERVE_TRX_DIR/9001.blob.record_locks
+--let $PROMOTION_INTENT= $PRESERVE_TRX_DIR/9001.promotion_intent
+--let $PROMOTION_ADOPTED= $PRESERVE_TRX_DIR/9001.promotion_adopted
+--let $PROMOTION_ABANDONED= $PRESERVE_TRX_DIR/9001.promotion_abandoned
+--let $EPOCH_FACT= $PRESERVE_TRX_DIR/.transfer/restart-epoch/epoch.fact
+--let $EPOCH_COMMIT= $PRESERVE_TRX_DIR/.transfer/restart-epoch/epoch.commit
+
+--exec mkdir -p "$TRANSFER_EPOCH_DIR"
+--exec echo frame > "$TRANSFER_SPOOL"
+--exec echo standby_pending > "$STANDBY_MARKER"
+--exec echo snapshot > "$SNAPSHOT_FILE"
+--exec echo record_locks > "$RECORD_LOCK_BLOB"
+--exec echo promotion_intent > "$PROMOTION_INTENT"
+--exec echo promotion_adopted > "$PROMOTION_ADOPTED"
+--exec echo promotion_abandoned > "$PROMOTION_ABANDONED"
+--exec echo fact > "$EPOCH_FACT"
+--exec echo commit > "$EPOCH_COMMIT"
+
+# Receiver artifacts are process-local even if the next process does not start
+# the receiver endpoint. Cleanup must happen before ordinary local recovery.
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-receiver-enable=OFF --skip-log-bin
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
+SELECT @@global.preserve_trx_transfer_receiver_enable=0 AS receiver_mode;
+--exec test ! -e "$PRESERVE_TRX_DIR/.transfer"
+--exec test ! -e "$STANDBY_MARKER"
+--exec test ! -e "$SNAPSHOT_FILE"
+--exec test ! -e "$RECORD_LOCK_BLOB"
+--exec test ! -e "$PROMOTION_INTENT"
+--exec test ! -e "$PROMOTION_ADOPTED"
+--exec test ! -e "$PROMOTION_ABANDONED"

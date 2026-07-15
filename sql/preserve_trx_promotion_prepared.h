@@ -23,6 +23,10 @@ class Mysql_binlog_preserve_prepared_cache_handle;
 class Preserve_memory_lease;
 struct Preserved_trx_bundle;
 class Preserve_trx_internal_operation_capability;
+struct Preserve_trx_prepared_token_key;
+struct Preserve_trx_resurrection_index_entry;
+struct Preserve_trx_targeted_publication_revocation_state;
+struct trx_preserve_targeted_publication_journal;
 struct Mysql_binlog_preserve_cache_facts;
 enum class Mysql_binlog_preserve_cache_status : uint8_t;
 
@@ -87,6 +91,30 @@ struct Preserve_trx_physical_fence_provider_ops {
 
 class Preserve_trx_physical_fence_lease_factory;
 
+/*
+  Capability for the no-physical-replication simulator only. It is bound to
+  one registry key and is revoked with the test fence lease that minted it.
+*/
+class Preserve_trx_targeted_publication_capability {
+ public:
+  Preserve_trx_targeted_publication_capability() = default;
+  bool valid_for(const Preserve_trx_prepared_token_key &key) const;
+  uint64_t source_fence_lsn() const { return m_source_fence_lsn; }
+  uint64_t provider_generation() const { return m_provider_generation; }
+
+ private:
+  std::weak_ptr<Preserve_trx_targeted_publication_revocation_state> m_state;
+  std::string m_source_uuid;
+  std::string m_epoch_id;
+  std::string m_token;
+  std::string m_target_boot_incarnation;
+  uint64_t m_generation{0};
+  uint64_t m_source_fence_lsn{0};
+  uint64_t m_provider_generation{0};
+
+  friend class Preserve_trx_physical_fence_lease;
+};
+
 class Preserve_trx_physical_fence_lease {
  public:
   Preserve_trx_physical_fence_lease() = default;
@@ -103,6 +131,9 @@ class Preserve_trx_physical_fence_lease {
   bool acquired() const { return m_opaque_lease != nullptr; }
   const Preserve_trx_physical_fence_proof &proof() const { return m_proof; }
   Preserve_trx_physical_fence_status revalidate();
+  bool make_targeted_publication_capability(
+      const Preserve_trx_prepared_token_key &key,
+      Preserve_trx_targeted_publication_capability *capability) const;
   void release();
 
  private:
@@ -110,6 +141,8 @@ class Preserve_trx_physical_fence_lease {
   Preserve_trx_physical_fence_proof m_expected;
   Preserve_trx_physical_fence_proof m_proof;
   void *m_opaque_lease{nullptr};
+  std::shared_ptr<Preserve_trx_targeted_publication_revocation_state>
+      m_targeted_publication_state;
 
   friend class Preserve_trx_physical_fence_lease_factory;
 
@@ -252,6 +285,9 @@ std::string preserved_trx_strict_attach_intent_journal_id(
 struct Preserve_trx_final_token_facts {
   uint64_t required_apply_lsn{0};
   uint64_t physical_fence_lsn{0};
+  uint64_t source_trx_id_store{0};
+  uint64_t source_trx_id_store_lsn{0};
+  uint64_t source_safe_next_trx_id_floor{0};
   std::string epoch_fact_digest;
   std::string final_lock_generation_digest;
   std::string page_layout_digest;
@@ -300,6 +336,7 @@ class Preserve_trx_prepared_token_resources {
   bool has_record_lock_plan() const;
   bool has_semantic_bundle() const;
   bool has_native_binlog_handle() const;
+  bool has_resurrection_entry() const;
   void reset() noexcept;
   Preserve_trx_prepared_status install_record_lock_plan(
       std::unique_ptr<lock_preserve_metadata_plan_t> plan);
@@ -308,6 +345,8 @@ class Preserve_trx_prepared_token_resources {
       Preserve_memory_lease &&memory_lease);
   Preserve_trx_prepared_status install_semantic_bundle(
       std::unique_ptr<Preserved_trx_bundle> bundle);
+  Preserve_trx_prepared_status install_resurrection_entry(
+      std::unique_ptr<Preserve_trx_resurrection_index_entry> entry);
   Mysql_binlog_preserve_cache_status prepare_native_binlog_handle(
       const Preserve_trx_internal_operation_capability &capability,
       const Mysql_binlog_preserve_cache_facts &facts,
@@ -328,6 +367,7 @@ class Preserve_trx_prepared_token_resources {
   friend class Preserve_trx_prepared_token_registry;
   friend class Preserve_trx_gate_adopt_lease;
   friend class Preserve_trx_attach_lease;
+  friend class Preserve_trx_cleanup_lease;
 };
 
 Preserve_trx_prepared_status
@@ -384,10 +424,16 @@ class Preserve_trx_gate_adopt_lease {
   ~Preserve_trx_gate_adopt_lease();
   bool active() const { return m_active; }
   const lock_preserve_metadata_plan_t *record_lock_plan() const;
+  const Preserve_trx_resurrection_index_entry *resurrection_entry() const;
+  Preserve_trx_prepared_status copy_publication(
+      Preserve_trx_prepared_token_key *key,
+      Preserve_trx_final_token_facts *facts) const;
   Preserve_trx_prepared_status take_semantic_bundle(
       std::unique_ptr<Preserved_trx_bundle> *out);
   Preserve_trx_prepared_status restore_semantic_bundle(
       std::unique_ptr<Preserved_trx_bundle> *inout);
+  Preserve_trx_prepared_status install_targeted_publication_journal(
+      std::unique_ptr<trx_preserve_targeted_publication_journal> &&journal);
 
  private:
   void fail_closed();
@@ -434,6 +480,10 @@ class Preserve_trx_cleanup_lease {
       Preserve_trx_cleanup_lease &&other) noexcept;
   ~Preserve_trx_cleanup_lease();
   bool active() const { return m_active; }
+  trx_preserve_targeted_publication_journal *targeted_publication_journal()
+      const;
+  Preserve_trx_prepared_status take_targeted_publication_journal(
+      std::unique_ptr<trx_preserve_targeted_publication_journal> *out);
 
  private:
   void fail_closed();
@@ -450,12 +500,23 @@ struct Preserve_trx_prepared_token_snapshot {
   bool record_lock_plan_owned{false};
   bool semantic_bundle_owned{false};
   bool native_binlog_handle_owned{false};
+  bool resurrection_entry_owned{false};
+  bool targeted_publication_journal_owned{false};
 };
 
 struct Preserve_trx_prepared_expire_result {
   size_t ready_expired{0};
   size_t adopted_tainted{0};
   size_t active_artifacts_cleaned{0};
+};
+
+struct Preserve_trx_prepared_registry_counts {
+  uint64_t registered_tokens{0};
+  uint64_t prewarm_pending_tokens{0};
+  uint64_t ready_tokens{0};
+  uint64_t adopting_tokens{0};
+  uint64_t adopted_tokens{0};
+  uint64_t tainted_tokens{0};
 };
 
 class Preserve_trx_prepared_token_registry {
@@ -523,6 +584,7 @@ class Preserve_trx_prepared_token_registry {
   Preserve_trx_prepared_status find_unique_adopted(
       const std::string &epoch_id, const std::string &token,
       Preserve_trx_prepared_token_snapshot *snapshot) const;
+  Preserve_trx_prepared_registry_counts status_counts() const;
   void invalidate_incarnation(const std::string &current_boot_incarnation);
   size_t expire_ready_facts_pending_lease(const std::string &source_uuid,
                                           const std::string &epoch_id,
@@ -587,6 +649,12 @@ uint64_t preserve_trx_resume_binlog_payload_read_bytes_status();
 uint64_t preserve_trx_resume_binlog_payload_write_bytes_status();
 uint64_t preserve_trx_resume_binlog_rename_count_status();
 uint64_t preserve_trx_resume_binlog_attach_count_status();
+uint64_t preserve_trx_promotion_prepared_registered_tokens_status();
+uint64_t preserve_trx_promotion_prepared_prewarm_pending_tokens_status();
+uint64_t preserve_trx_promotion_prepared_ready_tokens_status();
+uint64_t preserve_trx_promotion_prepared_adopting_tokens_status();
+uint64_t preserve_trx_promotion_prepared_adopted_tokens_status();
+uint64_t preserve_trx_promotion_prepared_tainted_tokens_status();
 
 #ifndef NDEBUG
 enum class Preserve_trx_prepared_registry_probe_point : uint8_t {

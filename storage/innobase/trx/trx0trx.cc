@@ -155,6 +155,7 @@ static void trx_init(trx_t *trx) {
 
   trx->is_recovered = false;
   trx->preserve_trx_claimed = false;
+  trx->preserve_prepare_lsn = 0;
 
   trx->op_info = "";
 
@@ -165,6 +166,7 @@ static void trx_init(trx_t *trx) {
   trx->check_unique_secondary = true;
 
   trx->lock.n_rec_locks.store(0);
+  trx->lock.lock_warmcopy_coordinate_generation.store(0);
   trx->lock.lock_warmcopy_conversion_frozen = false;
   trx->lock.lock_warmcopy_freeze_generation = 0;
   trx->lock.lock_warmcopy_conversion_freeze_wait_epoch = 0;
@@ -719,6 +721,8 @@ static void trx_resurrect_table_ids(trx_t *trx, const trx_undo_ptr_t *undo_ptr,
                                 undo->page_size, &mtr);
 
   undo_rec = undo_page + undo->top_offset;
+  uint64_t body_pages = 1;
+  uint64_t body_records = 0;
 
   do {
     ulint type;
@@ -733,10 +737,12 @@ static void trx_resurrect_table_ids(trx_t *trx, const trx_undo_ptr_t *undo_ptr,
     if (undo_rec_page != undo_page) {
       mtr.release_page(undo_page, MTR_MEMO_PAGE_X_FIX);
       undo_page = undo_rec_page;
+      ++body_pages;
     }
 
     trx_undo_rec_get_pars(undo_rec, &type, &cmpl_info, &updated_extern,
                           &undo_no, &table_id, type_cmpl);
+    ++body_records;
     tables.insert(table_id);
 
     undo_rec = trx_undo_get_prev_rec(undo_rec, undo->hdr_page_no,
@@ -744,6 +750,7 @@ static void trx_resurrect_table_ids(trx_t *trx, const trx_undo_ptr_t *undo_ptr,
   } while (undo_rec);
 
   mtr_commit(&mtr);
+  trx_preserve_startup_note_undo_body_scan(body_pages, body_records);
 }
 
 /** Resurrect table locks for resurrected transactions. */
@@ -979,6 +986,12 @@ the time of a crash, they need to be undone.
 static void trx_resurrect(trx_rseg_t *rseg) {
   trx_t *trx;
   trx_undo_t *undo;
+  /*
+    An authenticated Index hit only defers this transaction's Undo body scan.
+    Native resurrection still builds and publishes a PREPARED trx_t; SQL-layer
+    recovery changes it to PRESERVED only after the full bundle is validated.
+  */
+  std::set<trx_t *> indexed_candidates;
 
   ut_ad(rseg != nullptr);
 
@@ -989,7 +1002,11 @@ static void trx_resurrect(trx_rseg_t *rseg) {
 
     trx_sys_rw_trx_add(trx);
 
-    trx_resurrect_table_ids(trx, &trx->rsegs.m_redo, undo);
+    if (trx_preserve_startup_resurrection_is_candidate(trx->id)) {
+      indexed_candidates.insert(trx);
+    } else {
+      trx_resurrect_table_ids(trx, &trx->rsegs.m_redo, undo);
+    }
   }
 
   /* Ressurrect transactions that were doing updates. */
@@ -1013,7 +1030,35 @@ static void trx_resurrect(trx_rseg_t *rseg) {
 
     trx_sys_rw_trx_add(trx);
 
-    trx_resurrect_table_ids(trx, &trx->rsegs.m_redo, undo);
+    if (trx_preserve_startup_resurrection_is_candidate(trx->id)) {
+      indexed_candidates.insert(trx);
+    } else {
+      trx_resurrect_table_ids(trx, &trx->rsegs.m_redo, undo);
+    }
+  }
+
+  for (trx_t *candidate : indexed_candidates) {
+    std::vector<uint64_t> table_ids;
+    const trx_preserve_startup_resurrection_result result =
+        trx_preserve_startup_apply_resurrection_candidate(candidate,
+                                                          &table_ids);
+    if (result == trx_preserve_startup_resurrection_result::INDEXED) {
+      table_id_set empty;
+      table_id_set &tables =
+          resurrected_trx_tables
+              .insert(trx_table_map::value_type(candidate, empty))
+              .first->second;
+      tables.insert(table_ids.begin(), table_ids.end());
+      continue;
+    }
+    if (candidate->rsegs.m_redo.insert_undo != nullptr) {
+      trx_resurrect_table_ids(candidate, &candidate->rsegs.m_redo,
+                              candidate->rsegs.m_redo.insert_undo);
+    }
+    if (candidate->rsegs.m_redo.update_undo != nullptr) {
+      trx_resurrect_table_ids(candidate, &candidate->rsegs.m_redo,
+                              candidate->rsegs.m_redo.update_undo);
+    }
   }
 }
 
@@ -1042,6 +1087,8 @@ void trx_lists_init_at_db_start(void) {
     undo_space->rsegs()->s_unlock();
   }
   undo::spaces->s_unlock();
+
+  trx_preserve_startup_resurrection_finish();
 
   TrxIdSet::iterator end = trx_sys->rw_trx_set.end();
 
@@ -2849,6 +2896,8 @@ static void trx_prepare(trx_t *trx) /*!< in/out: transaction */
   if (trx->rsegs.m_redo.rseg != nullptr && trx_is_redo_rseg_updated(trx)) {
     lsn = trx_prepare_low(trx, &trx->rsegs.m_redo, false);
   }
+
+  trx->preserve_prepare_lsn = lsn;
 
   if (trx->rsegs.m_noredo.rseg != nullptr && trx_is_temp_rseg_updated(trx)) {
     trx_prepare_low(trx, &trx->rsegs.m_noredo, true);

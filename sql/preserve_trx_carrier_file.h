@@ -25,6 +25,7 @@
 #define SQL_PRESERVE_TRX_CARRIER_FILE_INCLUDED
 
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -53,6 +54,12 @@ class Local_file_preserved_trx_carrier final
   Preserved_trx_carrier_status write_snapshot_new(
       const std::string &token,
       const std::vector<unsigned char> &snapshot_bytes) override;
+  Preserved_trx_carrier_status write_resurrection_index_new(
+      const std::string &token,
+      const std::vector<unsigned char> &index_bytes) override;
+  Preserved_trx_carrier_status read_resurrection_index(
+      const std::string &token, uint64_t max_bytes,
+      std::vector<unsigned char> *index_bytes) override;
   Preserved_trx_carrier_status remove_external_blobs(
       const std::string &token,
       const std::vector<Preserved_trx_external_blob> &external_blobs) override;
@@ -128,6 +135,9 @@ class Local_file_preserved_trx_carrier final
       uint64_t max_bytes, Preserved_trx_external_blob *blob) override;
   Preserved_trx_carrier_status remove_warm_external_blob(
       const std::string &warmcopy_id, const std::string &blob_name) override;
+  Preserved_trx_carrier_status remove_warm_external_blobs(
+      const std::set<std::string> &warmcopy_ids,
+      const std::string &blob_name) override;
 
  private:
   std::string m_dir;

@@ -28,12 +28,25 @@
 #include <string>
 #include <vector>
 
+#include "my_inttypes.h"
 #include "sql/preserve_trx_bundle.h"
 #include "sql/preserve_trx_promotion_prepared.h"
+
+struct Preserve_trx_transfer_epoch_fact;
 
 extern uint preserve_trx_promotion_gate_batch_tokens;
 extern uint preserve_trx_promotion_gate_workers;
 extern uint preserve_trx_promotion_gate_timeout_ms;
+extern uint preserve_trx_promotion_prewarm_workers;
+extern ulonglong preserve_trx_promotion_prewarm_io_bytes_per_sec;
+extern ulonglong preserve_trx_promotion_prewarm_max_bytes;
+extern ulonglong preserve_trx_promotion_ready_cache_max_bytes;
+
+bool preserved_trx_promotion_start_gate_workers();
+void preserved_trx_promotion_shutdown_gate_workers();
+uint64_t preserve_trx_promotion_gate_worker_count_status();
+uint64_t preserve_trx_promotion_gate_worker_active_count_status();
+uint64_t preserve_trx_promotion_gate_worker_idle_count_status();
 
 uint64_t preserve_trx_promotion_gate_elapsed_us_status();
 uint64_t preserve_trx_promotion_gate_token_count_status();
@@ -52,6 +65,8 @@ uint64_t preserve_trx_promotion_gate_over_budget_count_status();
 uint64_t preserve_trx_promotion_prewarm_record_lock_page_count_status();
 uint64_t preserve_trx_promotion_prewarm_record_lock_resident_pages_status();
 uint64_t preserve_trx_promotion_prewarm_record_lock_cold_page_gets_status();
+uint64_t preserve_trx_promotion_ready_cache_bytes_status();
+uint64_t preserve_trx_promotion_ready_cache_evictions_status();
 
 enum class Preserve_trx_promotion_adopt_status {
   OK,
@@ -112,8 +127,8 @@ void preserved_trx_set_promotion_adopt_executor_for_unit_test(
 
 /*
   Unit-test hook for the Phase B promotion-ready cache. The cache is a
-  performance layer above durable standby-pending artifacts; ordinary local
-  recovery never consults it.
+  performance layer above current-process standby-pending artifacts; ordinary
+  local recovery never consults it.
 */
 void preserved_trx_promotion_ready_cache_clear_for_unit_test();
 
@@ -173,11 +188,18 @@ preserved_trx_promotion_prewarm_staged_bundle_with_record_lock_proof_for_receive
     uint64_t token, uint64_t required_apply_lsn,
     const Preserved_trx_bundle &bundle, uint64_t record_lock_page_count,
     uint64_t record_lock_resident_pages, uint64_t record_lock_cold_gets,
-    uint64_t record_lock_bitmap_pages, uint64_t record_lock_bitmap_bits);
+    uint64_t record_lock_bitmap_pages, uint64_t record_lock_bitmap_bits,
+    bool metadata_only);
 
 Preserve_trx_promotion_adopt_status
 preserved_trx_promotion_bind_prewarmed_epoch_for_receiver(
     const std::string &preserve_dir, const std::string &epoch_id,
+    const std::vector<uint64_t> &tokens, uint64_t *ready_tokens);
+
+Preserve_trx_promotion_adopt_status
+preserved_trx_promotion_bind_prewarmed_epoch_fact_for_receiver(
+    const std::string &preserve_dir,
+    const Preserve_trx_transfer_epoch_fact &fact,
     const std::vector<uint64_t> &tokens, uint64_t *ready_tokens);
 
 Preserve_trx_promotion_adopt_status
@@ -253,7 +275,7 @@ struct Preserve_trx_promotion_adopt_result {
 
 enum class Preserve_trx_promotion_ready_state {
   NOT_FOUND,
-  RECEIVED_DURABLE,
+  RECEIVED_CURRENT_PROCESS,
   HYDRATING,
   DRY_VALIDATED,
   PREWARMED_PENDING_FINAL_FACT,
@@ -302,7 +324,7 @@ struct Preserve_trx_physical_promotion_gate_request {
   std::vector<Preserve_trx_prepared_token_key> tokens;
   Preserve_trx_physical_fence_proof expected_fence;
   uint64_t operation_deadline_us{0};
-  uint32_t worker_count{1};
+  uint32_t worker_count{3};
 };
 
 struct Preserve_trx_physical_promotion_gate_result {
@@ -322,9 +344,14 @@ using Preserve_trx_strict_physical_adopt_executor =
         const std::string &, Preserve_trx_gate_adopt_lease *,
         Preserve_trx_physical_fence_lease *, uint64_t,
         Preserved_trx_physical_adopt_result *);
+using Preserve_trx_strict_physical_adopt_reversal_executor = bool (*)(
+    const Preserve_trx_prepared_token_key &, Preserve_trx_cleanup_lease *,
+    Preserve_trx_physical_fence_lease *, std::string *);
 
 void preserved_trx_set_strict_physical_adopt_executor_for_unit_test(
     Preserve_trx_strict_physical_adopt_executor executor);
+void preserved_trx_set_strict_physical_adopt_reversal_executor_for_unit_test(
+    Preserve_trx_strict_physical_adopt_reversal_executor executor);
 
 Preserve_trx_physical_promotion_gate_status
 preserved_trx_adopt_prepared_epoch_for_physical_promotion(

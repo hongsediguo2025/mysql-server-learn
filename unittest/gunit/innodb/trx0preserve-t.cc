@@ -743,7 +743,8 @@ TEST_F(Trx0TempPreserveNoRedoReconnectTest,
 
   EXPECT_EQ(DB_ERROR,
             trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-                &descriptor, &trx));
+                &descriptor, &trx,
+                trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED));
   EXPECT_EQ(sentinel_rseg, trx.rsegs.m_noredo.rseg);
   EXPECT_EQ(sentinel_insert_undo, trx.rsegs.m_noredo.insert_undo);
   EXPECT_EQ(sentinel_update_undo, trx.rsegs.m_noredo.update_undo);
@@ -797,9 +798,10 @@ TEST_F(Trx0TempPreserveNoRedoReconnectTest,
             trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(
                 &descriptor));
 
-  EXPECT_EQ(DB_UNSUPPORTED,
+  EXPECT_EQ(DB_ERROR,
             trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-                &descriptor, &trx));
+                &descriptor, &trx,
+                trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED));
   EXPECT_EQ(nullptr, trx.rsegs.m_noredo.rseg);
   EXPECT_EQ(nullptr, trx.rsegs.m_noredo.insert_undo);
   EXPECT_EQ(nullptr, trx.rsegs.m_noredo.update_undo);
@@ -864,7 +866,8 @@ TEST_F(Trx0TempPreserveNoRedoReconnectTest,
 
   EXPECT_EQ(DB_SUCCESS,
             trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-                &descriptor, &trx));
+                &descriptor, &trx,
+                trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED));
   EXPECT_TRUE(
       trx_preserve_temp_space_image_no_redo_undo_pointers_reconnected(
           descriptor));
@@ -969,7 +972,8 @@ TEST_F(Trx0TempPreserveNoRedoReconnectTest,
 
   EXPECT_EQ(DB_SUCCESS,
             trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-                &descriptor, &trx));
+                &descriptor, &trx,
+                trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED));
   ASSERT_NE(nullptr, trx.rsegs.m_noredo.update_undo);
   EXPECT_EQ(4U, trx.rsegs.m_noredo.update_undo->size);
   EXPECT_EQ(76U, trx.rsegs.m_noredo.update_undo->last_page_no);
@@ -1034,7 +1038,8 @@ TEST_F(Trx0TempPreserveNoRedoReconnectTest,
 
   EXPECT_EQ(DB_ERROR,
             trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-                &descriptor, &trx));
+                &descriptor, &trx,
+                trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED));
   EXPECT_EQ(nullptr, trx.rsegs.m_noredo.update_undo);
   EXPECT_FALSE(
       trx_preserve_temp_space_image_no_redo_undo_pointers_reconnected(
@@ -1099,7 +1104,8 @@ TEST_F(Trx0TempPreserveNoRedoReconnectTest,
 
   EXPECT_EQ(DB_ERROR,
             trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-                &descriptor, &trx));
+                &descriptor, &trx,
+                trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED));
   EXPECT_EQ(nullptr, trx.rsegs.m_noredo.update_undo);
   EXPECT_FALSE(
       trx_preserve_temp_space_image_no_redo_undo_pointers_reconnected(
@@ -1124,7 +1130,8 @@ TEST_F(Trx0TempPreserveNoRedoReconnectTest,
 
   EXPECT_EQ(DB_SUCCESS,
             trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-                &descriptor, &trx));
+                &descriptor, &trx,
+                trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED));
   EXPECT_EQ(sentinel_rseg, trx.rsegs.m_noredo.rseg);
   EXPECT_EQ(sentinel_insert_undo, trx.rsegs.m_noredo.insert_undo);
   EXPECT_EQ(sentinel_update_undo, trx.rsegs.m_noredo.update_undo);

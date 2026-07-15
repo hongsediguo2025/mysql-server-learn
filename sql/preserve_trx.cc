@@ -95,7 +95,9 @@
 #include "sql/preserve_trx_drain.h"
 #include "sql/preserve_trx_kernel.h"
 #include "sql/preserve_trx_lock_warmcopy.h"
+#include "sql/preserve_trx_promotion.h"
 #include "sql/preserve_trx_promotion_prepared.h"
+#include "sql/preserve_trx_resurrection_index.h"
 #include "sql/preserve_trx_temp_table.h"
 #include "sql/preserve_trx_transfer.h"
 #include "sql/preserve_trx_warmcopy.h"
@@ -141,6 +143,8 @@ ulong preserve_trx_off_artifact_policy =
     PRESERVE_TRX_OFF_ARTIFACT_POLICY_FAIL_IF_PRESENT;
 uint preserve_trx_drain_grace_ms = 30000;
 uint preserve_trx_drain_hard_timeout_ms = 30000;
+uint preserve_trx_transfer_phase1_timeout_ms = 600000;
+uint preserve_trx_transfer_phase2_timeout_ms = 3000;
 bool preserve_trx_warmcopy_enable = true;
 uint preserve_trx_warmcopy_close_timeout_ms = 30000;
 uint preserve_trx_warmcopy_min_open_ms = 1000;
@@ -2120,6 +2124,172 @@ static bool preserve_trx_snapshot_identity_digest(
             << metadata.has_temp_engine_state << '\n'
             << metadata.has_logged_persistent_work << '\n';
   return preserve_trx_hmac_hex(canonical.str(), digest);
+}
+
+static bool preserve_trx_decode_sha256_hex(
+    const std::string &hex,
+    std::array<unsigned char, kPreservedTrxSha256Length> *digest) {
+  if (digest == nullptr || hex.size() != digest->size() * 2) return true;
+  const auto nibble = [](char ch, unsigned char *value) {
+    if (ch >= '0' && ch <= '9') {
+      *value = static_cast<unsigned char>(ch - '0');
+      return false;
+    }
+    if (ch >= 'a' && ch <= 'f') {
+      *value = static_cast<unsigned char>(ch - 'a' + 10);
+      return false;
+    }
+    if (ch >= 'A' && ch <= 'F') {
+      *value = static_cast<unsigned char>(ch - 'A' + 10);
+      return false;
+    }
+    return true;
+  };
+  for (size_t i = 0; i < digest->size(); ++i) {
+    unsigned char high = 0;
+    unsigned char low = 0;
+    if (nibble(hex[i * 2], &high) || nibble(hex[i * 2 + 1], &low)) {
+      return true;
+    }
+    (*digest)[i] = static_cast<unsigned char>((high << 4) | low);
+  }
+  return false;
+}
+
+static bool preserve_trx_build_resurrection_index_entry(
+    uint64_t source_connection_id,
+    const trx_preserve_resurrection_facts &facts,
+    Preserve_trx_resurrection_index_entry *entry) {
+  if (entry == nullptr || source_connection_id == 0 || facts.trx_id == 0 ||
+      facts.prepare_lsn == 0) {
+    return true;
+  }
+  const long gtrid_length = facts.xid.get_gtrid_length();
+  const long bqual_length = facts.xid.get_bqual_length();
+  if (gtrid_length <= 0 || gtrid_length > 64 || bqual_length < 0 ||
+      bqual_length > 64 || gtrid_length + bqual_length > XIDDATASIZE) {
+    return true;
+  }
+  Preserve_trx_resurrection_index_entry built;
+  built.token = source_connection_id;
+  built.trx_id = facts.trx_id;
+  built.prepare_lsn = facts.prepare_lsn;
+  built.xid.format_id = facts.xid.get_format_id();
+  built.xid.gtrid_length = static_cast<uint32_t>(gtrid_length);
+  built.xid.bqual_length = static_cast<uint32_t>(bqual_length);
+  std::memcpy(built.xid.data.data(), facts.xid.get_data(),
+              static_cast<size_t>(gtrid_length + bqual_length));
+  built.modified_table_ids = facts.modified_table_ids;
+  built.undo_anchors.reserve(facts.undo_anchors.size());
+  for (const trx_preserve_resurrection_undo_anchor &anchor :
+       facts.undo_anchors) {
+    built.undo_anchors.push_back(
+        {anchor.kind == trx_preserve_resurrection_undo_kind::INSERT
+             ? Preserve_trx_resurrection_undo_kind::INSERT
+             : Preserve_trx_resurrection_undo_kind::UPDATE,
+         anchor.rseg_space_id, anchor.undo_slot, anchor.hdr_page_no,
+         anchor.hdr_offset, anchor.top_page_no, anchor.top_offset,
+         anchor.top_undo_no, anchor.empty});
+  }
+  *entry = std::move(built);
+  return false;
+}
+
+static bool preserve_trx_resurrection_entry_to_engine_facts(
+    const Preserve_trx_resurrection_index_entry &entry,
+    trx_preserve_resurrection_facts *facts) {
+  if (facts == nullptr || entry.trx_id == 0 || entry.prepare_lsn == 0 ||
+      entry.xid.format_id == -1 || entry.xid.gtrid_length == 0 ||
+      entry.xid.gtrid_length > 64 || entry.xid.bqual_length > 64 ||
+      entry.xid.gtrid_length + entry.xid.bqual_length > entry.xid.data.size()) {
+    return true;
+  }
+  trx_preserve_resurrection_facts converted;
+  converted.trx_id = entry.trx_id;
+  converted.prepare_lsn = entry.prepare_lsn;
+  const char *xid_data =
+      reinterpret_cast<const char *>(entry.xid.data.data());
+  converted.xid.set(
+      static_cast<long>(entry.xid.format_id), xid_data,
+      static_cast<long>(entry.xid.gtrid_length),
+      xid_data + entry.xid.gtrid_length,
+      static_cast<long>(entry.xid.bqual_length));
+  converted.modified_table_ids = entry.modified_table_ids;
+  converted.undo_anchors.reserve(entry.undo_anchors.size());
+  for (const Preserve_trx_resurrection_undo_anchor &anchor :
+       entry.undo_anchors) {
+    converted.undo_anchors.push_back(
+        {anchor.kind == Preserve_trx_resurrection_undo_kind::INSERT
+             ? trx_preserve_resurrection_undo_kind::INSERT
+             : trx_preserve_resurrection_undo_kind::UPDATE,
+         anchor.rseg_space_id, anchor.undo_slot, anchor.hdr_page_no,
+         anchor.hdr_offset, anchor.top_page_no, anchor.top_offset,
+         anchor.top_undo_no, anchor.empty});
+  }
+  *facts = std::move(converted);
+  return false;
+}
+
+static bool preserve_trx_resurrection_metadata_is_strict(
+    const Preserve_snapshot_metadata &metadata) {
+  return metadata.engine_shape ==
+             Preserve_snapshot_engine_shape::PERSISTENT_ONLY &&
+         metadata.has_persistent_engine_state &&
+         !metadata.has_temp_engine_state &&
+         metadata.temp_table_manifest_payload.empty() &&
+         !metadata.has_read_view && metadata.read_view_payload.empty() &&
+         metadata.predicate_locks_payload.empty() &&
+         (metadata.binlog_gtid_next.empty() ||
+          metadata.binlog_gtid_next == "AUTOMATIC") &&
+         metadata.binlog_owned_gtid.empty() &&
+         (!metadata.has_binlog_gtid_mode || metadata.binlog_gtid_mode == 0);
+}
+
+static bool preserve_trx_resurrection_metadata_supports_local_startup_index(
+    const Preserve_snapshot_metadata &metadata) {
+  return metadata.engine_shape ==
+             Preserve_snapshot_engine_shape::PERSISTENT_ONLY &&
+         metadata.has_persistent_engine_state &&
+         !metadata.has_temp_engine_state &&
+         metadata.temp_table_manifest_payload.empty();
+}
+
+static void preserve_trx_write_local_resurrection_index(
+    const std::string &token, const std::string &snapshot_identity_digest,
+    Preserve_trx_resurrection_index_entry entry, Preserved_trx_store *store) {
+  Preserved_trx_codec_context context;
+  Preserve_trx_resurrection_index index;
+  index.epoch_id = "local-" + token;
+  const bool input_error =
+      store == nullptr ||
+      store->codec_context(
+          &context, Preserved_trx_codec_context_purpose::READ_EXISTING) !=
+          Preserve_snapshot_status::OK ||
+      context.server_uuid.empty() ||
+      preserve_trx_decode_sha256_hex(snapshot_identity_digest,
+                                     &entry.snapshot_digest);
+  Preserve_trx_resurrection_index_status encode_status =
+      Preserve_trx_resurrection_index_status::INVALID_ARGUMENT;
+  std::string encoded;
+  if (!input_error) {
+    index.source_server_uuid = context.server_uuid;
+    index.target_server_uuid = context.server_uuid;
+    index.entries.push_back(std::move(entry));
+    encode_status =
+        preserve_trx_encode_resurrection_index(index, context, &encoded);
+  }
+  Preserve_snapshot_status status = Preserve_snapshot_status::INVALID_ARGUMENT;
+  if (encode_status == Preserve_trx_resurrection_index_status::OK) {
+    const std::vector<unsigned char> bytes(encoded.begin(), encoded.end());
+    status = store->write_resurrection_index_new(token, bytes);
+  }
+  if (status != Preserve_snapshot_status::OK) {
+    const std::string message =
+        "PRESERVE: local startup Resurrection Index unavailable; native Undo "
+        "scan remains authoritative token=" +
+        token;
+    LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
+  }
 }
 
 static bool preserved_trx_publish_recovery_attempt_ledger(
@@ -5402,10 +5572,11 @@ class Preserve_batch_phase1_transfer_target_scanner final : public Do_THD_Impl {
           !candidate->m_server_idle && candidate->is_classic_protocol();
       /*
         Standby streaming transfer publishes token identity during phase 1 so
-        the receiver can create durable state before the blocking phase starts.
-        This scan intentionally does not mutate the THD batch state; the later
-        target counter remains the authoritative quiesce/admission decision and
-        any token not in the final target set is explicitly aborted.
+        the receiver can create current-process saved state before the blocking
+        phase starts. This scan intentionally does not mutate the THD batch
+        state; the later target counter remains the authoritative
+        quiesce/admission decision and any token not in the final target set is
+        explicitly aborted.
       */
       if (active_explicit_transaction || batch_inflight_statement ||
           nonidle_unclassified_command_packet) {
@@ -5923,17 +6094,15 @@ class Phase1_transfer_binlog_blob_provider final
       m_phase1_blobs.clear();
     }
     if (warmcopy_ids.empty()) return;
-    auto carrier = create_preserved_trx_default_warm_external_blob_carrier(
+    auto carrier = create_preserved_trx_process_local_warm_external_blob_carrier(
         preserve_trx_default_dir());
     if (carrier == nullptr) return;
-    for (const std::string &warmcopy_id : warmcopy_ids) {
-      if (carrier->remove_warm_external_blob(
-              warmcopy_id, kPreservedTrxBlobBinlogCache) !=
-          Preserved_trx_carrier_status::OK) {
-        LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
-               "PRESERVE: failed to remove retained source rollback binlog "
-               "artifact");
-      }
+    if (carrier->remove_warm_external_blobs(
+            warmcopy_ids, kPreservedTrxBlobBinlogCache) !=
+        Preserved_trx_carrier_status::OK) {
+      LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: failed to remove retained source rollback binlog "
+             "artifacts");
     }
   }
 
@@ -7765,6 +7934,32 @@ ulonglong preserve_trx_startup_recovery_orphan_rollback_count_status() {
   return g_startup_recovery_orphan_rollback_count.load();
 }
 
+ulonglong preserve_trx_startup_resurrection_index_candidates_status() {
+  return trx_preserve_startup_resurrection_metrics_snapshot().candidates;
+}
+
+ulonglong preserve_trx_startup_resurrection_index_hits_status() {
+  return trx_preserve_startup_resurrection_metrics_snapshot().index_hits;
+}
+
+ulonglong preserve_trx_startup_resurrection_index_fallbacks_status() {
+  return trx_preserve_startup_resurrection_metrics_snapshot().fallbacks;
+}
+
+ulonglong preserve_trx_startup_resurrection_undo_anchor_checks_status() {
+  return trx_preserve_startup_resurrection_metrics_snapshot()
+      .undo_anchor_checks;
+}
+
+ulonglong preserve_trx_startup_resurrection_undo_body_pages_status() {
+  return trx_preserve_startup_resurrection_metrics_snapshot().undo_body_pages;
+}
+
+ulonglong preserve_trx_startup_resurrection_undo_body_records_status() {
+  return trx_preserve_startup_resurrection_metrics_snapshot()
+      .undo_body_records;
+}
+
 ulonglong preserve_trx_startup_recovery_phase_snapshot_load_us_status() {
   return g_startup_recovery_phase_snapshot_load_us.load();
 }
@@ -7913,6 +8108,11 @@ const char *preserved_trx_dir_value() {
 
 void preserved_trx_mark_recovery_complete() {
   mark_preserved_trx_recovery_complete();
+  if (preserve_trx_is_enabled() &&
+      !preserved_trx_promotion_start_gate_workers()) {
+    LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+           "PRESERVE: failed to prestart promotion gate worker pool");
+  }
 }
 
 bool preserved_trx_recovery_complete() {
@@ -7921,6 +8121,10 @@ bool preserved_trx_recovery_complete() {
 }
 
 bool preserved_trx_mark_innodb_read_only_recovery_state() {
+  if (preserve_trx_transfer_receiver_enable) {
+    mark_preserved_trx_recovery_complete();
+    return false;
+  }
   if (!preserve_trx_is_enabled()) {
     mark_preserved_trx_recovery_complete();
     return false;
@@ -10453,6 +10657,12 @@ struct Preserved_trx_recover_or_adopt_result {
   std::string reason;
 };
 
+struct Preserved_trx_simulated_publication_context {
+  const Preserve_trx_targeted_publication_capability *capability{nullptr};
+  const Preserve_trx_prepared_token_key *key{nullptr};
+  trx_preserve_targeted_publication_journal *journal{nullptr};
+};
+
 struct Preserved_trx_recover_or_adopt_options {
   Preserved_trx_recover_or_adopt_policy policy{
       Preserved_trx_recover_or_adopt_policy::LOCAL_STARTUP_RECOVERY};
@@ -10460,6 +10670,9 @@ struct Preserved_trx_recover_or_adopt_options {
   bool record_lock_pages_prewarmed{false};
   const lock_preserve_metadata_plan_t *record_lock_plan{nullptr};
   Preserve_trx_physical_fence_lease *physical_fence_lease{nullptr};
+  trx_t *prepared_trx{nullptr};
+  const Preserved_trx_simulated_publication_context *simulated_publication{
+      nullptr};
 };
 
 bool preserved_trx_snapshot_allows_synthetic_temp_claim(
@@ -10506,6 +10719,7 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
   const bool strict_physical =
       options.policy == Preserved_trx_recover_or_adopt_policy::
                             STANDBY_PROMOTION_PHYSICAL_FENCE;
+  const bool simulated_publication = options.simulated_publication != nullptr;
 
   auto fail_before_claim = [&](const std::string &reason) {
     result->reason = reason;
@@ -10515,6 +10729,17 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
     return fail_before_claim(local_startup ? "invalid durable transaction "
                                              "snapshot"
                                            : "invalid promotion ready record");
+  }
+  if (simulated_publication &&
+      (!strict_physical || options.prepared_trx == nullptr ||
+       options.simulated_publication->capability == nullptr ||
+       options.simulated_publication->key == nullptr ||
+       options.simulated_publication->journal == nullptr ||
+       !options.simulated_publication->journal->active ||
+       options.simulated_publication->journal->trx != options.prepared_trx ||
+       !options.simulated_publication->capability->valid_for(
+           *options.simulated_publication->key))) {
+    return fail_before_claim("invalid simulated targeted publication inputs");
   }
   if (strict_physical &&
       (options.physical_fence_lease == nullptr ||
@@ -10571,8 +10796,16 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
   };
 
   uint64_t phase_started_us = preserve_trx_monotonic_us();
-  trx_t *trx = trx_preserve_claim_prepared(xid);
-  if (trx == nullptr &&
+  trx_t *trx = nullptr;
+  if (options.prepared_trx != nullptr) {
+    if (trx_preserve_claim_detached_prepared_exact(options.prepared_trx, xid) ==
+        DB_SUCCESS) {
+      trx = options.prepared_trx;
+    }
+  } else {
+    trx = trx_preserve_claim_prepared(xid);
+  }
+  if (trx == nullptr && options.prepared_trx == nullptr &&
       preserved_trx_snapshot_allows_synthetic_temp_claim(metadata)) {
     const uint64_t temp_owner_trx_id =
         preserve_trx_temp_table_owner_trx_id(metadata);
@@ -10589,6 +10822,9 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
                                    "adopt");
   }
   result->claimed = true;
+  if (simulated_publication) {
+    options.simulated_publication->journal->claimed = true;
+  }
 
   lock_preserve_import_journal_t strict_lock_journal;
 
@@ -10601,7 +10837,27 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
       result->cleanup_error = true;
       result->reason += "; metadata lock unwind failed";
     }
-    if (local_startup) {
+    if (simulated_publication) {
+      const auto unclaim_status = trx_preserve_unclaim_simulated_prepared(
+          *options.simulated_publication->capability,
+          *options.simulated_publication->key,
+          options.simulated_publication->journal);
+      const auto unpublish_status =
+          unclaim_status == trx_preserve_targeted_publication_status::OK
+              ? trx_preserve_unpublish_simulated_prepared(
+                    *options.simulated_publication->capability,
+                    *options.simulated_publication->key,
+                    options.simulated_publication->journal)
+              : trx_preserve_targeted_publication_status::INVALID_STATE;
+      if (unclaim_status == trx_preserve_targeted_publication_status::OK &&
+          unpublish_status == trx_preserve_targeted_publication_status::OK) {
+        result->rolled_back = true;
+      } else {
+        result->rolled_back = false;
+        result->cleanup_error = true;
+        result->reason += "; simulated publication reversal failed";
+      }
+    } else if (local_startup) {
       const bool cleanup_error = rollback_claimed_preserved_snapshot_or_log(
           dir, token, trx, reason, &metadata);
       result->cleanup_error = cleanup_error;
@@ -10629,7 +10885,8 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
     const std::string reason =
         std::string("physical-fence revalidation failed ") + stage;
     if (fence_status == Preserve_trx_physical_fence_status::
-                            PROVIDER_CONTRACT_VIOLATION) {
+                            PROVIDER_CONTRACT_VIOLATION &&
+        !simulated_publication) {
       taint_after_claim(reason + "; provider contract violated");
     } else {
       rollback_after_claim(reason);
@@ -11018,6 +11275,11 @@ static bool recover_preserved_snapshot(const std::string &dir,
   recover_options.policy =
       Preserved_trx_recover_or_adopt_policy::LOCAL_STARTUP_RECOVERY;
   recover_options.record_lock_pages_prewarmed = record_lock_pages_prewarmed;
+  XID startup_xid;
+  if (!preserve_trx_token_to_xid(token, &startup_xid)) {
+    recover_options.prepared_trx =
+        trx_preserve_startup_resurrection_find_verified(startup_xid);
+  }
   add_elapsed_us(subphase_started_us,
                  phase_metrics == nullptr ? nullptr
                                           : &phase_metrics->validate_us);
@@ -11143,6 +11405,41 @@ preserved_trx_adopt_prepared_for_physical_promotion(
 
   const lock_preserve_metadata_plan_t *record_lock_plan =
       adopt_lease->record_lock_plan();
+  const bool simulated_fence =
+      physical_lease->proof().consistency_mode ==
+      Preserve_trx_physical_consistency_mode::
+          TEST_ONLY_PHYSICAL_FENCE_SIMULATOR;
+  if (simulated_fence) {
+    const Preserve_trx_physical_fence_status fence_status =
+        physical_lease->revalidate();
+    if (fence_status != Preserve_trx_physical_fence_status::OK) {
+      result->provider_contract_violation =
+          fence_status == Preserve_trx_physical_fence_status::
+                              PROVIDER_CONTRACT_VIOLATION;
+      result->status = result->provider_contract_violation
+                           ? Preserved_trx_physical_adopt_status::
+                                 PHYSICAL_FENCE_PROVIDER_VIOLATION
+                           : Preserved_trx_physical_adopt_status::
+                                 PHYSICAL_FENCE_REVALIDATE_FAILED;
+      result->reason =
+          "simulated physical fence revalidation failed before targeted "
+          "publication";
+      return result->status;
+    }
+  }
+  Preserve_trx_prepared_token_key publication_key;
+  Preserve_trx_final_token_facts publication_facts;
+  const Preserve_trx_resurrection_index_entry *resurrection_entry = nullptr;
+  if (simulated_fence) {
+    resurrection_entry = adopt_lease->resurrection_entry();
+    if (resurrection_entry == nullptr ||
+        adopt_lease->copy_publication(&publication_key, &publication_facts) !=
+            Preserve_trx_prepared_status::OK) {
+      result->reason =
+          "simulated promotion requires authenticated publication facts";
+      return result->status;
+    }
+  }
   std::unique_ptr<Preserved_trx_bundle> bundle;
   if (adopt_lease->take_semantic_bundle(&bundle) !=
           Preserve_trx_prepared_status::OK ||
@@ -11151,15 +11448,105 @@ preserved_trx_adopt_prepared_for_physical_promotion(
     return result->status;
   }
 
+  Preserve_trx_targeted_publication_capability publication_capability;
+  trx_preserve_targeted_publication_journal *publication_journal = nullptr;
+  if (simulated_fence) {
+    trx_preserve_resurrection_facts engine_facts;
+    XID expected_xid;
+    auto journal =
+        std::make_unique<trx_preserve_targeted_publication_journal>();
+    if (std::to_string(resurrection_entry->token) != publication_key.token ||
+        resurrection_entry->token == 0 ||
+        bundle->metadata.token != publication_key.token ||
+        preserve_trx_resurrection_entry_to_engine_facts(*resurrection_entry,
+                                                        &engine_facts) ||
+        preserve_trx_token_to_xid(publication_key.token, &expected_xid) ||
+        !engine_facts.xid.eq(&expected_xid) ||
+        publication_facts.source_safe_next_trx_id_floor == 0 ||
+        !physical_lease->make_targeted_publication_capability(
+            publication_key, &publication_capability)) {
+      result->reason = "simulated targeted publication facts are invalid";
+      if (adopt_lease->restore_semantic_bundle(&bundle) !=
+          Preserve_trx_prepared_status::OK) {
+        result->status = Preserved_trx_physical_adopt_status::CLEANUP_TAINTED;
+        result->reason += "; semantic bundle ownership restore failed";
+      }
+      return result->status;
+    }
+    trx_preserve_targeted_publication_candidate candidate;
+    candidate.xid = engine_facts.xid;
+    candidate.trx_id = engine_facts.trx_id;
+    candidate.prepare_lsn = engine_facts.prepare_lsn;
+    candidate.safe_next_trx_id_floor =
+        publication_facts.source_safe_next_trx_id_floor;
+    const auto publish_status = trx_preserve_publish_simulated_prepared(
+        publication_capability, publication_key, candidate, journal.get());
+    if (publish_status != trx_preserve_targeted_publication_status::OK ||
+        journal->origin !=
+            trx_preserve_targeted_publication_origin::NEWLY_PUBLISHED) {
+      result->status =
+          publish_status == trx_preserve_targeted_publication_status::OK
+              ? Preserved_trx_physical_adopt_status::CLEANUP_TAINTED
+              : Preserved_trx_physical_adopt_status::PREPARED_TRX_NOT_FOUND;
+      result->reason =
+          publish_status == trx_preserve_targeted_publication_status::OK
+              ? "simulated targeted publication already exists without the "
+                "owning journal"
+              : "simulated targeted publication failed";
+      if (adopt_lease->restore_semantic_bundle(&bundle) !=
+          Preserve_trx_prepared_status::OK) {
+        result->status = Preserved_trx_physical_adopt_status::CLEANUP_TAINTED;
+        result->reason += "; semantic bundle ownership restore failed";
+      }
+      return result->status;
+    }
+    publication_journal = journal.get();
+    if (adopt_lease->install_targeted_publication_journal(
+            std::move(journal)) != Preserve_trx_prepared_status::OK) {
+      const auto reverse_status = trx_preserve_unpublish_simulated_prepared(
+          publication_capability, publication_key, publication_journal);
+      result->status =
+          reverse_status == trx_preserve_targeted_publication_status::OK
+              ? Preserved_trx_physical_adopt_status::INVALID_ARGUMENT
+              : Preserved_trx_physical_adopt_status::CLEANUP_TAINTED;
+      result->reason = "failed to install simulated publication journal";
+      if (adopt_lease->restore_semantic_bundle(&bundle) !=
+          Preserve_trx_prepared_status::OK) {
+        result->status = Preserved_trx_physical_adopt_status::CLEANUP_TAINTED;
+        result->reason += "; semantic bundle ownership restore failed";
+      }
+      return result->status;
+    }
+  }
+
   Preserved_trx_recover_or_adopt_options options;
   options.policy = Preserved_trx_recover_or_adopt_policy::
       STANDBY_PROMOTION_PHYSICAL_FENCE;
   options.deadline_us = operation_deadline_us;
   options.record_lock_plan = record_lock_plan;
   options.physical_fence_lease = physical_lease;
+  Preserved_trx_simulated_publication_context simulated_publication;
+  if (simulated_fence) {
+    simulated_publication.capability = &publication_capability;
+    simulated_publication.key = &publication_key;
+    simulated_publication.journal = publication_journal;
+    options.prepared_trx = publication_journal->trx;
+    options.simulated_publication = &simulated_publication;
+  }
   Preserved_trx_recover_or_adopt_result kernel_result;
   const bool adopted = preserved_trx_recover_or_adopt_bundle_shared(
       dir, bundle.get(), options, nullptr, nullptr, &kernel_result);
+
+  if (!adopted && simulated_fence && publication_journal->active &&
+      !publication_journal->claimed) {
+    const auto reverse_status = trx_preserve_unpublish_simulated_prepared(
+        publication_capability, publication_key, publication_journal);
+    if (reverse_status != trx_preserve_targeted_publication_status::OK) {
+      kernel_result.cleanup_error = true;
+      kernel_result.reason += "; unclaimed simulated publication reversal "
+                              "failed";
+    }
+  }
 
   result->claimed = kernel_result.claimed;
   result->rolled_back = kernel_result.rolled_back;
@@ -11210,7 +11597,74 @@ preserved_trx_adopt_prepared_for_physical_promotion(
   return result->status;
 }
 
+bool preserved_trx_reverse_simulated_promotion_adopt(
+    const Preserve_trx_prepared_token_key &key,
+    Preserve_trx_cleanup_lease *cleanup_lease,
+    Preserve_trx_physical_fence_lease *physical_lease, std::string *reason) {
+  auto fail = [&](const std::string &message) {
+    if (reason != nullptr) *reason = message;
+    return false;
+  };
+  if (key.token.empty() || cleanup_lease == nullptr ||
+      !cleanup_lease->active() || physical_lease == nullptr ||
+      !physical_lease->acquired() ||
+      physical_lease->proof().consistency_mode !=
+          Preserve_trx_physical_consistency_mode::
+              TEST_ONLY_PHYSICAL_FENCE_SIMULATOR) {
+    return fail("simulated adopt reversal requires active cleanup and fence "
+                "leases");
+  }
+
+  Preserve_trx_targeted_publication_capability capability;
+  trx_preserve_targeted_publication_journal *journal =
+      cleanup_lease->targeted_publication_journal();
+  if (journal == nullptr || !journal->active || !journal->claimed ||
+      journal->origin !=
+          trx_preserve_targeted_publication_origin::NEWLY_PUBLISHED ||
+      journal->trx == nullptr ||
+      !physical_lease->make_targeted_publication_capability(key,
+                                                            &capability)) {
+    return fail("simulated adopt reversal journal is unavailable");
+  }
+
+  Preserved_trx_record record;
+  if (!preserved_trx_take_promotion_adopted_record(key.token, &record)) {
+    return fail("simulated adopt reversal record is unavailable");
+  }
+  if (record.trx != journal->trx || record.metadata.token != key.token) {
+    (void)restore_record_after_resume_failure(
+        record, "simulated adopt reversal identity conflict");
+    return fail("simulated adopt reversal identity conflict");
+  }
+
+  const auto unclaim_status = trx_preserve_unclaim_simulated_prepared(
+      capability, key, journal);
+  if (unclaim_status != trx_preserve_targeted_publication_status::OK) {
+    (void)restore_record_after_resume_failure(
+        record, "simulated adopt reversal unclaim failed");
+    return fail("simulated adopt reversal unclaim failed");
+  }
+  const auto unpublish_status = trx_preserve_unpublish_simulated_prepared(
+      capability, key, journal);
+  if (unpublish_status != trx_preserve_targeted_publication_status::OK) {
+    if (trx_preserve_claim_detached_prepared_exact(record.trx, journal->xid) ==
+        DB_SUCCESS) {
+      journal->claimed = true;
+      (void)restore_record_after_resume_failure(
+          record, "simulated adopt reversal unpublish failed");
+    }
+    return fail("simulated adopt reversal unpublish failed");
+  }
+
+  delete_detached_mdl_context(key.token);
+  audit_preserved_trx_event(current_thd, key.token,
+                            "promotion-simulator-reverse", "success");
+  if (reason != nullptr) reason->clear();
+  return true;
+}
+
 bool preserved_trx_preflight_recoverability() {
+  if (preserve_trx_transfer_receiver_enable) return false;
   if (!preserve_trx_is_enabled()) {
     if (!preserve_trx_off_artifact_policy_recover() &&
         !preserve_trx_off_artifact_policy_abandon()) {
@@ -11300,7 +11754,122 @@ bool preserved_trx_preflight_recoverability() {
   return false;
 }
 
+void preserved_trx_resurrection_index_bootstrap_preamble() {
+  trx_preserve_startup_resurrection_reset();
+  if (preserve_trx_transfer_receiver_enable) return;
+  if ((!preserve_trx_is_enabled() &&
+       !preserve_trx_off_artifact_policy_recover()) ||
+      srv_force_recovery > 0) {
+    return;
+  }
+
+  const std::string dir = normalize_dir(preserve_trx_default_dir());
+  auto store = create_preserved_trx_default_store(dir);
+  Preserved_trx_carrier_listing listing;
+  if (store->list_tokens(&listing) != Preserve_snapshot_status::OK) {
+    LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+           "PRESERVE: startup Resurrection Index scan unavailable; native "
+           "Undo scan remains authoritative");
+    return;
+  }
+
+  const std::set<std::string> snapshot_tokens =
+      preserved_trx_local_recoverable_snapshot_tokens(listing);
+  if (snapshot_tokens.empty()) return;
+
+  Preserved_trx_codec_context context;
+  if (store->codec_context(
+          &context, Preserved_trx_codec_context_purpose::READ_EXISTING) !=
+          Preserve_snapshot_status::OK ||
+      context.server_uuid.empty()) {
+    LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+           "PRESERVE: startup Resurrection Index authentication context "
+           "unavailable; native Undo scan remains authoritative");
+    return;
+  }
+
+  constexpr uint64_t kMaxLocalResurrectionIndexBytes = 64ULL * 1024ULL * 1024ULL;
+  for (const std::string &token : snapshot_tokens) {
+    std::vector<unsigned char> index_bytes;
+    const Preserve_snapshot_status sidecar_status =
+        store->read_resurrection_index(
+            token, kMaxLocalResurrectionIndexBytes, &index_bytes);
+    if (sidecar_status == Preserve_snapshot_status::NOT_FOUND) continue;
+    if (sidecar_status != Preserve_snapshot_status::OK) {
+      log_preserved_trx_recovery_warning(
+          token, "startup Resurrection Index sidecar is unreadable; native "
+                 "Undo scan will be used");
+      continue;
+    }
+
+    Preserve_trx_resurrection_index index;
+    const std::string encoded(index_bytes.begin(), index_bytes.end());
+    if (preserve_trx_decode_resurrection_index(encoded, context, &index) !=
+            Preserve_trx_resurrection_index_status::OK ||
+        index.source_server_uuid != context.server_uuid ||
+        index.target_server_uuid != context.server_uuid ||
+        index.epoch_id != "local-" + token || index.entries.size() != 1) {
+      log_preserved_trx_recovery_warning(
+          token, "startup Resurrection Index authentication or identity "
+                 "mismatch; native Undo scan will be used");
+      continue;
+    }
+
+    Preserved_trx_bundle bundle;
+    if (store->read(token, true,
+                    Preserved_trx_carrier::Payload_read_mode::SNAPSHOT_ONLY,
+                    &bundle) != Preserve_snapshot_status::OK ||
+        bundle.metadata.token != token ||
+        !preserve_trx_resurrection_metadata_supports_local_startup_index(
+            bundle.metadata)) {
+      log_preserved_trx_recovery_warning(
+          token,
+          "startup Resurrection Index snapshot has unsupported engine shape; "
+          "native Undo scan will be used");
+      continue;
+    }
+
+    std::string snapshot_identity_digest;
+    std::array<unsigned char, kPreservedTrxSha256Length> expected_digest{};
+    if (preserve_trx_snapshot_identity_digest(bundle.metadata,
+                                              &snapshot_identity_digest) ||
+        preserve_trx_decode_sha256_hex(snapshot_identity_digest,
+                                       &expected_digest) ||
+        index.entries.front().snapshot_digest != expected_digest) {
+      log_preserved_trx_recovery_warning(
+          token, "startup Resurrection Index snapshot digest mismatch; "
+                 "native Undo scan will be used");
+      continue;
+    }
+
+    trx_preserve_resurrection_facts facts;
+    XID expected_xid;
+    if (preserve_trx_resurrection_entry_to_engine_facts(index.entries.front(),
+                                                        &facts) ||
+        preserve_trx_token_to_xid(token, &expected_xid) ||
+        !facts.xid.eq(&expected_xid)) {
+      log_preserved_trx_recovery_warning(
+          token, "startup Resurrection Index transaction facts mismatch; "
+                 "native Undo scan will be used");
+      continue;
+    }
+    DBUG_EXECUTE_IF(
+        "preserve_trx_startup_force_resurrection_anchor_mismatch", {
+          if (!facts.undo_anchors.empty()) {
+            ++facts.undo_anchors.front().top_offset;
+          }
+        });
+    if (trx_preserve_startup_register_resurrection_candidate(facts) !=
+        DB_SUCCESS) {
+      log_preserved_trx_recovery_warning(
+          token, "startup Resurrection Index candidate registration failed; "
+                 "native Undo scan will be used");
+    }
+  }
+}
+
 bool preserved_temp_images_bootstrap_preamble() {
+  if (preserve_trx_transfer_receiver_enable) return false;
   if (!preserve_trx_is_enabled() &&
       !preserve_trx_off_artifact_policy_recover()) {
     return false;
@@ -11565,6 +12134,15 @@ bool preserved_temp_images_bootstrap_preamble() {
 }
 
 bool preserved_trx_recover_all() {
+  if (preserve_trx_transfer_receiver_enable) {
+    preserved_trx_mark_recovery_complete();
+    return false;
+  }
+  struct Startup_verified_resurrection_guard {
+    ~Startup_verified_resurrection_guard() {
+      trx_preserve_startup_resurrection_clear_verified();
+    }
+  } startup_verified_resurrection_guard;
   const bool off_recover_mode =
       !preserve_trx_is_enabled() && preserve_trx_off_artifact_policy_recover();
   const bool off_abandon_mode =
@@ -12511,14 +13089,30 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   lock_limits.max_modified_tables = preserve_trx_max_modified_tables;
   lock_limits.max_scan_pages = preserve_trx_max_scan_pages;
   lock_limits.materialize_timeout_ms = preserve_trx_materialize_timeout_ms;
+  /*
+    Batch drain preserves the native redo-backed transaction identity. Local
+    startup rebuilds the same trx_id in rw_trx_set from Undo, while strict
+    promotion must prove the equivalent physical continuity before adopt.
+    Record DB_TRX_ID plus that active trx_t already represents implicit lock
+    ownership, so batch artifacts serialize only explicit lock_sys state.
+
+    Keep the legacy client-token path unchanged until it is migrated to the
+    same authenticated resurrection contract.
+  */
+  const bool use_native_implicit_lock_continuity = batch_delivery;
   bool materialized_any_implicit_lock = false;
   auto materialize_implicit_locks_for_live_export = [&]() -> const char * {
     materialized_any_implicit_lock = false;
     /*
-      Live export must convert implicit record locks into explicit lock objects
-      before it can serialize them. If conversion fails after materializing
-      some locks, the transaction stays attached and remains valid with
-      equivalent or stronger InnoDB lock coverage.
+      The legacy client-token export has not migrated to the authenticated
+      resurrection contract, so it converts implicit record locks before
+      serializing lock_sys state. Batch drain/transfer must not call this
+      fallback: page/Undo trx_id plus active trx_t membership carries native
+      implicit-lock ownership across startup or a future physical promotion.
+
+      If legacy conversion fails after materializing some locks, the
+      transaction stays attached and remains valid with equivalent or stronger
+      InnoDB lock coverage.
     */
     if (trx_preserve_materialize_implicit_locks(
             thd, lock_limits, &materialized_any_implicit_lock) ==
@@ -12534,7 +13128,8 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     }
     return "implicit_lock_materialize_failed";
   };
-  if (!use_lock_warmcopy_artifact) {
+  if (!use_lock_warmcopy_artifact &&
+      !use_native_implicit_lock_continuity) {
     const char *materialize_failure =
         materialize_implicit_locks_for_live_export();
     if (materialize_failure != nullptr) {
@@ -12600,10 +13195,12 @@ bool preserve_trx_kernel_preserve_attached_transaction(
                 Preserve_trx_lock_warmcopy_reason::
                     CANONICAL_EQUIVALENCE_FAILED));
       }
-      const char *materialize_failure =
-          materialize_implicit_locks_for_live_export();
-      if (materialize_failure != nullptr) {
-        return reject_after_binlog_export(materialize_failure);
+      if (!use_native_implicit_lock_continuity) {
+        const char *materialize_failure =
+            materialize_implicit_locks_for_live_export();
+        if (materialize_failure != nullptr) {
+          return reject_after_binlog_export(materialize_failure);
+        }
       }
       preserve_trx_lock_warmcopy_note_route_fallback(
           Preserve_trx_lock_warmcopy_reason::CANONICAL_EQUIVALENCE_FAILED);
@@ -12712,9 +13309,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       source instead of mixing warmcopy record state with live table or MDL
       state.
     */
-    const char *materialize_failure =
-        materialize_implicit_locks_for_live_export();
-    if (materialize_failure != nullptr) return materialize_failure;
+    if (!use_native_implicit_lock_continuity) {
+      const char *materialize_failure =
+          materialize_implicit_locks_for_live_export();
+      if (materialize_failure != nullptr) return materialize_failure;
+    }
 
     const char *mdl_failure = export_live_mdl_descriptors();
     if (mdl_failure != nullptr) return mdl_failure;
@@ -13062,9 +13661,11 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       release the conversion freeze, materialize implicit locks for live export
       and rebuild all lock payloads before prepare observes the final state.
     */
-    const char *materialize_failure =
-        materialize_implicit_locks_for_live_export();
-    if (materialize_failure != nullptr) return materialize_failure;
+    if (!use_native_implicit_lock_continuity) {
+      const char *materialize_failure =
+          materialize_implicit_locks_for_live_export();
+      if (materialize_failure != nullptr) return materialize_failure;
+    }
 
     const char *mdl_failure = export_live_mdl_descriptors();
     if (mdl_failure != nullptr) return mdl_failure;
@@ -13243,6 +13844,19 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   if (temp_prepare_failed) {
     thaw_lock_warmcopy_conversion();
     return restore_batch_prepare_failure_or_rollback();
+  }
+  trx_preserve_resurrection_facts resurrection_facts;
+  trx_t *prepared_trx = trx_preserve_current_thd_trx(thd);
+  const bool has_resurrection_facts =
+      trx_preserve_export_resurrection_facts(
+          prepared_trx, preserve_trx_max_modified_tables,
+          &resurrection_facts) == DB_SUCCESS;
+  if (artifact_decision ==
+          Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE &&
+      !has_resurrection_facts) {
+      thaw_lock_warmcopy_conversion();
+      set_failure_reason("standby_transfer_resurrection_facts_unsupported");
+      return restore_batch_prepare_failure_or_rollback();
   }
   if (result != nullptr) result->durable_point_crossed = true;
   auto restore_prepared_batch_or_rollback = [&]() {
@@ -13854,6 +14468,37 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   }
   blob_descriptors = bundle.blob_descriptors;
 
+  Preserve_trx_resurrection_index_entry transfer_resurrection_entry;
+  const Preserve_trx_resurrection_index_entry *transfer_resurrection_entry_ptr =
+      nullptr;
+  bool local_startup_resurrection_index_eligible = false;
+  Preserve_trx_resurrection_index_entry local_resurrection_entry;
+  if (artifact_decision ==
+      Preserve_trx_transfer_artifact_decision::STANDBY_TRANSFER_SAVE) {
+    const Preserve_snapshot_metadata &transfer_metadata = bundle.metadata;
+    const bool strict_semantics =
+        has_resurrection_facts &&
+        preserve_trx_resurrection_metadata_is_strict(transfer_metadata) &&
+        !preserve_trx_build_resurrection_index_entry(
+            token_selection.transfer_token, resurrection_facts,
+            &transfer_resurrection_entry);
+    if (!strict_semantics) {
+      set_failure_reason("standby_transfer_strict_semantics_unsupported");
+      discard_prebuilt_binlog_blob_if_needed();
+      return reject_after_snapshot_failure(false);
+    }
+    transfer_resurrection_entry_ptr = &transfer_resurrection_entry;
+  } else if (artifact_decision ==
+                 Preserve_trx_transfer_artifact_decision::LOCAL_CARRIER &&
+             has_resurrection_facts &&
+             preserve_trx_resurrection_metadata_supports_local_startup_index(
+                 bundle.metadata)) {
+    local_startup_resurrection_index_eligible =
+        !preserve_trx_build_resurrection_index_entry(
+            static_cast<uint64_t>(thd->thread_id()), resurrection_facts,
+            &local_resurrection_entry);
+  }
+
   Preserve_snapshot_write_options snapshot_write_options;
   snapshot_write_options.defer_file_fsync = false;
   snapshot_write_options.defer_directory_fsync =
@@ -13900,7 +14545,8 @@ bool preserve_trx_kernel_preserve_attached_transaction(
           target_server_uuid, token_selection.transfer_token,
           preserve_trx_transfer_chunk_bytes,
           transfer_frame_sink.get(), &artifact_sink,
-          request.transfer_source_epoch_session, request.transfer_preserve_dir);
+          request.transfer_source_epoch_session, request.transfer_preserve_dir,
+          transfer_resurrection_entry_ptr);
   if (artifact_sink_status != Preserve_snapshot_status::OK ||
       artifact_sink == nullptr) {
     set_failure_reason("standby_transfer_publish_unsupported");
@@ -13950,6 +14596,12 @@ bool preserve_trx_kernel_preserve_attached_transaction(
       preserve_trx_xid_provenance_bind(token, snapshot_identity_digest)) {
     set_failure_reason("xid_provenance_snapshot_bind_failed");
     return reject_after_snapshot_failure(true);
+  }
+
+  if (local_startup_resurrection_index_eligible) {
+    preserve_trx_write_local_resurrection_index(
+        token, snapshot_identity_digest, std::move(local_resurrection_entry),
+        &store.store());
   }
 
   if (use_lock_warmcopy_artifact) {
@@ -14582,6 +15234,13 @@ bool Preserve_trx_drain_service::execute(
         descriptor.kind = Preserve_trx_transfer_object_kind::EXTERNAL_BLOB;
         descriptor.total_size = record_blob.size;
         descriptor.digest = record_blob.digest;
+        descriptor.lock_plan.version = record_blob.lock_plan_contract_version;
+        descriptor.lock_plan.source_live_generation =
+            record_blob.source_live_lock_generation;
+        descriptor.lock_plan.source_live_digest =
+            record_blob.source_live_lock_digest;
+        descriptor.lock_plan.record_store_fingerprint =
+            record_blob.record_store_fingerprint;
         if (batch_transfer_source_session->object_presealed_for_token(
                 static_cast<uint64_t>(target_thread_id), descriptor)) {
           continue;
@@ -14593,6 +15252,14 @@ bool Preserve_trx_drain_service::execute(
         request.warmcopy_epoch = record_blob.warmcopy_epoch;
         request.size = record_blob.size;
         request.digest = record_blob.digest;
+        request.lock_plan_contract_version =
+            record_blob.lock_plan_contract_version;
+        request.source_live_lock_generation =
+            record_blob.source_live_lock_generation;
+        request.source_live_lock_digest =
+            record_blob.source_live_lock_digest;
+        request.record_store_fingerprint =
+            record_blob.record_store_fingerprint;
         if (batch_transfer_phase1_sender->enqueue(request) !=
             Preserve_trx_transfer_status::OK) {
           abort_batch_transfer_epoch(
@@ -14741,6 +15408,14 @@ bool Preserve_trx_drain_service::execute(
               request.warmcopy_epoch = record_blob.warmcopy_epoch;
               request.size = record_blob.size;
               request.digest = record_blob.digest;
+              request.lock_plan_contract_version =
+                  record_blob.lock_plan_contract_version;
+              request.source_live_lock_generation =
+                  record_blob.source_live_lock_generation;
+              request.source_live_lock_digest =
+                  record_blob.source_live_lock_digest;
+              request.record_store_fingerprint =
+                  record_blob.record_store_fingerprint;
               return batch_transfer_phase1_sender->enqueue(request) ==
                      Preserve_trx_transfer_status::OK;
             })) {
@@ -14801,6 +15476,10 @@ bool Preserve_trx_drain_service::execute(
     preserve_trx_phase2_reset_latest_metrics();
     preserve_trx_transfer_reset_source_phase2_metrics();
     phase2_total_started_us = preserve_trx_monotonic_us();
+    if (batch_transfer_source_session != nullptr) {
+      batch_transfer_source_session->set_operation_timeout_ms(
+          preserve_trx_transfer_phase2_timeout_ms);
+    }
     draining.transition_to(Preserve_trx_manager_state::WARMCOPY_CLOSING);
     if (warmcopy_participant != nullptr) {
       warmcopy_close_deadline_us = preserve_trx_monotonic_deadline_after_ms(
@@ -15487,10 +16166,21 @@ bool Preserve_trx_drain_service::execute(
 
   std::map<my_thread_id, std::string> batch_provenance_tokens_by_thread_id;
   std::vector<std::string> batch_provenance_tokens;
-  if (preserve_trx_select_batch_tokens(
-          quiesced_target_thread_ids, batch_artifact_decision,
-          &batch_provenance_tokens_by_thread_id, &batch_provenance_tokens) ||
-      preserve_trx_xid_provenance_begin_many(batch_provenance_tokens)) {
+  const ulonglong provenance_begin_started_us = preserve_trx_monotonic_us();
+  const bool provenance_token_selection_failed = preserve_trx_select_batch_tokens(
+      quiesced_target_thread_ids, batch_artifact_decision,
+      &batch_provenance_tokens_by_thread_id, &batch_provenance_tokens);
+  const bool provenance_begin_failed =
+      !provenance_token_selection_failed &&
+      preserve_trx_xid_provenance_begin_many(batch_provenance_tokens);
+  if (batch_transfer_source_session != nullptr) {
+    const std::string message =
+        "PRESERVE: standby transfer source XID provenance begin token_count=" +
+        std::to_string(batch_provenance_tokens.size()) + " elapsed_us=" +
+        std::to_string(elapsed_since(provenance_begin_started_us));
+    LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
+  }
+  if (provenance_token_selection_failed || provenance_begin_failed) {
     Preserve_batch_clear_generation clear(generation);
     Global_THD_manager::get_instance()->do_for_all_thd_copy(&clear);
     abort_batch_transfer_epoch("xid_provenance_batch_intent_write_failed");
@@ -15883,7 +16573,17 @@ bool Preserve_trx_drain_service::execute(
     batch_provenance_bindings.emplace_back(
         execution.result.token, execution.result.snapshot_identity_digest);
   }
-  if (preserve_trx_xid_provenance_bind_many(batch_provenance_bindings)) {
+  const ulonglong provenance_bind_started_us = preserve_trx_monotonic_us();
+  const bool provenance_bind_failed =
+      preserve_trx_xid_provenance_bind_many(batch_provenance_bindings);
+  if (batch_transfer_source_session != nullptr) {
+    const std::string message =
+        "PRESERVE: standby transfer source XID provenance bind token_count=" +
+        std::to_string(batch_provenance_bindings.size()) + " elapsed_us=" +
+        std::to_string(elapsed_since(provenance_bind_started_us));
+    LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
+  }
+  if (provenance_bind_failed) {
     const bool cleanup_error = restore_preserved_batch_items_to_original_thds(
         generation, preserved_batch_items);
     abort_batch_transfer_epoch("xid_provenance_batch_bind_failed");
@@ -15938,12 +16638,21 @@ bool Preserve_trx_drain_service::execute(
         batch_transfer_source_session->commit_epoch();
     phase2_metrics.transfer_commit_epoch_us +=
         elapsed_since(commit_epoch_started_us);
-    if (commit_status != Preserve_trx_transfer_status::OK) {
+    const bool receiver_committed =
+        commit_status == Preserve_trx_transfer_status::COMMITTED_READY ||
+        commit_status == Preserve_trx_transfer_status::COMMITTED_NOT_READY;
+    const bool receiver_commit_succeeded =
+        commit_status == Preserve_trx_transfer_status::OK ||
+        commit_status == Preserve_trx_transfer_status::COMMITTED_READY ||
+        commit_status == Preserve_trx_transfer_status::COMMITTED_NOT_READY;
+    if (!receiver_commit_succeeded) {
       LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
              ("PRESERVE: standby transfer source epoch commit failed status=" +
               std::to_string(static_cast<int>(commit_status)))
                  .c_str());
-      abort_batch_transfer_epoch("standby_transfer_commit_failed");
+      if (!receiver_committed) {
+        abort_batch_transfer_epoch("standby_transfer_commit_failed");
+      }
       const bool cleanup_error = restore_preserved_batch_items_to_original_thds(
           generation, preserved_batch_items);
       if (cleanup_error) {
@@ -15956,6 +16665,42 @@ bool Preserve_trx_drain_service::execute(
       abort_drain_participants("standby_transfer_commit_failed");
       return preserve_trx_reject_unsupported();
     }
+
+    // FINAL_ACK is the transfer ownership boundary. From this point onward,
+    // target prewarm, promotion, or abandon are target-local HA concerns.
+    batch_transfer_phase1_flush_context.session = nullptr;
+
+    ulonglong teardown_started_us = preserve_trx_monotonic_us();
+    batch_transfer_source_session.reset();
+    LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+           ("PRESERVE: standby transfer source post-ack teardown component="
+            "source_epoch_session elapsed_us=" +
+            std::to_string(elapsed_since(teardown_started_us)))
+               .c_str());
+
+    teardown_started_us = preserve_trx_monotonic_us();
+    batch_transfer_frame_sink.reset();
+    LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+           ("PRESERVE: standby transfer source post-ack teardown component="
+            "frame_sink elapsed_us=" +
+            std::to_string(elapsed_since(teardown_started_us)))
+               .c_str());
+
+    teardown_started_us = preserve_trx_monotonic_us();
+    batch_transfer_binlog_blob_provider.reset();
+    LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+           ("PRESERVE: standby transfer source post-ack teardown component="
+            "binlog_blob_provider elapsed_us=" +
+            std::to_string(elapsed_since(teardown_started_us)))
+               .c_str());
+
+    teardown_started_us = preserve_trx_monotonic_us();
+    batch_transfer_phase1_declared_tokens.clear();
+    LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
+           ("PRESERVE: standby transfer source post-ack teardown component="
+            "declared_tokens elapsed_us=" +
+            std::to_string(elapsed_since(teardown_started_us)))
+               .c_str());
   }
   phase2_metrics.target_preserve_us += elapsed_since(timed_started_us);
 
@@ -16984,7 +17729,7 @@ bool write_strict_attach_intent(
       !preserved_trx_encode_strict_attach_intent_v1(intent, &encoded)) {
     return false;
   }
-  auto store = create_preserved_trx_default_store(key.preserve_dir);
+  auto store = create_preserved_trx_process_local_store(key.preserve_dir);
   return store->write_promotion_intent_epoch(journal_id, encoded) ==
          Preserve_snapshot_status::OK;
 }
@@ -16994,7 +17739,7 @@ void remove_strict_attach_intent(
   const std::string journal_id =
       preserved_trx_strict_attach_intent_journal_id(key);
   if (journal_id.empty()) return;
-  auto store = create_preserved_trx_default_store(key.preserve_dir);
+  auto store = create_preserved_trx_process_local_store(key.preserve_dir);
   (void)store->remove_promotion_intent_epoch(journal_id);
 }
 

@@ -14,6 +14,7 @@ planner do not require a running MySQL server.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import dataclasses
 import datetime
 import enum
@@ -33,7 +34,7 @@ import sys
 import threading
 import time
 import zlib
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Deque, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 
 LOG = logging.getLogger("resumable_trx_business_e2e")
@@ -41,7 +42,7 @@ LOG = logging.getLogger("resumable_trx_business_e2e")
 WARMCOPY_TAIL_BUDGET_BYTES = 1024 * 1024
 COM_PRESERVE_TRX_TRANSFER = 33
 TRANSFER_FRAME_MAGIC = b"PTRXFRM1"
-TRANSFER_PROTOCOL_VERSION = 3
+TRANSFER_PROTOCOL_VERSION = 4
 MAX_TRANSFER_FRAME_STRING_BYTES = 1024 * 1024
 FULL_LOCK_HEAVY_MIN_RECORD_LOCK_PAGES = 2000
 FULL_LOCK_HEAVY_MIN_PHASE2_RECORD_LOCKS = 1000000
@@ -54,6 +55,20 @@ REQUIRED_LOCK_HEAVY_STARTUP_FIELDS = [
     "startup_recovery_snapshot_record_lock_prefetch_pages_samples",
     "startup_recovery_snapshot_record_lock_prefetch_resident_pages_samples",
 ]
+EVIDENCE_KIND_LOCAL_STARTUP_E2E = "LOCAL_STARTUP_E2E"
+EVIDENCE_KIND_STANDALONE_TRANSFER_E2E = "STANDALONE_TRANSFER_E2E"
+EVIDENCE_KIND_WARM_GATE_SIMULATOR = "WARM_GATE_SIMULATOR"
+
+
+def _evidence_contract(evidence_kind: str) -> Dict[str, object]:
+    """Return the facts every Preserve/Resume evidence report must expose."""
+
+    return {
+        "evidence_kind": evidence_kind,
+        "physical_replication": False,
+        "production_provider": False,
+        "write_enable_exercised": False,
+    }
 
 
 def _max_numeric_report_value(value: object) -> float:
@@ -100,6 +115,100 @@ def _summarize_us_samples(samples: Sequence[Optional[int]]) -> Dict[str, Optiona
         "p99_us": nearest_rank(99),
         "max_us": values[-1],
     }
+
+
+def build_receiver_read_load_report(
+    *,
+    threads: int,
+    baseline_duration_s: float,
+    baseline_query_count: int,
+    baseline_latency_samples_us: Sequence[int],
+    transfer_duration_s: float,
+    transfer_query_count: int,
+    transfer_latency_samples_us: Sequence[int],
+    error_count: int,
+    first_error: Optional[str],
+) -> Dict[str, object]:
+    """Build bounded point-read evidence for the receiver transfer window."""
+
+    baseline_qps = (
+        baseline_query_count / baseline_duration_s if baseline_duration_s > 0 else 0.0
+    )
+    transfer_qps = (
+        transfer_query_count / transfer_duration_s if transfer_duration_s > 0 else 0.0
+    )
+    baseline_latency = _summarize_us_samples(baseline_latency_samples_us)
+    transfer_latency = _summarize_us_samples(transfer_latency_samples_us)
+    baseline_p99_us = int(baseline_latency["p99_us"] or 0)
+    transfer_p99_us = int(transfer_latency["p99_us"] or 0)
+    qps_drop_pct = (
+        max(0.0, (baseline_qps - transfer_qps) * 100.0 / baseline_qps)
+        if baseline_qps > 0
+        else 0.0
+    )
+    p99_increase_pct = (
+        max(
+            0.0,
+            (transfer_p99_us - baseline_p99_us) * 100.0 / baseline_p99_us,
+        )
+        if baseline_p99_us > 0
+        else 0.0
+    )
+    return {
+        "receiver_read_load_threads": threads,
+        "receiver_read_load_baseline_duration_s": round(baseline_duration_s, 6),
+        "receiver_read_load_transfer_duration_s": round(transfer_duration_s, 6),
+        "receiver_read_load_baseline_query_count": baseline_query_count,
+        "receiver_read_load_transfer_query_count": transfer_query_count,
+        "receiver_read_load_baseline_qps": round(baseline_qps, 6),
+        "receiver_read_load_transfer_qps": round(transfer_qps, 6),
+        "receiver_read_load_qps_drop_pct": round(qps_drop_pct, 6),
+        "receiver_read_load_baseline_latency_sample_count": int(
+            baseline_latency["sample_count"] or 0
+        ),
+        "receiver_read_load_transfer_latency_sample_count": int(
+            transfer_latency["sample_count"] or 0
+        ),
+        "receiver_read_load_baseline_p99_us": baseline_p99_us,
+        "receiver_read_load_transfer_p99_us": transfer_p99_us,
+        "receiver_read_load_p99_increase_pct": round(p99_increase_pct, 6),
+        "receiver_read_load_error_count": error_count,
+        "receiver_read_load_first_error": first_error,
+    }
+
+
+def validate_receiver_read_load_report(
+    report: Dict[str, object],
+    *,
+    max_qps_drop_pct: float,
+    max_p99_increase_pct: float,
+) -> None:
+    failures: List[str] = []
+    qps_drop_pct = float(report.get("receiver_read_load_qps_drop_pct", 0.0))
+    p99_increase_pct = float(
+        report.get("receiver_read_load_p99_increase_pct", 0.0)
+    )
+    error_count = int(report.get("receiver_read_load_error_count", 0))
+    if int(report.get("receiver_read_load_baseline_query_count", 0)) <= 0:
+        failures.append("baseline executed no receiver queries")
+    if int(report.get("receiver_read_load_transfer_query_count", 0)) <= 0:
+        failures.append("transfer window executed no receiver queries")
+    if qps_drop_pct > max_qps_drop_pct:
+        failures.append(
+            f"QPS drop {qps_drop_pct:.3f}% exceeds {max_qps_drop_pct:.3f}%"
+        )
+    if p99_increase_pct > max_p99_increase_pct:
+        failures.append(
+            "P99 increase "
+            f"{p99_increase_pct:.3f}% exceeds {max_p99_increase_pct:.3f}%"
+        )
+    if error_count != 0:
+        failures.append(
+            "query errors were observed: "
+            f"count={error_count} first={report.get('receiver_read_load_first_error')!r}"
+        )
+    if failures:
+        raise AssertionError("receiver read-load protection failed: " + "; ".join(failures))
 
 
 def _mysqld_command_option(command: Optional[str], option: str) -> Optional[str]:
@@ -187,12 +296,19 @@ def annotate_record_lock_import_report(
                 and elapsed_us > 0
                 and elapsed_us <= 1000000
             )
+            production_evidence = (
+                report.get("physical_replication") is True
+                and report.get("production_provider") is True
+                and report.get("write_enable_exercised") is True
+            )
             if debug_apply_reached:
                 promotion_gate_evidence_class = "debug_apply_simulator"
-            elif gate_metrics_ready:
+            elif gate_metrics_ready and production_evidence:
                 promotion_gate_evidence_class = "release_candidate_warm_gate"
                 closure_candidate = True
                 release_gate_ready = True
+            elif gate_metrics_ready:
+                promotion_gate_evidence_class = "warm_gate_simulator"
             else:
                 promotion_gate_evidence_class = "not_ready_or_degraded"
         else:
@@ -334,6 +450,7 @@ class OperationKind(enum.Enum):
     JSON_UPDATE = "json_update"
     TYPED_UPDATE = "typed_update"
     BULK_LOCKSET_UPDATE = "bulk_lockset_update"
+    REPEATED_ROW_WRITE = "repeated_row_write"
     TEMP_INSERT = "temp_insert"
     TEMP_UPDATE = "temp_update"
     TEMP_DELETE = "temp_delete"
@@ -422,6 +539,7 @@ class HarnessConfig:
     seed_insert_batch_size: int = 1000
     cycles: int = 3
     drain_interval_s: float = 30.0
+    drain_ready_timeout_s: float = 0.0
     business_run_before_drain_s: float = 0.0
     duration_s: float = 0.0
     max_transactions_per_worker: int = 0
@@ -432,6 +550,7 @@ class HarnessConfig:
     lockset_touch_one_row: bool = False
     lockset_select_for_update: bool = False
     lockset_minimal_table: bool = False
+    repeated_row_write_workload: bool = False
     compact_expected_state_row_threshold: int = 1_000_000
     preserve_timeout_s: int = 86400
     preserve_max_binlog_cache_bytes: int = 1_073_741_824
@@ -487,6 +606,11 @@ class HarnessConfig:
     receiver_start_command: Optional[str] = None
     receiver_restart_command: Optional[str] = None
     receiver_physical_copy_before_drain: bool = False
+    standalone_transfer_accept_committed_not_ready: bool = False
+    receiver_read_load_threads: int = 0
+    receiver_read_load_baseline_s: float = 0.0
+    receiver_read_load_max_qps_drop_pct: float = 5.0
+    receiver_read_load_max_p99_increase_pct: float = 10.0
     standby_transfer_user: str = "preserve_transfer_receiver"
     standby_transfer_password: str = "preserve_transfer_secret"
     standby_transfer_credential_name: str = "preserve_transfer_credential"
@@ -518,6 +642,27 @@ class HarnessConfig:
             raise ValueError(
                 "max receiver ready after phase2 ms must be non-negative"
             )
+        if self.receiver_read_load_threads < 0:
+            raise ValueError("receiver read-load threads must be non-negative")
+        if self.receiver_read_load_baseline_s < 0:
+            raise ValueError("receiver read-load baseline seconds must be non-negative")
+        if self.receiver_read_load_max_qps_drop_pct < 0:
+            raise ValueError("receiver read-load maximum QPS drop must be non-negative")
+        if self.receiver_read_load_max_p99_increase_pct < 0:
+            raise ValueError(
+                "receiver read-load maximum P99 increase must be non-negative"
+            )
+        if self.receiver_read_load_threads > 0:
+            if self.scenario != "standby_transfer_receiver_drain_metrics":
+                raise ValueError(
+                    "receiver read-load probe is only valid for "
+                    "standby_transfer_receiver_drain_metrics"
+                )
+            if self.receiver_read_load_baseline_s <= 0:
+                raise ValueError(
+                    "receiver read-load baseline seconds must be positive when "
+                    "the probe is enabled"
+                )
         if self.scenario == "standby_transfer_receiver_drain_metrics":
             if not self.receiver_preserve_dir:
                 raise ValueError(
@@ -602,14 +747,20 @@ class HarnessConfig:
                 )
         if self.statements_per_tx <= 0:
             raise ValueError("statements_per_tx must be positive")
-        if self.seed_rows_per_table_per_session < 8:
-            raise ValueError("seed_rows_per_table_per_session must be >= 8")
+        minimum_seed_rows = 1 if self.repeated_row_write_workload else 8
+        if self.seed_rows_per_table_per_session < minimum_seed_rows:
+            raise ValueError(
+                "seed_rows_per_table_per_session must be "
+                f">= {minimum_seed_rows}"
+            )
         if self.seed_insert_batch_size <= 0:
             raise ValueError("seed_insert_batch_size must be positive")
         if self.cycles < 0:
             raise ValueError("cycles must be non-negative")
         if self.drain_interval_s < 0:
             raise ValueError("drain_interval_s must be non-negative")
+        if self.drain_ready_timeout_s < 0:
+            raise ValueError("drain_ready_timeout_s must be non-negative")
         if self.business_run_before_drain_s < 0:
             raise ValueError("business_run_before_drain_s must be non-negative")
         if self.business_run_before_drain_s > 0 and self.inflight_drain_probe:
@@ -657,6 +808,14 @@ class HarnessConfig:
         if self.lockset_minimal_table and self.lockset_select_for_update:
             raise ValueError(
                 "lockset_minimal_table cannot be combined with lockset_select_for_update"
+            )
+        if self.repeated_row_write_workload and self.lockset_batch_size > 0:
+            raise ValueError(
+                "repeated_row_write_workload cannot be combined with lockset workloads"
+            )
+        if self.repeated_row_write_workload and self.temp_table_workload:
+            raise ValueError(
+                "repeated_row_write_workload cannot be combined with temp table workloads"
             )
         if self.compact_expected_state_row_threshold < 0:
             raise ValueError("compact_expected_state_row_threshold must be non-negative")
@@ -921,6 +1080,12 @@ class StartupRecoveryMetrics:
     snapshot_predicate_locks_ms: float = 0.0
     snapshot_mdl_ms: float = 0.0
     snapshot_register_ms: float = 0.0
+    resurrection_index_candidates: int = 0
+    resurrection_index_hits: int = 0
+    resurrection_index_fallbacks: int = 0
+    resurrection_undo_anchor_checks: int = 0
+    resurrection_undo_body_pages: int = 0
+    resurrection_undo_body_records: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -992,6 +1157,8 @@ class ReceiverPrewarmMetrics:
     staged_token_max_us: int = 0
     staged_token_active: int = 0
     staged_token_max_active: int = 0
+    receiver_queued_bytes: int = 0
+    receiver_worker_active: int = 0
     projection_publish_count: int = 0
     projection_publish_us: int = 0
     projection_publish_max_us: int = 0
@@ -1004,6 +1171,9 @@ class ReceiverPrewarmMetrics:
     projection_encode_us: int = 0
     projection_token_state_us: int = 0
     epoch_ready_bind_attempts: int = 0
+    strict_record_index_page_reads: int = 0
+    strict_ibuf_merges: int = 0
+    strict_target_local_redo_bytes: int = 0
 
 
 class WorkloadPlan:
@@ -1423,6 +1593,11 @@ WHERE n < {row_count}
         return math.ceil(self.config.statements_per_tx / self.config.lockset_batch_size)
 
     def expected_seed_row_count(self) -> int:
+        if self.config.repeated_row_write_workload:
+            return (
+                self.config.sessions
+                * self.config.seed_rows_per_table_per_session
+            )
         if self.bulk_lockset_uses_session_sharded_tables():
             return (
                 self.config.sessions
@@ -1435,6 +1610,8 @@ WHERE n < {row_count}
         )
 
     def uses_compact_bulk_expected_state(self) -> bool:
+        if self.config.repeated_row_write_workload:
+            return True
         return (
             self.config.lockset_batch_size > 0
             and self.expected_seed_row_count()
@@ -1457,7 +1634,10 @@ WHERE n < {row_count}
         tables = self.table_names()
         if table not in tables:
             raise ValueError(f"unknown table: {table}")
-        if not self.bulk_lockset_uses_session_sharded_tables():
+        if not (
+            self.bulk_lockset_uses_session_sharded_tables()
+            or self.config.repeated_row_write_workload
+        ):
             return list(range(1, self.config.sessions + 1))
         table_index = tables.index(table)
         table_count = len(tables)
@@ -1466,6 +1646,12 @@ WHERE n < {row_count}
             for sid in range(1, self.config.sessions + 1)
             if (sid - 1) % table_count == table_index
         ]
+
+    def repeated_row_write_table(self, sid: int) -> str:
+        if not self.config.repeated_row_write_workload:
+            raise AssertionError("repeated-row table requested for another workload")
+        tables = self.table_names()
+        return tables[(sid - 1) % len(tables)]
 
     def bulk_lockset_operation_range(
         self, sid: int, stmt_no: int
@@ -1530,6 +1716,16 @@ WHERE n < {row_count}
         return ops
 
     def transaction_operations(self, sid: int, tx_id: int) -> List[Operation]:
+        if self.config.repeated_row_write_workload:
+            del tx_id
+            table = self.repeated_row_write_table(sid)
+            operation = Operation(
+                OperationKind.REPEATED_ROW_WRITE,
+                table,
+                f"UPDATE `{table}` SET counter = counter + 1 "
+                f"WHERE sid = {sid} AND k = 0",
+            )
+            return [operation] * self.config.statements_per_tx
         if self.config.lockset_batch_size > 0:
             return self._bulk_lockset_operations(sid, tx_id)
         ops: List[Operation] = []
@@ -2059,7 +2255,7 @@ class ExpectedDatabaseState:
             for sid in sampled_sids:
                 tx_id = committed.get(sid)
                 touched_ops: List[Tuple[int, int, int]] = []
-                if tx_id is not None:
+                if tx_id is not None and not self._plan.config.repeated_row_write_workload:
                     for stmt_no in range(self._plan.bulk_lockset_operation_count()):
                         op_table, low, high = self._plan.bulk_lockset_operation_range(
                             sid, stmt_no
@@ -2113,6 +2309,19 @@ class ExpectedDatabaseState:
         committed: Dict[int, int],
     ) -> RowState:
         tx_id = committed.get(sid)
+        if self._plan.config.repeated_row_write_workload:
+            row = self._compact_seed_row(sid, key)
+            if (
+                tx_id is not None
+                and table == self._plan.repeated_row_write_table(sid)
+                and key == 0
+            ):
+                writes = tx_id * self._plan.config.statements_per_tx
+                return dataclasses.replace(
+                    row,
+                    counter=writes,
+                )
+            return row
         if tx_id is not None:
             for stmt_no in range(self._plan.bulk_lockset_operation_count()):
                 op_table, low, high = self._plan.bulk_lockset_operation_range(
@@ -2192,6 +2401,16 @@ class ExpectedDatabaseState:
             table: self._compact_seed_fingerprint(table)
             for table in self._plan.table_names()
         }
+        if self._plan.config.repeated_row_write_workload:
+            for sid, tx_id in self._compact_committed_tx_by_sid.items():
+                table = self._plan.repeated_row_write_table(sid)
+                writes = tx_id * self._plan.config.statements_per_tx
+                fingerprint = fingerprints[table]
+                fingerprints[table] = dataclasses.replace(
+                    fingerprint,
+                    sum_counter=fingerprint.sum_counter + writes,
+                )
+            return fingerprints
         for sid, tx_id in self._compact_committed_tx_by_sid.items():
             if self._plan.config.lockset_select_for_update:
                 continue
@@ -3133,6 +3352,158 @@ class MySQLRuntime:
             cursor.close()
 
 
+class ReceiverReadLoadProbe:
+    """Run bounded, read-only point queries across baseline and transfer phases."""
+
+    _MAX_SAMPLES_PER_THREAD = 50_000
+
+    def __init__(
+        self,
+        *,
+        threads: int,
+        connection_factory: Callable[[], object],
+        query: str,
+    ) -> None:
+        self._thread_count = threads
+        self._connection_factory = connection_factory
+        self._query = query
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._phase = "idle"
+        self._baseline_start = 0.0
+        self._baseline_end = 0.0
+        self._transfer_start = 0.0
+        self._transfer_end = 0.0
+        self._workers: List[threading.Thread] = []
+        self._counts = {"baseline": 0, "transfer": 0}
+        self._samples: Dict[str, List[Deque[int]]] = {
+            "baseline": [
+                deque(maxlen=self._MAX_SAMPLES_PER_THREAD)
+                for _ in range(threads)
+            ],
+            "transfer": [
+                deque(maxlen=self._MAX_SAMPLES_PER_THREAD)
+                for _ in range(threads)
+            ],
+        }
+        self._errors: List[str] = []
+        self._report: Optional[Dict[str, object]] = None
+
+    def start_baseline(self) -> None:
+        with self._lock:
+            if self._phase != "idle":
+                raise RuntimeError("receiver read-load probe was already started")
+            self._phase = "baseline"
+            self._baseline_start = time.monotonic()
+        for worker_id in range(self._thread_count):
+            worker = threading.Thread(
+                target=self._run_worker,
+                args=(worker_id,),
+                name=f"receiver-read-load-{worker_id}",
+                daemon=True,
+            )
+            self._workers.append(worker)
+            worker.start()
+
+    def begin_transfer(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if self._phase != "baseline":
+                raise RuntimeError("receiver read-load baseline is not active")
+            self._baseline_end = now
+            self._transfer_start = now
+            self._phase = "transfer"
+
+    def stop(self, join_timeout_s: float = 30.0) -> Dict[str, object]:
+        with self._lock:
+            if self._report is not None:
+                return dict(self._report)
+            now = time.monotonic()
+            if self._phase == "baseline":
+                self._baseline_end = now
+            elif self._phase == "transfer":
+                self._transfer_end = now
+            self._phase = "stopped"
+        self._stop_event.set()
+        deadline = time.monotonic() + join_timeout_s
+        for worker in self._workers:
+            worker.join(max(0.0, deadline - time.monotonic()))
+        alive = [worker.name for worker in self._workers if worker.is_alive()]
+        if alive:
+            with self._lock:
+                self._errors.append(
+                    "receiver read-load workers did not stop: " + ",".join(alive)
+                )
+        with self._lock:
+            baseline_samples = [
+                sample
+                for per_thread in self._samples["baseline"]
+                for sample in per_thread
+            ]
+            transfer_samples = [
+                sample
+                for per_thread in self._samples["transfer"]
+                for sample in per_thread
+            ]
+            baseline_duration = max(
+                0.0, self._baseline_end - self._baseline_start
+            )
+            transfer_duration = max(
+                0.0, self._transfer_end - self._transfer_start
+            )
+            self._report = build_receiver_read_load_report(
+                threads=self._thread_count,
+                baseline_duration_s=baseline_duration,
+                baseline_query_count=self._counts["baseline"],
+                baseline_latency_samples_us=baseline_samples,
+                transfer_duration_s=transfer_duration,
+                transfer_query_count=self._counts["transfer"],
+                transfer_latency_samples_us=transfer_samples,
+                error_count=len(self._errors),
+                first_error=self._errors[0] if self._errors else None,
+            )
+            return dict(self._report)
+
+    def _run_worker(self, worker_id: int) -> None:
+        conn = None
+        cursor = None
+        try:
+            conn = self._connection_factory()
+            cursor = conn.cursor()
+            while not self._stop_event.is_set():
+                with self._lock:
+                    phase = self._phase
+                if phase not in ("baseline", "transfer"):
+                    time.sleep(0.001)
+                    continue
+                started_ns = time.monotonic_ns()
+                cursor.execute(self._query)
+                rows = cursor.fetchall()
+                elapsed_us = max(1, (time.monotonic_ns() - started_ns) // 1000)
+                if len(rows) != 1:
+                    raise AssertionError(
+                        "receiver read-load point query returned "
+                        f"{len(rows)} rows"
+                    )
+                with self._lock:
+                    self._counts[phase] += 1
+                    self._samples[phase][worker_id].append(int(elapsed_us))
+        except BaseException as exc:
+            with self._lock:
+                self._errors.append(f"{type(exc).__name__}: {exc}")
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+
 class BusinessWorker(threading.Thread):
     def __init__(
         self,
@@ -3181,6 +3552,16 @@ class BusinessWorker(threading.Thread):
                 conn = self._run_transaction(conn, tx_id)
                 self.transactions_completed += 1
         except BaseException as exc:
+            if (
+                self.stop_event.is_set()
+                and isinstance(exc, RuntimeError)
+                and str(exc) == "drain checkpoint was cancelled before resume"
+            ):
+                LOG.debug(
+                    "worker sid=%s stopped after transfer-only drain cleanup",
+                    self.sid,
+                )
+                return
             LOG.exception("worker sid=%s failed", self.sid)
             self.coordinator.errors.put(exc)
         finally:
@@ -3581,6 +3962,23 @@ class BusinessWorker(threading.Thread):
     def _verify_committed_transaction(
         self, conn, tx_id: int, completed_stmt_count: Optional[int] = None
     ) -> None:
+        if self.plan.config.repeated_row_write_workload:
+            table = self.plan.repeated_row_write_table(self.sid)
+            rows = self.runtime.execute(
+                conn,
+                f"SELECT v, counter FROM `{table}` "
+                f"WHERE sid = {self.sid} AND k = 0",
+                fetch=True,
+            )
+            writes = tx_id * self.plan.config.statements_per_tx
+            expected = (self.sid * 1000, writes)
+            actual = tuple(int(value or 0) for value in rows[0]) if rows else ()
+            if actual != expected:
+                raise AssertionError(
+                    "repeated-row write commit verification failed: "
+                    f"sid={self.sid} tx={tx_id} expected={expected} actual={actual}"
+                )
+            return
         if self.plan.config.lockset_batch_size > 0:
             table, low, high = self.plan.bulk_lockset_operation_range(self.sid, 0)
             if (
@@ -3707,14 +4105,19 @@ class BusinessE2ERunner:
 
     def run(self) -> None:
         if self.config.promotion_gate_epoch_id:
-            self.run_promotion_warm_gate_simulator()
-            return
-        if self.config.scenario == "receiver_drain_then_promotion_gate":
-            self.run_receiver_drain_then_promotion_gate()
-            return
-        if self.config.scenario == "physical_standby_promotion_gate_scaled":
-            self.run_physical_standby_promotion_gate_scaled()
-            return
+            raise RuntimeError(
+                "classic protocol promotion control is unavailable; use the "
+                "internal test wrapper for warm-gate simulator evidence"
+            )
+        if self.config.scenario in {
+            "receiver_drain_then_promotion_gate",
+            "physical_standby_promotion_gate_scaled",
+        }:
+            raise RuntimeError(
+                "physical replication and a production promotion provider are "
+                "not available in this repository; run standalone transfer or "
+                "local startup E2E instead"
+            )
         if self.config.scenario == "standby_transfer_receiver_drain_metrics":
             self.run_standby_transfer_receiver_drain_metrics()
             return
@@ -3868,23 +4271,38 @@ class BusinessE2ERunner:
             and self.config.business_run_before_drain_s <= 0
         ):
             self.coordinator.hold_transaction_starts_until_next_checkpoint()
-        self.start_workers()
         generation = 0
         completed_stmt_total = 0
+        read_load_probe: Optional[ReceiverReadLoadProbe] = None
         try:
+            if self.config.receiver_read_load_threads > 0:
+                table = self.plan.table_names()[0]
+                read_load_probe = ReceiverReadLoadProbe(
+                    threads=self.config.receiver_read_load_threads,
+                    connection_factory=self._receiver_read_connection,
+                    query=(
+                        f"SELECT counter FROM `{table}` "
+                        "WHERE sid=1 AND k=0"
+                    ),
+                )
+            self.start_workers()
             if self.config.business_run_before_drain_s > 0:
                 self._run_business_before_drain(cycle=1)
                 generation = self.coordinator.request_drain_checkpoint()
             else:
                 generation = self.coordinator.request_drain_checkpoint()
                 self._wait_all_paused_for_drain_or_raise(
-                    generation,
-                    max(self.config.drain_interval_s, self.config.resume_timeout_s),
+                    generation, self._drain_ready_timeout_s()
                 )
+            if read_load_probe is not None:
+                read_load_probe.start_baseline()
+                time.sleep(self.config.receiver_read_load_baseline_s)
             error_log_offset = self.warmcopy_error_log_offset()
             LOG.info(
                 "issuing standby-transfer DRAIN TRANSACTIONS PRESERVE for receiver metrics"
             )
+            if read_load_probe is not None:
+                read_load_probe.begin_transfer()
             try:
                 drain_will_restart = self._execute_drain_preserve()
             except BaseException as exc:
@@ -3929,19 +4347,39 @@ class BusinessE2ERunner:
                     lock_fallback_count,
                 )
             self._record_warmcopy_drain_metrics(metrics)
-            self.receiver_artifact_counts = self.wait_for_receiver_artifacts(
-                expected_standby_pending=(
-                    self.config.sessions if self.config.strict_token_count else 1
-                ),
-                timeout_s=self.config.resume_timeout_s,
+            expected_receiver_tokens = (
+                self.config.sessions if self.config.strict_token_count else 1
             )
-            self.wait_for_receiver_readiness(
-                expected_standby_pending=(
-                    self.config.sessions if self.config.strict_token_count else 1
-                ),
-                timeout_s=self.config.resume_timeout_s,
-                connection_factory=self._receiver_admin_connection,
-            )
+            if self.config.standalone_transfer_accept_committed_not_ready:
+                self.receiver_artifact_counts = (
+                    self.receiver_preserve_artifact_counts()
+                )
+                self.wait_for_receiver_committed_not_ready(
+                    expected_tokens=expected_receiver_tokens,
+                    timeout_s=self.config.resume_timeout_s,
+                    connection_factory=self._receiver_admin_connection,
+                )
+            else:
+                self.receiver_artifact_counts = self.wait_for_receiver_artifacts(
+                    expected_standby_pending=expected_receiver_tokens,
+                    timeout_s=self.config.resume_timeout_s,
+                )
+                self.wait_for_receiver_readiness(
+                    expected_standby_pending=expected_receiver_tokens,
+                    timeout_s=self.config.resume_timeout_s,
+                    connection_factory=self._receiver_admin_connection,
+                )
+            if read_load_probe is not None:
+                self.receiver_read_load_report = read_load_probe.stop()
+                validate_receiver_read_load_report(
+                    self.receiver_read_load_report,
+                    max_qps_drop_pct=(
+                        self.config.receiver_read_load_max_qps_drop_pct
+                    ),
+                    max_p99_increase_pct=(
+                        self.config.receiver_read_load_max_p99_increase_pct
+                    ),
+                )
             completed_stmt_total = sum(
                 worker.statements_completed for worker in self.workers
             )
@@ -3950,6 +4388,8 @@ class BusinessE2ERunner:
                 completed_stmt_total=completed_stmt_total,
             )
         except BaseException as exc:
+            if read_load_probe is not None:
+                self.receiver_read_load_report = read_load_probe.stop()
             self.write_standby_transfer_receiver_report(
                 status="failed",
                 completed_stmt_total=completed_stmt_total,
@@ -4339,6 +4779,7 @@ class BusinessE2ERunner:
             "status": "success",
             "success": True,
             "scenario": scenario_name,
+            **_evidence_contract(EVIDENCE_KIND_WARM_GATE_SIMULATOR),
             "evidence_mode": "SIMULATOR",
             "physical_consistency_mode": (
                 "frozen_datadir_copy"
@@ -4544,6 +4985,7 @@ class BusinessE2ERunner:
             "status": "failed" if error else "success",
             "success": error is None,
             "scenario": "promotion_warm_gate_simulator",
+            **_evidence_contract(EVIDENCE_KIND_WARM_GATE_SIMULATOR),
             "evidence_mode": "SIMULATOR",
             "physical_consistency_mode": "not_proven",
             "physical_ha_evidence": {
@@ -4725,6 +5167,40 @@ class BusinessE2ERunner:
             if poll_interval_s > 0:
                 time.sleep(min(poll_interval_s, remaining))
 
+    def wait_for_receiver_committed_not_ready(
+        self,
+        *,
+        expected_tokens: int,
+        timeout_s: float,
+        connection_factory: Optional[Callable[[], object]] = None,
+        poll_interval_s: float = 0.2,
+    ) -> None:
+        deadline = time.monotonic() + timeout_s
+        last_error: Optional[BaseException] = None
+        while True:
+            self.receiver_prewarm_metrics = (
+                self.read_receiver_prewarm_metrics_from_status(
+                    connection_factory=connection_factory
+                )
+            )
+            try:
+                self.validate_standby_transfer_receiver_committed_not_ready(
+                    expected_tokens=expected_tokens
+                )
+                return
+            except AssertionError as exc:
+                last_error = exc
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if last_error is not None:
+                    raise last_error
+                raise TimeoutError(
+                    "receiver committed-not-ready evidence did not become available"
+                )
+            if poll_interval_s > 0:
+                time.sleep(min(poll_interval_s, remaining))
+
     def write_standby_transfer_receiver_report(
         self, status: str, completed_stmt_total: int, error: Optional[str] = None
     ) -> None:
@@ -4765,9 +5241,48 @@ class BusinessE2ERunner:
                 <= source_phase2_end_us
             )
         )
-        receiver_epoch_fact_bound = artifact_counts.get(
-            "epoch_fact_count", 0
-        ) > 0 and artifact_counts.get("epoch_commit_count", 0) > 0
+        receiver_all_token_prewarm_complete_monotonic_us = None
+        receiver_all_token_prewarm_after_final_ack_us = None
+        receiver_all_prewarm_complete_monotonic_us = None
+        receiver_all_prewarm_after_final_ack_us = None
+        if receiver_prewarm_metrics is not None:
+            receiver_all_token_prewarm_complete_monotonic_us = (
+                receiver_prewarm_metrics.prewarm_end_monotonic_us
+            )
+            receiver_all_prewarm_complete_monotonic_us = max(
+                receiver_all_token_prewarm_complete_monotonic_us,
+                receiver_prewarm_metrics.object_prewarm_last_end_monotonic_us,
+                receiver_prewarm_metrics.record_object_prewarm_last_end_monotonic_us,
+                receiver_prewarm_metrics.binlog_object_prewarm_last_end_monotonic_us,
+            )
+            final_ack_us = receiver_prewarm_metrics.final_spool_ack_monotonic_us
+            if (
+                final_ack_us > 0
+                and receiver_all_token_prewarm_complete_monotonic_us > 0
+            ):
+                receiver_all_token_prewarm_after_final_ack_us = max(
+                    0,
+                    receiver_all_token_prewarm_complete_monotonic_us
+                    - final_ack_us,
+                )
+            if final_ack_us > 0 and receiver_all_prewarm_complete_monotonic_us > 0:
+                receiver_all_prewarm_after_final_ack_us = max(
+                    0,
+                    receiver_all_prewarm_complete_monotonic_us - final_ack_us,
+                )
+        process_local_epoch = (
+            self.config.standalone_transfer_accept_committed_not_ready
+        )
+        receiver_process_local_epoch_accepted = (
+            process_local_epoch
+            and self.receiver_process_local_epoch_accepted()
+        )
+        receiver_epoch_fact_bound = (
+            receiver_process_local_epoch_accepted
+            if process_local_epoch
+            else artifact_counts.get("epoch_fact_count", 0) > 0
+            and artifact_counts.get("epoch_commit_count", 0) > 0
+        )
         source_phase2_total_us = [
             int(round(metric.phase2_total_ms * 1000))
             for metric in metrics
@@ -4796,6 +5311,12 @@ class BusinessE2ERunner:
             "status": status,
             "success": status == "success",
             "scenario": "standby_transfer_receiver_drain_metrics",
+            **_evidence_contract(EVIDENCE_KIND_STANDALONE_TRANSFER_E2E),
+            "receiver_readiness_contract": (
+                "COMMITTED_NOT_READY"
+                if self.config.standalone_transfer_accept_committed_not_ready
+                else "READY"
+            ),
             "sessions": self.config.sessions,
             "cycles": self.config.cycles,
             "workload_sessions": self.config.sessions,
@@ -5010,6 +5531,12 @@ class BusinessE2ERunner:
             "receiver_epoch_commit_count": artifact_counts.get(
                 "epoch_commit_count", 0
             ),
+            "receiver_epoch_storage": (
+                "PROCESS_LOCAL" if process_local_epoch else "FILE"
+            ),
+            "receiver_process_local_epoch_accepted": (
+                receiver_process_local_epoch_accepted
+            ),
             "receiver_epoch_fact_bound": receiver_epoch_fact_bound,
             "receiver_ready_tokens": (
                 None
@@ -5035,6 +5562,18 @@ class BusinessE2ERunner:
                 None
                 if receiver_prewarm_metrics is None
                 else receiver_prewarm_metrics.ready_after_final_spool_ack_us
+            ),
+            "receiver_all_prewarm_complete_monotonic_us": (
+                receiver_all_prewarm_complete_monotonic_us
+            ),
+            "receiver_all_prewarm_after_final_ack_us": (
+                receiver_all_prewarm_after_final_ack_us
+            ),
+            "receiver_all_token_prewarm_complete_monotonic_us": (
+                receiver_all_token_prewarm_complete_monotonic_us
+            ),
+            "receiver_all_token_prewarm_after_final_ack_us": (
+                receiver_all_token_prewarm_after_final_ack_us
             ),
             "receiver_prewarm_backlog_at_phase2_end": (
                 None
@@ -5172,6 +5711,12 @@ class BusinessE2ERunner:
                     "receiver_staged_token_max_active": (
                         receiver_prewarm_metrics.staged_token_max_active
                     ),
+                    "receiver_queued_bytes": (
+                        receiver_prewarm_metrics.receiver_queued_bytes
+                    ),
+                    "receiver_worker_active": (
+                        receiver_prewarm_metrics.receiver_worker_active
+                    ),
                     "receiver_projection_publish_count": (
                         receiver_prewarm_metrics.projection_publish_count
                     ),
@@ -5208,6 +5753,15 @@ class BusinessE2ERunner:
                     "receiver_epoch_ready_bind_attempts": (
                         receiver_prewarm_metrics.epoch_ready_bind_attempts
                     ),
+                    "receiver_strict_record_index_page_reads": (
+                        receiver_prewarm_metrics.strict_record_index_page_reads
+                    ),
+                    "receiver_strict_ibuf_merges": (
+                        receiver_prewarm_metrics.strict_ibuf_merges
+                    ),
+                    "receiver_strict_target_local_redo_bytes": (
+                        receiver_prewarm_metrics.strict_target_local_redo_bytes
+                    ),
                     "receiver_seal_prewarm_tokens": (
                         receiver_prewarm_metrics.seal_prewarm_tokens
                     ),
@@ -5222,6 +5776,11 @@ class BusinessE2ERunner:
                     ),
                 }
             )
+        receiver_read_load_report = getattr(
+            self, "receiver_read_load_report", None
+        )
+        if receiver_read_load_report is not None:
+            report.update(receiver_read_load_report)
         if error:
             report["error"] = error
         report_path.write_text(
@@ -5229,6 +5788,24 @@ class BusinessE2ERunner:
             + "\n",
             encoding="utf-8",
         )
+
+    @staticmethod
+    def _validate_transfer_strict_zero_side_effects(
+        metrics: ReceiverPrewarmMetrics,
+    ) -> None:
+        side_effects = {
+            "record_index_page_reads": metrics.strict_record_index_page_reads,
+            "ibuf_merges": metrics.strict_ibuf_merges,
+            "target_local_redo_bytes": metrics.strict_target_local_redo_bytes,
+        }
+        nonzero = {name: value for name, value in side_effects.items() if value != 0}
+        if nonzero:
+            raise AssertionError(
+                "receiver strict prewarm side effects must remain zero: "
+                + ", ".join(
+                    f"{name}={value}" for name, value in sorted(nonzero.items())
+                )
+            )
 
     def validate_standby_transfer_receiver_readiness(
         self, *, expected_standby_pending: int
@@ -5247,6 +5824,7 @@ class BusinessE2ERunner:
         receiver_prewarm_metrics = getattr(self, "receiver_prewarm_metrics", None)
         if receiver_prewarm_metrics is None:
             raise AssertionError("receiver not ready: prewarm status unavailable")
+        self._validate_transfer_strict_zero_side_effects(receiver_prewarm_metrics)
         phase2_end_us = self.latest_source_phase2_end_monotonic_us()
         if phase2_end_us is None:
             raise AssertionError(
@@ -5316,6 +5894,101 @@ class BusinessE2ERunner:
                 f"{ready_lag_label}={ready_lag_us} "
                 f"max_ms={max_lag_ms}"
             )
+
+    def validate_standby_transfer_receiver_committed_not_ready(
+        self, *, expected_tokens: int
+    ) -> None:
+        artifact_counts = dict(
+            getattr(self, "receiver_artifact_counts", {})
+            or self.receiver_preserve_artifact_counts()
+        )
+        persisted_control_artifacts = {
+            key: artifact_counts.get(key, 0)
+            for key in (
+                "snapshot_tokens",
+                "standby_pending_tokens",
+                "epoch_fact_count",
+                "epoch_commit_count",
+            )
+            if artifact_counts.get(key, 0) != 0
+        }
+        if persisted_control_artifacts:
+            raise AssertionError(
+                "receiver committed-not-ready: strict process-local epoch "
+                "unexpectedly published file-backed control artifacts "
+                f"observed={persisted_control_artifacts}"
+            )
+        metrics = getattr(self, "receiver_prewarm_metrics", None)
+        if metrics is None:
+            raise AssertionError(
+                "receiver committed-not-ready: prewarm status unavailable"
+            )
+        if not self.receiver_process_local_epoch_accepted():
+            raise AssertionError(
+                "receiver committed-not-ready: FINAL_ACK ownership handoff "
+                "was not observed by both source and receiver"
+            )
+        self._validate_transfer_strict_zero_side_effects(metrics)
+        phase2_end_us = self.latest_source_phase2_end_monotonic_us()
+        if (
+            phase2_end_us is None
+            or metrics.first_frame_monotonic_us == 0
+            or metrics.first_frame_monotonic_us > phase2_end_us
+        ):
+            raise AssertionError(
+                "receiver committed-not-ready: transfer did not begin before "
+                "source phase2 completed"
+            )
+        if (
+            metrics.seal_prewarm_tokens < expected_tokens
+            or metrics.seal_prewarm_success_tokens < expected_tokens
+            or metrics.object_prewarm_count == 0
+        ):
+            raise AssertionError(
+                "receiver committed-not-ready: metadata prewarm did not finish "
+                f"seal_tokens={metrics.seal_prewarm_tokens} "
+                f"seal_success={metrics.seal_prewarm_success_tokens} "
+                f"object_prewarm={metrics.object_prewarm_count} "
+                f"expected={expected_tokens}"
+            )
+        if metrics.receiver_queued_bytes != 0 or metrics.receiver_worker_active != 0:
+            raise AssertionError(
+                "receiver committed-not-ready: background prewarm has not drained "
+                f"queued_bytes={metrics.receiver_queued_bytes} "
+                f"worker_active={metrics.receiver_worker_active}"
+            )
+        if (
+            metrics.ready_monotonic_us != 0
+            or metrics.auto_prewarm_ready_tokens != 0
+            or metrics.epoch_ready_bind_attempts != 0
+        ):
+            raise AssertionError(
+                "receiver committed-not-ready: token became READY without a "
+                "production physical fence provider"
+            )
+        if metrics.prewarm_backlog_at_phase2_end < expected_tokens:
+            raise AssertionError(
+                "receiver committed-not-ready: fail-closed backlog is missing "
+                f"backlog={metrics.prewarm_backlog_at_phase2_end} "
+                f"expected={expected_tokens}"
+            )
+        if metrics.committed_epoch_fallback_count != 0:
+            raise AssertionError(
+                "receiver committed-not-ready: committed-epoch cold fallback was used"
+            )
+
+    def receiver_process_local_epoch_accepted(self) -> bool:
+        metrics = getattr(self, "receiver_prewarm_metrics", None)
+        source_metrics = getattr(self, "warmcopy_drain_metrics", [])
+        source_final_ack_observed = any(
+            metric.source_phase2_transfer_final_metadata_ack_us is not None
+            for metric in source_metrics
+        )
+        return bool(
+            metrics is not None
+            and metrics.final_spool_ack_monotonic_us > 0
+            and source_final_ack_observed
+        )
 
     def preflight_disk_budgets(self) -> None:
         plan = getattr(self, "plan", None)
@@ -5756,7 +6429,10 @@ class BusinessE2ERunner:
         tables = self.plan.table_names()
         for table_index, table in enumerate(tables):
             sid_filter = ""
-            if self.plan.bulk_lockset_uses_session_sharded_tables():
+            if (
+                self.plan.bulk_lockset_uses_session_sharded_tables()
+                or self.config.repeated_row_write_workload
+            ):
                 sid_filter = (
                     f"WHERE MOD(s.sid - 1, {len(tables)}) = {table_index} "
                 )
@@ -5897,6 +6573,17 @@ class BusinessE2ERunner:
             port=self.config.receiver_port,
             unix_socket=self.config.receiver_unix_socket,
             database=None,
+        )
+
+    def _receiver_read_connection(self):
+        return self.runtime.connect_endpoint(
+            user=self.config.receiver_user,
+            password=self.config.receiver_password,
+            host=self.config.receiver_host,
+            port=self.config.receiver_port,
+            unix_socket=self.config.receiver_unix_socket,
+            database=self.config.database,
+            autocommit=True,
         )
 
     def configure_standby_transfer_credentials(self) -> None:
@@ -6118,7 +6805,7 @@ class BusinessE2ERunner:
         try:
             if self.config.inflight_drain_probe:
                 if not self.coordinator.wait_all_drainable_for_drain(
-                    generation, max(self.config.drain_interval_s, self.config.resume_timeout_s)
+                    generation, self._drain_ready_timeout_s()
                 ):
                     raise TimeoutError(
                         "not all workers reached a drainable transaction before in-flight drain"
@@ -6138,8 +6825,7 @@ class BusinessE2ERunner:
                 )
             else:
                 self._wait_all_paused_for_drain_or_raise(
-                    generation,
-                    max(self.config.drain_interval_s, self.config.resume_timeout_s),
+                    generation, self._drain_ready_timeout_s()
                 )
             LOG.info("cycle %s issuing DRAIN TRANSACTIONS PRESERVE", cycle)
             phase2_started_at = time.monotonic()
@@ -6178,7 +6864,11 @@ class BusinessE2ERunner:
             self.restart_server()
             self.runtime.wait_until_up(self.config.startup_timeout_s)
             startup_metrics = self.read_startup_recovery_metrics_from_status()
-            if startup_metrics is None:
+            if self.config.repeated_row_write_workload:
+                self._validate_repeated_row_startup_capacity_metrics(
+                    startup_metrics
+                )
+            elif startup_metrics is None:
                 startup_metrics = self.read_latest_startup_recovery_metrics_since(
                     startup_recovery_log_offset
                 )
@@ -6330,6 +7020,63 @@ class BusinessE2ERunner:
             self.startup_recovery_metrics = []
         self.startup_recovery_metrics.append(observed_metrics)
 
+    def _validate_repeated_row_startup_capacity_metrics(
+        self, observed_metrics: Optional[StartupRecoveryMetrics]
+    ) -> None:
+        if observed_metrics is None:
+            raise AssertionError(
+                "startup status metrics are required for repeated-row "
+                "resurrection capacity evidence"
+            )
+
+        expected = self.config.sessions
+        exact_checks = {
+            "error": (observed_metrics.error, 0),
+            "snapshot_tokens": (observed_metrics.snapshot_tokens, expected),
+            "local_snapshot_tokens": (
+                observed_metrics.local_snapshot_tokens,
+                expected,
+            ),
+            "resurrection_index_candidates": (
+                observed_metrics.resurrection_index_candidates,
+                expected,
+            ),
+            "resurrection_index_hits": (
+                observed_metrics.resurrection_index_hits,
+                expected,
+            ),
+            "resurrection_index_fallbacks": (
+                observed_metrics.resurrection_index_fallbacks,
+                0,
+            ),
+            "resurrection_undo_body_pages": (
+                observed_metrics.resurrection_undo_body_pages,
+                0,
+            ),
+            "resurrection_undo_body_records": (
+                observed_metrics.resurrection_undo_body_records,
+                0,
+            ),
+        }
+        for name, (actual, required) in exact_checks.items():
+            if actual != required:
+                raise AssertionError(
+                    "repeated-row startup capacity metric mismatch: "
+                    f"{name}={actual} required={required}"
+                )
+        if observed_metrics.outcome != "completed":
+            raise AssertionError(
+                "repeated-row startup capacity metric mismatch: "
+                f"outcome={observed_metrics.outcome} required=completed"
+            )
+        if observed_metrics.resurrection_undo_anchor_checks < expected:
+            raise AssertionError(
+                "repeated-row startup capacity metric mismatch: "
+                "resurrection_undo_anchor_checks="
+                f"{observed_metrics.resurrection_undo_anchor_checks} "
+                f"required_at_least={expected}"
+            )
+
     def latest_source_phase2_end_monotonic_us(self) -> Optional[int]:
         metrics = list(getattr(self, "warmcopy_drain_metrics", []))
         return next(
@@ -6403,6 +7150,11 @@ class BusinessE2ERunner:
             f"completed={snapshot['completed'][:20]} "
             f"failed_before_pause={failed_before_pause[:20]}"
         )
+
+    def _drain_ready_timeout_s(self) -> float:
+        if self.config.drain_ready_timeout_s > 0:
+            return self.config.drain_ready_timeout_s
+        return max(self.config.drain_interval_s, self.config.resume_timeout_s)
 
     def _run_business_before_drain(self, cycle: int) -> None:
         LOG.info(
@@ -6782,6 +7534,12 @@ class BusinessE2ERunner:
             "Preserve_trx_startup_recovery_snapshot_tokens",
             "Preserve_trx_startup_recovery_standby_pending_tokens",
             "Preserve_trx_startup_recovery_tainted_tokens",
+            "Preserve_trx_startup_resurrection_index_candidates",
+            "Preserve_trx_startup_resurrection_index_hits",
+            "Preserve_trx_startup_resurrection_index_fallbacks",
+            "Preserve_trx_startup_resurrection_undo_anchor_checks",
+            "Preserve_trx_startup_resurrection_undo_body_pages",
+            "Preserve_trx_startup_resurrection_undo_body_records",
         }
         quoted_fields = ", ".join(f"'{field}'" for field in sorted(fields))
         sql = (
@@ -6806,11 +7564,16 @@ class BusinessE2ERunner:
                 return None
             name, value = row
             values[str(name)] = str(value)
-        if any(field not in values for field in fields):
+        if any(field not in values for field in fields if len(field) <= 63):
             return None
 
         def metric(field: str) -> int:
-            return int(values[field])
+            value = values.get(field)
+            if value is None:
+                if len(field) > 63:
+                    return 0
+                raise KeyError(field)
+            return int(value)
 
         try:
             elapsed_us = metric("Preserve_trx_startup_recovery_elapsed_us")
@@ -6906,7 +7669,25 @@ class BusinessE2ERunner:
             snapshot_register_us = metric(
                 "Preserve_trx_startup_recovery_phase_snapshot_register_us"
             )
-        except ValueError:
+            resurrection_index_candidates = metric(
+                "Preserve_trx_startup_resurrection_index_candidates"
+            )
+            resurrection_index_hits = metric(
+                "Preserve_trx_startup_resurrection_index_hits"
+            )
+            resurrection_index_fallbacks = metric(
+                "Preserve_trx_startup_resurrection_index_fallbacks"
+            )
+            resurrection_undo_anchor_checks = metric(
+                "Preserve_trx_startup_resurrection_undo_anchor_checks"
+            )
+            resurrection_undo_body_pages = metric(
+                "Preserve_trx_startup_resurrection_undo_body_pages"
+            )
+            resurrection_undo_body_records = metric(
+                "Preserve_trx_startup_resurrection_undo_body_records"
+            )
+        except (KeyError, ValueError):
             return None
 
         return StartupRecoveryMetrics(
@@ -6948,6 +7729,12 @@ class BusinessE2ERunner:
             snapshot_predicate_locks_ms=snapshot_predicate_locks_us / 1000.0,
             snapshot_mdl_ms=snapshot_mdl_us / 1000.0,
             snapshot_register_ms=snapshot_register_us / 1000.0,
+            resurrection_index_candidates=resurrection_index_candidates,
+            resurrection_index_hits=resurrection_index_hits,
+            resurrection_index_fallbacks=resurrection_index_fallbacks,
+            resurrection_undo_anchor_checks=resurrection_undo_anchor_checks,
+            resurrection_undo_body_pages=resurrection_undo_body_pages,
+            resurrection_undo_body_records=resurrection_undo_body_records,
         )
 
     def read_promotion_gate_metrics_from_status(
@@ -7099,6 +7886,8 @@ class BusinessE2ERunner:
             "Preserve_trx_transfer_receiver_staged_token_max_us",
             "Preserve_trx_transfer_receiver_staged_token_active",
             "Preserve_trx_transfer_receiver_staged_token_max_active",
+            "Preserve_trx_transfer_receiver_queued_bytes",
+            "Preserve_trx_transfer_receiver_worker_active",
             "Preserve_trx_transfer_receiver_projection_publish_count",
             "Preserve_trx_transfer_receiver_projection_publish_us",
             "Preserve_trx_transfer_receiver_projection_publish_max_us",
@@ -7111,6 +7900,9 @@ class BusinessE2ERunner:
             "Preserve_trx_transfer_receiver_projection_encode_us",
             "Preserve_trx_transfer_receiver_projection_token_state_us",
             "Preserve_trx_transfer_receiver_epoch_ready_bind_attempts",
+            "Preserve_trx_transfer_receiver_strict_record_index_page_reads",
+            "Preserve_trx_transfer_receiver_strict_ibuf_merges",
+            "Preserve_trx_transfer_receiver_strict_target_local_redo_bytes",
         }
         quoted_fields = ", ".join(f"'{field}'" for field in sorted(fields))
         sql = (
@@ -7292,6 +8084,12 @@ class BusinessE2ERunner:
                 staged_token_max_active=metric(
                     "Preserve_trx_transfer_receiver_staged_token_max_active"
                 ),
+                receiver_queued_bytes=metric(
+                    "Preserve_trx_transfer_receiver_queued_bytes"
+                ),
+                receiver_worker_active=metric(
+                    "Preserve_trx_transfer_receiver_worker_active"
+                ),
                 projection_publish_count=metric(
                     "Preserve_trx_transfer_receiver_projection_publish_count"
                 ),
@@ -7327,6 +8125,15 @@ class BusinessE2ERunner:
                 ),
                 epoch_ready_bind_attempts=metric(
                     "Preserve_trx_transfer_receiver_epoch_ready_bind_attempts"
+                ),
+                strict_record_index_page_reads=metric(
+                    "Preserve_trx_transfer_receiver_strict_record_index_page_reads"
+                ),
+                strict_ibuf_merges=metric(
+                    "Preserve_trx_transfer_receiver_strict_ibuf_merges"
+                ),
+                strict_target_local_redo_bytes=metric(
+                    "Preserve_trx_transfer_receiver_strict_target_local_redo_bytes"
                 ),
             )
         except ValueError:
@@ -8162,9 +8969,25 @@ class BusinessE2ERunner:
             "status": "success",
             "success": True,
             "scenario": self.config.scenario,
+            **_evidence_contract(EVIDENCE_KIND_LOCAL_STARTUP_E2E),
             "sessions": self.config.sessions,
             "cycles": self.config.cycles,
             "statements_per_tx": self.config.statements_per_tx,
+            "repeated_row_write_workload": (
+                self.config.repeated_row_write_workload
+            ),
+            "write_statements_per_transaction": (
+                self.config.statements_per_tx
+                if self.config.repeated_row_write_workload
+                else None
+            ),
+            "expected_total_write_statements": (
+                self.config.sessions
+                * self.config.statements_per_tx
+                * max(1, completed_tx_min)
+                if self.config.repeated_row_write_workload
+                else None
+            ),
             "completed_tx_min": completed_tx_min,
             "completed_stmt_total": completed_stmt_total,
             "temp_table_workload": self.config.temp_table_workload,
@@ -8293,6 +9116,24 @@ class BusinessE2ERunner:
             ],
             "startup_recovery_snapshot_register_samples_ms": [
                 metric.snapshot_register_ms for metric in startup_metrics
+            ],
+            "startup_resurrection_index_candidates_samples": [
+                metric.resurrection_index_candidates for metric in startup_metrics
+            ],
+            "startup_resurrection_index_hits_samples": [
+                metric.resurrection_index_hits for metric in startup_metrics
+            ],
+            "startup_resurrection_index_fallbacks_samples": [
+                metric.resurrection_index_fallbacks for metric in startup_metrics
+            ],
+            "startup_resurrection_undo_anchor_checks_samples": [
+                metric.resurrection_undo_anchor_checks for metric in startup_metrics
+            ],
+            "startup_resurrection_undo_body_pages_samples": [
+                metric.resurrection_undo_body_pages for metric in startup_metrics
+            ],
+            "startup_resurrection_undo_body_records_samples": [
+                metric.resurrection_undo_body_records for metric in startup_metrics
             ],
             "max_phase2_total_ms": self.config.max_phase2_total_ms,
             "temp_sidecar_bytes": None,
@@ -8839,6 +9680,7 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--seed-rows-per-table-per-session", type=int, default=12, help="seed rows per table/session; large bulk-lockset runs need enough existing rows per touched range")
     parser.add_argument("--cycles", "--drain-cycles", dest="cycles", type=int, default=3, help="number of drain/restart/resume maintenance cycles")
     parser.add_argument("--drain-interval", dest="drain_interval_s", type=float, default=30.0, help="seconds between maintenance cycles")
+    parser.add_argument("--drain-ready-timeout", dest="drain_ready_timeout_s", type=float, default=0.0, help="harness watchdog while workers finish their current transaction and pause before DRAIN; 0 keeps the legacy resume-timeout fallback")
     parser.add_argument("--business-run-before-drain", dest="business_run_before_drain_s", type=float, default=0.0, help="seconds to let workers run real business DML before issuing DRAIN directly; 0 keeps the deterministic pre-paused mode")
     parser.add_argument("--duration", dest="duration_s", type=float, default=0.0, help="total business workload seconds; workers continue after the last drain until this duration is reached")
     parser.add_argument("--max-transactions-per-worker", type=int, default=0, help="stop each worker after this many committed transactions; 0 means unbounded")
@@ -8849,6 +9691,7 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--lockset-touch-one-row", action="store_true", help="with --lockset-noop-update, update the first row in each batch so the transaction has minimal undo while retaining range lock pressure")
     parser.add_argument("--lockset-select-for-update", action="store_true", help="for bulk lockset workloads, use SELECT ... FOR UPDATE statements that acquire record locks without changing row contents")
     parser.add_argument("--lockset-minimal-table", action="store_true", help="for bulk lockset workloads, create narrow sid/k/counter tables so the gate measures lock preservation rather than wide-row data updates")
+    parser.add_argument("--repeated-row-write-workload", action="store_true", help="execute every transaction statement as a real UPDATE of one session-owned row; stresses long Undo chains without multiplying record locks")
     parser.add_argument("--preserve-timeout", dest="preserve_timeout_s", type=int, default=86400, help="WITH TIMEOUT value for DRAIN TRANSACTIONS PRESERVE")
     parser.add_argument("--preserve-max-binlog-cache-bytes", dest="preserve_max_binlog_cache_bytes", type=int, default=1_073_741_824, help="preserve_trx_max_binlog_cache_bytes for high-cardinality preserve artifacts")
     parser.add_argument("--preserve-max-lock-count", dest="preserve_max_lock_count", type=int, default=1_000_000, help="preserve_trx_max_lock_count for this high-cardinality E2E")
@@ -8912,6 +9755,19 @@ command is used after each DRAIN command shuts that server down.
             "mysqld processes, then run business workload and DRAIN"
         ),
     )
+    parser.add_argument(
+        "--standalone-transfer-accept-committed-not-ready",
+        action="store_true",
+        help=(
+            "accept current-process COMMITTED_NOT_READY receiver evidence "
+            "when no production physical fence provider exists; this does "
+            "not survive receiver restart and never proves promotion readiness"
+        ),
+    )
+    parser.add_argument("--receiver-read-load-threads", type=int, default=0, help="background receiver point-read threads active before and during transfer; 0 disables the probe")
+    parser.add_argument("--receiver-read-load-baseline-seconds", dest="receiver_read_load_baseline_s", type=float, default=0.0, help="receiver point-read baseline duration before source transfer starts")
+    parser.add_argument("--receiver-read-load-max-qps-drop-pct", type=float, default=5.0, help="maximum allowed receiver point-read QPS drop during transfer")
+    parser.add_argument("--receiver-read-load-max-p99-increase-pct", type=float, default=10.0, help="maximum allowed receiver point-read P99 latency increase during transfer")
     parser.add_argument("--standby-transfer-user", default="preserve_transfer_receiver", help="receiver account used by source-side standby transfer sessions")
     parser.add_argument("--standby-transfer-password", default="preserve_transfer_secret", help="shared secret stored in source/receiver credential stores for standby-transfer E2E")
     parser.add_argument("--standby-transfer-credential-name", default="preserve_transfer_credential", help="credential name used by source/receiver transfer codec and source client")
@@ -8920,6 +9776,7 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--shutdown-timeout", dest="shutdown_timeout_s", type=float, default=120.0, help="seconds to wait for DRAIN-triggered shutdown")
     parser.add_argument("--shutdown-quiet-period", dest="shutdown_quiet_period_s", type=float, default=2.0, help="seconds mysqld must remain unreachable before restart is attempted")
     parser.add_argument("--resume-timeout", dest="resume_timeout_s", type=float, default=120.0, help="seconds a worker waits for its resumed connection")
+    parser.add_argument("--worker-join-timeout", dest="worker_join_timeout_s", type=float, default=120.0, help="seconds to wait for all business workers to finish after the final resume")
     parser.add_argument("--restart-command", help="shell command used to start release mysqld after each drain")
     parser.add_argument("--server-pid-file", help="optional mysqld pid file; when set, shutdown waits for it to disappear before restart")
     parser.add_argument("--allow-partial-tokens", action="store_true", help="do not require exactly one preserved token per session")
@@ -8970,6 +9827,7 @@ command is used after each DRAIN command shuts that server down.
         seed_rows_per_table_per_session=args.seed_rows_per_table_per_session,
         cycles=args.cycles,
         drain_interval_s=args.drain_interval_s,
+        drain_ready_timeout_s=args.drain_ready_timeout_s,
         business_run_before_drain_s=args.business_run_before_drain_s,
         duration_s=args.duration_s,
         max_transactions_per_worker=max_transactions_per_worker,
@@ -8980,6 +9838,7 @@ command is used after each DRAIN command shuts that server down.
         lockset_touch_one_row=args.lockset_touch_one_row,
         lockset_select_for_update=args.lockset_select_for_update,
         lockset_minimal_table=args.lockset_minimal_table,
+        repeated_row_write_workload=args.repeated_row_write_workload,
         preserve_timeout_s=args.preserve_timeout_s,
         preserve_max_binlog_cache_bytes=args.preserve_max_binlog_cache_bytes,
         preserve_max_lock_count=args.preserve_max_lock_count,
@@ -9038,6 +9897,17 @@ command is used after each DRAIN command shuts that server down.
         receiver_start_command=args.receiver_start_command,
         receiver_restart_command=args.receiver_restart_command,
         receiver_physical_copy_before_drain=args.receiver_physical_copy_before_drain,
+        standalone_transfer_accept_committed_not_ready=(
+            args.standalone_transfer_accept_committed_not_ready
+        ),
+        receiver_read_load_threads=args.receiver_read_load_threads,
+        receiver_read_load_baseline_s=args.receiver_read_load_baseline_s,
+        receiver_read_load_max_qps_drop_pct=(
+            args.receiver_read_load_max_qps_drop_pct
+        ),
+        receiver_read_load_max_p99_increase_pct=(
+            args.receiver_read_load_max_p99_increase_pct
+        ),
         standby_transfer_user=args.standby_transfer_user,
         standby_transfer_password=args.standby_transfer_password,
         standby_transfer_credential_name=args.standby_transfer_credential_name,
@@ -9045,6 +9915,7 @@ command is used after each DRAIN command shuts that server down.
         shutdown_timeout_s=args.shutdown_timeout_s,
         shutdown_quiet_period_s=args.shutdown_quiet_period_s,
         resume_timeout_s=args.resume_timeout_s,
+        worker_join_timeout_s=args.worker_join_timeout_s,
         restart_command=args.restart_command,
         strict_token_count=not args.allow_partial_tokens,
         setup_schema=args.setup_schema,

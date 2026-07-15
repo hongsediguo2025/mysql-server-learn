@@ -9,16 +9,17 @@ KEY k_idx(k)
 INSERT INTO t_implicit_sec VALUES(1,100,10),(2,200,20),(3,300,30);
 START TRANSACTION;
 UPDATE t_implicit_sec SET k=250, v=21 WHERE id=2;
-PREPARE SHUTDOWN PRESERVE TRANSACTION WITH TIMEOUT 300;
-SELECT COUNT(*) > 0 AS recovered_secondary_record_locks
+SET SESSION debug="+d,preserve_trx_fail_materialize_implicit_locks";
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SELECT COUNT(*) AS recovered_explicit_secondary_record_locks
 FROM performance_schema.data_locks
 WHERE OBJECT_SCHEMA='test'
     AND OBJECT_NAME='t_implicit_sec'
     AND INDEX_NAME='k_idx'
     AND LOCK_TYPE='RECORD'
     AND LOCK_STATUS='GRANTED';
-recovered_secondary_record_locks
-1
+recovered_explicit_secondary_record_locks
+0
 SET innodb_lock_wait_timeout=1;
 UPDATE t_implicit_sec SET v=999 WHERE k=250;
 ERROR HY000: Lock wait timeout exceeded; try restarting transaction

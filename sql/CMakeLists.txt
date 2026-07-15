@@ -445,6 +445,7 @@ SET(SQL_SHARED_SOURCES
   preserve_trx_promotion.cc
   preserve_trx_promotion_prepared.cc
   preserve_trx_resource.cc
+  preserve_trx_resurrection_index.cc
   preserve_trx_rewrite.cc
   preserve_trx_temp_table.cc
   preserve_trx_temp_table_carrier.cc

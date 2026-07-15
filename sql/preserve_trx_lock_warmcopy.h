@@ -179,6 +179,7 @@ struct Preserve_trx_lock_warmcopy_artifact {
     within the same freeze.
   */
   bool record_live_seal_fence_valid{false};
+  bool record_store_fence_valid{false};
   /* True when prebuilt_record_locks_blob carries the record-lock body. */
   bool has_prebuilt_record_locks_blob{false};
   /* True while spill_path names a drain-local temporary spill file. */
@@ -186,6 +187,7 @@ struct Preserve_trx_lock_warmcopy_artifact {
   /* True after spill_path has been rehydrated into inline payload fields. */
   bool spill_materialized{false};
   lock_warmcopy_trx_lock_fence_t record_live_seal_fence;
+  lock_warmcopy_record_store_fence_t record_store_fence;
   /* Counts are used for P_S/show output and phase-2 workload attribution. */
   uint32_t record_lock_count{0};
   uint32_t table_lock_count{0};

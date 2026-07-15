@@ -145,6 +145,42 @@ die "record lock discard must mark the warmcopy shard dirty through a thin wrapp
 die "record lock discard hot hook must not build shard keys inline\n"
   if $discard =~ /lock_warmcopy_record_shard_key_t/s;
 
+my $bitmap_reset = extract_function(
+  $lock,
+  qr/static\s+void\s+lock_rec_bitmap_reset\s*\(/,
+  'lock_rec_bitmap_reset');
+die "bulk bitmap reset must advance the source-live lock coordinate generation\n"
+  unless $bitmap_reset =~
+         /lock_warmcopy_record_note_bulk_mutation_for_lock\s*\([\s\S]*REORGANIZE/s;
+
+my $move_low = extract_function(
+  $lock,
+  qr/static\s+void\s+lock_rec_move_low\s*\(/,
+  'lock_rec_move_low');
+die "record move must advance the source-live lock coordinate generation\n"
+  unless $move_low =~
+         /lock_warmcopy_record_note_bulk_mutation_for_lock\s*\([\s\S]*MOVE/s;
+
+my $inherit_gap = extract_function(
+  $lock,
+  qr/static\s+void\s+lock_rec_inherit_to_gap\s*\(/,
+  'lock_rec_inherit_to_gap');
+die "gap-lock inheritance must advance the source-live lock coordinate generation\n"
+  unless $inherit_gap =~
+         /lock_warmcopy_record_note_bulk_mutation_for_lock\s*\([\s\S]*INHERIT/s;
+
+my $bulk_mutation_wrapper = extract_function(
+  $lock_warmcopy,
+  qr/bool\s+lock_warmcopy_record_note_bulk_mutation_for_lock\s*\(/,
+  'lock_warmcopy_record_note_bulk_mutation_for_lock');
+die "bulk mutation wrapper must remain a gated atomic-only hot hook\n"
+  unless $bulk_mutation_wrapper =~ /lock_warmcopy_hooks_enabled/s &&
+         $bulk_mutation_wrapper =~
+           /lock_warmcopy_coordinate_generation\.fetch_add/s;
+die "bulk mutation wrapper must not touch the record-store map or allocate\n"
+  if $bulk_mutation_wrapper =~
+     /(record_store_partition_for_target|find_or_create_record_shard|new\s|malloc\s*\()/s;
+
 my $add_to_queue = extract_function(
   $lock,
   qr/static\s+void\s+lock_rec_add_to_queue\s*\(/,

@@ -715,6 +715,10 @@ struct trx_lock_t {
   It is read with exclusive lock_sys latch. */
   std::atomic<ulint> n_rec_locks;
 
+  /** Source-live record coordinate generation for lock warmcopy. Bulk page
+  operations increment it even when lock-list membership and count are stable. */
+  std::atomic<uint64_t> lock_warmcopy_coordinate_generation;
+
   /** True while Preserve/Resume lock warmcopy has frozen this transaction's
   record-lock conversion window. The freeze spans prepare and later preserve
   ownership checks until SQL explicitly thaws it. It prevents
@@ -1117,6 +1121,10 @@ struct trx_t {
   transaction and owns its lifecycle. Protected by trx_sys_t::mutex while the
   transaction is in trx_sys->rw_trx_list. */
   bool preserve_trx_claimed;
+
+  /** Redo LSN that made this transaction PREPARED. This is populated only at
+  the native prepare boundary and exported only for strict transfer evidence. */
+  lsn_t preserve_prepare_lsn;
 
   const char *mysql_log_file_name;
   /*!< if MySQL binlog is used, this field

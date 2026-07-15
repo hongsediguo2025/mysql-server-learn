@@ -35,6 +35,7 @@ class THD;
 
 static constexpr size_t kPreservedTrxKeyLength = 32;
 static constexpr size_t kPreservedTrxSha256Length = 32;
+static constexpr uint16_t kPreservedTrxLockPlanContractVersion = 2;
 static constexpr size_t kPreservedTrxRecoveredCountOffset = 25;
 static constexpr size_t kPreservedTrxHmacOffset = 516;
 static constexpr size_t kPreservedTrxHmacLength = 32;
@@ -352,6 +353,12 @@ struct Preserved_trx_external_blob {
   bool prebuilt{false};
   std::string warmcopy_id;
   uint64_t warmcopy_epoch{0};
+  uint16_t lock_plan_contract_version{0};
+  uint64_t source_live_lock_generation{0};
+  std::array<unsigned char, kPreservedTrxSha256Length>
+      source_live_lock_digest{};
+  std::array<unsigned char, kPreservedTrxSha256Length>
+      record_store_fingerprint{};
 };
 
 /*
@@ -377,6 +384,12 @@ struct PrebuiltRecordLocksBlob {
   uint64_t warmcopy_epoch{0};
   uint64_t size{0};
   std::array<unsigned char, kPreservedTrxSha256Length> digest{};
+  uint16_t lock_plan_contract_version{0};
+  uint64_t source_live_lock_generation{0};
+  std::array<unsigned char, kPreservedTrxSha256Length>
+      source_live_lock_digest{};
+  std::array<unsigned char, kPreservedTrxSha256Length>
+      record_store_fingerprint{};
 };
 
 /*

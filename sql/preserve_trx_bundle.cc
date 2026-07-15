@@ -2440,6 +2440,13 @@ Preserve_snapshot_status attach_prebuilt_record_locks_blob_if_requested(
   external_blob.prebuilt = true;
   external_blob.warmcopy_id = prebuilt.warmcopy_id;
   external_blob.warmcopy_epoch = prebuilt.warmcopy_epoch;
+  external_blob.lock_plan_contract_version =
+      prebuilt.lock_plan_contract_version;
+  external_blob.source_live_lock_generation =
+      prebuilt.source_live_lock_generation;
+  external_blob.source_live_lock_digest = prebuilt.source_live_lock_digest;
+  external_blob.record_store_fingerprint =
+      prebuilt.record_store_fingerprint;
   built->external_blobs.push_back(std::move(external_blob));
   built->metadata.record_locks_payload.clear();
   return Preserve_snapshot_status::OK;

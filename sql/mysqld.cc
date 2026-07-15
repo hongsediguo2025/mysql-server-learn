@@ -763,6 +763,7 @@
 #include "sql/persisted_variable.h"              // Persisted_variables_cache
 #include "sql/plugin_table.h"
 #include "sql/preserve_trx.h"
+#include "sql/preserve_trx_promotion.h"
 #include "sql/preserve_trx_lock_warmcopy.h"
 #include "sql/preserve_trx_resource.h"
 #include "sql/protocol.h"
@@ -2394,6 +2395,7 @@ static void clean_up(bool print_message) {
   if (cleanup_done++) return; /* purecov: inspected */
 
   preserved_trx_stop_expired_reaper();
+  preserved_trx_promotion_shutdown_gate_workers();
   preserve_trx_transfer_shutdown_receiver_prewarm_workers();
 
   ha_pre_dd_shutdown();
@@ -5919,6 +5921,25 @@ static int init_server_components() {
     unireg_abort(1);
   }
 
+  /*
+    Transfer receiver artifacts belong only to the mysqld process that accepted
+    them. Discard them before InnoDB initialization, because InnoDB startup
+    Preserve hooks must never interpret process-local receiver files as local
+    shutdown/startup recovery input. This is unconditional for a normal start:
+    the receiver endpoint may intentionally be disabled in the new process.
+  */
+  if (!opt_initialize && !is_help_or_validate_option()) {
+    const Preserve_trx_transfer_status cleanup_status =
+        preserve_trx_transfer_cleanup_receiver_restart_state(
+            preserved_trx_dir_value());
+    if (cleanup_status != Preserve_trx_transfer_status::OK) {
+      LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+             "PRESERVE: failed to discard process-local transfer receiver "
+             "state during startup");
+      unireg_abort(MYSQLD_ABORT_EXIT);
+    }
+  }
+
   /* Load builtin plugins, initialize MyISAM, CSV and InnoDB */
   if (plugin_register_builtin_and_init_core_se(&remaining_argc,
                                                remaining_argv)) {
@@ -9076,6 +9097,24 @@ SHOW_VAR status_vars[] = {
     {"Preserve_trx_startup_recovery_orphan_rollback_count",
      (char *)&show_preserve_trx_startup_recovery_orphan_rollback_count,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_startup_resurrection_index_candidates",
+     (char *)&show_preserve_trx_startup_resurrection_index_candidates,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_startup_resurrection_index_hits",
+     (char *)&show_preserve_trx_startup_resurrection_index_hits, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_startup_resurrection_index_fallbacks",
+     (char *)&show_preserve_trx_startup_resurrection_index_fallbacks,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_startup_resurrection_undo_anchor_checks",
+     (char *)&show_preserve_trx_startup_resurrection_undo_anchor_checks,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_startup_resurrection_undo_body_pages",
+     (char *)&show_preserve_trx_startup_resurrection_undo_body_pages,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_startup_resurrection_undo_body_records",
+     (char *)&show_preserve_trx_startup_resurrection_undo_body_records,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_startup_recovery_phase_snapshot_claim_us",
      (char *)&show_preserve_trx_startup_recovery_phase_snapshot_claim_us,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
@@ -9193,6 +9232,15 @@ SHOW_VAR status_vars[] = {
     {"Preserve_trx_promotion_gate_over_budget_count",
      (char *)&show_preserve_trx_promotion_gate_over_budget_count, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_promotion_gate_worker_count",
+     (char *)&show_preserve_trx_promotion_gate_worker_count, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_promotion_gate_worker_active_count",
+     (char *)&show_preserve_trx_promotion_gate_worker_active_count, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_promotion_gate_worker_idle_count",
+     (char *)&show_preserve_trx_promotion_gate_worker_idle_count, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_promotion_gate_skipped_count",
      (char *)&show_preserve_trx_promotion_gate_skipped_count, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
@@ -9201,6 +9249,24 @@ SHOW_VAR status_vars[] = {
      SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_promotion_gate_token_count",
      (char *)&show_preserve_trx_promotion_gate_token_count, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_promotion_prepared_registered_tokens",
+     (char *)&show_preserve_trx_promotion_prepared_registered_tokens,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_promotion_prepared_prewarm_pending_tokens",
+     (char *)&show_preserve_trx_promotion_prepared_prewarm_pending_tokens,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_promotion_prepared_ready_tokens",
+     (char *)&show_preserve_trx_promotion_prepared_ready_tokens, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_promotion_prepared_adopting_tokens",
+     (char *)&show_preserve_trx_promotion_prepared_adopting_tokens, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_promotion_prepared_adopted_tokens",
+     (char *)&show_preserve_trx_promotion_prepared_adopted_tokens, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_promotion_prepared_tainted_tokens",
+     (char *)&show_preserve_trx_promotion_prepared_tainted_tokens, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_promotion_prewarm_record_lock_cold_page_gets",
      (char *)&show_preserve_trx_promotion_prewarm_record_lock_cold_page_gets,
@@ -9286,6 +9352,39 @@ SHOW_VAR status_vars[] = {
     {"Preserve_trx_resume_real_redo_apply",
      (char *)&show_preserve_trx_resume_real_redo_apply, SHOW_FUNC,
      SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_throttled_milliseconds",
+     (char *)&show_preserve_trx_transfer_throttled_milliseconds, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_last_throttle_reason",
+     (char *)&show_preserve_trx_transfer_last_throttle_reason, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_receiver_queued_bytes",
+     (char *)&show_preserve_trx_transfer_receiver_queued_bytes, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_receiver_worker_active",
+     (char *)&show_preserve_trx_transfer_receiver_worker_active, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_receiver_worker_idle",
+     (char *)&show_preserve_trx_transfer_receiver_worker_idle, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_receiver_inflight_tokens",
+     (char *)&show_preserve_trx_transfer_receiver_inflight_tokens, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_receiver_inflight_bytes",
+     (char *)&show_preserve_trx_transfer_receiver_inflight_bytes, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_receiver_saved_online_tokens",
+     (char *)&show_preserve_trx_transfer_receiver_saved_online_tokens,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_receiver_failed_tokens",
+     (char *)&show_preserve_trx_transfer_receiver_failed_tokens, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_receiver_last_failed_token",
+     (char *)&show_preserve_trx_transfer_receiver_last_failed_token, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_receiver_last_failed_reason",
+     (char *)&show_preserve_trx_transfer_receiver_last_failed_reason,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_transfer_receiver_auto_prewarm_last_status",
      (char *)&show_preserve_trx_transfer_receiver_auto_prewarm_last_status,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
@@ -9356,6 +9455,15 @@ SHOW_VAR status_vars[] = {
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_transfer_receiver_record_object_prewarm_max_us",
      (char *)&show_preserve_trx_transfer_receiver_record_object_prewarm_max_us,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_receiver_strict_record_index_page_reads",
+     (char *)&show_preserve_trx_transfer_receiver_strict_record_index_page_reads,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_receiver_strict_ibuf_merges",
+     (char *)&show_preserve_trx_transfer_receiver_strict_ibuf_merges,
+     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Preserve_trx_transfer_receiver_strict_target_local_redo_bytes",
+     (char *)&show_preserve_trx_transfer_receiver_strict_target_local_redo_bytes,
      SHOW_FUNC, SHOW_SCOPE_GLOBAL},
     {"Preserve_trx_recv_rec_obj_prewarm_first_start_us",
      (char *)

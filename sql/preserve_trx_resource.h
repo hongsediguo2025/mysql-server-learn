@@ -268,6 +268,18 @@ int show_preserve_trx_startup_recovery_promotion_intent_tokens(THD *thd,
 int show_preserve_trx_startup_recovery_orphan_rollback_count(THD *thd,
                                                              SHOW_VAR *var,
                                                              char *buf);
+int show_preserve_trx_startup_resurrection_index_candidates(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_resurrection_index_hits(THD *thd, SHOW_VAR *var,
+                                                      char *buf);
+int show_preserve_trx_startup_resurrection_index_fallbacks(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_resurrection_undo_anchor_checks(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_resurrection_undo_body_pages(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_startup_resurrection_undo_body_records(
+    THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_startup_recovery_phase_snapshot_load_us(THD *thd,
                                                               SHOW_VAR *var,
                                                               char *buf);
@@ -357,6 +369,31 @@ int show_preserve_trx_promotion_gate_ready_cache_miss_count(THD *thd,
                                                             char *buf);
 int show_preserve_trx_promotion_gate_over_budget_count(THD *thd, SHOW_VAR *var,
                                                        char *buf);
+int show_preserve_trx_promotion_gate_worker_count(THD *thd, SHOW_VAR *var,
+                                                  char *buf);
+int show_preserve_trx_promotion_gate_worker_active_count(THD *thd,
+                                                         SHOW_VAR *var,
+                                                         char *buf);
+int show_preserve_trx_promotion_gate_worker_idle_count(THD *thd,
+                                                       SHOW_VAR *var,
+                                                       char *buf);
+int show_preserve_trx_promotion_prepared_registered_tokens(THD *thd,
+                                                           SHOW_VAR *var,
+                                                           char *buf);
+int show_preserve_trx_promotion_prepared_prewarm_pending_tokens(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_promotion_prepared_ready_tokens(THD *thd,
+                                                      SHOW_VAR *var,
+                                                      char *buf);
+int show_preserve_trx_promotion_prepared_adopting_tokens(THD *thd,
+                                                         SHOW_VAR *var,
+                                                         char *buf);
+int show_preserve_trx_promotion_prepared_adopted_tokens(THD *thd,
+                                                        SHOW_VAR *var,
+                                                        char *buf);
+int show_preserve_trx_promotion_prepared_tainted_tokens(THD *thd,
+                                                        SHOW_VAR *var,
+                                                        char *buf);
 int show_preserve_trx_promotion_prewarm_record_lock_page_count(THD *thd,
                                                                SHOW_VAR *var,
                                                                char *buf);
@@ -424,6 +461,39 @@ int show_preserve_trx_resume_physical_consistency_mode(THD *thd,
                                                         char *buf);
 int show_preserve_trx_resume_real_redo_apply(THD *thd, SHOW_VAR *var,
                                               char *buf);
+int show_preserve_trx_transfer_throttled_milliseconds(THD *thd,
+                                                      SHOW_VAR *var,
+                                                      char *buf);
+int show_preserve_trx_transfer_last_throttle_reason(THD *thd,
+                                                    SHOW_VAR *var,
+                                                    char *buf);
+int show_preserve_trx_transfer_receiver_queued_bytes(THD *thd,
+                                                     SHOW_VAR *var,
+                                                     char *buf);
+int show_preserve_trx_transfer_receiver_worker_active(THD *thd,
+                                                      SHOW_VAR *var,
+                                                      char *buf);
+int show_preserve_trx_transfer_receiver_worker_idle(THD *thd,
+                                                    SHOW_VAR *var,
+                                                    char *buf);
+int show_preserve_trx_transfer_receiver_inflight_tokens(THD *thd,
+                                                        SHOW_VAR *var,
+                                                        char *buf);
+int show_preserve_trx_transfer_receiver_inflight_bytes(THD *thd,
+                                                       SHOW_VAR *var,
+                                                       char *buf);
+int show_preserve_trx_transfer_receiver_saved_online_tokens(THD *thd,
+                                                            SHOW_VAR *var,
+                                                            char *buf);
+int show_preserve_trx_transfer_receiver_failed_tokens(THD *thd,
+                                                      SHOW_VAR *var,
+                                                      char *buf);
+int show_preserve_trx_transfer_receiver_last_failed_token(THD *thd,
+                                                          SHOW_VAR *var,
+                                                          char *buf);
+int show_preserve_trx_transfer_receiver_last_failed_reason(THD *thd,
+                                                           SHOW_VAR *var,
+                                                           char *buf);
 int show_preserve_trx_transfer_receiver_auto_prewarm_tokens(THD *thd,
                                                             SHOW_VAR *var,
                                                             char *buf);
@@ -473,6 +543,12 @@ int show_preserve_trx_transfer_receiver_record_object_prewarm_count(
 int show_preserve_trx_transfer_receiver_record_object_prewarm_us(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_record_object_prewarm_max_us(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_strict_record_index_page_reads(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_strict_ibuf_merges(
+    THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_transfer_receiver_strict_target_local_redo_bytes(
     THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_transfer_receiver_record_object_prewarm_first_start_monotonic_us(
     THD *thd, SHOW_VAR *var, char *buf);

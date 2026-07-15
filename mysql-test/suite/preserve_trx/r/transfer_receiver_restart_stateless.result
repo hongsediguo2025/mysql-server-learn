@@ -1,0 +1,4 @@
+# restart: --preserve-trx-enable=ON --preserve-trx-transfer-receiver-enable=OFF --skip-log-bin
+SELECT @@global.preserve_trx_transfer_receiver_enable=0 AS receiver_mode;
+receiver_mode
+1

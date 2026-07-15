@@ -32,10 +32,11 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertEqual(100000, FULL_PROFILE.lockset_batch_size)
         self.assertEqual(256 * 1024 * 1024, FULL_PROFILE.preserve_memory_budget_bytes)
         self.assertEqual(2 * 1024**3, FULL_PROFILE.source_buffer_pool_bytes)
-        self.assertEqual(4 * 1024**3, FULL_PROFILE.receiver_buffer_pool_bytes)
+        self.assertEqual(2 * 1024**3, FULL_PROFILE.receiver_buffer_pool_bytes)
         self.assertEqual(8, FULL_PROFILE.receiver_workers)
         self.assertEqual(8 * 1024**2, FULL_PROFILE.phase1_batch_bytes)
         self.assertEqual(50, FULL_PROFILE.phase1_batch_linger_ms)
+        self.assertEqual(500_000, FULL_PROFILE.source_phase2_limit_us)
 
     def test_paths_derive_receiver_preserve_dir_from_datadir(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -84,9 +85,16 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertIn("--tables 100", joined)
         self.assertIn("--lockset-batch-size 100000", joined)
         self.assertIn("--receiver-physical-copy-before-drain", command)
+        self.assertIn("--standalone-transfer-accept-committed-not-ready", command)
+        self.assertIn("--receiver-read-load-threads 8", joined)
+        self.assertIn("--receiver-read-load-max-qps-drop-pct 5.0", joined)
+        self.assertIn("--receiver-read-load-max-p99-increase-pct 10.0", joined)
         self.assertIn(str(paths.receiver_datadir / "preserve"), command)
         self.assertNotIn("do-not-record-this", " ".join(redact_command(command)))
         self.assertFalse(any("--server-uuid" in item for item in source + receiver))
+        self.assertIn("--log-error-verbosity=3", source)
+        self.assertIn("--log-error-verbosity=3", receiver)
+        self.assertIn("--innodb-buffer-pool-size=2147483648", receiver)
 
     def test_release_run_builds_current_mysqld_before_collecting_evidence(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -114,37 +122,141 @@ class FullPressureProfileTest(unittest.TestCase):
             "workload_statements_per_tx": 100000,
             "workload_seed_rows_per_table_per_session": 100000,
             "workload_lockset_batch_size": 100000,
-            "standby_tokens": 1000,
-            "receiver_ready_tokens": 1000,
+            "evidence_kind": "STANDALONE_TRANSFER_E2E",
+            "physical_replication": False,
+            "production_provider": False,
+            "write_enable_exercised": False,
+            "receiver_readiness_contract": "COMMITTED_NOT_READY",
+            "standby_tokens": 0,
+            "receiver_ready_tokens": 0,
             "receiver_not_ready_tokens": 0,
             "receiver_record_cold_gets": 0,
-            "receiver_prewarm_backlog_at_phase2_end": 0,
+            "receiver_prewarm_backlog_at_phase2_end": 1000,
             "phase2_transfer_bulk_bytes": 0,
             "receiver_record_object_prewarm_phase1_overlap": True,
             "source_phase2_total_us": [250000],
-            "receiver_ready_after_final_spool_ack_us": 200000,
-            "receiver_record_lock_page_count": 227800,
-            "receiver_record_lock_resident_pages": 227800,
-            "receiver_record_lock_required_residency_bytes": 3732275200,
-            "receiver_record_lock_reserved_residency_bytes": 3732275200,
+            "phase2_record_lock_count_samples": [100_000_000],
+            "receiver_ready_after_final_spool_ack_us": 0,
+            "receiver_all_prewarm_after_final_ack_us": 450000,
+            "receiver_record_lock_page_count": 0,
+            "receiver_record_lock_resident_pages": 0,
+            "receiver_record_lock_required_residency_bytes": 0,
+            "receiver_record_lock_reserved_residency_bytes": 0,
             "receiver_epoch_fact_bound": True,
+            "receiver_epoch_storage": "PROCESS_LOCAL",
+            "receiver_process_local_epoch_accepted": True,
+            "receiver_epoch_fact_count": 0,
+            "receiver_epoch_commit_count": 0,
+            "receiver_epoch_ready_bind_attempts": 0,
+            "receiver_seal_prewarm_tokens": 1000,
+            "receiver_seal_prewarm_success_tokens": 1000,
             "receiver_record_object_prewarm_count": 1000,
+            "receiver_strict_record_index_page_reads": 0,
+            "receiver_strict_ibuf_merges": 0,
+            "receiver_strict_target_local_redo_bytes": 0,
             "receiver_lock_plan_epoch_peak_bytes": 75563900,
             "receiver_lock_plan_subpool_cap_bytes": 161061273,
             "source_phase1_record_batch_tokens_avg": 20,
             "source_phase1_transfer_network_send_count": 61,
             "source_phase1_transfer_frame_count": 8000,
             "completed_stmt_total": 1136,
+            "receiver_read_load_threads": 8,
+            "receiver_read_load_baseline_query_count": 100000,
+            "receiver_read_load_transfer_query_count": 96000,
+            "receiver_read_load_baseline_qps": 10000.0,
+            "receiver_read_load_transfer_qps": 9600.0,
+            "receiver_read_load_qps_drop_pct": 4.0,
+            "receiver_read_load_baseline_p99_us": 1000,
+            "receiver_read_load_transfer_p99_us": 1090,
+            "receiver_read_load_p99_increase_pct": 9.0,
+            "receiver_read_load_error_count": 0,
         }
         metrics = validate_e2e_report(FULL_PROFILE, report)
-        self.assertEqual(227800, metrics["receiver_record_lock_page_count"])
+        self.assertEqual(100_000_000, metrics["phase2_record_lock_count"])
+        self.assertEqual(
+            450000, metrics["receiver_all_prewarm_after_final_ack_us"]
+        )
 
         report["workload_table_count"] = 30
-        report["receiver_ready_after_final_spool_ack_us"] = 600000
+        report["receiver_read_load_qps_drop_pct"] = 6.0
         with self.assertRaisesRegex(
-            RuntimeError, "workload_table_count.*receiver_ready_after_final_spool_ack_us"
+            RuntimeError, "workload_table_count.*receiver_read_load_qps_drop_pct"
         ):
             validate_e2e_report(FULL_PROFILE, report)
+
+    def test_full_report_gate_rejects_strict_side_effects_and_false_ready(self):
+        report = self._valid_committed_not_ready_report()
+        report["receiver_ready_tokens"] = 1
+        report["receiver_epoch_ready_bind_attempts"] = 1
+        report["receiver_strict_target_local_redo_bytes"] = 4096
+        report["receiver_record_lock_page_count"] = 1
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "receiver_ready_tokens.*receiver_epoch_ready_bind_attempts.*"
+            "receiver_record_lock_page_count.*receiver_strict_target_local_redo_bytes",
+        ):
+            validate_e2e_report(FULL_PROFILE, report)
+
+    @staticmethod
+    def _valid_committed_not_ready_report():
+        return {
+            "status": "success",
+            "success": True,
+            "workload_sessions": 1000,
+            "workload_table_count": 100,
+            "workload_statements_per_tx": 100000,
+            "workload_seed_rows_per_table_per_session": 100000,
+            "workload_lockset_batch_size": 100000,
+            "evidence_kind": "STANDALONE_TRANSFER_E2E",
+            "physical_replication": False,
+            "production_provider": False,
+            "write_enable_exercised": False,
+            "receiver_readiness_contract": "COMMITTED_NOT_READY",
+            "standby_tokens": 0,
+            "receiver_ready_tokens": 0,
+            "receiver_not_ready_tokens": 0,
+            "receiver_record_cold_gets": 0,
+            "receiver_prewarm_backlog_at_phase2_end": 1000,
+            "phase2_transfer_bulk_bytes": 0,
+            "receiver_record_object_prewarm_phase1_overlap": True,
+            "source_phase2_total_us": [250000],
+            "phase2_record_lock_count_samples": [100_000_000],
+            "receiver_ready_after_final_spool_ack_us": 0,
+            "receiver_all_prewarm_after_final_ack_us": 450000,
+            "receiver_record_lock_page_count": 0,
+            "receiver_record_lock_resident_pages": 0,
+            "receiver_record_lock_required_residency_bytes": 0,
+            "receiver_record_lock_reserved_residency_bytes": 0,
+            "receiver_epoch_fact_bound": True,
+            "receiver_epoch_storage": "PROCESS_LOCAL",
+            "receiver_process_local_epoch_accepted": True,
+            "receiver_epoch_fact_count": 0,
+            "receiver_epoch_commit_count": 0,
+            "receiver_epoch_ready_bind_attempts": 0,
+            "receiver_seal_prewarm_tokens": 1000,
+            "receiver_seal_prewarm_success_tokens": 1000,
+            "receiver_record_object_prewarm_count": 1000,
+            "receiver_strict_record_index_page_reads": 0,
+            "receiver_strict_ibuf_merges": 0,
+            "receiver_strict_target_local_redo_bytes": 0,
+            "receiver_lock_plan_epoch_peak_bytes": 75563900,
+            "receiver_lock_plan_subpool_cap_bytes": 161061273,
+            "source_phase1_record_batch_tokens_avg": 20,
+            "source_phase1_transfer_network_send_count": 61,
+            "source_phase1_transfer_frame_count": 8000,
+            "completed_stmt_total": 1136,
+            "receiver_read_load_threads": 8,
+            "receiver_read_load_baseline_query_count": 100000,
+            "receiver_read_load_transfer_query_count": 96000,
+            "receiver_read_load_baseline_qps": 10000.0,
+            "receiver_read_load_transfer_qps": 9600.0,
+            "receiver_read_load_qps_drop_pct": 4.0,
+            "receiver_read_load_baseline_p99_us": 1000,
+            "receiver_read_load_transfer_p99_us": 1090,
+            "receiver_read_load_p99_increase_pct": 9.0,
+            "receiver_read_load_error_count": 0,
+        }
 
 
 class FullPressureEnvironmentTest(unittest.TestCase):

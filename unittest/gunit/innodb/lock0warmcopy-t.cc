@@ -1536,6 +1536,7 @@ TEST(LockWarmcopyConversionFreeze, SamplesAndComparesTrxLockFence) {
   trx_t trx{};
   trx.lock.trx_locks_version = 10;
   trx.lock.n_rec_locks.store(3);
+  trx.lock.lock_warmcopy_coordinate_generation.store(7);
   trx.lock.lock_warmcopy_freeze_generation = 2;
 
   lock_warmcopy_trx_lock_fence_t fence;
@@ -1543,6 +1544,7 @@ TEST(LockWarmcopyConversionFreeze, SamplesAndComparesTrxLockFence) {
                                                                 &fence));
   EXPECT_EQ(10ULL, fence.trx_locks_version);
   EXPECT_EQ(3ULL, fence.n_rec_locks);
+  EXPECT_EQ(7ULL, fence.coordinate_generation);
   EXPECT_EQ(2ULL, fence.freeze_generation);
   EXPECT_FALSE(fence.conversion_attempt_after_freeze);
   EXPECT_FALSE(fence.conversion_unhandled_after_freeze);
@@ -1566,6 +1568,14 @@ TEST(LockWarmcopyConversionFreeze, SamplesAndComparesTrxLockFence) {
       &trx.lock, &changed_version));
   EXPECT_FALSE(lock_warmcopy_trx_lock_fence_equal_for_unit_test(
       fence, changed_version));
+
+  trx.lock.trx_locks_version = 10;
+  trx.lock.lock_warmcopy_coordinate_generation.store(8);
+  lock_warmcopy_trx_lock_fence_t changed_coordinate;
+  ASSERT_TRUE(lock_warmcopy_trx_lock_fence_sample_for_unit_test(
+      &trx.lock, &changed_coordinate));
+  EXPECT_FALSE(lock_warmcopy_trx_lock_fence_equal_for_unit_test(
+      fence, changed_coordinate));
 }
 
 TEST(LockWarmcopyConversionFreeze, WaitForThawReturnsSuccessAfterThaw) {

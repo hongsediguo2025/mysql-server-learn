@@ -492,6 +492,24 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_startup_recovery_orphan_rollback_count,
     preserve_trx_startup_recovery_orphan_rollback_count_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_resurrection_index_candidates,
+    preserve_trx_startup_resurrection_index_candidates_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_resurrection_index_hits,
+    preserve_trx_startup_resurrection_index_hits_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_resurrection_index_fallbacks,
+    preserve_trx_startup_resurrection_index_fallbacks_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_resurrection_undo_anchor_checks,
+    preserve_trx_startup_resurrection_undo_anchor_checks_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_resurrection_undo_body_pages,
+    preserve_trx_startup_resurrection_undo_body_pages_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_startup_resurrection_undo_body_records,
+    preserve_trx_startup_resurrection_undo_body_records_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_startup_recovery_phase_snapshot_load_us,
     preserve_trx_startup_recovery_phase_snapshot_load_us_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
@@ -606,6 +624,33 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_promotion_gate_over_budget_count,
     preserve_trx_promotion_gate_over_budget_count_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_gate_worker_count,
+    preserve_trx_promotion_gate_worker_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_gate_worker_active_count,
+    preserve_trx_promotion_gate_worker_active_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_gate_worker_idle_count,
+    preserve_trx_promotion_gate_worker_idle_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_prepared_registered_tokens,
+    preserve_trx_promotion_prepared_registered_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_prepared_prewarm_pending_tokens,
+    preserve_trx_promotion_prepared_prewarm_pending_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_prepared_ready_tokens,
+    preserve_trx_promotion_prepared_ready_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_prepared_adopting_tokens,
+    preserve_trx_promotion_prepared_adopting_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_prepared_adopted_tokens,
+    preserve_trx_promotion_prepared_adopted_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_promotion_prepared_tainted_tokens,
+    preserve_trx_promotion_prepared_tainted_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_promotion_prewarm_record_lock_page_count,
     preserve_trx_promotion_prewarm_record_lock_page_count_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
@@ -685,6 +730,47 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_resume_real_redo_apply,
                               preserve_trx_resume_real_redo_apply_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_throttled_milliseconds,
+    preserve_trx_transfer_throttled_milliseconds_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_last_throttle_reason,
+    preserve_trx_transfer_last_throttle_reason_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_queued_bytes,
+    preserve_trx_transfer_receiver_queued_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_worker_active,
+    preserve_trx_transfer_receiver_worker_active_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_worker_idle,
+    preserve_trx_transfer_receiver_worker_idle_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_inflight_tokens,
+    preserve_trx_transfer_receiver_inflight_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_inflight_bytes,
+    preserve_trx_transfer_receiver_inflight_bytes_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_saved_online_tokens,
+    preserve_trx_transfer_receiver_saved_online_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_failed_tokens,
+    preserve_trx_transfer_receiver_failed_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_last_failed_token,
+    preserve_trx_transfer_receiver_last_failed_token_status())
+
+int show_preserve_trx_transfer_receiver_last_failed_reason(THD *,
+                                                           SHOW_VAR *var,
+                                                           char *buf) {
+  const std::string reason =
+      preserve_trx_transfer_receiver_last_failed_reason_status();
+  var->type = SHOW_CHAR;
+  var->value = buf;
+  strmake(buf, reason.c_str(), SHOW_VAR_FUNC_BUFF_SIZE - 1);
+  return 0;
+}
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_auto_prewarm_tokens,
     preserve_trx_transfer_receiver_auto_prewarm_tokens_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
@@ -753,6 +839,15 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_record_object_prewarm_max_us,
     preserve_trx_transfer_receiver_record_object_prewarm_max_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_strict_record_index_page_reads,
+    preserve_trx_transfer_receiver_strict_record_index_page_reads_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_strict_ibuf_merges,
+    preserve_trx_transfer_receiver_strict_ibuf_merges_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_strict_target_local_redo_bytes,
+    preserve_trx_transfer_receiver_strict_target_local_redo_bytes_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_record_object_prewarm_first_start_monotonic_us,
     preserve_trx_transfer_receiver_record_object_prewarm_first_start_monotonic_us_status())

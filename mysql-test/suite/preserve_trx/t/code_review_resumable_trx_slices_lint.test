@@ -62,6 +62,10 @@ my $trx_undo_path = File::Spec->catfile($source_root, 'storage', 'innobase',
                                         'trx', 'trx0undo.cc');
 my $trx_path = File::Spec->catfile($source_root, 'storage', 'innobase',
                                    'trx', 'trx0trx.cc');
+my $srv_start_path = File::Spec->catfile($source_root, 'storage', 'innobase',
+                                         'srv', 'srv0start.cc');
+my $trx_sys_ic_path = File::Spec->catfile($source_root, 'storage', 'innobase',
+                                          'include', 'trx0sys.ic');
 my $mtr_path = File::Spec->catfile($source_root, 'storage', 'innobase',
                                    'mtr', 'mtr0mtr.cc');
 my $ha_innodb_path = File::Spec->catfile($source_root, 'storage', 'innobase',
@@ -123,6 +127,8 @@ my $trx_preserve_header = read_source($trx_preserve_header_path);
 my $trx_temp_preserve = read_source($trx_temp_preserve_path);
 my $trx_undo = read_source($trx_undo_path);
 my $trx = read_source($trx_path);
+my $srv_start = read_source($srv_start_path);
+my $trx_sys_ic = read_source($trx_sys_ic_path);
 my $mtr = read_source($mtr_path);
 my $ha_innodb = read_source($ha_innodb_path);
 my $mysqld = read_source($mysqld_path);
@@ -147,6 +153,28 @@ my $sql_lock_warmcopy = read_source($sql_lock_warmcopy_path);
 my $promotion = read_source($promotion_path);
 my $promotion_header = read_source($promotion_header_path);
 my $standby_transfer_doc = read_optional_source($standby_transfer_doc_path);
+
+my ($trx_id_store_fact_capture) =
+  $trx_preserve =~ /(dberr_t\s+trx_preserve_capture_durable_trx_id_store_fact\([\s\S]*?^})/m
+  or die "could not isolate transfer-only durable TRX_SYS store fact capture\n";
+die "transfer TRX_SYS store fact must persist the native store, retain its redo commit LSN, and flush that LSN\n"
+  unless $trx_id_store_fact_capture =~
+           /mlog_write_ull\s*\([\s\S]*TRX_SYS_TRX_ID_STORE[\s\S]*mtr\.commit\(\)[\s\S]*mtr\.commit_lsn\(\)[\s\S]*log_write_up_to/s;
+die "ordinary transaction-id allocation must not perform transfer TRX_SYS fact capture\n"
+  if $trx_sys_ic =~ /trx_preserve_capture_durable_trx_id_store_fact/s;
+my ($simulated_publication_body) =
+  $trx_preserve =~ /(trx_preserve_targeted_publication_status\s+trx_preserve_publish_simulated_prepared\([\s\S]*?^})/m
+  or die "could not isolate simulated targeted publication\n";
+die "online targeted publication must not mutate startup-only found_prepared_trx\n"
+  if $simulated_publication_body =~ /found_prepared_trx/s;
+die "standby transfer wire contract must keep v3 legacy and v4 strict versions distinct\n"
+  unless $transfer_header =~
+           /kPreserveTrxTransferLegacyProtocolVersion\s*=\s*3/s &&
+         $transfer_header =~ /kPreserveTrxTransferProtocolVersion\s*=\s*4/s;
+die "standby transfer v4 COMMIT frame and epoch fact V3 must carry the complete TRX_SYS store proof\n"
+  unless $transfer =~
+           /append_u64\s*\(&out,\s*frame\.trx_id_store\.source_trx_id_store\)[\s\S]*source_trx_id_store_lsn[\s\S]*source_safe_next_trx_id_floor/s &&
+         $transfer =~ /PTRXFER_EPOCH_FACT_V3[\s\S]*source_trx_id_store=[\s\S]*source_trx_id_store_lsn=[\s\S]*source_safe_next_trx_id_floor=/s;
 
 die "standby transfer portable bundle codec must not use a production hard-coded HMAC key\n"
   if $transfer =~ /std::fill\s*\([^;]*hmac_key[^;]*0x74[^;]*\)/s;
@@ -216,7 +244,7 @@ die "standby receiver encoded payload batch path must acknowledge written spool 
          $receiver_payload_batch =~ /pre_admit_receiver_batch_sequence[\s\S]*after_spool[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s &&
          $receiver_payload_batch =~ /preserve_trx_transfer_apply_receiver_frame_batch_with_workers\(\s*frames,\s*(?:worker_count|written_metadata\s*==\s*nullptr\s*\?\s*worker_count\s*:\s*1)/s;
 my ($receiver_apply_frame) =
-  $transfer =~ /(Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame[\s\S]*?^}\n\nPreserve_trx_transfer_status preserve_trx_transfer_replay_receiver_spool)/m
+  $transfer =~ /(preserve_trx_transfer_apply_receiver_frame_internal\([\s\S]*?^}\n\nPreserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame\()/m
   or die "could not isolate standby receiver frame apply path\n";
 die "standby receiver SEAL_OBJECT path must enqueue object/staged prewarm instead of synchronously prewarming\n"
   unless $receiver_apply_frame =~ /enqueue_receiver_object_prewarm/s &&
@@ -248,7 +276,7 @@ die "receiver strict metadata plan builder must not read or prefetch InnoDB page
 die "final manifest must move the exact record-lock plan into strict registry resources\n"
   unless $transfer =~
          /prepare_strict_bundle_for_receiver[\s\S]*take_receiver_record_lock_prepared[\s\S]*install_record_lock_plan[\s\S]*publish_prewarmed/s;
-die "COMMIT_EPOCH must cache the durable epoch fact and bind the prepared-token snapshot once\n"
+die "COMMIT_EPOCH must cache the current-process accepted epoch fact and bind the prepared-token snapshot once\n"
   unless $receiver_apply_frame =~
          /commit_epoch_final_metadata[\s\S]*bind_strict_prepared_tokens_from_committed_epoch/s;
 die "receiver native binlog preparation must stream from the sealed staging file\n"
@@ -727,6 +755,47 @@ die "force recovery must keep preserve magic XA transactions prepared\n"
   unless $trx_resurrect_insert =~
          /preserve_magic_xid\s*=\s*trx_preserve_xid_should_be_protected[\s\S]*srv_force_recovery\s*==\s*0\s*\|\|\s*preserve_magic_xid/s &&
          $trx_resurrect_insert =~ /\+\+trx_sys->n_prepared_trx/s;
+
+die "startup Resurrection Index preamble must run after Undo lists exist and before trx_sys resurrection\n"
+  unless $srv_start =~
+         /srv_undo_tablespaces_init\s*\(\s*false\s*\)[\s\S]{0,500}preserved_trx_resurrection_index_bootstrap_preamble\s*\(\s*\)[\s\S]{0,160}trx_sys_init_at_db_start\s*\(\s*\)/s;
+$preserve =~
+  /void preserved_trx_resurrection_index_bootstrap_preamble\s*\(\s*\)[\s\S]*?^}/m
+  or die "could not isolate startup Resurrection Index preamble\n";
+my $startup_resurrection_preamble = $&;
+die "startup Resurrection Index preamble must only register candidates, never claim or attach transactions\n"
+  if $startup_resurrection_preamble =~
+     /trx_preserve_claim|preserved_trx_add_record|trx_preserve_attach_to_thd|trx_preserve_activate/;
+$trx =~ /static void trx_resurrect\s*\(\s*trx_rseg_t \*rseg\s*\)[\s\S]*?^}/m
+  or die "could not isolate trx_resurrect\n";
+my $startup_trx_resurrect = $&;
+die "startup indexed resurrection must build the native trx_t/rw-trx topology before candidate body-scan deferral\n"
+  unless $startup_trx_resurrect =~
+           /trx_resurrect_insert[\s\S]*trx_sys_rw_trx_add[\s\S]*trx_preserve_startup_resurrection_is_candidate/s &&
+         $startup_trx_resurrect =~
+           /trx_resurrect_update[\s\S]*trx_sys_rw_trx_add[\s\S]*trx_preserve_startup_resurrection_is_candidate/s;
+die "startup candidate classification must not transition trx_t to PRESERVED or claim it before full bundle validation\n"
+  if $startup_trx_resurrect =~
+       /->state\s*=\s*TRX_STATE_PRESERVED|trx_preserve_(?:claim|mark_preserved)/s;
+die "startup indexed resurrection must defer Undo body scans until whole-transaction anchor validation completes\n"
+  unless $startup_trx_resurrect =~
+           /trx_preserve_startup_resurrection_is_candidate[\s\S]*indexed_candidates\.insert[\s\S]*else\s*\{[\s\S]*trx_resurrect_table_ids/s &&
+         $startup_trx_resurrect =~
+           /trx_preserve_startup_apply_resurrection_candidate[\s\S]*INDEXED[\s\S]*tables\.insert[\s\S]*insert_undo[\s\S]*trx_resurrect_table_ids[\s\S]*update_undo[\s\S]*trx_resurrect_table_ids/s;
+$trx_preserve =~
+  /trx_preserve_startup_resurrection_result\s+trx_preserve_startup_apply_resurrection_candidate[\s\S]*?^}/m
+  or die "could not isolate startup indexed candidate apply\n";
+my $startup_indexed_candidate_apply = $&;
+die "startup indexed candidate apply must publish the exact recovered trx pointer only through whole-transaction validation\n"
+  unless $startup_indexed_candidate_apply =~
+         /trx_preserve_startup_validate_resurrection_candidate\s*\(\s*actual\s*,\s*modified_table_ids\s*,\s*trx\s*\)/s;
+$trx_preserve =~
+  /trx_preserve_startup_resurrection_result\s+trx_preserve_startup_validate_resurrection_candidate[\s\S]*?^}/m
+  or die "could not isolate startup whole-transaction validation\n";
+my $startup_resurrection_validate = $&;
+die "startup exact trx pointer must be published only after every authenticated anchor matches\n"
+  unless $startup_resurrection_validate =~
+         /if\s*\(\s*!matches\s*\)[\s\S]*return\s+trx_preserve_startup_resurrection_result::FALLBACK[\s\S]*verified_trx\s*!=\s*nullptr[\s\S]*trx_preserve_startup_resurrection_verified[\s\S]*emplace/s;
 
 $carrier_file =~ /Preserved_trx_carrier_status read_file_limited[\s\S]*?^}/m
   or die "could not isolate read_file_limited\n";
@@ -1385,6 +1454,15 @@ my $recover_claim_pos =
 die "recovery must claim the prepared transaction before publishing the recovered record\n"
   unless $recover_add_record_pos >= 0 && $recover_claim_pos >= 0 &&
          $recover_claim_pos < $recover_add_record_pos;
+die "shared recover/adopt kernel must exact-claim an authenticated startup trx pointer and retain XID lookup only as the null-pointer fallback\n"
+  unless $shared_recover_adopt_kernel =~
+         /if\s*\(\s*options\.prepared_trx\s*!=\s*nullptr\s*\)[\s\S]*trx_preserve_claim_detached_prepared_exact\s*\(\s*options\.prepared_trx\s*,\s*xid\s*\)[\s\S]*else\s*\{\s*trx\s*=\s*trx_preserve_claim_prepared\s*\(\s*xid\s*\)/s;
+die "an exact startup pointer claim failure must not silently fall back to an rw_trx_list XID scan or a synthetic temp-only claim\n"
+  unless $shared_recover_adopt_kernel =~
+         /trx\s*==\s*nullptr\s*&&\s*options\.prepared_trx\s*==\s*nullptr\s*&&[\s\S]*preserved_trx_snapshot_allows_synthetic_temp_claim/s;
+die "startup recovery must resolve an authenticated exact trx pointer before entering the shared kernel\n"
+  unless $recover_snapshot =~
+         /recover_options\.prepared_trx\s*=\s*trx_preserve_startup_resurrection_find_verified\s*\(\s*startup_xid\s*\)[\s\S]*preserved_trx_recover_or_adopt_bundle_shared/s;
 die "recovery must not call legacy raw snapshot read/rewrite helpers\n"
   if $recover_snapshot =~ /preserved_trx_read_snapshot|read_snapshot_with_identity_check|rewrite_snapshot_recovered_count/s;
 die "recovery max-count cleanup must leave a FAILED observable P_S record\n"
@@ -1497,6 +1575,9 @@ die "recover_all must mark force-recovery taint through Preserved_trx_store\n"
   unless $recover_all =~ /->mark_tainted\s*\(/s;
 die "recover_all must remove taint markers through Preserved_trx_store\n"
   unless $recover_all =~ /->remove_taint\s*\(/s;
+die "recover_all must clear verified startup trx pointers on every exit after recovery workers have joined\n"
+  unless $recover_all =~
+         /struct\s+Startup_verified_resurrection_guard[\s\S]*~Startup_verified_resurrection_guard\s*\(\s*\)[\s\S]*trx_preserve_startup_resurrection_clear_verified\s*\(\s*\)/s;
 die "recover_all must not directly scan local files\n"
   if $recover_all =~ /\bmy_dir\s*\(/s;
 
@@ -1666,6 +1747,11 @@ die "could not find preserve_trx_kernel_preserve_attached_transaction end\n"
 my $preserve_kernel =
   substr($preserve, $preserve_kernel_start,
          $preserve_kernel_end - $preserve_kernel_start);
+die "batch drain must preserve native implicit-lock continuity instead of scanning indexes to materialize lock_t objects\n"
+  unless $preserve_kernel =~
+           /use_native_implicit_lock_continuity\s*=\s*batch_delivery/s &&
+         $preserve_kernel =~
+           /!use_lock_warmcopy_artifact\s*&&\s*!use_native_implicit_lock_continuity[\s\S]*materialize_implicit_locks_for_live_export/s;
 die "preserve kernel path must publish snapshots through the default store factory and artifact-sink factory\n"
   unless $preserve_kernel =~ /create_preserved_trx_default_store/s &&
          $preserve_kernel =~ /preserve_trx_transfer_make_configured_frame_sink/s &&
@@ -1788,9 +1874,21 @@ my $promotion_worker_release_count =
   () = $promotion =~ /std::atomic<bool>\s+workers_released/g;
 my $promotion_worker_abort_count =
   () = $promotion =~ /std::atomic<bool>\s+worker_abort/g;
-die "all promotion temporary worker pools must stop before joining after creation failure\n"
-  unless $promotion_worker_release_count >= 3 &&
-         $promotion_worker_abort_count >= 3;
+die "remaining promotion temporary worker pools must stop before joining after creation failure\n"
+  unless $promotion_worker_release_count >= 2 &&
+         $promotion_worker_abort_count >= 2;
+die "strict promotion gate workers must use a persistent queued pool\n"
+  unless $promotion =~ /g_promotion_gate_worker_jobs/s &&
+         $promotion =~ /g_promotion_gate_worker_threads/s &&
+         $promotion =~ /ensure_promotion_gate_workers/s &&
+         $promotion =~ /run_promotion_gate_worker_batch/s;
+die "persistent promotion gate workers must prestart after recovery and join during server cleanup\n"
+  unless $preserve =~
+           /preserved_trx_mark_recovery_complete[\s\S]*preserved_trx_promotion_start_gate_workers/s &&
+         $mysqld =~
+           /clean_up[\s\S]*preserved_trx_promotion_shutdown_gate_workers/s &&
+         $promotion =~
+           /preserved_trx_promotion_shutdown_gate_workers[\s\S]*worker\.join\s*\(\s*\)/s;
 die "lock warmcopy temporary worker pool must stop before joining after creation failure\n"
   unless $sql_lock_warmcopy =~ /std::atomic<bool>\s+workers_released/s &&
          $sql_lock_warmcopy =~ /std::atomic<bool>\s+worker_abort/s;
@@ -2221,8 +2319,8 @@ die "standby transfer receiver dispatch failure log must include decoded frame t
   unless $transfer_dispatch_command =~
          /preserve_trx_transfer_decode_frame\s*\(\s*encoded_frame[\s\S]*frame_type[\s\S]*std::to_string\s*\(\s*static_cast<int>\s*\(\s*decoded_frame\.type\s*\)\s*\)/s;
 $transfer =~
-  /Preserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame\([\s\S]*?^}/m
-  or die "could not isolate preserve_trx_transfer_apply_receiver_frame\n";
+  /preserve_trx_transfer_apply_receiver_frame_internal\([\s\S]*?^}\n\nPreserve_trx_transfer_status preserve_trx_transfer_apply_receiver_frame\(/m
+  or die "could not isolate preserve_trx_transfer_apply_receiver_frame_internal\n";
 my $transfer_apply_receiver_frame = $&;
 $transfer_apply_receiver_frame =~
   /case Preserve_trx_transfer_frame_type::COMMIT_EPOCH:[\s\S]*?case Preserve_trx_transfer_frame_type::BEGIN:/m
@@ -2268,10 +2366,12 @@ die "standby transfer default client must verify the authenticated receiver ACK\
          $transfer =~ /HMAC\s*\([\s\S]*EVP_sha256/s;
 die "standby transfer source must pin an unconfirmed payload until its exact ACK arrives\n"
   unless $transfer =~
-         /m_uncertain_payload[\s\S]*m_uncertain_payload\s*!=\s*encoded_frame[\s\S]*ACK_UNCERTAIN/s;
+         /m_uncertain_payloads\s*\[\s*connection_index\s*\][\s\S]*uncertain_payload\s*!=\s*encoded_frame[\s\S]*ACK_UNCERTAIN/s;
 die "standby transfer receiver must validate source incarnation and batch order before creating store side effects\n"
   unless $receiver_dispatch_command =~
-         /preserve_trx_transfer_validate_online_payload_identity[\s\S]*create_preserved_trx_default_store/s;
+         /preserve_trx_transfer_validate_online_payload_identity[\s\S]*create_preserved_trx_process_local_store/s;
+die "standby transfer receiver dispatch must not use the crash-durable local preserve store\n"
+  if $receiver_dispatch_command =~ /create_preserved_trx_default_store/s;
 die "standby transfer receiver retries must bind sequence admission to frame digest\n"
   unless $transfer =~
          /admit_frame_sequence[\s\S]*Frame_sequence_record[\s\S]*digest/s &&
@@ -2298,6 +2398,9 @@ die "standby transfer source publication must be selected only by artifact mode,
   if $sys_vars =~ /preserve_trx_transfer_enable/s ||
      $transfer =~ /preserve_trx_transfer_enable/s ||
      $transfer_header =~ /preserve_trx_transfer_enable/s;
+die "COMMITTED_CORRUPT must not transfer epoch ownership away from the source\n"
+  if $preserve =~
+     /const\s+bool\s+receiver_committed\s*=[\s\S]{0,320}COMMITTED_CORRUPT/s;
 die "batch target preserve failure log must include the failed target thread id\n"
   unless $preserve =~
          /PRESERVE: batch target preserve failed[\s\S]*target_thread_id=/s;
@@ -2311,34 +2414,49 @@ die "standby final-target coverage must distinguish phase1 presealed binlog blob
   unless $preserve =~ /phase1_blob_matches_current_thd/s;
 die "standby final-target coverage must not treat missing binlog provider as covered\n"
   if $preserve =~ /batch_transfer_binlog_blob_provider\s*==\s*nullptr\s*\|\|/s;
-die "standby transfer must not expose reserved/no-op source sender sysvars\n"
-  if $sys_vars =~ /preserve_trx_transfer_sender_workers/s ||
-     $transfer =~ /preserve_trx_transfer_sender_workers/s ||
-     $transfer_header =~ /preserve_trx_transfer_sender_workers/s;
-die "standby transfer must not expose ineffective data session sysvars while frames are single-sequence\n"
-  if $sys_vars =~ /preserve_trx_transfer_data_sessions/s ||
-     $transfer =~ /preserve_trx_transfer_data_sessions/s ||
-     $transfer_header =~ /preserve_trx_transfer_data_sessions/s;
+die "standby transfer sender workers must default to three and drive parallel final-token payload sends before the commit barrier\n"
+  unless $sys_vars =~
+             /Sys_preserve_trx_transfer_sender_workers[\s\S]*VALID_RANGE\s*\(\s*1\s*,\s*64\s*\)[\s\S]*DEFAULT\s*\(\s*3\s*\)/s &&
+         $transfer =~
+             /Preserve_trx_transfer_source_epoch_session::commit_epoch[\s\S]*preserve_trx_transfer_sender_workers[\s\S]*payload_index\s*=\s*worker_index[\s\S]*payload_index\s*\+=\s*worker_count[\s\S]*send_encoded_frame_on_session\s*\(\s*payload\s*,\s*worker_index\s*\)[\s\S]*workers\.emplace_back\s*\(\s*send_worker\s*,\s*worker\s*\)[\s\S]*encoded_commit/s;
+die "standby transfer data sessions must default to three and route token-affine payloads over independent classic connections\n"
+  unless $sys_vars =~
+             /Sys_preserve_trx_transfer_data_sessions[\s\S]*VALID_RANGE\s*\(\s*1\s*,\s*64\s*\)[\s\S]*DEFAULT\s*\(\s*3\s*\)/s &&
+         $transfer =~
+             /Preserve_trx_transfer_client_frame_sink[\s\S]*preserve_trx_transfer_data_sessions[\s\S]*m_connections\.resize[\s\S]*send_encoded_frame_on_session[\s\S]*session_index\s*%\s*m_connections\.size\s*\(\s*\)[\s\S]*connection_index_for_frame[\s\S]*token\s*%\s*m_connections\.size\s*\(\s*\)/s;
 die "standby transfer receiver worker sysvar must document the batch receiver worker path\n"
   unless $sys_vars =~
-         /preserve_trx_transfer_receiver_workers[\s\S]*batch receiver[\s\S]*classic single-frame dispatch/s;
+             /Sys_preserve_trx_transfer_receiver_workers[\s\S]*batch receiver[\s\S]*classic single-frame dispatch[\s\S]*VALID_RANGE\s*\(\s*1\s*,\s*64\s*\)[\s\S]*DEFAULT\s*\(\s*3\s*\)/s;
 die "standby transfer receiver batch payload path must use the bounded frame worker helper\n"
   unless $transfer_header =~ /preserve_trx_transfer_handle_receiver_payload_batch/s &&
          $transfer_header =~ /preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s &&
          $transfer =~ /preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*preserve_trx_transfer_decode_frame[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
-die "standby promotion simulator must expose transfer control frames for prewarm and gate only through COM_PRESERVE_TRX_TRANSFER\n"
+die "standby transfer multi-session receiver must serialize process-local sequence admission without serializing semantic worker apply\n"
+  unless $transfer =~
+             /preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*begin_payload_sequence[\s\S]*end_payload_sequence[\s\S]*pre_admit_receiver_batch_sequence[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
+die "standby transfer wire compatibility must retain the legacy promotion frame identifiers\n"
   unless $transfer_header =~ /PROMOTION_PREWARM_TOKEN/s &&
-         $transfer_header =~ /PROMOTION_GATE_EPOCH/s &&
-         $transfer =~ /PROMOTION_PREWARM_TOKEN[\s\S]*preserved_trx_promotion_prewarm_standby_pending_tokens/s &&
-         $transfer =~ /PROMOTION_GATE_EPOCH[\s\S]*preserved_trx_adopt_standby_pending_all_for_promotion/s;
+         $transfer_header =~ /PROMOTION_GATE_EPOCH/s;
+$transfer =~
+  /preserve_trx_transfer_apply_receiver_frame_internal\s*\([\s\S]*?^}/m
+  or die "could not isolate receiver frame apply helper\n";
+my $transfer_receiver_frame_apply = $&;
+die "classic standby transfer must reject promotion prewarm and gate control frames\n"
+  unless $transfer_receiver_frame_apply =~
+             /PROMOTION_PREWARM_TOKEN[\s\S]*PROMOTION_GATE_EPOCH[\s\S]*return\s+Preserve_trx_transfer_status::UNSUPPORTED/s;
+die "classic standby transfer frame apply must not invoke promotion prewarm or adopt\n"
+  if $transfer_receiver_frame_apply =~
+     /preserved_trx_promotion_prewarm_standby_pending|preserved_trx_adopt_standby_pending_all_for_promotion/s;
 $transfer =~
   /Preserve_trx_transfer_status\s+preserve_trx_transfer_apply_receiver_frame_batch_with_workers\s*\([\s\S]*?^}/m
   or die "could not isolate receiver frame batch worker helper\n";
 my $transfer_batch_worker_helper = $&;
-die "standby promotion gate frame must be a receiver batch barrier after prewarm worker segments complete\n"
+die "standby transfer commit frame must be the only receiver batch barrier\n"
   unless $transfer_batch_worker_helper =~
-         /is_batch_barrier[\s\S]*COMMIT_EPOCH[\s\S]*PROMOTION_GATE_EPOCH/s &&
+         /is_batch_barrier[\s\S]*COMMIT_EPOCH/s &&
          $transfer_batch_worker_helper =~ /flush_segment\s*\(\s*\)[\s\S]*apply_frame\s*\(\s*frame\s*,\s*context\s*\)/s;
+die "promotion gate must not participate in the standby transfer batch scheduler\n"
+  if $transfer_batch_worker_helper =~ /PROMOTION_GATE_EPOCH/s;
 $transfer =~ /Preserve_trx_transfer_status preserve_trx_transfer_seal_staged_object[\s\S]*?^}/m
   or die "could not isolate preserve_trx_transfer_seal_staged_object\n";
 my $transfer_seal_staged_object = $&;
@@ -2346,13 +2464,15 @@ die "standby transfer SEAL_OBJECT must verify object digest with streaming IO, n
   unless $transfer =~ /sha256_digest_file_streaming/s &&
          $transfer_seal_staged_object =~ /sha256_digest_file_streaming/s &&
          $transfer_seal_staged_object !~ /read_whole_file/s;
-die "standby promotion Phase C must use transfer manifest protocol version 3\n"
+die "standby promotion transfer must emit v4 while decoding legacy v3\n"
   unless $transfer_header =~
-         /kPreserveTrxTransferProtocolVersion\s*=\s*3\s*;/s &&
+         /kPreserveTrxTransferLegacyProtocolVersion\s*=\s*3\s*;/s &&
+         $transfer_header =~
+         /kPreserveTrxTransferProtocolVersion\s*=\s*4\s*;/s &&
          $transfer_header =~ /source_prepare_lsn/s &&
          $transfer_header =~ /source_epoch_commit_lsn/s &&
          $transfer =~
-         /parsed\.protocol_version\s*!=\s*kPreserveTrxTransferProtocolVersion/s;
+         /transfer_protocol_version_is_decodable[\s\S]*kPreserveTrxTransferLegacyProtocolVersion[\s\S]*kPreserveTrxTransferProtocolVersion/s;
 die "standby promotion Phase A must expose a single promotion adopt entry point\n"
   unless $promotion =~
          /preserved_trx_adopt_standby_pending_all_for_promotion/s;
@@ -2602,6 +2722,9 @@ die "batch preserve must reserve provenance in one write before workers and bind
 die "phase1 transfer binlog artifacts must survive until epoch success or rollback\n"
   unless $preserve =~
          /~Phase1_transfer_binlog_blob_provider[\s\S]*cleanup_phase1_blobs/s;
+die "phase1 transfer binlog cleanup must batch process-local artifacts instead of rescanning and syncing once per token\n"
+  unless $preserve =~
+         /cleanup_phase1_blobs[\s\S]{0,1000}create_preserved_trx_process_local_warm_external_blob_carrier[\s\S]{0,500}remove_warm_external_blobs/s;
 die "standby promotion abandoned marker must be an epoch-level side artifact\n"
   unless $promotion =~ /PTRX_PROMOTION_ABANDONED_EPOCH_V1/s &&
          $promotion =~ /write_promotion_abandoned_epoch/s &&
@@ -2612,6 +2735,114 @@ die "standby promotion abandoned marker must carry cleanup states for async roll
          $promotion =~ /CLEANUP_NOT_FOUND/s &&
          $promotion =~ /CLEANUP_TAINTED/s &&
          $promotion =~ /CLAIMED_IMPORT_FAILED/s;
+my ($strict_record_prewarm) =
+  $transfer =~ /if\s*\(strict_metadata_only\)\s*\{([\s\S]*?)\n\s*\}\s*else\s*\{/s;
+die "strict transfer prewarm must have an explicit metadata-only branch\n"
+  unless defined($strict_record_prewarm) &&
+         $strict_record_prewarm =~ /proof\.metadata_only\s*=\s*true/s;
+die "strict transfer prewarm must not read record or index pages\n"
+  if $strict_record_prewarm =~
+     /trx_preserve_prefetch_record_lock_pages_for_gate|buf_read_page|payload_residency/s;
+die "strict transfer prewarm must expose zero-side-effect counters\n"
+  unless $transfer =~ /strict_record_index_page_reads_status/s &&
+         $transfer =~ /strict_ibuf_merges_status/s &&
+         $transfer =~ /strict_target_local_redo_bytes_status/s;
+die "simulated terminal lock proof must require the internal unit-test provider\n"
+  unless $transfer_header =~
+           /Preserve_trx_transfer_terminal_lock_proof_provider/s &&
+         $transfer_header =~
+           /preserve_trx_transfer_set_terminal_lock_proof_provider_for_unit_test/s &&
+         $transfer =~
+           /maybe_attach_simulated_terminal_lock_proof[\s\S]{0,1800}unit_terminal_lock_proof_provider[\s\S]{0,700}simulated_terminal_lock_proof_digest/s;
+die "strict final-fact binding must verify the terminal lock proof before publishing READY\n"
+  unless $transfer =~
+         /bind_strict_prepared_tokens_from_epoch_fact[\s\S]{0,2600}simulated_terminal_lock_proof_matches[\s\S]*registry\.bind_final_facts/s;
+die "receiver epoch publication must require every shared strict token to be READY_FOR_GATE\n"
+  unless $transfer =~
+         /publish_receiver_epoch_ready_from_fact_if_possible_impl[\s\S]{0,5200}receiver_strict_token_ready[\s\S]{0,1200}preserved_trx_promotion_bind_prewarmed_epoch_fact_for_receiver/s;
+die "receiver prewarm pause must be a dynamic default-OFF governor with an update wakeup\n"
+  unless $sys_vars =~
+         /preserve_trx_transfer_prewarm_paused[\s\S]{0,700}DEFAULT\(false\)[\s\S]{0,240}ON_UPDATE\(update_preserve_trx_transfer_prewarm_paused\)/s &&
+         $transfer =~
+         /g_receiver_prewarm_paused\.load[\s\S]{0,800}g_receiver_prewarm_cv\.wait[\s\S]{0,800}PREWARM_PAUSED/s;
+die "receiver saved-artifact IO must remain independent from the opportunistic prewarm pause\n"
+  if $transfer =~
+     /throttle_receiver_saved_io[\s\S]{0,500}g_receiver_prewarm_paused/s;
+die "process-local transfer receiver artifacts must not execute file or directory fsync\n"
+  if $transfer =~ /\bmy_sync\s*\(|\bfsync_directory\s*\(/s;
+die "receiver standby projection writes must defer file and directory fsync\n"
+  unless $transfer =~
+         /receiver_standby_projection_write_options[\s\S]{0,500}defer_file_fsync\s*=\s*true[\s\S]{0,240}defer_directory_fsync\s*=\s*true/s;
+die "process-local promotion markers must defer file and directory fsync\n"
+  unless $carrier_file =~
+         /create_preserved_trx_process_local_store[\s\S]{0,500}defer_file_fsync\s*=\s*true[\s\S]{0,240}defer_directory_fsync\s*=\s*true/s &&
+         $carrier_file =~
+         /write_promotion_adopted_epoch[\s\S]{0,900}m_write_options/s &&
+         $carrier_file =~
+         /write_promotion_abandoned_epoch[\s\S]{0,900}m_write_options/s &&
+         $carrier_file =~
+         /write_promotion_intent_epoch[\s\S]{0,900}m_write_options/s &&
+         $promotion =~
+         /adopt_prepared_epoch_for_physical_promotion_impl[\s\S]{0,9000}create_preserved_trx_process_local_store/s &&
+         $preserve =~
+         /write_strict_attach_intent[\s\S]{0,1800}create_preserved_trx_process_local_store/s;
+$carrier_file =~
+  /Local_file_preserved_trx_carrier::remove_promotion_intent_epoch\s*\([\s\S]*?^}/m
+  or die "could not isolate process-local promotion intent removal\n";
+die "promotion intent removal must honor process-local deferred directory fsync\n"
+  unless $& =~ /!m_write_options\.defer_directory_fsync\s*&&\s*fsync_directory/s;
+die "process-local snapshot removal must propagate deferred directory fsync without weakening the durable default\n"
+  unless $carrier_header =~
+           /struct\s+Preserve_snapshot_remove_options[\s\S]{0,700}defer_directory_fsync\s*\{false\}/s &&
+         $carrier_file =~
+           /Local_file_preserved_trx_carrier::remove_with_status[\s\S]{0,500}options\.defer_directory_fsync\s*=\s*options\.defer_directory_fsync\s*\|\|\s*m_write_options\.defer_directory_fsync[\s\S]{0,240}delete_snapshot_files_with_status/s &&
+         $carrier_file =~
+           /delete_snapshot_files_with_status[\s\S]{0,5200}!options\.defer_directory_fsync[\s\S]{0,500}fsync_directory/s;
+die "receiver restart must discard transfer state before ordinary recovery hooks\n"
+  unless $mysqld =~
+         /if\s*\(!opt_initialize\s*&&\s*!is_help_or_validate_option\(\)\)[\s\S]{0,500}preserve_trx_transfer_cleanup_receiver_restart_state[\s\S]*preserved_trx_preflight_recoverability/s &&
+         $preserve =~
+         /preserved_trx_recover_all[\s\S]{0,500}preserve_trx_transfer_receiver_enable[\s\S]{0,220}return\s+false/s;
+die "receiver restart cleanup must run before InnoDB/core storage-engine initialization\n"
+  unless $mysqld =~
+         /preserve_trx_transfer_cleanup_receiver_restart_state[\s\S]{0,1500}plugin_register_builtin_and_init_core_se/s;
+my $receiver_restart_cleanup_decl =
+  index($transfer_header,
+        'preserve_trx_transfer_cleanup_receiver_restart_state');
+my $transfer_unit_test_guard = index($transfer_header, '#ifndef NDEBUG');
+die "receiver restart cleanup is a production mysqld API and must be declared outside the unit-test guard\n"
+  if $receiver_restart_cleanup_decl < 0 ||
+     ($transfer_unit_test_guard >= 0 &&
+      $receiver_restart_cleanup_decl > $transfer_unit_test_guard);
+$promotion =~
+  /adopt_prepared_epoch_for_physical_promotion_impl\s*\([\s\S]*?^}/m
+  or die "could not isolate strict physical promotion gate\n";
+my $strict_physical_promotion_gate = $&;
+die "strict physical promotion must be bound to current-process prepared facts and boot incarnation\n"
+  unless $strict_physical_promotion_gate =~
+             /target_boot_incarnation[\s\S]*preserved_trx_strict_prepared_token_registry[\s\S]*registry\.snapshot/s;
+$transfer =~
+  /Preserve_trx_transfer_strict_eligibility_status\s+preserve_trx_transfer_validate_strict_eligibility\s*\([\s\S]*?^}/m
+  or die "could not isolate strict transfer eligibility validation\n";
+my $strict_transfer_eligibility = $&;
+die "strict transfer eligibility must reject only an empty epoch, not impose a product token-count limit\n"
+  unless $strict_transfer_eligibility =~ /epoch_token_count\s*==\s*0/s;
+die "strict transfer eligibility must not impose a fixed epoch token-count ceiling\n"
+  if $strict_transfer_eligibility =~ /epoch_token_count\s*>/s;
+die "the three-token SUB500 limit must remain scoped to the test provider\n"
+  unless $strict_physical_promotion_gate =~
+         /use_test_provider\s*&&[\s\S]{0,160}request\.tokens\.size\(\)\s*>\s*kSub500SimulatorTokenLimit/s;
+die "receiver ready state must not claim crash durability\n"
+  if $promotion_header =~ /RECEIVED_DURABLE/s;
+die "receiver pending summary must use current-process semantics\n"
+  unless $promotion_header =~ /RECEIVED_CURRENT_PROCESS/s &&
+         $promotion =~
+         /summary->state\s*=\s*[\s\S]{0,100}RECEIVED_CURRENT_PROCESS/s;
+die "inflight budget pressure must be retryable resource exhaustion\n"
+  unless $transfer =~
+         /inflight_bytes\s*>\s*preserve_trx_transfer_max_inflight_bytes[\s\S]{0,120}RESOURCE_EXHAUSTED/s &&
+         $transfer =~
+         /epoch_reserved_bytes\s*\+\s*reserved_bytes\s*>[\s\S]{0,180}RESOURCE_EXHAUSTED/s;
 die "standby transfer design doc must not claim production HA promotion is complete in this milestone\n"
   unless $standby_transfer_doc =~
          /当前实现状态[\s\S]*source transport[\s\S]*fail-closed/s ||

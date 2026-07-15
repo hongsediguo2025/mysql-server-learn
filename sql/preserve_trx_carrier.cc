@@ -313,6 +313,18 @@ Preserved_trx_carrier_status Preserved_trx_carrier::new_token_state_for_write(
   return token_state(token, state);
 }
 
+Preserved_trx_carrier_status
+Preserved_trx_carrier::write_resurrection_index_new(
+    const std::string &, const std::vector<unsigned char> &) {
+  return Preserved_trx_carrier_status::CORRUPT;
+}
+
+Preserved_trx_carrier_status Preserved_trx_carrier::read_resurrection_index(
+    const std::string &, uint64_t, std::vector<unsigned char> *index_bytes) {
+  if (index_bytes != nullptr) index_bytes->clear();
+  return Preserved_trx_carrier_status::NOT_FOUND;
+}
+
 Preserved_trx_carrier_status Preserved_trx_carrier::standby_projection_exists(
     const std::string &token, bool *exists) {
   if (exists == nullptr) return Preserved_trx_carrier_status::CORRUPT;
@@ -607,6 +619,23 @@ Preserve_snapshot_status Preserved_trx_store::codec_context(
   if (m_carrier == nullptr || context == nullptr)
     return Preserve_snapshot_status::INVALID_ARGUMENT;
   return map_carrier_status(m_carrier->codec_context(context, purpose));
+}
+
+Preserve_snapshot_status Preserved_trx_store::write_resurrection_index_new(
+    const std::string &token,
+    const std::vector<unsigned char> &index_bytes) {
+  if (m_carrier == nullptr) return Preserve_snapshot_status::INVALID_ARGUMENT;
+  return map_carrier_status(
+      m_carrier->write_resurrection_index_new(token, index_bytes));
+}
+
+Preserve_snapshot_status Preserved_trx_store::read_resurrection_index(
+    const std::string &token, uint64_t max_bytes,
+    std::vector<unsigned char> *index_bytes) {
+  if (m_carrier == nullptr || index_bytes == nullptr)
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  return map_carrier_status(
+      m_carrier->read_resurrection_index(token, max_bytes, index_bytes));
 }
 
 Preserve_snapshot_status Preserved_trx_store::read(

@@ -2678,6 +2678,7 @@ files_checked:
       return (srv_init_abort(err));
     }
 
+    preserved_trx_resurrection_index_bootstrap_preamble();
     purge_queue = trx_sys_init_at_db_start();
 
     if (srv_is_upgrade_mode) {

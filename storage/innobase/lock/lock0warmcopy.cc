@@ -1245,6 +1245,23 @@ bool lock_warmcopy_record_bitmap_reset_for_lock(const lock_t *lock,
   return lock_warmcopy_record_bitmap_reset_for_trx(lock->trx, key, heap_no);
 }
 
+bool lock_warmcopy_record_note_bulk_mutation_for_lock(
+    const lock_t *lock, lock_warmcopy_record_bulk_mutation_t mutation) {
+  if (!lock_warmcopy_hooks_enabled() || lock == nullptr || lock->trx == nullptr) {
+    return false;
+  }
+  switch (mutation) {
+    case lock_warmcopy_record_bulk_mutation_t::REORGANIZE:
+    case lock_warmcopy_record_bulk_mutation_t::MOVE:
+    case lock_warmcopy_record_bulk_mutation_t::INHERIT:
+      break;
+  }
+  lock->trx->lock.lock_warmcopy_coordinate_generation.fetch_add(
+      1, std::memory_order_relaxed);
+  lock_warmcopy_observed_hook_events.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
 bool lock_warmcopy_record_mark_discard_for_lock(const lock_t *lock) {
   lock_warmcopy_record_shard_key_t key;
   if (!record_shard_key_from_lock(lock, &key)) {
@@ -1950,6 +1967,9 @@ bool lock_warmcopy_trx_lock_fence_sample(
   */
   fence->trx_locks_version = trx_lock->trx_locks_version;
   fence->n_rec_locks = trx_lock->n_rec_locks.load(std::memory_order_relaxed);
+  fence->coordinate_generation =
+      trx_lock->lock_warmcopy_coordinate_generation.load(
+          std::memory_order_relaxed);
   fence->freeze_generation = trx_lock->lock_warmcopy_freeze_generation;
   fence->conversion_attempt_after_freeze =
       trx_lock->lock_warmcopy_conversion_attempt_after_freeze;
@@ -1963,6 +1983,7 @@ bool lock_warmcopy_trx_lock_fence_equal(
     const lock_warmcopy_trx_lock_fence_t &rhs) {
   return lhs.trx_locks_version == rhs.trx_locks_version &&
          lhs.n_rec_locks == rhs.n_rec_locks &&
+         lhs.coordinate_generation == rhs.coordinate_generation &&
          lhs.freeze_generation == rhs.freeze_generation &&
          lhs.conversion_attempt_after_freeze ==
              rhs.conversion_attempt_after_freeze &&

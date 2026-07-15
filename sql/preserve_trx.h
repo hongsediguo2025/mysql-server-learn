@@ -45,6 +45,7 @@ struct LEX;
 struct Preserve_trx_lock_warmcopy_artifact;
 class Preserve_trx_transfer_source_epoch_session;
 class Preserve_trx_gate_adopt_lease;
+class Preserve_trx_cleanup_lease;
 class Preserve_trx_physical_fence_lease;
 struct Preserve_trx_prepared_token_key;
 struct Mysql_binlog_preserve_cache_facts;
@@ -151,6 +152,8 @@ extern ulong preserve_trx_off_artifact_policy;
 extern ulong preserve_trx_drain_mode;
 extern uint preserve_trx_drain_grace_ms;
 extern uint preserve_trx_drain_hard_timeout_ms;
+extern uint preserve_trx_transfer_phase1_timeout_ms;
+extern uint preserve_trx_transfer_phase2_timeout_ms;
 extern bool preserve_trx_warmcopy_enable;
 extern uint preserve_trx_warmcopy_close_timeout_ms;
 extern uint preserve_trx_warmcopy_min_open_ms;
@@ -216,6 +219,12 @@ ulonglong preserve_trx_startup_recovery_tainted_tokens_status();
 ulonglong preserve_trx_startup_recovery_standby_pending_tokens_status();
 ulonglong preserve_trx_startup_recovery_promotion_intent_tokens_status();
 ulonglong preserve_trx_startup_recovery_orphan_rollback_count_status();
+ulonglong preserve_trx_startup_resurrection_index_candidates_status();
+ulonglong preserve_trx_startup_resurrection_index_hits_status();
+ulonglong preserve_trx_startup_resurrection_index_fallbacks_status();
+ulonglong preserve_trx_startup_resurrection_undo_anchor_checks_status();
+ulonglong preserve_trx_startup_resurrection_undo_body_pages_status();
+ulonglong preserve_trx_startup_resurrection_undo_body_records_status();
 ulonglong preserve_trx_startup_recovery_phase_snapshot_load_us_status();
 ulonglong preserve_trx_startup_recovery_phase_snapshot_validate_us_status();
 ulonglong preserve_trx_startup_recovery_phase_snapshot_kernel_us_status();
@@ -614,6 +623,7 @@ bool preserved_trx_resolve_timeout_seconds(const Preserve_trx_options &options,
                                            ulonglong max_timeout,
                                            ulonglong *timeout_seconds);
 bool preserved_trx_preflight_recoverability();
+void preserved_trx_resurrection_index_bootstrap_preamble();
 bool preserved_temp_images_bootstrap_preamble();
 bool preserved_trx_recover_all();
 bool preserved_trx_recovery_complete();
@@ -657,6 +667,11 @@ preserved_trx_adopt_prepared_for_physical_promotion(
     Preserve_trx_physical_fence_lease *physical_lease,
     uint64_t operation_deadline_us,
     Preserved_trx_physical_adopt_result *result);
+
+bool preserved_trx_reverse_simulated_promotion_adopt(
+    const Preserve_trx_prepared_token_key &key,
+    Preserve_trx_cleanup_lease *cleanup_lease,
+    Preserve_trx_physical_fence_lease *physical_lease, std::string *reason);
 
 bool preserved_trx_adopt_ready_bundle_for_promotion(
     const std::string &dir, Preserved_trx_bundle bundle,

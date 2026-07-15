@@ -56,7 +56,10 @@ class FullPressureProfile:
     phase1_batch_linger_ms: int
     source_phase2_limit_us: int
     ready_after_final_spool_ack_limit_us: int
-    min_record_lock_pages: int
+    receiver_read_load_threads: int
+    receiver_read_load_baseline_s: float
+    receiver_read_load_max_qps_drop_pct: float
+    receiver_read_load_max_p99_increase_pct: float
     preserve_timeout_s: int
     startup_timeout_s: int
     shutdown_timeout_s: int
@@ -72,13 +75,16 @@ FULL_PROFILE = FullPressureProfile(
     lockset_batch_size=100000,
     preserve_memory_budget_bytes=256 * 1024**2,
     source_buffer_pool_bytes=2 * 1024**3,
-    receiver_buffer_pool_bytes=4 * 1024**3,
+    receiver_buffer_pool_bytes=2 * 1024**3,
     receiver_workers=8,
     phase1_batch_bytes=8 * 1024**2,
     phase1_batch_linger_ms=50,
-    source_phase2_limit_us=2_000_000,
+    source_phase2_limit_us=500_000,
     ready_after_final_spool_ack_limit_us=500_000,
-    min_record_lock_pages=200_000,
+    receiver_read_load_threads=8,
+    receiver_read_load_baseline_s=5.0,
+    receiver_read_load_max_qps_drop_pct=5.0,
+    receiver_read_load_max_p99_increase_pct=10.0,
     preserve_timeout_s=1800,
     startup_timeout_s=180,
     shutdown_timeout_s=300,
@@ -101,7 +107,8 @@ SMOKE_PROFILE = dataclasses.replace(
     phase1_batch_linger_ms=5,
     source_phase2_limit_us=5_000_000,
     ready_after_final_spool_ack_limit_us=2_000_000,
-    min_record_lock_pages=1,
+    receiver_read_load_threads=2,
+    receiver_read_load_baseline_s=1.0,
     preserve_timeout_s=300,
     startup_timeout_s=120,
     shutdown_timeout_s=180,
@@ -344,6 +351,7 @@ def build_mysqld_commands(
         f"--max-connections={max(1300, profile.sessions + 100)}",
         "--innodb-buffer-pool-dump-at-shutdown=OFF",
         "--innodb-buffer-pool-load-at-startup=OFF",
+        "--log-error-verbosity=3",
         "--preserve-trx-enable=ON",
         f"--preserve-trx-memory-budget-bytes={profile.preserve_memory_budget_bytes}",
         "--preserve-trx-transfer-target-user=preserve_transfer",
@@ -458,6 +466,15 @@ def build_e2e_command(
         "--receiver-preserve-dir",
         str(paths.receiver_preserve_dir),
         "--receiver-physical-copy-before-drain",
+        "--standalone-transfer-accept-committed-not-ready",
+        "--receiver-read-load-threads",
+        str(profile.receiver_read_load_threads),
+        "--receiver-read-load-baseline-seconds",
+        str(profile.receiver_read_load_baseline_s),
+        "--receiver-read-load-max-qps-drop-pct",
+        str(profile.receiver_read_load_max_qps_drop_pct),
+        "--receiver-read-load-max-p99-increase-pct",
+        str(profile.receiver_read_load_max_p99_increase_pct),
         "--standby-transfer-user",
         "preserve_transfer",
         "--standby-transfer-password",
@@ -775,14 +792,31 @@ def build_checklist(
         },
         "acceptance": {
             "source_phase2_total_us_max": profile.source_phase2_limit_us,
-            "receiver_ready_after_final_spool_ack_us_max": (
-                profile.ready_after_final_spool_ack_limit_us
-            ),
-            "ready_tokens": profile.sessions,
+            "receiver_readiness_contract": "COMMITTED_NOT_READY",
+            "receiver_epoch_storage": "PROCESS_LOCAL",
+            "receiver_process_local_epoch_accepted": True,
+            "receiver_epoch_fact_count": 0,
+            "receiver_epoch_commit_count": 0,
+            "receiver_ready_after_final_spool_ack_us": 0,
+            "ready_tokens": 0,
             "not_ready_tokens": 0,
-            "record_lock_page_count_min": profile.min_record_lock_pages,
+            "prewarm_backlog_tokens": profile.sessions,
+            "record_lock_count_min": (
+                profile.sessions * profile.lockset_batch_size
+            ),
+            "record_lock_page_count": 0,
+            "record_lock_resident_pages": 0,
             "record_lock_cold_gets": 0,
             "phase2_transfer_bulk_bytes": 0,
+            "strict_record_index_page_reads": 0,
+            "strict_ibuf_merges": 0,
+            "strict_target_local_redo_bytes": 0,
+            "receiver_read_load_qps_drop_pct_max": (
+                profile.receiver_read_load_max_qps_drop_pct
+            ),
+            "receiver_read_load_p99_increase_pct_max": (
+                profile.receiver_read_load_max_p99_increase_pct
+            ),
         },
         "preflight": dict(preflight),
         "source_command": redact_command(source_command),
@@ -900,6 +934,11 @@ def validate_e2e_report(
 
     require_equal("status", "success")
     require_equal("success", True)
+    require_equal("evidence_kind", "STANDALONE_TRANSFER_E2E")
+    require_equal("physical_replication", False)
+    require_equal("production_provider", False)
+    require_equal("write_enable_exercised", False)
+    require_equal("receiver_readiness_contract", "COMMITTED_NOT_READY")
     require_equal("workload_sessions", profile.sessions)
     require_equal("workload_table_count", profile.tables)
     require_equal("workload_statements_per_tx", profile.statements_per_tx)
@@ -908,52 +947,79 @@ def validate_e2e_report(
         profile.seed_rows_per_table_per_session,
     )
     require_equal("workload_lockset_batch_size", profile.lockset_batch_size)
-    require_equal("standby_tokens", profile.sessions)
-    require_equal("receiver_ready_tokens", profile.sessions)
+    require_equal("standby_tokens", 0)
+    require_equal("receiver_ready_tokens", 0)
     require_equal("receiver_not_ready_tokens", 0)
     require_equal("receiver_record_cold_gets", 0)
-    require_equal("receiver_prewarm_backlog_at_phase2_end", 0)
+    require_equal("receiver_prewarm_backlog_at_phase2_end", profile.sessions)
     require_equal("phase2_transfer_bulk_bytes", 0)
     require_equal("receiver_record_object_prewarm_phase1_overlap", True)
     require_equal("receiver_epoch_fact_bound", True)
+    require_equal("receiver_epoch_storage", "PROCESS_LOCAL")
+    require_equal("receiver_process_local_epoch_accepted", True)
+    require_equal("receiver_epoch_fact_count", 0)
+    require_equal("receiver_epoch_commit_count", 0)
+    require_equal("receiver_epoch_ready_bind_attempts", 0)
+    require_equal("receiver_seal_prewarm_tokens", profile.sessions)
+    require_equal("receiver_seal_prewarm_success_tokens", profile.sessions)
     require_equal("receiver_record_object_prewarm_count", profile.sessions)
+    require_equal("receiver_record_lock_page_count", 0)
+    require_equal("receiver_record_lock_resident_pages", 0)
+    require_equal("receiver_record_lock_required_residency_bytes", 0)
+    require_equal("receiver_record_lock_reserved_residency_bytes", 0)
+    require_equal("receiver_strict_record_index_page_reads", 0)
+    require_equal("receiver_strict_ibuf_merges", 0)
+    require_equal("receiver_strict_target_local_redo_bytes", 0)
+    require_equal("receiver_read_load_threads", profile.receiver_read_load_threads)
+    require_equal("receiver_read_load_error_count", 0)
     phase2_us = _metric_max(report, "source_phase2_total_us")
     ready_us = _metric_max(report, "receiver_ready_after_final_spool_ack_us")
+    all_prewarm_after_ack_us = _metric_max(
+        report, "receiver_all_prewarm_after_final_ack_us"
+    )
+    record_locks = _metric_max(report, "phase2_record_lock_count_samples")
     pages = _metric_max(report, "receiver_record_lock_page_count")
     resident = _metric_max(report, "receiver_record_lock_resident_pages")
-    required_residency = _metric_max(
-        report, "receiver_record_lock_required_residency_bytes"
-    )
-    reserved_residency = _metric_max(
-        report, "receiver_record_lock_reserved_residency_bytes"
-    )
     lock_plan_peak = _metric_max(report, "receiver_lock_plan_epoch_peak_bytes")
     lock_plan_cap = _metric_max(report, "receiver_lock_plan_subpool_cap_bytes")
     batch_tokens_avg = _metric_max(report, "source_phase1_record_batch_tokens_avg")
     network_sends = _metric_max(report, "source_phase1_transfer_network_send_count")
     frame_count = _metric_max(report, "source_phase1_transfer_frame_count")
     completed_statements = _metric_max(report, "completed_stmt_total")
+    read_baseline_queries = _metric_max(
+        report, "receiver_read_load_baseline_query_count"
+    )
+    read_transfer_queries = _metric_max(
+        report, "receiver_read_load_transfer_query_count"
+    )
+    read_baseline_qps = float(report.get("receiver_read_load_baseline_qps", 0.0))
+    read_transfer_qps = float(report.get("receiver_read_load_transfer_qps", 0.0))
+    read_qps_drop_pct = float(
+        report.get("receiver_read_load_qps_drop_pct", float("inf"))
+    )
+    read_baseline_p99_us = _metric_max(
+        report, "receiver_read_load_baseline_p99_us"
+    )
+    read_transfer_p99_us = _metric_max(
+        report, "receiver_read_load_transfer_p99_us"
+    )
+    read_p99_increase_pct = float(
+        report.get("receiver_read_load_p99_increase_pct", float("inf"))
+    )
     if phase2_us > profile.source_phase2_limit_us:
         failures.append(
             f"source_phase2_total_us: limit={profile.source_phase2_limit_us} actual={phase2_us}"
         )
-    if ready_us > profile.ready_after_final_spool_ack_limit_us:
+    if ready_us != 0:
         failures.append(
             "receiver_ready_after_final_spool_ack_us: "
-            f"limit={profile.ready_after_final_spool_ack_limit_us} actual={ready_us}"
+            f"expected=0 actual={ready_us}"
         )
-    if pages < profile.min_record_lock_pages:
+    expected_record_locks = profile.sessions * profile.lockset_batch_size
+    if record_locks < expected_record_locks:
         failures.append(
-            f"receiver_record_lock_page_count: minimum={profile.min_record_lock_pages} actual={pages}"
-        )
-    if resident != pages:
-        failures.append(
-            f"receiver_record_lock_resident_pages: expected={pages} actual={resident}"
-        )
-    if reserved_residency < required_residency:
-        failures.append(
-            "receiver record-lock residency budget is incomplete: "
-            f"required={required_residency} reserved={reserved_residency}"
+            "phase2_record_lock_count_samples: "
+            f"minimum={expected_record_locks} actual={record_locks}"
         )
     if lock_plan_peak > lock_plan_cap:
         failures.append(
@@ -972,19 +1038,59 @@ def validate_e2e_report(
         failures.append(
             f"completed_stmt_total is too small: minimum={profile.sessions} actual={completed_statements}"
         )
+    if read_baseline_queries <= 0 or read_baseline_qps <= 0 or read_baseline_p99_us <= 0:
+        failures.append(
+            "receiver read-load baseline evidence is empty: "
+            f"queries={read_baseline_queries} qps={read_baseline_qps} "
+            f"p99_us={read_baseline_p99_us}"
+        )
+    if read_transfer_queries <= 0 or read_transfer_qps <= 0 or read_transfer_p99_us <= 0:
+        failures.append(
+            "receiver read-load transfer evidence is empty: "
+            f"queries={read_transfer_queries} qps={read_transfer_qps} "
+            f"p99_us={read_transfer_p99_us}"
+        )
+    if read_qps_drop_pct > profile.receiver_read_load_max_qps_drop_pct:
+        failures.append(
+            "receiver_read_load_qps_drop_pct: "
+            f"limit={profile.receiver_read_load_max_qps_drop_pct} "
+            f"actual={read_qps_drop_pct}"
+        )
+    if read_p99_increase_pct > profile.receiver_read_load_max_p99_increase_pct:
+        failures.append(
+            "receiver_read_load_p99_increase_pct: "
+            f"limit={profile.receiver_read_load_max_p99_increase_pct} "
+            f"actual={read_p99_increase_pct}"
+        )
     if failures:
         raise RuntimeError("full-pressure acceptance failed: " + "; ".join(failures))
     return {
         "source_phase2_total_us": phase2_us,
         "receiver_ready_after_final_spool_ack_us": ready_us,
+        "receiver_all_prewarm_after_final_ack_us": all_prewarm_after_ack_us,
+        "phase2_record_lock_count": record_locks,
         "receiver_record_lock_page_count": pages,
         "receiver_record_lock_resident_pages": resident,
         "receiver_ready_tokens": report.get("receiver_ready_tokens"),
         "receiver_not_ready_tokens": report.get("receiver_not_ready_tokens"),
+        "receiver_prewarm_backlog_at_phase2_end": report.get(
+            "receiver_prewarm_backlog_at_phase2_end"
+        ),
         "receiver_lock_plan_epoch_peak_bytes": lock_plan_peak,
         "receiver_lock_plan_subpool_cap_bytes": lock_plan_cap,
         "source_phase1_transfer_network_send_count": network_sends,
         "source_phase1_transfer_frame_count": frame_count,
+        "receiver_read_load_qps_drop_pct": read_qps_drop_pct,
+        "receiver_read_load_p99_increase_pct": read_p99_increase_pct,
+        "receiver_strict_record_index_page_reads": report.get(
+            "receiver_strict_record_index_page_reads"
+        ),
+        "receiver_strict_ibuf_merges": report.get(
+            "receiver_strict_ibuf_merges"
+        ),
+        "receiver_strict_target_local_redo_bytes": report.get(
+            "receiver_strict_target_local_redo_bytes"
+        ),
     }
 
 

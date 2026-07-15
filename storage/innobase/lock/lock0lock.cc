@@ -715,6 +715,11 @@ static void lock_rec_bitmap_reset(lock_t *lock) /*!< in: record lock */
 
   ut_ad((lock_rec_get_n_bits(lock) % 8) == 0);
 
+  if (lock_warmcopy_hooks_enabled()) {
+    (void)lock_warmcopy_record_note_bulk_mutation_for_lock(
+        lock, lock_warmcopy_record_bulk_mutation_t::REORGANIZE);
+  }
+
   memset(&lock[1], 0, n_bytes);
 }
 
@@ -2713,6 +2718,10 @@ static void lock_rec_inherit_to_gap(
     if (!lock_rec_get_insert_intention(lock) &&
         !lock->index->table->skip_gap_locks() &&
         (!lock->trx->skip_gap_locks() || lock->trx->lock.inherit_all.load())) {
+      if (lock_warmcopy_hooks_enabled()) {
+        (void)lock_warmcopy_record_note_bulk_mutation_for_lock(
+            lock, lock_warmcopy_record_bulk_mutation_t::INHERIT);
+      }
       lock_rec_add_to_queue(LOCK_REC | LOCK_GAP | lock_get_mode(lock),
                             heir_block, heir_heap_no, lock->index, lock->trx);
     }
@@ -2744,6 +2753,10 @@ static void lock_rec_inherit_to_gap_if_gap_lock(
 
     if (!lock_rec_get_insert_intention(lock) &&
         (heap_no == PAGE_HEAP_NO_SUPREMUM || !lock_rec_get_rec_not_gap(lock))) {
+      if (lock_warmcopy_hooks_enabled()) {
+        (void)lock_warmcopy_record_note_bulk_mutation_for_lock(
+            lock, lock_warmcopy_record_bulk_mutation_t::INHERIT);
+      }
       lock_rec_add_to_queue(LOCK_REC | LOCK_GAP | lock_get_mode(lock), block,
                             heir_heap_no, lock->index, lock->trx);
     }
@@ -2778,6 +2791,11 @@ static void lock_rec_move_low(
   for (lock = lock_rec_get_first(lock_hash, donator, donator_heap_no);
        lock != nullptr; lock = lock_rec_get_next(donator_heap_no, lock)) {
     const ulint type_mode = lock->type_mode;
+
+    if (lock_warmcopy_hooks_enabled()) {
+      (void)lock_warmcopy_record_note_bulk_mutation_for_lock(
+          lock, lock_warmcopy_record_bulk_mutation_t::MOVE);
+    }
 
     lock_rec_reset_nth_bit(lock, donator_heap_no);
 
@@ -2974,6 +2992,10 @@ void lock_move_rec_list_end(const buf_block_t *new_block,
 
     for (lock = lock_rec_get_first_on_page(lock_sys->rec_hash, block); lock;
          lock = lock_rec_get_next_on_page(lock)) {
+      if (lock_warmcopy_hooks_enabled()) {
+        (void)lock_warmcopy_record_note_bulk_mutation_for_lock(
+            lock, lock_warmcopy_record_bulk_mutation_t::MOVE);
+      }
       const rec_t *rec1 = rec;
       const rec_t *rec2;
       const ulint type_mode = lock->type_mode;
@@ -3067,6 +3089,10 @@ void lock_move_rec_list_start(const buf_block_t *new_block,
 
     for (lock = lock_rec_get_first_on_page(lock_sys->rec_hash, block); lock;
          lock = lock_rec_get_next_on_page(lock)) {
+      if (lock_warmcopy_hooks_enabled()) {
+        (void)lock_warmcopy_record_note_bulk_mutation_for_lock(
+            lock, lock_warmcopy_record_bulk_mutation_t::MOVE);
+      }
       const rec_t *rec1;
       const rec_t *rec2;
       const ulint type_mode = lock->type_mode;
@@ -3159,6 +3185,10 @@ void lock_rtr_move_rec_list(const buf_block_t *new_block,
 
     for (lock = lock_rec_get_first_on_page(lock_sys->rec_hash, block); lock;
          lock = lock_rec_get_next_on_page(lock)) {
+      if (lock_warmcopy_hooks_enabled()) {
+        (void)lock_warmcopy_record_note_bulk_mutation_for_lock(
+            lock, lock_warmcopy_record_bulk_mutation_t::MOVE);
+      }
       ulint moved = 0;
       const rec_t *rec1;
       const rec_t *rec2;
@@ -6586,6 +6616,7 @@ void lock_trx_release_locks(trx_t *trx) /*!< in/out: transaction */
   trx_mutex_enter(trx);
   trx->lock.table_locks.clear();
   trx->lock.n_rec_locks.store(0);
+  trx->lock.lock_warmcopy_coordinate_generation.store(0);
   /*
     Conversion freeze is preserve-only bookkeeping and must not survive
     transaction lock-state reinitialization.

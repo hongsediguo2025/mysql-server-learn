@@ -40,6 +40,8 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "storage/innobase/include/lock0warmcopy.h"
 
 class THD;
+class Preserve_trx_targeted_publication_capability;
+struct Preserve_trx_prepared_token_key;
 struct trx_rseg_t;
 struct trx_t;
 
@@ -58,6 +60,87 @@ struct Preserve_modified_table_name {
   std::string schema_name;
   std::string table_name;
   uint32_t required_write_acls{0};
+};
+
+enum class trx_preserve_resurrection_undo_kind : uint8_t {
+  INSERT = 1,
+  UPDATE = 2
+};
+
+struct trx_preserve_resurrection_undo_anchor {
+  trx_preserve_resurrection_undo_kind kind{
+      trx_preserve_resurrection_undo_kind::INSERT};
+  uint32_t rseg_space_id{0};
+  uint32_t undo_slot{0};
+  uint32_t hdr_page_no{0};
+  uint32_t hdr_offset{0};
+  uint32_t top_page_no{0};
+  uint32_t top_offset{0};
+  uint64_t top_undo_no{0};
+  bool empty{false};
+};
+
+struct trx_preserve_resurrection_facts {
+  uint64_t trx_id{0};
+  uint64_t prepare_lsn{0};
+  XID xid;
+  std::vector<trx_preserve_resurrection_undo_anchor> undo_anchors;
+  std::vector<uint64_t> modified_table_ids;
+};
+
+enum class trx_preserve_startup_resurrection_result : uint8_t {
+  NOT_CANDIDATE = 0,
+  INDEXED,
+  FALLBACK
+};
+
+struct trx_preserve_startup_resurrection_metrics {
+  uint64_t candidates{0};
+  uint64_t index_hits{0};
+  uint64_t fallbacks{0};
+  uint64_t undo_anchor_checks{0};
+  uint64_t undo_body_pages{0};
+  uint64_t undo_body_records{0};
+};
+
+struct trx_preserve_trx_id_store_fact_t {
+  uint64_t store_value{0};
+  uint64_t redo_commit_lsn{0};
+  uint64_t safe_next_floor{0};
+};
+
+enum class trx_preserve_targeted_publication_origin : uint8_t {
+  NONE = 0,
+  NEWLY_PUBLISHED,
+  IDEMPOTENT_EXISTING_MATCH
+};
+
+enum class trx_preserve_targeted_publication_status : uint8_t {
+  OK = 0,
+  INVALID_ARGUMENT,
+  CAPABILITY_REJECTED,
+  CONFLICT,
+  INVALID_STATE,
+  RESOURCE_EXHAUSTED,
+  EXISTING_MUST_REMAIN
+};
+
+struct trx_preserve_targeted_publication_candidate {
+  XID xid;
+  uint64_t trx_id{0};
+  uint64_t prepare_lsn{0};
+  uint64_t safe_next_trx_id_floor{0};
+};
+
+struct trx_preserve_targeted_publication_journal {
+  trx_t *trx{nullptr};
+  XID xid;
+  uint64_t trx_id{0};
+  uint64_t generation{0};
+  trx_preserve_targeted_publication_origin origin{
+      trx_preserve_targeted_publication_origin::NONE};
+  bool active{false};
+  bool claimed{false};
 };
 
 struct trx_preserve_record_lock_import_metrics_t {
@@ -112,6 +195,24 @@ bool trx_preserve_probe_detached_prepared(const XID &xid);
 trx_t *trx_preserve_current_thd_trx(THD *thd);
 uint64_t trx_preserve_current_redo_lsn();
 dberr_t trx_preserve_claim_detached_prepared(trx_t *trx);
+dberr_t trx_preserve_claim_detached_prepared_exact(trx_t *trx,
+                                                   const XID &expected_xid);
+trx_preserve_targeted_publication_status
+trx_preserve_publish_simulated_prepared(
+    const Preserve_trx_targeted_publication_capability &capability,
+    const Preserve_trx_prepared_token_key &key,
+    const trx_preserve_targeted_publication_candidate &candidate,
+    trx_preserve_targeted_publication_journal *journal);
+trx_preserve_targeted_publication_status
+trx_preserve_unclaim_simulated_prepared(
+    const Preserve_trx_targeted_publication_capability &capability,
+    const Preserve_trx_prepared_token_key &key,
+    trx_preserve_targeted_publication_journal *journal);
+trx_preserve_targeted_publication_status
+trx_preserve_unpublish_simulated_prepared(
+    const Preserve_trx_targeted_publication_capability &capability,
+    const Preserve_trx_prepared_token_key &key,
+    trx_preserve_targeted_publication_journal *journal);
 dberr_t trx_preserve_rollback_by_token(const char *token);
 dberr_t trx_preserve_rollback_by_token_for_thd(const char *token, THD *thd);
 dberr_t trx_preserve_rollback_claimed(trx_t *trx);
@@ -171,6 +272,38 @@ dberr_t trx_preserve_export_modified_table_names(
 dberr_t trx_preserve_export_modified_table_names(
     THD *thd, std::vector<Preserve_modified_table_name> *tables,
     uint32_t max_modified_tables);
+dberr_t trx_preserve_export_resurrection_facts(
+    trx_t *trx, uint32_t max_modified_tables,
+    trx_preserve_resurrection_facts *facts);
+void trx_preserve_startup_resurrection_reset();
+dberr_t trx_preserve_startup_register_resurrection_candidate(
+    const trx_preserve_resurrection_facts &facts);
+bool trx_preserve_startup_resurrection_is_candidate(uint64_t trx_id);
+trx_preserve_startup_resurrection_result
+trx_preserve_startup_validate_resurrection_candidate(
+    const trx_preserve_resurrection_facts &actual,
+    std::vector<uint64_t> *modified_table_ids,
+    trx_t *verified_trx = nullptr);
+trx_preserve_startup_resurrection_result
+trx_preserve_startup_apply_resurrection_candidate(
+    trx_t *trx, std::vector<uint64_t> *modified_table_ids);
+trx_t *trx_preserve_startup_resurrection_find_verified(const XID &xid);
+void trx_preserve_startup_resurrection_clear_verified();
+void trx_preserve_startup_note_undo_body_scan(uint64_t pages,
+                                             uint64_t records);
+trx_preserve_startup_resurrection_metrics
+trx_preserve_startup_resurrection_metrics_snapshot();
+void trx_preserve_startup_resurrection_finish();
+
+/** Persist the current native TRX_SYS transaction-id store and return the
+redo coordinate needed by a transfer epoch. This is transfer-only work and is
+never called from the ordinary transaction-id allocation path. */
+dberr_t trx_preserve_capture_durable_trx_id_store_fact(
+    trx_preserve_trx_id_store_fact_t *fact);
+bool trx_preserve_validate_trx_id_store_fact(uint64_t store_value,
+                                             uint64_t redo_commit_lsn,
+                                             uint64_t safe_next_floor,
+                                             uint64_t source_fence_lsn);
 void trx_preserve_close_read_views_for_shutdown();
 dberr_t trx_preserve_materialize_implicit_locks(
     THD *thd, const Preserve_lock_limits &limits, bool *materialized_any);

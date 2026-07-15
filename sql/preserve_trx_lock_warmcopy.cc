@@ -124,6 +124,40 @@ void append_le64(std::string *payload, uint64_t value) {
   }
 }
 
+void attach_record_store_contract(
+    const lock_warmcopy_record_store_fence_t &fence,
+    PrebuiltRecordLocksBlob *blob,
+    const lock_warmcopy_trx_lock_fence_t *live_fence = nullptr) {
+  if (blob == nullptr || fence.total_mutation_generation == 0) return;
+
+  blob->lock_plan_contract_version =
+      kPreservedTrxLockPlanContractVersion;
+  const uint64_t coordinate_generation =
+      live_fence == nullptr ? 0 : live_fence->coordinate_generation;
+  blob->source_live_lock_generation =
+      coordinate_generation >
+              std::numeric_limits<uint64_t>::max() -
+                  fence.total_mutation_generation
+          ? std::numeric_limits<uint64_t>::max()
+          : fence.total_mutation_generation + coordinate_generation;
+  std::memcpy(blob->record_store_fingerprint.data(),
+              fence.canonical_fingerprint,
+              blob->record_store_fingerprint.size());
+
+  std::string commitment;
+  commitment.append("PRESERVE_LOCK_PLAN_LIVE_V2", 26);
+  append_le16(&commitment, blob->lock_plan_contract_version);
+  append_le32(&commitment, fence.shard_count);
+  append_le64(&commitment, fence.total_mutation_generation);
+  append_le64(&commitment, fence.dirty_generation);
+  append_le64(&commitment, coordinate_generation);
+  commitment.append(reinterpret_cast<const char *>(
+                        fence.canonical_fingerprint),
+                    sizeof(fence.canonical_fingerprint));
+  SHA_EVP256(reinterpret_cast<const unsigned char *>(commitment.data()),
+             commitment.size(), blob->source_live_lock_digest.data());
+}
+
 bool read_le32(const std::string &payload, size_t *offset, uint32_t *value) {
   if (offset == nullptr || value == nullptr || *offset > payload.size() ||
       payload.size() - *offset < 4) {
@@ -1584,7 +1618,9 @@ preserve_trx_lock_warmcopy_verify_record_final_fence(
       artifact.record_live_seal_fence.trx_locks_version !=
           current_fence.trx_locks_version ||
       artifact.record_live_seal_fence.n_rec_locks !=
-          current_fence.n_rec_locks) {
+          current_fence.n_rec_locks ||
+      artifact.record_live_seal_fence.coordinate_generation !=
+          current_fence.coordinate_generation) {
     return Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED;
   }
 
@@ -2170,6 +2206,9 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
     if (use_prebuilt_record_blob) {
       artifact.has_prebuilt_record_locks_blob = true;
       artifact.prebuilt_record_locks_blob = target->phase1_record_prebuilt_blob;
+      attach_record_store_contract(seal_result.seal_fence,
+                                   &artifact.prebuilt_record_locks_blob,
+                                   &target->record_live_seal_fence);
     } else {
       artifact.record_locks_payload = seal_result.record_locks_payload;
     }
@@ -2178,6 +2217,8 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
     artifact.autoinc_lock_owned = target->autoinc_lock_owned;
     artifact.record_live_seal_fence_valid = true;
     artifact.record_live_seal_fence = target->record_live_seal_fence;
+    artifact.record_store_fence_valid = true;
+    artifact.record_store_fence = seal_result.seal_fence;
     artifact.record_lock_count = seal_result.record_lock_count;
     artifact.table_lock_count = target->table_lock_count;
     artifact.record_predicate_table_lock_count =
@@ -2493,6 +2534,8 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
   target->phase1_record_prebuilt_blob.warmcopy_epoch = m_epoch;
   target->phase1_record_prebuilt_blob.size = descriptor.size;
   target->phase1_record_prebuilt_blob.digest = descriptor.digest;
+  attach_record_store_contract(prebuilt_fence,
+                               &target->phase1_record_prebuilt_blob);
   target->phase1_record_prebuilt_fence = prebuilt_fence;
   target->phase1_record_prebuilt_fence_valid = true;
   target->has_phase1_record_prebuilt_blob = true;
@@ -2748,6 +2791,13 @@ Preserve_trx_lock_warmcopy_drain_participant::
   target->phase1_record_prebuilt_blob.warmcopy_epoch = m_epoch;
   target->phase1_record_prebuilt_blob.size = descriptor.size;
   target->phase1_record_prebuilt_blob.digest = descriptor.digest;
+  if (artifact.record_store_fence_valid) {
+    attach_record_store_contract(artifact.record_store_fence,
+                                 &target->phase1_record_prebuilt_blob,
+                                 artifact.record_live_seal_fence_valid
+                                     ? &artifact.record_live_seal_fence
+                                     : nullptr);
+  }
   target->phase1_record_prebuilt_fence_valid = false;
   target->phase1_record_prebuilt_fence = lock_warmcopy_record_store_fence_t{};
   target->has_phase1_record_prebuilt_blob = true;

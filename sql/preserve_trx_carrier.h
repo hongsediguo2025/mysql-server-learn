@@ -60,6 +60,13 @@ struct Preserve_snapshot_remove_options {
     tablespace. Other token-owned sidecars are cleanup candidates.
   */
   std::set<uint32_t> preserve_committed_temp_sidecar_source_space_ids;
+
+  /*
+    Process-local transfer artifacts do not survive receiver restart. Their
+    removal must not pay a durability barrier; the durable local preserve path
+    keeps the default false value.
+  */
+  bool defer_directory_fsync{false};
 };
 
 struct Preserved_trx_carrier_listing {
@@ -178,9 +185,10 @@ struct Preserve_snapshot_write_options {
   Preserve_snapshot_io_observer observer{nullptr};
   void *observer_context{nullptr};
   /*
-    The defer flags leave durability to a surrounding test or caller-controlled
-    fsync point. They must not be used when the snapshot itself is the only
-    durable boundary for prepared-transaction ownership.
+    The defer flags either leave durability to a surrounding caller-controlled
+    fsync point or mark explicitly process-local artifacts. They must not be
+    used when the snapshot itself is the only durable boundary for
+    prepared-transaction ownership.
   */
   bool defer_file_fsync{false};
   bool defer_directory_fsync{false};
@@ -221,6 +229,14 @@ class Preserved_trx_carrier {
   virtual Preserved_trx_carrier_status write_snapshot_new(
       const std::string &token,
       const std::vector<unsigned char> &snapshot_bytes) = 0;
+
+  virtual Preserved_trx_carrier_status write_resurrection_index_new(
+      const std::string &token,
+      const std::vector<unsigned char> &index_bytes);
+
+  virtual Preserved_trx_carrier_status read_resurrection_index(
+      const std::string &token, uint64_t max_bytes,
+      std::vector<unsigned char> *index_bytes);
 
   virtual Preserved_trx_carrier_status remove_external_blobs(
       const std::string &token,
@@ -398,6 +414,14 @@ class Preserved_trx_warm_external_blob_carrier {
   */
   virtual Preserved_trx_carrier_status remove_warm_external_blob(
       const std::string &warmcopy_id, const std::string &blob_name) = 0;
+
+  /*
+    Idempotent bulk cleanup for one blob family. Implementations must avoid a
+    directory rescan per warmcopy id and follow the carrier's durability policy.
+  */
+  virtual Preserved_trx_carrier_status remove_warm_external_blobs(
+      const std::set<std::string> &warmcopy_ids,
+      const std::string &blob_name) = 0;
 };
 
 struct Preserved_trx_store_write_stats {
@@ -449,6 +473,14 @@ class Preserved_trx_store {
   Preserve_snapshot_status codec_context(
       Preserved_trx_codec_context *context,
       Preserved_trx_codec_context_purpose purpose);
+
+  Preserve_snapshot_status write_resurrection_index_new(
+      const std::string &token,
+      const std::vector<unsigned char> &index_bytes);
+
+  Preserve_snapshot_status read_resurrection_index(
+      const std::string &token, uint64_t max_bytes,
+      std::vector<unsigned char> *index_bytes);
 
   Preserve_snapshot_status read(const std::string &token, bool validate_identity,
                                 Preserved_trx_bundle *bundle);
@@ -549,8 +581,15 @@ Preserved_trx_store_handle create_preserved_trx_default_store(
     const std::string &dir,
     const Preserve_snapshot_write_options &write_options);
 
+Preserved_trx_store_handle create_preserved_trx_process_local_store(
+    const std::string &dir);
+
 std::unique_ptr<Preserved_trx_warm_external_blob_carrier>
 create_preserved_trx_default_warm_external_blob_carrier(const std::string &dir);
+
+std::unique_ptr<Preserved_trx_warm_external_blob_carrier>
+create_preserved_trx_process_local_warm_external_blob_carrier(
+    const std::string &dir);
 
 Preserve_snapshot_status preserve_trx_fsync_default_store_directory(
     const std::string &dir);
