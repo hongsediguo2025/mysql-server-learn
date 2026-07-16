@@ -236,8 +236,7 @@ enum class trx_preserve_thd_transition_failure {
   NOT_IN_MYSQL_TRX_LIST,
   THD_MISMATCH,
   CLAIMED,
-  UNDO_ACTIVATE_FAILED,
-  RECORD_LOCK_RESTORE_FAILED
+  UNDO_ACTIVATE_FAILED
 };
 
 const char *trx_preserve_thd_transition_failure_name(
@@ -245,12 +244,9 @@ const char *trx_preserve_thd_transition_failure_name(
 
 dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(
     THD *thd, trx_preserve_thd_transition_failure *reason = nullptr);
-dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(
-    THD *thd, const std::string &pre_prepare_record_locks_payload,
-    trx_preserve_thd_transition_failure *reason = nullptr);
 dberr_t trx_preserve_activate_reattached_in_original_thd(trx_t *trx, THD *thd);
 bool trx_preserve_is_active_attached_to_thd(trx_t *trx, THD *thd);
-dberr_t trx_preserve_prepare_current_temp_only(THD *thd, const XID &xid);
+dberr_t trx_preserve_prepare_current(THD *thd, const XID &xid);
 trx_t *trx_preserve_create_temp_only_claimed(const XID &xid, uint64_t trx_id);
 bool trx_preserve_engine_state_facts(const trx_t *trx,
                                      bool *has_persistent_state,

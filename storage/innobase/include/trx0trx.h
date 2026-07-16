@@ -209,6 +209,12 @@ Does the transaction prepare for MySQL.
 
 dberr_t trx_prepare_for_mysql(trx_t *trx);
 
+/**
+Prepare a transaction for Preserve without releasing transaction locks.
+@param[in,out] trx Transaction instance to prepare.
+@return DB_SUCCESS or error number. */
+dberr_t trx_prepare_for_preserve(trx_t *trx);
+
 /** This function is used to find number of prepared transactions and
  their transaction objects for a recovery.
  @return number of prepared transactions */

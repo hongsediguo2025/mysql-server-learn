@@ -21797,6 +21797,250 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
+       TransferReceiverSameTokenPayloadWaitsForEarlierSemanticApply) {
+  Transfer_codec_context_guard codec_guard;
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+  const uint64_t token = 919;
+
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-same-token-apply-barrier", "source-uuid",
+                "target-uuid", bundle, token, &manifest, &objects));
+  ASSERT_FALSE(objects.empty());
+
+  std::string manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_manifest(manifest,
+                                                  &manifest_payload));
+
+  Preserve_trx_transfer_frame begin;
+  begin.type = Preserve_trx_transfer_frame_type::BEGIN;
+  begin.sequence = 1;
+  begin.epoch_id = manifest.epoch_id;
+  begin.token = token;
+  begin.manifest_payload = manifest_payload;
+
+  Preserve_trx_transfer_frame chunk;
+  chunk.type = Preserve_trx_transfer_frame_type::OBJECT_CHUNK;
+  chunk.sequence = 2;
+  chunk.epoch_id = manifest.epoch_id;
+  chunk.token = token;
+  chunk.object_id = objects.front().descriptor.object_id;
+  chunk.chunk_payload = objects.front().payload;
+
+  Preserve_trx_transfer_frame seal;
+  seal.type = Preserve_trx_transfer_frame_type::SEAL_OBJECT;
+  seal.sequence = 3;
+  seal.epoch_id = manifest.epoch_id;
+  seal.token = token;
+  seal.object_id = chunk.object_id;
+
+  std::vector<std::string> first_payload;
+  for (const Preserve_trx_transfer_frame *frame : {&begin, &chunk}) {
+    std::string encoded;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_encode_frame(*frame, &encoded));
+    first_payload.push_back(std::move(encoded));
+  }
+  std::string encoded_seal;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_frame(seal, &encoded_seal));
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.declare_token(manifest.epoch_id, token, "source-uuid",
+                                   "target-uuid"));
+
+  Transfer_receiver_blocking_after_spool_probe probe;
+  std::atomic<int> first_status{
+      static_cast<int>(Preserve_trx_transfer_status::ACK_UNCERTAIN)};
+  std::thread first_thread([&] {
+    first_status.store(static_cast<int>(
+        preserve_trx_transfer_handle_receiver_payload_batch(
+            m_dir, first_payload, &store, &registry, 1, 1, nullptr,
+            transfer_receiver_blocking_after_spool_probe, &probe)));
+  });
+  {
+    std::unique_lock<std::mutex> lock(probe.mutex);
+    ASSERT_TRUE(probe.condition.wait_for(
+        lock, std::chrono::seconds(1), [&] { return probe.entered; }));
+  }
+
+  std::atomic<int> seal_status{
+      static_cast<int>(Preserve_trx_transfer_status::ACK_UNCERTAIN)};
+  std::thread seal_thread([&] {
+    seal_status.store(static_cast<int>(
+        preserve_trx_transfer_handle_receiver_payload_batch(
+            m_dir, {encoded_seal}, &store, &registry, 1, 1)));
+  });
+  my_sleep(20000);
+  EXPECT_EQ(static_cast<int>(Preserve_trx_transfer_status::ACK_UNCERTAIN),
+            seal_status.load());
+
+  {
+    std::lock_guard<std::mutex> lock(probe.mutex);
+    probe.released = true;
+  }
+  probe.condition.notify_all();
+  first_thread.join();
+  seal_thread.join();
+
+  EXPECT_EQ(static_cast<int>(Preserve_trx_transfer_status::OK),
+            first_status.load());
+  EXPECT_EQ(static_cast<int>(Preserve_trx_transfer_status::OK),
+            seal_status.load());
+  Preserve_trx_transfer_receiver_record record;
+  ASSERT_TRUE(registry.lookup(manifest.epoch_id, token, &record));
+  EXPECT_EQ(1U, record.sealed_objects.count(chunk.object_id));
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverDifferentTokenPayloadDoesNotWaitForSemanticApply) {
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+
+  auto encode_declare = [](const std::string &epoch_id, uint64_t sequence,
+                           uint64_t token) {
+    Preserve_trx_transfer_frame frame;
+    frame.type = Preserve_trx_transfer_frame_type::DECLARE_TOKEN;
+    frame.sequence = sequence;
+    frame.epoch_id = epoch_id;
+    frame.token = token;
+    frame.reason = "source-uuid\ntarget-uuid";
+    std::string encoded;
+    EXPECT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_encode_frame(frame, &encoded));
+    return encoded;
+  };
+
+  const std::string epoch_id = "epoch-different-token-apply-barrier";
+  const std::string first_payload = encode_declare(epoch_id, 1, 920);
+  const std::string second_payload = encode_declare(epoch_id, 2, 921);
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+
+  Transfer_receiver_blocking_after_spool_probe probe;
+  std::atomic<int> first_status{
+      static_cast<int>(Preserve_trx_transfer_status::ACK_UNCERTAIN)};
+  std::thread first_thread([&] {
+    first_status.store(static_cast<int>(
+        preserve_trx_transfer_handle_receiver_payload_batch(
+            m_dir, {first_payload}, &store, &registry, 1, 1, nullptr,
+            transfer_receiver_blocking_after_spool_probe, &probe)));
+  });
+  {
+    std::unique_lock<std::mutex> lock(probe.mutex);
+    ASSERT_TRUE(probe.condition.wait_for(
+        lock, std::chrono::seconds(1), [&] { return probe.entered; }));
+  }
+
+  std::atomic<int> second_status{
+      static_cast<int>(Preserve_trx_transfer_status::ACK_UNCERTAIN)};
+  std::thread second_thread([&] {
+    second_status.store(static_cast<int>(
+        preserve_trx_transfer_handle_receiver_payload_batch(
+            m_dir, {second_payload}, &store, &registry, 1, 1)));
+  });
+  for (uint attempt = 0;
+       attempt < 100 &&
+       second_status.load() ==
+           static_cast<int>(Preserve_trx_transfer_status::ACK_UNCERTAIN);
+       ++attempt) {
+    my_sleep(1000);
+  }
+  EXPECT_EQ(static_cast<int>(Preserve_trx_transfer_status::OK),
+            second_status.load());
+
+  {
+    std::lock_guard<std::mutex> lock(probe.mutex);
+    probe.released = true;
+  }
+  probe.condition.notify_all();
+  first_thread.join();
+  second_thread.join();
+  EXPECT_EQ(static_cast<int>(Preserve_trx_transfer_status::OK),
+            first_status.load());
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverPayloadRetryReusesSameTokenApplyReservation) {
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+  const std::string epoch_id = "epoch-same-token-apply-retry";
+  const uint64_t token = 922;
+
+  Preserve_trx_transfer_frame declare;
+  declare.type = Preserve_trx_transfer_frame_type::DECLARE_TOKEN;
+  declare.sequence = 1;
+  declare.epoch_id = epoch_id;
+  declare.token = token;
+  declare.reason = "source-uuid\ntarget-uuid";
+  std::string encoded_declare;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_frame(declare, &encoded_declare));
+
+  Preserve_trx_transfer_frame abort;
+  abort.type = Preserve_trx_transfer_frame_type::ABORT;
+  abort.sequence = 2;
+  abort.epoch_id = epoch_id;
+  abort.token = token;
+  abort.reason = "retry-complete";
+  std::string encoded_abort;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_frame(abort, &encoded_abort));
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  const auto fail_after_spool =
+      [](void *, bool contains_commit_epoch) {
+        return contains_commit_epoch
+                   ? Preserve_trx_transfer_status::INVALID_ARGUMENT
+                   : Preserve_trx_transfer_status::IO_ERROR;
+      };
+  ASSERT_EQ(Preserve_trx_transfer_status::IO_ERROR,
+            preserve_trx_transfer_handle_receiver_payload_batch(
+                m_dir, {encoded_declare}, &store, &registry, 1, 1, nullptr,
+                fail_after_spool, nullptr));
+
+  std::atomic<int> abort_status{
+      static_cast<int>(Preserve_trx_transfer_status::ACK_UNCERTAIN)};
+  std::thread abort_thread([&] {
+    abort_status.store(static_cast<int>(
+        preserve_trx_transfer_handle_receiver_payload_batch(
+            m_dir, {encoded_abort}, &store, &registry, 1, 1)));
+  });
+  my_sleep(20000);
+  EXPECT_EQ(static_cast<int>(Preserve_trx_transfer_status::ACK_UNCERTAIN),
+            abort_status.load());
+
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_handle_receiver_payload_batch(
+                m_dir, {encoded_declare}, &store, &registry, 1, 1));
+  abort_thread.join();
+  EXPECT_EQ(static_cast<int>(Preserve_trx_transfer_status::OK),
+            abort_status.load());
+
+  Preserve_trx_transfer_receiver_record record;
+  ASSERT_TRUE(registry.lookup(epoch_id, token, &record));
+  EXPECT_EQ(Preserve_trx_transfer_receiver_state::ABORTED, record.state);
+}
+
+TEST_F(PreserveSnapshotTest,
        TransferReceiverSealDoesNotPublishProjectionBeforeCommitEpoch) {
   Transfer_codec_context_guard codec_guard;
   const uint64_t seal_ready_before =

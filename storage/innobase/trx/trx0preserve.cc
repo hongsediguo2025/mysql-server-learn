@@ -814,21 +814,12 @@ const char *trx_preserve_thd_transition_failure_name(
       return "claimed";
     case trx_preserve_thd_transition_failure::UNDO_ACTIVATE_FAILED:
       return "undo_activate_failed";
-    case trx_preserve_thd_transition_failure::RECORD_LOCK_RESTORE_FAILED:
-      return "record_lock_restore_failed";
   }
   return "unknown";
 }
 
 dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(
     THD *thd, trx_preserve_thd_transition_failure *reason) {
-  return trx_preserve_reactivate_prepare_failure_in_original_thd(
-      thd, std::string(), reason);
-}
-
-dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(
-    THD *thd, const std::string &pre_prepare_record_locks_payload,
-    trx_preserve_thd_transition_failure *reason) {
   if (reason != nullptr) {
     *reason = trx_preserve_thd_transition_failure::NONE;
   }
@@ -889,14 +880,6 @@ dberr_t trx_preserve_reactivate_prepare_failure_in_original_thd(
   if (err != DB_SUCCESS && reason != nullptr) {
     *reason = trx_preserve_thd_transition_failure::UNDO_ACTIVATE_FAILED;
   }
-  if (err != DB_SUCCESS) return err;
-
-  trx->skip_lock_inheritance = false;
-  err = lock_preserve_restore_record_locks_after_prepare_failure(
-      trx, pre_prepare_record_locks_payload);
-  if (err != DB_SUCCESS && reason != nullptr) {
-    *reason = trx_preserve_thd_transition_failure::RECORD_LOCK_RESTORE_FAILED;
-  }
   return err;
 }
 
@@ -933,14 +916,14 @@ bool trx_preserve_is_active_attached_to_thd(trx_t *trx, THD *thd) {
 static dberr_t trx_preserve_make_temp_only_claimable(trx_t *trx);
 
 /*
-  Prepare a transaction that only changed no-redo temporary-table state.
+  Prepare the current transaction using Preserve freeze semantics.
 
-  Such a transaction may not have a normal redo rseg update, but preserve still
-  needs a prepared boundary so snapshot cleanup can own or roll back its temp
-  sidecars consistently. If the transaction has no temp rseg updates this is a
-  no-op; if it has redo updates the normal ha_prepare_low() path must handle it.
+  Redo, mixed and temp-only transactions share the same prepare operation.
+  Temp-only transactions first acquire the rw-list/rseg bookkeeping needed by
+  claim and rollback. Unlike native XA prepare, this path retains every lock
+  and other transaction resource owned by the source transaction.
 */
-dberr_t trx_preserve_prepare_current_temp_only(THD *thd, const XID &xid) {
+dberr_t trx_preserve_prepare_current(THD *thd, const XID &xid) {
   if (thd == nullptr || !xid_is_preserve_magic(xid)) return DB_ERROR;
 
   trx_t *trx = thd_to_trx(thd);
@@ -952,16 +935,19 @@ dberr_t trx_preserve_prepare_current_temp_only(THD *thd, const XID &xid) {
                : DB_ERROR;
   }
 
-  if (!trx_state_eq(trx, TRX_STATE_ACTIVE) ||
-      !trx_is_temp_rseg_updated(trx) || trx_is_redo_rseg_updated(trx)) {
-    return DB_SUCCESS;
+  if (!trx_state_eq(trx, TRX_STATE_ACTIVE)) return DB_ERROR;
+
+  const bool redo_updated = trx_is_redo_rseg_updated(trx);
+  const bool temp_updated = trx_is_temp_rseg_updated(trx);
+  if (!redo_updated && !temp_updated) return DB_ERROR;
+
+  if (temp_updated && !redo_updated) {
+    const dberr_t claimable_err = trx_preserve_make_temp_only_claimable(trx);
+    if (claimable_err != DB_SUCCESS) return claimable_err;
   }
 
-  const dberr_t claimable_err = trx_preserve_make_temp_only_claimable(trx);
-  if (claimable_err != DB_SUCCESS) return claimable_err;
-
   *trx->xid = xid;
-  return trx_prepare_for_mysql(trx);
+  return innobase_preserve_prepare(thd);
 }
 
 static void trx_preserve_add_to_rw_trx_list_ordered(trx_t *trx) {

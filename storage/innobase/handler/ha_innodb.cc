@@ -19190,6 +19190,37 @@ ulint innobase_get_at_most_n_mbchars(
   return (char_length);
 }
 
+/** Prepare the current InnoDB transaction for Preserve. */
+dberr_t innobase_preserve_prepare(THD *thd) {
+  trx_t *trx = check_trx_exists(thd);
+
+  thd_get_xid(thd, (MYSQL_XID *)trx->xid);
+  ut_ad(trx->xid != nullptr);
+  ut_ad(trx_preserve_xid_should_be_protected(*trx->xid));
+
+  innobase_srv_conc_force_exit_innodb(trx);
+
+  TrxInInnoDB trx_in_innodb(trx);
+
+  if (trx_in_innodb.is_aborted() ||
+      DBUG_EVALUATE_IF("simulate_xa_failure_prepare_in_engine", 1, 0)) {
+    innobase_rollback(innodb_hton_ptr, thd, true);
+    return DB_FORCED_ABORT;
+  }
+
+  if (!trx_is_registered_for_2pc(trx) && trx_is_started(trx)) {
+    log_errlog(ERROR_LEVEL, ER_INNODB_UNREGISTERED_TRX_ACTIVE);
+  }
+
+  ut_ad(trx_is_registered_for_2pc(trx));
+
+  const dberr_t err = trx_prepare_for_preserve(trx);
+  if (err == DB_FORCED_ABORT) {
+    innobase_rollback(innodb_hton_ptr, thd, true);
+  }
+  return err;
+}
+
 /** This function is used to prepare an X/Open XA distributed transaction.
  @return 0 or error number */
 static int innobase_xa_prepare(handlerton *hton, /*!< in: InnoDB handlerton */

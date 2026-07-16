@@ -895,9 +895,9 @@ die "batch prepare failure branch must restore InnoDB and binlog state before re
          /mysql_binlog_preserve_reactivate_after_prepare_failure/s &&
          $batch_prepare_restore_branch =~ /reattached_to_original_thd/s;
 $preserve =~ /DBUG_EXECUTE_IF\s*\(\s*"pfx_prepare_low"[\s\S]*?prepare_failed\s*=\s*true[\s\S]*?if\s*\(\s*prepare_failed\s*\)\s*\{[\s\S]*?return\s+restore_unprepared_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
-  or die "pre-ha_prepare_low failure hook must route through unprepared batch restore helper\n";
-$preserve =~ /ha_prepare_low\s*\(\s*thd\s*,\s*true\s*\)[\s\S]*?return\s+restore_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
-  or die "ha_prepare_low engine failure must route through prepared batch restore helper\n";
+  or die "pre-engine-prepare failure hook must route through unprepared batch restore helper\n";
+$preserve =~ /trx_preserve_prepare_current\s*\(\s*thd\s*,\s*xid\s*\)[\s\S]*?return\s+restore_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
+  or die "preserve engine prepare failure must route through prepared batch restore helper\n";
 $preserve =~ /DBUG_EXECUTE_IF\s*\(\s*"pfx_temp_prepare"[\s\S]*?temp_prepare_failed\s*=\s*true[\s\S]*?if\s*\(\s*temp_prepare_failed\s*\)\s*\{[\s\S]*?return\s+restore_batch_prepare_failure_or_rollback\s*\(\s*\)\s*;/m
   or die "temp-only prepare failure hook must route through batch restore helper\n";
 
@@ -907,9 +907,10 @@ my $binlog_preflight_pos =
   index($preserve,
         'set_stage(Preserve_trx_preserve_stage::BINLOG_PREFLIGHT);',
         $kernel_row_format_guard_pos);
-my $prepare_low_pos = index($preserve, 'ha_prepare_low(thd, true)',
-                            $kernel_row_format_guard_pos);
-die "non-ROW binlog format must fail before binlog export and ha_prepare_low\n"
+my $prepare_low_pos =
+  index($preserve, 'trx_preserve_prepare_current(thd, xid)',
+        $kernel_row_format_guard_pos);
+die "non-ROW binlog format must fail before binlog export and preserve prepare\n"
   if $kernel_row_format_guard_pos < 0 || $binlog_preflight_pos < 0 ||
      $prepare_low_pos < 0 ||
      $kernel_row_format_guard_pos > $binlog_preflight_pos ||
@@ -938,7 +939,7 @@ die "post-prepare batch cleanup must not fall through to single-session cleanup 
      /if\s*\(\s*batch_delivery\s*&&\s*!\s*reactivate_current_batch_prepared_failure_to_original_thd\s*\(\s*thd\s*\)\s*\)/s;
 die "post-prepare batch cleanup must handle batch reactivation failure before the single-session fallback\n"
   unless $prepared_batch_restore =~
-         /if\s*\(\s*batch_delivery\s*\)\s*\{[\s\S]*?if\s*\(\s*reactivate_current_batch_prepared_failure_to_original_thd\s*\(\s*thd\s*,\s*reactivation_record_locks\s*,\s*&reactivate_failure\s*\)\s*\)[\s\S]*?cleanup_failed_after_reattach\s*=\s*true[\s\S]*?return\s+reject_unsupported_for_delivery\s*\(\s*\)/s;
+         /if\s*\(\s*batch_delivery\s*\)\s*\{[\s\S]*?if\s*\(\s*reactivate_current_batch_prepared_failure_to_original_thd\s*\(\s*thd\s*,\s*&reactivate_failure\s*\)\s*\)[\s\S]*?cleanup_failed_after_reattach\s*=\s*true[\s\S]*?return\s+reject_unsupported_for_delivery\s*\(\s*\)/s;
 
 $preserve =~ /auto reject_after_binlog_export = \[\&\]\(const char \*reason\) \{[\s\S]*?^\s*\};/m
   or die "could not isolate reject_after_binlog_export\n";
@@ -1922,18 +1923,17 @@ $preserve =~ /DEBUG_SYNC\s*\(\s*thd\s*,\s*"preserve_trx_batch_after_targets_quie
   or die "batch drain must expose a pre-attach sync point after targets are quiesced\n";
 die "pre-attach sync point must be before target context-switch attach loop\n"
   if $& =~ /preserve_trx_preserve_attached_transaction/s;
-die "lock warmcopy must not hold a global prepare guard across ha_prepare_low\n"
+die "lock warmcopy must not hold a global prepare guard across preserve prepare\n"
   if $preserve =~
-     /lock_warmcopy_prepare_guard\.reset\s*\(\s*lock_warmcopy_prepare_guard_create\s*\(\s*\)\s*\)[\s\S]*ha_prepare_low\s*\(\s*thd\s*,\s*true\s*\)[\s\S]*lock_warmcopy_prepare_guard\.reset\s*\(\s*\)/s ||
-     $preserve =~ /Keep the lock warmcopy prepare guard beyond ha_prepare_low/s;
-die "lock warmcopy final fence must use per-trx conversion freeze before ha_prepare_low\n"
+     /lock_warmcopy_prepare_guard\.reset\s*\(\s*lock_warmcopy_prepare_guard_create\s*\(\s*\)\s*\)[\s\S]*trx_preserve_prepare_current\s*\(\s*thd\s*,\s*xid\s*\)[\s\S]*lock_warmcopy_prepare_guard\.reset\s*\(\s*\)/s;
+die "lock warmcopy final fence must use per-trx conversion freeze before preserve prepare\n"
   unless $preserve =~
-         /trx_t\s+\*lock_warmcopy_frozen_trx\s*=\s*nullptr[\s\S]*auto\s+thaw_lock_warmcopy_conversion[\s\S]*trx_preserve_lock_warmcopy_conversion_freeze\s*\(\s*thd[\s\S]*ha_prepare_low\s*\(\s*thd\s*,\s*true\s*\)[\s\S]*thaw_lock_warmcopy_conversion/s;
+         /trx_t\s+\*lock_warmcopy_frozen_trx\s*=\s*nullptr[\s\S]*auto\s+thaw_lock_warmcopy_conversion[\s\S]*trx_preserve_lock_warmcopy_conversion_freeze\s*\(\s*thd[\s\S]*trx_preserve_prepare_current\s*\(\s*thd\s*,\s*xid\s*\)[\s\S]*thaw_lock_warmcopy_conversion/s;
 die "batch preserve detach/reattach failures must expose InnoDB transition reasons\n"
   unless $trx_preserve_header =~ /enum class trx_preserve_thd_transition_failure/s &&
          $trx_preserve =~ /trx_preserve_thd_transition_failure_name/s &&
          $preserve =~ /trx_preserve_detach_current_thd\s*\(\s*thd\s*,\s*&detach_failure/s &&
-         $preserve =~ /reactivate_current_batch_prepared_failure_to_original_thd\s*\(\s*thd\s*,\s*reactivation_record_locks\s*,\s*&reactivate_failure/s &&
+         $preserve =~ /reactivate_current_batch_prepared_failure_to_original_thd\s*\(\s*thd\s*,\s*&reactivate_failure/s &&
          $preserve =~ /detach_reason=/s &&
          $preserve =~ /reactivate_reason=/s;
 die "lock warmcopy must expose a debug-only post-freeze conversion attempt injection before the final fence\n"
@@ -1941,7 +1941,7 @@ die "lock warmcopy must expose a debug-only post-freeze conversion attempt injec
          /preserve_trx_lock_warmcopy_after_conversion_freeze[\s\S]{0,600}DBUG_EXECUTE_IF\s*\(\s*"preserve_trx_lock_warmcopy_simulate_conversion_after_freeze"[\s\S]{0,600}preserve_trx_lock_warmcopy_after_final_fence/s &&
          $trx_preserve =~
          /trx_preserve_lock_warmcopy_note_conversion_attempt_after_freeze[\s\S]*lock_warmcopy_trx_conversion_note_attempt[\s\S]*lock_warmcopy_trx_conversion_note_handled/s;
-$preserve =~ /if\s*\(\s*ha_prepare_low\s*\(\s*thd\s*,\s*true\s*\)\s*\)([\s\S]*?)metadata\.has_read_view/m
+$preserve =~ /if\s*\(\s*trx_preserve_prepare_current\s*\(\s*thd\s*,\s*xid\s*\)\s*!=\s*DB_SUCCESS\s*\)([\s\S]*?)metadata\.has_read_view/m
   or die "could not isolate lock warmcopy guarded metadata region\n";
 my $lock_warmcopy_guarded_metadata = $1;
 die "lock warmcopy conversion freeze must cover detach, claim, lock metadata, and table/autoinc cross-check\n"
@@ -2434,6 +2434,9 @@ die "standby transfer receiver batch payload path must use the bounded frame wor
 die "standby transfer multi-session receiver must serialize process-local sequence admission without serializing semantic worker apply\n"
   unless $transfer =~
              /preserve_trx_transfer_handle_receiver_payload_batch[\s\S]*begin_payload_sequence[\s\S]*end_payload_sequence[\s\S]*pre_admit_receiver_batch_sequence[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
+die "standby transfer receiver must register same-token apply order before releasing sequence admission and wait only after ACK\n"
+  unless $receiver_payload_batch =~
+         /pre_admit_receiver_batch_sequence[\s\S]*reserve_payload_apply[\s\S]*payload_sequence_guard\.rollback[\s\S]*after_spool[\s\S]*wait_for_payload_apply_turn[\s\S]*preserve_trx_transfer_apply_receiver_frame_batch_with_workers/s;
 die "standby transfer wire compatibility must retain the legacy promotion frame identifiers\n"
   unless $transfer_header =~ /PROMOTION_PREWARM_TOKEN/s &&
          $transfer_header =~ /PROMOTION_GATE_EPOCH/s;
@@ -2691,7 +2694,7 @@ die "unknown magic XIDs must require authenticated internal provenance before pr
          $preserve =~
          /preserve_trx_magic_xid_should_be_protected[\s\S]{0,900}preserve_trx_xid_provenance_snapshot[\s\S]{0,300}provenance->find/s &&
          $preserve =~
-         /xid_provenance_intent_prepared[\s\S]{0,1200}preserve_trx_xid_provenance_begin\s*\(\s*token\s*\)[\s\S]{0,700}ha_prepare_low\s*\(\s*thd\s*,\s*true\s*\)/s &&
+         /xid_provenance_intent_prepared[\s\S]{0,1200}preserve_trx_xid_provenance_begin\s*\(\s*token\s*\)[\s\S]{0,700}trx_preserve_prepare_current\s*\(\s*thd\s*,\s*xid\s*\)/s &&
          $preserve =~
          /artifact_sink->publish_bundle[\s\S]{0,1800}defer_xid_provenance_bind[\s\S]{0,500}preserve_trx_xid_provenance_bind[\s\S]{0,2500}preserved_trx_add_record/s &&
          $trx_preserve =~
@@ -2707,11 +2710,15 @@ die "innodb_read_only startup must record deferred Preserve recovery instead of 
          /srv_read_only_mode[\s\S]{0,180}preserved_trx_mark_innodb_read_only_recovery_state/s &&
          $ha_innodb !~
          /srv_read_only_mode[\s\S]{0,180}preserved_trx_mark_recovery_complete/s;
-die "post-PREPARE failure reactivation must restore the pre-PREPARE record-lock payload and clear the inheritance flag\n"
+die "post-PREPARE failure reactivation must retain locks and only reactivate transaction and Undo state\n"
   unless $preserve =~
-         /restore_prepared_batch_or_rollback[\s\S]{0,900}reactivation_record_locks/s &&
+         /restore_prepared_batch_or_rollback[\s\S]{0,900}reactivate_current_batch_prepared_failure_to_original_thd/s &&
          $trx_preserve =~
-         /trx_preserve_reactivate_prepare_failure_in_original_thd[\s\S]*skip_lock_inheritance\s*=\s*false[\s\S]*lock_preserve_restore_record_locks_after_prepare_failure/s;
+         /trx_preserve_reactivate_prepare_failure_in_original_thd[\s\S]*trx_preserve_activate_undo_state/s;
+die "post-PREPARE failure reactivation must not rebuild record locks or repair lock inheritance\n"
+  if $trx_preserve =~
+       /trx_preserve_reactivate_prepare_failure_in_original_thd[\s\S]*skip_lock_inheritance\s*=\s*false/s ||
+     $trx_preserve =~ /lock_preserve_restore_record_locks_after_prepare_failure/s;
 die "batch preserve must reserve provenance in one write before workers and bind all snapshot identities before epoch commit\n"
   unless $preserve =~
          /preserve_trx_xid_provenance_begin_many[\s\S]*preserve_one_target/s &&

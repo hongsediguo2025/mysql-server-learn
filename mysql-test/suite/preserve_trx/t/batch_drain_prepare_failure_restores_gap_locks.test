@@ -18,6 +18,8 @@ UPDATE t_prepare_failure_gap SET v=11 WHERE id=10;
 SELECT * FROM t_prepare_failure_gap WHERE id BETWEEN 10 AND 30 FOR UPDATE;
 
 --connection default
+# Preserve prepare must ignore the native-XA debug-only gap-lock release hook.
+# The failed preserve is reactivated without rebuilding any record locks.
 SET DEBUG='+d,ib_force_release_gap_lock_prepare';
 SET DEBUG='+d,preserve_trx_fail_after_undo_prepared';
 --error ER_PRESERVE_TRX_UNSUPPORTED

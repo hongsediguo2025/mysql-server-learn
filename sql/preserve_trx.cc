@@ -10527,14 +10527,13 @@ static bool reattach_current_batch_preserve_failure_to_original_thd(
 }
 
 static bool reactivate_current_batch_prepared_failure_to_original_thd(
-    THD *thd, const std::string &pre_prepare_record_locks_payload,
+    THD *thd,
     trx_preserve_thd_transition_failure *reactivate_failure = nullptr) {
   if (reactivate_failure != nullptr) {
     *reactivate_failure = trx_preserve_thd_transition_failure::NONE;
   }
   if (trx_preserve_reactivate_prepare_failure_in_original_thd(
-          thd, pre_prepare_record_locks_payload, reactivate_failure) !=
-      DB_SUCCESS)
+          thd, reactivate_failure) != DB_SUCCESS)
     return true;
 
   reset_preserve_xid_to_active_transaction_xid(thd);
@@ -13567,12 +13566,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
 
   auto restore_batch_prepare_failure_or_rollback = [&]() {
     if (batch_delivery) {
-      const std::string &reactivation_record_locks =
-          use_lock_warmcopy_artifact && lock_warmcopy_artifact != nullptr
-              ? lock_warmcopy_artifact->record_locks_payload
-              : record_locks_preflight_payload;
-      if (reactivate_current_batch_prepared_failure_to_original_thd(
-              thd, reactivation_record_locks)) {
+      if (reactivate_current_batch_prepared_failure_to_original_thd(thd)) {
         if (result != nullptr) {
           result->cleanup_failed_after_reattach = true;
         }
@@ -13657,7 +13651,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   auto switch_lock_warmcopy_to_live_export_before_prepare =
       [&]() -> const char * {
     /*
-      Final-fence fallback still happens before ha_prepare_low(). It must
+      Final-fence fallback still happens before engine prepare. It must
       release the conversion freeze, materialize implicit locks for live export
       and rebuild all lock payloads before prepare observes the final state.
     */
@@ -13702,7 +13696,7 @@ bool preserve_trx_kernel_preserve_attached_transaction(
           const char *strict_failure_reason) -> bool {
     /*
       Final-fence failure is the last point where live fallback is still safe.
-      After ha_prepare_low(), preserve must either continue with the chosen
+      After engine prepare, preserve must either continue with the chosen
       payload or run the prepared cleanup path; it cannot rebuild lock state.
     */
     preserve_trx_lock_warmcopy_note_final_fence_mismatch();
@@ -13828,18 +13822,16 @@ bool preserve_trx_kernel_preserve_attached_transaction(
   }
   DBUG_EXECUTE_IF("preserve_trx_crash_after_xid_provenance_before_prepare",
                   DBUG_SUICIDE(););
-  if (ha_prepare_low(thd, true)) {
+  if (trx_preserve_prepare_current(thd, xid) != DB_SUCCESS) {
     thaw_lock_warmcopy_conversion();
     return restore_batch_prepare_failure_or_rollback();
   }
   /*
-    Keep the per-trx conversion freeze beyond ha_prepare_low().  The lock
+    Keep the per-trx conversion freeze beyond engine prepare. The lock
     payload contract is not fully frozen until the transaction is detached,
     claimed, and the preserved lock metadata below has been populated.
   */
-  bool temp_prepare_failed =
-      request.debug_fail_temp_only_prepare ||
-      trx_preserve_prepare_current_temp_only(thd, xid) != DB_SUCCESS;
+  bool temp_prepare_failed = request.debug_fail_temp_only_prepare;
   DBUG_EXECUTE_IF("pfx_temp_prepare", { temp_prepare_failed = true; });
   if (temp_prepare_failed) {
     thaw_lock_warmcopy_conversion();
@@ -13863,12 +13855,8 @@ bool preserve_trx_kernel_preserve_attached_transaction(
     if (batch_delivery) {
       trx_preserve_thd_transition_failure reactivate_failure =
           trx_preserve_thd_transition_failure::NONE;
-      const std::string &reactivation_record_locks =
-          use_lock_warmcopy_artifact && lock_warmcopy_artifact != nullptr
-              ? lock_warmcopy_artifact->record_locks_payload
-              : record_locks_preflight_payload;
       if (reactivate_current_batch_prepared_failure_to_original_thd(
-              thd, reactivation_record_locks, &reactivate_failure)) {
+              thd, &reactivate_failure)) {
         if (result != nullptr) {
           result->cleanup_failed_after_reattach = true;
           result->reactivate_failure_reason =

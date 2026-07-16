@@ -1,0 +1,3 @@
+SELECT 'ok' AS preserve_prepare_freeze_semantics_lint;
+preserve_prepare_freeze_semantics_lint
+ok

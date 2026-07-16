@@ -1245,6 +1245,12 @@ by a lock wait timeout or a deadlock.
 @return MySQL error code */
 int convert_error_code_to_mysql(dberr_t error, uint32_t flags, THD *thd);
 
+/** Prepare the current InnoDB transaction for Preserve without applying
+native XA lock-release semantics.
+@param[in] thd MySQL thread whose transaction is prepared.
+@return DB_SUCCESS or error number. */
+dberr_t innobase_preserve_prepare(THD *thd);
+
 /** Converts a search mode flag understood by MySQL to a flag understood
 by InnoDB.
 @param[in]	find_flag	MySQL search mode flag.

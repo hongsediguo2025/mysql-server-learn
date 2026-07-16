@@ -27,6 +27,7 @@
 #include <array>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -506,6 +507,12 @@ struct Preserve_trx_transfer_accepted_epoch {
   std::shared_ptr<const Preserve_trx_transfer_epoch_fact> fact;
 };
 
+struct Preserve_trx_transfer_payload_apply_reservation {
+  std::string epoch_id;
+  uint64_t first_sequence{0};
+  uint64_t last_sequence{0};
+};
+
 class Preserve_trx_transfer_receiver_registry {
  public:
   ~Preserve_trx_transfer_receiver_registry();
@@ -576,6 +583,15 @@ class Preserve_trx_transfer_receiver_registry {
       const std::string &epoch_id, uint64_t first_sequence,
       uint64_t last_sequence, uint64_t timeout_ms);
   void end_payload_sequence(const std::string &epoch_id);
+  Preserve_trx_transfer_status reserve_payload_apply(
+      const std::string &epoch_id, uint64_t first_sequence,
+      uint64_t last_sequence, const std::vector<uint64_t> &tokens,
+      Preserve_trx_transfer_payload_apply_reservation *reservation);
+  Preserve_trx_transfer_status wait_for_payload_apply_turn(
+      const Preserve_trx_transfer_payload_apply_reservation &reservation,
+      uint64_t timeout_ms, bool *apply_owner);
+  void finish_payload_apply(
+      const Preserve_trx_transfer_payload_apply_reservation &reservation);
   Preserve_trx_transfer_status wait_for_frame_sequence_applied_through(
       const std::string &epoch_id, uint64_t through_sequence,
       uint64_t timeout_ms);
@@ -617,6 +633,14 @@ class Preserve_trx_transfer_receiver_registry {
   std::map<Token_key, Preserve_trx_transfer_receiver_record> m_records;
   std::map<std::string, uint64_t> m_next_sequence_by_epoch;
   std::set<std::string> m_active_payload_sequences;
+  struct Payload_apply_record {
+    uint64_t last_sequence{0};
+    std::vector<uint64_t> tokens;
+    bool applying{false};
+  };
+  std::map<std::pair<std::string, uint64_t>, Payload_apply_record>
+      m_payload_apply_records;
+  std::map<Token_key, std::deque<uint64_t>> m_payload_apply_queue_by_token;
   struct Frame_sequence_record {
     std::array<unsigned char, kPreservedTrxSha256Length> digest{};
     bool applied{false};

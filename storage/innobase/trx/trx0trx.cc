@@ -2878,8 +2878,12 @@ bool trx_is_mysql_xa(const trx_t *trx) {
   return (my_xid != 0);
 }
 
+enum class trx_prepare_semantics { NATIVE_XA, PRESERVE_FREEZE };
+
 /** Prepares a transaction. */
-static void trx_prepare(trx_t *trx) /*!< in/out: transaction */
+static void trx_prepare(
+    trx_t *trx,                    /*!< in/out: transaction */
+    trx_prepare_semantics semantics) /*!< in: prepare behavior */
 {
   /* This transaction has crossed the point of no return and cannot
   be rolled back asynchronously now. It must commit or rollback
@@ -2926,19 +2930,21 @@ static void trx_prepare(trx_t *trx) /*!< in/out: transaction */
   /* Reset after successfully adding GTID to in memory table. */
   trx->persists_gtid = false;
 
-  /* Force isolation level to RC and release GAP locks
-  for test purpose. */
-  DBUG_EXECUTE_IF("ib_force_release_gap_lock_prepare",
-                  trx->isolation_level = TRX_ISO_READ_COMMITTED;);
+  if (semantics == trx_prepare_semantics::NATIVE_XA) {
+    /* Force isolation level to RC and release GAP locks
+    for test purpose. */
+    DBUG_EXECUTE_IF("ib_force_release_gap_lock_prepare",
+                    trx->isolation_level = TRX_ISO_READ_COMMITTED;);
 
-  /* Release read locks after PREPARE for READ COMMITTED
-  and lower isolation. */
-  if (trx->isolation_level <= TRX_ISO_READ_COMMITTED) {
-    /* Stop inheriting GAP locks. */
-    trx->skip_lock_inheritance = true;
+    /* Release read locks after PREPARE for READ COMMITTED
+    and lower isolation. Preserve keeps the complete transaction lock set. */
+    if (trx->isolation_level <= TRX_ISO_READ_COMMITTED) {
+      /* Stop inheriting GAP locks. */
+      trx->skip_lock_inheritance = true;
 
-    /* Release only GAP locks for now. */
-    lock_trx_release_read_locks(trx, true);
+      /* Release only GAP locks for now. */
+      lock_trx_release_read_locks(trx, true);
+    }
   }
 
   switch (thd_requested_durability(trx->mysql_thd)) {
@@ -2979,7 +2985,8 @@ static void trx_prepare(trx_t *trx) /*!< in/out: transaction */
 /**
 Does the transaction prepare for MySQL.
 @param[in, out] trx		Transaction instance to prepare */
-dberr_t trx_prepare_for_mysql(trx_t *trx) {
+static dberr_t trx_prepare_for_mysql_low(
+    trx_t *trx, trx_prepare_semantics semantics) {
   trx_start_if_not_started_xa(trx, false);
 
   TrxInInnoDB trx_in_innodb(trx, true);
@@ -2996,11 +3003,19 @@ dberr_t trx_prepare_for_mysql(trx_t *trx) {
 
   trx->op_info = "preparing";
 
-  trx_prepare(trx);
+  trx_prepare(trx, semantics);
 
   trx->op_info = "";
 
   return (DB_SUCCESS);
+}
+
+dberr_t trx_prepare_for_mysql(trx_t *trx) {
+  return trx_prepare_for_mysql_low(trx, trx_prepare_semantics::NATIVE_XA);
+}
+
+dberr_t trx_prepare_for_preserve(trx_t *trx) {
+  return trx_prepare_for_mysql_low(trx, trx_prepare_semantics::PRESERVE_FREEZE);
 }
 
 /**

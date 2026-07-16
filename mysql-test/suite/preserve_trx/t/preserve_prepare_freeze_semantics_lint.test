@@ -1,0 +1,53 @@
+--perl
+use strict;
+use warnings;
+use File::Spec;
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_file {
+  my ($path) = @_;
+  my $full_path = File::Spec->catfile($root, split('/', $path));
+  open(my $fh, '<', $full_path) or die "open $path: $!\n";
+  my $contents = do { local $/; <$fh> };
+  close($fh);
+  return $contents;
+}
+
+my $trx = read_file("storage/innobase/trx/trx0trx.cc");
+my $trx_h = read_file("storage/innobase/include/trx0trx.h");
+my $preserve = read_file("storage/innobase/trx/trx0preserve.cc");
+my $preserve_h = read_file("storage/innobase/include/trx0preserve.h");
+my $handler = read_file("storage/innobase/handler/ha_innodb.cc");
+my $lock_h = read_file("storage/innobase/include/lock0lock.h");
+my $lock = read_file("storage/innobase/lock/lock0preserve.cc");
+my $sql = read_file("sql/preserve_trx.cc");
+
+die "missing explicit preserve prepare entry\n"
+  unless $trx_h =~ /trx_prepare_for_preserve\s*\(/ &&
+         $trx =~ /trx_prepare_for_preserve\s*\(/;
+die "native XA lock release must remain isolated behind the native semantics branch\n"
+  unless $trx =~
+    /semantics\s*==\s*trx_prepare_semantics::NATIVE_XA[\s\S]{0,900}lock_trx_release_read_locks\s*\(\s*trx\s*,\s*true\s*\)/s;
+die "preserve prepare must select freeze semantics\n"
+  unless $trx =~
+    /trx_prepare_for_preserve\s*\([^)]*\)\s*\{\s*return\s+trx_prepare_for_mysql_low\s*\(\s*trx\s*,\s*trx_prepare_semantics::PRESERVE_FREEZE\s*\)/s;
+die "missing unified preserve current-transaction prepare bridge\n"
+  unless $preserve_h =~ /trx_preserve_prepare_current\s*\(/ &&
+         $preserve =~
+           /trx_preserve_prepare_current\s*\([^)]*\)[\s\S]{0,900}innobase_preserve_prepare\s*\(\s*thd\s*\)/s;
+die "InnoDB preserve handler must use the dedicated freeze prepare\n"
+  unless $handler =~
+    /innobase_preserve_prepare\s*\([^)]*\)[\s\S]{0,1200}trx_prepare_for_preserve\s*\(\s*trx\s*\)/s;
+die "preserve SQL path must not call generic ha_prepare_low\n"
+  if $sql =~ /ha_prepare_low\s*\(\s*thd\s*,\s*true\s*\)/;
+die "prepare failure must not rebuild record locks\n"
+  if $preserve =~ /lock_preserve_restore_record_locks_after_prepare_failure/s ||
+     $lock_h =~ /lock_preserve_restore_record_locks_after_prepare_failure/s ||
+     $lock =~ /lock_preserve_restore_record_locks_after_prepare_failure/s;
+EOF
+
+SELECT 'ok' AS preserve_prepare_freeze_semantics_lint;

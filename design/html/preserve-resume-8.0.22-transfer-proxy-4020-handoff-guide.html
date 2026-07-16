@@ -1,0 +1,1547 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Preserve/Resume 8.0.22：Transfer Phase 2、4020 挂起与 Tx→Ty 事务续作对接指南</title>
+  <style>
+    :root {
+      --ink: #18232c;
+      --muted: #5d6972;
+      --line: #d5dde2;
+      --paper: #ffffff;
+      --canvas: #f3f5f6;
+      --soft: #edf2f3;
+      --green: #087b70;
+      --green-soft: #e4f3ef;
+      --blue: #315f7c;
+      --blue-soft: #e8f0f5;
+      --amber: #976000;
+      --amber-soft: #fff2d5;
+      --red: #973d38;
+      --red-soft: #faeae8;
+      --ok: #3c7451;
+      --ok-soft: #e8f3eb;
+      --code: #20272d;
+      --radius: 6px;
+      --shadow: 0 1px 2px rgba(24, 35, 44, .05), 0 7px 22px rgba(24, 35, 44, .05);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--canvas);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", Arial, sans-serif;
+      font-size: 16px;
+      line-height: 1.72;
+      letter-spacing: 0;
+    }
+    a { color: var(--green); text-underline-offset: 3px; }
+    a:hover { color: #055f58; }
+    code, .mono {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: .92em;
+    }
+    code {
+      padding: .12em .34em;
+      color: #263942;
+      background: #edf1f3;
+      border: 1px solid #dce4e7;
+      border-radius: 4px;
+      overflow-wrap: anywhere;
+    }
+    pre {
+      margin: 15px 0;
+      padding: 16px 18px;
+      overflow: auto;
+      color: #e8edef;
+      background: var(--code);
+      border-radius: var(--radius);
+      font-size: 13px;
+      line-height: 1.62;
+    }
+    pre code { padding: 0; color: inherit; background: none; border: 0; }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(260px, 304px) minmax(0, 1fr);
+      max-width: 1600px;
+      min-height: 100vh;
+      margin: 0 auto;
+      background: var(--paper);
+      box-shadow: 0 0 0 1px rgba(24, 35, 44, .04);
+    }
+    .sidebar {
+      position: sticky;
+      top: 0;
+      align-self: start;
+      height: 100vh;
+      overflow-y: auto;
+      padding: 26px 22px 30px;
+      background: #f8f9fa;
+      border-right: 1px solid var(--line);
+    }
+    .brand {
+      margin-bottom: 21px;
+      padding-bottom: 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand strong { display: block; margin-bottom: 5px; font-size: 17px; line-height: 1.38; }
+    .brand span { color: var(--muted); font-size: 12px; }
+    .toc-title {
+      margin: 0 0 9px;
+      color: #76828b;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .toc { margin: 0; padding: 0; list-style: none; }
+    .toc a {
+      display: block;
+      margin: 1px 0;
+      padding: 6px 9px;
+      color: #43515b;
+      border-left: 2px solid transparent;
+      text-decoration: none;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .toc a:hover { color: var(--ink); background: var(--soft); }
+    .toc a.active {
+      color: var(--green);
+      background: var(--green-soft);
+      border-left-color: var(--green);
+      font-weight: 650;
+    }
+    .content { min-width: 0; padding: 0 5vw 90px; }
+    .hero {
+      margin: 0 -5vw;
+      padding: 54px 5vw 44px;
+      color: #fff;
+      background: #18363b;
+      border-bottom: 6px solid #d2a140;
+    }
+    .eyebrow { margin: 0 0 10px; color: #9bd7cf; font-size: 13px; font-weight: 700; }
+    h1 { max-width: 1120px; margin: 0; font-size: 46px; line-height: 1.16; letter-spacing: 0; }
+    .hero .lead { max-width: 1080px; margin: 21px 0 0; color: #dce9ea; font-size: 18px; }
+    .hero .meta { margin-top: 22px; color: #bad8d7; font-size: 12px; }
+    .summary-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 1px;
+      margin: 0 -5vw 30px;
+      background: var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+    .summary-strip > div { padding: 17px 20px; background: #fbfcfc; }
+    .summary-strip b { display: block; margin-bottom: 3px; font-size: 13px; }
+    .summary-strip span { color: var(--muted); font-size: 12px; }
+    main section { scroll-margin-top: 26px; }
+    h2 { margin: 64px 0 18px; padding-top: 4px; font-size: 28px; line-height: 1.3; letter-spacing: 0; }
+    h2::before { content: ""; display: block; width: 46px; height: 4px; margin-bottom: 13px; background: var(--green); }
+    h3 { margin: 34px 0 11px; font-size: 20px; line-height: 1.4; }
+    h4 { margin: 24px 0 8px; font-size: 16px; }
+    p { max-width: 1100px; margin: 12px 0; }
+    ul, ol { max-width: 1100px; margin: 10px 0 16px 23px; padding: 0; }
+    li { margin: 6px 0; }
+    .section-lead { color: #3d4b55; font-size: 17px; }
+    .note, .boundary, .risk, .success {
+      max-width: 1120px;
+      margin: 18px 0;
+      padding: 15px 18px;
+      border-left: 4px solid var(--green);
+      background: var(--green-soft);
+    }
+    .boundary { border-left-color: var(--amber); background: var(--amber-soft); }
+    .risk { border-left-color: var(--red); background: var(--red-soft); }
+    .success { border-left-color: var(--ok); background: var(--ok-soft); }
+    .note strong, .boundary strong, .risk strong, .success strong { display: block; margin-bottom: 4px; }
+    .grid-2, .grid-3 { display: grid; gap: 14px; margin: 18px 0; }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .panel {
+      min-width: 0;
+      padding: 17px 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fff;
+      box-shadow: var(--shadow);
+    }
+    .panel h3, .panel h4 { margin-top: 0; }
+    .panel p:last-child, .panel ul:last-child { margin-bottom: 0; }
+    .panel.green { border-top: 4px solid var(--green); }
+    .panel.blue { border-top: 4px solid var(--blue); }
+    .panel.amber { border-top: 4px solid var(--amber); }
+    .panel.red { border-top: 4px solid var(--red); }
+    .metric { display: block; margin-bottom: 3px; color: var(--green); font-size: 25px; font-weight: 750; }
+    .metric-label { color: var(--muted); font-size: 12px; }
+    .table-wrap { max-width: 1180px; margin: 17px 0 24px; overflow-x: auto; border: 1px solid var(--line); }
+    table { width: 100%; border-collapse: collapse; background: #fff; font-size: 14px; }
+    th, td { padding: 11px 13px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left; }
+    th { color: #3f4e58; background: #f2f5f6; font-size: 12px; font-weight: 700; }
+    tr:last-child td { border-bottom: 0; }
+    .yes { color: var(--ok); font-weight: 700; }
+    .no { color: var(--red); font-weight: 700; }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(132px, 1fr));
+      gap: 24px;
+      max-width: 1180px;
+      margin: 20px 0 24px;
+      overflow-x: auto;
+    }
+    .flow .step {
+      position: relative;
+      min-width: 132px;
+      min-height: 104px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-top: 4px solid var(--green);
+      border-radius: var(--radius);
+      background: #fff;
+    }
+    .flow .step::after {
+      content: "→";
+      position: absolute;
+      top: 34px;
+      right: -21px;
+      color: #8d989f;
+      font-size: 19px;
+    }
+    .flow .step:last-child::after { content: ""; }
+    .flow .step b { display: block; margin-bottom: 5px; font-size: 13px; }
+    .flow .step span { color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .state-line {
+      max-width: 1140px;
+      margin: 17px 0;
+      padding: 15px 17px;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--blue);
+      background: var(--blue-soft);
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 13px;
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+    .decision {
+      display: grid;
+      grid-template-columns: 174px minmax(0, 1fr);
+      gap: 0;
+      max-width: 1140px;
+      margin: 12px 0;
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+    .decision b { padding: 12px 14px; background: #edf3f3; border-right: 1px solid var(--line); }
+    .decision div { padding: 12px 15px; }
+    .small { color: var(--muted); font-size: 12px; }
+    .footer { margin-top: 72px; padding-top: 22px; color: var(--muted); border-top: 1px solid var(--line); font-size: 12px; }
+
+    @media (max-width: 1050px) {
+      .layout { display: block; }
+      .sidebar { position: static; width: auto; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+      .toc { columns: 2; }
+      .content { padding: 0 5vw 70px; }
+      h1 { font-size: 39px; }
+      .summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid-3 { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 700px) {
+      body { font-size: 15px; }
+      .sidebar { padding: 20px 16px; }
+      .toc { columns: 1; }
+      .hero { padding-top: 38px; }
+      h1 { font-size: 30px; }
+      .summary-strip, .grid-2 { grid-template-columns: 1fr; }
+      .decision { grid-template-columns: 1fr; }
+      .decision b { border-right: 0; border-bottom: 1px solid var(--line); }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <strong>Transfer / Proxy / HA</strong>
+        <span>4020 挂起与事务续作对接知识文档</span>
+      </div>
+      <p class="toc-title">目录</p>
+      <nav>
+        <ol class="toc">
+          <li><a href="#conclusion">1. 对接结论</a></li>
+          <li><a href="#scope">2. 场景与边界</a></li>
+          <li><a href="#actors">3. 角色与身份</a></li>
+          <li><a href="#source-facts">4. Source 当前代码事实</a></li>
+          <li><a href="#phase2">5. Phase 2 命令边界</a></li>
+          <li><a href="#error-4020">6. 4020 精确定义</a></li>
+          <li><a href="#proxy-state">7. 代理状态机</a></li>
+          <li><a href="#text-protocol">8. 文本协议续作</a></li>
+          <li><a href="#binary-ps">9. 二进制 PS 续作</a></li>
+          <li><a href="#promotion">10. HA 升主与 Tx→Ty</a></li>
+          <li><a href="#reset">11. RESET DRAIN 分支</a></li>
+          <li><a href="#final-ack">12. FINAL_ACK 责任边界</a></li>
+          <li><a href="#exactly-once">13. 请求结果安全</a></li>
+          <li><a href="#gap">14. 当前响应屏障缺口</a></li>
+          <li><a href="#minimal-kernel">15. 最小内核补强</a></li>
+          <li><a href="#interfaces">16. 三方接口合同</a></li>
+          <li><a href="#tests">17. 测试与验收</a></li>
+          <li><a href="#files">18. 代码地图与检查表</a></li>
+        </ol>
+      </nav>
+    </aside>
+
+    <div class="content">
+      <header class="hero">
+        <p class="eyebrow">Preserve/Resume 8.0.22 · 物理备机项目对接资料</p>
+        <h1>Transfer Phase 2、4020 挂起与 Tx→Ty 事务续作对接指南</h1>
+        <p class="lead">
+          本文说明代理节点如何只依赖 <code>ER_PRESERVE_TRX_SESSION_DRAINED (4020)</code>
+          挂起尚未执行的请求，并在 HA 完成目标节点升主和事务接管后，将该请求准确地重放到 Ty 上。
+          文档同时标出当前源码已经具备的行为、尚缺的响应完成屏障，以及最小化的内核补强范围。
+        </p>
+        <p class="meta">
+          代码基线：<span class="mono">302ae0940a58040ef35c0a0d0f6a289eb1708cc7</span>
+          · 生成日期：2026-07-16 · 范围：standby transfer 在线升主预埋，不讨论本地 startup resume
+        </p>
+      </header>
+
+      <div class="summary-strip">
+        <div><b>挂起触发器</b><span>只认错误码 <code>4020</code></span></div>
+        <div><b>事务标识</b><span><code>token = uint64_t(Tx)</code></span></div>
+        <div><b>成功续作</b><span>HA attach Tx→Ty 后重放原请求</span></div>
+        <div><b>回撤续作</b><span>RESET 成功后在原 Tx 重放</span></div>
+      </div>
+
+      <main>
+        <section id="conclusion">
+          <h2>1. 对接结论</h2>
+          <p class="section-lead">
+            代理、HA 与 mysqld 的职责可以压缩成三个简单合同，不需要把 HA 状态机或代理协议状态放进 Preserve 内核。
+          </p>
+
+          <div class="grid-3">
+            <article class="panel green">
+              <h3>mysqld</h3>
+              <p>
+                Source 将事务 preserve 成功后，把 Tx 会话置为 <code>PRESERVED_DRAINED</code>。
+                之后读取到的新命令不执行，统一返回 <code>4020</code>。
+              </p>
+            </article>
+            <article class="panel blue">
+              <h3>Proxy</h3>
+              <p>
+                收到 <code>4020</code> 后不向客户端返回错误，保存原始请求并停止向 source 继续下发；
+                后续客户端请求按连接顺序排队。
+              </p>
+            </article>
+            <article class="panel amber">
+              <h3>HA</h3>
+              <p>
+                HA 决定最终走升主还是 RESET。升主成功后提供 Tx→Ty 接管结果；
+                RESET 成功后通知代理原 source 已恢复；Preserve 接管放弃时明确结束续作。
+              </p>
+            </article>
+          </div>
+
+          <div class="success">
+            <strong>核心流程</strong>
+            source 正常执行的请求返回正常结果；source 明确返回 4020 的请求保证未执行，由代理恰好重放一次。
+            HA 升主成功则在 Ty 上重放，RESET 成功则在原 Tx 上重放。
+          </div>
+
+          <div class="risk">
+            <strong>不能把“连接断开”当成 4020</strong>
+            若代理没有收到完整的正常响应，也没有收到完整的 4020，而只看到网络断开，则请求结果不确定。
+            代理不得盲目重放。当前源码还缺一个在 COMMIT_EPOCH 前关闭命令准入并等待响应完成的
+            batch drained response fence，用于关闭 source 已读取请求的本地响应竞态。
+          </div>
+        </section>
+
+        <section id="scope">
+          <h2>2. 场景与边界</h2>
+          <p class="section-lead">
+            本文只描述 transfer 模式下的计划内物理备机升主对接。receiver 在线接收、保存和 prewarm；
+            真正升主由后续物理备机项目的 HA 流程触发。
+          </p>
+
+          <div class="grid-2">
+            <article class="panel green">
+              <h3>本文覆盖</h3>
+              <ul>
+                <li>source phase2 对业务命令的处理。</li>
+                <li><code>4020</code> 的代理挂起合同。</li>
+                <li>文本协议和二进制 prepared statement。</li>
+                <li>HA 升主后 Tx→Ty attach 与请求重放。</li>
+                <li><code>RESET DRAIN</code> 后在原 source 上继续。</li>
+                <li>FINAL_ACK 后 source 与 receiver 的责任边界。</li>
+              </ul>
+            </article>
+            <article class="panel red">
+              <h3>本文不覆盖</h3>
+              <ul>
+                <li>本地 preserve → shutdown → startup resume。</li>
+                <li>receiver crash 后恢复 transfer epoch。</li>
+                <li>真实物理 redo apply、authority 或 write-enable 实现。</li>
+                <li>由 source 触发 target promotion。</li>
+                <li>把代理 PS catalog、请求队列或 peerid 数据存入 mysqld。</li>
+                <li>分布式两阶段提交或 source/target 双向回滚协议。</li>
+              </ul>
+            </article>
+          </div>
+
+          <div class="boundary">
+            <strong>receiver 是在线、进程内候选</strong>
+            receiver 重启后 transfer epoch 失效，残留临时文件应清理；它不是本地 startup carrier。
+            因而代理续作也只针对当前 target mysqld 进程和当前 HA promotion attempt。
+          </div>
+        </section>
+
+        <section id="actors">
+          <h2>3. 角色与身份</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>角色</th><th>标识</th><th>职责</th><th>不负责</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>用户逻辑连接</td>
+                  <td>Proxy 前端连接</td>
+                  <td>保持客户端看到的一条连续会话和事务语义。</td>
+                  <td>感知 Tx、Ty、4020 或 promotion 内核状态。</td>
+                </tr>
+                <tr>
+                  <td>Source 后端连接</td>
+                  <td><code>Tx = source THD::thread_id()</code></td>
+                  <td>承载原事务，drain 时生成 transfer token。</td>
+                  <td>FINAL_ACK 后管理 target prewarm 或 promotion。</td>
+                </tr>
+                <tr>
+                  <td>Target 后端连接</td>
+                  <td><code>Ty = target THD::thread_id()</code></td>
+                  <td>升主时作为空闲、受保护的 THD 接收 preserved transaction。</td>
+                  <td>继承 source 的 backend statement id。</td>
+                </tr>
+                <tr>
+                  <td>peerid</td>
+                  <td><code>peerid(Tx, Ty)</code></td>
+                  <td>由代理/HA 保存 source 与 target 两个后端连接的对应关系。</td>
+                  <td>成为 transfer manifest 中第二个重复 token 字段。</td>
+                </tr>
+                <tr>
+                  <td>Transfer token</td>
+                  <td><code>uint64_t(Tx)</code></td>
+                  <td>唯一标识从 source 转移来的事务。</td>
+                  <td>直接等于 Ty，或要求额外 UUID 才能使用。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <pre><code>Proxy logical connection
+        |
+        +-- source backend: Tx  ---- token = Tx ----> receiver preserved candidate
+        |
+        +-- target backend: Ty  &lt;--- peerid(Tx, Ty) --- HA / proxy mapping
+
+promotion:
+    token Tx -> resolve peerid -> protected Ty -> attach transaction -> replay SQL</code></pre>
+
+          <p>
+            当前 transfer token 构造路径已经直接使用 source 会话的 <code>thread_id()</code>：
+            <code>sql/preserve_trx.cc:2160-2174</code> 构造 Resurrection Index 时令
+            <code>built.token = source_connection_id</code>；
+            <code>sql/preserve_trx.cc:2446-2490</code> 校验并选择 transfer token。
+            本地 preserve token 的旧生成路径不因此改变。
+          </p>
+        </section>
+
+        <section id="source-facts">
+          <h2>4. Source 当前代码事实</h2>
+          <p class="section-lead">
+            下列行为已经存在于当前 HEAD。代理对接可以依赖其语义，但不能把尚未实现的 response fence 当成现状。
+          </p>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>代码事实</th><th>位置</th><th>含义</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>phase2 先进入 <code>WARMCOPY_CLOSING</code></td>
+                  <td><code>sql/preserve_trx.cc:15471-15483</code></td>
+                  <td>先发布关闭边界，阻止新建事务或锁的命令，再收敛已准入工作。</td>
+                </tr>
+                <tr>
+                  <td>之后进入 <code>BATCH_DRAINING</code></td>
+                  <td><code>sql/preserve_trx.cc:15740</code></td>
+                  <td>执行 quiesce、prepare、detach、snapshot/transfer 等 phase2 工作。</td>
+                </tr>
+                <tr>
+                  <td>成功事务会话变为 <code>PRESERVED_DRAINED</code></td>
+                  <td><code>sql/sql_class.h:141-165</code><br><code>sql/preserve_trx.cc:6951</code></td>
+                  <td>事务已经从原会话分离；该会话不能继续执行普通命令。</td>
+                </tr>
+                <tr>
+                  <td>读取命令前处理 quiesce</td>
+                  <td><code>sql/sql_parse.cc:1266</code><br><code>sql/preserve_trx.cc:8460</code></td>
+                  <td><code>QUIESCED/ATTACHING</code> 状态下不读取新命令，等待 drain owner 完成关键工作。</td>
+                </tr>
+                <tr>
+                  <td>读取命令后优先检查 drained</td>
+                  <td><code>sql/sql_parse.cc:1278</code><br><code>sql/preserve_trx.cc:8588-8607</code></td>
+                  <td><code>PRESERVED_DRAINED</code> 会话读取一个新包后立即返回 4020，不进入 SQL 执行。</td>
+                </tr>
+                <tr>
+                  <td>SQL 与 protocol dispatch 还有二次 gate</td>
+                  <td><code>sql/sql_parse.cc:1625-1633</code><br><code>sql/sql_parse.cc:2741-2750</code></td>
+                  <td>即使绕过早期检查，文本 SQL 和协议命令仍会被 4020 拦截。</td>
+                </tr>
+                <tr>
+                  <td>COMMIT_EPOCH 得到 FINAL_ACK 后拆 source 上下文</td>
+                  <td><code>sql/preserve_trx.cc:16638-16705</code></td>
+                  <td>代码已明确 FINAL_ACK 是 transfer ownership boundary。</td>
+                </tr>
+                <tr>
+                  <td>当前成功尾部进入 shutdown handoff</td>
+                  <td><code>sql/preserve_trx.cc:16972</code><br><code>sql/sql_parse.cc:2316-2341</code></td>
+                  <td>这使 DRAIN 完成与业务连接关闭之间存在需要严格处理的响应竞态。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="note">
+            <strong>为什么 PRESERVED_DRAINED 仍允许读取命令</strong>
+            <code>preserve_trx_batch_state_blocks_target_owner()</code> 只把
+            <code>QUIESCED</code> 和 <code>ATTACHING</code> 视为“读命令前等待”状态。
+            <code>PRESERVED_DRAINED</code> 不等待，而是让 mysqld 读取下一个命令包并明确返回 4020。
+            这正是代理使用 4020 挂起请求的基础。
+          </div>
+        </section>
+
+        <section id="phase2">
+          <h2>5. Phase 2 命令边界</h2>
+          <p>
+            source 对 phase2 周围命令的处理不是“所有命令直接报错”，而是按命令被内核看到的时间点分成三类。
+          </p>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>命令时点</th><th>source 行为</th><th>代理行为</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>命令包已被 <code>get_command()</code> 读取，并在关闭边界前成为 inflight</td>
+                  <td>允许该命令完成，返回正常 OK、结果集或业务错误；之后会话再进入 quiesce。</td>
+                  <td>按普通结果处理，不得重放。</td>
+                </tr>
+                <tr>
+                  <td>命令在 <code>WARMCOPY_CLOSING/BATCH_DRAINING</code> 中尝试创建事务或锁，但事务尚未 preserve</td>
+                  <td>可能返回 <code>ER_PRESERVE_TRX_UNSUPPORTED (4013)</code>。</td>
+                  <td>4013 不是事务续作信号，不得作为挂起重放触发器。</td>
+                </tr>
+                <tr>
+                  <td>事务已 preserve，会话已是 <code>PRESERVED_DRAINED</code></td>
+                  <td>读取命令包，但不执行命令，返回 <code>4020</code>。</td>
+                  <td>隐藏 4020，挂起原请求，停止向 source 继续发送。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <pre><code>source Tx command boundary
+
+packet read before closing gate
+    -> mark inflight
+    -> command executes
+    -> normal response
+    -> Tx reaches idle boundary and quiesces
+
+packet read after Tx == PRESERVED_DRAINED
+    -> reject before dispatch
+    -> ER_PRESERVE_TRX_SESSION_DRAINED (4020)
+    -> command body is not executed</code></pre>
+
+          <p>
+            <code>mysql-test/suite/preserve_trx/t/batch_drain_packet_before_dispatch.test</code>
+            覆盖第一类边界；<code>batch_drain_target_command_blocked.test</code>
+            覆盖命令在 quiesce 期间等待、随后以 4020 返回的行为。
+          </p>
+        </section>
+
+        <section id="error-4020">
+          <h2>6. 4020 精确定义</h2>
+          <div class="decision">
+            <b>错误名</b>
+            <div><code>ER_PRESERVE_TRX_SESSION_DRAINED</code></div>
+          </div>
+          <div class="decision">
+            <b>错误号</b>
+            <div><code>4020</code></div>
+          </div>
+          <div class="decision">
+            <b>SQLSTATE</b>
+            <div><code>HY000</code></div>
+          </div>
+          <div class="decision">
+            <b>服务端消息</b>
+            <div><code>This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE</code></div>
+          </div>
+
+          <div class="success">
+            <strong>代理可依赖的语义</strong>
+            对产生该 4020 的命令包，mysqld 已经消费协议请求，但没有执行该命令的 SQL/协议主体；
+            原事务已经从 Tx 分离并由 Preserve 路径持有。因此该请求可以在终局节点上重放一次。
+          </div>
+
+          <div class="boundary">
+            <strong>4020 不等于 target 已接受</strong>
+            <code>PRESERVED_DRAINED</code> 也可能用于 unresolved detach/cleanup failure 的可见隔离。
+            因此 4020 只建立“source 上未执行”的请求边界，不表达 FINAL_ACK、READY、promotion authority 或 attach 成功。
+            代理必须等待 HA 的 promotion、RESET 或 continuation-abandoned 终局。
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>错误/事件</th><th>是否挂起</th><th>是否允许自动重放</th><th>说明</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>4020</code></td>
+                  <td class="yes">是</td>
+                  <td class="yes">HA 给出终局后是</td>
+                  <td>唯一的 Preserve 事务续作挂起触发器。</td>
+                </tr>
+                <tr>
+                  <td><code>4013 ER_PRESERVE_TRX_UNSUPPORTED</code></td>
+                  <td class="no">否</td>
+                  <td class="no">否</td>
+                  <td>用途广泛，可能表示资格、上下文或 drain gate 不支持，不能推导“请求未执行且事务已转移”。</td>
+                </tr>
+                <tr>
+                  <td><code>4014 ER_PRESERVE_TRX_DRAIN_TIMEOUT</code></td>
+                  <td class="no">否</td>
+                  <td class="no">否</td>
+                  <td>主要是 drain owner/control-plane 失败。</td>
+                </tr>
+                <tr>
+                  <td><code>4015 ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED</code></td>
+                  <td class="no">否</td>
+                  <td class="no">否</td>
+                  <td>需要 HA 检查 source 状态，不能由业务代理自行续作。</td>
+                </tr>
+                <tr>
+                  <td>网络断开、2013、EOF，未收到完整响应</td>
+                  <td>等待 HA 判定</td>
+                  <td class="no">不得盲目重放</td>
+                  <td>请求可能未执行、已执行但响应丢失，或只写入部分结果。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>
+            错误文本定义在 <code>share/messages_to_clients.txt:9475</code>；
+            当前 debug/release 生成头均确认 <code>ER_PRESERVE_TRX_SESSION_DRAINED = 4020</code>。
+          </p>
+        </section>
+
+        <section id="proxy-state">
+          <h2>7. 代理状态机</h2>
+          <p class="section-lead">
+            每条用户逻辑连接维护一个很小的状态机即可。进入挂起态不需要 HA 预先通知，只由 source 返回 4020 触发。
+          </p>
+
+          <div class="state-line">ACTIVE_SOURCE → REQUEST_IN_FLIGHT → SUSPENDED_4020 → WAIT_HA_TERMINAL → REPLAYING | TERMINAL_FAILED</div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>代理状态</th><th>可向 source 发送</th><th>可向 target 发送</th><th>客户端可见行为</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>ACTIVE_SOURCE</code></td>
+                  <td class="yes">是</td>
+                  <td class="no">否</td>
+                  <td>正常转发。</td>
+                </tr>
+                <tr>
+                  <td><code>REQUEST_IN_FLIGHT</code></td>
+                  <td>同一后端不得再发第二个 response-bearing 请求</td>
+                  <td class="no">否</td>
+                  <td>等待完整响应；long-data 分片只能作为紧随 execute 的 compound request 组成部分。</td>
+                </tr>
+                <tr>
+                  <td><code>SUSPENDED_4020</code></td>
+                  <td class="no">否</td>
+                  <td class="no">否</td>
+                  <td>不返回 4020；保存触发请求，后续前端请求排队。</td>
+                </tr>
+                <tr>
+                  <td><code>WAIT_HA_TERMINAL</code></td>
+                  <td class="no">否</td>
+                  <td class="no">否</td>
+                  <td>等待 promotion attach 成功或 RESET 成功。</td>
+                </tr>
+                <tr>
+                  <td><code>REPLAYING_SOURCE</code></td>
+                  <td class="yes">仅重放队列</td>
+                  <td class="no">否</td>
+                  <td>RESET 分支；先重放 4020 请求，再按序释放队列。</td>
+                </tr>
+                <tr>
+                  <td><code>REPLAYING_TARGET</code></td>
+                  <td class="no">否</td>
+                  <td class="yes">仅在 attach 成功后</td>
+                  <td>promotion 分支；先重放 4020 请求，再按序释放队列。</td>
+                </tr>
+                <tr>
+                  <td><code>AMBIGUOUS_DISCONNECT</code></td>
+                  <td class="no">否</td>
+                  <td class="no">否</td>
+                  <td>没有 4020 证据，不自动执行；由 HA/上层异常策略处理。</td>
+                </tr>
+                <tr>
+                  <td><code>TERMINAL_FAILED</code></td>
+                  <td class="no">否</td>
+                  <td class="no">否</td>
+                  <td>HA 已放弃 Preserve 续作；结束逻辑事务/连接，不阻塞普通升主。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>7.1 必须保持的顺序规则</h3>
+          <ol>
+            <li>每个 source backend connection 同时最多一个 response-bearing 请求在途。</li>
+            <li><code>COM_STMT_SEND_LONG_DATA...</code> 与紧随其后的 <code>COM_STMT_EXECUTE</code> 视为一个 compound request，不允许夹入其他命令。</li>
+            <li>收到 4020 后立即停止向该 source connection 发送任何新协议命令。</li>
+            <li>原始 4020 请求排在队首；promotion 或 RESET 后必须先重放它。</li>
+            <li>只有队首请求获得完整结果后，才释放后续排队请求。</li>
+            <li>不得把同一请求同时发往 Tx 和 Ty。</li>
+          </ol>
+
+          <div class="boundary">
+            <strong>“完全依赖 4020”的准确含义</strong>
+            4020 是进入挂起态的唯一触发器，不要求 HA 在 phase2 前通知每条代理连接。
+            但挂起后的终局仍必须由 HA 告知：target attach 成功、source RESET 成功，或 Preserve continuation 已放弃。
+          </div>
+        </section>
+
+        <section id="text-protocol">
+          <h2>8. 文本协议续作</h2>
+          <h3>8.1 Promotion 成功分支</h3>
+          <pre><code>Client          Proxy             Source Tx          HA              Target Ty
+  | COM_QUERY Q   |                   |               |                  |
+  |-------------->| COM_QUERY Q       |               |                  |
+  |               |------------------>|               |                  |
+  |               |  ERR 4020         |               |                  |
+  |               |&lt;------------------|               |                  |
+  |               | hold Q; no reply  |               |                  |
+  |               |                   |   promote target / build Ty      |
+  |               |                   |               |-----------------&gt;|
+  |               |                   |               | attach token Tx  |
+  |               |                   |               |-----------------&gt;|
+  |               |        HA: Tx→Ty attach OK        |                  |
+  |               |&lt;----------------------------------|                  |
+  |               | COM_QUERY Q                                          |
+  |               |-----------------------------------------------------&gt;|
+  |               | result / OK / business error                          |
+  |               |&lt;-----------------------------------------------------|
+  | client result |
+  |&lt;--------------|</code></pre>
+
+          <h3>8.2 RESET 成功分支</h3>
+          <pre><code>Client          Proxy             Source Tx          HA
+  | COM_QUERY Q   |                   |               |
+  |-------------->|------------------>|               |
+  |               |  ERR 4020         |               |
+  |               |&lt;------------------|               |
+  |               | hold Q            | RESET DRAIN   |
+  |               |                   |&lt;--------------|
+  |               |                   | source reopened
+  |               |      HA: RESET success            |
+  |               |&lt;----------------------------------|
+  |               | COM_QUERY Q       |               |
+  |               |------------------>|               |
+  |               | normal response   |               |
+  |               |&lt;------------------|               |
+  |&lt;--------------|</code></pre>
+
+          <div class="note">
+            <strong>重放的是原始协议请求，不是“重放事务历史”</strong>
+            已经 preserve 的事务状态由内核转移和 attach 恢复；代理只重放触发 4020 的那一条尚未执行命令，
+            再继续发送其后排队的新命令。之前已经成功执行的 SQL 绝不能重放。
+          </div>
+        </section>
+
+        <section id="binary-ps">
+          <h2>9. 二进制 Prepared Statement 续作</h2>
+          <p>
+            当前 MTR 已证明：事务 preserve 后，已有 prepared statement 的
+            <code>COM_STMT_EXECUTE</code> 返回错误码 4020，随后 <code>COM_PING</code>
+            也返回 4020。测试位于
+            <code>mysql-test/suite/preserve_trx/t/batch_drain_drained_session_binary_ps_blocked.test</code>。
+          </p>
+
+          <div class="risk">
+            <strong>backend statement id 不能跨 mysqld 使用</strong>
+            source 上的 statement id 只在 Tx 所属 mysqld 进程内有效。升主后不能把原
+            <code>COM_STMT_EXECUTE(stmt_id=source_id)</code> 原样发给 Ty。
+            PS 迁移必须由代理维护虚拟 statement catalog。
+          </div>
+
+          <h3>9.1 代理必须保存的 PS 信息</h3>
+          <ul>
+            <li>客户端可见 statement id 与 source/target backend statement id 的映射。</li>
+            <li>原始 SQL 文本和 prepare 时的数据库、字符集等必要会话上下文。</li>
+            <li>execute 参数类型、NULL bitmap、值和游标标志。</li>
+            <li><code>COM_STMT_SEND_LONG_DATA</code> 的全部分片内容，直到对应 execute 得到确定结果。</li>
+            <li>statement close/reset 状态，防止已关闭语句被重建。</li>
+          </ul>
+
+          <h3>9.2 Existing PS execute 的 promotion 重放</h3>
+          <pre><code>1. Tx 上 COM_STMT_EXECUTE(source_stmt_id) -> ERR 4020
+2. Proxy 挂起 execute，保存参数和 long-data
+3. HA 完成 token Tx -> Ty attach
+4. Proxy 在 Ty 上 COM_STMT_PREPARE(original_sql)
+5. Proxy 记录 target_stmt_id
+6. Proxy 按原顺序重发 COM_STMT_SEND_LONG_DATA(target_stmt_id, ...)
+7. Proxy 发送 COM_STMT_EXECUTE(target_stmt_id, original_params)
+8. Proxy 将结果转回客户端，并切换 stmt-id 映射</code></pre>
+
+          <h3>9.3 各 PS 命令处理</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>协议命令</th><th>4020/迁移处理</th><th>对接要求</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>COM_STMT_PREPARE</code></td>
+                  <td>若收到 4020，挂起 prepare；终局节点上重新 prepare。</td>
+                  <td>客户端 stmt id 必须由代理虚拟化，不能暴露 backend id 的迁移。</td>
+                </tr>
+                <tr>
+                  <td><code>COM_STMT_EXECUTE</code></td>
+                  <td>收到 4020 后挂起；attach 后 reprepare + execute。</td>
+                  <td>保存参数类型和值；只重放一次。</td>
+                </tr>
+                <tr>
+                  <td><code>COM_STMT_SEND_LONG_DATA</code></td>
+                  <td>协议本身不返回响应，不能把每个分片当成独立的 4020 请求。</td>
+                  <td>代理必须缓存每个分片，并与 execute 组成连续 compound request；最终 execute 确定前不能丢弃。</td>
+                </tr>
+                <tr>
+                  <td><code>COM_STMT_CLOSE</code></td>
+                  <td>协议本身无响应，不作为挂起业务请求。</td>
+                  <td>更新代理 catalog；终局节点不重建已关闭语句。drained gate 不应向该命令发送违背协议的 ERR packet。</td>
+                </tr>
+                <tr>
+                  <td><code>COM_STMT_RESET</code></td>
+                  <td>按有响应命令处理；必要时在终局 backend 映射上执行。</td>
+                  <td>同时清理代理缓存的 long-data。</td>
+                </tr>
+                <tr>
+                  <td><code>COM_STMT_FETCH</code></td>
+                  <td class="no">当前不支持跨节点 cursor 续作。</td>
+                  <td>Preserve 资格检查已拒绝 open server-side cursor，见 <code>sql/preserve_trx.cc:5083</code>。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="boundary">
+            <strong>mysqld 只恢复事务，不迁移代理协议对象</strong>
+            binlog cache、MDL、InnoDB trx、锁、会话事务属性等由 Preserve 内核恢复；
+            prepared statement catalog、backend stmt id 和客户端请求队列仍属于代理。
+          </div>
+
+          <h3>9.4 当前无响应命令缺口</h3>
+          <p>
+            当前 <code>do_command()</code> 在 <code>get_command()</code> 后对所有 server command
+            统一调用 <code>preserved_trx_reject_if_batch_session_drained()</code>。
+            该早期路径会直接 <code>send_statement_status()</code>。但正常 dispatch 对
+            <code>COM_STMT_SEND_LONG_DATA</code> 和 <code>COM_STMT_CLOSE</code> 会调用
+            <code>Diagnostics_area::disable_status()</code>，明确保持无响应协议语义，
+            见 <code>sql/sql_parse.cc:1751-1759</code> 和 <code>1782-1787</code>。
+          </p>
+          <div class="risk">
+            <strong>因此 binary PS 目前只证明了 execute/ping 被 4020 拦截，尚未证明完整协议闭环</strong>
+            后续最小修正应按 command 类型处理：response-bearing command 返回 4020；
+            <code>COM_STMT_SEND_LONG_DATA</code> 在 drained 后不再写入 backend PS buffer、不发送 ERR，
+            只标记一个有 deadline 的 <code>drained_ps_compound_pending</code>；
+            代理必须紧接着发送 <code>COM_STMT_EXECUTE</code>，由 execute 获得 4020 并关闭该 compound；
+            <code>COM_STMT_CLOSE</code> 可继续执行其无响应 close 语义，<code>COM_QUIT</code> 保持关闭语义。
+            不应向无响应命令注入一个客户端不会读取的 ERR packet。
+          </div>
+
+          <h3>9.5 Long-data 的 RESET 重放</h3>
+          <p>
+            部分 long-data 分片可能在 Tx 进入 <code>PRESERVED_DRAINED</code> 前已经写入 source 的 prepared statement buffer，
+            其余分片则可能在 drained 后被丢弃。代理无法仅凭 4020 判断 source 已接收了多少分片。
+            因此 RESET 分支不能直接追加式重发。
+            <code>mysqld_stmt_reset()</code> 会关闭 cursor 并调用 <code>reset_stmt_params()</code>
+            清除 <code>mysqld_stmt_send_long_data()</code> 写入的参数，见
+            <code>sql/sql_prepare.cc:1984-2016</code>。
+          </p>
+          <pre><code>RESET success, replay a hung long-data execute on original Tx:
+  1. COM_STMT_RESET(source_stmt_id)   // clear any partially accepted long-data
+  2. resend every cached COM_STMT_SEND_LONG_DATA chunk in original order
+  3. COM_STMT_EXECUTE(source_stmt_id, original_params)
+
+promotion success on Ty:
+  1. COM_STMT_PREPARE(original_sql)   // clean target statement
+  2. resend every cached long-data chunk
+  3. COM_STMT_EXECUTE(target_stmt_id, original_params)</code></pre>
+        </section>
+
+        <section id="promotion">
+          <h2>10. HA 升主与 Tx→Ty 接管</h2>
+          <p class="section-lead">
+            当前仓库没有真实物理备机 HA 流程，但已经预埋了一部分“受保护 Ty + promotion attach/resume”内核能力。
+            后续物理备机项目应从 HA 内部入口调用，而不是由 source classic session 触发。
+          </p>
+
+          <div class="flow">
+            <div class="step"><b>1. HA 选主</b><span>target 获得 promotion authority，满足 apply/fence 条件</span></div>
+            <div class="step"><b>2. 准备 Ty</b><span>建立或定位空闲、无事务、受保护的 target THD</span></div>
+            <div class="step"><b>3. peerid 解析</b><span>用 token Tx 找到 peerid(Tx, Ty) 中的 Ty</span></div>
+            <div class="step"><b>4. 内核 attach</b><span>将 ADOPTED_LOCKED 事务挂载到 Ty</span></div>
+            <div class="step"><b>5. 代理重放</b><span>HA 返回 attach OK 后，代理发送挂起命令</span></div>
+          </div>
+
+          <h3>10.1 当前已存在的内核预埋</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>能力</th><th>代码位置</th><th>作用</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>Preserved_trx_peer_thd_handle</code></td>
+                  <td><code>sql/preserve_trx.h:96-121</code></td>
+                  <td>持有 THD 生命周期 pin，并在接管期间把 THD 置为受保护的 <code>ATTACHING</code>。</td>
+                </tr>
+                <tr>
+                  <td><code>preserved_trx_defer_external_thd_kill()</code></td>
+                  <td><code>sql/preserve_trx.cc:7740-7765</code></td>
+                  <td>接管窗口内推迟外部 KILL，避免 Ty 生命周期竞态。</td>
+                </tr>
+                <tr>
+                  <td><code>preserved_trx_resume_adopted_for_promotion_on_thd()</code></td>
+                  <td><code>sql/preserve_trx.cc:17748-18124</code></td>
+                  <td>校验 <code>ADOPTED_LOCKED</code>，恢复事务与会话内核对象，并在成功后激活到 Ty。</td>
+                </tr>
+                <tr>
+                  <td><code>ADOPTED_FOR_PROMOTION</code> record</td>
+                  <td><code>sql/preserve_trx.cc:661</code><br><code>sql/preserve_trx.cc:17804-17814</code></td>
+                  <td>promotion-owned token 不允许普通 SQL RESUME 抢占。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>10.2 仍需由物理备机项目提供</h3>
+          <ul>
+            <li>真实 promotion authority、redo apply/freeze/fence 与 write-enable 时序。</li>
+            <li>真实 <code>peerid(Tx, Ty)</code> provider，把 source token Tx 映射到 target connection id Ty。</li>
+            <li>HA 调用统一 promotion 接口并取得每个 token 的 attach 结果。</li>
+            <li>attach 全部成功后向代理发布“可在 Ty 重放”的终局事件。</li>
+            <li>preserve 不可用、过期或 attach 失败时走普通升主策略，而不是阻塞升主。</li>
+          </ul>
+
+          <div class="note">
+            <strong>当前默认 resolver 不是生产 peerid provider</strong>
+            <code>preserved_trx_resolve_peer_thd()</code> 当前按传入的
+            <code>source_connection_id</code> 在本进程执行 <code>Find_thd_with_id</code>，
+            适合本地预埋/测试语义；跨节点生产对接必须由 HA/代理先完成 Tx→Ty 映射。
+            推荐的最小接口不是让 provider 返回裸 <code>THD*</code>，而是让 HA 传入 Ty，
+            再由现有 handle 逻辑按 Ty 查找、pin 并保护 THD。token 仍只有 Tx，Ty 只是 promotion 调用参数，
+            不进入 transfer artifact。
+          </div>
+
+          <div class="boundary">
+            <strong>普通升主不能被 Preserve 阻塞</strong>
+            若 receiver candidate 不存在、已过期、未 READY 或 attach 失败，HA 应放弃该 Preserve epoch，
+            清理 target 进程内对象并继续普通形态升主。只有 preserve-aware 接管成功，代理才重放挂起事务请求。
+          </div>
+        </section>
+
+        <section id="reset">
+          <h2>11. RESET DRAIN 分支</h2>
+          <p>
+            HA 放弃切换时，在 source 上执行 <code>RESET DRAIN</code>。成功定义是原主业务已经重新开放；
+            后台 artifact、transfer participant 或缓存清理可以继续。详细设计见
+            <a href="preserve-resume-8.0.22-reset-drain-and-receiver-expiry-design.html">
+              RESET DRAIN 与 Receiver 自动失效设计
+            </a>。
+          </p>
+
+          <ol>
+            <li>HA 调用 source <code>RESET DRAIN</code>。</li>
+            <li>source 停止新的 phase2/transfer 推进，恢复原 Tx 上的事务和会话状态。</li>
+            <li>source 发布“业务可继续”并返回 RESET 成功。</li>
+            <li>HA 通知代理该逻辑连接走 <code>REPLAYING_SOURCE</code>。</li>
+            <li>代理在原 Tx 上先重放触发 4020 的请求，再按序释放后续请求。</li>
+          </ol>
+
+          <div class="risk">
+            <strong>RESET 不等于重新执行已成功的命令</strong>
+            只有明确收到 4020 的命令才进入重放队列。phase2 前已经获得正常响应的命令仍然只执行一次。
+          </div>
+        </section>
+
+        <section id="final-ack">
+          <h2>12. FINAL_ACK 责任边界</h2>
+          <pre><code>source drain/build/send
+        |
+        v
+target 完整接收并保存当前进程内 epoch
+        |
+        v
+target 返回 FINAL_ACK
+        |
+        v
+source 收到 FINAL_ACK
+======== transfer ownership boundary ========
+source: 结束 sender/session/epoch 上下文，进入自身后续流程
+target: 独立 prewarm，等待 HA promotion 或 TTL 自动销毁</code></pre>
+
+          <div class="grid-2">
+            <article class="panel green">
+              <h3>FINAL_ACK 表达</h3>
+              <ul>
+                <li>target 当前 mysqld 进程已完整接收 epoch。</li>
+                <li>格式、完整性和当前进程内保存已成功。</li>
+                <li>transfer ownership 已交给 target。</li>
+              </ul>
+            </article>
+            <article class="panel red">
+              <h3>FINAL_ACK 不表达</h3>
+              <ul>
+                <li>target 已 READY 或已完成 prewarm。</li>
+                <li>事务已经 attach 到 Ty。</li>
+                <li>HA authority/write-enable 已满足。</li>
+                <li>receiver crash 后仍可恢复 epoch。</li>
+              </ul>
+            </article>
+          </div>
+
+          <p>
+            source 收到 FINAL_ACK 后不再查询 READY、不触发 promotion、不等待 target 清理，也不接收 target 后续状态。
+            target 的 prewarm、promotion、abandon 和 TTL 全部由 target 本地状态与 HA 管控。
+          </p>
+
+          <div class="boundary">
+            <strong>4020 响应 cutoff/fence 必须位于 FINAL_ACK 之前</strong>
+            source 在所有目标 Tx 已进入 <code>PRESERVED_DRAINED</code> 后，先关闭新的命令读取准入，
+            等待已经由自己读取的业务命令完成正常响应或 4020 响应，然后才发送
+            <code>COMMIT_EPOCH</code> 并等待 FINAL_ACK。这样 response fence 失败时 receiver epoch 尚未提交，
+            source 仍可走现有 abort/restore；FINAL_ACK 一旦生效，两端继续彻底解耦。
+          </div>
+        </section>
+
+        <section id="exactly-once">
+          <h2>13. 请求结果安全</h2>
+          <p>
+            对接目标不是实现通用的分布式 exactly-once，而是利用 source 的明确结果边界，避免 Preserve 场景下的重复执行。
+          </p>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>代理观察</th><th>请求执行状态</th><th>处理</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>完整正常 OK/结果集/业务错误</td>
+                  <td>source 已完成该命令</td>
+                  <td>把结果返回客户端，不重放。</td>
+                </tr>
+                <tr>
+                  <td>完整 ERR 4020</td>
+                  <td>该协议命令未执行；事务已 preserve</td>
+                  <td>挂起；终局节点上重放一次。</td>
+                </tr>
+                <tr>
+                  <td>其他完整 MySQL 错误</td>
+                  <td>按错误本身定义</td>
+                  <td>正常返回或交由 HA 控制面处理，不进入 4020 重放路径。</td>
+                </tr>
+                <tr>
+                  <td>无完整响应即断开</td>
+                  <td>不确定</td>
+                  <td>进入 <code>AMBIGUOUS_DISCONNECT</code>，不得自动重放。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>13.1 为什么 4020 可以重放</h3>
+          <p>
+            早期 gate 位于 <code>get_command()</code> 成功之后、<code>dispatch_command()</code> 之前。
+            <code>preserved_trx_reject_if_batch_session_drained()</code> 设置错误后，
+            <code>do_command()</code> 直接调用 <code>send_statement_status()</code> 并返回；
+            SQL parser、handler 和 InnoDB 执行路径都没有被调用。
+          </p>
+
+          <h3>13.2 无法消除的网络事实</h3>
+          <p>
+            mysqld 能确认完整错误包已交给本地网络层，却不能在不增加代理应用级 ACK 的情况下证明代理业务线程已经消费该包。
+            本设计不增加新的代理 ACK 协议。计划内切换中，代理以自己实际读取到的完整 MySQL packet 为准；
+            网络断开仍按结果不确定处理。
+          </p>
+        </section>
+
+        <section id="gap">
+          <h2>14. 当前响应屏障缺口</h2>
+          <p class="section-lead">
+            当前代码已经能返回 4020，但尚不能严格证明“DRAIN 完成时，所有已被 source 读取的业务命令都已经完成协议响应”。
+          </p>
+
+          <h3>14.1 已有的单事务 token delivery 机制不能直接复用</h3>
+          <p>
+            <code>preserved_trx_note_statement_response()</code> 位于
+            <code>sql/preserve_trx.cc:8418</code>，当前服务的是单会话 pending token delivery 与延迟 shutdown signal。
+            通用 dispatch 尾部在 <code>sql/sql_parse.cc:2227-2228</code> 调用它。
+          </p>
+          <p>
+            但 drained session 的最早 4020 路径位于
+            <code>sql/sql_parse.cc:1266-1325</code>。它在读取命令后直接
+            <code>send_statement_status()</code>，没有经过
+            <code>preserved_trx_note_statement_response()</code>。
+            该机制也没有按 batch generation 统计每个 Tx 的 accepted/completed command。
+          </p>
+
+          <h3>14.2 当前竞态</h3>
+          <pre><code>Tx 已 PRESERVED_DRAINED
+Proxy 写入一个新命令
+        |
+        +-- source 已 get_command()
+        |      -> 应返回 4020
+        |
+drain owner 直接发送 COMMIT_EPOCH
+        |
+        +-- FINAL_ACK -> teardown -> finish_with_shutdown()
+                               |
+                               +-- close_connections / socket close
+
+缺少条件：
+    在 COMMIT_EPOCH 前关闭新的命令读取准入，
+    并确认该已读取命令的 4020 packet 已完成本地发送。</code></pre>
+
+          <div class="risk">
+            <strong>影响</strong>
+            代理可能没有收到 4020，只看到连接断开，于是不能安全判断该请求是否执行。
+            这不破坏事务 preserve 正确性，但会破坏“完全依赖 4020 挂起命令”的稳定对接合同。
+            把 fence 放在 FINAL_ACK 后只能发现问题，无法再安全 abort 未提交 epoch，因此不是推荐落点。
+          </div>
+
+          <h3>14.3 必须精确定义“已接受命令”</h3>
+          <p>
+            本文将“source 已接受命令”定义为 <code>get_command()</code> 成功读取了一个完整 classic-protocol command packet。
+            仅停留在 TCP receive buffer、尚未被 mysqld 读取的字节不属于内核可观测的 accepted command。
+          </p>
+          <p>
+            因此 response fence 能保证 source 已读取请求的响应完成；它不能证明网络中尚未读取的请求一定得到 4020。
+            代理必须遵守每 backend connection 只有一个 response-bearing outstanding request；
+            long-data 只能与 execute 组成连续 compound request。收到 4020 后停止发送，
+            才能把不可观测窗口限制为正常的网络断开歧义，而不是制造协议流水线竞态。
+          </p>
+        </section>
+
+        <section id="minimal-kernel">
+          <h2>15. 最小内核补强</h2>
+          <p class="section-lead">
+            补强只解决 source 已读取命令的响应完成问题，不改 transfer wire、不改 receiver、不改 InnoDB，也不新增 HA 通知协议。
+          </p>
+
+          <h3>15.1 每个 Tx、每个 batch generation 的两个序号和一个 cutoff</h3>
+          <div class="decision">
+            <b><code>accepted_seq</code></b>
+            <div><code>get_command()</code> 成功后递增，表示 source 已读取完整命令包。</div>
+          </div>
+          <div class="decision">
+            <b><code>response_seq</code></b>
+            <div>该命令的完整 OK/result/error 已完成本地协议发送后推进到对应序号。</div>
+          </div>
+          <div class="decision">
+            <b><code>read_cutoff_closed</code></b>
+            <div>drain owner 捕获 fence 时置位；此后 Tx 不再从 socket 读取新的 command packet，直到 RESET 重新开放或连接关闭。</div>
+          </div>
+          <div class="decision">
+            <b><code>ps_compound_pending</code></b>
+            <div>drained 后已经消费 long-data 分片、但紧随的 execute 尚未读取；cutoff 必须等待其闭合或按 phase2 deadline 失败。</div>
+          </div>
+
+          <p>
+            字段只在 <code>preserve_trx_enable=ON</code> 且 THD 属于当前 batch generation 时使用。
+            普通 MySQL 路径仅保留一个极薄的条件分支。
+          </p>
+
+          <h3>15.2 Fence 流程</h3>
+          <ol>
+            <li>Tx 每次成功读取 response-bearing command 后记录本 generation 的 <code>accepted_seq</code>。</li>
+            <li>正常 dispatch 响应和早期 4020 响应都记录 <code>response_seq</code>。</li>
+            <li>所有目标事务 preserve 完成后，drain owner 在每个 Tx 上原子置位 <code>read_cutoff_closed</code>，并捕获当前 <code>accepted_seq</code> 作为 fence。</li>
+            <li>若存在 <code>ps_compound_pending</code>，先允许该连接读取紧随的 execute 并返回 4020；不得接受其他 response-bearing command。</li>
+            <li>cutoff 关闭后，命令线程停在读包前，不发送 unsolicited error，也不接受新的 command packet。</li>
+            <li>drain owner 等待每个 Tx 的 <code>response_seq &gt;= fence_seq</code>。</li>
+            <li>等待受 phase2 剩余 deadline 约束，不允许无限等待。</li>
+            <li>满足后才调用 <code>commit_epoch()</code>；失败时 abort 尚未提交的 receiver epoch，并复用现有 source restore 路径。</li>
+            <li>RESET 赢时清除 cutoff，socket 中尚未读取的命令可在原 Tx 恢复后正常执行。</li>
+          </ol>
+
+          <h3>15.3 线性化与锁</h3>
+          <ul>
+            <li>序号和 generation 在 <code>THD::LOCK_thd_data</code> 下读写，或使用同等强度的原子合同。</li>
+            <li>等待时不得持有 <code>LOCK_thd_data</code>、manager mutex、transfer session 锁或 InnoDB 锁。</li>
+            <li>旧 generation 的迟到 response 不能推进新 generation 的 fence。</li>
+            <li>普通无响应协议命令不占 response sequence；<code>COM_STMT_SEND_LONG_DATA</code> 仅建立一个 deadline-bounded compound obligation。</li>
+            <li>drained 状态下的 long-data 不进入 backend PS buffer，也不发送 ERR；代理保留的分片由紧随的 execute 统一获得 4020 边界。</li>
+            <li>compound 在 deadline 内没有 execute、连接断开或插入了其他命令时，response fence 失败并在 COMMIT_EPOCH 前 abort。</li>
+            <li>正常响应发送失败时，把 fence 标记为 transport failure，而不是假装 response complete。</li>
+          </ul>
+
+          <h3>15.4 为什么不需要更复杂的方案</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>候选设计</th><th>裁定</th><th>原因</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Proxy 给每个 4020 再发应用级 ACK</td>
+                  <td class="no">不采用</td>
+                  <td>需要新协议、双向状态和更多故障语义；当前计划内切换不需要。</td>
+                </tr>
+                <tr>
+                  <td>source 等每个连接至少收到一次新命令并返回 4020</td>
+                  <td class="no">不采用</td>
+                  <td>空闲连接可能永远不发命令，会阻塞 DRAIN。</td>
+                </tr>
+                <tr>
+                  <td>把 proxy 请求队列写入 transfer artifact</td>
+                  <td class="no">不采用</td>
+                  <td>代理协议状态不属于事务内核对象。</td>
+                </tr>
+                <tr>
+                  <td>accepted/response sequence fence</td>
+                  <td class="yes">采用</td>
+                  <td>只覆盖 source 已读取请求，修改面小，语义可测试。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="boundary">
+            <strong>该补强不改变 FINAL_ACK 后两端解耦</strong>
+            fence 在 COMMIT_EPOCH 前只观察 source 自己的 Tx 命令响应，不等待 READY，不发送 target 控制命令。
+            FINAL_ACK 后 source 不再执行任何 response-fence 协商。
+          </div>
+        </section>
+
+        <section id="interfaces">
+          <h2>16. 三方接口合同</h2>
+          <h3>16.1 mysqld → Proxy：MySQL 错误包</h3>
+          <pre><code>ERR packet:
+  error_code = 4020
+  sqlstate   = HY000
+
+meaning:
+  this exact command packet was consumed but not executed
+  source transaction has entered preserved/drained ownership
+
+proxy action:
+  suppress client-visible error
+  store exact request
+  stop source forwarding
+  wait for HA terminal event</code></pre>
+
+          <h3>16.2 HA → Proxy：三个终局结果</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>事件</th><th>必要字段</th><th>代理动作</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>PRESERVE_PROMOTION_ATTACHED</code></td>
+                  <td>logical connection id、Tx、Ty、promotion attempt/generation、target endpoint</td>
+                  <td>校验当前挂起 generation，切到 Ty，重放 4020 请求。</td>
+                </tr>
+                <tr>
+                  <td><code>PRESERVE_RESET_SUCCEEDED</code></td>
+                  <td>logical connection id、Tx、drain attempt/generation、source endpoint</td>
+                  <td>校验当前挂起 generation，回到 Tx，重放 4020 请求。</td>
+                </tr>
+                <tr>
+                  <td><code>PRESERVE_CONTINUATION_ABORTED</code></td>
+                  <td>logical connection id、Tx、attempt/generation、稳定 reason code</td>
+                  <td>不重放，结束该逻辑事务/连接；HA 可继续普通升主。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>
+            事件名可按 HA 项目现有接口命名调整，关键是携带 attempt/generation，防止旧 promotion/reset 结果唤醒新一轮挂起。
+            不需要 READY 进度事件驱动代理；代理只关心最终能在哪个 backend 上继续。
+          </p>
+
+          <h3>16.3 HA → mysqld：目标端内部 promotion 调用</h3>
+          <pre><code>promotion attempt
+  -> validate candidate/process generation
+  -> validate READY/apply/fence
+  -> adopt preserved token Tx
+  -> resolve peerid(Tx, Ty)
+  -> pass Ty to kernel and protect pristine target THD
+  -> resume adopted transaction on Ty
+  -> return per-token attach result
+  -> HA publishes terminal event to Proxy</code></pre>
+
+          <h3>16.4 Proxy 的伪代码</h3>
+          <pre><code>on_source_response(request, response):
+  if response.is_complete_mysql_error(4020):
+    assert no_other_backend_request_inflight()
+    suspended_request = request
+    state = WAIT_HA_TERMINAL
+    return  // do not expose 4020 to client
+
+  if response.is_complete():
+    deliver_to_client(response)
+    state = ACTIVE_SOURCE
+    return
+
+  state = AMBIGUOUS_DISCONNECT
+  notify_ha_transport_ambiguity()
+
+on_ha_promotion_attached(event):
+  require state == WAIT_HA_TERMINAL
+  require event.tx == source_connection_id
+  require event.generation == suspended_generation
+  bind_target_backend(event.ty, event.endpoint)
+  replay_on_target(suspended_request)
+  drain_queued_requests_in_order()
+
+on_ha_reset_succeeded(event):
+  require state == WAIT_HA_TERMINAL
+  require event.tx == source_connection_id
+  require event.generation == suspended_generation
+  replay_on_source(suspended_request)
+  drain_queued_requests_in_order()
+
+on_ha_continuation_aborted(event):
+  require state == WAIT_HA_TERMINAL
+  require event.tx == source_connection_id
+  require event.generation == suspended_generation
+  state = TERMINAL_FAILED
+  fail_logical_transaction_without_replay(event.reason)</code></pre>
+        </section>
+
+        <section id="tests">
+          <h2>17. 测试与验收</h2>
+          <h3>17.1 当前已有证据</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>测试</th><th>已证明</th><th>未证明</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>batch_drain_drained_session_blocked.test</code></td>
+                  <td>SELECT、SET、SHOW、COMMIT、ROLLBACK、UPDATE、PREPARE、EXECUTE、locking read、RESUME 均返回 4020。</td>
+                  <td>代理实际挂起和跨节点重放。</td>
+                </tr>
+                <tr>
+                  <td><code>batch_drain_drained_session_binary_ps_blocked.test</code></td>
+                  <td>binary PS execute 与 ping 得到数值错误码 4020。</td>
+                  <td>Ty reprepare、stmt-id remap 和 long-data 重放。</td>
+                </tr>
+                <tr>
+                  <td><code>batch_drain_target_command_blocked.test</code></td>
+                  <td>quiesce 中下发的命令等待，并在 preserved 后返回 4020。</td>
+                  <td>DRAIN owner 等待 4020 response fence。</td>
+                </tr>
+                <tr>
+                  <td><code>batch_drain_packet_before_dispatch.test</code></td>
+                  <td>关闭边界前已读取的 inflight 命令允许完成。</td>
+                  <td>响应包丢失时的代理异常处理。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>17.2 response fence 必加 MTR</h3>
+          <ul>
+            <li>在 Tx 读取命令后、早期 4020 <code>send_statement_status()</code> 前暂停；证明 COMMIT_EPOCH 尚未发送。</li>
+            <li>释放发送后，证明代理收到完整 4020，随后 source 才发送 COMMIT_EPOCH。</li>
+            <li>正常 inflight 命令响应前暂停；证明 fence 同样等待正常结果。</li>
+            <li>多 Tx 并行：一个响应慢时，全 batch fence 不提前完成；其余 Tx 不被串行执行。</li>
+            <li>旧 generation 迟到 response 不满足新 generation fence。</li>
+            <li>发送失败：DRAIN 不宣称成功完成 response contract。</li>
+            <li>cutoff 关闭后不再读取新命令；RESET 清除 cutoff 后，socket 中未读取命令可正常继续。</li>
+            <li><code>COM_STMT_SEND_LONG_DATA/CLOSE</code> drained 路径不产生错位 ERR packet；long-data compound 的下一条 execute 返回 4020。</li>
+            <li>long-data 在 preserve 边界前后各接收一部分；RESET 后先 STMT_RESET，再完整重发，最终参数内容无重复。</li>
+            <li><code>preserve_trx_enable=OFF</code> 时命令路径和 THD 行为不变。</li>
+          </ul>
+
+          <h3>17.3 代理与 HA 联调场景</h3>
+          <ol>
+            <li>文本 UPDATE 收到 4020，promotion attach 后在 Ty 执行一次，最终只产生一次业务效果。</li>
+            <li>文本 UPDATE 收到 4020，RESET 后在 Tx 执行一次。</li>
+            <li>已 prepare 的 binary execute 收到 4020，Ty 上 reprepare/remap 后成功。</li>
+            <li>带 long-data 的 execute 收到 4020，Ty 上按原分片顺序重发。</li>
+            <li>收到 4013 时不进入挂起。</li>
+            <li>网络断开但无 4020 时不自动重放。</li>
+            <li>旧 HA attempt 的 attach/reset 回调不能唤醒新 generation。</li>
+            <li>Preserve promotion 失败时 HA 继续普通升主，代理按既定异常策略结束挂起，不阻塞集群开写。</li>
+            <li>continuation-aborted 终局不重放触发 4020 的请求，也不让连接永久停留在 WAIT_HA_TERMINAL。</li>
+          </ol>
+
+          <h3>17.4 验收断言</h3>
+          <div class="grid-3">
+            <article class="panel green">
+              <span class="metric">0</span>
+              <span class="metric-label">收到 4020 的请求在 source 上实际执行次数</span>
+            </article>
+            <article class="panel blue">
+              <span class="metric">1</span>
+              <span class="metric-label">终局 backend 上该挂起请求的成功重放次数</span>
+            </article>
+            <article class="panel amber">
+              <span class="metric">0</span>
+              <span class="metric-label">无 4020 证据时的自动盲重放次数</span>
+            </article>
+          </div>
+        </section>
+
+        <section id="files">
+          <h2>18. 代码地图与检查表</h2>
+          <h3>18.1 当前相关文件</h3>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>文件</th><th>当前职责</th><th>对接关注点</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><code>sql/sql_class.h</code></td>
+                  <td>THD batch state。</td>
+                  <td><code>PRESERVED_DRAINED</code> 语义；未来最小 response sequence 与 read cutoff 字段。</td>
+                </tr>
+                <tr>
+                  <td><code>sql/preserve_trx.cc</code></td>
+                  <td>drain、命令 gate、token、FINAL_ACK、promotion attach core。</td>
+                  <td>response fence capture/wait 应集中在此，不散入 transfer receiver。</td>
+                </tr>
+                <tr>
+                  <td><code>sql/preserve_trx.h</code></td>
+                  <td>peer THD handle 和 promotion resume API。</td>
+                  <td>未来 HA 内部接口边界。</td>
+                </tr>
+                <tr>
+                  <td><code>sql/sql_parse.cc</code></td>
+                  <td>classic command read、dispatch 和 response 发送。</td>
+                  <td>accepted command 与早期 4020 response completion 的薄 hook。</td>
+                </tr>
+                <tr>
+                  <td><code>sql/preserve_trx_transfer.cc/.h</code></td>
+                  <td>source/receiver transfer 协议。</td>
+                  <td>FINAL_ACK 边界保持不变；response fence 不应侵入 wire/receiver。</td>
+                </tr>
+                <tr>
+                  <td><code>sql/preserve_trx_promotion.cc/.h</code></td>
+                  <td>receiver prewarm/promotion gate 预埋。</td>
+                  <td>未来 HA authority/provider 接入，不接受 source 控制。</td>
+                </tr>
+                <tr>
+                  <td><code>share/messages_to_clients.txt</code></td>
+                  <td>4020 错误定义。</td>
+                  <td>代理按数值错误码判断，不按英文文本匹配。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>18.2 最小实现修改面</h3>
+          <ul>
+            <li><code>sql/sql_class.h</code>：增加 generation-scoped accepted/response 计数与 read cutoff。</li>
+            <li><code>sql/preserve_trx.h/.cc</code>：增加薄的 command accepted、response completed、cutoff 和 batch fence wait API。</li>
+            <li><code>sql/sql_parse.cc</code>：在 <code>get_command()</code> 成功和两类 response 结束点调用薄 hook，并正确处理无响应 protocol command。</li>
+            <li><code>mysql-test/suite/preserve_trx/</code>：增加 response fence 行为与 OFF-path 测试。</li>
+          </ul>
+
+          <div class="success">
+            <strong>明确不需要修改</strong>
+            不修改 InnoDB trx/undo/lock 热路径，不修改 bundle、carrier、transfer wire、receiver artifact，
+            不新增错误码，不把 peerid 或代理 PS catalog 存入 mysqld，也不实现真实 HA。
+          </div>
+
+          <h3>18.3 代理项目对接检查表</h3>
+          <ul>
+            <li>按数值 <code>4020</code> 识别，不按错误文本。</li>
+            <li>每 backend connection 同时只允许一个 response-bearing outstanding request。</li>
+            <li>long-data 与 execute 作为一个连续 compound request，代理全量缓存分片。</li>
+            <li>收到 4020 后停止 source 转发，保存原请求并保持队列顺序。</li>
+            <li>正常响应永不重放；无完整响应永不盲目重放。</li>
+            <li>维护 client stmt id 与 Tx/Ty backend stmt id 双映射。</li>
+            <li>缓存 long-data 直到 execute 结果确定。</li>
+            <li>RESET 重放 long-data execute 前，先对 source statement 执行 <code>COM_STMT_RESET</code>。</li>
+            <li>HA 终局事件携带 Tx 和 generation；promotion-attached 额外携带 Ty。</li>
+            <li>HA 必须为每个挂起连接给出 attached、reset-succeeded 或 continuation-aborted 三选一终局。</li>
+            <li>Ty attach 成功前不得发送挂起业务请求。</li>
+            <li>RESET 成功后先重放 4020 请求，再开放后续请求。</li>
+            <li>Preserve 失败不阻塞普通升主。</li>
+          </ul>
+
+          <div class="success">
+            <strong>最终裁定</strong>
+            这套对接不需要把系统复杂化。mysqld 提供事务 preserve/attach 和明确的 4020 未执行边界；
+            Proxy 保存协议请求并负责重放；HA 只发布 promotion attach 成功或 RESET 成功的终局。
+            当前 source 侧需要补齐两个相邻合同：在 COMMIT_EPOCH 前关闭命令读取并等待已接受命令的正常响应或 4020；
+            对 <code>COM_STMT_SEND_LONG_DATA/CLOSE</code> 保持 classic protocol 的无响应语义。
+          </div>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <p>
+          本文基于 MySQL 8.0.22 Preserve/Resume 工作树 HEAD
+          <span class="mono">302ae0940a58040ef35c0a0d0f6a289eb1708cc7</span> 的源码与现有 MTR 编写。
+          文中“当前代码事实”已经落地；“response fence”和真实 physical HA/peerid provider 属于待实现对接项。
+        </p>
+      </footer>
+    </div>
+  </div>
+
+  <script>
+    (() => {
+      const links = Array.from(document.querySelectorAll('.toc a'));
+      const sections = links
+        .map(link => document.querySelector(link.getAttribute('href')))
+        .filter(Boolean);
+      if (!('IntersectionObserver' in window)) return;
+      const observer = new IntersectionObserver(entries => {
+        const visible = entries
+          .filter(entry => entry.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)[0];
+        if (!visible) return;
+        links.forEach(link => {
+          link.classList.toggle('active', link.getAttribute('href') === `#${visible.target.id}`);
+        });
+      }, { rootMargin: '-12% 0px -75% 0px', threshold: [0, 1] });
+      sections.forEach(section => observer.observe(section));
+    })();
+  </script>
+</body>
+</html>

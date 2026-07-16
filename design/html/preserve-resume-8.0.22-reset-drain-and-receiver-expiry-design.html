@@ -1,0 +1,1802 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Preserve/Resume 8.0.22：RESET DRAIN 与 Receiver 自动失效设计</title>
+  <style>
+    :root {
+      --ink: #18232c;
+      --muted: #5d6972;
+      --line: #d5dde2;
+      --paper: #ffffff;
+      --canvas: #f3f5f6;
+      --soft: #edf2f3;
+      --green: #087b70;
+      --green-soft: #e4f3ef;
+      --blue: #315f7c;
+      --blue-soft: #e8f0f5;
+      --amber: #976000;
+      --amber-soft: #fff2d5;
+      --red: #973d38;
+      --red-soft: #faeae8;
+      --ok: #3c7451;
+      --ok-soft: #e8f3eb;
+      --code: #20272d;
+      --radius: 6px;
+      --shadow: 0 1px 2px rgba(24, 35, 44, .05), 0 7px 22px rgba(24, 35, 44, .05);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--canvas);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", Arial, sans-serif;
+      font-size: 16px;
+      line-height: 1.72;
+      letter-spacing: 0;
+    }
+    a { color: var(--green); text-underline-offset: 3px; }
+    a:hover { color: #055f58; }
+    code, .mono {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: .92em;
+    }
+    code {
+      padding: .12em .34em;
+      color: #263942;
+      background: #edf1f3;
+      border: 1px solid #dce4e7;
+      border-radius: 4px;
+      overflow-wrap: anywhere;
+    }
+    pre {
+      margin: 15px 0;
+      padding: 16px 18px;
+      overflow: auto;
+      color: #e8edef;
+      background: var(--code);
+      border-radius: var(--radius);
+      font-size: 13px;
+      line-height: 1.62;
+    }
+    pre code { padding: 0; color: inherit; background: none; border: 0; }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(252px, 292px) minmax(0, 1fr);
+      max-width: 1580px;
+      min-height: 100vh;
+      margin: 0 auto;
+      background: var(--paper);
+      box-shadow: 0 0 0 1px rgba(24, 35, 44, .04);
+    }
+    .sidebar {
+      position: sticky;
+      top: 0;
+      align-self: start;
+      height: 100vh;
+      overflow-y: auto;
+      padding: 26px 22px 30px;
+      background: #f8f9fa;
+      border-right: 1px solid var(--line);
+    }
+    .brand {
+      margin-bottom: 21px;
+      padding-bottom: 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand strong { display: block; margin-bottom: 5px; font-size: 17px; line-height: 1.38; }
+    .brand span { color: var(--muted); font-size: 12px; }
+    .toc-title {
+      margin: 0 0 9px;
+      color: #76828b;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .toc { margin: 0; padding: 0; list-style: none; }
+    .toc a {
+      display: block;
+      margin: 1px 0;
+      padding: 6px 9px;
+      color: #43515b;
+      border-left: 2px solid transparent;
+      text-decoration: none;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .toc a:hover { color: var(--ink); background: var(--soft); }
+    .toc a.active {
+      color: var(--green);
+      background: var(--green-soft);
+      border-left-color: var(--green);
+      font-weight: 650;
+    }
+    .content { min-width: 0; padding: 0 5vw 90px; }
+    .hero {
+      margin: 0 -5vw;
+      padding: 54px 5vw 44px;
+      color: #fff;
+      background: #18363b;
+      border-bottom: 6px solid #d2a140;
+    }
+    .eyebrow { margin: 0 0 10px; color: #9bd7cf; font-size: 13px; font-weight: 700; }
+    h1 { max-width: 1080px; margin: 0; font-size: 48px; line-height: 1.16; letter-spacing: 0; }
+    .hero .lead { max-width: 1040px; margin: 21px 0 0; color: #dce9ea; font-size: 18px; }
+    .hero .meta { margin-top: 22px; color: #bad8d7; font-size: 12px; }
+    .summary-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 1px;
+      margin: 0 -5vw 30px;
+      background: var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+    .summary-strip > div { padding: 17px 20px; background: #fbfcfc; }
+    .summary-strip b { display: block; margin-bottom: 3px; font-size: 13px; }
+    .summary-strip span { color: var(--muted); font-size: 12px; }
+    main section { scroll-margin-top: 26px; }
+    h2 { margin: 64px 0 18px; padding-top: 4px; font-size: 28px; line-height: 1.3; letter-spacing: 0; }
+    h2::before { content: ""; display: block; width: 46px; height: 4px; margin-bottom: 13px; background: var(--green); }
+    h3 { margin: 34px 0 11px; font-size: 20px; line-height: 1.4; }
+    h4 { margin: 24px 0 8px; font-size: 16px; }
+    p { max-width: 1080px; margin: 12px 0; }
+    ul, ol { max-width: 1080px; margin: 10px 0 16px 23px; padding: 0; }
+    li { margin: 6px 0; }
+    .section-lead { color: #3d4b55; font-size: 17px; }
+    .note, .boundary, .risk, .success {
+      max-width: 1090px;
+      margin: 18px 0;
+      padding: 15px 18px;
+      border-left: 4px solid var(--green);
+      background: var(--green-soft);
+    }
+    .boundary { border-left-color: var(--amber); background: var(--amber-soft); }
+    .risk { border-left-color: var(--red); background: var(--red-soft); }
+    .success { border-left-color: var(--ok); background: var(--ok-soft); }
+    .note strong, .boundary strong, .risk strong, .success strong { display: block; margin-bottom: 4px; }
+    .grid-2, .grid-3 { display: grid; gap: 14px; margin: 18px 0; }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .panel {
+      min-width: 0;
+      padding: 17px 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fff;
+      box-shadow: var(--shadow);
+    }
+    .panel h3, .panel h4 { margin-top: 0; }
+    .panel p:last-child, .panel ul:last-child { margin-bottom: 0; }
+    .panel.green { border-top: 4px solid var(--green); }
+    .panel.blue { border-top: 4px solid var(--blue); }
+    .panel.amber { border-top: 4px solid var(--amber); }
+    .panel.red { border-top: 4px solid var(--red); }
+    .metric { display: block; margin-bottom: 3px; color: var(--green); font-size: 25px; font-weight: 750; }
+    .metric-label { color: var(--muted); font-size: 12px; }
+    .table-wrap { max-width: 1160px; margin: 17px 0 24px; overflow-x: auto; border: 1px solid var(--line); }
+    table { width: 100%; border-collapse: collapse; background: #fff; font-size: 14px; }
+    th, td { padding: 11px 13px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left; }
+    th { color: #3f4e58; background: #f2f5f6; font-size: 12px; font-weight: 700; }
+    tr:last-child td { border-bottom: 0; }
+    .yes { color: var(--ok); font-weight: 700; }
+    .no { color: var(--red); font-weight: 700; }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(128px, 1fr));
+      gap: 24px;
+      max-width: 1160px;
+      margin: 20px 0 24px;
+      overflow-x: auto;
+    }
+    .flow .step {
+      position: relative;
+      min-width: 128px;
+      min-height: 102px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-top: 4px solid var(--green);
+      border-radius: var(--radius);
+      background: #fff;
+    }
+    .flow .step::after {
+      content: "→";
+      position: absolute;
+      top: 34px;
+      right: -21px;
+      color: #8d989f;
+      font-size: 19px;
+    }
+    .flow .step:last-child::after { content: ""; }
+    .flow .step b { display: block; margin-bottom: 5px; font-size: 13px; }
+    .flow .step span { color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .state-line {
+      max-width: 1120px;
+      margin: 17px 0;
+      padding: 15px 17px;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--blue);
+      background: var(--blue-soft);
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 13px;
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+    .decision {
+      display: grid;
+      grid-template-columns: 150px minmax(0, 1fr);
+      gap: 0;
+      max-width: 1110px;
+      margin: 12px 0;
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+    .decision b { padding: 12px 14px; background: #edf3f3; border-right: 1px solid var(--line); }
+    .decision div { padding: 12px 15px; }
+    .small { color: var(--muted); font-size: 12px; }
+    .footer { margin-top: 72px; padding-top: 22px; color: var(--muted); border-top: 1px solid var(--line); font-size: 12px; }
+
+    @media (max-width: 1050px) {
+      .layout { display: block; }
+      .sidebar { position: static; width: auto; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+      .toc { columns: 2; }
+      .content { padding: 0 5vw 70px; }
+      h1 { font-size: 40px; }
+      .summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid-3 { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 700px) {
+      body { font-size: 15px; }
+      .sidebar { padding: 20px 16px; }
+      .toc { columns: 1; }
+      .hero { padding-top: 38px; }
+      h1 { font-size: 31px; }
+      .summary-strip, .grid-2 { grid-template-columns: 1fr; }
+      .decision { grid-template-columns: 1fr; }
+      .decision b { border-right: 0; border-bottom: 1px solid var(--line); }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <strong>RESET DRAIN / Receiver TTL</strong>
+        <span>MySQL 8.0.22 Preserve/Resume 详细设计</span>
+      </div>
+      <p class="toc-title">目录</p>
+      <nav>
+        <ol class="toc">
+          <li><a href="#conclusion">1. 设计结论</a></li>
+          <li><a href="#background">2. 背景与 HA 关系</a></li>
+          <li><a href="#boundary">3. 范围与非目标</a></li>
+          <li><a href="#facts">4. 当前代码事实</a></li>
+          <li><a href="#sql">5. SQL 与外部合同</a></li>
+          <li><a href="#source-state">6. Source 状态与线性化</a></li>
+          <li><a href="#source-flow">7. Phase 1 / Phase 2 回撤</a></li>
+          <li><a href="#kernel">8. 内核对象恢复</a></li>
+          <li><a href="#artifacts">9. Artifact 失效与清理</a></li>
+          <li><a href="#transfer-race">10. FINAL_ACK 与网络竞态</a></li>
+          <li><a href="#receiver">11. Receiver 两段 TTL</a></li>
+          <li><a href="#destroy">12. Receiver 统一销毁接口</a></li>
+          <li><a href="#promotion">13. Promotion 可选语义</a></li>
+          <li><a href="#concurrency">14. 并发与锁规则</a></li>
+          <li><a href="#performance">15. 性能目标与成本模型</a></li>
+          <li><a href="#parameters">16. 参数与观测</a></li>
+          <li><a href="#files">17. 文件与工作量</a></li>
+          <li><a href="#minimality">18. 防止过度设计</a></li>
+          <li><a href="#tests">19. 测试与验收</a></li>
+          <li><a href="#delivery">20. 推荐落地顺序</a></li>
+          <li><a href="#matrix">21. 设计闭环矩阵</a></li>
+        </ol>
+      </nav>
+    </aside>
+
+    <div class="content">
+      <header class="hero">
+        <p class="eyebrow">Preserve/Resume 8.0.22 · HA 内核能力预埋</p>
+        <h1>RESET DRAIN 与 Receiver 自动失效设计</h1>
+        <p class="lead">
+          目标只有两个：HA 取消切换时，source 快速恢复为正常主库；target 已接收但未被升主采用的
+          Preserve 内核对象，在当前 mysqld 进程内按两段超时自动销毁。RESET 同步路径只负责恢复连接与事务可执行性，
+          其余 worker 退出和物理清理由后台收敛；两端在 FINAL_ACK 之后不再互相控制。
+        </p>
+        <p class="meta">
+          代码基线：<span class="mono">302ae0940a58040ef35c0a0d0f6a289eb1708cc7</span>
+          · 生成日期：2026-07-16 · 本文是设计，不代表源码已经实现
+        </p>
+      </header>
+
+      <div class="summary-strip">
+        <div><b>Source 命令</b><span><code>RESET DRAIN;</code></span></div>
+        <div><b>Receiver TTL</b><span>ACK→READY 10s；READY→HA lease 30s</span></div>
+        <div><b>成功定义</b><span>全部原连接可继续 SQL；随后立即返回 OK</span></div>
+        <div><b>修改原则</b><span>复用现有逆路径，不改 InnoDB 热路径</span></div>
+      </div>
+
+      <main>
+        <section id="conclusion">
+          <h2>1. 设计结论</h2>
+          <p class="section-lead">
+            本设计不引入分布式回滚协议，也不让 source 管理 target 的后续生命周期。内核只提供 HA 需要的两个简单能力。
+          </p>
+          <div class="grid-2">
+            <article class="panel green">
+              <h3>Source：快速取消 DRAIN</h3>
+              <p>
+                HA 执行 <code>RESET DRAIN</code>。命令通过一个进程内 drain attempt 原子抢占取消权，立即停止新 phase2
+                工作和后续 COMMIT 发布；原 DRAIN owner 复用已有 reattach/activate 逆路径恢复原事务。RESET 等待全部受影响原连接
+                回到可执行状态并解除 generation-scoped 4020 read cutoff，但不等待 sender 临时资源、participant 或网络清理完成。
+              </p>
+            </article>
+            <article class="panel blue">
+              <h3>Target：自动失效 Preserve candidate</h3>
+              <p>
+                target 在 FINAL_ACK 后独立 prewarm。10 秒内未形成 epoch READY，或 READY 后 30 秒内未被 HA 取得
+                <code>ADOPT_LEASED</code>，现有 1 秒 reaper
+                调用统一 <code>destroy_epoch()</code> 逻辑失效并异步释放对象。HA 不主动调用销毁，source 也不回头干预。
+              </p>
+            </article>
+          </div>
+          <div class="success">
+            <strong>最重要的成功点</strong>
+            <code>RESET DRAIN</code> 返回 OK 表示 source 已经可以继续作为主库提供普通服务，并且本次 generation 的全部原连接
+            都已恢复为可运行状态：原 <code>trx_t</code> 已重新挂回原 THD、batch state 已清为 <code>NONE</code>、4020 read cutoff
+            已解除。达到该点后命令立即返回，不等待 worker join、participant teardown、sender 临时资源、文件删除或 target orphan
+            candidate 清理；这些动作只能在后台继续，且不得再改变连接的可运行状态。
+          </div>
+          <div class="state-line">RESET 同步屏障：RESET_WON → ALL_TRANSACTIONS_RUNNABLE → RESET OK</div>
+          <div class="state-line">异步尾部：WORKERS_QUIESCED → CLEANUP_DEBT_DRAINED；不参与 RESET response</div>
+          <div class="risk">
+            <strong>不可混淆</strong>
+            receiver 的 transfer 文件只是当前进程的容量扩展，不具备 crash durability。receiver 重启后 epoch/token 全部失效，
+            startup 删除残留，不 replay、不恢复 READY。local preserve→shutdown→startup resume 的 durable carrier 语义保持不变。
+          </div>
+        </section>
+
+        <section id="background">
+          <h2>2. 背景、场景与 HA 关系</h2>
+          <p>
+            该能力服务于计划内主备切换。HA 先在 source 执行 <code>DRAIN TRANSACTIONS PRESERVE</code>，source 将事务内核对象构建并
+            transfer 到 target。target 返回 FINAL_ACK 后，自行 prewarm，未来由 HA 在目标端调用 promotion 内部接口完成 adopt/resume。
+          </p>
+          <div class="flow">
+            <div class="step"><b>1. HA 发起 DRAIN</b><span>source phase1 预构建；phase2 阻断并 preserve</span></div>
+            <div class="step"><b>2. Target 接收</b><span>在线保存、校验、受限 prewarm</span></div>
+            <div class="step"><b>3. 本地竞态</b><span>source RESET 与 FINAL_ACK terminal CAS 二选一</span></div>
+            <div class="step"><b>4A. FINAL_ACK 赢</b><span>source shutdown；target 等 HA promotion 或 TTL</span></div>
+            <div class="step"><b>4B. RESET 赢</b><span>source 恢复；target orphan candidate 等 TTL 销毁</span></div>
+          </div>
+          <div class="boundary">
+            <strong>HA 与内核的职责切分</strong>
+            HA 决定“继续切换”还是“取消切换”，并调用 source 的 RESET 或 target 的 promotion 接口。内核不推断 HA 意图、不在两端
+            建立长期控制关系，也不实现 HA authority、write-enable、peerid Tx→Ty provider 或物理复制 apply fence。
+          </div>
+          <h3>取消切换的闭环</h3>
+          <ol>
+            <li>HA 在 source 调用 <code>RESET DRAIN</code>。</li>
+            <li>source 先开放未受影响的普通业务，并在 RESET 返回前把全部受影响原事务恢复到原 THD。</li>
+            <li>source 不向 target 等待 ABORT ACK，也不查询 READY。</li>
+            <li>target 若留下已接受 candidate，10s/30s TTL 自动销毁。</li>
+            <li>TTL 失效后未来 promotion 走普通升主，不因 Preserve candidate 缺失而阻塞。</li>
+          </ol>
+          <p class="small">
+            上述闭环只适用于 RESET 赢得 terminal CAS。若 source 已处理 FINAL_ACK 并进入
+            <code>SHUTDOWN_HANDOFF</code>，RESET 返回 TOO_LATE，source 继续 shutdown；HA 若随后放弃切换，应按既有主库拉起流程重启 source，
+            而不是要求 Preserve 内核逆转已完成的 shutdown handoff。
+          </p>
+        </section>
+
+        <section id="boundary">
+          <h2>3. 范围与非目标</h2>
+          <div class="grid-2">
+            <article class="panel green">
+              <h3>本轮设计与实现范围</h3>
+              <ul>
+                <li><code>RESET DRAIN</code> parser、权限、状态与错误合同。</li>
+                <li>phase1、phase1 closing、phase2、COMMIT/ACK 竞态回撤。</li>
+                <li>source 原事务的快速 reattach/activate、4020 cutoff 解除和业务唤醒。</li>
+                <li>首版仅支持 <code>STANDBY_TRANSFER_SAVE</code> drain attempt；source 非语义资源清理异步。</li>
+                <li>transfer source 的非阻塞取消与连接 I/O 唤醒。</li>
+                <li>receiver ACK→READY 与 READY→HA adopt lease 两段 TTL。</li>
+                <li>target-local epoch 统一销毁和 promotion <code>SKIPPED</code> 前置结果。</li>
+              </ul>
+            </article>
+            <article class="panel amber">
+              <h3>明确不实现</h3>
+              <ul>
+                <li>receiver crash/restart 后恢复 transfer epoch。</li>
+                <li>local carrier / 本地 shutdown-startup preserve 场景的 RESET；其 durability 与 recovery 语义保持不变。</li>
+                <li>source 通过 RPC 删除 target candidate。</li>
+                <li>新的分布式 ABORT、二阶段提交或反向 ACK。</li>
+                <li>新的 timer/cleanup 线程或通用任务框架。</li>
+                <li>真实物理复制升主 E2E、HA authority、开写 CAS。</li>
+                <li>peerid Tx→Ty attach、真实 production apply/fence provider。</li>
+                <li>为了 RESET 新增 InnoDB Undo/lock/MVCC 热路径 hook。</li>
+              </ul>
+            </article>
+          </div>
+          <p>
+            本轮可以做 standalone 双 mysqld transfer E2E 和本地 source RESET E2E；不能据此宣称真实物理备机升主已实现或达到某个 SLO。
+          </p>
+        </section>
+
+        <section id="facts">
+          <h2>4. 当前代码事实</h2>
+          <p class="section-lead">以下是设计必须顺着复用的现状，不重新发明一套 Preserve/Resume。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>代码事实</th><th>当前锚点</th><th>对本设计的含义</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>DRAIN 主流程、manager guard、phase1/phase2 和 shutdown 都在同一调用栈</td>
+                  <td><code>sql/preserve_trx.cc:14919</code></td>
+                  <td>RESET 不另起一套 drain engine；发布 attempt 并让原 DRAIN owner 执行逆路径。</td>
+                </tr>
+                <tr>
+                  <td>participant 已有 <code>abort_participants()</code> 与失败清理</td>
+                  <td><code>sql/preserve_trx_drain.h</code><br><code>sql/preserve_trx_drain.cc</code></td>
+                  <td>不扩 participant 接口；RESET 复用 abort。</td>
+                </tr>
+                <tr>
+                  <td>partial batch failure 已能把 preserved record 恢复到原 THD</td>
+                  <td><code>sql/preserve_trx.cc:10099</code><br><code>sql/preserve_trx.cc:10339</code></td>
+                  <td>语义逆操作已经存在；需要拆开“业务恢复”和“物理清理”，并消除 O(N×THD) 扫描。</td>
+                </tr>
+                <tr>
+                  <td><code>TRX_UNDO_PREPARED</code> 是原生 XA prepare 状态，不是 Preserve 新增的 Undo 格式或状态；Preserve 只增加专用 freeze prepare 语义</td>
+                  <td><code>storage/innobase/include/trx0undo.h:361</code><br><code>storage/innobase/trx/trx0undo.cc:1933</code><br><code>storage/innobase/trx/trx0preserve.cc:692</code></td>
+                  <td>Preserve 复用原生 Undo <code>ACTIVE→PREPARED→ACTIVE</code> 状态转换，但 prepare 入口不得调用通用 <code>ha_prepare_low()</code>，也不得释放 gap/read lock 或其他事务资源。RESET 只做状态逆操作；不得新增 <code>TRX_UNDO_PRESERVED</code> 或 Preserve Undo flag。当前 helper 逐事务同步等待 redo，N 较大时需要聚合 activation LSN 后一次批量等待。</td>
+                </tr>
+                <tr>
+                  <td>原路径恢复后同步删除 snapshot/sidecar/provenance</td>
+                  <td><code>sql/preserve_trx.cc:10242</code></td>
+                  <td>RESET 不能直接照搬该同步尾部，否则返回延迟受文件数量和大 payload 影响。</td>
+                </tr>
+                <tr>
+                  <td>成功 detach 后会丢弃原 THD binlog cache</td>
+                  <td><code>sql/preserve_trx.cc:14691</code></td>
+                  <td>为快速 RESET，只在可回撤 batch attempt 生命周期内延迟 discard；复用现有 reactivation API。</td>
+                </tr>
+                <tr>
+                  <td>phase2 target preserve 已支持自动 4–10 worker</td>
+                  <td><code>sql/preserve_trx.cc:6996</code><br><code>sql/preserve_trx.cc:16322</code></td>
+                  <td>先复用现有 worker 与取消检查，不新增 reset worker 参数。</td>
+                </tr>
+                <tr>
+                  <td><code>commit_epoch()</code> 在发送 final metadata/COMMIT 时解开 session mutex，并行发送后等待 ACK</td>
+                  <td><code>sql/preserve_trx_transfer.cc:9649</code></td>
+                  <td>FINAL_ACK 仲裁必须发生在 ACK 验证之后、设置 <code>m_epoch_committed</code> 和释放 transport 之前；不能等函数返回后再 CAS。</td>
+                </tr>
+                <tr>
+                  <td>FINAL_ACK 后 source transport teardown 已被注释为 target-local ownership</td>
+                  <td><code>sql/preserve_trx.cc:16638</code></td>
+                  <td>保持边界；补上与 RESET 的本地 CAS，而不是增加后 ACK 协议。</td>
+                </tr>
+                <tr>
+                  <td>当前 ACK 已绑定 source incarnation、epoch、sequence、原 frame digest 和 HMAC</td>
+                  <td><code>sql/preserve_trx_transfer.cc:6180</code><br><code>sql/preserve_trx_transfer.cc:6257</code></td>
+                  <td>不升级 wire format；只额外校验当前 drain attempt generation/epoch，防止本地错误归属。</td>
+                </tr>
+                <tr>
+                  <td>本树 <code>MYSQL</code>/<code>Vio</code> 结构可见，且已有 socket descriptor API</td>
+                  <td><code>include/mysql.h:296</code><br><code>include/mysql_async.h:242</code></td>
+                  <td>取消只对底层 socket 执行 <code>shutdown(SHUT_RDWR)</code>；不跨线程调用会 close/SSL_shutdown 的 <code>vio_shutdown()</code>。</td>
+                </tr>
+                <tr>
+                  <td>receiver 已有 accepted epoch、ready map、prewarm worker 和 ACK grace</td>
+                  <td><code>sql/preserve_trx_transfer.cc:194</code><br><code>sql/preserve_trx_transfer.cc:6956</code></td>
+                  <td>在现有 map 上加 lifecycle/deadline，不新增第二套 registry。</td>
+                </tr>
+                <tr>
+                  <td>receiver token 保存状态与 strict promotion token 状态已经分属两个现有 registry</td>
+                  <td><code>sql/preserve_trx_transfer.h:455</code><br><code>sql/preserve_trx_promotion_prepared.h:216</code></td>
+                  <td>TTL 只增加 epoch 级 lease；不把 <code>READY_FOR_GATE/ADOPTING/ACTIVE</code> 复制进 transfer receiver record。</td>
+                </tr>
+                <tr>
+                  <td>strict receiver 在 READY 类状态存在仅按 state 快速返回、未比较本次 object-set digest 的路径</td>
+                  <td><code>sql/preserve_trx_transfer.cc:3855</code></td>
+                  <td>这是实现前置修复：同 digest 才允许幂等；不同 digest 必须返回 <code>DIGEST_CONFLICT</code> 并标记 <code>CORRUPT</code>。</td>
+                </tr>
+                <tr>
+                  <td>现有 Preserve reaper 每秒调用 receiver scan</td>
+                  <td><code>sql/preserve_trx.cc:9784</code><br><code>sql/preserve_trx.cc:9815</code></td>
+                  <td>两段 TTL 复用该线程；实际到期精度为配置值加 0–1s。</td>
+                </tr>
+                <tr>
+                  <td>现有 reaper 没有 source RESET cleanup debt；receiver prewarm job 也没有 epoch lifecycle generation</td>
+                  <td><code>sql/preserve_trx.cc:9776</code><br><code>sql/preserve_trx_transfer.cc:10787</code></td>
+                  <td>需要两个局部补口：source 只移交普通清理描述符；receiver job/published entry 全部带 generation。</td>
+                </tr>
+                <tr>
+                  <td>receiver restart 已在 InnoDB init 前删除 process-local transfer 残留</td>
+                  <td><code>sql/preserve_trx_transfer.cc:4810</code><br><code>sql/mysqld.cc:5925</code></td>
+                  <td>不增加 replay、manifest 恢复或 fsync durability。</td>
+                </tr>
+                <tr>
+                  <td>promotion strict gate 已有 ready registry、fence、并行 adopt 与回滚框架</td>
+                  <td><code>sql/preserve_trx_promotion.cc:2937</code></td>
+                  <td>只在入口增加 epoch lease 和前置 <code>SKIPPED</code>；不改 shared adopt kernel。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="sql">
+          <h2>5. SQL 与外部合同</h2>
+          <pre><code>RESET DRAIN;</code></pre>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>项目</th><th>裁定</th></tr></thead>
+              <tbody>
+                <tr><td>调用者</td><td>HA 管控；普通用户不是目标调用方。</td></tr>
+                <tr><td>权限</td><td>复用 DRAIN 的 <code>SHUTDOWN_ACL</code>，不复用通用 RESET 的 <code>RELOAD_ACL</code>。</td></tr>
+                <tr><td>参数</td><td>无 token、epoch、timeout 或 mode；只取消当前 source drain attempt。</td></tr>
+                <tr><td>无 active drain</td><td>幂等返回 OK，包括 <code>preserve_trx_enable=OFF</code> 时。</td></tr>
+                <tr><td>并发/重复 RESET</td><td>同一 generation 共享一个 terminal winner 和一个业务恢复屏障；后续调用等待同一结果并返回 OK，不重复执行恢复。</td></tr>
+                <tr><td>调用会话有显式事务</td><td>返回 <code>ER_PRESERVE_TRX_INVALID_STATE</code>，避免控制命令夹在用户事务中。</td></tr>
+                <tr><td>成功</td><td>RESET 赢得取消权，全部受影响原 THD 已恢复原事务、batch state 为 <code>NONE</code>、4020 cutoff 已解除，普通业务 admission 已开放。</td></tr>
+                <tr><td>TOO_LATE</td><td>source 已本地处理 FINAL_ACK 并进入 <code>SHUTDOWN_HANDOFF</code>；返回专用错误。</td></tr>
+                <tr><td>原 DRAIN 语句</td><td>worker 停止引用 DRAIN 栈对象、普通 cleanup descriptor 完成移交后返回“被 RESET 取消”的专用错误；不等待实际文件删除。</td></tr>
+                <tr><td>cleanup 错误</td><td>仅 sender 临时资源、participant、transport 等非语义清理失败可形成 cleanup debt；不得让已返回 OK 的原连接继续处于 <code>PRESERVED_DRAINED</code>。</td></tr>
+                <tr><td>语义恢复异常</td><td>属于实现不变量破坏，RESET 不得发布 OK；发布前置资源和逆路径必须保证支持场景下可确定恢复，并以 fault injection 将该分支作为 release blocker。</td></tr>
+                <tr><td>RESET 调用会话断开/KILL</td><td>不撤销已经赢得的 RESET；原 DRAIN owner 继续恢复。HA 重连后重复执行可幂等观察最终 OK。</td></tr>
+                <tr><td>RESET 恢复期间 SHUTDOWN</td><td><code>all_transactions_runnable</code> 前返回 busy；达到业务恢复屏障后才允许进入普通 shutdown。</td></tr>
+                <tr><td>原业务 Tx 连接</td><td>代理必须在 RESET 或 SHUTDOWN terminal 决出前保持原 backend 连接存活；已物理断开的连接无法由内核重新创造。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <h3>Parser 与 dispatch</h3>
+          <p>
+            增加独立 <code>SQLCOM_RESET_DRAIN</code> 和 grammar rule <code>RESET_SYM DRAIN_SYM</code>。不塞进原生
+            <code>SQLCOM_RESET</code> 的 refresh bitmask，避免修改通用 RESET 语义。dispatch 继续进入
+            <code>preserve_trx_execute_command()</code>，并把该命令列为 drain 期间唯一允许由非 owner 发起的 Preserve 控制命令。
+          </p>
+        </section>
+
+        <section id="source-state">
+          <h2>6. Source 状态与线性化</h2>
+          <h3>6.1 两层状态，职责分离</h3>
+          <p>不要把所有并发语义塞进一个 manager enum。设计保留现有 manager state，并增加一个很小的 attempt terminal state。</p>
+          <div class="state-line">Manager: IDLE → WARMCOPY_DRAINING / BATCH_DRAINING → RESET_CLEANUP → IDLE</div>
+          <div class="state-line">Attempt terminal: RUNNING → RESET_REQUESTED&nbsp;&nbsp;或&nbsp;&nbsp;RUNNING → SHUTDOWN_HANDOFF</div>
+          <div class="state-line">FINAL_ACK winner: SHUTDOWN_HANDOFF → existing Manager SHUTDOWN_REQUESTED</div>
+          <ul>
+            <li><code>RESET_CLEANUP</code>：普通 SQL/protocol 允许；新的 DRAIN、PRESERVE 控制命令拒绝。</li>
+            <li><code>RESET_REQUESTED</code>：禁止新 phase2 任务、final metadata、COMMIT 和 shutdown。</li>
+            <li><code>SHUTDOWN_HANDOFF</code>：只属于 attempt terminal，表示 FINAL_ACK 已在 source 本地生效，RESET 只能返回 TOO_LATE。</li>
+            <li>原 DRAIN owner 随后用精确 state+owner CAS 把现有 manager 切到 <code>SHUTDOWN_REQUESTED</code>；不新增同义 manager 状态。</li>
+          </ul>
+
+          <h3>6.2 Drain attempt 最小对象</h3>
+          <pre><code>struct Preserve_trx_drain_attempt {
+  uint64_t generation;
+  my_thread_id owner_thread_id;
+  Artifact_mode artifact_mode;
+  atomic&lt;Terminal&gt; terminal;        // RUNNING / RESET_REQUESTED / SHUTDOWN_HANDOFF
+  atomic&lt;bool&gt; cancel_requested;
+
+  mutex state_mutex;
+  condition_variable state_cv;
+  bool admission_reopened;
+  bool all_transactions_runnable;
+  bool owner_quiesced;                // workers no longer reference DRAIN stack
+  Reset_terminal_result result;       // shared by all concurrent RESET waiters
+  Reset_metrics metrics;
+};</code></pre>
+          <p>
+            全局只保存一个受 mutex 保护的 <code>shared_ptr</code> 指向当前 attempt。它不拥有 <code>trx_t*</code>、THD 或 participant，
+            不暴露 DRAIN 栈上的 vector；原 DRAIN owner 始终是内核对象逆操作的唯一执行者。RESET 线程只做 CAS、请求 transport cancel，
+            然后等待 <code>all_transactions_runnable</code>。<code>admission_reopened</code> 只用于观测未受影响业务何时恢复，
+            不能作为 RESET 返回条件；<code>owner_quiesced</code> 只约束原 DRAIN statement 的栈退出，也不约束 RESET response。
+            cleanup debt 由进程级小队列持有，不把文件路径和 participant 生命周期塞进 attempt。
+          </p>
+          <p>
+            <code>all_transactions_runnable</code> 不是单纯的 restored counter：它同时要求全部 in-flight worker 已确认离开“可能 prepare、detach、
+            publish 或 COMMIT”的语义区间。worker 线程本身可以尚未 join，但 RESET OK 之后只能做栈展开、断链和资源释放，不能再产生新的 preserved state。
+          </p>
+
+          <h3>6.3 唯一线性化点</h3>
+          <div class="grid-2">
+            <article class="panel green">
+              <h4>RESET 赢</h4>
+              <p><code>CAS(RUNNING → RESET_REQUESTED)</code> 成功。之后任何 COMMIT outcome 都不能触发 source shutdown；即使 target 已接受，candidate 也只由 target TTL 处理。</p>
+            </article>
+            <article class="panel blue">
+              <h4>FINAL_ACK 赢</h4>
+              <p>ACK 完成完整性/HMAC 校验后，<code>commit_epoch()</code> 在设置 <code>m_epoch_committed</code>、清 final metadata 和释放 transport 之前调用本地 arbiter；只有 <code>CAS(RUNNING → SHUTDOWN_HANDOFF)</code> 成功才使 FINAL_ACK 在 source 生效。</p>
+            </article>
+          </div>
+          <div class="risk">
+            <strong>不要把“COMMIT 已发送”当作 TOO_LATE</strong>
+            用户要求的 ownership 边界是 source 本地收到 FINAL_ACK。COMMIT 在网络中或 target 已接受但 ACK 尚未在 source 生效时，RESET 仍可赢；
+            该 orphan candidate 不会反向约束 source，由 target TTL 清理。HA 发起 RESET 后不得同时发起该 candidate 的 promotion，这是 HA 调用顺序合同，
+            不是新分布式协议。
+          </div>
+          <pre><code>ACK verified
+  -> verify attempt.generation + epoch_id
+  -> try_final_ack_handoff()  // the only RUNNING -> SHUTDOWN_HANDOFF CAS
+       WON  : mark m_epoch_committed, release transport, return committed
+              DRAIN owner exact-CAS manager -> existing SHUTDOWN_REQUESTED
+       LOST : return RESET_CANCELED; no retry/query/release-as-committed</code></pre>
+          <p>
+            arbiter 是传入 source epoch session 的窄回调或等价内部函数，不让 transfer 模块依赖完整 drain manager。
+            target 已 accepted 但 arbiter 输给 RESET 时，不发送反向 ABORT；source 恢复，target 按本地 TTL 处理 orphan candidate。
+          </p>
+          <p>
+            该分支需要一个仅供内部调用链使用的 <code>RESET_CANCELED_AFTER_TARGET_ACCEPTED</code> 结果。外层 DRAIN 看到它后直接进入
+            source semantic restore，禁止调用 <code>abort_batch_transfer_epoch()</code>、重试 COMMIT 或查询 receiver；它不是面向用户的新错误码，
+            最终由原 DRAIN statement 映射为 <code>ER_PRESERVE_TRX_DRAIN_RESET</code>。
+          </p>
+
+          <h3>6.4 并发 RESET 与 attempt 终止</h3>
+          <ol>
+            <li>第一个成功执行 <code>CAS(RUNNING → RESET_REQUESTED)</code> 的 RESET 是唯一 terminal winner，并负责递增 winner/attempt 指标。</li>
+            <li>同一 generation 的后续 RESET 看到 <code>RESET_REQUESTED</code> 时，不重复恢复、不返回 busy；它们成为同一
+              <code>all_transactions_runnable</code> 屏障的 waiter，屏障完成后都返回 OK。</li>
+            <li>若恢复触发实现不变量失败，attempt 保存唯一 terminal error，所有 waiter 返回同一个 fail-closed 结果，不能一部分返回 OK。</li>
+            <li>后续 RESET 看到 <code>SHUTDOWN_HANDOFF</code> 时统一返回 TOO_LATE；不存在一个 RESET 返回 OK、另一个返回 TOO_LATE 的同 generation 分叉。</li>
+            <li><code>RESET_REQUESTED</code> 是 attempt 终止态，绝不回到 RUNNING。业务恢复后可以继续存在，以承载 waiter 和只读观测。</li>
+            <li>只有 <code>all_transactions_runnable</code>、<code>owner_quiesced</code> 且 source cleanup debt 清空后，reaper/owner 才能精确
+              CAS manager 从 <code>RESET_CLEANUP</code> 回 IDLE，并销毁 attempt。</li>
+            <li>attempt 已销毁后再次执行 RESET，按“无 active drain”幂等返回 OK。</li>
+          </ol>
+          <p>
+            <code>Preserve_trx_reset_requests</code> 统计所有 SQL 调用；另设 terminal winner 计数，只由第一个 CAS winner 增加，
+            避免并发 RESET 重复计算一次业务恢复。
+          </p>
+
+          <h3>6.5 Manager guard 的必要小修</h3>
+          <p>
+            当前 <code>Preserve_trx_manager_state_guard::transition_to()</code> 与析构使用无条件 store。RESET 跨线程发布
+            <code>RESET_CLEANUP</code> 后，原 DRAIN owner 可能覆盖该状态。需要把 guard 改为“精确 state+owner CAS”：
+          </p>
+          <ul>
+            <li>guard 记录自己最后成功发布的 state。</li>
+            <li><code>transition_to()</code> 返回 bool，只在 packed <code>(m_current_state, m_current_owner)</code> 仍归 guard 所有时 CAS 到目标值。</li>
+            <li>每个现有调用点必须处理 CAS 失败，不能继续执行对应 shutdown/cleanup 分支。</li>
+            <li>析构只从最后成功发布的 state+owner CAS 回原状态；若 RESET 已接管，析构保持静默，不得覆盖。</li>
+          </ul>
+          <pre><code>bool transition_to(State next, Owner next_owner) {
+  if (!m_active) return false;
+  if (!compare_exchange(m_current_state, m_current_owner,
+                        next, next_owner)) {
+    m_active = false;
+    return false;
+  }
+  m_current_state = next;
+  m_current_owner = next_owner;
+  return true;
+}
+
+~Guard() {
+  if (m_active)
+    compare_exchange(m_current_state, m_current_owner, m_from, 0);
+}</code></pre>
+          <p>这是 <code>sql/preserve_trx.cc</code> 内部类的局部修正，不改变原生 MySQL manager 或线程调度。</p>
+
+          <h3>6.6 不增加 RESET watchdog</h3>
+          <p>
+            RESET 赢得 terminal 后，语义恢复成为原 DRAIN owner 的非可取消区间：控制 THD 的 <code>KILL</code> 或客户端断开只能延后命令返回，
+            不能中止 reattach/activate。RESET 调用会话断开也不撤销 attempt。若整个 mysqld crash，则走既有进程重启语义；
+            本设计不承诺跨进程继续 RESET，也不增加 source reset timeout、restore watchdog 或第二恢复 owner。
+          </p>
+        </section>
+
+        <section id="source-flow">
+          <h2>7. Phase 1 / Phase 2 回撤流程</h2>
+          <h3>7.1 RESET 通用入口</h3>
+          <ol>
+            <li>校验 <code>SHUTDOWN_ACL</code> 和 RESET 会话状态。</li>
+            <li>取得当前 attempt；不存在则幂等 OK。</li>
+            <li>执行 terminal CAS；若已 <code>SHUTDOWN_HANDOFF</code> 返回 TOO_LATE；若已是同 generation 的
+              <code>RESET_REQUESTED</code>，直接加入现有恢复屏障等待。</li>
+            <li>只有第一个 RESET winner 发布 manager <code>RESET_CLEANUP</code>，禁止 drain 继续收紧 admission。</li>
+            <li>设置 generation-scoped cancel flag，唤醒 command waiters，并对正在阻塞的 transfer socket 执行 shutdown-only cancel。</li>
+            <li>原 DRAIN owner 和 worker 在安全 checkpoint 停止前进；已经 detach 的目标立即进入既有逆路径。</li>
+            <li>等待 attempt 的 <code>all_transactions_runnable</code>；不等待 worker join、<code>owner_quiesced</code> 或 cleanup debt。</li>
+            <li>立即返回 OK。之后原 DRAIN owner 只负责栈展开和清理所有权移交，1 秒 reaper 持续消耗非语义残留。</li>
+          </ol>
+
+          <h3>7.2 Phase 1</h3>
+          <p>phase1 中事务仍在原 THD 运行，没有 detach/claim。RESET 成本应接近常数：</p>
+          <ul>
+            <li>phase1 flush/enqueue 循环在每个 batch 前后检查 reset generation，停止新 target 宣告和 blob batch enqueue。</li>
+            <li>清除属于该 generation 的 <code>PENDING_QUIESCE</code>、<code>QUIESCED</code>、<code>DRAINED_NO_TRANSACTION</code>。</li>
+            <li>清除属于该 generation 的 read cutoff，唤醒 command-read 边界等待者。</li>
+            <li>调用现有 <code>abort_participants()</code>；传输 ABORT/断链是 best-effort，不参与 RESET 返回。</li>
+          </ul>
+
+          <h3>7.3 Phase1 closing</h3>
+          <p>
+            当前 <code>WARMCOPY_CLOSING</code> 已阻止新事务/锁工作。RESET 先发布 <code>RESET_CLEANUP</code> 重新开放普通 admission，
+            再由 DRAIN owner 清除 generation 状态。participant open/close/preflight 前后、进入 <code>WARMCOPY_CLOSING</code> 前后都检查
+            reset generation；RESET 生效后，任何迟到结果都不能重新进入 <code>BATCH_DRAINING</code>。
+          </p>
+
+          <h3>7.4 Phase 2</h3>
+          <p>phase2 按目标状态分三类处理：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>目标状态</th><th>RESET 动作</th><th>是否读取 artifact</th></tr></thead>
+              <tbody>
+                <tr><td>尚未开始 preserve</td><td>停止分配；清 generation/read cutoff；立即唤醒。</td><td class="no">否</td></tr>
+                <tr><td>worker 正在执行一个不可分割内核 substep</td><td>完成当前 substep，在下一个 checkpoint 停止；不进入后续 publish/COMMIT。</td><td class="no">否</td></tr>
+                <tr><td>已 <code>PRESERVED_DRAINED</code></td><td>复用 existing record→original THD reattach/activate；清为 <code>NONE</code>，解除 read cutoff 后唤醒。</td><td class="no">正常路径不读</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>
+            首版不新增 parallel restore。先把当前每 token 一次全局 THD scan 的 O(N×THD) 改为“一次 scan 收集所有匹配 THD pin，按原 reverse order 恢复”。
+            只有 release NFR 证明 1000 事务仍不达标，才进入条件切片实现 bounded parallel restore。
+          </p>
+          <h4>Phase2 必须存在的 checkpoint</h4>
+          <ul>
+            <li>target wait loop 每次唤醒后，以及 worker 取得下一个 target 之前。</li>
+            <li>进入 prepare/detach 前；不可分割内核 substep 完成并释放关键锁之后。</li>
+            <li>目标一旦完成 <code>trx_preserve_prepare_current()</code>，取消不得把它遗留在无 owner 的
+              <code>PREPARED</code> 状态：仍挂原 THD 时走 prepare-failure reactivation；已经 detach 时先 reattach，再 activate。</li>
+            <li>detach 已成功时不得直接 canceled return，必须先走 existing reverse path 恢复该 target。</li>
+            <li>每个 target 完成后、record/binlog catch-up stream 前后、artifact publish 前。</li>
+            <li>final metadata 编码/发送前、<code>COMMIT_EPOCH</code> 前，以及任意网络 I/O 被 shutdown 唤醒后。</li>
+          </ul>
+          <p>
+            checkpoint 不放在持有 InnoDB、MDL、registry 或 connection 关键锁的区间。实现必须记录
+            <code>reset_max_worker_cancel_latency_us</code>；若某个现有 substep 延迟无界，只拆该 substep 的安全边界，不引入通用取消框架。
+          </p>
+
+          <h3>7.5 业务开放与 RESET 返回</h3>
+          <ol>
+            <li>manager 进入 <code>RESET_CLEANUP</code> 后，未受本次 generation 影响的连接立即允许普通业务。</li>
+            <li>未 detach 的目标清 state 后立即唤醒。</li>
+            <li>已 detach 的目标完成原 <code>trx_t</code>、MDL、binlog cache、GTID、savepoint 和 session 状态恢复后，清除 <code>PRESERVED_DRAINED</code>。</li>
+            <li>聚合所有 Undo activation mtr 的最大 redo LSN；若非零，在解除受影响连接 cutoff 前只执行一次
+              <code>log_write_up_to()</code>，使 <code>PREPARED→ACTIVE</code> 在 RESET 成功返回前具备 crash-safe 顺序。</li>
+            <li>每个目标在 batch state 为 <code>NONE</code> 后解除 generation-scoped read cutoff，再唤醒 command reader。</li>
+            <li>确认每个 in-flight worker 已越过最后一个语义 checkpoint，之后不可能再 prepare/detach/publish/COMMIT。</li>
+            <li>当全部受影响目标均可执行下一条 SQL，且语义 worker 已 quiesced 时，attempt 发布 <code>all_transactions_runnable=true</code>。</li>
+            <li><code>RESET DRAIN</code> 立即返回 OK；从这一刻起，后台清理不得再写 batch state、cutoff 或事务生命周期。</li>
+            <li>原 DRAIN owner 停止并 join 自己创建的 worker，移交普通 cleanup descriptor，发布 <code>owner_quiesced</code>，随后原 DRAIN 语句返回 canceled。</li>
+          </ol>
+          <div class="boundary">
+            <strong>返回顺序不可颠倒</strong>
+            允许先返回 RESET OK、后完成原 DRAIN 栈展开；不允许先把连接留在 <code>PRESERVED_DRAINED</code>，再交给后台慢慢 restore。
+            后台只能删除或释放已经逻辑失效的非语义对象。
+          </div>
+        </section>
+
+        <section id="kernel">
+          <h2>8. 内核对象恢复：复用原对象，不做反序列化</h2>
+          <p class="section-lead">
+            RESET 与 startup/promotion resume 不同：source 进程没重启，原 <code>trx_t</code> 和相关对象仍在内存。因此最快、最可靠的做法是逆转 detach，
+            不是从 snapshot 重建事务。
+          </p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>对象</th><th>RESET 生命周期</th><th>复用路径/约束</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><code>trx_t</code> / XID / trx_id</td>
+                  <td>同一指针从 detached preserved 重新挂回 original THD，内存状态从 <code>PREPARED/PRESERVED</code> 恢复为 <code>ACTIVE</code>。</td>
+                  <td><code>PREPARED</code> 是原生 XA 状态；复用 <code>trx_preserve_reattach_preserved_to_original_thd()</code> + <code>trx_preserve_activate_reattached_in_original_thd()</code>。</td>
+                </tr>
+                <tr>
+                  <td>Undo / rseg / trx list</td>
+                  <td>通过原生 XA rollback 同款机制把 Undo segment header 从 <code>TRX_UNDO_PREPARED</code> 改回 <code>TRX_UNDO_ACTIVE</code>，恢复事务注册；不遍历 Undo record body。</td>
+                  <td>每个有 redo Undo 的事务需要提交一个很小的 activation mtr，但同步等待应从“每事务一次”收敛为“聚合最大 activation LSN 后一次”；事务大小、UPDATE 条数和 Undo record 数不进入 RESET 成本。</td>
+                </tr>
+                <tr>
+                  <td>MVCC ReadView</td>
+                  <td>ReadView 随原 <code>trx_t</code> 保留；恢复 session 可见状态。</td>
+                  <td>不从 payload import，不重新打开快照。</td>
+                </tr>
+                <tr>
+                  <td>record/table/predicate/implicit locks</td>
+                  <td>lock_sys 中仍由原 trx identity 持有；只恢复事务可执行性。</td>
+                  <td>Preserve freeze prepare 从一开始就不释放 gap/read lock，因此 RESET 不导入旧 payload、不重建 lock plan；隐式锁仍由页面 trx_id 语义自然存在。</td>
+                </tr>
+                <tr>
+                  <td>MDL</td>
+                  <td>将既有 detached MDL context 转回原 THD。</td>
+                  <td>复用 <code>restore_detached_mdl_context()</code>；不重新 acquire 业务 MDL。</td>
+                </tr>
+                <tr>
+                  <td>binlog cache</td>
+                  <td>仅 <code>artifact_mode == STANDBY_TRANSFER_SAVE</code> 的 batch detach 暂缓 discard，RESET 用 metadata 恢复原 cache 位置和 handler 状态。</td>
+                  <td>复用 <code>mysql_binlog_preserve_reactivate_after_detach_failure()</code>；正常 RESET 不读 external blob/文件；若 FINAL_ACK 赢，沿现有 shutdown path discard retained cache。</td>
+                </tr>
+                <tr>
+                  <td>GTID ownership</td>
+                  <td>恢复原 session GTID 状态。</td>
+                  <td>复用现有 batch restore helper；不发放新 GTID。</td>
+                </tr>
+                <tr>
+                  <td>savepoints / participant order</td>
+                  <td>恢复 SQL 与 InnoDB savepoint 栈。</td>
+                  <td>复用 <code>restore_savepoints_to_thd()</code>，保持现有顺序。</td>
+                </tr>
+                <tr>
+                  <td>session variables / user vars / DML policy</td>
+                  <td>恢复 isolation、autocommit、FK/unique checks、insert id 等已捕获状态。</td>
+                  <td>复用现有 <code>restore_preserved_*()</code> helpers。</td>
+                </tr>
+                <tr>
+                  <td>temp table / no-redo sidecar</td>
+                  <td>只复用当前 local batch 已支持的原对象回撤；strict transfer 当前仍拒绝该形态。</td>
+                  <td>RESET 不扩展 temp/no-redo feature envelope，不从 sidecar 重建。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="boundary">
+            <strong>PREPARED 不是新增的 Preserve 磁盘状态</strong>
+            Undo 页面只使用 MySQL 8.0.22 原生 XA 的 <code>ACTIVE/PREPARED</code> 状态和标准 XID 槽位；标准 XID 内容可携带
+            Preserve 内部关联 token，但 XID 本身不是有效 Preserve 的唯一认证依据，本设计也不增加 <code>TRX_UNDO_PRESERVED</code>。
+            Preserve 只复用原生 prepare 的持久状态转换，并通过专用 <code>trx_prepare_for_preserve()</code> 语义保留全部事务锁；
+            原生 XA 的 gap/read-lock 释放规则保持不变，Preserve 不再依赖失败后的 record-lock 补偿重建。
+            若 preserve 在 prepare 之后发现资格、序列化或发送条件不满足，默认先撤销 prepare 并让原事务继续；只有 HA 明确 abandon
+            或 startup orphan cleanup 才通过 Preserve 内部受控入口执行整事务 rollback。原 owner 丢失或 reattach/activate 失败不能被静默降级成
+            “rollback 后 RESET OK”，仍按语义恢复异常 fail closed。普通 XA <code>ROLLBACK BY XID</code> 也不得绕过 Preserve ownership。
+          </div>
+
+          <h3>8.1 对现有 restore helper 的精确拆分</h3>
+          <p>
+            <code>restore_batch_record_to_original_thd()</code> 当前把语义恢复和文件清理混在一起。拆分点应位于
+            <code>trx_preserve_activate_reattached_in_original_thd()</code> 成功之后、<code>delete_snapshot_files_with_status()</code> 之前：
+          </p>
+          <pre><code>restore_batch_record_semantics_to_original_thd(...)
+  -> BUSINESS_RESTORED | INVARIANT_BROKEN
+
+cleanup_reset_batch_artifacts(...)
+  -> cleanup debt only; never keeps a restored THD in PRESERVED_DRAINED</code></pre>
+          <p>
+            这不是新增一套 resume core，只是把现有 batch failure reverse path 的同步尾部切开，使 RESET 能在正确的业务恢复点返回。
+            <code>INVARIANT_BROKEN</code> 不属于可接受的 RESET 成功降级结果；支持场景必须在进入 resettable window 前保留完整逆操作资源，
+            并用故障注入证明该状态不会被静默转换成 OK。若该实现不变量仍被破坏，复用现有
+            <code>ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED</code> 和 manager <code>DRAIN_CLEANUP_FAILED</code> fail closed；
+            不再新增第三个同义错误码，也不得把后续文件 cleanup debt 与该语义失败混为一类。
+          </p>
+
+          <h3>8.2 可回撤资格与资源预留</h3>
+          <p>
+            不再增加一个与 <code>artifact_mode</code> 重复的 <code>attempt.resettable</code> 布尔值。首版可回撤资格唯一由
+            <code>STANDBY_TRANSFER_SAVE</code>、attempt terminal 仍为 RUNNING，以及原 backend THD 仍被支持合同保持存活共同决定。
+            每个成功 detach 的 <code>Preserve_trx_source_rollback_image</code> 增加
+            <code>original_binlog_cache_retained</code>，明确原 cache 是否仍可 metadata-only reactivation。
+          </p>
+          <ul>
+            <li>进入 <code>PRESERVED_DRAINED</code> 前构建 rollback image，并预留 restore vector/pin map 所需的 O(N) 容量。</li>
+            <li>RESET 赢时只恢复 retained 原 cache；不读取 prebuilt external blob，也不分配与 binlog payload 大小成比例的内存。</li>
+            <li>FINAL_ACK 赢或正常 shutdown handoff 时丢弃 retained 原 cache；非 transfer、本地 carrier 和普通单事务 preserve 路径保持原逻辑。</li>
+            <li>支持范围内的 OOM/缺失 rollback image 属进入可回撤窗口前的拒绝条件，不允许在 RESET 已赢后降级成“部分恢复”。</li>
+          </ul>
+        </section>
+
+        <section id="artifacts">
+          <h2>9. Source Artifact 失效与异步清理</h2>
+          <h3>9.1 首版只支持 Transfer 模式</h3>
+          <p>
+            <code>STANDBY_TRANSFER_SAVE</code> 使用 transfer artifact sink，不在 source 发布可供 startup resume 的本地 <code>.bin</code>。
+            RESET 返回前只恢复原事务、清除本次 generation 的 source token 可用性并解除 4020 cutoff；XID provenance reservation、
+            warm blobs 和 sender 临时状态在 cleanup 阶段删除。source 不等待 target 删除任何内容。
+          </p>
+
+          <h3>9.2 Local carrier 明确不在首版</h3>
+          <div class="boundary">
+            <strong>避免把两套场景混在一起</strong>
+            local preserve→shutdown→startup resume 要求 durable snapshot、目录 barrier 和跨重启恢复；transfer RESET 是同一 source 进程内的在线逆转。
+            首版 <code>RESET DRAIN</code> 只接受 <code>STANDBY_TRANSFER_SAVE</code> attempt，不修改 carrier、startup preflight、
+            Resurrection Index 或 recover_all。local-carrier attempt 不进入本设计的可撤销窗口。
+          </div>
+
+          <h3>9.3 同步与异步边界</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>动作</th><th>RESET 返回前</th><th>RESET 返回后</th></tr></thead>
+              <tbody>
+                <tr><td>停止 phase2/COMMIT</td><td class="yes">必须</td><td>—</td></tr>
+                <tr><td>普通 admission 开放</td><td class="yes">必须</td><td>保持</td></tr>
+                <tr><td>原事务语义恢复</td><td class="yes">全部必须成功</td><td>—</td></tr>
+                <tr><td>batch state / 4020 cutoff 清除</td><td class="yes">全部必须完成</td><td>—</td></tr>
+                <tr><td>transfer source token 逻辑失效</td><td class="yes">必须，禁止本次 token 再被 source 使用</td><td>—</td></tr>
+                <tr><td>transfer source provenance</td><td class="no">不要求物理清完</td><td>cleanup debt</td></tr>
+                <tr><td>sidecar/blob/tmp 删除</td><td class="no">不要求</td><td class="yes">source cleanup debt + 既有 1 秒 reaper</td></tr>
+                <tr><td>worker/participant 退出</td><td>只要求已发布 cancel，不能再产生新语义结果</td><td class="yes">原 DRAIN owner 停止/join 并展开栈对象</td></tr>
+                <tr><td>target ABORT/ACK/prewarm</td><td class="no">绝不等待</td><td class="no">source 不再参与</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>9.4 Source cleanup debt 的最小所有权</h3>
+          <p>
+            当前代码只有 receiver cleanup debt，不能笼统写成“既有 reaper 会清 source”。首版只增加一个进程级、单 active generation 的小队列，
+            并让现有 1 秒 reaper 多执行一次有界 source cleanup pass；不增加线程、通用任务系统或 durable journal。
+          </p>
+          <pre><code>struct Preserve_trx_source_cleanup_item {
+  Cleanup_kind kind;
+  string immutable_identity;          // generation-qualified path/id
+  uint64_t attempts;
+  uint64_t first_failed_monotonic_us;
+  uint64_t last_attempt_monotonic_us;
+  string last_error;
+};
+
+struct Preserve_trx_source_cleanup_debt {
+  uint64_t generation;
+  vector&lt;Preserve_trx_source_cleanup_item&gt; items;
+};</code></pre>
+          <ol>
+            <li>RESET OK 后，原 DRAIN owner 停止并 join 自己创建的 worker；worker 不得继续引用局部 vector、session、sink 或 provider。</li>
+            <li>owner 对 participant 做逻辑 disable/abort。现有 teardown 若包含文件 I/O，只把删除动作拆成 Preserve 私有 cleanup item，不扩通用 participant 接口。</li>
+            <li>owner 移交 generation-qualified provenance id、warm blob path、sender temp path 等普通描述符，随后发布 <code>owner_quiesced</code>，原 DRAIN 语句返回 canceled。</li>
+            <li>cleanup item 禁止保存 <code>THD*</code>、<code>trx_t*</code>、participant/provider/session/sink 指针或任何 DRAIN 栈引用。</li>
+            <li>manager 在 debt 清空前保持 <code>RESET_CLEANUP</code>：普通 SQL 完全开放，但拒绝新的 DRAIN，避免同一 connection-id token 的旧删除任务碰到新一轮 artifact。</li>
+            <li>最后一个 debt 删除且 <code>owner_quiesced</code> 已发布后，reaper 用精确 generation/state CAS 将 manager 置回 IDLE 并释放 attempt。</li>
+          </ol>
+
+          <h3>9.5 清理失败</h3>
+          <p>
+            非语义清理失败不能重新关闭全局业务，也不能把已经恢复的 THD 改回 <code>PRESERVED_DRAINED</code>。manager 可暂时留在
+            <code>RESET_CLEANUP</code> 拒绝新的 DRAIN，由现有 1 秒 reaper 重试 sender 临时资源、provenance 和文件 cleanup debt；
+            原连接继续正常运行。永久 I/O 错误通过 status/error log 暴露，不引入 watchdog。事务 reattach/activate、batch state 清除或
+            4020 cutoff 解除失败不属于 cleanup debt，RESET 不得在这种状态下返回 OK。
+          </p>
+          <ul>
+            <li>每个 reaper tick 只执行一个有界 cleanup pass，单项失败后保留原 descriptor，不阻塞同批其他 item。</li>
+            <li>进程存活期间持续按 1 秒周期重试，不设置“达到次数后静默放弃”的终止状态，也不增加 retry sysvar。</li>
+            <li>达到固定告警阈值后只做限频 error log；告警不改变普通 SQL 已开放、下一轮 DRAIN 仍被拒绝的语义。</li>
+            <li>必须暴露 debt generation、items、attempts、oldest age、last error 和 last attempted item，保证永久失败可被定位。</li>
+            <li>只有 debt 清零且 owner 已 quiesce 才能离开 <code>RESET_CLEANUP</code>；不能为了允许下一轮 DRAIN 丢弃旧 generation 的删除任务。</li>
+          </ul>
+        </section>
+
+        <section id="transfer-race">
+          <h2>10. FINAL_ACK、网络取消与幂等竞态</h2>
+          <h3>10.1 RESET 不等待网络</h3>
+          <p>
+            当前 classic client sink 用 1 秒粒度的 connect/read/write timeout，phase2 通常设置为 3 秒。仅设置 cancel flag 不能满足快速 RESET，
+            因为 DRAIN owner 可能阻塞在 <code>simple_command()</code>。需要给 transfer sink 增加一个窄接口：
+          </p>
+          <pre><code>virtual void request_cancel() noexcept;
+
+struct Transfer_cancel_slot {
+  mutex cancel_mutex;
+  bool cancel_requested;
+  void *active_connection;  // valid only while protected by cancel_mutex
+};
+
+// default classic client op, called while cancel_mutex is held:
+mysql_socket_shutdown(mysql->net.vio->mysql_socket, SHUT_RDWR);
+// shutdown only: no mysql_close(), no vio_shutdown(), no SSL_shutdown()</code></pre>
+          <p>
+            每个 data session 使用由 sink 拥有的稳定 cancellation slot。发送线程在进入 <code>simple_command()</code> 前于
+            <code>cancel_mutex</code> 下发布 active connection，返回后先在同一 mutex 下清除，再允许 disconnect/<code>mysql_close()</code>。
+            RESET 持有该 mutex 完成 socket shutdown，因而不会发生 fd 复用或 connection/VIO 生命周期竞争。shutdown 只唤醒 TCP、Unix socket
+            或 TLS 下正在等待的 I/O；SSL 对象的关闭和 <code>mysql_close()</code> 仍只由发送线程执行。
+          </p>
+          <p>
+            发送线程从网络返回后第一件事是重查 <code>cancel_requested</code> 和 attempt terminal。若 RESET 已赢，直接返回
+            <code>RESET_CANCELED</code>，不得执行 reconnect、exact-frame retry、<code>QUERY_EPOCH_STATUS</code> 或 committed teardown。
+            该改动只扩展 Preserve transfer client ops 的可选 cancel 回调，不修改通用 libmysql、connection scheduler 或 server protocol。
+          </p>
+
+          <h3>10.2 竞态矩阵</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>RESET 到达时点</th><th>source 结果</th><th>target 结果</th></tr></thead>
+              <tbody>
+                <tr><td>COMMIT 发送前</td><td>RESET 赢；禁止 COMMIT；恢复业务。</td><td>未 commit staging 走现有 abort/timeout cleanup。</td></tr>
+                <tr><td>final metadata 正在发送</td><td>RESET 赢；shutdown socket 唤醒发送线程；恢复业务。</td><td>不完整 epoch 不返回 FINAL_ACK，按现有 cleanup。</td></tr>
+                <tr><td>COMMIT 已发送，ACK 未在 source 生效</td><td>RESET 仍可赢；不等待查询状态。</td><td>若已 accepted，成为 orphan candidate，10s/30s TTL 销毁。</td></tr>
+                <tr><td>ACK 已验证、尚未执行本地 arbiter</td><td><code>commit_epoch()</code> 内 CAS 唯一决定：RESET OK 或 RESET TOO_LATE。</td><td>已 accepted；若 RESET 赢则 TTL，若 ACK 赢则等待 HA promotion。</td></tr>
+                <tr><td><code>SHUTDOWN_HANDOFF</code> 之后</td><td>RESET TOO_LATE；source 继续 shutdown。</td><td>正常 target-local prewarm/promotion 生命周期。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="note">
+            <strong>QUERY_EPOCH_STATUS 保持窄用途</strong>
+            只服务“source 尚未 RESET 且 FINAL_ACK 是否已生效”的短暂 ACK ambiguity。RESET 一旦赢，source 不再查询；FINAL_ACK arbiter 一旦赢，
+            sender/worker/session 上下文立即结束，target 后续行为与 source 无关。
+          </div>
+
+          <h3>10.3 与 4020 response cutoff 的关系</h3>
+          <p>
+            transfer drain 在发送 <code>COMMIT_EPOCH</code> 前，需要按代理对接合同关闭每个目标 THD 的 generation-scoped command-read cutoff，
+            并等待已被 source 接受的 response-bearing command 完成正常响应或 4020 响应。RESET 与该 cutoff 使用同一个 drain generation：
+          </p>
+          <ol>
+            <li>RESET 赢得 terminal CAS 后，禁止新的 cutoff/fence 发布和 <code>COMMIT_EPOCH</code>。</li>
+            <li>未 detach 目标清 batch state 后即可清除 cutoff。</li>
+            <li>已 detach 目标必须先完成原事务 reattach/activate，再清为 <code>NONE</code> 并清除 cutoff。</li>
+            <li>cutoff 清除后唤醒 command reader；socket 中尚未读取的 SQL 可以在原 Tx 上正常执行。</li>
+            <li>只有所有目标均满足“事务可运行 + cutoff 已清除”，RESET 才返回 OK。</li>
+          </ol>
+          <div class="boundary">
+            <strong>4020 不得在 RESET OK 后重复出现</strong>
+            代理收到 HA 的 RESET 成功终局后，会在原 Tx 上重放触发 4020 的请求。因此本次 generation 的任何原连接只要仍为
+            <code>PRESERVED_DRAINED</code> 或 cutoff 仍关闭，RESET 就尚未完成。
+          </div>
+
+          <h3>10.4 ACK 身份与重放</h3>
+          <p>
+            现有 ACK 对 source incarnation、epoch id、sequence、原 encoded frame digest 和 HMAC 的校验继续作为 wire 身份合同；
+            exact-frame retry 保持幂等。新增的只是 source 本地断言：ACK 对应的 epoch id 与当前 attempt generation 创建的 epoch 一致，
+            且 terminal 仍由该 attempt 持有。该防御不新增字段、不升级 v4，也不把 target 状态查询扩展成长期协议。
+          </p>
+        </section>
+
+        <section id="receiver">
+          <h2>11. Receiver 两段 TTL 状态机</h2>
+          <p>
+            Receiver 已经有两套职责不同的 token 状态，不能再用一条
+            <code>RECEIVING → READY → ADOPTING → ADOPTED</code> 把它们压扁。首版只在现有
+            <code>Receiver_epoch_ready_state</code> 上增加轻量 epoch TTL lease；不新建第三个 token registry。
+          </p>
+          <div class="state-line">Transfer record / token: DECLARED → RECEIVING → SAVED_ONLINE；失败进入 CLEANUP_PENDING / CLEANUP_TAINTED / CORRUPT / ABORTED</div>
+          <div class="state-line">Strict token: OBJECTS_RECEIVING → PREWARMING → PREWARMED_PENDING_FINAL_FACT → READY_FACTS_PENDING_LEASE → READY_FOR_GATE → ADOPTING → ADOPTED_LOCKED → ATTACHING → ACTIVATING → ACTIVE</div>
+          <div class="state-line">Epoch TTL lease: ACCEPTED_DEADLINE_ACTIVE → READY_DEADLINE_ACTIVE → ADOPT_LEASED</div>
+          <div class="state-line">ACCEPTED_DEADLINE_ACTIVE --10s--> EXPIRED&nbsp;&nbsp;&nbsp;&nbsp;READY_DEADLINE_ACTIVE --30s--> EXPIRED</div>
+
+          <h3>11.1 三层状态及唯一职责</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>层次</th><th>现有/新增位置</th><th>唯一职责</th><th>禁止事项</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>Transfer record，per-token</td>
+                  <td>现有 <code>Preserve_trx_transfer_receiver_registry</code></td>
+                  <td>描述 frame/object 是否完整接收并保存，以及接收清理结果。</td>
+                  <td>不表达 promotion READY、claim、attach 或 ACTIVE。</td>
+                </tr>
+                <tr>
+                  <td>Strict prepared token，per-token</td>
+                  <td>现有 <code>Preserve_trx_prepared_token_registry</code></td>
+                  <td>描述 prewarm、final facts、gate adopt、attach 和 activate 生命周期。</td>
+                  <td>不承担 FINAL_ACK ownership，也不自行决定整个 epoch TTL。</td>
+                </tr>
+                <tr>
+                  <td>Epoch TTL lease，per-epoch</td>
+                  <td>扩展现有 <code>Receiver_epoch_ready_state</code></td>
+                  <td>描述当前进程内 candidate 的 accepted deadline、ready deadline、HA adopt lease 和失效 generation。</td>
+                  <td>不复制 token 的 <code>ADOPTING/ADOPTED_LOCKED/ACTIVE</code> 状态。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>事件</th><th>Transfer token</th><th>Strict token</th><th>Epoch TTL lease</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>COMMIT 完整接受</td>
+                  <td>全部 token 必须为 <code>SAVED_ONLINE</code></td>
+                  <td>可处于 prewarm 中间状态</td>
+                  <td>安装 <code>ACCEPTED_DEADLINE_ACTIVE</code> 后才允许 FINAL_ACK</td>
+                </tr>
+                <tr>
+                  <td>全 epoch prewarm/fact binding 完成</td>
+                  <td>保持 <code>SAVED_ONLINE</code></td>
+                  <td>全部为 <code>READY_FOR_GATE</code></td>
+                  <td>CAS 到 <code>READY_DEADLINE_ACTIVE</code></td>
+                </tr>
+                <tr>
+                  <td>HA 选择 Preserve promotion</td>
+                  <td>不变</td>
+                  <td>尚未 claim，仍为 <code>READY_FOR_GATE</code></td>
+                  <td>先 CAS 到 <code>ADOPT_LEASED</code>，随后 strict kernel 才进入 <code>ADOPTING</code></td>
+                </tr>
+                <tr>
+                  <td>promotion 已进入 claim/attach</td>
+                  <td>不再作为 TTL 判定依据</td>
+                  <td><code>ADOPTING</code> 及以后由既有 strict 状态机负责</td>
+                  <td>保持 <code>ADOPT_LEASED</code>；TTL 不得销毁</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>11.2 ACK→READY：默认 10 秒</h3>
+          <ul>
+            <li>receiver 完整接受 epoch、确认全部 transfer token 为 <code>SAVED_ONLINE</code> 后，分配当前进程内单调递增的
+              <code>lifecycle_generation</code>，安装 <code>ACCEPTED_DEADLINE_ACTIVE</code> 和 10 秒 deadline，再返回 FINAL_ACK。</li>
+            <li>若 COMMIT 时所有 strict token 已完成 prewarm，可在 FINAL_ACK 前直接完成 epoch binder 并进入
+              <code>READY_DEADLINE_ACTIVE</code>，此时 ACK→READY 指标为接近 0。</li>
+            <li>所有 staged/object/epoch prewarm job 和其发布的 proof/cache entry 都捕获该 generation；10 秒内允许受资源治理的 prewarm。</li>
+            <li>超时不是传输错误，而是 target-local candidate 失效。</li>
+            <li>过期不向 source 上报，不等待 HA，不回滚 source。</li>
+          </ul>
+
+          <h3>11.3 READY→HA adopt lease：默认 30 秒</h3>
+          <ul>
+            <li>最后一个 token prewarm 完成且 epoch fact 可绑定时，epoch binder 先 snapshot
+              <code>ready_deadline_us = now + preserve_trx_transfer_receiver_ready_timeout_ms</code>。</li>
+            <li>binder 使用同一个 <code>ready_deadline_us</code> 构造全部 token final facts，令
+              <code>epoch_prepare_deadline_us == ready_deadline_us</code>，再把 token 推到 <code>READY_FOR_GATE</code>。</li>
+            <li>全部 token 和 epoch fact 成功后，CAS 到 <code>READY_DEADLINE_ACTIVE</code>。不得先发布 epoch READY、再异步修补 token deadline。</li>
+            <li>未来 HA promotion 入口先执行 epoch CAS：
+              <code>READY_DEADLINE_ACTIVE → ADOPT_LEASED</code>；成功后才调用现有 strict
+              <code>begin_gate_adopt()</code> 让 token 进入 <code>ADOPTING</code>。</li>
+            <li><code>ADOPT_LEASED</code> 一旦成功，两个 TTL 都永久取消；promotion 后续成功、逆转或 taint 由 strict 状态机处理。</li>
+            <li>30 秒内 HA 未取得 lease，epoch CAS 到 <code>EXPIRED</code> 并销毁尚未 claim 的 candidate。</li>
+          </ul>
+
+          <h3>11.4 与现有 deadline 字段的关系</h3>
+          <ul>
+            <li><code>epoch_prepare_deadline_us</code> 是 strict token 允许开始 gate adopt 的期限；transfer receiver 路径必须使用上述
+              epoch <code>ready_deadline_us</code>，不能继续从 <code>preserve_trx_transfer_commit_timeout_ms</code> 推导。</li>
+            <li><code>preserve_trx_transfer_commit_timeout_ms</code> 只表示 source 等 FINAL_ACK 的网络/协议预算，不承担 target READY lease。</li>
+            <li><code>client_resume_deadline_us</code> 是 token 已进入 <code>ADOPTED_LOCKED</code> 后等待 attach/resume 的既有期限，
+              不属于 10s/30s 两段 TTL，也不由这两个新 sysvar 修改。</li>
+            <li>epoch lease 与每个 token 的 <code>epoch_prepare_deadline_us</code> 必须使用同一个 monotonic clock 和同一 deadline snapshot；
+              任一 token 不一致时不得发布 epoch READY。</li>
+          </ul>
+
+          <h3>11.5 进程边界</h3>
+          <p>
+            deadline、epoch READY lease 和 lifecycle generation 都是当前进程内状态，不写 durable manifest。receiver restart 时现有
+            <code>preserve_trx_transfer_cleanup_receiver_restart_state()</code> 删除残留，所有 epoch 失效。不会从时间戳或文件恢复 TTL。
+          </p>
+          <p class="small">reaper 周期为 1 秒，因此默认 10s/30s 的实际物理清理触发时间为 deadline 后 0–1 秒。</p>
+        </section>
+
+        <section id="destroy">
+          <h2>12. Receiver 统一销毁接口</h2>
+          <p>HA 不主动调用销毁。两个 TTL 只复用同一个 target-local 内部接口：</p>
+          <pre><code>Preserve_trx_receiver_destroy_result
+preserve_trx_transfer_destroy_epoch(
+    const std::string &amp;root_dir,
+    const std::string &amp;epoch_id,
+    Preserve_trx_receiver_destroy_reason reason,
+    uint64_t expected_lifecycle_generation);</code></pre>
+
+          <h3>12.1 两阶段销毁</h3>
+          <ol>
+            <li><b>逻辑失效：</b>在 ready-epoch mutex 下验证 generation，只允许 CAS
+              <code>ACCEPTED_DEADLINE_ACTIVE/READY_DEADLINE_ACTIVE → EXPIRED</code>，随后递增 lifecycle generation。</li>
+            <li><b>lease 防护：</b>若状态已为 <code>ADOPT_LEASED</code>，destroy 返回
+              <code>LEASED_NOT_DESTROYED</code>；不得删除 strict token、ready cache 或 promotion 资源。</li>
+            <li><b>立即阻断：</b>新的 prewarm publish、READY publish 和 promotion lease 均返回 stale/skip。</li>
+            <li><b>取消排队：</b>在现有 prewarm mutex 下扫描 staged/object 两个 deque，删除匹配 root+epoch+旧 generation 的 jobs，并同步扣回 queued bytes、inflight/deferred set。</li>
+            <li><b>释放内存：</b>删除 object proofs、record lock prepared plan、strict lock/binlog facts、seal state、ready cache、prepared registry。</li>
+            <li><b>删除临时文件：</b>删除 staging、process-local carrier snapshot、external blobs、standby markers、epoch fact/commit marker；不 fsync。</li>
+            <li><b>保留轻量 ACK history：</b>在原 ACK grace 到期前，QUERY_EPOCH_STATUS 仍可回答“当前进程曾接受”，但不得重新构造 READY。</li>
+          </ol>
+
+          <h3>12.2 活跃 worker 不等待</h3>
+          <p>
+            destroy 不 join prewarm worker。job 在开始昂贵工作前校验 generation，发布的 proof/cache entry 也携带 generation；
+            所有消费者必须同时验证 authoritative epoch state 和 entry generation。worker 发布后再做一次 authoritative 校验，若已 stale，
+            只删除自己发布的旧 generation entry。这样 destroy 与 publish 无需持两把 cache mutex 做长临界区，也不会让迟到结果重新变成 READY。
+          </p>
+          <pre><code>worker(job_generation):
+  if (!epoch_is_live(job_generation)) return STALE;
+  compute_without_epoch_lock();
+  publish_entry_tagged(job_generation);
+  if (!epoch_is_live(job_generation))
+    erase_entry_if_generation_matches(job_generation);
+
+destroy(expected_generation):
+  CAS ACCEPTED_DEADLINE_ACTIVE / READY_DEADLINE_ACTIVE -> EXPIRED;
+  if ADOPT_LEASED: return LEASED_NOT_DESTROYED;
+  ++lifecycle_generation;  // authoritative visibility fence
+  cancel_queued_jobs(old_generation);
+  purge_entries(old_generation);</code></pre>
+
+          <h3>12.3 复用现有资源</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>资源</th><th>复用/新增动作</th></tr></thead>
+              <tbody>
+                <tr><td>receiver records、strict v4 objects、sequence</td><td>在现有 <code>Preserve_trx_transfer_receiver_registry</code> 增加 per-epoch erase；只处理 transfer 保存层，不新建 registry。</td></tr>
+                <tr><td>prepared token registry</td><td>仅在 epoch 已成功 CAS 到 <code>EXPIRED</code> 且全部 token 尚未 claim 时，复用现有 <code>purge_epoch()</code>。</td></tr>
+                <tr><td>promotion ready cache</td><td>新增窄的 production <code>purge_epoch(dir, epoch)</code>，复用现有 cache accounting。</td></tr>
+                <tr><td>prewarm queue</td><td>从现有 deque/set 做 per-epoch cancel；不新增 worker pool。</td></tr>
+                <tr><td>process-local files</td><td>复用 defer fsync store/remove；保持 receiver fsync=0。</td></tr>
+                <tr><td>restart cleanup</td><td>保持现有 startup 前全量删除；不从 runtime destroy 生成 durable 状态。</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="promotion">
+          <h2>13. Promotion：Preserve 是可选加速项</h2>
+          <p>
+            当前仓库没有真实物理复制升主流程。本轮只预埋 target 内部接口的前置 lease/skip 语义，不把 classic
+            <code>PROMOTION_GATE_EPOCH</code> 变成 production HA 入口。
+          </p>
+          <pre><code>HA promotion trigger
+  -> try_acquire_preserve_epoch(epoch)
+       READY_DEADLINE_ACTIVE : CAS -> ADOPT_LEASED, execute preserve adopt
+       NOT_FOUND             : SKIPPED, ordinary promotion continues
+       ACCEPTED/PREWARMING   : SKIPPED, ordinary promotion continues
+       EXPIRED               : SKIPPED, ordinary promotion continues
+  -> ordinary role/write-enable flow (future HA code)</code></pre>
+          <div class="boundary">
+            <strong>“不阻塞普通升主”的准确边界</strong>
+            candidate 缺失、未 READY、已过期必须在任何 trx claim/MDL attach 之前返回 <code>SKIPPED</code>。一旦 epoch
+            <code>READY_DEADLINE_ACTIVE→ADOPT_LEASED</code> 且 strict token 开始 <code>READY_FOR_GATE→ADOPTING</code> 的不可逆 claim，
+            仍必须使用现有 fail-closed reversal/cleanup 保证内核一致，不能把部分 adopt 当成可直接忽略的 SKIPPED。
+          </div>
+          <p>
+            epoch lease 成功后不再回到 READY，也不再受 TTL reaper 销毁。promotion 在第一个 token claim 前失败时，只允许当前 lease owner
+            执行窄的 <code>ADOPT_LEASED → EXPIRED</code> 放弃操作并调用统一 destroy；确认零 claim/零 MDL 后普通 promotion 才可继续。
+            TTL 线程和普通 destroy 调用都不能抢占已发放的 lease。
+          </p>
+          <p>
+            <code>ABANDONED_ROLLED_BACK</code> 只有在已 claim 的内核对象被完整逆转并证明 kernel clean 后，才能作为
+            <code>PRESERVE_ABANDONED</code> 让普通 promotion 继续；<code>CLEANUP_TAINTED</code> 必须 fail closed。二者不能都映射成前置
+            <code>SKIPPED</code>。
+          </p>
+          <h3>13.1 HA 调用顺序合同</h3>
+          <ol>
+            <li>HA 只有在观察到 source DRAIN 成功，即 source 已处理 FINAL_ACK 并进入 <code>SHUTDOWN_HANDOFF</code> 后，才允许调用 target promotion。</li>
+            <li>若 source RESET 赢，原 DRAIN 返回 <code>ER_PRESERVE_TRX_DRAIN_RESET</code>；HA 不得再对该 orphan epoch 调用 promotion，target 只等待 TTL 销毁。</li>
+            <li>该互斥由 HA attempt/fencing 保证，不增加 source→target cancel RPC，也不让 target 在 adopt 期间反查 source。</li>
+            <li>若 HA 违反上述顺序同时发起 RESET 与 promotion，属于 HA authority 错误；Preserve 内核不以跨节点回滚协议掩盖该错误。</li>
+          </ol>
+
+          <h3>13.2 失败状态分类</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>失败时点</th><th>允许结果</th><th>普通 promotion</th></tr></thead>
+              <tbody>
+                <tr><td>epoch 未 READY、已 EXPIRED 或不存在，且尚未 claim</td><td><code>SKIPPED</code></td><td>立即继续，不受 Preserve 阻塞。</td></tr>
+                <tr><td>READY deadline 到期，尚未取得 adopt lease</td><td><code>EXPIRED</code></td><td>销毁未 claim candidate 后继续。</td></tr>
+                <tr><td>已取得 epoch lease，但第一个 token claim 前失败</td><td>lease owner 执行 <code>ADOPT_LEASED→EXPIRED</code> 并 destroy；不得重新开放 TTL</td><td>确认零 claim/零 MDL 后可继续。</td></tr>
+                <tr><td>claim 后失败且完整逆转</td><td><code>ABANDONED_ROLLED_BACK</code> 或 <code>ABANDONED_NOT_FOUND_PROVEN</code></td><td>kernel-clean 证明成立后继续。</td></tr>
+                <tr><td>claim/attach 后无法完整逆转</td><td><code>CLEANUP_TAINTED</code> / <code>ATTACH_TAINTED</code></td><td>fail closed，不得伪装成 SKIPPED。</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="concurrency">
+          <h2>14. 并发、所有权与锁规则</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>规则</th><th>要求</th></tr></thead>
+              <tbody>
+                <tr><td>原事务逆操作 owner</td><td>只允许原 DRAIN owner 执行；RESET 线程不直接操作 stack vector、THD 或 <code>trx_t*</code>。</td></tr>
+                <tr><td>attempt terminal</td><td>单个 atomic CAS 决定 RESET 与 FINAL_ACK；不使用多个布尔值拼状态。</td></tr>
+                <tr><td>并发 RESET</td><td>第一个 RESET 赢 terminal；后续 RESET 只等待同一 <code>all_transactions_runnable</code>，不重复恢复和计数。</td></tr>
+                <tr><td>manager publication</td><td>使用精确 state+owner CAS；guard 不得覆盖跨线程 RESET 接管。</td></tr>
+                <tr><td>THD 生命周期</td><td>一次全局扫描取得现有 <code>Preserve_trx_external_thd_pin</code>；恢复期间保持 pin。</td></tr>
+                <tr><td>worker cancel</td><td>只在 substep 边界检查；不在持 InnoDB/MDL/registry 关键锁时 sleep/wait。</td></tr>
+                <tr><td>网络 cancel</td><td>cancel mutex 覆盖 active connection 发布、socket shutdown 和清除；不调用 <code>vio_shutdown</code>/<code>SSL_shutdown</code>，<code>mysql_close</code> 仍只由发送线程执行。</td></tr>
+                <tr><td>receiver lifecycle</td><td>只在现有 ready-epoch map 增加 epoch TTL lease；transfer token 与 strict token 状态保持各自 registry 所有权。state CAS 在 ready-epoch mutex 内完成，文件/cache 清理在锁外。</td></tr>
+                <tr><td>prewarm publish</td><td>job、proof/cache entry 和消费者均比对 lifecycle generation；禁止 expired epoch 被迟到 worker 重新发布 READY。</td></tr>
+                <tr><td>TTL 与 promotion</td><td>只允许 <code>READY_DEADLINE_ACTIVE→ADOPT_LEASED</code> 或
+                  <code>READY_DEADLINE_ACTIVE→EXPIRED</code> 一方成功；strict <code>ADOPTING</code> 只能发生在 epoch lease 之后。</td></tr>
+                <tr><td>4020 cutoff</td><td>RESET 只在对应原事务恢复后按 THD 清除；全部 cutoff 清除是 RESET OK 的必要条件。</td></tr>
+                <tr><td>source cleanup ownership</td><td>reaper 只持 generation-qualified 普通 descriptor；禁止持有 DRAIN 栈和内核对象指针。</td></tr>
+                <tr><td>等待者唤醒</td><td>在 Preserve 私有 condition variable 上按 batch-state sequence 唤醒，替代 RESET 关键路径的 10ms 轮询。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>
+            新 condition variable 只替换 Preserve batch wait helper 的 <code>my_sleep(10000)</code>；不修改原生 connection scheduler。
+            每次 batch state 变更递增 sequence 并 notify，waiter 仍以 THD state 为最终 predicate，避免丢唤醒。
+          </p>
+        </section>
+
+        <section id="performance">
+          <h2>15. 性能目标与成本模型</h2>
+          <div class="grid-3">
+            <article class="panel green"><span class="metric">&lt; 10ms</span><span class="metric-label">普通业务 admission 重新开放 P99</span></article>
+            <article class="panel blue"><span class="metric">&lt; 50ms</span><span class="metric-label">默认 3 事务 RESET response P99</span></article>
+            <article class="panel amber"><span class="metric">&lt; 500ms</span><span class="metric-label">1000 事务 hard target；P99 目标 &lt;300ms</span></article>
+          </div>
+          <p>
+            这些是设计目标，不是当前代码实测结论。release NFR 必须分别报告 admission、all sessions runnable、RESET response、
+            owner quiesce 和 cleanup debt drained；后两项不得混入 RESET response。
+          </p>
+
+          <h3>15.1 RESET 正常路径应与事务大小解耦</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>成本项</th><th>复杂度</th><th>是否受每事务 10,000 条写影响</th></tr></thead>
+              <tbody>
+                <tr><td>发布 cancel / manager state</td><td>O(1)</td><td class="no">否</td></tr>
+                <tr><td>一次 THD scan + pin map</td><td>O(T + N)</td><td class="no">否</td></tr>
+                <tr><td>reattach/activate/session restore</td><td>O(N + locks metadata already resident)</td><td class="no">不按 Undo body</td></tr>
+                <tr><td>Undo header activation + redo durability</td><td>O(N) 个小 mtr + 1 次聚合 redo wait</td><td class="no">不按 Undo body；只与有 Undo segment 的事务数相关</td></tr>
+                <tr><td>binlog cache</td><td>metadata-only truncate/reactivate</td><td class="no">不按 cache payload 读写</td></tr>
+                <tr><td>batch state / 4020 cutoff 清除</td><td>O(N)</td><td class="no">否</td></tr>
+                <tr><td>sidecar/blob/temp cleanup</td><td>可大</td><td>可能，但排除在 RESET response 外</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>15.2 首版优化顺序</h3>
+          <ol>
+            <li>消除每 token 全局 THD scan。</li>
+            <li>让 preserve-only Undo activation 返回/聚合最大 redo LSN；全部目标完成 activation 后、发布
+              <code>all_transactions_runnable</code> 前只执行一次 <code>log_write_up_to()</code>。</li>
+            <li>保留 source 原 binlog cache，消除 reset hydrate/file read。</li>
+            <li>按 generation 批量清除 batch state 与 4020 read cutoff。</li>
+            <li>用 socket shutdown-only cancel 中断网络等待。</li>
+            <li>用 condition variable 唤醒 batch waiters。</li>
+            <li>release NFR 后再决定是否需要 parallel restore。</li>
+          </ol>
+          <div class="note">
+            <strong>并行恢复不是首版默认答案</strong>
+            当前最明显的问题是 O(N×THD) 扫描和同步 I/O，而不是单个 reattach 算法。先把算法和 I/O 做对，再根据 1000 事务数据决定是否增加并行，
+            可以避免引入 THD/MDL/binlog restore 的新并发风险。
+          </div>
+        </section>
+
+        <section id="parameters">
+          <h2>16. 参数、状态与错误</h2>
+          <h3>16.1 只新增两个参数</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>参数</th><th>默认</th><th>范围/语义</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><code>preserve_trx_transfer_receiver_prewarm_timeout_ms</code></td>
+                  <td>10000</td>
+                  <td>GLOBAL dynamic，建议 1000–3600000；accepted/FINAL_ACK 后到全 epoch READY 的预算。</td>
+                </tr>
+                <tr>
+                  <td><code>preserve_trx_transfer_receiver_ready_timeout_ms</code></td>
+                  <td>30000</td>
+                  <td>GLOBAL dynamic，建议 1000–3600000；epoch READY 后到 HA 成功取得 <code>ADOPT_LEASED</code> 的预算。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p>
+            值在状态转换时 snapshot 到 epoch，修改 sysvar 只影响后续进入该状态的 epoch。复用现有 1 秒 reaper，不增加 source reset timeout、cleanup worker、
+            restore worker 或 HA mode 参数。现有 <code>preserve_trx_transfer_commit_timeout_ms</code> 仍只表示 source 等 FINAL_ACK 的网络预算，不承担 TTL。
+          </p>
+
+          <h3>16.2 Source status</h3>
+          <ul>
+            <li><code>Preserve_trx_reset_requests</code>、<code>reset_terminal_wins</code>、<code>reset_joined_waiters</code>、
+              <code>reset_noop</code>、<code>reset_too_late</code></li>
+            <li><code>reset_admission_reopen_us</code>、<code>reset_all_transactions_runnable_us</code>、<code>reset_response_us</code></li>
+            <li><code>reset_target_count</code>、<code>reset_restored_count</code>、<code>reset_cutoff_reopened_count</code></li>
+            <li><code>reset_max_worker_cancel_latency_us</code>、<code>reset_owner_quiesced_us</code></li>
+            <li><code>reset_cleanup_debt_generation</code>、<code>reset_cleanup_debt_items</code>、<code>reset_cleanup_debt_attempts</code>、
+              <code>reset_cleanup_debt_oldest_age_ms</code>、<code>reset_cleanup_debt_drained_us</code>、last item/error/state</li>
+          </ul>
+
+          <h3>16.3 Receiver status</h3>
+          <ul>
+            <li>active accepted-deadline/ready-deadline/adopt-leased epoch count</li>
+            <li>prewarm-timeout expired epochs、ready-timeout expired epochs</li>
+            <li>destroyed tokens/bytes、destroy cleanup pending、last expired epoch/reason</li>
+            <li>stale worker publish drops、queued jobs canceled/bytes released、promotion skipped count</li>
+          </ul>
+          <p>复用现有 SHOW STATUS function surface；不新建 Performance Schema table。</p>
+
+          <h3>16.4 新错误</h3>
+          <ul>
+            <li><code>ER_PRESERVE_TRX_DRAIN_RESET</code>：原 DRAIN statement 被 RESET 取消。</li>
+            <li><code>ER_PRESERVE_TRX_RESET_TOO_LATE</code>：FINAL_ACK 已在 source 生效并进入 shutdown handoff。</li>
+            <li>RESET 语义恢复出现实现不变量破坏时，复用现有 <code>ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED</code>，
+              manager 留在 <code>DRAIN_CLEANUP_FAILED</code>；不新增同义错误。</li>
+          </ul>
+        </section>
+
+        <section id="files">
+          <h2>17. 修改文件与工作量评估</h2>
+          <p class="section-lead">目标是把改动集中在 Preserve/Resume 自有模块。除 parser/status 接线外，不进入原生共享热路径。</p>
+
+          <h3>17.1 必改生产文件</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>文件</th><th>精确职责</th><th>预计净增/改动</th></tr></thead>
+              <tbody>
+                <tr><td><code>include/my_sqlcommand.h</code></td><td>新增 <code>SQLCOM_RESET_DRAIN</code>。</td><td>2–4 行</td></tr>
+                <tr><td><code>sql/sql_yacc.yy</code></td><td>独立 <code>RESET DRAIN</code> grammar。</td><td>12–22 行</td></tr>
+                <tr><td><code>sql/sql_parse.cc</code></td><td>dispatch 到 Preserve command service。</td><td>5–12 行</td></tr>
+                <tr><td><code>share/messages_to_clients.txt</code></td><td>RESET canceled / too late 两个错误。</td><td>6–10 行</td></tr>
+                <tr><td><code>sql/preserve_trx_drain.h/.cc</code></td><td>attempt state、FINAL_ACK arbiter、service/owner-quiesce condition、只读观测。</td><td>160–240 行</td></tr>
+                <tr><td><code>sql/preserve_trx.h</code></td><td>manager state、reset API、metrics/status 声明、rollback image retained 标记。</td><td>45–75 行</td></tr>
+                <tr><td><code>sql/preserve_trx.cc</code></td><td>RESET 执行、guard CAS、明确 phase checkpoints、一次 THD scan、restore split、binlog retention、4020 cutoff 解除、source cleanup debt/reaper。</td><td>500–700 行</td></tr>
+                <tr><td><code>sql/preserve_trx_transfer.h/.cc</code></td><td>source cancel slot/socket wake、commit 内 FINAL_ACK arbiter、strict digest 前置修复、
+                  receiver 三层状态映射、epoch lifecycle/deadline、READY 时统一 final-facts deadline binding、per-epoch destroy/queue cancel、status。</td><td>470–650 行</td></tr>
+                <tr><td><code>sql/preserve_trx_promotion.h/.cc</code></td><td>epoch lease、ready-cache purge、pre-claim <code>SKIPPED</code>。</td><td>90–150 行</td></tr>
+                <tr><td><code>storage/innobase/include/trx0preserve.h</code><br><code>storage/innobase/trx/trx0preserve.cc</code></td><td>仅扩展 Preserve 专用 Undo activation API：允许 defer 每事务 redo wait，并把 activation LSN 返回给 RESET owner 聚合；不修改 Undo 格式、Undo scan 或原生 XA 热路径。</td><td>30–60 行</td></tr>
+                <tr><td><code>sql/sys_vars.cc</code></td><td>两个 TTL sysvar。</td><td>20–35 行</td></tr>
+                <tr><td><code>sql/mysqld.cc</code></td><td>COM/status var 注册。</td><td>35–65 行</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>17.2 明确不改</h3>
+          <div class="grid-2">
+            <article class="panel green">
+              <h4>不改 InnoDB 磁盘格式与热路径</h4>
+              <p>不增加 Undo 状态/flag，不修改 Undo scan、lock move 或 crash recovery。只增加一个 Preserve 专用 freeze prepare 入口，并对现有 reattach/activate API 做窄扩展；普通 XA 与事务热路径不变。RESET 不扫描 Undo record、不重建 lock/MVCC。</p>
+            </article>
+            <article class="panel green">
+              <h4>不改 binlog core</h4>
+              <p><code>sql/binlog.cc/.h</code> 已有 metadata-only reactivation API，预计无需修改。</p>
+            </article>
+            <article class="panel green">
+              <h4>不改 wire format</h4>
+              <p>不增加 transfer protocol frame/version。取消是 source 本地信号，TTL 是 receiver 本地状态。</p>
+            </article>
+            <article class="panel green">
+              <h4>不改 startup recovery</h4>
+              <p>首版 RESET 只支持 transfer attempt，不增加 tombstone/replay，也不修改 local carrier、Resurrection Index 或 recover_all。</p>
+            </article>
+          </div>
+
+          <h3>17.3 测试文件：复用现有框架，不新建 harness</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>文件</th><th>处理方式</th><th>覆盖职责</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><code>unittest/gunit/preserve_trx_drain-t.cc</code></td>
+                  <td>扩展</td>
+                  <td>attempt state、commit 内 RESET/FINAL_ACK CAS、guard owner CAS、admission / runnable / owner-quiesced / debt-drained 里程碑。</td>
+                </tr>
+                <tr>
+                  <td><code>unittest/gunit/preserve_trx-t.cc</code></td>
+                  <td>扩展</td>
+                  <td>THD 一次扫描、reverse restore、4020 cutoff、retained cache、socket cancel lifetime、source debt、receiver generation/TTL/destroy。</td>
+                </tr>
+                <tr>
+                  <td><code>mysql-test/suite/preserve_trx/t/batch_drain_reset.test</code><br><code>mysql-test/suite/preserve_trx/r/batch_drain_reset.result</code></td>
+                  <td>新增一组矩阵</td>
+                  <td>语法/权限、无 drain 幂等、phase1/phase2 reset、原连接恢复、RESET_CLEANUP 控制面隔离、OFF-path。</td>
+                </tr>
+                <tr>
+                  <td><code>mysql-test/suite/preserve_trx/t/standby_transfer_receiver_expiry.test</code><br><code>mysql-test/suite/preserve_trx/r/standby_transfer_receiver_expiry.result</code></td>
+                  <td>新增一组矩阵</td>
+                  <td>10s/30s 状态转换使用缩短测试值，超时销毁、迟到 worker 丢弃、pre-claim promotion <code>SKIPPED</code>。</td>
+                </tr>
+                <tr>
+                  <td><code>mysql-test/suite/preserve_trx/t/transfer_receiver_restart_stateless.test</code><br><code>mysql-test/suite/preserve_trx/r/transfer_receiver_restart_stateless.result</code></td>
+                  <td>扩展</td>
+                  <td>receiver restart 后 epoch/READY/deadline 均不恢复，残留在线文件被清除。</td>
+                </tr>
+                <tr>
+                  <td><code>scripts/resumable_trx_business_e2e.py</code><br><code>scripts/tests/test_resumable_trx_business_e2e.py</code></td>
+                  <td>扩展现有场景与报告</td>
+                  <td>双 mysqld RESET/ACK race、TTL、source 继续事务、N=3/1000 release NFR；不创建第四套 E2E runner。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="small">
+            MTR 文件名是实施时建议的最小切分；不把每个 DEBUG_SYNC 点拆成独立用例。现有
+            <code>batch_drain_semantics_matrix.test</code>、<code>batch_drain_post_detach_failure_drains_target.test</code>、
+            <code>standby_promotion_fast_resume_contract_lint.test</code> 作为回归基线，原则上不改其既有断言。
+          </p>
+
+          <h3>17.4 代码量与工期</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>范围</th><th>生产代码</th><th>测试代码</th><th>单人工作量</th></tr></thead>
+              <tbody>
+                <tr><td>基础必需实现</td><td>约 1,300–2,050 行</td><td>约 1,250–1,950 行</td><td>14–20 工程日，含 build/MTR/E2E/NFR 与修复</td></tr>
+                <tr><td>条件项：bounded parallel restore</td><td>额外 180–280 行</td><td>额外 250–400 行</td><td>仅 N=1000 首版不达标时增加 2–3 日</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>实施块</th><th>预计工作量</th><th>主要风险</th></tr></thead>
+              <tbody>
+                <tr><td>SQL、commit 内 attempt CAS、manager guard</td><td>2–3 日</td><td>ACK 验证后、m_epoch_committed 前完成唯一 winner；不能覆盖既有 manager owner。</td></tr>
+                <tr><td>phase1/phase2 cancel、restore split、一次 THD scan、4020 cutoff</td><td>3–5 日</td><td>原 THD/trx 生命周期、cutoff/唤醒顺序、retained binlog cache。</td></tr>
+                <tr><td>classic transport cancel + source cleanup debt</td><td>2–3 日</td><td>socket shutdown 生命周期、worker 栈退出、descriptor-only ownership；取消后不得重连或查询 target。</td></tr>
+                <tr><td>receiver 三层状态、TTL/destroy、promotion pre-claim optionality</td><td>3–4 日</td><td>deadline 统一绑定、job/entry generation、worker 迟到 publish、expiry/adopt CAS、队列计账和清理幂等。</td></tr>
+                <tr><td>GUnit、MTR、双 mysqld E2E、release NFR 与修复</td><td>4–5 日</td><td>网络竞态可重复性、digest 冲突、1000 事务尾延迟和故障注入。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="small">
+            估算不包含真实物理复制/HA promotion 集成。最大不确定性是 source transport 的跨线程 socket cancel 在 Unix/TLS 下的验证、
+            4020 cutoff 与 THD 唤醒顺序、source cleanup ownership，以及 1000 THD reattach 的 release NFR；不是事务 payload 大小。
+          </p>
+        </section>
+
+        <section id="minimality">
+          <h2>18. 防止过度设计和代码泛滥</h2>
+          <div class="decision"><b>一个 SQL</b><div>只有 <code>RESET DRAIN</code>，不设计 token/epoch 级 source reset 命令。</div></div>
+          <div class="decision"><b>一个 attempt</b><div>进程内只有当前 drain attempt；不建通用 workflow engine。</div></div>
+          <div class="decision"><b>一个销毁入口</b><div>两个 receiver TTL 都调用同一个 <code>destroy_epoch()</code>；HA 不主动调用。</div></div>
+          <div class="decision"><b>两个参数</b><div>只增加 10s 与 30s；不增加 source reset timeout、worker count 或 retry 参数。</div></div>
+          <div class="decision"><b>零新线程</b><div>source owner 只移交 descriptor，source/target 都复用现有 1s reaper；prewarm 复用现有 pool。</div></div>
+          <div class="decision"><b>零 receiver durability</b><div>不 fsync、不 replay、不恢复 deadline/READY；restart 全部失效。</div></div>
+          <div class="decision"><b>零分布式回滚</b><div>RESET 不等待 target；orphan candidate 由 target TTL 处理。</div></div>
+          <div class="decision"><b>单一窄 InnoDB 入口</b><div>专用 freeze prepare 只复用原生持久状态转换并禁止锁释放；同一 <code>trx_t</code> 逆转 detach，不扫描 Undo、不重建内核对象。</div></div>
+          <div class="decision"><b>先串行再量化</b><div>先做一次 scan + reverse restore；parallel restore 由 NFR 数据触发。</div></div>
+
+          <h3>18.1 Review blocker</h3>
+          <ul>
+            <li>任何设计把 RESET 返回绑定到 receiver ACK/prewarm/cleanup。</li>
+            <li>任何设计在 RESET OK 后继续恢复某个原事务、batch state 或 4020 cutoff。</li>
+            <li>任何设计让 source 在 FINAL_ACK 后继续轮询 target READY。</li>
+            <li>任何设计为 receiver TTL 写 durable marker 或 startup replay。</li>
+            <li>任何设计在 RESET 正常路径读取 snapshot/binlog/record-lock payload。</li>
+            <li>任何设计从 RESET 线程调用 <code>vio_shutdown()</code>、<code>SSL_shutdown()</code> 或 <code>mysql_close()</code>。</li>
+            <li>任何 cleanup debt 保存 THD/trx/participant/session/sink 指针或 DRAIN 栈引用。</li>
+            <li>任何设计增加 source reset timeout、restore watchdog 或跨 mysqld crash replay。</li>
+            <li>任何设计修改 InnoDB Undo scan、lock move 或 crash recovery 热路径。</li>
+            <li>任何设计在 pre-claim candidate 不可用时阻塞普通 promotion。</li>
+            <li>任何设计在 transfer receiver record 中复制 <code>READY_FOR_GATE/ADOPTING/ACTIVE</code>，或另建一套 strict token registry。</li>
+            <li>任何设计继续用 <code>preserve_trx_transfer_commit_timeout_ms</code> 生成 transfer strict token 的
+              <code>epoch_prepare_deadline_us</code>。</li>
+            <li>任何设计允许普通 TTL destroy 删除 <code>ADOPT_LEASED</code> epoch。</li>
+            <li>任何设计仅凭 READY 类 state 把不同 object-set digest 的二次输入判为幂等成功。</li>
+            <li>任何设计首版直接引入跨 THD parallel restore，而没有串行索引化 NFR 证据。</li>
+          </ul>
+
+          <h3>18.2 本轮综合审核裁定</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>审核项</th><th>裁定</th><th>本文闭环</th></tr></thead>
+              <tbody>
+                <tr><td>C1 / C4</td><td class="yes">采纳</td><td>FINAL_ACK CAS 移入 commit 成功处理内部；manager guard 改为完整 state+owner CAS。</td></tr>
+                <tr><td>C7 / H4</td><td class="yes">采纳</td><td>枚举 phase1、closing、phase2、publish、COMMIT 和网络唤醒 checkpoint，并增加最大取消延迟指标。</td></tr>
+                <tr><td>H5 / H6</td><td class="yes">采纳</td><td>transfer-only retained binlog cache；新增 descriptor-only source cleanup debt，复用现有 reaper。</td></tr>
+                <tr><td>H14 / H15</td><td class="yes">采纳</td><td>job/entry/consumer generation + per-epoch queue cancel，先逻辑失效再异步清理。</td></tr>
+                <tr><td>C2 / X1</td><td>修正后采纳</td><td>本树结构可访问，但不调用 <code>vio_shutdown</code>；使用 cancel mutex 保护的 socket shutdown-only。</td></tr>
+                <tr><td>C6</td><td>降级并补防御</td><td>现有 wire ACK 身份已完整；只加本地 attempt generation/epoch 断言与 stale ACK 测试。</td></tr>
+                <tr><td>C5 / H2 / H3</td><td class="no">拒绝过度设计</td><td>不增加 watchdog/timeout/第二 restore owner；RESET 后语义恢复不可取消，mysqld crash 走既有进程语义。</td></tr>
+                <tr><td>H7 / X2 / X3 / X4</td><td>澄清或验证</td><td>使用既有 THD pin；保持既有 reverse order 并补并发测试；Bison build 验证 grammar；区分 SKIPPED/ABANDONED/TAINTED。</td></tr>
+                <tr><td>Receiver 状态映射</td><td class="yes">采纳</td><td>transfer record、strict token、epoch TTL lease 三层分离；只扩现有 ready-epoch map。</td></tr>
+                <tr><td>Strict digest fast return</td><td class="yes">采纳为前置修复</td><td>同 digest 才幂等；冲突进入 <code>CORRUPT/DIGEST_CONFLICT</code>，不得只看 state。</td></tr>
+                <tr><td>Source/target adoption 竞态</td><td>修正后采纳</td><td>由 HA 保证 DRAIN success 后才 promotion；不增加跨节点 cancel/rollback 协议。</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="tests">
+          <h2>19. 测试与验收</h2>
+          <h3>19.1 Release-blocking 测试规格</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>TestCaseID</th><th>前置条件 / DEBUG_SYNC</th><th>操作</th><th>预期状态序列</th><th>预期结果</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><code>RESET_ACK_RESET_WINS</code></td>
+                  <td>target 已接受 COMMIT；source 停在 ACK 验证后、terminal CAS 前</td>
+                  <td>并发执行 RESET，随后放行 ACK 线程</td>
+                  <td><code>RUNNING→RESET_REQUESTED</code>；不得进入 SHUTDOWN_HANDOFF</td>
+                  <td>RESET OK；DRAIN 返回 reset-canceled；source 原 Tx 可继续；target 等 TTL。</td>
+                </tr>
+                <tr>
+                  <td><code>RESET_ACK_FINAL_ACK_WINS</code></td>
+                  <td>source 停在 terminal CAS 成功后、<code>m_epoch_committed</code> 前</td>
+                  <td>并发执行 RESET</td>
+                  <td><code>RUNNING→SHUTDOWN_HANDOFF</code>；manager 随后精确 CAS 到 <code>SHUTDOWN_REQUESTED</code></td>
+                  <td>RESET 返回 TOO_LATE；source 继续既有 shutdown handoff。</td>
+                </tr>
+                <tr>
+                  <td><code>RESET_CONCURRENT_JOIN</code></td>
+                  <td>phase2 已 detach 至少一个事务；restore owner 暂停在语义恢复点</td>
+                  <td>两个 HA session 同时执行 RESET</td>
+                  <td>仅一个 terminal winner；两个调用等待同一 <code>all_transactions_runnable</code></td>
+                  <td>两个 RESET 都返回 OK；restore count 不重复；winner count=1。</td>
+                </tr>
+                <tr>
+                  <td><code>RESET_4020_REPLAY</code></td>
+                  <td>原业务 SQL 已收到 4020；对应事务处于 <code>PRESERVED_DRAINED</code></td>
+                  <td>RESET OK 后在原 Tx 重放同一 SQL</td>
+                  <td>reattach/activate → batch NONE → cutoff reopened</td>
+                  <td>重放正常执行，不再返回 4020；drained count=0。</td>
+                </tr>
+                <tr>
+                  <td><code>RESET_DEBT_ASYNC</code></td>
+                  <td>注入 provenance/临时文件删除失败</td>
+                  <td>执行 RESET 并持续运行普通 SQL</td>
+                  <td>业务恢复 → RESET OK → owner quiesced → debt 重试 → IDLE</td>
+                  <td>SQL 不受影响；新 DRAIN 在 debt 清空前拒绝；attempts/oldest-age/last-error 可观测。</td>
+                </tr>
+                <tr>
+                  <td><code>STRICT_DIGEST_CONFLICT</code></td>
+                  <td>同 key/generation 已处于 READY 类状态</td>
+                  <td>分别重放相同 digest 和不同 digest 的 manifest</td>
+                  <td>same → 原状态；different → <code>CORRUPT</code></td>
+                  <td>相同 digest 返回 IDEMPOTENT；不同 digest 返回 DIGEST_CONFLICT，禁止 state-only fast return。</td>
+                </tr>
+                <tr>
+                  <td><code>TTL_ACCEPTED_EXPIRES</code></td>
+                  <td>epoch 已 FINAL_ACK；prewarm worker 暂停，缩短 10s 参数</td>
+                  <td>推进 reaper 并随后放行迟到 worker</td>
+                  <td><code>ACCEPTED_DEADLINE_ACTIVE→EXPIRED</code>；generation 递增</td>
+                  <td>迟到 publish 被丢弃；strict/transfer/cache 资源最终清除。</td>
+                </tr>
+                <tr>
+                  <td><code>TTL_READY_ADOPT_RACE</code></td>
+                  <td>epoch 为 <code>READY_DEADLINE_ACTIVE</code>，expiry 与 HA lease 同时到达</td>
+                  <td>并发执行 reaper CAS 和 test promotion lease</td>
+                  <td>只能到 <code>EXPIRED</code> 或 <code>ADOPT_LEASED</code> 之一</td>
+                  <td>EXPIRED 时 claim count=0；ADOPT_LEASED 时普通 destroy 返回 LEASED_NOT_DESTROYED。</td>
+                </tr>
+                <tr>
+                  <td><code>HA_SEQUENCE_AFTER_RESET</code></td>
+                  <td>source RESET 已赢，target 存在 orphan candidate</td>
+                  <td>通过 test HA wrapper 验证调用顺序</td>
+                  <td>source DRAIN terminal 为 reset-canceled；target 不取得 lease</td>
+                  <td>只验证 HA 合同和 TTL 销毁，不增加 source→target cancel RPC。</td>
+                </tr>
+                <tr>
+                  <td><code>RESET_INVARIANT_FAIL_CLOSED</code></td>
+                  <td>fault injection 破坏 reattach/activate/cutoff-clear</td>
+                  <td>执行 RESET</td>
+                  <td>manager → <code>DRAIN_CLEANUP_FAILED</code></td>
+                  <td>不得返回 OK；复用 ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED；标记 release blocker。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>19.2 GUnit</h3>
+          <ul>
+            <li>attempt CAS：RESET vs FINAL_ACK 两边各赢；无双 winner。</li>
+            <li>ACK 验证后、<code>m_epoch_committed</code>/transport release 前完成 arbiter；RESET 输赢两条路径均无窗口。</li>
+            <li>manager guard 精确 CAS：RESET_CLEANUP 不被原 guard transition/析构覆盖。</li>
+            <li>无 drain 幂等、重复 RESET、TOO_LATE。</li>
+            <li>admission_reopened、all_transactions_runnable、owner_quiesced 与 debt_drained 四个里程碑分离；RESET 只等待第二个。</li>
+            <li>source cancel：final payload/COMMIT 阻塞时 shutdown-only wake；cancel mutex 覆盖 active connection 生命周期，取消后不 reconnect/query。</li>
+            <li>一次 THD scan、reverse restore 顺序、pin 生命周期。</li>
+            <li>binlog retained cache reactivation，payload read bytes=0。</li>
+            <li>source cleanup debt 只接受普通 descriptor；重复 pass 幂等，最后一个 debt 清除后精确 CAS 回 IDLE。</li>
+            <li>全部恢复目标 batch state=<code>NONE</code> 且 4020 cutoff 清除；不得出现 RESET OK 后再次返回 4020。</li>
+            <li>receiver 三层状态映射，以及 epoch
+              <code>ACCEPTED_DEADLINE_ACTIVE/READY_DEADLINE_ACTIVE/ADOPT_LEASED/EXPIRED</code> 转移；job/entry/consumer generation 防迟到 publish。</li>
+            <li>epoch binder 为全部 strict token 使用同一个 ready deadline；不再从 commit timeout 生成
+              <code>epoch_prepare_deadline_us</code>，不一致时 epoch READY 发布失败。</li>
+            <li>strict READY 类重入必须比较 object-set digest/version：相同为 IDEMPOTENT，不同为 DIGEST_CONFLICT/CORRUPT。</li>
+            <li>destroy 幂等、ACK history 保留、ready cache/prepared registry per-epoch purge。</li>
+            <li>过期 ACK、错误 attempt generation、destroy 与 publish 交错、queued bytes/inflight set 精确回收。</li>
+          </ul>
+
+          <h3>19.3 MTR</h3>
+          <ul>
+            <li>grammar、SHUTDOWN privilege、显式事务拒绝、无 active drain OK。</li>
+            <li>phase1、closing、phase2 before/after one target preserve 的 RESET。</li>
+            <li>active warmcopy participant、DRAIN owner KILL、RESET caller 断开/重试和恢复期间 SHUTDOWN busy。</li>
+            <li>RESET_CLEANUP 期间普通 SQL 可运行，新 DRAIN/Preserve control 被拒绝。</li>
+            <li>原 DRAIN 返回 canceled 专用错误；RESET 返回 OK。</li>
+            <li>RESET OK 后在原 Tx 重放触发 4020 的 SQL，正常执行且不再返回 4020。</li>
+            <li>local-carrier drain attempt 不进入首版 RESET 支持范围。</li>
+            <li><code>preserve_trx_enable=OFF</code> 原生路径不受影响。</li>
+          </ul>
+
+          <h3>19.4 Standalone 双 mysqld E2E</h3>
+          <ul>
+            <li>source phase1/phase2 各 DEBUG_SYNC 点执行 RESET，原事务继续 UPDATE/COMMIT。</li>
+            <li>Unix socket 与 TLS/TCP 两种 transport 在 final payload/COMMIT wait 中被 shutdown-only cancel 快速唤醒。</li>
+            <li>COMMIT 已发送但 ACK 尚未处理时 RESET 赢：source 业务恢复，target candidate 到 TTL 后消失。</li>
+            <li>FINAL_ACK CAS 赢：RESET TOO_LATE，source 继续 shutdown。</li>
+            <li>缩短 TTL 验证 ACK→READY timeout、READY→ADOPT_LEASED timeout 和 restart invalidation。</li>
+            <li>expired/missing candidate 的 test promotion wrapper 返回 <code>SKIPPED</code>，不执行 claim。</li>
+          </ul>
+          <div class="boundary">
+            <strong>证据命名</strong>
+            该 E2E 只能命名为 <code>STANDALONE_TRANSFER_RESET_E2E</code>。没有物理复制 provider、role switch 和 write-enable，
+            不得命名为 physical promotion E2E。
+          </div>
+
+          <h3>19.5 Release NFR</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>项目</th><th>固定合同</th></tr></thead>
+              <tbody>
+                <tr><td>构建</td><td><code>build-release</code>，记录完整 commit SHA、CMake flags；不使用 ASAN/UBSAN/Debug build 作为性能证据。</td></tr>
+                <tr><td>机器</td><td>报告 CPU 型号/核数、RAM、文件系统、磁盘、OS；测试期间禁止 swap 和无关压力任务，机器变化后结果不可直接横比。</td></tr>
+                <tr><td>MySQL 内存</td><td>source 与 receiver <code>innodb_buffer_pool_size=2GiB</code>；报告 Preserve transfer/prewarm 内存上限和实际峰值。</td></tr>
+                <tr><td>数据与事务</td><td>固定 schema、表大小、连接数和 token 数；payload-independence 场景使用每事务 10,000 条真实 UPDATE。</td></tr>
+                <tr><td>运行次数</td><td>每组先 warmup 10 次，再测量至少 100 次；若环境中断或出现 server restart，该组从 warmup 重新开始。</td></tr>
+                <tr><td>主矩阵</td><td>N=1、3、100、1000；Unix socket 为主性能门禁，loopback TCP/TLS 作为取消正确性和尾延迟补充报告。</td></tr>
+                <tr><td>统计</td><td>输出 count/min/median/P95/P99/max，不用单次最好值；N=1000 要同时满足 P99&lt;300ms、max&lt;500ms。</td></tr>
+                <tr><td>报告</td><td>生成机器可读 JSON 和文本摘要，包含五阶段时间、worker cancel、debt、4020、Undo body/payload read 零值、Undo header activation 数量、redo wait 次数/耗时及失败原因。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <ul>
+            <li>N=1、3、100、1000；大事务场景可使用每事务 10,000 条真实 UPDATE。</li>
+            <li>分别报告 <code>admission_reopen_us</code>、<code>all_transactions_runnable_us</code>、<code>reset_response_us</code>、<code>owner_quiesced_us</code>、<code>cleanup_debt_drained_us</code>。</li>
+            <li>报告 <code>reset_max_worker_cancel_latency_us</code>，证明没有无界 work-between-checkpoints。</li>
+            <li>断言 RESET window：Undo body pages/records=0、artifact payload read bytes=0、receiver wait us=0；另行断言
+              <code>undo_header_activation_count</code> 与具有 redo Undo 的目标事务/Undo segment 匹配，
+              <code>redo_durable_wait_count=1</code>（没有 redo activation LSN 时为 0）。</li>
+            <li>断言 RESET OK 时 restored_count=target_count、cutoff_reopened_count=target_count、<code>PRESERVED_DRAINED</code> count=0。</li>
+            <li>注入 sender 临时资源/provenance cleanup 失败时原事务仍可继续，cleanup debt 在后台收敛。</li>
+            <li>注入 reattach/activate/cutoff-clear 失败时不得返回 OK，并将用例标记为 release blocker。</li>
+            <li>只有一次 scan 方案未达到 N=1000 P99&lt;300ms / max&lt;500ms，才批准 parallel restore 条件切片。</li>
+          </ul>
+        </section>
+
+        <section id="delivery">
+          <h2>20. 推荐落地顺序</h2>
+          <p>以下是风险隔离顺序，不是要求一次性铺开修改。</p>
+          <ol>
+            <li><b>S0：strict digest 幂等前置修复。</b>修复 READY 类快速返回：相同 object-set digest 才返回幂等，
+              不同 digest 标记 CORRUPT 并返回 DIGEST_CONFLICT；在 TTL/destroy 接入前先锁住 registry 身份。</li>
+            <li><b>S1：SQL + commit 内 attempt CAS + manager guard。</b>先证明 RESET/FINAL_ACK 只有一个 winner，且 guard 不覆盖 RESET。</li>
+            <li><b>S2：source phase checkpoints + socket cancel + waiter wake。</b>覆盖 phase1/closing 和网络阻塞，不碰 detach restore。</li>
+            <li><b>S3：restore split + retained binlog cache + 一次 THD scan。</b>完成 phase2 原事务快速恢复和 4020 cutoff。</li>
+            <li><b>S4：source cleanup debt。</b>证明 RESET response、原 DRAIN 栈退出与物理清理三者解耦。</li>
+            <li><b>S5：receiver 三层状态映射 + lifecycle generation + TTL + destroy。</b>复用现有 ready-epoch map 和 reaper，
+              READY 时统一绑定 token deadline，先逻辑失效后取消队列/异步释放。</li>
+            <li><b>S6：promotion lease/SKIPPED/ABANDONED。</b>只做 pre-claim optionality和既有 post-claim fail-closed 对齐，不扩真实 HA。</li>
+            <li><b>S7：MTR/E2E/NFR。</b>根据 1000 事务数据决定是否启用条件 parallel restore。</li>
+          </ol>
+          <p>
+            每个切片都应保持 <code>preserve_trx_enable=OFF</code>、普通 XA、本地 startup resume 和现有 transfer E2E 不变；不应在 S1 就改动
+            InnoDB、startup recovery 或 wire codec。
+          </p>
+        </section>
+
+        <section id="matrix">
+          <h2>21. 设计闭环矩阵</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>用户原则</th><th>设计落点</th><th>验收</th></tr></thead>
+              <tbody>
+                <tr><td>可撤销窗口内 RESET 必然成功，原主立即服务</td><td>RESET 赢则发布 RESET_CLEANUP；返回前全部原事务已恢复、batch state=<code>NONE</code>、4020 cutoff 已解除。worker 退出和物理清理只能在该屏障之后继续。SHUTDOWN_HANDOFF 后明确 TOO_LATE。</td><td>phase1/phase2 E2E；RESET OK 后原 Tx 重放成功且 drained count=0；FINAL_ACK winner 返回 TOO_LATE。</td></tr>
+                <tr><td>并发 RESET 仍是一次回撤</td><td>第一个 CAS winner 执行恢复；同 generation 后续调用共享
+                  <code>all_transactions_runnable</code>，attempt 终止后不回 RUNNING。</td><td><code>RESET_CONCURRENT_JOIN</code>：两个 OK、winner=1、restore 不重复。</td></tr>
+                <tr><td>内核对象可持续清理</td><td>原 DRAIN owner 只做 worker quiesce 和 descriptor 移交；source debt 复用 1s reaper，禁止持内核/栈指针。</td><td>RESET response、owner_quiesced、debt_drained 三段指标分离。</td></tr>
+                <tr><td>FINAL_ACK 后 source/receiver 解耦</td><td>ACK 验证后在 commit 内先完成 terminal CAS，再标记 committed/release transport；source 不查 READY、不触发 promotion、不等待 target destroy。</td><td>commit 内双 winner 竞态；source teardown 与 target TTL 独立测试。</td></tr>
+                <tr><td>receiver restart 无状态</td><td>不持久化 lifecycle/deadline，现有 startup cleanup 删除残留。</td><td>receiver restart 后 query/gate 均无 candidate。</td></tr>
+                <tr><td>FINAL_ACK→READY 10s</td><td>accepted deadline + lifecycle generation；reaper 先逻辑失效，迟到 worker 结果不可见。</td><td>缩短参数的 TTL、queue cancel 和 late publish 用例。</td></tr>
+                <tr><td>READY→升主 lease 30s</td><td>ready deadline；<code>READY_DEADLINE_ACTIVE→ADOPT_LEASED</code> 取消 TTL，
+                  strict token 随后才进入 <code>ADOPTING</code>。</td><td>expiry/adopt lease CAS 双向竞态。</td></tr>
+                <tr><td>不重复发明 receiver 状态</td><td>transfer record、strict prepared token、epoch TTL lease 三层各自单一职责；
+                  <code>epoch_prepare_deadline_us</code> 与 ready deadline 使用同一 snapshot。</td><td>状态映射 GUnit；任一 token deadline 不一致不得发布 epoch READY。</td></tr>
+                <tr><td>READY 幂等不能掩盖内容冲突</td><td>READY 类快速路径仍校验 object-set digest/version；不同内容进入
+                  <code>CORRUPT/DIGEST_CONFLICT</code>。</td><td><code>STRICT_DIGEST_CONFLICT</code>。</td></tr>
+                <tr><td>Preserve 不阻塞普通升主</td><td>missing/prewarming/expired 在 claim 前返回 SKIPPED。</td><td>claim counter=0，ordinary path 可继续。</td></tr>
+                <tr><td>1000 事务快速 RESET</td><td>同一 trx_t、零 Undo scan、零 payload read、一次 THD scan、批量 state/cutoff 清除。</td><td>release NFR P99&lt;300ms、max&lt;500ms 目标。</td></tr>
+                <tr><td>不能过度设计</td><td>一个 SQL、一个 attempt、一个 destroy、两个参数、零新线程、零新 InnoDB hook。</td><td>source-shape lint + 文件变更审查。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="success">
+            <strong>最终裁定</strong>
+            该方案的核心不是“把 DRAIN 倒放一遍”，而是明确四个边界：source 业务恢复点、source worker/cleanup 所有权移交点、
+            source FINAL_ACK 线性化点、target candidate 自动失效点。RESET 只等待第一个点；其余各自原子推进且不得反向改变连接状态，
+            才能同时满足快速回撤、两端解耦和最小侵入。
+          </div>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <p>
+          本文基于 MySQL 8.0.22 Preserve/Resume 工作树 HEAD
+          <span class="mono">302ae0940a58040ef35c0a0d0f6a289eb1708cc7</span> 的代码事实编写。
+          源码、测试和参数尚未按本文实现；首版范围已收敛为 transfer drain，RESET OK 以全部原事务可运行且 4020 cutoff 已解除为准。
+        </p>
+      </footer>
+    </div>
+  </div>
+
+  <script>
+    (() => {
+      const links = Array.from(document.querySelectorAll('.toc a'));
+      const sections = links
+        .map(link => document.querySelector(link.getAttribute('href')))
+        .filter(Boolean);
+      if (!('IntersectionObserver' in window)) return;
+      const observer = new IntersectionObserver(entries => {
+        const visible = entries
+          .filter(entry => entry.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)[0];
+        if (!visible) return;
+        links.forEach(link => {
+          link.classList.toggle('active', link.getAttribute('href') === `#${visible.target.id}`);
+        });
+      }, { rootMargin: '-12% 0px -75% 0px', threshold: [0, 1] });
+      sections.forEach(section => observer.observe(section));
+    })();
+  </script>
+</body>
+</html>

@@ -7252,6 +7252,148 @@ void Preserve_trx_transfer_receiver_registry::end_payload_sequence(
   m_sequence_condition.notify_all();
 }
 
+Preserve_trx_transfer_status
+Preserve_trx_transfer_receiver_registry::reserve_payload_apply(
+    const std::string &epoch_id, uint64_t first_sequence,
+    uint64_t last_sequence, const std::vector<uint64_t> &tokens,
+    Preserve_trx_transfer_payload_apply_reservation *reservation) {
+  if (epoch_id.empty() || first_sequence == 0 ||
+      last_sequence < first_sequence || tokens.empty() ||
+      reservation == nullptr) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+
+  Preserve_trx_transfer_payload_apply_reservation built;
+  std::vector<uint64_t> sorted_tokens;
+  try {
+    built.epoch_id = epoch_id;
+    built.first_sequence = first_sequence;
+    built.last_sequence = last_sequence;
+    sorted_tokens = tokens;
+    std::sort(sorted_tokens.begin(), sorted_tokens.end());
+    sorted_tokens.erase(
+        std::unique(sorted_tokens.begin(), sorted_tokens.end()),
+        sorted_tokens.end());
+  } catch (...) {
+    return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
+  }
+  if (sorted_tokens.front() == 0) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+
+  std::lock_guard<std::mutex> guard(m_mutex);
+  const auto key = std::make_pair(epoch_id, first_sequence);
+  const auto existing = m_payload_apply_records.find(key);
+  if (existing != m_payload_apply_records.end()) {
+    if (existing->second.last_sequence != last_sequence ||
+        existing->second.tokens != sorted_tokens) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
+    *reservation = std::move(built);
+    return Preserve_trx_transfer_status::OK;
+  }
+
+  try {
+    Payload_apply_record record;
+    record.last_sequence = last_sequence;
+    record.tokens = sorted_tokens;
+    m_payload_apply_records.emplace(key, std::move(record));
+    for (uint64_t token : sorted_tokens) {
+      m_payload_apply_queue_by_token[Token_key(epoch_id, token)].push_back(
+          first_sequence);
+    }
+  } catch (...) {
+    m_payload_apply_records.erase(key);
+    for (uint64_t token : sorted_tokens) {
+      const auto queue =
+          m_payload_apply_queue_by_token.find(Token_key(epoch_id, token));
+      if (queue == m_payload_apply_queue_by_token.end()) continue;
+      if (!queue->second.empty() &&
+          queue->second.back() == first_sequence) {
+        queue->second.pop_back();
+      }
+      if (queue->second.empty()) m_payload_apply_queue_by_token.erase(queue);
+    }
+    return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
+  }
+  *reservation = std::move(built);
+  return Preserve_trx_transfer_status::OK;
+}
+
+Preserve_trx_transfer_status
+Preserve_trx_transfer_receiver_registry::wait_for_payload_apply_turn(
+    const Preserve_trx_transfer_payload_apply_reservation &reservation,
+    uint64_t timeout_ms, bool *apply_owner) {
+  if (reservation.epoch_id.empty() || reservation.first_sequence == 0 ||
+      reservation.last_sequence < reservation.first_sequence ||
+      timeout_ms == 0 || apply_owner == nullptr) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  *apply_owner = false;
+
+  std::unique_lock<std::mutex> guard(m_mutex);
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(timeout_ms);
+  const auto key =
+      std::make_pair(reservation.epoch_id, reservation.first_sequence);
+  for (;;) {
+    auto record = m_payload_apply_records.find(key);
+    if (record == m_payload_apply_records.end()) {
+      return Preserve_trx_transfer_status::OK;
+    }
+    if (record->second.last_sequence != reservation.last_sequence) {
+      return Preserve_trx_transfer_status::CORRUPT;
+    }
+
+    bool ready = !record->second.applying;
+    for (uint64_t token : record->second.tokens) {
+      const Token_key token_key(reservation.epoch_id, token);
+      const auto queue = m_payload_apply_queue_by_token.find(token_key);
+      if (queue == m_payload_apply_queue_by_token.end() ||
+          queue->second.empty() ||
+          queue->second.front() != reservation.first_sequence) {
+        ready = false;
+        break;
+      }
+    }
+    if (ready) {
+      record->second.applying = true;
+      *apply_owner = true;
+      return Preserve_trx_transfer_status::OK;
+    }
+    if (m_sequence_condition.wait_until(guard, deadline) ==
+        std::cv_status::timeout) {
+      return Preserve_trx_transfer_status::RESOURCE_EXHAUSTED;
+    }
+  }
+}
+
+void Preserve_trx_transfer_receiver_registry::finish_payload_apply(
+    const Preserve_trx_transfer_payload_apply_reservation &reservation) {
+  {
+    std::lock_guard<std::mutex> guard(m_mutex);
+    const auto key =
+        std::make_pair(reservation.epoch_id, reservation.first_sequence);
+    const auto record = m_payload_apply_records.find(key);
+    if (record == m_payload_apply_records.end() ||
+        record->second.last_sequence != reservation.last_sequence) {
+      return;
+    }
+    for (uint64_t token : record->second.tokens) {
+      const Token_key token_key(reservation.epoch_id, token);
+      const auto queue = m_payload_apply_queue_by_token.find(token_key);
+      if (queue == m_payload_apply_queue_by_token.end()) continue;
+      const auto sequence = std::find(queue->second.begin(),
+                                      queue->second.end(),
+                                      reservation.first_sequence);
+      if (sequence != queue->second.end()) queue->second.erase(sequence);
+      if (queue->second.empty()) m_payload_apply_queue_by_token.erase(queue);
+    }
+    m_payload_apply_records.erase(record);
+  }
+  m_sequence_condition.notify_all();
+}
+
 Preserve_trx_transfer_status Preserve_trx_transfer_receiver_registry::
     wait_for_frame_sequence_applied_through(const std::string &epoch_id,
                                             uint64_t through_sequence,
@@ -13265,6 +13407,7 @@ Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch
   std::string payload_epoch;
   uint64_t first_sequence = 0;
   uint64_t last_sequence = 0;
+  std::set<uint64_t> payload_apply_tokens;
   for (const Preserve_trx_transfer_frame &frame : frames) {
     if (!receiver_frame_should_spool(frame.type)) continue;
     if (payload_epoch.empty()) payload_epoch = frame.epoch_id;
@@ -13275,6 +13418,9 @@ Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch
       first_sequence = frame.sequence;
     }
     last_sequence = std::max(last_sequence, frame.sequence);
+    if (frame.type != Preserve_trx_transfer_frame_type::COMMIT_EPOCH) {
+      payload_apply_tokens.insert(frame.token);
+    }
   }
   bool payload_sequence_started = false;
   const uint64_t payload_timeout_ms =
@@ -13299,6 +13445,17 @@ Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch
   Preserve_trx_transfer_status status = pre_admit_receiver_batch_sequence(
       root_dir, frames, registry, !process_local_phase2);
   if (status != Preserve_trx_transfer_status::OK) return status;
+  Preserve_trx_transfer_payload_apply_reservation apply_reservation;
+  bool apply_reserved = false;
+  if (!payload_apply_tokens.empty()) {
+    const std::vector<uint64_t> tokens(payload_apply_tokens.begin(),
+                                       payload_apply_tokens.end());
+    status = registry->reserve_payload_apply(
+        payload_epoch, first_sequence, last_sequence, tokens,
+        &apply_reservation);
+    if (status != Preserve_trx_transfer_status::OK) return status;
+    apply_reserved = true;
+  }
   payload_sequence_guard.rollback();
   payload_sequence_started = false;
   bool contains_commit_epoch = false;
@@ -13317,6 +13474,18 @@ Preserve_trx_transfer_status preserve_trx_transfer_handle_receiver_payload_batch
     status = after_spool(after_spool_context, contains_commit_epoch);
     if (status != Preserve_trx_transfer_status::OK) return status;
   }
+  bool apply_owner = true;
+  if (apply_reserved) {
+    status = registry->wait_for_payload_apply_turn(
+        apply_reservation, payload_timeout_ms, &apply_owner);
+    if (status != Preserve_trx_transfer_status::OK) return status;
+    if (!apply_owner) return Preserve_trx_transfer_status::OK;
+  }
+  auto apply_reservation_guard = create_scope_guard([&] {
+    if (apply_reserved && apply_owner) {
+      registry->finish_payload_apply(apply_reservation);
+    }
+  });
   Receiver_payload_batch_apply_context context;
   context.root_dir = &root_dir;
   context.store = store;
