@@ -32,6 +32,8 @@ from scripts.resumable_trx_business_e2e import (
     DrainTargetCounterRejectionMetrics,
     Phase2PauseSample,
     ReceiverPrewarmMetrics,
+    ResetDrainCoordinator,
+    ResetDrainWorker,
     ResumeCoordinator,
     StartupRecoveryMetrics,
     TransferFrameType,
@@ -218,6 +220,9 @@ class _FakeRuntime:
     def is_preserve_session_drained(self, exc):
         return getattr(exc, "errno", None) == 4020
 
+    def is_preserve_drain_reset(self, exc):
+        return getattr(exc, "errno", None) == 4021
+
     def wait_until_up(self, timeout_s):
         return None
 
@@ -230,6 +235,94 @@ class _FakeRuntime:
     def send_preserve_transfer_frame(self, conn, encoded_frame):
         packet = conn._send_cmd(COM_PRESERVE_TRX_TRANSFER, encoded_frame)
         return conn._handle_ok(packet)
+
+
+class _ResetDrainError(Exception):
+    errno = 4020
+
+
+class _DrainInProgressError(Exception):
+    errno = 4013
+
+
+class _ResetDrainWorkerRuntime(_FakeRuntime):
+    def __init__(self):
+        super().__init__()
+        self.connection = _FakeConnection()
+        self.connection_id = 77
+        self.repeated_update_calls = []
+        self.probe_attempts = 0
+        self.probe_sql = None
+        self.counter = 0
+
+    def connect(self, database=False, autocommit=True):
+        del database, autocommit
+        return self.connection
+
+    def execute(self, conn, sql, fetch=False):
+        self.sql.append(sql)
+        self.calls.append((sql, fetch))
+        if sql == "SELECT CONNECTION_ID()":
+            return [(self.connection_id,)]
+        if sql.startswith("SELECT counter FROM"):
+            return [(self.counter,)]
+        if sql.startswith("UPDATE `"):
+            if self.probe_sql is not None and sql == self.probe_sql:
+                self.probe_attempts += 1
+                if self.probe_attempts == 1:
+                    raise _ResetDrainError()
+            self.counter += 1
+        return ()
+
+    def execute_command_without_connection_probe(self, conn, sql):
+        return self.execute(conn, sql)
+
+    def execute_repeated_row_writes(self, conn, table, sid, count):
+        self.repeated_update_calls.append((conn, table, sid, count))
+        self.counter += count
+
+    def is_preserve_session_drained(self, exc):
+        return isinstance(exc, _ResetDrainError)
+
+
+class _ResetDrainReleaseWorkerRuntime(_ResetDrainWorkerRuntime):
+    def execute(self, conn, sql, fetch=False):
+        if (
+            sql.startswith("UPDATE `")
+            and self.probe_sql is not None
+            and sql == self.probe_sql
+        ):
+            self.sql.append(sql)
+            self.calls.append((sql, fetch))
+            self.probe_attempts += 1
+            if self.probe_attempts == 1:
+                raise _DrainInProgressError()
+            self.counter += 1
+            return ()
+        return super().execute(conn, sql, fetch=fetch)
+
+    def is_preserve_draining_rejection(self, exc):
+        return isinstance(exc, _DrainInProgressError)
+
+
+class _Phase2ResetObserverRuntime(_FakeRuntime):
+    def __init__(self):
+        super().__init__()
+        self.connection = _FakeConnection()
+
+    def connect(self, database=False, autocommit=True):
+        del database, autocommit
+        return self.connection
+
+    def execute(self, conn, sql, fetch=False):
+        self.sql.append(sql)
+        self.calls.append((conn, sql, fetch))
+        if sql.startswith("UPDATE `"):
+            raise _DrainInProgressError()
+        return ()
+
+    def is_preserve_draining_rejection(self, exc):
+        return isinstance(exc, _DrainInProgressError)
 
 
 class RecordLockImportReportClassificationTest(unittest.TestCase):
@@ -4922,6 +5015,29 @@ class WorkloadPlanTest(unittest.TestCase):
                 report, max_qps_drop_pct=5.0, max_p99_increase_pct=10.0
             )
 
+    def test_receiver_read_load_diagnostic_mode_keeps_budget_regressions(self):
+        report = build_receiver_read_load_report(
+            threads=8,
+            baseline_duration_s=10.0,
+            baseline_query_count=100000,
+            baseline_latency_samples_us=[1000] * 200,
+            transfer_duration_s=10.0,
+            transfer_query_count=90000,
+            transfer_latency_samples_us=[1200] * 200,
+            error_count=0,
+            first_error=None,
+        )
+
+        validate_receiver_read_load_report(
+            report,
+            max_qps_drop_pct=5.0,
+            max_p99_increase_pct=10.0,
+            enforce_performance_budget=False,
+        )
+
+        self.assertEqual(report["receiver_read_load_qps_drop_pct"], 10.0)
+        self.assertEqual(report["receiver_read_load_p99_increase_pct"], 20.0)
+
     def test_receiver_read_load_report_rejects_query_errors(self):
         report = build_receiver_read_load_report(
             threads=1,
@@ -4937,7 +5053,10 @@ class WorkloadPlanTest(unittest.TestCase):
 
         with self.assertRaisesRegex(AssertionError, "query errors"):
             validate_receiver_read_load_report(
-                report, max_qps_drop_pct=5.0, max_p99_increase_pct=10.0
+                report,
+                max_qps_drop_pct=5.0,
+                max_p99_increase_pct=10.0,
+                enforce_performance_budget=False,
             )
 
     def test_standby_transfer_receiver_drain_metrics_defaults_to_100ms_ready_gate(self):
@@ -7362,6 +7481,33 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertIn("WHERE MOD(s.sid - 1, 2) = 0", insert_selects[0])
         self.assertIn("WHERE MOD(s.sid - 1, 2) = 1", insert_selects[1])
 
+    def test_reset_schema_creates_server_side_repeated_update_procedure(self):
+        cfg = HarnessConfig(
+            scenario="standby_transfer_reset_drain",
+            sessions=4,
+            table_count=2,
+            statements_per_tx=8,
+            seed_rows_per_table_per_session=1,
+            repeated_row_write_workload=True,
+            receiver_unix_socket="/tmp/reset-receiver.sock",
+            receiver_preserve_dir="/tmp/reset-receiver/preserve",
+        ).validate()
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = cfg
+        runner.plan = WorkloadPlan(cfg)
+        runner.runtime = _SchemaSeedRuntime()
+
+        runner.setup_schema()
+
+        create_routines = [
+            sql
+            for sql in runner.runtime.connection.cursor_obj.execute_calls
+            if sql.startswith("CREATE PROCEDURE rtx_reset_repeated_updates")
+        ]
+        self.assertEqual(1, len(create_routines))
+        self.assertIn("WHILE update_no < update_count DO", create_routines[0])
+        self.assertIn("EXECUTE rtx_reset_update USING @rtx_reset_sid", create_routines[0])
+
     def test_cli_scenario_presets_are_applied(self):
         cfg = parse_args(
             [
@@ -9735,6 +9881,453 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         )
         self.assertIn("SUM(OCTET_LENGTH(payload))", aggregate_sql)
         self.assertIn("OCTET_LENGTH(payload)", digest_sql)
+
+
+class ResetDrainHarnessTest(unittest.TestCase):
+    def test_receiver_dictionary_prewarm_opens_every_workload_table(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_reset_drain",
+            sessions=3,
+            table_count=3,
+            statements_per_tx=1,
+            seed_rows_per_table_per_session=1,
+            repeated_row_write_workload=True,
+            receiver_unix_socket="/tmp/reset-receiver.sock",
+            receiver_preserve_dir="/tmp/reset-receiver/preserve",
+        ).validate()
+        runner.plan = WorkloadPlan(runner.config)
+        runner.runtime = mock.Mock()
+        connection = _FakeConnection()
+        runner._receiver_read_connection = mock.Mock(return_value=connection)
+
+        runner.prewarm_receiver_dictionary_for_transfer()
+
+        self.assertEqual(
+            runner.runtime.execute.call_args_list,
+            [
+                mock.call(
+                    connection,
+                    "SELECT 1 FROM `rtx_e2e_t00` LIMIT 0",
+                    fetch=True,
+                ),
+                mock.call(
+                    connection,
+                    "SELECT 1 FROM `rtx_e2e_t01` LIMIT 0",
+                    fetch=True,
+                ),
+                mock.call(
+                    connection,
+                    "SELECT 1 FROM `rtx_e2e_t02` LIMIT 0",
+                    fetch=True,
+                ),
+            ],
+        )
+        self.assertTrue(connection.closed)
+
+    def test_release_reset_observer_is_armed_before_returning(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        observed = {}
+
+        def observe(timeout_s, *, ready_event, poll_interval_s):
+            observed["timeout_s"] = timeout_s
+            observed["poll_interval_s"] = poll_interval_s
+            ready_event.set()
+            return {
+                "requested_us": 10,
+                "response_us": 20,
+                "error": None,
+            }
+
+        runner._reset_on_phase2_draining_rejection = observe
+
+        thread, state = runner._start_phase2_reset_observer(timeout_s=2.0)
+        thread.join(1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertIsNone(state["error"])
+        self.assertEqual(state["requested_us"], 10)
+        self.assertEqual(state["response_us"], 20)
+        self.assertEqual(observed["timeout_s"], 2.0)
+        self.assertEqual(observed["poll_interval_s"], 0.0)
+
+    def test_debug_reset_scenario_pauses_receiver_prewarm_for_orphan_ttl(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.runtime = mock.Mock()
+        runner.reset_debug_sync_used = True
+        connection = _FakeConnection()
+        runner._receiver_admin_connection = mock.Mock(return_value=connection)
+
+        runner.configure_reset_receiver_ttl_globals()
+
+        self.assertEqual(
+            runner.runtime.execute.call_args_list,
+            [
+                mock.call(
+                    connection,
+                    "SET GLOBAL "
+                    "preserve_trx_transfer_receiver_prewarm_timeout_ms=1000",
+                ),
+                mock.call(
+                    connection,
+                    "SET GLOBAL "
+                    "preserve_trx_transfer_receiver_ready_timeout_ms=1000",
+                ),
+                mock.call(
+                    connection,
+                    "SET GLOBAL preserve_trx_transfer_prewarm_paused=ON",
+                ),
+            ],
+        )
+        self.assertTrue(runner.reset_receiver_prewarm_paused)
+        self.assertTrue(connection.closed)
+
+    def test_reset_scenario_restores_receiver_prewarm_after_debug_evidence(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.runtime = mock.Mock()
+        runner.reset_receiver_prewarm_paused = True
+        connection = _FakeConnection()
+        runner._receiver_admin_connection = mock.Mock(return_value=connection)
+
+        runner._reset_receiver_prewarm_pause()
+
+        runner.runtime.execute.assert_called_once_with(
+            connection,
+            "SET GLOBAL preserve_trx_transfer_prewarm_paused=OFF",
+        )
+        self.assertFalse(runner.reset_receiver_prewarm_paused)
+        self.assertTrue(connection.closed)
+
+    def test_direct_command_probe_does_not_create_cursor_or_ping(self):
+        class DirectConnection:
+            def __init__(self):
+                self.queries = []
+
+            def cursor(self):
+                raise AssertionError("cursor() would issue an implicit COM_PING")
+
+            def cmd_query(self, sql):
+                self.queries.append(sql)
+                return {"affected_rows": 1}
+
+        runtime = MySQLRuntime.__new__(MySQLRuntime)
+        connection = DirectConnection()
+
+        runtime.execute_command_without_connection_probe(
+            connection, "UPDATE `t` SET c = c + 1"
+        )
+
+        self.assertEqual(
+            connection.queries, ["UPDATE `t` SET c = c + 1"]
+        )
+
+    def test_debug_sync_off_is_not_reported_as_supported(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.runtime = mock.Mock()
+        connection = _FakeConnection()
+        runner.runtime.connect.return_value = connection
+        runner.runtime.execute.return_value = [("OFF",)]
+
+        self.assertFalse(runner._source_debug_sync_supported())
+        self.assertTrue(connection.closed)
+
+    def test_debug_sync_on_is_reset_before_reporting_supported(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.runtime = mock.Mock()
+        connection = _FakeConnection()
+        runner.runtime.connect.return_value = connection
+        runner.runtime.execute.side_effect = [
+            [("ON - signals: ''",)],
+            (),
+        ]
+
+        self.assertTrue(runner._source_debug_sync_supported())
+        self.assertEqual(
+            runner.runtime.execute.call_args_list,
+            [
+                mock.call(
+                    connection,
+                    "SELECT @@SESSION.debug_sync",
+                    fetch=True,
+                ),
+                mock.call(connection, "SET DEBUG_SYNC='RESET'"),
+            ],
+        )
+        self.assertTrue(connection.closed)
+
+    def test_debug_sync_now_reuses_preopened_control_connection(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.runtime = mock.Mock()
+        connection = _FakeConnection()
+
+        runner._debug_sync_now(
+            "now SIGNAL reset_phase2_release", connection=connection
+        )
+
+        runner.runtime.connect.assert_not_called()
+        runner.runtime.execute.assert_called_once_with(
+            connection,
+            "SET DEBUG_SYNC='now SIGNAL reset_phase2_release'",
+        )
+        self.assertFalse(connection.closed)
+
+    def test_reset_thread_reuses_preopened_control_connection(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.runtime = mock.Mock()
+        connection = _FakeConnection()
+
+        thread, state = runner._start_reset_thread(
+            label="phase2", connection=connection
+        )
+        thread.join(1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertIsNone(state["error"])
+        runner.runtime.connect.assert_not_called()
+        runner.runtime.execute.assert_called_once_with(
+            connection, "RESET DRAIN"
+        )
+        self.assertTrue(connection.closed)
+
+    def test_cli_reset_transfer_scenario_applies_phase_and_receiver_load(self):
+        cfg = parse_args(
+            [
+                "--scenario",
+                "standby_transfer_reset_drain",
+                "--repeated-row-write-workload",
+                "--reset-drain-phase",
+                "phase2",
+                "--receiver-unix-socket",
+                "/tmp/reset-receiver.sock",
+                "--receiver-preserve-dir",
+                "/tmp/reset-receiver/preserve",
+                "--receiver-read-load-threads",
+                "3",
+                "--receiver-read-load-baseline-seconds",
+                "1",
+            ]
+        )
+
+        self.assertEqual(cfg.scenario, "standby_transfer_reset_drain")
+        self.assertEqual(cfg.reset_drain_phase, "phase2")
+        self.assertEqual(cfg.receiver_read_load_threads, 3)
+        self.assertEqual(cfg.max_receiver_ready_after_phase2_ms, 0)
+
+    def test_reset_coordinator_does_not_release_replay_before_reset_ok(self):
+        coordinator = ResetDrainCoordinator(sessions=1)
+        result = {}
+
+        def waiter():
+            coordinator.mark_session_drained(1)
+            result["released"] = coordinator.wait_for_replay_permit(
+                sid=1, timeout_s=2.0
+            )
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        self.assertTrue(coordinator.wait_all_sessions_drained(timeout_s=1.0))
+        time.sleep(0.02)
+        self.assertNotIn("released", result)
+
+        reset_response_us = time.monotonic_ns() // 1000
+        coordinator.allow_replay_after_reset(reset_response_us)
+        thread.join(1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(result["released"])
+        self.assertEqual(coordinator.reset_response_us(), reset_response_us)
+
+    def test_reset_coordinator_observes_all_release_probes_started(self):
+        coordinator = ResetDrainCoordinator(sessions=2)
+
+        coordinator.mark_probe_started(1)
+        self.assertFalse(coordinator.wait_all_probes_started(timeout_s=0.01))
+        coordinator.mark_probe_started(2)
+
+        self.assertTrue(coordinator.wait_all_probes_started(timeout_s=0.1))
+
+    def test_reset_worker_replays_same_sql_on_same_connection(self):
+        cfg = HarnessConfig(
+            scenario="standby_transfer_reset_drain",
+            sessions=1,
+            table_count=1,
+            statements_per_tx=3,
+            seed_rows_per_table_per_session=1,
+            repeated_row_write_workload=True,
+            receiver_unix_socket="/tmp/reset-receiver.sock",
+            receiver_preserve_dir="/tmp/reset-receiver/preserve",
+        ).validate()
+        runtime = _ResetDrainWorkerRuntime()
+        coordinator = ResetDrainCoordinator(sessions=1)
+        worker = ResetDrainWorker(
+            sid=1,
+            plan=WorkloadPlan(cfg),
+            runtime=runtime,
+            coordinator=coordinator,
+            timeout_s=2.0,
+        )
+
+        worker.start()
+        self.assertTrue(coordinator.wait_all_transactions_prepared(timeout_s=1.0))
+        runtime.probe_sql = worker.probe_sql
+        coordinator.allow_drain_probe()
+        self.assertTrue(coordinator.wait_all_sessions_drained(timeout_s=1.0))
+        self.assertEqual(runtime.probe_attempts, 1)
+
+        coordinator.allow_replay_after_reset(time.monotonic_ns() // 1000)
+        worker.join(1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertIsNone(worker.error)
+        self.assertTrue(worker.committed)
+        self.assertEqual(runtime.probe_attempts, 2)
+        self.assertEqual(worker.original_connection_id, 77)
+        self.assertEqual(worker.replay_connection_id, 77)
+        self.assertEqual(worker.probe_sql, runtime.probe_sql)
+        self.assertEqual(
+            runtime.repeated_update_calls,
+            [(runtime.connection, "rtx_e2e_t00", 1, 3)],
+        )
+
+    def test_release_worker_accepts_phase2_draining_rejection_before_reset(self):
+        cfg = HarnessConfig(
+            scenario="standby_transfer_reset_drain",
+            sessions=1,
+            table_count=1,
+            statements_per_tx=3,
+            seed_rows_per_table_per_session=1,
+            repeated_row_write_workload=True,
+            receiver_unix_socket="/tmp/reset-receiver.sock",
+            receiver_preserve_dir="/tmp/reset-receiver/preserve",
+        ).validate()
+        runtime = _ResetDrainReleaseWorkerRuntime()
+        coordinator = ResetDrainCoordinator(sessions=1)
+        worker = ResetDrainWorker(
+            sid=1,
+            plan=WorkloadPlan(cfg),
+            runtime=runtime,
+            coordinator=coordinator,
+            timeout_s=2.0,
+            require_session_drained=False,
+        )
+
+        worker.start()
+        self.assertTrue(coordinator.wait_all_transactions_prepared(timeout_s=1.0))
+        runtime.probe_sql = worker.probe_sql
+        coordinator.allow_drain_probe()
+        self.assertTrue(coordinator.wait_all_probes_started(timeout_s=1.0))
+        coordinator.allow_replay_after_reset(time.monotonic_ns() // 1000)
+        worker.join(1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertIsNone(worker.error)
+        self.assertTrue(worker.committed)
+        self.assertEqual(coordinator.draining_rejected_count(), 1)
+        self.assertEqual(coordinator.drained_count(), 0)
+        self.assertEqual(runtime.probe_attempts, 2)
+
+    def test_runtime_recognizes_drain_cancelled_by_reset(self):
+        exc = type("DrainReset", (Exception,), {"errno": 4021})()
+        runtime = MySQLRuntime.__new__(MySQLRuntime)
+
+        self.assertTrue(runtime.is_preserve_drain_reset(exc))
+
+    def test_runtime_recognizes_phase2_draining_rejection(self):
+        exc = type("DrainInProgress", (Exception,), {"errno": 4013})()
+        runtime = MySQLRuntime.__new__(MySQLRuntime)
+
+        self.assertTrue(runtime.is_preserve_draining_rejection(exc))
+
+    def test_release_observer_issues_reset_on_same_preopened_connection(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_reset_drain",
+            sessions=1,
+            table_count=1,
+            statements_per_tx=1,
+            seed_rows_per_table_per_session=1,
+            repeated_row_write_workload=True,
+            receiver_unix_socket="/tmp/reset-receiver.sock",
+            receiver_preserve_dir="/tmp/reset-receiver/preserve",
+        ).validate()
+        runner.plan = WorkloadPlan(runner.config)
+        runner.runtime = _Phase2ResetObserverRuntime()
+
+        state = runner._reset_on_phase2_draining_rejection(timeout_s=1.0)
+
+        self.assertGreater(state["response_us"], 0)
+        self.assertGreaterEqual(state["response_us"], state["requested_us"])
+        self.assertEqual(runner.runtime.sql[-1], "RESET DRAIN")
+        self.assertIs(
+            runner.runtime.calls[-1][0], runner.runtime.connection
+        )
+
+    def test_runner_dispatches_reset_transfer_scenario(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_reset_drain",
+            repeated_row_write_workload=True,
+            seed_rows_per_table_per_session=1,
+            receiver_unix_socket="/tmp/reset-receiver.sock",
+            receiver_preserve_dir="/tmp/reset-receiver/preserve",
+        ).validate()
+        runner.run_standby_transfer_reset_drain = mock.Mock()
+
+        runner.run()
+
+        runner.run_standby_transfer_reset_drain.assert_called_once_with()
+
+    def test_reset_report_declares_standalone_non_physical_evidence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "reset.json"
+            runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+            runner.config = HarnessConfig(
+                scenario="standby_transfer_reset_drain",
+                sessions=3,
+                table_count=3,
+                statements_per_tx=10,
+                seed_rows_per_table_per_session=1,
+                repeated_row_write_workload=True,
+                receiver_unix_socket="/tmp/reset-receiver.sock",
+                receiver_preserve_dir="/tmp/reset-receiver/preserve",
+                report_json=str(report_path),
+            ).validate()
+            runner.reset_drain_samples = [
+                {
+                    "phase": "phase2",
+                    "reset_requested_us": 1_000,
+                    "ordinary_admission_reopened_us": 1_120,
+                    "all_transactions_runnable_us": 1_120,
+                    "reset_response_us": 1_120,
+                    "owner_cleanup_done_us": 1_150,
+                    "first_original_connection_replay_us": 1_130,
+                    "all_original_connections_replayed_us": 1_140,
+                    "phase2_trigger": "FINAL_ACK_DEBUG_SYNC",
+                    "phase2_observer_rejected": False,
+                    "draining_rejected_session_count": 0,
+                }
+            ]
+            runner.reset_receiver_orphan_accepted = True
+            runner.reset_receiver_orphan_expired = True
+            runner.reset_debug_sync_used = True
+            runner.receiver_read_load_report = None
+
+            runner.write_standby_transfer_reset_report(status="success")
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            report["evidence_kind"], "STANDALONE_TRANSFER_RESET_E2E"
+        )
+        self.assertFalse(report["physical_replication"])
+        self.assertFalse(report["production_provider"])
+        self.assertFalse(report["write_enable_exercised"])
+        self.assertEqual(report["reset_response_elapsed_us"], 120)
+        self.assertEqual(report["reset_response_receiver_wait_us"], 0)
+        self.assertEqual(report["reset_response_artifact_payload_read_bytes"], 0)
+        self.assertTrue(report["original_connections_continued"])
+        self.assertTrue(report["receiver_orphan_expired"])
+        self.assertEqual(report["phase2_trigger"], "FINAL_ACK_DEBUG_SYNC")
 
 
 if __name__ == "__main__":

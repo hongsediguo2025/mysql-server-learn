@@ -1,0 +1,3 @@
+SELECT 'ok' AS reset_drain_scope_lint;
+reset_drain_scope_lint
+ok

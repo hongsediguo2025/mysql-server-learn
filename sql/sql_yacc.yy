@@ -2250,6 +2250,7 @@ simple_statement:
         | optimize_table_stmt
         | keycache_stmt
         | drain_transactions_preserve_stmt { $$= nullptr; }
+        | reset_drain_stmt              { $$= nullptr; }
         | preload_stmt
         | prepare_shutdown_preserve_stmt { $$= nullptr; }
         | prepare                       { $$= nullptr; }
@@ -2318,6 +2319,13 @@ drain_transactions_preserve_stmt:
             Lex->preserve_trx_timeout_seconds= $4.timeout_seconds;
             Lex->preserve_trx_user_vars_mode=
               static_cast<uint>($4.user_vars_mode);
+          }
+        ;
+
+reset_drain_stmt:
+          RESET_SYM DRAIN_SYM
+          {
+            Lex->sql_command= SQLCOM_RESET_DRAIN;
           }
         ;
 

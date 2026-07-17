@@ -8,6 +8,8 @@ from pathlib import Path
 
 from scripts.preserve_trx_full_pressure_runner import (
     FULL_PROFILE,
+    RESET_FULL_PROFILE,
+    RESET_SMOKE_PROFILE,
     FullPressurePaths,
     archive_run_evidence,
     build_e2e_command,
@@ -15,6 +17,7 @@ from scripts.preserve_trx_full_pressure_runner import (
     build_release_command,
     create_owned_work_dir,
     detect_server_shutdown_failures,
+    parse_args,
     redact_command,
     remove_owned_work_dir,
     run_with_finalization,
@@ -37,6 +40,15 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertEqual(8 * 1024**2, FULL_PROFILE.phase1_batch_bytes)
         self.assertEqual(50, FULL_PROFILE.phase1_batch_linger_ms)
         self.assertEqual(500_000, FULL_PROFILE.source_phase2_limit_us)
+
+    def test_reset_profile_is_large_repeated_write_without_lockset_replacement(self):
+        self.assertEqual(1000, RESET_FULL_PROFILE.sessions)
+        self.assertEqual(10000, RESET_FULL_PROFILE.statements_per_tx)
+        self.assertEqual(1, RESET_FULL_PROFILE.seed_rows_per_table_per_session)
+        self.assertEqual(0, RESET_FULL_PROFILE.lockset_batch_size)
+        self.assertEqual(2 * 1024**3, RESET_FULL_PROFILE.source_buffer_pool_bytes)
+        self.assertEqual(2 * 1024**3, RESET_FULL_PROFILE.receiver_buffer_pool_bytes)
+        self.assertEqual(3, RESET_SMOKE_PROFILE.sessions)
 
     def test_paths_derive_receiver_preserve_dir_from_datadir(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -95,6 +107,66 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertIn("--log-error-verbosity=3", source)
         self.assertIn("--log-error-verbosity=3", receiver)
         self.assertIn("--innodb-buffer-pool-size=2147483648", receiver)
+
+    def test_default_evidence_command_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = FullPressurePaths.resolve(
+                repo_root=root / "repo",
+                build_dir=Path("build-release"),
+                work_root=root / "work",
+                history_root=root / "history",
+                run_id="run-default-evidence",
+            )
+            command = build_e2e_command(
+                FULL_PROFILE,
+                paths,
+                source_command=["mysqld", "--source"],
+                receiver_command=["mysqld", "--receiver"],
+                source_port=3511,
+                receiver_port=3512,
+                credential_secret="secret",
+            )
+
+        joined = " ".join(command)
+        self.assertIn("--scenario standby_transfer_receiver_drain_metrics", joined)
+        self.assertIn("--lockset-batch-size 100000", joined)
+        self.assertNotIn("--reset-drain-phase", joined)
+
+    def test_reset_evidence_command_uses_phase2_repeated_row_workload(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = FullPressurePaths.resolve(
+                repo_root=root / "repo",
+                build_dir=Path("build-release"),
+                work_root=root / "work",
+                history_root=root / "history",
+                run_id="run-reset-evidence",
+            )
+            command = build_e2e_command(
+                RESET_FULL_PROFILE,
+                paths,
+                source_command=["mysqld", "--source"],
+                receiver_command=["mysqld", "--receiver"],
+                source_port=3511,
+                receiver_port=3512,
+                credential_secret="secret",
+                evidence="reset-drain",
+            )
+
+        joined = " ".join(command)
+        self.assertIn("--scenario standby_transfer_reset_drain", joined)
+        self.assertIn("--reset-drain-phase phase2", joined)
+        self.assertIn("--repeated-row-write-workload", command)
+        self.assertIn("--statements-per-tx 10000", joined)
+        self.assertNotIn("--lockset-batch-size", command)
+
+    def test_cli_defaults_to_transfer_phase2_and_accepts_reset_evidence(self):
+        self.assertEqual(parse_args([]).evidence, "transfer-phase2")
+        self.assertEqual(
+            parse_args(["--evidence", "reset-drain"]).evidence,
+            "reset-drain",
+        )
 
     def test_release_run_builds_current_mysqld_before_collecting_evidence(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -197,6 +269,52 @@ class FullPressureProfileTest(unittest.TestCase):
             "receiver_record_lock_page_count.*receiver_strict_target_local_redo_bytes",
         ):
             validate_e2e_report(FULL_PROFILE, report)
+
+    def test_reset_report_gate_accepts_sub500_response_and_truthful_scope(self):
+        report = {
+            "status": "success",
+            "success": True,
+            "evidence_kind": "STANDALONE_TRANSFER_RESET_E2E",
+            "physical_replication": False,
+            "production_provider": False,
+            "write_enable_exercised": False,
+            "workload_sessions": 1000,
+            "workload_table_count": RESET_FULL_PROFILE.tables,
+            "workload_statements_per_tx": 10000,
+            "workload_seed_rows_per_table_per_session": 1,
+            "workload_lockset_batch_size": 0,
+            "reset_response_elapsed_us": 240000,
+            "reset_response_p99_us": 240000,
+            "reset_response_max_us": 240000,
+            "reset_response_receiver_wait_us": 0,
+            "reset_response_artifact_payload_read_bytes": 0,
+            "original_connections_continued": True,
+            "reset_debug_sync_used": False,
+            "receiver_read_load_performance_gate_enforced": False,
+            "phase2_trigger": "WARMCOPY_CLOSING_REJECTION",
+            "phase2_observer_rejected": True,
+            "drained_session_count": 0,
+            "draining_rejected_session_count": 1000,
+            "replayed_session_count": 1000,
+        }
+
+        metrics = validate_e2e_report(
+            RESET_FULL_PROFILE, report, evidence="reset-drain"
+        )
+
+        self.assertEqual(metrics["reset_response_p99_us"], 240000)
+        report["reset_response_max_us"] = 500001
+        with self.assertRaisesRegex(RuntimeError, "reset_response_max_us"):
+            validate_e2e_report(
+                RESET_FULL_PROFILE, report, evidence="reset-drain"
+            )
+
+        report["reset_response_max_us"] = 240000
+        report["phase2_observer_rejected"] = False
+        with self.assertRaisesRegex(RuntimeError, "phase2_observer_rejected"):
+            validate_e2e_report(
+                RESET_FULL_PROFILE, report, evidence="reset-drain"
+            )
 
     @staticmethod
     def _valid_committed_not_ready_report():

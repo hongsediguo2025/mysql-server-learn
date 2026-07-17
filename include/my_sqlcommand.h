@@ -206,6 +206,7 @@ enum enum_sql_command {
   SQLCOM_DRAIN_TRANSACTIONS_PRESERVE,
   SQLCOM_RESUME_PRESERVED_TRX,
   SQLCOM_SHOW_PRESERVED_TRX,
+  SQLCOM_RESET_DRAIN,
   /* This should be the last !!! */
   SQLCOM_END
 };

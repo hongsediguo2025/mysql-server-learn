@@ -2133,10 +2133,16 @@ TEST(TempLivePreserveManifestContractTest,
 
   const size_t late_prepare = preserve_impl.find(
       "temp_table_participant->prepare_late_phase1_idle_targets()");
-  const size_t closing_transition = preserve_impl.find(
-      "draining.transition_to(Preserve_trx_manager_state::WARMCOPY_CLOSING)");
   ASSERT_NE(std::string::npos, late_prepare);
+  const size_t closing_transition =
+      preserve_impl.find("draining->transition_to(", late_prepare);
   ASSERT_NE(std::string::npos, closing_transition);
+  const size_t closing_state = preserve_impl.find(
+      "Preserve_trx_manager_state::WARMCOPY_CLOSING", closing_transition);
+  ASSERT_NE(std::string::npos, closing_state);
+  EXPECT_LT(closing_state, closing_transition + 256)
+      << "the first post-prebuild state transition must enter "
+         "WARMCOPY_CLOSING";
   EXPECT_LT(late_prepare, closing_transition)
       << "late temp-table prebuild must finish before command admission enters "
          "the user-visible blocking state";

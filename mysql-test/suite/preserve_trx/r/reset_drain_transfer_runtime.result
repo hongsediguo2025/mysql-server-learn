@@ -1,0 +1,38 @@
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')
+- @reset_wins_before AS reset_winner_delta;
+reset_winner_delta
+1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late')
+- @reset_too_late_before AS reset_too_late_delta;
+reset_too_late_delta
+0
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_expired_epochs')
+- @receiver_expired_before AS receiver_expired_delta;
+receiver_expired_delta
+1
+SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id) AS committed_values
+FROM t_reset_drain_transfer_runtime;
+committed_values
+1:21,2:31,3:41
+SELECT CONNECTION_ID()=@original_connection_id AS app_1_same_connection;
+app_1_same_connection
+1
+SELECT CONNECTION_ID()=@original_connection_id AS app_2_same_connection;
+app_2_same_connection
+1
+SELECT CONNECTION_ID()=@original_connection_id AS app_3_same_connection;
+app_3_same_connection
+1
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')
+- @reset_wins_before_handoff AS handoff_reset_winner_delta;
+handoff_reset_winner_delta
+0
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late')
+- @reset_too_late_before_handoff AS handoff_too_late_delta;
+handoff_too_late_delta
+1

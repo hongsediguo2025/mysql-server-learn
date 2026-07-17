@@ -1593,6 +1593,26 @@ uint64_t preserve_trx_promotion_ready_cache_evictions_status() {
   return g_ready_cache_evictions.load();
 }
 
+void preserved_trx_promotion_ready_cache_purge_epoch(
+    const std::string &preserve_dir, const std::string &epoch_id) {
+  if (preserve_dir.empty() || epoch_id.empty()) return;
+  std::lock_guard<std::mutex> guard(g_ready_cache_mutex);
+  uint64_t current_bytes = g_ready_cache_bytes.load();
+  for (auto entry = g_ready_cache.begin(); entry != g_ready_cache.end();) {
+    if (entry->first.preserve_dir != preserve_dir ||
+        entry->first.epoch_id != epoch_id) {
+      ++entry;
+      continue;
+    }
+    current_bytes =
+        current_bytes >= entry->second.estimated_bytes
+            ? current_bytes - entry->second.estimated_bytes
+            : 0;
+    entry = g_ready_cache.erase(entry);
+  }
+  g_ready_cache_bytes.store(current_bytes);
+}
+
 void preserved_trx_set_promotion_apply_state_provider(
     Preserve_trx_promotion_apply_state_provider provider) {
   g_apply_state_provider = provider;

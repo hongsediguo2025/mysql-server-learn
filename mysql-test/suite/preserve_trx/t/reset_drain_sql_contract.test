@@ -1,0 +1,49 @@
+RESET DRAIN;
+
+SELECT @@GLOBAL.preserve_trx_transfer_receiver_prewarm_timeout_ms;
+SELECT @@GLOBAL.preserve_trx_transfer_receiver_ready_timeout_ms;
+SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=1000;
+SET GLOBAL preserve_trx_transfer_receiver_ready_timeout_ms=3600000;
+SELECT @@GLOBAL.preserve_trx_transfer_receiver_prewarm_timeout_ms;
+SELECT @@GLOBAL.preserve_trx_transfer_receiver_ready_timeout_ms;
+SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=999;
+SHOW WARNINGS;
+SELECT @@GLOBAL.preserve_trx_transfer_receiver_prewarm_timeout_ms;
+SET GLOBAL preserve_trx_transfer_receiver_ready_timeout_ms=3600001;
+SHOW WARNINGS;
+SELECT @@GLOBAL.preserve_trx_transfer_receiver_ready_timeout_ms;
+--error ER_GLOBAL_VARIABLE
+SET SESSION preserve_trx_transfer_receiver_prewarm_timeout_ms=1000;
+--error ER_GLOBAL_VARIABLE
+SET SESSION preserve_trx_transfer_receiver_ready_timeout_ms=1000;
+SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=10000;
+SET GLOBAL preserve_trx_transfer_receiver_ready_timeout_ms=30000;
+
+SHOW GLOBAL STATUS LIKE 'Preserve_trx_reset_drain_wins';
+SHOW GLOBAL STATUS LIKE 'Preserve_trx_reset_drain_too_late';
+SHOW GLOBAL STATUS LIKE 'Preserve_trx_transfer_receiver_active_epochs';
+SHOW GLOBAL STATUS LIKE 'Preserve_trx_transfer_receiver_expired_epochs';
+
+--source include/force_restart.inc
+--let $restart_parameters= restart: --preserve-trx-enable=OFF
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
+RESET DRAIN;
+
+--let $restart_parameters= restart: --preserve-trx-enable=ON
+--source include/restart_mysqld.inc
+--let $restart_parameters=
+
+START TRANSACTION;
+--error ER_PRESERVE_TRX_INVALID_STATE
+RESET DRAIN;
+ROLLBACK;
+
+CREATE USER preserve_reset_denied@localhost;
+--connect(preserve_reset_denied_con, localhost, preserve_reset_denied,,test)
+--error ER_SPECIFIC_ACCESS_DENIED_ERROR
+RESET DRAIN;
+--disconnect preserve_reset_denied_con
+--connection default
+DROP USER preserve_reset_denied@localhost;

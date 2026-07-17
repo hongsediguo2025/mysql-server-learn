@@ -172,16 +172,27 @@ die "warmcopy phase2 metrics must expose lock seal time and seal worker count\n"
   unless $preserve =~ /phase2_lock_seal_us/s &&
          $preserve =~ /phase2_seal_worker_count/s &&
          $preserve =~ /preserve_trx_phase2_lock_seal_us_status/s;
+my $late_idle_reject =
+  index($preserve, 'lock_warmcopy_late_phase1_prepare_rejected');
+my $late_active_reject =
+  index($preserve, 'lock_warmcopy_late_phase1_active_record_scan_rejected');
+my $closing_transition =
+  index($preserve, 'draining->transition_to(', $late_idle_reject);
+my $closing_state = $closing_transition < 0
+  ? -1
+  : index($preserve, 'Preserve_trx_manager_state::WARMCOPY_CLOSING',
+          $closing_transition);
+die "could not isolate the guarded WARMCOPY_CLOSING transition\n"
+  if $closing_transition < 0 || $closing_state < $closing_transition ||
+     $closing_state > $closing_transition + 256;
 die "lock warmcopy must perform a late idle phase1 sweep before WARMCOPY_CLOSING\n"
   unless $preserve =~ /prepare_lock_warmcopy_idle_targets/s &&
-         $preserve =~ /lock_warmcopy_late_phase1_prepare_rejected/s &&
-         index($preserve, 'lock_warmcopy_late_phase1_prepare_rejected') <
-         index($preserve, 'draining.transition_to(Preserve_trx_manager_state::WARMCOPY_CLOSING)');
+         $late_idle_reject >= 0 &&
+         $late_idle_reject < $closing_transition;
 die "lock warmcopy must scan active record targets before WARMCOPY_CLOSING\n"
   unless $preserve =~ /prepare_lock_warmcopy_active_record_targets/s &&
-         $preserve =~ /lock_warmcopy_late_phase1_active_record_scan_rejected/s &&
-         index($preserve, 'lock_warmcopy_late_phase1_active_record_scan_rejected') <
-         index($preserve, 'draining.transition_to(Preserve_trx_manager_state::WARMCOPY_CLOSING)');
+         $late_active_reject >= 0 &&
+         $late_active_reject < $closing_transition;
 die "lock warmcopy active phase1 record scan must be observable in metrics\n"
   unless $preserve =~ /preserve_trx_lock_warmcopy_after_active_record_scan/s &&
          $preserve =~ /phase1_record_active_scan_target_count/s;
@@ -189,7 +200,7 @@ die "lock warmcopy must prepare hook-built record stores before WARMCOPY_CLOSING
   unless $preserve =~ /prepare_phase1_record_store_targets/s &&
          $preserve =~ /lock_warmcopy_phase1_store_prepare_rejected/s &&
          index($preserve, 'prepare_phase1_record_store_targets') <
-         index($preserve, 'draining.transition_to(Preserve_trx_manager_state::WARMCOPY_CLOSING)');
+         $closing_transition;
 
 EOF
 

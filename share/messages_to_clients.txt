@@ -9475,6 +9475,12 @@ ER_PRESERVE_TRX_CORRUPT_SNAPSHOT
 ER_PRESERVE_TRX_SESSION_DRAINED
   eng "This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE"
 
+ER_PRESERVE_TRX_DRAIN_RESET
+  eng "DRAIN TRANSACTIONS PRESERVE was reset before shutdown handoff"
+
+ER_PRESERVE_TRX_RESET_TOO_LATE
+  eng "RESET DRAIN arrived after shutdown handoff"
+
 #
 #  End of 8.0 error messages (server-to-client).
 #  Do NOT add messages intended for the error log above!

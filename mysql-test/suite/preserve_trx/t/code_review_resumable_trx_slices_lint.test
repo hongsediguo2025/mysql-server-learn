@@ -310,7 +310,7 @@ die "online standby receiver staged-token worker must bind only its token from t
   unless $receiver_staged_prewarm_job =~
          /bind_strict_prepared_token_from_cached_epoch_fact/s;
 my ($receiver_epoch_ready_publish) =
-  $transfer =~ /(bool publish_receiver_epoch_ready_from_fact_if_possible\(\n    const std::string &root_dir, const std::string &epoch_id\) \{[\s\S]*?^}\n\nbool transfer_manifest_has_snapshot_bundle)/m
+  $transfer =~ /(bool\s+publish_receiver_epoch_ready_from_fact_if_possible\s*\([^;{}]*\)\s*\{[\s\S]*?^}\n\nbool transfer_manifest_has_snapshot_bundle)/m
   or die "could not isolate receiver epoch READY publisher\n";
 die "receiver epoch READY publisher must not repeat the strict full-epoch bind\n"
   if $receiver_epoch_ready_publish =~
@@ -1613,8 +1613,8 @@ die "preserve-trx gunit must use Store/codec/carrier APIs instead of snapshot wr
   if $gunit =~
      /\bpreserved_trx_(write_snapshot|read_snapshot|delete_snapshot_files)\s*\(/s;
 
-$preserve =~ /static bool restore_batch_record_to_original_thd[\s\S]*?^}/m
-  or die "could not isolate restore_batch_record_to_original_thd\n";
+$preserve =~ /static bool restore_batch_record_semantics_to_original_thd[\s\S]*?^}/m
+  or die "could not isolate restore_batch_record_semantics_to_original_thd\n";
 my $batch_restore = $&;
 die "batch cleanup must lazy-load logged binlog cache payload through the store path\n"
   unless $batch_restore =~ /hydrate_logged_binlog_cache_payload_if_needed/s;
@@ -2041,10 +2041,10 @@ die "batch reattach activation failure must not leave an active transaction atta
   unless $preserve =~
          /trx_preserve_activate_reattached_in_original_thd[\s\S]*restore_record_after_failure/s &&
          $preserve =~
-         /static bool restore_batch_record_to_original_thd[\s\S]*if\s*\(attached\)[\s\S]*trx_preserve_detach_resumed_from_thd/s;
+         /static bool restore_batch_record_semantics_to_original_thd[\s\S]*if\s*\(attached\)[\s\S]*trx_preserve_detach_resumed_from_thd/s;
 
-$preserve =~ /static bool restore_batch_record_to_original_thd[\s\S]*?^}/m
-  or die "could not isolate restore_batch_record_to_original_thd for WI-29\n";
+$preserve =~ /static bool restore_batch_record_semantics_to_original_thd[\s\S]*?^}/m
+  or die "could not isolate restore_batch_record_semantics_to_original_thd for WI-29\n";
 my $wi29_batch_restore = $&;
 die "batch reattach attached-detach failure must restore token or terminate after publishing failure\n"
   if $wi29_batch_restore =~

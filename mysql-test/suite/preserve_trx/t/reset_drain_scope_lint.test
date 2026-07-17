@@ -1,0 +1,202 @@
+--perl
+use strict;
+use warnings;
+use File::Find;
+use File::Spec;
+
+# Lint-only source-shape guard. Runtime RESET/TTL behavior is covered by
+# targeted GUnit, SQL MTR, and the standalone dual-mysqld E2E.
+
+my $mysql_test_dir = $ENV{'MYSQL_TEST_DIR'}
+  or die "MYSQL_TEST_DIR is not set";
+my $source_root = File::Spec->rel2abs(
+  File::Spec->catdir($mysql_test_dir, '..'));
+
+sub read_source {
+  my ($path) = @_;
+  open(my $fh, '<', $path) or die "cannot open $path: $!";
+  my $src = do { local $/; <$fh> };
+  close($fh);
+  return $src;
+}
+
+sub source_path {
+  return File::Spec->catfile($source_root, @_);
+}
+
+sub assert_tree_has_no_reset_drain_hook {
+  my ($root, $label) = @_;
+  my @violations;
+  find(
+    {
+      no_chdir => 1,
+      wanted => sub {
+        return unless -f $_ && /\.(?:cc|h|ic)$/;
+        my $src = read_source($File::Find::name);
+        if ($src =~
+            /(?:reset[_ ]drain|receiver_(?:prewarm|ready)_timeout|accepted_epoch_lifecycle)/i) {
+          push @violations, File::Spec->abs2rel($File::Find::name, $source_root);
+        }
+      },
+    },
+    $root
+  );
+  die "$label must not contain RESET DRAIN/receiver TTL hooks: @violations\n"
+    if @violations;
+}
+
+my $preserve = read_source(source_path('sql', 'preserve_trx.cc'));
+my $preserve_header = read_source(source_path('sql', 'preserve_trx.h'));
+my $transfer = read_source(source_path('sql', 'preserve_trx_transfer.cc'));
+my $transfer_header =
+  read_source(source_path('sql', 'preserve_trx_transfer.h'));
+my $drain = read_source(source_path('sql', 'preserve_trx_drain.cc')) .
+            read_source(source_path('sql', 'preserve_trx_drain.h'));
+my $binlog = read_source(source_path('sql', 'binlog.cc')) .
+             read_source(source_path('sql', 'binlog.h'));
+
+assert_tree_has_no_reset_drain_hook(
+  source_path('storage', 'innobase'), 'InnoDB shared paths');
+die "sql/binlog.* must not contain RESET DRAIN/receiver TTL hooks\n"
+  if $binlog =~
+     /(?:reset[_ ]drain|receiver_(?:prewarm|ready)_timeout|accepted_epoch_lifecycle)/i;
+die "sql/preserve_trx_drain.* must remain untouched by RESET DRAIN/receiver TTL\n"
+  if $drain =~
+     /(?:reset[_ ]drain|receiver_(?:prewarm|ready)_timeout|accepted_epoch_lifecycle)/i;
+
+my $all_reset_sources = $preserve . $transfer . $transfer_header;
+die "RESET DRAIN must not expose active-drain test-only APIs in production sources\n"
+  if ($preserve . $preserve_header) =~
+     /active_drain[A-Za-z0-9_]*_for_unit_test/;
+for my $test_only_api (
+  qw(
+    preserved_trx_compare_exchange_manager_state_owner_for_unit_test
+    preserved_trx_collect_batch_restore_thread_ids_for_unit_test
+  )
+) {
+  die "RESET DRAIN must not expose $test_only_api in production sources\n"
+    if ($preserve . $preserve_header) =~ /\Q$test_only_api\E/;
+}
+die "RESET DRAIN/receiver TTL must not add lifecycle_generation\n"
+  if $all_reset_sources =~ /lifecycle_generation/;
+die "receiver expiry must reuse housekeeping instead of adding a reaper thread\n"
+  if $all_reset_sources =~
+     /(?:std::thread[^\n;]*receiver[^\n;]*reaper|receiver[^\n;]*reaper[^\n;]*std::thread)/is;
+
+die "standby transfer protocol version changed\n"
+  unless $transfer_header =~
+         /kPreserveTrxTransferLegacyProtocolVersion\s*=\s*3/ &&
+         $transfer_header =~ /kPreserveTrxTransferProtocolVersion\s*=\s*4/;
+
+my ($frame_enum) =
+  $transfer_header =~
+    /(enum class Preserve_trx_transfer_frame_type\s*:\s*uint16_t\s*\{.*?^\};)/ms
+  or die "could not isolate transfer frame enum\n";
+die "RESET DRAIN must not add a transfer wire frame\n"
+  if $frame_enum =~ /RESET|EXPIRE|TTL/i;
+
+my ($status_enum) =
+  $transfer_header =~
+    /(enum class Preserve_trx_transfer_status\s*\{.*?^\};)/ms
+  or die "could not isolate transfer status enum\n";
+die "RESET DRAIN must not add a transfer wire status\n"
+  if $status_enum =~ /RESET|EXPIRE|TTL/i;
+
+my ($commit_body) =
+  $transfer =~
+    /(Preserve_trx_transfer_source_epoch_session::commit_epoch\([\s\S]*?^})/m
+  or die "could not isolate source commit_epoch\n";
+my $ack_pos = index($commit_body, 'const bool commit_acknowledged');
+my $arbiter_pos = index($commit_body, 'm_final_ack_arbiter(');
+my $committed_pos = index($commit_body, 'm_epoch_committed = true');
+die "FINAL_ACK arbiter must stay after receiver commit acknowledgement and before epoch publication\n"
+  unless $ack_pos >= 0 && $arbiter_pos > $ack_pos &&
+         $committed_pos > $arbiter_pos;
+die "FINAL_ACK arbiter must remain guarded by commit acknowledgement\n"
+  unless $commit_body =~
+         /bool final_ack_accepted\s*=\s*commit_acknowledged[\s\S]*m_final_ack_arbiter/s;
+
+die "receiver TTL must expose the existing receiver reaper scan entry point\n"
+  unless $transfer_header =~
+         /preserve_trx_transfer_receiver_reaper_scan_once\s*\(\s*uint64_t\s+now_us\s*\)/;
+die "receiver TTL public scan must delegate to the existing registry scan\n"
+  unless $transfer =~
+         /preserve_trx_transfer_receiver_reaper_scan_once\s*\(\s*uint64_t\s+now_us\s*\)\s*\{\s*receiver_reaper_scan_once\s*\(\s*now_us,\s*&default_receiver_registry\(\)\s*\)/s;
+die "receiver TTL must run from the existing preserve housekeeping loop\n"
+  unless $preserve =~
+         /preserve_trx_transfer_receiver_reaper_scan_once\s*\(\s*now_us\s*\)/;
+
+my ($manager_owner_cas) =
+  $preserve =~
+    /(bool preserve_trx_compare_exchange_manager_state_owner\(\n    Preserve_trx_manager_state expected_state,[\s\S]*?^})/m
+  or die "could not isolate exact manager state/owner CAS\n";
+die "manager takeover CAS must compare both expected state and owner\n"
+  unless $manager_owner_cas =~
+           /preserve_trx_pack_manager_state_owner\(expected_state, expected_owner\)/s &&
+         $manager_owner_cas =~ /compare_exchange_strong\(expected, desired\)/s;
+
+my ($batch_restore) =
+  $preserve =~
+    /(static bool restore_preserved_batch_items_to_original_thds\([\s\S]*?^})/m
+  or die "could not isolate RESET batch restore\n";
+my $collector_scan_count = () =
+  $batch_restore =~ /do_for_all_thd_copy\(&collector\)/g;
+die "RESET batch restore must collect target THDs in one global scan\n"
+  unless $collector_scan_count == 1;
+die "RESET batch restore must replay targets in reverse preserve order\n"
+  unless $batch_restore =~
+           /for \(size_t i = items\.size\(\); i != 0; --i\)/s &&
+         $batch_restore =~
+           /targets\[i - 1\]\.thd, items\[i - 1\]/s;
+
+my ($reset_participant_stop) =
+  $preserve =~
+    /(auto stop_reset_participant_admission = \[\&\]\(\) \{[\s\S]*?^  \};)/m
+  or die "RESET must expose a narrow participant-admission stop helper\n";
+die "RESET participant-admission stop must close binlog warmcopy admission without destroying the provider\n"
+  unless $reset_participant_stop =~
+         /warmcopy_participant->stop_admission_for_reset\s*\(\s*\)/s;
+die "RESET participant-admission stop must close the lock warmcopy epoch before sessions become runnable\n"
+  unless $reset_participant_stop =~ /lock_warmcopy_close_epoch\s*\(\s*\)/s;
+
+my ($phase1_reset) =
+  $preserve =~
+    /(auto finish_phase1_reset = \[\&\]\(const char \*stage\) \{[\s\S]*?)(?=^  auto reject_or_finish_phase1_reset)/m
+  or die "could not isolate phase-1 RESET completion\n";
+my $phase1_stop_pos =
+  index($phase1_reset, 'stop_reset_participant_admission()');
+my $phase1_clear_pos =
+  index($phase1_reset, 'Preserve_batch_clear_generation');
+my $phase1_runnable_pos =
+  index($phase1_reset,
+        'preserve_trx_mark_active_drain_transactions_runnable');
+my $phase1_abort_pos =
+  index($phase1_reset, 'abort_drain_participants(stage)');
+die "phase-1 RESET must stop participant admission, clear session state, publish runnable, then perform physical participant cleanup\n"
+  unless $phase1_stop_pos >= 0 &&
+         $phase1_clear_pos > $phase1_stop_pos &&
+         $phase1_runnable_pos > $phase1_clear_pos &&
+         $phase1_abort_pos > $phase1_runnable_pos;
+
+my ($phase2_reset) =
+  $preserve =~
+    /(auto finish_phase2_reset\s*=[\s\S]*?)(?=^  auto finish_with_shutdown)/m
+  or die "could not isolate phase-2 RESET completion\n";
+my $phase2_stop_pos =
+  index($phase2_reset, 'stop_reset_participant_admission()');
+my $phase2_restore_pos =
+  index($phase2_reset, 'restore_preserved_batch_items_to_original_thds');
+my $phase2_runnable_pos =
+  index($phase2_reset,
+        'preserve_trx_mark_active_drain_transactions_runnable');
+my $phase2_abort_pos =
+  rindex($phase2_reset, 'abort_drain_participants(stage)');
+die "phase-2 RESET must stop participant admission, restore transaction semantics, publish runnable, then perform physical participant cleanup\n"
+  unless $phase2_stop_pos >= 0 &&
+         $phase2_restore_pos > $phase2_stop_pos &&
+         $phase2_runnable_pos > $phase2_restore_pos &&
+         $phase2_abort_pos > $phase2_runnable_pos;
+
+EOF
+
+SELECT 'ok' AS reset_drain_scope_lint;

@@ -1,0 +1,257 @@
+# This runtime race test requires a Debug server with Debug Sync enabled.
+# Release builds must skip it; Release coverage is limited to non-sync tests.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+
+--let $credential_file= $MYSQL_TMP_DIR/reset_drain_transfer.secret
+--write_file $credential_file
+reset-drain-mtr-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_transfer_receiver@localhost;
+--enable_warnings
+CREATE USER preserve_transfer_receiver@localhost
+  IDENTIFIED BY 'reset-drain-mtr-secret';
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_transfer_receiver@localhost;
+
+--let $source_uuid= query_get_value(SELECT @@GLOBAL.server_uuid AS uuid, uuid, 1)
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-receiver-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-allowed-source-uuid=$source_uuid --preserve-trx-transfer-target-server-uuid=$source_uuid --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_transfer_receiver --preserve-trx-transfer-credential-name=reset_drain_mtr --preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+CALL mtr.add_suppression(
+  "PRESERVE: rolled back prepared transaction without snapshot during recovery");
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=1000;
+SET GLOBAL preserve_trx_transfer_receiver_ready_timeout_ms=1000;
+
+--disable_warnings
+DROP TABLE IF EXISTS t_reset_drain_transfer_runtime;
+--enable_warnings
+CREATE TABLE t_reset_drain_transfer_runtime(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_reset_drain_transfer_runtime VALUES (1,10),(2,20),(3,30);
+
+--connect(reset_runtime_app_1,localhost,root,,test)
+SET @original_connection_id=CONNECTION_ID();
+START TRANSACTION;
+UPDATE t_reset_drain_transfer_runtime SET v=v+1 WHERE id=1;
+
+--connect(reset_runtime_app_2,localhost,root,,test)
+SET @original_connection_id=CONNECTION_ID();
+START TRANSACTION;
+UPDATE t_reset_drain_transfer_runtime SET v=v+1 WHERE id=2;
+
+--connect(reset_runtime_app_3,localhost,root,,test)
+SET @original_connection_id=CONNECTION_ID();
+START TRANSACTION;
+UPDATE t_reset_drain_transfer_runtime SET v=v+1 WHERE id=3;
+
+--connection default
+SET @reset_wins_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins');
+SET @reset_too_late_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late');
+SET @receiver_active_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs');
+SET @receiver_expired_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_expired_epochs');
+
+--connect(reset_runtime_owner,localhost,root,,test)
+SET DEBUG_SYNC=
+  'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL reset_runtime_phase2_entered WAIT_FOR reset_runtime_phase2_release';
+SET DEBUG_SYNC=
+  'preserve_trx_transfer_after_commit_ack_before_final_ack SIGNAL reset_runtime_receiver_accepted WAIT_FOR reset_runtime_final_ack_release';
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300 WITH USER VARS
+
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR reset_runtime_phase2_entered TIMEOUT 30';
+--let $wait_condition= SELECT COUNT(*)=0 FROM performance_schema.threads WHERE PROCESSLIST_USER='preserve_transfer_receiver' AND PROCESSLIST_COMMAND<>'Sleep'
+--source include/wait_condition.inc
+
+--connection reset_runtime_app_1
+--send UPDATE t_reset_drain_transfer_runtime SET v=v WHERE id=1
+--connection reset_runtime_app_2
+--send UPDATE t_reset_drain_transfer_runtime SET v=v WHERE id=2
+--connection reset_runtime_app_3
+--send UPDATE t_reset_drain_transfer_runtime SET v=v WHERE id=3
+
+--connection default
+SET DEBUG_SYNC='now SIGNAL reset_runtime_phase2_release';
+
+--disable_result_log
+--connection reset_runtime_app_1
+--error 0,ER_PRESERVE_TRX_UNSUPPORTED,ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--connection reset_runtime_app_2
+--error 0,ER_PRESERVE_TRX_UNSUPPORTED,ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--connection reset_runtime_app_3
+--error 0,ER_PRESERVE_TRX_UNSUPPORTED,ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--enable_result_log
+
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR reset_runtime_receiver_accepted TIMEOUT 60';
+
+--disable_result_log
+--connection reset_runtime_app_1
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+UPDATE t_reset_drain_transfer_runtime SET v=v WHERE id=1;
+--connection reset_runtime_app_2
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+UPDATE t_reset_drain_transfer_runtime SET v=v WHERE id=2;
+--connection reset_runtime_app_3
+--error ER_PRESERVE_TRX_SESSION_DRAINED
+UPDATE t_reset_drain_transfer_runtime SET v=v WHERE id=3;
+--enable_result_log
+
+--connect(reset_runtime_reset_1,localhost,root,,test)
+--send RESET DRAIN
+--connect(reset_runtime_reset_2,localhost,root,,test)
+--send RESET DRAIN
+
+--connection default
+--let $wait_condition= SELECT COUNT(*)=2 FROM performance_schema.threads WHERE PROCESSLIST_INFO='RESET DRAIN'
+--source include/wait_condition.inc
+SET DEBUG_SYNC='now SIGNAL reset_runtime_final_ack_release';
+
+--connection reset_runtime_reset_1
+--reap
+--connection reset_runtime_reset_2
+--reap
+
+--connection reset_runtime_app_1
+UPDATE t_reset_drain_transfer_runtime SET v=v+10 WHERE id=1;
+COMMIT;
+--connection reset_runtime_app_2
+UPDATE t_reset_drain_transfer_runtime SET v=v+10 WHERE id=2;
+COMMIT;
+--connection reset_runtime_app_3
+UPDATE t_reset_drain_transfer_runtime SET v=v+10 WHERE id=3;
+COMMIT;
+
+--connection reset_runtime_owner
+--disable_result_log
+--error 4021
+--reap
+--enable_result_log
+
+--connection default
+--let $wait_condition= SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')=@receiver_active_before AND (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_expired_epochs')>@receiver_expired_before
+--source include/wait_condition.inc
+
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+        WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')
+       - @reset_wins_before AS reset_winner_delta;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+        WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late')
+       - @reset_too_late_before AS reset_too_late_delta;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+        WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_expired_epochs')
+       - @receiver_expired_before AS receiver_expired_delta;
+SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id) AS committed_values
+  FROM t_reset_drain_transfer_runtime;
+--connection reset_runtime_app_1
+SELECT CONNECTION_ID()=@original_connection_id AS app_1_same_connection;
+--connection reset_runtime_app_2
+SELECT CONNECTION_ID()=@original_connection_id AS app_2_same_connection;
+--connection reset_runtime_app_3
+SELECT CONNECTION_ID()=@original_connection_id AS app_3_same_connection;
+--disable_query_log
+
+--disconnect reset_runtime_app_1
+--disconnect reset_runtime_app_2
+--disconnect reset_runtime_app_3
+--disconnect reset_runtime_reset_1
+--disconnect reset_runtime_reset_2
+--disconnect reset_runtime_owner
+
+--connection default
+SET @reset_wins_before_handoff=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins');
+SET @reset_too_late_before_handoff=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late');
+
+--connect(reset_runtime_handoff_app,localhost,root,,test)
+START TRANSACTION;
+UPDATE t_reset_drain_transfer_runtime SET v=v+1 WHERE id=1;
+
+--connect(reset_runtime_handoff_owner,localhost,root,,test)
+SET DEBUG_SYNC=
+  'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL reset_runtime_handoff_phase2 WAIT_FOR reset_runtime_handoff_phase2_release';
+SET DEBUG_SYNC=
+  'preserve_trx_drain_after_shutdown_handoff SIGNAL reset_runtime_handoff_won WAIT_FOR reset_runtime_handoff_release';
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR reset_runtime_handoff_phase2 TIMEOUT 30';
+--let $wait_condition= SELECT COUNT(*)=0 FROM performance_schema.threads WHERE PROCESSLIST_USER='preserve_transfer_receiver' AND PROCESSLIST_COMMAND<>'Sleep'
+--source include/wait_condition.inc
+
+--connection reset_runtime_handoff_app
+--send UPDATE t_reset_drain_transfer_runtime SET v=v WHERE id=1
+
+--connection default
+SET DEBUG_SYNC='now SIGNAL reset_runtime_handoff_phase2_release';
+
+--disable_result_log
+--connection reset_runtime_handoff_app
+--error 0,ER_PRESERVE_TRX_UNSUPPORTED,ER_PRESERVE_TRX_SESSION_DRAINED
+--reap
+--enable_result_log
+
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR reset_runtime_handoff_won TIMEOUT 60';
+--disable_result_log
+--error 4022
+RESET DRAIN;
+--enable_result_log
+
+--enable_query_log
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+        WHERE VARIABLE_NAME='Preserve_trx_reset_drain_wins')
+       - @reset_wins_before_handoff AS handoff_reset_winner_delta;
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+        WHERE VARIABLE_NAME='Preserve_trx_reset_drain_too_late')
+       - @reset_too_late_before_handoff AS handoff_too_late_delta;
+--disable_query_log
+
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+SET DEBUG_SYNC='now SIGNAL reset_runtime_handoff_release';
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+
+--exec echo "restart: --preserve-trx-enable=ON --skip-log-bin" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+--disable_query_log
+
+DROP TABLE t_reset_drain_transfer_runtime;
+DROP USER preserve_transfer_receiver@localhost;
+SET DEBUG_SYNC='RESET';
+--remove_file $credential_file
+
+--enable_query_log

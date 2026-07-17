@@ -409,6 +409,10 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_warmcopy_phase2_pause_us,
     preserve_trx_warmcopy_phase2_pause_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_reset_drain_wins,
+                              preserve_trx_reset_drain_wins_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_reset_drain_too_late,
+                              preserve_trx_reset_drain_too_late_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_lock_warmcopy_attempts,
     preserve_trx_lock_warmcopy_attempts_status())
@@ -735,6 +739,12 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_last_throttle_reason,
     preserve_trx_transfer_last_throttle_reason_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_active_epochs,
+    preserve_trx_transfer_receiver_active_epochs_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_transfer_receiver_expired_epochs,
+    preserve_trx_transfer_receiver_expired_epochs_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_transfer_receiver_queued_bytes,
     preserve_trx_transfer_receiver_queued_bytes_status())

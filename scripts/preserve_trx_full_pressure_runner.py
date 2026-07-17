@@ -115,6 +115,30 @@ SMOKE_PROFILE = dataclasses.replace(
     resume_timeout_s=300,
 )
 
+RESET_FULL_PROFILE = dataclasses.replace(
+    FULL_PROFILE,
+    name="reset-full",
+    statements_per_tx=10_000,
+    seed_rows_per_table_per_session=1,
+    lockset_batch_size=0,
+)
+
+RESET_SMOKE_PROFILE = dataclasses.replace(
+    RESET_FULL_PROFILE,
+    name="reset-smoke",
+    sessions=3,
+    tables=3,
+    source_buffer_pool_bytes=512 * 1024**2,
+    receiver_buffer_pool_bytes=512 * 1024**2,
+    receiver_workers=2,
+    phase1_batch_bytes=1024**2,
+    phase1_batch_linger_ms=5,
+    preserve_timeout_s=300,
+    startup_timeout_s=120,
+    shutdown_timeout_s=180,
+    resume_timeout_s=300,
+)
+
 
 @dataclasses.dataclass(frozen=True)
 class FullPressurePaths:
@@ -397,8 +421,11 @@ def build_e2e_command(
     source_port: int,
     receiver_port: int,
     credential_secret: str,
+    evidence: str = "transfer-phase2",
 ) -> List[str]:
-    return [
+    if evidence not in {"transfer-phase2", "reset-drain"}:
+        raise ValueError(f"unknown evidence mode: {evidence}")
+    command = [
         sys.executable,
         str(paths.e2e_script),
         "--scenario",
@@ -498,6 +525,28 @@ def build_e2e_command(
         "--resume-timeout",
         str(profile.resume_timeout_s),
     ]
+    if evidence == "transfer-phase2":
+        return command
+
+    scenario_index = command.index("standby_transfer_receiver_drain_metrics")
+    command[scenario_index] = "standby_transfer_reset_drain"
+    for flag in (
+        "--lockset-session-table-shards",
+        "--lockset-noop-update",
+        "--lockset-touch-one-row",
+        "--lockset-minimal-table",
+    ):
+        command.remove(flag)
+    lockset_index = command.index("--lockset-batch-size")
+    del command[lockset_index : lockset_index + 2]
+    command.extend(
+        [
+            "--repeated-row-write-workload",
+            "--reset-drain-phase",
+            "phase2",
+        ]
+    )
+    return command
 
 
 def port_is_available(port: int) -> bool:
@@ -923,8 +972,14 @@ def _metric_max(report: Mapping[str, Any], key: str) -> int:
 
 
 def validate_e2e_report(
-    profile: FullPressureProfile, report: Mapping[str, Any]
+    profile: FullPressureProfile,
+    report: Mapping[str, Any],
+    evidence: str = "transfer-phase2",
 ) -> Dict[str, Any]:
+    if evidence == "reset-drain":
+        return validate_reset_drain_report(profile, report)
+    if evidence != "transfer-phase2":
+        raise ValueError(f"unknown evidence mode: {evidence}")
     failures: List[str] = []
 
     def require_equal(key: str, expected: Any) -> None:
@@ -1094,6 +1149,70 @@ def validate_e2e_report(
     }
 
 
+def validate_reset_drain_report(
+    profile: FullPressureProfile, report: Mapping[str, Any]
+) -> Dict[str, Any]:
+    failures: List[str] = []
+
+    def require_equal(key: str, expected: Any) -> None:
+        actual = report.get(key)
+        if actual != expected:
+            failures.append(f"{key}: expected={expected!r} actual={actual!r}")
+
+    require_equal("status", "success")
+    require_equal("success", True)
+    require_equal("evidence_kind", "STANDALONE_TRANSFER_RESET_E2E")
+    require_equal("physical_replication", False)
+    require_equal("production_provider", False)
+    require_equal("write_enable_exercised", False)
+    require_equal("workload_sessions", profile.sessions)
+    require_equal("workload_table_count", profile.tables)
+    require_equal("workload_statements_per_tx", profile.statements_per_tx)
+    require_equal(
+        "workload_seed_rows_per_table_per_session",
+        profile.seed_rows_per_table_per_session,
+    )
+    require_equal("workload_lockset_batch_size", 0)
+    require_equal("reset_response_receiver_wait_us", 0)
+    require_equal("reset_response_artifact_payload_read_bytes", 0)
+    require_equal("original_connections_continued", True)
+    require_equal("reset_debug_sync_used", False)
+    require_equal("receiver_read_load_performance_gate_enforced", False)
+    require_equal("phase2_trigger", "WARMCOPY_CLOSING_REJECTION")
+    require_equal("phase2_observer_rejected", True)
+    require_equal("replayed_session_count", profile.sessions)
+
+    response_us = _metric_max(report, "reset_response_elapsed_us")
+    p99_us = _metric_max(report, "reset_response_p99_us")
+    max_us = _metric_max(report, "reset_response_max_us")
+    p99_limit_us = 300_000 if profile.sessions >= 1000 else 50_000
+    max_limit_us = 500_000 if profile.sessions >= 1000 else 100_000
+    if p99_us >= p99_limit_us:
+        failures.append(
+            f"reset_response_p99_us: limit<{p99_limit_us} actual={p99_us}"
+        )
+    if max_us >= max_limit_us:
+        failures.append(
+            f"reset_response_max_us: limit<{max_limit_us} actual={max_us}"
+        )
+    if response_us != max_us:
+        failures.append(
+            "reset_response_elapsed_us must match the primary RESET sample: "
+            f"elapsed={response_us} max={max_us}"
+        )
+    if failures:
+        raise RuntimeError(
+            "full-pressure RESET acceptance failed: " + "; ".join(failures)
+        )
+    return {
+        "reset_response_elapsed_us": response_us,
+        "reset_response_p99_us": p99_us,
+        "reset_response_max_us": max_us,
+        "drained_session_count": report.get("drained_session_count"),
+        "replayed_session_count": report.get("replayed_session_count"),
+    }
+
+
 def _pid_is_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -1237,6 +1356,7 @@ class FullPressureRunner:
         check_only: bool,
         build_jobs: int,
         skip_build: bool,
+        evidence: str = "transfer-phase2",
     ) -> None:
         self.profile = profile
         self.paths = paths
@@ -1247,6 +1367,7 @@ class FullPressureRunner:
         self.check_only = check_only
         self.build_jobs = build_jobs
         self.skip_build = skip_build
+        self.evidence = evidence
         self.source_uuid = str(uuid.uuid4())
         self.receiver_uuid = str(uuid.uuid4())
         self.secret = secrets.token_urlsafe(32)
@@ -1315,11 +1436,13 @@ class FullPressureRunner:
             source_port=self.source_port,
             receiver_port=self.receiver_port,
             credential_secret=self.secret,
+            evidence=self.evidence,
         )
         started = time.monotonic()
         result: Dict[str, Any] = {
             "run_id": self.paths.run_id,
             "profile": self.profile.name,
+            "evidence": self.evidence,
             "status": "preflight",
             "started_at_utc": utc_now(),
         }
@@ -1384,7 +1507,9 @@ class FullPressureRunner:
                 report = json.loads(
                     self.paths.e2e_report.read_text(encoding="utf-8")
                 )
-                metrics = validate_e2e_report(self.profile, report)
+                metrics = validate_e2e_report(
+                    self.profile, report, evidence=self.evidence
+                )
                 result.update(status="success", success=True, metrics=metrics)
         except BaseException as exc:
             primary_error = exc
@@ -1500,6 +1625,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default="full",
         help="full is release evidence; smoke only validates runner lifecycle",
     )
+    parser.add_argument(
+        "--evidence",
+        choices=("transfer-phase2", "reset-drain"),
+        default="transfer-phase2",
+        help=(
+            "transfer-phase2 preserves the existing lockset gate; "
+            "reset-drain runs the large-transaction RESET DRAIN gate"
+        ),
+    )
     parser.add_argument("--run-id")
     parser.add_argument(
         "--work-root",
@@ -1546,7 +1680,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    profile = FULL_PROFILE if args.profile == "full" else SMOKE_PROFILE
+    if args.evidence == "reset-drain":
+        profile = (
+            RESET_FULL_PROFILE
+            if args.profile == "full"
+            else RESET_SMOKE_PROFILE
+        )
+    else:
+        profile = FULL_PROFILE if args.profile == "full" else SMOKE_PROFILE
     run_id = args.run_id or default_run_id(profile.name)
     repo_root = args.repo_root.expanduser().resolve(strict=False)
     build_dir = (
@@ -1596,6 +1737,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             check_only=args.check_only,
             build_jobs=args.build_jobs,
             skip_build=args.skip_build,
+            evidence=args.evidence,
         )
         return runner.run()
 

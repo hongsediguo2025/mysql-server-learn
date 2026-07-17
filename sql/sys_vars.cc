@@ -1607,6 +1607,22 @@ static Sys_var_uint Sys_preserve_trx_transfer_commit_timeout_ms(
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, UINT_MAX32), DEFAULT(30000),
     BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
+static Sys_var_uint Sys_preserve_trx_transfer_receiver_prewarm_timeout_ms(
+    "preserve_trx_transfer_receiver_prewarm_timeout_ms",
+    "Maximum milliseconds an accepted Preserve/Resume standby epoch may "
+    "remain PREWARMING in the current receiver process.",
+    GLOBAL_VAR(preserve_trx_transfer_receiver_prewarm_timeout_ms),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1000, 3600000), DEFAULT(10000),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_uint Sys_preserve_trx_transfer_receiver_ready_timeout_ms(
+    "preserve_trx_transfer_receiver_ready_timeout_ms",
+    "Maximum milliseconds a READY Preserve/Resume standby epoch may wait for "
+    "a promotion lease in the current receiver process.",
+    GLOBAL_VAR(preserve_trx_transfer_receiver_ready_timeout_ms),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1000, 3600000), DEFAULT(30000),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
 static Sys_var_ulonglong Sys_preserve_trx_transfer_phase1_batch_bytes(
     "preserve_trx_transfer_phase1_batch_bytes",
     "Target encoded-byte threshold for one Preserve/Resume phase-1 standby "

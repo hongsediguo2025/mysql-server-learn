@@ -4422,6 +4422,7 @@ int mysql_execute_command(THD *thd, bool first_level) {
     case SQLCOM_UNLOCK_INSTANCE:
     case SQLCOM_PREPARE_SHUTDOWN_PRESERVE:
     case SQLCOM_DRAIN_TRANSACTIONS_PRESERVE:
+    case SQLCOM_RESET_DRAIN:
     case SQLCOM_RESUME_PRESERVED_TRX:
     case SQLCOM_SHOW_PRESERVED_TRX:
     case SQLCOM_ALTER_TABLESPACE:
@@ -4430,7 +4431,8 @@ int mysql_execute_command(THD *thd, bool first_level) {
     case SQLCOM_CREATE_SRS:
     case SQLCOM_DROP_SRS: {
       if (lex->sql_command == SQLCOM_PREPARE_SHUTDOWN_PRESERVE ||
-          lex->sql_command == SQLCOM_DRAIN_TRANSACTIONS_PRESERVE) {
+          lex->sql_command == SQLCOM_DRAIN_TRANSACTIONS_PRESERVE ||
+          lex->sql_command == SQLCOM_RESET_DRAIN) {
         res = preserve_trx_execute_command(thd);
         break;
       }

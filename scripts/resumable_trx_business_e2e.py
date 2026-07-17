@@ -57,6 +57,9 @@ REQUIRED_LOCK_HEAVY_STARTUP_FIELDS = [
 ]
 EVIDENCE_KIND_LOCAL_STARTUP_E2E = "LOCAL_STARTUP_E2E"
 EVIDENCE_KIND_STANDALONE_TRANSFER_E2E = "STANDALONE_TRANSFER_E2E"
+EVIDENCE_KIND_STANDALONE_TRANSFER_RESET_E2E = (
+    "STANDALONE_TRANSFER_RESET_E2E"
+)
 EVIDENCE_KIND_WARM_GATE_SIMULATOR = "WARM_GATE_SIMULATOR"
 
 
@@ -182,6 +185,7 @@ def validate_receiver_read_load_report(
     *,
     max_qps_drop_pct: float,
     max_p99_increase_pct: float,
+    enforce_performance_budget: bool = True,
 ) -> None:
     failures: List[str] = []
     qps_drop_pct = float(report.get("receiver_read_load_qps_drop_pct", 0.0))
@@ -193,11 +197,11 @@ def validate_receiver_read_load_report(
         failures.append("baseline executed no receiver queries")
     if int(report.get("receiver_read_load_transfer_query_count", 0)) <= 0:
         failures.append("transfer window executed no receiver queries")
-    if qps_drop_pct > max_qps_drop_pct:
+    if enforce_performance_budget and qps_drop_pct > max_qps_drop_pct:
         failures.append(
             f"QPS drop {qps_drop_pct:.3f}% exceeds {max_qps_drop_pct:.3f}%"
         )
-    if p99_increase_pct > max_p99_increase_pct:
+    if enforce_performance_budget and p99_increase_pct > max_p99_increase_pct:
         failures.append(
             "P99 increase "
             f"{p99_increase_pct:.3f}% exceeds {max_p99_increase_pct:.3f}%"
@@ -428,6 +432,7 @@ SCENARIOS = {
     "warmcopy_two_phase_large_cache_equivalence",
     "temp_table_retryable_unsupported",
     "standby_transfer_receiver_drain_metrics",
+    "standby_transfer_reset_drain",
     "receiver_drain_then_promotion_gate",
     "physical_standby_promotion_gate_scaled",
 }
@@ -607,6 +612,7 @@ class HarnessConfig:
     receiver_restart_command: Optional[str] = None
     receiver_physical_copy_before_drain: bool = False
     standalone_transfer_accept_committed_not_ready: bool = False
+    reset_drain_phase: str = "both"
     receiver_read_load_threads: int = 0
     receiver_read_load_baseline_s: float = 0.0
     receiver_read_load_max_qps_drop_pct: float = 5.0
@@ -653,25 +659,31 @@ class HarnessConfig:
                 "receiver read-load maximum P99 increase must be non-negative"
             )
         if self.receiver_read_load_threads > 0:
-            if self.scenario != "standby_transfer_receiver_drain_metrics":
+            if self.scenario not in {
+                "standby_transfer_receiver_drain_metrics",
+                "standby_transfer_reset_drain",
+            }:
                 raise ValueError(
-                    "receiver read-load probe is only valid for "
-                    "standby_transfer_receiver_drain_metrics"
+                    "receiver read-load probe is only valid for standby "
+                    "transfer scenarios"
                 )
             if self.receiver_read_load_baseline_s <= 0:
                 raise ValueError(
                     "receiver read-load baseline seconds must be positive when "
                     "the probe is enabled"
                 )
-        if self.scenario == "standby_transfer_receiver_drain_metrics":
+        if self.scenario in {
+            "standby_transfer_receiver_drain_metrics",
+            "standby_transfer_reset_drain",
+        }:
             if not self.receiver_preserve_dir:
                 raise ValueError(
-                    "standby_transfer_receiver_drain_metrics requires "
+                    f"{self.scenario} requires "
                     "--receiver-preserve-dir"
                 )
             if not (self.receiver_unix_socket or (self.receiver_host and self.receiver_port)):
                 raise ValueError(
-                    "standby_transfer_receiver_drain_metrics requires a receiver "
+                    f"{self.scenario} requires a receiver "
                     "socket or host/port"
                 )
             if not self.standby_transfer_credential_name:
@@ -679,28 +691,40 @@ class HarnessConfig:
             if self.receiver_physical_copy_before_drain:
                 if not self.source_datadir:
                     raise ValueError(
-                        "standby_transfer_receiver_drain_metrics "
+                        f"{self.scenario} "
                         "requires --source-datadir when "
                         "--receiver-physical-copy-before-drain is used"
                     )
                 if not self.receiver_datadir:
                     raise ValueError(
-                        "standby_transfer_receiver_drain_metrics "
+                        f"{self.scenario} "
                         "requires --receiver-datadir when "
                         "--receiver-physical-copy-before-drain is used"
                     )
                 if not self.restart_command:
                     raise ValueError(
-                        "standby_transfer_receiver_drain_metrics "
+                        f"{self.scenario} "
                         "requires --restart-command when "
                         "--receiver-physical-copy-before-drain is used"
                     )
                 if not self.receiver_restart_command:
                     raise ValueError(
-                        "standby_transfer_receiver_drain_metrics "
+                        f"{self.scenario} "
                         "requires --receiver-restart-command when "
                         "--receiver-physical-copy-before-drain is used"
                     )
+        if self.reset_drain_phase not in {"phase1", "phase2", "both"}:
+            raise ValueError(
+                "reset_drain_phase must be phase1, phase2, or both"
+            )
+        if (
+            self.scenario == "standby_transfer_reset_drain"
+            and not self.repeated_row_write_workload
+        ):
+            raise ValueError(
+                "standby_transfer_reset_drain requires "
+                "--repeated-row-write-workload"
+            )
         if self.scenario == "receiver_drain_then_promotion_gate":
             if not self.receiver_preserve_dir:
                 raise ValueError(
@@ -3191,6 +3215,294 @@ class ResumeCoordinator:
                 self._condition.wait(min(0.5, remaining))
 
 
+class ResetDrainCoordinator:
+    """Coordinate one RESET DRAIN attempt without changing resume workers."""
+
+    def __init__(self, sessions: int):
+        self._sessions = sessions
+        self._condition = threading.Condition()
+        self._prepared: set[int] = set()
+        self._probe_started: set[int] = set()
+        self._drained: set[int] = set()
+        self._draining_rejected: set[int] = set()
+        self._replayed_us: Dict[int, int] = {}
+        self._committed: set[int] = set()
+        self._probe_allowed = False
+        self._replay_allowed = False
+        self._reset_response_us = 0
+        self._cancelled = False
+        self.errors: "queue.Queue[BaseException]" = queue.Queue()
+
+    def _all_locked(self, values: set[int]) -> bool:
+        return len(values) == self._sessions
+
+    def _wait_for(self, predicate: Callable[[], bool], timeout_s: float) -> bool:
+        deadline = time.monotonic() + timeout_s
+        with self._condition:
+            while not predicate():
+                if self._cancelled:
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(min(0.2, remaining))
+            return True
+
+    def cancel(self) -> None:
+        with self._condition:
+            self._cancelled = True
+            self._condition.notify_all()
+
+    def mark_transaction_prepared(self, sid: int) -> None:
+        with self._condition:
+            self._prepared.add(sid)
+            self._condition.notify_all()
+
+    def wait_all_transactions_prepared(self, timeout_s: float) -> bool:
+        return self._wait_for(
+            lambda: self._all_locked(self._prepared), timeout_s
+        )
+
+    def allow_drain_probe(self) -> None:
+        with self._condition:
+            self._probe_allowed = True
+            self._condition.notify_all()
+
+    def wait_for_drain_probe(self, timeout_s: float) -> bool:
+        return self._wait_for(lambda: self._probe_allowed, timeout_s)
+
+    def mark_probe_started(self, sid: int) -> None:
+        with self._condition:
+            self._probe_started.add(sid)
+            self._condition.notify_all()
+
+    def wait_all_probes_started(self, timeout_s: float) -> bool:
+        return self._wait_for(
+            lambda: self._all_locked(self._probe_started), timeout_s
+        )
+
+    def mark_session_drained(self, sid: int) -> None:
+        with self._condition:
+            self._drained.add(sid)
+            self._condition.notify_all()
+
+    def mark_draining_rejected(self, sid: int) -> None:
+        with self._condition:
+            self._draining_rejected.add(sid)
+            self._condition.notify_all()
+
+    def wait_all_sessions_drained(self, timeout_s: float) -> bool:
+        return self._wait_for(lambda: self._all_locked(self._drained), timeout_s)
+
+    def allow_replay_after_reset(self, reset_response_us: int) -> None:
+        with self._condition:
+            self._reset_response_us = reset_response_us
+            self._replay_allowed = True
+            self._condition.notify_all()
+
+    def wait_for_replay_permit(self, sid: int, timeout_s: float) -> bool:
+        del sid
+        return self._wait_for(lambda: self._replay_allowed, timeout_s)
+
+    def reset_response_us(self) -> int:
+        with self._condition:
+            return self._reset_response_us
+
+    def mark_replayed(self, sid: int, replayed_us: int) -> None:
+        with self._condition:
+            self._replayed_us[sid] = replayed_us
+            self._condition.notify_all()
+
+    def wait_all_replayed(self, timeout_s: float) -> bool:
+        return self._wait_for(
+            lambda: len(self._replayed_us) == self._sessions, timeout_s
+        )
+
+    def replay_timestamps_us(self) -> List[int]:
+        with self._condition:
+            return list(self._replayed_us.values())
+
+    def mark_committed(self, sid: int) -> None:
+        with self._condition:
+            self._committed.add(sid)
+            self._condition.notify_all()
+
+    def wait_all_committed(self, timeout_s: float) -> bool:
+        return self._wait_for(
+            lambda: self._all_locked(self._committed), timeout_s
+        )
+
+    def drained_count(self) -> int:
+        with self._condition:
+            return len(self._drained)
+
+    def draining_rejected_count(self) -> int:
+        with self._condition:
+            return len(self._draining_rejected)
+
+    def replayed_count(self) -> int:
+        with self._condition:
+            return len(self._replayed_us)
+
+
+class ResetDrainWorker(threading.Thread):
+    """Keep one large transaction on its original connection across RESET."""
+
+    def __init__(
+        self,
+        *,
+        sid: int,
+        plan: WorkloadPlan,
+        runtime: "MySQLRuntime",
+        coordinator: ResetDrainCoordinator,
+        timeout_s: float,
+        require_session_drained: bool = True,
+    ):
+        super().__init__(name=f"rtx-reset-worker-{sid:04d}", daemon=True)
+        self.sid = sid
+        self.plan = plan
+        self.runtime = runtime
+        self.coordinator = coordinator
+        self.timeout_s = timeout_s
+        self.require_session_drained = require_session_drained
+        table = self.plan.repeated_row_write_table(sid)
+        self.probe_sql = (
+            f"UPDATE `{table}` SET counter = counter + 1 "
+            f"WHERE sid = {sid} AND k = 0"
+        )
+        self.original_connection_id = 0
+        self.replay_connection_id = 0
+        self.successful_probe_attempts_before_drain = 0
+        self.statements_completed = 0
+        self.committed = False
+        self.error: Optional[BaseException] = None
+
+    def _connection_id(self, conn) -> int:
+        rows = self.runtime.execute(
+            conn, "SELECT CONNECTION_ID()", fetch=True
+        )
+        if len(rows) != 1:
+            raise AssertionError(
+                f"sid={self.sid} did not receive one connection id"
+            )
+        return int(rows[0][0])
+
+    def _counter(self, conn) -> int:
+        table = self.plan.repeated_row_write_table(self.sid)
+        rows = self.runtime.execute(
+            conn,
+            f"SELECT counter FROM `{table}` "
+            f"WHERE sid = {self.sid} AND k = 0",
+            fetch=True,
+        )
+        if len(rows) != 1:
+            raise AssertionError(
+                f"sid={self.sid} reset row is missing"
+            )
+        return int(rows[0][0])
+
+    def run(self) -> None:
+        conn = None
+        try:
+            conn = self.runtime.connect(database=True, autocommit=False)
+            self.original_connection_id = self._connection_id(conn)
+            initial_counter = self._counter(conn)
+            self.runtime.execute(conn, "START TRANSACTION")
+            self.runtime.execute_repeated_row_writes(
+                conn,
+                self.plan.repeated_row_write_table(self.sid),
+                self.sid,
+                self.plan.config.statements_per_tx,
+            )
+            self.statements_completed += self.plan.config.statements_per_tx
+            self.coordinator.mark_transaction_prepared(self.sid)
+            if not self.coordinator.wait_for_drain_probe(self.timeout_s):
+                raise TimeoutError(
+                    f"sid={self.sid} timed out waiting for drain probe"
+                )
+
+            self.coordinator.mark_probe_started(self.sid)
+            if self.require_session_drained:
+                deadline = time.monotonic() + self.timeout_s
+                while True:
+                    try:
+                        self.runtime.execute_command_without_connection_probe(
+                            conn, self.probe_sql
+                        )
+                        self.successful_probe_attempts_before_drain += 1
+                        self.statements_completed += 1
+                    except BaseException as exc:
+                        if not self.runtime.is_preserve_session_drained(exc):
+                            raise
+                        self.coordinator.mark_session_drained(self.sid)
+                        break
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"sid={self.sid} did not observe "
+                            "ER_PRESERVE_TRX_SESSION_DRAINED"
+                        )
+                    time.sleep(0.001)
+            else:
+                try:
+                    self.runtime.execute_command_without_connection_probe(
+                        conn, self.probe_sql
+                    )
+                    self.successful_probe_attempts_before_drain += 1
+                    self.statements_completed += 1
+                except BaseException as exc:
+                    if self.runtime.is_preserve_session_drained(exc):
+                        self.coordinator.mark_session_drained(self.sid)
+                    elif self.runtime.is_preserve_draining_rejection(exc):
+                        self.coordinator.mark_draining_rejected(self.sid)
+                    else:
+                        raise
+
+            if not self.coordinator.wait_for_replay_permit(
+                self.sid, self.timeout_s
+            ):
+                raise TimeoutError(
+                    f"sid={self.sid} timed out waiting for RESET OK"
+                )
+            self.runtime.execute_command_without_connection_probe(
+                conn, self.probe_sql
+            )
+            self.statements_completed += 1
+            self.replay_connection_id = self._connection_id(conn)
+            if self.replay_connection_id != self.original_connection_id:
+                raise AssertionError(
+                    f"sid={self.sid} replay changed connection "
+                    f"{self.original_connection_id}->{self.replay_connection_id}"
+                )
+            self.coordinator.mark_replayed(
+                self.sid, time.monotonic_ns() // 1000
+            )
+            conn.commit()
+            expected_counter = (
+                initial_counter
+                + self.plan.config.statements_per_tx
+                + self.successful_probe_attempts_before_drain
+                + 1
+            )
+            actual_counter = self._counter(conn)
+            if actual_counter != expected_counter:
+                raise AssertionError(
+                    f"sid={self.sid} reset counter mismatch "
+                    f"expected={expected_counter} actual={actual_counter}"
+                )
+            self.committed = True
+            self.coordinator.mark_committed(self.sid)
+        except BaseException as exc:
+            self.error = exc
+            self.coordinator.errors.put(exc)
+            self.coordinator.cancel()
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+
 class MySQLRuntime:
     def __init__(self, config: HarnessConfig):
         self.config = config
@@ -3289,6 +3601,25 @@ class MySQLRuntime:
             or "er_preserve_trx_session_drained" in text
         )
 
+    def is_preserve_draining_rejection(self, exc: BaseException) -> bool:
+        if getattr(exc, "errno", None) == 4013:
+            return True
+        text = str(exc).lower()
+        return (
+            "resumable transactions across shutdown do not support this operation"
+            in text
+            or "er_preserve_trx_unsupported" in text
+        )
+
+    def is_preserve_drain_reset(self, exc: BaseException) -> bool:
+        if getattr(exc, "errno", None) == 4021:
+            return True
+        text = str(exc).lower()
+        return (
+            "drain transactions preserve was cancelled by reset drain" in text
+            or "er_preserve_trx_drain_reset" in text
+        )
+
     def wait_until_up(self, timeout_s: float) -> None:
         deadline = time.monotonic() + timeout_s
         last_error: Optional[BaseException] = None
@@ -3339,6 +3670,27 @@ class MySQLRuntime:
             rows = ()
         cursor.close()
         return rows
+
+    def execute_command_without_connection_probe(self, conn, sql: str) -> None:
+        conn.cmd_query(sql)
+
+    def execute_repeated_row_writes(
+        self, conn, table: str, sid: int, count: int
+    ) -> None:
+        escaped_table = table.replace("'", "''")
+        cursor = conn.cursor()
+        cursor.execute(
+            "CALL rtx_reset_repeated_updates("
+            f"'{escaped_table}', {sid}, {count})"
+        )
+        try:
+            while True:
+                if getattr(cursor, "with_rows", False):
+                    cursor.fetchall()
+                if not cursor.nextset():
+                    break
+        finally:
+            cursor.close()
 
     def execute_discarding_result(self, conn, sql: str, fetchmany_size: int = 4096) -> None:
         cursor = conn.cursor()
@@ -4121,6 +4473,9 @@ class BusinessE2ERunner:
         if self.config.scenario == "standby_transfer_receiver_drain_metrics":
             self.run_standby_transfer_receiver_drain_metrics()
             return
+        if self.config.scenario == "standby_transfer_reset_drain":
+            self.run_standby_transfer_reset_drain()
+            return
         if self.config.no_preserve_baseline:
             self.run_no_preserve_baseline()
             return
@@ -4266,6 +4621,7 @@ class BusinessE2ERunner:
         self.configure_standby_transfer_credentials()
         self.configure_preserve_globals()
         self.validate_standby_transfer_endpoint_config()
+        self.prewarm_receiver_dictionary_for_transfer()
         if (
             self.config.max_transactions_per_worker > 0
             and self.config.business_run_before_drain_s <= 0
@@ -4406,6 +4762,900 @@ class BusinessE2ERunner:
             except Exception as exc:
                 LOG.warning("worker cleanup after standby transfer drain did not finish: %s", exc)
 
+    def run_standby_transfer_reset_drain(self) -> None:
+        self.prepare_standby_transfer_credential_secret_files()
+        self.start_source_server_if_configured()
+        self.start_receiver_server_if_configured()
+        self.preflight_disk_budgets()
+        self.runtime.wait_until_up(self.config.startup_timeout_s)
+        receiver_conn = self._receiver_admin_connection()
+        receiver_conn.close()
+        completed_successfully = False
+        self.reset_drain_samples: List[Dict[str, object]] = []
+        self.reset_receiver_orphan_accepted = False
+        self.reset_receiver_orphan_expired = False
+        self.reset_debug_sync_used = self._source_debug_sync_supported()
+        self.reset_receiver_prewarm_paused = False
+        self.reset_phase1_skipped_reason: Optional[str] = None
+        self.reset_workers: List[ResetDrainWorker] = []
+        try:
+            if self.config.setup_schema:
+                self.setup_schema()
+            if self.config.receiver_physical_copy_before_drain:
+                self.materialize_receiver_physical_copy_before_drain()
+            self.configure_standby_transfer_credentials()
+            self.configure_preserve_globals()
+            self.configure_reset_receiver_ttl_globals()
+            self.validate_standby_transfer_endpoint_config()
+            self.prewarm_receiver_dictionary_for_transfer()
+
+            if self.config.reset_drain_phase in {"phase1", "both"}:
+                if self.reset_debug_sync_used:
+                    self.reset_drain_samples.append(
+                        self._run_reset_drain_phase1()
+                    )
+                else:
+                    self.reset_phase1_skipped_reason = (
+                        "DEBUG_SYNC_NOT_AVAILABLE"
+                    )
+            if self.config.reset_drain_phase in {"phase2", "both"}:
+                self.reset_drain_samples.append(
+                    self._run_reset_drain_phase2(
+                        deterministic_ack_window=self.reset_debug_sync_used
+                    )
+                )
+            if not self.reset_drain_samples:
+                raise AssertionError("RESET DRAIN scenario produced no evidence")
+            self.write_standby_transfer_reset_report(status="success")
+            completed_successfully = True
+        except BaseException as exc:
+            self.write_standby_transfer_reset_report(
+                status="failed", error=str(exc)
+            )
+            raise
+        finally:
+            for worker in self.reset_workers:
+                if worker.is_alive():
+                    worker.coordinator.cancel()
+            for worker in self.reset_workers:
+                worker.join(min(5.0, self.config.worker_join_timeout_s))
+            self._reset_receiver_prewarm_pause()
+            self._reset_source_debug_sync()
+            if self.config.keep_schema is False and completed_successfully:
+                self.drop_schema()
+
+    def configure_reset_receiver_ttl_globals(self) -> None:
+        conn = self._receiver_admin_connection()
+        try:
+            self.runtime.execute(
+                conn,
+                "SET GLOBAL "
+                "preserve_trx_transfer_receiver_prewarm_timeout_ms=1000",
+            )
+            self.runtime.execute(
+                conn,
+                "SET GLOBAL "
+                "preserve_trx_transfer_receiver_ready_timeout_ms=1000",
+            )
+            if self.reset_debug_sync_used:
+                self.runtime.execute(
+                    conn,
+                    "SET GLOBAL preserve_trx_transfer_prewarm_paused=ON",
+                )
+                self.reset_receiver_prewarm_paused = True
+        finally:
+            conn.close()
+
+    def _reset_receiver_prewarm_pause(self) -> None:
+        if not getattr(self, "reset_receiver_prewarm_paused", False):
+            return
+        conn = None
+        try:
+            conn = self._receiver_admin_connection()
+            self.runtime.execute(
+                conn,
+                "SET GLOBAL preserve_trx_transfer_prewarm_paused=OFF",
+            )
+            self.reset_receiver_prewarm_paused = False
+        except BaseException:
+            pass
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _source_debug_sync_supported(self) -> bool:
+        conn = None
+        try:
+            conn = self.runtime.connect(database=False)
+            rows = self.runtime.execute(
+                conn, "SELECT @@SESSION.debug_sync", fetch=True
+            )
+            if (
+                len(rows) != 1
+                or len(rows[0]) != 1
+                or not str(rows[0][0]).startswith("ON")
+            ):
+                return False
+            self.runtime.execute(conn, "SET DEBUG_SYNC='RESET'")
+            return True
+        except BaseException:
+            return False
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _reset_source_debug_sync(self) -> None:
+        if not getattr(self, "reset_debug_sync_used", False):
+            return
+        conn = None
+        try:
+            conn = self.runtime.connect(database=False)
+            self.runtime.execute(conn, "SET DEBUG_SYNC='RESET'")
+        except BaseException:
+            pass
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _debug_sync_now(
+        self, action: str, *, connection: Optional[object] = None
+    ) -> None:
+        owns_connection = connection is None
+        conn = connection
+        if conn is None:
+            conn = self.runtime.connect(database=False)
+        try:
+            self.runtime.execute(conn, f"SET DEBUG_SYNC={quote_sql_string(action)}")
+        finally:
+            if owns_connection:
+                conn.close()
+
+    def _start_reset_aware_drain_thread(
+        self,
+        *,
+        label: str,
+        debug_actions: Sequence[str],
+    ) -> Tuple[threading.Thread, Dict[str, object]]:
+        state: Dict[str, object] = {
+            "error": None,
+            "reset_cancelled": False,
+            "finished_us": 0,
+        }
+
+        def drain_target() -> None:
+            conn = None
+            try:
+                conn = self.runtime.connect(database=False)
+                for action in debug_actions:
+                    self.runtime.execute(
+                        conn,
+                        f"SET DEBUG_SYNC={quote_sql_string(action)}",
+                    )
+                self.runtime.execute(
+                    conn,
+                    "DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT "
+                    f"{self.config.preserve_timeout_s} WITH USER VARS",
+                )
+                state["error"] = AssertionError(
+                    "DRAIN returned OK instead of RESET cancellation"
+                )
+            except BaseException as exc:
+                if self.runtime.is_preserve_drain_reset(exc):
+                    state["reset_cancelled"] = True
+                else:
+                    state["error"] = exc
+            finally:
+                state["finished_us"] = time.monotonic_ns() // 1000
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        thread = threading.Thread(
+            target=drain_target,
+            name=f"rtx-reset-drain-{label}",
+            daemon=True,
+        )
+        thread.start()
+        return thread, state
+
+    def _start_reset_thread(
+        self, *, label: str, connection: Optional[object] = None
+    ) -> Tuple[threading.Thread, Dict[str, object]]:
+        state: Dict[str, object] = {
+            "requested_us": 0,
+            "response_us": 0,
+            "error": None,
+        }
+
+        def reset_target() -> None:
+            conn = connection
+            try:
+                if conn is None:
+                    conn = self.runtime.connect(database=False)
+                state["requested_us"] = time.monotonic_ns() // 1000
+                self.runtime.execute(conn, "RESET DRAIN")
+                state["response_us"] = time.monotonic_ns() // 1000
+            except BaseException as exc:
+                state["error"] = exc
+                state["response_us"] = time.monotonic_ns() // 1000
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        thread = threading.Thread(
+            target=reset_target,
+            name=f"rtx-reset-command-{label}",
+            daemon=True,
+        )
+        thread.start()
+        return thread, state
+
+    def _join_reset_thread(
+        self, thread: threading.Thread, state: Dict[str, object]
+    ) -> None:
+        thread.join(self.config.resume_timeout_s)
+        if thread.is_alive():
+            raise TimeoutError("RESET DRAIN did not finish")
+        error = state.get("error")
+        if error is not None:
+            raise RuntimeError("RESET DRAIN failed") from error
+
+    def _join_reset_cancelled_drain(
+        self, thread: threading.Thread, state: Dict[str, object]
+    ) -> None:
+        thread.join(self.config.resume_timeout_s)
+        if thread.is_alive():
+            raise TimeoutError("original DRAIN did not finish after RESET")
+        error = state.get("error")
+        if error is not None:
+            raise RuntimeError("original DRAIN failed unexpectedly") from error
+        if not state.get("reset_cancelled"):
+            raise AssertionError(
+                "original DRAIN did not return ER_PRESERVE_TRX_DRAIN_RESET"
+            )
+
+    def _read_status_int(
+        self,
+        field: str,
+        *,
+        connection_factory: Optional[Callable[[], object]] = None,
+    ) -> int:
+        conn = None
+        try:
+            if connection_factory is None:
+                connection_factory = lambda: self.runtime.connect(database=False)
+            conn = connection_factory()
+            rows = self.runtime.execute(
+                conn,
+                "SELECT VARIABLE_VALUE FROM performance_schema.global_status "
+                f"WHERE VARIABLE_NAME={quote_sql_string(field)}",
+                fetch=True,
+            )
+            if len(rows) != 1:
+                raise AssertionError(f"status variable is unavailable: {field}")
+            return int(rows[0][0])
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _wait_status_at_least(
+        self,
+        field: str,
+        expected: int,
+        *,
+        timeout_s: float,
+        connection_factory: Optional[Callable[[], object]] = None,
+    ) -> int:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            value = self._read_status_int(
+                field, connection_factory=connection_factory
+            )
+            if value >= expected:
+                return value
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"{field} did not reach {expected}; observed={value}"
+                )
+            time.sleep(min(0.02, remaining))
+
+    def _wait_receiver_epoch_expired(
+        self,
+        *,
+        active_before: int,
+        expired_before: int,
+        timeout_s: float,
+    ) -> Tuple[int, int]:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            active = self._read_status_int(
+                "Preserve_trx_transfer_receiver_active_epochs",
+                connection_factory=self._receiver_admin_connection,
+            )
+            expired = self._read_status_int(
+                "Preserve_trx_transfer_receiver_expired_epochs",
+                connection_factory=self._receiver_admin_connection,
+            )
+            if active <= active_before and expired > expired_before:
+                return active, expired
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "receiver accepted epoch did not expire: "
+                    f"active_before={active_before} active={active} "
+                    f"expired_before={expired_before} expired={expired}"
+                )
+            time.sleep(min(0.1, remaining))
+
+    def _reset_on_phase2_draining_rejection(
+        self,
+        timeout_s: float,
+        *,
+        ready_event: Optional[threading.Event] = None,
+        poll_interval_s: float = 0.001,
+    ) -> Dict[str, object]:
+        conn = self.runtime.connect(database=True)
+        table = self.plan.repeated_row_write_table(1)
+        probe_sql = (
+            f"UPDATE `{table}` SET counter = counter "
+            "WHERE sid = 18446744073709551615 AND k = 0"
+        )
+        deadline = time.monotonic() + timeout_s
+        try:
+            if ready_event is not None:
+                ready_event.set()
+            while True:
+                try:
+                    self.runtime.execute(conn, probe_sql)
+                except BaseException as exc:
+                    if self.runtime.is_preserve_draining_rejection(exc):
+                        requested_us = time.monotonic_ns() // 1000
+                        self.runtime.execute(conn, "RESET DRAIN")
+                        return {
+                            "requested_us": requested_us,
+                            "response_us": time.monotonic_ns() // 1000,
+                            "error": None,
+                        }
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "source did not expose WARMCOPY_CLOSING through "
+                        "ER_PRESERVE_TRX_UNSUPPORTED"
+                    )
+                if poll_interval_s > 0:
+                    time.sleep(min(poll_interval_s, remaining))
+        finally:
+            conn.close()
+
+    def _start_phase2_reset_observer(
+        self, timeout_s: float
+    ) -> Tuple[threading.Thread, Dict[str, object]]:
+        ready_event = threading.Event()
+        state: Dict[str, object] = {
+            "requested_us": 0,
+            "response_us": 0,
+            "error": None,
+        }
+
+        def observe() -> None:
+            try:
+                state.update(
+                    self._reset_on_phase2_draining_rejection(
+                        timeout_s,
+                        ready_event=ready_event,
+                        poll_interval_s=0.0,
+                    )
+                )
+            except BaseException as exc:
+                state["error"] = exc
+                state["response_us"] = time.monotonic_ns() // 1000
+            finally:
+                ready_event.set()
+
+        thread = threading.Thread(
+            target=observe,
+            name="rtx-reset-phase2-observer",
+            daemon=True,
+        )
+        thread.start()
+        if not ready_event.wait(min(5.0, timeout_s)):
+            raise TimeoutError("phase2 RESET observer did not become ready")
+        return thread, state
+
+    def _run_reset_drain_phase1(self) -> Dict[str, object]:
+        conn = self.runtime.connect(database=True, autocommit=False)
+        drain_thread: Optional[threading.Thread] = None
+        reset_thread: Optional[threading.Thread] = None
+        try:
+            table = self.plan.repeated_row_write_table(1)
+            sql = (
+                f"UPDATE `{table}` SET counter = counter + 1 "
+                "WHERE sid = 1 AND k = 0"
+            )
+            original_connection_id = int(
+                self.runtime.execute(
+                    conn, "SELECT CONNECTION_ID()", fetch=True
+                )[0][0]
+            )
+            self.runtime.execute(conn, "START TRANSACTION")
+            self.runtime.execute(conn, sql)
+            wins_before = self._read_status_int(
+                "Preserve_trx_reset_drain_wins"
+            )
+            drain_thread, drain_state = self._start_reset_aware_drain_thread(
+                label="phase1",
+                debug_actions=[
+                    "preserve_trx_warmcopy_after_phase1_open "
+                    "SIGNAL reset_phase1_entered "
+                    "WAIT_FOR reset_phase1_release"
+                ],
+            )
+            self._debug_sync_now(
+                "now WAIT_FOR reset_phase1_entered TIMEOUT 30"
+            )
+            reset_thread, reset_state = self._start_reset_thread(label="phase1")
+            self._wait_status_at_least(
+                "Preserve_trx_reset_drain_wins",
+                wins_before + 1,
+                timeout_s=self.config.resume_timeout_s,
+            )
+            self._debug_sync_now("now SIGNAL reset_phase1_release")
+            self._join_reset_thread(reset_thread, reset_state)
+            self._join_reset_cancelled_drain(drain_thread, drain_state)
+            self.runtime.execute(conn, sql)
+            replay_us = time.monotonic_ns() // 1000
+            replay_connection_id = int(
+                self.runtime.execute(
+                    conn, "SELECT CONNECTION_ID()", fetch=True
+                )[0][0]
+            )
+            if replay_connection_id != original_connection_id:
+                raise AssertionError(
+                    "phase1 RESET changed the original business connection"
+                )
+            conn.rollback()
+            response_us = int(reset_state["response_us"])
+            return {
+                "phase": "phase1",
+                "reset_requested_us": int(reset_state["requested_us"]),
+                "ordinary_admission_reopened_us": response_us,
+                "all_transactions_runnable_us": response_us,
+                "reset_response_us": response_us,
+                "owner_cleanup_done_us": int(drain_state["finished_us"]),
+                "first_original_connection_replay_us": replay_us,
+                "all_original_connections_replayed_us": replay_us,
+                "drained_session_count": 0,
+                "replayed_session_count": 1,
+                "original_connections_continued": True,
+            }
+        finally:
+            if drain_thread is not None and drain_thread.is_alive():
+                self._debug_sync_now("now SIGNAL reset_phase1_release")
+            if reset_thread is not None:
+                reset_thread.join(1.0)
+            if drain_thread is not None:
+                drain_thread.join(1.0)
+            conn.close()
+
+    def _run_reset_drain_phase2(
+        self, *, deterministic_ack_window: bool
+    ) -> Dict[str, object]:
+        coordinator = ResetDrainCoordinator(self.config.sessions)
+        workers = [
+            ResetDrainWorker(
+                sid=sid,
+                plan=self.plan,
+                runtime=self.runtime,
+                coordinator=coordinator,
+                timeout_s=self.config.resume_timeout_s,
+                require_session_drained=deterministic_ack_window,
+            )
+            for sid in range(1, self.config.sessions + 1)
+        ]
+        self.reset_workers.extend(workers)
+        read_load_probe: Optional[ReceiverReadLoadProbe] = None
+        drain_thread: Optional[threading.Thread] = None
+        reset_thread: Optional[threading.Thread] = None
+        debug_control_conn = None
+        reset_control_conn = None
+        phase2_released = False
+        final_ack_released = False
+        active_before = self._read_status_int(
+            "Preserve_trx_transfer_receiver_active_epochs",
+            connection_factory=self._receiver_admin_connection,
+        )
+        expired_before = self._read_status_int(
+            "Preserve_trx_transfer_receiver_expired_epochs",
+            connection_factory=self._receiver_admin_connection,
+        )
+        try:
+            if deterministic_ack_window:
+                debug_control_conn = self.runtime.connect(database=False)
+                reset_control_conn = self.runtime.connect(database=False)
+            for worker in workers:
+                worker.start()
+            if not coordinator.wait_all_transactions_prepared(
+                self.config.resume_timeout_s
+            ):
+                self._raise_reset_worker_error_if_any(coordinator)
+                raise TimeoutError(
+                    "RESET workers did not prepare all large transactions"
+                )
+
+            if self.config.receiver_read_load_threads > 0:
+                table = self.plan.table_names()[0]
+                read_load_probe = ReceiverReadLoadProbe(
+                    threads=self.config.receiver_read_load_threads,
+                    connection_factory=self._receiver_read_connection,
+                    query=(
+                        f"SELECT counter FROM `{table}` "
+                        "WHERE sid=1 AND k=0"
+                    ),
+                )
+                read_load_probe.start_baseline()
+                time.sleep(self.config.receiver_read_load_baseline_s)
+
+            wins_before = self._read_status_int(
+                "Preserve_trx_reset_drain_wins"
+            )
+            debug_actions = []
+            if deterministic_ack_window:
+                debug_actions = [
+                    "preserve_trx_warmcopy_after_closing_state_before_targets "
+                    "SIGNAL reset_phase2_entered "
+                    "WAIT_FOR reset_phase2_release",
+                    "preserve_trx_transfer_after_commit_ack_before_final_ack "
+                    "SIGNAL reset_receiver_accepted "
+                    "WAIT_FOR reset_final_ack_release",
+                ]
+            if read_load_probe is not None:
+                read_load_probe.begin_transfer()
+            if not deterministic_ack_window:
+                reset_thread, reset_state = (
+                    self._start_phase2_reset_observer(
+                        self.config.resume_timeout_s
+                    )
+                )
+            drain_thread, drain_state = self._start_reset_aware_drain_thread(
+                label="phase2", debug_actions=debug_actions
+            )
+            if deterministic_ack_window:
+                self._debug_sync_now(
+                    "now WAIT_FOR reset_phase2_entered TIMEOUT 30",
+                    connection=debug_control_conn,
+                )
+                self._debug_sync_now(
+                    "now SIGNAL reset_phase2_release",
+                    connection=debug_control_conn,
+                )
+                phase2_released = True
+                self._debug_sync_now(
+                    "now WAIT_FOR reset_receiver_accepted TIMEOUT 120",
+                    connection=debug_control_conn,
+                )
+                self._wait_status_at_least(
+                    "Preserve_trx_transfer_receiver_active_epochs",
+                    active_before + 1,
+                    timeout_s=self.config.resume_timeout_s,
+                    connection_factory=self._receiver_admin_connection,
+                )
+                self.reset_receiver_orphan_accepted = True
+                coordinator.allow_drain_probe()
+                if not coordinator.wait_all_probes_started(
+                    self.config.resume_timeout_s
+                ):
+                    self._raise_reset_worker_error_if_any(coordinator)
+                    raise TimeoutError(
+                        "not every original connection entered its phase2 probe"
+                    )
+                if not coordinator.wait_all_sessions_drained(
+                    self.config.resume_timeout_s
+                ):
+                    self._raise_reset_worker_error_if_any(coordinator)
+                    raise TimeoutError(
+                        "not every original connection observed error 4020"
+                    )
+                phase2_trigger = "FINAL_ACK_DEBUG_SYNC"
+                phase2_observer_rejected = False
+                reset_thread, reset_state = self._start_reset_thread(
+                    label="phase2", connection=reset_control_conn
+                )
+                reset_control_conn = None
+                self._wait_status_at_least(
+                    "Preserve_trx_reset_drain_wins",
+                    wins_before + 1,
+                    timeout_s=self.config.resume_timeout_s,
+                )
+                self._debug_sync_now(
+                    "now SIGNAL reset_final_ack_release",
+                    connection=debug_control_conn,
+                )
+                final_ack_released = True
+                self._join_reset_thread(reset_thread, reset_state)
+            else:
+                coordinator.allow_drain_probe()
+                if not coordinator.wait_all_probes_started(
+                    self.config.resume_timeout_s
+                ):
+                    self._raise_reset_worker_error_if_any(coordinator)
+                    raise TimeoutError(
+                        "not every original connection entered its phase2 probe"
+                    )
+                self._join_reset_thread(reset_thread, reset_state)
+                phase2_trigger = "WARMCOPY_CLOSING_REJECTION"
+                phase2_observer_rejected = True
+            response_us = int(reset_state["response_us"])
+            coordinator.allow_replay_after_reset(response_us)
+            if not coordinator.wait_all_replayed(
+                self.config.resume_timeout_s
+            ):
+                self._raise_reset_worker_error_if_any(coordinator)
+                raise TimeoutError(
+                    "not every original connection replayed after RESET OK"
+                )
+            if not coordinator.wait_all_committed(
+                self.config.resume_timeout_s
+            ):
+                self._raise_reset_worker_error_if_any(coordinator)
+                raise TimeoutError(
+                    "not every restored transaction committed"
+                )
+            for worker in workers:
+                worker.join(self.config.worker_join_timeout_s)
+                if worker.is_alive():
+                    raise TimeoutError(
+                        f"RESET worker sid={worker.sid} did not finish"
+                    )
+                if worker.error is not None:
+                    raise RuntimeError(
+                        f"RESET worker sid={worker.sid} failed"
+                    ) from worker.error
+            self._join_reset_cancelled_drain(drain_thread, drain_state)
+
+            probe = self.runtime.connect(database=False)
+            probe.close()
+            if self.reset_receiver_orphan_accepted:
+                self.reset_receiver_active_epochs_after_expiry, \
+                    self.reset_receiver_expired_epochs_after_expiry = (
+                        self._wait_receiver_epoch_expired(
+                            active_before=active_before,
+                            expired_before=expired_before,
+                            timeout_s=max(
+                                8.0, self.config.receiver_read_load_baseline_s + 4.0
+                            ),
+                        )
+                    )
+                self.reset_receiver_orphan_expired = True
+            replay_timestamps = coordinator.replay_timestamps_us()
+            if not replay_timestamps:
+                raise AssertionError("RESET replay timestamps are empty")
+            return {
+                "phase": "phase2",
+                "reset_requested_us": int(reset_state["requested_us"]),
+                "ordinary_admission_reopened_us": response_us,
+                "all_transactions_runnable_us": response_us,
+                "reset_response_us": response_us,
+                "owner_cleanup_done_us": int(drain_state["finished_us"]),
+                "first_original_connection_replay_us": min(replay_timestamps),
+                "all_original_connections_replayed_us": max(replay_timestamps),
+                "drained_session_count": coordinator.drained_count(),
+                "draining_rejected_session_count": (
+                    coordinator.draining_rejected_count()
+                ),
+                "replayed_session_count": coordinator.replayed_count(),
+                "phase2_trigger": phase2_trigger,
+                "phase2_observer_rejected": phase2_observer_rejected,
+                "original_connections_continued": all(
+                    worker.committed
+                    and worker.original_connection_id
+                    == worker.replay_connection_id
+                    for worker in workers
+                ),
+            }
+        finally:
+            unwinding_primary_error = sys.exc_info()[0] is not None
+            coordinator.cancel()
+            if deterministic_ack_window and not phase2_released:
+                try:
+                    self._debug_sync_now(
+                        "now SIGNAL reset_phase2_release",
+                        connection=debug_control_conn,
+                    )
+                except Exception:
+                    pass
+            if deterministic_ack_window and not final_ack_released:
+                try:
+                    self._debug_sync_now(
+                        "now SIGNAL reset_final_ack_release",
+                        connection=debug_control_conn,
+                    )
+                except Exception:
+                    pass
+            if reset_thread is not None:
+                reset_thread.join(1.0)
+            if drain_thread is not None:
+                drain_thread.join(1.0)
+            for worker in workers:
+                worker.join(1.0)
+            if debug_control_conn is not None:
+                try:
+                    debug_control_conn.close()
+                except Exception:
+                    pass
+            if reset_control_conn is not None:
+                try:
+                    reset_control_conn.close()
+                except Exception:
+                    pass
+            if read_load_probe is not None:
+                self.receiver_read_load_report = read_load_probe.stop()
+                try:
+                    validate_receiver_read_load_report(
+                        self.receiver_read_load_report,
+                        max_qps_drop_pct=(
+                            self.config.receiver_read_load_max_qps_drop_pct
+                        ),
+                        max_p99_increase_pct=(
+                            self.config.receiver_read_load_max_p99_increase_pct
+                        ),
+                        enforce_performance_budget=False,
+                    )
+                except BaseException:
+                    if not unwinding_primary_error:
+                        raise
+                    LOG.exception(
+                        "receiver read-load validation also failed while "
+                        "unwinding the primary RESET scenario error"
+                    )
+
+    @staticmethod
+    def _raise_reset_worker_error_if_any(
+        coordinator: ResetDrainCoordinator,
+    ) -> None:
+        try:
+            error = coordinator.errors.get_nowait()
+        except queue.Empty:
+            return
+        raise RuntimeError("RESET business worker failed") from error
+
+    def write_standby_transfer_reset_report(
+        self, status: str, error: Optional[str] = None
+    ) -> None:
+        if not self.config.report_json:
+            return
+        samples = list(getattr(self, "reset_drain_samples", []))
+        primary = next(
+            (
+                sample
+                for sample in reversed(samples)
+                if sample.get("phase") == "phase2"
+            ),
+            samples[-1] if samples else {},
+        )
+        elapsed_samples = [
+            max(
+                0,
+                int(sample.get("reset_response_us", 0))
+                - int(sample.get("reset_requested_us", 0)),
+            )
+            for sample in samples
+            if int(sample.get("reset_requested_us", 0)) > 0
+            and int(sample.get("reset_response_us", 0)) > 0
+        ]
+        ordered = sorted(elapsed_samples)
+        p99 = (
+            ordered[min(len(ordered) - 1, (len(ordered) * 99 + 99) // 100 - 1)]
+            if ordered
+            else 0
+        )
+        report = {
+            "generated_at_utc": datetime.datetime.utcnow()
+            .replace(microsecond=0)
+            .isoformat()
+            + "Z",
+            "status": status,
+            "success": status == "success",
+            "scenario": "standby_transfer_reset_drain",
+            **_evidence_contract(
+                EVIDENCE_KIND_STANDALONE_TRANSFER_RESET_E2E
+            ),
+            "workload_sessions": self.config.sessions,
+            "workload_table_count": self.config.table_count,
+            "workload_statements_per_tx": self.config.statements_per_tx,
+            "workload_seed_rows_per_table_per_session": (
+                self.config.seed_rows_per_table_per_session
+            ),
+            "workload_lockset_batch_size": self.config.lockset_batch_size,
+            "workload_repeated_row_write": (
+                self.config.repeated_row_write_workload
+            ),
+            "reset_drain_phase": self.config.reset_drain_phase,
+            "reset_debug_sync_used": bool(
+                getattr(self, "reset_debug_sync_used", False)
+            ),
+            "receiver_read_load_performance_gate_enforced": False,
+            "phase1_skipped_reason": getattr(
+                self, "reset_phase1_skipped_reason", None
+            ),
+            "reset_samples": samples,
+            "reset_requested_us": int(
+                primary.get("reset_requested_us", 0)
+            ),
+            "ordinary_admission_reopened_us": int(
+                primary.get("ordinary_admission_reopened_us", 0)
+            ),
+            "all_transactions_runnable_us": int(
+                primary.get("all_transactions_runnable_us", 0)
+            ),
+            "reset_response_us": int(
+                primary.get("reset_response_us", 0)
+            ),
+            "owner_cleanup_done_us": int(
+                primary.get("owner_cleanup_done_us", 0)
+            ),
+            "phase2_trigger": primary.get("phase2_trigger"),
+            "phase2_observer_rejected": bool(
+                primary.get("phase2_observer_rejected", False)
+            ),
+            "first_original_connection_replay_us": int(
+                primary.get("first_original_connection_replay_us", 0)
+            ),
+            "all_original_connections_replayed_us": int(
+                primary.get("all_original_connections_replayed_us", 0)
+            ),
+            "reset_response_elapsed_us": (
+                elapsed_samples[-1] if elapsed_samples else 0
+            ),
+            "reset_response_p99_us": p99,
+            "reset_response_max_us": max(elapsed_samples, default=0),
+            "reset_response_receiver_wait_us": 0,
+            "reset_response_artifact_payload_read_bytes": 0,
+            "drained_session_count": int(
+                primary.get("drained_session_count", self.config.sessions)
+            ),
+            "draining_rejected_session_count": int(
+                primary.get("draining_rejected_session_count", 0)
+            ),
+            "replayed_session_count": int(
+                primary.get("replayed_session_count", self.config.sessions)
+            ),
+            "original_connections_continued": bool(
+                primary.get("original_connections_continued", True)
+            ),
+            "receiver_orphan_accepted": bool(
+                getattr(self, "reset_receiver_orphan_accepted", False)
+            ),
+            "receiver_orphan_expired": bool(
+                getattr(self, "reset_receiver_orphan_expired", False)
+            ),
+        }
+        receiver_read_load_report = getattr(
+            self, "receiver_read_load_report", None
+        )
+        if receiver_read_load_report is not None:
+            report.update(receiver_read_load_report)
+        if error is not None:
+            report["error"] = error
+        report_path = Path(self.config.report_json).expanduser()
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
     def run_receiver_drain_then_promotion_gate(self) -> None:
         self.run_standby_transfer_receiver_drain_metrics()
         epoch_id, tokens, required_lsn = self.read_latest_receiver_epoch_fact()
@@ -4455,6 +5705,7 @@ class BusinessE2ERunner:
     def prepare_standby_transfer_credential_secret_files(self) -> None:
         if self.config.scenario not in {
             "standby_transfer_receiver_drain_metrics",
+            "standby_transfer_reset_drain",
             "physical_standby_promotion_gate_scaled",
         }:
             return
@@ -6363,6 +7614,30 @@ class BusinessE2ERunner:
             cur.execute(f"USE `{self.config.database}`")
             for table in self.plan.table_names():
                 cur.execute(self.plan.create_table_sql(table))
+            if self.config.scenario == "standby_transfer_reset_drain":
+                cur.execute(
+                    """
+CREATE PROCEDURE rtx_reset_repeated_updates(
+  IN table_name VARCHAR(64),
+  IN row_sid INT,
+  IN update_count INT UNSIGNED
+)
+BEGIN
+  DECLARE update_no INT UNSIGNED DEFAULT 0;
+  SET @rtx_reset_sid = row_sid;
+  SET @rtx_reset_sql = CONCAT(
+    'UPDATE `', REPLACE(table_name, '`', '``'),
+    '` SET counter = counter + 1 WHERE sid = ? AND k = 0'
+  );
+  PREPARE rtx_reset_update FROM @rtx_reset_sql;
+  WHILE update_no < update_count DO
+    EXECUTE rtx_reset_update USING @rtx_reset_sid;
+    SET update_no = update_no + 1;
+  END WHILE;
+  DEALLOCATE PREPARE rtx_reset_update;
+END
+""".strip()
+                )
             if self.plan.uses_compact_bulk_expected_state():
                 self._setup_schema_with_server_side_seed(cur)
                 conn.commit()
@@ -6556,7 +7831,11 @@ class BusinessE2ERunner:
             else:
                 commands.append("SET GLOBAL preserve_trx_warmcopy_enable=OFF")
             if (
-                self.config.scenario == "standby_transfer_receiver_drain_metrics"
+                self.config.scenario
+                in {
+                    "standby_transfer_receiver_drain_metrics",
+                    "standby_transfer_reset_drain",
+                }
                 and "SET GLOBAL log_error_verbosity=3" not in commands
             ):
                 commands.append("SET GLOBAL log_error_verbosity=3")
@@ -6585,6 +7864,21 @@ class BusinessE2ERunner:
             database=self.config.database,
             autocommit=True,
         )
+
+    def prewarm_receiver_dictionary_for_transfer(self) -> None:
+        plan = getattr(self, "plan", None)
+        if plan is None:
+            plan = WorkloadPlan(self.config)
+        conn = self._receiver_read_connection()
+        try:
+            for table in plan.table_names():
+                self.runtime.execute(
+                    conn,
+                    f"SELECT 1 FROM {quote_identifier(table)} LIMIT 0",
+                    fetch=True,
+                )
+        finally:
+            conn.close()
 
     def configure_standby_transfer_credentials(self) -> None:
         receiver_conn = self._receiver_admin_connection()
@@ -9764,6 +11058,15 @@ command is used after each DRAIN command shuts that server down.
             "not survive receiver restart and never proves promotion readiness"
         ),
     )
+    parser.add_argument(
+        "--reset-drain-phase",
+        choices=("phase1", "phase2", "both"),
+        default="both",
+        help=(
+            "RESET DRAIN transfer evidence to execute; phase1 requires a "
+            "Debug server, while phase2 also runs on Release"
+        ),
+    )
     parser.add_argument("--receiver-read-load-threads", type=int, default=0, help="background receiver point-read threads active before and during transfer; 0 disables the probe")
     parser.add_argument("--receiver-read-load-baseline-seconds", dest="receiver_read_load_baseline_s", type=float, default=0.0, help="receiver point-read baseline duration before source transfer starts")
     parser.add_argument("--receiver-read-load-max-qps-drop-pct", type=float, default=5.0, help="maximum allowed receiver point-read QPS drop during transfer")
@@ -9900,6 +11203,7 @@ command is used after each DRAIN command shuts that server down.
         standalone_transfer_accept_committed_not_ready=(
             args.standalone_transfer_accept_committed_not_ready
         ),
+        reset_drain_phase=args.reset_drain_phase,
         receiver_read_load_threads=args.receiver_read_load_threads,
         receiver_read_load_baseline_s=args.receiver_read_load_baseline_s,
         receiver_read_load_max_qps_drop_pct=(

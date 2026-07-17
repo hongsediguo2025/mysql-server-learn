@@ -3820,6 +3820,67 @@ TEST_F(PreservedTrxCommandRead,
   EXPECT_EQ(Preserve_trx_command_block_result::ALLOW, context.observed);
 }
 
+static void publish_reset_cleanup_during_manager_guard(void *arg) {
+  const auto reset_owner = *static_cast<my_thread_id *>(arg);
+  preserved_trx_set_manager_state_for_unit_test(
+      Preserve_trx_manager_state::RESET_CLEANUP, reset_owner);
+}
+
+TEST_F(PreservedTrxCommandRead,
+       ManagerStateGuardDoesNotOverwriteResetCleanupTakeover) {
+  constexpr my_thread_id kDrainOwner = 201;
+  my_thread_id reset_owner = 202;
+  preserved_trx_set_manager_state_for_unit_test(Preserve_trx_manager_state::IDLE,
+                                                0);
+  preserved_trx_set_manager_state_publication_probe_for_unit_test(
+      publish_reset_cleanup_during_manager_guard, &reset_owner);
+
+  EXPECT_TRUE(preserved_trx_probe_manager_state_guard_for_unit_test(
+      Preserve_trx_manager_state::BATCH_DRAINING, kDrainOwner));
+  preserved_trx_set_manager_state_publication_probe_for_unit_test(nullptr,
+                                                                  nullptr);
+
+  EXPECT_EQ(Preserve_trx_manager_state::RESET_CLEANUP,
+            preserved_trx_manager_state());
+  preserved_trx_set_manager_state_for_unit_test(Preserve_trx_manager_state::IDLE,
+                                                0);
+}
+
+TEST_F(PreservedTrxCommandRead,
+       ResetCleanupAllowsBusinessButBlocksPreserveControls) {
+  THD *target = thd();
+  preserve_trx_set_enable_value(true);
+  preserved_trx_set_manager_state_for_unit_test(
+      Preserve_trx_manager_state::RESET_CLEANUP, 0);
+
+  EXPECT_EQ(Preserve_trx_command_block_result::ALLOW,
+            preserved_trx_command_block_result(target, SQLCOM_UPDATE));
+  EXPECT_EQ(Preserve_trx_command_block_result::ALLOW,
+            preserved_trx_protocol_command_block_result(target, COM_REFRESH));
+  EXPECT_EQ(Preserve_trx_command_block_result::ALLOW,
+            preserved_trx_command_block_result(target, SQLCOM_RESET_DRAIN));
+  EXPECT_EQ(
+      Preserve_trx_command_block_result::BLOCK_DRAINING,
+      preserved_trx_command_block_result(
+          target, SQLCOM_PREPARE_SHUTDOWN_PRESERVE));
+  EXPECT_EQ(
+      Preserve_trx_command_block_result::BLOCK_DRAINING,
+      preserved_trx_command_block_result(
+          target, SQLCOM_DRAIN_TRANSACTIONS_PRESERVE));
+  EXPECT_EQ(Preserve_trx_command_block_result::BLOCK_DRAINING,
+            preserved_trx_command_block_result(
+                target, SQLCOM_RESUME_PRESERVED_TRX));
+
+  target->preserve_trx_batch_state =
+      Preserve_trx_batch_thd_state::PRESERVED_DRAINED;
+  EXPECT_EQ(Preserve_trx_command_block_result::BLOCK_SESSION_DRAINED,
+            preserved_trx_command_block_result(target, SQLCOM_UPDATE));
+
+  target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
+  preserved_trx_set_manager_state_for_unit_test(Preserve_trx_manager_state::IDLE,
+                                                0);
+}
+
 struct ProtocolWarmcopyClosingProbeContext {
   THD *target{nullptr};
   Preserve_trx_command_block_result risky_observed{
@@ -6004,6 +6065,7 @@ class Transfer_client_ops_guard {
     g_fake_transfer_client_state = state;
     static const Preserve_trx_transfer_client_ops fake_ops = {
         fake_transfer_client_connect, fake_transfer_client_send,
+        nullptr,
         fake_transfer_client_disconnect};
     preserve_trx_transfer_set_client_ops_for_unit_test(&fake_ops);
   }
@@ -6016,6 +6078,97 @@ class Transfer_client_ops_guard {
  private:
   Fake_transfer_client_state *m_state;
 };
+
+struct Blocking_transfer_client_state {
+  std::atomic<int> connect_count{0};
+  std::atomic<int> send_count{0};
+  std::atomic<int> interrupt_count{0};
+  std::atomic<int> disconnect_count{0};
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool send_entered{false};
+  bool interrupted{false};
+  bool release_send{false};
+  std::vector<std::string> frames;
+};
+
+static Blocking_transfer_client_state *g_blocking_transfer_client_state =
+    nullptr;
+
+Preserve_trx_transfer_status blocking_transfer_client_connect(
+    const Preserve_trx_transfer_client_endpoint &, void **connection) {
+  if (g_blocking_transfer_client_state == nullptr || connection == nullptr) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  ++g_blocking_transfer_client_state->connect_count;
+  *connection = g_blocking_transfer_client_state;
+  return Preserve_trx_transfer_status::OK;
+}
+
+Preserve_trx_transfer_status blocking_transfer_client_send(
+    void *connection, const std::string &encoded_frame) {
+  Blocking_transfer_client_state *state =
+      g_blocking_transfer_client_state;
+  if (state == nullptr || connection != state) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  ++state->send_count;
+  std::unique_lock<std::mutex> lock(state->mutex);
+  state->frames.push_back(encoded_frame);
+  state->send_entered = true;
+  state->condition.notify_all();
+  state->condition.wait(
+      lock, [&] { return state->interrupted || state->release_send; });
+  return Preserve_trx_transfer_status::IO_ERROR;
+}
+
+void blocking_transfer_client_interrupt(void *connection) {
+  Blocking_transfer_client_state *state =
+      g_blocking_transfer_client_state;
+  if (state == nullptr || connection != state) return;
+  ++state->interrupt_count;
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->interrupted = true;
+  }
+  state->condition.notify_all();
+}
+
+void blocking_transfer_client_disconnect(void *connection) {
+  Blocking_transfer_client_state *state =
+      g_blocking_transfer_client_state;
+  if (state != nullptr && connection == state) ++state->disconnect_count;
+}
+
+class Blocking_transfer_client_ops_guard {
+ public:
+  explicit Blocking_transfer_client_ops_guard(
+      Blocking_transfer_client_state *state) {
+    g_blocking_transfer_client_state = state;
+    static const Preserve_trx_transfer_client_ops blocking_ops = {
+        blocking_transfer_client_connect, blocking_transfer_client_send,
+        blocking_transfer_client_interrupt,
+        blocking_transfer_client_disconnect};
+    preserve_trx_transfer_set_client_ops_for_unit_test(&blocking_ops);
+  }
+
+  ~Blocking_transfer_client_ops_guard() {
+    preserve_trx_transfer_set_client_ops_for_unit_test(nullptr);
+    g_blocking_transfer_client_state = nullptr;
+  }
+};
+
+struct Final_ack_arbiter_state {
+  uint calls{0};
+  bool allow{false};
+};
+
+bool final_ack_arbiter_probe(void *context) {
+  auto *state = static_cast<Final_ack_arbiter_state *>(context);
+  if (state == nullptr) return false;
+  ++state->calls;
+  return state->allow;
+}
 
 struct Transfer_ack_loss_context {
   uint calls{0};
@@ -7057,6 +7210,39 @@ class PreserveSnapshotTest : public ::testing::Test {
     metadata.global_log_bin = false;
     metadata.mdl_descriptors_payload = empty_mdl_descriptors_payload();
     return metadata;
+  }
+
+  std::shared_ptr<const Preserve_trx_transfer_epoch_fact>
+  publish_test_accepted_epoch(
+      Preserve_trx_transfer_receiver_registry *registry,
+      const std::string &epoch_id, uint64_t token, uint64_t now_us,
+      uint64_t prewarm_timeout_ms) {
+    Preserve_trx_transfer_manifest manifest;
+    manifest.epoch_id = epoch_id;
+    manifest.source_server_uuid = "source-uuid";
+    manifest.target_server_uuid = server_uuid;
+    manifest.token = token;
+    manifest.source_prepare_lsn = 10;
+    manifest.source_epoch_commit_lsn = 20;
+    EXPECT_EQ(Preserve_trx_transfer_status::OK,
+              registry->begin_receive(manifest));
+
+    auto fact = std::make_shared<Preserve_trx_transfer_epoch_fact>();
+    fact->epoch_id = epoch_id;
+    fact->source_server_uuid = manifest.source_server_uuid;
+    fact->target_server_uuid = manifest.target_server_uuid;
+    fact->source_fence_lsn = 30;
+    Preserve_trx_transfer_epoch_fact_token fact_token;
+    fact_token.token = token;
+    fact_token.source_prepare_lsn = manifest.source_prepare_lsn;
+    fact_token.source_epoch_commit_lsn = manifest.source_epoch_commit_lsn;
+    fact->tokens.push_back(std::move(fact_token));
+    fact->fact_digest[0] = 1;
+    EXPECT_EQ(Preserve_trx_transfer_status::OK,
+              registry->publish_accepted_epoch(
+                  m_dir, fact, "receiver-generation", now_us,
+                  prewarm_timeout_ms));
+    return fact;
   }
 
   Preserved_trx_codec_context codec_context() {
@@ -8732,6 +8918,39 @@ TEST_F(PreserveSnapshotTest, PromotionReadyCacheEnforcesByteCap) {
             preserve_trx_promotion_ready_cache_max_bytes);
   EXPECT_GT(preserve_trx_promotion_ready_cache_evictions_status(),
             evictions_before);
+}
+
+TEST_F(PreserveSnapshotTest, PromotionReadyCachePurgeEpochIsExact) {
+  preserved_trx_promotion_ready_cache_clear_for_unit_test();
+  preserved_trx_promotion_ready_cache_put_for_unit_test(
+      m_dir, "epoch-purge-a", 7101,
+      Preserve_trx_promotion_ready_state::READY, 100);
+  preserved_trx_promotion_ready_cache_put_for_unit_test(
+      m_dir, "epoch-purge-b", 7102,
+      Preserve_trx_promotion_ready_state::READY, 200);
+  preserved_trx_promotion_ready_cache_put_for_unit_test(
+      m_dir + "-other", "epoch-purge-a", 7103,
+      Preserve_trx_promotion_ready_state::READY, 300);
+
+  const uint64_t all_bytes =
+      preserve_trx_promotion_ready_cache_bytes_status();
+  ASSERT_GT(all_bytes, 0U);
+
+  preserved_trx_promotion_ready_cache_purge_epoch(m_dir, "epoch-purge-a");
+  const uint64_t remaining_bytes =
+      preserve_trx_promotion_ready_cache_bytes_status();
+  EXPECT_GT(remaining_bytes, 0U);
+  EXPECT_LT(remaining_bytes, all_bytes);
+
+  preserved_trx_promotion_ready_cache_purge_epoch(m_dir, "epoch-purge-a");
+  EXPECT_EQ(remaining_bytes,
+            preserve_trx_promotion_ready_cache_bytes_status());
+
+  preserved_trx_promotion_ready_cache_purge_epoch(m_dir, "epoch-purge-b");
+  EXPECT_GT(preserve_trx_promotion_ready_cache_bytes_status(), 0U);
+  preserved_trx_promotion_ready_cache_purge_epoch(m_dir + "-other",
+                                                  "epoch-purge-a");
+  EXPECT_EQ(0U, preserve_trx_promotion_ready_cache_bytes_status());
 }
 
 TEST_F(PreserveSnapshotTest, PromotionGateRejectsMoreThanBatchTokens) {
@@ -12373,6 +12592,27 @@ TEST_F(PreserveSnapshotTest,
                                                kPreservedTrxBlobBinlogCache));
 }
 
+TEST_F(PreserveSnapshotTest,
+       SourceRollbackImageRetainedNativeCacheSkipsExternalArtifactRead) {
+  Preserve_trx_source_rollback_image image;
+  image.preserve_dir = m_dir;
+  image.binlog_snapshot.event_counter = 1;
+  image.binlog_snapshot.has_cache_length = true;
+  image.binlog_snapshot.cache_length = 64;
+  image.prebuilt_binlog_blob.warmcopy_id = "missing-warmcopy";
+  image.prebuilt_binlog_blob.warmcopy_epoch = 91;
+  image.prebuilt_binlog_blob.name = kPreservedTrxBlobBinlogCache;
+  image.prebuilt_binlog_blob.size = 64;
+  image.has_prebuilt_binlog_blob = true;
+  image.native_binlog_cache_retained = true;
+
+  Preserve_snapshot_metadata restored = logged_with_cache_metadata();
+  restored.binlog_cache_size = 64;
+  EXPECT_FALSE(preserved_trx_hydrate_source_rollback_image_for_unit_test(
+      restored.token, &restored, image));
+  EXPECT_TRUE(restored.binlog_cache_payload.empty());
+}
+
 TEST_F(PreserveSnapshotTest, LocalFileStoreWriteCanDeferDirectoryFsync) {
   Preserved_trx_bundle bundle;
   Preserved_trx_bundle_build_input input;
@@ -13905,6 +14145,163 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
+       AcceptedEpochLifecycleInstallsAndAdvancesDeadlines) {
+  Preserve_trx_transfer_receiver_registry registry;
+  const uint64_t accepted_us = 1000;
+  const uint64_t prewarm_timeout_ms = 10;
+  publish_test_accepted_epoch(&registry, "epoch-lifecycle", 901, accepted_us,
+                              prewarm_timeout_ms);
+
+  Preserve_trx_transfer_accepted_epoch accepted;
+  ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(m_dir, "epoch-lifecycle", &accepted));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_lifecycle::PREWARMING,
+            accepted.lifecycle);
+  EXPECT_EQ(accepted_us + prewarm_timeout_ms * 1000,
+            accepted.deadline_monotonic_us);
+  EXPECT_TRUE(registry.accepted_epoch_is_live(m_dir, "epoch-lifecycle"));
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.mark_accepted_epoch_ready(m_dir, "epoch-lifecycle", 2000,
+                                               30));
+  ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(m_dir, "epoch-lifecycle", &accepted));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_lifecycle::READY, accepted.lifecycle);
+  EXPECT_EQ(32000U, accepted.deadline_monotonic_us);
+
+  std::vector<Preserve_trx_transfer_accepted_epoch> expired;
+  EXPECT_EQ(0U, registry.expire_accepted_epochs_once(31999, &expired));
+  EXPECT_EQ(1U, registry.expire_accepted_epochs_once(32000, &expired));
+  ASSERT_EQ(1U, expired.size());
+  EXPECT_EQ(Preserve_trx_transfer_epoch_lifecycle::EXPIRED,
+            expired.front().lifecycle);
+  EXPECT_FALSE(registry.accepted_epoch_is_live(m_dir, "epoch-lifecycle"));
+  EXPECT_EQ(Preserve_trx_transfer_status::IO_ERROR,
+            registry.query_accepted_epoch(m_dir, "epoch-lifecycle"));
+}
+
+TEST_F(PreserveSnapshotTest,
+       ReceiverEpochStatusCountsActiveAndCumulativeExpiry) {
+  Preserve_trx_transfer_receiver_registry registry;
+  EXPECT_EQ(0U, registry.active_epoch_count());
+  EXPECT_EQ(0U, registry.expired_epoch_count());
+
+  publish_test_accepted_epoch(&registry, "epoch-status-prewarming", 906, 1000,
+                              10);
+  publish_test_accepted_epoch(&registry, "epoch-status-leased", 907, 1000, 10);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.mark_accepted_epoch_ready(
+                m_dir, "epoch-status-leased", 2000, 30));
+  ASSERT_EQ(Preserve_trx_receiver_promotion_lease_status::ACQUIRED,
+            registry.try_acquire_accepted_epoch_promotion_lease(
+                m_dir, "epoch-status-leased", 3000));
+  EXPECT_EQ(2U, registry.active_epoch_count());
+  EXPECT_EQ(0U, registry.expired_epoch_count());
+
+  std::vector<Preserve_trx_transfer_accepted_epoch> expired;
+  EXPECT_EQ(1U, registry.expire_accepted_epochs_once(11000, &expired));
+  EXPECT_EQ(1U, registry.active_epoch_count());
+  EXPECT_EQ(1U, registry.expired_epoch_count());
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.erase_expired_epoch(m_dir,
+                                         "epoch-status-prewarming"));
+  EXPECT_EQ(1U, registry.active_epoch_count());
+  EXPECT_EQ(1U, registry.expired_epoch_count());
+}
+
+TEST_F(PreserveSnapshotTest, AcceptedEpochPromotionLeasePreventsExpiry) {
+  Preserve_trx_transfer_receiver_registry registry;
+  publish_test_accepted_epoch(&registry, "epoch-lease", 902, 1000, 10);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.mark_accepted_epoch_ready(m_dir, "epoch-lease", 2000, 30));
+  EXPECT_EQ(Preserve_trx_receiver_promotion_lease_status::ACQUIRED,
+            registry.try_acquire_accepted_epoch_promotion_lease(
+                m_dir, "epoch-lease", 3000));
+
+  Preserve_trx_transfer_accepted_epoch accepted;
+  ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(m_dir, "epoch-lease", &accepted));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_lifecycle::ADOPT_LEASED,
+            accepted.lifecycle);
+  std::vector<Preserve_trx_transfer_accepted_epoch> expired;
+  EXPECT_EQ(0U, registry.expire_accepted_epochs_once(
+                    std::numeric_limits<uint64_t>::max(), &expired));
+  EXPECT_TRUE(expired.empty());
+}
+
+TEST_F(PreserveSnapshotTest,
+       AcceptedEpochAckRetirementDoesNotRetireLifecycleState) {
+  Preserve_trx_transfer_receiver_registry registry;
+  publish_test_accepted_epoch(&registry, "epoch-ack-lifecycle", 903, 1000,
+                              100);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.acknowledge_epoch(m_dir, "epoch-ack-lifecycle", 1000, 1));
+  EXPECT_EQ(1U, registry.retire_acknowledged_epochs_once(1001));
+  EXPECT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(m_dir, "epoch-ack-lifecycle"));
+}
+
+TEST_F(PreserveSnapshotTest, AcceptedEpochReadyAndExpiryCannotBothWin) {
+  for (uint iteration = 0; iteration < 100; ++iteration) {
+    Preserve_trx_transfer_receiver_registry registry;
+    publish_test_accepted_epoch(&registry, "epoch-ready-expiry-race", 904,
+                                1000, 100);
+    std::atomic<bool> start{false};
+    Preserve_trx_transfer_status ready_status =
+        Preserve_trx_transfer_status::INVALID_ARGUMENT;
+    size_t expired_count = 0;
+    std::thread ready([&] {
+      while (!start.load(std::memory_order_acquire)) {
+      }
+      ready_status = registry.mark_accepted_epoch_ready(
+          m_dir, "epoch-ready-expiry-race", 100500, 30);
+    });
+    std::thread expire([&] {
+      while (!start.load(std::memory_order_acquire)) {
+      }
+      std::vector<Preserve_trx_transfer_accepted_epoch> expired;
+      expired_count =
+          registry.expire_accepted_epochs_once(101000, &expired);
+    });
+    start.store(true, std::memory_order_release);
+    ready.join();
+    expire.join();
+
+    const bool ready_won =
+        ready_status == Preserve_trx_transfer_status::OK;
+    const bool expiry_won = expired_count == 1;
+    EXPECT_NE(ready_won, expiry_won);
+  }
+}
+
+TEST_F(PreserveSnapshotTest,
+       ReceiverEpochExpiryPurgesRegistryAndPromotionReadyCache) {
+  Preserve_trx_transfer_receiver_registry registry;
+  const uint64_t ready_cache_bytes_before =
+      preserve_trx_promotion_ready_cache_bytes_status();
+  publish_test_accepted_epoch(&registry, "epoch-expiry-cleanup", 905, 1000,
+                              10);
+  preserved_trx_promotion_ready_cache_put_for_unit_test(
+      m_dir, "epoch-expiry-cleanup", 905,
+      Preserve_trx_promotion_ready_state::READY, 20);
+  ASSERT_GT(preserve_trx_promotion_ready_cache_bytes_status(),
+            ready_cache_bytes_before);
+
+  preserve_trx_transfer_receiver_reaper_scan_for_unit_test(11000, &registry);
+
+  EXPECT_EQ(Preserve_trx_transfer_status::IO_ERROR,
+            registry.query_accepted_epoch(m_dir, "epoch-expiry-cleanup"));
+  EXPECT_EQ(0U, registry.size());
+  EXPECT_EQ(ready_cache_bytes_before,
+            preserve_trx_promotion_ready_cache_bytes_status());
+  EXPECT_EQ(Preserve_trx_receiver_promotion_lease_status::
+                NOT_FOUND_OR_EXPIRED,
+            registry.try_acquire_accepted_epoch_promotion_lease(
+                m_dir, "epoch-expiry-cleanup", 11001));
+}
+
+TEST_F(PreserveSnapshotTest,
        TransferReceiverRejectsFrameTargetThatIsNotLocalServerUuid) {
   Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 1020;
@@ -14089,6 +14486,13 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_EQ(1U, ready_summary.ready_tokens.size());
   EXPECT_EQ(manifest.token, ready_summary.ready_tokens[0]);
   EXPECT_TRUE(ready_summary.pending_tokens.empty());
+  Preserve_trx_transfer_accepted_epoch accepted;
+  ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(m_dir, manifest.epoch_id,
+                                          &accepted));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_lifecycle::READY,
+            accepted.lifecycle);
+  EXPECT_GT(accepted.deadline_monotonic_us, 0U);
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -14193,6 +14597,130 @@ TEST_F(PreserveSnapshotTest,
                 m_dir, manifest.epoch_id, &ready_summary));
   EXPECT_EQ(1U, ready_summary.ready_tokens.size());
   EXPECT_EQ(0U, preserve_trx_transfer_receiver_queued_bytes_status());
+  Preserve_trx_transfer_accepted_epoch accepted;
+  ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(m_dir, manifest.epoch_id,
+                                          &accepted));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_lifecycle::READY,
+            accepted.lifecycle);
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferReceiverExpiryCancelsActivePrewarmWithoutReadyResurrection) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 1039;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_build_portable_objects(
+                "epoch-active-prewarm-expiry", "source-uuid", server_uuid,
+                bundle, transfer_token, &manifest, &objects));
+  std::string manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_manifest(manifest,
+                                                  &manifest_payload));
+
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", server_uuid);
+  Preserve_trx_transfer_receiver_registry registry;
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  preserved_trx_promotion_ready_cache_clear_for_unit_test();
+  preserve_trx_transfer_set_receiver_staged_prewarm_delay_ms_for_unit_test(500);
+  auto reset_delay = create_scope_guard([] {
+    preserve_trx_transfer_set_receiver_staged_prewarm_delay_ms_for_unit_test(0);
+    preserved_trx_promotion_ready_cache_clear_for_unit_test();
+  });
+
+  Preserve_trx_transfer_frame begin;
+  begin.type = Preserve_trx_transfer_frame_type::BEGIN;
+  begin.sequence = 1;
+  begin.epoch_id = manifest.epoch_id;
+  begin.token = manifest.token;
+  begin.manifest_payload = manifest_payload;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, begin, &store, &registry, 300, nullptr));
+
+  uint64_t sequence = 2;
+  for (const Preserve_trx_transfer_object_payload &object : objects) {
+    Preserve_trx_transfer_frame chunk;
+    chunk.type = Preserve_trx_transfer_frame_type::OBJECT_CHUNK;
+    chunk.sequence = sequence++;
+    chunk.epoch_id = manifest.epoch_id;
+    chunk.token = manifest.token;
+    chunk.object_id = object.descriptor.object_id;
+    chunk.chunk_payload = object.payload;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_apply_receiver_frame(
+                  m_dir, chunk, &store, &registry, 300, nullptr));
+
+    Preserve_trx_transfer_frame seal;
+    seal.type = Preserve_trx_transfer_frame_type::SEAL_OBJECT;
+    seal.sequence = sequence++;
+    seal.epoch_id = manifest.epoch_id;
+    seal.token = manifest.token;
+    seal.object_id = object.descriptor.object_id;
+    ASSERT_EQ(Preserve_trx_transfer_status::OK,
+              preserve_trx_transfer_apply_receiver_frame(
+                  m_dir, seal, &store, &registry, 300, nullptr));
+  }
+
+  for (uint attempt = 0; attempt < 200; ++attempt) {
+    if (preserve_trx_transfer_receiver_staged_token_active_status() != 0) {
+      break;
+    }
+    my_sleep(10000);
+  }
+  ASSERT_GT(preserve_trx_transfer_receiver_staged_token_active_status(), 0U);
+
+  Preserve_trx_transfer_frame commit;
+  commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
+  commit.sequence = sequence++;
+  commit.epoch_id = manifest.epoch_id;
+  commit.token = manifest.token;
+  set_test_transfer_commit_proof(&commit);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_apply_receiver_frame(
+                m_dir, commit, &store, &registry, 300, nullptr));
+
+  Preserve_trx_transfer_accepted_epoch accepted;
+  ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(m_dir, manifest.epoch_id,
+                                          &accepted));
+  ASSERT_EQ(Preserve_trx_transfer_epoch_lifecycle::PREWARMING,
+            accepted.lifecycle);
+  preserve_trx_transfer_receiver_reaper_scan_for_unit_test(
+      accepted.deadline_monotonic_us, &registry);
+
+  for (uint attempt = 0; attempt < 200; ++attempt) {
+    if (preserve_trx_transfer_receiver_staged_token_active_status() == 0) {
+      break;
+    }
+    my_sleep(10000);
+  }
+  EXPECT_EQ(0U,
+            preserve_trx_transfer_receiver_staged_token_active_status());
+  EXPECT_EQ(Preserve_trx_transfer_status::IO_ERROR,
+            registry.query_accepted_epoch(m_dir, manifest.epoch_id));
+  EXPECT_EQ(0U, registry.size());
+  EXPECT_FALSE(preserve_trx_transfer_epoch_bound_for_unit_test(
+      m_dir, manifest.epoch_id));
+  EXPECT_EQ(0U, preserve_trx_promotion_ready_cache_bytes_status());
+
+  Preserve_trx_promotion_ready_summary ready_summary;
+  EXPECT_NE(Preserve_trx_promotion_adopt_status::OK,
+            preserved_trx_promotion_ready_summary_for_epoch(
+                m_dir, manifest.epoch_id, &ready_summary));
+  EXPECT_TRUE(ready_summary.ready_tokens.empty());
 }
 
 #ifndef NDEBUG
@@ -20367,6 +20895,68 @@ TEST_F(PreserveSnapshotTest,
 }
 
 TEST_F(PreserveSnapshotTest,
+       TransferSourceFinalAckArbiterRetainsCommitStateUntilAccepted) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 7102;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+
+  Final_ack_arbiter_state arbiter;
+  Preserve_trx_transfer_source_epoch_options options;
+  options.chunk_bytes = 7;
+  options.max_inflight_bytes = preserve_trx_transfer_max_inflight_bytes;
+  options.phase1_batch_bytes = preserve_trx_transfer_phase1_batch_bytes;
+  options.final_ack_arbiter = final_ack_arbiter_probe;
+  options.final_ack_arbiter_context = &arbiter;
+  Commit_outcome_transfer_frame_sink sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-session-final-ack-arbiter", "source-uuid", "target-uuid",
+      options, &sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_token(transfer_token));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.send_token_bundle(bundle, transfer_token));
+
+  const uint64_t sequence_before_commit = session.next_sequence();
+  const size_t frame_count_before_commit = sink.frames().size();
+  EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED,
+            session.commit_epoch());
+  EXPECT_EQ(1U, arbiter.calls);
+  EXPECT_EQ(sequence_before_commit, session.next_sequence());
+  const size_t frames_per_commit_attempt =
+      sink.frames().size() - frame_count_before_commit;
+  EXPECT_GE(frames_per_commit_attempt, 2U);
+  EXPECT_EQ(0U, sink.release_count());
+
+  arbiter.allow = true;
+  EXPECT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
+  EXPECT_EQ(2U, arbiter.calls);
+  EXPECT_EQ(sequence_before_commit + 1, session.next_sequence());
+  EXPECT_EQ(frame_count_before_commit + 2 * frames_per_commit_attempt,
+            sink.frames().size());
+  EXPECT_EQ(1U, sink.release_count());
+
+  Preserve_trx_transfer_frame first_commit;
+  Preserve_trx_transfer_frame second_commit;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(
+                sink.frames()[frame_count_before_commit +
+                              frames_per_commit_attempt - 1],
+                &first_commit));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_decode_frame(sink.frames().back(),
+                                               &second_commit));
+  EXPECT_EQ(Preserve_trx_transfer_frame_type::COMMIT_EPOCH,
+            first_commit.type);
+  EXPECT_EQ(first_commit.sequence, second_commit.sequence);
+}
+
+TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSessionDoesNotAcceptCommittedCorrupt) {
   Transfer_codec_context_guard codec_guard;
   const uint64_t transfer_token = 7101;
@@ -22808,6 +23398,77 @@ TEST_F(PreserveSnapshotTest,
   const int disconnect_count_after_ack = client_state.disconnect_count;
   sink.reset();
   EXPECT_EQ(disconnect_count_after_ack, client_state.disconnect_count);
+}
+
+TEST_F(PreserveSnapshotTest,
+       TransferClientCancelInterruptsBlockedSendWithoutRetryOrReconnect) {
+  Transfer_source_config_guard config;
+  config.tcp("target-uuid", "127.0.0.1", 3307, "transfer_user",
+             "transfer_credential");
+  Blocking_transfer_client_state client_state;
+  Blocking_transfer_client_ops_guard client_ops(&client_state);
+  const uint saved_data_sessions = preserve_trx_transfer_data_sessions;
+  preserve_trx_transfer_data_sessions = 1;
+  auto restore_data_sessions = create_scope_guard(
+      [&] { preserve_trx_transfer_data_sessions = saved_data_sessions; });
+
+  std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> sink;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_make_configured_frame_sink(&sink));
+  ASSERT_NE(nullptr, sink.get());
+
+  Preserve_trx_transfer_frame commit;
+  commit.type = Preserve_trx_transfer_frame_type::COMMIT_EPOCH;
+  commit.sequence = 1;
+  commit.epoch_id = "epoch-client-cancel";
+  commit.token = 805;
+  std::string encoded_commit;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_encode_frame(commit, &encoded_commit));
+
+  Preserve_trx_transfer_status send_status =
+      Preserve_trx_transfer_status::ACK_UNCERTAIN;
+  std::thread sender([&] {
+    send_status = sink->send_encoded_frame(encoded_commit);
+  });
+  {
+    std::unique_lock<std::mutex> lock(client_state.mutex);
+    ASSERT_TRUE(client_state.condition.wait_for(
+        lock, std::chrono::seconds(2),
+        [&] { return client_state.send_entered; }));
+  }
+
+  std::atomic<bool> cancel_returned{false};
+  std::thread canceler([&] {
+    sink->request_cancel();
+    cancel_returned.store(true, std::memory_order_release);
+  });
+  for (uint attempt = 0;
+       attempt < 200 &&
+       !cancel_returned.load(std::memory_order_acquire);
+       ++attempt) {
+    my_sleep(1000);
+  }
+  if (!cancel_returned.load(std::memory_order_acquire)) {
+    {
+      std::lock_guard<std::mutex> lock(client_state.mutex);
+      client_state.release_send = true;
+    }
+    client_state.condition.notify_all();
+  }
+  canceler.join();
+  sender.join();
+
+  EXPECT_TRUE(cancel_returned.load(std::memory_order_acquire));
+  EXPECT_EQ(Preserve_trx_transfer_status::UNSUPPORTED, send_status);
+  EXPECT_EQ(1, client_state.connect_count.load());
+  EXPECT_EQ(1, client_state.send_count.load());
+  EXPECT_EQ(1, client_state.interrupt_count.load());
+  EXPECT_EQ(1, client_state.disconnect_count.load());
+  ASSERT_EQ(1U, client_state.frames.size());
+
+  sink.reset();
+  EXPECT_EQ(1, client_state.disconnect_count.load());
 }
 
 TEST_F(PreserveSnapshotTest, TransferArtifactSinkPublishesThroughFrameSink) {

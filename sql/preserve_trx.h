@@ -312,6 +312,7 @@ enum class Preserve_trx_manager_state {
       WARMCOPY_CLOSING          command admission is closing for phase 2
       BATCH_DRAINING            batch admission/target-quiesce/preserve window
       EXPIRED_ROLLBACK          expired token reaper owns manager work
+      RESET_CLEANUP             reset owns source transaction restoration
       DRAIN_CLEANUP_FAILED      cleanup left observable state for operators
       SHUTDOWN_REQUESTED        shutdown/token-delivery handoff is in progress
 
@@ -328,8 +329,17 @@ enum class Preserve_trx_manager_state {
   BATCH_DRAINING,
   SNAPSHOTTING,
   EXPIRED_ROLLBACK,
+  RESET_CLEANUP,
   DRAIN_CLEANUP_FAILED,
   SHUTDOWN_REQUESTED
+};
+
+enum class Preserve_trx_reset_drain_result : uint8_t {
+  NO_ACTIVE,
+  RESET_WON,
+  RESET_JOINED,
+  TOO_LATE,
+  UNSUPPORTED
 };
 
 enum class Preserve_trx_command_block_result {
@@ -377,6 +387,7 @@ struct Preserve_trx_source_rollback_image {
   Mysql_binlog_preserve_snapshot binlog_snapshot;
   PrebuiltBinlogCacheBlob prebuilt_binlog_blob;
   bool has_prebuilt_binlog_blob{false};
+  bool native_binlog_cache_retained{false};
 };
 
 struct Preserve_trx_preserve_result {
@@ -505,6 +516,8 @@ bool preserved_trx_ensure_snapshot_support();
 bool preserved_trx_validate_snapshot_support(bool allow_create_missing);
 bool preserved_trx_preflight_recoverability();
 Preserve_trx_manager_state preserved_trx_manager_state();
+ulonglong preserve_trx_reset_drain_wins_status();
+ulonglong preserve_trx_reset_drain_too_late_status();
 bool preserved_trx_can_disable_feature();
 bool preserved_trx_try_disable_feature_for_update();
 void preserved_trx_set_manager_state_publication_probe_for_unit_test(

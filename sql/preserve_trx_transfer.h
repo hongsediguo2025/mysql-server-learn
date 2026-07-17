@@ -99,6 +99,8 @@ extern ulonglong preserve_trx_transfer_io_bytes_per_sec;
 extern uint preserve_trx_transfer_commit_batch_tokens;
 extern uint preserve_trx_transfer_worker_yield_us;
 extern uint preserve_trx_transfer_commit_timeout_ms;
+extern uint preserve_trx_transfer_receiver_prewarm_timeout_ms;
+extern uint preserve_trx_transfer_receiver_ready_timeout_ms;
 extern ulonglong preserve_trx_transfer_phase1_batch_bytes;
 extern uint preserve_trx_transfer_phase1_batch_linger_ms;
 
@@ -125,6 +127,8 @@ uint64_t preserve_trx_transfer_receiver_saved_online_tokens_status();
 uint64_t preserve_trx_transfer_receiver_failed_tokens_status();
 uint64_t preserve_trx_transfer_receiver_last_failed_token_status();
 std::string preserve_trx_transfer_receiver_last_failed_reason_status();
+uint64_t preserve_trx_transfer_receiver_active_epochs_status();
+uint64_t preserve_trx_transfer_receiver_expired_epochs_status();
 
 bool preserve_trx_transfer_tls_identity_config_is_valid_for_unit_test(
     bool unix_socket, const std::string &ssl_ca, const std::string &ssl_capath);
@@ -495,6 +499,19 @@ struct Preserve_trx_transfer_receiver_status_counts {
   std::string last_failed_reason;
 };
 
+enum class Preserve_trx_transfer_epoch_lifecycle : uint8_t {
+  PREWARMING,
+  READY,
+  ADOPT_LEASED,
+  EXPIRED
+};
+
+enum class Preserve_trx_receiver_promotion_lease_status : uint8_t {
+  ACQUIRED,
+  NOT_READY,
+  NOT_FOUND_OR_EXPIRED
+};
+
 struct Preserve_trx_transfer_accepted_epoch {
   std::string root_dir;
   std::string epoch_id;
@@ -505,6 +522,9 @@ struct Preserve_trx_transfer_accepted_epoch {
   std::vector<uint64_t> tokens;
   std::array<unsigned char, kPreservedTrxSha256Length> fact_digest{};
   std::shared_ptr<const Preserve_trx_transfer_epoch_fact> fact;
+  Preserve_trx_transfer_epoch_lifecycle lifecycle{
+      Preserve_trx_transfer_epoch_lifecycle::PREWARMING};
+  uint64_t deadline_monotonic_us{0};
 };
 
 struct Preserve_trx_transfer_payload_apply_reservation {
@@ -559,10 +579,26 @@ class Preserve_trx_transfer_receiver_registry {
   Preserve_trx_transfer_status publish_accepted_epoch(
       const std::string &root_dir,
       std::shared_ptr<const Preserve_trx_transfer_epoch_fact> fact,
-      const std::string &receiver_process_generation);
+      const std::string &receiver_process_generation, uint64_t now_us,
+      uint64_t prewarm_timeout_ms);
   Preserve_trx_transfer_status query_accepted_epoch(
       const std::string &root_dir, const std::string &epoch_id,
       Preserve_trx_transfer_accepted_epoch *accepted = nullptr) const;
+  bool accepted_epoch_is_live(const std::string &root_dir,
+                              const std::string &epoch_id) const;
+  bool accepted_epoch_is_expired(const std::string &root_dir,
+                                 const std::string &epoch_id) const;
+  Preserve_trx_transfer_status mark_accepted_epoch_ready(
+      const std::string &root_dir, const std::string &epoch_id, uint64_t now_us,
+      uint64_t ready_timeout_ms);
+  Preserve_trx_receiver_promotion_lease_status
+  try_acquire_accepted_epoch_promotion_lease(
+      const std::string &root_dir, const std::string &epoch_id, uint64_t now_us);
+  size_t expire_accepted_epochs_once(
+      uint64_t now_us,
+      std::vector<Preserve_trx_transfer_accepted_epoch> *expired);
+  Preserve_trx_transfer_status erase_expired_epoch(
+      const std::string &root_dir, const std::string &epoch_id);
   size_t retire_acknowledged_epochs_once(uint64_t now_us);
   Preserve_trx_transfer_status mark_corrupt(const std::string &epoch_id,
                                             uint64_t token,
@@ -617,6 +653,8 @@ class Preserve_trx_transfer_receiver_registry {
   bool lookup(const std::string &epoch_id, uint64_t token,
               Preserve_trx_transfer_receiver_record *record) const;
   size_t size() const;
+  size_t active_epoch_count() const;
+  uint64_t expired_epoch_count() const;
   Preserve_trx_transfer_receiver_status_counts status_counts() const;
 
  private:
@@ -678,6 +716,7 @@ class Preserve_trx_transfer_receiver_registry {
   std::map<std::string, Acknowledged_epoch> m_acknowledged_epochs;
   std::map<std::string, Preserve_trx_transfer_accepted_epoch>
       m_accepted_epochs;
+  uint64_t m_expired_epoch_count{0};
 };
 
 Preserve_trx_transfer_status preserve_trx_transfer_encode_manifest(
@@ -777,13 +816,18 @@ class Preserve_trx_transfer_encoded_frame_sink {
   virtual void set_operation_timeout_ms(uint timeout_ms) {
     (void)timeout_ms;
   }
+  virtual void request_cancel() {}
   virtual void release_epoch_transport() {}
 };
+
+using Preserve_trx_transfer_source_final_ack_arbiter = bool (*)(void *);
 
 struct Preserve_trx_transfer_source_epoch_options {
   uint32_t chunk_bytes{0};
   uint64_t max_inflight_bytes{0};
   uint64_t phase1_batch_bytes{0};
+  Preserve_trx_transfer_source_final_ack_arbiter final_ack_arbiter{nullptr};
+  void *final_ack_arbiter_context{nullptr};
 };
 
 class Preserve_trx_transfer_source_epoch_session {
@@ -883,6 +927,8 @@ class Preserve_trx_transfer_source_epoch_session {
   uint64_t m_max_inflight_bytes{0};
   uint64_t m_phase1_batch_bytes{0};
   Preserve_trx_transfer_encoded_frame_sink *m_sink{nullptr};
+  Preserve_trx_transfer_source_final_ack_arbiter m_final_ack_arbiter{nullptr};
+  void *m_final_ack_arbiter_context{nullptr};
   uint64_t m_next_sequence{1};
   mutable std::mutex m_mutex;
   bool m_epoch_committed{false};
@@ -939,6 +985,7 @@ struct Preserve_trx_transfer_client_ops {
       void **connection);
   Preserve_trx_transfer_status (*send_frame)(void *connection,
                                              const std::string &encoded_frame);
+  void (*interrupt)(void *connection);
   void (*disconnect)(void *connection);
 };
 
@@ -968,8 +1015,15 @@ preserve_trx_transfer_acknowledge_epoch_for_unit_test(
     Preserve_trx_transfer_receiver_registry *registry, uint64_t now_us,
     uint64_t grace_us);
 void preserve_trx_transfer_receiver_reaper_scan_once(uint64_t now_us);
+Preserve_trx_receiver_promotion_lease_status
+preserve_trx_transfer_try_acquire_receiver_promotion_lease(
+    const std::string &root_dir, const std::string &epoch_id, uint64_t now_us);
 void preserve_trx_transfer_receiver_reaper_scan_for_unit_test(
     uint64_t now_us, Preserve_trx_transfer_receiver_registry *registry);
+Preserve_trx_transfer_status
+preserve_trx_transfer_destroy_receiver_epoch_process_local(
+    const Preserve_trx_transfer_accepted_epoch &accepted,
+    Preserve_trx_transfer_receiver_registry *registry);
 bool preserve_trx_transfer_frame_batch_count_fits_payload(
     uint32_t count, size_t remaining_bytes);
 

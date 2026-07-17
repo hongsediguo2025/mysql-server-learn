@@ -1,0 +1,1178 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Preserve / Resume 运行观察与故障诊断手册</title>
+  <style>
+    :root {
+      --ink:#19242d; --muted:#5c6972; --line:#d6dde1; --paper:#fff; --canvas:#f1f4f5;
+      --navy:#18343a; --teal:#087b70; --teal-soft:#e6f3f0; --blue:#3f647d; --blue-soft:#e9f0f4;
+      --amber:#9a6204; --amber-soft:#fff3d8; --red:#963e38; --red-soft:#faecea;
+      --green:#397451; --green-soft:#e9f3ec; --code:#20262c; --radius:6px;
+      --shadow:0 1px 2px rgba(25,36,45,.05),0 8px 24px rgba(25,36,45,.05);
+    }
+    *{box-sizing:border-box}
+    html{scroll-behavior:smooth}
+    body{margin:0;color:var(--ink);background:var(--canvas);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",Arial,sans-serif;font-size:15px;line-height:1.72;letter-spacing:0}
+    a{color:var(--teal);text-underline-offset:3px} a:hover{color:#05645c}
+    code,.mono{font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;font-size:.91em}
+    code{padding:.12em .34em;color:#273740;background:#edf1f3;border:1px solid #dde4e7;border-radius:4px;overflow-wrap:anywhere}
+    pre{margin:14px 0;padding:15px 17px;overflow:auto;color:#e8edef;background:var(--code);border-radius:var(--radius);font-size:12.5px;line-height:1.62}
+    pre code{padding:0;color:inherit;background:none;border:0}
+    .skip-link{position:fixed;top:-60px;left:16px;z-index:100;padding:8px 12px;color:#fff;background:var(--teal);border-radius:4px}.skip-link:focus{top:12px}
+    .layout{display:grid;grid-template-columns:minmax(255px,292px) minmax(0,1fr);max-width:1700px;min-height:100vh;margin:0 auto;background:var(--paper);box-shadow:0 0 0 1px rgba(25,36,45,.04)}
+    .sidebar{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;padding:25px 21px 30px;background:#f8f9fa;border-right:1px solid var(--line)}
+    .brand{margin-bottom:20px;padding-bottom:18px;border-bottom:1px solid var(--line)}.brand strong{display:block;margin-bottom:5px;font-size:17px;line-height:1.35}.brand span{color:var(--muted);font-size:12px}
+    .toc-title{margin:0 0 8px;color:#77828b;font-size:11px;font-weight:700;text-transform:uppercase}.toc{margin:0;padding:0;list-style:none}
+    .toc a{display:block;margin:1px 0;padding:6px 9px;color:#43515b;border-left:2px solid transparent;text-decoration:none;font-size:13px;line-height:1.4}
+    .toc a:hover{color:var(--ink);background:#eef2f3}.toc a.active{color:var(--teal);background:var(--teal-soft);border-left-color:var(--teal);font-weight:650}
+    .side-note{margin-top:22px;padding-top:16px;color:var(--muted);border-top:1px solid var(--line);font-size:12px}
+    .content{min-width:0;padding:0 4.5vw 90px}.hero{margin:0 -4.5vw;padding:52px 4.5vw 43px;color:#fff;background:var(--navy);border-bottom:6px solid #d7a13b}
+    .eyebrow{margin:0 0 9px;color:#9ed8d1;font-size:13px;font-weight:700}h1{max-width:1050px;margin:0;font-size:45px;line-height:1.15;letter-spacing:0}
+    .hero .lead{max-width:1050px;margin:20px 0 0;color:#dce9eb;font-size:17px}
+    .facts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;margin:0 -4.5vw 30px;background:var(--line);border-bottom:1px solid var(--line)}
+    .facts>div{padding:17px 20px;background:#fbfcfc}.facts b{display:block;font-size:20px}.facts span{color:var(--muted);font-size:12px}
+    main section{scroll-margin-top:24px}h2{margin:62px 0 17px;padding-top:3px;font-size:28px;line-height:1.3;letter-spacing:0}h2:before{content:"";display:block;width:46px;height:4px;margin-bottom:12px;background:var(--teal)}
+    h3{margin:31px 0 11px;font-size:20px;line-height:1.4}h4{margin:23px 0 8px;font-size:16px}p{max-width:1100px;margin:11px 0}ul,ol{max-width:1100px;margin:10px 0 15px 22px;padding:0}li{margin:5px 0}.lead-section{color:#3d4b55;font-size:17px}
+    .note,.warning,.risk,.success{max-width:1140px;margin:17px 0;padding:14px 17px;border-left:4px solid var(--teal);background:var(--teal-soft)}
+    .warning{border-left-color:var(--amber);background:var(--amber-soft)}.risk{border-left-color:var(--red);background:var(--red-soft)}.success{border-left-color:var(--green);background:var(--green-soft)}
+    .note strong,.warning strong,.risk strong,.success strong{display:block;margin-bottom:3px}
+    .grid-2,.grid-3,.grid-4{display:grid;gap:13px;margin:17px 0}.grid-2{grid-template-columns:repeat(2,minmax(0,1fr))}.grid-3{grid-template-columns:repeat(3,minmax(0,1fr))}.grid-4{grid-template-columns:repeat(4,minmax(0,1fr))}
+    .panel{min-width:0;padding:16px 17px;border:1px solid var(--line);border-radius:var(--radius);background:#fff;box-shadow:var(--shadow)}.panel h3,.panel h4{margin-top:0}.panel p:last-child,.panel ul:last-child{margin-bottom:0}
+    .panel.core{border-top:4px solid var(--teal)}.panel.native{border-top:4px solid var(--blue)}.panel.warn{border-top:4px solid var(--amber)}.panel.fail{border-top:4px solid var(--red)}
+    .flow{display:grid;grid-template-columns:repeat(6,minmax(155px,1fr));gap:22px;margin:22px 0;overflow-x:auto;padding:2px}
+    .flow-step{position:relative;min-height:138px;padding:15px;border:1px solid var(--line);border-top:4px solid var(--teal);border-radius:var(--radius);background:#fff}
+    .flow-step:not(:last-child):after{content:"→";position:absolute;right:-18px;top:44px;color:var(--amber);font-size:22px;font-weight:700}.flow-step b{display:block;margin-bottom:5px}.flow-step span{color:var(--muted);font-size:12px}
+    .timeline{display:grid;grid-template-columns:repeat(5,minmax(150px,1fr));gap:1px;margin:20px 0;background:var(--line);border:1px solid var(--line)}
+    .timeline>div{min-height:126px;padding:14px;background:#fff}.timeline b{display:block;margin-bottom:6px}.timeline small{color:var(--muted)}
+    .table-wrap{width:100%;margin:15px 0 22px;overflow:auto;border:1px solid var(--line);border-radius:var(--radius)}
+    table{width:100%;border-collapse:collapse;background:#fff;font-size:12.5px}th,td{padding:10px 11px;border-bottom:1px solid #e2e7ea;text-align:left;vertical-align:top}
+    th{position:sticky;top:0;z-index:1;color:#33424c;background:#f0f3f4;font-size:11px;white-space:nowrap}tr:last-child td{border-bottom:0}tbody tr:hover{background:#fafcfc}td code{font-size:11.5px}
+    .wide-table{min-width:1120px}.medium-table{min-width:820px}.state{display:inline-block;padding:2px 6px;border-radius:4px;font-family:"SFMono-Regular",Consolas,monospace;font-size:11px;font-weight:700}
+    .state.good{color:#2f6746;background:var(--green-soft)}.state.warn{color:#805203;background:var(--amber-soft)}.state.bad{color:#863a35;background:var(--red-soft)}
+    .filters{position:sticky;top:0;z-index:8;display:grid;grid-template-columns:minmax(260px,1fr) 220px auto;gap:9px;align-items:center;margin:18px 0;padding:11px;background:#f8f9fa;border:1px solid var(--line);border-radius:var(--radius);box-shadow:0 5px 18px rgba(25,36,45,.08)}
+    .filters input,.filters select{width:100%;height:38px;padding:0 10px;color:var(--ink);background:#fff;border:1px solid #b9c4ca;border-radius:4px;font:inherit;font-size:13px}.filter-count{min-width:120px;color:var(--muted);font-size:12px;text-align:right}
+    details{margin:14px 0;border:1px solid var(--line);border-radius:var(--radius);background:#fff}summary{padding:13px 15px;cursor:pointer;font-weight:700}details>div{padding:0 15px 15px}
+    .playbook{display:grid;grid-template-columns:120px minmax(0,1fr);gap:7px 15px;margin:8px 0}.playbook dt{color:var(--muted);font-size:12px;font-weight:700}.playbook dd{margin:0}
+    .checklist{counter-reset:item;list-style:none;margin-left:0}.checklist li{position:relative;padding-left:31px}.checklist li:before{counter-increment:item;content:counter(item);position:absolute;left:0;top:1px;display:grid;place-items:center;width:21px;height:21px;color:#fff;background:var(--teal);border-radius:3px;font-size:11px;font-weight:700}
+    .formula{display:inline-block;padding:8px 11px;color:#fff;background:var(--blue);border-radius:4px;font-family:"SFMono-Regular",Consolas,monospace;font-size:12px}
+    .footer{margin-top:65px;padding-top:20px;color:var(--muted);border-top:1px solid var(--line);font-size:12px}
+    @media(max-width:1150px){.layout{grid-template-columns:1fr}.sidebar{position:relative;height:auto;border-right:0;border-bottom:1px solid var(--line)}.toc{display:grid;grid-template-columns:repeat(3,minmax(0,1fr))}.content{padding-left:24px;padding-right:24px}.hero,.facts{margin-left:-24px;margin-right:-24px}.hero{padding-left:24px;padding-right:24px}.facts{grid-template-columns:repeat(2,minmax(0,1fr))}.filters{top:0}}
+    @media(max-width:760px){body{font-size:14px}.sidebar{padding:20px 16px}.toc{grid-template-columns:repeat(2,minmax(0,1fr))}.content{padding-left:16px;padding-right:16px}.hero,.facts{margin-left:-16px;margin-right:-16px}.hero{padding:38px 16px 34px}h1{font-size:34px}.facts,.grid-2,.grid-3,.grid-4,.timeline{grid-template-columns:1fr}.flow{grid-template-columns:1fr;overflow:visible}.flow-step:not(:last-child):after{content:"↓";right:auto;left:22px;top:auto;bottom:-24px}.filters{position:relative;grid-template-columns:1fr}.filter-count{text-align:left}.playbook{grid-template-columns:1fr}.table-wrap{border-radius:0}}
+    @media print{body{background:#fff}.layout{display:block;max-width:none;box-shadow:none}.sidebar,.filters{display:none}.content{padding:0}.hero,.facts{margin-left:0;margin-right:0}.hero{color:#000;background:#fff;border-bottom:2px solid #000}.hero .lead,.eyebrow{color:#333}.table-wrap{overflow:visible}.wide-table,.medium-table{min-width:0}th{position:static}details>div{display:block}a{color:#000;text-decoration:none}}
+  </style>
+</head>
+<body>
+<a class="skip-link" href="#main">跳到正文</a>
+<div class="layout">
+  <aside class="sidebar" aria-label="文档导航">
+    <div class="brand"><strong>Preserve / Resume 运行诊断</strong><span>MySQL 8.0.22 port</span></div>
+    <p class="toc-title">目录</p>
+    <ul class="toc">
+      <li><a href="#model">1. 观察模型</a></li>
+      <li><a href="#quick-check">2. 五分钟巡检</a></li>
+      <li><a href="#transactions">3. 事务视图</a></li>
+      <li><a href="#metrics">4. 指标与度量</a></li>
+      <li><a href="#logs">5. 日志与审计</a></li>
+      <li><a href="#artifacts">6. 文件与标记</a></li>
+      <li><a href="#promotion">7. 500ms 升主</a></li>
+      <li><a href="#playbooks">8. 故障诊断</a></li>
+      <li><a href="#evidence">9. 证据采集</a></li>
+      <li><a href="#code-map">10. 代码回溯</a></li>
+      <li><a href="#status-codes">A. 状态码</a></li>
+      <li><a href="#metric-catalog">B. 指标全集</a></li>
+    </ul>
+    <div class="side-note">文中的数量由当前源码生成：29 列事务视图、9 个本地生命周期状态、212 个 Preserve_trx 状态量和 4 个 Com 计数器。</div>
+  </aside>
+
+  <div class="content">
+    <header class="hero">
+      <p class="eyebrow">运行状态、诊断证据与源码定位</p>
+      <h1>Preserve / Resume 运行观察与故障诊断手册</h1>
+      <p class="lead">按一次真实排障的顺序组织：先确认事务和控制面状态，再比较操作前后的指标，随后对齐日志与落盘对象，最后沿状态量写入点和状态机回到代码。</p>
+    </header>
+    <div class="facts">
+      <div><b>29</b><span>preserved_transactions 字段</span></div>
+      <div><b>9</b><span>本地事务生命周期状态</span></div>
+      <div><b>212</b><span>Preserve_trx 状态量</span></div>
+      <div><b>4</b><span>SQL 命令 Com 计数器</span></div>
+    </div>
+
+    <main id="main">
+      <section id="model">
+        <h2>1. 观察模型</h2>
+        <p class="lead-section">Preserve/Resume 没有一个单独的“总状态”可以回答所有问题。事务是否可恢复、一次 DRAIN 为什么慢、接收端是否已经 READY、promotion 是否满足 500ms，分别落在不同对象上。排障时应保持固定的证据顺序。</p>
+
+        <div class="flow" aria-label="Preserve Resume 诊断证据链">
+          <div class="flow-step"><b>控制面</b><span>参数、SQL 命令次数、当前拓扑角色。先确认观察的是哪条功能路径。</span></div>
+          <div class="flow-step"><b>事务状态</b><span>SHOW / P_S 中的本地 record、生命周期、sidecar 和最近错误。</span></div>
+          <div class="flow-step"><b>运行指标</b><span>最近一次、当前 gauge、进程累计和 monotonic 时间点必须分开解释。</span></div>
+          <div class="flow-step"><b>结构化日志</b><span>恢复 begin/end、drain metrics、participant、receiver、resume failure。</span></div>
+          <div class="flow-step"><b>持久化对象</b><span>snapshot、sidecar、marker、ledger 说明 durable 边界和清理债务。</span></div>
+          <div class="flow-step"><b>代码写入点</b><span>从状态注册找到 getter，再找到 store/fetch_add 和状态迁移。</span></div>
+        </div>
+
+        <div class="grid-3">
+          <article class="panel core">
+            <h3>本地事务平面</h3>
+            <p><code>performance_schema.preserved_transactions</code> 和 <code>SHOW PRESERVED TRANSACTIONS</code> 读取同一份内存 registry。它们展示本机已经注册的 preserved record，不扫描目录。</p>
+          </article>
+          <article class="panel native">
+            <h3>传输与升主平面</h3>
+            <p>standby receiver registry 和 strict prepared registry 与本地 preserved record 分离。接收成功的 token 不会因此出现在本地事务视图，也不能直接执行普通 SQL RESUME。</p>
+          </article>
+          <article class="panel warn">
+            <h3>持久化平面</h3>
+            <p><code>preserve_trx_dir</code> 保存 snapshot、sidecar 和 marker。文件能证明某个 durable 对象存在，但不能单独证明内存状态已注册或 promotion gate 已通过。</p>
+          </article>
+        </div>
+
+        <h3>当前实现的四个观察边界</h3>
+        <div class="risk">
+          <strong>这些边界需要在诊断结论中写明</strong>
+          <ul>
+            <li>manager 的 <code>IDLE</code>、<code>BATCH_DRAINING</code>、<code>WARMCOPY_CLOSING</code> 等内部状态没有公开 P_S 表；只能通过事务状态、命令会话、日志和阶段指标间接判断。</li>
+            <li>strict prepared registry 只暴露 registered、prewarm pending、ready、adopting、adopted、tainted 六个聚合 gauge，没有逐 token 公共视图。</li>
+            <li>strict physical promotion gate 的 API 会返回 <code>status</code>、<code>elapsed_us</code> 和 <code>message</code>，但当前没有写入 <code>Preserve_trx_promotion_gate_status_code</code>；后者只对应旧 ready-cache gate。</li>
+            <li><code>Preserve_trx_transfer_receiver_strict_record_index_page_reads</code>、<code>...strict_ibuf_merges</code>、<code>...strict_target_local_redo_bytes</code> 已注册 getter，但当前源码没有写入点。它们为 0 不能证明没有副作用。</li>
+          </ul>
+        </div>
+      </section>
+
+      <section id="quick-check">
+        <h2>2. 五分钟巡检</h2>
+        <p class="lead-section">先采一份只读快照，不急着改参数、重试 RESUME 或清理文件。下面四组信息足以判断问题属于本地事务、启动恢复、两阶段 DRAIN、receiver 还是 promotion。</p>
+
+        <h3>2.1 功能开关与路径</h3>
+        <pre><code>SELECT NOW(6) AS sampled_at, @@server_uuid, @@server_id, @@version;
+
+SHOW GLOBAL VARIABLES WHERE Variable_name IN (
+  'preserve_trx_enable',
+  'preserve_trx_dir',
+  'preserve_trx_warmcopy_enable',
+  'preserve_trx_lock_warmcopy_enable',
+  'preserve_trx_transfer_receiver_enable',
+  'preserve_trx_promotion_gate_timeout_ms'
+);</code></pre>
+        <p>总开关为 OFF 时，事务视图返回空；不要把“看不到 token”直接判断为已清理。receiver、warm-copy 和 promotion 还受各自子开关与运行策略控制。</p>
+
+        <h3>2.2 本地事务与最近错误</h3>
+        <pre><code>SHOW PRESERVED TRANSACTIONS;
+
+SELECT STATE, COUNT(*) AS tokens,
+       MAX(AGE_SECONDS) AS max_age_seconds,
+       SUM(LAST_ERROR IS NOT NULL) AS tokens_with_error
+FROM performance_schema.preserved_transactions
+GROUP BY STATE
+ORDER BY STATE;
+
+SELECT TOKEN, USER, HOST, STATE, AGE_SECONDS, RECOVERED_COUNT,
+       LOCKS_COUNT, BINLOG_STATE, BINLOG_CACHE_SIZE,
+       TEMP_TABLE_STATE, TEMP_SIDECARS_COMPLETE,
+       LAST_ERROR, LAST_ERROR_AT
+FROM performance_schema.preserved_transactions
+ORDER BY AGE_SECONDS DESC;</code></pre>
+
+        <h3>2.3 最小状态集</h3>
+        <pre><code>SELECT VARIABLE_NAME, VARIABLE_VALUE
+FROM performance_schema.global_status
+WHERE VARIABLE_NAME IN (
+  'Preserve_trx_startup_recovery_elapsed_us',
+  'Preserve_trx_startup_recovery_error',
+  'Preserve_trx_startup_recovery_snapshot_tokens',
+  'Preserve_trx_phase2_total_us',
+  'Preserve_trx_resume_total_us',
+  'Preserve_trx_memory_current_bytes',
+  'Preserve_trx_memory_peak_bytes',
+  'Preserve_trx_spill_failures',
+  'Preserve_trx_transfer_receiver_inflight_tokens',
+  'Preserve_trx_transfer_receiver_queued_bytes',
+  'Preserve_trx_transfer_receiver_failed_tokens',
+  'Preserve_trx_transfer_receiver_last_failed_reason',
+  'Preserve_trx_promotion_prepared_ready_tokens',
+  'Preserve_trx_promotion_prepared_tainted_tokens',
+  'Preserve_trx_promotion_resume_failure_count'
+)
+ORDER BY VARIABLE_NAME;</code></pre>
+
+        <h3>2.4 日志路径与目录清单</h3>
+        <pre><code>SHOW GLOBAL VARIABLES WHERE Variable_name IN (
+  'log_error', 'general_log_file', 'slow_query_log_file', 'datadir'
+);
+SHOW GLOBAL VARIABLES LIKE 'preserve_trx_dir';</code></pre>
+        <pre><code># 在服务器主机上执行；只列目录，不读取或修改二进制 payload。
+find &lt;preserve_trx_dir&gt; -maxdepth 4 -type f -print
+du -sh &lt;preserve_trx_dir&gt;
+
+rg 'PRESERVE:|RESUME PRESERVED TRANSACTION' &lt;error-log&gt; | tail -n 200</code></pre>
+
+        <div class="table-wrap">
+          <table class="medium-table">
+            <thead><tr><th>看到的现象</th><th>先归到哪条路径</th><th>下一步</th></tr></thead>
+            <tbody>
+              <tr><td>P_S 有 <code>PRESERVED</code>，无 LAST_ERROR</td><td>本地 token 稳态</td><td>核对 owner、sidecar 和 RESUME 权限；不要先查 transfer。</td></tr>
+              <tr><td><code>startup_recovery_error=1</code></td><td>启动恢复</td><td>找 recovery begin/end，比较 load、validate、kernel 和各锁恢复阶段。</td></tr>
+              <tr><td><code>phase2_total_us</code> 高</td><td>Batch DRAIN phase 2</td><td>按 target_wait、participant、lock_seal、prepare、snapshot_write、register 分解。</td></tr>
+              <tr><td>receiver inflight/queued 持续增长</td><td>standby receiver</td><td>看 worker active/idle、throttle reason、last failure 和 prewarm backlog。</td></tr>
+              <tr><td>prepared ready 小于 registered</td><td>strict promotion 准备</td><td>先解决 prewarm pending/tainted；此时不应进入 500ms gate 验收。</td></tr>
+              <tr><td>目录有 marker，P_S 无行</td><td>持久化状态与内存状态不一致或属于 standby/promotion</td><td>按后缀分类，结合 startup log 和 carrier listing 路径判断，禁止手工删除。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="transactions">
+        <h2>3. 事务视图</h2>
+        <p class="lead-section"><code>SHOW PRESERVED TRANSACTIONS</code> 与 <code>performance_schema.preserved_transactions</code> 共用 <code>preserved_trx_snapshot()</code>。查询会等待 startup recovery 完成，因此启动期间的查询延迟本身可能是恢复尚未结束，而不是 P_S 锁死。</p>
+
+        <div class="grid-3">
+          <article class="panel core"><h3>PROCESS</h3><p>可见全部行，并看到完整 token。生产采集应限制输出范围和访问权限。</p></article>
+          <article class="panel native"><h3>RESUME_ANY_PRESERVED_TRANSACTION</h3><p>可见全部行，但没有 PROCESS 时 token 仍脱敏。</p></article>
+          <article class="panel warn"><h3>普通 owner</h3><p>只看到 USER/HOST 匹配自己的行，token 同样脱敏。其他账号的行不可见。</p></article>
+        </div>
+
+        <h3>3.1 生命周期状态</h3>
+        <div class="table-wrap">
+          <table class="medium-table">
+            <thead><tr><th>STATE</th><th>含义</th><th>诊断动作</th></tr></thead>
+            <tbody><tr><td><span class="state warn">DRAINING</span></td><td>批量 DRAIN 尚持有事务所有权</td><td>短暂状态；长期不变时检查 participant、token delivery 和批量收尾。</td></tr>
+<tr><td><span class="state warn">SNAPSHOTTING</span></td><td>单事务 snapshot 已进入持久化/交付窗口</td><td>短暂状态；关注 snapshot 写入、XID provenance 和注册失败。</td></tr>
+<tr><td><span class="state good">PRESERVED</span></td><td>本地稳定可恢复</td><td>正常稳态；可执行 SQL RESUME，前提是权限和 sidecar 校验通过。</td></tr>
+<tr><td><span class="state good">ADOPTED_FOR_PROMOTION</span></td><td>已被 promotion 路径认领</td><td>普通 SQL RESUME 不应抢占，等待 promotion resume core。</td></tr>
+<tr><td><span class="state warn">RESUMING</span></td><td>某会话正在认领并恢复</td><td>并发 RESUME 应被排除；失败后看是否回到可重试状态。</td></tr>
+<tr><td><span class="state warn">ROLLING_BACK</span></td><td>显式回滚正在认领</td><td>观察清理是否完成以及 artifacts 是否移除。</td></tr>
+<tr><td><span class="state warn">EXPIRED_ROLLBACK</span></td><td>到期 reaper 正在回滚</td><td>不要并发人工删除文件；等待终态或错误记录。</td></tr>
+<tr><td><span class="state bad">EXPIRED_CLEANUP_FAILED</span></td><td>到期回滚/清理未完整收敛</td><td>必须结合 LAST_ERROR、tainted/consume marker 和日志处理。</td></tr>
+<tr><td><span class="state bad">FAILED</span></td><td>仅用于诊断的 observable record</td><td>不代表可恢复；到 GC deadline 后会被移除。</td></tr></tbody>
+          </table>
+        </div>
+        <div class="warning"><strong>不要把所有非 PRESERVED 状态都当故障</strong><code>DRAINING</code>、<code>SNAPSHOTTING</code>、<code>RESUMING</code>、<code>ROLLING_BACK</code> 和 <code>EXPIRED_ROLLBACK</code> 都可能是正常短暂状态。判断异常需要“状态持续时间 + LAST_ERROR + 对应操作日志”三项同时成立。</div>
+
+        <h3>3.2 29 个字段怎么读</h3>
+        <div class="table-wrap">
+          <table class="wide-table">
+            <thead><tr><th>字段</th><th>含义</th><th>诊断要点</th></tr></thead>
+            <tbody><tr><td><code>TOKEN</code></td><td>恢复凭据</td><td>只有 PROCESS 权限看到原值；其他可见用户只看到 **** 加末尾字符。</td></tr>
+<tr><td><code>USER</code></td><td>事务所有者账号</td><td>用于判断普通用户可见性与 RESUME 所有权。</td></tr>
+<tr><td><code>HOST</code></td><td>事务所有者 host</td><td>与 USER 一起按 privilege account 匹配，不是当前连接来源。</td></tr>
+<tr><td><code>STATE</code></td><td>本地 preserved record 生命周期</td><td>判断是否稳定可恢复、正被认领，或处于失败清理状态。</td></tr>
+<tr><td><code>CREATED_AT</code></td><td>snapshot 创建墙钟时间</td><td>用于事件关联；不是 monotonic 时间。</td></tr>
+<tr><td><code>EXPIRES_AT</code></td><td>token 到期墙钟时间</td><td>到期后由 reaper 负责回滚和清理。</td></tr>
+<tr><td><code>RECOVERED_COUNT</code></td><td>已跨启动恢复次数</td><td>反复增加通常说明同一 token 经历多次 mysqld 启动。</td></tr>
+<tr><td><code>AGE_SECONDS</code></td><td>当前年龄</td><td>适合发现长期未消费 token；采样时会变化。</td></tr>
+<tr><td><code>SCHEMA_NAME</code></td><td>保留时默认 schema</td><td>为空不代表事务未访问表。</td></tr>
+<tr><td><code>ISOLATION</code></td><td>事务隔离级别</td><td>恢复后核对 RR、RC、RU、SERIALIZABLE 语义。</td></tr>
+<tr><td><code>MOD_TABLES_COUNT</code></td><td>修改表数量</td><td>用于评估 ACL 重检、隐式锁扫描和恢复开表成本。</td></tr>
+<tr><td><code>LOCKS_COUNT</code></td><td>可计算的锁总数</td><td>payload 无法可靠计数时为 NULL；不要把 NULL 当 0。</td></tr>
+<tr><td><code>HAS_READ_VIEW</code></td><td>是否携带 ReadView</td><td>与 RV_LOW_LIMIT_NO 一起判断历史可见性恢复。</td></tr>
+<tr><td><code>RV_LOW_LIMIT_NO</code></td><td>ReadView low limit</td><td>没有 ReadView 时为 NULL。</td></tr>
+<tr><td><code>SAVEPOINT_COUNT</code></td><td>保存点数量</td><td>恢复后继续 rollback-to-savepoint 的重要线索。</td></tr>
+<tr><td><code>BINLOG_STATE</code></td><td>Binlog 参与状态</td><td>区分无参与、logged empty 和带 transaction cache。</td></tr>
+<tr><td><code>WROTE_TO_CACHE</code></td><td>是否写过 Binlog cache</td><td>与 BINLOG_CACHE_SIZE、sidecar 状态一起判断。</td></tr>
+<tr><td><code>BINLOG_CACHE_SIZE</code></td><td>Binlog transaction cache 字节</td><td>用于核对 sidecar 大小和恢复 I/O。</td></tr>
+<tr><td><code>BINLOG_WARMCOPY_STATE</code></td><td>Binlog warm-copy 状态</td><td>NONE、READY 或 NOT_USED；READY 才表示使用了预构建 payload。</td></tr>
+<tr><td><code>SESSION_SQL_LOG_BIN</code></td><td>保留时 session sql_log_bin</td><td>恢复时还需结合 GLOBAL_LOG_BIN 和实际 binlog 模式。</td></tr>
+<tr><td><code>GLOBAL_LOG_BIN</code></td><td>保留时全局 log_bin</td><td>用于识别跨重启配置变化。</td></tr>
+<tr><td><code>GTID_NEXT</code></td><td>保留时 GTID_NEXT</td><td>核对显式 GTID 事务的续接语义。</td></tr>
+<tr><td><code>AUTOINC_LOCK_OWNED</code></td><td>是否持有 AUTO-INC 表锁</td><td>恢复后应继续阻塞冲突写入直到事务结束。</td></tr>
+<tr><td><code>TEMP_TABLE_STATE</code></td><td>用户临时表 sidecar 状态</td><td>NONE、READY、INCOMPLETE 或 CORRUPT。</td></tr>
+<tr><td><code>TEMP_IMAGE_BYTES</code></td><td>临时表物理 image 字节</td><td>用于容量、物化时延和残留核对。</td></tr>
+<tr><td><code>TEMP_UNDO_BYTES</code></td><td>临时表 no-redo undo 字节</td><td>用于回滚能力和 sidecar 完整性核对。</td></tr>
+<tr><td><code>TEMP_SIDECARS_COMPLETE</code></td><td>临时表 sidecar 是否齐全</td><td>NO 时不应把 token 当作可安全恢复。</td></tr>
+<tr><td><code>LAST_ERROR</code></td><td>最近一次可观察错误</td><td>失败或清理债务的首要文本证据。</td></tr>
+<tr><td><code>LAST_ERROR_AT</code></td><td>最近错误墙钟时间</td><td>用于和 error log、审计日志及 HA 时间线对齐。</td></tr></tbody>
+          </table>
+        </div>
+
+        <h3>3.3 常用查询</h3>
+        <pre><code>-- 找出正在迁移、认领、回滚或失败的 record
+SELECT TOKEN, STATE, AGE_SECONDS, LAST_ERROR, LAST_ERROR_AT
+FROM performance_schema.preserved_transactions
+WHERE STATE &lt;&gt; 'PRESERVED'
+ORDER BY LAST_ERROR_AT, AGE_SECONDS DESC;
+
+-- 检查 Binlog / 临时表 sidecar
+SELECT TOKEN, STATE, BINLOG_STATE, BINLOG_CACHE_SIZE,
+       BINLOG_WARMCOPY_STATE, TEMP_TABLE_STATE,
+       TEMP_IMAGE_BYTES, TEMP_UNDO_BYTES, TEMP_SIDECARS_COMPLETE
+FROM performance_schema.preserved_transactions
+WHERE BINLOG_CACHE_SIZE &gt; 0 OR TEMP_TABLE_STATE &lt;&gt; 'NONE';
+
+-- 找出恢复次数多或长期未消费的 token
+SELECT TOKEN, STATE, RECOVERED_COUNT, AGE_SECONDS, CREATED_AT, EXPIRES_AT
+FROM performance_schema.preserved_transactions
+WHERE RECOVERED_COUNT &gt; 0 OR AGE_SECONDS &gt; 3600
+ORDER BY RECOVERED_COUNT DESC, AGE_SECONDS DESC;</code></pre>
+
+        <div class="note"><strong>视图不覆盖的对象</strong>receiver registry 的 DECLARED/RECEIVING/SAVED_ONLINE/CORRUPT 等状态、strict prepared registry 的 READY_FOR_GATE/ADOPTING/ADOPTED_LOCKED 等状态，都不在这张表中。它们只能通过聚合状态量、日志和调用方结果观察。</div>
+      </section>
+
+      <section id="metrics">
+        <h2>4. 指标与度量</h2>
+        <p class="lead-section">212 个状态量混合了四种口径。先确定口径，再解释数值。最常见的误判，是把进程累计值当成最近一次操作，或把 monotonic 时间点当成墙钟时间。</p>
+
+        <div class="table-wrap">
+          <table class="medium-table">
+            <thead><tr><th>口径</th><th>读法</th><th>适合的度量</th><th>不能做什么</th></tr></thead>
+            <tbody>
+              <tr><td>当前 gauge</td><td>某一时刻的队列、内存、worker、registry 数量</td><td>定时采样，观察绝对值与持续时间</td><td>不能用两次差值当吞吐量，状态可能上下波动。</td></tr>
+              <tr><td>最近一次</td><td>最近一次 drain、resume、startup 或 gate 覆盖的结果</td><td>操作结束后立即采集，并和 operation ID/日志对齐</td><td>不能汇总多次操作，也不能说明历史 p99。</td></tr>
+              <tr><td>进程累计</td><td>本次 mysqld 启动以来的 count、bytes、us</td><td>用采样差值计算速率或单次增量</td><td>进程重启后归零；也不要假设 FLUSH STATUS 会清理自定义 atomics。</td></tr>
+              <tr><td>monotonic 时间点</td><td>同一进程 steady clock 的微秒值</td><td>同一 mysqld 内两时间点相减</td><td>不能跨进程、跨重启，不能直接和 NOW(6) 或日志时间相减。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p><span class="formula">累计增量 = value_after - value_before</span></p>
+        <p><span class="formula">平均速率 = 累计增量 / 采样间隔秒数</span></p>
+
+        <h3>4.1 SQL 命令计数</h3>
+        <div class="table-wrap">
+          <table class="medium-table">
+            <thead><tr><th>状态量</th><th>含义</th><th>注意</th></tr></thead>
+            <tbody>
+              <tr><td><code>Com_drain_transactions_preserve</code></td><td>DRAIN TRANSACTIONS PRESERVE 命令进入次数</td><td>是命令计数，不是成功 token 数。</td></tr>
+              <tr><td><code>Com_prepare_shutdown_preserve</code></td><td>PREPARE SHUTDOWN PRESERVE 进入次数</td><td>失败也可能计入。</td></tr>
+              <tr><td><code>Com_resume_preserved_transaction</code></td><td>SQL RESUME 命令进入次数</td><td>与 <code>Preserve_trx_resume_total_us</code>、审计 result 一起判断成功率。</td></tr>
+              <tr><td><code>Com_show_preserved_transactions</code></td><td>SHOW PRESERVED TRANSACTIONS 次数</td><td>用于审计观察频率，不代表 token 数。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>4.2 Phase 2 与 warm-copy</h3>
+        <p>先看 <code>Preserve_trx_phase2_total_us</code>，再按下面顺序找最大项。结构化日志中的 <code>PRESERVE: warm-copy drain metrics</code> 比 SHOW STATUS 暴露更多细分字段，二者应对应同一次 DRAIN。</p>
+        <div class="table-wrap">
+          <table class="wide-table">
+            <thead><tr><th>阶段</th><th>主要状态量</th><th>值高通常说明</th></tr></thead>
+            <tbody>
+              <tr><td>等待目标</td><td><code>Preserve_trx_phase2_target_wait_us</code></td><td>目标会话尚未到 quiesce/preserve 安全点，先查阻塞语句和 participant observation。</td></tr>
+              <tr><td>participant 收口</td><td><code>...participant_prepare_us</code>、<code>...participant_close_us</code>、<code>...participant_preflight_us</code></td><td>phase-1 参与者还在 finalize、close 或最终校验。</td></tr>
+              <tr><td>锁收口</td><td><code>...lock_seal_us</code>、<code>...lock_preflight_us</code></td><td>dirty shard、final fence、MDL/savepoint/predicate/table lock 检查成本高。</td></tr>
+              <tr><td>引擎 prepare</td><td><code>...prepare_us</code></td><td>InnoDB/Binlog prepare 或关联 hook 成本高。</td></tr>
+              <tr><td>detach/claim</td><td><code>...detach_claim_us</code></td><td>事务所有权转移和 THD detach 成本高。</td></tr>
+              <tr><td>快照发布</td><td><code>...snapshot_write_us</code></td><td>bundle 构建、sidecar、fsync、目录发布或磁盘延迟高；继续看 drain metrics 细分。</td></tr>
+              <tr><td>注册</td><td><code>...register_us</code></td><td>durable snapshot 到内存 registry 的交接慢或发生竞争。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="warning"><strong><code>Preserve_trx_phase2_slo_miss_count</code> 不是 500ms 指标</strong>当前代码在 <code>phase2_total_us &gt; 1,000,000</code> 时累加，阈值是 1 秒。它只评价 batch phase 2，不包含 receiver readiness、promotion gate、resume core、路由和第一笔业务写。</div>
+
+        <h3>4.3 启动恢复与 Resurrection Index</h3>
+        <div class="table-wrap">
+          <table class="wide-table">
+            <thead><tr><th>判断</th><th>观察量</th><th>解释</th></tr></thead>
+            <tbody>
+              <tr><td>启动是否失败</td><td><code>startup_recovery_error</code>、error log outcome</td><td>非 0 时先看 outcome，不应只分析 elapsed。</td></tr>
+              <tr><td>时间花在哪里</td><td>load、validate、kernel、claim、read_view、table/record/predicate locks、MDL、register</td><td>总耗时与子项是本次启动聚合值；record lock 子项还可下钻 page get、table open 和 prefetch。</td></tr>
+              <tr><td>索引快速路径命中</td><td>candidates、hits、fallbacks</td><td><code>hits / candidates</code> 是本次启动的直接命中率；候选未消费也会在 finish 时计入 fallback。</td></tr>
+              <tr><td>是否仍遍历 undo body</td><td>undo_body_pages、undo_body_records</td><td>命中快速路径后应下降；fallback 增加时通常同步上升。</td></tr>
+              <tr><td>记录锁冷读</td><td>page_get_count/us、prefetch_missing_pages、table_open_us</td><td>page get 与 missing 高说明页不驻留或 stable page/image 解析未覆盖。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>4.4 Receiver readiness</h3>
+        <div class="table-wrap">
+          <table class="wide-table">
+            <thead><tr><th>层次</th><th>关键状态量</th><th>正常趋势</th><th>异常信号</th></tr></thead>
+            <tbody>
+              <tr><td>接收</td><td>inflight_tokens、inflight_bytes、saved_online_tokens、failed_tokens</td><td>inflight 最终下降，saved_online 或 prepared ready 增加</td><td>inflight 长期不降，failed 增加，last_failed_reason 更新。</td></tr>
+              <tr><td>调度</td><td>queued_bytes、worker_active、worker_idle</td><td>有队列时 active 应大于 0；队列排空后 idle 增加</td><td>queued 增长且 active=0，或所有 worker 长期 active 但无 ready 进展。</td></tr>
+              <tr><td>节流</td><td>throttled_milliseconds、last_throttle_reason</td><td>按配置预期增长</td><td>节流增量主导总延迟；根据 1..5 定位 source、receiver saved、prewarm、yield 或 pause。</td></tr>
+              <tr><td>预热</td><td>object_prewarm count/us/max、miss/proof、prewarm backlog</td><td>proof 增加、miss 低、phase2 end backlog=0</td><td>miss、fallback 或 backlog 持续非零。</td></tr>
+              <tr><td>终态</td><td>ready_after_final_metadata_us、ready_after_final_spool_ack_us</td><td>接近 0 或落在预设预算内</td><td>最终元数据已到但 registry/facts/resource bind 迟迟未 READY。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>4.5 指标域总览</h3>
+        <div class="table-wrap">
+          <table class="medium-table">
+            <thead><tr><th>指标域</th><th>数量</th><th>诊断用途</th></tr></thead>
+            <tbody><tr><td>Lock warmcopy</td><td>16</td><td>看 sealed_valid/invalid、fallback、strict_reject 和 phase2_pause，判断快路径是否真正生效。</td></tr>
+<tr><td>通用内存</td><td>2</td><td>与 memory budget 同看；current 是当下占用，peak 是本次进程历史峰值。</td></tr>
+<tr><td>Batch phase 2</td><td>13</td><td>最近一次 batch 的关键暂停分解；下一次操作会覆盖大部分值。</td></tr>
+<tr><td>SQL Resume</td><td>1</td><td>最近一次 SQL RESUME 尝试总耗时，成功和失败都可能覆盖。</td></tr>
+<tr><td>启动恢复</td><td>33</td><td>本次 mysqld 启动固定快照；先看 error 和 elapsed，再下钻各恢复子阶段。</td></tr>
+<tr><td>启动 Resurrection Index</td><td>6</td><td>比较 candidates、hits、fallbacks 与 undo body 扫描量，判断快速启动路径命中率。</td></tr>
+<tr><td>旧 Promotion ready-cache gate</td><td>14</td><td>只对应旧 ready-cache gate，不代表 strict physical gate。</td></tr>
+<tr><td>Promotion worker 与 prepared registry</td><td>9</td><td>当前 worker 与 strict prepared registry 聚合状态，不提供逐 token 公共视图。</td></tr>
+<tr><td>Promotion prewarm</td><td>3</td><td>判断 record-lock 页是否已驻留，避免 gate 临界路径冷读。</td></tr>
+<tr><td>Promotion resume core</td><td>7</td><td>进程内 promotion 激活耗时与分布，是 500ms 路径的一段，不是完整 RTO。</td></tr>
+<tr><td>Promotion physical fence</td><td>3</td><td>观察 lease、digest compare、revalidate 的最近一次耗时。</td></tr>
+<tr><td>Promotion lock apply</td><td>5</td><td>定位 promotion 激活时 record-lock 页读和应用成本。</td></tr>
+<tr><td>Receiver lock-plan 内存</td><td>3</td><td>比较容量、epoch 峰值和子池上限，识别预热资源不足。</td></tr>
+<tr><td>资源准入</td><td>1</td><td>非零表示打开文件、内存或 tmpdir 等资源准入失败。</td></tr>
+<tr><td>Resume binlog attach</td><td>4</td><td>进程累计的 payload 读写、rename 和 attach，判断是否走零拷贝/重建路径。</td></tr>
+<tr><td>Resume 物理一致性</td><td>2</td><td>生产 promotion 期望 mode=3 且 real_redo_apply=1。</td></tr>
+<tr><td>Transfer runtime 与 receiver registry</td><td>11</td><td>看队列、worker、inflight、失败终态和节流原因，判断 receiver 是否在推进。</td></tr>
+<tr><td>Transfer receiver 与 prewarm</td><td>45</td><td>对象预热、projection 和 ready 时间线；多数为进程累计，时间点仅能在同一进程内相减。</td></tr>
+<tr><td>Strict receiver 副作用守卫</td><td>3</td><td>当前三个状态量没有写入点，只能记录观测缺口，不能用 0 证明无副作用。</td></tr>
+<tr><td>Transfer source phase 2</td><td>3</td><td>最近一次 source phase 2 的 bulk、最终元数据与 ACK 成本。</td></tr>
+<tr><td>Transfer source phase 1</td><td>15</td><td>当前 transfer epoch 的 batching、网络发送和 record 对象时间点。</td></tr>
+<tr><td>Transfer receiver 终态时序</td><td>6</td><td>从 final metadata/spool ACK 到 ready 的延迟和 phase2 结束 backlog。</td></tr>
+<tr><td>通用 Spill</td><td>2</td><td>进程累计 spill 字节和失败；持续增长说明内存预算或对象规模不匹配。</td></tr>
+<tr><td>Binlog warmcopy</td><td>5</td><td>当前/最近 batch 的 prefix、durable、digest 和 phase2 pause。</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="logs">
+        <h2>5. 日志与审计</h2>
+        <p class="lead-section">错误日志承担阶段时间线和失败原因，审计事件承担“谁执行了什么动作、结果如何”。general/slow/error/audit 出口都应只出现脱敏 token，排障材料也应保持同一规则。</p>
+
+        <h3>5.1 关键日志</h3>
+        <div class="table-wrap">
+          <table class="wide-table">
+            <thead><tr><th>日志前缀</th><th>出现时机</th><th>应提取的字段</th><th>代码入口</th></tr></thead>
+            <tbody>
+              <tr><td><code>PRESERVE: preserved transaction recovery begin</code></td><td>startup recovery 开始</td><td>preserve_enabled、off_recover_mode、off_abandon_mode</td><td><code>preserved_trx_recover_from_snapshots()</code></td></tr>
+              <tr><td><code>PRESERVE: preserved transaction recovery end</code></td><td>startup recovery 所有出口</td><td>elapsed_us、error、outcome、token 分类、各 phase_us</td><td><code>finish_recovery</code> lambda</td></tr>
+              <tr><td><code>PRESERVE: drain participant observation</code></td><td>participant 状态变化或失败</td><td>stage、index、state、owns_artifact、bytes、phase1_progress、failure_reason</td><td>batch drain orchestration</td></tr>
+              <tr><td><code>PRESERVE: warm-copy drain metrics</code></td><td>两阶段 batch drain 收尾</td><td>phase2 分解、worker、fallback、transfer、SLO reason</td><td>batch drain metrics publisher</td></tr>
+              <tr><td><code>PRESERVE: standby transfer receiver</code></td><td>receiver 接帧、prewarm、commit 或失败</td><td>status、frame_type、epoch、payload、last_failed_reason</td><td><code>sql/preserve_trx_transfer.cc</code></td></tr>
+              <tr><td><code>RESUME PRESERVED TRANSACTION '****xxxx' failed</code></td><td>SQL RESUME 失败</td><td>脱敏 token 尾部、reason、同一时刻 P_S LAST_ERROR</td><td><code>log_redacted_resume_failure()</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <pre><code># 按一次事件抽取，不要只 grep "error"。
+rg 'PRESERVE: preserved transaction recovery (begin|end)' &lt;error-log&gt;
+rg 'PRESERVE: drain participant observation' &lt;error-log&gt;
+rg 'PRESERVE: warm-copy drain metrics' &lt;error-log&gt;
+rg 'PRESERVE: standby transfer receiver|RESUME PRESERVED TRANSACTION' &lt;error-log&gt;
+
+# 查看最近一次 drain 的 key=value；保留原始整行作为附件。
+rg 'PRESERVE: warm-copy drain metrics' &lt;error-log&gt; | tail -n 1</code></pre>
+
+        <h3>5.2 审计事件</h3>
+        <div class="table-wrap">
+          <table class="medium-table">
+            <thead><tr><th>message</th><th>字段</th><th>动作</th></tr></thead>
+            <tbody>
+              <tr><td><code>preserved_transaction</code></td><td>action、token、result、可选 reason</td><td>preserve、resume、rollback、promotion-resume</td></tr>
+              <tr><td><code>preserved_transaction_control</code></td><td>action、result、target_count、token_count</td><td>drain 控制事件</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>事件的 producer 为 <code>preserve_trx</code>，token 使用 <code>****</code> 加末尾最多四个字符。审计 result 适合统计动作成功率；命令 Com 计数只说明命令进入，不说明结果。</p>
+
+        <h3>5.3 对齐时间线</h3>
+        <ol class="checklist">
+          <li>用 error/audit log 的墙钟时间对齐用户请求、mysqld 启停和 HA 控制器事件。</li>
+          <li>用同一 mysqld 内的 monotonic 状态量计算 receiver 内部阶段差值。</li>
+          <li>用 operation 前后累计值差分，计算本次 bytes、count 和累计耗时增量。</li>
+          <li>把最近一次指标与对应的完整结构化日志绑定；后续操作会覆盖 latest 指标。</li>
+        </ol>
+      </section>
+
+      <section id="artifacts">
+        <h2>6. 文件与标记</h2>
+        <p class="lead-section">文件层用来确认 durable 边界和清理债务。当前载体支持分片目录，snapshot 和部分 marker 不一定直接位于根目录，因此清单应递归获取。</p>
+
+        <div class="risk"><strong>运行中的实例禁止手工删除或改写 Preserve 文件</strong>内存 registry、InnoDB prepared transaction、XID provenance、consume marker 和 sidecar 是一个一致性整体。手工删掉其中一项可能把可重试错误变成无法判定的所有权状态。</div>
+
+        <div class="table-wrap">
+          <table class="wide-table">
+            <thead><tr><th>对象</th><th>典型名称</th><th>说明</th><th>异常时看什么</th></tr></thead>
+            <tbody>
+              <tr><td>snapshot metadata</td><td><code>&lt;token&gt;.bin</code></td><td>事务语义快照；可能位于分片目录。</td><td>是否同时存在 registry record、XID provenance 和所需 sidecar。</td></tr>
+              <tr><td>Binlog cache</td><td><code>&lt;token&gt;.binlog_cache</code></td><td>带 transaction cache 的外部 payload。</td><td>大小、摘要、BINLOG_CACHE_SIZE、consume/cleanup 状态。</td></tr>
+              <tr><td>通用外部 blob</td><td><code>blob_shards/.../&lt;token&gt;.blob.&lt;name&gt;</code></td><td>record-lock 等大 payload 的分片存储。</td><td>descriptor 是否存在、文件是否齐全、是否有 warm artifact 残留。</td></tr>
+              <tr><td>临时表 image/undo</td><td><code>&lt;token&gt;.tempts.&lt;space_id&gt;.image</code><br><code>&lt;token&gt;.tempts.&lt;space_id&gt;.undo</code></td><td>用户临时表物理 image 与 no-redo undo。</td><td>TEMP_TABLE_STATE、字节数、sidecars_complete 和启动物化日志。</td></tr>
+              <tr><td>warm-copy 临时对象</td><td><code>*.warm.*</code>、<code>*.tempts.*.warm</code>、<code>*.undo.warm</code></td><td>phase-1 预构建对象，成功采用或失败收尾后应按协议清理。</td><td>是否被 snapshot descriptor 引用，是否属于 cleanup debt。</td></tr>
+              <tr><td>taint marker</td><td><code>&lt;token&gt;.tainted</code></td><td>说明对象不能被普通恢复路径静默使用。</td><td>marker reason、P_S LAST_ERROR、startup cleanup outcome。</td></tr>
+              <tr><td>consume marker</td><td><code>&lt;token&gt;.consume_state</code></td><td>记录 CONSUME_PENDING、ROLLED_BACK、ACTIVE_CONSUMED 或 CLEANUP_TAINTED。</td><td>判断激活后崩溃、回滚证明和 artifact 清理是否收敛。</td></tr>
+              <tr><td>standby marker</td><td><code>&lt;token&gt;.standby_pending</code></td><td>token 属于未来 promotion，不是本机普通 SQL token。</td><td>epoch commit、receiver registry、promotion intent/adopted marker。</td></tr>
+              <tr><td>Resurrection Index</td><td><code>&lt;token&gt;.resurrection_index</code></td><td>启动时用于快速补充 prepared trx 事实，避免完整 undo body 遍历。</td><td>candidates/hits/fallbacks、anchor checks 与 undo body 扫描量。</td></tr>
+              <tr><td>promotion marker</td><td><code>&lt;epoch&gt;.promotion_intent</code><br><code>&lt;epoch&gt;.promotion_adopted</code><br><code>&lt;epoch&gt;.promotion_abandoned</code></td><td>记录 promotion 认领、完成或放弃收尾。</td><td>严格 fence、token 终态、cleanup pending/tainted。</td></tr>
+              <tr><td>恢复账本</td><td><code>.recovery_attempt_ledger</code></td><td>记录 token 的 startup recovery 尝试次数。</td><td>RECOVERED_COUNT、recovery max count 和反复失败原因。</td></tr>
+              <tr><td>XID 来源账本</td><td><code>.xid_provenance</code></td><td>把 Magic XA/XID 与 snapshot identity 绑定。</td><td>snapshot bind、启动验证和孤儿 prepared transaction 处理。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>6.1 安全的目录检查</h3>
+        <pre><code>find &lt;preserve_trx_dir&gt; -maxdepth 4 -type f -print | sort
+du -sh &lt;preserve_trx_dir&gt;
+du -h &lt;preserve_trx_dir&gt;/* 2&gt;/dev/null | sort -h
+
+# 只对问题 token 的文件做元数据清单；不要把完整 token 发到公共工单。
+ls -lah &lt;preserve_trx_dir&gt;
+shasum -a 256 &lt;selected-artifact&gt;</code></pre>
+        <p>目录清单用于确认“有无、大小、修改时间、摘要”，不建议直接 <code>cat</code> 二进制 snapshot、Binlog cache 或临时表 image。需要内容分析时，应在隔离副本上使用对应 codec 或 GUnit 工具链。</p>
+      </section>
+
+      <section id="promotion">
+        <h2>7. 500ms 升主怎么量</h2>
+        <p class="lead-section">“小于 500ms”必须先定义时间边界。当前代码能提供 receiver、gate 和 resume core 的内部证据，但不能单独覆盖 HA 决策、VIP/路由切换和第一笔业务写。因此验收需要一条外部时间线和三段内部时间线。</p>
+
+        <div class="timeline" aria-label="Preserve 模式升主时延时间线">
+          <div><b>T0：进入升主</b><small>HA 已冻结 apply，取得预期 physical fence，开始 strict promotion gate。</small></div>
+          <div><b>T1：gate 完成</b><small>prepared registry 认领完成，返回 strict gate status、elapsed_us、message。</small></div>
+          <div><b>T2：resume core 完成</b><small>事务对象激活并进入可续接状态；观察 resume core latest/分布。</small></div>
+          <div><b>T3：服务可写</b><small>mysqld/HA 解除写保护并发布服务状态。</small></div>
+          <div><b>T4：首笔写成功</b><small>从业务连接发出探针并成功提交，作为用户可见 RTO 终点。</small></div>
+        </div>
+
+        <p><span class="formula">用户可见 RTO = T4 - T0，要求 &lt; 500ms</span></p>
+        <p><span class="formula">内部分解 = gate + resume core + 可写发布 + 路由/连接 + 首写</span></p>
+
+        <h3>7.1 T0 之前必须满足的 READY 条件</h3>
+        <div class="table-wrap">
+          <table class="wide-table">
+            <thead><tr><th>条件</th><th>状态量/证据</th><th>进入 gate 前的要求</th></tr></thead>
+            <tbody>
+              <tr><td>receiver 已收完</td><td>inflight_tokens、failed_tokens、last_failed_reason</td><td>inflight=0、failed=0；否则 gate 延迟不再是纯采用成本。</td></tr>
+              <tr><td>预热已收敛</td><td>prewarm_backlog_at_phase2_end</td><td>为 0。</td></tr>
+              <tr><td>record-lock 页驻留</td><td>required/reserved residency bytes</td><td>无锁时同为 0；有锁时 reserved 应覆盖 required。</td></tr>
+              <tr><td>strict registry 就绪</td><td>registered、prewarm_pending、ready、tainted</td><td>prewarm_pending=0、tainted=0，待升主 token 全部计入 ready。</td></tr>
+              <tr><td>final fact 已绑定</td><td>ready_after_final_metadata_us、ready_after_final_spool_ack_us</td><td>已形成稳定数值，且落在 receiver 预算内。</td></tr>
+              <tr><td>物理证明可用</td><td>physical fence provider 返回的 proof</td><td>生产必须使用 <code>PRODUCTION_REDO_APPLY_FENCE</code>，apply frozen，LSN 与 digest 匹配。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>7.2 gate 与 resume core 的证据</h3>
+        <div class="grid-2">
+          <article class="panel core">
+            <h3>旧 ready-cache gate</h3>
+            <p><code>Preserve_trx_promotion_gate_elapsed_us</code>、status_code、token/adopted/abandoned/skipped、worker p50/p95/max、cold page gets 和 ready-cache miss 都由 <code>preserved_trx_adopt_standby_pending_all_for_promotion()</code> 发布。</p>
+          </article>
+          <article class="panel warn">
+            <h3>Strict physical gate</h3>
+            <p><code>preserved_trx_adopt_prepared_epoch_for_physical_promotion()</code> 通过 result 返回 status、elapsed_us 和 message。当前 SHOW STATUS 不保存这组结果，HA coordinator 必须把它写入自己的结构化日志或指标系统。</p>
+          </article>
+        </div>
+        <p>事务激活阶段使用 <code>Preserve_trx_promotion_resume_core_elapsed_us</code>、count、p50/p95/p99/max 和 failure_count。冷页或锁应用成本继续看 promotion lock page_get、image_resolves、apply_us；Binlog attach 看 payload read/write、rename 和 attach count。</p>
+
+        <h3>7.3 验收记录</h3>
+        <pre><code># 每次升主至少记录以下字段，统一由 HA coordinator 生成 operation_id。
+operation_id
+epoch_id
+T0_gate_start_wall_us
+strict_gate_status
+strict_gate_elapsed_us
+strict_gate_message
+promotion_resume_core_elapsed_us
+promotion_resume_failure_count_delta
+T3_service_writable_wall_us
+T4_first_business_write_commit_wall_us
+receiver_ready_after_final_spool_ack_us
+prepared_registered / ready / tainted
+cold_page_gets / ready_cache_miss / resource_open_failure_delta</code></pre>
+
+        <div class="risk"><strong>不能作为 500ms 通过证据的三种做法</strong>只看 <code>phase2_slo_miss_count=0</code>；只看旧 <code>promotion_gate_elapsed_us</code>；只测一条 <code>RESUME PRESERVED TRANSACTION</code>。这三者都没有覆盖完整用户可见升主路径。</div>
+      </section>
+
+      <section id="playbooks">
+        <h2>8. 故障诊断</h2>
+        <p class="lead-section">每个剧本都从“先证明哪一层出了问题”开始。除非状态机和清理语义已经明确，不要用重启、改参数或删文件代替定位。</p>
+
+        <details open>
+          <summary>8.1 看不到预期 token</summary>
+          <div><dl class="playbook">
+            <dt>先看</dt><dd><code>preserve_trx_enable</code>、当前账号 PROCESS/RESUME_ANY 权限、SHOW/P_S 是否正在等待 startup recovery。</dd>
+            <dt>再看</dt><dd>startup recovery end 的 token 分类；目录中的 <code>.standby_pending</code>、promotion marker、consume_state 和 tainted marker。</dd>
+            <dt>判断</dt><dd>本地普通 token 才进入 preserved_transactions。standby receiver token 和 strict prepared token 使用独立 registry。</dd>
+            <dt>代码入口</dt><dd><code>preserved_trx_snapshot()</code>、<code>preserved_trx_filter_standby_pending_tokens_for_local_recovery()</code>。</dd>
+            <dt>不要做</dt><dd>不要因为 P_S 空就删除目录；也不要用无 PROCESS 账号看到的脱敏 token 判断原值丢失。</dd>
+          </dl></div>
+        </details>
+
+        <details>
+          <summary>8.2 DRAIN 卡在 DRAINING / SNAPSHOTTING</summary>
+          <div><dl class="playbook">
+            <dt>先看</dt><dd>participant observation 的 state、failure_reason、phase1_progress；目标会话的 processlist、锁等待和当前语句。</dd>
+            <dt>度量</dt><dd>phase2 target_wait、participant prepare/close/preflight、lock seal/preflight、snapshot_write。</dd>
+            <dt>判断</dt><dd>target_wait 高是会话未进入安全点；participant 高是 warm-copy 收口；snapshot_write 高是 bundle/sidecar/fsync；register 高是 durable 到 runtime handoff。</dd>
+            <dt>代码入口</dt><dd><code>sql/preserve_trx_drain.cc</code>、<code>preserved_trx_batch_drain()</code>、<code>Preserve_trx_drain_orchestrator</code>。</dd>
+            <dt>不要做</dt><dd>不要直接 kill mysqld 后只看 SQL 错误；durable、detach、token delivery 不同边界的收尾责任不同。</dd>
+          </dl></div>
+        </details>
+
+        <details>
+          <summary>8.3 启动恢复慢或失败</summary>
+          <div><dl class="playbook">
+            <dt>先看</dt><dd>recovery begin/end 的 error、outcome、elapsed_us、snapshot/local/standby/tainted/orphan 数量。</dd>
+            <dt>度量</dt><dd>load、validate、kernel；kernel 内的 claim、read view、table/record/predicate locks、MDL、register。</dd>
+            <dt>快速路径</dt><dd>比较 resurrection candidates、hits、fallbacks、undo body pages/records。fallback 高时检查 prepare LSN、XID、undo anchor 和 index 文件。</dd>
+            <dt>锁 I/O</dt><dd>page_get_count/us、table_open_us、prefetch_missing_pages 高时检查 buffer pool residency、stable page/image 命中和表/index 打开。</dd>
+            <dt>代码入口</dt><dd><code>preserved_trx_recover_from_snapshots()</code>、<code>storage/innobase/trx/trx0preserve.cc</code>。</dd>
+          </dl></div>
+        </details>
+
+        <details>
+          <summary>8.4 SQL RESUME 失败或反复重试</summary>
+          <div><dl class="playbook">
+            <dt>先看</dt><dd>STATE、LAST_ERROR、LAST_ERROR_AT、sidecar 字段、<code>Preserve_trx_resume_total_us</code> 和审计 result/reason。</dd>
+            <dt>文件</dt><dd><code>.consume_state</code> 是否为 CONSUME_PENDING、ACTIVE_CONSUMED 或 CLEANUP_TAINTED；是否存在 tainted marker。</dd>
+            <dt>子系统</dt><dd>Binlog attach 的 read/write/rename/attach 增量；temp sidecar 完整性；锁恢复和 ACL 重检错误。</dd>
+            <dt>代码入口</dt><dd>SQL resume handler、consume marker 写入、activate-before-delete 和失败回滚路径均在 <code>sql/preserve_trx.cc</code>。</dd>
+            <dt>不要做</dt><dd>不要换账号、换 token 文本或并发重试来“碰运气”；先确认所有权是否已转移以及失败是否可重试。</dd>
+          </dl></div>
+        </details>
+
+        <details>
+          <summary>8.5 临时表或 Binlog sidecar 不完整</summary>
+          <div><dl class="playbook">
+            <dt>临时表</dt><dd>TEMP_TABLE_STATE=INCOMPLETE/CORRUPT 或 SIDECARS_COMPLETE=NO 时，核对 image/undo 文件、字节数和启动物化日志。</dd>
+            <dt>Binlog</dt><dd>BINLOG_STATE、CACHE_SIZE、WARMCOPY_STATE 与 <code>.binlog_cache</code> 应一致；摘要、事件计数或模式变化会拒绝激活。</dd>
+            <dt>代码入口</dt><dd><code>sql/preserve_trx_temp_table*.cc</code>、<code>storage/innobase/trx/trx0temp_preserve.cc</code>、<code>sql/binlog*.cc</code>。</dd>
+            <dt>不要做</dt><dd>不要只补一个缺失文件；sidecar 与 snapshot descriptor、摘要和引擎对象身份是整体契约。</dd>
+          </dl></div>
+        </details>
+
+        <details>
+          <summary>8.6 Receiver 不 READY</summary>
+          <div><dl class="playbook">
+            <dt>先看</dt><dd>inflight/failed/last_failed、queued_bytes、worker active/idle、throttle reason。</dd>
+            <dt>再看</dt><dd>object prewarm miss/proof/count/us、staged token total/max/active、projection publish 分解、ready bind attempts。</dd>
+            <dt>终态</dt><dd>final metadata/spool ACK 已到而 ready 延迟高，通常卡在 final facts、资源 lease、lock plan、native binlog handle 或 registry bind。</dd>
+            <dt>代码入口</dt><dd><code>Preserve_trx_transfer_receiver_registry</code>、receiver prewarm worker、projection publisher、strict prepared registry。</dd>
+            <dt>观察缺口</dt><dd>strict page reads/ibuf merges/target redo 三个状态量当前没有写入点，不能据此排除副作用。</dd>
+          </dl></div>
+        </details>
+
+        <details>
+          <summary>8.7 Promotion 超过 500ms 或 gate 失败</summary>
+          <div><dl class="playbook">
+            <dt>先分段</dt><dd>严格记录 T0..T4；确认慢在 gate、resume core、服务可写发布、路由连接还是首写。</dd>
+            <dt>gate 前</dt><dd>prepared ready 覆盖全部 token，prewarm pending/tainted 为 0，receiver backlog=0，record-lock residency 充分。</dd>
+            <dt>gate 内</dt><dd>strict API result 的 status/elapsed/message；physical fence lease、digest compare、revalidate；worker active/idle。</dd>
+            <dt>激活</dt><dd>resume core p95/p99/max、lock page get/apply、Binlog attach、resource open failure。</dd>
+            <dt>代码入口</dt><dd><code>sql/preserve_trx_promotion.cc</code>、<code>sql/preserve_trx_promotion_prepared.cc</code>、strict adopt executor。</dd>
+          </dl></div>
+        </details>
+
+        <details>
+          <summary>8.8 内存、spill 或资源准入异常</summary>
+          <div><dl class="playbook">
+            <dt>先看</dt><dd>memory current/peak、spill bytes/failures、receiver inflight/queued bytes、lock-plan capacity/peak/subpool。</dd>
+            <dt>对比</dt><dd>和 <code>preserve_trx_memory_budget_bytes</code>、per-token、spill chunk、max inflight 以及磁盘/tmpdir 余量比较。</dd>
+            <dt>判断</dt><dd>peak 是进程历史峰值；spill 持续增长说明 heap lease 不足或对象规模过大；resource open failed 表示准入阶段已 fail closed。</dd>
+            <dt>代码入口</dt><dd><code>sql/preserve_trx_resource.cc</code>、transfer runtime limits、prepared resource leases。</dd>
+            <dt>不要做</dt><dd>不要只调大总内存；snapshot、Binlog cache、temp sidecar、锁数和 scan pages 还有各自硬上限。</dd>
+          </dl></div>
+        </details>
+
+        <details>
+          <summary>8.9 cleanup tainted 或残留 marker</summary>
+          <div><dl class="playbook">
+            <dt>先看</dt><dd>P_S 的 EXPIRED_CLEANUP_FAILED/FAILED、LAST_ERROR；prepared tainted；receiver failed；startup tainted count。</dd>
+            <dt>文件</dt><dd><code>.tainted</code>、<code>.consume_state</code>、promotion abandoned/intent/adopted、临时 <code>.tmp</code> 和 warm artifact。</dd>
+            <dt>判断</dt><dd>tainted 表示系统不能证明对象已完全回滚或已安全激活。它是需要人工处置的证据，不是可以忽略的垃圾文件。</dd>
+            <dt>代码入口</dt><dd>carrier delete/mark_tainted、consume-state recovery、promotion abort/cleanup、receiver cleanup debt。</dd>
+            <dt>处置</dt><dd>先保存完整证据和源码版本，再使用经过测试的 cleanup 工具或恢复流程；禁止直接批量 rm。</dd>
+          </dl></div>
+        </details>
+      </section>
+
+      <section id="evidence">
+        <h2>9. 证据采集</h2>
+        <p class="lead-section">一次可复盘的故障包应能回答：运行的是哪版代码、哪条路径、哪个 operation、事务和 registry 当时是什么状态、指标如何变化、日志和文件是否一致。</p>
+
+        <h3>9.1 建议的最小故障包</h3>
+        <ol class="checklist">
+          <li>代码身份：<code>git rev-parse HEAD</code>、分支名、构建类型、mysqld <code>@@version</code>。</li>
+          <li>拓扑身份：server_uuid、server_id、source/receiver 角色、epoch_id、HA operation_id。</li>
+          <li>参数：所有 <code>preserve_trx%</code> 变量，以及 log_bin、GTID、read_only/super_read_only、错误日志路径。</li>
+          <li>事务视图：SHOW 和 P_S 的 29 列快照；对外共享前继续脱敏 token、用户和 host。</li>
+          <li>指标：操作前后各一份 <code>Preserve_trx%</code> 和四个 Com 计数器，保留采样墙钟时间。</li>
+          <li>日志：从操作前 30 秒到操作后 60 秒的 error/audit/HA coordinator 结构化日志。</li>
+          <li>文件：preserve_dir 的递归文件名、大小、mtime 和必要摘要，不默认附带 payload 内容。</li>
+          <li>系统资源：磁盘余量、tmpdir、进程 RSS、I/O 延迟、CPU 和连接/文件句柄压力。</li>
+        </ol>
+
+        <h3>9.2 SQL 快照模板</h3>
+        <pre><code>SELECT NOW(6) AS sampled_at, @@server_uuid, @@server_id, @@version,
+       @@global.read_only, @@global.super_read_only;
+
+SHOW GLOBAL VARIABLES LIKE 'preserve_trx%';
+SHOW GLOBAL STATUS LIKE 'Preserve_trx%';
+
+SHOW GLOBAL STATUS WHERE Variable_name IN (
+  'Com_drain_transactions_preserve',
+  'Com_prepare_shutdown_preserve',
+  'Com_resume_preserved_transaction',
+  'Com_show_preserved_transactions'
+);
+
+SELECT * FROM performance_schema.preserved_transactions
+ORDER BY STATE, AGE_SECONDS DESC;</code></pre>
+
+        <h3>9.3 差分原则</h3>
+        <ul>
+          <li>累计量用前后差分；gauge 保存完整采样序列；latest 值和对应操作日志绑定。</li>
+          <li>进程重启时另开一段时间序列，不能把重启前后累计值直接相减。</li>
+          <li>monotonic 时间点只在同一 mysqld 内计算；跨 source/receiver 使用墙钟或由同一协调器打点。</li>
+          <li>若存在并发 DRAIN、transfer 或 promotion，必须用 epoch_id、operation_id 和时间窗口隔离，不能只按“最后一条日志”归因。</li>
+        </ul>
+      </section>
+
+      <section id="code-map">
+        <h2>10. 从证据回到代码</h2>
+        <p class="lead-section">状态量名称只是入口。可靠的代码分析至少要走到“谁写入、在什么成功/失败边界写入、何时清零或覆盖”。</p>
+
+        <h3>10.1 状态量追踪方法</h3>
+        <pre><code># 1. 找 SHOW STATUS 注册
+rg -n '"Preserve_trx_phase2_total_us"' sql/mysqld.cc
+
+# 2. 找 SHOW_FUNC / getter
+rg -n 'show_preserve_trx_phase2_total_us|phase2_total_us_status' \
+  sql/preserve_trx_resource.cc sql/preserve_trx.cc
+
+# 3. 找真实写入和清零
+rg -n 'g_phase2_total_us\.(store|fetch_add)|reset.*phase2' sql/preserve_trx.cc
+
+# 4. 阅读写入点周围的状态迁移、错误出口和日志
+git blame -L &lt;start&gt;,&lt;end&gt; sql/preserve_trx.cc
+git log -S'g_phase2_total_us' -- sql/preserve_trx.cc</code></pre>
+
+        <h3>10.2 代码地图</h3>
+        <div class="table-wrap">
+          <table class="wide-table">
+            <thead><tr><th>证据/问题</th><th>首先阅读</th><th>继续下钻</th></tr></thead>
+            <tbody>
+              <tr><td>SQL、生命周期、startup、resume</td><td><a href="../../sql/preserve_trx.cc"><code>sql/preserve_trx.cc</code></a>、<a href="../../sql/preserve_trx.h"><code>sql/preserve_trx.h</code></a></td><td>manager record、snapshot/recovery、consume marker、strict adopt executor。</td></tr>
+              <tr><td>Batch DRAIN 与 participant</td><td><a href="../../sql/preserve_trx_drain.cc"><code>sql/preserve_trx_drain.cc</code></a>、<a href="../../sql/preserve_trx_drain.h"><code>sql/preserve_trx_drain.h</code></a></td><td>warm-copy participant、quiesce、失败回挂和 token delivery。</td></tr>
+              <tr><td>P_S / SHOW 29 列</td><td><a href="../../storage/perfschema/table_preserved_transactions.cc"><code>storage/perfschema/table_preserved_transactions.cc</code></a>、<a href="../../storage/perfschema/table_preserved_transactions.h"><code>storage/perfschema/table_preserved_transactions.h</code></a></td><td><code>preserved_trx_snapshot()</code>、<code>record_to_row()</code>、temp sidecar population。</td></tr>
+              <tr><td>状态量注册与 SHOW_FUNC</td><td><a href="../../sql/mysqld.cc"><code>sql/mysqld.cc</code></a>、<a href="../../sql/preserve_trx_resource.cc"><code>sql/preserve_trx_resource.cc</code></a></td><td>对应模块的 atomic getter 和写入点。</td></tr>
+              <tr><td>载体、marker、目录</td><td><a href="../../sql/preserve_trx_carrier_file.cc"><code>sql/preserve_trx_carrier_file.cc</code></a>、<a href="../../sql/preserve_trx_carrier.h"><code>sql/preserve_trx_carrier.h</code></a></td><td>atomic write、listing、delete、sharding、taint/consume/promotion marker。</td></tr>
+              <tr><td>Binlog cache / warm-copy</td><td><a href="../../sql/binlog.cc"><code>sql/binlog.cc</code></a>、<a href="../../sql/binlog_warmcopy.cc"><code>sql/binlog_warmcopy.cc</code></a></td><td>native prepared handle、payload attach、digest 和 savepoint state。</td></tr>
+              <tr><td>用户临时表</td><td><a href="../../sql/preserve_trx_temp_table.cc"><code>sql/preserve_trx_temp_table.cc</code></a>、<a href="../../sql/preserve_trx_temp_table_carrier.cc"><code>sql/preserve_trx_temp_table_carrier.cc</code></a></td><td><a href="../../storage/innobase/trx/trx0temp_preserve.cc"><code>storage/innobase/trx/trx0temp_preserve.cc</code></a>、space-id、no-redo undo、materialize/native adoption。</td></tr>
+              <tr><td>记录锁与 startup resurrection</td><td><a href="../../storage/innobase/trx/trx0preserve.cc"><code>storage/innobase/trx/trx0preserve.cc</code></a>、<a href="../../storage/innobase/lock/lock0preserve.cc"><code>storage/innobase/lock/lock0preserve.cc</code></a></td><td>stable page、lock image/bitmap、undo anchor、targeted publication。</td></tr>
+              <tr><td>Transfer receiver / projection</td><td><a href="../../sql/preserve_trx_transfer.cc"><code>sql/preserve_trx_transfer.cc</code></a>、<a href="../../sql/preserve_trx_transfer.h"><code>sql/preserve_trx_transfer.h</code></a></td><td>receiver registry、prewarm worker、frame apply、epoch fact、ready bind。</td></tr>
+              <tr><td>Promotion gate</td><td><a href="../../sql/preserve_trx_promotion.cc"><code>sql/preserve_trx_promotion.cc</code></a>、<a href="../../sql/preserve_trx_promotion.h"><code>sql/preserve_trx_promotion.h</code></a></td><td>旧 ready-cache gate 与 strict physical gate 必须分开读。</td></tr>
+              <tr><td>Strict prepared registry / fence</td><td><a href="../../sql/preserve_trx_promotion_prepared.cc"><code>sql/preserve_trx_promotion_prepared.cc</code></a>、<a href="../../sql/preserve_trx_promotion_prepared.h"><code>sql/preserve_trx_promotion_prepared.h</code></a></td><td>final facts、resource lease、gate adopt、attach/activate、tainted cleanup。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>10.3 三条反向定位路径</h3>
+        <div class="grid-3">
+          <article class="panel core">
+            <h3>从 P_S 行出发</h3>
+            <p>table handler → <code>preserved_trx_snapshot()</code> → <code>g_preserved_trx_records</code> → 状态迁移调用方。重点看 record 是否 <code>observable_only</code>，以及 LAST_ERROR 何时写入和 GC。</p>
+          </article>
+          <article class="panel native">
+            <h3>从日志出发</h3>
+            <p>搜索完整前缀 → 找构造 key=value 的代码 → 确认字段来自 latest、累计还是局部变量 → 阅读所有调用出口。不要只按日志文案猜阶段。</p>
+          </article>
+          <article class="panel warn">
+            <h3>从文件出发</h3>
+            <p>后缀常量 → carrier read/write/list/remove → store 封装 → 调用方的所有权边界。marker 的存在和删除都必须结合 crash window 阅读。</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="status-codes">
+        <h2>A. 状态码与内部状态</h2>
+
+        <h3>A.1 Transfer status</h3>
+        <div class="table-wrap"><table class="medium-table"><thead><tr><th>值</th><th>名称</th><th>含义</th></tr></thead><tbody>
+          <tr><td>0</td><td><code>OK</code></td><td>操作成功。</td></tr>
+          <tr><td>1</td><td><code>INVALID_ARGUMENT</code></td><td>请求参数、身份或状态组合无效。</td></tr>
+          <tr><td>2</td><td><code>CORRUPT</code></td><td>frame、manifest、摘要或持久对象损坏。</td></tr>
+          <tr><td>3</td><td><code>IO_ERROR</code></td><td>读写、fsync、rename 或目录操作失败。</td></tr>
+          <tr><td>4</td><td><code>UNSUPPORTED</code></td><td>协议、对象或当前运行模式不支持。</td></tr>
+          <tr><td>5</td><td><code>RESOURCE_EXHAUSTED</code></td><td>内存、磁盘、文件或 worker 等资源不足。</td></tr>
+          <tr><td>6</td><td><code>COMMITTED_READY</code></td><td>当前 receiver 进程已接受 committed epoch 且 ready。</td></tr>
+          <tr><td>7</td><td><code>COMMITTED_NOT_READY</code></td><td>当前进程已接受 committed epoch，但 readiness 尚未满足。</td></tr>
+          <tr><td>8</td><td><code>COMMITTED_CORRUPT</code></td><td>committed epoch 被当前进程判为损坏。</td></tr>
+          <tr><td>9</td><td><code>ACK_UNCERTAIN</code></td><td>远端结果可能已成立但 ACK 不确定，应按同一严格身份查询或续传。</td></tr>
+          <tr><td>10</td><td><code>LOCK_PLAN_STALE</code></td><td>record-lock plan 与最终 generation/facts 不一致。</td></tr>
+        </tbody></table></div>
+        <div class="warning"><strong>COMMITTED_* 的边界</strong>源码注释明确说明它只描述当前 receiver mysqld 进程的接受结果，不承诺 receiver crash durability 或 startup replay。</div>
+
+        <h3>A.2 旧 Promotion adopt status</h3>
+        <div class="table-wrap"><table class="wide-table"><thead><tr><th>值</th><th>名称</th><th>含义</th></tr></thead><tbody>
+          <tr><td>0</td><td><code>OK</code></td><td>全部成功。</td></tr>
+          <tr><td>1</td><td><code>OK_WITH_ABANDONED_TOKENS</code></td><td>主流程完成，但有 token 被放弃并需要明确收尾。</td></tr>
+          <tr><td>2</td><td><code>NOT_ENABLED</code></td><td>功能未启用。</td></tr>
+          <tr><td>3</td><td><code>INVALID_ARGUMENT</code></td><td>请求参数无效。</td></tr>
+          <tr><td>4</td><td><code>IO_ERROR</code></td><td>载体或 marker I/O 失败。</td></tr>
+          <tr><td>5</td><td><code>TOKEN_NOT_FOUND</code></td><td>请求 token 不存在。</td></tr>
+          <tr><td>6</td><td><code>NOT_STANDBY_PENDING</code></td><td>token 不属于 standby pending。</td></tr>
+          <tr><td>7</td><td><code>EPOCH_NOT_COMMITTED</code></td><td>epoch commit fact 不成立。</td></tr>
+          <tr><td>8</td><td><code>APPLY_BARRIER_NOT_REACHED</code></td><td>物理 apply 尚未到要求 LSN。</td></tr>
+          <tr><td>9</td><td><code>READY_CACHE_NOT_READY</code></td><td>旧 ready-cache 未就绪。</td></tr>
+          <tr><td>10</td><td><code>TOO_MANY_PROMOTION_TOKENS</code></td><td>超过旧 gate token 上限。</td></tr>
+          <tr><td>11</td><td><code>CORRUPT_ARTIFACT</code></td><td>promotion artifact 损坏。</td></tr>
+          <tr><td>12</td><td><code>UNSUPPORTED_ARTIFACT</code></td><td>artifact 版本或语义不受支持。</td></tr>
+          <tr><td>13</td><td><code>CLAIMED_IMPORT_FAILED</code></td><td>已 claim 后内核 import 失败。</td></tr>
+          <tr><td>14</td><td><code>TOKEN_ABANDONED</code></td><td>token 被显式放弃。</td></tr>
+          <tr><td>15</td><td><code>CLEANUP_PENDING</code></td><td>清理尚未完成。</td></tr>
+          <tr><td>16</td><td><code>CLEANUP_TAINTED</code></td><td>无法证明清理完成，需要人工处置。</td></tr>
+        </tbody></table></div>
+
+        <h3>A.3 Strict physical promotion gate</h3>
+        <div class="table-wrap"><table class="medium-table"><thead><tr><th>值</th><th>名称</th><th>含义</th></tr></thead><tbody>
+          <tr><td>0</td><td><code>OK</code></td><td>strict gate 成功。</td></tr>
+          <tr><td>1</td><td><code>NOT_ENABLED</code></td><td>功能未启用。</td></tr>
+          <tr><td>2</td><td><code>INVALID_ARGUMENT</code></td><td>epoch、token、deadline 或 worker 请求无效。</td></tr>
+          <tr><td>3</td><td><code>PHYSICAL_FENCE_NOT_AVAILABLE</code></td><td>生产 physical fence provider 不可用或不能取得 lease。</td></tr>
+          <tr><td>4</td><td><code>PHYSICAL_FENCE_MISMATCH</code></td><td>LSN、lineage、boot incarnation 或 digest 证明不一致。</td></tr>
+          <tr><td>5</td><td><code>REGISTRY_NOT_READY</code></td><td>strict prepared registry 未到 READY_FOR_GATE。</td></tr>
+          <tr><td>6</td><td><code>INTENT_IO_ERROR</code></td><td>promotion intent 持久化失败。</td></tr>
+          <tr><td>7</td><td><code>ADOPT_FAILED</code></td><td>一个或多个 token 采用失败。</td></tr>
+          <tr><td>8</td><td><code>CLEANUP_TAINTED</code></td><td>失败逆转或清理无法证明完成。</td></tr>
+        </tbody></table></div>
+
+        <h3>A.4 Physical consistency mode 与 throttle reason</h3>
+        <div class="grid-2">
+          <div class="table-wrap"><table><thead><tr><th>值</th><th>mode</th></tr></thead><tbody>
+            <tr><td>0</td><td><code>NONE</code></td></tr>
+            <tr><td>1</td><td><code>TEST_SAME_INSTANCE_ATTACH_ONLY</code></td></tr>
+            <tr><td>2</td><td><code>TEST_ONLY_PHYSICAL_FENCE_SIMULATOR</code></td></tr>
+            <tr><td>3</td><td><code>PRODUCTION_REDO_APPLY_FENCE</code></td></tr>
+          </tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>值</th><th>throttle reason</th></tr></thead><tbody>
+            <tr><td>0</td><td>尚未记录节流原因</td></tr>
+            <tr><td>1</td><td><code>SOURCE_IO</code></td></tr>
+            <tr><td>2</td><td><code>RECEIVER_SAVED_IO</code></td></tr>
+            <tr><td>3</td><td><code>RECEIVER_PREWARM_IO</code></td></tr>
+            <tr><td>4</td><td><code>WORKER_YIELD</code></td></tr>
+            <tr><td>5</td><td><code>PREWARM_PAUSED</code></td></tr>
+          </tbody></table></div>
+        </div>
+
+        <h3>A.5 Consume state</h3>
+        <div class="table-wrap"><table class="medium-table"><thead><tr><th>值</th><th>名称</th><th>解释</th></tr></thead><tbody>
+          <tr><td>1</td><td><code>CONSUME_PENDING</code></td><td>已进入消费/激活窗口，崩溃恢复必须判定所有权。</td></tr>
+          <tr><td>2</td><td><code>ROLLED_BACK</code></td><td>已证明回滚完成，可按协议继续清理。</td></tr>
+          <tr><td>3</td><td><code>ACTIVE_CONSUMED</code></td><td>事务已激活消费，artifact 清理尚需收尾。</td></tr>
+          <tr><td>4</td><td><code>CLEANUP_TAINTED</code></td><td>清理结果不确定，禁止静默复用。</td></tr>
+        </tbody></table></div>
+
+        <h3>A.6 Strict prepared token state</h3>
+        <p>下面状态是内核 registry 状态，不是 P_S <code>STATE</code>。当前只公开六个聚合 gauge。</p>
+        <div class="table-wrap"><table class="wide-table"><thead><tr><th>序号</th><th>状态</th><th>阶段</th><th>说明</th></tr></thead><tbody>
+          <tr><td>0</td><td><code>NOT_FOUND</code></td><td>无记录</td><td>registry 中不存在。</td></tr>
+          <tr><td>1</td><td><code>OBJECTS_RECEIVING</code></td><td>接收</td><td>对象仍在到达。</td></tr>
+          <tr><td>2</td><td><code>PREWARMING</code></td><td>预热</td><td>正在构建 lock plan、Binlog handle 或其他 ready resource。</td></tr>
+          <tr><td>3</td><td><code>PREWARMED_PENDING_FINAL_FACT</code></td><td>预热</td><td>资源已预热，等待最终 epoch/token facts。</td></tr>
+          <tr><td>4</td><td><code>READY_FACTS_PENDING_LEASE</code></td><td>资源</td><td>facts 已到，等待最终资源 lease。</td></tr>
+          <tr><td>5</td><td><code>READY_FOR_GATE</code></td><td>就绪</td><td>可以进入 strict promotion gate。</td></tr>
+          <tr><td>6</td><td><code>ADOPTING</code></td><td>采用</td><td>gate 已认领，正在采用。</td></tr>
+          <tr><td>7</td><td><code>ADOPTED_LOCKED</code></td><td>采用</td><td>已采用且仍持有 gate/registry 所有权。</td></tr>
+          <tr><td>8</td><td><code>ATTACHING</code></td><td>连接</td><td>正在附着到目标连接。</td></tr>
+          <tr><td>9</td><td><code>ACTIVATING</code></td><td>激活</td><td>正在进入 active transaction。</td></tr>
+          <tr><td>10</td><td><code>ACTIVE</code></td><td>激活</td><td>事务已激活。</td></tr>
+          <tr><td>11</td><td><code>ACTIVE_ARTIFACTS_CLEANED</code></td><td>激活</td><td>active 且持久化 artifacts 已完成清理。</td></tr>
+          <tr><td>12</td><td><code>NOT_READY</code></td><td>失败</td><td>当前 facts/resource 不足以 READY。</td></tr>
+          <tr><td>13</td><td><code>CORRUPT</code></td><td>失败</td><td>对象或摘要损坏。</td></tr>
+          <tr><td>14</td><td><code>RESOURCE_EXHAUSTED</code></td><td>失败</td><td>资源准入失败。</td></tr>
+          <tr><td>15</td><td><code>STALE_GENERATION</code></td><td>失败</td><td>generation 已过期。</td></tr>
+          <tr><td>16</td><td><code>ABANDONED_ROLLED_BACK</code></td><td>放弃</td><td>放弃后已证明回滚。</td></tr>
+          <tr><td>17</td><td><code>ABANDONED_NOT_FOUND_PROVEN</code></td><td>放弃</td><td>已证明底层事务不存在。</td></tr>
+          <tr><td>18</td><td><code>CLEANUP_PENDING</code></td><td>清理</td><td>清理尚未完成。</td></tr>
+          <tr><td>19</td><td><code>CLEANUP_ROLLED_BACK</code></td><td>清理</td><td>清理路径已证明回滚。</td></tr>
+          <tr><td>20</td><td><code>CLEANUP_TAINTED</code></td><td>清理</td><td>无法证明清理完成。</td></tr>
+          <tr><td>21</td><td><code>ATTACH_TAINTED</code></td><td>连接</td><td>attach 失败且所有权不确定。</td></tr>
+          <tr><td>22</td><td><code>ATTACH_ROLLED_BACK</code></td><td>连接</td><td>attach 失败后已证明回滚。</td></tr>
+        </tbody></table></div>
+      </section>
+
+      <section id="metric-catalog">
+        <h2>B. 212 个状态量完整索引</h2>
+        <p class="lead-section">名称直接取自当前 <code>sql/mysqld.cc</code> 注册表。搜索可以按名称、指标域、口径或描述过滤；正文优先解释诊断方法，附录用于查具体状态量。</p>
+        <div class="filters" aria-label="指标筛选">
+          <input id="metric-search" type="search" placeholder="搜索指标名、用途或口径" aria-label="搜索指标">
+          <select id="metric-group" aria-label="选择指标域">
+            <option value="">全部指标域</option>
+            <option value="Lock warmcopy">Lock warmcopy (16)</option>
+<option value="通用内存">通用内存 (2)</option>
+<option value="Batch phase 2">Batch phase 2 (13)</option>
+<option value="SQL Resume">SQL Resume (1)</option>
+<option value="启动恢复">启动恢复 (33)</option>
+<option value="启动 Resurrection Index">启动 Resurrection Index (6)</option>
+<option value="旧 Promotion ready-cache gate">旧 Promotion ready-cache gate (14)</option>
+<option value="Promotion worker 与 prepared registry">Promotion worker 与 prepared registry (9)</option>
+<option value="Promotion prewarm">Promotion prewarm (3)</option>
+<option value="Promotion resume core">Promotion resume core (7)</option>
+<option value="Promotion physical fence">Promotion physical fence (3)</option>
+<option value="Promotion lock apply">Promotion lock apply (5)</option>
+<option value="Receiver lock-plan 内存">Receiver lock-plan 内存 (3)</option>
+<option value="资源准入">资源准入 (1)</option>
+<option value="Resume binlog attach">Resume binlog attach (4)</option>
+<option value="Resume 物理一致性">Resume 物理一致性 (2)</option>
+<option value="Transfer runtime 与 receiver registry">Transfer runtime 与 receiver registry (11)</option>
+<option value="Transfer receiver 与 prewarm">Transfer receiver 与 prewarm (45)</option>
+<option value="Strict receiver 副作用守卫">Strict receiver 副作用守卫 (3)</option>
+<option value="Transfer source phase 2">Transfer source phase 2 (3)</option>
+<option value="Transfer source phase 1">Transfer source phase 1 (15)</option>
+<option value="Transfer receiver 终态时序">Transfer receiver 终态时序 (6)</option>
+<option value="通用 Spill">通用 Spill (2)</option>
+<option value="Binlog warmcopy">Binlog warmcopy (5)</option>
+          </select>
+          <span class="filter-count" id="metric-count">212 / 212</span>
+        </div>
+        <div class="table-wrap">
+          <table class="wide-table" id="metric-table">
+            <thead><tr><th>状态量</th><th>指标域</th><th>口径</th><th>单位</th><th>说明</th></tr></thead>
+            <tbody><tr class="metric-row" data-group="Lock warmcopy" data-search="preserve_trx_lock_warmcopy_artifact_bytes lock warmcopy 进程启动后累计 进程启动后累计 生成并计入锁 warmcopy artifact 的 payload 字节总量。"><td><code>Preserve_trx_lock_warmcopy_artifact_bytes</code></td><td>Lock warmcopy</td><td>进程启动后累计</td><td>bytes</td><td>生成并计入锁 warmcopy artifact 的 payload 字节总量。</td></tr>
+<tr class="metric-row" data-group="Lock warmcopy" data-search="preserve_trx_lock_warmcopy_attempts lock warmcopy 进程启动后累计 进程启动后累计 进入锁 warmcopy 的 target 尝试次数。"><td><code>Preserve_trx_lock_warmcopy_attempts</code></td><td>Lock warmcopy</td><td>进程启动后累计</td><td>count/gauge</td><td>进入锁 warmcopy 的 target 尝试次数。</td></tr>
+<tr class="metric-row" data-group="Lock warmcopy" data-search="preserve_trx_lock_warmcopy_canonical_mismatch lock warmcopy 进程启动后累计 进程启动后累计 warm artifact 与 live export canonical comparator 不等价的次数。"><td><code>Preserve_trx_lock_warmcopy_canonical_mismatch</code></td><td>Lock warmcopy</td><td>进程启动后累计</td><td>count/gauge</td><td>warm artifact 与 live export canonical comparator 不等价的次数。</td></tr>
+<tr class="metric-row" data-group="Lock warmcopy" data-search="preserve_trx_lock_warmcopy_conversion_freeze_waits lock warmcopy 进程启动后累计 进程启动后累计 其他 session 因目标事务 conversion freeze 等待/重试的次数。"><td><code>Preserve_trx_lock_warmcopy_conversion_freeze_waits</code></td><td>Lock warmcopy</td><td>进程启动后累计</td><td>count/gauge</td><td>其他 session 因目标事务 conversion freeze 等待/重试的次数。</td></tr>
+<tr class="metric-row" data-group="Lock warmcopy" data-search="preserve_trx_lock_warmcopy_dirty_shards lock warmcopy 进程启动后累计 进程启动后累计 phase 2 seal 处理的 dirty record shard 累计数。"><td><code>Preserve_trx_lock_warmcopy_dirty_shards</code></td><td>Lock warmcopy</td><td>进程启动后累计</td><td>count/gauge</td><td>phase 2 seal 处理的 dirty record shard 累计数。</td></tr>
+<tr class="metric-row" data-group="Lock warmcopy" data-search="preserve_trx_lock_warmcopy_final_fence_mismatch lock warmcopy 进程启动后累计 进程启动后累计 final fence 复检不一致的次数。"><td><code>Preserve_trx_lock_warmcopy_final_fence_mismatch</code></td><td>Lock warmcopy</td><td>进程启动后累计</td><td>count/gauge</td><td>final fence 复检不一致的次数。</td></tr>
+<tr class="metric-row" data-group="Lock warmcopy" data-search="preserve_trx_lock_warmcopy_journal_bytes lock warmcopy 进程启动后累计 进程启动后累计 锁变更 journal 累计字节。"><td><code>Preserve_trx_lock_warmcopy_journal_bytes</code></td><td>Lock warmcopy</td><td>进程启动后累计</td><td>bytes</td><td>锁变更 journal 累计字节。</td></tr>
+<tr class="metric-row" data-group="Lock warmcopy" data-search="preserve_trx_lock_warmcopy_live_fallback lock warmcopy 进程启动后累计 进程启动后累计 artifact 无效后整 target 回退 live export 的次数。"><td><code>Preserve_trx_lock_warmcopy_live_fallback</code></td><td>Lock warmcopy</td><td>进程启动后累计</td><td>count/gauge</td><td>artifact 无效后整 target 回退 live export 的次数。</td></tr>
+<tr class="metric-row" data-group="Lock warmcopy" data-search="preserve_trx_lock_warmcopy_phase2_pause_us lock warmcopy 进程启动后累计 进程启动后累计 锁 warmcopy phase 2 暂停窗口累计微秒。"><td><code>Preserve_trx_lock_warmcopy_phase2_pause_us</code></td><td>Lock warmcopy</td><td>进程启动后累计</td><td>us</td><td>锁 warmcopy phase 2 暂停窗口累计微秒。</td></tr>
+<tr class="metric-row" data-group="Lock warmcopy" data-search="preserve_trx_lock_warmcopy_resource_limit lock warmcopy 进程启动后累计 进程启动后累计 因内存、journal、dirty shard、mdl 等预算变为 invalid/reject 的次数。"><td><code>Preserve_trx_lock_warmcopy_resource_limit</code></td><td>Lock warmcopy</td><td>进程启动后累计</td><td>count/gauge</td><td>因内存、journal、dirty shard、MDL 等预算变为 invalid/reject 的次数。</td></tr>
+<tr class="metric-row" data-group="Lock warmcopy" data-search="preserve_trx_lock_warmcopy_sealed_invalid lock warmcopy 进程启动后累计 进程启动后累计 seal/validation 后 artifact 无效的次数。"><td><code>Preserve_trx_lock_warmcopy_sealed_invalid</code></td><td>Lock warmcopy</td><td>进程启动后累计</td><td>count/gauge</td><td>seal/validation 后 artifact 无效的次数。</td></tr>
+<tr class="metric-row" data-group="Lock warmcopy" data-search="preserve_trx_lock_warmcopy_sealed_valid lock warmcopy 进程启动后累计 进程启动后累计 seal 后 artifact 可直接使用的次数。"><td><code>Preserve_trx_lock_warmcopy_sealed_valid</code></td><td>Lock warmcopy</td><td>进程启动后累计</td><td>count/gauge</td><td>seal 后 artifact 可直接使用的次数。</td></tr>
+<tr class="metric-row" data-group="Lock warmcopy" data-search="preserve_trx_lock_warmcopy_spill_bytes lock warmcopy 进程启动后累计 进程启动后累计 锁 warmcopy 写入 spill backend 的累计字节。"><td><code>Preserve_trx_lock_warmcopy_spill_bytes</code></td><td>Lock warmcopy</td><td>进程启动后累计</td><td>bytes</td><td>锁 warmcopy 写入 spill backend 的累计字节。</td></tr>
+<tr class="metric-row" data-group="Lock warmcopy" data-search="preserve_trx_lock_warmcopy_spill_failures lock warmcopy 进程启动后累计 进程启动后累计 锁 warmcopy spill 失败次数。"><td><code>Preserve_trx_lock_warmcopy_spill_failures</code></td><td>Lock warmcopy</td><td>进程启动后累计</td><td>count/gauge</td><td>锁 warmcopy spill 失败次数。</td></tr>
+<tr class="metric-row" data-group="Lock warmcopy" data-search="preserve_trx_lock_warmcopy_strict_reject lock warmcopy 进程启动后累计 进程启动后累计 无法或不允许 fallback 时严格拒绝 target 的次数。"><td><code>Preserve_trx_lock_warmcopy_strict_reject</code></td><td>Lock warmcopy</td><td>进程启动后累计</td><td>count/gauge</td><td>无法或不允许 fallback 时严格拒绝 target 的次数。</td></tr>
+<tr class="metric-row" data-group="Lock warmcopy" data-search="preserve_trx_lock_warmcopy_unsupported_family lock warmcopy 进程启动后累计 进程启动后累计 因不支持的锁族导致 artifact 无效/拒绝的次数。"><td><code>Preserve_trx_lock_warmcopy_unsupported_family</code></td><td>Lock warmcopy</td><td>进程启动后累计</td><td>count/gauge</td><td>因不支持的锁族导致 artifact 无效/拒绝的次数。</td></tr>
+<tr class="metric-row" data-group="通用内存" data-search="preserve_trx_memory_current_bytes 通用内存 当前值 / 进程峰值 当前 gauge 当前所有 preserve 通用 heap lease 字节。"><td><code>Preserve_trx_memory_current_bytes</code></td><td>通用内存</td><td>当前 gauge</td><td>bytes</td><td>当前所有 Preserve 通用 heap lease 字节。</td></tr>
+<tr class="metric-row" data-group="通用内存" data-search="preserve_trx_memory_peak_bytes 通用内存 当前值 / 进程峰值 进程峰值 本次 mysqld 启动以来通用 heap lease 峰值。"><td><code>Preserve_trx_memory_peak_bytes</code></td><td>通用内存</td><td>进程峰值</td><td>bytes</td><td>本次 mysqld 启动以来通用 heap lease 峰值。</td></tr>
+<tr class="metric-row" data-group="Batch phase 2" data-search="preserve_trx_phase2_detach_claim_us batch phase 2 最近一次两阶段 batch drain 最近一次两阶段 batch drain 最近一次 phase 2 认领并 detach 目标事务的耗时。"><td><code>Preserve_trx_phase2_detach_claim_us</code></td><td>Batch phase 2</td><td>最近一次两阶段 batch drain</td><td>us</td><td>最近一次 phase 2 认领并 detach 目标事务的耗时。</td></tr>
+<tr class="metric-row" data-group="Batch phase 2" data-search="preserve_trx_phase2_lock_preflight_us batch phase 2 最近一次两阶段 batch drain 最近一次两阶段 batch drain 锁 artifact/preflight 检查耗时。"><td><code>Preserve_trx_phase2_lock_preflight_us</code></td><td>Batch phase 2</td><td>最近一次两阶段 batch drain</td><td>us</td><td>锁 artifact/preflight 检查耗时。</td></tr>
+<tr class="metric-row" data-group="Batch phase 2" data-search="preserve_trx_phase2_lock_seal_us batch phase 2 最近一次两阶段 batch drain 最近一次两阶段 batch drain 锁 warmcopy seal 耗时。"><td><code>Preserve_trx_phase2_lock_seal_us</code></td><td>Batch phase 2</td><td>最近一次两阶段 batch drain</td><td>us</td><td>锁 warmcopy seal 耗时。</td></tr>
+<tr class="metric-row" data-group="Batch phase 2" data-search="preserve_trx_phase2_participant_close_us batch phase 2 最近一次两阶段 batch drain 最近一次两阶段 batch drain 关闭 warmcopy participant 并等待收敛的耗时。"><td><code>Preserve_trx_phase2_participant_close_us</code></td><td>Batch phase 2</td><td>最近一次两阶段 batch drain</td><td>us</td><td>关闭 warmcopy participant 并等待收敛的耗时。</td></tr>
+<tr class="metric-row" data-group="Batch phase 2" data-search="preserve_trx_phase2_participant_preflight_us batch phase 2 最近一次两阶段 batch drain 最近一次两阶段 batch drain participant 最终状态预检耗时。"><td><code>Preserve_trx_phase2_participant_preflight_us</code></td><td>Batch phase 2</td><td>最近一次两阶段 batch drain</td><td>us</td><td>participant 最终状态预检耗时。</td></tr>
+<tr class="metric-row" data-group="Batch phase 2" data-search="preserve_trx_phase2_participant_prepare_us batch phase 2 最近一次两阶段 batch drain 最近一次两阶段 batch drain participant prepare/finalize 耗时。"><td><code>Preserve_trx_phase2_participant_prepare_us</code></td><td>Batch phase 2</td><td>最近一次两阶段 batch drain</td><td>us</td><td>participant prepare/finalize 耗时。</td></tr>
+<tr class="metric-row" data-group="Batch phase 2" data-search="preserve_trx_phase2_prepare_us batch phase 2 最近一次两阶段 batch drain 最近一次两阶段 batch drain 存储引擎/binlog prepare 阶段耗时。"><td><code>Preserve_trx_phase2_prepare_us</code></td><td>Batch phase 2</td><td>最近一次两阶段 batch drain</td><td>us</td><td>存储引擎/binlog prepare 阶段耗时。</td></tr>
+<tr class="metric-row" data-group="Batch phase 2" data-search="preserve_trx_phase2_register_us batch phase 2 最近一次两阶段 batch drain 最近一次两阶段 batch drain 把 durable token 注册到 manager/registry 的耗时。"><td><code>Preserve_trx_phase2_register_us</code></td><td>Batch phase 2</td><td>最近一次两阶段 batch drain</td><td>us</td><td>把 durable token 注册到 manager/registry 的耗时。</td></tr>
+<tr class="metric-row" data-group="Batch phase 2" data-search="preserve_trx_phase2_slo_miss_count batch phase 2 最近一次两阶段 batch drain 进程累计 phase 2 超过实现定义性能目标的累计次数；不是最近一次布尔值。"><td><code>Preserve_trx_phase2_slo_miss_count</code></td><td>Batch phase 2</td><td>进程累计</td><td>count/gauge</td><td>phase 2 超过实现定义性能目标的累计次数；不是最近一次布尔值。</td></tr>
+<tr class="metric-row" data-group="Batch phase 2" data-search="preserve_trx_phase2_snapshot_write_us batch phase 2 最近一次两阶段 batch drain 最近一次两阶段 batch drain 最终 snapshot metadata 写入和发布耗时。"><td><code>Preserve_trx_phase2_snapshot_write_us</code></td><td>Batch phase 2</td><td>最近一次两阶段 batch drain</td><td>us</td><td>最终 snapshot metadata 写入和发布耗时。</td></tr>
+<tr class="metric-row" data-group="Batch phase 2" data-search="preserve_trx_phase2_target_preserve_us batch phase 2 最近一次两阶段 batch drain 最近一次两阶段 batch drain 所有 target preserve 工作耗时。"><td><code>Preserve_trx_phase2_target_preserve_us</code></td><td>Batch phase 2</td><td>最近一次两阶段 batch drain</td><td>us</td><td>所有 target preserve 工作耗时。</td></tr>
+<tr class="metric-row" data-group="Batch phase 2" data-search="preserve_trx_phase2_target_wait_us batch phase 2 最近一次两阶段 batch drain 最近一次两阶段 batch drain 等待 target 达到可 preserve 状态的耗时。"><td><code>Preserve_trx_phase2_target_wait_us</code></td><td>Batch phase 2</td><td>最近一次两阶段 batch drain</td><td>us</td><td>等待 target 达到可 preserve 状态的耗时。</td></tr>
+<tr class="metric-row" data-group="Batch phase 2" data-search="preserve_trx_phase2_total_us batch phase 2 最近一次两阶段 batch drain 最近一次两阶段 batch drain 最近一次 batch phase 2 总耗时。"><td><code>Preserve_trx_phase2_total_us</code></td><td>Batch phase 2</td><td>最近一次两阶段 batch drain</td><td>us</td><td>最近一次 batch phase 2 总耗时。</td></tr>
+<tr class="metric-row" data-group="SQL Resume" data-search="preserve_trx_resume_total_us sql resume 最近一次 sql resume 最近一次 sql resume 最近一次 resume preserved transaction 尝试的总耗时，包括失败尝试。"><td><code>Preserve_trx_resume_total_us</code></td><td>SQL Resume</td><td>最近一次 SQL resume</td><td>us</td><td>最近一次 RESUME PRESERVED TRANSACTION 尝试的总耗时，包括失败尝试。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_binlog_cache_tokens 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 本次启动恢复中带 binlog cache payload 的 token 数。"><td><code>Preserve_trx_startup_recovery_binlog_cache_tokens</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>本次启动恢复中带 binlog cache payload 的 token 数。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_elapsed_us 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery preserve startup recovery 总耗时。"><td><code>Preserve_trx_startup_recovery_elapsed_us</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>us</td><td>Preserve startup recovery 总耗时。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_error 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 本次启动恢复是否记录错误；非 0 需要结合错误日志。"><td><code>Preserve_trx_startup_recovery_error</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>本次启动恢复是否记录错误；非 0 需要结合错误日志。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_local_snapshot_tokens 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 本次启动识别的本地 snapshot token 数。"><td><code>Preserve_trx_startup_recovery_local_snapshot_tokens</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>本次启动识别的本地 snapshot token 数。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_orphan_rollback_count 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 本次启动对 orphan prepared transaction 执行 rollback 的数量。"><td><code>Preserve_trx_startup_recovery_orphan_rollback_count</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>本次启动对 orphan prepared transaction 执行 rollback 的数量。</td></tr>
+<tr class="metric-row" data-group="启动 Resurrection Index" data-search="preserve_trx_startup_resurrection_index_candidates 启动 resurrection index 本次 startup recovery 本次启动计数 启动时注册为 resurrection index 候选的事务数。"><td><code>Preserve_trx_startup_resurrection_index_candidates</code></td><td>启动 Resurrection Index</td><td>本次启动计数</td><td>count/gauge</td><td>启动时注册为 Resurrection Index 候选的事务数。</td></tr>
+<tr class="metric-row" data-group="启动 Resurrection Index" data-search="preserve_trx_startup_resurrection_index_hits 启动 resurrection index 本次 startup recovery 本次启动计数 prepare lsn、xid 与 undo anchor 校验一致，走索引快速路径的事务数。"><td><code>Preserve_trx_startup_resurrection_index_hits</code></td><td>启动 Resurrection Index</td><td>本次启动计数</td><td>count/gauge</td><td>prepare LSN、XID 与 undo anchor 校验一致，走索引快速路径的事务数。</td></tr>
+<tr class="metric-row" data-group="启动 Resurrection Index" data-search="preserve_trx_startup_resurrection_index_fallbacks 启动 resurrection index 本次 startup recovery 本次启动计数 索引事实不匹配、注册冲突或候选未消费，回退原生 undo body 扫描的事务数。"><td><code>Preserve_trx_startup_resurrection_index_fallbacks</code></td><td>启动 Resurrection Index</td><td>本次启动计数</td><td>count/gauge</td><td>索引事实不匹配、注册冲突或候选未消费，回退原生 undo body 扫描的事务数。</td></tr>
+<tr class="metric-row" data-group="启动 Resurrection Index" data-search="preserve_trx_startup_resurrection_undo_anchor_checks 启动 resurrection index 本次 startup recovery 本次启动计数 为验证 resurrection index 执行的 undo anchor 比较次数。"><td><code>Preserve_trx_startup_resurrection_undo_anchor_checks</code></td><td>启动 Resurrection Index</td><td>本次启动计数</td><td>count/gauge</td><td>为验证 Resurrection Index 执行的 undo anchor 比较次数。</td></tr>
+<tr class="metric-row" data-group="启动 Resurrection Index" data-search="preserve_trx_startup_resurrection_undo_body_pages 启动 resurrection index 本次 startup recovery 本次启动计数 启动恢复仍扫描的 undo body page 数；快速路径命中时应显著减少。"><td><code>Preserve_trx_startup_resurrection_undo_body_pages</code></td><td>启动 Resurrection Index</td><td>本次启动计数</td><td>count/gauge</td><td>启动恢复仍扫描的 undo body page 数；快速路径命中时应显著减少。</td></tr>
+<tr class="metric-row" data-group="启动 Resurrection Index" data-search="preserve_trx_startup_resurrection_undo_body_records 启动 resurrection index 本次 startup recovery 本次启动计数 启动恢复仍解析的 undo body record 数。"><td><code>Preserve_trx_startup_resurrection_undo_body_records</code></td><td>启动 Resurrection Index</td><td>本次启动计数</td><td>count/gauge</td><td>启动恢复仍解析的 undo body record 数。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_claim_us 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 所有 snapshot 的 claim 阶段聚合耗时。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_claim_us</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>us</td><td>所有 snapshot 的 claim 阶段聚合耗时。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_kernel_us 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 所有 snapshot 内核恢复阶段聚合耗时。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_kernel_us</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>us</td><td>所有 snapshot 内核恢复阶段聚合耗时。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_load_us 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 读取/解码 snapshot 与 sidecar 的聚合耗时。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_load_us</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>us</td><td>读取/解码 snapshot 与 sidecar 的聚合耗时。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_mdl_us 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 恢复 mdl 的聚合耗时。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_mdl_us</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>us</td><td>恢复 MDL 的聚合耗时。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_predicate_locks_us 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 恢复 predicate lock 的聚合耗时。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_predicate_locks_us</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>us</td><td>恢复 predicate lock 的聚合耗时。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_read_view_us 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 恢复 read view 的聚合耗时。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_read_view_us</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>us</td><td>恢复 read view 的聚合耗时。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_record_locks_us 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 恢复 record lock 的聚合耗时。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_record_locks_us</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>us</td><td>恢复 record lock 的聚合耗时。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_record_lock_entries 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 处理的 record-lock entry 总数。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_record_lock_entries</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>处理的 record-lock entry 总数。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_record_lock_stable_page_hits 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery record-lock 恢复命中稳定页映射的次数。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_record_lock_stable_page_hits</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>record-lock 恢复命中稳定页映射的次数。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_record_lock_image_resolves 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 通过持久化 lock image 完成解析的次数。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_record_lock_image_resolves</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>通过持久化 lock image 完成解析的次数。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_pages 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery record-lock bitmap 涉及的 page 数。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_pages</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>record-lock bitmap 涉及的 page 数。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_bits 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery record-lock bitmap 中处理的 bit 数。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_record_lock_bitmap_bits</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>record-lock bitmap 中处理的 bit 数。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_us 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery record-lock 恢复同步取页的聚合耗时。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_us</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>us</td><td>record-lock 恢复同步取页的聚合耗时。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_count 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery record-lock 恢复同步取页次数。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_record_lock_page_get_count</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>record-lock 恢复同步取页次数。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_record_lock_table_open_us 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 为 record-lock 恢复打开 table/index 的聚合耗时。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_record_lock_table_open_us</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>us</td><td>为 record-lock 恢复打开 table/index 的聚合耗时。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_pages 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 发起预读的 page 数。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_pages</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>发起预读的 page 数。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_bytes 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 预读请求对应的字节数。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_bytes</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>bytes</td><td>预读请求对应的字节数。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_residency_pages 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 纳入预读 residency 检查的 page 数。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_residency_pages</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>纳入预读 residency 检查的 page 数。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_resident_pages 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 预读前/检查时已 resident 的 page 数。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_resident_pages</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>预读前/检查时已 resident 的 page 数。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_io_pending_pages 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 预读检查时已有 i/o pending 的 page 数。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_io_pending_pages</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>预读检查时已有 I/O pending 的 page 数。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_missing_pages 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 预读后仍未 resident 的 page 数。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_record_lock_prefetch_missing_pages</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>预读后仍未 resident 的 page 数。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_register_us 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 把恢复结果注册到本地 registry 的聚合耗时。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_register_us</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>us</td><td>把恢复结果注册到本地 registry 的聚合耗时。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_table_locks_us 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 恢复 table lock 的聚合耗时。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_table_locks_us</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>us</td><td>恢复 table lock 的聚合耗时。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_phase_snapshot_validate_us 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery snapshot/xid/摘要/兼容性验证的聚合耗时。"><td><code>Preserve_trx_startup_recovery_phase_snapshot_validate_us</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>us</td><td>snapshot/XID/摘要/兼容性验证的聚合耗时。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_promotion_intent_tokens 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 启动扫描发现的 promotion intent 相关 token 数。"><td><code>Preserve_trx_startup_recovery_promotion_intent_tokens</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>启动扫描发现的 promotion intent 相关 token 数。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_snapshot_tokens 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 本次启动实际进入 snapshot recovery 的 token 总数。"><td><code>Preserve_trx_startup_recovery_snapshot_tokens</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>本次启动实际进入 snapshot recovery 的 token 总数。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_standby_pending_tokens 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 启动扫描识别的 standby-pending token 数；不会因此自动成为普通 sql token。"><td><code>Preserve_trx_startup_recovery_standby_pending_tokens</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>启动扫描识别的 standby-pending token 数；不会因此自动成为普通 SQL token。</td></tr>
+<tr class="metric-row" data-group="启动恢复" data-search="preserve_trx_startup_recovery_tainted_tokens 启动恢复 本次 mysqld 启动的 startup recovery 本次 mysqld 启动的 startup recovery 本次启动识别为 tainted 的 token 数。"><td><code>Preserve_trx_startup_recovery_tainted_tokens</code></td><td>启动恢复</td><td>本次 mysqld 启动的 startup recovery</td><td>count/gauge</td><td>本次启动识别为 tainted 的 token 数。</td></tr>
+<tr class="metric-row" data-group="旧 Promotion ready-cache gate" data-search="preserve_trx_promotion_gate_abandoned_count 旧 promotion ready-cache gate 最近一次 gate 快照 最近一次 gate 快照 最近一次 gate 放弃的 token 数。"><td><code>Preserve_trx_promotion_gate_abandoned_count</code></td><td>旧 Promotion ready-cache gate</td><td>最近一次 gate 快照</td><td>count/gauge</td><td>最近一次 gate 放弃的 token 数。</td></tr>
+<tr class="metric-row" data-group="旧 Promotion ready-cache gate" data-search="preserve_trx_promotion_gate_adopted_count 旧 promotion ready-cache gate 最近一次 gate 快照 最近一次 gate 快照 最近一次 gate 成功采用的 token 数。"><td><code>Preserve_trx_promotion_gate_adopted_count</code></td><td>旧 Promotion ready-cache gate</td><td>最近一次 gate 快照</td><td>count/gauge</td><td>最近一次 gate 成功采用的 token 数。</td></tr>
+<tr class="metric-row" data-group="旧 Promotion ready-cache gate" data-search="preserve_trx_promotion_gate_elapsed_us 旧 promotion ready-cache gate 最近一次 gate 快照 最近一次 gate 快照 最近一次 gate 总耗时。"><td><code>Preserve_trx_promotion_gate_elapsed_us</code></td><td>旧 Promotion ready-cache gate</td><td>最近一次 gate 快照</td><td>us</td><td>最近一次 gate 总耗时。</td></tr>
+<tr class="metric-row" data-group="旧 Promotion ready-cache gate" data-search="preserve_trx_promotion_gate_max_worker_elapsed_us 旧 promotion ready-cache gate 最近一次 gate 快照 最近一次 gate 快照 最近一次 gate 最慢 worker 耗时。"><td><code>Preserve_trx_promotion_gate_max_worker_elapsed_us</code></td><td>旧 Promotion ready-cache gate</td><td>最近一次 gate 快照</td><td>us</td><td>最近一次 gate 最慢 worker 耗时。</td></tr>
+<tr class="metric-row" data-group="旧 Promotion ready-cache gate" data-search="preserve_trx_promotion_gate_p50_worker_elapsed_us 旧 promotion ready-cache gate 最近一次 gate 快照 最近一次 gate 快照 最近一次 gate worker 耗时 p50。"><td><code>Preserve_trx_promotion_gate_p50_worker_elapsed_us</code></td><td>旧 Promotion ready-cache gate</td><td>最近一次 gate 快照</td><td>us</td><td>最近一次 gate worker 耗时 p50。</td></tr>
+<tr class="metric-row" data-group="旧 Promotion ready-cache gate" data-search="preserve_trx_promotion_gate_p95_worker_elapsed_us 旧 promotion ready-cache gate 最近一次 gate 快照 最近一次 gate 快照 最近一次 gate worker 耗时 p95。"><td><code>Preserve_trx_promotion_gate_p95_worker_elapsed_us</code></td><td>旧 Promotion ready-cache gate</td><td>最近一次 gate 快照</td><td>us</td><td>最近一次 gate worker 耗时 p95。</td></tr>
+<tr class="metric-row" data-group="旧 Promotion ready-cache gate" data-search="preserve_trx_promotion_gate_record_lock_cold_page_gets 旧 promotion ready-cache gate 最近一次 gate 快照 最近一次 gate 快照 最近一次 gate 为 record locks 发生的冷页同步 get 数。"><td><code>Preserve_trx_promotion_gate_record_lock_cold_page_gets</code></td><td>旧 Promotion ready-cache gate</td><td>最近一次 gate 快照</td><td>count/gauge</td><td>最近一次 gate 为 record locks 发生的冷页同步 get 数。</td></tr>
+<tr class="metric-row" data-group="旧 Promotion ready-cache gate" data-search="preserve_trx_promotion_gate_record_lock_page_count 旧 promotion ready-cache gate 最近一次 gate 快照 最近一次 gate 快照 最近一次 gate 处理的 record-lock page 数。"><td><code>Preserve_trx_promotion_gate_record_lock_page_count</code></td><td>旧 Promotion ready-cache gate</td><td>最近一次 gate 快照</td><td>count/gauge</td><td>最近一次 gate 处理的 record-lock page 数。</td></tr>
+<tr class="metric-row" data-group="旧 Promotion ready-cache gate" data-search="preserve_trx_promotion_gate_record_lock_resident_pages 旧 promotion ready-cache gate 最近一次 gate 快照 最近一次 gate 快照 最近一次 gate 中已 resident 的 record-lock page 数。"><td><code>Preserve_trx_promotion_gate_record_lock_resident_pages</code></td><td>旧 Promotion ready-cache gate</td><td>最近一次 gate 快照</td><td>count/gauge</td><td>最近一次 gate 中已 resident 的 record-lock page 数。</td></tr>
+<tr class="metric-row" data-group="旧 Promotion ready-cache gate" data-search="preserve_trx_promotion_gate_ready_cache_miss_count 旧 promotion ready-cache gate 最近一次 gate 快照 最近一次 gate 快照 最近一次 gate 的 ready-cache miss 数。"><td><code>Preserve_trx_promotion_gate_ready_cache_miss_count</code></td><td>旧 Promotion ready-cache gate</td><td>最近一次 gate 快照</td><td>count/gauge</td><td>最近一次 gate 的 ready-cache miss 数。</td></tr>
+<tr class="metric-row" data-group="旧 Promotion ready-cache gate" data-search="preserve_trx_promotion_gate_over_budget_count 旧 promotion ready-cache gate 最近一次 gate 快照 最近一次 gate 快照 最近一次 gate 超过预算的 token/操作数。"><td><code>Preserve_trx_promotion_gate_over_budget_count</code></td><td>旧 Promotion ready-cache gate</td><td>最近一次 gate 快照</td><td>count/gauge</td><td>最近一次 gate 超过预算的 token/操作数。</td></tr>
+<tr class="metric-row" data-group="Promotion worker 与 prepared registry" data-search="preserve_trx_promotion_gate_worker_count promotion worker 与 prepared registry 当前进程 gauge 当前 worker 总数 当前 promotion gate worker 池中的线程总数。"><td><code>Preserve_trx_promotion_gate_worker_count</code></td><td>Promotion worker 与 prepared registry</td><td>当前 worker 总数</td><td>count/gauge</td><td>当前 promotion gate worker 池中的线程总数。</td></tr>
+<tr class="metric-row" data-group="Promotion worker 与 prepared registry" data-search="preserve_trx_promotion_gate_worker_active_count promotion worker 与 prepared registry 当前进程 gauge 当前 active 当前正在执行 promotion gate 工作的 worker 数。"><td><code>Preserve_trx_promotion_gate_worker_active_count</code></td><td>Promotion worker 与 prepared registry</td><td>当前 active</td><td>count/gauge</td><td>当前正在执行 promotion gate 工作的 worker 数。</td></tr>
+<tr class="metric-row" data-group="Promotion worker 与 prepared registry" data-search="preserve_trx_promotion_gate_worker_idle_count promotion worker 与 prepared registry 当前进程 gauge 当前 idle 由 worker 总数减 active 数得到的空闲 worker 数。"><td><code>Preserve_trx_promotion_gate_worker_idle_count</code></td><td>Promotion worker 与 prepared registry</td><td>当前 idle</td><td>count/gauge</td><td>由 worker 总数减 active 数得到的空闲 worker 数。</td></tr>
+<tr class="metric-row" data-group="旧 Promotion ready-cache gate" data-search="preserve_trx_promotion_gate_skipped_count 旧 promotion ready-cache gate 最近一次 gate 快照 最近一次 gate 快照 最近一次 gate 跳过的 token 数。"><td><code>Preserve_trx_promotion_gate_skipped_count</code></td><td>旧 Promotion ready-cache gate</td><td>最近一次 gate 快照</td><td>count/gauge</td><td>最近一次 gate 跳过的 token 数。</td></tr>
+<tr class="metric-row" data-group="旧 Promotion ready-cache gate" data-search="preserve_trx_promotion_gate_status_code 旧 promotion ready-cache gate 最近一次 gate 快照 最近一次 gate 快照 最近一次旧 gate 状态码；0..16 映射见附录，不等同 strict physical gate。"><td><code>Preserve_trx_promotion_gate_status_code</code></td><td>旧 Promotion ready-cache gate</td><td>最近一次 gate 快照</td><td>code</td><td>最近一次旧 gate 状态码；0..16 映射见附录，不等同 strict physical gate。</td></tr>
+<tr class="metric-row" data-group="旧 Promotion ready-cache gate" data-search="preserve_trx_promotion_gate_token_count 旧 promotion ready-cache gate 最近一次 gate 快照 最近一次 gate 快照 最近一次 gate 输入 token 数。"><td><code>Preserve_trx_promotion_gate_token_count</code></td><td>旧 Promotion ready-cache gate</td><td>最近一次 gate 快照</td><td>count/gauge</td><td>最近一次 gate 输入 token 数。</td></tr>
+<tr class="metric-row" data-group="Promotion worker 与 prepared registry" data-search="preserve_trx_promotion_prepared_registered_tokens promotion worker 与 prepared registry 当前严格 prepared registry 当前 gauge 当前 strict prepared registry 中尚未 retire 的 token 总数。"><td><code>Preserve_trx_promotion_prepared_registered_tokens</code></td><td>Promotion worker 与 prepared registry</td><td>当前 gauge</td><td>count/gauge</td><td>当前 strict prepared registry 中尚未 retire 的 token 总数。</td></tr>
+<tr class="metric-row" data-group="Promotion worker 与 prepared registry" data-search="preserve_trx_promotion_prepared_prewarm_pending_tokens promotion worker 与 prepared registry 当前严格 prepared registry 当前 gauge 处于 objects_receiving、prewarming、prewarmed_pending_final_fact 或 ready_facts_pending_lease 的 token 数。"><td><code>Preserve_trx_promotion_prepared_prewarm_pending_tokens</code></td><td>Promotion worker 与 prepared registry</td><td>当前 gauge</td><td>count/gauge</td><td>处于 OBJECTS_RECEIVING、PREWARMING、PREWARMED_PENDING_FINAL_FACT 或 READY_FACTS_PENDING_LEASE 的 token 数。</td></tr>
+<tr class="metric-row" data-group="Promotion worker 与 prepared registry" data-search="preserve_trx_promotion_prepared_ready_tokens promotion worker 与 prepared registry 当前严格 prepared registry 当前 gauge 处于 ready_for_gate 的 token 数。"><td><code>Preserve_trx_promotion_prepared_ready_tokens</code></td><td>Promotion worker 与 prepared registry</td><td>当前 gauge</td><td>count/gauge</td><td>处于 READY_FOR_GATE 的 token 数。</td></tr>
+<tr class="metric-row" data-group="Promotion worker 与 prepared registry" data-search="preserve_trx_promotion_prepared_adopting_tokens promotion worker 与 prepared registry 当前严格 prepared registry 当前 gauge 处于 adopting 的 token 数。"><td><code>Preserve_trx_promotion_prepared_adopting_tokens</code></td><td>Promotion worker 与 prepared registry</td><td>当前 gauge</td><td>count/gauge</td><td>处于 ADOPTING 的 token 数。</td></tr>
+<tr class="metric-row" data-group="Promotion worker 与 prepared registry" data-search="preserve_trx_promotion_prepared_adopted_tokens promotion worker 与 prepared registry 当前严格 prepared registry 当前 gauge 处于 adopted_locked 的 token 数。"><td><code>Preserve_trx_promotion_prepared_adopted_tokens</code></td><td>Promotion worker 与 prepared registry</td><td>当前 gauge</td><td>count/gauge</td><td>处于 ADOPTED_LOCKED 的 token 数。</td></tr>
+<tr class="metric-row" data-group="Promotion worker 与 prepared registry" data-search="preserve_trx_promotion_prepared_tainted_tokens promotion worker 与 prepared registry 当前严格 prepared registry 当前 gauge 处于 cleanup_tainted 或 attach_tainted 的 token 数。"><td><code>Preserve_trx_promotion_prepared_tainted_tokens</code></td><td>Promotion worker 与 prepared registry</td><td>当前 gauge</td><td>count/gauge</td><td>处于 CLEANUP_TAINTED 或 ATTACH_TAINTED 的 token 数。</td></tr>
+<tr class="metric-row" data-group="Promotion prewarm" data-search="preserve_trx_promotion_prewarm_record_lock_cold_page_gets promotion prewarm 当前 ready-cache 聚合 当前 ready-cache 聚合 当前 prewarm/ready-cache 汇总中的冷页同步 get 数。"><td><code>Preserve_trx_promotion_prewarm_record_lock_cold_page_gets</code></td><td>Promotion prewarm</td><td>当前 ready-cache 聚合</td><td>count/gauge</td><td>当前 prewarm/ready-cache 汇总中的冷页同步 get 数。</td></tr>
+<tr class="metric-row" data-group="Promotion prewarm" data-search="preserve_trx_promotion_prewarm_record_lock_page_count promotion prewarm 当前 ready-cache 聚合 当前 ready-cache 聚合 当前 promotion prewarm 涉及的 record-lock page 数。"><td><code>Preserve_trx_promotion_prewarm_record_lock_page_count</code></td><td>Promotion prewarm</td><td>当前 ready-cache 聚合</td><td>count/gauge</td><td>当前 promotion prewarm 涉及的 record-lock page 数。</td></tr>
+<tr class="metric-row" data-group="Promotion prewarm" data-search="preserve_trx_promotion_prewarm_record_lock_resident_pages promotion prewarm 当前 ready-cache 聚合 当前 ready-cache 聚合 当前已 resident 的 promotion record-lock page 数。"><td><code>Preserve_trx_promotion_prewarm_record_lock_resident_pages</code></td><td>Promotion prewarm</td><td>当前 ready-cache 聚合</td><td>count/gauge</td><td>当前已 resident 的 promotion record-lock page 数。</td></tr>
+<tr class="metric-row" data-group="Promotion resume core" data-search="preserve_trx_promotion_resume_core_elapsed_us promotion resume core 最近一次 + 进程累计直方图 最近一次 最近一次 promotion resume core 的耗时。"><td><code>Preserve_trx_promotion_resume_core_elapsed_us</code></td><td>Promotion resume core</td><td>最近一次</td><td>us</td><td>最近一次 promotion resume core 的耗时。</td></tr>
+<tr class="metric-row" data-group="Promotion resume core" data-search="preserve_trx_promotion_resume_core_count promotion resume core 最近一次 + 进程累计直方图 进程累计 promotion resume core 调用次数。"><td><code>Preserve_trx_promotion_resume_core_count</code></td><td>Promotion resume core</td><td>进程累计</td><td>count/gauge</td><td>promotion resume core 调用次数。</td></tr>
+<tr class="metric-row" data-group="Promotion resume core" data-search="preserve_trx_promotion_resume_core_p50_us promotion resume core 最近一次 + 进程累计直方图 进程累计分布 进程内 promotion resume core 耗时 p50。"><td><code>Preserve_trx_promotion_resume_core_p50_us</code></td><td>Promotion resume core</td><td>进程累计分布</td><td>us</td><td>进程内 promotion resume core 耗时 p50。</td></tr>
+<tr class="metric-row" data-group="Promotion resume core" data-search="preserve_trx_promotion_resume_core_p95_us promotion resume core 最近一次 + 进程累计直方图 进程累计分布 进程内 promotion resume core 耗时 p95。"><td><code>Preserve_trx_promotion_resume_core_p95_us</code></td><td>Promotion resume core</td><td>进程累计分布</td><td>us</td><td>进程内 promotion resume core 耗时 p95。</td></tr>
+<tr class="metric-row" data-group="Promotion resume core" data-search="preserve_trx_promotion_resume_core_p99_us promotion resume core 最近一次 + 进程累计直方图 进程累计分布 进程内 promotion resume core 耗时 p99。"><td><code>Preserve_trx_promotion_resume_core_p99_us</code></td><td>Promotion resume core</td><td>进程累计分布</td><td>us</td><td>进程内 promotion resume core 耗时 p99。</td></tr>
+<tr class="metric-row" data-group="Promotion resume core" data-search="preserve_trx_promotion_resume_core_max_us promotion resume core 最近一次 + 进程累计直方图 进程累计最大值 进程内 promotion resume core 最大耗时。"><td><code>Preserve_trx_promotion_resume_core_max_us</code></td><td>Promotion resume core</td><td>进程累计最大值</td><td>us</td><td>进程内 promotion resume core 最大耗时。</td></tr>
+<tr class="metric-row" data-group="Promotion resume core" data-search="preserve_trx_promotion_resume_failure_count promotion resume core 最近一次 + 进程累计直方图 进程累计 promotion resume 失败次数。"><td><code>Preserve_trx_promotion_resume_failure_count</code></td><td>Promotion resume core</td><td>进程累计</td><td>count/gauge</td><td>promotion resume 失败次数。</td></tr>
+<tr class="metric-row" data-group="Promotion physical fence" data-search="preserve_trx_promotion_fence_lease_wait_us promotion physical fence 最近一次 fence/adopt 操作 最近一次 fence/adopt 操作 等待/取得 promotion intent lease 的耗时。"><td><code>Preserve_trx_promotion_fence_lease_wait_us</code></td><td>Promotion physical fence</td><td>最近一次 fence/adopt 操作</td><td>us</td><td>等待/取得 promotion intent lease 的耗时。</td></tr>
+<tr class="metric-row" data-group="Promotion physical fence" data-search="preserve_trx_promotion_fence_digest_compare_us promotion physical fence 最近一次 fence/adopt 操作 最近一次 fence/adopt 操作 比较物理/语义对象摘要的耗时。"><td><code>Preserve_trx_promotion_fence_digest_compare_us</code></td><td>Promotion physical fence</td><td>最近一次 fence/adopt 操作</td><td>us</td><td>比较物理/语义对象摘要的耗时。</td></tr>
+<tr class="metric-row" data-group="Promotion physical fence" data-search="preserve_trx_promotion_fence_revalidate_us promotion physical fence 最近一次 fence/adopt 操作 最近一次 fence/adopt 操作 认领前最终 fence 重验证耗时。"><td><code>Preserve_trx_promotion_fence_revalidate_us</code></td><td>Promotion physical fence</td><td>最近一次 fence/adopt 操作</td><td>us</td><td>认领前最终 fence 重验证耗时。</td></tr>
+<tr class="metric-row" data-group="Promotion lock apply" data-search="preserve_trx_promotion_lock_page_get_count promotion lock apply 最近一次 promotion lock 操作 最近一次 promotion lock 操作 promotion lock apply 的同步取页次数。"><td><code>Preserve_trx_promotion_lock_page_get_count</code></td><td>Promotion lock apply</td><td>最近一次 promotion lock 操作</td><td>count/gauge</td><td>promotion lock apply 的同步取页次数。</td></tr>
+<tr class="metric-row" data-group="Promotion lock apply" data-search="preserve_trx_promotion_lock_page_get_us promotion lock apply 最近一次 promotion lock 操作 最近一次 promotion lock 操作 promotion lock apply 同步取页耗时。"><td><code>Preserve_trx_promotion_lock_page_get_us</code></td><td>Promotion lock apply</td><td>最近一次 promotion lock 操作</td><td>us</td><td>promotion lock apply 同步取页耗时。</td></tr>
+<tr class="metric-row" data-group="Promotion lock apply" data-search="preserve_trx_promotion_lock_image_resolves promotion lock apply 最近一次 promotion lock 操作 最近一次 promotion lock 操作 通过预热 lock image 直接解析的数量。"><td><code>Preserve_trx_promotion_lock_image_resolves</code></td><td>Promotion lock apply</td><td>最近一次 promotion lock 操作</td><td>count/gauge</td><td>通过预热 lock image 直接解析的数量。</td></tr>
+<tr class="metric-row" data-group="Promotion lock apply" data-search="preserve_trx_promotion_lock_apply_us promotion lock apply 最近一次 promotion lock 操作 最近一次 promotion lock 操作 应用 record lock 语义的耗时。"><td><code>Preserve_trx_promotion_lock_apply_us</code></td><td>Promotion lock apply</td><td>最近一次 promotion lock 操作</td><td>us</td><td>应用 record lock 语义的耗时。</td></tr>
+<tr class="metric-row" data-group="Promotion lock apply" data-search="preserve_trx_promotion_lock_accounting_bits promotion lock apply 最近一次 promotion lock 操作 最近一次 promotion lock 操作 promotion lock accounting 处理的 bitmap bit 数。"><td><code>Preserve_trx_promotion_lock_accounting_bits</code></td><td>Promotion lock apply</td><td>最近一次 promotion lock 操作</td><td>count/gauge</td><td>promotion lock accounting 处理的 bitmap bit 数。</td></tr>
+<tr class="metric-row" data-group="Receiver lock-plan 内存" data-search="preserve_trx_receiver_lock_plan_capacity_bytes receiver lock-plan 内存 当前容量 / 当前 epoch 峰值 当前容量 receiver lock-plan 可用总容量。"><td><code>Preserve_trx_receiver_lock_plan_capacity_bytes</code></td><td>Receiver lock-plan 内存</td><td>当前容量</td><td>bytes</td><td>receiver lock-plan 可用总容量。</td></tr>
+<tr class="metric-row" data-group="Receiver lock-plan 内存" data-search="preserve_trx_receiver_lock_plan_epoch_peak_bytes receiver lock-plan 内存 当前容量 / 当前 epoch 峰值 进程最大值 每次上报 epoch peak 时取 max；因此是本次 mysqld 启动以来所有已观测 epoch 的最大 lock-plan 占用，不会在新 epoch 自动清零。"><td><code>Preserve_trx_receiver_lock_plan_epoch_peak_bytes</code></td><td>Receiver lock-plan 内存</td><td>进程最大值</td><td>bytes</td><td>每次上报 epoch peak 时取 max；因此是本次 mysqld 启动以来所有已观测 epoch 的最大 lock-plan 占用，不会在新 epoch 自动清零。</td></tr>
+<tr class="metric-row" data-group="Receiver lock-plan 内存" data-search="preserve_trx_receiver_lock_plan_subpool_cap_bytes receiver lock-plan 内存 当前容量 / 当前 epoch 峰值 当前容量 lock-plan 子池容量上限。"><td><code>Preserve_trx_receiver_lock_plan_subpool_cap_bytes</code></td><td>Receiver lock-plan 内存</td><td>当前容量</td><td>bytes</td><td>lock-plan 子池容量上限。</td></tr>
+<tr class="metric-row" data-group="资源准入" data-search="preserve_trx_resource_admission_open_failed_count 资源准入 进程启动后累计 进程启动后累计 打开 preserve 资源准入/epoch 失败的次数。"><td><code>Preserve_trx_resource_admission_open_failed_count</code></td><td>资源准入</td><td>进程启动后累计</td><td>count/gauge</td><td>打开 Preserve 资源准入/epoch 失败的次数。</td></tr>
+<tr class="metric-row" data-group="Resume binlog attach" data-search="preserve_trx_resume_binlog_payload_read_bytes resume binlog attach 进程启动后累计 进程启动后累计 resume 读取 binlog cache payload 的累计字节。"><td><code>Preserve_trx_resume_binlog_payload_read_bytes</code></td><td>Resume binlog attach</td><td>进程启动后累计</td><td>bytes</td><td>resume 读取 binlog cache payload 的累计字节。</td></tr>
+<tr class="metric-row" data-group="Resume binlog attach" data-search="preserve_trx_resume_binlog_payload_write_bytes resume binlog attach 进程启动后累计 进程启动后累计 resume 为 attach/重建写入 binlog payload 的累计字节。"><td><code>Preserve_trx_resume_binlog_payload_write_bytes</code></td><td>Resume binlog attach</td><td>进程启动后累计</td><td>bytes</td><td>resume 为 attach/重建写入 binlog payload 的累计字节。</td></tr>
+<tr class="metric-row" data-group="Resume binlog attach" data-search="preserve_trx_resume_binlog_rename_count resume binlog attach 进程启动后累计 进程启动后累计 binlog sidecar 通过 rename/adopt 的累计次数。"><td><code>Preserve_trx_resume_binlog_rename_count</code></td><td>Resume binlog attach</td><td>进程启动后累计</td><td>count/gauge</td><td>binlog sidecar 通过 rename/adopt 的累计次数。</td></tr>
+<tr class="metric-row" data-group="Resume binlog attach" data-search="preserve_trx_resume_binlog_attach_count resume binlog attach 进程启动后累计 进程启动后累计 binlog transaction cache 成功 attach 的累计次数。"><td><code>Preserve_trx_resume_binlog_attach_count</code></td><td>Resume binlog attach</td><td>进程启动后累计</td><td>count/gauge</td><td>binlog transaction cache 成功 attach 的累计次数。</td></tr>
+<tr class="metric-row" data-group="Resume 物理一致性" data-search="preserve_trx_resume_physical_consistency_mode resume 物理一致性 最近一次 promotion resume 最近一次 promotion resume 最近一次恢复使用的物理一致性模式：0 none、1 同实例测试、2 模拟器、3 生产 redo apply fence。"><td><code>Preserve_trx_resume_physical_consistency_mode</code></td><td>Resume 物理一致性</td><td>最近一次 promotion resume</td><td>code</td><td>最近一次恢复使用的物理一致性模式：0 NONE、1 同实例测试、2 模拟器、3 生产 redo apply fence。</td></tr>
+<tr class="metric-row" data-group="Resume 物理一致性" data-search="preserve_trx_resume_real_redo_apply resume 物理一致性 最近一次 promotion resume 最近一次 promotion resume 最近一次是否使用真实 redo apply 证明；生产期望为 1。"><td><code>Preserve_trx_resume_real_redo_apply</code></td><td>Resume 物理一致性</td><td>最近一次 promotion resume</td><td>count/gauge</td><td>最近一次是否使用真实 redo apply 证明；生产期望为 1。</td></tr>
+<tr class="metric-row" data-group="Transfer runtime 与 receiver registry" data-search="preserve_trx_transfer_throttled_milliseconds transfer runtime 与 receiver registry 进程启动后累计 进程累计毫秒 source i/o、receiver 落盘、prewarm、worker yield 或暂停造成的累计节流时间。"><td><code>Preserve_trx_transfer_throttled_milliseconds</code></td><td>Transfer runtime 与 receiver registry</td><td>进程累计毫秒</td><td>ms</td><td>source I/O、receiver 落盘、prewarm、worker yield 或暂停造成的累计节流时间。</td></tr>
+<tr class="metric-row" data-group="Transfer runtime 与 receiver registry" data-search="preserve_trx_transfer_last_throttle_reason transfer runtime 与 receiver registry 最近一次节流 最近状态码 最近一次节流原因：1 source_io、2 receiver_saved_io、3 receiver_prewarm_io、4 worker_yield、5 prewarm_paused。"><td><code>Preserve_trx_transfer_last_throttle_reason</code></td><td>Transfer runtime 与 receiver registry</td><td>最近状态码</td><td>text/code</td><td>最近一次节流原因：1 SOURCE_IO、2 RECEIVER_SAVED_IO、3 RECEIVER_PREWARM_IO、4 WORKER_YIELD、5 PREWARM_PAUSED。</td></tr>
+<tr class="metric-row" data-group="Transfer runtime 与 receiver registry" data-search="preserve_trx_transfer_receiver_queued_bytes transfer runtime 与 receiver registry 当前 receiver prewarm 队列 当前 gauge 当前排队 prewarm job 的估算 i/o 字节；出队和取消时扣减。"><td><code>Preserve_trx_transfer_receiver_queued_bytes</code></td><td>Transfer runtime 与 receiver registry</td><td>当前 gauge</td><td>bytes</td><td>当前排队 prewarm job 的估算 I/O 字节；出队和取消时扣减。</td></tr>
+<tr class="metric-row" data-group="Transfer runtime 与 receiver registry" data-search="preserve_trx_transfer_receiver_worker_active transfer runtime 与 receiver registry 当前 receiver worker 池 当前 active 当前正在执行 receiver prewarm job 的 worker 数。"><td><code>Preserve_trx_transfer_receiver_worker_active</code></td><td>Transfer runtime 与 receiver registry</td><td>当前 active</td><td>count/gauge</td><td>当前正在执行 receiver prewarm job 的 worker 数。</td></tr>
+<tr class="metric-row" data-group="Transfer runtime 与 receiver registry" data-search="preserve_trx_transfer_receiver_worker_idle transfer runtime 与 receiver registry 当前 receiver worker 池 当前 idle 由 receiver worker 总数减 active 数得到的空闲 worker 数。"><td><code>Preserve_trx_transfer_receiver_worker_idle</code></td><td>Transfer runtime 与 receiver registry</td><td>当前 idle</td><td>count/gauge</td><td>由 receiver worker 总数减 active 数得到的空闲 worker 数。</td></tr>
+<tr class="metric-row" data-group="Transfer runtime 与 receiver registry" data-search="preserve_trx_transfer_receiver_inflight_tokens transfer runtime 与 receiver registry 当前默认 receiver registry 当前 gauge 处于 declared、receiving 或 cleanup_pending 的 token 数。"><td><code>Preserve_trx_transfer_receiver_inflight_tokens</code></td><td>Transfer runtime 与 receiver registry</td><td>当前 gauge</td><td>count/gauge</td><td>处于 DECLARED、RECEIVING 或 CLEANUP_PENDING 的 token 数。</td></tr>
+<tr class="metric-row" data-group="Transfer runtime 与 receiver registry" data-search="preserve_trx_transfer_receiver_inflight_bytes transfer runtime 与 receiver registry 当前默认 receiver registry 当前 gauge inflight token 与 cleanup debt 保留的字节总量，溢出时饱和到 uint64_max。"><td><code>Preserve_trx_transfer_receiver_inflight_bytes</code></td><td>Transfer runtime 与 receiver registry</td><td>当前 gauge</td><td>bytes</td><td>inflight token 与 cleanup debt 保留的字节总量，溢出时饱和到 UINT64_MAX。</td></tr>
+<tr class="metric-row" data-group="Transfer runtime 与 receiver registry" data-search="preserve_trx_transfer_receiver_saved_online_tokens transfer runtime 与 receiver registry 当前默认 receiver registry 当前 gauge 处于 saved_online 的 receiver token 数；表示当前进程已接收保存，不等于普通 sql 可 resume。"><td><code>Preserve_trx_transfer_receiver_saved_online_tokens</code></td><td>Transfer runtime 与 receiver registry</td><td>当前 gauge</td><td>count/gauge</td><td>处于 SAVED_ONLINE 的 receiver token 数；表示当前进程已接收保存，不等于普通 SQL 可 RESUME。</td></tr>
+<tr class="metric-row" data-group="Transfer runtime 与 receiver registry" data-search="preserve_trx_transfer_receiver_failed_tokens transfer runtime 与 receiver registry 当前默认 receiver registry 当前 gauge 处于 cleanup_tainted、corrupt 或 aborted 的 receiver token 数。"><td><code>Preserve_trx_transfer_receiver_failed_tokens</code></td><td>Transfer runtime 与 receiver registry</td><td>当前 gauge</td><td>count/gauge</td><td>处于 CLEANUP_TAINTED、CORRUPT 或 ABORTED 的 receiver token 数。</td></tr>
+<tr class="metric-row" data-group="Transfer runtime 与 receiver registry" data-search="preserve_trx_transfer_receiver_last_failed_token transfer runtime 与 receiver registry 当前默认 receiver registry 最近失败标识 最近一次进入失败终态的 transfer token 数值；采集和传递时按敏感标识处理。"><td><code>Preserve_trx_transfer_receiver_last_failed_token</code></td><td>Transfer runtime 与 receiver registry</td><td>最近失败标识</td><td>count/gauge</td><td>最近一次进入失败终态的 transfer token 数值；采集和传递时按敏感标识处理。</td></tr>
+<tr class="metric-row" data-group="Transfer runtime 与 receiver registry" data-search="preserve_trx_transfer_receiver_last_failed_reason transfer runtime 与 receiver registry 当前默认 receiver registry 最近失败文本 最近一次 receiver 失败原因；需要与 failed_tokens、错误日志和 epoch 时间线一起判断。"><td><code>Preserve_trx_transfer_receiver_last_failed_reason</code></td><td>Transfer runtime 与 receiver registry</td><td>最近失败文本</td><td>text/code</td><td>最近一次 receiver 失败原因；需要与 failed_tokens、错误日志和 epoch 时间线一起判断。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_auto_prewarm_last_status transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 最近一次状态码 最近一次 receiver 自动 prewarm 的 promotion adopt status；0..16 映射见 a.2。"><td><code>Preserve_trx_transfer_receiver_auto_prewarm_last_status</code></td><td>Transfer receiver 与 prewarm</td><td>最近一次状态码</td><td>code</td><td>最近一次 receiver 自动 prewarm 的 promotion adopt status；0..16 映射见 A.2。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计 自动 prewarm 后仍未 ready 的 token 数。"><td><code>Preserve_trx_transfer_receiver_auto_prewarm_not_ready_tokens</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计</td><td>count/gauge</td><td>自动 prewarm 后仍未 ready 的 token 数。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_auto_prewarm_ready_tokens transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计 自动 prewarm 后 ready 的 token 数。"><td><code>Preserve_trx_transfer_receiver_auto_prewarm_ready_tokens</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计</td><td>count/gauge</td><td>自动 prewarm 后 ready 的 token 数。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_auto_prewarm_tokens transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计 进入自动 prewarm 的 token 总数。"><td><code>Preserve_trx_transfer_receiver_auto_prewarm_tokens</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计</td><td>count/gauge</td><td>进入自动 prewarm 的 token 总数。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_ready_monotonic_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 最近一次 monotonic 时间点 receiver 最近一次达到 ready 的进程内 steady-clock 微秒值；不是墙上时间。"><td><code>Preserve_trx_transfer_receiver_ready_monotonic_us</code></td><td>Transfer receiver 与 prewarm</td><td>最近一次 monotonic 时间点</td><td>us</td><td>receiver 最近一次达到 ready 的进程内 steady-clock 微秒值；不是墙上时间。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_first_frame_monotonic_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程首个 monotonic 时间点 本次 mysqld 启动后第一帧 durable 的 steady-clock 时间点；首次写入后不再覆盖。"><td><code>Preserve_trx_transfer_receiver_first_frame_monotonic_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程首个 monotonic 时间点</td><td>us</td><td>本次 mysqld 启动后第一帧 durable 的 steady-clock 时间点；首次写入后不再覆盖。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_last_object_seal_monotonic_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 最近一次 monotonic 时间点 当前/最近 epoch 最后对象 seal 的 steady-clock 时间点。"><td><code>Preserve_trx_transfer_receiver_last_object_seal_monotonic_us</code></td><td>Transfer receiver 与 prewarm</td><td>最近一次 monotonic 时间点</td><td>us</td><td>当前/最近 epoch 最后对象 seal 的 steady-clock 时间点。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_prewarm_start_monotonic_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程首个 monotonic 时间点 本次 mysqld 启动后第一次 receiver prewarm 开始的 steady-clock 时间点；首次写入后不再覆盖。"><td><code>Preserve_trx_transfer_receiver_prewarm_start_monotonic_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程首个 monotonic 时间点</td><td>us</td><td>本次 mysqld 启动后第一次 receiver prewarm 开始的 steady-clock 时间点；首次写入后不再覆盖。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_prewarm_end_monotonic_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程最新 monotonic 时间点 最近一次 receiver prewarm 结束的 steady-clock 时间点。"><td><code>Preserve_trx_transfer_receiver_prewarm_end_monotonic_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程最新 monotonic 时间点</td><td>us</td><td>最近一次 receiver prewarm 结束的 steady-clock 时间点。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_seal_prewarm_last_status transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 最近一次状态码 对象 seal 触发 prewarm 的最近 promotion adopt status；0..16 映射见 a.2。"><td><code>Preserve_trx_transfer_receiver_seal_prewarm_last_status</code></td><td>Transfer receiver 与 prewarm</td><td>最近一次状态码</td><td>code</td><td>对象 seal 触发 prewarm 的最近 promotion adopt status；0..16 映射见 A.2。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计 seal prewarm 后未 ready 的 token 数。"><td><code>Preserve_trx_transfer_receiver_seal_prewarm_not_ready_tokens</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计</td><td>count/gauge</td><td>seal prewarm 后未 ready 的 token 数。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_seal_prewarm_success_tokens transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计 seal prewarm 成功 token 数。"><td><code>Preserve_trx_transfer_receiver_seal_prewarm_success_tokens</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计</td><td>count/gauge</td><td>seal prewarm 成功 token 数。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_seal_prewarm_tokens transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计 触发 seal prewarm 的 token 数。"><td><code>Preserve_trx_transfer_receiver_seal_prewarm_tokens</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计</td><td>count/gauge</td><td>触发 seal prewarm 的 token 数。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_object_prewarm_proof_count transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计 对象 prewarm 生成/验证 readiness proof 的次数。"><td><code>Preserve_trx_transfer_receiver_object_prewarm_proof_count</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计</td><td>count/gauge</td><td>对象 prewarm 生成/验证 readiness proof 的次数。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_object_prewarm_miss_count transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计 对象 prewarm 未命中 ready resource 的次数。"><td><code>Preserve_trx_transfer_receiver_object_prewarm_miss_count</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计</td><td>count/gauge</td><td>对象 prewarm 未命中 ready resource 的次数。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_object_prewarm_count transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计 对象 prewarm 调用次数。"><td><code>Preserve_trx_transfer_receiver_object_prewarm_count</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计</td><td>count/gauge</td><td>对象 prewarm 调用次数。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_object_prewarm_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计耗时 所有对象 prewarm 的累计耗时。"><td><code>Preserve_trx_transfer_receiver_object_prewarm_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计耗时</td><td>us</td><td>所有对象 prewarm 的累计耗时。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_object_prewarm_max_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程最大值 单个对象 prewarm 的最大耗时。"><td><code>Preserve_trx_transfer_receiver_object_prewarm_max_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程最大值</td><td>us</td><td>单个对象 prewarm 的最大耗时。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_recv_obj_prewarm_first_start_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程首个 monotonic 时间点 本次 mysqld 启动后对象 prewarm 最早开始的 steady-clock 时间点。"><td><code>Preserve_trx_recv_obj_prewarm_first_start_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程首个 monotonic 时间点</td><td>us</td><td>本次 mysqld 启动后对象 prewarm 最早开始的 steady-clock 时间点。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_recv_obj_prewarm_last_end_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程最新 monotonic 时间点 本次 mysqld 启动后对象 prewarm 最晚结束的 steady-clock 时间点。"><td><code>Preserve_trx_recv_obj_prewarm_last_end_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程最新 monotonic 时间点</td><td>us</td><td>本次 mysqld 启动后对象 prewarm 最晚结束的 steady-clock 时间点。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_record_object_prewarm_count transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计 record-lock 对象 prewarm 次数。"><td><code>Preserve_trx_transfer_receiver_record_object_prewarm_count</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计</td><td>count/gauge</td><td>record-lock 对象 prewarm 次数。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_record_object_prewarm_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计耗时 record-lock 对象 prewarm 累计耗时。"><td><code>Preserve_trx_transfer_receiver_record_object_prewarm_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计耗时</td><td>us</td><td>record-lock 对象 prewarm 累计耗时。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_record_object_prewarm_max_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程最大值 单个 record-lock 对象 prewarm 最大耗时。"><td><code>Preserve_trx_transfer_receiver_record_object_prewarm_max_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程最大值</td><td>us</td><td>单个 record-lock 对象 prewarm 最大耗时。</td></tr>
+<tr class="metric-row" data-group="Strict receiver 副作用守卫" data-search="preserve_trx_transfer_receiver_strict_record_index_page_reads strict receiver 副作用守卫 当前实现观测缺口 当前只读值 预留用于统计 strict receiver 构建 record index 时的页读取；当前源码未找到写入点，恒为 0 不能证明没有页读。"><td><code>Preserve_trx_transfer_receiver_strict_record_index_page_reads</code></td><td>Strict receiver 副作用守卫</td><td>当前只读值</td><td>count/gauge</td><td>预留用于统计 strict receiver 构建 record index 时的页读取；当前源码未找到写入点，恒为 0 不能证明没有页读。</td></tr>
+<tr class="metric-row" data-group="Strict receiver 副作用守卫" data-search="preserve_trx_transfer_receiver_strict_ibuf_merges strict receiver 副作用守卫 当前实现观测缺口 当前只读值 预留用于统计 strict receiver 引发的 change buffer merge；当前源码未找到写入点，恒为 0 不能作为验收证据。"><td><code>Preserve_trx_transfer_receiver_strict_ibuf_merges</code></td><td>Strict receiver 副作用守卫</td><td>当前只读值</td><td>count/gauge</td><td>预留用于统计 strict receiver 引发的 change buffer merge；当前源码未找到写入点，恒为 0 不能作为验收证据。</td></tr>
+<tr class="metric-row" data-group="Strict receiver 副作用守卫" data-search="preserve_trx_transfer_receiver_strict_target_local_redo_bytes strict receiver 副作用守卫 当前实现观测缺口 当前只读值 预留用于统计 strict receiver 在目标端产生的本地 redo；当前源码未找到写入点，恒为 0 不能作为验收证据。"><td><code>Preserve_trx_transfer_receiver_strict_target_local_redo_bytes</code></td><td>Strict receiver 副作用守卫</td><td>当前只读值</td><td>bytes</td><td>预留用于统计 strict receiver 在目标端产生的本地 redo；当前源码未找到写入点，恒为 0 不能作为验收证据。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_recv_rec_obj_prewarm_first_start_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程首个 monotonic 时间点 本次 mysqld 启动后 record-lock 对象 prewarm 最早开始的 steady-clock 时间点。"><td><code>Preserve_trx_recv_rec_obj_prewarm_first_start_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程首个 monotonic 时间点</td><td>us</td><td>本次 mysqld 启动后 record-lock 对象 prewarm 最早开始的 steady-clock 时间点。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_recv_rec_obj_prewarm_last_end_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程最新 monotonic 时间点 本次 mysqld 启动后 record-lock 对象 prewarm 最晚结束的 steady-clock 时间点。"><td><code>Preserve_trx_recv_rec_obj_prewarm_last_end_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程最新 monotonic 时间点</td><td>us</td><td>本次 mysqld 启动后 record-lock 对象 prewarm 最晚结束的 steady-clock 时间点。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_recv_binlog_obj_prewarm_first_start_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程首个 monotonic 时间点 本次 mysqld 启动后 binlog 对象 prewarm 最早开始的 steady-clock 时间点。"><td><code>Preserve_trx_recv_binlog_obj_prewarm_first_start_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程首个 monotonic 时间点</td><td>us</td><td>本次 mysqld 启动后 binlog 对象 prewarm 最早开始的 steady-clock 时间点。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_recv_binlog_obj_prewarm_last_end_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程最新 monotonic 时间点 本次 mysqld 启动后 binlog 对象 prewarm 最晚结束的 steady-clock 时间点。"><td><code>Preserve_trx_recv_binlog_obj_prewarm_last_end_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程最新 monotonic 时间点</td><td>us</td><td>本次 mysqld 启动后 binlog 对象 prewarm 最晚结束的 steady-clock 时间点。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_committed_epoch_fallback_count transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计 committed epoch 未走期望快速路径而触发 fallback 的次数。"><td><code>Preserve_trx_transfer_receiver_committed_epoch_fallback_count</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计</td><td>count/gauge</td><td>committed epoch 未走期望快速路径而触发 fallback 的次数。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_staged_token_ready_cache_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计耗时 staged token 建立 ready-cache 的累计耗时。"><td><code>Preserve_trx_transfer_receiver_staged_token_ready_cache_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计耗时</td><td>us</td><td>staged token 建立 ready-cache 的累计耗时。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_staged_token_total_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计耗时 staged token 从处理开始到完成的累计耗时。"><td><code>Preserve_trx_transfer_receiver_staged_token_total_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计耗时</td><td>us</td><td>staged token 从处理开始到完成的累计耗时。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_staged_token_max_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程最大值 单个 staged token 的最大处理耗时。"><td><code>Preserve_trx_transfer_receiver_staged_token_max_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程最大值</td><td>us</td><td>单个 staged token 的最大处理耗时。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_staged_token_active transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 当前 gauge 当前并发处理的 staged token 数。"><td><code>Preserve_trx_transfer_receiver_staged_token_active</code></td><td>Transfer receiver 与 prewarm</td><td>当前 gauge</td><td>count/gauge</td><td>当前并发处理的 staged token 数。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_staged_token_max_active transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程峰值 本次启动以来 staged token 最大并发数。"><td><code>Preserve_trx_transfer_receiver_staged_token_max_active</code></td><td>Transfer receiver 与 prewarm</td><td>进程峰值</td><td>count/gauge</td><td>本次启动以来 staged token 最大并发数。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_projection_publish_count transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计 发布 standby projection 的次数。"><td><code>Preserve_trx_transfer_receiver_projection_publish_count</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计</td><td>count/gauge</td><td>发布 standby projection 的次数。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_projection_publish_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计耗时 projection publish 累计耗时。"><td><code>Preserve_trx_transfer_receiver_projection_publish_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计耗时</td><td>us</td><td>projection publish 累计耗时。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_projection_publish_max_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程最大值 单次 projection publish 最大耗时。"><td><code>Preserve_trx_transfer_receiver_projection_publish_max_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程最大值</td><td>us</td><td>单次 projection publish 最大耗时。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_projection_publish_p95_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计分布 projection publish 耗时 p95。"><td><code>Preserve_trx_transfer_receiver_projection_publish_p95_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计分布</td><td>us</td><td>projection publish 耗时 p95。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_projection_lock_wait_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计耗时 projection publish 等待内部锁的累计耗时。"><td><code>Preserve_trx_transfer_receiver_projection_lock_wait_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计耗时</td><td>us</td><td>projection publish 等待内部锁的累计耗时。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_projection_store_write_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计耗时 projection store 持久化写入累计耗时。"><td><code>Preserve_trx_transfer_receiver_projection_store_write_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计耗时</td><td>us</td><td>projection store 持久化写入累计耗时。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_projection_marker_write_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计耗时 standby/promotion marker 写入累计耗时。"><td><code>Preserve_trx_transfer_receiver_projection_marker_write_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计耗时</td><td>us</td><td>standby/promotion marker 写入累计耗时。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_projection_snapshot_write_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计耗时 projection snapshot metadata 写入累计耗时。"><td><code>Preserve_trx_transfer_receiver_projection_snapshot_write_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计耗时</td><td>us</td><td>projection snapshot metadata 写入累计耗时。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_projection_external_blob_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计耗时 projection external blob 发布累计耗时。"><td><code>Preserve_trx_transfer_receiver_projection_external_blob_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计耗时</td><td>us</td><td>projection external blob 发布累计耗时。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_projection_encode_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计耗时 projection 编码累计耗时。"><td><code>Preserve_trx_transfer_receiver_projection_encode_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计耗时</td><td>us</td><td>projection 编码累计耗时。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_projection_token_state_us transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计耗时 projection token state 变更累计耗时。"><td><code>Preserve_trx_transfer_receiver_projection_token_state_us</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计耗时</td><td>us</td><td>projection token state 变更累计耗时。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 与 prewarm" data-search="preserve_trx_transfer_receiver_epoch_ready_bind_attempts transfer receiver 与 prewarm 进程累计；last/timestamp/gauge 例外 进程累计 把 committed epoch 绑定到 ready state/registry 的尝试次数。"><td><code>Preserve_trx_transfer_receiver_epoch_ready_bind_attempts</code></td><td>Transfer receiver 与 prewarm</td><td>进程累计</td><td>count/gauge</td><td>把 committed epoch 绑定到 ready state/registry 的尝试次数。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 2" data-search="preserve_trx_transfer_phase2_bulk_bytes transfer source phase 2 最近一次 phase 2；fsync count 例外 最近一次 phase 2 本次 phase 2 bulk 传输字节；下一次 phase 2 开始时重置。"><td><code>Preserve_trx_transfer_phase2_bulk_bytes</code></td><td>Transfer source phase 2</td><td>最近一次 phase 2</td><td>bytes</td><td>本次 phase 2 bulk 传输字节；下一次 phase 2 开始时重置。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 2" data-search="preserve_trx_transfer_phase2_final_metadata_fsync_count transfer source phase 2 最近一次 phase 2；fsync count 例外 进程启动后累计 最终元数据执行 durable fsync 的累计次数；不会随 source phase 2 reset 清零。"><td><code>Preserve_trx_transfer_phase2_final_metadata_fsync_count</code></td><td>Transfer source phase 2</td><td>进程启动后累计</td><td>count/gauge</td><td>最终元数据执行 durable fsync 的累计次数；不会随 source phase 2 reset 清零。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 2" data-search="preserve_trx_transfer_phase2_final_metadata_ack_us transfer source phase 2 最近一次 phase 2；fsync count 例外 最近一次 phase 2 发送最终元数据到收到确认 ack 的耗时。"><td><code>Preserve_trx_transfer_phase2_final_metadata_ack_us</code></td><td>Transfer source phase 2</td><td>最近一次 phase 2</td><td>us</td><td>发送最终元数据到收到确认 ACK 的耗时。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 1" data-search="preserve_trx_transfer_phase1_frame_count transfer source phase 1 当前/最近 transfer epoch；打开 epoch 时重置 当前/最近 transfer epoch；打开 epoch 时重置 本 epoch phase 1 编码/发送的 frame 数。"><td><code>Preserve_trx_transfer_phase1_frame_count</code></td><td>Transfer source phase 1</td><td>当前/最近 transfer epoch；打开 epoch 时重置</td><td>count/gauge</td><td>本 epoch phase 1 编码/发送的 frame 数。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 1" data-search="preserve_trx_transfer_phase1_network_send_count transfer source phase 1 当前/最近 transfer epoch；打开 epoch 时重置 当前/最近 transfer epoch；打开 epoch 时重置 本 epoch 实际网络 send 调用/批次次数。"><td><code>Preserve_trx_transfer_phase1_network_send_count</code></td><td>Transfer source phase 1</td><td>当前/最近 transfer epoch；打开 epoch 时重置</td><td>count/gauge</td><td>本 epoch 实际网络 send 调用/批次次数。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 1" data-search="preserve_trx_transfer_phase1_batch_count transfer source phase 1 当前/最近 transfer epoch；打开 epoch 时重置 当前/最近 transfer epoch；打开 epoch 时重置 本 epoch 形成的 phase 1 batch 数。"><td><code>Preserve_trx_transfer_phase1_batch_count</code></td><td>Transfer source phase 1</td><td>当前/最近 transfer epoch；打开 epoch 时重置</td><td>count/gauge</td><td>本 epoch 形成的 phase 1 batch 数。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 1" data-search="preserve_trx_transfer_phase1_batch_bytes_p50 transfer source phase 1 当前/最近 transfer epoch；打开 epoch 时重置 当前/最近 transfer epoch；打开 epoch 时重置 本 epoch batch 编码字节 p50。"><td><code>Preserve_trx_transfer_phase1_batch_bytes_p50</code></td><td>Transfer source phase 1</td><td>当前/最近 transfer epoch；打开 epoch 时重置</td><td>bytes</td><td>本 epoch batch 编码字节 p50。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 1" data-search="preserve_trx_transfer_phase1_batch_bytes_p95 transfer source phase 1 当前/最近 transfer epoch；打开 epoch 时重置 当前/最近 transfer epoch；打开 epoch 时重置 本 epoch batch 编码字节 p95。"><td><code>Preserve_trx_transfer_phase1_batch_bytes_p95</code></td><td>Transfer source phase 1</td><td>当前/最近 transfer epoch；打开 epoch 时重置</td><td>bytes</td><td>本 epoch batch 编码字节 p95。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 1" data-search="preserve_trx_transfer_phase1_batch_bytes_max transfer source phase 1 当前/最近 transfer epoch；打开 epoch 时重置 当前/最近 transfer epoch；打开 epoch 时重置 本 epoch最大 batch 编码字节。"><td><code>Preserve_trx_transfer_phase1_batch_bytes_max</code></td><td>Transfer source phase 1</td><td>当前/最近 transfer epoch；打开 epoch 时重置</td><td>bytes</td><td>本 epoch最大 batch 编码字节。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 1" data-search="preserve_trx_transfer_phase1_batch_tokens_p50 transfer source phase 1 当前/最近 transfer epoch；打开 epoch 时重置 当前/最近 transfer epoch；打开 epoch 时重置 本 epoch 每 batch token 数 p50。"><td><code>Preserve_trx_transfer_phase1_batch_tokens_p50</code></td><td>Transfer source phase 1</td><td>当前/最近 transfer epoch；打开 epoch 时重置</td><td>count/gauge</td><td>本 epoch 每 batch token 数 p50。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 1" data-search="preserve_trx_transfer_phase1_batch_tokens_p95 transfer source phase 1 当前/最近 transfer epoch；打开 epoch 时重置 当前/最近 transfer epoch；打开 epoch 时重置 本 epoch 每 batch token 数 p95。"><td><code>Preserve_trx_transfer_phase1_batch_tokens_p95</code></td><td>Transfer source phase 1</td><td>当前/最近 transfer epoch；打开 epoch 时重置</td><td>count/gauge</td><td>本 epoch 每 batch token 数 p95。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 1" data-search="preserve_trx_transfer_phase1_batch_tokens_max transfer source phase 1 当前/最近 transfer epoch；打开 epoch 时重置 当前/最近 transfer epoch；打开 epoch 时重置 本 epoch 每 batch 最大 token 数。"><td><code>Preserve_trx_transfer_phase1_batch_tokens_max</code></td><td>Transfer source phase 1</td><td>当前/最近 transfer epoch；打开 epoch 时重置</td><td>count/gauge</td><td>本 epoch 每 batch 最大 token 数。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 1" data-search="preserve_trx_transfer_phase1_record_batch_tokens_avg transfer source phase 1 当前/最近 transfer epoch；打开 epoch 时重置 当前/最近 transfer epoch；打开 epoch 时重置 本 epoch record-lock 对象 batch 的平均 token 数。"><td><code>Preserve_trx_transfer_phase1_record_batch_tokens_avg</code></td><td>Transfer source phase 1</td><td>当前/最近 transfer epoch；打开 epoch 时重置</td><td>count/gauge</td><td>本 epoch record-lock 对象 batch 的平均 token 数。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 1" data-search="preserve_trx_transfer_phase1_batch_linger_us_p95 transfer source phase 1 当前/最近 transfer epoch；打开 epoch 时重置 当前/最近 transfer epoch；打开 epoch 时重置 本 epoch batch 等待 linger 的耗时 p95。"><td><code>Preserve_trx_transfer_phase1_batch_linger_us_p95</code></td><td>Transfer source phase 1</td><td>当前/最近 transfer epoch；打开 epoch 时重置</td><td>count/gauge</td><td>本 epoch batch 等待 linger 的耗时 p95。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 1" data-search="preserve_trx_transfer_phase1_batch_linger_us_max transfer source phase 1 当前/最近 transfer epoch；打开 epoch 时重置 当前/最近 transfer epoch；打开 epoch 时重置 本 epoch batch 最大 linger 耗时。"><td><code>Preserve_trx_transfer_phase1_batch_linger_us_max</code></td><td>Transfer source phase 1</td><td>当前/最近 transfer epoch；打开 epoch 时重置</td><td>count/gauge</td><td>本 epoch batch 最大 linger 耗时。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 1" data-search="preserve_trx_transfer_phase1_oversize_token_count transfer source phase 1 当前/最近 transfer epoch；打开 epoch 时重置 当前/最近 transfer epoch；打开 epoch 时重置 单 token 超过目标 batch bytes、需要独立发送的数量。"><td><code>Preserve_trx_transfer_phase1_oversize_token_count</code></td><td>Transfer source phase 1</td><td>当前/最近 transfer epoch；打开 epoch 时重置</td><td>count/gauge</td><td>单 token 超过目标 batch bytes、需要独立发送的数量。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 1" data-search="preserve_trx_transfer_phase1_record_first_batch_send_us transfer source phase 1 当前/最近 transfer epoch；打开 epoch 时重置 当前 epoch monotonic 时间点 本 epoch record 对象第一批发送的 steady-clock 时间点。"><td><code>Preserve_trx_transfer_phase1_record_first_batch_send_us</code></td><td>Transfer source phase 1</td><td>当前 epoch monotonic 时间点</td><td>us</td><td>本 epoch record 对象第一批发送的 steady-clock 时间点。</td></tr>
+<tr class="metric-row" data-group="Transfer source phase 1" data-search="preserve_trx_transfer_phase1_record_last_batch_send_us transfer source phase 1 当前/最近 transfer epoch；打开 epoch 时重置 当前 epoch monotonic 时间点 本 epoch record 对象最后一批发送的 steady-clock 时间点。"><td><code>Preserve_trx_transfer_phase1_record_last_batch_send_us</code></td><td>Transfer source phase 1</td><td>当前 epoch monotonic 时间点</td><td>us</td><td>本 epoch record 对象最后一批发送的 steady-clock 时间点。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 终态时序" data-search="preserve_trx_transfer_receiver_ready_after_final_metadata_us transfer receiver 终态时序 最近一次 / 当前值 最近一次耗时 receiver 在最终元数据到达后达到 ready 的延迟。"><td><code>Preserve_trx_transfer_receiver_ready_after_final_metadata_us</code></td><td>Transfer receiver 终态时序</td><td>最近一次耗时</td><td>us</td><td>receiver 在最终元数据到达后达到 ready 的延迟。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 终态时序" data-search="preserve_trx_transfer_receiver_final_spool_ack_monotonic_us transfer receiver 终态时序 最近一次 / 当前值 最近一次 monotonic 时间点 最终 spool ack 的进程内 steady-clock 时间点。"><td><code>Preserve_trx_transfer_receiver_final_spool_ack_monotonic_us</code></td><td>Transfer receiver 终态时序</td><td>最近一次 monotonic 时间点</td><td>us</td><td>最终 spool ACK 的进程内 steady-clock 时间点。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 终态时序" data-search="preserve_trx_transfer_receiver_ready_after_final_spool_ack_us transfer receiver 终态时序 最近一次 / 当前值 最近一次耗时 最终 spool ack 后到 receiver ready 的延迟。"><td><code>Preserve_trx_transfer_receiver_ready_after_final_spool_ack_us</code></td><td>Transfer receiver 终态时序</td><td>最近一次耗时</td><td>us</td><td>最终 spool ACK 后到 receiver ready 的延迟。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 终态时序" data-search="preserve_trx_transfer_receiver_prewarm_backlog_at_phase2_end transfer receiver 终态时序 最近一次 / 当前值 最近一次 gauge phase 2 结束时仍待 prewarm 的对象/token 数。"><td><code>Preserve_trx_transfer_receiver_prewarm_backlog_at_phase2_end</code></td><td>Transfer receiver 终态时序</td><td>最近一次 gauge</td><td>count/gauge</td><td>phase 2 结束时仍待 prewarm 的对象/token 数。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 终态时序" data-search="preserve_trx_transfer_receiver_record_lock_req_residency_bytes transfer receiver 终态时序 最近一次 / 当前值 当前 ready-cache gauge 当前 ready-cache 中需预热的 record-lock page 数乘 16 kib 得到的 required residency。"><td><code>Preserve_trx_transfer_receiver_record_lock_req_residency_bytes</code></td><td>Transfer receiver 终态时序</td><td>当前 ready-cache gauge</td><td>bytes</td><td>当前 ready-cache 中需预热的 record-lock page 数乘 16 KiB 得到的 required residency。</td></tr>
+<tr class="metric-row" data-group="Transfer receiver 终态时序" data-search="preserve_trx_transfer_receiver_record_lock_resv_residency_bytes transfer receiver 终态时序 最近一次 / 当前值 当前 ready-cache gauge 当前 ready-cache 中已 resident 的 record-lock page 数乘 16 kib 得到的 reserved residency。"><td><code>Preserve_trx_transfer_receiver_record_lock_resv_residency_bytes</code></td><td>Transfer receiver 终态时序</td><td>当前 ready-cache gauge</td><td>bytes</td><td>当前 ready-cache 中已 resident 的 record-lock page 数乘 16 KiB 得到的 reserved residency。</td></tr>
+<tr class="metric-row" data-group="通用 Spill" data-search="preserve_trx_spill_bytes 通用 spill 进程启动后累计 进程启动后累计 通用 preserve spill backend 写入累计字节。"><td><code>Preserve_trx_spill_bytes</code></td><td>通用 Spill</td><td>进程启动后累计</td><td>bytes</td><td>通用 Preserve spill backend 写入累计字节。</td></tr>
+<tr class="metric-row" data-group="通用 Spill" data-search="preserve_trx_spill_failures 通用 spill 进程启动后累计 进程启动后累计 通用 preserve spill 失败次数。"><td><code>Preserve_trx_spill_failures</code></td><td>通用 Spill</td><td>进程启动后累计</td><td>count/gauge</td><td>通用 Preserve spill 失败次数。</td></tr>
+<tr class="metric-row" data-group="Binlog warmcopy" data-search="preserve_trx_warmcopy_digest_bytes binlog warmcopy 当前/最近一次 batch warmcopy；phase 1 open 时清零 当前/最近一次 batch warmcopy；phase 1 open 时清零 本次 warmcopy 参与摘要计算的字节。"><td><code>Preserve_trx_warmcopy_digest_bytes</code></td><td>Binlog warmcopy</td><td>当前/最近一次 batch warmcopy；phase 1 open 时清零</td><td>bytes</td><td>本次 warmcopy 参与摘要计算的字节。</td></tr>
+<tr class="metric-row" data-group="Binlog warmcopy" data-search="preserve_trx_warmcopy_durable_bytes binlog warmcopy 当前/最近一次 batch warmcopy；phase 1 open 时清零 当前/最近一次 batch warmcopy；phase 1 open 时清零 本次 warmcopy 推进到 durable watermark 的字节。"><td><code>Preserve_trx_warmcopy_durable_bytes</code></td><td>Binlog warmcopy</td><td>当前/最近一次 batch warmcopy；phase 1 open 时清零</td><td>bytes</td><td>本次 warmcopy 推进到 durable watermark 的字节。</td></tr>
+<tr class="metric-row" data-group="Binlog warmcopy" data-search="preserve_trx_warmcopy_phase2_pause_us binlog warmcopy 当前/最近一次 batch warmcopy；phase 1 open 时清零 当前/最近一次 batch warmcopy；phase 1 open 时清零 本次 binlog warmcopy phase 2 finalize 暂停窗口微秒。"><td><code>Preserve_trx_warmcopy_phase2_pause_us</code></td><td>Binlog warmcopy</td><td>当前/最近一次 batch warmcopy；phase 1 open 时清零</td><td>us</td><td>本次 binlog warmcopy phase 2 finalize 暂停窗口微秒。</td></tr>
+<tr class="metric-row" data-group="Binlog warmcopy" data-search="preserve_trx_warmcopy_prefix_bytes binlog warmcopy 当前/最近一次 batch warmcopy；phase 1 open 时清零 当前/最近一次 batch warmcopy；phase 1 open 时清零 本次 phase 1 已复制的 binlog cache prefix 字节。"><td><code>Preserve_trx_warmcopy_prefix_bytes</code></td><td>Binlog warmcopy</td><td>当前/最近一次 batch warmcopy；phase 1 open 时清零</td><td>bytes</td><td>本次 phase 1 已复制的 binlog cache prefix 字节。</td></tr>
+<tr class="metric-row" data-group="Binlog warmcopy" data-search="preserve_trx_warmcopy_provider_full_copy_to_count binlog warmcopy 当前/最近一次 batch warmcopy；phase 1 open 时清零 当前/最近一次 batch warmcopy；phase 1 open 时清零 本次 drain 中没有可用 provider、转走 full-copy 路径的次数。"><td><code>Preserve_trx_warmcopy_provider_full_copy_to_count</code></td><td>Binlog warmcopy</td><td>当前/最近一次 batch warmcopy；phase 1 open 时清零</td><td>count/gauge</td><td>本次 drain 中没有可用 provider、转走 full-copy 路径的次数。</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      本文档以当前源码中的状态注册、P_S 表定义、状态机、日志和载体实现为准。运行结论应同时保留代码 SHA、参数快照和操作时间线。
+    </footer>
+  </div>
+</div>
+
+<script>
+  const metricRows = Array.from(document.querySelectorAll(".metric-row"));
+  const metricSearch = document.getElementById("metric-search");
+  const metricGroup = document.getElementById("metric-group");
+  const metricCount = document.getElementById("metric-count");
+
+  function filterMetrics() {
+    const needle = metricSearch.value.trim().toLowerCase();
+    const group = metricGroup.value;
+    let visible = 0;
+    metricRows.forEach(function (row) {
+      const matchesText = !needle || row.dataset.search.includes(needle);
+      const matchesGroup = !group || row.dataset.group === group;
+      const show = matchesText && matchesGroup;
+      row.hidden = !show;
+      if (show) visible += 1;
+    });
+    metricCount.textContent = visible + " / " + metricRows.length;
+  }
+  metricSearch.addEventListener("input", filterMetrics);
+  metricGroup.addEventListener("change", filterMetrics);
+
+  const tocLinks = Array.from(document.querySelectorAll(".toc a"));
+  const sections = tocLinks
+    .map(function (link) { return document.querySelector(link.getAttribute("href")); })
+    .filter(Boolean);
+  const observer = new IntersectionObserver(function (entries) {
+    const visible = entries
+      .filter(function (entry) { return entry.isIntersecting; })
+      .sort(function (a, b) { return a.boundingClientRect.top - b.boundingClientRect.top; });
+    if (!visible.length) return;
+    const id = "#" + visible[0].target.id;
+    tocLinks.forEach(function (link) {
+      link.classList.toggle("active", link.getAttribute("href") === id);
+    });
+  }, { rootMargin: "-10% 0px -76% 0px", threshold: [0, 0.1] });
+  sections.forEach(function (section) { observer.observe(section); });
+</script>
+</body>
+</html>

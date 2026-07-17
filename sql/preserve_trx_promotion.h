@@ -68,6 +68,9 @@ uint64_t preserve_trx_promotion_prewarm_record_lock_cold_page_gets_status();
 uint64_t preserve_trx_promotion_ready_cache_bytes_status();
 uint64_t preserve_trx_promotion_ready_cache_evictions_status();
 
+void preserved_trx_promotion_ready_cache_purge_epoch(
+    const std::string &preserve_dir, const std::string &epoch_id);
+
 enum class Preserve_trx_promotion_adopt_status {
   OK,
   OK_WITH_ABANDONED_TOKENS,

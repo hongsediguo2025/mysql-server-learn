@@ -32,7 +32,7 @@ die "temp-table participant must call preserve_trx_temp_table_begin_capture_epoc
 die "temp-table participant cleanup must clear unsupported capture boundaries\n"
   unless $preserve =~ /class\s+Clear_capture_epoch_targets[\s\S]*preserve_trx_temp_table_clear_batch_unsupported_boundary\s*\(\s*candidate\s*\)/s;
 my $active_guard = index($preserve,
-  'if (!draining.active()) return preserve_trx_reject_unsupported();');
+  'if (!draining->active()) return preserve_trx_reject_unsupported();');
 my $boundary_sweep = index($preserve,
   'Preserve_batch_clear_temp_table_unsupported_boundaries clear_temp_boundaries');
 die "batch temp-table boundary sweep must happen only after active drain guard\n"

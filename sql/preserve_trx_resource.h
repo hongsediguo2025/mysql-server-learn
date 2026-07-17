@@ -202,6 +202,9 @@ int show_preserve_trx_warmcopy_provider_full_copy_to_count(THD *thd,
                                                            char *buf);
 int show_preserve_trx_warmcopy_phase2_pause_us(THD *thd, SHOW_VAR *var,
                                                char *buf);
+int show_preserve_trx_reset_drain_wins(THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_reset_drain_too_late(THD *thd, SHOW_VAR *var,
+                                           char *buf);
 int show_preserve_trx_lock_warmcopy_attempts(THD *thd, SHOW_VAR *var,
                                              char *buf);
 int show_preserve_trx_lock_warmcopy_artifact_bytes(THD *thd, SHOW_VAR *var,
@@ -467,6 +470,12 @@ int show_preserve_trx_transfer_throttled_milliseconds(THD *thd,
 int show_preserve_trx_transfer_last_throttle_reason(THD *thd,
                                                     SHOW_VAR *var,
                                                     char *buf);
+int show_preserve_trx_transfer_receiver_active_epochs(THD *thd,
+                                                       SHOW_VAR *var,
+                                                       char *buf);
+int show_preserve_trx_transfer_receiver_expired_epochs(THD *thd,
+                                                        SHOW_VAR *var,
+                                                        char *buf);
 int show_preserve_trx_transfer_receiver_queued_bytes(THD *thd,
                                                      SHOW_VAR *var,
                                                      char *buf);

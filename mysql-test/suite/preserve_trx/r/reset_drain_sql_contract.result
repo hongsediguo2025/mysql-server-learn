@@ -1,0 +1,62 @@
+RESET DRAIN;
+SELECT @@GLOBAL.preserve_trx_transfer_receiver_prewarm_timeout_ms;
+@@GLOBAL.preserve_trx_transfer_receiver_prewarm_timeout_ms
+10000
+SELECT @@GLOBAL.preserve_trx_transfer_receiver_ready_timeout_ms;
+@@GLOBAL.preserve_trx_transfer_receiver_ready_timeout_ms
+30000
+SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=1000;
+SET GLOBAL preserve_trx_transfer_receiver_ready_timeout_ms=3600000;
+SELECT @@GLOBAL.preserve_trx_transfer_receiver_prewarm_timeout_ms;
+@@GLOBAL.preserve_trx_transfer_receiver_prewarm_timeout_ms
+1000
+SELECT @@GLOBAL.preserve_trx_transfer_receiver_ready_timeout_ms;
+@@GLOBAL.preserve_trx_transfer_receiver_ready_timeout_ms
+3600000
+SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=999;
+Warnings:
+Warning	1292	Truncated incorrect preserve_trx_transfer_receiver_prewarm_timeout_ms value: '999'
+SHOW WARNINGS;
+Level	Code	Message
+Warning	1292	Truncated incorrect preserve_trx_transfer_receiver_prewarm_timeout_ms value: '999'
+SELECT @@GLOBAL.preserve_trx_transfer_receiver_prewarm_timeout_ms;
+@@GLOBAL.preserve_trx_transfer_receiver_prewarm_timeout_ms
+1000
+SET GLOBAL preserve_trx_transfer_receiver_ready_timeout_ms=3600001;
+Warnings:
+Warning	1292	Truncated incorrect preserve_trx_transfer_receiver_ready_timeout_ms value: '3600001'
+SHOW WARNINGS;
+Level	Code	Message
+Warning	1292	Truncated incorrect preserve_trx_transfer_receiver_ready_timeout_ms value: '3600001'
+SELECT @@GLOBAL.preserve_trx_transfer_receiver_ready_timeout_ms;
+@@GLOBAL.preserve_trx_transfer_receiver_ready_timeout_ms
+3600000
+SET SESSION preserve_trx_transfer_receiver_prewarm_timeout_ms=1000;
+ERROR HY000: Variable 'preserve_trx_transfer_receiver_prewarm_timeout_ms' is a GLOBAL variable and should be set with SET GLOBAL
+SET SESSION preserve_trx_transfer_receiver_ready_timeout_ms=1000;
+ERROR HY000: Variable 'preserve_trx_transfer_receiver_ready_timeout_ms' is a GLOBAL variable and should be set with SET GLOBAL
+SET GLOBAL preserve_trx_transfer_receiver_prewarm_timeout_ms=10000;
+SET GLOBAL preserve_trx_transfer_receiver_ready_timeout_ms=30000;
+SHOW GLOBAL STATUS LIKE 'Preserve_trx_reset_drain_wins';
+Variable_name	Value
+Preserve_trx_reset_drain_wins	0
+SHOW GLOBAL STATUS LIKE 'Preserve_trx_reset_drain_too_late';
+Variable_name	Value
+Preserve_trx_reset_drain_too_late	0
+SHOW GLOBAL STATUS LIKE 'Preserve_trx_transfer_receiver_active_epochs';
+Variable_name	Value
+Preserve_trx_transfer_receiver_active_epochs	0
+SHOW GLOBAL STATUS LIKE 'Preserve_trx_transfer_receiver_expired_epochs';
+Variable_name	Value
+Preserve_trx_transfer_receiver_expired_epochs	0
+# restart: --preserve-trx-enable=OFF
+RESET DRAIN;
+# restart: --preserve-trx-enable=ON
+START TRANSACTION;
+RESET DRAIN;
+ERROR HY000: Invalid preserved transaction state
+ROLLBACK;
+CREATE USER preserve_reset_denied@localhost;
+RESET DRAIN;
+ERROR 42000: Access denied; you need (at least one of) the SHUTDOWN privilege(s) for this operation
+DROP USER preserve_reset_denied@localhost;

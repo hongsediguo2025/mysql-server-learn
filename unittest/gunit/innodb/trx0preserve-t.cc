@@ -661,58 +661,23 @@ class Trx0TempPreserveNoRedoReconnectTest : public ::testing::Test {
 
 uint32_t Trx0TempPreserveNoRedoReconnectTest::s_saved_max_threads = 0;
 
-void free_reconnected_no_redo_for_test(trx_t *trx) {
-  if (trx == nullptr || trx->rsegs.m_noredo.rseg == nullptr) return;
+dberr_t reload_no_redo_undo_sidecar_for_test(
+    const trx_preserve_temp_space_image_descriptor &source,
+    trx_preserve_temp_space_image_descriptor *loaded) {
+  std::string payload;
+  dberr_t err =
+      trx_preserve_temp_space_image_build_no_redo_undo_sidecar_payload(
+          source, &payload);
+  if (err != DB_SUCCESS) return err;
 
-  trx_rseg_t *rseg = trx->rsegs.m_noredo.rseg;
-  if (trx->rsegs.m_noredo.insert_undo != nullptr) {
-    UT_LIST_REMOVE(rseg->insert_undo_list, trx->rsegs.m_noredo.insert_undo);
-    trx_undo_mem_free(trx->rsegs.m_noredo.insert_undo);
-    trx->rsegs.m_noredo.insert_undo = nullptr;
-  }
-  if (trx->rsegs.m_noredo.update_undo != nullptr) {
-    UT_LIST_REMOVE(rseg->update_undo_list, trx->rsegs.m_noredo.update_undo);
-    trx_undo_mem_free(trx->rsegs.m_noredo.update_undo);
-    trx->rsegs.m_noredo.update_undo = nullptr;
-  }
-  trx->rsegs.m_noredo.rseg = nullptr;
-  ut_free(rseg);
-}
-
-class ReconnectedNoRedoCleanupGuard {
- public:
-  explicit ReconnectedNoRedoCleanupGuard(trx_t *trx) : m_trx(trx) {}
-  ~ReconnectedNoRedoCleanupGuard() {
-    free_reconnected_no_redo_for_test(m_trx);
-  }
-
- private:
-  trx_t *m_trx;
-};
-
-void init_reconnect_target_rseg(trx_rseg_t *rseg, uint32_t space_id,
-                                uint32_t page_no, uint32_t slot,
-                                uint32_t page_size) {
-  rseg->id = slot;
-  rseg->space_id = space_id;
-  rseg->page_no = page_no;
-  rseg->page_size.copy_from(page_size_t(page_size, page_size, false));
-  rseg->trx_ref_count = 1;
-  rseg->max_size = 64;
-  UT_LIST_INIT(rseg->update_undo_list, &trx_undo_t::undo_list);
-  UT_LIST_INIT(rseg->update_undo_cached, &trx_undo_t::undo_list);
-  UT_LIST_INIT(rseg->insert_undo_list, &trx_undo_t::undo_list);
-  UT_LIST_INIT(rseg->insert_undo_cached, &trx_undo_t::undo_list);
-}
-
-trx_rseg_t *alloc_reconnect_target_rseg_for_test(uint32_t space_id,
-                                                 uint32_t page_no,
-                                                 uint32_t slot,
-                                                 uint32_t page_size) {
-  auto *rseg = static_cast<trx_rseg_t *>(
-      ut_zalloc_nokey(sizeof(trx_rseg_t)));
-  init_reconnect_target_rseg(rseg, space_id, page_no, slot, page_size);
-  return rseg;
+  loaded->source_space_id = source.source_space_id;
+  loaded->page_size = source.page_size;
+  loaded->image_bytes = source.page_size;
+  loaded->image_digest[0] = 0x42;
+  loaded->sealed = true;
+  return trx_preserve_temp_space_image_load_no_redo_undo_sidecar(
+      loaded, reinterpret_cast<const unsigned char *>(payload.data()),
+      payload.size());
 }
 
 TEST_F(Trx0TempPreserveNoRedoReconnectTest,
@@ -811,10 +776,7 @@ TEST_F(Trx0TempPreserveNoRedoReconnectTest,
 }
 
 TEST_F(Trx0TempPreserveNoRedoReconnectTest,
-       ReconnectsTransactionNoRedoPointers) {
-  GTEST_SKIP()
-      << "future temp-DML no-redo undo allocator/remap materialization is "
-         "outside the current P1 fail-closed contract";
+       LoadsSinglePageNoRedoUndoReconnectGraph) {
   PreserveTempTableGateGuard enable_guard(true);
   trx_preserve_temp_space_image_descriptor descriptor;
   descriptor.source_space_id = 4243767294U;
@@ -830,12 +792,6 @@ TEST_F(Trx0TempPreserveNoRedoReconnectTest,
       kFilPageUndoLogForTest);
   temp_preserve_write_undo_page_list_bounds(&undo_header, 1, 53, 53);
   temp_preserve_write_undo_page_node(&undo_header, FIL_NULL, FIL_NULL);
-  trx_t trx{};
-  trx_rseg_t *rseg = alloc_reconnect_target_rseg_for_test(
-      descriptor.source_space_id, 51, 6, descriptor.page_size);
-  trx.rsegs.m_noredo.rseg = rseg;
-  ReconnectedNoRedoCleanupGuard cleanup_guard(&trx);
-
   ASSERT_EQ(DB_SUCCESS,
             trx_preserve_temp_space_image_note_temp_dml_requires_no_redo_undo(
                 &descriptor));
@@ -864,35 +820,26 @@ TEST_F(Trx0TempPreserveNoRedoReconnectTest,
             trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(
                 &descriptor));
 
-  EXPECT_EQ(DB_SUCCESS,
-            trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-                &descriptor, &trx,
-                trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED));
-  EXPECT_TRUE(
-      trx_preserve_temp_space_image_no_redo_undo_pointers_reconnected(
-          descriptor));
-  EXPECT_EQ(rseg, trx.rsegs.m_noredo.rseg);
-  EXPECT_EQ(1U, rseg->trx_ref_count.load());
-  EXPECT_EQ(nullptr, trx.rsegs.m_noredo.insert_undo);
-  ASSERT_NE(nullptr, trx.rsegs.m_noredo.update_undo);
-  EXPECT_EQ(12U, trx.rsegs.m_noredo.update_undo->id);
-  EXPECT_EQ(TRX_UNDO_UPDATE, trx.rsegs.m_noredo.update_undo->type);
-  EXPECT_EQ(descriptor.source_space_id,
-            trx.rsegs.m_noredo.update_undo->space);
-  EXPECT_EQ(53U, trx.rsegs.m_noredo.update_undo->hdr_page_no);
-  EXPECT_EQ(128U, trx.rsegs.m_noredo.update_undo->hdr_offset);
-  EXPECT_EQ(53U, trx.rsegs.m_noredo.update_undo->last_page_no);
-  EXPECT_EQ(53U, trx.rsegs.m_noredo.update_undo->top_page_no);
-  EXPECT_EQ(512U, trx.rsegs.m_noredo.update_undo->top_offset);
-  EXPECT_EQ(1234U, trx.rsegs.m_noredo.update_undo->top_undo_no);
-  EXPECT_EQ(1U, trx.rsegs.m_noredo.update_undo->size);
+  trx_preserve_temp_space_image_descriptor loaded;
+  ASSERT_EQ(DB_SUCCESS,
+            reload_no_redo_undo_sidecar_for_test(descriptor, &loaded));
+  const trx_preserve_temp_no_redo_undo_log_anchor *anchor =
+      trx_preserve_temp_space_image_no_redo_update_undo_anchor(loaded);
+  ASSERT_NE(nullptr, anchor);
+  EXPECT_TRUE(anchor->present);
+  EXPECT_EQ(12U, anchor->undo_slot);
+  EXPECT_EQ(53U, anchor->hdr_page_no);
+  EXPECT_EQ(128U, anchor->hdr_offset);
+  EXPECT_EQ(53U, anchor->last_page_no);
+  EXPECT_EQ(53U, anchor->top_page_no);
+  EXPECT_EQ(512U, anchor->top_offset);
+  EXPECT_EQ(1234U, anchor->top_undo_no);
+  EXPECT_EQ(3U,
+            trx_preserve_temp_space_image_no_redo_undo_page_count(loaded));
 }
 
 TEST_F(Trx0TempPreserveNoRedoReconnectTest,
-       ReconnectsMultiPageNoRedoUndoSize) {
-  GTEST_SKIP()
-      << "future temp-DML no-redo undo allocator/remap materialization is "
-         "outside the current P1 fail-closed contract";
+       LoadsMultiPageNoRedoUndoReconnectGraph) {
   PreserveTempTableGateGuard enable_guard(true);
   trx_preserve_temp_space_image_descriptor descriptor;
   descriptor.source_space_id = 4243767297U;
@@ -920,12 +867,6 @@ TEST_F(Trx0TempPreserveNoRedoReconnectTest,
   temp_preserve_write_undo_page_node(&undo_log_1, 73, 75);
   temp_preserve_write_undo_page_node(&undo_log_2, 74, 76);
   temp_preserve_write_undo_page_node(&undo_log_3, 75, FIL_NULL);
-
-  trx_t trx{};
-  trx_rseg_t *rseg = alloc_reconnect_target_rseg_for_test(
-      descriptor.source_space_id, 71, 8, descriptor.page_size);
-  trx.rsegs.m_noredo.rseg = rseg;
-  ReconnectedNoRedoCleanupGuard cleanup_guard(&trx);
 
   ASSERT_EQ(DB_SUCCESS,
             trx_preserve_temp_space_image_note_temp_dml_requires_no_redo_undo(
@@ -970,21 +911,21 @@ TEST_F(Trx0TempPreserveNoRedoReconnectTest,
             trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(
                 &descriptor));
 
-  EXPECT_EQ(DB_SUCCESS,
-            trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-                &descriptor, &trx,
-                trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED));
-  ASSERT_NE(nullptr, trx.rsegs.m_noredo.update_undo);
-  EXPECT_EQ(4U, trx.rsegs.m_noredo.update_undo->size);
-  EXPECT_EQ(76U, trx.rsegs.m_noredo.update_undo->last_page_no);
-  EXPECT_EQ(74U, trx.rsegs.m_noredo.update_undo->top_page_no);
+  trx_preserve_temp_space_image_descriptor loaded;
+  ASSERT_EQ(DB_SUCCESS,
+            reload_no_redo_undo_sidecar_for_test(descriptor, &loaded));
+  const trx_preserve_temp_no_redo_undo_log_anchor *anchor =
+      trx_preserve_temp_space_image_no_redo_update_undo_anchor(loaded);
+  ASSERT_NE(nullptr, anchor);
+  EXPECT_TRUE(anchor->present);
+  EXPECT_EQ(76U, anchor->last_page_no);
+  EXPECT_EQ(74U, anchor->top_page_no);
+  EXPECT_EQ(6U,
+            trx_preserve_temp_space_image_no_redo_undo_page_count(loaded));
 }
 
 TEST_F(Trx0TempPreserveNoRedoReconnectTest,
-       MalformedNullNextAddressDoesNotMutateTransaction) {
-  GTEST_SKIP()
-      << "future temp-DML no-redo undo allocator/remap materialization is "
-         "outside the current P1 fail-closed contract";
+       RejectsMalformedNullNextAddressWithoutMutation) {
   PreserveTempTableGateGuard enable_guard(true);
   trx_preserve_temp_space_image_descriptor descriptor;
   descriptor.source_space_id = 4243767298U;
@@ -1001,12 +942,6 @@ TEST_F(Trx0TempPreserveNoRedoReconnectTest,
   temp_preserve_write_undo_page_list_bounds(&undo_header, 1, 83, 83);
   temp_preserve_write_undo_page_node(&undo_header, FIL_NULL, FIL_NULL);
   temp_preserve_corrupt_next_null_byte_offset(&undo_header);
-
-  trx_t trx{};
-  trx_rseg_t *rseg = alloc_reconnect_target_rseg_for_test(
-      descriptor.source_space_id, 81, 9, descriptor.page_size);
-  trx.rsegs.m_noredo.rseg = rseg;
-  ReconnectedNoRedoCleanupGuard cleanup_guard(&trx);
 
   ASSERT_EQ(DB_SUCCESS,
             trx_preserve_temp_space_image_note_temp_dml_requires_no_redo_undo(
@@ -1036,21 +971,17 @@ TEST_F(Trx0TempPreserveNoRedoReconnectTest,
             trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(
                 &descriptor));
 
-  EXPECT_EQ(DB_ERROR,
-            trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-                &descriptor, &trx,
-                trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED));
-  EXPECT_EQ(nullptr, trx.rsegs.m_noredo.update_undo);
+  trx_preserve_temp_space_image_descriptor loaded;
+  EXPECT_EQ(DB_CORRUPTION,
+            reload_no_redo_undo_sidecar_for_test(descriptor, &loaded));
   EXPECT_FALSE(
-      trx_preserve_temp_space_image_no_redo_undo_pointers_reconnected(
-          descriptor));
+      trx_preserve_temp_space_image_no_redo_undo_sidecar_sealed(loaded));
+  EXPECT_EQ(0U,
+            trx_preserve_temp_space_image_no_redo_undo_page_count(loaded));
 }
 
 TEST_F(Trx0TempPreserveNoRedoReconnectTest,
-       OutOfPageUndoOffsetsDoNotMutateTransaction) {
-  GTEST_SKIP()
-      << "future temp-DML no-redo undo allocator/remap materialization is "
-         "outside the current P1 fail-closed contract";
+       RejectsOutOfPageUndoOffsetsWithoutMutation) {
   PreserveTempTableGateGuard enable_guard(true);
   trx_preserve_temp_space_image_descriptor descriptor;
   descriptor.source_space_id = 4243767299U;
@@ -1066,12 +997,6 @@ TEST_F(Trx0TempPreserveNoRedoReconnectTest,
       kFilPageUndoLogForTest);
   temp_preserve_write_undo_page_list_bounds(&undo_header, 1, 93, 93);
   temp_preserve_write_undo_page_node(&undo_header, FIL_NULL, FIL_NULL);
-
-  trx_t trx{};
-  trx_rseg_t *rseg = alloc_reconnect_target_rseg_for_test(
-      descriptor.source_space_id, 91, 10, descriptor.page_size);
-  trx.rsegs.m_noredo.rseg = rseg;
-  ReconnectedNoRedoCleanupGuard cleanup_guard(&trx);
 
   ASSERT_EQ(DB_SUCCESS,
             trx_preserve_temp_space_image_note_temp_dml_requires_no_redo_undo(
@@ -1102,14 +1027,13 @@ TEST_F(Trx0TempPreserveNoRedoReconnectTest,
             trx_preserve_temp_space_image_seal_no_redo_undo_sidecar(
                 &descriptor));
 
-  EXPECT_EQ(DB_ERROR,
-            trx_preserve_temp_space_image_reconnect_no_redo_undo_before_resume(
-                &descriptor, &trx,
-                trx_preserve_temp_no_redo_undo_reconnect_mode::NATIVE_OWNED));
-  EXPECT_EQ(nullptr, trx.rsegs.m_noredo.update_undo);
+  trx_preserve_temp_space_image_descriptor loaded;
+  EXPECT_EQ(DB_CORRUPTION,
+            reload_no_redo_undo_sidecar_for_test(descriptor, &loaded));
   EXPECT_FALSE(
-      trx_preserve_temp_space_image_no_redo_undo_pointers_reconnected(
-          descriptor));
+      trx_preserve_temp_space_image_no_redo_undo_sidecar_sealed(loaded));
+  EXPECT_EQ(0U,
+            trx_preserve_temp_space_image_no_redo_undo_page_count(loaded));
 }
 
 TEST_F(Trx0TempPreserveNoRedoReconnectTest,
