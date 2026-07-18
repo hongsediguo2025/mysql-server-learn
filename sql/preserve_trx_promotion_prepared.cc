@@ -1720,6 +1720,76 @@ Preserve_trx_prepared_token_registry::bind_final_facts(
 }
 
 Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::update_epoch_prepare_deadline(
+    const std::string &source_uuid, const std::string &epoch_id,
+    size_t expected_token_count, uint64_t deadline_monotonic_us) {
+  if (source_uuid.empty() || epoch_id.empty() || expected_token_count == 0 ||
+      deadline_monotonic_us == 0) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+
+  std::vector<std::shared_ptr<Preserve_trx_prepared_token_entry>> entries;
+  std::vector<std::unique_lock<std::mutex>> entry_guards;
+  std::vector<std::shared_ptr<const Preserve_trx_prepared_token_publication>>
+      publications;
+  try {
+    std::lock_guard<std::mutex> registry_guard(m_state->mutex);
+    entries.reserve(expected_token_count);
+    for (const auto &item : m_state->entries) {
+      if (item.first.source_uuid == source_uuid &&
+          item.first.epoch_id == epoch_id) {
+        entries.push_back(item.second);
+      }
+    }
+    if (entries.size() != expected_token_count) {
+      return Preserve_trx_prepared_status::INVALID_STATE;
+    }
+
+    entry_guards.reserve(entries.size());
+    for (const auto &entry : entries) entry_guards.emplace_back(entry->mutex);
+    publications.reserve(entries.size());
+    for (const auto &entry : entries) {
+      const auto state = entry->state.load(std::memory_order_acquire);
+      if (entry->retired_from_registry ||
+          (state != Preserve_trx_prepared_token_state::
+                        READY_FACTS_PENDING_LEASE &&
+           state != Preserve_trx_prepared_token_state::READY_FOR_GATE)) {
+        return Preserve_trx_prepared_status::INVALID_STATE;
+      }
+      const auto current = std::atomic_load_explicit(
+          &entry->publication, std::memory_order_acquire);
+      if (current == nullptr || current->key.source_uuid != source_uuid ||
+          current->key.epoch_id != epoch_id) {
+        return Preserve_trx_prepared_status::STALE_GENERATION;
+      }
+      if (current->facts.epoch_prepare_deadline_us ==
+          deadline_monotonic_us) {
+        publications.push_back(current);
+        continue;
+      }
+      Preserve_trx_final_token_facts facts = current->facts;
+      facts.epoch_prepare_deadline_us = deadline_monotonic_us;
+      facts.canonical_digest.clear();
+      if (!preserved_trx_finalize_token_facts(&facts)) {
+        return Preserve_trx_prepared_status::INVALID_STATE;
+      }
+      publications.push_back(
+          std::make_shared<const Preserve_trx_prepared_token_publication>(
+              Preserve_trx_prepared_token_publication{current->key,
+                                                      std::move(facts)}));
+    }
+    for (size_t index = 0; index < entries.size(); ++index) {
+      std::atomic_store_explicit(&entries[index]->publication,
+                                 std::move(publications[index]),
+                                 std::memory_order_release);
+    }
+  } catch (const std::bad_alloc &) {
+    return Preserve_trx_prepared_status::RESOURCE_EXHAUSTED;
+  }
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
 Preserve_trx_prepared_token_registry::mark_ready_for_gate(
     const Preserve_trx_prepared_token_key &key,
     uint64_t expected_generation) {

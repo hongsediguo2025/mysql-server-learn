@@ -525,6 +525,7 @@ struct Preserve_trx_transfer_accepted_epoch {
   Preserve_trx_transfer_epoch_lifecycle lifecycle{
       Preserve_trx_transfer_epoch_lifecycle::PREWARMING};
   uint64_t deadline_monotonic_us{0};
+  bool flat_projection_published{false};
 };
 
 struct Preserve_trx_transfer_payload_apply_reservation {
@@ -580,7 +581,7 @@ class Preserve_trx_transfer_receiver_registry {
       const std::string &root_dir,
       std::shared_ptr<const Preserve_trx_transfer_epoch_fact> fact,
       const std::string &receiver_process_generation, uint64_t now_us,
-      uint64_t prewarm_timeout_ms);
+      uint64_t prewarm_timeout_ms, bool flat_projection_published);
   Preserve_trx_transfer_status query_accepted_epoch(
       const std::string &root_dir, const std::string &epoch_id,
       Preserve_trx_transfer_accepted_epoch *accepted = nullptr) const;
@@ -590,7 +591,7 @@ class Preserve_trx_transfer_receiver_registry {
                                  const std::string &epoch_id) const;
   Preserve_trx_transfer_status mark_accepted_epoch_ready(
       const std::string &root_dir, const std::string &epoch_id, uint64_t now_us,
-      uint64_t ready_timeout_ms);
+      uint64_t ready_deadline_monotonic_us);
   Preserve_trx_receiver_promotion_lease_status
   try_acquire_accepted_epoch_promotion_lease(
       const std::string &root_dir, const std::string &epoch_id, uint64_t now_us);
@@ -681,6 +682,8 @@ class Preserve_trx_transfer_receiver_registry {
   std::map<Token_key, std::deque<uint64_t>> m_payload_apply_queue_by_token;
   struct Frame_sequence_record {
     std::array<unsigned char, kPreservedTrxSha256Length> digest{};
+    Preserve_trx_transfer_status apply_failure{
+        Preserve_trx_transfer_status::OK};
     bool applied{false};
     bool corrupt{false};
   };

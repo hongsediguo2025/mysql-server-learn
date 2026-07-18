@@ -277,7 +277,8 @@ class Binlog_cache_storage : public Basic_ostream {
   IO_CACHE_binlog_cache_storage m_file;
   mutable std::mutex m_warmcopy_mutex;
   std::shared_ptr<Binlog_cache_warmcopy_lease> m_warmcopy_lease{nullptr};
-  uint64_t m_truncate_generation{0};
+  /* Preserve-only ABA fence; it does not publish cache contents. */
+  std::atomic<uint64_t> m_truncate_generation{0};
 };
 
 /**

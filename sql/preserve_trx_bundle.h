@@ -375,6 +375,11 @@ struct PrebuiltBinlogCacheBlob {
   uint64_t size{0};
   std::array<unsigned char, kPreservedTrxSha256Length> digest{};
   Mysql_binlog_preserve_snapshot metadata;
+  /*
+    Process-local cache-replacement fence. Length/metadata catch appends;
+    truncate_generation catches equal-length replacement ABA. Never encoded.
+  */
+  uint64_t phase1_truncate_generation{0};
 };
 
 /* Warmcopy-produced record-lock body for descriptor-only snapshot storage. */

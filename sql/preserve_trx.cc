@@ -70,6 +70,7 @@
 #include "sql/auto_thd.h"
 #include "sql/binlog.h"
 #include "sql/binlog_preserve_prepared.h"
+#include "sql/binlog_warmcopy.h"
 #include "sql/dd/cache/dictionary_client.h"
 #include "sql/dd/dd_schema.h"
 #include "sql/dd/string_type.h"
@@ -6590,14 +6591,7 @@ class Phase1_transfer_binlog_blob_provider final
       phase1_blob = it->second;
     }
 
-    uint64_t current_length = 0;
-    bool current_has_blob = false;
-    Mysql_binlog_preserve_snapshot current_metadata;
-    return !mysql_binlog_preserve_warmcopy_cache_length(
-               thd, &current_length, &current_has_blob) &&
-           current_has_blob && current_length == phase1_blob.size &&
-           !mysql_binlog_preserve_export_metadata_only(thd, &current_metadata) &&
-           binlog_metadata_matches(current_metadata, phase1_blob.metadata);
+    return phase1_blob_is_current(thd, phase1_blob);
   }
 
   bool has_blob_for_thd(const THD *thd) const override {
@@ -6627,15 +6621,7 @@ class Phase1_transfer_binlog_blob_provider final
       }
     }
     if (has_phase1_blob) {
-      uint64_t current_length = 0;
-      bool current_has_blob = false;
-      Mysql_binlog_preserve_snapshot current_metadata;
-      const bool current_matches =
-          !mysql_binlog_preserve_warmcopy_cache_length(
-              thd, &current_length, &current_has_blob) &&
-          current_has_blob && current_length == phase1_blob.size &&
-          !mysql_binlog_preserve_export_metadata_only(thd, &current_metadata) &&
-          binlog_metadata_matches(current_metadata, phase1_blob.metadata);
+      const bool current_matches = phase1_blob_is_current(thd, phase1_blob);
       if (current_matches) {
         std::lock_guard<std::mutex> guard(m_mutex);
         auto it = m_phase1_blobs.find(thd->thread_id());
@@ -6684,6 +6670,23 @@ class Phase1_transfer_binlog_blob_provider final
   }
 
  private:
+  static bool phase1_blob_is_current(
+      THD *thd, const PrebuiltBinlogCacheBlob &phase1_blob) {
+    uint64_t current_length = 0;
+    uint64_t current_generation = 0;
+    bool current_has_blob = false;
+    Mysql_binlog_preserve_snapshot current_metadata;
+    return !mysql_binlog_preserve_warmcopy_cache_length(
+               thd, &current_length, &current_has_blob) &&
+           current_has_blob && current_length == phase1_blob.size &&
+           !mysql_binlog_preserve_export_metadata_only(thd,
+                                                       &current_metadata) &&
+           binlog_metadata_matches(current_metadata, phase1_blob.metadata) &&
+           !mysql_binlog_warmcopy_source_truncate_generation(
+               thd, &current_generation) &&
+           current_generation == phase1_blob.phase1_truncate_generation;
+  }
+
   static bool binlog_metadata_matches(
       const Mysql_binlog_preserve_snapshot &lhs,
       const Mysql_binlog_preserve_snapshot &rhs) {
@@ -8160,6 +8163,7 @@ void preserve_trx_warmcopy_admit_current_thd_binlog_write_impl(THD *thd) {
   if (thd == nullptr ||
       !g_warmcopy_admission_open.load(std::memory_order_acquire))
     return;
+  if (!preserve_trx_is_enabled()) return;
 
   std::shared_ptr<Warmcopy_batch_blob_provider> provider;
   uint64_t epoch = 0;
@@ -16507,6 +16511,7 @@ bool Preserve_trx_drain_service::execute(
       return reject_or_finish_phase1_reset(
           "reset_during_phase1_binlog_stream");
     }
+    DEBUG_SYNC(thd, "preserve_trx_transfer_after_phase1_binlog_stream");
     if (begin_phase1_transfer_prewarm_manifests()) {
       return reject_or_finish_phase1_reset("reset_during_phase1_manifest");
     }

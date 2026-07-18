@@ -456,6 +456,7 @@ class Mysql_binlog_warmcopy_session final
       (void)m_writer->abort();
       return true;
     }
+    blob->phase1_truncate_generation = m_truncate_generation;
     const Preserved_trx_carrier_status seal_status =
         m_writer->seal_descriptor(descriptor_from_prebuilt_warmcopy_blob(*blob));
     if (seal_status != Preserved_trx_carrier_status::OK) {
@@ -747,6 +748,7 @@ bool mysql_binlog_preserve_warmcopy_build_blob(
   blob->size = cache_length;
   blob->digest = digest;
   blob->metadata = std::move(metadata);
+  blob->phase1_truncate_generation = truncate_generation;
   if (writer->seal_descriptor(descriptor_from_prebuilt_warmcopy_blob(*blob)) !=
       Preserved_trx_carrier_status::OK) {
     (void)writer->abort();

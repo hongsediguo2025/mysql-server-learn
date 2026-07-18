@@ -713,6 +713,26 @@ die "warmcopy live-session path must compute and publish the external blob diges
   unless $warmcopy_finalize =~ /EVP_DigestFinal_ex[\s\S]*digest\.data\s*\(\s*\)/s &&
          $warmcopy_finalize =~ /blob->digest\s*=\s*digest/s;
 
+$binlog =~ /int binlog_cache_data::write_event[\s\S]*?^}/m
+  or die "could not isolate binlog_cache_data::write_event\n";
+my $binlog_cache_write_event = $&;
+die "native binlog write admission must remain one thin Preserve hook\n"
+  unless $binlog_cache_write_event =~
+           /preserve_trx_warmcopy_admit_current_thd_binlog_write/s &&
+         $binlog_cache_write_event !~ /preserve_trx_is_enabled/s;
+
+$preserve =~
+  /void preserve_trx_warmcopy_admit_current_thd_binlog_write_impl[\s\S]*?^}/m
+  or die "could not isolate Preserve binlog write admission\n";
+my $preserve_binlog_write_admission = $&;
+die "Preserve binlog write admission must test the active drain window before the global feature switch\n"
+  unless $preserve_binlog_write_admission =~
+           /g_warmcopy_admission_open\.load[\s\S]*preserve_trx_is_enabled/s &&
+         index($preserve_binlog_write_admission,
+               'g_warmcopy_admission_open.load') <
+         index($preserve_binlog_write_admission,
+               'preserve_trx_is_enabled');
+
 $preserve =~ /bool preserved_trx_metadata_locks_count[\s\S]*?^}/m
   or die "could not isolate preserved_trx_metadata_locks_count\n";
 my $metadata_locks_count = $&;
@@ -1108,6 +1128,8 @@ die "binlog cache write must avoid the warmcopy mutex when no mirror is installe
   unless $binlog_cache_write =~ /lease->active\s*\(\s*\)/s &&
          index($binlog_cache_write, 'lease->active') <
          index($binlog_cache_write, 'std::lock_guard');
+die "ordinary binlog cache writes must not maintain Preserve truncate generation\n"
+  if $binlog_cache_write =~ /m_truncate_generation/;
 
 $binlog_ostream =~ /bool Binlog_cache_storage::truncate[\s\S]*?^}/m
   or die "could not isolate Binlog_cache_storage::truncate\n";
@@ -1116,6 +1138,14 @@ die "binlog cache truncate must avoid the warmcopy mutex when no mirror is insta
   unless $binlog_cache_truncate =~ /lease->active\s*\(\s*\)/s &&
          index($binlog_cache_truncate, 'lease->active') <
          index($binlog_cache_truncate, 'std::lock_guard');
+die "binlog cache truncate must preserve the lease-null native fast return\n"
+  unless $binlog_cache_truncate =~
+         /if\s*\(\s*lease\s*==\s*nullptr\s*\)[\s\S]{0,160}return\s+m_pipeline_head->truncate\s*\(\s*offset\s*\)/s &&
+         index($binlog_cache_truncate, 'lease == nullptr') <
+         index($binlog_cache_truncate, 'preserve_trx_is_enabled');
+die "inactive-mirror truncate generation must be isolated by preserve_trx_enable\n"
+  unless $binlog_cache_truncate =~
+         /if\s*\(\s*!source_error\s*&&\s*preserve_trx_is_enabled\s*\(\s*\)\s*\)[\s\S]{0,160}m_truncate_generation\.fetch_add/s;
 
 $binlog_ostream =~ /bool Binlog_cache_storage::reset[\s\S]*?^}/m
   or die "could not isolate Binlog_cache_storage::reset\n";
@@ -1124,6 +1154,14 @@ die "binlog cache reset must avoid the warmcopy mutex when no mirror is installe
   unless $binlog_cache_reset =~ /lease->active\s*\(\s*\)/s &&
          index($binlog_cache_reset, 'lease->active') <
          index($binlog_cache_reset, 'std::lock_guard');
+die "binlog cache reset must preserve the lease-null native fast return\n"
+  unless $binlog_cache_reset =~
+         /if\s*\(\s*lease\s*==\s*nullptr\s*\)\s*return\s+m_file\.reset\s*\(\s*\)/s &&
+         index($binlog_cache_reset, 'lease == nullptr') <
+         index($binlog_cache_reset, 'preserve_trx_is_enabled');
+die "inactive-mirror reset generation must be isolated by preserve_trx_enable\n"
+  unless $binlog_cache_reset =~
+         /if\s*\(\s*!source_error\s*&&\s*preserve_trx_is_enabled\s*\(\s*\)\s*\)[\s\S]{0,160}m_truncate_generation\.fetch_add/s;
 
 die "temp dirty-page hook must test active source-space before per-space admission-close checks\n"
   unless $temp_stage_dirty_page =~

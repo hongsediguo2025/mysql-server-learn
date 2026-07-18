@@ -541,6 +541,9 @@ class Preserve_trx_prepared_token_registry {
   Preserve_trx_prepared_status bind_final_facts(
       const Preserve_trx_prepared_token_key &key,
       uint64_t expected_generation, Preserve_trx_final_token_facts facts);
+  Preserve_trx_prepared_status update_epoch_prepare_deadline(
+      const std::string &source_uuid, const std::string &epoch_id,
+      size_t expected_token_count, uint64_t deadline_monotonic_us);
   Preserve_trx_prepared_status mark_ready_for_gate(
       const Preserve_trx_prepared_token_key &key,
       uint64_t expected_generation);

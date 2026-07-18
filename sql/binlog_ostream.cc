@@ -34,6 +34,7 @@
 #include "mysql/psi/mysql_file.h"
 #include "mysqld_error.h"
 #include "sql/mysqld.h"
+#include "sql/preserve_trx.h"
 #include "sql/rpl_log_encryption.h"
 #include "sql/sql_class.h"
 
@@ -386,7 +387,8 @@ bool Binlog_cache_storage::install_warmcopy_mirror_if_absent(
   }
   if (length != nullptr) *length = m_file.length();
   if (truncate_generation != nullptr)
-    *truncate_generation = m_truncate_generation;
+    *truncate_generation =
+        m_truncate_generation.load(std::memory_order_relaxed);
   if (current_lease->install_if_absent(mirror)) return true;
   if (lease != nullptr) *lease = current_lease;
   return false;
@@ -406,8 +408,7 @@ bool Binlog_cache_storage::warmcopy_mirror_active() const {
 }
 
 uint64_t Binlog_cache_storage::truncate_generation() const {
-  std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
-  return m_truncate_generation;
+  return m_truncate_generation.load(std::memory_order_relaxed);
 }
 
 bool Binlog_cache_storage::write(const unsigned char *buffer,
@@ -446,9 +447,17 @@ bool Binlog_cache_storage::write(const unsigned char *buffer,
 bool Binlog_cache_storage::truncate(my_off_t offset) {
   auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
                                          std::memory_order_acquire);
-  if (lease == nullptr || !lease->active()) {
+  if (lease == nullptr) {
     if (m_pipeline_head == nullptr) return true;
     return m_pipeline_head->truncate(offset);
+  }
+  if (!lease->active()) {
+    if (m_pipeline_head == nullptr) return true;
+    const bool source_error = m_pipeline_head->truncate(offset);
+    if (!source_error && preserve_trx_is_enabled()) {
+      m_truncate_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+    return source_error;
   }
 
   std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
@@ -459,7 +468,7 @@ bool Binlog_cache_storage::truncate(my_off_t offset) {
   const bool source_error = m_pipeline_head->truncate(offset);
   if (source_error) return true;
 
-  ++m_truncate_generation;
+  m_truncate_generation.fetch_add(1, std::memory_order_relaxed);
   if (lease != nullptr && lease->active() &&
       lease->truncate(static_cast<uint64_t>(offset)) ==
           Binlog_warmcopy_mirror_status::ERROR) {
@@ -471,8 +480,13 @@ bool Binlog_cache_storage::truncate(my_off_t offset) {
 bool Binlog_cache_storage::reset() {
   auto lease = std::atomic_load_explicit(&m_warmcopy_lease,
                                          std::memory_order_acquire);
-  if (lease == nullptr || !lease->active()) {
-    return m_file.reset();
+  if (lease == nullptr) return m_file.reset();
+  if (!lease->active()) {
+    const bool source_error = m_file.reset();
+    if (!source_error && preserve_trx_is_enabled()) {
+      m_truncate_generation.fetch_add(1, std::memory_order_relaxed);
+    }
+    return source_error;
   }
 
   std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
@@ -481,7 +495,7 @@ bool Binlog_cache_storage::reset() {
   const bool source_error = m_file.reset();
   if (source_error) return true;
 
-  ++m_truncate_generation;
+  m_truncate_generation.fetch_add(1, std::memory_order_relaxed);
   if (lease != nullptr && lease->active()) lease->note_non_lifecycle_reset();
   return false;
 }
@@ -496,14 +510,16 @@ bool Binlog_cache_storage::copy_range_to(
     return true;
   }
   std::lock_guard<std::mutex> lock(m_warmcopy_mutex);
-  if (expected_truncate_generation != m_truncate_generation) {
+  if (expected_truncate_generation !=
+      m_truncate_generation.load(std::memory_order_relaxed)) {
     if (stale_generation != nullptr) *stale_generation = true;
     return true;
   }
 
   if (m_file.copy_range_to(offset, length, ostream)) return true;
 
-  if (expected_truncate_generation != m_truncate_generation) {
+  if (expected_truncate_generation !=
+      m_truncate_generation.load(std::memory_order_relaxed)) {
     if (stale_generation != nullptr) *stale_generation = true;
     return true;
   }

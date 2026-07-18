@@ -689,6 +689,83 @@ TEST(PreservedTrxPreparedRegistry, PrewarmResourcesWaitForFinalFacts) {
 }
 
 TEST(PreservedTrxPreparedRegistry,
+     EpochDeadlineUpdateUsesOneAbsoluteDeadline) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto first_key = make_prepared_token_key(1);
+  first_key.token = "17";
+  auto second_key = first_key;
+  second_key.token = "18";
+
+  for (const auto *key : {&first_key, &second_key}) {
+    Preserve_trx_prepare_lease prepare;
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.begin_prepare(*key, key->generation, &prepare));
+    auto facts = make_final_token_facts(100);
+    facts.epoch_prepare_deadline_us = 10000;
+    facts.canonical_digest.clear();
+    ASSERT_TRUE(preserved_trx_finalize_token_facts(&facts));
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.publish_ready(&prepare, std::move(facts),
+                                     acquire_prepared_resources(*key)));
+  }
+
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.update_epoch_prepare_deadline(
+                first_key.source_uuid, first_key.epoch_id, 2, 32000));
+  for (const auto *key : {&first_key, &second_key}) {
+    Preserve_trx_prepared_token_snapshot snapshot;
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.snapshot(*key, &snapshot));
+    EXPECT_EQ(32000U, snapshot.facts.epoch_prepare_deadline_us);
+    EXPECT_FALSE(snapshot.facts.canonical_digest.empty());
+  }
+
+  registry.purge_epoch(first_key.source_uuid, first_key.epoch_id);
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry,
+     EpochDeadlineUpdateRequiresCompleteTokenSet) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  key.token = "17";
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, key.generation, &prepare));
+  auto facts = make_final_token_facts(100);
+  facts.epoch_prepare_deadline_us = 10000;
+  facts.canonical_digest.clear();
+  ASSERT_TRUE(preserved_trx_finalize_token_facts(&facts));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&prepare, std::move(facts),
+                                   acquire_prepared_resources(key)));
+
+  EXPECT_EQ(Preserve_trx_prepared_status::INVALID_STATE,
+            registry.update_epoch_prepare_deadline(
+                key.source_uuid, key.epoch_id, 2, 32000));
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(10000U, snapshot.facts.epoch_prepare_deadline_us);
+
+  const Preserve_trx_prepared_expire_result expired =
+      registry.expire_once(10000);
+  EXPECT_EQ(1U, expired.ready_expired);
+  EXPECT_EQ(Preserve_trx_prepared_status::INVALID_STATE,
+            registry.update_epoch_prepare_deadline(
+                key.source_uuid, key.epoch_id, 1, 32000));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::NOT_READY, snapshot.state);
+  EXPECT_EQ(10000U, snapshot.facts.epoch_prepare_deadline_us);
+
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry,
      StrictResourcesRetainResurrectionEntryThroughGateLease) {
   preserve_trx_resource_manager_reset_for_unit_test();
   Preserve_trx_prepared_token_registry registry;
@@ -7282,7 +7359,7 @@ class PreserveSnapshotTest : public ::testing::Test {
   publish_test_accepted_epoch(
       Preserve_trx_transfer_receiver_registry *registry,
       const std::string &epoch_id, uint64_t token, uint64_t now_us,
-      uint64_t prewarm_timeout_ms) {
+      uint64_t prewarm_timeout_ms, bool flat_projection_published = false) {
     Preserve_trx_transfer_manifest manifest;
     manifest.epoch_id = epoch_id;
     manifest.source_server_uuid = "source-uuid";
@@ -7307,7 +7384,7 @@ class PreserveSnapshotTest : public ::testing::Test {
     EXPECT_EQ(Preserve_trx_transfer_status::OK,
               registry->publish_accepted_epoch(
                   m_dir, fact, "receiver-generation", now_us,
-                  prewarm_timeout_ms));
+                  prewarm_timeout_ms, flat_projection_published));
     return fact;
   }
 
@@ -14237,10 +14314,16 @@ TEST_F(PreserveSnapshotTest,
 
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             registry.mark_accepted_epoch_ready(m_dir, "epoch-lifecycle", 2000,
-                                               30));
+                                               32000));
   ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
             registry.query_accepted_epoch(m_dir, "epoch-lifecycle", &accepted));
   EXPECT_EQ(Preserve_trx_transfer_epoch_lifecycle::READY, accepted.lifecycle);
+  EXPECT_EQ(32000U, accepted.deadline_monotonic_us);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.mark_accepted_epoch_ready(m_dir, "epoch-lifecycle", 3000,
+                                               42000));
+  ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(m_dir, "epoch-lifecycle", &accepted));
   EXPECT_EQ(32000U, accepted.deadline_monotonic_us);
 
   std::vector<Preserve_trx_transfer_accepted_epoch> expired;
@@ -14265,7 +14348,7 @@ TEST_F(PreserveSnapshotTest,
   publish_test_accepted_epoch(&registry, "epoch-status-leased", 907, 1000, 10);
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             registry.mark_accepted_epoch_ready(
-                m_dir, "epoch-status-leased", 2000, 30));
+                m_dir, "epoch-status-leased", 2000, 32000));
   ASSERT_EQ(Preserve_trx_receiver_promotion_lease_status::ACQUIRED,
             registry.try_acquire_accepted_epoch_promotion_lease(
                 m_dir, "epoch-status-leased", 3000));
@@ -14288,7 +14371,8 @@ TEST_F(PreserveSnapshotTest, AcceptedEpochPromotionLeasePreventsExpiry) {
   Preserve_trx_transfer_receiver_registry registry;
   publish_test_accepted_epoch(&registry, "epoch-lease", 902, 1000, 10);
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
-            registry.mark_accepted_epoch_ready(m_dir, "epoch-lease", 2000, 30));
+            registry.mark_accepted_epoch_ready(m_dir, "epoch-lease", 2000,
+                                               32000));
   EXPECT_EQ(Preserve_trx_receiver_promotion_lease_status::ACQUIRED,
             registry.try_acquire_accepted_epoch_promotion_lease(
                 m_dir, "epoch-lease", 3000));
@@ -14329,7 +14413,7 @@ TEST_F(PreserveSnapshotTest, AcceptedEpochReadyAndExpiryCannotBothWin) {
       while (!start.load(std::memory_order_acquire)) {
       }
       ready_status = registry.mark_accepted_epoch_ready(
-          m_dir, "epoch-ready-expiry-race", 100500, 30);
+          m_dir, "epoch-ready-expiry-race", 100500, 130500);
     });
     std::thread expire([&] {
       while (!start.load(std::memory_order_acquire)) {
@@ -14373,6 +14457,36 @@ TEST_F(PreserveSnapshotTest,
                 NOT_FOUND_OR_EXPIRED,
             registry.try_acquire_accepted_epoch_promotion_lease(
                 m_dir, "epoch-expiry-cleanup", 11001));
+}
+
+TEST_F(PreserveSnapshotTest,
+       StrictReceiverEpochExpiryPreservesUnownedFlatArtifact) {
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string token = "1905";
+  write_file(m_dir + token + ".bin", "unowned-flat-artifact");
+  publish_test_accepted_epoch(&registry, "strict-epoch-expiry", 1905, 1000,
+                              10, false);
+
+  preserve_trx_transfer_receiver_reaper_scan_for_unit_test(11000, &registry);
+
+  MY_STAT stat_area;
+  EXPECT_NE(nullptr,
+            my_stat((m_dir + token + ".bin").c_str(), &stat_area, MYF(0)));
+}
+
+TEST_F(PreserveSnapshotTest,
+       LegacyReceiverEpochExpiryRemovesOwnedFlatArtifact) {
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string token = "1906";
+  write_file(m_dir + token + ".bin", "owned-flat-artifact");
+  publish_test_accepted_epoch(&registry, "legacy-epoch-expiry", 1906, 1000,
+                              10, true);
+
+  preserve_trx_transfer_receiver_reaper_scan_for_unit_test(11000, &registry);
+
+  MY_STAT stat_area;
+  EXPECT_EQ(nullptr,
+            my_stat((m_dir + token + ".bin").c_str(), &stat_area, MYF(0)));
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -19999,6 +20113,57 @@ TEST(PreservedTrxTransfer,
                 "epoch-applied-failure", 1, 1000));
 }
 
+TEST(PreservedTrxTransfer,
+     TransferReceiverSuccessfulRetryClearsPriorApplyFailure) {
+  Preserve_trx_transfer_receiver_registry registry;
+  Preserve_trx_transfer_sequence_admission admission;
+  const auto digest = test_sha256("retry-frame");
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.admit_frame_sequence("epoch-retry-success", 1, digest,
+                                          &admission));
+  registry.mark_frame_sequence_apply_failed(
+      "epoch-retry-success", 1,
+      Preserve_trx_transfer_status::RESOURCE_EXHAUSTED);
+  ASSERT_EQ(Preserve_trx_transfer_status::RESOURCE_EXHAUSTED,
+            registry.wait_for_frame_sequence_applied_through(
+                "epoch-retry-success", 1, 1000));
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.admit_frame_sequence("epoch-retry-success", 1, digest,
+                                          &admission));
+  ASSERT_EQ(Preserve_trx_transfer_sequence_admission::RETRY_PENDING,
+            admission);
+  registry.mark_frame_sequence_applied("epoch-retry-success", 1);
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            registry.wait_for_frame_sequence_applied_through(
+                "epoch-retry-success", 1, 1000));
+}
+
+TEST(PreservedTrxTransfer,
+     TransferReceiverSuccessfulRetryExposesNextUnresolvedFailure) {
+  Preserve_trx_transfer_receiver_registry registry;
+  Preserve_trx_transfer_sequence_admission admission;
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.admit_frame_sequence("epoch-retry-next-failure", 1,
+                                          test_sha256("retry-frame-1"),
+                                          &admission));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.admit_frame_sequence("epoch-retry-next-failure", 2,
+                                          test_sha256("retry-frame-2"),
+                                          &admission));
+  registry.mark_frame_sequence_apply_failed(
+      "epoch-retry-next-failure", 1,
+      Preserve_trx_transfer_status::RESOURCE_EXHAUSTED);
+  registry.mark_frame_sequence_apply_failed(
+      "epoch-retry-next-failure", 2,
+      Preserve_trx_transfer_status::IO_ERROR);
+
+  registry.mark_frame_sequence_applied("epoch-retry-next-failure", 1);
+  EXPECT_EQ(Preserve_trx_transfer_status::IO_ERROR,
+            registry.wait_for_frame_sequence_applied_through(
+                "epoch-retry-next-failure", 2, 1000));
+}
+
 TEST_F(PreserveSnapshotTest, TransferReceiverShortSpoolWriteRollsBackTail) {
   Transfer_codec_context_guard codec_guard;
   Transfer_receiver_config_guard receiver_config;
@@ -24546,6 +24711,15 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(snapshot.cache_payload.size(),
             strict_snapshot.facts.binlog_cache_length);
   EXPECT_TRUE(strict_snapshot.facts.binlog_cache_file_backed);
+  Preserve_trx_transfer_accepted_epoch accepted;
+  ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(
+                m_dir, "epoch-native-binlog-ready", &accepted));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_lifecycle::READY,
+            accepted.lifecycle);
+  EXPECT_NE(0U, accepted.deadline_monotonic_us);
+  EXPECT_EQ(accepted.deadline_monotonic_us,
+            strict_snapshot.facts.epoch_prepare_deadline_us);
   EXPECT_GT(preserve_trx_receiver_lock_plan_capacity_bytes_status(), 0U);
   EXPECT_GT(preserve_trx_receiver_lock_plan_epoch_peak_bytes_status(), 0U);
   EXPECT_GT(preserve_trx_receiver_lock_plan_subpool_cap_bytes_status(), 0U);

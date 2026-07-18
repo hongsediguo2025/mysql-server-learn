@@ -63,6 +63,11 @@ SET DEBUG_SYNC = 'now SIGNAL lock_wc_interrupt_continue';
 --connection lock_wc_interrupt_ha
 SELECT COUNT(*) AS preserved_count_after_kill_query
   FROM performance_schema.preserved_transactions;
+--disable_query_log
+--disable_result_log
+RESET DRAIN;
+--enable_result_log
+--enable_query_log
 
 --connection lock_wc_interrupt_app
 ROLLBACK;
@@ -98,6 +103,11 @@ SET DEBUG_SYNC = 'now SIGNAL lock_wc_interrupt_conn_continue';
 --connection lock_wc_interrupt_ha
 SELECT COUNT(*) AS preserved_count_after_kill_connection
   FROM performance_schema.preserved_transactions;
+--disable_query_log
+--disable_result_log
+RESET DRAIN;
+--enable_result_log
+--enable_query_log
 
 --connection lock_wc_interrupt_app_conn
 ROLLBACK;
@@ -236,6 +246,11 @@ ROLLBACK;
 --connection lock_wc_interrupt_ha_after_sigterm
 SELECT COUNT(*) AS preserved_count_after_lock_wait_interrupt
   FROM performance_schema.preserved_transactions;
+--disable_query_log
+--disable_result_log
+RESET DRAIN;
+--enable_result_log
+--enable_query_log
 
 --connection lock_wc_interrupt_wait_owner
 ROLLBACK;
