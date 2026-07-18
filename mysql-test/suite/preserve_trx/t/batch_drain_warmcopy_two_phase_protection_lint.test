@@ -44,11 +44,12 @@ $admission =~
   /SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_toctou_window TIMEOUT 10';(.*?)SET DEBUG_SYNC = 'now SIGNAL warmcopy_toctou_continue'/s
   or die "could not isolate phase1 admission close window\n";
 my $admission_window = $1;
-die "phase1 admission close guard must block new UPDATE/EXECUTE/FOR UPDATE before batch publish\n"
-  unless $admission_window =~ /--error ER_PRESERVE_TRX_UNSUPPORTED\s+BEGIN/s &&
-         $admission_window =~ /--error ER_PRESERVE_TRX_UNSUPPORTED\s+UPDATE/s &&
-         $admission_window =~ /--error ER_PRESERVE_TRX_UNSUPPORTED\s+EXECUTE/s &&
-         $admission_window =~ /--error ER_PRESERVE_TRX_UNSUPPORTED\s+SELECT[\s\S]*FOR UPDATE/s;
+die "phase1 closing guard must return SESSION_DRAINED for every ordinary command before batch publish\n"
+  unless $admission_window =~ /--error ER_PRESERVE_TRX_SESSION_DRAINED\s+BEGIN/s &&
+         $admission_window =~ /--error ER_PRESERVE_TRX_SESSION_DRAINED\s+UPDATE/s &&
+         $admission_window =~ /--error ER_PRESERVE_TRX_SESSION_DRAINED\s+SET/s &&
+         $admission_window =~ /--error ER_PRESERVE_TRX_SESSION_DRAINED\s+EXECUTE/s &&
+         $admission_window =~ /--error ER_PRESERVE_TRX_SESSION_DRAINED\s+SELECT[\s\S]*FOR UPDATE/s;
 die "phase1 admission close result must keep one preserved transaction and original row values\n"
   unless $admission_result =~ /preserved_count\s+1/s &&
          $admission_result =~ /id\s+v\s+1\s+11\s+2\s+20/s;

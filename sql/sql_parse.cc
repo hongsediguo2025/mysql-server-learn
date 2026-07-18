@@ -1627,6 +1627,15 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
     case Preserve_trx_command_block_result::BLOCK_SESSION_DRAINED:
       my_error(ER_PRESERVE_TRX_SESSION_DRAINED, MYF(0));
       goto done;
+    case Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED:
+      if (command == COM_STMT_SEND_LONG_DATA) {
+        // This protocol packet has no response. Drop it without extending the
+        // prepared statement's parameter buffer; COM_STMT_EXECUTE returns 4020.
+        thd->get_stmt_da()->disable_status();
+        goto done;
+      }
+      my_error(ER_PRESERVE_TRX_SESSION_DRAINED, MYF(0));
+      goto done;
     case Preserve_trx_command_block_result::BLOCK_DRAINING:
       my_error(ER_PRESERVE_TRX_UNSUPPORTED, MYF(0));
       goto done;
@@ -2313,7 +2322,8 @@ done:
 
 */
 
-bool shutdown(THD *thd, enum mysql_enum_shutdown_level level) {
+bool shutdown(THD *thd, enum mysql_enum_shutdown_level level,
+              bool send_response) {
   DBUG_TRACE;
   bool res = false;
   thd->lex->no_write_to_binlog = true;
@@ -2329,7 +2339,7 @@ bool shutdown(THD *thd, enum mysql_enum_shutdown_level level) {
     ;
   }
 
-  my_ok(thd);
+  if (send_response) my_ok(thd);
 
   LogErr(SYSTEM_LEVEL, ER_SERVER_SHUTDOWN_INFO,
          thd->security_context()->user().str, server_version,
@@ -2742,6 +2752,9 @@ int mysql_execute_command(THD *thd, bool first_level) {
     case Preserve_trx_command_block_result::ALLOW:
       break;
     case Preserve_trx_command_block_result::BLOCK_SESSION_DRAINED:
+      my_error(ER_PRESERVE_TRX_SESSION_DRAINED, MYF(0));
+      return 1;
+    case Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED:
       my_error(ER_PRESERVE_TRX_SESSION_DRAINED, MYF(0));
       return 1;
     case Preserve_trx_command_block_result::BLOCK_DRAINING:

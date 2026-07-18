@@ -4,7 +4,16 @@
 
 --disable_warnings
 DROP TABLE IF EXISTS t_batch_all_pending_no_tokens;
+--disable_query_log
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_query_log
 --enable_warnings
+
+--disable_query_log
+CREATE USER preserve_trx_ha_admin@localhost;
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+--enable_query_log
 
 SET GLOBAL preserve_trx_enable=ON;
 
@@ -30,12 +39,14 @@ SET DEBUG_SYNC =
 SET DEBUG_SYNC = 'now WAIT_FOR batch_no_token_a_ready TIMEOUT 10';
 SET DEBUG_SYNC = 'now WAIT_FOR batch_no_token_b_ready TIMEOUT 10';
 
+--connect(batch_no_token_control,localhost,preserve_trx_ha_admin,,test)
+
 --connect(batch_no_token_owner,localhost,root,,test)
 --connection batch_no_token_owner
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
 
---connection default
+--connection batch_no_token_control
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_no_token_a';
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_no_token_b';
 
@@ -63,4 +74,7 @@ SELECT COUNT(*) AS preserved_count
 SELECT * FROM t_batch_all_pending_no_tokens ORDER BY id;
 
 DROP TABLE t_batch_all_pending_no_tokens;
+--disable_query_log
+DROP USER preserve_trx_ha_admin@localhost;
+--enable_query_log
 SET GLOBAL preserve_trx_enable=ON;

@@ -1422,6 +1422,17 @@ die "dispatch_command must run preserve protocol command gate before the protoco
          $protocol_gate_pos < $dispatch_switch_pos &&
          $dispatch_command =~ /ER_PRESERVE_TRX_UNSUPPORTED/s &&
          $dispatch_command =~ /ER_PRESERVE_TRX_SESSION_DRAINED/s;
+die "CLOSING protocol gate must default-deny every command except protocol-defined no-response cleanup\n"
+  unless $protocol_command_gate =~
+         /if\s*\(closing_command_gate_active\)\s*\{\s*if\s*\(preserve_trx_protocol_command_is_no_response_cleanup\(command\)\)\s*return\s+Preserve_trx_command_block_result::ALLOW\s*;\s*return\s+Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED\s*;\s*\}/s;
+$preserve =~
+  /static bool preserve_trx_protocol_command_is_no_response_cleanup\s*\([^\{]*\)\s*\{([\s\S]*?)^}/m
+  or die "could not isolate CLOSING no-response cleanup allowlist\n";
+my $closing_cleanup_allowlist = $&;
+die "CLOSING no-response cleanup allowlist must contain only COM_QUIT and COM_STMT_CLOSE\n"
+  unless $closing_cleanup_allowlist =~ /COM_QUIT/s &&
+         $closing_cleanup_allowlist =~ /COM_STMT_CLOSE/s &&
+         $closing_cleanup_allowlist !~ /COM_STMT_SEND_LONG_DATA/s;
 
 $preserve =~ /static bool recover_preserved_snapshot[\s\S]*?^}/m
   or die "could not isolate recover_preserved_snapshot\n";
@@ -1781,14 +1792,20 @@ die "preserve kernel must not register pending token delivery\n"
 $preserve =~ /class Preserve_batch_quiesced_idle_target[\s\S]*?^};/m
   or die "could not isolate Preserve_batch_quiesced_idle_target\n";
 my $quiesced_target = $&;
-die "batch target early errors must clear QUIESCED/ATTACHING state\n"
+die "batch target early errors must defer QUIESCED/ATTACHING cleanup\n"
   unless $quiesced_target =~ /clear_target_after_error/s &&
-         $quiesced_target =~ /preserve_trx_is_unsupported_common_context\(candidate\)[\s\S]*clear_target_after_error\(candidate\)[\s\S]*return/s &&
-         $quiesced_target =~ /!switch_thd\.active\(\)[\s\S]*clear_target_after_error\(candidate\)[\s\S]*return/s;
+         $quiesced_target =~
+         /preserve_trx_is_unsupported_common_context\(candidate\)[\s\S]*early_target_error\s*=\s*true/s &&
+         $quiesced_target =~
+         /if\s*\(\s*early_target_error\s*\)[\s\S]*clear_target_after_error\(candidate\)[\s\S]*return/s;
 
 my $switch_pos = index($quiesced_target, 'Preserve_thd_context_switch switch_thd');
 die "could not find batch target context-switch scope\n" if $switch_pos < 0;
-my $scope_start = rindex(substr($quiesced_target, 0, $switch_pos), '{');
+my $retry_loop_pos = rindex(substr($quiesced_target, 0, $switch_pos),
+                           'for (;;)');
+die "could not find batch target context-switch retry loop\n"
+  if $retry_loop_pos < 0;
+my $scope_start = index($quiesced_target, '{', $retry_loop_pos);
 die "could not find batch target context-switch scope start\n"
   if $scope_start < 0;
 my $depth = 0;
@@ -1806,9 +1823,12 @@ die "could not find batch target context-switch scope end\n" if $scope_end < 0;
 my $switch_scope = substr($quiesced_target, $scope_start, $scope_end - $scope_start + 1);
 die "batch target must not clear state while THD globals are switched\n"
   if $switch_scope =~ /clear_target_after_error\s*\(/s;
-die "batch target ATTACHING failures must defer state clear until after globals restore\n"
-  unless $switch_scope =~ /!switch_thd\.active\(\)[\s\S]*early_target_error\s*=\s*true/s &&
-         $switch_scope =~ /preserve_trx_is_unsupported_common_context\(candidate\)[\s\S]*early_target_error\s*=\s*true/s;
+die "batch target busy context switch must retry without clearing state\n"
+  unless $switch_scope =~
+         /!switch_thd\.active\(\)[\s\S]*my_sleep\s*\(\s*1000\s*\)[\s\S]*continue/s;
+die "batch target unsupported context must defer state clear until after globals restore\n"
+  unless $switch_scope =~
+         /preserve_trx_is_unsupported_common_context\(candidate\)[\s\S]*early_target_error\s*=\s*true/s;
 my $after_switch_scope = substr($quiesced_target, $scope_end + 1);
 die "batch target deferred ATTACHING failures must clear after context-switch scope\n"
   unless $after_switch_scope =~ /if\s*\(\s*early_target_error\s*\)[\s\S]*clear_target_after_error\s*\(\s*candidate\s*\)[\s\S]*return/s;
@@ -2855,6 +2875,42 @@ die "standby transfer design doc must not claim production HA promotion is compl
          /当前实现状态[\s\S]*source transport[\s\S]*fail-closed/s ||
          $standby_transfer_doc =~
          /真实物理备机升主[\s\S]*不在/s;
+die "CLOSING HA identity must use the authenticated dedicated account rather than root, roles, or a generic dynamic privilege\n"
+  unless $preserve =~
+         /static bool preserve_trx_is_ha_admin_account\s*\([\s\S]{0,500}preserve_trx_ha_admin/s &&
+         $preserve =~
+         /static bool preserve_trx_is_ha_admin_account\s*\([\s\S]{0,800}priv_user\(\)/s &&
+         $preserve =~
+         /static bool preserve_trx_is_ha_control_connection\s*\([\s\S]{0,500}preserve_trx_is_ha_admin_account\(thd\)[\s\S]{0,500}SHUTDOWN_ACL/s;
+die "CLOSING HA identity must not depend on active role state\n"
+  if $preserve =~
+     /static bool preserve_trx_is_ha_admin_account\s*\([\s\S]{0,1000}get_active_roles\(\)/s;
+die "CLOSING HA identity must not infer control identity from a registered PRESERVE_TRX_HA_ADMIN dynamic privilege\n"
+  if $preserve =~ /has_global_grant[\s\S]{0,200}PRESERVE_TRX_HA_ADMIN/s;
+die "RESET DRAIN must require the dedicated HA account before its native SHUTDOWN authorization check\n"
+  unless $preserve =~
+         /static bool preserve_trx_execute_reset_drain\s*\([^\{]*\)\s*\{[\s\S]{0,500}!preserve_trx_is_ha_admin_account\(thd\)[\s\S]{0,500}check_global_access\(thd, SHUTDOWN_ACL\)/s;
+die "CLOSING protocol admission must not depend on parsing RESET or other SQL text\n"
+  if $preserve =~ /preserve_trx_is_ha_control_connection\s*\([^\)]*\)[\s\S]{0,240}SQLCOM_RESET_DRAIN/s;
+$preserve =~
+  /bool preserved_trx_mark_inflight_command_packet\s*\([^\{]*\)\s*\{([\s\S]*?)^}/m
+  or die "could not isolate Preserve command packet marker\n";
+my $command_packet_marker = $&;
+my $marker_enable = index($command_packet_marker,
+                          '!preserve_trx_is_enabled()');
+my $marker_clock = index($command_packet_marker,
+                         'preserve_trx_monotonic_us()');
+my $marker_lock = index($command_packet_marker, 'LOCK_thd_data');
+my $marker_sequence = index($command_packet_marker,
+                            'preserve_trx_command_sequence');
+my $marker_started = index($command_packet_marker,
+                           'preserve_trx_command_started_monotonic_us');
+die "Preserve command identity must keep the OFF path ahead of clock, THD lock, and field writes\n"
+  unless $marker_enable >= 0 &&
+         $marker_clock > $marker_enable &&
+         $marker_lock > $marker_clock &&
+         $marker_sequence > $marker_lock &&
+         $marker_started > $marker_lock;
 EOF
 
 SELECT 'ok' AS code_review_resumable_trx_slices_lint;

@@ -71,9 +71,17 @@ NECESSARY_INTEGRATION_POINTS = {
     ),
     "sql/preserve_trx.h": "sysvar/status declarations only",
     "sql/preserve_trx_kernel.h": "artifact pointer handoff only",
+    "sql/preserve_trx_transfer.cc": (
+        "transfer protocol implementation and Debug Sync/fault-injection hooks "
+        "only; no native SQL or InnoDB policy"
+    ),
     "sql/sql_parse.cc": (
         "command-boundary adapter calls only; no preserve state machine or "
         "local guard implementation"
+    ),
+    "sql/sql_parse.h": (
+        "existing SQL dispatch declarations only; no Preserve/Resume state or "
+        "policy"
     ),
     "sql/sql_rewrite.cc": (
         "rewrite dispatch adapter only; Preserve/Resume raw token parsing and "

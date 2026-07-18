@@ -4,7 +4,16 @@
 
 --disable_warnings
 DROP TABLE IF EXISTS t_batch_disconnect;
+--disable_query_log
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_query_log
 --enable_warnings
+
+--disable_query_log
+CREATE USER preserve_trx_ha_admin@localhost;
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+--enable_query_log
 
 SET GLOBAL preserve_trx_enable=ON;
 
@@ -16,6 +25,13 @@ SET DEBUG_SYNC =
   'preserve_trx_batch_after_one_target_preserved SIGNAL batch_disconnect_paused WAIT_FOR continue_batch_disconnect';
 START TRANSACTION;
 INSERT INTO t_batch_disconnect VALUES(1,10);
+--let $batch_disconnect_app_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+
+--connection default
+--let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_ID=$batch_disconnect_app_id AND PROCESSLIST_COMMAND='Sleep'
+--source include/wait_condition.inc
+
+--connect(batch_disconnect_control,localhost,preserve_trx_ha_admin,,test)
 
 --connect(batch_disconnect_owner,localhost,root,,test)
 --connection batch_disconnect_owner
@@ -23,7 +39,7 @@ SET DEBUG_SYNC =
   'preserve_trx_batch_after_one_target_preserved SIGNAL batch_disconnect_paused WAIT_FOR continue_batch_disconnect';
 --send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
 
---connection default
+--connection batch_disconnect_control
 --disable_warnings
 SET DEBUG_SYNC = 'now WAIT_FOR batch_disconnect_paused TIMEOUT 1';
 --enable_warnings
@@ -31,7 +47,7 @@ SET DEBUG_SYNC = 'now WAIT_FOR batch_disconnect_paused TIMEOUT 1';
 --connection batch_disconnect_app
 --dirty_close batch_disconnect_app
 
---connection default
+--connection batch_disconnect_control
 --sleep 1
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_disconnect';
@@ -56,4 +72,7 @@ COMMIT;
 SELECT * FROM t_batch_disconnect;
 
 DROP TABLE t_batch_disconnect;
+--disable_query_log
+DROP USER preserve_trx_ha_admin@localhost;
+--enable_query_log
 SET GLOBAL preserve_trx_enable=ON;

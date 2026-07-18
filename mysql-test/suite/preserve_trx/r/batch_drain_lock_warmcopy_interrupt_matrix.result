@@ -105,10 +105,10 @@ DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_interrupt_wait_closing TIMEOUT 10';
 KILL QUERY WAIT_CONN_ID;
 ERROR 70100: Query execution was interrupted
-ROLLBACK;
 KILL QUERY DRAIN_CONN_ID;
 SET DEBUG_SYNC = 'now SIGNAL lock_wc_interrupt_wait_continue';
 ERROR HY000: Resumable transactions across shutdown do not support this operation
+ROLLBACK;
 SELECT COUNT(*) AS preserved_count_after_lock_wait_interrupt
 FROM performance_schema.preserved_transactions;
 preserved_count_after_lock_wait_interrupt

@@ -11,7 +11,7 @@ DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SET DEBUG_SYNC = 'now WAIT_FOR batch_preserve_paused TIMEOUT 1';
 SELECT 1;
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_preserve';
-ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ERROR HY000: Preserve drain is active; this command was not executed
 RESUME PRESERVED TRANSACTION 'TOKEN';
 UPDATE t_batch_blocked SET b=11 WHERE a=1;
 COMMIT;

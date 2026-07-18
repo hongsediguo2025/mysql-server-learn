@@ -22,12 +22,12 @@ SELECT COUNT(*) AS skip_locked_rows
 FROM t_lock_warmcopy_conversion_nowait
 WHERE id=2
 FOR UPDATE SKIP LOCKED;
-ERROR HY000: Resumable transactions across shutdown do not support this operation
+ERROR HY000: Preserve drain is active; this command was not executed
 SELECT id
 FROM t_lock_warmcopy_conversion_nowait
 WHERE id=2
 FOR UPDATE NOWAIT;
-ERROR HY000: Resumable transactions across shutdown do not support this operation
+ERROR HY000: Preserve drain is active; this command was not executed
 SET DEBUG_SYNC = 'now SIGNAL lock_wc_conversion_nowait_continue';
 include/assert_grep.inc [lock warmcopy succeeds after conversion command barrier]
 SELECT COUNT(*) AS preserved_count_after_conversion_command_barrier

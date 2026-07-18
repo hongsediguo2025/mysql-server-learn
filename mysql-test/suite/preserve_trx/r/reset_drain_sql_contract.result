@@ -1,4 +1,8 @@
 RESET DRAIN;
+ERROR 42000: Access denied; you need (at least one of) the PRESERVE_TRX_HA_ADMIN account privilege(s) for this operation
+CREATE USER preserve_trx_ha_admin@localhost;
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+RESET DRAIN;
 SELECT @@GLOBAL.preserve_trx_transfer_receiver_prewarm_timeout_ms;
 @@GLOBAL.preserve_trx_transfer_receiver_prewarm_timeout_ms
 10000
@@ -57,6 +61,8 @@ RESET DRAIN;
 ERROR HY000: Invalid preserved transaction state
 ROLLBACK;
 CREATE USER preserve_reset_denied@localhost;
+GRANT SHUTDOWN ON *.* TO preserve_reset_denied@localhost;
 RESET DRAIN;
-ERROR 42000: Access denied; you need (at least one of) the SHUTDOWN privilege(s) for this operation
+ERROR 42000: Access denied; you need (at least one of) the PRESERVE_TRX_HA_ADMIN account privilege(s) for this operation
 DROP USER preserve_reset_denied@localhost;
+DROP USER preserve_trx_ha_admin@localhost;

@@ -1,0 +1,103 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+
+--let $credential_file= $MYSQL_TMP_DIR/closing-timeout-abort-failure.secret
+--write_file $credential_file
+closing-timeout-abort-failure-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS closing_abort_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'closing-timeout-abort-failure-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+CREATE USER closing_abort_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO closing_abort_app@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO closing_abort_app@localhost;
+
+--let $source_uuid= query_get_value(SELECT @@GLOBAL.server_uuid AS uuid, uuid, 1)
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-receiver-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-allowed-source-uuid=$source_uuid --preserve-trx-transfer-target-server-uuid=$source_uuid --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=closing_timeout_abort_failure --preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=OFF;
+SET GLOBAL preserve_trx_transfer_phase1_timeout_ms=200;
+SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=100;
+SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=OFF;
+SET GLOBAL debug='+d,preserve_trx_transfer_fail_abort_token';
+
+--disable_warnings
+DROP TABLE IF EXISTS t_closing_timeout_abort_failure;
+--enable_warnings
+CREATE TABLE t_closing_timeout_abort_failure(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_closing_timeout_abort_failure VALUES(1,10);
+
+--connect(closing_abort_timeout,localhost,closing_abort_app,,test)
+START TRANSACTION;
+UPDATE t_closing_timeout_abort_failure SET v=11 WHERE id=1;
+SET DEBUG_SYNC=
+  'before_execute_sql_command SIGNAL closing_abort_command_running WAIT_FOR closing_abort_command_continue';
+--send SELECT 1 AS old_command_completed
+
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR closing_abort_command_running TIMEOUT 10';
+--sleep 0.2
+
+--connection default
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+
+--connection default
+SELECT VARIABLE_VALUE=0 AS no_active_epoch
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs';
+SELECT VARIABLE_VALUE+0 >= 1 AS uncommitted_receiver_state_only
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_inflight_tokens';
+SELECT VARIABLE_VALUE=0 AS no_saved_receiver_token
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_saved_online_tokens';
+SELECT VARIABLE_VALUE=1 AS timeout_detected
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_closing_command_timed_out_count';
+SELECT VARIABLE_VALUE=0 AS no_exclusion_without_abort_ack
+  FROM performance_schema.global_status
+ WHERE VARIABLE_NAME='Preserve_trx_closing_excluded_tokens';
+
+SET DEBUG_SYNC='now SIGNAL closing_abort_command_continue';
+--connection closing_abort_timeout
+--reap
+ROLLBACK;
+
+--connection default
+SELECT * FROM t_closing_timeout_abort_failure;
+SET GLOBAL debug='-d,preserve_trx_transfer_fail_abort_token';
+DROP TABLE t_closing_timeout_abort_failure;
+DROP USER preserve_trx_ha_admin@localhost;
+DROP USER closing_abort_app@localhost;
+SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=ON;
+SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=1000;
+SET GLOBAL preserve_trx_transfer_phase1_timeout_ms=600000;
+SET GLOBAL preserve_trx_lock_warmcopy_enable=ON;
+SET DEBUG_SYNC='RESET';
+--remove_file $credential_file
+
+--enable_query_log

@@ -414,6 +414,9 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_reset_drain_wins,
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_reset_drain_too_late,
                               preserve_trx_reset_drain_too_late_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_closing_control_connection_commands,
+    preserve_trx_closing_control_connection_commands_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_lock_warmcopy_attempts,
     preserve_trx_lock_warmcopy_attempts_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
@@ -441,6 +444,49 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_total_us,
                               preserve_trx_phase2_total_us_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_target_wait_us,
                               preserve_trx_phase2_target_wait_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase1_readiness_samples,
+                              preserve_trx_phase1_readiness_samples_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_phase1_readiness_inflight_commands,
+    preserve_trx_phase1_readiness_inflight_commands_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_phase1_readiness_oldest_command_age_us,
+    preserve_trx_phase1_readiness_oldest_command_age_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_phase1_readiness_offender_count,
+    preserve_trx_phase1_readiness_offender_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase1_readiness_wait_us,
+                              preserve_trx_phase1_readiness_wait_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_closing_started_monotonic_us,
+    preserve_trx_closing_started_monotonic_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_closing_command_effective_budget_us,
+    preserve_trx_closing_command_effective_budget_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_closing_command_wait_us,
+                              preserve_trx_closing_command_wait_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_closing_command_timed_out_count,
+    preserve_trx_closing_command_timed_out_count_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_closing_command_deadline_clamped,
+    preserve_trx_closing_command_deadline_clamped_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_closing_inflight_commands,
+    preserve_trx_closing_inflight_commands_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_closing_completed_before_deadline,
+    preserve_trx_closing_completed_before_deadline_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_closing_excluded_tokens,
+    preserve_trx_closing_excluded_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_closing_last_excluded_token,
+    preserve_trx_closing_last_excluded_token_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_transfer_tail_us,
+                              preserve_trx_phase2_transfer_tail_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_closing_to_final_ack_us,
+                              preserve_trx_closing_to_final_ack_us_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(
     show_preserve_trx_phase2_participant_prepare_us,
     preserve_trx_phase2_participant_prepare_us_status())

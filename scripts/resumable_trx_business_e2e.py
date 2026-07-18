@@ -61,6 +61,7 @@ EVIDENCE_KIND_STANDALONE_TRANSFER_RESET_E2E = (
     "STANDALONE_TRANSFER_RESET_E2E"
 )
 EVIDENCE_KIND_WARM_GATE_SIMULATOR = "WARM_GATE_SIMULATOR"
+PRESERVE_TRX_HA_ADMIN_USER = "preserve_trx_ha_admin"
 
 
 def _evidence_contract(evidence_kind: str) -> Dict[str, object]:
@@ -572,6 +573,7 @@ class HarnessConfig:
     inflight_drain_probe: bool = False
     inflight_probe_min_waits: int = 1
     inflight_probe_timeout_s: int = 5
+    shutdown_gap_replay_probe: bool = False
     large_binlog_cache_sessions: int = 0
     large_binlog_cache_buckets_mb: List[int] = dataclasses.field(default_factory=list)
     artifact_dir: Optional[str] = None
@@ -612,6 +614,7 @@ class HarnessConfig:
     receiver_restart_command: Optional[str] = None
     receiver_physical_copy_before_drain: bool = False
     standalone_transfer_accept_committed_not_ready: bool = False
+    standby_transfer_timeout_exclusion: bool = False
     reset_drain_phase: str = "both"
     receiver_read_load_threads: int = 0
     receiver_read_load_baseline_s: float = 0.0
@@ -642,11 +645,46 @@ class HarnessConfig:
             raise ValueError("sessions must be positive")
         if self.table_count <= 0:
             raise ValueError("table_count must be positive")
+        if self.shutdown_gap_replay_probe:
+            if self.scenario in {
+                "standby_transfer_receiver_drain_metrics",
+                "standby_transfer_reset_drain",
+            }:
+                raise ValueError(
+                    "shutdown-gap replay probe is only valid for local "
+                    "startup/resume E2E"
+                )
+            if self.business_run_before_drain_s > 0 or self.inflight_drain_probe:
+                raise ValueError(
+                    "shutdown-gap replay probe requires deterministic "
+                    "pre-drain worker pause"
+                )
+            if self.lockset_batch_size > 0:
+                raise ValueError(
+                    "shutdown-gap replay probe does not support bulk lockset mode"
+                )
+            if self.statements_per_tx < 2:
+                raise ValueError(
+                    "shutdown-gap replay probe requires at least two statements"
+                )
+            if self.min_statements_before_drain_pause >= self.statements_per_tx:
+                raise ValueError(
+                    "shutdown-gap replay probe requires one statement after "
+                    "the drain checkpoint"
+                )
         if self.promotion_gate_required_apply_lsn < 0:
             raise ValueError("promotion gate required apply LSN must be non-negative")
         if self.max_receiver_ready_after_phase2_ms < 0:
             raise ValueError(
                 "max receiver ready after phase2 ms must be non-negative"
+            )
+        if (
+            self.standby_transfer_timeout_exclusion
+            and self.scenario != "standby_transfer_receiver_drain_metrics"
+        ):
+            raise ValueError(
+                "standby transfer timeout exclusion is only valid for "
+                "standby_transfer_receiver_drain_metrics"
             )
         if self.receiver_read_load_threads < 0:
             raise ValueError("receiver read-load threads must be non-negative")
@@ -2876,6 +2914,14 @@ class ResumeCoordinator:
         self._inflight_probe_open_generation: Dict[int, bool] = {}
         self._inflight_probe_closed_generation: Dict[int, bool] = {}
         self._drain_command_started_generation: Dict[int, bool] = {}
+        self._shutdown_gap_probe_release_generation: Dict[int, int] = {}
+        self._shutdown_gap_probe_pending_generation: Dict[int, int] = {}
+        self._shutdown_gap_disconnect_us: Dict[Tuple[int, int], int] = {}
+        self._shutdown_gap_resume_succeeded_us: Dict[Tuple[int, int], int] = {}
+        self._shutdown_gap_replay_sent_us: Dict[Tuple[int, int], int] = {}
+        self._shutdown_gap_replay_completed_us: Dict[Tuple[int, int], int] = {}
+        self._shutdown_gap_replay_send_count: Dict[Tuple[int, int], int] = {}
+        self._shutdown_gap_sql_digest: Dict[Tuple[int, int], str] = {}
         self._desired_large_bucket_mb = 0
         self._drain_large_bucket_mb: Dict[int, int] = {}
         self._hold_transaction_starts = False
@@ -3122,6 +3168,14 @@ class ResumeCoordinator:
                     self._paused_generation[sid] = generation
                     if self._all_paused_locked(generation):
                         self._notify_all_locked("paused_complete")
+                if (
+                    self._shutdown_gap_probe_release_generation.get(sid)
+                    == generation
+                ):
+                    self._shutdown_gap_probe_release_generation.pop(sid, None)
+                    self._shutdown_gap_probe_pending_generation[sid] = generation
+                    self._notify_all_locked("shutdown_gap_probe_released")
+                    return None
                 if self._cancelled_generation.get(generation):
                     self._completed_generation[sid] = generation
                     return None
@@ -3129,6 +3183,137 @@ class ResumeCoordinator:
                 if remaining <= 0:
                     raise TimeoutError(f"timed out waiting for resumed connection for sid {sid}")
                 self._condition.wait(min(0.5, remaining))
+
+    def release_shutdown_gap_probe(self, sid: int, generation: int) -> None:
+        with self._condition:
+            if generation != self._drain_generation:
+                raise AssertionError("shutdown-gap probe generation is stale")
+            if self._paused_generation.get(sid) != generation:
+                raise AssertionError("shutdown-gap probe worker is not paused")
+            self._shutdown_gap_probe_release_generation[sid] = generation
+            self._notify_all_locked("shutdown_gap_probe_release_requested")
+
+    def mark_shutdown_gap_disconnect_if_pending(
+        self, sid: int, sql: str
+    ) -> Optional[int]:
+        with self._condition:
+            generation = self._shutdown_gap_probe_pending_generation.get(sid)
+            if generation is None:
+                return None
+            key = (generation, sid)
+            if key in self._shutdown_gap_disconnect_us:
+                raise AssertionError("shutdown-gap SQL disconnected more than once")
+            self._shutdown_gap_disconnect_us[key] = time.monotonic_ns() // 1000
+            self._shutdown_gap_sql_digest[key] = hashlib.sha256(
+                sql.encode("utf-8")
+            ).hexdigest()
+            self._notify_all_locked("shutdown_gap_disconnect_observed")
+            return generation
+
+    def wait_for_shutdown_gap_disconnect(
+        self, sid: int, generation: int, timeout_s: float
+    ) -> bool:
+        deadline = time.monotonic() + timeout_s
+        key = (generation, sid)
+        with self._condition:
+            while key not in self._shutdown_gap_disconnect_us:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(min(0.2, remaining))
+            return True
+
+    def mark_shutdown_gap_resume_succeeded(
+        self, sid: int, generation: int, resume_succeeded_us: int
+    ) -> None:
+        key = (generation, sid)
+        with self._condition:
+            disconnected_us = self._shutdown_gap_disconnect_us.get(key)
+            if disconnected_us is None:
+                raise AssertionError(
+                    "shutdown-gap RESUME succeeded before disconnect was observed"
+                )
+            if resume_succeeded_us < disconnected_us:
+                raise AssertionError(
+                    "shutdown-gap RESUME timestamp precedes disconnect"
+                )
+            self._shutdown_gap_resume_succeeded_us[key] = resume_succeeded_us
+            self._notify_all_locked("shutdown_gap_resume_succeeded")
+
+    def mark_shutdown_gap_replay_sent(
+        self, sid: int, generation: int, sql: str
+    ) -> None:
+        key = (generation, sid)
+        replay_sent_us = time.monotonic_ns() // 1000
+        with self._condition:
+            resume_succeeded_us = self._shutdown_gap_resume_succeeded_us.get(key)
+            if resume_succeeded_us is None:
+                raise AssertionError(
+                    "shutdown-gap SQL replay attempted before RESUME succeeded"
+                )
+            digest = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+            if digest != self._shutdown_gap_sql_digest.get(key):
+                raise AssertionError("shutdown-gap replay SQL changed after RESUME")
+            count = self._shutdown_gap_replay_send_count.get(key, 0) + 1
+            if count != 1:
+                raise AssertionError("shutdown-gap SQL replay attempted more than once")
+            if replay_sent_us < resume_succeeded_us:
+                raise AssertionError("shutdown-gap replay timestamp precedes RESUME")
+            self._shutdown_gap_replay_send_count[key] = count
+            self._shutdown_gap_replay_sent_us[key] = replay_sent_us
+            self._notify_all_locked("shutdown_gap_replay_sent")
+
+    def mark_shutdown_gap_replay_completed(
+        self, sid: int, generation: int
+    ) -> None:
+        key = (generation, sid)
+        replay_completed_us = time.monotonic_ns() // 1000
+        with self._condition:
+            replay_sent_us = self._shutdown_gap_replay_sent_us.get(key)
+            if replay_sent_us is None:
+                raise AssertionError("shutdown-gap replay completed before send")
+            if replay_completed_us < replay_sent_us:
+                raise AssertionError("shutdown-gap replay completion precedes send")
+            self._shutdown_gap_replay_completed_us[key] = replay_completed_us
+            self._shutdown_gap_probe_pending_generation.pop(sid, None)
+            self._notify_all_locked("shutdown_gap_replay_completed")
+
+    def wait_for_shutdown_gap_replay_completed(
+        self, sid: int, generation: int, timeout_s: float
+    ) -> bool:
+        deadline = time.monotonic() + timeout_s
+        key = (generation, sid)
+        with self._condition:
+            while key not in self._shutdown_gap_replay_completed_us:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(min(0.2, remaining))
+            return True
+
+    def shutdown_gap_replay_sample(
+        self, sid: int, generation: int
+    ) -> Dict[str, object]:
+        key = (generation, sid)
+        with self._condition:
+            return {
+                "generation": generation,
+                "sid": sid,
+                "disconnect_observed_us": self._shutdown_gap_disconnect_us.get(
+                    key, 0
+                ),
+                "resume_succeeded_us": (
+                    self._shutdown_gap_resume_succeeded_us.get(key, 0)
+                ),
+                "replay_sent_us": self._shutdown_gap_replay_sent_us.get(key, 0),
+                "replay_completed_us": (
+                    self._shutdown_gap_replay_completed_us.get(key, 0)
+                ),
+                "replay_send_count": self._shutdown_gap_replay_send_count.get(
+                    key, 0
+                ),
+                "sql_sha256": self._shutdown_gap_sql_digest.get(key, ""),
+            }
 
     def begin_inflight_probe_if_requested(self, sid: int) -> Optional[int]:
         with self._condition:
@@ -3294,6 +3479,11 @@ class ResetDrainCoordinator:
     def wait_all_sessions_drained(self, timeout_s: float) -> bool:
         return self._wait_for(lambda: self._all_locked(self._drained), timeout_s)
 
+    def wait_any_closing_rejection(self, timeout_s: float) -> bool:
+        return self._wait_for(
+            lambda: bool(self._drained or self._draining_rejected), timeout_s
+        )
+
     def allow_replay_after_reset(self, reset_response_us: int) -> None:
         with self._condition:
             self._reset_response_us = reset_response_us
@@ -3357,6 +3547,7 @@ class ResetDrainWorker(threading.Thread):
         coordinator: ResetDrainCoordinator,
         timeout_s: float,
         require_session_drained: bool = True,
+        wait_for_closing_rejection: bool = False,
     ):
         super().__init__(name=f"rtx-reset-worker-{sid:04d}", daemon=True)
         self.sid = sid
@@ -3365,6 +3556,7 @@ class ResetDrainWorker(threading.Thread):
         self.coordinator = coordinator
         self.timeout_s = timeout_s
         self.require_session_drained = require_session_drained
+        self.wait_for_closing_rejection = wait_for_closing_rejection
         table = self.plan.repeated_row_write_table(sid)
         self.probe_sql = (
             f"UPDATE `{table}` SET counter = counter + 1 "
@@ -3422,7 +3614,24 @@ class ResetDrainWorker(threading.Thread):
                 )
 
             self.coordinator.mark_probe_started(self.sid)
-            if self.require_session_drained:
+            if self.wait_for_closing_rejection:
+                deadline = time.monotonic() + self.timeout_s
+                while True:
+                    try:
+                        self.runtime.execute(conn, "SELECT 1", fetch=True)
+                    except BaseException as exc:
+                        if self.runtime.is_preserve_session_drained(exc):
+                            self.coordinator.mark_session_drained(self.sid)
+                        elif self.runtime.is_preserve_draining_rejection(exc):
+                            self.coordinator.mark_draining_rejected(self.sid)
+                        else:
+                            raise
+                        break
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"sid={self.sid} did not observe a CLOSING rejection"
+                        )
+            elif self.require_session_drained:
                 deadline = time.monotonic() + self.timeout_s
                 while True:
                     try:
@@ -3602,7 +3811,7 @@ class MySQLRuntime:
         )
 
     def is_preserve_draining_rejection(self, exc: BaseException) -> bool:
-        if getattr(exc, "errno", None) == 4013:
+        if getattr(exc, "errno", None) in (4013, 4020):
             return True
         text = str(exc).lower()
         return (
@@ -3702,6 +3911,30 @@ class MySQLRuntime:
                     break
         finally:
             cursor.close()
+
+
+class SourceWorkloadRuntime:
+    """Use source application credentials while reusing runtime helpers."""
+
+    def __init__(self, runtime: MySQLRuntime, user: str, password: str):
+        self._runtime = runtime
+        self._user = user
+        self._password = password
+
+    def connect(self, database: bool = True, autocommit: bool = True):
+        config = self._runtime.config
+        return self._runtime.connect_endpoint(
+            user=self._user,
+            password=self._password,
+            host=config.host,
+            port=config.port,
+            unix_socket=config.unix_socket,
+            database=config.database if database else None,
+            autocommit=autocommit,
+        )
+
+    def __getattr__(self, name):
+        return getattr(self._runtime, name)
 
 
 class ReceiverReadLoadProbe:
@@ -3980,9 +4213,14 @@ class BusinessWorker(threading.Thread):
         pause_log_generation = 0
         finish_after_resume = False
         rollback_after_resume = False
+        shutdown_gap_replay_generation: Optional[int] = None
         while stmt_index < len(ops):
             op = ops[stmt_index]
             try:
+                if shutdown_gap_replay_generation is not None:
+                    self.coordinator.mark_shutdown_gap_replay_sent(
+                        self.sid, shutdown_gap_replay_generation, op.sql
+                    )
                 try:
                     if op.discard_result:
                         self.runtime.execute_discarding_result(conn, op.sql)
@@ -4003,6 +4241,11 @@ class BusinessWorker(threading.Thread):
                         tx_expected.validate_query_result(tx_id, stmt_index, rows)
                     else:
                         op.validator(rows)
+                if shutdown_gap_replay_generation is not None:
+                    self.coordinator.mark_shutdown_gap_replay_completed(
+                        self.sid, shutdown_gap_replay_generation
+                    )
+                    shutdown_gap_replay_generation = None
                 if tx_expected is not None:
                     tx_expected.apply_statement(tx_id, stmt_index)
                 self.runtime.execute(
@@ -4048,6 +4291,16 @@ class BusinessWorker(threading.Thread):
             except BaseException as exc:
                 if not self.runtime.is_connection_error(exc):
                     raise
+                if shutdown_gap_replay_generation is not None:
+                    raise AssertionError(
+                        "shutdown-gap SQL replay result is ambiguous; refusing "
+                        "a second replay"
+                    ) from exc
+                shutdown_gap_replay_generation = (
+                    self.coordinator.mark_shutdown_gap_disconnect_if_pending(
+                        self.sid, op.sql
+                    )
+                )
                 LOG.info("worker sid=%s waiting for resume at tx=%s stmt=%s", self.sid, tx_id, stmt_index)
                 conn = self.coordinator.wait_for_resumed_connection(
                     self.sid, self.plan.resume_connection_wait_timeout_s()
@@ -4454,6 +4707,7 @@ class BusinessE2ERunner:
         self.promotion_gate_server_metrics: List[PromotionGateMetrics] = []
         self.receiver_prewarm_metrics: Optional[ReceiverPrewarmMetrics] = None
         self.post_resume_temp_dml_executed = False
+        self.shutdown_gap_replay_samples: List[Dict[str, object]] = []
 
     def run(self) -> None:
         if self.config.promotion_gate_epoch_id:
@@ -4630,6 +4884,7 @@ class BusinessE2ERunner:
         generation = 0
         completed_stmt_total = 0
         read_load_probe: Optional[ReceiverReadLoadProbe] = None
+        timeout_exclusion_probe_started = False
         try:
             if self.config.receiver_read_load_threads > 0:
                 table = self.plan.table_names()[0]
@@ -4653,6 +4908,9 @@ class BusinessE2ERunner:
             if read_load_probe is not None:
                 read_load_probe.start_baseline()
                 time.sleep(self.config.receiver_read_load_baseline_s)
+            if self.config.standby_transfer_timeout_exclusion:
+                self.start_standby_transfer_timeout_exclusion_probe()
+                timeout_exclusion_probe_started = True
             error_log_offset = self.warmcopy_error_log_offset()
             LOG.info(
                 "issuing standby-transfer DRAIN TRANSACTIONS PRESERVE for receiver metrics"
@@ -4686,6 +4944,9 @@ class BusinessE2ERunner:
                     "standby transfer DRAIN returned retryable unsupported" + suffix
                 )
             self.runtime.wait_until_down(self.config.shutdown_timeout_s)
+            if timeout_exclusion_probe_started:
+                self.stop_standby_transfer_timeout_exclusion_probe()
+                timeout_exclusion_probe_started = False
             metrics = self.read_latest_warmcopy_metrics_since(error_log_offset)
             if metrics is None or metrics.phase2_total_ms is None:
                 raise AssertionError(
@@ -4753,6 +5014,13 @@ class BusinessE2ERunner:
             )
             raise
         finally:
+            if timeout_exclusion_probe_started:
+                try:
+                    self.stop_standby_transfer_timeout_exclusion_probe()
+                except Exception as exc:
+                    LOG.warning(
+                        "timeout exclusion probe cleanup failed: %s", exc
+                    )
             self.stop_event.set()
             self.coordinator.release_transaction_start_hold()
             if generation:
@@ -4770,6 +5038,7 @@ class BusinessE2ERunner:
         self.runtime.wait_until_up(self.config.startup_timeout_s)
         receiver_conn = self._receiver_admin_connection()
         receiver_conn.close()
+        self.configure_source_ha_control_credentials()
         completed_successfully = False
         self.reset_drain_samples: List[Dict[str, object]] = []
         self.reset_receiver_orphan_accepted = False
@@ -4866,7 +5135,7 @@ class BusinessE2ERunner:
     def _source_debug_sync_supported(self) -> bool:
         conn = None
         try:
-            conn = self.runtime.connect(database=False)
+            conn = self._source_ha_control_connection()
             rows = self.runtime.execute(
                 conn, "SELECT @@SESSION.debug_sync", fetch=True
             )
@@ -4892,7 +5161,7 @@ class BusinessE2ERunner:
             return
         conn = None
         try:
-            conn = self.runtime.connect(database=False)
+            conn = self._source_ha_control_connection()
             self.runtime.execute(conn, "SET DEBUG_SYNC='RESET'")
         except BaseException:
             pass
@@ -4909,7 +5178,7 @@ class BusinessE2ERunner:
         owns_connection = connection is None
         conn = connection
         if conn is None:
-            conn = self.runtime.connect(database=False)
+            conn = self._source_ha_control_connection()
         try:
             self.runtime.execute(conn, f"SET DEBUG_SYNC={quote_sql_string(action)}")
         finally:
@@ -4931,7 +5200,7 @@ class BusinessE2ERunner:
         def drain_target() -> None:
             conn = None
             try:
-                conn = self.runtime.connect(database=False)
+                conn = self._source_ha_control_connection()
                 for action in debug_actions:
                     self.runtime.execute(
                         conn,
@@ -4979,7 +5248,7 @@ class BusinessE2ERunner:
             conn = connection
             try:
                 if conn is None:
-                    conn = self.runtime.connect(database=False)
+                    conn = self._source_ha_control_connection()
                 state["requested_us"] = time.monotonic_ns() // 1000
                 self.runtime.execute(conn, "RESET DRAIN")
                 state["response_us"] = time.monotonic_ns() // 1000
@@ -5099,82 +5368,6 @@ class BusinessE2ERunner:
                 )
             time.sleep(min(0.1, remaining))
 
-    def _reset_on_phase2_draining_rejection(
-        self,
-        timeout_s: float,
-        *,
-        ready_event: Optional[threading.Event] = None,
-        poll_interval_s: float = 0.001,
-    ) -> Dict[str, object]:
-        conn = self.runtime.connect(database=True)
-        table = self.plan.repeated_row_write_table(1)
-        probe_sql = (
-            f"UPDATE `{table}` SET counter = counter "
-            "WHERE sid = 18446744073709551615 AND k = 0"
-        )
-        deadline = time.monotonic() + timeout_s
-        try:
-            if ready_event is not None:
-                ready_event.set()
-            while True:
-                try:
-                    self.runtime.execute(conn, probe_sql)
-                except BaseException as exc:
-                    if self.runtime.is_preserve_draining_rejection(exc):
-                        requested_us = time.monotonic_ns() // 1000
-                        self.runtime.execute(conn, "RESET DRAIN")
-                        return {
-                            "requested_us": requested_us,
-                            "response_us": time.monotonic_ns() // 1000,
-                            "error": None,
-                        }
-                    raise
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        "source did not expose WARMCOPY_CLOSING through "
-                        "ER_PRESERVE_TRX_UNSUPPORTED"
-                    )
-                if poll_interval_s > 0:
-                    time.sleep(min(poll_interval_s, remaining))
-        finally:
-            conn.close()
-
-    def _start_phase2_reset_observer(
-        self, timeout_s: float
-    ) -> Tuple[threading.Thread, Dict[str, object]]:
-        ready_event = threading.Event()
-        state: Dict[str, object] = {
-            "requested_us": 0,
-            "response_us": 0,
-            "error": None,
-        }
-
-        def observe() -> None:
-            try:
-                state.update(
-                    self._reset_on_phase2_draining_rejection(
-                        timeout_s,
-                        ready_event=ready_event,
-                        poll_interval_s=0.0,
-                    )
-                )
-            except BaseException as exc:
-                state["error"] = exc
-                state["response_us"] = time.monotonic_ns() // 1000
-            finally:
-                ready_event.set()
-
-        thread = threading.Thread(
-            target=observe,
-            name="rtx-reset-phase2-observer",
-            daemon=True,
-        )
-        thread.start()
-        if not ready_event.wait(min(5.0, timeout_s)):
-            raise TimeoutError("phase2 RESET observer did not become ready")
-        return thread, state
-
     def _run_reset_drain_phase1(self) -> Dict[str, object]:
         conn = self.runtime.connect(database=True, autocommit=False)
         drain_thread: Optional[threading.Thread] = None
@@ -5211,6 +5404,7 @@ class BusinessE2ERunner:
                 "Preserve_trx_reset_drain_wins",
                 wins_before + 1,
                 timeout_s=self.config.resume_timeout_s,
+                connection_factory=self._source_ha_control_connection,
             )
             self._debug_sync_now("now SIGNAL reset_phase1_release")
             self._join_reset_thread(reset_thread, reset_state)
@@ -5262,6 +5456,9 @@ class BusinessE2ERunner:
                 coordinator=coordinator,
                 timeout_s=self.config.resume_timeout_s,
                 require_session_drained=deterministic_ack_window,
+                wait_for_closing_rejection=(
+                    not deterministic_ack_window and sid == 1
+                ),
             )
             for sid in range(1, self.config.sessions + 1)
         ]
@@ -5283,8 +5480,10 @@ class BusinessE2ERunner:
         )
         try:
             if deterministic_ack_window:
-                debug_control_conn = self.runtime.connect(database=False)
-                reset_control_conn = self.runtime.connect(database=False)
+                debug_control_conn = self._source_ha_control_connection()
+                reset_control_conn = self._source_ha_control_connection()
+            else:
+                reset_control_conn = self._source_ha_control_connection()
             for worker in workers:
                 worker.start()
             if not coordinator.wait_all_transactions_prepared(
@@ -5323,12 +5522,6 @@ class BusinessE2ERunner:
                 ]
             if read_load_probe is not None:
                 read_load_probe.begin_transfer()
-            if not deterministic_ack_window:
-                reset_thread, reset_state = (
-                    self._start_phase2_reset_observer(
-                        self.config.resume_timeout_s
-                    )
-                )
             drain_thread, drain_state = self._start_reset_aware_drain_thread(
                 label="phase2", debug_actions=debug_actions
             )
@@ -5378,6 +5571,7 @@ class BusinessE2ERunner:
                     "Preserve_trx_reset_drain_wins",
                     wins_before + 1,
                     timeout_s=self.config.resume_timeout_s,
+                    connection_factory=self._source_ha_control_connection,
                 )
                 self._debug_sync_now(
                     "now SIGNAL reset_final_ack_release",
@@ -5394,6 +5588,18 @@ class BusinessE2ERunner:
                     raise TimeoutError(
                         "not every original connection entered its phase2 probe"
                     )
+                if not coordinator.wait_any_closing_rejection(
+                    self.config.resume_timeout_s
+                ):
+                    self._raise_reset_worker_error_if_any(coordinator)
+                    raise TimeoutError(
+                        "the original transaction sentinel did not observe "
+                        "error 4020"
+                    )
+                reset_thread, reset_state = self._start_reset_thread(
+                    label="phase2", connection=reset_control_conn
+                )
+                reset_control_conn = None
                 self._join_reset_thread(reset_thread, reset_state)
                 phase2_trigger = "WARMCOPY_CLOSING_REJECTION"
                 phase2_observer_rejected = True
@@ -6571,6 +6777,24 @@ class BusinessE2ERunner:
             "sessions": self.config.sessions,
             "cycles": self.config.cycles,
             "workload_sessions": self.config.sessions,
+            "source_workload_user": getattr(
+                self, "standby_transfer_source_workload_user", None
+            ),
+            "source_workload_has_shutdown_acl": False,
+            "timeout_exclusion_enabled": (
+                self.config.standby_transfer_timeout_exclusion
+            ),
+            "timeout_exclusion_probe_connection_id": getattr(
+                self, "timeout_exclusion_probe_connection_id", None
+            ),
+            "drain_result_rows": list(
+                getattr(self, "drain_result_rows", [])
+            ),
+            "drain_result_outcome": (
+                None
+                if not getattr(self, "drain_result_rows", [])
+                else str(self.drain_result_rows[0]["outcome"])
+            ),
             "workload_table_count": self.config.table_count,
             "workload_statements_per_tx": self.config.statements_per_tx,
             "workload_seed_rows_per_table_per_session": (
@@ -7854,6 +8078,50 @@ END
             database=None,
         )
 
+    def _source_ha_control_connection(self):
+        return self.runtime.connect_endpoint(
+            user=PRESERVE_TRX_HA_ADMIN_USER,
+            password=self.config.standby_transfer_password,
+            host=self.config.host,
+            port=self.config.port,
+            unix_socket=self.config.unix_socket,
+            database=None,
+        )
+
+    def configure_source_ha_control_credentials(self) -> None:
+        source_conn = self.runtime.connect(database=False)
+        try:
+            password = self.config.standby_transfer_password
+            for host in ("localhost", "127.0.0.1", "%"):
+                account = (
+                    f"{quote_sql_string(PRESERVE_TRX_HA_ADMIN_USER)}@"
+                    f"{quote_sql_string(host)}"
+                )
+                self.runtime.execute(
+                    source_conn,
+                    "CREATE USER IF NOT EXISTS "
+                    f"{account} IDENTIFIED BY {quote_sql_string(password)}",
+                )
+                self.runtime.execute(
+                    source_conn,
+                    f"ALTER USER {account} IDENTIFIED BY "
+                    f"{quote_sql_string(password)}",
+                )
+                self.runtime.execute(
+                    source_conn,
+                    f"GRANT SHUTDOWN ON *.* TO {account}",
+                )
+                self.runtime.execute(
+                    source_conn,
+                    f"GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO {account}",
+                )
+                self.runtime.execute(
+                    source_conn,
+                    f"GRANT SELECT ON performance_schema.* TO {account}",
+                )
+        finally:
+            source_conn.close()
+
     def _receiver_read_connection(self):
         return self.runtime.connect_endpoint(
             user=self.config.receiver_user,
@@ -7928,6 +8196,182 @@ END
                 )
         finally:
             receiver_conn.close()
+
+    def prepare_standby_transfer_source_workload_runtime(
+        self,
+    ) -> SourceWorkloadRuntime:
+        workload_user = f"{self.config.standby_transfer_user}_workload"
+        workload_password = self.config.standby_transfer_password
+        source_conn = self.runtime.connect(database=False)
+        try:
+            for host in ("localhost", "127.0.0.1", "%"):
+                account = (
+                    f"{quote_sql_string(workload_user)}@"
+                    f"{quote_sql_string(host)}"
+                )
+                self.runtime.execute(
+                    source_conn,
+                    "CREATE USER IF NOT EXISTS "
+                    f"{account} IDENTIFIED BY "
+                    f"{quote_sql_string(workload_password)}",
+                )
+                self.runtime.execute(
+                    source_conn,
+                    f"ALTER USER {account} IDENTIFIED BY "
+                    f"{quote_sql_string(workload_password)}",
+                )
+                self.runtime.execute(
+                    source_conn,
+                    f"REVOKE ALL PRIVILEGES, GRANT OPTION FROM {account}",
+                )
+                self.runtime.execute(
+                    source_conn,
+                    "GRANT ALL PRIVILEGES ON "
+                    f"{quote_identifier(self.config.database)}.* TO {account}",
+                )
+        finally:
+            source_conn.close()
+        self.standby_transfer_source_workload_user = workload_user
+        return SourceWorkloadRuntime(
+            self.runtime, workload_user, workload_password
+        )
+
+    def start_standby_transfer_timeout_exclusion_probe(self) -> None:
+        worker_runtime = getattr(self, "worker_runtime", None)
+        if worker_runtime is None:
+            raise AssertionError(
+                "standby transfer workload runtime was not initialized"
+            )
+
+        admin_conn = self.runtime.connect(database=False)
+        try:
+            self.runtime.execute(
+                admin_conn,
+                "SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=OFF",
+            )
+            self.runtime.execute(
+                admin_conn,
+                "SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=100",
+            )
+            self.runtime.execute(
+                admin_conn,
+                "SET GLOBAL preserve_trx_transfer_phase1_timeout_ms=1000",
+            )
+            self.runtime.execute(
+                admin_conn,
+                "CREATE TABLE IF NOT EXISTS "
+                f"{quote_identifier(self.config.database)}."
+                "`rtx_closing_timeout_probe` ("
+                "id INT PRIMARY KEY, v INT NOT NULL) ENGINE=InnoDB",
+            )
+            self.runtime.execute(
+                admin_conn,
+                "INSERT INTO "
+                f"{quote_identifier(self.config.database)}."
+                "`rtx_closing_timeout_probe` VALUES(1,0) "
+                "ON DUPLICATE KEY UPDATE v=VALUES(v)",
+            )
+
+            probe_conn = worker_runtime.connect(
+                database=True, autocommit=False
+            )
+            worker_runtime.execute(probe_conn, "START TRANSACTION")
+            worker_runtime.execute(
+                probe_conn,
+                "UPDATE `rtx_closing_timeout_probe` SET v=v+1 WHERE id=1",
+            )
+            rows = worker_runtime.execute(
+                probe_conn, "SELECT CONNECTION_ID()", fetch=True
+            )
+            if len(rows) != 1:
+                probe_conn.close()
+                raise AssertionError(
+                    "timeout exclusion probe did not obtain a connection ID"
+                )
+            connection_id = int(rows[0][0])
+            errors: List[BaseException] = []
+
+            def run_old_command() -> None:
+                try:
+                    worker_runtime.execute(
+                        probe_conn, "SELECT SLEEP(300)", fetch=True
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            thread = threading.Thread(
+                target=run_old_command,
+                name="standby-transfer-timeout-exclusion",
+                daemon=True,
+            )
+            thread.start()
+            deadline = time.monotonic() + min(
+                10.0, self.config.startup_timeout_s
+            )
+            while True:
+                running = self.runtime.execute(
+                    admin_conn,
+                    "SELECT COUNT(*) FROM performance_schema.threads "
+                    f"WHERE PROCESSLIST_ID={connection_id} "
+                    "AND PROCESSLIST_INFO LIKE 'SELECT SLEEP(300)%'",
+                    fetch=True,
+                )
+                if running and int(running[0][0]) == 1:
+                    break
+                if errors:
+                    probe_conn.close()
+                    raise AssertionError(
+                        "timeout exclusion probe command failed before DRAIN"
+                    ) from errors[0]
+                if time.monotonic() >= deadline:
+                    probe_conn.close()
+                    raise TimeoutError(
+                        "timeout exclusion probe command did not become visible"
+                    )
+                time.sleep(0.01)
+        finally:
+            admin_conn.close()
+
+        self.timeout_exclusion_probe_connection_id = connection_id
+        self.timeout_exclusion_probe_connection = probe_conn
+        self.timeout_exclusion_probe_thread = thread
+        self.timeout_exclusion_probe_errors = errors
+
+    def stop_standby_transfer_timeout_exclusion_probe(self) -> None:
+        thread = getattr(self, "timeout_exclusion_probe_thread", None)
+        connection_id = getattr(
+            self, "timeout_exclusion_probe_connection_id", None
+        )
+        if thread is not None and thread.is_alive() and connection_id is not None:
+            admin_conn = None
+            try:
+                admin_conn = self.runtime.connect(database=False)
+                self.runtime.execute(admin_conn, f"KILL {int(connection_id)}")
+            except BaseException:
+                pass
+            finally:
+                if admin_conn is not None:
+                    try:
+                        admin_conn.close()
+                    except Exception:
+                        pass
+        if thread is not None:
+            thread.join(min(10.0, self.config.worker_join_timeout_s))
+            if thread.is_alive():
+                raise TimeoutError(
+                    "timeout exclusion probe did not stop after source shutdown"
+                )
+        probe_conn = getattr(self, "timeout_exclusion_probe_connection", None)
+        if probe_conn is not None:
+            try:
+                probe_conn.close()
+            except Exception:
+                pass
+        errors = list(getattr(self, "timeout_exclusion_probe_errors", []))
+        if errors and not all(self.runtime.is_connection_error(exc) for exc in errors):
+            raise AssertionError(
+                "timeout exclusion probe failed for a non-connection reason"
+            ) from errors[0]
 
     def validate_standby_transfer_endpoint_config(self) -> None:
         source_conn = self.runtime.connect(database=False)
@@ -8038,11 +8482,17 @@ END
             conn.close()
 
     def start_workers(self) -> None:
+        worker_runtime = self.runtime
+        if self.config.scenario == "standby_transfer_receiver_drain_metrics":
+            worker_runtime = (
+                self.prepare_standby_transfer_source_workload_runtime()
+            )
+        self.worker_runtime = worker_runtime
         self.workers = [
             BusinessWorker(
                 sid,
                 self.plan,
-                self.runtime,
+                worker_runtime,
                 self.coordinator,
                 self.stop_event,
                 self.expected_state,
@@ -8155,6 +8605,20 @@ END
                     return
             phase2_pause_ms = (time.monotonic() - phase2_started_at) * 1000.0
             self.runtime.wait_until_down(self.config.shutdown_timeout_s)
+            server_down_confirmed_us = time.monotonic_ns() // 1000
+            if self.config.shutdown_gap_replay_probe:
+                self.coordinator.release_shutdown_gap_probe(
+                    sid=1, generation=generation
+                )
+                if not self.coordinator.wait_for_shutdown_gap_disconnect(
+                    sid=1,
+                    generation=generation,
+                    timeout_s=self.config.resume_timeout_s,
+                ):
+                    raise TimeoutError(
+                        "worker did not observe the shutdown-gap connection error"
+                    )
+            restart_started_us = time.monotonic_ns() // 1000
             self.restart_server()
             self.runtime.wait_until_up(self.config.startup_timeout_s)
             startup_metrics = self.read_startup_recovery_metrics_from_status()
@@ -8228,6 +8692,12 @@ END
                 resumed_large_buckets[sid] = bucket_mb
                 resumed_tx_ids[sid] = tx_id
                 resumed_completed_stmt[sid] = completed_stmt_no
+                if self.config.shutdown_gap_replay_probe and sid == 1:
+                    self.coordinator.mark_shutdown_gap_resume_succeeded(
+                        sid=sid,
+                        generation=generation,
+                        resume_succeeded_us=time.monotonic_ns() // 1000,
+                    )
                 if self._will_execute_temp_dml_after_resume(completed_stmt_no):
                     self.post_resume_temp_dml_executed = True
             if self.config.strict_token_count:
@@ -8296,6 +8766,42 @@ END
                     and cycle < self.config.cycles
                 ),
             )
+            if self.config.shutdown_gap_replay_probe:
+                if not self.coordinator.wait_for_shutdown_gap_replay_completed(
+                    sid=1,
+                    generation=generation,
+                    timeout_s=self.config.resume_timeout_s,
+                ):
+                    raise TimeoutError(
+                        "shutdown-gap SQL was not replayed after RESUME"
+                    )
+                sample = self.coordinator.shutdown_gap_replay_sample(
+                    sid=1, generation=generation
+                )
+                sample.update(
+                    {
+                        "cycle": cycle,
+                        "server_down_confirmed_us": server_down_confirmed_us,
+                        "restart_started_us": restart_started_us,
+                    }
+                )
+                if not (
+                    server_down_confirmed_us
+                    <= int(sample["disconnect_observed_us"])
+                    <= restart_started_us
+                    <= int(sample["resume_succeeded_us"])
+                    <= int(sample["replay_sent_us"])
+                    <= int(sample["replay_completed_us"])
+                ):
+                    raise AssertionError(
+                        "shutdown-gap replay ordering is invalid: "
+                        f"{sample}"
+                    )
+                if int(sample["replay_send_count"]) != 1:
+                    raise AssertionError(
+                        "shutdown-gap SQL must be replayed exactly once"
+                    )
+                self.shutdown_gap_replay_samples.append(sample)
         except BaseException:
             self.coordinator.cancel_drain_checkpoint(generation)
             raise
@@ -9586,14 +10092,43 @@ END
 
     def _execute_drain_preserve(self) -> bool:
         conn = None
+        expects_transfer_result = (
+            self.config.scenario == "standby_transfer_receiver_drain_metrics"
+        )
         try:
             conn = self.runtime.connect(database=False)
-            self.runtime.execute(
+            rows = self.runtime.execute(
                 conn,
                 f"DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT {self.config.preserve_timeout_s} WITH USER VARS",
+                fetch=expects_transfer_result,
             )
+            if expects_transfer_result:
+                self.drain_result_rows = self._decode_transfer_drain_result(rows)
+                excluded_connection_id = getattr(
+                    self, "timeout_exclusion_probe_connection_id", None
+                )
+                if (
+                    self.config.standby_transfer_timeout_exclusion
+                    and excluded_connection_id is None
+                ):
+                    raise AssertionError(
+                        "standby transfer timeout exclusion probe was not started"
+                    )
+                self.validate_standby_transfer_drain_result(
+                    expected_survivor_count=self.config.sessions,
+                    expected_excluded_connection_id=(
+                        int(excluded_connection_id)
+                        if self.config.standby_transfer_timeout_exclusion
+                        else None
+                    ),
+                )
         except BaseException as exc:
             if self.runtime.is_connection_error(exc):
+                if expects_transfer_result:
+                    raise AssertionError(
+                        "standby transfer DRAIN disconnected before its "
+                        "structured result was read"
+                    ) from exc
                 return True
             if (
                 self.config.scenario == "temp_table_retryable_unsupported"
@@ -9608,6 +10143,101 @@ END
                 except Exception:
                     pass
         return True
+
+    @staticmethod
+    def _decode_transfer_drain_result(
+        rows: Sequence[Tuple],
+    ) -> List[Dict[str, object]]:
+        decoded: List[Dict[str, object]] = []
+        for row in rows:
+            if len(row) != 7:
+                raise AssertionError(
+                    "standby transfer DRAIN returned an unexpected result "
+                    f"shape: columns={len(row)}"
+                )
+            decoded.append(
+                {
+                    "generation": int(row[0]),
+                    "outcome": str(row[1]),
+                    "source_connection_id": (
+                        None if row[2] is None else int(row[2])
+                    ),
+                    "token_role": str(row[3]),
+                    "reason": str(row[4]),
+                    "closing_started_us": int(row[5]),
+                    "closing_deadline_us": int(row[6]),
+                }
+            )
+        if not decoded:
+            raise AssertionError(
+                "standby transfer DRAIN returned an empty structured result"
+            )
+        return decoded
+
+    def validate_standby_transfer_drain_result(
+        self,
+        *,
+        expected_survivor_count: int,
+        expected_excluded_connection_id: Optional[int] = None,
+    ) -> None:
+        rows = list(getattr(self, "drain_result_rows", []))
+        if not rows:
+            raise AssertionError("standby transfer DRAIN result was not captured")
+        generations = {int(row["generation"]) for row in rows}
+        outcomes = {str(row["outcome"]) for row in rows}
+        closing_starts = {int(row["closing_started_us"]) for row in rows}
+        closing_deadlines = {int(row["closing_deadline_us"]) for row in rows}
+        if len(generations) != 1 or len(outcomes) != 1:
+            raise AssertionError(
+                "standby transfer DRAIN result changed generation/outcome "
+                "within one response"
+            )
+        if len(closing_starts) != 1 or len(closing_deadlines) != 1:
+            raise AssertionError(
+                "standby transfer DRAIN result changed its CLOSING timestamps"
+            )
+
+        survivors = [row for row in rows if row["token_role"] == "SURVIVOR"]
+        excluded = [row for row in rows if row["token_role"] == "EXCLUDED"]
+        if len(survivors) != expected_survivor_count:
+            raise AssertionError(
+                "standby transfer DRAIN survivor count mismatch: "
+                f"expected={expected_survivor_count} actual={len(survivors)}"
+            )
+        survivor_ids = [row["source_connection_id"] for row in survivors]
+        if None in survivor_ids or len(set(survivor_ids)) != len(survivor_ids):
+            raise AssertionError(
+                "standby transfer DRAIN survivor connection IDs are invalid"
+            )
+        if any(row["reason"] != "NONE" for row in survivors):
+            raise AssertionError("standby transfer survivor carried an error reason")
+
+        if expected_excluded_connection_id is None:
+            expected_outcome = "SUCCESS"
+            if excluded:
+                raise AssertionError(
+                    "standby transfer DRAIN unexpectedly excluded a token"
+                )
+        else:
+            expected_outcome = "SUCCESS_WITH_EXCLUSIONS"
+            if len(excluded) != 1:
+                raise AssertionError(
+                    "standby transfer DRAIN must report exactly one timeout "
+                    f"exclusion, observed={len(excluded)}"
+                )
+            excluded_row = excluded[0]
+            if excluded_row["source_connection_id"] != int(
+                expected_excluded_connection_id
+            ) or excluded_row["reason"] != "CLOSING_COMMAND_TIMEOUT":
+                raise AssertionError(
+                    "standby transfer DRAIN did not report the expected "
+                    "timeout connection ID and reason"
+                )
+        if outcomes != {expected_outcome}:
+            raise AssertionError(
+                "standby transfer DRAIN outcome mismatch: "
+                f"expected={expected_outcome} actual={sorted(outcomes)}"
+            )
 
     def _start_drain_thread(self, cycle: int):
         state: Dict[str, Optional[BaseException]] = {"error": None}
@@ -10140,6 +10770,15 @@ END
         completed = [worker.transactions_completed for worker in self.workers]
         if min(completed) < 1:
             raise AssertionError(f"each worker must complete at least one transaction: {completed[:10]}")
+        if (
+            self.config.shutdown_gap_replay_probe
+            and len(self.shutdown_gap_replay_samples) != self.config.cycles
+        ):
+            raise AssertionError(
+                "shutdown-gap replay evidence is incomplete: "
+                f"samples={len(self.shutdown_gap_replay_samples)} "
+                f"cycles={self.config.cycles}"
+            )
         self.expected_state.assert_matches(self.actual_table_fingerprints())
         if (
             hasattr(self.expected_state, "uses_compact_bulk_model")
@@ -10294,6 +10933,24 @@ END
             "temp_table_resume_action": self.config.temp_table_resume_action,
             "post_resume_temp_dml_executed": bool(
                 getattr(self, "post_resume_temp_dml_executed", False)
+            ),
+            "shutdown_gap_replay_probe": self.config.shutdown_gap_replay_probe,
+            "shutdown_gap_replay_samples": list(
+                getattr(self, "shutdown_gap_replay_samples", [])
+            ),
+            "shutdown_gap_resume_preceded_replay": (
+                None
+                if not self.config.shutdown_gap_replay_probe
+                else len(getattr(self, "shutdown_gap_replay_samples", []))
+                == self.config.cycles
+                and all(
+                    int(sample["resume_succeeded_us"])
+                    <= int(sample["replay_sent_us"])
+                    and int(sample["replay_send_count"]) == 1
+                    for sample in getattr(
+                        self, "shutdown_gap_replay_samples", []
+                    )
+                )
             ),
             "phase2_pause_samples_ms": [
                 sample.phase2_pause_ms
@@ -11001,6 +11658,14 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--inflight-drain-probe", action="store_true", help="allow even-numbered workers to enter real UPDATE lock waits before each DRAIN")
     parser.add_argument("--inflight-probe-min-waits", dest="inflight_probe_min_waits", type=int, default=1, help="minimum simultaneous harness data_lock_waits required before issuing DRAIN in in-flight probe mode")
     parser.add_argument("--inflight-probe-timeout", dest="inflight_probe_timeout_s", type=int, default=5, help="innodb_lock_wait_timeout used by in-flight probe statements")
+    parser.add_argument(
+        "--shutdown-gap-replay-probe",
+        action="store_true",
+        help=(
+            "after mysqld is confirmed down, send one held SQL on its old "
+            "connection and prove it is replayed exactly once only after RESUME"
+        ),
+    )
     parser.add_argument("--large-binlog-cache-sessions", type=int, default=0, help="first N sessions write large payloads to build large binlog transaction caches")
     parser.add_argument("--large-binlog-cache-buckets-mb", type=_parse_positive_mb_list, default=[], help="comma-separated MiB buckets rotated by transaction for large-cache sessions")
     parser.add_argument("--artifact-dir", help="filesystem path used for disk budgeting; required for warmcopy-required large-cache runs")
@@ -11056,6 +11721,15 @@ command is used after each DRAIN command shuts that server down.
             "accept current-process COMMITTED_NOT_READY receiver evidence "
             "when no production physical fence provider exists; this does "
             "not survive receiver restart and never proves promotion readiness"
+        ),
+    )
+    parser.add_argument(
+        "--standby-transfer-timeout-exclusion",
+        action="store_true",
+        help=(
+            "add one ordinary source transaction whose old command exceeds "
+            "the CLOSING deadline; validate survivor-only transfer and the "
+            "exact excluded source connection ID"
         ),
     )
     parser.add_argument(
@@ -11157,6 +11831,7 @@ command is used after each DRAIN command shuts that server down.
         inflight_drain_probe=args.inflight_drain_probe,
         inflight_probe_min_waits=args.inflight_probe_min_waits,
         inflight_probe_timeout_s=args.inflight_probe_timeout_s,
+        shutdown_gap_replay_probe=args.shutdown_gap_replay_probe,
         large_binlog_cache_sessions=large_binlog_cache_sessions,
         large_binlog_cache_buckets_mb=large_binlog_cache_buckets_mb,
         artifact_dir=args.artifact_dir,
@@ -11202,6 +11877,9 @@ command is used after each DRAIN command shuts that server down.
         receiver_physical_copy_before_drain=args.receiver_physical_copy_before_drain,
         standalone_transfer_accept_committed_not_ready=(
             args.standalone_transfer_accept_committed_not_ready
+        ),
+        standby_transfer_timeout_exclusion=(
+            args.standby_transfer_timeout_exclusion
         ),
         reset_drain_phase=args.reset_drain_phase,
         receiver_read_load_threads=args.receiver_read_load_threads,

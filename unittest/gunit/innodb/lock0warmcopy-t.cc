@@ -501,6 +501,7 @@ TEST(LockWarmcopyMetadataPlan, DeadlineAndDictLeaseFailBeforePageAccess) {
   metadata_dict_lease_valid.store(true, std::memory_order_relaxed);
 }
 
+#ifndef NDEBUG
 TEST(LockWarmcopyMetadataPlan, RevalidationUsesStableIdsNotRetainedIndex) {
   constexpr uint32_t kRecordBitmapMargin = 64;
   const uint32_t page_n_heap = 16;
@@ -520,6 +521,7 @@ TEST(LockWarmcopyMetadataPlan, RevalidationUsesStableIdsNotRetainedIndex) {
   EXPECT_TRUE(plan.revalidates_stable_ids_for_unit_test());
   metadata_dict_lease_rebound.store(false, std::memory_order_relaxed);
 }
+#endif
 
 TEST(LockWarmcopyMetadataPlan, PartialDictLeaseAcquireIsReleased) {
   constexpr uint32_t kRecordBitmapMargin = 64;

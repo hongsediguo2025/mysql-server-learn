@@ -9473,7 +9473,7 @@ ER_PRESERVE_TRX_CORRUPT_SNAPSHOT
   eng "Preserved transaction snapshot is corrupt"
 
 ER_PRESERVE_TRX_SESSION_DRAINED
-  eng "This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE"
+  eng "Preserve drain is active; this command was not executed"
 
 ER_PRESERVE_TRX_DRAIN_RESET
   eng "DRAIN TRANSACTIONS PRESERVE was reset before shutdown handoff"

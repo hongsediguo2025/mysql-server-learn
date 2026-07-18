@@ -1,0 +1,1295 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Preserve/Resume 8.0.22：WARMCOPY_CLOSING 全命令截断与超时事务降级设计</title>
+  <style>
+    :root {
+      --ink: #18232c;
+      --muted: #5d6972;
+      --line: #d5dde2;
+      --paper: #ffffff;
+      --canvas: #f3f5f6;
+      --soft: #edf2f3;
+      --green: #087b70;
+      --green-soft: #e4f3ef;
+      --blue: #315f7c;
+      --blue-soft: #e8f0f5;
+      --amber: #976000;
+      --amber-soft: #fff2d5;
+      --red: #973d38;
+      --red-soft: #faeae8;
+      --ok: #3c7451;
+      --ok-soft: #e8f3eb;
+      --code: #20272d;
+      --radius: 6px;
+      --shadow: 0 1px 2px rgba(24, 35, 44, .05), 0 7px 22px rgba(24, 35, 44, .05);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--canvas);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", Arial, sans-serif;
+      font-size: 16px;
+      line-height: 1.72;
+      letter-spacing: 0;
+    }
+    a { color: var(--green); text-underline-offset: 3px; }
+    a:hover { color: #055f58; }
+    code, .mono {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: .92em;
+    }
+    code {
+      padding: .12em .34em;
+      color: #263942;
+      background: #edf1f3;
+      border: 1px solid #dce4e7;
+      border-radius: 4px;
+      overflow-wrap: anywhere;
+    }
+    pre {
+      margin: 15px 0;
+      padding: 16px 18px;
+      overflow: auto;
+      color: #e8edef;
+      background: var(--code);
+      border-radius: var(--radius);
+      font-size: 13px;
+      line-height: 1.62;
+    }
+    pre code { padding: 0; color: inherit; background: none; border: 0; }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(252px, 292px) minmax(0, 1fr);
+      max-width: 1580px;
+      min-height: 100vh;
+      margin: 0 auto;
+      background: var(--paper);
+      box-shadow: 0 0 0 1px rgba(24, 35, 44, .04);
+    }
+    .sidebar {
+      position: sticky;
+      top: 0;
+      align-self: start;
+      height: 100vh;
+      overflow-y: auto;
+      padding: 26px 22px 30px;
+      background: #f8f9fa;
+      border-right: 1px solid var(--line);
+    }
+    .brand {
+      margin-bottom: 21px;
+      padding-bottom: 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand strong { display: block; margin-bottom: 5px; font-size: 17px; line-height: 1.38; }
+    .brand span { color: var(--muted); font-size: 12px; }
+    .toc-title {
+      margin: 0 0 9px;
+      color: #76828b;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .toc { margin: 0; padding: 0; list-style: none; }
+    .toc a {
+      display: block;
+      margin: 1px 0;
+      padding: 6px 9px;
+      color: #43515b;
+      border-left: 2px solid transparent;
+      text-decoration: none;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .toc a:hover { color: var(--ink); background: var(--soft); }
+    .toc a.active {
+      color: var(--green);
+      background: var(--green-soft);
+      border-left-color: var(--green);
+      font-weight: 650;
+    }
+    .content { min-width: 0; padding: 0 5vw 90px; }
+    .hero {
+      margin: 0 -5vw;
+      padding: 54px 5vw 44px;
+      color: #fff;
+      background: #18363b;
+      border-bottom: 6px solid #d2a140;
+    }
+    .eyebrow { margin: 0 0 10px; color: #9bd7cf; font-size: 13px; font-weight: 700; }
+    h1 { max-width: 1100px; margin: 0; font-size: 46px; line-height: 1.16; letter-spacing: 0; }
+    .hero .lead { max-width: 1040px; margin: 21px 0 0; color: #dce9ea; font-size: 18px; }
+    .hero .meta { margin-top: 22px; color: #bad8d7; font-size: 12px; }
+    .summary-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 1px;
+      margin: 0 -5vw 30px;
+      background: var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+    .summary-strip > div { padding: 17px 20px; background: #fbfcfc; }
+    .summary-strip b { display: block; margin-bottom: 3px; font-size: 13px; }
+    .summary-strip span { color: var(--muted); font-size: 12px; }
+    main section { scroll-margin-top: 26px; }
+    h2 { margin: 64px 0 18px; padding-top: 4px; font-size: 28px; line-height: 1.3; letter-spacing: 0; }
+    h2::before { content: ""; display: block; width: 46px; height: 4px; margin-bottom: 13px; background: var(--green); }
+    h3 { margin: 34px 0 11px; font-size: 20px; line-height: 1.4; }
+    h4 { margin: 24px 0 8px; font-size: 16px; }
+    p { max-width: 1080px; margin: 12px 0; }
+    ul, ol { max-width: 1080px; margin: 10px 0 16px 23px; padding: 0; }
+    li { margin: 6px 0; }
+    .section-lead { color: #3d4b55; font-size: 17px; }
+    .note, .boundary, .risk, .success {
+      max-width: 1090px;
+      margin: 18px 0;
+      padding: 15px 18px;
+      border-left: 4px solid var(--green);
+      background: var(--green-soft);
+    }
+    .boundary { border-left-color: var(--amber); background: var(--amber-soft); }
+    .risk { border-left-color: var(--red); background: var(--red-soft); }
+    .success { border-left-color: var(--ok); background: var(--ok-soft); }
+    .note strong, .boundary strong, .risk strong, .success strong { display: block; margin-bottom: 4px; }
+    .grid-2, .grid-3 { display: grid; gap: 14px; margin: 18px 0; }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .panel {
+      min-width: 0;
+      padding: 17px 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: #fff;
+      box-shadow: var(--shadow);
+    }
+    .panel h3, .panel h4 { margin-top: 0; }
+    .panel p:last-child, .panel ul:last-child { margin-bottom: 0; }
+    .panel.green { border-top: 4px solid var(--green); }
+    .panel.blue { border-top: 4px solid var(--blue); }
+    .panel.amber { border-top: 4px solid var(--amber); }
+    .panel.red { border-top: 4px solid var(--red); }
+    .metric { display: block; margin-bottom: 3px; color: var(--green); font-size: 25px; font-weight: 750; }
+    .metric-label { color: var(--muted); font-size: 12px; }
+    .table-wrap { max-width: 1160px; margin: 17px 0 24px; overflow-x: auto; border: 1px solid var(--line); }
+    table { width: 100%; border-collapse: collapse; background: #fff; font-size: 14px; }
+    th, td { padding: 11px 13px; border-bottom: 1px solid var(--line); vertical-align: top; text-align: left; }
+    th { color: #3f4e58; background: #f2f5f6; font-size: 12px; font-weight: 700; }
+    tr:last-child td { border-bottom: 0; }
+    .yes { color: var(--ok); font-weight: 700; }
+    .no { color: var(--red); font-weight: 700; }
+    .state-line {
+      max-width: 1120px;
+      margin: 17px 0;
+      padding: 15px 17px;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--blue);
+      background: var(--blue-soft);
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 13px;
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+    .decision {
+      display: grid;
+      grid-template-columns: 180px minmax(0, 1fr);
+      max-width: 1110px;
+      margin: 12px 0;
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+    .decision b { padding: 12px 14px; background: #edf3f3; border-right: 1px solid var(--line); }
+    .decision div { padding: 12px 15px; }
+    .tag {
+      display: inline-block;
+      margin: 2px 4px 2px 0;
+      padding: 2px 7px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: #f5f7f8;
+      color: #44525c;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .small { color: var(--muted); font-size: 12px; }
+    .footer { margin: 75px -5vw -90px; padding: 24px 5vw; color: #68747c; background: #f2f4f5; border-top: 1px solid var(--line); font-size: 12px; }
+    @media (max-width: 980px) {
+      .layout { display: block; }
+      .sidebar { position: static; width: auto; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+      .toc { columns: 2; }
+      .content { padding: 0 24px 70px; }
+      .hero, .summary-strip, .footer { margin-left: -24px; margin-right: -24px; }
+      .hero, .footer { padding-left: 24px; padding-right: 24px; }
+      h1 { font-size: 38px; }
+      .summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid-3 { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 680px) {
+      body { font-size: 15px; }
+      .toc { columns: 1; }
+      .content { padding: 0 17px 58px; }
+      .hero, .summary-strip, .footer { margin-left: -17px; margin-right: -17px; }
+      .hero { padding: 38px 17px 32px; }
+      .footer { padding-left: 17px; padding-right: 17px; }
+      h1 { font-size: 31px; }
+      h2 { font-size: 24px; }
+      .summary-strip, .grid-2 { grid-template-columns: 1fr; }
+      .decision { grid-template-columns: 1fr; }
+      .decision b { border-right: 0; border-bottom: 1px solid var(--line); }
+      th, td { padding: 9px 10px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <strong>Preserve/Resume 8.0.22</strong>
+        <span>CLOSING command cutoff design</span>
+      </div>
+      <p class="toc-title">目录</p>
+      <ol class="toc">
+        <li><a href="#conclusion">1. 设计结论</a></li>
+        <li><a href="#background">2. 背景与场景</a></li>
+        <li><a href="#scope">3. 边界与非目标</a></li>
+        <li><a href="#facts">4. 当前代码事实</a></li>
+        <li><a href="#problems">5. 当前缺口</a></li>
+        <li><a href="#model">6. 总体流程</a></li>
+        <li><a href="#readiness">7. Phase1 readiness</a></li>
+        <li><a href="#cutoff">8. CLOSING 全命令截断</a></li>
+        <li><a href="#deadline">9. 参数 B 与 deadline</a></li>
+        <li><a href="#policy">10. 参数 A 与超时裁决</a></li>
+        <li><a href="#survivors">11. survivor 增量闭合</a></li>
+        <li><a href="#ha">12. HA 与代理合同</a></li>
+        <li><a href="#errors">13. 结果与错误语义</a></li>
+        <li><a href="#concurrency">14. 并发与竞态</a></li>
+        <li><a href="#implementation">15. 最小实现面</a></li>
+        <li><a href="#metrics">16. 可观测性</a></li>
+        <li><a href="#tests">17. 测试计划</a></li>
+        <li><a href="#delivery">18. 落地顺序</a></li>
+        <li><a href="#matrix">19. 闭环矩阵</a></li>
+      </ol>
+    </aside>
+
+    <div class="content">
+      <header class="hero">
+        <p class="eyebrow">在线 Transfer / 未来物理备机计划内升主</p>
+        <h1>WARMCOPY_CLOSING 全命令截断与超时事务降级设计</h1>
+        <p class="lead">
+          Phase1 尽量吸收正在执行的长命令；CLOSING 发布后，普通业务连接的所有新 command 立即返回 4020；
+          专用 HA 管控连接保持可用；
+          已在执行的命令按统一 deadline 收敛。超时后由一个布尔策略决定整批终止，或只排除超时事务并继续 transfer。
+        </p>
+        <p class="meta">设计日期：2026-07-17　代码基线：580bb688a812a38aa834e4c00d53fa8a51d6a424　状态：待实现</p>
+      </header>
+
+      <div class="summary-strip">
+        <div><b>新 command</b><span>普通业务连接统一 4020，零副作用</span></div>
+        <div><b>旧 command</b><span>允许完成，不 KILL、不强制回滚</span></div>
+        <div><b>超时策略</b><span>整批失败或排除单 token</span></div>
+        <div><b>改动原则</b><span>复用状态、ABORT 与序列化，不改 InnoDB</span></div>
+      </div>
+
+      <main>
+        <section id="conclusion">
+          <h2>1. 设计结论</h2>
+          <div class="success">
+            <strong>一句话裁定</strong>
+            <code>WARMCOPY_CLOSING</code> 是普通客户端业务 command 的硬截断点，不再是“风险 SQL 分类点”。
+            Phase1 尾部只做轻量 readiness 观察，用来减少进入 CLOSING 时已经在执行的长命令；
+            观察不承担正确性，CLOSING 门禁和统一 monotonic deadline 才承担正确性。
+          </div>
+
+          <div class="grid-2">
+            <div class="panel green">
+              <h3>进入 CLOSING 之前</h3>
+              <p>正常业务继续执行，Phase1 继续构建和发送可提前完成的 Preserve 内容。</p>
+              <p>在 Phase1 尾部只读统计正在执行的 command 数量与最老执行时长。若已有明显长命令，则在 Phase1 剩余预算内等待其自然完成。</p>
+            </div>
+            <div class="panel blue">
+              <h3>进入 CLOSING 之后</h3>
+              <p>普通业务连接的所有新 command 在 dispatch 入口直接返回 <code>ER_PRESERVE_TRX_SESSION_DRAINED</code>，错误码 4020；专用 HA 管控连接整体豁免。</p>
+              <p>切换前已经执行中的 command 继续完成；到参数 B 的绝对 deadline 仍未完成时，由参数 A 决定整批失败还是只排除对应 token。</p>
+            </div>
+          </div>
+
+          <div class="boundary">
+            <strong>不要扩大“部分成功”语义</strong>
+            参数 A 只处理“CLOSING 时旧 command 未按期结束”这一种情况。snapshot、seal、传输、digest、receiver commit、
+            final metadata 或任一 survivor 的 Preserve 失败，仍按现有 all-or-nothing 语义终止整批。
+          </div>
+          <div class="risk">
+            <strong>A=OFF 当前不是生产物理升主能力</strong>
+            当前仓库没有 source terminal authority fence 与 production physical apply provider。A=OFF 可以实现和验证 subset transfer，
+            但在这些 provider 落地前只能用于 standalone/simulator 证据，不得作为在线物理升主的生产开关；默认 A=ON 保持现有整批失败语义。
+          </div>
+        </section>
+
+        <section id="background">
+          <h2>2. 背景与场景</h2>
+          <p class="section-lead">
+            本设计服务于在线 transfer 和未来物理备机计划内升主，不服务于本地 shutdown/startup 场景。
+          </p>
+
+          <h3>2.1 HA、代理与 mysqld 的分工</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>组件</th><th>负责内容</th><th>不负责内容</th></tr></thead>
+              <tbody>
+                <tr><td>HA 管控</td><td>使用认证用户名固定为 <code>preserve_trx_ha_admin</code>、并持有 <code>SHUTDOWN</code> 的专用连接发起 DRAIN、RESET 或未来 promotion；停止代理创建新连接；处理 ordinary promotion 降级。</td><td>不解析 InnoDB 内核对象，不参与 transfer frame；不使用该连接承载业务事务。</td></tr>
+                <tr><td>代理</td><td>已有连接继续下发 command；收到 4020 后挂起该 command；按 HA 结果在原主或新主重放。</td><td>不猜测事务是否 Preserve 成功，不把超时排除事务当成可 resume。</td></tr>
+                <tr><td>source mysqld</td><td>Phase1 构建/发送，CLOSING 截断新 command，等待旧 command 收敛，构造 survivor epoch。</td><td>FINAL_ACK 后不等待 target READY，不触发 promotion。</td></tr>
+                <tr><td>target mysqld</td><td>接收、保存、prewarm；未来由 HA 在本地调用 promotion 预埋接口。</td><td>不要求 receiver crash 后恢复 transfer 状态。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>2.2 为什么必须由 mysqld 返回 4020</h3>
+          <p>
+            HA 可以通知代理停止新建连接，但已有代理连接在没有收到特殊错误前仍会继续下发 command。
+            因此，只有 mysqld 在 CLOSING 入口对每个新业务 command 返回 4020，代理才能确定该 command 未执行、可以安全挂起。
+          </p>
+          <div class="note">
+            <strong>command 结果必须闭合</strong>
+            DRAIN 完成时，CLOSING 之前已经接收的 command 要么已经正常完成，要么已经被明确判定为超时；
+            CLOSING 之后接收的业务 command 均已返回 4020。代理侧不存在“已经发给 mysqld 但不知道是否执行”的悬空 command。
+          </div>
+
+          <h3>2.3 HA 专用管控连接</h3>
+          <p>
+            协议层在解析 SQL 之前已经能够读取认证后的 <code>Security_context</code>。首版直接以
+            <code>Security_context::priv_user()</code> 精确等于 <code>preserve_trx_ha_admin</code> 识别专用 HA 账号，
+            并要求该账号持有原有的 <code>SHUTDOWN_ACL</code>。gate 只读取认证账号与有效权限，不解析 SQL 文本、
+            不按业务命令类型做白名单，也不新增 role、动态权限或 wire capability。
+          </p>
+          <ul>
+            <li>HA 身份必须同时满足：认证上下文中的 <code>priv_user()</code> 精确等于 <code>preserve_trx_ha_admin</code>，且有效全局权限包含 <code>SHUTDOWN_ACL</code>。</li>
+            <li>root、SUPER、SYSTEM_USER、SHUTDOWN 或其他动态权限都不会单独获得 HA 身份；MySQL 初始化 root 自动拥有大量权限，因此不能把任一普通 privilege 等同于该专用账号属性。</li>
+            <li>protocol gate 与 SQL gate 仅按上述身份放行，不读取 SQL 文本，也不根据连接当前要执行的是 RESET、SHOW 或 DML 做分类。</li>
+            <li><code>RESET DRAIN</code> 真正执行时再次要求固定 HA 账号，并沿用 <code>check_global_access(..., SHUTDOWN_ACL)</code> 做最终授权。</li>
+            <li>HA 管控连接必须保持 autocommit 且无活动业务事务。readiness 忽略该控制连接；target 枚举若发现它持有显式事务或 RW participant，则整批 fail closed，不把该事务静默排除。</li>
+          </ul>
+          <div class="risk">
+            <strong>信任边界</strong>
+            该连接在 CLOSING 中执行 DML 会绕过 4020，破坏业务封口假设。因此它必须是 HA 专用控制面连接；
+            内核不为“高权限账号同时承载业务 SQL”提供 Preserve 正确性保证。
+          </div>
+          <p class="small">
+            首版只在 protocol gate 的唯一计数点累计 <code>Preserve_trx_closing_control_connection_commands</code>，用于发现 CLOSING
+            期间控制连接的实际使用；SQL gate 不重复计数。本文不新增逐 DML warning 或另一套 SQL 风险分类，具体语句继续由现有 audit/general log
+            记录。该指标只帮助发现账号误配，不能把“控制账号承载业务 SQL”变成受支持用法。
+          </p>
+        </section>
+
+        <section id="scope">
+          <h2>3. 边界与非目标</h2>
+          <div class="grid-2">
+            <div class="panel green">
+              <h3>本轮设计范围</h3>
+              <ul>
+                <li>Phase1 尾部 lightweight readiness 观察。</li>
+                <li>CLOSING 后普通客户端的所有新业务 command 返回 4020。</li>
+                <li>基于认证上下文中的固定 <code>preserve_trx_ha_admin</code> 用户名与 <code>SHUTDOWN_ACL</code> 识别并豁免 HA 专用管控连接。</li>
+                <li>参数 B 定义旧 command 的统一 deadline。</li>
+                <li>参数 A 定义整批失败或单 token 排除。</li>
+                <li>复用现有 per-token <code>ABORT</code>。</li>
+                <li>source 进入 CLOSING 后只按 HA 管控连接身份豁免，不为其他命令类型增加放行口。</li>
+                <li>survivor set、excluded set 与 HA 结果合同。</li>
+                <li>并发裁决、指标和真实测试。</li>
+              </ul>
+            </div>
+            <div class="panel amber">
+              <h3>明确不做</h3>
+              <ul>
+                <li>不实现物理复制 apply/fence provider。</li>
+                <li>不实现 peerid 的 Tx 到 Ty attach。</li>
+                <li>不修改本地 shutdown/startup Preserve。</li>
+                <li>不 KILL 长 SQL，不强制回滚事务。</li>
+                <li>不新增 transfer wire frame 或 wire version。</li>
+                <li>不改 artifact 格式或内核对象序列化。</li>
+                <li>不新增调度线程、预测器或 Pre-CLOSING 状态。</li>
+                <li>不支持任意 Preserve 失败后的部分成功。</li>
+                <li>不新增专用账号表、动态权限或控制面 wire 协议。</li>
+              </ul>
+            </div>
+          </div>
+          <p>
+            <span class="tag">零新 InnoDB hook</span>
+            <span class="tag">零新 receiver crash replay</span>
+            <span class="tag">零新 wire 协议</span>
+            <span class="tag">零通用 SQL 黑名单</span>
+          </p>
+        </section>
+
+        <section id="facts">
+          <h2>4. 当前代码事实</h2>
+          <p>以下事实基于当前 HEAD 的源代码核对。它们用于确定最小改动点，不代表目标行为已经实现。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>代码事实</th><th>当前语义</th><th>设计影响</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><a href="../../sql/preserve_trx.cc"><code>sql/preserve_trx.cc:15935</code></a></td>
+                  <td>Phase1 完成后发布 <code>WARMCOPY_CLOSING</code>，随后枚举 target 并等待。</td>
+                  <td>readiness 观察应插在 transition 之前；硬截断仍以 transition 的线性化时点为准。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/preserve_trx.cc"><code>sql/preserve_trx.cc:5493</code></a></td>
+                  <td><code>preserve_trx_sql_command_may_create_trx_or_lock()</code> 按 SQL 类型判断风险。</td>
+                  <td>该分类可保留给其他状态，但不能再决定 CLOSING 的业务放行。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/preserve_trx.cc"><code>sql/preserve_trx.cc:8895</code></a></td>
+                  <td>CLOSING 目前只阻止“可能建事务或锁”的 SQL。</td>
+                  <td>目标是所有新业务 command 一律截断。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/preserve_trx.cc"><code>sql/preserve_trx.cc:8943</code></a></td>
+                  <td>协议命令同样只按风险分类阻止。</td>
+                  <td>目标是 protocol/SQL 两层共用 HA 管控连接豁免；普通业务 command 在最早可识别的位置截断。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/sql_parse.cc"><code>sql/sql_parse.cc:1624</code></a>、<a href="../../sql/sql_parse.cc"><code>:1679</code></a>、<a href="../../sql/preserve_trx_transfer.cc"><code>sql/preserve_trx_transfer.cc:14380</code></a></td>
+                  <td>protocol gate 位于 transfer command dispatch 之前；receiver data session 使用独立的 <code>PRESERVE_TRX_TRANSFER_ADMIN</code> 动态权限。</td>
+                  <td>source CLOSING 只豁免 HA 管控连接；单独拥有 transfer 动态权限不能绕过 source 门禁。正常 receiver 不处于 source 的 CLOSING 状态。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/preserve_trx.cc"><code>sql/preserve_trx.cc:8845</code></a>、<a href="../../sql/preserve_trx.cc"><code>:17637</code></a></td>
+                  <td>实施前 SQL gate 显式按 <code>SQLCOM_RESET_DRAIN</code> 放行，无法供 protocol pre-parse gate 复用。</td>
+                  <td>实施后两层 gate 统一读取固定 HA 账号；RESET 执行再检查账号与 <code>SHUTDOWN_ACL</code>，无需在门禁解析 SQL 文本。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../unittest/gunit/preserve_trx-t.cc"><code>unittest/gunit/preserve_trx-t.cc:3898</code></a></td>
+                  <td>现有 GUnit 明确断言 CLOSING 时普通 <code>COM_QUERY</code> 仍被允许。</td>
+                  <td>这是当前合同，实施时必须反向更新为全 command 截断。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/sql_parse.cc"><code>sql/sql_parse.cc:1624</code></a>、<a href="../../sql/sql_parse.cc"><code>:2741</code></a></td>
+                  <td><code>BLOCK_SESSION_DRAINED</code> 映射 4020；<code>BLOCK_DRAINING</code> 映射通用 unsupported 错误。</td>
+                  <td>CLOSING 应返回 drained 语义，不能让代理收到通用 Preserve 错误。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/preserve_trx.cc"><code>sql/preserve_trx.cc:5689</code></a>、<a href="../../sql/preserve_trx.cc"><code>:5839</code></a></td>
+                  <td>切换前已执行 command 的 THD 可进入 <code>PENDING_QUIESCE</code>，并在 command boundary 发布 <code>QUIESCED</code> 或 <code>DRAINED_NO_TRANSACTION</code>。</td>
+                  <td>旧 command 自然完成的主干已经存在，应复用而不是新建 waiter 状态机。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/sql_class.h"><code>sql/sql_class.h:1455</code></a>、<a href="../../sql/sql_class.cc"><code>sql/sql_class.cc:2840</code></a></td>
+                  <td><code>THD::start_utime</code> 是普通字段，owner THD 在 <code>set_time()</code> 中无 <code>LOCK_thd_data</code> 写入。</td>
+                  <td>readiness 不能跨线程直接读取它，也不能假设“读侧加锁”可以建立同步；需要 Preserve 自己受同步保护的 command identity。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/preserve_trx.cc"><code>sql/preserve_trx.cc:146</code></a>、<a href="../../sql/sys_vars.cc"><code>sql/sys_vars.cc:1235</code></a></td>
+                  <td>Phase1 timeout 默认 600000ms；当前主要作为 transfer operation timeout。</td>
+                  <td>readiness 不能无限等待。实现时应在 drain 局部捕获同一预算的绝对 deadline，不新增第三个 readiness 参数。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/preserve_trx.cc"><code>sql/preserve_trx.cc:147</code></a>、<a href="../../sql/sys_vars.cc"><code>sql/sys_vars.cc:1243</code></a></td>
+                  <td>Phase2 transfer operation timeout 默认 3000ms。</td>
+                  <td>它是 classic connection 的 connect/read/write operation timeout，不是整个 Phase2 tail 的绝对 deadline。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/preserve_trx.cc"><code>sql/preserve_trx.cc:149</code></a>、<a href="../../sql/preserve_trx.cc"><code>:15941</code></a></td>
+                  <td><code>preserve_trx_warmcopy_close_timeout_ms</code> 默认 30000ms；当前从 CLOSING 起算同一绝对 deadline，依次约束 target wait 和 warmcopy participant prepare/close/tail validation。</td>
+                  <td>参数 B 必须成为该总 deadline 内的 command 子截止线，participant 只能使用剩余预算，不能重新获得 30 秒。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/preserve_trx.cc"><code>sql/preserve_trx.cc:145</code></a>、<a href="../../sql/preserve_trx.cc"><code>:15947</code></a></td>
+                  <td>没有 binlog warmcopy participant 时，target wait 当前回退到默认 30000ms 的 <code>preserve_trx_drain_hard_timeout_ms</code>。</td>
+                  <td>新参数 B 应始终约束 command wait；hard timeout 保留为 drain 外层安全上限，不与 B 重复定义。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/preserve_trx_transfer.h"><code>sql/preserve_trx_transfer.h:882</code></a>、<a href="../../sql/preserve_trx_transfer.cc"><code>sql/preserve_trx_transfer.cc:10149</code></a></td>
+                  <td>source epoch session 已提供单 token <code>abort_token()</code>。</td>
+                  <td>参数 A=OFF 复用它，不增加 EXCLUDE frame。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/preserve_trx.cc"><code>sql/preserve_trx.cc:15625</code></a>、<a href="../../sql/preserve_trx.cc"><code>:16330</code></a></td>
+                  <td>drain 已有 <code>abort_phase1_transfer_targets_not_quiesced()</code>，在 quiesced set 固定后逐个 ABORT 已声明但未入选的 token。</td>
+                  <td>A=OFF 应扩展这一现成接缝，而不是另建排除协议或 receiver 控制面。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/preserve_trx_transfer.cc"><code>sql/preserve_trx_transfer.cc:7190</code></a>、<a href="../../sql/preserve_trx_transfer.cc"><code>:7968</code></a></td>
+                  <td>receiver accepted epoch 构建会跳过 <code>ABORTED</code> token；sealed 检查只要求仍在接收的 token 完整。</td>
+                  <td>现有 receiver registry 已能表达 survivor 子集。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/preserve_trx_transfer.cc"><code>sql/preserve_trx_transfer.cc:13322</code></a></td>
+                  <td>receiver 收到 ABORT 时会清 strict state、prepared token 与 staging；清理失败进入既有 cleanup-pending。</td>
+                  <td>A=OFF 只需复用现有逻辑排除和清理，不增加 receiver 状态机。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/preserve_trx.cc"><code>sql/preserve_trx.cc:16099</code></a></td>
+                  <td>target counter 发现 non-idle/unsupported transaction 时直接清 generation、abort epoch 和 participants。</td>
+                  <td>A=OFF 不能泛化到资格或稳定性失败，只能处理 deadline 下的 <code>PENDING_QUIESCE</code>。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/preserve_trx_drain.cc"><code>sql/preserve_trx_drain.cc:191</code></a>、<a href="../../sql/preserve_trx_drain.cc"><code>:202</code></a></td>
+                  <td>orchestrator 已有普通 success finalize 与 shutdown finalize；后者允许进程退出时延后清理内存状态。</td>
+                  <td>source excluded 资源按 epoch finalize，不为 A=OFF 新增逐 token participant API。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../sql/sql_parse.cc"><code>sql/sql_parse.cc:2332</code></a>、<a href="../../sql/preserve_trx.cc"><code>sql/preserve_trx.cc:16055</code></a></td>
+                  <td>通用 <code>shutdown()</code> 先发送 <code>my_ok()</code>；当前 Preserve success 直接调用该入口。</td>
+                  <td>若 DRAIN 改为结构化结果集，必须抑制普通 shutdown 的第二个响应，同时保持原生 SHUTDOWN 行为不变。</td>
+                </tr>
+                <tr>
+                  <td><a href="../../share/messages_to_clients.txt"><code>share/messages_to_clients.txt:9475</code></a></td>
+                  <td>4020 当前文案断言“事务已经 preserved”。</td>
+                  <td>CLOSING 复用同一错误码后文案必须改为中性语义，只承诺 command 未执行，不承诺事务最终成为 survivor。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="boundary">
+            <strong>现状与目标必须分开</strong>
+            当前代码仍是“风险 command 截断 + 统一整批超时”。本文提出的是待实现合同：
+            “所有新业务 command 截断 + command deadline + 可选单 token 排除”。
+          </div>
+        </section>
+
+        <section id="problems">
+          <h2>5. 当前缺口</h2>
+          <div class="grid-3">
+            <div class="panel red">
+              <h3>命令漏口</h3>
+              <p>普通 SELECT、DO、部分 SET、协议级命令可能在 CLOSING 后继续执行。即使它们看似只读，也可能建立 ReadView、改变会话上下文，或通过 stored routine 触发写入。</p>
+            </div>
+            <div class="panel amber">
+              <h3>长命令放大 Phase2</h3>
+              <p>当前在 Phase1 末尾直接进入 CLOSING。若此时已有明显长 SQL，Phase2 首段只能被动等待，容易消耗全部 close budget。</p>
+            </div>
+            <div class="panel blue">
+              <h3>超时粒度固定</h3>
+              <p>一个 target 未到达 quiesce boundary 会终止整批。计划内倒换需要可配置地排除该事务，让其余事务继续 Preserve。</p>
+            </div>
+          </div>
+          <div class="risk">
+            <strong>不能继续扩 SQL 黑名单</strong>
+            目标不是继续判断哪条 SQL “危险”，而是在 CLOSING 后建立清晰的命令所有权边界：
+            transition 之前已经开始执行的 command 归 source 完成；transition 之后的新业务 command 一律不执行并返回 4020。
+          </div>
+        </section>
+
+        <section id="model">
+          <h2>6. 总体流程</h2>
+          <pre><code>WARMCOPY_DRAINING
+  Phase1 prebuild / stream，业务 command 仍可执行
+  Phase1 尾部 readiness 观察
+    ├─ 无明显长 command：立即进入 CLOSING
+    └─ 有明显长 command：在 Phase1 剩余预算内等待完成
+                    |
+                    v
+WARMCOPY_CLOSING @ t0
+  新业务 command  ------------------------&gt; 4020，未执行
+  t0 前已执行 command --------------------&gt; PENDING_QUIESCE，继续完成
+                    |
+        +-----------+---------------------+
+        |                                 |
+        v                                 v
+  command deadline 前完成            command deadline 时仍在执行
+  有事务 -&gt; QUIESCED                A=ON  -&gt; 整批失败
+  无事务 -&gt; DRAINED_NO_TRANSACTION   A=OFF -&gt; ABORT/exclude token
+        |                                 |
+        +---------------+-----------------+
+                        v
+              survivor set 固定
+              tail catchup / final fence / preserve / seal
+                        |
+                        v
+              COMMIT_EPOCH + FINAL_ACK</code></pre>
+
+          <div class="decision">
+            <b>正确性线性化点</b>
+            <div>manager state 成功发布为 <code>WARMCOPY_CLOSING</code> 的时点 <code>t0</code>。readiness 观察值不决定 command 是否执行。</div>
+          </div>
+          <div class="decision">
+            <b>门禁锁存到 FINAL_ACK / RESET</b>
+            <div>
+              现有流程在 target quiesce 与 participant close 后会把 manager enum 从
+              <code>WARMCOPY_CLOSING</code> 切回 <code>BATCH_DRAINING</code>，再执行 Phase2 catchup、final metadata 与
+              <code>COMMIT_EPOCH</code>。该内部迁移不得重新放开普通连接。transfer drain attempt 在发布
+              <code>WARMCOPY_CLOSING</code> 时锁存 command gate；直到 RESET 进入恢复流程或 shutdown handoff 获胜前，
+              后续 <code>BATCH_DRAINING</code> 仍属于同一个 CLOSING 截断窗口。
+            </div>
+          </div>
+          <div class="decision">
+            <b>超时线性化点</b>
+            <div><code>closing_command_deadline = min(t0 + B, overall_close_deadline)</code>。每个 pending target 在 deadline 下只允许被分类一次。</div>
+          </div>
+          <div class="decision">
+            <b>epoch 线性化点</b>
+            <div>超时裁决完成且 survivor set 冻结之后，final metadata 与 epoch fact 只能包含 survivor token。</div>
+          </div>
+        </section>
+
+        <section id="readiness">
+          <h2>7. Phase1 尾部 lightweight readiness</h2>
+          <p class="section-lead">
+            readiness 的目的只是减少 CLOSING 刚发布时的在执行命令数量，尤其是避免把已经明显变成长 SQL 的 command 带入 1 秒 closing deadline。
+          </p>
+
+          <h3>7.1 观察内容</h3>
+          <p>在最后一次 Phase1 target/lock/binlog prepare 完成后、发布 CLOSING 之前，执行只读 THD 观察：</p>
+          <ul>
+            <li><code>inflight_business_command_count</code>：当前正在执行的业务 command 数。</li>
+            <li><code>oldest_inflight_command_age_ms</code>：最老 command 的已执行时长。</li>
+            <li><code>long_command_count</code>：执行时长已经达到参数 B 的 command 数。</li>
+          </ul>
+          <p>
+            不读取 <code>THD::start_utime</code>。在现有 <code>preserved_trx_mark_inflight_command_packet()</code> Preserve hook 中，
+            为可执行长业务工作的 command 记录受同一同步纪律保护的 <code>preserve_command_sequence</code> 与
+            <code>preserve_command_started_monotonic_us</code>。readiness 仅用它们识别和统计当前 command；不修改通用
+            <code>THD::set_time()</code>，也不把该 identity 带入 artifact 或 wire。无活动事务的 HA 管控连接不计入这些指标。
+          </p>
+          <div class="boundary">
+            <strong>OFF-path 合同</strong>
+            <code>preserve_trx_enable=OFF</code> 时，command marker 必须在写入上述字段、读取 monotonic clock 或获取
+            <code>LOCK_thd_data</code> 之前立即返回。这里保证的是“无新增字段写入、取时钟和取锁”，不宣称消除现有 hook 调用与一次 enable 分支本身的 CPU 开销。
+          </div>
+
+          <h3>7.2 进入 CLOSING 的判断</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>观测结果</th><th>动作</th><th>理由</th></tr></thead>
+              <tbody>
+                <tr><td>没有执行时长达到 B 的 command</td><td>立即发布 CLOSING。</td><td>不等待 command 数清零，避免高 QPS 下 Phase1 永不结束。</td></tr>
+                <tr><td>首次采样存在执行时长达到 B 的 command</td><td>冻结本次等待集合，继续停留在 Phase1，直到集合中的原 command 全部完成或 Phase1 deadline 到达。</td><td>业务尚未被截断，让已经很长的 command 尽量在宽松阶段完成，同时避免持续流量无限扩充等待集合。</td></tr>
+                <tr><td>Phase1 deadline 到达</td><td>停止 readiness 等待，立即进入 CLOSING。</td><td>readiness 不得把 drain 变成无界等待。</td></tr>
+                <tr><td>RESET、owner KILL 或 Phase1 participant 失败</td><td>沿用现有退出/回撤路径。</td><td>不创建新的失败语义。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>7.3 预算与采样纪律</h3>
+          <ul>
+            <li>不新增 readiness sysvar。长命令阈值复用参数 B。</li>
+            <li>等待集合只在 readiness 首次采样时冻结；元素身份使用 <code>(thread_id, preserve_command_sequence)</code>。同一 THD 开始下一条 command 即表示原 command 已完成，新 command 交给 CLOSING+B 处理。</li>
+            <li>readiness 等待上限复用现有 Phase1 总预算。实现时在 two-phase drain 开始处捕获一个 monotonic absolute deadline。</li>
+            <li>当前 <code>preserve_trx_transfer_phase1_timeout_ms</code> 主要用于 transfer operation timeout；实现应明确同一数值也限制 Phase1 readiness，不能只依赖单次 socket timeout。</li>
+            <li>采样 sleep 必须发生在不持 <code>LOCK_thd_data</code>、manager mutex、participant lock 或 transfer session mutex 的位置。</li>
+            <li>首次采样执行一次全 THD 摘要扫描；后续只按冻结的 thread id 定点查询，不得每 10ms 反复全量扫描所有 THD。</li>
+            <li>定点查询不读取事务 payload、不扫描 Undo、不导出锁对象；固定 10 至 50ms 采样即可，不做自适应算法或新 worker。</li>
+          </ul>
+
+          <div class="boundary">
+            <strong>为什么不能等待 inflight count 变为 0</strong>
+            Phase1 期间代理仍可在已有连接上持续下发 command。在高吞吐下，count 可能始终非零。
+            readiness 只等待首次采样时“已经明显长”的 command；随后必须依靠 CLOSING 截断新 command，关闭最后的竞态窗口。
+          </div>
+        </section>
+
+        <section id="cutoff">
+          <h2>8. CLOSING 全命令截断</h2>
+          <h3>8.1 “所有 command”的精确定义</h3>
+          <p>
+            本文门禁只作用于 client protocol dispatch，不扩展到 replica applier、event scheduler 或其他 internal THD。
+            对普通客户端连接，所有新业务 command，包括文本 SQL、prepared statement 执行、cursor fetch、schema/session 操作以及其他 classic protocol 业务命令，
+            均必须在产生业务副作用前返回 4020。不能只覆盖 <code>COM_QUERY</code>，也不能继续依赖 <code>CF_CHANGES_DATA</code>。
+          </p>
+          <div class="boundary">
+            <strong>实现规则是 default-deny</strong>
+            普通认证客户端在 CLOSING 中默认被截断；只有 HA 管控连接可以继续执行新命令。DRAIN owner 的当前 DRAIN 与 t0 前 command
+            属于已经进入执行的旧 command；无响应清理包只完成协议资源释放，不构成业务命令放行。
+            <code>COM_CHANGE_USER</code>、<code>COM_RESET_CONNECTION</code>、<code>COM_STMT_RESET</code>、PING、STATUS、KILL 等均不得因当前风险分类没有命中而漏过。
+          </div>
+
+          <h3>8.2 最小例外</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>类别</th><th>CLOSING 行为</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td>t0 前已进入执行的 command</td><td class="yes">继续执行</td><td>已有 inflight marker 或 target 扫描确认；完成时发布 quiesce/no-transaction。</td></tr>
+                <tr><td>DRAIN owner 的当前 DRAIN 流程</td><td class="yes">继续执行</td><td>它在 t0 前已经进入执行，且实际应由 HA 管控连接发起；这不是 owner 连接后续新 command 的额外白名单。</td></tr>
+                <tr><td>认证用户名为 <code>preserve_trx_ha_admin</code> 且有效持有 <code>SHUTDOWN_ACL</code> 的专用连接</td><td class="yes">所有 command 放行</td><td>protocol/SQL 两层直接读取认证上下文，不解析 SQL；RESET、诊断和管控命令不受 CLOSING 门禁影响。</td></tr>
+                <tr><td>仅持有 <code>PRESERVE_TRX_TRANSFER_ADMIN</code> 的连接</td><td class="no">4020</td><td>该动态权限不能绕过 source CLOSING；正常 target receiver 不处于 source 的 CLOSING manager 状态。</td></tr>
+                <tr><td><code>COM_QUIT</code> 与连接 teardown</td><td class="yes">允许清理</td><td>不要求返回结果，不能因 Preserve 阻止连接释放。</td></tr>
+                <tr><td>普通连接新到达的业务 protocol command</td><td class="no">4020</td><td>在最早可识别的位置阻止，不产生业务副作用。</td></tr>
+                <tr><td>普通连接新到达的业务 SQL command</td><td class="no">4020</td><td>SQL 层保留二次门禁，覆盖文本 SQL 与 prepared execution 等路径。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="small">
+            这里的“业务 command”指能够执行 SQL、改变事务/会话业务语义或产生可见协议结果的 command。
+            <code>COM_QUIT</code>、<code>COM_STMT_CLOSE</code> 这类协议定义为无响应的纯清理命令只能执行清理，不能被强行改造成 4020 响应。
+            <code>COM_STMT_SEND_LONG_DATA</code> 也不是独立 SQL 执行点，但它属于 CLOSING 后新到达的普通 command，不能继续改变
+            prepared-statement 参数缓冲区。内核静默丢弃该无响应 packet，后续 <code>COM_STMT_EXECUTE</code> 返回 4020；代理必须把
+            long-data packets 与 EXECUTE 视为一个可重放的逻辑 command。首版不为这类无响应 packet 新建一套 ACK 协议。
+            已经运行的 binlog dump command 属于 t0 前 inflight；未来物理复制若要求在 CLOSING 后新建 dump connection，应由物理复制集成设计增加精确身份例外，本文不提前放宽。
+          </p>
+
+          <h3>8.3 错误映射</h3>
+          <p>
+            建议新增一个内部 block result，例如 <code>BLOCK_CLOSING_DRAINED</code>，由 protocol 和 SQL 两个 dispatch 入口都映射为
+            <code>ER_PRESERVE_TRX_SESSION_DRAINED</code>。不要把全局 CLOSING 伪装成 THD 已永久进入 <code>PRESERVED_DRAINED</code>，
+            因为 RESET 后这些连接需要恢复正常执行。
+          </p>
+          <p>
+            两个 gate 共用 <code>preserve_trx_is_ha_control_connection(thd)</code>：直接检查
+            <code>Security_context::priv_user()</code> 是否精确等于 <code>preserve_trx_ha_admin</code>，并确认有效权限含
+            <code>SHUTDOWN_ACL</code>。该判断发生在 SQL 解析前，不读取 SQL 文本。实际 RESET 执行仍再次检查账号与
+            <code>check_global_access()</code>；普通 root、PROCESS、SUPER、SYSTEM_USER 或用户名包含 admin 都不会自动获得豁免。
+            连接误持事务不是 gate 的 SQL 分类条件，而是在 target 枚举中触发整批 fail closed。
+          </p>
+          <div class="note">
+            <strong>4020 的唯一承诺</strong>
+            本次 command 没有执行，代理可以挂起。4020 不承诺该事务最终一定被 transfer、prewarm 或 promotion；
+            后续 HA 还要结合 DRAIN result 的 survivor/excluded 列表决定重放位置。
+          </div>
+          <p class="small">
+            保持错误码 4020 不变，但同步把客户端文案改为中性表述，例如：
+            <code>Preserve drain is active; this command was not executed</code>。该文案同时兼容 CLOSING 截断与已 drained 会话，不能继续声称事务已经 Preserve 成功。
+          </p>
+          <div class="boundary">
+            <strong>诊断窗口</strong>
+            普通业务连接在 CLOSING 中执行 SHOW、STATUS、KILL 仍返回 4020，不增加命令级诊断白名单。
+            HA 使用专用管控连接查询状态或执行 RESET，因此既保留业务硬截断，也不存在控制面诊断盲窗。
+          </div>
+        </section>
+
+        <section id="deadline">
+          <h2>9. 参数 B：CLOSING command deadline</h2>
+          <div class="decision">
+            <b>参数名</b>
+            <div><code>preserve_trx_drain_closing_command_timeout_ms</code></div>
+          </div>
+          <div class="decision">
+            <b>建议默认值</b>
+            <div><code>1000</code> ms。该默认值需在实现评审时由真实长 SQL/高并发测试确认。</div>
+          </div>
+          <div class="decision">
+            <b>时间起点</b>
+            <div>manager state 成功发布 <code>WARMCOPY_CLOSING</code> 的 monotonic 时点 <code>t0</code>。</div>
+          </div>
+          <div class="decision">
+            <b>计算公式</b>
+            <div>
+              <code>closing_command_deadline_us = min(t0 + B * 1000, overall_close_deadline_us)</code>
+            </div>
+          </div>
+
+          <h3>9.1 这是全局 deadline，不是每事务 timeout</h3>
+          <ul>
+            <li>所有 t0 前正在执行的 command 共享同一个 deadline。</li>
+            <li>不能在等待某个 token 时重新开始 B，否则 N 个 target 会串行放大为 N×B。</li>
+            <li>target wait 应批量观察或逐个读取同一绝对 deadline。</li>
+            <li>deadline 判断使用 monotonic clock，不使用 THD 的启发式 command start 时间。</li>
+          </ul>
+
+          <h3>9.2 两级 deadline 与串行预算</h3>
+          <p>
+            参数 B 只度量“旧 command 收敛窗口”，它是现有 CLOSING 总预算内的子截止线，不是独立于总预算之外再追加 1 秒。
+            有 warmcopy participant 时，现有 <code>preserve_trx_warmcopy_close_timeout_ms</code> 从 <code>t0</code> 形成
+            <code>overall_close_deadline_us</code>；没有 warmcopy participant 时，复用现有 drain hard deadline 作为外层安全上限。
+          </p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>阶段</th><th>预算合同</th><th>禁止行为</th></tr></thead>
+              <tbody>
+                <tr><td>旧 command 收敛</td><td>所有 target 共用 <code>min(t0+B, overall_close_deadline)</code>。</td><td>不得按 token 重启 B。</td></tr>
+                <tr><td>participant prepare/close</td><td>只使用同一个 <code>overall_close_deadline</code> 的剩余时间。</td><td>command 裁决后不得重新获得完整 30 秒。</td></tr>
+                <tr><td>survivor tail / seal / COMMIT</td><td><code>preserve_trx_transfer_phase2_timeout_ms</code> 继续约束 classic session 的 connect/read/write 单次操作。</td><td>不得把默认 3 秒解释成整个 tail 的绝对总时限。</td></tr>
+                <tr><td>CLOSING 到 FINAL_ACK</td><td>以真实端到端指标计量，并受既有 drain/participant 失败边界约束。</td><td>不得用 <code>B+3s</code> 或其他参数相加伪造 SLO。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>
+            当前执行顺序保持不变：先让旧 command 到达边界并冻结 survivor/excluded，再关闭 participant、补齐增量对象并发送最终 epoch。
+            不能为了并行缩短时间而在旧 command 尚可继续修改 binlog cache、锁或会话状态时提前关闭 participant。
+          </p>
+          <p>
+            若 B 大于外层剩余预算，运行时继续按 <code>min()</code> 安全收敛，不增加跨 sysvar 的硬性 SET 校验。
+            实现应累计 <code>closing_deadline_clamped</code> 并记录有效 command budget；若 command wait 消耗完外层预算，按稳定原因码失败，不能静默给 participant 重新分配时间。
+          </p>
+          <div class="risk">
+            <strong>禁止预算偷换</strong>
+            不能把 3 秒 operation timeout 写成 Phase2 总预算，也不能让 participant prepare/close 在 command wait 后重新开始一轮 30 秒。
+            现有 Phase2 总指标可继续覆盖 CLOSING 后全链路，但报告必须另外给出 command wait、participant close、transfer tail 和 CLOSING 到 FINAL_ACK 总时间。
+          </div>
+          <p class="small">
+            实施时同步修正 sysvar help：<code>preserve_trx_transfer_phase1_timeout_ms</code> 同时作为 Phase1 transfer operation timeout 的数值来源与
+            本设计 readiness 的绝对外层预算；<code>preserve_trx_transfer_phase2_timeout_ms</code> 是 classic session 单次 connect/read/write operation timeout，
+            不得继续描述为 Phase2 “maximum total milliseconds”。
+          </p>
+        </section>
+
+        <section id="policy">
+          <h2>10. 参数 A：整批失败或排除超时 token</h2>
+          <div class="decision">
+            <b>参数名</b>
+            <div><code>preserve_trx_drain_command_timeout_fail_batch</code></div>
+          </div>
+          <div class="decision">
+            <b>建议默认值</b>
+            <div><code>ON</code>，保持现有 all-or-nothing 行为兼容。<code>OFF</code> 本轮只开放给内部测试/standalone simulator；生产物理升主必须等待 source terminal fence 与 apply provider 落地。</div>
+          </div>
+
+          <h3>10.1 A=ON：整批终止</h3>
+          <ol>
+            <li>任一 target 在 <code>closing_command_deadline</code> 仍为 <code>PENDING_QUIESCE</code>，本次 drain 失败。</li>
+            <li>终止 source transfer epoch，receiver 不得形成 accepted epoch。</li>
+            <li>清除 batch generation，沿用现有回撤/失败路径。</li>
+            <li>不 KILL 仍在执行的 command，不把 timeout 转换成事务 rollback。</li>
+            <li>HA 让原主继续承担业务；代理在 HA 确认后把已挂起的 4020 command 重放到原连接。</li>
+          </ol>
+
+          <h3>10.2 A=OFF：只排除未按期结束的 command 对应事务</h3>
+          <ol>
+            <li>deadline 到达后，在目标 THD 的同一次 <code>LOCK_thd_data</code> 临界区校验本 generation 与 <code>PENDING_QUIESCE</code>。</li>
+            <li>若仍超时，在该临界区内原子完成“分类为 excluded → <code>state=NONE</code> → <code>generation=0</code> → 关闭 temp capture epoch”；禁止先分类、解锁后再清 state。</li>
+            <li>释放 <code>LOCK_thd_data</code> 后，再把 source connection id 加入 epoch-local <code>excluded_tokens</code> 并执行可能阻塞的 transfer 操作；锁内不得发网络包或取得 participant lock。</li>
+            <li>若 token 已向 receiver DECLARE 或发送 Phase1 object，复用现有 <code>abort_phase1_transfer_targets_not_quiesced()</code> 接缝，调用 <code>abort_token(token, "closing_command_timeout")</code>。</li>
+            <li>ABORT 必须成功且 ACK 明确；失败或 ACK 不明确时立即整批失败，不得继续构造 survivor epoch，也不得发送 <code>COMMIT_EPOCH</code>。</li>
+            <li>所有 excluded token 都得到确定 ABORT 后才冻结 survivor set；后续 Preserve、seal、final fact 与 COMMIT 只处理 survivor。</li>
+            <li>DRAIN result 返回 excluded token 及稳定原因码，供 HA 通过 peerid 识别不可续作事务。</li>
+          </ol>
+          <p>
+            receiver 侧现有 ABORT handler 会清 strict state、prepared token 与 staging；清理失败转入现有 cleanup-pending，并保持该 token 不可 promotion。
+            source participant 的 Phase1 临时状态不新增逐 token 清理接口。binlog/lock warmcopy 均按 source thread id 保存候选，最终 prepare/close
+            只接收 survivor/quiesced target；excluded token 不进入任何 survivor final artifact。遗留的 source 进程内 working state 在整 epoch
+            abort/reset 或 success finalize 时统一释放。当前成功路径随后 shutdown，可继续调用
+            <code>finalize_participants_for_shutdown()</code>；未来 source 不退出的在线 HA wrapper 必须调用现有
+            <code>finalize_participants()</code> 完成普通成功清理。
+          </p>
+
+          <div class="boundary">
+            <strong>artifact 隔离不变量</strong>
+            excluded token 在排除时点之后产生的 binlog cache、lock 或 temp-table 变化，不得进入任何 survivor 的 digest、fingerprint、final metadata 或 epoch fact。
+            正确性依靠原子清 generation/capture、per-target participant 容器与 survivor-only finalization；不要求为此增加逐 token participant cleanup API。
+          </div>
+
+          <h3>10.3 HA 最终决策下的后续结果</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>HA 最终决策</th><th>excluded 事务在 source 的结果</th><th>代理/target 动作</th></tr></thead>
+              <tbody>
+                <tr><td>不执行 promotion，原主继续</td><td>解除 source gate 后继续作为原事务运行；旧 command 可完成或提交。</td><td>代理在 HA 确认 gate 已解除后，把已挂起的 4020 command 重放到原 Tx。</td></tr>
+                <tr><td>执行 promotion，事务在 source terminal fence 前已提交</td><td>提交结果由物理复制的 redo/Undo/数据页体现，不走 Preserve resume。</td><td>target 必须追到 provider 给出的最终 apply 位点后再开写。</td></tr>
+                <tr><td>执行 promotion，事务在 terminal fence 时仍未提交</td><td>它不在 Preserve epoch 中，由普通 failover/recovery 语义处理。</td><td>不得 attach/resume；未提交事务按普通 failover 回滚。</td></tr>
+                <tr><td>terminal fence 到来时旧 command 仍在执行</td><td>未来 source fence 阻止旧主继续产生写入。</td><td>target 开写前必须确认 fence 生效；不能允许 source 在新主开写后提交。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>
+            这里的“超时”只表示 command 没有在 B 内结束，不表示它已经提交，也不表示 mysqld 主动回滚它。
+            当前代码在 transfer 成功后立即进入 shutdown，因此 A=OFF 的本轮价值是让 survivor epoch 成功，而不是保证 excluded 事务长期留在原主继续服务。
+            只有未来 HA 控制 source terminal fence、target apply catchup 与是否继续保留原主身份时，上表结果才成为完整生产合同。
+          </p>
+
+          <h3>10.4 全部 token 被排除</h3>
+          <p>
+            receiver accepted epoch 当前要求 token 集非空。若 A=OFF 且全部 target 被排除，不发送空 <code>COMMIT_EPOCH</code>，
+            而是终止 transfer epoch并向 HA 返回 <code>NO_PRESERVABLE_TOKENS</code>。这不是 promotion 失败：HA 仍可走普通升主，只是没有事务续作。
+          </p>
+
+          <div class="boundary">
+            <strong>参数 A 的严格适用范围</strong>
+            只有 deadline 时仍处于 <code>PENDING_QUIESCE</code> 的 closing command timeout 可以生成 excluded token。
+            unsupported/unstable session、temp/no-redo 资格不满足、容量不足、participant preflight/close 失败、<code>abort_token()</code> 失败、ACK 不明确、
+            survivor Preserve 失败或 final fact 不一致，都必须整批失败，不能借 A=OFF 静默删除 token 后继续。
+          </div>
+        </section>
+
+        <section id="survivors">
+          <h2>11. survivor 的增量内核对象闭合</h2>
+          <p>
+            Phase1 构建的是候选快照，不是最终快照。所有 survivor 到达 <code>QUIESCED</code> 且 excluded set 固定后，复用现有 Phase2 逻辑完成增量闭合。
+          </p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>内核对象</th><th>Phase1 可提前做</th><th>CLOSING 后必须闭合</th></tr></thead>
+              <tbody>
+                <tr><td>record locks</td><td>预导出 payload、record store、live generation 基线。</td><td>tail catchup、最终 live generation/digest/fingerprint、stale 复验。</td></tr>
+                <tr><td>binlog cache</td><td>流式镜像大部分 payload。</td><td>最后增量、最终长度/digest/handle metadata。</td></tr>
+                <tr><td>table/AUTO_INC locks</td><td>构建候选 metadata。</td><td>从静止事务导出最终集合。</td></tr>
+                <tr><td>MDL</td><td>只做描述符准备。</td><td>导出最终 detached MDL descriptors；target prewarm 不提前 acquire 业务 MDL。</td></tr>
+                <tr><td>ReadView/MVCC</td><td>按准入策略采集候选。</td><td>确认最终 view/active transaction facts 与 eligibility。</td></tr>
+                <tr><td>Undo/XID/trx identity</td><td>prepare LSN、Undo anchors、exact table IDs 等可提前采集。</td><td>最终 identity/fence 校验，不扫描 Undo body。</td></tr>
+                <tr><td>savepoints / participant state</td><td>候选序列化。</td><td>final fence 后固化最终状态。</td></tr>
+                <tr><td>temp table sidecar</td><td>仅在现有支持开关下做 Phase1 delta。</td><td>按现有 participant close/seal 语义闭合；本文不扩大资格范围。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="risk">
+            <strong>A=OFF 下的并发事实</strong>
+            被排除的长 command 仍可能在 source 修改与 survivor 相关的页面或锁坐标。本文不假装当前仓库已具备生产物理 fence。
+            未来 provider 必须在 source terminal fence 与 target apply catchup 后复验 survivor 的 live lock/page/dictionary facts；失效时重导出、排除 survivor 或整体 fail closed。
+          </div>
+          <div class="boundary">
+            <strong>survivor-only 闭合</strong>
+            excluded 的候选 payload 可以暂时留在其自己的 participant entry 中等待 epoch finalize，但任何 survivor finalization 都只能按冻结后的 survivor thread id 集合取数。
+            测试必须让 excluded 的旧 command 在排除后继续产生写入，并证明 survivor digest/final fact 不发生污染。
+          </div>
+        </section>
+
+        <section id="ha">
+          <h2>12. HA 与代理合同</h2>
+          <h3>12.1 DRAIN 返回结果</h3>
+          <p>内核向 HA 同步返回结构化结果，不要求代理解析 error log、SHOW STATUS 或 shutdown 日志：</p>
+          <pre><code>drain_result {
+  generation
+  outcome: SUCCESS | SUCCESS_WITH_EXCLUSIONS |
+           NO_PRESERVABLE_TOKENS | FAILED
+  survivor_tokens[]
+  excluded_tokens[] {
+    source_connection_id
+    reason = CLOSING_COMMAND_TIMEOUT
+  }
+  closing_started_us
+  closing_deadline_us
+}</code></pre>
+          <p>
+            内部 HA 调用面直接返回上述结构；SQL <code>DRAIN TRANSACTIONS PRESERVE</code> 使用一个结果集承载同一内容。
+            结果集按 token 一行，包含 <code>generation</code>、<code>outcome</code>、<code>source_connection_id</code>、
+            <code>token_role</code>（SURVIVOR/EXCLUDED）、<code>reason</code> 和两个 closing 时间字段；没有 token 时返回一行 summary，token 字段为 NULL。
+          </p>
+          <div class="note">
+            <strong>协议兼容与升级</strong>
+            现有 SQL DRAIN 成功面是 OK packet；改为结果集属于调用协议变更。HA/代理必须先升级为完整读取结果集、解析 survivor/excluded，
+            并容忍结果发送完成后连接因 source shutdown 断开，再部署返回结果集的 mysqld。首版采用 HA 与 mysqld 协同升级，不增加旧 OK/新结果集双模式、协商参数或 wire 版本。
+          </div>
+          <div class="boundary">
+            <strong>响应必须先于 server shutdown</strong>
+            SQL 路径只能发送一个完整 response：FINAL_ACK 后先把 active attempt 原子推进到不可 RESET 的 terminal handoff，
+            再写完并 flush 上述结果集，最后进入 <code>SHUTDOWN_REQUESTED</code> 和 server shutdown。
+            最小实现是在现有 <code>shutdown()</code> 增加窄范围的 <code>send_response</code> 参数，默认值保持 <code>true</code>；普通 SHUTDOWN 调用不变，
+            只有已经完整发送 DRAIN result 的 Preserve 路径传 <code>false</code>，从而只跳过 <code>my_ok()</code> 而继续执行原权限、日志和 <code>kill_mysql()</code> 流程。
+            若 result 写入或 flush 失败，receiver 已接受的 epoch不能反向撤销；source 仍进入 terminal handoff，HA 按控制连接响应丢失处理。
+            error log/status var 只用于诊断，不是 HA 的结果传输面。
+          </div>
+
+          <h3>12.2 代理动作</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>HA 结果</th><th>代理如何处理已挂起的 4020 command</th></tr></thead>
+              <tbody>
+                <tr><td>RESET/整批失败，原主继续</td><td>等待 HA 确认 source gate 已解除，在原 Tx 上重放。</td></tr>
+                <tr><td>promotion 成功且 token 为 survivor</td><td>建立到新主的 Ty，调用未来 attach/resume；只有收到 RESUME 成功响应后，才在该 Ty 上单次重放 command。</td></tr>
+                <tr><td>token 被 excluded，HA 决定不 promotion</td><td>等待 source gate 解除，在原 Tx 上重放；事务可以继续完成或提交。</td></tr>
+                <tr><td>token 被 excluded，HA 决定 promotion</td><td>不得当作可 resume 事务；按普通 failover 失败/回滚合同处理。</td></tr>
+                <tr><td>无事务会话获得 4020</td><td>promotion 后可在新连接重放；不需要事务 attach。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="boundary">
+            <strong>RESUME 成功是事务 command 重放的硬前置条件</strong>
+            对 survivor，代理必须按“连接新主 → token/peerid 映射 → RESUME 成功 → 单次重放原 command”的顺序执行。
+            新主连接失败、RESUME 失败、RESUME 响应不明确或连接再次断开时，均不得下发原 command；继续保持挂起并把失败交给 HA。
+            4020 只证明 source 没有执行该 command。若 command 是在 HA 已确认旧 mysqld 完全退出之后才下发，transport disconnect 也能证明该次发送没有进入旧 server；
+            任意时点发生的普通网络断连仍可能结果不明确，不能一概当作可重放信号。
+          </div>
+
+          <h3>12.3 FINAL_ACK 后边界不变</h3>
+          <p>
+            source 收到 FINAL_ACK 后 transfer 协议结束。target 后续 prewarm、TTL、promotion 或 abandon 由 target 和 HA 管控；
+            source 不查询 READY、不触发 promotion，也不因 target 后续失败重新打开本 epoch。
+          </p>
+        </section>
+
+        <section id="errors">
+          <h2>13. 结果与错误语义</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>事件</th><th>SQL/内部结果</th><th>是否接受 epoch</th></tr></thead>
+              <tbody>
+                <tr><td>CLOSING 后普通业务连接的新 command</td><td>4020；command 未执行。</td><td>与该次 command 无关。</td></tr>
+                <tr><td>CLOSING 后 HA 专用管控连接的 command</td><td>绕过门禁，进入普通解析与权限检查。</td><td>与该次管控 command 无关。</td></tr>
+                <tr><td>A=ON 且任一旧 command 超时</td><td>DRAIN 失败，原因 <code>CLOSING_COMMAND_TIMEOUT_BATCH</code>。</td><td class="no">否</td></tr>
+                <tr><td>A=OFF，部分 token 超时</td><td>DRAIN 成功但带 exclusions。</td><td class="yes">仅 survivor</td></tr>
+                <tr><td>A=OFF，全部 token 超时</td><td><code>NO_PRESERVABLE_TOKENS</code>，普通 promotion 可继续。</td><td class="no">否</td></tr>
+                <tr><td>资格、session stability 或 participant 失败</td><td>无论 A 值均整批失败。</td><td class="no">否</td></tr>
+                <tr><td>单 token ABORT 失败或 ACK 不明确</td><td>整批 transfer 失败。</td><td class="no">否</td></tr>
+                <tr><td>survivor 的 snapshot/seal/final metadata 失败</td><td>整批 transfer 失败。</td><td class="no">否</td></tr>
+                <tr><td>COMMIT_EPOCH 已确定接受</td><td>FINAL_ACK；source transfer 结束。</td><td class="yes">是</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>
+            4020 是可重放信号；excluded 是不可 Preserve 信号；两者不能混为一谈。同一连接上，t0 前已经执行的旧 command 可能在 deadline 被 excluded；
+            该 command 后续完成后，连接读取到的下一条 t0 后 command 才返回 4020。这是两个不同 command 的不同信号。
+          </p>
+        </section>
+
+        <section id="concurrency">
+          <h2>14. 并发与竞态</h2>
+          <h3>14.1 transition 与新 command</h3>
+          <p>
+            command admission 必须读取 manager state 的同一发布序列。若 command 在 CLOSING publication 前完成 admission，它属于旧 command；
+            publication 后才进入 gate，普通业务连接返回 4020，HA 专用管控连接绕过门禁。不能出现“看见 CLOSING 但仍按 SQL 风险分类放行”的中间态。
+          </p>
+          <p>
+            classic protocol 每个连接一次只处理一个 command；t0 前旧 command 未完成时，同连接不会并行 dispatch 下一条 command。
+            本设计依赖该半双工不变量区分 old/new command；未来若引入同连接 pipelining，必须重新设计 command identity 与 admission，而不能沿用本合同。
+          </p>
+          <p>
+            控制连接豁免只解决控制面可达性。readiness 直接忽略专用控制连接，避免 PING/SHOW/RESET 拖住 Phase1；target 枚举若发现它持有显式事务或 RW participant，则必须把该事实作为不满足控制连接合同处理并整批失败，
+            不能一边绕过 command gate 一边把它从 Preserve 正确性集合中静默删除。
+          </p>
+
+          <h3>14.2 command boundary 与 deadline 同时发生</h3>
+          <p>在目标 THD 的同一次 <code>LOCK_thd_data</code> 临界区完成一次性裁决：</p>
+          <ul>
+            <li>若 command boundary 已发布 <code>QUIESCED</code> 或 <code>DRAINED_NO_TRANSACTION</code>，按完成处理。</li>
+            <li>若仍为本 generation 的 <code>PENDING_QUIESCE</code>，A=ON 按整批失败；A=OFF 在锁内原子分类并清 <code>state/generation/capture</code>。</li>
+            <li>排除后即使 command 下一微秒完成，也不能重新加入已冻结的 survivor set。</li>
+            <li>excluded vector、ABORT 网络发送和 participant 操作在解锁后完成；持 manager mutex/participant lock 时不得获取目标 <code>LOCK_thd_data</code>。</li>
+          </ul>
+
+          <h3>14.3 RESET</h3>
+          <p>
+            RESET 赢时沿用现有 attempt/generation 回撤：立即解除 CLOSING gate，让原连接恢复业务；readiness waiter、target waiter 与 sender 看见 reset marker 后退出。
+            本设计不重新定义 FINAL_ACK 后 RESET 的所有权合同。
+          </p>
+
+          <h3>14.4 ABORT 与 COMMIT</h3>
+          <p>
+            所有 timeout exclusion 必须在 source epoch session 进入 commit 前完成。现有 <code>abort_token_locked()</code> 已拒绝
+            <code>m_epoch_committed</code> 或 <code>m_commit_in_progress</code>，应继续作为硬约束。每个已声明的 excluded token 必须得到确定 ABORT ACK；
+            任一失败或 ACK ambiguity 都终止整批，不能先从 final fact 删除 token 再继续 COMMIT。receiver 的物理 staging cleanup 复用现有 handler，失败只形成 cleanup debt，
+            不会把 token 恢复为 promotion-visible。
+          </p>
+
+          <h3>14.5 DRAIN result 与 shutdown</h3>
+          <p>
+            survivor/excluded 集合在 COMMIT 前冻结；FINAL_ACK 确认后结果内容不再变化。active attempt 必须先 CAS 到 terminal handoff，拒绝后续 RESET，
+            SQL owner 再在进入 <code>SHUTDOWN_REQUESTED</code> 和 server shutdown 前同步发送结果，且 shutdown 路径不得再发送第二个 OK。
+            若连接在响应期间断开，不能反向修改 receiver 已接受的 epoch；HA 按控制连接断开处理，不由 source 重开 transfer。
+          </p>
+        </section>
+
+        <section id="implementation">
+          <h2>15. 最小实现面</h2>
+          <p class="section-lead">不新增模块，不修改 InnoDB，不改 transfer wire。实现尽量集中在现有 drain orchestration 与 dispatch gate。</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>文件</th><th>最小修改</th><th>避免事项</th></tr></thead>
+              <tbody>
+                <tr><td><code>sql/preserve_trx.cc</code></td><td>Phase1 readiness observer；HA 控制连接识别；CLOSING 全业务 command gate；两级绝对 deadline；survivor/excluded 分类；调用现有 abort_token；构造 DRAIN result。</td><td>不改 shared recovery/resume kernel，不增加通用调度层或逐 token participant 清理 API。</td></tr>
+                <tr><td><code>sql/preserve_trx.h</code></td><td>仅声明 A/B 参数、内部 block result、控制连接判断和必要结果结构。</td><td>不暴露 test-only API。</td></tr>
+                <tr><td><code>sql/sql_class.h</code></td><td>增加仅供 Preserve readiness 使用、由现有 command marker 同步维护的 command sequence/start monotonic time。</td><td>不修改通用 <code>THD::set_time()</code>，不把字段写入 artifact/wire。</td></tr>
+                <tr><td><code>sql/sql_parse.cc/.h</code></td><td>protocol/SQL 两处把 CLOSING block result 映射为 4020；保留 teardown/HA/transfer 例外；给 <code>shutdown()</code> 增加默认兼容的 response 开关。</td><td>普通 SHUTDOWN 继续返回原有 OK；不改 parser/optimizer/execute 语义。</td></tr>
+                <tr><td><code>sql/sys_vars.cc</code>、<code>sql/system_variables.h</code></td><td>增加 A/B 两个参数，修正 phase1/phase2 既有 help，并同步手册说明。</td><td>不增加 readiness 第三个参数。</td></tr>
+                <tr><td><code>share/messages_to_clients.txt</code></td><td>保持错误码 4020，改为“command 未执行”的中性文案。</td><td>不承诺事务一定 Preserve 成功，不新增代理错误码。</td></tr>
+                <tr><td><code>sql/preserve_trx_transfer.cc/.h</code></td><td>原则上不改 wire；只有现有 result 暴露不足时补最小 helper。</td><td>不增加 EXCLUDE frame/version。</td></tr>
+                <tr><td><code>sql/preserve_trx_resource.cc/.h</code>、<code>sql/mysqld.cc</code></td><td>按现有 SHOW STATUS 注册方式增加分段聚合指标。</td><td>不新建 P_S 表或诊断线程。</td></tr>
+                <tr><td>MTR/E2E 为主，GUnit 为辅</td><td>MTR 覆盖真实协议与 server 状态，standalone E2E 覆盖双 mysqld transfer/ACK/READY 对账；GUnit 只覆盖纯决策和 deadline 计算。</td><td>GUnit、source-shape lint 或 fake receiver 不能替代真实 runtime 证据。</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>15.1 推荐内部结构</h3>
+          <pre><code>struct Preserve_trx_closing_result {
+  std::vector&lt;my_thread_id&gt; survivor_thread_ids;
+  std::vector&lt;my_thread_id&gt; drained_no_transaction_thread_ids;
+  std::vector&lt;my_thread_id&gt; excluded_timeout_thread_ids;
+};
+
+struct Preserve_trx_readiness_identity {
+  my_thread_id thread_id;
+  uint64_t preserve_command_sequence;
+};</code></pre>
+          <p>
+            这是 drain 栈内、generation-local 的结果，不需要新全局 registry。超时排除可通过清理该 THD 的 generation/state 表达，
+            不要求给 <code>Preserve_trx_batch_thd_state</code> 增加长期可见的 <code>EXCLUDED</code> 状态。readiness 的 frozen offender identity
+            同样只保存在栈内集合中；THD 上只保留轻量 sequence/start time，不保存 drain 集合或新状态机。
+          </p>
+
+          <h3>15.2 工作量评估</h3>
+          <p>
+            若严格复用现有 <code>PENDING_QUIESCE</code>、manager publication、per-token ABORT 和 receiver accepted-epoch 过滤，
+            预计生产代码约 500 至 800 行，不含测试和文档。主要复杂度在 command matrix、同步 command identity、原子排除、预算传递和结果报告，
+            不在内核对象序列化；若明显超过该范围，应先检查是否误引入新状态机、adapter 或逐 token participant cleanup。
+          </p>
+          <div class="boundary">
+            <strong>变更审查门槛</strong>
+            若实施开始修改 InnoDB lock/trx/undo、carrier 格式、receiver crash replay、promotion provider 或新增后台线程，应暂停并重新评审；
+            这些都不属于本设计的必要修改。
+          </div>
+        </section>
+
+        <section id="metrics">
+          <h2>16. 可观测性</h2>
+          <p>复用现有 SHOW STATUS 基础设施，增加最少的聚合指标，不新建 P_S 表：</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>指标</th><th>含义</th></tr></thead>
+              <tbody>
+                <tr><td><code>Preserve_trx_phase1_readiness_samples</code></td><td>Phase1 尾部采样次数。</td></tr>
+                <tr><td><code>Preserve_trx_phase1_readiness_wait_us</code></td><td>因明显长 command 延迟进入 CLOSING 的时间。</td></tr>
+                <tr><td><code>Preserve_trx_phase1_readiness_oldest_command_ms</code></td><td>最后一次采样的最老 command 年龄，仅诊断。</td></tr>
+                <tr><td><code>Preserve_trx_closing_inflight_commands</code></td><td>t0 时已在执行的 command 数。</td></tr>
+                <tr><td><code>Preserve_trx_closing_completed_before_deadline</code></td><td>B 内自然完成的旧 command 数。</td></tr>
+                <tr><td><code>Preserve_trx_closing_timed_out_commands</code></td><td>deadline 时仍未完成的 command 数。</td></tr>
+                <tr><td><code>Preserve_trx_closing_excluded_tokens</code></td><td>A=OFF 排除 token 数。</td></tr>
+                <tr><td><code>Preserve_trx_closing_wait_us</code></td><td>t0 到 timeout classification 完成的时间。</td></tr>
+                <tr><td><code>Preserve_trx_closing_last_excluded_token</code></td><td>最近排除的 source connection id，用于快速诊断。</td></tr>
+                <tr><td><code>Preserve_trx_closing_deadline_clamped</code></td><td>B 被外层剩余预算截短的次数；同时记录最近有效 command budget。</td></tr>
+                <tr><td><code>Preserve_trx_closing_control_connection_commands</code></td><td>CLOSING 期间 HA 控制连接通过 protocol gate 的 command 数；每个 protocol command 只计一次，用于发现控制账号误用。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>
+            性能报告同时输出 <code>phase1_readiness_wait_us</code>、<code>closing_command_wait_us</code>、
+            现有 <code>Preserve_trx_phase2_participant_prepare_us</code> / <code>Preserve_trx_phase2_participant_close_us</code>、
+            <code>phase2_transfer_tail_us</code> 和 <code>closing_to_final_ack_us</code>，禁止只展示其中最短的一段或把 3 秒 operation timeout 当作总耗时上限。
+          </p>
+        </section>
+
+        <section id="tests">
+          <h2>17. 测试计划</h2>
+          <div class="success">
+            <strong>验收主线：MTR + Standalone E2E</strong>
+            测试代码和 release 证据以真实 mysqld 为主。MTR 负责单/多连接协议行为、权限、DEBUG_SYNC 竞态和零副作用；
+            standalone 双 mysqld E2E 负责 source/receiver、ABORT/COMMIT/FINAL_ACK、READY 与 token 对账。
+            GUnit 只验证不需要网络、THD 生命周期或真实 receiver 的纯决策逻辑，不能单独关闭任何端到端验收项。
+          </div>
+
+          <h3>17.1 GUnit：仅纯决策辅助</h3>
+          <ul>
+            <li>default-deny command 分类表及 t0 前 inflight、HA 管控连接、无响应 teardown 的纯 block-result 决策。</li>
+            <li><code>min(t0+B, overall close deadline)</code>、剩余预算、clamp 计数和多 target 不产生 N×B 的纯时间计算。</li>
+            <li>readiness frozen identity 集合的 sequence 比较、首次冻结和后续新 command 不扩充集合。</li>
+            <li>A=ON/A=OFF 的纯分类结果、全部 excluded 判定以及 DRAIN result 序列化。</li>
+            <li>不得为方便 GUnit 在生产头文件增加 <code>*_for_unit_test</code> API；需要真实 THD/网络/receiver 的行为直接进入 MTR/E2E。</li>
+          </ul>
+
+          <h3>17.2 MTR：协议、并发与零副作用主回归</h3>
+          <ul>
+            <li>在 CLOSING DEBUG_SYNC 窗口由普通连接发送 COM_QUERY、prepared execute/fetch、INIT_DB、PING、SET、DO、SHOW、STATUS、KILL、CHANGE_USER、RESET_CONNECTION、STMT_RESET 等，除明确的无响应 teardown 外均得到 4020。</li>
+            <li>认证用户名精确为 <code>preserve_trx_ha_admin</code> 且有效持有 <code>SHUTDOWN_ACL</code> 的专用连接，在同一窗口可执行 PING、SHOW STATUS 和 RESET DRAIN；普通 root 或仅持 SHUTDOWN 的连接不能绕过。</li>
+            <li>控制连接依次执行 PING、SHOW STATUS 和 RESET DRAIN 时，<code>Preserve_trx_closing_control_connection_commands</code> 每个 protocol command 只增加一次，SQL 二次门禁不得重复计数。</li>
+            <li>仅持有 <code>PRESERVE_TRX_TRANSFER_ADMIN</code>、不具备 HA 身份的连接在 source CLOSING 窗口同样得到 4020；另设 receiver 正常状态用例证明原 transfer handler 未受影响。</li>
+            <li>另一个 HA 控制连接持有活动事务时，DRAIN 整批失败而不是忽略该事务。</li>
+            <li>验证每条被 4020 截断的 command 没有数据、事务、schema、session variable 或 cursor side effect。</li>
+            <li>4020 客户端文案只声明 command 未执行；CLOSING 下无事务会话和随后被 excluded 的事务均不得收到“事务已经 Preserve”的误导文本。</li>
+            <li>一个 t0 前已执行的长 command 正常返回；同连接下一条 command 得到 4020。</li>
+            <li>A=ON：确定性长 command 超过 B，source 不发送 accepted epoch；HA 解除 gate 后，代理在原连接重放先前 4020 command 成功。</li>
+            <li>A=OFF 下构造 unsupported/unstable target，断言仍整批失败，不被归类为 timeout exclusion。</li>
+            <li>DRAIN result 返回被排除的 source connection id 和 <code>CLOSING_COMMAND_TIMEOUT</code>。</li>
+            <li>SQL 客户端在 source shutdown 前完整收到唯一 DRAIN result set，不再收到额外 OK packet。</li>
+            <li>全部 token 超时返回 no-preservable，不发送空 COMMIT；no-target/no-quiesced 分支也走同一结构化结果面。</li>
+            <li>RESET 在 readiness/CLOSING wait 中解除 gate；代理模拟客户端在原连接重放 4020 command 成功。</li>
+          </ul>
+
+          <h3>17.3 Standalone 双 mysqld E2E：transfer 真实性主证据</h3>
+          <ul>
+            <li>source 真实 DRAIN，target 真实 receiver save/prewarm；代理模拟层挂起 4020 command。</li>
+            <li>内部测试能力开启 A=OFF 时，survivor epoch 正常 FINAL_ACK，excluded token 不出现在 target READY summary。</li>
+            <li>3 个 token 中 1 个超时：receiver epoch fact 只有 2 个 survivor，第三个为 ABORTED 且不可 READY。</li>
+            <li>excluded 旧 command 在排除后继续产生真实写入，receiver 侧 survivor digest/fingerprint/final fact 均不含该 token 的变化。</li>
+            <li>在真实 frame/ACK 路径注入 ABORT failure 和 ACK ambiguity，断言 source 整批失败且 receiver 不接受 <code>COMMIT_EPOCH</code>。</li>
+            <li>全部 excluded、no-target 和 no-quiesced 分支分别验证无空 epoch、唯一结构化结果及 receiver 状态收敛。</li>
+            <li>readiness 场景分别覆盖无长 SQL、一个长 SQL在 Phase1 完成、长 SQL跨越 Phase1 deadline。</li>
+            <li>报告 readiness、command wait、participant prepare/close、transfer tail、CLOSING 到 FINAL_ACK 时延和 source/receiver token 对账。</li>
+          </ul>
+          <div class="boundary">
+            <strong>证据边界</strong>
+            当前仓库没有真实物理复制和升主流程。E2E 只能证明 command 截断、subset transfer、receiver save/prewarm 和 simulator 合同，
+            不能宣称完成真实物理 promotion E2E，也不能据此把 A=OFF 标记为 production-ready。
+          </div>
+
+          <h3>17.4 Local startup E2E：停机窗口与续作顺序模拟</h3>
+          <ul>
+            <li>真实 DRAIN 关闭 mysqld，并通过 socket、pid file 和 quiet period 确认旧进程已经退出。</li>
+            <li>确认停机后，在旧业务连接上发送一条尚未执行的 SQL，必须观察到 transport disconnect；在此之前不得启动新 mysqld。</li>
+            <li>启动 mysqld并完成 startup recovery 后，先对对应 token 执行真实 SQL RESUME；RESUME 未成功时，原 SQL 的发送次数必须为零。</li>
+            <li>RESUME 成功后在新连接上重放同一 SQL，发送次数严格为一；报告记录 SQL digest、disconnect、restart、RESUME、replay send/completion 的单调时间序列。</li>
+            <li>该用例只验证共享 startup/resume 内核与代理时序，可为未来 promotion 对接提供证据；它不冒充物理备机升主 E2E。</li>
+          </ul>
+
+          <h3>17.5 隔离性回归</h3>
+          <ul>
+            <li><code>preserve_trx_enable=OFF</code> 时 command dispatch 与原生 MySQL 完全一致。</li>
+            <li>MTR 运行同一 command matrix 验证 OFF 时原生行为；辅助 source-shape lint 同时锁定 OFF 短路位于新 CLOSING default-deny 分支以及 command identity 字段写入、monotonic clock 读取和 <code>LOCK_thd_data</code> 获取之前。</li>
+            <li>单事务 local preserve、shutdown/startup recovery、SQL RESUME 行为不变。</li>
+            <li>A/B 只在 two-phase online transfer CLOSING 中生效。</li>
+            <li>既有 receiver restart 无状态、FINAL_ACK 后 source 解耦合同不变。</li>
+          </ul>
+        </section>
+
+        <section id="delivery">
+          <h2>18. 推荐落地顺序</h2>
+          <ol>
+            <li><b>S0：锁定测试合同。</b>先补失败态 MTR 和最小 GUnit：用真实 command 证明当前 COM_QUERY 会漏过、BLOCK_DRAINING 错误码不对、timeout 只能整批失败，并锁定 HA 控制连接身份合同。</li>
+            <li><b>S1：全 command 4020。</b>只改 manager gate、sql_parse 映射和 4020 文案，落实 default-deny；只有 t0 前 inflight 和 HA 控制连接可继续，无响应 teardown 只释放协议资源。</li>
+            <li><b>S2：参数 B。</b>把 command deadline 嵌入现有 overall close deadline，传递剩余预算，并分离 command wait、participant close 与 transfer tail 指标。</li>
+            <li><b>S3：Phase1 readiness。</b>复用现有 command marker 维护同步 identity；增加栈内 observer，首次扫描冻结 offender，后续定点查询，复用 B 阈值和 Phase1 budget，不增加线程。</li>
+            <li><b>S4：A=OFF + HA result 单一交付切片。</b>在同一不可拆分切片中完成原子排除、survivor/excluded set、确定 ABORT、结构化结果、唯一 response 与双 mysqld E2E；完成前 A=OFF 不能对外启用。</li>
+            <li><b>S5：未来 production provider。</b>由物理备机项目接入 source terminal fence、target apply catchup 和 HA authority 后，才评审 A=OFF 的生产启用。</li>
+          </ol>
+          <p>
+            S1、S2、S3 可先以 A=ON 保持现有整批语义。S4 的内部实现可以分小提交，但 subset epoch 与 HA 可观测结果必须作为同一 release unit，
+            不能留下“receiver 已接受 survivor、HA 却不知道谁被排除”的中间能力。
+          </p>
+        </section>
+
+        <section id="matrix">
+          <h2>19. 设计闭环矩阵</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>需求</th><th>设计落点</th><th>验收</th></tr></thead>
+              <tbody>
+                <tr><td>CLOSING 后业务 command 被截断</td><td>普通连接由 protocol + SQL 双门禁 default-deny 并统一返回 4020；只有 HA 控制连接和 t0 前已执行 command 可继续，无响应 teardown 只做资源释放。</td><td>command matrix + 零副作用断言。</td></tr>
+                <tr><td>HA 控制面持续可用</td><td>两层 gate 在 pre-parse 阶段共用固定 <code>preserve_trx_ha_admin</code> 账号 + <code>SHUTDOWN_ACL</code> 身份判断；不解析 SQL。readiness 忽略控制连接，target 枚举发现其持有显式事务或 RW participant 时整批失败。</td><td>RESET/SHOW/PING 可用；普通 root 仍为普通连接；HA 账号误承载业务事务时 fail closed。</td></tr>
+                <tr><td>旧 command 继续执行</td><td>复用 PENDING_QUIESCE 和 command boundary publication。</td><td>长 command 正常返回，下一 command 4020。</td></tr>
+                <tr><td>尽量减少 CLOSING inflight</td><td>Preserve command sequence/start time 提供同步 identity；首次全量采样冻结明显长 command，后续只定点查询。</td><td>不读取 <code>start_utime</code>；新流量不延长 readiness；三场景及 wait 指标。</td></tr>
+                <tr><td>CLOSING timeout 从进入时算</td><td><code>min(t0+B, overall close deadline)</code>，所有 target 共用；participant 只得剩余预算。</td><td>多 target 不出现 N×B，participant 不重启 30 秒。</td></tr>
+                <tr><td>A=ON 整批失败</td><td>沿用现有 fail-closed cleanup。</td><td>无 accepted epoch。</td></tr>
+                <tr><td>A=OFF 只排除 timeout 事务</td><td><code>LOCK_thd_data</code> 内原子清 state/generation/capture，锁外确定 ABORT，survivor-only finalization；source participant 按 epoch finalize。</td><td>3 取 2、排除后污染和 ABORT ambiguity；当前仅 simulator。</td></tr>
+                <tr><td>未按期结束不等于已提交</td><td>excluded 事务退出 Preserve candidate；旧 command 不被 KILL，最终结果由当前 shutdown 或未来 source fence 决定。</td><td>commit、未提交、fence 中断三类语义测试或未来 HA 测试。</td></tr>
+                <tr><td>Preserve 不阻塞普通升主</td><td>全部 excluded 返回 no-preservable；部分 excluded 在 promotion 时交给 ordinary failover，未 promotion 时可回到原 Tx。</td><td>HA simulator 同时覆盖 promotion/no-promotion 分支。</td></tr>
+                <tr><td>HA 获得确定结果</td><td>内部 API 返回结构；SQL 在 shutdown 前发送唯一 result set。</td><td>响应完整，无第二个 OK，不依赖日志。</td></tr>
+                <tr><td>不过度设计</td><td>两个参数、两个轻量 THD readiness 字段、一个栈内 observer、现有状态、现有 ABORT/finalize、零新 wire、零 InnoDB 改动。</td><td>变更文件、LOC 上限与 source-shape 审查。</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="success">
+            <strong>最终设计原则</strong>
+            Phase1 readiness 负责“尽量少带长 command 进入 CLOSING”；CLOSING 4020 负责“停止接收新业务工作”；
+            参数 B 负责“给旧 command 一个统一结束边界”；参数 A 负责“决定 timeout 的批次粒度”。
+            HA 专用控制连接只保证控制面在硬截断期间可达，不承载业务事务。各职责分开，且全部建立在现有 drain、THD batch state、transfer ABORT、
+            participant finalize 和 Preserve 序列化之上。
+          </div>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <p>
+          本文基于 MySQL 8.0.22 Preserve/Resume 工作树 HEAD
+          <span class="mono">580bb688a812a38aa834e4c00d53fa8a51d6a424</span> 的代码事实编写。
+          本文是待实现设计，不表示当前代码已经支持全 command 4020、Phase1 readiness 或 timeout token exclusion。
+        </p>
+      </footer>
+    </div>
+  </div>
+
+  <script>
+    (() => {
+      const links = Array.from(document.querySelectorAll('.toc a'));
+      const sections = links
+        .map(link => document.querySelector(link.getAttribute('href')))
+        .filter(Boolean);
+      if (!('IntersectionObserver' in window)) return;
+      const observer = new IntersectionObserver(entries => {
+        const visible = entries
+          .filter(entry => entry.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top)[0];
+        if (!visible) return;
+        links.forEach(link => {
+          link.classList.toggle('active', link.getAttribute('href') === `#${visible.target.id}`);
+        });
+      }, { rootMargin: '-12% 0px -75% 0px', threshold: [0, 1] });
+      sections.forEach(section => observer.observe(section));
+    })();
+  </script>
+</body>
+</html>

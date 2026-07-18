@@ -4,7 +4,16 @@
 
 --disable_warnings
 DROP TABLE IF EXISTS t_warmcopy_finalize_deadline;
+--disable_query_log
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_query_log
 --enable_warnings
+
+--disable_query_log
+CREATE USER preserve_trx_ha_admin@localhost;
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+--enable_query_log
 
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_enable=ON;
@@ -23,14 +32,13 @@ RESET MASTER;
 START TRANSACTION;
 UPDATE t_warmcopy_finalize_deadline SET payload=REPEAT('x',512) WHERE id=1;
 INSERT INTO t_warmcopy_finalize_deadline VALUES(2, REPEAT('b',512));
-SET DEBUG_SYNC =
-  'preserve_trx_after_begin_before_command_read SIGNAL warmcopy_finalize_before_read WAIT_FOR warmcopy_finalize_read_continue';
 
---connection default
-SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_finalize_before_read TIMEOUT 10';
+--connect(warmcopy_finalize_control, localhost, preserve_trx_ha_admin,,test)
 
 --connect(warmcopy_finalize_owner, localhost, root,,test)
 --connection warmcopy_finalize_owner
+SET DEBUG_SYNC =
+  'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL warmcopy_finalize_closing WAIT_FOR warmcopy_finalize_targets';
 SET DEBUG_SYNC =
   'preserve_trx_batch_after_targets_quiesced_before_attach SIGNAL warmcopy_finalize_ready WAIT_FOR warmcopy_finalize_continue';
 SET DEBUG_SYNC =
@@ -38,17 +46,17 @@ SET DEBUG_SYNC =
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
 
---connection default
---disable_warnings
-SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_finalize_ready TIMEOUT 2';
---enable_warnings
+--connection warmcopy_finalize_control
+SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_finalize_closing TIMEOUT 10';
 
 --connection warmcopy_finalize_app
 --send SELECT 1
 
---connection default
-SET DEBUG_SYNC = 'now SIGNAL warmcopy_finalize_read_continue';
+--connection warmcopy_finalize_control
+SET DEBUG_SYNC = 'now SIGNAL warmcopy_finalize_targets';
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_finalize_ready TIMEOUT 30';
+
+--connection warmcopy_finalize_control
 --sleep 16
 SET DEBUG_SYNC = 'now SIGNAL warmcopy_finalize_continue';
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_finalize_preserved TIMEOUT 10';
@@ -58,7 +66,7 @@ SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_finalize_preserved TIMEOUT 10';
 --reap
 --disconnect warmcopy_finalize_app
 
---connection default
+--connection warmcopy_finalize_control
 SET DEBUG_SYNC = 'now SIGNAL warmcopy_finalize_preserved_continue';
 
 --connection warmcopy_finalize_owner
@@ -87,6 +95,9 @@ SELECT id, OCTET_LENGTH(payload) AS payload_len,
   ORDER BY id;
 
 DROP TABLE t_warmcopy_finalize_deadline;
+--disable_query_log
+DROP USER preserve_trx_ha_admin@localhost;
+--enable_query_log
 SET GLOBAL preserve_trx_enable=ON;
 SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=30000;
 SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;

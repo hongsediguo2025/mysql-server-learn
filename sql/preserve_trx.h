@@ -152,6 +152,8 @@ extern ulong preserve_trx_off_artifact_policy;
 extern ulong preserve_trx_drain_mode;
 extern uint preserve_trx_drain_grace_ms;
 extern uint preserve_trx_drain_hard_timeout_ms;
+extern uint preserve_trx_drain_closing_command_timeout_ms;
+extern bool preserve_trx_drain_command_timeout_fail_batch;
 extern uint preserve_trx_transfer_phase1_timeout_ms;
 extern uint preserve_trx_transfer_phase2_timeout_ms;
 extern bool preserve_trx_warmcopy_enable;
@@ -198,6 +200,22 @@ ulonglong preserve_trx_warmcopy_provider_full_copy_to_count_status();
 ulonglong preserve_trx_warmcopy_phase2_pause_us_status();
 ulonglong preserve_trx_phase2_total_us_status();
 ulonglong preserve_trx_phase2_target_wait_us_status();
+ulonglong preserve_trx_phase1_readiness_samples_status();
+ulonglong preserve_trx_phase1_readiness_inflight_commands_status();
+ulonglong preserve_trx_phase1_readiness_oldest_command_age_us_status();
+ulonglong preserve_trx_phase1_readiness_offender_count_status();
+ulonglong preserve_trx_phase1_readiness_wait_us_status();
+ulonglong preserve_trx_closing_started_monotonic_us_status();
+ulonglong preserve_trx_closing_command_effective_budget_us_status();
+ulonglong preserve_trx_closing_command_wait_us_status();
+ulonglong preserve_trx_closing_command_timed_out_count_status();
+ulonglong preserve_trx_closing_command_deadline_clamped_status();
+ulonglong preserve_trx_closing_inflight_commands_status();
+ulonglong preserve_trx_closing_completed_before_deadline_status();
+ulonglong preserve_trx_closing_excluded_tokens_status();
+ulonglong preserve_trx_closing_last_excluded_token_status();
+ulonglong preserve_trx_phase2_transfer_tail_us_status();
+ulonglong preserve_trx_closing_to_final_ack_us_status();
 ulonglong preserve_trx_phase2_participant_prepare_us_status();
 ulonglong preserve_trx_phase2_participant_close_us_status();
 ulonglong preserve_trx_phase2_participant_preflight_us_status();
@@ -345,6 +363,7 @@ enum class Preserve_trx_reset_drain_result : uint8_t {
 enum class Preserve_trx_command_block_result {
   ALLOW,
   BLOCK_DRAINING,
+  BLOCK_CLOSING_DRAINED,
   BLOCK_SESSION_DRAINED
 };
 
@@ -518,6 +537,7 @@ bool preserved_trx_preflight_recoverability();
 Preserve_trx_manager_state preserved_trx_manager_state();
 ulonglong preserve_trx_reset_drain_wins_status();
 ulonglong preserve_trx_reset_drain_too_late_status();
+ulonglong preserve_trx_closing_control_connection_commands_status();
 bool preserved_trx_can_disable_feature();
 bool preserved_trx_try_disable_feature_for_update();
 void preserved_trx_set_manager_state_publication_probe_for_unit_test(

@@ -32,11 +32,11 @@ SET DEBUG_SYNC = 'now SIGNAL continue_batch_packet';
 
 --connection batch_packet_app
 --reap
---disconnect batch_packet_app
 
 --connection batch_packet_owner
 --reap
 --disconnect batch_packet_owner
+--disconnect batch_packet_app
 
 --connection default
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc

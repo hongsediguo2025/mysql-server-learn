@@ -5,25 +5,40 @@
 --disable_warnings
 DROP TABLE IF EXISTS t_batch_blocked;
 --enable_warnings
+--disable_query_log
+--disable_warnings
+DROP USER IF EXISTS batch_blocked_app@localhost;
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost;
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+--enable_query_log
 
 SET GLOBAL preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_blocked(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+--disable_query_log
+CREATE USER batch_blocked_app@localhost;
+GRANT SELECT, INSERT, UPDATE ON test.* TO batch_blocked_app@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO batch_blocked_app@localhost;
+--enable_query_log
 
---connect(batch_blocked_app,localhost,root,,test)
+--connect(batch_blocked_ha,localhost,preserve_trx_ha_admin,,test)
+
+--connect(batch_blocked_app,localhost,batch_blocked_app,,test)
 --connection batch_blocked_app
 SET DEBUG_SYNC =
   'preserve_trx_batch_after_one_target_preserved SIGNAL batch_preserve_paused WAIT_FOR continue_batch_preserve';
 START TRANSACTION;
 INSERT INTO t_batch_blocked VALUES(1,10);
 
---connect(batch_blocked_owner,localhost,root,,test)
---connection batch_blocked_owner
+--connection default
 SET DEBUG_SYNC =
   'preserve_trx_batch_after_one_target_preserved SIGNAL batch_preserve_paused WAIT_FOR continue_batch_preserve';
 --send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
 
---connection default
+--connection batch_blocked_ha
 --disable_warnings
 SET DEBUG_SYNC = 'now WAIT_FOR batch_preserve_paused TIMEOUT 1';
 --enable_warnings
@@ -31,13 +46,12 @@ SET DEBUG_SYNC = 'now WAIT_FOR batch_preserve_paused TIMEOUT 1';
 --connection batch_blocked_app
 --send SELECT 1
 
---connection default
+--connection batch_blocked_ha
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_preserve';
 
---connection batch_blocked_owner
+--connection default
 --reap
---disconnect batch_blocked_owner
 
 --connection batch_blocked_app
 --error ER_PRESERVE_TRX_SESSION_DRAINED
@@ -60,4 +74,8 @@ COMMIT;
 SELECT * FROM t_batch_blocked;
 
 DROP TABLE t_batch_blocked;
+--disable_query_log
+DROP USER batch_blocked_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+--enable_query_log
 SET GLOBAL preserve_trx_enable=ON;

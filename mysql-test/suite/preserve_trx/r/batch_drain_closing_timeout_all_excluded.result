@@ -1,0 +1,20 @@
+no_active_epoch
+1
+no_receiver_token
+1
+closing_inflight_commands
+1
+closing_completed_before_deadline
+0
+closing_excluded_tokens
+1
+closing_last_excluded_token
+EXCLUDED_ID
+transfer_tail_us
+0
+closing_to_final_ack_us
+0
+excluded_old_command
+1
+generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
+GENERATION	NO_PRESERVABLE_TOKENS	EXCLUDED_ID	EXCLUDED	CLOSING_COMMAND_TIMEOUT	CLOSING_STARTED_US	CLOSING_DEADLINE_US

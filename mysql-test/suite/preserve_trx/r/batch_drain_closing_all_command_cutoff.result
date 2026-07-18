@@ -1,0 +1,74 @@
+DROP TABLE IF EXISTS t_closing_command_cutoff;
+DROP USER IF EXISTS closing_command_app@localhost;
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=5000;
+SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=30000;
+CREATE TABLE t_closing_command_cutoff(
+id INT PRIMARY KEY,
+v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_closing_command_cutoff VALUES(1,10);
+CREATE USER closing_command_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO closing_command_app@localhost;
+include/wait_for_pattern_in_file.inc [raw_closing_client_ready]
+SET DEBUG_SYNC =
+'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL closing_command_gate_active WAIT_FOR closing_command_continue';
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+SET DEBUG_SYNC = 'now WAIT_FOR closing_command_gate_active TIMEOUT 10';
+include/wait_for_pattern_in_file.inc [closing_command_matrix_done]
+raw_client_start
+raw_closing_client_ready
+sleep=4020
+init_db=4020
+query=4020
+field_list=4020
+create_db=4020
+drop_db=4020
+refresh=4020
+deprecated_shutdown=4020
+statistics=4020
+process_info=4020
+connect=4020
+process_kill=4020
+debug=4020
+ping=4020
+time=4020
+delayed_insert=4020
+change_user=4020
+binlog_dump=4020
+table_dump=4020
+connect_out=4020
+register_slave=4020
+stmt_prepare=4020
+stmt_execute=4020
+stmt_reset=4020
+set_option=4020
+stmt_fetch=4020
+daemon=4020
+binlog_dump_gtid=4020
+reset_connection=4020
+clone=4020
+preserve_transfer=4020
+end_or_unknown=4020
+after_long_data_ping=4020
+after_stmt_close_ping=4020
+closing_command_matrix_done
+include/assert.inc [blocked classic commands leave the target transaction active]
+SET DEBUG_SYNC = 'now SIGNAL closing_command_continue';
+SELECT COUNT(*) AS preserved_count
+FROM performance_schema.preserved_transactions;
+preserved_count
+1
+RESUME PRESERVED TRANSACTION 'TOKEN';
+ROLLBACK;
+SELECT * FROM t_closing_command_cutoff;
+id	v
+1	10
+DROP TABLE t_closing_command_cutoff;
+DROP USER closing_command_app@localhost;
+SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=30000;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=1000;
+SET DEBUG_SYNC = 'RESET';

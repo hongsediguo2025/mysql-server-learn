@@ -4,7 +4,16 @@
 
 --disable_warnings
 DROP TABLE IF EXISTS t_warmcopy_parameter_matrix;
+--disable_query_log
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_query_log
 --enable_warnings
+
+--disable_query_log
+CREATE USER preserve_trx_ha_admin@localhost;
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+--enable_query_log
 
 --let $old_preserve_trx_enable= `SELECT @@GLOBAL.preserve_trx_enable`
 --let $old_preserve_trx_warmcopy_enable= `SELECT @@GLOBAL.preserve_trx_warmcopy_enable`
@@ -41,6 +50,8 @@ UPDATE t_warmcopy_parameter_matrix
   SET v=11, pad=REPEAT('x',32)
   WHERE id=1;
 
+--connect(warmcopy_matrix_binlog_control, localhost, preserve_trx_ha_admin,,test)
+
 --connect(warmcopy_matrix_binlog_owner, localhost, root,,test)
 --connection warmcopy_matrix_binlog_owner
 SET DEBUG_SYNC =
@@ -48,7 +59,7 @@ SET DEBUG_SYNC =
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
 
---connection default
+--connection warmcopy_matrix_binlog_control
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_matrix_binlog_closing TIMEOUT 10';
 SELECT 'binlog_only_two_phase_observed' AS matrix_case;
 SET DEBUG_SYNC = 'now SIGNAL warmcopy_matrix_binlog_continue';
@@ -89,6 +100,8 @@ UPDATE t_warmcopy_parameter_matrix
   SET v=22, pad=REPEAT('y',32)
   WHERE id=2;
 
+--connect(warmcopy_matrix_lock_control, localhost, preserve_trx_ha_admin,,test)
+
 --connect(warmcopy_matrix_lock_owner, localhost, root,,test)
 --connection warmcopy_matrix_lock_owner
 SET DEBUG_SYNC =
@@ -96,7 +109,7 @@ SET DEBUG_SYNC =
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
 
---connection default
+--connection warmcopy_matrix_lock_control
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_matrix_lock_closing TIMEOUT 10';
 SELECT 'lock_only_two_phase_observed' AS matrix_case;
 SET DEBUG_SYNC = 'now SIGNAL warmcopy_matrix_lock_continue';
@@ -137,6 +150,8 @@ UPDATE t_warmcopy_parameter_matrix
   SET v=33, pad=REPEAT('z',32)
   WHERE id=3;
 
+--connect(warmcopy_matrix_both_control, localhost, preserve_trx_ha_admin,,test)
+
 --connect(warmcopy_matrix_both_owner, localhost, root,,test)
 --connection warmcopy_matrix_both_owner
 SET DEBUG_SYNC =
@@ -144,7 +159,7 @@ SET DEBUG_SYNC =
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
 
---connection default
+--connection warmcopy_matrix_both_control
 SET DEBUG_SYNC = 'now WAIT_FOR warmcopy_matrix_both_closing TIMEOUT 10';
 SELECT 'both_warmcopy_two_phase_observed' AS matrix_case;
 SET DEBUG_SYNC = 'now SIGNAL warmcopy_matrix_both_continue';
@@ -180,6 +195,7 @@ SELECT id, v, pad IN (REPEAT('x',32), REPEAT('y',32), REPEAT('z',32)) AS pad_ok
 
 DROP TABLE t_warmcopy_parameter_matrix;
 --disable_query_log
+DROP USER preserve_trx_ha_admin@localhost;
 --eval SET GLOBAL preserve_trx_single_phase_max_binlog_cache_bytes=$old_preserve_trx_single_phase_max_binlog_cache_bytes
 --eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
 --eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback

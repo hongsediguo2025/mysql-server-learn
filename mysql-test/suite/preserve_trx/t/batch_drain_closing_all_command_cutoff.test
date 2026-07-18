@@ -1,0 +1,332 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/have_log_bin.inc
+--source include/force_restart.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t_closing_command_cutoff;
+DROP USER IF EXISTS closing_command_app@localhost;
+--disable_query_log
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_query_log
+--enable_warnings
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_enable=ON;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1;
+SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=5000;
+SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=30000;
+
+CREATE TABLE t_closing_command_cutoff(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_closing_command_cutoff VALUES(1,10);
+CREATE USER closing_command_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO closing_command_app@localhost;
+--disable_query_log
+CREATE USER preserve_trx_ha_admin@localhost;
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PROCESS ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.threads TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+--enable_query_log
+
+--let $raw_client= $MYSQLTEST_VARDIR/tmp/closing_command_cutoff_client.pl
+--let $raw_ready= $MYSQLTEST_VARDIR/tmp/closing_command_cutoff_ready
+--let $raw_go= $MYSQLTEST_VARDIR/tmp/closing_command_cutoff_go
+--let $raw_finish= $MYSQLTEST_VARDIR/tmp/closing_command_cutoff_finish
+--let $raw_output= $MYSQLTEST_VARDIR/tmp/closing_command_cutoff.out
+
+--write_file $raw_client
+use strict;
+use warnings;
+use IO::Socket::UNIX;
+
+$| = 1;
+
+my ($socket_path, $ready_file, $go_file, $finish_file) = @ARGV;
+
+use constant CLIENT_LONG_PASSWORD => 0x00000001;
+use constant CLIENT_LONG_FLAG => 0x00000004;
+use constant CLIENT_CONNECT_WITH_DB => 0x00000008;
+use constant CLIENT_PROTOCOL_41 => 0x00000200;
+use constant CLIENT_TRANSACTIONS => 0x00002000;
+use constant CLIENT_SECURE_CONNECTION => 0x00008000;
+use constant CLIENT_MULTI_RESULTS => 0x00020000;
+use constant CLIENT_PLUGIN_AUTH => 0x00080000;
+use constant CLIENT_CONNECT_ATTRS => 0x00100000;
+
+sub read_exact {
+  my ($sock, $len) = @_;
+  my $buf = '';
+  while (length($buf) < $len) {
+    my $read = sysread($sock, my $chunk, $len - length($buf));
+    die "socket closed\n" unless defined($read) && $read > 0;
+    $buf .= $chunk;
+  }
+  return $buf;
+}
+
+sub read_packet {
+  my ($sock) = @_;
+  my $header = read_exact($sock, 4);
+  my @h = unpack('C4', $header);
+  my $len = $h[0] | ($h[1] << 8) | ($h[2] << 16);
+  return read_exact($sock, $len);
+}
+
+sub write_packet {
+  my ($sock, $seq, $payload) = @_;
+  my $len = length($payload);
+  print {$sock} pack('C4', $len & 0xff, ($len >> 8) & 0xff,
+                     ($len >> 16) & 0xff, $seq) . $payload;
+}
+
+sub error_packet {
+  my ($packet) = @_;
+  return unless length($packet) > 0 && ord(substr($packet, 0, 1)) == 0xff;
+  my $code = unpack('v', substr($packet, 1, 2));
+  my $msg_start = substr($packet, 3, 1) eq '#' ? 9 : 3;
+  my $message = substr($packet, $msg_start);
+  $message =~ s/\r?\n/ /g;
+  return ($code, $message);
+}
+
+sub expect_ok {
+  my ($packet, $label) = @_;
+  if (my ($code, $message) = error_packet($packet)) {
+    die "$label failed: $code $message\n";
+  }
+  die "$label returned an unexpected packet\n"
+      unless length($packet) > 0 && ord(substr($packet, 0, 1)) == 0x00;
+}
+
+sub command {
+  my ($sock, $cmd, $body) = @_;
+  write_packet($sock, 0, chr($cmd) . $body);
+  return read_packet($sock);
+}
+
+sub query_ok {
+  my ($sock, $query) = @_;
+  expect_ok(command($sock, 0x03, $query), $query);
+}
+
+sub expect_4020 {
+  my ($sock, $cmd, $body, $label) = @_;
+  my $packet = command($sock, $cmd, $body);
+  my ($code, $message) = error_packet($packet);
+  die "$label did not return a server error\n" unless defined($code);
+  die "$label returned $code instead of 4020: $message\n" if $code != 4020;
+  print "$label=$code\n";
+}
+
+sub prepare_statement {
+  my ($sock, $query) = @_;
+  my $packet = command($sock, 0x16, $query);
+  if (my ($code, $message) = error_packet($packet)) {
+    die "prepare failed: $code $message\n";
+  }
+  die "prepare returned a malformed response\n"
+      unless length($packet) >= 12 && ord(substr($packet, 0, 1)) == 0x00;
+  my $stmt_id = unpack('V', substr($packet, 1, 4));
+  my $column_count = unpack('v', substr($packet, 5, 2));
+  my $param_count = unpack('v', substr($packet, 7, 2));
+  read_packet($sock) for 1..$param_count;
+  read_packet($sock) if $param_count > 0;
+  read_packet($sock) for 1..$column_count;
+  read_packet($sock) if $column_count > 0;
+  return $stmt_id;
+}
+
+my $sock = IO::Socket::UNIX->new(Type => SOCK_STREAM(), Peer => $socket_path)
+  or die "connect failed: $!\n";
+
+my $handshake = read_packet($sock);
+my $pos = 0;
+$pos += 1;
+my $nul = index($handshake, "\0", $pos);
+$pos = $nul + 1;
+$pos += 4 + 8 + 1;
+my $cap_lower = unpack('v', substr($handshake, $pos, 2));
+$pos += 2 + 1 + 2;
+my $cap_upper = unpack('v', substr($handshake, $pos, 2));
+my $server_cap = $cap_lower | ($cap_upper << 16);
+$pos += 2;
+my $auth_len = ord(substr($handshake, $pos, 1));
+$pos += 1 + 10;
+my $auth_part2_len = $auth_len > 8 ? $auth_len - 8 : 13;
+$pos += $auth_part2_len;
+my $plugin = 'mysql_native_password';
+if ($server_cap & CLIENT_PLUGIN_AUTH) {
+  my $plugin_end = index($handshake, "\0", $pos);
+  $plugin = substr($handshake, $pos, $plugin_end - $pos)
+    if $plugin_end > $pos;
+}
+
+my $flags = CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG | CLIENT_CONNECT_WITH_DB |
+            CLIENT_PROTOCOL_41 | CLIENT_TRANSACTIONS |
+            CLIENT_SECURE_CONNECTION | CLIENT_MULTI_RESULTS |
+            CLIENT_PLUGIN_AUTH | CLIENT_CONNECT_ATTRS;
+$flags &= $server_cap;
+
+my $response = pack('VVC', $flags, 16 * 1024 * 1024, 33) . ("\0" x 23) .
+               "closing_command_app\0" . pack('C', 0) . "test\0";
+$response .= "$plugin\0" if $flags & CLIENT_PLUGIN_AUTH;
+$response .= "\0" if $flags & CLIENT_CONNECT_ATTRS;
+write_packet($sock, 1, $response);
+
+my $auth = read_packet($sock);
+if (length($auth) > 0 && ord(substr($auth, 0, 1)) == 0x01) {
+  die "full authentication requested\n"
+    unless length($auth) > 1 && ord(substr($auth, 1, 1)) == 0x03;
+  $auth = read_packet($sock);
+} elsif (length($auth) > 0 && ord(substr($auth, 0, 1)) == 0xfe) {
+  write_packet($sock, 3, '');
+  $auth = read_packet($sock);
+}
+expect_ok($auth, 'auth');
+
+query_ok($sock, 'START TRANSACTION');
+query_ok($sock, 'UPDATE t_closing_command_cutoff SET v=11 WHERE id=1');
+my $stmt_id = prepare_statement($sock, 'SELECT 1');
+my $long_stmt_id = prepare_statement($sock, 'SELECT ?');
+
+open(my $ready_fh, '>', $ready_file) or die "open ready failed: $!\n";
+print {$ready_fh} "raw_closing_client_ready\n";
+close($ready_fh);
+print "raw_closing_client_ready\n";
+
+sleep 1 until -e $go_file;
+
+my @response_commands = (
+  [0x00, '', 'sleep'],
+  [0x02, 'mysql', 'init_db'],
+  [0x03, 'SELECT 1', 'query'],
+  [0x04, "t_closing_command_cutoff\0%", 'field_list'],
+  [0x05, 'unused', 'create_db'],
+  [0x06, 'unused', 'drop_db'],
+  [0x07, chr(1), 'refresh'],
+  [0x08, '', 'deprecated_shutdown'],
+  [0x09, '', 'statistics'],
+  [0x0a, '', 'process_info'],
+  [0x0b, '', 'connect'],
+  [0x0c, pack('V', 0), 'process_kill'],
+  [0x0d, '', 'debug'],
+  [0x0e, '', 'ping'],
+  [0x0f, '', 'time'],
+  [0x10, '', 'delayed_insert'],
+  [0x11, "\0", 'change_user'],
+  [0x12, '', 'binlog_dump'],
+  [0x13, '', 'table_dump'],
+  [0x14, '', 'connect_out'],
+  [0x15, '', 'register_slave'],
+  [0x16, 'SELECT 2', 'stmt_prepare'],
+  [0x17, pack('VCV', $stmt_id, 0, 1), 'stmt_execute'],
+  [0x1a, pack('V', $stmt_id), 'stmt_reset'],
+  [0x1b, pack('v', 0), 'set_option'],
+  [0x1c, pack('VV', $stmt_id, 1), 'stmt_fetch'],
+  [0x1d, '', 'daemon'],
+  [0x1e, '', 'binlog_dump_gtid'],
+  [0x1f, '', 'reset_connection'],
+  [0x20, '', 'clone'],
+  [0x21, '', 'preserve_transfer'],
+  [0x22, '', 'end_or_unknown'],
+);
+
+for my $case (@response_commands) {
+  expect_4020($sock, @{$case});
+}
+
+# COM_STMT_SEND_LONG_DATA has no response. The CLOSING gate must drop it
+# without desynchronizing the connection; the following PING still gets 4020.
+write_packet($sock, 0,
+             chr(0x18) . pack('Vv', $long_stmt_id, 0) . 'blocked-data');
+expect_4020($sock, 0x0e, '', 'after_long_data_ping');
+
+# COM_STMT_CLOSE is a no-response resource cleanup exception, not a business
+# command exception. The connection remains under the CLOSING gate afterward.
+write_packet($sock, 0, chr(0x19) . pack('V', $stmt_id));
+write_packet($sock, 0, chr(0x19) . pack('V', $long_stmt_id));
+expect_4020($sock, 0x0e, '', 'after_stmt_close_ping');
+
+print "closing_command_matrix_done\n";
+sleep 1 until -e $finish_file;
+close($sock);
+EOF
+
+--exec echo "raw_client_start" > $raw_output
+--exec_in_background perl $raw_client $MASTER_MYSOCK $raw_ready $raw_go $raw_finish >> $raw_output 2>&1
+
+--let $grep_file= $raw_output
+--let $grep_pattern= raw_closing_client_ready
+--let $wait_timeout= 10
+--source include/wait_for_pattern_in_file.inc
+
+--connect(closing_command_control,localhost,preserve_trx_ha_admin,,test)
+--connect(closing_command_owner,localhost,root,,test)
+--connection closing_command_owner
+SET DEBUG_SYNC =
+  'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL closing_command_gate_active WAIT_FOR closing_command_continue';
+--exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection closing_command_control
+SET DEBUG_SYNC = 'now WAIT_FOR closing_command_gate_active TIMEOUT 10';
+--exec echo "go" > $raw_go
+
+--let $grep_file= $raw_output
+--let $grep_pattern= closing_command_matrix_done
+--let $wait_timeout= 30
+--source include/wait_for_pattern_in_file.inc
+--cat_file $raw_output
+
+# Receiving the final 4020 precedes the server thread returning to its next
+# command-read boundary. Wait for that observable boundary instead of racing
+# the DRAIN target scan.
+--let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_USER='closing_command_app' AND PROCESSLIST_COMMAND='Sleep'
+--source include/wait_condition.inc
+--let $target_trx_count= `SELECT COUNT(*) FROM information_schema.innodb_trx AS trx JOIN performance_schema.threads AS ps_thread ON ps_thread.PROCESSLIST_ID=trx.trx_mysql_thread_id WHERE ps_thread.PROCESSLIST_USER='closing_command_app'`
+--let $assert_text= blocked classic commands leave the target transaction active
+--let $assert_cond= $target_trx_count = 1
+--source include/assert.inc
+
+SET DEBUG_SYNC = 'now SIGNAL closing_command_continue';
+
+--connection closing_command_owner
+--reap
+--disconnect closing_command_owner
+
+--connection default
+--source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
+--exec echo "restart: --preserve-trx-enable=ON --preserve-trx-recovery-max-count=10" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+--enable_reconnect
+--source include/wait_until_connected_again.inc
+--disable_reconnect
+
+--exec echo "finish" > $raw_finish
+
+SELECT COUNT(*) AS preserved_count
+  FROM performance_schema.preserved_transactions;
+--source suite/preserve_trx/include/get_preserved_token.inc
+--replace_result $preserved_token TOKEN
+--eval RESUME PRESERVED TRANSACTION '$preserved_token'
+ROLLBACK;
+SELECT * FROM t_closing_command_cutoff;
+
+DROP TABLE t_closing_command_cutoff;
+DROP USER closing_command_app@localhost;
+--disable_query_log
+DROP USER preserve_trx_ha_admin@localhost;
+--enable_query_log
+SET GLOBAL preserve_trx_warmcopy_close_timeout_ms=30000;
+SET GLOBAL preserve_trx_warmcopy_min_open_ms=1000;
+SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=1000;
+SET DEBUG_SYNC = 'RESET';
+
+--remove_file $raw_client
+--remove_file $raw_ready
+--remove_file $raw_go
+--remove_file $raw_finish
+--remove_file $raw_output

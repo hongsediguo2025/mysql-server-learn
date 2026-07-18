@@ -24,7 +24,7 @@ TOKEN	PRESERVED	1
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ROLLBACK;
 SELECT 1;
-ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ERROR HY000: Preserve drain is active; this command was not executed
 ROLLBACK;
 SELECT * FROM t_batch_restore_activate_failure ORDER BY id;
 id	v

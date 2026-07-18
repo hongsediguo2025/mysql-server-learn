@@ -12,9 +12,9 @@ include/wait_for_pattern_in_file.inc [ping_error_code=4020]
 raw_ps_client_start
 raw_ps_client_ready
 stmt_execute_error_code=4020
-stmt_execute_error_message=This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+stmt_execute_error_message=Preserve drain is active; this command was not executed
 ping_error_code=4020
-ping_error_message=This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ping_error_message=Preserve drain is active; this command was not executed
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_drained_ps';
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ROLLBACK;

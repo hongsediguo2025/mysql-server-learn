@@ -31,7 +31,7 @@ TOKEN	PRESERVED	1
 BEGIN;
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SELECT 1;
-ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ERROR HY000: Preserve drain is active; this command was not executed
 ROLLBACK;
 SHOW VARIABLES LIKE 'pid_file';
 Variable_name	Value

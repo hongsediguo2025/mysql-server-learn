@@ -44,40 +44,38 @@ open(my $carrier_file_fh, '<', $carrier_file_path)
 my $carrier_file_src = do { local $/; <$carrier_file_fh> };
 close($carrier_file_fh);
 
-my $switch_line = -1;
-my $publish_line = -1;
-for my $idx (0 .. $#lines) {
-  $switch_line = $idx
-    if $lines[$idx] =~ /Preserve_thd_context_switch\s+switch_thd/;
-  if ($switch_line >= 0 &&
-      $lines[$idx] =~ /preserve_trx_set_batch_state\s*\(/) {
-    $publish_line = $idx;
-    last;
-  }
-}
-
-die "could not find batch context switch and publish lines\n"
-  if $switch_line < 0 || $publish_line < 0;
-
-my $scope_start = $switch_line - 1;
-$scope_start-- while $scope_start >= 0 && $lines[$scope_start] =~ /^\s*$/;
-die "batch target context switch must use an explicit inner scope\n"
-  unless $scope_start >= 0 && $lines[$scope_start] =~ /^\s*\{\s*$/;
+$preserve_src =~ /class Preserve_batch_quiesced_idle_target[\s\S]*?^};/m
+  or die "could not isolate Preserve_batch_quiesced_idle_target\n";
+my $quiesced_target = $&;
+my $switch_pos = index($quiesced_target,
+                       'Preserve_thd_context_switch switch_thd');
+die "could not find batch target context switch\n" if $switch_pos < 0;
+my $retry_loop_pos = rindex(substr($quiesced_target, 0, $switch_pos),
+                           'for (;;)');
+die "could not find batch target context-switch retry loop\n"
+  if $retry_loop_pos < 0;
+my $scope_start = index($quiesced_target, '{', $retry_loop_pos);
+die "could not find batch target context-switch scope start\n"
+  if $scope_start < 0;
 
 my $depth = 0;
 my $scope_end = -1;
-for my $idx ($scope_start .. $#lines) {
-  my $line = $lines[$idx];
-  $depth += () = $line =~ /\{/g;
-  $depth -= () = $line =~ /\}/g;
+for my $idx ($scope_start .. length($quiesced_target) - 1) {
+  my $ch = substr($quiesced_target, $idx, 1);
+  ++$depth if $ch eq '{';
+  --$depth if $ch eq '}';
   if ($idx > $scope_start && $depth == 0) {
     $scope_end = $idx;
     last;
   }
 }
 
+die "could not find batch target context-switch scope end\n"
+  if $scope_end < 0;
+my $publish_pos = index($quiesced_target, 'preserve_trx_set_batch_state',
+                        $switch_pos);
 die "batch drained-state publish must happen after context switch scope closes\n"
-  unless $scope_end >= 0 && $scope_end < $publish_line;
+  unless $publish_pos > $scope_end;
 
 my $clear_body_for_cleanup = $preserve_src;
 my $clear_body = $preserve_src;

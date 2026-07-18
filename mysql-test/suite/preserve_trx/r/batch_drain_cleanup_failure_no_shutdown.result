@@ -29,13 +29,13 @@ ORDER BY TOKEN;
 TOKEN	STATE	has_last_error
 TOKEN	PRESERVED	1
 SELECT 1;
-ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ERROR HY000: Preserve drain is active; this command was not executed
 SET GLOBAL preserve_trx_enable=OFF;
 ERROR HY000: Incorrect arguments to preserve_trx_enable is a startup-only option
 INSERT INTO t_batch_cleanup_no_shutdown VALUES(99,99);
 ERROR HY000: Resumable transactions across shutdown do not support this operation
 SELECT 2;
-ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ERROR HY000: Preserve drain is active; this command was not executed
 ROLLBACK;
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ROLLBACK;

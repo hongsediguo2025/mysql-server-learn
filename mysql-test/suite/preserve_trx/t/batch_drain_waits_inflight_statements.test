@@ -4,7 +4,16 @@
 
 --disable_warnings
 DROP TABLE IF EXISTS t_batch_inflight;
+--disable_query_log
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_query_log
 --enable_warnings
+
+--disable_query_log
+CREATE USER preserve_trx_ha_admin@localhost;
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+--enable_query_log
 
 SET GLOBAL preserve_trx_enable=ON;
 
@@ -43,6 +52,8 @@ SET DEBUG_SYNC = 'now WAIT_FOR batch_inflight_a_blocked TIMEOUT 10';
 SET DEBUG_SYNC = 'now WAIT_FOR batch_inflight_b_blocked TIMEOUT 10';
 SET GLOBAL preserve_trx_batch_max_transactions=2;
 
+--connect(batch_inflight_control,localhost,preserve_trx_ha_admin,,test)
+
 --connect(batch_inflight_owner,localhost,root,,test)
 --connection batch_inflight_owner
 SET DEBUG_SYNC =
@@ -50,7 +61,7 @@ SET DEBUG_SYNC =
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
 
---connection default
+--connection batch_inflight_control
 SET DEBUG_SYNC = 'now WAIT_FOR batch_inflight_drain_closing TIMEOUT 10';
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_inflight_a';
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_inflight_b';
@@ -58,15 +69,15 @@ SET DEBUG_SYNC = 'now SIGNAL continue_batch_inflight_drain';
 
 --connection batch_inflight_a
 --reap
---disconnect batch_inflight_a
 
 --connection batch_inflight_b
 --reap
---disconnect batch_inflight_b
 
 --connection batch_inflight_owner
 --reap
 --disconnect batch_inflight_owner
+--disconnect batch_inflight_a
+--disconnect batch_inflight_b
 
 --connection default
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
@@ -134,4 +145,7 @@ SELECT COUNT(*) AS row_count,
   FROM t_batch_inflight;
 
 DROP TABLE t_batch_inflight;
+--disable_query_log
+DROP USER preserve_trx_ha_admin@localhost;
+--enable_query_log
 SET GLOBAL preserve_trx_enable=ON;

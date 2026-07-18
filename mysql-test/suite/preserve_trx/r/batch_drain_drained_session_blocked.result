@@ -10,25 +10,25 @@ SET DEBUG_SYNC =
 DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
 SET DEBUG_SYNC = 'now WAIT_FOR batch_drained_preserved TIMEOUT 10';
 SELECT 1;
-ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ERROR HY000: Preserve drain is active; this command was not executed
 SET @drained = 1;
-ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ERROR HY000: Preserve drain is active; this command was not executed
 SHOW WARNINGS;
-ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ERROR HY000: Preserve drain is active; this command was not executed
 COMMIT;
-ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ERROR HY000: Preserve drain is active; this command was not executed
 ROLLBACK;
-ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ERROR HY000: Preserve drain is active; this command was not executed
 UPDATE t_batch_drained SET b=30 WHERE a=1;
-ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ERROR HY000: Preserve drain is active; this command was not executed
 PREPARE drained_stmt FROM 'UPDATE t_batch_drained SET b=40 WHERE a=1';
-ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ERROR HY000: Preserve drain is active; this command was not executed
 EXECUTE drained_existing_stmt;
-ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ERROR HY000: Preserve drain is active; this command was not executed
 SELECT * FROM t_batch_drained WHERE a=1 FOR UPDATE;
-ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ERROR HY000: Preserve drain is active; this command was not executed
 RESUME PRESERVED TRANSACTION 'not-a-token';
-ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ERROR HY000: Preserve drain is active; this command was not executed
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_drained';
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ROLLBACK;

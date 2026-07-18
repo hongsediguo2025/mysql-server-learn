@@ -1232,18 +1232,37 @@ static Sys_var_uint Sys_preserve_trx_drain_hard_timeout_ms(
     VALID_RANGE(1, UINT_MAX32), DEFAULT(30000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
     NOT_IN_BINLOG);
 
+static Sys_var_uint Sys_preserve_trx_drain_closing_command_timeout_ms(
+    "preserve_trx_drain_closing_command_timeout_ms",
+    "Maximum shared milliseconds after WARMCOPY_CLOSING is published for "
+    "commands admitted before the boundary to finish. This deadline is "
+    "clamped to the existing overall close deadline.",
+    GLOBAL_VAR(preserve_trx_drain_closing_command_timeout_ms),
+    CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, UINT_MAX32), DEFAULT(1000),
+    BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
+static Sys_var_bool Sys_preserve_trx_drain_command_timeout_fail_batch(
+    "preserve_trx_drain_command_timeout_fail_batch",
+    "Fail the whole drain when a command admitted before WARMCOPY_CLOSING "
+    "does not finish by the shared command deadline. OFF permits timeout "
+    "exclusion only for standby-transfer drains.",
+    GLOBAL_VAR(preserve_trx_drain_command_timeout_fail_batch),
+    CMD_LINE(OPT_ARG), DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG);
+
 static Sys_var_uint Sys_preserve_trx_transfer_phase1_timeout_ms(
     "preserve_trx_transfer_phase1_timeout_ms",
-    "Maximum total milliseconds for the source standby-transfer phase that "
-    "runs before transaction command quiesce.",
+    "Classic-protocol operation timeout in milliseconds for source "
+    "standby-transfer phase 1. The same value also bounds phase-1 readiness "
+    "observation before command quiesce.",
     GLOBAL_VAR(preserve_trx_transfer_phase1_timeout_ms),
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, UINT_MAX32), DEFAULT(600000),
     BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);
 
 static Sys_var_uint Sys_preserve_trx_transfer_phase2_timeout_ms(
     "preserve_trx_transfer_phase2_timeout_ms",
-    "Maximum total milliseconds for source standby-transfer work after "
-    "transaction command quiesce, including final epoch acknowledgment.",
+    "Classic-protocol connect/read/write operation timeout in milliseconds "
+    "for source standby-transfer work after command quiesce. This is not an "
+    "end-to-end phase-2 wall-clock deadline.",
     GLOBAL_VAR(preserve_trx_transfer_phase2_timeout_ms),
     CMD_LINE(REQUIRED_ARG), VALID_RANGE(1, UINT_MAX32), DEFAULT(3000),
     BLOCK_SIZE(1), NO_MUTEX_GUARD, NOT_IN_BINLOG);

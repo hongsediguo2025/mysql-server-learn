@@ -27,7 +27,7 @@ ORDER BY TOKEN;
 TOKEN	STATE	has_last_error
 TOKEN	PRESERVED	1
 SELECT 1;
-ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ERROR HY000: Preserve drain is active; this command was not executed
 SELECT COUNT(*) AS preserved_count
 FROM performance_schema.preserved_transactions;
 preserved_count

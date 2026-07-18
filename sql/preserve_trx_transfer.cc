@@ -10109,6 +10109,10 @@ Preserve_trx_transfer_source_epoch_session::abort_token_locked(
     return Preserve_trx_transfer_status::UNSUPPORTED;
   }
 
+  DBUG_EXECUTE_IF("preserve_trx_transfer_fail_abort_token", {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  });
+
   Preserve_trx_transfer_frame abort;
   abort.type = Preserve_trx_transfer_frame_type::ABORT;
   abort.sequence = m_next_sequence;

@@ -100,6 +100,7 @@ namespace {
 
 bool g_test_physical_fence_drift_on_acquire{false};
 bool g_test_physical_fence_drift_on_revalidate{false};
+#ifndef NDEBUG
 std::mutex g_final_fact_bind_barrier_mutex;
 std::condition_variable g_final_fact_bind_barrier_cv;
 uint g_final_fact_bind_barrier_arrivals{0};
@@ -119,6 +120,7 @@ void wait_for_worker_final_fact_bind_for_test() {
       lock, std::chrono::seconds(5),
       [] { return g_final_fact_bind_barrier_arrivals >= 1; });
 }
+#endif
 
 Preserve_trx_physical_fence_proof make_test_physical_fence_proof(
     Preserve_trx_physical_consistency_mode mode) {
@@ -535,6 +537,7 @@ Preserve_trx_prepared_token_resources acquire_strict_prepared_resources(
 bool activation_intent_writer_for_test(
     const Preserve_trx_prepared_token_key &, void *context);
 
+#ifndef NDEBUG
 struct Prepared_registry_interleave_context {
   Preserve_trx_prepared_token_registry *registry{nullptr};
   Preserve_trx_prepared_token_key key;
@@ -561,6 +564,7 @@ void prepared_registry_interleave_probe(
       break;
   }
 }
+#endif
 
 TEST(PreservedTrxPreparedRegistry, StaleWorkerCannotOverwriteNewGeneration) {
   preserve_trx_resource_manager_reset_for_unit_test();
@@ -908,6 +912,7 @@ TEST(PreservedTrxPreparedRegistry, SameDigestPublishIsIdempotent) {
   preserve_trx_resource_manager_reset_for_unit_test();
 }
 
+#ifndef NDEBUG
 TEST(PreservedTrxPreparedRegistry, ResourceSubpoolsEnforceSixtyThirtyTen) {
   preserve_trx_resource_manager_reset_for_unit_test();
   preserve_trx_resource_manager_set_limits_for_unit_test({1000, 1000});
@@ -937,6 +942,7 @@ TEST(PreservedTrxPreparedRegistry, ResourceSubpoolsEnforceSixtyThirtyTen) {
   preserve_trx_resource_manager_set_limits_for_unit_test(
       Preserve_trx_resource_limits{});
 }
+#endif
 
 TEST(PreservedTrxPreparedRegistry, GateAndAttachLeasesEnforceStateMachine) {
   preserve_trx_resource_manager_reset_for_unit_test();
@@ -1522,6 +1528,7 @@ class ChunkedBinlogPayloadReader final
   size_t m_max_read_bytes{0};
 };
 
+#ifndef NDEBUG
 class PreservedTrxNativeBinlogPrepared : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -2247,6 +2254,7 @@ TEST_F(PreservedTrxNativeBinlogPrepared,
             registry.commit_cleanup(&cleanup, true));
   registry.purge_epoch(key.source_uuid, key.epoch_id);
 }
+#endif
 
 TEST(PreservedTrxPreparedRegistry,
      PurgeAndInvalidateCannotDestroyClaimedTokenResources) {
@@ -2321,6 +2329,7 @@ TEST(PreservedTrxPreparedRegistry,
             registry.snapshot(key, &snapshot));
 }
 
+#ifndef NDEBUG
 TEST(PreservedTrxPreparedRegistry,
      PurgeAfterLookupCannotCreateOrphanPrepareLease) {
   preserve_trx_resource_manager_reset_for_unit_test();
@@ -2391,6 +2400,7 @@ TEST(PreservedTrxPreparedRegistry,
   EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
   preserve_trx_resource_manager_reset_for_unit_test();
 }
+#endif
 
 TEST(PreservedTrxRecordLockImportMetrics, AddAccumulatesIoBreakdown) {
   trx_preserve_record_lock_import_metrics_t total;
@@ -3632,6 +3642,54 @@ TEST_F(PreservedTrxCommandRead, TimeoutsWhenTargetStateCannotDrainWithinHardLimi
 }
 
 TEST_F(PreservedTrxCommandRead,
+       ClosingQuiescedTargetReadsOnlyForProtocolRejection) {
+  THD *target = thd();
+  const uint saved_timeout = preserve_trx_drain_hard_timeout_ms;
+  auto restore_state = create_scope_guard([this, target, saved_timeout] {
+    set_expected_error(0);
+    preserve_trx_drain_hard_timeout_ms = saved_timeout;
+    mysql_mutex_lock(&target->LOCK_thd_data);
+    target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
+    mysql_mutex_unlock(&target->LOCK_thd_data);
+    preserved_trx_set_manager_state_for_unit_test(
+        Preserve_trx_manager_state::IDLE, 0);
+  });
+
+  preserve_trx_set_enable_value(true);
+  preserve_trx_drain_hard_timeout_ms = 1;
+  preserved_trx_set_manager_state_for_unit_test(
+      Preserve_trx_manager_state::WARMCOPY_CLOSING, 0);
+  mysql_mutex_lock(&target->LOCK_thd_data);
+  target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::QUIESCED;
+  target->m_server_idle = true;
+  mysql_mutex_unlock(&target->LOCK_thd_data);
+
+  set_expected_error(ER_PRESERVE_TRX_DRAIN_TIMEOUT);
+  const bool can_read_for_rejection = preserved_trx_begin_command_read(target);
+  EXPECT_TRUE(can_read_for_rejection);
+  if (!can_read_for_rejection) return;
+  set_expected_error(0);
+
+  EXPECT_TRUE(preserved_trx_command_read_is_idle(target));
+  EXPECT_TRUE(preserved_trx_end_idle_for_command_packet(target));
+  EXPECT_FALSE(target->m_server_idle);
+  EXPECT_TRUE(preserved_trx_mark_inflight_command_packet(target, COM_QUERY));
+  EXPECT_TRUE(preserved_trx_end_command_read(target));
+  EXPECT_FALSE(target->m_server_idle);
+  set_expected_error(ER_PRESERVE_TRX_DRAIN_TIMEOUT);
+  EXPECT_FALSE(preserved_trx_wait_if_batch_session_quiesced(target));
+  set_expected_error(0);
+  EXPECT_FALSE(preserved_trx_reject_if_batch_session_drained(target));
+  EXPECT_EQ(Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED,
+            preserved_trx_protocol_command_block_result(target, COM_QUERY));
+
+  // The rejected command completes before the connection re-enters socket read.
+  EXPECT_TRUE(preserved_trx_begin_command_read(target));
+  EXPECT_TRUE(target->m_server_idle);
+  EXPECT_EQ(0U, target->preserve_trx_inflight_unknown_query_depth);
+}
+
+TEST_F(PreservedTrxCommandRead,
        DisabledFeatureMatchesNativeCommandReadIdleState) {
   THD *target = thd();
   target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
@@ -3857,7 +3915,7 @@ TEST_F(PreservedTrxCommandRead,
             preserved_trx_command_block_result(target, SQLCOM_UPDATE));
   EXPECT_EQ(Preserve_trx_command_block_result::ALLOW,
             preserved_trx_protocol_command_block_result(target, COM_REFRESH));
-  EXPECT_EQ(Preserve_trx_command_block_result::ALLOW,
+  EXPECT_EQ(Preserve_trx_command_block_result::BLOCK_DRAINING,
             preserved_trx_command_block_result(target, SQLCOM_RESET_DRAIN));
   EXPECT_EQ(
       Preserve_trx_command_block_result::BLOCK_DRAINING,
@@ -3886,7 +3944,9 @@ struct ProtocolWarmcopyClosingProbeContext {
   Preserve_trx_command_block_result risky_observed{
       Preserve_trx_command_block_result::ALLOW};
   Preserve_trx_command_block_result ordinary_observed{
-      Preserve_trx_command_block_result::BLOCK_DRAINING};
+      Preserve_trx_command_block_result::ALLOW};
+  Preserve_trx_command_block_result long_data_observed{
+      Preserve_trx_command_block_result::ALLOW};
 };
 
 static void capture_protocol_gate_during_warmcopy_closing(void *arg) {
@@ -3895,10 +3955,12 @@ static void capture_protocol_gate_during_warmcopy_closing(void *arg) {
       preserved_trx_protocol_command_block_result(context->target, COM_REFRESH);
   context->ordinary_observed =
       preserved_trx_protocol_command_block_result(context->target, COM_QUERY);
+  context->long_data_observed = preserved_trx_protocol_command_block_result(
+      context->target, COM_STMT_SEND_LONG_DATA);
 }
 
 TEST_F(PreservedTrxCommandRead,
-       WarmcopyClosingProtocolGateBlocksOnlyRiskyProtocolCommands) {
+       WarmcopyClosingProtocolGateBlocksAllOrdinaryProtocolCommands) {
   THD *target = thd();
   preserve_trx_set_enable_value(true);
 
@@ -3912,10 +3974,12 @@ TEST_F(PreservedTrxCommandRead,
                                                                   nullptr);
 
   ASSERT_TRUE(active);
-  EXPECT_EQ(Preserve_trx_command_block_result::BLOCK_DRAINING,
+  EXPECT_EQ(Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED,
             context.risky_observed);
-  EXPECT_EQ(Preserve_trx_command_block_result::ALLOW,
+  EXPECT_EQ(Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED,
             context.ordinary_observed);
+  EXPECT_EQ(Preserve_trx_command_block_result::BLOCK_CLOSING_DRAINED,
+            context.long_data_observed);
 }
 
 TEST_F(PreservedTrxCommandRead,
@@ -6323,6 +6387,7 @@ class Transfer_codec_context_guard {
   }
 };
 
+#ifndef NDEBUG
 class Transfer_native_binlog_runtime_guard {
  public:
   Transfer_native_binlog_runtime_guard()
@@ -6372,6 +6437,7 @@ class Transfer_native_binlog_runtime_guard {
   ulonglong m_saved_max_binlog_stmt_cache_size;
   handlerton m_hton{};
 };
+#endif
 
 TEST(PreservedTrxTransfer, ConfiguredFrameSinkDefaultsToUnsupported) {
   std::unique_ptr<Preserve_trx_transfer_encoded_frame_sink> sink;
@@ -9365,6 +9431,7 @@ TEST_F(PreserveSnapshotTest,
   preserved_trx_set_physical_fence_provider_for_unit_test(nullptr);
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        StrictPhysicalFenceFinalIntentFailureTaintsAdoptedToken) {
   preserve_trx_set_enable_value(true);
@@ -9436,6 +9503,7 @@ TEST_F(PreserveSnapshotTest,
   preserved_trx_set_strict_physical_adopt_executor_for_unit_test(nullptr);
   preserved_trx_set_physical_fence_provider_for_unit_test(nullptr);
 }
+#endif
 
 TEST_F(PreserveSnapshotTest, StrictPhysicalFenceUsesRequestedWorkers) {
   preserve_trx_set_enable_value(true);
@@ -9858,6 +9926,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(3U, sample_count);
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverResidencyWaitUsesMonotonicTimeAndCancellation) {
   size_t sample_count = 0;
@@ -9874,6 +9943,7 @@ TEST_F(PreserveSnapshotTest,
       std::numeric_limits<size_t>::max(), 100, &sample_count));
   EXPECT_LE(sample_count, 3U);
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        PromotionGateRejectsStaleRecordLockResidencyProof) {
@@ -10004,6 +10074,7 @@ TEST_F(PreserveSnapshotTest,
   preserve_trx_set_enable_value(true);
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        PromotionExecuteAdoptFailsClosedWhenFinalIntentCannotBeRewritten) {
   preserve_trx_set_enable_value(true);
@@ -10065,6 +10136,7 @@ TEST_F(PreserveSnapshotTest,
   preserved_trx_promotion_ready_cache_clear_for_unit_test();
   preserve_trx_set_enable_value(true);
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        PromotionExecuteAdoptFailsClosedWhenAdoptedMarkerCannotBeWritten) {
@@ -10517,6 +10589,7 @@ TEST_F(PreserveSnapshotTest, PromotionMissingApplyProviderFailsClosed) {
   preserve_trx_set_enable_value(true);
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest, PromotionDebugApplyProviderEnablesSimulatorGate) {
   preserve_trx_set_enable_value(true);
   preserved_trx_promotion_ready_cache_clear_for_unit_test();
@@ -10609,6 +10682,7 @@ TEST_F(PreserveSnapshotTest, PromotionGateStatusReflectsLatestGateResult) {
   preserved_trx_promotion_ready_cache_clear_for_unit_test();
   preserve_trx_set_enable_value(true);
 }
+#endif
 
 TEST_F(PreserveSnapshotTest, PromotionApplyReachedStillNeedsReadyCache) {
   preserve_trx_set_enable_value(true);
@@ -14889,6 +14963,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_TRUE(ready_summary.pending_tokens.empty());
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverStrictRecordLockPrewarmUsesMetadataOnly) {
   Transfer_codec_context_guard codec_guard;
@@ -15711,6 +15786,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(Preserve_trx_prepared_status::NOT_FOUND,
             strict_registry.snapshot(strict_key, &strict_snapshot));
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverSealTimeReadyDoesNotPublishStandbyProjection) {
@@ -17049,6 +17125,7 @@ TEST_F(PreserveSnapshotTest,
                 nullptr));
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferSourceFrameSequenceChunksAndPublishesThroughReceiver) {
   Transfer_codec_context_guard codec_guard;
@@ -17178,6 +17255,7 @@ TEST_F(PreserveSnapshotTest,
               ? static_cast<int>(strict_snapshot.state)
               : -1);
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverStrictCommitWithoutTrxIdStoreProofFailsBeforeSavedFact) {
@@ -18369,6 +18447,7 @@ TEST_F(PreserveSnapshotTest, TransferCommitEpochRejectsCorruptMarker) {
   EXPECT_FALSE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferSourceEncodedFrameSequenceFeedsReceiverPayloadHandler) {
   Transfer_codec_context_guard codec_guard;
@@ -18420,6 +18499,7 @@ TEST_F(PreserveSnapshotTest,
             registry.query_accepted_epoch(m_dir, manifest.epoch_id));
   EXPECT_TRUE(written_metadata.token.empty());
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverCommitRequiresExplicitObjectSealFrame) {
@@ -19176,6 +19256,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_FALSE(preserve_trx_transfer_receiver_workers_started_for_unit_test());
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverPoolShutdownCancelsBlockedBusinessFirstBacklog) {
   preserve_trx_transfer_shutdown_receiver_prewarm_workers();
@@ -19218,6 +19299,7 @@ TEST_F(PreserveSnapshotTest,
   shutdown.join();
   EXPECT_TRUE(shutdown_cancelled_backlog);
 }
+#endif
 
 TEST_F(PreserveSnapshotTest, TransferReceiverBatchTreatsCommitAsBarrier) {
   std::vector<Preserve_trx_transfer_frame> frames;
@@ -21195,6 +21277,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_FALSE(preserve_trx_transfer_epoch_committed(m_dir, manifest));
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferSourceEpochSessionStreamsDeclaredBlobBeforeFinalManifest) {
   Transfer_codec_context_guard codec_guard;
@@ -21396,6 +21479,7 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_TRUE(registry.lookup(manifest.epoch_id, manifest.token, &record));
   EXPECT_EQ(Preserve_trx_transfer_receiver_state::DECLARED, record.state);
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverPhase1PrewarmManifestMovesDeclaredTokenToReceiving) {
@@ -21470,6 +21554,7 @@ TEST_F(PreserveSnapshotTest,
             preserve_trx_transfer_receiver_strict_target_local_redo_bytes_status());
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverStrictStagedTokenChargesOnlyActualFileReads) {
   Preserve_trx_transfer_manifest manifest;
@@ -21552,6 +21637,7 @@ TEST_F(PreserveSnapshotTest, TransferReceiverPrewarmYieldsByWorkBatch) {
           1000, 0, &active_work_us));
   EXPECT_EQ(0U, active_work_us);
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverStagedTokenPrewarmHasPriorityOverObjectBacklog) {
@@ -21670,6 +21756,7 @@ TEST_F(PreserveSnapshotTest,
             4U);
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferReceiverReusesPhase1RecordLockPreparationForFinalManifest) {
   Transfer_codec_context_guard codec_guard;
@@ -21796,6 +21883,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(after_phase1,
             preserve_trx_transfer_receiver_record_object_prewarm_count_status());
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferReceiverRecordLockObjectPrewarmRejectsMalformedPayload) {
@@ -24152,6 +24240,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_FALSE(state.standby_pending);
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        TransferArtifactSinkBatchesFinalManifestAfterPredeclaredExternalBlob) {
   Transfer_codec_context_guard codec_guard;
@@ -24588,6 +24677,7 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_TRUE(wait_for_epoch_ready_token("epoch-artifact-deadline",
                                          transfer_token));
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        TransferArtifactSinkMaterializesPrebuiltRecordLocksBlob) {
@@ -26301,6 +26391,7 @@ TEST(PreservedTrxRecovery,
       preserved_trx_snapshot_allows_synthetic_temp_claim(metadata));
 }
 
+#ifndef NDEBUG
 TEST_F(PreserveSnapshotTest,
        ConsumeStateMarkerExcludesSnapshotFromLocalRecovery) {
   Preserved_trx_bundle_build_input input;
@@ -26346,6 +26437,7 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_FALSE(token_state.snapshot);
   EXPECT_FALSE(token_state.consume_state);
 }
+#endif
 
 TEST_F(PreserveSnapshotTest,
        BundleCodecAcceptsCurrentNoCacheWithoutMetadataTlv) {

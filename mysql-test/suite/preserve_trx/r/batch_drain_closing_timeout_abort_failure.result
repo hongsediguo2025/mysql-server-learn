@@ -1,0 +1,15 @@
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+no_active_epoch
+1
+uncommitted_receiver_state_only
+1
+no_saved_receiver_token
+1
+timeout_detected
+1
+no_exclusion_without_abort_ack
+1
+old_command_completed
+1
+id	v
+1	10

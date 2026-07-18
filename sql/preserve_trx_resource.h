@@ -205,6 +205,9 @@ int show_preserve_trx_warmcopy_phase2_pause_us(THD *thd, SHOW_VAR *var,
 int show_preserve_trx_reset_drain_wins(THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_reset_drain_too_late(THD *thd, SHOW_VAR *var,
                                            char *buf);
+int show_preserve_trx_closing_control_connection_commands(THD *thd,
+                                                           SHOW_VAR *var,
+                                                           char *buf);
 int show_preserve_trx_lock_warmcopy_attempts(THD *thd, SHOW_VAR *var,
                                              char *buf);
 int show_preserve_trx_lock_warmcopy_artifact_bytes(THD *thd, SHOW_VAR *var,
@@ -227,6 +230,44 @@ int show_preserve_trx_lock_warmcopy_live_fallback(THD *thd, SHOW_VAR *var,
 int show_preserve_trx_phase2_total_us(THD *thd, SHOW_VAR *var, char *buf);
 int show_preserve_trx_phase2_target_wait_us(THD *thd, SHOW_VAR *var,
                                             char *buf);
+int show_preserve_trx_phase1_readiness_samples(THD *thd, SHOW_VAR *var,
+                                               char *buf);
+int show_preserve_trx_phase1_readiness_inflight_commands(THD *thd,
+                                                         SHOW_VAR *var,
+                                                         char *buf);
+int show_preserve_trx_phase1_readiness_oldest_command_age_us(THD *thd,
+                                                             SHOW_VAR *var,
+                                                             char *buf);
+int show_preserve_trx_phase1_readiness_offender_count(THD *thd,
+                                                      SHOW_VAR *var,
+                                                      char *buf);
+int show_preserve_trx_phase1_readiness_wait_us(THD *thd, SHOW_VAR *var,
+                                               char *buf);
+int show_preserve_trx_closing_started_monotonic_us(THD *thd, SHOW_VAR *var,
+                                                   char *buf);
+int show_preserve_trx_closing_command_effective_budget_us(THD *thd,
+                                                          SHOW_VAR *var,
+                                                          char *buf);
+int show_preserve_trx_closing_command_wait_us(THD *thd, SHOW_VAR *var,
+                                              char *buf);
+int show_preserve_trx_closing_command_timed_out_count(THD *thd, SHOW_VAR *var,
+                                                      char *buf);
+int show_preserve_trx_closing_command_deadline_clamped(THD *thd,
+                                                       SHOW_VAR *var,
+                                                       char *buf);
+int show_preserve_trx_closing_inflight_commands(THD *thd, SHOW_VAR *var,
+                                                char *buf);
+int show_preserve_trx_closing_completed_before_deadline(THD *thd,
+                                                        SHOW_VAR *var,
+                                                        char *buf);
+int show_preserve_trx_closing_excluded_tokens(THD *thd, SHOW_VAR *var,
+                                              char *buf);
+int show_preserve_trx_closing_last_excluded_token(THD *thd, SHOW_VAR *var,
+                                                  char *buf);
+int show_preserve_trx_phase2_transfer_tail_us(THD *thd, SHOW_VAR *var,
+                                              char *buf);
+int show_preserve_trx_closing_to_final_ack_us(THD *thd, SHOW_VAR *var,
+                                              char *buf);
 int show_preserve_trx_phase2_participant_prepare_us(THD *thd, SHOW_VAR *var,
                                                     char *buf);
 int show_preserve_trx_phase2_participant_close_us(THD *thd, SHOW_VAR *var,

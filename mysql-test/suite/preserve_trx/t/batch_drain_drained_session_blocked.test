@@ -4,7 +4,16 @@
 
 --disable_warnings
 DROP TABLE IF EXISTS t_batch_drained;
+--disable_query_log
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_query_log
 --enable_warnings
+
+--disable_query_log
+CREATE USER preserve_trx_ha_admin@localhost;
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+--enable_query_log
 
 SET GLOBAL preserve_trx_enable=ON;
 
@@ -16,6 +25,13 @@ INSERT INTO t_batch_drained VALUES(1,10);
 START TRANSACTION;
 UPDATE t_batch_drained SET b=20 WHERE a=1;
 PREPARE drained_existing_stmt FROM 'UPDATE t_batch_drained SET b=40 WHERE a=1';
+--let $batch_drained_app_id= query_get_value(SELECT CONNECTION_ID() AS id, id, 1)
+
+--connection default
+--let $wait_condition= SELECT COUNT(*)=1 FROM performance_schema.threads WHERE PROCESSLIST_ID=$batch_drained_app_id AND PROCESSLIST_COMMAND='Sleep'
+--source include/wait_condition.inc
+
+--connect(batch_drained_control,localhost,preserve_trx_ha_admin,,test)
 
 --connect(batch_drained_owner,localhost,root,,test)
 --connection batch_drained_owner
@@ -23,7 +39,7 @@ SET DEBUG_SYNC =
   'preserve_trx_batch_after_one_target_preserved SIGNAL batch_drained_preserved WAIT_FOR continue_batch_drained';
 --send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
 
---connection default
+--connection batch_drained_control
 --disable_warnings
 SET DEBUG_SYNC = 'now WAIT_FOR batch_drained_preserved TIMEOUT 10';
 --enable_warnings
@@ -50,7 +66,7 @@ SELECT * FROM t_batch_drained WHERE a=1 FOR UPDATE;
 --error ER_PRESERVE_TRX_SESSION_DRAINED
 RESUME PRESERVED TRANSACTION 'not-a-token';
 
---connection default
+--connection batch_drained_control
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_drained';
 
@@ -76,4 +92,7 @@ ROLLBACK;
 SELECT * FROM t_batch_drained;
 
 DROP TABLE t_batch_drained;
+--disable_query_log
+DROP USER preserve_trx_ha_admin@localhost;
+--enable_query_log
 SET GLOBAL preserve_trx_enable=ON;

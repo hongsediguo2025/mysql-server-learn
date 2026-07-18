@@ -5,11 +5,26 @@
 --disable_warnings
 DROP TABLE IF EXISTS t_batch_drained_ps;
 --enable_warnings
+--disable_query_log
+--disable_warnings
+DROP USER IF EXISTS batch_drained_ps_app@localhost;
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost;
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+--enable_query_log
 
 SET GLOBAL preserve_trx_enable=ON;
 
 CREATE TABLE t_batch_drained_ps(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
 INSERT INTO t_batch_drained_ps VALUES(1,10);
+--disable_query_log
+CREATE USER batch_drained_ps_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO batch_drained_ps_app@localhost;
+--enable_query_log
+
+--connect(batch_drained_ps_ha,localhost,preserve_trx_ha_admin,,test)
 
 --let $raw_ps_client= $MYSQLTEST_VARDIR/tmp/batch_drain_raw_ps_client.pl
 --let $raw_ps_ready= $MYSQLTEST_VARDIR/tmp/batch_drain_raw_ps_ready
@@ -123,7 +138,7 @@ my $flags = CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG | CLIENT_CONNECT_WITH_DB |
 $flags &= $server_cap;
 
 my $response = pack('VVC', $flags, 16 * 1024 * 1024, 33) . ("\0" x 23) .
-               "root\0" . pack('C', 0) . "test\0";
+               "batch_drained_ps_app\0" . pack('C', 0) . "test\0";
 $response .= "$plugin\0" if $flags & CLIENT_PLUGIN_AUTH;
 $response .= "\0" if $flags & CLIENT_CONNECT_ATTRS;
 write_packet($sock, 1, $response);
@@ -191,13 +206,12 @@ EOF
 --let $wait_timeout= 10
 --source include/wait_for_pattern_in_file.inc
 
---connect(batch_drained_ps_owner,localhost,root,,test)
---connection batch_drained_ps_owner
+--connection default
 SET DEBUG_SYNC =
   'preserve_trx_batch_after_one_target_preserved SIGNAL batch_drained_ps_preserved WAIT_FOR continue_batch_drained_ps';
 --send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
 
---connection default
+--connection batch_drained_ps_ha
 --disable_warnings
 SET DEBUG_SYNC = 'now WAIT_FOR batch_drained_ps_preserved TIMEOUT 10';
 --enable_warnings
@@ -215,9 +229,8 @@ SET DEBUG_SYNC = 'now WAIT_FOR batch_drained_ps_preserved TIMEOUT 10';
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 SET DEBUG_SYNC = 'now SIGNAL continue_batch_drained_ps';
 
---connection batch_drained_ps_owner
+--connection default
 --reap
---disconnect batch_drained_ps_owner
 
 --connection default
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
@@ -234,6 +247,10 @@ ROLLBACK;
 SELECT * FROM t_batch_drained_ps;
 
 DROP TABLE t_batch_drained_ps;
+--disable_query_log
+DROP USER batch_drained_ps_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+--enable_query_log
 SET GLOBAL preserve_trx_enable=ON;
 
 --remove_file $raw_ps_client

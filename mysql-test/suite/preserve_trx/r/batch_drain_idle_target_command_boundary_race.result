@@ -1,6 +1,10 @@
 DROP TABLE IF EXISTS t_batch_idle_boundary;
+DROP USER IF EXISTS batch_idle_boundary_app@localhost;
 SET GLOBAL preserve_trx_enable=ON;
 CREATE TABLE t_batch_idle_boundary(a INT PRIMARY KEY, b INT) ENGINE=InnoDB;
+CREATE USER batch_idle_boundary_app@localhost;
+GRANT SELECT, INSERT ON test.* TO batch_idle_boundary_app@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO batch_idle_boundary_app@localhost;
 START TRANSACTION;
 INSERT INTO t_batch_idle_boundary VALUES(1,10);
 SET DEBUG_SYNC =
@@ -20,11 +24,12 @@ SELECT 1;
 SET DEBUG_SYNC = 'now SIGNAL continue_idle_target_read';
 SET DEBUG_SYNC = 'now SIGNAL continue_idle_target_attach';
 SET DEBUG_SYNC = 'now WAIT_FOR idle_target_preserved TIMEOUT 10';
-ERROR HY000: This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE
+ERROR HY000: Preserve drain is active; this command was not executed
 SET DEBUG_SYNC = 'now SIGNAL continue_idle_target_preserved';
 RESUME PRESERVED TRANSACTION 'TOKEN';
 ROLLBACK;
 SELECT * FROM t_batch_idle_boundary;
 a	b
+DROP USER batch_idle_boundary_app@localhost;
 DROP TABLE t_batch_idle_boundary;
 SET GLOBAL preserve_trx_enable=ON;

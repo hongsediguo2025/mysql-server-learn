@@ -10,11 +10,15 @@ let $mysql_errno= 0;
 while (!$mysql_errno)
 {
   # This helper polls during shutdown. Success means the server is still alive,
-  # ER_PRESERVE_TRX_UNSUPPORTED means preserve/drain command blocking is still
-  # active, and the client/server disconnect errors mean shutdown completed.
-  --error 0,1040,1053,2002,2003,2006,2013,2016,2017,ER_PRESERVE_TRX_UNSUPPORTED
+  # Preserve/drain errors mean command blocking is still active, and the
+  # client/server disconnect errors mean shutdown completed.
+  --error 0,1040,1053,2002,2003,2006,2013,2016,2017,ER_PRESERVE_TRX_UNSUPPORTED,ER_PRESERVE_TRX_SESSION_DRAINED
   show session status;
   if ($mysql_errname == ER_PRESERVE_TRX_UNSUPPORTED)
+  {
+    --let $mysql_errno= 0
+  }
+  if ($mysql_errname == ER_PRESERVE_TRX_SESSION_DRAINED)
   {
     --let $mysql_errno= 0
   }

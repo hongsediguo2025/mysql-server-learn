@@ -2,6 +2,15 @@
 --source include/not_log_bin.inc
 --source include/force_restart.inc
 
+--disable_query_log
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost;
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+--enable_query_log
+
 --disable_warnings
 DROP TABLE IF EXISTS t_lock_warmcopy_conversion_nowait;
 --enable_warnings
@@ -24,41 +33,41 @@ CREATE TABLE t_lock_warmcopy_conversion_nowait(
 ) ENGINE=InnoDB;
 INSERT INTO t_lock_warmcopy_conversion_nowait VALUES(1,10),(3,30);
 
+--connect(lock_wc_conversion_nowait_ha,localhost,preserve_trx_ha_admin,,test)
+
 --connect(lock_wc_conversion_nowait_app, localhost, root,,test)
 START TRANSACTION;
 INSERT INTO t_lock_warmcopy_conversion_nowait VALUES(2,20);
 
---connect(lock_wc_conversion_nowait_owner, localhost, root,,test)
---connection lock_wc_conversion_nowait_owner
+--connection default
 SET DEBUG_SYNC =
   'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL lock_wc_conversion_nowait_closing WAIT_FOR lock_wc_conversion_nowait_continue';
 --exec echo "wait" > $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
 --send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
 
---connection default
+--connection lock_wc_conversion_nowait_ha
 SET DEBUG_SYNC = 'now WAIT_FOR lock_wc_conversion_nowait_closing TIMEOUT 10';
 SELECT 'conversion_command_barrier_observed' AS barrier_case;
 
 --connect(lock_wc_conversion_skiplocked_reader, localhost, root,,test)
---error ER_PRESERVE_TRX_UNSUPPORTED
+--error ER_PRESERVE_TRX_SESSION_DRAINED
 SELECT COUNT(*) AS skip_locked_rows
   FROM t_lock_warmcopy_conversion_nowait
   WHERE id=2
   FOR UPDATE SKIP LOCKED;
 
 --connect(lock_wc_conversion_nowait_reader, localhost, root,,test)
---error ER_PRESERVE_TRX_UNSUPPORTED
+--error ER_PRESERVE_TRX_SESSION_DRAINED
 SELECT id
   FROM t_lock_warmcopy_conversion_nowait
   WHERE id=2
   FOR UPDATE NOWAIT;
 
---connection default
+--connection lock_wc_conversion_nowait_ha
 SET DEBUG_SYNC = 'now SIGNAL lock_wc_conversion_nowait_continue';
 
---connection lock_wc_conversion_nowait_owner
+--connection default
 --reap
---disconnect lock_wc_conversion_nowait_owner
 
 --connection default
 --source suite/preserve_trx/include/wait_until_disconnected_allow_preserve_block.inc
@@ -96,6 +105,7 @@ DROP TABLE t_lock_warmcopy_conversion_nowait;
 SET DEBUG_SYNC = 'RESET';
 
 --disable_query_log
+DROP USER preserve_trx_ha_admin@localhost;
 --eval SET GLOBAL preserve_trx_recovery_max_count=$old_preserve_trx_recovery_max_count
 --eval SET GLOBAL preserve_trx_lock_warmcopy_fallback_to_live_export=$old_preserve_trx_lock_warmcopy_fallback
 --eval SET GLOBAL preserve_trx_lock_warmcopy_enable=$old_preserve_trx_lock_warmcopy_enable

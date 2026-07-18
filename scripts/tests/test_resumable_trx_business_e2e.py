@@ -237,6 +237,16 @@ class _FakeRuntime:
         return conn._handle_ok(packet)
 
 
+class _EndpointCaptureRuntime(_FakeRuntime):
+    def __init__(self):
+        super().__init__()
+        self.endpoint_kwargs = []
+
+    def connect_endpoint(self, **kwargs):
+        self.endpoint_kwargs.append(kwargs)
+        return _FakeConnection()
+
+
 class _ResetDrainError(Exception):
     errno = 4020
 
@@ -287,6 +297,10 @@ class _ResetDrainWorkerRuntime(_FakeRuntime):
 
 class _ResetDrainReleaseWorkerRuntime(_ResetDrainWorkerRuntime):
     def execute(self, conn, sql, fetch=False):
+        if sql == "SELECT 1":
+            self.sql.append(sql)
+            self.calls.append((sql, fetch))
+            raise _DrainInProgressError()
         if (
             sql.startswith("UPDATE `")
             and self.probe_sql is not None
@@ -300,26 +314,6 @@ class _ResetDrainReleaseWorkerRuntime(_ResetDrainWorkerRuntime):
             self.counter += 1
             return ()
         return super().execute(conn, sql, fetch=fetch)
-
-    def is_preserve_draining_rejection(self, exc):
-        return isinstance(exc, _DrainInProgressError)
-
-
-class _Phase2ResetObserverRuntime(_FakeRuntime):
-    def __init__(self):
-        super().__init__()
-        self.connection = _FakeConnection()
-
-    def connect(self, database=False, autocommit=True):
-        del database, autocommit
-        return self.connection
-
-    def execute(self, conn, sql, fetch=False):
-        self.sql.append(sql)
-        self.calls.append((conn, sql, fetch))
-        if sql.startswith("UPDATE `"):
-            raise _DrainInProgressError()
-        return ()
 
     def is_preserve_draining_rejection(self, exc):
         return isinstance(exc, _DrainInProgressError)
@@ -1359,6 +1353,21 @@ class _DrainRuntime(_FakeRuntime):
         return None
 
 
+class _TransferDrainRuntime(_FakeRuntime):
+    def __init__(self, rows):
+        super().__init__()
+        self._rows = list(rows)
+
+    def execute(self, conn, sql, fetch=False):
+        self.sql.append(sql)
+        self.calls.append((sql, fetch))
+        if sql.startswith("DRAIN TRANSACTIONS PRESERVE"):
+            if not fetch:
+                raise AssertionError("transfer DRAIN result must be fetched")
+            return list(self._rows)
+        return ()
+
+
 class _InflightDrainRuntime(_DrainRuntime):
     def __init__(
         self,
@@ -1562,6 +1571,28 @@ class _SetupDisconnectRuntime(_FakeRuntime):
 
     def is_connection_error(self, exc):
         return getattr(exc, "errno", None) == 2013
+
+
+class _ShutdownGapReplayRuntime(_FakeRuntime):
+    def __init__(self):
+        super().__init__()
+        self.server_down = False
+        self.old_connection = _FakeConnection()
+        self.resumed_connection = _FakeConnection()
+        self.disconnected_sql = []
+        self.replayed_sql = []
+
+    def execute(self, conn, sql, fetch=False):
+        if self.server_down and conn is self.old_connection:
+            self.disconnected_sql.append(sql)
+            raise _FakeConnectionLost()
+        if conn is self.resumed_connection and self.disconnected_sql:
+            if sql == self.disconnected_sql[-1]:
+                self.replayed_sql.append(sql)
+        return super().execute(conn, sql, fetch=fetch)
+
+    def is_connection_error(self, exc):
+        return isinstance(exc, _FakeConnectionLost)
 
 
 class _InspectingWorker(BusinessWorker):
@@ -3278,6 +3309,71 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertIs(result["conn"], resumed)
 
+    def test_shutdown_gap_sql_replays_once_only_after_resume_succeeds(self):
+        cfg = HarnessConfig(
+            sessions=1,
+            table_count=1,
+            statements_per_tx=3,
+            shutdown_gap_replay_probe=True,
+        ).validate()
+        runtime = _ShutdownGapReplayRuntime()
+        coordinator = ResumeCoordinator(sessions=1)
+        worker = BusinessWorker(
+            1,
+            WorkloadPlan(cfg),
+            runtime,
+            coordinator,
+            stop_event=threading.Event(),
+        )
+        result = {}
+        generation = coordinator.request_drain_checkpoint()
+
+        thread = threading.Thread(
+            target=lambda: result.setdefault(
+                "connection",
+                worker._run_transaction(runtime.old_connection, tx_id=1),
+            )
+        )
+        thread.start()
+        self.assertTrue(
+            coordinator.wait_all_paused_for_drain(generation, timeout_s=1.0)
+        )
+
+        runtime.server_down = True
+        coordinator.release_shutdown_gap_probe(sid=1, generation=generation)
+        self.assertTrue(
+            coordinator.wait_for_shutdown_gap_disconnect(
+                sid=1, generation=generation, timeout_s=1.0
+            )
+        )
+        self.assertEqual(len(runtime.disconnected_sql), 1)
+        self.assertEqual(runtime.replayed_sql, [])
+        self.assertTrue(thread.is_alive())
+
+        runtime.server_down = False
+        resume_succeeded_us = time.monotonic_ns() // 1000
+        coordinator.mark_shutdown_gap_resume_succeeded(
+            sid=1,
+            generation=generation,
+            resume_succeeded_us=resume_succeeded_us,
+        )
+        coordinator.publish_resumed_connection(1, runtime.resumed_connection)
+        thread.join(1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertIs(result["connection"], runtime.resumed_connection)
+        self.assertEqual(runtime.replayed_sql, runtime.disconnected_sql)
+        sample = coordinator.shutdown_gap_replay_sample(
+            sid=1, generation=generation
+        )
+        self.assertEqual(sample["replay_send_count"], 1)
+        self.assertLessEqual(
+            sample["resume_succeeded_us"], sample["replay_sent_us"]
+        )
+        self.assertLessEqual(
+            sample["replay_sent_us"], sample["replay_completed_us"]
+        )
+
     def test_batch_publish_releases_paused_workers_together(self):
         coordinator = ResumeCoordinator(sessions=2)
         generation = coordinator.request_drain_checkpoint()
@@ -3841,6 +3937,137 @@ class WorkloadPlanTest(unittest.TestCase):
             if sql.startswith("DRAIN TRANSACTIONS PRESERVE")
         ]
         self.assertEqual(drain_calls, [False])
+
+    def test_transfer_drain_fetches_and_validates_success_result(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=2,
+            receiver_preserve_dir="/tmp/receiver-preserve",
+            receiver_unix_socket="/tmp/receiver.sock",
+        )
+        runner.runtime = _TransferDrainRuntime(
+            [
+                (7, "SUCCESS", 101, "SURVIVOR", "NONE", 1000, 2000),
+                (7, "SUCCESS", 102, "SURVIVOR", "NONE", 1000, 2000),
+            ]
+        )
+
+        self.assertTrue(runner._execute_drain_preserve())
+        runner.validate_standby_transfer_drain_result(
+            expected_survivor_count=2,
+        )
+
+        self.assertEqual(
+            [row["source_connection_id"] for row in runner.drain_result_rows],
+            [101, 102],
+        )
+        self.assertEqual(runner.runtime.calls[-1][1], True)
+
+    def test_transfer_drain_validates_exact_timeout_exclusion(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            sessions=1,
+            standby_transfer_timeout_exclusion=True,
+            receiver_preserve_dir="/tmp/receiver-preserve",
+            receiver_unix_socket="/tmp/receiver.sock",
+        )
+        runner.timeout_exclusion_probe_connection_id = 299
+        runner.runtime = _TransferDrainRuntime(
+            [
+                (
+                    9,
+                    "SUCCESS_WITH_EXCLUSIONS",
+                    201,
+                    "SURVIVOR",
+                    "NONE",
+                    3000,
+                    4000,
+                ),
+                (
+                    9,
+                    "SUCCESS_WITH_EXCLUSIONS",
+                    299,
+                    "EXCLUDED",
+                    "CLOSING_COMMAND_TIMEOUT",
+                    3000,
+                    4000,
+                ),
+            ]
+        )
+
+        self.assertTrue(runner._execute_drain_preserve())
+        runner.validate_standby_transfer_drain_result(
+            expected_survivor_count=1,
+            expected_excluded_connection_id=299,
+        )
+
+    def test_standby_transfer_workers_use_non_ha_source_account(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_receiver_drain_metrics",
+            database="transfer_workload_db",
+            unix_socket="/tmp/source.sock",
+            standby_transfer_user="transfer_receiver",
+            standby_transfer_password="transfer-secret",
+            receiver_preserve_dir="/tmp/receiver-preserve",
+            receiver_unix_socket="/tmp/receiver.sock",
+        )
+        runner.runtime = _EndpointCaptureRuntime()
+        runner.runtime.config = runner.config
+
+        worker_runtime = runner.prepare_standby_transfer_source_workload_runtime()
+        worker_runtime.connect(database=True, autocommit=False)
+
+        self.assertTrue(
+            any(
+                "GRANT ALL PRIVILEGES ON `transfer_workload_db`.*" in sql
+                for sql in runner.runtime.sql
+            )
+        )
+        self.assertEqual(
+            sum(
+                sql.startswith("REVOKE ALL PRIVILEGES, GRANT OPTION FROM")
+                for sql in runner.runtime.sql
+            ),
+            3,
+        )
+        self.assertEqual(
+            runner.runtime.endpoint_kwargs[-1]["user"],
+            "transfer_receiver_workload",
+        )
+        self.assertEqual(
+            runner.runtime.endpoint_kwargs[-1]["password"],
+            "transfer-secret",
+        )
+
+    def test_reset_source_ha_account_is_explicit_and_minimally_granted(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_reset_drain",
+            standby_transfer_password="transfer-secret",
+            receiver_preserve_dir="/tmp/receiver-preserve",
+            receiver_unix_socket="/tmp/receiver.sock",
+        )
+        runner.runtime = _EndpointCaptureRuntime()
+        runner.runtime.config = runner.config
+
+        runner.configure_source_ha_control_credentials()
+        runner._source_ha_control_connection()
+
+        sql_text = "\n".join(runner.runtime.sql)
+        self.assertIn(
+            "CREATE USER IF NOT EXISTS 'preserve_trx_ha_admin'@'localhost'",
+            sql_text,
+        )
+        self.assertIn("GRANT SHUTDOWN ON *.*", sql_text)
+        self.assertIn("GRANT SYSTEM_VARIABLES_ADMIN ON *.*", sql_text)
+        self.assertNotIn("CREATE ROLE", sql_text)
+        self.assertEqual(
+            runner.runtime.endpoint_kwargs[-1]["user"],
+            "preserve_trx_ha_admin",
+        )
 
     def test_temp_table_retryable_unsupported_drain_cancels_checkpoint(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
@@ -5585,6 +5812,29 @@ class WorkloadPlanTest(unittest.TestCase):
                 "epoch_fact_count": 1,
                 "epoch_commit_count": 1,
             }
+            runner.standby_transfer_source_workload_user = (
+                "preserve_transfer_receiver_workload"
+            )
+            runner.drain_result_rows = [
+                {
+                    "generation": 7,
+                    "outcome": "SUCCESS",
+                    "source_connection_id": 101,
+                    "token_role": "SURVIVOR",
+                    "reason": "NONE",
+                    "closing_started_us": 900_000,
+                    "closing_deadline_us": 1_000_000,
+                },
+                {
+                    "generation": 7,
+                    "outcome": "SUCCESS",
+                    "source_connection_id": 102,
+                    "token_role": "SURVIVOR",
+                    "reason": "NONE",
+                    "closing_started_us": 900_000,
+                    "closing_deadline_us": 1_000_000,
+                },
+            ]
             runner.compute_receiver_ready_after_source_phase2_end_us(
                 now_monotonic_us=lambda: 1_042_000
             )
@@ -5659,6 +5909,14 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertFalse(report["production_provider"])
             self.assertFalse(report["write_enable_exercised"])
             self.assertEqual(report["workload_sessions"], 2)
+            self.assertEqual(
+                report["source_workload_user"],
+                "preserve_transfer_receiver_workload",
+            )
+            self.assertFalse(report["source_workload_has_shutdown_acl"])
+            self.assertFalse(report["timeout_exclusion_enabled"])
+            self.assertEqual(len(report["drain_result_rows"]), 2)
+            self.assertEqual(report["drain_result_outcome"], "SUCCESS")
             self.assertEqual(report["workload_statements_per_tx"], 100000)
             self.assertEqual(report["workload_lockset_batch_size"], 100000)
             self.assertEqual(report["workload_seed_rows_per_table_per_session"], 100000)
@@ -9925,32 +10183,6 @@ class ResetDrainHarnessTest(unittest.TestCase):
         )
         self.assertTrue(connection.closed)
 
-    def test_release_reset_observer_is_armed_before_returning(self):
-        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
-        observed = {}
-
-        def observe(timeout_s, *, ready_event, poll_interval_s):
-            observed["timeout_s"] = timeout_s
-            observed["poll_interval_s"] = poll_interval_s
-            ready_event.set()
-            return {
-                "requested_us": 10,
-                "response_us": 20,
-                "error": None,
-            }
-
-        runner._reset_on_phase2_draining_rejection = observe
-
-        thread, state = runner._start_phase2_reset_observer(timeout_s=2.0)
-        thread.join(1.0)
-
-        self.assertFalse(thread.is_alive())
-        self.assertIsNone(state["error"])
-        self.assertEqual(state["requested_us"], 10)
-        self.assertEqual(state["response_us"], 20)
-        self.assertEqual(observed["timeout_s"], 2.0)
-        self.assertEqual(observed["poll_interval_s"], 0.0)
-
     def test_debug_reset_scenario_pauses_receiver_prewarm_for_orphan_ttl(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.runtime = mock.Mock()
@@ -10025,7 +10257,9 @@ class ResetDrainHarnessTest(unittest.TestCase):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.runtime = mock.Mock()
         connection = _FakeConnection()
-        runner.runtime.connect.return_value = connection
+        runner._source_ha_control_connection = mock.Mock(
+            return_value=connection
+        )
         runner.runtime.execute.return_value = [("OFF",)]
 
         self.assertFalse(runner._source_debug_sync_supported())
@@ -10035,7 +10269,9 @@ class ResetDrainHarnessTest(unittest.TestCase):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
         runner.runtime = mock.Mock()
         connection = _FakeConnection()
-        runner.runtime.connect.return_value = connection
+        runner._source_ha_control_connection = mock.Mock(
+            return_value=connection
+        )
         runner.runtime.execute.side_effect = [
             [("ON - signals: ''",)],
             (),
@@ -10083,6 +10319,26 @@ class ResetDrainHarnessTest(unittest.TestCase):
 
         self.assertFalse(thread.is_alive())
         self.assertIsNone(state["error"])
+        runner.runtime.connect.assert_not_called()
+        runner.runtime.execute.assert_called_once_with(
+            connection, "RESET DRAIN"
+        )
+        self.assertTrue(connection.closed)
+
+    def test_reset_thread_opens_dedicated_ha_control_connection(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.runtime = mock.Mock()
+        connection = _FakeConnection()
+        runner._source_ha_control_connection = mock.Mock(
+            return_value=connection
+        )
+
+        thread, state = runner._start_reset_thread(label="phase1")
+        thread.join(1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertIsNone(state["error"])
+        runner._source_ha_control_connection.assert_called_once_with()
         runner.runtime.connect.assert_not_called()
         runner.runtime.execute.assert_called_once_with(
             connection, "RESET DRAIN"
@@ -10226,6 +10482,43 @@ class ResetDrainHarnessTest(unittest.TestCase):
         self.assertEqual(coordinator.drained_count(), 0)
         self.assertEqual(runtime.probe_attempts, 2)
 
+    def test_release_worker_uses_original_transaction_as_closing_sentinel(self):
+        cfg = HarnessConfig(
+            scenario="standby_transfer_reset_drain",
+            sessions=1,
+            table_count=1,
+            statements_per_tx=3,
+            seed_rows_per_table_per_session=1,
+            repeated_row_write_workload=True,
+            receiver_unix_socket="/tmp/reset-receiver.sock",
+            receiver_preserve_dir="/tmp/reset-receiver/preserve",
+        ).validate()
+        runtime = _ResetDrainReleaseWorkerRuntime()
+        coordinator = ResetDrainCoordinator(sessions=1)
+        worker = ResetDrainWorker(
+            sid=1,
+            plan=WorkloadPlan(cfg),
+            runtime=runtime,
+            coordinator=coordinator,
+            timeout_s=2.0,
+            require_session_drained=False,
+            wait_for_closing_rejection=True,
+        )
+
+        worker.start()
+        self.assertTrue(coordinator.wait_all_transactions_prepared(timeout_s=1.0))
+        coordinator.allow_drain_probe()
+        self.assertTrue(coordinator.wait_any_closing_rejection(timeout_s=1.0))
+        coordinator.allow_replay_after_reset(time.monotonic_ns() // 1000)
+        worker.join(1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertIsNone(worker.error)
+        self.assertTrue(worker.committed)
+        self.assertEqual(runtime.sql.count("SELECT 1"), 1)
+        self.assertEqual(coordinator.draining_rejected_count(), 1)
+        self.assertEqual(coordinator.replayed_count(), 1)
+
     def test_runtime_recognizes_drain_cancelled_by_reset(self):
         exc = type("DrainReset", (Exception,), {"errno": 4021})()
         runtime = MySQLRuntime.__new__(MySQLRuntime)
@@ -10238,29 +10531,11 @@ class ResetDrainHarnessTest(unittest.TestCase):
 
         self.assertTrue(runtime.is_preserve_draining_rejection(exc))
 
-    def test_release_observer_issues_reset_on_same_preopened_connection(self):
-        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
-        runner.config = HarnessConfig(
-            scenario="standby_transfer_reset_drain",
-            sessions=1,
-            table_count=1,
-            statements_per_tx=1,
-            seed_rows_per_table_per_session=1,
-            repeated_row_write_workload=True,
-            receiver_unix_socket="/tmp/reset-receiver.sock",
-            receiver_preserve_dir="/tmp/reset-receiver/preserve",
-        ).validate()
-        runner.plan = WorkloadPlan(runner.config)
-        runner.runtime = _Phase2ResetObserverRuntime()
+    def test_runtime_recognizes_closing_session_drained_rejection(self):
+        exc = type("SessionDrained", (Exception,), {"errno": 4020})()
+        runtime = MySQLRuntime.__new__(MySQLRuntime)
 
-        state = runner._reset_on_phase2_draining_rejection(timeout_s=1.0)
-
-        self.assertGreater(state["response_us"], 0)
-        self.assertGreaterEqual(state["response_us"], state["requested_us"])
-        self.assertEqual(runner.runtime.sql[-1], "RESET DRAIN")
-        self.assertIs(
-            runner.runtime.calls[-1][0], runner.runtime.connection
-        )
+        self.assertTrue(runtime.is_preserve_draining_rejection(exc))
 
     def test_runner_dispatches_reset_transfer_scenario(self):
         runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
