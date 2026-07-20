@@ -316,6 +316,8 @@ dberr_t trx_preserve_export_record_locks(trx_t *trx, std::string *payload,
 dberr_t trx_preserve_export_record_locks(THD *thd, std::string *payload,
                                          uint32_t max_lock_count);
 dberr_t trx_preserve_export_record_locks_stable_page_only(
+    trx_t *trx, std::string *payload, uint32_t max_lock_count);
+dberr_t trx_preserve_export_record_locks_stable_page_only(
     THD *thd, std::string *payload, uint32_t max_lock_count);
 bool trx_preserve_sample_lock_warmcopy_fence(
     THD *thd, lock_warmcopy_trx_lock_fence_t *fence);

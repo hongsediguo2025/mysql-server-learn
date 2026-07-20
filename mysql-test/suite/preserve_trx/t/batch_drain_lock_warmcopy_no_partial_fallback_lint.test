@@ -106,7 +106,7 @@ die "lock warmcopy target sampler must skip record live export for phase1 seeded
 
 die "lock warmcopy record payload must be externalized when building the preserve bundle\n"
   unless $kernel =~
-         /bundle_input\.externalize_record_locks_payload\s*=\s*use_lock_warmcopy_artifact[\s\S]{0,160}bundle_input\.prebuilt_record_locks_blob\s*==\s*nullptr[\s\S]{0,160}!metadata\.record_locks_payload\.empty\s*\(\s*\)/s;
+         /bundle_input\.externalize_record_locks_payload\s*=\s*\([\s\S]{0,180}use_lock_warmcopy_artifact[\s\S]{0,180}request\.deferred_transfer_candidate\s*!=\s*nullptr[\s\S]{0,180}bundle_input\.prebuilt_record_locks_blob\s*==\s*nullptr[\s\S]{0,180}!metadata\.record_locks_payload\.empty\s*\(\s*\)/s;
 die "lock warmcopy prebuilt record blob must be passed into the preserve bundle\n"
   unless $kernel =~
          /lock_warmcopy_artifact->has_prebuilt_record_locks_blob[\s\S]{0,180}bundle_input\.prebuilt_record_locks_blob\s*=[\s\S]{0,120}&lock_warmcopy_artifact->prebuilt_record_locks_blob/s;
@@ -201,6 +201,19 @@ die "lock warmcopy must prepare hook-built record stores before WARMCOPY_CLOSING
          $preserve =~ /lock_warmcopy_phase1_store_prepare_rejected/s &&
          index($preserve, 'prepare_phase1_record_store_targets') <
          $closing_transition;
+
+die "early transfer pipeline must remain strict standby transfer with A=ON\n"
+  unless $preserve =~
+         /const\s+bool\s+early_pipeline_policy_enabled\s*=[\s\S]{0,300}standby_transfer_streaming_enabled[\s\S]{0,120}two_phase_enabled[\s\S]{0,160}preserve_trx_drain_command_timeout_fail_batch[\s\S]{0,180}lock_warmcopy_participant\s*!=\s*nullptr[\s\S]{0,180}fallback_to_live_export/s &&
+         $preserve =~
+         /const\s+bool\s+early_pipeline_enabled\s*=[\s\S]{0,180}early_pipeline_policy_enabled[\s\S]{0,160}batch_transfer_source_session\s*!=\s*nullptr/s;
+my $second_scan = index($preserve, 'early_final_lock_fence_changed');
+my $commit_epoch = index($preserve, 'batch_transfer_source_session->commit_epoch()',
+                         $second_scan);
+die "early final lock-fence scan must remain immediately before transfer commit\n"
+  if $second_scan < 0 || $commit_epoch < $second_scan;
+die "early pipeline must not introduce a user-visible selection sysvar\n"
+  if $sys_vars =~ /early[_-](?:pipeline|staged)/i;
 
 EOF
 

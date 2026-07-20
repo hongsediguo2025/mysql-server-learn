@@ -1357,6 +1357,22 @@ TEST(PreserveTrxLockWarmcopyDrainParticipant,
 }
 
 TEST(PreserveTrxLockWarmcopyDrainParticipant,
+     CompleteEarlyPreparedTargetsPrunesPhase1OnlyTargets) {
+  Preserve_trx_lock_warmcopy_drain_participant participant(
+      preserve_trx_lock_warmcopy_current_options());
+  ASSERT_TRUE(participant.open_phase1());
+  ASSERT_TRUE(participant.prepare_quiesced_targets_for_unit_test({42, 43}));
+
+  ASSERT_TRUE(participant.complete_early_prepared_targets({42}));
+
+  Preserve_trx_lock_warmcopy_target_observation target;
+  EXPECT_TRUE(
+      participant.target_observation_for_thread_for_unit_test(42, &target));
+  EXPECT_FALSE(
+      participant.target_observation_for_thread_for_unit_test(43, &target));
+}
+
+TEST(PreserveTrxLockWarmcopyDrainParticipant,
      Phase2PreflightCreatesValidEmptyArtifactsForMultipleTargets) {
   lock_warmcopy_reset_for_unit_test();
 

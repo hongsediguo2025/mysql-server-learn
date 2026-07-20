@@ -3094,6 +3094,26 @@ void maybe_attach_simulated_terminal_lock_proof(
       epoch_id, token, object->lock_plan);
 }
 
+Preserve_trx_transfer_object_descriptor transfer_external_blob_descriptor(
+    const std::string &epoch_id, uint64_t token,
+    const Preserved_trx_external_blob &blob) {
+  Preserve_trx_transfer_object_descriptor descriptor;
+  descriptor.object_id = blob.name;
+  descriptor.kind = Preserve_trx_transfer_object_kind::EXTERNAL_BLOB;
+  descriptor.lock_plan.version = blob.lock_plan_contract_version;
+  descriptor.lock_plan.source_live_generation =
+      blob.source_live_lock_generation;
+  descriptor.lock_plan.source_live_digest = blob.source_live_lock_digest;
+  descriptor.lock_plan.record_store_fingerprint =
+      blob.record_store_fingerprint;
+  descriptor.total_size =
+      blob.prebuilt ? blob.descriptor.size : blob.payload.length();
+  descriptor.digest =
+      blob.prebuilt ? blob.descriptor.digest : sha256_digest(blob.payload);
+  maybe_attach_simulated_terminal_lock_proof(epoch_id, token, &descriptor);
+  return descriptor;
+}
+
 bool receiver_frame_should_spool(Preserve_trx_transfer_frame_type type) {
   switch (type) {
     case Preserve_trx_transfer_frame_type::DECLARE_TOKEN:
@@ -8465,15 +8485,8 @@ Preserve_trx_transfer_status preserve_trx_transfer_build_portable_objects_impl(
     }
 
     Preserve_trx_transfer_object_payload object;
-    object.descriptor.object_id = blob.name;
-    object.descriptor.kind = Preserve_trx_transfer_object_kind::EXTERNAL_BLOB;
-    object.descriptor.lock_plan.version = blob.lock_plan_contract_version;
-    object.descriptor.lock_plan.source_live_generation =
-        blob.source_live_lock_generation;
-    object.descriptor.lock_plan.source_live_digest =
-        blob.source_live_lock_digest;
-    object.descriptor.lock_plan.record_store_fingerprint =
-        blob.record_store_fingerprint;
+    object.descriptor =
+        transfer_external_blob_descriptor(epoch_id, transfer_token, blob);
     if (blob.prebuilt) {
       if (presealed_prebuilt_objects == nullptr ||
           presealed_prebuilt_objects->count(blob.name) == 0 ||
@@ -8481,18 +8494,10 @@ Preserve_trx_transfer_status preserve_trx_transfer_build_portable_objects_impl(
           !blob.payload.empty()) {
         return Preserve_trx_transfer_status::UNSUPPORTED;
       }
-      object.descriptor.total_size = blob.descriptor.size;
-      object.descriptor.digest = blob.descriptor.digest;
-      maybe_attach_simulated_terminal_lock_proof(
-          epoch_id, transfer_token, &object.descriptor);
       built_manifest.objects.push_back(object.descriptor);
       continue;
     }
-    object.descriptor.total_size = blob.payload.length();
-    object.descriptor.digest = sha256_digest(blob.payload);
     object.payload = blob.payload;
-    maybe_attach_simulated_terminal_lock_proof(
-        epoch_id, transfer_token, &object.descriptor);
     built_manifest.objects.push_back(object.descriptor);
     built_objects.push_back(std::move(object));
   }
@@ -9380,6 +9385,22 @@ bool Preserve_trx_transfer_source_epoch_session::object_presealed_for_token(
          written_object->second == descriptor.total_size;
 }
 
+uint64_t Preserve_trx_transfer_source_epoch_session::
+    presealed_object_source_live_generation(
+        uint64_t transfer_token, const std::string &object_id) const {
+  std::lock_guard<std::mutex> guard(m_mutex);
+  const auto declared_token = m_streaming_declared_objects.find(transfer_token);
+  if (declared_token == m_streaming_declared_objects.end()) return 0;
+  const auto declared_object = declared_token->second.find(object_id);
+  if (declared_object == declared_token->second.end()) return 0;
+  const auto sealed_token = m_streaming_sealed_objects.find(transfer_token);
+  if (sealed_token == m_streaming_sealed_objects.end() ||
+      sealed_token->second.count(object_id) == 0) {
+    return 0;
+  }
+  return declared_object->second.lock_plan.source_live_generation;
+}
+
 Preserve_trx_transfer_status
 Preserve_trx_transfer_source_epoch_session::finalize_token_manifest(
     uint64_t transfer_token) {
@@ -10154,6 +10175,169 @@ preserve_trx_transfer_stream_prebuilt_binlog_cache_blob(
   return stream_prebuilt_external_blob_for_transfer(
       session, transfer_token, preserve_dir, blob.name, blob.warmcopy_id,
       blob.warmcopy_epoch, blob.size, blob.digest);
+}
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_stage_deferred_candidate_external_objects(
+    Preserve_trx_transfer_source_epoch_session *session,
+    const std::string &preserve_dir,
+    Preserve_trx_deferred_transfer_candidate *candidate) {
+  if (session == nullptr || candidate == nullptr || !candidate->captured ||
+      candidate->finalized || candidate->transfer_token == 0 ||
+      candidate->epoch_id != session->epoch_id() ||
+      candidate->source_server_uuid != session->source_server_uuid() ||
+      candidate->target_server_uuid != session->target_server_uuid()) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  if (candidate->external_objects_staged)
+    return Preserve_trx_transfer_status::OK;
+
+  for (const Preserved_trx_external_blob &blob :
+       candidate->bundle.external_blobs) {
+    const Preserve_trx_transfer_object_descriptor descriptor =
+        transfer_external_blob_descriptor(candidate->epoch_id,
+                                          candidate->transfer_token, blob);
+    if (session->object_presealed_for_token(candidate->transfer_token,
+                                            descriptor)) {
+      continue;
+    }
+
+    Preserve_trx_transfer_status status = Preserve_trx_transfer_status::OK;
+    const char *stage = "prebuilt_read";
+    if (blob.prebuilt) {
+      status = stream_prebuilt_external_blob_for_transfer(
+          session, candidate->transfer_token, preserve_dir, blob.name,
+          blob.warmcopy_id, blob.warmcopy_epoch, blob.descriptor.size,
+          blob.descriptor.digest,
+          blob.name == kPreservedTrxBlobRecordLocks ? &descriptor.lock_plan
+                                                    : nullptr);
+    } else {
+      if (blob.name.empty() || blob.payload.empty())
+        return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+      stage = "declare";
+      status = session->declare_object(candidate->transfer_token, descriptor);
+      for (uint64_t offset = 0;
+           status == Preserve_trx_transfer_status::OK &&
+           offset < blob.payload.length();
+           offset += session->chunk_bytes()) {
+        stage = "chunk";
+        const size_t length = std::min<uint64_t>(
+            session->chunk_bytes(), blob.payload.length() - offset);
+        status = session->write_object_chunk(
+            candidate->transfer_token, descriptor.object_id, offset,
+            blob.payload.substr(offset, length));
+      }
+      if (status == Preserve_trx_transfer_status::OK) {
+        stage = "seal";
+        status = session->seal_object(candidate->transfer_token,
+                                      descriptor.object_id);
+      }
+    }
+    if (status != Preserve_trx_transfer_status::OK) {
+      const std::string message =
+          "PRESERVE: deferred transfer external object stage failed epoch=" +
+          candidate->epoch_id +
+          " token=" + std::to_string(candidate->transfer_token) +
+          " object=" + blob.name +
+          " prebuilt=" + (blob.prebuilt ? "1" : "0") +
+          " stage=" + stage +
+          " lock_contract_version=" +
+          std::to_string(descriptor.lock_plan.version) +
+          " lock_generation=" +
+          std::to_string(descriptor.lock_plan.source_live_generation) +
+          " status=" + transfer_status_name(status);
+      LogErr(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
+      return status;
+    }
+  }
+  candidate->external_objects_staged = true;
+  return Preserve_trx_transfer_status::OK;
+}
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_replace_deferred_candidate_record_locks(
+    Preserve_trx_deferred_transfer_candidate *candidate,
+    Preserved_trx_external_blob replacement) {
+  if (candidate == nullptr || !candidate->captured || candidate->finalized ||
+      !candidate->external_objects_staged || replacement.prebuilt ||
+      replacement.name != kPreservedTrxBlobRecordLocks ||
+      replacement.payload.empty()) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+
+  auto current = std::find_if(
+      candidate->bundle.external_blobs.begin(),
+      candidate->bundle.external_blobs.end(),
+      [](const Preserved_trx_external_blob &blob) {
+        return blob.name == kPreservedTrxBlobRecordLocks;
+      });
+  const Preserve_trx_transfer_object_descriptor replacement_descriptor =
+      transfer_external_blob_descriptor(candidate->epoch_id,
+                                        candidate->transfer_token, replacement);
+  if (!transfer_lock_plan_contract_valid(replacement_descriptor)) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  if (current == candidate->bundle.external_blobs.end()) {
+    candidate->bundle.external_blobs.push_back(std::move(replacement));
+    candidate->external_objects_staged = false;
+    return Preserve_trx_transfer_status::OK;
+  }
+
+  const Preserve_trx_transfer_object_descriptor current_descriptor =
+      transfer_external_blob_descriptor(candidate->epoch_id,
+                                        candidate->transfer_token, *current);
+  const Preserve_trx_transfer_status replacement_status =
+      transfer_lock_plan_replacement_status(current_descriptor,
+                                            replacement_descriptor);
+  if (replacement_status != Preserve_trx_transfer_status::OK) {
+    return replacement_status;
+  }
+
+  *current = std::move(replacement);
+  candidate->external_objects_staged = false;
+  return Preserve_trx_transfer_status::OK;
+}
+
+Preserve_trx_transfer_status preserve_trx_transfer_finalize_deferred_candidate(
+    Preserve_trx_transfer_source_epoch_session *session,
+    Preserve_trx_deferred_transfer_candidate *candidate) {
+  if (session == nullptr || candidate == nullptr || !candidate->captured ||
+      !candidate->external_objects_staged || candidate->transfer_token == 0 ||
+      candidate->epoch_id != session->epoch_id() ||
+      candidate->source_server_uuid != session->source_server_uuid() ||
+      candidate->target_server_uuid != session->target_server_uuid()) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  if (candidate->finalized) return Preserve_trx_transfer_status::OK;
+
+  std::set<std::string> presealed_external_objects;
+  for (const Preserved_trx_external_blob &blob :
+       candidate->bundle.external_blobs) {
+    const Preserve_trx_transfer_object_descriptor descriptor =
+        transfer_external_blob_descriptor(candidate->epoch_id,
+                                          candidate->transfer_token, blob);
+    if (!session->object_presealed_for_token(candidate->transfer_token,
+                                             descriptor)) {
+      return Preserve_trx_transfer_status::UNSUPPORTED;
+    }
+    presealed_external_objects.insert(blob.name);
+  }
+
+  Preserve_trx_transfer_manifest manifest;
+  std::vector<Preserve_trx_transfer_object_payload> objects;
+  Preserve_trx_transfer_status status =
+      preserve_trx_transfer_build_portable_objects_impl(
+          candidate->epoch_id, candidate->source_server_uuid,
+          candidate->target_server_uuid, candidate->bundle,
+          candidate->transfer_token, &manifest, &objects,
+          &presealed_external_objects,
+          candidate->has_resurrection_entry ? &candidate->resurrection_entry
+                                            : nullptr);
+  if (status != Preserve_trx_transfer_status::OK) return status;
+  status = session->send_token_objects_batch(
+      manifest, objects, presealed_external_objects, true);
+  if (status == Preserve_trx_transfer_status::OK) candidate->finalized = true;
+  return status;
 }
 
 Preserve_trx_transfer_status
@@ -14612,6 +14796,46 @@ Preserve_snapshot_status Preserve_trx_local_carrier_artifact_sink::publish_bundl
                         write_failure_delete_status, write_stats);
 }
 
+Preserve_snapshot_status preserve_trx_transfer_capture_deferred_candidate(
+    const std::string &epoch_id, const std::string &source_server_uuid,
+    const std::string &target_server_uuid, uint64_t transfer_token,
+    Preserved_trx_bundle bundle, uint64_t timeout_seconds,
+    const Preserve_trx_resurrection_index_entry *resurrection_entry,
+    Preserve_trx_deferred_transfer_candidate *candidate,
+    Preserve_snapshot_metadata *written_metadata) {
+  if (candidate == nullptr || candidate->captured || transfer_token == 0 ||
+      timeout_seconds == 0 || epoch_id.empty() || source_server_uuid.empty() ||
+      target_server_uuid.empty()) {
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
+  if (!preserve_trx_is_enabled()) return Preserve_snapshot_status::UNSUPPORTED;
+
+  const uint64_t created_at_us = my_micro_time();
+  constexpr uint64_t kMicrosecondsPerSecond = 1000000ULL;
+  if (timeout_seconds >
+      (std::numeric_limits<uint64_t>::max() - created_at_us) /
+          kMicrosecondsPerSecond) {
+    return Preserve_snapshot_status::INVALID_ARGUMENT;
+  }
+  bundle.metadata.created_at_us = created_at_us;
+  bundle.metadata.expires_at_us =
+      created_at_us + timeout_seconds * kMicrosecondsPerSecond;
+
+  candidate->epoch_id = epoch_id;
+  candidate->source_server_uuid = source_server_uuid;
+  candidate->target_server_uuid = target_server_uuid;
+  candidate->transfer_token = transfer_token;
+  candidate->timeout_seconds = timeout_seconds;
+  candidate->bundle = std::move(bundle);
+  if (resurrection_entry != nullptr) {
+    candidate->resurrection_entry = *resurrection_entry;
+    candidate->has_resurrection_entry = true;
+  }
+  candidate->captured = true;
+  if (written_metadata != nullptr) *written_metadata = candidate->bundle.metadata;
+  return Preserve_snapshot_status::OK;
+}
+
 Preserve_snapshot_status Preserve_trx_transfer_artifact_sink::publish_bundle(
     Preserved_trx_bundle bundle, uint64_t timeout_seconds,
     Preserve_snapshot_metadata *written_metadata,
@@ -14695,24 +14919,9 @@ Preserve_trx_transfer_session_artifact_sink::publish_bundle(
 
   std::set<std::string> presealed_external_objects;
   for (const Preserved_trx_external_blob &blob : bundle.external_blobs) {
-    Preserve_trx_transfer_object_descriptor descriptor;
-    descriptor.object_id = blob.name;
-    descriptor.kind = Preserve_trx_transfer_object_kind::EXTERNAL_BLOB;
-    descriptor.lock_plan.version = blob.lock_plan_contract_version;
-    descriptor.lock_plan.source_live_generation =
-        blob.source_live_lock_generation;
-    descriptor.lock_plan.source_live_digest = blob.source_live_lock_digest;
-    descriptor.lock_plan.record_store_fingerprint =
-        blob.record_store_fingerprint;
-    if (blob.prebuilt) {
-      descriptor.total_size = blob.descriptor.size;
-      descriptor.digest = blob.descriptor.digest;
-    } else {
-      descriptor.total_size = blob.payload.length();
-      descriptor.digest = sha256_digest(blob.payload);
-    }
-    maybe_attach_simulated_terminal_lock_proof(
-        m_session->epoch_id(), m_transfer_token, &descriptor);
+    const Preserve_trx_transfer_object_descriptor descriptor =
+        transfer_external_blob_descriptor(m_session->epoch_id(),
+                                          m_transfer_token, blob);
     if (m_session->object_presealed_for_token(m_transfer_token, descriptor)) {
       presealed_external_objects.insert(blob.name);
       continue;

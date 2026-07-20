@@ -103,9 +103,9 @@ SET DEBUG_SYNC='now SIGNAL binlog_aba_final_ack_continue';
 --enable_result_log
 
 --connection default
---let $assert_text= Phase2 rejects the equal-length stale Phase1 binlog blob
+--let $assert_text= Early preserve rejects the equal-length stale Phase1 binlog blob
 --let $assert_file= $MYSQLTEST_VARDIR/log/mysqld.1.err
---let $assert_select= PRESERVE: standby transfer phase2 binlog catchup target_count=1 streamed_tokens=1 already_current_tokens=0 not_required_tokens=0
+--let $assert_select= PRESERVE: standby transfer early binlog catchup target=[0-9]+ bytes=[1-9][0-9]*
 --let $assert_count_condition= >= 1
 --source include/assert_grep.inc
 

@@ -1,0 +1,8 @@
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT v AS value_after_finalize_failure FROM t_closing_early_failure;
+value_after_finalize_failure
+21
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT v AS value_after_replacement_failure FROM t_closing_early_failure;
+value_after_replacement_failure
+122

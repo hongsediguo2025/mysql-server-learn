@@ -1977,10 +1977,10 @@ die "batch cleanup failure helper must clear non-preserved targets, abort partic
          $batch_cleanup_failure_no_shutdown =~ /preserve_trx_reject_batch_cleanup_failed\s*\(\s*\)/s;
 die "batch cleanup failure must use a dedicated client error\n"
   unless $preserve =~ /ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED/s;
-$preserve =~ /DEBUG_SYNC\s*\(\s*thd\s*,\s*"preserve_trx_batch_after_targets_quiesced_before_attach"\s*\)([\s\S]*?)Preserve_batch_quiesced_idle_target\s+batch/m
+$preserve =~ /DEBUG_SYNC\s*\(\s*thd\s*,\s*"preserve_trx_batch_after_targets_quiesced_before_attach"\s*\)([\s\S]*?)if\s*\(\s*!early_pipeline_enabled\s*&&\s*preserve_worker_count\s*<=\s*1\s*\)/m
   or die "batch drain must expose a pre-attach sync point after targets are quiesced\n";
 die "pre-attach sync point must be before target context-switch attach loop\n"
-  if $& =~ /preserve_trx_preserve_attached_transaction/s;
+  if $1 =~ /preserve_one_target\s*\(|preserve_trx_preserve_attached_transaction/s;
 die "lock warmcopy must not hold a global prepare guard across preserve prepare\n"
   if $preserve =~
      /lock_warmcopy_prepare_guard\.reset\s*\(\s*lock_warmcopy_prepare_guard_create\s*\(\s*\)\s*\)[\s\S]*trx_preserve_prepare_current\s*\(\s*thd\s*,\s*xid\s*\)[\s\S]*lock_warmcopy_prepare_guard\.reset\s*\(\s*\)/s;

@@ -1,0 +1,6 @@
+one_accepted_epoch
+1
+one_survivor_receiving
+1
+generation	outcome	source_connection_id	token_role	reason	closing_started_us	closing_deadline_us
+GENERATION	SUCCESS	SURVIVOR_ID	SURVIVOR	NONE	CLOSING_STARTED_US	CLOSING_DEADLINE_US

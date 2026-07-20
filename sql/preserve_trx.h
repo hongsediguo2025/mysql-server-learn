@@ -40,6 +40,7 @@
 #include "sql/sql_cmd.h"
 
 class THD;
+struct trx_t;
 struct TABLE;
 struct LEX;
 struct Preserve_trx_lock_warmcopy_artifact;
@@ -48,6 +49,7 @@ class Preserve_trx_gate_adopt_lease;
 class Preserve_trx_cleanup_lease;
 class Preserve_trx_physical_fence_lease;
 struct Preserve_trx_prepared_token_key;
+struct Preserve_trx_deferred_transfer_candidate;
 struct Mysql_binlog_preserve_cache_facts;
 struct Mysql_binlog_preserve_token_identity;
 
@@ -226,6 +228,12 @@ ulonglong preserve_trx_phase2_prepare_us_status();
 ulonglong preserve_trx_phase2_detach_claim_us_status();
 ulonglong preserve_trx_phase2_snapshot_write_us_status();
 ulonglong preserve_trx_phase2_register_us_status();
+ulonglong preserve_trx_early_staged_tokens_status();
+ulonglong preserve_trx_command_boundary_to_enqueue_us_max_status();
+ulonglong preserve_trx_final_fast_scan_us_status();
+ulonglong preserve_trx_final_dirty_tokens_status();
+ulonglong preserve_trx_final_replacement_tokens_status();
+ulonglong preserve_trx_final_validation_rejects_status();
 ulonglong preserve_trx_phase2_slo_miss_count_status();
 ulonglong preserve_trx_resume_total_us_status();
 ulonglong preserve_trx_startup_recovery_elapsed_us_status();
@@ -477,6 +485,12 @@ struct Preserve_trx_preserve_result {
   /* True when binlog cache semantics were logged into the snapshot. */
   bool logged_binlog_cache{false};
   std::string snapshot_identity_digest;
+  /*
+    Non-owning handle for batch-drain final validation. It is set only after
+    the preserved record owns the detached transaction and remains valid until
+    that record is restored, resumed, or discarded.
+  */
+  trx_t *preserved_trx{nullptr};
   std::unique_ptr<Preserve_trx_source_rollback_image> source_rollback_image;
 };
 
@@ -740,7 +754,9 @@ bool preserve_trx_preserve_attached_transaction(
     const std::string &transfer_preserve_dir = std::string(),
     const std::string &preselected_token = std::string(),
     bool xid_provenance_intent_prepared = false,
-    bool defer_xid_provenance_bind = false);
+    bool defer_xid_provenance_bind = false,
+    Preserve_trx_deferred_transfer_candidate *deferred_transfer_candidate =
+        nullptr);
 
 /*
   SQL command for preserving the current transaction before shutdown.

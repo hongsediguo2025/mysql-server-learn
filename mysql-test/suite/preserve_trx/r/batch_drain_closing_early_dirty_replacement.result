@@ -1,0 +1,38 @@
+ERROR HY000: DRAIN TRANSACTIONS PRESERVE was reset before shutdown handoff
+SELECT
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_lock_warmcopy_sealed_valid')>=1
+AS early_prebuilt_sealed,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_early_staged_tokens')=1
+AS replacement_staged_one,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_final_dirty_tokens')=1
+AS replacement_dirty_one,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_final_replacement_tokens')=1
+AS replacement_sent_one,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_final_validation_rejects')=0
+AS replacement_no_reject;
+early_prebuilt_sealed	replacement_staged_one	replacement_dirty_one	replacement_sent_one	replacement_no_reject
+1	1	1	1	1
+SELECT v AS value_after_replacement_reset FROM t_closing_early_dirty;
+value_after_replacement_reset
+21
+ERROR HY000: Resumable transactions across shutdown do not support this operation
+SELECT
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_early_staged_tokens')=1
+AS reject_staged_one,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_final_replacement_tokens')=0
+AS reject_no_replacement,
+(SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME='Preserve_trx_final_validation_rejects')=1
+AS reject_count_one;
+reject_staged_one	reject_no_replacement	reject_count_one
+1	1	1
+SELECT v AS value_after_final_scan_reject FROM t_closing_early_dirty;
+value_after_final_scan_reject
+122

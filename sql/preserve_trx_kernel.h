@@ -29,6 +29,7 @@
 #include "sql/preserve_trx.h"
 
 struct Preserve_trx_lock_warmcopy_artifact;
+struct Preserve_trx_deferred_transfer_candidate;
 class Preserve_trx_transfer_source_epoch_session;
 
 struct Preserve_trx_kernel_request {
@@ -49,6 +50,8 @@ struct Preserve_trx_kernel_request {
   std::string preselected_token;
   bool xid_provenance_intent_prepared{false};
   bool defer_xid_provenance_bind{false};
+  Preserve_trx_deferred_transfer_candidate *deferred_transfer_candidate{
+      nullptr};
 };
 
 struct Preserve_trx_kernel_result {

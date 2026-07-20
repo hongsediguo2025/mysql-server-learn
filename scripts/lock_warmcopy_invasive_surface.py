@@ -75,6 +75,10 @@ NECESSARY_INTEGRATION_POINTS = {
         "transfer protocol implementation and Debug Sync/fault-injection hooks "
         "only; no native SQL or InnoDB policy"
     ),
+    "sql/preserve_trx_transfer.h": (
+        "transfer protocol declarations and process-local handoff types only; "
+        "no native SQL or InnoDB policy"
+    ),
     "sql/sql_parse.cc": (
         "command-boundary adapter calls only; no preserve state machine or "
         "local guard implementation"

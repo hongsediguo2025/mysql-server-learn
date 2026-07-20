@@ -1,4 +1,4 @@
-include/assert_grep.inc [Phase2 rejects the equal-length stale Phase1 binlog blob]
+include/assert_grep.inc [Early preserve rejects the equal-length stale Phase1 binlog blob]
 SELECT note FROM t_binlog_savepoint_aba WHERE id=1;
 note
 transfer-aba-B

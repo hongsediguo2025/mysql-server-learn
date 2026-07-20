@@ -284,8 +284,8 @@
           <li><a href="#reset">11. RESET DRAIN 分支</a></li>
           <li><a href="#final-ack">12. FINAL_ACK 责任边界</a></li>
           <li><a href="#exactly-once">13. 请求结果安全</a></li>
-          <li><a href="#gap">14. 当前响应屏障缺口</a></li>
-          <li><a href="#minimal-kernel">15. 最小内核补强</a></li>
+          <li><a href="#gap">14. 场景化请求边界</a></li>
+          <li><a href="#minimal-kernel">15. 最小内核职责</a></li>
           <li><a href="#interfaces">16. 三方接口合同</a></li>
           <li><a href="#tests">17. 测试与验收</a></li>
           <li><a href="#files">18. 代码地图与检查表</a></li>
@@ -298,18 +298,19 @@
         <p class="eyebrow">Preserve/Resume 8.0.22 · 物理备机项目对接资料</p>
         <h1>Transfer Phase 2、4020 挂起与 Tx→Ty 事务续作对接指南</h1>
         <p class="lead">
-          本文说明代理节点如何只依赖 <code>ER_PRESERVE_TRX_SESSION_DRAINED (4020)</code>
-          挂起尚未执行的请求，并在 HA 完成目标节点升主和事务接管后，将该请求准确地重放到 Ty 上。
-          文档同时标出当前源码已经具备的行为、尚缺的响应完成屏障，以及最小化的内核补强范围。
+          本文说明代理节点如何处理两种“尚未执行”边界：source 在线时收到
+          <code>ER_PRESERVE_TRX_SESSION_DRAINED (4020)</code>，以及 promotion/shutdown 终态中的计划内连接断开。
+          两种路径都必须等 HA 完成终态节点的事务 RESUME 后，才把队首请求准确重放到 Ty 或重启后的连接；RESET 保留原连接，单独处理。
         </p>
         <p class="meta">
-          代码基线：<span class="mono">302ae0940a58040ef35c0a0d0f6a289eb1708cc7</span>
-          · 生成日期：2026-07-16 · 范围：standby transfer 在线升主预埋，不讨论本地 startup resume
+          原代码基线：<span class="mono">302ae0940a58040ef35c0a0d0f6a289eb1708cc7</span>
+          · 合同复核基线：<span class="mono">1578fdb61ab84e0d7c00b7028ab78d68c432cb3e</span>
+          · 更新日期：2026-07-20 · 主范围：standby transfer 在线升主预埋；同时说明本地 shutdown/startup 的同类断连续作边界
         </p>
       </header>
 
       <div class="summary-strip">
-        <div><b>挂起触发器</b><span>只认错误码 <code>4020</code></span></div>
+        <div><b>挂起触发器</b><span><code>4020</code> 或匹配 HA attempt 的计划内断连</span></div>
         <div><b>事务标识</b><span><code>token = uint64_t(Tx)</code></span></div>
         <div><b>成功续作</b><span>HA attach Tx→Ty 后重放原请求</span></div>
         <div><b>回撤续作</b><span>RESET 成功后在原 Tx 重放</span></div>
@@ -326,15 +327,16 @@
             <article class="panel green">
               <h3>mysqld</h3>
               <p>
-                Source 将事务 preserve 成功后，把 Tx 会话置为 <code>PRESERVED_DRAINED</code>。
-                之后读取到的新命令不执行，统一返回 <code>4020</code>。
+                Source 发布 CLOSING 后，普通业务连接的新 command 一律不进入执行主体；已读完整 packet 时返回 <code>4020</code>，
+                终态连接先关闭时则由断连结束；
+                该连接当时可能尚无事务、正在等待 Preserve，或最终被排除，不能从 4020 推导 token 已经 Preserve。
               </p>
             </article>
             <article class="panel blue">
               <h3>Proxy</h3>
               <p>
-                收到 <code>4020</code> 后不向客户端返回错误，保存原始请求并停止向 source 继续下发；
-                后续客户端请求按连接顺序排队。
+                收到 <code>4020</code> 后不向客户端返回错误；计划内终态断连时也保存唯一在途请求。
+                两者都停止向 source 继续下发，后续客户端请求按连接顺序排队。
               </p>
             </article>
             <article class="panel amber">
@@ -348,24 +350,70 @@
 
           <div class="success">
             <strong>核心流程</strong>
-            source 正常执行的请求返回正常结果；source 明确返回 4020 的请求保证未执行，由代理恰好重放一次。
-            HA 升主成功则在 Ty 上重放，RESET 成功则在原 Tx 上重放。
+            source 正常执行的旧请求必须先完成并返回正常结果；CLOSING 后完整 4020 明确证明该请求未执行。
+            若 promotion/shutdown 终态先关闭连接，只有当前 HA attempt 明确完成且事务 RESUME 成功，代理才重放唯一在途、未得到完整结果的请求。
+            HA 升主成功则在 Ty 上重放，local startup 在重连并 RESUME 后重放，RESET 成功只重放明确收到 4020 的请求。
+          </div>
+
+          <div class="boundary">
+            <strong>本文是三方接口权威面</strong>
+            HA 身份、4020 唯一承诺、DRAIN survivor/excluded 结果、RESET/promotion 终局和计划内断连重放条件以本文为准。
+            CLOSING 编排细节见
+            <a href="preserve-resume-8.0.22-closing-command-cutoff-and-timeout-policy-design.html">WARMCOPY_CLOSING 逐 token 设计</a>；
+            RESET 内部恢复和 TTL 见
+            <a href="preserve-resume-8.0.22-reset-drain-and-receiver-expiry-design.html">RESET DRAIN 与 Receiver 自动失效设计</a>。
           </div>
 
           <div class="risk">
-            <strong>不能把“连接断开”当成 4020</strong>
-            若代理没有收到完整的正常响应，也没有收到完整的 4020，而只看到网络断开，则请求结果不确定。
-            代理不得盲目重放。当前源码还缺一个在 COMMIT_EPOCH 前关闭命令准入并等待响应完成的
-            batch drained response fence，用于关闭 source 已读取请求的本地响应竞态。
+            <strong>只能识别计划内终态断连，不能泛化任意断连</strong>
+            代理必须先消费断连前收到的完整 MySQL packet。只有连接关闭与当前 drain/promotion 或 local shutdown generation 匹配，
+            HA 已确认 source 终态，且事务随后 RESUME 成功时，才允许重放没有完整结果的唯一在途请求。
+            网络故障、mysqld crash、旧 generation 回调或无法证明旧 command 已收敛的断连仍是结果不确定，禁止盲重放。
           </div>
         </section>
 
         <section id="scope">
           <h2>2. 场景与边界</h2>
           <p class="section-lead">
-            本文只描述 transfer 模式下的计划内物理备机升主对接。receiver 在线接收、保存和 prewarm；
-            真正升主由后续物理备机项目的 HA 流程触发。
+            本文以 transfer 模式下的计划内物理备机升主为主，同时解释本地 shutdown/startup 与 RESET DRAIN
+            为什么采用不同的连接处理。三类场景共享 CLOSING 命令门禁，但连接是否终止、由谁授权重发并不相同。
           </p>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>场景</th><th>旧 source 连接</th><th>未进入执行主体的在途请求</th><th>允许重发的时点</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><b>物理备机计划内升主</b></td>
+                  <td>source 交权后关闭；代理在新主建立 Ty。</td>
+                  <td>若 source 在线时已完整返回 4020，则按 4020 挂起；若终态先关闭连接，则保存唯一在途请求并等待 HA 判定。</td>
+                  <td>HA 确认本 generation 的 promotion 成功，且 token 已在 Ty 上 RESUME/attach 成功之后。</td>
+                </tr>
+                <tr>
+                  <td><b>本地 preserve → shutdown → startup</b></td>
+                  <td>旧连接随 mysqld shutdown 断开；startup 后重新连接。</td>
+                  <td>处理方式与计划内升主相同：完整 4020 可直接证明未执行；计划内 shutdown 断连由本次 generation 的恢复结果裁决。</td>
+                  <td>startup recovery 完成、对应事务在新连接上 RESUME 成功之后。</td>
+                </tr>
+                <tr>
+                  <td><b>RESET DRAIN</b></td>
+                  <td>mysqld 不退出，原 Tx 保留并恢复可运行。</td>
+                  <td>完整收到 4020 的请求由代理保存；尚未被 mysqld 读取的 packet 仍留在 socket 中，不应由代理再发一份。</td>
+                  <td>HA 收到 RESET OK 后：仅重发明确收到 4020 的请求；未读 packet 由原连接自然读取执行。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="boundary">
+            <strong>本文的“计划内断连可重发”不是通用网络重试</strong>
+            代理必须维持 classic protocol 半双工约束：每个 backend 同时最多一个需要响应的请求，并先消费断连前已经收到的完整 packet。
+            只有旧 command 已按 drain completion boundary 收敛、连接按当前 generation 正常终态关闭、transfer DRAIN 结果确认 Tx 是 survivor
+            （或本地 startup recovery 确认 token 可恢复）、且终态 RESUME 成功时，
+            才允许重发该唯一在途请求。RST、socket send failure、网络故障、mysqld crash、旧 generation 回调或已执行但响应不明的请求仍按结果不确定处理。
+          </div>
 
           <div class="grid-2">
             <article class="panel green">
@@ -375,6 +423,7 @@
                 <li><code>4020</code> 的代理挂起合同。</li>
                 <li>文本协议和二进制 prepared statement。</li>
                 <li>HA 升主后 Tx→Ty attach 与请求重放。</li>
+                <li>本地 startup 后重新连接、RESUME 与请求重放的同类边界。</li>
                 <li><code>RESET DRAIN</code> 后在原 source 上继续。</li>
                 <li>FINAL_ACK 后 source 与 receiver 的责任边界。</li>
               </ul>
@@ -382,7 +431,7 @@
             <article class="panel red">
               <h3>本文不覆盖</h3>
               <ul>
-                <li>本地 preserve → shutdown → startup resume。</li>
+                <li>本地 carrier、startup recovery 和事务对象重建的内部实现。</li>
                 <li>receiver crash 后恢复 transfer epoch。</li>
                 <li>真实物理 redo apply、authority 或 write-enable 实现。</li>
                 <li>由 source 触发 target promotion。</li>
@@ -407,6 +456,12 @@
                 <tr><th>角色</th><th>标识</th><th>职责</th><th>不负责</th></tr>
               </thead>
               <tbody>
+                <tr>
+                  <td>HA 控制连接</td>
+                  <td><code>priv_user() == preserve_trx_ha_admin</code> 且有效持有 <code>SHUTDOWN_ACL</code></td>
+                  <td>在 CLOSING 中发起/查询 DRAIN、RESET 和诊断；执行时仍经过原命令权限检查。</td>
+                  <td>承载业务 SQL，或只凭 root/SUPER/SHUTDOWN 身份自动绕过门禁。</td>
+                </tr>
                 <tr>
                   <td>用户逻辑连接</td>
                   <td>Proxy 前端连接</td>
@@ -462,7 +517,8 @@ promotion:
         <section id="source-facts">
           <h2>4. Source 当前代码事实</h2>
           <p class="section-lead">
-            下列行为已经存在于当前 HEAD。代理对接可以依赖其语义，但不能把尚未实现的 response fence 当成现状。
+            下列行为已经存在于当前 HEAD。终态场景依赖的是 CLOSING 执行门禁、旧 command completion boundary、
+            DRAIN survivor 结果和最终 RESUME，而不是新增一套每 THD response-fence 状态机。
           </p>
 
           <div class="table-wrap">
@@ -472,62 +528,62 @@ promotion:
               </thead>
               <tbody>
                 <tr>
-                  <td>phase2 先进入 <code>WARMCOPY_CLOSING</code></td>
-                  <td><code>sql/preserve_trx.cc:15471-15483</code></td>
-                  <td>先发布关闭边界，阻止新建事务或锁的命令，再收敛已准入工作。</td>
+                  <td>CLOSING gate 对普通连接 default-deny</td>
+                  <td><code>sql/preserve_trx.cc:9390-9395</code><br><code>sql/preserve_trx.cc:9465-9477</code></td>
+                  <td>普通业务连接的所有新 command 都不能进入执行主体；source 仍在线并读到完整 response-bearing packet 时返回 4020。</td>
                 </tr>
                 <tr>
-                  <td>之后进入 <code>BATCH_DRAINING</code></td>
-                  <td><code>sql/preserve_trx.cc:15740</code></td>
-                  <td>执行 quiesce、prepare、detach、snapshot/transfer 等 phase2 工作。</td>
+                  <td>HA 控制连接按认证账号识别</td>
+                  <td><code>sql/preserve_trx.cc:5649-5660</code></td>
+                  <td>必须同时满足固定 <code>preserve_trx_ha_admin</code> 与 <code>SHUTDOWN_ACL</code>；不解析 SQL，也不把普通 root 当 HA。</td>
                 </tr>
                 <tr>
-                  <td>成功事务会话变为 <code>PRESERVED_DRAINED</code></td>
-                  <td><code>sql/sql_class.h:141-165</code><br><code>sql/preserve_trx.cc:6951</code></td>
-                  <td>事务已经从原会话分离；该会话不能继续执行普通命令。</td>
+                  <td>t0 前已 inflight command 继续执行</td>
+                  <td><code>sql/preserve_trx.cc:9381-9384</code><br><code>sql/preserve_trx.cc:9456-9459</code></td>
+                  <td>已接受旧 command 保持原正常响应；同连接下一条新 command 才进入 4020 门禁。</td>
                 </tr>
                 <tr>
-                  <td>读取命令前处理 quiesce</td>
-                  <td><code>sql/sql_parse.cc:1266</code><br><code>sql/preserve_trx.cc:8460</code></td>
-                  <td><code>QUIESCED/ATTACHING</code> 状态下不读取新命令，等待 drain owner 完成关键工作。</td>
+                  <td>4020 文案已经中性化</td>
+                  <td><code>share/messages_to_clients.txt:9475-9476</code></td>
+                  <td>只声明 Preserve drain active 且本 command 未执行，不承诺事务已经 Preserve。</td>
                 </tr>
                 <tr>
-                  <td>读取命令后优先检查 drained</td>
-                  <td><code>sql/sql_parse.cc:1278</code><br><code>sql/preserve_trx.cc:8588-8607</code></td>
-                  <td><code>PRESERVED_DRAINED</code> 会话读取一个新包后立即返回 4020，不进入 SQL 执行。</td>
+                  <td>无响应命令保持 classic protocol 语义</td>
+                  <td><code>sql/sql_parse.cc:1605-1637</code></td>
+                  <td><code>COM_STMT_SEND_LONG_DATA</code> 在 CLOSING 中不写 PS buffer、不发 ERR；<code>COM_STMT_CLOSE/QUIT</code> 只做无响应清理。</td>
                 </tr>
                 <tr>
-                  <td>SQL 与 protocol dispatch 还有二次 gate</td>
-                  <td><code>sql/sql_parse.cc:1625-1633</code><br><code>sql/sql_parse.cc:2741-2750</code></td>
-                  <td>即使绕过早期检查，文本 SQL 和协议命令仍会被 4020 拦截。</td>
+                  <td>DRAIN 已返回 survivor/excluded 结果集</td>
+                  <td><code>sql/preserve_trx.cc:15784-15847</code></td>
+                  <td>HA 必须完整读取 generation、outcome、token role/reason 与 closing deadline；不能再假设成功面只有 OK packet。</td>
                 </tr>
                 <tr>
-                  <td>COMMIT_EPOCH 得到 FINAL_ACK 后拆 source 上下文</td>
-                  <td><code>sql/preserve_trx.cc:16638-16705</code></td>
-                  <td>代码已明确 FINAL_ACK 是 transfer ownership boundary。</td>
+                  <td>旧 command 在既有 command boundary 收敛</td>
+                  <td><code>preserved_trx_begin_command_read()</code> 与 <code>PENDING_QUIESCE → QUIESCED</code> 发布路径</td>
+                  <td>CLOSING 前已 dispatch 的旧 command 继续完成；到达下一次 command-read boundary 后才对 drain owner 发布 QUIESCED。</td>
                 </tr>
                 <tr>
-                  <td>当前成功尾部进入 shutdown handoff</td>
-                  <td><code>sql/preserve_trx.cc:16972</code><br><code>sql/sql_parse.cc:2316-2341</code></td>
-                  <td>这使 DRAIN 完成与业务连接关闭之间存在需要严格处理的响应竞态。</td>
+                  <td>shutdown 可抑制第二个响应</td>
+                  <td><code>sql/sql_parse.h:124</code><br><code>sql/sql_parse.cc:2326-2342</code></td>
+                  <td>Preserve 路径可先完整发送 DRAIN result，再进入 shutdown；普通 SHUTDOWN 行为不变。</td>
                 </tr>
               </tbody>
             </table>
           </div>
 
           <div class="note">
-            <strong>为什么 PRESERVED_DRAINED 仍允许读取命令</strong>
-            <code>preserve_trx_batch_state_blocks_target_owner()</code> 只把
-            <code>QUIESCED</code> 和 <code>ATTACHING</code> 视为“读命令前等待”状态。
-            <code>PRESERVED_DRAINED</code> 不等待，而是让 mysqld 读取下一个命令包并明确返回 4020。
-            这正是代理使用 4020 挂起请求的基础。
+            <strong>当前 4020 已前移到 CLOSING gate</strong>
+            代理不再等待 Tx 进入 <code>PRESERVED_DRAINED</code> 才可能获得 4020。只要 CLOSING 已发布，普通连接的新 command 就不能进入执行主体；
+            source 仍来得及读取并回复时返回 4020，终态连接先关闭时则由计划内断连合同接管。
+            因而 4020 可以来自尚未 Preserve、最终被 timeout exclusion，甚至没有活动事务的会话。
           </div>
         </section>
 
         <section id="phase2">
           <h2>5. Phase 2 命令边界</h2>
           <p>
-            source 对 phase2 周围命令的处理不是“所有命令直接报错”，而是按命令被内核看到的时间点分成三类。
+            source 对 phase2 周围命令的处理不是“所有命令都必须收到 4020”，而是先保证所有新 command 零执行，
+            再根据 source 是否来得及读取并完整回复 packet，表现为 4020 或计划内断连。
           </p>
 
           <div class="table-wrap">
@@ -542,14 +598,19 @@ promotion:
                   <td>按普通结果处理，不得重放。</td>
                 </tr>
                 <tr>
-                  <td>命令在 <code>WARMCOPY_CLOSING/BATCH_DRAINING</code> 中尝试创建事务或锁，但事务尚未 preserve</td>
-                  <td>可能返回 <code>ER_PRESERVE_TRX_UNSUPPORTED (4013)</code>。</td>
-                  <td>4013 不是事务续作信号，不得作为挂起重放触发器。</td>
+                  <td>CLOSING 发布后，普通业务连接读取新 response-bearing command</td>
+                  <td>无论是否有事务、是否已经 Preserve，均在执行主体前返回 <code>4020</code>。</td>
+                  <td>隐藏 4020，挂起原请求，停止向 source 继续发送；等待 HA 终局。</td>
                 </tr>
                 <tr>
-                  <td>事务已 preserve，会话已是 <code>PRESERVED_DRAINED</code></td>
-                  <td>读取命令包，但不执行命令，返回 <code>4020</code>。</td>
-                  <td>隐藏 4020，挂起原请求，停止向 source 继续发送。</td>
+                  <td>CLOSING 发布后，packet 尚未被 mysqld 读取，终态先关闭连接</td>
+                  <td>该 command 没有进入 dispatch；连接随 promotion handoff 或 shutdown 关闭，不要求补发 4020。</td>
+                  <td>保存唯一在途请求；只有匹配本 generation 的终态 RESUME 成功后才重发。</td>
+                </tr>
+                <tr>
+                  <td>CLOSING 中的 HA 专用控制连接</td>
+                  <td>固定账号 + <code>SHUTDOWN_ACL</code> 绕过 CLOSING gate，随后按命令原生权限和语义执行。</td>
+                  <td>只用于 HA 控制，不承载业务请求，也不因绕过门禁获得额外 SQL 权限。</td>
                 </tr>
               </tbody>
             </table>
@@ -563,10 +624,15 @@ packet read before closing gate
     -> normal response
     -> Tx reaches idle boundary and quiesces
 
-packet read after Tx == PRESERVED_DRAINED
+packet read after CLOSING publication on ordinary connection
     -> reject before dispatch
     -> ER_PRESERVE_TRX_SESSION_DRAINED (4020)
-    -> command body is not executed</code></pre>
+    -> command body is not executed
+
+packet not read before planned terminal connection close
+    -> no dispatch and no 4020 requirement
+    -> proxy waits for matching HA terminal + successful RESUME
+    -> replay once on the resumed connection</code></pre>
 
           <p>
             <code>mysql-test/suite/preserve_trx/t/batch_drain_packet_before_dispatch.test</code>
@@ -591,19 +657,19 @@ packet read after Tx == PRESERVED_DRAINED
           </div>
           <div class="decision">
             <b>服务端消息</b>
-            <div><code>This session's transaction has been preserved by DRAIN TRANSACTIONS PRESERVE</code></div>
+            <div><code>Preserve drain is active; this command was not executed</code></div>
           </div>
 
           <div class="success">
             <strong>代理可依赖的语义</strong>
-            对产生该 4020 的命令包，mysqld 已经消费协议请求，但没有执行该命令的 SQL/协议主体；
-            原事务已经从 Tx 分离并由 Preserve 路径持有。因此该请求可以在终局节点上重放一次。
+            对产生该 4020 的命令包，mysqld 已经消费协议请求，但没有执行该命令的 SQL/协议主体。
+            这是 4020 的唯一内核承诺；事务是否成为 survivor 只能由 DRAIN result 和 HA 终局决定。
           </div>
 
           <div class="boundary">
-            <strong>4020 不等于 target 已接受</strong>
-            <code>PRESERVED_DRAINED</code> 也可能用于 unresolved detach/cleanup failure 的可见隔离。
-            因此 4020 只建立“source 上未执行”的请求边界，不表达 FINAL_ACK、READY、promotion authority 或 attach 成功。
+            <strong>4020 不等于事务已 Preserve，也不等于 target 已接受</strong>
+            CLOSING gate 可在 token Preserve 前、无事务会话上或最终 timeout exclusion 的会话上返回 4020。
+            因此 4020 只建立“source 上未执行”的请求边界，不表达 survivor、FINAL_ACK、READY、promotion authority 或 attach 成功。
             代理必须等待 HA 的 promotion、RESET 或 continuation-abandoned 终局。
           </div>
 
@@ -617,7 +683,7 @@ packet read after Tx == PRESERVED_DRAINED
                   <td><code>4020</code></td>
                   <td class="yes">是</td>
                   <td class="yes">HA 给出终局后是</td>
-                  <td>唯一的 Preserve 事务续作挂起触发器。</td>
+                  <td>显式证明该 command 已被读取但未执行；不是终态场景唯一的挂起触发器。</td>
                 </tr>
                 <tr>
                   <td><code>4013 ER_PRESERVE_TRX_UNSUPPORTED</code></td>
@@ -638,8 +704,14 @@ packet read after Tx == PRESERVED_DRAINED
                   <td>需要 HA 检查 source 状态，不能由业务代理自行续作。</td>
                 </tr>
                 <tr>
-                  <td>网络断开、2013、EOF，未收到完整响应</td>
-                  <td>等待 HA 判定</td>
+                  <td>匹配当前 generation、旧 command 已收敛的 promotion 或 local shutdown 正常终态断连</td>
+                  <td class="yes">是</td>
+                  <td class="yes">RESUME 成功后是</td>
+                  <td>代理先消费完整 packet；对没有完整结果的唯一在途请求，HA 终态与 survivor/RESUME 结果共同授权重发。</td>
+                </tr>
+                <tr>
+                  <td>普通网络断开、2013、EOF 或无法匹配 generation</td>
+                  <td>进入歧义态</td>
                   <td class="no">不得盲目重放</td>
                   <td>请求可能未执行、已执行但响应丢失，或只写入部分结果。</td>
                 </tr>
@@ -656,10 +728,11 @@ packet read after Tx == PRESERVED_DRAINED
         <section id="proxy-state">
           <h2>7. 代理状态机</h2>
           <p class="section-lead">
-            每条用户逻辑连接维护一个很小的状态机即可。进入挂起态不需要 HA 预先通知，只由 source 返回 4020 触发。
+            每条用户逻辑连接只需要一个很小的状态机。完整 4020 与可归属到当前 drain generation 的计划内终态断连
+            都可以进入等待态；真正重发仍只能由 HA 的 RESUME 成功终局授权。
           </p>
 
-          <div class="state-line">ACTIVE_SOURCE → REQUEST_IN_FLIGHT → SUSPENDED_4020 → WAIT_HA_TERMINAL → REPLAYING | TERMINAL_FAILED</div>
+          <div class="state-line">ACTIVE_SOURCE → REQUEST_IN_FLIGHT → WAIT_HA_TERMINAL → REPLAYING | TERMINAL_FAILED</div>
 
           <div class="table-wrap">
             <table>
@@ -680,34 +753,21 @@ packet read after Tx == PRESERVED_DRAINED
                   <td>等待完整响应；long-data 分片只能作为紧随 execute 的 compound request 组成部分。</td>
                 </tr>
                 <tr>
-                  <td><code>SUSPENDED_4020</code></td>
-                  <td class="no">否</td>
-                  <td class="no">否</td>
-                  <td>不返回 4020；保存触发请求，后续前端请求排队。</td>
-                </tr>
-                <tr>
                   <td><code>WAIT_HA_TERMINAL</code></td>
                   <td class="no">否</td>
                   <td class="no">否</td>
-                  <td>等待 promotion attach 成功或 RESET 成功。</td>
+                  <td>隐藏完整 4020 或接收匹配 generation 的计划内断连，保存唯一在途请求并排队后续请求；等待 promotion/startup RESUME 成功或 RESET 成功。</td>
                 </tr>
                 <tr>
-                  <td><code>REPLAYING_SOURCE</code></td>
-                  <td class="yes">仅重放队列</td>
-                  <td class="no">否</td>
-                  <td>RESET 分支；先重放 4020 请求，再按序释放队列。</td>
-                </tr>
-                <tr>
-                  <td><code>REPLAYING_TARGET</code></td>
-                  <td class="no">否</td>
-                  <td class="yes">仅在 attach 成功后</td>
-                  <td>promotion 分支；先重放 4020 请求，再按序释放队列。</td>
+                  <td><code>REPLAYING</code></td>
+                  <td colspan="2">只向 HA 终局指定且已满足继续条件的 backend 发送：RESET 为原 Tx，promotion 为已 attach 的 Ty，startup 为已 RESUME 的新连接。</td>
+                  <td>先重放唯一在途请求；得到完整结果后再按序释放队列。</td>
                 </tr>
                 <tr>
                   <td><code>AMBIGUOUS_DISCONNECT</code></td>
                   <td class="no">否</td>
                   <td class="no">否</td>
-                  <td>没有 4020 证据，不自动执行；由 HA/上层异常策略处理。</td>
+                  <td>断连无法绑定当前计划内 generation，或请求结果无法裁定；不自动执行。</td>
                 </tr>
                 <tr>
                   <td><code>TERMINAL_FAILED</code></td>
@@ -724,15 +784,16 @@ packet read after Tx == PRESERVED_DRAINED
             <li>每个 source backend connection 同时最多一个 response-bearing 请求在途。</li>
             <li><code>COM_STMT_SEND_LONG_DATA...</code> 与紧随其后的 <code>COM_STMT_EXECUTE</code> 视为一个 compound request，不允许夹入其他命令。</li>
             <li>收到 4020 后立即停止向该 source connection 发送任何新协议命令。</li>
-            <li>原始 4020 请求排在队首；promotion 或 RESET 后必须先重放它。</li>
+            <li>发生计划内终态断连时，先消费断连前已经收到的完整 packet，再保存没有完整结果的唯一在途请求。</li>
+            <li>挂起请求排在队首；promotion/startup RESUME 或 RESET 后必须先处理它。</li>
             <li>只有队首请求获得完整结果后，才释放后续排队请求。</li>
             <li>不得把同一请求同时发往 Tx 和 Ty。</li>
           </ol>
 
           <div class="boundary">
-            <strong>“完全依赖 4020”的准确含义</strong>
-            4020 是进入挂起态的唯一触发器，不要求 HA 在 phase2 前通知每条代理连接。
-            但挂起后的终局仍必须由 HA 告知：target attach 成功、source RESET 成功，或 Preserve continuation 已放弃。
+            <strong>不再要求“每条晚到 command 必须收到 4020”</strong>
+            4020 是 source 在线时最清晰的未执行证据；promotion/shutdown 已进入终态时，关闭旧连接比继续维护逐连接响应屏障更简单。
+            代理仍必须等待 HA 告知：target attach/RESUME 成功、local startup RESUME 成功、source RESET 成功，或 Preserve continuation 已放弃。
           </div>
         </section>
 
@@ -759,6 +820,11 @@ packet read after Tx == PRESERVED_DRAINED
   | client result |
   |&lt;--------------|</code></pre>
 
+          <p>
+            上图展示 source 来得及返回 4020 的路径。若同一请求尚未被 source 读取、旧连接已随 promotion 终态关闭，
+            Proxy 不等待补发 4020：它保存该唯一在途请求，等 HA 确认 Tx 是 survivor、Ty 已完成 RESUME 后，再执行同样的末段重放。
+          </p>
+
           <h3>8.2 RESET 成功分支</h3>
           <pre><code>Client          Proxy             Source Tx          HA
   | COM_QUERY Q   |                   |               |
@@ -776,9 +842,32 @@ packet read after Tx == PRESERVED_DRAINED
   |               |&lt;------------------|               |
   |&lt;--------------|</code></pre>
 
+          <h3>8.3 本地 shutdown/startup 成功分支</h3>
+          <pre><code>Client          Proxy             Old source Tx       mysqld startup
+  | request Q     |                    |                    |
+  |-------------->|-------------------&gt;|                    |
+  |               |  planned disconnect                    |
+  |               |&lt;-------------------X                    |
+  |               | hold Q; reconnect after startup        |
+  |               |----------------------------------------&gt;|
+  |               | RESUME token on new connection         |
+  |               |----------------------------------------&gt;|
+  |               | RESUME OK                              |
+  |               |&lt;----------------------------------------|
+  |               | replay Q                               |
+  |               |----------------------------------------&gt;|
+  |               | result                                 |
+  |               |&lt;----------------------------------------|
+  |&lt;--------------|</code></pre>
+
+          <p>
+            这里不复用 transfer receiver 或 HA promotion。共同点只有请求边界：旧连接必然消失，代理必须先完成 startup 后的事务 RESUME，
+            再重发 CLOSING 后未执行且未获得完整结果的请求。本地 preserve token 继续使用既有生成语义，不等于本节 transfer 场景的 Tx token。
+          </p>
+
           <div class="note">
             <strong>重放的是原始协议请求，不是“重放事务历史”</strong>
-            已经 preserve 的事务状态由内核转移和 attach 恢复；代理只重放触发 4020 的那一条尚未执行命令，
+            已经 preserve 的事务状态由内核转移和 attach/RESUME 恢复；代理只重放触发 4020、或在计划内终态断连时尚未执行的那一条命令，
             再继续发送其后排队的新命令。之前已经成功执行的 SQL 绝不能重放。
           </div>
         </section>
@@ -865,23 +954,18 @@ packet read after Tx == PRESERVED_DRAINED
             prepared statement catalog、backend stmt id 和客户端请求队列仍属于代理。
           </div>
 
-          <h3>9.4 当前无响应命令缺口</h3>
+          <h3>9.4 无响应命令与终态断连合同</h3>
           <p>
-            当前 <code>do_command()</code> 在 <code>get_command()</code> 后对所有 server command
-            统一调用 <code>preserved_trx_reject_if_batch_session_drained()</code>。
-            该早期路径会直接 <code>send_statement_status()</code>。但正常 dispatch 对
-            <code>COM_STMT_SEND_LONG_DATA</code> 和 <code>COM_STMT_CLOSE</code> 会调用
-            <code>Diagnostics_area::disable_status()</code>，明确保持无响应协议语义，
-            见 <code>sql/sql_parse.cc:1751-1759</code> 和 <code>1782-1787</code>。
+            当前 protocol gate 已对 <code>BLOCK_CLOSING_DRAINED</code> 单独处理
+            <code>COM_STMT_SEND_LONG_DATA</code>：不写入 backend PS buffer，也不发送 ERR；
+            <code>COM_STMT_CLOSE</code> 和 <code>COM_QUIT</code> 继续作为无响应清理命令放行。
+            该行为位于 <code>sql/sql_parse.cc:1605-1637</code>。
           </p>
           <div class="risk">
-            <strong>因此 binary PS 目前只证明了 execute/ping 被 4020 拦截，尚未证明完整协议闭环</strong>
-            后续最小修正应按 command 类型处理：response-bearing command 返回 4020；
-            <code>COM_STMT_SEND_LONG_DATA</code> 在 drained 后不再写入 backend PS buffer、不发送 ERR，
-            只标记一个有 deadline 的 <code>drained_ps_compound_pending</code>；
-            代理必须紧接着发送 <code>COM_STMT_EXECUTE</code>，由 execute 获得 4020 并关闭该 compound；
-            <code>COM_STMT_CLOSE</code> 可继续执行其无响应 close 语义，<code>COM_QUIT</code> 保持关闭语义。
-            不应向无响应命令注入一个客户端不会读取的 ERR packet。
+            <strong>promotion/shutdown 不需要在 mysqld 中记录 compound fence</strong>
+            旧 backend 连接在终态必然关闭，source PS buffer 也不会迁移。代理已经缓存全部 long-data 分片；
+            只有 HA 或 startup 完成事务 RESUME 后，代理才在新 backend 上重新 PREPARE、重发全部分片并 EXECUTE。
+            因而无需增加 <code>ps_compound_pending</code>、accepted/response sequence 或 long-data ACK，也不能向无响应命令注入 ERR packet。
           </div>
 
           <h3>9.5 Long-data 的 RESET 重放</h3>
@@ -990,9 +1074,15 @@ promotion success on Ty:
             <li>HA 调用 source <code>RESET DRAIN</code>。</li>
             <li>source 停止新的 phase2/transfer 推进，恢复原 Tx 上的事务和会话状态。</li>
             <li>source 发布“业务可继续”并返回 RESET 成功。</li>
-            <li>HA 通知代理该逻辑连接走 <code>REPLAYING_SOURCE</code>。</li>
+            <li>HA 通知代理该逻辑连接进入 <code>REPLAYING</code>，backend 仍为原 Tx。</li>
             <li>代理在原 Tx 上先重放触发 4020 的请求，再按序释放后续请求。</li>
           </ol>
+
+          <div class="boundary">
+            <strong>RESET 不等待 target ABORT ACK</strong>
+            source 可 best-effort 发送 epoch ABORT 或断开 transport，但 RESET OK 只等待原 Tx 恢复可运行和 4020 gate 解除；
+            target orphan 由 receiver TTL 销毁。只有 A=OFF 后仍要提交 survivor epoch 的 timeout exclusion，才要求 excluded token 先取得确定 ABORT ACK。
+          </div>
 
           <div class="risk">
             <strong>RESET 不等于重新执行已成功的命令</strong>
@@ -1042,18 +1132,18 @@ target: 独立 prewarm，等待 HA promotion 或 TTL 自动销毁</code></pre>
           </p>
 
           <div class="boundary">
-            <strong>4020 响应 cutoff/fence 必须位于 FINAL_ACK 之前</strong>
-            source 在所有目标 Tx 已进入 <code>PRESERVED_DRAINED</code> 后，先关闭新的命令读取准入，
-            等待已经由自己读取的业务命令完成正常响应或 4020 响应，然后才发送
-            <code>COMMIT_EPOCH</code> 并等待 FINAL_ACK。这样 response fence 失败时 receiver epoch 尚未提交，
-            source 仍可走现有 abort/restore；FINAL_ACK 一旦生效，两端继续彻底解耦。
+            <strong>FINAL_ACK 前不再增加逐 THD response fence</strong>
+            source 只需保证：CLOSING 前已经 dispatch 的旧 command 先到既有 completion boundary；CLOSING 后普通新 command 不进入执行主体；
+            survivor epoch 完整提交后才接受 FINAL_ACK。source 在线时可返回 4020，终态先到则关闭旧连接。
+            FINAL_ACK 一旦生效，两端彻底解耦，后续重连、RESUME 和重发由 HA/Proxy 终局驱动。
           </div>
         </section>
 
         <section id="exactly-once">
           <h2>13. 请求结果安全</h2>
           <p>
-            对接目标不是实现通用的分布式 exactly-once，而是利用 source 的明确结果边界，避免 Preserve 场景下的重复执行。
+            对接目标不是实现通用的分布式 exactly-once，而是在计划内 drain generation 内区分“已有完整结果”“明确未执行”与“结果不确定”，
+            避免 Preserve 续作时重复执行。计划内断连只有满足本节完整证据链时，才能等价于“该晚到请求未执行”。
           </p>
 
           <div class="table-wrap">
@@ -1069,7 +1159,7 @@ target: 独立 prewarm，等待 HA promotion 或 TTL 自动销毁</code></pre>
                 </tr>
                 <tr>
                   <td>完整 ERR 4020</td>
-                  <td>该协议命令未执行；事务已 preserve</td>
+                  <td>该协议命令未执行；事务 Preserve 结果尚未由该错误确定</td>
                   <td>挂起；终局节点上重放一次。</td>
                 </tr>
                 <tr>
@@ -1078,7 +1168,12 @@ target: 独立 prewarm，等待 HA promotion 或 TTL 自动销毁</code></pre>
                   <td>正常返回或交由 HA 控制面处理，不进入 4020 重放路径。</td>
                 </tr>
                 <tr>
-                  <td>无完整响应即断开</td>
+                  <td>匹配当前 generation 的计划内终态断连，且 Tx 是 survivor</td>
+                  <td>CLOSING 后的唯一在途请求未进入执行主体；旧连接已终止</td>
+                  <td>继续挂起；promotion/startup RESUME 成功后在终局连接上重放一次。</td>
+                </tr>
+                <tr>
+                  <td>无法匹配 generation 的断连，或旧请求是否已 dispatch 无法裁定</td>
                   <td>不确定</td>
                   <td>进入 <code>AMBIGUOUS_DISCONNECT</code>，不得自动重放。</td>
                 </tr>
@@ -1088,131 +1183,107 @@ target: 独立 prewarm，等待 HA promotion 或 TTL 自动销毁</code></pre>
 
           <h3>13.1 为什么 4020 可以重放</h3>
           <p>
-            早期 gate 位于 <code>get_command()</code> 成功之后、<code>dispatch_command()</code> 之前。
-            <code>preserved_trx_reject_if_batch_session_drained()</code> 设置错误后，
-            <code>do_command()</code> 直接调用 <code>send_statement_status()</code> 并返回；
-            SQL parser、handler 和 InnoDB 执行路径都没有被调用。
+            mysqld 在读取完整 command packet 后，先经过 protocol CLOSING gate；文本/PS 执行还有 SQL gate 兜底。
+            <code>BLOCK_CLOSING_DRAINED</code> 在 parser/handler/InnoDB 执行主体之前设置 4020 并结束本 command，
+            所以代理实际读取到完整 4020 时，能证明该 command 主体没有执行。
           </p>
 
-          <h3>13.2 无法消除的网络事实</h3>
+          <h3>13.2 为什么计划内终态断连也可重放</h3>
+          <ol>
+            <li>代理遵守半双工：每个 backend 同时最多一个需要响应的请求。</li>
+            <li>CLOSING 前已 dispatch 的旧 command 继续执行，只有完成后才在既有 command-read boundary 发布 QUIESCED。</li>
+            <li>CLOSING 后普通新 command 不能进入执行主体；source 来得及读取时返回 4020，否则旧连接随终态关闭。</li>
+            <li>transfer 由 HA 用 drain generation 和 DRAIN result 确认 Tx 是 survivor；本地 startup 则以 recovery 找到 token 且 RESUME 成功为准。</li>
+            <li>代理先消费断连前的完整 packet，并只保留那个没有完整结果的唯一在途请求。</li>
+            <li>只有事务在 Ty 或 startup 后的新连接上 RESUME 成功，HA 才授权重发。</li>
+          </ol>
+
+          <div class="risk">
+            <strong>缺少任一条证据就不能使用该简化合同</strong>
+            尤其是普通网络故障、mysqld crash、旧 generation 回调、Tx 不在 survivor 结果中，或旧 command 已执行但响应不明，
+            都不能仅凭 EOF 推导“未执行”。这些情况进入普通异常处理，不得盲目重放。
+          </div>
+
+          <h3>13.3 无法消除的网络事实</h3>
           <p>
             mysqld 能确认完整错误包已交给本地网络层，却不能在不增加代理应用级 ACK 的情况下证明代理业务线程已经消费该包。
-            本设计不增加新的代理 ACK 协议。计划内切换中，代理以自己实际读取到的完整 MySQL packet 为准；
-            网络断开仍按结果不确定处理。
+            本设计不增加新的代理 ACK 协议。代理以自己实际读取到的完整 MySQL packet 为准，并由 HA generation 区分计划内终态断连与普通网络故障。
           </p>
         </section>
 
         <section id="gap">
-          <h2>14. 当前响应屏障缺口</h2>
+          <h2>14. 场景化请求边界</h2>
           <p class="section-lead">
-            当前代码已经能返回 4020，但尚不能严格证明“DRAIN 完成时，所有已被 source 读取的业务命令都已经完成协议响应”。
+            三类场景必须分开理解。promotion 与 shutdown/startup 是终态连接切换；RESET 是原进程、原连接继续运行。
+            把它们混成同一套 response fence 会增加状态和竞态，却不能替代 HA 对终局的裁决。
           </p>
 
-          <h3>14.1 已有的单事务 token delivery 机制不能直接复用</h3>
-          <p>
-            <code>preserved_trx_note_statement_response()</code> 位于
-            <code>sql/preserve_trx.cc:8418</code>，当前服务的是单会话 pending token delivery 与延迟 shutdown signal。
-            通用 dispatch 尾部在 <code>sql/sql_parse.cc:2227-2228</code> 调用它。
-          </p>
-          <p>
-            但 drained session 的最早 4020 路径位于
-            <code>sql/sql_parse.cc:1266-1325</code>。它在读取命令后直接
-            <code>send_statement_status()</code>，没有经过
-            <code>preserved_trx_note_statement_response()</code>。
-            该机制也没有按 batch generation 统计每个 Tx 的 accepted/completed command。
-          </p>
-
-          <h3>14.2 当前竞态</h3>
-          <pre><code>Tx 已 PRESERVED_DRAINED
-Proxy 写入一个新命令
-        |
-        +-- source 已 get_command()
-        |      -> 应返回 4020
-        |
-drain owner 直接发送 COMMIT_EPOCH
-        |
-        +-- FINAL_ACK -> teardown -> finish_with_shutdown()
-                               |
-                               +-- close_connections / socket close
-
-缺少条件：
-    在 COMMIT_EPOCH 前关闭新的命令读取准入，
-    并确认该已读取命令的 4020 packet 已完成本地发送。</code></pre>
-
-          <div class="risk">
-            <strong>影响</strong>
-            代理可能没有收到 4020，只看到连接断开，于是不能安全判断该请求是否执行。
-            这不破坏事务 preserve 正确性，但会破坏“完全依赖 4020 挂起命令”的稳定对接合同。
-            把 fence 放在 FINAL_ACK 后只能发现问题，无法再安全 abort 未提交 epoch，因此不是推荐落点。
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>场景</th><th>内核边界</th><th>Proxy/HA 边界</th><th>不需要做</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>物理备机 promotion</td>
+                  <td>旧 command 完成；CLOSING 后新 command 零执行；FINAL_ACK 后 source 关闭。</td>
+                  <td>HA 确认 survivor 和 Ty RESUME；Proxy 重发唯一在途请求。</td>
+                  <td>不等待每个 Tx 都收到一次 4020；不保留旧连接。</td>
+                </tr>
+                <tr>
+                  <td>本地 shutdown/startup</td>
+                  <td>旧 command 完成；CLOSING 后新 command 零执行；旧连接随 shutdown 消失。</td>
+                  <td>startup recovery 完成后重连；事务 RESUME 成功后重发。</td>
+                  <td>不把 transfer receiver、FINAL_ACK 或 peerid 引入本地路径。</td>
+                </tr>
+                <tr>
+                  <td>RESET DRAIN</td>
+                  <td>撤销 CLOSING，恢复原 Tx；mysqld 和 socket 不因 RESET 终止。</td>
+                  <td>完整 4020 请求在 RESET OK 后重发；未读 packet 留在原 socket 自然执行。</td>
+                  <td>不按终态断连重建连接；不重复发送未读 packet。</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
 
-          <h3>14.3 必须精确定义“已接受命令”</h3>
-          <p>
-            本文将“source 已接受命令”定义为 <code>get_command()</code> 成功读取了一个完整 classic-protocol command packet。
-            仅停留在 TCP receive buffer、尚未被 mysqld 读取的字节不属于内核可观测的 accepted command。
-          </p>
-          <p>
-            因此 response fence 能保证 source 已读取请求的响应完成；它不能证明网络中尚未读取的请求一定得到 4020。
-            代理必须遵守每 backend connection 只有一个 response-bearing outstanding request；
-            long-data 只能与 execute 组成连续 compound request。收到 4020 后停止发送，
-            才能把不可观测窗口限制为正常的网络断开歧义，而不是制造协议流水线竞态。
-          </p>
+          <div class="boundary">
+            <strong>终态期间不得重新开放普通 command</strong>
+            promotion 或 shutdown 已选择成功终局后，CLOSING gate 一直保持到旧普通连接关闭。
+            FINAL_ACK 与 teardown 之间不能出现短暂 reopen，否则新 command 可能在旧主重新进入执行主体，计划内断连重发合同随即失效。
+          </div>
+
+          <div class="note">
+            <strong>RESET 是唯一的 reopen 分支</strong>
+            RESET 成功屏障要求原事务恢复、batch state 清除、CLOSING gate 解除。收到完整 4020 的请求由 Proxy 重发；
+            mysqld 尚未读取的 packet 本来就在 socket 中，解除 gate 后只会执行一份，Proxy 不应再复制发送。
+          </div>
         </section>
 
         <section id="minimal-kernel">
-          <h2>15. 最小内核补强</h2>
+          <h2>15. 最小内核职责</h2>
           <p class="section-lead">
-            补强只解决 source 已读取命令的响应完成问题，不改 transfer wire、不改 receiver、不改 InnoDB，也不新增 HA 通知协议。
+            按上述场景边界，终态路径不需要新增逐 THD request/response 状态机。内核只做好命令执行门禁、旧 command 收敛、
+            survivor 结果和终态连接关闭；请求保存与重发属于 Proxy，终局授权属于 HA。
           </p>
 
-          <h3>15.1 每个 Tx、每个 batch generation 的两个序号和一个 cutoff</h3>
-          <div class="decision">
-            <b><code>accepted_seq</code></b>
-            <div><code>get_command()</code> 成功后递增，表示 source 已读取完整命令包。</div>
-          </div>
-          <div class="decision">
-            <b><code>response_seq</code></b>
-            <div>该命令的完整 OK/result/error 已完成本地协议发送后推进到对应序号。</div>
-          </div>
-          <div class="decision">
-            <b><code>read_cutoff_closed</code></b>
-            <div>drain owner 捕获 fence 时置位；此后 Tx 不再从 socket 读取新的 command packet，直到 RESET 重新开放或连接关闭。</div>
-          </div>
-          <div class="decision">
-            <b><code>ps_compound_pending</code></b>
-            <div>drained 后已经消费 long-data 分片、但紧随的 execute 尚未读取；cutoff 必须等待其闭合或按 phase2 deadline 失败。</div>
-          </div>
-
-          <p>
-            字段只在 <code>preserve_trx_enable=ON</code> 且 THD 属于当前 batch generation 时使用。
-            普通 MySQL 路径仅保留一个极薄的条件分支。
-          </p>
-
-          <h3>15.2 Fence 流程</h3>
+          <h3>15.1 内核必须保证的四件事</h3>
           <ol>
-            <li>Tx 每次成功读取 response-bearing command 后记录本 generation 的 <code>accepted_seq</code>。</li>
-            <li>正常 dispatch 响应和早期 4020 响应都记录 <code>response_seq</code>。</li>
-            <li>所有目标事务 preserve 完成后，drain owner 在每个 Tx 上原子置位 <code>read_cutoff_closed</code>，并捕获当前 <code>accepted_seq</code> 作为 fence。</li>
-            <li>若存在 <code>ps_compound_pending</code>，先允许该连接读取紧随的 execute 并返回 4020；不得接受其他 response-bearing command。</li>
-            <li>cutoff 关闭后，命令线程停在读包前，不发送 unsolicited error，也不接受新的 command packet。</li>
-            <li>drain owner 等待每个 Tx 的 <code>response_seq &gt;= fence_seq</code>。</li>
-            <li>等待受 phase2 剩余 deadline 约束，不允许无限等待。</li>
-            <li>满足后才调用 <code>commit_epoch()</code>；失败时 abort 尚未提交的 receiver epoch，并复用现有 source restore 路径。</li>
-            <li>RESET 赢时清除 cutoff，socket 中尚未读取的命令可在原 Tx 恢复后正常执行。</li>
+            <li>发布 CLOSING 后，普通连接的所有新 command 在 parser/handler/存储引擎执行主体之前被截断。</li>
+            <li>CLOSING 前已 dispatch 的旧 command 继续执行；只有到达既有 command-read completion boundary 后才发布 QUIESCED。</li>
+            <li>DRAIN 结果明确给出 generation、survivor 和 excluded；终态只能续作 survivor。</li>
+            <li>promotion/shutdown 成功分支保持 CLOSING 到普通连接关闭；RESET 分支在恢复原事务后才解除 gate。</li>
           </ol>
 
-          <h3>15.3 线性化与锁</h3>
+          <h3>15.2 明确不新增的状态</h3>
           <ul>
-            <li>序号和 generation 在 <code>THD::LOCK_thd_data</code> 下读写，或使用同等强度的原子合同。</li>
-            <li>等待时不得持有 <code>LOCK_thd_data</code>、manager mutex、transfer session 锁或 InnoDB 锁。</li>
-            <li>旧 generation 的迟到 response 不能推进新 generation 的 fence。</li>
-            <li>普通无响应协议命令不占 response sequence；<code>COM_STMT_SEND_LONG_DATA</code> 仅建立一个 deadline-bounded compound obligation。</li>
-            <li>drained 状态下的 long-data 不进入 backend PS buffer，也不发送 ERR；代理保留的分片由紧随的 execute 统一获得 4020 边界。</li>
-            <li>compound 在 deadline 内没有 execute、连接断开或插入了其他命令时，response fence 失败并在 COMMIT_EPOCH 前 abort。</li>
-            <li>正常响应发送失败时，把 fence 标记为 transport failure，而不是假装 response complete。</li>
+            <li>不增加 <code>accepted_seq</code>、<code>response_seq</code> 或 <code>read_cutoff_closed</code>。</li>
+            <li>不增加 <code>ps_compound_pending</code>；终态连接关闭后由 Proxy 在新 backend 重建完整 PS compound request。</li>
+            <li>不在 <code>get_command()</code> 前 park 普通连接；source 在线时继续使用现有 gate 返回 4020。</li>
+            <li>不增加 Proxy 对 4020 的应用级 ACK，不把请求队列或 backend stmt-id 写入 Preserve artifact。</li>
+            <li>不修改 transfer wire、receiver、InnoDB、carrier 或 startup recovery。</li>
           </ul>
 
-          <h3>15.4 为什么不需要更复杂的方案</h3>
+          <h3>15.3 为什么该方案足够</h3>
           <div class="table-wrap">
             <table>
               <thead>
@@ -1236,22 +1307,33 @@ drain owner 直接发送 COMMIT_EPOCH
                 </tr>
                 <tr>
                   <td>accepted/response sequence fence</td>
+                  <td class="no">不采用</td>
+                  <td>终态路径最终关闭旧连接；已有执行门禁与 RESUME 后重发合同足够，新增字段只会扩大共享命令热路径。</td>
+                </tr>
+                <tr>
+                  <td>CLOSING + old-command boundary + terminal reconnect</td>
                   <td class="yes">采用</td>
-                  <td>只覆盖 source 已读取请求，修改面小，语义可测试。</td>
+                  <td>复用现有内核状态；明确区分 promotion/startup 与 RESET，修改面最小。</td>
                 </tr>
               </tbody>
             </table>
           </div>
 
           <div class="boundary">
-            <strong>该补强不改变 FINAL_ACK 后两端解耦</strong>
-            fence 在 COMMIT_EPOCH 前只观察 source 自己的 Tx 命令响应，不等待 READY，不发送 target 控制命令。
-            FINAL_ACK 后 source 不再执行任何 response-fence 协商。
+            <strong>FINAL_ACK 后两端仍彻底解耦</strong>
+            source 不等待 READY、不发送 target 控制命令，也不参与 target 的 prewarm、promotion 或 TTL。
+            HA 在 target 本地完成 RESUME 后通知 Proxy；请求重发不回到 transfer 协议。
           </div>
         </section>
 
         <section id="interfaces">
           <h2>16. 三方接口合同</h2>
+          <div class="boundary">
+            <strong>HA → source 控制连接身份</strong>
+            发起 DRAIN、RESET 或 CLOSING 期间诊断的连接必须使用认证用户名精确为 <code>preserve_trx_ha_admin</code>、且有效持有
+            <code>SHUTDOWN_ACL</code> 的专用账号。身份判断发生在 SQL 解析前；执行具体命令时仍按原权限检查。
+            普通 root、仅持 SHUTDOWN 的其他账号或 transfer data session 都不是 HA 控制连接。
+          </div>
           <h3>16.1 mysqld → Proxy：MySQL 错误包</h3>
           <pre><code>ERR packet:
   error_code = 4020
@@ -1259,15 +1341,41 @@ drain owner 直接发送 COMMIT_EPOCH
 
 meaning:
   this exact command packet was consumed but not executed
-  source transaction has entered preserved/drained ownership
+  no statement is made about survivor, FINAL_ACK, READY or attach
 
 proxy action:
   suppress client-visible error
   store exact request
   stop source forwarding
   wait for HA terminal event</code></pre>
+          <p>
+            promotion/shutdown 的另一条合法入口是旧连接的计划内关闭：若请求没有完整结果，Proxy 保存唯一在途请求，
+            但只有 HA 后续把该连接、Tx 和 generation 对账为 survivor，并报告 RESUME 成功，才能重发。
+          </p>
 
-          <h3>16.2 HA → Proxy：三个终局结果</h3>
+          <h3>16.2 HA → Proxy：DRAIN 结构化结果</h3>
+          <pre><code>result row:
+  generation
+  outcome = SUCCESS | SUCCESS_WITH_EXCLUSIONS | NO_PRESERVABLE_TOKENS
+  source_connection_id | NULL
+  token_role = SURVIVOR | EXCLUDED | SUMMARY
+  reason = NONE | CLOSING_COMMAND_TIMEOUT
+  closing_started_us
+  closing_deadline_us</code></pre>
+          <p>
+            4020 只决定“请求挂起”，DRAIN result 才决定 Tx 是否属于 survivor。HA 必须完整读取结果集并按
+            <code>(generation, source_connection_id)</code> 对账；不能把所有收到 4020 的连接都当作可在新主 Resume。
+            <code>SUCCESS_WITH_EXCLUSIONS</code> 当前只用于 standalone/simulator；未来生产物理升主准入固定要求 A=ON。
+          </p>
+          <div class="boundary">
+            <strong>结果集范围与升级顺序</strong>
+            该结构化结果集只由 strict standby-transfer streaming 的成功路径返回；本地 durable
+            preserve→shutdown→startup 成功路径继续使用原响应合同。失败由 MySQL ERR packet 表达，不发送
+            <code>outcome=FAILED</code> 结果行。部署必须先升级 HA/Proxy，使其能够完整消费结果集并容忍结果结束后 source
+            进入计划内 shutdown，再升级返回该结果集的 mysqld；首版不增加 OK/result 双模式、capability 协商或 wire version。
+          </div>
+
+          <h3>16.3 HA → Proxy：终局结果</h3>
           <div class="table-wrap">
             <table>
               <thead>
@@ -1277,12 +1385,17 @@ proxy action:
                 <tr>
                   <td><code>PRESERVE_PROMOTION_ATTACHED</code></td>
                   <td>logical connection id、Tx、Ty、promotion attempt/generation、target endpoint</td>
-                  <td>校验当前挂起 generation，切到 Ty，重放 4020 请求。</td>
+                  <td>校验当前挂起 generation 和 survivor，切到已 RESUME 的 Ty，重放挂起请求。</td>
+                </tr>
+                <tr>
+                  <td><code>PRESERVE_STARTUP_RESUMED</code></td>
+                  <td>logical connection id、本地 preserved token、startup/drain generation、新 source endpoint/connection</td>
+                  <td>校验 startup recovery 与 RESUME 已成功，在新连接重放挂起请求。</td>
                 </tr>
                 <tr>
                   <td><code>PRESERVE_RESET_SUCCEEDED</code></td>
                   <td>logical connection id、Tx、drain attempt/generation、source endpoint</td>
-                  <td>校验当前挂起 generation，回到 Tx，重放 4020 请求。</td>
+                  <td>仅对明确收到 4020 的请求重放；未被 mysqld 读取的 packet 仍由原 socket 自然执行。</td>
                 </tr>
                 <tr>
                   <td><code>PRESERVE_CONTINUATION_ABORTED</code></td>
@@ -1295,10 +1408,10 @@ proxy action:
 
           <p>
             事件名可按 HA 项目现有接口命名调整，关键是携带 attempt/generation，防止旧 promotion/reset 结果唤醒新一轮挂起。
-            不需要 READY 进度事件驱动代理；代理只关心最终能在哪个 backend 上继续。
+            不需要 READY 进度事件驱动代理；代理只关心事务是否已在某个 backend 上成功 RESUME，以及是否允许重发挂起请求。
           </p>
 
-          <h3>16.3 HA → mysqld：目标端内部 promotion 调用</h3>
+          <h3>16.4 HA → mysqld：目标端内部 promotion 调用</h3>
           <pre><code>promotion attempt
   -> validate candidate/process generation
   -> validate READY/apply/fence
@@ -1309,17 +1422,29 @@ proxy action:
   -> return per-token attach result
   -> HA publishes terminal event to Proxy</code></pre>
 
-          <h3>16.4 Proxy 的伪代码</h3>
+          <h3>16.5 Proxy 的伪代码</h3>
           <pre><code>on_source_response(request, response):
   if response.is_complete_mysql_error(4020):
     assert no_other_backend_request_inflight()
     suspended_request = request
+    suspension_evidence = EXPLICIT_4020
     state = WAIT_HA_TERMINAL
     return  // do not expose 4020 to client
 
   if response.is_complete():
     deliver_to_client(response)
     state = ACTIVE_SOURCE
+    return
+
+on_source_connection_closed(request, connection):
+  consume_complete_packet_before_eof_if_any()
+  if clean_terminal_close(connection) and
+     ha_matches_current_planned_terminal(connection, drain_generation) and
+     old_commands_converged(drain_generation):
+    assert no_other_backend_request_inflight()
+    suspended_request = request
+    suspension_evidence = PLANNED_TERMINAL_DISCONNECT
+    state = WAIT_HA_TERMINAL
     return
 
   state = AMBIGUOUS_DISCONNECT
@@ -1329,12 +1454,25 @@ on_ha_promotion_attached(event):
   require state == WAIT_HA_TERMINAL
   require event.tx == source_connection_id
   require event.generation == suspended_generation
+  require event.tx_role == SURVIVOR
+  require event.resume_succeeded
   bind_target_backend(event.ty, event.endpoint)
   replay_on_target(suspended_request)
   drain_queued_requests_in_order()
 
+on_ha_startup_resumed(event):
+  require state == WAIT_HA_TERMINAL
+  require event.token == suspended_local_preserve_token
+  require event.generation == suspended_generation
+  require event.recovered_token == suspended_local_preserve_token
+  require event.resume_succeeded
+  bind_restarted_source(event.connection, event.endpoint)
+  replay_on_restarted_source(suspended_request)
+  drain_queued_requests_in_order()
+
 on_ha_reset_succeeded(event):
   require state == WAIT_HA_TERMINAL
+  require suspension_evidence == EXPLICIT_4020
   require event.tx == source_connection_id
   require event.generation == suspended_generation
   replay_on_source(suspended_request)
@@ -1370,7 +1508,7 @@ on_ha_continuation_aborted(event):
                 <tr>
                   <td><code>batch_drain_target_command_blocked.test</code></td>
                   <td>quiesce 中下发的命令等待，并在 preserved 后返回 4020。</td>
-                  <td>DRAIN owner 等待 4020 response fence。</td>
+                  <td>代理收到计划内断连后的 HA/RESUME 联动。</td>
                 </tr>
                 <tr>
                   <td><code>batch_drain_packet_before_dispatch.test</code></td>
@@ -1381,17 +1519,17 @@ on_ha_continuation_aborted(event):
             </table>
           </div>
 
-          <h3>17.2 response fence 必加 MTR</h3>
+          <h3>17.2 命令边界与终态连接测试</h3>
           <ul>
-            <li>在 Tx 读取命令后、早期 4020 <code>send_statement_status()</code> 前暂停；证明 COMMIT_EPOCH 尚未发送。</li>
-            <li>释放发送后，证明代理收到完整 4020，随后 source 才发送 COMMIT_EPOCH。</li>
-            <li>正常 inflight 命令响应前暂停；证明 fence 同样等待正常结果。</li>
-            <li>多 Tx 并行：一个响应慢时，全 batch fence 不提前完成；其余 Tx 不被串行执行。</li>
-            <li>旧 generation 迟到 response 不满足新 generation fence。</li>
-            <li>发送失败：DRAIN 不宣称成功完成 response contract。</li>
-            <li>cutoff 关闭后不再读取新命令；RESET 清除 cutoff 后，socket 中未读取命令可正常继续。</li>
-            <li><code>COM_STMT_SEND_LONG_DATA/CLOSE</code> drained 路径不产生错位 ERR packet；long-data compound 的下一条 execute 返回 4020。</li>
+            <li>CLOSING 前已 dispatch 的旧 command 正常完成，随后才发布对应 Tx 的 QUIESCED。</li>
+            <li>CLOSING 后普通文本、binary PS 和无响应 command 均不进入执行主体；可响应命令在 source 在线时得到完整 4020。</li>
+            <li>promotion/shutdown 终态先关闭连接时，不要求补发 4020；旧连接不能在 FINAL_ACK 与 teardown 之间重新执行普通 command。</li>
+            <li>本地 startup：计划内断连后必须先重连并 RESUME，再重发请求；RESUME 前执行次数为 0。</li>
+            <li>promotion：计划内断连后必须先在 Ty attach/RESUME，再重发请求；旧 generation 终局不得唤醒。</li>
+            <li>RESET：完整 4020 请求在 RESET OK 后重发；未读 packet 留在 socket 中自然执行，代理不得复制一份。</li>
+            <li><code>COM_STMT_SEND_LONG_DATA/CLOSE</code> drained 路径不产生错位 ERR packet；终态重连后 reprepare 并重发完整 long-data。</li>
             <li>long-data 在 preserve 边界前后各接收一部分；RESET 后先 STMT_RESET，再完整重发，最终参数内容无重复。</li>
+            <li>普通网络断开、mysqld crash、Tx 非 survivor 和 generation 不匹配均进入歧义/失败路径，不自动重放。</li>
             <li><code>preserve_trx_enable=OFF</code> 时命令路径和 THD 行为不变。</li>
           </ul>
 
@@ -1402,7 +1540,9 @@ on_ha_continuation_aborted(event):
             <li>已 prepare 的 binary execute 收到 4020，Ty 上 reprepare/remap 后成功。</li>
             <li>带 long-data 的 execute 收到 4020，Ty 上按原分片顺序重发。</li>
             <li>收到 4013 时不进入挂起。</li>
-            <li>网络断开但无 4020 时不自动重放。</li>
+            <li>匹配 generation 的计划内终态断连，在 RESUME 后重放一次。</li>
+            <li>普通网络断开或无法匹配 generation 时不自动重放。</li>
+            <li>本地 shutdown/startup 断连后，重连、RESUME、重发的业务效果恰好一次。</li>
             <li>旧 HA attempt 的 attach/reset 回调不能唤醒新 generation。</li>
             <li>Preserve promotion 失败时 HA 继续普通升主，代理按既定异常策略结束挂起，不阻塞集群开写。</li>
             <li>continuation-aborted 终局不重放触发 4020 的请求，也不让连接永久停留在 WAIT_HA_TERMINAL。</li>
@@ -1420,7 +1560,7 @@ on_ha_continuation_aborted(event):
             </article>
             <article class="panel amber">
               <span class="metric">0</span>
-              <span class="metric-label">无 4020 证据时的自动盲重放次数</span>
+              <span class="metric-label">无 4020 或计划内终态证据时的自动盲重放次数</span>
             </article>
           </div>
         </section>
@@ -1437,12 +1577,12 @@ on_ha_continuation_aborted(event):
                 <tr>
                   <td><code>sql/sql_class.h</code></td>
                   <td>THD batch state。</td>
-                  <td><code>PRESERVED_DRAINED</code> 语义；未来最小 response sequence 与 read cutoff 字段。</td>
+                  <td><code>PENDING_QUIESCE / QUIESCED / PRESERVED_DRAINED</code> 的既有 command boundary；不新增请求序号字段。</td>
                 </tr>
                 <tr>
                   <td><code>sql/preserve_trx.cc</code></td>
                   <td>drain、命令 gate、token、FINAL_ACK、promotion attach core。</td>
-                  <td>response fence capture/wait 应集中在此，不散入 transfer receiver。</td>
+                  <td>保持 CLOSING gate、旧 command 收敛和终态不 reopen；不把代理请求跟踪塞入 transfer receiver。</td>
                 </tr>
                 <tr>
                   <td><code>sql/preserve_trx.h</code></td>
@@ -1452,12 +1592,12 @@ on_ha_continuation_aborted(event):
                 <tr>
                   <td><code>sql/sql_parse.cc</code></td>
                   <td>classic command read、dispatch 和 response 发送。</td>
-                  <td>accepted command 与早期 4020 response completion 的薄 hook。</td>
+                  <td>复用现有 CLOSING protocol gate 和无响应命令处理；终态路径不增加 accepted/response hook。</td>
                 </tr>
                 <tr>
                   <td><code>sql/preserve_trx_transfer.cc/.h</code></td>
                   <td>source/receiver transfer 协议。</td>
-                  <td>FINAL_ACK 边界保持不变；response fence 不应侵入 wire/receiver。</td>
+                  <td>FINAL_ACK 边界保持不变；请求重发状态不进入 wire/receiver。</td>
                 </tr>
                 <tr>
                   <td><code>sql/preserve_trx_promotion.cc/.h</code></td>
@@ -1473,18 +1613,19 @@ on_ha_continuation_aborted(event):
             </table>
           </div>
 
-          <h3>18.2 最小实现修改面</h3>
+          <h3>18.2 最小实现与联调面</h3>
           <ul>
-            <li><code>sql/sql_class.h</code>：增加 generation-scoped accepted/response 计数与 read cutoff。</li>
-            <li><code>sql/preserve_trx.h/.cc</code>：增加薄的 command accepted、response completed、cutoff 和 batch fence wait API。</li>
-            <li><code>sql/sql_parse.cc</code>：在 <code>get_command()</code> 成功和两类 response 结束点调用薄 hook，并正确处理无响应 protocol command。</li>
-            <li><code>mysql-test/suite/preserve_trx/</code>：增加 response fence 行为与 OFF-path 测试。</li>
+            <li><code>sql/preserve_trx.cc</code>：只验证/保持现有不变量：旧 command 完成后才 QUIESCED，终态关闭前 CLOSING 不 reopen。</li>
+            <li><code>sql/sql_parse.cc</code> 与 <code>sql/sql_class.h</code>：本方案不要求新增字段或 hook；复用已交付 gate/batch state。</li>
+            <li>Proxy：增加 planned terminal generation 归属、唯一在途请求保存、startup/promotion RESUME 后重发。</li>
+            <li>HA：把 DRAIN survivor 结果、terminal attempt 和 RESUME 结果绑定到同一 logical connection/Tx/generation。</li>
+            <li>MTR/E2E：补计划内断连与普通断连分流、startup/promotion RESUME 前不得重发、RESET 未读 packet 不重复发送。</li>
           </ul>
 
           <div class="success">
             <strong>明确不需要修改</strong>
             不修改 InnoDB trx/undo/lock 热路径，不修改 bundle、carrier、transfer wire、receiver artifact，
-            不新增错误码，不把 peerid 或代理 PS catalog 存入 mysqld，也不实现真实 HA。
+            不新增错误码，不增加 accepted/response/cutoff/compound 状态，不把 peerid 或代理 PS catalog 存入 mysqld，也不实现真实 HA。
           </div>
 
           <h3>18.3 代理项目对接检查表</h3>
@@ -1493,12 +1634,13 @@ on_ha_continuation_aborted(event):
             <li>每 backend connection 同时只允许一个 response-bearing outstanding request。</li>
             <li>long-data 与 execute 作为一个连续 compound request，代理全量缓存分片。</li>
             <li>收到 4020 后停止 source 转发，保存原请求并保持队列顺序。</li>
-            <li>正常响应永不重放；无完整响应永不盲目重放。</li>
+            <li>计划内终态断连前先消费已完成 packet；只保存没有完整结果的唯一在途请求。</li>
+            <li>正常响应永不重放；无 4020 或匹配 generation 的计划内终态证据时永不盲目重放。</li>
             <li>维护 client stmt id 与 Tx/Ty backend stmt id 双映射。</li>
             <li>缓存 long-data 直到 execute 结果确定。</li>
             <li>RESET 重放 long-data execute 前，先对 source statement 执行 <code>COM_STMT_RESET</code>。</li>
             <li>HA 终局事件携带 Tx 和 generation；promotion-attached 额外携带 Ty。</li>
-            <li>HA 必须为每个挂起连接给出 attached、reset-succeeded 或 continuation-aborted 三选一终局。</li>
+            <li>HA 必须为每个挂起连接给出 promotion-attached、startup-resumed、reset-succeeded 或 continuation-aborted 终局。</li>
             <li>Ty attach 成功前不得发送挂起业务请求。</li>
             <li>RESET 成功后先重放 4020 请求，再开放后续请求。</li>
             <li>Preserve 失败不阻塞普通升主。</li>
@@ -1506,19 +1648,20 @@ on_ha_continuation_aborted(event):
 
           <div class="success">
             <strong>最终裁定</strong>
-            这套对接不需要把系统复杂化。mysqld 提供事务 preserve/attach 和明确的 4020 未执行边界；
-            Proxy 保存协议请求并负责重放；HA 只发布 promotion attach 成功或 RESET 成功的终局。
-            当前 source 侧需要补齐两个相邻合同：在 COMMIT_EPOCH 前关闭命令读取并等待已接受命令的正常响应或 4020；
-            对 <code>COM_STMT_SEND_LONG_DATA/CLOSE</code> 保持 classic protocol 的无响应语义。
+            这套对接不需要把系统复杂化。mysqld 提供事务 preserve/attach、CLOSING 零执行门禁和明确的 4020 未执行边界；
+            promotion 与 shutdown/startup 终态直接关闭旧连接；Proxy 保存唯一在途请求并负责重放；HA 只在事务 RESUME 成功后授权重放。
+            RESET 保持原连接，完整 4020 请求由 Proxy 重发，未读 packet 由原 socket 自然执行。
+            不引入 generation-scoped response fence，也不把 long-data+execute 状态塞进内核。
           </div>
         </section>
       </main>
 
       <footer class="footer">
         <p>
-          本文基于 MySQL 8.0.22 Preserve/Resume 工作树 HEAD
-          <span class="mono">302ae0940a58040ef35c0a0d0f6a289eb1708cc7</span> 的源码与现有 MTR 编写。
-          文中“当前代码事实”已经落地；“response fence”和真实 physical HA/peerid provider 属于待实现对接项。
+          本文原始基线为 <span class="mono">302ae0940a58040ef35c0a0d0f6a289eb1708cc7</span>，
+          三方合同按 <span class="mono">1578fdb61ab84e0d7c00b7028ab78d68c432cb3e</span> 复核。
+          CLOSING 全 command 4020、HA 固定账号、DRAIN survivor/excluded 结果和无响应命令门禁已经落地；
+          终态请求边界复用 CLOSING、旧 command completion 和连接关闭，不新增 response fence；真实 physical HA/peerid provider 仍属未来对接项。
         </p>
       </footer>
     </div>

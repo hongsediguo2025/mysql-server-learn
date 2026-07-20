@@ -331,6 +331,15 @@ class Preserve_trx_lock_warmcopy_drain_participant final
   bool prepare_phase1_record_store_targets(
       const Phase1_record_blob_ready_callback &blob_ready = {});
   bool prepare_quiesced_targets(const std::vector<uint64_t> &thread_ids);
+  bool prepare_quiesced_target(
+      THD *target, Preserve_trx_lock_warmcopy_artifact *artifact);
+  bool complete_early_prepared_targets(
+      const std::vector<uint64_t> &thread_ids);
+  bool bind_early_live_record_blob(
+      uint64_t thread_id,
+      const lock_warmcopy_trx_lock_fence_t &live_fence,
+      uint64_t minimum_publication_generation,
+      Preserved_trx_external_blob *blob);
   bool prepare_quiesced_targets_for_unit_test(
       const std::vector<uint64_t> &thread_ids);
   bool prepare_phase1_record_payload_for_thread_for_unit_test(
@@ -389,6 +398,8 @@ class Preserve_trx_lock_warmcopy_drain_participant final
     PrebuiltRecordLocksBlob phase1_record_prebuilt_blob;
     bool phase1_record_prebuilt_fence_valid{false};
     lock_warmcopy_record_store_fence_t phase1_record_prebuilt_fence;
+    bool phase1_record_live_fence_valid{false};
+    lock_warmcopy_trx_lock_fence_t phase1_record_live_fence;
     std::string record_locks_payload;
     uint32_t record_lock_count{0};
     /*
@@ -429,6 +440,7 @@ class Preserve_trx_lock_warmcopy_drain_participant final
   std::set<uint64_t> m_phase1_record_active_scan_targets;
   uint64_t m_epoch{0};
   bool m_record_store_cleanup_deferred_for_shutdown{false};
+  bool m_early_targets_prepared{false};
 
   Target_session *ensure_target_session(uint64_t thread_id);
   void refresh_phase1_record_prebuilt_observation();

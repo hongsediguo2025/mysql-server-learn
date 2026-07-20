@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the Preserve/Resume standby-transfer full-pressure release profile safely.
+"""Run Preserve/Resume full-pressure release profiles safely.
 
 This wrapper owns only test-environment setup and teardown.  The business
 workload remains in resumable_trx_business_e2e.py.  Every run uses unique
@@ -15,6 +15,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import resource
@@ -37,6 +38,7 @@ RUNNER_VERSION = 1
 OWNERSHIP_MARKER = ".preserve-full-pressure-runner.json"
 MAX_MYSQL_SOCKET_PATH_BYTES = 100
 DEFAULT_FULL_REQUIRED_FREE_BYTES = 20 * 1024**3
+DEFAULT_MIXED_FULL_REQUIRED_FREE_BYTES = 80 * 1024**3
 DEFAULT_SMOKE_REQUIRED_FREE_BYTES = 2 * 1024**3
 
 
@@ -49,6 +51,7 @@ class FullPressureProfile:
     seed_rows_per_table_per_session: int
     lockset_batch_size: int
     preserve_memory_budget_bytes: int
+    transfer_max_inflight_bytes: int
     source_buffer_pool_bytes: int
     receiver_buffer_pool_bytes: int
     receiver_workers: int
@@ -64,6 +67,24 @@ class FullPressureProfile:
     startup_timeout_s: int
     shutdown_timeout_s: int
     resume_timeout_s: int
+    mixed_seed_rows_per_table: int = 0
+    mixed_transaction_sizes: Tuple[int, ...] = ()
+    mixed_transaction_weights: Tuple[int, ...] = ()
+    business_run_before_drain_s: float = 0.0
+    mixed_min_started_sessions: int = 0
+    mixed_min_completed_statements: int = 0
+    mixed_min_survivor_count: int = 0
+    max_sql_resume_ms: int = 0
+    source_tiered_load_threads_per_tier: int = 0
+    source_tiered_load_work_units: Tuple[int, ...] = ()
+    source_tiered_load_min_samples_per_tier: int = 0
+
+    @property
+    def source_tiered_load_threads(self) -> int:
+        return (
+            self.source_tiered_load_threads_per_tier
+            * len(self.source_tiered_load_work_units)
+        )
 
 
 FULL_PROFILE = FullPressureProfile(
@@ -74,6 +95,7 @@ FULL_PROFILE = FullPressureProfile(
     seed_rows_per_table_per_session=100000,
     lockset_batch_size=100000,
     preserve_memory_budget_bytes=256 * 1024**2,
+    transfer_max_inflight_bytes=1024**3,
     source_buffer_pool_bytes=2 * 1024**3,
     receiver_buffer_pool_bytes=2 * 1024**3,
     receiver_workers=8,
@@ -115,12 +137,32 @@ SMOKE_PROFILE = dataclasses.replace(
     resume_timeout_s=300,
 )
 
+CONTINUOUS_TIERED_FULL_PROFILE = dataclasses.replace(
+    FULL_PROFILE,
+    name="continuous-tiered-full",
+    source_tiered_load_threads_per_tier=10,
+    source_tiered_load_work_units=(50, 130, 260),
+    source_tiered_load_min_samples_per_tier=10,
+)
+
+CONTINUOUS_TIERED_SMOKE_PROFILE = dataclasses.replace(
+    SMOKE_PROFILE,
+    name="continuous-tiered-smoke",
+    statements_per_tx=100_000,
+    seed_rows_per_table_per_session=100_000,
+    lockset_batch_size=100_000,
+    source_tiered_load_threads_per_tier=2,
+    source_tiered_load_work_units=(50, 550, 1100),
+    source_tiered_load_min_samples_per_tier=2,
+)
+
 RESET_FULL_PROFILE = dataclasses.replace(
     FULL_PROFILE,
     name="reset-full",
     statements_per_tx=10_000,
     seed_rows_per_table_per_session=1,
     lockset_batch_size=0,
+    transfer_max_inflight_bytes=4 * 1024**3,
 )
 
 RESET_SMOKE_PROFILE = dataclasses.replace(
@@ -137,6 +179,44 @@ RESET_SMOKE_PROFILE = dataclasses.replace(
     startup_timeout_s=120,
     shutdown_timeout_s=180,
     resume_timeout_s=300,
+)
+
+MIXED_FULL_PROFILE = dataclasses.replace(
+    FULL_PROFILE,
+    name="mixed-full",
+    statements_per_tx=10_000,
+    seed_rows_per_table_per_session=8,
+    lockset_batch_size=0,
+    preserve_memory_budget_bytes=2 * 1024**3,
+    mixed_seed_rows_per_table=300_000,
+    mixed_transaction_sizes=(10_000, 1_000, 100, 10),
+    mixed_transaction_weights=(10, 20, 30, 40),
+    business_run_before_drain_s=60.0,
+    mixed_min_started_sessions=1000,
+    mixed_min_completed_statements=10_000,
+    mixed_min_survivor_count=1,
+    source_phase2_limit_us=180_000_000,
+    max_sql_resume_ms=100,
+)
+
+MIXED_SMOKE_PROFILE = dataclasses.replace(
+    SMOKE_PROFILE,
+    name="mixed-smoke",
+    sessions=8,
+    tables=4,
+    statements_per_tx=100,
+    seed_rows_per_table_per_session=8,
+    lockset_batch_size=0,
+    preserve_memory_budget_bytes=2 * 1024**3,
+    mixed_seed_rows_per_table=2_000,
+    mixed_transaction_sizes=(100, 50, 20, 10),
+    mixed_transaction_weights=(1, 1, 2, 4),
+    business_run_before_drain_s=3.0,
+    mixed_min_started_sessions=8,
+    mixed_min_completed_statements=80,
+    mixed_min_survivor_count=1,
+    source_phase2_limit_us=180_000_000,
+    max_sql_resume_ms=100,
 )
 
 
@@ -365,21 +445,26 @@ def build_mysqld_commands(
     receiver_uuid: str,
     source_port: int,
     receiver_port: int,
+    transfer_enabled: bool = True,
 ) -> Tuple[List[str], List[str]]:
+    ssl_data_dir = paths.repo_root / "mysql-test" / "std_data"
     common = [
         str(paths.mysqld),
         "--no-defaults",
         f"--basedir={paths.build_dir}",
         "--binlog-format=ROW",
         "--bind-address=127.0.0.1",
+        "--default-authentication-plugin=mysql_native_password",
         f"--max-connections={max(1300, profile.sessions + 100)}",
         "--innodb-buffer-pool-dump-at-shutdown=OFF",
         "--innodb-buffer-pool-load-at-startup=OFF",
         "--log-error-verbosity=3",
+        f"--ssl-ca={ssl_data_dir / 'ca-cert-verify-san.pem'}",
+        f"--ssl-cert={ssl_data_dir / 'server-cert-verify-san.pem'}",
+        f"--ssl-key={ssl_data_dir / 'server-key-verify-san.pem'}",
         "--preserve-trx-enable=ON",
         f"--preserve-trx-memory-budget-bytes={profile.preserve_memory_budget_bytes}",
-        "--preserve-trx-transfer-target-user=preserve_transfer",
-        "--preserve-trx-transfer-credential-name=fullpressure",
+        f"--preserve-trx-transfer-max-inflight-bytes={profile.transfer_max_inflight_bytes}",
         "--loose-mysqlx=0",
     ]
     source = common + [
@@ -391,11 +476,36 @@ def build_mysqld_commands(
         f"--server-id={source_port}",
         f"--log-bin={paths.source_root / 'mysql-bin'}",
         f"--innodb-buffer-pool-size={profile.source_buffer_pool_bytes}",
-        "--preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE",
-        f"--preserve-trx-transfer-target-server-uuid={receiver_uuid}",
-        f"--preserve-trx-transfer-target-socket={paths.receiver_socket}",
     ]
+    if profile.mixed_seed_rows_per_table > 0:
+        source.extend(
+            [
+                "--preserve-trx-drain-closing-command-timeout-ms=120000",
+                "--preserve-trx-warmcopy-close-timeout-ms=120000",
+                "--preserve-trx-drain-hard-timeout-ms=120000",
+                "--preserve-trx-memory-per-token-bytes=1073741824",
+                f"--preserve-trx-warmcopy-max-total-bytes={profile.preserve_memory_budget_bytes}",
+            ]
+        )
+    if transfer_enabled:
+        source.extend(
+            [
+                "--preserve-trx-transfer-target-user=preserve_transfer",
+                "--preserve-trx-transfer-credential-name=fullpressure",
+                "--preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE",
+                f"--preserve-trx-transfer-target-server-uuid={receiver_uuid}",
+                "--preserve-trx-transfer-target-host=127.0.0.1",
+                f"--preserve-trx-transfer-target-port={receiver_port}",
+            ]
+        )
+    else:
+        source.append(
+            "--preserve-trx-transfer-artifact-mode=LOCAL_CARRIER"
+        )
+        return source, []
     receiver = common + [
+        "--preserve-trx-transfer-target-user=preserve_transfer",
+        "--preserve-trx-transfer-credential-name=fullpressure",
         f"--datadir={paths.receiver_datadir}",
         f"--socket={paths.receiver_socket}",
         f"--port={receiver_port}",
@@ -423,15 +533,98 @@ def build_e2e_command(
     credential_secret: str,
     evidence: str = "transfer-phase2",
 ) -> List[str]:
-    if evidence not in {"transfer-phase2", "reset-drain"}:
+    if evidence not in {
+        "transfer-phase2",
+        "continuous-tiered-transfer",
+        "reset-drain",
+        "mixed-shutdown-startup",
+        "mixed-transfer",
+    }:
         raise ValueError(f"unknown evidence mode: {evidence}")
+
+    mixed_arguments = [
+        "--mixed-pressure-workload",
+        "--allow-partial-tokens",
+        "--mixed-seed-rows-per-table",
+        str(profile.mixed_seed_rows_per_table),
+        "--mixed-transaction-sizes",
+        ",".join(str(value) for value in profile.mixed_transaction_sizes),
+        "--mixed-transaction-weights",
+        ",".join(str(value) for value in profile.mixed_transaction_weights),
+        "--mixed-min-started-sessions",
+        str(profile.mixed_min_started_sessions),
+        "--mixed-min-completed-statements",
+        str(profile.mixed_min_completed_statements),
+        "--business-run-before-drain",
+        str(profile.business_run_before_drain_s),
+        "--max-sql-resume-ms",
+        str(profile.max_sql_resume_ms),
+    ]
+    if evidence == "mixed-shutdown-startup":
+        return [
+            sys.executable,
+            str(paths.e2e_script),
+            "--scenario",
+            "hundred_session_semantic_matrix",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(source_port),
+            "--user",
+            "root",
+            "--database",
+            "resumable_trx_e2e",
+            "--sessions",
+            str(profile.sessions),
+            "--tables",
+            str(profile.tables),
+            "--statements-per-tx",
+            str(profile.statements_per_tx),
+            "--seed-rows-per-table-per-session",
+            str(profile.seed_rows_per_table_per_session),
+            "--cycles",
+            "1",
+            "--drain-interval",
+            "0.1",
+            "--min-statements-before-drain-pause",
+            "1",
+            "--preserve-timeout",
+            str(profile.preserve_timeout_s),
+            "--lock-warmcopy-mode",
+            "on",
+            "--max-phase2-total-ms",
+            str(profile.source_phase2_limit_us // 1000),
+            "--source-datadir",
+            str(paths.source_datadir),
+            "--source-start-command",
+            shell_join(source_command),
+            "--restart-command",
+            shell_join(source_command),
+            "--server-error-log",
+            str(paths.source_error_log),
+            "--server-pid-file",
+            str(paths.source_pid_file),
+            "--artifact-dir",
+            str(paths.work_dir),
+            "--mysql-basedir",
+            str(paths.build_dir),
+            "--report-json",
+            str(paths.e2e_report),
+            "--startup-timeout",
+            str(profile.startup_timeout_s),
+            "--shutdown-timeout",
+            str(profile.shutdown_timeout_s),
+            "--resume-timeout",
+            str(profile.resume_timeout_s),
+            *mixed_arguments,
+        ]
     command = [
         sys.executable,
         str(paths.e2e_script),
         "--scenario",
         "standby_transfer_receiver_drain_metrics",
-        "--unix-socket",
-        str(paths.source_socket),
+        "--host",
+        "127.0.0.1",
         "--port",
         str(source_port),
         "--user",
@@ -488,8 +681,6 @@ def build_e2e_command(
         "127.0.0.1",
         "--receiver-port",
         str(receiver_port),
-        "--receiver-unix-socket",
-        str(paths.receiver_socket),
         "--receiver-preserve-dir",
         str(paths.receiver_preserve_dir),
         "--receiver-physical-copy-before-drain",
@@ -504,8 +695,7 @@ def build_e2e_command(
         str(profile.receiver_read_load_max_p99_increase_pct),
         "--standby-transfer-user",
         "preserve_transfer",
-        "--standby-transfer-password",
-        credential_secret,
+        f"--standby-transfer-password={credential_secret}",
         "--standby-transfer-credential-name",
         "fullpressure",
         "--server-error-log",
@@ -526,6 +716,35 @@ def build_e2e_command(
         str(profile.resume_timeout_s),
     ]
     if evidence == "transfer-phase2":
+        return command
+
+    if evidence == "continuous-tiered-transfer":
+        command.extend(
+            [
+                "--source-continuous-tiered-load",
+                "--source-tiered-load-threads-per-tier",
+                str(profile.source_tiered_load_threads_per_tier),
+                "--source-tiered-load-work-units",
+                ",".join(
+                    str(value) for value in profile.source_tiered_load_work_units
+                ),
+                "--source-tiered-load-min-samples-per-tier",
+                str(profile.source_tiered_load_min_samples_per_tier),
+            ]
+        )
+        return command
+
+    if evidence == "mixed-transfer":
+        for flag in (
+            "--lockset-session-table-shards",
+            "--lockset-noop-update",
+            "--lockset-touch-one-row",
+            "--lockset-minimal-table",
+        ):
+            command.remove(flag)
+        lockset_index = command.index("--lockset-batch-size")
+        del command[lockset_index : lockset_index + 2]
+        command.extend(mixed_arguments)
         return command
 
     scenario_index = command.index("standby_transfer_receiver_drain_metrics")
@@ -782,6 +1001,132 @@ def git_value(repo_root: Path, args: Sequence[str], default: Any) -> Any:
     return result.stdout.strip() if result.returncode == 0 else default
 
 
+def build_acceptance_contract(
+    profile: FullPressureProfile, evidence: str
+) -> Dict[str, Any]:
+    if evidence == "continuous-tiered-transfer":
+        return {
+            **build_acceptance_contract(profile, "transfer-phase2"),
+            "source_continuous_tiered_load": True,
+            "source_tiered_load_threads": profile.source_tiered_load_threads,
+            "source_tiered_load_threads_per_tier": (
+                profile.source_tiered_load_threads_per_tier
+            ),
+            "source_tiered_load_work_units": list(
+                profile.source_tiered_load_work_units
+            ),
+            "source_tiered_load_min_samples_per_tier": (
+                profile.source_tiered_load_min_samples_per_tier
+            ),
+            "source_tiered_load_client_sleep_calls": 0,
+            "source_tiered_load_p50_us_ranges": {
+                "10ms": [5_000, 40_000],
+                "100ms": [60_000, 160_000],
+                "200ms": [140_000, 320_000],
+            },
+            "receiver_all_prewarm_after_final_ack_us_max": (
+                profile.ready_after_final_spool_ack_limit_us
+            ),
+        }
+    if evidence == "mixed-shutdown-startup":
+        return {
+            "evidence_kind": "LOCAL_STARTUP_E2E",
+            "source_phase2_total_us_max": profile.source_phase2_limit_us,
+            "sql_resume_sample_count_min": profile.mixed_min_survivor_count,
+            "sql_resume_max_us": profile.max_sql_resume_ms * 1000,
+            "startup_recovery_required": True,
+            "receiver_started": False,
+            "drain_trigger_mode": "independent_control_connection",
+            "harness_checkpoint_before_drain": False,
+            "tables": profile.tables,
+            "rows_per_table": profile.mixed_seed_rows_per_table,
+            "sessions": profile.sessions,
+            "source_log_bin": True,
+            "binlog_format": "ROW",
+            "minimum_survivor_count": profile.mixed_min_survivor_count,
+            "measured_sql_duration_tiers": [
+                "sub_100ms",
+                "hundreds_ms",
+                "seconds",
+                "tens_seconds",
+            ],
+            "minimum_business_sql_before_drain": (
+                profile.mixed_min_completed_statements
+            ),
+            "minimum_business_sql_per_session_before_drain": math.ceil(
+                profile.mixed_min_completed_statements
+                / profile.mixed_min_started_sessions
+            ),
+        }
+    if evidence == "mixed-transfer":
+        return {
+            "evidence_kind": "STANDALONE_TRANSFER_E2E",
+            "source_phase2_total_us_max": profile.source_phase2_limit_us,
+            "receiver_readiness_contract": "COMMITTED_NOT_READY",
+            "receiver_epoch_storage": "PROCESS_LOCAL",
+            "receiver_process_local_epoch_accepted": True,
+            "receiver_final_ack_required": True,
+            "promotion_or_resume_executed": False,
+            "drain_trigger_mode": "independent_control_connection",
+            "harness_checkpoint_before_drain": False,
+            "strict_record_index_page_reads": 0,
+            "strict_ibuf_merges": 0,
+            "strict_target_local_redo_bytes": 0,
+            "receiver_read_load_qps_drop_pct_max": (
+                profile.receiver_read_load_max_qps_drop_pct
+            ),
+            "receiver_read_load_p99_increase_pct_max": (
+                profile.receiver_read_load_max_p99_increase_pct
+            ),
+            "tables": profile.tables,
+            "rows_per_table": profile.mixed_seed_rows_per_table,
+            "sessions": profile.sessions,
+            "source_log_bin": True,
+            "receiver_log_bin": True,
+            "binlog_format": "ROW",
+            "minimum_survivor_count": profile.mixed_min_survivor_count,
+            "measured_sql_duration_tiers": [
+                "sub_100ms",
+                "hundreds_ms",
+                "seconds",
+                "tens_seconds",
+            ],
+            "minimum_business_sql_before_drain": (
+                profile.mixed_min_completed_statements
+            ),
+            "minimum_business_sql_per_session_before_drain": math.ceil(
+                profile.mixed_min_completed_statements
+                / profile.mixed_min_started_sessions
+            ),
+        }
+    return {
+        "source_phase2_total_us_max": profile.source_phase2_limit_us,
+        "receiver_readiness_contract": "COMMITTED_NOT_READY",
+        "receiver_epoch_storage": "PROCESS_LOCAL",
+        "receiver_process_local_epoch_accepted": True,
+        "receiver_epoch_fact_count": 0,
+        "receiver_epoch_commit_count": 0,
+        "receiver_ready_after_final_spool_ack_us": 0,
+        "ready_tokens": 0,
+        "not_ready_tokens": 0,
+        "prewarm_backlog_tokens": profile.sessions,
+        "record_lock_count_min": profile.sessions * profile.lockset_batch_size,
+        "record_lock_page_count": 0,
+        "record_lock_resident_pages": 0,
+        "record_lock_cold_gets": 0,
+        "phase2_transfer_bulk_bytes": 0,
+        "strict_record_index_page_reads": 0,
+        "strict_ibuf_merges": 0,
+        "strict_target_local_redo_bytes": 0,
+        "receiver_read_load_qps_drop_pct_max": (
+            profile.receiver_read_load_max_qps_drop_pct
+        ),
+        "receiver_read_load_p99_increase_pct_max": (
+            profile.receiver_read_load_max_p99_increase_pct
+        ),
+    }
+
+
 def build_checklist(
     profile: FullPressureProfile,
     paths: FullPressurePaths,
@@ -794,6 +1139,7 @@ def build_checklist(
     receiver_command: Sequence[str],
     e2e_command: Sequence[str],
     preflight: Mapping[str, Any],
+    evidence: str = "transfer-phase2",
 ) -> Dict[str, Any]:
     status = git_value(paths.repo_root, ["status", "--short", "-uall"], "")
     version_result = subprocess.run(
@@ -839,34 +1185,7 @@ def build_checklist(
             "receiver_datadir": str(paths.receiver_datadir),
             "receiver_preserve_dir": str(paths.receiver_preserve_dir),
         },
-        "acceptance": {
-            "source_phase2_total_us_max": profile.source_phase2_limit_us,
-            "receiver_readiness_contract": "COMMITTED_NOT_READY",
-            "receiver_epoch_storage": "PROCESS_LOCAL",
-            "receiver_process_local_epoch_accepted": True,
-            "receiver_epoch_fact_count": 0,
-            "receiver_epoch_commit_count": 0,
-            "receiver_ready_after_final_spool_ack_us": 0,
-            "ready_tokens": 0,
-            "not_ready_tokens": 0,
-            "prewarm_backlog_tokens": profile.sessions,
-            "record_lock_count_min": (
-                profile.sessions * profile.lockset_batch_size
-            ),
-            "record_lock_page_count": 0,
-            "record_lock_resident_pages": 0,
-            "record_lock_cold_gets": 0,
-            "phase2_transfer_bulk_bytes": 0,
-            "strict_record_index_page_reads": 0,
-            "strict_ibuf_merges": 0,
-            "strict_target_local_redo_bytes": 0,
-            "receiver_read_load_qps_drop_pct_max": (
-                profile.receiver_read_load_max_qps_drop_pct
-            ),
-            "receiver_read_load_p99_increase_pct_max": (
-                profile.receiver_read_load_max_p99_increase_pct
-            ),
-        },
+        "acceptance": build_acceptance_contract(profile, evidence),
         "preflight": dict(preflight),
         "source_command": redact_command(source_command),
         "receiver_command": redact_command(receiver_command),
@@ -971,11 +1290,274 @@ def _metric_max(report: Mapping[str, Any], key: str) -> int:
     return int(value)
 
 
+def _metric_max_float(report: Mapping[str, Any], key: str) -> float:
+    value = report.get(key)
+    if isinstance(value, list):
+        if not value:
+            raise RuntimeError(f"report metric is empty: {key}")
+        return max(float(item) for item in value)
+    if value is None:
+        raise RuntimeError(f"report metric is missing: {key}")
+    return float(value)
+
+
+def validate_mixed_pressure_report(
+    profile: FullPressureProfile,
+    report: Mapping[str, Any],
+    evidence: str,
+) -> Dict[str, Any]:
+    failures: List[str] = []
+
+    def require_equal(key: str, expected: Any) -> None:
+        actual = report.get(key)
+        if actual != expected:
+            failures.append(f"{key}: expected={expected!r} actual={actual!r}")
+
+    require_equal("status", "success")
+    require_equal("success", True)
+    require_equal("mixed_pressure_workload", True)
+    require_equal(
+        "mixed_drain_trigger_mode", "independent_control_connection"
+    )
+    require_equal("mixed_harness_checkpoint_before_drain", False)
+    require_equal("sessions", profile.sessions)
+    require_equal("mixed_seed_rows_per_table", profile.mixed_seed_rows_per_table)
+    require_equal(
+        "mixed_total_seed_rows",
+        profile.tables * profile.mixed_seed_rows_per_table,
+    )
+    require_equal(
+        "mixed_transaction_sizes", list(profile.mixed_transaction_sizes)
+    )
+    require_equal(
+        "mixed_transaction_weights", list(profile.mixed_transaction_weights)
+    )
+    require_equal("mixed_source_log_bin_enabled", True)
+    require_equal("mixed_source_binlog_format", "ROW")
+    expected_class_counts: Dict[str, int] = {}
+    total_weight = sum(profile.mixed_transaction_weights)
+    for sid in range(1, profile.sessions + 1):
+        bucket = (sid - 1) % total_weight
+        cumulative = 0
+        for size, weight in zip(
+            profile.mixed_transaction_sizes,
+            profile.mixed_transaction_weights,
+        ):
+            cumulative += weight
+            if bucket < cumulative:
+                key = str(size)
+                expected_class_counts[key] = expected_class_counts.get(key, 0) + 1
+                break
+    require_equal(
+        "mixed_transaction_class_connection_counts", expected_class_counts
+    )
+    readiness = report.get("mixed_pre_drain_readiness")
+    if not isinstance(readiness, Mapping):
+        failures.append("mixed_pre_drain_readiness is missing")
+        readiness = {}
+    if int(readiness.get("started_sessions", 0)) < profile.mixed_min_started_sessions:
+        failures.append(
+            "mixed pre-drain connections were not all active: "
+            f"actual={readiness.get('started_sessions')} "
+            f"required={profile.mixed_min_started_sessions}"
+        )
+    if int(readiness.get("completed_statements", 0)) < profile.mixed_min_completed_statements:
+        failures.append(
+            "mixed pre-drain SQL volume is too small: "
+            f"actual={readiness.get('completed_statements')} "
+            f"required={profile.mixed_min_completed_statements}"
+        )
+    required_per_session = math.ceil(
+        profile.mixed_min_completed_statements
+        / profile.mixed_min_started_sessions
+    )
+    minimum_per_session = int(
+        readiness.get("minimum_completed_statements_per_session", 0)
+    )
+    if minimum_per_session < required_per_session:
+        failures.append(
+            "mixed pre-drain per-session SQL volume is too small: "
+            f"actual={minimum_per_session} required={required_per_session}"
+        )
+    operations = readiness.get("operation_counts", {})
+    durations = readiness.get("duration_class_counts", {})
+    if not isinstance(operations, Mapping):
+        operations = {}
+    if not isinstance(durations, Mapping):
+        durations = {}
+    for key in (
+        "tx_audit",
+        "insert",
+        "update",
+        "delete",
+        "replace",
+        "upsert",
+        "insert_select",
+        "multi_table_update",
+        "select",
+        "locking_select",
+        "json_update",
+        "typed_update",
+        "join_select",
+        "range_update",
+        "stored_procedure",
+    ):
+        if int(operations.get(key, 0)) <= 0:
+            failures.append(f"mixed pre-drain operation is missing: {key}")
+    for key in ("short", "hundreds_ms", "seconds", "tens_seconds"):
+        if int(durations.get(key, 0)) <= 0:
+            failures.append(f"mixed pre-drain duration class is missing: {key}")
+    duration_min_us = report.get("mixed_duration_class_min_us", {})
+    duration_max_us = report.get("mixed_duration_class_max_us", {})
+    if not isinstance(duration_min_us, Mapping):
+        duration_min_us = {}
+    if not isinstance(duration_max_us, Mapping):
+        duration_max_us = {}
+    if int(duration_min_us.get("short", 100_000)) >= 100_000:
+        failures.append("mixed short SQL did not complete below 100ms")
+    for key, threshold_us in (
+        ("hundreds_ms", 100_000),
+        ("seconds", 1_000_000),
+        ("tens_seconds", 10_000_000),
+    ):
+        if int(duration_max_us.get(key, 0)) < threshold_us:
+            failures.append(
+                f"mixed {key} SQL did not reach its measured duration tier: "
+                f"actual_us={duration_max_us.get(key)} required_us={threshold_us}"
+            )
+
+    survivor_count = int(report.get("mixed_preserved_survivor_count") or 0)
+    minimum_survivors = profile.mixed_min_survivor_count
+    if not minimum_survivors <= survivor_count <= profile.sessions:
+        failures.append(
+            "mixed preserved survivor coverage is outside the contract: "
+            f"actual={survivor_count} required_min={minimum_survivors} "
+            f"sessions={profile.sessions}"
+        )
+
+    mode_metrics: Dict[str, Any] = {}
+    if evidence == "mixed-shutdown-startup":
+        require_equal("evidence_kind", "LOCAL_STARTUP_E2E")
+        resume = report.get("sql_resume_latency", {})
+        if not isinstance(resume, Mapping):
+            failures.append("sql_resume_latency is missing")
+            resume = {}
+        if int(resume.get("sample_count", 0)) != survivor_count:
+            failures.append(
+                "SQL RESUME sample count mismatch: "
+                f"actual={resume.get('sample_count')} required={survivor_count}"
+            )
+        require_equal(
+            "mixed_restart_fresh_connection_count",
+            profile.sessions - survivor_count,
+        )
+        survivor_details = report.get("mixed_resumed_survivor_details", [])
+        if not isinstance(survivor_details, list) or len(
+            survivor_details
+        ) != survivor_count:
+            failures.append(
+                "mixed resumed survivor detail count does not match tokens"
+            )
+            survivor_details = []
+        if not any(
+            bool(detail.get("stored_procedure_completed"))
+            and int(detail.get("stored_procedure_work_units", 0)) >= 100_000
+            for detail in survivor_details
+            if isinstance(detail, Mapping)
+        ):
+            failures.append(
+                "mixed local E2E did not resume a rich transaction that "
+                "completed the real stored-procedure DML tier"
+            )
+        max_resume_us = int(resume.get("max_us") or 0)
+        if profile.max_sql_resume_ms > 0 and max_resume_us > profile.max_sql_resume_ms * 1000:
+            failures.append(
+                "SQL RESUME max latency exceeded: "
+                f"actual_us={max_resume_us} limit_us={profile.max_sql_resume_ms * 1000}"
+            )
+        if int(report.get("mixed_final_table_row_count_min") or 0) < profile.mixed_seed_rows_per_table:
+            failures.append("mixed local final table row count is below the seed")
+        phase2_total_ms = _metric_max_float(
+            report, "phase2_total_samples_ms"
+        )
+        if phase2_total_ms * 1000 > profile.source_phase2_limit_us:
+            failures.append(
+                "local source phase2 exceeded: "
+                f"actual_ms={phase2_total_ms} "
+                f"limit_ms={profile.source_phase2_limit_us / 1000}"
+            )
+        mode_metrics = {
+            "sql_resume_max_us": max_resume_us,
+            "sql_resume_samples": int(resume.get("sample_count", 0)),
+            "phase2_total_ms": phase2_total_ms,
+            "startup_recovery_elapsed_ms": _metric_max_float(
+                report, "startup_recovery_elapsed_samples_ms"
+            ),
+        }
+    elif evidence == "mixed-transfer":
+        require_equal("evidence_kind", "STANDALONE_TRANSFER_E2E")
+        require_equal("mixed_receiver_log_bin_enabled", True)
+        require_equal("mixed_receiver_binlog_format", "ROW")
+        require_equal("mixed_restart_fresh_connection_count", 0)
+        require_equal("receiver_readiness_contract", "COMMITTED_NOT_READY")
+        require_equal("receiver_epoch_storage", "PROCESS_LOCAL")
+        require_equal("receiver_process_local_epoch_accepted", True)
+        require_equal("receiver_epoch_fact_bound", True)
+        phase2_us = _metric_max(report, "source_phase2_total_us")
+        if phase2_us > profile.source_phase2_limit_us:
+            failures.append(
+                "source phase2 exceeded: "
+                f"actual_us={phase2_us} limit_us={profile.source_phase2_limit_us}"
+            )
+        mode_metrics = {
+            "source_phase2_total_us": phase2_us,
+            "receiver_all_prewarm_after_final_ack_us": int(
+                report.get("receiver_all_prewarm_after_final_ack_us") or 0
+            ),
+            "receiver_read_load_qps_drop_pct": float(
+                report.get("receiver_read_load_qps_drop_pct") or 0.0
+            ),
+            "receiver_read_load_p99_increase_pct": float(
+                report.get("receiver_read_load_p99_increase_pct") or 0.0
+            ),
+        }
+    else:
+        raise ValueError(f"unknown mixed evidence mode: {evidence}")
+    require_equal("physical_replication", False)
+    require_equal("production_provider", False)
+    require_equal("write_enable_exercised", False)
+    if failures:
+        raise RuntimeError("mixed-pressure report validation failed: " + "; ".join(failures))
+    return {
+        "sessions": profile.sessions,
+        "tables": profile.tables,
+        "seed_rows": profile.tables * profile.mixed_seed_rows_per_table,
+        "completed_statements_before_drain": int(
+            readiness.get("completed_statements", 0)
+        ),
+        "minimum_statements_per_session_before_drain": minimum_per_session,
+        "preserved_survivors": survivor_count,
+        "preserved_survivor_ratio": survivor_count / profile.sessions,
+        "evidence_kind": report.get("evidence_kind"),
+        **mode_metrics,
+    }
+
+
 def validate_e2e_report(
     profile: FullPressureProfile,
     report: Mapping[str, Any],
     evidence: str = "transfer-phase2",
 ) -> Dict[str, Any]:
+    if evidence == "continuous-tiered-transfer":
+        base_metrics = validate_e2e_report(
+            profile, report, evidence="transfer-phase2"
+        )
+        return {
+            **base_metrics,
+            **validate_continuous_tiered_load_report(profile, report),
+        }
+    if evidence in {"mixed-shutdown-startup", "mixed-transfer"}:
+        return validate_mixed_pressure_report(profile, report, evidence)
     if evidence == "reset-drain":
         return validate_reset_drain_report(profile, report)
     if evidence != "transfer-phase2":
@@ -1041,6 +1623,24 @@ def validate_e2e_report(
     network_sends = _metric_max(report, "source_phase1_transfer_network_send_count")
     frame_count = _metric_max(report, "source_phase1_transfer_frame_count")
     completed_statements = _metric_max(report, "completed_stmt_total")
+    early_staged_tokens = _metric_max(
+        report, "source_early_staged_tokens_samples"
+    )
+    boundary_to_enqueue_us = _metric_max(
+        report, "source_command_boundary_to_enqueue_us_max_samples"
+    )
+    final_fast_scan_us = _metric_max(
+        report, "source_final_fast_scan_us_samples"
+    )
+    final_dirty_tokens = _metric_max(
+        report, "source_final_dirty_tokens_samples"
+    )
+    final_replacement_tokens = _metric_max(
+        report, "source_final_replacement_tokens_samples"
+    )
+    final_validation_rejects = _metric_max(
+        report, "source_final_validation_rejects_samples"
+    )
     read_baseline_queries = _metric_max(
         report, "receiver_read_load_baseline_query_count"
     )
@@ -1093,6 +1693,21 @@ def validate_e2e_report(
         failures.append(
             f"completed_stmt_total is too small: minimum={profile.sessions} actual={completed_statements}"
         )
+    if early_staged_tokens != profile.sessions:
+        failures.append(
+            "source_early_staged_tokens_samples: "
+            f"expected={profile.sessions} actual={early_staged_tokens}"
+        )
+    if final_dirty_tokens != final_replacement_tokens:
+        failures.append(
+            "final dirty/replacement mismatch: "
+            f"dirty={final_dirty_tokens} replacement={final_replacement_tokens}"
+        )
+    if final_validation_rejects != 0:
+        failures.append(
+            "source_final_validation_rejects_samples: "
+            f"expected=0 actual={final_validation_rejects}"
+        )
     if read_baseline_queries <= 0 or read_baseline_qps <= 0 or read_baseline_p99_us <= 0:
         failures.append(
             "receiver read-load baseline evidence is empty: "
@@ -1135,6 +1750,12 @@ def validate_e2e_report(
         "receiver_lock_plan_subpool_cap_bytes": lock_plan_cap,
         "source_phase1_transfer_network_send_count": network_sends,
         "source_phase1_transfer_frame_count": frame_count,
+        "source_early_staged_tokens": early_staged_tokens,
+        "source_command_boundary_to_enqueue_us_max": boundary_to_enqueue_us,
+        "source_final_fast_scan_us": final_fast_scan_us,
+        "source_final_dirty_tokens": final_dirty_tokens,
+        "source_final_replacement_tokens": final_replacement_tokens,
+        "source_final_validation_rejects": final_validation_rejects,
         "receiver_read_load_qps_drop_pct": read_qps_drop_pct,
         "receiver_read_load_p99_increase_pct": read_p99_increase_pct,
         "receiver_strict_record_index_page_reads": report.get(
@@ -1146,6 +1767,106 @@ def validate_e2e_report(
         "receiver_strict_target_local_redo_bytes": report.get(
             "receiver_strict_target_local_redo_bytes"
         ),
+    }
+
+
+def validate_continuous_tiered_load_report(
+    profile: FullPressureProfile, report: Mapping[str, Any]
+) -> Dict[str, Any]:
+    failures: List[str] = []
+    expected_threads = profile.source_tiered_load_threads
+
+    def require_equal(key: str, expected: Any) -> None:
+        actual = report.get(key)
+        if actual != expected:
+            failures.append(f"{key}: expected={expected!r} actual={actual!r}")
+
+    require_equal("source_continuous_tiered_load", True)
+    require_equal(
+        "source_tiered_load_threads_per_tier",
+        profile.source_tiered_load_threads_per_tier,
+    )
+    require_equal("source_tiered_load_thread_count", expected_threads)
+    require_equal("source_tiered_load_started_workers", expected_threads)
+    require_equal(
+        "source_tiered_load_workers_with_samples", expected_threads
+    )
+    require_equal("source_tiered_load_completed_workers", expected_threads)
+    require_equal(
+        "source_tiered_load_natural_drain_stop_workers", expected_threads
+    )
+    require_equal("source_tiered_load_error_count", 0)
+    require_equal("source_tiered_load_client_sleep_calls", 0)
+
+    cutoff_count = int(report.get("source_tiered_load_cutoff_4020_count") or 0)
+    disconnect_count = int(report.get("source_tiered_load_disconnect_count") or 0)
+    if cutoff_count + disconnect_count != expected_threads:
+        failures.append(
+            "source tiered workers did not all terminate at the drain boundary: "
+            f"4020={cutoff_count} disconnect={disconnect_count} "
+            f"expected={expected_threads}"
+        )
+
+    p50_ranges = {
+        "10ms": (5_000, 40_000),
+        "100ms": (60_000, 160_000),
+        "200ms": (140_000, 320_000),
+    }
+    tier_metrics: Dict[str, int] = {}
+    p50_values: List[int] = []
+    for label, work_units in zip(
+        ("10ms", "100ms", "200ms"),
+        profile.source_tiered_load_work_units,
+    ):
+        prefix = f"source_tiered_{label}"
+        require_equal(f"{prefix}_work_units", work_units)
+        sample_count = int(report.get(f"{prefix}_sample_count") or 0)
+        p50_us = int(report.get(f"{prefix}_p50_us") or 0)
+        if sample_count < profile.source_tiered_load_min_samples_per_tier:
+            failures.append(
+                f"{prefix}_sample_count: minimum="
+                f"{profile.source_tiered_load_min_samples_per_tier} "
+                f"actual={sample_count}"
+            )
+        lower_us, upper_us = p50_ranges[label]
+        if not lower_us <= p50_us <= upper_us:
+            failures.append(
+                f"{prefix}_p50_us: expected_range=[{lower_us},{upper_us}] "
+                f"actual={p50_us}"
+            )
+        p50_values.append(p50_us)
+        tier_metrics[f"{prefix}_sample_count"] = sample_count
+        tier_metrics[f"{prefix}_p50_us"] = p50_us
+        tier_metrics[f"{prefix}_p95_us"] = int(
+            report.get(f"{prefix}_p95_us") or 0
+        )
+        tier_metrics[f"{prefix}_max_us"] = int(
+            report.get(f"{prefix}_max_us") or 0
+        )
+    if p50_values != sorted(p50_values) or len(set(p50_values)) != 3:
+        failures.append(
+            "source tiered P50 latencies are not strictly ordered: "
+            + ",".join(str(value) for value in p50_values)
+        )
+
+    all_prewarm_us = _metric_max(
+        report, "receiver_all_prewarm_after_final_ack_us"
+    )
+    if all_prewarm_us > profile.ready_after_final_spool_ack_limit_us:
+        failures.append(
+            "receiver_all_prewarm_after_final_ack_us: "
+            f"limit={profile.ready_after_final_spool_ack_limit_us} "
+            f"actual={all_prewarm_us}"
+        )
+    if failures:
+        raise RuntimeError(
+            "continuous-tiered full-pressure acceptance failed: "
+            + "; ".join(failures)
+        )
+    return {
+        **tier_metrics,
+        "source_tiered_load_cutoff_4020_count": cutoff_count,
+        "source_tiered_load_disconnect_count": disconnect_count,
     }
 
 
@@ -1178,8 +1899,8 @@ def validate_reset_drain_report(
     require_equal("original_connections_continued", True)
     require_equal("reset_debug_sync_used", False)
     require_equal("receiver_read_load_performance_gate_enforced", False)
-    require_equal("phase2_trigger", "WARMCOPY_CLOSING_REJECTION")
-    require_equal("phase2_observer_rejected", True)
+    require_equal("phase2_trigger", "WARMCOPY_CLOSING_STATUS")
+    require_equal("phase2_observer_rejected", False)
     require_equal("replayed_session_count", profile.sessions)
 
     response_us = _metric_max(report, "reset_response_elapsed_us")
@@ -1420,6 +2141,7 @@ class FullPressureRunner:
             return {"stopped": True, "signal": "SIGKILL", "returncode": returncode}
 
     def run(self) -> int:
+        transfer_enabled = self.evidence != "mixed-shutdown-startup"
         source_command, receiver_command = build_mysqld_commands(
             self.profile,
             self.paths,
@@ -1427,6 +2149,7 @@ class FullPressureRunner:
             receiver_uuid=self.receiver_uuid,
             source_port=self.source_port,
             receiver_port=self.receiver_port,
+            transfer_enabled=transfer_enabled,
         )
         e2e_command = build_e2e_command(
             self.profile,
@@ -1476,6 +2199,7 @@ class FullPressureRunner:
                 receiver_command=receiver_command,
                 e2e_command=e2e_command,
                 preflight=preflight,
+                evidence=self.evidence,
             )
             print(json.dumps(checklist, indent=2, sort_keys=True), flush=True)
             if self.check_only:
@@ -1494,11 +2218,16 @@ class FullPressureRunner:
                 initialize_datadir(
                     self.paths, self.paths.source_datadir, self.paths.source_init_log
                 )
-                initialize_datadir(
-                    self.paths, self.paths.receiver_datadir, self.paths.receiver_init_log
-                )
                 write_server_uuid(self.paths.source_datadir, self.source_uuid)
-                write_server_uuid(self.paths.receiver_datadir, self.receiver_uuid)
+                if transfer_enabled:
+                    initialize_datadir(
+                        self.paths,
+                        self.paths.receiver_datadir,
+                        self.paths.receiver_init_log,
+                    )
+                    write_server_uuid(
+                        self.paths.receiver_datadir, self.receiver_uuid
+                    )
                 for signum in (signal.SIGINT, signal.SIGTERM):
                     original_handlers[signum] = signal.getsignal(signum)
                     signal.signal(signum, self._signal_handler)
@@ -1627,7 +2356,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--evidence",
-        choices=("transfer-phase2", "reset-drain"),
+        choices=(
+            "transfer-phase2",
+            "continuous-tiered-transfer",
+            "reset-drain",
+            "mixed-shutdown-startup",
+            "mixed-transfer",
+        ),
         default="transfer-phase2",
         help=(
             "transfer-phase2 preserves the existing lockset gate; "
@@ -1678,13 +2413,31 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(
+    argv: Optional[Sequence[str]] = None,
+    *,
+    forced_evidence: Optional[str] = None,
+) -> int:
     args = parse_args(argv)
-    if args.evidence == "reset-drain":
+    if forced_evidence is not None:
+        args.evidence = forced_evidence
+    if args.evidence in {"mixed-shutdown-startup", "mixed-transfer"}:
+        profile = (
+            MIXED_FULL_PROFILE
+            if args.profile == "full"
+            else MIXED_SMOKE_PROFILE
+        )
+    elif args.evidence == "reset-drain":
         profile = (
             RESET_FULL_PROFILE
             if args.profile == "full"
             else RESET_SMOKE_PROFILE
+        )
+    elif args.evidence == "continuous-tiered-transfer":
+        profile = (
+            CONTINUOUS_TIERED_FULL_PROFILE
+            if args.profile == "full"
+            else CONTINUOUS_TIERED_SMOKE_PROFILE
         )
     else:
         profile = FULL_PROFILE if args.profile == "full" else SMOKE_PROFILE
@@ -1709,8 +2462,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.required_free_gib * 1024**3
         if args.required_free_gib is not None
         else (
-            DEFAULT_FULL_REQUIRED_FREE_BYTES
-            if profile.name == "full"
+            (
+                DEFAULT_MIXED_FULL_REQUIRED_FREE_BYTES
+                if args.evidence in {
+                    "mixed-shutdown-startup",
+                    "mixed-transfer",
+                }
+                else DEFAULT_FULL_REQUIRED_FREE_BYTES
+            )
+            if args.profile == "full"
             else DEFAULT_SMOKE_REQUIRED_FREE_BYTES
         )
     )

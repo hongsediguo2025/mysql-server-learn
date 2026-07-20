@@ -2096,6 +2096,12 @@ dberr_t trx_preserve_export_record_locks(THD *thd, std::string *payload,
 }
 
 dberr_t trx_preserve_export_record_locks_stable_page_only(
+    trx_t *trx, std::string *payload, uint32_t max_lock_count) {
+  return lock_preserve_export_record_locks_stable_page_only(
+      trx, payload, max_lock_count);
+}
+
+dberr_t trx_preserve_export_record_locks_stable_page_only(
     THD *thd, std::string *payload, uint32_t max_lock_count) {
   if (thd == nullptr || payload == nullptr) {
     return DB_ERROR;
@@ -2106,7 +2112,7 @@ dberr_t trx_preserve_export_record_locks_stable_page_only(
     return DB_ERROR;
   }
 
-  return lock_preserve_export_record_locks_stable_page_only(
+  return trx_preserve_export_record_locks_stable_page_only(
       trx, payload, max_lock_count);
 }
 

@@ -46,6 +46,8 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertEqual(10000, RESET_FULL_PROFILE.statements_per_tx)
         self.assertEqual(1, RESET_FULL_PROFILE.seed_rows_per_table_per_session)
         self.assertEqual(0, RESET_FULL_PROFILE.lockset_batch_size)
+        self.assertEqual(256 * 1024**2, RESET_FULL_PROFILE.preserve_memory_budget_bytes)
+        self.assertEqual(4 * 1024**3, RESET_FULL_PROFILE.transfer_max_inflight_bytes)
         self.assertEqual(2 * 1024**3, RESET_FULL_PROFILE.source_buffer_pool_bytes)
         self.assertEqual(2 * 1024**3, RESET_FULL_PROFILE.receiver_buffer_pool_bytes)
         self.assertEqual(3, RESET_SMOKE_PROFILE.sessions)
@@ -89,7 +91,7 @@ class FullPressureProfileTest(unittest.TestCase):
                 receiver_command=receiver,
                 source_port=3511,
                 receiver_port=3512,
-                credential_secret="do-not-record-this",
+                credential_secret="-do-not-record-this",
             )
 
         joined = " ".join(command)
@@ -102,11 +104,80 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertIn("--receiver-read-load-max-qps-drop-pct 5.0", joined)
         self.assertIn("--receiver-read-load-max-p99-increase-pct 10.0", joined)
         self.assertIn(str(paths.receiver_datadir / "preserve"), command)
+        self.assertIn(
+            "--standby-transfer-password=-do-not-record-this", command
+        )
         self.assertNotIn("do-not-record-this", " ".join(redact_command(command)))
         self.assertFalse(any("--server-uuid" in item for item in source + receiver))
         self.assertIn("--log-error-verbosity=3", source)
         self.assertIn("--log-error-verbosity=3", receiver)
         self.assertIn("--innodb-buffer-pool-size=2147483648", receiver)
+
+    def test_full_pressure_uses_tcp_for_source_receiver_and_transfer(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = FullPressurePaths.resolve(
+                repo_root=root / "repo",
+                build_dir=Path("build-release"),
+                work_root=root / "work",
+                history_root=root / "history",
+                run_id="run-tcp-transport",
+            )
+            source, receiver = build_mysqld_commands(
+                FULL_PROFILE,
+                paths,
+                source_uuid="11111111-1111-1111-1111-111111111111",
+                receiver_uuid="22222222-2222-2222-2222-222222222222",
+                source_port=3511,
+                receiver_port=3512,
+            )
+            command = build_e2e_command(
+                FULL_PROFILE,
+                paths,
+                source_command=source,
+                receiver_command=receiver,
+                source_port=3511,
+                receiver_port=3512,
+                credential_secret="secret",
+            )
+
+        self.assertIn(
+            "--preserve-trx-transfer-target-host=127.0.0.1", source
+        )
+        self.assertIn("--preserve-trx-transfer-target-port=3512", source)
+        self.assertFalse(
+            any(
+                item.startswith("--preserve-trx-transfer-target-socket=")
+                for item in source
+            )
+        )
+        self.assertEqual("127.0.0.1", command[command.index("--host") + 1])
+        self.assertEqual("3511", command[command.index("--port") + 1])
+        self.assertEqual(
+            "127.0.0.1", command[command.index("--receiver-host") + 1]
+        )
+        self.assertEqual(
+            "3512", command[command.index("--receiver-port") + 1]
+        )
+        self.assertNotIn("--unix-socket", command)
+        self.assertNotIn("--receiver-unix-socket", command)
+        for mysqld_command in (source, receiver):
+            self.assertIn(
+                "--default-authentication-plugin=mysql_native_password",
+                mysqld_command,
+            )
+            self.assertIn(
+                f"--ssl-ca={paths.repo_root / 'mysql-test/std_data/ca-cert-verify-san.pem'}",
+                mysqld_command,
+            )
+            self.assertIn(
+                f"--ssl-cert={paths.repo_root / 'mysql-test/std_data/server-cert-verify-san.pem'}",
+                mysqld_command,
+            )
+            self.assertIn(
+                f"--ssl-key={paths.repo_root / 'mysql-test/std_data/server-key-verify-san.pem'}",
+                mysqld_command,
+            )
 
     def test_default_evidence_command_is_unchanged(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -232,6 +303,12 @@ class FullPressureProfileTest(unittest.TestCase):
             "source_phase1_transfer_network_send_count": 61,
             "source_phase1_transfer_frame_count": 8000,
             "completed_stmt_total": 1136,
+            "source_early_staged_tokens_samples": [1000],
+            "source_command_boundary_to_enqueue_us_max_samples": [1200],
+            "source_final_fast_scan_us_samples": [350],
+            "source_final_dirty_tokens_samples": [12],
+            "source_final_replacement_tokens_samples": [12],
+            "source_final_validation_rejects_samples": [0],
             "receiver_read_load_threads": 8,
             "receiver_read_load_baseline_query_count": 100000,
             "receiver_read_load_transfer_query_count": 96000,
@@ -248,6 +325,8 @@ class FullPressureProfileTest(unittest.TestCase):
         self.assertEqual(
             450000, metrics["receiver_all_prewarm_after_final_ack_us"]
         )
+        self.assertEqual(1000, metrics["source_early_staged_tokens"])
+        self.assertEqual(12, metrics["source_final_replacement_tokens"])
 
         report["workload_table_count"] = 30
         report["receiver_read_load_qps_drop_pct"] = 6.0
@@ -267,6 +346,20 @@ class FullPressureProfileTest(unittest.TestCase):
             RuntimeError,
             "receiver_ready_tokens.*receiver_epoch_ready_bind_attempts.*"
             "receiver_record_lock_page_count.*receiver_strict_target_local_redo_bytes",
+        ):
+            validate_e2e_report(FULL_PROFILE, report)
+
+    def test_full_report_gate_rejects_incomplete_early_pipeline(self):
+        report = self._valid_committed_not_ready_report()
+        report["source_early_staged_tokens_samples"] = [999]
+        report["source_final_dirty_tokens_samples"] = [2]
+        report["source_final_replacement_tokens_samples"] = [1]
+        report["source_final_validation_rejects_samples"] = [1]
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "source_early_staged_tokens_samples.*final dirty/replacement mismatch.*"
+            "source_final_validation_rejects_samples",
         ):
             validate_e2e_report(FULL_PROFILE, report)
 
@@ -291,8 +384,8 @@ class FullPressureProfileTest(unittest.TestCase):
             "original_connections_continued": True,
             "reset_debug_sync_used": False,
             "receiver_read_load_performance_gate_enforced": False,
-            "phase2_trigger": "WARMCOPY_CLOSING_REJECTION",
-            "phase2_observer_rejected": True,
+            "phase2_trigger": "WARMCOPY_CLOSING_STATUS",
+            "phase2_observer_rejected": False,
             "drained_session_count": 0,
             "draining_rejected_session_count": 1000,
             "replayed_session_count": 1000,
@@ -310,7 +403,7 @@ class FullPressureProfileTest(unittest.TestCase):
             )
 
         report["reset_response_max_us"] = 240000
-        report["phase2_observer_rejected"] = False
+        report["phase2_observer_rejected"] = True
         with self.assertRaisesRegex(RuntimeError, "phase2_observer_rejected"):
             validate_e2e_report(
                 RESET_FULL_PROFILE, report, evidence="reset-drain"
@@ -364,6 +457,12 @@ class FullPressureProfileTest(unittest.TestCase):
             "source_phase1_transfer_network_send_count": 61,
             "source_phase1_transfer_frame_count": 8000,
             "completed_stmt_total": 1136,
+            "source_early_staged_tokens_samples": [1000],
+            "source_command_boundary_to_enqueue_us_max_samples": [1200],
+            "source_final_fast_scan_us_samples": [350],
+            "source_final_dirty_tokens_samples": [12],
+            "source_final_replacement_tokens_samples": [12],
+            "source_final_validation_rejects_samples": [0],
             "receiver_read_load_threads": 8,
             "receiver_read_load_baseline_query_count": 100000,
             "receiver_read_load_transfer_query_count": 96000,

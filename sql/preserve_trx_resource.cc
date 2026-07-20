@@ -510,6 +510,19 @@ DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_snapshot_write_us,
                               preserve_trx_phase2_snapshot_write_us_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_register_us,
                               preserve_trx_phase2_register_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_early_staged_tokens,
+                              preserve_trx_early_staged_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(
+    show_preserve_trx_command_boundary_to_enqueue_us_max,
+    preserve_trx_command_boundary_to_enqueue_us_max_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_final_fast_scan_us,
+                              preserve_trx_final_fast_scan_us_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_final_dirty_tokens,
+                              preserve_trx_final_dirty_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_final_replacement_tokens,
+                              preserve_trx_final_replacement_tokens_status())
+DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_final_validation_rejects,
+                              preserve_trx_final_validation_rejects_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_phase2_slo_miss_count,
                               preserve_trx_phase2_slo_miss_count_status())
 DEFINE_PRESERVE_TRX_SHOW_FUNC(show_preserve_trx_resume_total_us,

@@ -14,7 +14,7 @@ planner do not require a running MySQL server.
 from __future__ import annotations
 
 import argparse
-from collections import deque
+from collections import Counter, deque
 import dataclasses
 import datetime
 import enum
@@ -62,6 +62,7 @@ EVIDENCE_KIND_STANDALONE_TRANSFER_RESET_E2E = (
 )
 EVIDENCE_KIND_WARM_GATE_SIMULATOR = "WARM_GATE_SIMULATOR"
 PRESERVE_TRX_HA_ADMIN_USER = "preserve_trx_ha_admin"
+SOURCE_TIERED_LOAD_LABELS = ("10ms", "100ms", "200ms")
 
 
 def _evidence_contract(evidence_kind: str) -> Dict[str, object]:
@@ -444,6 +445,7 @@ BINLOG_SCENARIOS = (
 
 
 class OperationKind(enum.Enum):
+    TX_AUDIT = "tx_audit"
     INSERT = "insert"
     UPDATE = "update"
     DELETE = "delete"
@@ -455,12 +457,40 @@ class OperationKind(enum.Enum):
     LOCKING_SELECT = "locking_select"
     JSON_UPDATE = "json_update"
     TYPED_UPDATE = "typed_update"
+    JOIN_SELECT = "join_select"
+    RANGE_UPDATE = "range_update"
+    STORED_PROCEDURE = "stored_procedure"
     BULK_LOCKSET_UPDATE = "bulk_lockset_update"
     REPEATED_ROW_WRITE = "repeated_row_write"
     TEMP_INSERT = "temp_insert"
     TEMP_UPDATE = "temp_update"
     TEMP_DELETE = "temp_delete"
     TEMP_SELECT = "temp_select"
+
+
+MIXED_PRESSURE_REQUIRED_OPERATION_KINDS = (
+    OperationKind.TX_AUDIT,
+    OperationKind.INSERT,
+    OperationKind.UPDATE,
+    OperationKind.DELETE,
+    OperationKind.REPLACE,
+    OperationKind.UPSERT,
+    OperationKind.INSERT_SELECT,
+    OperationKind.MULTI_TABLE_UPDATE,
+    OperationKind.SELECT,
+    OperationKind.LOCKING_SELECT,
+    OperationKind.JSON_UPDATE,
+    OperationKind.TYPED_UPDATE,
+    OperationKind.JOIN_SELECT,
+    OperationKind.RANGE_UPDATE,
+    OperationKind.STORED_PROCEDURE,
+)
+MIXED_PRESSURE_REQUIRED_DURATION_CLASSES = (
+    "short",
+    "hundreds_ms",
+    "seconds",
+    "tens_seconds",
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -471,6 +501,7 @@ class Operation:
     validator: Optional[Callable[[Sequence[Tuple]], None]] = None
     payload_bytes: int = 0
     discard_result: bool = False
+    duration_class: str = "short"
 
     @property
     def sql(self) -> str:
@@ -557,6 +588,13 @@ class HarnessConfig:
     lockset_select_for_update: bool = False
     lockset_minimal_table: bool = False
     repeated_row_write_workload: bool = False
+    mixed_pressure_workload: bool = False
+    mixed_seed_rows_per_table: int = 0
+    mixed_transaction_sizes: List[int] = dataclasses.field(default_factory=list)
+    mixed_transaction_weights: List[int] = dataclasses.field(default_factory=list)
+    mixed_min_started_sessions: int = 0
+    mixed_min_completed_statements: int = 0
+    max_sql_resume_ms: int = 0
     compact_expected_state_row_threshold: int = 1_000_000
     preserve_timeout_s: int = 86400
     preserve_max_binlog_cache_bytes: int = 1_073_741_824
@@ -620,6 +658,12 @@ class HarnessConfig:
     receiver_read_load_baseline_s: float = 0.0
     receiver_read_load_max_qps_drop_pct: float = 5.0
     receiver_read_load_max_p99_increase_pct: float = 10.0
+    source_continuous_tiered_load: bool = False
+    source_tiered_load_threads_per_tier: int = 0
+    source_tiered_load_work_units: List[int] = dataclasses.field(
+        default_factory=list
+    )
+    source_tiered_load_min_samples_per_tier: int = 0
     standby_transfer_user: str = "preserve_transfer_receiver"
     standby_transfer_password: str = "preserve_transfer_secret"
     standby_transfer_credential_name: str = "preserve_transfer_credential"
@@ -709,6 +753,33 @@ class HarnessConfig:
                 raise ValueError(
                     "receiver read-load baseline seconds must be positive when "
                     "the probe is enabled"
+                )
+        if self.source_continuous_tiered_load:
+            if self.scenario != "standby_transfer_receiver_drain_metrics":
+                raise ValueError(
+                    "source continuous tiered load is only valid for "
+                    "standby_transfer_receiver_drain_metrics"
+                )
+            if self.source_tiered_load_threads_per_tier <= 0:
+                raise ValueError(
+                    "source tiered load threads per tier must be positive"
+                )
+            if (
+                len(self.source_tiered_load_work_units)
+                != len(SOURCE_TIERED_LOAD_LABELS)
+                or any(
+                    value <= 0 for value in self.source_tiered_load_work_units
+                )
+                or self.source_tiered_load_work_units
+                != sorted(set(self.source_tiered_load_work_units))
+            ):
+                raise ValueError(
+                    "source tiered load requires three strictly increasing "
+                    "positive work-unit values"
+                )
+            if self.source_tiered_load_min_samples_per_tier <= 0:
+                raise ValueError(
+                    "source tiered load minimum samples per tier must be positive"
                 )
         if self.scenario in {
             "standby_transfer_receiver_drain_metrics",
@@ -879,6 +950,55 @@ class HarnessConfig:
             raise ValueError(
                 "repeated_row_write_workload cannot be combined with temp table workloads"
             )
+        if self.mixed_pressure_workload:
+            if self.lockset_batch_size > 0 or self.repeated_row_write_workload:
+                raise ValueError(
+                    "mixed_pressure_workload cannot be combined with lockset or "
+                    "repeated-row workloads"
+                )
+            if self.temp_table_workload:
+                raise ValueError(
+                    "mixed_pressure_workload does not include temporary tables"
+                )
+            if self.mixed_seed_rows_per_table <= 0:
+                raise ValueError(
+                    "mixed_seed_rows_per_table must be positive for mixed pressure"
+                )
+            if self.mixed_seed_rows_per_table < self.sessions:
+                raise ValueError(
+                    "mixed_seed_rows_per_table must provide at least one row "
+                    "per session"
+                )
+            if not self.mixed_transaction_sizes:
+                raise ValueError("mixed_transaction_sizes must not be empty")
+            if len(self.mixed_transaction_sizes) != len(
+                self.mixed_transaction_weights
+            ):
+                raise ValueError(
+                    "mixed transaction sizes and weights must have equal length"
+                )
+            if any(value <= 0 for value in self.mixed_transaction_sizes):
+                raise ValueError("mixed transaction sizes must be positive")
+            if any(value <= 0 for value in self.mixed_transaction_weights):
+                raise ValueError("mixed transaction weights must be positive")
+            if max(self.mixed_transaction_sizes) > self.statements_per_tx:
+                raise ValueError(
+                    "statements_per_tx must cover the largest mixed transaction"
+                )
+            if not 1 <= self.mixed_min_started_sessions <= self.sessions:
+                raise ValueError(
+                    "mixed_min_started_sessions must be in 1..sessions"
+                )
+            if self.mixed_min_completed_statements <= 0:
+                raise ValueError(
+                    "mixed_min_completed_statements must be positive"
+                )
+            if self.business_run_before_drain_s <= 0:
+                raise ValueError(
+                    "mixed pressure requires a positive business warmup"
+                )
+        if self.max_sql_resume_ms < 0:
+            raise ValueError("max_sql_resume_ms must be non-negative")
         if self.compact_expected_state_row_threshold < 0:
             raise ValueError("compact_expected_state_row_threshold must be non-negative")
         if self.lockset_batch_size > 0:
@@ -1049,6 +1169,12 @@ class WarmcopyDrainMetrics:
     phase2_savepoint_live_export_target_count: Optional[int] = None
     phase2_target_pin_us: Optional[int] = None
     phase2_target_worker_wall_us: Optional[int] = None
+    early_staged_tokens: Optional[int] = None
+    command_boundary_to_enqueue_us_max: Optional[int] = None
+    final_fast_scan_us: Optional[int] = None
+    final_dirty_tokens: Optional[int] = None
+    final_replacement_tokens: Optional[int] = None
+    final_validation_rejects: Optional[int] = None
     phase2_target_result_collect_us: Optional[int] = None
     phase2_target_deferred_dir_fsync_us: Optional[int] = None
     phase2_transfer_commit_epoch_us: Optional[int] = None
@@ -1277,6 +1403,293 @@ CREATE TABLE `{table}` (
 ) ENGINE=InnoDB
 """.strip()
 
+    def transaction_statement_count(self, sid: int) -> int:
+        if not self.config.mixed_pressure_workload:
+            return self.config.statements_per_tx
+        if sid < 1 or sid > self.config.sessions:
+            raise ValueError(f"invalid mixed-pressure sid: {sid}")
+        bucket = (sid - 1) % sum(self.config.mixed_transaction_weights)
+        cumulative = 0
+        for size, weight in zip(
+            self.config.mixed_transaction_sizes,
+            self.config.mixed_transaction_weights,
+        ):
+            cumulative += weight
+            if bucket < cumulative:
+                return size
+        raise AssertionError("mixed transaction weight selection fell through")
+
+    def mixed_pressure_transaction_class_counts(self) -> Dict[int, int]:
+        if not self.config.mixed_pressure_workload:
+            return {}
+        counts: Dict[int, int] = {}
+        for sid in range(1, self.config.sessions + 1):
+            size = self.transaction_statement_count(sid)
+            counts[size] = counts.get(size, 0) + 1
+        return counts
+
+    def mixed_pressure_procedure_work(self, sid: int) -> Tuple[int, str]:
+        if sid < 1 or sid > self.config.sessions:
+            raise ValueError(f"invalid mixed-pressure sid: {sid}")
+        if sid == self.config.sessions:
+            return 500_000, "tens_seconds"
+        if sid % 100 == 0 or (
+            self.config.sessions < 100 and sid == self.config.sessions - 1
+        ):
+            return 100_000, "seconds"
+        if sid % 10 == 0 or (
+            self.config.sessions < 10 and sid == self.config.sessions - 2
+        ):
+            return 2_000, "hundreds_ms"
+        return 1, "short"
+
+    def mixed_pressure_rows_for_sid(self, sid: int) -> int:
+        total = self.config.mixed_seed_rows_per_table
+        if sid < 1 or sid > self.config.sessions or sid > total:
+            return 0
+        return ((total - sid) // self.config.sessions) + 1
+
+    def mixed_pressure_seed_sql(self, table: str) -> str:
+        if table not in self.table_names():
+            raise ValueError(f"unknown table: {table}")
+        rows = self.config.mixed_seed_rows_per_table
+        sessions = self.config.sessions
+        return f"""
+INSERT INTO `{table}`
+  (sid,k,v,counter,amount,d,note,js,deleted)
+SELECT
+  MOD(seq.n, {sessions}) + 1,
+  FLOOR(seq.n / {sessions}),
+  seq.n + 1,
+  0,
+  10.00,
+  DATE '2026-05-21',
+  CONCAT('seed-', MOD(seq.n, {sessions}) + 1, '-', FLOOR(seq.n / {sessions})),
+  JSON_OBJECT('seed_sid', MOD(seq.n, {sessions}) + 1,
+              'seed_k', FLOOR(seq.n / {sessions})),
+  0
+FROM rtx_e2e_seed_seq seq
+WHERE seq.n < {rows}
+ORDER BY seq.n
+""".strip()
+
+    def mixed_pressure_procedure_sql(self) -> str:
+        return f"""
+CREATE PROCEDURE rtx_e2e_mixed_step(
+  IN p_sid INT,
+  IN p_tx_id INT,
+  IN p_stmt_no INT,
+  IN p_row_count INT,
+  IN p_work_units INT
+)
+BEGIN
+  DECLARE v_work INT DEFAULT 0;
+  DECLARE v_scan_sum BIGINT DEFAULT 0;
+  WHILE v_work < p_work_units DO
+    UPDATE rtx_e2e_t00
+       SET v = v + 1,
+           counter = counter + 1
+     WHERE sid = p_sid AND k = MOD(v_work, p_row_count);
+    SET v_work = v_work + 1;
+  END WHILE;
+  SELECT COALESCE(SUM(v + counter),0)
+    INTO v_scan_sum
+    FROM rtx_e2e_t00 FORCE INDEX(PRIMARY)
+   WHERE sid = p_sid;
+  UPDATE rtx_e2e_proc_state
+     SET call_count = call_count + 1,
+         last_tx_id = p_tx_id,
+         last_stmt_no = p_stmt_no,
+         last_scan_checksum = v_scan_sum,
+         last_changed = CURRENT_TIMESTAMP(6)
+   WHERE sid = p_sid;
+END
+""".strip()
+
+    def continuous_tiered_load_procedure_sql(self) -> str:
+        scan_rows = self.config.seed_rows_per_table_per_session
+        return f"""
+CREATE PROCEDURE rtx_e2e_tiered_scan(IN p_work_units INT UNSIGNED)
+READS SQL DATA
+BEGIN
+  DECLARE v_remaining_rows BIGINT UNSIGNED DEFAULT p_work_units * 1000;
+  DECLARE v_scan_rows INT UNSIGNED DEFAULT 0;
+  DECLARE v_scan_sum BIGINT DEFAULT 0;
+  WHILE v_remaining_rows > 0 DO
+    SET v_scan_rows = LEAST(v_remaining_rows, {scan_rows});
+    SELECT COALESCE(SUM(counter),0)
+      INTO v_scan_sum
+      FROM rtx_e2e_t00 FORCE INDEX(PRIMARY)
+     WHERE sid = 1 AND k >= 0 AND k < v_scan_rows;
+    SET v_remaining_rows = v_remaining_rows - v_scan_rows;
+  END WHILE;
+END
+""".strip()
+
+    def mixed_pressure_operation(
+        self, sid: int, tx_id: int, stmt_no: int
+    ) -> Operation:
+        statement_count = self.transaction_statement_count(sid)
+        if stmt_no < 0 or stmt_no >= statement_count:
+            raise ValueError(
+                f"mixed statement {stmt_no} is outside transaction size "
+                f"{statement_count} for sid {sid}"
+            )
+        tables = self.table_names()
+        table = tables[(sid + stmt_no - 1) % len(tables)]
+        peer = tables[(sid + stmt_no) % len(tables)]
+        rows_for_sid = self.mixed_pressure_rows_for_sid(sid)
+        if rows_for_sid <= 0:
+            raise ValueError(f"mixed dataset has no seed rows for sid {sid}")
+        base_k = (tx_id * 131 + stmt_no * 17 + sid) % rows_for_sid
+        tx_k = 1_000_000 + tx_id * self.config.statements_per_tx + stmt_no
+        value = sid * 10_000_000 + tx_id * 10_000 + stmt_no
+        note = f"mix-s{sid:04d}-t{tx_id:06d}-n{stmt_no:05d}"
+        op_case = stmt_no % 16
+
+        if op_case == 0:
+            return Operation(
+                OperationKind.TX_AUDIT,
+                "rtx_e2e_tx_audit",
+                "INSERT INTO rtx_e2e_tx_audit"
+                "(sid,tx_id,tx_size,first_seen) VALUES "
+                f"({sid},{tx_id},{statement_count},CURRENT_TIMESTAMP(6)) "
+                "ON DUPLICATE KEY UPDATE tx_size=VALUES(tx_size)",
+            )
+        if op_case == 1:
+            return Operation(
+                OperationKind.UPDATE,
+                table,
+                f"UPDATE `{table}` SET v={value}, counter=counter+1, "
+                f"note='{note}', deleted=0 WHERE sid={sid} AND k={base_k}",
+            )
+        if op_case == 2:
+            return Operation(
+                OperationKind.SELECT,
+                table,
+                f"SELECT v,counter FROM `{table}` "
+                f"WHERE sid={sid} AND k={base_k}",
+                _expect_single_non_null_row,
+            )
+        if op_case == 3:
+            return Operation(
+                OperationKind.UPSERT,
+                table,
+                f"INSERT INTO `{table}`"
+                "(sid,k,v,counter,amount,d,note,js,deleted) VALUES "
+                f"({sid},{tx_k},{value},{stmt_no},12.34,DATE '2026-05-21',"
+                f"'{note}',JSON_OBJECT('op','upsert','tx',{tx_id}),0) "
+                "ON DUPLICATE KEY UPDATE v=VALUES(v),counter=VALUES(counter),"
+                "js=VALUES(js),deleted=0",
+            )
+        if op_case == 4:
+            return Operation(
+                OperationKind.SELECT,
+                table,
+                f"SELECT COUNT(*),COALESCE(SUM(v),0) FROM `{table}` "
+                f"WHERE sid={sid} AND k BETWEEN {max(0, base_k - 8)} "
+                f"AND {base_k + 8}",
+                _expect_count_sum_row,
+            )
+        if op_case == 5:
+            return Operation(
+                OperationKind.JSON_UPDATE,
+                table,
+                f"UPDATE `{table}` SET "
+                "js=JSON_SET(COALESCE(js,JSON_OBJECT()),"
+                f"'$.sid',{sid},'$.tx',{tx_id},'$.stmt',{stmt_no}),"
+                f"note='{note}' WHERE sid={sid} AND k={base_k}",
+            )
+        if op_case == 6:
+            return Operation(
+                OperationKind.MULTI_TABLE_UPDATE,
+                table,
+                f"UPDATE `{table}` a JOIN `{peer}` b "
+                f"ON b.sid=a.sid AND b.k={base_k} "
+                f"SET a.counter=a.counter+1,b.counter=b.counter "
+                f"WHERE a.sid={sid} AND a.k={base_k}",
+            )
+        if op_case == 7:
+            return Operation(
+                OperationKind.LOCKING_SELECT,
+                table,
+                f"SELECT v FROM `{table}` WHERE sid={sid} AND k={base_k} "
+                "FOR UPDATE",
+                _expect_single_non_null_row,
+            )
+        if op_case == 8:
+            work_units, duration_class = (
+                self.mixed_pressure_procedure_work(sid)
+            )
+            return Operation(
+                OperationKind.STORED_PROCEDURE,
+                "rtx_e2e_proc_state",
+                f"CALL rtx_e2e_mixed_step({sid},{tx_id},{stmt_no},"
+                f"{rows_for_sid},{work_units})",
+                discard_result=True,
+                duration_class=duration_class,
+            )
+        if op_case == 9:
+            return Operation(
+                OperationKind.INSERT,
+                table,
+                f"INSERT IGNORE INTO `{table}`"
+                "(sid,k,v,counter,amount,d,note,js,deleted) VALUES "
+                f"({sid},{tx_k},{value},{stmt_no},22.22,DATE '2026-05-22',"
+                f"'{note}',JSON_OBJECT('op','insert','tx',{tx_id}),0)",
+            )
+        if op_case == 10:
+            return Operation(
+                OperationKind.DELETE,
+                table,
+                f"DELETE FROM `{table}` WHERE sid={sid} AND "
+                f"k={tx_k - 1}",
+            )
+        if op_case == 11:
+            return Operation(
+                OperationKind.INSERT_SELECT,
+                table,
+                f"INSERT INTO `{table}`"
+                "(sid,k,v,counter,amount,d,note,js,deleted) "
+                f"SELECT sid,{tx_k},{value},{stmt_no},33.33,"
+                f"DATE '2026-05-23','{note}',"
+                f"JSON_OBJECT('op','insert_select','tx',{tx_id}),0 "
+                f"FROM `{table}` WHERE sid={sid} AND k={base_k} "
+                "ON DUPLICATE KEY UPDATE v=VALUES(v),counter=VALUES(counter)",
+            )
+        if op_case == 12:
+            return Operation(
+                OperationKind.TYPED_UPDATE,
+                table,
+                f"UPDATE `{table}` SET amount={stmt_no}.25,"
+                f"d=DATE '2026-05-21' + INTERVAL {stmt_no % 20} DAY "
+                f"WHERE sid={sid} AND k={base_k}",
+            )
+        if op_case == 13:
+            return Operation(
+                OperationKind.REPLACE,
+                table,
+                f"REPLACE INTO `{table}`"
+                "(sid,k,v,counter,amount,d,note,js,deleted) VALUES "
+                f"({sid},{tx_k},{value},{stmt_no},44.44,DATE '2026-05-24',"
+                f"'{note}',JSON_OBJECT('op','replace','tx',{tx_id}),0)",
+            )
+        if op_case == 14:
+            return Operation(
+                OperationKind.JOIN_SELECT,
+                table,
+                f"SELECT a.v,b.counter FROM `{table}` a JOIN `{peer}` b "
+                f"ON b.sid=a.sid AND b.k={base_k} "
+                f"WHERE a.sid={sid} AND a.k={base_k}",
+                _expect_single_non_null_row,
+            )
+        return Operation(
+            OperationKind.RANGE_UPDATE,
+            table,
+            f"UPDATE `{table}` SET counter=counter+1 "
+            f"WHERE sid={sid} AND k BETWEEN {max(0, base_k - 2)} "
+            f"AND {base_k + 2}",
+        )
     def temp_table_name(self, sid: int) -> str:
         return f"rtx_e2e_tmp_{sid:03d}"
 
@@ -3409,7 +3822,6 @@ class ResetDrainCoordinator:
         self._prepared: set[int] = set()
         self._probe_started: set[int] = set()
         self._drained: set[int] = set()
-        self._draining_rejected: set[int] = set()
         self._replayed_us: Dict[int, int] = {}
         self._committed: set[int] = set()
         self._probe_allowed = False
@@ -3453,7 +3865,8 @@ class ResetDrainCoordinator:
             self._probe_allowed = True
             self._condition.notify_all()
 
-    def wait_for_drain_probe(self, timeout_s: float) -> bool:
+    def wait_for_drain_probe(self, sid: int, timeout_s: float) -> bool:
+        del sid
         return self._wait_for(lambda: self._probe_allowed, timeout_s)
 
     def mark_probe_started(self, sid: int) -> None:
@@ -3471,18 +3884,8 @@ class ResetDrainCoordinator:
             self._drained.add(sid)
             self._condition.notify_all()
 
-    def mark_draining_rejected(self, sid: int) -> None:
-        with self._condition:
-            self._draining_rejected.add(sid)
-            self._condition.notify_all()
-
     def wait_all_sessions_drained(self, timeout_s: float) -> bool:
         return self._wait_for(lambda: self._all_locked(self._drained), timeout_s)
-
-    def wait_any_closing_rejection(self, timeout_s: float) -> bool:
-        return self._wait_for(
-            lambda: bool(self._drained or self._draining_rejected), timeout_s
-        )
 
     def allow_replay_after_reset(self, reset_response_us: int) -> None:
         with self._condition:
@@ -3526,10 +3929,6 @@ class ResetDrainCoordinator:
         with self._condition:
             return len(self._drained)
 
-    def draining_rejected_count(self) -> int:
-        with self._condition:
-            return len(self._draining_rejected)
-
     def replayed_count(self) -> int:
         with self._condition:
             return len(self._replayed_us)
@@ -3547,7 +3946,6 @@ class ResetDrainWorker(threading.Thread):
         coordinator: ResetDrainCoordinator,
         timeout_s: float,
         require_session_drained: bool = True,
-        wait_for_closing_rejection: bool = False,
     ):
         super().__init__(name=f"rtx-reset-worker-{sid:04d}", daemon=True)
         self.sid = sid
@@ -3556,7 +3954,6 @@ class ResetDrainWorker(threading.Thread):
         self.coordinator = coordinator
         self.timeout_s = timeout_s
         self.require_session_drained = require_session_drained
-        self.wait_for_closing_rejection = wait_for_closing_rejection
         table = self.plan.repeated_row_write_table(sid)
         self.probe_sql = (
             f"UPDATE `{table}` SET counter = counter + 1 "
@@ -3608,30 +4005,14 @@ class ResetDrainWorker(threading.Thread):
             )
             self.statements_completed += self.plan.config.statements_per_tx
             self.coordinator.mark_transaction_prepared(self.sid)
-            if not self.coordinator.wait_for_drain_probe(self.timeout_s):
-                raise TimeoutError(
-                    f"sid={self.sid} timed out waiting for drain probe"
-                )
-
-            self.coordinator.mark_probe_started(self.sid)
-            if self.wait_for_closing_rejection:
-                deadline = time.monotonic() + self.timeout_s
-                while True:
-                    try:
-                        self.runtime.execute(conn, "SELECT 1", fetch=True)
-                    except BaseException as exc:
-                        if self.runtime.is_preserve_session_drained(exc):
-                            self.coordinator.mark_session_drained(self.sid)
-                        elif self.runtime.is_preserve_draining_rejection(exc):
-                            self.coordinator.mark_draining_rejected(self.sid)
-                        else:
-                            raise
-                        break
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError(
-                            f"sid={self.sid} did not observe a CLOSING rejection"
-                        )
-            elif self.require_session_drained:
+            if self.require_session_drained:
+                if not self.coordinator.wait_for_drain_probe(
+                    self.sid, self.timeout_s
+                ):
+                    raise TimeoutError(
+                        f"sid={self.sid} timed out waiting for drain probe"
+                    )
+                self.coordinator.mark_probe_started(self.sid)
                 deadline = time.monotonic() + self.timeout_s
                 while True:
                     try:
@@ -3651,20 +4032,6 @@ class ResetDrainWorker(threading.Thread):
                             "ER_PRESERVE_TRX_SESSION_DRAINED"
                         )
                     time.sleep(0.001)
-            else:
-                try:
-                    self.runtime.execute_command_without_connection_probe(
-                        conn, self.probe_sql
-                    )
-                    self.successful_probe_attempts_before_drain += 1
-                    self.statements_completed += 1
-                except BaseException as exc:
-                    if self.runtime.is_preserve_session_drained(exc):
-                        self.coordinator.mark_session_drained(self.sid)
-                    elif self.runtime.is_preserve_draining_rejection(exc):
-                        self.coordinator.mark_draining_rejected(self.sid)
-                    else:
-                        raise
 
             if not self.coordinator.wait_for_replay_permit(
                 self.sid, self.timeout_s
@@ -3896,7 +4263,8 @@ class MySQLRuntime:
             while True:
                 if getattr(cursor, "with_rows", False):
                     cursor.fetchall()
-                if not cursor.nextset():
+                nextset = getattr(cursor, "nextset", None)
+                if nextset is None or not nextset():
                     break
         finally:
             cursor.close()
@@ -3905,9 +4273,13 @@ class MySQLRuntime:
         cursor = conn.cursor()
         cursor.execute(sql)
         try:
-            while getattr(cursor, "with_rows", False):
-                rows = cursor.fetchmany(fetchmany_size)
-                if not rows:
+            while True:
+                while getattr(cursor, "with_rows", False):
+                    rows = cursor.fetchmany(fetchmany_size)
+                    if not rows:
+                        break
+                nextset = getattr(cursor, "nextset", None)
+                if nextset is None or not nextset():
                     break
         finally:
             cursor.close()
@@ -3935,6 +4307,211 @@ class SourceWorkloadRuntime:
 
     def __getattr__(self, name):
         return getattr(self._runtime, name)
+
+
+class SourceContinuousTieredLoadProbe:
+    """Continuously execute real read-only SQL until source drain cuts it off."""
+
+    _MAX_SAMPLES_PER_TIER = 100_000
+
+    def __init__(
+        self,
+        *,
+        runtime: SourceWorkloadRuntime,
+        threads_per_tier: int,
+        work_units: Sequence[int],
+    ) -> None:
+        if threads_per_tier <= 0:
+            raise ValueError("threads per tier must be positive")
+        if len(work_units) != len(SOURCE_TIERED_LOAD_LABELS):
+            raise ValueError("exactly three tier work-unit values are required")
+        self._runtime = runtime
+        self._threads_per_tier = threads_per_tier
+        self._work_units = tuple(int(value) for value in work_units)
+        self._thread_count = threads_per_tier * len(self._work_units)
+        self._condition = threading.Condition()
+        self._stop_event = threading.Event()
+        self._drain_started = threading.Event()
+        self._workers: List[threading.Thread] = []
+        self._samples: Dict[str, Deque[int]] = {
+            label: deque(maxlen=self._MAX_SAMPLES_PER_TIER)
+            for label in SOURCE_TIERED_LOAD_LABELS
+        }
+        self._started_workers = 0
+        self._workers_with_samples = set()
+        self._completed_workers = 0
+        self._cutoff_4020_count = 0
+        self._disconnect_count = 0
+        self._natural_drain_stop_workers = 0
+        self._errors: List[str] = []
+        self._report: Optional[Dict[str, object]] = None
+
+    def start(self) -> None:
+        if self._workers:
+            raise RuntimeError("source tiered load probe was already started")
+        for tier_index, label in enumerate(SOURCE_TIERED_LOAD_LABELS):
+            for tier_worker in range(self._threads_per_tier):
+                worker_id = tier_index * self._threads_per_tier + tier_worker
+                worker = threading.Thread(
+                    target=self._run_worker,
+                    args=(worker_id, label, self._work_units[tier_index]),
+                    name=f"source-tiered-{label}-{tier_worker}",
+                    daemon=True,
+                )
+                self._workers.append(worker)
+                worker.start()
+
+    def wait_for_min_samples(self, minimum: int, timeout_s: float) -> None:
+        deadline = time.monotonic() + timeout_s
+        with self._condition:
+            while True:
+                if self._errors:
+                    raise AssertionError(self._errors[0])
+                if (
+                    self._started_workers == self._thread_count
+                    and len(self._workers_with_samples) == self._thread_count
+                    and all(
+                        len(self._samples[label]) >= minimum
+                        for label in SOURCE_TIERED_LOAD_LABELS
+                    )
+                ):
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    counts = {
+                        label: len(self._samples[label])
+                        for label in SOURCE_TIERED_LOAD_LABELS
+                    }
+                    raise TimeoutError(
+                        "source tiered load did not reach its pre-drain sample "
+                        f"contract: started={self._started_workers}/"
+                        f"{self._thread_count} workers_with_samples="
+                        f"{len(self._workers_with_samples)}/"
+                        f"{self._thread_count} tier_samples={counts}"
+                    )
+                self._condition.wait(remaining)
+
+    def begin_drain(self) -> None:
+        self._drain_started.set()
+
+    def stop(self, *, expect_drain: bool, join_timeout_s: float = 30.0) -> Dict[str, object]:
+        with self._condition:
+            if self._report is not None:
+                return dict(self._report)
+        deadline = time.monotonic() + join_timeout_s
+        if expect_drain:
+            for worker in self._workers:
+                worker.join(max(0.0, deadline - time.monotonic()))
+        self._stop_event.set()
+        for worker in self._workers:
+            if worker.is_alive():
+                worker.join(max(0.0, deadline - time.monotonic()))
+        alive = [worker.name for worker in self._workers if worker.is_alive()]
+        with self._condition:
+            if alive:
+                self._errors.append(
+                    "source tiered load workers did not stop: "
+                    + ",".join(alive)
+                )
+            report: Dict[str, object] = {
+                "source_continuous_tiered_load": True,
+                "source_tiered_load_threads_per_tier": (
+                    self._threads_per_tier
+                ),
+                "source_tiered_load_thread_count": self._thread_count,
+                "source_tiered_load_started_workers": self._started_workers,
+                "source_tiered_load_workers_with_samples": len(
+                    self._workers_with_samples
+                ),
+                "source_tiered_load_completed_workers": self._completed_workers,
+                "source_tiered_load_natural_drain_stop_workers": (
+                    self._natural_drain_stop_workers
+                ),
+                "source_tiered_load_cutoff_4020_count": (
+                    self._cutoff_4020_count
+                ),
+                "source_tiered_load_disconnect_count": self._disconnect_count,
+                "source_tiered_load_error_count": len(self._errors),
+                "source_tiered_load_first_error": (
+                    self._errors[0] if self._errors else None
+                ),
+                "source_tiered_load_client_sleep_calls": 0,
+            }
+            for label, work_units in zip(
+                SOURCE_TIERED_LOAD_LABELS, self._work_units
+            ):
+                values = list(self._samples[label])
+                summary = _summarize_us_samples(values)
+                prefix = f"source_tiered_{label}"
+                report.update(
+                    {
+                        f"{prefix}_work_units": work_units,
+                        f"{prefix}_sample_count": int(
+                            summary["sample_count"] or 0
+                        ),
+                        f"{prefix}_min_us": min(values) if values else None,
+                        f"{prefix}_p50_us": summary["p50_us"],
+                        f"{prefix}_p95_us": summary["p95_us"],
+                        f"{prefix}_max_us": summary["max_us"],
+                    }
+                )
+            self._report = report
+            return dict(report)
+
+    def _run_worker(self, worker_id: int, label: str, work_units: int) -> None:
+        conn = None
+        try:
+            conn = self._runtime.connect(database=True, autocommit=True)
+            with self._condition:
+                self._started_workers += 1
+                self._condition.notify_all()
+            sql = f"CALL rtx_e2e_tiered_scan({work_units})"
+            while not self._stop_event.is_set():
+                started_ns = time.monotonic_ns()
+                try:
+                    self._runtime.execute_discarding_result(conn, sql)
+                except BaseException as exc:
+                    with self._condition:
+                        if (
+                            self._drain_started.is_set()
+                            and self._runtime.is_preserve_session_drained(exc)
+                        ):
+                            self._cutoff_4020_count += 1
+                            self._natural_drain_stop_workers += 1
+                        elif (
+                            self._drain_started.is_set()
+                            and self._runtime.is_connection_error(exc)
+                        ):
+                            self._disconnect_count += 1
+                            self._natural_drain_stop_workers += 1
+                        else:
+                            self._errors.append(
+                                f"{threading.current_thread().name}: {exc}"
+                            )
+                        self._condition.notify_all()
+                    return
+                elapsed_us = max(
+                    1, (time.monotonic_ns() - started_ns) // 1000
+                )
+                with self._condition:
+                    self._samples[label].append(int(elapsed_us))
+                    self._workers_with_samples.add(worker_id)
+                    self._condition.notify_all()
+        except BaseException as exc:
+            with self._condition:
+                self._errors.append(
+                    f"{threading.current_thread().name}: {exc}"
+                )
+                self._condition.notify_all()
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            with self._condition:
+                self._completed_workers += 1
+                self._condition.notify_all()
 
 
 class ReceiverReadLoadProbe:
@@ -4109,6 +4686,13 @@ class BusinessWorker(threading.Thread):
         self.expected_state = expected_state
         self.transactions_completed = 0
         self.statements_completed = 0
+        self.operation_counts: Counter = Counter()
+        self.duration_class_counts: Counter = Counter()
+        self.duration_class_total_us: Counter = Counter()
+        self.duration_class_max_us: Counter = Counter()
+        self.duration_class_min_us: Dict[str, int] = {}
+        self.drained_command_rejections = 0
+        self.unsupported_handoff_rejections = 0
 
     def run(self) -> None:
         conn = None
@@ -4140,7 +4724,11 @@ class BusinessWorker(threading.Thread):
             if (
                 self.stop_event.is_set()
                 and isinstance(exc, RuntimeError)
-                and str(exc) == "drain checkpoint was cancelled before resume"
+                and str(exc)
+                in {
+                    "drain checkpoint was cancelled before resume",
+                    "standby transfer drain completed",
+                }
             ):
                 LOG.debug(
                     "worker sid=%s stopped after transfer-only drain cleanup",
@@ -4159,7 +4747,10 @@ class BusinessWorker(threading.Thread):
                     pass
 
     def _configure_connection(self, conn) -> None:
-        if self.plan.config.lockset_batch_size <= 0:
+        if (
+            self.plan.config.lockset_batch_size <= 0
+            and not self.plan.config.mixed_pressure_workload
+        ):
             return
         self.runtime.execute(
             conn,
@@ -4174,35 +4765,115 @@ class BusinessWorker(threading.Thread):
             self.runtime.execute_discarding_result(conn, sql)
         conn.commit()
 
-    def _run_transaction(self, conn, tx_id: int):
-        large_bucket_mb = self.plan.large_cache_bucket_mb(self.sid, tx_id)
+    def _wait_for_resume_or_transfer_completion(self):
+        if (
+            self.plan.config.scenario
+            == "standby_transfer_receiver_drain_metrics"
+        ):
+            timeout_s = self.plan.resume_connection_wait_timeout_s()
+            if not self.stop_event.wait(timeout_s):
+                raise TimeoutError(
+                    "timed out waiting for standby transfer drain completion "
+                    f"for sid {self.sid}"
+                )
+            raise RuntimeError("standby transfer drain completed")
+        return self.coordinator.wait_for_resumed_connection(
+            self.sid, self.plan.resume_connection_wait_timeout_s()
+        )
+
+    def _consume_expected_drain_handoff_error(self, exc: BaseException) -> bool:
+        if self.runtime.is_preserve_session_drained(exc):
+            self.drained_command_rejections += 1
+            return True
+        if not self.plan.config.mixed_pressure_workload:
+            return False
+        is_drain_rejection = getattr(
+            self.runtime, "is_preserve_drain_rejection", None
+        )
+        if not callable(is_drain_rejection) or not is_drain_rejection(exc):
+            return False
+        generation = self.coordinator.current_drain_generation()
+        if generation <= 0 or not self.coordinator.drain_command_started(
+            generation
+        ):
+            return False
+        self.unsupported_handoff_rejections += 1
+        return True
+
+    def _record_statement_progress(self, conn, tx_id: int, stmt_index: int):
+        sql = f"SET @rtx_e2e_stmt_completed = {stmt_index}"
         while True:
             try:
-                self.runtime.execute(conn, "START TRANSACTION")
-                self.runtime.execute(conn, f"SET @rtx_e2e_sid = {self.sid}")
-                self.runtime.execute(conn, f"SET @rtx_e2e_tx = {tx_id}")
-                self.runtime.execute(
-                    conn,
-                    f"SET @rtx_e2e_large_bucket_mb = "
-                    f"{large_bucket_mb}",
-                )
-                self.runtime.execute(conn, "SET @rtx_e2e_stmt_completed = -1")
-                break
+                self.runtime.execute(conn, sql)
+                return conn
             except BaseException as exc:
+                if self._consume_expected_drain_handoff_error(exc):
+                    LOG.info(
+                        "worker sid=%s received drained-session response "
+                        "after tx=%s stmt=%s; waiting for local RESUME or "
+                        "transfer cleanup",
+                        self.sid,
+                        tx_id,
+                        stmt_index,
+                    )
+                    conn = self._wait_for_resume_or_transfer_completion()
+                    continue
                 if not self.runtime.is_connection_error(exc):
                     raise
                 LOG.info(
-                    "worker sid=%s waiting for resume while starting tx=%s",
+                    "worker sid=%s waiting for resume after tx=%s stmt=%s",
                     self.sid,
                     tx_id,
+                    stmt_index,
                 )
-                conn = self.coordinator.wait_for_resumed_connection(
-                    self.sid, self.plan.resume_connection_wait_timeout_s()
-                )
+                conn = self._wait_for_resume_or_transfer_completion()
+
+    def _run_transaction(self, conn, tx_id: int):
+        large_bucket_mb = self.plan.large_cache_bucket_mb(self.sid, tx_id)
+        transaction_setup_sql = (
+            "START TRANSACTION",
+            f"SET @rtx_e2e_sid = {self.sid}",
+            f"SET @rtx_e2e_tx = {tx_id}",
+            f"SET @rtx_e2e_large_bucket_mb = {large_bucket_mb}",
+            "SET @rtx_e2e_stmt_completed = -1",
+        )
+        for setup_sql in transaction_setup_sql:
+            while True:
+                try:
+                    self.runtime.execute(conn, setup_sql)
+                    break
+                except BaseException as exc:
+                    if self._consume_expected_drain_handoff_error(exc):
+                        LOG.info(
+                            "worker sid=%s received drained-session response "
+                            "while starting tx=%s; waiting for local RESUME or "
+                            "transfer cleanup",
+                            self.sid,
+                            tx_id,
+                        )
+                        conn = self._wait_for_resume_or_transfer_completion()
+                        continue
+                    if not self.runtime.is_connection_error(exc):
+                        raise
+                    LOG.info(
+                        "worker sid=%s waiting for resume while starting tx=%s",
+                        self.sid,
+                        tx_id,
+                    )
+                    conn = self._wait_for_resume_or_transfer_completion()
         self.coordinator.mark_in_transaction(self.sid, True)
         self.coordinator.mark_drainable_transaction(self.sid, False)
 
-        ops = self.plan.transaction_operations(self.sid, tx_id)
+        ops = (
+            None
+            if self.plan.config.mixed_pressure_workload
+            else self.plan.transaction_operations(self.sid, tx_id)
+        )
+        statement_count = (
+            self.plan.transaction_statement_count(self.sid)
+            if ops is None
+            else len(ops)
+        )
         tx_expected = None
         if (
             self.expected_state is not None
@@ -4214,13 +4885,18 @@ class BusinessWorker(threading.Thread):
         finish_after_resume = False
         rollback_after_resume = False
         shutdown_gap_replay_generation: Optional[int] = None
-        while stmt_index < len(ops):
-            op = ops[stmt_index]
+        while stmt_index < statement_count:
+            op = (
+                self.plan.mixed_pressure_operation(self.sid, tx_id, stmt_index)
+                if ops is None
+                else ops[stmt_index]
+            )
             try:
                 if shutdown_gap_replay_generation is not None:
                     self.coordinator.mark_shutdown_gap_replay_sent(
                         self.sid, shutdown_gap_replay_generation, op.sql
                     )
+                operation_started_ns = time.monotonic_ns()
                 try:
                     if op.discard_result:
                         self.runtime.execute_discarding_result(conn, op.sql)
@@ -4230,6 +4906,17 @@ class BusinessWorker(threading.Thread):
                             conn, op.sql, fetch=op.validator is not None
                         )
                 except BaseException as exc:
+                    if self._consume_expected_drain_handoff_error(exc):
+                        LOG.info(
+                            "worker sid=%s received drained-session response "
+                            "at tx=%s stmt=%s; waiting for local RESUME or "
+                            "transfer cleanup",
+                            self.sid,
+                            tx_id,
+                            stmt_index,
+                        )
+                        conn = self._wait_for_resume_or_transfer_completion()
+                        continue
                     if not self.runtime.is_connection_error(exc):
                         raise RuntimeError(
                             f"worker sid={self.sid} tx={tx_id} stmt={stmt_index} "
@@ -4248,8 +4935,27 @@ class BusinessWorker(threading.Thread):
                     shutdown_gap_replay_generation = None
                 if tx_expected is not None:
                     tx_expected.apply_statement(tx_id, stmt_index)
-                self.runtime.execute(
-                    conn, f"SET @rtx_e2e_stmt_completed = {stmt_index}"
+                operation_elapsed_us = max(
+                    1, (time.monotonic_ns() - operation_started_ns) // 1000
+                )
+                self.operation_counts[op.kind.value] += 1
+                self.duration_class_counts[op.duration_class] += 1
+                self.duration_class_total_us[op.duration_class] += int(
+                    operation_elapsed_us
+                )
+                self.duration_class_max_us[op.duration_class] = max(
+                    int(self.duration_class_max_us[op.duration_class]),
+                    int(operation_elapsed_us),
+                )
+                current_min = self.duration_class_min_us.get(
+                    op.duration_class
+                )
+                if current_min is None or operation_elapsed_us < current_min:
+                    self.duration_class_min_us[op.duration_class] = int(
+                        operation_elapsed_us
+                    )
+                conn = self._record_statement_progress(
+                    conn, tx_id, stmt_index
                 )
                 self.statements_completed += 1
                 stmt_index += 1
@@ -4302,9 +5008,7 @@ class BusinessWorker(threading.Thread):
                     )
                 )
                 LOG.info("worker sid=%s waiting for resume at tx=%s stmt=%s", self.sid, tx_id, stmt_index)
-                conn = self.coordinator.wait_for_resumed_connection(
-                    self.sid, self.plan.resume_connection_wait_timeout_s()
-                )
+                conn = self._wait_for_resume_or_transfer_completion()
                 if self.plan.finish_temp_transaction_after_resume():
                     finish_after_resume = True
                     rollback_after_resume = (
@@ -4333,16 +5037,15 @@ class BusinessWorker(threading.Thread):
                     )
                 return conn
             except BaseException as exc:
-                if (
-                    self.plan.config.scenario == "standby_transfer_receiver_drain_metrics"
-                    and self.runtime.is_preserve_session_drained(exc)
-                ):
+                if self._consume_expected_drain_handoff_error(exc):
                     LOG.info(
-                        "worker sid=%s transaction was handed off to standby-transfer DRAIN at commit",
+                        "worker sid=%s received drained-session response while "
+                        "committing tx=%s; waiting for local RESUME or transfer cleanup",
                         self.sid,
+                        tx_id,
                     )
-                    self.stop_event.set()
-                    return conn
+                    conn = self._wait_for_resume_or_transfer_completion()
+                    continue
                 if (
                     self.plan.config.scenario == "standby_transfer_receiver_drain_metrics"
                     and self.runtime.is_connection_error(exc)
@@ -4351,14 +5054,12 @@ class BusinessWorker(threading.Thread):
                         "worker sid=%s connection closed by standby-transfer DRAIN at commit",
                         self.sid,
                     )
-                    self.stop_event.set()
-                    return conn
+                    conn = self._wait_for_resume_or_transfer_completion()
+                    continue
                 if not self.runtime.is_connection_error(exc):
                     raise
                 LOG.info("worker sid=%s waiting for resume while committing tx=%s", self.sid, tx_id)
-                conn = self.coordinator.wait_for_resumed_connection(
-                    self.sid, self.plan.resume_connection_wait_timeout_s()
-                )
+                conn = self._wait_for_resume_or_transfer_completion()
 
     def _verify_temp_table_rollback(self, conn, tx_id: int) -> None:
         if not self.plan.config.temp_table_workload:
@@ -4567,6 +5268,32 @@ class BusinessWorker(threading.Thread):
     def _verify_committed_transaction(
         self, conn, tx_id: int, completed_stmt_count: Optional[int] = None
     ) -> None:
+        if self.plan.config.mixed_pressure_workload:
+            rows = self.runtime.execute(
+                conn,
+                "SELECT tx_size FROM rtx_e2e_tx_audit "
+                f"WHERE sid={self.sid} AND tx_id={tx_id}",
+                fetch=True,
+            )
+            expected_size = self.plan.transaction_statement_count(self.sid)
+            if rows != [(expected_size,)]:
+                raise AssertionError(
+                    "mixed transaction audit mismatch: "
+                    f"sid={self.sid} tx={tx_id} expected_size={expected_size} "
+                    f"actual={rows!r}"
+                )
+            rows = self.runtime.execute(
+                conn,
+                "SELECT call_count FROM rtx_e2e_proc_state "
+                f"WHERE sid={self.sid}",
+                fetch=True,
+            )
+            if len(rows) != 1 or int(rows[0][0]) <= 0:
+                raise AssertionError(
+                    "mixed stored procedure state was not committed: "
+                    f"sid={self.sid} tx={tx_id} actual={rows!r}"
+                )
+            return
         if self.plan.config.repeated_row_write_workload:
             table = self.plan.repeated_row_write_table(self.sid)
             rows = self.runtime.execute(
@@ -4696,7 +5423,11 @@ class BusinessE2ERunner:
         self.plan = WorkloadPlan(self.config)
         self.runtime = MySQLRuntime(self.config)
         self.coordinator = ResumeCoordinator(self.config.sessions)
-        self.expected_state = ExpectedDatabaseState(self.plan)
+        self.expected_state = (
+            None
+            if self.config.mixed_pressure_workload
+            else ExpectedDatabaseState(self.plan)
+        )
         self.stop_event = threading.Event()
         self.workers: List[BusinessWorker] = []
         self.server_processes: List[subprocess.Popen] = []
@@ -4708,6 +5439,8 @@ class BusinessE2ERunner:
         self.receiver_prewarm_metrics: Optional[ReceiverPrewarmMetrics] = None
         self.post_resume_temp_dml_executed = False
         self.shutdown_gap_replay_samples: List[Dict[str, object]] = []
+        self.resume_token_elapsed_samples_us: List[int] = []
+        self.mixed_resumed_survivor_details: List[Dict[str, int]] = []
 
     def run(self) -> None:
         if self.config.promotion_gate_epoch_id:
@@ -4740,12 +5473,14 @@ class BusinessE2ERunner:
             self.run_purge_readview_visibility()
             return
 
+        self.start_source_server_if_configured()
         self.preflight_disk_budgets()
         self.runtime.wait_until_up(self.config.startup_timeout_s)
         if self.config.setup_schema:
             self.setup_schema()
         if self.binlog_event_validation_enabled():
             self.reset_binary_logs_for_event_validation()
+        self.verify_mixed_pressure_binlog_contract(include_receiver=False)
         self.configure_preserve_globals()
         if (
             self.config.max_transactions_per_worker > 0
@@ -4872,6 +5607,7 @@ class BusinessE2ERunner:
             self.setup_schema()
         if self.config.receiver_physical_copy_before_drain:
             self.materialize_receiver_physical_copy_before_drain()
+        self.verify_mixed_pressure_binlog_contract(include_receiver=True)
         self.configure_standby_transfer_credentials()
         self.configure_preserve_globals()
         self.validate_standby_transfer_endpoint_config()
@@ -4884,6 +5620,10 @@ class BusinessE2ERunner:
         generation = 0
         completed_stmt_total = 0
         read_load_probe: Optional[ReceiverReadLoadProbe] = None
+        source_tiered_load_probe: Optional[
+            SourceContinuousTieredLoadProbe
+        ] = None
+        source_tiered_drain_started = False
         timeout_exclusion_probe_started = False
         try:
             if self.config.receiver_read_load_threads > 0:
@@ -4899,15 +5639,30 @@ class BusinessE2ERunner:
             self.start_workers()
             if self.config.business_run_before_drain_s > 0:
                 self._run_business_before_drain(cycle=1)
-                generation = self.coordinator.request_drain_checkpoint()
+                if not self.config.mixed_pressure_workload:
+                    generation = self.coordinator.request_drain_checkpoint()
             else:
                 generation = self.coordinator.request_drain_checkpoint()
                 self._wait_all_paused_for_drain_or_raise(
                     generation, self._drain_ready_timeout_s()
                 )
+            if self.config.source_continuous_tiered_load:
+                source_tiered_load_probe = SourceContinuousTieredLoadProbe(
+                    runtime=self.worker_runtime,
+                    threads_per_tier=(
+                        self.config.source_tiered_load_threads_per_tier
+                    ),
+                    work_units=self.config.source_tiered_load_work_units,
+                )
+                source_tiered_load_probe.start()
             if read_load_probe is not None:
                 read_load_probe.start_baseline()
                 time.sleep(self.config.receiver_read_load_baseline_s)
+            if source_tiered_load_probe is not None:
+                source_tiered_load_probe.wait_for_min_samples(
+                    self.config.source_tiered_load_min_samples_per_tier,
+                    timeout_s=min(60.0, self.config.resume_timeout_s),
+                )
             if self.config.standby_transfer_timeout_exclusion:
                 self.start_standby_transfer_timeout_exclusion_probe()
                 timeout_exclusion_probe_started = True
@@ -4915,6 +5670,9 @@ class BusinessE2ERunner:
             LOG.info(
                 "issuing standby-transfer DRAIN TRANSACTIONS PRESERVE for receiver metrics"
             )
+            if source_tiered_load_probe is not None:
+                source_tiered_load_probe.begin_drain()
+                source_tiered_drain_started = True
             if read_load_probe is not None:
                 read_load_probe.begin_transfer()
             try:
@@ -4944,6 +5702,15 @@ class BusinessE2ERunner:
                     "standby transfer DRAIN returned retryable unsupported" + suffix
                 )
             self.runtime.wait_until_down(self.config.shutdown_timeout_s)
+            if source_tiered_load_probe is not None:
+                self.source_tiered_load_report = (
+                    source_tiered_load_probe.stop(
+                        expect_drain=True,
+                        join_timeout_s=min(
+                            30.0, self.config.worker_join_timeout_s
+                        ),
+                    )
+                )
             if timeout_exclusion_probe_started:
                 self.stop_standby_transfer_timeout_exclusion_probe()
                 timeout_exclusion_probe_started = False
@@ -5005,6 +5772,15 @@ class BusinessE2ERunner:
                 completed_stmt_total=completed_stmt_total,
             )
         except BaseException as exc:
+            if source_tiered_load_probe is not None:
+                self.source_tiered_load_report = (
+                    source_tiered_load_probe.stop(
+                        expect_drain=source_tiered_drain_started,
+                        join_timeout_s=min(
+                            30.0, self.config.worker_join_timeout_s
+                        ),
+                    )
+                )
             if read_load_probe is not None:
                 self.receiver_read_load_report = read_load_probe.stop()
             self.write_standby_transfer_receiver_report(
@@ -5014,6 +5790,15 @@ class BusinessE2ERunner:
             )
             raise
         finally:
+            if source_tiered_load_probe is not None:
+                self.source_tiered_load_report = (
+                    source_tiered_load_probe.stop(
+                        expect_drain=source_tiered_drain_started,
+                        join_timeout_s=min(
+                            30.0, self.config.worker_join_timeout_s
+                        ),
+                    )
+                )
             if timeout_exclusion_probe_started:
                 try:
                     self.stop_standby_transfer_timeout_exclusion_probe()
@@ -5194,6 +5979,7 @@ class BusinessE2ERunner:
         state: Dict[str, object] = {
             "error": None,
             "reset_cancelled": False,
+            "reset_win_required": False,
             "finished_us": 0,
         }
 
@@ -5217,6 +6003,9 @@ class BusinessE2ERunner:
             except BaseException as exc:
                 if self.runtime.is_preserve_drain_reset(exc):
                     state["reset_cancelled"] = True
+                elif self.runtime.is_preserve_draining_rejection(exc):
+                    state["reset_cancelled"] = True
+                    state["reset_win_required"] = True
                 else:
                     state["error"] = exc
             finally:
@@ -5236,7 +6025,11 @@ class BusinessE2ERunner:
         return thread, state
 
     def _start_reset_thread(
-        self, *, label: str, connection: Optional[object] = None
+        self,
+        *,
+        label: str,
+        connection: Optional[object] = None,
+        wait_for_closing_control_commands_after: Optional[int] = None,
     ) -> Tuple[threading.Thread, Dict[str, object]]:
         state: Dict[str, object] = {
             "requested_us": 0,
@@ -5249,6 +6042,17 @@ class BusinessE2ERunner:
             try:
                 if conn is None:
                     conn = self._source_ha_control_connection()
+                if wait_for_closing_control_commands_after is not None:
+                    deadline = time.monotonic() + self.config.resume_timeout_s
+                    while self._read_status_int_on_connection(
+                        conn, "Preserve_trx_closing_control_connection_commands"
+                    ) <= wait_for_closing_control_commands_after:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(
+                                "WARMCOPY_CLOSING was not published before RESET"
+                            )
+                        time.sleep(min(0.001, remaining))
                 state["requested_us"] = time.monotonic_ns() // 1000
                 self.runtime.execute(conn, "RESET DRAIN")
                 state["response_us"] = time.monotonic_ns() // 1000
@@ -5281,7 +6085,11 @@ class BusinessE2ERunner:
             raise RuntimeError("RESET DRAIN failed") from error
 
     def _join_reset_cancelled_drain(
-        self, thread: threading.Thread, state: Dict[str, object]
+        self,
+        thread: threading.Thread,
+        state: Dict[str, object],
+        *,
+        reset_win_confirmed: bool,
     ) -> None:
         thread.join(self.config.resume_timeout_s)
         if thread.is_alive():
@@ -5293,6 +6101,21 @@ class BusinessE2ERunner:
             raise AssertionError(
                 "original DRAIN did not return ER_PRESERVE_TRX_DRAIN_RESET"
             )
+        if state.get("reset_win_required") and not reset_win_confirmed:
+            raise AssertionError(
+                "DRAIN returned 4013 without a confirmed RESET winner"
+            )
+
+    def _read_status_int_on_connection(self, conn: object, field: str) -> int:
+        rows = self.runtime.execute(
+            conn,
+            "SELECT VARIABLE_VALUE FROM performance_schema.global_status "
+            f"WHERE VARIABLE_NAME={quote_sql_string(field)}",
+            fetch=True,
+        )
+        if len(rows) != 1:
+            raise AssertionError(f"status variable is unavailable: {field}")
+        return int(rows[0][0])
 
     def _read_status_int(
         self,
@@ -5305,15 +6128,7 @@ class BusinessE2ERunner:
             if connection_factory is None:
                 connection_factory = lambda: self.runtime.connect(database=False)
             conn = connection_factory()
-            rows = self.runtime.execute(
-                conn,
-                "SELECT VARIABLE_VALUE FROM performance_schema.global_status "
-                f"WHERE VARIABLE_NAME={quote_sql_string(field)}",
-                fetch=True,
-            )
-            if len(rows) != 1:
-                raise AssertionError(f"status variable is unavailable: {field}")
-            return int(rows[0][0])
+            return self._read_status_int_on_connection(conn, field)
         finally:
             if conn is not None:
                 conn.close()
@@ -5456,9 +6271,6 @@ class BusinessE2ERunner:
                 coordinator=coordinator,
                 timeout_s=self.config.resume_timeout_s,
                 require_session_drained=deterministic_ack_window,
-                wait_for_closing_rejection=(
-                    not deterministic_ack_window and sid == 1
-                ),
             )
             for sid in range(1, self.config.sessions + 1)
         ]
@@ -5470,6 +6282,7 @@ class BusinessE2ERunner:
         reset_control_conn = None
         phase2_released = False
         final_ack_released = False
+        reset_win_confirmed = False
         active_before = self._read_status_int(
             "Preserve_trx_transfer_receiver_active_epochs",
             connection_factory=self._receiver_admin_connection,
@@ -5510,6 +6323,12 @@ class BusinessE2ERunner:
             wins_before = self._read_status_int(
                 "Preserve_trx_reset_drain_wins"
             )
+            closing_control_commands_before = 0
+            if not deterministic_ack_window:
+                closing_control_commands_before = self._read_status_int_on_connection(
+                    reset_control_conn,
+                    "Preserve_trx_closing_control_connection_commands",
+                )
             debug_actions = []
             if deterministic_ack_window:
                 debug_actions = [
@@ -5522,6 +6341,15 @@ class BusinessE2ERunner:
                 ]
             if read_load_probe is not None:
                 read_load_probe.begin_transfer()
+            if not deterministic_ack_window:
+                reset_thread, reset_state = self._start_reset_thread(
+                    label="phase2",
+                    connection=reset_control_conn,
+                    wait_for_closing_control_commands_after=(
+                        closing_control_commands_before
+                    ),
+                )
+                reset_control_conn = None
             drain_thread, drain_state = self._start_reset_aware_drain_thread(
                 label="phase2", debug_actions=debug_actions
             )
@@ -5573,6 +6401,7 @@ class BusinessE2ERunner:
                     timeout_s=self.config.resume_timeout_s,
                     connection_factory=self._source_ha_control_connection,
                 )
+                reset_win_confirmed = True
                 self._debug_sync_now(
                     "now SIGNAL reset_final_ack_release",
                     connection=debug_control_conn,
@@ -5580,29 +6409,16 @@ class BusinessE2ERunner:
                 final_ack_released = True
                 self._join_reset_thread(reset_thread, reset_state)
             else:
-                coordinator.allow_drain_probe()
-                if not coordinator.wait_all_probes_started(
-                    self.config.resume_timeout_s
-                ):
-                    self._raise_reset_worker_error_if_any(coordinator)
-                    raise TimeoutError(
-                        "not every original connection entered its phase2 probe"
-                    )
-                if not coordinator.wait_any_closing_rejection(
-                    self.config.resume_timeout_s
-                ):
-                    self._raise_reset_worker_error_if_any(coordinator)
-                    raise TimeoutError(
-                        "the original transaction sentinel did not observe "
-                        "error 4020"
-                    )
-                reset_thread, reset_state = self._start_reset_thread(
-                    label="phase2", connection=reset_control_conn
-                )
-                reset_control_conn = None
                 self._join_reset_thread(reset_thread, reset_state)
-                phase2_trigger = "WARMCOPY_CLOSING_REJECTION"
-                phase2_observer_rejected = True
+                self._wait_status_at_least(
+                    "Preserve_trx_reset_drain_wins",
+                    wins_before + 1,
+                    timeout_s=min(self.config.resume_timeout_s, 5.0),
+                    connection_factory=self._source_ha_control_connection,
+                )
+                reset_win_confirmed = True
+                phase2_trigger = "WARMCOPY_CLOSING_STATUS"
+                phase2_observer_rejected = False
             response_us = int(reset_state["response_us"])
             coordinator.allow_replay_after_reset(response_us)
             if not coordinator.wait_all_replayed(
@@ -5629,7 +6445,11 @@ class BusinessE2ERunner:
                     raise RuntimeError(
                         f"RESET worker sid={worker.sid} failed"
                     ) from worker.error
-            self._join_reset_cancelled_drain(drain_thread, drain_state)
+            self._join_reset_cancelled_drain(
+                drain_thread,
+                drain_state,
+                reset_win_confirmed=reset_win_confirmed,
+            )
 
             probe = self.runtime.connect(database=False)
             probe.close()
@@ -5658,9 +6478,7 @@ class BusinessE2ERunner:
                 "first_original_connection_replay_us": min(replay_timestamps),
                 "all_original_connections_replayed_us": max(replay_timestamps),
                 "drained_session_count": coordinator.drained_count(),
-                "draining_rejected_session_count": (
-                    coordinator.draining_rejected_count()
-                ),
+                "draining_rejected_session_count": 0,
                 "replayed_session_count": coordinator.replayed_count(),
                 "phase2_trigger": phase2_trigger,
                 "phase2_observer_rejected": phase2_observer_rejected,
@@ -6769,6 +7587,7 @@ class BusinessE2ERunner:
             "success": status == "success",
             "scenario": "standby_transfer_receiver_drain_metrics",
             **_evidence_contract(EVIDENCE_KIND_STANDALONE_TRANSFER_E2E),
+            **self.mixed_pressure_report_fields(),
             "receiver_readiness_contract": (
                 "COMMITTED_NOT_READY"
                 if self.config.standalone_transfer_accept_committed_not_ready
@@ -6880,6 +7699,24 @@ class BusinessE2ERunner:
             ),
             "source_phase2_target_worker_wall_us_samples": source_metric_samples(
                 "phase2_target_worker_wall_us"
+            ),
+            "source_early_staged_tokens_samples": source_metric_samples(
+                "early_staged_tokens"
+            ),
+            "source_command_boundary_to_enqueue_us_max_samples": (
+                source_metric_samples("command_boundary_to_enqueue_us_max")
+            ),
+            "source_final_fast_scan_us_samples": source_metric_samples(
+                "final_fast_scan_us"
+            ),
+            "source_final_dirty_tokens_samples": source_metric_samples(
+                "final_dirty_tokens"
+            ),
+            "source_final_replacement_tokens_samples": source_metric_samples(
+                "final_replacement_tokens"
+            ),
+            "source_final_validation_rejects_samples": source_metric_samples(
+                "final_validation_rejects"
             ),
             "source_phase2_target_result_collect_us_samples": source_metric_samples(
                 "phase2_target_result_collect_us"
@@ -7256,6 +8093,11 @@ class BusinessE2ERunner:
         )
         if receiver_read_load_report is not None:
             report.update(receiver_read_load_report)
+        source_tiered_load_report = getattr(
+            self, "source_tiered_load_report", None
+        )
+        if source_tiered_load_report is not None:
+            report.update(source_tiered_load_report)
         if error:
             report["error"] = error
         report_path.write_text(
@@ -7838,6 +8680,10 @@ class BusinessE2ERunner:
             cur.execute(f"USE `{self.config.database}`")
             for table in self.plan.table_names():
                 cur.execute(self.plan.create_table_sql(table))
+            if self.config.source_continuous_tiered_load:
+                cur.execute(
+                    self.plan.continuous_tiered_load_procedure_sql()
+                )
             if self.config.scenario == "standby_transfer_reset_drain":
                 cur.execute(
                     """
@@ -7862,6 +8708,11 @@ BEGIN
 END
 """.strip()
                 )
+            if self.config.mixed_pressure_workload:
+                self._setup_mixed_pressure_schema(cur)
+                conn.commit()
+                cur.close()
+                return
             if self.plan.uses_compact_bulk_expected_state():
                 self._setup_schema_with_server_side_seed(cur)
                 conn.commit()
@@ -7904,6 +8755,62 @@ END
             cur.close()
         finally:
             conn.close()
+
+    def _setup_mixed_pressure_schema(self, cur) -> None:
+        cur.execute(
+            "CREATE TABLE rtx_e2e_seed_digit("
+            "d INT NOT NULL PRIMARY KEY) ENGINE=MEMORY"
+        )
+        cur.executemany(
+            "INSERT INTO rtx_e2e_seed_digit(d) VALUES (%s)",
+            [(value,) for value in range(10)],
+        )
+        digit_count = max(
+            1,
+            len(str(self.config.mixed_seed_rows_per_table - 1)),
+        )
+        aliases = [f"d{index}" for index in range(digit_count)]
+        number_expr = " + ".join(
+            f"{alias}.d * {10 ** index}"
+            for index, alias in enumerate(aliases)
+        )
+        from_clause = " CROSS JOIN ".join(
+            f"rtx_e2e_seed_digit {alias}" for alias in aliases
+        )
+        cur.execute(
+            "CREATE TABLE rtx_e2e_seed_seq("
+            "n INT NOT NULL PRIMARY KEY) ENGINE=InnoDB"
+        )
+        cur.execute(
+            "INSERT INTO rtx_e2e_seed_seq(n) "
+            f"SELECT {number_expr} FROM {from_clause} "
+            f"WHERE {number_expr} < {self.config.mixed_seed_rows_per_table} "
+            f"ORDER BY {number_expr}"
+        )
+        cur.execute(
+            "CREATE TABLE rtx_e2e_tx_audit("
+            "sid INT NOT NULL, tx_id INT NOT NULL, tx_size INT NOT NULL, "
+            "first_seen TIMESTAMP(6) NOT NULL, "
+            "PRIMARY KEY(sid,tx_id), KEY idx_tx_size(tx_size)) ENGINE=InnoDB"
+        )
+        cur.execute(
+            "CREATE TABLE rtx_e2e_proc_state("
+            "sid INT NOT NULL PRIMARY KEY, call_count BIGINT NOT NULL DEFAULT 0, "
+            "last_tx_id INT NOT NULL DEFAULT 0, "
+            "last_stmt_no INT NOT NULL DEFAULT -1, "
+            "last_scan_checksum BIGINT NOT NULL DEFAULT 0, "
+            "last_changed TIMESTAMP(6) NULL) ENGINE=InnoDB"
+        )
+        cur.execute(
+            "INSERT INTO rtx_e2e_proc_state(sid) "
+            "SELECT n + 1 FROM rtx_e2e_seed_seq "
+            f"WHERE n < {self.config.sessions} ORDER BY n"
+        )
+        cur.execute(self.plan.mixed_pressure_procedure_sql())
+        for table in self.plan.table_names():
+            cur.execute(self.plan.mixed_pressure_seed_sql(table))
+        cur.execute("DROP TABLE rtx_e2e_seed_seq")
+        cur.execute("DROP TABLE rtx_e2e_seed_digit")
 
     def _setup_schema_with_server_side_seed(self, cur) -> None:
         cur.execute(
@@ -7989,6 +8896,21 @@ END
                 f"SET GLOBAL preserve_trx_max_scan_pages={self.config.preserve_max_scan_pages}",
                 f"SET GLOBAL preserve_trx_materialize_timeout_ms={self.config.preserve_materialize_timeout_ms}",
             ]
+            if self.config.mixed_pressure_workload:
+                mixed_global_budget = max(
+                    2 * 1024**3,
+                    self.config.preserve_max_binlog_cache_bytes * 2,
+                )
+                commands.extend(
+                    [
+                        "SET GLOBAL preserve_trx_memory_budget_bytes="
+                        f"{mixed_global_budget}",
+                        "SET GLOBAL preserve_trx_memory_per_token_bytes="
+                        f"{self.config.preserve_max_binlog_cache_bytes}",
+                        "SET GLOBAL preserve_trx_warmcopy_max_total_bytes="
+                        f"{mixed_global_budget}",
+                    ]
+                )
             if self.config.preserve_parallel_preserve_threads > 0:
                 commands.append(
                     "SET GLOBAL preserve_trx_parallel_preserve_threads="
@@ -8067,6 +8989,53 @@ END
                 self.runtime.execute(conn, sql)
         finally:
             conn.close()
+
+    def verify_mixed_pressure_binlog_contract(
+        self, *, include_receiver: bool
+    ) -> None:
+        if not self.config.mixed_pressure_workload:
+            return
+
+        def read_contract(conn, role: str) -> Tuple[bool, str]:
+            rows = self.runtime.execute(
+                conn,
+                "SELECT @@GLOBAL.log_bin,@@GLOBAL.binlog_format",
+                fetch=True,
+            )
+            if len(rows) != 1:
+                raise AssertionError(
+                    f"{role} binlog contract query returned {len(rows)} rows"
+                )
+            enabled = bool(int(rows[0][0]))
+            binlog_format = str(rows[0][1]).upper()
+            if not enabled or binlog_format != "ROW":
+                raise AssertionError(
+                    f"{role} must run mixed pressure with ROW binlog enabled: "
+                    f"log_bin={int(enabled)} format={binlog_format}"
+                )
+            return enabled, binlog_format
+
+        source_conn = self.runtime.connect(database=False)
+        try:
+            (
+                self.mixed_source_log_bin_enabled,
+                self.mixed_source_binlog_format,
+            ) = read_contract(source_conn, "source")
+        finally:
+            source_conn.close()
+
+        if not include_receiver:
+            self.mixed_receiver_log_bin_enabled = None
+            self.mixed_receiver_binlog_format = None
+            return
+        receiver_conn = self._receiver_admin_connection()
+        try:
+            (
+                self.mixed_receiver_log_bin_enabled,
+                self.mixed_receiver_binlog_format,
+            ) = read_contract(receiver_conn, "receiver")
+        finally:
+            receiver_conn.close()
 
     def _receiver_admin_connection(self):
         return self.runtime.connect_endpoint(
@@ -8532,6 +9501,36 @@ END
                 )
             time.sleep(min(0.05, remaining))
 
+    def _add_mixed_pressure_fresh_restart_connections(
+        self, resumed_connections: Dict[int, object]
+    ) -> int:
+        if (
+            not self.config.mixed_pressure_workload
+            or self.config.strict_token_count
+        ):
+            return 0
+        missing_sids = sorted(
+            set(range(1, self.config.sessions + 1)) - set(resumed_connections)
+        )
+        added: Dict[int, object] = {}
+        try:
+            for sid in missing_sids:
+                conn = self.runtime.connect(database=True, autocommit=False)
+                self.runtime.execute(
+                    conn,
+                    "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                )
+                added[sid] = conn
+        except BaseException:
+            for conn in added.values():
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            raise
+        resumed_connections.update(added)
+        return len(added)
+
     def drain_restart_resume(self, cycle: int) -> None:
         if not hasattr(self, "phase2_pause_samples"):
             self.phase2_pause_samples = []
@@ -8594,6 +9593,7 @@ END
                         LOG.warning("DRAIN thread cleanup after failure did not finish: %s", join_exc)
                     raise
             else:
+                self.coordinator.mark_drain_command_started(generation)
                 drain_will_restart = self._execute_drain_preserve()
                 if drain_will_restart is False:
                     self.coordinator.cancel_drain_checkpoint(generation)
@@ -8692,6 +9692,30 @@ END
                 resumed_large_buckets[sid] = bucket_mb
                 resumed_tx_ids[sid] = tx_id
                 resumed_completed_stmt[sid] = completed_stmt_no
+                if self.config.mixed_pressure_workload:
+                    work_units, _ = self.plan.mixed_pressure_procedure_work(
+                        sid
+                    )
+                    procedure_proof = (
+                        self._mixed_resumed_stored_procedure_proof(
+                            conn, sid=sid, tx_id=tx_id
+                        )
+                    )
+                    self.mixed_resumed_survivor_details.append(
+                        {
+                            "sid": sid,
+                            "tx_id": tx_id,
+                            "transaction_size": (
+                                self.plan.transaction_statement_count(sid)
+                            ),
+                            "completed_stmt_no": completed_stmt_no,
+                            "stored_procedure_work_units": work_units,
+                            "sql_resume_elapsed_us": int(
+                                self.resume_token_elapsed_samples_us[-1]
+                            ),
+                            **procedure_proof,
+                        }
+                    )
                 if self.config.shutdown_gap_replay_probe and sid == 1:
                     self.coordinator.mark_shutdown_gap_resume_succeeded(
                         sid=sid,
@@ -8714,6 +9738,15 @@ END
                     raise AssertionError(
                         f"resumed sid mapping mismatch: missing={missing[:10]} extra={extra[:10]}"
                     )
+            if self.config.mixed_pressure_workload:
+                self.mixed_preserved_survivor_count = len(
+                    resumed_connections
+                )
+                self.mixed_restart_fresh_connection_count = (
+                    self._add_mixed_pressure_fresh_restart_connections(
+                        resumed_connections
+                    )
+                )
             if self.config.temp_table_workload:
                 try:
                     for sid, conn in sorted(resumed_connections.items()):
@@ -8968,8 +10001,230 @@ END
             self._raise_worker_error_if_any()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return
+                break
             time.sleep(min(1.0, remaining))
+        if not self.config.mixed_pressure_workload:
+            return
+
+        readiness_deadline = time.monotonic() + self._drain_ready_timeout_s()
+        while True:
+            self._raise_worker_error_if_any()
+            snapshot = self.mixed_pressure_readiness_snapshot()
+            failures = self._mixed_pressure_readiness_failures(snapshot)
+            if not failures:
+                LOG.info(
+                    "mixed workload ready before DRAIN: started=%s statements=%s "
+                    "operations=%s durations=%s",
+                    snapshot["started_sessions"],
+                    snapshot["completed_statements"],
+                    snapshot["operation_counts"],
+                    snapshot["duration_class_counts"],
+                )
+                self.mixed_pressure_pre_drain_snapshot = snapshot
+                return
+            remaining = readiness_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "mixed workload did not become ready before DRAIN: "
+                    + "; ".join(failures)
+                    + f" snapshot={snapshot}"
+                )
+            time.sleep(min(0.2, remaining))
+
+    def mixed_pressure_readiness_snapshot(self) -> Dict[str, object]:
+        operation_counts: Counter = Counter()
+        duration_class_counts: Counter = Counter()
+        completed_statements = 0
+        started_sessions = 0
+        per_session_statements: List[int] = []
+        for worker in getattr(self, "workers", []):
+            statements = int(getattr(worker, "statements_completed", 0))
+            per_session_statements.append(statements)
+            completed_statements += statements
+            if statements > 0:
+                started_sessions += 1
+            operation_counts.update(getattr(worker, "operation_counts", {}))
+            duration_class_counts.update(
+                getattr(worker, "duration_class_counts", {})
+            )
+        return {
+            "started_sessions": started_sessions,
+            "completed_statements": completed_statements,
+            "minimum_completed_statements_per_session": (
+                min(per_session_statements) if per_session_statements else 0
+            ),
+            "maximum_completed_statements_per_session": (
+                max(per_session_statements) if per_session_statements else 0
+            ),
+            "operation_counts": dict(sorted(operation_counts.items())),
+            "duration_class_counts": dict(
+                sorted(duration_class_counts.items())
+            ),
+        }
+
+    def _mixed_pressure_readiness_failures(
+        self, snapshot: Dict[str, object]
+    ) -> List[str]:
+        failures: List[str] = []
+        started = int(snapshot["started_sessions"])
+        completed = int(snapshot["completed_statements"])
+        operations = dict(snapshot["operation_counts"])
+        durations = dict(snapshot["duration_class_counts"])
+        if started < self.config.mixed_min_started_sessions:
+            failures.append(
+                f"started_sessions={started} required="
+                f"{self.config.mixed_min_started_sessions}"
+            )
+        if completed < self.config.mixed_min_completed_statements:
+            failures.append(
+                f"completed_statements={completed} required="
+                f"{self.config.mixed_min_completed_statements}"
+            )
+        required_per_session = max(
+            1,
+            math.ceil(
+                self.config.mixed_min_completed_statements
+                / self.config.mixed_min_started_sessions
+            ),
+        )
+        minimum_per_session = int(
+            snapshot.get("minimum_completed_statements_per_session", 0)
+        )
+        if minimum_per_session < required_per_session:
+            failures.append(
+                "minimum_completed_statements_per_session="
+                f"{minimum_per_session} required={required_per_session}"
+            )
+        dml_count = sum(
+            int(operations.get(kind.value, 0))
+            for kind in (
+                OperationKind.INSERT,
+                OperationKind.UPDATE,
+                OperationKind.DELETE,
+                OperationKind.REPLACE,
+                OperationKind.UPSERT,
+                OperationKind.INSERT_SELECT,
+                OperationKind.MULTI_TABLE_UPDATE,
+                OperationKind.JSON_UPDATE,
+                OperationKind.TYPED_UPDATE,
+                OperationKind.RANGE_UPDATE,
+            )
+        )
+        query_count = sum(
+            int(operations.get(kind.value, 0))
+            for kind in (
+                OperationKind.SELECT,
+                OperationKind.LOCKING_SELECT,
+                OperationKind.JOIN_SELECT,
+            )
+        )
+        if dml_count <= 0:
+            failures.append("no DML completed")
+        if query_count <= 0:
+            failures.append("no query completed")
+        for kind in MIXED_PRESSURE_REQUIRED_OPERATION_KINDS:
+            if int(operations.get(kind.value, 0)) <= 0:
+                failures.append(f"no {kind.value} operation completed")
+        for duration_class in MIXED_PRESSURE_REQUIRED_DURATION_CLASSES:
+            if int(durations.get(duration_class, 0)) <= 0:
+                failures.append(f"no {duration_class} SQL completed")
+        return failures
+
+    def mixed_pressure_report_fields(self) -> Dict[str, object]:
+        if not self.config.mixed_pressure_workload:
+            return {"mixed_pressure_workload": False}
+        snapshot = self.mixed_pressure_readiness_snapshot()
+        total_us: Counter = Counter()
+        max_us: Counter = Counter()
+        min_us: Dict[str, int] = {}
+        for worker in getattr(self, "workers", []):
+            total_us.update(getattr(worker, "duration_class_total_us", {}))
+            for name, value in getattr(
+                worker, "duration_class_max_us", {}
+            ).items():
+                max_us[name] = max(int(max_us[name]), int(value))
+            for name, value in getattr(
+                worker, "duration_class_min_us", {}
+            ).items():
+                if name not in min_us or int(value) < min_us[name]:
+                    min_us[name] = int(value)
+        row_counts = dict(
+            getattr(self, "mixed_pressure_final_row_counts", {})
+        )
+        return {
+            "mixed_pressure_workload": True,
+            "mixed_seed_rows_per_table": (
+                self.config.mixed_seed_rows_per_table
+            ),
+            "mixed_total_seed_rows": (
+                self.config.table_count
+                * self.config.mixed_seed_rows_per_table
+            ),
+            "mixed_transaction_sizes": list(
+                self.config.mixed_transaction_sizes
+            ),
+            "mixed_transaction_weights": list(
+                self.config.mixed_transaction_weights
+            ),
+            "mixed_transaction_class_connection_counts": (
+                self.plan.mixed_pressure_transaction_class_counts()
+            ),
+            "mixed_business_warmup_s": self.config.business_run_before_drain_s,
+            "mixed_drain_trigger_mode": "independent_control_connection",
+            "mixed_harness_checkpoint_before_drain": False,
+            "mixed_source_log_bin_enabled": getattr(
+                self, "mixed_source_log_bin_enabled", None
+            ),
+            "mixed_source_binlog_format": getattr(
+                self, "mixed_source_binlog_format", None
+            ),
+            "mixed_receiver_log_bin_enabled": getattr(
+                self, "mixed_receiver_log_bin_enabled", None
+            ),
+            "mixed_receiver_binlog_format": getattr(
+                self, "mixed_receiver_binlog_format", None
+            ),
+            "mixed_min_started_sessions": (
+                self.config.mixed_min_started_sessions
+            ),
+            "mixed_min_completed_statements": (
+                self.config.mixed_min_completed_statements
+            ),
+            "mixed_pre_drain_readiness": dict(
+                getattr(self, "mixed_pressure_pre_drain_snapshot", {})
+            ),
+            "mixed_final_workload_snapshot": snapshot,
+            "mixed_duration_class_total_us": dict(sorted(total_us.items())),
+            "mixed_duration_class_min_us": dict(sorted(min_us.items())),
+            "mixed_duration_class_max_us": dict(sorted(max_us.items())),
+            "mixed_drained_command_rejections": sum(
+                int(getattr(worker, "drained_command_rejections", 0))
+                for worker in getattr(self, "workers", [])
+            ),
+            "mixed_unsupported_handoff_rejections": sum(
+                int(getattr(worker, "unsupported_handoff_rejections", 0))
+                for worker in getattr(self, "workers", [])
+            ),
+            "mixed_preserved_survivor_count": int(
+                getattr(self, "mixed_preserved_survivor_count", 0)
+            ),
+            "mixed_restart_fresh_connection_count": int(
+                getattr(self, "mixed_restart_fresh_connection_count", 0)
+            ),
+            "mixed_resumed_survivor_details": list(
+                getattr(self, "mixed_resumed_survivor_details", [])
+            ),
+            "mixed_final_table_row_count_min": (
+                min(row_counts.values()) if row_counts else None
+            ),
+            "mixed_final_table_row_count_max": (
+                max(row_counts.values()) if row_counts else None
+            ),
+            "sql_resume_latency": _summarize_us_samples(
+                getattr(self, "resume_token_elapsed_samples_us", [])
+            ),
+            "max_sql_resume_ms": self.config.max_sql_resume_ms,
+        }
 
     def purge_old_binary_logs_after_resume(self) -> None:
         conn = self.runtime.connect(database=False)
@@ -9177,6 +10432,14 @@ END
             phase2_target_worker_wall_us=int_metric(
                 "phase2_target_worker_wall_us"
             ),
+            early_staged_tokens=int_metric("early_staged_tokens"),
+            command_boundary_to_enqueue_us_max=int_metric(
+                "command_boundary_to_enqueue_us_max"
+            ),
+            final_fast_scan_us=int_metric("final_fast_scan_us"),
+            final_dirty_tokens=int_metric("final_dirty_tokens"),
+            final_replacement_tokens=int_metric("final_replacement_tokens"),
+            final_validation_rejects=int_metric("final_validation_rejects"),
             phase2_target_result_collect_us=int_metric(
                 "phase2_target_result_collect_us"
             ),
@@ -10115,7 +11378,11 @@ END
                         "standby transfer timeout exclusion probe was not started"
                     )
                 self.validate_standby_transfer_drain_result(
-                    expected_survivor_count=self.config.sessions,
+                    expected_survivor_count=(
+                        self.config.sessions
+                        if self.config.strict_token_count
+                        else None
+                    ),
                     expected_excluded_connection_id=(
                         int(excluded_connection_id)
                         if self.config.standby_transfer_timeout_exclusion
@@ -10177,7 +11444,7 @@ END
     def validate_standby_transfer_drain_result(
         self,
         *,
-        expected_survivor_count: int,
+        expected_survivor_count: Optional[int],
         expected_excluded_connection_id: Optional[int] = None,
     ) -> None:
         rows = list(getattr(self, "drain_result_rows", []))
@@ -10199,7 +11466,14 @@ END
 
         survivors = [row for row in rows if row["token_role"] == "SURVIVOR"]
         excluded = [row for row in rows if row["token_role"] == "EXCLUDED"]
-        if len(survivors) != expected_survivor_count:
+        if expected_survivor_count is None and not survivors:
+            raise AssertionError(
+                "standby transfer DRAIN did not preserve any active transaction"
+            )
+        if (
+            expected_survivor_count is not None
+            and len(survivors) != expected_survivor_count
+        ):
             raise AssertionError(
                 "standby transfer DRAIN survivor count mismatch: "
                 f"expected={expected_survivor_count} actual={len(survivors)}"
@@ -10211,6 +11485,8 @@ END
             )
         if any(row["reason"] != "NONE" for row in survivors):
             raise AssertionError("standby transfer survivor carried an error reason")
+        if self.config.mixed_pressure_workload:
+            self.mixed_preserved_survivor_count = len(survivors)
 
         if expected_excluded_connection_id is None:
             expected_outcome = "SUCCESS"
@@ -10367,10 +11643,38 @@ END
         finally:
             conn.close()
 
+    def _mixed_resumed_stored_procedure_proof(
+        self, conn, *, sid: int, tx_id: int
+    ) -> Dict[str, object]:
+        rows = self.runtime.execute(
+            conn,
+            "SELECT last_tx_id,last_stmt_no FROM "
+            f"rtx_e2e_proc_state WHERE sid={sid}",
+            fetch=True,
+        )
+        if len(rows) != 1:
+            raise AssertionError(
+                f"mixed resumed sid {sid} has no procedure state row"
+            )
+        last_tx_id = int(rows[0][0] or 0)
+        last_stmt_no = int(rows[0][1] if rows[0][1] is not None else -1)
+        return {
+            "stored_procedure_completed": (
+                last_tx_id == tx_id and last_stmt_no == 8
+            ),
+            "stored_procedure_last_tx_id": last_tx_id,
+            "stored_procedure_last_stmt_no": last_stmt_no,
+        }
+
     def resume_token(self, token: str) -> Tuple[int, object, int, int, int]:
         conn = self.runtime.connect(database=True, autocommit=False)
         quoted = quote_sql_string(token)
+        started_ns = time.monotonic_ns()
         self.runtime.execute(conn, f"RESUME PRESERVED TRANSACTION {quoted}")
+        elapsed_us = max(1, (time.monotonic_ns() - started_ns) // 1000)
+        if not hasattr(self, "resume_token_elapsed_samples_us"):
+            self.resume_token_elapsed_samples_us = []
+        self.resume_token_elapsed_samples_us.append(int(elapsed_us))
         rows = self.runtime.execute(
             conn,
             "SELECT @rtx_e2e_sid, @rtx_e2e_tx, @rtx_e2e_large_bucket_mb, "
@@ -10770,6 +12074,22 @@ END
         completed = [worker.transactions_completed for worker in self.workers]
         if min(completed) < 1:
             raise AssertionError(f"each worker must complete at least one transaction: {completed[:10]}")
+        if self.config.mixed_pressure_workload:
+            self._validate_mixed_pressure_final_state()
+            self.write_report_json_if_requested(
+                completed_tx_min=min(completed),
+                completed_stmt_total=sum(
+                    worker.statements_completed for worker in self.workers
+                ),
+            )
+            LOG.info(
+                "mixed-pressure E2E finished: workers=%s completed_tx_min=%s "
+                "completed_stmt_total=%s",
+                self.config.sessions,
+                min(completed),
+                sum(worker.statements_completed for worker in self.workers),
+            )
+            return
         if (
             self.config.shutdown_gap_replay_probe
             and len(self.shutdown_gap_replay_samples) != self.config.cycles
@@ -10857,6 +12177,86 @@ END
             sum(worker.statements_completed for worker in self.workers),
         )
 
+    def _validate_mixed_pressure_final_state(self) -> None:
+        conn = self.runtime.connect(database=True)
+        try:
+            rows = self.runtime.execute(
+                conn,
+                "SELECT COUNT(DISTINCT sid),COUNT(*) "
+                "FROM rtx_e2e_tx_audit",
+                fetch=True,
+            )
+            if not rows or int(rows[0][0]) != self.config.sessions:
+                raise AssertionError(
+                    "mixed transaction audit does not cover every session: "
+                    f"actual={rows!r} required={self.config.sessions}"
+                )
+            rows = self.runtime.execute(
+                conn,
+                "SELECT COUNT(*),COALESCE(MIN(call_count),0) "
+                "FROM rtx_e2e_proc_state",
+                fetch=True,
+            )
+            if (
+                not rows
+                or int(rows[0][0]) != self.config.sessions
+                or int(rows[0][1]) <= 0
+            ):
+                raise AssertionError(
+                    "mixed stored-procedure state is incomplete: "
+                    f"actual={rows!r} required_sessions={self.config.sessions}"
+                )
+            row_counts: Dict[str, int] = {}
+            for table in self.plan.table_names():
+                rows = self.runtime.execute(
+                    conn, f"SELECT COUNT(*) FROM `{table}`", fetch=True
+                )
+                count = int(rows[0][0]) if rows else 0
+                row_counts[table] = count
+                if count < self.config.mixed_seed_rows_per_table:
+                    raise AssertionError(
+                        "mixed business table lost seed rows: "
+                        f"table={table} rows={count} required_at_least="
+                        f"{self.config.mixed_seed_rows_per_table}"
+                    )
+            self.mixed_pressure_final_row_counts = row_counts
+            rows = self.runtime.execute(
+                conn,
+                "SELECT COUNT(*) FROM performance_schema.preserved_transactions",
+                fetch=True,
+            )
+            if rows and int(rows[0][0]) != 0:
+                raise AssertionError(
+                    "preserved transaction records remain after mixed E2E: "
+                    f"{rows[0][0]}"
+                )
+        finally:
+            conn.close()
+
+        resume_samples = list(
+            getattr(self, "resume_token_elapsed_samples_us", [])
+        )
+        survivor_count = int(
+            getattr(self, "mixed_preserved_survivor_count", 0)
+        )
+        if len(resume_samples) != survivor_count:
+            raise AssertionError(
+                "mixed local E2E did not measure one SQL RESUME per survivor: "
+                f"samples={len(resume_samples)} survivors={survivor_count}"
+            )
+        if not resume_samples:
+            raise AssertionError(
+                "mixed local E2E did not preserve a transaction to resume"
+            )
+        if self.config.max_sql_resume_ms > 0:
+            observed_max_us = max(resume_samples)
+            limit_us = self.config.max_sql_resume_ms * 1000
+            if observed_max_us > limit_us:
+                raise AssertionError(
+                    "individual SQL RESUME latency exceeded: "
+                    f"observed_max_us={observed_max_us} limit_us={limit_us}"
+                )
+
     def write_report_json_if_requested(
         self, completed_tx_min: int, completed_stmt_total: int
     ) -> None:
@@ -10903,6 +12303,7 @@ END
             "success": True,
             "scenario": self.config.scenario,
             **_evidence_contract(EVIDENCE_KIND_LOCAL_STARTUP_E2E),
+            **self.mixed_pressure_report_fields(),
             "sessions": self.config.sessions,
             "cycles": self.config.cycles,
             "statements_per_tx": self.config.statements_per_tx,
@@ -11447,6 +12848,25 @@ def _parse_positive_mb_list(value: str) -> List[int]:
     return buckets
 
 
+def _parse_positive_int_list(value: str) -> List[int]:
+    if not value:
+        return []
+    values: List[int] = []
+    for part in value.split(","):
+        try:
+            parsed = int(part)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"invalid positive integer value {part!r}"
+            ) from exc
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError(
+                "comma-separated integer values must be positive"
+            )
+        values.append(parsed)
+    return values
+
+
 def _parse_uint64_list(value: str) -> List[int]:
     if not value:
         return []
@@ -11643,6 +13063,13 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--lockset-select-for-update", action="store_true", help="for bulk lockset workloads, use SELECT ... FOR UPDATE statements that acquire record locks without changing row contents")
     parser.add_argument("--lockset-minimal-table", action="store_true", help="for bulk lockset workloads, create narrow sid/k/counter tables so the gate measures lock preservation rather than wide-row data updates")
     parser.add_argument("--repeated-row-write-workload", action="store_true", help="execute every transaction statement as a real UPDATE of one session-owned row; stresses long Undo chains without multiplying record locks")
+    parser.add_argument("--mixed-pressure-workload", action="store_true", help="run the rich mixed DML/query/stored-procedure pressure workload")
+    parser.add_argument("--mixed-seed-rows-per-table", type=int, default=0, help="total seed rows in each mixed-pressure business table")
+    parser.add_argument("--mixed-transaction-sizes", type=_parse_positive_int_list, default=[], help="comma-separated SQL statement counts for mixed transaction classes")
+    parser.add_argument("--mixed-transaction-weights", type=_parse_positive_int_list, default=[], help="comma-separated deterministic connection weights for mixed transaction classes")
+    parser.add_argument("--mixed-min-started-sessions", type=int, default=0, help="minimum mixed-pressure connections that must execute SQL before DRAIN")
+    parser.add_argument("--mixed-min-completed-statements", type=int, default=0, help="minimum aggregate business SQL count required after warmup before DRAIN")
+    parser.add_argument("--max-sql-resume-ms", type=int, default=0, help="maximum individual SQL RESUME latency for local startup evidence; 0 disables the gate")
     parser.add_argument("--preserve-timeout", dest="preserve_timeout_s", type=int, default=86400, help="WITH TIMEOUT value for DRAIN TRANSACTIONS PRESERVE")
     parser.add_argument("--preserve-max-binlog-cache-bytes", dest="preserve_max_binlog_cache_bytes", type=int, default=1_073_741_824, help="preserve_trx_max_binlog_cache_bytes for high-cardinality preserve artifacts")
     parser.add_argument("--preserve-max-lock-count", dest="preserve_max_lock_count", type=int, default=1_000_000, help="preserve_trx_max_lock_count for this high-cardinality E2E")
@@ -11745,6 +13172,10 @@ command is used after each DRAIN command shuts that server down.
     parser.add_argument("--receiver-read-load-baseline-seconds", dest="receiver_read_load_baseline_s", type=float, default=0.0, help="receiver point-read baseline duration before source transfer starts")
     parser.add_argument("--receiver-read-load-max-qps-drop-pct", type=float, default=5.0, help="maximum allowed receiver point-read QPS drop during transfer")
     parser.add_argument("--receiver-read-load-max-p99-increase-pct", type=float, default=10.0, help="maximum allowed receiver point-read P99 latency increase during transfer")
+    parser.add_argument("--source-continuous-tiered-load", action="store_true", help="run independent continuous source SQL in measured 10ms/100ms/200ms tiers until CLOSING cuts every connection off")
+    parser.add_argument("--source-tiered-load-threads-per-tier", type=int, default=0, help="ordinary source business connections in each continuous SQL duration tier")
+    parser.add_argument("--source-tiered-load-work-units", type=_parse_positive_int_list, default=[], help="three comma-separated real scan work-unit counts for the 10ms/100ms/200ms tiers")
+    parser.add_argument("--source-tiered-load-min-samples-per-tier", type=int, default=0, help="minimum completed SQL samples required in each source duration tier before DRAIN")
     parser.add_argument("--standby-transfer-user", default="preserve_transfer_receiver", help="receiver account used by source-side standby transfer sessions")
     parser.add_argument("--standby-transfer-password", default="preserve_transfer_secret", help="shared secret stored in source/receiver credential stores for standby-transfer E2E")
     parser.add_argument("--standby-transfer-credential-name", default="preserve_transfer_credential", help="credential name used by source/receiver transfer codec and source client")
@@ -11816,6 +13247,13 @@ command is used after each DRAIN command shuts that server down.
         lockset_select_for_update=args.lockset_select_for_update,
         lockset_minimal_table=args.lockset_minimal_table,
         repeated_row_write_workload=args.repeated_row_write_workload,
+        mixed_pressure_workload=args.mixed_pressure_workload,
+        mixed_seed_rows_per_table=args.mixed_seed_rows_per_table,
+        mixed_transaction_sizes=args.mixed_transaction_sizes,
+        mixed_transaction_weights=args.mixed_transaction_weights,
+        mixed_min_started_sessions=args.mixed_min_started_sessions,
+        mixed_min_completed_statements=args.mixed_min_completed_statements,
+        max_sql_resume_ms=args.max_sql_resume_ms,
         preserve_timeout_s=args.preserve_timeout_s,
         preserve_max_binlog_cache_bytes=args.preserve_max_binlog_cache_bytes,
         preserve_max_lock_count=args.preserve_max_lock_count,
@@ -11889,6 +13327,16 @@ command is used after each DRAIN command shuts that server down.
         ),
         receiver_read_load_max_p99_increase_pct=(
             args.receiver_read_load_max_p99_increase_pct
+        ),
+        source_continuous_tiered_load=(
+            args.source_continuous_tiered_load
+        ),
+        source_tiered_load_threads_per_tier=(
+            args.source_tiered_load_threads_per_tier
+        ),
+        source_tiered_load_work_units=args.source_tiered_load_work_units,
+        source_tiered_load_min_samples_per_tier=(
+            args.source_tiered_load_min_samples_per_tier
         ),
         standby_transfer_user=args.standby_transfer_user,
         standby_transfer_password=args.standby_transfer_password,

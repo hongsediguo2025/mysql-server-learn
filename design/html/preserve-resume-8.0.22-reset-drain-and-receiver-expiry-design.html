@@ -306,8 +306,9 @@
           其余 worker 退出和物理清理由后台收敛；两端在 FINAL_ACK 之后不再互相控制。
         </p>
         <p class="meta">
-          代码基线：<span class="mono">302ae0940a58040ef35c0a0d0f6a289eb1708cc7</span>
-          · 生成日期：2026-07-16 · 本文是设计，不代表源码已经实现
+          原代码基线：<span class="mono">302ae0940a58040ef35c0a0d0f6a289eb1708cc7</span>
+          · 合同复核基线：<span class="mono">1578fdb61ab84e0d7c00b7028ab78d68c432cb3e</span>
+          · 更新日期：2026-07-20 · 状态：RESET/Receiver TTL 已交付；终态请求边界已收敛，真实物理 HA 待接入
         </p>
       </header>
 
@@ -330,7 +331,7 @@
               <p>
                 HA 执行 <code>RESET DRAIN</code>。命令通过一个进程内 drain attempt 原子抢占取消权，立即停止新 phase2
                 工作和后续 COMMIT 发布；原 DRAIN owner 复用已有 reattach/activate 逆路径恢复原事务。RESET 等待全部受影响原连接
-                回到可执行状态并解除 generation-scoped 4020 read cutoff，但不等待 sender 临时资源、participant 或网络清理完成。
+                回到可执行状态并解除本 generation 的 CLOSING/batch gate，但不等待 sender 临时资源、participant 或网络清理完成。
               </p>
             </article>
             <article class="panel blue">
@@ -345,7 +346,7 @@
           <div class="success">
             <strong>最重要的成功点</strong>
             <code>RESET DRAIN</code> 返回 OK 表示 source 已经可以继续作为主库提供普通服务，并且本次 generation 的全部原连接
-            都已恢复为可运行状态：原 <code>trx_t</code> 已重新挂回原 THD、batch state 已清为 <code>NONE</code>、4020 read cutoff
+            都已恢复为可运行状态：原 <code>trx_t</code> 已重新挂回原 THD、batch state 已清为 <code>NONE</code>、CLOSING/batch gate
             已解除。达到该点后命令立即返回，不等待 worker join、participant teardown、sender 临时资源、文件删除或 target orphan
             candidate 清理；这些动作只能在后台继续，且不得再改变连接的可运行状态。
           </div>
@@ -356,6 +357,12 @@
             receiver 的 transfer 文件只是当前进程的容量扩展，不具备 crash durability。receiver 重启后 epoch/token 全部失效，
             startup 删除残留，不 replay、不恢复 READY。local preserve→shutdown→startup resume 的 durable carrier 语义保持不变。
           </div>
+          <div class="boundary">
+            <strong>外部接口合同不在本文重复定义</strong>
+            HA 控制连接身份、4020 唯一承诺、DRAIN survivor/excluded 结果和代理重放顺序，以
+            <a href="preserve-resume-8.0.22-transfer-proxy-4020-handoff-guide.html">Transfer Phase 2、4020 挂起与 Tx→Ty 事务续作对接指南</a>
+            为权威面。本文只定义 RESET 的 source 恢复屏障和 receiver TTL。
+          </div>
         </section>
 
         <section id="background">
@@ -364,6 +371,33 @@
             该能力服务于计划内主备切换。HA 先在 source 执行 <code>DRAIN TRANSACTIONS PRESERVE</code>，source 将事务内核对象构建并
             transfer 到 target。target 返回 FINAL_ACK 后，自行 prewarm，未来由 HA 在目标端调用 promotion 内部接口完成 adopt/resume。
           </p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>分支</th><th>连接命运</th><th>请求续作</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>FINAL_ACK / promotion 继续</td>
+                  <td>旧 source 普通连接保持 CLOSING，随后随 source handoff/shutdown 关闭。</td>
+                  <td>Proxy 等 HA 在新主完成事务 RESUME，再重发完整 4020 或计划内断连留下的唯一在途请求。</td>
+                </tr>
+                <tr>
+                  <td>本地 shutdown/startup</td>
+                  <td>旧连接随 mysqld shutdown 关闭，startup 后建立新连接。</td>
+                  <td>新连接先 RESUME，再重发终态前未执行的唯一在途请求；这不是 RESET 分支。</td>
+                </tr>
+                <tr>
+                  <td>RESET DRAIN 赢</td>
+                  <td>mysqld 不退出，原连接与原 Tx 恢复可运行。</td>
+                  <td>完整收到 4020 的请求在 RESET OK 后重发；未被 mysqld 读取的 packet 留在原 socket，自然执行且不得复制重发。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="boundary">
+            <strong>RESET 与终态断连必须分开</strong>
+            promotion 和 shutdown/startup 最终都会销毁旧连接，因此无需新增逐 THD response fence；RESET 则保留原连接，
+            只需恢复原事务并解除现有 CLOSING/batch gate。普通网络故障不属于任何计划内分支，仍按结果不确定处理。
+          </div>
           <div class="flow">
             <div class="step"><b>1. HA 发起 DRAIN</b><span>source phase1 预构建；phase2 阻断并 preserve</span></div>
             <div class="step"><b>2. Target 接收</b><span>在线保存、校验、受限 prewarm</span></div>
@@ -399,7 +433,7 @@
               <ul>
                 <li><code>RESET DRAIN</code> parser、权限、状态与错误合同。</li>
                 <li>phase1、phase1 closing、phase2、COMMIT/ACK 竞态回撤。</li>
-                <li>source 原事务的快速 reattach/activate、4020 cutoff 解除和业务唤醒。</li>
+                <li>source 原事务的快速 reattach/activate、CLOSING/batch gate 解除和业务唤醒。</li>
                 <li>首版仅支持 <code>STANDBY_TRANSFER_SAVE</code> drain attempt；source 非语义资源清理异步。</li>
                 <li>transfer source 的非阻塞取消与连接 I/O 唤醒。</li>
                 <li>receiver ACK→READY 与 READY→HA adopt lease 两段 TTL。</li>
@@ -534,13 +568,13 @@
             <table>
               <thead><tr><th>项目</th><th>裁定</th></tr></thead>
               <tbody>
-                <tr><td>调用者</td><td>HA 管控；普通用户不是目标调用方。</td></tr>
-                <tr><td>权限</td><td>复用 DRAIN 的 <code>SHUTDOWN_ACL</code>，不复用通用 RESET 的 <code>RELOAD_ACL</code>。</td></tr>
+                <tr><td>调用者</td><td>HA 专用控制连接；认证用户名必须精确为 <code>preserve_trx_ha_admin</code>。</td></tr>
+                <tr><td>身份与权限</td><td>固定 HA 账号且有效持有 <code>SHUTDOWN_ACL</code>；不复用通用 RESET 的 <code>RELOAD_ACL</code>。普通 root 或仅持 SHUTDOWN 的其他账号不构成 HA 身份。</td></tr>
                 <tr><td>参数</td><td>无 token、epoch、timeout 或 mode；只取消当前 source drain attempt。</td></tr>
                 <tr><td>无 active drain</td><td>幂等返回 OK，包括 <code>preserve_trx_enable=OFF</code> 时。</td></tr>
                 <tr><td>并发/重复 RESET</td><td>同一 generation 共享一个 terminal winner 和一个业务恢复屏障；后续调用等待同一结果并返回 OK，不重复执行恢复。</td></tr>
                 <tr><td>调用会话有显式事务</td><td>返回 <code>ER_PRESERVE_TRX_INVALID_STATE</code>，避免控制命令夹在用户事务中。</td></tr>
-                <tr><td>成功</td><td>RESET 赢得取消权，全部受影响原 THD 已恢复原事务、batch state 为 <code>NONE</code>、4020 cutoff 已解除，普通业务 admission 已开放。</td></tr>
+                <tr><td>成功</td><td>RESET 赢得取消权，全部受影响原 THD 已恢复原事务、batch state 为 <code>NONE</code>、CLOSING gate 已解除，普通业务 admission 已开放。</td></tr>
                 <tr><td>TOO_LATE</td><td>source 已本地处理 FINAL_ACK 并进入 <code>SHUTDOWN_HANDOFF</code>；返回专用错误。</td></tr>
                 <tr><td>原 DRAIN 语句</td><td>原 DRAIN owner 停止/join worker，并在原栈完成 participant、sender、provenance 和临时对象收尾后，返回“被 RESET 取消”的专用错误。</td></tr>
                 <tr><td>cleanup 错误</td><td>sender 临时资源、participant、transport 等非语义清理失败由原 DRAIN owner 重试；不得让已返回 OK 的原连接继续处于 <code>PRESERVED_DRAINED</code>。</td></tr>
@@ -687,7 +721,7 @@
           <h2>7. Phase 1 / Phase 2 回撤流程</h2>
           <h3>7.1 RESET 通用入口</h3>
           <ol>
-            <li>校验 <code>SHUTDOWN_ACL</code> 和 RESET 会话状态。</li>
+            <li>校验认证用户名精确为 <code>preserve_trx_ha_admin</code>、有效持有 <code>SHUTDOWN_ACL</code>，并检查 RESET 会话无活动业务事务。</li>
             <li>取得当前 attempt；不存在则幂等 OK。</li>
             <li>执行 terminal CAS；若已 <code>SHUTDOWN_HANDOFF</code> 返回 TOO_LATE；若已是同 generation 的
               <code>RESET_REQUESTED</code>，直接加入现有恢复屏障等待。</li>
@@ -703,13 +737,13 @@
           <ul>
             <li>phase1 flush/enqueue 循环在每个 batch 前后检查 reset generation，停止新 target 宣告和 blob batch enqueue。</li>
             <li>清除属于该 generation 的 <code>PENDING_QUIESCE</code>、<code>QUIESCED</code>、<code>DRAINED_NO_TRANSACTION</code>。</li>
-            <li>清除属于该 generation 的 read cutoff，唤醒 command-read 边界等待者。</li>
+            <li>清除属于该 generation 的 batch state；全部事务恢复后再解除 CLOSING gate 并唤醒 command reader。</li>
             <li>调用现有 <code>abort_participants()</code>；传输 ABORT/断链是 best-effort，不参与 RESET 返回。</li>
           </ul>
 
           <h3>7.3 Phase1 closing</h3>
           <p>
-            当前 <code>WARMCOPY_CLOSING</code> 已阻止新事务/锁工作。RESET 先发布 <code>RESET_CLEANUP</code> 重新开放普通 admission，
+            当前 <code>WARMCOPY_CLOSING</code> 已对普通连接的所有新 command 执行 4020 default-deny。RESET 先发布 <code>RESET_CLEANUP</code> 重新开放普通 admission，
             再由 DRAIN owner 清除 generation 状态。participant open/close/preflight 前后、进入 <code>WARMCOPY_CLOSING</code> 前后都检查
             reset generation；RESET 生效后，任何迟到结果都不能重新进入 <code>BATCH_DRAINING</code>。
           </p>
@@ -720,11 +754,16 @@
             <table>
               <thead><tr><th>目标状态</th><th>RESET 动作</th><th>是否读取 artifact</th></tr></thead>
               <tbody>
-                <tr><td>尚未开始 preserve</td><td>停止分配；清 generation/read cutoff；立即唤醒。</td><td class="no">否</td></tr>
+                <tr><td>尚未开始 preserve</td><td>停止分配；清 generation/batch state；满足统一恢复屏障后唤醒。</td><td class="no">否</td></tr>
                 <tr><td>worker 正在执行一个不可分割内核 substep</td><td>完成当前 substep，在下一个 checkpoint 停止；不进入后续 publish/COMMIT。</td><td class="no">否</td></tr>
-                <tr><td>已 <code>PRESERVED_DRAINED</code></td><td>复用 existing record→original THD reattach/activate；清为 <code>NONE</code>，解除 read cutoff 后唤醒。</td><td class="no">正常路径不读</td></tr>
+                <tr><td>已 <code>PRESERVED_DRAINED</code></td><td>复用 existing record→original THD reattach/activate；清为 <code>NONE</code>，统一解除 CLOSING 后唤醒。</td><td class="no">正常路径不读</td></tr>
               </tbody>
             </table>
+          </div>
+          <div class="boundary">
+            <strong>未来 EARLY_STAGED 仍服从同一 RESET 合同</strong>
+            若逐 token early pipeline 已把 provisional object 发到 receiver，RESET 只发起 best-effort epoch ABORT/断链并恢复 source；
+            不等待 target ACK。该语义不同于 A=OFF timeout exclusion：后者仍要提交 survivor epoch，因此排除 token 必须先取得确定 ABORT ACK。
           </div>
           <p>
             首版不新增 parallel restore。先把当前每 token 一次全局 THD scan 的 O(N×THD) 改为“一次 scan 收集所有匹配 THD pin，按原 reverse order 恢复”。
@@ -751,10 +790,10 @@
             <li>未 detach 的目标清 state 后立即唤醒。</li>
             <li>已 detach 的目标完成原 <code>trx_t</code>、MDL、binlog cache、GTID、savepoint 和 session 状态恢复后，清除 <code>PRESERVED_DRAINED</code>。</li>
             <li>复用现有逐事务 reattach/activate 语义；首版不修改 InnoDB activation/redo flush。若 N=1000 profile 明确证明它是剩余主瓶颈，再单独评审。</li>
-            <li>每个目标在 batch state 为 <code>NONE</code> 后解除 generation-scoped read cutoff，再唤醒 command reader。</li>
+            <li>确认每个目标的 batch state 均为 <code>NONE</code> 后，统一解除 CLOSING gate，再唤醒 command reader。</li>
             <li>确认每个 in-flight worker 已越过最后一个语义 checkpoint，之后不可能再 prepare/detach/publish/COMMIT。</li>
             <li>当全部受影响目标均可执行下一条 SQL时，attempt 发布 <code>all_transactions_runnable=true</code>。</li>
-            <li><code>RESET DRAIN</code> 立即返回 OK；从这一刻起，后台清理不得再写 batch state、cutoff 或事务生命周期。</li>
+            <li><code>RESET DRAIN</code> 立即返回 OK；从这一刻起，后台清理不得再写 batch state、CLOSING gate 或事务生命周期。</li>
             <li>原 DRAIN owner 继续完成栈内非语义清理；清理完成后 manager 回 IDLE，原 DRAIN 语句返回 canceled。</li>
           </ol>
           <div class="boundary">
@@ -876,7 +915,7 @@ cleanup_reset_batch_artifacts(...)
           <h3>9.1 首版只支持 Transfer 模式</h3>
           <p>
             <code>STANDBY_TRANSFER_SAVE</code> 使用 transfer artifact sink，不在 source 发布可供 startup resume 的本地 <code>.bin</code>。
-            RESET 返回前只恢复原事务、清除本次 generation 的 source token 可用性并解除 4020 cutoff；XID provenance reservation、
+            RESET 返回前只恢复原事务、清除本次 generation 的 source token 可用性并解除 CLOSING/batch gate；XID provenance reservation、
             warm blobs 和 sender 临时状态在 cleanup 阶段删除。source 不等待 target 删除任何内容。
           </p>
 
@@ -896,7 +935,7 @@ cleanup_reset_batch_artifacts(...)
                 <tr><td>停止 phase2/COMMIT</td><td class="yes">必须</td><td>—</td></tr>
                 <tr><td>普通 admission 开放</td><td class="yes">必须</td><td>保持</td></tr>
                 <tr><td>原事务语义恢复</td><td class="yes">全部必须成功</td><td>—</td></tr>
-                <tr><td>batch state / 4020 cutoff 清除</td><td class="yes">全部必须完成</td><td>—</td></tr>
+                <tr><td>batch state 清除 / CLOSING gate 解除</td><td class="yes">全部必须完成</td><td>—</td></tr>
                 <tr><td>transfer source token 逻辑失效</td><td class="yes">必须，禁止本次 token 再被 source 使用</td><td>—</td></tr>
                 <tr><td>transfer source provenance</td><td class="no">不要求物理清完</td><td>原 DRAIN owner 栈内清理</td></tr>
                 <tr><td>sidecar/blob/tmp 删除</td><td class="no">不要求</td><td class="yes">原 DRAIN owner 栈内清理和有界重试</td></tr>
@@ -924,7 +963,7 @@ cleanup_reset_batch_artifacts(...)
             非语义清理失败不能重新关闭全局业务，也不能把已经恢复的 THD 改回 <code>PRESERVED_DRAINED</code>。manager 可暂时留在
             <code>RESET_CLEANUP</code> 拒绝新的 DRAIN，由原 DRAIN owner 重试 sender 临时资源、provenance 和文件删除；
             原连接继续正常运行。错误通过 error log 暴露，不引入 watchdog。事务 reattach/activate、batch state 清除或
-            4020 cutoff 解除失败不属于 cleanup debt，RESET 不得在这种状态下返回 OK。
+            CLOSING gate 解除失败不属于 cleanup debt，RESET 不得在这种状态下返回 OK。
           </p>
           <ul>
             <li>每轮只执行一个有界 cleanup pass，单项失败不阻塞同批其他普通清理。</li>
@@ -983,22 +1022,27 @@ mysql_socket_shutdown(mysql->net.vio->mysql_socket, SHUT_RDWR);
             sender/worker/session 上下文立即结束，target 后续行为与 source 无关。
           </div>
 
-          <h3>10.3 与 4020 response cutoff 的关系</h3>
+          <h3>10.3 与 CLOSING 命令门禁的关系</h3>
           <p>
-            transfer drain 在发送 <code>COMMIT_EPOCH</code> 前，需要按代理对接合同关闭每个目标 THD 的 generation-scoped command-read cutoff，
-            并等待已被 source 接受的 response-bearing command 完成正常响应或 4020 响应。RESET 与该 cutoff 使用同一个 drain generation：
+            本设计不再要求 transfer drain 在 <code>COMMIT_EPOCH</code> 前构造逐 THD accepted/response sequence 或 command-read cutoff。
+            RESET 只逆转当前已经存在的 CLOSING/batch state，并保持“先恢复原事务，再开放普通 command”的顺序：
           </p>
           <ol>
-            <li>RESET 赢得 terminal CAS 后，禁止新的 cutoff/fence 发布和 <code>COMMIT_EPOCH</code>。</li>
-            <li>未 detach 目标清 batch state 后即可清除 cutoff。</li>
-            <li>已 detach 目标必须先完成原事务 reattach/activate，再清为 <code>NONE</code> 并清除 cutoff。</li>
-            <li>cutoff 清除后唤醒 command reader；socket 中尚未读取的 SQL 可以在原 Tx 上正常执行。</li>
-            <li>只有所有目标均满足“事务可运行 + cutoff 已清除”，RESET 才返回 OK。</li>
+            <li>RESET 赢得 terminal CAS 后，禁止新的 phase2/final metadata/<code>COMMIT_EPOCH</code> 推进。</li>
+            <li>未 detach 目标在确认原事务仍可运行后清除本 generation 的 batch state。</li>
+            <li>已 detach 目标必须先完成原事务 reattach/activate，再清为 <code>NONE</code>。</li>
+            <li>全部目标恢复后解除 CLOSING gate 并唤醒 command reader；socket 中尚未读取的 SQL 在原 Tx 上自然执行。</li>
+            <li>只有所有目标均满足“事务可运行 + batch state 为 NONE + CLOSING 已解除”，RESET 才返回 OK。</li>
           </ol>
           <div class="boundary">
             <strong>4020 不得在 RESET OK 后重复出现</strong>
-            代理收到 HA 的 RESET 成功终局后，会在原 Tx 上重放触发 4020 的请求。因此本次 generation 的任何原连接只要仍为
-            <code>PRESERVED_DRAINED</code> 或 cutoff 仍关闭，RESET 就尚未完成。
+            代理收到 HA 的 RESET 成功终局后，只会在原 Tx 上重放明确收到完整 4020 的请求。因此本次 generation 的任何原连接只要仍为
+            <code>PRESERVED_DRAINED</code> 或 CLOSING/batch gate 仍生效，RESET 就尚未完成；尚未被 mysqld 读取的 packet 则不得由代理再发一份。
+          </div>
+          <div class="risk">
+            <strong>RESET 的少量协议边缘不外推到终态路径</strong>
+            若同一 socket 上存在部分 long-data compound 或响应结果不明，按 RESET 专属的 PS/reset 合同处理；
+            不为此在 promotion/shutdown 热路径增加通用 <code>ps_compound_pending</code> 或 response-fence 状态机。
           </div>
 
           <h3>10.4 ACK 身份与重放</h3>
@@ -1249,7 +1293,7 @@ destroy(root, epoch):
                 <tr><td>prewarm publish</td><td>worker 在重工作前和 publish 前后比对 accepted epoch live state；禁止 expired epoch 被迟到 worker 重新发布 READY。</td></tr>
                 <tr><td>TTL 与 promotion</td><td>只允许 <code>READY_DEADLINE_ACTIVE→ADOPT_LEASED</code> 或
                   <code>READY_DEADLINE_ACTIVE→EXPIRED</code> 一方成功；strict <code>ADOPTING</code> 只能发生在 epoch lease 之后。</td></tr>
-                <tr><td>4020 cutoff</td><td>RESET 只在对应原事务恢复后按 THD 清除；全部 cutoff 清除是 RESET OK 的必要条件。</td></tr>
+                <tr><td>CLOSING/batch gate</td><td>RESET 只在对应原事务恢复、全部目标 batch state 清为 <code>NONE</code> 后统一解除；这是 RESET OK 的必要条件。</td></tr>
                 <tr><td>source cleanup ownership</td><td>原 DRAIN owner 在原调用栈完成收尾；不向全局队列或 reaper 移交 DRAIN 栈和内核对象指针。</td></tr>
                 <tr><td>RESET 等待</td><td>RESET 只按 1ms 间隔检查 <code>all_transactions_runnable</code>；首版不增加 condition variable 或新唤醒框架。</td></tr>
               </tbody>
@@ -1280,7 +1324,7 @@ destroy(root, epoch):
                 <tr><td>reattach/activate/session restore</td><td>O(N + locks metadata already resident)</td><td class="no">不按 Undo body</td></tr>
                 <tr><td>Undo header activation + redo durability</td><td>复用现有 O(N) activation 路径</td><td class="no">不按 Undo body；只与有 Undo segment 的事务数相关</td></tr>
                 <tr><td>binlog cache</td><td>metadata-only truncate/reactivate</td><td class="no">不按 cache payload 读写</td></tr>
-                <tr><td>batch state / 4020 cutoff 清除</td><td>O(N)</td><td class="no">否</td></tr>
+                <tr><td>batch state 清除 / CLOSING gate 解除</td><td>O(N) + O(1)</td><td class="no">否</td></tr>
                 <tr><td>sidecar/blob/temp cleanup</td><td>可大</td><td>可能，但排除在 RESET response 外</td></tr>
               </tbody>
             </table>
@@ -1290,7 +1334,7 @@ destroy(root, epoch):
           <ol>
             <li>消除每 token 全局 THD scan。</li>
             <li>保留 source 原 binlog cache，消除 reset hydrate/file read。</li>
-            <li>按 generation 批量清除 batch state 与 4020 read cutoff。</li>
+            <li>按 generation 批量清除 batch state，随后统一解除 CLOSING gate。</li>
             <li>用 shutdown-only <code>vio_shutdown()</code> 中断网络等待。</li>
             <li>release NFR 后再决定是否需要 parallel restore 或独立的 InnoDB activation 优化。</li>
           </ol>
@@ -1363,7 +1407,7 @@ destroy(root, epoch):
                 <tr><td><code>sql/sql_parse.cc</code></td><td>dispatch 到 Preserve command service。</td><td>5–12 行</td></tr>
                 <tr><td><code>share/messages_to_clients.txt</code></td><td>RESET canceled / too late 两个错误。</td><td>6–10 行</td></tr>
                 <tr><td><code>sql/preserve_trx.h</code></td><td>manager state、reset API、最小 status 声明、rollback image retained 标记。</td><td>25–55 行</td></tr>
-                <tr><td><code>sql/preserve_trx.cc</code></td><td>attempt、RESET 执行、guard CAS、phase checkpoints、一次 THD scan、restore split、binlog retention 和 4020 cutoff 解除。</td><td>450–650 行</td></tr>
+                <tr><td><code>sql/preserve_trx.cc</code></td><td>attempt、RESET 执行、guard CAS、phase checkpoints、一次 THD scan、restore split、binlog retention 和 CLOSING/batch gate 解除。</td><td>450–650 行</td></tr>
                 <tr><td><code>sql/preserve_trx_transfer.h/.cc</code></td><td>source cancel slot/socket wake、commit 内 FINAL_ACK arbiter、strict digest 前置修复、
                   receiver accepted lifecycle/deadline、per-epoch destroy/queue cancel 和 status。</td><td>350–550 行</td></tr>
                 <tr><td><code>sql/preserve_trx_promotion.h/.cc</code></td><td>epoch lease、ready-cache purge、pre-claim optionality。</td><td>45–90 行</td></tr>
@@ -1406,7 +1450,7 @@ destroy(root, epoch):
                 <tr>
                   <td><code>unittest/gunit/preserve_trx-t.cc</code></td>
                   <td>扩展</td>
-                  <td>THD 一次扫描、reverse restore、4020 cutoff、retained cache、socket cancel lifetime、source debt、receiver generation/TTL/destroy。</td>
+                  <td>THD 一次扫描、reverse restore、CLOSING/batch gate、retained cache、socket cancel lifetime、source debt、receiver generation/TTL/destroy。</td>
                 </tr>
                 <tr>
                   <td><code>mysql-test/suite/preserve_trx/t/batch_drain_reset.test</code><br><code>mysql-test/suite/preserve_trx/r/batch_drain_reset.result</code></td>
@@ -1452,7 +1496,7 @@ destroy(root, epoch):
               <thead><tr><th>实施块</th><th>预计工作量</th><th>主要风险</th></tr></thead>
               <tbody>
                 <tr><td>SQL、commit 内 attempt CAS、manager guard</td><td>2–3 日</td><td>ACK 验证后、m_epoch_committed 前完成唯一 winner；不能覆盖既有 manager owner。</td></tr>
-                <tr><td>phase1/phase2 cancel、restore split、一次 THD scan、4020 cutoff</td><td>3–5 日</td><td>原 THD/trx 生命周期、cutoff/唤醒顺序、retained binlog cache。</td></tr>
+                <tr><td>phase1/phase2 cancel、restore split、一次 THD scan、CLOSING/batch gate</td><td>3–5 日</td><td>原 THD/trx 生命周期、gate/唤醒顺序、retained binlog cache。</td></tr>
                 <tr><td>classic transport cancel + owner-local cleanup</td><td>2–3 日</td><td>socket shutdown 生命周期、worker 栈退出和原 DRAIN owner 所有权；取消后不得重连或查询 target。</td></tr>
                 <tr><td>receiver 三层状态、TTL/destroy、promotion pre-claim optionality</td><td>3–4 日</td><td>deadline 统一绑定、worker pre/post live check、expiry/adopt CAS、队列计账和清理幂等。</td></tr>
                 <tr><td>GUnit、MTR、双 mysqld E2E、release NFR 与修复</td><td>4–5 日</td><td>网络竞态可重复性、digest 冲突、1000 事务尾延迟和故障注入。</td></tr>
@@ -1461,7 +1505,7 @@ destroy(root, epoch):
           </div>
           <p class="small">
             估算不包含真实物理复制/HA promotion 集成。最大不确定性是 source transport 的跨线程 socket cancel 在 Unix/TLS 下的验证、
-            4020 cutoff 与 THD 状态恢复顺序、source owner-local cleanup，以及 1000 THD reattach 的 release NFR；不是事务 payload 大小。
+            CLOSING gate 与 THD 状态恢复顺序、source owner-local cleanup，以及 1000 THD reattach 的 release NFR；不是事务 payload 大小。
           </p>
         </section>
 
@@ -1480,7 +1524,7 @@ destroy(root, epoch):
           <h3>18.1 Review blocker</h3>
           <ul>
             <li>任何设计把 RESET 返回绑定到 receiver ACK/prewarm/cleanup。</li>
-            <li>任何设计在 RESET OK 后继续恢复某个原事务、batch state 或 4020 cutoff。</li>
+            <li>任何设计在 RESET OK 后继续恢复某个原事务、batch state 或 CLOSING gate。</li>
             <li>任何设计让 source 在 FINAL_ACK 后继续轮询 target READY。</li>
             <li>任何设计为 receiver TTL 写 durable marker 或 startup replay。</li>
             <li>任何设计在 RESET 正常路径读取 snapshot/binlog/record-lock payload。</li>
@@ -1551,8 +1595,15 @@ destroy(root, epoch):
                   <td><code>RESET_4020_REPLAY</code></td>
                   <td>原业务 SQL 已收到 4020；对应事务处于 <code>PRESERVED_DRAINED</code></td>
                   <td>RESET OK 后在原 Tx 重放同一 SQL</td>
-                  <td>reattach/activate → batch NONE → cutoff reopened</td>
+                  <td>reattach/activate → batch NONE → CLOSING reopened</td>
                   <td>重放正常执行，不再返回 4020；drained count=0。</td>
+                </tr>
+                <tr>
+                  <td><code>RESET_UNREAD_PACKET_SINGLE_EXECUTION</code></td>
+                  <td>CLOSING 已生效；业务 packet 尚未被 mysqld 读取并留在原 socket</td>
+                  <td>执行 RESET；Proxy 不重发该 packet</td>
+                  <td>事务恢复 → batch NONE → CLOSING reopened → 原 reader 读取 packet</td>
+                  <td>该 SQL 只执行一次；不会先被 4020 再由 Proxy 重发一份。</td>
                 </tr>
                 <tr>
                   <td><code>RESET_OWNER_CLEANUP_ASYNC</code></td>
@@ -1591,7 +1642,7 @@ destroy(root, epoch):
                 </tr>
                 <tr>
                   <td><code>RESET_INVARIANT_FAIL_CLOSED</code></td>
-                  <td>fault injection 破坏 reattach/activate/cutoff-clear</td>
+                  <td>fault injection 破坏 reattach/activate/batch-state-clear 或 CLOSING reopen</td>
                   <td>执行 RESET</td>
                   <td>manager → <code>DRAIN_CLEANUP_FAILED</code></td>
                   <td>不得返回 OK；复用 ER_PRESERVE_TRX_BATCH_CLEANUP_FAILED；标记 release blocker。</td>
@@ -1611,7 +1662,7 @@ destroy(root, epoch):
             <li>一次 THD scan、reverse restore 顺序、pin 生命周期。</li>
             <li>binlog retained cache reactivation，payload read bytes=0。</li>
             <li>source 非语义收尾只由原 DRAIN owner 执行；重复 cleanup pass 幂等，完成后精确 CAS 回 IDLE。</li>
-            <li>全部恢复目标 batch state=<code>NONE</code> 且 4020 cutoff 清除；不得出现 RESET OK 后再次返回 4020。</li>
+            <li>全部恢复目标 batch state=<code>NONE</code> 且 CLOSING gate 已解除；不得出现 RESET OK 后再次返回 4020。</li>
             <li>receiver 三层状态映射，以及 epoch
               <code>ACCEPTED_DEADLINE_ACTIVE/READY_DEADLINE_ACTIVE/ADOPT_LEASED/EXPIRED</code> 转移；pre/post live check 防迟到 publish。</li>
             <li>epoch binder 为全部 strict token 使用同一个 ready deadline；不再从 commit timeout 生成
@@ -1629,6 +1680,7 @@ destroy(root, epoch):
             <li>RESET_CLEANUP 期间普通 SQL 可运行，新 DRAIN/Preserve control 被拒绝。</li>
             <li>原 DRAIN 返回 canceled 专用错误；RESET 返回 OK。</li>
             <li>RESET OK 后在原 Tx 重放触发 4020 的 SQL，正常执行且不再返回 4020。</li>
+            <li>CLOSING 时尚未读取的 packet 在 RESET OK 后由原 socket 自然执行；Proxy 不重发，最终执行次数为 1。</li>
             <li>local-carrier drain attempt 不进入首版 RESET 支持范围。</li>
             <li><code>preserve_trx_enable=OFF</code> 原生路径不受影响。</li>
           </ul>
@@ -1671,9 +1723,9 @@ destroy(root, epoch):
             <li>报告 <code>reset_max_worker_cancel_latency_us</code>，证明没有无界 work-between-checkpoints。</li>
             <li>断言 RESET window：Undo body pages/records=0、artifact payload read bytes=0、receiver wait us=0；另行断言
               <code>undo_header_activation_count</code> 与具有 redo Undo 的目标事务/Undo segment 匹配。首版不把 redo wait 次数设为 1 的硬合同。</li>
-            <li>断言 RESET OK 时 restored_count=target_count、cutoff_reopened_count=target_count、<code>PRESERVED_DRAINED</code> count=0。</li>
+            <li>断言 RESET OK 时 restored_count=target_count、batch_state_none_count=target_count、closing_reopened=1、<code>PRESERVED_DRAINED</code> count=0。</li>
             <li>注入 sender 临时资源/provenance cleanup 失败时原事务仍可继续，原 DRAIN owner 在栈内收敛。</li>
-            <li>注入 reattach/activate/cutoff-clear 失败时不得返回 OK，并将用例标记为 release blocker。</li>
+            <li>注入 reattach/activate/batch-state-clear/CLOSING-reopen 失败时不得返回 OK，并将用例标记为 release blocker。</li>
             <li>只有一次 scan 方案未达到 N=1000 P99&lt;300ms / max&lt;500ms，才批准 parallel restore 条件切片。</li>
           </ul>
         </section>
@@ -1686,7 +1738,7 @@ destroy(root, epoch):
               不同 digest 标记 CORRUPT 并返回 DIGEST_CONFLICT；在 TTL/destroy 接入前先锁住 registry 身份。</li>
             <li><b>S1：SQL + commit 内 attempt CAS + manager guard。</b>先证明 RESET/FINAL_ACK 只有一个 winner，且 guard 不覆盖 RESET。</li>
             <li><b>S2：source phase checkpoints + socket cancel + waiter wake。</b>覆盖 phase1/closing 和网络阻塞，不碰 detach restore。</li>
-            <li><b>S3：restore split + retained binlog cache + 一次 THD scan。</b>完成 phase2 原事务快速恢复和 4020 cutoff。</li>
+            <li><b>S3：restore split + retained binlog cache + 一次 THD scan。</b>完成 phase2 原事务快速恢复、batch state 清除和 CLOSING reopen。</li>
             <li><b>S4：owner-local cleanup。</b>证明 RESET response、原 DRAIN RPC 返回与物理清理三者解耦，不增加 source queue/reaper。</li>
             <li><b>S5：receiver 三层状态映射 + TTL + destroy。</b>扩展现有 accepted-epoch registry 并复用 receiver reaper，
               READY 时统一绑定 token deadline，先逻辑失效后取消队列/异步释放。</li>
@@ -1705,7 +1757,7 @@ destroy(root, epoch):
             <table>
               <thead><tr><th>用户原则</th><th>设计落点</th><th>验收</th></tr></thead>
               <tbody>
-                <tr><td>可撤销窗口内 RESET 必然成功，原主立即服务</td><td>RESET 赢则发布 RESET_CLEANUP；返回前全部原事务已恢复、batch state=<code>NONE</code>、4020 cutoff 已解除。worker 退出和物理清理只能在该屏障之后继续。SHUTDOWN_HANDOFF 后明确 TOO_LATE。</td><td>phase1/phase2 E2E；RESET OK 后原 Tx 重放成功且 drained count=0；FINAL_ACK winner 返回 TOO_LATE。</td></tr>
+                <tr><td>可撤销窗口内 RESET 必然成功，原主立即服务</td><td>RESET 赢则发布 RESET_CLEANUP；返回前全部原事务已恢复、batch state=<code>NONE</code>、CLOSING gate 已解除。worker 退出和物理清理只能在该屏障之后继续。SHUTDOWN_HANDOFF 后明确 TOO_LATE。</td><td>phase1/phase2 E2E；RESET OK 后 4020 请求重放成功、未读 packet 单次执行且 drained count=0；FINAL_ACK winner 返回 TOO_LATE。</td></tr>
                 <tr><td>并发 RESET 仍是一次回撤</td><td>第一个 CAS winner 执行恢复；同 generation 后续调用共享
                   <code>all_transactions_runnable</code>，attempt 终止后不回 RUNNING。</td><td><code>RESET_CONCURRENT_JOIN</code>：两个 OK、winner=1、restore 不重复。</td></tr>
                 <tr><td>内核对象可持续清理</td><td>原 DRAIN owner 在原栈中完成 worker quiesce、participant/sender/provenance 和临时文件收尾；不移交内核/栈指针。</td><td>RESET response 与 owner_cleanup_done 分段报告。</td></tr>
@@ -1719,7 +1771,7 @@ destroy(root, epoch):
                 <tr><td>READY 幂等不能掩盖内容冲突</td><td>READY 类快速路径仍校验 object-set digest/version；不同内容进入
                   <code>CORRUPT/DIGEST_CONFLICT</code>。</td><td><code>STRICT_DIGEST_CONFLICT</code>。</td></tr>
                 <tr><td>Preserve 不阻塞普通升主</td><td>missing/prewarming/expired 在 claim 前返回 SKIPPED。</td><td>claim counter=0，ordinary path 可继续。</td></tr>
-                <tr><td>1000 事务快速 RESET</td><td>同一 trx_t、零 Undo scan、零 payload read、一次 THD scan、批量 state/cutoff 清除。</td><td>release NFR P99&lt;300ms、max&lt;500ms 目标。</td></tr>
+                <tr><td>1000 事务快速 RESET</td><td>同一 trx_t、零 Undo scan、零 payload read、一次 THD scan、批量 state 清除与一次 CLOSING reopen。</td><td>release NFR P99&lt;300ms、max&lt;500ms 目标。</td></tr>
                 <tr><td>不能过度设计</td><td>一个 SQL、一个 attempt、一个 destroy、两个参数、零新线程、零新 InnoDB hook。</td><td>source-shape lint + 文件变更审查。</td></tr>
               </tbody>
             </table>
@@ -1736,8 +1788,8 @@ destroy(root, epoch):
       <footer class="footer">
         <p>
           本文基于 MySQL 8.0.22 Preserve/Resume 工作树 HEAD
-          <span class="mono">58b61e89d5e4d4207a5063840b0423cce57fdfa3</span> 的代码事实修订。
-          源码、测试和参数尚未按本文实现；首版范围已收敛为 transfer drain，RESET OK 以全部原事务可运行且 4020 cutoff 已解除为准。
+          <span class="mono">1578fdb61ab84e0d7c00b7028ab78d68c432cb3e</span> 的代码事实复核。
+          RESET/Receiver TTL 已交付；本次只收敛请求边界。RESET OK 以全部原事务可运行、batch state 为 NONE 且 CLOSING gate 已解除为准。
         </p>
       </footer>
     </div>

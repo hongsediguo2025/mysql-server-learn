@@ -8089,6 +8089,39 @@ TEST_F(PreserveSnapshotTest,
   lock_warmcopy_reset_for_unit_test();
 }
 
+TEST_F(PreserveSnapshotTest,
+       LockWarmcopyLiveRecordReplacementAdvancesPublicationGeneration) {
+  lock_warmcopy_reset_for_unit_test();
+
+  Preserve_trx_lock_warmcopy_options options;
+  options.enabled = true;
+  options.preserve_dir = m_dir;
+  Preserve_trx_lock_warmcopy_drain_participant participant(options);
+  ASSERT_TRUE(participant.open_phase1());
+
+  constexpr uint64_t target_id = 7002;
+  lock_warmcopy_trx_lock_fence_t live_fence;
+  Preserved_trx_external_blob first;
+  first.name = kPreservedTrxBlobRecordLocks;
+  first.payload = record_locks_payload();
+  ASSERT_TRUE(participant.bind_early_live_record_blob(target_id, live_fence, 0,
+                                                       &first));
+  ASSERT_GT(first.source_live_lock_generation, 0U);
+
+  lock_warmcopy_record_store_clear_for_target(target_id);
+  Preserved_trx_external_blob replacement;
+  replacement.name = kPreservedTrxBlobRecordLocks;
+  replacement.payload = record_locks_payload();
+  ASSERT_TRUE(participant.bind_early_live_record_blob(
+      target_id, live_fence, first.source_live_lock_generation,
+      &replacement));
+  EXPECT_GT(replacement.source_live_lock_generation,
+            first.source_live_lock_generation);
+
+  participant.abort_phase();
+  lock_warmcopy_reset_for_unit_test();
+}
+
 TEST_F(PreserveSnapshotTest, PromotionAdoptedEpochMarkerDoesNotDeleteStandby) {
   Local_file_preserved_trx_carrier carrier(m_dir);
   const std::string token = "901";
@@ -14775,7 +14808,8 @@ TEST_F(PreserveSnapshotTest,
     if (preserved_trx_promotion_ready_summary_for_epoch(
             m_dir, manifest.epoch_id, &ready_summary) ==
             Preserve_trx_promotion_adopt_status::OK &&
-        ready_summary.ready_tokens.size() == 1) {
+        ready_summary.ready_tokens.size() == 1 &&
+        preserve_trx_transfer_receiver_queued_bytes_status() == 0) {
       break;
     }
     my_sleep(10000);
@@ -25031,6 +25065,271 @@ TEST_F(PreserveSnapshotTest, ArtifactSinkFactoryUsesSourceEpochSession) {
 
   ASSERT_TRUE(wait_for_epoch_ready_token("epoch-factory-session",
                                          transfer_token));
+}
+
+TEST_F(PreserveSnapshotTest,
+       DeferredTransferArtifactSinkCapturesWithoutPublishingFrames) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 712;
+  Mysql_binlog_preserve_snapshot snapshot;
+  snapshot.cache_payload = "deferred-candidate-binlog-cache";
+  snapshot.gtid_next = "AUTOMATIC";
+  snapshot.event_counter = 2;
+  snapshot.with_rbr = true;
+  snapshot.with_start = true;
+  snapshot.with_content = true;
+  Preserve_snapshot_metadata meta = logged_with_cache_metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  input.logged_binlog_snapshot = &snapshot;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+  ASSERT_EQ(1U, bundle.external_blobs.size());
+
+  Capturing_transfer_frame_sink frame_sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-deferred-candidate", "source-uuid", "target-uuid", 17,
+      &frame_sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_token(transfer_token));
+  ASSERT_EQ(1U, frame_sink.frames().size());
+
+  Preserve_trx_deferred_transfer_candidate candidate;
+  Preserve_snapshot_metadata written;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            preserve_trx_transfer_capture_deferred_candidate(
+                session.epoch_id(), session.source_server_uuid(),
+                session.target_server_uuid(), transfer_token,
+                std::move(bundle), 300, nullptr, &candidate, &written));
+  EXPECT_TRUE(candidate.captured);
+  EXPECT_EQ(transfer_token, candidate.transfer_token);
+  EXPECT_EQ(meta.token, candidate.bundle.metadata.token);
+  EXPECT_EQ(candidate.bundle.metadata.created_at_us, written.created_at_us);
+  EXPECT_GT(candidate.bundle.metadata.expires_at_us,
+            candidate.bundle.metadata.created_at_us);
+  EXPECT_EQ(1U, frame_sink.frames().size())
+      << "deferred capture must not publish token objects or final metadata";
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_stage_deferred_candidate_external_objects(
+                &session, m_dir, &candidate));
+  const size_t staged_frame_count = frame_sink.frames().size();
+  EXPECT_GT(staged_frame_count, 1U);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_finalize_deferred_candidate(&session,
+                                                               &candidate));
+  EXPECT_EQ(staged_frame_count, frame_sink.frames().size())
+      << "final snapshot and manifest must remain queued until COMMIT_EPOCH";
+}
+
+#ifndef NDEBUG
+TEST_F(PreserveSnapshotTest,
+       DeferredTransferFinalManifestSchedulesTokenPrewarm) {
+  Transfer_codec_context_guard codec_guard;
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", "target-uuid");
+
+  const uint64_t transfer_token = 714;
+  Preserve_snapshot_metadata meta = metadata();
+  meta.token = test_transfer_token_string(transfer_token);
+  meta.record_locks_payload = metadata_only_record_locks_payload();
+  Preserved_trx_bundle bundle;
+  Preserved_trx_bundle_build_input input;
+  input.metadata = meta;
+  input.externalize_record_locks_payload = true;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            build_preserved_trx_bundle(input, &bundle));
+  ASSERT_TRUE(set_test_transfer_record_lock_contract(&bundle));
+
+  Local_file_preserved_trx_carrier carrier(m_dir);
+  Preserved_trx_store store(&carrier);
+  Preserve_trx_transfer_receiver_registry registry;
+  Preserve_snapshot_metadata receiver_metadata;
+  Transfer_receiver_payload_test_sink frame_sink(
+      m_dir, &store, &registry, &receiver_metadata);
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-deferred-final-prewarm", "source-uuid", "target-uuid", 17,
+      &frame_sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_token(transfer_token));
+
+  Preserve_trx_deferred_transfer_candidate candidate;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            preserve_trx_transfer_capture_deferred_candidate(
+                session.epoch_id(), session.source_server_uuid(),
+                session.target_server_uuid(), transfer_token,
+                std::move(bundle), 300, nullptr, &candidate, nullptr));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_stage_deferred_candidate_external_objects(
+                &session, m_dir, &candidate));
+  for (uint attempt = 0; attempt < 300; ++attempt) {
+    if (preserve_trx_transfer_receiver_queued_bytes_status() == 0 &&
+        preserve_trx_transfer_receiver_worker_active_status() == 0) {
+      break;
+    }
+    my_sleep(10000);
+  }
+  ASSERT_EQ(0U, preserve_trx_transfer_receiver_queued_bytes_status());
+  ASSERT_EQ(0U, preserve_trx_transfer_receiver_worker_active_status());
+
+  preserve_trx_transfer_set_receiver_object_prewarm_delay_ms_for_unit_test(500);
+  auto restore_object_delay = create_scope_guard([] {
+    preserve_trx_transfer_set_receiver_object_prewarm_delay_ms_for_unit_test(0);
+  });
+
+  const uint64_t seal_prewarm_before =
+      preserve_trx_transfer_receiver_seal_prewarm_tokens_status();
+  const uint64_t object_prewarm_before =
+      preserve_trx_transfer_receiver_object_prewarm_count_status();
+  const uint64_t object_miss_before =
+      preserve_trx_transfer_receiver_object_prewarm_miss_count_status();
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_finalize_deferred_candidate(&session,
+                                                               &candidate));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK, session.commit_epoch());
+
+  Preserve_trx_transfer_receiver_record receiver_record;
+  ASSERT_TRUE(registry.lookup(session.epoch_id(), transfer_token,
+                              &receiver_record));
+  Preserve_trx_transfer_manifest final_manifest;
+  final_manifest.epoch_id = receiver_record.epoch_id;
+  final_manifest.source_server_uuid = receiver_record.source_server_uuid;
+  final_manifest.target_server_uuid = receiver_record.target_server_uuid;
+  final_manifest.token = receiver_record.token;
+  final_manifest.source_prepare_lsn = receiver_record.source_prepare_lsn;
+  final_manifest.source_epoch_commit_lsn =
+      receiver_record.source_epoch_commit_lsn;
+  final_manifest.objects = receiver_record.objects;
+
+  const std::string record_payload = metadata_only_record_locks_payload();
+  lock_preserve_record_lock_metadata_facts_t facts;
+  ASSERT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_facts(record_payload,
+                                                           &facts));
+  lock_preserve_metadata_plan_validation_t validation;
+  validation.object_generation = final_manifest.source_epoch_commit_lsn;
+  validation.expected_object_generation =
+      final_manifest.source_epoch_commit_lsn;
+  validation.physical_fence_lsn = final_manifest.source_epoch_commit_lsn;
+  validation.artifact_protocol_version = 1;
+  validation.source_server_version = MYSQL_VERSION_ID;
+  validation.object_digest = test_sha256_hex(record_payload);
+  validation.final_lock_generation_digest =
+      facts.final_lock_generation_digest;
+  validation.page_layout_digest = facts.page_layout_digest;
+  validation.dictionary_generation_digest =
+      facts.dictionary_generation_digest;
+  validation.implicit_native_continuity_proven = true;
+  validation.is_final_quiesced = true;
+  auto prepared_plan = std::make_unique<lock_preserve_metadata_plan_t>();
+  ASSERT_EQ(lock_preserve_metadata_plan_status::OK,
+            lock_preserve_build_record_lock_metadata_plan(
+                record_payload, validation, transfer_metadata_dict_lease_ops(),
+                prepared_plan.get()));
+  ASSERT_TRUE(preserve_trx_transfer_put_receiver_record_lock_plan_for_unit_test(
+      m_dir, final_manifest, std::move(prepared_plan), facts));
+
+  EXPECT_TRUE(registry.all_objects_sealed(session.epoch_id(), transfer_token));
+  EXPECT_EQ(receiver_record.objects.size(),
+            receiver_record.sealed_objects.size());
+
+  const uint64_t deadline_us = my_micro_time() + 5ULL * 1000ULL * 1000ULL;
+  while (my_micro_time() < deadline_us &&
+         preserve_trx_transfer_receiver_seal_prewarm_tokens_status() ==
+             seal_prewarm_before) {
+    my_sleep(1000);
+  }
+  EXPECT_GT(preserve_trx_transfer_receiver_seal_prewarm_tokens_status(),
+            seal_prewarm_before);
+  EXPECT_GT(preserve_trx_transfer_receiver_object_prewarm_count_status(),
+            object_prewarm_before);
+  EXPECT_EQ(preserve_trx_transfer_receiver_object_prewarm_miss_count_status(),
+            object_miss_before);
+}
+#endif
+
+TEST_F(PreserveSnapshotTest,
+       DeferredTransferCandidateReplacesOnlyNewerRecordLockObject) {
+  Transfer_codec_context_guard codec_guard;
+  const uint64_t transfer_token = 713;
+  Preserved_trx_bundle bundle;
+  bundle.metadata = metadata();
+  bundle.metadata.token = test_transfer_token_string(transfer_token);
+
+  Preserved_trx_external_blob record_blob;
+  record_blob.name = kPreservedTrxBlobRecordLocks;
+  record_blob.payload = "record-lock-generation-2";
+  record_blob.lock_plan_contract_version =
+      kPreserveTrxTransferLockPlanContractVersion;
+  record_blob.source_live_lock_generation = 2;
+  record_blob.source_live_lock_digest.fill(0x11);
+  record_blob.record_store_fingerprint.fill(0x21);
+  bundle.external_blobs.push_back(record_blob);
+
+  Preserved_trx_external_blob binlog_blob;
+  binlog_blob.name = kPreservedTrxBlobBinlogCache;
+  binlog_blob.payload = "unchanged-binlog-cache";
+  bundle.external_blobs.push_back(binlog_blob);
+
+  Capturing_transfer_frame_sink frame_sink;
+  Preserve_trx_transfer_source_epoch_session session(
+      "epoch-deferred-replacement", "source-uuid", "target-uuid", 17,
+      &frame_sink);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            session.declare_token(transfer_token));
+
+  Preserve_trx_deferred_transfer_candidate candidate;
+  ASSERT_EQ(Preserve_snapshot_status::OK,
+            preserve_trx_transfer_capture_deferred_candidate(
+                session.epoch_id(), session.source_server_uuid(),
+                session.target_server_uuid(), transfer_token,
+                std::move(bundle), 300, nullptr, &candidate, nullptr));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_stage_deferred_candidate_external_objects(
+                &session, m_dir, &candidate));
+  ASSERT_TRUE(candidate.external_objects_staged);
+  EXPECT_EQ(
+      2U, session.presealed_object_source_live_generation(
+              transfer_token, kPreservedTrxBlobRecordLocks));
+  const size_t first_stage_frame_count = frame_sink.frames().size();
+
+  Preserved_trx_external_blob same_generation = record_blob;
+  same_generation.payload = "same-generation-different-payload";
+  EXPECT_EQ(Preserve_trx_transfer_status::CORRUPT,
+            preserve_trx_transfer_replace_deferred_candidate_record_locks(
+                &candidate, std::move(same_generation)));
+  EXPECT_TRUE(candidate.external_objects_staged);
+
+  Preserved_trx_external_blob stale = record_blob;
+  stale.payload = "record-lock-generation-1";
+  stale.source_live_lock_generation = 1;
+  EXPECT_EQ(Preserve_trx_transfer_status::LOCK_PLAN_STALE,
+            preserve_trx_transfer_replace_deferred_candidate_record_locks(
+                &candidate, std::move(stale)));
+  EXPECT_TRUE(candidate.external_objects_staged);
+
+  Preserved_trx_external_blob replacement = record_blob;
+  replacement.payload = "record-lock-generation-3";
+  replacement.source_live_lock_generation = 3;
+  replacement.source_live_lock_digest.fill(0x12);
+  replacement.record_store_fingerprint.fill(0x22);
+  ASSERT_EQ(
+      Preserve_trx_transfer_status::OK,
+      preserve_trx_transfer_replace_deferred_candidate_record_locks(
+          &candidate, std::move(replacement)));
+  EXPECT_FALSE(candidate.external_objects_staged);
+  ASSERT_EQ(2U, candidate.bundle.external_blobs.size());
+  EXPECT_EQ("record-lock-generation-3",
+            candidate.bundle.external_blobs[0].payload);
+  EXPECT_EQ("unchanged-binlog-cache",
+            candidate.bundle.external_blobs[1].payload);
+
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            preserve_trx_transfer_stage_deferred_candidate_external_objects(
+                &session, m_dir, &candidate));
+  EXPECT_GT(frame_sink.frames().size(), first_stage_frame_count);
 }
 
 TEST_F(PreserveSnapshotTest,

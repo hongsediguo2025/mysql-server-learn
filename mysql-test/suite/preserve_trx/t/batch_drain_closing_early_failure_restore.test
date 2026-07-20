@@ -1,0 +1,109 @@
+# Verify source ownership restoration after failures that occur only after an
+# early token has detached and staged receiver objects.
+--source include/have_debug.inc
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/closing_early_failure.secret
+--write_file $credential_file
+closing-early-failure-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS closing_early_failure_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'closing-early-failure-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+CREATE USER closing_early_failure_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO closing_early_failure_app@localhost;
+
+--let $source_uuid= query_get_value(SELECT @@GLOBAL.server_uuid AS uuid, uuid, 1)
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-receiver-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-allowed-source-uuid=$source_uuid --preserve-trx-transfer-target-server-uuid=$source_uuid --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=closing_early_failure --preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+SET GLOBAL preserve_trx_batch_max_transactions=1;
+SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=ON;
+SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=60000;
+SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
+
+CREATE TABLE t_closing_early_failure(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_closing_early_failure VALUES (1,10);
+
+--connect(closing_early_failure_ha,localhost,preserve_trx_ha_admin,closing-early-failure-secret,test)
+--connect(closing_early_failure_app,localhost,closing_early_failure_app,,test)
+--connect(closing_early_failure_owner,localhost,root,,test)
+
+# Final metadata failure occurs after external objects were staged. The source
+# transaction must be reattached to the same application THD.
+--connection closing_early_failure_app
+START TRANSACTION;
+UPDATE t_closing_early_failure SET v=v+1 WHERE id=1;
+
+--connection closing_early_failure_ha
+SET GLOBAL debug='+d,preserve_trx_early_fail_candidate_finalize';
+
+--connection closing_early_failure_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+
+--connection closing_early_failure_ha
+SET GLOBAL debug='-d,preserve_trx_early_fail_candidate_finalize';
+
+--connection closing_early_failure_app
+UPDATE t_closing_early_failure SET v=v+10 WHERE id=1;
+COMMIT;
+
+--connection default
+--enable_query_log
+SELECT v AS value_after_finalize_failure FROM t_closing_early_failure;
+--disable_query_log
+
+# A record-lock candidate has already been replaced when this injection stops
+# its retransmission. Epoch ABORT and source restoration remain all-or-nothing.
+--connection closing_early_failure_app
+START TRANSACTION;
+UPDATE t_closing_early_failure SET v=v+1 WHERE id=1;
+
+--connection closing_early_failure_ha
+SET GLOBAL debug='+d,preserve_trx_early_force_one_coordinate_drift,preserve_trx_early_fail_replacement_stage';
+
+--connection closing_early_failure_owner
+--error ER_PRESERVE_TRX_UNSUPPORTED
+DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300;
+
+--connection closing_early_failure_ha
+SET GLOBAL debug='-d,preserve_trx_early_force_one_coordinate_drift,preserve_trx_early_fail_replacement_stage';
+
+--connection closing_early_failure_app
+UPDATE t_closing_early_failure SET v=v+100 WHERE id=1;
+COMMIT;
+
+--connection default
+--enable_query_log
+SELECT v AS value_after_replacement_failure FROM t_closing_early_failure;
+--disable_query_log
+
+--disconnect closing_early_failure_app
+--disconnect closing_early_failure_owner
+--disconnect closing_early_failure_ha
+
+--connection default
+DROP TABLE t_closing_early_failure;
+DROP USER closing_early_failure_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+--remove_file $credential_file

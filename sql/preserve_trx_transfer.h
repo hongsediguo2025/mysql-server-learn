@@ -869,6 +869,8 @@ class Preserve_trx_transfer_source_epoch_session {
   bool object_presealed_for_token(
       uint64_t transfer_token,
       const Preserve_trx_transfer_object_descriptor &descriptor) const;
+  uint64_t presealed_object_source_live_generation(
+      uint64_t transfer_token, const std::string &object_id) const;
   Preserve_trx_transfer_status finalize_token_manifest(
       uint64_t transfer_token);
   Preserve_trx_transfer_status send_token_objects(
@@ -1320,6 +1322,48 @@ class Preserve_trx_artifact_sink {
       Preserve_snapshot_delete_status *write_failure_delete_status = nullptr,
       Preserved_trx_store_write_stats *write_stats = nullptr) = 0;
 };
+
+/*
+  Process-local handoff used while CLOSING drains targets independently. The
+  preserve kernel builds the ordinary transfer bundle, but publication is
+  deferred until the drain attempt has validated every preserved target.
+*/
+struct Preserve_trx_deferred_transfer_candidate {
+  std::string epoch_id;
+  std::string source_server_uuid;
+  std::string target_server_uuid;
+  uint64_t transfer_token{0};
+  uint64_t timeout_seconds{0};
+  Preserved_trx_bundle bundle;
+  Preserve_trx_resurrection_index_entry resurrection_entry;
+  bool has_resurrection_entry{false};
+  bool captured{false};
+  bool external_objects_staged{false};
+  bool finalized{false};
+};
+
+Preserve_snapshot_status preserve_trx_transfer_capture_deferred_candidate(
+    const std::string &epoch_id, const std::string &source_server_uuid,
+    const std::string &target_server_uuid, uint64_t transfer_token,
+    Preserved_trx_bundle bundle, uint64_t timeout_seconds,
+    const Preserve_trx_resurrection_index_entry *resurrection_entry,
+    Preserve_trx_deferred_transfer_candidate *candidate,
+    Preserve_snapshot_metadata *written_metadata);
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_stage_deferred_candidate_external_objects(
+    Preserve_trx_transfer_source_epoch_session *session,
+    const std::string &preserve_dir,
+    Preserve_trx_deferred_transfer_candidate *candidate);
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_replace_deferred_candidate_record_locks(
+    Preserve_trx_deferred_transfer_candidate *candidate,
+    Preserved_trx_external_blob replacement);
+
+Preserve_trx_transfer_status preserve_trx_transfer_finalize_deferred_candidate(
+    Preserve_trx_transfer_source_epoch_session *session,
+    Preserve_trx_deferred_transfer_candidate *candidate);
 
 class Preserve_trx_local_carrier_artifact_sink final
     : public Preserve_trx_artifact_sink {

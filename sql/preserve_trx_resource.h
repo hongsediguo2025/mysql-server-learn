@@ -285,6 +285,16 @@ int show_preserve_trx_phase2_detach_claim_us(THD *thd, SHOW_VAR *var,
 int show_preserve_trx_phase2_snapshot_write_us(THD *thd, SHOW_VAR *var,
                                                char *buf);
 int show_preserve_trx_phase2_register_us(THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_early_staged_tokens(THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_command_boundary_to_enqueue_us_max(THD *thd,
+                                                          SHOW_VAR *var,
+                                                          char *buf);
+int show_preserve_trx_final_fast_scan_us(THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_final_dirty_tokens(THD *thd, SHOW_VAR *var, char *buf);
+int show_preserve_trx_final_replacement_tokens(THD *thd, SHOW_VAR *var,
+                                               char *buf);
+int show_preserve_trx_final_validation_rejects(THD *thd, SHOW_VAR *var,
+                                               char *buf);
 int show_preserve_trx_phase2_slo_miss_count(THD *thd, SHOW_VAR *var,
                                             char *buf);
 int show_preserve_trx_resume_total_us(THD *thd, SHOW_VAR *var, char *buf);

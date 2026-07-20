@@ -295,12 +295,8 @@ class _ResetDrainWorkerRuntime(_FakeRuntime):
         return isinstance(exc, _ResetDrainError)
 
 
-class _ResetDrainReleaseWorkerRuntime(_ResetDrainWorkerRuntime):
+class _ResetDrainPostResetWorkerRuntime(_ResetDrainWorkerRuntime):
     def execute(self, conn, sql, fetch=False):
-        if sql == "SELECT 1":
-            self.sql.append(sql)
-            self.calls.append((sql, fetch))
-            raise _DrainInProgressError()
         if (
             sql.startswith("UPDATE `")
             and self.probe_sql is not None
@@ -309,14 +305,9 @@ class _ResetDrainReleaseWorkerRuntime(_ResetDrainWorkerRuntime):
             self.sql.append(sql)
             self.calls.append((sql, fetch))
             self.probe_attempts += 1
-            if self.probe_attempts == 1:
-                raise _DrainInProgressError()
             self.counter += 1
             return ()
         return super().execute(conn, sql, fetch=fetch)
-
-    def is_preserve_draining_rejection(self, exc):
-        return isinstance(exc, _DrainInProgressError)
 
 
 class RecordLockImportReportClassificationTest(unittest.TestCase):
@@ -3087,7 +3078,7 @@ class WorkloadPlanTest(unittest.TestCase):
         self.assertEqual(original.commit_count, 0)
         self.assertGreater(resumed.commit_count, 0)
 
-    def test_standby_receiver_worker_treats_preserved_commit_as_drain_handoff(self):
+    def test_standby_receiver_worker_waits_for_transfer_completion_after_commit_4020(self):
         class PreserveSessionDrained(Exception):
             errno = 4020
 
@@ -3115,13 +3106,18 @@ class WorkloadPlanTest(unittest.TestCase):
             stop_event=stop_event,
         )
         conn = PreserveRejectedCommitConnection()
+        completion = threading.Timer(0.01, stop_event.set)
+        completion.start()
 
-        result = worker._run_transaction(conn, tx_id=1)
+        with self.assertRaisesRegex(
+            RuntimeError, "standby transfer drain completed"
+        ):
+            worker._run_transaction(conn, tx_id=1)
+        completion.join()
 
-        self.assertIs(result, conn)
         self.assertTrue(stop_event.is_set())
 
-    def test_standby_receiver_worker_treats_commit_disconnect_as_drain_handoff(self):
+    def test_standby_receiver_worker_waits_for_transfer_completion_after_commit_disconnect(self):
         class DisconnectCommitConnection(_FakeConnection):
             def commit(self):
                 raise _FakeConnectionLost()
@@ -3129,10 +3125,6 @@ class WorkloadPlanTest(unittest.TestCase):
         class DisconnectRuntime(_FakeRuntime):
             def is_connection_error(self, exc):
                 return isinstance(exc, _FakeConnectionLost)
-
-        class CancelledResumeCoordinator(ResumeCoordinator):
-            def wait_for_resumed_connection(self, sid, timeout_s):
-                raise RuntimeError("drain checkpoint was cancelled before resume")
 
         cfg = HarnessConfig(
             scenario="standby_transfer_receiver_drain_metrics",
@@ -3147,14 +3139,19 @@ class WorkloadPlanTest(unittest.TestCase):
             1,
             WorkloadPlan(cfg),
             DisconnectRuntime(),
-            CancelledResumeCoordinator(cfg.sessions),
+            ResumeCoordinator(cfg.sessions),
             stop_event=stop_event,
         )
         conn = DisconnectCommitConnection()
+        completion = threading.Timer(0.01, stop_event.set)
+        completion.start()
 
-        result = worker._run_transaction(conn, tx_id=1)
+        with self.assertRaisesRegex(
+            RuntimeError, "standby transfer drain completed"
+        ):
+            worker._run_transaction(conn, tx_id=1)
+        completion.join()
 
-        self.assertIs(result, conn)
         self.assertTrue(stop_event.is_set())
 
     def test_worker_resume_wait_covers_full_warmcopy_drain_lifecycle(self):
@@ -5779,6 +5776,12 @@ class WorkloadPlanTest(unittest.TestCase):
                     phase2_savepoint_live_export_target_count=0,
                     phase2_target_pin_us=111,
                     phase2_target_worker_wall_us=222,
+                    early_staged_tokens=2,
+                    command_boundary_to_enqueue_us_max=223,
+                    final_fast_scan_us=224,
+                    final_dirty_tokens=1,
+                    final_replacement_tokens=1,
+                    final_validation_rejects=0,
                     phase2_target_result_collect_us=333,
                     phase2_target_deferred_dir_fsync_us=444,
                     phase2_transfer_commit_epoch_us=555,
@@ -5946,6 +5949,14 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertEqual(
                 report["source_phase2_target_worker_wall_us_samples"], [222]
             )
+            self.assertEqual(report["source_early_staged_tokens_samples"], [2])
+            self.assertEqual(
+                report["source_command_boundary_to_enqueue_us_max_samples"], [223]
+            )
+            self.assertEqual(report["source_final_fast_scan_us_samples"], [224])
+            self.assertEqual(report["source_final_dirty_tokens_samples"], [1])
+            self.assertEqual(report["source_final_replacement_tokens_samples"], [1])
+            self.assertEqual(report["source_final_validation_rejects_samples"], [0])
             self.assertEqual(
                 report["source_phase2_target_result_collect_us_samples"], [333]
             )
@@ -8757,6 +8768,12 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
                 "phase2_savepoint_live_export_target_count=4 "
                 "phase2_target_pin_us=111 "
                 "phase2_target_worker_wall_us=222 "
+                "early_staged_tokens=3 "
+                "command_boundary_to_enqueue_us_max=223 "
+                "final_fast_scan_us=224 "
+                "final_dirty_tokens=1 "
+                "final_replacement_tokens=1 "
+                "final_validation_rejects=0 "
                 "phase2_target_result_collect_us=333 "
                 "phase2_target_deferred_dir_fsync_us=444 "
                 "phase2_transfer_commit_epoch_us=555 "
@@ -8805,6 +8822,12 @@ SET @@SESSION.GTID_NEXT= 'AUTOMATIC' /* added by mysqlbinlog */ /*!*/;
         self.assertEqual(metrics.lock_warmcopy_live_fallback_count(), 10)
         self.assertEqual(metrics.phase2_target_pin_us, 111)
         self.assertEqual(metrics.phase2_target_worker_wall_us, 222)
+        self.assertEqual(metrics.early_staged_tokens, 3)
+        self.assertEqual(metrics.command_boundary_to_enqueue_us_max, 223)
+        self.assertEqual(metrics.final_fast_scan_us, 224)
+        self.assertEqual(metrics.final_dirty_tokens, 1)
+        self.assertEqual(metrics.final_replacement_tokens, 1)
+        self.assertEqual(metrics.final_validation_rejects, 0)
         self.assertEqual(metrics.phase2_target_result_collect_us, 333)
         self.assertEqual(metrics.phase2_target_deferred_dir_fsync_us, 444)
         self.assertEqual(metrics.phase2_transfer_commit_epoch_us, 555)
@@ -10345,6 +10368,77 @@ class ResetDrainHarnessTest(unittest.TestCase):
         )
         self.assertTrue(connection.closed)
 
+    def test_reset_thread_waits_for_live_closing_control_counter(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_reset_drain",
+            repeated_row_write_workload=True,
+            receiver_unix_socket="/tmp/reset-receiver.sock",
+            receiver_preserve_dir="/tmp/reset-receiver/preserve",
+            resume_timeout_s=2.0,
+        ).validate()
+        connection = _FakeConnection()
+        runner.runtime = mock.Mock()
+        status_values = iter((10, 11))
+
+        def execute(_connection, sql, fetch=False):
+            self.assertIs(_connection, connection)
+            if sql.startswith("SELECT VARIABLE_VALUE"):
+                self.assertTrue(fetch)
+                self.assertIn(
+                    "Preserve_trx_closing_control_connection_commands", sql
+                )
+                return [(next(status_values),)]
+            self.assertEqual(sql, "RESET DRAIN")
+            self.assertFalse(fetch)
+            return ()
+
+        runner.runtime.execute.side_effect = execute
+
+        thread, state = runner._start_reset_thread(
+            label="phase2",
+            connection=connection,
+            wait_for_closing_control_commands_after=10,
+        )
+        thread.join(1.0)
+
+        self.assertFalse(thread.is_alive())
+        self.assertIsNone(state["error"])
+        self.assertEqual(runner.runtime.execute.call_count, 3)
+        self.assertTrue(connection.closed)
+
+    def test_reset_cancelled_drain_accepts_4013_only_after_confirmed_win(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.config = HarnessConfig(
+            scenario="standby_transfer_reset_drain",
+            repeated_row_write_workload=True,
+            receiver_unix_socket="/tmp/reset-receiver.sock",
+            receiver_preserve_dir="/tmp/reset-receiver/preserve",
+            resume_timeout_s=2.0,
+        ).validate()
+        runner.runtime = mock.Mock()
+        runner.runtime.execute.side_effect = _DrainInProgressError()
+        runner.runtime.is_preserve_drain_reset.return_value = False
+        runner.runtime.is_preserve_draining_rejection.return_value = True
+        connection = _FakeConnection()
+        runner._source_ha_control_connection = mock.Mock(
+            return_value=connection
+        )
+
+        thread, state = runner._start_reset_aware_drain_thread(
+            label="phase2", debug_actions=[]
+        )
+        thread.join(1.0)
+
+        self.assertFalse(thread.is_alive())
+        with self.assertRaises(AssertionError):
+            runner._join_reset_cancelled_drain(
+                thread, state, reset_win_confirmed=False
+            )
+        runner._join_reset_cancelled_drain(
+            thread, state, reset_win_confirmed=True
+        )
+
     def test_cli_reset_transfer_scenario_applies_phase_and_receiver_load(self):
         cfg = parse_args(
             [
@@ -10445,7 +10539,7 @@ class ResetDrainHarnessTest(unittest.TestCase):
             [(runtime.connection, "rtx_e2e_t00", 1, 3)],
         )
 
-    def test_release_worker_accepts_phase2_draining_rejection_before_reset(self):
+    def test_release_worker_waits_for_reset_and_replays_once(self):
         cfg = HarnessConfig(
             scenario="standby_transfer_reset_drain",
             sessions=1,
@@ -10456,7 +10550,7 @@ class ResetDrainHarnessTest(unittest.TestCase):
             receiver_unix_socket="/tmp/reset-receiver.sock",
             receiver_preserve_dir="/tmp/reset-receiver/preserve",
         ).validate()
-        runtime = _ResetDrainReleaseWorkerRuntime()
+        runtime = _ResetDrainPostResetWorkerRuntime()
         coordinator = ResetDrainCoordinator(sessions=1)
         worker = ResetDrainWorker(
             sid=1,
@@ -10470,54 +10564,17 @@ class ResetDrainHarnessTest(unittest.TestCase):
         worker.start()
         self.assertTrue(coordinator.wait_all_transactions_prepared(timeout_s=1.0))
         runtime.probe_sql = worker.probe_sql
-        coordinator.allow_drain_probe()
-        self.assertTrue(coordinator.wait_all_probes_started(timeout_s=1.0))
+        time.sleep(0.02)
+        self.assertEqual(runtime.probe_attempts, 0)
         coordinator.allow_replay_after_reset(time.monotonic_ns() // 1000)
         worker.join(1.0)
 
         self.assertFalse(worker.is_alive())
         self.assertIsNone(worker.error)
         self.assertTrue(worker.committed)
-        self.assertEqual(coordinator.draining_rejected_count(), 1)
         self.assertEqual(coordinator.drained_count(), 0)
-        self.assertEqual(runtime.probe_attempts, 2)
-
-    def test_release_worker_uses_original_transaction_as_closing_sentinel(self):
-        cfg = HarnessConfig(
-            scenario="standby_transfer_reset_drain",
-            sessions=1,
-            table_count=1,
-            statements_per_tx=3,
-            seed_rows_per_table_per_session=1,
-            repeated_row_write_workload=True,
-            receiver_unix_socket="/tmp/reset-receiver.sock",
-            receiver_preserve_dir="/tmp/reset-receiver/preserve",
-        ).validate()
-        runtime = _ResetDrainReleaseWorkerRuntime()
-        coordinator = ResetDrainCoordinator(sessions=1)
-        worker = ResetDrainWorker(
-            sid=1,
-            plan=WorkloadPlan(cfg),
-            runtime=runtime,
-            coordinator=coordinator,
-            timeout_s=2.0,
-            require_session_drained=False,
-            wait_for_closing_rejection=True,
-        )
-
-        worker.start()
-        self.assertTrue(coordinator.wait_all_transactions_prepared(timeout_s=1.0))
-        coordinator.allow_drain_probe()
-        self.assertTrue(coordinator.wait_any_closing_rejection(timeout_s=1.0))
-        coordinator.allow_replay_after_reset(time.monotonic_ns() // 1000)
-        worker.join(1.0)
-
-        self.assertFalse(worker.is_alive())
-        self.assertIsNone(worker.error)
-        self.assertTrue(worker.committed)
-        self.assertEqual(runtime.sql.count("SELECT 1"), 1)
-        self.assertEqual(coordinator.draining_rejected_count(), 1)
-        self.assertEqual(coordinator.replayed_count(), 1)
+        self.assertEqual(runtime.probe_attempts, 1)
+        self.assertEqual(worker.original_connection_id, worker.replay_connection_id)
 
     def test_runtime_recognizes_drain_cancelled_by_reset(self):
         exc = type("DrainReset", (Exception,), {"errno": 4021})()

@@ -1,0 +1,163 @@
+# The early-pipeline boundary is coordinated with DEBUG_SYNC. Release builds
+# exercise the same public behavior through the transfer E2E harness.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_windows.inc
+--source include/not_log_bin.inc
+--source include/force_restart.inc
+
+--disable_query_log
+--let $credential_file= $MYSQL_TMP_DIR/closing_early_pipeline.secret
+--write_file $credential_file
+closing-early-pipeline-secret
+EOF
+--exec chmod 600 $credential_file
+
+--disable_warnings
+DROP USER IF EXISTS preserve_trx_ha_admin@localhost;
+DROP USER IF EXISTS closing_early_app@localhost;
+--enable_warnings
+CREATE USER preserve_trx_ha_admin@localhost
+  IDENTIFIED BY 'closing-early-pipeline-secret';
+GRANT SHUTDOWN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO preserve_trx_ha_admin@localhost;
+GRANT PRESERVE_TRX_TRANSFER_ADMIN ON *.*
+  TO preserve_trx_ha_admin@localhost;
+GRANT SELECT ON performance_schema.* TO preserve_trx_ha_admin@localhost;
+CREATE USER closing_early_app@localhost;
+GRANT SELECT, UPDATE ON test.* TO closing_early_app@localhost;
+GRANT SESSION_VARIABLES_ADMIN ON *.* TO closing_early_app@localhost;
+
+--let $source_uuid= query_get_value(SELECT @@GLOBAL.server_uuid AS uuid, uuid, 1)
+--let $restart_parameters= restart: --preserve-trx-enable=ON --preserve-trx-transfer-receiver-enable=ON --preserve-trx-transfer-artifact-mode=STANDBY_TRANSFER_SAVE --preserve-trx-transfer-allowed-source-uuid=$source_uuid --preserve-trx-transfer-target-server-uuid=$source_uuid --preserve-trx-transfer-target-socket=$MASTER_MYSOCK --preserve-trx-transfer-target-user=preserve_trx_ha_admin --preserve-trx-transfer-credential-name=closing_early_pipeline --preserve-trx-transfer-credential-secret-file=$credential_file
+--disable_result_log
+--source include/restart_mysqld.inc
+--enable_result_log
+--let $restart_parameters=
+--disable_query_log
+
+SET GLOBAL preserve_trx_enable=ON;
+SET GLOBAL preserve_trx_batch_max_transactions=2;
+SET GLOBAL preserve_trx_drain_command_timeout_fail_batch=ON;
+SET GLOBAL preserve_trx_drain_closing_command_timeout_ms=60000;
+SET GLOBAL preserve_trx_transfer_prewarm_paused=ON;
+
+CREATE TABLE t_closing_early_pipeline(
+  id INT PRIMARY KEY,
+  v INT NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_closing_early_pipeline VALUES (1,10),(2,20);
+delimiter |;
+CREATE PROCEDURE p_closing_early_pipeline()
+BEGIN
+  UPDATE t_closing_early_pipeline SET v=v+20 WHERE id=2;
+END|
+delimiter ;|
+GRANT EXECUTE ON PROCEDURE test.p_closing_early_pipeline
+  TO closing_early_app@localhost;
+
+--connect(closing_early_ha,localhost,preserve_trx_ha_admin,closing-early-pipeline-secret,test)
+
+--connect(closing_early_app_1,localhost,closing_early_app,,test)
+START TRANSACTION;
+UPDATE t_closing_early_pipeline SET v=v+1 WHERE id=1;
+SET DEBUG_SYNC=
+  'before_execute_sql_command SIGNAL closing_early_app_1_blocked WAIT_FOR closing_early_app_1_continue';
+--send UPDATE t_closing_early_pipeline SET v=v+10 WHERE id=1
+
+--connect(closing_early_app_2,localhost,closing_early_app,,test)
+START TRANSACTION;
+UPDATE t_closing_early_pipeline SET v=v+1 WHERE id=2;
+SET DEBUG_SYNC=
+  'sp_lex_instr_before_exec_core SIGNAL closing_early_app_2_blocked WAIT_FOR closing_early_app_2_continue';
+--send CALL p_closing_early_pipeline()
+
+# An in-flight ordinary command without an explicit transaction belongs to the
+# CLOSING wait set, but it is not a Preserve token and must not disable the
+# per-token early pipeline for the two transactions above.
+--connect(closing_early_probe,localhost,closing_early_app,,test)
+SET DEBUG_SYNC=
+  'before_execute_sql_command SIGNAL closing_early_probe_blocked WAIT_FOR closing_early_probe_continue';
+--send DO 1
+
+--connection default
+SET DEBUG_SYNC='now WAIT_FOR closing_early_app_1_blocked TIMEOUT 10';
+SET DEBUG_SYNC='now WAIT_FOR closing_early_app_2_blocked TIMEOUT 10';
+SET DEBUG_SYNC='now WAIT_FOR closing_early_probe_blocked TIMEOUT 10';
+
+--connection closing_early_ha
+SET @accepted_before=(
+  SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs');
+
+--connect(closing_early_owner,localhost,root,,test)
+SET DEBUG_SYNC=
+  'preserve_trx_warmcopy_after_closing_state_before_targets SIGNAL closing_early_entered';
+SET DEBUG_SYNC=
+  'preserve_trx_batch_after_one_target_preserved SIGNAL closing_early_first_staged';
+--send DRAIN TRANSACTIONS PRESERVE WITH TIMEOUT 300
+
+--connection closing_early_ha
+SET DEBUG_SYNC='now WAIT_FOR closing_early_entered TIMEOUT 30';
+SET DEBUG_SYNC='now SIGNAL closing_early_app_1_continue';
+SET DEBUG_SYNC='now SIGNAL closing_early_probe_continue';
+
+--connection closing_early_app_1
+--reap
+
+--connection closing_early_probe
+--reap
+
+# The second old command is still blocked. The early pipeline must preserve
+# token 1 now instead of waiting for token 2 to reach its command boundary.
+--connection closing_early_ha
+SET DEBUG_SYNC='now WAIT_FOR closing_early_first_staged TIMEOUT 10';
+SELECT (SELECT VARIABLE_VALUE+0 FROM performance_schema.global_status
+        WHERE VARIABLE_NAME='Preserve_trx_transfer_receiver_active_epochs')
+       - @accepted_before AS accepted_epoch_delta_before_final_ack;
+
+--connect(closing_early_reset,localhost,preserve_trx_ha_admin,closing-early-pipeline-secret,test)
+--send RESET DRAIN
+
+--connection closing_early_ha
+SET DEBUG_SYNC='now SIGNAL closing_early_app_2_continue';
+
+--connection closing_early_app_2
+--reap
+
+--connection closing_early_reset
+--reap
+
+--connection closing_early_owner
+--error 4021
+--reap
+
+# RESET restores the early-preserved transaction to its original THD and
+# leaves the still-running old command on its original THD.
+--connection closing_early_app_1
+UPDATE t_closing_early_pipeline SET v=v+100 WHERE id=1;
+COMMIT;
+--connection closing_early_app_2
+UPDATE t_closing_early_pipeline SET v=v+200 WHERE id=2;
+COMMIT;
+
+--connection default
+--enable_query_log
+SELECT GROUP_CONCAT(CONCAT(id, ':', v) ORDER BY id) AS committed_values
+  FROM t_closing_early_pipeline;
+--disable_query_log
+
+--disconnect closing_early_app_1
+--disconnect closing_early_app_2
+--disconnect closing_early_probe
+--disconnect closing_early_reset
+--disconnect closing_early_owner
+--disconnect closing_early_ha
+
+--connection default
+DROP PROCEDURE p_closing_early_pipeline;
+DROP TABLE t_closing_early_pipeline;
+DROP USER closing_early_app@localhost;
+DROP USER preserve_trx_ha_admin@localhost;
+SET GLOBAL preserve_trx_enable=ON;
+--remove_file $credential_file

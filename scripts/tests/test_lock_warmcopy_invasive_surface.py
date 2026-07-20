@@ -110,6 +110,7 @@ class LockWarmcopyInvasiveSurfaceTest(unittest.TestCase):
             "sql/preserve_trx_drain.cc",
             "sql/preserve_trx_drain.h",
             "sql/preserve_trx_transfer.cc",
+            "sql/preserve_trx_transfer.h",
             "sql/sql_parse.cc",
             "sql/sql_parse.h",
             "sql/sql_rewrite.cc",

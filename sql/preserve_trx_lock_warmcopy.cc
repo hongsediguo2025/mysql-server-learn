@@ -158,6 +158,17 @@ void attach_record_store_contract(
              commitment.size(), blob->source_live_lock_digest.data());
 }
 
+bool record_live_fence_matches_phase1(
+    const lock_warmcopy_trx_lock_fence_t &phase1,
+    const lock_warmcopy_trx_lock_fence_t &current) {
+  return !current.conversion_attempt_after_freeze &&
+         !current.conversion_unhandled_after_freeze &&
+         phase1.trx_locks_version == current.trx_locks_version &&
+         phase1.n_rec_locks == current.n_rec_locks &&
+         (current.n_rec_locks == 0 ||
+          phase1.coordinate_generation == current.coordinate_generation);
+}
+
 bool read_le32(const std::string &payload, size_t *offset, uint32_t *value) {
   if (offset == nullptr || value == nullptr || *offset > payload.size() ||
       payload.size() - *offset < 4) {
@@ -1816,6 +1827,7 @@ Preserve_trx_lock_warmcopy_drain_participant::
 
 bool Preserve_trx_lock_warmcopy_drain_participant::open_phase1() {
   m_record_store_cleanup_deferred_for_shutdown = false;
+  m_early_targets_prepared = false;
   if (!preserve_trx_lock_warmcopy_cleanup_orphan_spill_files()) return false;
   /*
     The epoch is the admission boundary for phase-1 lock observations. Hooks
@@ -1856,12 +1868,14 @@ bool Preserve_trx_lock_warmcopy_drain_participant::close_phase1() {
     prebuilt or mirrored record-lock artifact is still usable.
   */
   lock_warmcopy_close_epoch();
-  for (const uint64_t thread_id : m_target_thread_ids) {
-    auto target_it = m_targets.find(thread_id);
-    if (target_it == m_targets.end()) continue;
-    target_it->second.phase1_record_fence_valid =
-        lock_warmcopy_record_store_fence_for_target(
-            thread_id, &target_it->second.phase1_record_fence);
+  if (!m_early_targets_prepared) {
+    for (const uint64_t thread_id : m_target_thread_ids) {
+      auto target_it = m_targets.find(thread_id);
+      if (target_it == m_targets.end()) continue;
+      target_it->second.phase1_record_fence_valid =
+          lock_warmcopy_record_store_fence_for_target(
+              thread_id, &target_it->second.phase1_record_fence);
+    }
   }
   if (m_observation.state != Preserve_trx_drain_participant_state::ABANDONED) {
     m_observation.state = Preserve_trx_drain_participant_state::READY;
@@ -1887,6 +1901,12 @@ bool Preserve_trx_lock_warmcopy_drain_participant::phase2_preflight(
 
   if (!phase1_ready()) return false;
   if (!m_options.enabled || m_target_thread_ids.empty()) return true;
+  if (m_early_targets_prepared) {
+    m_artifacts.clear();
+    m_observation.owns_artifact = false;
+    m_observation.state = Preserve_trx_drain_participant_state::READY;
+    return true;
+  }
 
   m_artifacts.clear();
   m_observation.owns_artifact = false;
@@ -2544,9 +2564,10 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
 
 void Preserve_trx_lock_warmcopy_drain_participant::discard_phase1_record_blob(
     Target_session *target) {
-  if (target == nullptr || !target->has_phase1_record_prebuilt_blob) return;
+  if (target == nullptr) return;
 
-  if (!m_options.preserve_dir.empty() &&
+  if (target->has_phase1_record_prebuilt_blob &&
+      !m_options.preserve_dir.empty() &&
       !target->phase1_record_prebuilt_blob.warmcopy_id.empty()) {
     std::unique_ptr<Preserved_trx_warm_external_blob_carrier> carrier =
         create_preserved_trx_default_warm_external_blob_carrier(
@@ -2561,6 +2582,8 @@ void Preserve_trx_lock_warmcopy_drain_participant::discard_phase1_record_blob(
   target->phase1_record_prebuilt_blob = PrebuiltRecordLocksBlob{};
   target->phase1_record_prebuilt_fence_valid = false;
   target->phase1_record_prebuilt_fence = lock_warmcopy_record_store_fence_t{};
+  target->phase1_record_live_fence_valid = false;
+  target->phase1_record_live_fence = lock_warmcopy_trx_lock_fence_t{};
 }
 
 bool Preserve_trx_lock_warmcopy_drain_participant::
@@ -2895,6 +2918,7 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
   }
 
   std::vector<uint64_t> target_ids;
+  std::vector<uint64_t> prebuilt_target_ids;
   lock_warmcopy_record_store_target_ids(&target_ids);
   for (const uint64_t target_id : target_ids) {
     if (target_id == 0) continue;
@@ -2910,12 +2934,8 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
     if (!seed_phase1_record_payload_for_thread(target_id,
                                                record_locks_payload)) {
       lock_warmcopy_record_store_clear_for_target(target_id);
-    } else if (blob_ready) {
-      PrebuiltRecordLocksBlob blob;
-      if (!phase1_record_prebuilt_blob_for_thread(target_id, &blob) ||
-          !blob_ready(target_id, blob)) {
-        return false;
-      }
+    } else {
+      prebuilt_target_ids.push_back(target_id);
     }
   }
   if (!target_ids.empty() && Global_THD_manager::get_instance() != nullptr) {
@@ -2926,6 +2946,20 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
     Global_THD_manager::get_instance()->do_for_all_thd_copy(
         &non_record_sampler);
     for (const uint64_t target_id : target_ids) {
+      auto target_it = m_targets.find(target_id);
+      if (target_it != m_targets.end()) {
+        target_it->second.phase1_record_live_fence_valid =
+            non_record_sampler.fence_for_thread(
+                target_id, &target_it->second.phase1_record_live_fence);
+        if (target_it->second.phase1_record_live_fence_valid &&
+            target_it->second.has_phase1_record_prebuilt_blob &&
+            target_it->second.phase1_record_prebuilt_fence_valid) {
+          attach_record_store_contract(
+              target_it->second.phase1_record_prebuilt_fence,
+              &target_it->second.phase1_record_prebuilt_blob,
+              &target_it->second.phase1_record_live_fence);
+        }
+      }
       std::string table_locks_payload;
       uint32_t table_lock_count = 0;
       bool autoinc_lock_owned = false;
@@ -2940,6 +2974,15 @@ bool Preserve_trx_lock_warmcopy_drain_participant::
             target_id, table_locks_payload, table_lock_count,
             autoinc_lock_owned, mdl_descriptors_payload,
             mdl_descriptor_count);
+      }
+    }
+  }
+  if (blob_ready) {
+    for (const uint64_t target_id : prebuilt_target_ids) {
+      PrebuiltRecordLocksBlob blob;
+      if (!phase1_record_prebuilt_blob_for_thread(target_id, &blob) ||
+          !blob_ready(target_id, blob)) {
+        return false;
       }
     }
   }
@@ -3007,6 +3050,10 @@ bool Preserve_trx_lock_warmcopy_drain_participant::prepare_quiesced_targets(
           old_it->second.phase1_record_prebuilt_fence_valid;
       session.phase1_record_prebuilt_fence =
           old_it->second.phase1_record_prebuilt_fence;
+      session.phase1_record_live_fence_valid =
+          old_it->second.phase1_record_live_fence_valid;
+      session.phase1_record_live_fence =
+          old_it->second.phase1_record_live_fence;
       if (m_options.validate_canonical_equivalence) {
         session.record_locks_payload = old_it->second.record_locks_payload;
       }
@@ -3066,6 +3113,209 @@ bool Preserve_trx_lock_warmcopy_drain_participant::prepare_quiesced_targets(
   refresh_phase1_record_prebuilt_observation();
   m_observation.failure_reason.clear();
   return true;
+}
+
+bool Preserve_trx_lock_warmcopy_drain_participant::prepare_quiesced_target(
+    THD *target, Preserve_trx_lock_warmcopy_artifact *artifact) {
+  if (target == nullptr || artifact == nullptr) return false;
+
+  auto reject_candidate = [&](Preserve_trx_lock_warmcopy_reason reason) {
+    *artifact = invalid_artifact(reason);
+    preserve_trx_lock_warmcopy_note_target_sealed_invalid(reason);
+    return true;
+  };
+
+  preserve_trx_lock_warmcopy_note_target_attempt();
+  const uint64_t thread_id = static_cast<uint64_t>(target->thread_id());
+  const auto target_it = m_targets.find(thread_id);
+  if (!m_options.enabled || target_it == m_targets.end()) {
+    return reject_candidate(
+        Preserve_trx_lock_warmcopy_reason::ARTIFACT_INVALID);
+  }
+
+  const std::vector<uint64_t> target_ids{thread_id};
+  const std::set<uint64_t> skip_record_export{thread_id};
+  Lock_warmcopy_target_fence_sampler sampler(
+      target_ids, m_options.max_lock_count, skip_record_export);
+  sampler(target);
+
+  lock_warmcopy_trx_lock_fence_t current_live_fence;
+  std::string table_locks_payload;
+  uint32_t table_lock_count = 0;
+  bool autoinc_lock_owned = false;
+  std::string mdl_descriptors_payload;
+  uint32_t mdl_descriptor_count = 0;
+  if (!sampler.fence_for_thread(thread_id, &current_live_fence) ||
+      !sampler.table_locks_for_thread(thread_id, &table_locks_payload,
+                                      &table_lock_count,
+                                      &autoinc_lock_owned) ||
+      !sampler.mdl_descriptors_for_thread(
+          thread_id, &mdl_descriptors_payload, &mdl_descriptor_count)) {
+    return reject_candidate(
+        Preserve_trx_lock_warmcopy_reason::ARTIFACT_INVALID);
+  }
+
+  const Target_session &phase1 = target_it->second;
+  Preserve_trx_lock_warmcopy_artifact candidate;
+  candidate.record_live_seal_fence_valid = true;
+  candidate.record_live_seal_fence = current_live_fence;
+  candidate.table_locks_payload = std::move(table_locks_payload);
+  candidate.table_lock_count = table_lock_count;
+  candidate.autoinc_lock_owned = autoinc_lock_owned;
+  candidate.mdl_descriptors_payload = std::move(mdl_descriptors_payload);
+  candidate.mdl_descriptor_count = mdl_descriptor_count;
+
+  if (current_live_fence.n_rec_locks != 0) {
+    if (!phase1.record_locks_candidate_valid ||
+        !phase1.record_locks_seeded_in_phase1 ||
+        !phase1.has_phase1_record_prebuilt_blob ||
+        !phase1.phase1_record_prebuilt_fence_valid ||
+        !phase1.phase1_record_live_fence_valid ||
+        phase1.phase1_record_prebuilt_blob.warmcopy_id.empty() ||
+        phase1.phase1_record_prebuilt_blob.size == 0 ||
+        phase1.phase1_record_prebuilt_blob.lock_plan_contract_version == 0 ||
+        phase1.phase1_record_prebuilt_blob.source_live_lock_generation == 0) {
+      return reject_candidate(
+          Preserve_trx_lock_warmcopy_reason::ARTIFACT_INVALID);
+    }
+    if (!record_live_fence_matches_phase1(
+            phase1.phase1_record_live_fence, current_live_fence)) {
+      return reject_candidate(
+          Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED);
+    }
+
+    lock_warmcopy_record_store_fence_t current_store_fence;
+    if (!lock_warmcopy_record_store_fence_for_target(
+            thread_id, &current_store_fence) ||
+        !lock_warmcopy_record_store_fence_equal(
+            phase1.phase1_record_prebuilt_fence, current_store_fence)) {
+      return reject_candidate(
+          Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED);
+    }
+
+    lock_warmcopy_record_seal_result_t seal_result;
+    if (!lock_warmcopy_record_store_seal_metadata_for_target(
+            thread_id, phase1.phase1_record_prebuilt_fence,
+            phase1.record_lock_count, m_options.max_lock_count,
+            m_options.max_journal_bytes, m_options.max_dirty_shards,
+            &seal_result)) {
+      return false;
+    }
+    preserve_trx_lock_warmcopy_note_record_store_observation(
+        seal_result.journal_bytes, seal_result.dirty_shard_count);
+    if (seal_result.status !=
+            lock_warmcopy_record_seal_status_t::SEALED_VALID &&
+        seal_result.status != lock_warmcopy_record_seal_status_t::EMPTY) {
+      const Preserve_trx_lock_warmcopy_reason reason =
+          seal_result.status ==
+                  lock_warmcopy_record_seal_status_t::RESOURCE_LIMIT_EXCEEDED
+              ? Preserve_trx_lock_warmcopy_reason::RESOURCE_LIMIT_EXCEEDED
+              : Preserve_trx_lock_warmcopy_reason::SEAL_FENCE_CHANGED;
+      return reject_candidate(reason);
+    }
+
+    candidate.has_prebuilt_record_locks_blob = true;
+    candidate.prebuilt_record_locks_blob =
+        phase1.phase1_record_prebuilt_blob;
+    candidate.record_store_fence_valid = true;
+    candidate.record_store_fence = seal_result.seal_fence;
+    candidate.record_lock_count = seal_result.record_lock_count;
+  }
+
+  const uint64_t combined_lock_count =
+      static_cast<uint64_t>(candidate.record_lock_count) +
+      candidate.table_lock_count;
+  if (combined_lock_count > m_options.max_lock_count ||
+      candidate.mdl_descriptor_count > m_options.max_mdl_descriptors ||
+      (candidate.has_prebuilt_record_locks_blob &&
+       candidate.prebuilt_record_locks_blob.size >
+           m_options.max_journal_bytes) ||
+      artifact_resident_payload_bytes(candidate) >
+          m_options.max_memory_bytes) {
+    return reject_candidate(
+        Preserve_trx_lock_warmcopy_reason::RESOURCE_LIMIT_EXCEEDED);
+  }
+
+  candidate.record_predicate_table_lock_count =
+      static_cast<uint32_t>(combined_lock_count);
+  candidate.valid = true;
+  candidate.reason = Preserve_trx_lock_warmcopy_reason::OK;
+  candidate.source = Preserve_trx_lock_warmcopy_artifact_source::WARM_COPY;
+  preserve_trx_lock_warmcopy_note_target_sealed_valid(
+      artifact_payload_bytes(candidate));
+  *artifact = std::move(candidate);
+  return true;
+}
+
+bool Preserve_trx_lock_warmcopy_drain_participant::
+    complete_early_prepared_targets(
+        const std::vector<uint64_t> &thread_ids) {
+  const std::set<uint64_t> completed(thread_ids.begin(), thread_ids.end());
+  if (completed.size() != thread_ids.size()) return false;
+
+  /*
+    Phase 1 may observe transactions that commit before CLOSING selects the
+    final survivor set. Early preparation is already complete for every
+    survivor, so only discard process-local state owned by non-survivors; do
+    not rebuild or clear the survivor artifacts.
+  */
+  for (const uint64_t old_thread_id : m_target_thread_ids) {
+    if (completed.count(old_thread_id) != 0) continue;
+    auto old_it = m_targets.find(old_thread_id);
+    if (old_it != m_targets.end()) discard_phase1_record_blob(&old_it->second);
+    lock_warmcopy_record_store_clear_for_target(old_thread_id);
+    m_artifacts.erase(old_thread_id);
+  }
+  for (auto it = m_targets.begin(); it != m_targets.end();) {
+    if (completed.count(it->first) == 0) {
+      it = m_targets.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  m_target_thread_ids = thread_ids;
+  m_early_targets_prepared = true;
+  return true;
+}
+
+bool Preserve_trx_lock_warmcopy_drain_participant::
+    bind_early_live_record_blob(
+        uint64_t thread_id,
+        const lock_warmcopy_trx_lock_fence_t &live_fence,
+        uint64_t minimum_publication_generation,
+        Preserved_trx_external_blob *blob) {
+  if (blob == nullptr || blob->prebuilt || blob->payload.empty() ||
+      blob->name != kPreservedTrxBlobRecordLocks) {
+    return false;
+  }
+  lock_warmcopy_record_store_fence_t store_fence;
+  if (!lock_warmcopy_record_store_seed_payload_for_target(
+          thread_id, blob->payload, nullptr) ||
+      !lock_warmcopy_record_store_fence_for_target(thread_id, &store_fence)) {
+    return false;
+  }
+  PrebuiltRecordLocksBlob contract;
+  attach_record_store_contract(store_fence, &contract, &live_fence);
+  if (contract.source_live_lock_generation <=
+      minimum_publication_generation) {
+    if (minimum_publication_generation ==
+        std::numeric_limits<uint64_t>::max()) {
+      return false;
+    }
+    /*
+      The digest binds the live lock plan; the generation orders publications
+      of that plan. Reseeding an equivalent-sized store may reproduce its raw
+      counters, so a replacement must advance past the object already sent.
+    */
+    contract.source_live_lock_generation =
+        minimum_publication_generation + 1;
+  }
+  blob->lock_plan_contract_version = contract.lock_plan_contract_version;
+  blob->source_live_lock_generation = contract.source_live_lock_generation;
+  blob->source_live_lock_digest = contract.source_live_lock_digest;
+  blob->record_store_fingerprint = contract.record_store_fingerprint;
+  return blob->lock_plan_contract_version != 0 &&
+         blob->source_live_lock_generation != 0;
 }
 
 bool Preserve_trx_lock_warmcopy_drain_participant::
