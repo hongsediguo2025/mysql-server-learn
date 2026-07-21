@@ -50,6 +50,7 @@ class Preserve_trx_cleanup_lease;
 class Preserve_trx_physical_fence_lease;
 struct Preserve_trx_prepared_token_key;
 struct Preserve_trx_deferred_transfer_candidate;
+struct Preserve_trx_resurrection_index_entry;
 struct Mysql_binlog_preserve_cache_facts;
 struct Mysql_binlog_preserve_token_identity;
 
@@ -711,12 +712,20 @@ struct Preserved_trx_physical_adopt_result {
 Preserved_trx_physical_adopt_status
 preserved_trx_adopt_prepared_for_physical_promotion(
     const std::string &dir, Preserve_trx_gate_adopt_lease *adopt_lease,
+    trx_t *prepared_trx,
     Preserve_trx_physical_fence_lease *physical_lease,
     uint64_t operation_deadline_us,
     Preserved_trx_physical_adopt_result *result);
 
+bool preserved_trx_register_physical_resurrection_candidates(
+    const std::vector<Preserve_trx_resurrection_index_entry> &entries);
+
 bool preserved_trx_reverse_simulated_promotion_adopt(
     const Preserve_trx_prepared_token_key &key,
+    trx_t *prepared_trx, Preserve_trx_cleanup_lease *cleanup_lease,
+    Preserve_trx_physical_fence_lease *physical_lease, std::string *reason);
+bool preserved_trx_rollback_physical_promotion_adopt(
+    const Preserve_trx_prepared_token_key &key, trx_t *prepared_trx,
     Preserve_trx_cleanup_lease *cleanup_lease,
     Preserve_trx_physical_fence_lease *physical_lease, std::string *reason);
 

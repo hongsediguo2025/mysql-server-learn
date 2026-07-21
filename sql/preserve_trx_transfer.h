@@ -347,8 +347,9 @@ struct Preserve_trx_transfer_lock_plan_contract {
     Version zero means the object has no strict live-lock freshness proof.
     Version two binds a record-lock payload to the source mirror generation
     and fingerprint sampled at its quiesced export boundary. The terminal
-    proof bit is test-only in this delivery; production promotion must still
-    obtain its fence from the physical apply provider.
+    proof bit is test-only in this delivery; production still needs a source
+    terminal lock-plan freshness proof before the token can become READY.
+    Physical redo completion and freeze are a separate coordinator contract.
   */
   uint16_t version{0};
   uint64_t source_live_generation{0};
@@ -503,6 +504,7 @@ enum class Preserve_trx_transfer_epoch_lifecycle : uint8_t {
   PREWARMING,
   READY,
   ADOPT_LEASED,
+  ABANDONING,
   EXPIRED
 };
 
@@ -594,11 +596,19 @@ class Preserve_trx_transfer_receiver_registry {
       uint64_t ready_deadline_monotonic_us);
   Preserve_trx_receiver_promotion_lease_status
   try_acquire_accepted_epoch_promotion_lease(
-      const std::string &root_dir, const std::string &epoch_id, uint64_t now_us);
+      const std::string &root_dir, const std::string &epoch_id, uint64_t now_us,
+      const std::string &expected_receiver_process_generation,
+      Preserve_trx_transfer_accepted_epoch *accepted);
+  Preserve_trx_transfer_status abandon_accepted_epoch_promotion_lease(
+      const Preserve_trx_transfer_accepted_epoch &accepted);
+  Preserve_trx_transfer_status complete_accepted_epoch_promotion_lease(
+      const Preserve_trx_transfer_accepted_epoch &accepted);
   size_t expire_accepted_epochs_once(
       uint64_t now_us,
       std::vector<Preserve_trx_transfer_accepted_epoch> *expired);
   Preserve_trx_transfer_status erase_expired_epoch(
+      const std::string &root_dir, const std::string &epoch_id);
+  Preserve_trx_transfer_status erase_abandoning_epoch(
       const std::string &root_dir, const std::string &epoch_id);
   size_t retire_acknowledged_epochs_once(uint64_t now_us);
   Preserve_trx_transfer_status mark_corrupt(const std::string &epoch_id,
@@ -666,6 +676,9 @@ class Preserve_trx_transfer_receiver_registry {
   Preserve_trx_transfer_status mark_terminal_locked(
       const Token_key &key, Preserve_trx_transfer_receiver_state state,
       const std::string &reason);
+  Preserve_trx_transfer_status erase_cleaned_epoch(
+      const std::string &root_dir, const std::string &epoch_id,
+      Preserve_trx_transfer_epoch_lifecycle expected_lifecycle);
 
   mutable std::mutex m_mutex;
   std::condition_variable m_sequence_condition;
@@ -1022,7 +1035,17 @@ preserve_trx_transfer_acknowledge_epoch_for_unit_test(
 void preserve_trx_transfer_receiver_reaper_scan_once(uint64_t now_us);
 Preserve_trx_receiver_promotion_lease_status
 preserve_trx_transfer_try_acquire_receiver_promotion_lease(
-    const std::string &root_dir, const std::string &epoch_id, uint64_t now_us);
+    const std::string &root_dir, const std::string &epoch_id, uint64_t now_us,
+    Preserve_trx_transfer_accepted_epoch *accepted);
+Preserve_trx_transfer_status
+preserve_trx_transfer_abandon_receiver_promotion_lease_process_local(
+    Preserve_trx_transfer_accepted_epoch *accepted);
+Preserve_trx_transfer_status
+preserve_trx_transfer_complete_receiver_promotion_lease_process_local(
+    const Preserve_trx_transfer_accepted_epoch &accepted);
+Preserve_trx_transfer_status
+preserve_trx_transfer_destroy_abandoning_receiver_epoch_process_local(
+    const Preserve_trx_transfer_accepted_epoch &accepted);
 void preserve_trx_transfer_receiver_reaper_scan_for_unit_test(
     uint64_t now_us, Preserve_trx_transfer_receiver_registry *registry);
 Preserve_trx_transfer_status

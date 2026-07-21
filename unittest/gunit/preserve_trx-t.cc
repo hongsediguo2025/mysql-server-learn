@@ -169,14 +169,14 @@ void test_physical_fence_release(void *opaque_lease) {
 
 }  // namespace
 
-TEST(PreservedTrxPhysicalFence, ProductionPathRejectsMissingProvider) {
+TEST(PreservedTrxPhysicalFence, SimulatorProviderStartsEmpty) {
   preserved_trx_set_physical_fence_provider_for_unit_test(nullptr);
   Preserve_trx_physical_fence_lease lease;
   EXPECT_EQ(Preserve_trx_physical_fence_status::MISSING_PROVIDER,
-            preserved_trx_acquire_production_physical_fence_lease(
+            preserved_trx_acquire_physical_fence_lease_for_unit_test(
                 make_test_physical_fence_proof(
                     Preserve_trx_physical_consistency_mode::
-                        PRODUCTION_REDO_APPLY_FENCE),
+                        TEST_ONLY_PHYSICAL_FENCE_SIMULATOR),
                 &lease));
   EXPECT_FALSE(lease.acquired());
 }
@@ -229,33 +229,24 @@ TEST(PreservedTrxPhysicalFence,
       {first, first}, &lock_reverse, &page_reverse, &dictionary_reverse));
 }
 
-TEST(PreservedTrxPhysicalFence, TestProviderCannotReachProductionSlot) {
+TEST(PreservedTrxPhysicalFence, SimulatorProviderRejectsProductionMode) {
   Preserve_trx_physical_fence_provider_ops ops;
   ops.consistency_mode =
       Preserve_trx_physical_consistency_mode::
-          TEST_ONLY_PHYSICAL_FENCE_SIMULATOR;
+          PRODUCTION_REDO_APPLY_FENCE;
   ops.acquire = test_physical_fence_acquire;
   ops.revalidate = test_physical_fence_revalidate;
   ops.release = test_physical_fence_release;
   preserved_trx_set_physical_fence_provider_for_unit_test(&ops);
 
-  Preserve_trx_physical_fence_lease production_lease;
+  Preserve_trx_physical_fence_lease lease;
   EXPECT_EQ(Preserve_trx_physical_fence_status::MISSING_PROVIDER,
-            preserved_trx_acquire_production_physical_fence_lease(
-                make_test_physical_fence_proof(
-                    Preserve_trx_physical_consistency_mode::
-                        PRODUCTION_REDO_APPLY_FENCE),
-                &production_lease));
-
-  Preserve_trx_physical_fence_lease test_lease;
-  EXPECT_EQ(Preserve_trx_physical_fence_status::OK,
             preserved_trx_acquire_physical_fence_lease_for_unit_test(
                 make_test_physical_fence_proof(
                     Preserve_trx_physical_consistency_mode::
                         TEST_ONLY_PHYSICAL_FENCE_SIMULATOR),
-                &test_lease));
-  EXPECT_TRUE(test_lease.acquired());
-  EXPECT_EQ(Preserve_trx_physical_fence_status::OK, test_lease.revalidate());
+                &lease));
+  EXPECT_FALSE(lease.acquired());
   preserved_trx_set_physical_fence_provider_for_unit_test(nullptr);
 }
 
@@ -542,7 +533,11 @@ struct Prepared_registry_interleave_context {
   Preserve_trx_prepared_token_registry *registry{nullptr};
   Preserve_trx_prepared_token_key key;
   Preserve_trx_gate_adopt_lease *adopt_lease{nullptr};
+  Preserve_trx_physical_promotion_pin_lease pin_lease;
+  bool pin_epoch{false};
   Preserve_trx_prepared_status adopt_status{
+      Preserve_trx_prepared_status::INVALID_STATE};
+  Preserve_trx_prepared_status pin_status{
       Preserve_trx_prepared_status::INVALID_STATE};
 };
 
@@ -558,6 +553,14 @@ void prepared_registry_interleave_probe(
       break;
     case Preserve_trx_prepared_registry_probe_point::
         INVALIDATE_BEFORE_RETIRE:
+      if (context->pin_epoch) {
+        context->pin_status =
+            context->registry->pin_epoch_for_physical_promotion(
+                {context->key},
+                preserved_trx_promotion_prepared_monotonic_us_for_unit_test(),
+                &context->pin_lease);
+        break;
+      }
       ASSERT_NE(nullptr, context->adopt_lease);
       context->adopt_status = context->registry->begin_gate_adopt(
           context->key, context->key.generation, context->adopt_lease);
@@ -806,6 +809,151 @@ TEST(PreservedTrxPreparedRegistry,
                 &gate,
                 Preserve_trx_gate_abort_outcome::ABANDONED_ROLLED_BACK));
   registry.purge_epoch(key.source_uuid, key.epoch_id);
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry,
+     PhysicalBootstrapCopiesExactReadyEntriesWithExtendedDeadline) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto first_key = make_prepared_token_key(11);
+  first_key.token = "17";
+  auto second_key = first_key;
+  second_key.token = "18";
+
+  for (const auto *key : {&first_key, &second_key}) {
+    Preserve_trx_prepare_lease prepare;
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.begin_prepare(*key, key->generation, &prepare));
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.publish_ready(
+                  &prepare, make_final_token_facts(100),
+                  acquire_strict_prepared_resources(*key, 100)));
+  }
+
+  const uint64_t now_us =
+      preserved_trx_promotion_prepared_monotonic_us_for_unit_test();
+  const uint64_t deadline_us = now_us + 3ULL * 3600ULL * 1000000ULL;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.update_epoch_prepare_deadline(
+                first_key.source_uuid, first_key.epoch_id, 2, deadline_us));
+  Preserve_trx_resurrection_index_entry entry;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.copy_ready_resurrection_entry(second_key, now_us,
+                                                    &entry));
+  EXPECT_EQ(18U, entry.token);
+  EXPECT_EQ(0U, registry.expire_once(deadline_us - 1).ready_expired);
+  EXPECT_EQ(2U, registry.expire_once(deadline_us).ready_expired);
+  registry.purge_epoch(first_key.source_uuid, first_key.epoch_id);
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry,
+     PhysicalBootstrapPinIsWholeEpochPublicationBarrier) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto first_key = make_prepared_token_key(21);
+  first_key.token = "21";
+  auto second_key = first_key;
+  second_key.token = "22";
+
+  for (const auto *key : {&first_key, &second_key}) {
+    Preserve_trx_prepare_lease prepare;
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.begin_prepare(*key, key->generation, &prepare));
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.publish_ready(
+                  &prepare, make_final_token_facts(100),
+                  acquire_strict_prepared_resources(*key, 100)));
+  }
+
+  const uint64_t now_us =
+      preserved_trx_promotion_prepared_monotonic_us_for_unit_test();
+  const uint64_t deadline_us = now_us + 1000;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.update_epoch_prepare_deadline(
+                first_key.source_uuid, first_key.epoch_id, 2, deadline_us));
+  Preserve_trx_physical_promotion_pin_lease pin_lease;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.pin_epoch_for_physical_promotion(
+                {first_key, second_key}, now_us, &pin_lease));
+
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.mark_ready_for_gate(first_key, first_key.generation));
+  Preserve_trx_gate_adopt_lease adopt;
+  EXPECT_EQ(Preserve_trx_prepared_status::ALREADY_CLAIMED,
+            registry.begin_gate_adopt(first_key, first_key.generation, &adopt));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_gate_adopt(first_key, first_key.generation, &adopt,
+                                      &pin_lease));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.commit_gate_adopt(&adopt));
+
+  EXPECT_EQ(0U, registry.expire_once(deadline_us + 1).ready_expired);
+  EXPECT_EQ(0U, registry.expire_once(std::numeric_limits<uint64_t>::max())
+                    .adopted_tainted);
+  Preserve_trx_resurrection_index_entry entry;
+  EXPECT_EQ(Preserve_trx_prepared_status::OK,
+            registry.copy_ready_resurrection_entry(
+                second_key, deadline_us + 1, &entry));
+  Preserve_trx_prepared_token_snapshot adopted_snapshot;
+  EXPECT_EQ(Preserve_trx_prepared_status::INVALID_STATE,
+            registry.find_unique_adopted(first_key.epoch_id, first_key.token,
+                                         &adopted_snapshot));
+  Preserve_trx_attach_lease attach;
+  EXPECT_EQ(Preserve_trx_prepared_status::ALREADY_CLAIMED,
+            registry.begin_attach(first_key, first_key.generation, &attach));
+  registry.purge_epoch(first_key.source_uuid, first_key.epoch_id);
+  EXPECT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(first_key, &adopted_snapshot));
+
+  pin_lease.release_atomically();
+  EXPECT_EQ(Preserve_trx_prepared_status::OK,
+            registry.find_unique_adopted(first_key.epoch_id, first_key.token,
+                                         &adopted_snapshot));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_attach(first_key, first_key.generation, &attach));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.abort_attach_after_full_unwind(&attach));
+  EXPECT_EQ(1U, registry.expire_once(deadline_us + 1).ready_expired);
+  Preserve_trx_cleanup_lease cleanup;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_cleanup(
+                first_key, first_key.generation,
+                Preserve_trx_prepared_token_state::ADOPTED_LOCKED, &cleanup));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.commit_cleanup(&cleanup, true));
+  registry.purge_epoch(first_key.source_uuid, first_key.epoch_id);
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry,
+     PhysicalBootstrapAbandonPinReleaseIsIdempotent) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(23);
+  key.token = "23";
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, key.generation, &prepare));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&prepare, make_final_token_facts(100),
+                                   acquire_strict_prepared_resources(key,
+                                                                     100)));
+  const uint64_t now_us =
+      preserved_trx_promotion_prepared_monotonic_us_for_unit_test();
+  Preserve_trx_physical_promotion_pin_lease pin_lease;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.pin_epoch_for_physical_promotion({key}, now_us,
+                                                       &pin_lease));
+
+  pin_lease.release_for_abandon();
+  pin_lease.release_for_abandon();
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+  Preserve_trx_prepared_token_snapshot snapshot;
+  EXPECT_EQ(Preserve_trx_prepared_status::NOT_FOUND,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
   preserve_trx_resource_manager_reset_for_unit_test();
 }
 
@@ -1104,7 +1252,7 @@ TEST(PreservedTrxPhysicalPromotion,
 
   EXPECT_EQ(Preserved_trx_physical_adopt_status::INVALID_ARGUMENT,
             preserved_trx_adopt_prepared_for_physical_promotion(
-                "", &adopt_lease, &physical_lease, 0, &result));
+                "", &adopt_lease, nullptr, &physical_lease, 0, &result));
   EXPECT_FALSE(result.claimed);
   EXPECT_FALSE(result.rolled_back);
   EXPECT_FALSE(result.provider_contract_violation);
@@ -1159,7 +1307,7 @@ TEST(PreservedTrxPhysicalPromotion,
   EXPECT_EQ(Preserved_trx_physical_adopt_status::
                 PHYSICAL_FENCE_PROVIDER_VIOLATION,
             preserved_trx_adopt_prepared_for_physical_promotion(
-                key.preserve_dir, &adopt_lease, &physical_lease,
+                key.preserve_dir, &adopt_lease, nullptr, &physical_lease,
                 my_micro_time() + 1000000, &result))
       << result.reason;
   EXPECT_FALSE(result.claimed);
@@ -1181,7 +1329,7 @@ TEST(PreservedTrxPhysicalPromotion,
 
 Preserved_trx_physical_adopt_status strict_adopt_success_for_test(
     const std::string &, Preserve_trx_gate_adopt_lease *adopt_lease,
-    Preserve_trx_physical_fence_lease *, uint64_t,
+    trx_t *, Preserve_trx_physical_fence_lease *, uint64_t,
     Preserved_trx_physical_adopt_result *result) {
   if (adopt_lease == nullptr || result == nullptr) {
     return Preserved_trx_physical_adopt_status::INVALID_ARGUMENT;
@@ -1202,6 +1350,7 @@ std::atomic<int> g_strict_adopt_parallel_max_active{0};
 
 Preserved_trx_physical_adopt_status strict_adopt_parallel_probe_for_test(
     const std::string &dir, Preserve_trx_gate_adopt_lease *adopt_lease,
+    trx_t *prepared_trx,
     Preserve_trx_physical_fence_lease *physical_lease, uint64_t deadline_us,
     Preserved_trx_physical_adopt_result *result) {
   const int active = g_strict_adopt_parallel_active.fetch_add(1) + 1;
@@ -1212,15 +1361,34 @@ Preserved_trx_physical_adopt_status strict_adopt_parallel_probe_for_test(
   }
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
   const auto status = strict_adopt_success_for_test(
-      dir, adopt_lease, physical_lease, deadline_us, result);
+      dir, adopt_lease, prepared_trx, physical_lease, deadline_us, result);
   g_strict_adopt_parallel_active.fetch_sub(1);
   return status;
 }
 
 std::atomic<int> g_strict_adopt_reversal_calls{0};
+std::atomic<int> g_strict_production_exact_adopt_calls{0};
+std::atomic<int> g_strict_production_exact_pointer_mismatches{0};
+std::mutex g_strict_production_exact_pointer_mutex;
+std::map<std::string, trx_t *> g_strict_production_exact_pointers;
+
+bool strict_production_exact_pointer_matches_for_test(
+    const Preserve_trx_prepared_token_key &key, trx_t *prepared_trx) {
+  std::lock_guard<std::mutex> guard(
+      g_strict_production_exact_pointer_mutex);
+  if (g_strict_production_exact_pointers.empty()) return true;
+  const auto expected = g_strict_production_exact_pointers.find(key.token);
+  if (expected == g_strict_production_exact_pointers.end() ||
+      expected->second != prepared_trx) {
+    g_strict_production_exact_pointer_mismatches.fetch_add(1);
+    return false;
+  }
+  return true;
+}
 
 Preserved_trx_physical_adopt_status strict_adopt_fail_token_202_for_test(
     const std::string &dir, Preserve_trx_gate_adopt_lease *adopt_lease,
+    trx_t *prepared_trx,
     Preserve_trx_physical_fence_lease *physical_lease, uint64_t deadline_us,
     Preserved_trx_physical_adopt_result *result) {
   Preserve_trx_prepared_token_key key;
@@ -1230,9 +1398,12 @@ Preserved_trx_physical_adopt_status strict_adopt_fail_token_202_for_test(
           Preserve_trx_prepared_status::OK) {
     return Preserved_trx_physical_adopt_status::INVALID_ARGUMENT;
   }
+  if (!strict_production_exact_pointer_matches_for_test(key, prepared_trx)) {
+    return Preserved_trx_physical_adopt_status::INVALID_ARGUMENT;
+  }
   if (key.token != "202") {
-    return strict_adopt_success_for_test(dir, adopt_lease, physical_lease,
-                                         deadline_us, result);
+    return strict_adopt_success_for_test(dir, adopt_lease, prepared_trx,
+                                         physical_lease, deadline_us, result);
   }
   *result = {};
   result->status = Preserved_trx_physical_adopt_status::ROLLED_BACK;
@@ -1243,10 +1414,68 @@ Preserved_trx_physical_adopt_status strict_adopt_fail_token_202_for_test(
 }
 
 bool strict_adopt_reversal_success_for_test(
-    const Preserve_trx_prepared_token_key &, Preserve_trx_cleanup_lease *,
-    Preserve_trx_physical_fence_lease *, std::string *) {
+    const Preserve_trx_prepared_token_key &key, trx_t *prepared_trx,
+    Preserve_trx_cleanup_lease *, Preserve_trx_physical_fence_lease *,
+    std::string *) {
+  if (!strict_production_exact_pointer_matches_for_test(key, prepared_trx)) {
+    return false;
+  }
   g_strict_adopt_reversal_calls.fetch_add(1);
   return true;
+}
+
+Preserved_trx_physical_adopt_status
+strict_production_exact_adopt_success_for_test(
+    const std::string &dir, Preserve_trx_gate_adopt_lease *adopt_lease,
+    trx_t *prepared_trx,
+    Preserve_trx_physical_fence_lease *physical_lease, uint64_t deadline_us,
+    Preserved_trx_physical_adopt_result *result) {
+  if (prepared_trx == nullptr || physical_lease != nullptr) {
+    return Preserved_trx_physical_adopt_status::INVALID_ARGUMENT;
+  }
+  Preserve_trx_prepared_token_key key;
+  Preserve_trx_final_token_facts facts;
+  if (adopt_lease == nullptr ||
+      adopt_lease->copy_publication(&key, &facts) !=
+          Preserve_trx_prepared_status::OK ||
+      !strict_production_exact_pointer_matches_for_test(key, prepared_trx)) {
+    return Preserved_trx_physical_adopt_status::INVALID_ARGUMENT;
+  }
+  g_strict_production_exact_adopt_calls.fetch_add(1);
+  return strict_adopt_success_for_test(dir, adopt_lease, prepared_trx,
+                                       physical_lease, deadline_us, result);
+}
+
+Preserve_trx_transfer_accepted_epoch
+make_production_equivalent_accepted_epoch_for_test(
+    const std::string &root_dir,
+    const Preserve_trx_physical_promotion_gate_request &request,
+    uint64_t source_fence_lsn) {
+  Preserve_trx_transfer_accepted_epoch accepted;
+  accepted.root_dir = root_dir;
+  accepted.epoch_id = request.epoch_id;
+  accepted.source_server_uuid = request.tokens.front().source_uuid;
+  accepted.target_server_uuid = "target-uuid";
+  accepted.receiver_process_generation =
+      request.tokens.front().target_boot_incarnation;
+  accepted.source_fence_lsn = source_fence_lsn;
+  accepted.fact_digest.fill(0xaa);
+  accepted.lifecycle = Preserve_trx_transfer_epoch_lifecycle::ADOPT_LEASED;
+
+  auto fact = std::make_shared<Preserve_trx_transfer_epoch_fact>();
+  fact->epoch_id = accepted.epoch_id;
+  fact->source_server_uuid = accepted.source_server_uuid;
+  fact->target_server_uuid = accepted.target_server_uuid;
+  fact->source_fence_lsn = source_fence_lsn;
+  fact->fact_digest = accepted.fact_digest;
+  for (const auto &key : request.tokens) {
+    const uint64_t token = std::stoull(key.token);
+    accepted.tokens.push_back(token);
+    fact->tokens.push_back(
+        {token, source_fence_lsn, key.generation, {}, {}});
+  }
+  accepted.fact = std::move(fact);
+  return accepted;
 }
 
 bool activation_intent_writer_for_test(
@@ -2473,6 +2702,39 @@ TEST(PreservedTrxPreparedRegistry,
             registry.abort_gate_adopt(
                 &adopt,
                 Preserve_trx_gate_abort_outcome::ABANDONED_ROLLED_BACK));
+  registry.purge_epoch(key.source_uuid, key.epoch_id);
+  EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
+  preserve_trx_resource_manager_reset_for_unit_test();
+}
+
+TEST(PreservedTrxPreparedRegistry,
+     InvalidateCannotRetirePhysicalPinWonAfterStateCheck) {
+  preserve_trx_resource_manager_reset_for_unit_test();
+  Preserve_trx_prepared_token_registry registry;
+  auto key = make_prepared_token_key(1);
+  Preserve_trx_prepare_lease prepare;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.begin_prepare(key, 1, &prepare));
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.publish_ready(&prepare, make_final_token_facts(100),
+                                   acquire_prepared_resources(key)));
+
+  Prepared_registry_interleave_context context;
+  context.registry = &registry;
+  context.key = key;
+  context.pin_epoch = true;
+  preserved_trx_prepared_registry_set_probe_for_unit_test(
+      prepared_registry_interleave_probe, &context);
+  registry.invalidate_incarnation("different-boot");
+  preserved_trx_prepared_registry_set_probe_for_unit_test(nullptr, nullptr);
+
+  ASSERT_EQ(Preserve_trx_prepared_status::OK, context.pin_status);
+  Preserve_trx_prepared_token_snapshot snapshot;
+  ASSERT_EQ(Preserve_trx_prepared_status::OK,
+            registry.snapshot(key, &snapshot));
+  EXPECT_EQ(Preserve_trx_prepared_token_state::READY_FACTS_PENDING_LEASE,
+            snapshot.state);
+  context.pin_lease.release_for_abandon();
   registry.purge_epoch(key.source_uuid, key.epoch_id);
   EXPECT_EQ(0U, preserve_trx_memory_current_bytes_status());
   preserve_trx_resource_manager_reset_for_unit_test();
@@ -9180,34 +9442,54 @@ TEST_F(PreserveSnapshotTest, PromotionGateRejectsMoreThanBatchTokens) {
 }
 
 TEST_F(PreserveSnapshotTest,
-       StrictPhysicalFenceRejectsMissingProviderBeforeIntent) {
+       StrictPhysicalGateRejectsMissingBootstrapBeforeIntent) {
   preserve_trx_set_enable_value(true);
-  Preserve_trx_physical_promotion_gate_request request;
-  request.epoch_id = "strict-missing-provider";
-  request.expected_fence = make_test_physical_fence_proof(
-      Preserve_trx_physical_consistency_mode::PRODUCTION_REDO_APPLY_FENCE);
-  for (uint64_t token_id = 1; token_id <= 4; ++token_id) {
-    auto key = make_prepared_token_key(token_id);
-    key.token = "token-" + std::to_string(token_id);
-    key.preserve_dir = m_dir;
-    key.source_uuid = request.expected_fence.source_lineage_uuid;
-    key.epoch_id = request.epoch_id;
-    key.target_boot_incarnation =
-        request.expected_fence.target_boot_incarnation;
-    request.tokens.push_back(key);
-  }
-
   Preserve_trx_physical_promotion_gate_result result;
-  EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::
-                PHYSICAL_FENCE_NOT_AVAILABLE,
+  Preserve_trx_physical_promotion_bootstrap_attempt attempt;
+  EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY,
             preserved_trx_adopt_prepared_epoch_for_physical_promotion(
-                m_dir, request, &result));
+                m_dir, &attempt, &result));
   EXPECT_EQ(0U, result.adopted_count);
   EXPECT_EQ(0U, result.tainted_count);
   MY_STAT stat_area;
   EXPECT_EQ(nullptr,
-            my_stat((m_dir + request.epoch_id + ".promotion_intent").c_str(),
+            my_stat((m_dir + "missing-bootstrap.promotion_intent").c_str(),
                     &stat_area, MYF(0)));
+}
+
+TEST_F(PreserveSnapshotTest,
+       ProductionPhysicalBootstrapDoesNotRequireFenceProvider) {
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", server_uuid);
+
+  Preserve_trx_physical_bootstrap_request request;
+  request.epoch_id = "missing-physical-bootstrap-epoch";
+  request.operation_deadline_us = my_micro_time() + 1000000;
+  request.worker_count = 1;
+
+  Preserve_trx_physical_promotion_bootstrap_attempt attempt;
+  EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::REGISTRY_NOT_READY,
+            preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
+                m_dir, request, &attempt));
+  EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::OK, attempt.abort());
+}
+
+TEST_F(PreserveSnapshotTest,
+       ProductionPhysicalBootstrapRejectsMonotonicDeadlineAtWallClockApi) {
+  Transfer_receiver_config_guard receiver_config;
+  receiver_config.allow("source-uuid", server_uuid);
+
+  Preserve_trx_physical_bootstrap_request request;
+  request.epoch_id = "wrong-clock-physical-bootstrap-epoch";
+  request.operation_deadline_us =
+      preserved_trx_promotion_prepared_monotonic_us_for_unit_test() + 1000000;
+  request.worker_count = 1;
+
+  Preserve_trx_physical_promotion_bootstrap_attempt attempt;
+  EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::INVALID_ARGUMENT,
+            preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
+                m_dir, request, &attempt));
+  EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::OK, attempt.abort());
 }
 
 TEST_F(PreserveSnapshotTest, CarrierListsStrictPromotionIntentV2Tokens) {
@@ -9539,6 +9821,165 @@ TEST_F(PreserveSnapshotTest,
       nullptr);
   preserved_trx_set_strict_physical_adopt_executor_for_unit_test(nullptr);
   preserved_trx_set_physical_fence_provider_for_unit_test(nullptr);
+}
+
+TEST_F(PreserveSnapshotTest,
+       ProductionEquivalentGateConsumesExactVerifiedTransactions) {
+  preserve_trx_set_enable_value(true);
+  preserve_trx_resource_manager_reset_for_unit_test();
+  preserved_trx_set_strict_physical_adopt_executor_for_unit_test(
+      strict_production_exact_adopt_success_for_test);
+  g_strict_production_exact_adopt_calls.store(0);
+  g_strict_production_exact_pointer_mismatches.store(0);
+  {
+    std::lock_guard<std::mutex> guard(
+        g_strict_production_exact_pointer_mutex);
+    g_strict_production_exact_pointers.clear();
+  }
+  auto exact_pointer_guard = create_scope_guard([] {
+    std::lock_guard<std::mutex> guard(
+        g_strict_production_exact_pointer_mutex);
+    g_strict_production_exact_pointers.clear();
+  });
+
+  Preserve_trx_physical_promotion_gate_request request;
+  request.epoch_id = "production-equivalent-success";
+  request.operation_deadline_us = my_micro_time() + 1000000;
+  request.worker_count = 2;
+  auto &registry = preserved_trx_strict_prepared_token_registry();
+  std::vector<trx_t *> verified_transactions;
+  int trx_identities[2]{};
+  for (uint64_t i = 0; i < 2; ++i) {
+    auto key = make_prepared_token_key(31 + i);
+    key.preserve_dir = m_dir;
+    key.epoch_id = request.epoch_id;
+    key.token = std::to_string(301 + i);
+    request.tokens.push_back(key);
+
+    Preserve_trx_prepare_lease prepare;
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.begin_prepare(key, key.generation, &prepare));
+    auto facts = make_final_token_facts(100);
+    facts.target_boot_incarnation = key.target_boot_incarnation;
+    facts.canonical_digest.clear();
+    ASSERT_TRUE(preserved_trx_finalize_token_facts(&facts));
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.publish_ready(
+                  &prepare, std::move(facts),
+                  acquire_strict_prepared_resources(key, 100)));
+    trx_t *verified_trx = reinterpret_cast<trx_t *>(&trx_identities[i]);
+    verified_transactions.push_back(verified_trx);
+    std::lock_guard<std::mutex> guard(
+        g_strict_production_exact_pointer_mutex);
+    g_strict_production_exact_pointers.emplace(key.token, verified_trx);
+  }
+  const auto accepted = make_production_equivalent_accepted_epoch_for_test(
+      m_dir, request, 100);
+
+  Preserve_trx_physical_promotion_gate_result result;
+  EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::OK,
+            preserved_trx_adopt_prepared_epoch_for_physical_promotion_for_unit_test(
+                m_dir, request, &result, &verified_transactions, &accepted))
+      << result.message;
+  EXPECT_EQ(2U, result.adopted_count);
+  EXPECT_EQ(0U, result.rolled_back_count);
+  EXPECT_EQ(0U, result.tainted_count);
+  EXPECT_EQ(2, g_strict_production_exact_adopt_calls.load());
+  EXPECT_EQ(0, g_strict_production_exact_pointer_mismatches.load());
+
+  for (const auto &key : request.tokens) {
+    Preserve_trx_cleanup_lease cleanup;
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.begin_cleanup(
+                  key, key.generation,
+                  Preserve_trx_prepared_token_state::ADOPTED_LOCKED,
+                  &cleanup));
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.commit_cleanup(&cleanup, true));
+  }
+  registry.purge_epoch(request.tokens.front().source_uuid, request.epoch_id);
+  preserved_trx_set_strict_physical_adopt_executor_for_unit_test(nullptr);
+}
+
+TEST_F(PreserveSnapshotTest,
+       ProductionEquivalentGateReversesWholeEpochWhenOneTokenFails) {
+  preserve_trx_set_enable_value(true);
+  preserve_trx_resource_manager_reset_for_unit_test();
+  preserved_trx_set_strict_physical_adopt_executor_for_unit_test(
+      strict_adopt_fail_token_202_for_test);
+  preserved_trx_set_strict_physical_adopt_reversal_executor_for_unit_test(
+      strict_adopt_reversal_success_for_test);
+  g_strict_adopt_reversal_calls.store(0);
+  g_strict_production_exact_pointer_mismatches.store(0);
+  {
+    std::lock_guard<std::mutex> guard(
+        g_strict_production_exact_pointer_mutex);
+    g_strict_production_exact_pointers.clear();
+  }
+  auto exact_pointer_guard = create_scope_guard([] {
+    std::lock_guard<std::mutex> guard(
+        g_strict_production_exact_pointer_mutex);
+    g_strict_production_exact_pointers.clear();
+  });
+
+  Preserve_trx_physical_promotion_gate_request request;
+  request.epoch_id = "production-equivalent-atomic";
+  request.operation_deadline_us = my_micro_time() + 1000000;
+  request.worker_count = 3;
+  auto &registry = preserved_trx_strict_prepared_token_registry();
+  std::vector<trx_t *> verified_transactions;
+  int trx_identities[3]{};
+  for (uint64_t i = 0; i < 3; ++i) {
+    auto key = make_prepared_token_key(41 + i);
+    key.preserve_dir = m_dir;
+    key.epoch_id = request.epoch_id;
+    key.token = std::to_string(201 + i);
+    request.tokens.push_back(key);
+
+    Preserve_trx_prepare_lease prepare;
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.begin_prepare(key, key.generation, &prepare));
+    auto facts = make_final_token_facts(100);
+    facts.target_boot_incarnation = key.target_boot_incarnation;
+    facts.canonical_digest.clear();
+    ASSERT_TRUE(preserved_trx_finalize_token_facts(&facts));
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.publish_ready(
+                  &prepare, std::move(facts),
+                  acquire_strict_prepared_resources(key, 100)));
+    trx_t *verified_trx = reinterpret_cast<trx_t *>(&trx_identities[i]);
+    verified_transactions.push_back(verified_trx);
+    std::lock_guard<std::mutex> guard(
+        g_strict_production_exact_pointer_mutex);
+    g_strict_production_exact_pointers.emplace(key.token, verified_trx);
+  }
+  const auto accepted = make_production_equivalent_accepted_epoch_for_test(
+      m_dir, request, 100);
+
+  Preserve_trx_physical_promotion_gate_result result;
+  EXPECT_EQ(Preserve_trx_physical_promotion_gate_status::ADOPT_FAILED,
+            preserved_trx_adopt_prepared_epoch_for_physical_promotion_for_unit_test(
+                m_dir, request, &result, &verified_transactions, &accepted))
+      << result.message;
+  EXPECT_EQ(0U, result.adopted_count);
+  EXPECT_EQ(3U, result.rolled_back_count);
+  EXPECT_EQ(0U, result.tainted_count);
+  EXPECT_EQ(2, g_strict_adopt_reversal_calls.load());
+  EXPECT_EQ(0, g_strict_production_exact_pointer_mismatches.load());
+
+  for (size_t i = 0; i < request.tokens.size(); ++i) {
+    Preserve_trx_prepared_token_snapshot snapshot;
+    ASSERT_EQ(Preserve_trx_prepared_status::OK,
+              registry.snapshot(request.tokens[i], &snapshot));
+    EXPECT_EQ(i == 1
+                  ? Preserve_trx_prepared_token_state::ABANDONED_ROLLED_BACK
+                  : Preserve_trx_prepared_token_state::CLEANUP_ROLLED_BACK,
+              snapshot.state);
+  }
+  registry.purge_epoch(request.tokens.front().source_uuid, request.epoch_id);
+  preserved_trx_set_strict_physical_adopt_reversal_executor_for_unit_test(
+      nullptr);
+  preserved_trx_set_strict_physical_adopt_executor_for_unit_test(nullptr);
 }
 
 #ifndef NDEBUG
@@ -14382,9 +14823,11 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             registry.mark_accepted_epoch_ready(
                 m_dir, "epoch-status-leased", 2000, 32000));
+  Preserve_trx_transfer_accepted_epoch leased_epoch;
   ASSERT_EQ(Preserve_trx_receiver_promotion_lease_status::ACQUIRED,
             registry.try_acquire_accepted_epoch_promotion_lease(
-                m_dir, "epoch-status-leased", 3000));
+                m_dir, "epoch-status-leased", 3000, "receiver-generation",
+                &leased_epoch));
   EXPECT_EQ(2U, registry.active_epoch_count());
   EXPECT_EQ(0U, registry.expired_epoch_count());
 
@@ -14400,25 +14843,124 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(1U, registry.expired_epoch_count());
 }
 
-TEST_F(PreserveSnapshotTest, AcceptedEpochPromotionLeasePreventsExpiry) {
+TEST_F(PreserveSnapshotTest,
+       AcceptedEpochPromotionLeaseOwnsAbandonCleanup) {
   Preserve_trx_transfer_receiver_registry registry;
   publish_test_accepted_epoch(&registry, "epoch-lease", 902, 1000, 10);
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             registry.mark_accepted_epoch_ready(m_dir, "epoch-lease", 2000,
                                                32000));
+  Preserve_trx_transfer_accepted_epoch accepted;
   EXPECT_EQ(Preserve_trx_receiver_promotion_lease_status::ACQUIRED,
             registry.try_acquire_accepted_epoch_promotion_lease(
-                m_dir, "epoch-lease", 3000));
+                m_dir, "epoch-lease", 3000, "receiver-generation",
+                &accepted));
+  Preserve_trx_transfer_accepted_epoch second;
+  EXPECT_EQ(Preserve_trx_receiver_promotion_lease_status::NOT_READY,
+            registry.try_acquire_accepted_epoch_promotion_lease(
+                m_dir, "epoch-lease", 3001, "receiver-generation",
+                &second));
 
-  Preserve_trx_transfer_accepted_epoch accepted;
-  ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
-            registry.query_accepted_epoch(m_dir, "epoch-lease", &accepted));
   EXPECT_EQ(Preserve_trx_transfer_epoch_lifecycle::ADOPT_LEASED,
             accepted.lifecycle);
   std::vector<Preserve_trx_transfer_accepted_epoch> expired;
   EXPECT_EQ(0U, registry.expire_accepted_epochs_once(
                     std::numeric_limits<uint64_t>::max(), &expired));
   EXPECT_TRUE(expired.empty());
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.abandon_accepted_epoch_promotion_lease(accepted));
+  accepted.lifecycle = Preserve_trx_transfer_epoch_lifecycle::ABANDONING;
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            registry.abandon_accepted_epoch_promotion_lease(accepted));
+  EXPECT_FALSE(registry.accepted_epoch_is_live(m_dir, "epoch-lease"));
+  EXPECT_FALSE(registry.accepted_epoch_is_expired(m_dir, "epoch-lease"));
+  EXPECT_EQ(1U, registry.expire_accepted_epochs_once(
+                    std::numeric_limits<uint64_t>::max(), &expired));
+  ASSERT_EQ(1U, expired.size());
+  EXPECT_EQ("epoch-lease", expired.front().epoch_id);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.erase_abandoning_epoch(m_dir, "epoch-lease"));
+}
+
+TEST_F(PreserveSnapshotTest,
+       AcceptedEpochAbandonCleanupFailureRetainsRetryOwnership) {
+  Preserve_trx_transfer_receiver_registry registry;
+  const std::string epoch_id = "epoch-abandon-retry";
+  publish_test_accepted_epoch(&registry, epoch_id, 1901, 1000, 10);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.mark_accepted_epoch_ready(m_dir, epoch_id, 2000, 32000));
+  Preserve_trx_transfer_accepted_epoch accepted;
+  ASSERT_EQ(Preserve_trx_receiver_promotion_lease_status::ACQUIRED,
+            registry.try_acquire_accepted_epoch_promotion_lease(
+                m_dir, epoch_id, 3000, "receiver-generation", &accepted));
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.abandon_accepted_epoch_promotion_lease(accepted));
+  accepted.lifecycle = Preserve_trx_transfer_epoch_lifecycle::ABANDONING;
+
+  const std::string transfer_root = m_dir + ".transfer";
+  const std::string epoch_dir = transfer_root + "/" + epoch_id;
+  ASSERT_EQ(0, my_mkdir(transfer_root.c_str(), 0700, MYF(0)));
+  ASSERT_EQ(0, my_mkdir(epoch_dir.c_str(), 0700, MYF(0)));
+  std::vector<std::string> nested_dirs;
+  std::string nested = epoch_dir;
+  for (uint depth = 0; depth < 5; ++depth) {
+    nested += "/d" + std::to_string(depth);
+    ASSERT_EQ(0, my_mkdir(nested.c_str(), 0700, MYF(0)));
+    nested_dirs.push_back(nested);
+  }
+
+  EXPECT_EQ(Preserve_trx_transfer_status::IO_ERROR,
+            preserve_trx_transfer_destroy_receiver_epoch_process_local(
+                accepted, &registry));
+  for (auto dir = nested_dirs.rbegin(); dir != nested_dirs.rend(); ++dir) {
+    ASSERT_EQ(0, rmdir(dir->c_str()));
+  }
+  preserve_trx_transfer_receiver_reaper_scan_for_unit_test(
+      std::numeric_limits<uint64_t>::max(), &registry);
+  std::vector<Preserve_trx_transfer_accepted_epoch> pending_cleanup;
+  EXPECT_EQ(0U, registry.expire_accepted_epochs_once(
+                    std::numeric_limits<uint64_t>::max(), &pending_cleanup));
+  EXPECT_EQ(Preserve_trx_transfer_status::IO_ERROR,
+            registry.query_accepted_epoch(m_dir, epoch_id));
+}
+
+TEST_F(PreserveSnapshotTest, AcceptedEpochPromotionLeaseCompletesOwnership) {
+  Preserve_trx_transfer_receiver_registry registry;
+  publish_test_accepted_epoch(&registry, "epoch-complete-lease", 1902, 1000,
+                              10);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.mark_accepted_epoch_ready(
+                m_dir, "epoch-complete-lease", 2000, 32000));
+  Preserve_trx_transfer_accepted_epoch accepted;
+  ASSERT_EQ(Preserve_trx_receiver_promotion_lease_status::ACQUIRED,
+            registry.try_acquire_accepted_epoch_promotion_lease(
+                m_dir, "epoch-complete-lease", 3000,
+                "receiver-generation", &accepted));
+  EXPECT_EQ(Preserve_trx_transfer_status::OK,
+            registry.complete_accepted_epoch_promotion_lease(accepted));
+  EXPECT_EQ(Preserve_trx_transfer_status::IO_ERROR,
+            registry.query_accepted_epoch(m_dir, "epoch-complete-lease"));
+}
+
+TEST_F(PreserveSnapshotTest,
+       AcceptedEpochPhysicalBootstrapRejectsProcessGenerationMismatch) {
+  Preserve_trx_transfer_receiver_registry registry;
+  publish_test_accepted_epoch(&registry, "epoch-bootstrap-generation", 1912,
+                              1000, 10);
+  ASSERT_EQ(Preserve_trx_transfer_status::OK,
+            registry.mark_accepted_epoch_ready(
+                m_dir, "epoch-bootstrap-generation", 2000, 32000));
+
+  Preserve_trx_transfer_accepted_epoch accepted;
+  EXPECT_EQ(Preserve_trx_receiver_promotion_lease_status::NOT_READY,
+            registry.try_acquire_accepted_epoch_promotion_lease(
+                m_dir, "epoch-bootstrap-generation", 3000,
+                "wrong-generation", &accepted));
+  ASSERT_EQ(Preserve_trx_transfer_status::COMMITTED_NOT_READY,
+            registry.query_accepted_epoch(
+                m_dir, "epoch-bootstrap-generation", &accepted));
+  EXPECT_EQ(Preserve_trx_transfer_epoch_lifecycle::READY,
+            accepted.lifecycle);
 }
 
 TEST_F(PreserveSnapshotTest,
@@ -14486,10 +15028,12 @@ TEST_F(PreserveSnapshotTest,
   EXPECT_EQ(0U, registry.size());
   EXPECT_EQ(ready_cache_bytes_before,
             preserve_trx_promotion_ready_cache_bytes_status());
+  Preserve_trx_transfer_accepted_epoch accepted;
   EXPECT_EQ(Preserve_trx_receiver_promotion_lease_status::
                 NOT_FOUND_OR_EXPIRED,
             registry.try_acquire_accepted_epoch_promotion_lease(
-                m_dir, "epoch-expiry-cleanup", 11001));
+                m_dir, "epoch-expiry-cleanup", 11001,
+                "receiver-generation", &accepted));
 }
 
 TEST_F(PreserveSnapshotTest,

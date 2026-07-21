@@ -78,6 +78,7 @@ struct Preserve_trx_prepared_token_entry {
   bool preparing{false};
   bool retired_from_registry{false};
   uint64_t preparing_generation{0};
+  uint32_t physical_promotion_pins{0};
 };
 
 struct Preserve_trx_prepared_token_locator {
@@ -98,6 +99,60 @@ struct Preserve_trx_prepared_registry_state {
            std::shared_ptr<Preserve_trx_prepared_token_entry>>
       entries;
 };
+
+Preserve_trx_physical_promotion_pin_lease::
+    Preserve_trx_physical_promotion_pin_lease(
+        Preserve_trx_physical_promotion_pin_lease &&other) noexcept
+    : m_entries(std::move(other.m_entries)),
+      m_guards(std::move(other.m_guards)),
+      m_active(std::exchange(other.m_active, false)) {}
+
+Preserve_trx_physical_promotion_pin_lease &
+Preserve_trx_physical_promotion_pin_lease::operator=(
+    Preserve_trx_physical_promotion_pin_lease &&other) noexcept {
+  if (this != &other) {
+    release_for_abandon();
+    m_entries = std::move(other.m_entries);
+    m_guards = std::move(other.m_guards);
+    m_active = std::exchange(other.m_active, false);
+  }
+  return *this;
+}
+
+Preserve_trx_physical_promotion_pin_lease::
+    ~Preserve_trx_physical_promotion_pin_lease() {
+  release_for_abandon();
+}
+
+void Preserve_trx_physical_promotion_pin_lease::release_atomically() noexcept {
+  if (!m_active) return;
+  m_guards.clear();
+  DBUG_ASSERT(m_guards.capacity() >= m_entries.size());
+  for (const auto &entry : m_entries) m_guards.emplace_back(entry->mutex);
+  for (const auto &entry : m_entries) {
+    DBUG_ASSERT(entry->physical_promotion_pins != 0);
+    if (entry->physical_promotion_pins != 0) {
+      --entry->physical_promotion_pins;
+    }
+  }
+  m_active = false;
+  m_guards.clear();
+  m_entries.clear();
+}
+
+void Preserve_trx_physical_promotion_pin_lease::release_for_abandon() noexcept {
+  if (!m_active) return;
+  m_guards.clear();
+  for (const auto &entry : m_entries) {
+    std::lock_guard<std::mutex> guard(entry->mutex);
+    DBUG_ASSERT(entry->physical_promotion_pins != 0);
+    if (entry->physical_promotion_pins != 0) {
+      --entry->physical_promotion_pins;
+    }
+  }
+  m_active = false;
+  m_entries.clear();
+}
 
 namespace {
 
@@ -143,8 +198,6 @@ constexpr std::array<uint64_t, 20> kResumeCoreHistogramUpperBoundsUs{{
 }};
 
 std::mutex g_provider_mutex;
-bool g_production_provider_registered{false};
-Preserve_trx_physical_fence_provider_ops g_production_provider;
 bool g_test_provider_registered{false};
 Preserve_trx_physical_fence_provider_ops g_test_provider;
 
@@ -700,20 +753,6 @@ void Preserve_trx_physical_fence_lease::release() {
   m_targeted_publication_state.reset();
 }
 
-bool preserved_trx_register_production_physical_fence_provider(
-    const Preserve_trx_physical_fence_provider_ops &ops) {
-  if (ops.consistency_mode != Preserve_trx_physical_consistency_mode::
-                                  PRODUCTION_REDO_APPLY_FENCE ||
-      !provider_ops_are_complete(ops)) {
-    return false;
-  }
-  std::lock_guard<std::mutex> guard(g_provider_mutex);
-  if (g_production_provider_registered) return false;
-  g_production_provider = ops;
-  g_production_provider_registered = true;
-  return true;
-}
-
 void preserved_trx_set_physical_fence_provider_for_unit_test(
     const Preserve_trx_physical_fence_provider_ops *ops) {
   std::lock_guard<std::mutex> guard(g_provider_mutex);
@@ -727,21 +766,6 @@ void preserved_trx_set_physical_fence_provider_for_unit_test(
   }
   g_test_provider = *ops;
   g_test_provider_registered = true;
-}
-
-Preserve_trx_physical_fence_status
-preserved_trx_acquire_production_physical_fence_lease(
-    const Preserve_trx_physical_fence_proof &expected,
-    Preserve_trx_physical_fence_lease *lease) {
-  Preserve_trx_physical_fence_provider_ops ops;
-  {
-    std::lock_guard<std::mutex> guard(g_provider_mutex);
-    if (!g_production_provider_registered) {
-      return Preserve_trx_physical_fence_status::MISSING_PROVIDER;
-    }
-    ops = g_production_provider;
-  }
-  return acquire_with_provider(&ops, expected, lease);
 }
 
 Preserve_trx_physical_fence_status
@@ -1790,6 +1814,72 @@ Preserve_trx_prepared_token_registry::update_epoch_prepare_deadline(
 }
 
 Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::pin_epoch_for_physical_promotion(
+    const std::vector<Preserve_trx_prepared_token_key> &keys,
+    uint64_t now_monotonic_us,
+    Preserve_trx_physical_promotion_pin_lease *lease) {
+  if (keys.empty() || now_monotonic_us == 0 || lease == nullptr ||
+      lease->active()) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  std::vector<std::shared_ptr<Preserve_trx_prepared_token_entry>> entries;
+  std::vector<std::unique_lock<std::mutex>> guards;
+  try {
+    {
+      std::lock_guard<std::mutex> registry_guard(m_state->mutex);
+      entries.reserve(keys.size());
+      for (const auto &key : keys) {
+        if (!prepared_token_key_is_valid(key) ||
+            key.source_uuid != keys.front().source_uuid ||
+            key.epoch_id != keys.front().epoch_id) {
+          return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+        }
+        const auto found = m_state->entries.find(
+            {key.source_uuid, key.epoch_id, key.token});
+        if (found == m_state->entries.end() ||
+            !prepared_token_keys_match(found->second->key, key)) {
+          return Preserve_trx_prepared_status::NOT_FOUND;
+        }
+        entries.push_back(found->second);
+      }
+    }
+    std::sort(entries.begin(), entries.end(), [](const auto &left,
+                                                 const auto &right) {
+      return left->key.token < right->key.token;
+    });
+    if (std::adjacent_find(entries.begin(), entries.end()) != entries.end()) {
+      return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+    }
+    guards.reserve(entries.size());
+    for (const auto &entry : entries) guards.emplace_back(entry->mutex);
+    for (const auto &entry : entries) {
+      const auto state = entry->state.load(std::memory_order_acquire);
+      const auto publication = std::atomic_load_explicit(
+          &entry->publication, std::memory_order_acquire);
+      if (entry->retired_from_registry ||
+          (state != Preserve_trx_prepared_token_state::
+                        READY_FACTS_PENDING_LEASE &&
+           state != Preserve_trx_prepared_token_state::READY_FOR_GATE) ||
+          publication == nullptr ||
+          !prepared_token_keys_match(publication->key, entry->key) ||
+          publication->facts.epoch_prepare_deadline_us <= now_monotonic_us ||
+          entry->physical_promotion_pins ==
+              std::numeric_limits<uint32_t>::max()) {
+        return Preserve_trx_prepared_status::INVALID_STATE;
+      }
+    }
+    for (const auto &entry : entries) ++entry->physical_promotion_pins;
+    lease->m_entries = std::move(entries);
+    lease->m_guards = std::move(guards);
+    lease->m_guards.clear();
+    lease->m_active = true;
+  } catch (const std::bad_alloc &) {
+    return Preserve_trx_prepared_status::RESOURCE_EXHAUSTED;
+  }
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
 Preserve_trx_prepared_token_registry::mark_ready_for_gate(
     const Preserve_trx_prepared_token_key &key,
     uint64_t expected_generation) {
@@ -1824,9 +1914,40 @@ Preserve_trx_prepared_token_registry::mark_ready_for_gate(
 }
 
 Preserve_trx_prepared_status
+Preserve_trx_prepared_token_registry::copy_ready_resurrection_entry(
+    const Preserve_trx_prepared_token_key &key, uint64_t now_monotonic_us,
+    Preserve_trx_resurrection_index_entry *resurrection_entry) const {
+  if (!prepared_token_key_is_valid(key) || now_monotonic_us == 0 ||
+      resurrection_entry == nullptr) {
+    return Preserve_trx_prepared_status::INVALID_ARGUMENT;
+  }
+  const auto entry = find_prepared_entry(m_state, key);
+  if (entry == nullptr) return Preserve_trx_prepared_status::NOT_FOUND;
+  std::lock_guard<std::mutex> guard(entry->mutex);
+  const auto publication = std::atomic_load_explicit(
+      &entry->publication, std::memory_order_acquire);
+  const auto state = entry->state.load(std::memory_order_acquire);
+  if (entry->retired_from_registry || entry->preparing ||
+      (state != Preserve_trx_prepared_token_state::
+                    READY_FACTS_PENDING_LEASE &&
+       state != Preserve_trx_prepared_token_state::READY_FOR_GATE) ||
+      publication == nullptr ||
+      !prepared_token_keys_match(publication->key, key) ||
+      (publication->facts.epoch_prepare_deadline_us <= now_monotonic_us &&
+       entry->physical_promotion_pins == 0) ||
+      entry->resources.m_impl == nullptr ||
+      entry->resources.m_impl->resurrection_entry == nullptr) {
+    return Preserve_trx_prepared_status::INVALID_STATE;
+  }
+  *resurrection_entry = *entry->resources.m_impl->resurrection_entry;
+  return Preserve_trx_prepared_status::OK;
+}
+
+Preserve_trx_prepared_status
 Preserve_trx_prepared_token_registry::begin_gate_adopt(
     const Preserve_trx_prepared_token_key &key, uint64_t expected_generation,
-    Preserve_trx_gate_adopt_lease *lease) {
+    Preserve_trx_gate_adopt_lease *lease,
+    const Preserve_trx_physical_promotion_pin_lease *physical_pin) {
   if (!prepared_token_key_is_valid(key) ||
       expected_generation != key.generation || lease == nullptr ||
       lease->active()) {
@@ -1845,8 +1966,23 @@ Preserve_trx_prepared_token_registry::begin_gate_adopt(
       !prepared_token_keys_match(publication->key, key)) {
     return Preserve_trx_prepared_status::STALE_GENERATION;
   }
-  if (publication->facts.epoch_prepare_deadline_us <=
-      prepared_monotonic_us()) {
+  if (entry->physical_promotion_pins != 0) {
+    if (entry->physical_promotion_pins != 1 || physical_pin == nullptr ||
+        !physical_pin->m_active) {
+      return Preserve_trx_prepared_status::ALREADY_CLAIMED;
+    }
+    const auto owned = std::lower_bound(
+        physical_pin->m_entries.begin(), physical_pin->m_entries.end(),
+        entry->key.token, [](const auto &candidate, const std::string &token) {
+          return candidate->key.token < token;
+        });
+    if (owned == physical_pin->m_entries.end() ||
+        owned->get() != entry.get()) {
+      return Preserve_trx_prepared_status::ALREADY_CLAIMED;
+    }
+  }
+  if (publication->facts.epoch_prepare_deadline_us <= prepared_monotonic_us() &&
+      entry->physical_promotion_pins == 0) {
     if (entry->state.compare_exchange_strong(
             expected, Preserve_trx_prepared_token_state::NOT_READY,
             std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -2023,7 +2159,8 @@ Preserve_trx_prepared_status Preserve_trx_prepared_token_registry::begin_attach(
   if (entry == nullptr) return Preserve_trx_prepared_status::NOT_FOUND;
   std::lock_guard<std::mutex> guard(entry->mutex);
   auto expected = Preserve_trx_prepared_token_state::ADOPTED_LOCKED;
-  if (entry->state.load(std::memory_order_acquire) != expected) {
+  if (entry->physical_promotion_pins != 0 ||
+      entry->state.load(std::memory_order_acquire) != expected) {
     return Preserve_trx_prepared_status::ALREADY_CLAIMED;
   }
   const auto publication = std::atomic_load_explicit(
@@ -2344,8 +2481,9 @@ Preserve_trx_prepared_token_registry::find_unique_adopted(
   bool found = false;
   for (const auto &entry : candidates) {
     std::lock_guard<std::mutex> guard(entry->mutex);
-    if (entry->state.load(std::memory_order_acquire) !=
-        Preserve_trx_prepared_token_state::ADOPTED_LOCKED) {
+    if (entry->physical_promotion_pins != 0 ||
+        entry->state.load(std::memory_order_acquire) !=
+            Preserve_trx_prepared_token_state::ADOPTED_LOCKED) {
       continue;
     }
     const auto publication = std::atomic_load_explicit(
@@ -2425,7 +2563,7 @@ void Preserve_trx_prepared_token_registry::invalidate_incarnation(
       continue;
     }
     auto expected = entry->state.load(std::memory_order_acquire);
-    if (entry->preparing ||
+    if (entry->preparing || entry->physical_promotion_pins != 0 ||
         prepared_state_has_live_or_ambiguous_owner(expected)) {
       continue;
     }
@@ -2435,6 +2573,11 @@ void Preserve_trx_prepared_token_registry::invalidate_incarnation(
         Preserve_trx_prepared_registry_probe_point::INVALIDATE_BEFORE_RETIRE);
     guard.lock();
 #endif
+    expected = entry->state.load(std::memory_order_acquire);
+    if (entry->preparing || entry->physical_promotion_pins != 0 ||
+        prepared_state_has_live_or_ambiguous_owner(expected)) {
+      continue;
+    }
     if (!entry->state.compare_exchange_strong(
             expected, Preserve_trx_prepared_token_state::STALE_GENERATION,
             std::memory_order_acq_rel, std::memory_order_acquire)) {
@@ -2461,12 +2604,13 @@ size_t Preserve_trx_prepared_token_registry::expire_ready_facts_pending_lease(
   }
   size_t expired = 0;
   for (const auto &entry : entries) {
+    std::lock_guard<std::mutex> guard(entry->mutex);
     auto expected =
         Preserve_trx_prepared_token_state::READY_FACTS_PENDING_LEASE;
     if (entry->state.load(std::memory_order_acquire) != expected) continue;
     const auto publication = std::atomic_load_explicit(
         &entry->publication, std::memory_order_acquire);
-    if (publication == nullptr ||
+    if (publication == nullptr || entry->physical_promotion_pins != 0 ||
         publication->facts.epoch_prepare_deadline_us > now_us) {
       continue;
     }
@@ -2475,7 +2619,6 @@ size_t Preserve_trx_prepared_token_registry::expire_ready_facts_pending_lease(
             std::memory_order_acq_rel, std::memory_order_acquire)) {
       continue;
     }
-    std::lock_guard<std::mutex> guard(entry->mutex);
     entry->resources.reset();
     ++expired;
   }
@@ -2498,6 +2641,7 @@ Preserve_trx_prepared_token_registry::expire_once(uint64_t now_us) {
     const auto publication = std::atomic_load_explicit(
         &entry->publication, std::memory_order_acquire);
     if (publication == nullptr) continue;
+    if (entry->physical_promotion_pins != 0) continue;
 
     auto state = entry->state.load(std::memory_order_acquire);
     if (state == Preserve_trx_prepared_token_state::NOT_READY ||
@@ -2566,6 +2710,7 @@ Preserve_trx_prepared_token_registry::purge_token(
     std::lock_guard<std::mutex> entry_guard(found->second->mutex);
     auto expected = found->second->state.load(std::memory_order_acquire);
     if (found->second->preparing ||
+        found->second->physical_promotion_pins != 0 ||
         prepared_state_has_live_or_ambiguous_owner(expected)) {
       return Preserve_trx_prepared_status::INVALID_STATE;
     }
@@ -2594,6 +2739,7 @@ void Preserve_trx_prepared_token_registry::purge_epoch(
         std::lock_guard<std::mutex> entry_guard(it->second->mutex);
         auto expected = it->second->state.load(std::memory_order_acquire);
         if (it->second->preparing ||
+            it->second->physical_promotion_pins != 0 ||
             prepared_state_has_live_or_ambiguous_owner(expected)) {
           ++it;
           continue;

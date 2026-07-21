@@ -274,6 +274,7 @@ constexpr size_t kUserVariableEntryFixedLength = 12;
 
 std::string normalize_dir(std::string dir);
 std::string preserve_trx_default_dir();
+bool preserve_trx_token_to_xid(const std::string &token, XID *xid);
 static bool preserve_trx_xid_provenance_ledger_presence(bool *exists);
 
 bool preserved_trx_startup_needed_crash_recovery() {
@@ -2520,6 +2521,23 @@ static bool preserve_trx_resurrection_entry_to_engine_facts(
          anchor.top_undo_no, anchor.empty});
   }
   *facts = std::move(converted);
+  return false;
+}
+
+static bool preserve_trx_register_resurrection_candidate(
+    const Preserve_trx_resurrection_index_entry &entry,
+    const std::string &expected_token,
+    trx_preserve_resurrection_facts *registered_facts = nullptr) {
+  trx_preserve_resurrection_facts facts;
+  XID expected_xid;
+  if (preserve_trx_resurrection_entry_to_engine_facts(entry, &facts) ||
+      preserve_trx_token_to_xid(expected_token, &expected_xid) ||
+      !facts.xid.eq(&expected_xid) ||
+      trx_preserve_startup_register_resurrection_candidate(facts) !=
+          DB_SUCCESS) {
+    return true;
+  }
+  if (registered_facts != nullptr) *registered_facts = std::move(facts);
   return false;
 }
 
@@ -8693,6 +8711,20 @@ void preserve_trx_warmcopy_admit_current_thd_binlog_write_impl(THD *thd) {
 
 }  // namespace
 
+bool preserved_trx_register_physical_resurrection_candidates(
+    const std::vector<Preserve_trx_resurrection_index_entry> &entries) {
+  trx_preserve_startup_resurrection_reset();
+  if (entries.empty()) return true;
+  for (const auto &entry : entries) {
+    if (preserve_trx_register_resurrection_candidate(
+            entry, std::to_string(entry.token))) {
+      trx_preserve_startup_resurrection_reset();
+      return true;
+    }
+  }
+  return false;
+}
+
 bool preserved_trx_hydrate_source_rollback_image_for_unit_test(
     const std::string &token, Preserve_snapshot_metadata *metadata,
     const Preserve_trx_source_rollback_image &source_rollback_image) {
@@ -12058,6 +12090,7 @@ struct Preserved_trx_recover_or_adopt_options {
   Preserved_trx_recover_or_adopt_policy policy{
       Preserved_trx_recover_or_adopt_policy::LOCAL_STARTUP_RECOVERY};
   uint64_t deadline_us{0};
+  uint64_t deadline_monotonic_us{0};
   bool record_lock_pages_prewarmed{false};
   const lock_preserve_metadata_plan_t *record_lock_plan{nullptr};
   Preserve_trx_physical_fence_lease *physical_fence_lease{nullptr};
@@ -12133,8 +12166,9 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
     return fail_before_claim("invalid simulated targeted publication inputs");
   }
   if (strict_physical &&
-      (options.physical_fence_lease == nullptr ||
-       !options.physical_fence_lease->acquired() ||
+      (options.prepared_trx == nullptr ||
+       (options.physical_fence_lease != nullptr &&
+        !options.physical_fence_lease->acquired()) ||
        !metadata.predicate_locks_payload.empty() ||
        (!metadata.record_locks_payload.empty() &&
         (options.record_lock_plan == nullptr ||
@@ -12157,7 +12191,9 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
   }
 
   auto revalidate_physical_fence = [&]() {
-    if (!strict_physical) return Preserve_trx_physical_fence_status::OK;
+    if (!strict_physical || options.physical_fence_lease == nullptr) {
+      return Preserve_trx_physical_fence_status::OK;
+    }
     return options.physical_fence_lease->revalidate();
   };
   Preserve_trx_physical_fence_status fence_status =
@@ -12384,7 +12420,8 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
     if (options.record_lock_plan != nullptr) {
       const auto conflict =
           lock_preserve_check_record_bitmap_conflicts_from_metadata(
-              trx, *options.record_lock_plan, options.deadline_us);
+              trx, *options.record_lock_plan,
+              options.deadline_monotonic_us);
       if (conflict != lock_preserve_metadata_conflict_result::OK) {
         result->record_lock_conflict =
             conflict == lock_preserve_metadata_conflict_result::CONFLICT;
@@ -12396,7 +12433,7 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
                 : "metadata-only record-lock preflight failed");
       }
       semantic_err = lock_preserve_apply_record_lock_metadata_plan(
-          trx, *options.record_lock_plan, options.deadline_us,
+          trx, *options.record_lock_plan, options.deadline_monotonic_us,
           &strict_lock_journal);
       result->phase_metrics.record_lock_import.record_entries +=
           options.record_lock_plan->entry_count();
@@ -12779,6 +12816,7 @@ bool preserved_trx_adopt_ready_bundle_for_promotion(
 Preserved_trx_physical_adopt_status
 preserved_trx_adopt_prepared_for_physical_promotion(
     const std::string &dir, Preserve_trx_gate_adopt_lease *adopt_lease,
+    trx_t *prepared_trx,
     Preserve_trx_physical_fence_lease *physical_lease,
     uint64_t operation_deadline_us,
     Preserved_trx_physical_adopt_result *result) {
@@ -12787,19 +12825,29 @@ preserved_trx_adopt_prepared_for_physical_promotion(
   }
   *result = {};
   if (dir.empty() || adopt_lease == nullptr || !adopt_lease->active() ||
-      physical_lease == nullptr || !physical_lease->acquired() ||
-      operation_deadline_us == 0) {
-    result->reason = "strict promotion requires active registry and physical "
-                     "fence leases";
+      (physical_lease != nullptr && !physical_lease->acquired()) ||
+      operation_deadline_us <= my_micro_time()) {
+    result->reason = "strict promotion requires an active registry lease";
     return result->status;
   }
 
   const lock_preserve_metadata_plan_t *record_lock_plan =
       adopt_lease->record_lock_plan();
   const bool simulated_fence =
+      physical_lease != nullptr &&
       physical_lease->proof().consistency_mode ==
       Preserve_trx_physical_consistency_mode::
           TEST_ONLY_PHYSICAL_FENCE_SIMULATOR;
+  if (physical_lease != nullptr && !simulated_fence) {
+    result->reason =
+        "production promotion does not consume a Preserve fence provider";
+    return result->status;
+  }
+  if (!simulated_fence && prepared_trx == nullptr) {
+    result->reason =
+        "production promotion requires an exact verified prepared trx";
+    return result->status;
+  }
   if (simulated_fence) {
     const Preserve_trx_physical_fence_status fence_status =
         physical_lease->revalidate();
@@ -12914,8 +12962,14 @@ preserved_trx_adopt_prepared_for_physical_promotion(
   options.policy = Preserved_trx_recover_or_adopt_policy::
       STANDBY_PROMOTION_PHYSICAL_FENCE;
   options.deadline_us = operation_deadline_us;
+  const uint64_t deadline_anchor_wall_us = my_micro_time();
+  const uint64_t deadline_anchor_monotonic_us = preserve_trx_monotonic_us();
+  options.deadline_monotonic_us = preserve_trx_wall_deadline_to_monotonic(
+      operation_deadline_us, deadline_anchor_wall_us,
+      deadline_anchor_monotonic_us);
   options.record_lock_plan = record_lock_plan;
   options.physical_fence_lease = physical_lease;
+  options.prepared_trx = prepared_trx;
   Preserved_trx_simulated_publication_context simulated_publication;
   if (simulated_fence) {
     simulated_publication.capability = &publication_capability;
@@ -12990,7 +13044,7 @@ preserved_trx_adopt_prepared_for_physical_promotion(
 
 bool preserved_trx_reverse_simulated_promotion_adopt(
     const Preserve_trx_prepared_token_key &key,
-    Preserve_trx_cleanup_lease *cleanup_lease,
+    trx_t *, Preserve_trx_cleanup_lease *cleanup_lease,
     Preserve_trx_physical_fence_lease *physical_lease, std::string *reason) {
   auto fail = [&](const std::string &message) {
     if (reason != nullptr) *reason = message;
@@ -13050,6 +13104,42 @@ bool preserved_trx_reverse_simulated_promotion_adopt(
   delete_detached_mdl_context(key.token);
   audit_preserved_trx_event(current_thd, key.token,
                             "promotion-simulator-reverse", "success");
+  if (reason != nullptr) reason->clear();
+  return true;
+}
+
+bool preserved_trx_rollback_physical_promotion_adopt(
+    const Preserve_trx_prepared_token_key &key, trx_t *prepared_trx,
+    Preserve_trx_cleanup_lease *cleanup_lease,
+    Preserve_trx_physical_fence_lease *physical_lease, std::string *reason) {
+  auto fail = [&](const std::string &message) {
+    if (reason != nullptr) *reason = message;
+    return false;
+  };
+  if (key.token.empty() || prepared_trx == nullptr || cleanup_lease == nullptr ||
+      !cleanup_lease->active() || physical_lease != nullptr) {
+    return fail("production adopt rollback requires exact transaction and "
+                "cleanup lease");
+  }
+
+  Preserved_trx_record record;
+  if (!preserved_trx_take_promotion_adopted_record(key.token, &record)) {
+    return fail("production adopt rollback record is unavailable");
+  }
+  if (record.trx != prepared_trx || record.metadata.token != key.token) {
+    (void)restore_record_after_resume_failure(
+        record, "production adopt rollback identity conflict");
+    return fail("production adopt rollback identity conflict");
+  }
+  if (trx_preserve_rollback_claimed(record.trx) != DB_SUCCESS) {
+    (void)restore_record_after_resume_failure(
+        record, "production adopt rollback failed");
+    return fail("production adopt rollback failed");
+  }
+
+  delete_detached_mdl_context(key.token);
+  audit_preserved_trx_event(current_thd, key.token,
+                            "promotion-production-rollback", "success");
   if (reason != nullptr) reason->clear();
   return true;
 }
@@ -13233,28 +13323,20 @@ void preserved_trx_resurrection_index_bootstrap_preamble() {
       continue;
     }
 
-    trx_preserve_resurrection_facts facts;
-    XID expected_xid;
-    if (preserve_trx_resurrection_entry_to_engine_facts(index.entries.front(),
-                                                        &facts) ||
-        preserve_trx_token_to_xid(token, &expected_xid) ||
-        !facts.xid.eq(&expected_xid)) {
+    Preserve_trx_resurrection_index_entry registration_entry =
+        index.entries.front();
+    DBUG_EXECUTE_IF(
+        "preserve_trx_startup_force_resurrection_anchor_mismatch", {
+          if (!registration_entry.undo_anchors.empty()) {
+            ++registration_entry.undo_anchors.front().top_offset;
+          }
+        });
+    if (preserve_trx_register_resurrection_candidate(registration_entry,
+                                                     token)) {
       log_preserved_trx_recovery_warning(
           token, "startup Resurrection Index transaction facts mismatch; "
                  "native Undo scan will be used");
       continue;
-    }
-    DBUG_EXECUTE_IF(
-        "preserve_trx_startup_force_resurrection_anchor_mismatch", {
-          if (!facts.undo_anchors.empty()) {
-            ++facts.undo_anchors.front().top_offset;
-          }
-        });
-    if (trx_preserve_startup_register_resurrection_candidate(facts) !=
-        DB_SUCCESS) {
-      log_preserved_trx_recovery_warning(
-          token, "startup Resurrection Index candidate registration failed; "
-                 "native Undo scan will be used");
     }
   }
 }

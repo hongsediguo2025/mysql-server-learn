@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -147,24 +148,14 @@ class Preserve_trx_physical_fence_lease {
   friend class Preserve_trx_physical_fence_lease_factory;
 
   friend Preserve_trx_physical_fence_status
-  preserved_trx_acquire_production_physical_fence_lease(
-      const Preserve_trx_physical_fence_proof &,
-      Preserve_trx_physical_fence_lease *);
-  friend Preserve_trx_physical_fence_status
   preserved_trx_acquire_physical_fence_lease_for_unit_test(
       const Preserve_trx_physical_fence_proof &,
       Preserve_trx_physical_fence_lease *);
 };
 
-bool preserved_trx_register_production_physical_fence_provider(
-    const Preserve_trx_physical_fence_provider_ops &ops);
 void preserved_trx_set_physical_fence_provider_for_unit_test(
     const Preserve_trx_physical_fence_provider_ops *ops);
 
-Preserve_trx_physical_fence_status
-preserved_trx_acquire_production_physical_fence_lease(
-    const Preserve_trx_physical_fence_proof &expected,
-    Preserve_trx_physical_fence_lease *lease);
 Preserve_trx_physical_fence_status
 preserved_trx_acquire_physical_fence_lease_for_unit_test(
     const Preserve_trx_physical_fence_proof &expected,
@@ -519,6 +510,31 @@ struct Preserve_trx_prepared_registry_counts {
   uint64_t tainted_tokens{0};
 };
 
+class Preserve_trx_physical_promotion_pin_lease {
+ public:
+  Preserve_trx_physical_promotion_pin_lease() = default;
+  Preserve_trx_physical_promotion_pin_lease(
+      const Preserve_trx_physical_promotion_pin_lease &) = delete;
+  Preserve_trx_physical_promotion_pin_lease &operator=(
+      const Preserve_trx_physical_promotion_pin_lease &) = delete;
+  Preserve_trx_physical_promotion_pin_lease(
+      Preserve_trx_physical_promotion_pin_lease &&other) noexcept;
+  Preserve_trx_physical_promotion_pin_lease &operator=(
+      Preserve_trx_physical_promotion_pin_lease &&other) noexcept;
+  ~Preserve_trx_physical_promotion_pin_lease();
+
+  bool active() const { return m_active; }
+  void release_atomically() noexcept;
+  void release_for_abandon() noexcept;
+
+ private:
+  std::vector<std::shared_ptr<Preserve_trx_prepared_token_entry>> m_entries;
+  std::vector<std::unique_lock<std::mutex>> m_guards;
+  bool m_active{false};
+
+  friend class Preserve_trx_prepared_token_registry;
+};
+
 class Preserve_trx_prepared_token_registry {
  public:
   Preserve_trx_prepared_token_registry();
@@ -544,12 +560,20 @@ class Preserve_trx_prepared_token_registry {
   Preserve_trx_prepared_status update_epoch_prepare_deadline(
       const std::string &source_uuid, const std::string &epoch_id,
       size_t expected_token_count, uint64_t deadline_monotonic_us);
+  Preserve_trx_prepared_status pin_epoch_for_physical_promotion(
+      const std::vector<Preserve_trx_prepared_token_key> &keys,
+      uint64_t now_monotonic_us,
+      Preserve_trx_physical_promotion_pin_lease *lease);
   Preserve_trx_prepared_status mark_ready_for_gate(
       const Preserve_trx_prepared_token_key &key,
       uint64_t expected_generation);
+  Preserve_trx_prepared_status copy_ready_resurrection_entry(
+      const Preserve_trx_prepared_token_key &key, uint64_t now_monotonic_us,
+      Preserve_trx_resurrection_index_entry *resurrection_entry) const;
   Preserve_trx_prepared_status begin_gate_adopt(
       const Preserve_trx_prepared_token_key &key,
-      uint64_t expected_generation, Preserve_trx_gate_adopt_lease *lease);
+      uint64_t expected_generation, Preserve_trx_gate_adopt_lease *lease,
+      const Preserve_trx_physical_promotion_pin_lease *physical_pin = nullptr);
   Preserve_trx_prepared_status commit_gate_adopt(
       Preserve_trx_gate_adopt_lease *lease);
   Preserve_trx_prepared_status abort_gate_adopt(

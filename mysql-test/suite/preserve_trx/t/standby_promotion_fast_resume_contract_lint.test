@@ -48,11 +48,12 @@ my $test_attach_plugin = read_source(File::Spec->catfile(
   $source_root, 'plugin', 'test_preserve_trx_promotion',
   'test_preserve_trx_promotion.cc'));
 
-die "strict production fence must be acquired only by promotion coordinator\n"
-  unless $promotion =~ /preserved_trx_acquire_production_physical_fence_lease/;
-die "transfer/shared kernel must not acquire the production physical fence\n"
-  if $transfer =~ /preserved_trx_acquire_production_physical_fence_lease/ ||
-     $preserve =~ /preserved_trx_acquire_production_physical_fence_lease/;
+die "physical promotion must not depend on the removed Preserve production fence provider\n"
+  if $promotion =~ /preserved_trx_acquire_production_physical_fence_lease/ ||
+     $transfer =~ /preserved_trx_acquire_production_physical_fence_lease/ ||
+     $preserve =~ /preserved_trx_acquire_production_physical_fence_lease/ ||
+     $prepared =~ /preserved_trx_(?:register|acquire)_production_physical_fence/ ||
+     $prepared_h =~ /preserved_trx_(?:register|acquire)_production_physical_fence/;
 
 die "strict promotion coordinator must consume the prepared-token registry\n"
   unless $promotion =~ /preserved_trx_strict_prepared_token_registry/;
@@ -81,10 +82,10 @@ die "promotion/transfer wrappers must not attach native binlog caches\n"
   if $promotion =~ /mysql_binlog_preserve_attach_detached_cache/ ||
      $transfer =~ /mysql_binlog_preserve_attach_detached_cache/;
 
-die "test physical-fence provider must not be a production fallback\n"
-  unless $prepared =~ /g_production_provider_registered/ &&
-         $prepared =~ /g_test_provider_registered/ &&
-         $prepared =~ /MISSING_PROVIDER/;
+die "physical-fence provider must remain simulator-only\n"
+  unless $prepared =~ /g_test_provider_registered/ &&
+         $prepared =~ /MISSING_PROVIDER/ &&
+         $prepared =~ /TEST_ONLY_PHYSICAL_FENCE_SIMULATOR/;
 
 die "strict gate must use the shared physical-fence kernel entry\n"
   unless $promotion =~ /preserved_trx_adopt_prepared_for_physical_promotion/ &&

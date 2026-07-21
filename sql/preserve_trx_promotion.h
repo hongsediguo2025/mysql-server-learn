@@ -25,6 +25,7 @@
 #define SQL_PRESERVE_TRX_PROMOTION_INCLUDED
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,8 @@
 #include "sql/preserve_trx_promotion_prepared.h"
 
 struct Preserve_trx_transfer_epoch_fact;
+struct Preserve_trx_transfer_accepted_epoch;
+struct trx_t;
 
 extern uint preserve_trx_promotion_gate_batch_tokens;
 extern uint preserve_trx_promotion_gate_workers;
@@ -340,16 +343,19 @@ struct Preserve_trx_physical_promotion_gate_result {
   std::string message;
 };
 
+class Preserve_trx_physical_promotion_bootstrap_attempt;
+
 enum class Preserved_trx_physical_adopt_status : uint8_t;
 struct Preserved_trx_physical_adopt_result;
 using Preserve_trx_strict_physical_adopt_executor =
     Preserved_trx_physical_adopt_status (*)(
         const std::string &, Preserve_trx_gate_adopt_lease *,
-        Preserve_trx_physical_fence_lease *, uint64_t,
+        trx_t *, Preserve_trx_physical_fence_lease *, uint64_t,
         Preserved_trx_physical_adopt_result *);
 using Preserve_trx_strict_physical_adopt_reversal_executor = bool (*)(
-    const Preserve_trx_prepared_token_key &, Preserve_trx_cleanup_lease *,
-    Preserve_trx_physical_fence_lease *, std::string *);
+    const Preserve_trx_prepared_token_key &, trx_t *,
+    Preserve_trx_cleanup_lease *, Preserve_trx_physical_fence_lease *,
+    std::string *);
 
 void preserved_trx_set_strict_physical_adopt_executor_for_unit_test(
     Preserve_trx_strict_physical_adopt_executor executor);
@@ -359,13 +365,75 @@ void preserved_trx_set_strict_physical_adopt_reversal_executor_for_unit_test(
 Preserve_trx_physical_promotion_gate_status
 preserved_trx_adopt_prepared_epoch_for_physical_promotion(
     const std::string &preserve_dir,
-    const Preserve_trx_physical_promotion_gate_request &request,
+    Preserve_trx_physical_promotion_bootstrap_attempt *attempt,
     Preserve_trx_physical_promotion_gate_result *result);
 Preserve_trx_physical_promotion_gate_status
 preserved_trx_adopt_prepared_epoch_for_physical_promotion_for_unit_test(
     const std::string &preserve_dir,
     const Preserve_trx_physical_promotion_gate_request &request,
-    Preserve_trx_physical_promotion_gate_result *result);
+    Preserve_trx_physical_promotion_gate_result *result,
+    const std::vector<trx_t *> *verified_transactions = nullptr,
+    const Preserve_trx_transfer_accepted_epoch *accepted_epoch = nullptr);
+
+struct Preserve_trx_physical_bootstrap_request {
+  std::string epoch_id;
+  uint64_t operation_deadline_us{0};
+  uint32_t worker_count{3};
+};
+
+/*
+  Owns the current-process receiver epoch from immediately before
+  trx_sys_init_at_db_start() until the existing strict adopt gate consumes the
+  attempt. Exact verified trx_t pointers remain private to that gate. The
+  physical standby coordinator owns redo completion and freeze around this
+  interval; Preserve validates only its receiver epoch and transaction facts.
+  The coordinator must consume the attempt before starting recovery rollback,
+  purge, or write service. Exact claim revalidates each trx_t under trx_sys
+  locking; the attempt does not create a second transaction lifetime system.
+*/
+class Preserve_trx_physical_promotion_bootstrap_attempt {
+ public:
+  Preserve_trx_physical_promotion_bootstrap_attempt();
+  Preserve_trx_physical_promotion_bootstrap_attempt(
+      const Preserve_trx_physical_promotion_bootstrap_attempt &) = delete;
+  Preserve_trx_physical_promotion_bootstrap_attempt &operator=(
+      const Preserve_trx_physical_promotion_bootstrap_attempt &) = delete;
+  ~Preserve_trx_physical_promotion_bootstrap_attempt();
+
+  Preserve_trx_physical_promotion_gate_status abort();
+
+ private:
+  bool prepare_gate_handoff(
+      const Preserve_trx_physical_promotion_gate_request **request,
+      std::vector<trx_t *> *verified_transactions,
+      const Preserve_trx_transfer_accepted_epoch **accepted_epoch,
+      const Preserve_trx_physical_promotion_pin_lease **prepared_token_pin);
+  bool complete_gate_handoff();
+
+  class Impl;
+  std::unique_ptr<Impl> m_impl;
+
+  friend Preserve_trx_physical_promotion_gate_status
+  preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
+      const std::string &, const Preserve_trx_physical_bootstrap_request &,
+      Preserve_trx_physical_promotion_bootstrap_attempt *);
+  friend Preserve_trx_physical_promotion_gate_status
+  preserved_trx_adopt_prepared_epoch_for_physical_promotion(
+      const std::string &,
+      Preserve_trx_physical_promotion_bootstrap_attempt *,
+      Preserve_trx_physical_promotion_gate_result *);
+};
+
+/*
+  Registers authenticated receiver Resurrection Index entries for the native
+  trx_sys initialization pass. This does not claim a transaction, import
+  locks/MDL, attach a THD, or resume a transaction.
+*/
+Preserve_trx_physical_promotion_gate_status
+preserved_trx_prepare_before_trx_sys_init_for_physical_promotion(
+    const std::string &preserve_dir,
+    const Preserve_trx_physical_bootstrap_request &request,
+    Preserve_trx_physical_promotion_bootstrap_attempt *attempt);
 
 Preserve_trx_promotion_adopt_status
 preserved_trx_cleanup_abandoned_standby_promotion_epoch(

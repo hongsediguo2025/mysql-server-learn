@@ -7306,6 +7306,8 @@ Preserve_trx_transfer_receiver_registry::query_accepted_epoch(
   const auto found = m_accepted_epochs.find(epoch_id);
   if (found == m_accepted_epochs.end() || found->second.root_dir != root_dir ||
       found->second.lifecycle ==
+          Preserve_trx_transfer_epoch_lifecycle::ABANDONING ||
+      found->second.lifecycle ==
           Preserve_trx_transfer_epoch_lifecycle::EXPIRED) {
     return Preserve_trx_transfer_status::IO_ERROR;
   }
@@ -7320,6 +7322,8 @@ bool Preserve_trx_transfer_receiver_registry::accepted_epoch_is_live(
   const auto found = m_accepted_epochs.find(epoch_id);
   return found != m_accepted_epochs.end() &&
          found->second.root_dir == root_dir &&
+         found->second.lifecycle !=
+             Preserve_trx_transfer_epoch_lifecycle::ABANDONING &&
          found->second.lifecycle !=
              Preserve_trx_transfer_epoch_lifecycle::EXPIRED;
 }
@@ -7349,7 +7353,9 @@ Preserve_trx_transfer_receiver_registry::mark_accepted_epoch_ready(
     return Preserve_trx_transfer_status::IO_ERROR;
   }
   Preserve_trx_transfer_accepted_epoch &accepted = found->second;
-  if (accepted.lifecycle == Preserve_trx_transfer_epoch_lifecycle::EXPIRED) {
+  if (accepted.lifecycle ==
+          Preserve_trx_transfer_epoch_lifecycle::ABANDONING ||
+      accepted.lifecycle == Preserve_trx_transfer_epoch_lifecycle::EXPIRED) {
     return Preserve_trx_transfer_status::IO_ERROR;
   }
   if (accepted.lifecycle == Preserve_trx_transfer_epoch_lifecycle::ADOPT_LEASED) {
@@ -7357,6 +7363,10 @@ Preserve_trx_transfer_receiver_registry::mark_accepted_epoch_ready(
   }
   if (accepted.lifecycle == Preserve_trx_transfer_epoch_lifecycle::READY) {
     return Preserve_trx_transfer_status::OK;
+  }
+  if (accepted.lifecycle !=
+      Preserve_trx_transfer_epoch_lifecycle::PREWARMING) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
   }
   if (accepted.deadline_monotonic_us <= now_us) {
     accepted.lifecycle = Preserve_trx_transfer_epoch_lifecycle::EXPIRED;
@@ -7372,8 +7382,12 @@ Preserve_trx_receiver_promotion_lease_status
 Preserve_trx_transfer_receiver_registry::
     try_acquire_accepted_epoch_promotion_lease(
         const std::string &root_dir, const std::string &epoch_id,
-        uint64_t now_us) {
-  if (root_dir.empty() || !transfer_component_safe(epoch_id)) {
+        uint64_t now_us,
+        const std::string &expected_receiver_process_generation,
+        Preserve_trx_transfer_accepted_epoch *accepted_snapshot) {
+  if (root_dir.empty() || !transfer_component_safe(epoch_id) ||
+      expected_receiver_process_generation.empty() ||
+      accepted_snapshot == nullptr) {
     return Preserve_trx_receiver_promotion_lease_status::
         NOT_FOUND_OR_EXPIRED;
   }
@@ -7384,13 +7398,17 @@ Preserve_trx_transfer_receiver_registry::
         NOT_FOUND_OR_EXPIRED;
   }
   Preserve_trx_transfer_accepted_epoch &accepted = found->second;
-  if (accepted.lifecycle == Preserve_trx_transfer_epoch_lifecycle::EXPIRED) {
+  if (accepted.lifecycle ==
+          Preserve_trx_transfer_epoch_lifecycle::ABANDONING ||
+      accepted.lifecycle == Preserve_trx_transfer_epoch_lifecycle::EXPIRED) {
     return Preserve_trx_receiver_promotion_lease_status::
         NOT_FOUND_OR_EXPIRED;
   }
-  if (accepted.lifecycle ==
-      Preserve_trx_transfer_epoch_lifecycle::ADOPT_LEASED) {
-    return Preserve_trx_receiver_promotion_lease_status::ACQUIRED;
+  if (accepted.receiver_process_generation !=
+          expected_receiver_process_generation ||
+      accepted.lifecycle ==
+          Preserve_trx_transfer_epoch_lifecycle::ADOPT_LEASED) {
+    return Preserve_trx_receiver_promotion_lease_status::NOT_READY;
   }
   if (accepted.deadline_monotonic_us <= now_us) {
     accepted.lifecycle = Preserve_trx_transfer_epoch_lifecycle::EXPIRED;
@@ -7401,9 +7419,69 @@ Preserve_trx_transfer_receiver_registry::
   if (accepted.lifecycle != Preserve_trx_transfer_epoch_lifecycle::READY) {
     return Preserve_trx_receiver_promotion_lease_status::NOT_READY;
   }
+  try {
+    *accepted_snapshot = accepted;
+  } catch (const std::bad_alloc &) {
+    return Preserve_trx_receiver_promotion_lease_status::NOT_READY;
+  }
   accepted.lifecycle = Preserve_trx_transfer_epoch_lifecycle::ADOPT_LEASED;
   accepted.deadline_monotonic_us = 0;
+  accepted_snapshot->lifecycle =
+      Preserve_trx_transfer_epoch_lifecycle::ADOPT_LEASED;
+  accepted_snapshot->deadline_monotonic_us = 0;
   return Preserve_trx_receiver_promotion_lease_status::ACQUIRED;
+}
+
+Preserve_trx_transfer_status
+Preserve_trx_transfer_receiver_registry::
+    abandon_accepted_epoch_promotion_lease(
+        const Preserve_trx_transfer_accepted_epoch &accepted) {
+  if (accepted.root_dir.empty() || accepted.epoch_id.empty() ||
+      accepted.source_server_uuid.empty() ||
+      accepted.receiver_process_generation.empty()) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  std::lock_guard<std::mutex> guard(m_mutex);
+  const auto found = m_accepted_epochs.find(accepted.epoch_id);
+  if (found == m_accepted_epochs.end()) {
+    return Preserve_trx_transfer_status::OK;
+  }
+  if (found->second.root_dir != accepted.root_dir ||
+      found->second.source_server_uuid != accepted.source_server_uuid ||
+      found->second.receiver_process_generation !=
+          accepted.receiver_process_generation) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+  if (found->second.lifecycle ==
+      Preserve_trx_transfer_epoch_lifecycle::ABANDONING) {
+    return Preserve_trx_transfer_status::OK;
+  }
+  if (found->second.lifecycle !=
+      Preserve_trx_transfer_epoch_lifecycle::ADOPT_LEASED) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+  found->second.lifecycle =
+      Preserve_trx_transfer_epoch_lifecycle::ABANDONING;
+  return Preserve_trx_transfer_status::OK;
+}
+
+Preserve_trx_transfer_status
+Preserve_trx_transfer_receiver_registry::
+    complete_accepted_epoch_promotion_lease(
+        const Preserve_trx_transfer_accepted_epoch &accepted) {
+  std::lock_guard<std::mutex> guard(m_mutex);
+  const auto found = m_accepted_epochs.find(accepted.epoch_id);
+  if (found == m_accepted_epochs.end() ||
+      found->second.root_dir != accepted.root_dir ||
+      found->second.source_server_uuid != accepted.source_server_uuid ||
+      found->second.receiver_process_generation !=
+          accepted.receiver_process_generation ||
+      found->second.lifecycle !=
+          Preserve_trx_transfer_epoch_lifecycle::ADOPT_LEASED) {
+    return Preserve_trx_transfer_status::UNSUPPORTED;
+  }
+  m_accepted_epochs.erase(found);
+  return Preserve_trx_transfer_status::OK;
 }
 
 size_t Preserve_trx_transfer_receiver_registry::expire_accepted_epochs_once(
@@ -7416,6 +7494,11 @@ size_t Preserve_trx_transfer_receiver_registry::expire_accepted_epochs_once(
     Preserve_trx_transfer_accepted_epoch &accepted = item.second;
     if (accepted.lifecycle ==
         Preserve_trx_transfer_epoch_lifecycle::ADOPT_LEASED) {
+      continue;
+    }
+    if (accepted.lifecycle ==
+        Preserve_trx_transfer_epoch_lifecycle::ABANDONING) {
+      expired->push_back(accepted);
       continue;
     }
     if (accepted.lifecycle != Preserve_trx_transfer_epoch_lifecycle::EXPIRED) {
@@ -7434,6 +7517,22 @@ size_t Preserve_trx_transfer_receiver_registry::expire_accepted_epochs_once(
 Preserve_trx_transfer_status
 Preserve_trx_transfer_receiver_registry::erase_expired_epoch(
     const std::string &root_dir, const std::string &epoch_id) {
+  return erase_cleaned_epoch(root_dir, epoch_id,
+                             Preserve_trx_transfer_epoch_lifecycle::EXPIRED);
+}
+
+Preserve_trx_transfer_status
+Preserve_trx_transfer_receiver_registry::erase_abandoning_epoch(
+    const std::string &root_dir, const std::string &epoch_id) {
+  return erase_cleaned_epoch(
+      root_dir, epoch_id,
+      Preserve_trx_transfer_epoch_lifecycle::ABANDONING);
+}
+
+Preserve_trx_transfer_status
+Preserve_trx_transfer_receiver_registry::erase_cleaned_epoch(
+    const std::string &root_dir, const std::string &epoch_id,
+    Preserve_trx_transfer_epoch_lifecycle expected_lifecycle) {
   if (root_dir.empty() || !transfer_component_safe(epoch_id)) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
@@ -7444,8 +7543,7 @@ Preserve_trx_transfer_receiver_registry::erase_expired_epoch(
       return Preserve_trx_transfer_status::OK;
     }
     if (accepted->second.root_dir != root_dir ||
-        accepted->second.lifecycle !=
-            Preserve_trx_transfer_epoch_lifecycle::EXPIRED) {
+        accepted->second.lifecycle != expected_lifecycle) {
       return Preserve_trx_transfer_status::UNSUPPORTED;
     }
 
@@ -8133,7 +8231,9 @@ size_t Preserve_trx_transfer_receiver_registry::active_epoch_count() const {
   return std::count_if(
       m_accepted_epochs.begin(), m_accepted_epochs.end(), [](const auto &item) {
         return item.second.lifecycle !=
-               Preserve_trx_transfer_epoch_lifecycle::EXPIRED;
+                   Preserve_trx_transfer_epoch_lifecycle::ABANDONING &&
+               item.second.lifecycle !=
+                   Preserve_trx_transfer_epoch_lifecycle::EXPIRED;
       });
 }
 
@@ -12027,8 +12127,7 @@ void receiver_reaper_scan_once(
                                                                    registry);
     if (destroy_status != Preserve_trx_transfer_status::OK) {
       const std::string message =
-          "PRESERVE: receiver epoch TTL cleanup left process-local files "
-          "for restart cleanup epoch=" +
+          "PRESERVE: receiver epoch cleanup remains pending epoch=" +
           accepted.epoch_id +
           " status=" + transfer_status_name(destroy_status);
       LogErr(WARNING_LEVEL, ER_LOG_PRINTF_MSG, message.c_str());
@@ -12053,7 +12152,9 @@ preserve_trx_transfer_destroy_receiver_epoch_process_local(
     Preserve_trx_transfer_receiver_registry *registry) {
   if (registry == nullptr || accepted.root_dir.empty() ||
       !transfer_component_safe(accepted.epoch_id) ||
-      accepted.lifecycle != Preserve_trx_transfer_epoch_lifecycle::EXPIRED) {
+      (accepted.lifecycle !=
+           Preserve_trx_transfer_epoch_lifecycle::ABANDONING &&
+       accepted.lifecycle != Preserve_trx_transfer_epoch_lifecycle::EXPIRED)) {
     return Preserve_trx_transfer_status::INVALID_ARGUMENT;
   }
 
@@ -12078,11 +12179,16 @@ preserve_trx_transfer_destroy_receiver_epoch_process_local(
       Preserve_trx_transfer_status::OK) {
     cleanup_status = Preserve_trx_transfer_status::IO_ERROR;
   }
+  if (cleanup_status != Preserve_trx_transfer_status::OK) {
+    return cleanup_status;
+  }
 
-  const Preserve_trx_transfer_status erase_status =
-      registry->erase_expired_epoch(accepted.root_dir, accepted.epoch_id);
-  return erase_status == Preserve_trx_transfer_status::OK ? cleanup_status
-                                                          : erase_status;
+  return accepted.lifecycle ==
+                 Preserve_trx_transfer_epoch_lifecycle::ABANDONING
+             ? registry->erase_abandoning_epoch(accepted.root_dir,
+                                                accepted.epoch_id)
+             : registry->erase_expired_epoch(accepted.root_dir,
+                                             accepted.epoch_id);
 }
 
 void preserve_trx_transfer_receiver_reaper_scan_once(uint64_t now_us) {
@@ -12091,9 +12197,40 @@ void preserve_trx_transfer_receiver_reaper_scan_once(uint64_t now_us) {
 
 Preserve_trx_receiver_promotion_lease_status
 preserve_trx_transfer_try_acquire_receiver_promotion_lease(
-    const std::string &root_dir, const std::string &epoch_id, uint64_t now_us) {
+    const std::string &root_dir, const std::string &epoch_id, uint64_t now_us,
+    Preserve_trx_transfer_accepted_epoch *accepted) {
   return default_receiver_registry()
-      .try_acquire_accepted_epoch_promotion_lease(root_dir, epoch_id, now_us);
+      .try_acquire_accepted_epoch_promotion_lease(
+          root_dir, epoch_id, now_us, receiver_boot_incarnation(), accepted);
+}
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_abandon_receiver_promotion_lease_process_local(
+    Preserve_trx_transfer_accepted_epoch *accepted) {
+  if (accepted == nullptr) {
+    return Preserve_trx_transfer_status::INVALID_ARGUMENT;
+  }
+  auto &registry = default_receiver_registry();
+  const auto abandon_status =
+      registry.abandon_accepted_epoch_promotion_lease(*accepted);
+  if (abandon_status == Preserve_trx_transfer_status::OK) {
+    accepted->lifecycle = Preserve_trx_transfer_epoch_lifecycle::ABANDONING;
+  }
+  return abandon_status;
+}
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_complete_receiver_promotion_lease_process_local(
+    const Preserve_trx_transfer_accepted_epoch &accepted) {
+  return default_receiver_registry()
+      .complete_accepted_epoch_promotion_lease(accepted);
+}
+
+Preserve_trx_transfer_status
+preserve_trx_transfer_destroy_abandoning_receiver_epoch_process_local(
+    const Preserve_trx_transfer_accepted_epoch &accepted) {
+  return preserve_trx_transfer_destroy_receiver_epoch_process_local(
+      accepted, &default_receiver_registry());
 }
 
 void preserve_trx_transfer_receiver_reaper_scan_for_unit_test(
