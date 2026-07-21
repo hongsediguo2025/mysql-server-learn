@@ -28,7 +28,3 @@ WHERE VARIABLE_NAME IN (
 'Preserve_trx_resume_real_redo_apply');
 registered_fast_resume_metrics
 25
-INSTALL PLUGIN test_preserve_trx_promotion
-SONAME 'libtest_preserve_trx_promotion.so';
-production_resume_failure_delta=1
-UNINSTALL PLUGIN test_preserve_trx_promotion;

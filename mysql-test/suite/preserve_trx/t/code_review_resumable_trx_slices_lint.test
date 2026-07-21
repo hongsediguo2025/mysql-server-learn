@@ -1236,13 +1236,21 @@ die "second resume deadline branch must preserve timeout as LAST_ERROR before ro
 $preserve =~ /bool Sql_cmd_resume_preserved_transaction::execute\(THD \*thd\)[\s\S]*?^}/m
   or die "could not isolate Sql_cmd_resume_preserved_transaction::execute\n";
 my $resume_execute = $&;
-die "SQL RESUME wrapper must delegate to preserved_trx_resume_record_on_thd\n"
-  unless $resume_execute =~ /preserved_trx_resume_record_on_thd\s*\(/s;
+die "SQL RESUME wrapper must delegate to preserved_trx_resume_record_on_current_thd\n"
+  unless $resume_execute =~ /preserved_trx_resume_record_on_current_thd\s*\(/s;
 die "SQL RESUME wrapper must not directly run the large resume core\n"
   if $resume_execute =~ /preserved_trx_take_resumable_record\s*\(|restore_detached_mdl_context\s*\(|trx_preserve_attach_to_thd\s*\(/s;
-$preserve =~ /static bool preserved_trx_resume_record_on_thd[\s\S]*?^}/m
-  or die "could not isolate preserved_trx_resume_record_on_thd\n";
+$preserve =~ /static bool preserved_trx_resume_record_on_current_thd[\s\S]*?^}/m
+  or die "could not isolate preserved_trx_resume_record_on_current_thd\n";
 my $resume_core = $&;
+$preserve =~
+  /static Preserved_trx_resume_prepare_result\s+prepare_resume_on_current_thd_shared[\s\S]*?^}/m
+  or die "could not isolate prepare_resume_on_current_thd_shared\n";
+my $resume_prepare_shared = $&;
+$preserve =~
+  /static Preserved_trx_promotion_resume_status\s+preserved_trx_resume_adopted_for_promotion_on_current_thd\s*\([^;]*\)\s*\{[\s\S]*?^}/m
+  or die "could not isolate strict current-THD resume shell\n";
+my $promotion_resume_current_thd = $&;
 my $deadline_pos = index($resume_core,
                          "preserved_trx_record_resume_deadline_expired(record)");
 my $not_resumable_pos = index($resume_core, "if (!record.resumable)");
@@ -1289,14 +1297,14 @@ die "token delivery rollback failure must atomically publish LAST_ERROR with the
 
 my $resume_execute_for_failure_guards = $resume_core;
 
-$resume_execute_for_failure_guards =~ /if\s*\(restore_savepoints_to_thd[\s\S]*?return preserve_trx_reject_unsupported\(\);/m
-  or die "could not isolate RESUME savepoint failure branch\n";
-my $resume_savepoint_failure = $&;
-die "RESUME savepoint failure branch must route through detach cleanup helper\n"
-  unless $resume_savepoint_failure =~ /detach_resumed_after_failure/s &&
-         $resume_savepoint_failure !~ /else\s*\{[\s\S]*thd_state_guard\.dismiss/s;
+die "shared RESUME preparation must report savepoint failure after attach\n"
+  unless $resume_prepare_shared =~
+         /trx_preserve_attach_to_thd[\s\S]*restore_savepoints_to_thd[\s\S]*Preserved_trx_resume_prepare_stage::SAVEPOINTS/s;
+die "local RESUME must detach and restore the record when shared preparation fails after attach\n"
+  unless $resume_execute_for_failure_guards =~
+         /if\s*\(\s*!prepare_result\.ok\s*\)[\s\S]*resume_runtime\.trx_attached[\s\S]*detach_resumed_after_failure[\s\S]*restore_preserved_record_after_failure/s;
 
-$resume_execute_for_failure_guards =~ /if\s*\(trx_preserve_activate_resumed\(record\.trx\)[\s\S]*?return preserve_trx_reject_unsupported\(\);/m
+$resume_execute_for_failure_guards =~ /if\s*\(activate_resumed_trx_shared\(&record\)[\s\S]*?return preserve_trx_reject_unsupported\(\);/m
   or die "could not isolate RESUME activation failure branch\n";
 my $resume_activation_failure = $&;
 die "RESUME activation failure branch must route through detach cleanup helper\n"
@@ -2618,25 +2626,27 @@ die "promotion-adopted records must be registered as promotion-owned and non-res
   unless $preserve =~ /ADOPTED_FOR_PROMOTION/s &&
          $shared_recover_adopt_kernel =~
          /preserved_trx_add_record\s*\(\s*metadata\s*,\s*trx\s*,\s*local_startup\s*,[\s\S]*local_startup\s*\?\s*Preserved_trx_lifecycle_state::PRESERVED\s*:\s*Preserved_trx_lifecycle_state::ADOPTED_FOR_PROMOTION/s;
-$resume_core =~ /if\s*\(\s*!record\.resumable\s*\)[\s\S]*?return preserve_trx_reject_unsupported\s*\(\s*\);/m
-  or die "could not isolate SQL RESUME non-resumable branch\n";
-my $non_resumable_resume_branch = $&;
-die "ordinary SQL RESUME must not turn non-resumable promotion-owned records into FAILED records\n"
-  unless $non_resumable_resume_branch =~ /preserved_trx_update_record_last_error/s &&
-         $non_resumable_resume_branch !~ /preserved_trx_update_record_error/s;
-die "resume core must be policy-scoped so SQL users cannot construct PROMOTION_RESUME_ON_THD\n"
-  unless $preserve =~ /enum\s+class\s+Preserved_trx_resume_policy[\s\S]*SQL_RESUME[\s\S]*PROMOTION_RESUME_ON_THD/s &&
-         $resume_core =~ /const\s+Preserved_trx_resume_options\s*&options/s &&
-         $resume_execute =~ /Preserved_trx_resume_policy::SQL_RESUME/s &&
-         $resume_execute !~ /PROMOTION_RESUME_ON_THD/s;
-die "promotion-owned records must have a dedicated take helper guarded by ADOPTED_FOR_PROMOTION and non-resumable state\n"
-  unless $preserve =~ /preserved_trx_take_promotion_adopted_record[\s\S]*ADOPTED_FOR_PROMOTION[\s\S]*!it->resumable/s &&
-         $resume_core =~ /preserved_trx_take_promotion_adopted_record/s;
-die "promotion resume-on-THD must be exposed only through a protected peer THD handle\n"
-  unless $preserve_header =~ /class\s+Preserved_trx_peer_thd_handle[\s\S]*THD\s*\*\s*get\s*\(\s*\)\s*const/s &&
-         $preserve_header =~ /using\s+Preserved_trx_peer_thd_resolver\s*=[\s\S]*Preserved_trx_peer_thd_handle\s*\*/s &&
-         $preserve =~ /preserved_trx_resume_adopted_for_promotion_on_thd\s*\(\s*Preserved_trx_peer_thd_handle\s*\*/s &&
-         $preserve !~ /preserved_trx_resume_adopted_for_promotion_on_thd\s*\(\s*THD\s*\*/s;
+die "ordinary non-promotion SQL RESUME must retain non-resumable fail-closed handling\n"
+  unless $resume_core =~
+         /if\s*\(\s*!record\.resumable\s*\)[\s\S]*preserved_trx_update_record_last_error[\s\S]*return preserve_trx_reject_unsupported\s*\(\s*\);/s;
+die "SQL RESUME may enter the strict shell only for an exact promotion-owned registry identity\n"
+  unless $resume_core =~
+         /!record\.resumable[\s\S]*ADOPTED_FOR_PROMOTION[\s\S]*record\.has_promotion_key[\s\S]*record\.promotion_key\.token\s*!=\s*token[\s\S]*preserved_trx_resume_adopted_for_promotion_on_current_thd\s*\(\s*thd\s*,\s*record\.promotion_key/s;
+die "promotion-owned records must have a dedicated exact-key take helper guarded by ADOPTED_FOR_PROMOTION and non-resumable state\n"
+  unless $preserve =~
+           /bool preserved_trx_take_promotion_adopted_record\s*\(\s*const Preserve_trx_prepared_token_key\s*&key/s &&
+         $preserve =~
+           /it->state\s*==\s*Preserved_trx_lifecycle_state::ADOPTED_FOR_PROMOTION[\s\S]{0,240}!it->resumable[\s\S]{0,120}it->has_promotion_key[\s\S]{0,180}preserved_trx_promotion_keys_match\s*\(\s*it->promotion_key\s*,\s*key\s*\)/s &&
+         $promotion_resume_current_thd =~
+           /preserved_trx_take_promotion_adopted_record\s*\(\s*key\s*,\s*&record\s*\)/s;
+die "obsolete peer-THD promotion resume stack and write-only result must be absent\n"
+  if $preserve_header =~ /Preserved_trx_peer_thd_handle|Preserved_trx_promotion_resume_result|preserved_trx_resolve_peer_thd|preserved_trx_resume_adopted_for_promotion_on_thd|preserved_trx_defer_external_thd_kill/ ||
+     $preserve =~ /Preserved_trx_peer_thd_handle|Preserved_trx_promotion_resume_result|preserved_trx_resolve_peer_thd|Preserve_peer_thd_execution_context|preserved_trx_resume_adopted_for_promotion_on_thd|preserved_trx_defer_external_thd_kill/ ||
+     $sql_class =~ /preserved_trx_defer_external_thd_kill/;
+die "strict promotion resume shell must only mutate its executing current THD\n"
+  unless $promotion_resume_current_thd =~ /current_thd\s*==\s*target/s &&
+         $promotion_resume_current_thd =~ /Preserve_trx_batch_thd_state::NONE/s &&
+         $promotion_resume_current_thd !~ /protected_peer_thd/s;
 die "shared startup recover/adopt kernel must accept operation options with a monotonic deadline\n"
   unless $preserve =~ /struct Preserved_trx_recover_or_adopt_options[\s\S]*deadline_us/s &&
          $shared_recover_adopt_kernel =~ /const Preserved_trx_recover_or_adopt_options\s*&options/s &&
@@ -2717,10 +2727,10 @@ die "binlog import failure after handler registration must reset both handler sc
 die "resume must restore autocommit through the native behavior-preserving helper before transaction attach\n"
   unless $preserve =~
          /restore_preserved_dml_policy[\s\S]*set_session_autocommit_internal/s &&
-         $resume_core =~
+         $resume_prepare_shared =~
          /restore_preserved_dml_policy[\s\S]*trx_preserve_attach_to_thd[\s\S]*mark_preserved_transaction_attached/s;
 die "resume must restore DML policy into both THD state and the detached InnoDB transaction before attach\n"
-  unless $resume_core =~
+  unless $resume_prepare_shared =~
          /restore_preserved_dml_policy[\s\S]*trx_preserve_attach_to_thd/s;
 die "cross-owner sql_log_bin OFF restore must require native session-variable administration privilege\n"
   unless $resume_core =~
@@ -2728,7 +2738,7 @@ die "cross-owner sql_log_bin OFF restore must require native session-variable ad
 die "resume must rebuild explicit transaction tracker state after attach\n"
   unless $preserve =~
          /mark_preserved_transaction_attached[\s\S]*restore_preserved_transaction_tracker/s &&
-         $resume_core =~
+         $resume_prepare_shared =~
          /trx_preserve_attach_to_thd[\s\S]*mark_preserved_transaction_attached/s;
 die "preserve eligibility must inspect every SESSION and STMT participant without a read-write shortcut\n"
   unless $preserve =~

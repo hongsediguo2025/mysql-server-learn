@@ -5435,6 +5435,7 @@ class BusinessE2ERunner:
         self.warmcopy_drain_metrics: List[WarmcopyDrainMetrics] = []
         self.startup_recovery_metrics: List[StartupRecoveryMetrics] = []
         self.promotion_gate_elapsed_samples_us: List[int] = []
+        self.promotion_sql_resume_elapsed_samples_us: List[int] = []
         self.promotion_gate_server_metrics: List[PromotionGateMetrics] = []
         self.receiver_prewarm_metrics: Optional[ReceiverPrewarmMetrics] = None
         self.post_resume_temp_dml_executed = False
@@ -6693,6 +6694,7 @@ class BusinessE2ERunner:
             connection_factory=self._receiver_admin_connection,
             wait_until_up=False,
         )
+        self.resume_promoted_transactions_with_sql(tokens)
         self.write_receiver_promotion_gate_report(epoch_id, tokens)
 
     def run_physical_standby_promotion_gate_scaled(self) -> None:
@@ -6716,6 +6718,7 @@ class BusinessE2ERunner:
                 connection_factory=self._receiver_admin_connection,
                 wait_until_up=False,
             )
+            self.resume_promoted_transactions_with_sql(tokens)
             all_epoch_ids.append(epoch_id)
             all_tokens.extend(tokens)
         if not all_tokens:
@@ -6725,6 +6728,33 @@ class BusinessE2ERunner:
             sorted(all_tokens),
             scenario_name="physical_standby_promotion_gate_scaled",
         )
+
+    def resume_promoted_transactions_with_sql(
+        self, tokens: Sequence[int]
+    ) -> None:
+        samples = []
+        for token in tokens:
+            conn = self._receiver_admin_connection()
+            try:
+                started_ns = time.monotonic_ns()
+                self.runtime.execute(
+                    conn,
+                    "RESUME PRESERVED TRANSACTION "
+                    f"{quote_sql_string(str(token))}",
+                )
+                elapsed_us = max(1, (time.monotonic_ns() - started_ns) // 1000)
+                rows = self.runtime.execute(conn, "SELECT 1", fetch=True)
+                if rows != [(1,)]:
+                    raise AssertionError(
+                        f"promoted token {token} could not continue SQL: {rows!r}"
+                    )
+                self.runtime.execute(conn, "ROLLBACK")
+                samples.append(int(elapsed_us))
+            finally:
+                conn.close()
+        if not hasattr(self, "promotion_sql_resume_elapsed_samples_us"):
+            self.promotion_sql_resume_elapsed_samples_us = []
+        self.promotion_sql_resume_elapsed_samples_us.extend(samples)
 
     def prepare_standby_transfer_credential_secret_files(self) -> None:
         if self.config.scenario not in {
@@ -7080,6 +7110,9 @@ class BusinessE2ERunner:
                 self.config.promotion_gate_debug_apply_reached
             ),
             "promotion_gate_elapsed_us": gate_elapsed_us,
+            "promotion_sql_resume_elapsed_samples_us": list(
+                getattr(self, "promotion_sql_resume_elapsed_samples_us", [])
+            ),
             "receiver_snapshot_tokens": artifact_counts.get("snapshot_tokens", 0),
             "receiver_standby_pending_tokens": artifact_counts.get(
                 "standby_pending_tokens", 0

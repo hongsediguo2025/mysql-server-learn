@@ -28,6 +28,8 @@ my $transfer = read_source(File::Spec->catfile(
   $source_root, 'sql', 'preserve_trx_transfer.cc'));
 my $preserve = read_source(File::Spec->catfile(
   $source_root, 'sql', 'preserve_trx.cc'));
+my $preserve_h = read_source(File::Spec->catfile(
+  $source_root, 'sql', 'preserve_trx.h'));
 my $sys_vars = read_source(File::Spec->catfile(
   $source_root, 'sql', 'sys_vars.cc'));
 my $mysqld = read_source(File::Spec->catfile(
@@ -44,9 +46,6 @@ my $prepared_gunit = read_source(File::Spec->catfile(
   $source_root, 'unittest', 'gunit', 'preserve_trx-t.cc'));
 my $sql_class = read_source(File::Spec->catfile(
   $source_root, 'sql', 'sql_class.cc'));
-my $test_attach_plugin = read_source(File::Spec->catfile(
-  $source_root, 'plugin', 'test_preserve_trx_promotion',
-  'test_preserve_trx_promotion.cc'));
 
 die "physical promotion must not depend on the removed Preserve production fence provider\n"
   if $promotion =~ /preserved_trx_acquire_production_physical_fence_lease/ ||
@@ -77,7 +76,7 @@ my $native_attach_call_count = () =
 die "P5 native binlog attach must have one strict production-core caller\n"
   unless $native_attach_call_count == 1 &&
          $preserve =~
-         /preserved_trx_resume_adopted_for_promotion_on_thd[\s\S]*mysql_binlog_preserve_attach_detached_cache/s;
+         /prepare_resume_on_current_thd_shared[\s\S]*mysql_binlog_preserve_attach_detached_cache/s;
 die "promotion/transfer wrappers must not attach native binlog caches\n"
   if $promotion =~ /mysql_binlog_preserve_attach_detached_cache/ ||
      $transfer =~ /mysql_binlog_preserve_attach_detached_cache/;
@@ -150,27 +149,36 @@ die "P3 test capability must be exercised only by GUnit before P4\n"
 
 die "P5 strict attach core must consume prepared handles without payload hydrate/import\n"
   unless $preserve =~
-           /preserved_trx_resume_adopted_for_promotion_on_thd[\s\S]*take_native_binlog_handle[\s\S]*mysql_binlog_preserve_attach_detached_cache/s &&
-         $preserve !~
-           /preserved_trx_resume_adopted_for_promotion_on_thd[\s\S]{0,12000}(?:hydrate_logged_binlog_cache_payload_if_needed|mysql_binlog_preserve_import)/s;
-die "P5 protected THD handle must own lifetime pin, command gate and kill deferral\n"
-  unless $preserve =~ /Preserved_trx_peer_thd_handle::Impl[\s\S]*Preserve_trx_external_thd_pin/s &&
-         $preserve =~ /preserve_trx_batch_state\s*=\s*Preserve_trx_batch_thd_state::ATTACHING/s &&
-         $preserve =~ /preserved_trx_defer_external_thd_kill[\s\S]*!preserve_trx_is_enabled/s &&
-         $sql_class =~ /THD::awake[\s\S]*preserved_trx_defer_external_thd_kill/s;
+           /prepare_resume_on_current_thd_shared[\s\S]*take_native_binlog_handle[\s\S]*mysql_binlog_preserve_attach_detached_cache/s &&
+         $preserve =~
+           /preserved_trx_resume_adopted_for_promotion_on_current_thd[\s\S]*prepare_resume_on_current_thd_shared/s;
+die "promotion-adopted records must retain their complete strict registry key\n"
+  unless $preserve =~
+           /struct\s+Preserved_trx_record[\s\S]*has_promotion_key[\s\S]*Preserve_trx_prepared_token_key\s+promotion_key/s &&
+         $preserve =~
+           /copy_publication\s*\([\s\S]*preserved_trx_recover_or_adopt_bundle_shared/s;
+die "ordinary SQL RESUME must dispatch promotion-owned records to the strict current-THD shell\n"
+  unless $preserve =~
+           /Sql_cmd_resume_preserved_transaction::execute[\s\S]*preserved_trx_resume_record_on_current_thd/s &&
+         $preserve =~
+           /preserved_trx_resume_record_on_current_thd[\s\S]*ADOPTED_FOR_PROMOTION[\s\S]*preserved_trx_resume_adopted_for_promotion_on_current_thd/s;
+die "startup and promotion resume must share current-THD preparation and activation kernels\n"
+  unless $preserve =~ /prepare_resume_on_current_thd_shared/s &&
+         $preserve =~ /activate_resumed_trx_shared/s;
+die "obsolete peer-THD promotion resume API and write-only result must not remain public or implemented\n"
+  if $preserve_h =~ /Preserved_trx_peer_thd_handle|Preserved_trx_promotion_resume_result|preserved_trx_resolve_peer_thd|preserved_trx_resume_adopted_for_promotion_on_thd|preserved_trx_defer_external_thd_kill/ ||
+     $preserve =~ /Preserved_trx_peer_thd_handle|Preserved_trx_promotion_resume_result|preserved_trx_resolve_peer_thd|Preserve_peer_thd_execution_context|preserved_trx_resume_adopted_for_promotion_on_thd|preserved_trx_defer_external_thd_kill/;
+die "native THD kill handling must not contain promotion-only peer kill deferral\n"
+  if $sql_class =~ /preserved_trx_defer_external_thd_kill/;
+die "strict promotion SQL RESUME must accept only the executing current THD\n"
+  unless $preserve =~
+           /preserved_trx_resume_adopted_for_promotion_on_current_thd[\s\S]*current_thd\s*==\s*target[\s\S]*Preserve_trx_batch_thd_state::NONE/s &&
+         $preserve !~ /protected_peer_thd/s;
 die "P5 attach activation must be bracketed by versioned durable token intent\n"
   unless $prepared =~ /PTRX_STRICT_PROMOTION_ATTACH_INTENT_V1/s &&
          $prepared =~ /begin_activation[\s\S]*intent_writer/s &&
          $prepared =~ /commit_attach[\s\S]*intent_writer/s &&
          $preserve =~ /ATTACHING[\s\S]*ACTIVATING[\s\S]*ACTIVE/s;
-die "TEST_ONLY promotion plugin must only resolve an adopted token and call the production core\n"
-  unless $test_attach_plugin =~ /find_unique_adopted/s &&
-         $test_attach_plugin =~ /preserved_trx_resolve_peer_thd/s &&
-         $test_attach_plugin =~ /preserved_trx_resume_adopted_for_promotion_on_thd/s;
-die "TEST_ONLY promotion plugin must not fake a fence, gate, registry publication or adopted record\n"
-  if $test_attach_plugin =~
-     /set_physical_fence_provider|acquire_physical_fence|adopt_prepared_epoch|publish_ready|commit_gate_adopt|preserved_trx_add_record/s;
-
 my $metadata_start = index(
   $lock_preserve, 'lock_preserve_build_record_lock_metadata_plan(');
 my $metadata_end = index(

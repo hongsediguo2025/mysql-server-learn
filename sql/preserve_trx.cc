@@ -983,7 +983,19 @@ struct Preserved_trx_record {
   uint64_t last_error_monotonic_us{0};
   uint64_t observable_gc_at_monotonic_us{0};
   std::vector<Preserved_trx_external_blob_descriptor> blob_descriptors;
+  bool has_promotion_key{false};
+  Preserve_trx_prepared_token_key promotion_key;
 };
+
+static bool preserved_trx_promotion_keys_match(
+    const Preserve_trx_prepared_token_key &lhs,
+    const Preserve_trx_prepared_token_key &rhs) {
+  return lhs.preserve_dir == rhs.preserve_dir &&
+         lhs.source_uuid == rhs.source_uuid && lhs.epoch_id == rhs.epoch_id &&
+         lhs.token == rhs.token &&
+         lhs.target_boot_incarnation == rhs.target_boot_incarnation &&
+         lhs.generation == rhs.generation;
+}
 
 struct Preserve_batch_account_count {
   std::string user;
@@ -1042,8 +1054,6 @@ std::mutex g_preserved_trx_thd_pin_mutex;
 std::condition_variable g_preserved_trx_thd_pin_cond;
 std::unordered_map<THD *, uint> g_preserved_trx_thd_pin_counts;
 std::unordered_set<THD *> g_preserved_trx_thd_teardown;
-std::unordered_map<THD *, uint> g_preserved_trx_thd_kill_deferral_counts;
-std::unordered_map<THD *, int> g_preserved_trx_thd_deferred_kills;
 
 static uint64_t preserve_trx_monotonic_us() {
   using clock = std::chrono::steady_clock;
@@ -1472,13 +1482,14 @@ bool preserved_trx_take_resumable_record(const std::string &token,
 }
 
 bool preserved_trx_take_promotion_adopted_record(
-    const std::string &token, Preserved_trx_record *record) {
+    const Preserve_trx_prepared_token_key &key, Preserved_trx_record *record) {
   std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
   for (auto it = g_preserved_trx_records.begin();
        it != g_preserved_trx_records.end(); ++it) {
-    if (!it->observable_only && it->metadata.token == token &&
+    if (!it->observable_only && it->metadata.token == key.token &&
         it->state == Preserved_trx_lifecycle_state::ADOPTED_FOR_PROMOTION &&
-        !it->resumable) {
+        !it->resumable && it->has_promotion_key &&
+        preserved_trx_promotion_keys_match(it->promotion_key, key)) {
       if (record != nullptr) *record = *it;
       g_preserved_trx_records.erase(it);
       return true;
@@ -1570,7 +1581,9 @@ bool preserved_trx_add_record(const Preserve_snapshot_metadata &metadata,
                               Preserved_trx_lifecycle_state state =
                                   Preserved_trx_lifecycle_state::PRESERVED,
                               std::vector<Preserved_trx_external_blob_descriptor>
-                                  blob_descriptors = {}) {
+                                  blob_descriptors = {},
+                              const Preserve_trx_prepared_token_key
+                                  *promotion_key = nullptr) {
   DBUG_EXECUTE_IF("preserve_trx_fail_add_record", return true;);
 
   std::lock_guard<std::mutex> lock(g_preserved_trx_mutex);
@@ -1581,6 +1594,17 @@ bool preserved_trx_add_record(const Preserve_snapshot_metadata &metadata,
   record.resumable = resumable;
   record.state = state;
   record.blob_descriptors = std::move(blob_descriptors);
+  if (promotion_key != nullptr) {
+    if (promotion_key->token != metadata.token ||
+        promotion_key->preserve_dir.empty() ||
+        promotion_key->source_uuid.empty() || promotion_key->epoch_id.empty() ||
+        promotion_key->target_boot_incarnation.empty() ||
+        promotion_key->generation == 0) {
+      return true;
+    }
+    record.has_promotion_key = true;
+    record.promotion_key = *promotion_key;
+  }
   preserved_trx_initialize_record_deadlines(&record);
   preserved_trx_initialize_observable_gc_deadline(&record);
   g_preserved_trx_records.push_back(std::move(record));
@@ -8788,124 +8812,6 @@ bool preserved_trx_build_native_binlog_cache_facts(
   return true;
 }
 
-class Preserved_trx_peer_thd_handle::Impl {
- public:
-  THD *thd{nullptr};
-  std::unique_ptr<Preserve_trx_external_thd_pin> lifetime_pin;
-};
-
-Preserved_trx_peer_thd_handle::Preserved_trx_peer_thd_handle() = default;
-Preserved_trx_peer_thd_handle::Preserved_trx_peer_thd_handle(
-    Preserved_trx_peer_thd_handle &&) noexcept = default;
-Preserved_trx_peer_thd_handle &Preserved_trx_peer_thd_handle::operator=(
-    Preserved_trx_peer_thd_handle &&other) noexcept {
-  if (this == &other) return *this;
-  release();
-  m_impl = std::move(other.m_impl);
-  return *this;
-}
-Preserved_trx_peer_thd_handle::~Preserved_trx_peer_thd_handle() { release(); }
-
-THD *Preserved_trx_peer_thd_handle::get() const {
-  return m_impl == nullptr ? nullptr : m_impl->thd;
-}
-
-bool Preserved_trx_peer_thd_handle::valid() const { return get() != nullptr; }
-
-bool Preserved_trx_peer_thd_handle::acquire_locked_for_internal_use(THD *thd) {
-  if (thd == nullptr || m_impl != nullptr) return false;
-  auto lifetime_pin = Preserve_trx_external_thd_pin::acquire_locked(thd);
-  if (lifetime_pin == nullptr) return false;
-  {
-    std::lock_guard<std::mutex> guard(g_preserved_trx_thd_pin_mutex);
-    if (g_preserved_trx_thd_kill_deferral_counts.count(thd) != 0) {
-      return false;
-    }
-    g_preserved_trx_thd_kill_deferral_counts[thd] = 1;
-  }
-  thd->preserve_trx_batch_state = Preserve_trx_batch_thd_state::ATTACHING;
-  auto impl = std::make_unique<Impl>();
-  impl->thd = thd;
-  impl->lifetime_pin = std::move(lifetime_pin);
-  m_impl = std::move(impl);
-  return true;
-}
-
-void Preserved_trx_peer_thd_handle::release() {
-  if (m_impl == nullptr || m_impl->thd == nullptr) {
-    m_impl.reset();
-    return;
-  }
-  THD *const thd = m_impl->thd;
-  int deferred_kill = static_cast<int>(THD::NOT_KILLED);
-  bool has_deferred_kill = false;
-  mysql_mutex_lock(&thd->LOCK_thd_data);
-  if (thd->preserve_trx_batch_state ==
-      Preserve_trx_batch_thd_state::ATTACHING) {
-    thd->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
-  }
-  {
-    std::lock_guard<std::mutex> guard(g_preserved_trx_thd_pin_mutex);
-    auto count_it = g_preserved_trx_thd_kill_deferral_counts.find(thd);
-    if (count_it != g_preserved_trx_thd_kill_deferral_counts.end()) {
-      assert(count_it->second == 1);
-      g_preserved_trx_thd_kill_deferral_counts.erase(count_it);
-    }
-    auto kill_it = g_preserved_trx_thd_deferred_kills.find(thd);
-    if (kill_it != g_preserved_trx_thd_deferred_kills.end()) {
-      deferred_kill = kill_it->second;
-      has_deferred_kill = true;
-      g_preserved_trx_thd_deferred_kills.erase(kill_it);
-    }
-  }
-  if (has_deferred_kill) {
-    thd->awake(static_cast<THD::killed_state>(deferred_kill));
-  }
-  mysql_mutex_unlock(&thd->LOCK_thd_data);
-  m_impl->lifetime_pin.reset();
-  m_impl.reset();
-}
-
-bool preserved_trx_resolve_peer_thd(
-    uint64_t source_connection_id, Preserved_trx_operation_deadline deadline,
-    Preserved_trx_peer_thd_handle *target_handle) {
-  if (!preserve_trx_is_enabled() || source_connection_id == 0 ||
-      target_handle == nullptr || target_handle->valid() ||
-      (deadline.deadline_us != 0 &&
-       preserve_trx_monotonic_us() >= deadline.deadline_us)) {
-    return false;
-  }
-  Find_thd_with_id finder(static_cast<my_thread_id>(source_connection_id));
-  THD *target = Global_THD_manager::get_instance()->find_thd(&finder);
-  if (target == nullptr) return false;
-  const bool eligible =
-      target != current_thd && !target->release_resources_done() &&
-      target->killed == THD::NOT_KILLED && target->m_server_idle &&
-      target->preserve_trx_batch_state == Preserve_trx_batch_thd_state::NONE &&
-      !target->in_active_multi_stmt_transaction();
-  const bool acquired =
-      eligible && target_handle->acquire_locked_for_internal_use(target);
-  mysql_mutex_unlock(&target->LOCK_thd_data);
-  return acquired;
-}
-
-bool preserved_trx_defer_external_thd_kill(THD *thd, int killed_state) {
-  if (!preserve_trx_is_enabled() || thd == nullptr) return false;
-  std::lock_guard<std::mutex> guard(g_preserved_trx_thd_pin_mutex);
-  if (g_preserved_trx_thd_kill_deferral_counts.count(thd) == 0) return false;
-  auto rank = [](int state) {
-    if (state == static_cast<int>(THD::KILL_CONNECTION)) return 3;
-    if (state == static_cast<int>(THD::KILL_TIMEOUT)) return 2;
-    return 1;
-  };
-  auto it = g_preserved_trx_thd_deferred_kills.find(thd);
-  if (it == g_preserved_trx_thd_deferred_kills.end() ||
-      rank(killed_state) > rank(it->second)) {
-    g_preserved_trx_thd_deferred_kills[thd] = killed_state;
-  }
-  return true;
-}
-
 bool preserve_trx_magic_xid_has_snapshot(const XID &xid) {
   return preserve_trx_magic_xid_has_snapshot_impl(xid);
 }
@@ -12095,6 +12001,7 @@ struct Preserved_trx_recover_or_adopt_options {
   const lock_preserve_metadata_plan_t *record_lock_plan{nullptr};
   Preserve_trx_physical_fence_lease *physical_fence_lease{nullptr};
   trx_t *prepared_trx{nullptr};
+  const Preserve_trx_prepared_token_key *promotion_key{nullptr};
   const Preserved_trx_simulated_publication_context *simulated_publication{
       nullptr};
 };
@@ -12167,6 +12074,8 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
   }
   if (strict_physical &&
       (options.prepared_trx == nullptr ||
+       options.promotion_key == nullptr ||
+       options.promotion_key->token != token ||
        (options.physical_fence_lease != nullptr &&
         !options.physical_fence_lease->acquired()) ||
        !metadata.predicate_locks_payload.empty() ||
@@ -12501,7 +12410,7 @@ static bool preserved_trx_recover_or_adopt_bundle_shared(
           metadata, trx, local_startup,
           local_startup ? Preserved_trx_lifecycle_state::PRESERVED
                         : Preserved_trx_lifecycle_state::ADOPTED_FOR_PROMOTION,
-          std::move(bundle->blob_descriptors));
+          std::move(bundle->blob_descriptors), options.promotion_key);
   add_kernel_elapsed_us(phase_started_us, &result->phase_metrics.register_us);
   if (add_record_err) {
     return rollback_after_claim(
@@ -12868,12 +12777,16 @@ preserved_trx_adopt_prepared_for_physical_promotion(
   }
   Preserve_trx_prepared_token_key publication_key;
   Preserve_trx_final_token_facts publication_facts;
+  if (adopt_lease->copy_publication(&publication_key, &publication_facts) !=
+          Preserve_trx_prepared_status::OK ||
+      publication_key.preserve_dir != dir) {
+    result->reason = "strict promotion publication facts are unavailable";
+    return result->status;
+  }
   const Preserve_trx_resurrection_index_entry *resurrection_entry = nullptr;
   if (simulated_fence) {
     resurrection_entry = adopt_lease->resurrection_entry();
-    if (resurrection_entry == nullptr ||
-        adopt_lease->copy_publication(&publication_key, &publication_facts) !=
-            Preserve_trx_prepared_status::OK) {
+    if (resurrection_entry == nullptr) {
       result->reason =
           "simulated promotion requires authenticated publication facts";
       return result->status;
@@ -12970,6 +12883,7 @@ preserved_trx_adopt_prepared_for_physical_promotion(
   options.record_lock_plan = record_lock_plan;
   options.physical_fence_lease = physical_lease;
   options.prepared_trx = prepared_trx;
+  options.promotion_key = &publication_key;
   Preserved_trx_simulated_publication_context simulated_publication;
   if (simulated_fence) {
     simulated_publication.capability = &publication_capability;
@@ -13073,7 +12987,7 @@ bool preserved_trx_reverse_simulated_promotion_adopt(
   }
 
   Preserved_trx_record record;
-  if (!preserved_trx_take_promotion_adopted_record(key.token, &record)) {
+  if (!preserved_trx_take_promotion_adopted_record(key, &record)) {
     return fail("simulated adopt reversal record is unavailable");
   }
   if (record.trx != journal->trx || record.metadata.token != key.token) {
@@ -13123,7 +13037,7 @@ bool preserved_trx_rollback_physical_promotion_adopt(
   }
 
   Preserved_trx_record record;
-  if (!preserved_trx_take_promotion_adopted_record(key.token, &record)) {
+  if (!preserved_trx_take_promotion_adopted_record(key, &record)) {
     return fail("production adopt rollback record is unavailable");
   }
   if (record.trx != prepared_trx || record.metadata.token != key.token) {
@@ -19740,19 +19654,267 @@ bool preserve_trx_execute_command(THD *thd) {
   }
 }
 
-enum class Preserved_trx_resume_policy {
-  SQL_RESUME,
-  PROMOTION_RESUME_ON_THD
+enum class Preserved_trx_promotion_resume_status : uint8_t {
+  OK = 0,
+  INVALID_ARGUMENT,
+  FEATURE_DISABLED,
+  DEADLINE_EXPIRED,
+  REGISTRY_NOT_ADOPTED,
+  TARGET_NOT_PRISTINE,
+  ATTACH_INTENT_IO_ERROR,
+  PROMOTION_RECORD_NOT_FOUND,
+  STAGING_FAILED,
+  ACTIVATION_FAILED_ROLLED_BACK,
+  ATTACH_TAINTED
 };
 
-struct Preserved_trx_resume_options {
-  Preserved_trx_resume_policy policy{Preserved_trx_resume_policy::SQL_RESUME};
-  bool skip_sql_privilege_check{false};
+enum class Preserved_trx_resume_source {
+  LOCAL_DURABLE,
+  STRICT_PROMOTION
 };
 
-static bool preserved_trx_resume_record_on_thd(
-    THD *thd, const LEX_CSTRING &resume_token,
-    const Preserved_trx_resume_options &options) {
+enum class Preserved_trx_resume_prepare_stage {
+  NONE,
+  SESSION_STATE,
+  BINLOG_CACHE,
+  MDL,
+  GTID_OWNERSHIP,
+  GTID_ROLLBACK_UNDO,
+  TEMP_TABLE,
+  TRX_ATTACH,
+  SAVEPOINTS,
+  TEMP_TABLE_RESEED,
+  DEADLINE
+};
+
+struct Preserved_trx_resume_prepare_options {
+  Preserved_trx_resume_source source{
+      Preserved_trx_resume_source::LOCAL_DURABLE};
+  const std::string *dir{nullptr};
+  const std::string *token{nullptr};
+  Preserve_trx_attach_lease *strict_attach_lease{nullptr};
+  const Preserve_trx_final_token_facts *strict_facts{nullptr};
+  uint64_t deadline_monotonic_us{0};
+};
+
+struct Preserved_trx_resume_runtime {
+  bool local_binlog_imported{false};
+  bool strict_binlog_attached{false};
+  bool mdl_transferred{false};
+  bool gtid_restored{false};
+  bool temp_tables_materialized{false};
+  bool trx_attached{false};
+  Preserve_memory_lease local_binlog_payload_lease;
+  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle>
+      strict_binlog_handle;
+  Mysql_binlog_preserve_attach_journal strict_binlog_journal;
+};
+
+struct Preserved_trx_resume_prepare_result {
+  bool ok{false};
+  bool temp_cleanup_incomplete{false};
+  Preserved_trx_resume_prepare_stage stage{
+      Preserved_trx_resume_prepare_stage::NONE};
+  std::string reason;
+};
+
+static Preserved_trx_resume_prepare_result
+prepare_resume_on_current_thd_shared(
+    THD *thd, Preserved_trx_record *record,
+    const Preserved_trx_resume_prepare_options &options,
+    Preserved_trx_resume_runtime *runtime) {
+  Preserved_trx_resume_prepare_result result;
+  if (thd == nullptr || record == nullptr || runtime == nullptr ||
+      options.dir == nullptr || options.token == nullptr ||
+      options.dir->empty() || options.token->empty()) {
+    result.reason = "invalid resume preparation inputs";
+    return result;
+  }
+  const bool strict =
+      options.source == Preserved_trx_resume_source::STRICT_PROMOTION;
+  auto fail = [&](Preserved_trx_resume_prepare_stage stage,
+                  const std::string &reason) {
+    result.stage = stage;
+    result.reason = reason;
+    return result;
+  };
+
+  if (strict &&
+      (options.strict_attach_lease == nullptr ||
+       !options.strict_attach_lease->active() ||
+       options.strict_facts == nullptr ||
+       !record->metadata.temp_table_manifest_payload.empty())) {
+    return fail(Preserved_trx_resume_prepare_stage::SESSION_STATE,
+                "invalid strict promotion resume inputs");
+  }
+
+  bool debug_isolation_failure = false;
+  if (!strict) {
+    DBUG_EXECUTE_IF("preserve_trx_fail_resume_set_isolation",
+                    debug_isolation_failure = true;);
+  }
+  if (debug_isolation_failure ||
+      record->metadata.tx_isolation > ISO_SERIALIZABLE ||
+      set_tx_isolation(
+          thd,
+          static_cast<enum_tx_isolation>(record->metadata.tx_isolation),
+          true)) {
+    return fail(Preserved_trx_resume_prepare_stage::SESSION_STATE,
+                debug_isolation_failure
+                    ? "debug injected isolation restore failure"
+                    : "isolation restore failure");
+  }
+  if (restore_preserved_session_variables(thd, record->metadata)) {
+    return fail(Preserved_trx_resume_prepare_stage::SESSION_STATE,
+                "session state restore failure");
+  }
+  if (restore_preserved_dml_policy(thd, record->trx, record->metadata)) {
+    return fail(Preserved_trx_resume_prepare_stage::SESSION_STATE,
+                "DML policy restore failure");
+  }
+
+  thd->variables.sql_log_bin = record->metadata.session_sql_log_bin;
+  if (record->metadata.option_bin_log)
+    thd->variables.option_bits |= OPTION_BIN_LOG;
+  else
+    thd->variables.option_bits &= ~OPTION_BIN_LOG;
+  restore_preserved_transaction_access_mode(thd, record->metadata);
+  restore_last_insert_id_state(thd, record->metadata);
+  restore_forced_insert_id_state(thd, record->metadata);
+  if (import_user_vars_payload(thd, record->metadata.user_vars_payload)) {
+    return fail(Preserved_trx_resume_prepare_stage::SESSION_STATE,
+                "user variables restore failure");
+  }
+
+  const bool metadata_has_binlog_cache =
+      record->metadata.binlog_state ==
+      Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE;
+  if (strict) {
+    if (metadata_has_binlog_cache != options.strict_facts->binlog_cache_present) {
+      return fail(Preserved_trx_resume_prepare_stage::BINLOG_CACHE,
+                  "native binlog facts do not match promoted metadata");
+    }
+    if (metadata_has_binlog_cache) {
+      Preserve_trx_internal_operation_capability capability;
+      if (options.strict_attach_lease->make_native_binlog_attach_capability(
+              &capability) != Preserve_trx_prepared_status::OK ||
+          options.strict_attach_lease->take_native_binlog_handle(
+              &runtime->strict_binlog_handle) !=
+              Preserve_trx_prepared_status::OK ||
+          mysql_binlog_preserve_attach_detached_cache(
+              capability, thd, &runtime->strict_binlog_handle,
+              &runtime->strict_binlog_journal) !=
+              Mysql_binlog_preserve_cache_status::OK) {
+        return fail(Preserved_trx_resume_prepare_stage::BINLOG_CACHE,
+                    "native binlog cache attach failed");
+      }
+      runtime->strict_binlog_attached = true;
+    }
+  } else if (metadata_has_binlog_cache) {
+    DBUG_EXECUTE_IF("preserve_trx_resume_clear_binlog_cache_payload",
+                    record->metadata.binlog_cache_payload.clear(););
+    if (hydrate_logged_binlog_cache_payload_if_needed(
+            record, *options.token, nullptr,
+            &runtime->local_binlog_payload_lease)) {
+      return fail(Preserved_trx_resume_prepare_stage::BINLOG_CACHE,
+                  "binlog cache read failure");
+    }
+    Mysql_binlog_preserve_snapshot binlog_snapshot =
+        metadata_to_binlog_cache_snapshot(record->metadata);
+    if (mysql_binlog_preserve_import(thd, binlog_snapshot)) {
+      return fail(Preserved_trx_resume_prepare_stage::BINLOG_CACHE,
+                  "binlog cache import failure");
+    }
+    runtime->local_binlog_imported = true;
+  }
+
+  if (restore_detached_mdl_context(thd, *options.token)) {
+    return fail(Preserved_trx_resume_prepare_stage::MDL,
+                "MDL transfer failure");
+  }
+  runtime->mdl_transferred = true;
+
+  bool debug_before_attach_failure = false;
+  if (!strict) {
+    DBUG_EXECUTE_IF("preserve_trx_fail_resume_before_attach",
+                    debug_before_attach_failure = true;);
+  }
+  if (debug_before_attach_failure) {
+    return fail(Preserved_trx_resume_prepare_stage::MDL,
+                "debug injected failure");
+  }
+
+  if (preserve_snapshot_allows_gtid_restore(record->metadata)) {
+    if (restore_logged_cache_gtid_next(thd, record->metadata)) {
+      return fail(Preserved_trx_resume_prepare_stage::GTID_OWNERSHIP,
+                  "binlog GTID ownership restore failure");
+    }
+    runtime->gtid_restored = true;
+    if (trx_preserve_prepare_resumed_rollback_gtid(record->trx) != DB_SUCCESS) {
+      return fail(Preserved_trx_resume_prepare_stage::GTID_ROLLBACK_UNDO,
+                  "binlog GTID rollback undo preparation failure");
+    }
+  }
+
+  std::string temp_reason;
+  Preserve_snapshot_status temp_status;
+  if (strict) {
+    temp_status = preserve_trx_temp_table_materialize_for_resume(
+        thd, record->trx, *options.dir, *options.token, record->metadata,
+        &temp_reason);
+  } else {
+    Preserve_trx_temp_table_cleanup_result temp_cleanup;
+    temp_status = preserve_trx_temp_table_materialize_for_resume(
+        thd, record->trx, *options.dir, *options.token, record->metadata,
+        &temp_reason, &temp_cleanup);
+    result.temp_cleanup_incomplete = !temp_cleanup.complete();
+  }
+  if (temp_status != Preserve_snapshot_status::OK) {
+    return fail(Preserved_trx_resume_prepare_stage::TEMP_TABLE,
+                temp_reason.empty() ? "temporary table materialization failure"
+                                    : "temporary table materialization failure: " +
+                                          temp_reason);
+  }
+  runtime->temp_tables_materialized =
+      !record->metadata.temp_table_manifest_payload.empty();
+
+  if (trx_preserve_attach_to_thd(record->trx, thd) != DB_SUCCESS) {
+    return fail(Preserved_trx_resume_prepare_stage::TRX_ATTACH,
+                "attach failure");
+  }
+  runtime->trx_attached = true;
+  mark_preserved_transaction_attached(thd, record->metadata);
+  if (restore_savepoints_to_thd(thd, record->trx, record->metadata)) {
+    return fail(Preserved_trx_resume_prepare_stage::SAVEPOINTS,
+                "savepoint restore failure");
+  }
+  if (!strict && runtime->temp_tables_materialized &&
+      !preserve_trx_temp_table_reseed_after_resume(thd)) {
+    return fail(Preserved_trx_resume_prepare_stage::TEMP_TABLE_RESEED,
+                "temporary table baseline reseed failure");
+  }
+  if (options.deadline_monotonic_us != 0 &&
+      preserve_trx_monotonic_us() >= options.deadline_monotonic_us) {
+    return fail(Preserved_trx_resume_prepare_stage::DEADLINE,
+                "deadline expired before activation");
+  }
+
+  result.ok = true;
+  return result;
+}
+
+static dberr_t activate_resumed_trx_shared(Preserved_trx_record *record) {
+  return record == nullptr ? DB_ERROR
+                           : trx_preserve_activate_resumed(record->trx);
+}
+
+static Preserved_trx_promotion_resume_status
+preserved_trx_resume_adopted_for_promotion_on_current_thd(
+    THD *target, const Preserve_trx_prepared_token_key &key,
+    uint64_t requested_deadline_us);
+
+static bool preserved_trx_resume_record_on_current_thd(
+    THD *thd, const LEX_CSTRING &resume_token) {
   DBUG_TRACE;
   struct Resume_total_us_guard {
     uint64_t started_us{preserve_trx_monotonic_us()};
@@ -19793,18 +19955,11 @@ static bool preserved_trx_resume_record_on_thd(
   DEBUG_SYNC(thd, "preserve_trx_resume_start");
 
   const std::string token(resume_token.str, resume_token.length);
-  const bool promotion_resume =
-      options.policy == Preserved_trx_resume_policy::PROMOTION_RESUME_ON_THD;
-  const bool check_sql_privilege = !options.skip_sql_privilege_check;
   const bool has_resume_any_privilege =
-      check_sql_privilege && preserve_trx_has_resume_any_privilege(thd);
+      preserve_trx_has_resume_any_privilege(thd);
   preserved_trx_wait_recovery_complete();
   Preserved_trx_record record;
   if (!preserved_trx_find_record(token, &record)) {
-    if (!check_sql_privilege) {
-      my_error(ER_PRESERVE_TRX_NOT_FOUND, MYF(0));
-      return true;
-    }
     if (!has_resume_any_privilege) {
       my_error(ER_PRESERVE_TRX_ACCESS_DENIED, MYF(0));
       return true;
@@ -19834,21 +19989,49 @@ static bool preserved_trx_resume_record_on_thd(
   }
   Security_context *sctx = thd->security_context();
   const bool owns_token =
-      check_sql_privilege &&
       record.metadata.owner_user == lex_cstring_to_string(sctx->priv_user()) &&
       record.metadata.owner_host == lex_cstring_to_string(sctx->priv_host());
-  if (check_sql_privilege &&
-      !preserved_trx_resume_allowed_for_account(owns_token,
+  if (!preserved_trx_resume_allowed_for_account(owns_token,
                                                 has_resume_any_privilege)) {
     my_error(ER_PRESERVE_TRX_ACCESS_DENIED, MYF(0));
     return true;
   }
-  if (check_sql_privilege && !owns_token &&
-      !record.metadata.session_sql_log_bin &&
+  if (!owns_token && !record.metadata.session_sql_log_bin &&
       !has_session_variable_admin_privilege(thd)) {
     my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0),
              "SUPER, SYSTEM_VARIABLES_ADMIN or SESSION_VARIABLES_ADMIN");
     return true;
+  }
+
+  if (!record.resumable &&
+      record.state == Preserved_trx_lifecycle_state::ADOPTED_FOR_PROMOTION) {
+    if (!record.has_promotion_key ||
+        record.promotion_key.token != token) {
+      (void)preserved_trx_update_record_last_error(
+          token, "promotion-owned token has no strict registry identity");
+      return preserve_trx_reject_unsupported();
+    }
+    if (preserve_trx_recheck_resume_object_privileges(
+            thd, record.metadata,
+            !owns_token /* require_all_modified_write_acls */)) {
+      (void)preserved_trx_update_record_last_error(
+          token, "resume user lacks object privileges");
+      return true;
+    }
+    const auto status =
+        preserved_trx_resume_adopted_for_promotion_on_current_thd(
+            thd, record.promotion_key, std::numeric_limits<uint64_t>::max());
+    if (status == Preserved_trx_promotion_resume_status::OK) {
+      my_ok(thd);
+      return false;
+    }
+    if (status ==
+            Preserved_trx_promotion_resume_status::PROMOTION_RECORD_NOT_FOUND ||
+        status == Preserved_trx_promotion_resume_status::REGISTRY_NOT_ADOPTED) {
+      my_error(ER_PRESERVE_TRX_NOT_FOUND, MYF(0));
+      return true;
+    }
+    return preserve_trx_reject_unsupported();
   }
 
   if (preserved_trx_record_resume_deadline_expired(record)) {
@@ -19862,26 +20045,11 @@ static bool preserved_trx_resume_record_on_thd(
   }
 
   if (!record.resumable) {
-    if (promotion_resume &&
-        record.state == Preserved_trx_lifecycle_state::ADOPTED_FOR_PROMOTION) {
-      /*
-        Promotion adopt has already claimed/imported/registered the InnoDB trx.
-        This internal policy is the only path that can consume the
-        non-resumable promotion-owned record and attach it to a pinned peer THD.
-      */
-    } else {
-      (void)preserved_trx_update_record_last_error(
-          record.metadata.token,
-          "token is not resumable at current recovery mode");
-      log_redacted_resume_failure(record.metadata.token,
-                                  "token is pending and cannot be resumed");
-      return preserve_trx_reject_unsupported();
-    }
-  } else if (promotion_resume) {
     (void)preserved_trx_update_record_last_error(
-        record.metadata.token, "token is not promotion-owned");
+        record.metadata.token,
+        "token is not resumable at current recovery mode");
     log_redacted_resume_failure(record.metadata.token,
-                                "token is not promotion-owned");
+                                "token is pending and cannot be resumed");
     return preserve_trx_reject_unsupported();
   }
 
@@ -19968,8 +20136,7 @@ static bool preserved_trx_resume_record_on_thd(
     return preserve_trx_reject_unsupported();
   }
 
-  if (check_sql_privilege &&
-      preserve_trx_recheck_resume_object_privileges(
+  if (preserve_trx_recheck_resume_object_privileges(
           thd, record.metadata,
           !owns_token /* require_all_modified_write_acls */)) {
     (void)preserved_trx_update_record_last_error(
@@ -20000,11 +20167,7 @@ static bool preserved_trx_resume_record_on_thd(
     }
   }
 
-  const bool record_taken =
-      promotion_resume
-          ? preserved_trx_take_promotion_adopted_record(token, &record)
-          : preserved_trx_take_resumable_record(token, &record);
-  if (!record_taken) {
+  if (!preserved_trx_take_resumable_record(token, &record)) {
     my_error(ER_PRESERVE_TRX_NOT_FOUND, MYF(0));
     return true;
   }
@@ -20018,71 +20181,11 @@ static bool preserved_trx_resume_record_on_thd(
   DEBUG_SYNC(thd, "preserve_trx_resume_after_record_take");
 
   Resume_thd_state_guard thd_state_guard(thd);
-
-  DBUG_EXECUTE_IF("preserve_trx_fail_resume_set_isolation",
-                  (void)restore_record_after_resume_failure(
-                      record, "debug injected isolation restore failure");
-                  return preserve_trx_reject_unsupported(););
-
-  if (record.metadata.tx_isolation > ISO_SERIALIZABLE ||
-      set_tx_isolation(thd,
-                       static_cast<enum_tx_isolation>(
-                           record.metadata.tx_isolation),
-                       true)) {
-    (void)restore_record_after_resume_failure(record,
-                                              "isolation restore failure");
-    return preserve_trx_reject_unsupported();
-  }
-  if (restore_preserved_session_variables(thd, record.metadata)) {
-    (void)restore_record_after_resume_failure(
-        record, "session state restore failure");
-    return preserve_trx_reject_unsupported();
-  }
-  if (restore_preserved_dml_policy(thd, record.trx, record.metadata)) {
-    (void)restore_record_after_resume_failure(record,
-                                              "DML policy restore failure");
-    return preserve_trx_reject_unsupported();
-  }
-
-  thd->variables.sql_log_bin = record.metadata.session_sql_log_bin;
-  if (record.metadata.option_bin_log)
-    thd->variables.option_bits |= OPTION_BIN_LOG;
-  else
-    thd->variables.option_bits &= ~OPTION_BIN_LOG;
-  restore_preserved_transaction_access_mode(thd, record.metadata);
-  restore_last_insert_id_state(thd, record.metadata);
-  restore_forced_insert_id_state(thd, record.metadata);
-  if (import_user_vars_payload(thd, record.metadata.user_vars_payload)) {
-    (void)restore_record_after_resume_failure(record,
-                                              "user variables restore failure");
-    return preserve_trx_reject_unsupported();
-  }
-
-  bool binlog_imported = false;
-  Preserve_memory_lease binlog_payload_lease;
-  if (record.metadata.binlog_state ==
-      Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE) {
-    DBUG_EXECUTE_IF("preserve_trx_resume_clear_binlog_cache_payload",
-                    record.metadata.binlog_cache_payload.clear(););
-    if (hydrate_logged_binlog_cache_payload_if_needed(
-            &record, token, nullptr, &binlog_payload_lease)) {
-      (void)restore_record_after_resume_failure(
-          record, "binlog cache read failure");
-      return preserve_trx_reject_unsupported();
-    }
-    Mysql_binlog_preserve_snapshot binlog_snapshot =
-        metadata_to_binlog_cache_snapshot(record.metadata);
-    if (mysql_binlog_preserve_import(thd, binlog_snapshot)) {
-      (void)restore_record_after_resume_failure(record,
-                                                "binlog cache import failure");
-      return preserve_trx_reject_unsupported();
-    }
-    binlog_imported = true;
-  }
-
-  bool mdl_transferred = false;
-  bool gtid_restored = false;
-  bool temp_tables_materialized = false;
+  Preserved_trx_resume_runtime resume_runtime;
+  bool &binlog_imported = resume_runtime.local_binlog_imported;
+  bool &mdl_transferred = resume_runtime.mdl_transferred;
+  bool &gtid_restored = resume_runtime.gtid_restored;
+  bool &temp_tables_materialized = resume_runtime.temp_tables_materialized;
   bool thd_detached_after_attach = false;
   auto taint_record_after_temp_cleanup_failure =
       [&](const std::string &reason) {
@@ -20136,6 +20239,7 @@ static bool preserved_trx_resume_record_on_thd(
 
   auto detach_resumed_after_failure = [&](const char *reason) {
     if (trx_preserve_detach_resumed_from_thd(record.trx, thd) == DB_SUCCESS) {
+      resume_runtime.trx_attached = false;
       thd_detached_after_attach = true;
       return false;
     }
@@ -20146,6 +20250,7 @@ static bool preserved_trx_resume_record_on_thd(
     LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG, retry_message.c_str());
     if (trx_preserve_detach_resumed_from_thd_for_cleanup(record.trx, thd) ==
         DB_SUCCESS) {
+      resume_runtime.trx_attached = false;
       thd_detached_after_attach = true;
       return false;
     }
@@ -20159,20 +20264,21 @@ static bool preserved_trx_resume_record_on_thd(
     thd_state_guard.dismiss();
     return true;
   };
-
-  if (restore_detached_mdl_context(thd, token)) {
-    (void)restore_preserved_record_after_failure("MDL transfer failure");
-    return preserve_trx_reject_unsupported();
-  }
-  mdl_transferred = true;
-
-  DBUG_EXECUTE_IF(
-      "preserve_trx_fail_resume_before_attach",
-      (void)restore_preserved_record_after_failure("debug injected failure");
-      return preserve_trx_reject_unsupported(););
-
-  if (preserve_snapshot_allows_gtid_restore(record.metadata)) {
-    if (restore_logged_cache_gtid_next(thd, record.metadata)) {
+  const std::string local_dir = preserve_trx_default_dir();
+  Preserved_trx_resume_prepare_options prepare_options;
+  prepare_options.source = Preserved_trx_resume_source::LOCAL_DURABLE;
+  prepare_options.dir = &local_dir;
+  prepare_options.token = &token;
+  const Preserved_trx_resume_prepare_result prepare_result =
+      prepare_resume_on_current_thd_shared(thd, &record, prepare_options,
+                                           &resume_runtime);
+  if (!prepare_result.ok) {
+    if (resume_runtime.trx_attached &&
+        detach_resumed_after_failure(prepare_result.reason.c_str())) {
+      return preserve_trx_reject_unsupported();
+    }
+    if (prepare_result.stage ==
+        Preserved_trx_resume_prepare_stage::GTID_OWNERSHIP) {
       if (binlog_imported) {
         discard_binlog_preserve_cache_and_reset_scopes(thd);
         binlog_imported = false;
@@ -20185,56 +20291,11 @@ static bool preserved_trx_resume_record_on_thd(
       }
       delete_detached_mdl_context(token);
       (void)delete_preserved_snapshot_files_and_sidecars_or_log(
-          preserve_trx_default_dir(), token, &record.metadata);
+          local_dir, token, &record.metadata);
       return preserve_trx_reject_unsupported();
     }
-    gtid_restored = true;
-
-    if (trx_preserve_prepare_resumed_rollback_gtid(record.trx) !=
-        DB_SUCCESS) {
-      (void)restore_preserved_record_after_failure(
-          "binlog GTID rollback undo preparation failure");
-      return preserve_trx_reject_unsupported();
-    }
-  }
-
-  std::string temp_materialize_reason;
-  Preserve_trx_temp_table_cleanup_result temp_materialize_cleanup;
-  const Preserve_snapshot_status temp_materialize_status =
-      preserve_trx_temp_table_materialize_for_resume(
-          thd, record.trx, preserve_trx_default_dir(), token, record.metadata,
-          &temp_materialize_reason, &temp_materialize_cleanup);
-  if (temp_materialize_status != Preserve_snapshot_status::OK) {
     (void)restore_preserved_record_after_failure(
-        temp_materialize_reason.empty()
-            ? "temporary table materialization failure"
-            : "temporary table materialization failure: " +
-                  temp_materialize_reason,
-        !temp_materialize_cleanup.complete());
-    return preserve_trx_reject_unsupported();
-  }
-  temp_tables_materialized = !record.metadata.temp_table_manifest_payload.empty();
-
-  if (trx_preserve_attach_to_thd(record.trx, thd) != DB_SUCCESS) {
-    (void)restore_preserved_record_after_failure("attach failure");
-    return preserve_trx_reject_unsupported();
-  }
-  mark_preserved_transaction_attached(thd, record.metadata);
-
-  if (restore_savepoints_to_thd(thd, record.trx, record.metadata)) {
-    if (!detach_resumed_after_failure("savepoint restore failure")) {
-      (void)restore_preserved_record_after_failure(
-          "savepoint restore failure");
-    }
-    return preserve_trx_reject_unsupported();
-  }
-
-  if (temp_tables_materialized &&
-      !preserve_trx_temp_table_reseed_after_resume(thd)) {
-    if (!detach_resumed_after_failure("temporary table baseline reseed failure")) {
-      (void)restore_preserved_record_after_failure(
-          "temporary table baseline reseed failure");
-    }
+        prepare_result.reason, prepare_result.temp_cleanup_incomplete);
     return preserve_trx_reject_unsupported();
   }
 
@@ -20250,7 +20311,7 @@ static bool preserved_trx_resume_record_on_thd(
     return preserve_trx_reject_unsupported();
   }
 
-  if (trx_preserve_activate_resumed(record.trx) != DB_SUCCESS) {
+  if (activate_resumed_trx_shared(&record) != DB_SUCCESS) {
     LogErr(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
            "Preserved transaction resume failed to activate prepared undo state");
     if (!detach_resumed_after_failure("undo activation failure")) {
@@ -20367,49 +20428,10 @@ static bool preserved_trx_resume_record_on_thd(
 
 bool Sql_cmd_resume_preserved_transaction::execute(THD *thd) {
   DBUG_TRACE;
-  const Preserved_trx_resume_options options{
-      Preserved_trx_resume_policy::SQL_RESUME, false};
-  return preserved_trx_resume_record_on_thd(thd, m_token, options);
+  return preserved_trx_resume_record_on_current_thd(thd, m_token);
 }
 
 namespace {
-
-class Preserve_peer_thd_execution_context {
- public:
-  explicit Preserve_peer_thd_execution_context(THD *target)
-      : m_owner(current_thd),
-        m_target(target),
-        m_old_real_id(target == nullptr ? my_thread_t{} : target->real_id),
-        m_old_thread_stack(target == nullptr ? nullptr : target->thread_stack) {
-    if (m_owner == nullptr || m_target == nullptr || m_owner == m_target) return;
-    m_owner->restore_globals();
-    m_target->thread_stack = m_owner->thread_stack;
-    m_target->store_globals();
-    m_active = true;
-  }
-
-  Preserve_peer_thd_execution_context(
-      const Preserve_peer_thd_execution_context &) = delete;
-  Preserve_peer_thd_execution_context &operator=(
-      const Preserve_peer_thd_execution_context &) = delete;
-
-  ~Preserve_peer_thd_execution_context() {
-    if (!m_active) return;
-    m_target->restore_globals();
-    m_target->real_id = m_old_real_id;
-    m_target->thread_stack = m_old_thread_stack;
-    m_owner->store_globals();
-  }
-
-  bool active() const { return m_active; }
-
- private:
-  THD *m_owner{nullptr};
-  THD *m_target{nullptr};
-  my_thread_t m_old_real_id{};
-  const char *m_old_thread_stack{nullptr};
-  bool m_active{false};
-};
 
 struct Preserve_strict_attach_intent_write_context {
   Preserve_trx_strict_attach_intent_state state{
@@ -20454,61 +20476,50 @@ void remove_strict_attach_intent(
 
 }  // namespace
 
-Preserved_trx_promotion_resume_status
-preserved_trx_resume_adopted_for_promotion_on_thd(
-    Preserved_trx_peer_thd_handle *target_handle,
+static Preserved_trx_promotion_resume_status
+preserved_trx_resume_adopted_for_promotion_on_current_thd(
+    THD *target,
     const Preserve_trx_prepared_token_key &key,
-    Preserved_trx_operation_deadline deadline,
-    Preserved_trx_promotion_resume_result *result) {
+    uint64_t requested_deadline_us) {
   const uint64_t started_us = preserve_trx_monotonic_us();
-  auto finish = [&](Preserved_trx_promotion_resume_status status,
-                    const std::string &reason) {
+  auto finish = [&](Preserved_trx_promotion_resume_status status) {
     const uint64_t elapsed_us = preserve_trx_monotonic_us() - started_us;
-    if (result != nullptr) {
-      result->status = status;
-      result->reason = reason;
-      result->elapsed_us = elapsed_us;
-    }
     preserved_trx_promotion_resume_core_note(
         elapsed_us, status == Preserved_trx_promotion_resume_status::OK);
     return status;
   };
-  if (result == nullptr || target_handle == nullptr ||
-      !target_handle->valid() || key.preserve_dir.empty() ||
+  if (target == nullptr || key.preserve_dir.empty() ||
       key.source_uuid.empty() || key.epoch_id.empty() || key.token.empty() ||
-      key.target_boot_incarnation.empty() || key.generation == 0 ||
-      deadline.deadline_us == 0) {
-    return finish(Preserved_trx_promotion_resume_status::INVALID_ARGUMENT,
-                  "invalid strict promotion resume request");
+      key.target_boot_incarnation.empty() || key.generation == 0) {
+    return finish(Preserved_trx_promotion_resume_status::INVALID_ARGUMENT);
   }
-  *result = {};
   if (!preserve_trx_is_enabled()) {
-    return finish(Preserved_trx_promotion_resume_status::FEATURE_DISABLED,
-                  "preserve transaction support is disabled");
-  }
-  if (preserve_trx_monotonic_us() >= deadline.deadline_us) {
-    return finish(Preserved_trx_promotion_resume_status::DEADLINE_EXPIRED,
-                  "strict promotion resume deadline expired");
+    return finish(Preserved_trx_promotion_resume_status::FEATURE_DISABLED);
   }
   Preserve_trx_prepared_token_snapshot snapshot;
   auto &registry = preserved_trx_strict_prepared_token_registry();
   if (registry.snapshot(key, &snapshot) != Preserve_trx_prepared_status::OK ||
       snapshot.state != Preserve_trx_prepared_token_state::ADOPTED_LOCKED) {
-    return finish(
-        Preserved_trx_promotion_resume_status::REGISTRY_NOT_ADOPTED,
-        "strict prepared token is not ADOPTED_LOCKED");
+    return finish(Preserved_trx_promotion_resume_status::REGISTRY_NOT_ADOPTED);
   }
-  THD *const target = target_handle->get();
+  const uint64_t effective_deadline_us =
+      requested_deadline_us == 0
+          ? snapshot.facts.client_resume_deadline_us
+          : std::min(requested_deadline_us,
+                     snapshot.facts.client_resume_deadline_us);
+  if (effective_deadline_us == 0 ||
+      preserve_trx_monotonic_us() >= effective_deadline_us) {
+    return finish(Preserved_trx_promotion_resume_status::DEADLINE_EXPIRED);
+  }
   mysql_mutex_lock(&target->LOCK_thd_data);
-  const bool target_pristine =
-      target->preserve_trx_batch_state ==
-          Preserve_trx_batch_thd_state::ATTACHING &&
-      target->m_server_idle && target->killed == THD::NOT_KILLED &&
-      !target->release_resources_done();
+  const bool target_pristine = target->killed == THD::NOT_KILLED &&
+                               !target->release_resources_done() &&
+                               current_thd == target &&
+                               target->preserve_trx_batch_state ==
+                                   Preserve_trx_batch_thd_state::NONE;
   mysql_mutex_unlock(&target->LOCK_thd_data);
   if (!target_pristine || target->in_active_multi_stmt_transaction()) {
-    return finish(Preserved_trx_promotion_resume_status::TARGET_NOT_PRISTINE,
-                  "protected target THD is not pristine");
+    return finish(Preserved_trx_promotion_resume_status::TARGET_NOT_PRISTINE);
   }
 
   Preserved_trx_record preview;
@@ -20516,10 +20527,10 @@ preserved_trx_resume_adopted_for_promotion_on_thd(
       preview.state !=
           Preserved_trx_lifecycle_state::ADOPTED_FOR_PROMOTION ||
       preview.resumable || preview.trx == nullptr ||
-      preview.metadata.token != key.token) {
+      preview.metadata.token != key.token || !preview.has_promotion_key ||
+      !preserved_trx_promotion_keys_match(preview.promotion_key, key)) {
     return finish(
-        Preserved_trx_promotion_resume_status::PROMOTION_RECORD_NOT_FOUND,
-        "promotion-owned transaction record is unavailable");
+        Preserved_trx_promotion_resume_status::PROMOTION_RECORD_NOT_FOUND);
   }
   if (preserve_trx_is_unsupported_common_context(target) ||
       !trx_preserve_thd_can_accept_preserved_trx(target) ||
@@ -20527,15 +20538,13 @@ preserved_trx_resume_adopted_for_promotion_on_thd(
       !binlog_state_matches_current_mode(preview.metadata) ||
       !preserved_trx_resume_binlog_format_is_supported(target,
                                                         preview.metadata)) {
-    return finish(Preserved_trx_promotion_resume_status::TARGET_NOT_PRISTINE,
-                  "protected target THD cannot accept promoted transaction");
+    return finish(Preserved_trx_promotion_resume_status::TARGET_NOT_PRISTINE);
   }
   const bool metadata_has_binlog_cache =
       preview.metadata.binlog_state ==
       Preserve_snapshot_binlog_state::LOGGED_WITH_CACHE;
   if (metadata_has_binlog_cache != snapshot.facts.binlog_cache_present) {
-    return finish(Preserved_trx_promotion_resume_status::STAGING_FAILED,
-                  "native binlog facts do not match promoted metadata");
+    return finish(Preserved_trx_promotion_resume_status::STAGING_FAILED);
   }
 
   Preserve_strict_attach_intent_write_context intent_context;
@@ -20543,8 +20552,7 @@ preserved_trx_resume_adopted_for_promotion_on_thd(
   intent_context.target_connection_id = target->thread_id();
   if (!write_strict_attach_intent(key, &intent_context)) {
     return finish(
-        Preserved_trx_promotion_resume_status::ATTACH_INTENT_IO_ERROR,
-        "failed to write strict ATTACHING intent");
+        Preserved_trx_promotion_resume_status::ATTACH_INTENT_IO_ERROR);
   }
 
   Preserve_trx_attach_lease attach_lease;
@@ -20555,12 +20563,11 @@ preserved_trx_resume_adopted_for_promotion_on_thd(
     if (write_strict_attach_intent(key, &intent_context)) {
       remove_strict_attach_intent(key);
     }
-    return finish(Preserved_trx_promotion_resume_status::REGISTRY_NOT_ADOPTED,
-                  "strict prepared token attach ownership changed");
+    return finish(Preserved_trx_promotion_resume_status::REGISTRY_NOT_ADOPTED);
   }
 
   Preserved_trx_record record;
-  if (!preserved_trx_take_promotion_adopted_record(key.token, &record)) {
+  if (!preserved_trx_take_promotion_adopted_record(key, &record)) {
     intent_context.state =
         Preserve_trx_strict_attach_intent_state::ATTACH_ROLLED_BACK;
     const bool terminal_written =
@@ -20570,42 +20577,19 @@ preserved_trx_resume_adopted_for_promotion_on_thd(
             Preserve_trx_prepared_status::OK) {
       remove_strict_attach_intent(key);
       return finish(
-          Preserved_trx_promotion_resume_status::PROMOTION_RECORD_NOT_FOUND,
-          "promotion-owned record was concurrently consumed");
+          Preserved_trx_promotion_resume_status::PROMOTION_RECORD_NOT_FOUND);
     }
     if (attach_lease.active()) (void)registry.taint_attach(&attach_lease);
-    return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED,
-                  "failed to close attach ownership after missing record");
-  }
-
-  Preserve_peer_thd_execution_context execution_context(target);
-  if (!execution_context.active()) {
-    (void)restore_record_after_resume_failure(record,
-                                              "peer THD context switch failed");
-    intent_context.state =
-        Preserve_trx_strict_attach_intent_state::ATTACH_ROLLED_BACK;
-    const bool terminal_written =
-        write_strict_attach_intent(key, &intent_context);
-    if (terminal_written &&
-        registry.abort_attach_after_full_unwind(&attach_lease) ==
-            Preserve_trx_prepared_status::OK) {
-      remove_strict_attach_intent(key);
-      return finish(Preserved_trx_promotion_resume_status::STAGING_FAILED,
-                    "peer THD context switch failed");
-    }
-    if (attach_lease.active()) (void)registry.taint_attach(&attach_lease);
-    return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED,
-                  "peer THD context switch ownership is tainted");
+    return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED);
   }
 
   Resume_thd_state_guard thd_state_guard(target);
-  bool binlog_attached = false;
-  bool mdl_cloned = false;
-  bool gtid_restored = false;
-  bool temp_materialized = false;
-  bool trx_attached = false;
-  std::unique_ptr<Mysql_binlog_preserve_prepared_cache_handle> binlog_handle;
-  Mysql_binlog_preserve_attach_journal binlog_journal;
+  Preserved_trx_resume_runtime resume_runtime;
+  bool &binlog_attached = resume_runtime.strict_binlog_attached;
+  bool &mdl_cloned = resume_runtime.mdl_transferred;
+  bool &gtid_restored = resume_runtime.gtid_restored;
+  bool &temp_materialized = resume_runtime.temp_tables_materialized;
+  bool &trx_attached = resume_runtime.trx_attached;
 
   auto pre_boundary_failure = [&](const std::string &reason) {
     bool unwind_ok = true;
@@ -20630,14 +20614,16 @@ preserved_trx_resume_adopted_for_promotion_on_thd(
     mdl_cloned = false;
     if (binlog_attached) {
       if (mysql_binlog_preserve_abort_detached_cache_attach(
-              &binlog_journal, &binlog_handle) !=
+              &resume_runtime.strict_binlog_journal,
+              &resume_runtime.strict_binlog_handle) !=
           Mysql_binlog_preserve_cache_status::OK) {
         unwind_ok = false;
       }
       binlog_attached = false;
     }
-    if (binlog_handle != nullptr &&
-        attach_lease.restore_native_binlog_handle(&binlog_handle) !=
+    if (resume_runtime.strict_binlog_handle != nullptr &&
+        attach_lease.restore_native_binlog_handle(
+            &resume_runtime.strict_binlog_handle) !=
             Preserve_trx_prepared_status::OK) {
       unwind_ok = false;
     }
@@ -20653,80 +20639,23 @@ preserved_trx_resume_adopted_for_promotion_on_thd(
         registry.abort_attach_after_full_unwind(&attach_lease) ==
             Preserve_trx_prepared_status::OK) {
       remove_strict_attach_intent(key);
-      return finish(Preserved_trx_promotion_resume_status::STAGING_FAILED,
-                    reason);
+      return finish(Preserved_trx_promotion_resume_status::STAGING_FAILED);
     }
     if (attach_lease.active()) (void)registry.taint_attach(&attach_lease);
-    return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED,
-                  reason + "; attach unwind is tainted");
+    return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED);
   };
-
-  if (record.metadata.tx_isolation > ISO_SERIALIZABLE ||
-      set_tx_isolation(target,
-                       static_cast<enum_tx_isolation>(
-                           record.metadata.tx_isolation),
-                       true) ||
-      restore_preserved_session_variables(target, record.metadata) ||
-      restore_preserved_dml_policy(target, record.trx, record.metadata)) {
-    return pre_boundary_failure("session state restore failed");
-  }
-  target->variables.sql_log_bin = record.metadata.session_sql_log_bin;
-  if (record.metadata.option_bin_log)
-    target->variables.option_bits |= OPTION_BIN_LOG;
-  else
-    target->variables.option_bits &= ~OPTION_BIN_LOG;
-  restore_preserved_transaction_access_mode(target, record.metadata);
-  restore_last_insert_id_state(target, record.metadata);
-  restore_forced_insert_id_state(target, record.metadata);
-  if (import_user_vars_payload(target, record.metadata.user_vars_payload)) {
-    return pre_boundary_failure("user variable restore failed");
-  }
-
-  if (snapshot.facts.binlog_cache_present) {
-    Preserve_trx_internal_operation_capability capability;
-    if (attach_lease.make_native_binlog_attach_capability(&capability) !=
-            Preserve_trx_prepared_status::OK ||
-        attach_lease.take_native_binlog_handle(&binlog_handle) !=
-            Preserve_trx_prepared_status::OK ||
-        mysql_binlog_preserve_attach_detached_cache(
-            capability, target, &binlog_handle, &binlog_journal) !=
-            Mysql_binlog_preserve_cache_status::OK) {
-      return pre_boundary_failure("native binlog cache attach failed");
-    }
-    binlog_attached = true;
-  }
-
-  if (restore_detached_mdl_context(target, key.token)) {
-    return pre_boundary_failure("detached MDL clone failed");
-  }
-  mdl_cloned = true;
-  if (preserve_snapshot_allows_gtid_restore(record.metadata)) {
-    if (restore_logged_cache_gtid_next(target, record.metadata) ||
-        trx_preserve_prepare_resumed_rollback_gtid(record.trx) != DB_SUCCESS) {
-      return pre_boundary_failure("GTID ownership restore failed");
-    }
-    gtid_restored = true;
-  }
-
-  std::string temp_reason;
-  if (preserve_trx_temp_table_materialize_for_resume(
-          target, record.trx, key.preserve_dir, key.token, record.metadata,
-          &temp_reason) != Preserve_snapshot_status::OK) {
-    return pre_boundary_failure(temp_reason.empty()
-                                    ? "temporary table materialization failed"
-                                    : temp_reason);
-  }
-  temp_materialized = !record.metadata.temp_table_manifest_payload.empty();
-  if (trx_preserve_attach_to_thd(record.trx, target) != DB_SUCCESS) {
-    return pre_boundary_failure("InnoDB transaction attach failed");
-  }
-  trx_attached = true;
-  mark_preserved_transaction_attached(target, record.metadata);
-  if (restore_savepoints_to_thd(target, record.trx, record.metadata)) {
-    return pre_boundary_failure("savepoint restore failed");
-  }
-  if (preserve_trx_monotonic_us() >= deadline.deadline_us) {
-    return pre_boundary_failure("deadline expired before activation");
+  Preserved_trx_resume_prepare_options prepare_options;
+  prepare_options.source = Preserved_trx_resume_source::STRICT_PROMOTION;
+  prepare_options.dir = &key.preserve_dir;
+  prepare_options.token = &key.token;
+  prepare_options.strict_attach_lease = &attach_lease;
+  prepare_options.strict_facts = &snapshot.facts;
+  prepare_options.deadline_monotonic_us = effective_deadline_us;
+  const Preserved_trx_resume_prepare_result prepare_result =
+      prepare_resume_on_current_thd_shared(target, &record, prepare_options,
+                                           &resume_runtime);
+  if (!prepare_result.ok) {
+    return pre_boundary_failure(prepare_result.reason);
   }
 
   intent_context.state = Preserve_trx_strict_attach_intent_state::ACTIVATING;
@@ -20735,22 +20664,18 @@ preserved_trx_resume_adopted_for_promotion_on_thd(
       Preserve_trx_prepared_status::OK) {
     return pre_boundary_failure("durable ACTIVATING intent failed");
   }
-  result->activation_boundary_committed = true;
-  auto post_boundary_failure = [&](const std::string &reason,
-                                   bool ownership_tainted) {
+  auto post_boundary_failure = [&](bool ownership_tainted) {
     if (!ownership_tainted && !trans_rollback(target)) {
       intent_context.state =
           Preserve_trx_strict_attach_intent_state::ATTACH_ROLLED_BACK;
       if (registry.rollback_attach_after_activation(
               &attach_lease, write_strict_attach_intent, &intent_context) ==
           Preserve_trx_prepared_status::OK) {
-        result->rolled_back = true;
         delete_detached_mdl_context(key.token);
         (void)delete_preserved_snapshot_files_and_sidecars_or_log(
             key.preserve_dir, key.token, &record.metadata);
         return finish(Preserved_trx_promotion_resume_status::
-                          ACTIVATION_FAILED_ROLLED_BACK,
-                      reason);
+                          ACTIVATION_FAILED_ROLLED_BACK);
       }
     }
     intent_context.state =
@@ -20758,13 +20683,13 @@ preserved_trx_resume_adopted_for_promotion_on_thd(
     (void)write_strict_attach_intent(key, &intent_context);
     if (attach_lease.active()) (void)registry.taint_attach(&attach_lease);
     thd_state_guard.dismiss();
-    return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED,
-                  reason + "; ownership retained for operator cleanup");
+    return finish(Preserved_trx_promotion_resume_status::ATTACH_TAINTED);
   };
 
   if (binlog_attached) {
     const auto binlog_commit_status =
-        mysql_binlog_preserve_commit_detached_cache_attach(&binlog_journal);
+        mysql_binlog_preserve_commit_detached_cache_attach(
+            &resume_runtime.strict_binlog_journal);
     if (binlog_commit_status != Mysql_binlog_preserve_cache_status::OK) {
       bool ownership_tainted =
           binlog_commit_status ==
@@ -20772,27 +20697,27 @@ preserved_trx_resume_adopted_for_promotion_on_thd(
       if (!ownership_tainted) {
         const auto abort_status =
             mysql_binlog_preserve_abort_detached_cache_attach(
-                &binlog_journal, &binlog_handle);
+                &resume_runtime.strict_binlog_journal,
+                &resume_runtime.strict_binlog_handle);
         if (abort_status == Mysql_binlog_preserve_cache_status::OK) {
           binlog_attached = false;
-          binlog_handle.reset();
+          resume_runtime.strict_binlog_handle.reset();
         } else {
           ownership_tainted = true;
         }
       }
-      return post_boundary_failure(
-          "native binlog ownership commit failed", ownership_tainted);
+      return post_boundary_failure(ownership_tainted);
     }
   }
   binlog_attached = false;
-  if (trx_preserve_activate_resumed(record.trx) != DB_SUCCESS) {
-    return post_boundary_failure("InnoDB undo activation failed", false);
+  if (activate_resumed_trx_shared(&record) != DB_SUCCESS) {
+    return post_boundary_failure(false);
   }
   intent_context.state = Preserve_trx_strict_attach_intent_state::ACTIVE;
   if (registry.commit_attach(&attach_lease, write_strict_attach_intent,
                              &intent_context) !=
       Preserve_trx_prepared_status::OK) {
-    return post_boundary_failure("durable ACTIVE intent failed", false);
+    return post_boundary_failure(false);
   }
 
   delete_detached_mdl_context(key.token);
@@ -20830,7 +20755,7 @@ preserved_trx_resume_adopted_for_promotion_on_thd(
   }
   thd_state_guard.dismiss();
   audit_preserved_trx_event(target, key.token, "promotion-resume", "success");
-  return finish(Preserved_trx_promotion_resume_status::OK, "ok");
+  return finish(Preserved_trx_promotion_resume_status::OK);
 }
 
 bool Sql_cmd_show_preserved_transactions::execute(THD *thd) {

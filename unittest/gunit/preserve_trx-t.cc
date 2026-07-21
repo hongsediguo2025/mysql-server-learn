@@ -4322,107 +4322,6 @@ TEST_F(PreservedTrxCommandRead,
 }
 
 TEST_F(PreservedTrxCommandRead,
-       ProtectedPeerHandlePinsCommandGateAndDefersKill) {
-  THD *target = thd();
-  preserve_trx_set_enable_value(true);
-  target->m_server_idle = true;
-  target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
-  target->killed = THD::NOT_KILLED;
-  ASSERT_NE(0U, target->thread_id());
-  Global_THD_manager *const thd_manager =
-      Global_THD_manager::get_instance();
-  thd_manager->set_unit_test();
-  thd_manager->add_thd(target);
-  struct Remove_thd_guard {
-    Global_THD_manager *manager;
-    THD *target;
-    ~Remove_thd_guard() { manager->remove_thd(target); }
-  } remove_thd_guard{thd_manager, target};
-  Find_thd_with_id finder(target->thread_id());
-  THD *const found = thd_manager->find_thd(&finder);
-  ASSERT_EQ(target, found);
-  mysql_mutex_unlock(&found->LOCK_thd_data);
-  EXPECT_FALSE(target->release_resources_done());
-  EXPECT_FALSE(target->in_active_multi_stmt_transaction());
-
-  Preserved_trx_peer_thd_handle handle;
-  THD *const saved_current_thd = current_thd;
-  current_thd = nullptr;
-  const bool resolved = preserved_trx_resolve_peer_thd(
-      target->thread_id(), Preserved_trx_operation_deadline{}, &handle);
-  current_thd = saved_current_thd;
-  ASSERT_TRUE(resolved);
-  ASSERT_TRUE(handle.valid());
-  EXPECT_EQ(target, handle.get());
-  EXPECT_TRUE(preserved_trx_thd_has_external_use(target));
-  mysql_mutex_lock(&target->LOCK_thd_data);
-  EXPECT_EQ(Preserve_trx_batch_thd_state::ATTACHING,
-            target->preserve_trx_batch_state);
-  mysql_mutex_unlock(&target->LOCK_thd_data);
-
-  mysql_mutex_lock(&target->LOCK_thd_data);
-  target->awake(THD::KILL_CONNECTION);
-  mysql_mutex_unlock(&target->LOCK_thd_data);
-  EXPECT_EQ(THD::NOT_KILLED, target->killed);
-
-  handle.release();
-  EXPECT_FALSE(preserved_trx_thd_has_external_use(target));
-  mysql_mutex_lock(&target->LOCK_thd_data);
-  EXPECT_EQ(Preserve_trx_batch_thd_state::NONE,
-            target->preserve_trx_batch_state);
-  mysql_mutex_unlock(&target->LOCK_thd_data);
-  EXPECT_EQ(THD::KILL_CONNECTION, target->killed);
-  target->killed = THD::NOT_KILLED;
-  target->m_server_idle = false;
-}
-
-TEST_F(PreservedTrxCommandRead,
-       StrictPromotionResumeRejectsMissingRegistryBeforeTargetMutation) {
-  THD *target = thd();
-  preserve_trx_set_enable_value(true);
-  target->m_server_idle = true;
-  target->preserve_trx_batch_state = Preserve_trx_batch_thd_state::NONE;
-  target->killed = THD::NOT_KILLED;
-  Global_THD_manager *const thd_manager =
-      Global_THD_manager::get_instance();
-  thd_manager->set_unit_test();
-  thd_manager->add_thd(target);
-  struct Remove_thd_guard {
-    Global_THD_manager *manager;
-    THD *target;
-    ~Remove_thd_guard() { manager->remove_thd(target); }
-  } remove_thd_guard{thd_manager, target};
-
-  Preserved_trx_peer_thd_handle handle;
-  THD *const saved_current_thd = current_thd;
-  current_thd = nullptr;
-  const bool resolved = preserved_trx_resolve_peer_thd(
-      target->thread_id(), Preserved_trx_operation_deadline{}, &handle);
-  current_thd = saved_current_thd;
-  ASSERT_TRUE(resolved);
-
-  Preserve_trx_prepared_token_key key = make_prepared_token_key(73);
-  key.preserve_dir = "/tmp/preserve-missing-registry/";
-  const auto now = std::chrono::steady_clock::now().time_since_epoch();
-  Preserved_trx_operation_deadline deadline;
-  deadline.deadline_us =
-      std::chrono::duration_cast<std::chrono::microseconds>(now).count() +
-      1000000;
-  Preserved_trx_promotion_resume_result result;
-  EXPECT_EQ(Preserved_trx_promotion_resume_status::REGISTRY_NOT_ADOPTED,
-            preserved_trx_resume_adopted_for_promotion_on_thd(
-                &handle, key, deadline, &result));
-  EXPECT_TRUE(handle.valid());
-  EXPECT_EQ(THD::NOT_KILLED, target->killed);
-  mysql_mutex_lock(&target->LOCK_thd_data);
-  EXPECT_EQ(Preserve_trx_batch_thd_state::ATTACHING,
-            target->preserve_trx_batch_state);
-  mysql_mutex_unlock(&target->LOCK_thd_data);
-  handle.release();
-  target->m_server_idle = false;
-}
-
-TEST_F(PreservedTrxCommandRead,
        DrainCleanupFailedWithoutRecordsAllowsNewTransactions) {
   THD *target = thd();
   preserve_trx_set_enable_value(true);
@@ -25693,6 +25592,17 @@ TEST_F(PreserveSnapshotTest,
   Preserve_snapshot_metadata receiver_metadata;
   Transfer_receiver_payload_test_sink frame_sink(
       m_dir, &store, &registry, &receiver_metadata);
+  const auto wait_for_receiver_prewarm_idle = [&] {
+    for (uint attempt = 0; attempt < 500; ++attempt) {
+      if (preserve_trx_transfer_receiver_queued_bytes_status() == 0 &&
+          preserve_trx_transfer_receiver_active_jobs_for_unit_test(&registry) ==
+              0) {
+        return true;
+      }
+      my_sleep(10000);
+    }
+    return false;
+  };
   Preserve_trx_transfer_source_epoch_session session(
       "epoch-deferred-final-prewarm", "source-uuid", "target-uuid", 17,
       &frame_sink);
@@ -25708,19 +25618,12 @@ TEST_F(PreserveSnapshotTest,
   ASSERT_EQ(Preserve_trx_transfer_status::OK,
             preserve_trx_transfer_stage_deferred_candidate_external_objects(
                 &session, m_dir, &candidate));
-  for (uint attempt = 0; attempt < 300; ++attempt) {
-    if (preserve_trx_transfer_receiver_queued_bytes_status() == 0 &&
-        preserve_trx_transfer_receiver_worker_active_status() == 0) {
-      break;
-    }
-    my_sleep(10000);
-  }
+  ASSERT_TRUE(wait_for_receiver_prewarm_idle());
   ASSERT_EQ(0U, preserve_trx_transfer_receiver_queued_bytes_status());
-  ASSERT_EQ(0U, preserve_trx_transfer_receiver_worker_active_status());
 
-  preserve_trx_transfer_set_receiver_object_prewarm_delay_ms_for_unit_test(500);
-  auto restore_object_delay = create_scope_guard([] {
-    preserve_trx_transfer_set_receiver_object_prewarm_delay_ms_for_unit_test(0);
+  preserve_trx_transfer_set_prewarm_paused_for_unit_test(true);
+  auto resume_prewarm = create_scope_guard([] {
+    preserve_trx_transfer_set_prewarm_paused_for_unit_test(false);
   });
 
   const uint64_t seal_prewarm_before =
@@ -25774,6 +25677,8 @@ TEST_F(PreserveSnapshotTest,
                 prepared_plan.get()));
   ASSERT_TRUE(preserve_trx_transfer_put_receiver_record_lock_plan_for_unit_test(
       m_dir, final_manifest, std::move(prepared_plan), facts));
+  preserve_trx_transfer_set_prewarm_paused_for_unit_test(false);
+  resume_prewarm.commit();
 
   EXPECT_TRUE(registry.all_objects_sealed(session.epoch_id(), transfer_token));
   EXPECT_EQ(receiver_record.objects.size(),
@@ -25785,6 +25690,7 @@ TEST_F(PreserveSnapshotTest,
              seal_prewarm_before) {
     my_sleep(1000);
   }
+  ASSERT_TRUE(wait_for_receiver_prewarm_idle());
   EXPECT_GT(preserve_trx_transfer_receiver_seal_prewarm_tokens_status(),
             seal_prewarm_before);
   EXPECT_GT(preserve_trx_transfer_receiver_object_prewarm_count_status(),

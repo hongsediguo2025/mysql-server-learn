@@ -1,7 +1,0 @@
-INSTALL PLUGIN test_preserve_trx_promotion
-SONAME 'libtest_preserve_trx_promotion.so';
-SELECT test_preserve_trx_promotion_resume(
-'missing-epoch', 'missing-token', CONNECTION_ID()) AS status;
-status
-4
-UNINSTALL PLUGIN test_preserve_trx_promotion;

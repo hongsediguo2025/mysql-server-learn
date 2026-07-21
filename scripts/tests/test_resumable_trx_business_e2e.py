@@ -698,6 +698,7 @@ class TransferPromotionFrameTest(unittest.TestCase):
             runner.runtime = runtime
             runner.run_standby_transfer_receiver_drain_metrics = mock.Mock()
             runner._receiver_admin_connection = mock.Mock(return_value=receiver_conn)
+            runner.resume_promoted_transactions_with_sql = mock.Mock()
 
             runner.run_receiver_drain_then_promotion_gate()
 
@@ -731,6 +732,39 @@ class TransferPromotionFrameTest(unittest.TestCase):
             self.assertEqual(report["receiver_standby_pending_tokens"], 2)
             self.assertEqual(report["promotion_gate_token_count"], 2)
             self.assertEqual(report["server_promotion_gate_record_lock_cold_page_gets"], 0)
+            runner.resume_promoted_transactions_with_sql.assert_called_once_with(
+                [101, 102]
+            )
+
+    def test_promoted_tokens_resume_on_fresh_sql_connections(self):
+        runner = BusinessE2ERunner.__new__(BusinessE2ERunner)
+        runner.runtime = _FakeRuntime()
+        connections = [_FakeConnection(), _FakeConnection()]
+        runner._receiver_admin_connection = mock.Mock(
+            side_effect=connections
+        )
+
+        runner.resume_promoted_transactions_with_sql([101, 102])
+
+        self.assertEqual(
+            runner.runtime.calls,
+            [
+                ("RESUME PRESERVED TRANSACTION '101'", False),
+                ("SELECT 1", True),
+                ("ROLLBACK", False),
+                ("RESUME PRESERVED TRANSACTION '102'", False),
+                ("SELECT 1", True),
+                ("ROLLBACK", False),
+            ],
+        )
+        self.assertTrue(all(connection.closed for connection in connections))
+        self.assertEqual(len(runner.promotion_sql_resume_elapsed_samples_us), 2)
+        self.assertTrue(
+            all(
+                elapsed_us > 0
+                for elapsed_us in runner.promotion_sql_resume_elapsed_samples_us
+            )
+        )
 
     def test_promotion_warm_gate_simulator_writes_failure_report(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -6998,6 +7032,7 @@ class WorkloadPlanTest(unittest.TestCase):
                 }
             )
             runner.promotion_gate_elapsed_samples_us = [4000, 5000, 6000]
+            runner.promotion_sql_resume_elapsed_samples_us = [120, 140, 160]
             runner.promotion_gate_server_metrics = []
             runner.warmcopy_drain_metrics = [
                 WarmcopyDrainMetrics(
@@ -7050,6 +7085,10 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertNotIn("real_ha_promotion", report)
             self.assertNotIn("ha_blocked", report)
             self.assertEqual(report["promotion_gate_elapsed_us"], 15000)
+            self.assertEqual(
+                report["promotion_sql_resume_elapsed_samples_us"],
+                [120, 140, 160],
+            )
             self.assertEqual(report["phase2_total_samples_ms"], [10.2])
             self.assertEqual(report["lock_warmcopy_live_fallback_count"], 0)
             self.assertFalse(report["phase2_slo_guaranteed"])
@@ -7295,6 +7334,9 @@ class WorkloadPlanTest(unittest.TestCase):
         runner.run_promotion_warm_gate_simulator = mock.Mock(
             side_effect=lambda **_: calls.append("promotion_gate")
         )
+        runner.resume_promoted_transactions_with_sql = mock.Mock(
+            side_effect=lambda _: calls.append("sql_resume")
+        )
         runner.write_receiver_promotion_gate_report = mock.Mock(
             side_effect=lambda *_, **__: calls.append("write_report")
         )
@@ -7309,6 +7351,7 @@ class WorkloadPlanTest(unittest.TestCase):
                 "materialize",
                 "restart_receiver",
                 "promotion_gate",
+                "sql_resume",
                 "write_report",
             ],
         )
@@ -7371,6 +7414,7 @@ class WorkloadPlanTest(unittest.TestCase):
             runner.run_promotion_warm_gate_simulator = mock.Mock(
                 side_effect=lambda **_: calls.append("promotion_gate")
             )
+            runner.resume_promoted_transactions_with_sql = mock.Mock()
             runner.write_receiver_promotion_gate_report = mock.Mock(
                 side_effect=lambda *_, **__: calls.append("write_report")
             )
@@ -7384,6 +7428,10 @@ class WorkloadPlanTest(unittest.TestCase):
             self.assertEqual(runner.config.promotion_gate_tokens, [103])
             self.assertEqual(runner.config.promotion_gate_required_apply_lsn, 1030)
             self.assertEqual(runner.config.promotion_gate_epoch_id, "103")
+            self.assertEqual(
+                runner.resume_promoted_transactions_with_sql.call_args_list,
+                [mock.call([101]), mock.call([102]), mock.call([103])],
+            )
             runner.write_receiver_promotion_gate_report.assert_called_once_with(
                 "101,102,103",
                 [101, 102, 103],
@@ -7420,6 +7468,9 @@ class WorkloadPlanTest(unittest.TestCase):
         runner.run_promotion_warm_gate_simulator = mock.Mock(
             side_effect=lambda **_: calls.append("promotion_gate")
         )
+        runner.resume_promoted_transactions_with_sql = mock.Mock(
+            side_effect=lambda _: calls.append("sql_resume")
+        )
         runner.write_receiver_promotion_gate_report = mock.Mock(
             side_effect=lambda *_, **__: calls.append("write_report")
         )
@@ -7434,6 +7485,7 @@ class WorkloadPlanTest(unittest.TestCase):
                 "materialize",
                 "restart_receiver",
                 "promotion_gate",
+                "sql_resume",
                 "write_report",
             ],
         )

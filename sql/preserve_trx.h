@@ -93,64 +93,6 @@ enum class Preserved_trx_recover_load_profile {
   SNAPSHOT_ONLY,
   WITH_SEMANTIC_EXTERNAL_BLOBS
 };
-struct Preserved_trx_operation_deadline {
-  uint64_t deadline_us{0};
-};
-
-class Preserved_trx_peer_thd_handle {
- public:
-  Preserved_trx_peer_thd_handle();
-  Preserved_trx_peer_thd_handle(const Preserved_trx_peer_thd_handle &) =
-      delete;
-  Preserved_trx_peer_thd_handle &operator=(
-      const Preserved_trx_peer_thd_handle &) = delete;
-  Preserved_trx_peer_thd_handle(Preserved_trx_peer_thd_handle &&) noexcept;
-  Preserved_trx_peer_thd_handle &operator=(
-      Preserved_trx_peer_thd_handle &&) noexcept;
-  ~Preserved_trx_peer_thd_handle();
-
-  THD *get() const;
-  bool valid() const;
-  void release();
-
- private:
-  class Impl;
-  std::unique_ptr<Impl> m_impl;
-  bool acquire_locked_for_internal_use(THD *thd);
-
-  friend bool preserved_trx_resolve_peer_thd(
-      uint64_t, Preserved_trx_operation_deadline,
-      Preserved_trx_peer_thd_handle *);
-};
-
-using Preserved_trx_peer_thd_resolver = bool (*)(
-    uint64_t source_connection_id, Preserved_trx_operation_deadline deadline,
-    Preserved_trx_peer_thd_handle *target_handle);
-bool preserved_trx_resolve_peer_thd(
-    uint64_t source_connection_id, Preserved_trx_operation_deadline deadline,
-    Preserved_trx_peer_thd_handle *target_handle);
-bool preserved_trx_defer_external_thd_kill(THD *thd, int killed_state);
-enum class Preserved_trx_promotion_resume_status : uint8_t {
-  OK = 0,
-  INVALID_ARGUMENT,
-  FEATURE_DISABLED,
-  DEADLINE_EXPIRED,
-  REGISTRY_NOT_ADOPTED,
-  TARGET_NOT_PRISTINE,
-  ATTACH_INTENT_IO_ERROR,
-  PROMOTION_RECORD_NOT_FOUND,
-  STAGING_FAILED,
-  ACTIVATION_FAILED_ROLLED_BACK,
-  ATTACH_TAINTED
-};
-struct Preserved_trx_promotion_resume_result {
-  Preserved_trx_promotion_resume_status status{
-      Preserved_trx_promotion_resume_status::INVALID_ARGUMENT};
-  std::string reason;
-  uint64_t elapsed_us{0};
-  bool activation_boundary_committed{false};
-  bool rolled_back{false};
-};
 extern ulong preserve_trx_off_artifact_policy;
 extern ulong preserve_trx_drain_mode;
 extern uint preserve_trx_drain_grace_ms;
@@ -189,12 +131,6 @@ bool preserve_trx_off_artifact_policy_recover();
 bool preserve_trx_off_artifact_policy_abandon();
 bool preserve_trx_off_artifact_policy_fail_if_present();
 bool preserve_trx_execute_command(THD *thd);
-Preserved_trx_promotion_resume_status
-preserved_trx_resume_adopted_for_promotion_on_thd(
-    Preserved_trx_peer_thd_handle *target_handle,
-    const Preserve_trx_prepared_token_key &key,
-    Preserved_trx_operation_deadline deadline,
-    Preserved_trx_promotion_resume_result *result);
 
 ulonglong preserve_trx_warmcopy_prefix_bytes_status();
 ulonglong preserve_trx_warmcopy_digest_bytes_status();

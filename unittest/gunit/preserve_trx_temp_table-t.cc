@@ -603,18 +603,19 @@ TEST(TempResumeMaterializerContractTest, ResumeMaterializerEntryPointsExist) {
   EXPECT_TRUE(source_contains_exact_signature_for_temp_table_test(
       innodb_impl, innodb_undo_reconnect_signature));
 
-  const std::string resume_body =
+  const std::string resume_prepare_body =
       extract_function_body_after_signature_for_temp_table_test(
-          resume_impl, "static bool preserved_trx_resume_record_on_thd(");
-  ASSERT_FALSE(resume_body.empty());
-  const std::string normalized_resume_body =
-      normalize_whitespace_for_temp_table_test(resume_body);
+          resume_impl, "prepare_resume_on_current_thd_shared(");
+  ASSERT_FALSE(resume_prepare_body.empty());
+  const std::string normalized_resume_prepare_body =
+      normalize_whitespace_for_temp_table_test(resume_prepare_body);
   const std::string expected_materialize_call =
-      "preserve_trx_temp_table_materialize_for_resume( thd, record.trx,";
+      "preserve_trx_temp_table_materialize_for_resume( thd, record->trx,";
   const size_t materialize_call =
-      normalized_resume_body.find(expected_materialize_call);
+      normalized_resume_prepare_body.find(expected_materialize_call);
   const size_t trx_attach_call =
-      normalized_resume_body.find("trx_preserve_attach_to_thd(record.trx, thd)");
+      normalized_resume_prepare_body.find(
+          "trx_preserve_attach_to_thd(record->trx, thd)");
   ASSERT_NE(std::string::npos, materialize_call);
   ASSERT_NE(std::string::npos, trx_attach_call);
   EXPECT_LT(materialize_call, trx_attach_call);
@@ -656,9 +657,13 @@ TEST(TempResumeMaterializerContractTest,
       {"Sql_cmd_resume_preserved_transaction::execute",
        extract_function_body_after_signature_for_temp_table_test(
            resume_impl, "bool Sql_cmd_resume_preserved_transaction::execute(")},
-      {"preserved_trx_resume_record_on_thd",
+      {"preserved_trx_resume_record_on_current_thd",
        extract_function_body_after_signature_for_temp_table_test(
-           resume_impl, "static bool preserved_trx_resume_record_on_thd(")},
+           resume_impl,
+           "static bool preserved_trx_resume_record_on_current_thd(")},
+      {"prepare_resume_on_current_thd_shared",
+       extract_function_body_after_signature_for_temp_table_test(
+           resume_impl, "prepare_resume_on_current_thd_shared(")},
   };
   for (const auto &source : checked_sources) {
     ASSERT_FALSE(source.second.empty()) << source.first;
@@ -1781,20 +1786,28 @@ TEST(TempResumeMaterializerContractTest,
       "Preserve_snapshot_status\n"
       "preserve_trx_temp_table_rollback_materialized_for_resume("));
 
+  const std::string resume_prepare_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          resume_impl, "prepare_resume_on_current_thd_shared(");
   const std::string resume_body =
       extract_function_body_after_signature_for_temp_table_test(
-          resume_impl, "static bool preserved_trx_resume_record_on_thd(");
+          resume_impl,
+          "static bool preserved_trx_resume_record_on_current_thd(");
+  ASSERT_FALSE(resume_prepare_body.empty());
   ASSERT_FALSE(resume_body.empty());
+  const std::string normalized_resume_prepare_body =
+      normalize_whitespace_for_temp_table_test(resume_prepare_body);
   const std::string normalized_resume_body =
       normalize_whitespace_for_temp_table_test(resume_body);
   EXPECT_NE(std::string::npos,
-            normalized_resume_body.find("bool temp_tables_materialized = false"));
+            normalized_resume_body.find(
+                "bool &temp_tables_materialized = resume_runtime.temp_tables_materialized"));
   EXPECT_NE(std::string::npos,
-            normalized_resume_body.find(
-                "temp_tables_materialized = !record.metadata.temp_table_manifest_payload.empty()"));
+            normalized_resume_prepare_body.find(
+                "runtime->temp_tables_materialized = !record->metadata.temp_table_manifest_payload.empty()"));
   EXPECT_EQ(std::string::npos,
-            normalized_resume_body.find(
-                "temp_tables_materialized = !record.metadata.temp_table_manifest_payload.empty() && preserve_trx_temp_table_enable"))
+            normalized_resume_prepare_body.find(
+                "runtime->temp_tables_materialized = !record->metadata.temp_table_manifest_payload.empty() && preserve_trx_temp_table_enable"))
       << "resume cleanup must be driven by successful materialization state, "
          "not by the current value of the temp-table feature switch";
   const size_t rollback_call = normalized_resume_body.find(
@@ -1827,7 +1840,8 @@ TEST(TempResumeMaterializerContractTest,
 
   const std::string resume_body =
       extract_function_body_after_signature_for_temp_table_test(
-          resume_impl, "static bool preserved_trx_resume_record_on_thd(");
+          resume_impl,
+          "static bool preserved_trx_resume_record_on_current_thd(");
   ASSERT_FALSE(resume_body.empty());
   EXPECT_NE(std::string::npos,
             resume_body.find("Preserve_trx_temp_table_cleanup_result"));
@@ -1858,17 +1872,28 @@ TEST(TempResumeMaterializerContractTest,
   EXPECT_NE(std::string::npos,
             reseed_body.find("preserve_trx_temp_table_no_redo_baseline_valid"));
 
+  const std::string resume_prepare_body =
+      extract_function_body_after_signature_for_temp_table_test(
+          resume_impl, "prepare_resume_on_current_thd_shared(");
   const std::string resume_body =
       extract_function_body_after_signature_for_temp_table_test(
-          resume_impl, "static bool preserved_trx_resume_record_on_thd(");
+          resume_impl,
+          "static bool preserved_trx_resume_record_on_current_thd(");
+  ASSERT_FALSE(resume_prepare_body.empty());
   ASSERT_FALSE(resume_body.empty());
   const size_t reseed_call =
-      resume_body.find("preserve_trx_temp_table_reseed_after_resume(thd)");
-  const size_t activate_call =
-      resume_body.find("trx_preserve_activate_resumed(record.trx)");
+      resume_prepare_body.find("preserve_trx_temp_table_reseed_after_resume(thd)");
+  const size_t attach_call =
+      resume_prepare_body.find("trx_preserve_attach_to_thd(record->trx, thd)");
+  const size_t prepare_call =
+      resume_body.find("prepare_resume_on_current_thd_shared");
+  const size_t activate_call = resume_body.find("activate_resumed_trx_shared");
   ASSERT_NE(std::string::npos, reseed_call);
+  ASSERT_NE(std::string::npos, attach_call);
+  ASSERT_NE(std::string::npos, prepare_call);
   ASSERT_NE(std::string::npos, activate_call);
-  EXPECT_LT(reseed_call, activate_call);
+  EXPECT_LT(attach_call, reseed_call);
+  EXPECT_LT(prepare_call, activate_call);
 }
 
 TEST(TempLivePreserveManifestContractTest,
